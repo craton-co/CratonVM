@@ -47,9 +47,9 @@ standard library, so it can run with **no JDK installation, no `JAVA_HOME`, no `
 | Sieve 100Kx500          | 358 ms       | 31,665 ms        | 88.4x         | 466 ms                    | 1.30x     |
 | Matrix 500x500          | 336 ms       | 39,078 ms        | 116.3x        | 452 ms                    | 1.35x     |
 | **QuickBench TOTAL**    | **3,756 ms** | **173,532 ms**   | **46.2x**     | **30,977 ms**             | **8.25x** |
-| Binary Trees (depth=18) | 681 ms       | 19,737 ms        | 29.0x         | 36,665 ms                 | 53.8x     |
+| Binary Trees (depth=18) | 681 ms       | 36,525 ms        | 53.6x         | 36,983 ms                 | 54.3x     |
 
-*Single-run snapshot measured 2026-07-02 on Microsoft Windows 11 Home, JDK 25.0.1 LTS, CratonVM code `b80c50b5`, release build. The benchmark sources are the historical `bench/QuickBench.java` and `bench/binarytrees.java` from commit `2cea208`; `bench/` is currently untracked. The default column uses the launcher default, where OSR is disabled. The OSR column sets `CRATONVM_JIT_OSR=1 CRATONVM_JIT_THRESHOLD=1`; on this snapshot it recovers Arithmetic, Sieve, and Matrix, while Fibonacci and Binary Trees remain current regressions.*
+*Single-run snapshot measured on Microsoft Windows 11 Home, JDK 25.0.1 LTS, release builds. QuickBench rows are from CratonVM code `b80c50b5` on 2026-07-02. The Binary Trees CratonVM columns were rechecked on 2026-07-03 at `8292ec9c`, using the same 681 ms HotSpot baseline from the 2026-07-02 JDK run. The benchmark sources are the historical `bench/QuickBench.java` and `bench/binarytrees.java` from commit `2cea208`; `bench/` is currently untracked. The default column uses the launcher default, where OSR is disabled. The OSR column sets `CRATONVM_JIT_OSR=1 CRATONVM_JIT_THRESHOLD=1`; for QuickBench it recovers Arithmetic, Sieve, and Matrix, while Fibonacci and Binary Trees remain current regressions.*
 
 See [docs/JIT_OPTIMIZATION.md](docs/JIT_OPTIMIZATION.md) for the full 26-round JIT optimization journey.
 

@@ -170,20 +170,52 @@ pub fn ensure_system_stdin_object(
             .unwrap_or(2)
     };
     let in_obj = shared.heap.alloc_object(fis_class_id, num_fields);
+    // gcstress residual face fix — pin `in_obj` across the FileDescriptor
+    // class-load/clinit/alloc window below. Those calls allocate, and under
+    // allocation pressure a MOVING young GC can run inside the window; this
+    // Rust local is invisible to `collect_roots` (the A1 "Rust local across
+    // allocating calls" family), so the later `set_field(in_obj, ..)` wrote
+    // through the STALE pre-move address (observed as the bootstrap
+    // "set_field: out-of-bounds field write dropped" on an all-zero header
+    // under CRATONVM_DBG_GC_STRESS, leaving System.in without its fd and the
+    // stale ref cached in `shared.system_in`). `native_pin_roots` is scanned
+    // as a root AND remapped in place by every collection, so re-reading the
+    // pin after the window yields the object's current address.
+    let pin_base = thread.native_pin_roots.len();
+    thread.native_pin_roots.push(in_obj);
 
     // Build a real `FileDescriptor` carrying fd=0 and pin it to the FIS's
     // `fd` slot. The `native_fis_read*` path resolves the fd via
     // `fis_fd_object` -> `FileDescriptor.fd`, so the descriptor's int `fd`
     // field carries the kernel handle.
-    let fd_class_id = shared.load_class_concurrent("java/io/FileDescriptor")?;
-    ensure_class_initialized_shared(shared, thread, fd_class_id)?;
-    let fd_num_fields = {
-        let cm = shared.class_manager.read();
-        cm.get_class(fd_class_id)
-            .map(|c| c.num_total_fields.max(2))
-            .unwrap_or(2)
+    //
+    // The fallible calls run through an explicit match (not `?`) so the pin
+    // pushed above is truncated on the error path too — a leaked pin entry
+    // would over-retain and unbalance `native_pin_roots` forever.
+    let fd_setup: Result<(ClassId, usize), MethodCallFailed> = (|| {
+        let fd_class_id = shared.load_class_concurrent("java/io/FileDescriptor")?;
+        ensure_class_initialized_shared(shared, thread, fd_class_id)?;
+        let fd_num_fields = {
+            let cm = shared.class_manager.read();
+            cm.get_class(fd_class_id)
+                .map(|c| c.num_total_fields.max(2))
+                .unwrap_or(2)
+        };
+        Ok((fd_class_id, fd_num_fields))
+    })();
+    let (fd_class_id, fd_num_fields) = match fd_setup {
+        Ok(v) => v,
+        Err(e) => {
+            thread.native_pin_roots.truncate(pin_base);
+            return Err(e);
+        }
     };
     let fd_obj = shared.heap.alloc_object(fd_class_id, fd_num_fields);
+    // End of the allocating window: re-read the (possibly remapped) pin and
+    // release it. `fd_obj` was the last allocation, so it cannot go stale
+    // before the writes below.
+    let in_obj = thread.native_pin_roots[pin_base];
+    thread.native_pin_roots.truncate(pin_base);
     // Find the `fd` / `handle` field indices by name so we don't depend on
     // a hardcoded slot order. `fd` is an int (kernel fd, used on POSIX and
     // mirrored on Windows); `handle` is a long (Windows HANDLE), match the

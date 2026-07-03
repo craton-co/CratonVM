@@ -7,10 +7,12 @@ with hardware, OS load, JDK version, and VM configuration.
 
 ## QuickBench vs. HotSpot JDK 25 C2
 
-*Measured 2026-07-02 on Windows 11 against JDK 25.0.1 C2 and CratonVM code
-`b80c50b5`. Ratio = CratonVM time / HotSpot time (lower is better; 1.00x is
-parity). The OSR column sets `CRATONVM_JIT_OSR=1` and
-`CRATONVM_JIT_THRESHOLD=1`.*
+*Measured on Windows 11 against JDK 25.0.1 C2 and CratonVM release builds.
+QuickBench rows are from CratonVM code `b80c50b5` on 2026-07-02. The Binary
+Trees CratonVM columns were rechecked on 2026-07-03 at `8292ec9c`, using the
+same 681 ms HotSpot baseline from the 2026-07-02 JDK run. Ratio = CratonVM time
+/ HotSpot time (lower is better; 1.00x is parity). The OSR column sets
+`CRATONVM_JIT_OSR=1` and `CRATONVM_JIT_THRESHOLD=1`.*
 
 | Benchmark                 | JDK 25 C2    | CratonVM default | Default ratio | CratonVM OSR, threshold=1 | OSR ratio |
 |---------------------------|--------------|------------------|---------------|---------------------------|-----------|
@@ -19,7 +21,7 @@ parity). The OSR column sets `CRATONVM_JIT_OSR=1` and
 | Sieve (100K x 500 reps)   | 358 ms       | 31,665 ms        | 88.4x         | 466 ms                    | 1.30x     |
 | Matrix 500x500 multiply   | 336 ms       | 39,078 ms        | 116.3x        | 452 ms                    | 1.35x     |
 | **QuickBench TOTAL**      | **3,756 ms** | **173,532 ms**   | **46.2x**     | **30,977 ms**             | **8.25x** |
-| Binary Trees (depth = 18) | 681 ms       | 19,737 ms        | 29.0x         | 36,665 ms                 | 53.8x     |
+| Binary Trees (depth = 18) | 681 ms       | 36,525 ms        | 53.6x         | 36,983 ms                 | 54.3x     |
 
 **Reading the results:**
 

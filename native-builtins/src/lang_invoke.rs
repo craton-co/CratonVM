@@ -1404,6 +1404,16 @@ fn segment_raw_access(
         .class_name_of_id(ctx.class_id_of_object(seg))
         .unwrap_or_default();
     let (base, base_off) = if class_name.contains("Heap") {
+        // `HeapMemorySegmentImpl.offset` is `Unsafe`-style: it carries
+        // `Unsafe.arrayBaseOffset(elementType)` baked in (CratonVM's Unsafe
+        // reports 16 for every array type — see the `ABASE` constants in
+        // lib.rs/phases_early.rs), so a fresh full-array segment's `offset`
+        // is 16, not 0. `segment_heap_get`/`segment_heap_set` below use this
+        // value directly as a 0-based `ctx.get/set_array_element` index, so
+        // it must be un-biased here or every heap-segment access lands 16
+        // bytes past its intended target (silently corrupting data when
+        // still in-bounds, throwing when it overflows the backing array).
+        const ABASE: i64 = 16;
         let base_idx = ctx.resolve_field_index(HEAP_SEGMENT, "base");
         let off_idx = ctx.resolve_field_index(HEAP_SEGMENT, "offset");
         let base = match (base_idx, base_idx.map(|i| ctx.get_field(seg, i))) {
@@ -1412,7 +1422,7 @@ fn segment_raw_access(
         };
         let off = match off_idx {
             Some(i) => match ctx.get_field(seg, i) {
-                Value::Long(n) => n,
+                Value::Long(n) => n - ABASE,
                 _ => 0,
             },
             None => 0,

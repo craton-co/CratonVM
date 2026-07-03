@@ -25,6 +25,7 @@ pub use cratonvm_gc::vm_heap;
 pub mod gc;
 pub mod native_roots;
 pub mod roots;
+pub mod smuggled_longs;
 
 // Top-level re-exports for convenience.
 pub use cratonvm_gc::collector::GarbageCollector;
