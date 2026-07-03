@@ -1,47 +1,59 @@
-# Tomcat DoHead — rare main-vm array-helper boundary read (SIGSEGV, distinct from the GC-corruption family)
+# Tomcat DoHead — main-vm mark-phase boundary read (SIGSEGV) — ROOT-CAUSED + CLAMPED
 
-Status: **OPEN, rare (1/18 runs).** Observed once during the combined-binary
-validation of the DoHead GC fixes (2026-07-02, binary = dev@`11ca8abc` +
-`fix/dohead-sweep-freelist`, run `dhswcomb-7`). NOT the walk-desync /
-register-invisible-root family: zero GC warnings of any kind in the log, and
-the face reproduced on neither 12 pure-dev (`11ca8abc`) runs nor 18 runs of
-the Layer-2-only binary nor 18 unfixed-baseline runs (whose one crash was the
-classic garbage-base+0x18 worker-thread corruption face).
+Status: **crash face FIXED** (branch `fix/dohead-sweep-freelist` commit
+`8e64d9a5`, 2026-07-03); upstream corrupt-header producer still open (see
+Residual). Originally filed as a suspected "JIT-called array helper" fault;
+byte-exact disassembly of the crashed binary refuted that.
 
-## Signature
+## Root cause (disassembly-attributed, arithmetic exact)
 
-```
-EXCEPTION_ACCESS_VIOLATION (SIGSEGV) at pc RVA exe+0x20214C  (native helper, called from JIT)
-Faulting access: read at address 0x000000003E960000
-thread: "main-vm"
-rdi=0x3AE0D9B0  r14=0x000000000076A4C5  r13=0x45B  rbx=0x3AE0D928
-```
+The faulting pc (exe RVA `0x20214C`, `mov r15,[rdi+r14*8+0x28]`) is the
+reference-array arm of `for_each_ref_slot` inlined into the **young-mark BFS**
+of `sweep_young_non_moving` (gc/src/gen_heap.rs), reached from the JIT
+allocation slow path (alloc helper → collect_garbage → mark) — hence
+"main-vm", the JIT frames below, sub-test-startup timing, and ZERO GC warnings
+(the run died mid-mark; every garbage element read before the fault was
+silently absorbed by `mark_young`'s `in_young` rejection).
 
-Decode: fault address == `rdi + r14*8 + 0x28` **exactly** — an object-array
-element read (`base + index*8 + HEADER_SIZE`) inside a native helper, with
-index r14 = 7,775,429 (absurd; r13 = 1,115 nearby suggests the real bound).
-The read runs off the end of a mapped region (fault at the round boundary
-0x3E960000). Crash happened at sub-test 44 **startup** ("Starting
-ProtocolHandler http-nio-...auto-90"), not during stop-churn.
+A conservative-root/BFS candidate at `rdi=0x3AE0D9B0` had packed-pointer DATA
+where a header should be: it misparsed as `kind=Array, element_type=Reference,
+array_length=0x3AE0D928` — the low 32 bits of a heap address 136 bytes below
+the object (rbx in the dump). `mark_young`'s gate caps `array_length` only at
+`i32::MAX` (987M passes) and never cross-checks the claimed EXTENT against the
+arena; the scan then marched `(0x3E960000-0x3AE0D9B0-0x28)/8 = 0x76A4C5`
+elements (~59.3 MB) and crossed the mapped-region boundary at exactly
+`0x3E960000`. (The original doc's "r13=1115 is the real bound" guess was wrong
+— r13 was the mark-worklist length.)
 
-Repro/logs: `apps/tomcat/.suite/results/dhswcomb-7/real-jit/*.log.err`
-(same `-Xmx500m`/150 s idx-38 harness as the GC-corruption repro).
-Symbolization of the release PDB is line-tables-only (nearest-symbol garbage);
-a `profsym` build is needed to name exe+0x20214C / the JIT return sites
-(code bytes of three JIT frames are in the dump).
+## Fix (8e64d9a5)
 
-## Hypotheses (unverified)
+A real object's extent always fits inside the generation it was allocated
+from, so an out-of-extent header is definitionally corrupt. `mark_young`
+(young BFS gate) and `scan_object_for_old_refs` (old BFS) now compute
+`gen_object_total_size` and reject candidates whose extent leaves the
+generation — no mark, no scan (retention-safe). Rate-limited diagnostics dump
+the surrounding words + counter `SWEEP_BAD_EXTENT_HITS`, so any recurrence
+attributes the upstream producer face directly.
 
-- A JIT-called array/arraycopy-style helper fed a runaway index or a corrupt
-  array length (cf. `reference_jit_arraycopy_spill_aliasing`,
-  `reference_jit_lentable_regalloc_fastmath` families).
-- Incidence too low (1/48 across all hardened+devpure runs that day) for
-  black-box A/B; needs the symbolized helper name first.
+## Residual (open)
 
-## Next steps
+The WRITER of the corrupt bytes is unconfirmed. Most probable (synthesis of
+3-reader analysis): stale packed-pointer content in a reclaimed/reused young
+slot — the accepted Layer-1 register-invisibility residual — or the
+`try_alloc_young` publish→unlock→zero→late-header window (gen_heap.rs
+~5824-5832 / ~1170-1183). The extent clamp converts the whole face into a
+skipped root + log line regardless of producer. If `SWEEP_BAD_EXTENT_HITS`
+warnings appear in future runs, their hex context distinguishes the faces.
 
-1. Rebuild with `[profile.release] strip="none"`/`debug="line-tables-only"`
-   (or profsym) and symbolize exe+0x20214C, exe+0x1F394A, exe+0xBCBAB9.
-2. Once the helper is named, audit its index/length inputs for the
-   JIT-miscompile families above; check whether the 2026-07-02 dev drift
-   (types/value.rs, compact_value.rs, jit/tiered.rs) touched its operands.
+Related finding (SEPARATE, still live on dev): the `7e2f2f9d` provenance
+check's false-POSITIVE direction — never-evicted membership means a primitive
+`long` whose bits equal a once-recorded (possibly freed) address passes
+`object_ref_payload_is_known`, and the GC long-smuggle remap
+(vm/src/runtime/value_stack.rs ~1418-1450) then REWRITES the long's bits via
+the pointer map (silent value corruption; matches the observed wrong bt18
+checksum 68332204). The `10a1be37` bitmap fix addressed only the perf convoy
+and WIDENED false-positive acceptance to 64-byte granules. Needs its own fix
+(eviction on free/move, or exact side-structure, or opt-out of long remap —
+`longroot_strict`).
+
+Crash artifacts: `apps/tomcat/.suite/results/dhswcomb-7/real-jit/*.log.err`.
