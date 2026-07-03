@@ -1,9 +1,15 @@
 # JIT inline-alloc header corruption under Hibernate batch workloads (OOM) — OPEN
 
-**Status:** OPEN — root cause not isolated, only characterized.
+**Status:** OPEN — root cause not isolated, only characterized. Two candidate
+mechanisms have now been ruled out (see "Additional evidence" below).
 **Discovered:** 2026-07-03, while chasing HIB-CV-38 (see
 [`docs/internal/hibernate-bugs/HIB-CV-38-boolean-type-field-static-slot-corruption-FIXED.md`](../internal/hibernate-bugs/HIB-CV-38-boolean-type-field-static-slot-corruption-FIXED.md)
 for the unrelated bug that doc was originally filed for — that one is fixed).
+**Also the likely explanation for HIB-CV-39** (a `DynamicBatchFetchTest` SIGSEGV
+filed before the HIB-CV-38 fix landed): see
+[`docs/internal/hibernate-bugs/HIB-CV-39-dynamicbatchfetch-sigsegv-regression.md`](../internal/hibernate-bugs/HIB-CV-39-dynamicbatchfetch-sigsegv-regression.md)
+for the closure reasoning — with HIB-CV-38 fixed, the identical repro no longer
+SIGSEGVs and instead deterministically reproduces this bug.
 
 ## Symptom
 
@@ -45,22 +51,32 @@ directly — and `bintrees18` itself is checksummed correct
 (`docs/internal/gaps/gap-bintrees18-gc-throughput.md`).
 
 So this is a **different trigger of the same corruption family**, not a
-regression of the bintrees18 fix. Candidates not yet distinguished:
+regression of the bintrees18 fix. Candidates (see "Additional evidence" for
+which of these are now ruled out):
 
-1. A separate inline-allocation fast path (e.g. for arrays specifically —
-   `anewarray`/`newarray`, or the `compact_ref_fields` branch inside
-   `emit_inline_tlab_new` itself) that has an analogous
-   publish-before-initialize ordering bug not covered by the bintrees18 fix
-   (which was analyzed against plain 2-field `Node` objects, never arrays).
+1. ~~A separate inline-allocation fast path for arrays~~ — **RULED OUT
+   2026-07-03**: `newarray`/`anewarray` never had an inline TLAB path at all;
+   they unconditionally call the `jit_newarray`/`jit_anewarray_object` helpers
+   (confirmed by direct code read, `jit/src/x64.rs` ~23211-23385, opcodes
+   0xbc/0xbd). There is no array-specific inline fast path to be buggy.
 2. bintrees18 allocates one uniform object shape at high frequency; Hibernate's
    batch path allocates a heavy *mix* of shapes/sizes (Strings, JDBC parameter
    arrays, HashMap/collection backing arrays, entity instances) — possibly
    exposing a race that needs that heterogeneity (e.g. TLAB-boundary or
    GC-timing interaction the uniform-shape bintrees18 workload doesn't hit).
+   **Still open** — plain `new`'s inline path is ruled out too (see below), so
+   if this is timing/heterogeneity-driven the race must be in a different
+   component than the JIT inline-alloc codegen itself (e.g. the moving young
+   GC's copy/remap routine writing/reading a header on an unrelated object).
 3. `class_id=0` in most of the observed warnings is consistent with the
    walker genuinely reading a TLAB-zeroed header (the exact pre-fix
    bintrees18 signature) — suggesting the SAME race, just via a code path the
-   prior fix didn't reach, rather than a new mechanism.
+   prior fix didn't reach, rather than a new mechanism. **Partially narrowed**:
+   the corrupted `class_id`/`num_slots`/`array_length` values vary run-to-run
+   (0, 4, 2000, 786439952, ...) rather than being one fixed garbage pattern —
+   consistent with reading genuinely uninitialized/stale memory rather than a
+   single deterministic bad address, but the *source* of that stale read is
+   no longer the plain-`new` inline path (ruled out below).
 
 ## Repro
 
@@ -74,18 +90,72 @@ CRATONVM_DISABLE_DEFAULT_WATCHDOG=1 <cv> --java-home "C:/Program Files/Java/jdk-
 Needs a binary built with the HIB-CV-38 Boolean fix — without it, this run
 fails earlier at JUnit-launcher bootstrap before ever reaching `testMultiLoad`.
 
+## Additional evidence (2026-07-03, `investigate/hib-cv-39-dynamicbatchfetch-sigsegv` branch)
+
+Rebuilt `cratonvm-cli` from dev (post HIB-CV-38 merge, includes the `-XX:+UseG1GC`
+concurrent-marking fix too — not relevant here since G1 is opt-in and this repro
+doesn't pass `-XX:+UseG1GC`, so the default Generational/moving-young collector
+is what's under test, same as bintrees18). Three isolated single-class reruns of
+`DynamicBatchFetchTest` via `apps/hib-suite-runner`, `--java-home jdk-25`,
+`@common.args -Dcraton.batch=1`:
+
+1. **Baseline (JIT on, `--Xmx 1500m`)**: reproduced exactly as documented above —
+   `inconsistent header` warning storm (`class_id=786439952`, `num_slots=2`,
+   `array_length=2` this run) then `OutOfMemoryError` at `ms=553385`. **No
+   SIGSEGV.**
+2. **`CRATONVM_JIT_DISABLE_INLINE_NEW=1` (JIT still on, `--Xmx 1500m`)**: this
+   disables `emit_inline_tlab_new` entirely, forcing every plain `new` through
+   the `jit_new_object` helper — the exact toggle the "Next steps" list below
+   asked for, and the same toggle that isolated the bintrees18 fix. **Did NOT
+   suppress the corruption**: identical warning storm (`class_id=2000`,
+   `num_slots=1180939`), `OutOfMemoryError` at `ms=499794`. This rules out
+   `emit_inline_tlab_new` (both the base bump-pointer path and the
+   `compact_ref_fields` branch inside it) as the source — the race survives
+   with that inline path fully disabled.
+3. **Large heap (`--Xmx 6000m`, JIT on, inline-`new` enabled)**: corruption
+   warnings still occur (`class_id=0/4/4`, various `num_slots`/`array_length`),
+   so a big heap does **not** cleanly suppress this the way it suppressed
+   HIB-CV-37's SIGSEGV and the `type.temporal.*` cluster's crash. Instead the
+   run limps through both test methods for ~20 minutes (`ms=1194268`) before
+   failing differently: transient H2 DDL/transaction errors ("An old
+   transaction with the same id is still open", "Index PRIMARY_KEY_ not
+   found" — H2 here is in-process/in-memory per run, so this isn't
+   cross-process stale disk state; more likely downstream fallout of the same
+   header corruption confusing JDBC/schema-management bookkeeping rather than
+   a distinct bug) and finally `testMultiLoad` hitting JUnit's plain 120s
+   `@Timeout` despite JIT being on — i.e. a big heap changes the *terminal*
+   symptom but does not stop the underlying corruption from happening.
+
+**Net effect on the "Candidates" list above**: candidate 1 (array-specific
+inline path) is definitively false — no such path exists. Candidate 2's most
+obvious culprit (`emit_inline_tlab_new`'s per-object-shape codegen) is now also
+ruled out by evidence 2. The corruption is real and reproducible 3/3, but its
+locus is narrower than originally scoped: **not** the array codegen, **not**
+the plain-`new` inline-TLAB codegen. Remaining candidates: the shared
+allocation helpers themselves (`jit_new_object`/`jit_newarray`/
+`jit_anewarray_object`, wherever they live in `vm`/`gc`), or the moving young
+GC's copy/remap routine writing a stale/short header onto an object it
+relocates (which would explain corruption appearing regardless of which JIT
+codegen path allocated the object in the first place).
+
 ## Next steps
 
-- Check whether array allocation (`anewarray`/`newarray`) has its own inline
-  TLAB fast path distinct from `emit_inline_tlab_new`, or whether it always
-  falls through to a helper — if the latter, look at the `compact_ref_fields`
-  branch inside `emit_inline_tlab_new` for the same header-vs-commit ordering
-  bug bintrees18 had.
-- A larger `-Xmx` (per the HIB-CV-37 truth table pattern, where a big heap
-  suppressed a similar symptom) would help distinguish "genuine leak from
-  abandoned arena regions" vs. "this workload's live set is just larger than
-  1500m" — not yet tried.
-- `CRATONVM_JIT_DISABLE_INLINE_NEW=1` (the exact toggle that isolated BUG 1 in
-  the bintrees18 doc) on this repro would confirm/deny inline-`new` as the
-  source without fully disabling JIT (which also disables inline arrays, if
-  those are a separate path) — not yet tried.
+- ~~Check whether array allocation has its own inline TLAB fast path~~ — done,
+  it doesn't (see above).
+- ~~Try `CRATONVM_JIT_DISABLE_INLINE_NEW=1`~~ — done; does not suppress (see
+  above). Stop looking at `emit_inline_tlab_new` for this bug.
+- ~~Try a larger `-Xmx`~~ — done; does not cleanly suppress, just delays and
+  changes the terminal symptom (see above).
+- Since neither inline-alloc codegen path is the source, look at the **moving
+  young GC's object-copy/relocation code** (`gc/src/gen_heap.rs`) for a
+  header-write ordering or size-computation bug on the *copy* side (as
+  opposed to the *allocation* side already ruled out) — e.g. does the Cheney
+  copy routine write the new copy's header fields in a safe order, and does it
+  use the correct size class for a copied object of mixed/heterogeneous shape?
+- Try `--nojit` with the large heap too (not yet tried in combination) to
+  confirm the corruption is still JIT-gated even when the terminal symptom
+  changes with heap size.
+- A repro that isolates `testDynamicBatchFetch`/`testMultiLoad` into separate
+  single-method runs (rather than the whole class) would help tell whether the
+  corruption is triggered by the first test's setup (2 rows) or specifically
+  by `testMultiLoad`'s 2000-row batch.
