@@ -1,15 +1,22 @@
-# GC_STRESS — concurrent old-gen collection races (Fork6Hard lane)
+# GC_STRESS — concurrent old-gen collection races (Fork6Hard lane) — FIXED
 
-**Status:** 🟡 PARTIAL. Three unambiguous live-object-freeing defects in the
-concurrent old-gen mark/sweep are FIXED on
-`fix/oldgen-concurrent-mark-races-20260703` (commit `57f545be`, worktree
-`CratonVM-oldgc-20260703`, binary `cvmp-oldgc-20260703.exe`, based on dev
-`bdca89db`). The aggressive `CRATONVM_DBG_GC_STRESS` lane is improved but not
-green: residual corruption with at least two *distinct* signatures remains
-(see "Residual faces"). Split out of
-[fork6-fjp-multithread-jit-root-reclamation.md](fork6-fjp-multithread-jit-root-reclamation.md)
+**Status:** ✅ **FIXED on dev** (merged from `fix/oldgen-concurrent-mark-races-20260703`,
+commit `57f545be`). Three unambiguous live-object-freeing defects in the
+concurrent old-gen mark/sweep, described below, are fixed and unit-tested.
+Moved to `docs/internal/` per the known-issues triage rule: the *primary*
+defects this doc investigated are resolved. A **residual** — different
+corruption signatures the fix does not touch — remains open and is tracked
+separately at
+[../known-issues/gcstress-residual-corruption-faces.md](../known-issues/gcstress-residual-corruption-faces.md).
+Do not re-investigate the three defects below; they are closed.
+
+Split out of
+[fork6-fjp-multithread-jit-root-reclamation.md](../known-issues/fork6-fjp-multithread-jit-root-reclamation.md)
 (2026-07-02 section), which established this family is JIT-free — it
 reproduces under `--nojit` and with `any_thread_in_jit=false` at every STW.
+The GC_STRESS lane failures previously attributed to fork6-fjp's A4 (register-
+only JIT root residual) were NOT A4 — that mis-scoping is corrected in the A4
+doc and in `docs/known-issues/README.md`.
 
 ## Repro
 
