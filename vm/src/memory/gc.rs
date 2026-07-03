@@ -38,6 +38,13 @@ pub fn update_all_roots(
     // the cache rather than forcing a full rebuild. Opt-in/default-OFF + no-op
     // unless the rootsnap cache is enabled. See `remap_rs_cache_after_gc`.
     crate::runtime::interpreter::remap_rs_cache_after_gc(thread, pointer_map, &shared.heap);
+    // Long-smuggle mint registry: relocate registered handles through this
+    // cycle's pointer map and drop entries whose referent died. BEFORE the
+    // empty-map early return so non-relocating sweeps still sweep dead
+    // entries (a reclaimed address must not stay registered — a future
+    // primitive long colliding with the reused address would otherwise pass
+    // the rewrite gate).
+    crate::memory::smuggled_longs::remap_and_sweep(pointer_map, &shared.heap);
     if pointer_map.is_empty() {
         return;
     }
