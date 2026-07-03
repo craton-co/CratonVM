@@ -2264,27 +2264,29 @@ fn s_instantiation_strategy_instantiate(
         _ => return Ok(Some(Value::Object(None))),
     };
 
-    // Read the `beanClass` field directly. Spring uses `Object beanClass`
-    // which is either a `Class<?>` (resolved) or a `String` (unresolved
-    // bean class name) — exactly the union our getBeanClass intercept
-    // sees.
-    let bean_class_field = ctx.get_field_by_name(mbd, "beanClass");
-    let mirror = match bean_class_field {
-        Value::Object(Some(o)) => o,
-        // null beanClass — no class was ever specified on the definition (no
-        // class name either, otherwise the field would hold the String name).
-        // Real Spring's `SimpleInstantiationStrategy.instantiate` calls
+    // Resolve via `resolve_bean_class_field` directly (dot-vs-dollar
+    // nested-class retry included) rather than only reading the raw
+    // `beanClass` field — this used to assume an EARLIER `resolveBeanClass()`/
+    // `getBeanClass()` call had already resolved and cached a String class
+    // name into a Class mirror before `instantiate()` ever runs, but for some
+    // XML-defined beans (e.g. `DestroyMethodInferenceTests-context.xml`'s
+    // `x8`, `Spr16022Tests`' `bean1`) that earlier call never happens on this
+    // exact `mbd`, so a resolvable-but-still-String (or not-yet-attempted)
+    // class permanently read as "no class specified". Attempting resolution
+    // HERE, right before the only consumer that needs the actual Class,
+    // guarantees correctness regardless of what ran earlier.
+    let mirror = match resolve_bean_class_field(ctx, mbd) {
+        BeanClassResolution::Resolved(m) => m,
+        // No class name at all — genuinely "no class specified". Real
+        // Spring's `SimpleInstantiationStrategy.instantiate` calls
         // `bd.getBeanClass()`, which throws
         // `IllegalStateException("No bean class specified on bean definition")`
         // for exactly this case; `instantiateBean` then wraps it as the
         // BeanCreationException whose root cause is that ISE
         // (DefaultListableBeanFactoryTests / {Autowired,Inject}AnnotationBean
         // PostProcessorTests.incompleteBeanDefinition). Returning null instead
-        // surfaced a misleading IllegalArgumentException downstream. Orphaned
-        // /unresolved beans carry a String class NAME in `beanClass` (handled
-        // by the `mirror_cn != "java/lang/Class"` branch below), so this null
-        // case is genuinely "no class specified".
-        _ => {
+        // surfaced a misleading IllegalArgumentException downstream.
+        BeanClassResolution::NoClass => {
             tracing::debug!(
                 "[spring-shim] SimpleInstantiationStrategy.instantiate: null beanClass, throwing ISE"
             );
@@ -2293,19 +2295,15 @@ fn s_instantiation_strategy_instantiate(
             }
             .into());
         }
+        // Named but genuinely unresolvable (not on the classpath) — return
+        // null, matching the prior "String not yet resolved — skip" behavior.
+        BeanClassResolution::Missing => {
+            tracing::debug!(
+                "[spring-shim] SimpleInstantiationStrategy.instantiate: beanClass unresolvable — skipping"
+            );
+            return Ok(Some(Value::Object(None)));
+        }
     };
-
-    // Verify it's actually a java/lang/Class mirror; if it's a String
-    // (bean class name still unresolved), return null.
-    let mirror_cid = ctx.class_id_of_object(mirror);
-    let mirror_cn = ctx.class_name_of_id(mirror_cid).unwrap_or_default();
-    if mirror_cn != "java/lang/Class" {
-        tracing::debug!(
-            "[spring-shim] SimpleInstantiationStrategy.instantiate: beanClass is `{}`, not java/lang/Class — skipping",
-            mirror_cn
-        );
-        return Ok(Some(Value::Object(None)));
-    }
 
     // Real Class mirror — resolve internal name and instantiate via
     // no-arg constructor. The vast majority of Spring beans Spring
