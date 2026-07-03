@@ -43269,6 +43269,60 @@ fn native_proxy_dispatch_invoke(ctx: &mut dyn NativeContext, args: &[Value]) -> 
             Value::Object(Some(s)) => ctx.read_string(s).unwrap_or_default(),
             _ => String::new(),
         };
+        // Object-inherited methods: `ctx.invoke("AnnotationProxy", mname, ...)`
+        // below does not reliably resolve these (the by-name path used by this
+        // 2nd call site doesn't reach `annotation_proxy_dispatch_impl`'s
+        // hashCode/equals/toString/getClass arms — only the primary
+        // interpreter dispatch hook does), so compute them directly instead.
+        // See `lang_class::ctx_annotation_proxy_*` for the rationale.
+        match mname.as_str() {
+            "hashCode" => {
+                // invokeProxy's return type is `Object` — the generated body does
+                // `CHECKCAST Integer; Integer.intValue()`, so the result must be a
+                // real boxed Integer, not a raw `Value::Int` (which isn't a valid
+                // object reference and CHECKCAST/unbox turns into null).
+                let hash = crate::lang_class::ctx_annotation_proxy_hash_code(ctx, handler);
+                return Ok(Some(crate::lang_class::box_value(ctx, Value::Int(hash), "I")));
+            }
+            "equals" => {
+                let mut other = match args_arr {
+                    Some(arr) if ctx.array_length(arr) > 0 => ctx.get_array_element(arr, 0),
+                    _ => Value::Object(None),
+                };
+                // Under CRATONVM_REAL_ANNOTATIONS every annotation is a real
+                // `$ProxyN`, so the `other` argument is typically ALSO a real
+                // proxy (not a bare AnnotationProxy) — unwrap it to its
+                // AnnotationProxy handler (slot 0) before comparing, mirroring
+                // `proxy_invoke_handler_shared`'s equals-argument unwrap in
+                // vm_exec.rs. Without this every same-type comparison between
+                // two real-proxied annotations spuriously compares unequal.
+                if let Value::Object(Some(other_obj)) = other {
+                    if crate::lang_class::ctx_class_name_of(ctx, other_obj)
+                        != "java/lang/annotation/AnnotationProxy"
+                    {
+                        if let Value::Object(Some(other_handler)) = ctx.get_field(other_obj, 0) {
+                            if crate::lang_class::ctx_class_name_of(ctx, other_handler)
+                                == "java/lang/annotation/AnnotationProxy"
+                            {
+                                other = Value::Object(Some(other_handler));
+                            }
+                        }
+                    }
+                }
+                let eq = crate::lang_class::ctx_annotation_proxy_equals(ctx, handler, other);
+                let flag = Value::Int(if eq { 1 } else { 0 });
+                return Ok(Some(crate::lang_class::box_value(ctx, flag, "Z")));
+            }
+            "toString" => {
+                let s = crate::lang_class::ctx_annotation_proxy_to_string(ctx, handler);
+                let result = ctx.create_string(&s);
+                return Ok(Some(Value::Object(Some(result))));
+            }
+            "getClass" => {
+                return Ok(Some(ctx.get_field(handler, crate::lang_class::ANN_PROXY_TYPE_MIRROR)));
+            }
+            _ => {}
+        }
         if !mname.is_empty() {
             let mut ann_args = vec![Value::Object(Some(handler))];
             if let Some(arr) = args_arr {
