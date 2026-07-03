@@ -1,14 +1,20 @@
 # G1 parallel evacuator drops a root-referenced object (persistent `forwarding_ptr` vs per-cycle `pointer_map`)
 
-**Status:** 🟡 PARTIALLY FIXED. The DOMINANT bug (this doc's persistent-
-`forwarding_ptr` root-remap flaw, deterministic ~12.5% on the repro) is **FIXED**
-(see "Fix" below; `SteadyChurn @16m` ~12.5%→0 via the verifier's LOST check, no
-regression on `binarytrees16`/`PromoteMixed` serial+parallel vs HotSpot). A
-SEPARATE, rarer **concurrency race** remains 🔴 OPEN (~5%, timing-sensitive,
-invisible to the post-collection verifier) — see "Residual". Still blocks
-parallel-evac-default-on / the G1 default flip (Step 9/10 of
-`docs/feature-designs/concurrent-gc-maturation.md`). The `task_58d60f7a` family
-turned out to be TWO stacked bugs.
+**Status:** 🟢 FIXED (both bugs), soak-verified 2026-07-03. The DOMINANT bug
+(persistent-`forwarding_ptr` root-remap, deterministic ~12.5% on the repro)
+was fixed first (see "Fix" below). The residual **concurrency race** (~5%,
+timing-sensitive) no longer reproduces after the deferred-self-forward-scan
+restructure plus the 2026-07-03 change set: **80/80 parallel-evac runs clean
+at `-Xmx16m --nojit` 2M iterations** (40× `SteadyChurnLight` — the original
+bug note's no-promotion shape — and 40× the heavier `SteadyChurn` recreation;
+plus 10/10 serial each; `binarytrees 16 @64m` byte-identical to HotSpot
+serial+parallel; gc crate 749/749). See "2026-07-03" below for the FIVE
+additional serial-G1 defects that had been masking this validation.
+Parallel-evac default-on / the G1 default flip (Step 9/10 of
+`docs/feature-designs/concurrent-gc-maturation.md`) is now gated only on the
+two REMAINING OPEN follow-ups listed at the end (concurrent-mark liveness
+audit; interpreter root-liveness imprecision), not on this race.
+The `task_58d60f7a` family turned out to be TWO stacked bugs.
 
 **Scope:** opt-in only (`CRATONVM_G1_PARALLEL_EVAC=1`). The DEFAULT (serial) G1
 and Generational are unaffected. Mixed GC is kept on the serial evacuator
@@ -267,10 +273,29 @@ failure drain).
 the original's no-promotion shape — see its header comment) print the correct
 `2002062093760` at `-Xmx16m` for 2M iterations, serial and parallel;
 `binarytrees 16 @64m` is byte-identical to HotSpot serial + parallel; gc crate
-749/749 tests. Parallel/serial soak results are recorded below as they
-complete.
+749/749 tests.
 
-Parallel evac stays **opt-in/experimental** and mixed stays serial until the
-residual-race soak evidence is in and the marking-soundness follow-up is
-resolved. Default G1 (serial) and Generational are unaffected by the residual
-race; the serial-path fixes above apply to default G1.
+**Soak results (2026-07-03, Linux probe host, 2M iterations @16m --nojit):**
+
+| suite                         | result      |
+|-------------------------------|-------------|
+| parallel `SteadyChurnLight`   | 40/40 clean |
+| parallel `SteadyChurn` (heavy)| 40/40 clean |
+| serial `SteadyChurnLight`     | 10/10 clean |
+| serial `SteadyChurn` (heavy)  | 10/10 clean |
+
+The residual race (previously ~2/40 post-dominant-fix) did not reproduce in
+80 parallel runs. This known issue's two bugs are considered FIXED.
+
+Remaining OPEN follow-ups (separate issues, tracked in the 2026-07-03 section
+above; they gate the parallel-default flip, not this race):
+
+1. Concurrent-mark liveness under moving young collections (cleanup's
+   in-place Old-region free stays disabled as containment until audited).
+2. Interpreter root liveness imprecision (scoped-out local slots retain their
+   last referent for the frame's lifetime — unbounded retention on linked
+   structures; both repros are written temp-free to sidestep it).
+
+Parallel evac stays **opt-in/experimental** and mixed stays serial until
+those two are resolved. Default G1 (serial) and Generational benefit from the
+serial-path fixes above.
