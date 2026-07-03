@@ -66,10 +66,13 @@ fn init_wrapper_type(
     wrapper_name: &str,
     primitive_name: &str,
 ) -> MethodCallResult {
+    // Resolve the TYPE field BY NAME rather than assuming static index 0:
+    // most of these wrappers declare TYPE as their only reference-typed
+    // static field, but java.lang.Boolean declares TRUE and FALSE ahead of
+    // it (see `clinit_boolean_type`), so a hardcoded index 0 would silently
+    // clobber the wrong field on any wrapper whose layout isn't TYPE-only.
     let mirror = ctx.primitive_class_mirror(primitive_name);
-    if let Some(class_id) = ctx.class_id_by_name(wrapper_name) {
-        ctx.set_static_field(class_id, 0, Value::Object(Some(mirror)));
-    }
+    ctx.set_static_field_by_name(wrapper_name, "TYPE", Value::Object(Some(mirror)));
     Ok(None)
 }
 
@@ -90,6 +93,26 @@ fn clinit_double_type(ctx: &mut dyn NativeContext, _: &[Value]) -> MethodCallRes
 }
 
 fn clinit_boolean_type(ctx: &mut dyn NativeContext, _: &[Value]) -> MethodCallResult {
+    // Unlike the other primitive wrappers, java.lang.Boolean's real <clinit>
+    // (`TRUE = new Boolean(true); FALSE = new Boolean(false); TYPE = ...;`)
+    // also has to populate TRUE/FALSE, so it can't just delegate to
+    // `init_wrapper_type`. Construct real Boolean instances via the actual
+    // `Boolean(boolean)` constructor so `TRUE`/`FALSE` behave like genuine
+    // objects (identity, instanceof, etc.), matching HotSpot.
+    if let Some(Value::Object(Some(true_obj))) =
+        ctx.new_object_initialized("java/lang/Boolean", "(Z)V", &[Value::Int(1)])?
+    {
+        ctx.set_static_field_by_name("java/lang/Boolean", "TRUE", Value::Object(Some(true_obj)));
+    }
+    if let Some(Value::Object(Some(false_obj))) =
+        ctx.new_object_initialized("java/lang/Boolean", "(Z)V", &[Value::Int(0)])?
+    {
+        ctx.set_static_field_by_name(
+            "java/lang/Boolean",
+            "FALSE",
+            Value::Object(Some(false_obj)),
+        );
+    }
     init_wrapper_type(ctx, "java/lang/Boolean", "boolean")
 }
 
