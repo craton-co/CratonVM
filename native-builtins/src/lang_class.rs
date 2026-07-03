@@ -11194,21 +11194,54 @@ pub(crate) fn native_class_get_package_name(
 //
 // We synthesise a `java.lang.Package` object with:
 //   * `name` — the dotted package name (e.g. `org.keycloak.common`).
-//   * `implementationTitle` — the manifest's `Implementation-Title`, or null.
-//   * `implementationVersion` — the manifest's `Implementation-Version`,
-//     or null when the class is not jar-loaded.
-//   * `specificationTitle/Version/Vendor` — the matching `Specification-*`
-//     attributes (often unset on modern jars; we surface null in that case).
+//   * `implementationTitle`/`implementationVersion`/`specificationTitle`/
+//     `specificationVersion`/`specificationVendor`/`implementationVendor` —
+//     read from the manifest, best-effort (see caveat below).
 //
 // The lookup is best-effort: if the class is loaded from the boot classpath
 // (no manifest) or from a directory, we return a Package with name set and
 // every other field null. That matches HotSpot, which always returns a
 // non-null Package for a named class even when the manifest is missing.
 //
-// Layout: real-JDK `java.lang.Package` extends `java.lang.NamedPackage`;
-// we write fields by name to insulate from layout drift, and additionally
-// keep slot 0 (the synthetic-mode "name" slot) populated for
-// pre-class-loaded paths.
+// Layout: real-JDK `java.lang.Package` extends `java.lang.NamedPackage`
+// (fields `name`, `module`) and itself declares only `versionInfo`
+// (`Package$VersionInfo`, bundling specTitle/specVersion/specVendor/
+// implTitle/implVersion/implVendor/sealBase) and `packageInfo` (`Class<?>`,
+// the cached `<pkg>.package-info` lookup). There is NO direct `specTitle` /
+// `implVersion` / etc. field on `Package` itself in JDK 9+ — those manifest
+// attributes live inside the nested `VersionInfo` record.
+//
+// We therefore write fields ONLY by name, never by raw slot index (past
+// slot 0, which happens to be `name` in both the synthetic-mode and
+// real-JDK layouts). A prior version of this function also wrote the
+// manifest attributes by raw index (1..6), on the mistaken assumption
+// that `Package` declares six flat manifest fields at those slots. Under
+// the real JDK 25 layout those indices are actually `module` (1),
+// `versionInfo` (2), and `packageInfo` (3) — the index-3 write silently
+// overwrote `packageInfo` with a `String` (the `Specification-Vendor`
+// manifest value, whenever a jar's manifest set one), which is not a
+// `Class`. Real `Package.getAnnotation()`/`isAnnotationPresent()` bytecode
+// treats `packageInfo` as a `Class<?>` receiver unconditionally once it is
+// non-null (`getPackageInfo()`'s lazy-load only fires when the field is
+// still null) — so `pkg.getAnnotation(X)` on any such Package dispatched
+// `getAnnotation` on a `String` receiver, throwing `NoSuchMethodError:
+// java/lang/String.getAnnotation`. This is exactly what tripped up
+// Arquillian's `EventTestRunnerAdaptor` bootstrap (MOXy JAXB asks
+// `Package.isAnnotationPresent(XmlSchema.class)` on classes from
+// JBoss-vendored jars whose manifests set `Specification-Vendor`). See
+// `docs/known-issues/keycloak-arquillian-package-getannotation-string-linkage.md`.
+//
+// Consequence of writing by name only: since `Package` has no flat
+// `specTitle`/etc. fields to target by name, `getSpecificationTitle()` and
+// friends currently surface null even when the manifest has real values
+// (rather than crashing, which is what the raw-index write did). Properly
+// populating them would require constructing a real `Package$VersionInfo`
+// via its private `getInstance(...)` factory, which needs a static-invoke
+// capability this native layer doesn't currently expose — left as a
+// follow-up. We do wire `versionInfo` to the `NULL_VERSION_INFO` sentinel
+// (matching the real 2-arg `Package(String, Module)` constructor) so that
+// sentinel, not a raw null, backs `getSpecificationTitle()` / `isSealed()`
+// / etc. — avoiding a NullPointerException in their place.
 // ---------------------------------------------------------------------------
 
 /// Read a manifest attribute by name from the class's source jar, if any.
@@ -11450,26 +11483,50 @@ pub(crate) fn native_class_get_package(
         };
     let pkg = alloc_concurrent_synthetic(ctx, "java/lang/Package", 12);
     // Slot 0: name (synthetic-mode layout used by `getPackageName`/`getName`
-    // shims pre-real-class-load). Same write goes by-name for real JDK.
+    // shims pre-real-class-load). Also happens to be `NamedPackage.name`'s
+    // real slot, so the by-index write is harmless there; every other field
+    // below is by-name ONLY — see the raw-index corruption note above.
     let name_str = ctx.create_string(&pkg_name);
     ctx.set_field(pkg, 0, Value::Object(Some(name_str)));
     ctx.set_field_by_name(pkg, "name", Value::Object(Some(name_str)));
-    // Manifest-derived attributes.
-    let write_optional =
-        |ctx: &mut dyn NativeContext, slot: usize, field: &str, val: Option<String>| {
-            let obj = match val {
-                Some(s) => Value::Object(Some(ctx.create_string(&s))),
-                None => Value::Object(None),
-            };
-            ctx.set_field(pkg, slot, obj);
-            ctx.set_field_by_name(pkg, field, obj);
+    // Manifest-derived attributes. NOT written by raw slot index (see the
+    // function-level comment above) — `Package` has no flat `specTitle` /
+    // `implVersion` / etc. fields in real JDK 9+, so these by-name writes
+    // currently no-op for a real-class Package (tracked as a follow-up);
+    // what matters here is that they can never clobber `module` /
+    // `versionInfo` / `packageInfo` the way the old by-index writes did.
+    let write_optional = |ctx: &mut dyn NativeContext, field: &str, val: Option<String>| {
+        let obj = match val {
+            Some(s) => Value::Object(Some(ctx.create_string(&s))),
+            None => Value::Object(None),
         };
-    write_optional(ctx, 1, "specTitle", spec_title);
-    write_optional(ctx, 2, "specVersion", spec_version);
-    write_optional(ctx, 3, "specVendor", spec_vendor);
-    write_optional(ctx, 4, "implTitle", impl_title);
-    write_optional(ctx, 5, "implVersion", impl_version);
-    write_optional(ctx, 6, "implVendor", impl_vendor);
+        ctx.set_field_by_name(pkg, field, obj);
+    };
+    write_optional(ctx, "specTitle", spec_title);
+    write_optional(ctx, "specVersion", spec_version);
+    write_optional(ctx, "specVendor", spec_vendor);
+    write_optional(ctx, "implTitle", impl_title);
+    write_optional(ctx, "implVersion", impl_version);
+    write_optional(ctx, "implVendor", impl_vendor);
+    // Wire `versionInfo` to the real `Package$VersionInfo.NULL_VERSION_INFO`
+    // sentinel, matching what the real `Package(String, Module)` constructor
+    // does unconditionally (`javap -c` confirms `getstatic
+    // Package$VersionInfo.NULL_VERSION_INFO; putfield versionInfo`). Without
+    // this, `versionInfo` stays null on our hand-built object and
+    // `getSpecificationTitle()` / `isSealed()` / etc. (which all deref
+    // `versionInfo` unconditionally) throw NullPointerException instead of
+    // HotSpot's null/false. Best-effort: if `Package$VersionInfo` can't be
+    // resolved (e.g. pure synthetic-JDK mode with no real `java.lang.Package`
+    // on the classpath), leave `versionInfo` unset — real bytecode isn't
+    // running against this object in that mode anyway.
+    if let Ok(vi_cid) = ctx.ensure_class_initialized("java/lang/Package$VersionInfo") {
+        if let Some(idx) = ctx.static_field_index_by_name(vi_cid, "NULL_VERSION_INFO") {
+            let null_version_info = ctx.get_static_field(vi_cid, idx);
+            if matches!(null_version_info, Value::Object(Some(_))) {
+                ctx.set_field_by_name(pkg, "versionInfo", null_version_info);
+            }
+        }
+    }
     // Wire the Package's `module` from the class's own module so the *real*
     // `Package.getDeclaredAnnotations()` bytecode works. That JDK body does
     // `packageInfo()` -> `module().getClassLoader()`; with a null module it
@@ -11664,21 +11721,33 @@ pub(crate) fn i2_classloader_define_package_class(
             (None, None, None, None, None, None)
         };
     let pkg = i2_alloc_synthetic_package(ctx, &pkg_name);
-    let write_optional =
-        |ctx: &mut dyn NativeContext, slot: usize, field: &str, val: Option<String>| {
-            let obj = match val {
-                Some(s) => Value::Object(Some(ctx.create_string(&s))),
-                None => Value::Object(None),
-            };
-            ctx.set_field(pkg, slot, obj);
-            ctx.set_field_by_name(pkg, field, obj);
+    // By-name only — NOT by raw slot index. See the corruption note on
+    // `native_class_get_package` above: real JDK 9+ `Package` has no flat
+    // `specTitle`/etc. fields at slots 1-6 (those live inside the nested
+    // `versionInfo` object; slots 1-3 are actually `module`/`versionInfo`/
+    // `packageInfo`), so a by-index write here clobbers them exactly like
+    // the `native_class_get_package` bug did.
+    let write_optional = |ctx: &mut dyn NativeContext, field: &str, val: Option<String>| {
+        let obj = match val {
+            Some(s) => Value::Object(Some(ctx.create_string(&s))),
+            None => Value::Object(None),
         };
-    write_optional(ctx, 1, "specTitle", spec_title);
-    write_optional(ctx, 2, "specVersion", spec_version);
-    write_optional(ctx, 3, "specVendor", spec_vendor);
-    write_optional(ctx, 4, "implTitle", impl_title);
-    write_optional(ctx, 5, "implVersion", impl_version);
-    write_optional(ctx, 6, "implVendor", impl_vendor);
+        ctx.set_field_by_name(pkg, field, obj);
+    };
+    write_optional(ctx, "specTitle", spec_title);
+    write_optional(ctx, "specVersion", spec_version);
+    write_optional(ctx, "specVendor", spec_vendor);
+    write_optional(ctx, "implTitle", impl_title);
+    write_optional(ctx, "implVersion", impl_version);
+    write_optional(ctx, "implVendor", impl_vendor);
+    if let Ok(vi_cid) = ctx.ensure_class_initialized("java/lang/Package$VersionInfo") {
+        if let Some(idx) = ctx.static_field_index_by_name(vi_cid, "NULL_VERSION_INFO") {
+            let null_version_info = ctx.get_static_field(vi_cid, idx);
+            if matches!(null_version_info, Value::Object(Some(_))) {
+                ctx.set_field_by_name(pkg, "versionInfo", null_version_info);
+            }
+        }
+    }
     Ok(Some(Value::Object(Some(pkg))))
 }
 
@@ -14971,6 +15040,45 @@ mod tests {
         mirror
     }
 
+    /// Writes a real jar (unique per `label`) whose `META-INF/MANIFEST.MF`
+    /// sets all six `Specification-*`/`Implementation-*` attributes —
+    /// mirroring the JBoss-vendored jars (`Specification-Vendor: JBoss by
+    /// Red Hat`) that tripped the Package-field-corruption bug — and
+    /// returns the jar's path. Used by the regression tests below.
+    fn t19_h10_write_vendored_test_jar(label: &str) -> std::path::PathBuf {
+        use std::io::Write as _;
+        let dir = std::env::temp_dir().join(format!(
+            "cratonvm-t19h10-vendored-jar-{}-{}-{label}",
+            std::process::id(),
+            VENDORED_JAR_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        ));
+        let _ = std::fs::create_dir_all(&dir);
+        let jar_path = dir.join("vendored.jar");
+        let f = std::fs::File::create(&jar_path).unwrap();
+        let mut zw = zip::ZipWriter::new(f);
+        let opts = zip::write::SimpleFileOptions::default()
+            .compression_method(zip::CompressionMethod::Stored);
+        zw.start_file("com/example/vendored/Foo.class", opts)
+            .unwrap();
+        zw.write_all(b"\xCA\xFE\xBA\xBE").unwrap();
+        zw.start_file("META-INF/MANIFEST.MF", opts).unwrap();
+        zw.write_all(
+            "Manifest-Version: 1.0\r\n\
+             Specification-Title: Common\r\n\
+             Specification-Version: 1.0\r\n\
+             Specification-Vendor: JBoss by Red Hat\r\n\
+             Implementation-Title: Common\r\n\
+             Implementation-Version: 26.0.0\r\n\
+             Implementation-Vendor: Red Hat\r\n"
+                .as_bytes(),
+        )
+        .unwrap();
+        zw.finish().unwrap();
+        jar_path
+    }
+
+    static VENDORED_JAR_SEQ: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
     #[test]
     fn t19_h10_validate_resource_name_accepts_simple() {
         assert_eq!(
@@ -15238,6 +15346,106 @@ mod tests {
             "",
             "default package's name is the empty string"
         );
+    }
+
+    #[test]
+    fn t19_h10_get_package_manifest_writes_do_not_corrupt_module_or_package_info() {
+        // Regression test for the `Package.getAnnotation()` ->
+        // `NoSuchMethodError: java/lang/String.getAnnotation` crash (see
+        // docs/known-issues/keycloak-arquillian-package-getannotation-string-linkage.md):
+        // manifest-attribute writes must land ONLY on their named fields,
+        // never on raw slots 1-6. Real JDK 9+ `java.lang.Package` has no
+        // flat `specTitle`/`specVersion`/`specVendor`/`implTitle`/
+        // `implVersion`/`implVendor` fields at those slots — they are
+        // `module` (1), `versionInfo` (2, itself bundling the manifest
+        // strings), and `packageInfo` (3, a `Class<?>`). A stray by-index
+        // write there — e.g. writing `specVendor` to slot 3 — clobbers
+        // `packageInfo` with a raw `String`, and real `getAnnotation()`/
+        // `isAnnotationPresent()` bytecode then dispatches on that String
+        // receiver instead of a `Class`, throwing `NoSuchMethodError`.
+        let jar_path = t19_h10_write_vendored_test_jar("get_package");
+        let mut ctx = mock_ctx();
+        let cid = ctx
+            .ensure_class_initialized("com/example/vendored/Foo")
+            .unwrap();
+        unsafe {
+            (*ctx.code_base_override.get()).insert(
+                cid.as_u32(),
+                format!("file:/{}", jar_path.to_string_lossy().replace('\\', "/")),
+            );
+        }
+        // Sanity: the manifest must actually resolve, else this test would
+        // trivially pass for the wrong reason (the corrupting write only
+        // fires when a manifest attribute is present).
+        assert_eq!(
+            t19_h10_class_manifest_attr(&mut ctx, cid, "Specification-Vendor").as_deref(),
+            Some("JBoss by Red Hat"),
+            "test fixture manifest must resolve for this regression test to be meaningful"
+        );
+        let mirror =
+            make_class_mirror_with_package(&mut ctx, cid.as_u32(), "com/example/vendored/Foo");
+        let r = native_class_get_package(&mut ctx, &[Value::Object(Some(mirror))]).unwrap();
+        let pkg = match r {
+            Some(Value::Object(Some(o))) => o,
+            other => panic!("expected non-null Package, got {other:?}"),
+        };
+        // Slot 1 is deliberately excluded: the mock's `set_field_by_name`
+        // routes through a slot table shared with Field/Method mirrors
+        // where `"name"` happens to map to slot 1 (`mock_jdk_field_slot`),
+        // so the earlier (legitimate, unrelated-to-this-bug) `name` by-name
+        // write lands there too. Slots 2-6 are the ones a raw-index
+        // manifest-attribute write would corrupt.
+        for slot in 2..=6 {
+            assert_eq!(
+                ctx.get_field(pkg, slot),
+                Value::Int(0),
+                "slot {slot} must be untouched by manifest-attribute writes — a raw-index \
+                 write there corrupts real Package fields (module/versionInfo/packageInfo)"
+            );
+        }
+    }
+
+    #[test]
+    fn i2_define_package_class_manifest_writes_do_not_corrupt_module_or_package_info() {
+        // Same regression as above, for the sibling `ClassLoader
+        // .definePackage(Class)` Package builder — it had an identical
+        // by-index write bug.
+        let jar_path = t19_h10_write_vendored_test_jar("define_package");
+        let mut ctx = mock_ctx();
+        let cid = ctx
+            .ensure_class_initialized("com/example/vendored/Foo")
+            .unwrap();
+        unsafe {
+            (*ctx.code_base_override.get()).insert(
+                cid.as_u32(),
+                format!("file:/{}", jar_path.to_string_lossy().replace('\\', "/")),
+            );
+        }
+        assert_eq!(
+            t19_h10_class_manifest_attr(&mut ctx, cid, "Specification-Vendor").as_deref(),
+            Some("JBoss by Red Hat"),
+            "test fixture manifest must resolve for this regression test to be meaningful"
+        );
+        let mirror =
+            make_class_mirror_with_package(&mut ctx, cid.as_u32(), "com/example/vendored/Foo");
+        let r = i2_classloader_define_package_class(
+            &mut ctx,
+            &[Value::Object(None), Value::Object(Some(mirror))],
+        )
+        .unwrap();
+        let pkg = match r {
+            Some(Value::Object(Some(o))) => o,
+            other => panic!("expected non-null Package, got {other:?}"),
+        };
+        // See the sibling test above for why slot 1 is excluded.
+        for slot in 2..=6 {
+            assert_eq!(
+                ctx.get_field(pkg, slot),
+                Value::Int(0),
+                "slot {slot} must be untouched by manifest-attribute writes — a raw-index \
+                 write there corrupts real Package fields (module/versionInfo/packageInfo)"
+            );
+        }
     }
 
     #[test]
