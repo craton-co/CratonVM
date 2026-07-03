@@ -2572,6 +2572,17 @@ pub(crate) fn remap_rs_cache_after_gc(
 fn maybe_concurrent_gc(shared: &SharedVm, thread: &mut JvmThread) {
     // G1 backend: trigger concurrent marking when IHOP threshold crossed
     if shared.heap.is_g1() {
+        // Finish first, start second: if an active cycle's background marker
+        // has drained to a fixed point, run the STW final remark + cleanup
+        // NOW, on this thread (it has the STW-barrier context). The remark
+        // is NOT optional — the SATB log and a fresh root scan must reach
+        // the bitmap before cleanup acts on it (see
+        // `g1_final_remark_and_cleanup`); the old completion path (a watcher
+        // thread calling straight into cleanup) discarded both.
+        if shared.heap.g1_is_marking_active() && shared.heap.g1_concurrent_mark_finished() {
+            g1_final_remark_cleanup(shared, thread);
+            return;
+        }
         if shared.heap.g1_should_start_marking() && !shared.heap.g1_is_marking_active() {
             g1_concurrent_mark_cycle(shared, thread);
         }
@@ -2753,32 +2764,64 @@ fn g1_concurrent_mark_cycle(shared: &SharedVm, thread: &mut JvmThread) {
     // above spawned it during the initial-mark STW, so by the time we
     // get here the marker is already running concurrently with mutators.
     //
-    // Phase 3+4: spawn a watcher that polls until the marker has
-    // exhausted the worklist naturally, then runs cleanup via
-    // `g1_signal_marking_complete`. The poll-then-signal pattern
-    // preserves the legacy behaviour (let marking finish, *then*
-    // cleanup) — without it, calling g1_signal_marking_complete
-    // immediately would stop the worker before it scanned anything.
-    {
-        let shared_arc = shared.self_arc.read().as_ref().and_then(|w| w.upgrade());
-        if let Some(shared_ref) = shared_arc {
-            std::thread::Builder::new()
-                .name("G1-MarkComplete".to_string())
-                .spawn(move || {
-                    // Poll until the controller's worker has drained
-                    // the worklist and exited naturally. 1 ms backoff
-                    // matches the legacy yield cadence closely enough
-                    // that mutators are not starved.
-                    while !shared_ref.heap.g1_concurrent_mark_finished() {
-                        std::thread::sleep(std::time::Duration::from_millis(1));
-                    }
-                    // Worker has exited — drain the slot, run cleanup,
-                    // return phase to Idle. The remark STW proper is
-                    // handled at the next safepoint check.
-                    shared_ref.heap.g1_signal_marking_complete();
-                })
-                .ok(); // Ignore spawn errors (e.g., too many threads)
-        }
+    // Phases 3+4 (STW final remark + cleanup) are driven by
+    // `maybe_concurrent_gc`: after each subsequent young collection the
+    // GC-initiating mutator checks `g1_concurrent_mark_finished()` and,
+    // once the worker has drained to a fixed point, runs
+    // `g1_final_remark_cleanup` under its own brief STW. The previous
+    // design — a detached watcher thread polling quiescence and calling
+    // `g1_signal_marking_complete` (i.e. cleanup) directly — never ran a
+    // final remark at all: the SATB log was discarded wholesale and the
+    // roots were never re-scanned, so the sweep verdicts raced every
+    // reference the mutators rewrote during the concurrent phase. A
+    // watcher thread also cannot run the remark itself: it has no
+    // JvmThread/barrier context to initiate an STW.
+    //
+    // Deferral note: if allocation stops entirely after IHOP fired, no
+    // young GC follows and the cycle stays open (SATB active, cleanup
+    // pending). That is benign — a heap nobody allocates into needs no
+    // reclamation — and the next allocation-triggered GC closes it.
+}
+
+/// Phases 3+4 of the G1 cycle: STW final remark, then cleanup.
+///
+/// Called by `maybe_concurrent_gc` on the GC-initiating mutator once the
+/// background marker has quiesced. Collects the full root set (all
+/// threads) under a brief STW and hands it to
+/// [`VmHeap::g1_final_remark_and_cleanup`], which re-marks roots, drains
+/// the SATB log, completes the transitive closure, and runs cleanup —
+/// all while the world is stopped.
+///
+/// fork6-pattern race handling: if another thread's STW wins
+/// (`brief_stw_counted` returns false), nothing ran — the cycle simply
+/// stays open (SATB active, worklist quiescent) and the next
+/// `maybe_concurrent_gc` retries. Unlike the generational remark there is
+/// nothing to abort: no sweep decision has been made yet.
+fn g1_final_remark_cleanup(shared: &SharedVm, thread: &mut JvmThread) {
+    let done = shared.gc_barrier.brief_stw_counted(
+        thread.thread_id,
+        || u32::try_from(shared.thread_registry.alive_count()).unwrap_or(u32::MAX),
+        || {
+            // Drain the initiator's per-thread SATB buffer; the other
+            // mutators' buffers are pulled by `remark` itself
+            // (`flush_all_thread_satb_buffers`) now that they are parked.
+            shared.heap.flush_thread_satb();
+            let roots = collect_roots(shared, thread);
+            let snapshot_roots = shared.thread_registry.collect_all_root_snapshots();
+            let all_roots: Vec<cratonvm_types::ObjectRef> = roots
+                .into_iter()
+                .chain(snapshot_roots.into_iter())
+                .collect();
+            let completed = shared.heap.g1_final_remark_and_cleanup(&all_roots);
+            tracing::debug!(
+                "[G1] Final remark: {} roots, cycle_completed={}",
+                all_roots.len(),
+                completed
+            );
+        },
+    );
+    if !done {
+        tracing::debug!("[G1] Final remark lost the STW race — retrying at next GC");
     }
 }
 
@@ -14345,13 +14388,75 @@ fn is_global_resolution_namespace(name: &str) -> bool {
 /// a class a loader has itself defined, or a prior validated initiating result.
 /// This is the half of loader-faithful resolution that needs no `&mut thread`,
 /// so it is safe to call from the hot field/method-owner resolvers.
+/// Whether `referencing_class_id`'s DEFINING loader is a `groovy.lang.
+/// GroovyClassLoader` (or a subtype, e.g. `GroovyClassLoader$InnerLoader` —
+/// the per-`parseClass`-call loader Groovy mints internally). Used to widen
+/// the loader-initiated resolution trigger (below) to Groovy scripts
+/// unconditionally, without touching the global `CRATONVM_LOADER_AWARE_
+/// RESOLUTION` gate's default (which stays off pending the full Tomcat /
+/// Hibernate / WildFly custom-loader soak it was written for — see
+/// `docs/known-issues/hib-proxyclassreuse-loader-blind-class-resolution.md`).
+///
+/// Rationale (context.groovy bug cluster): `GroovyShell.evaluate` compiles
+/// each script through its own fresh `GroovyClassLoader$InnerLoader`
+/// instance, and Groovy names every closure literal in a script
+/// positionally (`<Script>$_run_closure1`, `$_run_closure2`, …) — so two
+/// different scripts loaded in the same process routinely produce two
+/// DIFFERENT classes sharing an identical name. With the gate off, `new
+/// <closure>(...)` / `checkcast` / similar `CONSTANT_Class` resolution from
+/// the SECOND script's own bytecode resolved through the flat global class
+/// store (`load_class_concurrent`) and silently collapsed onto whichever
+/// same-named closure a DIFFERENT script's `InnerLoader` had registered
+/// first — no exception, just the wrong compiled bytecode running (e.g.
+/// Spring's `GroovyBeanDefinitionReader` executing an earlier script's
+/// closure body and registering none of the beans the current script
+/// declared). A real type check here (subtype of `GroovyClassLoader`, not a
+/// class-NAME string match) keeps the blast radius to Groovy's own loader
+/// hierarchy: Hibernate's ByteBuddy/CGLIB isolating loaders, Tomcat's
+/// `WebappClassLoader`, and WildFly's module loaders are never
+/// `GroovyClassLoader` instances, so their resolution order is completely
+/// unaffected by this check.
+fn is_groovy_class_loader(shared: &SharedVm, loader_obj: cratonvm_types::ObjectRef) -> bool {
+    let cm = shared.class_manager.read();
+    let loader_class_id = shared.heap.class_id_of(loader_obj);
+    match cm.get_loaded_class_id("groovy/lang/GroovyClassLoader") {
+        Some(groovy_cl_id) => {
+            loader_class_id == groovy_cl_id || cm.is_subclass_of(loader_class_id, groovy_cl_id)
+        }
+        // `groovy/lang/GroovyClassLoader` not loaded at all in this process
+        // (no Groovy on the classpath) => trivially not a Groovy loader.
+        None => false,
+    }
+}
+
+/// Whether loader-initiated (JVMS §5.4.3 initiating-loader) `CONSTANT_Class`
+/// resolution should run for a reference from `referencing_class_id`: either
+/// the global gate is on, or the referencing class was defined by a
+/// `GroovyClassLoader` (see [`is_groovy_class_loader`]'s doc comment for the
+/// full rationale — this is the narrow, type-checked carve-out for the
+/// context.groovy bug cluster that does not touch the gate's default).
+#[inline]
+fn should_use_loader_initiated_resolution(
+    shared: &SharedVm,
+    referencing_class_id: ClassId,
+) -> bool {
+    if crate::runtime::env_cache::loader_aware_resolution() {
+        return true;
+    }
+    match cratonvm_native_builtins::classloader::defining_loader_for(referencing_class_id.as_u32())
+    {
+        Some(loader_obj) => is_groovy_class_loader(shared, loader_obj),
+        None => false,
+    }
+}
+
 #[inline]
 fn lookup_loader_initiated(
     shared: &SharedVm,
     referencing_class_id: ClassId,
     name: &str,
 ) -> Option<ClassId> {
-    if !crate::runtime::env_cache::loader_aware_resolution() {
+    if !should_use_loader_initiated_resolution(shared, referencing_class_id) {
         return None;
     }
     let loader = match shared
@@ -14412,7 +14517,7 @@ fn resolve_class_loader_aware(
     // (gate off / built-in loader / JDK or array name) or the loader is
     // user-defined but has not yet resolved this name. Only the latter takes the
     // cold loadClass path below; everything else resolves globally.
-    let user_loader = if crate::runtime::env_cache::loader_aware_resolution()
+    let user_loader = if should_use_loader_initiated_resolution(shared, referencing_class_id)
         && !name.starts_with('[')
         && !is_global_resolution_namespace(name)
     {
@@ -18064,7 +18169,28 @@ fn force_native_over_real_jdk_bytecode(
     // exports/opens (java.base exports `java.lang`/… to all but not
     // `jdk.internal.*` — which ByteBuddy's `JavaDispatcher` relies on) instead of
     // touching the null descriptor.
-    if class_name == "java/lang/Module" && matches!(method_name, "isExported" | "isOpen") {
+    //
+    // `getDescriptor` has the same null-descriptor problem, but real HotSpot
+    // guarantees `isNamed() == (getDescriptor() != null)` — a named module's
+    // descriptor is never null. CratonVM's `isNamed()` (real bytecode, reading
+    // the dual-written real `name` field) can report a classpath-loaded,
+    // modularized jar as named (see `classloading::module::ModuleDescriptor
+    // ::automatic`), yet `getDescriptor()`'s real bytecode (`return this
+    // .descriptor;`) reads a field CratonVM never populates. Any code that
+    // only calls `getDescriptor()` after checking `isNamed()` (e.g.
+    // Elasticsearch's `ProviderLocator.checkUses` — `caller.isNamed() &&
+    // caller.getDescriptor().uses()...`) gets `NullPointerException: Cannot
+    // invoke "ModuleDescriptor.uses()" because the return value of
+    // "Module.getDescriptor()" is null`, breaking `XContentProvider$Holder`
+    // static init and cascading into thousands of Elasticsearch suite
+    // failures via `NoClassDefFoundError`. Force the native (registered in
+    // `native-builtins::lib::register_essential_natives`, alongside
+    // isExported/isOpen above), which returns null only for the true unnamed
+    // module and otherwise builds a descriptor backed by the boot
+    // `ModuleRegistry`'s parsed `uses`.
+    if class_name == "java/lang/Module"
+        && matches!(method_name, "isExported" | "isOpen" | "getDescriptor")
+    {
         return true;
     }
     // BUG-15: `sun.util.locale.provider.LocaleResources.getDateTimePattern(int,

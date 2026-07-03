@@ -4,7 +4,9 @@
 //! Build script for cratonvm-vm.
 //!
 //! Automatically compiles Java test classes in `tests/resources/cratonvm/` if
-//! `javac` is available on the PATH. Generated classes are staged under
+//! a `javac` is available. `$JAVA_HOME/bin/javac` is preferred when
+//! `JAVA_HOME` is set and points at a real file, falling back to plain
+//! `javac` resolved via PATH otherwise. Generated classes are staged under
 //! `OUT_DIR/test-classes` and exposed through `CRATONVM_TEST_CLASSES_DIR`;
 //! the build script does not mutate the source tree.
 //!
@@ -28,6 +30,7 @@ fn is_modern_java(path: &Path) -> bool {
 }
 
 fn compile_files(
+    javac: &Path,
     files: &[PathBuf],
     out_dir: &Path,
     extra_args: &[&str],
@@ -36,7 +39,7 @@ fn compile_files(
     if files.is_empty() {
         return true;
     }
-    let mut cmd = Command::new("javac");
+    let mut cmd = Command::new(javac);
     cmd.arg("-d").arg(out_dir);
     for arg in extra_args {
         cmd.arg(arg);
@@ -82,7 +85,7 @@ fn compile_files(
 ///   * The user updates their `PATH` and triggers a rerun via the
 ///     `cargo:rerun-if-env-changed=PATH` directive we emit below.
 ///   * The Java sources change (existing `cargo:rerun-if-changed`).
-fn javac_available_cached(out_dir: &Path) -> bool {
+fn javac_available_cached(out_dir: &Path, javac: &Path) -> bool {
     let cache_path = out_dir.join("javac-version.txt");
     let fingerprint = javac_env_fingerprint();
     if let Ok(prev) = std::fs::read_to_string(&cache_path) {
@@ -93,7 +96,7 @@ fn javac_available_cached(out_dir: &Path) -> bool {
             return state == "present";
         }
     }
-    let javac_check = Command::new("javac").arg("-version").output();
+    let javac_check = Command::new(javac).arg("-version").output();
     let present = javac_check.is_ok_and(|o| o.status.success());
     // Best-effort cache write; if the FS is read-only we'll just
     // shell out again next build (no correctness impact).
@@ -106,6 +109,22 @@ fn javac_available_cached(out_dir: &Path) -> bool {
         ),
     );
     present
+}
+
+/// Resolve which `javac` to invoke. Prefers `$JAVA_HOME/bin/javac` (or
+/// `javac.exe` on Windows) when `JAVA_HOME` is set and that file exists —
+/// this matters on hosts where JAVA_HOME designates a specific JDK that
+/// isn't first on PATH (e.g. multiple JDKs installed side by side). Falls
+/// back to plain `javac`, resolved via PATH by `Command`/`std::process`.
+fn resolve_javac() -> PathBuf {
+    if let Some(java_home) = std::env::var_os("JAVA_HOME") {
+        let exe_name = if cfg!(windows) { "javac.exe" } else { "javac" };
+        let candidate = Path::new(&java_home).join("bin").join(exe_name);
+        if candidate.is_file() {
+            return candidate;
+        }
+    }
+    PathBuf::from("javac")
 }
 
 fn javac_env_fingerprint() -> String {
@@ -164,16 +183,19 @@ fn main() {
         return;
     }
 
+    let javac_path = resolve_javac();
+
     // Round-11 cross-cutting HIGH-6: cached javac availability probe.
     // The first incremental build runs `javac -version` once; every
     // subsequent build reads $OUT_DIR/javac-version.txt and avoids the
     // 100-200 ms fork/exec.
-    let javac_available = javac_available_cached(out_dir);
+    let javac_available = javac_available_cached(out_dir, &javac_path);
 
     if !javac_available {
         println!(
-            "cargo:warning=javac not found on PATH — skipping Java test class compilation. \
-             Integration tests will be skipped."
+            "cargo:warning=javac not found ({}) — skipping Java test class compilation. \
+             Integration tests will be skipped.",
+            javac_path.display()
         );
         return;
     }
@@ -204,20 +226,29 @@ fn main() {
     // is speculative and a mismatched toolchain is expected.
     if !legacy.is_empty()
         && !compile_files(
+            &javac_path,
             &legacy,
             &output_dir,
             &["-source", "7", "-target", "7"],
             false,
         )
     {
-        compile_files(&legacy, &output_dir, &[], true);
+        compile_files(&javac_path, &legacy, &output_dir, &[], true);
     }
 
     // Pass 2: modern files (Java 21+ features: pattern matching, records, sealed classes).
     // Also speculative — if the host javac doesn't support --release 21
     // we fall back to plain javac which handles modern syntax on JDK
     // 21+ toolchains.
-    if !modern.is_empty() && !compile_files(&modern, &output_dir, &["--release", "21"], false) {
-        compile_files(&modern, &output_dir, &[], true);
+    if !modern.is_empty()
+        && !compile_files(
+            &javac_path,
+            &modern,
+            &output_dir,
+            &["--release", "21"],
+            false,
+        )
+    {
+        compile_files(&javac_path, &modern, &output_dir, &[], true);
     }
 }

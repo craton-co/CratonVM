@@ -174,13 +174,13 @@ fn string_starts_with_offset_via_dispatch() {
         shared: &vm.shared,
         thread: &mut vm.main_thread,
     };
-    // "cratonvm.boot.fixture".startsWith("boot", 8) == true
+    // "cratonvm.boot.fixture".startsWith("boot", 9) == true
     let r = cb(
         &mut ctx,
         &[
             Value::Object(Some(s)),
             Value::Object(Some(prefix)),
-            Value::Int(8),
+            Value::Int(9),
         ],
     )
     .expect("startsWith call should not error");

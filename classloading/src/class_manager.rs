@@ -1709,11 +1709,49 @@ impl ClassManager {
         // walking every entry in `loaded_classes`. Same fix as
         // `find_class_by_name`. Empty-set early-out keeps the common
         // "no user loaders" case at zero extra work.
+        //
+        // context.groovy fix: `user_loaders` is an unordered `FxHashSet`, so
+        // "return the first match" was really "return an ARBITRARY match" --
+        // unsound whenever more than one user-defined loader has its OWN
+        // distinct class registered under the same simple name. This is the
+        // common case for Apache Groovy: `GroovyShell.evaluate` compiles each
+        // script through a fresh `GroovyClassLoader$InnerLoader`, and every
+        // closure literal in a script is named positionally
+        // (`<Script>$_run_closure1`, `$_run_closure2`, ...), so two different
+        // scripts loaded in the same process routinely produce two DIFFERENT
+        // classes sharing the identical name. Blindly returning whichever
+        // loader's copy the hash-set happened to visit first silently
+        // collapsed every later script's closures onto the first script's
+        // compiled bytecode (no exception -- the class "resolved" fine, just
+        // to the wrong loader's copy), e.g. Spring's
+        // `GroovyBeanDefinitionReader` registering zero of the beans the
+        // current script actually declared. A name that is genuinely
+        // ambiguous across loaders has no single correct answer here (this
+        // function takes no loader/caller context to disambiguate with), so
+        // when more than one user loader owns a same-named class we return
+        // `None` -- ambiguous is a miss, not a guess -- letting the caller fall
+        // through to a loader-specific resolution path (e.g.
+        // `drive_defining_loader_load`) instead of silently picking one. The
+        // common single-custom-loader case (Tomcat/Hibernate/WildFly: one
+        // relevant webapp/session loader) is unaffected -- this only changes
+        // behavior when 2+ user loaders actually collide on the same name.
         if !self.user_loaders.is_empty() {
+            let mut found: Option<ClassId> = None;
             for loader_id in &self.user_loaders {
                 if let Some(id) = loaded_classes_probe(&self.loaded_classes, *loader_id, name) {
-                    return Some(id);
+                    if let Some(prev) = found {
+                        if prev != id {
+                            // Ambiguous: two different loaders each define
+                            // their own distinct class under this name.
+                            return None;
+                        }
+                    } else {
+                        found = Some(id);
+                    }
                 }
+            }
+            if let Some(id) = found {
+                return Some(id);
             }
         }
         None
@@ -2805,6 +2843,46 @@ impl ClassManager {
                         ),
                     },
                 ));
+            }
+
+            // A synthetic stub for this exact name may already exist under a
+            // built-in loader (`create_synthetic_stub` always registers under
+            // `ClassLoaderId::Bootstrap` — see `is_enterprise_stub_prefix`).
+            // This happens when code deliberately probes for a not-yet-generated
+            // class via `ClassLoader.loadClass`/`Class.forName` expecting
+            // `ClassNotFoundException` and then dynamically generates + defines
+            // the real bytecode itself (e.g. SmallRye Config's `@ConfigMapping`
+            // `<iface>$$CMImpl` runtime generation via
+            // `MethodHandles.Lookup.defineClass`). The `reflective_probe` gate
+            // only forces a proper CNFE for `Class.forName`-style existence
+            // probes, not plain `ClassLoader.loadClass`, so the first lookup
+            // fabricates a Bootstrap stub instead.
+            //
+            // If we minted a brand-new ClassId here instead, it would be
+            // permanently shadowed: `get_loaded_class_id` (used by every
+            // subsequent by-name resolution — Class.forName, loadClass,
+            // MethodHandles.Lookup.findStatic/findConstructor, constant-pool
+            // resolution, ...) always prefers the first-registered built-in
+            // loader in delegation order, i.e. the empty Bootstrap stub, never
+            // the real class just defined. Upgrade the existing stub in place
+            // instead (same mechanism `load_class` uses when a stub's real
+            // `.class` file later appears on the classpath), reusing its
+            // ClassId so it becomes visible to every future lookup.
+            if let Some(existing_id) = self.get_loaded_class_id(&stored_name_preview) {
+                let is_stub = self
+                    .class_store
+                    .get(existing_id)
+                    .map(|c| c.is_synthetic_stub)
+                    .unwrap_or(false);
+                if is_stub {
+                    self.upgrade_synthetic_class(
+                        existing_id,
+                        &stored_name_preview,
+                        bytes,
+                        loader_id,
+                    )?;
+                    return Ok(existing_id);
+                }
             }
         }
 
@@ -4968,10 +5046,21 @@ impl ClassManager {
         //
         // Early-out: most apps never define a user loader, in which case
         // the set is empty and we skip the inner loop entirely.
+        //
+        // context.groovy fix: same unsound "first match across an unordered
+        // hash-set of loaders" issue as `get_loaded_class_id` above (see its
+        // doc comment for the full Groovy `GroovyClassLoader$InnerLoader` /
+        // same-named-closure rationale) -- when two or more DIFFERENT user
+        // loaders each define their own distinct class under this name, this
+        // context-free lookup cannot know which one the caller means, so it
+        // must report a miss (`None`) rather than guess and silently return
+        // the wrong loader's copy.
         if !self.user_loaders.is_empty() {
             for key in &keys {
                 // C34 audit fix (HIGH): zero-allocation borrowed-key probe
                 // (same rationale as the builtin loaders loop above).
+                let mut found: Option<ClassId> = None;
+                let mut ambiguous = false;
                 for loader_id in &self.user_loaders {
                     if let Some(id) = loaded_classes_probe(&self.loaded_classes, *loader_id, key) {
                         if let Some(class) = self.get_class(id) {
@@ -4979,8 +5068,20 @@ impl ClassManager {
                                 continue;
                             }
                         }
-                        return Some(id);
+                        match found {
+                            Some(prev) if prev != id => {
+                                ambiguous = true;
+                                break;
+                            }
+                            _ => found = Some(id),
+                        }
                     }
+                }
+                if ambiguous {
+                    continue;
+                }
+                if let Some(id) = found {
+                    return Some(id);
                 }
             }
         }
@@ -5935,6 +6036,9 @@ fn jdk_superclass(name: &str) -> &'static str {
         | "java/lang/Float" | "java/lang/Double" => "java/lang/Number",
         "java/lang/Number" => "java/lang/Object",
 
+        // JDBC legacy date/time wrappers extend java.util.Date.
+        "java/sql/Date" | "java/sql/Time" | "java/sql/Timestamp" => "java/util/Date",
+
         // Record hierarchy (JEP 395, Java 16+)
         "java/lang/Record" => "java/lang/Object",
 
@@ -6615,6 +6719,8 @@ fn synthetic_stub_fields(name: &str) -> Vec<cratonvm_reader::field::ClassFileFie
         "java/util/Random" => instance_fields(2),
         // UUID = 2 fields (msb, lsb)
         "java/util/UUID" => instance_fields(2),
+        // Date = 1 field (millis since epoch). java.sql date/time subclasses inherit it.
+        "java/util/Date" => instance_fields(1),
         // Properties = 4 fields
         "java/util/Properties" => instance_fields(4),
         // Formatter = 2 fields (output=0, locale=1)
@@ -8852,6 +8958,22 @@ fn synthetic_stub_ctor_methods(name: &str) -> Vec<ClassFileMethod> {
             descriptor: cratonvm_types::intern_arc("()V"),
             attributes: vec![],
         });
+    }
+    if matches!(
+        name,
+        "java/sql/Date" | "java/sql/Time" | "java/sql/Timestamp"
+    ) {
+        let mk = |method: &str, descriptor: &str| ClassFileMethod {
+            access_flags: MethodAccessFlags::PUBLIC | MethodAccessFlags::NATIVE,
+            name: cratonvm_types::intern_arc(method),
+            descriptor: cratonvm_types::intern_arc(descriptor),
+            attributes: vec![],
+        };
+        out.extend([
+            mk("<init>", "(J)V"),
+            mk("getTime", "()J"),
+            mk("toString", "()Ljava/lang/String;"),
+        ]);
     }
     if name == "java/io/InputStreamReader" {
         out.extend([

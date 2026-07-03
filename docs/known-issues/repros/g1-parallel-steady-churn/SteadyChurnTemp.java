@@ -1,20 +1,23 @@
-// Recreated standalone repro for the G1 parallel evacuation residual race.
-// The original scratch/g1par source was not tracked, so this is not byte-identical.
+// Regression repro for INTERPRETER LOCAL LIVENESS (runtime/local_liveness.rs).
 //
-// Shape:
-//   * maintain a fixed 4096-node live linked list reachable from one root;
-//   * replace one node per iteration so the live set remains young/survivor-heavy;
-//   * give every live node a payload object and byte[] so the 16m heap forces
-//     to-space pressure and evacuation failure/self-forwarding;
-//   * allocate short-lived payloads each iteration to keep young GC frequent.
+// Identical to SteadyChurnLight except the list-setup loop deliberately uses
+// a construction temp:
 //
-// Correct command from the bug note:
+//     Node node = new Node(i);   // scoped-out after the setup loop
+//     tail.next = node;
+//     tail = node;
 //
-//   CRATONVM_G1_PARALLEL_EVAC=1 CRATONVM_DISABLE_DEFAULT_WATCHDOG=1 \
-//     cratonvm --nojit -XX:+UseG1GC -Xmx16m -cp <classes> SteadyChurn 2000000
+// Under a liveness-free root scan (CRATONVM_NO_LOCAL_LIVENESS=1) the temp's
+// slot keeps node[LIVE-1] alive for main's whole lifetime and, through the
+// `next` chain, EVERY node appended afterwards — unbounded retention that
+// OOMs at any heap size. With the per-bci liveness filter the temp is dead
+// after the setup loop and the run completes at -Xmx16m like HotSpot.
+//
+//   CRATONVM_DISABLE_DEFAULT_WATCHDOG=1 \
+//     cratonvm --nojit -XX:+UseG1GC -Xmx16m -cp <classes> SteadyChurnTemp 2000000
 //
 // Expected stdout for 2,000,000 iterations: 2002062093760
-public final class SteadyChurn {
+public final class SteadyChurnTemp {
     private static final int LIVE = 4096;
     private static final int PAYLOAD = 256;
     private static final long PER_ITER = 1_001_031L;
@@ -52,13 +55,10 @@ public final class SteadyChurn {
 
         Node head = new Node(0);
         Node tail = head;
-        // Temp-free on purpose — see SteadyChurnLight.java: a construction
-        // temp here becomes a stale scoped-out local slot that CratonVM's
-        // liveness-imprecise interpreter roots retain for main's lifetime,
-        // anchoring the entire appended chain (unbounded retention).
         for (int i = 1; i < LIVE; i++) {
-            tail.next = new Node(i);
-            tail = tail.next;
+            Node node = new Node(i); // THE deliberate scoped-out temp
+            tail.next = node;
+            tail = node;
         }
 
         long churn = 0;
@@ -68,15 +68,10 @@ public final class SteadyChurn {
             tail = node;
             head = head.next;
 
-            Payload a = new Payload(i ^ 0x5a5a5a5a);
-            Payload b = new Payload(i ^ 0x33cc33cc);
-            a.owner = head;
-            b.owner = tail;
-
             churn += (head.seq & 31)
                     + (tail.seq & 17)
-                    + (a.bytes[0] & 0xff)
-                    + (b.bytes[b.bytes.length - 1] & 0xff);
+                    + (head.payload.bytes[0] & 0xff)
+                    + (tail.payload.bytes[PAYLOAD - 1] & 0xff);
         }
 
         long graph = verifyGraph(head, iterations);
@@ -93,6 +88,9 @@ public final class SteadyChurn {
             if (node.seq != iterations + count) {
                 fail();
             }
+            if (node.payload.owner != node || node.payload.seq != node.seq) {
+                fail();
+            }
             check += node.seq * 17L;
             count++;
             node = node.next;
@@ -100,8 +98,7 @@ public final class SteadyChurn {
         if (count != LIVE) {
             fail();
         }
-        int firstExpected = iterations;
-        if (head.seq != firstExpected) {
+        if (head.seq != iterations) {
             fail();
         }
         return check;

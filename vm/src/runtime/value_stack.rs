@@ -1398,9 +1398,7 @@ impl ValueStack {
                         // The `from_raw` round-trip is the canonical recorder.
                         // SAFETY: `new_addr` is a live moved object's address
                         // from the GC pointer map; only its bits are used.
-                        let _ = unsafe {
-                            crate::types::ObjectRef::from_raw(new_addr as *mut u8)
-                        };
+                        let _ = unsafe { crate::types::ObjectRef::from_raw(new_addr as *mut u8) };
                         // SAFETY: `new_addr` comes from a `HashMap<usize,
                         // usize>` of live-heap pointers populated by the GC
                         // compactor; every entry is the moved address of a
@@ -1499,9 +1497,8 @@ impl ValueStack {
                             // write below bypasses `from_raw`, and a later
                             // decode of this slot must not provenance-MISS.
                             // SAFETY: live moved address; only bits are used.
-                            let _ = unsafe {
-                                crate::types::ObjectRef::from_raw(new_addr as *mut u8)
-                            };
+                            let _ =
+                                unsafe { crate::types::ObjectRef::from_raw(new_addr as *mut u8) };
                             // Preserve the slot's raw-bits encoding (the
                             // smuggle stores the pointer verbatim as the slot's
                             // bits, for both the tagged-`Long` and untagged-

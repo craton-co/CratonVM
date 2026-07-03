@@ -1252,6 +1252,30 @@ impl<'a> NativeContextImpl<'a> {
         // blocked duration, and the sweep would free those still-live
         // targets. Cheap no-op whenever no marking cycle is active.
         self.shared.heap.flush_thread_satb();
+        // Throttle-hang fix (ConcurrencyThrottleInterceptorTests, 2026-07-02):
+        // this deposit is a GC-AUTHORITATIVE root publish — it is the ONLY view
+        // a cross-thread STW collector has of this thread's roots for as long
+        // as it stays parked. The JIT-frame portion below therefore must be a
+        // FRESH scan, not the possibly-stale `JIT_SCAN_CACHE` snapshot: the
+        // cache is (boundary-gen, chain-len, collection-count)-keyed, and NONE
+        // of those change when compiled code inline-allocates (TLAB fast path
+        // bumps no boundary generation) or when only void natives (park/unpark/
+        // setCurrentBlocker) run after the last object-returning native filled
+        // the cache. A JIT'd `AQS$ConditionObject.await` frame's freshly
+        // allocated `ConditionNode` was exactly that: absent from the cached
+        // scan, so the deposited snapshot omitted it → it was never PINNED →
+        // the JIT-active non-moving young sweep's selective promotion evacuated
+        // it (or reclaimed it outright) while the JIT spill slot still held the
+        // young address → on wake the thread read a zeroed header
+        // (`num_slots=0 ConditionNode` / `class_id=0` "Object.isReleasable"
+        // NSME) → broken condition queue → every waiter parked forever (the
+        // 100-thread throttle wedge). The safepoint publish path
+        // (`interpreter.rs` `safepoint_check`) and `collect_roots` already
+        // invalidate before their authoritative scans; this blocked-path
+        // deposit was the one publish that didn't. See
+        // `invalidate_scan_cache_for_gc`'s doc — it names "a parked thread's
+        // pre-STW publish" as a required call site.
+        crate::jit::conservative_roots::invalidate_scan_cache_for_gc();
         let mut snapshot = self.thread.root_snapshot.lock();
         snapshot.clear();
         // Multi-thread non-moving-sweep root hardening (Fork6): see
@@ -2116,6 +2140,10 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
         } else {
             h
         }
+    }
+
+    fn vm_identity(&self) -> usize {
+        self.shared.vm_identity
     }
 
     fn register_var_handle_root(&mut self, vh: ObjectRef) {
@@ -6276,6 +6304,25 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
             .read()
             .module_registry
             .packages_of(module_name)
+    }
+
+    fn module_uses(&self, module_name: &str) -> Vec<String> {
+        self.shared
+            .class_manager
+            .read()
+            .module_registry
+            .get(module_name)
+            .map(|d| d.uses.clone())
+            .unwrap_or_default()
+    }
+
+    fn module_is_open(&self, module_name: &str) -> bool {
+        self.shared
+            .class_manager
+            .read()
+            .module_registry
+            .get(module_name)
+            .is_some_and(|d| d.is_open)
     }
 
     fn all_module_names(&self) -> Vec<String> {

@@ -1166,8 +1166,80 @@ impl VmHeap {
         true
     }
 
+    /// G1 STW final remark + cleanup — the cycle-ending twin of
+    /// [`Self::g1_mark_roots`].
+    ///
+    /// MUST be called from inside a stop-the-world pause (the caller holds
+    /// the GC barrier; every mutator is parked at its safepoint), with
+    /// `roots` covering ALL threads. Performs, in order:
+    ///
+    /// 1. joins the background marker (its worklist is at a fixed point —
+    ///    the caller gates on [`Self::g1_concurrent_mark_finished`], and a
+    ///    stopped worker rules out interleaving with the drain below);
+    /// 2. `remark(roots)` — re-scans roots and drains the SATB log (every
+    ///    parked mutator's local buffer + the global shards) into the gray
+    ///    set. Without this the SATB write barrier's entire output was
+    ///    DISCARDED at cleanup: the cycle was a one-shot closure from the
+    ///    initial roots, racing mutator edge deletions, and any live object
+    ///    whose only marker-visible path was rewritten mid-trace stayed
+    ///    unmarked (the SteadyChurn freed-live-Old-region defect);
+    /// 3. drains the gray set to a fixed point (including the overflow
+    ///    rescans — `concurrent_mark_step` returns `false` until both the
+    ///    worklist is empty and no overflow recovery is pending);
+    /// 4. `cleanup()` — per-region liveness, in-place free of wholly-dead
+    ///    Old regions, humongous reclaim, SATB deactivation — while the
+    ///    world is still stopped.
+    ///
+    /// Returns `false` (and does nothing) when no cycle is active, so a
+    /// second initiator that lost the STW race cannot re-run remark against
+    /// an already-completed cycle.
+    pub fn g1_final_remark_and_cleanup(&self, roots: &[cratonvm_types::ObjectRef]) -> bool {
+        if let VmHeap::G1(state) = self {
+            let Some(ctrl) = state.concurrent_mark.lock().take() else {
+                // Defensive: a marking-active phase with no controller is an
+                // orphaned cycle nobody is driving — abort it (no bitmap
+                // verdicts) rather than letting the completion gate spin on
+                // it forever. We are inside an STW here, so this cannot race
+                // `g1_start_concurrent_mark` (also STW-only).
+                if state.collector.gc_state.is_marking_active() {
+                    tracing::warn!(
+                        "g1_final_remark_and_cleanup: marking active with no \
+                         controller — aborting orphaned cycle"
+                    );
+                    state.collector.abort_concurrent_mark();
+                } else {
+                    tracing::trace!("g1_final_remark_and_cleanup: no active controller");
+                }
+                return false;
+            };
+            let steps = ctrl.steps_performed();
+            let outcome = ctrl.request_stop_and_join();
+            state.collector.remark(roots);
+            while !state.collector.concurrent_mark_step(usize::MAX) {}
+            tracing::debug!(
+                "g1_final_remark_and_cleanup: remark+drain done (worker steps={}, joined_ok={})",
+                steps,
+                outcome.is_ok(),
+            );
+            state
+                .collector
+                .gc_state
+                .set_phase(ConcurrentGcPhase::ConcurrentSweep);
+            state.collector.cleanup();
+            state.collector.gc_state.set_phase(ConcurrentGcPhase::Idle);
+            return true;
+        }
+        false
+    }
+
     /// Signal that G1 concurrent marking is complete: join the worker,
     /// run cleanup, return phase to `Idle`.
+    ///
+    /// NOTE: prefer [`Self::g1_final_remark_and_cleanup`] — this variant
+    /// skips the final remark (no root re-scan, no SATB drain), so any
+    /// reference the mutators overwrote during the concurrent phase never
+    /// reaches the bitmap. Retained for tests and as the abort/teardown
+    /// path; the runtime cycle driver no longer calls it.
     ///
     /// Task #56: drains the [`ConcurrentMarkController`] slot and joins
     /// the background worker (blocking). The STW remark the caller runs

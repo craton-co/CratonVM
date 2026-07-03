@@ -38,10 +38,9 @@
 //!      probes that every `T.class` literal LDCs successfully and
 //!      `Class.getName()` round-trips through the bootstrap classloader.
 //!   4. `connection_methods_carry_signatures` /
-//!      `result_set_next_reflects_with_boolean_return` — best-effort
-//!      reflection-deep probes that log a SKIP if the synthetic stub
-//!      does not declare `Class.getDeclaredMethods` in its method table
-//!      (a baseline gap shared with WP7.1). Registry pins still hold.
+//!      `result_set_next_reflects_with_boolean_return` — hard
+//!      reflection-deep probes that drive `Class.getDeclaredMethods()`
+//!      through real fixture bytecode and assert usable Method mirrors.
 //!
 //! The Java fixture lives at
 //! `vm/tests/resources/cratonvm/Wp72JdbcCoreTypes.java` and is auto-compiled
@@ -65,13 +64,24 @@ fn test_resources_dir() -> String {
     format!("{manifest_dir}/tests/resources")
 }
 
+fn test_classpath() -> Vec<String> {
+    let mut cp = Vec::new();
+    if let Some(compiled) = option_env!("CRATONVM_TEST_CLASSES_DIR") {
+        cp.push(compiled.to_string());
+    }
+    cp.push(test_resources_dir());
+    cp
+}
+
 fn fixture_compiled() -> bool {
-    let path = format!("{}/cratonvm/Wp72JdbcCoreTypes.class", test_resources_dir());
-    std::path::Path::new(&path).exists()
+    test_classpath().into_iter().any(|dir| {
+        let path = format!("{dir}/cratonvm/Wp72JdbcCoreTypes.class");
+        std::path::Path::new(&path).exists()
+    })
 }
 
 fn fresh_vm() -> Vm {
-    let config = VmConfig::new().with_classpath(vec![test_resources_dir()]);
+    let config = VmConfig::new().with_classpath(test_classpath());
     Vm::new(config)
 }
 
@@ -120,13 +130,16 @@ fn class_get_declared_methods_native_registered() {
             "getDeclaredMethods0",
             "(Z)[Ljava/lang/reflect/Method;"
         )
-        .is_some()
-            || r.find(
-                "java/lang/Class",
-                "getDeclaredMethods",
-                "()[Ljava/lang/reflect/Method;"
-            )
-            .is_some(),
+        .is_some(),
+        "Class.getDeclaredMethods0 must be registered for WP7.2"
+    );
+    assert!(
+        r.find(
+            "java/lang/Class",
+            "getDeclaredMethods",
+            "()[Ljava/lang/reflect/Method;"
+        )
+        .is_some(),
         "Class.getDeclaredMethods must be registered for WP7.2"
     );
 }

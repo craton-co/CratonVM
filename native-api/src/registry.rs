@@ -512,6 +512,16 @@ pub trait NativeContext {
     /// Get the identity hash code of an ObjectRef.
     fn identity_hash_code(&self, obj: ObjectRef) -> i32;
 
+    /// Stable identity for the owning VM/heap.
+    ///
+    /// Native side caches that store heap `ObjectRef`s must scope entries to
+    /// this value; Rust tests can create multiple independent `Vm` instances in
+    /// one process, so process-global object caches are otherwise stale across
+    /// VM lifetimes. Mock contexts default to a single synthetic scope.
+    fn vm_identity(&self) -> usize {
+        0
+    }
+
     /// B-J: register a `java.lang.invoke.VarHandle` as a permanent GC root.
     /// VarHandles live in `static final` fields and are used for lock-free CAS;
     /// without an explicit root a moving GC reclaimed them and left their static
@@ -2377,6 +2387,23 @@ pub trait NativeContext {
     fn module_packages(&self, module_name: &str) -> Vec<String> {
         let _ = module_name;
         vec![]
+    }
+
+    /// Return the `uses` service-type binary names (slash format) declared by
+    /// `module_name`'s `module-info.class` `uses` directives. Empty for the
+    /// unnamed module, an unregistered module, or a module whose descriptor
+    /// declares no `uses`.
+    fn module_uses(&self, module_name: &str) -> Vec<String> {
+        let _ = module_name;
+        vec![]
+    }
+
+    /// True if `module_name`'s `module-info.class` declared `open module ...`
+    /// (the real `ACC_MODULE_OPEN` flag). `false` for the unnamed module, an
+    /// unregistered module, or a module that isn't open.
+    fn module_is_open(&self, module_name: &str) -> bool {
+        let _ = module_name;
+        false
     }
 
     /// Return all registered module names.

@@ -165,7 +165,6 @@ fn invoke_long(method: &str) -> i64 {
 }
 
 #[test]
-#[ignore = "Timestamp.getTime returns 0 in baseline (constructor stores millis but getter rounds-trips through unimplemented path); owner WP1.8"]
 fn wp7_3_sqlTimestamp_millis_roundtrip() {
     require_class_files!();
     let got = invoke_long("sqlTimestamp_getTime");
@@ -176,7 +175,6 @@ fn wp7_3_sqlTimestamp_millis_roundtrip() {
 }
 
 #[test]
-#[ignore = "Date.getTime returns 0 in baseline; owner WP1.8"]
 fn wp7_3_sqlDate_millis_roundtrip() {
     require_class_files!();
     let got = invoke_long("sqlDate_getTime");
@@ -187,7 +185,6 @@ fn wp7_3_sqlDate_millis_roundtrip() {
 }
 
 #[test]
-#[ignore = "Time.getTime returns 0 in baseline; owner WP1.8"]
 fn wp7_3_sqlTime_millis_roundtrip() {
     require_class_files!();
     let got = invoke_long("sqlTime_getTime");
@@ -324,6 +321,24 @@ fn wp7_3_sqlTime_valueOf_string() {
 fn wp7_3_sqlTimestamp_valueOf_string() {
     require_class_files!();
     assert_pass("sqlTimestamp_valueOf_string");
+}
+
+#[test]
+fn wp7_3_sql_datetime_essential_natives_registered() {
+    let mut r = NativeMethodRegistry::new();
+    cratonvm_native_builtins::register_essential_natives(&mut r);
+
+    for class_name in ["java/sql/Date", "java/sql/Time", "java/sql/Timestamp"] {
+        assert!(
+            r.find(class_name, "<init>", "(J)V").is_some(),
+            "{class_name}.<init>(J)V must be registered for SQL date/time reachability"
+        );
+        assert!(
+            r.find(class_name, "toString", "()Ljava/lang/String;")
+                .is_some(),
+            "{class_name}.toString() must be registered for SQL date/time reachability"
+        );
+    }
 }
 
 // ---------------------------------------------------------------------------

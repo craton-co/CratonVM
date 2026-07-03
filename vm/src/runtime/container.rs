@@ -56,7 +56,7 @@ impl ContainerInfo {
 
 #[cfg(target_os = "linux")]
 mod platform {
-    use super::ContainerInfo;
+    use super::{calculate_effective_cpus, ContainerInfo};
     use std::fs;
     use std::path::Path;
 
@@ -231,7 +231,7 @@ mod platform {
 
 #[cfg(not(target_os = "linux"))]
 mod platform {
-    use super::ContainerInfo;
+    use super::{calculate_effective_cpus, ContainerInfo};
 
     pub fn detect_container() -> ContainerInfo {
         ContainerInfo::non_containerized()

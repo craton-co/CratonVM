@@ -1959,7 +1959,30 @@ pub(crate) fn register_core_stdlib_extras(r: &mut NativeMethodRegistry) {
     fn clinit_boolean(ctx: &mut dyn NativeContext, _: &[Value]) -> MethodCallResult {
         let m = ctx.primitive_class_mirror("boolean");
         if let Some(c) = ctx.class_id_by_name("java/lang/Boolean") {
-            ctx.set_static_field(c, 0, Value::Object(Some(m)));
+            // Unlike the other primitive wrappers (whose other static finals
+            // like MIN_VALUE/MAX_VALUE are primitives, so TYPE is their only
+            // object-reference static and lands at index 0), real
+            // java.lang.Boolean declares TRUE and FALSE — both
+            // object-reference statics — BEFORE TYPE, so real Boolean.TYPE is
+            // index 2, not 0. This native <clinit> replaces the real bytecode
+            // <clinit> entirely, so hardcoding index 0 here silently
+            // overwrote Boolean.TRUE with the Class mirror and left
+            // Boolean.FALSE at its default null forever — real-bytecode
+            // `Boolean.valueOf(false)` (`return b ? TRUE : FALSE`) returned
+            // null. Resolve TYPE's slot by name, and explicitly populate
+            // TRUE/FALSE since the real bytecode that would do so never runs.
+            let type_idx = ctx.static_field_index_by_name(c, "TYPE").unwrap_or(0);
+            ctx.set_static_field(c, type_idx, Value::Object(Some(m)));
+            if let Some(true_idx) = ctx.static_field_index_by_name(c, "TRUE") {
+                let true_obj = ctx.alloc_object(c, 1);
+                ctx.set_field(true_obj, 0, Value::Int(1));
+                ctx.set_static_field(c, true_idx, Value::Object(Some(true_obj)));
+            }
+            if let Some(false_idx) = ctx.static_field_index_by_name(c, "FALSE") {
+                let false_obj = ctx.alloc_object(c, 1);
+                ctx.set_field(false_obj, 0, Value::Int(0));
+                ctx.set_static_field(c, false_idx, Value::Object(Some(false_obj)));
+            }
         }
         Ok(None)
     }

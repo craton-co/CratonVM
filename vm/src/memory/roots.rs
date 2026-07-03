@@ -168,13 +168,36 @@ pub fn collect_roots(shared: &SharedVm, thread: &JvmThread) -> Vec<ObjectRef> {
         }
     }
 
-    // 7. System streams (System.out, System.err)
+    // 7. System streams (System.out, System.err, System.in)
+    //
+    // try_read, NOT read: the singleton initializers (e.g.
+    // `ensure_system_stdin_object`) hold the WRITE guard across allocating
+    // calls, and an allocation-triggered GC on that same thread would
+    // self-deadlock on the non-reentrant RwLock (observed live: instant
+    // 0-output wedge at the first stress GC inside the stdin window). A
+    // locked guard means the initializer is mid-population — the in-flight
+    // object is covered by its native_pin_roots pin, and the cache slot is
+    // not yet (or already) consistent, so skipping the scan is sound.
     {
-        if let Some(out_ref) = *shared.system_out.read() {
-            roots.push(out_ref);
+        if let Some(g) = shared.system_out.try_read() {
+            if let Some(out_ref) = *g {
+                roots.push(out_ref);
+            }
         }
-        if let Some(err_ref) = *shared.system_err.read() {
-            roots.push(err_ref);
+        if let Some(g) = shared.system_err.try_read() {
+            if let Some(err_ref) = *g {
+                roots.push(err_ref);
+            }
+        }
+        // gcstress residual face fix — `system_in` was missing from both this
+        // root scan and the update_all_roots remap (out/err had both): the
+        // cached System.in FileInputStream went stale on the first moving
+        // young GC after `ensure_system_stdin_object` populated it, and every
+        // later use of the cache served a dangling ObjectRef.
+        if let Some(g) = shared.system_in.try_read() {
+            if let Some(in_ref) = *g {
+                roots.push(in_ref);
+            }
         }
     }
 
@@ -415,7 +438,10 @@ pub fn collect_roots(shared: &SharedVm, thread: &JvmThread) -> Vec<ObjectRef> {
     //     invisible to the GC root scanner — under a moving collector the
     //     cached ObjectRefs would point at relocated or reclaimed memory
     //     after the first compaction.
-    cratonvm_native_builtins::lang_math::gc_scan_value_of_cache_roots(&mut roots);
+    cratonvm_native_builtins::lang_math::gc_scan_value_of_cache_roots(
+        shared.vm_identity,
+        &mut roots,
+    );
 
     // 15a. Unsafe / Class$Atomic synthetic-offset side stores. These hold live
     //      `ObjectRef`s that exist in NO heap slot (the synthetic-offset scheme

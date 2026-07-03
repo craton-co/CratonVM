@@ -2552,10 +2552,7 @@ extern "C" fn jni_set_long_field(_env: JNIEnv, obj: JObject, field_id: JFieldID,
         // handle into a Java long field (see smuggled_longs). Strict probe so
         // ordinary numeric stores don't register.
         let bits = val as u64;
-        if bits != 0
-            && bits & 0x7 == 0
-            && shared.heap.is_object_address(bits as usize).is_some()
-        {
+        if bits != 0 && bits & 0x7 == 0 && shared.heap.is_object_address(bits as usize).is_some() {
             crate::memory::smuggled_longs::record_minted_long(bits);
         }
         shared.heap.set_field(oref, field_index, Value::Long(val));
@@ -3398,6 +3395,7 @@ set_array_region!(jni_set_short_array_region, JShort, |v: JShort| Value::Int(
     v as i32
 )); // 210
 set_array_region!(jni_set_int_array_region, JInt, |v: JInt| Value::Int(v)); // 211
+
 // Index 212: SetLongArrayRegion — hand-unrolled (vs the macro) to add the
 // long-smuggle mint chokepoint: native code bulk-storing raw jobject handles
 // into a long[] (see smuggled_longs). Strict object-start probe per element,

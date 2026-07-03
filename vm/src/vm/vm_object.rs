@@ -751,6 +751,8 @@ pub fn get_or_create_class_mirror(shared: &SharedVm, class_id: ClassId) -> Objec
 /// Primitive mirrors use ClassId(0) and store Int(-1) in field 0 as a marker.
 /// Field 1 stores the primitive name as a String.
 pub fn get_or_create_primitive_mirror(shared: &SharedVm, prim_name: &str) -> ObjectRef {
+    let prim_name = canonical_primitive_mirror_name(prim_name);
+
     // Fast path: check cache
     if let Some(&mirror) = shared.primitive_mirrors.read().get(prim_name) {
         return mirror;
@@ -827,6 +829,21 @@ pub fn get_or_create_primitive_mirror(shared: &SharedVm, prim_name: &str) -> Obj
 
     mirrors.insert(prim_name.to_string(), mirror);
     mirror
+}
+
+fn canonical_primitive_mirror_name(name: &str) -> &str {
+    match name {
+        "I" | "int" => "int",
+        "J" | "long" => "long",
+        "F" | "float" => "float",
+        "D" | "double" => "double",
+        "Z" | "boolean" => "boolean",
+        "B" | "byte" => "byte",
+        "C" | "char" => "char",
+        "S" | "short" => "short",
+        "V" | "void" => "void",
+        other => other,
+    }
 }
 
 // ---------------------------------------------------------------------------

@@ -480,22 +480,22 @@ fn two_loaders_same_name_yield_distinct_class_ids() {
     // Both should be > 0 (init + foo).
     assert!(bytes_a_len > 0 && bytes_b_len > 0);
 
-    // `get_loaded_class_id` walks the built-in delegation chain and
-    // then falls back to the user-loaders set. With two distinct
-    // user-loader ids it must surface SOME registration for "Foo"
-    // (either one is acceptable since user-loaders aren't ordered),
-    // and that registration must be one of `id_a` or `id_b` — never
-    // a freshly-minted third id.
-    let any = cm.get_loaded_class_id("Foo");
-    assert!(
-        any.is_some(),
-        "Foo must be findable through user-loaders fallback"
-    );
-    let resolved_any = any.unwrap();
-    assert!(
-        resolved_any == id_a || resolved_any == id_b,
-        "get_loaded_class_id surfaced an unrelated ClassId {resolved_any:?} \
-         (expected {id_a:?} or {id_b:?})",
+    // `get_loaded_class_id` walks the built-in delegation chain and then
+    // falls back to the user-loaders set. This test's original expectation
+    // (surface SOME arbitrary registration) predates the "context.groovy
+    // fix" (see `get_loaded_class_id`'s doc comment): when two or more
+    // DIFFERENT user loaders each own their own distinct class under the
+    // identical name, a context-free, loader-unaware lookup cannot know
+    // which one the caller means, so it now deliberately reports a miss
+    // (`None`) rather than silently guessing — exactly the same contract
+    // `find_class_by_name` uses for the same reason. `Foo` under loader A
+    // and `Foo` under loader B are unambiguously two DIFFERENT classes
+    // here, so this is the correct outcome, not a bug.
+    assert_eq!(
+        cm.get_loaded_class_id("Foo"),
+        None,
+        "get_loaded_class_id must report ambiguous same-name registrations \
+         across distinct user loaders as a miss, not guess one",
     );
 }
 

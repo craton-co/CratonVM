@@ -10,8 +10,9 @@ import java.util.concurrent.ConcurrentHashMap;
  * (Value::Object(None)/Uninitialized → 0 in pop_int/pop_long) does not
  * regress under CHM's primitive-field-driven CAS retries.
  *
- * Each test method returns 1 on success, 0 on failure.  Wrapped in
- * try/catch so a thrown exception is also reported as 0.
+ * Most methods return 1 on success and 0 on failure. The no-resize boxed-value
+ * probes return negative stage codes for assertion misses and rethrow unexpected
+ * VM/linkage errors so the Rust harness can report the Java exception class.
  */
 public class ChmBasicProbe {
 
@@ -39,20 +40,29 @@ public class ChmBasicProbe {
      * working subset of CHM put/get on cratonvm even when the larger
      * post-resize path regresses.
      */
-    public static int testChmPreResizePutGet() {
+    public static int testChmPreResizePutGet() throws Throwable {
         try {
             ConcurrentHashMap<String, Integer> map = new ConcurrentHashMap<>();
             for (int i = 0; i < 11; i++) {
                 map.put("k" + i, i);
             }
-            if (map.size() != 11) return 0;
+            if (map.size() != 11) return -1;
             for (int i = 0; i < 11; i++) {
                 Integer v = map.get("k" + i);
-                if (v == null || v.intValue() != i) return 0;
+                if (v == null) return -100 - i;
+                if (v.intValue() != i) return -200 - i;
             }
             return 1;
+        } catch (NullPointerException t) {
+            return -991;
+        } catch (ClassCastException t) {
+            return -992;
+        } catch (ArrayIndexOutOfBoundsException t) {
+            return -993;
+        } catch (IllegalStateException t) {
+            return -994;
         } catch (Throwable t) {
-            return 0;
+            throw t;
         }
     }
 
@@ -73,27 +83,38 @@ public class ChmBasicProbe {
     }
 
     /** putIfAbsent + replace + remove cycle. */
-    public static int testChmMutationCycle() {
+    public static int testChmMutationCycle() throws Throwable {
         try {
             ConcurrentHashMap<String, Integer> map = new ConcurrentHashMap<>();
             // Initial put.
             Integer prev1 = map.putIfAbsent("k", 1);
-            if (prev1 != null) return 0;
+            if (prev1 != null) return -1;
             // putIfAbsent on existing key returns the existing mapping.
             Integer prev2 = map.putIfAbsent("k", 99);
-            if (prev2 == null || prev2.intValue() != 1) return 0;
+            if (prev2 == null) return -2;
+            if (prev2.intValue() != 1) return -3;
             // replace overwrites.
             Integer prev3 = map.replace("k", 42);
-            if (prev3 == null || prev3.intValue() != 1) return 0;
+            if (prev3 == null) return -4;
+            if (prev3.intValue() != 1) return -5;
             // remove returns the previous value.
             Integer prev4 = map.remove("k");
-            if (prev4 == null || prev4.intValue() != 42) return 0;
+            if (prev4 == null) return -6;
+            if (prev4.intValue() != 42) return -7;
             // After remove the key is gone.
-            if (map.containsKey("k")) return 0;
-            if (map.size() != 0) return 0;
+            if (map.containsKey("k")) return -8;
+            if (map.size() != 0) return -9;
             return 1;
+        } catch (NullPointerException t) {
+            return -991;
+        } catch (ClassCastException t) {
+            return -992;
+        } catch (ArrayIndexOutOfBoundsException t) {
+            return -993;
+        } catch (IllegalStateException t) {
+            return -994;
         } catch (Throwable t) {
-            return 0;
+            throw t;
         }
     }
 

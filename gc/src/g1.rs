@@ -305,54 +305,6 @@ impl<'a> SharedEvac<'a> {
         }
     }
 
-    unsafe fn append_kept_cset_region_objects(
-        &self,
-        forwards: &[(usize, usize)],
-        serial_work: &mut Vec<usize>,
-    ) {
-        let mut kept_regions = std::collections::HashSet::new();
-        for &(old, new) in forwards {
-            if old != new {
-                continue;
-            }
-            if let Some(region_idx) = self.collector.lookup_region_for_addr(old) {
-                if self.cset.contains(&region_idx) {
-                    kept_regions.insert(region_idx);
-                }
-            }
-        }
-        if kept_regions.is_empty() {
-            return;
-        }
-
-        let mut seen: std::collections::HashSet<usize> = serial_work.iter().copied().collect();
-        for region_idx in kept_regions {
-            let region = &*self.regions_base.0.add(region_idx);
-            if region.region_type == RegionType::Free {
-                continue;
-            }
-            let cursor = region.cursor;
-            let base = region.data.addr() as *mut u8;
-            let mut offset = 0usize;
-            while offset < cursor {
-                let obj_ptr = base.add(offset);
-                let header = &*(obj_ptr as *const ObjectHeader);
-                if is_humongous_filler(header) {
-                    break;
-                }
-                let obj_size = object_total_size(header);
-                if obj_size < HEADER_SIZE || offset + obj_size > cursor {
-                    break;
-                }
-                let addr = obj_ptr as usize;
-                if seen.insert(addr) {
-                    serial_work.push(addr);
-                }
-                offset += obj_size;
-            }
-        }
-    }
-
     fn record_fresh_child(
         old_ptr: *mut u8,
         new_ptr: *mut u8,
@@ -802,6 +754,12 @@ impl<'a> SharedEvac<'a> {
     /// worker can race another worker that is still copying the same object as a
     /// source. The driver therefore scans these in-place objects only after all
     /// parallel workers have stopped.
+    /// `scan` is the persistent cursor into `work`: entries before it were
+    /// already scanned by an earlier drain round of the same collection (the
+    /// caller loops this to a fixpoint with `append_kept_cset_region_objects`,
+    /// which can only grow `work`). The caller retires `tlab` once the
+    /// fixpoint is reached — NOT here — so successive rounds keep filling the
+    /// same partially-used to-space region instead of burning one per round.
     unsafe fn drain_deferred_self_forwarded(
         &self,
         tlab: &mut TlabSet,
@@ -809,12 +767,12 @@ impl<'a> SharedEvac<'a> {
         objs: &mut usize,
         bytes: &mut usize,
         work: &mut Vec<usize>,
+        scan: &mut usize,
     ) {
         let mut ignored_deferred = Vec::new();
-        let mut scan = 0usize;
-        while scan < work.len() {
-            let addr = work[scan];
-            scan += 1;
+        while *scan < work.len() {
+            let addr = work[*scan];
+            *scan += 1;
             self.process_object(
                 tlab,
                 addr as *mut u8,
@@ -826,7 +784,6 @@ impl<'a> SharedEvac<'a> {
                 false,
             );
         }
-        self.retire_all(tlab);
     }
 }
 
@@ -965,6 +922,11 @@ pub struct G1Region {
     pub pin_count: u32,
     /// Survivor age (number of young GCs survived).
     pub age: u8,
+    /// Incarnation counter, bumped on every [`Self::reset`]. Lets the
+    /// concurrent-mark cleanup detect that a region was recycled after the
+    /// mark-start snapshot (its content then has no mark information and
+    /// must be treated as live) — the TAMS-equivalent guard.
+    pub reuse_epoch: u64,
     /// Per-region mark bitmap for concurrent marking.
     ///
     /// Round-2 fix (HIGH — GC #5): the bitmap is keyed off the region's
@@ -997,6 +959,7 @@ impl G1Region {
             pinned: false,
             pin_count: 0,
             age: 0,
+            reuse_epoch: 0,
             mark_bitmap,
         }
     }
@@ -1036,6 +999,9 @@ impl G1Region {
         self.pinned = false;
         self.pin_count = 0;
         self.age = 0;
+        // New incarnation: content allocated from here on postdates any
+        // in-flight mark cycle's snapshot (see `cleanup`).
+        self.reuse_epoch = self.reuse_epoch.wrapping_add(1);
         // Round-2 fix (HIGH — GC #5): clear stale mark bits so they don't
         // pollute the next concurrent-mark cycle. The Vec is never
         // reallocated (only `fill(0)`'d) so the bitmap's base address
@@ -1198,6 +1164,28 @@ pub struct G1Collector {
     arena: Box<[u8]>,
     /// All heap regions.
     regions: Mutex<Vec<G1Region>>,
+
+    /// Adaptive `needs_gc` Free-fraction threshold, in percent (baseline 25).
+    /// Raised (up to 50) after any collection that recorded an evacuation
+    /// failure — the free pool at trigger time is the young collection's
+    /// ENTIRE to-space, so a live-young set larger than 25% of the heap
+    /// otherwise self-forwards en masse on every single pause (the retry
+    /// loop then drains the keeps, but at the cost of re-copying the live
+    /// set several times per pause). Decays back to the baseline after a
+    /// clean collection so healthy workloads keep the larger eden.
+    needs_gc_free_percent: AtomicUsize,
+
+    /// Per-region `(reuse_epoch, cursor, region_type)` snapshot captured at
+    /// concurrent-mark start (`start_concurrent_mark`, under the `regions`
+    /// lock). The TAMS equivalent: `cleanup` treats every byte allocated
+    /// after this snapshot — a grown cursor, a recycled (epoch-bumped) or
+    /// re-typed region — as LIVE, because the mark bitmap carries no
+    /// information about objects that did not exist when marking began.
+    /// Without it, cleanup freed Old regions filled by promotion DURING the
+    /// mark cycle (zero marked bytes), zeroing freshly-promoted live objects
+    /// wholesale (SteadyChurn: live list nodes vanished the moment the first
+    /// mark cycle completed under promotion pressure).
+    mark_start_snapshot: Mutex<Vec<(u64, usize, RegionType)>>,
 
     /// Index of the current Eden allocation region.
     current_eden: AtomicUsize,
@@ -1391,6 +1379,8 @@ impl G1Collector {
             regions: Mutex::new(regions),
             current_eden: AtomicUsize::new(usize::MAX), // no eden yet
             next_hash_code: AtomicI32::new(1),
+            needs_gc_free_percent: AtomicUsize::new(25),
+            mark_start_snapshot: Mutex::new(Vec::new()),
             gc_state: Arc::new(ConcurrentGcState::new()),
             satb_queue: Arc::new(SatbQueue::new()),
             collection_count: AtomicU64::new(0),
@@ -1621,11 +1611,265 @@ impl G1Collector {
                     regions[cset_idx].region_type = RegionType::Survivor;
                 }
             } else {
+                if std::env::var_os("CRATONVM_G1_DBG_REACH").is_some() {
+                    eprintln!(
+                        "[g1][FREED] evac region={cset_idx} type={:?} cursor={:#x}",
+                        regions[cset_idx].region_type, regions[cset_idx].cursor
+                    );
+                }
                 bytes_freed += regions[cset_idx].cursor;
                 regions[cset_idx].reset();
             }
         }
         bytes_freed
+    }
+
+    /// Evacuation-failure recovery (the kept-region death-spiral fix).
+    ///
+    /// A young/mixed pass that exhausts its to-space pool self-forwards every
+    /// remaining reached object, KEEPING each such object's region wholesale —
+    /// including all the garbage those regions hold. Under allocation churn
+    /// the free pool at trigger time is small (`needs_gc` fires at <25% free),
+    /// so once young-live exceeds the pool a single pass can convert most of
+    /// the heap into kept, mostly-garbage regions; every later collection then
+    /// finds even fewer free regions and keeps even more, monotonically, until
+    /// each pass reports `objects_copied == 0 && bytes_freed == 0` and the
+    /// mutator dies on a heap that is largely garbage. Observed
+    /// deterministically on the SteadyChurn recreation at `-Xmx16m` (serial
+    /// G1, --nojit): from the 4th collection onward nothing is copied or
+    /// freed, and the program aborts with a corrupted OOM-path throwable.
+    ///
+    /// Recovery: drain the self-forwarded (identity-forwarded) objects with a
+    /// MINIMAL live-only pass — evacuate exactly those objects (plus any
+    /// still-kept objects they transitively reference), rewrite all heap/root
+    /// references through the drain's map, and free the kept regions that are
+    /// now fully drained. Loop while progress is made and identities remain.
+    ///
+    /// The seeds are live BY CONSTRUCTION (only reached objects self-forward),
+    /// and their slots were already rewritten in place when the failing pass
+    /// scanned them, so the drain never touches a dead object and never walks
+    /// a region wholesale. (Two earlier designs failed here: re-running full
+    /// young collections re-copied the live set several times per pause —
+    /// inflating `gc_age` until the whole churn set promoted — and any
+    /// whole-region source walk resurrects dead objects' targets, a
+    /// compounding "undead" population that permanently filled Old.)
+    ///
+    /// Healthy collections (no evacuation failure) pay one `pointer_map`
+    /// scan; no drain runs.
+    fn retry_after_evacuation_failure(
+        &self,
+        first: GcResult,
+        roots: &mut [ObjectRef],
+        monitors: &dyn MonitorCleanup,
+    ) -> GcResult {
+        // Hard cap: each productive drain frees at least one region (growing
+        // the pool for the next), so real recoveries converge quickly.
+        const MAX_EVAC_RETRY_PASSES: usize = 8;
+
+        // Diagnostic kill-switch (bisection aid): CRATONVM_G1_NO_EVAC_RETRY=1
+        // restores the single-pass behaviour (and with it, the kept-region
+        // death spiral under to-space exhaustion).
+        if std::env::var_os("CRATONVM_G1_NO_EVAC_RETRY").is_some() {
+            return first;
+        }
+
+        let identities = |m: &HashMap<usize, usize>| -> Vec<usize> {
+            m.iter().filter(|(k, v)| k == v).map(|(&k, _)| k).collect()
+        };
+
+        let mut acc = first;
+        let mut seeds = identities(&acc.pointer_map);
+        if seeds.is_empty() {
+            // Clean pause: decay the adaptive trigger back toward baseline so
+            // healthy workloads keep the larger eden.
+            let cur = self.needs_gc_free_percent.load(Ordering::Relaxed);
+            if cur > 25 {
+                self.needs_gc_free_percent
+                    .store((cur - 5).max(25), Ordering::Relaxed);
+            }
+            return acc;
+        }
+        // Evacuation failure: the free pool at trigger time was too small for
+        // the live-young set. Trigger the NEXT collection earlier so its
+        // to-space pool is larger (capped at 50% of the heap).
+        {
+            let cur = self.needs_gc_free_percent.load(Ordering::Relaxed);
+            self.needs_gc_free_percent
+                .store((cur + 8).min(50), Ordering::Relaxed);
+        }
+
+        let mut passes = 1usize;
+        while !seeds.is_empty() && passes < MAX_EVAC_RETRY_PASSES {
+            let drain = self.drain_kept_self_forwards(&seeds, roots, monitors);
+            if std::env::var_os("CRATONVM_G1_DBG_REACH").is_some() {
+                eprintln!(
+                    "[g1][RETRY] drain pass={} seeds={} copied={} freed={} forwards={}",
+                    passes + 1,
+                    seeds.len(),
+                    drain.stats.objects_copied,
+                    drain.stats.bytes_freed,
+                    drain.pointer_map.len(),
+                );
+            }
+            let progressed = drain.stats.objects_copied > 0 || drain.stats.bytes_freed > 0;
+            seeds = identities(&drain.pointer_map);
+            Self::compose_forward_maps(&mut acc.pointer_map, &drain.pointer_map);
+            acc.stats.objects_copied += drain.stats.objects_copied;
+            acc.stats.bytes_copied += drain.stats.bytes_copied;
+            acc.stats.bytes_freed += drain.stats.bytes_freed;
+            passes += 1;
+            if !progressed {
+                break; // genuinely wedged: the live set does not fit (true OOM)
+            }
+        }
+        acc
+    }
+
+    /// Minimal same-pause drain of evacuation-failed objects: evacuate exactly
+    /// `seeds` (self-forwarded, hence LIVE, objects still sitting in kept
+    /// from-space regions) and their transitively-kept referents, then run the
+    /// normal Phase-4/5 fix-ups against the drain's forwarding map. See
+    /// [`Self::retry_after_evacuation_failure`].
+    fn drain_kept_self_forwards(
+        &self,
+        seeds: &[usize],
+        roots: &mut [ObjectRef],
+        monitors: &dyn MonitorCleanup,
+    ) -> GcResult {
+        let start = std::time::Instant::now();
+        let mut regions = self.regions.lock();
+        // SECURITY FIX (V7a): Phase 5 below can reset/retype regions.
+        self.rset_cache_epoch.fetch_add(1, Ordering::Release);
+
+        // The drain's collection set: exactly the regions holding seeds (the
+        // kept regions). Only seed-reachable objects inside them are copied.
+        let cset_set: std::collections::HashSet<usize> = seeds
+            .iter()
+            .filter_map(|&s| self.lookup_region_for_addr(s))
+            .collect();
+        let cset: Vec<usize> = cset_set.iter().copied().collect();
+        if cset.is_empty() {
+            return GcResult {
+                stats: GcStats {
+                    objects_copied: 0,
+                    bytes_copied: 0,
+                    bytes_freed: 0,
+                },
+                pointer_map: HashMap::new(),
+            };
+        }
+
+        let mut pointer_map: HashMap<usize, usize> = HashMap::new();
+        let mut objects_copied = 0usize;
+        let mut bytes_copied = 0usize;
+        let mut work_list: Vec<*mut u8> = Vec::new();
+
+        for &seed in seeds {
+            if let Some((new_ptr, _fresh)) = self.evacuate_object(
+                &mut regions,
+                seed as *mut u8,
+                &mut pointer_map,
+                &mut objects_copied,
+                &mut bytes_copied,
+                &cset_set,
+            ) {
+                work_list.push(new_ptr);
+            }
+        }
+        let mut scan_idx = 0;
+        while scan_idx < work_list.len() {
+            let obj_ptr = work_list[scan_idx];
+            scan_idx += 1;
+            let header = unsafe { &*(obj_ptr as *const ObjectHeader) };
+            self.scan_and_evacuate_refs(
+                &mut regions,
+                obj_ptr,
+                header,
+                &cset_set,
+                &mut pointer_map,
+                &mut objects_copied,
+                &mut bytes_copied,
+                &mut work_list,
+            );
+        }
+
+        // Roots may point directly at seeds — remap them like Phase 1 would.
+        for root in roots.iter_mut() {
+            if let Some(&new_addr) = pointer_map.get(&(root.as_ptr() as usize)) {
+                *root = unsafe { ObjectRef::from_raw(new_addr as *mut u8) };
+            }
+        }
+
+        // Phase 4/5 equivalents against the drain map.
+        self.update_references_in_regions(&mut regions, &cset_set, &pointer_map);
+        let bytes_freed = self.free_or_keep_cset(&mut regions, &cset, &pointer_map);
+        self.verify_no_dangling_into_cset(&regions, &cset_set, &pointer_map);
+        self.dbg_verify_no_unrewritten_forward(&regions, &cset_set, &pointer_map, roots);
+        self.dbg_scan_for_zeroed_refs(&regions, &cset_set, roots);
+        self.dbg_verify_reachable_integrity(&regions, roots, "kept-drain");
+
+        let cur_eden = self.current_eden.load(Ordering::Relaxed);
+        if cset_set.contains(&cur_eden) {
+            self.current_eden.store(usize::MAX, Ordering::Relaxed);
+        }
+
+        let old_bytes: usize = regions
+            .iter()
+            .filter(|r| r.region_type == RegionType::Old)
+            .map(|r| r.cursor)
+            .sum();
+        self.old_gen_bytes.store(old_bytes, Ordering::Relaxed);
+
+        monitors.remap_after_gc(&pointer_map);
+
+        // Remap (or drop) stale concurrent-mark worklist entries — same
+        // protocol as the young paths (done under STW, guard held).
+        {
+            let mut worklist = self.mark_worklist.lock();
+            if !worklist.is_empty() {
+                worklist.retain_mut(|addr| {
+                    if let Some(&new_addr) = pointer_map.get(&*addr) {
+                        *addr = new_addr;
+                        return true;
+                    }
+                    match self.region_for_ptr(&regions, *addr as *mut u8) {
+                        Some(idx) if cset_set.contains(&idx) => false,
+                        _ => true,
+                    }
+                });
+            }
+        }
+
+        let pause_us = start.elapsed().as_micros() as u64;
+        let stats = GcStats {
+            objects_copied,
+            bytes_copied,
+            bytes_freed,
+        };
+        self.record_collection(G1CollectionType::YoungOnly, pause_us, &stats);
+        GcResult { stats, pointer_map }
+    }
+
+    /// Compose the forwarding maps of two consecutive same-pause passes
+    /// (`acc` ran first, `next` second) into `acc`.
+    ///
+    /// Values chase one hop: an object moved by an earlier pass and moved
+    /// again — including a pass-1 self-forward `k -> k` that a retry resolved
+    /// to a real copy — ends at its final address. New keys are added only if
+    /// absent: the VM's `update_all_roots` remaps frame locals that hold
+    /// PAUSE-START addresses, so when a `next` key collides with an existing
+    /// `acc` key the `acc` entry is the meaningful one (the `next` key is a
+    /// pass-1-freed address recycled as later-pass to-space — no frame local
+    /// can name it).
+    fn compose_forward_maps(acc: &mut HashMap<usize, usize>, next: &HashMap<usize, usize>) {
+        for v in acc.values_mut() {
+            if let Some(&nv) = next.get(v) {
+                *v = nv;
+            }
+        }
+        for (&k, &v) in next {
+            acc.entry(k).or_insert(v);
+        }
     }
 
     // -----------------------------------------------------------------------
@@ -1724,6 +1968,29 @@ impl G1Collector {
             }
         }
 
+        // Phase 1b: marking keep-alive (see `marking_keepalive_roots`).
+        // While a concurrent mark cycle is active, CSet-resident gray/SATB
+        // objects are snapshot-live: evacuate them like roots so the marker
+        // can finish tracing them. The worklist remap at the end of this
+        // pause then rewrites every gray through `pointer_map` instead of
+        // dropping it (a drop = the object's unscanned subtree is silently
+        // unmarked = cleanup frees live Old/humongous objects).
+        for addr in self.marking_keepalive_roots(&regions, &cset_set) {
+            if let Some((new_ptr, fresh)) = self.evacuate_object(
+                &mut regions,
+                addr as *mut u8,
+                &mut pointer_map,
+                &mut objects_copied,
+                &mut bytes_copied,
+                &cset_set,
+            ) {
+                if fresh {
+                    work_list.push(new_ptr);
+                }
+                self.push_gray_or_mark(&regions, new_ptr as usize);
+            }
+        }
+
         // Phase 2: Scan remembered sets for references into CSet
         // (Collect rset sources before mutating regions)
         let mut rset_sources: Vec<(usize, Vec<usize>)> = Vec::new();
@@ -1746,7 +2013,16 @@ impl G1Collector {
             .iter()
             .flat_map(|(_, srcs)| srcs.iter().copied())
             .collect();
+        let dbg_phases = std::env::var_os("CRATONVM_G1_DBG_REACH").is_some();
+        let p1_forwards = pointer_map.len();
         unique_sources.extend(jit_pinned_regions.iter().copied());
+        if dbg_phases {
+            eprintln!(
+                "[g1][PHASES] roots={} p1_forwards={p1_forwards} sources={:?}",
+                roots.len(),
+                unique_sources
+            );
+        }
         for src_idx in unique_sources {
             self.scan_source_region_for_cset_refs(
                 &mut regions,
@@ -1756,6 +2032,13 @@ impl G1Collector {
                 &mut objects_copied,
                 &mut bytes_copied,
                 &mut work_list,
+            );
+        }
+        if dbg_phases {
+            eprintln!(
+                "[g1][PHASES] after-sources forwards={} (delta={})",
+                pointer_map.len(),
+                pointer_map.len() - p1_forwards
             );
         }
 
@@ -1789,6 +2072,13 @@ impl G1Collector {
         // forwarding entry (incomplete remembered set => UAF). No-op on
         // the release/quiet path; aborts in debug.
         self.verify_no_dangling_into_cset(&regions, &cset_set, &pointer_map);
+        // Env-gated diagnostics (no-ops unless CRATONVM_G1_DBG_HEADERS /
+        // CRATONVM_G1_DBG_ZERO are set) — same coverage the parallel path has,
+        // so serial-path corruption is also caught at the collection that
+        // introduces it.
+        self.dbg_verify_no_unrewritten_forward(&regions, &cset_set, &pointer_map, roots);
+        self.dbg_scan_for_zeroed_refs(&regions, &cset_set, roots);
+        self.dbg_verify_reachable_integrity(&regions, roots, "young-serial");
 
         // Young and mixed evacuation leave humongous spans in place. Their
         // reachability is decided by the concurrent-mark cleanup phase, which
@@ -1818,10 +2108,17 @@ impl G1Collector {
         // young STW. The marker, after we unpark mutators, would otherwise
         // dereference stale pointers into freed regions → UAF. Walk the
         // worklist and apply the same `pointer_map` we applied to roots
-        // and remembered-set updates; drop entries whose source region was
-        // freed (no forward) since those objects were unreachable via the
-        // normal evacuation closure (the only way they were on the
-        // worklist without being evacuated is if they were already dead).
+        // and remembered-set updates.
+        //
+        // With the Phase-1b marking keep-alive, every CSet-resident gray was
+        // evacuated above and therefore has a forwarding entry — the drop arm
+        // below is defensive only. (It used to fire for grays the evacuation
+        // closure did not reach, on the reasoning "unreached ⇒ dead ⇒ safe to
+        // drop" — unsound under SATB: a gray unreachable at PAUSE time was
+        // still live at MARK START, and dropping it unmarked its whole
+        // unscanned subtree, which can include Old/humongous objects that are
+        // very much live at cleanup. That was the marking-soundness defect
+        // behind SteadyChurn's freed-live-Old-region failure.)
         //
         // Done under STW (still holding `regions.lock()`), so no marker
         // thread can be reading/writing `mark_worklist` concurrently — the
@@ -2066,6 +2363,28 @@ impl G1Collector {
             }
         }
 
+        // Marking keep-alive (see `marking_keepalive_roots`): a mixed pause
+        // can run while a NEW concurrent mark cycle is active (IHOP re-fires
+        // during the post-cleanup mixed sequence — `start_concurrent_mark`
+        // does not clear `marking_complete`), and its CSet includes Old
+        // regions, exactly where the gray set concentrates. Same protocol as
+        // the young paths.
+        for addr in self.marking_keepalive_roots(&regions, &cset_set) {
+            if let Some((new_ptr, fresh)) = self.evacuate_object(
+                &mut regions,
+                addr as *mut u8,
+                &mut pointer_map,
+                &mut objects_copied,
+                &mut bytes_copied,
+                &cset_set,
+            ) {
+                if fresh {
+                    work_list.push(new_ptr);
+                }
+                self.push_gray_or_mark(&regions, new_ptr as usize);
+            }
+        }
+
         // CRIT fix (UAF): process remembered-set sources for every CSet
         // region. Collect sources up front (before mutating regions during
         // evacuation), dedup, then walk each source region rewriting
@@ -2090,6 +2409,7 @@ impl G1Collector {
             set.extend(jit_pinned_regions.iter().copied());
             set
         };
+
         for src_idx in mixed_rset_sources {
             self.scan_source_region_for_cset_refs(
                 &mut regions,
@@ -2131,6 +2451,12 @@ impl G1Collector {
         // survivor slot dangles into a freed CSet region. No-op on the
         // release/quiet path; aborts in debug.
         self.verify_no_dangling_into_cset(&regions, &cset_set, &pointer_map);
+        // Env-gated diagnostics (no-ops unless CRATONVM_G1_DBG_HEADERS /
+        // CRATONVM_G1_DBG_ZERO are set) — mixed-path coverage matching the
+        // parallel young path.
+        self.dbg_verify_no_unrewritten_forward(&regions, &cset_set, &pointer_map, roots);
+        self.dbg_scan_for_zeroed_refs(&regions, &cset_set, roots);
+        self.dbg_verify_reachable_integrity(&regions, roots, "mixed-serial");
 
         let cur_eden = self.current_eden.load(Ordering::Relaxed);
         if cset_set.contains(&cur_eden) {
@@ -2146,6 +2472,28 @@ impl G1Collector {
         self.old_gen_bytes.store(old_bytes, Ordering::Relaxed);
 
         monitors.remap_after_gc(&pointer_map);
+
+        // Remap (or drop) stale concurrent-mark worklist entries — same
+        // protocol as the young paths. A mixed pause moves OLD objects, where
+        // the gray set concentrates; before this block the mixed path left
+        // every gray pointing into freed CSet regions (marker UAF whenever a
+        // new mark cycle overlaps the mixed sequence). With the keep-alive
+        // above, every retained CSet gray has a forwarding entry.
+        {
+            let mut worklist = self.mark_worklist.lock();
+            if !worklist.is_empty() {
+                worklist.retain_mut(|addr| {
+                    if let Some(&new_addr) = pointer_map.get(&*addr) {
+                        *addr = new_addr;
+                        return true;
+                    }
+                    match self.region_for_ptr(&regions, *addr as *mut u8) {
+                        Some(idx) if cset_set.contains(&idx) => false,
+                        _ => true,
+                    }
+                });
+            }
+        }
 
         // Decrement mixed GC counter.
         // Relaxed ordering: mixed_gc_remaining and marking_complete are GC-internal
@@ -2219,6 +2567,7 @@ impl G1Collector {
         cset_set: &std::collections::HashSet<usize>,
         pool: Vec<usize>,
         roots: &mut [ObjectRef],
+        keepalive: &[usize],
     ) -> (HashMap<usize, usize>, usize, usize) {
         // One-shot confirmation that the parallel evacuator is genuinely active
         // (the gauntlet lesson: never assume a gated path was taken — verify).
@@ -2264,6 +2613,35 @@ impl G1Collector {
                         &mut bytes,
                     ) {
                         *root = ObjectRef::from_raw(new_ptr);
+                        if fresh {
+                            if new_ptr == old_ptr {
+                                main_deferred_self_forwarded.push(new_ptr as usize);
+                            } else {
+                                outstanding.fetch_add(1, Ordering::AcqRel);
+                                queue.lock().push(new_ptr as usize);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // Phase 1b (driver): seed marking keep-alive addresses (CSet-resident
+        // gray/SATB objects — snapshot-live; see `marking_keepalive_roots`).
+        // Evacuated exactly like roots; the fresh copies are re-grayed by the
+        // caller and the worklist remap after Phase 5 rewrites the old gray
+        // entries through the forwarding map instead of dropping them.
+        for &addr in keepalive {
+            let old_ptr = addr as *mut u8;
+            if let Some(ridx) = self.lookup_region_for_addr(addr) {
+                if cset_set.contains(&ridx) {
+                    if let Some((new_ptr, fresh)) = shared.evacuate(
+                        &mut main_tlab,
+                        old_ptr,
+                        &mut main_forwards,
+                        &mut objs,
+                        &mut bytes,
+                    ) {
                         if fresh {
                             if new_ptr == old_ptr {
                                 main_deferred_self_forwarded.push(new_ptr as usize);
@@ -2361,17 +2739,31 @@ impl G1Collector {
         // drain set from the merged forward shards as a backstop for every
         // caller path, rather than relying only on the side-channel populated
         // when a caller observes `fresh && old == new`.
-        SharedEvac::append_self_forwarded_from_forwards(
-            &main_forwards,
-            &mut main_deferred_self_forwarded,
-        );
-        unsafe {
-            shared
-                .append_kept_cset_region_objects(&main_forwards, &mut main_deferred_self_forwarded);
-        }
-
-        if !main_deferred_self_forwarded.is_empty() {
-            let mut serial_tlab = TlabSet::default();
+        //
+        // FIXPOINT: the serial drain can itself self-forward children (pool
+        // exhaustion mid-drain), so re-derive the identity-forward set and
+        // re-drain until no new work appears — every LIVE self-forwarded
+        // holder gets its slots rewritten before Phase 4/5.
+        //
+        // DEAD objects in kept regions are deliberately NOT scanned (an
+        // earlier revision walked every object of every kept region here;
+        // under sustained evacuation failure that resurrected the kept
+        // regions' garbage wholesale each pause — the dead holders' targets
+        // were evacuated as if live — and OOMed the SteadyChurn recreation).
+        // Their slots may retain stale cross-cycle references, which is safe:
+        // a stale reference can only point into a region that is Free, a
+        // this-pause destination, or a mutator-reused region — never a
+        // CSet-resident live object — so nothing consults it as a live edge.
+        let mut serial_tlab = TlabSet::default();
+        let mut drained = 0usize;
+        loop {
+            SharedEvac::append_self_forwarded_from_forwards(
+                &main_forwards,
+                &mut main_deferred_self_forwarded,
+            );
+            if drained >= main_deferred_self_forwarded.len() {
+                break;
+            }
             unsafe {
                 shared.drain_deferred_self_forwarded(
                     &mut serial_tlab,
@@ -2379,8 +2771,12 @@ impl G1Collector {
                     &mut objs,
                     &mut bytes,
                     &mut main_deferred_self_forwarded,
+                    &mut drained,
                 );
             }
+        }
+        unsafe {
+            shared.retire_all(&mut serial_tlab);
         }
 
         // Merge the per-worker forward shards into the pointer map consumed by
@@ -2469,11 +2865,17 @@ impl G1Collector {
             .map(|(i, _)| i)
             .collect();
 
+        // Marking keep-alive (see `marking_keepalive_roots`): computed while
+        // the guard is still dereferenceable, passed to the evacuator as
+        // extra roots, and re-grayed after Phase 5 below.
+        let keepalive = self.marking_keepalive_roots(&regions, &cset_set);
+
         // Take the raw regions base; do NOT deref `regions` again until after
         // `parallel_evacuate` returns (see the module SAFETY MODEL note).
         let regions_base = RegionsBase(regions.as_mut_ptr());
-        let (pointer_map, objects_copied, bytes_copied) =
-            unsafe { self.parallel_evacuate(regions_base, &cset, &cset_set, pool, roots) };
+        let (pointer_map, objects_copied, bytes_copied) = unsafe {
+            self.parallel_evacuate(regions_base, &cset, &cset_set, pool, roots, &keepalive)
+        };
 
         // Phase 4: update interior refs in non-CSet regions.
         self.update_references_in_regions(&mut regions, &cset_set, &pointer_map);
@@ -2483,6 +2885,16 @@ impl G1Collector {
         self.verify_no_dangling_into_cset(&regions, &cset_set, &pointer_map);
         self.dbg_verify_no_unrewritten_forward(&regions, &cset_set, &pointer_map, roots);
         self.dbg_scan_for_zeroed_refs(&regions, &cset_set, roots);
+        self.dbg_verify_reachable_integrity(&regions, roots, "young-parallel");
+
+        // Re-gray the keep-alive copies (SATB-origin entries never sat in the
+        // worklist, so the remap below cannot rewrite them — push their
+        // relocated copies explicitly; duplicates are idempotent).
+        for &addr in &keepalive {
+            if let Some(&new_addr) = pointer_map.get(&addr) {
+                self.push_gray_or_mark(&regions, new_addr);
+            }
+        }
 
         let cur_eden = self.current_eden.load(Ordering::Relaxed);
         if cset_set.contains(&cur_eden) {
@@ -2600,14 +3012,27 @@ impl G1Collector {
             .map(|(i, _)| i)
             .collect();
 
+        // Marking keep-alive (see `marking_keepalive_roots` and the note in
+        // the serial `mixed_collection`).
+        let keepalive = self.marking_keepalive_roots(&regions, &cset_set);
+
         let regions_base = RegionsBase(regions.as_mut_ptr());
-        let (pointer_map, objects_copied, bytes_copied) =
-            unsafe { self.parallel_evacuate(regions_base, &cset, &cset_set, pool, roots) };
+        let (pointer_map, objects_copied, bytes_copied) = unsafe {
+            self.parallel_evacuate(regions_base, &cset, &cset_set, pool, roots, &keepalive)
+        };
 
         self.update_references_in_regions(&mut regions, &cset_set, &pointer_map);
 
         let bytes_freed = self.free_or_keep_cset(&mut regions, &cset, &pointer_map);
         self.verify_no_dangling_into_cset(&regions, &cset_set, &pointer_map);
+        self.dbg_verify_reachable_integrity(&regions, roots, "mixed-parallel");
+
+        // Re-gray the keep-alive copies (see young_collection_parallel).
+        for &addr in &keepalive {
+            if let Some(&new_addr) = pointer_map.get(&addr) {
+                self.push_gray_or_mark(&regions, new_addr);
+            }
+        }
 
         let cur_eden = self.current_eden.load(Ordering::Relaxed);
         if cset_set.contains(&cur_eden) {
@@ -2622,6 +3047,25 @@ impl G1Collector {
         self.old_gen_bytes.store(old_bytes, Ordering::Relaxed);
 
         monitors.remap_after_gc(&pointer_map);
+
+        // Remap (or drop) stale concurrent-mark worklist entries — same
+        // protocol as the young paths (the mixed CSet includes Old regions,
+        // where the gray set concentrates).
+        {
+            let mut worklist = self.mark_worklist.lock();
+            if !worklist.is_empty() {
+                worklist.retain_mut(|addr| {
+                    if let Some(&new_addr) = pointer_map.get(&*addr) {
+                        *addr = new_addr;
+                        return true;
+                    }
+                    match self.region_for_ptr(&regions, *addr as *mut u8) {
+                        Some(idx) if cset_set.contains(&idx) => false,
+                        _ => true,
+                    }
+                });
+            }
+        }
 
         let remaining = self.mixed_gc_remaining.load(Ordering::Relaxed);
         if remaining > 0 {
@@ -2966,6 +3410,12 @@ impl G1Collector {
             }
             let obj_size = object_total_size(header);
             if obj_size < HEADER_SIZE || offset + obj_size > cursor {
+                if std::env::var_os("CRATONVM_G1_DBG_REACH").is_some() {
+                    eprintln!(
+                        "[g1][WALKBRK] source-scan region={source_idx} off={offset:#x} \
+                         cursor={cursor:#x} obj_size={obj_size:#x}"
+                    );
+                }
                 break;
             }
 
@@ -3098,6 +3548,12 @@ impl G1Collector {
                 let obj_size = object_total_size(header);
 
                 if obj_size < HEADER_SIZE || offset + obj_size > cursor {
+                    if std::env::var_os("CRATONVM_G1_DBG_REACH").is_some() {
+                        eprintln!(
+                            "[g1][WALKBRK] phase4 region={i} off={offset:#x} \
+                             cursor={cursor:#x} obj_size={obj_size:#x}"
+                        );
+                    }
                     break;
                 }
 
@@ -3543,9 +3999,318 @@ impl G1Collector {
         }
     }
 
+    /// DIAGNOSTIC (env `CRATONVM_G1_DBG_REACH=1`): after a collection, BFS the
+    /// heap from `roots` and report any REACHABLE slot whose target has a
+    /// zeroed header or lies outside every region. Unlike `DBG-ZERO` (which
+    /// walks regions linearly and false-positives on dead objects' harmless
+    /// stale slots), this checks exactly the invariant the mutator depends on
+    /// — so the FIRST collection it fires on is the one that corrupted live
+    /// state. No-op unless the env is set.
+    fn dbg_verify_reachable_integrity(
+        &self,
+        regions: &[G1Region],
+        roots: &[ObjectRef],
+        label: &str,
+    ) {
+        if std::env::var_os("CRATONVM_G1_DBG_REACH").is_none() {
+            return;
+        }
+        static PAUSE_NO: AtomicUsize = AtomicUsize::new(0);
+        let pause = PAUSE_NO.fetch_add(1, Ordering::Relaxed);
+
+        let is_zeroed = |addr: usize| -> bool {
+            let h = unsafe { &*(addr as *const ObjectHeader) };
+            // identity_hash_code is stamped non-zero on every allocation, so
+            // requiring it zero here keeps a live bare `new Object()` (which
+            // legitimately has class_id 0 / no slots) from false-positiving.
+            h.class_id.as_u32() == 0
+                && h.num_slots == 0
+                && (h.kind as u8) == 0
+                && h.array_length == 0
+                && h.identity_hash_code == 0
+        };
+
+        let mut stack: Vec<usize> = Vec::new();
+        let mut seen: std::collections::HashSet<usize> = std::collections::HashSet::new();
+        let mut bad = 0usize;
+        let mut check_push = |addr: usize,
+                              holder: usize,
+                              where_: &str,
+                              slot: usize,
+                              stack: &mut Vec<usize>,
+                              seen: &mut std::collections::HashSet<usize>,
+                              bad: &mut usize| {
+            if addr == 0 {
+                return;
+            }
+            let region = self.lookup_region_for_addr(addr);
+            if region.is_none() || is_zeroed(addr) {
+                *bad += 1;
+                if *bad <= 16 {
+                    let (hcid, hkind, hslots, hlen) = if holder != 0 {
+                        let hh = unsafe { &*(holder as *const ObjectHeader) };
+                        (
+                            hh.class_id.as_u32(),
+                            hh.kind as u8,
+                            hh.num_slots,
+                            hh.array_length,
+                        )
+                    } else {
+                        (0, 0, 0, 0)
+                    };
+                    let hregion = self.lookup_region_for_addr(holder);
+                    let (hoff, hcur) = hregion
+                        .map(|ri| {
+                            let base = regions[ri].data.as_ptr() as usize;
+                            (holder - base, regions[ri].cursor)
+                        })
+                        .unwrap_or((0, 0));
+                    eprintln!(
+                        "[g1][DBG-REACH] pause={pause} {label}: LIVE-REACHABLE {where_}[{slot}] \
+                         holder={holder:#x} (cid={hcid} kind={hkind} slots={hslots} len={hlen} \
+                         region={hregion:?} off={hoff:#x} cursor={hcur:#x}{}) -> {addr:#x} is {} \
+                         (region={region:?})",
+                        if hoff >= hcur { " ABOVE-CURSOR" } else { "" },
+                        if region.is_none() { "WILD" } else { "ZEROED" }
+                    );
+                }
+                return;
+            }
+            if seen.insert(addr) {
+                stack.push(addr);
+            }
+        };
+
+        for r in roots {
+            check_push(
+                r.as_ptr() as usize,
+                0,
+                "root",
+                0,
+                &mut stack,
+                &mut seen,
+                &mut bad,
+            );
+        }
+        while let Some(addr) = stack.pop() {
+            let header = unsafe { &*(addr as *const ObjectHeader) };
+            if header.kind == ObjectKind::Array {
+                if header.element_type == ArrayElementType::Reference {
+                    let data = unsafe { (addr as *const u8).add(HEADER_SIZE) };
+                    for k in 0..header.array_length as usize {
+                        let raw = unsafe { std::ptr::read(data.add(k * 8) as *const u64) } as usize;
+                        check_push(raw, addr, "array-elem", k, &mut stack, &mut seen, &mut bad);
+                    }
+                }
+            } else {
+                let data = unsafe { (addr as *const u8).add(HEADER_SIZE) };
+                for s in 0..header.num_slots as usize {
+                    let v = unsafe { std::ptr::read(data.add(s * SLOT_SIZE) as *const Value) };
+                    if let Value::Object(Some(o)) = v {
+                        check_push(
+                            o.as_ptr() as usize,
+                            addr,
+                            "field",
+                            s,
+                            &mut stack,
+                            &mut seen,
+                            &mut bad,
+                        );
+                    }
+                }
+            }
+        }
+        if bad > 0 {
+            eprintln!(
+                "[g1][DBG-REACH] pause={pause} {label}: {bad} corrupted LIVE-REACHABLE ref(s) \
+                 ({} objects reached)",
+                seen.len()
+            );
+        }
+
+        // Root census (env CRATONVM_G1_DBG_ROOTCENSUS=1): per-root transitive
+        // reach counts, to identify a stale root anchoring a large dead
+        // subgraph (e.g. a historical list node retaining everything appended
+        // after it through `next` chains).
+        if std::env::var_os("CRATONVM_G1_DBG_ROOTCENSUS").is_some() {
+            for (ri, r) in roots.iter().enumerate() {
+                let addr = r.as_ptr() as usize;
+                if addr == 0 || self.lookup_region_for_addr(addr).is_none() {
+                    continue;
+                }
+                let mut rseen: std::collections::HashSet<usize> = std::collections::HashSet::new();
+                let mut rstack = vec![addr];
+                rseen.insert(addr);
+                while let Some(a) = rstack.pop() {
+                    let h = unsafe { &*(a as *const ObjectHeader) };
+                    let data = unsafe { (a as *const u8).add(HEADER_SIZE) };
+                    if h.kind == ObjectKind::Array {
+                        if h.element_type == ArrayElementType::Reference {
+                            for k in 0..h.array_length as usize {
+                                let raw = unsafe { std::ptr::read(data.add(k * 8) as *const u64) }
+                                    as usize;
+                                if raw != 0
+                                    && self.lookup_region_for_addr(raw).is_some()
+                                    && rseen.insert(raw)
+                                {
+                                    rstack.push(raw);
+                                }
+                            }
+                        }
+                    } else {
+                        for s in 0..h.num_slots as usize {
+                            let v =
+                                unsafe { std::ptr::read(data.add(s * SLOT_SIZE) as *const Value) };
+                            if let Value::Object(Some(o)) = v {
+                                let a2 = o.as_ptr() as usize;
+                                if self.lookup_region_for_addr(a2).is_some() && rseen.insert(a2) {
+                                    rstack.push(a2);
+                                }
+                            }
+                        }
+                    }
+                }
+                if rseen.len() > 1000 {
+                    let h = unsafe { &*(addr as *const ObjectHeader) };
+                    // Diagnostic slot peek: for SteadyChurn-shaped objects,
+                    // slot 1 is the `seq` int — identifies WHICH node/payload
+                    // anchors the subgraph (ancient seq ⟹ stale root).
+                    let slot1 = if h.num_slots >= 2 {
+                        let v = unsafe {
+                            std::ptr::read(
+                                (addr as *const u8).add(HEADER_SIZE + SLOT_SIZE) as *const Value
+                            )
+                        };
+                        format!("{v:?}")
+                    } else {
+                        String::new()
+                    };
+                    eprintln!(
+                        "[g1][ROOTCENSUS] pause={pause} root#{ri} addr={addr:#x} cid={} kind={} \
+                         slots={} reach={} slot1={slot1}",
+                        h.class_id.as_u32(),
+                        h.kind as u8,
+                        h.num_slots,
+                        rseen.len()
+                    );
+                }
+            }
+        }
+    }
+
     // -----------------------------------------------------------------------
     // Concurrent Marking
     // -----------------------------------------------------------------------
+
+    /// Marking keep-alive (SATB soundness across evacuation pauses).
+    ///
+    /// While a concurrent mark cycle is active, two sets of raw object
+    /// addresses are snapshot-live (live at mark start, so the SATB
+    /// invariant obliges the marker to trace them to completion):
+    ///
+    ///   1. the gray set (`mark_worklist`) — discovered but not yet scanned;
+    ///   2. the SATB log — old reference values overwritten by mutators
+    ///      since the last drain.
+    ///
+    /// An evacuation pause moves/frees CSet regions, so both sets must be
+    /// carried across the pause. Dropping a CSet-resident gray whose object
+    /// the evacuation closure did not reach (the pre-fix `retain_mut`
+    /// behaviour) silently unmarks its entire unscanned subtree: a live Old
+    /// or humongous object whose only remaining marker-visible path ran
+    /// through that gray is then never marked, and cleanup frees it live
+    /// (the SteadyChurn `[FREED] cleanup region=N` failure). Leaving SATB
+    /// entries in the queue is just as bad once the final remark consumes
+    /// them: the addresses dangle into reset regions.
+    ///
+    /// Called at the start of an evacuation pause (STW, `regions` lock
+    /// held). Drains the SATB log (every parked mutator's local buffer plus
+    /// the global shards) into the gray set, then returns the gray entries
+    /// that live in the CSet and are not already marked (marked ⇒ already
+    /// scanned — its successors are in the gray set on their own). The
+    /// caller evacuates each returned address exactly like a root; the
+    /// existing worklist remap then rewrites every retained gray through
+    /// the pause's forwarding map instead of dropping it.
+    ///
+    /// No-op (empty Vec) while no cycle is active — the SATB queue is only
+    /// active between `start_concurrent_mark` and `cleanup`.
+    fn marking_keepalive_roots(
+        &self,
+        regions: &[G1Region],
+        cset_set: &std::collections::HashSet<usize>,
+    ) -> Vec<usize> {
+        if !self.satb_queue.is_active() {
+            return Vec::new();
+        }
+        // Mutators are parked at the STW barrier, so their thread-local SATB
+        // buffers are stable — pull them into the global shards, then drain.
+        crate::satb::flush_all_thread_satb_buffers(&self.satb_queue);
+        let mut worklist = self.mark_worklist.lock();
+        let mut keepalive: Vec<usize> = Vec::new();
+        for addr in self.satb_queue.drain() {
+            if addr == 0 {
+                continue;
+            }
+            let Some(idx) = self.lookup_region_for_addr(addr) else {
+                continue;
+            };
+            if regions[idx].region_type == RegionType::Free
+                || regions[idx].mark_bitmap.is_marked(addr)
+            {
+                continue;
+            }
+            if cset_set.contains(&idx) {
+                // CSet resident: the evacuation loop below owns its survival;
+                // its (forwarded) copy is re-grayed by the caller, so the
+                // worklist push is not needed and cannot be capped away.
+                keepalive.push(addr);
+            } else if worklist.len() < MARK_WORKLIST_CAP {
+                worklist.push(addr);
+            } else {
+                // Seed-class entry at cap. A plain drop is NOT recoverable:
+                // the overflow rescan only re-walks MARKED objects, and no
+                // marked object need reference a SATB seed. Mark it black
+                // without scanning — the rescan the flag forces will scan
+                // its fields. (Stays in place: non-CSet checked above.)
+                regions[idx].mark_bitmap.try_mark(addr);
+                self.mark_worklist_overflowed.store(true, Ordering::Relaxed);
+            }
+        }
+        keepalive.extend(worklist.iter().copied().filter(|&addr| {
+            match self.lookup_region_for_addr(addr) {
+                Some(idx) => cset_set.contains(&idx) && !regions[idx].mark_bitmap.is_marked(addr),
+                None => false,
+            }
+        }));
+        keepalive
+    }
+
+    /// Re-gray the relocated copy of a marking keep-alive object: push
+    /// `new_addr` onto the mark worklist, or — at the worklist cap — mark it
+    /// black-without-scan and set the overflow flag so the conservative
+    /// rescan in `concurrent_mark_step` scans its fields instead. `new_addr`
+    /// is a to-space (non-CSet) address, so the mark bit survives the pause.
+    fn push_gray_or_mark(&self, regions: &[G1Region], new_addr: usize) {
+        let mut worklist = self.mark_worklist.lock();
+        if worklist.len() < MARK_WORKLIST_CAP {
+            worklist.push(new_addr);
+        } else if let Some(idx) = self.lookup_region_for_addr(new_addr) {
+            regions[idx].mark_bitmap.try_mark(new_addr);
+            self.mark_worklist_overflowed.store(true, Ordering::Relaxed);
+        }
+    }
+
+    /// Abort an in-flight marking cycle WITHOUT acting on the (incomplete)
+    /// bitmap: discard the gray set, deactivate the SATB barrier, return the
+    /// phase to `Idle`. No cleanup verdicts are computed — the next cycle
+    /// re-discovers liveness from scratch. Used when the cycle's driver
+    /// state is lost (an orphaned controller slot) so the completion gate
+    /// in the VM does not spin forever on a cycle nobody is driving.
+    pub fn abort_concurrent_mark(&self) {
+        self.mark_worklist.lock().clear();
+        self.mark_worklist_overflowed.store(false, Ordering::Relaxed);
+        let _ = self.satb_queue.deactivate_and_drain();
+        self.gc_state.set_phase(ConcurrentGcPhase::Idle);
+    }
 
     /// Start a concurrent marking cycle. Sets phase to InitialMark.
     ///
@@ -3561,6 +4326,17 @@ impl G1Collector {
             for r in regions.iter() {
                 r.mark_bitmap.clear();
             }
+            // TAMS snapshot: record every region's incarnation + fill level
+            // at mark start so `cleanup` can treat later allocations as live
+            // (see `mark_start_snapshot`). Same regions-then-snapshot lock
+            // order as `cleanup`.
+            let mut snap = self.mark_start_snapshot.lock();
+            snap.clear();
+            snap.extend(
+                regions
+                    .iter()
+                    .map(|r| (r.reuse_epoch, r.cursor, r.region_type)),
+            );
         }
         self.mark_worklist.lock().clear();
         // Round-9 gc HIGH-5: reset overflow indicator at cycle start so
@@ -3961,8 +4737,13 @@ impl G1Collector {
         // `rset_cache_epoch`.
         self.rset_cache_epoch.fetch_add(1, Ordering::Release);
         let region_size = self.config.region_size;
+        // TAMS guard (see `mark_start_snapshot`): bytes allocated after the
+        // mark-start snapshot carry no mark information and MUST count as
+        // live, or this pass frees Old regions filled by promotion during
+        // the cycle and zeroes live objects.
+        let mark_snapshot: Vec<(u64, usize, RegionType)> = self.mark_start_snapshot.lock().clone();
 
-        for region in regions.iter_mut() {
+        for (region_idx, region) in regions.iter_mut().enumerate() {
             if region.region_type == RegionType::Free {
                 continue;
             }
@@ -3994,6 +4775,23 @@ impl G1Collector {
                 offset += obj_size;
             }
 
+            // TAMS: everything allocated after the mark-start snapshot is
+            // conservatively live. A recycled (epoch), re-typed, or absent
+            // snapshot entry means the region's ENTIRE content postdates the
+            // snapshot. An empty snapshot (cleanup driven outside a real
+            // mark cycle, e.g. unit tests) keeps the pure-bitmap behaviour.
+            if !mark_snapshot.is_empty() {
+                let post_mark_bytes = match mark_snapshot.get(region_idx) {
+                    Some(&(epoch, snap_cursor, snap_type))
+                        if epoch == region.reuse_epoch && snap_type == region.region_type =>
+                    {
+                        region.cursor.saturating_sub(snap_cursor)
+                    }
+                    _ => region.cursor,
+                };
+                live_bytes += post_mark_bytes;
+            }
+
             region.live_bytes = live_bytes;
             region.gc_efficiency = if region_size > 0 {
                 live_bytes as f64 / region_size as f64
@@ -4001,8 +4799,43 @@ impl G1Collector {
                 0.0
             };
 
-            // Free completely empty old regions
-            if region.live_bytes == 0 && region.region_type == RegionType::Old && !region.pinned {
+            // In-place free of wholly-dead Old regions — RESTORED. This was
+            // disabled ("containment") when concurrent marking missed objects
+            // whose holders young collections moved mid-cycle (SteadyChurn
+            // @16m: live list nodes vanished right after a mark cycle,
+            // observed via CRATONVM_G1_DBG_REACH + the [FREED] cleanup
+            // trace). The marker itself is fixed now, so a 0-live verdict is
+            // trustworthy again:
+            //
+            //   1. FINAL REMARK actually runs: the VM finishes every cycle
+            //      with an STW remark (root re-scan + SATB drain) and drains
+            //      the gray set to a fixed point BEFORE calling cleanup
+            //      (`vm_heap::g1_final_remark_and_cleanup`). Previously the
+            //      SATB log was never consumed — the whole cycle was a
+            //      one-shot closure racing mutator edge deletions.
+            //   2. KEEP-ALIVE across evacuation pauses: CSet-resident gray
+            //      and SATB entries are evacuated like roots and re-grayed
+            //      (`marking_keepalive_roots`), never dropped — snapshot-live
+            //      subtrees survive every young/mixed pause in the cycle.
+            //   3. TAMS: the `mark_start_snapshot` guard above counts every
+            //      post-snapshot allocation as live.
+            //
+            // Under (1)–(3), `live_bytes == 0` ⇒ every object in the region
+            // predates the mark snapshot and is unreachable in it ⇒ garbage
+            // by SATB. The empty-snapshot gate keeps the bitmap-only verdict
+            // advisory when cleanup is driven outside a real cycle (unit
+            // tests) — no in-place free there.
+            if !mark_snapshot.is_empty()
+                && region.live_bytes == 0
+                && region.region_type == RegionType::Old
+                && !region.pinned
+            {
+                if std::env::var_os("CRATONVM_G1_DBG_REACH").is_some() {
+                    eprintln!(
+                        "[g1][FREED] cleanup region={region_idx} cursor={:#x}",
+                        region.cursor
+                    );
+                }
                 region.reset();
             }
         }
@@ -4102,8 +4935,18 @@ impl G1Collector {
             // Pause too long: lower threshold to start marking earlier
             (current_threshold as f64 * 0.9) as usize
         } else if actual_pause_ms < target / 2 {
-            // Pause well under target: raise threshold
-            let max = self.config.heap_size * 90 / 100;
+            // Pause well under target: raise threshold — but NEVER above the
+            // statically-configured IHOP. G1 has no full-GC fallback: letting
+            // fast young pauses defer marking indefinitely means dead promoted
+            // objects accumulate in Old unreclaimed until the heap is
+            // exhausted. Observed on the SteadyChurn recreation: ~7ms pauses
+            // raised the threshold 5% per collection to the old 90%-of-heap
+            // cap, concurrent marking never started across 61k young
+            // collections, and every heap size died with a true OOM while
+            // >80% of Old was garbage. The adaptive threshold may float
+            // BELOW the configured IHOP (long pauses → mark earlier) and
+            // recover back up to it, no further.
+            let max = self.config.heap_size * self.config.ihop_percent as usize / 100;
             ((current_threshold as f64 * 1.05) as usize).min(max)
         } else {
             current_threshold
@@ -4274,8 +5117,42 @@ impl G1Collector {
             stats.bytes_freed,
         );
         eprintln!(
-            "[GC-STAT] type={:?} pause_us={pause_us} objects_copied={} bytes_copied={} bytes_freed={}",
-            collection_type, stats.objects_copied, stats.bytes_copied, stats.bytes_freed,
+            "[GC-STAT] type={:?} pause_us={pause_us} objects_copied={} bytes_copied={} bytes_freed={}{}",
+            collection_type,
+            stats.objects_copied,
+            stats.bytes_copied,
+            stats.bytes_freed,
+            if std::env::var_os("CRATONVM_G1_DBG_REACH").is_some() {
+                // try_lock: the collection paths call this while still holding
+                // the regions guard (diagnostic-only; skip the counts then).
+                if let Some(regions) = self.regions.try_lock() {
+                    let mut f = 0usize;
+                    let mut e = 0usize;
+                    let mut s = 0usize;
+                    let mut o = 0usize;
+                    let mut h = 0usize;
+                    for r in regions.iter() {
+                        match r.region_type {
+                            RegionType::Free => f += 1,
+                            RegionType::Eden => e += 1,
+                            RegionType::Survivor => s += 1,
+                            RegionType::Old => o += 1,
+                            _ => h += 1,
+                        }
+                    }
+                    format!(
+                        " free={f} eden={e} surv={s} old={o} hum={h} old_bytes={}",
+                        self.old_gen_bytes.load(Ordering::Relaxed)
+                    )
+                } else {
+                    format!(
+                        " old_bytes={}",
+                        self.old_gen_bytes.load(Ordering::Relaxed)
+                    )
+                }
+            } else {
+                String::new()
+            },
         );
     }
 
@@ -5459,8 +6336,15 @@ impl GarbageCollector for G1Collector {
             .filter(|r| r.region_type == RegionType::Free)
             .count();
         let total = regions.len();
-        // Trigger GC when less than 25% of regions are free
-        free_count * 4 < total
+        // Trigger a GC when the Free fraction drops below the (adaptive)
+        // threshold. Baseline 25%; raised after a collection that hit
+        // evacuation failure so the NEXT pause starts with a to-space pool
+        // big enough for its live-young set (see
+        // `retry_after_evacuation_failure` — the free pool at trigger time
+        // IS the young evacuation's to-space, and a live-young set larger
+        // than it self-forwards wholesale every pause).
+        let pct = self.needs_gc_free_percent.load(Ordering::Relaxed).max(1);
+        free_count * 100 < total * pct
     }
 
     fn collect_garbage(
@@ -5487,6 +6371,7 @@ impl GarbageCollector for G1Collector {
         } else {
             self.young_collection(roots, monitors)
         };
+        let result = self.retry_after_evacuation_failure(result, roots, monitors);
         let pause_ms = pause_start.elapsed().as_millis() as u64;
 
         // 2. IHOP / concurrent-mark triggering is driven by the VM layer
@@ -6962,6 +7847,247 @@ mod tests {
         );
     }
 
+    // =====================================================================
+    // Marking soundness across evacuation pauses (SATB keep-alive) and the
+    // restored cleanup in-place free — regression tests for the SteadyChurn
+    // "[FREED] cleanup region=N while live holders point in" defect stack.
+    // =====================================================================
+
+    /// A gray worklist entry whose object the evacuation closure does not
+    /// reach (dead at PAUSE time, live at MARK START) must be evacuated and
+    /// re-grayed, not dropped: under SATB its unscanned subtree is
+    /// snapshot-live. Pre-fix, the young pause dropped the gray and the
+    /// subtree was silently unmarked.
+    #[test]
+    fn gray_cset_entry_is_evacuated_and_subtree_marked_across_young_pause() {
+        let gc = make_collector();
+        // G (young) → H (young); at the pause below NEITHER is reachable
+        // from any root — the evacuation closure alone judges both dead.
+        let g = gc.alloc_object(ClassId::new(1), 1);
+        let h = gc.alloc_object(ClassId::new(2), 0);
+        gc.set_field(g, 0, Value::Object(Some(h)));
+
+        gc.start_concurrent_mark();
+        // Seed G gray (as the initial-mark root scan would); do NOT drain —
+        // the young pause interrupts marking mid-cycle.
+        gc.remark(&[g]);
+
+        let mut roots: Vec<ObjectRef> = vec![];
+        let result = gc.young_collection(&mut roots, &NoopMonitors);
+
+        let g_new = *result
+            .pointer_map
+            .get(&(g.as_ptr() as usize))
+            .expect("snapshot-live gray must be evacuated by the keep-alive, not dropped");
+        let h_new = *result
+            .pointer_map
+            .get(&(h.as_ptr() as usize))
+            .expect("the gray's referent must be evacuated with it");
+
+        // Drain the marker: both copies must end up marked.
+        while !gc.concurrent_mark_step(usize::MAX) {}
+        let regions = gc.regions.lock();
+        let g_idx = gc.region_for_ptr(&regions, g_new as *mut u8).unwrap();
+        let h_idx = gc.region_for_ptr(&regions, h_new as *mut u8).unwrap();
+        assert!(
+            regions[g_idx].mark_bitmap.is_marked(g_new),
+            "evacuated gray must be re-grayed and marked"
+        );
+        assert!(
+            regions[h_idx].mark_bitmap.is_marked(h_new),
+            "the gray's unscanned subtree must reach the bitmap (SATB snapshot)"
+        );
+    }
+
+    /// SATB-logged references must survive an evacuation pause: the log is
+    /// drained into the gray set at pause start and CSet-resident entries
+    /// are evacuated. Pre-fix the raw addresses sat in the queue while the
+    /// pause reset their regions (dangling), and at runtime the log was
+    /// never consumed at all.
+    #[test]
+    fn satb_entry_survives_young_pause_and_gets_marked() {
+        let gc = make_collector();
+        let x = gc.alloc_object(ClassId::new(7), 0);
+
+        gc.start_concurrent_mark();
+        // A mutator overwrites the last reference to X mid-cycle: the SATB
+        // pre-barrier logs X. Flush the thread-local buffer immediately so
+        // a concurrent test's registry-wide flush cannot steal the entry
+        // into a different collector's queue (the buffer is process-global).
+        gc.satb_pre_barrier(x.as_ptr() as usize);
+        crate::satb::flush_thread_satb_buffer(gc.satb_queue());
+
+        let mut roots: Vec<ObjectRef> = vec![];
+        let result = gc.young_collection(&mut roots, &NoopMonitors);
+
+        let x_new = *result
+            .pointer_map
+            .get(&(x.as_ptr() as usize))
+            .expect("SATB-logged object must be kept alive across the pause");
+        while !gc.concurrent_mark_step(usize::MAX) {}
+        let regions = gc.regions.lock();
+        let idx = gc.region_for_ptr(&regions, x_new as *mut u8).unwrap();
+        assert!(
+            regions[idx].mark_bitmap.is_marked(x_new),
+            "SATB entry must reach the bitmap after the pause"
+        );
+    }
+
+    /// Mixed pauses move OLD regions — where the gray set concentrates —
+    /// and must remap the mark worklist exactly like young pauses do.
+    /// Pre-fix, neither mixed path touched the worklist at all: every gray
+    /// pointing into an evacuated Old region dangled into freed memory.
+    #[test]
+    fn mixed_collection_keeps_and_remaps_gray_old_entry() {
+        let cfg = G1CollectorConfig {
+            promotion_age: 1,
+            ..small_config()
+        };
+        let gc = G1Collector::new(cfg);
+        // Promote OBJ to Old with two young collections.
+        let obj = gc.alloc_object(ClassId::new(1), 1);
+        gc.set_field(obj, 0, Value::Int(41));
+        let mut roots = vec![obj];
+        gc.young_collection(&mut roots, &NoopMonitors);
+        gc.young_collection(&mut roots, &NoopMonitors);
+        let obj = roots[0];
+        {
+            let regions = gc.regions.lock();
+            let idx = gc.region_for_ptr(&regions, obj.as_ptr()).unwrap();
+            assert_eq!(
+                regions[idx].region_type,
+                RegionType::Old,
+                "test setup: object must be promoted"
+            );
+        }
+
+        // A NEW marking cycle overlaps the post-cleanup mixed sequence
+        // (reachable in production: start_concurrent_mark does not clear
+        // marking_complete).
+        gc.start_concurrent_mark();
+        gc.remark(&[obj]); // OBJ gray, unscanned
+        gc.marking_complete.store(true, Ordering::Relaxed);
+        gc.mixed_gc_remaining.store(1, Ordering::Relaxed);
+
+        let result = gc.mixed_collection(&mut roots, &NoopMonitors);
+
+        // No gray may dangle into a freed region…
+        {
+            let regions = gc.regions.lock();
+            let worklist = gc.mark_worklist.lock();
+            for &addr in worklist.iter() {
+                let idx = gc
+                    .region_for_ptr(&regions, addr as *mut u8)
+                    .expect("gray entry must point into the heap");
+                assert_ne!(
+                    regions[idx].region_type,
+                    RegionType::Free,
+                    "gray entry {addr:#x} dangles into a freed region"
+                );
+            }
+        }
+        // …and OBJ (possibly relocated) must be marked after draining.
+        let obj_final = result
+            .pointer_map
+            .get(&(obj.as_ptr() as usize))
+            .copied()
+            .unwrap_or(obj.as_ptr() as usize);
+        while !gc.concurrent_mark_step(usize::MAX) {}
+        let regions = gc.regions.lock();
+        let idx = gc.region_for_ptr(&regions, obj_final as *mut u8).unwrap();
+        assert!(regions[idx].mark_bitmap.is_marked(obj_final));
+    }
+
+    /// The SteadyChurn failure shape, end to end: an Old object X whose
+    /// only marker-visible path runs through a young gray G that a
+    /// mid-cycle young pause judges dead. The keep-alive must carry G (and
+    /// through it X) to the bitmap, and cleanup's restored in-place free
+    /// must therefore keep X's region.
+    #[test]
+    fn cleanup_in_place_free_respects_keepalive_marking() {
+        let cfg = G1CollectorConfig {
+            promotion_age: 1,
+            ..small_config()
+        };
+        let gc = G1Collector::new(cfg);
+
+        // Promote X (the "list node") to Old.
+        let x = gc.alloc_object(ClassId::new(1), 0);
+        let mut roots = vec![x];
+        gc.young_collection(&mut roots, &NoopMonitors);
+        gc.young_collection(&mut roots, &NoopMonitors);
+        let x = roots[0];
+        let x_region = {
+            let regions = gc.regions.lock();
+            let idx = gc.region_for_ptr(&regions, x.as_ptr()).unwrap();
+            assert_eq!(regions[idx].region_type, RegionType::Old);
+            idx
+        };
+
+        // Young holder G → X.
+        let g = gc.alloc_object(ClassId::new(2), 1);
+        gc.set_field(g, 0, Value::Object(Some(x)));
+
+        gc.start_concurrent_mark();
+        gc.remark(&[g]); // G gray, unscanned; X reachable ONLY through G
+
+        // Mid-cycle young pause with no roots: the evacuation closure
+        // reaches neither G nor X. Pre-fix: G dropped → X never marked →
+        // cleanup freed X's region while it was snapshot-live.
+        let mut no_roots: Vec<ObjectRef> = vec![];
+        gc.young_collection(&mut no_roots, &NoopMonitors);
+
+        while !gc.concurrent_mark_step(usize::MAX) {}
+        gc.cleanup();
+
+        let regions = gc.regions.lock();
+        assert_eq!(
+            regions[x_region].region_type,
+            RegionType::Old,
+            "Old region holding snapshot-live X must survive cleanup's in-place free"
+        );
+        assert!(regions[x_region].live_bytes > 0);
+    }
+
+    /// Companion: cleanup's restored in-place free DOES free a wholly-dead,
+    /// TAMS-clean Old region (the whole point of restoring it — reclaiming
+    /// such regions without waiting for a mixed pause).
+    #[test]
+    fn cleanup_in_place_frees_wholly_dead_old_region() {
+        let cfg = G1CollectorConfig {
+            promotion_age: 1,
+            ..small_config()
+        };
+        let gc = G1Collector::new(cfg);
+        let x = gc.alloc_object(ClassId::new(1), 0);
+        let mut roots = vec![x];
+        gc.young_collection(&mut roots, &NoopMonitors);
+        gc.young_collection(&mut roots, &NoopMonitors);
+        let x = roots[0];
+        let x_region = {
+            let regions = gc.regions.lock();
+            let idx = gc.region_for_ptr(&regions, x.as_ptr()).unwrap();
+            assert_eq!(regions[idx].region_type, RegionType::Old);
+            idx
+        };
+
+        // Drop the last reference BEFORE the cycle starts: X is dead in the
+        // snapshot and its region wholly garbage at mark start.
+        roots.clear();
+
+        gc.start_concurrent_mark();
+        gc.remark(&[]);
+        while !gc.concurrent_mark_step(usize::MAX) {}
+        gc.cleanup();
+
+        let regions = gc.regions.lock();
+        assert_eq!(
+            regions[x_region].region_type,
+            RegionType::Free,
+            "wholly-dead TAMS-clean Old region must be freed in place by cleanup"
+        );
+    }
+
     // -- Needs GC --
 
     #[test]
@@ -8418,6 +9544,101 @@ mod tests {
         assert_eq!(gc.get_field(roots[0], 0).as_int(), Some(99));
     }
 
+    /// Drain-phase evacuation-failure semantics: a LIVE holder that
+    /// self-forwards during the serial drain still gets its children
+    /// discovered (fixpoint over the identity-forward set), while a DEAD
+    /// object in the same kept region is NOT scanned — its targets are not
+    /// resurrected (an earlier revision walked every kept-region object,
+    /// which under sustained evacuation failure resurrected kept garbage
+    /// wholesale each pause and OOMed the SteadyChurn recreation). The dead
+    /// holder's slot goes stale, which is safe: a stale reference can only
+    /// point into a region that is Free or a this-pause destination — never a
+    /// CSet-resident live object — so nothing consults it as a live edge.
+    #[test]
+    fn parallel_drain_phase_self_forward_kept_region_fully_scanned() {
+        // workers=1 → the parallel machinery runs single-threaded, making the
+        // pool-exhaustion sequencing deterministic.
+        let gc = G1Collector::new(parallel_config(1, 8));
+
+        let region_of = |o: ObjectRef| {
+            gc.lookup_region_for_addr(o.as_ptr() as usize)
+                .expect("object not in any region")
+        };
+
+        // Region A: root X.
+        let x = gc.alloc_object(ClassId::new(1), 1);
+        let ra = region_of(x);
+
+        // Spill into region B.
+        let mut filler = gc.alloc_object(ClassId::new(9), 200);
+        while region_of(filler) == ra {
+            filler = gc.alloc_object(ClassId::new(9), 200);
+        }
+
+        // Region B: DEAD holder D (never rooted) and live child Y; X -> Y.
+        let d = gc.alloc_object(ClassId::new(2), 1);
+        let y = gc.alloc_object(ClassId::new(3), 1);
+        let rb = region_of(d);
+        assert_eq!(region_of(y), rb, "D and Y must share region B");
+        assert_ne!(ra, rb);
+        gc.set_field(y, 0, Value::Int(41));
+        gc.set_field(x, 0, Value::Object(Some(y)));
+
+        // Spill into region C.
+        let mut filler2 = gc.alloc_object(ClassId::new(9), 200);
+        while region_of(filler2) == rb {
+            filler2 = gc.alloc_object(ClassId::new(9), 200);
+        }
+
+        // Region C: Z, referenced ONLY by the dead D.
+        let z = gc.alloc_object(ClassId::new(4), 1);
+        let rc = region_of(z);
+        assert!(rc != ra && rc != rb);
+        gc.set_field(z, 0, Value::Int(42));
+        gc.set_field(d, 0, Value::Object(Some(z)));
+        let z_addr = z.as_ptr() as usize;
+
+        // Empty the to-space pool so EVERY evacuation self-forwards: X in
+        // Phase 1 (worker-phase keep of region A), Y only during the serial
+        // drain (drain-phase keep of region B — after the old single-round
+        // backstop had already run).
+        {
+            let mut regions = gc.regions.lock();
+            for r in regions.iter_mut() {
+                if r.region_type == RegionType::Free {
+                    r.region_type = RegionType::Old;
+                }
+            }
+        }
+
+        let mut roots = vec![x];
+        let r = gc.young_collection_parallel(&mut roots, &NoopMonitors);
+
+        // Y self-forwarded during the drain — region B is a drain-phase keep.
+        let y_addr = gc.get_field(roots[0], 0);
+        let y_now = match y_addr {
+            Value::Object(Some(o)) => o,
+            other => panic!("X.field lost: {other:?}"),
+        };
+        assert_eq!(
+            r.pointer_map.get(&(y_now.as_ptr() as usize)),
+            Some(&(y_now.as_ptr() as usize)),
+            "Y should have self-forwarded (drain-phase evacuation failure)"
+        );
+
+        // Dead holder D (region B) must NOT have been scanned: its target Z is
+        // garbage and must not be resurrected into the pointer map (that
+        // wholesale resurrection is what OOMed the churn workload).
+        assert_eq!(
+            r.pointer_map.get(&z_addr),
+            None,
+            "dead kept-region holder was scanned — its garbage target Z was \
+             resurrected (kept-garbage amplification)"
+        );
+        // And the live path through the drain is fully intact.
+        assert_eq!(gc.get_field(y_now, 0).as_int(), Some(41), "Y corrupted");
+    }
+
     #[test]
     fn parallel_mixed_basic() {
         let mut cfg = parallel_config(4, 16);
@@ -8605,6 +9826,147 @@ mod tests {
             }
         }
         assert_eq!(count, n, "evacuation failure dropped live nodes");
+    }
+
+    /// Regression for the kept-region death spiral (the serial-G1 "SteadyChurn
+    /// recreation trips at -Xmx16m" wedge). When young-live exceeds the free
+    /// pool at trigger time, a single pass keeps most of the heap (every
+    /// region holding one self-forwarded live object survives wholesale,
+    /// garbage included) and successive collections monotonically degrade to
+    /// `copied == 0 && freed == 0`. `retry_after_evacuation_failure` must
+    /// drain the kept garbage with same-pause retry passes (excluding earlier
+    /// passes' destination regions) and compose the per-pass forward maps so
+    /// pause-start addresses still remap correctly.
+    #[test]
+    fn evacuation_failure_retry_drains_kept_garbage() {
+        let mut cfg = small_config();
+        cfg.region_size = 1024 * 1024;
+        cfg.heap_size = 10 * 1024 * 1024; // 10 regions
+        let gc = G1Collector::new(cfg);
+
+        // Interleave live chain nodes with ~2x garbage so every filled region
+        // holds BOTH live and garbage (the SteadyChurn shape): ~6 MB total,
+        // ~2 MB live — more than the 1-region pool left below, so pass 1 must
+        // hit evacuation failure part-way through.
+        let head = gc.alloc_object(ClassId::new(1), 8);
+        let head_addr = head.as_ptr() as usize;
+        let mut cur = head;
+        let mut live_count = 1usize;
+        loop {
+            let _g1 = gc.alloc_object(ClassId::new(9), 8);
+            let _g2 = gc.alloc_object(ClassId::new(9), 8);
+            let node = gc.alloc_object(ClassId::new(1), 8);
+            gc.set_field(cur, 0, Value::Object(Some(node)));
+            cur = node;
+            live_count += 1;
+            // Stop once ~6 of the 10 regions are consumed.
+            let used: usize = {
+                let regions = gc.regions.lock();
+                regions
+                    .iter()
+                    .filter(|r| r.region_type != RegionType::Free)
+                    .count()
+            };
+            if used >= 6 {
+                break;
+            }
+        }
+        gc.set_field(cur, 0, Value::Int(424242)); // tail marker
+
+        // Leave exactly ONE Free region as evacuation pool; deny the rest.
+        {
+            let mut regions = gc.regions.lock();
+            let mut left = 1usize;
+            for r in regions.iter_mut().rev() {
+                if r.region_type == RegionType::Free {
+                    if left > 0 {
+                        left -= 1;
+                    } else {
+                        r.region_type = RegionType::Old;
+                    }
+                }
+            }
+        }
+
+        let mut roots = vec![head];
+        let first = gc.young_collection(&mut roots, &NoopMonitors);
+        assert!(
+            first.pointer_map.iter().any(|(k, v)| k == v),
+            "setup failed to force evacuation failure (no self-forwards)"
+        );
+
+        let result = gc.retry_after_evacuation_failure(first, &mut roots, &NoopMonitors);
+
+        // (a) recovery converged: no identity forward survives the pause.
+        assert!(
+            !result.pointer_map.iter().any(|(k, v)| k == v),
+            "retry loop left unresolved self-forwards (still wedged)"
+        );
+        // (b) the kept garbage was actually drained: most of the ~4 MB of
+        // garbage must be free again.
+        let free_after = {
+            let regions = gc.regions.lock();
+            regions
+                .iter()
+                .filter(|r| r.region_type == RegionType::Free)
+                .count()
+        };
+        assert!(
+            free_after >= 3,
+            "kept-region garbage not reclaimed (free regions after recovery: {free_after})"
+        );
+        // (c) the composed map remaps the PAUSE-START head address to the
+        // final location the root was rewritten to (frame-local semantics).
+        assert_eq!(
+            result.pointer_map.get(&head_addr),
+            Some(&(roots[0].as_ptr() as usize)),
+            "composed pointer_map does not take the pause-start address to the final copy"
+        );
+        // (d) the live chain is fully intact.
+        let mut count = 0usize;
+        let mut c = roots[0];
+        loop {
+            count += 1;
+            assert!(count <= live_count, "chain longer than {live_count}");
+            match gc.get_field(c, 0) {
+                Value::Object(Some(next)) => c = next,
+                Value::Int(424242) => break,
+                other => panic!("chain broke at node {count} -> {other:?}"),
+            }
+        }
+        assert_eq!(count, live_count, "retry recovery dropped live nodes");
+    }
+
+    /// `compose_forward_maps` semantics: values chase one hop (including a
+    /// pass-1 self-forward resolved by a retry), new keys are added, and a
+    /// colliding key keeps the FIRST pass's entry (pause-start address wins
+    /// over a recycled intermediate).
+    #[test]
+    fn compose_forward_maps_chases_and_keeps_pause_start_keys() {
+        let mut acc: HashMap<usize, usize> = [(0xa0, 0xb0), (0x40, 0x40), (0x70, 0x71)]
+            .into_iter()
+            .collect();
+        let next: HashMap<usize, usize> = [(0xb0, 0xc0), (0x40, 0x90), (0xe0, 0xf0), (0x70, 0x99)]
+            .into_iter()
+            .collect();
+        G1Collector::compose_forward_maps(&mut acc, &next);
+        assert_eq!(
+            acc.get(&0xa0),
+            Some(&0xc0),
+            "value not chased through pass 2"
+        );
+        assert_eq!(
+            acc.get(&0x40),
+            Some(&0x90),
+            "identity self-forward not resolved"
+        );
+        assert_eq!(acc.get(&0xe0), Some(&0xf0), "new pass-2 key not added");
+        assert_eq!(
+            acc.get(&0x70),
+            Some(&0x71),
+            "a colliding pass-2 key (recycled intermediate address) must NOT \
+             clobber the pause-start entry from pass 1"
+        );
     }
 
     /// Regression for the Old->young remembered-set-completeness hole: an
