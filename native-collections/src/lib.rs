@@ -4641,8 +4641,28 @@ fn native_map_put(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResu
     // encounter order for keys that collide into the same bucket (the prior
     // head-prepend reversed them, the dominant source of HashMap iteration-
     // order divergence vs HotSpot across the gauntlet).
+    //
+    // gcstress residual face-1 fix — `alloc_object` below can trigger a moving
+    // young GC (deterministically under CRATONVM_DBG_GC_STRESS) that relocates
+    // every survivor. `this`, `buckets`, and `tail_node` are bare Rust locals
+    // captured BEFORE this allocation, invisible to `collect_roots`; using the
+    // stale post-move addresses for the `set_field`/`set_array_element`/
+    // `set_map_size` writes below stores into the object's OLD (now
+    // freed-and-reused) address, landing misaligned in whatever now occupies
+    // it — the observed `{raw ptr, 0}` corrupt Value cells in a neighboring
+    // live object (Fork6Hard$StrTask / Thread mirror). Pin the three
+    // cross-allocation roots and re-read them after the alloc. (`key_val`/
+    // `value` are consumed into `new_node` immediately, before any further
+    // allocation, so they need no pin.)
+    let this_pin = ctx.pin_native_root(this);
+    let buckets_pin = ctx.pin_native_root(buckets);
+    let tail_pin = tail_node.map(|t| ctx.pin_native_root(t));
     // Create node — for null keys, store Value::Object(None) in key field
     let new_node = ctx.alloc_object(cratonvm_types::ClassId::new(0), NODE_NUM_FIELDS);
+    // Re-read the pinned roots at their post-GC addresses.
+    let this = ctx.read_native_pin(this_pin, this);
+    let buckets = ctx.read_native_pin(buckets_pin, buckets);
+    let tail_node = tail_node.map(|t| ctx.read_native_pin(tail_pin.unwrap(), t));
     ctx.set_field(new_node, NODE_FIELD_HASH, Value::Int(hash));
     ctx.set_field(new_node, NODE_FIELD_KEY, key_val);
     ctx.set_field(new_node, NODE_FIELD_VALUE, value);
@@ -4654,6 +4674,7 @@ fn native_map_put(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResu
         None => ctx.set_array_element(buckets, idx, Value::Object(Some(new_node))),
     }
     set_map_size(ctx, this, size + 1);
+    ctx.unpin_native_roots(this_pin);
 
     Ok(Some(Value::Object(None))) // no old value
 }
