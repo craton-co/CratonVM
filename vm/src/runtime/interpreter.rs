@@ -17890,7 +17890,28 @@ fn force_native_over_real_jdk_bytecode(
     // exports/opens (java.base exports `java.lang`/… to all but not
     // `jdk.internal.*` — which ByteBuddy's `JavaDispatcher` relies on) instead of
     // touching the null descriptor.
-    if class_name == "java/lang/Module" && matches!(method_name, "isExported" | "isOpen") {
+    //
+    // `getDescriptor` has the same null-descriptor problem, but real HotSpot
+    // guarantees `isNamed() == (getDescriptor() != null)` — a named module's
+    // descriptor is never null. CratonVM's `isNamed()` (real bytecode, reading
+    // the dual-written real `name` field) can report a classpath-loaded,
+    // modularized jar as named (see `classloading::module::ModuleDescriptor
+    // ::automatic`), yet `getDescriptor()`'s real bytecode (`return this
+    // .descriptor;`) reads a field CratonVM never populates. Any code that
+    // only calls `getDescriptor()` after checking `isNamed()` (e.g.
+    // Elasticsearch's `ProviderLocator.checkUses` — `caller.isNamed() &&
+    // caller.getDescriptor().uses()...`) gets `NullPointerException: Cannot
+    // invoke "ModuleDescriptor.uses()" because the return value of
+    // "Module.getDescriptor()" is null`, breaking `XContentProvider$Holder`
+    // static init and cascading into thousands of Elasticsearch suite
+    // failures via `NoClassDefFoundError`. Force the native (registered in
+    // `native-builtins::lib::register_essential_natives`, alongside
+    // isExported/isOpen above), which returns null only for the true unnamed
+    // module and otherwise builds a descriptor backed by the boot
+    // `ModuleRegistry`'s parsed `uses`.
+    if class_name == "java/lang/Module"
+        && matches!(method_name, "isExported" | "isOpen" | "getDescriptor")
+    {
         return true;
     }
     // BUG-15: `sun.util.locale.provider.LocaleResources.getDateTimePattern(int,

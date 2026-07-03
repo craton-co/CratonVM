@@ -4333,6 +4333,21 @@ pub fn register_essential_natives(registry: &mut NativeMethodRegistry) {
     // `if (!isNamed()) return true;` short-circuit. The Java API uses dot-format
     // package names; the registry is keyed on slash-format.
     fn module_name_of_mirror(ctx: &dyn NativeContext, m: ObjectRef) -> String {
+        // Real-bytecode `Module.isNamed()`/`getName()` read the real `name`
+        // field, which is what actually determines named-ness for a Module
+        // built through any path other than this file's `Class.getModule()`
+        // override (e.g. one that dual-writes only the real field, not the
+        // legacy synthetic slot 0). Check it FIRST so isExported/isOpen/
+        // getDescriptor agree with `isNamed()` — otherwise a Module whose
+        // slot 0 was never populated reads back as unnamed here even though
+        // `isNamed()` (and everyone else) sees it as named, which silently
+        // over-permits isExported/isOpen and NPEs getDescriptor's callers
+        // (observed via Elasticsearch's `ProviderLocator.checkUses`, whose
+        // `caller.getModule()` mirror had a null slot 0 but a populated real
+        // `name` field).
+        if let Value::Object(Some(s)) = ctx.get_field_by_name(m, "name") {
+            return ctx.read_string(s).unwrap_or_default();
+        }
         match ctx.get_field(m, 0) {
             Value::Object(Some(s)) => ctx.read_string(s).unwrap_or_default(),
             _ => String::new(), // unnamed module
@@ -4412,6 +4427,64 @@ pub fn register_essential_natives(registry: &mut NativeMethodRegistry) {
             };
             let ok = ctx.is_package_open_to(&module_name, &pkg, &to_module);
             Ok(Some(Value::Int(ok as i32)))
+        },
+    );
+    // Module.getDescriptor() → ModuleDescriptor
+    //
+    // Real HotSpot: `descriptor` is null iff the module is unnamed — a named
+    // module is always constructed with a non-null descriptor. `getModule()`
+    // above returns a named Module mirror with a NULL `descriptor` field (see
+    // its comment above), so the real bytecode's `return this.descriptor;`
+    // NPEs any caller that only calls `getDescriptor()` after checking
+    // `isNamed()` — e.g. Elasticsearch's `ProviderLocator.checkUses`:
+    // `caller.isNamed() && caller.getDescriptor().uses()...`, which breaks
+    // `XContentProvider$Holder`'s static init and cascades into thousands of
+    // Elasticsearch suite failures via `NoClassDefFoundError`. Force-listed
+    // in `force_native_over_real_jdk_bytecode` alongside isExported/isOpen
+    // above. Answers from the same boot `ModuleRegistry` (accurate `uses`
+    // parsed from each module-info), dual-written onto the real `name`/`uses`
+    // fields (via `set_field_by_name`) so any *other*, non-forced
+    // `ModuleDescriptor` accessor called on this same instance still sees
+    // correct data.
+    registry.register(
+        "java/lang/Module",
+        "getDescriptor",
+        "()Ljava/lang/module/ModuleDescriptor;",
+        |ctx, args| {
+            let this = obj_arg(args, 0)?;
+            let module_name = module_name_of_mirror(ctx, this);
+            if module_name.is_empty() {
+                // Unnamed module — matches real Module.getDescriptor()'s null.
+                return Ok(Some(Value::Object(None)));
+            }
+            // Dot-format binary class names, matching `Class.getName()` (the
+            // boot `ModuleRegistry` stores JVM-internal slash format parsed
+            // straight from the module-info `uses` directives).
+            let uses: Vec<String> = ctx
+                .module_uses(&module_name)
+                .into_iter()
+                .map(|s| s.replace('/', "."))
+                .collect();
+            let desc = alloc_concurrent_synthetic(ctx, "java/lang/module/ModuleDescriptor", 2);
+            // GC-safety: pin `desc` across the allocations inside
+            // `build_string_set` (same pattern as `getModule()` above).
+            let pin = ctx.pin_native_root(desc);
+            let uses_set = crate::phases_late::build_string_set(ctx, uses);
+            let desc = ctx.read_native_pin(pin, desc);
+            // `this` is a live incoming argument for the duration of this
+            // native call, so re-reading its field here (after the
+            // allocations above) is GC-safe without a separate pin.
+            let name_val = ctx.get_field_by_name(this, "name");
+            let name_val = match name_val {
+                Value::Object(Some(_)) => name_val,
+                _ => ctx.get_field(this, 0),
+            };
+            ctx.set_field(desc, 0, name_val); // legacy synthetic slot
+            ctx.set_field(desc, 1, Value::Int(0)); // legacy synthetic slot
+            ctx.set_field_by_name(desc, "name", name_val);
+            ctx.set_field_by_name(desc, "uses", Value::Object(Some(uses_set)));
+            ctx.unpin_native_roots(pin);
+            Ok(Some(Value::Object(Some(desc))))
         },
     );
     // `static native void addReads0(Module from, Module to)` — the VM-sync hook
