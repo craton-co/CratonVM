@@ -796,6 +796,22 @@ fn file_not_found(path: &str) -> MethodCallFailed {
     }))
 }
 
+/// Convert an `io::Error` for a `java.nio.file` operation, mapping ENOENT to
+/// the real JDK's `NoSuchFileException` (not a bare `IOException`) so callers
+/// that specifically catch `NoSuchFileException` — e.g.
+/// `FileSystemResource.getContentAsByteArray`/`getContentAsString`, which
+/// translate it to `FileNotFoundException` — actually see it
+/// (ResourceTests#resourceCreateRelativeUnknown).
+fn io_err_nio(e: io::Error, path: &str) -> MethodCallFailed {
+    if e.kind() == io::ErrorKind::NotFound {
+        MethodCallFailed::InternalError(VmError::Runtime(RuntimeError::NoSuchFileException {
+            path: path.to_string(),
+        }))
+    } else {
+        io_err(e)
+    }
+}
+
 /// Validate caller-supplied `(off, len)` against a byte array of length
 /// `arr_len`, matching the JDK's `Objects.checkFromIndexSize` contract
 /// used by `FileInputStream`/`FileOutputStream`/`RandomAccessFile`.
@@ -6430,12 +6446,25 @@ fn native_fc_open(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResu
         .unwrap_or_default();
 
     // Simplified: open for read (a full impl would check OpenOptions)
-    let fd_id = ctx
-        .fd_table()
-        .open_read(&path_str)
-        .map_err(|e| RuntimeError::IOException {
-            message: format!("FileChannel.open: {e}"),
-        })?;
+    //
+    // Real `FileChannel.open` throws `java.nio.file.NoSuchFileException` (not
+    // `FileNotFoundException`) when the target is missing — callers like
+    // `FileSystemResource.readableChannel()` explicitly catch
+    // `NoSuchFileException` and translate it to `FileNotFoundException`
+    // (ResourceTests#resourceCreateRelativeUnknown). Mapping every open
+    // failure to a generic `IOException` (as before) made that catch miss,
+    // so the raw `IOException` propagated instead.
+    let fd_id = ctx.fd_table().open_read(&path_str).map_err(|e| {
+        if e.kind() == io::ErrorKind::NotFound {
+            MethodCallFailed::InternalError(VmError::Runtime(RuntimeError::NoSuchFileException {
+                path: path_str.clone(),
+            }))
+        } else {
+            MethodCallFailed::InternalError(VmError::Runtime(RuntimeError::IOException {
+                message: format!("FileChannel.open: {e}"),
+            }))
+        }
+    })?;
 
     let fc = match ctx.ensure_class_initialized("java/nio/channels/FileChannel") {
         Ok(cid) => ctx.alloc_object(cid, 2),
@@ -8262,6 +8291,95 @@ fn alloc_path(ctx: &mut dyn NativeContext, path_str: &str) -> ObjectRef {
     path
 }
 
+/// Windows `Path` syntax validation, close enough to
+/// `sun.nio.fs.WindowsPathParser`'s character checks for `Paths.get`/
+/// `File.toPath()` to reject what real JDK rejects. A colon is only legal as
+/// the second character of a drive specifier (`C:...`) — anywhere else
+/// (including a bare `scheme:rest` string like Spring's `ping:foo`
+/// `ProtocolResolver` probe) it's illegal, along with the usual reserved
+/// characters and control bytes. `GenericApplicationContextTests.
+/// getResourceWithCustomResourceLoader` relies on `FileSystemResourceLoader
+/// .getResource("ping:foo")` throwing `InvalidPathException` on Windows
+/// *before* any `ProtocolResolver` runs — `Paths.get`/`File.toPath()`
+/// previously wrapped any string verbatim with no validation at all.
+fn validate_windows_path(s: &str) -> Result<(), &'static str> {
+    if !cfg!(windows) {
+        return Ok(());
+    }
+    let bytes = s.as_bytes();
+    // A `\\?\` verbatim prefix disables normalization; JDK still accepts
+    // almost anything there, so skip further validation for that rare case.
+    if bytes.len() >= 4
+        && (bytes[0] == b'\\' || bytes[0] == b'/')
+        && (bytes[1] == b'\\' || bytes[1] == b'/')
+        && bytes[2] == b'?'
+    {
+        return Ok(());
+    }
+    // Index of the one legal colon (the drive specifier), if this path
+    // starts with `<letter>:`.
+    let drive_colon = if bytes.len() >= 2 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':' {
+        Some(1usize)
+    } else {
+        None
+    };
+    for (i, &b) in bytes.iter().enumerate() {
+        if b == b':' && Some(i) != drive_colon {
+            return Err("Illegal char <:>");
+        }
+        if b < 0x20 || matches!(b, b'<' | b'>' | b'"' | b'|' | b'?' | b'*') {
+            return Err("Illegal char");
+        }
+    }
+    Ok(())
+}
+
+/// Construct and throw a real `java.nio.file.InvalidPathException` via its
+/// public `(String input, String reason)` constructor, so `getMessage()`
+/// (real JDK bytecode) includes `input` verbatim — required by
+/// `assertThatExceptionOfType(InvalidPathException.class)
+/// .withMessageContaining(pingLocation)`.
+fn throw_invalid_path_exception(
+    ctx: &mut dyn NativeContext,
+    input: &str,
+    reason: &str,
+) -> MethodCallFailed {
+    match ctx.new_object("java/nio/file/InvalidPathException") {
+        Ok(Some(Value::Object(Some(exc)))) => {
+            let input_str = ctx.create_string(input);
+            let reason_str = ctx.create_string(reason);
+            let _ = ctx.invoke(
+                "java/nio/file/InvalidPathException",
+                "<init>",
+                "(Ljava/lang/String;Ljava/lang/String;)V",
+                &[
+                    Value::Object(Some(exc)),
+                    Value::Object(Some(input_str)),
+                    Value::Object(Some(reason_str)),
+                ],
+            );
+            MethodCallFailed::ExceptionThrown(exc)
+        }
+        _ => RuntimeError::IllegalArgumentException {
+            message: format!("{reason}: {input}"),
+        }
+        .into(),
+    }
+}
+
+/// Validate `path_str` as a Windows path before wrapping it in a synthetic
+/// `Path` object; throws `InvalidPathException` (matching real JDK) instead
+/// of silently accepting any string. Shared by the `Paths.get`/
+/// `File.toPath()` entry points — the ONLY places a `Path` is built directly
+/// from unvalidated user input (accessor natives like `getParent`/`getRoot`
+/// split an already-validated path and don't need to re-check).
+fn alloc_path_checked(ctx: &mut dyn NativeContext, path_str: &str) -> MethodCallResult {
+    if let Err(reason) = validate_windows_path(path_str) {
+        return Err(throw_invalid_path_exception(ctx, path_str, reason));
+    }
+    Ok(Some(Value::Object(Some(alloc_path(ctx, path_str)))))
+}
+
 fn read_path_str(ctx: &dyn NativeContext, path: ObjectRef) -> String {
     // Prefer by-name resolution for real concrete Path types.
     if let Value::Object(Some(s)) = ctx.get_field_by_name(path, "path") {
@@ -8295,8 +8413,7 @@ fn native_paths_get(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRe
             }
         }
     }
-    let path = alloc_path(ctx, &result);
-    Ok(Some(Value::Object(Some(path))))
+    alloc_path_checked(ctx, &result)
 }
 
 fn native_paths_get_simple(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
@@ -8304,8 +8421,7 @@ fn native_paths_get_simple(ctx: &mut dyn NativeContext, args: &[Value]) -> Metho
         Some(Value::Object(Some(o))) => ctx.read_string(*o).unwrap_or_default(),
         _ => String::new(),
     };
-    let path = alloc_path(ctx, &s);
-    Ok(Some(Value::Object(Some(path))))
+    alloc_path_checked(ctx, &s)
 }
 
 fn native_path_to_string(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
@@ -8829,8 +8945,7 @@ fn native_file_to_path(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCal
             message: "File.toPath(): this.path is null".to_string(),
         }));
     }
-    let path = alloc_path(ctx, &s);
-    Ok(Some(Value::Object(Some(path))))
+    alloc_path_checked(ctx, &s)
 }
 
 // --- Files static methods ---
@@ -8943,7 +9058,7 @@ fn native_files_create_directories(
 
 fn native_files_read_all_bytes(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let s = validated_path(&files_path_str(ctx, args))?;
-    let bytes = std::fs::read(&s).map_err(io_err)?;
+    let bytes = std::fs::read(&s).map_err(|e| io_err_nio(e, &s))?;
     let arr = ctx.new_array(cratonvm_types::ArrayElementType::Byte, bytes.len());
     // AUDIT 2026-05-29: bulk copy via NativeContext::write_byte_array_from
     // instead of a per-element `set_array_element` loop. The VM override
@@ -8957,7 +9072,7 @@ fn native_files_read_all_bytes(ctx: &mut dyn NativeContext, args: &[Value]) -> M
 
 fn native_files_read_string(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let s = validated_path(&files_path_str(ctx, args))?;
-    let content = std::fs::read_to_string(&s).map_err(io_err)?;
+    let content = std::fs::read_to_string(&s).map_err(|e| io_err_nio(e, &s))?;
     let result = ctx.create_string(&content);
     Ok(Some(Value::Object(Some(result))))
 }

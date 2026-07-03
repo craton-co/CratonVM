@@ -5873,6 +5873,13 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
                     let s = ctx.create_string(&content);
                     Ok(Some(Value::Object(Some(s))))
                 }
+                // NIO contract: missing file → NoSuchFileException (see
+                // newByteChannel above), not a bare IOException — callers like
+                // FileSystemResource.getContentAsString() catch
+                // NoSuchFileException and translate it to FileNotFoundException.
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                    Err(p57_no_such_file(ctx, &p))
+                }
                 Err(e) => Err(p57_io_error(&e)),
             }
         },
@@ -5890,6 +5897,9 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
                 Ok(content) => {
                     let s = ctx.create_string(&content);
                     Ok(Some(Value::Object(Some(s))))
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                    Err(p57_no_such_file(ctx, &p))
                 }
                 Err(e) => Err(p57_io_error(&e)),
             }
@@ -6499,14 +6509,27 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
             // JDK FileChannel.open contract: a channel with neither READ nor
             // WRITE is read-only; WRITE without READ is write-only.
             let readable = read_opt || !writable;
-            let fd_id = if writable {
+            // Real `FileChannel.open` throws `java.nio.file.NoSuchFileException`
+            // (not a bare `IOException`) when the target is missing — callers
+            // like `FileSystemResource.readableChannel()` explicitly catch
+            // `NoSuchFileException` and translate it to `FileNotFoundException`
+            // (ResourceTests#resourceCreateRelativeUnknown). Mapping every open
+            // failure to a generic `IOException` made that catch miss, so the
+            // raw `IOException` propagated to the caller instead.
+            let open_result = if writable {
                 ctx.fd_table().open_read_write(&p, create)
             } else {
                 ctx.fd_table().open_read_write(&p, false)
                     .or_else(|_| ctx.fd_table().open_read(&p))
-            }
-            .map_err(|e| RuntimeError::IOException {
-                message: format!("Cannot open {}: {}", p, e),
+            };
+            let fd_id = open_result.map_err(|e| {
+                if e.kind() == std::io::ErrorKind::NotFound {
+                    RuntimeError::NoSuchFileException { path: p.clone() }
+                } else {
+                    RuntimeError::IOException {
+                        message: format!("Cannot open {}: {}", p, e),
+                    }
+                }
             })?;
             if truncate && writable {
                 let _ = ctx.fd_table().rw_set_length(fd_id, 0);
@@ -7132,6 +7155,14 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
                     }
                     Ok(Some(Value::Object(Some(arr))))
                 }
+                // NIO contract: missing file → NoSuchFileException (see
+                // newByteChannel above), not a bare IOException — callers like
+                // FileSystemResource.getContentAsByteArray() catch
+                // NoSuchFileException and translate it to FileNotFoundException
+                // (ResourceTests#resourceCreateRelativeUnknown).
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                    Err(p57_no_such_file(ctx, &p))
+                }
                 Err(e) => Err(p57_io_error(&e)),
             }
         },
@@ -7433,8 +7464,7 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
                     }
                 }
             }
-            let result = p57_alloc_path(ctx, &p);
-            Ok(Some(Value::Object(Some(result))))
+            p57_alloc_path_checked(ctx, &p)
         },
     );
 
@@ -8122,6 +8152,76 @@ fn path_owned_by_virtual_fs(ctx: &mut dyn NativeContext, path_obj: ObjectRef) ->
     } else {
         false
     }
+}
+
+/// Windows `Path` syntax validation for the `Paths.get` factory — the ONLY
+/// p57 entry point that builds a `Path` directly from unvalidated caller
+/// input (every other `p57_alloc_path` call site here derives its string
+/// from an already-validated `Path`, e.g. `getParent`/`resolve`/`normalize`).
+/// A colon is only legal as the second character of a drive specifier
+/// (`C:...`) — anywhere else (including a bare `scheme:rest` string like
+/// Spring's `ping:foo` `ProtocolResolver` probe) it's illegal, matching real
+/// `sun.nio.fs.WindowsPathParser`. Mirrors `native-io`'s
+/// `validate_windows_path` (duplicated rather than shared: this is a
+/// separate crate, and this specific "mixed real-JDK mode" registration
+/// (`register_phase57_nio_file`) runs AFTER — and overwrites — `native-io`'s
+/// `Paths.get` registration for the same method key).
+fn p57_validate_windows_path(s: &str) -> Result<(), &'static str> {
+    if !cfg!(windows) {
+        return Ok(());
+    }
+    let bytes = s.as_bytes();
+    if bytes.len() >= 4
+        && (bytes[0] == b'\\' || bytes[0] == b'/')
+        && (bytes[1] == b'\\' || bytes[1] == b'/')
+        && bytes[2] == b'?'
+    {
+        return Ok(());
+    }
+    let drive_colon = if bytes.len() >= 2 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':' {
+        Some(1usize)
+    } else {
+        None
+    };
+    for (i, &b) in bytes.iter().enumerate() {
+        if b == b':' && Some(i) != drive_colon {
+            return Err("Illegal char <:>");
+        }
+        if b < 0x20 || matches!(b, b'<' | b'>' | b'"' | b'|' | b'?' | b'*') {
+            return Err("Illegal char");
+        }
+    }
+    Ok(())
+}
+
+/// Validate `path` before wrapping it in a synthetic p57 `Path` object;
+/// throws a real `java.nio.file.InvalidPathException` (matching real JDK)
+/// instead of silently accepting any string. See [`p57_validate_windows_path`].
+fn p57_alloc_path_checked(ctx: &mut dyn NativeContext, path: &str) -> MethodCallResult {
+    if let Err(reason) = p57_validate_windows_path(path) {
+        return match ctx.new_object("java/nio/file/InvalidPathException") {
+            Ok(Some(Value::Object(Some(exc)))) => {
+                let input_str = ctx.create_string(path);
+                let reason_str = ctx.create_string(reason);
+                let _ = ctx.invoke(
+                    "java/nio/file/InvalidPathException",
+                    "<init>",
+                    "(Ljava/lang/String;Ljava/lang/String;)V",
+                    &[
+                        Value::Object(Some(exc)),
+                        Value::Object(Some(input_str)),
+                        Value::Object(Some(reason_str)),
+                    ],
+                );
+                Err(MethodCallFailed::ExceptionThrown(exc))
+            }
+            _ => Err(RuntimeError::IllegalArgumentException {
+                message: format!("{reason}: {path}"),
+            }
+            .into()),
+        };
+    }
+    Ok(Some(Value::Object(Some(p57_alloc_path(ctx, path)))))
 }
 
 fn p57_alloc_path(ctx: &mut dyn NativeContext, path: &str) -> ObjectRef {
@@ -11650,9 +11750,44 @@ pub fn register_phase57_file(r: &mut NativeMethodRegistry) {
     });
 
     // toPath and toURI
+    //
+    // Validate the path first — real `File.toPath()` delegates to
+    // `FileSystems.getDefault().getPath(...)`, which throws
+    // `InvalidPathException` for Windows-illegal syntax (e.g. a bare colon
+    // outside a drive specifier, as in Spring's `ping:foo`
+    // `ProtocolResolver` probe: `GenericApplicationContextTests.
+    // getResourceWithCustomResourceLoader` relies on `FileSystemResource`'s
+    // `this.file.toPath()` throwing for exactly this). See
+    // `p57_validate_windows_path` (registered alongside `Paths.get` above)
+    // for the same check — duplicated here rather than shared because this
+    // registration builds a differently-shaped synthetic Path (2 fields via
+    // `alloc_concurrent_synthetic` directly, not `p57_alloc_path`).
     r.register(file, "toPath", "()Ljava/nio/file/Path;", |ctx, args| {
         let this = obj_arg(args, 0)?;
         let path = file_read_path(ctx, this);
+        if let Err(reason) = p57_validate_windows_path(&path) {
+            return match ctx.new_object("java/nio/file/InvalidPathException") {
+                Ok(Some(Value::Object(Some(exc)))) => {
+                    let input_str = ctx.create_string(&path);
+                    let reason_str = ctx.create_string(reason);
+                    let _ = ctx.invoke(
+                        "java/nio/file/InvalidPathException",
+                        "<init>",
+                        "(Ljava/lang/String;Ljava/lang/String;)V",
+                        &[
+                            Value::Object(Some(exc)),
+                            Value::Object(Some(input_str)),
+                            Value::Object(Some(reason_str)),
+                        ],
+                    );
+                    Err(MethodCallFailed::ExceptionThrown(exc))
+                }
+                _ => Err(RuntimeError::IllegalArgumentException {
+                    message: format!("{reason}: {path}"),
+                }
+                .into()),
+            };
+        }
         let p = alloc_concurrent_synthetic(ctx, "java/nio/file/Path", 2);
         let s = ctx.create_string(&path);
         ctx.set_field(p, 0, Value::Object(Some(s)));
@@ -19999,15 +20134,25 @@ pub(crate) fn register_p59_file_attributes(r: &mut NativeMethodRegistry) {
         "(Ljava/nio/file/Path;[Ljava/nio/file/LinkOption;)Ljava/nio/file/attribute/FileTime;",
         |ctx, args| {
             let path_str = extract_path_string(ctx, args.first());
-            let millis = if let Ok(meta) = std::fs::metadata(&path_str) {
-                meta.modified()
-                    .ok()
-                    .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-                    .map(|d| d.as_millis() as i64)
-                    .unwrap_or(0)
-            } else {
-                0
+            // NIO contract: a missing file must raise `NoSuchFileException`
+            // (see `newByteChannel` above), not silently answer with a
+            // zero/epoch `FileTime` — callers like
+            // `FileSystemResource.lastModified()` explicitly catch
+            // `NoSuchFileException` and translate it to
+            // `FileNotFoundException` (ResourceTests#resourceCreateRelativeUnknown).
+            let meta = match std::fs::metadata(&path_str) {
+                Ok(m) => m,
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                    return Err(p57_no_such_file(ctx, &path_str));
+                }
+                Err(e) => return Err(p57_io_error(&e)),
             };
+            let millis = meta
+                .modified()
+                .ok()
+                .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                .map(|d| d.as_millis() as i64)
+                .unwrap_or(0);
             let ft = filetime_alloc(ctx, millis);
             Ok(Some(Value::Object(Some(ft))))
         },
@@ -20066,13 +20211,22 @@ fn filetime_read_millis(ctx: &dyn NativeContext, ft: ObjectRef) -> i64 {
 
 /// Extract path string from a Path argument (field 0 = String)
 fn extract_path_string(ctx: &mut dyn NativeContext, arg: Option<&Value>) -> String {
-    match arg {
+    let raw = match arg {
         Some(Value::Object(Some(path_obj))) => match ctx.get_field(*path_obj, 0) {
             Value::Object(Some(s)) => ctx.read_string(s).unwrap_or_default(),
-            _ => String::new(),
+            _ => return String::new(),
         },
-        _ => String::new(),
-    }
+        _ => return String::new(),
+    };
+    // Match `p57_read_path`'s OS-path conversion (strips the leading `/`
+    // from a `/C:/...` Windows drive path). Without it, callers of this
+    // helper (e.g. `p59_files_read_attributes`) did a filesystem lookup
+    // against the raw `/C:/...` string, which Windows does not resolve the
+    // same way as `C:/...` — so a `Files.readAttributes`/
+    // `getLastModifiedTime` NotFound check could disagree with
+    // `Files.exists()` (which already goes through `p57_read_path`) for the
+    // exact same logical path.
+    p57_to_os_path(&raw)
 }
 
 /// Convert a SystemTime to epoch millis
@@ -20180,15 +20334,20 @@ fn p59_files_read_attributes(ctx: &mut dyn NativeContext, args: &[Value]) -> Met
             ctx.set_field(bfa, 3, Value::Int(if meta.is_dir() { 1 } else { 0 }));
             ctx.set_field(bfa, 4, Value::Long(meta.len() as i64));
         }
-        Err(_) => {
-            // Return default zeros for non-existent files
-            let ft = filetime_alloc(ctx, 0);
-            ctx.set_field(bfa, 0, Value::Object(Some(ft)));
-            ctx.set_field(bfa, 1, Value::Object(Some(ft)));
-            ctx.set_field(bfa, 2, Value::Object(Some(ft)));
-            ctx.set_field(bfa, 3, Value::Int(0));
-            ctx.set_field(bfa, 4, Value::Long(0));
+        // NIO contract: `Files.readAttributes` must raise `IOException`
+        // (`NoSuchFileException` when the path is missing) — silently
+        // answering with a fake all-zero `BasicFileAttributes` masked every
+        // failure, including a missing file. Real bytecode
+        // `Files.getLastModifiedTime`/`size`/`isDirectory` etc. are thin
+        // wrappers over `readAttributes`, so this silent success also broke
+        // `Files.getLastModifiedTime` never throwing for a missing file —
+        // `FileSystemResource.lastModified()` catches `NoSuchFileException`
+        // and translates it to `FileNotFoundException`
+        // (ResourceTests#resourceCreateRelativeUnknown).
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            return Err(p57_no_such_file(ctx, &path_str));
         }
+        Err(e) => return Err(p57_io_error(&e)),
     }
 
     Ok(Some(Value::Object(Some(bfa))))
@@ -43667,6 +43826,11 @@ pub(crate) fn register_p71_files_bridge(r: &mut NativeMethodRegistry) {
                         ctx.set_array_element(arr, i, Value::Int(b as i8 as i32));
                     }
                     Ok(Some(Value::Object(Some(arr))))
+                }
+                // NIO contract: missing file → NoSuchFileException, not a bare
+                // IOException/IllegalStateException (see newByteChannel above).
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                    Err(p57_no_such_file(ctx, &p))
                 }
                 Err(e) => Err(RuntimeError::IllegalStateException {
                     message: format!("IOException: {}", e),
