@@ -3948,15 +3948,14 @@ fn register_re4_url_http(r: &mut NativeMethodRegistry) {
             // and `JarURLConnection.getJarFile` below for the same ambiguity.
             let raw_rest = rest;
             let trimmed_rest = rest.trim_start_matches('/');
-            let rest = if std::path::Path::new(
-                trimmed_rest.split("!/").next().unwrap_or(trimmed_rest),
-            )
-            .exists()
-            {
-                trimmed_rest
-            } else {
-                raw_rest
-            };
+            let rest =
+                if std::path::Path::new(trimmed_rest.split("!/").next().unwrap_or(trimmed_rest))
+                    .exists()
+                {
+                    trimmed_rest
+                } else {
+                    raw_rest
+                };
             let (outer_jar, inner_path) = match rest.find("!/") {
                 Some(i) => (&rest[..i], &rest[i + 2..]),
                 None => {

@@ -10509,7 +10509,13 @@ pub(crate) fn pbkdf2_prf_code(alg: &str) -> Option<i32> {
 /// needs the same math `pbkdf2_generate_secret` already does but driven from
 /// a `Cipher.init(..., AlgorithmParameters)` call instead of a
 /// `SecretKeyFactory.generateSecret(PBEKeySpec)` call.
-pub(crate) fn pbkdf2_derive_for(prf: i32, pw: &[u8], salt: &[u8], iters: u32, dklen: usize) -> Vec<u8> {
+pub(crate) fn pbkdf2_derive_for(
+    prf: i32,
+    pw: &[u8],
+    salt: &[u8],
+    iters: u32,
+    dklen: usize,
+) -> Vec<u8> {
     match prf {
         1 => pbkdf2_derive::<sha1::Sha1>(pw, salt, iters, dklen),
         224 => pbkdf2_derive::<sha2::Sha224>(pw, salt, iters, dklen),

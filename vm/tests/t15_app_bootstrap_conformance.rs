@@ -280,7 +280,7 @@ fn t15_unit_tests_exist() {
         "finalizer_register_with_null",
         "array_new_array_int",
         "array_new_array_negative_size",
-        "define_class1_empty_bytes_returns_null",
+        "define_class1_empty_bytes_throws",
         "define_class1_out_of_bounds",
     ];
 

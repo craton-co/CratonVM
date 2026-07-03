@@ -2422,8 +2422,8 @@ fn ss_wrapper_local_address(ctx: &mut dyn NativeContext, args: &[Value]) -> Meth
         // Plain ServerSocket — read the port recorded by the binder (BUG-04),
         // same channel ss_wrapper_local_port uses. No channel registry entry
         // to resolve a real host from here, so keep the wildcard text.
-        let port =
-            cratonvm_native_api::server_socket_ports::get(ctx.identity_hash_code(this)).unwrap_or(0);
+        let port = cratonvm_native_api::server_socket_ports::get(ctx.identity_hash_code(this))
+            .unwrap_or(0);
         (port, "0.0.0.0".to_string())
     };
     if port <= 0 {

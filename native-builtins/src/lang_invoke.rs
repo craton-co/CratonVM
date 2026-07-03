@@ -1455,7 +1455,12 @@ fn segment_raw_access(
 /// case). `addr` is the Unsafe-style absolute byte offset into `base` as returned by
 /// `unsafeGetOffset()`; real `byte[]` segments carry `ARRAY_BYTE_BASE_OFFSET` baked into
 /// that value so it lands directly on `base`'s own element indices.
-fn segment_heap_get(ctx: &mut dyn NativeContext, base: ObjectRef, addr: i64, width: i64) -> Option<u64> {
+fn segment_heap_get(
+    ctx: &mut dyn NativeContext,
+    base: ObjectRef,
+    addr: i64,
+    width: i64,
+) -> Option<u64> {
     let len = ctx.array_length(base);
     let start = usize::try_from(addr).ok()?;
     if start.checked_add(width as usize)? > len {
@@ -1472,7 +1477,13 @@ fn segment_heap_get(ctx: &mut dyn NativeContext, base: ObjectRef, addr: i64, wid
     Some(raw)
 }
 
-fn segment_heap_set(ctx: &mut dyn NativeContext, base: ObjectRef, addr: i64, width: i64, raw: u64) -> bool {
+fn segment_heap_set(
+    ctx: &mut dyn NativeContext,
+    base: ObjectRef,
+    addr: i64,
+    width: i64,
+    raw: u64,
+) -> bool {
     let len = ctx.array_length(base);
     let start = match usize::try_from(addr) {
         Ok(s) => s,
@@ -1565,7 +1576,11 @@ fn segment_native_set(addr: i64, width: i64, raw: u64) -> Result<(), MethodCallF
 /// once `is_segment_var_handle` matches. Returns `None` (fall through to the
 /// existing dispatch) only if the VarHandle's own fields can't be resolved;
 /// otherwise always produces a value or an error.
-fn segment_vh_get(ctx: &mut dyn NativeContext, this: ObjectRef, args: &[Value]) -> Option<MethodCallResult> {
+fn segment_vh_get(
+    ctx: &mut dyn NativeContext,
+    this: ObjectRef,
+    args: &[Value],
+) -> Option<MethodCallResult> {
     let (enclosing, vh_offset, be) = segment_vh_fields(ctx, this)?;
     let seg = match args.get(1) {
         Some(Value::Object(Some(s))) => *s,
@@ -1594,7 +1609,11 @@ fn segment_vh_get(ctx: &mut dyn NativeContext, this: ObjectRef, args: &[Value]) 
 }
 
 /// `SegmentVarHandle.set(segment, offset, value)` — see `segment_vh_get`.
-fn segment_vh_set(ctx: &mut dyn NativeContext, this: ObjectRef, args: &[Value]) -> Option<MethodCallResult> {
+fn segment_vh_set(
+    ctx: &mut dyn NativeContext,
+    this: ObjectRef,
+    args: &[Value],
+) -> Option<MethodCallResult> {
     let (enclosing, vh_offset, be) = segment_vh_fields(ctx, this)?;
     let seg = match args.get(1) {
         Some(Value::Object(Some(s))) => *s,
@@ -1612,10 +1631,9 @@ fn segment_vh_set(ctx: &mut dyn NativeContext, this: ObjectRef, args: &[Value]) 
         // Direct field read (not `isReadOnly()` invoke_virtual) — see
         // `segment_raw_access`'s doc comment on avoiding reentrant native→
         // bytecode calls from inside a native invoked by JIT-compiled code.
-        let is_ro = match ctx.resolve_field_index(
-            "jdk/internal/foreign/AbstractMemorySegmentImpl",
-            "readOnly",
-        ) {
+        let is_ro = match ctx
+            .resolve_field_index("jdk/internal/foreign/AbstractMemorySegmentImpl", "readOnly")
+        {
             Some(i) => matches!(ctx.get_field(seg, i), Value::Int(n) if n != 0),
             None => false,
         };
