@@ -5873,6 +5873,13 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
                     let s = ctx.create_string(&content);
                     Ok(Some(Value::Object(Some(s))))
                 }
+                // NIO contract: missing file → NoSuchFileException (see
+                // newByteChannel above), not a bare IOException — callers like
+                // FileSystemResource.getContentAsString() catch
+                // NoSuchFileException and translate it to FileNotFoundException.
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                    Err(p57_no_such_file(ctx, &p))
+                }
                 Err(e) => Err(p57_io_error(&e)),
             }
         },
@@ -5890,6 +5897,9 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
                 Ok(content) => {
                     let s = ctx.create_string(&content);
                     Ok(Some(Value::Object(Some(s))))
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                    Err(p57_no_such_file(ctx, &p))
                 }
                 Err(e) => Err(p57_io_error(&e)),
             }
@@ -6499,14 +6509,27 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
             // JDK FileChannel.open contract: a channel with neither READ nor
             // WRITE is read-only; WRITE without READ is write-only.
             let readable = read_opt || !writable;
-            let fd_id = if writable {
+            // Real `FileChannel.open` throws `java.nio.file.NoSuchFileException`
+            // (not a bare `IOException`) when the target is missing — callers
+            // like `FileSystemResource.readableChannel()` explicitly catch
+            // `NoSuchFileException` and translate it to `FileNotFoundException`
+            // (ResourceTests#resourceCreateRelativeUnknown). Mapping every open
+            // failure to a generic `IOException` made that catch miss, so the
+            // raw `IOException` propagated to the caller instead.
+            let open_result = if writable {
                 ctx.fd_table().open_read_write(&p, create)
             } else {
                 ctx.fd_table().open_read_write(&p, false)
                     .or_else(|_| ctx.fd_table().open_read(&p))
-            }
-            .map_err(|e| RuntimeError::IOException {
-                message: format!("Cannot open {}: {}", p, e),
+            };
+            let fd_id = open_result.map_err(|e| {
+                if e.kind() == std::io::ErrorKind::NotFound {
+                    RuntimeError::NoSuchFileException { path: p.clone() }
+                } else {
+                    RuntimeError::IOException {
+                        message: format!("Cannot open {}: {}", p, e),
+                    }
+                }
             })?;
             if truncate && writable {
                 let _ = ctx.fd_table().rw_set_length(fd_id, 0);
@@ -7131,6 +7154,14 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
                         ctx.set_array_element(arr, i, Value::Int(b as i8 as i32));
                     }
                     Ok(Some(Value::Object(Some(arr))))
+                }
+                // NIO contract: missing file → NoSuchFileException (see
+                // newByteChannel above), not a bare IOException — callers like
+                // FileSystemResource.getContentAsByteArray() catch
+                // NoSuchFileException and translate it to FileNotFoundException
+                // (ResourceTests#resourceCreateRelativeUnknown).
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                    Err(p57_no_such_file(ctx, &p))
                 }
                 Err(e) => Err(p57_io_error(&e)),
             }
@@ -19999,15 +20030,25 @@ pub(crate) fn register_p59_file_attributes(r: &mut NativeMethodRegistry) {
         "(Ljava/nio/file/Path;[Ljava/nio/file/LinkOption;)Ljava/nio/file/attribute/FileTime;",
         |ctx, args| {
             let path_str = extract_path_string(ctx, args.first());
-            let millis = if let Ok(meta) = std::fs::metadata(&path_str) {
-                meta.modified()
-                    .ok()
-                    .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-                    .map(|d| d.as_millis() as i64)
-                    .unwrap_or(0)
-            } else {
-                0
+            // NIO contract: a missing file must raise `NoSuchFileException`
+            // (see `newByteChannel` above), not silently answer with a
+            // zero/epoch `FileTime` — callers like
+            // `FileSystemResource.lastModified()` explicitly catch
+            // `NoSuchFileException` and translate it to
+            // `FileNotFoundException` (ResourceTests#resourceCreateRelativeUnknown).
+            let meta = match std::fs::metadata(&path_str) {
+                Ok(m) => m,
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                    return Err(p57_no_such_file(ctx, &path_str));
+                }
+                Err(e) => return Err(p57_io_error(&e)),
             };
+            let millis = meta
+                .modified()
+                .ok()
+                .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                .map(|d| d.as_millis() as i64)
+                .unwrap_or(0);
             let ft = filetime_alloc(ctx, millis);
             Ok(Some(Value::Object(Some(ft))))
         },
@@ -20066,13 +20107,22 @@ fn filetime_read_millis(ctx: &dyn NativeContext, ft: ObjectRef) -> i64 {
 
 /// Extract path string from a Path argument (field 0 = String)
 fn extract_path_string(ctx: &mut dyn NativeContext, arg: Option<&Value>) -> String {
-    match arg {
+    let raw = match arg {
         Some(Value::Object(Some(path_obj))) => match ctx.get_field(*path_obj, 0) {
             Value::Object(Some(s)) => ctx.read_string(s).unwrap_or_default(),
-            _ => String::new(),
+            _ => return String::new(),
         },
-        _ => String::new(),
-    }
+        _ => return String::new(),
+    };
+    // Match `p57_read_path`'s OS-path conversion (strips the leading `/`
+    // from a `/C:/...` Windows drive path). Without it, callers of this
+    // helper (e.g. `p59_files_read_attributes`) did a filesystem lookup
+    // against the raw `/C:/...` string, which Windows does not resolve the
+    // same way as `C:/...` — so a `Files.readAttributes`/
+    // `getLastModifiedTime` NotFound check could disagree with
+    // `Files.exists()` (which already goes through `p57_read_path`) for the
+    // exact same logical path.
+    p57_to_os_path(&raw)
 }
 
 /// Convert a SystemTime to epoch millis
@@ -20180,15 +20230,20 @@ fn p59_files_read_attributes(ctx: &mut dyn NativeContext, args: &[Value]) -> Met
             ctx.set_field(bfa, 3, Value::Int(if meta.is_dir() { 1 } else { 0 }));
             ctx.set_field(bfa, 4, Value::Long(meta.len() as i64));
         }
-        Err(_) => {
-            // Return default zeros for non-existent files
-            let ft = filetime_alloc(ctx, 0);
-            ctx.set_field(bfa, 0, Value::Object(Some(ft)));
-            ctx.set_field(bfa, 1, Value::Object(Some(ft)));
-            ctx.set_field(bfa, 2, Value::Object(Some(ft)));
-            ctx.set_field(bfa, 3, Value::Int(0));
-            ctx.set_field(bfa, 4, Value::Long(0));
+        // NIO contract: `Files.readAttributes` must raise `IOException`
+        // (`NoSuchFileException` when the path is missing) — silently
+        // answering with a fake all-zero `BasicFileAttributes` masked every
+        // failure, including a missing file. Real bytecode
+        // `Files.getLastModifiedTime`/`size`/`isDirectory` etc. are thin
+        // wrappers over `readAttributes`, so this silent success also broke
+        // `Files.getLastModifiedTime` never throwing for a missing file —
+        // `FileSystemResource.lastModified()` catches `NoSuchFileException`
+        // and translates it to `FileNotFoundException`
+        // (ResourceTests#resourceCreateRelativeUnknown).
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            return Err(p57_no_such_file(ctx, &path_str));
         }
+        Err(e) => return Err(p57_io_error(&e)),
     }
 
     Ok(Some(Value::Object(Some(bfa))))
@@ -43667,6 +43722,11 @@ pub(crate) fn register_p71_files_bridge(r: &mut NativeMethodRegistry) {
                         ctx.set_array_element(arr, i, Value::Int(b as i8 as i32));
                     }
                     Ok(Some(Value::Object(Some(arr))))
+                }
+                // NIO contract: missing file → NoSuchFileException, not a bare
+                // IOException/IllegalStateException (see newByteChannel above).
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                    Err(p57_no_such_file(ctx, &p))
                 }
                 Err(e) => Err(RuntimeError::IllegalStateException {
                     message: format!("IOException: {}", e),

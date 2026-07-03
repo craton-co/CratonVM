@@ -131,6 +131,27 @@ fn get_environment(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRes
         if let Value::Object(Some(env)) = ctx.get_field_by_name(*this, "environment") {
             return Ok(Some(Value::Object(Some(env))));
         }
+        // Real bytecode: `this.environment = createEnvironment();` — a VIRTUAL
+        // call, not a direct construction of `StandardEnvironment`. Web
+        // application contexts (`GenericWebApplicationContext`,
+        // `StaticWebApplicationContext`, …) override `createEnvironment()` in
+        // real bytecode to return `StandardServletEnvironment`. Calling
+        // `construct_real_standard_environment` directly here bypassed that
+        // override, so every context — web or not — got a plain
+        // `StandardEnvironment`, breaking `instanceof StandardServletEnvironment`
+        // checks (EnvironmentSystemIntegrationTests). Dispatch virtually so a
+        // bytecode override wins; only fall back to the base-class native
+        // construction when there is none (`invoke_virtual` then resolves back
+        // to `create_environment` itself, registered on `ABSTRACT_CTX`).
+        if let Ok(Some(Value::Object(Some(env)))) = ctx.invoke_virtual(
+            *this,
+            "createEnvironment",
+            "()Lorg/springframework/core/env/ConfigurableEnvironment;",
+            &[],
+        ) {
+            ctx.set_field_by_name(*this, "environment", Value::Object(Some(env)));
+            return Ok(Some(Value::Object(Some(env))));
+        }
         if let Some(env) = construct_real_standard_environment(ctx) {
             ctx.set_field_by_name(*this, "environment", Value::Object(Some(env)));
             return Ok(Some(Value::Object(Some(env))));

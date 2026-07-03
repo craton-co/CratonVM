@@ -2242,7 +2242,6 @@ pub(crate) fn native_module_classloader_get_resource(
 /// writes for any synthetic-mode consumers that still index by slot.
 pub(crate) fn build_synthetic_url(ctx: &mut dyn NativeContext, spec: &str) -> ObjectRef {
     let url = alloc_concurrent_synthetic(ctx, "java/net/URL", 13);
-    let full = ctx.create_string(spec);
     let (protocol, file_part) = if let Some(rest) = spec.strip_prefix("jar:") {
         ("jar", rest.to_string())
     } else if let Some(rest) = spec.strip_prefix("file:") {
@@ -2268,12 +2267,22 @@ pub(crate) fn build_synthetic_url(ctx: &mut dyn NativeContext, spec: &str) -> Ob
     // `url.getProtocol()` return the entire string — exactly the bug this
     // helper fixes.
     //
-    // We DO write slot 5 (URL_FIELD_FULL) which is used by native_url_equals
-    // and native_url_hash_code for correct identity-neutral URL comparison.
-    // Slot 5 in real-JDK URL is `authority` (a String field distinct from
-    // the spec), so writing the full spec here shadows authority — that is
-    // acceptable because build_synthetic_url URLs never have authorities.
-    ctx.set_field(url, 5, Value::Object(Some(full)));
+    // A prior version of this helper ALSO wrote the full spec into slot 5
+    // (`authority`), reasoning that `native_url_equals`/`native_url_hash_code`
+    // needed it there for identity-neutral comparison. That's no longer true —
+    // both now reconstruct the external form from protocol/host/port/file/ref
+    // (see `url_external_form` in lib.rs) and never read `authority`. Worse,
+    // leaving `authority` = the full spec string was an active bug: real
+    // bytecode's `URLStreamHandler.parseURL` inherits a context URL's
+    // `authority` into the merged result when a relative `spec` has no `//`
+    // authority of its own. A synthetic classpath-resource URL used as the
+    // context for `new URL(context, "X.class")` (e.g.
+    // `ResourceUtils.toRelativeURL`) then produced a merged URL whose
+    // `authority` was the entire original spec — which contains `/` — and the
+    // JDK's own authority validation rejects that with `MalformedURLException:
+    // Illegal character found in authority: '/'` (ResourceTests
+    // #resourceCreateRelativeUnknown[UrlResource]). Leave `authority` null, as
+    // set above.
     url
 }
 

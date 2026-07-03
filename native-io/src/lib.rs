@@ -796,6 +796,22 @@ fn file_not_found(path: &str) -> MethodCallFailed {
     }))
 }
 
+/// Convert an `io::Error` for a `java.nio.file` operation, mapping ENOENT to
+/// the real JDK's `NoSuchFileException` (not a bare `IOException`) so callers
+/// that specifically catch `NoSuchFileException` — e.g.
+/// `FileSystemResource.getContentAsByteArray`/`getContentAsString`, which
+/// translate it to `FileNotFoundException` — actually see it
+/// (ResourceTests#resourceCreateRelativeUnknown).
+fn io_err_nio(e: io::Error, path: &str) -> MethodCallFailed {
+    if e.kind() == io::ErrorKind::NotFound {
+        MethodCallFailed::InternalError(VmError::Runtime(RuntimeError::NoSuchFileException {
+            path: path.to_string(),
+        }))
+    } else {
+        io_err(e)
+    }
+}
+
 /// Validate caller-supplied `(off, len)` against a byte array of length
 /// `arr_len`, matching the JDK's `Objects.checkFromIndexSize` contract
 /// used by `FileInputStream`/`FileOutputStream`/`RandomAccessFile`.
@@ -6430,12 +6446,25 @@ fn native_fc_open(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResu
         .unwrap_or_default();
 
     // Simplified: open for read (a full impl would check OpenOptions)
-    let fd_id = ctx
-        .fd_table()
-        .open_read(&path_str)
-        .map_err(|e| RuntimeError::IOException {
-            message: format!("FileChannel.open: {e}"),
-        })?;
+    //
+    // Real `FileChannel.open` throws `java.nio.file.NoSuchFileException` (not
+    // `FileNotFoundException`) when the target is missing — callers like
+    // `FileSystemResource.readableChannel()` explicitly catch
+    // `NoSuchFileException` and translate it to `FileNotFoundException`
+    // (ResourceTests#resourceCreateRelativeUnknown). Mapping every open
+    // failure to a generic `IOException` (as before) made that catch miss,
+    // so the raw `IOException` propagated instead.
+    let fd_id = ctx.fd_table().open_read(&path_str).map_err(|e| {
+        if e.kind() == io::ErrorKind::NotFound {
+            MethodCallFailed::InternalError(VmError::Runtime(RuntimeError::NoSuchFileException {
+                path: path_str.clone(),
+            }))
+        } else {
+            MethodCallFailed::InternalError(VmError::Runtime(RuntimeError::IOException {
+                message: format!("FileChannel.open: {e}"),
+            }))
+        }
+    })?;
 
     let fc = match ctx.ensure_class_initialized("java/nio/channels/FileChannel") {
         Ok(cid) => ctx.alloc_object(cid, 2),
@@ -8943,7 +8972,7 @@ fn native_files_create_directories(
 
 fn native_files_read_all_bytes(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let s = validated_path(&files_path_str(ctx, args))?;
-    let bytes = std::fs::read(&s).map_err(io_err)?;
+    let bytes = std::fs::read(&s).map_err(|e| io_err_nio(e, &s))?;
     let arr = ctx.new_array(cratonvm_types::ArrayElementType::Byte, bytes.len());
     // AUDIT 2026-05-29: bulk copy via NativeContext::write_byte_array_from
     // instead of a per-element `set_array_element` loop. The VM override
@@ -8957,7 +8986,7 @@ fn native_files_read_all_bytes(ctx: &mut dyn NativeContext, args: &[Value]) -> M
 
 fn native_files_read_string(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let s = validated_path(&files_path_str(ctx, args))?;
-    let content = std::fs::read_to_string(&s).map_err(io_err)?;
+    let content = std::fs::read_to_string(&s).map_err(|e| io_err_nio(e, &s))?;
     let result = ctx.create_string(&content);
     Ok(Some(Value::Object(Some(result))))
 }
