@@ -1391,6 +1391,60 @@ pub fn register(registry: &mut NativeMethodRegistry) {
         },
     );
 
+    // java.util.Currency.getSymbol(Locale) — real bytecode resolves the
+    // display symbol via `LocaleServiceProviderPool.getPool(CurrencyNameProvider.class)
+    // .getLocalizedObject(...)`, which walks the `jdk.localedata` class-based
+    // resource chain CratonVM doesn't surface (same gap as the
+    // ResourceBundle/LocaleResources overrides above). With no provider found,
+    // the JDK's own fallback kicks in: "use currency code as symbol of last
+    // resort" — i.e. it returns the bare ISO 4217 code ("USD") instead of "$".
+    //
+    // This silently poisons `DecimalFormatSymbols.initialize` below:
+    // `setCurrencySymbol("$")` runs first, but `setInternationalCurrencySymbol
+    // ("USD")` runs right after and its real bytecode body re-derives
+    // `currencySymbol = currency.getSymbol(locale)` — which, without this
+    // override, clobbers the correct "$" back to "USD". Surfaced as
+    // `CurrencyStyleFormatterTests`/`NumberFormattingTests` formatting
+    // `new BigDecimal("23")` as "USD23.00" instead of "$23.00", and parsing
+    // "$23.56" failing with `ParseException` because the computed
+    // `positivePrefix` affix ("USD") never matches the literal "$" prefix in
+    // the input text.
+    //
+    // Answer directly from a small curated ISO-code → symbol table (same
+    // curation level as the existing `populate_currency_names_en` map and the
+    // `Currency.getSymbol()` no-arg override that already existed for
+    // synthetic-JDK mode). `getSymbol()` (no-arg) delegates to
+    // `getSymbol(Locale.getDefault(...))` in real bytecode, so overriding only
+    // the 1-arg overload fixes both call forms.
+    registry.register(
+        "java/util/Currency",
+        "getSymbol",
+        "(Ljava/util/Locale;)Ljava/lang/String;",
+        |ctx, args| {
+            let this = match args.first() {
+                Some(Value::Object(Some(o))) => *o,
+                _ => return Ok(Some(Value::Object(None))),
+            };
+            let code = match ctx.get_field_by_name(this, "currencyCode") {
+                Value::Object(Some(o)) => ctx.read_string(o).unwrap_or_default(),
+                _ => String::new(),
+            };
+            let sym = match code.as_str() {
+                "USD" => "$",
+                "EUR" => "\u{20AC}",
+                "GBP" => "\u{00A3}",
+                "JPY" => "\u{00A5}",
+                "CNY" => "\u{00A5}",
+                "CHF" => "CHF",
+                "CAD" => "$",
+                "AUD" => "$",
+                _ => &code,
+            };
+            let s = ctx.create_string(sym);
+            Ok(Some(Value::Object(Some(s))))
+        },
+    );
+
     // java.text.DecimalFormatSymbols.initialize(Locale) — bypass the
     // JDK's private locale-provider walk entirely.  The original method
     // reads `LocaleResources.getDecimalFormatSymbolsData()` then uses
@@ -1499,6 +1553,21 @@ pub fn register(registry: &mut NativeMethodRegistry) {
                 "setMonetaryDecimalSeparator",
                 "(C)V",
                 &[Value::Int(dec_sep as i32)],
+            );
+            // setMonetaryGroupingSeparator — without this, `monetaryGroupingSeparator`
+            // keeps its zero-value default. Real `DecimalFormat.subparse` (the
+            // number-parsing engine) uses `symbols.getMonetaryGroupingSeparator()`
+            // instead of `symbols.getGroupingSeparator()` whenever `isCurrencyFormat`
+            // is true (i.e. any format built via `NumberFormat.getCurrencyInstance`),
+            // so a grouped currency string like "$3,339.12" failed to recognize the
+            // "," as a grouping separator and parsing stopped after the first digit
+            // group — surfaced as `NumberFormattingTests.currencyFormatting()`
+            // binding "$3,339.12" with a ParseException (getErrorCount()==1).
+            let _ = ctx.invoke_virtual(
+                this,
+                "setMonetaryGroupingSeparator",
+                "(C)V",
+                &[Value::Int(grp_sep as i32)],
             );
             let cs = ctx.create_string("$");
             let _ = ctx.invoke_virtual(
