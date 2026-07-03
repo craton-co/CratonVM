@@ -3558,12 +3558,26 @@ fn map_resize_inner(ctx: &mut dyn NativeContext, this: ObjectRef, is_concurrent:
         None
     };
 
-    let (old_buckets, size, old_cap) = map_state(ctx, this);
+    let (_old_buckets0, size, old_cap) = map_state(ctx, this);
     if old_cap >= MAP_MAX_CAPACITY {
         return; // cannot grow further
     }
     let new_cap = std::cmp::min(old_cap * 2, MAP_MAX_CAPACITY);
+    // gcstress residual face-1 fix — `alloc_ref_array` can trigger a moving
+    // young GC (deterministic under CRATONVM_DBG_GC_STRESS) that relocates
+    // `this` and its bucket array. Both were captured as bare Rust locals
+    // above and are used throughout the rehash + the final field writes; a
+    // stale address would make every `get_array_element(old_b, ..)` /
+    // `set_field(this, ..)` land in freed-and-reused storage (the same
+    // corrupt-cell family as native_map_put). Pin `this` across the alloc,
+    // then re-read `this` and re-fetch `old_buckets` from the live map. The
+    // split loop below reuses existing nodes (no further allocation), so one
+    // re-read suffices; nodes reached via the re-read `old_b` are already
+    // forwarded. The only early `return` (MAX_CAPACITY) is above this pin.
+    let this_pin = ctx.pin_native_root(this);
     let new_buckets = alloc_ref_array(ctx, new_cap as usize);
+    let this = ctx.read_native_pin(this_pin, this);
+    let old_buckets = map_state(ctx, this).0;
 
     // Re-hash all entries. When `new_cap == 2 * old_cap` (the common
     // doubling case) we use JDK's split semantics: each entry whose
@@ -3760,6 +3774,7 @@ fn map_resize_inner(ctx: &mut dyn NativeContext, this: ObjectRef, is_concurrent:
     if table_slot != Some(MAP_FIELD_CAPACITY) {
         ctx.set_field(this, MAP_FIELD_CAPACITY, Value::Int(new_cap));
     }
+    ctx.unpin_native_roots(this_pin); // gcstress residual face-1 fix
 }
 
 /// Collect all keys from a HashMap into a Vec.
