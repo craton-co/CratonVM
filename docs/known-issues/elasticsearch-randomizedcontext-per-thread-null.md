@@ -1,12 +1,15 @@
 # Elasticsearch RandomizedContext per-thread state is null
 
 Status: open (one real GC bug found + fixed, see "Confirmed root cause #1
-(fixed)"; the exact repro below still fails via a SEPARATE, JIT-related
-residual — narrowed to 4 suspect JIT-compiled `WeakHashMap` methods, see
-"Residual: root cause NARROWED to a JIT bug — not GC")
+(fixed)"; the exact repro below still fails via a SEPARATE residual —
+confirmed JIT-dependent, and confirmed via systematic bisection to be a
+volume/timing effect rather than any single miscompiled method, see
+"Residual: bisected to a JIT-volume/timing effect, NOT a specific
+miscompiled method")
 
 Date observed: 2026-07-02
-Date partially fixed / JIT lead identified: 2026-07-02 (branch
+Date partially fixed / JIT lead identified: 2026-07-02, bisected 2026-07-03
+(branch
 `fix/es-randomizedcontext-per-thread-null`, worktree
 `C:\craton\CratonVM-randctx-perthread`, NOT YET MERGED)
 
@@ -121,7 +124,7 @@ non-moving sweep ran.
 - `gc/src/old_gen.rs::tests::compact_records_identity_map_for_watched_stationary_survivor`
   — same shape, for the old-gen compactor.
 
-## Residual: root cause NARROWED to a JIT bug — not GC (2026-07-02, later session)
+## Residual: bisected to a JIT-volume/timing effect, NOT a specific miscompiled method (2026-07-02/03)
 
 With both GC fixes applied, `MappingStatsTests` (see Repro) still fails
 **deterministically** with the identical NPE signature, reported as a JUnit
@@ -194,17 +197,58 @@ java/util/WeakHashMap.matchesKey(Ljava/util/WeakHashMap$Entry;Ljava/lang/Object;
 
 These are precisely the bucket-lookup/key-matching primitives behind
 `WeakHashMap.get()`/`getEntry()`. `matchesKey` in particular is the
-strongest suspect: it dereferences an `Entry`'s `WeakReference.get()` and
-compares against the query key — a JIT codegen bug there (wrong register
-compared, a spilled value read after being clobbered, etc.) would produce
-exactly this symptom: an entry present in the correct bucket that the
-lookup fails to recognize as a match, so `getEntry()`/`get()` returns null
-even though the entry was never actually cleared. `matchesKey`'s compiled
-body is unusually large for its Java source (979 bytes; dumped via
-`CRATONVM_DBG_DUMP_JIT=matchesKey`) with 3-4 near-duplicate code blocks,
-consistent with the method being inlined at multiple call sites — not yet
-manually verified against expected semantics (needs a proper disassembler
-pass, not just hex inspection).
+strongest suspect: it dereferences an `Entry`'s `WeakReference` and compares
+against the query key — a JIT codegen bug there would produce exactly this
+symptom: an entry present in the correct bucket that the lookup fails to
+recognize as a match, so `getEntry()`/`get()` returns null even though the
+entry was never actually cleared.
+
+**Update — proper disassembly obtained and checked against real semantics.**
+CratonVM already has a real x86-64 disassembler for this
+(`vm/src/jit/disasm.rs`, `CRATONVM_DBG_JIT_DISASM=<Class.method substring>`,
+NASM-formatted, annotated with real addresses) — no need for raw hex
+inspection. Real JDK 25 bytecode for `matchesKey`
+(`javap -p -c -classpath <jdk>/lib/modules java.util.WeakHashMap`):
+
+```java
+private boolean matchesKey(Entry e, Object key) {
+    if (e.refersTo(key)) return true;      // Reference.refersTo — fast path
+    Object k = e.get();                     // dereference the WeakReference
+    return k != null && key.equals(k);
+}
+```
+
+The compiled 979-byte body's control flow (offsets `0x5a`, `0x16b`, `0x288` —
+three near-identical inline-cache blocks) matches this exactly: block 1 is
+`e.refersTo(key)` (return true if it matches), block 2 is `e.get()` (jump to
+false if null), block 3 is `key.equals(k)`. **The high-level control flow is
+correct** — this is not a wrong-branch or inverted-condition bug.
+
+The remaining suspect is lower-level: `e`/`key`/`k` are locals homed in
+callee-saved registers r12/r13/r14 (`jit/src/x64.rs` "Register mapping for
+locals → callee-saved registers... R12-R15 + RBX", confirmed against the
+observed prologue, which saves/restores exactly r12/r13/r14). Each of the
+three blocks makes a GC-capable virtual-dispatch call
+(`refersTo`/`get`/`equals`) and then reloads its locals from register/spill
+state afterward. `jit/src/x64.rs` documents an **already-known, closely
+related** hazard class right next to this code:
+`flush_callee_saved_oops_enabled` (default ON, opt out with
+`CRATONVM_JIT_NO_CALLEE_OOP_FLUSH`) — "a callee-saved register pushed onto
+the operand stack... survives a GC-capable call un-spilled by ABI, so a live
+oop residing ONLY in that register at the safepoint is invisible to the
+conservative... scan → the object can be reclaimed → use-after-free." That
+existing fix covers **operand-stack** `CalleeSaved` entries specifically;
+whether the same protection extends to plain **local-variable** homes
+(`matchesKey`'s `e`/`key`/`k`, never pushed to the operand stack) is
+unconfirmed — this is the most concrete remaining lead.
+
+Tested and **did not fix it**: `CRATONVM_JIT_SAFEPOINT_REG_SPILL=all` (blind-
+spills every allocatable GPR, not just callee-saved, at every GC-capable
+safepoint — documented as closing "a live oop held in a caller-saved /
+argument / RAX register... invisible to the conservative root scan"). NPE
+still reproduced with this set. Either this specific mechanism doesn't cover
+`matchesKey`'s call sites, or the root cause is not register-visibility to
+the conservative scanner at all.
 
 **Ruled out**: the bug is NOT one specific, already-toggleable JIT
 optimization pass. Re-running with `CRATONVM_DISABLE_SCALAR_REPLACEMENT=1`
@@ -225,20 +269,99 @@ shared `synchronized` lock, each `put`ting and `get`ting its own key 20000
 times plus periodic churn `put`s, then a final check from `main` after
 `join`ing; (4) 500 rounds of `new Thread().start().join()` with a `get()`
 check on the stable "self" key after each round. None reproduced a single
-miss. The real failure needs either the full ES/RandomizedContext workload's
-scale (165 total JIT-compiled methods interacting, not just the four
-`WeakHashMap` ones in isolation) or a timing window not yet captured by
-these simplified repros — worth another isolated-repro attempt that more
-closely matches ES's exact allocation/thread-churn pattern, or a proper
-disassembly-level review of the four suspect compiled methods.
+miss. This is now explained by the bisection finding below: these tiny
+repros never come close to compiling the ~60+ methods needed to cross
+whatever threshold matters.
+
+### `matchesKey`/`hash`/`indexFor`/`maskNull` disassembled and verified CORRECT
+
+Using the codebase's existing real x86-64 disassembler
+(`vm/src/jit/disasm.rs`, `CRATONVM_DBG_JIT_DISASM=<Class.method substring>`,
+NASM-formatted, address-annotated — a much better tool than the raw hex from
+`CRATONVM_DBG_DUMP_JIT`), all four suspect methods' compiled bodies were
+checked instruction-by-instruction against real JDK 25 bytecode
+(`javap -p -c -classpath <jdk>/lib/modules java.util.WeakHashMap`, saved in
+`docs/internal/repros/randomizedcontext-perthread-null/whm-repro/
+WeakHashMap-real-bytecode-excerpt.javap`):
+
+- `matchesKey` (979 bytes): `e.refersTo(key) || (e.get() != null &&
+  key.equals(e.get()))`. The three near-duplicate inline-cache blocks map
+  exactly onto these three calls with correct control flow.
+- `hash` (456 bytes): `h = x.hashCode(); h ^= (h>>>20)^(h>>>12); return
+  h^(h>>>7)^(h>>>4);` — every shift/xor/mask instruction matches.
+- `maskNull` (116 bytes): `return key != null ? key : NULL_KEY;` — correct.
+- `indexFor` (89 bytes): `return h & (length-1);` — correct.
+
+**All four are exonerated at the logic level.** Full disassembly saved in
+`matchesKey-jit-disasm.txt` in the same directory.
+
+### Bisection: it's a compiled-code VOLUME/TIMING effect, not one miscompiled method
+
+Added a new diagnostic, `CRATONVM_JIT_DENY=<comma-separated Class.method
+substrings>` (`jit/src/lib.rs`, checked in `try_compile` right after the
+existing bail-list check) — force-interprets matching methods while
+everything else still gets JIT-compiled normally, so a single suspect (or
+a whole subset) can be isolated without disabling JIT wholesale. No rebuild
+needed between experiments (it's a runtime env var).
+
+A failing run JIT-compiles 128 distinct methods
+(`docs/internal/repros/randomizedcontext-perthread-null/whm-repro/
+all-compiled-methods.txt`). Systematic bisection:
+
+| Denied set | Size | Result |
+|---|---|---|
+| `matchesKey` alone | 1 | **still fails** (rules out matchesKey's own code) |
+| all 4 `WeakHashMap` methods | 4 | **still fails** (rules out all 4, individually confirmed correct above) |
+| methods 1–64 (`half1`) | 64 | **FIXED** (only the unrelated pre-existing `ClassCastException` remains) |
+| methods 1–32 (`q1`, includes the entire `ThreadLocal`/`ThreadLocalMap` cluster) | 32 | still fails |
+| methods 33–48 (`e1`, includes all 4 `WeakHashMap` methods) | 16 | still fails |
+| methods 49–56 (`f1`) | 8 | still fails |
+| methods 57–60 (`g1`: 3 `Pattern` lambdas + `WhileOps.accept`) | 4 | still fails (2 failures, if anything worse) |
+| methods 61–64 (`g2`: `log4j Level.equals`, `RamUsageEstimator.alignObjectSize`/`sizeOf`, `TransportVersion.compareTo`) | 4 | still fails |
+| methods 65–128 (`half2` — the **other** half) | 64 | **FIXED** (same as half1) |
+
+The decisive result is the last row: denying the *other* 64 methods — a
+completely disjoint set from `half1`, sharing zero methods — **also** fixes
+it, with the identical symptom (only the pre-existing `ClassCastException`
+remains). Since two disjoint 64-method sets each independently "fix" the
+bug, while multiple 32/16/8/4-method subsets (drawn from all over the list,
+including ones containing all 4 originally-suspected `WeakHashMap` methods)
+do not, **this cannot be one specific miscompiled method** — no single
+method can simultaneously belong to two disjoint sets. The dependent
+variable is the *volume* of JIT-compiled code active (or equivalently, the
+*timing*/*speed* of execution that a smaller compiled surface produces),
+not any particular method's correctness.
+
+This reframes the bug as most likely a genuine **race condition** whose
+window's probability depends on overall execution speed — consistent with
+the earlier-observed non-deterministic `testConcurrentSerialization`
+mid-test failure (same NPE, only in some runs). More JIT-compiled code make
+the suite run faster/differently-interleaved, which apparently makes the
+race reliably land; less JIT-compiled code changes the timing enough that
+it doesn't.
 
 ### Leads for further investigation
 
-- **Primary lead**: disassemble and manually verify
-  `WeakHashMap.matchesKey`/`hash`/`indexFor`/`maskNull`'s JIT-compiled output
-  against expected semantics (a real x86-64 disassembler, not hex-by-eye).
-  Reproduce via `CRATONVM_DBG_DUMP_JIT=matchesKey` (or `hash`/`indexFor`/
-  `maskNull`) against the Repro command below.
+- **Primary lead, reframed**: stop looking for a miscompiled method — look
+  for a **race condition** whose window is sensitive to overall execution
+  speed. Candidates: (a) the suite thread observing a transient state on
+  some OTHER thread (a per-test `ThreadLeakControl`-forked thread, or a
+  `testConcurrentSerialization`/`testConcurrentHashCode` worker) that
+  hasn't fully published its writes yet — a missing memory barrier or an
+  incomplete `synchronized` implementation would fit; (b) a genuine
+  thread-teardown/thread-registry race that only has enough of a window to
+  land when threads start/finish fast enough relative to each other. Try
+  binary-searching TIME rather than method identity: add an artificial
+  delay (e.g. `Thread.sleep` or a busy-loop) at specific points in
+  `RandomizedRunner`/`ThreadLeakControl`'s call chain (via bytecode
+  instrumentation or a native hook) to see if slowing down (without
+  touching JIT at all) also avoids or shifts the bug — that would confirm
+  the timing-window theory independently of the JIT angle entirely.
+- Try narrowing the volume threshold itself: find the exact boundary
+  between "still fails" (a subset that reproduces) and "fixed" (a larger
+  subset that doesn't) via more bisection rounds between 16 and 64 methods
+  denied — knowing the threshold size (e.g. "somewhere around 40 methods")
+  is itself a clue about what resource/timing budget is being crossed.
 - The blocked-thread root-snapshot mechanism (`reference_thread_mirror_
   snapshot_root` in memory — the Tomcat `TestDigestAuthenticator` fix,
   commit 34f9f68b / merge b109248e) was a leading theory earlier in this
@@ -247,14 +370,8 @@ disassembly-level review of the four suspect compiled methods.
   thread in a full failing run) — do not re-open it without new evidence.
 - The non-deterministic `testConcurrentSerialization` worker-thread failure
   (mid-test `ExecutionException` wrapping the identical NPE, seen in some but
-  not all runs) is presumably the same JIT bug hitting a different thread's
-  entry at a different point — not independently re-investigated after the
-  JIT-vs-nojit finding above.
-- A tighter isolated repro: try scaling up the isolated `WhmRepro*.java`
-  tests' total JIT-compiled-method count (e.g. by adding unrelated hot loops
-  elsewhere in the same process) to see if register/codegen pressure from
-  *other* JIT-compiled code is a necessary ingredient, not just
-  `WeakHashMap`'s own methods in isolation.
+  not all runs) is now well-explained by the volume/timing finding above —
+  same race, different thread/moment depending on exact interleaving.
 
 ### Related symptom: duplicate `createTempDir()` paths → node-lock cascade
 

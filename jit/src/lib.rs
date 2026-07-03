@@ -4565,6 +4565,22 @@ pub fn jit_bail_list_size() -> usize {
     jit_bail_list().read().len()
 }
 
+/// Parsed `CRATONVM_JIT_DENY` filter (see the `try_compile` call site).
+/// `None` = disabled.
+fn jit_deny_filter() -> Option<&'static Vec<String>> {
+    use std::sync::OnceLock;
+    static CACHE: OnceLock<Option<Vec<String>>> = OnceLock::new();
+    CACHE
+        .get_or_init(|| {
+            let v = std::env::var("CRATONVM_JIT_DENY").ok()?;
+            if v.is_empty() {
+                return None;
+            }
+            Some(v.split(',').map(|s| s.trim().to_string()).collect())
+        })
+        .as_ref()
+}
+
 /// Diagnostic: number of `try_compile` calls short-circuited because
 /// the method was already bail-listed.  Each short-circuit saves the
 /// ~50µs we'd otherwise have spent re-running scan/IR/lowering only to
@@ -4808,6 +4824,19 @@ pub fn try_compile(
         &cached.method_descriptor,
     ) {
         JIT_BAIL_SHORTCIRCUITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        return None;
+    }
+
+    // DBG (RandomizedContext WeakHashMap JIT investigation, 2026-07-02):
+    // `CRATONVM_JIT_DENY` — comma-separated substrings matched against
+    // `Class.method`; a matching method is force-interpreted (never
+    // JIT-compiled) so a single suspect compiled method can be isolated
+    // from the rest of a workload's JIT-compiled code, without disabling
+    // JIT wholesale. No-op unless the env var is set.
+    if jit_deny_filter().is_some_and(|filter| {
+        let sig = format!("{}.{}", cached.class_name, cached.method_name);
+        filter.iter().any(|f| sig.contains(f.as_str()))
+    }) {
         return None;
     }
 
