@@ -3905,7 +3905,28 @@ fn register_re4_url_http(r: &mut NativeMethodRegistry) {
             //     the entry in the inner archive.
             // Bug 2 fix: cache outer JAR bytes + nested JAR bytes so the
             // O(N) autoconfig walk doesn't become O(N²) on disk reads.
-            let rest = rest.trim_start_matches('/');
+            //
+            // `file:` URLs prefix a leading `/` before a Windows drive letter
+            // (`/C:/…`), which must be stripped for `std::fs`/`Path` to resolve
+            // the path on Windows. On POSIX that same leading `/` is the path's
+            // own root and must be KEPT — unconditionally trimming every
+            // leading slash turned `/home/user/foo.jar` into the relative
+            // `home/user/foo.jar`, which resolved (if at all) against the
+            // wrong CWD and failed with ENOENT on every Linux/macOS host. Try
+            // the trimmed form first, then the raw form — mirrors the
+            // existence-check fallback already used by `jar_url_entry_size`
+            // and `JarURLConnection.getJarFile` below for the same ambiguity.
+            let raw_rest = rest;
+            let trimmed_rest = rest.trim_start_matches('/');
+            let rest = if std::path::Path::new(
+                trimmed_rest.split("!/").next().unwrap_or(trimmed_rest),
+            )
+            .exists()
+            {
+                trimmed_rest
+            } else {
+                raw_rest
+            };
             let (outer_jar, inner_path) = match rest.find("!/") {
                 Some(i) => (&rest[..i], &rest[i + 2..]),
                 None => {

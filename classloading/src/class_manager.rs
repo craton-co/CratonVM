@@ -1709,11 +1709,49 @@ impl ClassManager {
         // walking every entry in `loaded_classes`. Same fix as
         // `find_class_by_name`. Empty-set early-out keeps the common
         // "no user loaders" case at zero extra work.
+        //
+        // context.groovy fix: `user_loaders` is an unordered `FxHashSet`, so
+        // "return the first match" was really "return an ARBITRARY match" --
+        // unsound whenever more than one user-defined loader has its OWN
+        // distinct class registered under the same simple name. This is the
+        // common case for Apache Groovy: `GroovyShell.evaluate` compiles each
+        // script through a fresh `GroovyClassLoader$InnerLoader`, and every
+        // closure literal in a script is named positionally
+        // (`<Script>$_run_closure1`, `$_run_closure2`, ...), so two different
+        // scripts loaded in the same process routinely produce two DIFFERENT
+        // classes sharing the identical name. Blindly returning whichever
+        // loader's copy the hash-set happened to visit first silently
+        // collapsed every later script's closures onto the first script's
+        // compiled bytecode (no exception -- the class "resolved" fine, just
+        // to the wrong loader's copy), e.g. Spring's
+        // `GroovyBeanDefinitionReader` registering zero of the beans the
+        // current script actually declared. A name that is genuinely
+        // ambiguous across loaders has no single correct answer here (this
+        // function takes no loader/caller context to disambiguate with), so
+        // when more than one user loader owns a same-named class we return
+        // `None` -- ambiguous is a miss, not a guess -- letting the caller fall
+        // through to a loader-specific resolution path (e.g.
+        // `drive_defining_loader_load`) instead of silently picking one. The
+        // common single-custom-loader case (Tomcat/Hibernate/WildFly: one
+        // relevant webapp/session loader) is unaffected -- this only changes
+        // behavior when 2+ user loaders actually collide on the same name.
         if !self.user_loaders.is_empty() {
+            let mut found: Option<ClassId> = None;
             for loader_id in &self.user_loaders {
                 if let Some(id) = loaded_classes_probe(&self.loaded_classes, *loader_id, name) {
-                    return Some(id);
+                    if let Some(prev) = found {
+                        if prev != id {
+                            // Ambiguous: two different loaders each define
+                            // their own distinct class under this name.
+                            return None;
+                        }
+                    } else {
+                        found = Some(id);
+                    }
                 }
+            }
+            if let Some(id) = found {
+                return Some(id);
             }
         }
         None
@@ -4968,10 +5006,21 @@ impl ClassManager {
         //
         // Early-out: most apps never define a user loader, in which case
         // the set is empty and we skip the inner loop entirely.
+        //
+        // context.groovy fix: same unsound "first match across an unordered
+        // hash-set of loaders" issue as `get_loaded_class_id` above (see its
+        // doc comment for the full Groovy `GroovyClassLoader$InnerLoader` /
+        // same-named-closure rationale) -- when two or more DIFFERENT user
+        // loaders each define their own distinct class under this name, this
+        // context-free lookup cannot know which one the caller means, so it
+        // must report a miss (`None`) rather than guess and silently return
+        // the wrong loader's copy.
         if !self.user_loaders.is_empty() {
             for key in &keys {
                 // C34 audit fix (HIGH): zero-allocation borrowed-key probe
                 // (same rationale as the builtin loaders loop above).
+                let mut found: Option<ClassId> = None;
+                let mut ambiguous = false;
                 for loader_id in &self.user_loaders {
                     if let Some(id) = loaded_classes_probe(&self.loaded_classes, *loader_id, key) {
                         if let Some(class) = self.get_class(id) {
@@ -4979,8 +5028,20 @@ impl ClassManager {
                                 continue;
                             }
                         }
-                        return Some(id);
+                        match found {
+                            Some(prev) if prev != id => {
+                                ambiguous = true;
+                                break;
+                            }
+                            _ => found = Some(id),
+                        }
                     }
+                }
+                if ambiguous {
+                    continue;
+                }
+                if let Some(id) = found {
+                    return Some(id);
                 }
             }
         }

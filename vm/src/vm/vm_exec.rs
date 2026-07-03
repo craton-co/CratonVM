@@ -2404,12 +2404,19 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
                     let (cb_addr, culprit) = CURRENT_NATIVE_STACK
                         .with(|s| s.borrow().last().cloned())
                         .unwrap_or((0, "<unknown>".to_string()));
+                    // RVA is a Windows-debugging convenience (module-relative
+                    // address is easier to correlate with a .pdb/disassembly);
+                    // GetModuleHandleW does not exist on other platforms, so
+                    // fall back to reporting the raw (module_base=0) address.
+                    #[cfg(windows)]
                     let module_base = unsafe {
                         extern "system" {
                             fn GetModuleHandleW(name: *const u16) -> *mut core::ffi::c_void;
                         }
                         GetModuleHandleW(core::ptr::null()) as usize
                     };
+                    #[cfg(not(windows))]
+                    let module_base: usize = 0;
                     let rva = cb_addr.wrapping_sub(module_base);
                     eprintln!(
                         "[straystack-native] #{k} STRAY ctx.set_field recv@0x{:x} cid={} num_slots={} kind={} idx={} value={:?} CULPRIT-NATIVE={} RVA=0x{:X}",
