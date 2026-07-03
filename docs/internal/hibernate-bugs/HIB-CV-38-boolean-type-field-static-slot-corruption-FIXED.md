@@ -45,24 +45,29 @@ Boolean.valueOf(true)    // returned a java.lang.Class instance (!), not a Boole
 ## Root cause
 
 `java/lang/Boolean`'s `<clinit>` is natively overridden (`register_essential_natives`
-→ `register_primitive_wrapper_type_clinits` → `clinit_boolean_type` →
-`init_wrapper_type`, `native-builtins/src/lib.rs`) — this REPLACES the real
-bytecode `<clinit>` entirely (native registrations take priority over
+→ `clinit_boolean` in `native-builtins/src/phases_early.rs`) — this REPLACES
+the real bytecode `<clinit>` entirely (native registrations take priority over
 bytecode), so the real `TRUE = new Boolean(true); FALSE = new Boolean(false);`
 never runs.
 
-`init_wrapper_type` hardcoded `ctx.set_static_field(class_id, 0, ...)` to
-populate the primitive-type mirror (`Boolean.TYPE`), assuming static field
-index 0 is always `TYPE`. That holds for the other 7 primitive wrappers
-(Integer, Long, Float, Double, Character, Byte, Short — their other
-`static final` fields like `MIN_VALUE`/`MAX_VALUE` are primitives, not object
-references, so `TYPE` is their only/first object-reference static) and for
-`Void` (whose only field is `TYPE`). **`Boolean` is the one exception**: real
-JDK `Boolean.class` declares object-reference statics in the order
-`TRUE, FALSE, TYPE` (confirmed via `javap` against JDK 25's `java.lang.Boolean`)
-— so `TYPE` is index 2, not 0.
+`clinit_boolean` hardcoded `ctx.set_static_field(c, 0, ...)` to populate the
+primitive-type mirror (`Boolean.TYPE`), assuming static field index 0 is
+always `TYPE`. That holds for the other 7 primitive wrappers' sibling
+`clinit_*` functions in the same file (Integer, Long, Float, Double,
+Character, Byte, Short — their other `static final` fields like
+`MIN_VALUE`/`MAX_VALUE` are primitives, not object references, so `TYPE` is
+their only/first object-reference static) and for `Void` (whose only field is
+`TYPE`). **`Boolean` is the one exception**: real JDK `Boolean.class` declares
+object-reference statics in the order `TRUE, FALSE, TYPE` (confirmed via
+`javap` against JDK 25's `java.lang.Boolean`) — so `TYPE` is index 2, not 0.
 
-Effect: `init_wrapper_type` wrote the `Class` mirror for `boolean` into
+(This bug and fix originally lived in a shared `init_wrapper_type` helper in
+`native-builtins/src/lib.rs` at the time of investigation; a concurrent dev
+refactor inlined each wrapper type's `<clinit>` into its own function in
+`phases_early.rs` before this branch merged, carrying the identical bug over
+unchanged. The fix below targets the current post-refactor location.)
+
+Effect: `clinit_boolean` wrote the `Class` mirror for `boolean` into
 `Boolean`'s slot **0**, silently corrupting `Boolean.TRUE` into a `Class`
 object. `Boolean.FALSE` (slot 1) and the real `Boolean.TYPE` (slot 2) were
 never populated at all, staying at their default null.
@@ -82,8 +87,8 @@ site and heap layout.
 
 ## Fix
 
-`native-builtins/src/lib.rs`, `init_wrapper_type`: resolve the `TYPE` static
-slot **by field name** (`ctx.static_field_index_by_name(class_id, "TYPE")`,
+`native-builtins/src/phases_early.rs`, `clinit_boolean`: resolve the `TYPE`
+static slot **by field name** (`ctx.static_field_index_by_name(c, "TYPE")`,
 falling back to 0 only if the lookup fails) instead of hardcoding index 0.
 Additionally, since `Boolean`'s native `<clinit>` override bypasses the real
 bytecode that would otherwise populate `TRUE`/`FALSE`, explicitly allocate and
