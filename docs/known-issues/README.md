@@ -34,6 +34,13 @@ initialization gap was fixed 2026-07-02), grouped as:
    the Spring suite (same root cause, different entry point); `springsuite-bug-04` was the same race
    but **no longer reproduces** (doc removed). The suite-scale field evidence in
    `jit-junit-discovery-reflection-corruption.md` is the same race.
+   **Parked-thread deposit member FIXED 2026-07-02**: the blocked-path
+   `deposit_root_snapshot` served a stale `JIT_SCAN_CACHE` snapshot (missing
+   `invalidate_scan_cache_for_gc()`), so a JIT'd `AQS.await` frame's freshly
+   inline-allocated `ConditionNode` was never pinned and selective promotion
+   moved it under the parked thread — the 100%-reproducible
+   `ConcurrencyThrottleInterceptorTests` TIMEOUT wedge. Writeup:
+   [`docs/internal/fixed-suite-bugs/throttle-park-deposit-stale-jit-scan-cache.md`](../internal/fixed-suite-bugs/throttle-park-deposit-stale-jit-scan-cache.md).
 2. **Standalone B** — JUnit `@Timeout` interceptor double-`proceed()` (open).
 3. **Standalone C** — deep JIT→JIT recursion native-stack overflow (latent; stack-bang containment landed; resumable fault recovery still open).
 4. ~~**bug-06 F5**~~ — reflection native returns null vs a `Class`/`Method`: **✅ CLOSED 2026-07-02,
