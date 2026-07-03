@@ -12,8 +12,10 @@ serial+parallel; gc crate 749/749). See "2026-07-03" below for the FIVE
 additional serial-G1 defects that had been masking this validation.
 Parallel-evac default-on / the G1 default flip (Step 9/10 of
 `docs/feature-designs/concurrent-gc-maturation.md`) is now gated only on the
-two REMAINING OPEN follow-ups listed at the end (concurrent-mark liveness
-audit; interpreter root-liveness imprecision), not on this race.
+ONE remaining OPEN follow-up listed at the end (interpreter root-liveness
+imprecision) — the concurrent-mark liveness audit is DONE and the marker is
+FIXED (see "2026-07-03 (second change set): concurrent-marking soundness"
+below).
 The `task_58d60f7a` family turned out to be TWO stacked bugs.
 
 **Scope:** opt-in only (`CRATONVM_G1_PARALLEL_EVAC=1`). The DEFAULT (serial) G1
@@ -225,20 +227,17 @@ with this change set:
    accumulated in Old un-reclaimed (61k young pauses, zero mixed, true OOM at
    every heap size). The adaptive raise is now capped at the statically
    configured IHOP.
-4. **Concurrent-mark cleanup freeing live regions — CONTAINED (open marking
-   issue).** `cleanup()` freed any 0-marked Old region; regions filled by
-   promotion AFTER the mark snapshot have no marks at all, so cleanup zeroed
-   freshly-promoted live objects (TAMS violation). Fixed with a
-   `mark_start_snapshot` (per-region `reuse_epoch`/cursor/type; post-snapshot
-   bytes count as live). Even TAMS-clean regions were then observed freed
-   under live holders — the marker can miss pre-snapshot objects while young
-   GCs move their holders mid-cycle (marker-vs-moving-collector liveness, NOT
-   audited here). Containment: cleanup no longer frees Old regions in place at
-   all — a wholly-dead region has `gc_efficiency == 0.0` and is the first
-   thing the next mixed collection evacuates, and mixed reclamation is
-   reachability-driven, hence sound. Humongous reclaim keeps the cleanup-time
-   path (mixed cannot evacuate spans) with the TAMS guard. The marking
-   soundness audit is a follow-up.
+4. **Concurrent-mark cleanup freeing live regions — FIXED (marker audited
+   and repaired; in-place free RESTORED).** `cleanup()` freed any 0-marked
+   Old region; regions filled by promotion AFTER the mark snapshot have no
+   marks at all, so cleanup zeroed freshly-promoted live objects (TAMS
+   violation). Fixed with a `mark_start_snapshot` (per-region
+   `reuse_epoch`/cursor/type; post-snapshot bytes count as live). Even
+   TAMS-clean regions were then observed freed under live holders — the
+   marker missed pre-snapshot objects while young GCs moved their holders
+   mid-cycle. Initially CONTAINED by disabling cleanup's in-place free; the
+   follow-up audit found and fixed the marker itself and restored the free —
+   see "2026-07-03 (second change set): concurrent-marking soundness" below.
 5. **Repro flaw — interpreter root liveness imprecision (open VM issue,
    repro fixed).** The recreation's list-setup loop used a construction temp
    (`Node node = new Node(i); tail.next = node; ...`). CratonVM's interpreter
@@ -287,15 +286,99 @@ the original's no-promotion shape — see its header comment) print the correct
 The residual race (previously ~2/40 post-dominant-fix) did not reproduce in
 80 parallel runs. This known issue's two bugs are considered FIXED.
 
-Remaining OPEN follow-ups (separate issues, tracked in the 2026-07-03 section
-above; they gate the parallel-default flip, not this race):
+## 2026-07-03 (second change set): concurrent-marking soundness — audited, FIXED, in-place free RESTORED
 
-1. Concurrent-mark liveness under moving young collections (cleanup's
-   in-place Old-region free stays disabled as containment until audited).
-2. Interpreter root liveness imprecision (scoped-out local slots retain their
+The follow-up audit of "concurrent-mark liveness under moving young
+collections" found the containment was NOT sufficient (humongous reclaim at
+cleanup still trusted the broken bitmap → freeing a live humongous span was
+still reachable) and identified four marker defects:
+
+1. **No final remark at runtime (architectural, dominant).** The cycle driver
+   spawned a watcher thread that polled worker quiescence and then called
+   cleanup DIRECTLY — `remark()` only ever ran once, during initial-mark STW,
+   when the just-activated SATB queue is empty. Every SATB entry logged during
+   the concurrent phase was discarded at cleanup ("stragglers"): the whole
+   cycle was a one-shot closure from the initial roots racing mutator edge
+   deletions. Any live object whose only marker-visible path was rewritten
+   mid-trace (old edge deleted → SATB logged → discarded; new edge landing in
+   an already-scanned object → never traced) stayed unmarked. Under churn
+   ("holders" replaced constantly) this is routine — the SteadyChurn
+   `[FREED] cleanup region=N`-under-live-holders failure. **Fix:** the cycle
+   now ends with a real STW final remark on the GC-initiating mutator
+   (`interpreter::g1_final_remark_cleanup` → brief STW → all-thread roots +
+   `flush_all_thread_satb_buffers` + `remark()` + drain to fixed point →
+   `cleanup()`, all inside the pause; `VmHeap::g1_final_remark_and_cleanup`).
+   `maybe_concurrent_gc` drives it after any collection once the worker has
+   quiesced; a lost STW race just retries at the next GC.
+2. **Young pauses DROPPED unreached gray worklist entries.** The
+   remap-or-drop `retain_mut` reasoned "unreached by evacuation ⇒ dead ⇒ safe
+   to drop" — unsound under SATB: a gray dead at PAUSE time was live at MARK
+   START, and dropping it silently unmarks its entire unscanned subtree
+   (which can contain live Old/humongous objects whose only remaining
+   marker path ran through it). **Fix:** marking keep-alive
+   (`G1Collector::marking_keepalive_roots`): at every evacuation pause while
+   a cycle is active, the SATB log (all thread buffers + shards) is drained
+   into the gray set and every CSet-resident, not-yet-marked gray is
+   EVACUATED like a root and re-grayed (`push_gray_or_mark`; at the worklist
+   cap the copy is marked-without-scan and the overflow rescan re-walks it).
+   Snapshot-live floating garbage is retained for the cycle — standard G1
+   SATB behaviour — and dies the following cycle.
+3. **SATB queue entries dangled across pauses.** Raw addresses in the queue
+   were never remapped when evacuation moved/freed their regions (harmless
+   only while defect 1 made the queue write-only). The pause-time drain in
+   fix 2 empties the queue at every pause, so no entry survives a region
+   move.
+4. **Mixed pauses never remapped the worklist at all** (serial + parallel) —
+   dangling grays into freed Old regions whenever a new cycle overlaps the
+   post-cleanup mixed sequence (reachable: `start_concurrent_mark` does not
+   clear `marking_complete`). **Fix:** both mixed paths now run the same
+   keep-alive + remap protocol as young.
+
+With the marker sound, **cleanup's in-place free of wholly-dead Old regions
+is RESTORED** (gated on a non-empty mark snapshot: unit-test cleanups driven
+outside a real cycle keep the pure-liveness bookkeeping without freeing).
+A defensive `abort_concurrent_mark` closes an orphaned cycle (marking phase
+active with no controller) instead of letting the completion gate spin.
+
+**Repro/validation workload:** `SteadyChurn`/`SteadyChurnLight` at 16m are
+YOUNG-ONLY on hosts with a multi-thousand-iteration pause cadence (nodes die
+before promoting; IHOP never fires; the marker never runs — which is why the
+marking defect surfaced only indirectly). New
+`repros/g1-parallel-steady-churn/SteadyChurnPromote.java` forces the marking
+régime: 64 KiB/iter temp pacing → ring chains survive >15 young pauses →
+promote → die in Old; two cross-chain `link` rewires + a chain's-worth of
+`link = null` stores per iteration (SATB install+delete traffic); an
+8-chain/iteration rotating graph verifier catches a freed-live object within
+one ring turnover. Checksum is a pure function of the iteration count —
+HotSpot output is the golden value (`SteadyChurnPromote 30000` →
+`156454144`).
+
+**Validation (this Windows host, `--nojit`, checksums == HotSpot):**
+
+| suite                                                          | result      |
+|----------------------------------------------------------------|-------------|
+| serial `SteadyChurn` 2M @16m                                   | 10/10 clean |
+| parallel `SteadyChurn` 2M @16m                                 | 10/10 clean |
+| serial `SteadyChurnPromote` 30k @16m IHOP=20 (≈35 mark cycles, 281 mixed/run) | 10/10 clean |
+| parallel `SteadyChurnPromote` 30k @16m IHOP=20                 | 10/10 clean |
+| serial `SteadyChurnLight` 2M @16m                              | 5/5 clean   |
+| parallel `SteadyChurnLight` 2M @16m                            | 5/5 clean   |
+
+`CRATONVM_G1_DBG_REACH=1` runs of `SteadyChurnPromote`: 0 reachability
+violations; the restored in-place free observed firing (`[FREED] cleanup`,
+2×/6× per run at IHOP=35/50) with clean output — at IHOP=20 mixed's
+efficiency-first selection reclaims near-dead regions before they go wholly
+dead, so 0 in-place frees there is expected scheduling, not a regression.
+gc crate 759/759 (5 new regression tests: gray-keep-alive across young
+pauses, SATB-entry survival, mixed worklist remap, keep-alive-vs-cleanup
+end-to-end, wholly-dead-region in-place free); vm lib suite green.
+
+Remaining OPEN follow-up (separate issue; gates the parallel-default flip):
+
+1. Interpreter root liveness imprecision (scoped-out local slots retain their
    last referent for the frame's lifetime — unbounded retention on linked
-   structures; both repros are written temp-free to sidestep it).
+   structures; the repros are written temp-free to sidestep it).
 
 Parallel evac stays **opt-in/experimental** and mixed stays serial until
-those two are resolved. Default G1 (serial) and Generational benefit from the
+that is resolved. Default G1 (serial) and Generational benefit from the
 serial-path fixes above.
