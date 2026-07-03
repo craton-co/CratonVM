@@ -1759,6 +1759,59 @@ pub fn register_sun_nio_ch_net(r: &mut NativeMethodRegistry) {
         }
     }
 
+    // Linux analogue of the `WindowsSocketOptions` block above (HIB-linux
+    // SQL-Server-driver regression, 2026-07-03): the JDK picks
+    // `jdk.net.LinuxSocketOptions` over `WindowsSocketOptions` on Linux, so
+    // only stubbing the Windows class left `ExtendedSocketOptions.<clinit>`
+    // without a native for `LinuxSocketOptions.quickAckSupported0()` there —
+    // an `UnsatisfiedLinkError` (uncaught, since it's an Error) that aborts
+    // `<clinit>` and marks the class permanently erroneous. mssql-jdbc's
+    // `SQLServerDriver.<clinit>` transitively touches `ExtendedSocketOptions`
+    // (Linux-specific TCP_QUICKACK tuning), so this surfaced as
+    // `NoClassDefFoundError: SQLServerDriver` on every later reference,
+    // silently masking the original `UnsatisfiedLinkError` per JVMS 5.5.
+    // Same "no extended options supported" policy as the Windows block:
+    // report unsupported everywhere so `<clinit>` succeeds and the
+    // getters/setters below are never exercised for real.
+    {
+        let lso = "jdk/net/LinuxSocketOptions";
+        r.register(lso, "keepAliveOptionsSupported0", "()Z", |_c, _a| {
+            Ok(Some(Value::Int(0)))
+        });
+        r.register(lso, "quickAckSupported0", "()Z", |_c, _a| {
+            Ok(Some(Value::Int(0)))
+        });
+        r.register(lso, "incomingNapiIdSupported0", "()Z", |_c, _a| {
+            Ok(Some(Value::Int(0)))
+        });
+        r.register(lso, "getIpDontFragment0", "(IZ)Z", |_c, _a| {
+            Ok(Some(Value::Int(0)))
+        });
+        r.register(lso, "setIpDontFragment0", "(IZZ)V", |_c, _a| Ok(None));
+        r.register(lso, "getQuickAck0", "(I)Z", |_c, _a| Ok(Some(Value::Int(0))));
+        r.register(lso, "setQuickAck0", "(IZ)V", |_c, _a| Ok(None));
+        r.register(lso, "getSoPeerCred0", "(I)J", |_c, _a| {
+            Ok(Some(Value::Long(-1)))
+        });
+        r.register(lso, "getIncomingNapiId0", "(I)I", |_c, _a| {
+            Ok(Some(Value::Int(0)))
+        });
+        for (name, desc) in [
+            ("getTcpKeepAliveProbes0", "(I)I"),
+            ("getTcpKeepAliveTime0", "(I)I"),
+            ("getTcpKeepAliveIntvl0", "(I)I"),
+        ] {
+            r.register(lso, name, desc, |_c, _a| Ok(Some(Value::Int(0))));
+        }
+        for (name, desc) in [
+            ("setTcpKeepAliveProbes0", "(II)V"),
+            ("setTcpKeepAliveTime0", "(II)V"),
+            ("setTcpKeepAliveIntvl0", "(II)V"),
+        ] {
+            r.register(lso, name, desc, |_c, _a| Ok(None));
+        }
+    }
+
     // NIO-SERVER-SOCKET: `IOUtil.newFD(int)` calls `setfdVal(fd, value)` to
     // stash the OS fd integer into `FileDescriptor.fd`. JDK-25 implements this
     // as a native; without it the real `NioSocketImpl.create()` path throws
