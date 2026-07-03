@@ -86,6 +86,99 @@ fails earlier at JUnit-launcher bootstrap before ever reaching `testMultiLoad`.
   abandoned arena regions" vs. "this workload's live set is just larger than
   1500m" — not yet tried.
 - `CRATONVM_JIT_DISABLE_INLINE_NEW=1` (the exact toggle that isolated BUG 1 in
-  the bintrees18 doc) on this repro would confirm/deny inline-`new` as the
-  source without fully disabling JIT (which also disables inline arrays, if
-  those are a separate path) — not yet tried.
+  the bintrees18 doc) on this repro: tried on the sibling
+  `family-a-throttle-park/MiniThrottle.java` repro (same corruption
+  signature) — does NOT eliminate the corruption there (3 runs, 95-134
+  warnings each). Array allocation was also ruled out structurally: `newarray`/
+  `anewarray` have no inline TLAB fast path in `jit/src/x64.rs` at all — they
+  always call `jit_newarray`/`jit_anewarray_object`, which build the header via
+  the same non-inline, already-safe `heap.try_alloc_array` the interpreter uses.
+
+## 2026-07-03/04 — two real conservative-root-scan bugs found and fixed (session on `fix/family-a-inline-alloc-header`); corruption family only partially closed
+
+Deep investigation via a new forensic breadcrumb (`CRATONVM_DBG_A2`, extended
+this session to also record JIT inline-`new` and TLAB-tail-filler header
+writes — see `gc/src/a2dbg.rs`) on the `MiniThrottle` sibling repro found and
+fixed **two real, previously-undiscovered bugs** in the conservative-root
+mark path, but did **not** fully close this corruption family — it remains
+OPEN, now much better characterized.
+
+### Bug 1 (FIXED): `is_object_address` missing the extent-vs-arena-bound check
+
+`GenerationalHeap::is_object_address` (`gc/src/gen_heap.rs`, the canonical
+validator used by ~28 call sites across the VM: root scanning, cross-thread
+takeover, selective-promotion pinning, etc.) validated a candidate's
+`kind`/`num_slots`/`array_length` bounds but never checked that the object's
+full CLAIMED EXTENT (`HEADER_SIZE + body`) actually fit inside the arena the
+candidate's address falls in. `sweep_young_non_moving`'s own `mark_young`
+closure already had this exact hardening (added 2026-07-03 for the DoHead
+comb-7 SIGSEGV) — `is_object_address` did not. Fixed by adding the same
+extent-vs-`region_bounds` check, centrally, so every caller benefits.
+
+### Bug 2 (FIXED): `mark_young` wrote `GC_FLAG_MARKED` through unverified non-zero-word0 candidates
+
+The real corruption mechanism, root-caused via the breadcrumb: a conservative
+root candidate that merely LOOKS like a plausible header (passes
+kind/num_slots/extent checks) is not necessarily the true start address of a
+real allocation. A `mark_young` comment already documented the **zero-word0**
+case of this hazard (a candidate at `live_object_start - 8`, mark-write at
+`candidate+21` landing at `victim+13` — flipping bit 9 of the victim's real
+`array_length`, producing exactly the "array_length=512" signature) and
+routed zero-word0 candidates through a write-free `side_marks` set instead of
+writing through them. But any candidate whose first header word was
+**non-zero** (e.g. landing on ANY element of a live `Object[]`, where every
+`Value::Object` cell's discriminant word is `VTAG_OBJECT = 4` — decoding as
+`class_id=4`, and the SAME pattern 16 bytes later decoding as `num_slots=4`)
+still fell through to the unconditional `header.gc_flags |= GC_FLAG_MARKED`
+write. Fixed by routing **every** conservative candidate through `side_marks`
+(pure retention, never write through) — matching the collector's own
+documented invariant ("a conservative false-positive root only over-retains,
+it can never corrupt non-pointer data"). A regression this surfaced
+(`non_moving_sweep_records_identity_map_for_watched_survivor` — the
+WeakHashMap-referent identity-map insert was only wired to the
+header-marked branch) was fixed alongside it. `cratonvm-gc` test suite:
+761/761 pass after both fixes.
+
+### Residual: BOTH fixes verified correct (zero regressions, real Spring
+### `ConcurrencyThrottleInterceptorTests` passes clean) but do NOT
+### eliminate the corruption on the harsher `MiniThrottle` repro
+
+Post-fix `MiniThrottle` distribution (5 runs): 84-276 "inconsistent header"
+warnings per run, SAME `class_id=4, num_slots=4` signature, still failing to
+complete within budget. Critically, `CRATONVM_DBG_A2`-instrumented runs show
+the exact same false-positive address (e.g. `0x17b0c6002a0`) recurring
+**identically across 8 separate GC cycles spanning tens of seconds**, with
+byte-for-byte identical surrounding context each time. A moving/reused TLAB
+slot would not reproduce identical content run after run — this is a
+**long-lived, structurally fixed region being repeatedly fed as a
+conservative root candidate**, which points at a specific CPU register (or a
+fixed stack slot) of a HOT, frequently-re-entered JIT-compiled method
+(plausibly the reflection/proxy `invoke` dispatch path, given both this repro
+and MiniThrottle are `Method.invoke`/proxy-heavy) consistently holding an
+`Object[]`-interior pointer across many safepoints/GC pauses. `mark_young`'s
+extent check and side-marking correctly PROTECT the victim from corruption
+(both fixes verified this), but the walker still logs "inconsistent header"
+because the address genuinely does have that byte pattern on disk at every
+scan — i.e. the log itself is not evidence of memory corruption post-fix, but
+the underlying "why does a register/slot hold a stable interior pointer
+across dozens of GCs" question is unanswered and is the recommended next
+thread: instrument `scan_context`/`scan_one_frame`
+(`vm/src/jit/xt_root_scan.rs`, `vm/src/jit/conservative_roots.rs`) to log
+WHICH register or stack offset produces this exact candidate address, then
+find the JIT-emitted code (likely in the reflection/`MethodHandle`/proxy
+`invoke` compiled path) that keeps an array-interior pointer live there
+instead of the array's base address.
+
+An A/B during this investigation also found `CRATONVM_XT_JIT_ROOT_SCAN=0`
+(disabling the cross-thread OS-suspend conservative takeover entirely)
+dropped MiniThrottle's corruption to 0/0/0 across 6 runs — the strongest
+single lever found — but a matching in-code change (delaying takeover behind
+a cooperative-wait window) did NOT reproduce that improvement (avg
+corruption ~52/run at a 20ms wait, no better than baseline), so the true
+lever is more specific than "takeover happens at all" — most likely the
+SAME static-register-candidate mechanism above, just fed at much higher
+volume by `xt_root_scan`'s full-register+full-stack scan of every other
+live thread on every GC. Disabling `xt_root_scan` outright was not shipped
+as a fix: it is a real, load-bearing mechanism for a different family of
+bugs (BUG-03/Fork6/A4) and disabling it broadly is not a safe trade without
+further isolation.
