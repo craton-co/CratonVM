@@ -16,6 +16,114 @@
 > fixture is not present in this worktree, so `ProxyClassReuseTest` / BeanShell app-level reruns
 > were not retried here.
 
+## Manifestation — Spring `context.groovy` (2026-07-03)
+
+Three CratonVM-unique failures in `spring-context`'s `context.groovy` package
+(`GroovyApplicationContextTests`, `GroovyApplicationContextDynamicBeanPropertyTests`,
+`GroovyBeanDefinitionReaderTests`), all failing with e.g.
+`NoSuchBeanDefinitionException: No bean named 'framework' available` even
+though the Groovy config script visibly declares that bean and no exception
+is thrown while loading it.
+
+### Primary root cause (fixed) — `MethodHandles` invoker adapters were inert stubs
+
+Not the loader-blind-resolution bug this doc otherwise describes. Spring's
+`GroovyBeanDefinitionReader` uses Groovy's `BeanBuilder` DSL
+(`beans { framework String, 'Grails' }`), which Groovy dispatches dynamically
+(`methodMissing`/`invokeMethod`) through `invokedynamic` call sites bootstrapped
+via `org.codehaus.groovy.vmplugin.v8.IndyInterface`. `IndyInterface.<clinit>`
+builds exactly one `MethodHandles.exactInvoker(methodType(Object.class,
+Object[].class))` handle (`CACHED_INVOKER`), and **every** generic
+(non-special-cased) Groovy indy call site dispatches through it. CratonVM's
+`exactInvoker`/`invoker`/`spreadInvoker` natives returned a `MethodHandle`
+with no `MH_KIND` set — an inert stub — so `mh_dispatch` silently no-opped on
+invocation. Every Groovy dynamic-DSL closure body therefore never actually
+ran: `beans { ... }` "loaded" with no error and registered zero beans.
+
+**Fix:** added `MH_KIND_INVOKER` and its dispatch semantics (invoke the first
+argument as the real target, forwarding the rest — spreading the tail into an
+array for `spreadInvoker`) in `native-builtins/src/lang_invoke.rs`. Shipped
+alongside two independent classloader-hygiene fixes found investigating the
+same cluster (both unconditional, not gated):
+
+- `native-builtins/src/classloader.rs` `get_or_assign_loader_id`: in real-JDK
+  mode CratonVM's synthetic `CL_LOADER_ID` slot index aliases the REAL
+  `java.lang.ClassLoader.classes` field (confirmed via `javap` against JDK 25)
+  — writing a loader id there clobbered that field with a bare int. Now
+  delegates to the existing mode-aware `loader_namespace_id` helper instead.
+- `classloading/src/class_manager.rs` `get_loaded_class_id`/`find_class_by_name`:
+  the custom-loader fallback returned the *first* same-named class found
+  across an unordered loader set, unsound when 2+ user-defined loaders each
+  have their own distinct class under an identical name (the common case for
+  Apache Groovy, which names closure literals positionally per script —
+  `$_run_closure1`, `$_run_closure2`, … — so two different scripts routinely
+  define two different classes sharing a name). Now returns `None` (ambiguous
+  is a miss, not a guess) instead of guessing, when 2+ loaders' copies are
+  found. Only changes behavior when a real name collision across loaders
+  exists; the common single-custom-loader case (Tomcat/Hibernate/WildFly) is
+  unaffected.
+
+### Residual (not fixed) — cross-script/cross-method closure-identity collision
+
+Even with the fixes above, `GroovyApplicationContextDynamicBeanPropertyTests`
+is now fully green (2/2, byte-for-byte HotSpot match), but
+`GroovyApplicationContextTests` still fails 3/4 methods **even run in total
+isolation** (fresh JVM, single class), and `GroovyBeanDefinitionReaderTests`
+improved from complete failure to 6/36.
+
+Root cause: this is the SAME loader-blind-resolution family this doc
+documents, one level removed. Two Groovy scripts (or two test *methods*
+within one class/JVM, since JUnit's method execution order is unspecified)
+each compile a positionally-named closure via their own fresh
+`GroovyClassLoader` instance. The global flat class store can resolve a
+later script/method's `new`/`checkcast` reference for its own closure to an
+EARLIER script's same-named closure class — the closure silently runs the
+wrong compiled body, registering the wrong (or zero) beans, with no
+exception. Confirmed via a minimal repro (two `GroovyShell.evaluate(script,
+"beans")` calls, same script `name`, different closure bodies): with
+class-constant resolution loader-blind, `inner1.getClass() ==
+inner2.getClass()` was `true` and the second closure's `call()` ran the
+first's body.
+
+**A `GroovyClassLoader`-type-scoped attempt was tried and reverted** — gating
+`resolve_class_loader_aware`'s enhanced path on `loader_aware_resolution() ||
+is_groovy_class_loader(defining_loader)` (a real subtype check against
+`groovy.lang.GroovyClassLoader`, not a name-pattern match) *does* fix class
+identity in isolation (`c1.getClass() != c2.getClass()` becomes correctly
+`false`... i.e. distinct, matching HotSpot), confirmed via a standalone
+`ClosureNameCheck.java` repro. But applied to the actual test suite it made
+results WORSE (`GroovyApplicationContextTests` 1/4, `DynamicBeanPropertyTests`
+1/2, `GroovyBeanDefinitionReaderTests` 3/36 — down from 1/4, 2/2, 6/36),
+because a SEPARATE, deeper bug surfaced: even with two closures now correctly
+distinct objects, `Closure.call()` → `getMetaClass().invokeMethod(this,
+"doCall", args)` — real Groovy bytecode/reflection machinery
+(`MetaClassImpl`, `ClassInfo`, `CachedClass`) — still routed the call to the
+WRONG compiled body. Fixing class identity without also fixing this
+MetaClass/dispatch-layer bug made the wrong-body-dispatch bug fire in MORE
+cases than the accidental identity-collapse had been coincidentally masking.
+This attempt was reverted; `vm/src/runtime/interpreter.rs` is unchanged by
+the shipped fix.
+
+**Flipping this doc's `CRATONVM_LOADER_AWARE_RESOLUTION` global default was
+considered and explicitly rejected** for this bug cluster — this doc's own
+bar ("Full app gauntlet … must be soaked with the gate ON … until then the
+gate stays default-off") was not met (only the 3 target classes plus a
+handful of `scripting.bsh`/`scripting.groovy` classes were checked, nowhere
+near Tomcat/Hibernate/WildFly), and the checked slice already showed a
+regression from flipping it (`GroovyBeanDefinitionReaderTests` 6/36 → 5/36,
+a NEW `NoSuchMethodError` on Groovy's synthetic `$get$$class$...`
+class-literal-caching accessor). `vm/src/runtime/env_cache.rs`'s default is
+unchanged by the shipped fix.
+
+**Follow-up scope** (not attempted here): the Groovy `MetaClass`/`ClassInfo`/
+`CachedClass` dispatch-layer bug is a separate investigation from this doc's
+classloading-resolution mechanism — likely another instance of "resolves by
+name instead of by identity," one level up in Groovy's own runtime reflection
+layer rather than CratonVM's class store. Fixing it, plus doing the actual
+full app-gauntlet soak this doc calls for, would likely close out the
+residual failures in both `GroovyApplicationContextTests` and
+`GroovyBeanDefinitionReaderTests`.
+
 ## Fix (2026-06-24) — gated, three interacting layers
 
 Triage (via `.scratch-loader/probe/IsoProbe.java` + `IsoProbe2.java` + `LoadProbe.java`)
