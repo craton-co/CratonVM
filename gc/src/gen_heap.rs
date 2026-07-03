@@ -6914,11 +6914,22 @@ impl GenerationalHeap {
             self.young_from.lock().contains(holder_addr as *const u8),
             self.old_gen.lock().contains(holder_addr as *const u8),
         );
+        // Neighbor window: a misaligned-by-8 tagged Value write (the bc
+        // math-ec "0x4" family — receiver pointer off by 8) leaves its
+        // discriminant in the PREVIOUS cell's payload word and its payload in
+        // THIS cell's discriminant word; the ±2-cell dump makes that pattern
+        // (small disc at odd word positions) directly visible.
+        // SAFETY: the window lies within the holder's body ± one cell; the
+        // holder is a live validated object and heap arenas pad allocations,
+        // so the reads stay inside mapped arena memory.
+        let win: [u64; 8] = unsafe { std::ptr::read((cell_ptr as usize - 16) as *const [u64; 8]) };
         eprintln!(
             "[CELLCORRUPT] holder=0x{holder_addr:x} (young_from={hyf} old={hog}) \
              class_id={} class={class_name} kind=0x{:02x} num_slots={} array_len={} \
              gc_flags=0x{:x} index={index} raw0=0x{:016x} raw1=0x{:016x} | \
-             raw0-target: young_from={yf} young_to={yt} old={og}\n{}",
+             raw0-target: young_from={yf} young_to={yt} old={og}\n\
+             [CELLCORRUPT]   window cell-1..cell+2: {:016x},{:016x} | {:016x},{:016x} | \
+             {:016x},{:016x} | {:016x},{:016x}\n{}",
             header.class_id.as_u32(),
             header.kind as u8,
             header.num_slots,
@@ -6926,6 +6937,14 @@ impl GenerationalHeap {
             header.gc_flags,
             raw[0],
             raw[1],
+            win[0],
+            win[1],
+            win[2],
+            win[3],
+            win[4],
+            win[5],
+            win[6],
+            win[7],
             std::backtrace::Backtrace::force_capture(),
         );
         // If the stale target is still inside a CURRENT generation, dump its
