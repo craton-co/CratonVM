@@ -1015,7 +1015,30 @@ impl Frame {
         let i = index as usize;
         if i < self.locals.len() {
             self.locals[i] = CompactValue::from_value(value);
-            self.local_kinds[i] = lkind_of_value(&value);
+            let k = lkind_of_value(&value);
+            self.local_kinds[i] = k;
+            self.invalidate_cat2_upper_half(i, k);
+        }
+    }
+
+    /// A category-2 (`long`/`double`) value occupies JVM local slots `i` and
+    /// `i+1`, but this VM keeps the whole 64-bit value in slot `i` alone — slot
+    /// `i+1` is a spec-mandated reservation that carries no value and is never
+    /// read on its own. `set_local*` must nonetheless OVERWRITE slot `i+1`:
+    /// if it previously held an object reference (e.g. a scoped-out reference
+    /// temp that javac reused the pair for), leaving it intact makes the GC
+    /// root scan treat that dead reference as live for the frame's whole
+    /// lifetime. On the SteadyChurn repro `main`'s setup-loop `Node` temp lived
+    /// in the slot the churn-loop `long` reused, so every appended node stayed
+    /// reachable through its `next` chain — unbounded retention / OOM at any
+    /// heap size (`CRATONVM_G1_DBG_ROOTCENSUS=1`). The upper half is set to a
+    /// non-object int filler and marked cat-2 so the scan's `LKIND` gate skips
+    /// it before it ever reaches the lost-tag pointer probe.
+    #[inline(always)]
+    fn invalidate_cat2_upper_half(&mut self, i: usize, kind: u8) {
+        if (kind == LKIND_LONG || kind == LKIND_DOUBLE) && i + 1 < self.locals.len() {
+            self.locals[i + 1] = CompactValue::int(0);
+            self.local_kinds[i + 1] = kind;
         }
     }
 
@@ -1027,7 +1050,12 @@ impl Frame {
     #[inline(always)]
     pub fn set_local_unchecked(&mut self, index: usize, value: Value) {
         self.locals[index] = CompactValue::from_value(value);
-        self.local_kinds[index] = lkind_of_value(&value);
+        let k = lkind_of_value(&value);
+        self.local_kinds[index] = k;
+        // Invalidate the reserved upper half of a cat-2 store — see
+        // `invalidate_cat2_upper_half`. Guarded on `index + 1` so a
+        // (malformed) cat-2 store into the last slot cannot panic.
+        self.invalidate_cat2_upper_half(index, k);
     }
 
     /// Set a local int slot directly (T10.9.D hot-path, mirrors
@@ -1290,7 +1318,31 @@ impl Frame {
     /// filter unchanged; long-bit-patterns whose lower 47 bits don't point
     /// at a live heap object are correctly excluded.
     pub fn scan_local_objects(&self, roots: &mut Vec<ObjectRef>, heap: &crate::memory::VmHeap) {
+        // Per-bci local liveness (HotSpot interpreter-oop-map equivalent): a
+        // slot whose value can never be read again under bytecode semantics
+        // is NOT a root. Without this, a scoped-out local (e.g. a loop
+        // construction temp) retains its last referent for the frame's whole
+        // lifetime — unbounded retention on linked structures (the
+        // SteadyChurn `node[4095]` anchor, `CRATONVM_G1_DBG_ROOTCENSUS=1`).
+        // The analysis is conservative (all-live on anything it cannot fully
+        // model), both the current and last-started instruction pcs are
+        // unioned, and slot 0 is always kept. Opt out with
+        // `CRATONVM_NO_LOCAL_LIVENESS=1`. The NON-MOVING conservative scan
+        // (`scan_locals_conservative`) is intentionally unfiltered.
+        let live_mask = if crate::runtime::env_cache::no_local_liveness() {
+            crate::runtime::local_liveness::ALL_LIVE
+        } else {
+            crate::runtime::local_liveness::live_locals_mask(
+                &self.code,
+                self.exception_table(),
+                self.max_locals,
+                [self.pc, self.last_instr_pc],
+            )
+        };
         for (i, cv) in self.locals.iter().enumerate() {
+            if i < 64 && live_mask & (1u64 << i) == 0 {
+                continue;
+            }
             // A primitive `long` / `double` is never a heap reference — not
             // even when its NaN-boxed bits collide with the SUB_OBJECT tag
             // (BC F2m `LongArray` `0xfffd_…` words). The `is_heap_addr` filter
@@ -1799,13 +1851,17 @@ mod tests {
         // to `CompactValue::object(addr)`, but it is a *value*, not a pointer.
         let collision_bits = CompactValue::object(addr).raw_bits();
 
+        // Bytecode that READS both slots at pc 0 so the per-bci liveness
+        // filter (which correctly drops never-read-again slots) keeps them:
+        // this test is about tag-collision semantics, not liveness.
+        //   0: lload_0 ; 1: pop2 ; 2: aload_1 ; 3: pop ; 4: return
         let mut frame = Frame::new(
             ClassId::new(0),
             "T".to_string(),
             "m".to_string(),
             "()V".to_string(),
             None,
-            vec![0xb1],
+            vec![0x1e, 0x58, 0x2b, 0x57, 0xb1],
             vec![],
             10,
             4,
@@ -1825,6 +1881,106 @@ mod tests {
         // …yet only the reference slot is rooted; the collision long is not.
         assert_eq!(roots.len(), 1, "only the genuine reference is a GC root");
         assert_eq!(roots[0].as_ptr() as u64, addr);
+    }
+
+    /// A category-2 (`long`/`double`) store must INVALIDATE the reserved upper
+    /// half so a former object reference in that slot is not rooted forever.
+    /// This is the interpreter-side root of the SteadyChurn unbounded-retention
+    /// leak: `main`'s setup-loop `Node` temp lived in the slot pair the
+    /// churn-loop `long` reused, so without clearing the upper half the dead
+    /// node (and its whole `next` chain) stayed reachable.
+    #[test]
+    fn cat2_store_invalidates_reserved_upper_half() {
+        use crate::memory::VmHeap;
+        use cratonvm_gc::GcBackend;
+
+        let heap = VmHeap::new(GcBackend::Generational, 16 * 1024 * 1024);
+        let obj = heap.alloc_object(ClassId::new(0), 0);
+
+        // Bytecode that reads slots 2 and 3 as a long at pc 0 so per-bci
+        // liveness keeps the pair live — the test is about the store clearing
+        // the upper half, not liveness dropping it.
+        //   0: lload_2 ; 1: pop2 ; 2: return
+        let mut frame = Frame::new(
+            ClassId::new(0),
+            "T".to_string(),
+            "m".to_string(),
+            "()V".to_string(),
+            None,
+            vec![0x20, 0x58, 0xb1],
+            vec![],
+            10,
+            6,
+            &[],
+        );
+
+        // Slot 3 first holds a live object (the "scoped-out temp").
+        frame.set_local_unchecked(3, Value::Object(Some(obj)));
+        // A long stored at slot 2 reserves slots 2 AND 3 — slot 3's stale
+        // object reference must be gone.
+        frame.set_local_unchecked(2, Value::Long(0x1_0000_0002));
+
+        let mut roots = Vec::new();
+        frame.scan_local_objects(&mut roots, &heap);
+        assert!(
+            roots.is_empty(),
+            "cat-2 store did not clear the reserved upper half (stale object rooted)"
+        );
+        // The long still reads back intact from slot 2.
+        assert_eq!(frame.get_local_compact(2).as_long(), Some(0x1_0000_0002));
+    }
+
+    /// `scan_local_objects` must NOT root a genuinely scoped-out OBJECT local
+    /// (written once, never read again) — the general liveness imprecision,
+    /// independent of the cat-2-store leak. Verifies the frame-level WIRING of
+    /// the per-bci liveness filter (the analyzer itself is unit-tested in
+    /// `runtime::local_liveness`).
+    #[test]
+    fn scan_local_objects_drops_scoped_out_object_local() {
+        use crate::memory::VmHeap;
+        use cratonvm_gc::GcBackend;
+
+        let heap = VmHeap::new(GcBackend::Generational, 16 * 1024 * 1024);
+        let obj = heap.alloc_object(ClassId::new(0), 0);
+
+        // Bytecode: slot 1 written at pc 0, then an endless counter loop over
+        // slot 2 that never reads slot 1.
+        //   0: astore_1 ; 1: iinc 2,1 ; 4: goto 1
+        let mut frame = Frame::new(
+            ClassId::new(0),
+            "T".to_string(),
+            "m".to_string(),
+            "()V".to_string(),
+            None,
+            vec![0x4c, 0x84, 0x02, 0x01, 0xa7, 0xff, 0xfd],
+            vec![],
+            10,
+            4,
+            &[],
+        );
+        frame.set_local_unchecked(1, Value::Object(Some(obj)));
+        // Position the frame in the loop (pc 1), where slot 1 is dead.
+        frame.pc = 1;
+        frame.last_instr_pc = 1;
+
+        let mut roots = Vec::new();
+        frame.scan_local_objects(&mut roots, &heap);
+        assert!(
+            roots.is_empty(),
+            "a scoped-out object local was rooted (liveness filter not applied)"
+        );
+
+        // With the kill-switch the historical behaviour returns: the slot is
+        // rooted. (Cannot toggle the cached env flag here, so assert the
+        // analyzer agrees the slot is dead — the wiring above proves the
+        // filter consults it.)
+        let mask = crate::runtime::local_liveness::live_locals_mask(
+            &frame.code,
+            frame.exception_table(),
+            frame.max_locals,
+            [frame.pc, frame.last_instr_pc],
+        );
+        assert_eq!(mask & 0b010, 0, "analyzer must report slot 1 dead");
     }
 
     #[test]

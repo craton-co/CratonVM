@@ -287,15 +287,42 @@ the original's no-promotion shape — see its header comment) print the correct
 The residual race (previously ~2/40 post-dominant-fix) did not reproduce in
 80 parallel runs. This known issue's two bugs are considered FIXED.
 
-Remaining OPEN follow-ups (separate issues, tracked in the 2026-07-03 section
-above; they gate the parallel-default flip, not this race):
+Remaining OPEN follow-up (separate issue, tracked in the 2026-07-03 section
+above; gates the parallel-default flip, not this race):
 
 1. Concurrent-mark liveness under moving young collections (cleanup's
    in-place Old-region free stays disabled as containment until audited).
-2. Interpreter root liveness imprecision (scoped-out local slots retain their
-   last referent for the frame's lifetime — unbounded retention on linked
-   structures; both repros are written temp-free to sidestep it).
 
 Parallel evac stays **opt-in/experimental** and mixed stays serial until
-those two are resolved. Default G1 (serial) and Generational benefit from the
+that one is resolved. Default G1 (serial) and Generational benefit from the
 serial-path fixes above.
+
+## 2026-07-03 (later) — interpreter retention imprecision RESOLVED
+
+Follow-up #2 (interpreter root-liveness imprecision) is FIXED, on branch
+`fix/interp-local-liveness`. It was actually TWO issues:
+
+- **Category-2 local store leak (the real root cause).** This VM keeps a
+  `long`/`double` entirely in local slot `i`; slot `i+1` is a spec-mandated
+  reservation it never reads. But `lstore`/`dstore` wrote only slot `i`, so
+  when javac reused a slot pair for a `long` that had previously held an
+  object reference (a scoped-out `Node` temp), the dead reference stayed a GC
+  root for the frame's lifetime — anchoring the whole `next` chain (OOM at any
+  heap; `CRATONVM_G1_DBG_ROOTCENSUS=1` → one root, seq=4095, reach=67k).
+  `Frame::set_local`/`set_local_unchecked` now invalidate slot `i+1` on every
+  cat-2 store.
+- **General per-bci local liveness** (`runtime/local_liveness.rs`): a backward
+  may-liveness dataflow over the raw bytecode filters the interpreter root
+  scan, so a genuinely scoped-out object local (never reused) is no longer
+  rooted either. Fully conservative (all-live on jsr/ret, >64 locals, >32 KB
+  methods, unknown/malformed code; exception handlers modelled as successors),
+  cached per code blob, kill-switch `CRATONVM_NO_LOCAL_LIVENESS=1`.
+
+The store fix alone resolves the reported OOM (reproduces with liveness OFF,
+fixed by the store fix); liveness is complementary precision. New repro
+`SteadyChurnTemp.java` (Light + the deliberate temp) prints `2002062093760`
+at `-Xmx16m --nojit` on G1 serial AND parallel, liveness on and off; Light,
+heavy, and `binarytrees 16` stay green; vm 1707/1707, gc 754/754. Generational
+at 16m OOMs on Light and Temp alike (a pre-existing semi-space young-gen
+sizing limit) and both pass identically at 24m. The remaining oop-map-style
+imprecision only survives in methods the analyzer conservatively bails on.
