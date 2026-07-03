@@ -68,7 +68,36 @@ fn init_wrapper_type(
 ) -> MethodCallResult {
     let mirror = ctx.primitive_class_mirror(primitive_name);
     if let Some(class_id) = ctx.class_id_by_name(wrapper_name) {
-        ctx.set_static_field(class_id, 0, Value::Object(Some(mirror)));
+        // This native <clinit> REPLACES the real bytecode <clinit> entirely
+        // (native registration takes priority over bytecode), so it must not
+        // assume `TYPE` is static field index 0. That only holds for the
+        // wrapper types whose only object-reference static field is `TYPE`
+        // (Integer, Long, Float, Double, Character, Byte, Short, Void — their
+        // other static finals like MIN_VALUE/MAX_VALUE are primitives).
+        // `java.lang.Boolean` declares `TRUE` and `FALSE` (both
+        // object-reference statics) BEFORE `TYPE`, so real Boolean.TYPE is
+        // index 2, not 0. Hardcoding 0 there silently overwrote Boolean.TRUE
+        // with the Class mirror and left Boolean.FALSE at its default null —
+        // e.g. `Boolean.valueOf(false)` (real bytecode `return b ? TRUE :
+        // FALSE`) returned null. Resolve the slot by name so this works
+        // regardless of a class's static-field declaration order.
+        let type_idx = ctx
+            .static_field_index_by_name(class_id, "TYPE")
+            .unwrap_or(0);
+        ctx.set_static_field(class_id, type_idx, Value::Object(Some(mirror)));
+
+        if wrapper_name == "java/lang/Boolean" {
+            if let Some(true_idx) = ctx.static_field_index_by_name(class_id, "TRUE") {
+                let true_obj = ctx.alloc_object(class_id, 1);
+                ctx.set_field(true_obj, 0, Value::Int(1));
+                ctx.set_static_field(class_id, true_idx, Value::Object(Some(true_obj)));
+            }
+            if let Some(false_idx) = ctx.static_field_index_by_name(class_id, "FALSE") {
+                let false_obj = ctx.alloc_object(class_id, 1);
+                ctx.set_field(false_obj, 0, Value::Int(0));
+                ctx.set_static_field(class_id, false_idx, Value::Object(Some(false_obj)));
+            }
+        }
     }
     Ok(None)
 }
