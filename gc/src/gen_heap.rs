@@ -4353,8 +4353,11 @@ impl GenerationalHeap {
                         match old_gen.alloc(total_size, 8) {
                             Some(dst) => {
                                 // gcstress face-1 hunt (no-op unless gated):
-                                // dump the source qword pair too (see
-                                // cheney-copy).
+                                // validate the SOURCE body before promoting —
+                                // catching a corrupt cell here pins the
+                                // corruption to BEFORE promotion and reports
+                                // the victim's stable young address.
+                                validate_copy_source_cells(src, header, "promote-src");
                                 {
                                     let w = crate::heap::cell_watch_addr();
                                     let d = dst as usize;
@@ -6392,9 +6395,12 @@ impl GenerationalHeap {
         };
 
         // Copy the entire object
-        // gcstress face-1 hunt (no-op unless gated): also dump the SOURCE
-        // qword pair at the watched offset, so a copy that IMPORTS corrupt
-        // content is distinguishable from one that copies a clean cell.
+        // gcstress face-1 hunt (no-op unless gated): validate the source body
+        // (see promote-src) and dump the SOURCE qword pair at the watched
+        // offset, so a copy that IMPORTS corrupt content is distinguishable
+        // from one that copies a clean cell.
+        // SAFETY: `old_ptr` is the live source object under STW.
+        validate_copy_source_cells(old_ptr, unsafe { &*(old_ptr as *const ObjectHeader) }, "cheney-src");
         {
             let w = crate::heap::cell_watch_addr();
             let dst = new_ptr as usize;
@@ -7006,6 +7012,41 @@ impl GenerationalHeap {
 fn cell_corrupt_diag_enabled() -> bool {
     static G: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *G.get_or_init(|| std::env::var_os("CRATONVM_DBG_CELLCORRUPT").is_some())
+}
+
+/// gcstress residual face-1 hunt (`CRATONVM_DBG_CELLCORRUPT`) — validate a
+/// legacy object's Value cells at a GC copy SOURCE. A corrupt cell caught
+/// here proves the corruption happened before this copy and reports the
+/// victim's pre-copy (young, often bootstrap-page-stable) address — the
+/// address a follow-up `CRATONVM_DBG_WATCH_CELL` run must watch to catch the
+/// forming write. Rate-capped; no-op unless the gate is set.
+fn validate_copy_source_cells(obj_ptr: *const u8, header: &ObjectHeader, site: &str) {
+    if !cell_corrupt_diag_enabled()
+        || header.kind != ObjectKind::Object
+        || is_compact_object(header)
+    {
+        return;
+    }
+    static HITS: AtomicUsize = AtomicUsize::new(0);
+    for k in 0..header.num_slots as usize {
+        let c = obj_ptr as usize + HEADER_SIZE + k * SLOT_SIZE;
+        // SAFETY: within the source object's body (walk-validated under STW).
+        if unsafe { cratonvm_types::read_value_checked(c as *const Value) }.is_none() {
+            if HITS.fetch_add(1, Ordering::Relaxed) < 16 {
+                // SAFETY: same cell, raw read.
+                let raw = unsafe { std::ptr::read(c as *const [u64; 2]) };
+                eprintln!(
+                    "[CELLCORRUPT:{site}] PRE-COPY corrupt cell: src_obj=0x{:x} class_id={} \
+                     num_slots={} slot={k} cell=0x{c:x} raw={:016x},{:016x}",
+                    obj_ptr as usize,
+                    header.class_id.as_u32(),
+                    header.num_slots,
+                    raw[0],
+                    raw[1],
+                );
+            }
+        }
+    }
 }
 
 impl Default for GenerationalHeap {
