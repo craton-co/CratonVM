@@ -71,7 +71,9 @@ Compared with the HotSpot baseline:
 Additional overlapping failures still carry useful VM information:
 
 ```text
-2 LoggerFactory.provider() null log files in vectorization init
+2 LoggerFactory.provider() null log files in vectorization init (RESOLVED —
+  not a CratonVM bug; HotSpot failed identically. Root cause and fix in
+  ../internal/elasticsearch-suite/elasticsearch-loggerfactory-provider-null.md)
 9 Buffer.isReadOnly() has no Code attribute log files
 2 TSDB doc-values classes that crashed in JIT-on mode hung in no-JIT mode
 ```
