@@ -3912,6 +3912,7 @@ fn register_hashmap_natives(r: &mut NativeMethodRegistry) {
 
     r.register(c, "<init>", "()V", native_map_init);
     r.register(c, "<init>", "(I)V", native_map_init_capacity);
+    r.register(c, "<init>", "(IF)V", native_map_init_capacity_load);
     r.register(c, "<init>", "(Ljava/util/Map;)V", native_map_init_from_map);
     // Serialization: drive the stream from the actual backing so a HashMap that
     // was built via the native `<init>(Map)` copy-constructor (which leaves the
@@ -4148,6 +4149,16 @@ fn native_map_init_capacity(ctx: &mut dyn NativeContext, args: &[Value]) -> Meth
     try_set_jdk_map_field(ctx, this, "threshold", Value::Int((cap as i32 * 3) / 4));
     try_set_jdk_map_field(ctx, this, "loadFactor", Value::Float(0.75_f32));
     Ok(None)
+}
+
+/// `HashMap(int initialCapacity, float loadFactor)` — mirrors
+/// `native_hs_init_capacity_load`/`native_lhm_init_capacity_lf`: the
+/// loadFactor arg is accepted but not stored, since this layout already
+/// fixes loadFactor at 0.75 (see `native_map_init_capacity`'s rationale).
+/// `native_map_init_capacity` only reads `args[0]`/`args[1]`, so the extra
+/// trailing float arg is already harmless — no trimming needed.
+fn native_map_init_capacity_load(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    native_map_init_capacity(ctx, args)
 }
 
 // Public wrappers for cross-module access (EnumMap, IdentityHashMap, WeakHashMap)
