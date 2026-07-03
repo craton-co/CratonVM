@@ -2307,7 +2307,26 @@ fn ssc_local_address(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallR
     // flat object made it return -1 — which is the port `TomcatBaseTest.getPort()`
     // hands to `SimpleHttpClient`, so every embedded-server test connected to
     // ":-1" and hung. The real ctor populates the holder and fixes getLocalPort.
-    let h = ctx.create_string("0.0.0.0");
+    //
+    // Host: originally hardcoded to the literal string `"0.0.0.0"` since only
+    // `getLocalPort()` mattered for the Tomcat fix above. That broke any
+    // caller that DOES use the host — `com.sun.net.httpserver.HttpsServer`
+    // (real `sun.net.httpserver.ServerImpl`, which binds a
+    // `ServerSocketChannel` and later calls `getLocalAddress()` to answer its
+    // own `getAddress()`) handed that bogus `0.0.0.0` back to
+    // `RestClientBuilderIntegTests`, which reconnects using it — `0.0.0.0` is
+    // not a valid TLS connect target (`WSAEADDRNOTAVAIL`). Look up the
+    // listener's REAL bound address instead; falls back to the old
+    // `"0.0.0.0"` wildcard text only if the registry entry is gone (channel
+    // already closed) or isn't actually a listener.
+    let host = match tcp_registry().read().get(&id) {
+        Some(TcpHandle::Listener(l)) => l
+            .local_addr()
+            .map(|a| a.ip().to_string())
+            .unwrap_or_else(|_| "0.0.0.0".to_string()),
+        _ => "0.0.0.0".to_string(),
+    };
+    let h = ctx.create_string(&host);
     ctx.new_object_initialized(
         "java/net/InetSocketAddress",
         "(Ljava/lang/String;I)V",
@@ -2386,12 +2405,26 @@ fn ss_wrapper_local_address(ctx: &mut dyn NativeContext, args: &[Value]) -> Meth
         Some(o) => o,
         None => return Ok(Some(Value::Object(None))),
     };
-    let port = if let Some(ssc) = ss_back_ref(ctx, this) {
-        cf_get(ctx, ssc, F_LOCAL_PORT).as_int().unwrap_or(0)
+    let (port, host) = if let Some(ssc) = ss_back_ref(ctx, this) {
+        let port = cf_get(ctx, ssc, F_LOCAL_PORT).as_int().unwrap_or(0);
+        let id = cf_get(ctx, ssc, F_REG_ID).as_int().unwrap_or(-1);
+        // Real bound address, not the historical "0.0.0.0" placeholder —
+        // see `ssc_local_address` (same registry, same rationale).
+        let host = match tcp_registry().read().get(&id) {
+            Some(TcpHandle::Listener(l)) => l
+                .local_addr()
+                .map(|a| a.ip().to_string())
+                .unwrap_or_else(|_| "0.0.0.0".to_string()),
+            _ => "0.0.0.0".to_string(),
+        };
+        (port, host)
     } else {
         // Plain ServerSocket — read the port recorded by the binder (BUG-04),
-        // same channel ss_wrapper_local_port uses.
-        cratonvm_native_api::server_socket_ports::get(ctx.identity_hash_code(this)).unwrap_or(0)
+        // same channel ss_wrapper_local_port uses. No channel registry entry
+        // to resolve a real host from here, so keep the wildcard text.
+        let port =
+            cratonvm_native_api::server_socket_ports::get(ctx.identity_hash_code(this)).unwrap_or(0);
+        (port, "0.0.0.0".to_string())
     };
     if port <= 0 {
         return Ok(Some(Value::Object(None)));
@@ -2405,7 +2438,7 @@ fn ss_wrapper_local_address(ctx: &mut dyn NativeContext, args: &[Value]) -> Meth
     // object made it 0 → every Spring HTTP-client test connected to
     // `http://localhost:0` and failed (BUG-04). The real ctor populates the
     // holder so `getPort()` returns the bound ephemeral port.
-    let h = ctx.create_string("0.0.0.0");
+    let h = ctx.create_string(&host);
     ctx.new_object_initialized(
         "java/net/InetSocketAddress",
         "(Ljava/lang/String;I)V",

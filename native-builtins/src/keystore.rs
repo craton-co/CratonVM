@@ -1171,10 +1171,30 @@ fn engine_load(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult 
     };
 
     // Bridge the parsed keystore into the rustls-backed TLS engine: install the
-    // first key entry as the server identity. Trust anchors are intentionally
-    // not mirrored into any process-global TLS root set here; explicit
-    // truststores are scoped by TrustManagerFactory/SSLContext instead.
+    // first key entry as the server identity.
+    //
+    // FIX (es-restclient-https): trust anchors ARE now also mirrored here (see
+    // below), reversing the previous "TrustManagerFactory/SSLContext scope
+    // them instead" assumption. That assumption relied on
+    // `TrustManagerFactory.init(KeyStore)`'s native firing reliably — mirroring
+    // the same (correct, see below) assumption made for `KeyManagerFactory
+    // .init` — but empirically, `TrustManagerFactory.getInstance("PKIX")`
+    // (the JDK default algorithm) resolves to
+    // `sun.security.ssl.TrustManagerFactoryImpl$PKIXFactory`, whose
+    // `engineInit(KeyStore)` is REAL, non-native bytecode (inherited from the
+    // abstract `TrustManagerFactoryImpl.engineInit`) that CratonVM does not
+    // intercept — only the SunX509 `$SimpleFactory` variant has a registered
+    // native (`x509_manager.rs::tmf_engine_init`). So for the (common) PKIX
+    // default algorithm, no native ever runs to call
+    // `set_pending_tm_trust_roots`, and a caller-supplied truststore's anchors
+    // were silently dropped: `SSLContext.init` always fell back to the
+    // platform root store only, so a self-signed/test-CA certificate (e.g.
+    // the `HttpsServer`+`RestClient` pattern in `RestClientBuilderIntegTests`)
+    // always failed handshake with `UnknownIssuer`. `engineLoad` is the one
+    // reliable native call point regardless of which `TrustManagerFactory`
+    // algorithm/impl class ends up being used, so stage the anchors here too.
     let mut first_key_identity: Option<(Vec<u8>, Vec<Vec<u8>>)> = None;
+    let mut trust_anchor_ders: Vec<Vec<u8>> = Vec::new();
     for entry in store.entries.values() {
         match &entry.kind {
             EntryKind::PrivateKey { key_der, chain } => {
@@ -1182,8 +1202,16 @@ fn engine_load(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult 
                 if first_key_identity.is_none() {
                     first_key_identity = Some((key_der.clone(), chain.clone()));
                 }
+                // The chain's root (last cert) is a trust anchor too — a
+                // keystore holding a self-signed identity (the common test
+                // pattern: `keytool -genkeypair`) IS its own trust anchor.
+                if let Some(root) = chain.last() {
+                    trust_anchor_ders.push(root.clone());
+                }
             }
-            EntryKind::TrustedCert { .. } => {}
+            EntryKind::TrustedCert { cert_der } => {
+                trust_anchor_ders.push(cert_der.clone());
+            }
         }
     }
 
@@ -1204,6 +1232,12 @@ fn engine_load(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult 
             .unwrap()
             .insert(id, (cert_pem.clone(), key_pem.clone()));
         crate::t27_tls::set_pending_km_identity(cert_pem, key_pem);
+    }
+    // FIX (es-restclient-https): stage this keystore's trust anchors for the
+    // next `SSLContext.init`, same lifetime/consumption rules as the KM
+    // identity above (one-shot thread-local, cleared by `SSLContext.init`).
+    if !trust_anchor_ders.is_empty() {
+        crate::t27_tls::set_pending_tm_trust_roots(trust_anchor_ders);
     }
     Ok(Some(Value::Object(None)))
 }
