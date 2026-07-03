@@ -5452,6 +5452,25 @@ impl GenerationalHeap {
                 *(obj_ptr as *const u64)
             }));
 
+            let side_marked_survivor = if !header.is_forwarded() {
+                // xt-hardening (2026-07-03): side-marked survivor check
+                // (lockstep, absolute addrs). These candidates were kept
+                // alive WITHOUT a header write; retain them without writing
+                // gc_flags/gc_age either (their "header" may be a zero span
+                // or a legal zero-word0 container — never write through it).
+                let abs = from_base + cursor;
+                while let Some(&&a) = side_iter.peek() {
+                    if a < abs {
+                        side_iter.next();
+                    } else {
+                        break;
+                    }
+                }
+                side_iter.peek().is_some_and(|&&a| a == abs)
+            } else {
+                false
+            };
+
             if header.is_forwarded() {
                 // Evacuated to old gen by selective promotion: the live copy is
                 // in old gen and references were redirected in the fixup pass;
@@ -5490,22 +5509,7 @@ impl GenerationalHeap {
                         header.kind as u8,
                     ));
                 }
-            } else if {
-                // xt-hardening (2026-07-03): side-marked survivor check
-                // (lockstep, absolute addrs). These candidates were kept
-                // alive WITHOUT a header write; retain them without writing
-                // gc_flags/gc_age either (their "header" may be a zero span
-                // or a legal zero-word0 container — never write through it).
-                let abs = from_base + cursor;
-                while let Some(&&a) = side_iter.peek() {
-                    if a < abs {
-                        side_iter.next();
-                    } else {
-                        break;
-                    }
-                }
-                side_iter.peek().is_some_and(|&&a| a == abs)
-            } {
+            } else if side_marked_survivor {
                 // Side-marked survivor: pure retention, no header writes.
                 objects_live += 1;
             } else if header.gc_flags & GC_FLAG_MARKED != 0 {

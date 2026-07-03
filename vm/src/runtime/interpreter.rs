@@ -759,7 +759,7 @@ fn maybe_gc(shared: &SharedVm, thread: &mut JvmThread) {
         } else {
             // Multi-threaded path: coordinate via GC barrier
             let mut counted_os_tids: Vec<u32> = Vec::new();
-            if {
+            let should_initiate_gc = {
                 // xt-hardening (2026-07-03): snapshot the counted alive
                 // set's OS tids atomically with the expected computation
                 // (same closure, same barrier lock) for identity-based
@@ -770,7 +770,8 @@ fn maybe_gc(shared: &SharedVm, thread: &mut JvmThread) {
                     counted_os_tids = tids;
                     u32::try_from(n).unwrap_or(u32::MAX)
                 })
-            } {
+            };
+            if should_initiate_gc {
                 // We are the GC initiator. BUG-03 — forcibly stop in-JIT
                 // peers and conservatively scan them before waiting for the
                 // cooperative mutators.
@@ -893,7 +894,7 @@ fn maybe_gc_forced(shared: &SharedVm, thread: &mut JvmThread) {
         note_gc_productivity(shared, before_live);
     } else {
         let mut counted_os_tids: Vec<u32> = Vec::new();
-        if {
+        let should_initiate_gc = {
             // xt-hardening (2026-07-03): see maybe_gc — atomic counted-set
             // snapshot for identity-based takeover excusal.
             counted_os_tids.clear();
@@ -902,7 +903,8 @@ fn maybe_gc_forced(shared: &SharedVm, thread: &mut JvmThread) {
                 counted_os_tids = tids;
                 u32::try_from(n).unwrap_or(u32::MAX)
             })
-        } {
+        };
+        if should_initiate_gc {
             // BUG-03 — forcibly stop + conservatively scan in-JIT peers.
             let mut xt_roots: Vec<ObjectRef> = Vec::new();
             let taken = stw_take_over_and_wait(shared, &mut xt_roots, &counted_os_tids);
@@ -1058,7 +1060,7 @@ pub fn force_gc_from_native(shared: &SharedVm, thread: &mut JvmThread) {
         }
     } else {
         let mut counted_os_tids: Vec<u32> = Vec::new();
-        if {
+        let should_initiate_gc = {
             // xt-hardening (2026-07-03): see maybe_gc — atomic counted-set
             // snapshot for identity-based takeover excusal.
             counted_os_tids.clear();
@@ -1067,7 +1069,8 @@ pub fn force_gc_from_native(shared: &SharedVm, thread: &mut JvmThread) {
                 counted_os_tids = tids;
                 u32::try_from(n).unwrap_or(u32::MAX)
             })
-        } {
+        };
+        if should_initiate_gc {
             // BUG-03 — forcibly stop + conservatively scan in-JIT peers.
             let mut xt_roots: Vec<ObjectRef> = Vec::new();
             let taken = stw_take_over_and_wait(shared, &mut xt_roots, &counted_os_tids);
