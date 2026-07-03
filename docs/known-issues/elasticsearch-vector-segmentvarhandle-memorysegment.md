@@ -1,8 +1,31 @@
 # Elasticsearch vector codecs missing SegmentVarHandle MemorySegment access
 
-Status: open
+Status: open (likely fixed — see 2026-07-03 update below; not fully re-verified)
 
 Date observed: 2026-07-02
+
+## 2026-07-03 update
+
+This is the same root cause as `elasticsearch-tsdb-docvalues-native-crashes.md`
+and `elasticsearch-tsdb-storedfields-hang.md` (both now FIXED in
+`docs/internal/`): `SegmentVarHandle.get/set` was never routed to CratonVM's
+existing signature-polymorphic-dispatch fallback (`is_vh` in `vm_exec.rs`
+didn't recognise the `SegmentVarHandle` class name) and had no
+implementation once routed. Both are fixed on
+`fix/es-tsdb-docvalues-storedfields` (`vm/src/vm/vm_exec.rs`,
+`native-builtins/src/lang_invoke.rs`).
+
+A representative class from this doc
+(`org.elasticsearch.index.codec.vectors.es818.ES818BinaryQuantizedVectorsFormatTests`)
+was spot-checked against the fix: zero `SegmentVarHandle` occurrences and no
+crash across ~230 lines of test output before the check was cut off by a
+90-second timeout (not a hang — the run was still making progress through
+normal test/failure output, e.g. an unrelated `JdkZstdLibrary` native-loading
+`ExceptionInInitializerError`). It was **not** run to full completion, so
+this doc is left open rather than moved to `docs/internal/` per the
+known-issues triage rule — re-run the full repro below against a build
+containing the fix and confirm a clean (or HotSpot-parity) finish before
+closing it out.
 
 ## Summary
 

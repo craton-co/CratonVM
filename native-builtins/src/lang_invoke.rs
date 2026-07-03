@@ -10,7 +10,7 @@ use std::borrow::Cow;
 use std::sync::Arc;
 
 use cratonvm_native_api::{NativeContext, NativeMethodRegistry};
-use cratonvm_types::error::MethodCallResult;
+use cratonvm_types::error::{MethodCallFailed, MethodCallResult, RuntimeError};
 use cratonvm_types::{ClassId, ObjectKind, ObjectRef, Value};
 
 use crate::lang_class::{box_value, mirror_class_id, mirror_class_name};
@@ -1249,11 +1249,415 @@ fn byte_view_kind(meta: Option<&VarHandleMeta>) -> Option<(u8, bool)> {
     Some((*m.field_desc.as_bytes().first().unwrap_or(&b'J'), le))
 }
 
+// ---------------------------------------------------------------------------
+// java.lang.foreign / SegmentVarHandle (JEP 454 FFM API) coordinate access
+// ---------------------------------------------------------------------------
+//
+// `MemorySegment.get/set(ValueLayout, long)` real bytecode
+// (`jdk.internal.foreign.AbstractMemorySegmentImpl`) calls straight into
+// `SegmentVarHandle.get/set(segment, offset[, value])`. That class is real
+// bytecode with no native body for these signature-polymorphic accessors (no
+// concrete `get`/`set` method exists on it at all — see JVMS §5.4.3.3), so it
+// has no entry in our synthetic `VH_KIND` side-table either. Detected purely
+// by the VarHandle's own (real) class name, distinct from the array-element
+// and byte-array-view shapes handled above.
+
+const SEGMENT_VAR_HANDLE_CLASS: &str = "java/lang/invoke/SegmentVarHandle";
+
+fn is_segment_var_handle(ctx: &mut dyn NativeContext, vh: ObjectRef) -> bool {
+    ctx.class_name_of_id(ctx.class_id_of_object(vh)).as_deref() == Some(SEGMENT_VAR_HANDLE_CLASS)
+}
+
+/// A `SegmentVarHandle`'s own `enclosing` (the `ValueLayout` it was built
+/// from), baked-in `offset`, and `be` (byte order requires a swap) fields —
+/// resolved by name since this is a real class (real, JDK-image field
+/// layout), not our synthetic 6-field VarHandle shape.
+fn segment_vh_fields(ctx: &mut dyn NativeContext, vh: ObjectRef) -> Option<(ObjectRef, i64, bool)> {
+    let enclosing_idx = ctx.resolve_field_index(SEGMENT_VAR_HANDLE_CLASS, "enclosing")?;
+    let offset_idx = ctx.resolve_field_index(SEGMENT_VAR_HANDLE_CLASS, "offset")?;
+    let be_idx = ctx.resolve_field_index(SEGMENT_VAR_HANDLE_CLASS, "be")?;
+    let enclosing = match ctx.get_field(vh, enclosing_idx) {
+        Value::Object(Some(o)) => o,
+        _ => return None,
+    };
+    let offset = match ctx.get_field(vh, offset_idx) {
+        Value::Long(n) => n,
+        _ => 0,
+    };
+    let be = matches!(ctx.get_field(vh, be_idx), Value::Int(n) if n != 0);
+    Some((enclosing, offset, be))
+}
+
+/// Primitive "shape" of a real `ValueLayout`, read off its implementation
+/// class name (`jdk.internal.foreign.layout.ValueLayouts$OfXxxImpl`).
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum SegShape {
+    Byte,
+    Boolean,
+    Short,
+    Char,
+    Int,
+    Long,
+    Float,
+    Double,
+    Address,
+}
+
+fn segment_layout_shape(ctx: &mut dyn NativeContext, layout: ObjectRef) -> SegShape {
+    let name = ctx
+        .class_name_of_id(ctx.class_id_of_object(layout))
+        .unwrap_or_default();
+    if name.contains("OfByte") {
+        SegShape::Byte
+    } else if name.contains("OfBoolean") {
+        SegShape::Boolean
+    } else if name.contains("OfShort") {
+        SegShape::Short
+    } else if name.contains("OfChar") {
+        SegShape::Char
+    } else if name.contains("OfInt") {
+        SegShape::Int
+    } else if name.contains("OfLong") {
+        SegShape::Long
+    } else if name.contains("OfFloat") {
+        SegShape::Float
+    } else if name.contains("OfDouble") {
+        SegShape::Double
+    } else {
+        SegShape::Address
+    }
+}
+
+fn seg_shape_width(shape: SegShape) -> i64 {
+    match shape {
+        SegShape::Byte | SegShape::Boolean => 1,
+        SegShape::Short | SegShape::Char => 2,
+        SegShape::Int | SegShape::Float => 4,
+        SegShape::Long | SegShape::Double | SegShape::Address => 8,
+    }
+}
+
+fn seg_swap_bytes(raw: u64, width: i64) -> u64 {
+    match width {
+        1 => raw,
+        2 => (raw as u16).swap_bytes() as u64,
+        4 => (raw as u32).swap_bytes() as u64,
+        _ => raw.swap_bytes(),
+    }
+}
+
+fn seg_decode_value(shape: SegShape, raw: u64) -> Value {
+    match shape {
+        SegShape::Byte => Value::Int(raw as u8 as i8 as i32),
+        SegShape::Boolean => Value::Int((raw as u8 != 0) as i32),
+        SegShape::Short => Value::Int(raw as u16 as i16 as i32),
+        SegShape::Char => Value::Int(raw as u16 as i32),
+        SegShape::Int => Value::Int(raw as u32 as i32),
+        SegShape::Float => Value::Float(f32::from_bits(raw as u32)),
+        SegShape::Long | SegShape::Address => Value::Long(raw as i64),
+        SegShape::Double => Value::Double(f64::from_bits(raw)),
+    }
+}
+
+fn seg_encode_value(value: &Value, width: i64) -> u64 {
+    let raw: u64 = match value {
+        Value::Long(v) => *v as u64,
+        Value::Double(v) => v.to_bits(),
+        Value::Int(v) => *v as u32 as u64,
+        Value::Float(v) => v.to_bits() as u64,
+        _ => 0,
+    };
+    match width {
+        1 => raw & 0xff,
+        2 => raw & 0xffff,
+        4 => raw & 0xffff_ffff,
+        _ => raw,
+    }
+}
+
+/// Resolve a `MemorySegment` coordinate's raw access point by reading the
+/// real implementation object's own fields directly (NOT by calling back
+/// into its `unsafeGetBase()`/`unsafeGetOffset()`/`byteSize()` methods — a
+/// reentrant native→bytecode call from inside a native invoked by
+/// JIT-compiled code crashed here; see the fix commit for the observed
+/// fault). Mirrors `sun.misc.Unsafe`'s dual addressing: a null base means
+/// `offset` is an absolute native address; a non-null base means `offset` is
+/// a byte offset into that (possibly heap/GC-managed) array object.
+///
+/// Field layout (real JDK `jdk.internal.foreign` classes, JEP 454):
+/// `AbstractMemorySegmentImpl.length` (byteSize for every concrete subtype);
+/// `NativeMemorySegmentImpl.min` (absolute address; `MappedMemorySegmentImpl`
+/// extends it and inherits the field); `HeapMemorySegmentImpl.base`/`.offset`
+/// (array object + Unsafe-style byte offset into it).
+fn segment_raw_access(
+    ctx: &mut dyn NativeContext,
+    seg: ObjectRef,
+    vh_offset: i64,
+    coord_offset: i64,
+    width: i64,
+) -> Result<(Option<ObjectRef>, i64), MethodCallFailed> {
+    const ABSTRACT_SEGMENT: &str = "jdk/internal/foreign/AbstractMemorySegmentImpl";
+    const NATIVE_SEGMENT: &str = "jdk/internal/foreign/NativeMemorySegmentImpl";
+    const HEAP_SEGMENT: &str = "jdk/internal/foreign/HeapMemorySegmentImpl";
+
+    let class_name = ctx
+        .class_name_of_id(ctx.class_id_of_object(seg))
+        .unwrap_or_default();
+    let (base, base_off) = if class_name.contains("Heap") {
+        let base_idx = ctx.resolve_field_index(HEAP_SEGMENT, "base");
+        let off_idx = ctx.resolve_field_index(HEAP_SEGMENT, "offset");
+        let base = match (base_idx, base_idx.map(|i| ctx.get_field(seg, i))) {
+            (Some(_), Some(Value::Object(b))) => b,
+            _ => None,
+        };
+        let off = match off_idx {
+            Some(i) => match ctx.get_field(seg, i) {
+                Value::Long(n) => n,
+                _ => 0,
+            },
+            None => 0,
+        };
+        (base, off)
+    } else {
+        let off = match ctx.resolve_field_index(NATIVE_SEGMENT, "min") {
+            Some(i) => match ctx.get_field(seg, i) {
+                Value::Long(n) => n,
+                _ => 0,
+            },
+            None => 0,
+        };
+        (None, off)
+    };
+    let size = match ctx.resolve_field_index(ABSTRACT_SEGMENT, "length") {
+        Some(i) => match ctx.get_field(seg, i) {
+            Value::Long(n) => n,
+            _ => 0,
+        },
+        None => 0,
+    };
+    let bounds_err = || {
+        MethodCallFailed::from(RuntimeError::IllegalStateException {
+            message: format!(
+                "Out of bound access on segment: offset={coord_offset}, width={width}, size={size}"
+            ),
+        })
+    };
+    let total_offset = vh_offset.checked_add(coord_offset).ok_or_else(bounds_err)?;
+    let end = total_offset.checked_add(width);
+    if total_offset < 0 || end.map_or(true, |e| e > size) {
+        return Err(bounds_err());
+    }
+    let addr = base_off.checked_add(total_offset).ok_or_else(bounds_err)?;
+    Ok((base, addr))
+}
+
+/// Byte-array-backed heap segment access (the common `MemorySegment.ofArray(byte[])`
+/// case). `addr` is the Unsafe-style absolute byte offset into `base` as returned by
+/// `unsafeGetOffset()`; real `byte[]` segments carry `ARRAY_BYTE_BASE_OFFSET` baked into
+/// that value so it lands directly on `base`'s own element indices.
+fn segment_heap_get(ctx: &mut dyn NativeContext, base: ObjectRef, addr: i64, width: i64) -> Option<u64> {
+    let len = ctx.array_length(base);
+    let start = usize::try_from(addr).ok()?;
+    if start.checked_add(width as usize)? > len {
+        return None;
+    }
+    let mut raw: u64 = 0;
+    for i in 0..width as usize {
+        let byte = match ctx.get_array_element(base, start + i) {
+            Value::Int(b) => b as u8,
+            _ => 0,
+        };
+        raw |= (byte as u64) << (8 * i);
+    }
+    Some(raw)
+}
+
+fn segment_heap_set(ctx: &mut dyn NativeContext, base: ObjectRef, addr: i64, width: i64, raw: u64) -> bool {
+    let len = ctx.array_length(base);
+    let start = match usize::try_from(addr) {
+        Ok(s) => s,
+        Err(_) => return false,
+    };
+    match start.checked_add(width as usize) {
+        Some(end) if end <= len => {}
+        _ => return false,
+    }
+    for i in 0..width as usize {
+        let byte = ((raw >> (8 * i)) & 0xff) as u8 as i8 as i32;
+        ctx.set_array_element(base, start + i, Value::Int(byte));
+    }
+    true
+}
+
+/// Read `width` bytes at a null-base (off-heap) `MemorySegment` address.
+///
+/// `addr` is NOT necessarily a real OS pointer: `Unsafe.allocateMemory` (which
+/// real `Arena.ofConfined()/allocate()` bytecode calls into) hands out
+/// synthetic tagged arena handles (see `unsafe_arena_contains` doc), not real
+/// pointers — dereferencing one directly segfaults. Real `MMapDirectory`
+/// segments (backed by an actual OS mapping) DO carry a real pointer, so both
+/// cases must be handled, exactly mirroring `vm_exec.rs`'s
+/// `copy_from_native_memory`.
+fn segment_native_get(addr: i64, width: i64) -> Result<u64, MethodCallFailed> {
+    if crate::unsafe_arena_contains(addr) {
+        let mut buf = [0u8; 8];
+        if !crate::unsafe_arena_copy_out(addr, &mut buf[..width as usize]) {
+            return Err(RuntimeError::IllegalStateException {
+                message: "Out of bound access on off-heap MemorySegment arena handle".into(),
+            }
+            .into());
+        }
+        return Ok(u64::from_le_bytes(buf));
+    }
+    let ptr = addr as usize as *const u8;
+    if ptr.is_null() {
+        return Err(RuntimeError::IllegalStateException {
+            message: "MemorySegment access via null address".into(),
+        }
+        .into());
+    }
+    // SAFETY: bounds-checked against the segment's declared size and
+    // overflow-checked address arithmetic in `segment_raw_access`; not a
+    // synthetic arena handle (checked above), so this is a real OS pointer.
+    Ok(unsafe {
+        match width {
+            1 => *ptr as u64,
+            2 => *(ptr as *const u16) as u64,
+            4 => *(ptr as *const u32) as u64,
+            _ => *(ptr as *const u64),
+        }
+    })
+}
+
+/// Write `width` bytes at a null-base (off-heap) `MemorySegment` address —
+/// see `segment_native_get`.
+fn segment_native_set(addr: i64, width: i64, raw: u64) -> Result<(), MethodCallFailed> {
+    if crate::unsafe_arena_contains(addr) {
+        let bytes = raw.to_le_bytes();
+        if !crate::unsafe_arena_copy_in(addr, &bytes[..width as usize]) {
+            return Err(RuntimeError::IllegalStateException {
+                message: "Out of bound access on off-heap MemorySegment arena handle".into(),
+            }
+            .into());
+        }
+        return Ok(());
+    }
+    let ptr = addr as usize as *mut u8;
+    if ptr.is_null() {
+        return Err(RuntimeError::IllegalStateException {
+            message: "MemorySegment access via null address".into(),
+        }
+        .into());
+    }
+    // SAFETY: see `segment_native_get`.
+    unsafe {
+        match width {
+            1 => *ptr = raw as u8,
+            2 => *(ptr as *mut u16) = raw as u16,
+            4 => *(ptr as *mut u32) = raw as u32,
+            _ => *(ptr as *mut u64) = raw,
+        }
+    }
+    Ok(())
+}
+
+/// `SegmentVarHandle.get(segment, offset)` — handled inline by `varhandle_get`
+/// once `is_segment_var_handle` matches. Returns `None` (fall through to the
+/// existing dispatch) only if the VarHandle's own fields can't be resolved;
+/// otherwise always produces a value or an error.
+fn segment_vh_get(ctx: &mut dyn NativeContext, this: ObjectRef, args: &[Value]) -> Option<MethodCallResult> {
+    let (enclosing, vh_offset, be) = segment_vh_fields(ctx, this)?;
+    let seg = match args.get(1) {
+        Some(Value::Object(Some(s))) => *s,
+        _ => return Some(Ok(Some(Value::Object(None)))),
+    };
+    let coord_offset = match args.get(2) {
+        Some(Value::Long(n)) => *n,
+        Some(Value::Int(n)) => *n as i64,
+        _ => 0,
+    };
+    let shape = segment_layout_shape(ctx, enclosing);
+    let width = seg_shape_width(shape);
+    Some((|| -> MethodCallResult {
+        let (base, addr) = segment_raw_access(ctx, seg, vh_offset, coord_offset, width)?;
+        let raw = match base {
+            None => segment_native_get(addr, width)?,
+            Some(base_obj) => segment_heap_get(ctx, base_obj, addr, width).ok_or_else(|| {
+                MethodCallFailed::from(RuntimeError::IllegalStateException {
+                    message: "Out of bound access on heap MemorySegment".into(),
+                })
+            })?,
+        };
+        let raw = if be { seg_swap_bytes(raw, width) } else { raw };
+        Ok(Some(seg_decode_value(shape, raw)))
+    })())
+}
+
+/// `SegmentVarHandle.set(segment, offset, value)` — see `segment_vh_get`.
+fn segment_vh_set(ctx: &mut dyn NativeContext, this: ObjectRef, args: &[Value]) -> Option<MethodCallResult> {
+    let (enclosing, vh_offset, be) = segment_vh_fields(ctx, this)?;
+    let seg = match args.get(1) {
+        Some(Value::Object(Some(s))) => *s,
+        _ => return Some(Ok(None)),
+    };
+    let coord_offset = match args.get(2) {
+        Some(Value::Long(n)) => *n,
+        Some(Value::Int(n)) => *n as i64,
+        _ => 0,
+    };
+    let value = args.get(3).cloned().unwrap_or(Value::Int(0));
+    let shape = segment_layout_shape(ctx, enclosing);
+    let width = seg_shape_width(shape);
+    Some((|| -> MethodCallResult {
+        // Direct field read (not `isReadOnly()` invoke_virtual) — see
+        // `segment_raw_access`'s doc comment on avoiding reentrant native→
+        // bytecode calls from inside a native invoked by JIT-compiled code.
+        let is_ro = match ctx.resolve_field_index(
+            "jdk/internal/foreign/AbstractMemorySegmentImpl",
+            "readOnly",
+        ) {
+            Some(i) => matches!(ctx.get_field(seg, i), Value::Int(n) if n != 0),
+            None => false,
+        };
+        if is_ro {
+            return Err(RuntimeError::IllegalStateException {
+                message: "Attempted write on read-only MemorySegment".into(),
+            }
+            .into());
+        }
+        let (base, addr) = segment_raw_access(ctx, seg, vh_offset, coord_offset, width)?;
+        let mut raw = seg_encode_value(&value, width);
+        if be {
+            raw = seg_swap_bytes(raw, width);
+        }
+        match base {
+            None => segment_native_set(addr, width, raw)?,
+            Some(base_obj) => {
+                if !segment_heap_set(ctx, base_obj, addr, width, raw) {
+                    return Err(RuntimeError::IllegalStateException {
+                        message: "Out of bound access on heap MemorySegment".into(),
+                    }
+                    .into());
+                }
+            }
+        }
+        Ok(None)
+    })())
+}
+
 /// VarHandle.get(receiver) → value
 /// Signature-polymorphic: args arrive as individual values from the call-site,
 /// i.e. args = [vh_ref, receiver] for instance fields.
 fn varhandle_get(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = obj_arg(args, 0)?;
+    // `SegmentVarHandle` (JEP 454 FFM API): a distinct real class with its own
+    // (real) fields, no synthetic VH_KIND entry. Must be checked before the
+    // meta/array/byte-view paths below, which don't apply to it.
+    if is_segment_var_handle(ctx, this) {
+        if let Some(result) = segment_vh_get(ctx, this, args) {
+            return result;
+        }
+    }
     // Round-7 HIGH-2 fix: fetch the side-table meta exactly once and reuse
     // the bound Arc for `kind`/`field_index`/`class_name`/`field_name`/
     // `field_desc`. Previously each helper (`vh_meta_get`, `vh_type_desc`,
@@ -1374,6 +1778,12 @@ fn varhandle_get(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResul
 /// i.e. args = [vh_ref, receiver, value] for instance fields.
 fn varhandle_set(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = obj_arg(args, 0)?;
+    // `SegmentVarHandle` (JEP 454 FFM API): see the matching check in `varhandle_get`.
+    if is_segment_var_handle(ctx, this) {
+        if let Some(result) = segment_vh_set(ctx, this, args) {
+            return result;
+        }
+    }
     // Round-7 HIGH-2 fix: bind the Arc once and reuse for kind / field_index
     // / class+field lookups instead of re-locking `vh_meta_table` each branch.
     let meta = vh_meta_get(ctx, this);
