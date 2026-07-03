@@ -3999,91 +3999,90 @@ impl GenerationalHeap {
         // mark_if_young: mark a candidate young pointer and enqueue it.
         // SAFETY contract: `ptr` is only dereferenced after `in_young`
         // confirms it lands inside the live from-space region.
-        let mut mark_young = |ptr: *mut u8,
-                              worklist: &mut Vec<*mut u8>,
-                              side_marks: &mut FxHashSet<usize>| {
-            let addr = ptr as usize;
-            if !in_young(addr) {
-                return;
-            }
-            // SAFETY: `in_young` confirmed `addr` is an 8-byte-aligned
-            // address inside the live from-space region, so reading an
-            // ObjectHeader there is valid.
-            let header = unsafe { &mut *(ptr as *mut ObjectHeader) };
-            // Reject implausible headers — a conservative root may point
-            // at a non-object word. `is_object_address`-style sanity.
-            // Multi-array reloc fix (2026-05-22): `num_slots` mirrors
-            // `array_length` for arrays, so a legitimate 256 MB int[] has
-            // num_slots = 2^26 > 1<<24 and would be skipped (then swept as
-            // garbage, despite being a live root). Gate num_slots on
-            // non-arrays; bound array_length at the JVM ceiling.
-            let kind_byte = header.kind as u8;
-            let is_array = header.kind == ObjectKind::Array;
-            if kind_byte > 1
-                || (!is_array && header.num_slots > (1 << 24))
-                || (is_array && header.array_length > i32::MAX as u32)
-            {
-                return;
-            }
-            // DoHead comb-7 fix (2026-07-03): also validate the object's
-            // EXTENT. The field bounds above still admit a corrupt header
-            // claiming millions of elements (array_length is only capped at
-            // i32::MAX), and the BFS scan (`for_each_ref_slot`) iterates
-            // that count with the header as its ONLY bound — a claimed
-            // extent past from-space ran the scan off the mapped arena
-            // (observed: main-vm SIGSEGV at the region boundary, corrupt
-            // header claiming array_length=7,775,429 — the JIT inline-alloc
-            // kind/array_length fault family). A real object's extent always
-            // fits inside the arena it was allocated from, so an
-            // out-of-extent header is definitionally corrupt: never mark or
-            // scan it (its "referents" would be garbage reads anyway).
-            let total = gen_object_total_size(header);
-            if total < HEADER_SIZE || addr + total > from_end {
-                let n = SWEEP_BAD_EXTENT_HITS.fetch_add(1, Ordering::Relaxed);
-                if n < 8 {
-                    // Attribution diagnostic: dump the words around the
-                    // rejected "header" so the upstream corruptor face is
-                    // identifiable (stale packed-pointer reuse shows heap
-                    // pointers; a clobbered real header shows a torn mix).
-                    let lo = addr.saturating_sub(32).max(from_base);
-                    let mut hex = String::new();
-                    let mut w = lo;
-                    while w + 8 <= (addr + 48).min(from_end) {
-                        // SAFETY: `[from_base, from_end)` is mapped arena
-                        // memory and `w` is 8-aligned within it.
-                        let v = unsafe { *((w & !7) as *const u64) };
-                        hex.push_str(&format!("{:#x}:{:016x} ", w & !7, v));
-                        w += 8;
-                    }
-                    tracing::warn!(
-                        "mark_young: rejecting object at {:#x} with implausible extent \
+        let mut mark_young =
+            |ptr: *mut u8, worklist: &mut Vec<*mut u8>, side_marks: &mut FxHashSet<usize>| {
+                let addr = ptr as usize;
+                if !in_young(addr) {
+                    return;
+                }
+                // SAFETY: `in_young` confirmed `addr` is an 8-byte-aligned
+                // address inside the live from-space region, so reading an
+                // ObjectHeader there is valid.
+                let header = unsafe { &mut *(ptr as *mut ObjectHeader) };
+                // Reject implausible headers — a conservative root may point
+                // at a non-object word. `is_object_address`-style sanity.
+                // Multi-array reloc fix (2026-05-22): `num_slots` mirrors
+                // `array_length` for arrays, so a legitimate 256 MB int[] has
+                // num_slots = 2^26 > 1<<24 and would be skipped (then swept as
+                // garbage, despite being a live root). Gate num_slots on
+                // non-arrays; bound array_length at the JVM ceiling.
+                let kind_byte = header.kind as u8;
+                let is_array = header.kind == ObjectKind::Array;
+                if kind_byte > 1
+                    || (!is_array && header.num_slots > (1 << 24))
+                    || (is_array && header.array_length > i32::MAX as u32)
+                {
+                    return;
+                }
+                // DoHead comb-7 fix (2026-07-03): also validate the object's
+                // EXTENT. The field bounds above still admit a corrupt header
+                // claiming millions of elements (array_length is only capped at
+                // i32::MAX), and the BFS scan (`for_each_ref_slot`) iterates
+                // that count with the header as its ONLY bound — a claimed
+                // extent past from-space ran the scan off the mapped arena
+                // (observed: main-vm SIGSEGV at the region boundary, corrupt
+                // header claiming array_length=7,775,429 — the JIT inline-alloc
+                // kind/array_length fault family). A real object's extent always
+                // fits inside the arena it was allocated from, so an
+                // out-of-extent header is definitionally corrupt: never mark or
+                // scan it (its "referents" would be garbage reads anyway).
+                let total = gen_object_total_size(header);
+                if total < HEADER_SIZE || addr + total > from_end {
+                    let n = SWEEP_BAD_EXTENT_HITS.fetch_add(1, Ordering::Relaxed);
+                    if n < 8 {
+                        // Attribution diagnostic: dump the words around the
+                        // rejected "header" so the upstream corruptor face is
+                        // identifiable (stale packed-pointer reuse shows heap
+                        // pointers; a clobbered real header shows a torn mix).
+                        let lo = addr.saturating_sub(32).max(from_base);
+                        let mut hex = String::new();
+                        let mut w = lo;
+                        while w + 8 <= (addr + 48).min(from_end) {
+                            // SAFETY: `[from_base, from_end)` is mapped arena
+                            // memory and `w` is 8-aligned within it.
+                            let v = unsafe { *((w & !7) as *const u64) };
+                            hex.push_str(&format!("{:#x}:{:016x} ", w & !7, v));
+                            w += 8;
+                        }
+                        tracing::warn!(
+                            "mark_young: rejecting object at {:#x} with implausible extent \
                          {} (kind={}, array_len={}, num_slots={}) — corrupt header, \
                          not marked/scanned; context {}",
-                        addr,
-                        total,
-                        kind_byte,
-                        header.array_length,
-                        header.num_slots,
-                        hex,
-                    );
+                            addr,
+                            total,
+                            kind_byte,
+                            header.array_length,
+                            header.num_slots,
+                            hex,
+                        );
+                    }
+                    return;
                 }
-                return;
-            }
-            // Zero first-header-word candidates take the SIDE path: alive and
-            // traced, but the header is NEVER written (see side_marks above).
-            // SAFETY: `addr` is 8-aligned inside mapped from-space.
-            let word0 = unsafe { *(ptr as *const u64) };
-            if word0 == 0 {
-                if side_marks.insert(addr) {
+                // Zero first-header-word candidates take the SIDE path: alive and
+                // traced, but the header is NEVER written (see side_marks above).
+                // SAFETY: `addr` is 8-aligned inside mapped from-space.
+                let word0 = unsafe { *(ptr as *const u64) };
+                if word0 == 0 {
+                    if side_marks.insert(addr) {
+                        worklist.push(ptr);
+                    }
+                    return;
+                }
+                if header.gc_flags & GC_FLAG_MARKED == 0 {
+                    header.gc_flags |= GC_FLAG_MARKED;
                     worklist.push(ptr);
                 }
-                return;
-            }
-            if header.gc_flags & GC_FLAG_MARKED == 0 {
-                header.gc_flags |= GC_FLAG_MARKED;
-                worklist.push(ptr);
-            }
-        };
+            };
 
         // Seed: precise + conservative roots gathered by the caller.
         for root in roots.iter() {
