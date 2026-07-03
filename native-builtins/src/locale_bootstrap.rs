@@ -525,6 +525,41 @@ pub fn register(registry: &mut NativeMethodRegistry) {
         "(Ljava/util/Locale$Category;)Ljava/util/Locale;",
         |ctx, _args| get_or_create_default(ctx),
     );
+    // java.util.Locale.setDefault(Locale) / setDefault(Category, Locale) —
+    // since `getDefault()` above is hard-overridden to read our own cache
+    // instead of the real JDK's `defaultLocale` static field, `setDefault`
+    // must write to that SAME cache or it becomes a no-op from the caller's
+    // perspective: `Locale.setDefault(GERMAN); Locale.getDefault()` would
+    // keep returning the original cached en_US Locale. Both real JDK
+    // overloads set the same process-wide default (the Category variant only
+    // matters for the JDK's own DISPLAY/FORMAT split, which we don't track
+    // separately), so both write the one cache `getDefault()` reads. Verified
+    // against real JDK 25 that this is required for
+    // `ResourceBundle.Control.getFallbackLocale`'s `Locale.getDefault()`
+    // fallback (see `locale_resources::resolve_fallback_locale`) to see a
+    // `setDefault` call made earlier in the same test/run.
+    registry.register(
+        "java/util/Locale",
+        "setDefault",
+        "(Ljava/util/Locale;)V",
+        |_ctx, args| {
+            if let Some(Value::Object(Some(loc))) = args.first() {
+                *cached_default_locale().lock() = Some(*loc);
+            }
+            Ok(None)
+        },
+    );
+    registry.register(
+        "java/util/Locale",
+        "setDefault",
+        "(Ljava/util/Locale$Category;Ljava/util/Locale;)V",
+        |_ctx, args| {
+            if let Some(Value::Object(Some(loc))) = args.get(1) {
+                *cached_default_locale().lock() = Some(*loc);
+            }
+            Ok(None)
+        },
+    );
 
     // Note: `ResourceBundle$Control.getCandidateLocales` override is
     // registered from `register_essential_natives` (real-JDK path),

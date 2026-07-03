@@ -34,7 +34,7 @@
 //! These cover real gaps elsewhere in the bootstrap and are documented inline.
 
 use cratonvm_native_api::{DefineClassFull, NativeContext, NativeMethodRegistry};
-use cratonvm_types::error::MethodCallResult;
+use cratonvm_types::error::{MethodCallFailed, MethodCallResult};
 use cratonvm_types::{ObjectRef, Value};
 use parking_lot::Mutex;
 use std::sync::OnceLock;
@@ -1065,9 +1065,9 @@ pub fn register(registry: &mut NativeMethodRegistry) {
             };
             match resolve_bean_class_field(ctx, this) {
                 BeanClassResolution::Resolved(mirror) => Ok(Some(Value::Object(Some(mirror)))),
-                BeanClassResolution::Missing | BeanClassResolution::NoClass => {
-                    Ok(Some(Value::Object(None)))
-                }
+                BeanClassResolution::Missing
+                | BeanClassResolution::NoClass
+                | BeanClassResolution::Placeholder => Ok(Some(Value::Object(None))),
             }
         },
     );
@@ -1503,72 +1503,36 @@ fn abstract_bean_definition_get_bean_class_name(
         _ => return Ok(Some(Value::Object(None))),
     };
 
-    // Probe the classpath. Spring uses dotted names; CratonVM uses internal
-    // (slash-separated) names. Try both forms so we don't false-negative on
-    // legitimately-loadable classes.
-    //
-    // We deliberately do NOT call `ctx.load_class()` here — `getBeanClassName`
-    // is called many times during context refresh, and triggering a load
-    // (with the side-effect of running clinit) per call is too heavy and
-    // would regress unrelated paths.  By the time Spring reaches an
-    // instantiation site that depends on the class being resolved, our
-    // existing `resolveBeanClass` / `doResolveBeanClass` shims will already
-    // have attempted `ensure_class_initialized`, so a class that's truly on
-    // the classpath will have a ClassId by this point.
-    let internal = name.replace('.', "/");
-    let mut loadable = ctx.class_id_by_name(&internal).is_some()
-        || ctx.class_id_by_name(&name).is_some()
-        // FIX(bug-B): a bean class can be ON the classpath but not yet LOADED —
-        // lazily-resolved nested / method-injection / proxied bean classes (e.g.
-        // a `<lookup-method>` AbstractBean) are loaded only at the instantiation
-        // site. `class_id_by_name` is a loaded-SET lookup, so it false-negatives
-        // those, and we used to hide a legitimately-loadable bean → this getter
-        // returned null → Spring instantiated a null instance → BeanWrapperImpl
-        // asserted "Target object must not be null". Probe the classpath resource
-        // (no clinit) so ONLY genuinely-absent classes are hidden.
-        || ctx.find_resource(&format!("{internal}.class")).is_some();
-
-    // FIX: nested-class dotted convention. Spring XML/reflection allows a
-    // nested class to be named with a DOT before the nested segment (e.g.
-    // "com.example.Outer.Inner", matching `ClassUtils.forName`'s own
-    // last-dot-to-`$` fallback at ClassUtils.java:308-318) even though the
-    // real class-file path uses `$` ("com/example/Outer$Inner.class"). The
-    // naive `name.replace('.', "/")` above turns every dot into a slash,
-    // producing a resource path that never exists, so a legitimately
-    // loadable nested-class bean (e.g. an `<aop:aspect ref="testAspect">`
-    // pointing at a test's static nested aspect class) was wrongly hidden —
-    // observed as `MethodLocatingFactoryBean` throwing "Can't determine type
-    // of bean with name 'testAspect'" because `getBeanClassName()` returned
-    // null. Mirror the same single-level last-dot substitution before
-    // giving up.
-    if !loadable {
-        if let Some(last_dot) = name.rfind('.') {
-            let nested_dotted = format!("{}${}", &name[..last_dot], &name[last_dot + 1..]);
-            let nested_internal = nested_dotted.replace('.', "/");
-            if ctx.class_id_by_name(&nested_internal).is_some()
-                || ctx.class_id_by_name(&nested_dotted).is_some()
-                || ctx
-                    .find_resource(&format!("{nested_internal}.class"))
-                    .is_some()
-            {
-                loadable = true;
-            }
-        }
-    }
-
-    if !loadable {
-        tracing::warn!(
-            "[bean-filter] hiding bean class '{}' — not loadable on partial classpath",
-            name
-        );
-        return Ok(Some(Value::Object(None)));
-    }
-
-    // Class IS loadable — return the canonical (dotted) name so Spring's
-    // happy path runs unchanged.
+    // Historically this getter hid an unloadable class name behind a
+    // classpath probe (returning null instead of the raw string) so
+    // `preInstantiateSingletons`'s type-probing scan wouldn't crash on a
+    // partial classpath. That filtering lived at the WRONG layer: real
+    // bytecode's `getBeanClassName()` does zero loadability filtering — it
+    // unconditionally returns the raw string — and several other Spring
+    // internals depend on that: `BeanDefinitionVisitor.visitBeanClassName`
+    // needs the raw (possibly still-`${...}`-placeholder) string to run
+    // `PropertyPlaceholderConfigurer` substitution
+    // (`ClassPathXmlApplicationContextTests.
+    // contextWithClassNameThatContainsPlaceholder`), and — critically —
+    // `AbstractBeanDefinition`'s copy constructor
+    // (`new RootBeanDefinition(original)`, used to build every MERGED bean
+    // definition) calls `setBeanClassName(original.getBeanClassName())`. A
+    // null here doesn't just affect the currently-probing caller: it
+    // permanently wipes the real `beanClass` field on the merged copy — the
+    // copy `AbstractAutowireCapableBeanFactory.createBeanInstance` actually
+    // instantiates from — turning a genuinely-missing-class bean's failure
+    // from `CannotLoadBeanClassException` (real HotSpot) into
+    // `IllegalStateException: No bean class specified on bean definition`
+    // even for an EXPLICIT `getBean()` call that should fail loudly
+    // (`ClassPathXmlApplicationContextTests.contextWithInvalidLazyClass`).
+    // The "gracefully skip during boot type-probing" protection this used to
+    // provide is now handled at the correct layer — `resolveBeanClass`/
+    // `doResolveBeanClass` (`m4`/`m5` below), which DO see `typesToMatch` and
+    // so can distinguish a type-probe (tolerate + remove) from a real
+    // instantiation attempt (throw) — so this getter can go back to being a
+    // pure, unfiltered passthrough like the real bytecode.
     let dotted = name.replace('/', ".");
-    let s = ctx.create_string(&dotted);
-    Ok(Some(Value::Object(Some(s))))
+    Ok(Some(Value::Object(Some(ctx.create_string(&dotted)))))
 }
 
 /// `BeanWrapperImpl.getWrappedInstance()` — return the stored wrapped target,
@@ -2323,9 +2287,16 @@ fn s_instantiation_strategy_instantiate(
             }
             .into());
         }
-        // Named but genuinely unresolvable (not on the classpath) — return
-        // null, matching the prior "String not yet resolved — skip" behavior.
-        BeanClassResolution::Missing => {
+        // Named but genuinely unresolvable (not on the classpath), or still
+        // carrying an unresolved `${...}` placeholder — return null, matching
+        // the prior "String not yet resolved — skip" behavior. In practice
+        // `createBeanInstance`'s earlier `resolveBeanClass(mbd, beanName)`
+        // call (see `m4`/`m5`) now throws first for a genuinely-missing or
+        // still-unresolved-placeholder class, so this instantiation strategy
+        // is only reached once that has already succeeded; this arm stays
+        // permissive as a fallback for any path that reaches `instantiate`
+        // without going through `resolveBeanClass` first.
+        BeanClassResolution::Missing | BeanClassResolution::Placeholder => {
             tracing::debug!(
                 "[spring-shim] SimpleInstantiationStrategy.instantiate: beanClass unresolvable — skipping"
             );
@@ -2483,6 +2454,21 @@ enum BeanClassResolution {
     /// `resolveBeanClass` returns `null` here WITHOUT touching the registry —
     /// these beans are created another way and MUST NOT be removed.
     NoClass,
+    /// The class name still contains an unresolved `${...}` placeholder
+    /// (`org.springframework.context.support.${msClass}`). This is NOT a
+    /// genuinely-missing class — it's transiently unresolvable until a
+    /// `PropertyPlaceholderConfigurer`/`PropertySourcesPlaceholderConfigurer`
+    /// `BeanFactoryPostProcessor` substitutes it, which may not have run yet
+    /// (e.g. during `invokeBeanFactoryPostProcessors`'s own type-matching scan
+    /// over every registered bean, used to discover
+    /// `PriorityOrdered`/`Ordered` `BeanFactoryPostProcessor`s — this probes
+    /// `someMessageSource` itself before its own placeholder gets resolved).
+    /// Real Spring anticipates exactly this: `DefaultListableBeanFactory
+    /// .doGetBeanNamesForType` catches `CannotLoadBeanClassException` from a
+    /// type-match probe with the comment "Probably a placeholder: let's
+    /// ignore it for type matching purposes" — and critically does NOT
+    /// remove the bean definition, unlike the genuinely-missing-class case.
+    Placeholder,
 }
 
 /// Resolve `internal` (the plain dot-to-slash conversion of `dotted`) to a
@@ -2559,6 +2545,17 @@ fn resolve_bean_class_field(ctx: &mut dyn NativeContext, recv: ObjectRef) -> Bea
         }
     };
 
+    // An unresolved `${...}` placeholder is never a real, probeable class
+    // name — skip the classpath probe (which could never succeed) and report
+    // it distinctly from a genuinely-missing class so callers don't purge the
+    // bean definition over what is only a transient, not-yet-substituted name.
+    if name.contains("${") {
+        if dbg {
+            eprintln!("[resolve-shim] Placeholder: {name} not yet resolved");
+        }
+        return BeanClassResolution::Placeholder;
+    }
+
     // Resolve the name to a Class; only classes actually on the classpath
     // succeed (a named-but-unloadable class yields Missing → partial-cp skip).
     // Mirrors `ClassUtils.forName`'s dot-vs-dollar nested-class fallback: XML
@@ -2622,27 +2619,170 @@ fn m3_abstract_bean_definition_resolve_bean_class(
     // else null (no CNFE) — like the real bytecode, no registry mutation here.
     let resolved = match resolve_bean_class_field(ctx, recv) {
         BeanClassResolution::Resolved(m) => Some(m),
-        BeanClassResolution::Missing | BeanClassResolution::NoClass => None,
+        BeanClassResolution::Missing
+        | BeanClassResolution::NoClass
+        | BeanClassResolution::Placeholder => None,
     };
     Ok(Some(Value::Object(resolved)))
+}
+
+/// Real `doResolveBeanClass`/`resolveBeanClass(RootBeanDefinition, String,
+/// Class<?>...)`'s own doc comment: a non-empty `typesToMatch` "signals that
+/// the returned Class will never be exposed to application code" — i.e. an
+/// internal type-probe (`predictBeanType`, `isFactoryBean`, …) that real
+/// Spring itself expects to tolerate an unresolvable class. An EMPTY
+/// `typesToMatch` is the real instantiation-time call
+/// (`createBeanInstance`'s `resolveBeanClass(mbd, beanName)`), where real
+/// HotSpot bytecode catches `ClassNotFoundException` and rethrows
+/// `CannotLoadBeanClassException` — so `Missing` must propagate there instead
+/// of being swallowed to null, or `getBean()` on a bean with a genuinely
+/// unloadable class name returns silently instead of throwing
+/// (`ClassPathXmlApplicationContextTests.contextWithInvalidLazyClass`).
+fn types_to_match_is_empty(ctx: &dyn NativeContext, args: &[Value], idx: usize) -> bool {
+    match args.get(idx) {
+        Some(Value::Object(Some(arr))) => ctx.array_length(*arr) == 0,
+        _ => true,
+    }
+}
+
+/// Build (but do not throw) a `java.lang.ClassNotFoundException` for
+/// `class_name`, mirroring what `Class.forName`/`ClassLoader.loadClass`
+/// would raise for the same name.
+fn build_class_not_found(ctx: &mut dyn NativeContext, class_name: &str) -> ObjectRef {
+    let exc = crate::alloc_concurrent_synthetic(ctx, "java/lang/ClassNotFoundException", 1);
+    let msg = ctx.create_string(class_name);
+    ctx.set_field(exc, 0, Value::Object(Some(msg)));
+    exc
+}
+
+/// Throw `java.lang.ClassNotFoundException` for `class_name` directly
+/// (uncaught/unwrapped) — used by callers (`m4`, the private
+/// `doResolveBeanClass`) that don't have a `beanName` handy to build the
+/// properly-wrapped `CannotLoadBeanClassException` real Spring's PUBLIC
+/// `resolveBeanClass` wrapper produces; see
+/// [`throw_cannot_load_bean_class_exception`] for that case.
+fn throw_class_not_found(ctx: &mut dyn NativeContext, class_name: &str) -> MethodCallFailed {
+    MethodCallFailed::ExceptionThrown(build_class_not_found(ctx, class_name))
+}
+
+/// Construct and throw a real
+/// `org.springframework.beans.factory.CannotLoadBeanClassException` wrapping
+/// a `ClassNotFoundException` cause, matching what real bytecode's
+/// `AbstractBeanFactory.resolveBeanClass(RootBeanDefinition, String,
+/// Class<?>...)` does in its `catch (ClassNotFoundException ex) { throw new
+/// CannotLoadBeanClassException(...); }` block. Since `m5` (this method's
+/// native override) fully REPLACES that method — no real bytecode ever runs,
+/// so no real try/catch is there to do the wrapping — throwing a bare
+/// `ClassNotFoundException` from the native would propagate uncaught instead
+/// of surfacing as `CannotLoadBeanClassException`
+/// (`ClassPathXmlApplicationContextTests.contextWithInvalidLazyClass` expects
+/// `CannotLoadBeanClassException.withCauseExactlyInstanceOf(ClassNotFoundException
+/// .class)`), so the wrapping must happen here instead.
+fn throw_cannot_load_bean_class_exception(
+    ctx: &mut dyn NativeContext,
+    resource_description: Option<&str>,
+    bean_name: &str,
+    bean_class_name: &str,
+) -> MethodCallFailed {
+    let cause = build_class_not_found(ctx, bean_class_name);
+    match ctx.new_object("org/springframework/beans/factory/CannotLoadBeanClassException") {
+        Ok(Some(Value::Object(Some(exc)))) => {
+            let resource_val = match resource_description {
+                Some(s) => Value::Object(Some(ctx.create_string(s))),
+                None => Value::Object(None),
+            };
+            let name_val = Value::Object(Some(ctx.create_string(bean_name)));
+            let class_name_val = Value::Object(Some(ctx.create_string(bean_class_name)));
+            let _ = ctx.invoke(
+                "org/springframework/beans/factory/CannotLoadBeanClassException",
+                "<init>",
+                "(Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;Ljava/lang/ClassNotFoundException;)V",
+                &[
+                    Value::Object(Some(exc)),
+                    resource_val,
+                    name_val,
+                    class_name_val,
+                    Value::Object(Some(cause)),
+                ],
+            );
+            MethodCallFailed::ExceptionThrown(exc)
+        }
+        _ => MethodCallFailed::ExceptionThrown(cause),
+    }
+}
+
+/// Best-effort `mbd.getResourceDescription()` (a plain, side-effect-free
+/// bytecode getter) for the `CannotLoadBeanClassException` message; `None` on
+/// any failure (e.g. the field/method isn't resolvable on this definition
+/// type) rather than propagating an unrelated error from exception
+/// construction itself.
+fn resource_description_of(ctx: &mut dyn NativeContext, mbd: ObjectRef) -> Option<String> {
+    match ctx.invoke_virtual(
+        mbd,
+        "getResourceDescription",
+        "()Ljava/lang/String;",
+        &[],
+    ) {
+        Ok(Some(Value::Object(Some(s)))) => ctx.read_string(s),
+        _ => None,
+    }
+}
+
+/// Read the `lazyInit` field directly (a boxed `Boolean`, null unless
+/// explicitly set via `lazy-init="true"`/`setLazyInit(true)`) rather than
+/// calling `isLazyInit()` — matches the field-access pattern already used
+/// throughout this file for `beanClass`/`beanClassName` and avoids any
+/// virtual-dispatch uncertainty.
+fn is_lazy_init(ctx: &dyn NativeContext, bd: ObjectRef) -> bool {
+    matches!(
+        ctx.get_field_by_name(bd, "lazyInit"),
+        Value::Object(Some(o)) if matches!(
+            ctx.get_field_by_name(o, "value"),
+            Value::Int(n) if n != 0
+        )
+    )
+}
+
+/// Read the still-unresolved class name off `mbd`'s `beanClass`/`beanClassName`
+/// field, for use in a `ClassNotFoundException` message when resolution fails.
+fn unresolved_bean_class_name(ctx: &dyn NativeContext, mbd: ObjectRef) -> String {
+    match ctx.get_field_by_name(mbd, "beanClass") {
+        Value::Object(Some(o)) => ctx.read_string(o).unwrap_or_default(),
+        _ => match ctx.get_field_by_name(mbd, "beanClassName") {
+            Value::Object(Some(s)) => ctx.read_string(s).unwrap_or_default(),
+            _ => String::new(),
+        },
+    }
 }
 
 fn m4_abstract_bean_factory_do_resolve_bean_class(
     ctx: &mut dyn NativeContext,
     args: &[Value],
 ) -> MethodCallResult {
-    // args[0] = this (AbstractBeanFactory), args[1] = mbd (RootBeanDefinition)
+    // args[0] = this (AbstractBeanFactory), args[1] = mbd (RootBeanDefinition),
+    // args[2] = typesToMatch (Class[])
     let mbd = match args.get(1) {
         Some(Value::Object(Some(o))) => *o,
         _ => return Ok(Some(Value::Object(None))),
     };
     // Resolve from the real `beanClass` field (mirror or String name); null for
     // a missing/absent class — like the real bytecode, no registry mutation.
-    let resolved = match resolve_bean_class_field(ctx, mbd) {
-        BeanClassResolution::Resolved(m) => Some(m),
-        BeanClassResolution::Missing | BeanClassResolution::NoClass => None,
-    };
-    Ok(Some(Value::Object(resolved)))
+    match resolve_bean_class_field(ctx, mbd) {
+        BeanClassResolution::Resolved(m) => Ok(Some(Value::Object(Some(m)))),
+        BeanClassResolution::NoClass => Ok(Some(Value::Object(None))),
+        // A still-unresolved `${...}` placeholder tolerates a type-probe
+        // (non-empty typesToMatch — the class may resolve once a
+        // PlaceholderConfigurer runs) but must fail loudly for a real
+        // instantiation attempt, exactly like `Missing`.
+        BeanClassResolution::Missing | BeanClassResolution::Placeholder => {
+            if types_to_match_is_empty(ctx, args, 2) {
+                let name = unresolved_bean_class_name(ctx, mbd);
+                Err(throw_class_not_found(ctx, &name))
+            } else {
+                Ok(Some(Value::Object(None)))
+            }
+        }
+    }
 }
 
 /// Strategy B: `AbstractBeanFactory.resolveBeanClass(RootBeanDefinition,
@@ -2690,8 +2830,109 @@ fn m5_abstract_bean_factory_resolve_bean_class_with_name(
             // residual: AfterThrowing lost 'testBean' via this path).
             return Ok(Some(Value::Object(None)));
         }
+        BeanClassResolution::Placeholder => {
+            // A still-unresolved `${...}` placeholder is NOT a genuinely
+            // missing class — it's transiently unresolvable until a
+            // `PropertyPlaceholderConfigurer` runs, which may not have
+            // happened yet (`invokeBeanFactoryPostProcessors`'s own
+            // type-matching scan over every registered bean, e.g. to find
+            // `PriorityOrdered` `BeanFactoryPostProcessor`s, probes this
+            // very bean before its own placeholder is substituted). Real
+            // Spring's `DefaultListableBeanFactory.doGetBeanNamesForType`
+            // catches exactly this (`CannotLoadBeanClassException` during a
+            // type-match probe, comment: "Probably a placeholder: let's
+            // ignore it for type matching purposes") and — critically —
+            // does NOT remove the bean definition. Only an EMPTY
+            // `typesToMatch` (the real instantiation-time call) should fail:
+            // if the placeholder is STILL unresolved once Spring actually
+            // tries to create the bean (all BeanFactoryPostProcessors have
+            // by definition already run by then), that's a genuine failure,
+            // matching real HotSpot's `CannotLoadBeanClassException` — but
+            // still without removing the definition, since a removed bean
+            // can never be retried and real HotSpot never removes it either.
+            return if types_to_match_is_empty(ctx, args, 3) {
+                let name = unresolved_bean_class_name(ctx, mbd);
+                let bean_name = bean_name_obj
+                    .and_then(|v| match v {
+                        Value::Object(Some(s)) => ctx.read_string(s),
+                        _ => None,
+                    })
+                    .unwrap_or_default();
+                let resource_description = resource_description_of(ctx, mbd);
+                Err(throw_cannot_load_bean_class_exception(
+                    ctx,
+                    resource_description.as_deref(),
+                    &bean_name,
+                    &name,
+                ))
+            } else {
+                Ok(Some(Value::Object(None)))
+            };
+        }
         BeanClassResolution::Missing => { /* fall through to removal */ }
     }
+
+    // An EMPTY `typesToMatch` (args[3]) is the real instantiation-time call —
+    // `AbstractAutowireCapableBeanFactory.createBeanInstance`'s
+    // `resolveBeanClass(mbd, beanName)` — where real HotSpot bytecode's
+    // `resolveBeanClass` catches `ClassNotFoundException` from
+    // `doResolveBeanClass` and rethrows `CannotLoadBeanClassException`. The
+    // partial-classpath removal below is only appropriate for the type-probe
+    // overload (non-empty `typesToMatch`, e.g. `isFactoryBean`/
+    // `predictBeanType` scanning every registered bean during boot) — a bean
+    // explicitly reached for real instantiation must fail loudly instead of
+    // silently vanishing, matching real Spring's contract
+    // (`ClassPathXmlApplicationContextTests.contextWithInvalidLazyClass`
+    // expects `CannotLoadBeanClassException` from `getBean()` on a
+    // lazy-init bean whose class name doesn't exist).
+    if types_to_match_is_empty(ctx, args, 3) {
+        let name = unresolved_bean_class_name(ctx, mbd);
+        let bean_name = bean_name_obj
+            .and_then(|v| match v {
+                Value::Object(Some(s)) => ctx.read_string(s),
+                _ => None,
+            })
+            .unwrap_or_default();
+        let resource_description = resource_description_of(ctx, mbd);
+        return Err(throw_cannot_load_bean_class_exception(
+            ctx,
+            resource_description.as_deref(),
+            &bean_name,
+            &name,
+        ));
+    }
+
+    // Non-empty `typesToMatch` (a type-probe) on a `lazy-init="true"` bean
+    // whose class is genuinely missing: tolerate it for THIS probe (return
+    // null, matching the `Missing`-without-removal contract) but do NOT
+    // remove the definition. `preInstantiateSingletons` never eagerly
+    // resolves a lazy bean's class, so there is no partial-classpath
+    // boot-crash risk in leaving it registered — and removing it here would
+    // make a later explicit `getBean()` see `NoSuchBeanDefinitionException`
+    // instead of the `CannotLoadBeanClassException` real Spring throws
+    // (`ClassPathXmlApplicationContextTests.contextWithInvalidLazyClass`).
+    // This mirrors `bdru_register_bean_definition`'s registration-time guard
+    // for the exact same bean — that guard alone isn't sufficient because
+    // `invokeBeanFactoryPostProcessors`'s own type-matching scan (finding
+    // `PriorityOrdered`/`Ordered` `BeanFactoryPostProcessor`s) probes EVERY
+    // registered bean, lazy or not, via this non-empty-typesToMatch path,
+    // independently of registration.
+    if is_lazy_init(ctx, mbd) {
+        return Ok(Some(Value::Object(None)));
+    }
+
+    let removed_bean_name = bean_name_obj
+        .and_then(|v| match v {
+            Value::Object(Some(s)) => ctx.read_string(s),
+            _ => None,
+        })
+        .unwrap_or_default();
+    let removed_class_name = unresolved_bean_class_name(ctx, mbd);
+    tracing::warn!(
+        "[bean-orphan] m5: removing '{}' (class '{}' not loadable, non-lazy, non-empty typesToMatch)",
+        removed_bean_name,
+        removed_class_name
+    );
 
     // Class not on classpath. Remove the bean definition so Spring's
     // preInstantiateSingletons won't trip over it later.
@@ -2869,7 +3110,44 @@ fn bdru_register_bean_definition(ctx: &mut dyn NativeContext, args: &[Value]) ->
         ctx.invoke_virtual(bd, "getBeanClassName", "()Ljava/lang/String;", &[])
     {
         if let Some(cn) = ctx.read_string(s) {
-            if !cn.is_empty() {
+            // A class name still containing an unresolved `${...}` placeholder
+            // (e.g. `org.springframework.context.support.${msClass}`) is not
+            // a genuinely-missing class — it's transiently unresolvable until
+            // a `PropertyPlaceholderConfigurer` runs during
+            // `invokeBeanFactoryPostProcessors`, which happens AFTER every
+            // bean definition (including this one) is already registered.
+            // Dropping the registration here permanently loses the bean
+            // before the placeholder ever gets a chance to resolve — real
+            // bytecode does no loadability filtering at registration time at
+            // all (`ClassPathXmlApplicationContextTests.
+            // contextWithClassNameThatContainsPlaceholder` expects
+            // `containsBean("someMessageSource")` to be true immediately
+            // after construction, long before any placeholder substitution
+            // runs). Mirrors the same guard already applied in
+            // `abstract_bean_definition_get_bean_class_name` and `m5`'s
+            // `BeanClassResolution::Placeholder` handling.
+            //
+            // A `lazy-init="true"` bean also must NOT be dropped here even
+            // when its class is genuinely, permanently unloadable (a typo,
+            // not a placeholder): `preInstantiateSingletons` never eagerly
+            // resolves a lazy bean's class, so removing it at registration
+            // time serves no partial-classpath-boot purpose for THIS bean —
+            // it only breaks the documented contract that an explicit
+            // `getBean()` on a lazy bean with a bad class name throws
+            // `CannotLoadBeanClassException` (`ClassPathXmlApplicationContextTests
+            // .contextWithInvalidLazyClass`, which our `m5`/`doResolveBeanClass`
+            // shims already handle correctly once the definition is allowed
+            // to survive to that point). Eager (non-lazy) beans keep the
+            // existing drop-at-registration tolerance — a missing class on a
+            // bean `preInstantiateSingletons` WILL eagerly try to construct
+            // is exactly the partial-classpath boot-crash scenario this
+            // filter exists for.
+            // Read the `lazyInit` field directly (a boxed `Boolean`, null
+            // unless explicitly set) rather than calling `isLazyInit()` —
+            // matches the field-access pattern already used throughout this
+            // file for `beanClass`/`beanClassName` and avoids any virtual
+            // dispatch uncertainty for this early-registration-time check.
+            if !cn.is_empty() && !cn.contains("${") && !is_lazy_init(ctx, bd) {
                 let internal = cn.replace('.', "/");
                 let mut loadable = ctx.class_id_by_name(&internal).is_some()
                     || ctx.class_id_by_name(&cn).is_some()
