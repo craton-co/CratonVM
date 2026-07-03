@@ -6169,7 +6169,9 @@ fn declared_methods_with_synthetic(
                 });
             }
         }
-        if ctx.lambda_proxy_host(class_id).is_some() && !methods.iter().any(|m| m.name == "writeReplace") {
+        if ctx.lambda_proxy_host(class_id).is_some()
+            && !methods.iter().any(|m| m.name == "writeReplace")
+        {
             methods.push(MethodMetadata {
                 name: "writeReplace".to_string(),
                 descriptor: "()Ljava/lang/Object;".to_string(),

@@ -6509,6 +6509,12 @@ pub fn register_essential_natives(registry: &mut NativeMethodRegistry) {
         "()Ljava/lang/Class;",
         lang_class::native_method_get_declaring_class,
     );
+    registry.register(
+        "java/lang/reflect/Method",
+        "getParameterCount",
+        "()I",
+        lang_class::native_method_get_parameter_count,
+    );
     // WP2.2: Method.invoke is non-native in real JDK 25 (delegates to
     // MethodHandle-based DirectMethodHandleAccessor which performs primitive
     // box/unbox via .asType(genericMethodType(...))). Our MH .asType is a
@@ -32860,7 +32866,11 @@ fn native_bd_init_bigint(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
             let mag = (le.first().copied().unwrap_or(0) as u64)
                 | ((le.get(1).copied().unwrap_or(0) as u64) << 32);
             if mag <= i64::MAX as u64 {
-                Some(if v.is_neg() { -(mag as i64) } else { mag as i64 })
+                Some(if v.is_neg() {
+                    -(mag as i64)
+                } else {
+                    mag as i64
+                })
             } else {
                 None
             }
@@ -33482,16 +33492,16 @@ fn bd_set_scale_impl(
     let divisor = BigInt::from_decimal(&divisor_dec);
     let (quotient, remainder) = unscaled.divmod(&divisor);
     let dividend_neg = unscaled.is_neg();
-    let increment = match bd_round_needs_increment(&remainder, &divisor, &quotient, dividend_neg, mode)
-    {
-        Ok(v) => v,
-        Err(()) => {
-            return Err(RuntimeError::ArithmeticException {
-                message: "Rounding necessary".to_string(),
+    let increment =
+        match bd_round_needs_increment(&remainder, &divisor, &quotient, dividend_neg, mode) {
+            Ok(v) => v,
+            Err(()) => {
+                return Err(RuntimeError::ArithmeticException {
+                    message: "Rounding necessary".to_string(),
+                }
+                .into());
             }
-            .into());
-        }
-    };
+        };
     let rounded = if increment {
         let one = BigInt::from_decimal(if dividend_neg { "-1" } else { "1" });
         quotient.add(&one)

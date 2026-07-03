@@ -4201,6 +4201,27 @@ fn do_unwrap(
                     break;
                 }
                 if let Err(e) = conn.process_new_packets() {
+                    // A rustls protocol error surfacing while the handshake is
+                    // still in progress (e.g. `InvalidCertificate` — the peer's
+                    // certificate failed validation against the trust store)
+                    // must reach Java as `SSLHandshakeException`, not a bare
+                    // `IOException`. Real JSSE's `SSLEngine.unwrap()` throws
+                    // `SSLHandshakeException` for essentially any failure
+                    // during the handshake phase; callers (e.g. Apache
+                    // httpasyncclient's `SSLIOSession`) that specifically
+                    // catch `SSLException`/`SSLHandshakeException` to
+                    // distinguish a TLS failure from an ordinary I/O error
+                    // never see it with a plain `IOException`, and the
+                    // connection teardown that follows can surface as an
+                    // unrelated `ConnectionClosedException` instead
+                    // (RestClientBuilderIntegTests.testBuilderUsesDefaultSSLContext).
+                    if conn.is_handshaking() {
+                        return Err(crate::phases_early::throw_jca_exc(
+                            ctx,
+                            "javax/net/ssl/SSLHandshakeException",
+                            &format!("rustls: {}", e),
+                        ));
+                    }
                     return Err(RuntimeError::IOException {
                         message: format!("rustls process_new_packets: {}", e),
                     }

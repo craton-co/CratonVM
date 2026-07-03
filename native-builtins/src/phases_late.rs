@@ -32981,8 +32981,8 @@ fn new13_build_connector(extra_root_ders: &[Vec<u8>]) -> Result<native_tls::TlsC
 /// `x509_manager::build_trust_manager_state`); consumed by `getSocketFactory`
 /// so the returned `SSLSocketFactory` carries the same trust scope into
 /// `createSocket`.
-fn p68_ctx_trust_roots_table() -> &'static parking_lot::Mutex<std::collections::HashMap<usize, Vec<Vec<u8>>>>
-{
+fn p68_ctx_trust_roots_table(
+) -> &'static parking_lot::Mutex<std::collections::HashMap<usize, Vec<Vec<u8>>>> {
     static T: std::sync::OnceLock<
         parking_lot::Mutex<std::collections::HashMap<usize, Vec<Vec<u8>>>>,
     > = std::sync::OnceLock::new();
@@ -33227,7 +33227,9 @@ pub(crate) fn register_p68_ssl(r: &mut NativeMethodRegistry) {
                 let ctx_key = this.as_ptr() as usize;
                 if let Some(roots) = p68_ctx_trust_roots_table().lock().get(&ctx_key).cloned() {
                     let factory_key = obj.as_ptr() as usize;
-                    p68_ctx_trust_roots_table().lock().insert(factory_key, roots);
+                    p68_ctx_trust_roots_table()
+                        .lock()
+                        .insert(factory_key, roots);
                 }
             }
             Ok(Some(Value::Object(Some(obj))))
@@ -33451,13 +33453,21 @@ pub(crate) fn register_p68_ssl(r: &mut NativeMethodRegistry) {
         ssl_sock,
         "getSupportedCipherSuites",
         "()[Ljava/lang/String;",
-        |ctx, _args| Ok(Some(Value::Object(Some(ssl_sock_supported_cipher_suites(ctx))))),
+        |ctx, _args| {
+            Ok(Some(Value::Object(Some(ssl_sock_supported_cipher_suites(
+                ctx,
+            )))))
+        },
     );
     r.register(
         ssl_sock,
         "getEnabledCipherSuites",
         "()[Ljava/lang/String;",
-        |ctx, _args| Ok(Some(Value::Object(Some(ssl_sock_supported_cipher_suites(ctx))))),
+        |ctx, _args| {
+            Ok(Some(Value::Object(Some(ssl_sock_supported_cipher_suites(
+                ctx,
+            )))))
+        },
     );
     r.register(
         ssl_sock,
@@ -33487,16 +33497,15 @@ pub(crate) fn register_p68_ssl(r: &mut NativeMethodRegistry) {
             // Report the protocol actually negotiated (stored on the
             // session) alongside TLSv1.2 so callers checking membership
             // against either standard name succeed.
-            let negotiated = if let Value::Object(Some(session)) =
-                ctx.get_field(this, NEW13_SOCK_SESSION)
-            {
-                match ctx.get_field(session, NEW13_SESS_PROTO) {
-                    Value::Object(Some(s)) => ctx.read_string(s),
-                    _ => None,
-                }
-            } else {
-                None
-            };
+            let negotiated =
+                if let Value::Object(Some(session)) = ctx.get_field(this, NEW13_SOCK_SESSION) {
+                    match ctx.get_field(session, NEW13_SESS_PROTO) {
+                        Value::Object(Some(s)) => ctx.read_string(s),
+                        _ => None,
+                    }
+                } else {
+                    None
+                };
             let proto = negotiated.unwrap_or_else(|| "TLSv1.3".to_string());
             let arr = ctx.new_ref_array(cratonvm_types::ClassId::new(0), 1);
             let s = ctx.create_string(&proto);

@@ -1521,7 +1521,10 @@ mod tests {
 
         // Initial mark with NO roots: `live` is invisible to the trace.
         marker.initial_mark(&[], &og2);
-        assert!(satb.is_active(), "initial_mark must activate the shared queue");
+        assert!(
+            satb.is_active(),
+            "initial_mark must activate the shared queue"
+        );
         assert!(state.is_marking_active());
 
         // Simulate the write barrier on another code path: a mutator
@@ -1553,7 +1556,10 @@ mod tests {
         assert_eq!(marker.state.phase(), ConcurrentGcPhase::ConcurrentMark);
 
         marker.abort_cycle();
-        assert!(!marker.satb_queue.is_active(), "abort must deactivate the barrier");
+        assert!(
+            !marker.satb_queue.is_active(),
+            "abort must deactivate the barrier"
+        );
         assert_eq!(marker.state.phase(), ConcurrentGcPhase::Idle);
     }
 }

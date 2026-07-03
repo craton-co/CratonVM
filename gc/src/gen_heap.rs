@@ -4214,8 +4214,7 @@ impl GenerationalHeap {
                 }
                 while cursor < used && !old_full {
                     {
-                        let (resynced, overshot) =
-                            skip_free_blocks(&mut cursor, &mut free_iter);
+                        let (resynced, overshot) = skip_free_blocks(&mut cursor, &mut free_iter);
                         if overshot {
                             // The stride that crossed into the block was
                             // mis-sized: candidates since the last anchor are
@@ -4246,10 +4245,7 @@ impl GenerationalHeap {
                         // SAFETY: offset 4 lies within the >=8-byte gap.
                         let gap = unsafe { std::ptr::read((src as *const u8).add(4) as *const u32) }
                             as usize;
-                        if (8..HEADER_SIZE).contains(&gap)
-                            && gap & 7 == 0
-                            && cursor + gap <= used
-                        {
+                        if (8..HEADER_SIZE).contains(&gap) && gap & 7 == 0 && cursor + gap <= used {
                             cursor += gap;
                             continue;
                         }
@@ -4262,14 +4258,21 @@ impl GenerationalHeap {
                     let word0 = unsafe { *(src as *const u64) };
                     let mut anomaly = false;
                     if word0 == 0 {
-                        let limit =
-                            free_iter.peek().map(|&&(off, _)| off).unwrap_or(used).min(used);
+                        let limit = free_iter
+                            .peek()
+                            .map(|&&(off, _)| off)
+                            .unwrap_or(used)
+                            .min(used);
                         let run_end = zero_run_end(from_base, cursor, limit);
                         if run_end - cursor >= HEADER_SIZE {
                             anomaly = true;
                         }
                     }
-                    let total_size = if anomaly { 0 } else { gen_object_total_size(header) };
+                    let total_size = if anomaly {
+                        0
+                    } else {
+                        gen_object_total_size(header)
+                    };
                     if anomaly || total_size < HEADER_SIZE || cursor + total_size > used {
                         unwind_evac(
                             &mut fwd_installs,
@@ -4492,7 +4495,10 @@ impl GenerationalHeap {
                             let gap =
                                 unsafe { std::ptr::read((obj as *const u8).add(4) as *const u32) }
                                     as usize;
-                            if (8..HEADER_SIZE).contains(&gap) && gap & 7 == 0 && cursor + gap <= used {
+                            if (8..HEADER_SIZE).contains(&gap)
+                                && gap & 7 == 0
+                                && cursor + gap <= used
+                            {
                                 cursor += gap;
                                 continue;
                             }
@@ -4510,8 +4516,11 @@ impl GenerationalHeap {
                                 anomaly = true;
                             }
                         }
-                        let total_size =
-                            if anomaly { 0 } else { gen_object_total_size(header) };
+                        let total_size = if anomaly {
+                            0
+                        } else {
+                            gen_object_total_size(header)
+                        };
                         if anomaly || total_size < HEADER_SIZE || cursor + total_size > used {
                             let stretch_lo = cursor;
                             let resynced = resync_to_next_free_block(&mut cursor, &mut free_iter);
@@ -4968,7 +4977,11 @@ impl GenerationalHeap {
             // free-block anchor and resume on-grid there.
             let word0 = unsafe { *(obj_ptr as *const u64) };
             if word0 == 0 {
-                let limit = free_iter.peek().map(|&&(off, _)| off).unwrap_or(used).min(used);
+                let limit = free_iter
+                    .peek()
+                    .map(|&&(off, _)| off)
+                    .unwrap_or(used)
+                    .min(used);
                 let run_end = zero_run_end(from_base, cursor, limit);
                 if run_end - cursor >= HEADER_SIZE {
                     let n = SWEEP_ZERO_SPAN_HITS.fetch_add(1, Ordering::Relaxed);
@@ -5286,9 +5299,7 @@ impl GenerationalHeap {
                 // (or header corruption) — retain the span instead of zeroing
                 // and freeing what may be a live object's interior.
                 let fwd = header.forwarding_ptr;
-                if watchref_dbg()
-                    && crate::gc_quiescence::is_watched_referent(obj_ptr as usize)
-                {
+                if watchref_dbg() && crate::gc_quiescence::is_watched_referent(obj_ptr as usize) {
                     eprintln!(
                         "[watchref] non-moving sweep: watched address @0x{:x} was EVACUATED to old gen @{:p} (should already be in evac_map from selective promotion)",
                         obj_ptr as usize, fwd
@@ -5338,9 +5349,7 @@ impl GenerationalHeap {
                     evac_map.insert(addr, addr);
                 }
             } else {
-                if watchref_dbg()
-                    && crate::gc_quiescence::is_watched_referent(obj_ptr as usize)
-                {
+                if watchref_dbg() && crate::gc_quiescence::is_watched_referent(obj_ptr as usize) {
                     eprintln!(
                         "[watchref] non-moving sweep: watched address @0x{:x} was DEAD (unmarked) — zeroing",
                         obj_ptr as usize
@@ -5677,13 +5686,21 @@ impl GenerationalHeap {
             let word0 = unsafe { *(obj_ptr as *const u64) };
             let mut anomaly = false;
             if word0 == 0 {
-                let limit = free_iter.peek().map(|&&(off, _)| off).unwrap_or(used).min(used);
+                let limit = free_iter
+                    .peek()
+                    .map(|&&(off, _)| off)
+                    .unwrap_or(used)
+                    .min(used);
                 let run_end = zero_run_end(base, cursor, limit);
                 if run_end - cursor >= HEADER_SIZE {
                     anomaly = true;
                 }
             }
-            let total_size = if anomaly { 0 } else { gen_object_total_size(header) };
+            let total_size = if anomaly {
+                0
+            } else {
+                gen_object_total_size(header)
+            };
             if anomaly || total_size < HEADER_SIZE || cursor + total_size > used {
                 let stretch_lo = cursor;
                 let resynced = resync_to_next_free_block(&mut cursor, &mut free_iter);
@@ -5818,13 +5835,21 @@ impl GenerationalHeap {
             let word0 = unsafe { *(obj_ptr as *const u64) };
             let mut anomaly = false;
             if word0 == 0 {
-                let limit = free_iter.peek().map(|&&(off, _)| off).unwrap_or(used).min(used);
+                let limit = free_iter
+                    .peek()
+                    .map(|&&(off, _)| off)
+                    .unwrap_or(used)
+                    .min(used);
                 let run_end = zero_run_end(base, cursor, limit);
                 if run_end - cursor >= HEADER_SIZE {
                     anomaly = true;
                 }
             }
-            let total_size = if anomaly { 0 } else { gen_object_total_size(header) };
+            let total_size = if anomaly {
+                0
+            } else {
+                gen_object_total_size(header)
+            };
             if anomaly || total_size < HEADER_SIZE || cursor + total_size > used {
                 let stretch_lo = cursor;
                 let resynced = resync_to_next_free_block(&mut cursor, &mut free_iter);
@@ -6711,8 +6736,11 @@ impl GenerationalHeap {
                 let word0 = unsafe { *(ptr as *const u64) };
                 let mut anomaly = false;
                 if word0 == 0 {
-                    let limit =
-                        free_iter.peek().map(|&&(off, _)| off).unwrap_or(used).min(used);
+                    let limit = free_iter
+                        .peek()
+                        .map(|&&(off, _)| off)
+                        .unwrap_or(used)
+                        .min(used);
                     let run_end = zero_run_end(base, offset, limit);
                     if run_end - offset >= HEADER_SIZE {
                         anomaly = true;
@@ -6722,7 +6750,11 @@ impl GenerationalHeap {
                 // implausible length or a kind=Object header with a non-zero
                 // array_length / oversized num_slots; the `< HEADER_SIZE` check
                 // below then re-anchors the walk (matching the sweep).
-                let total_size = if anomaly { 0 } else { gen_object_total_size(header) };
+                let total_size = if anomaly {
+                    0
+                } else {
+                    gen_object_total_size(header)
+                };
                 if anomaly || total_size < HEADER_SIZE || offset + total_size > used {
                     if resync_to_next_free_block(&mut offset, &mut free_iter) {
                         continue;
@@ -7349,8 +7381,7 @@ fn zero_run_end(base: usize, start: usize, limit: usize) -> usize {
     if r < limit && limit - r < 8 {
         // Sub-word tail before `limit`: absorb it only if fully zero, so a
         // run ending exactly at a free-block boundary is reported as such.
-        let all_zero =
-            (r..limit).all(|i| unsafe { *((base + i) as *const u8) } == 0);
+        let all_zero = (r..limit).all(|i| unsafe { *((base + i) as *const u8) } == 0);
         if all_zero {
             r = limit;
         }
@@ -7435,13 +7466,21 @@ fn clear_all_mark_bits_in_arena(arena: &mut Arena) {
         let word0 = unsafe { *(obj_ptr as *const u64) };
         let mut anomaly = false;
         if word0 == 0 {
-            let limit = free_iter.peek().map(|&&(off, _)| off).unwrap_or(used).min(used);
+            let limit = free_iter
+                .peek()
+                .map(|&&(off, _)| off)
+                .unwrap_or(used)
+                .min(used);
             let run_end = zero_run_end(base, cursor, limit);
             if run_end - cursor >= HEADER_SIZE {
                 anomaly = true;
             }
         }
-        let total_size = if anomaly { 0 } else { gen_object_total_size(header) };
+        let total_size = if anomaly {
+            0
+        } else {
+            gen_object_total_size(header)
+        };
         if anomaly || total_size < HEADER_SIZE || cursor + total_size > used {
             // Corruption — same defence as the sweep loop: re-anchor at the
             // next free block rather than risk parsing arbitrary bytes as a

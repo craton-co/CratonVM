@@ -312,7 +312,8 @@ fn pbes2_extract_params(
         _ => return None,
     };
     let salt_slot = ctx.resolve_field_index("com/sun/crypto/provider/PBES2Parameters", "salt")?;
-    let icount_slot = ctx.resolve_field_index("com/sun/crypto/provider/PBES2Parameters", "iCount")?;
+    let icount_slot =
+        ctx.resolve_field_index("com/sun/crypto/provider/PBES2Parameters", "iCount")?;
     let cipher_param_slot =
         ctx.resolve_field_index("com/sun/crypto/provider/PBES2Parameters", "cipherParam")?;
     let salt = match ctx.get_field(spi, salt_slot) {

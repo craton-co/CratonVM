@@ -713,13 +713,12 @@ mod tests {
         ];
         let is_obj = |a: usize| if a == obj { fake_obj(a) } else { None };
         let mut candidates = Vec::new();
-        let has_jit = classify_helper_window_words(
-            words.iter().copied(),
-            &ranges,
-            &is_obj,
-            &mut candidates,
+        let has_jit =
+            classify_helper_window_words(words.iter().copied(), &ranges, &is_obj, &mut candidates);
+        assert!(
+            has_jit,
+            "JIT return address on the band must classify as a helper window"
         );
-        assert!(has_jit, "JIT return address on the band must classify as a helper window");
         assert_eq!(candidates.len(), 1);
         assert_eq!(candidates[0].as_ptr() as usize, obj);
     }
@@ -734,12 +733,8 @@ mod tests {
         let words = [obj, 0x12345usize, 0usize];
         let is_obj = |a: usize| if a == obj { fake_obj(a) } else { None };
         let mut candidates = Vec::new();
-        let has_jit = classify_helper_window_words(
-            words.iter().copied(),
-            &ranges,
-            &is_obj,
-            &mut candidates,
-        );
+        let has_jit =
+            classify_helper_window_words(words.iter().copied(), &ranges, &is_obj, &mut candidates);
         assert!(!has_jit);
         // Candidates were still collected — the caller's `has_jit` gate is
         // what discards them.

@@ -949,7 +949,13 @@ fn seed_sunec_services() {
 fn seed_sunjce_pbe_services() {
     const P: &str = "SunJCE";
     const HASHES: &[&str] = &[
-        "SHA1", "SHA224", "SHA256", "SHA384", "SHA512", "SHA512_224", "SHA512_256",
+        "SHA1",
+        "SHA224",
+        "SHA256",
+        "SHA384",
+        "SHA512",
+        "SHA512_224",
+        "SHA512_256",
     ];
     const KEYSIZES: &[&str] = &["128", "256"];
     for hash in HASHES {

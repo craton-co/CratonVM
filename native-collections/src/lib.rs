@@ -27005,7 +27005,11 @@ fn chm_total_capacity(ctx: &dyn NativeContext, this: ObjectRef) -> usize {
 /// their relative collection order, which is the best available
 /// approximation of JDK's intra-bucket chain order without also replicating
 /// its incremental resize-and-split history exactly.
-fn chm_reorder_by_virtual_bucket<T>(ctx: &dyn NativeContext, this: ObjectRef, mut items: Vec<(i32, T)>) -> Vec<T> {
+fn chm_reorder_by_virtual_bucket<T>(
+    ctx: &dyn NativeContext,
+    this: ObjectRef,
+    mut items: Vec<(i32, T)>,
+) -> Vec<T> {
     let total_cap = chm_total_capacity(ctx, this).next_power_of_two().max(1);
     let mask = (total_cap - 1) as u32;
     items.sort_by_key(|(hash, _)| (*hash as u32) & mask);
@@ -31057,10 +31061,12 @@ fn native_collections_extreme(
         None => return Ok(Some(Value::Object(None))),
     };
     if size == 0 {
-        return Err(cratonvm_types::error::RuntimeError::NoSuchElementException {
-            message: String::new(),
-        }
-        .into());
+        return Err(
+            cratonvm_types::error::RuntimeError::NoSuchElementException {
+                message: String::new(),
+            }
+            .into(),
+        );
     }
     let mut best = ctx.get_array_element(data, 0);
     for i in 1..size as usize {

@@ -167,7 +167,8 @@ const PROVENANCE_GRANULE_SHIFT: u32 = 6;
 /// log2 of the address span one leaf covers (1 GiB).
 const PROVENANCE_LEAF_COVER_SHIFT: u32 = 30;
 /// Granule bits per leaf: 2^(30-6) = 2^24.
-const PROVENANCE_LEAF_GRANULES: usize = 1 << (PROVENANCE_LEAF_COVER_SHIFT - PROVENANCE_GRANULE_SHIFT);
+const PROVENANCE_LEAF_GRANULES: usize =
+    1 << (PROVENANCE_LEAF_COVER_SHIFT - PROVENANCE_GRANULE_SHIFT);
 /// `u64` words per leaf: 2^24 / 64 = 2^18 (2 MiB).
 const PROVENANCE_LEAF_WORDS: usize = PROVENANCE_LEAF_GRANULES / 64;
 /// L1 slots: 47-bit address space / 1 GiB per leaf = 2^17.
