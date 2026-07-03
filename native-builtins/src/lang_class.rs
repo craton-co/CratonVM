@@ -5445,9 +5445,33 @@ pub(crate) fn native_method_invoke(
     // Static methods, `<init>`, and private methods bypass virtual dispatch
     // and call the resolved class directly.
     const ACC_PRIVATE: i32 = 0x0002;
+    const ACC_PROTECTED: i32 = 0x0004;
     let is_private = (modifiers & ACC_PRIVATE) != 0;
+    let is_protected = (modifiers & ACC_PROTECTED) != 0;
     let is_init = method_name == "<init>";
-    let use_virtual_dispatch = !is_static && !is_private && !is_init;
+
+    // JLS §8.4.8.1: a package-private (default-access) method is only
+    // overridden by a same-named/same-descriptor subclass method in the SAME
+    // runtime package as the declaring class. Virtual dispatch by name on
+    // the receiver's runtime class can therefore resolve to a completely
+    // unrelated, independently-declared same-named package-private method
+    // there instead of the exact method this `Method` mirror represents —
+    // exactly the javax.inject/jakarta.inject TCK's package-private-across-
+    // packages cases (SpringAtInjectTckTests). When that's the situation,
+    // `Method.invoke` must invoke the EXACT declaring-class method (no
+    // retarget), same as a private method.
+    let is_package_private = !is_public && !is_protected && !is_private;
+    let crosses_package = is_package_private
+        && !is_static
+        && receiver
+            .map(|recv| {
+                let recv_cid = ctx.class_id_of_object(recv);
+                let recv_class_name = ctx.class_name_of_id(recv_cid).unwrap_or_default();
+                let pkg_of = |n: &str| n.rfind('/').map(|i| n[..i].to_string()).unwrap_or_default();
+                pkg_of(&class_name) != pkg_of(&recv_class_name)
+            })
+            .unwrap_or(false);
+    let use_virtual_dispatch = !is_static && !is_private && !is_init && !crosses_package;
 
     let iae_trace = std::env::var_os("CRATONVM_IAE_TRACE").is_some();
     if iae_trace {
@@ -5483,7 +5507,7 @@ pub(crate) fn native_method_invoke(
                 return Err(wrap_as_invocation_target_exception(ctx, failure));
             }
         }
-    } else if is_private && !is_static && !is_init {
+    } else if (is_private || crosses_package) && !is_static && !is_init {
         // Private instance methods bypass virtual dispatch AND must never be
         // retargeted to a subclass's same-name method. `ctx.invoke`
         // (invoke_on_class_shared) retargets a call whose declaring class is
@@ -5497,7 +5521,8 @@ pub(crate) fn native_method_invoke(
         // SessionFactory UUID and deserialization reconnected a null factory
         // → NPE (HIB-DEV-05). `invoke_special` resolves to the declaring class
         // with no retarget — exactly the invokespecial semantics a private
-        // method requires.
+        // method requires, and exactly what a cross-package package-private
+        // method also needs (see `crosses_package` above).
         match ctx.invoke_special(&class_name, &method_name, &descriptor, &invoke_args) {
             Ok(v) => v,
             Err(failure) => {
@@ -6120,8 +6145,31 @@ fn declared_methods_with_synthetic(
     // finds it; `native_method_invoke` builds the SerializedLambda when it is
     // actually called. (Private + declared on the proxy class itself, matching
     // the real lambda, so `getInheritableMethod` accepts it.)
-    if is_lambda_proxy_id(class_id) && ctx.lambda_proxy_host(class_id).is_some() {
-        if !methods.iter().any(|m| m.name == "writeReplace") {
+    if is_lambda_proxy_id(class_id) {
+        // The SAM method itself (e.g. `Supplier.get()`) has no real bytecode
+        // on the synthetic lambda proxy class, so it never shows up in
+        // `ctx.declared_methods`. Reflective callers that enumerate methods
+        // to find advisable targets — notably AspectJ pointcut matching
+        // during Spring autoproxying (`execution(* ...Supplier+.get())`) —
+        // see an empty candidate set and conclude no advisor applies, so the
+        // lambda is never wrapped in a proxy at all (`AopUtils.isAopProxy`
+        // false). Synthesize the entry the same way `getInterfaces()` already
+        // synthesizes `[SAM]` for lambda proxies (see above).
+        if let Some(meta) = ctx.lambda_proxy_serial_metadata(class_id) {
+            let already_present = methods
+                .iter()
+                .any(|m| m.name == meta.sam_method_name && m.descriptor == meta.sam_descriptor);
+            if !already_present {
+                methods.push(MethodMetadata {
+                    name: meta.sam_method_name,
+                    descriptor: meta.sam_descriptor,
+                    access_flags: 0x0001, // ACC_PUBLIC
+                    declaring_class_id: class_id,
+                    exceptions: Vec::new(),
+                });
+            }
+        }
+        if ctx.lambda_proxy_host(class_id).is_some() && !methods.iter().any(|m| m.name == "writeReplace") {
             methods.push(MethodMetadata {
                 name: "writeReplace".to_string(),
                 descriptor: "()Ljava/lang/Object;".to_string(),

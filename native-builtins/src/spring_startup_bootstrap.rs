@@ -1041,12 +1041,19 @@ pub fn register(registry: &mut NativeMethodRegistry) {
 
     // sportme: the actual throw site is `AbstractBeanDefinition.getBeanClass()`,
     // which throws ISE("Bean class name [%s] has not been resolved into an
-    // actual Class") when beanClass is a String (not yet resolved). Intercept
-    // to return Object.class as a placeholder, which causes Spring to skip
-    // instantiation later because Object can't be a configuration class. Better:
-    // try to read beanClass field; if it's a Class mirror, return it. If it's
-    // a String, return null (the caller in Spring usually handles null
-    // gracefully — for sportme, RedisHttpSessionConfiguration is then skipped).
+    // actual Class") when beanClass is a String (not yet resolved). This used
+    // to unconditionally return null for a String beanClass WITHOUT ever
+    // attempting resolution — tolerant for sportme's partial classpath (an
+    // unresolvable class silently skips the bean), but it also meant a
+    // perfectly loadable class whose name just hadn't been resolved YET (no
+    // prior `resolveBeanClass()` call happened to run first) permanently
+    // read as "no class", surfacing as "No bean class specified on bean
+    // definition" downstream (DestroyMethodInferenceTests::xml()'s `x8`,
+    // Spr16022Tests' `bean1` — both dotted-nested-class XML bean
+    // definitions). Delegate to the same `resolve_bean_class_field` used by
+    // `resolveBeanClass()` (dot-vs-dollar nested-class retry included) so a
+    // genuinely loadable class resolves here too; still return null (not an
+    // ISE) on `Missing`/`NoClass` to preserve the sportme-tolerant behavior.
     registry.register(
         "org/springframework/beans/factory/support/AbstractBeanDefinition",
         "getBeanClass",
@@ -1056,25 +1063,11 @@ pub fn register(registry: &mut NativeMethodRegistry) {
                 Some(Value::Object(Some(o))) => *o,
                 _ => return Ok(Some(Value::Object(None))),
             };
-            // Try field-by-name lookup; in Spring the field is named "beanClass"
-            // and is private. If the field holds a Class mirror, return it.
-            // If it's a String (resolved bean class name), return null so the
-            // caller can fall back to other resolution paths.
-            let v = ctx.get_field_by_name(this, "beanClass");
-            match v {
-                Value::Object(Some(o)) => {
-                    let cid = ctx.class_id_of_object(o);
-                    let name = ctx.class_name_of_id(cid).unwrap_or_default();
-                    if name == "java/lang/Class" {
-                        Ok(Some(Value::Object(Some(o))))
-                    } else {
-                        // String or other — bean class name not yet resolved.
-                        // Return null instead of throwing ISE so Spring skips
-                        // the bean during preInstantiateSingletons.
-                        Ok(Some(Value::Object(None)))
-                    }
+            match resolve_bean_class_field(ctx, this) {
+                BeanClassResolution::Resolved(mirror) => Ok(Some(Value::Object(Some(mirror)))),
+                BeanClassResolution::Missing | BeanClassResolution::NoClass => {
+                    Ok(Some(Value::Object(None)))
                 }
-                _ => Ok(Some(Value::Object(None))),
             }
         },
     );
@@ -1523,7 +1516,7 @@ fn abstract_bean_definition_get_bean_class_name(
     // have attempted `ensure_class_initialized`, so a class that's truly on
     // the classpath will have a ClassId by this point.
     let internal = name.replace('.', "/");
-    let loadable = ctx.class_id_by_name(&internal).is_some()
+    let mut loadable = ctx.class_id_by_name(&internal).is_some()
         || ctx.class_id_by_name(&name).is_some()
         // FIX(bug-B): a bean class can be ON the classpath but not yet LOADED —
         // lazily-resolved nested / method-injection / proxied bean classes (e.g.
@@ -1534,6 +1527,34 @@ fn abstract_bean_definition_get_bean_class_name(
         // asserted "Target object must not be null". Probe the classpath resource
         // (no clinit) so ONLY genuinely-absent classes are hidden.
         || ctx.find_resource(&format!("{internal}.class")).is_some();
+
+    // FIX: nested-class dotted convention. Spring XML/reflection allows a
+    // nested class to be named with a DOT before the nested segment (e.g.
+    // "com.example.Outer.Inner", matching `ClassUtils.forName`'s own
+    // last-dot-to-`$` fallback at ClassUtils.java:308-318) even though the
+    // real class-file path uses `$` ("com/example/Outer$Inner.class"). The
+    // naive `name.replace('.', "/")` above turns every dot into a slash,
+    // producing a resource path that never exists, so a legitimately
+    // loadable nested-class bean (e.g. an `<aop:aspect ref="testAspect">`
+    // pointing at a test's static nested aspect class) was wrongly hidden —
+    // observed as `MethodLocatingFactoryBean` throwing "Can't determine type
+    // of bean with name 'testAspect'" because `getBeanClassName()` returned
+    // null. Mirror the same single-level last-dot substitution before
+    // giving up.
+    if !loadable {
+        if let Some(last_dot) = name.rfind('.') {
+            let nested_dotted = format!("{}${}", &name[..last_dot], &name[last_dot + 1..]);
+            let nested_internal = nested_dotted.replace('.', "/");
+            if ctx.class_id_by_name(&nested_internal).is_some()
+                || ctx.class_id_by_name(&nested_dotted).is_some()
+                || ctx
+                    .find_resource(&format!("{nested_internal}.class"))
+                    .is_some()
+            {
+                loadable = true;
+            }
+        }
+    }
 
     if !loadable {
         tracing::warn!(
@@ -2271,27 +2292,29 @@ fn s_instantiation_strategy_instantiate(
         _ => return Ok(Some(Value::Object(None))),
     };
 
-    // Read the `beanClass` field directly. Spring uses `Object beanClass`
-    // which is either a `Class<?>` (resolved) or a `String` (unresolved
-    // bean class name) — exactly the union our getBeanClass intercept
-    // sees.
-    let bean_class_field = ctx.get_field_by_name(mbd, "beanClass");
-    let mirror = match bean_class_field {
-        Value::Object(Some(o)) => o,
-        // null beanClass — no class was ever specified on the definition (no
-        // class name either, otherwise the field would hold the String name).
-        // Real Spring's `SimpleInstantiationStrategy.instantiate` calls
+    // Resolve via `resolve_bean_class_field` directly (dot-vs-dollar
+    // nested-class retry included) rather than only reading the raw
+    // `beanClass` field — this used to assume an EARLIER `resolveBeanClass()`/
+    // `getBeanClass()` call had already resolved and cached a String class
+    // name into a Class mirror before `instantiate()` ever runs, but for some
+    // XML-defined beans (e.g. `DestroyMethodInferenceTests-context.xml`'s
+    // `x8`, `Spr16022Tests`' `bean1`) that earlier call never happens on this
+    // exact `mbd`, so a resolvable-but-still-String (or not-yet-attempted)
+    // class permanently read as "no class specified". Attempting resolution
+    // HERE, right before the only consumer that needs the actual Class,
+    // guarantees correctness regardless of what ran earlier.
+    let mirror = match resolve_bean_class_field(ctx, mbd) {
+        BeanClassResolution::Resolved(m) => m,
+        // No class name at all — genuinely "no class specified". Real
+        // Spring's `SimpleInstantiationStrategy.instantiate` calls
         // `bd.getBeanClass()`, which throws
         // `IllegalStateException("No bean class specified on bean definition")`
         // for exactly this case; `instantiateBean` then wraps it as the
         // BeanCreationException whose root cause is that ISE
         // (DefaultListableBeanFactoryTests / {Autowired,Inject}AnnotationBean
         // PostProcessorTests.incompleteBeanDefinition). Returning null instead
-        // surfaced a misleading IllegalArgumentException downstream. Orphaned
-        // /unresolved beans carry a String class NAME in `beanClass` (handled
-        // by the `mirror_cn != "java/lang/Class"` branch below), so this null
-        // case is genuinely "no class specified".
-        _ => {
+        // surfaced a misleading IllegalArgumentException downstream.
+        BeanClassResolution::NoClass => {
             tracing::debug!(
                 "[spring-shim] SimpleInstantiationStrategy.instantiate: null beanClass, throwing ISE"
             );
@@ -2300,19 +2323,15 @@ fn s_instantiation_strategy_instantiate(
             }
             .into());
         }
+        // Named but genuinely unresolvable (not on the classpath) — return
+        // null, matching the prior "String not yet resolved — skip" behavior.
+        BeanClassResolution::Missing => {
+            tracing::debug!(
+                "[spring-shim] SimpleInstantiationStrategy.instantiate: beanClass unresolvable — skipping"
+            );
+            return Ok(Some(Value::Object(None)));
+        }
     };
-
-    // Verify it's actually a java/lang/Class mirror; if it's a String
-    // (bean class name still unresolved), return null.
-    let mirror_cid = ctx.class_id_of_object(mirror);
-    let mirror_cn = ctx.class_name_of_id(mirror_cid).unwrap_or_default();
-    if mirror_cn != "java/lang/Class" {
-        tracing::debug!(
-            "[spring-shim] SimpleInstantiationStrategy.instantiate: beanClass is `{}`, not java/lang/Class — skipping",
-            mirror_cn
-        );
-        return Ok(Some(Value::Object(None)));
-    }
 
     // Real Class mirror — resolve internal name and instantiate via
     // no-arg constructor. The vast majority of Spring beans Spring
@@ -2383,12 +2402,33 @@ fn s_instantiation_strategy_instantiate(
         }
     }
 
-    if !ctx.method_exists(&class_name, "<init>", "()V") {
+    // `<init>` is never inherited (JVMS §5.4.3.3 constructors aren't looked up
+    // via the superclass chain) — `method_exists` walks the hierarchy and
+    // always finds SOME `<init>()V` at `Object`, so it never actually guards
+    // anything here. Use the exact-class-only check instead: does THIS class
+    // declare a no-arg constructor? (Spr12278Tests.componentTwoSpecificConstru
+    // ctorsNoHint expects instantiation of a class with only `(Integer)`/
+    // `(String)` constructors and no default one to fail with
+    // BeanInstantiationException, not silently succeed — mirrors real
+    // SimpleInstantiationStrategy.instantiate/BeanUtils.instantiateClass,
+    // which both throw `BeanInstantiationException(clazz, "No default
+    // constructor found", ex)` from this exact case, same as the
+    // abstract/interface delegation just above.)
+    let has_no_arg_ctor = match exact_cid.or_else(|| ctx.class_id_by_name(&class_name)) {
+        Some(cid) => ctx.class_declares_method(cid, "<init>", "()V"),
+        None => ctx.method_exists(&class_name, "<init>", "()V"),
+    };
+    if !has_no_arg_ctor {
         tracing::debug!(
-            "[spring-shim] SimpleInstantiationStrategy.instantiate: {} has no no-arg ctor, skipping",
+            "[spring-shim] SimpleInstantiationStrategy.instantiate: {} has no no-arg ctor, delegating to BeanUtils.instantiateClass for the real exception",
             class_name
         );
-        return Ok(Some(Value::Object(None)));
+        return ctx.invoke(
+            "org/springframework/beans/BeanUtils",
+            "instantiateClass",
+            "(Ljava/lang/Class;)Ljava/lang/Object;",
+            &[Value::Object(Some(mirror))],
+        );
     }
 
     // Allocate + run `<init>()V` against the EXACT class id from the mirror when
@@ -2445,6 +2485,38 @@ enum BeanClassResolution {
     NoClass,
 }
 
+/// Resolve `internal` (the plain dot-to-slash conversion of `dotted`) to a
+/// `ClassId`, retrying with a `ClassUtils.forName`-style dot-vs-dollar
+/// nested-class fallback on failure: if the segment right after the
+/// second-to-last dot starts with an uppercase letter (looks like a class
+/// name), replace only the LAST dot with `$` and retry once. Mirrors
+/// `ClassUtils.forName` (`spring-core/.../ClassUtils.java:310-323`) exactly —
+/// XML bean definitions may spell a nested class with dotted notation
+/// (`Outer.Inner`) instead of `Outer$Inner`.
+fn resolve_class_id_with_nested_retry(
+    ctx: &mut dyn NativeContext,
+    dotted: &str,
+    internal: &str,
+) -> Option<cratonvm_types::ClassId> {
+    if let Some(c) = ctx.class_id_by_name(internal) {
+        return Some(c);
+    }
+    if let Ok(c) = ctx.ensure_class_initialized(internal) {
+        return Some(c);
+    }
+    let last_dot = dotted.rfind('.')?;
+    let prev_dot = dotted[..last_dot].rfind('.')?;
+    let next_char = dotted[prev_dot + 1..].chars().next()?;
+    if !next_char.is_ascii_uppercase() {
+        return None;
+    }
+    let nested_internal = format!("{}${}", &internal[..last_dot], &internal[last_dot + 1..]);
+    if let Some(c) = ctx.class_id_by_name(&nested_internal) {
+        return Some(c);
+    }
+    ctx.ensure_class_initialized(&nested_internal).ok()
+}
+
 /// Resolve a bean's class from `AbstractBeanDefinition`/`RootBeanDefinition`'s
 /// single `beanClass` field — an `Object` holding EITHER an already-resolved
 /// `Class` mirror OR the still-unresolved `String` class name. (`setBeanClassName`
@@ -2487,22 +2559,46 @@ fn resolve_bean_class_field(ctx: &mut dyn NativeContext, recv: ObjectRef) -> Bea
         }
     };
 
-    let internal = name.replace('.', "/");
     // Resolve the name to a Class; only classes actually on the classpath
     // succeed (a named-but-unloadable class yields Missing → partial-cp skip).
-    let cid = match ctx.class_id_by_name(&internal) {
+    // Mirrors `ClassUtils.forName`'s dot-vs-dollar nested-class fallback: XML
+    // bean definitions may spell a nested class with dotted notation
+    // (`Outer.Inner` instead of `Outer$Inner`) — e.g.
+    // `DestroyMethodInferenceTests-context.xml`'s bean `x8` uses
+    // `...DestroyMethodInferenceTests.WithInheritedCloseMethod`. A naive
+    // `name.replace('.', "/")` produces a bogus internal name for that case
+    // (an extra path segment instead of a `$`), which never resolves — so we
+    // retry with only the LAST dot replaced by `$` when the segment right
+    // after the previous dot looks like a class name (starts uppercase),
+    // exactly like the real Java method.
+    let internal = name.replace('.', "/");
+    let cid = match resolve_class_id_with_nested_retry(ctx, &name, &internal) {
         Some(c) => c,
-        None => match ctx.ensure_class_initialized(&internal) {
-            Ok(c) => c,
-            Err(e) => {
-                if dbg {
-                    eprintln!(
-                        "[resolve-shim] Missing: {internal} not on classpath (ensure_class_initialized ERR: {e:?})"
-                    );
+        None => {
+            // Second-chance nested-class retry, without the "does the
+            // preceding segment look like a class name" heuristic guard
+            // `resolve_class_id_with_nested_retry` applies — covers names
+            // where that stricter `ClassUtils.forName`-style check doesn't
+            // fire but the last-dot-as-`$` substitution still resolves to a
+            // real loadable class (fix/aop-cluster's nested-class fix).
+            let nested_cid = name.rfind('.').and_then(|last_dot| {
+                let nested_dotted = format!("{}${}", &name[..last_dot], &name[last_dot + 1..]);
+                let nested_internal = nested_dotted.replace('.', "/");
+                ctx.class_id_by_name(&nested_internal)
+                    .or_else(|| ctx.ensure_class_initialized(&nested_internal).ok())
+            });
+            match nested_cid {
+                Some(c) => c,
+                None => {
+                    if dbg {
+                        eprintln!(
+                            "[resolve-shim] Missing: {internal} not on classpath (incl. nested-class retry)"
+                        );
+                    }
+                    return BeanClassResolution::Missing;
                 }
-                return BeanClassResolution::Missing;
             }
-        },
+        }
     };
     if dbg {
         eprintln!("[resolve-shim] Resolved: {internal}");
@@ -2775,12 +2871,36 @@ fn bdru_register_bean_definition(ctx: &mut dyn NativeContext, args: &[Value]) ->
         if let Some(cn) = ctx.read_string(s) {
             if !cn.is_empty() {
                 let internal = cn.replace('.', "/");
-                let loadable = ctx.class_id_by_name(&internal).is_some()
+                let mut loadable = ctx.class_id_by_name(&internal).is_some()
                     || ctx.class_id_by_name(&cn).is_some()
                     // FIX(bug-B): see the getBeanClassName filter above — a
                     // loaded-set miss is NOT proof of absence; probe the classpath
                     // resource before dropping a legitimately-loadable bean.
                     || ctx.find_resource(&format!("{internal}.class")).is_some();
+                // FIX: nested-class dotted convention (see the identical
+                // fallback in `abstract_bean_definition_get_bean_class_name`
+                // above for the full rationale) — a bean class name like
+                // "pkg.Outer.Inner" is only loadable at "pkg/Outer$Inner",
+                // not "pkg/Outer/Inner". Without this, a legitimately
+                // loadable nested-class aspect bean (e.g.
+                // `<aop:aspect ref="testAspect">` pointing at a test's
+                // static nested aspect class) never even gets its
+                // `BeanDefinition` registered, so later lookups fail with
+                // "Can't determine type of bean" / NoSuchBeanDefinitionException.
+                if !loadable {
+                    if let Some(last_dot) = cn.rfind('.') {
+                        let nested_dotted = format!("{}${}", &cn[..last_dot], &cn[last_dot + 1..]);
+                        let nested_internal = nested_dotted.replace('.', "/");
+                        if ctx.class_id_by_name(&nested_internal).is_some()
+                            || ctx.class_id_by_name(&nested_dotted).is_some()
+                            || ctx
+                                .find_resource(&format!("{nested_internal}.class"))
+                                .is_some()
+                        {
+                            loadable = true;
+                        }
+                    }
+                }
                 if !loadable {
                     tracing::warn!(
                         "[bean-orphan] SKIP registering '{}' (class '{}' not loadable)",

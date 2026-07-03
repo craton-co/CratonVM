@@ -158,6 +158,21 @@ pub fn weakref_null_referents_pre_gc(shared: &SharedVm) {
         let rp = shared.ref_processor.lock();
         rp.weak_phantom_active_pairs()
     };
+    // RandomizedContext WeakHashMap<Thread,...> fix: publish this cycle's
+    // referent addresses so the non-moving young sweep can recognize a
+    // kept-in-place (unpromoted) survivor as having genuinely survived (see
+    // gc_quiescence::is_watched_referent). Unconditional — even an empty
+    // list must be published so a previous cycle's entries can never leak
+    // into this one.
+    let watch_addrs: Vec<usize> = pairs.iter().map(|&(_, referent)| referent).collect();
+    if std::env::var_os("CRATONVM_DBG_WATCHREF").is_some() {
+        eprintln!(
+            "[watchref] publishing {} watched referent(s): {:x?}",
+            watch_addrs.len(),
+            watch_addrs
+        );
+    }
+    cratonvm_gc::gc_quiescence::set_watched_referents(&watch_addrs);
     if pairs.is_empty() {
         return;
     }
@@ -473,13 +488,35 @@ fn stw_take_over_and_wait(
             warned = true;
         }
     }
+    // A4 (fork6-fjp) — helper-window coverage. The barrier is satisfied, so
+    // every remaining un-scanned root holder is a BLOCKED thread (excluded via
+    // `threads_blocked`, covered only by its `deposit_root_snapshot`, which
+    // never scans JIT frames). A worker blocked in `join()`/park under
+    // JIT-compiled `runWorker`/`doExec` frames that are the sole holder of a
+    // forked subtask would otherwise lose it to the non-moving sweep (the
+    // Fork6 stale all-zero receivers). Scan each remaining peer's register
+    // file + used stack once, contributing roots only when the stack actually
+    // carries a JIT return address. Gated to collections where the gap can
+    // exist at all: a blocked thread while some thread holds live JIT frames.
+    let mut helper_windows = 0usize;
+    if xt::helper_window_scan_enabled()
+        && shared.gc_barrier.blocked_count() > 0
+        && crate::jit::conservative_roots::any_thread_in_jit()
+    {
+        let (windows, _roots) =
+            xt::helper_window_pass(&taken, &|a| shared.heap.is_object_address(a), xt_roots);
+        helper_windows = windows;
+    }
     // Publish any reserved TLAB tails still present after the barrier is
     // satisfied. Usually only forcibly-stopped in-JIT peers have one; collecting
     // all live threads also hardens the sweep against a blocked/tearing-down
     // thread that missed its retire before it left the counted mutator set.
     // Cleared by the caller after the collection completes.
     let regions = shared.thread_registry.collect_reserved_tlab_tails();
-    if taken.count() > 0 || !regions.is_empty() {
+    if taken.count() > 0 || helper_windows > 0 || !regions.is_empty() {
+        // Helper-window roots are conservative (unprovable coverage) — the
+        // collection must stay non-moving so a false-positive candidate can
+        // only over-retain, never relocate under a live JIT/blocked frame.
         cratonvm_gc::gc_quiescence::mark_moving_young_coverage_incomplete();
         shared.heap.set_jit_tlab_skip_regions(&regions);
     }
@@ -2470,8 +2507,22 @@ fn maybe_concurrent_gc(shared: &SharedVm, thread: &mut JvmThread) {
 
     let (old_gen_base, old_gen_size) = shared.heap.old_gen_info();
 
-    // Create a temporary concurrent marker for this cycle
-    let marker = cratonvm_gc::ConcurrentMarker::new(old_gen_base, old_gen_size);
+    // Create a temporary concurrent marker for this cycle.
+    //
+    // fork6 GC_STRESS fix — build it on the heap's SHARED SATB queue + phase
+    // state (attached via `enable_concurrent_gc` at SharedVm construction).
+    // The previous `ConcurrentMarker::new` created a private queue + state per
+    // cycle while the heap's `satb_barrier` gated on the HEAP's (formerly
+    // never-attached) instances: the write barrier was a hard no-op, nothing
+    // ever reached this cycle's remark, and the concurrent mark effectively
+    // ran against live mutators with no write barrier — the sweep then freed
+    // old objects whose only reference moved during the concurrent phase.
+    let marker = cratonvm_gc::ConcurrentMarker::with_shared(
+        old_gen_base,
+        old_gen_size,
+        shared.concurrent_satb.clone(),
+        shared.concurrent_gc_state.clone(),
+    );
 
     // Phase 1: Initial Mark — brief STW pause
     let initial_mark_done = shared.gc_barrier.brief_stw_counted(
@@ -2481,11 +2532,27 @@ fn maybe_concurrent_gc(shared: &SharedVm, thread: &mut JvmThread) {
             // Collect root pointers for old-gen marking
             let roots = collect_roots(shared, thread);
             let snapshot_roots = shared.thread_registry.collect_all_root_snapshots();
-            let root_ptrs: Vec<*mut u8> = roots
+            let mut root_ptrs: Vec<*mut u8> = roots
                 .iter()
                 .chain(snapshot_roots.iter())
                 .map(|r| r.as_ptr())
                 .collect();
+            // fork6 GC_STRESS fix — young→old references are mandatory
+            // old-marking roots. `initial_mark` filters this list with
+            // `old_gen.contains`, so an old object whose only path from a
+            // root goes THROUGH a young object (root → young holder → old
+            // target) was invisible and the sweep freed it live. Selective
+            // promotion mass-produces exactly that shape (it tenures a
+            // pinned young holder's children), which is why the Fork6Hard
+            // GC_STRESS lane corrupted even single-threaded during clinit.
+            // Safe here: brief STW, mutators quiesced, TLABs retired.
+            root_ptrs.extend(
+                shared
+                    .heap
+                    .collect_young_to_old_roots()
+                    .into_iter()
+                    .map(|a| a as *mut u8),
+            );
             if let Some(guard) = shared.heap.old_gen_lock() {
                 marker.initial_mark(&root_ptrs, &*guard);
             }
@@ -2502,7 +2569,7 @@ fn maybe_concurrent_gc(shared: &SharedVm, thread: &mut JvmThread) {
     }
 
     // Phase 3: Remark — brief STW pause
-    shared.gc_barrier.brief_stw_counted(
+    let remark_done = shared.gc_barrier.brief_stw_counted(
         thread.thread_id,
         || u32::try_from(shared.thread_registry.alive_count()).unwrap_or(u32::MAX),
         || {
@@ -2513,16 +2580,40 @@ fn maybe_concurrent_gc(shared: &SharedVm, thread: &mut JvmThread) {
             shared.heap.flush_thread_satb();
             let roots = collect_roots(shared, thread);
             let snapshot_roots = shared.thread_registry.collect_all_root_snapshots();
-            let root_ptrs: Vec<*mut u8> = roots
+            let mut root_ptrs: Vec<*mut u8> = roots
                 .iter()
                 .chain(snapshot_roots.iter())
                 .map(|r| r.as_ptr())
                 .collect();
+            // fork6 GC_STRESS fix — refresh the young→old roots at remark
+            // too: a young→old edge created during the concurrent phase
+            // (e.g. a promoted child stored into a fresh young holder) must
+            // be in the final bitmap before the sweep.
+            root_ptrs.extend(
+                shared
+                    .heap
+                    .collect_young_to_old_roots()
+                    .into_iter()
+                    .map(|a| a as *mut u8),
+            );
             if let Some(guard) = shared.heap.old_gen_lock() {
                 marker.remark(&root_ptrs, &*guard);
             }
         },
     );
+
+    // fork6 GC_STRESS fix — the remark STW is NOT optional. If another
+    // thread's STW won the race (`brief_stw_counted` returned false — a
+    // near-certainty under allocation storms, where a young-GC request is
+    // always pending), the closure never ran: the SATB queue is undrained
+    // and the roots were never rescanned, so the mark bitmap is NOT final.
+    // The old code fell through to the sweep anyway and freed live objects.
+    // Abort the cycle instead (deactivate the barrier, discard the bitmap);
+    // the next `old_gen_needs_gc` trigger starts over.
+    if !remark_done {
+        marker.abort_cycle();
+        return;
+    }
 
     // Phase 4: Concurrent Sweep
     if let Some(mut guard) = shared.heap.old_gen_lock() {
@@ -2531,6 +2622,11 @@ fn maybe_concurrent_gc(shared: &SharedVm, thread: &mut JvmThread) {
             tracing::debug!("Concurrent GC: swept {} old-gen objects", swept,);
         }
     }
+    // Cycle complete — phase back to Idle (the write barrier's
+    // `is_marking_active()` gate is already false after remark, but leaving
+    // the shared state at `ConcurrentSweep` would misreport the VM as
+    // mid-cycle to any observer).
+    marker.finish_cycle();
 }
 
 // ---------------------------------------------------------------------------
@@ -18028,6 +18124,17 @@ fn force_native_over_real_jdk_bytecode(
     {
         return true;
     }
+    // WF-XNIO: `OptionMap$Builder.addAll(OptionMap)` copies through
+    // `OptionMap.iterator()`. Our XNIO map/builder state lives in native side
+    // tables, and the synthetic array iterator can resolve as
+    // `java/lang/Object.next()` through this path. Force the registered native
+    // to copy entries directly; companion gate in vm_exec.rs.
+    if class_name == "org/xnio/OptionMap$Builder"
+        && method_name == "addAll"
+        && method_descriptor == "(Lorg/xnio/OptionMap;)Lorg/xnio/OptionMap$Builder;"
+    {
+        return true;
+    }
     matches!(
         (class_name, method_name, method_descriptor),
         ("java/lang/ClassLoader", "setDefaultAssertionStatus", "(Z)V")
@@ -24632,6 +24739,59 @@ fn execute_invokevirtual_vtable_fast(
             if &**rcv_name == "java/lang/annotation/AnnotationProxy" {
                 drop(cm);
                 return Ok(CachedCallResult::CacheMiss);
+            }
+            // Dynamic-proxy default-method dispatch guard. A JDK dynamic
+            // proxy must route EVERY interface method call — including
+            // concrete default methods like `AgeHolder.age()` — through its
+            // `InvocationHandler.invoke()` (see `is_proxy_dispatch` in
+            // `execute_invoke_kind`, which does this correctly). This vtable
+            // fast path installs a direct `VirtualBytecode` target keyed by
+            // `receiver_class_id` alone; since every proxy instance sharing
+            // an interface set shares one generated `$ProxyN` class id, the
+            // FIRST call that resolves a default method here poisons the
+            // cache for that call site, so a LATER call on a *different*
+            // proxy instance of the same generated class dispatches straight
+            // to the default method's bytecode and skips the handler
+            // entirely (observed: `AspectJAutoProxyCreatorTests.twoAdviceAspectPrototype`/
+            // `twoAdviceAspectSingleton` advice silently not firing on the
+            // second proxy instance).
+            // Force the slow path for any proxy receiver so `is_proxy_dispatch`
+            // is consulted on every call; cost is zero on non-proxy dispatch.
+            //
+            // NOTE: walk the chain using the ALREADY-HELD `cm` guard rather
+            // than calling `class_chain_reaches_proxy_instance` (which takes
+            // its own `shared.class_manager.read()`) — a nested second read
+            // acquisition on the same thread self-deadlocks under
+            // parking_lot's writer-preferring fairness once any writer is
+            // queued, since the outer guard here is never dropped before the
+            // inner one blocks.
+            {
+                const MAX_DEPTH: usize = 32;
+                const PROXY_INSTANCE: &str = "java/lang/reflect/Proxy$Instance";
+                let mut current = Some(receiver_class_id);
+                let mut is_proxy = false;
+                for _ in 0..MAX_DEPTH {
+                    let cid = match current {
+                        Some(c) => c,
+                        None => break,
+                    };
+                    let class = match cm.get_class(cid) {
+                        Some(c) => c,
+                        None => break,
+                    };
+                    if &*class.name == PROXY_INSTANCE {
+                        is_proxy = true;
+                        break;
+                    }
+                    if &*class.name == "java/lang/Object" {
+                        break;
+                    }
+                    current = class.superclass;
+                }
+                if is_proxy {
+                    drop(cm);
+                    return Ok(CachedCallResult::CacheMiss);
+                }
             }
             // `URLClassLoader.findClass` invoked on a SUBCLASS receiver (the
             // native is registered on `URLClassLoader`, not the subclass, so the

@@ -22,7 +22,7 @@ $CV --java-home "$JDK" -cp <dir> <Repro>  # CratonVM (reproduces the gap)
 | `spring-bug-08-…` | `spring-bug-08-proxy-serialization/ProxySer.java` | serialize→deserialize a `Serializable` JDK proxy → **`UnsatisfiedLinkError: Module.defineModule0`** on deserialize. HotSpot `RESULT=OK`. |
 | `keycloak-15-…` | `keycloak-15-path-root/PathRoot.java` | `Paths.get("C:\\foo\\bar")` → `getRoot()=null`, `nameCount=3` (HotSpot `C:\`, 2). |
 | `keycloak-16-…` | `keycloak-16-stream-onclose/StreamOnClose.java` | `onClose` handler dropped (close() no-op) **and** eager `peek` (`peeked=5` vs lazy 1). |
-| `bug06-fam5-…` | `bug06-fam5-reflection-null/Refl5.java` | reflection-surface diff vs HotSpot (the *common* cases pass; doc needs the narrow failing path attributed). |
+| `bug06-fam5-…` | `bug06-fam5-reflection-null/Refl5.java` | ✅ **CLOSED 2026-07-02** — probe ==HotSpot in nojit+jit on dev `ffb247e5`; the suite-level `getDeclaredMethod on null` ×28 is extinct (0 instances in the clean 2026-06-30/07-01 re-runs + fresh 196-class sweep). Doc: `docs/internal/fixed-suite-bugs/bug06-fam5-reflection-getdeclaredmethod-null.md`. |
 | `springrepos-…` (latent deep recursion) | `springrepos-deep-recursion/GroovyNestProbe.java` | deeply-nested Groovy closures; clean `dev` runs slow-not-crash — the native-stack overflow only with the unmerged cold-path JIT experiment. |
 | `jit-regalloc-callee-saved-clobber-family` | `jit-regalloc-dup_x1/Dupx.java` | the bare `tab[index++]` `dup_x1` idiom — **does NOT** reproduce alone (matches HotSpot); kept as the negative control showing the family bug is method-shape-specific. |
 

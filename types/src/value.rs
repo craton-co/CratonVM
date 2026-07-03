@@ -9,11 +9,9 @@
 //! Java object. The `Value` layout is size/alignment-asserted to stay
 //! compatible with the JIT slot layout.
 
-use std::collections::HashSet;
 use std::fmt;
 use std::ptr::NonNull;
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Mutex, OnceLock};
+use std::sync::atomic::{AtomicPtr, AtomicU64, Ordering};
 
 /// A JVM runtime value.
 ///
@@ -121,32 +119,146 @@ fn debug_assert_aligned(ptr: *mut u8) {
 // a stable integer, so we derive a non-zero u64 token from it via its `Hash`.
 const SINGLE_THREAD_GUARD_UNSET: u64 = 0;
 static SINGLE_THREAD_GUARD: AtomicU64 = AtomicU64::new(SINGLE_THREAD_GUARD_UNSET);
-static KNOWN_OBJECT_REFS: OnceLock<Mutex<HashSet<usize>>> = OnceLock::new();
+// ---------------------------------------------------------------------------
+// Object-reference provenance bitmap (context-free decode hardening)
+// ---------------------------------------------------------------------------
+//
+// Context-free decoders (`decode_value`, `CompactValue::to_value`) must not
+// fabricate an `ObjectRef` out of arbitrary long bits whose pattern merely
+// *looks* like a pointer (HIGH long↔object type-confusion). Every pointer
+// that legitimately becomes an object reference crosses the unsafe
+// `ObjectRef::from_raw` / `from_raw_nonnull` boundary, so provenance is
+// recorded there and consulted at decode time.
+//
+// This was first implemented as a global `Mutex<HashSet<usize>>`. That
+// serialized every `ObjectRef` construction AND every object-slot decode on
+// one process-global mutex, and — because entries were never evicted while
+// arena addresses recycle — the set grew monotonically until every probe was
+// a cache miss. Measured: ~1.7x wall-time regression on the allocation-churn
+// bintrees18 benchmark. It is now a lock-free two-level atomic bitmap over
+// the 47-bit user address space:
+//
+//   * granule: 64 bytes — one bit per 64-byte-aligned address block;
+//   * leaf: covers 1 GiB of address space = 2^24 bits = 2 MiB, allocated
+//     zeroed on first record into that GiB and never freed;
+//   * L1: a static array of 2^17 `AtomicPtr` leaf slots (1 MiB of .bss).
+//
+// Record = two loads + (only if the bit is not yet set) one `fetch_or`.
+// Check = two loads + a bit test. No locks anywhere; memory is bounded by
+// 2 MiB per GiB of address space that ever hosted an object.
+//
+// SECURITY TRADEOFF (vs. the exact HashSet): membership is per 64-byte
+// granule, so a fabricated payload landing within 64 bytes of a
+// once-recorded reference is accepted. This is equivalent-in-the-limit to
+// the exact set: the set never evicted while the allocator recycles arena
+// addresses, so over a process lifetime exact membership converges to "every
+// address the heap ever handed out" anyway. Both are heuristic backstops —
+// the load-bearing defense against long↔object confusion remains the typed
+// decode paths (`decode_value_checked`, `decode_by_descriptor`,
+// `to_value_checked`), which validate against the live heap.
+//
+// Never-evict semantics are intentional and match the previous
+// implementation: a stale-but-once-valid pointer stays "known" (the decode
+// then degrades or survives via the GC's own stale-ref containment); only
+// bit patterns that were NEVER a reference are rejected here.
 
-fn known_object_refs() -> &'static Mutex<HashSet<usize>> {
-    KNOWN_OBJECT_REFS.get_or_init(|| Mutex::new(HashSet::new()))
+/// log2 of the provenance granule (64 bytes).
+const PROVENANCE_GRANULE_SHIFT: u32 = 6;
+/// log2 of the address span one leaf covers (1 GiB).
+const PROVENANCE_LEAF_COVER_SHIFT: u32 = 30;
+/// Granule bits per leaf: 2^(30-6) = 2^24.
+const PROVENANCE_LEAF_GRANULES: usize = 1 << (PROVENANCE_LEAF_COVER_SHIFT - PROVENANCE_GRANULE_SHIFT);
+/// `u64` words per leaf: 2^24 / 64 = 2^18 (2 MiB).
+const PROVENANCE_LEAF_WORDS: usize = PROVENANCE_LEAF_GRANULES / 64;
+/// L1 slots: 47-bit address space / 1 GiB per leaf = 2^17.
+const PROVENANCE_L1_LEN: usize = 1 << (47 - PROVENANCE_LEAF_COVER_SHIFT);
+
+/// Top-level table: one lazily-allocated leaf bitmap per GiB of address
+/// space. A null slot means "no object reference ever recorded in this GiB".
+static PROVENANCE_L1: [AtomicPtr<AtomicU64>; PROVENANCE_L1_LEN] =
+    [const { AtomicPtr::new(std::ptr::null_mut()) }; PROVENANCE_L1_LEN];
+
+/// Split a plausible pointer into (L1 slot, word-in-leaf, bit mask).
+///
+/// Callers must have already checked [`plausible_heap_pointer`]; that caps
+/// `raw` below 2^47, which bounds the L1 index below `PROVENANCE_L1_LEN`.
+#[inline(always)]
+fn provenance_indices(raw: u64) -> (usize, usize, u64) {
+    let granule = raw >> PROVENANCE_GRANULE_SHIFT;
+    let l1 = (raw >> PROVENANCE_LEAF_COVER_SHIFT) as usize;
+    let word = ((granule as usize) & (PROVENANCE_LEAF_GRANULES - 1)) >> 6;
+    let bit = 1u64 << (granule & 63);
+    (l1, word, bit)
 }
 
-fn lock_known_object_refs() -> std::sync::MutexGuard<'static, HashSet<usize>> {
-    known_object_refs()
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
+/// Allocate and publish the leaf for an L1 slot (first record into that GiB).
+/// Cold: happens at most once per GiB of address space per process.
+#[cold]
+#[inline(never)]
+fn provenance_leaf_alloc(slot: &AtomicPtr<AtomicU64>) -> *mut AtomicU64 {
+    let layout = std::alloc::Layout::array::<AtomicU64>(PROVENANCE_LEAF_WORDS).unwrap();
+    // Zeroed = every granule starts "unknown".
+    let fresh = unsafe { std::alloc::alloc_zeroed(layout) } as *mut AtomicU64;
+    if fresh.is_null() {
+        std::alloc::handle_alloc_error(layout);
+    }
+    // AcqRel publish pairs with the Acquire loads in record/check so the
+    // zeroed contents are visible before the pointer is. The losing racer
+    // frees its copy and adopts the winner's.
+    match slot.compare_exchange(
+        std::ptr::null_mut(),
+        fresh,
+        Ordering::AcqRel,
+        Ordering::Acquire,
+    ) {
+        Ok(_) => fresh,
+        Err(winner) => {
+            unsafe { std::alloc::dealloc(fresh as *mut u8, layout) };
+            winner
+        }
+    }
 }
 
 #[inline]
 fn record_object_ref_payload(ptr: *mut u8) {
     let raw = ptr as u64;
-    if plausible_heap_pointer(raw) {
-        lock_known_object_refs().insert(ptr as usize);
+    if !plausible_heap_pointer(raw) {
+        return;
+    }
+    let (l1, word, bit) = provenance_indices(raw);
+    let slot = &PROVENANCE_L1[l1];
+    let mut leaf = slot.load(Ordering::Acquire);
+    if leaf.is_null() {
+        leaf = provenance_leaf_alloc(slot);
+    }
+    // SAFETY: `leaf` points to PROVENANCE_LEAF_WORDS live AtomicU64 words
+    // (published above, never freed); `word` is in-bounds by construction.
+    let w = unsafe { &*leaf.add(word) };
+    // In steady state the granule bit is already set (arena reuse), so the
+    // hot path is a single relaxed load with no store traffic. Relaxed is
+    // enough for the word itself: any cross-thread transfer of the pointer
+    // value synchronizes-with on its own (and today Java execution is
+    // single-OS-thread — see the tripwire above), ordering this record
+    // before any remote decode's check.
+    if w.load(Ordering::Relaxed) & bit == 0 {
+        w.fetch_or(bit, Ordering::Relaxed);
     }
 }
 
 #[inline]
 pub(crate) fn object_ref_payload_is_known(raw: u64) -> bool {
-    if !plausible_heap_pointer(raw) || raw > usize::MAX as u64 {
+    if !plausible_heap_pointer(raw) {
         return false;
     }
-    lock_known_object_refs().contains(&(raw as usize))
+    let (l1, word, bit) = provenance_indices(raw);
+    let leaf = PROVENANCE_L1[l1].load(Ordering::Acquire);
+    if leaf.is_null() {
+        return false;
+    }
+    // SAFETY: non-null leaves point to PROVENANCE_LEAF_WORDS live AtomicU64
+    // words (never freed); `word` is in-bounds by construction.
+    let w = unsafe { &*leaf.add(word) };
+    w.load(Ordering::Relaxed) & bit != 0
 }
 
 /// Derive a stable, non-zero u64 token for the current OS thread.
@@ -914,6 +1026,29 @@ mod tests {
             decode_value_checked(unseen, VTAG_OBJECT, |_| false),
             Value::Object(None)
         ));
+    }
+
+    /// Pins the provenance-bitmap granule semantics: recording a reference
+    /// marks its whole 64-byte granule known (a documented false-positive
+    /// tradeoff vs. the old exact set — see the module note on
+    /// PROVENANCE_L1), while the neighboring granule stays unknown.
+    ///
+    /// Uses an address region no other test records into, since the bitmap
+    /// is process-global and `cargo test` shares one process.
+    #[test]
+    fn provenance_bitmap_granule_semantics() {
+        let base = 0x0000_4A11_2233_4400u64; // 64-byte aligned, unique region
+        assert!(!object_ref_payload_is_known(base));
+        assert!(!object_ref_payload_is_known(base + 0x40));
+        let _obj = unsafe { ObjectRef::from_raw(base as *mut u8) };
+        // The recorded address and its granule-mates are known …
+        assert!(object_ref_payload_is_known(base));
+        assert!(object_ref_payload_is_known(base + 8));
+        assert!(object_ref_payload_is_known(base + 0x38));
+        // … the adjacent granule is not, and implausible bits never are.
+        assert!(!object_ref_payload_is_known(base + 0x40));
+        assert!(!object_ref_payload_is_known(base + 1)); // unaligned
+        assert!(!object_ref_payload_is_known(0));
     }
 
     #[test]

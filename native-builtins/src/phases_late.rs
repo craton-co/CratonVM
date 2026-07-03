@@ -5304,6 +5304,115 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
         });
     }
 
+    // FileSystemProvider.getFileStore(Path) — abstract on the base, so the
+    // synthetic default provider (stamped as the literal
+    // `java/nio/file/spi/FileSystemProvider` class, not a concrete
+    // sun.nio.fs.* subclass) lacked it: `Files.getFileStore(path)`'s real
+    // bytecode is `return provider(path).getFileStore(path);`, and the
+    // `provider()` native above returns exactly that synthetic instance, so
+    // the invokevirtual landed on the abstract declaration —
+    // "AbstractMethodError: FileSystemProvider.getFileStore(Path) has no
+    // Code attribute" — killing any Elasticsearch/Lucene engine test whose
+    // constructor path calls `Environment.getFileStore(...)` (8 CratonVM-only
+    // suite failures incl. InternalEngineFieldInfoCachingTests,
+    // ReadOnlyEngineTests, NoOpEngineTests). Return a synthetic `FileStore`
+    // (see below) rather than null — the JDK contract never returns null
+    // here, and ES's `ESFileStore` wrapper unconditionally calls through to
+    // `in.getTotalSpace()`/`in.isReadOnly()`/etc. on the result.
+    r.register(
+        fsp,
+        "getFileStore",
+        "(Ljava/nio/file/Path;)Ljava/nio/file/FileStore;",
+        |ctx, args| {
+            let path_obj = obj_arg(args, 1)?;
+            let p = p57_read_path(ctx, path_obj);
+            Ok(Some(Value::Object(Some(p57_alloc_file_store(ctx, &p)))))
+        },
+    );
+
+    // java.nio.file.FileStore — every accessor is abstract in the real JDK
+    // (delegated to sun.nio.fs.{Windows,Unix}FileStore in a real install),
+    // so an instance stamped as the literal abstract `FileStore` class needs
+    // every one of them registered directly or each individual accessor call
+    // throws its own "has no Code attribute" AbstractMethodError in turn.
+    // Field 0 = backing path string (drives name()/type()); values otherwise
+    // mirror the `java/io/File` disk-space fallback below (`getTotalSpace`
+    // etc. — no portable free-space query, so report "plenty available").
+    {
+        let fs_store = "java/nio/file/FileStore";
+        r.register(fs_store, "name", "()Ljava/lang/String;", |ctx, args| {
+            let this = obj_arg(args, 0)?;
+            let name = match ctx.get_field(this, 0) {
+                Value::Object(Some(s)) => ctx.read_string(s).unwrap_or_default(),
+                _ => String::new(),
+            };
+            Ok(Some(Value::Object(Some(ctx.create_string(&name)))))
+        });
+        r.register(fs_store, "type", "()Ljava/lang/String;", |ctx, _args| {
+            let t = if cfg!(windows) { "NTFS" } else { "ext4" };
+            Ok(Some(Value::Object(Some(ctx.create_string(t)))))
+        });
+        r.register(fs_store, "isReadOnly", "()Z", |_ctx, _args| {
+            Ok(Some(Value::Int(0)))
+        });
+        r.register(fs_store, "getTotalSpace", "()J", |_ctx, _args| {
+            Ok(Some(Value::Long(i64::MAX)))
+        });
+        r.register(fs_store, "getUsableSpace", "()J", |_ctx, _args| {
+            Ok(Some(Value::Long(i64::MAX)))
+        });
+        r.register(fs_store, "getUnallocatedSpace", "()J", |_ctx, _args| {
+            Ok(Some(Value::Long(i64::MAX)))
+        });
+        // Real JDK's `FileStore.getBlockSize()` default body unconditionally
+        // throws `UnsupportedOperationException` (only OS-specific subclasses
+        // override it) — ES's `FsDirectoryFactory.blockSize` calls this
+        // directly, so give a real answer instead of matching that throw.
+        r.register(fs_store, "getBlockSize", "()J", |_ctx, _args| {
+            Ok(Some(Value::Long(4096)))
+        });
+        r.register(
+            fs_store,
+            "supportsFileAttributeView",
+            "(Ljava/lang/Class;)Z",
+            |_ctx, _args| Ok(Some(Value::Int(1))),
+        );
+        r.register(
+            fs_store,
+            "supportsFileAttributeView",
+            "(Ljava/lang/String;)Z",
+            |_ctx, _args| Ok(Some(Value::Int(1))),
+        );
+        r.register(
+            fs_store,
+            "getFileStoreAttributeView",
+            "(Ljava/lang/Class;)Ljava/nio/file/attribute/FileStoreAttributeView;",
+            |_ctx, _args| Ok(Some(Value::Object(None))),
+        );
+        r.register(
+            fs_store,
+            "getAttribute",
+            "(Ljava/lang/String;)Ljava/lang/Object;",
+            |_ctx, _args| {
+                Err(RuntimeError::UnsupportedOperationException {
+                    message: "no such attribute".into(),
+                }
+                .into())
+            },
+        );
+        r.register(fs_store, "toString", "()Ljava/lang/String;", |ctx, args| {
+            let this = obj_arg(args, 0)?;
+            let name = match ctx.get_field(this, 0) {
+                Value::Object(Some(s)) => ctx.read_string(s).unwrap_or_default(),
+                _ => String::new(),
+            };
+            let t = if cfg!(windows) { "NTFS" } else { "ext4" };
+            Ok(Some(Value::Object(Some(
+                ctx.create_string(&format!("{name} ({t})")),
+            ))))
+        });
+    }
+
     r.register(
         fsp,
         "installedProviders",
@@ -8967,6 +9076,26 @@ fn p57_alloc_jrt_filesystem(ctx: &mut dyn NativeContext, java_home: &str) -> Obj
     let jh = ctx.create_string(java_home);
     ctx.set_field(fs, P57_FS_JRT_FIELD, Value::Object(Some(jh)));
     fs
+}
+
+/// Allocate a synthetic `java/nio/file/FileStore` for `path`. Field 0 holds
+/// the store's `name()` — the drive root on Windows (`C:\`), or `/` on
+/// Unix — since real JDK FileStore names are the mount point, not the
+/// queried path itself.
+fn p57_alloc_file_store(ctx: &mut dyn NativeContext, path: &str) -> ObjectRef {
+    let store = alloc_concurrent_synthetic(ctx, "java/nio/file/FileStore", 1);
+    let name = if cfg!(windows) {
+        std::path::Path::new(path)
+            .components()
+            .next()
+            .map(|c| c.as_os_str().to_string_lossy().to_string())
+            .unwrap_or_else(|| "C:\\".to_string())
+    } else {
+        "/".to_string()
+    };
+    let s = ctx.create_string(&name);
+    ctx.set_field(store, 0, Value::Object(Some(s)));
+    store
 }
 
 /// The per-VM default-FileSystem SINGLETON. Identity matters: callers
@@ -23183,6 +23312,29 @@ pub(crate) fn register_p62_char_buffer(r: &mut NativeMethodRegistry) {
             0
         })))
     });
+    // CharBuffer.isReadOnly()/isDirect() are abstract in the real JDK (each
+    // concrete Heap/Direct/View subclass overrides them) — every OTHER typed
+    // view buffer (Int/Long/Short/Float/DoubleBuffer) gets these registered
+    // directly on its own class, but CharBuffer was missing from that list.
+    // Objects allocated straight against the literal `java/nio/CharBuffer`
+    // class (this file's `wrap`/`allocate` above use it directly rather than
+    // a Heap-prefixed subclass) then hit the abstract declaration on
+    // `isReadOnly()` — "AbstractMethodError: java/nio/Buffer.isReadOnly()Z
+    // has no Code attribute" (CratonVM resolves the abstract method all the
+    // way up to `Buffer` because neither `CharBuffer` nor `Buffer` had a
+    // native registered) — killing any caller whose real-JDK bytecode reads
+    // `hasArray()`/`isReadOnly()` on a CharBuffer (e.g. Lucene's vector codec
+    // tests decoding index metadata strings).
+    r.register(cb, "isReadOnly", "()Z", |ctx, args| {
+        let this = obj_arg(args, 0)?;
+        Ok(Some(Value::Int(
+            match ctx.get_field_by_name(this, "isReadOnly") {
+                Value::Int(v) => v,
+                _ => 0,
+            },
+        )))
+    });
+    r.register(cb, "isDirect", "()Z", |_ctx, _args| Ok(Some(Value::Int(0))));
     r.register(cb, "arrayOffset", "()I", |ctx, args| {
         let this = obj_arg(args, 0)?;
         match ctx.get_field_by_name(this, "offset") {
@@ -33133,6 +33285,100 @@ pub(crate) fn register_p68_ssl(r: &mut NativeMethodRegistry) {
         // Handshake already done in createSocket
         Ok(None)
     });
+    // getSupportedCipherSuites/getEnabledCipherSuites/getSupportedProtocols/
+    // getEnabledProtocols — same AbstractMethodError family as TC0622's
+    // SSLSession buffer-size gap: the accessors above cover I/O and
+    // lifecycle, but nothing registered these on `javax/net/ssl/SSLSocket`
+    // itself, so `invokeinterface SSLSocket.getEnabledCipherSuites()`
+    // resolved to the abstract interface declaration (no Code) and threw
+    // `AbstractMethodError`. Mirrors the static suite/protocol lists already
+    // used by `SSLEngineImpl` (t27_tls.rs) for consistency; the socket's
+    // handshake already completed in `createSocket`/`accept`, so
+    // enabled == supported here (matches the JDK default before any
+    // `setEnabledCipherSuites` call — this synthetic socket has no
+    // set-side storage, so `set*` below are accepted but not persisted).
+    fn ssl_sock_supported_cipher_suites(ctx: &mut dyn NativeContext) -> ObjectRef {
+        let suites = [
+            "TLS_AES_128_GCM_SHA256",
+            "TLS_AES_256_GCM_SHA384",
+            "TLS_CHACHA20_POLY1305_SHA256",
+            "TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256",
+            "TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256",
+            "TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384",
+            "TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384",
+            "TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305_SHA256",
+            "TLS_ECDHE_RSA_WITH_CHACHA20_POLY1305_SHA256",
+        ];
+        let arr = ctx.new_ref_array(cratonvm_types::ClassId::new(0), suites.len());
+        for (i, &s) in suites.iter().enumerate() {
+            let so = ctx.create_string(s);
+            ctx.set_array_element(arr, i, Value::Object(Some(so)));
+        }
+        arr
+    }
+    r.register(
+        ssl_sock,
+        "getSupportedCipherSuites",
+        "()[Ljava/lang/String;",
+        |ctx, _args| Ok(Some(Value::Object(Some(ssl_sock_supported_cipher_suites(ctx))))),
+    );
+    r.register(
+        ssl_sock,
+        "getEnabledCipherSuites",
+        "()[Ljava/lang/String;",
+        |ctx, _args| Ok(Some(Value::Object(Some(ssl_sock_supported_cipher_suites(ctx))))),
+    );
+    r.register(
+        ssl_sock,
+        "setEnabledCipherSuites",
+        "([Ljava/lang/String;)V",
+        |_ctx, _args| Ok(None),
+    );
+    r.register(
+        ssl_sock,
+        "getSupportedProtocols",
+        "()[Ljava/lang/String;",
+        |ctx, _args| {
+            let arr = ctx.new_ref_array(cratonvm_types::ClassId::new(0), 2);
+            let s1 = ctx.create_string("TLSv1.3");
+            let s2 = ctx.create_string("TLSv1.2");
+            ctx.set_array_element(arr, 0, Value::Object(Some(s1)));
+            ctx.set_array_element(arr, 1, Value::Object(Some(s2)));
+            Ok(Some(Value::Object(Some(arr))))
+        },
+    );
+    r.register(
+        ssl_sock,
+        "getEnabledProtocols",
+        "()[Ljava/lang/String;",
+        |ctx, args| {
+            let this = obj_arg(args, 0)?;
+            // Report the protocol actually negotiated (stored on the
+            // session) alongside TLSv1.2 so callers checking membership
+            // against either standard name succeed.
+            let negotiated = if let Value::Object(Some(session)) =
+                ctx.get_field(this, NEW13_SOCK_SESSION)
+            {
+                match ctx.get_field(session, NEW13_SESS_PROTO) {
+                    Value::Object(Some(s)) => ctx.read_string(s),
+                    _ => None,
+                }
+            } else {
+                None
+            };
+            let proto = negotiated.unwrap_or_else(|| "TLSv1.3".to_string());
+            let arr = ctx.new_ref_array(cratonvm_types::ClassId::new(0), 1);
+            let s = ctx.create_string(&proto);
+            ctx.set_array_element(arr, 0, Value::Object(Some(s)));
+            Ok(Some(Value::Object(Some(arr))))
+        },
+    );
+    r.register(
+        ssl_sock,
+        "setEnabledProtocols",
+        "([Ljava/lang/String;)V",
+        |_ctx, _args| Ok(None),
+    );
     r.register(
         ssl_sock,
         "getInputStream",
