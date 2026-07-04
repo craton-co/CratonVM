@@ -1525,7 +1525,7 @@ fn cglib_guard_value(ctx: &mut dyn NativeContext, name: &str, _bytes: &[u8]) -> 
     None
 }
 
-fn cl_define_class_basic(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+pub(crate) fn cl_define_class_basic(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     // defineClass(String name, byte[] b, int off, int len)
     // args: [this, name, byte_array, offset, length]
     //

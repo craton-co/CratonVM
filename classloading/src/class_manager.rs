@@ -176,6 +176,26 @@ fn is_prohibited_package_name(internal_name: &str) -> bool {
     if internal_name.starts_with("sun/reflect/misc/") {
         return false;
     }
+    // Exemption: `jdk.internal.reflect` is where the JDK generates
+    // `GeneratedMethodAccessorN` / `GeneratedConstructorAccessorN` /
+    // `GeneratedSerializationConstructorAccessorN` classes — for reflective
+    // `Method.invoke`/`Constructor.newInstance` past the inflation threshold,
+    // and (unconditionally, no threshold) for `ObjectStreamClass`'s
+    // serialization constructor, which must invoke the nearest
+    // non-serializable superclass's no-arg constructor and has no other way
+    // to do so. `jdk.internal.reflect.ClassDefiner.defineClass` performs this
+    // define through a throwaway `DelegatingClassLoader` — NOT the bootstrap
+    // loader. Verified on real JDK 21: this define succeeds there, so
+    // blocking it here is a false rejection, not a security fix — it broke
+    // ALL first-use reflective invocation past inflation and ALL
+    // serialization of a class whose nearest non-serializable ancestor has
+    // any constructor logic, with `NoClassDefFoundError: IllegalName: ...`
+    // (when routed through real bytecode `preDefineClass`) or `SecurityException:
+    // Prohibited package name` (native path) — both symptoms of this same
+    // over-broad prefix.
+    if internal_name.starts_with("jdk/internal/reflect/") {
+        return false;
+    }
     const PROHIBITED_PREFIXES: [&str; 3] = ["java", "jdk/internal", "sun"];
     for prefix in PROHIBITED_PREFIXES {
         if let Some(rest) = internal_name.strip_prefix(prefix) {
