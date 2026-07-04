@@ -507,6 +507,16 @@ mod windows_fault {
     const EXCEPTION_PRIV_INSTRUCTION: u32 = 0xC000_0096;
     const EXCEPTION_INT_DIVIDE_BY_ZERO: u32 = 0xC000_0094;
     const EXCEPTION_STACK_OVERFLOW: u32 = 0xC000_00FD;
+    // Raised by `__fastfail` / `RaiseFailFastException` — in particular the
+    // MSVC `/GS` stack-cookie check calling `__report_gsfailure` on a
+    // detected stack-buffer overrun. This is exactly the "Exception code:
+    // 0xc0000409" signature Windows Error Reporting shows for these crashes
+    // when there is no VEH watching for it: the process fastfails with an
+    // empty stderr and no hs_err log. Treating it as fatal here lets us
+    // capture the faulting PC/RVA and a raw backtrace before the OS
+    // terminates the process (fastfail exceptions still reach registered
+    // vectored handlers even though they are non-continuable).
+    const EXCEPTION_STACK_BUFFER_OVERRUN: u32 = 0xC000_0409;
 
     const EXCEPTION_CONTINUE_SEARCH: i32 = 0;
 
@@ -524,6 +534,7 @@ mod windows_fault {
             EXCEPTION_PRIV_INSTRUCTION => "EXCEPTION_PRIV_INSTRUCTION",
             EXCEPTION_INT_DIVIDE_BY_ZERO => "EXCEPTION_INT_DIVIDE_BY_ZERO (SIGFPE)",
             EXCEPTION_STACK_OVERFLOW => "EXCEPTION_STACK_OVERFLOW",
+            EXCEPTION_STACK_BUFFER_OVERRUN => "EXCEPTION_STACK_BUFFER_OVERRUN (fastfail)",
             _ => "UNKNOWN",
         }
     }
@@ -537,6 +548,7 @@ mod windows_fault {
                 | EXCEPTION_PRIV_INSTRUCTION
                 | EXCEPTION_INT_DIVIDE_BY_ZERO
                 | EXCEPTION_STACK_OVERFLOW
+                | EXCEPTION_STACK_BUFFER_OVERRUN
         )
     }
 
@@ -999,13 +1011,21 @@ mod windows_fault {
                 path_buf.len() as u32,
             );
             let loaded = if len > 0 {
+                // DllSize=0 leaves SymFromAddr unable to tell whether a
+                // queried address falls within this module's range (it
+                // reliably fails with ERROR_INVALID_ADDRESS/487 even though
+                // SymLoadModuleExW itself reports success) — pass a
+                // generous over-estimate; SymLoadModuleExW only needs the
+                // registered range to COVER real addresses, not match the
+                // image size exactly.
+                const DLL_SIZE_OVERESTIMATE: u32 = 0x8000000; // 128 MiB
                 SymLoadModuleExW(
                     process,
                     core::ptr::null_mut(),
                     path_buf.as_ptr(),
                     core::ptr::null(),
                     module_base as u64,
-                    0,
+                    DLL_SIZE_OVERESTIMATE,
                     core::ptr::null_mut(),
                     0,
                 )

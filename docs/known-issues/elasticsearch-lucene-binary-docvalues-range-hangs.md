@@ -1,9 +1,10 @@
 # Elasticsearch Lucene binary doc-values range query hangs
 
-Status: open (root causes #1 and #2 FIXED; a third, unidentified blocker remains)
+Status: open (root causes #1 and #2 FIXED; a narrower residual stall in
+`testAllEqual` remains, not yet isolated)
 
 Date observed: 2026-07-02
-Date updated: 2026-07-04 (later same day)
+Date updated: 2026-07-04 (third update, same day)
 
 ## Summary
 
@@ -34,50 +35,96 @@ Root-caused to **two independent bugs** stacked in the same test run:
    design and the standalone `FSTCompiler`/`NodeHash` stress repro used to
    isolate it without needing the ES harness.
 
-2. **FIXED** (branch `investigate/es-lrucache-rrwl-contention`, merged to
-   dev): root-caused the `ReentrantReadWriteLock`/`LRUQueryCache` contention
-   from #2 above to a genuine permanent-hang bug, not just slowness. JDK 25's
-   `ReentrantReadWriteLock$Sync` extends the newer 64-bit-state
-   `AbstractQueuedLongSynchronizer`, not the classic int-state
-   `AbstractQueuedSynchronizer`. CratonVM already has a hand-maintained JIT
-   skip-list (`vm/src/jit/skip_list.rs`) banning compilation of the classic
-   class's `acquire`/`release`/`signalNext`/`ConditionObject` methods — they
-   allocate a fresh `ExclusiveNode`/`ConditionNode` and immediately `putfield`
-   `prev`/`next`/`waiter` into it, a known allocate-then-putfield
-   register-allocation miscompile that corrupts the waiter linked list's
-   next-pointer, permanently losing wakeups. `AbstractQueuedLongSynchronizer`
-   is a near-line-for-line port with the identical hazard in its own
-   identically-shaped node types, but being a textually distinct class name it
-   matched none of the existing (bare `(class, method)` tuple, no inheritance)
-   skip-list entries, so its hot path stayed JIT-eligible and hit the same
-   miscompile. Confirmed and fixed via a minimal, Lucene-free 4-thread
-   `ReentrantReadWriteLock` stress repro that went from an unbounded, CPU-idle
-   hang (proving parked threads, not a spin/livelock) to completing correctly
-   in ~10-12s once the sibling skip-list entries were added.
+2. **FIXED** (two commits, both merged to dev — `d6f26b56` on
+   `investigate/es-lrucache-rrwl-contention` and a follow-up `96656a8e` on the
+   same branch): root-caused the `ReentrantReadWriteLock`/`LRUQueryCache`
+   contention from #2 above to a genuine permanent-hang bug, not just
+   slowness, requiring two rounds to fully close:
 
-3. **OPEN, now the sole blocker**: with both #1 and #2 fixed (and both
-   individually verified — `cargo test -p cratonvm-jit`/`-p cratonvm-vm`
-   green, `bt18` checksum unchanged, and the standalone RRWL stress repro now
-   passing), the actual `Integer`/`LongRandomBinaryDocValuesRangeQueryTests`
-   classes **still do not complete** within a generous window (tested up to
-   480s; HotSpot passes in ~15s). Process CPU-time sampling during a run shows
-   real work happening for the first ~30-40s (JIT warmup, early random
-   iterations) followed by the process going essentially idle (near-zero CPU
-   growth) for the remainder — the same "parked with no wakeup" signature as
-   bug #2, but occurring later in the run and in a path not yet identified.
-   The stack dump at timeout still shows contention on
-   `LRUQueryCache.putIfAbsent` → `ReentrantReadWriteLock$WriteLock.lock()` →
-   `AbstractQueuedLongSynchronizer.acquire`, which IS now interpreter-only
-   (per fix #2) — so this is either (a) a third, similar
-   allocate-then-putfield-class miscompile in a *different* synchronization
-   primitive somewhere in Lucene's concurrent `IndexSearcher`/`TaskExecutor`/
-   `LRUQueryCache` machinery that hasn't been identified yet, or (b) severe
-   but finite cumulative slowdown from forcing `AbstractQueuedLongSynchronizer`
-   permanently into the interpreter under heavy concurrent contention (many
-   leaf searches all serializing through one now-interpreted lock). Not yet
-   distinguished — needs either a longer soak run to see if it eventually
-   completes, or a fresh stack-dump-based investigation of whatever hot path
-   is active during the still-time-CPU window right before the stall.
+   - **Round 1** (`d6f26b56`): JDK 25's `ReentrantReadWriteLock$Sync` extends
+     the newer 64-bit-state `AbstractQueuedLongSynchronizer`, not the classic
+     int-state `AbstractQueuedSynchronizer`. CratonVM has a hand-maintained
+     JIT skip-list (`vm/src/jit/skip_list.rs`) banning compilation of the
+     classic class's `acquire`/`release`/`signalNext`/`ConditionObject`
+     methods — allocate-then-putfield register-allocation miscompile,
+     corrupting the waiter linked list and losing wakeups permanently.
+     `AbstractQueuedLongSynchronizer` is a near-line-for-line port with the
+     identical hazard, but being a textually distinct class name matched none
+     of the existing entries. Added the missing sibling entries plus
+     `ReentrantReadWriteLock$Sync`/`HoldCounter`.
+   - **Round 2** (`96656a8e`): round 1 did not actually take effect. An
+     unrelated concurrent commit (`a4913d8b`, "disable callee-saved GPR local
+     homes") had gated the *entire* `is_known_miscompile` skip-list —
+     including round 1's brand-new entries — behind
+     `callee_saved_gpr_local_homes_enabled()`, an env var that defaults to
+     off on x86_64. That commit's premise (every skip-list entry belonged to
+     one now-closed regalloc family) does not hold for this family: a
+     16-thread heavy-contention repro reproduces a permanent hang for BOTH
+     `ReentrantReadWriteLock` *and plain `ReentrantLock`* with the gate at
+     its default value, and `CRATONVM_DBG_JITC` tracing pinned the actually-
+     compiled culprits as `AbstractQueued(Long)?Synchronizer$Node`'s
+     `getAndUnsetStatus`/`clearStatus` and the synchronizer's own
+     `tryInitializeHead` (allocates the CLH queue's sentinel node and
+     `casHead`s it in — same hazard, but reachable only once per lock
+     instance's first contended acquire, hence invisible to light-contention
+     repros) — none of which were ever on the historical list at all, for
+     either AQS variant. Fixed with a new, unconditional
+     `is_known_miscompile_aqs_family` covering the `Node` class and every
+     queue-management helper for both variants.
+
+   Verified after round 2: a 16-thread heavy-contention repro for both
+   `ReentrantReadWriteLock` and `ReentrantLock` now completes with the exact
+   correct result (was an unconditional, unbounded hang before). `cargo test
+   -p cratonvm-jit`/`-p cratonvm-vm` (115 test groups) green on both rounds
+   and after merging. `bt18` checksum unchanged (`68332206`).
+
+3. **OPEN, narrower residual**: with #1 and #2 (both rounds) fixed and
+   merged, the real `LongRandomBinaryDocValuesRangeQueryTests` now makes
+   *substantial, concrete* progress — it used to stall permanently on the
+   very first test method (`testRandomTiny`); it now runs through most of
+   the class and reaches `testAllEqual` before stalling. At that point two
+   threads (the main test-runner thread and one `TaskExecutor` pool worker)
+   are permanently parked at the identical bytecode offset in
+   `AbstractQueuedLongSynchronizer.acquire`, contending for the same
+   `LRUQueryCache` write lock, confirmed unmoving across a 600-second window
+   (only one stack dump each, no redump churn, vs. hundreds of redumps for
+   the unrelated `ThreadLeakControl` monitor thread — i.e. genuinely parked,
+   not slow).
+
+   `testAllEqual`'s shape: `Arrays.fill()` of `atLeast(1000)` range entries
+   with a single random range repeated identically, then `verify()` — so
+   every leaf search during verification uses an `equals()`-identical query,
+   hammering the *same* `LRUQueryCache` entry far more intensely than the
+   varied-bounds tests. Two increasingly targeted standalone Lucene-only
+   repros were built to isolate this in isolation from the full ES/
+   randomizedtesting harness (both real `IndexSearcher`/`LRUQueryCache`/
+   `ExecutorService`, no ES-specific code):
+   - A generic cache-stress repro (8 segments, 500 searches, 5 rotating
+     queries) — completed correctly, no hang.
+   - A repro shaped exactly like `testAllEqual` (2 segments so
+     `IndexSearcher.search` splits into exactly 1 inline + 1 pooled
+     partition, matching the observed 2-thread contention; 1000 identical
+     repeated searches against the same query object) — also completed
+     correctly, no hang.
+
+   Neither reproduced the stall, so the real trigger is narrower or
+   different from what's been tried — possibly requiring the actual
+   `atLeast(1000)` scaling (can be considerably larger than 1000 under
+   certain random seeds/multipliers), the specific `BinaryDocValuesRangeQuery`
+   query type rather than a plain `TermQuery`, or some interaction with
+   `RandomIndexWriter`/`AssertingIndexSearcher`/`AssertingWeight`'s extra
+   wrapping layers that the minimal repros don't exercise. Not yet
+   distinguished; needs either a bigger/more faithful standalone repro or a
+   fresh stack-dump-based investigation targeting `testAllEqual` specifically.
+
+   Separately and NOT believed related (no code in this investigation
+   touches GC header-writing, only JIT compile-eligibility): a `bt18` run
+   during round-2 verification logged transient `GC: inconsistent header`/
+   `mark_young: rejecting object ... corrupt header` warnings that hadn't
+   appeared in earlier runs, before the GC's own defensive re-sync path
+   recovered and the checksum still matched exactly. Likely from an
+   unrelated concurrent commit on `dev`; flagged here in case it resurfaces
+   elsewhere, but out of scope for this investigation.
 
 ## Current full-suite result
 

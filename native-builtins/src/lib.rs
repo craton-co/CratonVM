@@ -18574,7 +18574,29 @@ pub fn register_essential_natives(registry: &mut NativeMethodRegistry) {
             };
             // Canonicalise custom GMT-offset ids ("GMT+2" -> "GMT+02:00") so
             // getID() matches the real JDK; IANA/named ids are kept verbatim.
-            let id = normalize_gmt_custom_id(&id).unwrap_or(id);
+            let custom_gmt = normalize_gmt_custom_id(&id);
+            // Real JDK's TimeZone.getTimeZone falls back to the "GMT" zone
+            // (getID() == "GMT") for any string it can't resolve against
+            // tzdata — callers like StringUtils.parseTimeZoneString rely on
+            // exactly that fallback to detect a bogus zone id (e.g. "foo")
+            // and throw IllegalArgumentException. Without it, CratonVM used
+            // to echo the bogus string back as the ID, so that detection
+            // never fired (Jackson2ObjectMapperBuilderTests
+            // .wrongTimeZoneStringSetter expected the throw and never got
+            // it). CratonVM has no full tzdata, so approximate "resolvable"
+            // with the curated offset table plus the universal IANA
+            // Area/Location pattern (a '/' in the id) — real zone ids all
+            // match one of those; "foo" matches neither.
+            let recognized = id == "GMT"
+                || id == "UTC"
+                || custom_gmt.is_some()
+                || tz_standard_offset_seconds(&id).is_some()
+                || id.contains('/');
+            let id = if recognized {
+                custom_gmt.unwrap_or(id)
+            } else {
+                "GMT".to_string()
+            };
             Ok(Some(alloc_synth_timezone(ctx, &id)))
         },
     );
@@ -44416,7 +44438,6 @@ pub(crate) fn url_parse(ctx: &mut dyn NativeContext, this: ObjectRef, url_str: &
     // which used to leave `URI` field 5 empty and broke
     // `getSchemeSpecificPart() -> new File(...)` for Spring Boot's launcher.
     if let Some(rest) = url_str.strip_prefix("file:") {
-        let full_obj = ctx.create_string(url_str);
         let path_str = rest.to_string();
         let path_obj = ctx.create_string(&path_str);
         let proto_obj = ctx.create_string("file");
@@ -44426,7 +44447,22 @@ pub(crate) fn url_parse(ctx: &mut dyn NativeContext, this: ObjectRef, url_str: &
         ctx.set_field(this, URL_FIELD_PORT, Value::Int(-1));
         ctx.set_field(this, URL_FIELD_PATH, Value::Object(Some(path_obj)));
         ctx.set_field(this, URL_FIELD_QUERY, Value::Object(None));
-        ctx.set_field(this, URL_FIELD_FULL, Value::Object(Some(full_obj)));
+        // Intentionally skip writing `URL_FIELD_FULL` (slot index 5): for a
+        // real-JDK URL instance that index aliases the real `authority`
+        // field (see the sibling `jar:` fast path below, which already
+        // avoids this). Stuffing the whole raw string there made real
+        // bytecode's `getAuthority()` return e.g. `"file:/opt/foo/bar"`
+        // instead of `null`, which corrupted any later `new URL(URL base,
+        // String spec)` merge that used this URL as its base (Woodstox's
+        // `URLUtil.urlFromSystemId(String, URL)`, hit while resolving a
+        // DTD's external SYSTEM entity, inherited the bogus authority and
+        // real JDK's own validation rejected it with
+        // `MalformedURLException: Illegal character found in authority:
+        // '/'` — see Jaxb2CollectionHttpMessageConverterTests
+        // .readXmlRootElementExternalEntityEnabled()). Explicitly null the
+        // named `authority` field instead; `getProtocol`/`toExternalForm`
+        // reconstruct the string from protocol/host/port/path already.
+        ctx.set_field_by_name(this, "authority", Value::Object(None));
         return;
     }
 
@@ -52604,7 +52640,7 @@ fn native_proxy_dispatch_invoke(ctx: &mut dyn NativeContext, args: &[Value]) -> 
                 return Ok(Some(crate::lang_class::box_value(ctx, Value::Int(hash), "I")));
             }
             "equals" => {
-                let mut other = match args_arr {
+                let other = match args_arr {
                     Some(arr) if ctx.array_length(arr) > 0 => ctx.get_array_element(arr, 0),
                     _ => Value::Object(None),
                 };
@@ -52623,9 +52659,55 @@ fn native_proxy_dispatch_invoke(ctx: &mut dyn NativeContext, args: &[Value]) -> 
                             if crate::lang_class::ctx_class_name_of(ctx, other_handler)
                                 == "java/lang/annotation/AnnotationProxy"
                             {
-                                other = Value::Object(Some(other_handler));
+                                let eq = crate::lang_class::ctx_annotation_proxy_equals(
+                                    ctx,
+                                    handler,
+                                    Value::Object(Some(other_handler)),
+                                );
+                                let flag = Value::Int(if eq { 1 } else { 0 });
+                                return Ok(Some(crate::lang_class::box_value(ctx, flag, "Z")));
                             }
                         }
+                        // `other` is a foreign `Annotation` implementation — e.g. Spring's
+                        // own `synthesize()`, whose handler is Spring's
+                        // `SynthesizedMergedAnnotationInvocationHandler`, not our
+                        // `AnnotationProxy` — so it can never be recognized by the
+                        // structural comparison above. Mirror
+                        // `annotation_proxy_invoke_shared`'s equivalent delegation
+                        // (vm_exec.rs): if `other` implements the SAME annotation type,
+                        // let ITS `equals` decide (it presumably knows how to compare
+                        // member values reflectively against any `Annotation`, the way
+                        // HotSpot's `AnnotationInvocationHandler.equals` does). Without
+                        // this, comparing a reflection-obtained annotation against a
+                        // Spring-synthesized one of the same type spuriously returns
+                        // false (MergedAnnotationsTests.equalsForSynthesizedAnnotations).
+                        if let Value::Object(Some(type_mirror)) =
+                            ctx.get_field(handler, crate::lang_class::ANN_PROXY_TYPE_MIRROR)
+                        {
+                            if let Some(ann_cid) = ctx.class_id_from_mirror(type_mirror) {
+                                let other_cid = ctx.class_id_of_object(other_obj);
+                                if other_cid == ann_cid || ctx.is_subclass(other_cid, ann_cid) {
+                                    let other_class_name =
+                                        crate::lang_class::ctx_class_name_of(ctx, other_obj);
+                                    // `other.equals(proxy)` is a REAL bytecode call with a
+                                    // primitive `Z` return — `ctx.invoke` naturally yields a
+                                    // raw `Value::Int`, but `native_proxy_dispatch_invoke`'s
+                                    // OWN return must be a boxed `Object` (the ORIGINAL
+                                    // generated proxy body CHECKCASTs it to Boolean before
+                                    // `booleanValue()`) — same boxing requirement as the
+                                    // hashCode/equals arms above.
+                                    let result = ctx.invoke(
+                                        &other_class_name,
+                                        "equals",
+                                        "(Ljava/lang/Object;)Z",
+                                        &[other, Value::Object(Some(proxy))],
+                                    )?;
+                                    let flag = result.unwrap_or(Value::Int(0));
+                                    return Ok(Some(crate::lang_class::box_value(ctx, flag, "Z")));
+                                }
+                            }
+                        }
+                        return Ok(Some(crate::lang_class::box_value(ctx, Value::Int(0), "Z")));
                     }
                 }
                 let eq = crate::lang_class::ctx_annotation_proxy_equals(ctx, handler, other);
@@ -52637,7 +52719,19 @@ fn native_proxy_dispatch_invoke(ctx: &mut dyn NativeContext, args: &[Value]) -> 
                 let result = ctx.create_string(&s);
                 return Ok(Some(Value::Object(Some(result))));
             }
-            "getClass" => {
+            // `getClass`/`annotationType`/`getType` all return the same stored
+            // annotation-type mirror (field `ANN_PROXY_TYPE_MIRROR`) in
+            // `annotation_proxy_dispatch_impl`. `annotationType()` in
+            // particular is called repeatedly by Spring's own meta-annotation
+            // introspection machinery (`AnnotationTypeMappings`,
+            // `TypeMappedAnnotation`, ...), which is exactly the kind of hot,
+            // repeated call that gets JIT-compiled and hits this 2nd-call-site
+            // path — leaving `Method.invoke` against a wrong/stale receiver
+            // type and surfacing as Spring's own
+            // `Assert.isInstanceOf` / `Method.invoke` IllegalArgumentException
+            // ("... must be an instance of interface ...") deep inside
+            // MergedAnnotations/AnnotatedElementUtils.
+            "getClass" | "annotationType" | "getType" => {
                 return Ok(Some(ctx.get_field(handler, crate::lang_class::ANN_PROXY_TYPE_MIRROR)));
             }
             _ => {}
@@ -53210,6 +53304,22 @@ fn define_or_get_proxy_class(
         // as-is. Verified by the `emitted_class_is_straight_line_no_handlers`
         // regression test in `classloading::proxy_gen`.
         skip_verification: false,
+        // A generated `$ProxyN` MUST implement the EXACT interface `ClassId`
+        // it was generated for (the one the caller passed to
+        // `Proxy.newProxyInstance`/`getProxyClass`, or that annotation
+        // reflection resolved via the declaring class's loader) — there is
+        // no "which same-named copy is more correct" ambiguity the way there
+        // can be for an ordinary subclass's supertype link. Without this,
+        // linking the generated `implements <Iface>` reference falls back to
+        // the loader-agnostic `load_class(name)` (since
+        // `CRATONVM_LOADER_AWARE_RESOLUTION` defaults off) and can silently
+        // bind to a DIFFERENT same-named class already loaded elsewhere
+        // (e.g. the application loader's copy), producing a `$ProxyN` that
+        // `interfaceClass.isInstance(proxy)` and `Method.invoke` both reject
+        // — reproduced with a plain `Proxy.newProxyInstance` + custom
+        // `ClassLoader`, independent of annotations. See "Residual issue B" in
+        // docs/known-issues/mergedannotationstests-proxy-class-identity-reflection-vs-synthesize.md.
+        force_loader_faithful_linking: true,
         ..Default::default()
     };
     // Failure mode (3): class definition through the normal loader

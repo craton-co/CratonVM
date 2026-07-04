@@ -140,6 +140,14 @@ pub struct DefineClassFull {
     /// the ordinary `ClassLoader.defineClass` path leaves it false so the
     /// spoofing guard still applies there.
     pub privileged_define: bool,
+    /// Force loader-faithful supertype/interface linking for this define —
+    /// mirrors `cratonvm_classloading::DefineClassOptions::force_loader_faithful_linking`.
+    /// Set by generated `$ProxyN` class definitions
+    /// (`native_builtins::define_or_get_proxy_class`) so the proxy links
+    /// against the EXACT interface `ClassId` it was generated for, rather
+    /// than the loader-agnostic global `load_class(name)` fallback that
+    /// `CRATONVM_LOADER_AWARE_RESOLUTION` (default off) otherwise gates.
+    pub force_loader_faithful_linking: bool,
 }
 
 /// The lambda-call-site metadata needed to round-trip a serializable lambda.

@@ -132,17 +132,25 @@ fn set_date_millis(ctx: &mut dyn NativeContext, this: ObjectRef, millis: i64) {
 
 /// Percent/`+`-decode into the raw byte sequence, without assuming any
 /// particular charset for the final bytes-to-`String` step (the caller picks
-/// that — see `url_decode`/`url_decode_named`).
-fn url_decode_bytes(input: &str) -> Vec<u8> {
+/// that — see `url_decode`/`url_decode_named`). Real JDK's `URLDecoder.decode`
+/// throws `IllegalArgumentException` on a malformed escape rather than
+/// passing it through unchanged.
+fn url_decode_bytes(input: &str) -> Result<Vec<u8>, &'static str> {
     let mut result = Vec::new();
     let bytes = input.as_bytes();
     let mut i = 0;
     while i < bytes.len() {
-        if bytes[i] == b'%' && i + 2 < bytes.len() {
-            if let (Some(hi), Some(lo)) = (hex_digit(bytes[i + 1]), hex_digit(bytes[i + 2])) {
-                result.push(hi << 4 | lo);
-                i += 3;
-                continue;
+        if bytes[i] == b'%' {
+            if i + 2 >= bytes.len() {
+                return Err("URLDecoder: Incomplete trailing escape (%) pattern");
+            }
+            match (hex_digit(bytes[i + 1]), hex_digit(bytes[i + 2])) {
+                (Some(hi), Some(lo)) => {
+                    result.push(hi << 4 | lo);
+                    i += 3;
+                    continue;
+                }
+                _ => return Err("URLDecoder: Illegal hex characters in escape (%) pattern"),
             }
         } else if bytes[i] == b'+' {
             result.push(b' ');
@@ -152,11 +160,11 @@ fn url_decode_bytes(input: &str) -> Vec<u8> {
         result.push(bytes[i]);
         i += 1;
     }
-    result
+    Ok(result)
 }
 
-fn url_decode(input: &str) -> String {
-    String::from_utf8_lossy(&url_decode_bytes(input)).into_owned()
+fn url_decode(input: &str) -> Result<String, &'static str> {
+    Ok(String::from_utf8_lossy(&url_decode_bytes(input)?).into_owned())
 }
 
 /// `URLDecoder.decode(String, String)` / `(String, Charset)` — decode the
@@ -167,8 +175,11 @@ fn url_decode(input: &str) -> String {
 /// replacement characters (U+FFFD) instead of the correct Cyrillic text —
 /// breaking `ServletServerHttpRequestTests.getFormBodyWithNotUtf8Charset`
 /// and any non-UTF-8 form-urlencoded request body.
-fn url_decode_named(input: &str, charset_name: &str) -> String {
-    crate::charset::decode_str_named(charset_name, &url_decode_bytes(input))
+fn url_decode_named(input: &str, charset_name: &str) -> Result<String, &'static str> {
+    Ok(crate::charset::decode_str_named(
+        charset_name,
+        &url_decode_bytes(input)?,
+    ))
 }
 
 fn hex_digit(b: u8) -> Option<u8> {
@@ -1050,28 +1061,33 @@ fn register_class_new_instance(r: &mut NativeMethodRegistry) {
 fn register_number_defaults(r: &mut NativeMethodRegistry) {
     let num = "java/lang/Number";
 
-    // byteValue()B — returns (byte) intValue()
+    // byteValue()B — returns (byte) intValue(). Real JDK's `Number`
+    // default is exactly `(byte) intValue()`, dispatched virtually — it
+    // must NOT assume the value lives in field 0, because that's only
+    // true for the built-in boxed wrappers (Integer/Long/Float/Double).
+    // `BigDecimal` (no field-0 primitive at all — arbitrary-precision
+    // fields instead) silently returned 0 for every value under the old
+    // field-read shortcut, which broke JSON-B/Yasson's untyped numeric
+    // binding (every JSON number decodes to a `BigDecimal`) — see
+    // JsonbHttpMessageConverterTests.readUntyped(). Delegating to the
+    // virtual `intValue()` handles BigDecimal, BigInteger, and any other
+    // Number subclass correctly, while still being correct for the boxed
+    // wrappers since their own `intValue()` natives already do the right
+    // thing.
     r.register(num, "byteValue", "()B", |ctx, args| {
         let this = obj_arg(args, 0)?;
-        // intValue is stored in field 0 for boxed numbers
-        let int_val = match ctx.get_field(this, 0) {
-            Value::Int(v) => v,
-            Value::Long(v) => v as i32,
-            Value::Float(f) => f as i32,
-            Value::Double(d) => d as i32,
+        let int_val = match ctx.invoke_virtual(this, "intValue", "()I", &[])? {
+            Some(Value::Int(v)) => v,
             _ => 0,
         };
         Ok(Some(Value::Int((int_val as i8) as i32)))
     });
 
-    // shortValue()S — returns (short) intValue()
+    // shortValue()S — returns (short) intValue(); see byteValue() above.
     r.register(num, "shortValue", "()S", |ctx, args| {
         let this = obj_arg(args, 0)?;
-        let int_val = match ctx.get_field(this, 0) {
-            Value::Int(v) => v,
-            Value::Long(v) => v as i32,
-            Value::Float(f) => f as i32,
-            Value::Double(d) => d as i32,
+        let int_val = match ctx.invoke_virtual(this, "intValue", "()I", &[])? {
+            Some(Value::Int(v)) => v,
             _ => 0,
         };
         Ok(Some(Value::Int((int_val as i16) as i32)))
@@ -1584,7 +1600,15 @@ fn register_url_codec(r: &mut NativeMethodRegistry) {
         |ctx, args| {
             let str_obj = obj_arg(args, 0)?;
             let text = ctx.read_string(str_obj).unwrap_or_default();
-            let decoded = url_decode(&text);
+            let decoded = match url_decode(&text) {
+                Ok(d) => d,
+                Err(message) => {
+                    return Err(RuntimeError::IllegalArgumentException {
+                        message: message.to_string(),
+                    }
+                    .into())
+                }
+            };
             let result = ctx.create_string(&decoded);
             Ok(Some(Value::Object(Some(result))))
         },
@@ -1602,7 +1626,15 @@ fn register_url_codec(r: &mut NativeMethodRegistry) {
                 Some(Value::Object(Some(o))) => ctx.read_string(*o).unwrap_or_default(),
                 _ => String::new(),
             };
-            let decoded = url_decode_named(&text, &charset_name);
+            let decoded = match url_decode_named(&text, &charset_name) {
+                Ok(d) => d,
+                Err(message) => {
+                    return Err(RuntimeError::IllegalArgumentException {
+                        message: message.to_string(),
+                    }
+                    .into())
+                }
+            };
             let result = ctx.create_string(&decoded);
             Ok(Some(Value::Object(Some(result))))
         },
@@ -1620,7 +1652,15 @@ fn register_url_codec(r: &mut NativeMethodRegistry) {
                 Some(v @ Value::Object(Some(_))) => crate::charset::charset_name_of(ctx, *v),
                 _ => String::new(),
             };
-            let decoded = url_decode_named(&text, &charset_name);
+            let decoded = match url_decode_named(&text, &charset_name) {
+                Ok(d) => d,
+                Err(message) => {
+                    return Err(RuntimeError::IllegalArgumentException {
+                        message: message.to_string(),
+                    }
+                    .into())
+                }
+            };
             let result = ctx.create_string(&decoded);
             Ok(Some(Value::Object(Some(result))))
         },
@@ -2266,10 +2306,16 @@ mod tests {
 
     #[test]
     fn test_number_byte_value() {
+        // byteValue()/shortValue() now delegate to the virtual `intValue()`
+        // (matching real JDK's `Number` default and correctly handling
+        // subclasses like BigDecimal that don't store their value as a raw
+        // field-0 primitive) — script the mock's `invoke_virtual` to stand
+        // in for that dispatch.
         let reg = setup();
         let mut ctx = MockNativeContext::new();
         let num = alloc_concurrent_synthetic(&mut ctx, "java/lang/Number", 4);
         ctx.set_field(num, 0, Value::Int(300));
+        ctx.set_invoke_virtual_result(Ok(Some(Value::Int(300))));
 
         let result = call_native(
             &reg,
@@ -2289,6 +2335,7 @@ mod tests {
         let mut ctx = MockNativeContext::new();
         let num = alloc_concurrent_synthetic(&mut ctx, "java/lang/Number", 4);
         ctx.set_field(num, 0, Value::Int(70000));
+        ctx.set_invoke_virtual_result(Ok(Some(Value::Int(70000))));
 
         let result = call_native(
             &reg,
@@ -2580,7 +2627,7 @@ mod tests {
     fn test_url_encode_decode_roundtrip() {
         let original = "key=value&foo=bar baz";
         let encoded = url_encode(original);
-        let decoded = url_decode(&encoded);
+        let decoded = url_decode(&encoded).expect("well-formed escape sequence");
         assert_eq!(decoded, original);
     }
 }

@@ -9,9 +9,61 @@ angles**; this index is the consolidated map. Read it first.
 
 - [http.server cluster: fixes + residuals](http-server-cluster-residuals.md) - core fix: `Collections.emptyListIterator()` mis-stamped as `EmptyIterator` crashed Jetty's `ContextHandler.notifyExitScope` on the main thread (fatal, not per-test) — fixed 8 of 9 ABEND classes. Plus `newSetFromMap(LinkedCaseInsensitiveMap)` losing case-insensitivity (+ a `SetFromMap.size()` follow-on regression), `java.net.URI` malformed-`%`-escape validation + multi-arg query quoting, and `URLDecoder`/`URLEncoder` ignoring non-UTF-8 charsets. 2 residuals open: `ServerHttpsRequestIntegrationTests` self-signed-cert `CertificateEncodingException`, `ZeroCopyIntegrationTests` Jetty-Core zero-copy write-0-bytes.
 
+## 2026-07-04 Keycloak full-suite sweep (branch test/keycloak-fullsuite-20260704)
+
+Ran the 1124 Keycloak JUnit classes not covered by the prior 238-class baseline
+(39 compiled modules, 1362 concrete classes total) — see the harness fix in
+`apps/keycloak-suite-runner/run-keycloak-suite.ps1` (JUnit Platform
+launcher/engines + `junit:junit` were missing from every module's classpath;
+KcRunner always drives tests through the JUnit Platform Launcher regardless of
+whether the module declares JUnit5). Result: 28 PASS, 910 FAIL, 71 CRASH, 115
+EMPTY, 0 HANG, wall time 2469s (41 min) at parallel=2.
+
+One CratonVM bug found and FIXED this session:
+[SmallRyeConfig.getConfigMapping(Class) 1-arg bare-interface AbstractMethodError](../internal/fixed-suite-bugs/smallrye-getconfigmapping-1arg-bare-interface-abstractmethoderror.md).
+
+New OPEN findings from this sweep, roughly by priority (blast radius):
+- [SmallRye Config missing Charset/MemorySize converters](smallrye-config-missing-charset-memorysize-converters.md) — blocks 341+ classes, the single highest-value lever found.
+- [quarkus/runtime CompactValue NaN-box collision SIGSEGV](quarkus-runtime-compactvalue-nanbox-collision-sigsegv.md) — the only *uncaught* native crash in this sweep (4 classes).
+- [crypto/fips1402 CryptoProvider ServiceLoader returns empty](crypto-fips1402-cryptoprovider-serviceloader-empty.md) — 21 classes.
+- [FacadeClassLoader Object.size() NoSuchMethodError + guarded Class-object OOB access](facadeclassloader-object-size-nosuchmethoderror-classoob.md) — confirmed non-fatal (guard-protected) but real; root cause not fully pinned.
+- [quarkus/runtime config-value divergences](quarkus-runtime-config-value-divergences.md) — 3 classes, likely related to the converter gap above.
+- [System Rules getenv() field 'm' reflection mismatch](system-rules-getenv-field-m-reflection.md) — 1 class, narrow.
+- [KcAdmV2HelpTest --help text env-var mentions](kcadmv2-helptext-env-var-mentions.md) — 1 class, possibly a stale test rather than a VM bug.
+
+Already-tracked, not re-documented: the 37 `testsuite/model` CRASHes are the
+existing [Infinispan GlobalConfigurationBuilder.isClustered() NoSuchMethodError](keycloak-model-infinispan-globalconfiguration-isclustered-nosuchmethod.md).
+Not CratonVM bugs: 544 FAILs (`testsuite/integration-arquillian/tests/base`
++ `tests/other/sssd`) are "Not found frontend container: auth-server-undertow"
+— an Arquillian environment/container-provisioning gap in this harness, not a
+VM defect (would fail identically on real HotSpot run the same way). 25
+additional CRASHes (`scim/core`, `ssf/*`, `test-framework/*`,
+`tests/webauthn`, 2×`tests/clustering`) were a harness classpath gap
+(missing `junit:junit`, fixed alongside the JUnit Platform launcher fix
+above), not a VM bug.
+
 ## 2026-07-03 http.client bug cluster (branch fix/http-client-cluster-azure)
 
 - [http.client cluster: redefine-dispatch fix + JDK 21 gaps](http-client-cluster-redefine-dispatch-and-jdk21-gaps.md) - core fix: two of three "native shadow" dispatch paths never checked whether an ANCESTOR class (not just the receiver) was JVMTI-redefined, so Mockito-mocked concrete classes (e.g. `HttpURLConnection`) silently bypassed their own advice. Plus several JDK 21 real-mode native gaps (`JavaLangAccess.defineClass`/`getConstantPool`/`start`, `StackWalker.callStackWalk` overload). 4 residuals documented (Linux-only NIO gaps, a 4-class hang, one order-dependent Mockito state leak, pre-existing `SimpleClientHttpRequestFactoryTests` gaps).
+
+## 2026-07-04 jmx cluster (branch fix/jmx-rmi-cluster)
+
+- FIXED: `sun/nio/ch/FileDispatcherImpl.init0()V` was registered under the
+  wrong native name (`"init"` instead of the real JDK 25 `init0`), so any
+  bytecode path touching `FileDispatcherImpl` (e.g.
+  `ManagementFactory.getPlatformMBeanServer()` on Linux) hit
+  `UnsatisfiedLinkError`, aborting `MBeanClientInterceptorTests`,
+  `RemoteMBeanClientInterceptorTests`, `JmxUtilsTests`,
+  `MBeanServerFactoryBeanTests`. Also landed in this cluster:
+  `jdk/internal/platform/CgroupMetrics.isUseContainerSupport()Z` (previously
+  unregistered, also on the `getPlatformMBeanServer()` boot path), and a
+  `JMXConnectorFactory.newJMXConnector` improvement that delegates to real
+  classpath-declared `JMXConnectorProvider`s (via `ServiceLoader`) before
+  falling back to the "not implemented" IOException — covers `jmxmp`
+  end-to-end with real provider bytecode instead of a canned error.
+- OPEN residual: [MXBeanMapping.toOpenValue AbstractMethodError + InvocationFailureException](spring-jmx-mxbeanmapping-toopenvalue-abstractmethoderror.md)
+  — 4 test methods across 2 classes still fail after the above fixes, on a
+  distinct `com.sun.jmx.mbeanserver.MXBeanMapping` resolution gap.
 
 ## Bug-document lifecycle
 
@@ -428,6 +480,13 @@ regression):
   and its ByteBuddy proxy collides. loadClass-override isolation itself works; this is deeper
   (core class-store change, broad blast radius). Min repro `.scratch-hhsf/IsoProbe3.java`. Same
   family as **SBR-14** / `SC-custom-classloader`.
+- [hib-bytecode-enhancement-loader-faithful-linking.md](hib-bytecode-enhancement-loader-faithful-linking.md) —
+  🔴 **REOPENED 2026-07-04** (moved back from `docs/internal`, where it was mis-archived as
+  "FIXED / ARCHIVED"). Builds on the proxyclassreuse fix above with superclass/interface linking,
+  `invokespecial` owner dispatch, and SessionFactory-build loader-identity fixes — all confirmed
+  genuinely landed on `dev` by a fresh source audit. But `enhancement.lazy.*`/`mapping.lazytoone.*`
+  remain the single largest open Hibernate-enhancement gap (a fresh 18-class sample: 2/18 PASS,
+  14/18 FAIL, 1/18 HANG), not the "separate residual" the archived doc implied.
 - [hib-sortnatural-persistentsortedset-cascade-drop.md](../internal/hibernate-bugs/hib-sortnatural-persistentsortedset-cascade-drop.md) —
   ✅ **FIXED on dev** (`9ac7ef1d`; moved to docs/internal). `SortNaturalTest` (`sorted.set`/`sorted.map`): a cascaded `@OneToMany SortedSet`
   drops an element on **persist** (only 1 of 2 rows inserted; `size()` 2→1). Core `TreeSet` verified

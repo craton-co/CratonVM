@@ -920,7 +920,13 @@ pub fn register_nio_natives_real(r: &mut NativeMethodRegistry) {
             "(Ljava/io/FileDescriptor;Ljava/nio/CharBuffer;)I",
             native_fd_setdirect0,
         );
-        r.register(cls, "init", "()V", native_nt_init);
+        // Real JDK 25 declares `FileDispatcherImpl.init0()` (confirmed via
+        // javap), not `init()` -- that name doesn't exist on this class at
+        // all. The `init()` entry below was a name mismatch that left
+        // `init0` unregistered, so any bytecode path that loads
+        // `FileDispatcherImpl` (e.g. `ManagementFactory.getPlatformMBeanServer()`
+        // on Linux) hit `UnsatisfiedLinkError: sun/nio/ch/FileDispatcherImpl.init0()V`.
+        r.register(cls, "init0", "()V", native_nt_init);
         // map0 / unmap0 / transferTo0 / maxDirectTransferSize0 / force0
         // are registered by `file_channel.rs::register_file_channel_real`
         // (real memmap2 / sendfile / fsync implementations). They were
