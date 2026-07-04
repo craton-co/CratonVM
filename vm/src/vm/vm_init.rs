@@ -1095,6 +1095,20 @@ impl SharedVm {
             let set_id = class_manager
                 .load_class("java/util/Set")
                 .expect("java/util/Set must be loadable");
+            // `Collections.unmodifiableSortedSet`/`unmodifiableNavigableSet`
+            // also allocate `UnmodifiableSet` (see
+            // `native_collections_unmodifiable_set`), so it must declare these
+            // two interfaces too — otherwise a caller-side `(SortedSet)` /
+            // `(NavigableSet)` checkcast on the returned wrapper (e.g.
+            // `IndexVersionUtils.ALL_VERSIONS` typed as `NavigableSet<...>`)
+            // raises ClassCastException even though the native methods for
+            // both surfaces are registered on the wrapper class.
+            let sorted_set_id = class_manager
+                .load_class("java/util/SortedSet")
+                .expect("java/util/SortedSet must be loadable");
+            let navigable_set_id = class_manager
+                .load_class("java/util/NavigableSet")
+                .expect("java/util/NavigableSet must be loadable");
             let map_id = class_manager
                 .load_class("java/util/Map")
                 .expect("java/util/Map must be loadable");
@@ -1125,7 +1139,13 @@ impl SharedVm {
                 ),
                 (
                     "cratonvm/internal/UnmodifiableSet",
-                    &[set_id, collection_id, serializable_id],
+                    &[
+                        set_id,
+                        sorted_set_id,
+                        navigable_set_id,
+                        collection_id,
+                        serializable_id,
+                    ],
                 ),
                 (
                     "cratonvm/internal/UnmodifiableMap",
