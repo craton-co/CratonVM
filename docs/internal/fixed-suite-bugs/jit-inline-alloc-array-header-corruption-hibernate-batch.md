@@ -1,16 +1,25 @@
-# JIT inline-alloc header corruption under Hibernate batch workloads (OOM) — OPEN
+# JIT inline-alloc header corruption under Hibernate batch workloads (OOM) — FIXED
 
-**Status:** OPEN — multiple mechanisms have been ruled out and several real
-bugs have been fixed, but the broader corruption family is not fully closed.
-This pass fixes a shared GenerationalHeap allocation publish-before-initialize
-race; the original Hibernate batch fixture was not present in this checkout
-for an end-to-end rerun.
+**Status:** FIXED on `dev` (fix commit `74dc80b8`, merged by `45a0a858`) for
+the Hibernate batch OOM / corrupt-header symptom described here. The root cause
+was a shared GenerationalHeap allocation publish-before-initialize race. The
+original Hibernate batch fixture was not present in this checkout for an
+end-to-end rerun; validation is the focused allocation-ordering regression test
+plus the full `cratonvm-gc` lib suite listed below.
+
+**Scope note:** the later MiniThrottle / Family-A residual captured at the end
+of this document is not this Hibernate allocation-publication bug. That
+separate root-scan residual remains actively tracked in
+[`docs/known-issues/dohead-jit-heap-corruption-register-invisibility.md`](../../known-issues/dohead-jit-heap-corruption-register-invisibility.md)
+and its repro notes under
+[`docs/known-issues/repros/family-a-throttle-park/`](../../known-issues/repros/family-a-throttle-park/README.md).
+
 **Discovered:** 2026-07-03, while chasing HIB-CV-38 (see
-[`docs/internal/hibernate-bugs/HIB-CV-38-boolean-type-field-static-slot-corruption-FIXED.md`](../internal/hibernate-bugs/HIB-CV-38-boolean-type-field-static-slot-corruption-FIXED.md)
+[`docs/internal/hibernate-bugs/HIB-CV-38-boolean-type-field-static-slot-corruption-FIXED.md`](../hibernate-bugs/HIB-CV-38-boolean-type-field-static-slot-corruption-FIXED.md)
 for the unrelated bug that doc was originally filed for — that one is fixed).
 **Also the likely explanation for HIB-CV-39** (a `DynamicBatchFetchTest` SIGSEGV
 filed before the HIB-CV-38 fix landed): see
-[`docs/internal/hibernate-bugs/HIB-CV-39-dynamicbatchfetch-sigsegv-regression.md`](../internal/hibernate-bugs/HIB-CV-39-dynamicbatchfetch-sigsegv-regression.md)
+[`docs/internal/hibernate-bugs/HIB-CV-39-dynamicbatchfetch-sigsegv-regression.md`](../hibernate-bugs/HIB-CV-39-dynamicbatchfetch-sigsegv-regression.md)
 for the closure reasoning — with HIB-CV-38 fixed, the identical repro no longer
 SIGSEGVs and instead deterministically reproduces this bug.
 
@@ -40,7 +49,7 @@ passes (`ok=1`) and `testMultiLoad` instead hits a plain 120s JUnit
 no GC warnings, no corruption. This confirms the corruption is JIT-inline-alloc
 specific, not present in the interpreter path.
 
-## Why this is a new/open issue, not a reopening
+## Why this was a distinct issue, not a reopening
 
 The warning text (`kind=Object but array_length=N ...; inline-alloc forgot to
 set kind=Array`) is the exact signature documented and marked **FIXED** in
@@ -67,10 +76,9 @@ which of these are now ruled out):
    arrays, HashMap/collection backing arrays, entity instances) — possibly
    exposing a race that needs that heterogeneity (e.g. TLAB-boundary or
    GC-timing interaction the uniform-shape bintrees18 workload doesn't hit).
-   **Still open** — plain `new`'s inline path is ruled out too (see below), so
-   if this is timing/heterogeneity-driven the race must be in a different
-   component than the JIT inline-alloc codegen itself (e.g. the moving young
-   GC's copy/remap routine writing/reading a header on an unrelated object).
+   **Resolved for this Hibernate symptom by the shared allocation-helper fix
+   below** — plain `new`'s inline path was ruled out too (see below), so the
+   race had to live outside the JIT inline-alloc codegen itself.
 3. `class_id=0` in most of the observed warnings is consistent with the
    walker genuinely reading a TLAB-zeroed header (the exact pre-fix
    bintrees18 signature) — suggesting the SAME race, just via a code path the
@@ -108,7 +116,7 @@ is what's under test, same as bintrees18). Three isolated single-class reruns of
    SIGSEGV.**
 2. **`CRATONVM_JIT_DISABLE_INLINE_NEW=1` (JIT still on, `--Xmx 1500m`)**: this
    disables `emit_inline_tlab_new` entirely, forcing every plain `new` through
-   the `jit_new_object` helper — the exact toggle the "Next steps" list below
+   the `jit_new_object` helper — the exact toggle the pre-fix triage list below
    asked for, and the same toggle that isolated the bintrees18 fix. **Did NOT
    suppress the corruption**: identical warning storm (`class_id=2000`,
    `num_slots=1180939`), `OutOfMemoryError` at `ms=499794`. This rules out
@@ -141,7 +149,7 @@ GC's copy/remap routine writing a stale/short header onto an object it
 relocates (which would explain corruption appearing regardless of which JIT
 codegen path allocated the object in the first place).
 
-## Next steps
+## Pre-fix triage notes
 
 - Check whether array allocation (`anewarray`/`newarray`) has its own inline
   TLAB fast path distinct from `emit_inline_tlab_new`, or whether it always
@@ -190,14 +198,14 @@ Validation from branch `codex/hib-inlinealloc-gc-20260703-001`:
   this note are not present in this checkout, so the Hibernate batch repro
   itself was not rerun here.
 
-## 2026-07-03/04 — two real conservative-root-scan bugs found and fixed (session on `fix/family-a-inline-alloc-header`); corruption family only partially closed
+## 2026-07-03/04 — related Family-A follow-up, separately tracked
 
 Deep investigation via a new forensic breadcrumb (`CRATONVM_DBG_A2`, extended
 this session to also record JIT inline-`new` and TLAB-tail-filler header
 writes — see `gc/src/a2dbg.rs`) on the `MiniThrottle` sibling repro found and
 fixed **two real, previously-undiscovered bugs** in the conservative-root
-mark path, but did **not** fully close this corruption family — it remains
-OPEN, now much better characterized.
+mark path. That work did **not** fully close the broader Family-A/root-scan
+residual, which is tracked outside this archived Hibernate allocation note.
 
 ### Bug 1 (FIXED): `is_object_address` missing the extent-vs-arena-bound check
 
@@ -235,8 +243,8 @@ WeakHashMap-referent identity-map insert was only wired to the
 header-marked branch) was fixed alongside it. `cratonvm-gc` test suite:
 761/761 pass after both fixes.
 
-### Residual: BOTH fixes verified correct (zero regressions, real Spring
-### `ConcurrencyThrottleInterceptorTests` passes clean) but do NOT
+### Separate residual: BOTH fixes verified correct (zero regressions, real
+### Spring `ConcurrencyThrottleInterceptorTests` passes clean) but do NOT
 ### eliminate the corruption on the harsher `MiniThrottle` repro
 
 Post-fix `MiniThrottle` distribution (5 runs): 84-276 "inconsistent header"

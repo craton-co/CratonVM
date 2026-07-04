@@ -29,7 +29,6 @@ $CV --java-home "$JDK" -cp <dir> <Repro>  # CratonVM (reproduces the gap)
 | `keycloak-16-…` | `keycloak-16-stream-onclose/StreamOnClose.java` | ✅ **NOW PASSES on dev** (re-run 2026-06-29: onClose ran, lazy `peek=1`, ==HotSpot). Was: `onClose` handler dropped (close() no-op) and eager `peek` (`peeked=5`). |
 | `bug06-fam5-…` | ✅ **CLOSED 2026-07-02** — moved to `docs/internal/fixed-suite-bugs/repros/bug06-fam5-reflection-null/Refl5.java` | failcause extinct: 0 × `getDeclaredMethod on null` across the clean 2026-06-30/07-01 full re-runs and a fresh 196-class nojit+jit sweep on dev `ffb247e5`; probe stays ==HotSpot. |
 | `springrepos-…` (latent deep recursion) | `springrepos-deep-recursion/GroovyNestProbe.java` | deeply-nested Groovy closures; clean `dev` runs slow-not-crash — the native-stack overflow only with the unmerged cold-path JIT experiment. |
-| `jit-regalloc-callee-saved-clobber-family` | `jit-regalloc-dup_x1/Dupx.java` | the bare `tab[index++]` `dup_x1` idiom — **does NOT** reproduce alone (matches HotSpot); kept as the negative control showing the family bug is method-shape-specific. |
 | `g1-parallel-evac-persistent-forwarding-root-remap` | `g1-parallel-steady-churn/SteadyChurn.java` | tracked recreation of the lost `scratch/g1par/SteadyChurn.java` shape plus `run-g1-parallel-steady-churn.ps1`. HotSpot prints `2002062093760` for `2000000`; not retirement evidence yet because this recreation still also trips serial G1 before the original serial-clean boundary is recovered. |
 
 ## GC-root-race / Family-A probe (needs `GC_STRESS` or load)
