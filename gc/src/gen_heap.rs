@@ -525,8 +525,8 @@ pub struct GenerationalHeap {
     /// Records the topology's preferred home node for this heap (defaults
     /// to 0 on single-node hosts, which covers every current test target).
     /// On a multi-node host this is the node whose arena the slow path
-    /// would prefer if/when [`try_alloc_young`]/[`refill_tlab`] grow into a
-    /// per-node arena layout.
+    /// would prefer if/when [`try_alloc_young_initialized`]/[`refill_tlab`]
+    /// grow into a per-node arena layout.
     ///
     /// TODO(numa-multi-arena): replace the single `young_from`/`young_to`
     /// pair with `Arc<Vec<Mutex<Arena>>>` keyed by node id, and route the
@@ -701,8 +701,8 @@ impl GenerationalHeap {
     /// slow-path allocation, falling back to the heap's primary hint.
     ///
     /// This is the seam where the multi-arena refactor will plug in: it
-    /// returns the index that `try_alloc_young`/`refill_tlab` would use to
-    /// pick a per-node arena. Today there is only one arena pair, so the
+    /// returns the index that `try_alloc_young_initialized`/`refill_tlab`
+    /// would use to pick a per-node arena. Today there is only one arena pair, so the
     /// return value is consumed only by the tracing stub below — but the
     /// query path is exercised on every slow-path allocation, which means
     /// the platform probe and topology cache are validated in production
@@ -803,34 +803,38 @@ impl GenerationalHeap {
         // `ctx.new_*` allocators, which cannot safely GC-and-retry (a moving
         // young GC would dangle their unrooted local ObjectRefs). See
         // [`try_alloc_object_old`]. Only when old gen is also full does
-        // `alloc_young` fire the OOM diagnostic and abort.
-        let ptr = match self.try_alloc_young(total_size) {
+        // `alloc_young_initialized` fire the OOM diagnostic and abort.
+        let init = |ptr: *mut u8| {
+            let mut header = ObjectHeader::new(
+                class_id,
+                ObjectKind::Object,
+                ArrayElementType::Reference,
+                self.next_hash(),
+                array_len,
+                num_slots_u32,
+            );
+            header.gc_flags |= compact_flag;
+            // SAFETY: `ptr` was just allocated from the young arena with
+            // `total_size` bytes and remains protected by the arena lock until
+            // this header write completes.
+            unsafe {
+                std::ptr::write(ptr as *mut ObjectHeader, header);
+            }
+        };
+        let ptr = match self.try_alloc_young_initialized(total_size, &init) {
             Some(p) => p,
             None => {
                 if let Some(obj) = self.try_alloc_object_old(class_id, num_fields) {
                     return obj;
                 }
-                self.alloc_young(total_size)
+                self.alloc_young_initialized(total_size, &init)
             }
         };
 
-        let mut header = ObjectHeader::new(
-            class_id,
-            ObjectKind::Object,
-            ArrayElementType::Reference,
-            self.next_hash(),
-            array_len,
-            num_slots_u32,
-        );
-        header.gc_flags |= compact_flag;
-
-        // SAFETY: `ptr` was just bump-allocated from the young arena with sufficient
-        // size (`total_size`) and 8-byte alignment, so writing an `ObjectHeader` at
-        // its start is valid. The pointer is non-null and exclusively owned by this
-        // allocation; wrapping it in `ObjectRef` is sound because the header has been
-        // fully initialized.
+        // SAFETY: `ptr` is non-null and the header was fully initialized by
+        // `try_alloc_young_initialized` / `alloc_young_initialized` before the
+        // young arena lock was released.
         unsafe {
-            std::ptr::write(ptr as *mut ObjectHeader, header);
             crate::a2dbg::record(
                 ptr as usize,
                 class_id.as_u32(),
@@ -849,7 +853,7 @@ impl GenerationalHeap {
     /// process when both generations are exhausted (or the size overflows).
     /// This lets a *native*/JIT caller surface a catchable
     /// `java.lang.OutOfMemoryError` ("Java heap space") rather than the VM
-    /// hard-aborting in [`alloc_young`]. Like `alloc_object` it performs no GC,
+    /// hard-aborting in [`alloc_young_initialized`]. Like `alloc_object` it performs no GC,
     /// so it is safe to call from a context holding unrooted local `ObjectRef`s
     /// (the JIT object-alloc helper GC-and-retries before calling this).
     pub fn try_alloc_object_full(&self, class_id: ClassId, num_fields: usize) -> Option<ObjectRef> {
@@ -858,8 +862,22 @@ impl GenerationalHeap {
 
         // Young fast path; on exhaustion spill into old gen (non-moving) BEFORE
         // reporting OOM — mirrors `alloc_object`, but returns `None` instead of
-        // aborting in `alloc_young` when old gen is also full (the divergence).
-        let ptr = match self.try_alloc_young(total_size) {
+        // aborting in `alloc_young_initialized` when old gen is also full (the divergence).
+        let init = |ptr: *mut u8| {
+            let mut header = ObjectHeader::new(
+                class_id,
+                ObjectKind::Object,
+                ArrayElementType::Reference,
+                self.next_hash(),
+                array_len,
+                num_slots_u32,
+            );
+            header.gc_flags |= compact_flag;
+            unsafe {
+                std::ptr::write(ptr as *mut ObjectHeader, header);
+            }
+        };
+        let ptr = match self.try_alloc_young_initialized(total_size, &init) {
             Some(p) => p,
             None => {
                 if let Some(obj) = self.try_alloc_object_old(class_id, num_fields) {
@@ -869,21 +887,11 @@ impl GenerationalHeap {
             }
         };
 
-        let mut header = ObjectHeader::new(
-            class_id,
-            ObjectKind::Object,
-            ArrayElementType::Reference,
-            self.next_hash(),
-            array_len,
-            num_slots_u32,
-        );
-        header.gc_flags |= compact_flag;
         // SAFETY: identical invariants to `alloc_object` — `ptr` is a freshly
         // bump-allocated, exclusively-owned, zeroed region of `total_size` bytes
         // with 8-byte alignment, so writing the header and wrapping it in an
         // `ObjectRef` are sound.
         unsafe {
-            std::ptr::write(ptr as *mut ObjectHeader, header);
             crate::a2dbg::record(
                 ptr as usize,
                 class_id.as_u32(),
@@ -1001,8 +1009,8 @@ impl GenerationalHeap {
                 return obj;
             }
             // Old gen was full — fall through to the young-gen path so the
-            // standard OOM diagnostic fires (`alloc_young` aborts hard with
-            // a young-gen-exhaustion message; a future humongous-OOM
+            // standard OOM diagnostic fires (`alloc_young_initialized` aborts
+            // hard with a young-gen-exhaustion message; a future humongous-OOM
             // diagnostic would live here).
         }
 
@@ -1011,9 +1019,23 @@ impl GenerationalHeap {
         // `ctx.new_array`/`new_ref_array` allocators, which cannot safely
         // GC-and-retry (a moving young GC would dangle their unrooted local
         // ObjectRefs). `try_alloc_array_humongous` allocates in old gen
-        // regardless of size; only when old gen is also full does `alloc_young`
-        // fire the OOM diagnostic and abort. See [`try_alloc_object_old`].
-        let ptr = match self.try_alloc_young(total_size) {
+        // regardless of size; only when old gen is also full does
+        // `alloc_young_initialized` fire the OOM diagnostic and abort. See
+        // [`try_alloc_object_old`].
+        let init = |ptr: *mut u8| {
+            let header = ObjectHeader::new(
+                class_id,
+                ObjectKind::Array,
+                element_type,
+                self.next_hash(),
+                length_u32,
+                length_u32,
+            );
+            unsafe {
+                std::ptr::write(ptr as *mut ObjectHeader, header);
+            }
+        };
+        let ptr = match self.try_alloc_young_initialized(total_size, &init) {
             Some(p) => p,
             None => {
                 if let Some(obj) =
@@ -1021,26 +1043,13 @@ impl GenerationalHeap {
                 {
                     return obj;
                 }
-                self.alloc_young(total_size)
+                self.alloc_young_initialized(total_size, &init)
             }
         };
 
-        let header = ObjectHeader::new(
-            class_id,
-            ObjectKind::Array,
-            element_type,
-            self.next_hash(),
-            length_u32,
-            length_u32,
-        );
-
-        // SAFETY: `ptr` was bump-allocated from the young arena with sufficient size
-        // (`HEADER_SIZE + data_size`) and 8-byte alignment. Writing the header is valid
-        // because the region is exclusively owned and properly sized. The data region
-        // is already zeroed by `try_alloc_young()`. Wrapping in `ObjectRef` is sound
-        // because the header is fully initialized.
+        // SAFETY: `ptr` was allocated, zeroed, and header-initialized before
+        // the young arena lock was released.
         unsafe {
-            std::ptr::write(ptr as *mut ObjectHeader, header);
             crate::a2dbg::record(
                 ptr as usize,
                 class_id.as_u32(),
@@ -1050,7 +1059,7 @@ impl GenerationalHeap {
                 length_u32,
                 total_size,
             );
-            // Data region already zeroed by try_alloc_young() — no redundant memset needed.
+            // Data region already zeroed by the locked young-allocation helper.
             ObjectRef::from_raw(ptr)
         }
     }
@@ -1061,7 +1070,7 @@ impl GenerationalHeap {
     /// overflow, or both generations exhausted). This lets a *native* caller
     /// surface a catchable `java.lang.OutOfMemoryError` (matching HotSpot's
     /// "Requested array size exceeds VM limit" / "Java heap space") rather than
-    /// the VM hard-aborting in [`alloc_young`]. Like `alloc_array` it performs
+    /// the VM hard-aborting in [`alloc_young_initialized`]. Like `alloc_array` it performs
     /// no GC, so it is safe to call from a native method holding unrooted local
     /// `ObjectRef`s.
     pub fn try_alloc_array_full(
@@ -1082,7 +1091,20 @@ impl GenerationalHeap {
             // Old gen full — fall through to the young path (mirrors `alloc_array`).
         }
 
-        let ptr = match self.try_alloc_young(total_size) {
+        let init = |ptr: *mut u8| {
+            let header = ObjectHeader::new(
+                class_id,
+                ObjectKind::Array,
+                element_type,
+                self.next_hash(),
+                length_u32,
+                length_u32,
+            );
+            unsafe {
+                std::ptr::write(ptr as *mut ObjectHeader, header);
+            }
+        };
+        let ptr = match self.try_alloc_young_initialized(total_size, &init) {
             Some(p) => p,
             None => {
                 if let Some(obj) =
@@ -1096,20 +1118,11 @@ impl GenerationalHeap {
             }
         };
 
-        let header = ObjectHeader::new(
-            class_id,
-            ObjectKind::Array,
-            element_type,
-            self.next_hash(),
-            length_u32,
-            length_u32,
-        );
         // SAFETY: identical invariants to `alloc_array` — `ptr` is a freshly
         // bump-allocated, exclusively-owned, zeroed region of `total_size`
         // bytes with 8-byte alignment, so writing the header and wrapping it in
         // an `ObjectRef` are sound.
         unsafe {
-            std::ptr::write(ptr as *mut ObjectHeader, header);
             crate::a2dbg::record(
                 ptr as usize,
                 class_id.as_u32(),
@@ -1129,28 +1142,33 @@ impl GenerationalHeap {
         // near-`usize::MAX` field count can't wrap past the checked multiply.
         // `plan_object_alloc` also selects the compact reference-field layout.
         let (total_size, array_len, compact_flag) = plan_object_alloc(class_id, num_fields)?;
-        let ptr = self.try_alloc_young(total_size)?;
-        let mut header = ObjectHeader::new(
-            class_id,
-            ObjectKind::Object,
-            ArrayElementType::Reference,
-            self.next_hash(),
-            array_len,
-            u32::try_from(num_fields).ok()?,
-        );
-        header.gc_flags |= compact_flag;
+        let num_slots_u32 = u32::try_from(num_fields).ok()?;
+        let init = |ptr: *mut u8| {
+            let mut header = ObjectHeader::new(
+                class_id,
+                ObjectKind::Object,
+                ArrayElementType::Reference,
+                self.next_hash(),
+                array_len,
+                num_slots_u32,
+            );
+            header.gc_flags |= compact_flag;
+            unsafe {
+                std::ptr::write(ptr as *mut ObjectHeader, header);
+            }
+        };
+        let ptr = self.try_alloc_young_initialized(total_size, &init)?;
         // SAFETY: `ptr` was bump-allocated from the young arena with sufficient size
-        // and 8-byte alignment via `try_alloc_young`. The pointer is exclusively owned,
-        // so writing the header and creating an `ObjectRef` are sound.
+        // and 8-byte alignment via `try_alloc_young_initialized`. The pointer
+        // is exclusively owned, so creating an `ObjectRef` is sound.
         unsafe {
-            std::ptr::write(ptr as *mut ObjectHeader, header);
             crate::a2dbg::record(
                 ptr as usize,
                 class_id.as_u32(),
                 ObjectKind::Object as u8,
                 ArrayElementType::Reference as u8,
                 array_len,
-                u32::try_from(num_fields).unwrap_or(u32::MAX),
+                num_slots_u32,
                 total_size,
             );
             Some(ObjectRef::from_raw(ptr))
@@ -1190,20 +1208,24 @@ impl GenerationalHeap {
             // can't satisfy the request, the standard OOM fires.
         }
 
-        let ptr = self.try_alloc_young(total_size)?;
-        let header = ObjectHeader::new(
-            class_id,
-            ObjectKind::Array,
-            element_type,
-            self.next_hash(),
-            length_u32,
-            length_u32,
-        );
+        let init = |ptr: *mut u8| {
+            let header = ObjectHeader::new(
+                class_id,
+                ObjectKind::Array,
+                element_type,
+                self.next_hash(),
+                length_u32,
+                length_u32,
+            );
+            unsafe {
+                std::ptr::write(ptr as *mut ObjectHeader, header);
+            }
+        };
+        let ptr = self.try_alloc_young_initialized(total_size, &init)?;
         // SAFETY: `ptr` was bump-allocated from the young arena with sufficient size
         // for the array header + data and 8-byte alignment. The pointer is exclusively
         // owned, so writing the header and creating an `ObjectRef` are sound.
         unsafe {
-            std::ptr::write(ptr as *mut ObjectHeader, header);
             crate::a2dbg::record(
                 ptr as usize,
                 class_id.as_u32(),
@@ -1259,11 +1281,6 @@ impl GenerationalHeap {
         let data_size = array_data_size(length_u32 as usize, element_type).ok()?;
         let total_size = HEADER_SIZE.checked_add(data_size)?;
 
-        let ptr = {
-            let mut og = self.old_gen.lock();
-            og.alloc(total_size, 8)?
-        };
-
         let mut header = ObjectHeader::new(
             class_id,
             ObjectKind::Array,
@@ -1279,13 +1296,18 @@ impl GenerationalHeap {
         // below initializes the rest of the bookkeeping.
         header.gc_flags |= GC_FLAG_OLD_GEN;
 
-        // SAFETY: `OldGen::alloc` returned a pointer to `total_size` bytes
-        // of zeroed, 8-byte-aligned memory exclusive to this allocation.
-        // Writing the header is in-bounds and the resulting `ObjectRef`
-        // wraps a fully-initialized header.
-        unsafe {
-            std::ptr::write(ptr as *mut ObjectHeader, header);
-        }
+        let ptr = {
+            let mut og = self.old_gen.lock();
+            let ptr = og.alloc(total_size, 8)?;
+            // SAFETY: `OldGen::alloc` returned a pointer to `total_size`
+            // bytes of zeroed, 8-byte-aligned memory exclusive to this
+            // allocation. The old-gen lock is still held, so major GC cannot
+            // walk the span until this complete header has been published.
+            unsafe {
+                std::ptr::write(ptr as *mut ObjectHeader, header);
+            }
+            ptr
+        };
         self.stats.old_allocations.fetch_add(1, Ordering::Relaxed);
         // SAFETY: `ptr` points at the header just written above; it is a valid,
         // fully-initialized, heap-owned object so wrapping it as an `ObjectRef` is sound.
@@ -1310,10 +1332,6 @@ impl GenerationalHeap {
     /// The `GC_FLAG_OLD_GEN` mark keeps minor GC from trying to forward it.
     fn try_alloc_object_old(&self, class_id: ClassId, num_fields: usize) -> Option<ObjectRef> {
         let (total_size, array_len, compact_flag) = plan_object_alloc(class_id, num_fields)?;
-        let ptr = {
-            let mut og = self.old_gen.lock();
-            og.alloc(total_size, 8)?
-        };
         let mut header = ObjectHeader::new(
             class_id,
             ObjectKind::Object,
@@ -1323,12 +1341,18 @@ impl GenerationalHeap {
             u32::try_from(num_fields).ok()?,
         );
         header.gc_flags |= GC_FLAG_OLD_GEN | compact_flag;
-        // SAFETY: `OldGen::alloc` returned `total_size` bytes of zeroed,
-        // 8-byte-aligned memory exclusive to this allocation; writing the
-        // header is in-bounds and the resulting `ObjectRef` is fully valid.
-        unsafe {
-            std::ptr::write(ptr as *mut ObjectHeader, header);
-        }
+        let ptr = {
+            let mut og = self.old_gen.lock();
+            let ptr = og.alloc(total_size, 8)?;
+            // SAFETY: `OldGen::alloc` returned `total_size` bytes of zeroed,
+            // 8-byte-aligned memory exclusive to this allocation. Holding the
+            // old-gen lock through the header write prevents major GC from
+            // observing the allocation before it is a valid object.
+            unsafe {
+                std::ptr::write(ptr as *mut ObjectHeader, header);
+            }
+            ptr
+        };
         self.stats.old_allocations.fetch_add(1, Ordering::Relaxed);
         // SAFETY: `ptr` points at the header just written above; it is a valid,
         // fully-initialized, heap-owned object so wrapping it as an `ObjectRef` is sound.
@@ -1486,8 +1510,63 @@ impl GenerationalHeap {
             return None;
         }
 
-        // SAFETY: `raw` passed the region containment and header sanity checks above,
-        // so it points to a valid object header within a heap arena.
+        // Family-A fix (2026-07-03): also validate the object's EXTENT against
+        // the arena it claims to live in — the same hardening `mark_young`
+        // (sweep_young_non_moving) already applies, now centralized here so
+        // every one of this function's ~28 callers gets it. Without this, a
+        // conservative root candidate that lands NOT on a real object start
+        // but on an interior 16-byte `Value` cell of a live `Object[]` (every
+        // element's discriminant word is `VTAG_OBJECT = 4`, so `class_id=4`
+        // decodes at the candidate offset AND `num_slots=4` decodes 16 bytes
+        // later — a self-consistent-looking but entirely coincidental fake
+        // header) passes every check above. Bit-plausible headers of this
+        // shape are common: a hot proxy/reflection `invoke(Object,Object[])`
+        // path keeps element-interior pointers alive in registers/stack slots
+        // that a conservative scan (`scan_one_frame` et al.) then feeds
+        // through this function as candidate roots. `mark_young` catches this
+        // via its extent check and safely discards such a candidate WITHOUT
+        // writing through it; but every OTHER caller of `is_object_address`
+        // (root-set seeding for old-gen `major_gc`, the selective-promotion
+        // pin set, `is_movable_jit_root`, cross-thread snapshot validation,
+        // and more) had no such check and could WRITE through the accepted
+        // "object" (mark bit, gc_age, forwarding_ptr) at a byte offset that
+        // is actually the interior of an unrelated live array — corrupting
+        // that array's real header/body bytes. This reproduced as the
+        // long-standing "kind=Object but array_length=N; inline-alloc forgot
+        // to set kind=Array" corruption family (Family-A / MiniThrottle /
+        // the independently-found Hibernate-batch corruption): the "N" is
+        // not random — it is bits of the flipped mark/age/forwarding write
+        // landing inside the victim array's real `array_length` field.
+        let claimed_extent = if is_array {
+            match array_data_size(header.array_length as usize, header.element_type) {
+                Ok(data) => HEADER_SIZE.checked_add(data),
+                Err(_) => None,
+            }
+        } else {
+            HEADER_SIZE.checked_add(header.num_slots as usize * SLOT_SIZE)
+        };
+        let Some(extent) = claimed_extent else {
+            return None;
+        };
+        let Some(obj_end) = addr.checked_add(extent) else {
+            return None;
+        };
+        // The object's full extent must fit within the SAME arena the region
+        // check above matched (not just "some" arena — a header claiming to
+        // span from young into old gen is exactly the interior-cell false
+        // positive this guards against).
+        let extent_fits = self.region_bounds.iter().any(|(base, end)| {
+            let b = base.load(Ordering::Acquire);
+            let e = end.load(Ordering::Acquire);
+            addr >= b && addr < e && obj_end <= e
+        });
+        if !extent_fits {
+            return None;
+        }
+
+        // SAFETY: `raw` passed the region containment, header sanity, and
+        // extent-containment checks above, so it points to a valid object
+        // header within a heap arena.
         Some(unsafe { ObjectRef::from_raw(raw as *mut u8) })
     }
 
@@ -4065,33 +4144,97 @@ impl GenerationalHeap {
                             header.num_slots,
                             hex,
                         );
+                        // A2 forensic probe (CRATONVM_DBG_A2): correlate this
+                        // rejected address against the allocation breadcrumb
+                        // ring — was this slot EVER header-written by an
+                        // allocator (interpreter TLAB / gen_heap / JIT
+                        // inline-alloc / TLAB tail-filler), and with what
+                        // real size/class? Distinguishes "never allocated
+                        // here" (stale conservative root over reused/free
+                        // memory) from "allocated then clobbered" (a real
+                        // header-write race) from "allocated exactly this
+                        // shape, walker/mark logic disagrees" (a formula bug).
+                        match crate::a2dbg::lookup_at(addr) {
+                            Some(r) => tracing::warn!(
+                                "  [A2] BREADCRUMB exact-addr alloc: class_id={} kind={} et={} alen={} ns={} REAL_size={} seq={}",
+                                r.class_id, r.kind, r.element_type, r.array_length, r.num_slots, r.size, r.seq,
+                            ),
+                            None => match crate::a2dbg::lookup_covering(addr) {
+                                Some(r) => tracing::warn!(
+                                    "  [A2] BREADCRUMB covered by alloc start={:#x} class_id={} kind={} et={} alen={} ns={} REAL_size={} seq={} (mid-object offset={})",
+                                    r.addr, r.class_id, r.kind, r.element_type, r.array_length, r.num_slots, r.size, r.seq, addr - r.addr,
+                                ),
+                                None => tracing::warn!(
+                                    "  [A2] BREADCRUMB — NO allocation record covers {:#x} (never header-written here, or freed+reused past the ring)",
+                                    addr,
+                                ),
+                            },
+                        }
                     }
                     return;
                 }
-                // Zero first-header-word candidates take the SIDE path: alive and
-                // traced, but the header is NEVER written (see side_marks above).
+                // Family-A fix (2026-07-03): EVERY conservative root candidate
+                // takes the SIDE path now — alive and traced, but the header is
+                // NEVER written through. Previously only a zero-first-word
+                // candidate was side-marked; any OTHER candidate that merely
+                // passed the kind/num_slots/extent plausibility checks above
+                // (bit-plausible but not necessarily the true start of a live
+                // object) fell through to `header.gc_flags |= GC_FLAG_MARKED`
+                // below, an unconditional write through the candidate pointer.
+                //
+                // The checks above bound `class_id`/`kind`/`num_slots`/extent to
+                // "looks like it could be a real header" — they do NOT prove the
+                // candidate is the actual start address a real allocator wrote a
+                // header at. A conservative root scan (register/stack scan, or
+                // — at much higher volume — the cross-thread `xt_root_scan`
+                // OS-suspend takeover, which floods this seed with thousands of
+                // raw register/stack words from EVERY other live thread) can
+                // easily produce an address that is NOT a real object start but
+                // decodes as one anyway: e.g. the 16-byte-aligned `Value` cells
+                // of a live `Object[]` all carry `VTAG_OBJECT = 4` as their
+                // discriminant word, so landing on ANY element's disc word reads
+                // `class_id=4, kind=Object` — and 16 bytes later, the NEXT
+                // element's disc word reads as a matching, equally-plausible
+                // `num_slots=4`. Writing `GC_FLAG_MARKED` (0x02) through such a
+                // false-positive candidate lands the byte write inside a
+                // genuinely live neighboring object's real header — bit 9 of
+                // `array_length` (byte offset 13, 8 bytes past `gc_flags` at
+                // offset 21 minus the header's own +8 alignment window) is
+                // exactly the observed "kind=Object but array_length=512/513"
+                // corruption face this whole family is named for; other offsets
+                // hit `num_slots`, `gc_age`, or the low byte of `forwarding_ptr`
+                // depending on the candidate's exact false-positive offset.
+                //
+                // `side_marks` was already proven safe and sufficient for the
+                // zero-word0 case (over-retention only, per the comment above);
+                // extending it to every candidate closes the entire
+                // write-through class at the cost of pure over-retention (a
+                // false-positive candidate keeps its neighbor pinned instead of
+                // corrupting it — the collector's own documented safety
+                // invariant: "a conservative false-positive root only
+                // over-retains, it can never cause a live object to be freed OR
+                // its non-pointer data to be corrupted").
                 // SAFETY: `addr` is 8-aligned inside mapped from-space.
-                let word0 = unsafe { *(ptr as *const u64) };
-                if word0 == 0 {
-                    if side_marks.insert(addr) {
-                        worklist.push(ptr);
-                    }
-                    return;
-                }
-                // xt-hardening follow-up (2026-07-03): a non-zero-word0
-                // candidate whose always-zero header fields are non-zero is
-                // still corrupt garbage that happened to satisfy the
-                // field-bound + extent checks above — route it through the
-                // same non-writing side path rather than trusting it enough
-                // to header-write.
-                if !header_reserved_fields_plausible(header) {
-                    if side_marks.insert(addr) {
-                        worklist.push(ptr);
-                    }
-                    return;
-                }
-                if header.gc_flags & GC_FLAG_MARKED == 0 {
-                    header.gc_flags |= GC_FLAG_MARKED;
+                //
+                // Merge note (2026-07-04): dev independently landed a NARROWER
+                // mitigation for this same non-zero-word0 hazard
+                // (`header_reserved_fields_plausible` — reject a candidate
+                // whose always-zero padding/reserved bytes or undefined
+                // gc_flags bits are set, ~1/2^29 false-negative rate on
+                // garbage) and still header-wrote through anything that
+                // passed it. That check is real and kept (used elsewhere by
+                // dev's other hardening below), but it does NOT catch this
+                // fix's target case: a genuine live `Object[]` element cell,
+                // whose bytes are NOT garbage — `_padding`/`_gc_reserved`
+                // read 0 legitimately (they alias the high bytes of an
+                // adjacent element's pointer payload, which is frequently
+                // 0 on a 48-bit address space) and `gc_flags` reads 0 too.
+                // Such a candidate sails through
+                // `header_reserved_fields_plausible` and still gets
+                // header-written. Unconditional side-marking (this fix)
+                // has no such gap: every candidate is treated as
+                // never-write-through, full stop.
+                if side_marks.insert(addr) {
                     worklist.push(ptr);
                 }
             };
@@ -5549,6 +5692,26 @@ impl GenerationalHeap {
             } else if side_marked_survivor {
                 // Side-marked survivor: pure retention, no header writes.
                 objects_live += 1;
+                // Family-A fix follow-up: a side-marked survivor is kept in
+                // place exactly like a header-marked one (same "never moves"
+                // guarantee), so it needs the SAME watched-referent identity
+                // mapping — a live Weak/Soft/Phantom reference watching this
+                // address must still see it as "survived" post-GC. Before the
+                // write-through fix, every candidate that reached this point
+                // via a real root had `GC_FLAG_MARKED` set on its own header
+                // and took the branch below; now ALL conservative-root
+                // survivors (real objects included) take this side-marked
+                // path instead, so the identity-map insert must move here too
+                // (regression: `non_moving_sweep_records_identity_map_for_watched_survivor`).
+                let addr = obj_ptr as usize;
+                if crate::gc_quiescence::is_watched_referent(addr) {
+                    if watchref_dbg() {
+                        eprintln!(
+                            "[watchref] non-moving sweep: side-marked watched survivor kept in place @0x{addr:x} — identity-mapped"
+                        );
+                    }
+                    evac_map.insert(addr, addr);
+                }
             } else if header.gc_flags & GC_FLAG_MARKED != 0 {
                 // Survivor: clear the mark, keep in place, and age it so the
                 // next sweep can tenure it once it reaches PROMOTION_AGE
@@ -5597,9 +5760,9 @@ impl GenerationalHeap {
         }
 
         // Publish reclaimed regions to the arena's free list FIRST. Subsequent
-        // `try_alloc_young` calls will satisfy allocations from these holes
-        // before bumping the cursor — reclaiming memory without moving a
-        // survivor.
+        // `try_alloc_young_initialized` calls will satisfy allocations from
+        // these holes before bumping the cursor — reclaiming memory without
+        // moving a survivor.
         //
         // ORDER MATTERS (bintrees18 Bug B fix): this must run BEFORE
         // `clear_all_mark_bits_in_arena` below. The main sweep loop zeroed each
@@ -5847,8 +6010,7 @@ impl GenerationalHeap {
                     && (is_array || header.num_slots <= (1 << 24))
                     && (!is_array || header.array_length <= i32::MAX as u32)
                     && header_reserved_fields_plausible(header)
-                    && (word0 != 0
-                        || !victim8_neighbor_explains_zero_prefix(ptr, old_gen));
+                    && (word0 != 0 || !victim8_neighbor_explains_zero_prefix(ptr, old_gen));
                 if plausible {
                     let total = gen_object_total_size(header);
                     let fits = total >= HEADER_SIZE
@@ -6185,12 +6347,16 @@ impl GenerationalHeap {
 
     // ----- Internal ----------------------------------------------------------
 
-    /// Allocate bytes in the young from-space.
+    /// Allocate bytes in the young from-space and run `init` before publishing
+    /// the span to any GC walker.
     ///
     /// Returns `None` if the young generation is exhausted and cannot satisfy
     /// the allocation. The caller should trigger a GC cycle and retry, or
     /// throw `OutOfMemoryError`.
-    fn try_alloc_young(&self, size: usize) -> Option<*mut u8> {
+    fn try_alloc_young_initialized<F>(&self, size: usize, init: F) -> Option<*mut u8>
+    where
+        F: FnOnce(*mut u8),
+    {
         // NUMA stub: query the preferred node for the calling thread so
         // the topology probe gets exercised in production. On multi-node
         // hosts this records when the heap's primary node disagrees with
@@ -6202,23 +6368,22 @@ impl GenerationalHeap {
             tracing::trace!(
                 target: "cratonvm::gc::numa",
                 node, primary = self.numa_node_hint, size,
-                "try_alloc_young: cross-node slow path (single-arena fallback)",
+                "try_alloc_young_initialized: cross-node slow path (single-arena fallback)",
             );
         }
 
         let ptr = {
             let mut from = self.young_from.lock();
-            from.alloc(size, 8)
-            // Lock released here — zeroing happens outside the lock
-        };
-        if let Some(ptr) = ptr {
-            // Zero the block after releasing the lock (O(size) memset)
-            // SAFETY: `ptr` was just allocated from the arena with `size` bytes; zeroing is within bounds.
+            let ptr = from.alloc(size, 8)?;
+            // SAFETY: `ptr` was just allocated from the arena with `size`
+            // bytes; zeroing is within bounds. `init` writes the valid header
+            // before the arena lock is released.
             unsafe { std::ptr::write_bytes(ptr, 0, size) };
-            self.stats.young_allocations.fetch_add(1, Ordering::Relaxed);
-            return Some(ptr);
-        }
-        None
+            init(ptr);
+            ptr
+        };
+        self.stats.young_allocations.fetch_add(1, Ordering::Relaxed);
+        Some(ptr)
     }
 
     /// Check if an allocation of `size` bytes would succeed in the young from-space.
@@ -6260,7 +6425,7 @@ impl GenerationalHeap {
     /// the zeroed region and `size` is the actual TLAB size (may be smaller
     /// than requested if the arena is nearly full).
     pub fn refill_tlab(&self, requested_size: usize) -> Option<(*mut u8, usize)> {
-        // NUMA stub: same shape as try_alloc_young. The TLAB itself is
+        // NUMA stub: same shape as try_alloc_young_initialized. The TLAB itself is
         // per-thread so its fast path is already NUMA-local; this records
         // the *refill* node so that once we land per-node arenas we can
         // size each node's young-from to match its TLAB refill pressure.
@@ -6286,24 +6451,29 @@ impl GenerationalHeap {
         Some((ptr, actual_size))
     }
 
-    /// Allocate bytes in the young from-space.
+    /// Allocate bytes in the young from-space and initialize the object before
+    /// publishing it.
     ///
     /// If the from-space is full, logs a fatal error and aborts. The
-    /// interpreter's `gc_alloc_*` functions use `try_alloc_young` with
+    /// interpreter's `gc_alloc_*` functions use fallible allocation with
     /// GC-and-retry; this method is only called by the panicking
     /// `alloc_object`/`alloc_array` convenience wrappers.
-    fn alloc_young(&self, size: usize) -> *mut u8 {
-        self.try_alloc_young(size).unwrap_or_else(|| {
-            let from = self.young_from.lock();
-            eprintln!(
-                "FATAL: OutOfMemoryError: young gen exhausted — tried to allocate {} bytes, \
+    fn alloc_young_initialized<F>(&self, size: usize, init: F) -> *mut u8
+    where
+        F: FnOnce(*mut u8),
+    {
+        self.try_alloc_young_initialized(size, init)
+            .unwrap_or_else(|| {
+                let from = self.young_from.lock();
+                eprintln!(
+                    "FATAL: OutOfMemoryError: young gen exhausted — tried to allocate {} bytes, \
                  from-space has {}/{} used",
-                size,
-                from.used(),
-                from.capacity(),
-            );
-            std::process::abort();
-        })
+                    size,
+                    from.used(),
+                    from.capacity(),
+                );
+                std::process::abort();
+            })
     }
 
     /// Generate the next identity hash code.
@@ -6597,7 +6767,7 @@ impl GenerationalHeap {
                             // A copying collector cannot safely "skip" an
                             // object: there is no valid address to hand back.
                             // This is an unrecoverable OOM; abort hard, the
-                            // same way `alloc_young` handles young-gen
+                            // same way `alloc_young_initialized` handles young-gen
                             // exhaustion.
                             eprintln!(
                                 "FATAL: OutOfMemoryError: GC could not relocate a live object — \
@@ -6625,7 +6795,7 @@ impl GenerationalHeap {
                     // dangle (use-after-free). A copying collector has no
                     // valid address to return for an un-relocated object.
                     // This is an unrecoverable OOM; abort hard, consistent
-                    // with `alloc_young`'s handling of young-gen exhaustion.
+                    // with `alloc_young_initialized`'s handling of young-gen exhaustion.
                     eprintln!(
                         "FATAL: OutOfMemoryError: GC could not relocate a live object — \
                          young to-space is full (tried {} bytes, to-space has {}/{} used). \
@@ -6646,7 +6816,11 @@ impl GenerationalHeap {
         // offset, so a copy that IMPORTS corrupt content is distinguishable
         // from one that copies a clean cell.
         // SAFETY: `old_ptr` is the live source object under STW.
-        validate_copy_source_cells(old_ptr, unsafe { &*(old_ptr as *const ObjectHeader) }, "cheney-src");
+        validate_copy_source_cells(
+            old_ptr,
+            unsafe { &*(old_ptr as *const ObjectHeader) },
+            "cheney-src",
+        );
         {
             let w = crate::heap::cell_watch_addr();
             let dst = new_ptr as usize;
@@ -8396,6 +8570,59 @@ mod tests {
         assert_eq!(heap.get_header(obj).num_slots, 2);
         assert_eq!(heap.get_header(obj).gc_age, 0);
         assert_eq!(heap.get_header(obj).gc_flags, 0);
+    }
+
+    #[test]
+    fn young_alloc_initializes_header_before_unlocking_arena() {
+        use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
+        use std::sync::{mpsc, Arc};
+
+        let heap = Arc::new(GenerationalHeap::with_sizes(4096, 4096));
+        let entered_init = Arc::new(AtomicBool::new(false));
+        let (release_tx, release_rx) = mpsc::channel();
+
+        let worker_heap = heap.clone();
+        let worker_entered = entered_init.clone();
+        let worker = std::thread::spawn(move || {
+            worker_heap
+                .try_alloc_young_initialized(HEADER_SIZE, move |ptr| {
+                    worker_entered.store(true, AtomicOrdering::Release);
+                    release_rx.recv().expect("test should release initializer");
+                    let header = ObjectHeader::new(
+                        ClassId::new(123),
+                        ObjectKind::Object,
+                        ArrayElementType::Reference,
+                        7,
+                        0,
+                        0,
+                    );
+                    // SAFETY: the helper passed a freshly allocated,
+                    // zero-initialized HEADER_SIZE-byte span and still holds
+                    // the young arena lock while this initializer runs.
+                    unsafe {
+                        std::ptr::write(ptr as *mut ObjectHeader, header);
+                    }
+                })
+                .expect("young allocation should fit") as usize
+        });
+
+        while !entered_init.load(AtomicOrdering::Acquire) {
+            std::thread::yield_now();
+        }
+        let allocation_still_locked = heap.young_from.try_lock().is_none();
+        release_tx.send(()).expect("release initializer");
+        let ptr = worker.join().expect("allocation worker should finish");
+
+        assert!(
+            allocation_still_locked,
+            "young allocation must not release the arena before the header is initialized"
+        );
+        // SAFETY: the worker finished after writing a valid object header.
+        let header = unsafe { &*(ptr as *const ObjectHeader) };
+        assert_eq!(header.class_id, ClassId::new(123));
+        assert_eq!(header.kind, ObjectKind::Object);
+        assert_eq!(header.array_length, 0);
+        assert_eq!(header.num_slots, 0);
     }
 
     #[test]

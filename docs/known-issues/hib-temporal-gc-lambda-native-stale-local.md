@@ -1,23 +1,26 @@
 # Hibernate `type.temporal.*` crash — moving young GC strands lambda refs in native stream/collection intrinsics
 
 **Severity:** High (process aborts rc=1 mid-class, no `@@RESULT`; also flaky SIGSEGV / rc=139).
-**Status:** 🟠 PARTIALLY FIXED. Per-native pinning (this commit) corrects the stale-Rust-local bug in the
+**Status:** PARTIALLY FIXED. Per-native pinning corrects the stale-Rust-local bug in the
 stream/collection natives that drove the clean `java/lang/Object.<sam>` linkage-error crash — those natives
 now re-read every held ref from its pin handle after each allocating dispatch, so they can no longer
-dispatch on a relocated slot. The crash rate dropped markedly (repeated InstantTests runs now reach
+dispatch on a relocated slot. A 2026-07-03 follow-up also pins the scheduled-task pump's runnable across
+accrued `Runnable.run()` callbacks, closing another native-local callback loop that could dispatch a
+periodic JUnit/concurrency task through a relocated stale local. The crash rate dropped markedly (repeated InstantTests runs now reach
 `@@RESULT/@@DONE` instead of aborting early on the stream path). A **distinct residual** remains: a broader
 GC missed-root reclamation that zeroes a connected set of *concurrency / JUnit* objects
 (`AbstractQueuedSynchronizer`, `ThreadPoolExecutor`, `ScheduledFuture`, `NodeTestTask`) in a single
 collection → "Stale pointer in invokevirtual receiver (all-zero header)" storm → SIGSEGV (~1 in 3 runs at
-the default heap). That residual is the **GC root-coverage family** (see #15 lost-tag missed-root and #18
-blocked-thread frame `Thread`-mirror reclamation), NOT a stream native — per-native pinning cannot fix it.
+the default heap). That residual is still tracked as the **GC root-coverage family** (see #15 lost-tag
+missed-root and #18 blocked-thread frame `Thread`-mirror reclamation); this note stays open until the
+Hibernate runner is available and the temporal class loop is proven crash-free under default-heap GC pressure.
 **Mode:** Interpreter (default and `--nojit`). **HotSpot (JDK 25):** PASS.
 **Affected classes (5):** `org.hibernate.orm.test.type.temporal.{InstantTests, LocalDateTimeTest,
 OffsetDateTimeTest, OffsetTimeTest, ZonedDateTimeTest}`.
 
 This is **NOT** a java.time temporal-type binding bug (no `Timestamp`/`Calendar`/`OffsetDateTime`
 conversion is involved). It is another manifestation of the GC-root-coverage family already documented in
-[`hibernate-bytearraymapping-stackwalk-gc-corruption.md`](hibernate-bytearraymapping-stackwalk-gc-corruption.md):
+[`hibernate-bytearraymapping-stackwalk-gc-corruption.md`](../internal/fixed-suite-bugs/hibernate-bytearraymapping-stackwalk-gc-corruption.md):
 
 > CV native code holds Java object refs in Rust locals/`Vec`s across allocating `ctx` calls
 > (`invoke_virtual` / `create_string` / `alloc_*`) **without re-reading them from a pin** afterwards.
@@ -110,6 +113,22 @@ moved pins, and `gc_native_pins.rs` covers `HashMap.replaceAll` under callback-t
 registered here (`forEachEntry`, `forEachKey`, `forEachValue`, and `search`) now pin and re-read their
 callback plus the collected key/value snapshots across each callback dispatch. Focused regressions cover
 `ConcurrentHashMap.forEachKey` and `ConcurrentHashMap.search` under callback-triggered moving GC.
+
+**Additional scheduled-pump sweep (2026-07-03, follow-up):** `native-builtins/src/scheduled_pump.rs`
+now pins the stored periodic-task runnable before pumping accrued ticks, re-reads it from the pin before and
+after each `Runnable.run()` dispatch, and writes the current address back to the task record. This covers the
+case where a pump call fires more than one accrued tick and the first callback allocates/triggers a moving GC:
+the old loop reconstructed the runnable once, then reused that Rust local for every later callback in the same
+pump. Regression `scheduled_pump::tests::pump_re_reads_runnable_pin_after_callback_gc` simulates relocation
+during the first callback and asserts the second callback receives the remapped object.
+
+## Validation (2026-07-03 follow-up)
+
+- `cargo test -p cratonvm-native-builtins scheduled_pump::tests::pump_re_reads_runnable_pin_after_callback_gc -- --nocapture`
+- `cargo test -p cratonvm-native-builtins scheduled_pump::tests -- --nocapture`
+- `cargo build -p cratonvm-cli --bin cratonvm`
+- Unique binary smoke: `target/debug/cratonvm-hib-temporal-gc-lambda-20260703.exe --version` => `cratonvm 0.3.0`
+- Hibernate runner validation was **not run in this worktree**: `apps/hib-suite-runner` / `common.args` are absent.
 
 **Do NOT** try to fix this by forcing the non-moving sweep when a native is active: it re-triggers the
 documented [`HIB-CV-33`](HIB-CV-33-sigsegv-execute-fault-joined-inheritance-sf-build.md) precise-root

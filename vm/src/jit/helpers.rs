@@ -1558,6 +1558,30 @@ pub unsafe extern "C" fn jit_post_tlab_init(
     *(raw_ptr.add(8) as *mut i32) = hash;
     *(raw_ptr.add(16) as *mut u32) = num_fields as u32;
 
+    // Family-A forensics (CRATONVM_DBG_A2, default-inert): record the
+    // JIT-inline allocation into the a2dbg breadcrumb ring, exactly like the
+    // interpreter TLAB fast path (`init_object_header`) and the gen_heap
+    // allocators already do. Without this, the sweep's desync forensics
+    // report "NO young alloc record" for every JIT-allocated object, which
+    // makes the corrupt-header attribution ambiguous (allocated-then-clobbered
+    // vs never-allocated-here).
+    {
+        let total = if let Some(body) = compact_body {
+            HEADER_SIZE + body as usize
+        } else {
+            HEADER_SIZE + num_fields as usize * SLOT_SIZE
+        };
+        cratonvm_gc::a2dbg::record(
+            raw_ptr as usize,
+            class_id_raw as u32,
+            0, // kind = Object
+            0, // element_type = Reference
+            compact_body.unwrap_or(0),
+            num_fields as u32,
+            total,
+        );
+    }
+
     // Reconstruct the typed handle and finish init.
     let obj_ref = cratonvm_types::ObjectRef::from_raw(raw_ptr);
 

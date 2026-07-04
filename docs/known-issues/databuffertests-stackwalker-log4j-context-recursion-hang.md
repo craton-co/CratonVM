@@ -4,6 +4,34 @@ Status: open
 
 Date observed: 2026-07-03 (updated 2026-07-04 after a second investigation pass)
 
+## A concurrent fix attempt did NOT resolve this (verified 2026-07-04)
+
+A separate, concurrent session investigated a similarly-shaped StackWalker/
+Log4j2 issue and concluded it was fixed (see
+`docs/internal/databuffertests-stackwalker-log4j-context-recursion-hang.md`,
+added alongside `vm/tests/wp1_9_stackwalker.rs`). That session's own
+write-up states it did **not** verify against the real Spring test suite —
+`apps/spring-suite-runner`/`apps/spring-framework` were not present in their
+checkout — and instead validated a hand-rolled synthetic probe fixture plus
+a standalone Netty micro-test that merely resembles the failure shape.
+
+Built the actual merged `dev` (including that session's changes) and reran
+the real test:
+
+```bash
+cd apps/spring-suite-runner
+CRATONVM_BIN=$PWD/vmfrozen/cratonvm-swverify.exe KRUN_STACK=1 \
+  ./run-suite.sh run --jdk real --jit on --batch 1 --batch-to 300 --one-to 300 \
+  --only 'core\.io\.buffer\.DataBufferTests'
+```
+
+Result: **still `TIMEOUT`** (`wall=602s`, `found=0 passed=0 failed=0` — zero
+test methods completed). The synthetic-probe-based fix does not cover
+whatever makes the real Spring test class's bootstrap sequence trigger this
+at a scale/shape the probe didn't reproduce. This doc stays in
+`docs/known-issues/` (not `docs/internal/`) because the real, originally-
+reported failure is confirmed still present on current `dev`.
+
 ## Summary
 
 `org.springframework.core.io.buffer.DataBufferTests` times out under CratonVM

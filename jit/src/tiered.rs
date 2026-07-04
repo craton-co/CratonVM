@@ -33,6 +33,11 @@ use std::thread::JoinHandle;
 use parking_lot::{Condvar, Mutex};
 use rustc_hash::FxHashMap;
 
+/// Consecutive background-compile attempts allowed to fail (run but not
+/// publish a body) at a given tier before `should_compile` gives up on that
+/// method entirely. See `CompilerCore::complete_task` / `should_compile`.
+const MAX_TIER_FAIL_RETRIES: u32 = 3;
+
 // ───────────────────────────────────────────────────────────────────────────────
 // CompilationTier
 // ───────────────────────────────────────────────────────────────────────────────
@@ -238,6 +243,15 @@ pub struct MethodState {
     pub c2_bailout: bool,
     /// Profile data collected during interpreted/C1 execution.
     pub profile: MethodProfile,
+    /// Consecutive background-compile attempts that ran but did not
+    /// publish a compiled body (`complete_task(success=false)`). Distinct
+    /// from `c2_bailout` (which tracks *runtime* deopt-driven demotion from
+    /// an already-published C2 body) — this tracks the compile STEP itself
+    /// never producing/publishing code, so `current_tier` never advances
+    /// past whatever tier last actually succeeded. `should_compile` stops
+    /// recommending further attempts once this saturates, mirroring the
+    /// existing "3+ deopts" convention for `c2_bailout` above.
+    pub tier_fail_count: u32,
 }
 
 impl MethodState {
@@ -253,6 +267,7 @@ impl MethodState {
             last_compile_time_ms: 0,
             c2_bailout: false,
             profile: MethodProfile::default(),
+            tier_fail_count: 0,
         }
     }
 }
@@ -389,28 +404,52 @@ impl CompilerCore {
         self.queue.lock().dequeue()
     }
 
-    /// Record that `key` finished compiling at `tier`. Mirrors
+    /// Record that `key` finished a compile attempt at `tier`. Mirrors
     /// [`TieredCompilationManager::compilation_complete`] but operates purely on
     /// the shared core so the background worker needs no back-reference to the
     /// (by-value, non-`Arc`) manager.
-    fn complete_task(&self, key: &MethodKey, tier: CompilationTier, compile_time_ms: u64) {
+    ///
+    /// `success` reports whether the attempt actually produced and published a
+    /// compiled body (vs. `compile_fn` running but bailing internally — a
+    /// skip-listed construct, a resolver miss, the code-cache cap, a
+    /// concurrent class redefine, etc.). Only on success does `current_tier`
+    /// advance to `tier` and the per-tier compilation stat increment — a
+    /// failed attempt must NOT be recorded as "compiled", or the method is
+    /// silently stuck interpreting forever: `current_tier` would already read
+    /// as "done" for that tier, so `should_compile` would never recommend it
+    /// again, and nothing was ever inserted into `jit_cache` for the
+    /// interpreter's fast-path lookup to find.
+    fn complete_task(
+        &self,
+        key: &MethodKey,
+        tier: CompilationTier,
+        compile_time_ms: u64,
+        success: bool,
+    ) {
         {
             let mut methods = self.methods.lock();
             if let Some(state) = methods.get_mut(key) {
-                state.current_tier = tier;
+                if success {
+                    state.current_tier = tier;
+                    state.tier_fail_count = 0;
+                } else {
+                    state.tier_fail_count = state.tier_fail_count.saturating_add(1);
+                }
                 state.queued_for_compilation = false;
                 state.queued_tier = None;
                 state.last_compile_time_ms = compile_time_ms;
             }
         }
-        match tier {
-            CompilationTier::C1 | CompilationTier::C1WithProfiling => {
-                self.stats.c1_compilations.fetch_add(1, Ordering::Relaxed);
+        if success {
+            match tier {
+                CompilationTier::C1 | CompilationTier::C1WithProfiling => {
+                    self.stats.c1_compilations.fetch_add(1, Ordering::Relaxed);
+                }
+                CompilationTier::C2 => {
+                    self.stats.c2_compilations.fetch_add(1, Ordering::Relaxed);
+                }
+                _ => {}
             }
-            CompilationTier::C2 => {
-                self.stats.c2_compilations.fetch_add(1, Ordering::Relaxed);
-            }
-            _ => {}
         }
         self.stats
             .total_compile_time_ms
@@ -421,9 +460,12 @@ impl CompilerCore {
 
 /// A compile callback invoked on the background thread for each drained task.
 ///
-/// Returns the wall-clock compile time in milliseconds. The actual codegen is
-/// supplied by the VM at startup; `tiered.rs` only owns the scheduling.
-pub type CompileFn = Box<dyn Fn(&CompilationTask) -> u64 + Send + 'static>;
+/// Returns `(wall_clock_compile_time_ms, success)` — `success` is `true` only
+/// if the attempt actually published a compiled body (see
+/// [`CompilerCore::complete_task`] for why this must not be conflated with
+/// "the task was processed"). The actual codegen is supplied by the VM at
+/// startup; `tiered.rs` only owns the scheduling.
+pub type CompileFn = Box<dyn Fn(&CompilationTask) -> (u64, bool) + Send + 'static>;
 
 /// Whether a target tier should use the **optimized** (C2-equivalent) backend.
 ///
@@ -789,40 +831,18 @@ impl TieredCompilationManager {
         self.core.dequeue()
     }
 
-    /// Notify that compilation completed.
+    /// Notify that compilation completed successfully at `tier`. A thin
+    /// synchronous wrapper over [`CompilerCore::complete_task`] (always
+    /// reports `success = true` — this API has no failure-reporting caller
+    /// today; production code goes through the background worker's
+    /// `compiler_loop`, which threads a real success/failure bool through).
     pub fn compilation_complete(
         &self,
         key: &MethodKey,
         tier: CompilationTier,
         compile_time_ms: u64,
     ) {
-        let mut methods = self.core.methods.lock();
-        if let Some(state) = methods.get_mut(key) {
-            state.current_tier = tier;
-            state.queued_for_compilation = false;
-            state.queued_tier = None;
-            state.last_compile_time_ms = compile_time_ms;
-        }
-
-        match tier {
-            CompilationTier::C1 | CompilationTier::C1WithProfiling => {
-                self.core
-                    .stats
-                    .c1_compilations
-                    .fetch_add(1, Ordering::Relaxed);
-            }
-            CompilationTier::C2 => {
-                self.core
-                    .stats
-                    .c2_compilations
-                    .fetch_add(1, Ordering::Relaxed);
-            }
-            _ => {}
-        }
-        self.core
-            .stats
-            .total_compile_time_ms
-            .fetch_add(compile_time_ms, Ordering::Relaxed);
+        self.core.complete_task(key, tier, compile_time_ms, true);
     }
 
     // ── Deoptimization ───────────────────────────────────────────────────
@@ -1038,8 +1058,8 @@ impl TieredCompilationManager {
             // Compile off the mutator thread with NO lock held by this frame
             // (`q` was dropped above), then publish completion. `compile_fn`
             // bounds its own VM-lock scopes internally.
-            let compile_time_ms = compile_fn(&task);
-            core.complete_task(&task.method_key, task.target_tier, compile_time_ms);
+            let (compile_time_ms, success) = compile_fn(&task);
+            core.complete_task(&task.method_key, task.target_tier, compile_time_ms, success);
         }
     }
 
@@ -1082,6 +1102,17 @@ impl TieredCompilationManager {
         state: &MethodState,
         policy: &CompilationPolicy,
     ) -> Option<CompilationTier> {
+        // Give up after repeated compile-attempt failures (the attempt ran
+        // but never published a body — see `complete_task`), matching the
+        // "3+ deopts" convention `c2_bailout` already uses below. Without
+        // this, a method whose compile step keeps failing for a reason
+        // outside the (fast) permanent bail-list — e.g. a transient
+        // code-cache-cap or in-flight class redefine — would be
+        // re-recommended and re-enqueued on every single invocation
+        // forever, since a failed attempt no longer advances `current_tier`.
+        if state.tier_fail_count >= MAX_TIER_FAIL_RETRIES {
+            return None;
+        }
         match state.current_tier {
             CompilationTier::Interpreter => {
                 // Can we skip straight to C2?
@@ -1471,6 +1502,88 @@ mod tests {
         mgr.on_method_invocation(&key); // create state
         mgr.compilation_complete(&key, CompilationTier::C1, 10);
         assert_eq!(mgr.current_tier(&key), CompilationTier::C1);
+    }
+
+    // ── Failed compile attempts do not fake "compiled" and DO retry ──────
+    //
+    // Regression coverage for the bg-compile-no-publish bug: a
+    // `compile_fn` that runs but bails (skip-listed method, resolver miss,
+    // code-cache cap, ...) must not be recorded as having reached `tier` —
+    // `current_tier` has to stay put so a later invocation gets another
+    // shot, and the per-tier compilation stat must not count a body that
+    // was never published.
+
+    #[test]
+    fn failed_compile_does_not_advance_tier_or_stats() {
+        let mgr = TieredCompilationManager::with_default_policy();
+        let key = test_key();
+        mgr.on_method_invocation(&key); // create state
+        mgr.core.complete_task(&key, CompilationTier::C1, 10, false);
+        assert_eq!(
+            mgr.current_tier(&key),
+            CompilationTier::Interpreter,
+            "a failed attempt must not advance current_tier"
+        );
+        assert_eq!(
+            mgr.stats().c1_compilations.load(Ordering::Relaxed),
+            0,
+            "a failed attempt must not count as a C1 compilation"
+        );
+    }
+
+    #[test]
+    fn failed_compile_is_retried_up_to_the_fail_limit() {
+        let policy = CompilationPolicy {
+            c1_threshold: 1,
+            ..CompilationPolicy::default()
+        };
+        let mgr = TieredCompilationManager::new(policy);
+        let key = test_key();
+
+        // 1st invocation crosses c1_threshold=1 and enqueues C1.
+        assert_eq!(
+            mgr.on_method_invocation(&key),
+            Some(CompilationTier::C1)
+        );
+        // Fail it MAX_TIER_FAIL_RETRIES - 1 times; each failure must still
+        // leave the method eligible for another attempt (queued_for_compilation
+        // reset, current_tier untouched).
+        for i in 0..(MAX_TIER_FAIL_RETRIES - 1) {
+            mgr.core.complete_task(&key, CompilationTier::C1, 1, false);
+            assert_eq!(
+                mgr.on_method_invocation(&key),
+                Some(CompilationTier::C1),
+                "attempt {i}: should still be retried below the fail limit"
+            );
+        }
+        // One more failure reaches MAX_TIER_FAIL_RETRIES — should_compile
+        // must now give up permanently.
+        mgr.core.complete_task(&key, CompilationTier::C1, 1, false);
+        assert_eq!(
+            mgr.on_method_invocation(&key),
+            None,
+            "should stop recommending compilation after the fail limit"
+        );
+        assert_eq!(mgr.current_tier(&key), CompilationTier::Interpreter);
+    }
+
+    #[test]
+    fn successful_compile_after_a_failure_resets_the_fail_count() {
+        let policy = CompilationPolicy {
+            c1_threshold: 1,
+            ..CompilationPolicy::default()
+        };
+        let mgr = TieredCompilationManager::new(policy);
+        let key = test_key();
+        mgr.on_method_invocation(&key);
+        mgr.core.complete_task(&key, CompilationTier::C1, 1, false);
+        mgr.core.complete_task(&key, CompilationTier::C1, 5, true);
+        assert_eq!(mgr.current_tier(&key), CompilationTier::C1);
+        let methods = mgr.core.methods.lock();
+        assert_eq!(
+            methods[&key].tier_fail_count, 0,
+            "a later success should reset the fail streak"
+        );
     }
 
     // ── Deoptimization ───────────────────────────────────────────────────
@@ -1902,10 +2015,10 @@ mod tests {
         // the test thread, proving the work happened off the "mutator".
         let (tx, rx) = mpsc::channel::<(CompilationTier, std::thread::ThreadId)>();
         let bg = mgr
-            .start_background_compiler(Box::new(move |task: &CompilationTask| -> u64 {
+            .start_background_compiler(Box::new(move |task: &CompilationTask| -> (u64, bool) {
                 tx.send((task.target_tier, std::thread::current().id()))
                     .unwrap();
-                7 // pretend the compile took 7ms
+                (7, true) // pretend the compile took 7ms and published
             }))
             .expect("worker should start");
 
@@ -2011,14 +2124,14 @@ mod tests {
         let (tx, rx) = mpsc::channel::<(CompilationTier, bool, std::thread::ThreadId)>();
         let published_w = Arc::clone(&published);
         let bg = mgr
-            .start_background_compiler(Box::new(move |task: &CompilationTask| -> u64 {
+            .start_background_compiler(Box::new(move |task: &CompilationTask| -> (u64, bool) {
                 // Real compile_fn shape: pick the backend by tier (Step 3),
                 // "publish" the Jit target, and report back off-thread.
                 let optimized = tier_uses_optimized_backend(task.target_tier);
                 published_w.lock().push(task.method_key.clone());
                 tx.send((task.target_tier, optimized, std::thread::current().id()))
                     .unwrap();
-                3
+                (3, true)
             }))
             .expect("worker should start");
 
@@ -2122,7 +2235,7 @@ mod tests {
         let vm_lock_w = StdArc::clone(&vm_lock);
         let release_w = StdArc::clone(&release);
         let bg = mgr
-            .start_background_compiler(Box::new(move |_task: &CompilationTask| -> u64 {
+            .start_background_compiler(Box::new(move |_task: &CompilationTask| -> (u64, bool) {
                 // (1) Bounded VM-lock scope: acquire, read, DROP — exactly the
                 // shape `try_jit_compile_callee_slow` uses for class_manager /
                 // jit_cache. The guard must NOT survive into the blocking wait.
@@ -2135,7 +2248,7 @@ mod tests {
                 // or a `load_class_concurrent` condvar wait. If a VM lock were
                 // still held here, the STW thread below would deadlock.
                 release_w.wait();
-                4
+                (4, true)
             }))
             .expect("worker should start");
 

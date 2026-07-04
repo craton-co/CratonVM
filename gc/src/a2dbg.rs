@@ -56,7 +56,15 @@ pub fn record(
         // Bound memory on this contended host: the young gen is tiny, so the
         // recent tail always covers every live young object. Clear (not
         // ring-shift) when large — cheaper, and only loses ancient records.
-        if l.len() >= 300_000 {
+        // Family-A investigation (2026-07-03): raised from 300k to 4M —
+        // a heavy multi-threaded allocation workload (100 threads x 1000+
+        // proxy/reflection calls, each several allocations) wraps a 300k ring
+        // in well under a second, so "NO allocation record covers" was often
+        // a false negative (ring already cleared), not evidence the address
+        // was never allocated. 4M records is a bounded ~200MB Vec<Rec>
+        // (Rec is ~48 bytes) — acceptable for a default-inert, opt-in-only
+        // diagnostic.
+        if l.len() >= 4_000_000 {
             l.clear();
         }
         l.push(Rec {
