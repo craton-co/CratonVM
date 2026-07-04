@@ -12294,6 +12294,61 @@ pub fn i2_register_classloader_package_natives(r: &mut cratonvm_native_api::Nati
         "()[Ljava/lang/Package;",
         i2_classloader_get_defined_packages,
     );
+    // `Package.equals(Object)` -- real JDK has NO override (inherits identity
+    // `Object.equals`), which is correct there because HotSpot INTERNS one
+    // `Package` instance per (loader, package name): every `Class.getPackage()`
+    // call for the same package returns the SAME object, so identity equality
+    // is suffient. Our `native_class_get_package` (and the sibling package-
+    // mirror builders) allocate a FRESH synthetic `Package` object on every
+    // call -- no interning -- so two `Package`s for the literal same package
+    // name are never `==`, and since `equals` falls back to identity, they
+    // also never `.equals()`. Spring's `HandlerMethodValidationException`
+    // test helper `MvcParamPredicate.hasMvcAnnotation` (and any other code
+    // doing `someAnnotation.annotationType().getPackage().equals(SomeOther
+    // Annotation.class.getPackage())`) depends on same-named packages
+    // comparing equal, so this silently misclassified annotations by
+    // declaring package.
+    //
+    // Fix: override `equals` to compare by package name (`Package.hashCode()`
+    // already runs real bytecode hashing `getName()`, so this keeps the
+    // equals/hashCode contract intact). This is not a byte-for-byte identity
+    // match (two different loaders' same-named packages would now compare
+    // equal, where HotSpot's interned-per-loader objects would not), but it
+    // fixes the common case without the GC-safety complexity of interning
+    // `Package` objects in a side-table (cf. `system_props_singleton`).
+    r.register(
+        "java/lang/Package",
+        "equals",
+        "(Ljava/lang/Object;)Z",
+        |ctx, args| {
+            let this = match args.first() {
+                Some(Value::Object(Some(o))) => *o,
+                _ => return Ok(Some(Value::Int(0))),
+            };
+            let other = match args.get(1) {
+                Some(Value::Object(Some(o))) => *o,
+                _ => return Ok(Some(Value::Int(0))),
+            };
+            if this == other {
+                return Ok(Some(Value::Int(1)));
+            }
+            let other_cid = ctx.class_id_of_object(other);
+            let other_class_name = ctx.class_name_of_id(other_cid).unwrap_or_default();
+            if other_class_name != "java/lang/Package" {
+                return Ok(Some(Value::Int(0)));
+            }
+            let this_name = ctx.get_field_by_name(this, "name");
+            let other_name = ctx.get_field_by_name(other, "name");
+            let eq = match (this_name, other_name) {
+                (Value::Object(Some(a)), Value::Object(Some(b))) => {
+                    ctx.read_string(a).unwrap_or_default() == ctx.read_string(b).unwrap_or_default()
+                }
+                (Value::Object(None), Value::Object(None)) => true,
+                _ => false,
+            };
+            Ok(Some(Value::Int(eq as i32)))
+        },
+    );
     r.register(
         cl,
         "getNamedPackage",
