@@ -1,38 +1,88 @@
 # Elasticsearch engine merge-policy hangs
 
-Status: open
+Status: open (partially mitigated)
 
 Date observed: 2026-07-02
+Date investigated: 2026-07-03/04
 
 ## Summary
 
-Two engine/merge-policy tests hang under CratonVM until the suite runner kills
-the process at the requested 300-second timeout.
+`ShuffleForcedMergePolicyTests` was reported as a 300s suite-timeout "HANG"
+under CratonVM JIT-on. Deep investigation (symbolicated native-stack capture
++ CPU profiling + targeted instrumentation) shows this is **not a deadlock**:
+left running, the process completes on its own — it is simply catastrophically
+slower than HotSpot for this specific test (HotSpot: 15s).
 
-## Current full-suite result
+One genuine, safe performance bug was found and fixed (below), giving a real
+but partial speedup. The test still exceeds the 300s suite timeout, so it
+still needs to be treated as a hang/hangs-class defect by the suite runner
+until further work lands.
 
-Run `es-current-full-jiton-20260702`, `all[1..2701]`, CratonVM JIT-on,
-`-TimeoutSec 300`:
+## Root cause of the slowdown
 
-- 2 CratonVM `HANG` rows in this family.
-- 1 is CratonVM-only.
-- 1 overlaps a HotSpot baseline failure.
+The test exercises Lucene's `NamedSPILoader`, which reflectively constructs
+dozens of backward-compat `Codec`/`PostingsFormat`/`DocValuesFormat`
+providers via `ServiceLoader`. Each provider construction triggers a deep,
+legitimate chain of nested class-initialization (`ServiceLoader` iteration →
+reflective `Constructor.newInstance` → `AccessController.doPrivileged` →
+`MethodHandle`/`MethodHandles.Lookup.findStatic` dispatch → further nested
+`<clinit>`s), observed via a symbolicated (`profsym`) `cdb` capture as ~130
+native stack frames deep / ~30-40 interpreter frames deep.
 
-Representative Craton-only row:
+`update_root_snapshot` runs on every object-returning native call (confirmed:
+**~1.6-2.8 million calls** in under 90 seconds of this test). Its frozen-frame
+cache (`rootsnap_cache`) and cross-GC cache survival
+(`rootsnap_cache_survive_gc`) are both working correctly and were **not** the
+bottleneck (confirmed via targeted instrumentation: near-zero GC cycles
+during the slow phase, near-perfect frame-cache hit rate).
 
-```text
-index=1569
-module=server
-class=org.elasticsearch.index.engine.ShuffleForcedMergePolicyTests
-CratonVM=HANG, 300.149s
-HotSpot=PASS, 15.372s
-```
+The actual dominant, *provably growing* cost was the "unregistered JIT frame"
+safety-net scan in `scan_active_jit_frames`
+(`vm/src/jit/conservative_roots.rs`, the A5-fix block): on **every** call
+(whenever any method has ever been JIT-compiled — i.e. essentially always),
+it scanned `[search_lo, stack_high)` for a stray JIT return address, where
+`search_lo` tracks the current native stack pointer. Since that pointer only
+gets deeper as this workload's nested-reflection call chain grows, the
+scanned range — and therefore the cost of every single snapshot — grew
+monotonically over the run (measured: ~3µs → ~15µs per call across 2.4M
+calls, accounting for the large majority of `update_root_snapshot`'s own
+cost, which itself was roughly half of total wall-clock time).
 
-The overlapping HotSpot-fail class is:
+## Fix landed
 
-```text
-org.elasticsearch.index.engine.InternalEngineTests
-```
+`vm/src/jit/conservative_roots.rs`: memoize the deepest stack pointer already
+verified clean of an unregistered JIT frame, keyed additionally on
+`jit_code_range_count()` (invalidated by any new compilation, closing the one
+theoretical staleness gap — an OSR/late-registration race). Once a region
+`[verified_lo, stack_high)` scans clean, any later call whose `search_lo >=
+verified_lo` is checking a subset of an already-verified-clean range (nothing
+above the current stack pointer can change while this thread is nested below
+it), so the scan is skipped. New compilations invalidate the memo and force a
+fresh scan, so the safety net (Windows-only "A5" unregistered-`main`-frame
+detection) is preserved exactly as before.
+
+**Verified:**
+- Same test outcome before/after (both hit the pre-existing, separately
+  tracked `RandomizedContext.getPerThread()` NPE — see below — not a new
+  regression).
+- Instrumented (`CRATONVM_DBG_ROOTSNAP=1`) A/B: the per-call cost driven by
+  this scan dropped from a growing ~3-15µs/call to a much smaller, far more
+  slowly growing ~0.1-2.6µs/call.
+- Full-run timing: JUnit-reported internal time dropped from 2,277s to
+  1,416s for this test (~1.6x) — a real, substantial improvement, but the
+  test **still exceeds the 300s suite timeout**.
+
+## Residual gap
+
+Even after the fix, this test takes ~1,416s (vs HotSpot's 15s) before hitting
+the pre-existing `RandomizedContext.getPerThread()` NPE documented in
+[elasticsearch-randomizedcontext-per-thread-null.md](elasticsearch-randomizedcontext-per-thread-null.md)
+(a genuine JIT-timing-dependent race, already root-caused there — not
+re-investigated here). Closing the remaining gap to HotSpot parity (or at
+least under the 300s timeout) needs further profiling of the *other* costs in
+this reflection/classloading-heavy path (dozens of SPI providers, each paying
+real `ServiceLoader` + reflection + nested-`<clinit>` overhead); no further
+single dominant bottleneck was identified in this pass.
 
 ## Repro
 
@@ -46,6 +96,10 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass `
   -Exe C:\craton\CratonVM-elasticsearch-current-suite-20260702\target\release\cratonvm-elasticsearch-current-suite-20260702.exe
 ```
 
+To reproduce and observe the (fixed) `update_root_snapshot` cost directly,
+run the class standalone (see `docs/CONFIG.md` for CLI flags) with
+`CRATONVM_DBG_ROOTSNAP=1` and watch the periodic `[ROOTSNAP]` stderr lines.
+
 ## Evidence
 
 ```text
@@ -53,3 +107,11 @@ C:\craton\CratonVM-elasticsearch-current-suite-20260702\apps\elasticsearch-suite
 C:\craton\CratonVM-elasticsearch-current-suite-20260702\apps\elasticsearch-suite-runner\.suite\results\es-current-full-jiton-20260702\all-jit\logs\server.org.elasticsearch.index.engine.ShuffleForcedMergePolicyTests.out.log
 C:\craton\CratonVM-elasticsearch-full-suite-20260702\apps\elasticsearch-suite-runner\.suite\results\es-full-hotspot-20260702\hotspot-jit\results.tsv
 ```
+
+Fix branch: `fix/es-engine-merge-policy-hangs-20260703` (worktree
+`C:\craton\CratonVM-es-mergehang-20260703`), commit touches
+`vm/src/jit/conservative_roots.rs` only.
+
+The overlapping HotSpot-fail class mentioned in the original report,
+`org.elasticsearch.index.engine.InternalEngineTests`, was not investigated
+here (separate defect).

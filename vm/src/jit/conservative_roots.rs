@@ -177,6 +177,33 @@ thread_local! {
 }
 
 thread_local! {
+    /// Memoizes how deep the "unregistered JIT frame above the tracked chain"
+    /// scan (see the A5-fix block in `scan_active_jit_frames`) has already
+    /// verified clean: `(verified_lo, code_range_count_at_verification)`.
+    ///
+    /// That scan checks `[search_lo, stack_high)` for a stray JIT return
+    /// address on every `update_root_snapshot` call. `search_lo` tracks the
+    /// current (thread-local) native stack pointer, which only DECREASES as
+    /// this thread recurses deeper — so once a range `[verified_lo,
+    /// stack_high)` has been scanned and found clean, any LATER call whose
+    /// `search_lo >= verified_lo` needs only a subset of that same range:
+    /// nothing above our current stack pointer can change while we are
+    /// nested below it (that memory belongs to still-waiting caller frames),
+    /// so the "clean" verdict still holds and the scan can be skipped.
+    ///
+    /// The one way the verdict COULD go stale is a method compiling (OSR or
+    /// otherwise) between the two checks: a stack slot that held a plain
+    /// (non-JIT) value at the first scan could later be sitting where a
+    /// *new* JIT code range now claims to start. Guard against that by also
+    /// storing `jit_code_range_count()` at verification time and requiring
+    /// it be unchanged — any new compilation invalidates the memo and forces
+    /// a fresh scan. Reset to `(usize::MAX, 0)` so the very first check
+    /// always scans.
+    static UNREG_JIT_VERIFIED_LO: std::cell::Cell<(usize, usize)> =
+        const { std::cell::Cell::new((usize::MAX, 0)) };
+}
+
+thread_local! {
     /// Perf mirror of the CURRENT top chain entry's `exact_rbp`. The hot
     /// per-invocation `set_top_frame_base` (called once per JIT method entry —
     /// ~1.8B times for fib44) writes ONLY this `Cell` (a single TLS store, no
@@ -1287,15 +1314,24 @@ pub fn scan_active_jit_frames(heap: &VmHeap, out: &mut Vec<ObjectRef>) {
     // scan is bounded + early-exits. Windows-only for now (reuses
     // `current_thread_stack_high`); the non-Windows port is a tracked follow-up.
     #[cfg(target_os = "windows")]
-    if cratonvm_jit::jit_code_range_count() > 0 {
-        let cover_hi = JIT_ENTRY_CHAIN
-            .with(|c| c.borrow().iter().map(|e| e.entry_sp).max())
-            .unwrap_or(scanner_sp);
-        let search_lo = scanner_sp.max(cover_hi);
-        let high = current_thread_stack_high();
-        if high > search_lo && native_stack_has_jit_frame(search_lo, high) {
-            scan_one_frame(search_lo, high, heap, out);
-            cratonvm_gc::gc_quiescence::set_unregistered_jit_frame_on_stack();
+    {
+        let code_ranges = cratonvm_jit::jit_code_range_count();
+        if code_ranges > 0 {
+            let cover_hi = JIT_ENTRY_CHAIN
+                .with(|c| c.borrow().iter().map(|e| e.entry_sp).max())
+                .unwrap_or(scanner_sp);
+            let search_lo = scanner_sp.max(cover_hi);
+            let (verified_lo, verified_ranges) = UNREG_JIT_VERIFIED_LO.with(std::cell::Cell::get);
+            let already_clean = code_ranges == verified_ranges && search_lo >= verified_lo;
+            if !already_clean {
+                let high = current_thread_stack_high();
+                if high > search_lo && native_stack_has_jit_frame(search_lo, high) {
+                    scan_one_frame(search_lo, high, heap, out);
+                    cratonvm_gc::gc_quiescence::set_unregistered_jit_frame_on_stack();
+                } else {
+                    UNREG_JIT_VERIFIED_LO.with(|v| v.set((search_lo, code_ranges)));
+                }
+            }
         }
     }
 

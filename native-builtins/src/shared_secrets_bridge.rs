@@ -355,6 +355,63 @@ fn jla_add_enable_native_access(_ctx: &mut dyn NativeContext, args: &[Value]) ->
     Ok(Some(args.get(1).copied().unwrap_or(Value::Object(None))))
 }
 
+/// `JavaLangAccess.defineClass(ClassLoader loader, String name, byte[] b,
+/// ProtectionDomain pd, String source)` -> `Class<?>`.
+///
+/// `jdk.internal.reflect.ClassDefiner.defineClass(String, byte[], int, int,
+/// ClassLoader)` — used by `ReflectionFactory` to materialize the
+/// serialization-constructor-accessor / `MethodAccessor` classes that JUnit5's
+/// `SessionPerRequestLauncher` (and every Arquillian
+/// `testsuite/integration-arquillian/tests/base` test class) generates during
+/// test-plan construction — slices its `(off, len)` window down to an
+/// exact-size array before calling
+/// `SharedSecrets.getJavaLangAccess().defineClass(parent, name, bytes, null,
+/// "__ClassDefiner__")`. `System$1` (the `JavaLangAccess` singleton, see
+/// `register_java_lang_access`) never had this method registered, so the
+/// `invokeinterface` raised `NoSuchMethodError`, aborting `ClassDefiner`
+/// before any Arquillian base test class could run.
+///
+/// No offset/length here (unlike `ClassLoader.defineClass1`/`defineClass2`) —
+/// the real `JavaLangAccess` interface method takes the whole array. Shares
+/// the same `define_class_via_full` backend as `defineClass1` so magic-byte
+/// validation, panic-guarding, and PD/code-source attribution stay unified
+/// across every defineClass entry point.
+///
+/// INSTANCE method: args[0] = receiver (System$1), args[1] = loader,
+/// args[2] = name, args[3] = byte[], args[4] = pd, args[5] = source (unused —
+/// `define_class_via_full` derives its own SourceFile handling).
+fn jla_define_class(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    use cratonvm_types::error::RuntimeError;
+
+    let loader = args.get(1).copied().unwrap_or(Value::Object(None));
+    let name = crate::classloader::read_optional_internal_name(ctx, args, 2);
+    let byte_array = match args.get(3) {
+        Some(Value::Object(Some(arr))) => *arr,
+        _ => {
+            return Err(RuntimeError::IllegalArgumentException {
+                message: "JavaLangAccess.defineClass: bytes must not be null".into(),
+            }
+            .into());
+        }
+    };
+    let len = ctx.array_length(byte_array);
+    let bytes = crate::classloader::read_byte_array_slice(ctx, byte_array, 0, len).map_err(
+        |_msg| {
+            cratonvm_types::error::MethodCallFailed::from(
+                RuntimeError::ArrayIndexOutOfBoundsException { index: 0 },
+            )
+        },
+    )?;
+
+    let mut opts = cratonvm_native_api::DefineClassFull::default();
+    if let Some(Value::Object(Some(pd))) = args.get(4) {
+        opts.code_source_url = crate::classloader::extract_pd_code_source_url(ctx, *pd);
+    }
+
+    let loader_id = crate::classloader::loader_id_for(ctx, loader);
+    crate::classloader::define_class_via_full(ctx, &name, bytes, loader_id, opts, false, None)
+}
+
 /// `JavaLangAccess.getConstantPool(Class<?>)` -> `jdk.internal.reflect.ConstantPool`.
 ///
 /// ByteBuddy's class-file reader consults this via `invokeinterface
@@ -570,61 +627,35 @@ fn jla_get_methods_or_null(ctx: &mut dyn NativeContext, args: &[Value]) -> Metho
     }
 }
 
-/// `JavaLangAccess.defineClass(ClassLoader loader, String name, byte[] b,
-/// ProtectionDomain pd, String source)` -> `Class<?>`.
+/// `JavaLangAccess.findBootstrapClassOrNull(String name)` -> `Class<?>`.
 ///
-/// `jdk.internal.reflect.ClassDefiner.defineClass(String, byte[], int, int,
-/// ClassLoader)` — used by `ReflectionFactory` to materialize the
-/// serialization-constructor-accessor / `MethodAccessor` classes that JUnit5's
-/// `SessionPerRequestLauncher` (and every Arquillian
-/// `testsuite/integration-arquillian/tests/base` test class) generates during
-/// test-plan construction — slices its `(off, len)` window down to an
-/// exact-size array before calling
-/// `SharedSecrets.getJavaLangAccess().defineClass(parent, name, bytes, null,
-/// "__ClassDefiner__")`. `System$1` (the `JavaLangAccess` singleton, see
-/// `register_java_lang_access`) never had this method registered, so the
-/// `invokeinterface` raised `NoSuchMethodError`, aborting `ClassDefiner`
-/// before any Arquillian base test class could run.
+/// `jdk.internal.loader.BootLoader.loadClassOrNull(String name)` calls this to
+/// check whether the bootstrap loader has already loaded `name` WITHOUT
+/// triggering a fresh load — a pure "is it already loaded" probe, not a
+/// resolve-or-define path. Missing this registration raised
+/// `NoSuchMethodError` on every SSSD Arquillian test row (see
+/// docs/known-issues/keycloak-sssd-system1-findbootstrapclassornull-nosuchmethod.md).
 ///
-/// No offset/length here (unlike `ClassLoader.defineClass1`/`defineClass2`) —
-/// the real `JavaLangAccess` interface method takes the whole array. Shares
-/// the same `define_class_via_full` backend as `defineClass1` so magic-byte
-/// validation, panic-guarding, and PD/code-source attribution stay unified
-/// across every defineClass entry point.
+/// `ctx.class_id_by_name` is a pure lookup against the already-loaded class
+/// table — it does not itself trigger classloading (the same guarantee
+/// `classloader::find_loaded_class_for_loader` relies on for
+/// `ClassLoader.findLoadedClass`/`findLoadedClass0`), so this preserves the
+/// real JDK's "does not trigger loading" contract.
 ///
-/// INSTANCE method: args[0] = receiver (System$1), args[1] = loader,
-/// args[2] = name, args[3] = byte[], args[4] = pd, args[5] = source (unused —
-/// `define_class_via_full` derives its own SourceFile handling).
-fn jla_define_class(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    use cratonvm_types::error::RuntimeError;
-
-    let loader = args.get(1).copied().unwrap_or(Value::Object(None));
-    let name = crate::classloader::read_optional_internal_name(ctx, args, 2);
-    let byte_array = match args.get(3) {
-        Some(Value::Object(Some(arr))) => *arr,
-        _ => {
-            return Err(RuntimeError::IllegalArgumentException {
-                message: "JavaLangAccess.defineClass: bytes must not be null".into(),
-            }
-            .into());
-        }
+/// INSTANCE method: args[0] = receiver (System$1), args[1] = name (dotted or
+/// slashed binary name).
+fn jla_find_bootstrap_class_or_null(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    let name = match args.get(1) {
+        Some(Value::Object(Some(s))) => ctx.read_string(*s).unwrap_or_default().replace('.', "/"),
+        _ => return Ok(Some(Value::Object(None))),
     };
-    let len = ctx.array_length(byte_array);
-    let bytes = crate::classloader::read_byte_array_slice(ctx, byte_array, 0, len).map_err(
-        |_msg| {
-            cratonvm_types::error::MethodCallFailed::from(
-                RuntimeError::ArrayIndexOutOfBoundsException { index: 0 },
-            )
-        },
-    )?;
-
-    let mut opts = cratonvm_native_api::DefineClassFull::default();
-    if let Some(Value::Object(Some(pd))) = args.get(4) {
-        opts.code_source_url = crate::classloader::extract_pd_code_source_url(ctx, *pd);
+    match ctx.class_id_by_name(&name) {
+        Some(cid) => Ok(Some(Value::Object(Some(ctx.get_class_mirror(cid))))),
+        None => Ok(Some(Value::Object(None))),
     }
-
-    let loader_id = crate::classloader::loader_id_for(ctx, loader);
-    crate::classloader::define_class_via_full(ctx, &name, bytes, loader_id, opts, false, None)
 }
 
 fn register_java_lang_access(registry: &mut NativeMethodRegistry) {
@@ -741,7 +772,6 @@ fn register_java_lang_access(registry: &mut NativeMethodRegistry) {
         "(Ljava/lang/Module;)Ljava/lang/Module;",
         jla_add_enable_native_access,
     );
-    // `jdk.internal.reflect.ClassDefiner.defineClass` -> JavaLangAccess.defineClass.
     registry.register(
         owner,
         "getConstantPool",
@@ -761,6 +791,14 @@ fn register_java_lang_access(registry: &mut NativeMethodRegistry) {
         "defineClass",
         "(Ljava/lang/ClassLoader;Ljava/lang/String;[BLjava/security/ProtectionDomain;Ljava/lang/String;)Ljava/lang/Class;",
         jla_define_class,
+    );
+    // `jdk.internal.loader.BootLoader.loadClassOrNull` — see
+    // `jla_find_bootstrap_class_or_null` doc comment.
+    registry.register(
+        owner,
+        "findBootstrapClassOrNull",
+        "(Ljava/lang/String;)Ljava/lang/Class;",
+        jla_find_bootstrap_class_or_null,
     );
     registry.register(
         owner,
@@ -2020,6 +2058,27 @@ mod tests {
             )
             .is_some(),
             "JavaLangAccess.defineClass not registered on java/lang/System$1"
+        );
+    }
+
+    #[test]
+    fn java_lang_access_find_bootstrap_class_or_null_registered() {
+        // `jdk.internal.loader.BootLoader.loadClassOrNull` calls
+        // `SharedSecrets.getJavaLangAccess().findBootstrapClassOrNull(name)`,
+        // which dispatches on the `System$1` singleton's concrete class.
+        // Missing this registration raised NoSuchMethodError on every SSSD
+        // Keycloak Arquillian test row (see
+        // docs/known-issues/keycloak-sssd-system1-findbootstrapclassornull-nosuchmethod.md).
+        let mut r = NativeMethodRegistry::new();
+        register_wp1_4_shared_secrets(&mut r);
+        assert!(
+            r.find(
+                "java/lang/System$1",
+                "findBootstrapClassOrNull",
+                "(Ljava/lang/String;)Ljava/lang/Class;",
+            )
+            .is_some(),
+            "JavaLangAccess.findBootstrapClassOrNull not registered on java/lang/System$1"
         );
     }
 }

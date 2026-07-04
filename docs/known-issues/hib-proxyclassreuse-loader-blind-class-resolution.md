@@ -7,6 +7,7 @@
 | **Symptom** | `org.hibernate.orm.test.proxy.ProxyClassReuseTest.testNoReuse` fails: `MappingException: Could not instantiate persister … MyEntity`, caused by `IncompatibleClassChangeError: class …MyEntity$HibernateProxy already defined by application loader`. |
 | **Severity** | medium (CratonVM-only; pre-existing — fails identically at baseline `b0aab8f9`). Same class as SBR-14 / SC-custom-classloader isolation residuals. |
 | **Discovered** | 2026-06-24, triaging the Hibernate suite residuals after the collection-delegation stack-overflow fix (`7b224d8a`). |
+| **See also** | [hib-bytecode-enhancement-loader-faithful-linking.md](hib-bytecode-enhancement-loader-faithful-linking.md) — describes the *linking/dispatch* layer built on top of this doc's three-layer `CONSTANT_Class`/`defineClass`-namespace/`findLoadedClass` fix (superclass linking, `invokespecial` dispatch, SessionFactory-build identity). Both docs describe the same loader-identity mechanism; that doc's `enhancement.lazy.*`/`mapping.lazytoone.*` cluster is the largest remaining gap in this whole family, re-verified still open 2026-07-04. |
 
 > **RETRY 2026-07-01:** Re-ran the focused builtin-loader reverse-pollution coverage on
 > current `dev`: `cargo test -p cratonvm-native-builtins test_builtin_find_loaded_class -- --nocapture`

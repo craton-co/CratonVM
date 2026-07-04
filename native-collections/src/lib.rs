@@ -29685,6 +29685,28 @@ fn unmod_delegate_rewrap_map(
     }
 }
 
+/// Forward a read-only NavigableSet/SortedSet *view* call to the backing
+/// (e.g. `tailSet`, `headSet`, `subSet`, `descendingSet`) and re-wrap the
+/// returned set as unmodifiable, mirroring the JDK's `UnmodifiableNavigableSet`
+/// which returns unmodifiable sub-views. A non-set / null result is passed
+/// through unchanged.
+fn unmod_delegate_rewrap_set(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+    method: &str,
+    descriptor: &str,
+) -> MethodCallResult {
+    let res = unmod_delegate(ctx, args, method, descriptor)?;
+    match res {
+        Some(Value::Object(Some(s))) => Ok(Some(Value::Object(Some(alloc_unmod_wrapper(
+            ctx,
+            UNMOD_SET_CLASS,
+            s,
+        ))))),
+        other => Ok(other),
+    }
+}
+
 fn register_unmodifiable_natives(r: &mut NativeMethodRegistry) {
     let __prev_cat = r.current_category();
     r.set_category(cratonvm_native_api::NativeKind::Bridge);
@@ -29861,6 +29883,146 @@ fn register_unmodifiable_natives(r: &mut NativeMethodRegistry) {
             };
             r.register(c, m, desc, cb);
         }
+    }
+
+    // ---- UnmodifiableSet — NavigableSet/SortedSet read-only surface -------
+    //
+    // `cratonvm/internal/UnmodifiableSet` also backs `Collections.
+    // unmodifiableSortedSet`/`unmodifiableNavigableSet` (see
+    // `native_collections_unmodifiable_set`), so a wrapped TreeSet navigated
+    // as a NavigableSet needs the same surface `UnmodifiableMap` already gets
+    // for NavigableMap above — e.g. `KnownIndexVersions.<clinit>` calls
+    // `Collections.unmodifiableNavigableSet(new TreeSet<>(...)).tailSet(v,
+    // true)`, which previously raised NoSuchMethodError (no method registered
+    // on the synthetic wrapper class at all) and aborted every caller's
+    // `<clinit>` with ExceptionInInitializerError.
+    {
+        let c = UNMOD_SET_CLASS;
+        r.register(c, "first", "()Ljava/lang/Object;", |ctx, args| {
+            unmod_delegate(ctx, args, "first", "()Ljava/lang/Object;")
+        });
+        r.register(c, "last", "()Ljava/lang/Object;", |ctx, args| {
+            unmod_delegate(ctx, args, "last", "()Ljava/lang/Object;")
+        });
+        r.register(c, "comparator", "()Ljava/util/Comparator;", |ctx, args| {
+            unmod_delegate(ctx, args, "comparator", "()Ljava/util/Comparator;")
+        });
+        for m in ["ceiling", "floor", "higher", "lower"] {
+            let desc = "(Ljava/lang/Object;)Ljava/lang/Object;";
+            let cb: cratonvm_native_api::NativeCallback = match m {
+                "ceiling" => |ctx, args| {
+                    unmod_delegate(ctx, args, "ceiling", "(Ljava/lang/Object;)Ljava/lang/Object;")
+                },
+                "floor" => |ctx, args| {
+                    unmod_delegate(ctx, args, "floor", "(Ljava/lang/Object;)Ljava/lang/Object;")
+                },
+                "higher" => |ctx, args| {
+                    unmod_delegate(ctx, args, "higher", "(Ljava/lang/Object;)Ljava/lang/Object;")
+                },
+                _ => |ctx, args| {
+                    unmod_delegate(ctx, args, "lower", "(Ljava/lang/Object;)Ljava/lang/Object;")
+                },
+            };
+            r.register(c, m, desc, cb);
+        }
+        r.register(
+            c,
+            "descendingIterator",
+            "()Ljava/util/Iterator;",
+            |ctx, args| unmod_delegate(ctx, args, "descendingIterator", "()Ljava/util/Iterator;"),
+        );
+        // Mutators — unmodifiable, so throw like the other poll*/mutators above.
+        r.register(c, "pollFirst", "()Ljava/lang/Object;", native_unmod_throw);
+        r.register(c, "pollLast", "()Ljava/lang/Object;", native_unmod_throw);
+        // Sub-views — re-wrap the backing set's result as unmodifiable too
+        // (mirrors the JDK's UnmodifiableNavigableSet.tailSet/headSet/subSet/
+        // descendingSet, which never leak a mutable view of the backing set).
+        r.register(
+            c,
+            "descendingSet",
+            "()Ljava/util/NavigableSet;",
+            |ctx, args| {
+                unmod_delegate_rewrap_set(ctx, args, "descendingSet", "()Ljava/util/NavigableSet;")
+            },
+        );
+        r.register(
+            c,
+            "headSet",
+            "(Ljava/lang/Object;)Ljava/util/SortedSet;",
+            |ctx, args| {
+                unmod_delegate_rewrap_set(
+                    ctx,
+                    args,
+                    "headSet",
+                    "(Ljava/lang/Object;)Ljava/util/SortedSet;",
+                )
+            },
+        );
+        r.register(
+            c,
+            "tailSet",
+            "(Ljava/lang/Object;)Ljava/util/SortedSet;",
+            |ctx, args| {
+                unmod_delegate_rewrap_set(
+                    ctx,
+                    args,
+                    "tailSet",
+                    "(Ljava/lang/Object;)Ljava/util/SortedSet;",
+                )
+            },
+        );
+        r.register(
+            c,
+            "subSet",
+            "(Ljava/lang/Object;Ljava/lang/Object;)Ljava/util/SortedSet;",
+            |ctx, args| {
+                unmod_delegate_rewrap_set(
+                    ctx,
+                    args,
+                    "subSet",
+                    "(Ljava/lang/Object;Ljava/lang/Object;)Ljava/util/SortedSet;",
+                )
+            },
+        );
+        r.register(
+            c,
+            "headSet",
+            "(Ljava/lang/Object;Z)Ljava/util/NavigableSet;",
+            |ctx, args| {
+                unmod_delegate_rewrap_set(
+                    ctx,
+                    args,
+                    "headSet",
+                    "(Ljava/lang/Object;Z)Ljava/util/NavigableSet;",
+                )
+            },
+        );
+        r.register(
+            c,
+            "tailSet",
+            "(Ljava/lang/Object;Z)Ljava/util/NavigableSet;",
+            |ctx, args| {
+                unmod_delegate_rewrap_set(
+                    ctx,
+                    args,
+                    "tailSet",
+                    "(Ljava/lang/Object;Z)Ljava/util/NavigableSet;",
+                )
+            },
+        );
+        r.register(
+            c,
+            "subSet",
+            "(Ljava/lang/Object;ZLjava/lang/Object;Z)Ljava/util/NavigableSet;",
+            |ctx, args| {
+                unmod_delegate_rewrap_set(
+                    ctx,
+                    args,
+                    "subSet",
+                    "(Ljava/lang/Object;ZLjava/lang/Object;Z)Ljava/util/NavigableSet;",
+                )
+            },
+        );
     }
 
     // ---- UnmodifiableList — adds positional reads + list mutators ---------
