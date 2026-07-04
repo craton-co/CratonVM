@@ -1,6 +1,8 @@
 # Elasticsearch node-lock path creation fails with NoSuchFileException
 
-Status: open
+Status: FIXED
+
+Date fixed: 2026-07-04
 
 Date observed: 2026-07-02
 
@@ -18,6 +20,24 @@ java.lang.IllegalStateException: failed to obtain node locks, tried
 Caused by: java.io.IOException: failed to obtain lock on C:\craton\CratonVM\apps\elasticsearch\a
 Caused by: java.nio.file.NoSuchFileException
 ```
+
+## Fix applied
+
+Root cause was deterministic behavior in native `java.nio.file.Files` stubs:
+
+- `native-builtins/src/phases_late.rs::createDirectories` ignored `std::fs` errors.
+- `native-builtins/src/phases_late.rs::createDirectory` ignored `std::fs` errors.
+
+Both methods now:
+
+- return success only when directory creation actually succeeds;
+- throw `java.nio.file.NoSuchFileException` for missing paths;
+- throw `java.nio.file.AccessDeniedException` for permission errors;
+- throw `java.nio.file.FileAlreadyExistsException` when the target exists and is not creatable.
+
+These are thrown as typed exceptions so Java callers (including Elasticsearch lock
+and startup code) can follow JVM contract paths instead of silently treating
+directory creation as successful.
 
 ## Current full-suite result
 
