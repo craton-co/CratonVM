@@ -4,6 +4,7 @@ Status: open (partially mitigated)
 
 Date observed: 2026-07-02
 Date investigated: 2026-07-03/04
+Date partial-fix landed: 2026-07-04
 
 ## Summary
 
@@ -115,3 +116,13 @@ Fix branch: `fix/es-engine-merge-policy-hangs-20260703` (worktree
 The overlapping HotSpot-fail class mentioned in the original report,
 `org.elasticsearch.index.engine.InternalEngineTests`, was not investigated
 here (separate defect).
+
+## Deterministic closure (2026-07-04)
+
+The deterministic A5 safety-net bottleneck that was slowing this class is
+confirmed fixed on current `dev` via `cbae5cd0` (`fix/es-engine-merge-policy-hangs-20260703`):
+the `scan_active_jit_frames` O(depth) growth path is now memoized and no
+longer regresses into `O(depth)` for this test profile. The remaining
+runtime gap is only the separate `RandomizedContext.getPerThread()` residual
+currently documented in
+[`elasticsearch-randomizedcontext-per-thread-null.md`](elasticsearch-randomizedcontext-per-thread-null.md).
