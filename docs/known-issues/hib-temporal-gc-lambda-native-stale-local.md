@@ -17,7 +17,7 @@ OffsetDateTimeTest, OffsetTimeTest, ZonedDateTimeTest}`.
 
 This is **NOT** a java.time temporal-type binding bug (no `Timestamp`/`Calendar`/`OffsetDateTime`
 conversion is involved). It is another manifestation of the GC-root-coverage family already documented in
-[`hibernate-bytearraymapping-stackwalk-gc-corruption.md`](hibernate-bytearraymapping-stackwalk-gc-corruption.md):
+[`hibernate-bytearraymapping-stackwalk-gc-corruption.md`](../internal/fixed-suite-bugs/hibernate-bytearraymapping-stackwalk-gc-corruption.md):
 
 > CV native code holds Java object refs in Rust locals/`Vec`s across allocating `ctx` calls
 > (`invoke_virtual` / `create_string` / `alloc_*`) **without re-reading them from a pin** afterwards.
