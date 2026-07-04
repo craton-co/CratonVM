@@ -484,6 +484,28 @@ JIT divide-by-zero re-run) has since been fixed; the other two remain open:
   `SmallRyeConfigBuilder.withConverters`) — not new bugs, both covered by this
   doc's existing next steps.
 
+## Keycloak post-PreviewFeatures rerun (2026-07-03)
+
+After `jdk/internal/misc/PreviewFeatures.isPreviewEnabled()Z` was fixed, the
+1044-class Azure non-passed rerun no longer contains the original
+PreviewFeatures native crash. The remaining non-passed rows are tracked here:
+
+- [keycloak-arquillian-system1-defineclass-nosuchmethod.md](keycloak-arquillian-system1-defineclass-nosuchmethod.md) -
+  621 `CRASH` rows in `testsuite/integration-arquillian/tests/base`, missing
+  `java/lang/System$1.defineClass(...ProtectionDomain;String;)Class`.
+- [keycloak-quarkus-cmimpl-no-class-def.md](keycloak-quarkus-cmimpl-no-class-def.md) -
+  283 `CRASH` rows on generated Quarkus/SmallRye `$$CMImpl` config mapping
+  implementation classes (`LogBuildTimeConfig$$CMImpl` and `TestConfig$$CMImpl`).
+- [keycloak-junit-stringutils-anonymousobject-anymatch.md](keycloak-junit-stringutils-anonymousobject-anymatch.md) -
+  64 `FAIL` rows from `StringUtils.containsWhitespace` calling missing
+  `cratonvm/synthetic/AnonymousObject$1.anyMatch(IntPredicate)Z`.
+- [keycloak-model-infinispan-globalconfiguration-isclustered-nosuchmethod.md](keycloak-model-infinispan-globalconfiguration-isclustered-nosuchmethod.md) -
+  still reproduces for the `testsuite/model` module: 37 `CRASH` rows plus one
+  abstract/no-test `EMPTY` row.
+- [keycloak-sssd-system1-findbootstrapclassornull-nosuchmethod.md](keycloak-sssd-system1-findbootstrapclassornull-nosuchmethod.md) -
+  2 `FAIL` rows in the SSSD module, missing
+  `java/lang/System$1.findBootstrapClassOrNull(String)Class`.
+
 ## Consolidation log
 
 - **2026-06-17:** Merged `precise-jit-stack-maps-multithread-fjp-worker-testcase.md`
