@@ -308,6 +308,16 @@ fn lkind_of_value(v: &Value) -> u8 {
     }
 }
 
+/// Kind mark for compact locals when the VM can prove the slot is a
+/// category-2 primitive from its compact tag.
+#[inline(always)]
+fn lkind_of_compact(cv: &CompactValue) -> u8 {
+    match cv.tag() {
+        CompactTag::Long => LKIND_LONG,
+        _ => LKIND_OTHER,
+    }
+}
+
 #[inline]
 fn lost_tag_local_candidates(cv: CompactValue) -> [u64; 3] {
     [
@@ -1152,12 +1162,13 @@ impl Frame {
         let i = index as usize;
         if i < self.locals.len() {
             self.locals[i] = cv;
-            // The compact setters are only ever fed ints/floats (`istore`,
-            // `fstore`) or genuine references (`astore`); raw long/double
-            // values always arrive via the `Value`-typed `set_local*`. So a
-            // primitive cat-2 never lands here, and `LKIND_OTHER` keeps a
-            // genuine reference scannable by the GC.
-            self.local_kinds[i] = LKIND_OTHER;
+            // Keep legacy behavior for the hot-path int/float/reference
+            // setters, but preserve the explicit long-tagged compact path for
+            // NaN-box collision cases where a compact value is genuinely a
+            // primitive `long`.
+            let k = lkind_of_compact(&cv);
+            self.local_kinds[i] = k;
+            self.invalidate_cat2_upper_half(i, k);
         }
     }
 
@@ -1168,9 +1179,11 @@ impl Frame {
     #[inline(always)]
     pub fn set_local_compact_unchecked(&mut self, index: usize, cv: CompactValue) {
         self.locals[index] = cv;
-        // See `set_local_compact`: only int/float/reference compacts reach
-        // this path, so the slot is never a primitive cat-2.
-        self.local_kinds[index] = LKIND_OTHER;
+        // Preserve the compact-tagged category-2 path for NaN-box collisions
+        // while keeping the existing int/float/reference fast path.
+        let k = lkind_of_compact(&cv);
+        self.local_kinds[index] = k;
+        self.invalidate_cat2_upper_half(index, k);
     }
 
     /// Get a local as a `CompactValue` without bounds check (fast path).
@@ -2082,6 +2095,35 @@ mod tests {
 
         assert_eq!(roots.len(), 1);
         assert_eq!(roots[0].as_ptr() as u64, addr);
+    }
+
+    #[test]
+    fn set_local_compact_long_preserves_kind_and_upper_half_mark() {
+        let mut frame = Frame::new(
+            ClassId::new(0),
+            "T".to_string(),
+            "m".to_string(),
+            "()V".to_string(),
+            None,
+            vec![0xb1],
+            vec![],
+            10,
+            2,
+            &[],
+        );
+
+        // `CompactValue::long(-1)` is a real compact-tagged `Long` collision.
+        // Preserving the kind keeps this category-2 slot from being treated as a
+        // stale upper half in later scans and OSR snapshots.
+        let cv = CompactValue::long(-1);
+        assert_eq!(cv.tag(), CompactTag::Long);
+        frame.set_local_compact(1, CompactValue::object(0x1000));
+        frame.set_local_compact(0, cv);
+
+        assert_eq!(frame.get_local_tag(0), VTAG_LONG);
+        assert_eq!(frame.get_local_raw(0), u64::MAX);
+        assert_eq!(frame.get_local_tag(1), VTAG_LONG);
+        assert_eq!(frame.get_local_raw(1), 0);
     }
 
     #[test]

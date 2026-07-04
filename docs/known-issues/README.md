@@ -65,9 +65,25 @@ above), not a VM bug.
   classpath-declared `JMXConnectorProvider`s (via `ServiceLoader`) before
   falling back to the "not implemented" IOException — covers `jmxmp`
   end-to-end with real provider bytecode instead of a canned error.
-- OPEN residual: [MXBeanMapping.toOpenValue AbstractMethodError + InvocationFailureException](spring-jmx-mxbeanmapping-toopenvalue-abstractmethoderror.md)
-  — 4 test methods across 2 classes still fail after the above fixes, on a
-  distinct `com.sun.jmx.mbeanserver.MXBeanMapping` resolution gap.
+- FIXED (branch fix/jmx-platform-mxbean-registration): platform MXBeans
+  (Memory, Threading, etc.) were never actually registered onto the real
+  MBeanServer returned by `ManagementFactory.getPlatformMBeanServer()` —
+  the real-bytecode registration loop aborted partway through on the two
+  native gaps above. With those fixed, registration completes, but a
+  second gap surfaced: synthetic `com/sun/jmx/mbeanserver/MXBeanMapping`
+  instances never had `toOpenValue`/`fromOpenValue` implemented, so any
+  real attribute value needing OpenType conversion (e.g.
+  `MemoryMXBean.getHeapMemoryUsage()`) hit `AbstractMethodError`. Fixed as
+  an identity passthrough (correct here since our mappings only ever
+  round-trip within the same in-process MBeanServer call). Also fixed
+  `MemoryUsage.max` for the heap pool to report the real `-Xmx` instead of
+  the `-1` unavailable sentinel.
+- OPEN residual: [getThreadInfo(long) operation-signature mismatch](spring-jmx-getthreadinfo-operation-signature-mismatch.md)
+  — 2 of the original 4 test methods still fail: `mxBeanOperationAccess()`
+  on a JMX operation-signature-matching gap for overloaded native methods,
+  unrelated to the registration/marshalling fixes above. jmx.* suite is now
+  319/321 passing (up from the original registration failure blocking all
+  platform MXBean access).
 
 ## Bug-document lifecycle
 
