@@ -50,14 +50,17 @@
 
 use cratonvm_native_api::NativeMethodRegistry;
 
-/// Pin 1: `Provider.put`, `parseLegacyPut`, and `getService` are all
-/// registered with the right descriptors. These are the three shims
+/// Pin 1: `Provider.put`, raw property-map reads, `parseLegacyPut`, and
+/// `getService`/`getServices` are all registered with the right descriptors.
+/// These shims
 /// that close the WP6.5 resolution path: `put` is what
 /// `BouncyCastleProvider.<init>`'s `addAlgorithm(...)` chain writes
 /// through (it inherits from `Properties`/`Hashtable`, so `put` is the
-/// public surface); `parseLegacyPut` is the package-private helper
-/// some BC versions reach directly; `getService` is the consumer side
-/// that `Cipher.getInstance(algo, providerName)` uses to resolve.
+/// public surface); `containsKey`/`get` are what BouncyCastle FIPS uses to
+/// validate primary keys before alias registration; `parseLegacyPut` is the
+/// package-private helper some BC versions reach directly; `getService` is
+/// the consumer side that `Cipher.getInstance(algo, providerName)` uses to
+/// resolve.
 ///
 /// A descriptor mismatch on any of the three falls through to the
 /// real-JDK bytecode which then NPEs on either `knownEngines.get(type)`
@@ -92,12 +95,38 @@ fn wp6_5_finish_put_parseLegacyPut_getService_registered() {
     assert!(
         r.find(
             "java/security/Provider",
+            "containsKey",
+            "(Ljava/lang/Object;)Z",
+        )
+        .is_some(),
+        "Provider.containsKey must be registered — BouncyCastle FIPS checks \
+         primary keys in the inherited Provider map before registering aliases"
+    );
+    assert!(
+        r.find(
+            "java/security/Provider",
+            "get",
+            "(Ljava/lang/Object;)Ljava/lang/Object;",
+        )
+        .is_some(),
+        "Provider.get(Object) must be registered so raw provider properties \
+         written through Provider.put are observable through the Map surface"
+    );
+    assert!(
+        r.find(
+            "java/security/Provider",
             "getService",
             "(Ljava/lang/String;Ljava/lang/String;)Ljava/security/Provider$Service;",
         )
         .is_some(),
         "Provider.getService must be registered — Cipher.getInstance(algo, \
          providerName) routes through it for service resolution"
+    );
+    assert!(
+        r.find("java/security/Provider", "getServices", "()Ljava/util/Set;")
+            .is_some(),
+        "Provider.getServices must be registered — BouncyCastle JSSE scans \
+         provider services during FIPS provider construction"
     );
     assert!(
         r.find(
@@ -249,7 +278,8 @@ fn wp6_5_finish_full_chain_natives_are_registered_together() {
         "Security.addProvider must be registered (Step 1 of BC chain)"
     );
 
-    // Step 2: parseLegacyPut + put — BC populates the service map.
+    // Step 2: parseLegacyPut + put — BC populates the service map and raw
+    // property map.
     assert!(
         r.find(
             "java/security/Provider",
@@ -269,8 +299,27 @@ fn wp6_5_finish_full_chain_natives_are_registered_together() {
         "Provider.put must be registered (Step 2b of BC chain — \
          Hashtable inheritance route)"
     );
+    assert!(
+        r.find(
+            "java/security/Provider",
+            "containsKey",
+            "(Ljava/lang/Object;)Z",
+        )
+        .is_some(),
+        "Provider.containsKey must be registered (Step 2c of BC FIPS chain — \
+         alias registration validates that the primary key already exists)"
+    );
+    assert!(
+        r.find(
+            "java/security/Provider",
+            "get",
+            "(Ljava/lang/Object;)Ljava/lang/Object;",
+        )
+        .is_some(),
+        "Provider.get(Object) must remain registered with Provider.put"
+    );
 
-    // Step 2c — the constructor BC calls during put → addAlgorithm.
+    // Step 2d — the constructor BC calls during put → addAlgorithm.
     assert!(
         r.find(
             "java/security/Provider$Service",
@@ -283,7 +332,7 @@ fn wp6_5_finish_full_chain_natives_are_registered_together() {
          WP6.5 partial closed this NPE in session 101)"
     );
 
-    // Step 3: getService + getClassName — the consumer-side chain.
+    // Step 3: getService/getServices + getClassName — the consumer-side chain.
     assert!(
         r.find(
             "java/security/Provider",
@@ -292,6 +341,12 @@ fn wp6_5_finish_full_chain_natives_are_registered_together() {
         )
         .is_some(),
         "Provider.getService must be registered (Step 3a of BC chain)"
+    );
+    assert!(
+        r.find("java/security/Provider", "getServices", "()Ljava/util/Set;")
+            .is_some(),
+        "Provider.getServices must remain registered with Provider.getService \
+         so provider constructors can enumerate service entries"
     );
     assert!(
         r.find(

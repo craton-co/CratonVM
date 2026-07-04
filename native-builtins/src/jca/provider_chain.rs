@@ -1314,6 +1314,40 @@ fn provider_get_property(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
     }
 }
 
+/// `java.security.Provider.containsKey(Object)` — BouncyCastle FIPS checks
+/// primary provider keys this way before registering aliases. Our `put` native
+/// records raw properties in a side table instead of the inherited Hashtable, so
+/// the inherited bytecode would falsely report "missing" for keys just put.
+fn provider_contains_key(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = obj_arg(args, 0)?;
+    let key = match args.get(1) {
+        Some(Value::Object(Some(s))) => ctx.read_string(*s).unwrap_or_default(),
+        _ => return Ok(Some(Value::Int(0))),
+    };
+    let pname = provider_name_of(ctx, this);
+    let found = provider_properties().lock().contains_key(&(pname, key));
+    Ok(Some(Value::Int(if found { 1 } else { 0 })))
+}
+
+/// `java.security.Provider.get(Object)` — keep raw property reads consistent
+/// with `containsKey` for provider implementations that consult the inherited
+/// Map surface directly instead of `getProperty(String)`.
+fn provider_get_object(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = obj_arg(args, 0)?;
+    let key = match args.get(1) {
+        Some(Value::Object(Some(s))) => ctx.read_string(*s).unwrap_or_default(),
+        _ => return Ok(Some(Value::Object(None))),
+    };
+    let pname = provider_name_of(ctx, this);
+    match provider_properties().lock().get(&(pname, key)).cloned() {
+        Some(v) => {
+            let s = ctx.create_string(&v);
+            Ok(Some(Value::Object(Some(s))))
+        }
+        None => Ok(Some(Value::Object(None))),
+    }
+}
+
 /// GC-stable side table mapping a synthetic `Provider$Service` id to its
 /// implementation class name. The `Provider$Service` synthetic's object slots
 /// hold `String` references that are NOT reliably traced/forwarded by the moving
@@ -1332,10 +1366,21 @@ fn service_classname_table() -> &'static parking_lot::Mutex<rustc_hash::FxHashMa
 /// `ServiceEntry`.  Used by `provider_get_service_native` and the
 /// `Cipher.getInstance(algo, providerName)` resolution path.
 fn make_service(ctx: &mut dyn NativeContext, entry: &ServiceEntry, prov: ObjectRef) -> ObjectRef {
-    let svc = alloc_concurrent_synthetic(ctx, "java/security/Provider$Service", 7);
-    let type_s = ctx.create_string(&entry.type_str);
-    let algo_s = ctx.create_string(&entry.algorithm);
-    let class_s = ctx.create_string(&entry.class_name);
+    let prov_pin = ctx.pin_native_root(prov);
+    let svc0 = alloc_concurrent_synthetic(ctx, "java/security/Provider$Service", 7);
+    let svc_pin = ctx.pin_native_root(svc0);
+    let type_s0 = ctx.create_string(&entry.type_str);
+    let type_pin = ctx.pin_native_root(type_s0);
+    let algo_s0 = ctx.create_string(&entry.algorithm);
+    let algo_pin = ctx.pin_native_root(algo_s0);
+    let class_s0 = ctx.create_string(&entry.class_name);
+    let class_pin = ctx.pin_native_root(class_s0);
+
+    let prov = ctx.read_native_pin(prov_pin, prov);
+    let svc = ctx.read_native_pin(svc_pin, svc0);
+    let type_s = ctx.read_native_pin(type_pin, type_s0);
+    let algo_s = ctx.read_native_pin(algo_pin, algo_s0);
+    let class_s = ctx.read_native_pin(class_pin, class_s0);
 
     // Real-JDK path — write by field name.
     ctx.set_field_by_name(svc, "provider", Value::Object(Some(prov)));
@@ -1361,6 +1406,7 @@ fn make_service(ctx: &mut dyn NativeContext, entry: &ServiceEntry, prov: ObjectR
     service_classname_table()
         .lock()
         .insert(ih, entry.class_name.clone());
+    ctx.unpin_native_roots(prov_pin);
     svc
 }
 
@@ -1409,6 +1455,47 @@ fn provider_get_service_native(ctx: &mut dyn NativeContext, args: &[Value]) -> M
             Ok(Some(Value::Object(None)))
         }
     }
+}
+
+/// `Provider.getServices()` native: expose the service side table used by
+/// `getService(type, algorithm)`. The early bootstrap fallback returns an empty
+/// set; BouncyCastle JSSE needs the populated set while constructing the FIPS
+/// provider so it can discover TLS key/trust manager algorithms.
+fn provider_get_services_native(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = obj_arg(args, 0)?;
+    let prov_name = provider_name_of(ctx, this);
+    let entries: Vec<ServiceEntry> = services()
+        .lock()
+        .get(&prov_name)
+        .map(|m| m.values().cloned().collect())
+        .unwrap_or_default();
+
+    let this_pin = ctx.pin_native_root(this);
+    let set = cratonvm_native_collections::make_hashset_with_elements(ctx, &[]);
+    let set_pin = ctx.pin_native_root(set);
+    for entry in entries {
+        let prov = ctx.read_native_pin(this_pin, this);
+        let svc = make_service(ctx, &entry, prov);
+        let svc_pin = ctx.pin_native_root(svc);
+        let set = ctx.read_native_pin(set_pin, set);
+        let svc = ctx.read_native_pin(svc_pin, svc);
+        let add_result = ctx.invoke(
+            "java/util/HashSet",
+            "add",
+            "(Ljava/lang/Object;)Z",
+            &[Value::Object(Some(set)), Value::Object(Some(svc))],
+        );
+        ctx.unpin_native_roots(svc_pin);
+        if let Err(e) = add_result {
+            ctx.unpin_native_roots(set_pin);
+            ctx.unpin_native_roots(this_pin);
+            return Err(e);
+        }
+    }
+    let set = ctx.read_native_pin(set_pin, set);
+    ctx.unpin_native_roots(set_pin);
+    ctx.unpin_native_roots(this_pin);
+    Ok(Some(Value::Object(Some(set))))
 }
 
 /// `Provider$Service.getClassName()` native — returns the entry's
@@ -1866,6 +1953,24 @@ pub(crate) fn register(r: &mut NativeMethodRegistry) {
         "getService",
         "(Ljava/lang/String;Ljava/lang/String;)Ljava/security/Provider$Service;",
         provider_get_service_native,
+    );
+    r.register(
+        prov,
+        "getServices",
+        "()Ljava/util/Set;",
+        provider_get_services_native,
+    );
+    r.register(
+        prov,
+        "containsKey",
+        "(Ljava/lang/Object;)Z",
+        provider_contains_key,
+    );
+    r.register(
+        prov,
+        "get",
+        "(Ljava/lang/Object;)Ljava/lang/Object;",
+        provider_get_object,
     );
 
     // Provider$Service accessors — `getClassName()` is consumed by both
