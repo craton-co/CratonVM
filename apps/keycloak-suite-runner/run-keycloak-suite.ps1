@@ -281,6 +281,64 @@ function Add-InferredJUnitRuntimeEntries {
   }
 }
 
+function Get-M2RepoRoot {
+  if ($script:M2RepoRootCache) { return $script:M2RepoRootCache }
+  $candidates = @()
+  if ($env:KCRUNNER_M2_REPO) { $candidates += $env:KCRUNNER_M2_REPO }
+  if ($env:HOME) { $candidates += (Join-Path $env:HOME '.m2/repository') }
+  if ($env:USERPROFILE) { $candidates += (Join-Path $env:USERPROFILE '.m2/repository') }
+  foreach ($c in $candidates) {
+    if (Test-Path $c) { $script:M2RepoRootCache = $c; return $c }
+  }
+  $script:M2RepoRootCache = ''
+  return ''
+}
+
+function Add-JUnitPlatformInfraEntries {
+  # KcRunner (kc-runner/KcRunner.java) always drives tests through the JUnit
+  # Platform Launcher so it can run BOTH vintage (JUnit4) and jupiter (JUnit5)
+  # classes uniformly. Maven's dependency:build-classpath only reflects what a
+  # module's own pom declares, and plain-JUnit4 modules never declare the
+  # launcher/vintage-engine (Surefire bundles its own internally), so KcRunner
+  # would NoClassDefFoundError on org.junit.platform.launcher.core.* before
+  # running a single test. Make the launcher + both engines universally
+  # available regardless of what the module under test happens to depend on.
+  param(
+    [System.Collections.Generic.List[string]]$Entries,
+    [hashtable]$Seen
+  )
+
+  $repo = Get-M2RepoRoot
+  if (-not $repo) { return }
+
+  $artifacts = @(
+    @('org/junit/platform/junit-platform-commons', 'junit-platform-commons'),
+    @('org/junit/platform/junit-platform-engine', 'junit-platform-engine'),
+    @('org/junit/platform/junit-platform-launcher', 'junit-platform-launcher'),
+    @('org/junit/jupiter/junit-jupiter-api', 'junit-jupiter-api'),
+    @('org/junit/jupiter/junit-jupiter-engine', 'junit-jupiter-engine'),
+    @('org/junit/vintage/junit-vintage-engine', 'junit-vintage-engine'),
+    @('org/opentest4j/opentest4j', 'opentest4j'),
+    @('org/apiguardian/apiguardian-api', 'apiguardian-api'),
+    # junit-vintage-engine's own TestEngine impl reaches into classic JUnit4
+    # runtime classes (org.junit.runner.Version, Description, Runner, ...) —
+    # without the real junit:junit jar this surfaces as "class not found:
+    # junit/runner/Version" (25 CRASH classes in the 2026-07-04 full-suite run:
+    # scim/core, ssf/core, ssf/transmitter, test-framework/*, tests/webauthn,
+    # tests/clustering — every module whose own pom has no JUnit4 dependency).
+    @('junit/junit', 'junit')
+  )
+  foreach ($pair in $artifacts) {
+    $artifactDir = Join-Path $repo $pair[0]
+    if (-not (Test-Path $artifactDir)) { continue }
+    $jar = Get-ChildItem -Path $artifactDir -Recurse -File -Filter "$($pair[1])-*.jar" -ErrorAction SilentlyContinue |
+      Where-Object { $_.Name -notmatch '(-sources|-javadoc)\.jar$' } |
+      Sort-Object FullName -Descending |
+      Select-Object -First 1
+    if ($jar) { Add-UniqueClasspathEntry -Entries $Entries -Seen $Seen -Entry $jar.FullName }
+  }
+}
+
 function ConvertTo-ManifestClasspathUrl([string]$Entry) {
   $full = [System.IO.Path]::GetFullPath($Entry)
   if ((Test-Path $full -PathType Container) -and -not ($full.EndsWith('\') -or $full.EndsWith('/'))) {
@@ -528,6 +586,8 @@ function Get-UniversalClasspathEntries {
   foreach ($entry in (@($runnerDir) + (Split-ClasspathEntries $cp))) {
     Add-UniqueClasspathEntry -Entries $entries -Seen $seen -Entry $entry
   }
+  Add-InferredJUnitRuntimeEntries -Entries $entries -Seen $seen
+  Add-JUnitPlatformInfraEntries -Entries $entries -Seen $seen
   return @($entries)
 }
 
@@ -606,6 +666,7 @@ function Get-ModuleClasspathEntries {
     Add-UniqueClasspathEntry -Entries $entries -Seen $seen -Entry $entry
   }
   Add-InferredJUnitRuntimeEntries -Entries $entries -Seen $seen
+  Add-JUnitPlatformInfraEntries -Entries $entries -Seen $seen
 
   $result = @($entries)
   Write-Info "module classpath $Module entries=$($result.Count)"
