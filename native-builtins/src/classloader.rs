@@ -1525,7 +1525,7 @@ fn cglib_guard_value(ctx: &mut dyn NativeContext, name: &str, _bytes: &[u8]) -> 
     None
 }
 
-fn cl_define_class_basic(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+pub(crate) fn cl_define_class_basic(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     // defineClass(String name, byte[] b, int off, int len)
     // args: [this, name, byte_array, offset, length]
     //
@@ -1733,7 +1733,13 @@ fn cl_define_class_bb(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
 
 /// Read a UTF-8 String from arg slot `idx`. Returns the empty string
 /// on null. Treats binary-name dots as JVM internal slashes.
-fn read_optional_internal_name(ctx: &dyn NativeContext, args: &[Value], idx: usize) -> String {
+///
+/// `pub(crate)`: also used by `shared_secrets_bridge::jla_define_class`.
+pub(crate) fn read_optional_internal_name(
+    ctx: &dyn NativeContext,
+    args: &[Value],
+    idx: usize,
+) -> String {
     match args.get(idx) {
         Some(Value::Object(Some(o))) => {
             let dotted = ctx.read_string(*o).unwrap_or_default();
@@ -1763,7 +1769,7 @@ fn read_nonneg_int(args: &[Value], idx: usize) -> Option<usize> {
 /// (e.g. due to a corrupt array object on the cglib path) returns an
 /// `Err` instead of unwinding to SIGABRT. cglib emits 10-50 KB bytecode
 /// buffers, so OOB-style SEGVs were observed before this hardening.
-fn read_byte_array_slice(
+pub(crate) fn read_byte_array_slice(
     ctx: &dyn NativeContext,
     array: ObjectRef,
     off: usize,
@@ -1817,7 +1823,7 @@ fn read_byte_array_slice(
 /// `URL` ObjectRef or a String at slot 0 (= `CS_LOCATION_REF`). For
 /// a real-JDK-shape PD, we additionally probe `getCodeSource()` /
 /// `getLocation()` by name as a belt-and-suspenders fallback.
-fn extract_pd_code_source_url(ctx: &dyn NativeContext, pd: ObjectRef) -> Option<String> {
+pub(crate) fn extract_pd_code_source_url(ctx: &dyn NativeContext, pd: ObjectRef) -> Option<String> {
     // Synthetic PD path: field 0 -> CodeSource; field 0 of CS -> URL or String.
     if let Value::Object(Some(cs)) = ctx.get_field(pd, PD_CODE_SOURCE_REF) {
         if let Some(s) = ctx.read_string(cs) {
@@ -1981,7 +1987,7 @@ fn read_byte_buffer_slice(
 /// id), otherwise fall through to id 0 (= application loader). A null
 /// loader is treated as the bootstrap class loader, which the backend
 /// also models as id 0 in this VM.
-fn loader_id_for(ctx: &mut dyn NativeContext, loader: Value) -> u32 {
+pub(crate) fn loader_id_for(ctx: &mut dyn NativeContext, loader: Value) -> u32 {
     if let Value::Object(Some(cl)) = loader {
         return get_or_assign_loader_id(ctx, cl);
     }
@@ -1991,7 +1997,12 @@ fn loader_id_for(ctx: &mut dyn NativeContext, loader: Value) -> u32 {
 /// Common backend used by all three `defineClassN` natives. Returns
 /// the resulting Class mirror as a `Value::Object(Some(...))` or an
 /// exception via the `MethodCallResult` channel.
-fn define_class_via_full(
+///
+/// `pub(crate)`: also reused by `shared_secrets_bridge::jla_define_class`
+/// (`JavaLangAccess.defineClass`, the `System$1` bridge that
+/// `jdk.internal.reflect.ClassDefiner` calls into) so both entry points
+/// share the same magic-check / panic-guard / PD-attribution behavior.
+pub(crate) fn define_class_via_full(
     ctx: &mut dyn NativeContext,
     name: &str,
     bytes: Vec<u8>,

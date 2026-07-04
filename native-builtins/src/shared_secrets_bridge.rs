@@ -355,6 +355,147 @@ fn jla_add_enable_native_access(_ctx: &mut dyn NativeContext, args: &[Value]) ->
     Ok(Some(args.get(1).copied().unwrap_or(Value::Object(None))))
 }
 
+/// `JavaLangAccess.defineClass(ClassLoader loader, String name, byte[] b,
+/// ProtectionDomain pd, String source)` -> `Class<?>`.
+///
+/// `jdk.internal.reflect.ClassDefiner.defineClass(String, byte[], int, int,
+/// ClassLoader)` — used by `ReflectionFactory` to materialize the
+/// serialization-constructor-accessor / `MethodAccessor` classes that JUnit5's
+/// `SessionPerRequestLauncher` (and every Arquillian
+/// `testsuite/integration-arquillian/tests/base` test class) generates during
+/// test-plan construction — slices its `(off, len)` window down to an
+/// exact-size array before calling
+/// `SharedSecrets.getJavaLangAccess().defineClass(parent, name, bytes, null,
+/// "__ClassDefiner__")`. `System$1` (the `JavaLangAccess` singleton, see
+/// `register_java_lang_access`) never had this method registered, so the
+/// `invokeinterface` raised `NoSuchMethodError`, aborting `ClassDefiner`
+/// before any Arquillian base test class could run.
+///
+/// No offset/length here (unlike `ClassLoader.defineClass1`/`defineClass2`) —
+/// the real `JavaLangAccess` interface method takes the whole array. Shares
+/// the same `define_class_via_full` backend as `defineClass1` so magic-byte
+/// validation, panic-guarding, and PD/code-source attribution stay unified
+/// across every defineClass entry point.
+///
+/// INSTANCE method: args[0] = receiver (System$1), args[1] = loader,
+/// args[2] = name, args[3] = byte[], args[4] = pd, args[5] = source (unused —
+/// `define_class_via_full` derives its own SourceFile handling).
+fn jla_define_class(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    use cratonvm_types::error::RuntimeError;
+
+    let loader = args.get(1).copied().unwrap_or(Value::Object(None));
+    let name = crate::classloader::read_optional_internal_name(ctx, args, 2);
+    let byte_array = match args.get(3) {
+        Some(Value::Object(Some(arr))) => *arr,
+        _ => {
+            return Err(RuntimeError::IllegalArgumentException {
+                message: "JavaLangAccess.defineClass: bytes must not be null".into(),
+            }
+            .into());
+        }
+    };
+    let len = ctx.array_length(byte_array);
+    let bytes = crate::classloader::read_byte_array_slice(ctx, byte_array, 0, len).map_err(
+        |_msg| {
+            cratonvm_types::error::MethodCallFailed::from(
+                RuntimeError::ArrayIndexOutOfBoundsException { index: 0 },
+            )
+        },
+    )?;
+
+    let mut opts = cratonvm_native_api::DefineClassFull::default();
+    if let Some(Value::Object(Some(pd))) = args.get(4) {
+        opts.code_source_url = crate::classloader::extract_pd_code_source_url(ctx, *pd);
+    }
+
+    let loader_id = crate::classloader::loader_id_for(ctx, loader);
+    crate::classloader::define_class_via_full(ctx, &name, bytes, loader_id, opts, false, None)
+}
+
+/// `JavaLangAccess.getConstantPool(Class<?>)` -> `jdk.internal.reflect.ConstantPool`.
+///
+/// ByteBuddy's class-file reader consults this via `invokeinterface
+/// JavaLangAccess` when instrumenting a class for Mockito's inline mock
+/// maker (`Instrumentation.redefineClasses`/`retransformClasses`). Without
+/// it, `NoSuchMethodError` on this method aborted the redefine with
+/// `MockitoException: Could not modify all classes [...]`, and every mock()
+/// of a JDK class in this suite failed. Thin passthrough to the existing
+/// `Class.getConstantPool()` native — same synthetic ConstantPool mirror.
+///
+/// INSTANCE method: args[0] = receiver (System$1), args[1] = Class<?>.
+fn jla_get_constant_pool(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let class_obj = args.get(1).copied().unwrap_or(Value::Object(None));
+    crate::lang_class::native_class_get_constant_pool(ctx, &[class_obj])
+}
+
+/// `JavaLangAccess.start(Thread, ThreadContainer)` -> `void`.
+///
+/// `jdk.internal.vm.SharedThreadContainer.start(Thread)` (structured-
+/// concurrency / virtual-thread executor plumbing — e.g. Jetty's thread
+/// pool) calls this via `invokeinterface JavaLangAccess` to start a thread
+/// while registering it with a container that tracks its children. Without
+/// it, `NoSuchMethodError` here aborted every thread-pool-backed HTTP
+/// client (Jetty) at startup. CratonVM does not model thread containers
+/// (no structured-concurrency introspection), so — like the
+/// `defineUnnamedModule`/`addEnableNativeAccess` bridges above — this is a
+/// behavioral passthrough: just start the thread for real.
+///
+/// INSTANCE method: args[0] = receiver (System$1), args[1] = Thread,
+/// args[2] = ThreadContainer (ignored).
+fn jla_start_in_container(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let thread_obj = match args.get(1) {
+        Some(Value::Object(Some(o))) => *o,
+        _ => return Ok(None),
+    };
+    ctx.invoke_virtual(thread_obj, "start", "()V", &[])?;
+    Ok(None)
+}
+
+/// `JavaLangAccess.join(String prefix, String suffix, String delimiter,
+/// String[] elements, int size)` -> `String`.
+///
+/// A fast-path helper `String.join(...)`/`StringJoiner`-adjacent code calls
+/// to concatenate `elements[0..size]` with `delimiter` between them and
+/// `prefix`/`suffix` on the ends, bypassing the general `StringJoiner`
+/// machinery. Missing here broke Apache HttpClient5's
+/// `HttpComponentsClientHttpRequestFactoryTests` (`NoSuchMethodError` on
+/// this exact signature).
+///
+/// INSTANCE method: args[0] = receiver (System$1), args[1] = prefix,
+/// args[2] = suffix, args[3] = delimiter, args[4] = String[] elements,
+/// args[5] = int size.
+fn jla_join(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let read = |ctx: &dyn NativeContext, v: Option<&Value>| -> String {
+        match v {
+            Some(Value::Object(Some(s))) => ctx.read_string(*s).unwrap_or_default(),
+            _ => String::new(),
+        }
+    };
+    let prefix = read(ctx, args.get(1));
+    let suffix = read(ctx, args.get(2));
+    let delimiter = read(ctx, args.get(3));
+    let elements = match args.get(4) {
+        Some(Value::Object(Some(arr))) => *arr,
+        _ => {
+            let s = ctx.create_string(&format!("{prefix}{suffix}"));
+            return Ok(Some(Value::Object(Some(s))));
+        }
+    };
+    let size = args.get(5).and_then(|v| v.as_int()).unwrap_or(0).max(0) as usize;
+    let mut out = prefix;
+    for i in 0..size {
+        if i > 0 {
+            out.push_str(&delimiter);
+        }
+        if let Value::Object(Some(s)) = ctx.get_array_element(elements, i) {
+            out.push_str(&ctx.read_string(s).unwrap_or_default());
+        }
+    }
+    out.push_str(&suffix);
+    let s = ctx.create_string(&out);
+    Ok(Some(Value::Object(Some(s))))
+}
+
 fn jla_new_string_utf8_no_repl(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     // (byte[] bytes, int offset, int length) -> String
     // Decode the bytes as UTF-8 with no replacement on malformed
@@ -486,6 +627,37 @@ fn jla_get_methods_or_null(ctx: &mut dyn NativeContext, args: &[Value]) -> Metho
     }
 }
 
+/// `JavaLangAccess.findBootstrapClassOrNull(String name)` -> `Class<?>`.
+///
+/// `jdk.internal.loader.BootLoader.loadClassOrNull(String name)` calls this to
+/// check whether the bootstrap loader has already loaded `name` WITHOUT
+/// triggering a fresh load — a pure "is it already loaded" probe, not a
+/// resolve-or-define path. Missing this registration raised
+/// `NoSuchMethodError` on every SSSD Arquillian test row (see
+/// docs/known-issues/keycloak-sssd-system1-findbootstrapclassornull-nosuchmethod.md).
+///
+/// `ctx.class_id_by_name` is a pure lookup against the already-loaded class
+/// table — it does not itself trigger classloading (the same guarantee
+/// `classloader::find_loaded_class_for_loader` relies on for
+/// `ClassLoader.findLoadedClass`/`findLoadedClass0`), so this preserves the
+/// real JDK's "does not trigger loading" contract.
+///
+/// INSTANCE method: args[0] = receiver (System$1), args[1] = name (dotted or
+/// slashed binary name).
+fn jla_find_bootstrap_class_or_null(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    let name = match args.get(1) {
+        Some(Value::Object(Some(s))) => ctx.read_string(*s).unwrap_or_default().replace('.', "/"),
+        _ => return Ok(Some(Value::Object(None))),
+    };
+    match ctx.class_id_by_name(&name) {
+        Some(cid) => Ok(Some(Value::Object(Some(ctx.get_class_mirror(cid))))),
+        None => Ok(Some(Value::Object(None))),
+    }
+}
+
 fn register_java_lang_access(registry: &mut NativeMethodRegistry) {
     let owner = "java/lang/System$1";
     registry.register(
@@ -600,6 +772,40 @@ fn register_java_lang_access(registry: &mut NativeMethodRegistry) {
         "(Ljava/lang/Module;)Ljava/lang/Module;",
         jla_add_enable_native_access,
     );
+    registry.register(
+        owner,
+        "getConstantPool",
+        "(Ljava/lang/Class;)Ljdk/internal/reflect/ConstantPool;",
+        jla_get_constant_pool,
+    );
+    registry.register(
+        owner,
+        "start",
+        "(Ljava/lang/Thread;Ljdk/internal/vm/ThreadContainer;)V",
+        jla_start_in_container,
+    );
+    // `jdk.internal.reflect.ClassDefiner` (JUnit5/Arquillian serialization-
+    // constructor-accessor generation) — see `jla_define_class` doc comment.
+    registry.register(
+        owner,
+        "defineClass",
+        "(Ljava/lang/ClassLoader;Ljava/lang/String;[BLjava/security/ProtectionDomain;Ljava/lang/String;)Ljava/lang/Class;",
+        jla_define_class,
+    );
+    // `jdk.internal.loader.BootLoader.loadClassOrNull` — see
+    // `jla_find_bootstrap_class_or_null` doc comment.
+    registry.register(
+        owner,
+        "findBootstrapClassOrNull",
+        "(Ljava/lang/String;)Ljava/lang/Class;",
+        jla_find_bootstrap_class_or_null,
+    );
+    registry.register(
+        owner,
+        "join",
+        "(Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;[Ljava/lang/String;I)Ljava/lang/String;",
+        jla_join,
+    );
     // Also register on the interface so direct invokeinterface
     // dispatch (when the receiver's concrete class lookup falls
     // back to the interface class) still hits these natives.
@@ -628,6 +834,30 @@ fn register_java_lang_access(registry: &mut NativeMethodRegistry) {
         "addEnableNativeAccess",
         "(Ljava/lang/Module;)Ljava/lang/Module;",
         jla_add_enable_native_access,
+    );
+    registry.register(
+        iface,
+        "defineClass",
+        "(Ljava/lang/ClassLoader;Ljava/lang/String;[BLjava/security/ProtectionDomain;Ljava/lang/String;)Ljava/lang/Class;",
+        jla_define_class,
+    );
+    registry.register(
+        iface,
+        "getConstantPool",
+        "(Ljava/lang/Class;)Ljdk/internal/reflect/ConstantPool;",
+        jla_get_constant_pool,
+    );
+    registry.register(
+        iface,
+        "start",
+        "(Ljava/lang/Thread;Ljdk/internal/vm/ThreadContainer;)V",
+        jla_start_in_container,
+    );
+    registry.register(
+        iface,
+        "join",
+        "(Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;[Ljava/lang/String;I)Ljava/lang/String;",
+        jla_join,
     );
 }
 
@@ -1807,5 +2037,48 @@ mod tests {
                 "expected method {owner}.{method}{desc} not registered"
             );
         }
+    }
+
+    #[test]
+    fn java_lang_access_define_class_registered() {
+        // `jdk.internal.reflect.ClassDefiner.defineClass` calls
+        // `SharedSecrets.getJavaLangAccess().defineClass(...)`, which
+        // dispatches on the `System$1` singleton's concrete class. Missing
+        // this registration aborted every Arquillian
+        // `testsuite/integration-arquillian/tests/base` test class with
+        // NoSuchMethodError during JUnit5 test-plan construction (see
+        // docs/known-issues/keycloak-arquillian-system1-defineclass-nosuchmethod.md).
+        let mut r = NativeMethodRegistry::new();
+        register_wp1_4_shared_secrets(&mut r);
+        assert!(
+            r.find(
+                "java/lang/System$1",
+                "defineClass",
+                "(Ljava/lang/ClassLoader;Ljava/lang/String;[BLjava/security/ProtectionDomain;Ljava/lang/String;)Ljava/lang/Class;",
+            )
+            .is_some(),
+            "JavaLangAccess.defineClass not registered on java/lang/System$1"
+        );
+    }
+
+    #[test]
+    fn java_lang_access_find_bootstrap_class_or_null_registered() {
+        // `jdk.internal.loader.BootLoader.loadClassOrNull` calls
+        // `SharedSecrets.getJavaLangAccess().findBootstrapClassOrNull(name)`,
+        // which dispatches on the `System$1` singleton's concrete class.
+        // Missing this registration raised NoSuchMethodError on every SSSD
+        // Keycloak Arquillian test row (see
+        // docs/known-issues/keycloak-sssd-system1-findbootstrapclassornull-nosuchmethod.md).
+        let mut r = NativeMethodRegistry::new();
+        register_wp1_4_shared_secrets(&mut r);
+        assert!(
+            r.find(
+                "java/lang/System$1",
+                "findBootstrapClassOrNull",
+                "(Ljava/lang/String;)Ljava/lang/Class;",
+            )
+            .is_some(),
+            "JavaLangAccess.findBootstrapClassOrNull not registered on java/lang/System$1"
+        );
     }
 }

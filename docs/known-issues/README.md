@@ -5,6 +5,10 @@ suites. The docs had grown to describe the **same underlying bug from several
 angles**; this index is the consolidated map. Read it first.
 
 
+## 2026-07-03 http.client bug cluster (branch fix/http-client-cluster-azure)
+
+- [http.client cluster: redefine-dispatch fix + JDK 21 gaps](http-client-cluster-redefine-dispatch-and-jdk21-gaps.md) - core fix: two of three "native shadow" dispatch paths never checked whether an ANCESTOR class (not just the receiver) was JVMTI-redefined, so Mockito-mocked concrete classes (e.g. `HttpURLConnection`) silently bypassed their own advice. Plus several JDK 21 real-mode native gaps (`JavaLangAccess.defineClass`/`getConstantPool`/`start`, `StackWalker.callStackWalk` overload). 4 residuals documented (Linux-only NIO gaps, a 4-class hang, one order-dependent Mockito state leak, pre-existing `SimpleClientHttpRequestFactoryTests` gaps).
+
 ## Bug-document lifecycle
 
 Every unresolved bug document belongs under `docs/known-issues`. Once the bug
@@ -496,9 +500,15 @@ PreviewFeatures native crash. The remaining non-passed rows are tracked here:
 - [keycloak-quarkus-cmimpl-no-class-def.md](keycloak-quarkus-cmimpl-no-class-def.md) -
   283 `CRASH` rows on generated Quarkus/SmallRye `$$CMImpl` config mapping
   implementation classes (`LogBuildTimeConfig$$CMImpl` and `TestConfig$$CMImpl`).
-- [keycloak-junit-stringutils-anonymousobject-anymatch.md](keycloak-junit-stringutils-anonymousobject-anymatch.md) -
-  64 `FAIL` rows from `StringUtils.containsWhitespace` calling missing
-  `cratonvm/synthetic/AnonymousObject$1.anyMatch(IntPredicate)Z`.
+- ~~keycloak-junit-stringutils-anonymousobject-anymatch.md~~ - FIXED
+  2026-07-04: 64 `FAIL` rows from `StringUtils.containsWhitespace` calling
+  missing `cratonvm/synthetic/AnonymousObject$1.anyMatch(IntPredicate)Z`. Root
+  cause was `String.chars()`/`codePoints()` (`native_string_chars`) allocating
+  its IntStream via a raw `ClassId::new(0)`, which the VM's undersized-object
+  guard silently substituted with a generic `AnonymousObject$1` placeholder
+  instead of the real `IntStream` interface stamp — broke every IntStream op
+  on `chars()`, not just `anyMatch`. Moved to
+  `docs/internal/fixed-suite-bugs/`.
 - [keycloak-model-infinispan-globalconfiguration-isclustered-nosuchmethod.md](keycloak-model-infinispan-globalconfiguration-isclustered-nosuchmethod.md) -
   still reproduces for the `testsuite/model` module: 37 `CRASH` rows plus one
   abstract/no-test `EMPTY` row.

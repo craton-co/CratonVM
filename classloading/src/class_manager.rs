@@ -176,6 +176,26 @@ fn is_prohibited_package_name(internal_name: &str) -> bool {
     if internal_name.starts_with("sun/reflect/misc/") {
         return false;
     }
+    // Exemption: `jdk.internal.reflect` is where the JDK generates
+    // `GeneratedMethodAccessorN` / `GeneratedConstructorAccessorN` /
+    // `GeneratedSerializationConstructorAccessorN` classes — for reflective
+    // `Method.invoke`/`Constructor.newInstance` past the inflation threshold,
+    // and (unconditionally, no threshold) for `ObjectStreamClass`'s
+    // serialization constructor, which must invoke the nearest
+    // non-serializable superclass's no-arg constructor and has no other way
+    // to do so. `jdk.internal.reflect.ClassDefiner.defineClass` performs this
+    // define through a throwaway `DelegatingClassLoader` — NOT the bootstrap
+    // loader. Verified on real JDK 21: this define succeeds there, so
+    // blocking it here is a false rejection, not a security fix — it broke
+    // ALL first-use reflective invocation past inflation and ALL
+    // serialization of a class whose nearest non-serializable ancestor has
+    // any constructor logic, with `NoClassDefFoundError: IllegalName: ...`
+    // (when routed through real bytecode `preDefineClass`) or `SecurityException:
+    // Prohibited package name` (native path) — both symptoms of this same
+    // over-broad prefix.
+    if internal_name.starts_with("jdk/internal/reflect/") {
+        return false;
+    }
     const PROHIBITED_PREFIXES: [&str; 3] = ["java", "jdk/internal", "sun"];
     for prefix in PROHIBITED_PREFIXES {
         if let Some(rest) = internal_name.strip_prefix(prefix) {
@@ -2612,6 +2632,32 @@ impl ClassManager {
                 // path is gated (the probe flag is set by the Class.forName
                 // native); genuine constant-pool resolution still gets its stub.
                 if is_enterprise_stub_prefix(name) && cratonvm_types::reflective_probe::active() {
+                    return Err(VmError::ClassFile(ClassFileError::ClassNotFound {
+                        class_name: name.to_string(),
+                    }));
+                }
+                // A name containing "$$" is the universal marker JVM bytecode
+                // generators use for a runtime-synthesized implementation that
+                // is never shipped as a `.class` file — SmallRye Config's
+                // `@ConfigMapping` `<Iface>$$CMImpl` (io.smallrye.config.
+                // ConfigMappingLoader + io.smallrye.common.classloader.
+                // ClassDefiner), CGLIB's `$$EnhancerBy...$$`/`$$FastClassBy...$$`,
+                // ByteBuddy, Mockito's `$MockitoMock$`, etc. These generators all
+                // use the same idiom: try `ClassLoader.loadClass(generatedName)`
+                // first (a cheap check for an already-generated class earlier in
+                // the same run), catch `ClassNotFoundException`, and only then
+                // generate + `Lookup.defineClass`/`Unsafe.defineClass` the real
+                // bytecode. Fabricating an enterprise-prefix synthetic stub here
+                // (as below, for genuinely-missing-jar classes) hands that probe
+                // a bogus non-null `Class` instead of the CNFE it needs to ever
+                // reach the generation step — the real class is never produced,
+                // and any later reference to the same name is permanently stuck
+                // on the wrong stub. Unlike the reflective-probe gate above, this
+                // must fire unconditionally: the generators call plain
+                // `ClassLoader.loadClass`, which never sets that flag. A real,
+                // non-generated class name essentially never contains "$$", so
+                // this can't misclassify a genuine missing-jar case.
+                if name.contains("$$") {
                     return Err(VmError::ClassFile(ClassFileError::ClassNotFound {
                         class_name: name.to_string(),
                     }));
@@ -9281,6 +9327,47 @@ mod tests {
         assert!(!cratonvm_types::reflective_probe::active());
         let _g = cratonvm_types::reflective_probe::ProbeGuard::new();
         assert!(cratonvm_types::reflective_probe::active());
+    }
+
+    // --- keycloak-quarkus-cmimpl-no-class-def: "$$"-marked runtime-generated
+    //     class names must report ClassNotFoundException, not a fabricated
+    //     enterprise stub, even outside a reflective-probe (Class.forName)
+    //     context ---
+
+    #[test]
+    fn double_dollar_generated_class_name_is_not_stubbed() {
+        // No reflective probe active — this is the plain `ClassLoader.loadClass`
+        // path SmallRye Config's `ConfigMappingLoader.loadClass` (and CGLIB/
+        // ByteBuddy/Mockito's identical check-then-generate idiom) actually use.
+        assert!(!cratonvm_types::reflective_probe::active());
+        let mut cm = ClassManager::new(&[], &[], &[]);
+        let result = cm.load_class("io/quarkus/deployment/dev/testing/TestConfig$$CMImpl");
+        match result {
+            Err(VmError::ClassFile(ClassFileError::ClassNotFound { class_name })) => {
+                assert_eq!(
+                    class_name,
+                    "io/quarkus/deployment/dev/testing/TestConfig$$CMImpl"
+                );
+            }
+            other => panic!(
+                "expected ClassNotFound so the generator's catch-CNFE-then-defineClass \
+                 idiom can run, got {other:?}"
+            ),
+        }
+    }
+
+    #[test]
+    fn enterprise_prefix_without_double_dollar_still_gets_a_stub() {
+        // Regression guard: the new "$$" gate must not widen and start
+        // rejecting the existing (bytecode-linkage) enterprise-stub fallback
+        // for ordinary missing-jar classes that don't look generated.
+        let mut cm = ClassManager::new(&[], &[], &[]);
+        let result = cm.load_class("io/quarkus/runtime/Application");
+        assert!(
+            result.is_ok(),
+            "plain enterprise-prefix class (no \"$$\") must still get a synthetic \
+             stub for bytecode linkage: {result:?}"
+        );
     }
 
     // --- bug-06 family 4: synthetic stubs inherit java/lang/Object ---
