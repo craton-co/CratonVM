@@ -814,18 +814,6 @@ pub fn register_nio_natives_real(r: &mut NativeMethodRegistry) {
         "sun/nio/ch/WindowsFileDispatcherImpl",
         "sun/nio/ch/UnixFileDispatcherImpl",
     ] {
-        // `FileDispatcherImpl.<clinit>` calls `init0()` once, before any
-        // other native on this class is reachable (see `static { init0(); }`
-        // in FileDispatcherImpl.java). Real JDK's native side just probes a
-        // couple of platform capability flags (e.g. whether `pwrite`
-        // supports `O_APPEND` atomically) that our dispatcher natives below
-        // don't consult, so a no-op is behavior-complete for us -- but the
-        // missing registration was a real UnsatisfiedLinkError that aborted
-        // `FileChannelImpl.<clinit>` (and everything that touches a
-        // FileChannel for the first time, e.g. `VM.getBufferPools()` during
-        // `ManagementFactory.getPlatformMBeanServer()`'s platform-MXBean
-        // registration loop).
-        r.register(cls, "init0", "()V", |_ctx, _args| Ok(None));
         r.register(
             cls,
             "read0",
