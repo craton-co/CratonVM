@@ -17948,19 +17948,35 @@ pub(crate) fn try_lambda_dispatch(
                 .map(|c| c.num_total_fields)
                 .unwrap_or(0);
             let new_obj = gc_alloc_object(shared, thread, class_id, num_fields)?;
-            // Build <init> args: [new_obj, ...full_args]
-            let mut init_args = Vec::with_capacity(1 + full_args.len());
-            init_args.push(Value::Object(Some(new_obj)));
-            init_args.extend_from_slice(&full_args);
-            invoke_on_class_shared(
-                shared,
-                thread,
-                class_id,
-                &call_site.impl_handle.member_name,
-                &call_site.impl_handle.descriptor,
-                &init_args,
-            )?;
-            Ok(Some(Some(Value::Object(Some(new_obj)))))
+            // Build <init> args: [new_obj, ...full_args]. The constructor body
+            // can allocate and trigger a moving GC; the Java frame/locals are
+            // remapped, but this Rust local `new_obj` is not. Pin the receiver
+            // across `<init>` and return the forwarded object ref, mirroring the
+            // MethodHandle `newInvokeSpecial` path in `vm_exec.rs`.
+            let new_obj_pin = thread.native_pin_roots.len();
+            thread.native_pin_roots.push(new_obj);
+            let init_result = (|| -> Result<(), MethodCallFailed> {
+                let mut init_args = Vec::with_capacity(1 + full_args.len());
+                init_args.push(Value::Object(Some(new_obj)));
+                init_args.extend_from_slice(&full_args);
+                invoke_on_class_shared(
+                    shared,
+                    thread,
+                    class_id,
+                    &call_site.impl_handle.member_name,
+                    &call_site.impl_handle.descriptor,
+                    &init_args,
+                )?;
+                Ok(())
+            })();
+            let forwarded = thread
+                .native_pin_roots
+                .get(new_obj_pin)
+                .copied()
+                .unwrap_or(new_obj);
+            thread.native_pin_roots.truncate(new_obj_pin);
+            init_result?;
+            Ok(Some(Some(Value::Object(Some(forwarded)))))
         }
         MethodHandleKind::GetField => {
             // Field getter: first arg is the object, return the field value.
