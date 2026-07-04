@@ -355,49 +355,61 @@ fn jla_add_enable_native_access(_ctx: &mut dyn NativeContext, args: &[Value]) ->
     Ok(Some(args.get(1).copied().unwrap_or(Value::Object(None))))
 }
 
-/// `JavaLangAccess.defineClass(ClassLoader, String, byte[], ProtectionDomain,
-/// String)` -> `Class<?>`.
+/// `JavaLangAccess.defineClass(ClassLoader loader, String name, byte[] b,
+/// ProtectionDomain pd, String source)` -> `Class<?>`.
 ///
-/// `jdk.internal.reflect.ClassDefiner.defineClass` (used to define
-/// reflection-generated method/constructor accessor classes, and by other
-/// internal callers) invokes this via `invokeinterface JavaLangAccess`.
-/// Without it, real-JDK mode threw `NoSuchMethodError` out of
-/// `ClassDefiner.defineClass`, which aborted the JUnit launcher during
-/// session setup on JDK 21+ (every class in a run collapsed to LOADERR).
+/// `jdk.internal.reflect.ClassDefiner.defineClass(String, byte[], int, int,
+/// ClassLoader)` — used by `ReflectionFactory` to materialize the
+/// serialization-constructor-accessor / `MethodAccessor` classes that JUnit5's
+/// `SessionPerRequestLauncher` (and every Arquillian
+/// `testsuite/integration-arquillian/tests/base` test class) generates during
+/// test-plan construction — slices its `(off, len)` window down to an
+/// exact-size array before calling
+/// `SharedSecrets.getJavaLangAccess().defineClass(parent, name, bytes, null,
+/// "__ClassDefiner__")`. `System$1` (the `JavaLangAccess` singleton, see
+/// `register_java_lang_access`) never had this method registered, so the
+/// `invokeinterface` raised `NoSuchMethodError`, aborting `ClassDefiner`
+/// before any Arquillian base test class could run.
 ///
-/// Real JDK's `System$1.defineClass` body is just
-/// `loader.defineClass(name, b, 0, b.length, pd)` — delegate to the loader's
-/// own protected 5-arg `defineClass` so this goes through the exact same
-/// path as any other `ClassLoader.defineClass` call.
+/// No offset/length here (unlike `ClassLoader.defineClass1`/`defineClass2`) —
+/// the real `JavaLangAccess` interface method takes the whole array. Shares
+/// the same `define_class_via_full` backend as `defineClass1` so magic-byte
+/// validation, panic-guarding, and PD/code-source attribution stay unified
+/// across every defineClass entry point.
 ///
-/// INSTANCE method: args[0] = receiver (System$1), args[1] = ClassLoader,
-/// args[2] = String name, args[3] = byte[] b, args[4] = ProtectionDomain pd,
-/// args[5] = String source (unused — the real body ignores it too).
+/// INSTANCE method: args[0] = receiver (System$1), args[1] = loader,
+/// args[2] = name, args[3] = byte[], args[4] = pd, args[5] = source (unused —
+/// `define_class_via_full` derives its own SourceFile handling).
 fn jla_define_class(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    use cratonvm_types::error::RuntimeError;
+
     let loader = args.get(1).copied().unwrap_or(Value::Object(None));
-    let name = args.get(2).copied().unwrap_or(Value::Object(None));
-    let bytes = args.get(3).copied().unwrap_or(Value::Object(None));
-    let pd = args.get(4).copied().unwrap_or(Value::Object(None));
-    let len = match bytes {
-        Value::Object(Some(arr)) => ctx.array_length(arr) as i32,
-        _ => 0,
+    let name = crate::classloader::read_optional_internal_name(ctx, args, 2);
+    let byte_array = match args.get(3) {
+        Some(Value::Object(Some(arr))) => *arr,
+        _ => {
+            return Err(RuntimeError::IllegalArgumentException {
+                message: "JavaLangAccess.defineClass: bytes must not be null".into(),
+            }
+            .into());
+        }
     };
-    // `ctx.invoke_virtual` runs the REAL bytecode for `ClassLoader.defineClass`
-    // (that is its whole purpose — bridges use it to deliberately reach real
-    // JDK behavior instead of re-entering the native registry). That bytecode
-    // opens with `preDefineClass(name, pd)`, whose `checkName` rejects any
-    // name containing `/` with `NoClassDefFoundError: IllegalName: ...` — but
-    // ordinary bytecode `invokevirtual` call sites for this exact method
-    // never reach that check at all, because `cl_define_class_pd` is
-    // registered on `java/lang/ClassLoader.defineClass` and wins native
-    // dispatch first. Call it directly so this bridge gets the SAME behavior
-    // any other `loader.defineClass(name, b, off, len, pd)` caller gets,
-    // instead of a divergent bytecode path. Args shape matches a normal
-    // instance call: [receiver=loader, name, bytes, off, len, pd].
-    crate::classloader::cl_define_class_basic(
-        ctx,
-        &[loader, name, bytes, Value::Int(0), Value::Int(len), pd],
-    )
+    let len = ctx.array_length(byte_array);
+    let bytes = crate::classloader::read_byte_array_slice(ctx, byte_array, 0, len).map_err(
+        |_msg| {
+            cratonvm_types::error::MethodCallFailed::from(
+                RuntimeError::ArrayIndexOutOfBoundsException { index: 0 },
+            )
+        },
+    )?;
+
+    let mut opts = cratonvm_native_api::DefineClassFull::default();
+    if let Some(Value::Object(Some(pd))) = args.get(4) {
+        opts.code_source_url = crate::classloader::extract_pd_code_source_url(ctx, *pd);
+    }
+
+    let loader_id = crate::classloader::loader_id_for(ctx, loader);
+    crate::classloader::define_class_via_full(ctx, &name, bytes, loader_id, opts, false, None)
 }
 
 /// `JavaLangAccess.getConstantPool(Class<?>)` -> `jdk.internal.reflect.ConstantPool`.
