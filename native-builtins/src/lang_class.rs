@@ -3199,6 +3199,43 @@ pub(crate) fn illegal_arg_exc(msg: String) -> MethodCallFailed {
     cratonvm_types::error::RuntimeError::IllegalArgumentException { message: msg }.into()
 }
 
+/// Build a materialized `IllegalArgumentException(msg, cause)` whose cause is
+/// a fresh `NullPointerException`, matching HotSpot's
+/// `jdk.internal.reflect.*Accessor` behaviour when a reflective
+/// `Method.invoke`/`Constructor.newInstance` call passes `null` for a
+/// primitive formal parameter: HotSpot's argument unboxing calls
+/// `Number.doubleValue()` (etc.) on the null argument, and the resulting
+/// `NullPointerException` becomes the `IllegalArgumentException`'s cause
+/// (message text is HotSpot's own NPE helper message, not "argument type
+/// mismatch" -- but callers only key off the exception TYPE hierarchy, e.g.
+/// Spring's `InvocableHandlerMethod.doInvoke`:
+///   `(ex.getMessage() == null || ex.getCause() instanceof NullPointerException)
+///       ? "Illegal argument" : ex.getMessage()`
+/// -- so attaching an NPE cause here (keeping our own descriptive message) is
+/// sufficient to match that branch without needing byte-for-byte NPE text).
+///
+/// Falls back to the plain message-only `illegal_arg_exc` if the exception
+/// object can't be materialized (e.g. exotic classloader state) -- losing the
+/// cause is preferable to losing the exception entirely.
+pub(crate) fn illegal_arg_exc_null_to_primitive(
+    ctx: &mut dyn NativeContext,
+    msg: String,
+) -> MethodCallFailed {
+    let npe = match ctx.new_object_initialized("java/lang/NullPointerException", "()V", &[]) {
+        Ok(Some(Value::Object(Some(obj)))) => obj,
+        _ => return illegal_arg_exc(msg),
+    };
+    let msg_obj = ctx.create_string(&msg);
+    match ctx.new_object_initialized(
+        "java/lang/IllegalArgumentException",
+        "(Ljava/lang/String;Ljava/lang/Throwable;)V",
+        &[Value::Object(Some(msg_obj)), Value::Object(Some(npe))],
+    ) {
+        Ok(Some(Value::Object(Some(iae)))) => MethodCallFailed::ExceptionThrown(iae),
+        _ => illegal_arg_exc(msg),
+    }
+}
+
 /// Wrap a propagated Java exception from a reflective call into
 /// `java.lang.reflect.InvocationTargetException(cause)`, matching HotSpot's
 /// behaviour for `Method.invoke` and `Constructor.newInstance`.
@@ -5580,6 +5617,29 @@ pub(crate) fn native_method_invoke(
             match coerce_arg_strict(ctx, arg_val, pdesc, "Method.invoke argument") {
                 Ok(coerced) => invoke_args.push(coerced),
                 Err(e) => {
+                    // JDK-faithful cause: HotSpot's reflective unboxing calls
+                    // `Number.xxxValue()` on a null argument passed for a
+                    // primitive formal parameter, so the resulting
+                    // `IllegalArgumentException` carries a `NullPointerException`
+                    // cause. Spring's `InvocableHandlerMethod.doInvoke` (and
+                    // other callers) branch on `ex.getCause() instanceof
+                    // NullPointerException` to pick a friendlier message, so a
+                    // bare message-only IAE here diverges from HotSpot even
+                    // though the exception TYPE matches. See
+                    // `illegal_arg_exc_null_to_primitive`.
+                    let e = if matches!(arg_val, Value::Object(None))
+                        && matches!(pdesc.as_str(), "I" | "J" | "F" | "D" | "Z" | "B" | "S" | "C")
+                        && matches!(
+                            &e,
+                            MethodCallFailed::InternalError(cratonvm_types::error::VmError::Runtime(
+                                cratonvm_types::error::RuntimeError::IllegalArgumentException { .. }
+                            ))
+                        )
+                    {
+                        illegal_arg_exc_null_to_primitive(ctx, "argument type mismatch".to_string())
+                    } else {
+                        e
+                    };
                     // CRATONVM_DBG_INVOKE_COERCE=1 — dump the method, formal
                     // descriptors, actual arg runtime types, and innermost Java
                     // caller frames on a coercion mismatch. Env-gated.
