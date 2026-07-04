@@ -439,6 +439,22 @@ These were open here and are now **fixed / do-not-reproduce**; the detailed writ
 - **JUnit 5 `@ExtendWith` meta-annotation `ParameterResolver`** — ⚠️ MISDIAGNOSED / does-not-reproduce;
   annotation discovery is byte-identical to HotSpot and `JtaCustomAfterCompletionTest` passes 5/5. → [`docs/internal/junit5-extendwith-meta-annotation-parameterresolver.md`](../internal/junit5-extendwith-meta-annotation-parameterresolver.md).
 
+## Standalone — HQL parser rejects chained additive/duration/concat operators
+
+[docs/known-issues/hql-antlr-chained-operator-syntax-error.md](hql-antlr-chained-operator-syntax-error.md)
+— ✅ **FIXED** (branch `fix/hql-chained-operator-parse`, commit `4e2a4493`,
+not yet merged — awaiting sign-off + follow-up verification). `a + b + c`
+(or `a || b || c`, chained date/duration arithmetic, etc.) failed to parse —
+CratonVM-only, second occurrence of the same operator class rejected with
+ANTLR `SyntaxException: no viable alternative`. **NOT the same bug as
+`jit-deep-recursion-fault-recovery.md` (Bug C)** — reproduced identically
+with `--nojit` (Bug C is JIT-only) and with a trivial standalone ANTLR4
+grammar unrelated to Hibernate/Groovy. Root-caused to a one-line defect in
+CratonVM's native Rust reimplementation of `ParserATNSimulator`'s closure
+algorithm (passed `inContext = !full_ctx` instead of `depth == 0`), a
+generic defect in revisiting the same parser decision
+twice within one parse; the specific defective method is not yet identified.
+
 ## Standalone — Hibernate deserialized SessionFactory is null
 
 [docs/internal/hibernate-deserialization-sessionfactory-reconnect-null.md](../internal/hibernate-deserialization-sessionfactory-reconnect-null.md)

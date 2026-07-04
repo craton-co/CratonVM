@@ -3793,13 +3793,23 @@ fn antlr_parser_closure_impl(
         };
         let continue_collecting =
             collect_predicates && !antlr_transition_is_action(ctx, transition);
+        // `inContext` mirrors real ANTLR's `getEpsilonTarget(config, t, collectPredicates,
+        // depth == 0, fullCtx, treatEofAsEpsilon)` call in `ParserATNSimulator.closure_` —
+        // it must track whether this epsilon walk is still within the rule invocation
+        // closure started from (depth == 0), not merely "are we in full-context mode"
+        // (`!full_ctx`, which is constant for the whole SLL closure and never reflects
+        // having dipped into an outer context). Passing `!full_ctx` here made every
+        // SLL-mode precedence/predicate transition look "in context" even after falling
+        // off a rule with an exhausted (empty) context, wrongly attaching a precedence
+        // predicate that real ANTLR would have suppressed — corrupting prediction on the
+        // second+ visit to the same left-recursive loop decision within one parse.
         let Some(next_config) = antlr_parser_native_get_epsilon_target(
             ctx,
             simulator,
             config,
             transition,
             continue_collecting,
-            !full_ctx,
+            depth == 0,
             full_ctx,
             treat_eof_as_epsilon,
         )?
