@@ -19806,7 +19806,25 @@ fn register_annotation_overrides(registry: &mut NativeMethodRegistry) {
                 let cname = ctx
                     .class_name_of_id(ctx.class_id_of_object(m))
                     .unwrap_or_default();
-                if cname == "java/util/IdentityHashMap" {
+                // Same trap as `IdentityHashMap` (identity keys): Spring's
+                // `LinkedCaseInsensitiveMap` also overrides key equals/hashCode
+                // (case-insensitive folding) away from the plain value-hash
+                // semantics the synthetic `HashSet` below assumes. Wrapping it
+                // in a value-hash `HashSet<String>` silently reverts to
+                // case-SENSITIVE dedup, so e.g.
+                // `Collections.newSetFromMap(new LinkedCaseInsensitiveMap<>())`
+                // (used by `HttpComponentsHeadersAdapter`'s header-name Set)
+                // keeps "TestHeader" and "TestHEADER" as two distinct elements
+                // instead of one — breaking case-insensitive header-name
+                // dedup/removal. Route it through the real
+                // `Collections$SetFromMap`, same as `IdentityHashMap`: the
+                // `SetFromMap` natives already dispatch `iterator`/`toArray`/
+                // `contains` via `invoke_virtual` against the live backing map
+                // (see `set_from_map_backing` in native-collections), so they
+                // work correctly for any backing map's own equals/hashCode.
+                if cname == "java/util/IdentityHashMap"
+                    || cname == "org/springframework/util/LinkedCaseInsensitiveMap"
+                {
                     return ctx.new_object_initialized(
                         "java/util/Collections$SetFromMap",
                         "(Ljava/util/Map;)V",
