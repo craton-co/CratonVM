@@ -19020,6 +19020,28 @@ fn try_stackless_invoke(
             if parent.find_method(method_name, descriptor).is_some() {
                 return None;
             }
+            // JVMTI redefine guard, per ancestor. Mockito's inline mock
+            // maker mocks a CONCRETE class (e.g. `java.net.HttpURLConnection`)
+            // by redefining that class directly and weaving advice into its
+            // methods, then instantiating a trivial marker SUBCLASS (which
+            // declares only a couple of identity/interceptor-plumbing
+            // methods — it does NOT override every mockable method the way
+            // an interface mock's generated subclass does). So the RECEIVER
+            // here is that marker subclass, which itself was never redefined
+            // — only the ANCESTOR (`HttpURLConnection`) was. The top-level
+            // `native_shadow_suppressed_by_redefine(shared, class_name)`
+            // check below only inspects the receiver's own class and misses
+            // this entirely, so a native registered on the redefined
+            // ancestor kept winning over its now-woven bytecode: every call
+            // on the mock (including Mockito's own stubbing/verification
+            // calls) silently bypassed the mock's advice and ran the real
+            // native instead. Skip an ancestor's native the same way the
+            // receiver-class check does.
+            if native_shadow_suppressed_by_redefine(shared, &parent.name)
+                && !redefine_immune_reflection_native(&parent.name, method_name)
+            {
+                return None;
+            }
             if let Some(cb) = shared
                 .native_methods
                 .find(&parent.name, method_name, descriptor)
@@ -25101,47 +25123,73 @@ fn execute_invokevirtual_vtable_fast(
                         rcv_name, method_name, method_descriptor,
                     );
                 }
-                // FJP fix: walk the parent chain to find natives registered on
-                // a superclass (e.g. `RecursiveTask.fork()` defined on
-                // `ForkJoinTask` but registered as a Rust native at
-                // `RecursiveTask`). Without this walk, the vtable would
-                // dispatch the inherited JDK bytecode for `fork()`, which uses
-                // Unsafe CAS and bypasses our native side-table.
-                let mut cid = receiver_class_id;
-                while let Some(parent_id) = cm.get_class(cid).and_then(|c| c.superclass) {
-                    if let Some(parent) = cm.get_class(parent_id) {
-                        // S107 collection-toString fix: if this parent has its
-                        // own bytecode for the method, the bytecode override wins
-                        // over any deeper native ancestor (e.g. Object.toString).
-                        // Stop walking so the vtable bytecode path runs.
-                        //
-                        // Round 19 (peaceful-sammet) — IMPORTANT exception: if
-                        // the parent has BOTH bytecode AND a Rust native, the
-                        // native wins. See `populate_virtual_invoke_cache` for
-                        // the LinkedHashMap-overlay rationale.
-                        let has_bytecode = parent
-                            .find_method(&method_name, &method_descriptor)
-                            .is_some();
-                        // Suppress an inherited native shadow when the declaring
-                        // parent has been redefined by an agent (woven bytecode wins).
-                        let parent_redefined = crate::classloading::any_class_redefined()
-                            && cm.class_redefine_generation(parent_id) > 0
-                            && !redefine_immune_reflection_native(&parent.name, &method_name);
-                        let has_native = !parent_redefined
-                            && shared
-                                .native_methods
-                                .find(&parent.name, &method_name, &method_descriptor)
+                // Receiver's-own-class override guard. The parent-walk below
+                // (FJP fix, next comment) starts at `receiver_class_id`'s
+                // SUPERCLASS — it never inspects whether `receiver_class_id`
+                // itself directly declares this method. That is correct for
+                // an INHERITED method (the walk's intended case: no override
+                // on the receiver, so scanning ancestors for the nearest
+                // bytecode-or-native is exactly right), but wrong for an
+                // OVERRIDDEN one: a Mockito/ByteBuddy-generated mock subclass
+                // of e.g. `java.net.HttpURLConnection` declares its OWN
+                // bytecode body for every mockable method, and that override
+                // is the most-derived target — it must win over a native
+                // registered on an ancestor (`HttpURLConnection` itself),
+                // exactly like real JVM virtual dispatch. Without this guard
+                // the walk finds `HttpURLConnection`'s native at the very
+                // first step and treats it as authoritative, so EVERY call on
+                // the mock — including Mockito's own stubbing/verification
+                // calls — silently bypasses the mock's advice and runs the
+                // real native instead (observed as `MockitoException: Could
+                // not modify all classes` / stray `IllegalArgumentException:
+                // HttpURLConnection: URL not set` from `given(mock.foo())`).
+                let receiver_has_own_bytecode = cm
+                    .get_class(receiver_class_id)
+                    .map(|c| c.find_method(&method_name, &method_descriptor).is_some())
+                    .unwrap_or(false);
+                if !receiver_has_own_bytecode {
+                    // FJP fix: walk the parent chain to find natives registered on
+                    // a superclass (e.g. `RecursiveTask.fork()` defined on
+                    // `ForkJoinTask` but registered as a Rust native at
+                    // `RecursiveTask`). Without this walk, the vtable would
+                    // dispatch the inherited JDK bytecode for `fork()`, which uses
+                    // Unsafe CAS and bypasses our native side-table.
+                    let mut cid = receiver_class_id;
+                    while let Some(parent_id) = cm.get_class(cid).and_then(|c| c.superclass) {
+                        if let Some(parent) = cm.get_class(parent_id) {
+                            // S107 collection-toString fix: if this parent has its
+                            // own bytecode for the method, the bytecode override wins
+                            // over any deeper native ancestor (e.g. Object.toString).
+                            // Stop walking so the vtable bytecode path runs.
+                            //
+                            // Round 19 (peaceful-sammet) — IMPORTANT exception: if
+                            // the parent has BOTH bytecode AND a Rust native, the
+                            // native wins. See `populate_virtual_invoke_cache` for
+                            // the LinkedHashMap-overlay rationale.
+                            let has_bytecode = parent
+                                .find_method(&method_name, &method_descriptor)
                                 .is_some();
-                        if has_native {
-                            remember_vtable_native_shadow(thread, native_shadow_cache_key, true);
-                            drop(cm);
-                            return Ok(CachedCallResult::CacheMiss);
+                            // Suppress an inherited native shadow when the declaring
+                            // parent has been redefined by an agent (woven bytecode wins).
+                            let parent_redefined = crate::classloading::any_class_redefined()
+                                && cm.class_redefine_generation(parent_id) > 0
+                                && !redefine_immune_reflection_native(&parent.name, &method_name);
+                            let has_native = !parent_redefined
+                                && shared
+                                    .native_methods
+                                    .find(&parent.name, &method_name, &method_descriptor)
+                                    .is_some();
+                            if has_native {
+                                remember_vtable_native_shadow(thread, native_shadow_cache_key, true);
+                                drop(cm);
+                                return Ok(CachedCallResult::CacheMiss);
+                            }
+                            if has_bytecode {
+                                break;
+                            }
                         }
-                        if has_bytecode {
-                            break;
-                        }
+                        cid = parent_id;
                     }
-                    cid = parent_id;
                 }
             }
             if cached_native_shadow != Some(false) {
@@ -26281,6 +26329,31 @@ fn populate_virtual_invoke_cache(
                     // for `@EnableAutoConfiguration` and surfacing as
                     // `MissingWebServerFactoryBean` on Spring Boot startup.
                     let parent_name = parent.name.to_string();
+                    // JVMTI redefine guard: Mockito's inline mock maker mocks a
+                    // CONCRETE class (e.g. `java.net.HttpURLConnection`) by
+                    // redefining that class directly (weaving advice into its
+                    // methods) and instantiating a trivial marker SUBCLASS that
+                    // does NOT itself override every mockable method — so the
+                    // RECEIVER here is that marker subclass (never redefined),
+                    // while an ANCESTOR up this walk (`parent`) is the one
+                    // that was redefined. Without this guard, BOTH branches
+                    // below (the Round-19 dual-registration exception and the
+                    // pure-inherited-native case) cache a `VirtualNative`
+                    // target pointing at our native, permanently shadowing the
+                    // now-woven bytecode for every FUTURE call at this call
+                    // site — even though the first (uncached) call correctly
+                    // ran the woven bytecode via the slow path and the mock's
+                    // advice fired. `execute_invokevirtual_cached`'s eviction
+                    // check only inspects the RECEIVER class's redefine
+                    // generation (stored in the cached target), so it never
+                    // catches a shadow whose declaring class is an ancestor —
+                    // the fix has to be here, where the entry is created.
+                    let parent_redefined = crate::classloading::any_class_redefined()
+                        && cm.class_redefine_generation(parent_id) > 0
+                        && !redefine_immune_reflection_native(&parent_name, &method_name);
+                    if parent_redefined {
+                        break;
+                    }
                     if parent.find_method(&method_name, &descriptor).is_some() {
                         if let Some(callback) =
                             shared

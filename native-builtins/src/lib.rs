@@ -9742,6 +9742,26 @@ pub fn register_essential_natives(registry: &mut NativeMethodRegistry) {
     // real-JDK path picks them up too.
     crate::phases_late::register_p62_char_buffer(registry);
 
+    // `jdk/net/LinuxSocketOptions.incomingNapiIdSupported0()Z` — a
+    // Linux-only extended-socket-options probe (`jdk.net.Sockets
+    // .optionSets()` calls it while building the supported-options set,
+    // reached the first time ANY code touches `ExtendedSocketOptions` on a
+    // Linux JDK — e.g. Apache HttpClient 5's connection-pool setup). With
+    // no native registered, real-JDK mode threw UnsatisfiedLinkError,
+    // which — since this runs during `PoolingHttpClientConnectionManager`
+    // construction — left `DefaultHttpClientConnectionOperator` in the
+    // JVM's permanent "erroneous class" state, so every LATER reference
+    // anywhere in the run threw `NoClassDefFoundError` instead of the real
+    // cause. `false` (NAPI ID busy-poll steering unsupported) is always a
+    // safe, conservative answer — HotSpot itself returns false on any
+    // kernel/NIC lacking the feature, and callers already handle that.
+    registry.register(
+        "jdk/net/LinuxSocketOptions",
+        "incomingNapiIdSupported0",
+        "()Z",
+        |_ctx, _args| Ok(Some(Value::Int(0))),
+    );
+
     // Restore the caller's category so later registrars keep their intended tag.
     registry.set_category(prev_category);
     let after = registry.len();

@@ -575,6 +575,32 @@ pub fn register_lang_stackwalker(registry: &mut NativeMethodRegistry) {
             native_call_stack_walk(ctx, &reordered)
         },
     );
+    // JDK 21's actual signature: single `long mode` (not split into two
+    // ints like JDK 25) plus the ContinuationScope/Continuation params and
+    // an `Object` return (not `int` like the older no-continuation
+    // variant below). Missing this exact overload meant EVERY
+    // `StackWalker.walk(...)` on JDK 21 threw `UnsatisfiedLinkError` —
+    // including Mockito's `LocationImpl` (used by the inline mock maker on
+    // every mocked-method invocation), so any suite mocking a JDK class
+    // failed on the very first stubbed call.
+    registry.register(
+        asw,
+        "callStackWalk",
+        "(JILjdk/internal/vm/ContinuationScope;Ljdk/internal/vm/Continuation;II[Ljava/lang/Object;)Ljava/lang/Object;",
+        |ctx, args| {
+            // args = (this, mode, skip, contScope, continuation, batch, startIndex, frameBuffer)
+            let reordered = [
+                args.first().copied().unwrap_or(Value::Object(None)),
+                args.get(1).copied().unwrap_or(Value::Long(0)),
+                args.get(2).copied().unwrap_or(Value::Int(0)),
+                args.get(5).copied().unwrap_or(Value::Int(0)),
+                args.get(6).copied().unwrap_or(Value::Int(0)),
+                args.get(7).copied().unwrap_or(Value::Object(None)),
+                Value::Object(None),
+            ];
+            native_call_stack_walk(ctx, &reordered)
+        },
+    );
     // JDK 21+ changed the signature slightly (added ContinuationScope,
     // Continuation params) — register the old variant too so both paths
     // resolve.

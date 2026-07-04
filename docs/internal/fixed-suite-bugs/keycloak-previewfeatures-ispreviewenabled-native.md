@@ -2,6 +2,14 @@
 
 ## Status: FIXED (2026-07-03)
 
+Independently re-discovered the same day while reproducing the unrelated
+`http.client` bug cluster on this same Azure host/JDK 21 (see
+`docs/known-issues/http-client-cluster-redefine-dispatch-and-jdk21-gaps.md`) —
+every one of that cluster's 12 target classes hit this exact
+`UnsatisfiedLinkError` before a single test method could run. No functional
+change needed there once this fix was already in place; noted here only for
+cross-reference.
+
 Added a native implementation for `jdk/internal/misc/PreviewFeatures.isPreviewEnabled()Z`
 in `native-builtins/src/lib.rs` (`register_essential_natives`, next to the
 `jdk/internal/misc/CDS` block), returning `false` — matching HotSpot's

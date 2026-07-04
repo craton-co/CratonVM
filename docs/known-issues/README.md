@@ -5,6 +5,10 @@ suites. The docs had grown to describe the **same underlying bug from several
 angles**; this index is the consolidated map. Read it first.
 
 
+## 2026-07-03 http.client bug cluster (branch fix/http-client-cluster-azure)
+
+- [http.client cluster: redefine-dispatch fix + JDK 21 gaps](http-client-cluster-redefine-dispatch-and-jdk21-gaps.md) - core fix: two of three "native shadow" dispatch paths never checked whether an ANCESTOR class (not just the receiver) was JVMTI-redefined, so Mockito-mocked concrete classes (e.g. `HttpURLConnection`) silently bypassed their own advice. Plus several JDK 21 real-mode native gaps (`JavaLangAccess.defineClass`/`getConstantPool`/`start`, `StackWalker.callStackWalk` overload). 4 residuals documented (Linux-only NIO gaps, a 4-class hang, one order-dependent Mockito state leak, pre-existing `SimpleClientHttpRequestFactoryTests` gaps).
+
 ## Bug-document lifecycle
 
 Every unresolved bug document belongs under `docs/known-issues`. Once the bug
