@@ -1,16 +1,18 @@
 # Elasticsearch NativeAccess LoaderHelper platform lib dir null
 
-Status: open
+Status: RETRACTED — benign, not a CratonVM bug
 
 Date observed: 2026-07-02
 
 ## Summary
 
 Many Elasticsearch tests that initialize native access under CratonVM log an
-`ExceptionInInitializerError` from `LoaderHelper.findPlatformLibDir`. The suite
-can often continue after Elasticsearch disables native methods, so this is not
-counted as a standalone failing class family, but it is a recurring VM-visible
-bug and a precursor to several vector and compression failures.
+`ExceptionInInitializerError` from `LoaderHelper.findPlatformLibDir`. This is
+caught by `NativeAccessHolder` as part of Elasticsearch's own native-fallback
+flow (same behavior observed on HotSpot), so it is not a standalone CratonVM bug.
+No direct VM-side fix is required for this signature alone.
+
+Cross-reference: `docs/internal/elasticsearch-suite/ES-FAIL-03-RETRACTED-nativeaccess-not-a-bug.md`.
 
 Signature:
 

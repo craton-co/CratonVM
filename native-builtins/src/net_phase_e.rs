@@ -6510,7 +6510,7 @@ fn register_re6_ssl_context(r: &mut NativeMethodRegistry) {
             // and attach it to this SSLContext. createSSLEngine / createSocket
             // then use THIS context's cert+key rather than the process-global
             // slot, so an in-process server and client don't clobber each other.
-            crate::t27_tls::attach_pending_identity_to_ctx(this);
+            crate::t27_tls::attach_pending_identity_to_ctx(ctx, this);
             Ok(None)
         },
     );
@@ -6530,7 +6530,7 @@ fn register_re6_ssl_context(r: &mut NativeMethodRegistry) {
             // the synthetic factory. This is the reliable capture point —
             // overriding the concrete `setDefaultSSLSocketFactory` bytecode does
             // not work (real JDK method body wins over a native override).
-            if let Some((cert, key)) = crate::t27_tls::ctx_identity(this) {
+            if let Some((cert, key)) = crate::t27_tls::ctx_identity(ctx, this) {
                 crate::t27_tls::set_huc_default_client_identity(Some((cert, key)));
             }
             Ok(Some(Value::Object(Some(f))))
@@ -6655,7 +6655,7 @@ fn register_re6_ssl_context(r: &mut NativeMethodRegistry) {
             // onto the engine, so the rustls handshake presents THIS context's
             // cert (server cert, or client cert for mTLS) instead of the global.
             if let Ok(sslctx) = obj_arg(args, 0) {
-                if let Some((cert, key)) = crate::t27_tls::ctx_identity(sslctx) {
+                if let Some((cert, key)) = crate::t27_tls::ctx_identity(ctx, sslctx) {
                     crate::t27_tls::set_engine_identity_override(eng, cert, key);
                 }
             }
@@ -6701,7 +6701,7 @@ fn register_re6_ssl_context(r: &mut NativeMethodRegistry) {
             // Per-context client identity (mTLS): the SSLContext stashed on the
             // factory by getSocketFactory (field 0) may carry a client cert+key.
             let client_ident = match ctx.get_field(this_factory, 0) {
-                Value::Object(Some(sslctx)) => crate::t27_tls::ctx_identity(sslctx),
+                Value::Object(Some(sslctx)) => crate::t27_tls::ctx_identity(ctx, sslctx),
                 _ => None,
             };
             // Use the rustls client path rather than a default native-tls
