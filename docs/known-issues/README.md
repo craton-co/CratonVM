@@ -13,30 +13,38 @@ Ran the 1124 Keycloak JUnit classes not covered by the prior 238-class baseline
 launcher/engines + `junit:junit` were missing from every module's classpath;
 KcRunner always drives tests through the JUnit Platform Launcher regardless of
 whether the module declares JUnit5). Result: 28 PASS, 910 FAIL, 71 CRASH, 115
-EMPTY, 0 HANG, wall time 2469s (41 min) at parallel=2.
+EMPTY, 0 HANG, wall time 2469s (41 min) at parallel=2. All 981 FAIL+CRASH rows
+were exhaustively bucketed by exact terminal-error signature (not sampled) —
+see `keycloak-07-04/` for every distinct finding.
 
 One CratonVM bug found and FIXED this session:
 [SmallRyeConfig.getConfigMapping(Class) 1-arg bare-interface AbstractMethodError](../internal/fixed-suite-bugs/smallrye-getconfigmapping-1arg-bare-interface-abstractmethoderror.md).
+A background task has been spawned to investigate/fix the highest-priority
+open finding below (the Charset/MemorySize converter gap).
 
-New OPEN findings from this sweep, roughly by priority (blast radius):
-- [SmallRye Config missing Charset/MemorySize converters](smallrye-config-missing-charset-memorysize-converters.md) — blocks 341+ classes, the single highest-value lever found.
-- [quarkus/runtime CompactValue NaN-box collision SIGSEGV](quarkus-runtime-compactvalue-nanbox-collision-sigsegv.md) — the only *uncaught* native crash in this sweep (4 classes).
-- [crypto/fips1402 CryptoProvider ServiceLoader returns empty](crypto-fips1402-cryptoprovider-serviceloader-empty.md) — 21 classes.
-- [FacadeClassLoader Object.size() NoSuchMethodError + guarded Class-object OOB access](facadeclassloader-object-size-nosuchmethoderror-classoob.md) — confirmed non-fatal (guard-protected) but real; root cause not fully pinned.
-- [quarkus/runtime config-value divergences](quarkus-runtime-config-value-divergences.md) — 3 classes, likely related to the converter gap above.
-- [System Rules getenv() field 'm' reflection mismatch](system-rules-getenv-field-m-reflection.md) — 1 class, narrow.
-- [KcAdmV2HelpTest --help text env-var mentions](kcadmv2-helptext-env-var-mentions.md) — 1 class, possibly a stale test rather than a VM bug.
+New OPEN findings from this sweep, in `keycloak-07-04/`, roughly by priority (blast radius):
+- [SmallRye Config missing Charset/MemorySize converters](keycloak-07-04/smallrye-config-missing-charset-memorysize-converters.md) — blocks 341/341 `tests/base` classes (exhaustively confirmed, not sampled), the single highest-value lever found. Investigation/fix spawned as a separate task.
+- [quarkus/runtime CompactValue NaN-box collision SIGSEGV](keycloak-07-04/quarkus-runtime-compactvalue-nanbox-collision-sigsegv.md) — the only *uncaught* native crash in this sweep (4 classes).
+- [crypto/fips1402 CryptoProvider ServiceLoader returns empty](keycloak-07-04/crypto-fips1402-cryptoprovider-serviceloader-empty.md) — 21 classes.
+- [FacadeClassLoader Object.size() NoSuchMethodError + guarded Class-object OOB access](keycloak-07-04/facadeclassloader-object-size-nosuchmethoderror-classoob.md) — confirmed non-fatal (guard-protected) but real; root cause not fully pinned.
+- [LoggingConfigurationTest wildcard DEBUG level resolves null](keycloak-07-04/quarkus-runtime-logging-wildcard-debug-level-null.md) — 1 class/sub-test.
+- [SmallRyeConfig.getPropertyNames() surfaces a garbage property name during log-category validation](keycloak-07-04/quarkus-runtime-logging-getpropertynames-garbage-key.md) — 2 sub-tests in the same class as above, plausibly related.
+- [TelemetryConfigurationTest telemetry-service-name wrong value](keycloak-07-04/quarkus-runtime-telemetry-service-name-wrong-value.md) — 1 class/sub-test.
+- [IgnoredArtifactsTest.multipleDatasources boolean mismatch](keycloak-07-04/quarkus-runtime-ignoredartifacts-multipledatasources-boolean.md) — 1 class/sub-test.
+- [System Rules getenv() field 'm' reflection mismatch](keycloak-07-04/system-rules-getenv-field-m-reflection.md) — 1 class, narrow.
+- [KcAdmV2HelpTest --help text env-var mentions](keycloak-07-04/kcadmv2-helptext-env-var-mentions.md) — 1 class, possibly a stale test rather than a VM bug.
 
 Already-tracked, not re-documented: the 37 `testsuite/model` CRASHes are the
 existing [Infinispan GlobalConfigurationBuilder.isClustered() NoSuchMethodError](keycloak-model-infinispan-globalconfiguration-isclustered-nosuchmethod.md).
-Not CratonVM bugs: 544 FAILs (`testsuite/integration-arquillian/tests/base`
-+ `tests/other/sssd`) are "Not found frontend container: auth-server-undertow"
-— an Arquillian environment/container-provisioning gap in this harness, not a
-VM defect (would fail identically on real HotSpot run the same way). 25
-additional CRASHes (`scim/core`, `ssf/*`, `test-framework/*`,
-`tests/webauthn`, 2×`tests/clustering`) were a harness classpath gap
-(missing `junit:junit`, fixed alongside the JUnit Platform launcher fix
-above), not a VM bug.
+Not CratonVM bugs: 543 FAILs (`testsuite/integration-arquillian/tests/base`
++ `tests/other/sssd`, exhaustively confirmed — 543/544 exact match, the 544th
+is the System Rules finding above) are "Not found frontend container:
+auth-server-undertow" — an Arquillian environment/container-provisioning gap
+in this harness, not a VM defect (would fail identically on real HotSpot run
+the same way). 25 additional CRASHes (`scim/core`, `ssf/*`,
+`test-framework/*`, `tests/webauthn`, 2×`tests/clustering`) were a harness
+classpath gap (missing `junit:junit`, fixed alongside the JUnit Platform
+launcher fix above), not a VM bug.
 
 ## 2026-07-03 http.client bug cluster (branch fix/http-client-cluster-azure)
 
