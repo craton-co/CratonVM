@@ -26,9 +26,54 @@ which still exercises the same `<clinit>` → `isPreviewEnabled()` native call):
   `UnsatisfiedLinkError: jdk/internal/misc/PreviewFeatures.isPreviewEnabled()Z`.
 - Post-fix binary: returns `false`, matching HotSpot, `main-vm run()` exits `Ok`.
 
-The full 1044-class Azure rerun with this fix has not been re-executed yet;
-that is the natural follow-up to close out the Keycloak Azure non-passed
-batch. Original report follows.
+## Full Azure rerun after fix
+
+Smoke run first, then full suite rerun, both on the Azure host
+`victor@20.84.156.31`.
+
+Smoke probe:
+
+- Worktree: `/home/victor/wt-keycloak-previewfeatures-suite-20260703-01`
+- Branch: `codex/keycloak-previewfeatures-suite-20260703-01`
+- Branch head: `d57bb9049`
+- Binary: `target/release/cratonvm-keycloak-previewfeatures-suite-20260703-01`
+- Probe: `PreviewFeaturesProbe.class.isUnnamedClass()` on JDK 21
+- HotSpot: `rc=0`, output `false`
+- CratonVM: `rc=0`, output `false`, `main-vm run()` exited normally
+
+Full rerun:
+
+- Run name: `craton-azure-nonpassed-dev-20260703-previewfeatures-fixed-01`
+- Mode: `others-jit`, `-Vm craton`, `-Jit on`
+- Class list: 1044 classes from the previous non-passed Keycloak batch
+- Results: `apps/keycloak-suite-runner/.suite/results/craton-azure-nonpassed-dev-20260703-previewfeatures-fixed-01/others-jit/results.tsv`
+- Summary: `apps/keycloak-suite-runner/.suite/results/craton-azure-nonpassed-dev-20260703-previewfeatures-fixed-01/others-jit/summary.md`
+- Wall seconds: `1526.233`
+
+Status count after the fix:
+
+| Status | Count |
+|---|---:|
+| CRASH | 941 |
+| FAIL | 66 |
+| EMPTY | 37 |
+
+The rerun has zero `PreviewFeatures.isPreviewEnabled` occurrences in
+`results.tsv` notes and zero occurrences in per-class stderr logs. The original
+1044/1044 launcher-wide native crash is fixed. The remaining rows are later
+post-fix residuals, tracked separately in `docs/known-issues`:
+
+| Residual signature | Count |
+|---|---:|
+| `java/lang/System$1.defineClass(...ProtectionDomain;String;)Class` `NoSuchMethodError` | 621 |
+| `LogBuildTimeConfig$$CMImpl` generated config class `no class def found` | 281 |
+| `cratonvm/synthetic/AnonymousObject$1.anyMatch(IntPredicate)Z` `NoSuchMethodError` | 64 |
+| `org/keycloak/testsuite/model/KeycloakModelTest` `no class def found` | 37 |
+| `TestConfig$$CMImpl` generated config class `no class def found` | 2 |
+| `java/lang/System$1.findBootstrapClassOrNull(String)Class` `NoSuchMethodError` | 2 |
+| Abstract/no-test rows recorded as `EMPTY` | 37 |
+
+Original report follows.
 
 ## Symptom
 

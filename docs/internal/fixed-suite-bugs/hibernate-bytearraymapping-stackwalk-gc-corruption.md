@@ -1,11 +1,10 @@
 # `ByteArrayMappingTests` SIGSEGV — log4j2 `getCallerClass` → `StackWalker.walk` GC corruption
 
 **Severity:** High (hard, uncatchable crash, `EXCEPTION_ACCESS_VIOLATION` / SIGSEGV, rc=139).
-**Status:** 🟠 PARTIALLY FIXED. The earlier "re-entrant non-termination" diagnosis (below, struck through)
-was **WRONG** — this is **GC memory corruption** during the `StackWalker` walk, not an infinite loop.
-A whole layer of GC-safety bugs in the synthetic stream / StackWalker natives is now fixed (minimal repros
-`DeepWalkGC.java` / `DeepWalkGC2.java` pass), but `ByteArrayMappingTests` itself still SIGSEGVs via a
-**distinct, deeper** residual (see "Corrected diagnosis" / "Residual").
+**Status:** FIXED on `codex/hib-bytearray-stackwalk-gc-20260703`. The earlier "re-entrant non-termination" diagnosis (below) was **WRONG**: this was GC memory corruption during the real-JDK `StackWalker` walk. The final residual was the lazy `StackFrameBuffer.fill` reflective-constructor path holding the `StackWalker` constructor argument only in native Rust locals across allocation/class-init GC.
+**Fix:** `NativeContextImpl::{new_object_initialized,new_object_initialized_with_class_id}` now pins object constructor arguments and re-reads them from `native_pin_roots` before dispatching `<init>`, so reflective constructors receive post-GC object references.
+**Validation (2026-07-04):** `ByteArrayMappingTests` solo, `--nojit --Xmx 1500m`, unique binary `cratonvm-hib-bytearray-stackwalk-gc-20260703.exe`: `@@RESULT 0 org.hibernate.orm.test.mapping.basic.ByteArrayMappingTests found=2 started=2 ok=2 failed=0 aborted=0 skipped=0`.
+**Note:** The validation still emits guarded `HIB-CV-32` corrupt-Value diagnostics during BLOB bind/extract logging; those degrade to null and are tracked separately in the archived HIB-CV-32 write-up, not this StackWalker crash.
 **Mode:** Interpreter (JIT-off, and JIT-on). **HotSpot (JDK 25):** PASS.
 
 ## Corrected diagnosis (2026-06-20 — supersedes the "re-entrant loop" section below)
@@ -61,21 +60,15 @@ public class DeepWalkGC {
 }
 ```
 
-## Residual (still 🔴 OPEN — distinct, deeper bug)
+## Fixed residual (2026-07-04)
 
-`ByteArrayMappingTests` STILL SIGSEGVs. Its walk uses the **real-JDK lazy drain** (`Stream.dropWhile` →
-`tryAdvance` → `StackFrameBuffer.fetchStackFrames()I` → `resize` → `fill`), not CV's eager spliterator path
-that the minimal repros exercise — so the stream-native fixes above don't cover it. The fault is
-`ValueStack::push` reading a wild address inside `StackFrameBuffer.fill`'s reflective `ctor.newInstance(walker)`
-loop. `CompactValue::from_value` does **not** dereference the value (it only stores the pointer), so the bad
-read is `self` = `thread.frames[frame_idx].stack` → **frame-index / value-stack corruption**, NOT a stale
-Java field value. Most likely an operand-stack-tag-loss / missed-root on the `fill` JDK frame during its
-allocating loop, or `thread.frames`/`frame_idx` mismanagement across the deep native↔interpreter re-entry
-(`native_call_stack_walk` → `ctx.invoke("doStackWalk")` → … → our `fetchStackFrames` native). Not reproduced
-by a minimal repro yet (needs the full Hibernate stack). Pre-existing — the pre-fix binary crashes identically.
+The remaining hard crash was in the real-JDK lazy drain path (`Stream.dropWhile` -> `tryAdvance` -> `StackFrameBuffer.fetchStackFrames()` -> `resize` -> `fill`). `StackFrameBuffer.fill` reflectively constructs `StackFrameInfo(StackWalker)`. `Constructor.newInstance(walker)` read `walker` from the native argument array, then passed it to `new_object_initialized_with_class_id` as an unrooted Rust-local `Value`.
+
+A moving young GC during object allocation or class initialization could relocate that `StackWalker` before the Java `<init>` frame copied the argument into scanned locals. The constructor then read a stale object reference, corrupting the value-stack/frame state and eventually crashing in the fill loop. The construction helpers now root object constructor arguments across allocation/class initialization and rebuild the `<init>` argument vector from remapped pin handles immediately before dispatch.
+
+Validated with the full Hibernate fixture: `ByteArrayMappingTests` now reports `found=2 started=2 ok=2 failed=0 aborted=0 skipped=0` and exits normally.
 
 ---
-
 ## (Superseded) original hypothesis — re-entrant non-termination
 
 ## What it actually is (confirmed via instrumentation — supersedes earlier hypotheses)

@@ -1041,6 +1041,36 @@ fn initialize_class_shared(
                 ) {
                     post_clinit_fixup(shared, class_id, &class_name_for_jfr);
                 }
+                // HIB-CV-27-linux-regression: `java/io/File.<clinit>` derives
+                // separatorChar/separator/pathSeparatorChar/pathSeparator from
+                // `DefaultFileSystem.getFileSystem()` (real `UnixFileSystem`/
+                // `WinNTFileSystem`), whose constructor reads
+                // `System.getProperties().getProperty("file.separator"/
+                // "path.separator")` off the REAL `Properties.map`
+                // (`ConcurrentHashMap`) field. The synthetic
+                // `System.getProperties()` singleton is allocated via
+                // `alloc_concurrent_synthetic` (no real constructor runs), so
+                // `map` is null — `UnixFileSystem`'s field reads NPE partway
+                // through, and per JVMS 5.5 a caught/swallowed `<clinit>`
+                // failure leaves whichever static fields were assigned BEFORE
+                // the throw (`separatorChar`/`separator`, set first) correct
+                // while the ones after (`pathSeparatorChar`/`pathSeparator`)
+                // stay at their zero-init default (`'\0'`/`""`). That silently
+                // broke every real-bytecode consumer of `File.pathSeparator`
+                // (e.g. `com.sun.tools.javac.file.Locations`'s default
+                // `-classpath` decoding), which read an empty separator and
+                // treated the whole `java.class.path` string as one jar path —
+                // reproducing the exact "package X does not exist" symptom
+                // HIB-CV-27 already fixed once, via a different `<clinit>`-order
+                // (not encoding) mechanism. Backfill deterministically instead
+                // of chasing the Properties bootstrap gap — these four fields
+                // are pure platform constants, so an unconditional overwrite is
+                // always correct (unlike the BigInteger/PosixFilePermission
+                // arms, which patch in place because those constants are
+                // themselves real heap objects the JDK allocates).
+                if matches!(&*class_name_for_jfr, "java/io/File") {
+                    post_clinit_fixup(shared, class_id, &class_name_for_jfr);
+                }
                 // FFM/Unsafe fix: `jdk/internal/misc/UnsafeConstants.<clinit>`
                 // zero-inits ADDRESS_SIZE0/PAGE_SIZE/BIG_ENDIAN/UNALIGNED_ACCESS/
                 // DATA_CACHE_LINE_FLUSH_SIZE and relies on the JVM to overwrite
@@ -2009,6 +2039,29 @@ fn post_clinit_fixup(shared: &SharedVm, class_id: ClassId, class_name: &str) {
             n += set_static_by_name("UNALIGNED_ACCESS", Value::Int(1)) as i32;
             n += set_static_by_name("DATA_CACHE_LINE_FLUSH_SIZE", Value::Int(0)) as i32;
             tracing::warn!("Post-clinit fixup: UnsafeConstants populated ({n}/5)");
+        }
+        "java/io/File" => {
+            // See the success-path call site (`init_class`) for the full
+            // root-cause writeup: `UnixFileSystem`'s constructor reads
+            // `System.getProperties()`'s real `map` (`ConcurrentHashMap`)
+            // field, which is null on the synthetic system-properties
+            // singleton, so the read partway through `<clinit>` NPEs and
+            // gets swallowed — leaving whichever of the four static fields
+            // were assigned before the throw correct and the rest at their
+            // zero-init default. Backfill deterministically; these are pure
+            // platform constants (same value every time), so an
+            // unconditional overwrite is always correct.
+            let sep_char = std::path::MAIN_SEPARATOR;
+            let path_sep_char = if cfg!(windows) { ';' } else { ':' };
+            let sep_str = super::vm_object::create_java_string(shared, &sep_char.to_string());
+            let path_sep_str =
+                super::vm_object::create_java_string(shared, &path_sep_char.to_string());
+            let mut n = 0;
+            n += set_static_by_name("separatorChar", Value::Int(sep_char as i32)) as i32;
+            n += set_static_by_name("separator", Value::Object(Some(sep_str))) as i32;
+            n += set_static_by_name("pathSeparatorChar", Value::Int(path_sep_char as i32)) as i32;
+            n += set_static_by_name("pathSeparator", Value::Object(Some(path_sep_str))) as i32;
+            tracing::warn!("Post-clinit fixup: File separator/pathSeparator populated ({n}/4)");
         }
         // (Removed) "org/jboss/modules/Module" arm.
         //
