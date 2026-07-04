@@ -28,8 +28,8 @@ HIB-CV-38 fix (`docs/internal/hibernate-bugs/HIB-CV-38-boolean-type-field-static
 
 - **0/3 reruns SIGSEGV'd.** All three (JIT on default heap; JIT on with
   `CRATONVM_JIT_DISABLE_INLINE_NEW=1`; JIT on with `-Xmx 6000m`) instead
-  deterministically reproduced the separate, already-tracked, still-**open**
-  `docs/known-issues/jit-inline-alloc-array-header-corruption-hibernate-batch.md`
+  deterministically reproduced the separate, already-tracked, then-**open**
+  `docs/internal/fixed-suite-bugs/jit-inline-alloc-array-header-corruption-hibernate-batch.md`
   bug (the "inconsistent header — kind=Object but array_length=N" GC
   corruption warning storm, terminating in an `OutOfMemoryError` at default
   heap, or a slower failure at a larger heap).
@@ -53,9 +53,9 @@ separately-tracked, already-open** bug, not a new one.
 
 This doc is archived rather than kept open because its own question — "is
 this a regression/reopening of HIB-CV-37, or something new" — is answered
-(no to both). The residual failure mode it happened to observe continues to
-be tracked at
-`docs/known-issues/jit-inline-alloc-array-header-corruption-hibernate-batch.md`,
+(no to both). The residual failure mode it happened to observe has since been
+fixed and archived at
+`docs/internal/fixed-suite-bugs/jit-inline-alloc-array-header-corruption-hibernate-batch.md`,
 which was updated with this session's truth-table evidence (ruling out the
 plain-`new` JIT inline-TLAB path and confirming arrays never had an inline
 path to begin with).
