@@ -2837,18 +2837,41 @@ fn native_bais_read_byte_array(ctx: &mut dyn NativeContext, args: &[Value]) -> M
         _ => return Ok(Some(Value::Int(-1))),
     };
     let buf_len = ctx.array_length(buf) as i32;
-    // Delegate to the (off=0, len=b.length) three-arg form. This
-    // dispatches to the BAIS-specific `read([BII)I` native and so
-    // honours the `-1`-at-EOF contract for the synthetic streams
-    // produced by `URL.openStream` / `Class.getResourceAsStream`.
-    native_bais_read_bytes(
-        ctx,
-        &[
-            Value::Object(Some(this)),
-            Value::Object(Some(buf)),
-            Value::Int(0),
-            Value::Int(buf_len),
-        ],
+    // Delegate to the (off=0, len=b.length) three-arg form via a REAL
+    // virtual dispatch (`ctx.invoke_virtual`), not a direct Rust call to
+    // `native_bais_read_bytes`. The JDK contract for `read(byte[])` is
+    // exactly `return read(b, 0, b.length)` — a polymorphic call — so a
+    // receiver that overrides the three-arg form (any real, foreign
+    // InputStream subclass that doesn't override the one-arg form, e.g.
+    // Jetty's `InputStreamResponseListener$Input`, which overrides
+    // `read(byte[],int,int)` but not `read(byte[])`) must reach ITS OWN
+    // override, not our synthetic-BAIS fallback.
+    //
+    // The previous direct-call version bypassed dispatch entirely, so it
+    // always ran `native_bais_read_bytes`'s "not BAIS" fallback (loop
+    // calling `read()` once per byte) instead of the receiver's real
+    // three-arg logic. For `Input`, whose own `read()` (no-arg, real
+    // bytecode) itself calls `read(byte[1])` — routing back through THIS
+    // native — that fallback loop's `read()` call closed a cycle:
+    // read() -> read([B)I [this native] -> loop calling read() -> read()
+    // again -> ... with no bound, blowing the stack (observed:
+    // `StackOverflowError` at `InputStreamResponseListener$Input.read`,
+    // hundreds of identical frames). `ctx.invoke_virtual` for the 3-arg
+    // form now reaches `Input`'s real lock/queue-based implementation
+    // directly, which terminates normally. VERIFIED on Windows/JDK25:
+    // JettyClientHttpRequestFactoryTests went from 5/6 to 6/6 (fully OK,
+    // matching HotSpot).
+    //
+    // For a genuine synthetic BAIS-like receiver (no own override of the
+    // three-arg form), virtual dispatch still resolves to
+    // `native_bais_read_bytes` (registered on `java/io/InputStream`),
+    // reaching the exact same code as before — the KC26/SmallRye
+    // `LineReader` EOF contract this was written for is unaffected.
+    ctx.invoke_virtual(
+        this,
+        "read",
+        "([BII)I",
+        &[Value::Object(Some(buf)), Value::Int(0), Value::Int(buf_len)],
     )
 }
 
