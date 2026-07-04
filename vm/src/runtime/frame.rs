@@ -1062,25 +1062,47 @@ impl Frame {
     /// ints, `f64::to_bits()` for doubles), reconstructed from the inline
     /// CompactValue. The JIT ABI expects this exact representation.
     ///
+    /// Honors the `local_kinds` mark first, exactly like `locals_snapshot`:
+    /// a long/double whose bits collide with the NaN-tag space (e.g. into the
+    /// `SUB_OBJECT` sub-tag) would otherwise be misread by
+    /// `compact_to_local_slot` as an object slot, truncating the value to its
+    /// low 47 bits. `try_osr`'s per-local `jit_locals` snapshot is this
+    /// method's only production caller, so this was a real, unguarded
+    /// OSR-entry-state-reconstruction corruption path: a collision long got
+    /// silently handed to the OSR-compiled frame as a fabricated, truncated
+    /// "pointer" instead of its true bit-exact value.
+    ///
     /// # Panics
     /// Panics if `index` is out of bounds.
     #[inline(always)]
     pub fn get_local_raw(&self, index: usize) -> u64 {
-        let (v, _t) = compact_to_local_slot(self.locals[index]);
-        v
+        match self.local_kinds[index] {
+            LKIND_LONG | LKIND_DOUBLE => self.locals[index].raw_bits(),
+            _ => {
+                let (v, _t) = compact_to_local_slot(self.locals[index]);
+                v
+            }
+        }
     }
 
     /// Get the legacy VTAG byte of a local (for JIT/OSR interop).
     ///
     /// Derived from the inline CompactValue tag — the parallel `local_tags`
-    /// Vec no longer exists.
+    /// Vec no longer exists. Honors the `local_kinds` mark first; see
+    /// [`get_local_raw`](Self::get_local_raw) for why this matters.
     ///
     /// # Panics
     /// Panics if `index` is out of bounds.
     #[inline(always)]
     pub fn get_local_tag(&self, index: usize) -> u8 {
-        let (_v, t) = compact_to_local_slot(self.locals[index]);
-        t
+        match self.local_kinds[index] {
+            LKIND_LONG => VTAG_LONG,
+            LKIND_DOUBLE => VTAG_DOUBLE,
+            _ => {
+                let (_v, t) = compact_to_local_slot(self.locals[index]);
+                t
+            }
+        }
     }
 
     /// Get a local as a `CompactValue` without the `Value` enum round-trip
@@ -1683,6 +1705,51 @@ mod tests {
 
         assert_eq!(frame.get_local_raw(0), 42);
         assert_eq!(frame.get_local_raw(1) as i64, 100);
+    }
+
+    /// REGRESSION (OSR entry-state reconstruction / `CRATONVM_JIT_OSR`): a
+    /// primitive `long` whose NaN-boxed bits collide with the `SUB_OBJECT`
+    /// sub-tag must still round-trip through `get_local_raw`/`get_local_tag`
+    /// bit-exact as `VTAG_LONG`. `try_osr` is this pair's only production
+    /// caller (building the `jit_locals` snapshot handed to `osr_enter`); before
+    /// the `local_kinds` gate, `compact_to_local_slot` classified such a slot
+    /// as `VTAG_OBJECT` purely from `CompactValue::tag()` and returned only its
+    /// low 47-bit payload — silently truncating the long's true value into a
+    /// fabricated "pointer" at OSR entry, mirroring the exact hazard
+    /// `scan_local_objects_skips_collision_long_aliasing_live_object` and
+    /// `locals_snapshot`'s `local_kinds` gate already guard against elsewhere.
+    #[test]
+    fn get_local_raw_preserves_collision_long_as_long_not_truncated_object() {
+        let mut frame = Frame::new(
+            ClassId::new(0),
+            "T".to_string(),
+            "m".to_string(),
+            "()V".to_string(),
+            None,
+            vec![0xb1],
+            vec![],
+            10,
+            2,
+            &[],
+        );
+        // Bit-identical to a genuine `CompactValue::object(addr)` for some
+        // plausible-looking, 8-byte-aligned, above-guard-page address — but
+        // stored as a `long`, so `local_kinds[0]` is `LKIND_LONG`.
+        let addr = 0x20000000000u64;
+        assert_eq!(addr & 0x7, 0);
+        assert!(addr < (1 << 47));
+        let collision_bits = CompactValue::object(addr).raw_bits();
+        frame.set_local_unchecked(0, Value::Long(collision_bits as i64));
+
+        // Sanity: the underlying CompactValue really is tag-ambiguous.
+        assert!(frame.get_local_compact(0).is_object());
+
+        assert_eq!(
+            frame.get_local_raw(0),
+            collision_bits,
+            "get_local_raw must return the bit-exact long, not the masked 47-bit payload"
+        );
+        assert_eq!(frame.get_local_tag(0), VTAG_LONG);
     }
 
     /// A `VTAG_LONG` local whose bits happen to look like an aligned object
