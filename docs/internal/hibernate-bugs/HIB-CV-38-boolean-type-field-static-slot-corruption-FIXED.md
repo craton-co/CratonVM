@@ -124,5 +124,6 @@ in `docs/internal/app-jvm-bugs/jit-bintrees18-inline-alloc-and-bc-ec-round2.md`
 present on this dev tree and bt18 itself is correct/checksummed, so this is a
 **different, not-yet-covered trigger** of the same corruption family, surfaced
 by Hibernate's heavier/mixed allocation mix rather than bintrees' uniform
-2-field `Node` allocation. Tracked as a fresh, narrow open issue:
-`docs/known-issues/jit-inline-alloc-array-header-corruption-hibernate-batch.md`.
+2-field `Node` allocation. Tracked as a fresh, narrow issue that has since
+been fixed and archived:
+`docs/internal/fixed-suite-bugs/jit-inline-alloc-array-header-corruption-hibernate-batch.md`.
