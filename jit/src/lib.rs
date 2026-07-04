@@ -4813,6 +4813,18 @@ pub fn try_compile(
     // FP-opcode method is admitted, so the builder never sees an FP opcode. Gated
     // default-OFF behind `CRATONVM_JIT_IR_FP` at the VM call sites until it soaks.
     ir_emit_fp: bool,
+    // invokedynamic-uncommon-trap fix: resolves an `invokedynamic` (0xba)
+    // CP index to just its target descriptor string (e.g. via
+    // `NameAndType.descriptor` — no bootstrap/`CallSite` resolution needed).
+    // `jit_scan` is CP-blind and no longer bails on 0xba (it just records the
+    // site); this resolver lets the single-pass backend compute the site's
+    // stack effect (arg count via `count_param_slots`, return type via
+    // `return_type`) so it can lower the instruction to an unconditional jump
+    // to the existing uncommon-trap deopt stub (`DeoptReason::UnreachedCode`)
+    // while keeping the compiler's simulated operand stack consistent for
+    // whatever bytecode follows. `None` (resolver absent, or it returns `None`
+    // for a given site) bails the whole compile — see `try_compile_inner`.
+    cp_invokedynamic_descriptor_resolver: Option<&dyn Fn(u16) -> Option<String>>,
 ) -> Option<CompiledMethod> {
     // round-7 fix (bug 1): short-circuit re-attempts on methods the
     // backend already permanently bailed on.  Avoids ~50µs of wasted
@@ -4883,6 +4895,7 @@ pub fn try_compile(
         ir_emit_long,
         ir_emit_virtual_calls,
         ir_emit_fp,
+        cp_invokedynamic_descriptor_resolver,
         &mut backend_attempted,
     );
 
@@ -5027,6 +5040,9 @@ fn try_compile_inner(
     // inc 30: admit a float/double-using method to the IR path (XMM value
     // tier). See `try_compile`. Default-OFF at the VM call sites.
     ir_emit_fp: bool,
+    // invokedynamic-uncommon-trap fix: resolves an invokedynamic CP index to
+    // its target descriptor. See `try_compile`.
+    cp_invokedynamic_descriptor_resolver: Option<&dyn Fn(u16) -> Option<String>>,
     // round-7 fix (bug 1): set to `true` immediately before invoking
     // the heavy `x64::compile` path so the outer wrapper can tell a
     // permanent backend bail (worth bail-listing) from an early
@@ -6111,6 +6127,25 @@ fn try_compile_inner(
         }
     }
 
+    // invokedynamic-uncommon-trap fix: resolve each `indy_ops` site's target
+    // descriptor to the minimal stack-effect info the codegen needs (arg slot
+    // count + return type tag) — see the `indy_info` field doc on the x64
+    // `Compiler` struct. Mirrors the `field_info`/`invoke_info` resolution
+    // blocks above: a `None` from the resolver (absent, or the site can't be
+    // resolved) bails the WHOLE compile via `?`, exactly like every other
+    // CP-resolved metadata table here — the codegen must never guess an
+    // invokedynamic's stack effect.
+    let mut indy_info: Vec<(usize, usize, u8)> = Vec::new();
+    if !scan.indy_ops.is_empty() {
+        let resolver = cp_invokedynamic_descriptor_resolver?;
+        for &(pc, cp_idx) in &scan.indy_ops {
+            let descriptor = resolver(cp_idx)?;
+            let arg_slots = count_param_slots(&descriptor);
+            let ret_type = return_type(&descriptor);
+            indy_info.push((pc, arg_slots, ret_type));
+        }
+    }
+
     // Prologue argument-slot count — includes the implicit `this` for
     // instance methods (see `prologue_param_slots` above).
     let param_slots = prologue_param_slots;
@@ -6220,6 +6255,7 @@ fn try_compile_inner(
         param_oop_mask,
         compact_field_info,
         &despec_method_key,
+        indy_info,
     )?;
 
     compiled._jit_strings = owned_strings;
@@ -7103,6 +7139,7 @@ mod tests {
         let c2 = try_compile(
             &cached, None, None, None, None, None, None, None, None, None, &helpers, None, None,
             None, None, true, false, false, false, false, false,
+        None, // cp_invokedynamic_descriptor_resolver: no indy in these test methods
         );
         let c2_used_ir = IR_LOWER_COMPILES.with(|c| c.get());
         assert!(c2.is_some(), "optimize=true (C2) must compile `add`");
@@ -7116,6 +7153,7 @@ mod tests {
         let c1 = try_compile(
             &cached, None, None, None, None, None, None, None, None, None, &helpers, None, None,
             None, None, false, false, false, false, false, false,
+        None, // cp_invokedynamic_descriptor_resolver: no indy in these test methods
         );
         let c1_used_ir = IR_LOWER_COMPILES.with(|c| c.get());
         assert!(
@@ -7202,6 +7240,7 @@ mod tests {
             false,
             false,
             false,
+        None, // cp_invokedynamic_descriptor_resolver: no indy in these test methods
         );
         assert!(c2.is_some(), "optimize=true (C2) must compile `get`");
         assert_eq!(
@@ -7218,6 +7257,7 @@ mod tests {
         let _ = try_compile(
             &cached, None, None, None, None, None, None, None, None, None, &helpers, None, None,
             None, None, true, false, false, false, false, false,
+        None, // cp_invokedynamic_descriptor_resolver: no indy in these test methods
         );
         assert_eq!(
             IR_LOWER_COMPILES.with(|c| c.get()),
@@ -7645,6 +7685,7 @@ mod tests {
             false,
             false,
             false,
+        None, // cp_invokedynamic_descriptor_resolver: no indy in these test methods
         );
         assert!(r.is_some(), "an elidable `new` method must compile via IR");
         assert_eq!(
@@ -7677,6 +7718,7 @@ mod tests {
             false,
             false,
             false,
+        None, // cp_invokedynamic_descriptor_resolver: no indy in these test methods
         );
         assert_eq!(
             IR_LOWER_COMPILES.with(|c| c.get()),
@@ -7749,6 +7791,7 @@ mod tests {
             false, // ir_emit_long
             false, // ir_emit_virtual_calls
             false, // ir_emit_fp
+        None, // cp_invokedynamic_descriptor_resolver: no indy in these test methods
         );
         assert!(
             with.is_some(),
@@ -7788,6 +7831,7 @@ mod tests {
             false, // ir_emit_long OFF
             false, // ir_emit_virtual_calls OFF
             false, // ir_emit_fp OFF
+        None, // cp_invokedynamic_descriptor_resolver: no indy in these test methods
         );
         assert_eq!(
             IR_LOWER_COMPILES.with(|c| c.get()),
@@ -7861,6 +7905,7 @@ mod tests {
             false, // ir_emit_long
             false, // ir_emit_virtual_calls OFF
             false, // ir_emit_fp OFF
+        None, // cp_invokedynamic_descriptor_resolver: no indy in these test methods
         );
         assert!(
             with.is_some(),
@@ -7902,6 +7947,7 @@ mod tests {
             false, // ir_emit_long OFF
             false, // ir_emit_virtual_calls OFF
             false, // ir_emit_fp OFF
+        None, // cp_invokedynamic_descriptor_resolver: no indy in these test methods
         );
         assert_eq!(
             IR_LOWER_COMPILES.with(|c| c.get()),
@@ -7945,6 +7991,7 @@ mod tests {
         let with = try_compile(
             &cached, None, None, None, None, None, None, None, None, None, &helpers, None, None,
             None, None, true, false, false, true, false, false,
+        None, // cp_invokedynamic_descriptor_resolver: no indy in these test methods
         );
         assert!(with.is_some(), "long method must compile with ir_emit_long");
         assert_eq!(
@@ -7958,6 +8005,7 @@ mod tests {
         let _without = try_compile(
             &cached, None, None, None, None, None, None, None, None, None, &helpers, None, None,
             None, None, true, false, false, false, false, false,
+        None, // cp_invokedynamic_descriptor_resolver: no indy in these test methods
         );
         assert_eq!(
             IR_LOWER_COMPILES.with(|c| c.get()),
@@ -8000,6 +8048,7 @@ mod tests {
         let with = try_compile(
             &cached, None, None, None, None, None, None, None, None, None, &helpers, None, None,
             None, None, true, false, false, false, false, true,
+        None, // cp_invokedynamic_descriptor_resolver: no indy in these test methods
         );
         assert!(with.is_some(), "FP method must compile with ir_emit_fp");
         assert_eq!(
@@ -8013,6 +8062,7 @@ mod tests {
         let _without = try_compile(
             &cached, None, None, None, None, None, None, None, None, None, &helpers, None, None,
             None, None, true, false, false, false, false, false,
+        None, // cp_invokedynamic_descriptor_resolver: no indy in these test methods
         );
         assert_eq!(
             IR_LOWER_COMPILES.with(|c| c.get()),
@@ -8085,6 +8135,7 @@ mod tests {
             false, // ir_emit_long
             true,  // ir_emit_virtual_calls ON
             false, // ir_emit_fp OFF
+        None, // cp_invokedynamic_descriptor_resolver: no indy in these test methods
         );
         assert!(
             with.is_some(),
@@ -8126,6 +8177,7 @@ mod tests {
             false, // ir_emit_long
             false, // ir_emit_virtual_calls OFF
             false, // ir_emit_fp OFF
+        None, // cp_invokedynamic_descriptor_resolver: no indy in these test methods
         );
         assert_eq!(
             IR_LOWER_COMPILES.with(|c| c.get()),
@@ -9143,6 +9195,7 @@ mod tests {
                     false,
                     false,
                     false,
+                None, // cp_invokedynamic_descriptor_resolver: no indy in these test methods
                 )?;
                 assert_eq!(
                     compiled_b._jit_invoke_infos.len(),
@@ -9175,6 +9228,7 @@ mod tests {
             false,
             false,
             false,
+        None, // cp_invokedynamic_descriptor_resolver: no indy in these test methods
         )
         .expect("A should compile");
 
@@ -9633,19 +9687,49 @@ mod tests {
         prefix
     }
 
-    /// RG.1 — A method containing `invokedynamic` (0xba) must not be JIT'd
-    /// so the interpreter's real invokedynamic dispatch (makeConcat, lambda
-    /// bootstraps) runs. Bailing to the interpreter is the correctness
-    /// guarantee — RG.1's "JIT output matches interpreter byte-for-byte"
-    /// trivially holds if JIT refuses to compile the method.
+    /// RG.1 — A method containing `invokedynamic` (0xba) no longer vetoes
+    /// JIT compilation at the scan stage.
+    ///
+    /// Previously ANY invokedynamic anywhere in a method's bytecode —
+    /// reachable or not — permanently blacklisted the WHOLE method from JIT
+    /// compilation. The overwhelmingly common source of a "surprise"
+    /// invokedynamic in otherwise-ordinary hot methods is
+    /// `assert cond : "msg" + var;` (javac lowers the message concat via
+    /// `StringConcatFactory`, guarded by the `assertionsDisabled` dead
+    /// branch), so this blanket veto forced hot per-call-site methods that
+    /// merely CONTAIN a dead assert into the interpreter forever (see
+    /// `docs/internal/...binary-docvalues-range-hang...md` for the concrete
+    /// Lucene `FSTCompiler`/`NodeHash` repro).
+    ///
+    /// The new design: the scanner accepts 0xba and simply records the site
+    /// (`indy_ops`); the codegen (which DOES have CP access, unlike this
+    /// scan) lowers the instruction to an UNCONDITIONAL jump to the existing
+    /// uncommon-trap deopt stub (`DeoptReason::UnreachedCode`). If this exact
+    /// program point is ever actually reached at runtime (assertions
+    /// enabled, or a genuinely live indy), the method permanently reverts to
+    /// interpreter-only execution for the rest of the process — i.e. today's
+    /// status quo for that one method — so the interpreter's real
+    /// invokedynamic dispatch (makeConcat, lambda bootstraps) still runs
+    /// whenever the instruction is genuinely exercised. In the common case
+    /// (assertions disabled, dead branch) the trap is never taken and the
+    /// surrounding hot method compiles and runs at full JIT speed.
     #[test]
-    fn rg1_jit_rejects_invokedynamic() {
+    fn rg1_jit_accepts_invokedynamic_at_scan_stage() {
         let code = ireturn_tail(vec![
             0xba, 0x00, 0x01, 0x00, 0x00, // invokedynamic #1, 0, 0
         ]);
         assert!(
-            !is_jit_compatible(&code, code.len(), "()I"),
-            "JIT must bail on invokedynamic so interpreter handles the bootstrap"
+            is_jit_compatible(&code, code.len(), "()I"),
+            "the scanner must no longer bail on invokedynamic — it defers to \
+             an unconditional uncommon-trap deopt in the codegen instead"
+        );
+        // The scan also records the site so the codegen can resolve its
+        // descriptor and lower it to the deopt stub.
+        let scan = x64::jit_scan(&code, code.len(), "()I").expect("scan must succeed");
+        assert_eq!(
+            scan.indy_ops,
+            vec![(0, 1u16)],
+            "invokedynamic site (pc, cp_index) must be recorded for codegen resolution"
         );
     }
 
