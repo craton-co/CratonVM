@@ -418,17 +418,17 @@ fn should_skip_jit_internal(
     }
 
     // T1.1.g — the historical blanket bans for `java/util/*` and
-    // `cratonvm/*` have been narrowed to targeted per-method
-    // exclusions covering only the specific reproducible miscompiles
-    // that NEW-1.3/1.4 have not yet closed. Every other method in
-    // those packages is now JIT-eligible under both policies, which
-    // closes the T1.1.g "delete blanket bans" roadmap item while
-    // preserving correctness for the known-failing cases.
+    // `cratonvm/*` were narrowed to targeted per-method exclusions.
+    // Those targeted exclusions guarded the callee-saved-GPR local-home
+    // regalloc family. The x64 backend now keeps those GPR local homes
+    // default-off, so the methods are JIT-eligible again on the safe
+    // path. If a developer opts back into the old register homes for
+    // diagnosis, keep the targeted list active.
     //
-    // The conservative policy still applies the targeted list; the
-    // aggressive policy (set via `jit_aggressive_compilation` or
-    // `CRATONVM_JIT_ALLOW_PACKAGES`) lifts even the targeted list so
-    // developers can surface new miscompiles.
+    // The conservative policy applies the targeted list only when the legacy
+    // GPR local-home allocator is explicitly enabled. The aggressive policy
+    // (set via `jit_aggressive_compilation` or `CRATONVM_JIT_ALLOW_PACKAGES`)
+    // still lifts the targeted list so developers can surface new miscompiles.
     // DBG bypass: force-compile JUnitCore.main despite the JUNIT.1 stopgap ban,
     // so its emitted code can be dumped/diagnosed. Default-off; the ban holds in
     // normal runs.
@@ -440,7 +440,8 @@ fn should_skip_jit_internal(
     }
 
     if policy == SkipPolicy::Conservative {
-        if is_known_miscompile(class_name, method_name)
+        if callee_saved_gpr_local_homes_enabled()
+            && is_known_miscompile(class_name, method_name)
             && !package_allowed(class_name, allow_packages)
         {
             return Some(if class_name.starts_with("java/util/") {
@@ -2091,6 +2092,18 @@ fn is_antlr_prediction_context_miscompile(class_name: &str, method_name: &str) -
     )
 }
 
+fn callee_saved_gpr_local_homes_enabled() -> bool {
+    std::env::var("CRATONVM_JIT_ENABLE_CALLEE_SAVED_GPR_LOCALS")
+        .ok()
+        .map(|v| {
+            matches!(
+                v.trim().to_ascii_lowercase().as_str(),
+                "1" | "true" | "on" | "yes"
+            )
+        })
+        .unwrap_or(false)
+}
+
 /// True if `prefix` matches any entry in `allow_packages`. An entry matches if
 /// `prefix` starts with the entry, so `CRATONVM_JIT_ALLOW_PACKAGES=java/util`
 /// lifts the `java/util/` ban.
@@ -2189,8 +2202,11 @@ mod tests {
     }
 
     #[test]
-    fn java_util_targeted_methods_only_skipped_under_conservative() {
-        // T1.1.g — HashMap.put is on the targeted list (NEW-1.3).
+    fn java_util_regalloc_family_lifted_under_safe_default() {
+        // The targeted table still records the historical NEW-1.3 member, but
+        // x64 no longer uses callee-saved GPR local homes by default, so the
+        // method is eligible even under Conservative policy.
+        assert!(is_known_miscompile("java/util/HashMap", "put"));
         assert_eq!(
             check(
                 "java/util/HashMap",
@@ -2199,9 +2215,8 @@ mod tests {
                 true,
                 SkipPolicy::Conservative
             ),
-            Some(SkipReason::JavaUtilCollection)
+            None
         );
-        // Aggressive still lifts it.
         assert_eq!(
             check(
                 "java/util/HashMap",
@@ -2215,12 +2230,14 @@ mod tests {
     }
 
     #[test]
-    fn aqs_condition_wait_variants_skipped_under_conservative() {
-        // Tomcat DoHead shutdown parks ScheduledThreadPoolExecutor workers in
-        // ConditionObject.awaitNanos. Keep every wait variant interpreted under
-        // the normal policy so parked-frame GC snapshots do not miss a
-        // register-resident ConditionNode.
+    fn aqs_condition_wait_variants_lifted_under_safe_default() {
+        // These remain in the historical targeted table for opt-in regalloc
+        // diagnosis, but the safe default has no register-resident GPR locals.
         for method in ["await", "awaitNanos", "awaitUntil", "awaitUninterruptibly"] {
+            assert!(is_known_miscompile(
+                "java/util/concurrent/locks/AbstractQueuedSynchronizer$ConditionObject",
+                method
+            ));
             assert_eq!(
                 check(
                     "java/util/concurrent/locks/AbstractQueuedSynchronizer$ConditionObject",
@@ -2229,8 +2246,8 @@ mod tests {
                     true,
                     SkipPolicy::Conservative,
                 ),
-                Some(SkipReason::JavaUtilCollection),
-                "AQS ConditionObject.{method} must be JIT-skipped under Conservative"
+                None,
+                "AQS ConditionObject.{method} must be JIT-eligible under the safe default"
             );
             assert_eq!(
                 check(
@@ -2241,18 +2258,15 @@ mod tests {
                     SkipPolicy::Aggressive,
                 ),
                 None,
-                "Aggressive policy still deliberately lifts targeted java/util bans"
+                "Aggressive policy remains JIT-eligible"
             );
         }
     }
 
     #[test]
-    fn weakhashmap_spliterator_walk_skipped_under_conservative() {
-        // ES-HANG-01 — WeakHashMap$*Spliterator.{tryAdvance,forEachRemaining}
-        // JIT-miscompile (infinite loop) is on the targeted list. The confirmed
-        // culprit is ValueSpliterator.tryAdvance; the Key/Entry siblings and
-        // forEachRemaining share identical table-walk bytecode and are banned
-        // together.
+    fn weakhashmap_spliterator_walk_lifted_under_safe_default() {
+        // ES-HANG-01 remains recorded in the targeted table, but the callee-
+        // saved GPR local-home path that required the ban is default-off.
         for (cls, m) in [
             ("java/util/WeakHashMap$KeySpliterator", "tryAdvance"),
             ("java/util/WeakHashMap$KeySpliterator", "forEachRemaining"),
@@ -2261,16 +2275,16 @@ mod tests {
             ("java/util/WeakHashMap$EntrySpliterator", "tryAdvance"),
             ("java/util/WeakHashMap$EntrySpliterator", "forEachRemaining"),
         ] {
+            assert!(is_known_miscompile(cls, m));
             assert_eq!(
                 check(cls, m, false, true, SkipPolicy::Conservative),
-                Some(SkipReason::JavaUtilCollection),
-                "{cls}.{m} must be JIT-skipped under Conservative (ES-HANG-01)"
+                None,
+                "{cls}.{m} must be JIT-eligible under the safe default"
             );
-            // Aggressive lifts the targeted ban (developers surfacing new miscompiles).
             assert_eq!(
                 check(cls, m, false, true, SkipPolicy::Aggressive),
                 None,
-                "{cls}.{m} must be JIT-eligible under Aggressive"
+                "{cls}.{m} must remain JIT-eligible under Aggressive"
             );
         }
         // A non-walk WeakHashMap method stays JIT-eligible.
@@ -2463,11 +2477,12 @@ mod tests {
     }
 
     #[test]
-    fn keycloak_credential_lazy_init_getters_are_interpreted() {
+    fn keycloak_credential_lazy_init_getters_lifted_under_safe_default() {
         for cls in [
             "org/keycloak/models/credential/dto/PasswordCredentialData",
             "org/keycloak/models/credential/dto/PasswordSecretData",
         ] {
+            assert!(is_known_miscompile(cls, "getAdditionalParameters"));
             assert_eq!(
                 check(
                     cls,
@@ -2476,8 +2491,8 @@ mod tests {
                     true,
                     SkipPolicy::Conservative
                 ),
-                Some(SkipReason::RustJvmTestFixture),
-                "{cls}.getAdditionalParameters must stay interpreted under Conservative"
+                None,
+                "{cls}.getAdditionalParameters must be JIT-eligible under the safe default"
             );
             assert_eq!(
                 check(

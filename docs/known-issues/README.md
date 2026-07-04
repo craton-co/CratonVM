@@ -156,14 +156,12 @@ deep-recursion item remains — see below).
   the per-class file is now a redirect stub.
 - (2026-06-17) The two Fork6 precise-maps files were already merged into `fork6-fjp-multithread-jit-root-reclamation.md`.
 
-There is also a **second umbrella family** distinct from the GC-root one:
-[**JIT regalloc callee-saved-register clobber**](jit-regalloc-callee-saved-clobber-family.md)
-— the single root cause behind the ~30+ targeted JIT method bans in
-`vm/src/jit/skip_list.rs` (HashMap/WeakHashMap/`Integer.valueOf`/`String.toLowerCase`/j.u.c./
-BouncyCastle/Spring-boot/ByteBuddy/kafka-bug-C). Manifests as either `rc=139` corruption or
-`rc=124` hangs, always JIT-only. Individual members are lifted as fixed; the general fix is the
-deferred precise-JIT-maps / regalloc project. **Do not conflate it with Family A** — that one is
-about root-*scanning* completeness, this one about register *clobber*.
+The former **JIT regalloc callee-saved-register clobber** umbrella family is
+resolved on dev (2026-07-04) by making callee-saved GPR local homes opt-in only;
+the archived write-up is
+[`docs/internal/jit-regalloc-callee-saved-clobber-family.md`](../internal/jit-regalloc-callee-saved-clobber-family.md).
+Do not conflate that historical register-*clobber* family with Family A below,
+which is about root-*scanning* completeness.
 
 ---
 
@@ -339,7 +337,7 @@ and already-consolidated ones (fam5/6) were left in place.
 | JUnit-platform execution `LoadError` | VM-CORRECTNESS / dispatch | 🔴 **OPEN** — JUnit platform internals; Family-A GC-root race (NOT related to the now-fixed bug-04, which was a non-`Comparable` compare exception-type bug, not a GC race) | [spring-bug-10-junit-platform-execution-loaderr.md](../internal/spring-bug-10-junit-platform-execution-loaderr.md) |
 | Groovy / scheduler crashes (rc=139) | VM-CRASH | 🟡 **PARTIAL** — Groovy SIGSEGV fixed via the bug-12 HashMap-layout fix; residual = a separate Groovy **hang at BEGIN** (inventory, needs per-cluster trace) | [spring-bug-11-groovy-and-scheduler-crashes.md](../internal/spring-bug-11-groovy-and-scheduler-crashes.md) |
 | Mockito `mockStatic` + mock dispatch | VM-CORRECTNESS (Mockito dispatch) | ✅ **FIXED on `dev`** — the dispatch/shadowing half landed earlier, and the stale JIT call-site residual was fixed by redefine-time compiled dispatch quiescing. | [fixed residual](../internal/fixed-suite-bugs/kafka-bug-B-mockstatic-capturing-lambda-jit.md) |
-| `WeakHashMap` stream infinite hang | VM-HANG → JIT codegen | ✅ **FIXED on `dev`** (`1cd0ab26`, JIT ban; verified; doc removed). The underlying `dup_x1` field-post-increment codegen weakness is tracked in the [JIT regalloc family doc](jit-regalloc-callee-saved-clobber-family.md). | _(removed)_ |
+| `WeakHashMap` stream infinite hang | VM-HANG → JIT codegen | ✅ **FIXED on `dev`** (`1cd0ab26`, JIT ban; verified; doc removed). The broader callee-saved GPR local-home family is now retired by the default-off fix and archived in the [JIT regalloc family doc](../internal/jit-regalloc-callee-saved-clobber-family.md). | _(removed)_ |
 
 > `spring-bug-10` is a **Family A** (GC-root-coverage-under-JIT) manifestation seen from the
 > Spring suite — same root cause as A1–A4 above, a different entry point. Fixing precise JIT
