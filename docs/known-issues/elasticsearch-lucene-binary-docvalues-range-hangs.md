@@ -1,9 +1,9 @@
 # Elasticsearch Lucene binary doc-values range query hangs
 
-Status: open (root cause #1 FIXED; root cause #2 open and now the sole blocker)
+Status: open (root causes #1 and #2 FIXED; a third, unidentified blocker remains)
 
 Date observed: 2026-07-02
-Date updated: 2026-07-04
+Date updated: 2026-07-04 (later same day)
 
 ## Summary
 
@@ -34,21 +34,50 @@ Root-caused to **two independent bugs** stacked in the same test run:
    design and the standalone `FSTCompiler`/`NodeHash` stress repro used to
    isolate it without needing the ES harness.
 
-2. **OPEN, now the sole blocker**: with #1 fixed, the same two test classes
-   still do not complete within a reasonable window. The hang moved from FST
-   construction to genuine concurrent search: `BaseRangeFieldQueryTestCase`'s
-   `verify`/`testAllEqual` methods drive `IndexSearcher.search` via Lucene's
-   `TaskExecutor`, and a worker thread blocks in `LRUQueryCache.putIfAbsent` →
-   `ReentrantReadWriteLock$WriteLock.lock()` → `AbstractQueuedLongSynchronizer`
-   contention, with severe (not necessarily infinite) slowness rather than a
-   clean deadlock. This matches the already-documented limitation at
-   `docs/book/src/java-support/limitations.md`: "`java.util.concurrent` is
-   broad but not complete. Some constructs (full ForkJoin parity,
-   `ReentrantReadWriteLock`, `Phaser`) are still being brought to full
-   parity." Not yet investigated further — needs its own root-cause pass
-   (possibly in the concurrent `IndexSearcher`/`LRUQueryCache` interaction
-   specifically, since `ReentrantReadWriteLock` itself works correctly in
-   isolation elsewhere).
+2. **FIXED** (branch `investigate/es-lrucache-rrwl-contention`, merged to
+   dev): root-caused the `ReentrantReadWriteLock`/`LRUQueryCache` contention
+   from #2 above to a genuine permanent-hang bug, not just slowness. JDK 25's
+   `ReentrantReadWriteLock$Sync` extends the newer 64-bit-state
+   `AbstractQueuedLongSynchronizer`, not the classic int-state
+   `AbstractQueuedSynchronizer`. CratonVM already has a hand-maintained JIT
+   skip-list (`vm/src/jit/skip_list.rs`) banning compilation of the classic
+   class's `acquire`/`release`/`signalNext`/`ConditionObject` methods — they
+   allocate a fresh `ExclusiveNode`/`ConditionNode` and immediately `putfield`
+   `prev`/`next`/`waiter` into it, a known allocate-then-putfield
+   register-allocation miscompile that corrupts the waiter linked list's
+   next-pointer, permanently losing wakeups. `AbstractQueuedLongSynchronizer`
+   is a near-line-for-line port with the identical hazard in its own
+   identically-shaped node types, but being a textually distinct class name it
+   matched none of the existing (bare `(class, method)` tuple, no inheritance)
+   skip-list entries, so its hot path stayed JIT-eligible and hit the same
+   miscompile. Confirmed and fixed via a minimal, Lucene-free 4-thread
+   `ReentrantReadWriteLock` stress repro that went from an unbounded, CPU-idle
+   hang (proving parked threads, not a spin/livelock) to completing correctly
+   in ~10-12s once the sibling skip-list entries were added.
+
+3. **OPEN, now the sole blocker**: with both #1 and #2 fixed (and both
+   individually verified — `cargo test -p cratonvm-jit`/`-p cratonvm-vm`
+   green, `bt18` checksum unchanged, and the standalone RRWL stress repro now
+   passing), the actual `Integer`/`LongRandomBinaryDocValuesRangeQueryTests`
+   classes **still do not complete** within a generous window (tested up to
+   480s; HotSpot passes in ~15s). Process CPU-time sampling during a run shows
+   real work happening for the first ~30-40s (JIT warmup, early random
+   iterations) followed by the process going essentially idle (near-zero CPU
+   growth) for the remainder — the same "parked with no wakeup" signature as
+   bug #2, but occurring later in the run and in a path not yet identified.
+   The stack dump at timeout still shows contention on
+   `LRUQueryCache.putIfAbsent` → `ReentrantReadWriteLock$WriteLock.lock()` →
+   `AbstractQueuedLongSynchronizer.acquire`, which IS now interpreter-only
+   (per fix #2) — so this is either (a) a third, similar
+   allocate-then-putfield-class miscompile in a *different* synchronization
+   primitive somewhere in Lucene's concurrent `IndexSearcher`/`TaskExecutor`/
+   `LRUQueryCache` machinery that hasn't been identified yet, or (b) severe
+   but finite cumulative slowdown from forcing `AbstractQueuedLongSynchronizer`
+   permanently into the interpreter under heavy concurrent contention (many
+   leaf searches all serializing through one now-interpreted lock). Not yet
+   distinguished — needs either a longer soak run to see if it eventually
+   completes, or a fresh stack-dump-based investigation of whatever hot path
+   is active during the still-time-CPU window right before the stall.
 
 ## Current full-suite result
 
