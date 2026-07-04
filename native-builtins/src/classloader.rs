@@ -1526,6 +1526,8 @@ fn cglib_guard_value(ctx: &mut dyn NativeContext, name: &str, _bytes: &[u8]) -> 
 }
 
 pub(crate) fn cl_define_class_basic(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    use cratonvm_types::error::{LinkageError, RuntimeError};
+
     // defineClass(String name, byte[] b, int off, int len)
     // args: [this, name, byte_array, offset, length]
     //
@@ -1547,7 +1549,11 @@ pub(crate) fn cl_define_class_basic(ctx: &mut dyn NativeContext, args: &[Value])
     let byte_array = match args.get(2) {
         Some(Value::Object(Some(arr))) => *arr,
         _ => {
-            return Ok(Some(Value::Object(None)));
+            tracing::warn!("ClassLoader.defineClass({name_str}): null bytecode array");
+            return Err(RuntimeError::NullPointerException {
+                message: Some("ClassLoader.defineClass: bytecode array must not be null".into()),
+            }
+            .into());
         }
     };
 
@@ -1556,16 +1562,12 @@ pub(crate) fn cl_define_class_basic(ctx: &mut dyn NativeContext, args: &[Value])
     // Safe integer handling: reject negative offset/length (i32 → usize)
     let offset = match args.get(3) {
         Some(Value::Int(v)) if *v >= 0 => *v as usize,
-        Some(Value::Int(_)) => {
-            return Ok(Some(Value::Object(None)));
-        }
+        Some(Value::Int(_)) => return Err(RuntimeError::ArrayIndexOutOfBoundsException { index: -1 }.into()),
         _ => 0,
     };
     let length = match args.get(4) {
         Some(Value::Int(v)) if *v >= 0 => *v as usize,
-        Some(Value::Int(_)) => {
-            return Ok(Some(Value::Object(None)));
-        }
+        Some(Value::Int(_)) => return Err(RuntimeError::ArrayIndexOutOfBoundsException { index: -1 }.into()),
         _ => array_len,
     };
 
@@ -1580,7 +1582,10 @@ pub(crate) fn cl_define_class_basic(ctx: &mut dyn NativeContext, args: &[Value])
             "[define_class] bounds violation: offset={offset} length={length} \
              array_len={array_len} (name={name_str})"
         );
-        return Ok(Some(Value::Object(None)));
+        return Err(RuntimeError::ArrayIndexOutOfBoundsException {
+            index: -1,
+        }
+        .into());
     }
 
     // Read bytes from the array.
@@ -1607,7 +1612,11 @@ pub(crate) fn cl_define_class_basic(ctx: &mut dyn NativeContext, args: &[Value])
             tracing::error!(
                 "[define_class] panic while reading byte array for {name_str}; aborting"
             );
-            return Ok(Some(Value::Object(None)));
+            return Err(LinkageError::ClassFormatError {
+                class_name: name_str.clone(),
+                message: "defineClass: panic while reading bytecode array".into(),
+            }
+            .into());
         }
     };
 
@@ -1615,7 +1624,11 @@ pub(crate) fn cl_define_class_basic(ctx: &mut dyn NativeContext, args: &[Value])
     // never reach `define_class_full` (cheap CAFEBABE magic check).
     if class_bytes.len() < 8 || class_bytes[0..4] != CLASS_FILE_MAGIC {
         tracing::warn!("[define_class] invalid magic for {name_str}; rejecting");
-        return Ok(Some(Value::Object(None)));
+        return Err(LinkageError::ClassFormatError {
+            class_name: name_str.clone(),
+            message: "defineClass: not a valid class file (bad magic)".into(),
+        }
+        .into());
     }
 
     // cglib SEGV guard: short-circuit proxy classes BEFORE handing the
@@ -1659,7 +1672,11 @@ pub(crate) fn cl_define_class_basic(ctx: &mut dyn NativeContext, args: &[Value])
             tracing::error!(
                 "[define_class] panic inside define_class_full for {name_str}; aborting"
             );
-            return Ok(Some(Value::Object(None)));
+            return Err(LinkageError::ClassFormatError {
+                class_name: name_str.clone(),
+                message: "defineClass: panic inside backend (likely malformed bytecode)".into(),
+            }
+            .into());
         }
     };
     match define_result {
