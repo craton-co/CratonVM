@@ -2,6 +2,8 @@
 
 Status: RETRACTED — benign, not a CratonVM bug
 
+Date archived from known-issues: 2026-07-04
+
 Date observed: 2026-07-02
 
 ## Summary
