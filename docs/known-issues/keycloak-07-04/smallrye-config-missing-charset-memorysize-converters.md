@@ -39,18 +39,24 @@ shared root cause, not per-class breakage.
 
 ## Scale
 
-- `testsuite/integration-arquillian/tests/base` (`org.keycloak.tests.*`):
-  **341/341 FAIL rows**, confirmed byte-identical root cause across an 83-class
-  stratified sample spanning all 30 package areas (admin, oauth, oid4vc,
-  organization, federation, forms, broker, db, tracing, i18n, session, login,
-  authz, account, policy, infinispan, cors, actions, etc.) — 100% hit rate.
+- `tests/base` (`org.keycloak.tests.*`): **341/341 FAIL rows — exhaustively
+  confirmed** (every single FAIL row in this module checked directly, not
+  sampled; the two rows that initially looked like exceptions turned out to
+  be a log-lookup script bug on truncated/hashed log filenames for two
+  long class names — both carry the identical ConfigValidationException on
+  direct inspection). 100% of this module's FAILs share this one root cause.
 - `quarkus/deployment` (`PersistenceXmlDatasourcesTest` and siblings): reached
   after fixing the two CRASH-class blockers ahead of it (see above);
   confirmed via direct repro on this exact class.
-- `quarkus/runtime` (`LoggingConfigurationTest`, `TelemetryConfigurationTest`):
-  plausibly related — both show config-resolution divergences from expected
-  values (see `quarkus-runtime-config-value-divergences.md`); not confirmed to
-  share this exact SRCFG00013 path, flagged for re-triage after this is fixed.
+- `quarkus/runtime` (`LoggingConfigurationTest`, `TelemetryConfigurationTest`,
+  `IgnoredArtifactsTest`): plausibly related — all show config-resolution
+  divergences from expected values, filed as their own docs
+  (`quarkus-runtime-logging-wildcard-debug-level-null.md`,
+  `quarkus-runtime-logging-getpropertynames-garbage-key.md`,
+  `quarkus-runtime-telemetry-service-name-wrong-value.md`,
+  `quarkus-runtime-ignoredartifacts-multipledatasources-boolean.md`); not
+  confirmed to share this exact SRCFG00013 path, flagged for re-triage after
+  this is fixed.
 
 ## Root cause (not yet pinned)
 
