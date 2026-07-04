@@ -10874,6 +10874,114 @@ fn win_get_full_path_name(path: &str) -> Option<String> {
     }
 }
 
+/// Case-correct each *existing* path component of an absolute,
+/// `GetFullPathNameW`-normalized Windows path to match the real on-disk
+/// filename casing — restoring the behaviour real HotSpot's
+/// `WinNTFileSystem.canonicalize` provides (it resolves the true on-disk case
+/// for the existing prefix of a path, leaving any non-existent tail as given).
+///
+/// `GetFullPathNameW` is purely lexical: it does not query the filesystem, so
+/// `getCanonicalPath("dir/D1-F1.TXT")` on a case-insensitive volume would
+/// otherwise echo back the caller's requested casing verbatim, even when the
+/// real on-disk file is `d1-f1.txt`. Callers that compare the canonical path
+/// against the requested path to detect case mismatches (e.g. Tomcat's
+/// `AbstractFileResourceSet.file()`, which rejects a request whose case
+/// doesn't match the real file to guard against case-insensitive-filesystem
+/// false positives) would then never observe a mismatch — silently defeating
+/// the check.
+///
+/// This queries a per-component **targeted** `FindFirstFileW` (exact name, no
+/// wildcard) against each existing ancestor directory. `FindFirstFileW`
+/// enumerates directory entries; it never opens the target file itself, so —
+/// like `GetFullPathNameW` — it does not engage the `cpcrypt.dll` AppCompat
+/// filesystem filter that motivated moving off `std::fs::canonicalize`/
+/// `GetFinalPathNameByHandleW` (see the doc comment on `win_get_full_path_name`).
+#[cfg(windows)]
+fn win_case_correct(full: &str) -> String {
+    use std::os::windows::ffi::{OsStrExt, OsStringExt};
+
+    #[repr(C)]
+    struct FileTime {
+        _low: u32,
+        _high: u32,
+    }
+    #[repr(C)]
+    struct Win32FindDataW {
+        _attrs: u32,
+        _creation: FileTime,
+        _access: FileTime,
+        _write: FileTime,
+        _size_high: u32,
+        _size_low: u32,
+        _reserved0: u32,
+        _reserved1: u32,
+        file_name: [u16; 260],
+        _alt_name: [u16; 14],
+    }
+    extern "system" {
+        fn FindFirstFileW(lp_file_name: *const u16, lp_find_file_data: *mut Win32FindDataW) -> *mut std::ffi::c_void;
+        fn FindClose(h_find_file: *mut std::ffi::c_void) -> i32;
+    }
+    const INVALID_HANDLE_VALUE: *mut std::ffi::c_void = -1isize as *mut std::ffi::c_void;
+
+    // Find the real on-disk name of `name` inside `dir` (both directory paths as
+    // given, any case) via an exact-name `FindFirstFileW` probe. Returns `None`
+    // if the entry doesn't exist.
+    fn find_real_name(dir: &str, name: &str) -> Option<String> {
+        let probe = format!(r"{dir}\{name}");
+        let wide: Vec<u16> = std::ffi::OsStr::new(&probe)
+            .encode_wide()
+            .chain(std::iter::once(0))
+            .collect();
+        unsafe {
+            let mut data: Win32FindDataW = std::mem::zeroed();
+            let handle = FindFirstFileW(wide.as_ptr(), &mut data);
+            if handle == INVALID_HANDLE_VALUE {
+                return None;
+            }
+            FindClose(handle);
+            let end = data.file_name.iter().position(|&c| c == 0).unwrap_or(data.file_name.len());
+            Some(std::ffi::OsString::from_wide(&data.file_name[..end]).to_string_lossy().into_owned())
+        }
+    }
+
+    let path = std::path::Path::new(full);
+    let mut components = path.components();
+    let prefix = match components.next() {
+        Some(std::path::Component::Prefix(p)) => p.as_os_str().to_string_lossy().into_owned(),
+        _ => return full.to_string(),
+    };
+    // Consume the RootDir component that follows a drive/UNC prefix, if present.
+    let mut current = prefix;
+    let had_root = matches!(components.clone().next(), Some(std::path::Component::RootDir));
+    if had_root {
+        components.next();
+        current.push('\\');
+    }
+    let mut still_existing = true;
+    let mut first_comp = true;
+    for comp in components {
+        let std::path::Component::Normal(name) = comp else {
+            continue; // GetFullPathNameW already collapsed `.`/`..`
+        };
+        let name = name.to_string_lossy();
+        let probe_dir = current.trim_end_matches('\\').to_string();
+        if !current.ends_with('\\') && !first_comp {
+            current.push('\\');
+        }
+        first_comp = false;
+        if still_existing {
+            if let Some(real) = find_real_name(&probe_dir, &name) {
+                current.push_str(&real);
+                continue;
+            }
+            still_existing = false;
+        }
+        current.push_str(&name);
+    }
+    current
+}
+
 /// Canonicalize a `java.io.File` path the way `File.getCanonicalPath()` does.
 ///
 /// `std::fs::canonicalize` only works for paths that *exist* on disk; the real
@@ -10940,7 +11048,7 @@ fn file_canonicalize_path_uncached(path: &str) -> String {
                 return strip_unc(&c.to_string_lossy());
             }
         } else if let Some(full) = win_get_full_path_name(path) {
-            return strip_unc(&full);
+            return strip_unc(&win_case_correct(&full));
         }
         // GetFullPathNameW failed (empty input / API error) — fall through to the
         // pure-Rust lexical normalization below.
