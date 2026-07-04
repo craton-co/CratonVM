@@ -1486,8 +1486,63 @@ impl GenerationalHeap {
             return None;
         }
 
-        // SAFETY: `raw` passed the region containment and header sanity checks above,
-        // so it points to a valid object header within a heap arena.
+        // Family-A fix (2026-07-03): also validate the object's EXTENT against
+        // the arena it claims to live in — the same hardening `mark_young`
+        // (sweep_young_non_moving) already applies, now centralized here so
+        // every one of this function's ~28 callers gets it. Without this, a
+        // conservative root candidate that lands NOT on a real object start
+        // but on an interior 16-byte `Value` cell of a live `Object[]` (every
+        // element's discriminant word is `VTAG_OBJECT = 4`, so `class_id=4`
+        // decodes at the candidate offset AND `num_slots=4` decodes 16 bytes
+        // later — a self-consistent-looking but entirely coincidental fake
+        // header) passes every check above. Bit-plausible headers of this
+        // shape are common: a hot proxy/reflection `invoke(Object,Object[])`
+        // path keeps element-interior pointers alive in registers/stack slots
+        // that a conservative scan (`scan_one_frame` et al.) then feeds
+        // through this function as candidate roots. `mark_young` catches this
+        // via its extent check and safely discards such a candidate WITHOUT
+        // writing through it; but every OTHER caller of `is_object_address`
+        // (root-set seeding for old-gen `major_gc`, the selective-promotion
+        // pin set, `is_movable_jit_root`, cross-thread snapshot validation,
+        // and more) had no such check and could WRITE through the accepted
+        // "object" (mark bit, gc_age, forwarding_ptr) at a byte offset that
+        // is actually the interior of an unrelated live array — corrupting
+        // that array's real header/body bytes. This reproduced as the
+        // long-standing "kind=Object but array_length=N; inline-alloc forgot
+        // to set kind=Array" corruption family (Family-A / MiniThrottle /
+        // the independently-found Hibernate-batch corruption): the "N" is
+        // not random — it is bits of the flipped mark/age/forwarding write
+        // landing inside the victim array's real `array_length` field.
+        let claimed_extent = if is_array {
+            match array_data_size(header.array_length as usize, header.element_type) {
+                Ok(data) => HEADER_SIZE.checked_add(data),
+                Err(_) => None,
+            }
+        } else {
+            HEADER_SIZE.checked_add(header.num_slots as usize * SLOT_SIZE)
+        };
+        let Some(extent) = claimed_extent else {
+            return None;
+        };
+        let Some(obj_end) = addr.checked_add(extent) else {
+            return None;
+        };
+        // The object's full extent must fit within the SAME arena the region
+        // check above matched (not just "some" arena — a header claiming to
+        // span from young into old gen is exactly the interior-cell false
+        // positive this guards against).
+        let extent_fits = self.region_bounds.iter().any(|(base, end)| {
+            let b = base.load(Ordering::Acquire);
+            let e = end.load(Ordering::Acquire);
+            addr >= b && addr < e && obj_end <= e
+        });
+        if !extent_fits {
+            return None;
+        }
+
+        // SAFETY: `raw` passed the region containment, header sanity, and
+        // extent-containment checks above, so it points to a valid object
+        // header within a heap arena.
         Some(unsafe { ObjectRef::from_raw(raw as *mut u8) })
     }
 
@@ -4065,33 +4120,97 @@ impl GenerationalHeap {
                             header.num_slots,
                             hex,
                         );
+                        // A2 forensic probe (CRATONVM_DBG_A2): correlate this
+                        // rejected address against the allocation breadcrumb
+                        // ring — was this slot EVER header-written by an
+                        // allocator (interpreter TLAB / gen_heap / JIT
+                        // inline-alloc / TLAB tail-filler), and with what
+                        // real size/class? Distinguishes "never allocated
+                        // here" (stale conservative root over reused/free
+                        // memory) from "allocated then clobbered" (a real
+                        // header-write race) from "allocated exactly this
+                        // shape, walker/mark logic disagrees" (a formula bug).
+                        match crate::a2dbg::lookup_at(addr) {
+                            Some(r) => tracing::warn!(
+                                "  [A2] BREADCRUMB exact-addr alloc: class_id={} kind={} et={} alen={} ns={} REAL_size={} seq={}",
+                                r.class_id, r.kind, r.element_type, r.array_length, r.num_slots, r.size, r.seq,
+                            ),
+                            None => match crate::a2dbg::lookup_covering(addr) {
+                                Some(r) => tracing::warn!(
+                                    "  [A2] BREADCRUMB covered by alloc start={:#x} class_id={} kind={} et={} alen={} ns={} REAL_size={} seq={} (mid-object offset={})",
+                                    r.addr, r.class_id, r.kind, r.element_type, r.array_length, r.num_slots, r.size, r.seq, addr - r.addr,
+                                ),
+                                None => tracing::warn!(
+                                    "  [A2] BREADCRUMB — NO allocation record covers {:#x} (never header-written here, or freed+reused past the ring)",
+                                    addr,
+                                ),
+                            },
+                        }
                     }
                     return;
                 }
-                // Zero first-header-word candidates take the SIDE path: alive and
-                // traced, but the header is NEVER written (see side_marks above).
+                // Family-A fix (2026-07-03): EVERY conservative root candidate
+                // takes the SIDE path now — alive and traced, but the header is
+                // NEVER written through. Previously only a zero-first-word
+                // candidate was side-marked; any OTHER candidate that merely
+                // passed the kind/num_slots/extent plausibility checks above
+                // (bit-plausible but not necessarily the true start of a live
+                // object) fell through to `header.gc_flags |= GC_FLAG_MARKED`
+                // below, an unconditional write through the candidate pointer.
+                //
+                // The checks above bound `class_id`/`kind`/`num_slots`/extent to
+                // "looks like it could be a real header" — they do NOT prove the
+                // candidate is the actual start address a real allocator wrote a
+                // header at. A conservative root scan (register/stack scan, or
+                // — at much higher volume — the cross-thread `xt_root_scan`
+                // OS-suspend takeover, which floods this seed with thousands of
+                // raw register/stack words from EVERY other live thread) can
+                // easily produce an address that is NOT a real object start but
+                // decodes as one anyway: e.g. the 16-byte-aligned `Value` cells
+                // of a live `Object[]` all carry `VTAG_OBJECT = 4` as their
+                // discriminant word, so landing on ANY element's disc word reads
+                // `class_id=4, kind=Object` — and 16 bytes later, the NEXT
+                // element's disc word reads as a matching, equally-plausible
+                // `num_slots=4`. Writing `GC_FLAG_MARKED` (0x02) through such a
+                // false-positive candidate lands the byte write inside a
+                // genuinely live neighboring object's real header — bit 9 of
+                // `array_length` (byte offset 13, 8 bytes past `gc_flags` at
+                // offset 21 minus the header's own +8 alignment window) is
+                // exactly the observed "kind=Object but array_length=512/513"
+                // corruption face this whole family is named for; other offsets
+                // hit `num_slots`, `gc_age`, or the low byte of `forwarding_ptr`
+                // depending on the candidate's exact false-positive offset.
+                //
+                // `side_marks` was already proven safe and sufficient for the
+                // zero-word0 case (over-retention only, per the comment above);
+                // extending it to every candidate closes the entire
+                // write-through class at the cost of pure over-retention (a
+                // false-positive candidate keeps its neighbor pinned instead of
+                // corrupting it — the collector's own documented safety
+                // invariant: "a conservative false-positive root only
+                // over-retains, it can never cause a live object to be freed OR
+                // its non-pointer data to be corrupted").
                 // SAFETY: `addr` is 8-aligned inside mapped from-space.
-                let word0 = unsafe { *(ptr as *const u64) };
-                if word0 == 0 {
-                    if side_marks.insert(addr) {
-                        worklist.push(ptr);
-                    }
-                    return;
-                }
-                // xt-hardening follow-up (2026-07-03): a non-zero-word0
-                // candidate whose always-zero header fields are non-zero is
-                // still corrupt garbage that happened to satisfy the
-                // field-bound + extent checks above — route it through the
-                // same non-writing side path rather than trusting it enough
-                // to header-write.
-                if !header_reserved_fields_plausible(header) {
-                    if side_marks.insert(addr) {
-                        worklist.push(ptr);
-                    }
-                    return;
-                }
-                if header.gc_flags & GC_FLAG_MARKED == 0 {
-                    header.gc_flags |= GC_FLAG_MARKED;
+                //
+                // Merge note (2026-07-04): dev independently landed a NARROWER
+                // mitigation for this same non-zero-word0 hazard
+                // (`header_reserved_fields_plausible` — reject a candidate
+                // whose always-zero padding/reserved bytes or undefined
+                // gc_flags bits are set, ~1/2^29 false-negative rate on
+                // garbage) and still header-wrote through anything that
+                // passed it. That check is real and kept (used elsewhere by
+                // dev's other hardening below), but it does NOT catch this
+                // fix's target case: a genuine live `Object[]` element cell,
+                // whose bytes are NOT garbage — `_padding`/`_gc_reserved`
+                // read 0 legitimately (they alias the high bytes of an
+                // adjacent element's pointer payload, which is frequently
+                // 0 on a 48-bit address space) and `gc_flags` reads 0 too.
+                // Such a candidate sails through
+                // `header_reserved_fields_plausible` and still gets
+                // header-written. Unconditional side-marking (this fix)
+                // has no such gap: every candidate is treated as
+                // never-write-through, full stop.
+                if side_marks.insert(addr) {
                     worklist.push(ptr);
                 }
             };
@@ -5549,6 +5668,26 @@ impl GenerationalHeap {
             } else if side_marked_survivor {
                 // Side-marked survivor: pure retention, no header writes.
                 objects_live += 1;
+                // Family-A fix follow-up: a side-marked survivor is kept in
+                // place exactly like a header-marked one (same "never moves"
+                // guarantee), so it needs the SAME watched-referent identity
+                // mapping — a live Weak/Soft/Phantom reference watching this
+                // address must still see it as "survived" post-GC. Before the
+                // write-through fix, every candidate that reached this point
+                // via a real root had `GC_FLAG_MARKED` set on its own header
+                // and took the branch below; now ALL conservative-root
+                // survivors (real objects included) take this side-marked
+                // path instead, so the identity-map insert must move here too
+                // (regression: `non_moving_sweep_records_identity_map_for_watched_survivor`).
+                let addr = obj_ptr as usize;
+                if crate::gc_quiescence::is_watched_referent(addr) {
+                    if watchref_dbg() {
+                        eprintln!(
+                            "[watchref] non-moving sweep: side-marked watched survivor kept in place @0x{addr:x} — identity-mapped"
+                        );
+                    }
+                    evac_map.insert(addr, addr);
+                }
             } else if header.gc_flags & GC_FLAG_MARKED != 0 {
                 // Survivor: clear the mark, keep in place, and age it so the
                 // next sweep can tenure it once it reaches PROMOTION_AGE

@@ -398,6 +398,20 @@ impl Tlab {
             // sanity checks on the next walk.
             std::ptr::write_bytes((aligned + HEADER_SIZE) as *mut u8, 0, data_bytes);
         }
+        // Family-A forensics (CRATONVM_DBG_A2, default-inert): record the
+        // tail-filler header write so the sweep's desync forensics can tell
+        // "corrupt header over a recycled filler slot" apart from "corrupt
+        // header over a real object". Filler lengths (512, 751, 254, ...)
+        // exactly match the alen values seen in the corrupt-header family.
+        crate::a2dbg::record(
+            aligned,
+            class_id.as_u32(),
+            ObjectKind::Array as u8,
+            ArrayElementType::Int as u8,
+            length,
+            0,
+            tail,
+        );
         // Bump cursor past the filler so subsequent `remaining()` calls
         // report zero. The TLAB is now fully consumed (by the filler).
         self.cursor = self.end;
