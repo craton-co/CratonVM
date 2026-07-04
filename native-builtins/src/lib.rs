@@ -18766,6 +18766,194 @@ pub fn register_essential_natives(registry: &mut NativeMethodRegistry) {
         "()Z",
         |_ctx, _args| Ok(Some(Value::Int(0))),
     );
+    // Same rationale as `incomingNapiIdSupported0` above: a Linux-only
+    // extended-socket-options probe reached via the same
+    // `jdk.net.Sockets.optionSets()` walk. `false` (quick-ACK toggling
+    // unsupported) is a safe conservative default.
+    registry.register(
+        "jdk/net/LinuxSocketOptions",
+        "quickAckSupported0",
+        "()Z",
+        |_ctx, _args| Ok(Some(Value::Int(0))),
+    );
+    // Full `jdk/net/LinuxSocketOptions` native surface (`ExtendedSocketOptions`'s
+    // Linux `PlatformSocketOptions` implementation). Same rationale as the two
+    // "supported0" probes above: reached via `jdk.net.Sockets.optionSets()`'s
+    // static init walk on ANY code touching a real `java.net.Socket`'s
+    // `SocketImpl` (e.g. Apache HttpClient5's `DefaultHttpClientConnectionOperator`).
+    // The remaining "supportedX0" probes report the feature absent (safe,
+    // conservative — real callers already handle an unsupported option); the
+    // actual get/set natives are stubbed defensively in case any code path
+    // still reaches them despite the "unsupported" answer above (shouldn't
+    // happen in practice, since JDK code checks the "supported" flag first,
+    // but a hard crash here would be far worse than a silently-ignored
+    // TCP-keepalive/quick-ACK/NAPI-ID tuning knob our tests don't exercise).
+    registry.register(
+        "jdk/net/LinuxSocketOptions",
+        "keepAliveOptionsSupported0",
+        "()Z",
+        |_ctx, _args| Ok(Some(Value::Int(0))),
+    );
+    registry.register(
+        "jdk/net/LinuxSocketOptions",
+        "setTcpKeepAliveProbes0",
+        "(II)V",
+        |_ctx, _args| Ok(None),
+    );
+    registry.register(
+        "jdk/net/LinuxSocketOptions",
+        "setTcpKeepAliveTime0",
+        "(II)V",
+        |_ctx, _args| Ok(None),
+    );
+    registry.register(
+        "jdk/net/LinuxSocketOptions",
+        "setTcpKeepAliveIntvl0",
+        "(II)V",
+        |_ctx, _args| Ok(None),
+    );
+    registry.register(
+        "jdk/net/LinuxSocketOptions",
+        "getTcpKeepAliveProbes0",
+        "(I)I",
+        |_ctx, _args| Ok(Some(Value::Int(0))),
+    );
+    registry.register(
+        "jdk/net/LinuxSocketOptions",
+        "getTcpKeepAliveTime0",
+        "(I)I",
+        |_ctx, _args| Ok(Some(Value::Int(0))),
+    );
+    registry.register(
+        "jdk/net/LinuxSocketOptions",
+        "getTcpKeepAliveIntvl0",
+        "(I)I",
+        |_ctx, _args| Ok(Some(Value::Int(0))),
+    );
+    registry.register(
+        "jdk/net/LinuxSocketOptions",
+        "setIpDontFragment0",
+        "(IZZ)V",
+        |_ctx, _args| Ok(None),
+    );
+    registry.register(
+        "jdk/net/LinuxSocketOptions",
+        "getIpDontFragment0",
+        "(IZ)Z",
+        |_ctx, _args| Ok(Some(Value::Int(0))),
+    );
+    registry.register(
+        "jdk/net/LinuxSocketOptions",
+        "setQuickAck0",
+        "(IZ)V",
+        |_ctx, _args| Ok(None),
+    );
+    registry.register(
+        "jdk/net/LinuxSocketOptions",
+        "getQuickAck0",
+        "(I)Z",
+        |_ctx, _args| Ok(Some(Value::Int(0))),
+    );
+    registry.register(
+        "jdk/net/LinuxSocketOptions",
+        "getSoPeerCred0",
+        "(I)J",
+        |_ctx, _args| Ok(Some(Value::Long(-1))),
+    );
+    registry.register(
+        "jdk/net/LinuxSocketOptions",
+        "getIncomingNapiId0",
+        "(I)I",
+        |_ctx, _args| Ok(Some(Value::Int(0))),
+    );
+
+    // `sun/nio/ch/Net.shouldShutdownWriteBeforeClose0()Z` — queried once
+    // during `NioSocketImpl.<clinit>` (same static-init chain as the
+    // LinuxSocketOptions/NativeThread/UnixDispatcher natives above) to
+    // decide whether closing a socket should shutdown(SHUT_WR) first for
+    // graceful half-close delivery. `true` mirrors real Linux's answer
+    // (this is the platform we're emulating here); our own socket I/O
+    // path does its own close/shutdown handling independent of this
+    // JDK-internal flag, so the exact value mainly needs to avoid the
+    // UnsatisfiedLinkError, not drive real behavior.
+    registry.register(
+        "sun/nio/ch/Net",
+        "shouldShutdownWriteBeforeClose0",
+        "()Z",
+        |_ctx, _args| Ok(Some(Value::Int(1))),
+    );
+
+    // `sun/net/dns/ResolverConfigurationImpl.{init0,loadDNSconfig0,notifyAddrChange0}`
+    // — reads the OS's configured DNS search list/nameservers (on Windows, via
+    // the IP Helper API). Netty's `DnsServerAddressStreamProviders` consults
+    // this as a courtesy default-resolver config; without any of these three
+    // natives registered, `init0()` (called from static init, before the
+    // other two) threw `UnsatisfiedLinkError`, leaving
+    // `sun.net.dns.ResolverConfigurationImpl`/`ResolverConfiguration` in the
+    // JVM's permanent "erroneous class" state — cascading to
+    // `NoClassDefFoundError: io/netty/resolver/dns/DnsServerAddressStreamProviders$DefaultProviderHolder`
+    // for every later reference, breaking Reactor-Netty-based HTTP client
+    // tests entirely. We don't surface real OS DNS config (no IP Helper API
+    // integration), so leave `os_searchlist`/`os_nameservers` as their
+    // default null — `loadConfig()`'s `stringToList`/`addressesToList` treat
+    // a null input as "empty", giving an empty search list. Netty's own
+    // resolver falls back to platform-default nameservers when this
+    // courtesy list is empty, so plain loopback/localhost resolution (all
+    // this suite needs) is unaffected. `notifyAddrChange0()` (address-change
+    // notification handle) is only consulted by an optional network-change
+    // listener our tests don't exercise; 0 is a harmless placeholder.
+    registry.register(
+        "sun/net/dns/ResolverConfigurationImpl",
+        "init0",
+        "()V",
+        |_ctx, _args| Ok(None),
+    );
+    registry.register(
+        "sun/net/dns/ResolverConfigurationImpl",
+        "loadDNSconfig0",
+        "()V",
+        |_ctx, _args| Ok(None),
+    );
+    registry.register(
+        "sun/net/dns/ResolverConfigurationImpl",
+        "notifyAddrChange0",
+        "()I",
+        |_ctx, _args| Ok(Some(Value::Int(0))),
+    );
+
+    // `sun/nio/ch/NativeThread.supportPendingSignals0()Z` — a Linux-only
+    // probe (`UnixDispatcher.<clinit>` -> `NativeThread.supportPendingSignals()`)
+    // for whether this platform can deliver a pending POSIX signal to
+    // interrupt a thread blocked in native I/O. Real Linux supports this
+    // (that mechanism is the whole reason `UnixDispatcher`/`NativeThread`
+    // exist), so `true` matches HotSpot's real answer on this OS — unlike
+    // the `false` stubs elsewhere in this block, this is not a "safe
+    // default for an absent feature" but the actual Linux capability.
+    // Without it, `NioSocketImpl.<clinit>` (reached the first time ANY
+    // code touches a real `java.net.Socket`'s `SocketImpl`, e.g.
+    // `Socket.supportedOptions()` during `jdk.net.Sockets.optionSets()`)
+    // threw `UnsatisfiedLinkError`, leaving `NioSocketImpl` erroneous and
+    // cascading to `NoClassDefFoundError` for `DefaultHttpClientConnectionOperator`
+    // — breaking Apache HttpClient5-based tests entirely on this host.
+    registry.register(
+        "sun/nio/ch/NativeThread",
+        "supportPendingSignals0",
+        "()Z",
+        |_ctx, _args| Ok(Some(Value::Int(1))),
+    );
+
+    // `sun/nio/ch/UnixDispatcher.init()V` — one-time native bookkeeping
+    // init for the Unix blocking-I/O dispatcher (reached right after the
+    // `supportPendingSignals0` check above, same `<clinit>` chain). We
+    // don't need any native-side state for this — our socket I/O doesn't
+    // route through a `UnixDispatcher` table — so a no-op keeps
+    // `NioSocketImpl.<clinit>` progressing.
+    registry.register(
+        "sun/nio/ch/UnixDispatcher",
+        "init",
+        "()V",
+        |_ctx, _args| Ok(None),
+    );
 
     // Restore the caller's category so later registrars keep their intended tag.
     registry.set_category(prev_category);

@@ -355,51 +355,6 @@ fn jla_add_enable_native_access(_ctx: &mut dyn NativeContext, args: &[Value]) ->
     Ok(Some(args.get(1).copied().unwrap_or(Value::Object(None))))
 }
 
-/// `JavaLangAccess.defineClass(ClassLoader, String, byte[], ProtectionDomain,
-/// String)` -> `Class<?>`.
-///
-/// `jdk.internal.reflect.ClassDefiner.defineClass` (used to define
-/// reflection-generated method/constructor accessor classes, and by other
-/// internal callers) invokes this via `invokeinterface JavaLangAccess`.
-/// Without it, real-JDK mode threw `NoSuchMethodError` out of
-/// `ClassDefiner.defineClass`, which aborted the JUnit launcher during
-/// session setup on JDK 21+ (every class in a run collapsed to LOADERR).
-///
-/// Real JDK's `System$1.defineClass` body is just
-/// `loader.defineClass(name, b, 0, b.length, pd)` — delegate to the loader's
-/// own protected 5-arg `defineClass` so this goes through the exact same
-/// path as any other `ClassLoader.defineClass` call.
-///
-/// INSTANCE method: args[0] = receiver (System$1), args[1] = ClassLoader,
-/// args[2] = String name, args[3] = byte[] b, args[4] = ProtectionDomain pd,
-/// args[5] = String source (unused — the real body ignores it too).
-fn jla_define_class(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    let loader = args.get(1).copied().unwrap_or(Value::Object(None));
-    let name = args.get(2).copied().unwrap_or(Value::Object(None));
-    let bytes = args.get(3).copied().unwrap_or(Value::Object(None));
-    let pd = args.get(4).copied().unwrap_or(Value::Object(None));
-    let len = match bytes {
-        Value::Object(Some(arr)) => ctx.array_length(arr) as i32,
-        _ => 0,
-    };
-    // `ctx.invoke_virtual` runs the REAL bytecode for `ClassLoader.defineClass`
-    // (that is its whole purpose — bridges use it to deliberately reach real
-    // JDK behavior instead of re-entering the native registry). That bytecode
-    // opens with `preDefineClass(name, pd)`, whose `checkName` rejects any
-    // name containing `/` with `NoClassDefFoundError: IllegalName: ...` — but
-    // ordinary bytecode `invokevirtual` call sites for this exact method
-    // never reach that check at all, because `cl_define_class_pd` (below) is
-    // registered on `java/lang/ClassLoader.defineClass` and wins native
-    // dispatch first. Call it directly so this bridge gets the SAME behavior
-    // any other `loader.defineClass(name, b, off, len, pd)` caller gets,
-    // instead of a divergent bytecode path. Args shape matches a normal
-    // instance call: [receiver=loader, name, bytes, off, len, pd].
-    crate::classloader::cl_define_class_basic(
-        ctx,
-        &[loader, name, bytes, Value::Int(0), Value::Int(len), pd],
-    )
-}
-
 /// `JavaLangAccess.getConstantPool(Class<?>)` -> `jdk.internal.reflect.ConstantPool`.
 ///
 /// ByteBuddy's class-file reader consults this via `invokeinterface
@@ -437,6 +392,51 @@ fn jla_start_in_container(ctx: &mut dyn NativeContext, args: &[Value]) -> Method
     };
     ctx.invoke_virtual(thread_obj, "start", "()V", &[])?;
     Ok(None)
+}
+
+/// `JavaLangAccess.join(String prefix, String suffix, String delimiter,
+/// String[] elements, int size)` -> `String`.
+///
+/// A fast-path helper `String.join(...)`/`StringJoiner`-adjacent code calls
+/// to concatenate `elements[0..size]` with `delimiter` between them and
+/// `prefix`/`suffix` on the ends, bypassing the general `StringJoiner`
+/// machinery. Missing here broke Apache HttpClient5's
+/// `HttpComponentsClientHttpRequestFactoryTests` (`NoSuchMethodError` on
+/// this exact signature).
+///
+/// INSTANCE method: args[0] = receiver (System$1), args[1] = prefix,
+/// args[2] = suffix, args[3] = delimiter, args[4] = String[] elements,
+/// args[5] = int size.
+fn jla_join(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let read = |ctx: &dyn NativeContext, v: Option<&Value>| -> String {
+        match v {
+            Some(Value::Object(Some(s))) => ctx.read_string(*s).unwrap_or_default(),
+            _ => String::new(),
+        }
+    };
+    let prefix = read(ctx, args.get(1));
+    let suffix = read(ctx, args.get(2));
+    let delimiter = read(ctx, args.get(3));
+    let elements = match args.get(4) {
+        Some(Value::Object(Some(arr))) => *arr,
+        _ => {
+            let s = ctx.create_string(&format!("{prefix}{suffix}"));
+            return Ok(Some(Value::Object(Some(s))));
+        }
+    };
+    let size = args.get(5).and_then(|v| v.as_int()).unwrap_or(0).max(0) as usize;
+    let mut out = prefix;
+    for i in 0..size {
+        if i > 0 {
+            out.push_str(&delimiter);
+        }
+        if let Value::Object(Some(s)) = ctx.get_array_element(elements, i) {
+            out.push_str(&ctx.read_string(s).unwrap_or_default());
+        }
+    }
+    out.push_str(&suffix);
+    let s = ctx.create_string(&out);
+    Ok(Some(Value::Object(Some(s))))
 }
 
 fn jla_new_string_utf8_no_repl(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
@@ -762,6 +762,12 @@ fn register_java_lang_access(registry: &mut NativeMethodRegistry) {
         "(Ljava/lang/ClassLoader;Ljava/lang/String;[BLjava/security/ProtectionDomain;Ljava/lang/String;)Ljava/lang/Class;",
         jla_define_class,
     );
+    registry.register(
+        owner,
+        "join",
+        "(Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;[Ljava/lang/String;I)Ljava/lang/String;",
+        jla_join,
+    );
     // Also register on the interface so direct invokeinterface
     // dispatch (when the receiver's concrete class lookup falls
     // back to the interface class) still hits these natives.
@@ -808,6 +814,12 @@ fn register_java_lang_access(registry: &mut NativeMethodRegistry) {
         "start",
         "(Ljava/lang/Thread;Ljdk/internal/vm/ThreadContainer;)V",
         jla_start_in_container,
+    );
+    registry.register(
+        iface,
+        "join",
+        "(Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;[Ljava/lang/String;I)Ljava/lang/String;",
+        jla_join,
     );
 }
 
