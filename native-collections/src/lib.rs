@@ -7343,6 +7343,22 @@ fn register_arrays_natives(r: &mut NativeMethodRegistry) {
     r.set_category(__prev_cat);
 }
 
+// FMT-STREAMS-CCE: the real JDK's 2-arg `Arrays.copyOf(T[] original, int
+// newLength)` allocates the copy via `Array.newInstance(original.getClass()
+// .getComponentType(), newLength)`, so the result preserves `original`'s
+// exact runtime component type — including nested array types. E.g. copying
+// an `Object[][]` (as `java.util.stream.SpinedBuffer.ensureCapacity` does for
+// its `E[][] spine` field, reached via a `LongStream`/boxing pipeline's
+// `toArray()`) must yield another `Object[][]`, not a flat `Object[]`. This
+// previously always allocated a flat `Object[]` via `alloc_ref_array`
+// (component ClassId hardcoded to 0) regardless of `src`'s real type, so
+// callers whose static type is a multi-dimensional array hit an implicit
+// erasure checkcast back to the 2D descriptor against the flat 1D result and
+// threw `ClassCastException: java.lang.Object cannot be cast to
+// [[Ljava.lang.Object;` (format.datetime.standard.InstantFormatterTests).
+// Fix: read `src`'s own component ClassId from its heap header (same
+// template `real_jdk_to_array_typed` / the native-builtins `phases_early`
+// `copyOf` overloads already use) and propagate it via `new_ref_array`.
 fn native_arrays_copy_of(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let src = match args.first() {
         Some(Value::Object(Some(arr))) => *arr,
@@ -7353,7 +7369,8 @@ fn native_arrays_copy_of(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
         _ => return Ok(Some(Value::Object(None))),
     };
     let old_len = ctx.array_length(src);
-    let result = alloc_ref_array(ctx, new_len);
+    let comp_cid = ctx.class_id_of_object(src);
+    let result = ctx.new_ref_array(comp_cid, new_len);
     let copy_len = std::cmp::min(old_len, new_len);
     for i in 0..copy_len {
         let val = ctx.get_array_element(src, i);
@@ -9925,13 +9942,28 @@ fn stream_lazy_spliterator(ctx: &dyn NativeContext, stream: ObjectRef) -> Option
 /// (the accept native, registered globally, appends + grows). Pins both objects
 /// across the loop since every `tryAdvance` re-enters Java and may move them.
 fn drain_spliterator_to_array(ctx: &mut dyn NativeContext, spl: ObjectRef) -> ObjectRef {
+    drain_spliterator_to_array_capped(ctx, spl, 1_000_000)
+}
+
+/// As [`drain_spliterator_to_array`], but with a caller-chosen safety cap
+/// instead of the shared default. Used by `stream_elements_concat_bounded`
+/// (FMT-STREAMS-CCE) with a much smaller cap: `Stream.concat`'s bounded path
+/// exists ONLY to survive an unbounded/infinite real-pipeline operand without
+/// OOMing, and legitimate finite real-pipeline concat operands in practice
+/// (e.g. Spring's `MergedAnnotations.stream()`-style use) are far smaller
+/// than even a few thousand elements — a smaller cap keeps that safety net
+/// cheap without weakening it for any real use case.
+fn drain_spliterator_to_array_capped(
+    ctx: &mut dyn NativeContext,
+    spl: ObjectRef,
+    safety_cap: usize,
+) -> ObjectRef {
     let collector = alloc_synthetic(ctx, "cratonvm/internal/StreamCollector", 2);
     let storage = alloc_ref_array(ctx, 16);
     ctx.set_field(collector, 0, Value::Object(Some(storage)));
     ctx.set_field(collector, 1, Value::Int(0));
     let spl_pin = ctx.pin_native_root(spl);
     let col_pin = ctx.pin_native_root(collector);
-    const SAFETY_CAP: usize = 1_000_000;
     let mut n = 0usize;
     loop {
         let s = ctx.read_native_pin(spl_pin, spl);
@@ -9944,7 +9976,7 @@ fn drain_spliterator_to_array(ctx: &mut dyn NativeContext, spl: ObjectRef) -> Ob
         ) {
             Ok(Some(Value::Int(v))) if v != 0 => {
                 n += 1;
-                if n >= SAFETY_CAP {
+                if n >= safety_cap {
                     break;
                 }
             }
@@ -11407,6 +11439,92 @@ fn native_stream_empty(ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCa
     make_stream(ctx, &[])
 }
 
+/// Bounded variant of [`stream_elements`], used ONLY by [`native_stream_concat`].
+///
+/// FMT-STREAMS-CCE: `Stream.concat(a, b)` used to call the plain
+/// `stream_elements` on both operands, which for a REAL (non-synthetic)
+/// pipeline operand materialises via the real bytecode `toArray()` — entirely
+/// unbounded. `random.longs(min, max)` (JDK's 2-arg `Random.longs` overload,
+/// internally `longs(Long.MAX_VALUE, min, max)`) produces an
+/// effectively-infinite `RandomLongsSpliterator`; piping it through
+/// `.mapToObj(...)` and into `Stream.concat(Stream.of(x), ...)` made
+/// `concat` try to drain that infinite pipeline to completion via `toArray()`
+/// BEFORE the caller's `.limit(10)` (applied to the CONCAT RESULT, not to
+/// either operand) ever got a chance to short-circuit anything. The JDK's own
+/// `SpinedBuffer` grew without bound and eventually attempted a
+/// 268435456-element (2^28) array allocation, throwing `OutOfMemoryError:
+/// Java heap space` (Spring's
+/// `format.datetime.standard.InstantFormatterTests.RandomInstantProvider`,
+/// which does exactly this pattern; HotSpot never reaches `toArray()` at all
+/// here because its whole pipeline is lazy end-to-end).
+///
+/// We can't make CratonVM's synthetic concat stream fully lazy — `concat`
+/// still eagerly builds a materialised result — but we CAN cap the damage.
+/// For a real pipeline this obtains the REAL spliterator by calling
+/// `AbstractPipeline.spliterator()` via `invoke_special` (invokespecial
+/// semantics: exact resolved method on the given class, no virtual retarget),
+/// which bypasses our own `native_stream_spliterator` override (registered on
+/// the concrete `java/util/stream/ReferencePipeline` class name, so a normal
+/// virtual dispatch would hit it and recurse back into `stream_elements`/
+/// `toArray()` — the very thing we're trying to avoid). The genuine spliterator
+/// is then drained through the existing bounded `tryAdvance` loop
+/// (`drain_spliterator_to_array`, capped at 1,000,000 elements) instead of the
+/// unbounded native `toArray()`. This is byte-identical to the previous
+/// behavior for every FINITE real pipeline (same elements, same encounter
+/// order) and turns an unbounded-allocation OOM into a bounded, harmless
+/// materialization for the rare unbounded case — matching the bounded-cap
+/// precedent already used for real spliterators elsewhere (e.g.
+/// `StreamSupport.stream(realSpliterator, false)`).
+fn stream_elements_concat_bounded(
+    ctx: &mut dyn NativeContext,
+    stream: ObjectRef,
+) -> Result<Vec<Value>, MethodCallFailed> {
+    // Synthetic streams (including lazy-spliterator-backed ones, which are
+    // already bounded via `drain_spliterator_to_array`'s 1M cap inside
+    // `materialize_lazy_stream`) are unaffected by this bug — delegate
+    // straight to the ordinary path.
+    let class_id = ctx.class_id_of_object(stream);
+    let class_name = ctx.class_name_of_id(class_id).unwrap_or_default();
+    if is_synthetic_stream(&class_name) {
+        return stream_elements(ctx, stream);
+    }
+    let stream_pin = ctx.pin_native_root(stream);
+    let result: Result<Vec<Value>, MethodCallFailed> = match ctx.invoke_special(
+        "java/util/stream/AbstractPipeline",
+        "spliterator",
+        "()Ljava/util/Spliterator;",
+        &[Value::Object(Some(stream))],
+    ) {
+        Ok(Some(Value::Object(Some(spl)))) => {
+            // Smaller cap than the shared 1,000,000 default: this path exists
+            // only to survive an unbounded/infinite operand without OOMing,
+            // and no legitimate finite `concat` operand needs anywhere near
+            // this many elements. Keeps the bounded fallback fast.
+            const CONCAT_SAFETY_CAP: usize = 20_000;
+            let arr = drain_spliterator_to_array_capped(ctx, spl, CONCAT_SAFETY_CAP);
+            let len = ctx.array_length(arr);
+            Ok((0..len).map(|i| ctx.get_array_element(arr, i)).collect())
+        }
+        // Not an AbstractPipeline subclass (or spliterator() unavailable via
+        // invokespecial for some other reason) — stay defensive and fall back
+        // to the original unbounded toArray() path so we never regress a
+        // real, finite, non-pipeline Stream implementation.
+        _ => {
+            let stream = ctx.read_native_pin(stream_pin, stream);
+            match ctx.invoke_virtual(stream, "toArray", "()[Ljava/lang/Object;", &[]) {
+                Ok(Some(Value::Object(Some(arr)))) => {
+                    let len = ctx.array_length(arr);
+                    Ok((0..len).map(|i| ctx.get_array_element(arr, i)).collect())
+                }
+                Ok(_) => Ok(Vec::new()),
+                Err(e) => Err(e),
+            }
+        }
+    };
+    ctx.unpin_native_roots(stream_pin);
+    result
+}
+
 fn native_stream_concat(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let a_ref = match args.first() {
         Some(Value::Object(Some(r))) => Some(*r),
@@ -11418,12 +11536,16 @@ fn native_stream_concat(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCa
     };
     // (Sequential `&mut` borrows — `stream_elements` is now `&mut`, so avoid the
     // closure form which would capture `ctx` mutably twice.)
+    //
+    // FMT-STREAMS-CCE: use the bounded variant here (see doc comment on
+    // `stream_elements_concat_bounded`) — `concat` is the one native that
+    // must tolerate an unbounded/infinite real-pipeline operand.
     let a = match a_ref {
-        Some(r) => stream_elements(ctx, r)?,
+        Some(r) => stream_elements_concat_bounded(ctx, r)?,
         None => Vec::new(),
     };
     let b = match b_ref {
-        Some(r) => stream_elements(ctx, r)?,
+        Some(r) => stream_elements_concat_bounded(ctx, r)?,
         None => Vec::new(),
     };
     let mut combined = a;
