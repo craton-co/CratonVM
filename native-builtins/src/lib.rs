@@ -18574,7 +18574,29 @@ pub fn register_essential_natives(registry: &mut NativeMethodRegistry) {
             };
             // Canonicalise custom GMT-offset ids ("GMT+2" -> "GMT+02:00") so
             // getID() matches the real JDK; IANA/named ids are kept verbatim.
-            let id = normalize_gmt_custom_id(&id).unwrap_or(id);
+            let custom_gmt = normalize_gmt_custom_id(&id);
+            // Real JDK's TimeZone.getTimeZone falls back to the "GMT" zone
+            // (getID() == "GMT") for any string it can't resolve against
+            // tzdata — callers like StringUtils.parseTimeZoneString rely on
+            // exactly that fallback to detect a bogus zone id (e.g. "foo")
+            // and throw IllegalArgumentException. Without it, CratonVM used
+            // to echo the bogus string back as the ID, so that detection
+            // never fired (Jackson2ObjectMapperBuilderTests
+            // .wrongTimeZoneStringSetter expected the throw and never got
+            // it). CratonVM has no full tzdata, so approximate "resolvable"
+            // with the curated offset table plus the universal IANA
+            // Area/Location pattern (a '/' in the id) — real zone ids all
+            // match one of those; "foo" matches neither.
+            let recognized = id == "GMT"
+                || id == "UTC"
+                || custom_gmt.is_some()
+                || tz_standard_offset_seconds(&id).is_some()
+                || id.contains('/');
+            let id = if recognized {
+                custom_gmt.unwrap_or(id)
+            } else {
+                "GMT".to_string()
+            };
             Ok(Some(alloc_synth_timezone(ctx, &id)))
         },
     );
@@ -44398,7 +44420,6 @@ pub(crate) fn url_parse(ctx: &mut dyn NativeContext, this: ObjectRef, url_str: &
     // which used to leave `URI` field 5 empty and broke
     // `getSchemeSpecificPart() -> new File(...)` for Spring Boot's launcher.
     if let Some(rest) = url_str.strip_prefix("file:") {
-        let full_obj = ctx.create_string(url_str);
         let path_str = rest.to_string();
         let path_obj = ctx.create_string(&path_str);
         let proto_obj = ctx.create_string("file");
@@ -44408,7 +44429,22 @@ pub(crate) fn url_parse(ctx: &mut dyn NativeContext, this: ObjectRef, url_str: &
         ctx.set_field(this, URL_FIELD_PORT, Value::Int(-1));
         ctx.set_field(this, URL_FIELD_PATH, Value::Object(Some(path_obj)));
         ctx.set_field(this, URL_FIELD_QUERY, Value::Object(None));
-        ctx.set_field(this, URL_FIELD_FULL, Value::Object(Some(full_obj)));
+        // Intentionally skip writing `URL_FIELD_FULL` (slot index 5): for a
+        // real-JDK URL instance that index aliases the real `authority`
+        // field (see the sibling `jar:` fast path below, which already
+        // avoids this). Stuffing the whole raw string there made real
+        // bytecode's `getAuthority()` return e.g. `"file:/opt/foo/bar"`
+        // instead of `null`, which corrupted any later `new URL(URL base,
+        // String spec)` merge that used this URL as its base (Woodstox's
+        // `URLUtil.urlFromSystemId(String, URL)`, hit while resolving a
+        // DTD's external SYSTEM entity, inherited the bogus authority and
+        // real JDK's own validation rejected it with
+        // `MalformedURLException: Illegal character found in authority:
+        // '/'` — see Jaxb2CollectionHttpMessageConverterTests
+        // .readXmlRootElementExternalEntityEnabled()). Explicitly null the
+        // named `authority` field instead; `getProtocol`/`toExternalForm`
+        // reconstruct the string from protocol/host/port/path already.
+        ctx.set_field_by_name(this, "authority", Value::Object(None));
         return;
     }
 
