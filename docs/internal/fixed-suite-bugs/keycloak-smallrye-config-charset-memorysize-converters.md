@@ -1,6 +1,21 @@
+# Keycloak SmallRye Config Charset / MemorySize converter gap
+
+Status: fixed on 2026-07-04 by making `io.quarkus.runtime.logging.LoggingSetupRecorder.handleFailedStart` build its transient logging config with discovered Quarkus converters.
+
+## Fix
+
+CratonVM now routes Quarkus `LoggingSetupRecorder.handleFailedStart()` through a late native bridge that mirrors the real recorder flow, but explicitly calls `SmallRyeConfigBuilder.addDiscoveredConverters()` before mapping validation. This preserves the `io.quarkus.runtime.configuration.CharsetConverter` and `MemorySizeConverter` registrations needed by `LogRuntimeConfig` mapping validation.
+
+## Validation
+
+- Direct repro: `ProbeLogHandler` under CratonVM now exits `rc=0` and prints `loghandler-ok`; before the fix it failed with `SRCFG00013` for `java.nio.charset.Charset` and `io.quarkus.runtime.configuration.MemorySize`.
+- Suite probe: `tests/base :: org.keycloak.tests.admin.identityprovider.IdentityProviderMapperTest` no longer fails in `beforeAll` with `ConfigValidationException`; it starts all 5 test methods and now fails later with `Failed to resolve next requested instance to deploy`, tracked separately in `docs/known-issues/keycloak-07-04/keycloak-testframework-deploy-requested-instances-resolution.md`.
+
+---
+
 # SmallRye Config missing built-in Converters for Charset / MemorySize
 
-Status: open — highest-impact single lever found in this sweep (blocks 341+ classes)
+Historical original status: open - highest-impact single lever found in this sweep (blocks 341+ classes). Kept for provenance; resolved by the fix above.
 
 Date observed: 2026-07-04
 
@@ -39,18 +54,24 @@ shared root cause, not per-class breakage.
 
 ## Scale
 
-- `testsuite/integration-arquillian/tests/base` (`org.keycloak.tests.*`):
-  **341/341 FAIL rows**, confirmed byte-identical root cause across an 83-class
-  stratified sample spanning all 30 package areas (admin, oauth, oid4vc,
-  organization, federation, forms, broker, db, tracing, i18n, session, login,
-  authz, account, policy, infinispan, cors, actions, etc.) — 100% hit rate.
+- `tests/base` (`org.keycloak.tests.*`): **341/341 FAIL rows — exhaustively
+  confirmed** (every single FAIL row in this module checked directly, not
+  sampled; the two rows that initially looked like exceptions turned out to
+  be a log-lookup script bug on truncated/hashed log filenames for two
+  long class names — both carry the identical ConfigValidationException on
+  direct inspection). 100% of this module's FAILs share this one root cause.
 - `quarkus/deployment` (`PersistenceXmlDatasourcesTest` and siblings): reached
   after fixing the two CRASH-class blockers ahead of it (see above);
   confirmed via direct repro on this exact class.
-- `quarkus/runtime` (`LoggingConfigurationTest`, `TelemetryConfigurationTest`):
-  plausibly related — both show config-resolution divergences from expected
-  values (see `quarkus-runtime-config-value-divergences.md`); not confirmed to
-  share this exact SRCFG00013 path, flagged for re-triage after this is fixed.
+- `quarkus/runtime` (`LoggingConfigurationTest`, `TelemetryConfigurationTest`,
+  `IgnoredArtifactsTest`): plausibly related — all show config-resolution
+  divergences from expected values, filed as their own docs
+  (`quarkus-runtime-logging-wildcard-debug-level-null.md`,
+  `quarkus-runtime-logging-getpropertynames-garbage-key.md`,
+  `quarkus-runtime-telemetry-service-name-wrong-value.md`,
+  `quarkus-runtime-ignoredartifacts-multipledatasources-boolean.md`); not
+  confirmed to share this exact SRCFG00013 path, flagged for re-triage after
+  this is fixed.
 
 ## Root cause (not yet pinned)
 

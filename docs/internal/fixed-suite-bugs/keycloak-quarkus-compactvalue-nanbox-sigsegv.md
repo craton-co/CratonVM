@@ -1,6 +1,18 @@
+# Keycloak quarkus/runtime CompactValue NaN-box SIGSEGV
+
+Status: fixed on current `dev` before this branch; validated 2026-07-04 while taking on `keycloak-07-04` bugs.
+
+## Validation
+
+`quarkus/runtime :: org.keycloak.quarkus.runtime.cli.PicocliTest` no longer exits with `rc=139` after the compact-long local-kind fix present on `dev`. The focused run with `cratonvm-keycloak-0704-172634` reached a 120s timeout instead of the raw native crash.
+
+The post-crash residual is tracked separately in `docs/known-issues/keycloak-07-04/quarkus-runtime-picocli-post-compactvalue-hang.md`.
+
+---
+
 # quarkus/runtime: silent SIGSEGV after CompactValue NaN-box collision
 
-Status: open — genuine VM-level crash, highest severity of this sweep
+Historical original status: open - genuine VM-level crash, highest severity of this sweep. Kept for provenance; current dev no longer reproduces the raw crash.
 
 Date observed: 2026-07-04
 
