@@ -185,6 +185,42 @@ pub(crate) fn register_string_builder_natives(registry: &mut NativeMethodRegistr
     registry.register(
         class,
         "append",
+        "(Ljava/lang/String;)Ljava/lang/AbstractStringBuilder;",
+        native_sb_append_string,
+    );
+    registry.register(
+        class,
+        "append",
+        "(Ljava/lang/StringBuffer;)Ljava/lang/StringBuilder;",
+        native_sb_append_charsequence,
+    );
+    registry.register(
+        class,
+        "append",
+        "(Ljava/lang/StringBuffer;)Ljava/lang/StringBuffer;",
+        native_sb_append_charsequence,
+    );
+    registry.register(
+        class,
+        "append",
+        "(Ljava/lang/StringBuffer;)Ljava/lang/AbstractStringBuilder;",
+        native_sb_append_charsequence,
+    );
+    registry.register(
+        class,
+        "append",
+        "(Ljava/lang/AbstractStringBuilder;)Ljava/lang/AbstractStringBuilder;",
+        native_sb_append_charsequence,
+    );
+    registry.register(
+        class,
+        "appendNull",
+        "()Ljava/lang/AbstractStringBuilder;",
+        native_sb_append_null,
+    );
+    registry.register(
+        class,
+        "append",
         "(I)Ljava/lang/StringBuilder;",
         native_sb_append_int,
     );
@@ -192,6 +228,12 @@ pub(crate) fn register_string_builder_natives(registry: &mut NativeMethodRegistr
         class,
         "append",
         "(I)Ljava/lang/StringBuffer;",
+        native_sb_append_int,
+    );
+    registry.register(
+        class,
+        "append",
+        "(I)Ljava/lang/AbstractStringBuilder;",
         native_sb_append_int,
     );
     registry.register(
@@ -205,6 +247,36 @@ pub(crate) fn register_string_builder_natives(registry: &mut NativeMethodRegistr
         "append",
         "(C)Ljava/lang/StringBuffer;",
         native_sb_append_char,
+    );
+    registry.register(
+        class,
+        "append",
+        "(C)Ljava/lang/AbstractStringBuilder;",
+        native_sb_append_char,
+    );
+    registry.register(
+        class,
+        "append",
+        "(C)Ljava/lang/Appendable;",
+        native_sb_append_char,
+    );
+    registry.register(
+        class,
+        "appendCodePoint",
+        "(I)Ljava/lang/StringBuilder;",
+        native_sb_append_codepoint,
+    );
+    registry.register(
+        class,
+        "appendCodePoint",
+        "(I)Ljava/lang/StringBuffer;",
+        native_sb_append_codepoint,
+    );
+    registry.register(
+        class,
+        "appendCodePoint",
+        "(I)Ljava/lang/AbstractStringBuilder;",
+        native_sb_append_codepoint,
     );
     // JDK 21+ `repeat(int codePoint, int count)` — intercept so it operates on
     // the synthetic char[] layout instead of running real bytecode that hits
@@ -223,6 +295,18 @@ pub(crate) fn register_string_builder_natives(registry: &mut NativeMethodRegistr
     );
     registry.register(
         class,
+        "repeat",
+        "(II)Ljava/lang/AbstractStringBuilder;",
+        native_sb_repeat_codepoint,
+    );
+    registry.register(
+        class,
+        "repeat",
+        "(CI)Ljava/lang/AbstractStringBuilder;",
+        native_sb_repeat_codepoint,
+    );
+    registry.register(
+        class,
         "append",
         "([CII)Ljava/lang/StringBuilder;",
         native_sb_append_char_array_off_len,
@@ -231,6 +315,12 @@ pub(crate) fn register_string_builder_natives(registry: &mut NativeMethodRegistr
         class,
         "append",
         "([CII)Ljava/lang/StringBuffer;",
+        native_sb_append_char_array_off_len,
+    );
+    registry.register(
+        class,
+        "append",
+        "([CII)Ljava/lang/AbstractStringBuilder;",
         native_sb_append_char_array_off_len,
     );
     registry.register(
@@ -248,6 +338,12 @@ pub(crate) fn register_string_builder_natives(registry: &mut NativeMethodRegistr
     registry.register(
         class,
         "append",
+        "([C)Ljava/lang/AbstractStringBuilder;",
+        native_sb_append_char_array,
+    );
+    registry.register(
+        class,
+        "append",
         "(Z)Ljava/lang/StringBuilder;",
         native_sb_append_boolean,
     );
@@ -255,6 +351,12 @@ pub(crate) fn register_string_builder_natives(registry: &mut NativeMethodRegistr
         class,
         "append",
         "(Z)Ljava/lang/StringBuffer;",
+        native_sb_append_boolean,
+    );
+    registry.register(
+        class,
+        "append",
+        "(Z)Ljava/lang/AbstractStringBuilder;",
         native_sb_append_boolean,
     );
     registry.register(
@@ -272,6 +374,12 @@ pub(crate) fn register_string_builder_natives(registry: &mut NativeMethodRegistr
     registry.register(
         class,
         "append",
+        "(J)Ljava/lang/AbstractStringBuilder;",
+        native_sb_append_long,
+    );
+    registry.register(
+        class,
+        "append",
         "(D)Ljava/lang/StringBuilder;",
         native_sb_append_double,
     );
@@ -279,6 +387,12 @@ pub(crate) fn register_string_builder_natives(registry: &mut NativeMethodRegistr
         class,
         "append",
         "(D)Ljava/lang/StringBuffer;",
+        native_sb_append_double,
+    );
+    registry.register(
+        class,
+        "append",
+        "(D)Ljava/lang/AbstractStringBuilder;",
         native_sb_append_double,
     );
     registry.register(
@@ -296,6 +410,12 @@ pub(crate) fn register_string_builder_natives(registry: &mut NativeMethodRegistr
     registry.register(
         class,
         "append",
+        "(F)Ljava/lang/AbstractStringBuilder;",
+        native_sb_append_float,
+    );
+    registry.register(
+        class,
+        "append",
         "(Ljava/lang/Object;)Ljava/lang/StringBuilder;",
         native_sb_append_object,
     );
@@ -303,6 +423,12 @@ pub(crate) fn register_string_builder_natives(registry: &mut NativeMethodRegistr
         class,
         "append",
         "(Ljava/lang/Object;)Ljava/lang/StringBuffer;",
+        native_sb_append_object,
+    );
+    registry.register(
+        class,
+        "append",
+        "(Ljava/lang/Object;)Ljava/lang/AbstractStringBuilder;",
         native_sb_append_object,
     );
     // C36: intercept the (CharSequence, int, int) variants used by
@@ -330,6 +456,12 @@ pub(crate) fn register_string_builder_natives(registry: &mut NativeMethodRegistr
     registry.register(
         class,
         "append",
+        "(Ljava/lang/CharSequence;II)Ljava/lang/Appendable;",
+        native_sb_append_charsequence_off_len,
+    );
+    registry.register(
+        class,
+        "append",
         "(Ljava/lang/CharSequence;)Ljava/lang/StringBuilder;",
         native_sb_append_charsequence,
     );
@@ -343,6 +475,12 @@ pub(crate) fn register_string_builder_natives(registry: &mut NativeMethodRegistr
         class,
         "append",
         "(Ljava/lang/CharSequence;)Ljava/lang/AbstractStringBuilder;",
+        native_sb_append_charsequence,
+    );
+    registry.register(
+        class,
+        "append",
+        "(Ljava/lang/CharSequence;)Ljava/lang/Appendable;",
         native_sb_append_charsequence,
     );
     registry.register(
@@ -579,6 +717,30 @@ pub(crate) fn register_string_builder_natives(registry: &mut NativeMethodRegistr
             sb_write_chars(ctx, this, &chars);
             Ok(Some(Value::Object(Some(this))))
         },
+    );
+    registry.register(
+        class,
+        "repeat",
+        "(Ljava/lang/CharSequence;I)Ljava/lang/StringBuffer;",
+        native_sb_repeat_charsequence,
+    );
+    registry.register(
+        class,
+        "repeat",
+        "(Ljava/lang/CharSequence;I)Ljava/lang/AbstractStringBuilder;",
+        native_sb_repeat_charsequence,
+    );
+    registry.register(
+        class,
+        "repeat",
+        "(Ljava/lang/String;I)Ljava/lang/StringBuffer;",
+        native_sb_repeat_charsequence,
+    );
+    registry.register(
+        class,
+        "repeat",
+        "(Ljava/lang/String;I)Ljava/lang/AbstractStringBuilder;",
+        native_sb_repeat_charsequence,
     );
     // Java 21: StringBuilder.repeat(int codePoint, int count). MUST be a native:
     // unregistered, it falls through to the real `AbstractStringBuilder.repeat`
@@ -1450,6 +1612,38 @@ pub(crate) fn native_sb_append_char(
     Ok(Some(Value::Object(Some(this))))
 }
 
+pub(crate) fn native_sb_append_null(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(obj))) => *obj,
+        _ => return Ok(None),
+    };
+    sb_append_str(ctx, this, "null");
+    Ok(Some(Value::Object(Some(this))))
+}
+
+pub(crate) fn native_sb_append_codepoint(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(obj))) => *obj,
+        _ => return Ok(None),
+    };
+    let code_point = match args.get(1) {
+        Some(Value::Int(v)) => *v,
+        _ => 0,
+    };
+    let repeat_args = [
+        Value::Object(Some(this)),
+        Value::Int(code_point),
+        Value::Int(1),
+    ];
+    native_sb_repeat_codepoint(ctx, &repeat_args)
+}
+
 /// `StringBuilder.repeat(int codePoint, int count)` / `StringBuffer.repeat(...)`
 /// (JDK 21+). Without this native the real `AbstractStringBuilder.repeat`
 /// bytecode runs against our synthetic `char[]` layout: it reaches
@@ -1510,6 +1704,35 @@ pub(crate) fn native_sb_repeat_codepoint(
         chars.extend_from_slice(&unit);
     }
     sb_append_chars(ctx, this, &chars);
+    Ok(Some(Value::Object(Some(this))))
+}
+
+pub(crate) fn native_sb_repeat_charsequence(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(obj))) => *obj,
+        _ => return Ok(None),
+    };
+    let cs = match args.get(1) {
+        Some(Value::Object(Some(o))) => *o,
+        _ => return Ok(Some(Value::Object(Some(this)))),
+    };
+    let count = match args.get(2) {
+        Some(Value::Int(v)) => (*v).max(0) as usize,
+        _ => 0,
+    };
+    if count == 0 {
+        return Ok(Some(Value::Object(Some(this))));
+    }
+    let text = invoke_to_string(ctx, cs).unwrap_or_default();
+    let units: Vec<u16> = text.encode_utf16().collect();
+    let mut chars = sb_read_chars(ctx, this);
+    for _ in 0..count {
+        chars.extend_from_slice(&units);
+    }
+    sb_write_chars(ctx, this, &chars);
     Ok(Some(Value::Object(Some(this))))
 }
 
@@ -5870,6 +6093,64 @@ mod tests {
                 "java/lang/AbstractStringBuilder",
                 "append",
                 "(Ljava/lang/CharSequence;II)Ljava/lang/AbstractStringBuilder;",
+            )
+            .is_some());
+    }
+
+    #[test]
+    fn sb_abstract_builder_registration_includes_layout_sensitive_append_variants() {
+        let mut registry = NativeMethodRegistry::new();
+        register_string_builder_natives(&mut registry, "java/lang/AbstractStringBuilder");
+        for (name, desc) in [
+            (
+                "append",
+                "(Ljava/lang/String;)Ljava/lang/AbstractStringBuilder;",
+            ),
+            (
+                "append",
+                "(Ljava/lang/Object;)Ljava/lang/AbstractStringBuilder;",
+            ),
+            ("append", "([C)Ljava/lang/AbstractStringBuilder;"),
+            ("append", "([CII)Ljava/lang/AbstractStringBuilder;"),
+            ("append", "(I)Ljava/lang/AbstractStringBuilder;"),
+            (
+                "appendCodePoint",
+                "(I)Ljava/lang/AbstractStringBuilder;",
+            ),
+            ("repeat", "(II)Ljava/lang/AbstractStringBuilder;"),
+            (
+                "repeat",
+                "(Ljava/lang/CharSequence;I)Ljava/lang/AbstractStringBuilder;",
+            ),
+        ] {
+            assert!(
+                registry
+                    .find("java/lang/AbstractStringBuilder", name, desc)
+                    .is_some(),
+                "missing native for {name}{desc}"
+            );
+        }
+    }
+
+    #[test]
+    fn sb_appendable_bridge_registration_includes_charsequence_variants() {
+        let mut registry = NativeMethodRegistry::new();
+        register_string_builder_natives(&mut registry, "java/lang/StringBuilder");
+        assert!(registry
+            .find("java/lang/StringBuilder", "append", "(C)Ljava/lang/Appendable;")
+            .is_some());
+        assert!(registry
+            .find(
+                "java/lang/StringBuilder",
+                "append",
+                "(Ljava/lang/CharSequence;)Ljava/lang/Appendable;",
+            )
+            .is_some());
+        assert!(registry
+            .find(
+                "java/lang/StringBuilder",
+                "append",
+                "(Ljava/lang/CharSequence;II)Ljava/lang/Appendable;",
             )
             .is_some());
     }
