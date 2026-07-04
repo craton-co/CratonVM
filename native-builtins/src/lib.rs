@@ -44851,12 +44851,29 @@ fn uri_scheme_name_fail_index(s: &str) -> Option<(usize, &'static str)> {
 /// goal is to match HotSpot on the clearly-malformed ASCII cases (spaces,
 /// `{}<>"\^|`), not to police every Unicode edge.
 fn uri_first_illegal_index(s: &str) -> Option<usize> {
+    let bytes = s.as_bytes();
     for (i, c) in s.char_indices() {
         let u = c as u32;
         if u < 0x20 || u == 0x7f {
             return Some(i);
         }
         if u >= 0x80 {
+            continue;
+        }
+        // A `%` is only legal as the start of an "escaped" triple (`%` hex hex,
+        // RFC 2396). The real JDK single-string URI parser validates this and
+        // throws `URISyntaxException` for a bare/malformed `%` (e.g. "foo%%x",
+        // "/p%th") — our check previously allowed `%` unconditionally, so
+        // malformed escapes silently passed through `new URI(String)` instead
+        // of throwing, which broke `ServletServerHttpRequest.initURI`'s
+        // catch-and-reencode fallback (it never got a chance to run) and the
+        // "malformed path must throw IllegalStateException" contract.
+        if c == '%' {
+            let valid_escape = bytes.get(i + 1).copied().map(is_ascii_hex_digit) == Some(true)
+                && bytes.get(i + 2).copied().map(is_ascii_hex_digit) == Some(true);
+            if !valid_escape {
+                return Some(i);
+            }
             continue;
         }
         let ok = c.is_ascii_alphanumeric()
@@ -44867,14 +44884,66 @@ fn uri_first_illegal_index(s: &str) -> Option<usize> {
                 // reserved (RFC 2396 + RFC 2732 host brackets)
                 | ';' | '/' | '?' | ':' | '@' | '&' | '=' | '+' | '$' | ','
                 | '[' | ']'
-                // escape + fragment delimiter
-                | '%' | '#'
+                // fragment delimiter
+                | '#'
             );
         if !ok {
             return Some(i);
         }
     }
     None
+}
+
+fn is_ascii_hex_digit(b: u8) -> bool {
+    b.is_ascii_hexdigit()
+}
+
+/// Percent-quote characters not permitted in a URI query component (RFC 2396
+/// `uric` = reserved | unreserved), mirroring `java.net.URI`'s private
+/// `quote(String, L_URIC, H_URIC)`. The multi-argument `URI` constructors
+/// (`native_uri_init_5`/`native_uri_init_7`) take *raw/decoded* component
+/// strings and must escape anything outside that set — including a literal
+/// `%`, which is NOT in `L_URIC` (real JDK always escapes a bare `%` supplied
+/// this way to `%25`, since these constructors have no "already escaped"
+/// concept). Previously these natives spliced the query string in completely
+/// unescaped, so `ServletServerHttpRequest.initURI`'s malformed-query
+/// fallback (`new URI(null, null, "", query, null).getRawQuery()`, used to
+/// turn "foo%%x" into "foo%25%25x") was a no-op.
+fn quote_uric(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        if c.is_ascii() {
+            let allowed = c.is_ascii_alphanumeric()
+                || matches!(
+                    c,
+                    '-' | '_' | '.' | '!' | '~' | '*' | '\'' | '('
+                        | ')'
+                        | ';'
+                        | '/'
+                        | '?'
+                        | ':'
+                        | '@'
+                        | '&'
+                        | '='
+                        | '+'
+                        | '$'
+                        | ','
+                        | '['
+                        | ']'
+                );
+            if allowed {
+                out.push(c);
+            } else {
+                out.push_str(&format!("%{:02X}", c as u32));
+            }
+        } else {
+            let mut buf = [0u8; 4];
+            for b in c.encode_utf8(&mut buf).as_bytes() {
+                out.push_str(&format!("%{b:02X}"));
+            }
+        }
+    }
+    out
 }
 
 /// Returns the index at which `java.net.URI`'s single-string parser would throw
@@ -45120,7 +45189,7 @@ fn native_uri_init_5(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallR
         _ => None,
     };
     let query_part = match &query {
-        Some(q) => format!("?{q}"),
+        Some(q) => format!("?{}", quote_uric(q)),
         None => String::new(),
     };
     let frag_part = match &_fragment {
@@ -45184,7 +45253,7 @@ fn native_uri_init_7(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallR
         String::new()
     };
     let query_part = match &query {
-        Some(q) => format!("?{q}"),
+        Some(q) => format!("?{}", quote_uric(q)),
         None => String::new(),
     };
     let frag_part = match &_fragment {
