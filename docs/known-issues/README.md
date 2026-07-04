@@ -27,11 +27,15 @@ see `keycloak-07-04/` for every distinct finding.
 
 One CratonVM bug found and FIXED this session:
 [SmallRyeConfig.getConfigMapping(Class) 1-arg bare-interface AbstractMethodError](../internal/fixed-suite-bugs/smallrye-getconfigmapping-1arg-bare-interface-abstractmethoderror.md).
-A background task has been spawned to investigate/fix the highest-priority
-open finding below (the Charset/MemorySize converter gap).
+A background task investigated the Charset/MemorySize converter gap below
+(2026-07-04 follow-up) — the root cause was narrowed substantially but not
+conclusively pinned, and critically, fixing it would NOT unlock any of the
+341 tests/base classes to pass (they hit a separate Maven-artifact-resolution
+environment gap immediately after, confirmed present on HotSpot too). See the
+doc for the full writeup; this is no longer the top-priority item.
 
 New OPEN findings from this sweep, in `keycloak-07-04/`, roughly by priority (blast radius):
-- [SmallRye Config missing Charset/MemorySize converters](keycloak-07-04/smallrye-config-missing-charset-memorysize-converters.md) — blocks 341/341 `tests/base` classes (exhaustively confirmed, not sampled), the single highest-value lever found. Investigation/fix spawned as a separate task.
+- [SmallRye Config missing Charset/MemorySize converters](keycloak-07-04/smallrye-config-missing-charset-memorysize-converters.md) — fires on 341/341 `tests/base` classes (exhaustively confirmed), but does NOT block them from passing: HotSpot hits a separate, unrelated Maven-artifact-resolution environment gap immediately after this point clears. Root cause narrowed (confirmed NOT a ServiceLoader/reflection bug) but not conclusively pinned; deprioritized after this discovery.
 - [quarkus/runtime CompactValue NaN-box collision SIGSEGV](keycloak-07-04/quarkus-runtime-compactvalue-nanbox-collision-sigsegv.md) — the only *uncaught* native crash in this sweep (4 classes).
 - [crypto/fips1402 CryptoProvider ServiceLoader returns empty](keycloak-07-04/crypto-fips1402-cryptoprovider-serviceloader-empty.md) — 21 classes.
 - [FacadeClassLoader Object.size() NoSuchMethodError + guarded Class-object OOB access](keycloak-07-04/facadeclassloader-object-size-nosuchmethoderror-classoob.md) — confirmed non-fatal (guard-protected) but real; root cause not fully pinned.
