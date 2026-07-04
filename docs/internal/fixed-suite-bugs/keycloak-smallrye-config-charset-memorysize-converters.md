@@ -1,6 +1,21 @@
+# Keycloak SmallRye Config Charset / MemorySize converter gap
+
+Status: fixed on 2026-07-04 by making `io.quarkus.runtime.logging.LoggingSetupRecorder.handleFailedStart` build its transient logging config with discovered Quarkus converters.
+
+## Fix
+
+CratonVM now routes Quarkus `LoggingSetupRecorder.handleFailedStart()` through a late native bridge that mirrors the real recorder flow, but explicitly calls `SmallRyeConfigBuilder.addDiscoveredConverters()` before mapping validation. This preserves the `io.quarkus.runtime.configuration.CharsetConverter` and `MemorySizeConverter` registrations needed by `LogRuntimeConfig` mapping validation.
+
+## Validation
+
+- Direct repro: `ProbeLogHandler` under CratonVM now exits `rc=0` and prints `loghandler-ok`; before the fix it failed with `SRCFG00013` for `java.nio.charset.Charset` and `io.quarkus.runtime.configuration.MemorySize`.
+- Suite probe: `tests/base :: org.keycloak.tests.admin.identityprovider.IdentityProviderMapperTest` no longer fails in `beforeAll` with `ConfigValidationException`; it starts all 5 test methods and now fails later with `Failed to resolve next requested instance to deploy`, tracked separately in `docs/known-issues/keycloak-07-04/keycloak-testframework-deploy-requested-instances-resolution.md`.
+
+---
+
 # SmallRye Config missing built-in Converters for Charset / MemorySize
 
-Status: open — highest-impact single lever found in this sweep (blocks 341+ classes)
+Historical original status: open - highest-impact single lever found in this sweep (blocks 341+ classes). Kept for provenance; resolved by the fix above.
 
 Date observed: 2026-07-04
 
