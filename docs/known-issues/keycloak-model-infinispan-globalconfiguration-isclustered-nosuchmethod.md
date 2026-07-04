@@ -70,6 +70,28 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass `
 without it, this repro fails earlier with the old `<clinit>` null-realms NPE
 instead of reaching this point.)
 
+## Update: post-PreviewFeatures rerun
+
+The full Azure rerun after fixing
+`jdk/internal/misc/PreviewFeatures.isPreviewEnabled()Z` still reproduces this
+bucket unchanged for the model module:
+
+```text
+run: craton-azure-nonpassed-dev-20260703-previewfeatures-fixed-01
+results: /home/victor/wt-keycloak-previewfeatures-suite-20260703-01/apps/keycloak-suite-runner/.suite/results/craton-azure-nonpassed-dev-20260703-previewfeatures-fixed-01/others-jit/results.tsv
+testsuite/model: 37 CRASH, 1 EMPTY
+signature: no class def found: org/keycloak/testsuite/model/KeycloakModelTest
+```
+
+Representative log:
+
+```text
+/home/victor/wt-keycloak-previewfeatures-suite-20260703-01/apps/keycloak-suite-runner/.suite/results/craton-azure-nonpassed-dev-20260703-previewfeatures-fixed-01/others-jit/logs/testsuite_model.org.keycloak.testsuite.model.client.ClientModelTest.err.log
+```
+
+The rerun confirms this is a residual after the PreviewFeatures fix, not part
+of the original launcher-wide native crash.
+
 ## Next steps
 
 - Instrument/trace CratonVM's method resolution for

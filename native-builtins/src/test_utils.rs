@@ -234,6 +234,9 @@ pub(crate) struct MockNativeContext {
     /// Optional method-aware virtual-call hook for tests that need an invoked
     /// object to perform side effects before returning.
     pub(crate) invoke_virtual_hook: UnsafeCell<Option<InvokeVirtualHook>>,
+    /// Per-native-call roots for tests that simulate a moving GC during
+    /// `invoke_virtual` callbacks.
+    native_pin_roots: UnsafeCell<Vec<ObjectRef>>,
     /// NEW-8: tracks class IDs that have been marked as hidden via
     /// `set_class_hidden`. Consulted by the `is_class_hidden` override.
     hidden_classes: UnsafeCell<std::collections::HashSet<u32>>,
@@ -384,6 +387,7 @@ impl MockNativeContext {
             upcall_entries: UnsafeCell::new(Vec::new()),
             invoke_virtual_result: UnsafeCell::new(None),
             invoke_virtual_hook: UnsafeCell::new(None),
+            native_pin_roots: UnsafeCell::new(Vec::new()),
             hidden_classes: UnsafeCell::new(std::collections::HashSet::new()),
             last_defined_class_name: UnsafeCell::new(None),
             class_flags_override: UnsafeCell::new(HashMap::new()),
@@ -676,6 +680,19 @@ impl MockNativeContext {
     pub(crate) fn set_invoke_virtual_hook(&self, hook: InvokeVirtualHook) {
         // SAFETY: single-threaded test context; no aliasing of the cell.
         unsafe { *self.invoke_virtual_hook.get() = Some(hook) };
+    }
+
+    pub(crate) fn remap_native_pin_addr_for_test(&self, old_addr: usize, new_addr: usize) {
+        let pins = unsafe { &mut *self.native_pin_roots.get() };
+        for pin in pins.iter_mut() {
+            if pin.as_ptr() as usize == old_addr {
+                *pin = unsafe { ObjectRef::from_raw(new_addr as *mut u8) };
+            }
+        }
+    }
+
+    pub(crate) fn native_pin_count_for_test(&self) -> usize {
+        unsafe { (&*self.native_pin_roots.get()).len() }
     }
 
     /// FIX(test-isolation): map a `thread_id` handed out by
@@ -1408,6 +1425,24 @@ impl NativeContext for MockNativeContext {
             r
         } else {
             Ok(None)
+        }
+    }
+
+    fn pin_native_root(&mut self, obj: ObjectRef) -> usize {
+        let roots = unsafe { &mut *self.native_pin_roots.get() };
+        let idx = roots.len();
+        roots.push(obj);
+        idx
+    }
+
+    fn read_native_pin(&self, handle: usize, fallback: ObjectRef) -> ObjectRef {
+        unsafe { (&*self.native_pin_roots.get()).get(handle).copied() }.unwrap_or(fallback)
+    }
+
+    fn unpin_native_roots(&mut self, base: usize) {
+        let roots = unsafe { &mut *self.native_pin_roots.get() };
+        if base < roots.len() {
+            roots.truncate(base);
         }
     }
 

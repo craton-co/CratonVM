@@ -19,7 +19,13 @@
 //! focuses on the unit-level guarantees.
 
 use cratonvm_native_api::{NativeMethodRegistry, StackTraceEntry};
+use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio};
 use std::sync::Arc;
+use std::time::{Duration, Instant};
+
+const LOG4J_CALLER_PROBE: &str = "StackWalkerLog4jCallerProbe";
+const LOG4J_CALLER_TIMEOUT: Duration = Duration::from_secs(45);
 
 #[test]
 fn stack_trace_entry_carries_bci_and_line_number() {
@@ -184,4 +190,146 @@ fn line_number_sentinels_are_minus_one_and_minus_two() {
     use cratonvm_vm::runtime::stackwalker::{LINE_NUMBER_NATIVE, LINE_NUMBER_UNKNOWN};
     assert_eq!(LINE_NUMBER_UNKNOWN, -1);
     assert_eq!(LINE_NUMBER_NATIVE, -2);
+}
+
+fn workspace_root() -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .expect("CARGO_MANIFEST_DIR has no parent")
+        .to_path_buf()
+}
+
+fn cratonvm_binary() -> Option<PathBuf> {
+    if let Ok(bin) = std::env::var("CRATONVM_BIN") {
+        let p = PathBuf::from(&bin);
+        if p.exists() {
+            return Some(p);
+        }
+    }
+    let target = workspace_root().join("target");
+    let exe = if cfg!(windows) {
+        "cratonvm.exe"
+    } else {
+        "cratonvm"
+    };
+    for profile in &["release", "debug"] {
+        let candidate = target.join(profile).join(exe);
+        if candidate.exists() {
+            return Some(candidate);
+        }
+    }
+    None
+}
+
+fn java_home() -> Option<PathBuf> {
+    if let Ok(home) = std::env::var("JAVA_HOME") {
+        let p = PathBuf::from(home);
+        if p.exists() {
+            return Some(p);
+        }
+    }
+    for candidate in [
+        "C:/Program Files/Java/jdk-25",
+        "C:/Program Files/Microsoft/jdk-25.0.3.9-hotspot",
+        "C:/Program Files/Eclipse Adoptium/jdk-25.0.2.10-hotspot",
+    ] {
+        let p = PathBuf::from(candidate);
+        if p.exists() {
+            return Some(p);
+        }
+    }
+    None
+}
+
+fn classpath_dir() -> Option<PathBuf> {
+    if let Some(compiled) = option_env!("CRATONVM_TEST_CLASSES_DIR") {
+        let p = PathBuf::from(compiled);
+        if p.join("cratonvm")
+            .join(format!("{LOG4J_CALLER_PROBE}.class"))
+            .exists()
+        {
+            return Some(p);
+        }
+    }
+    let committed = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/resources");
+    if committed
+        .join("cratonvm")
+        .join(format!("{LOG4J_CALLER_PROBE}.class"))
+        .exists()
+    {
+        return Some(committed);
+    }
+    None
+}
+
+#[test]
+fn stackwalker_log4j_shape_resolves_declaring_caller_under_jit() {
+    let Some(bin) = cratonvm_binary() else {
+        eprintln!(
+            "[wp1_9_stackwalker] cratonvm binary missing; build -p cratonvm-cli or set CRATONVM_BIN"
+        );
+        return;
+    };
+    let Some(jh) = java_home() else {
+        eprintln!("[wp1_9_stackwalker] JDK 25 java-home missing; skipping Log4j caller probe");
+        return;
+    };
+    let Some(cp) = classpath_dir() else {
+        eprintln!(
+            "[wp1_9_stackwalker] {LOG4J_CALLER_PROBE}.class missing; javac likely unavailable"
+        );
+        return;
+    };
+
+    let mut child = Command::new(&bin)
+        .arg("--java-home")
+        .arg(&jh)
+        .arg("-c")
+        .arg(&cp)
+        .arg(format!("cratonvm.{LOG4J_CALLER_PROBE}"))
+        .env_remove("CRATONVM_DISABLE_JIT")
+        .env("CRATONVM_JIT_ALLOW_PACKAGES", "cratonvm/")
+        .env("CRATONVM_JIT_THRESHOLD", "1")
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn cratonvm Log4j caller probe");
+
+    let start = Instant::now();
+    loop {
+        match child.try_wait() {
+            Ok(Some(_)) => break,
+            Ok(None) => {
+                if start.elapsed() > LOG4J_CALLER_TIMEOUT {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    panic!(
+                        "[wp1_9_stackwalker] {LOG4J_CALLER_PROBE} timed out after \
+                         {LOG4J_CALLER_TIMEOUT:?}; StackWalker caller resolution may \
+                         be recursing"
+                    );
+                }
+                std::thread::sleep(Duration::from_millis(25));
+            }
+            Err(e) => panic!("[wp1_9_stackwalker] try_wait failed: {e}"),
+        }
+    }
+
+    let output = child
+        .wait_with_output()
+        .expect("collect cratonvm Log4j caller probe output");
+    let stdout = String::from_utf8_lossy(&output.stdout).replace("\r\n", "\n");
+    let stderr = String::from_utf8_lossy(&output.stderr).replace("\r\n", "\n");
+    let combined = format!("{stdout}\n{stderr}");
+    assert!(
+        output.status.success(),
+        "{LOG4J_CALLER_PROBE} exited with {:?}\n\n{combined}",
+        output.status.code()
+    );
+    assert!(
+        stdout.contains("caller=cratonvm.StackWalkerLog4jCallerProbe$LoggerFactory")
+            && stdout.contains("STACKWALKER_LOG4J_CALLER_OK"),
+        "{LOG4J_CALLER_PROBE} did not resolve the expected caller class\n\n{combined}"
+    );
 }

@@ -18166,6 +18166,660 @@ pub(crate) fn is_typeuse_annotation_native_override(
     }
 }
 
+pub(crate) fn is_antlr_prediction_context_native_override(
+    class_name: &str,
+    method_name: &str,
+    descriptor: &str,
+) -> bool {
+    let antlr_runtime = class_name.starts_with("org/antlr/v4/runtime/")
+        || class_name.starts_with("groovyjarjarantlr4/v4/runtime/");
+    if !antlr_runtime {
+        return false;
+    }
+    if class_name == "org/antlr/v4/runtime/CommonTokenFactory" {
+        return matches!(
+            (method_name, descriptor),
+            (
+                "create",
+                "(Lorg/antlr/v4/runtime/misc/Pair;ILjava/lang/String;IIIII)Lorg/antlr/v4/runtime/CommonToken;"
+            ) | (
+                "create",
+                "(Lorg/antlr/v4/runtime/misc/Pair;ILjava/lang/String;IIIII)Lorg/antlr/v4/runtime/Token;"
+            ) | (
+                "create",
+                "(ILjava/lang/String;)Lorg/antlr/v4/runtime/CommonToken;"
+            ) | ("create", "(ILjava/lang/String;)Lorg/antlr/v4/runtime/Token;")
+        );
+    }
+    if class_name == "org/antlr/v4/runtime/CommonToken" {
+        return matches!(
+            (method_name, descriptor),
+            ("getType", "()I")
+                | ("setType", "(I)V")
+                | ("getText", "()Ljava/lang/String;")
+                | ("setText", "(Ljava/lang/String;)V")
+                | ("getLine", "()I")
+                | ("setLine", "(I)V")
+                | ("getCharPositionInLine", "()I")
+                | ("setCharPositionInLine", "(I)V")
+                | ("getChannel", "()I")
+                | ("setChannel", "(I)V")
+                | ("getStartIndex", "()I")
+                | ("setStartIndex", "(I)V")
+                | ("getStopIndex", "()I")
+                | ("setStopIndex", "(I)V")
+                | ("getTokenIndex", "()I")
+                | ("setTokenIndex", "(I)V")
+                | ("getTokenSource", "()Lorg/antlr/v4/runtime/TokenSource;")
+                | ("getInputStream", "()Lorg/antlr/v4/runtime/CharStream;")
+        );
+    }
+    if class_name.ends_with("/misc/DoubleKeyMap") {
+        return matches!(
+            (method_name, descriptor),
+            ("<init>", "()V")
+                | (
+                    "get",
+                    "(Ljava/lang/Object;Ljava/lang/Object;)Ljava/lang/Object;"
+                )
+                | (
+                    "put",
+                    "(Ljava/lang/Object;Ljava/lang/Object;Ljava/lang/Object;)Ljava/lang/Object;"
+                )
+        );
+    }
+    if class_name.ends_with("/atn/ATNConfigSet") || class_name.ends_with("/atn/OrderedATNConfigSet")
+    {
+        return matches!(
+            (method_name, descriptor),
+            ("add", "(Lorg/antlr/v4/runtime/atn/ATNConfig;)Z")
+                | (
+                    "add",
+                    "(Lorg/antlr/v4/runtime/atn/ATNConfig;Lorg/antlr/v4/runtime/misc/DoubleKeyMap;)Z"
+                )
+                | ("add", "(Lgroovyjarjarantlr4/v4/runtime/atn/ATNConfig;)Z")
+                | (
+                    "add",
+                    "(Lgroovyjarjarantlr4/v4/runtime/atn/ATNConfig;Lgroovyjarjarantlr4/v4/runtime/misc/DoubleKeyMap;)Z"
+                )
+                | ("hashCode", "()I")
+                | ("equals", "(Ljava/lang/Object;)Z")
+        );
+    }
+    if class_name.ends_with("/atn/ATNConfig") {
+        return matches!(
+            (method_name, descriptor),
+            (
+                "<init>",
+                "(Lorg/antlr/v4/runtime/atn/ATNConfig;)V"
+            )
+                | (
+                    "<init>",
+                    "(Lorg/antlr/v4/runtime/atn/ATNConfig;Lorg/antlr/v4/runtime/atn/ATNState;)V"
+                )
+                | (
+                    "<init>",
+                    "(Lorg/antlr/v4/runtime/atn/ATNConfig;Lorg/antlr/v4/runtime/atn/ATNState;Lorg/antlr/v4/runtime/atn/PredictionContext;)V"
+                )
+                | (
+                    "<init>",
+                    "(Lorg/antlr/v4/runtime/atn/ATNConfig;Lorg/antlr/v4/runtime/atn/ATNState;Lorg/antlr/v4/runtime/atn/SemanticContext;)V"
+                )
+                | (
+                "<init>",
+                "(Lorg/antlr/v4/runtime/atn/ATNConfig;Lorg/antlr/v4/runtime/atn/ATNState;Lorg/antlr/v4/runtime/atn/PredictionContext;Lorg/antlr/v4/runtime/atn/SemanticContext;)V"
+            )
+                | (
+                    "<init>",
+                    "(Lgroovyjarjarantlr4/v4/runtime/atn/ATNConfig;)V"
+                )
+                | (
+                    "<init>",
+                    "(Lgroovyjarjarantlr4/v4/runtime/atn/ATNConfig;Lgroovyjarjarantlr4/v4/runtime/atn/ATNState;)V"
+                )
+                | (
+                    "<init>",
+                    "(Lgroovyjarjarantlr4/v4/runtime/atn/ATNConfig;Lgroovyjarjarantlr4/v4/runtime/atn/ATNState;Lgroovyjarjarantlr4/v4/runtime/atn/PredictionContext;)V"
+                )
+                | (
+                    "<init>",
+                    "(Lgroovyjarjarantlr4/v4/runtime/atn/ATNConfig;Lgroovyjarjarantlr4/v4/runtime/atn/ATNState;Lgroovyjarjarantlr4/v4/runtime/atn/SemanticContext;)V"
+                )
+                | (
+                    "<init>",
+                    "(Lgroovyjarjarantlr4/v4/runtime/atn/ATNConfig;Lgroovyjarjarantlr4/v4/runtime/atn/ATNState;Lgroovyjarjarantlr4/v4/runtime/atn/PredictionContext;Lgroovyjarjarantlr4/v4/runtime/atn/SemanticContext;)V"
+                )
+                | ("hashCode", "()I")
+                | ("equals", "(Ljava/lang/Object;)Z")
+                | ("equals", "(Lorg/antlr/v4/runtime/atn/ATNConfig;)Z")
+                | ("equals", "(Lgroovyjarjarantlr4/v4/runtime/atn/ATNConfig;)Z")
+        );
+    }
+    if class_name.ends_with("/atn/LexerATNConfig") {
+        return matches!(
+            (method_name, descriptor),
+            ("hashCode", "()I")
+                | ("equals", "(Ljava/lang/Object;)Z")
+                | ("equals", "(Lorg/antlr/v4/runtime/atn/ATNConfig;)Z")
+                | ("equals", "(Lgroovyjarjarantlr4/v4/runtime/atn/ATNConfig;)Z")
+        );
+    }
+    if class_name.ends_with("/dfa/DFAState") {
+        return matches!(
+            (method_name, descriptor),
+            ("hashCode", "()I") | ("equals", "(Ljava/lang/Object;)Z")
+        );
+    }
+    if class_name.ends_with("/atn/SemanticContext") {
+        return matches!(
+            (method_name, descriptor),
+            (
+                "and",
+                "(Lorg/antlr/v4/runtime/atn/SemanticContext;Lorg/antlr/v4/runtime/atn/SemanticContext;)Lorg/antlr/v4/runtime/atn/SemanticContext;"
+            ) | (
+                "or",
+                "(Lorg/antlr/v4/runtime/atn/SemanticContext;Lorg/antlr/v4/runtime/atn/SemanticContext;)Lorg/antlr/v4/runtime/atn/SemanticContext;"
+            ) | (
+                "and",
+                "(Lgroovyjarjarantlr4/v4/runtime/atn/SemanticContext;Lgroovyjarjarantlr4/v4/runtime/atn/SemanticContext;)Lgroovyjarjarantlr4/v4/runtime/atn/SemanticContext;"
+            ) | (
+                "or",
+                "(Lgroovyjarjarantlr4/v4/runtime/atn/SemanticContext;Lgroovyjarjarantlr4/v4/runtime/atn/SemanticContext;)Lgroovyjarjarantlr4/v4/runtime/atn/SemanticContext;"
+            )
+        );
+    }
+    if matches!(
+        class_name.rsplit('/').next().unwrap_or_default(),
+        "SemanticContext$Predicate"
+            | "SemanticContext$PrecedencePredicate"
+            | "SemanticContext$AND"
+            | "SemanticContext$OR"
+    ) && class_name.contains("/atn/")
+    {
+        return matches!(
+            (method_name, descriptor),
+            ("hashCode", "()I") | ("equals", "(Ljava/lang/Object;)Z")
+        );
+    }
+    if class_name.ends_with("/atn/ATNState") {
+        return matches!(
+            (method_name, descriptor),
+            ("getNumberOfTransitions", "()I")
+                | ("onlyHasEpsilonTransitions", "()Z")
+                | ("transition", "(I)Lorg/antlr/v4/runtime/atn/Transition;")
+                | (
+                    "transition",
+                    "(I)Lgroovyjarjarantlr4/v4/runtime/atn/Transition;"
+                )
+        );
+    }
+    if matches!(
+        class_name.rsplit('/').next().unwrap_or_default(),
+        "BasicState"
+            | "RuleStartState"
+            | "BasicBlockStartState"
+            | "PlusBlockStartState"
+            | "StarBlockStartState"
+            | "TokensStartState"
+            | "RuleStopState"
+            | "BlockEndState"
+            | "StarLoopbackState"
+            | "StarLoopEntryState"
+            | "PlusLoopbackState"
+            | "LoopEndState"
+    ) && class_name.contains("/atn/")
+    {
+        return (method_name, descriptor) == ("getStateType", "()I");
+    }
+    if class_name.ends_with("/misc/IntervalSet") {
+        return (method_name, descriptor) == ("contains", "(I)Z");
+    }
+    if class_name.ends_with("/atn/ParserATNSimulator") {
+        return matches!(
+            (method_name, descriptor),
+            (
+                "canDropLoopEntryEdgeInLeftRecursiveRule",
+                "(Lorg/antlr/v4/runtime/atn/ATNConfig;)Z"
+            ) | (
+                "canDropLoopEntryEdgeInLeftRecursiveRule",
+                "(Lgroovyjarjarantlr4/v4/runtime/atn/ATNConfig;)Z"
+            ) | (
+                "getEpsilonTarget",
+                "(Lorg/antlr/v4/runtime/atn/ATNConfig;Lorg/antlr/v4/runtime/atn/Transition;ZZZZ)Lorg/antlr/v4/runtime/atn/ATNConfig;"
+            ) | (
+                "getEpsilonTarget",
+                "(Lgroovyjarjarantlr4/v4/runtime/atn/ATNConfig;Lgroovyjarjarantlr4/v4/runtime/atn/Transition;ZZZZ)Lgroovyjarjarantlr4/v4/runtime/atn/ATNConfig;"
+            ) | (
+                "computeReachSet",
+                "(Lorg/antlr/v4/runtime/atn/ATNConfigSet;IZ)Lorg/antlr/v4/runtime/atn/ATNConfigSet;"
+            ) | (
+                "computeReachSet",
+                "(Lgroovyjarjarantlr4/v4/runtime/atn/ATNConfigSet;IZ)Lgroovyjarjarantlr4/v4/runtime/atn/ATNConfigSet;"
+            ) | (
+                "closureCheckingStopState",
+                "(Lorg/antlr/v4/runtime/atn/ATNConfig;Lorg/antlr/v4/runtime/atn/ATNConfigSet;Ljava/util/Set;ZZIZ)V"
+            ) | (
+                "closureCheckingStopState",
+                "(Lgroovyjarjarantlr4/v4/runtime/atn/ATNConfig;Lgroovyjarjarantlr4/v4/runtime/atn/ATNConfigSet;Ljava/util/Set;ZZIZ)V"
+            ) | (
+                "closure",
+                "(Lorg/antlr/v4/runtime/atn/ATNConfig;Lorg/antlr/v4/runtime/atn/ATNConfigSet;Ljava/util/Set;ZZZ)V"
+            ) | (
+                "closure",
+                "(Lgroovyjarjarantlr4/v4/runtime/atn/ATNConfig;Lgroovyjarjarantlr4/v4/runtime/atn/ATNConfigSet;Ljava/util/Set;ZZZ)V"
+            ) | (
+                "closure_",
+                "(Lorg/antlr/v4/runtime/atn/ATNConfig;Lorg/antlr/v4/runtime/atn/ATNConfigSet;Ljava/util/Set;ZZIZ)V"
+            ) | (
+                "closure_",
+                "(Lgroovyjarjarantlr4/v4/runtime/atn/ATNConfig;Lgroovyjarjarantlr4/v4/runtime/atn/ATNConfigSet;Ljava/util/Set;ZZIZ)V"
+            )
+        );
+    }
+    if class_name.ends_with("/atn/Transition") {
+        return (method_name, descriptor) == ("isEpsilon", "()Z");
+    }
+    if matches!(
+        class_name.rsplit('/').next().unwrap_or_default(),
+        "EpsilonTransition"
+            | "RangeTransition"
+            | "RuleTransition"
+            | "PredicateTransition"
+            | "AtomTransition"
+            | "ActionTransition"
+            | "SetTransition"
+            | "NotSetTransition"
+            | "WildcardTransition"
+            | "PrecedencePredicateTransition"
+    ) && class_name.contains("/atn/")
+    {
+        return matches!(
+            (method_name, descriptor),
+            ("getSerializationType", "()I") | ("isEpsilon", "()Z") | ("matches", "(III)Z")
+        );
+    }
+    if class_name.ends_with("/atn/PredictionMode") {
+        return matches!(
+            (method_name, descriptor),
+            (
+                "getConflictingAltSubsets",
+                "(Lorg/antlr/v4/runtime/atn/ATNConfigSet;)Ljava/util/Collection;"
+            ) | (
+                "getConflictingAltSubsets",
+                "(Lgroovyjarjarantlr4/v4/runtime/atn/ATNConfigSet;)Ljava/util/Collection;"
+            ) | (
+                "hasStateAssociatedWithOneAlt",
+                "(Lorg/antlr/v4/runtime/atn/ATNConfigSet;)Z"
+            ) | (
+                "hasStateAssociatedWithOneAlt",
+                "(Lgroovyjarjarantlr4/v4/runtime/atn/ATNConfigSet;)Z"
+            )
+        );
+    }
+    if class_name.ends_with("/atn/PredictionContext") {
+        return matches!(
+            (method_name, descriptor),
+            ("hashCode", "()I")
+                | ("isEmpty", "()Z")
+                | ("hasEmptyPath", "()Z")
+                | ("calculateEmptyHashCode", "()I")
+                | (
+                    "calculateHashCode",
+                    "(Lorg/antlr/v4/runtime/atn/PredictionContext;I)I"
+                )
+                | (
+                    "calculateHashCode",
+                    "([Lorg/antlr/v4/runtime/atn/PredictionContext;[I)I"
+                )
+                | (
+                    "calculateHashCode",
+                    "(Lgroovyjarjarantlr4/v4/runtime/atn/PredictionContext;I)I"
+                )
+                | (
+                    "calculateHashCode",
+                    "([Lgroovyjarjarantlr4/v4/runtime/atn/PredictionContext;[I)I"
+                )
+                | (
+                    "merge",
+                    "(Lorg/antlr/v4/runtime/atn/PredictionContext;Lorg/antlr/v4/runtime/atn/PredictionContext;ZLorg/antlr/v4/runtime/misc/DoubleKeyMap;)Lorg/antlr/v4/runtime/atn/PredictionContext;"
+                )
+                | (
+                    "mergeSingletons",
+                    "(Lorg/antlr/v4/runtime/atn/SingletonPredictionContext;Lorg/antlr/v4/runtime/atn/SingletonPredictionContext;ZLorg/antlr/v4/runtime/misc/DoubleKeyMap;)Lorg/antlr/v4/runtime/atn/PredictionContext;"
+                )
+                | (
+                    "mergeRoot",
+                    "(Lorg/antlr/v4/runtime/atn/SingletonPredictionContext;Lorg/antlr/v4/runtime/atn/SingletonPredictionContext;Z)Lorg/antlr/v4/runtime/atn/PredictionContext;"
+                )
+                | (
+                    "mergeArrays",
+                    "(Lorg/antlr/v4/runtime/atn/ArrayPredictionContext;Lorg/antlr/v4/runtime/atn/ArrayPredictionContext;ZLorg/antlr/v4/runtime/misc/DoubleKeyMap;)Lorg/antlr/v4/runtime/atn/PredictionContext;"
+                )
+                | (
+                    "merge",
+                    "(Lgroovyjarjarantlr4/v4/runtime/atn/PredictionContext;Lgroovyjarjarantlr4/v4/runtime/atn/PredictionContext;ZLgroovyjarjarantlr4/v4/runtime/misc/DoubleKeyMap;)Lgroovyjarjarantlr4/v4/runtime/atn/PredictionContext;"
+                )
+                | (
+                    "mergeSingletons",
+                    "(Lgroovyjarjarantlr4/v4/runtime/atn/SingletonPredictionContext;Lgroovyjarjarantlr4/v4/runtime/atn/SingletonPredictionContext;ZLgroovyjarjarantlr4/v4/runtime/misc/DoubleKeyMap;)Lgroovyjarjarantlr4/v4/runtime/atn/PredictionContext;"
+                )
+                | (
+                    "mergeRoot",
+                    "(Lgroovyjarjarantlr4/v4/runtime/atn/SingletonPredictionContext;Lgroovyjarjarantlr4/v4/runtime/atn/SingletonPredictionContext;Z)Lgroovyjarjarantlr4/v4/runtime/atn/PredictionContext;"
+                )
+                | (
+                    "mergeArrays",
+                    "(Lgroovyjarjarantlr4/v4/runtime/atn/ArrayPredictionContext;Lgroovyjarjarantlr4/v4/runtime/atn/ArrayPredictionContext;ZLgroovyjarjarantlr4/v4/runtime/misc/DoubleKeyMap;)Lgroovyjarjarantlr4/v4/runtime/atn/PredictionContext;"
+                )
+        );
+    }
+    if class_name.ends_with("/atn/SingletonPredictionContext")
+        || class_name.ends_with("/atn/EmptyPredictionContext")
+        || class_name.ends_with("/atn/ArrayPredictionContext")
+    {
+        if method_name == "<init>" {
+            return matches!(
+                descriptor,
+                "()V"
+                    | "(Lorg/antlr/v4/runtime/atn/PredictionContext;I)V"
+                    | "(Lgroovyjarjarantlr4/v4/runtime/atn/PredictionContext;I)V"
+                    | "([Lorg/antlr/v4/runtime/atn/PredictionContext;[I)V"
+                    | "([Lgroovyjarjarantlr4/v4/runtime/atn/PredictionContext;[I)V"
+                    | "(Lorg/antlr/v4/runtime/atn/SingletonPredictionContext;)V"
+                    | "(Lgroovyjarjarantlr4/v4/runtime/atn/SingletonPredictionContext;)V"
+            );
+        }
+        return matches!(
+            (method_name, descriptor),
+            ("hashCode", "()I")
+                | ("isEmpty", "()Z")
+                | ("hasEmptyPath", "()Z")
+                | ("size", "()I")
+                | ("getReturnState", "(I)I")
+                | ("equals", "(Ljava/lang/Object;)Z")
+                | (
+                    "getParent",
+                    "(I)Lorg/antlr/v4/runtime/atn/PredictionContext;"
+                )
+                | (
+                    "getParent",
+                    "(I)Lgroovyjarjarantlr4/v4/runtime/atn/PredictionContext;"
+                )
+        );
+    }
+    false
+}
+
+pub(crate) fn is_bytebuddy_method_token_native_override(
+    class_name: &str,
+    method_name: &str,
+    descriptor: &str,
+) -> bool {
+    if matches!(
+        class_name,
+        "net/bytebuddy/description/method/MethodDescription$TypeToken"
+            | "net/bytebuddy/description/method/MethodDescription$SignatureToken"
+            | "net/bytebuddy/dynamic/scaffold/MethodGraph$Compiler$Default$Harmonizer$ForJavaMethod$Token"
+    ) {
+        return matches!(
+            (method_name, descriptor),
+            ("hashCode", "()I") | ("equals", "(Ljava/lang/Object;)Z")
+        );
+    }
+    if class_name == "net/bytebuddy/description/method/MethodDescription$TypeSubstituting" {
+        return (method_name, descriptor)
+            == (
+                "<init>",
+                "(Lnet/bytebuddy/description/type/TypeDescription$Generic;Lnet/bytebuddy/description/method/MethodDescription;Lnet/bytebuddy/description/type/TypeDescription$Generic$Visitor;)V",
+            );
+    }
+    if matches!(
+        class_name,
+        "net/bytebuddy/description/method/MethodList$Explicit"
+            | "net/bytebuddy/description/method/MethodList$TypeSubstituting"
+            | "net/bytebuddy/description/method/MethodList$ForLoadedMethods"
+            | "net/bytebuddy/description/method/MethodList$ForTokens"
+            | "net/bytebuddy/description/field/FieldList$Explicit"
+            | "net/bytebuddy/description/field/FieldList$ForTokens"
+            | "net/bytebuddy/description/field/FieldList$ForLoadedFields"
+            | "net/bytebuddy/description/type/TypeList$Explicit"
+            | "net/bytebuddy/description/type/TypeList$Generic$Explicit"
+    ) {
+        return method_name == "size" && descriptor == "()I"
+            || method_name == "get"
+                && matches!(
+                    descriptor,
+                    "(I)Ljava/lang/Object;"
+                        | "(I)Lnet/bytebuddy/description/method/MethodDescription;"
+                        | "(I)Lnet/bytebuddy/description/method/MethodDescription$InGenericShape;"
+                        | "(I)Lnet/bytebuddy/description/method/MethodDescription$InDefinedShape;"
+                        | "(I)Lnet/bytebuddy/description/field/FieldDescription;"
+                        | "(I)Lnet/bytebuddy/description/field/FieldDescription$InDefinedShape;"
+                        | "(I)Lnet/bytebuddy/description/type/TypeDescription;"
+                        | "(I)Lnet/bytebuddy/description/type/TypeDescription$Generic;"
+                );
+    }
+    false
+}
+
+pub(crate) fn is_hibernate_testing_util_native_override(
+    class_name: &str,
+    method_name: &str,
+    descriptor: &str,
+) -> bool {
+    class_name == "org/hibernate/testing/orm/junit/TestingUtil"
+        && (method_name, descriptor)
+            == (
+                "hasEffectiveAnnotation",
+                "(Lorg/junit/jupiter/api/extension/ExtensionContext;Ljava/lang/Class;)Z",
+            )
+}
+
+pub(crate) fn is_hibernate_models_native_override(
+    class_name: &str,
+    method_name: &str,
+    descriptor: &str,
+) -> bool {
+    if class_name == "org/hibernate/metamodel/mapping/AssociationKey" {
+        return matches!(
+            (method_name, descriptor),
+            ("hashCode", "()I") | ("equals", "(Ljava/lang/Object;)Z")
+        );
+    }
+    if class_name == "org/hibernate/metamodel/mapping/internal/ImmutableAttributeMappingList" {
+        return (method_name, descriptor)
+            == (
+                "indexedForEach",
+                "(Lorg/hibernate/internal/util/IndexedConsumer;)V",
+            );
+    }
+    if class_name == "org/hibernate/metamodel/mapping/BasicValuedModelPart" {
+        return matches!(
+            (method_name, descriptor),
+            (
+                "forEachSelectable",
+                "(ILorg/hibernate/metamodel/mapping/SelectableConsumer;)I"
+            ) | (
+                "forEachSelectable",
+                "(Lorg/hibernate/metamodel/mapping/SelectableConsumer;)I"
+            )
+        );
+    }
+    if class_name == "org/hibernate/models/internal/AnnotationUsageHelper" {
+        return matches!(
+            (method_name, descriptor),
+            (
+                "findUsage",
+                "(Lorg/hibernate/models/spi/AnnotationDescriptor;Ljava/util/Map;)Ljava/lang/annotation/Annotation;"
+            )
+                | (
+                    "getUsage",
+                    "(Lorg/hibernate/models/spi/AnnotationDescriptor;Ljava/util/Map;Lorg/hibernate/models/spi/ModelsContext;)Ljava/lang/annotation/Annotation;"
+                )
+                | (
+                    "getUsage",
+                    "(Ljava/lang/Class;Ljava/util/Map;Lorg/hibernate/models/spi/ModelsContext;)Ljava/lang/annotation/Annotation;"
+                )
+        );
+    }
+    if matches!(
+        class_name,
+        "org/hibernate/models/internal/AnnotationDescriptorRegistryStandard"
+            | "org/hibernate/models/spi/AnnotationDescriptorRegistry"
+    ) {
+        return (method_name, descriptor)
+            == (
+                "getDescriptor",
+                "(Ljava/lang/Class;)Lorg/hibernate/models/spi/AnnotationDescriptor;",
+            );
+    }
+    matches!(
+        class_name,
+        "org/hibernate/models/internal/AnnotationTargetSupport"
+            | "org/hibernate/models/spi/AnnotationTarget"
+            | "org/hibernate/models/spi/MutableAnnotationTarget"
+            | "org/hibernate/models/spi/AnnotationDescriptor"
+            | "org/hibernate/models/spi/MutableAnnotationDescriptor"
+            | "org/hibernate/models/spi/ClassDetails"
+            | "org/hibernate/models/spi/MutableClassDetails"
+            | "org/hibernate/models/spi/MemberDetails"
+            | "org/hibernate/models/spi/MutableMemberDetails"
+            | "org/hibernate/models/spi/FieldDetails"
+            | "org/hibernate/models/spi/MethodDetails"
+            | "org/hibernate/models/spi/RecordComponentDetails"
+            | "org/hibernate/models/internal/AbstractAnnotationDescriptor"
+            | "org/hibernate/models/internal/StandardAnnotationDescriptor"
+            | "org/hibernate/models/internal/OrmAnnotationDescriptor"
+    ) && matches!(
+        (method_name, descriptor),
+        ("hasDirectAnnotationUsage", "(Ljava/lang/Class;)Z")
+            | (
+                "getDirectAnnotationUsage",
+                "(Ljava/lang/Class;)Ljava/lang/annotation/Annotation;"
+            )
+            | (
+                "hasAnnotationUsage",
+                "(Ljava/lang/Class;Lorg/hibernate/models/spi/ModelsContext;)Z"
+            )
+            | (
+                "getAnnotationUsage",
+                "(Lorg/hibernate/models/spi/AnnotationDescriptor;Lorg/hibernate/models/spi/ModelsContext;)Ljava/lang/annotation/Annotation;"
+            )
+            | (
+                "getAnnotationUsage",
+                "(Ljava/lang/Class;Lorg/hibernate/models/spi/ModelsContext;)Ljava/lang/annotation/Annotation;"
+            )
+            | (
+                "locateAnnotationUsage",
+                "(Ljava/lang/Class;Lorg/hibernate/models/spi/ModelsContext;)Ljava/lang/annotation/Annotation;"
+            )
+    )
+}
+
+pub(crate) fn is_bitset_native_override(
+    class_name: &str,
+    method_name: &str,
+    descriptor: &str,
+) -> bool {
+    class_name == "java/util/BitSet"
+        && matches!(
+            (method_name, descriptor),
+            ("set", "(I)V")
+                | ("set", "(IZ)V")
+                | ("clear", "(I)V")
+                | ("clear", "()V")
+                | ("get", "(I)Z")
+                | ("length", "()I")
+                | ("cardinality", "()I")
+                | ("isEmpty", "()Z")
+                | ("nextSetBit", "(I)I")
+                | ("nextClearBit", "(I)I")
+        )
+}
+
+pub(crate) fn is_h2_parser_native_override(
+    class_name: &str,
+    method_name: &str,
+    descriptor: &str,
+) -> bool {
+    if class_name == "org/h2/constraint/ConstraintReferential" {
+        return (method_name, descriptor)
+            == ("checkExistingData", "(Lorg/h2/engine/SessionLocal;)V");
+    }
+    if class_name == "org/h2/mvstore/type/LongDataType" {
+        return matches!(
+            (method_name, descriptor),
+            ("binarySearch", "(Ljava/lang/Long;Ljava/lang/Object;II)I")
+                | ("binarySearch", "(Ljava/lang/Object;Ljava/lang/Object;II)I")
+        );
+    }
+    if class_name == "org/h2/mvstore/RootReference" {
+        return (method_name, descriptor)
+            == (
+                "updateRootPage",
+                "(Lorg/h2/mvstore/Page;J)Lorg/h2/mvstore/RootReference;",
+            );
+    }
+    if class_name == "org/h2/mvstore/tx/Transaction" {
+        return (method_name, descriptor)
+            == (
+                "<init>",
+                "(Lorg/h2/mvstore/tx/TransactionStore;IJILjava/lang/String;JIILorg/h2/engine/IsolationLevel;Lorg/h2/mvstore/tx/TransactionStore$RollbackListener;)V",
+            );
+    }
+    if class_name == "org/h2/command/ParserBase" {
+        return matches!(
+            (method_name, descriptor),
+            ("read", "()V") | ("setTokenIndex", "(I)V")
+        );
+    }
+    class_name.starts_with("org/h2/command/Token")
+        && matches!(
+            (method_name, descriptor),
+            ("tokenType", "()I") | ("asIdentifier", "()Ljava/lang/String;") | ("isQuoted", "()Z")
+        )
+}
+
+pub(crate) fn is_jdk_string_native_override(
+    class_name: &str,
+    method_name: &str,
+    descriptor: &str,
+) -> bool {
+    class_name == "java/lang/StringLatin1" && (method_name, descriptor) == ("inflate", "([BI[CII)V")
+}
+
+pub(crate) fn is_time_native_override(
+    class_name: &str,
+    method_name: &str,
+    descriptor: &str,
+) -> bool {
+    class_name == "java/time/Instant"
+        && matches!(
+            (method_name, descriptor),
+            ("now", "()Ljava/time/Instant;")
+                | ("ofEpochSecond", "(J)Ljava/time/Instant;")
+                | ("ofEpochSecond", "(JJ)Ljava/time/Instant;")
+                | ("ofEpochMilli", "(J)Ljava/time/Instant;")
+        )
+}
+
+pub(crate) fn is_jdk_wrapper_math_native_override(
+    class_name: &str,
+    method_name: &str,
+    descriptor: &str,
+) -> bool {
+    match class_name {
+        "java/lang/Integer" => {
+            descriptor == "(II)I" && matches!(method_name, "sum" | "max" | "min" | "compare")
+        }
+        "java/lang/Long" => {
+            (descriptor == "(JJ)J" && matches!(method_name, "sum" | "max" | "min"))
+                || (descriptor == "(JJ)I" && method_name == "compare")
+        }
+        _ => false,
+    }
+}
+
 fn force_native_over_real_jdk_bytecode(
     class_name: &str,
     method_name: &str,
@@ -18332,6 +18986,69 @@ fn force_native_over_real_jdk_bytecode(
     // our null getTypeAnnotationBytes0 + unexposed ConstantPool. Single source
     // of truth — `check_override` (vm_exec.rs) consults the same predicate.
     if is_typeuse_annotation_native_override(class_name, method_name, method_descriptor) {
+        return true;
+    }
+    // Hibernate HQL and Groovy route through ANTLR's prediction-context hot
+    // loop during cold full-context parsing. These helpers are tiny
+    // bytecode-equivalent methods; forcing the registered intrinsics removes
+    // millions of interpreter frame transitions without changing parser
+    // semantics.
+    if is_antlr_prediction_context_native_override(class_name, method_name, method_descriptor) {
+        return true;
+    }
+    // Hibernate/ByteBuddy proxy generation spends a large fraction of cold
+    // setup in these tiny cached token hash/equals methods. Force the registered
+    // bytecode-equivalent intrinsics to avoid thousands of interpreted
+    // AbstractList iterator frames while ByteBuddy builds method graphs.
+    if is_bytebuddy_method_token_native_override(class_name, method_name, method_descriptor) {
+        return true;
+    }
+    // Hibernate's test extensions call this helper before every test method.
+    // The real body delegates to JUnit's recursive composed-annotation scanner;
+    // our native checks the same effective method/class locations directly.
+    if is_hibernate_testing_util_native_override(class_name, method_name, method_descriptor) {
+        return true;
+    }
+    // Hibernate Models stores annotation usages in a Map behind tiny default
+    // interface methods. Force bytecode-equivalent natives to remove a hot
+    // interpreted layer while FunctionTests repeatedly builds metadata.
+    if is_hibernate_models_native_override(class_name, method_name, method_descriptor) {
+        return true;
+    }
+    // H2's MVStore transaction bookkeeping uses java.util.BitSet in the
+    // Hibernate FunctionTests schema-drop path. These single-bit methods are
+    // bytecode-equivalent intrinsics and avoid a hot interpreted cleanup loop.
+    if is_bitset_native_override(class_name, method_name, method_descriptor) {
+        return true;
+    }
+    // H2's SQL parser cursor/token accessors are tiny methods called heavily
+    // while Hibernate creates and drops schemas in FunctionTests. The native
+    // versions are bytecode-equivalent and keep the parser moving under the
+    // external harness cap.
+    if is_h2_parser_native_override(class_name, method_name, method_descriptor) {
+        return true;
+    }
+    // Hibernate's metadata boot path repeatedly builds property accessor names
+    // through `new String(char[], int, int, Void)`, whose real-JDK body spends
+    // most of its time in `StringLatin1.inflate`. The native is bytecode-
+    // equivalent for the Latin-1 byte[] -> char[] copy and avoids millions of
+    // interpreted inner-loop frames.
+    if is_jdk_string_native_override(class_name, method_name, method_descriptor) {
+        return true;
+    }
+    // H2 calls `Instant.now()` for every SQL statement command swap during
+    // Hibernate schema creation. The registered java.time bridge creates the
+    // same two-field Instant directly and avoids the real-JDK
+    // Clock.currentInstant -> VM.getNanoTimeAdjustment path, which is a hot
+    // interpreted layer under FunctionTests.
+    if is_time_native_override(class_name, method_name, method_descriptor) {
+        return true;
+    }
+    // Tiny JDK wrapper arithmetic helpers are already registered as exact
+    // natives in `phases_early`; route real-JDK bytecode through them so hot
+    // collection reductions such as Hibernate's JoinedList constructor do not
+    // spin through one-frame interpreted helpers.
+    if is_jdk_wrapper_math_native_override(class_name, method_name, method_descriptor) {
         return true;
     }
     // Surefire fork bootstrap/teardown: bypass ServiceLoader decoder discovery
@@ -21068,6 +21785,8 @@ fn compile_osr_artifact(
                 .unwrap_or(false);
             let param_slots = crate::jit::count_param_slots(&method_descriptor)
                 + if osr_method_is_static { 0 } else { 1 };
+            let (param_jvm_slots, param_slot_span) =
+                crate::jit::compute_param_jvm_slots(&method_descriptor, osr_method_is_static);
             let helpers = crate::jit::helpers::build_helpers();
             // HIB-CV-20 — seed the local-oop dataflow with this method's reference
             // PARAMETERS, exactly as the hot-path `jit::try_compile` does. The
@@ -21117,9 +21836,8 @@ fn compile_osr_artifact(
                 scan.non_escaping_new.clone(), // escape analysis results
                 std::collections::HashMap::new(), // inline_sites
                 None, // string_layout — String intrinsics land in a later wave
-                &[],  // param_jvm_slots — legacy "arg index == slot" layout (OSR
-                // bails category-2 params elsewhere; unchanged behavior)
-                0, // param_slot_span — legacy layout
+                &param_jvm_slots,
+                param_slot_span,
                 param_oop_mask,
                 compact_field_info,
                 "", // method_key — OSR path disables the per-bci de-spec consult

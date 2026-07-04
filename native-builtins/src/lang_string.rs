@@ -3084,6 +3084,107 @@ pub(crate) fn native_string_split_limit(
     native_string_split_impl(ctx, args, limit)
 }
 
+pub(crate) fn native_string_split_private(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    let limit = match args.get(2) {
+        Some(Value::Int(n)) => *n,
+        _ => 0,
+    };
+    let with_delimiters = matches!(args.get(3), Some(Value::Int(v)) if *v != 0);
+    if !with_delimiters {
+        return native_string_split_impl(ctx, args, limit);
+    }
+    native_string_split_with_delimiters(ctx, args, limit)
+}
+
+fn string_array_from_parts(ctx: &mut dyn NativeContext, parts: &[String]) -> MethodCallResult {
+    let string_class_id = match ctx.ensure_class_initialized("java/lang/String") {
+        Ok(id) => id,
+        Err(_) => cratonvm_types::ClassId::new(0),
+    };
+    let arr = ctx.new_ref_array(string_class_id, parts.len());
+    for (i, part) in parts.iter().enumerate() {
+        let str_ref = ctx.create_string(part);
+        ctx.set_array_element(arr, i, Value::Object(Some(str_ref)));
+    }
+    Ok(Some(Value::Object(Some(arr))))
+}
+
+fn native_string_split_with_delimiters(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+    limit: i32,
+) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(obj))) => *obj,
+        _ => return Ok(Some(Value::Object(None))),
+    };
+    let delim_obj = match args.get(1) {
+        Some(Value::Object(Some(obj))) => *obj,
+        _ => return Ok(Some(Value::Object(None))),
+    };
+    let s = ctx.read_string(this).unwrap_or_default();
+    let delim = ctx.read_string(delim_obj).unwrap_or_default();
+    let limited = limit > 0;
+    let mut parts = Vec::new();
+    let mut last = 0usize;
+    let mut pos = 0usize;
+    let mut matches_seen = 0i32;
+
+    if let Ok(re) = compile_java_regex(&delim, 0) {
+        while pos <= s.len() {
+            if limited && matches_seen >= limit - 1 {
+                break;
+            }
+            let Some(m) = re.find(&s[pos..]) else {
+                break;
+            };
+            let start = pos + m.start;
+            let end = pos + m.end;
+            parts.push(s[last..start].to_string());
+            parts.push(s[start..end].to_string());
+            matches_seen += 1;
+            last = end;
+            if start == end {
+                let mut next = end + 1;
+                while next < s.len() && !s.is_char_boundary(next) {
+                    next += 1;
+                }
+                pos = next.max(end);
+            } else {
+                pos = end;
+            }
+        }
+    } else if !delim.is_empty() {
+        while let Some(rel) = s[pos..].find(&delim) {
+            if limited && matches_seen >= limit - 1 {
+                break;
+            }
+            let start = pos + rel;
+            let end = start + delim.len();
+            parts.push(s[last..start].to_string());
+            parts.push(delim.clone());
+            matches_seen += 1;
+            last = end;
+            pos = end;
+        }
+    }
+
+    if parts.is_empty() && last == 0 {
+        parts.push(s);
+    } else {
+        parts.push(s[last..].to_string());
+    }
+    if limit == 0 {
+        while parts.last().map(|s| s.is_empty()).unwrap_or(false) {
+            parts.pop();
+        }
+    }
+    string_array_from_parts(ctx, &parts)
+}
+
 pub(crate) fn native_string_split_impl(
     ctx: &mut dyn NativeContext,
     args: &[Value],
@@ -3135,17 +3236,7 @@ pub(crate) fn native_string_split_impl(
         parts
     };
 
-    // Create String[] array
-    let string_class_id = match ctx.ensure_class_initialized("java/lang/String") {
-        Ok(id) => id,
-        Err(_) => cratonvm_types::ClassId::new(0),
-    };
-    let arr = ctx.new_ref_array(string_class_id, parts.len());
-    for (i, part) in parts.iter().enumerate() {
-        let str_ref = ctx.create_string(part);
-        ctx.set_array_element(arr, i, Value::Object(Some(str_ref)));
-    }
-    Ok(Some(Value::Object(Some(arr))))
+    string_array_from_parts(ctx, &parts)
 }
 
 pub(crate) fn native_string_join(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {

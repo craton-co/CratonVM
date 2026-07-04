@@ -8653,7 +8653,27 @@ fn wrap_annotation_in_real_proxy(
     ann_cid: ClassId,
     handler: ObjectRef,
 ) -> Option<ObjectRef> {
-    let proxy_cid = match crate::define_or_get_proxy_class(ctx, 0, &[ann_cid]) {
+    // Cache under the SAME namespace `Proxy.newProxyInstance(annotationType
+    // .getClassLoader(), [annotationType], handler)` would use — this is
+    // exactly the call Spring's `synthesize()` makes. A hardcoded `0` here
+    // put every real-annotation proxy in the bootstrap-loader bucket
+    // regardless of the annotation's actual defining loader, so a
+    // `synthesize()`-built proxy for a non-bootstrap-loaded annotation type
+    // landed in a different cache bucket than this one and never compared
+    // `getClass()`-equal, even once dispatch returns correct hashCode/equals.
+    // Mirrors `native_proxy_new_instance`'s `proxy_loader_namespace()` use.
+    let ann_mirror = ctx.get_class_mirror(ann_cid);
+    let annotation_loader: Option<ObjectRef> = match native_class_get_class_loader(
+        ctx,
+        &[Value::Object(Some(ann_mirror))],
+    ) {
+        Ok(Some(Value::Object(Some(loader_obj)))) => Some(loader_obj),
+        _ => None,
+    };
+    let loader_namespace: u32 = annotation_loader
+        .map(|loader_obj| crate::proxy_loader_namespace(ctx, loader_obj))
+        .unwrap_or(0);
+    let proxy_cid = match crate::define_or_get_proxy_class(ctx, loader_namespace, &[ann_cid]) {
         crate::ProxyClassOutcome::Real(cid) => cid,
         // Gate-off degrade or a generation failure: fall back to the bare
         // AnnotationProxy. This annotation path degrades gracefully and is
@@ -8661,6 +8681,17 @@ fn wrap_annotation_in_real_proxy(
         // even when the proxy STRICT mode is on.
         _ => return None,
     };
+    // Register the annotation type's defining loader as the generated proxy
+    // class's defining loader too, mirroring `native_proxy_new_instance` —
+    // otherwise `proxyClass.getClassLoader()` falls back to the app-loader
+    // default (`defining_loader_for` returns None) even when the annotation
+    // was loaded by a user-defined loader
+    // (MergedAnnotationClassLoaderTests.synthesizedUsesCorrectClassLoader).
+    if let Some(loader_obj) = annotation_loader {
+        if crate::classloader::is_user_defined_loader(ctx, loader_obj) {
+            crate::classloader::register_defining_loader(proxy_cid.as_u32(), loader_obj);
+        }
+    }
     let n = ctx.class_num_total_fields(proxy_cid).max(3);
     let real = ctx.alloc_object(proxy_cid, n);
     ctx.set_field(real, 0, Value::Object(Some(handler)));
@@ -8670,6 +8701,392 @@ fn wrap_annotation_in_real_proxy(
     ctx.set_field(real, 1, Value::Object(Some(iface_arr)));
     ctx.set_field(real, 2, Value::Int(0));
     Some(real)
+}
+
+// ---------------------------------------------------------------------------
+// CRATONVM_REAL_ANNOTATIONS "2nd call site" support: hashCode/equals/toString
+// computed directly via `NativeContext`.
+//
+// `native_proxy_dispatch_invoke` (native-builtins/src/lib.rs) is reached when
+// a real `$ProxyN`'s generated hashCode/equals/toString body (bytecode that
+// calls `Proxy$Dispatch.invokeProxy`) runs — this happens for every call once
+// the JIT has compiled that generated body, bypassing the interpreter's
+// primary AnnotationProxy dispatch hook. That hook's logic lives in
+// `annotation_proxy_hash_code` / `annotation_proxy_equals` /
+// `annotation_proxy_to_string` / the `"getClass"` arm of
+// `annotation_proxy_dispatch_impl` (`vm/src/vm/vm_exec.rs`), which operate on
+// `&SharedVm` directly. `native-builtins` cannot call into `vm` (the crate
+// dependency only goes the other way — `vm` depends on `native-builtins`),
+// and threading a `NativeContext` into the `vm`-side functions would mean
+// touching the primary proxy-dispatch hot path used by every proxy consumer
+// in the VM — out of scope for this narrow fix. These are therefore
+// self-contained re-implementations against `NativeContext`, kept minimal on
+// purpose (the common member-value shapes: primitives, String, Class, nested
+// AnnotationProxy, boxed wrappers, arrays, enum-like objects). Keep in sync
+// with the vm_exec.rs originals if annotation `Object`-method semantics
+// change.
+// ---------------------------------------------------------------------------
+
+pub(crate) fn ctx_class_name_of(ctx: &mut dyn NativeContext, obj: ObjectRef) -> String {
+    let cid = ctx.class_id_of_object(obj);
+    ctx.class_name_of_id(cid).unwrap_or_default()
+}
+
+fn ctx_wrapper_class_to_primitive(class_name: &str) -> Option<&'static str> {
+    Some(match class_name {
+        "java/lang/Integer" => "int",
+        "java/lang/Long" => "long",
+        "java/lang/Short" => "short",
+        "java/lang/Byte" => "byte",
+        "java/lang/Character" => "char",
+        "java/lang/Boolean" => "boolean",
+        "java/lang/Float" => "float",
+        "java/lang/Double" => "double",
+        _ => return None,
+    })
+}
+
+/// Java-spec `String.hashCode()` — `s[0]*31^(n-1) + ... + s[n-1]`.
+fn ctx_java_string_hash(s: &str) -> i32 {
+    let mut h: i32 = 0;
+    for ch in s.encode_utf16() {
+        h = h.wrapping_mul(31).wrapping_add(ch as i32);
+    }
+    h
+}
+
+fn ctx_annotation_proxy_elements(
+    ctx: &mut dyn NativeContext,
+    proxy: ObjectRef,
+) -> Vec<(String, Value)> {
+    let names_arr = match ctx.get_field(proxy, ANN_PROXY_ELEM_NAMES) {
+        Value::Object(Some(a)) => a,
+        _ => return Vec::new(),
+    };
+    let values_arr = match ctx.get_field(proxy, ANN_PROXY_ELEM_VALUES) {
+        Value::Object(Some(a)) => a,
+        _ => return Vec::new(),
+    };
+    let n = ctx.array_length(names_arr);
+    let mut out = Vec::with_capacity(n);
+    for i in 0..n {
+        let name = match ctx.get_array_element(names_arr, i) {
+            Value::Object(Some(name_ref)) => ctx.read_string(name_ref).unwrap_or_default(),
+            _ => continue,
+        };
+        let val = ctx.get_array_element(values_arr, i);
+        out.push((name, val));
+    }
+    out
+}
+
+fn ctx_annotation_value_hash(ctx: &mut dyn NativeContext, val: Value) -> i32 {
+    match val {
+        Value::Int(i) => i,
+        Value::Long(l) => (l ^ (l >> 32)) as i32,
+        Value::Float(f) => f.to_bits() as i32,
+        Value::Double(d) => {
+            let bits = d.to_bits() as i64;
+            (bits ^ (bits >> 32)) as i32
+        }
+        Value::Object(None) | Value::Uninitialized => 0,
+        Value::Object(Some(obj)) => {
+            if ctx.heap_kind_of(obj) == cratonvm_types::ObjectKind::Array {
+                return ctx_annotation_array_hash(ctx, obj);
+            }
+            let cname = ctx_class_name_of(ctx, obj);
+            if ctx_wrapper_class_to_primitive(&cname).is_some() {
+                let inner = ctx.get_field(obj, 0);
+                return ctx_annotation_value_hash(ctx, inner);
+            }
+            if cname == "java/lang/String" {
+                if let Some(s) = ctx.read_string(obj) {
+                    return ctx_java_string_hash(&s);
+                }
+            }
+            if cname == "java/lang/annotation/AnnotationProxy" {
+                return ctx_annotation_proxy_hash_code(ctx, obj);
+            }
+            // Class mirror, Enum constant, and any other reference-typed
+            // member hash via `value.hashCode()` — identity hash, matching
+            // `annotation_value_hash` in vm_exec.rs (Class/Enum do not
+            // override `Object.hashCode()`).
+            ctx.identity_hash_code(obj)
+        }
+        _ => 0,
+    }
+}
+
+fn ctx_annotation_array_hash(ctx: &mut dyn NativeContext, arr: ObjectRef) -> i32 {
+    let n = ctx.array_length(arr);
+    let mut h: i32 = 1;
+    for i in 0..n {
+        let elem = ctx.get_array_element(arr, i);
+        let elem_hash = ctx_annotation_value_hash(ctx, elem);
+        h = h.wrapping_mul(31).wrapping_add(elem_hash);
+    }
+    h
+}
+
+fn ctx_annotation_member_hash(ctx: &mut dyn NativeContext, name: &str, val: Value) -> i32 {
+    let name_hash = ctx_java_string_hash(name);
+    let value_hash = ctx_annotation_value_hash(ctx, val);
+    127i32.wrapping_mul(name_hash) ^ value_hash
+}
+
+/// Mirrors `annotation_proxy_hash_code` in vm_exec.rs.
+pub(crate) fn ctx_annotation_proxy_hash_code(ctx: &mut dyn NativeContext, proxy: ObjectRef) -> i32 {
+    let elems = ctx_annotation_proxy_elements(ctx, proxy);
+    let mut h: i32 = 0;
+    for (name, val) in elems {
+        h = h.wrapping_add(ctx_annotation_member_hash(ctx, &name, val));
+    }
+    h
+}
+
+fn ctx_annotation_values_equal(ctx: &mut dyn NativeContext, a: Value, b: Value) -> bool {
+    match (a, b) {
+        (Value::Int(x), Value::Int(y)) => x == y,
+        (Value::Long(x), Value::Long(y)) => x == y,
+        (Value::Float(x), Value::Float(y)) => x.to_bits() == y.to_bits(),
+        (Value::Double(x), Value::Double(y)) => x.to_bits() == y.to_bits(),
+        (Value::Object(None), Value::Object(None)) => true,
+        (Value::Object(None), _) | (_, Value::Object(None)) => false,
+        (Value::Object(Some(x)), Value::Object(Some(y))) => {
+            if x == y {
+                return true;
+            }
+            let xk = ctx.heap_kind_of(x);
+            let yk = ctx.heap_kind_of(y);
+            if xk == cratonvm_types::ObjectKind::Array || yk == cratonvm_types::ObjectKind::Array {
+                if xk != yk {
+                    return false;
+                }
+                let nx = ctx.array_length(x);
+                let ny = ctx.array_length(y);
+                if nx != ny {
+                    return false;
+                }
+                for i in 0..nx {
+                    let av = ctx.get_array_element(x, i);
+                    let bv = ctx.get_array_element(y, i);
+                    if !ctx_annotation_values_equal(ctx, av, bv) {
+                        return false;
+                    }
+                }
+                return true;
+            }
+            let xname = ctx_class_name_of(ctx, x);
+            let yname = ctx_class_name_of(ctx, y);
+            if xname == "java/lang/annotation/AnnotationProxy"
+                && yname == "java/lang/annotation/AnnotationProxy"
+            {
+                return ctx_annotation_proxy_equals(ctx, x, Value::Object(Some(y)));
+            }
+            if xname == "java/lang/String" && yname == "java/lang/String" {
+                let sx = ctx.read_string(x).unwrap_or_default();
+                let sy = ctx.read_string(y).unwrap_or_default();
+                return sx == sy;
+            }
+            if xname == "java/lang/Class" && yname == "java/lang/Class" {
+                let xcid_field = ctx.get_field(x, 0);
+                let ycid_field = ctx.get_field(y, 0);
+                return matches!(
+                    (xcid_field, ycid_field),
+                    (Value::Int(a), Value::Int(b)) if a == b
+                );
+            }
+            if ctx_wrapper_class_to_primitive(&xname).is_some()
+                && ctx_wrapper_class_to_primitive(&yname).is_some()
+            {
+                let xv = ctx.get_field(x, 0);
+                let yv = ctx.get_field(y, 0);
+                return ctx_annotation_values_equal(ctx, xv, yv);
+            }
+            // Enum / generic — compare name field if present.
+            if let (Value::Object(Some(xn)), Value::Object(Some(yn))) =
+                (ctx.get_field(x, 0), ctx.get_field(y, 0))
+            {
+                let sx = ctx.read_string(xn).unwrap_or_default();
+                let sy = ctx.read_string(yn).unwrap_or_default();
+                if !sx.is_empty() && !sy.is_empty() {
+                    return sx == sy && xname == yname;
+                }
+            }
+            x == y
+        }
+        _ => false,
+    }
+}
+
+/// Mirrors `annotation_proxy_equals` in vm_exec.rs — the plain same-type
+/// structural comparison `annotation_proxy_dispatch_impl`'s `"equals"` arm
+/// uses. Does NOT implement the cross-type delegation to a foreign proxy's
+/// own `equals` that `annotation_proxy_invoke_shared` layers on top (that
+/// logic lives one level up from `annotation_proxy_dispatch_impl` and is out
+/// of scope here); a foreign non-`AnnotationProxy` argument simply compares
+/// unequal, same as calling this before that delegation was added.
+pub(crate) fn ctx_annotation_proxy_equals(ctx: &mut dyn NativeContext, a: ObjectRef, b: Value) -> bool {
+    let other = match b {
+        Value::Object(Some(o)) => o,
+        _ => return false,
+    };
+    if a == other {
+        return true;
+    }
+    if ctx.heap_kind_of(other) != cratonvm_types::ObjectKind::Object {
+        return false;
+    }
+    if ctx_class_name_of(ctx, other) != "java/lang/annotation/AnnotationProxy" {
+        return false;
+    }
+    let a_desc = match ctx.get_field(a, ANN_PROXY_TYPE_DESC) {
+        Value::Object(Some(s)) => ctx.read_string(s).unwrap_or_default(),
+        _ => String::new(),
+    };
+    let b_desc = match ctx.get_field(other, ANN_PROXY_TYPE_DESC) {
+        Value::Object(Some(s)) => ctx.read_string(s).unwrap_or_default(),
+        _ => String::new(),
+    };
+    if a_desc != b_desc {
+        return false;
+    }
+    let a_elems = ctx_annotation_proxy_elements(ctx, a);
+    let b_elems = ctx_annotation_proxy_elements(ctx, other);
+    if a_elems.len() != b_elems.len() {
+        return false;
+    }
+    for (name, av) in &a_elems {
+        let bv = match b_elems.iter().find(|(n, _)| n == name) {
+            Some((_, v)) => *v,
+            None => return false,
+        };
+        if !ctx_annotation_values_equal(ctx, *av, bv) {
+            return false;
+        }
+    }
+    true
+}
+
+fn ctx_java_string_escape(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for ch in s.chars() {
+        match ch {
+            '\\' => out.push_str("\\\\"),
+            '"' => out.push_str("\\\""),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            '\x08' => out.push_str("\\b"),
+            '\x0c' => out.push_str("\\f"),
+            c if (c as u32) < 0x20 => {
+                out.push_str(&format!("\\u{:04x}", c as u32));
+            }
+            c => out.push(c),
+        }
+    }
+    out
+}
+
+fn ctx_format_annotation_value(ctx: &mut dyn NativeContext, val: Value) -> String {
+    match val {
+        Value::Object(None) => "null".to_string(),
+        Value::Int(i) => i.to_string(),
+        Value::Long(l) => l.to_string(),
+        Value::Float(f) => f.to_string(),
+        Value::Double(d) => d.to_string(),
+        Value::Object(Some(obj)) => {
+            if ctx.heap_kind_of(obj) == cratonvm_types::ObjectKind::Array {
+                return ctx_format_annotation_array(ctx, obj);
+            }
+            let cname = ctx_class_name_of(ctx, obj);
+            if cname == "java/lang/annotation/AnnotationProxy" {
+                return ctx_annotation_proxy_to_string(ctx, obj);
+            }
+            if cname == "java/lang/String" {
+                if let Some(s) = ctx.read_string(obj) {
+                    return format!("\"{}\"", ctx_java_string_escape(&s));
+                }
+            }
+            if cname == "java/lang/Class" {
+                if let Value::Object(Some(name_ref)) = ctx.get_field(obj, 1) {
+                    if let Some(cls_name) = ctx.read_string(name_ref) {
+                        return format!("{}.class", cls_name.replace('/', "."));
+                    }
+                }
+                return "<unknown>.class".to_string();
+            }
+            if let Some(prim_name) = ctx_wrapper_class_to_primitive(&cname) {
+                let inner = ctx.get_field(obj, 0);
+                let mut s = ctx_format_annotation_value(ctx, inner);
+                if prim_name == "long" {
+                    s.push('L');
+                } else if prim_name == "float" {
+                    s.push('f');
+                }
+                return s;
+            }
+            if let Value::Object(Some(name_ref)) = ctx.get_field(obj, 0) {
+                if let Some(name) = ctx.read_string(name_ref) {
+                    if !name.is_empty() {
+                        return name;
+                    }
+                }
+            }
+            cname.replace('/', ".")
+        }
+        Value::Uninitialized => "null".to_string(),
+        _ => "null".to_string(),
+    }
+}
+
+fn ctx_format_annotation_array(ctx: &mut dyn NativeContext, arr: ObjectRef) -> String {
+    let n = ctx.array_length(arr);
+    let mut s = String::from("[");
+    for i in 0..n {
+        if i > 0 {
+            s.push_str(", ");
+        }
+        let elem = ctx.get_array_element(arr, i);
+        s.push_str(&ctx_format_annotation_value(ctx, elem));
+    }
+    s.push(']');
+    s
+}
+
+/// Mirrors `annotation_proxy_to_string` in vm_exec.rs.
+pub(crate) fn ctx_annotation_proxy_to_string(ctx: &mut dyn NativeContext, proxy: ObjectRef) -> String {
+    let desc = match ctx.get_field(proxy, ANN_PROXY_TYPE_DESC) {
+        Value::Object(Some(s)) => ctx.read_string(s).unwrap_or_default(),
+        _ => String::new(),
+    };
+    let class_name = if let Some(stripped) = desc.strip_prefix('L').and_then(|s| s.strip_suffix(';'))
+    {
+        stripped.to_string()
+    } else if desc.is_empty() {
+        "<unknown>".to_string()
+    } else {
+        desc.clone()
+    };
+    let dotted = class_name.replace('/', ".");
+    let mut elems = ctx_annotation_proxy_elements(ctx, proxy);
+    elems.sort_by(|a, b| a.0.cmp(&b.0));
+    let mut s = String::with_capacity(64);
+    s.push('@');
+    s.push_str(&dotted);
+    s.push('(');
+    let mut first = true;
+    for (name, val) in elems {
+        if !first {
+            s.push_str(", ");
+        }
+        first = false;
+        s.push_str(&name);
+        s.push('=');
+        s.push_str(&ctx_format_annotation_value(ctx, val));
+    }
+    s.push(')');
+    s
 }
 
 /// Build a `java.lang.TypeNotPresentException(typeName, cause)` to store as a

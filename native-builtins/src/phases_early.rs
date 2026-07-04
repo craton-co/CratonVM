@@ -971,6 +971,45 @@ pub(crate) fn register_core_stdlib_extras(r: &mut NativeMethodRegistry) {
         },
     );
 
+    // Arrays.hashCode(Object[])
+    r.register(arrays, "hashCode", "([Ljava/lang/Object;)I", |ctx, args| {
+        let arr = match args.first() {
+            Some(Value::Object(Some(a))) => *a,
+            Some(Value::Object(None)) | None => return Ok(Some(Value::Int(0))),
+            _ => return Ok(Some(Value::Int(0))),
+        };
+        let base_pin = ctx.pin_native_root(arr);
+        let len = ctx.array_length(arr);
+        let mut hash = 1i32;
+        for i in 0..len {
+            let arr = ctx.read_native_pin(base_pin, arr);
+            let elem_hash = match ctx.get_array_element(arr, i) {
+                Value::Object(Some(obj)) => {
+                    let elem_pin = ctx.pin_native_root(obj);
+                    let obj = ctx.read_native_pin(elem_pin, obj);
+                    let result = ctx.invoke_virtual(obj, "hashCode", "()I", &[]);
+                    ctx.unpin_native_roots(elem_pin);
+                    match result? {
+                        Some(Value::Int(v)) => v,
+                        _ => 0,
+                    }
+                }
+                Value::Object(None) | Value::Uninitialized => 0,
+                Value::Int(v) => v,
+                Value::Long(v) => (v ^ (v >> 32)) as i32,
+                Value::Float(v) => v.to_bits() as i32,
+                Value::Double(v) => {
+                    let bits = v.to_bits() as i64;
+                    (bits ^ (bits >> 32)) as i32
+                }
+                _ => 0,
+            };
+            hash = hash.wrapping_mul(31).wrapping_add(elem_hash);
+        }
+        ctx.unpin_native_roots(base_pin);
+        Ok(Some(Value::Int(hash)))
+    });
+
     // Arrays.toString(int[])
     r.register(arrays, "toString", "([I)Ljava/lang/String;", |ctx, args| {
         let arr = match args.first() {
@@ -3587,10 +3626,102 @@ fn native_st_count_tokens(ctx: &mut dyn NativeContext, args: &[Value]) -> Method
 }
 
 // ---------------------------------------------------------------------------
-// BitSet — 2-field synthetic (words=0 long[], nbits=1 Int)
+// BitSet. Older synthetic tests use a 2-field shape
+// (words=0 long[], nbits=1 Int); real JDK BitSet uses
+// (words, wordsInUse, sizeIsSticky). Resolve by name when real class
+// metadata is available so forced real-JDK dispatch does not corrupt
+// wordsInUse.
 // ---------------------------------------------------------------------------
 const BS_FIELD_WORDS: usize = 0;
 const BS_FIELD_NBITS: usize = 1;
+
+#[derive(Clone, Copy)]
+struct BsLayout {
+    words: usize,
+    words_in_use: Option<usize>,
+    size_is_sticky: Option<usize>,
+}
+
+fn bs_layout(ctx: &dyn NativeContext) -> BsLayout {
+    BsLayout {
+        words: ctx
+            .resolve_field_index("java/util/BitSet", "words")
+            .unwrap_or(BS_FIELD_WORDS),
+        words_in_use: ctx.resolve_field_index("java/util/BitSet", "wordsInUse"),
+        size_is_sticky: ctx.resolve_field_index("java/util/BitSet", "sizeIsSticky"),
+    }
+}
+
+fn bs_words_obj(ctx: &dyn NativeContext, this: ObjectRef) -> Option<ObjectRef> {
+    let layout = bs_layout(ctx);
+    match ctx.get_field(this, layout.words) {
+        Value::Object(Some(o)) => Some(o),
+        _ => None,
+    }
+}
+
+fn bs_set_capacity_bits(ctx: &mut dyn NativeContext, this: ObjectRef, words_len: usize) {
+    let layout = bs_layout(ctx);
+    if layout.words_in_use.is_none() {
+        ctx.set_field(
+            this,
+            BS_FIELD_NBITS,
+            Value::Int((words_len.saturating_mul(64)).min(i32::MAX as usize) as i32),
+        );
+    }
+}
+
+fn bs_words_in_use(ctx: &dyn NativeContext, this: ObjectRef, words: ObjectRef) -> usize {
+    let layout = bs_layout(ctx);
+    let len = ctx.array_length(words);
+    if let Some(slot) = layout.words_in_use {
+        return match ctx.get_field(this, slot) {
+            Value::Int(n) if n > 0 => (n as usize).min(len),
+            _ => 0,
+        };
+    }
+    match ctx.get_field(this, BS_FIELD_NBITS) {
+        Value::Int(n) if n > 0 => bs_word_count(n as usize).min(len),
+        _ => len,
+    }
+}
+
+fn bs_set_words_in_use(ctx: &mut dyn NativeContext, this: ObjectRef, value: usize) {
+    let layout = bs_layout(ctx);
+    if let Some(slot) = layout.words_in_use {
+        ctx.set_field(this, slot, Value::Int(value.min(i32::MAX as usize) as i32));
+    }
+}
+
+fn bs_recalculate_words_in_use(ctx: &mut dyn NativeContext, this: ObjectRef) {
+    let layout = bs_layout(ctx);
+    let Some(slot) = layout.words_in_use else {
+        return;
+    };
+    let Some(words) = bs_words_obj(ctx, this) else {
+        ctx.set_field(this, slot, Value::Int(0));
+        return;
+    };
+    let mut used = ctx.array_length(words);
+    while used > 0 {
+        let word = match ctx.get_array_element(words, used - 1) {
+            Value::Long(v) => v,
+            _ => 0,
+        };
+        if word != 0 {
+            break;
+        }
+        used -= 1;
+    }
+    ctx.set_field(this, slot, Value::Int(used.min(i32::MAX as usize) as i32));
+}
+
+fn bs_mark_capacity_not_sticky(ctx: &mut dyn NativeContext, this: ObjectRef) {
+    let layout = bs_layout(ctx);
+    if let Some(slot) = layout.size_is_sticky {
+        ctx.set_field(this, slot, Value::Int(0));
+    }
+}
 
 pub(crate) fn register_bitset_natives(r: &mut NativeMethodRegistry) {
     let __prev_cat = r.current_category();
@@ -3745,49 +3876,75 @@ fn bs_checked_range(
 
 fn native_bs_init(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = obj_arg(args, 0)?;
+    let layout = bs_layout(ctx);
     let words = ctx.new_array(cratonvm_types::ArrayElementType::Long, 1);
-    ctx.set_field(this, BS_FIELD_WORDS, Value::Object(Some(words)));
-    ctx.set_field(this, BS_FIELD_NBITS, Value::Int(64));
+    ctx.set_field(this, layout.words, Value::Object(Some(words)));
+    if let Some(slot) = layout.words_in_use {
+        ctx.set_field(this, slot, Value::Int(0));
+    } else {
+        ctx.set_field(this, BS_FIELD_NBITS, Value::Int(64));
+    }
+    if let Some(slot) = layout.size_is_sticky {
+        ctx.set_field(this, slot, Value::Int(0));
+    }
     Ok(None)
 }
 
 fn native_bs_init_nbits(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = obj_arg(args, 0)?;
     let nbits = match args.get(1) {
-        Some(Value::Int(n)) => (*n).max(0) as usize,
+        Some(Value::Int(n)) if *n < 0 => {
+            return Err(bs_throw_index_oob(ctx, &format!("nbits < 0: {n}")));
+        }
+        Some(Value::Int(n)) => *n as usize,
         _ => 64,
     };
+    let layout = bs_layout(ctx);
     let nwords = bs_word_count(nbits).max(1);
     let words = ctx.new_array(cratonvm_types::ArrayElementType::Long, nwords);
-    ctx.set_field(this, BS_FIELD_WORDS, Value::Object(Some(words)));
-    ctx.set_field(this, BS_FIELD_NBITS, Value::Int((nwords * 64) as i32));
+    ctx.set_field(this, layout.words, Value::Object(Some(words)));
+    if let Some(slot) = layout.words_in_use {
+        ctx.set_field(this, slot, Value::Int(0));
+    } else {
+        ctx.set_field(this, BS_FIELD_NBITS, Value::Int((nwords * 64) as i32));
+    }
+    if let Some(slot) = layout.size_is_sticky {
+        ctx.set_field(this, slot, Value::Int(1));
+    }
     Ok(None)
 }
 
 fn bs_ensure_capacity(ctx: &mut dyn NativeContext, this: ObjectRef, bit_index: usize) {
-    let old_nbits = match ctx.get_field(this, BS_FIELD_NBITS) {
-        Value::Int(n) => n as usize,
-        _ => 64,
-    };
     // Defensive bound: callers validate the bit index (non-negative, ≤
     // Integer.MAX_VALUE) before reaching here, but clamp the requested word
     // count to `BS_MAX_WORDS` so a stray huge index can never overflow
     // `bit_index + 64` (panic in debug / wrap in release) nor drive an
     // unbounded `new_array`. `bit_index` is at most `i32::MAX` after
     // validation, so `+ 64` cannot overflow `usize` on a 64-bit target.
-    let new_words_req = bs_word_count(bit_index.saturating_add(1)).min(BS_MAX_WORDS);
-    let needed = new_words_req.saturating_mul(64);
-    if needed <= old_nbits {
-        return;
-    }
-    let old_words = match ctx.get_field(this, BS_FIELD_WORDS) {
+    let needed_words = bs_word_count(bit_index.saturating_add(1)).min(BS_MAX_WORDS);
+    let layout = bs_layout(ctx);
+    let old_words = match ctx.get_field(this, layout.words) {
         Value::Object(Some(o)) => o,
-        _ => return,
+        _ => {
+            let new_words =
+                ctx.new_array(cratonvm_types::ArrayElementType::Long, needed_words.max(1));
+            ctx.set_field(this, layout.words, Value::Object(Some(new_words)));
+            bs_set_capacity_bits(ctx, this, needed_words.max(1));
+            bs_mark_capacity_not_sticky(ctx, this);
+            return;
+        }
     };
     let old_len = ctx.array_length(old_words);
-    let new_len = bs_word_count(needed);
+    if needed_words <= old_len {
+        return;
+    }
+    let new_len = old_len
+        .saturating_mul(2)
+        .max(needed_words)
+        .max(1)
+        .min(BS_MAX_WORDS);
     if new_len <= old_len {
-        ctx.set_field(this, BS_FIELD_NBITS, Value::Int(needed as i32));
+        bs_set_capacity_bits(ctx, this, old_len);
         return;
     }
     let new_words = ctx.new_array(cratonvm_types::ArrayElementType::Long, new_len);
@@ -3795,17 +3952,17 @@ fn bs_ensure_capacity(ctx: &mut dyn NativeContext, this: ObjectRef, bit_index: u
         let v = ctx.get_array_element(old_words, i);
         ctx.set_array_element(new_words, i, v);
     }
-    ctx.set_field(this, BS_FIELD_WORDS, Value::Object(Some(new_words)));
-    ctx.set_field(this, BS_FIELD_NBITS, Value::Int((new_len * 64) as i32));
+    ctx.set_field(this, layout.words, Value::Object(Some(new_words)));
+    bs_set_capacity_bits(ctx, this, new_len);
+    bs_mark_capacity_not_sticky(ctx, this);
 }
 
 fn bs_get_bit(ctx: &mut dyn NativeContext, this: ObjectRef, bit: usize) -> bool {
-    let words = match ctx.get_field(this, BS_FIELD_WORDS) {
-        Value::Object(Some(o)) => o,
-        _ => return false,
+    let Some(words) = bs_words_obj(ctx, this) else {
+        return false;
     };
     let word_idx = bit / 64;
-    if word_idx >= ctx.array_length(words) {
+    if word_idx >= bs_words_in_use(ctx, this, words) {
         return false;
     }
     let word = match ctx.get_array_element(words, word_idx) {
@@ -3816,12 +3973,19 @@ fn bs_get_bit(ctx: &mut dyn NativeContext, this: ObjectRef, bit: usize) -> bool 
 }
 
 fn bs_set_bit(ctx: &mut dyn NativeContext, this: ObjectRef, bit: usize, val: bool) {
-    bs_ensure_capacity(ctx, this, bit);
-    let words = match ctx.get_field(this, BS_FIELD_WORDS) {
-        Value::Object(Some(o)) => o,
-        _ => return,
+    if val {
+        bs_ensure_capacity(ctx, this, bit);
+    }
+    let Some(words) = bs_words_obj(ctx, this) else {
+        return;
     };
     let word_idx = bit / 64;
+    if word_idx >= ctx.array_length(words) {
+        return;
+    }
+    if !val && word_idx >= bs_words_in_use(ctx, this, words) {
+        return;
+    }
     let word = match ctx.get_array_element(words, word_idx) {
         Value::Long(v) => v,
         _ => 0,
@@ -3829,14 +3993,19 @@ fn bs_set_bit(ctx: &mut dyn NativeContext, this: ObjectRef, bit: usize, val: boo
     let mask = 1i64 << (bit % 64);
     let new_word = if val { word | mask } else { word & !mask };
     ctx.set_array_element(words, word_idx, Value::Long(new_word));
+    if val {
+        let used = bs_words_in_use(ctx, this, words).max(word_idx + 1);
+        bs_set_words_in_use(ctx, this, used);
+    } else {
+        bs_recalculate_words_in_use(ctx, this);
+    }
 }
 
 fn bs_read_words(ctx: &mut dyn NativeContext, this: ObjectRef) -> Vec<i64> {
-    let words = match ctx.get_field(this, BS_FIELD_WORDS) {
-        Value::Object(Some(o)) => o,
-        _ => return vec![],
+    let Some(words) = bs_words_obj(ctx, this) else {
+        return vec![];
     };
-    let len = ctx.array_length(words);
+    let len = bs_words_in_use(ctx, this, words);
     let mut result = Vec::with_capacity(len);
     for i in 0..len {
         let v = match ctx.get_array_element(words, i) {
@@ -3884,14 +4053,14 @@ fn native_bs_clear(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRes
 
 fn native_bs_clear_all(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = obj_arg(args, 0)?;
-    let words = match ctx.get_field(this, BS_FIELD_WORDS) {
-        Value::Object(Some(o)) => o,
-        _ => return Ok(None),
+    let Some(words) = bs_words_obj(ctx, this) else {
+        return Ok(None);
     };
     let len = ctx.array_length(words);
     for i in 0..len {
         ctx.set_array_element(words, i, Value::Long(0));
     }
+    bs_set_words_in_use(ctx, this, 0);
     Ok(None)
 }
 
@@ -3947,6 +4116,13 @@ fn native_bs_length(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRe
 
 fn native_bs_size(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = obj_arg(args, 0)?;
+    if bs_layout(ctx).words_in_use.is_some() {
+        let size = bs_words_obj(ctx, this)
+            .map(|words| ctx.array_length(words).saturating_mul(64))
+            .unwrap_or(0)
+            .min(i32::MAX as usize);
+        return Ok(Some(Value::Int(size as i32)));
+    }
     let nbits = match ctx.get_field(this, BS_FIELD_NBITS) {
         Value::Int(n) => n,
         _ => 64,
@@ -3970,10 +4146,7 @@ fn native_bs_is_empty(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
 
 fn native_bs_next_set_bit(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = obj_arg(args, 0)?;
-    let from = match args.get(1) {
-        Some(Value::Int(n)) => (*n).max(0) as usize,
-        _ => 0,
-    };
+    let from = bs_checked_bit_index(ctx, args, 1)?;
     let words = bs_read_words(ctx, this);
     let total_bits = words.len() * 64;
     for bit in from..total_bits {
@@ -3988,12 +4161,12 @@ fn native_bs_next_set_bit(ctx: &mut dyn NativeContext, args: &[Value]) -> Method
 
 fn native_bs_next_clear_bit(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = obj_arg(args, 0)?;
-    let from = match args.get(1) {
-        Some(Value::Int(n)) => (*n).max(0) as usize,
-        _ => 0,
-    };
+    let from = bs_checked_bit_index(ctx, args, 1)?;
     let words = bs_read_words(ctx, this);
     let total_bits = words.len() * 64;
+    if from >= total_bits {
+        return Ok(Some(Value::Int(from.min(i32::MAX as usize) as i32)));
+    }
     for bit in from..total_bits {
         let word_idx = bit / 64;
         let bit_idx = bit % 64;
@@ -4031,9 +4204,8 @@ fn native_bs_previous_set_bit(ctx: &mut dyn NativeContext, args: &[Value]) -> Me
 fn native_bs_and(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = obj_arg(args, 0)?;
     let other = obj_arg(args, 1)?;
-    let this_words_obj = match ctx.get_field(this, BS_FIELD_WORDS) {
-        Value::Object(Some(o)) => o,
-        _ => return Ok(None),
+    let Some(this_words_obj) = bs_words_obj(ctx, this) else {
+        return Ok(None);
     };
     let other_words = bs_read_words(ctx, other);
     let this_len = ctx.array_length(this_words_obj);
@@ -4049,6 +4221,7 @@ fn native_bs_and(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResul
         };
         ctx.set_array_element(this_words_obj, i, Value::Long(tw & ow));
     }
+    bs_recalculate_words_in_use(ctx, this);
     Ok(None)
 }
 
@@ -4060,9 +4233,8 @@ fn native_bs_or(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult
     if !other_words.is_empty() {
         bs_ensure_capacity(ctx, this, other_words.len() * 64 - 1);
     }
-    let this_words_obj = match ctx.get_field(this, BS_FIELD_WORDS) {
-        Value::Object(Some(o)) => o,
-        _ => return Ok(None),
+    let Some(this_words_obj) = bs_words_obj(ctx, this) else {
+        return Ok(None);
     };
     let this_len = ctx.array_length(this_words_obj);
     for (i, &ow) in other_words.iter().enumerate().take(this_len) {
@@ -4072,6 +4244,7 @@ fn native_bs_or(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult
         };
         ctx.set_array_element(this_words_obj, i, Value::Long(tw | ow));
     }
+    bs_recalculate_words_in_use(ctx, this);
     Ok(None)
 }
 
@@ -4082,9 +4255,8 @@ fn native_bs_xor(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResul
     if !other_words.is_empty() {
         bs_ensure_capacity(ctx, this, other_words.len() * 64 - 1);
     }
-    let this_words_obj = match ctx.get_field(this, BS_FIELD_WORDS) {
-        Value::Object(Some(o)) => o,
-        _ => return Ok(None),
+    let Some(this_words_obj) = bs_words_obj(ctx, this) else {
+        return Ok(None);
     };
     let this_len = ctx.array_length(this_words_obj);
     for (i, &ow) in other_words.iter().enumerate().take(this_len) {
@@ -4094,6 +4266,7 @@ fn native_bs_xor(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResul
         };
         ctx.set_array_element(this_words_obj, i, Value::Long(tw ^ ow));
     }
+    bs_recalculate_words_in_use(ctx, this);
     Ok(None)
 }
 
@@ -4101,9 +4274,8 @@ fn native_bs_and_not(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallR
     let this = obj_arg(args, 0)?;
     let other = obj_arg(args, 1)?;
     let other_words = bs_read_words(ctx, other);
-    let this_words_obj = match ctx.get_field(this, BS_FIELD_WORDS) {
-        Value::Object(Some(o)) => o,
-        _ => return Ok(None),
+    let Some(this_words_obj) = bs_words_obj(ctx, this) else {
+        return Ok(None);
     };
     let this_len = ctx.array_length(this_words_obj);
     for (i, &ow) in other_words.iter().enumerate().take(this_len) {
@@ -4113,6 +4285,7 @@ fn native_bs_and_not(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallR
         };
         ctx.set_array_element(this_words_obj, i, Value::Long(tw & !ow));
     }
+    bs_recalculate_words_in_use(ctx, this);
     Ok(None)
 }
 
@@ -4170,17 +4343,32 @@ fn native_bs_hash_code(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCal
 fn native_bs_clone(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = obj_arg(args, 0)?;
     let words = bs_read_words(ctx, this);
-    let nbits = match ctx.get_field(this, BS_FIELD_NBITS) {
-        Value::Int(n) => n,
-        _ => 64,
-    };
-    let clone = alloc_concurrent_synthetic(ctx, "java/util/BitSet", 2);
+    let capacity_words = bs_words_obj(ctx, this)
+        .map(|words_obj| ctx.array_length(words_obj))
+        .unwrap_or(words.len().max(1));
+    let clone = alloc_concurrent_synthetic(ctx, "java/util/BitSet", 3);
     let new_words = ctx.new_array(cratonvm_types::ArrayElementType::Long, words.len());
     for (i, w) in words.iter().enumerate() {
         ctx.set_array_element(new_words, i, Value::Long(*w));
     }
-    ctx.set_field(clone, BS_FIELD_WORDS, Value::Object(Some(new_words)));
-    ctx.set_field(clone, BS_FIELD_NBITS, Value::Int(nbits));
+    let layout = bs_layout(ctx);
+    ctx.set_field(clone, layout.words, Value::Object(Some(new_words)));
+    if let Some(slot) = layout.words_in_use {
+        ctx.set_field(
+            clone,
+            slot,
+            Value::Int(words.len().min(i32::MAX as usize) as i32),
+        );
+    } else {
+        ctx.set_field(
+            clone,
+            BS_FIELD_NBITS,
+            Value::Int((capacity_words.saturating_mul(64)).min(i32::MAX as usize) as i32),
+        );
+    }
+    if let Some(slot) = layout.size_is_sticky {
+        ctx.set_field(clone, slot, Value::Int(0));
+    }
     Ok(Some(Value::Object(Some(clone))))
 }
 
@@ -4207,14 +4395,40 @@ fn native_bs_value_of_longs(ctx: &mut dyn NativeContext, args: &[Value]) -> Meth
         _ => return Ok(Some(Value::Object(None))),
     };
     let len = ctx.array_length(arr);
-    let bs = alloc_concurrent_synthetic(ctx, "java/util/BitSet", 2);
+    let bs = alloc_concurrent_synthetic(ctx, "java/util/BitSet", 3);
     let new_words = ctx.new_array(cratonvm_types::ArrayElementType::Long, len);
+    let mut words_in_use = len;
     for i in 0..len {
         let v = ctx.get_array_element(arr, i);
+        if matches!(v, Value::Long(0)) && i + 1 == words_in_use {
+            while words_in_use > 0 {
+                let candidate = if words_in_use - 1 == i {
+                    v
+                } else {
+                    ctx.get_array_element(arr, words_in_use - 1)
+                };
+                if !matches!(candidate, Value::Long(0)) {
+                    break;
+                }
+                words_in_use -= 1;
+            }
+        }
         ctx.set_array_element(new_words, i, v);
     }
-    ctx.set_field(bs, BS_FIELD_WORDS, Value::Object(Some(new_words)));
-    ctx.set_field(bs, BS_FIELD_NBITS, Value::Int((len * 64) as i32));
+    let layout = bs_layout(ctx);
+    ctx.set_field(bs, layout.words, Value::Object(Some(new_words)));
+    if let Some(slot) = layout.words_in_use {
+        ctx.set_field(
+            bs,
+            slot,
+            Value::Int(words_in_use.min(i32::MAX as usize) as i32),
+        );
+    } else {
+        ctx.set_field(bs, BS_FIELD_NBITS, Value::Int((len * 64) as i32));
+    }
+    if let Some(slot) = layout.size_is_sticky {
+        ctx.set_field(bs, slot, Value::Int(0));
+    }
     Ok(Some(Value::Object(Some(bs))))
 }
 
@@ -15679,6 +15893,78 @@ fn p54_crc32_update(crc: u32, data: &[u8]) -> u32 {
 // when the interpreter's loop / getChar interaction goes wrong.
 // ---------------------------------------------------------------------------
 
+fn native_string_latin1_inflate(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let src = match args.first() {
+        Some(Value::Object(Some(o))) => *o,
+        _ => {
+            return Err(RuntimeError::NullPointerException {
+                message: Some("StringLatin1.inflate source".to_string()),
+            }
+            .into())
+        }
+    };
+    let src_off = match args.get(1) {
+        Some(Value::Int(v)) => *v,
+        _ => 0,
+    };
+    let dst = match args.get(2) {
+        Some(Value::Object(Some(o))) => *o,
+        _ => {
+            return Err(RuntimeError::NullPointerException {
+                message: Some("StringLatin1.inflate destination".to_string()),
+            }
+            .into())
+        }
+    };
+    let dst_off = match args.get(3) {
+        Some(Value::Int(v)) => *v,
+        _ => 0,
+    };
+    let len = match args.get(4) {
+        Some(Value::Int(v)) => *v,
+        _ => 0,
+    };
+
+    if len <= 0 {
+        return Ok(None);
+    }
+
+    let src_len = ctx.array_length(src) as i64;
+    let dst_len = ctx.array_length(dst) as i64;
+    let src_end = i64::from(src_off) + i64::from(len);
+    let dst_end = i64::from(dst_off) + i64::from(len);
+    if src_off < 0 || dst_off < 0 || src_end > src_len || dst_end > dst_len {
+        let index = if src_off < 0 {
+            src_off
+        } else if dst_off < 0 {
+            dst_off
+        } else if src_end > src_len {
+            (src_end - 1).clamp(i64::from(i32::MIN), i64::from(i32::MAX)) as i32
+        } else {
+            (dst_end - 1).clamp(i64::from(i32::MIN), i64::from(i32::MAX)) as i32
+        };
+        return Err(RuntimeError::ArrayIndexOutOfBoundsException { index }.into());
+    }
+
+    let count = len as usize;
+    let mut bytes = vec![0u8; count];
+    let read = ctx.read_byte_array_into(src, src_off as usize, &mut bytes);
+    if read != count {
+        return Err(RuntimeError::ArrayIndexOutOfBoundsException {
+            index: src_off + read as i32,
+        }
+        .into());
+    }
+    let chars: Vec<u16> = bytes.into_iter().map(u16::from).collect();
+    if !ctx.write_char_array_from(dst, dst_off as usize, &chars) {
+        return Err(RuntimeError::ArrayIndexOutOfBoundsException {
+            index: dst_off + count as i32 - 1,
+        }
+        .into());
+    }
+    Ok(None)
+}
+
 pub fn register_string_latin1_natives(r: &mut NativeMethodRegistry) {
     let __prev_cat = r.current_category();
     r.set_category(cratonvm_native_api::NativeKind::Intrinsic);
@@ -15773,6 +16059,7 @@ pub fn register_string_latin1_natives(r: &mut NativeMethodRegistry) {
         };
         Ok(Some(Value::Int(val)))
     });
+    r.register(c, "inflate", "([BI[CII)V", native_string_latin1_inflate);
     r.set_category(__prev_cat);
 }
 
@@ -16978,8 +17265,8 @@ fn native_scanner_find_within_horizon_string_int(
 #[cfg(test)]
 mod t2_tests {
     use super::*;
-    use crate::test_utils::mock_ctx;
-    use cratonvm_types::ArrayElementType;
+    use crate::test_utils::{mock_ctx, MockNativeContext};
+    use cratonvm_types::{ArrayElementType, ObjectRef};
 
     // -----------------------------------------------------------------------
     // T2.3.13: StringTokenizer.countTokens — O(n) single pass
@@ -17057,6 +17344,97 @@ mod t2_tests {
             ctx.set_array_element(arr, i, Value::Int(v));
         }
         arr
+    }
+
+    fn make_byte_array(ctx: &mut dyn NativeContext, data: &[u8]) -> cratonvm_types::ObjectRef {
+        let arr = ctx.new_array(ArrayElementType::Byte, data.len());
+        for (i, &v) in data.iter().enumerate() {
+            ctx.set_array_element(arr, i, Value::Int(v as i8 as i32));
+        }
+        arr
+    }
+
+    fn read_char_array(ctx: &dyn NativeContext, arr: cratonvm_types::ObjectRef) -> Vec<u16> {
+        (0..ctx.array_length(arr))
+            .map(|i| match ctx.get_array_element(arr, i) {
+                Value::Int(v) => v as u16,
+                _ => 0,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn t2_string_latin1_inflate_zero_extends_bytes_into_chars() {
+        let mut ctx = mock_ctx();
+        let src = make_byte_array(&mut ctx, &[0x41, 0x80, 0xff, 0x42]);
+        let dst = ctx.new_array(ArrayElementType::Char, 6);
+        native_string_latin1_inflate(
+            &mut ctx,
+            &[
+                Value::Object(Some(src)),
+                Value::Int(1),
+                Value::Object(Some(dst)),
+                Value::Int(2),
+                Value::Int(3),
+            ],
+        )
+        .unwrap();
+        assert_eq!(read_char_array(&ctx, dst), vec![0, 0, 0x80, 0xff, 0x42, 0]);
+    }
+
+    #[test]
+    fn t2_string_latin1_inflate_registered() {
+        let mut registry = NativeMethodRegistry::new();
+        register_string_latin1_natives(&mut registry);
+        assert!(registry
+            .find("java/lang/StringLatin1", "inflate", "([BI[CII)V")
+            .is_some());
+    }
+
+    fn mock_field_zero_hash_code(
+        ctx: &mut MockNativeContext,
+        receiver: ObjectRef,
+        method_name: &str,
+        descriptor: &str,
+        _args: &[Value],
+    ) -> Option<MethodCallResult> {
+        if (method_name, descriptor) != ("hashCode", "()I") {
+            return None;
+        }
+        match ctx.get_field(receiver, 0) {
+            Value::Int(v) => Some(Ok(Some(Value::Int(v)))),
+            _ => Some(Ok(Some(Value::Int(0)))),
+        }
+    }
+
+    #[test]
+    fn t2_arrays_object_hash_code_uses_virtual_hash_and_null_zero() {
+        let mut ctx = mock_ctx();
+        ctx.set_invoke_virtual_hook(mock_field_zero_hash_code);
+        let first = ctx.fresh_object_ref();
+        let second = ctx.fresh_object_ref();
+        ctx.set_field(first, 0, Value::Int(7));
+        ctx.set_field(second, 0, Value::Int(11));
+        let arr = ctx.new_array(ArrayElementType::Reference, 3);
+        ctx.set_array_element(arr, 0, Value::Object(Some(first)));
+        ctx.set_array_element(arr, 1, Value::Object(None));
+        ctx.set_array_element(arr, 2, Value::Object(Some(second)));
+
+        let mut registry = NativeMethodRegistry::new();
+        register_core_stdlib_extras(&mut registry);
+        let hash_code = registry
+            .find("java/util/Arrays", "hashCode", "([Ljava/lang/Object;)I")
+            .expect("Arrays.hashCode(Object[]) native should be registered");
+        let result = hash_code(&mut ctx, &[Value::Object(Some(arr))]);
+
+        let expected = 1i32
+            .wrapping_mul(31)
+            .wrapping_add(7)
+            .wrapping_mul(31)
+            .wrapping_add(0)
+            .wrapping_mul(31)
+            .wrapping_add(11);
+        assert_eq!(result.unwrap(), Some(Value::Int(expected)));
     }
 
     /// Reference 31-mul-accumulating hash that mirrors the Java formula.
