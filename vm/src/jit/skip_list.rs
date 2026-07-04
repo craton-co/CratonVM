@@ -1461,6 +1461,45 @@ fn is_known_miscompile(class_name: &str, method_name: &str) -> bool {
         | ("java/util/concurrent/locks/AbstractQueuedSynchronizer$ConditionObject", "awaitUninterruptibly")
         | ("java/util/concurrent/locks/AbstractQueuedSynchronizer$ConditionObject", "newConditionNode")
         | ("java/util/concurrent/locks/AbstractQueuedSynchronizer$ConditionObject", "enableWait")
+        // AbstractQueuedLongSynchronizer — the 64-bit-state sibling of
+        // AbstractQueuedSynchronizer (JDK 25's `ReentrantReadWriteLock$Sync`
+        // extends this one, not the classic int-state class). It is a
+        // near-line-for-line port with its own `ExclusiveNode`/`ConditionNode`
+        // types, and hits the EXACT SAME allocate-then-putfield miscompile as
+        // its sibling above — but being a textually distinct class name, none
+        // of the entries above match it, so its hot acquire/release/signal
+        // path stayed fully JIT-eligible and silently corrupted the waiter
+        // linked list's next-pointer, permanently losing wakeups (confirmed:
+        // a minimal 4-thread ReentrantReadWriteLock stress repro hangs
+        // completely — CPU-idle, no forward progress — while the equivalent
+        // ReentrantLock repro, which uses the classic already-skipped class,
+        // completes correctly). Method names verified identical to the
+        // classic class via `javap` against the real JDK 25
+        // AbstractQueuedLongSynchronizer(.ConditionObject) — mirror the same
+        // list method-for-method.
+        | ("java/util/concurrent/locks/AbstractQueuedLongSynchronizer", "acquire")
+        | ("java/util/concurrent/locks/AbstractQueuedLongSynchronizer", "release")
+        | ("java/util/concurrent/locks/AbstractQueuedLongSynchronizer", "acquireShared")
+        | ("java/util/concurrent/locks/AbstractQueuedLongSynchronizer", "releaseShared")
+        | ("java/util/concurrent/locks/AbstractQueuedLongSynchronizer", "signalNext")
+        | ("java/util/concurrent/locks/AbstractQueuedLongSynchronizer", "signalNextIfShared")
+        | ("java/util/concurrent/locks/AbstractQueuedLongSynchronizer$ConditionObject", "signal")
+        | ("java/util/concurrent/locks/AbstractQueuedLongSynchronizer$ConditionObject", "signalAll")
+        | ("java/util/concurrent/locks/AbstractQueuedLongSynchronizer$ConditionObject", "doSignal")
+        | ("java/util/concurrent/locks/AbstractQueuedLongSynchronizer$ConditionObject", "await")
+        | ("java/util/concurrent/locks/AbstractQueuedLongSynchronizer$ConditionObject", "awaitNanos")
+        | ("java/util/concurrent/locks/AbstractQueuedLongSynchronizer$ConditionObject", "awaitUntil")
+        | ("java/util/concurrent/locks/AbstractQueuedLongSynchronizer$ConditionObject", "awaitUninterruptibly")
+        | ("java/util/concurrent/locks/AbstractQueuedLongSynchronizer$ConditionObject", "newConditionNode")
+        | ("java/util/concurrent/locks/AbstractQueuedLongSynchronizer$ConditionObject", "enableWait")
+        // ReentrantReadWriteLock's own Sync hot path — same allocate-then-
+        // putfield hazard reached one level up (WriteLock/ReadLock.lock()
+        // call straight into Sync.tryAcquire/tryAcquireShared, which is
+        // where AbstractQueuedLongSynchronizer's acquire() is entered from).
+        | ("java/util/concurrent/locks/ReentrantReadWriteLock$WriteLock", "lock")
+        | ("java/util/concurrent/locks/ReentrantReadWriteLock$WriteLock", "unlock")
+        | ("java/util/concurrent/locks/ReentrantReadWriteLock$ReadLock", "lock")
+        | ("java/util/concurrent/locks/ReentrantReadWriteLock$ReadLock", "unlock")
         // ReentrantLock guards LBQ — every offer/take takes the lock
         | ("java/util/concurrent/locks/ReentrantLock", "lock")
         | ("java/util/concurrent/locks/ReentrantLock", "unlock")
