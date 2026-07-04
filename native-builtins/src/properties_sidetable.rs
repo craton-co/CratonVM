@@ -658,6 +658,20 @@ pub(crate) fn get_property_from_sidetable(
     get_kv(ctx, obj, key)
 }
 
+/// Public re-export of `remove_kv` so `System.clearProperty` (in `lib.rs`)
+/// can keep the cached `System.getProperties()` singleton's side-table in
+/// sync when a key is removed via the *static* `System` entry point rather
+/// than through the `Properties` object itself -- see the matching
+/// `store_property_in_sidetable` call in `System.setProperty`'s native for
+/// the full rationale (SC-web-method-spel RC-A). This one-key sync is needed
+/// in addition to the wholesale `replace_sidetable` resync that already
+/// happens on every fresh `System.getProperties()` call, because a caller
+/// that already holds a reference to the singleton (e.g. Spring's
+/// `systemProperties` bean) never triggers that resync again.
+pub fn remove_property_from_sidetable(ctx: &dyn NativeContext, obj: ObjectRef, key: &str) {
+    remove_kv(ctx, obj, key);
+}
+
 /// Public re-export of `put_kv` so other modules (e.g. the surefire
 /// `SystemPropertyManager.loadProperties` native in `lib.rs`) can store
 /// key/value pairs in the side-table keyed by an arbitrary object
