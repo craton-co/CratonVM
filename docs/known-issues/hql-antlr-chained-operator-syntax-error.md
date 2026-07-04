@@ -1,14 +1,43 @@
 # HQL parser rejects chained additive/duration/concat operators (second `+`/`-`/`||` fails)
 
-**Status:** OPEN. **Not the same bug as `jit-deep-recursion-fault-recovery.md`
-("Bug C") — that hypothesis is REFUTED, see below.** Root-caused to a generic,
-JIT-independent defect in CratonVM's interpretation of ANTLR4's per-decision
-DFA/ATN simulation on the *second* visit to the same parser decision within a
-single parse. The specific defective Rust method has not yet been identified.
-**Discovered:** 2026-07-04, triaging the residual FAIL bucket after the JIT
-SIGSEGV regression investigation (dev `0ef780a2`+). **Investigated:**
+**Status:** FIXED (not yet merged — awaiting sign-off + follow-up
+verification, see below). **Not the same bug as
+`jit-deep-recursion-fault-recovery.md` ("Bug C") — that hypothesis was
+REFUTED, see below.** Root-caused to a one-line defect in CratonVM's *native
+Rust reimplementation* of `ParserATNSimulator`'s closure algorithm
+(`native-builtins/src/lib.rs`, `antlr_parser_closure_impl`): it passed
+`inContext = !full_ctx` to `getEpsilonTarget` instead of real ANTLR's
+`inContext = (depth == 0)`, wrongly attaching a left-recursion precedence
+predicate to configs that should have had it suppressed. Fixed on branch
+`fix/hql-chained-operator-parse`, commit `4e2a4493`. **Discovered:**
+2026-07-04, triaging the residual FAIL bucket after the JIT SIGSEGV
+regression investigation (dev `0ef780a2`+). **Investigated + fixed:**
 2026-07-04, branch `fix/hql-chained-operator-parse` (dev `c20f6f15`+, Azure
 Linux host, real-JDK, `hibpkg` harness).
+
+## The fix
+
+`native-builtins/src/lib.rs`, `antlr_parser_closure_impl`: changed the 6th
+argument to `antlr_parser_native_get_epsilon_target` from `!full_ctx` to
+`depth == 0`. See
+[[reference_antlr_closure_incontext_precedence_predicate_fix]] for the full
+root-cause writeup and the methodology used to find it (a
+Hibernate-independent minimal ANTLR4 grammar reproducer +
+`ParserATNSimulator.debug`/`trace_atn_sim`'s built-in trace, diffed against
+HotSpot).
+
+**Verified:** the minimal grammar reproducer now matches HotSpot exactly.
+`TemporalParameterPlusDurationTest`: **6/6 pass** (was `ok=2 failed=4`).
+
+**NOT yet re-verified against the fix** (do this before merge/triage):
+`TimeZoneStorageMappingTests`, `StandardFunctionTests` (its 3
+`ArrayIndexOutOfBoundsException` failures are a confirmed-unrelated bug —
+throws from the test's own lambda body, not ANTLR — expect those to persist
+after this fix), and the ~32-class `query.hql`/`query.criteria` regression
+sample (ran clean against the *unfixed* baseline; should stay clean). Held
+off on these reruns this session because another agent was already running
+a full Hibernate sweep concurrently on the shared Azure host — don't
+duplicate that work, just consume its results when ready.
 
 ## Symptom
 
@@ -121,15 +150,24 @@ parser.expr();
   mutation bug tied to the decision's DFA or config-set state, not raw
   arithmetic).
 
-**Root cause is NOT yet pinned to a specific Rust method or Java bytecode
-pattern.** Getting further requires instrumented tracing inside
-`ParserATNSimulator.execATN`/`closure`/`addDFAEdge`/`getExistingTargetState`
-(or CratonVM's interpretation of them) comparing state before/after the first
-vs. second visit to the same decision — a materially bigger investigation than
-black-box behavioral probing from outside the VM. No further attempt was made
-in this session; **no code change was made and none is proposed** (the
-originally-hypothesized `skip_list.rs` prefix fix is confirmed inapplicable,
-per above).
+**UPDATE — root cause pinned and fixed (same session, continued).** Flipping
+`ParserATNSimulator.debug`/`trace_atn_sim` (both `public static`, settable via
+reflection with no recompilation) gave full built-in ANTLR trace output;
+diffing CratonVM's trace against HotSpot's for the same input pinpointed the
+exact diverging config. Bytecode-level instrumentation of a recompiled
+`ParserATNSimulator.java` placed ahead of the real jar on the classpath then
+revealed something classpath-override tests couldn't explain (the
+instrumented method's own prints never fired even though the method clearly
+still ran) — which led straight to `native-builtins/src/lib.rs`: CratonVM has
+a **native Rust reimplementation** of `ParserATNSimulator`'s closure/ATN-
+simulation methods, registered by class+method+descriptor, which silently
+overrides whatever bytecode is on the classpath for
+`closureCheckingStopState`/`closure_`/`closure`/`getEpsilonTarget`/
+`computeReachSet`/`canDropLoopEntryEdgeInLeftRecursiveRule`. See "The fix"
+above and [[reference_antlr_closure_incontext_precedence_predicate_fix]] for
+the full writeup — the originally-hypothesized `skip_list.rs` prefix change
+remains confirmed inapplicable (this was never a JIT issue), but a real,
+different fix does now exist.
 
 ## Secondary finding in `StandardFunctionTests`: confirmed UNRELATED
 
@@ -176,15 +214,16 @@ target: all failing sub-tests fail identically, no interleaved unrelated
 failures, and the query shape is minimal (`:i + N unit + M unit`). Confirm on
 HotSpot that all methods pass (expected — this is CratonVM-only).
 
-## Regression check (no code changed, so this is a sanity baseline, not a diff)
+## Regression check (against the UNFIXED baseline — pre-fix sanity check, not a post-fix diff)
 
 Ran a 32-class sample from `query.hql.*`/`query.criteria.*` (not overlapping
-the 3 known-affected classes) on the same baseline binary: all 32 pass cleanly
-(zero unexpected failures; the 2 apparent "skipped" counts in
+the 3 known-affected classes) on the unfixed baseline binary: all 32 pass
+cleanly (zero unexpected failures; the 2 apparent "skipped" counts in
 `CollateTests`/`CriteriaBuilderNonStandardFunctionsTest` are pre-existing
 conditional `@Skip`s, not regressions). Confirms the bug's blast radius really
 is scoped to queries that repeat the same operator/decision, not a broad
-`query.hql`/`query.criteria` regression.
+`query.hql`/`query.criteria` regression. **Not yet re-run against the fixed
+binary** — do this before merge (see "The fix" section above).
 
 ## Scope
 
@@ -193,5 +232,6 @@ generic-grammar reproduction means the actual blast radius is any HQL query —
 or any other CratonVM-hosted ANTLR4 grammar (SpEL, Groovy, etc.) — that visits
 the same parser decision twice in one parse: chained date/duration arithmetic,
 chained string concatenation, or (per the two-decision test above) potentially
-other repeated-decision shapes not yet surveyed. No fix exists yet; no
-regression risk since no code changed this session.
+other repeated-decision shapes not yet surveyed. Fix exists on branch
+`fix/hql-chained-operator-parse` (commit `4e2a4493`), verified against the
+primary repro; not yet merged.
