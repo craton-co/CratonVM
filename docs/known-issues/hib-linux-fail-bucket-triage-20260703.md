@@ -129,7 +129,7 @@ constant in this codebase). Not yet merged to `dev` — awaiting sign-off.
 - `timezones.JDBCTimeZoneZonedTest`, `timezones.PassThruZonedTest`, `timezones.UTCNormalizedInstantTest` — all three fail with `expected: <2026-07-03T19:XX:XX...> but was: <...>` (wall-clock timestamp mismatches). Worth checking whether these are flaky (test compares against `Instant.now()`-ish values with a tolerance CratonVM's timing exceeds) vs a genuine timezone-storage correctness bug — distinct from the already-tracked `type.temporal.*` GC-crash cluster (these are FAIL/assertion, not CRASH).
 
 ## Ruled out / already tracked (no new action)
-- **7 classes shuffling between two already-broken statuses** (FAIL↔HANG↔CRASH in OSR on/off) — see `jit-osr-linux-regression-triad.md`.
+- **7 classes shuffling between two already-broken statuses** (FAIL↔HANG↔CRASH in OSR on/off) — see `../internal/fixed-suite-bugs/jit-osr-linux-regression-triad.md`.
 - **`proxy.ProxyClassReuseTest`** (`ClassCastException`) — already tracked in `docs/known-issues/hib-proxyclassreuse-loader-blind-class-resolution.md`.
 - **`service.ClassLoaderServiceImplTest`** — already tracked (HIB-CV-24 area).
 - **9 "Could not build SessionFactory: To-one map..." classes** (`EnhancedProxyCacheTest`, `AutoFlushBeforeLoadTest`, `JoinFetchWithEnhancementTest`, `PrivateConstructorEnhancerTest`, `LockExistingBytecodeProxyTest`, `OneToOneEmbeddedIdTest`, `OneToOneJoinColumnsEmbeddedIdTest`, `DetachedEntityParameterAutoFlushVersionTest`, `BaseIdEntityByteCodeTest`) — enhancement-bootstrap-adjacent, same root cause as the tracked bytecode-enhancement cluster.
