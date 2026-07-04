@@ -14142,6 +14142,18 @@ pub fn register_essential_natives(registry: &mut NativeMethodRegistry) {
         "(Ljava/lang/Class;)Ljava/lang/annotation/Annotation;",
         lang_class::native_annotated_type_get_annotation,
     );
+    // `AnnotatedParameterizedType.getAnnotatedActualTypeArguments()` --
+    // surfaces TYPE_ARGUMENT-level annotations (e.g. `@Valid` in
+    // `List<@Valid Person>`) that real-JDK's null `getTypeAnnotationBytes0`
+    // stub can never recover. See
+    // `native_annotated_parameterized_type_get_annotated_actual_type_arguments`
+    // doc comment for the full rationale (SC-web-method-validation RC-B).
+    registry.register(
+        "sun/reflect/annotation/AnnotatedTypeFactory$AnnotatedParameterizedTypeImpl",
+        "getAnnotatedActualTypeArguments",
+        "()[Ljava/lang/reflect/AnnotatedType;",
+        lang_class::native_annotated_parameterized_type_get_annotated_actual_type_arguments,
+    );
     registry.register(
         "java/lang/Class",
         "getClassFileVersion0",

@@ -13416,6 +13416,53 @@ fn make_annotated_type_with_anns(
     obj
 }
 
+/// Side-table holding, per constructed `AnnotatedType` object (keyed by
+/// pointer identity -- same pattern/caveats as `constructor_mirror_side_table`:
+/// short-lived objects, not expected to survive a moving GC between
+/// construction and the `getAnnotatedActualTypeArguments()` read that
+/// consumes them), the TYPE_ARGUMENT-level annotations for a *parameterized*
+/// type built from a method parameter, indexed by type-argument position.
+///
+/// Populated by [`native_executable_get_annotated_parameter_types`] (which has
+/// access to the owning method + parameter index needed to look up the
+/// per-type-argument annotations) and consumed by
+/// [`native_annotated_parameterized_type_get_annotated_actual_type_arguments`].
+/// Not every `AnnotatedType` has an entry here -- only ones backed by a
+/// `ParameterizedType` method-parameter whose type arguments carry TYPE_USE
+/// annotations (e.g. `List<@Valid Person>`); absence means "no per-argument
+/// annotations", not an error.
+fn annotated_parameterized_type_arg_anns_table(
+) -> &'static Mutex<FxHashMap<usize, Vec<Vec<cratonvm_native_api::AnnotationData>>>> {
+    static TABLE: OnceLock<Mutex<FxHashMap<usize, Vec<Vec<cratonvm_native_api::AnnotationData>>>>> =
+        OnceLock::new();
+    TABLE.get_or_init(|| Mutex::new(FxHashMap::default()))
+}
+
+fn stash_annotated_type_argument_anns(
+    at_obj: ObjectRef,
+    per_arg_anns: Vec<Vec<cratonvm_native_api::AnnotationData>>,
+) {
+    if per_arg_anns.iter().all(|v| v.is_empty()) {
+        return;
+    }
+    let key = at_obj.as_ptr() as usize;
+    annotated_parameterized_type_arg_anns_table()
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .insert(key, per_arg_anns);
+}
+
+fn take_annotated_type_argument_anns(
+    at_obj: ObjectRef,
+) -> Option<Vec<Vec<cratonvm_native_api::AnnotationData>>> {
+    let key = at_obj.as_ptr() as usize;
+    annotated_parameterized_type_arg_anns_table()
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .get(&key)
+        .cloned()
+}
+
 /// Read the stashed `Annotation[]` from an AnnotatedType built by
 /// [`make_annotated_type`] / [`make_annotated_type_with_anns`], returning
 /// `(array_ref, len)`. Returns `None` when the `annotations` field is null or
@@ -13552,12 +13599,13 @@ pub(crate) fn native_executable_get_annotated_parameter_types(
     args: &[Value],
 ) -> MethodCallResult {
     let this = obj_arg(args, 0)?;
-    let (per_param, count) = match method_class_name_desc(ctx, this) {
+    let (per_param, per_param_type_args, count) = match method_class_name_desc(ctx, this) {
         Some((cid, name, desc)) => {
             let pta = ctx.method_parameter_type_annotations(cid, &name, &desc);
-            (pta, count_method_params(&desc))
+            let pta_args = ctx.method_parameter_type_argument_annotations(cid, &name, &desc);
+            (pta, pta_args, count_method_params(&desc))
         }
-        None => (Vec::new(), 0),
+        None => (Vec::new(), Vec::new(), 0),
     };
     // Resolve the erased parameter type mirrors once (fallback + length
     // reference for the generic array below).
@@ -13606,6 +13654,15 @@ pub(crate) fn native_executable_get_annotated_parameter_types(
         let empty = Vec::new();
         let anns = per_param.get(i).unwrap_or(&empty);
         let at = make_annotated_type_with_anns(ctx, tm, anns);
+        // Stash this parameter's TYPE_ARGUMENT-level annotations (e.g. the
+        // `@Valid` in `List<@Valid Person>`) alongside the AnnotatedType we
+        // just built, so a later `getAnnotatedActualTypeArguments()` call on
+        // it (if it turns out to be an `AnnotatedParameterizedType`) can
+        // attach them to the right type-argument `AnnotatedType` -- see
+        // `native_annotated_parameterized_type_get_annotated_actual_type_arguments`.
+        if let Some(type_arg_anns) = per_param_type_args.get(i) {
+            stash_annotated_type_argument_anns(at, type_arg_anns.clone());
+        }
         ctx.set_array_element(out, i, Value::Object(Some(at)));
     }
     Ok(Some(Value::Object(Some(out))))
@@ -13686,6 +13743,79 @@ pub(crate) fn native_annotated_type_get_annotation(
         }
     }
     Ok(Some(Value::Object(None)))
+}
+
+/// `AnnotatedParameterizedType.getAnnotatedActualTypeArguments()
+/// [Ljava/lang/reflect/AnnotatedType;` override.
+///
+/// Real JDK's `AnnotatedParameterizedTypeImpl` computes this from
+/// `getTypeAnnotationBytes0`-derived bookkeeping, which CratonVM never
+/// populates (that native is stubbed to null -- see the module-level notes
+/// on `make_annotated_type`), so the real-bytecode path returns type
+/// arguments with no annotations. That breaks Spring's
+/// `HandlerMethod.MethodValidationInitializer.getContainerElementAnnotations`,
+/// which relies on this call to find `@Valid`/`@Constraint` annotations
+/// nested in a parameter's type arguments (e.g. `List<@Valid Person>`).
+///
+/// This override: reads the wrapped `Type` (stashed in the `type` field by
+/// [`make_annotated_type`] / [`make_annotated_type_with_anns`]), calls its
+/// `getActualTypeArguments()` (real JDK `ParameterizedTypeImpl`, works fine
+/// since generic signatures are already parsed correctly), and wraps each
+/// argument as a plain `AnnotatedType` -- attaching the TYPE_ARGUMENT-level
+/// annotations stashed by [`native_executable_get_annotated_parameter_types`]
+/// (via [`take_annotated_type_argument_anns`]) when available. AnnotatedTypes
+/// not built from a method parameter (no side-table entry) simply get
+/// argument wrappers with no annotations, matching the prior (gap) behavior.
+pub(crate) fn native_annotated_parameterized_type_get_annotated_actual_type_arguments(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    let this = obj_arg(args, 0)?;
+    let per_arg_anns = take_annotated_type_argument_anns(this);
+
+    let backing_type = match ctx.get_field_by_name(this, "type") {
+        Value::Object(Some(t)) => t,
+        _ => {
+            let comp = ctx
+                .class_id_by_name("java/lang/reflect/AnnotatedType")
+                .unwrap_or(cratonvm_types::ClassId::new(0));
+            return Ok(Some(Value::Object(Some(ctx.new_ref_array(comp, 0)))));
+        }
+    };
+
+    let type_args = match ctx.invoke_virtual(
+        backing_type,
+        "getActualTypeArguments",
+        "()[Ljava/lang/reflect/Type;",
+        &[],
+    ) {
+        Ok(Some(Value::Object(Some(arr)))) => arr,
+        _ => {
+            let comp = ctx
+                .class_id_by_name("java/lang/reflect/AnnotatedType")
+                .unwrap_or(cratonvm_types::ClassId::new(0));
+            return Ok(Some(Value::Object(Some(ctx.new_ref_array(comp, 0)))));
+        }
+    };
+    let n = ctx.array_length(type_args);
+    let comp = ctx
+        .class_id_by_name("java/lang/reflect/AnnotatedType")
+        .unwrap_or(cratonvm_types::ClassId::new(0));
+    let out = ctx.new_ref_array(comp, n);
+    let empty = Vec::new();
+    for i in 0..n {
+        let tm = match ctx.get_array_element(type_args, i) {
+            Value::Object(Some(m)) => m,
+            _ => continue,
+        };
+        let anns = per_arg_anns
+            .as_ref()
+            .and_then(|v| v.get(i))
+            .unwrap_or(&empty);
+        let at = make_annotated_type_with_anns(ctx, tm, anns);
+        ctx.set_array_element(out, i, Value::Object(Some(at)));
+    }
+    Ok(Some(Value::Object(Some(out))))
 }
 
 /// Build a non-null, empty `java.security.Permissions` collection.
