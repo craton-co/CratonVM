@@ -28660,8 +28660,18 @@ fn native_set_from_map_size(ctx: &mut dyn NativeContext, args: &[Value]) -> Meth
         Some(Value::Object(Some(o))) => *o,
         _ => return Ok(Some(Value::Int(0))),
     };
+    // Delegate to the real backing map's `size()` via virtual dispatch, same
+    // as `native_set_from_map_contains`/`_to_array`/`_iterator` below — NOT
+    // through `native_map_size`, which has its own synthetic-layout
+    // heuristic (`map_state`'s "is slot 0 an array" probe) that can misfire
+    // on a REAL map whose own `table`/backing array field happens to land at
+    // the same slot index CratonVM's synthetic HashMap uses for `buckets`.
+    // For a real `LinkedCaseInsensitiveMap` (extends `LinkedHashMap`) this
+    // silently read the wrong field as "size" and returned 0, breaking
+    // `HeadersAdaptersTests.sizeWithMultipleValuesForHeaderShouldCountHeaders`
+    // once `newSetFromMap` started returning a real `SetFromMap` for it.
     match set_from_map_backing(ctx, this) {
-        Some(m) => native_map_size(ctx, &[Value::Object(Some(m))]),
+        Some(m) => ctx.invoke_virtual(m, "size", "()I", &[]),
         None => Ok(Some(Value::Int(0))),
     }
 }
