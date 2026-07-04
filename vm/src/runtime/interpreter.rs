@@ -16991,19 +16991,31 @@ fn lambda_arg_provably_not_instance(shared: &SharedVm, obj_ref: ObjectRef, desc_
     // target can be soundly rejected for such an object (e.g. `Object` → `String`
     // in the motivating `Map<String,Object>.forEach` case). For an interface
     // target, fail open. This never weakens the class-narrowing fix.
-    if target_is_interface {
-        let obj_is_bare = obj_class_id == ClassId::new(0)
-            || shared
-                .class_manager
-                .read()
-                .get_class(obj_class_id)
-                .map(|c| &*c.name == "java/lang/Object")
-                .unwrap_or(true);
-        if obj_is_bare {
-            return false;
-        }
+    //
+    // Some early synthetic stubs are later used as interface edges before their
+    // own `ACC_INTERFACE` metadata is trustworthy. Elasticsearch's
+    // `Writeable$Writer.write` bridge is one such path: the target
+    // `Writeable` id is present in implementors' `interfaces` lists, but a
+    // concurrently observed value can carry the bare `Object` stamp. Treat that
+    // target as interface-like too, matching the conservative posture above.
+    let obj_is_bare = obj_class_id == ClassId::new(0)
+        || shared
+            .class_manager
+            .read()
+            .get_class(obj_class_id)
+            .map(|c| &*c.name == "java/lang/Object")
+            .unwrap_or(true);
+    if obj_is_bare && (target_is_interface || target_used_as_interface(shared, target_cid)) {
+        return false;
     }
     true
+}
+
+fn target_used_as_interface(shared: &SharedVm, target_cid: ClassId) -> bool {
+    let cm = shared.class_manager.read();
+    cm.class_store()
+        .iter()
+        .any(|class| class.interfaces.iter().any(|iface| *iface == target_cid))
 }
 
 /// Widen a primitive value from `from_tok` to `to_tok` per JVM numeric promotion.

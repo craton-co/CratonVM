@@ -97,6 +97,11 @@ wins over `--java-home`.
 
 ### Examples
 
+
+............
+.
+.
+
 ```bash
 # Single class in current directory
 cargo run --release -p cratonvm-cli -- --classpath . HelloWorld
