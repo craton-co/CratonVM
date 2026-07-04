@@ -9,6 +9,25 @@ angles**; this index is the consolidated map. Read it first.
 
 - [http.client cluster: redefine-dispatch fix + JDK 21 gaps](http-client-cluster-redefine-dispatch-and-jdk21-gaps.md) - core fix: two of three "native shadow" dispatch paths never checked whether an ANCESTOR class (not just the receiver) was JVMTI-redefined, so Mockito-mocked concrete classes (e.g. `HttpURLConnection`) silently bypassed their own advice. Plus several JDK 21 real-mode native gaps (`JavaLangAccess.defineClass`/`getConstantPool`/`start`, `StackWalker.callStackWalk` overload). 4 residuals documented (Linux-only NIO gaps, a 4-class hang, one order-dependent Mockito state leak, pre-existing `SimpleClientHttpRequestFactoryTests` gaps).
 
+## 2026-07-04 jmx cluster (branch fix/jmx-rmi-cluster)
+
+- FIXED: `sun/nio/ch/FileDispatcherImpl.init0()V` was registered under the
+  wrong native name (`"init"` instead of the real JDK 25 `init0`), so any
+  bytecode path touching `FileDispatcherImpl` (e.g.
+  `ManagementFactory.getPlatformMBeanServer()` on Linux) hit
+  `UnsatisfiedLinkError`, aborting `MBeanClientInterceptorTests`,
+  `RemoteMBeanClientInterceptorTests`, `JmxUtilsTests`,
+  `MBeanServerFactoryBeanTests`. Also landed in this cluster:
+  `jdk/internal/platform/CgroupMetrics.isUseContainerSupport()Z` (previously
+  unregistered, also on the `getPlatformMBeanServer()` boot path), and a
+  `JMXConnectorFactory.newJMXConnector` improvement that delegates to real
+  classpath-declared `JMXConnectorProvider`s (via `ServiceLoader`) before
+  falling back to the "not implemented" IOException — covers `jmxmp`
+  end-to-end with real provider bytecode instead of a canned error.
+- OPEN residual: [MXBeanMapping.toOpenValue AbstractMethodError + InvocationFailureException](spring-jmx-mxbeanmapping-toopenvalue-abstractmethoderror.md)
+  — 4 test methods across 2 classes still fail after the above fixes, on a
+  distinct `com.sun.jmx.mbeanserver.MXBeanMapping` resolution gap.
+
 ## Bug-document lifecycle
 
 Every unresolved bug document belongs under `docs/known-issues`. Once the bug
