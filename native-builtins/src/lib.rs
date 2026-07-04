@@ -39,6 +39,43 @@ pub(crate) fn bootstrap_property_fallback(key: &str) -> Option<String> {
     }
 }
 
+pub(crate) fn native_unsafe_ensure_class_initialized(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    let class_mirror = args.iter().find_map(|v| match v {
+        Value::Object(Some(obj)) => {
+            let obj_cid = ctx.class_id_of_object(*obj);
+            let is_class_mirror = ctx
+                .class_name_of_id(obj_cid)
+                .map(|n| n == "java/lang/Class")
+                .unwrap_or(false);
+            if is_class_mirror && crate::lang_class::mirror_class_id(ctx, *obj).is_some() {
+                Some(*obj)
+            } else {
+                None
+            }
+        }
+        _ => None,
+    });
+    let Some(class_mirror) = class_mirror else {
+        return Ok(None);
+    };
+    let Some(class_name) = crate::lang_class::mirror_class_name(ctx, class_mirror) else {
+        return Ok(None);
+    };
+    if class_name.starts_with('[') {
+        return Ok(None);
+    }
+    match class_name.as_str() {
+        "boolean" | "byte" | "char" | "short" | "int" | "long" | "float" | "double"
+        | "void" => return Ok(None),
+        _ => {}
+    }
+    ctx.ensure_class_initialized(&class_name)?;
+    Ok(None)
+}
+
 fn register_test_harness_natives(registry: &mut NativeMethodRegistry) {
     registry.register(
         "cratonvm/test/Util",
@@ -14952,6 +14989,18 @@ pub fn register_essential_natives(registry: &mut NativeMethodRegistry) {
     // matching the JDK's "not a built-in" contract. Without this, the JDK's
     // NativeLibraries bootstrap throws UnsatisfiedLinkError during
     // Inflater.<clinit>, which cascades into downstream Unsafe panics.
+    // Linux real-JDK boot classes such as `java.net.NetworkInterface` call
+    // `BootLoader.loadLibrary("net")` during <clinit>. CratonVM implements the
+    // Java-visible networking natives itself, and the lower-level
+    // `NativeLibraries.load` fallback is already non-fatal, but the JDK
+    // bytecode can block indefinitely before reaching it while acquiring the
+    // native-library lock. Short-circuit the boot-loader entry point directly.
+    registry.register(
+        "jdk/internal/loader/BootLoader",
+        "loadLibrary",
+        "(Ljava/lang/String;)V",
+        |_ctx, _args| Ok(None),
+    );
     registry.register(
         "jdk/internal/loader/NativeLibraries",
         "findBuiltinLib",
@@ -15917,7 +15966,7 @@ pub fn register_essential_natives(registry: &mut NativeMethodRegistry) {
         u2,
         "ensureClassInitialized0",
         "(Ljava/lang/Class;)V",
-        native_noop_with_this,
+        native_unsafe_ensure_class_initialized,
     );
     registry.register(
         u2,
@@ -26683,16 +26732,36 @@ fn register_unsafe_natives(r: &mut NativeMethodRegistry) {
         u,
         "ensureClassInitialized",
         "(Ljava/lang/Class;)V",
-        native_noop_with_this,
+        native_unsafe_ensure_class_initialized,
     );
     r.register(
         u2,
         "ensureClassInitialized",
         "(Ljava/lang/Class;)V",
-        native_noop_with_this,
+        native_unsafe_ensure_class_initialized,
     );
 
     // defineClass — define a class from byte array (delegate to ClassLoader)
+    // jdk.internal.misc.CDS: CratonVM does not support HotSpot CDS archives.
+    // Return disabled for all query natives and no-op archive hooks.
+    let cds_cls = "jdk/internal/misc/CDS";
+    r.register(cds_cls, "isDumpingClassList0", "()Z", native_return_false);
+    r.register(cds_cls, "isDumpingArchive0", "()Z", native_return_false);
+    r.register(cds_cls, "isSharingEnabled0", "()Z", native_return_false);
+    r.register(cds_cls, "logLambdaFormInvoker", "(Ljava/lang/String;)V", native_noop);
+    r.register(cds_cls, "initializeFromArchive", "(Ljava/lang/Class;)V", native_noop);
+    r.register(
+        cds_cls,
+        "defineArchivedModules",
+        "(Ljava/lang/ClassLoader;Ljava/lang/ClassLoader;)V",
+        native_noop,
+    );
+    r.register(cds_cls, "getRandomSeedForDumping", "()J", |_ctx, _args| {
+        Ok(Some(Value::Long(0)))
+    });
+    r.register(cds_cls, "dumpClassList", "(Ljava/lang/String;)V", native_noop);
+    r.register(cds_cls, "dumpDynamicArchive", "(Ljava/lang/String;)V", native_noop);
+
     r.register(u, "defineClass", "(Ljava/lang/String;[BIILjava/lang/ClassLoader;Ljava/security/ProtectionDomain;)Ljava/lang/Class;", |_ctx, _args| Ok(Some(Value::Object(None))));
     r.register(u2, "defineClass0", "(Ljava/lang/String;[BIILjava/lang/ClassLoader;Ljava/security/ProtectionDomain;)Ljava/lang/Class;", |_ctx, _args| Ok(Some(Value::Object(None))));
 

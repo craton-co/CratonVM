@@ -455,6 +455,38 @@ pub fn register_vm_management_impl(r: &mut NativeMethodRegistry) {
     // wrappers `getMemoryPoolMXBeans()` / `getMemoryManagerMXBeans()` /
     // `getGarbageCollectorMXBeans()` all flow through this method, so a
     // single override populates all three lists at once.
+    // Wave 1 / Task A: short-circuit `ManagementFactory.getPlatformMXBean
+    // (Class<? extends PlatformManagedObject>)T`. The real bytecode routes
+    // through `PlatformMBeanFinder`; in real-JDK mode that nested helper can be
+    // left unresolved even though callers only need conservative MXBean values.
+    r.register(
+        "java/lang/management/ManagementFactory",
+        "getPlatformMXBean",
+        "(Ljava/lang/Class;)Ljava/lang/management/PlatformManagedObject;",
+        |ctx, args| {
+            let cls_arg = obj_arg(args, 0).ok();
+            let cls_name: String = cls_arg
+                .and_then(|c| ctx.class_id_from_mirror(c))
+                .and_then(|id| ctx.class_name_of_id(id))
+                .unwrap_or_default();
+            let bean = match cls_name.as_str() {
+                "java/lang/management/RuntimeMXBean" => Some(alloc_runtime_mxbean(ctx)),
+                "java/lang/management/MemoryMXBean" => Some(alloc_memory_mxbean(ctx)),
+                "java/lang/management/ThreadMXBean" => Some(alloc_thread_mxbean(ctx)),
+                "java/lang/management/ClassLoadingMXBean" => Some(alloc_class_loading_mxbean(ctx)),
+                "java/lang/management/OperatingSystemMXBean"
+                | "com/sun/management/OperatingSystemMXBean" => Some(alloc_os_mxbean(ctx)),
+                "java/lang/management/CompilationMXBean" => Some(alloc_compilation_mxbean(ctx)),
+                // Optional HotSpot-only diagnostics. Returning null mirrors a
+                // JVM without that platform bean and lets Elasticsearch keep
+                // its documented fallback defaults for these VM options.
+                "com/sun/management/HotSpotDiagnosticMXBean" => None,
+                _ => None,
+            };
+            Ok(Some(Value::Object(bean)))
+        },
+    );
+
     r.register(
         "java/lang/management/ManagementFactory",
         "getPlatformMXBeans",

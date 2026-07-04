@@ -412,6 +412,83 @@ fn jla_define_class(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRe
     crate::classloader::define_class_via_full(ctx, &name, bytes, loader_id, opts, false, None)
 }
 
+fn jla_define_class_hidden(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    use cratonvm_types::error::RuntimeError;
+
+    const NESTMATE: i32 = 0x01;
+    const HIDDEN: i32 = 0x02;
+
+    let loader = args.get(1).copied().unwrap_or(Value::Object(None));
+    let lookup_mirror = match args.get(2) {
+        Some(Value::Object(Some(o))) => Some(*o),
+        _ => None,
+    };
+    let name = crate::classloader::read_optional_internal_name(ctx, args, 3);
+    let byte_array = match args.get(4) {
+        Some(Value::Object(Some(arr))) => *arr,
+        _ => {
+            return Err(RuntimeError::IllegalArgumentException {
+                message: "JavaLangAccess.defineClass: bytes must not be null".into(),
+            }
+            .into());
+        }
+    };
+    let len = ctx.array_length(byte_array);
+    let bytes = crate::classloader::read_byte_array_slice(ctx, byte_array, 0, len).map_err(
+        |_msg| {
+            cratonvm_types::error::MethodCallFailed::from(
+                RuntimeError::ArrayIndexOutOfBoundsException { index: 0 },
+            )
+        },
+    )?;
+
+    let mut opts = cratonvm_native_api::DefineClassFull::default();
+    if let Some(Value::Object(Some(pd))) = args.get(5) {
+        opts.code_source_url = crate::classloader::extract_pd_code_source_url(ctx, *pd);
+    }
+    let initialize = matches!(args.get(6), Some(Value::Int(v)) if *v != 0);
+    let flags = match args.get(7) {
+        Some(Value::Int(v)) => *v,
+        _ => 0,
+    };
+    let is_jdk_internal_define = name.starts_with("java/")
+        || name.starts_with("jdk/")
+        || name.starts_with("sun/")
+        || name.starts_with("com/sun/");
+    if is_jdk_internal_define {
+        // JDK MethodHandles spin implementation classes in protected platform
+        // packages through JavaLangAccess. Some of those classes are hidden;
+        // others, such as BoundMethodHandle species classes, are ordinary
+        // generated classes. CratonVM's dynamic define backend maps loader id 0
+        // to the application namespace, so use the explicit privileged flag for
+        // this JDK-internal bridge while keeping ordinary application
+        // ClassLoader.defineClass package checks intact.
+        opts.privileged_define = true;
+    }
+    if (flags & HIDDEN) != 0 {
+        opts.hidden = true;
+        opts.skip_verification = true;
+    }
+    if (flags & NESTMATE) != 0 {
+        if let Some(lk) = lookup_mirror {
+            if let Some(cid) = crate::lang_class::mirror_class_id(ctx, lk) {
+                opts.nest_host_class_name = ctx.nest_host_name(cid).or_else(|| ctx.class_name_of_id(cid));
+            }
+        }
+    }
+    let class_data = match args.get(8) {
+        Some(Value::Object(Some(_))) => Some(args[8]),
+        _ => None,
+    };
+
+    let loader_id = if name.starts_with("java/") || name.starts_with("jdk/") || name.starts_with("sun/") {
+        0
+    } else {
+        crate::classloader::loader_id_for(ctx, loader)
+    };
+    crate::classloader::define_class_via_full(ctx, &name, bytes, loader_id, opts, initialize, class_data)
+}
+
 /// `JavaLangAccess.getConstantPool(Class<?>)` -> `jdk.internal.reflect.ConstantPool`.
 ///
 /// ByteBuddy's class-file reader consults this via `invokeinterface
@@ -792,6 +869,12 @@ fn register_java_lang_access(registry: &mut NativeMethodRegistry) {
         "(Ljava/lang/ClassLoader;Ljava/lang/String;[BLjava/security/ProtectionDomain;Ljava/lang/String;)Ljava/lang/Class;",
         jla_define_class,
     );
+    registry.register(
+        owner,
+        "defineClass",
+        "(Ljava/lang/ClassLoader;Ljava/lang/Class;Ljava/lang/String;[BLjava/security/ProtectionDomain;ZILjava/lang/Object;)Ljava/lang/Class;",
+        jla_define_class_hidden,
+    );
     // `jdk.internal.loader.BootLoader.loadClassOrNull` — see
     // `jla_find_bootstrap_class_or_null` doc comment.
     registry.register(
@@ -840,6 +923,12 @@ fn register_java_lang_access(registry: &mut NativeMethodRegistry) {
         "defineClass",
         "(Ljava/lang/ClassLoader;Ljava/lang/String;[BLjava/security/ProtectionDomain;Ljava/lang/String;)Ljava/lang/Class;",
         jla_define_class,
+    );
+    registry.register(
+        iface,
+        "defineClass",
+        "(Ljava/lang/ClassLoader;Ljava/lang/Class;Ljava/lang/String;[BLjava/security/ProtectionDomain;ZILjava/lang/Object;)Ljava/lang/Class;",
+        jla_define_class_hidden,
     );
     registry.register(
         iface,
