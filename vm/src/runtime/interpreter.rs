@@ -17013,9 +17013,11 @@ fn lambda_arg_provably_not_instance(shared: &SharedVm, obj_ref: ObjectRef, desc_
 
 fn target_used_as_interface(shared: &SharedVm, target_cid: ClassId) -> bool {
     let cm = shared.class_manager.read();
-    cm.class_store()
+    let found = cm
+        .class_store()
         .iter()
-        .any(|class| class.interfaces.iter().any(|iface| *iface == target_cid))
+        .any(|class| class.interfaces.iter().any(|iface| *iface == target_cid));
+    found
 }
 
 /// Widen a primitive value from `from_tok` to `to_tok` per JVM numeric promotion.
