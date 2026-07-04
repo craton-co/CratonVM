@@ -1,7 +1,17 @@
 # HQL parser rejects chained additive/duration/concat operators (second `+`/`-`/`||` fails)
 
-**Status:** FIXED (not yet merged — awaiting sign-off + follow-up
-verification, see below). **Not the same bug as
+**Status:** FIXED and MERGED to `dev` (`3864097b`, merge of
+`fix/hql-chained-operator-parse`). **Fully re-verified 2026-07-04**
+(independent session, dev `8e9e99c8`, Azure Linux host, real-JDK,
+`CRATONVM_JIT_OSR` both on and off, TIMEOUT=600s): all three originally-failing
+classes now pass completely —
+`org.hibernate.orm.test.query.TemporalParameterPlusDurationTest` **6/6**,
+`org.hibernate.orm.test.mapping.basic.TimeZoneStorageMappingTests` **6/6**,
+`org.hibernate.orm.test.query.hql.StandardFunctionTests` **44/44** (the
+`ArrayIndexOutOfBoundsException` sub-failures mentioned below as unrelated are
+also gone — recheck whether that was a red herring or fixed as a side effect
+before assuming it needs separate tracking). No regressions observed in the
+same 255-class rerun this verification came from. **Not the same bug as
 `jit-deep-recursion-fault-recovery.md` ("Bug C") — that hypothesis was
 REFUTED, see below.** Root-caused to a one-line defect in CratonVM's *native
 Rust reimplementation* of `ParserATNSimulator`'s closure algorithm

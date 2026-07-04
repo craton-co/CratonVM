@@ -469,9 +469,11 @@ These were open here and are now **fixed / do-not-reproduce**; the detailed writ
 
 ## Standalone — HQL parser rejects chained additive/duration/concat operators
 
-[docs/known-issues/hql-antlr-chained-operator-syntax-error.md](hql-antlr-chained-operator-syntax-error.md)
-— ✅ **FIXED** (branch `fix/hql-chained-operator-parse`, commit `4e2a4493`,
-not yet merged — awaiting sign-off + follow-up verification). `a + b + c`
+✅ **FIXED and MERGED to `dev`** (`3864097b`, `fix/hql-chained-operator-parse`,
+commit `4e2a4493`); fully re-verified 2026-07-04 (all 3 affected classes now
+100% pass, no regressions). Moved to
+[`docs/internal/hql-antlr-chained-operator-syntax-error-FIXED.md`](../internal/hql-antlr-chained-operator-syntax-error-FIXED.md).
+`a + b + c`
 (or `a || b || c`, chained date/duration arithmetic, etc.) failed to parse —
 CratonVM-only, second occurrence of the same operator class rejected with
 ANTLR `SyntaxException: no viable alternative`. **NOT the same bug as
