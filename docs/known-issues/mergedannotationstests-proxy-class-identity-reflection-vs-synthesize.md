@@ -1,30 +1,29 @@
 # `MergedAnnotationsTests` — reflection-obtained vs. re-synthesized annotation proxy class identity
 
-Status: primary bug fixed (gated, default-off); two independent follow-on bugs found during verification, not yet fixed
+Status: fixed (gated behind default-off `CRATONVM_REAL_ANNOTATIONS`); the two residual issues from the prior pass are now root-caused and fixed too. Default flip is still a separate, deliberate decision — see "Should the default flip?" below.
 
 Date observed: 2026-07-03
-Date updated: 2026-07-03
+Date updated: 2026-07-04
 
 ## Summary
 
 `org.springframework.core.annotation.MergedAnnotationsTests.synthesizedAnnotationShouldReuseJdkProxyClass()`
 failed under CratonVM real-JDK+JIT mode (HotSpot passes; 177/178 other tests in
 this class pass — this was the only failure in the class, and remains the only
-one at the **default** `CRATONVM_REAL_ANNOTATIONS=off` setting).
+one at the **default** `CRATONVM_REAL_ANNOTATIONS=off` setting, which is
+expected and correct — see below).
 
 ```java
 Method method = WebController.class.getMethod("handleMappedWithValueAttribute");
 RequestMapping jdkRequestMapping = method.getAnnotation(RequestMapping.class);
 RequestMapping synthesizedRequestMapping = MergedAnnotation.from(jdkRequestMapping).synthesize();
 ...
-assertThat(jdkRequestMapping.getClass()).isSameAs(synthesizedRequestMapping.getClass()); // FAILED
+assertThat(jdkRequestMapping.getClass()).isSameAs(synthesizedRequestMapping.getClass()); // FAILED at gate-off
 ```
 
-`CRATONVM_REAL_ANNOTATIONS=1` makes this test (and the whole class) pass — see
-"Fixed in this pass" below — but the feature stays **default-off** because two
-*other*, independent bugs were found while soak-testing it broadly (see
-"Residual issues" below). Landing the fixes below is safe regardless: they are
-either unconditionally correct or dead code while the gate stays off.
+`CRATONVM_REAL_ANNOTATIONS=1` now makes the **entire** `core.annotation.*`
+package pass (728/728, minus one pre-existing unrelated `@Disabled`-style
+skip) — see "Fixed" below for the full chain of bugs it took to get there.
 
 ## Root cause (confirmed by direct repro + code reading)
 
@@ -49,17 +48,20 @@ Meanwhile Spring's `synthesize()` calls `Proxy.newProxyInstance()` explicitly
 So the two annotation instances were represented by two fundamentally
 different runtime shapes (bare synthetic object vs. real JDK proxy) unless
 `CRATONVM_REAL_ANNOTATIONS` is on — and turning it on used to immediately
-break JUnit's own test discovery (see below), so it never got soaked far
-enough to fix the identity assertion itself.
+break JUnit's own test discovery, so nobody had ever soaked it far enough to
+find (let alone fix) the identity bug itself, or the several other bugs
+documented below.
 
-## Fixed in this pass (native-builtins/src/lang_class.rs, native-builtins/src/lib.rs)
+## Fixed (in two passes, 2026-07-03 and 2026-07-04)
 
-All fixes below are gated behind `CRATONVM_REAL_ANNOTATIONS` (default OFF) or
-are unconditionally-correct dead-code-when-off fixes. Verified: default
-settings (`CRATONVM_REAL_ANNOTATIONS` unset) are byte-for-byte unchanged —
-726/728 across the full `core.annotation.*` package (29 classes), identical
-to the pre-fix baseline, both for the single `MergedAnnotationsTests` class
-(177/178) and the package as a whole.
+All fixes below are gated behind `CRATONVM_REAL_ANNOTATIONS` (default OFF),
+touch only dead code while it stays off, OR (fix 5) are behind a new
+per-call option that defaults to today's behavior everywhere except
+generated-proxy class definition. Verified: default settings
+(`CRATONVM_REAL_ANNOTATIONS` unset) are byte-for-byte unchanged — 726/728
+across the full `core.annotation.*` package (29 classes), identical to the
+untouched baseline before any of this work, both for the single
+`MergedAnnotationsTests` class (177/178) and the package as a whole.
 
 1. **`wrap_annotation_in_real_proxy` hardcoded `loader_id=0`.** Now resolves
    the annotation type's actual defining classloader (via
@@ -76,27 +78,33 @@ to the pre-fix baseline, both for the single `MergedAnnotationsTests` class
    (`defining_loader_for` returns `None`) because nothing called
    `register_defining_loader` for the newly-generated class — unlike
    `native_proxy_new_instance`, which does. This broke
-   `MergedAnnotationClassLoaderTests.synthesizedUsesCorrectClassLoader`
-   (discovered during soak — see below). Now registers the annotation's
-   defining loader (when user-defined) against the generated `proxy_cid`,
-   mirroring `native_proxy_new_instance` exactly.
+   `MergedAnnotationClassLoaderTests.synthesizedUsesCorrectClassLoader`'s
+   first assertion. Now registers the annotation's defining loader (when
+   user-defined) against the generated `proxy_cid`, mirroring
+   `native_proxy_new_instance` exactly.
 
 3. **`native_proxy_dispatch_invoke`'s `AnnotationProxy` by-name dispatch for
-   `hashCode`/`equals`/`toString`/`getClass` returned null.** This is the
-   "2nd call site" reached once the JIT has compiled a generated `$ProxyN`'s
-   `hashCode`/`equals`/`toString` body (real bytecode that calls
-   `Proxy$Dispatch.invokeProxy`), bypassing the primary interpreter dispatch
-   hook (`proxy_invoke_handler_shared` → `annotation_proxy_dispatch_impl` in
-   `vm/src/vm/vm_exec.rs`). The existing by-name fallback
-   (`ctx.invoke("AnnotationProxy", mname, "()Ljava/lang/Object;", ...)`) does
-   not reliably resolve these four names through that logic. Confirmed via
-   direct repro: this was the exact cause of
-   `NullPointerException: Cannot invoke "Integer.intValue()" because the
+   `hashCode`/`equals`/`toString`/`getClass`/`annotationType`/`getType`
+   returned null or wrong values.** This is the "2nd call site" reached once
+   the JIT has compiled a generated `$ProxyN`'s `hashCode`/`equals`/`toString`
+   body (real bytecode that calls `Proxy$Dispatch.invokeProxy`), bypassing
+   the primary interpreter dispatch hook (`proxy_invoke_handler_shared` →
+   `annotation_proxy_dispatch_impl` in `vm/src/vm/vm_exec.rs`). The existing
+   by-name fallback (`ctx.invoke("AnnotationProxy", mname,
+   "()Ljava/lang/Object;", ...)`) does not reliably resolve these names
+   through that logic. Confirmed via direct repro: this was the exact cause
+   of `NullPointerException: Cannot invoke "Integer.intValue()" because the
    return value of "Proxy$Dispatch.invokeProxy(...)" is null` at
    `$Proxy0.hashCode()`, which broke JUnit's own test discovery
    (`AnnotationUtils.findMetaAnnotation`) the moment
-   `CRATONVM_REAL_ANNOTATIONS=1` was set — explaining why the feature never
-   got soaked far enough to reach the identity bug at all.
+   `CRATONVM_REAL_ANNOTATIONS=1` was set.
+
+   `annotationType`/`getType` were added in the second pass: Spring's own
+   meta-annotation introspection machinery (`AnnotationTypeMappings`,
+   `TypeMappedAnnotation`) calls `annotationType()` repeatedly — exactly the
+   kind of hot, JIT-compiled call that hits this "2nd call site" — and was a
+   contributing factor to residual issue B below before it was root-caused as
+   a separate, deeper bug (see fix 5).
 
    Fix: `native-builtins/src/lang_class.rs` gained self-contained
    `ctx_annotation_proxy_hash_code` / `ctx_annotation_proxy_equals` /
@@ -107,14 +115,15 @@ to the pre-fix baseline, both for the single `MergedAnnotationsTests` class
    `vm` (the crate dependency only goes the other way — `vm` depends on
    `native-builtins`), and threading a `NativeContext` into the `vm`-side
    functions would mean touching the primary proxy-dispatch hot path used by
-   every proxy consumer in the VM (real surgery, out of scope here — see
-   "Why the deeper identity-shim path was still not taken" below, which still
-   applies). `native_proxy_dispatch_invoke` now calls these directly for the
-   four Object-inherited names instead of going through `ctx.invoke`.
+   every proxy consumer in the VM (real surgery, out of scope — see
+   "Why the deeper identity-shim path was still not taken" below).
+   `native_proxy_dispatch_invoke` now calls these directly for the six
+   Object-inherited/annotation-identity names instead of going through
+   `ctx.invoke`.
 
    Two additional wrinkles surfaced only by running the actual generated
    bytecode (found via direct debugging, not visible from code reading
-   alone):
+   alone) — **both are instances of the same pitfall, hit twice**:
 
    - **Boxing.** `invokeProxy`'s declared return type is `Object`, and the
      generated method body does `CHECKCAST Integer; Integer.intValue()`
@@ -123,10 +132,12 @@ to the pre-fix baseline, both for the single `MergedAnnotationsTests` class
      `annotation_proxy_dispatch_impl`'s own `hashCode`/`equals` arms do,
      correctly, from the *primary* dispatch path where the ultimate consumer
      expects an unboxed primitive directly — is not a valid object reference
-     here and got silently treated as null. Fixed by boxing through the
-     existing `box_value(ctx, Value::Int(..), "I"/"Z")` helper
-     (`native-builtins/src/lang_class.rs`), the same one
-     `native_proxy_new_instance`'s callers rely on elsewhere.
+     here and silently becomes null. Fixed by boxing through the existing
+     `box_value(ctx, Value::Int(..), "I"/"Z")` helper. The exact same mistake
+     recurred in the fix-5 delegation call below (`other.equals(proxy)` is
+     ALSO a primitive-`Z`-returning bytecode call reached via `ctx.invoke`)
+     and caused a `checkcast: not an object reference` VM abend in
+     `MergedAnnotationsTests` before it, too, was boxed.
    - **Equals-argument unwrapping.** Under `CRATONVM_REAL_ANNOTATIONS=1`
      *every* annotation instance is a real `$ProxyN`, so the argument to
      `.equals(other)` is typically *also* a real proxy, not a bare
@@ -135,109 +146,176 @@ to the pre-fix baseline, both for the single `MergedAnnotationsTests` class
      `AnnotationProxy` handler (slot 0) first, every same-type comparison
      between two now-real-proxied annotations spuriously compared unequal.
      Fixed by mirroring the equivalent unwrap already present in
-     `proxy_invoke_handler_shared` (`vm/src/vm/vm_exec.rs`, lines ~8119–8143)
-     before delegating to `ctx_annotation_proxy_equals`.
+     `proxy_invoke_handler_shared` (`vm/src/vm/vm_exec.rs`, lines ~8119–8143).
 
-## Verified effect
+4. **`ctx_annotation_proxy_equals` had no cross-type delegation** — fixed
+   residual issue A below.
 
-With all of the above: `CRATONVM_REAL_ANNOTATIONS=1` against
-`MergedAnnotationsTests` alone went from **EMPTY** (JUnit discovery crash) →
-**178 found, 177 passed, 1 failed** — the *same* 177/178 that gate-off
-produces, except the failing test is now different: the original target
-(`synthesizedAnnotationShouldReuseJdkProxyClass`) now **passes**, and
-`equalsForSynthesizedAnnotations` (previously masked by the discovery crash)
-is the new sole failure — see "Residual issues" below.
+5. **General `CRATONVM_REAL_PROXY` bug: generated `$ProxyN` classes link
+   `implements <Iface>` against the WRONG same-named class when the
+   interface was loaded by a non-default `ClassLoader`.** Root-caused residual
+   issue B below; this is the one that actually mattered most, and is not
+   annotation-specific at all.
 
-Against the full `core.annotation.*` package (29 classes, 728 test methods):
+## Residual issues from the first pass — now root-caused and fixed
 
-| | gate off (default) | gate on (`CRATONVM_REAL_ANNOTATIONS=1`) |
-|---|---|---|
-| passed | 726/728 | 721/728 |
-| failing classes | 1 (`MergedAnnotationsTests`) | 3 |
+### A. `equalsForSynthesizedAnnotations` — cross-type equals delegation
 
-Gate-off numbers are byte-for-byte identical before and after this pass — no
-regression. Gate-on trades the 1 known failure for 3 classes' worth of
-*newly visible* failures (6 test methods) that were previously masked by the
-discovery crash — see below.
+**Root cause:** `assertThat(reflectivelyObtained).isEqualTo(springSynthesized)`
+compares two annotation instances of the SAME type but with fundamentally
+different `InvocationHandler`s: the reflectively-obtained side's handler is
+our `AnnotationProxy`; Spring's `synthesize()`-built side's handler is
+Spring's own `SynthesizedMergedAnnotationInvocationHandler` (real Java
+bytecode, not our `AnnotationProxy`). `ctx_annotation_proxy_equals`'s
+same-type structural comparison can only ever recognize another
+`AnnotationProxy`-backed instance, so it always returned `false` for a
+genuinely different `Annotation` implementation — exactly the case this test
+exercises (`MergedAnnotationsTests.java:2096-2097`).
 
-## Residual issues (found during broad soak, NOT fixed in this pass)
+**Fix:** mirrored the delegation `annotation_proxy_invoke_shared` already
+does in `vm/src/vm/vm_exec.rs` (lines ~8548-8583): when `other` is neither our
+`AnnotationProxy` nor a real proxy wrapping one, check whether `other`'s
+class implements the SAME annotation interface (`ctx.is_subclass(other_cid,
+ann_cid)` against the type mirror in `ANN_PROXY_TYPE_MIRROR`); if so, delegate
+to `other.equals(proxy)` — its own `equals`, whatever implementation it is,
+presumably knows how to compare member values reflectively against any
+`Annotation`, the same way HotSpot's `AnnotationInvocationHandler.equals`
+does. Only a genuinely non-annotation-typed `other` returns `false` directly.
 
-Both of the following are independent of the fixes above and were **not
-visible before** because the JUnit discovery NPE aborted the whole class
-before any of this code ran. They are genuinely new discoveries, not
-regressions caused by this pass's changes (confirmed: they persist whether or
-not the classloader-registration fix, item 2 above, is applied — that fix
-only moves `MergedAnnotationClassLoaderTests.synthesizedUsesCorrectClassLoader`
-past its *first* assertion into the second issue below).
-
-### A. `equalsForSynthesizedAnnotations` — toString-format / equals mismatch
-
-`assertThat(reflectivelyObtained).isEqualTo(springSynthesized)` fails. The
-AssertJ failure message shows the *same underlying attribute values*
-rendered in two different `toString()` styles — `(byte)0xff`,
-`{...}`-bracketed arrays (Spring/modern-JDK `Annotation.toString()` style, on
-the side going through Spring's own `SynthesizedMergedAnnotationInvocationHandler`)
-vs. `-1`, `[...]`-bracketed arrays (our `ctx_annotation_proxy_to_string`'s
-older format, ported from `annotation_proxy_to_string` in vm_exec.rs). The
-differing display is *cosmetic* evidence of the real defect — `.equals()`
-itself returns `false` — not yet root-caused. Candidates: a residual gap in
-`ctx_annotation_proxy_equals` (which intentionally does not implement the
-cross-type delegation that `annotation_proxy_invoke_shared` layers on top of
-`annotation_proxy_dispatch_impl` — see the code comment on
-`ctx_annotation_proxy_equals`), or a member-value representation mismatch
-between the two sides not covered by the current comparison logic.
+Hit the exact same boxing pitfall as fix 3 above: the delegated
+`ctx.invoke(..., "equals", "(Ljava/lang/Object;)Z", ...)` call returns a raw
+`Value::Int` for the primitive `Z` return, which needed boxing via
+`box_value(ctx, flag, "Z")` before returning it as `native_proxy_dispatch_invoke`'s
+own `Object`-typed result — missing this caused a VM abend
+(`internal error: checkcast: not an object reference`) that briefly regressed
+`MergedAnnotationsTests` to a hard crash before it was caught and fixed in
+the same pass.
 
 ### B. Interface-linkage bug: "`$ProxyN` must be an instance of interface X"
 
-Affects `AnnotationIntrospectionFailureTests` (all 4 methods) and the tail of
-`MergedAnnotationClassLoaderTests.synthesizedUsesCorrectClassLoader` (once
-fix 2 above gets it past its classloader-identity assertion). `Method.invoke`
-on a generated `$ProxyN` throws `IllegalArgumentException: Object of class
-[$ProxyN] must be an instance of interface X`, i.e. the generated proxy class
-does not actually implement the interface (`ExampleAnnotation`,
-`ExampleMetaAnnotation`, `TestAnnotation`) that a `Method` was resolved
-against. This message format is the real-JDK reflection wording (distinct
-from CratonVM's own `native_method_invoke` IAE message,
-`"object of type X is not an instance of Y"`, ruled out by grep), so it's
-happening on a call path that runs real JDK bytecode, not our native.
+**This was never annotation-specific.** Isolated with a minimal, Spring-free,
+JUnit-free repro (`ProxyLoaderTest.java`, no longer in the tree — was scratch
+work under `.claude/worktrees/annoproxy-residual/scratch_repro/`, reproducible
+from the description below): a plain
 
-This looks like a **general bug in the real-proxy-class-generation path**
-(`define_or_get_proxy_class` / `classloading/src/proxy_gen.rs`), not something
-specific to annotations — the common thread across the affected tests is a
-nested/meta-annotation or custom-classloader-loaded interface, not anything
-`wrap_annotation_in_real_proxy`-specific. It plausibly also affects the
-broader `CRATONVM_REAL_PROXY` feature (default ON) outside of annotations,
-which would make it independently worth investigating regardless of
-`CRATONVM_REAL_ANNOTATIONS`'s fate. Not root-caused in this pass — flagged
-here for follow-up.
+```java
+ClassLoader loader = new MyLoader(parent);          // any ClassLoader subclass that defineClass()es its own copy
+Class<?> iface = loader.loadClass("Greeter");        // interface loaded by `loader`, NOT the app loader
+Object proxy = Proxy.newProxyInstance(loader, new Class<?>[]{iface}, handler);
+iface.isInstance(proxy);                              // false! should be true
+Method.invoke(iface.getMethod("greet"), proxy);        // IllegalArgumentException: object of type $ProxyN is not an instance of Greeter
+```
+
+reproduces the identical failure with **zero** Spring, JUnit, or annotation
+code involved, confirming this is a general bug in dynamic-proxy class
+generation under a custom `ClassLoader` — affecting `CRATONVM_REAL_PROXY`
+(default **ON**) everywhere, not just the `CRATONVM_REAL_ANNOTATIONS` path.
+It happened to surface in the annotation work because
+`AnnotationIntrospectionFailureTests`/`MergedAnnotationClassLoaderTests` are
+exactly the two `core.annotation.*` tests that load an interface through a
+non-default `ClassLoader` (`OverridingClassLoader` subclasses).
+
+**Root cause, precisely:** `define_or_get_proxy_class` generates the `$ProxyN`
+classfile with `implements <IfaceName>` encoded as a plain constant-pool
+`CONSTANT_Class` **name string** (classfiles have no other way to reference a
+type) and defines it via `ClassManager::define_class_with_options` under the
+SAME `ClassLoaderId::UserDefined(loader_namespace)` the interface itself was
+loaded under. During linking, `define_class_with_options`'s `resolve_supertype`
+closure resolves that name — and here's the bug: the loader-scoped lookup
+that would find the interface's ALREADY-LOADED `ClassId` under that exact
+namespace (`loaded_classes_probe`) is gated behind
+`CRATONVM_LOADER_AWARE_RESOLUTION` (`classloading/src/class_manager.rs:116-131`,
+**default OFF**, added for an unrelated Hibernate bytecode-enhancement
+scenario — "link an enhanced subclass to its same-loader supertype copy").
+With that gate off (the default), resolution always falls through to the
+loader-*agnostic* global `this.load_class(internal)`, which binds to
+whichever same-named class it finds first — typically a DIFFERENT class
+already loaded by the application loader (e.g. because the interface's own
+`.class` literal got eagerly resolved earlier by the enclosing class's
+loader). The generated `$ProxyN` ends up implementing THAT unrelated
+same-named class, not the interface it was actually built for — confirmed
+directly via a debug trace showing two distinct `ClassId`s for the identical
+name under the identical loader namespace.
+
+Verified via `CRATONVM_DBG_PROXY=1`/an added `CRATONVM_DBG_ISINSTANCE=1` trace
+in `native_class_is_instance` (`native-builtins/src/lang_class.rs`) printing
+the generated proxy's actual resolved `class_interfaces()` next to the
+target `ClassId` being checked — they were both named `Greeter` but were
+different `ClassId`s.
+
+**Fix (surgical, not a global default flip):** added
+`force_loader_faithful_linking: bool` (default `false`) to
+`DefineClassOptions` (`classloading/src/class_manager.rs`) and to the
+FFI-facing `DefineClassFull` (`native-api/src/registry.rs`), threaded through
+`vm/src/vm/vm_exec.rs`'s `define_class_full`. `resolve_supertype` now checks
+`loader_aware_resolution() || options.force_loader_faithful_linking`.
+`native-builtins/src/lib.rs`'s `define_or_get_proxy_class` sets this to
+`true` unconditionally for every generated proxy class — unlike the
+ambiguous "which same-loader copy is more correct" question the global gate
+exists for, a generated proxy has exactly one correct answer: it MUST link
+against the exact interface `ClassId` its generator resolved. This is
+byte-identical for every OTHER class-definition call site (the new field
+defaults `false`), so the global `CRATONVM_LOADER_AWARE_RESOLUTION` default
+is untouched.
+
+Note this fix applies to **every** `Proxy.newProxyInstance`/`getProxyClass`
+call, not just annotations — it is *not* gated behind
+`CRATONVM_REAL_ANNOTATIONS` and takes effect under the default-on
+`CRATONVM_REAL_PROXY` too. This is intentional: it is a strict correctness
+fix with no plausible downside (the loader-scoped lookup, when it doesn't
+find an exact match, still falls through to the existing global
+`load_class`), and was re-verified against the full `core.annotation.*`
+default-gate-off baseline (726/728, unchanged) plus a `spring-aop` sanity
+pass (60/66 classes clean; the 6 non-clean classes' failures/timeouts all
+independently traced to a missing test-classpath dependency
+(`org/springframework/aot/test/generate/TestGenerationContext`, pre-existing,
+unrelated) or abstract test base classes with no runnable methods — none
+touch dynamic-proxy or classloading code).
+
+## Verified effect (after all fixes)
+
+`core.annotation.*` package (29 classes, 728 test methods):
+
+| | gate off (default) | gate on (`CRATONVM_REAL_ANNOTATIONS=1`) |
+|---|---|---|
+| passed | 726/728 | 727/728 |
+| failing | 1 (`synthesizedAnnotationShouldReuseJdkProxyClass`) | 0 |
+| skipped | 0 | 1 (pre-existing, unrelated `@Disabled`-style skip) |
+
+Gate-off is byte-for-byte identical to the untouched baseline — zero
+regression. Gate-on now passes the **entire** package cleanly.
 
 ## Why the deeper identity-shim path was still not taken
 
-(Unchanged from before this pass.) A narrower "lie in `getClass()` only" shim
-that doesn't require `CRATONVM_REAL_ANNOTATIONS` at all would need to reach
-into `native-builtins`'s proxy-class cache from `vm/src/vm/vm_exec.rs`, which
-are one-directional-dependent crates (`vm` depends on `native-builtins`, and
-the handful of existing precedents for `vm` calling into `native-builtins`,
-e.g. `classloader_real::get_or_create_system_cl`, all require a live
+A narrower "lie in `getClass()` only" shim that doesn't require
+`CRATONVM_REAL_ANNOTATIONS` at all would need to reach into
+`native-builtins`'s proxy-class cache from `vm/src/vm/vm_exec.rs`, which are
+one-directional-dependent crates (`vm` depends on `native-builtins`, and the
+handful of existing precedents for `vm` calling into `native-builtins`, e.g.
+`classloader_real::get_or_create_system_cl`, all require a live
 `&mut dyn NativeContext`, which `annotation_proxy_dispatch_impl` does not
-have — it only has `&SharedVm`). Doing this safely needs either threading a
-`NativeContext` handle through, or duplicating class-definition logic in the
-`vm` crate against the *same* shared cache — real surgery, not a quick patch,
-and risks the shared GC-safety-sensitive proxy machinery used by every other
-proxy consumer in the VM. The fixes in this pass sidestep that by making the
-*existing* `CRATONVM_REAL_ANNOTATIONS` path (which already avoids that
-problem, since it's an env-gated whole-representation switch, not a
-`getClass()`-only lie) actually functional up to the point of the two
-residual issues above.
+have — it only has `&SharedVm`). This remains true and remains out of scope
+— it's moot now that the `CRATONVM_REAL_ANNOTATIONS` path itself works
+end-to-end.
 
-## Suggested next steps
+## Should the default flip?
 
-1. Root-cause residual issue B (the interface-linkage bug) first — it looks
-   broader than annotations and may be masking other `CRATONVM_REAL_PROXY`
-   bugs unrelated to this cluster entirely.
-2. Root-cause residual issue A (`equalsForSynthesizedAnnotations`).
-3. Once both are fixed, re-soak `CRATONVM_REAL_ANNOTATIONS=1` broadly
-   (`core.annotation.*` plus other annotation-heavy spring-core/spring-context
-   suites) before considering flipping the default. Do not flip the default
-   without that soak — this pass's package-level run alone (721/728, 3 failing
-   classes) is not sufficient evidence.
+Not decided here — flagging what's now true so whoever makes that call has
+current information:
+
+- The ORIGINAL blocker (JUnit discovery crash) is gone.
+- The full `core.annotation.*` package now passes identically well under
+  either setting.
+- Fix 5 (proxy interface linking) is the biggest-blast-radius change in this
+  set — it changes behavior for `CRATONVM_REAL_PROXY` broadly, independent of
+  `CRATONVM_REAL_ANNOTATIONS`, and got a `spring-aop` sanity pass but not a
+  full-suite soak.
+- `CRATONVM_REAL_ANNOTATIONS` itself reshapes the runtime representation of
+  *every* annotation instance in the VM — a wide blast radius the original
+  gate comment explicitly called out as needing "wide soak" before
+  default-on, and that soak (beyond this one package) has not happened.
+
+Recommend running the fuller spring-core/spring-context/spring-beans suites
+(annotation-heavy, e.g. bean-definition metadata scanning) under
+`CRATONVM_REAL_ANNOTATIONS=1` before considering the default flip — this pass
+only re-confirmed `core.annotation.*` plus a partial `spring-aop` pass.

@@ -6738,6 +6738,7 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
             allow_redefine: opts.allow_redefine,
             nest_host_class_name: opts.nest_host_class_name.clone(),
             privileged_define: opts.privileged_define,
+            force_loader_faithful_linking: opts.force_loader_faithful_linking,
             ..Default::default()
         };
 

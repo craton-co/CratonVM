@@ -2020,6 +2020,20 @@ pub(crate) fn native_class_is_instance(
     if target_class_id == this_class_id || ctx.is_subclass(target_class_id, this_class_id) {
         return Ok(Some(Value::Int(1)));
     }
+    if std::env::var_os("CRATONVM_DBG_ISINSTANCE").is_some() {
+        let ifaces = ctx.class_interfaces(target_class_id);
+        let iface_names: Vec<String> = ifaces
+            .iter()
+            .map(|&c| format!("{}:{:?}", c.as_u32(), ctx.class_name_of_id(c)))
+            .collect();
+        eprintln!(
+            "[DBG_ISINSTANCE] target_class_id={} ({:?}) this_class_id={} ({:?}) target_interfaces={iface_names:?}",
+            target_class_id.as_u32(),
+            ctx.class_name_of_id(target_class_id),
+            this_class_id.as_u32(),
+            ctx.class_name_of_id(this_class_id),
+        );
+    }
 
     // Consistency with `getClass()`: synthetic collection wrappers (the
     // `List.of`/`Map.of`/`Collections.unmodifiable*` families) and other
@@ -8678,6 +8692,14 @@ fn wrap_annotation_in_real_proxy(
         // even when the proxy STRICT mode is on.
         _ => return None,
     };
+    if std::env::var_os("CRATONVM_DBG_ANNPROXY_WRAP").is_some() {
+        let ann_name = ctx.class_name_of_id(ann_cid).unwrap_or_default();
+        eprintln!(
+            "[DBG_WRAP] ann_cid={} ann_name={ann_name} loader_namespace={loader_namespace} proxy_cid={}",
+            ann_cid.as_u32(),
+            proxy_cid.as_u32()
+        );
+    }
     // Register the annotation type's defining loader as the generated proxy
     // class's defining loader too, mirroring `native_proxy_new_instance` —
     // otherwise `proxyClass.getClassLoader()` falls back to the app-loader

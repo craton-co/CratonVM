@@ -989,6 +989,27 @@ pub struct DefineClassOptions {
     /// prohibited-package check below is skipped — matching that semantics.
     /// The ordinary `ClassLoader.defineClass` path leaves this `false`.
     pub privileged_define: bool,
+    /// Force loader-faithful supertype/interface linking for THIS define,
+    /// regardless of the global `CRATONVM_LOADER_AWARE_RESOLUTION` gate
+    /// (default off — see `loader_aware_resolution` above, which keeps
+    /// every ordinary define byte-identical). A dynamically generated
+    /// `$ProxyN` class MUST link against the exact interface `ClassId` its
+    /// generator resolved (e.g. the interface a caller passed to
+    /// `Proxy.newProxyInstance(loader, interfaces, handler)`) — unlike the
+    /// broader Hibernate-enhancement scenario the global gate exists for,
+    /// there is no "which copy is more correct" ambiguity here, so this is
+    /// unconditionally required for a generated proxy to actually implement
+    /// the interface it was built for. Without this, `resolve_supertype`
+    /// falls through to the loader-agnostic `load_class(name)` and can bind
+    /// to a DIFFERENT, unrelated same-named class (e.g. one already loaded
+    /// by the application loader), so the resulting `$ProxyN` type-checks
+    /// (`interfaceClass.isInstance(proxy)`) and `Method.invoke` against the
+    /// requested interface both fail — see "Residual issue B" in
+    /// `docs/known-issues/mergedannotationstests-proxy-class-identity-reflection-vs-synthesize.md`
+    /// (found via annotation-proxy work but is a general `CRATONVM_REAL_PROXY`
+    /// bug, reproducible with a plain `Proxy.newProxyInstance` + custom
+    /// `ClassLoader`, independent of annotations).
+    pub force_loader_faithful_linking: bool,
 }
 
 /// Options for [`ClassManager::redefine_class`] (WP2.4-B).
@@ -2909,7 +2930,7 @@ impl ClassManager {
         // `preload_supertypes_via_loader`, JVMS §5.3.5 initiating-loader order),
         // falling back to the global `load_class`. Gated + only when the exact
         // copy exists → byte-identical gate-off / no same-loader copy.
-        let loader_faithful = loader_aware_resolution();
+        let loader_faithful = loader_aware_resolution() || options.force_loader_faithful_linking;
         let resolve_supertype = |this: &mut Self, internal: &str| -> Result<ClassId, VmError> {
             if loader_faithful {
                 if let Some(id) = loaded_classes_probe(&this.loaded_classes, loader_id, internal) {
