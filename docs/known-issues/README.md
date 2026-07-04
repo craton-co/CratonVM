@@ -157,7 +157,7 @@ deep-recursion item remains — see below).
 - (2026-06-17) The two Fork6 precise-maps files were already merged into `fork6-fjp-multithread-jit-root-reclamation.md`.
 
 The former **JIT regalloc callee-saved-register clobber** umbrella family is
-resolved on dev (2026-07-04) by making callee-saved GPR local homes opt-in only;
+resolved on x64 dev (2026-07-04) by making callee-saved GPR local homes opt-in only;
 the archived write-up is
 [`docs/internal/jit-regalloc-callee-saved-clobber-family.md`](../internal/jit-regalloc-callee-saved-clobber-family.md).
 Do not conflate that historical register-*clobber* family with Family A below,

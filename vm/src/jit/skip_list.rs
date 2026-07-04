@@ -421,9 +421,10 @@ fn should_skip_jit_internal(
     // `cratonvm/*` were narrowed to targeted per-method exclusions.
     // Those targeted exclusions guarded the callee-saved-GPR local-home
     // regalloc family. The x64 backend now keeps those GPR local homes
-    // default-off, so the methods are JIT-eligible again on the safe
+    // default-off, so the methods are JIT-eligible again on that safe
     // path. If a developer opts back into the old register homes for
-    // diagnosis, keep the targeted list active.
+    // diagnosis, or if a non-x64 backend has not installed an equivalent
+    // guard, keep the targeted list active.
     //
     // The conservative policy applies the targeted list only when the legacy
     // GPR local-home allocator is explicitly enabled. The aggressive policy
@@ -2093,6 +2094,12 @@ fn is_antlr_prediction_context_miscompile(class_name: &str, method_name: &str) -
 }
 
 fn callee_saved_gpr_local_homes_enabled() -> bool {
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        return true;
+    }
+
+    #[cfg(target_arch = "x86_64")]
     std::env::var("CRATONVM_JIT_ENABLE_CALLEE_SAVED_GPR_LOCALS")
         .ok()
         .map(|v| {
