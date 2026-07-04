@@ -21785,6 +21785,8 @@ fn compile_osr_artifact(
                 .unwrap_or(false);
             let param_slots = crate::jit::count_param_slots(&method_descriptor)
                 + if osr_method_is_static { 0 } else { 1 };
+            let (param_jvm_slots, param_slot_span) =
+                crate::jit::compute_param_jvm_slots(&method_descriptor, osr_method_is_static);
             let helpers = crate::jit::helpers::build_helpers();
             // HIB-CV-20 — seed the local-oop dataflow with this method's reference
             // PARAMETERS, exactly as the hot-path `jit::try_compile` does. The
@@ -21834,9 +21836,8 @@ fn compile_osr_artifact(
                 scan.non_escaping_new.clone(), // escape analysis results
                 std::collections::HashMap::new(), // inline_sites
                 None, // string_layout — String intrinsics land in a later wave
-                &[],  // param_jvm_slots — legacy "arg index == slot" layout (OSR
-                // bails category-2 params elsewhere; unchanged behavior)
-                0, // param_slot_span — legacy layout
+                &param_jvm_slots,
+                param_slot_span,
                 param_oop_mask,
                 compact_field_info,
                 "", // method_key — OSR path disables the per-bci de-spec consult

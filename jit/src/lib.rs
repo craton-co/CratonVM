@@ -1091,9 +1091,10 @@ pub struct CompiledMethod {
     /// OSR metadata: per-local GPR register assignments from graph-coloring allocator.
     pub osr_local_assignments: Option<Vec<Option<u8>>>,
     /// OSR metadata: per-bytecode-PC "dead local" mask. `osr_dead_mask[pc]` bit
-    /// `i` set means local `i` is dead at that OSR entry PC and must NOT be
-    /// loaded into its register by the trampoline (it would clobber a live
-    /// local that shares the coalesced register). Indexed like `osr_pc_to_native`.
+    /// `i` set means local `i` is dead at that OSR entry PC and shares compiled
+    /// state risk with the live locals at that entry. OSR currently declines
+    /// those entries and falls back to the interpreter. Indexed like
+    /// `osr_pc_to_native`.
     pub osr_dead_mask: Option<Vec<u64>>,
     /// OSR metadata: per-local XMM register assignments for float/double locals.
     pub osr_xmm_assignments: Option<Vec<Option<u8>>>,
@@ -1793,11 +1794,20 @@ impl CompiledMethod {
             .expect("call_with_heap: invalid JIT entry or arg count (use try_call_with_context for the fallible variant)")
     }
 
-    /// True when this artifact recorded an OSR entry point for `entry_pc`
+    /// True when this artifact recorded a safe OSR entry point for `entry_pc`
     /// (i.e. [`osr_enter`](Self::osr_enter) at that pc would not bail).
     /// Lets the interpreter's OSR trigger reuse a cached compile instead of
     /// re-running the whole x64 pipeline on every trigger.
     pub fn can_osr_enter(&self, entry_pc: usize) -> bool {
+        if self
+            .osr_dead_mask
+            .as_ref()
+            .and_then(|m| m.get(entry_pc).copied())
+            .unwrap_or(0)
+            != 0
+        {
+            return false;
+        }
         self.osr_pc_to_native
             .as_ref()
             .and_then(|t| t.get(entry_pc).copied())
@@ -1832,14 +1842,17 @@ impl CompiledMethod {
         }
         let target_addr = self.entry as usize + native_offset as usize;
 
-        // Locals dead at this entry PC must not be loaded into their (possibly
-        // shared) registers — loading a dead local clobbers the live local that
-        // colours to the same register. See `osr_dead_mask`.
+        // A nonzero dead mask means at least one dead interpreter local shares a
+        // compiled location with a live local at this entry. Until OSR supports
+        // reconstructing that coalesced state, fall back to the interpreter.
         let dead_mask = self
             .osr_dead_mask
             .as_ref()
             .and_then(|m| m.get(entry_pc).copied())
             .unwrap_or(0);
+        if dead_mask != 0 {
+            return None;
+        }
 
         osr_trampoline(
             target_addr,
@@ -6336,7 +6349,7 @@ fn method_uses_category2(code: &[u8], code_len: usize, descriptor: &str) -> bool
 /// 2, while the JIT passes them as args 0 and 1. The bytecode-x64 prologue
 /// uses this to deposit each argument in the slot the body reads. See
 /// [`x64::compile_with_param_slots`].
-fn compute_param_jvm_slots(descriptor: &str, is_static: bool) -> (Vec<usize>, usize) {
+pub fn compute_param_jvm_slots(descriptor: &str, is_static: bool) -> (Vec<usize>, usize) {
     let mut slots = Vec::new();
     let mut slot = 0usize;
     if !is_static {
@@ -8507,6 +8520,35 @@ mod tests {
     }
 
     #[test]
+    fn test_can_osr_enter_rejects_dead_masked_entry() {
+        let mut buf = ExecutableBuffer::new(16).expect("alloc failed");
+        buf.emit(&[0xC3]); // RET
+        let mut cm = CompiledMethod::new(buf);
+        cm.osr_pc_to_native = Some(vec![-1, 0, 4]);
+        cm.osr_dead_mask = Some(vec![0, 0x80, 0]);
+
+        assert!(!cm.can_osr_enter(0), "negative native offset must bail");
+        assert!(
+            !cm.can_osr_enter(1),
+            "dead coalesced locals are not safe OSR entries"
+        );
+        assert!(cm.can_osr_enter(2), "zero dead mask remains OSR-eligible");
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn test_osr_enter_rejects_dead_mask_before_trampoline() {
+        let mut buf = ExecutableBuffer::new(16).expect("alloc failed");
+        buf.emit(&[0xC3]); // RET
+        let mut cm = CompiledMethod::new(buf);
+        cm.osr_pc_to_native = Some(vec![0]);
+        cm.osr_dead_mask = Some(vec![0x80]);
+
+        let result = unsafe { cm.osr_enter(0, &[], 0, 0) };
+        assert_eq!(result, None);
+    }
+
+    #[test]
     fn test_executable_buffer_finalize_and_make_writable() {
         let mut buf = ExecutableBuffer::new(16).expect("alloc failed");
         buf.emit(&[0xC3]); // RET
@@ -9055,6 +9097,18 @@ mod tests {
     #[test]
     fn test_count_param_slots_empty_string() {
         assert_eq!(count_param_slots(""), 0);
+    }
+
+    #[test]
+    fn test_compute_param_jvm_slots_category2_instance() {
+        assert_eq!(
+            compute_param_jvm_slots("(Ljava/lang/Object;JZ)V", false),
+            (vec![0, 1, 2, 4], 5)
+        );
+        assert_eq!(
+            compute_param_jvm_slots("(JLjava/lang/Object;)V", true),
+            (vec![0, 2], 3)
+        );
     }
 
     #[test]

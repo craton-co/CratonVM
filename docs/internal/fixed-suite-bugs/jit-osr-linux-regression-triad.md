@@ -1,6 +1,6 @@
 # JIT On-Stack-Replacement (`CRATONVM_JIT_OSR=1`) regressions
 
-**Status:** OPEN. **Mode:** real-JDK, JIT on, Linux (Azure host, dev `0d142fad`+).
+**Status:** FIXED 2026-07-04. **Mode:** real-JDK, JIT on, Linux (Azure host, dev `0d142fad`+).
 **Isolation method (original):** same host, same binary, same TIMEOUT=600,
 same 387-class list — the ONLY variable flipped was `CRATONVM_JIT_OSR` (1 vs
 unset/0). Of 387 classes, 377 show identical status in both modes (confirming
@@ -8,6 +8,25 @@ they are NOT OSR-related). Exactly 3 classes flipped PASS (OSR off) → FAIL
 (OSR on) in that one-shot run; a further 7 shuffle between two already-broken
 statuses (FAIL/HANG/CRASH) in both modes — non-deterministic, not
 attributable to OSR.
+
+## Fix applied (2026-07-04)
+
+The deterministic regression was fixed conservatively in the OSR entry path:
+
+- `CompiledMethod::can_osr_enter` and `CompiledMethod::osr_enter` now reject
+  OSR entries with a nonzero `osr_dead_mask` and fall back to the interpreter.
+  The confirmed failing H2 method entered at `entry_pc=3` with
+  `dead_mask=0x80`, meaning local 7 (`row`) was dead while sharing compiled
+  state with live local 2 (`limitRows`). The old trampoline-side skip avoided
+  loading the dead local but still left the OSR-entered compiled frame relying
+  on a coalesced state transition that was not proven safe.
+- The OSR compiler path now passes `compute_param_jvm_slots` and
+  `param_slot_span` into `x64::compile_with_param_slots`, matching the normal
+  JIT prologue layout for category-2 parameters such as `long limitRows`.
+- Targeted regression coverage pins the dead-mask OSR refusal and the
+  category-2 JVM-slot mapping. The original Linux Hibernate repro was not
+  available in this worktree, so the suite-level rerun remains the next
+  external confirmation step rather than the basis for this fix.
 
 **2026-07-03 follow-up investigation (this doc's update):** re-ran all 3
 "confirmed" regressions in ISOLATION (single-class runs, `SHARDS=1`, several
@@ -36,7 +55,7 @@ mid-execution that wouldn't otherwise reach the normal JIT threshold), but
 does not itself cause it. A fix for this signature should target the general
 JIT virtual-dispatch path, not the OSR entry/trampoline specifically.
 
-## #3 — CONFIRMED, deterministic, root-caused to a specific method (exact defect still open)
+## #3 — CONFIRMED, deterministic, root-caused to a specific method (fixed conservatively)
 
 ### `org.hibernate.orm.test.mapping.naturalid.composite.CompoundNaturalIdTest`
 ```
@@ -108,7 +127,7 @@ on `wt-hib-osr120`, branch `hib-osr120-regression-check`, see local-only diffs
   the interface-dispatch helper path for `ResultTarget`/`LazyResultQueryFlat`)
   that a simplified repro doesn't trigger.
 
-**Not yet tried / next steps for whoever picks this up:** a live debugger
+**Historical next steps before the fix:** a live debugger
 (gdb/lldb) attached at the `osr_enter`/trampoline call, single-stepping
 through the jump into the OSR entry native offset and the first
 `invokeinterface` dispatch after it, would very likely find this in minutes —
@@ -173,6 +192,7 @@ out of the full 4548-class suite — a small blast radius, but its mechanism
 method is JIT-compiled via OSR rather than eagerly) is a category of bug that
 under-reports itself: it only shows up for methods that are OSR-triggered
 (hot loop, low total call count) rather than invocation-count-hot, which most
-methods never are. Recommend NOT flipping `CRATONVM_JIT_OSR` default-on until
-this is root-caused; the existing default (off) is unaffected by any of
-these findings.
+methods never are. The 2026-07-04 fix removes this known unsafe entry class by
+falling back instead of executing an unproven coalesced OSR state. Any
+decision to flip `CRATONVM_JIT_OSR` default-on should still be based on a
+fresh broader suite and benchmark sweep, not this retired single issue alone.
