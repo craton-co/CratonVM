@@ -5,6 +5,10 @@ suites. The docs had grown to describe the **same underlying bug from several
 angles**; this index is the consolidated map. Read it first.
 
 
+## 2026-07-04 http.server bug cluster (branch fix/http-server-cluster)
+
+- [http.server cluster: fixes + residuals](http-server-cluster-residuals.md) - core fix: `Collections.emptyListIterator()` mis-stamped as `EmptyIterator` crashed Jetty's `ContextHandler.notifyExitScope` on the main thread (fatal, not per-test) — fixed 8 of 9 ABEND classes. Plus `newSetFromMap(LinkedCaseInsensitiveMap)` losing case-insensitivity (+ a `SetFromMap.size()` follow-on regression), `java.net.URI` malformed-`%`-escape validation + multi-arg query quoting, and `URLDecoder`/`URLEncoder` ignoring non-UTF-8 charsets. 2 residuals open: `ServerHttpsRequestIntegrationTests` self-signed-cert `CertificateEncodingException`, `ZeroCopyIntegrationTests` Jetty-Core zero-copy write-0-bytes.
+
 ## 2026-07-04 Keycloak full-suite sweep (branch test/keycloak-fullsuite-20260704)
 
 Ran the 1124 Keycloak JUnit classes not covered by the prior 238-class baseline

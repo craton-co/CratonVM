@@ -28660,8 +28660,18 @@ fn native_set_from_map_size(ctx: &mut dyn NativeContext, args: &[Value]) -> Meth
         Some(Value::Object(Some(o))) => *o,
         _ => return Ok(Some(Value::Int(0))),
     };
+    // Delegate to the real backing map's `size()` via virtual dispatch, same
+    // as `native_set_from_map_contains`/`_to_array`/`_iterator` below — NOT
+    // through `native_map_size`, which has its own synthetic-layout
+    // heuristic (`map_state`'s "is slot 0 an array" probe) that can misfire
+    // on a REAL map whose own `table`/backing array field happens to land at
+    // the same slot index CratonVM's synthetic HashMap uses for `buckets`.
+    // For a real `LinkedCaseInsensitiveMap` (extends `LinkedHashMap`) this
+    // silently read the wrong field as "size" and returned 0, breaking
+    // `HeadersAdaptersTests.sizeWithMultipleValuesForHeaderShouldCountHeaders`
+    // once `newSetFromMap` started returning a real `SetFromMap` for it.
     match set_from_map_backing(ctx, this) {
-        Some(m) => native_map_size(ctx, &[Value::Object(Some(m))]),
+        Some(m) => ctx.invoke_virtual(m, "size", "()I", &[]),
         None => Ok(Some(Value::Int(0))),
     }
 }
@@ -32523,7 +32533,7 @@ fn register_iterator_protocol_natives(r: &mut NativeMethodRegistry) {
         colls,
         "emptyListIterator",
         "()Ljava/util/ListIterator;",
-        native_empty_iterator,
+        native_empty_list_iterator,
     );
     // Bug fix: previously this allocated `Collections$EmptyIterator` as an
     // Enumeration. EmptyIterator is an Iterator (only has hasNext/next/remove)
@@ -32842,6 +32852,41 @@ fn native_empty_iterator(ctx: &mut dyn NativeContext, _args: &[Value]) -> Method
     // Fallback (class/field unavailable): fresh synthetic empty iterator.
     let arr = alloc_ref_array(ctx, 0);
     let itr = alloc_synthetic(ctx, "java/util/Collections$EmptyIterator", 2);
+    ctx.set_field(itr, 0, Value::Object(Some(arr)));
+    ctx.set_field(itr, 1, Value::Int(0));
+    Ok(Some(Value::Object(Some(itr))))
+}
+
+fn native_empty_list_iterator(ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
+    // `Collections.emptyListIterator()` must return a `Collections$EmptyListIterator`
+    // (a ListIterator), NOT a plain `Collections$EmptyIterator` (an Iterator).
+    // This previously shared `native_empty_iterator`, which always stamped the
+    // result as `EmptyIterator` regardless of caller — real `EmptyIterator` has
+    // no hasPrevious/previous/nextIndex/previousIndex/set/add, so any code
+    // holding the result as a `ListIterator` (e.g. Jetty's
+    // `ContextHandler.notifyExitScope` walking an empty listener list) crashed
+    // the whole VM with a fatal main-thread NoSuchMethodError on `hasPrevious()Z`
+    // (an uncaught linkage error on the primary thread aborts the process,
+    // unlike a per-test failure). Mirrors the EMPTY_ITERATOR singleton pattern
+    // above, but keyed off `EmptyListIterator`'s own static field so identity
+    // (`emptyListIterator() == emptyListIterator()`) still holds.
+    let _ = ctx.ensure_class_initialized("java/util/Collections$EmptyListIterator");
+    if let Some(cid) = ctx.class_id_by_name("java/util/Collections$EmptyListIterator") {
+        if let Some(idx) = ctx.static_field_index_by_name(cid, "EMPTY_ITERATOR") {
+            if let v @ Value::Object(Some(_)) = ctx.get_static_field(cid, idx) {
+                return Ok(Some(v));
+            }
+            let arr = alloc_ref_array(ctx, 0);
+            let itr = alloc_synthetic(ctx, "java/util/Collections$EmptyListIterator", 2);
+            ctx.set_field(itr, 0, Value::Object(Some(arr)));
+            ctx.set_field(itr, 1, Value::Int(0));
+            ctx.set_static_field(cid, idx, Value::Object(Some(itr)));
+            return Ok(Some(Value::Object(Some(itr))));
+        }
+    }
+    // Fallback (class/field unavailable): fresh synthetic empty list iterator.
+    let arr = alloc_ref_array(ctx, 0);
+    let itr = alloc_synthetic(ctx, "java/util/Collections$EmptyListIterator", 2);
     ctx.set_field(itr, 0, Value::Object(Some(arr)));
     ctx.set_field(itr, 1, Value::Int(0));
     Ok(Some(Value::Object(Some(itr))))

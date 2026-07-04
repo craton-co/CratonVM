@@ -1114,13 +1114,39 @@ fn native_nel_execute(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
             // Do not propagate: `execute()` is fire-and-forget; a task failure
             // must not break the submitter. Mirror Netty's "rejected/uncaught
             // task" handling by logging and returning normally.
+            //
+            // `{e:?}` on `MethodCallFailed::ExceptionThrown` only prints the
+            // Throwable's raw heap pointer, which is useless for diagnosing
+            // *why* a submitted task failed (e.g. a reactive pipeline that
+            // then hangs waiting for a completion signal this swallowed
+            // exception was supposed to deliver). Resolve the Throwable's own
+            // `toString()` so the log carries the actual exception class +
+            // message.
+            let detail = describe_thrown(ctx, &e);
             tracing::warn!(
-                error = ?e,
+                error = %detail,
                 "NioEventLoop.execute: submitted Runnable.run() threw; swallowing per execute() contract",
             );
             Ok(None)
         }
     }
+}
+
+/// Best-effort `Throwable.toString()` for a swallowed `MethodCallFailed`, used
+/// only for diagnostic logging (never propagated). Falls back to the plain
+/// `Display` impl (which just prints the raw pointer) if the Throwable's own
+/// `toString()` can't be resolved.
+fn describe_thrown(ctx: &mut dyn NativeContext, e: &cratonvm_types::error::MethodCallFailed) -> String {
+    if let cratonvm_types::error::MethodCallFailed::ExceptionThrown(obj) = e {
+        if let Ok(Some(Value::Object(Some(s)))) =
+            ctx.invoke_virtual(*obj, "toString", "()Ljava/lang/String;", &[])
+        {
+            if let Some(text) = ctx.read_string(s) {
+                return text;
+            }
+        }
+    }
+    format!("{e}")
 }
 
 /// `*.schedule(Ljava/lang/Runnable;JLjava/util/concurrent/TimeUnit;)Ljava/util/concurrent/ScheduledFuture;`
@@ -1171,8 +1197,9 @@ fn native_nel_schedule(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCal
         match ctx.invoke_virtual(runnable, "run", "()V", &[]) {
             Ok(_) => {}
             Err(e) => {
+                let detail = describe_thrown(ctx, &e);
                 tracing::warn!(
-                    error = ?e,
+                    error = %detail,
                     "NioEventLoop.schedule(delay=0): Runnable.run() threw; swallowing",
                 );
             }

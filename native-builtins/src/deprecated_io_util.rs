@@ -130,14 +130,17 @@ fn set_date_millis(ctx: &mut dyn NativeContext, this: ObjectRef, millis: i64) {
 // URL encoding/decoding utilities
 // ---------------------------------------------------------------------------
 
-fn url_decode(input: &str) -> Result<String, &'static str> {
+/// Percent/`+`-decode into the raw byte sequence, without assuming any
+/// particular charset for the final bytes-to-`String` step (the caller picks
+/// that — see `url_decode`/`url_decode_named`). Real JDK's `URLDecoder.decode`
+/// throws `IllegalArgumentException` on a malformed escape rather than
+/// passing it through unchanged.
+fn url_decode_bytes(input: &str) -> Result<Vec<u8>, &'static str> {
     let mut result = Vec::new();
     let bytes = input.as_bytes();
     let mut i = 0;
     while i < bytes.len() {
         if bytes[i] == b'%' {
-            // Real JDK's URLDecoder.decode throws IllegalArgumentException on
-            // a malformed escape rather than passing it through unchanged.
             if i + 2 >= bytes.len() {
                 return Err("URLDecoder: Incomplete trailing escape (%) pattern");
             }
@@ -157,7 +160,26 @@ fn url_decode(input: &str) -> Result<String, &'static str> {
         result.push(bytes[i]);
         i += 1;
     }
-    Ok(String::from_utf8_lossy(&result).into_owned())
+    Ok(result)
+}
+
+fn url_decode(input: &str) -> Result<String, &'static str> {
+    Ok(String::from_utf8_lossy(&url_decode_bytes(input)?).into_owned())
+}
+
+/// `URLDecoder.decode(String, String)` / `(String, Charset)` — decode the
+/// percent-escaped bytes using the CALLER'S requested charset, not always
+/// UTF-8. Previously both overloads ignored their charset argument entirely
+/// (see the removed "we always use UTF-8 for simplicity" comments), so e.g.
+/// `URLDecoder.decode("%e0%e0%e0", "windows-1251")` produced UTF-8-lossy
+/// replacement characters (U+FFFD) instead of the correct Cyrillic text —
+/// breaking `ServletServerHttpRequestTests.getFormBodyWithNotUtf8Charset`
+/// and any non-UTF-8 form-urlencoded request body.
+fn url_decode_named(input: &str, charset_name: &str) -> Result<String, &'static str> {
+    Ok(crate::charset::decode_str_named(
+        charset_name,
+        &url_decode_bytes(input)?,
+    ))
 }
 
 fn hex_digit(b: u8) -> Option<u8> {
@@ -195,6 +217,38 @@ fn to_hex_char(nibble: u8) -> char {
         10..=15 => (b'A' + nibble - 10) as char,
         _ => '0',
     }
+}
+
+/// `URLEncoder.encode(String, String)` / `(String, Charset)` — same charset
+/// gap as `url_decode_named`, mirrored on the encode side: previously always
+/// percent-escaped the input's raw UTF-8 bytes regardless of the requested
+/// charset, so e.g. `URLEncoder.encode("а", "windows-1251")` produced
+/// `%D0%B0` (UTF-8) instead of the correct single-byte `%E0`. Safe
+/// (unescaped) characters are ASCII and identical across every charset this
+/// VM supports, so only non-safe characters need the charset's own byte
+/// encoding.
+fn url_encode_named(input: &str, charset_name: &str) -> String {
+    let mut result = String::new();
+    for ch in input.chars() {
+        match ch {
+            'A'..='Z' | 'a'..='z' | '0'..='9' | '-' | '_' | '.' | '*' => {
+                result.push(ch);
+            }
+            ' ' => {
+                result.push('+');
+            }
+            _ => {
+                let mut buf = [0u8; 4];
+                let s = ch.encode_utf8(&mut buf);
+                for b in crate::charset::encode_str_named(charset_name, s) {
+                    result.push('%');
+                    result.push(to_hex_char(b >> 4));
+                    result.push(to_hex_char(b & 0x0f));
+                }
+            }
+        }
+    }
+    result
 }
 
 // ---------------------------------------------------------------------------
@@ -1568,8 +1622,11 @@ fn register_url_codec(r: &mut NativeMethodRegistry) {
         |ctx, args| {
             let str_obj = obj_arg(args, 0)?;
             let text = ctx.read_string(str_obj).unwrap_or_default();
-            // Charset name is in args[1] — we always use UTF-8 for simplicity
-            let decoded = match url_decode(&text) {
+            let charset_name = match args.get(1) {
+                Some(Value::Object(Some(o))) => ctx.read_string(*o).unwrap_or_default(),
+                _ => String::new(),
+            };
+            let decoded = match url_decode_named(&text, &charset_name) {
                 Ok(d) => d,
                 Err(message) => {
                     return Err(RuntimeError::IllegalArgumentException {
@@ -1591,8 +1648,11 @@ fn register_url_codec(r: &mut NativeMethodRegistry) {
         |ctx, args| {
             let str_obj = obj_arg(args, 0)?;
             let text = ctx.read_string(str_obj).unwrap_or_default();
-            // Charset object is in args[1] — we always use UTF-8 for simplicity
-            let decoded = match url_decode(&text) {
+            let charset_name = match args.get(1) {
+                Some(v @ Value::Object(Some(_))) => crate::charset::charset_name_of(ctx, *v),
+                _ => String::new(),
+            };
+            let decoded = match url_decode_named(&text, &charset_name) {
                 Ok(d) => d,
                 Err(message) => {
                     return Err(RuntimeError::IllegalArgumentException {
@@ -1614,7 +1674,11 @@ fn register_url_codec(r: &mut NativeMethodRegistry) {
         |ctx, args| {
             let str_obj = obj_arg(args, 0)?;
             let text = ctx.read_string(str_obj).unwrap_or_default();
-            let encoded = url_encode(&text);
+            let charset_name = match args.get(1) {
+                Some(Value::Object(Some(o))) => ctx.read_string(*o).unwrap_or_default(),
+                _ => String::new(),
+            };
+            let encoded = url_encode_named(&text, &charset_name);
             let result = ctx.create_string(&encoded);
             Ok(Some(Value::Object(Some(result))))
         },
@@ -1628,7 +1692,11 @@ fn register_url_codec(r: &mut NativeMethodRegistry) {
         |ctx, args| {
             let str_obj = obj_arg(args, 0)?;
             let text = ctx.read_string(str_obj).unwrap_or_default();
-            let encoded = url_encode(&text);
+            let charset_name = match args.get(1) {
+                Some(v @ Value::Object(Some(_))) => crate::charset::charset_name_of(ctx, *v),
+                _ => String::new(),
+            };
+            let encoded = url_encode_named(&text, &charset_name);
             let result = ctx.create_string(&encoded);
             Ok(Some(Value::Object(Some(result))))
         },

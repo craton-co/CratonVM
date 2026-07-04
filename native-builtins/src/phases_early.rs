@@ -8388,7 +8388,11 @@ pub(crate) fn register_phase52_url_encoding(r: &mut NativeMethodRegistry) {
         "(Ljava/lang/String;Ljava/lang/String;)Ljava/lang/String;",
         |ctx, args| {
             let input = ctx.read_string(obj_arg(args, 0)?).unwrap_or_default();
-            let encoded = p52_url_encode(&input);
+            let charset_name = match args.get(1) {
+                Some(Value::Object(Some(o))) => ctx.read_string(*o).unwrap_or_default(),
+                _ => String::new(),
+            };
+            let encoded = p52_url_encode_named(&input, &charset_name);
             let s = ctx.create_string(&encoded);
             Ok(Some(Value::Object(Some(s))))
         },
@@ -8410,7 +8414,11 @@ pub(crate) fn register_phase52_url_encoding(r: &mut NativeMethodRegistry) {
         "(Ljava/lang/String;Ljava/lang/String;)Ljava/lang/String;",
         |ctx, args| {
             let input = ctx.read_string(obj_arg(args, 0)?).unwrap_or_default();
-            let decoded = match p52_url_decode(&input) {
+            let charset_name = match args.get(1) {
+                Some(Value::Object(Some(o))) => ctx.read_string(*o).unwrap_or_default(),
+                _ => String::new(),
+            };
+            let decoded = match p52_url_decode_named(&input, &charset_name) {
                 Ok(d) => d,
                 Err(message) => {
                     return Err(RuntimeError::IllegalArgumentException {
@@ -8448,7 +8456,11 @@ pub(crate) fn register_phase52_url_encoding(r: &mut NativeMethodRegistry) {
         "(Ljava/lang/String;Ljava/nio/charset/Charset;)Ljava/lang/String;",
         |ctx, args| {
             let input = ctx.read_string(obj_arg(args, 0)?).unwrap_or_default();
-            let encoded = p52_url_encode(&input);
+            let charset_name = match args.get(1) {
+                Some(v @ Value::Object(Some(_))) => crate::charset::charset_name_of(ctx, *v),
+                _ => String::new(),
+            };
+            let encoded = p52_url_encode_named(&input, &charset_name);
             let s = ctx.create_string(&encoded);
             Ok(Some(Value::Object(Some(s))))
         },
@@ -8459,7 +8471,11 @@ pub(crate) fn register_phase52_url_encoding(r: &mut NativeMethodRegistry) {
         "(Ljava/lang/String;Ljava/nio/charset/Charset;)Ljava/lang/String;",
         |ctx, args| {
             let input = ctx.read_string(obj_arg(args, 0)?).unwrap_or_default();
-            let decoded = match p52_url_decode(&input) {
+            let charset_name = match args.get(1) {
+                Some(v @ Value::Object(Some(_))) => crate::charset::charset_name_of(ctx, *v),
+                _ => String::new(),
+            };
+            let decoded = match p52_url_decode_named(&input, &charset_name) {
                 Ok(d) => d,
                 Err(message) => {
                     return Err(RuntimeError::IllegalArgumentException {
@@ -8503,7 +8519,47 @@ fn p52_url_encode(input: &str) -> String {
     result
 }
 
-fn p52_url_decode(input: &str) -> Result<String, &'static str> {
+/// `URLEncoder.encode(String, String)` / `(String, Charset)` — charset-aware
+/// counterpart to `url_encode_named` in `deprecated_io_util.rs` (same defect:
+/// this registration previously always percent-escaped raw UTF-8 bytes
+/// regardless of the requested charset).
+fn p52_url_encode_named(input: &str, charset_name: &str) -> String {
+    let mut result = String::with_capacity(input.len() * 3);
+    for ch in input.chars() {
+        match ch {
+            'A'..='Z' | 'a'..='z' | '0'..='9' | '-' | '_' | '.' | '*' => {
+                result.push(ch);
+            }
+            ' ' => result.push('+'),
+            _ => {
+                let mut buf = [0u8; 4];
+                let s = ch.encode_utf8(&mut buf);
+                for b in crate::charset::encode_str_named(charset_name, s) {
+                    result.push('%');
+                    result.push(if (b >> 4) < 10 {
+                        (b'0' + (b >> 4)) as char
+                    } else {
+                        (b'A' + (b >> 4) - 10) as char
+                    });
+                    let lo = b & 0x0F;
+                    result.push(if lo < 10 {
+                        (b'0' + lo) as char
+                    } else {
+                        (b'A' + lo - 10) as char
+                    });
+                }
+            }
+        }
+    }
+    result
+}
+
+/// Percent-decode into raw bytes only, without picking a charset for the
+/// bytes-to-`String` step. See `p52_url_decode_named` for the charset-aware
+/// entry point that overloads accepting a charset name/`Charset` must use.
+/// Real JDK's `URLDecoder.decode` throws `IllegalArgumentException` rather
+/// than passing malformed escapes through.
+fn p52_url_decode_bytes(input: &str) -> Result<Vec<u8>, &'static str> {
     let mut result = Vec::with_capacity(input.len());
     let bytes = input.as_bytes();
     let mut i = 0;
@@ -8514,11 +8570,9 @@ fn p52_url_decode(input: &str) -> Result<String, &'static str> {
                 i += 1;
             }
             b'%' => {
-                // Real JDK's URLDecoder.decode throws IllegalArgumentException
-                // rather than passing malformed escapes through: "Incomplete
-                // trailing escape (%) pattern" when fewer than 2 chars remain,
-                // "Illegal hex characters in escape (%) pattern" when they
-                // aren't valid hex digits.
+                // "Incomplete trailing escape (%) pattern" when fewer than 2
+                // chars remain, "Illegal hex characters in escape (%)
+                // pattern" when they aren't valid hex digits.
                 if i + 2 >= bytes.len() {
                     return Err("URLDecoder: Incomplete trailing escape (%) pattern");
                 }
@@ -8540,7 +8594,24 @@ fn p52_url_decode(input: &str) -> Result<String, &'static str> {
             }
         }
     }
-    Ok(String::from_utf8(result).unwrap_or_default())
+    Ok(result)
+}
+
+fn p52_url_decode(input: &str) -> Result<String, &'static str> {
+    Ok(String::from_utf8(p52_url_decode_bytes(input)?).unwrap_or_default())
+}
+
+/// `URLDecoder.decode(String, String)` / `(String, Charset)` — decode the
+/// percent-escaped bytes using the requested charset rather than always
+/// UTF-8 (see `deprecated_io_util::url_decode_named` for the sibling
+/// registration that fixes the same gap; both must handle non-UTF-8 charsets
+/// like windows-1251 correctly for
+/// `ServletServerHttpRequestTests.getFormBodyWithNotUtf8Charset`).
+fn p52_url_decode_named(input: &str, charset_name: &str) -> Result<String, &'static str> {
+    Ok(crate::charset::decode_str_named(
+        charset_name,
+        &p52_url_decode_bytes(input)?,
+    ))
 }
 
 fn p52_hex_val(b: u8) -> Option<u8> {
