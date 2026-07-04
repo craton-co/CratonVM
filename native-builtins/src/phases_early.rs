@@ -15116,48 +15116,51 @@ pub(crate) fn register_phase54_net_extras(r: &mut NativeMethodRegistry) {
     });
     r.register(uri, "toString", "()Ljava/lang/String;", |ctx, args| {
         let this = obj_arg(args, 0)?;
-        Ok(Some(ctx.get_field(this, 6)))
+        // residual-3 fix: field 6 is only populated by the `<init>`/`create`
+        // constructors below; URI objects built via `url_parse`+`uri_store_named`
+        // (e.g. `File.toURI()`, `phases_late.rs`'s `Path.toUri()` helpers) only
+        // set the "string" field BY NAME plus field 5 (`URL_FIELD_FULL`), so a
+        // bare `get_field(this, 6)` silently reads an unset slot for those.
+        // `uri_raw_string` (net_phase_e.rs) already tries the by-name "string"
+        // field, then indices 6 and 5, then a guarded index-0 fallback — a
+        // strict superset that still finds field 6 for the `<init>`/`create`
+        // convention, so this is a pure widening, not a behavior change for
+        // the previously-working case.
+        let s = crate::net_phase_e::uri_raw_string(ctx, this);
+        Ok(Some(Value::Object(Some(ctx.create_string(&s)))))
     });
     r.register(uri, "toASCIIString", "()Ljava/lang/String;", |ctx, args| {
         let this = obj_arg(args, 0)?;
-        Ok(Some(ctx.get_field(this, 6)))
+        let s = crate::net_phase_e::uri_raw_string(ctx, this);
+        Ok(Some(Value::Object(Some(ctx.create_string(&s)))))
     });
     r.register(uri, "toURL", "()Ljava/net/URL;", |ctx, args| {
         let this = obj_arg(args, 0)?;
-        // Create a URL from the raw string
-        let raw = ctx.get_field(this, 6);
+        // Create a URL from the raw string (see residual-3 fix note above).
+        let raw = crate::net_phase_e::uri_raw_string(ctx, this);
+        let raw_obj = ctx.create_string(&raw);
         let url_obj = alloc_concurrent_synthetic(ctx, "java/net/URL", 1);
-        ctx.set_field(url_obj, 0, raw);
+        ctx.set_field(url_obj, 0, Value::Object(Some(raw_obj)));
         Ok(Some(Value::Object(Some(url_obj))))
     });
     r.register(uri, "equals", "(Ljava/lang/Object;)Z", |ctx, args| {
         let this = obj_arg(args, 0)?;
         if let Value::Object(Some(other)) = args[1] {
-            let r1 = ctx.get_field(this, 6);
-            let r2 = ctx.get_field(other, 6);
-            if let (Value::Object(Some(s1)), Value::Object(Some(s2))) = (r1, r2) {
-                let str1 = ctx.read_string(s1).unwrap_or_default();
-                let str2 = ctx.read_string(s2).unwrap_or_default();
-                Ok(Some(Value::Int(if str1 == str2 { 1 } else { 0 })))
-            } else {
-                Ok(Some(Value::Int(0)))
-            }
+            let str1 = crate::net_phase_e::uri_raw_string(ctx, this);
+            let str2 = crate::net_phase_e::uri_raw_string(ctx, other);
+            Ok(Some(Value::Int(if str1 == str2 { 1 } else { 0 })))
         } else {
             Ok(Some(Value::Int(0)))
         }
     });
     r.register(uri, "hashCode", "()I", |ctx, args| {
         let this = obj_arg(args, 0)?;
-        if let Value::Object(Some(s)) = ctx.get_field(this, 6) {
-            let text = ctx.read_string(s).unwrap_or_default();
-            let mut hash: i32 = 0;
-            for ch in text.bytes() {
-                hash = hash.wrapping_mul(31).wrapping_add(ch as i32);
-            }
-            Ok(Some(Value::Int(hash)))
-        } else {
-            Ok(Some(Value::Int(0)))
+        let text = crate::net_phase_e::uri_raw_string(ctx, this);
+        let mut hash: i32 = 0;
+        for ch in text.bytes() {
+            hash = hash.wrapping_mul(31).wrapping_add(ch as i32);
         }
+        Ok(Some(Value::Int(hash)))
     });
 
     // --- HttpURLConnection (10-field) ---
@@ -15166,33 +15169,24 @@ pub(crate) fn register_phase54_net_extras(r: &mut NativeMethodRegistry) {
     // doInput=7, doOutput=8, connected=9
     let huc = "java/net/HttpURLConnection";
 
-    r.register(huc, "getResponseCode", "()I", |ctx, args| {
-        let this = obj_arg(args, 0)?;
-        // Auto-connect if not yet connected
-        if ctx.get_field(this, 9).as_int().unwrap_or(0) == 0 {
-            p54_huc_do_request(ctx, this)?;
-        }
-        Ok(Some(ctx.get_field(this, 2)))
-    });
-    r.register(
-        huc,
-        "getRequestMethod",
-        "()Ljava/lang/String;",
-        |ctx, args| {
-            let this = obj_arg(args, 0)?;
-            Ok(Some(ctx.get_field(this, 1)))
-        },
-    );
-    r.register(
-        huc,
-        "setRequestMethod",
-        "(Ljava/lang/String;)V",
-        |ctx, args| {
-            let this = obj_arg(args, 0)?;
-            ctx.set_field(this, 1, args[1]);
-            Ok(None)
-        },
-    );
+    // residual-4 fix: `getResponseCode`/`getRequestMethod`/`setRequestMethod`/
+    // `setRequestProperty`/`addRequestProperty` are intentionally NOT
+    // re-registered here. This function (`register_phase54_net_extras`) runs
+    // AFTER `http_url_connection::register_http_url_connection_real` (see
+    // `lib.rs`'s `register_essential_natives` vs `register_synthetic_overrides`
+    // call order), so a duplicate registration here would win and silently
+    // shadow it. The `http_url_connection.rs` versions are a strict superset:
+    // they branch on `is_real_carrier` and store custom headers in the
+    // identity-keyed `real_reqs` side table for a real-JDK URL carrier (this
+    // MockWebServer/HttpURLConnection-based case), falling back to the same
+    // synthetic field-4 array this file used for the non-real-carrier case.
+    // The old duplicate here always wrote to field 4 regardless of carrier
+    // kind, so a header set via `customizeConnection(HttpURLConnection)` on a
+    // real carrier never reached `huc_real_perform`'s request — the request
+    // dispatched with the caller-set headers missing entirely (Spring's
+    // `UrlResource` `customizeConnection`/`exists()` HEAD-then-GET fallback
+    // tests: `canCustomizeHttpUrlConnectionForExists[Fallback]`).
+
     r.register(huc, "setDoInput", "(Z)V", |ctx, args| {
         let this = obj_arg(args, 0)?;
         let v = args.get(1).and_then(|v| v.as_int()).unwrap_or(1);
@@ -15214,69 +15208,6 @@ pub(crate) fn register_phase54_net_extras(r: &mut NativeMethodRegistry) {
         }
         Ok(None)
     });
-    r.register(
-        huc,
-        "setRequestProperty",
-        "(Ljava/lang/String;Ljava/lang/String;)V",
-        |ctx, args| {
-            let this = obj_arg(args, 0)?;
-            // Store request headers in field 4 as an array of "Key: Value" strings
-            let key_ref = obj_arg(args, 1)?;
-            let val_ref = obj_arg(args, 2)?;
-            let key = ctx.read_string(key_ref).unwrap_or_default();
-            let val = ctx.read_string(val_ref).unwrap_or_default();
-            let header_str = ctx.create_string(&format!("{}: {}", key, val));
-
-            let hdr_arr = match ctx.get_field(this, 4) {
-                Value::Object(Some(a)) => a,
-                _ => {
-                    let a = ctx.new_array(cratonvm_types::ArrayElementType::Reference, 32);
-                    ctx.set_field(this, 4, Value::Object(Some(a)));
-                    a
-                }
-            };
-            // Find first null slot
-            let len = ctx.array_length(hdr_arr);
-            for i in 0..len {
-                if let Value::Object(None) = ctx.get_array_element(hdr_arr, i) {
-                    ctx.set_array_element(hdr_arr, i, Value::Object(Some(header_str)));
-                    break;
-                }
-            }
-            Ok(None)
-        },
-    );
-    r.register(
-        huc,
-        "addRequestProperty",
-        "(Ljava/lang/String;Ljava/lang/String;)V",
-        |ctx, args| {
-            // Same as setRequestProperty for our purposes (append)
-            let this = obj_arg(args, 0)?;
-            let key_ref = obj_arg(args, 1)?;
-            let val_ref = obj_arg(args, 2)?;
-            let key = ctx.read_string(key_ref).unwrap_or_default();
-            let val = ctx.read_string(val_ref).unwrap_or_default();
-            let header_str = ctx.create_string(&format!("{}: {}", key, val));
-
-            let hdr_arr = match ctx.get_field(this, 4) {
-                Value::Object(Some(a)) => a,
-                _ => {
-                    let a = ctx.new_array(cratonvm_types::ArrayElementType::Reference, 32);
-                    ctx.set_field(this, 4, Value::Object(Some(a)));
-                    a
-                }
-            };
-            let len = ctx.array_length(hdr_arr);
-            for i in 0..len {
-                if let Value::Object(None) = ctx.get_array_element(hdr_arr, i) {
-                    ctx.set_array_element(hdr_arr, i, Value::Object(Some(header_str)));
-                    break;
-                }
-            }
-            Ok(None)
-        },
-    );
     r.register(huc, "connect", "()V", |ctx, args| {
         let this = obj_arg(args, 0)?;
         if ctx.get_field(this, 9).as_int().unwrap_or(0) == 0 {

@@ -570,6 +570,63 @@ fn jla_get_methods_or_null(ctx: &mut dyn NativeContext, args: &[Value]) -> Metho
     }
 }
 
+/// `JavaLangAccess.defineClass(ClassLoader loader, String name, byte[] b,
+/// ProtectionDomain pd, String source)` -> `Class<?>`.
+///
+/// `jdk.internal.reflect.ClassDefiner.defineClass(String, byte[], int, int,
+/// ClassLoader)` — used by `ReflectionFactory` to materialize the
+/// serialization-constructor-accessor / `MethodAccessor` classes that JUnit5's
+/// `SessionPerRequestLauncher` (and every Arquillian
+/// `testsuite/integration-arquillian/tests/base` test class) generates during
+/// test-plan construction — slices its `(off, len)` window down to an
+/// exact-size array before calling
+/// `SharedSecrets.getJavaLangAccess().defineClass(parent, name, bytes, null,
+/// "__ClassDefiner__")`. `System$1` (the `JavaLangAccess` singleton, see
+/// `register_java_lang_access`) never had this method registered, so the
+/// `invokeinterface` raised `NoSuchMethodError`, aborting `ClassDefiner`
+/// before any Arquillian base test class could run.
+///
+/// No offset/length here (unlike `ClassLoader.defineClass1`/`defineClass2`) —
+/// the real `JavaLangAccess` interface method takes the whole array. Shares
+/// the same `define_class_via_full` backend as `defineClass1` so magic-byte
+/// validation, panic-guarding, and PD/code-source attribution stay unified
+/// across every defineClass entry point.
+///
+/// INSTANCE method: args[0] = receiver (System$1), args[1] = loader,
+/// args[2] = name, args[3] = byte[], args[4] = pd, args[5] = source (unused —
+/// `define_class_via_full` derives its own SourceFile handling).
+fn jla_define_class(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    use cratonvm_types::error::RuntimeError;
+
+    let loader = args.get(1).copied().unwrap_or(Value::Object(None));
+    let name = crate::classloader::read_optional_internal_name(ctx, args, 2);
+    let byte_array = match args.get(3) {
+        Some(Value::Object(Some(arr))) => *arr,
+        _ => {
+            return Err(RuntimeError::IllegalArgumentException {
+                message: "JavaLangAccess.defineClass: bytes must not be null".into(),
+            }
+            .into());
+        }
+    };
+    let len = ctx.array_length(byte_array);
+    let bytes = crate::classloader::read_byte_array_slice(ctx, byte_array, 0, len).map_err(
+        |_msg| {
+            cratonvm_types::error::MethodCallFailed::from(
+                RuntimeError::ArrayIndexOutOfBoundsException { index: 0 },
+            )
+        },
+    )?;
+
+    let mut opts = cratonvm_native_api::DefineClassFull::default();
+    if let Some(Value::Object(Some(pd))) = args.get(4) {
+        opts.code_source_url = crate::classloader::extract_pd_code_source_url(ctx, *pd);
+    }
+
+    let loader_id = crate::classloader::loader_id_for(ctx, loader);
+    crate::classloader::define_class_via_full(ctx, &name, bytes, loader_id, opts, false, None)
+}
+
 fn register_java_lang_access(registry: &mut NativeMethodRegistry) {
     let owner = "java/lang/System$1";
     registry.register(
@@ -687,12 +744,6 @@ fn register_java_lang_access(registry: &mut NativeMethodRegistry) {
     // `jdk.internal.reflect.ClassDefiner.defineClass` -> JavaLangAccess.defineClass.
     registry.register(
         owner,
-        "defineClass",
-        "(Ljava/lang/ClassLoader;Ljava/lang/String;[BLjava/security/ProtectionDomain;Ljava/lang/String;)Ljava/lang/Class;",
-        jla_define_class,
-    );
-    registry.register(
-        owner,
         "getConstantPool",
         "(Ljava/lang/Class;)Ljdk/internal/reflect/ConstantPool;",
         jla_get_constant_pool,
@@ -702,6 +753,14 @@ fn register_java_lang_access(registry: &mut NativeMethodRegistry) {
         "start",
         "(Ljava/lang/Thread;Ljdk/internal/vm/ThreadContainer;)V",
         jla_start_in_container,
+    );
+    // `jdk.internal.reflect.ClassDefiner` (JUnit5/Arquillian serialization-
+    // constructor-accessor generation) — see `jla_define_class` doc comment.
+    registry.register(
+        owner,
+        "defineClass",
+        "(Ljava/lang/ClassLoader;Ljava/lang/String;[BLjava/security/ProtectionDomain;Ljava/lang/String;)Ljava/lang/Class;",
+        jla_define_class,
     );
     // Also register on the interface so direct invokeinterface
     // dispatch (when the receiver's concrete class lookup falls
@@ -1928,5 +1987,27 @@ mod tests {
                 "expected method {owner}.{method}{desc} not registered"
             );
         }
+    }
+
+    #[test]
+    fn java_lang_access_define_class_registered() {
+        // `jdk.internal.reflect.ClassDefiner.defineClass` calls
+        // `SharedSecrets.getJavaLangAccess().defineClass(...)`, which
+        // dispatches on the `System$1` singleton's concrete class. Missing
+        // this registration aborted every Arquillian
+        // `testsuite/integration-arquillian/tests/base` test class with
+        // NoSuchMethodError during JUnit5 test-plan construction (see
+        // docs/known-issues/keycloak-arquillian-system1-defineclass-nosuchmethod.md).
+        let mut r = NativeMethodRegistry::new();
+        register_wp1_4_shared_secrets(&mut r);
+        assert!(
+            r.find(
+                "java/lang/System$1",
+                "defineClass",
+                "(Ljava/lang/ClassLoader;Ljava/lang/String;[BLjava/security/ProtectionDomain;Ljava/lang/String;)Ljava/lang/Class;",
+            )
+            .is_some(),
+            "JavaLangAccess.defineClass not registered on java/lang/System$1"
+        );
     }
 }

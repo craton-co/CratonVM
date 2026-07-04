@@ -52,7 +52,8 @@ root — see below.)
   JIT codegen of **`scan`** (single-pass, invocation-tier-up, `len=5880`).
 - A *generic* missed-root would not care which method is compiled. This one does ⇒ it is in
   scan's compiled code path, i.e. the **regalloc/codegen family**
-  (`jit-regalloc-callee-saved-clobber-family.md`), NOT the GC-root-coverage family.
+  ([`jit-regalloc-callee-saved-clobber-family.md`](../jit-regalloc-callee-saved-clobber-family.md)),
+  NOT the GC-root-coverage family.
 - `--nojit` clean. `-Xmx 4g` (suppress young GC) does not crash. Needs GC.
 
 ### What ruled-OUT (current binary, each rebuilt-free env A/B)
@@ -88,9 +89,9 @@ across a `String[]` for-each calling a `+`-concat-bailing helper) and `scratch-m
 (two loops over **freshly-allocated-inside-scan** arrays) — **do NOT reproduce** (`bad=0`).
 **Only the real reflection natives** (`getDeclaredFields`/`getDeclaredMethods`/`isSynthetic`/
 `getName`/`getParameterCount`) inside scan trigger it. This matches
-`jit-regalloc-callee-saved-clobber-family.md`'s key finding: *"NOT reproducible by bytecode
-shape … context-sensitive register allocation … per-method skip bisection, not a small
-synthetic repro, is what localizes each instance."*
+the archived [`jit-regalloc-callee-saved-clobber-family.md`](../jit-regalloc-callee-saved-clobber-family.md)
+key finding: *"NOT reproducible by bytecode shape … context-sensitive register allocation …
+per-method skip bisection, not a small synthetic repro, is what localizes each instance."*
 
 ### Forensic workflow verdicts (6 agents, all 3 root-cause hypotheses REFUTED)
 1. "JIT spills r13/r14 before every call but never reloads them" — **REFUTED**: r13/r14 are

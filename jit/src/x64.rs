@@ -1098,6 +1098,7 @@ pub fn jit_scan(code: &[u8], code_len: usize, descriptor: &str) -> Option<JitSca
     let mut anewarray_ops: Vec<(usize, u16)> = Vec::new(); // (pc, cp_index) for `anewarray` (0xbd)
     let mut ldc_ops: Vec<(usize, u16)> = Vec::new(); // (pc, cp_index) for `ldc`/`ldc_w`
     let mut ldc2w_ops: Vec<(usize, u16)> = Vec::new(); // (pc, cp_index) for `ldc2_w` (0x14)
+    let mut indy_ops: Vec<(usize, u16)> = Vec::new(); // (pc, cp_index) for `invokedynamic` (0xba)
     let mut has_athrow = false; // RBC.6 — method contains 0xbf
     let mut pc = 0;
     while pc < code_len {
@@ -1449,6 +1450,37 @@ pub fn jit_scan(code: &[u8], code_len: usize, descriptor: &str) -> Option<JitSca
                 needs_heap = true;
                 pc += 5;
             }
+            // invokedynamic — no longer a permanent scan-time veto (5 bytes:
+            // opcode, cp_hi, cp_lo, 0, 0). The overwhelmingly common source of
+            // an invokedynamic in otherwise-ordinary hot methods is
+            // `assert cond : "msg" + var;` (javac lowers the message concat via
+            // `StringConcatFactory`), which sits on the assertions-disabled dead
+            // branch. Previously ANY invokedynamic anywhere in a method's
+            // bytecode — reachable or not — permanently blacklisted the WHOLE
+            // method from JIT compilation (see the removed RG.1 test), forcing
+            // hot per-call-site methods that merely CONTAIN a dead assert into
+            // the interpreter forever.
+            //
+            // This scanner is CP-blind by design and does not resolve the
+            // target descriptor — it just records the site (pc, cp_index) so
+            // the codegen (which DOES have CP access) can look up the
+            // descriptor later. The codegen lowers the instruction to an
+            // unconditional jump to the existing uncommon-trap deopt stub
+            // (`DeoptReason::UnreachedCode`): if this exact program point is
+            // ever actually reached at runtime (assertions enabled, or a
+            // genuinely live indy), the method permanently reverts to
+            // interpreter-only execution for the rest of the process — i.e.
+            // today's status quo for that one method. In the common case
+            // (assertions disabled, dead branch) the trap is never taken and
+            // the surrounding hot method compiles and runs at full JIT speed.
+            0xba => {
+                if pc + 4 >= code_len {
+                    return None;
+                }
+                let cp_idx = ((code[pc + 1] as u16) << 8) | (code[pc + 2] as u16); // Widening: always safe
+                indy_ops.push((pc, cp_idx));
+                pc += 5;
+            }
             // tableswitch — accept in scanner, emit CMP chain in compiler
             0xaa => {
                 pc += 1;
@@ -1650,6 +1682,7 @@ pub fn jit_scan(code: &[u8], code_len: usize, descriptor: &str) -> Option<JitSca
         non_escaping_new,
         ldc_ops,
         ldc2w_ops,
+        indy_ops,
         has_athrow,
     })
 }
@@ -1677,6 +1710,11 @@ pub struct JitScanResult {
     pub ldc_ops: Vec<(usize, u16)>,
     /// For each `ldc2_w` (0x14) instruction: (bytecode_pc, cp_index)
     pub ldc2w_ops: Vec<(usize, u16)>,
+    /// For each `invokedynamic` (0xba) instruction: (bytecode_pc, cp_index).
+    /// The codegen resolves each site's target descriptor (this CP-less scan
+    /// cannot) and lowers the instruction to an unconditional deopt to the
+    /// interpreter via `DeoptReason::UnreachedCode` — see the 0xba codegen arm.
+    pub indy_ops: Vec<(usize, u16)>,
     /// RBC.6 — the method contains `athrow` (0xbf). Compilable only when
     /// the method has NO local exception handlers (the athrow codegen
     /// stashes the exception and returns the deopt sentinel; it cannot
@@ -1789,12 +1827,13 @@ fn bytecode_len_at(code: &[u8], pc: usize) -> usize {
         0xbb => 3, // new
         0xc5 => 4,
         // 5-byte instructions. invokeinterface (0xb9: opcode, cp_hi, cp_lo,
-        // count, 0) is the only one reachable today; invokedynamic (0xba:
-        // opcode, cp_hi, cp_lo, 0, 0) and the wide-offset branches goto_w
-        // (0xc8) / jsr_w (0xc9: opcode + 4-byte signed offset) are rejected by
-        // `jit_scan` (catch-all → `None`), so no compiled method contains them
-        // — but, like `wide` (0xc4) below, the length table must stay correct
-        // as defense-in-depth so every PC-stepping consumer (branch-target
+        // count, 0) and invokedynamic (0xba: opcode, cp_hi, cp_lo, 0, 0) are
+        // both reachable in a compiled method today (`jit_scan` accepts
+        // both). The wide-offset branches goto_w (0xc8) / jsr_w (0xc9:
+        // opcode + 4-byte signed offset) are still rejected by `jit_scan`
+        // (catch-all → `None`), so no compiled method contains them — but,
+        // like `wide` (0xc4) below, the length table must stay correct as
+        // defense-in-depth so every PC-stepping consumer (branch-target
         // precompute, DCE, OSR/unroll, instruction-start map, oop-map dataflow)
         // stays in lockstep if any is ever accepted. A missing entry
         // under-counts by 4 bytes and misaligns the walk — the same class of
@@ -2354,6 +2393,31 @@ fn flush_callee_saved_oops_enabled() -> bool {
     use std::sync::OnceLock;
     static G: OnceLock<bool> = OnceLock::new();
     *G.get_or_init(|| std::env::var_os("CRATONVM_JIT_NO_CALLEE_OOP_FLUSH").is_none())
+}
+
+/// Temporary safety gate for the callee-saved GPR local allocator.
+///
+/// The remaining `is_known_miscompile` family is driven by live Java values kept
+/// exclusively in callee-saved GPRs across calls/OSR transitions. Until the
+/// precise register-map allocator work lands, keep those GPR local homes out of
+/// the default codegen path. The graph-coloring allocator still runs for tests
+/// and XMM locals; developers can opt back into the old GPR homes with
+/// `CRATONVM_JIT_ENABLE_CALLEE_SAVED_GPR_LOCALS=1` when bisecting allocator
+/// bugs.
+pub fn callee_saved_gpr_local_homes_enabled() -> bool {
+    use std::sync::OnceLock;
+    static G: OnceLock<bool> = OnceLock::new();
+    *G.get_or_init(|| {
+        std::env::var("CRATONVM_JIT_ENABLE_CALLEE_SAVED_GPR_LOCALS")
+            .ok()
+            .map(|v| {
+                matches!(
+                    v.trim().to_ascii_lowercase().as_str(),
+                    "1" | "true" | "on" | "yes"
+                )
+            })
+            .unwrap_or(false)
+    })
 }
 
 fn compute_branch_targets(code: &[u8], code_len: usize) -> Vec<bool> {
@@ -6571,6 +6635,23 @@ struct Compiler {
     anewarray_info: Vec<(usize, u32)>,
     /// Invoke dispatch info: (bytecode_pc, pointer to leaked JitInvokeInfo).
     invoke_info: Vec<(usize, *const JitInvokeInfo)>,
+    /// Resolved `invokedynamic` (0xba) call-site info, needed ONLY for
+    /// stack-effect bookkeeping (arg pop count + result push kind) at the
+    /// unconditional-deopt codegen site — see the 0xba arm in
+    /// `compile_bytecode`. Entry: `(bytecode_pc, arg_slot_count, return_type_tag)`
+    /// where `arg_slot_count` is `count_param_slots(descriptor)` — one
+    /// simulated slot per argument regardless of category, matching every
+    /// other invoke-arg-popping site in this file — and `return_type_tag` is
+    /// the descriptor's return type byte (`b'V'` for void). Popping is
+    /// type-agnostic (`self.pop_stack()` returns any `StackSlot` kind), so
+    /// only the count is needed for args; only the *push* (the call's result)
+    /// needs the type, to select the correctly-shaped placeholder value.
+    /// Populated during the same CP-resolution pre-pass as `invoke_info`,
+    /// from `jit_scan`'s `indy_ops`. A method whose invokedynamic site cannot
+    /// be resolved here (no resolver, or the resolver returns `None`) bails
+    /// the whole compile (`x64::compile` returns `None`) rather than
+    /// guessing — see `try_compile_inner`.
+    indy_info: Vec<(usize, usize, u8)>,
     /// Direct call targets: (bytecode_pc, direct call info).
     /// For invokestatic/invokespecial where the callee is already JIT-compiled.
     direct_calls: Vec<(usize, super::JitDirectCall)>,
@@ -6924,6 +7005,7 @@ struct Compiler {
     field_info_idx: FxHashMap<usize, usize>,
     static_field_info_idx: FxHashMap<usize, usize>,
     invoke_info_idx: FxHashMap<usize, usize>,
+    indy_info_idx: FxHashMap<usize, usize>,
     direct_calls_idx: FxHashMap<usize, usize>,
     mic_slots_idx: FxHashMap<usize, usize>,
     pic_slots_idx: FxHashMap<usize, usize>,
@@ -7476,9 +7558,21 @@ impl Compiler {
         let stack_arg_reserve: i32 = 16;
 
         // Use graph-coloring allocator results
-        let local_assignments = alloc_result.assignments;
+        let raw_local_assignments = alloc_result.assignments;
+        let raw_used_callee_saved = alloc_result.used_callee_saved;
+        let raw_local_assignments_len = raw_local_assignments.len();
+        let gpr_local_homes_enabled = callee_saved_gpr_local_homes_enabled();
+        let local_assignments = if gpr_local_homes_enabled {
+            raw_local_assignments
+        } else {
+            vec![None; raw_local_assignments_len]
+        };
         let osr_block_live_in = alloc_result.block_live_in;
-        let alloc_used_regs = alloc_result.used_callee_saved;
+        let alloc_used_regs = if gpr_local_homes_enabled {
+            raw_used_callee_saved
+        } else {
+            Vec::new()
+        };
         let xmm_assignments = alloc_result.xmm_assignments;
         let alloc_used_xmms = alloc_result.used_xmm_regs;
         let num_reg_locals = local_assignments.iter().filter(|a| a.is_some()).count()
@@ -7626,6 +7720,7 @@ impl Compiler {
             new_info: Vec::new(),
             anewarray_info: Vec::new(),
             invoke_info: Vec::new(),
+            indy_info: Vec::new(),
             direct_calls: Vec::new(),
             mic_slots: Vec::new(),
             pic_slots: Vec::new(),
@@ -7694,6 +7789,7 @@ impl Compiler {
             field_info_idx: FxHashMap::default(),
             static_field_info_idx: FxHashMap::default(),
             invoke_info_idx: FxHashMap::default(),
+            indy_info_idx: FxHashMap::default(),
             direct_calls_idx: FxHashMap::default(),
             mic_slots_idx: FxHashMap::default(),
             pic_slots_idx: FxHashMap::default(),
@@ -7740,6 +7836,11 @@ impl Compiler {
         self.invoke_info_idx.reserve(self.invoke_info.len());
         for (i, e) in self.invoke_info.iter().enumerate() {
             self.invoke_info_idx.insert(e.0, i);
+        }
+        self.indy_info_idx.clear();
+        self.indy_info_idx.reserve(self.indy_info.len());
+        for (i, e) in self.indy_info.iter().enumerate() {
+            self.indy_info_idx.insert(e.0, i);
         }
         self.direct_calls_idx.clear();
         self.direct_calls_idx.reserve(self.direct_calls.len());
@@ -23207,6 +23308,82 @@ impl Compiler {
                     }
                 }
 
+                // invokedynamic — unconditional deopt to the interpreter.
+                //
+                // This instruction is never actually JIT-executed: rather than
+                // building call-site machinery for MethodHandle/CallSite
+                // dispatch, the codegen jumps straight to the EXISTING shared
+                // uncommon-trap deopt stub (reason 8 = `UnreachedCode`), whose
+                // pre-existing policy (`DeoptimizationController::recommend_action`,
+                // `jit/src/deopt.rs`) gives up immediately on first occurrence —
+                // exactly the right fail-safe: if this exact program point is
+                // ever actually reached at runtime (assertions enabled, or a
+                // genuinely live indy), the method permanently reverts to
+                // interpreter-only execution for the rest of the process (i.e.
+                // today's status quo for that one method), while the
+                // overwhelmingly common case — a dead `assert cond : "msg" +
+                // var;` branch — never takes the trap and the surrounding hot
+                // method compiles and runs at full JIT speed.
+                //
+                // Only the STACK EFFECT is modeled here (pop the call's args,
+                // push a placeholder result of the correct kind) so the
+                // compiler's simulated operand stack stays consistent for
+                // whatever bytecode follows the (unreachable, but still
+                // compiled) invokedynamic — e.g. the assert-message pattern's
+                // `invokespecial AssertionError.<init>` + `athrow`.
+                0xba => {
+                    // O(1) pc-indexed lookup — see `indy_info` field doc.
+                    let info = self.indy_info_idx.get(&pc).map(|&i| self.indy_info[i]);
+                    let Some((_pc, arg_slots, ret_type)) = info else {
+                        // No resolver, or this site couldn't be resolved at
+                        // compile time: fail safe and bail the whole method,
+                        // exactly like every other CP-resolved metadata miss
+                        // in this backend (see 0x12/0x13 above) — never emit
+                        // unsound code for an unresolvable call site.
+                        return false;
+                    };
+
+                    self.flush_scratch_registers();
+
+                    // Unconditional JMP to the shared deopt stub. Mirrors the
+                    // conditional String-intrinsic bail edges elsewhere in
+                    // this file (`emit_jcc_rel32_patch` + `deopt_stubs.push`),
+                    // but unconditional (`emit_jmp_rel32_patch`) since this
+                    // instruction is NEVER taken on the JIT-compiled path.
+                    let patch = self.emit_jmp_rel32_patch();
+                    self.deopt_stubs.push((patch, pc, 8)); // 8 = DEOPT_REASON_UNREACHED_CODE
+
+                    // Stack-effect-only bookkeeping for subsequent (unreachable
+                    // but still-compiled) bytecode: pop the call's arguments —
+                    // popping is type-agnostic, so only the count matters —
+                    // then push a single placeholder of the correct STACK-SLOT
+                    // KIND for the descriptor's return type (control never
+                    // reaches past the trap above, so the placeholder's actual
+                    // bit-pattern is irrelevant; only its kind must match what
+                    // downstream codegen expects).
+                    for _ in 0..arg_slots {
+                        self.pop_stack();
+                    }
+                    match ret_type {
+                        b'V' => {}
+                        b'F' | b'D' => {
+                            self.emit_xor_reg_self(RAX);
+                            self.push_from_rax_as_xmm0();
+                        }
+                        b'L' | b'[' => {
+                            self.emit_xor_reg_self(RAX);
+                            self.push_from_rax();
+                            self.mark_top_as_oop();
+                        }
+                        _ => {
+                            // int / long / short / byte / char / boolean
+                            self.emit_xor_reg_self(RAX);
+                            self.push_from_rax();
+                        }
+                    }
+                    pc += 5;
+                }
+
                 // newarray — allocate a new primitive array
                 0xbc => {
                     self.flush_scratch_registers();
@@ -23941,6 +24118,7 @@ pub fn compile(
         // empty for tests/AOT → legacy/helper field path.
         PENDING_COMPACT_FIELD_INFO.with(|c| std::mem::take(&mut *c.borrow_mut())),
         "", // method_key: legacy/test wrapper disables the per-bci de-spec consult
+        Vec::new(), // indy_info: legacy/test wrapper passes no invokedynamic sites
     )
 }
 
@@ -24015,6 +24193,11 @@ pub fn compile_with_param_slots(
     // `compile()` wrapper) disables the consult; the registry is empty in
     // production, so a non-empty key is still byte-identical there.
     method_key: &str,
+    // Resolved `invokedynamic` (0xba) call-site info — see the `indy_info`
+    // field doc on the `Compiler` struct. Empty from the legacy `compile()`
+    // test wrapper (which also passes no `indy_ops` to `jit_scan` callers, so
+    // this is always consistent with an invokedynamic-free method there).
+    indy_info: Vec<(usize, usize, u8)>,
 ) -> Option<CompiledMethod> {
     let verified_max_stack = PENDING_VERIFIED_MAX_STACK.with(|c| c.borrow_mut().take());
 
@@ -24394,6 +24577,7 @@ pub fn compile_with_param_slots(
     compiler.new_info = new_info;
     compiler.anewarray_info = anewarray_info;
     compiler.invoke_info = invoke_info;
+    compiler.indy_info = indy_info;
     compiler.direct_calls = direct_calls;
     // deopt-osr Step 8 (test trigger): under CRATONVM_OSR_EXIT_TEST + CRATONVM_DEOPT_REAL,
     // pick the first (lowest-pc) detected loop header as the synthetic OSR-exit
@@ -30837,10 +31021,11 @@ mod tests {
         assert_eq!(bytecode_len_at(&[0xb7, 0x00, 0x01], 0), 3); // invokespecial
         assert_eq!(bytecode_len_at(&[0xb9, 0x00, 0x01, 0x02, 0x00], 0), 5); // invokeinterface
                                                                             // Defense-in-depth (same class as the missing-`ldc` desync): the other
-                                                                            // 5-byte ops. invokedynamic / goto_w / jsr_w are rejected by `jit_scan`
-                                                                            // today, but the length table must stay correct so a future acceptance
-                                                                            // can't silently desync every PC-stepping walk. Must match the
-                                                                            // regalloc.rs `bc_len` twin's `bc_len_five_byte_ops`.
+                                                                            // 5-byte ops. invokedynamic is now accepted by `jit_scan` (see the 0xba
+                                                                            // scan/codegen arms); goto_w / jsr_w are still rejected today, but the
+                                                                            // length table must stay correct so a future acceptance can't silently
+                                                                            // desync every PC-stepping walk. Must match the regalloc.rs `bc_len`
+                                                                            // twin's `bc_len_five_byte_ops`.
         assert_eq!(bytecode_len_at(&[0xba, 0x00, 0x01, 0x00, 0x00], 0), 5); // invokedynamic
         assert_eq!(bytecode_len_at(&[0xc8, 0x00, 0x00, 0x00, 0x10], 0), 5); // goto_w
         assert_eq!(bytecode_len_at(&[0xc9, 0x00, 0x00, 0x00, 0x10], 0), 5); // jsr_w
@@ -30937,6 +31122,60 @@ mod tests {
         // Verify other OSR metadata
         assert_eq!(compiled.osr_num_locals, 3);
         assert!(compiled.osr_frame_size > 0, "Frame size should be positive");
+    }
+
+    #[test]
+    fn callee_saved_gpr_local_homes_are_default_off() {
+        if callee_saved_gpr_local_homes_enabled() {
+            return;
+        }
+
+        // int f(int a, int b) { int c = a + b; return c; }
+        let code: Vec<u8> = vec![
+            0x1a, // iload_0
+            0x1b, // iload_1
+            0x60, // iadd
+            0x3d, // istore_2
+            0x1c, // iload_2
+            0xac, // ireturn
+            0, 0,
+        ];
+        let compiled = compile(
+            &code,
+            6,
+            2,
+            3,
+            false,
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            HashMap::new(),
+            HashMap::new(),
+            &test_helpers(),
+            std::collections::HashSet::new(),
+            HashMap::new(),
+            None,
+        )
+        .expect("simple int-local method should compile");
+
+        assert_eq!(compiled.osr_num_reg_locals, 0);
+        assert!(compiled
+            .osr_callee_saved_regs
+            .as_ref()
+            .is_some_and(Vec::is_empty));
+        assert!(compiled
+            .osr_local_assignments
+            .as_ref()
+            .is_some_and(|assignments| assignments.iter().all(Option::is_none)));
     }
 
     #[test]

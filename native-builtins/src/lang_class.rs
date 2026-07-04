@@ -942,11 +942,21 @@ pub(crate) fn native_class_is_sealed(
 //   * Any byte < 0x20 or == 0x7F (DEL) → reject. NUL injects through native
 //     POSIX paths; the rest are control bytes that have no business in a
 //     resource name and tend to indicate a corrupted constant-pool entry.
-//   * `..` segment → reject. Even though `find_resource` re-canonicalizes,
-//     defence-in-depth keeps a malicious resource name from sneaking past
-//     a future change to the class-path matcher.
 //   * Backslash → reject. Resource paths are forward-slash on every JVM
 //     platform; backslash here is a Windows-path-injection signal.
+//
+// `..` segments are intentionally NOT rejected here (residual-1 fix):
+// HotSpot's `URLClassLoader`/`Class.getResource` transparently tolerates an
+// embedded `..` when probing a directory classpath root (e.g.
+// `SomeClass.class.getResource("../Sibling.class")`), and the real
+// path-traversal backstop already lives one layer down in
+// `find_resource`/`find_all_resource_urls` (`classloading/src/class_path.rs`),
+// which canonicalize the resolved path and reject it unless it stays
+// `starts_with` the canonicalized classpath root — the exact same
+// archive-vs-directory split (`is_safe_resource_name` vs
+// `is_directory_resolvable_resource_name`) already governs jar-entry lookups
+// there, so rejecting `..` again here only broke the legitimate case without
+// adding any protection the containment check doesn't already provide.
 //
 // The name passed in already has its leading `/` stripped (the package-
 // prefix prepending happens before this guard), so we do not need to re-
@@ -974,13 +984,6 @@ fn t19_h10_validate_resource_name(name: &str) -> Option<&str> {
     }
     if name.contains('\\') {
         return None;
-    }
-    // Reject `..` only as a path segment, not as a substring of a real
-    // filename like `foo..bar.txt`.
-    for seg in name.split('/') {
-        if seg == ".." {
-            return None;
-        }
     }
     Some(name)
 }
@@ -13176,33 +13179,47 @@ pub(crate) fn native_class_get_annotated_superclass(
 /// `java/lang/Class.getAnnotatedInterfaces()[Ljava/lang/reflect/AnnotatedType;`
 ///
 /// WP2.1-class-modern: returns an `AnnotatedType[]` mirroring the
-/// `getInterfaces()` array. Each element is a synthetic `AnnotatedType`
-/// wrapping the corresponding interface `Class` mirror — see
+/// `getGenericInterfaces()` array (residual-2 fix — see below for why the
+/// erased `getInterfaces()` array is wrong here). Each element is a
+/// synthetic `AnnotatedType` wrapping the corresponding interface Type — see
 /// [`make_annotated_type`] for the layout.
 ///
 /// Always returns a non-null (possibly zero-length) array — matching the
 /// JDK contract. Frameworks (ByteBuddy, JMX OpenMBean introspector) rely
 /// on the non-null guarantee; throwing or returning null here breaks
 /// `MBeanIntrospector.getMethods` recursion.
+///
+/// residual-2 fix: this must wrap the GENERIC interface types (from
+/// `getGenericInterfaces()`, which parses the class's Signature attribute
+/// into real `ParameterizedTypeImpl`s), not the erased `Class` mirrors from
+/// `getInterfaces()`. An erased `Class` always looks like a plain type to
+/// `annotated_type_impl_class_name`, so a generic interface such as
+/// `Comparable<Path>`/`Iterable<Path>` (two of `java.nio.file.Path`'s direct
+/// superinterfaces) got wrapped in the base `AnnotatedTypeBaseImpl` instead
+/// of `AnnotatedParameterizedTypeImpl` — the same ByteBuddy `AnnotatedType`
+/// dispatch mismatch the ES bytebuddy-annotatedtype fix addressed for
+/// methods/fields/parameters (see
+/// `docs/known-issues/elasticsearch-bytebuddy-annotatedtype-proxy-mismatch.md`),
+/// just not yet applied here. Mockito's `mock(Path.class)` walks exactly
+/// this path via ByteBuddy's owner-type reader when generating the mock.
 pub(crate) fn native_class_get_annotated_interfaces(
     ctx: &mut dyn NativeContext,
     args: &[Value],
 ) -> MethodCallResult {
-    let this = obj_arg(args, 0)?;
-    let class_id = match mirror_class_id(ctx, this) {
-        Some(id) => id,
-        None => {
+    let generic_ifaces = match native_class_get_generic_interfaces(ctx, args)? {
+        Some(Value::Object(Some(arr))) => arr,
+        _ => {
             let arr = ctx.new_ref_array(cratonvm_types::ClassId::new(0), 0);
             return Ok(Some(Value::Object(Some(arr))));
         }
     };
-
-    let iface_ids = ctx.class_interfaces(class_id);
-    let arr = ctx.new_ref_array(cratonvm_types::ClassId::new(0), iface_ids.len());
-    for (i, iface_id) in iface_ids.iter().enumerate() {
-        let iface_mirror = ctx.get_class_mirror(*iface_id);
-        let at = make_annotated_type(ctx, iface_mirror);
-        ctx.set_array_element(arr, i, Value::Object(Some(at)));
+    let len = ctx.array_length(generic_ifaces);
+    let arr = ctx.new_ref_array(cratonvm_types::ClassId::new(0), len);
+    for i in 0..len {
+        if let Value::Object(Some(iface_type)) = ctx.get_array_element(generic_ifaces, i) {
+            let at = make_annotated_type(ctx, iface_type);
+            ctx.set_array_element(arr, i, Value::Object(Some(at)));
+        }
     }
     Ok(Some(Value::Object(Some(arr))))
 }
@@ -15527,14 +15544,19 @@ mod tests {
     }
 
     #[test]
-    fn t19_h10_validate_resource_name_rejects_traversal_and_backslash() {
+    fn t19_h10_validate_resource_name_allows_traversal_rejects_backslash() {
+        // `..` segments are accepted here — HotSpot tolerates them for
+        // directory-classpath-root lookups, and the real containment check
+        // lives downstream in `find_resource`/`find_all_resource_urls`
+        // (canonicalize + `starts_with` the classpath root), same as an
+        // archive-entry lookup already rejects `..` via `is_safe_resource_name`.
         assert!(
-            t19_h10_validate_resource_name("../etc/passwd").is_none(),
-            "leading `..` segment must be rejected"
+            t19_h10_validate_resource_name("../etc/passwd").is_some(),
+            "`..` segment is no longer rejected at this layer"
         );
         assert!(
-            t19_h10_validate_resource_name("foo/../bar").is_none(),
-            "embedded `..` segment must be rejected"
+            t19_h10_validate_resource_name("foo/../bar").is_some(),
+            "embedded `..` segment is no longer rejected at this layer"
         );
         assert!(
             t19_h10_validate_resource_name("foo\\bar").is_none(),

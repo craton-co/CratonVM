@@ -2,7 +2,7 @@
 
 | | |
 |---|---|
-| **Status** | FIXED behind gate `CRATONVM_LOADER_AWARE_RESOLUTION` (default **OFF** pending app-gauntlet soak). Acceptance probes (IsoProbe / IsoProbe2) pass gate-on; gate-off byte-identical to baseline. Branch `fix/loader-aware-class-resolution`. |
+| **Status** | `ProxyClassReuseTest.testNoReuse` FIXED, gate now **default ON** (flipped 2026-07-03 during the `context.groovy` fix, validated with the Hibernate app-gauntlet soak below on 2026-07-04). Genuinely open residuals remain elsewhere in this doc (Groovy `MetaClass`/dispatch-layer bug, `BshScriptFactoryTests` reverse-pollution) — kept in `known-issues` for those. |
 | **Area** | VM core — real-JDK-mode class-loader identity + `CONSTANT_Class` resolution (the flat global class store conflated loader namespaces). |
 | **Symptom** | `org.hibernate.orm.test.proxy.ProxyClassReuseTest.testNoReuse` fails: `MappingException: Could not instantiate persister … MyEntity`, caused by `IncompatibleClassChangeError: class …MyEntity$HibernateProxy already defined by application loader`. |
 | **Severity** | medium (CratonVM-only; pre-existing — fails identically at baseline `b0aab8f9`). Same class as SBR-14 / SC-custom-classloader isolation residuals. |
@@ -15,6 +15,34 @@
 > insufficient disk space while producing debug test binaries. The gitignored Hibernate app
 > fixture is not present in this worktree, so `ProxyClassReuseTest` / BeanShell app-level reruns
 > were not retried here.
+
+## Hibernate app-gauntlet soak (2026-07-04) — the validation this doc called for
+
+The gate flipped default-on 2026-07-03 (see the `context.groovy` section below)
+explicitly on a narrow slice (3 target classes + a handful of `scripting.bsh`/
+`scripting.groovy` classes), flagging that Hibernate/Tomcat/WildFly
+custom-loader-heavy suites still needed a broader soak before full confidence.
+That soak: full Hibernate ORM 8.0 suite, 4548 classes, real-JDK JIT-on, gate
+on, TIMEOUT=600s, Linux (Azure host, dev `81a31c08`+).
+
+- `ProxyClassReuseTest` (this doc's original bug): **3/3 PASS**.
+- Full suite: **PASS 4293/4548 (94.4%)**, FAIL 133, CRASH 17, HANG 8, ABORTED 3.
+- Diffed against the known non-passed baseline and filtered for
+  already-documented pre-existing clusters (`bytecode.enhancement`/`lazytoone`,
+  jar-scanning, temporal-GC, the OSR-vtable-dispatch family): the residual
+  ~62 classes are the same pre-existing bugs independently root-caused
+  elsewhere this session — **no evidence of the gate turning any
+  previously-passing class into a failure**.
+- The two classes flagged as gate-sensitive in earlier same-session testing
+  (`bytecode.enhancement.basic.{InheritedTest,MappedSuperclassTest}`) were
+  never passing gate-off either; gate-on changes their failure mode from a
+  hard native CRASH (rc=139) to ABORTED — a safety improvement, not a new
+  regression, though still not a clean pass (tracked under the
+  `fix/lazy-enhancement-gate` line of work, not this doc).
+
+**Conclusion:** default-on holds under the Hibernate custom-loader-heavy
+suite. See `vm/src/runtime/env_cache.rs::loader_aware_resolution` for the
+updated doc comment recording this validation.
 
 ## Manifestation — Spring `context.groovy` (2026-07-03)
 

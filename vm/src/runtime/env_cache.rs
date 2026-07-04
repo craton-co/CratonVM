@@ -173,9 +173,23 @@ pub fn osr_backedge_enabled() -> bool {
 /// in this slice). `GroovyApplicationContextTests` and
 /// `GroovyApplicationContextDynamicBeanPropertyTests` go fully green
 /// (byte-for-byte HotSpot match); `GroovyAspectTests` gains one more pass.
-/// This is NOT the full "app gauntlet" soak the known-issues doc calls for
-/// (Hibernate/Tomcat/WildFly custom-loader-heavy suites were not re-run here)
-/// — if a broader regression turns up, revert this default flip (the env var
+/// **2026-07-04 Hibernate app-gauntlet soak (the broader validation this doc
+/// asked for):** full Hibernate ORM 8.0 suite, 4548 classes, real-JDK JIT-on,
+/// gate on, TIMEOUT=600s, Linux (Azure host, dev `81a31c08`+): PASS 4293/4548
+/// (94.4%), FAIL 133, CRASH 17, HANG 8, ABORTED 3. `ProxyClassReuseTest`
+/// (the original bug this gate fixes) is 3/3 clean. Diffed against the known
+/// baseline and filtered for already-documented pre-existing clusters
+/// (bytecode.enhancement/lazytoone, jar-scanning, temporal-GC, the OSR-vtable
+/// family): the residual ~62 classes are the same pre-existing bugs
+/// independently root-caused elsewhere this session — **no evidence of the
+/// gate turning any previously-passing class into a failure**. The two
+/// specific classes flagged as gate-sensitive earlier (`bytecode.enhancement.
+/// basic.{InheritedTest,MappedSuperclassTest}`) were never passing gate-off
+/// either; gate-on changes their failure mode from a hard native CRASH
+/// (rc=139) to ABORTED — a safety improvement, not a new regression, though
+/// still not a clean pass. Conclusion: default-on holds under the Hibernate
+/// custom-loader-heavy suite this comment previously flagged as untested.
+/// If a broader regression turns up, revert this default flip (the env var
 /// still overrides either way: `CRATONVM_LOADER_AWARE_RESOLUTION=0` to force
 /// off) rather than reverting the loader-aware resolution logic itself, which
 /// is independently correct.

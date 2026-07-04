@@ -8,7 +8,7 @@ use cratonvm_types::error::MethodCallResult;
 use cratonvm_types::intern_arc;
 use cratonvm_types::Value;
 
-use crate::{compile_java_regex, native_noop_with_this, obj_arg};
+use crate::{alloc_concurrent_synthetic, compile_java_regex, native_noop_with_this, obj_arg};
 
 // ---------------------------------------------------------------------------
 // Thread-local scratch buffers for per-element char[] reads.
@@ -4354,8 +4354,17 @@ pub(crate) fn native_string_chars(ctx: &mut dyn NativeContext, args: &[Value]) -
     let s = ctx.read_string(this).unwrap_or_default();
     let char_values: Vec<Value> = s.encode_utf16().map(|c| Value::Int(c as i32)).collect();
 
-    // Create IntStream: 1-field synthetic object (field 0 = Object[] elements)
-    let stream = ctx.alloc_object(ClassId::new(0), 1);
+    // Create IntStream: 1-field synthetic object stamped with the real
+    // `java/util/stream/IntStream` interface class (field 0 = Object[]
+    // elements) so the IntStream-keyed natives (anyMatch/allMatch/etc., see
+    // native-collections/src/lib.rs register_int_stream_natives) actually
+    // dispatch. Previously this allocated with `ClassId::new(0)` directly,
+    // which trips `alloc_object`'s unresolved-class defense-in-depth and
+    // silently substitutes the shared `cratonvm/synthetic/AnonymousObject$1`
+    // placeholder instead — that placeholder isn't stamped as IntStream, so
+    // every IntStream method call on it fails NoSuchMethodError (JUnit5's
+    // `StringUtils.containsWhitespace` -> `"...".chars().anyMatch(...)`).
+    let stream = alloc_concurrent_synthetic(ctx, "java/util/stream/IntStream", 1);
     let arr = ctx.new_ref_array(ClassId::new(0), char_values.len());
     for (i, val) in char_values.iter().enumerate() {
         ctx.set_array_element(arr, i, *val);
