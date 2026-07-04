@@ -17335,6 +17335,33 @@ pub fn register_essential_natives(registry: &mut NativeMethodRegistry) {
     // WP5.3 — X509KeyManager + X509TrustManager with EKU-aware alias selection
     //         and RFC 5280 chain validation backed by rustls-native-certs.
     x509_manager::register_x509_manager_real(registry);
+    // Cert-code fix (real-JDK AbstractMethodError): java.security.cert.
+    // Certificate / X509Certificate generic accessors (getEncoded, getType,
+    // checkValidity, getNotBefore/getNotAfter, ...) and CertificateFactory.
+    // getInstance/generateCertificate* are registered by
+    // phases_late::register_p68_security_cert, but that function is
+    // reachable ONLY via register_phase68_natives -> register_synthetic_
+    // overrides, which is #[cfg(feature = "synthetic-jdk")] and therefore
+    // compiled OUT of the default real-JDK CLI. The synthetic X509Certificate
+    // mirror objects that keystore.rs::make_x509_mirror (fallback path),
+    // x509_manager.rs::make_x509_mirror, and t27_tls.rs's
+    // getAcceptedIssuers/getCertificateChain allocate are instances of the
+    // real, ABSTRACT java/security/cert/X509Certificate class -- so
+    // Certificate.getEncoded() (declared abstract on Certificate, never
+    // overridden by X509Certificate itself) resolves to a Code-less method
+    // and every rescue path (the resolved-class native check and the
+    // receiver-own-class walk in interpreter.rs) finds nothing, throwing
+    // AbstractMethodError: method java/security/cert/Certificate.getEncoded()
+    // [B has no Code attribute. Repro: TrustManagerFactory.getInstance(...)
+    // .init((KeyStore) null) then ((X509TrustManager) tmf.getTrustManagers()
+    // [0]).getAcceptedIssuers()[i].getEncoded() -- exactly what OkHttp's
+    // Platform.platformTrustManager() does on every OkHttpClient
+    // construction (spring-webflux InvalidHttpMethodIntegrationTests
+    // Jetty-Core/Tomcat variants). Call the security.cert registration here
+    // too so it reaches the real-mode registry (mirrors the
+    // register_sslengine_real / register_ssl_session_real precedent for the
+    // analogous SSLSession bug, BUG-TC0622).
+    crate::phases_late::register_p68_security_cert(registry);
     // WP5.4 — TLS ALPN extension (`h2` / `http/1.1`) and SNI dispatch.
     t27_tls::register_alpn_real(registry);
     // WP5.5 — JDK 11+ java.net.http.HttpClient (sync + async, HTTP/1.1 + HTTP/2).
