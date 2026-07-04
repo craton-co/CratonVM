@@ -646,6 +646,60 @@ pub(crate) fn native_thread_start0(
             ctx.set_field_by_name(this, "contextClassLoader", Value::Object(Some(parent_ccl)));
         }
     }
+    // test-context-round2: real JDK `Thread.<init>`'s InheritableThreadLocal
+    // copy (`this.inheritableThreadLocals = ThreadLocal.createInheritedMap(
+    // parent.inheritableThreadLocals)`) silently doesn't take effect for a
+    // still-unexplained interpreter reason specifically when BOTH the
+    // ThreadGroup and name constructor arguments are explicitly non-null at
+    // the same time — confirmed via minimal repro: `Thread(Runnable)` and
+    // `Thread(ThreadGroup, Runnable)` alone each correctly propagate;
+    // `Thread(ThreadGroup, Runnable, String[, long])` — exactly what
+    // `Executors.defaultThreadFactory()` uses for every pooled worker —
+    // does not, losing the parent's InheritableThreadLocal values entirely
+    // (name/group/priority/contextClassLoader are all unaffected; only this
+    // one field is dropped). The two-condition trigger rules out a native
+    // registration gap (the constructors aren't natively overridden at all;
+    // this is real bytecode misbehaving) — root-causing it further needs
+    // interpreter-level bytecode tracing, out of scope here. Apply the copy
+    // here at start0-time instead, mirroring the TC0622 CCL fix above.
+    //
+    // Known trade-off: `characteristics` (which flags an explicit
+    // `Thread(group, target, name, stackSize, false)` opt-out of
+    // inheritance) isn't retained anywhere observable post-construction, so
+    // this can't distinguish "buggy" from "intentionally opted out". A
+    // legitimate opt-out combined with non-null group+name would incorrectly
+    // regain inheritance. That combination is rare in practice (the 5-arg
+    // opt-out constructor itself is rarely used); documented pending a real
+    // interpreter-level fix. Opt-out: `CRATONVM_INHERIT_TL_WORKAROUND=0`.
+    let apply_itl_workaround = match std::env::var("CRATONVM_INHERIT_TL_WORKAROUND") {
+        Ok(v) => v != "0" && !v.eq_ignore_ascii_case("false"),
+        Err(_) => true,
+    };
+    // The buggy path doesn't leave this field as `Object(None)` (the normal
+    // "never written" value real bytecode `getfield` would observe) — a raw
+    // native heap read here sees `Int(0)` instead, matching CratonVM's
+    // zero-fill representation for a slot the constructor's `putfield`
+    // (offset 201 in the real master constructor) never actually reached.
+    // Treat either as "not yet inherited".
+    let child_itl_unset = matches!(
+        ctx.get_field_by_name(this, "inheritableThreadLocals"),
+        Value::Object(None) | Value::Int(0)
+    );
+    if apply_itl_workaround && child_itl_unset {
+        let parent = ctx.current_thread_object();
+        if let Value::Object(Some(parent_map)) =
+            ctx.get_field_by_name(parent, "inheritableThreadLocals")
+        {
+            if let Ok(Some(new_map)) = ctx.invoke(
+                "java/lang/ThreadLocal",
+                "createInheritedMap",
+                "(Ljava/lang/ThreadLocal$ThreadLocalMap;)Ljava/lang/ThreadLocal$ThreadLocalMap;",
+                &[Value::Object(Some(parent_map))],
+            ) {
+                ctx.set_field_by_name(this, "inheritableThreadLocals", new_map);
+            }
+        }
+    }
     ctx.thread_start(this)
 }
 
