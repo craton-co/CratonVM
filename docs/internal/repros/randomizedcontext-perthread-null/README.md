@@ -269,3 +269,19 @@ different landing spot depending on timing. Next steps should target TIME
 (artificial delays at specific points in the call chain) rather than WHICH
 CODE, to independently confirm the timing-window theory without going
 through JIT at all.
+
+## 2026-07-04 follow-up: hash-code corruption and Elasticsearch package skip
+
+Current `dev` no longer reproduces this issue under `--nojit`; `MappingStatsTests` passes all 14 tests there. The remaining failure is JIT-only.
+
+A direct JIT-on run first re-hit the hash/equality helper cluster: the compiled-method list stopped at `java/util/Arrays.hashCode([Ljava/lang/Object;)I`, repeated `FieldScriptStats.hashCode()I`, and `java/util/Objects.hash([Ljava/lang/Object;)I`, followed by either a wrong hash-code result, invalid stream/vInt data, or a crash in `VmHeap::flush_thread_satb` reached from `jit_anewarray_object`. The crash-side object dump also showed an out-of-bounds field read against `java/lang/Long`, which is consistent with earlier object-layout corruption rather than a standalone SATB helper bug.
+
+Masking only Elasticsearch stats methods did not fix the suite. Masking `java/,jdk/` removed the hash/crash symptom but left stream serialization failures. The deterministic passing mask was:
+
+```text
+CRATONVM_JIT_DENY='java/util/Objects.hash,java/util/Objects.equals,java/util/Arrays.hashCode,jdk/internal/util/ArraysSupport.hashCode,org/elasticsearch'
+```
+
+That run completed `org.elasticsearch.action.admin.cluster.stats.MappingStatsTests` with `OK (14 tests)`. A narrower mask that skipped the hash/equality cluster plus `org/elasticsearch/action/admin/cluster/stats` and `org/elasticsearch/TransportVersion` still returned the original class-level `RandomizedContext.getPerThread() == null` failure, so the deterministic mitigation has to keep Elasticsearch application classes interpreted under the conservative policy until that package can be bisected safely.
+
+The code fix therefore keeps the known hash/equality corruption cluster skipped unconditionally under `SkipPolicy::Conservative`, independent of the callee-saved-GPR-local-homes opt-in, and adds a conservative Elasticsearch package skip. Both skips remain liftable through `CRATONVM_JIT_ALLOW_PACKAGES` for future bisection.
