@@ -131,14 +131,16 @@ initialization gap was fixed 2026-07-02), grouped as:
     gate at every ref-decode + JIT receiver-deref boundary) degrades a stale ref to a Java NPE — all 6 are now
     **crash-free jit+nojit** but still fail/time out (the residual reclamation itself is unfixed).
 19. **[Hibernate `type.temporal.*` — moving GC strands lambda refs in native stream/collection intrinsics](hib-temporal-gc-lambda-native-stale-local.md)** —
-    🟠 **OPEN** (fix in progress: per-native pinning). The 5 `org.hibernate.orm.test.type.temporal.*` classes
+    🟠 **OPEN** (native callback pinning hardened; full Hibernate rerun still pending). The 5 `org.hibernate.orm.test.type.temporal.*` classes
     abort rc=1 / SIGSEGV with `linkage error: no such method java/lang/Object.<sam>` — **not** a java.time
     binding bug. Same native-stale-Rust-local family as the StackWalker corruption
     ([hibernate-bytearraymapping-stackwalk-gc-corruption.md](hibernate-bytearraymapping-stackwalk-gc-corruption.md)):
     `Stream.forEach`/`sorted`, `Spliterator.tryAdvance`/`forEachRemaining`, `ArrayList.forEach` hold the lambda
-    + materialized elements in Rust locals across `invoke_virtual`; the moving young collector relocates them
-    out from under the stale local. `-Xmx8g` passes; default heap ~50–70 % crash. Fix = `pin_native_root` /
-    `read_native_pin` per native (NOT force-non-moving — that hits the HIB-CV-33 precise-root gap).
+    + materialized elements in Rust locals across `invoke_virtual`; the scheduled-task pump had the same issue
+    when firing multiple accrued `Runnable.run()` callbacks. Current focused fix = `pin_native_root` /
+    `read_native_pin` per callback/native (NOT force-non-moving — that hits the HIB-CV-33 precise-root gap).
+    This remains open until the Hibernate runner fixture is available and the temporal class loop is proven
+    crash-free at the default heap.
 
 FIXED bugs whose standalone docs were **removed** from this folder (resolved; full writeups in
 `git` history or [`docs/internal/fixed-suite-bugs/`](../internal/fixed-suite-bugs/)): A1 (reflection

@@ -172,17 +172,23 @@ impl ScheduledRegistry {
             if runnable_ptr.is_null() {
                 continue;
             }
-            let runnable = unsafe { ObjectRef::from_raw(runnable_ptr) };
+            let mut runnable = unsafe { ObjectRef::from_raw(runnable_ptr) };
+            let pin_base = ctx.pin_native_root(runnable);
             for _ in 0..to_fire {
                 if task.is_cancelled() {
                     break;
                 }
+                runnable = ctx.read_native_pin(pin_base, runnable);
                 let _ = ctx.invoke_virtual(runnable, "run", "()V", &[]);
+                runnable = ctx.read_native_pin(pin_base, runnable);
+                task.runnable_ptr
+                    .store(runnable.as_ptr() as usize, Ordering::Release);
                 task.fired.fetch_add(1, Ordering::AcqRel);
                 if task.fixed_delay {
                     *task.last_fire.lock() = Some(Instant::now());
                 }
             }
+            ctx.unpin_native_roots(pin_base);
         }
     }
 
@@ -276,7 +282,43 @@ pub fn gc_update_scheduled_refs(map: &std::collections::HashMap<usize, usize>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_utils::MockNativeContext;
+    use cratonvm_types::error::MethodCallResult;
+    use std::sync::atomic::AtomicUsize;
     use std::time::Duration;
+
+    static PUMP_RELOC_OLD: AtomicUsize = AtomicUsize::new(0);
+    static PUMP_RELOC_NEW: AtomicUsize = AtomicUsize::new(0);
+    static PUMP_RELOC_CALLS: AtomicUsize = AtomicUsize::new(0);
+    static PUMP_RELOC_FIRST: AtomicUsize = AtomicUsize::new(0);
+    static PUMP_RELOC_SECOND: AtomicUsize = AtomicUsize::new(0);
+
+    fn relocating_run_hook(
+        ctx: &mut MockNativeContext,
+        receiver: ObjectRef,
+        method_name: &str,
+        descriptor: &str,
+        _args: &[Value],
+    ) -> Option<MethodCallResult> {
+        if method_name != "run" || descriptor != "()V" {
+            return None;
+        }
+        let call = PUMP_RELOC_CALLS.fetch_add(1, Ordering::SeqCst);
+        match call {
+            0 => {
+                PUMP_RELOC_FIRST.store(receiver.as_ptr() as usize, Ordering::SeqCst);
+                ctx.remap_native_pin_addr_for_test(
+                    PUMP_RELOC_OLD.load(Ordering::SeqCst),
+                    PUMP_RELOC_NEW.load(Ordering::SeqCst),
+                );
+            }
+            1 => {
+                PUMP_RELOC_SECOND.store(receiver.as_ptr() as usize, Ordering::SeqCst);
+            }
+            _ => {}
+        }
+        Some(Ok(None))
+    }
 
     #[test]
     fn registry_singleton() {
@@ -335,6 +377,44 @@ mod tests {
             last_fire: Mutex::new(None),
         };
         assert_eq!(task.due_ticks(Instant::now()), 1);
+    }
+
+    #[test]
+    fn pump_re_reads_runnable_pin_after_callback_gc() {
+        let old_addr = 0x5100usize;
+        let new_addr = 0x6100usize;
+        PUMP_RELOC_OLD.store(old_addr, Ordering::SeqCst);
+        PUMP_RELOC_NEW.store(new_addr, Ordering::SeqCst);
+        PUMP_RELOC_CALLS.store(0, Ordering::SeqCst);
+        PUMP_RELOC_FIRST.store(0, Ordering::SeqCst);
+        PUMP_RELOC_SECOND.store(0, Ordering::SeqCst);
+
+        let reg = ScheduledRegistry::new();
+        let task = Arc::new(ScheduledTask {
+            id: 500,
+            runnable_ptr: AtomicUsize::new(old_addr),
+            start: Instant::now() - Duration::from_millis(10),
+            initial_delay_ms: 0,
+            period_ms: 1,
+            fired: AtomicU64::new(0),
+            cancelled: AtomicBool::new(false),
+            fixed_delay: false,
+            last_fire: Mutex::new(None),
+        });
+        reg.tasks.lock().push(task.clone());
+
+        let mut ctx = MockNativeContext::new();
+        ctx.set_invoke_virtual_hook(relocating_run_hook);
+        reg.pump(&mut ctx);
+
+        assert!(
+            PUMP_RELOC_CALLS.load(Ordering::SeqCst) >= 2,
+            "test setup must accrue at least two scheduled fires"
+        );
+        assert_eq!(PUMP_RELOC_FIRST.load(Ordering::SeqCst), old_addr);
+        assert_eq!(PUMP_RELOC_SECOND.load(Ordering::SeqCst), new_addr);
+        assert_eq!(task.runnable_ptr.load(Ordering::SeqCst), new_addr);
+        assert_eq!(ctx.native_pin_count_for_test(), 0);
     }
 
     #[test]
