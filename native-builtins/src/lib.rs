@@ -11773,6 +11773,19 @@ pub fn register_essential_natives(registry: &mut NativeMethodRegistry) {
             let key = ctx.read_string(key_obj).unwrap_or_default();
             let val = ctx.read_string(val_obj).unwrap_or_default();
             let old = ctx.set_system_property(&key, &val);
+            // Keep the cached `System.getProperties()` singleton's side-table in
+            // sync (SC-web-method-spel RC-A): a caller that already holds a
+            // reference to that singleton (e.g. Spring's `systemProperties` bean,
+            // registered once at ApplicationContext refresh time) never calls
+            // `System.getProperties()` again, so the resync-on-call logic in the
+            // `getProperties` native never re-fires. Without this, a later
+            // `System.setProperty(...)` is invisible through that stale
+            // reference -- SpEL's `#{systemProperties.foo}` (routed through
+            // `MapAccessor.canRead` -> `Properties.containsKey`) then reports the
+            // property as absent even though `System.getProperty("foo")` sees it.
+            if let Some(props) = crate::lang_system::system_props_singleton() {
+                crate::properties_sidetable::store_property_in_sidetable(ctx, props, &key, &val);
+            }
             match old {
                 Some(v) => Ok(Some(Value::Object(Some(ctx.create_string(&v))))),
                 None => Ok(Some(Value::Object(None))),
@@ -11794,7 +11807,13 @@ pub fn register_essential_natives(registry: &mut NativeMethodRegistry) {
             // "" — keycloak's `${name}` placeholder resolution (and any code that
             // distinguishes unset from empty) depends on the key being absent.
             // Returns the prior value, matching `Hashtable.remove`.
-            match ctx.remove_system_property(&key) {
+            let result = ctx.remove_system_property(&key);
+            // Mirror the removal into the cached singleton's side-table -- see
+            // the matching comment in `setProperty` above (SC-web-method-spel RC-A).
+            if let Some(props) = crate::lang_system::system_props_singleton() {
+                crate::properties_sidetable::remove_property_from_sidetable(ctx, props, &key);
+            }
+            match result {
                 Some(v) => Ok(Some(Value::Object(Some(ctx.create_string(&v))))),
                 None => Ok(Some(Value::Object(None))),
             }
@@ -14175,6 +14194,18 @@ pub fn register_essential_natives(registry: &mut NativeMethodRegistry) {
         "getAnnotation",
         "(Ljava/lang/Class;)Ljava/lang/annotation/Annotation;",
         lang_class::native_annotated_type_get_annotation,
+    );
+    // `AnnotatedParameterizedType.getAnnotatedActualTypeArguments()` --
+    // surfaces TYPE_ARGUMENT-level annotations (e.g. `@Valid` in
+    // `List<@Valid Person>`) that real-JDK's null `getTypeAnnotationBytes0`
+    // stub can never recover. See
+    // `native_annotated_parameterized_type_get_annotated_actual_type_arguments`
+    // doc comment for the full rationale (SC-web-method-validation RC-B).
+    registry.register(
+        "sun/reflect/annotation/AnnotatedTypeFactory$AnnotatedParameterizedTypeImpl",
+        "getAnnotatedActualTypeArguments",
+        "()[Ljava/lang/reflect/AnnotatedType;",
+        lang_class::native_annotated_parameterized_type_get_annotated_actual_type_arguments,
     );
     registry.register(
         "java/lang/Class",

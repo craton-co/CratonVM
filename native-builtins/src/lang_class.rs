@@ -3199,6 +3199,43 @@ pub(crate) fn illegal_arg_exc(msg: String) -> MethodCallFailed {
     cratonvm_types::error::RuntimeError::IllegalArgumentException { message: msg }.into()
 }
 
+/// Build a materialized `IllegalArgumentException(msg, cause)` whose cause is
+/// a fresh `NullPointerException`, matching HotSpot's
+/// `jdk.internal.reflect.*Accessor` behaviour when a reflective
+/// `Method.invoke`/`Constructor.newInstance` call passes `null` for a
+/// primitive formal parameter: HotSpot's argument unboxing calls
+/// `Number.doubleValue()` (etc.) on the null argument, and the resulting
+/// `NullPointerException` becomes the `IllegalArgumentException`'s cause
+/// (message text is HotSpot's own NPE helper message, not "argument type
+/// mismatch" -- but callers only key off the exception TYPE hierarchy, e.g.
+/// Spring's `InvocableHandlerMethod.doInvoke`:
+///   `(ex.getMessage() == null || ex.getCause() instanceof NullPointerException)
+///       ? "Illegal argument" : ex.getMessage()`
+/// -- so attaching an NPE cause here (keeping our own descriptive message) is
+/// sufficient to match that branch without needing byte-for-byte NPE text).
+///
+/// Falls back to the plain message-only `illegal_arg_exc` if the exception
+/// object can't be materialized (e.g. exotic classloader state) -- losing the
+/// cause is preferable to losing the exception entirely.
+pub(crate) fn illegal_arg_exc_null_to_primitive(
+    ctx: &mut dyn NativeContext,
+    msg: String,
+) -> MethodCallFailed {
+    let npe = match ctx.new_object_initialized("java/lang/NullPointerException", "()V", &[]) {
+        Ok(Some(Value::Object(Some(obj)))) => obj,
+        _ => return illegal_arg_exc(msg),
+    };
+    let msg_obj = ctx.create_string(&msg);
+    match ctx.new_object_initialized(
+        "java/lang/IllegalArgumentException",
+        "(Ljava/lang/String;Ljava/lang/Throwable;)V",
+        &[Value::Object(Some(msg_obj)), Value::Object(Some(npe))],
+    ) {
+        Ok(Some(Value::Object(Some(iae)))) => MethodCallFailed::ExceptionThrown(iae),
+        _ => illegal_arg_exc(msg),
+    }
+}
+
 /// Wrap a propagated Java exception from a reflective call into
 /// `java.lang.reflect.InvocationTargetException(cause)`, matching HotSpot's
 /// behaviour for `Method.invoke` and `Constructor.newInstance`.
@@ -5614,6 +5651,29 @@ pub(crate) fn native_method_invoke(
             match coerce_arg_strict(ctx, arg_val, pdesc, "Method.invoke argument") {
                 Ok(coerced) => invoke_args.push(coerced),
                 Err(e) => {
+                    // JDK-faithful cause: HotSpot's reflective unboxing calls
+                    // `Number.xxxValue()` on a null argument passed for a
+                    // primitive formal parameter, so the resulting
+                    // `IllegalArgumentException` carries a `NullPointerException`
+                    // cause. Spring's `InvocableHandlerMethod.doInvoke` (and
+                    // other callers) branch on `ex.getCause() instanceof
+                    // NullPointerException` to pick a friendlier message, so a
+                    // bare message-only IAE here diverges from HotSpot even
+                    // though the exception TYPE matches. See
+                    // `illegal_arg_exc_null_to_primitive`.
+                    let e = if matches!(arg_val, Value::Object(None))
+                        && matches!(pdesc.as_str(), "I" | "J" | "F" | "D" | "Z" | "B" | "S" | "C")
+                        && matches!(
+                            &e,
+                            MethodCallFailed::InternalError(cratonvm_types::error::VmError::Runtime(
+                                cratonvm_types::error::RuntimeError::IllegalArgumentException { .. }
+                            ))
+                        )
+                    {
+                        illegal_arg_exc_null_to_primitive(ctx, "argument type mismatch".to_string())
+                    } else {
+                        e
+                    };
                     // CRATONVM_DBG_INVOKE_COERCE=1 — dump the method, formal
                     // descriptors, actual arg runtime types, and innermost Java
                     // caller frames on a coercion mismatch. Env-gated.
@@ -12304,6 +12364,61 @@ pub fn i2_register_classloader_package_natives(r: &mut cratonvm_native_api::Nati
         "()[Ljava/lang/Package;",
         i2_classloader_get_defined_packages,
     );
+    // `Package.equals(Object)` -- real JDK has NO override (inherits identity
+    // `Object.equals`), which is correct there because HotSpot INTERNS one
+    // `Package` instance per (loader, package name): every `Class.getPackage()`
+    // call for the same package returns the SAME object, so identity equality
+    // is suffient. Our `native_class_get_package` (and the sibling package-
+    // mirror builders) allocate a FRESH synthetic `Package` object on every
+    // call -- no interning -- so two `Package`s for the literal same package
+    // name are never `==`, and since `equals` falls back to identity, they
+    // also never `.equals()`. Spring's `HandlerMethodValidationException`
+    // test helper `MvcParamPredicate.hasMvcAnnotation` (and any other code
+    // doing `someAnnotation.annotationType().getPackage().equals(SomeOther
+    // Annotation.class.getPackage())`) depends on same-named packages
+    // comparing equal, so this silently misclassified annotations by
+    // declaring package.
+    //
+    // Fix: override `equals` to compare by package name (`Package.hashCode()`
+    // already runs real bytecode hashing `getName()`, so this keeps the
+    // equals/hashCode contract intact). This is not a byte-for-byte identity
+    // match (two different loaders' same-named packages would now compare
+    // equal, where HotSpot's interned-per-loader objects would not), but it
+    // fixes the common case without the GC-safety complexity of interning
+    // `Package` objects in a side-table (cf. `system_props_singleton`).
+    r.register(
+        "java/lang/Package",
+        "equals",
+        "(Ljava/lang/Object;)Z",
+        |ctx, args| {
+            let this = match args.first() {
+                Some(Value::Object(Some(o))) => *o,
+                _ => return Ok(Some(Value::Int(0))),
+            };
+            let other = match args.get(1) {
+                Some(Value::Object(Some(o))) => *o,
+                _ => return Ok(Some(Value::Int(0))),
+            };
+            if this == other {
+                return Ok(Some(Value::Int(1)));
+            }
+            let other_cid = ctx.class_id_of_object(other);
+            let other_class_name = ctx.class_name_of_id(other_cid).unwrap_or_default();
+            if other_class_name != "java/lang/Package" {
+                return Ok(Some(Value::Int(0)));
+            }
+            let this_name = ctx.get_field_by_name(this, "name");
+            let other_name = ctx.get_field_by_name(other, "name");
+            let eq = match (this_name, other_name) {
+                (Value::Object(Some(a)), Value::Object(Some(b))) => {
+                    ctx.read_string(a).unwrap_or_default() == ctx.read_string(b).unwrap_or_default()
+                }
+                (Value::Object(None), Value::Object(None)) => true,
+                _ => false,
+            };
+            Ok(Some(Value::Int(eq as i32)))
+        },
+    );
     r.register(
         cl,
         "getNamedPackage",
@@ -13486,6 +13601,53 @@ fn make_annotated_type_with_anns(
     obj
 }
 
+/// Side-table holding, per constructed `AnnotatedType` object (keyed by
+/// pointer identity -- same pattern/caveats as `constructor_mirror_side_table`:
+/// short-lived objects, not expected to survive a moving GC between
+/// construction and the `getAnnotatedActualTypeArguments()` read that
+/// consumes them), the TYPE_ARGUMENT-level annotations for a *parameterized*
+/// type built from a method parameter, indexed by type-argument position.
+///
+/// Populated by [`native_executable_get_annotated_parameter_types`] (which has
+/// access to the owning method + parameter index needed to look up the
+/// per-type-argument annotations) and consumed by
+/// [`native_annotated_parameterized_type_get_annotated_actual_type_arguments`].
+/// Not every `AnnotatedType` has an entry here -- only ones backed by a
+/// `ParameterizedType` method-parameter whose type arguments carry TYPE_USE
+/// annotations (e.g. `List<@Valid Person>`); absence means "no per-argument
+/// annotations", not an error.
+fn annotated_parameterized_type_arg_anns_table(
+) -> &'static Mutex<FxHashMap<usize, Vec<Vec<cratonvm_native_api::AnnotationData>>>> {
+    static TABLE: OnceLock<Mutex<FxHashMap<usize, Vec<Vec<cratonvm_native_api::AnnotationData>>>>> =
+        OnceLock::new();
+    TABLE.get_or_init(|| Mutex::new(FxHashMap::default()))
+}
+
+fn stash_annotated_type_argument_anns(
+    at_obj: ObjectRef,
+    per_arg_anns: Vec<Vec<cratonvm_native_api::AnnotationData>>,
+) {
+    if per_arg_anns.iter().all(|v| v.is_empty()) {
+        return;
+    }
+    let key = at_obj.as_ptr() as usize;
+    annotated_parameterized_type_arg_anns_table()
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .insert(key, per_arg_anns);
+}
+
+fn take_annotated_type_argument_anns(
+    at_obj: ObjectRef,
+) -> Option<Vec<Vec<cratonvm_native_api::AnnotationData>>> {
+    let key = at_obj.as_ptr() as usize;
+    annotated_parameterized_type_arg_anns_table()
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .get(&key)
+        .cloned()
+}
+
 /// Read the stashed `Annotation[]` from an AnnotatedType built by
 /// [`make_annotated_type`] / [`make_annotated_type_with_anns`], returning
 /// `(array_ref, len)`. Returns `None` when the `annotations` field is null or
@@ -13622,12 +13784,13 @@ pub(crate) fn native_executable_get_annotated_parameter_types(
     args: &[Value],
 ) -> MethodCallResult {
     let this = obj_arg(args, 0)?;
-    let (per_param, count) = match method_class_name_desc(ctx, this) {
+    let (per_param, per_param_type_args, count) = match method_class_name_desc(ctx, this) {
         Some((cid, name, desc)) => {
             let pta = ctx.method_parameter_type_annotations(cid, &name, &desc);
-            (pta, count_method_params(&desc))
+            let pta_args = ctx.method_parameter_type_argument_annotations(cid, &name, &desc);
+            (pta, pta_args, count_method_params(&desc))
         }
-        None => (Vec::new(), 0),
+        None => (Vec::new(), Vec::new(), 0),
     };
     // Resolve the erased parameter type mirrors once (fallback + length
     // reference for the generic array below).
@@ -13676,6 +13839,15 @@ pub(crate) fn native_executable_get_annotated_parameter_types(
         let empty = Vec::new();
         let anns = per_param.get(i).unwrap_or(&empty);
         let at = make_annotated_type_with_anns(ctx, tm, anns);
+        // Stash this parameter's TYPE_ARGUMENT-level annotations (e.g. the
+        // `@Valid` in `List<@Valid Person>`) alongside the AnnotatedType we
+        // just built, so a later `getAnnotatedActualTypeArguments()` call on
+        // it (if it turns out to be an `AnnotatedParameterizedType`) can
+        // attach them to the right type-argument `AnnotatedType` -- see
+        // `native_annotated_parameterized_type_get_annotated_actual_type_arguments`.
+        if let Some(type_arg_anns) = per_param_type_args.get(i) {
+            stash_annotated_type_argument_anns(at, type_arg_anns.clone());
+        }
         ctx.set_array_element(out, i, Value::Object(Some(at)));
     }
     Ok(Some(Value::Object(Some(out))))
@@ -13756,6 +13928,79 @@ pub(crate) fn native_annotated_type_get_annotation(
         }
     }
     Ok(Some(Value::Object(None)))
+}
+
+/// `AnnotatedParameterizedType.getAnnotatedActualTypeArguments()
+/// [Ljava/lang/reflect/AnnotatedType;` override.
+///
+/// Real JDK's `AnnotatedParameterizedTypeImpl` computes this from
+/// `getTypeAnnotationBytes0`-derived bookkeeping, which CratonVM never
+/// populates (that native is stubbed to null -- see the module-level notes
+/// on `make_annotated_type`), so the real-bytecode path returns type
+/// arguments with no annotations. That breaks Spring's
+/// `HandlerMethod.MethodValidationInitializer.getContainerElementAnnotations`,
+/// which relies on this call to find `@Valid`/`@Constraint` annotations
+/// nested in a parameter's type arguments (e.g. `List<@Valid Person>`).
+///
+/// This override: reads the wrapped `Type` (stashed in the `type` field by
+/// [`make_annotated_type`] / [`make_annotated_type_with_anns`]), calls its
+/// `getActualTypeArguments()` (real JDK `ParameterizedTypeImpl`, works fine
+/// since generic signatures are already parsed correctly), and wraps each
+/// argument as a plain `AnnotatedType` -- attaching the TYPE_ARGUMENT-level
+/// annotations stashed by [`native_executable_get_annotated_parameter_types`]
+/// (via [`take_annotated_type_argument_anns`]) when available. AnnotatedTypes
+/// not built from a method parameter (no side-table entry) simply get
+/// argument wrappers with no annotations, matching the prior (gap) behavior.
+pub(crate) fn native_annotated_parameterized_type_get_annotated_actual_type_arguments(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    let this = obj_arg(args, 0)?;
+    let per_arg_anns = take_annotated_type_argument_anns(this);
+
+    let backing_type = match ctx.get_field_by_name(this, "type") {
+        Value::Object(Some(t)) => t,
+        _ => {
+            let comp = ctx
+                .class_id_by_name("java/lang/reflect/AnnotatedType")
+                .unwrap_or(cratonvm_types::ClassId::new(0));
+            return Ok(Some(Value::Object(Some(ctx.new_ref_array(comp, 0)))));
+        }
+    };
+
+    let type_args = match ctx.invoke_virtual(
+        backing_type,
+        "getActualTypeArguments",
+        "()[Ljava/lang/reflect/Type;",
+        &[],
+    ) {
+        Ok(Some(Value::Object(Some(arr)))) => arr,
+        _ => {
+            let comp = ctx
+                .class_id_by_name("java/lang/reflect/AnnotatedType")
+                .unwrap_or(cratonvm_types::ClassId::new(0));
+            return Ok(Some(Value::Object(Some(ctx.new_ref_array(comp, 0)))));
+        }
+    };
+    let n = ctx.array_length(type_args);
+    let comp = ctx
+        .class_id_by_name("java/lang/reflect/AnnotatedType")
+        .unwrap_or(cratonvm_types::ClassId::new(0));
+    let out = ctx.new_ref_array(comp, n);
+    let empty = Vec::new();
+    for i in 0..n {
+        let tm = match ctx.get_array_element(type_args, i) {
+            Value::Object(Some(m)) => m,
+            _ => continue,
+        };
+        let anns = per_arg_anns
+            .as_ref()
+            .and_then(|v| v.get(i))
+            .unwrap_or(&empty);
+        let at = make_annotated_type_with_anns(ctx, tm, anns);
+        ctx.set_array_element(out, i, Value::Object(Some(at)));
+    }
+    Ok(Some(Value::Object(Some(out))))
 }
 
 /// Build a non-null, empty `java.security.Permissions` collection.
