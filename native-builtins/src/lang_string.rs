@@ -353,6 +353,37 @@ pub(crate) fn register_string_builder_natives(registry: &mut NativeMethodRegistr
     );
     registry.register(class, "length", "()I", native_sb_length);
     registry.register(class, "charAt", "(I)C", native_sb_char_at);
+    // codePointAt/codePointBefore/codePointCount/appendCodePoint: MUST be
+    // native for the same reason as getValue/getCoder below — unregistered,
+    // real JDK `AbstractStringBuilder` bytecode operates on the compact
+    // `byte[] value` + `byte coder` layout, which CratonVM's synthetic
+    // `char[]`-backed StringBuilder does not have. See the doc comments on
+    // `native_sb_code_point_at` / `native_sb_append_code_point`.
+    registry.register(class, "codePointAt", "(I)I", native_sb_code_point_at);
+    registry.register(
+        class,
+        "codePointBefore",
+        "(I)I",
+        native_sb_code_point_before,
+    );
+    registry.register(
+        class,
+        "codePointCount",
+        "(II)I",
+        native_sb_code_point_count,
+    );
+    registry.register(
+        class,
+        "appendCodePoint",
+        "(I)Ljava/lang/StringBuilder;",
+        native_sb_append_code_point,
+    );
+    registry.register(
+        class,
+        "appendCodePoint",
+        "(I)Ljava/lang/StringBuffer;",
+        native_sb_append_code_point,
+    );
     // BUG-TC0622: real-JDK bytecode (String.nonSyncContentEquals, reached via
     // String.contentEquals(CharSequence)) reads the builder's value/coder
     // directly. Our synthetic char[]+count layout has no compact byte[]/coder,
@@ -2027,6 +2058,166 @@ pub(crate) fn native_sb_char_at(ctx: &mut dyn NativeContext, args: &[Value]) -> 
     let buf = buf.unwrap();
     let ch = ctx.get_array_element(buf, index as usize);
     Ok(Some(ch))
+}
+
+/// `AbstractStringBuilder.codePointAt(int index)`.
+///
+/// MUST be a native: unregistered, this falls through to the real JDK
+/// bytecode, which calls `checkIndex`/`isLatin1()` and then either indexes
+/// the compact `byte[] value` field directly or delegates to
+/// `StringUTF16.codePointAt(value, index, count)`. CratonVM's StringBuilder
+/// backing is a synthetic `char[]` (slot 0 = `char[] buffer`, slot 1 =
+/// `int count`; no `coder`/compact `byte[] value` fields), so that real
+/// bytecode reads garbage out of the mismatched layout — surfacing as a
+/// bare `ArrayIndexOutOfBoundsException` (no message, since it is CratonVM's
+/// own array-bounds-check codegen faulting on the miscomputed index/array,
+/// not a real `new ArrayIndexOutOfBoundsException(...)` call) and, because
+/// it depends on whatever the interpreter/JIT happens to have left in the
+/// aliased slot, non-deterministically. This is the same layout-mismatch
+/// family as `getValue`/`getCoder` (BUG-TC0622) and `charAt` above — see
+/// `native_string_code_point_at` for the equivalent `String` native, whose
+/// surrogate-pair handling this mirrors.
+pub(crate) fn native_sb_code_point_at(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(obj))) => *obj,
+        _ => return Ok(Some(Value::Int(0))),
+    };
+    let index_i32 = match args.get(1) {
+        Some(Value::Int(v)) => *v,
+        _ => 0,
+    };
+    let chars = sb_read_chars(ctx, this);
+    if index_i32 < 0 || (index_i32 as usize) >= chars.len() {
+        return Err(
+            cratonvm_types::error::RuntimeError::StringIndexOutOfBoundsException {
+                index: index_i32,
+            }
+            .into(),
+        );
+    }
+    let index = index_i32 as usize;
+    let ch = chars[index];
+    if (0xD800..=0xDBFF).contains(&ch) && index + 1 < chars.len() {
+        let low = chars[index + 1];
+        if (0xDC00..=0xDFFF).contains(&low) {
+            let cp = 0x10000 + ((ch as i32 - 0xD800) << 10) + (low as i32 - 0xDC00);
+            return Ok(Some(Value::Int(cp)));
+        }
+    }
+    Ok(Some(Value::Int(ch as i32)))
+}
+
+/// `AbstractStringBuilder.codePointBefore(int index)` — companion to
+/// [`native_sb_code_point_at`], same layout-mismatch rationale.
+pub(crate) fn native_sb_code_point_before(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(obj))) => *obj,
+        _ => return Ok(Some(Value::Int(0))),
+    };
+    let index_i32 = match args.get(1) {
+        Some(Value::Int(v)) => *v,
+        _ => 0,
+    };
+    let chars = sb_read_chars(ctx, this);
+    if index_i32 <= 0 || (index_i32 as usize) > chars.len() {
+        return Err(
+            cratonvm_types::error::RuntimeError::StringIndexOutOfBoundsException {
+                index: index_i32,
+            }
+            .into(),
+        );
+    }
+    let index = index_i32 as usize;
+    let ch = chars[index - 1];
+    if (0xDC00..=0xDFFF).contains(&ch) && index >= 2 {
+        let high = chars[index - 2];
+        if (0xD800..=0xDBFF).contains(&high) {
+            let cp = 0x10000 + ((high as i32 - 0xD800) << 10) + (ch as i32 - 0xDC00);
+            return Ok(Some(Value::Int(cp)));
+        }
+    }
+    Ok(Some(Value::Int(ch as i32)))
+}
+
+/// `AbstractStringBuilder.codePointCount(int beginIndex, int endIndex)` —
+/// same layout-mismatch rationale as [`native_sb_code_point_at`].
+pub(crate) fn native_sb_code_point_count(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(obj))) => *obj,
+        _ => return Ok(Some(Value::Int(0))),
+    };
+    let begin = match args.get(1) {
+        Some(Value::Int(i)) => *i as usize,
+        _ => 0,
+    };
+    let end = match args.get(2) {
+        Some(Value::Int(i)) => *i as usize,
+        _ => 0,
+    };
+    let chars = sb_read_chars(ctx, this);
+    let end = end.min(chars.len());
+    let mut count = 0;
+    let mut i = begin;
+    while i < end {
+        let ch = chars[i];
+        if (0xD800..=0xDBFF).contains(&ch) && i + 1 < end {
+            let low = chars[i + 1];
+            if (0xDC00..=0xDFFF).contains(&low) {
+                i += 2;
+                count += 1;
+                continue;
+            }
+        }
+        i += 1;
+        count += 1;
+    }
+    Ok(Some(Value::Int(count)))
+}
+
+/// `AbstractStringBuilder.appendCodePoint(int codePoint)`.
+///
+/// MUST be a native for the same reason as [`native_sb_code_point_at`]:
+/// unregistered, real JDK bytecode would encode the code point into the
+/// compact `byte[] value` field (growing/re-coding it via
+/// `ensureCapacityNewCoder`), which CratonVM's synthetic `char[]`-backed
+/// StringBuilder does not have — corrupting the backing array.
+pub(crate) fn native_sb_append_code_point(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(obj))) => *obj,
+        _ => return Ok(None),
+    };
+    let cp = match args.get(1) {
+        Some(Value::Int(v)) => *v,
+        _ => 0,
+    };
+    let mut buf = [0u16; 2];
+    let encoded: &[u16] = match char::from_u32(cp as u32) {
+        Some(c) => c.encode_utf16(&mut buf),
+        None => {
+            // Not a valid Unicode scalar value (e.g. an unpaired surrogate
+            // used internally by the parser) — Character.toChars would throw
+            // IllegalArgumentException for these, but WHATWG callers only
+            // ever appendCodePoint values already validated as scalar
+            // values/ASCII, so fall back to truncating to a single UTF-16
+            // unit rather than diverging further.
+            buf[0] = cp as u16;
+            &buf[..1]
+        }
+    };
+    sb_append_chars(ctx, this, encoded);
+    Ok(Some(Value::Object(Some(this))))
 }
 
 pub(crate) fn native_sb_reverse(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
