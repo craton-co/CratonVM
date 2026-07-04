@@ -6738,6 +6738,7 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
             allow_redefine: opts.allow_redefine,
             nest_host_class_name: opts.nest_host_class_name.clone(),
             privileged_define: opts.privileged_define,
+            force_loader_faithful_linking: opts.force_loader_faithful_linking,
             ..Default::default()
         };
 
@@ -12374,6 +12375,27 @@ fn invoke_on_class_shared_inner(
                     eprintln!(
                         "[NSME_DBG] dispatch_class={class_name} method={method_name}{descriptor} receiver={recv_dbg} caller={caller_dbg}"
                     );
+                    // Full Java call stack (mirrors CRATONVM_DBG_NPE_STACK) --
+                    // the immediate caller alone doesn't show whether this
+                    // invoke originates from real bytecode several frames up
+                    // (e.g. real JDK URLClassPath machinery) or from a native
+                    // helper reusing the wrong object as a receiver.
+                    let cm4 = shared.class_manager.read();
+                    eprintln!("[NSME_DBG] full stack:");
+                    for (i, f) in thread.frames.iter().enumerate().rev().take(30) {
+                        let cn = cm4
+                            .get_class(f.class_id)
+                            .map(|c| c.name.to_string())
+                            .unwrap_or_default();
+                        eprintln!(
+                            "  [{i}] {}.{}{} pc={}",
+                            cn,
+                            f.method_name(),
+                            f.method_descriptor(),
+                            f.pc
+                        );
+                    }
+                    drop(cm4);
                 }
                 // Compatibility fallback: a few real-world call sites have shown
                 // descriptor canonicalization drift (same signature but object

@@ -4112,6 +4112,42 @@ fn cm_fallback_alloc(ctx: &mut dyn NativeContext, cls: ObjectRef) -> MethodCallR
     }
 }
 
+/// `SmallRyeConfig.getConfigMapping(Class)` — the real bytecode is
+/// `getConfigMapping(type, getPrefixFromConfigMapping(type))`, i.e. it reads
+/// the `@ConfigMapping(prefix = ...)` annotation off `type` (default `""`)
+/// and delegates to the 2-arg form. Read the annotation the same way, then
+/// reuse `native_smallrye_get_config_mapping` — the SAME fixed path the 2-arg
+/// form uses — instead of the bare-interface `alloc_concurrent_synthetic`
+/// shim, which has no method bodies and threw `AbstractMethodError` on the
+/// first interface call (e.g. `TestConfig.classOrderer()` during Quarkus
+/// JUnit test discovery — the identical failure class as the 2-arg Gap 6 bug,
+/// just reached through the 1-arg overload this fallback never covered).
+fn config_mapping_prefix(ctx: &mut dyn NativeContext, cls: ObjectRef) -> Value {
+    let name_str = ctx.create_string("io.smallrye.config.ConfigMapping");
+    let ann_cls = match ctx.invoke(
+        "java/lang/Class",
+        "forName",
+        "(Ljava/lang/String;)Ljava/lang/Class;",
+        &[Value::Object(Some(name_str))],
+    ) {
+        Ok(Some(Value::Object(Some(c)))) => c,
+        _ => return Value::Object(None),
+    };
+    let ann = match ctx.invoke_virtual(
+        cls,
+        "getAnnotation",
+        "(Ljava/lang/Class;)Ljava/lang/annotation/Annotation;",
+        &[Value::Object(Some(ann_cls))],
+    ) {
+        Ok(Some(Value::Object(Some(a)))) => a,
+        _ => return Value::Object(None),
+    };
+    match ctx.invoke_virtual(ann, "prefix", "()Ljava/lang/String;", &[]) {
+        Ok(Some(v @ Value::Object(Some(_)))) => v,
+        _ => Value::Object(None),
+    }
+}
+
 pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
     let __prev_cat = r.current_category();
     r.set_category(cratonvm_native_api::NativeKind::Bridge);
@@ -5579,7 +5615,12 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
     // The single-arg form `getConfigMapping(Class)` delegates to the two-arg
     // form on real SmallRyeConfig, but when the JIT/interp doesn't re-enter
     // the bytecode path (e.g. direct invokevirtual without inline cache), we
-    // mirror the same logic here so both arms are covered.
+    // mirror the same logic here so both arms are covered. This used to
+    // allocate a bare synthetic of the mapping INTERFACE (no method bodies),
+    // which threw AbstractMethodError on the first call (e.g.
+    // `TestConfig.classOrderer()` during Quarkus JUnit discovery) — the same
+    // bug class the 2-arg form's Gap-6 fix already solved. Derive the real
+    // prefix from `@ConfigMapping` and reuse that fixed path.
     r.register(
         "io/smallrye/config/SmallRyeConfig",
         "getConfigMapping",
@@ -5589,12 +5630,11 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
                 Some(Value::Object(Some(c))) => *c,
                 _ => return Ok(Some(Value::Object(None))),
             };
-            let cls_name = match crate::lang_class::mirror_class_name(ctx, class_mirror) {
-                Some(n) => n,
-                None => return Ok(Some(Value::Object(None))),
-            };
-            let obj = alloc_concurrent_synthetic(ctx, &cls_name, 0);
-            Ok(Some(Value::Object(Some(obj))))
+            let prefix = config_mapping_prefix(ctx, class_mirror);
+            native_smallrye_get_config_mapping(
+                ctx,
+                &[args[0], Value::Object(Some(class_mirror)), prefix],
+            )
         },
     );
 
