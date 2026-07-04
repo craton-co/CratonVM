@@ -344,7 +344,11 @@ pub fn register_vm_management_impl(r: &mut NativeMethodRegistry) {
     r.register(memory_impl, "setVerboseGC", "(Z)V", |_ctx, _args| Ok(None));
     // getMemoryUsage0(boolean heap) — for the HEAP case we have a REAL
     // source (`heap_allocated_bytes`, the same accessor MemoryMXBean's
-    // getHeapMemoryUsage uses); report it as `used` with committed>=used.
+    // getHeapMemoryUsage uses); report it as `used` with committed>=used,
+    // and `max` from `max_heap_bytes()` (the configured `-Xmx`, already
+    // wired up for `Runtime.maxMemory()`) rather than the JMM "unavailable"
+    // sentinel — CratonVM genuinely does enforce a heap cap, so -1 there
+    // was an oversight, not an honest "unknown" answer.
     // For the NON-HEAP case we have no real metric, so we return
     // MemoryUsage.UNDEFINED_USAGE (-1 for init/used/committed/max) per the
     // JMM spec for "metric unavailable" — an honest sentinel, not a fake
@@ -362,7 +366,7 @@ pub fn register_vm_management_impl(r: &mut NativeMethodRegistry) {
                 ctx.set_field(obj, 0, Value::Long(0)); // init (unknown)
                 ctx.set_field(obj, 1, Value::Long(used)); // used (real)
                 ctx.set_field(obj, 2, Value::Long(committed)); // committed
-                ctx.set_field(obj, 3, Value::Long(-1)); // max (no cap)
+                ctx.set_field(obj, 3, Value::Long(ctx.max_heap_bytes())); // max (real -Xmx)
             } else {
                 // Non-heap: no real metric — UNDEFINED_USAGE sentinel.
                 ctx.set_field(obj, 0, Value::Long(-1));
@@ -968,6 +972,24 @@ pub fn register_operating_system_impl(r: &mut NativeMethodRegistry) {
         r.register(mcls, name, "()D", neg_one_double);
     }
     r.register(mcls, "initialize0", "()V", |_ctx, _args| Ok(None));
+
+    // jdk.internal.platform.CgroupMetrics.isUseContainerSupport()Z gates
+    // Metrics.getInstance(): when it returns false, getInstance() returns
+    // null immediately, without ever calling CgroupSubsystemFactory.create()
+    // (which would need real /sys/fs/cgroup file parsing we do not
+    // implement). Real JDK takes this exact path under
+    // -XX:-UseContainerSupport or outside a container, and
+    // ManagementFactory's callers already handle a null Metrics instance.
+    // Reporting container support as off is honest -- CratonVM genuinely
+    // does no cgroup accounting -- not a fabricated value, and it was an
+    // unregistered native (UnsatisfiedLinkError) that aborted
+    // ManagementFactory.getPlatformMBeanServer() before this fix.
+    r.register(
+        "jdk/internal/platform/CgroupMetrics",
+        "isUseContainerSupport",
+        "()Z",
+        |_ctx, _args| Ok(Some(Value::Int(0))),
+    );
 
     r.set_category(__prev_cat);
 }
