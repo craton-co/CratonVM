@@ -4,6 +4,10 @@ This folder collects CratonVM-only defects found while running upstream Java
 suites. The docs had grown to describe the **same underlying bug from several
 angles**; this index is the consolidated map. Read it first.
 
+## 2026-07-04 test.context.* cluster (bean/groovy/junit/junit4/testng/web, branch fix/test-context-cluster)
+
+- [Constructor-parameter-annotation offset fix + 3 residuals](test-context-constructor-param-annotation-offset.md) — core fix: `Constructor.getParameterAnnotations()`'s native override didn't account for a synthetic leading parameter (non-static inner-class constructors' implicit outer-instance arg), causing an AIOOBE that crashed 13 of 25 CV-unique classes across the six packages (7 directly + cascading ABEND in 6 more sharing a batch). 3 residuals open: Groovy TestContext script loading (isPresent stub blocks it; removing the stub exposes a separate ANTLR/jarjar class-layout bug — not fixed), `InheritableThreadLocal` not propagated through `Thread(ThreadGroup, Runnable, String[, long])` constructors (breaks `Executors`-backed pools generally, not just these tests), and one JUnit5-parallel-execution TIMEOUT not yet triaged.
+
 
 ## 2026-07-04 http.server bug cluster (branch fix/http-server-cluster)
 
@@ -69,9 +73,25 @@ launcher fix above), not a VM bug.
   classpath-declared `JMXConnectorProvider`s (via `ServiceLoader`) before
   falling back to the "not implemented" IOException — covers `jmxmp`
   end-to-end with real provider bytecode instead of a canned error.
-- OPEN residual: [MXBeanMapping.toOpenValue AbstractMethodError + InvocationFailureException](spring-jmx-mxbeanmapping-toopenvalue-abstractmethoderror.md)
-  — 4 test methods across 2 classes still fail after the above fixes, on a
-  distinct `com.sun.jmx.mbeanserver.MXBeanMapping` resolution gap.
+- FIXED (branch fix/jmx-platform-mxbean-registration): platform MXBeans
+  (Memory, Threading, etc.) were never actually registered onto the real
+  MBeanServer returned by `ManagementFactory.getPlatformMBeanServer()` —
+  the real-bytecode registration loop aborted partway through on the two
+  native gaps above. With those fixed, registration completes, but a
+  second gap surfaced: synthetic `com/sun/jmx/mbeanserver/MXBeanMapping`
+  instances never had `toOpenValue`/`fromOpenValue` implemented, so any
+  real attribute value needing OpenType conversion (e.g.
+  `MemoryMXBean.getHeapMemoryUsage()`) hit `AbstractMethodError`. Fixed as
+  an identity passthrough (correct here since our mappings only ever
+  round-trip within the same in-process MBeanServer call). Also fixed
+  `MemoryUsage.max` for the heap pool to report the real `-Xmx` instead of
+  the `-1` unavailable sentinel.
+- OPEN residual: [getThreadInfo(long) operation-signature mismatch](spring-jmx-getthreadinfo-operation-signature-mismatch.md)
+  — 2 of the original 4 test methods still fail: `mxBeanOperationAccess()`
+  on a JMX operation-signature-matching gap for overloaded native methods,
+  unrelated to the registration/marshalling fixes above. jmx.* suite is now
+  319/321 passing (up from the original registration failure blocking all
+  platform MXBean access).
 
 ## Bug-document lifecycle
 
