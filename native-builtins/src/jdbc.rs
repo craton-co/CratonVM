@@ -84,18 +84,33 @@ fn register_sql_datetime_natives(registry: &mut NativeMethodRegistry) {
 
 fn native_sql_datetime_init(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = crate::obj_arg(args, 0)?;
-    let millis = match args.get(1) {
+    let time = match args.get(1) {
         Some(Value::Long(v)) => *v,
         Some(Value::Int(v)) => *v as i64,
         _ => 0,
     };
-    ctx.set_field(this, 0, Value::Long(millis));
+    // `java.sql.Timestamp(long time)` (real JDK) floors `time` to the
+    // enclosing whole second in the inherited `Date` millis field and
+    // stashes the sub-second remainder in Timestamp's own `nanos` field.
+    // Only do this when the loaded class actually has that extra field
+    // (real-JDK mode) — see `timestamp_nanos_index`.
+    match timestamp_nanos_index(ctx, this) {
+        Some(idx) => {
+            let whole_second_millis = time.div_euclid(1000) * 1000;
+            let nanos = (time.rem_euclid(1000) * 1_000_000) as i32;
+            ctx.set_field(this, 0, Value::Long(whole_second_millis));
+            ctx.set_field(this, idx, Value::Int(nanos));
+        }
+        None => ctx.set_field(this, 0, Value::Long(time)),
+    }
     Ok(None)
 }
 
 fn native_sql_datetime_get_time(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = crate::obj_arg(args, 0)?;
-    Ok(Some(Value::Long(sql_datetime_millis(ctx, this))))
+    let millis = sql_datetime_millis(ctx, this);
+    let nanos_millis = (timestamp_nanos(ctx, this) / 1_000_000) as i64;
+    Ok(Some(Value::Long(millis + nanos_millis)))
 }
 
 fn native_sql_datetime_to_string(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
@@ -108,7 +123,8 @@ fn native_sql_datetime_to_string(ctx: &mut dyn NativeContext, args: &[Value]) ->
     let text = match class_name.as_str() {
         "java/sql/Time" => format!("{hour:02}:{minute:02}:{second:02}"),
         "java/sql/Timestamp" => {
-            format!("{year:04}-{month:02}-{day:02} {hour:02}:{minute:02}:{second:02}.0")
+            let frac = format_nanos_fraction(timestamp_nanos(ctx, this));
+            format!("{year:04}-{month:02}-{day:02} {hour:02}:{minute:02}:{second:02}.{frac}")
         }
         _ => format!("{year:04}-{month:02}-{day:02}"),
     };
@@ -121,6 +137,48 @@ fn sql_datetime_millis(ctx: &dyn NativeContext, obj: ObjectRef) -> i64 {
         Value::Long(v) => v,
         _ => 0,
     }
+}
+
+/// `java.sql.Timestamp` declares exactly one instance field of its own
+/// (`nanos: int`) beyond the two it inherits from `java.util.Date`
+/// (`fastTime`, `cdate`) — confirmed via `javap -p -verbose` against the
+/// real JDK loaded in "real" mode, and via `compute_field_layout`'s
+/// superclass-fields-then-own-fields ordering (`classloading::class_manager`).
+/// It is always the LAST field in the flattened object layout, so this
+/// derives the index from the object's actual slot count rather than
+/// hard-coding `2` — that keeps it correct if a future JDK adds a field
+/// to `Date`, and returns `None` (no such field) for `java.sql.Date`/
+/// `java.sql.Time`, and for synthetic-JDK mode, where Timestamp gets no
+/// extra slot beyond the shared millis field (see `synthetic_stub_fields`
+/// in class_manager.rs, which has no `java/sql/Timestamp` case).
+fn timestamp_nanos_index(ctx: &dyn NativeContext, obj: ObjectRef) -> Option<usize> {
+    let class_id = ctx.class_id_of_object(obj);
+    if ctx.class_name_of_id(class_id).as_deref() != Some("java/sql/Timestamp") {
+        return None;
+    }
+    let num_fields = ctx.object_num_fields(obj);
+    (num_fields > 1).then_some(num_fields - 1)
+}
+
+fn timestamp_nanos(ctx: &dyn NativeContext, obj: ObjectRef) -> i32 {
+    match timestamp_nanos_index(ctx, obj) {
+        Some(idx) => match ctx.get_field(obj, idx) {
+            Value::Int(v) => v,
+            _ => 0,
+        },
+        None => 0,
+    }
+}
+
+/// Render a `nanos` value (0..=999_999_999) the way real
+/// `java.sql.Timestamp.toString()` does: zero-padded to 9 digits, then
+/// trailing zeros trimmed, but always at least one digit (`"0"` for
+/// `nanos == 0`, matching the previous hardcoded `.0`).
+fn format_nanos_fraction(nanos: i32) -> String {
+    if nanos == 0 {
+        return "0".to_string();
+    }
+    format!("{nanos:09}").trim_end_matches('0').to_string()
 }
 
 fn sql_datetime_parts(millis: i64) -> (i32, i32, i32, i32, i32, i32) {
