@@ -4147,6 +4147,281 @@ fn config_mapping_prefix(ctx: &mut dyn NativeContext, cls: ObjectRef) -> Value {
         _ => Value::Object(None),
     }
 }
+fn class_mirror_by_name(ctx: &mut dyn NativeContext, name: &str) -> Option<ObjectRef> {
+    let class_id = ctx.ensure_class_initialized(name).ok()?;
+    Some(ctx.get_class_mirror(class_id))
+}
+
+fn static_object_field(ctx: &mut dyn NativeContext, class_name: &str, field_name: &str) -> Option<ObjectRef> {
+    let class_id = ctx.ensure_class_initialized(class_name).ok()?;
+    let field_index = ctx.static_field_index_by_name(class_id, field_name)?;
+    match ctx.get_static_field(class_id, field_index) {
+        Value::Object(Some(o)) => Some(o),
+        _ => None,
+    }
+}
+
+fn new_runtime_value(ctx: &mut dyn NativeContext, value: Value) -> Option<ObjectRef> {
+    let rv = match ctx.new_object("io/quarkus/runtime/RuntimeValue") {
+        Ok(Some(Value::Object(Some(o)))) => o,
+        _ => return None,
+    };
+    ctx.invoke(
+        "io/quarkus/runtime/RuntimeValue",
+        "<init>",
+        "(Ljava/lang/Object;)V",
+        &[Value::Object(Some(rv)), value],
+    )
+    .ok()?;
+    Some(rv)
+}
+
+fn empty_optional_runtime_value(ctx: &mut dyn NativeContext) -> Option<ObjectRef> {
+    let optional = ctx
+        .invoke("java/util/Optional", "empty", "()Ljava/util/Optional;", &[])
+        .ok()??;
+    new_runtime_value(ctx, optional)
+}
+
+fn invoke_collections_value(ctx: &mut dyn NativeContext, name: &str, desc: &str) -> Option<Value> {
+    ctx.invoke("java/util/Collections", name, desc, &[]).ok()?
+}
+
+/// `LoggingSetupRecorder.handleFailedStart(...)` rebuilds a small transient
+/// logging config from Keycloak's already-registered config. On HotSpot that
+/// path retains Quarkus' converter set; under CratonVM the transient builder
+/// reaches mapping validation without the Quarkus `Charset`/`MemorySize`
+/// converters and aborts every Keycloak test-framework class in `beforeAll`.
+/// Mirror the real recorder flow but make the converter dependency explicit.
+fn native_quarkus_logging_handle_failed_start(
+    ctx: &mut dyn NativeContext,
+    optional_supplier_runtime_value: Option<ObjectRef>,
+) -> MethodCallResult {
+    let supplier_rv = match optional_supplier_runtime_value {
+        Some(o) => o,
+        None => match empty_optional_runtime_value(ctx) {
+            Some(o) => o,
+            None => return Ok(None),
+        },
+    };
+
+    let smallrye_config_cls = match class_mirror_by_name(ctx, "io/smallrye/config/SmallRyeConfig") {
+        Some(o) => o,
+        None => return Ok(None),
+    };
+    let config = match ctx.invoke(
+        "org/eclipse/microprofile/config/ConfigProvider",
+        "getConfig",
+        "()Lorg/eclipse/microprofile/config/Config;",
+        &[],
+    )? {
+        Some(Value::Object(Some(o))) => o,
+        _ => return Ok(None),
+    };
+    let base_config = match ctx.invoke_virtual(
+        config,
+        "unwrap",
+        "(Ljava/lang/Class;)Ljava/lang/Object;",
+        &[Value::Object(Some(smallrye_config_cls))],
+    )? {
+        Some(Value::Object(Some(o))) => o,
+        _ => return Ok(None),
+    };
+
+    let builder = match ctx.new_object("io/smallrye/config/SmallRyeConfigBuilder") {
+        Ok(Some(Value::Object(Some(o)))) => o,
+        _ => return Ok(None),
+    };
+    ctx.invoke(
+        "io/smallrye/config/SmallRyeConfigBuilder",
+        "<init>",
+        "()V",
+        &[Value::Object(Some(builder))],
+    )?;
+
+    // This is the compatibility fix: the recorder's transient builder needs
+    // Quarkus' service-loaded converters for LogRuntimeConfig mappings.
+    ctx.invoke_virtual(
+        builder,
+        "addDiscoveredConverters",
+        "()Lio/smallrye/config/SmallRyeConfigBuilder;",
+        &[],
+    )?;
+
+    let customizer = match ctx.new_object("io/quarkus/runtime/configuration/QuarkusConfigBuilderCustomizer") {
+        Ok(Some(Value::Object(Some(o)))) => o,
+        _ => return Ok(None),
+    };
+    ctx.invoke(
+        "io/quarkus/runtime/configuration/QuarkusConfigBuilderCustomizer",
+        "<init>",
+        "()V",
+        &[Value::Object(Some(customizer))],
+    )?;
+    ctx.invoke_virtual(
+        customizer,
+        "configBuilder",
+        "(Lio/smallrye/config/SmallRyeConfigBuilder;)V",
+        &[Value::Object(Some(builder))],
+    )?;
+
+    for class_name in [
+        "io/quarkus/runtime/logging/LogBuildTimeConfig",
+        "io/quarkus/runtime/logging/LogRuntimeConfig",
+        "io/quarkus/runtime/console/ConsoleRuntimeConfig",
+    ] {
+        let mirror = match class_mirror_by_name(ctx, class_name) {
+            Some(o) => o,
+            None => return Ok(None),
+        };
+        ctx.invoke_virtual(
+            builder,
+            "withMapping",
+            "(Ljava/lang/Class;)Lio/smallrye/config/SmallRyeConfigBuilder;",
+            &[Value::Object(Some(mirror))],
+        )?;
+    }
+
+    let source = match ctx.new_object("io/quarkus/runtime/logging/LoggingSetupRecorder$1") {
+        Ok(Some(Value::Object(Some(o)))) => o,
+        _ => return Ok(None),
+    };
+    ctx.invoke(
+        "io/quarkus/runtime/logging/LoggingSetupRecorder$1",
+        "<init>",
+        "(Lio/smallrye/config/SmallRyeConfig;)V",
+        &[Value::Object(Some(source)), Value::Object(Some(base_config))],
+    )?;
+    let config_source_id = match ctx.ensure_class_initialized("org/eclipse/microprofile/config/spi/ConfigSource") {
+        Ok(cid) => cid,
+        Err(_) => return Ok(None),
+    };
+    let sources = ctx.new_ref_array(config_source_id, 1);
+    ctx.set_array_element(sources, 0, Value::Object(Some(source)));
+    ctx.invoke_virtual(
+        builder,
+        "withSources",
+        "([Lorg/eclipse/microprofile/config/spi/ConfigSource;)Lio/smallrye/config/SmallRyeConfigBuilder;",
+        &[Value::Object(Some(sources))],
+    )?;
+
+    let logging_config = match ctx.invoke_virtual(
+        builder,
+        "build",
+        "()Lio/smallrye/config/SmallRyeConfig;",
+        &[],
+    )? {
+        Some(Value::Object(Some(o))) => o,
+        _ => return Ok(None),
+    };
+
+    let log_build = match class_mirror_by_name(ctx, "io/quarkus/runtime/logging/LogBuildTimeConfig") {
+        Some(cls) => match ctx.invoke_virtual(
+            logging_config,
+            "getConfigMapping",
+            "(Ljava/lang/Class;)Ljava/lang/Object;",
+            &[Value::Object(Some(cls))],
+        )? {
+            Some(Value::Object(Some(o))) => o,
+            _ => return Ok(None),
+        },
+        None => return Ok(None),
+    };
+    let log_runtime = match class_mirror_by_name(ctx, "io/quarkus/runtime/logging/LogRuntimeConfig") {
+        Some(cls) => match ctx.invoke_virtual(
+            logging_config,
+            "getConfigMapping",
+            "(Ljava/lang/Class;)Ljava/lang/Object;",
+            &[Value::Object(Some(cls))],
+        )? {
+            Some(Value::Object(Some(o))) => o,
+            _ => return Ok(None),
+        },
+        None => return Ok(None),
+    };
+    let console_runtime = match class_mirror_by_name(ctx, "io/quarkus/runtime/console/ConsoleRuntimeConfig") {
+        Some(cls) => match ctx.invoke_virtual(
+            logging_config,
+            "getConfigMapping",
+            "(Ljava/lang/Class;)Ljava/lang/Object;",
+            &[Value::Object(Some(cls))],
+        )? {
+            Some(Value::Object(Some(o))) => o,
+            _ => return Ok(None),
+        },
+        None => return Ok(None),
+    };
+
+    let log_runtime_rv = match new_runtime_value(ctx, Value::Object(Some(log_runtime))) {
+        Some(o) => o,
+        None => return Ok(None),
+    };
+    let console_runtime_rv = match new_runtime_value(ctx, Value::Object(Some(console_runtime))) {
+        Some(o) => o,
+        None => return Ok(None),
+    };
+    let recorder = match ctx.new_object("io/quarkus/runtime/logging/LoggingSetupRecorder") {
+        Ok(Some(Value::Object(Some(o)))) => o,
+        _ => return Ok(None),
+    };
+    ctx.invoke(
+        "io/quarkus/runtime/logging/LoggingSetupRecorder",
+        "<init>",
+        "(Lio/quarkus/runtime/logging/LogBuildTimeConfig;Lio/quarkus/runtime/RuntimeValue;Lio/quarkus/runtime/RuntimeValue;)V",
+        &[
+            Value::Object(Some(recorder)),
+            Value::Object(Some(log_build)),
+            Value::Object(Some(log_runtime_rv)),
+            Value::Object(Some(console_runtime_rv)),
+        ],
+    )?;
+
+    let components = match ctx.invoke(
+        "io/quarkus/runtime/logging/DiscoveredLogComponents",
+        "ofEmpty",
+        "()Lio/quarkus/runtime/logging/DiscoveredLogComponents;",
+        &[],
+    )? {
+        Some(Value::Object(Some(o))) => o,
+        _ => return Ok(None),
+    };
+    let empty_map = match invoke_collections_value(ctx, "emptyMap", "()Ljava/util/Map;") {
+        Some(v) => v,
+        None => return Ok(None),
+    };
+    let empty_list = match invoke_collections_value(ctx, "emptyList", "()Ljava/util/List;") {
+        Some(v) => v,
+        None => return Ok(None),
+    };
+    let launch_mode = match static_object_field(ctx, "io/quarkus/runtime/LaunchMode", "DEVELOPMENT") {
+        Some(o) => o,
+        None => return Ok(None),
+    };
+
+    ctx.invoke_virtual(
+        recorder,
+        "initializeLogging",
+        "(Lio/quarkus/runtime/logging/DiscoveredLogComponents;Ljava/util/Map;ZLio/quarkus/runtime/RuntimeValue;Ljava/util/List;Ljava/util/List;Ljava/util/List;Ljava/util/List;Ljava/util/List;Ljava/util/List;Lio/quarkus/runtime/RuntimeValue;Lio/quarkus/runtime/LaunchMode;Z)Lio/quarkus/runtime/shutdown/ShutdownListener;",
+        &[
+            Value::Object(Some(components)),
+            empty_map,
+            Value::Int(0),
+            Value::Object(None),
+            empty_list,
+            empty_list,
+            empty_list,
+            empty_list,
+            empty_list,
+            empty_list,
+            Value::Object(Some(supplier_rv)),
+            Value::Object(Some(launch_mode)),
+            Value::Int(0),
+        ],
+    )?;
+
+    Ok(None)
+}
+
 
 pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
     let __prev_cat = r.current_category();
@@ -5635,6 +5910,30 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
                 ctx,
                 &[args[0], Value::Object(Some(class_mirror)), prefix],
             )
+        },
+    );
+
+    // --- Quarkus LoggingSetupRecorder.handleFailedStart ---
+    // Keycloak's test framework registers a SmallRye config that already has
+    // Quarkus' Charset/MemorySize converters. The recorder builds a transient
+    // logging config from it; under CratonVM that transient builder needs the
+    // discovered Quarkus converters made explicit before mapping validation.
+    r.register(
+        "io/quarkus/runtime/logging/LoggingSetupRecorder",
+        "handleFailedStart",
+        "()V",
+        |ctx, _args| native_quarkus_logging_handle_failed_start(ctx, None),
+    );
+    r.register(
+        "io/quarkus/runtime/logging/LoggingSetupRecorder",
+        "handleFailedStart",
+        "(Lio/quarkus/runtime/RuntimeValue;)V",
+        |ctx, args| {
+            let supplier = match args.first() {
+                Some(Value::Object(Some(o))) => Some(*o),
+                _ => None,
+            };
+            native_quarkus_logging_handle_failed_start(ctx, supplier)
         },
     );
 
