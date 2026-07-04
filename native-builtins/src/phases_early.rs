@@ -8410,7 +8410,15 @@ pub(crate) fn register_phase52_url_encoding(r: &mut NativeMethodRegistry) {
         "(Ljava/lang/String;Ljava/lang/String;)Ljava/lang/String;",
         |ctx, args| {
             let input = ctx.read_string(obj_arg(args, 0)?).unwrap_or_default();
-            let decoded = p52_url_decode(&input);
+            let decoded = match p52_url_decode(&input) {
+                Ok(d) => d,
+                Err(message) => {
+                    return Err(RuntimeError::IllegalArgumentException {
+                        message: message.to_string(),
+                    }
+                    .into())
+                }
+            };
             let s = ctx.create_string(&decoded);
             Ok(Some(Value::Object(Some(s))))
         },
@@ -8421,7 +8429,15 @@ pub(crate) fn register_phase52_url_encoding(r: &mut NativeMethodRegistry) {
         "(Ljava/lang/String;)Ljava/lang/String;",
         |ctx, args| {
             let input = ctx.read_string(obj_arg(args, 0)?).unwrap_or_default();
-            let decoded = p52_url_decode(&input);
+            let decoded = match p52_url_decode(&input) {
+                Ok(d) => d,
+                Err(message) => {
+                    return Err(RuntimeError::IllegalArgumentException {
+                        message: message.to_string(),
+                    }
+                    .into())
+                }
+            };
             let s = ctx.create_string(&decoded);
             Ok(Some(Value::Object(Some(s))))
         },
@@ -8443,7 +8459,15 @@ pub(crate) fn register_phase52_url_encoding(r: &mut NativeMethodRegistry) {
         "(Ljava/lang/String;Ljava/nio/charset/Charset;)Ljava/lang/String;",
         |ctx, args| {
             let input = ctx.read_string(obj_arg(args, 0)?).unwrap_or_default();
-            let decoded = p52_url_decode(&input);
+            let decoded = match p52_url_decode(&input) {
+                Ok(d) => d,
+                Err(message) => {
+                    return Err(RuntimeError::IllegalArgumentException {
+                        message: message.to_string(),
+                    }
+                    .into())
+                }
+            };
             let s = ctx.create_string(&decoded);
             Ok(Some(Value::Object(Some(s))))
         },
@@ -8479,7 +8503,7 @@ fn p52_url_encode(input: &str) -> String {
     result
 }
 
-fn p52_url_decode(input: &str) -> String {
+fn p52_url_decode(input: &str) -> Result<String, &'static str> {
     let mut result = Vec::with_capacity(input.len());
     let bytes = input.as_bytes();
     let mut i = 0;
@@ -8489,15 +8513,25 @@ fn p52_url_decode(input: &str) -> String {
                 result.push(b' ');
                 i += 1;
             }
-            b'%' if i + 2 < bytes.len() => {
+            b'%' => {
+                // Real JDK's URLDecoder.decode throws IllegalArgumentException
+                // rather than passing malformed escapes through: "Incomplete
+                // trailing escape (%) pattern" when fewer than 2 chars remain,
+                // "Illegal hex characters in escape (%) pattern" when they
+                // aren't valid hex digits.
+                if i + 2 >= bytes.len() {
+                    return Err("URLDecoder: Incomplete trailing escape (%) pattern");
+                }
                 let hi = p52_hex_val(bytes[i + 1]);
                 let lo = p52_hex_val(bytes[i + 2]);
-                if let (Some(h), Some(l)) = (hi, lo) {
-                    result.push(h << 4 | l);
-                    i += 3;
-                } else {
-                    result.push(b'%');
-                    i += 1;
+                match (hi, lo) {
+                    (Some(h), Some(l)) => {
+                        result.push(h << 4 | l);
+                        i += 3;
+                    }
+                    _ => {
+                        return Err("URLDecoder: Illegal hex characters in escape (%) pattern");
+                    }
                 }
             }
             b => {
@@ -8506,7 +8540,7 @@ fn p52_url_decode(input: &str) -> String {
             }
         }
     }
-    String::from_utf8(result).unwrap_or_default()
+    Ok(String::from_utf8(result).unwrap_or_default())
 }
 
 fn p52_hex_val(b: u8) -> Option<u8> {
