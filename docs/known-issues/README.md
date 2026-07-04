@@ -134,7 +134,7 @@ initialization gap was fixed 2026-07-02), grouped as:
     🟠 **OPEN** (native callback pinning hardened; full Hibernate rerun still pending). The 5 `org.hibernate.orm.test.type.temporal.*` classes
     abort rc=1 / SIGSEGV with `linkage error: no such method java/lang/Object.<sam>` — **not** a java.time
     binding bug. Same native-stale-Rust-local family as the StackWalker corruption
-    ([hibernate-bytearraymapping-stackwalk-gc-corruption.md](hibernate-bytearraymapping-stackwalk-gc-corruption.md)):
+    ([hibernate-bytearraymapping-stackwalk-gc-corruption.md](../internal/fixed-suite-bugs/hibernate-bytearraymapping-stackwalk-gc-corruption.md)):
     `Stream.forEach`/`sorted`, `Spliterator.tryAdvance`/`forEachRemaining`, `ArrayList.forEach` hold the lambda
     + materialized elements in Rust locals across `invoke_virtual`; the scheduled-task pump had the same issue
     when firing multiple accrued `Runnable.run()` callbacks. Current focused fix = `pin_native_root` /

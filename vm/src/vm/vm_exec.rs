@@ -1912,6 +1912,41 @@ impl<'a> NativeContextImpl<'a> {
     }
 }
 
+fn pin_native_object_values(thread: &mut JvmThread, values: &[Value]) -> Vec<Option<usize>> {
+    let mut handles = Vec::with_capacity(values.len());
+    for value in values {
+        if let Value::Object(Some(obj)) = value {
+            let handle = thread.native_pin_roots.len();
+            thread.native_pin_roots.push(*obj);
+            handles.push(Some(handle));
+        } else {
+            handles.push(None);
+        }
+    }
+    handles
+}
+
+fn reread_native_object_values(
+    thread: &JvmThread,
+    values: &[Value],
+    handles: &[Option<usize>],
+) -> Vec<Value> {
+    values
+        .iter()
+        .zip(handles.iter())
+        .map(|(value, handle)| match (value, handle) {
+            (Value::Object(Some(fallback)), Some(handle)) => Value::Object(Some(
+                thread
+                    .native_pin_roots
+                    .get(*handle)
+                    .copied()
+                    .unwrap_or(*fallback),
+            )),
+            _ => *value,
+        })
+        .collect()
+}
+
 impl<'a> NativeContext for NativeContextImpl<'a> {
     fn load_class(&mut self, name: &str) -> MethodCallResult {
         let class_id = self.shared.load_class_concurrent(name)?;
@@ -1939,50 +1974,59 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
         init_desc: &str,
         init_args: &[Value],
     ) -> MethodCallResult {
-        let class_id = self.shared.load_class_concurrent(class_name)?;
-        let num_fields = self
-            .shared
-            .class_manager
-            .read()
-            .get_class(class_id)
-            .map(|c| c.num_total_fields)
-            .unwrap_or(0);
-        let obj_ref = self.shared.heap.alloc_object(class_id, num_fields);
-        crate::runtime::interpreter::init_primitive_fields(self.shared, obj_ref, class_id);
+        let pin_base = self.thread.native_pin_roots.len();
+        let arg_pins = pin_native_object_values(self.thread, init_args);
+        let result = (|| {
+            let class_id = self.shared.load_class_concurrent(class_name)?;
+            let num_fields = self
+                .shared
+                .class_manager
+                .read()
+                .get_class(class_id)
+                .map(|c| c.num_total_fields)
+                .unwrap_or(0);
+            let obj_ref = self.shared.heap.alloc_object(class_id, num_fields);
+            crate::runtime::interpreter::init_primitive_fields(self.shared, obj_ref, class_id);
 
-        // Pin the freshly-allocated object as a GC root across `<init>`. The
-        // moving collector forwards `native_pin_roots` entries in place (see
-        // memory/gc.rs), so after a relocation triggered by a heavy constructor
-        // (e.g. BouncyCastle provider setup) we read back the up-to-date address
-        // instead of returning a stale pointer that resolves to a reused
-        // `java.lang.Object`. This mirrors how the bytecode `new`/`invokespecial`
-        // path keeps the dup'd reference live on the (scanned) operand stack.
-        let pin_idx = self.thread.native_pin_roots.len();
-        self.thread.native_pin_roots.push(obj_ref);
+            // Keep the new object and constructor object arguments rooted until
+            // the Java `<init>` frame owns them in scanned locals.
+            let obj_pin = self.thread.native_pin_roots.len();
+            self.thread.native_pin_roots.push(obj_ref);
+            super::ensure_class_initialized_shared(self.shared, self.thread, class_id)?;
 
-        let mut full = Vec::with_capacity(init_args.len() + 1);
-        full.push(Value::Object(Some(obj_ref)));
-        full.extend_from_slice(init_args);
-        let init_result = invoke_shared(
-            self.shared,
-            self.thread,
-            class_name,
-            "<init>",
-            init_desc,
-            &full,
-        );
+            let obj_ref = self
+                .thread
+                .native_pin_roots
+                .get(obj_pin)
+                .copied()
+                .unwrap_or(obj_ref);
+            let mut full = Vec::with_capacity(init_args.len() + 1);
+            full.push(Value::Object(Some(obj_ref)));
+            full.extend(reread_native_object_values(
+                self.thread,
+                init_args,
+                &arg_pins,
+            ));
+            let init_result = invoke_on_class_shared(
+                self.shared,
+                self.thread,
+                class_id,
+                "<init>",
+                init_desc,
+                &full,
+            );
 
-        // Read the (possibly forwarded) reference back before unpinning.
-        let forwarded = self
-            .thread
-            .native_pin_roots
-            .get(pin_idx)
-            .copied()
-            .unwrap_or(obj_ref);
-        self.thread.native_pin_roots.truncate(pin_idx);
-
-        init_result?;
-        Ok(Some(Value::Object(Some(forwarded))))
+            let forwarded = self
+                .thread
+                .native_pin_roots
+                .get(obj_pin)
+                .copied()
+                .unwrap_or(obj_ref);
+            init_result?;
+            Ok(Some(Value::Object(Some(forwarded))))
+        })();
+        self.thread.native_pin_roots.truncate(pin_base);
+        result
     }
 
     fn new_object_initialized_with_class_id(
@@ -1991,54 +2035,64 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
         init_desc: &str,
         init_args: &[Value],
     ) -> MethodCallResult {
-        // Per-loader-identity construction (JVMS §5.3): allocate and `<init>`
-        // the EXACT `class_id` the caller resolved from a Class mirror, never
-        // re-resolving the name (which collapses to the first/global definer).
-        let num_fields = self
-            .shared
-            .class_manager
-            .read()
-            .get_class(class_id)
-            .map(|c| c.num_total_fields)
-            .unwrap_or(0);
-        let obj_ref = self.shared.heap.alloc_object(class_id, num_fields);
-        crate::runtime::interpreter::init_primitive_fields(self.shared, obj_ref, class_id);
+        let pin_base = self.thread.native_pin_roots.len();
+        let arg_pins = pin_native_object_values(self.thread, init_args);
+        let result = (|| {
+            // Per-loader-identity construction (JVMS §5.3): allocate and `<init>`
+            // the EXACT `class_id` the caller resolved from a Class mirror, never
+            // re-resolving the name (which collapses to the first/global definer).
+            let num_fields = self
+                .shared
+                .class_manager
+                .read()
+                .get_class(class_id)
+                .map(|c| c.num_total_fields)
+                .unwrap_or(0);
+            let obj_ref = self.shared.heap.alloc_object(class_id, num_fields);
+            crate::runtime::interpreter::init_primitive_fields(self.shared, obj_ref, class_id);
 
-        // Pin across `<init>` exactly like the name-based path above.
-        let pin_idx = self.thread.native_pin_roots.len();
-        self.thread.native_pin_roots.push(obj_ref);
+            // Pin across `<init>` exactly like the name-based path above.
+            let obj_pin = self.thread.native_pin_roots.len();
+            self.thread.native_pin_roots.push(obj_ref);
 
-        let mut full = Vec::with_capacity(init_args.len() + 1);
-        full.push(Value::Object(Some(obj_ref)));
-        full.extend_from_slice(init_args);
+            super::ensure_class_initialized_shared(self.shared, self.thread, class_id)?;
+            let obj_ref = self
+                .thread
+                .native_pin_roots
+                .get(obj_pin)
+                .copied()
+                .unwrap_or(obj_ref);
+            let mut full = Vec::with_capacity(init_args.len() + 1);
+            full.push(Value::Object(Some(obj_ref)));
+            full.extend(reread_native_object_values(
+                self.thread,
+                init_args,
+                &arg_pins,
+            ));
 
-        // Ensure the class is initialized (<clinit>) then dispatch `<init>` on
-        // this precise class id — `invoke_on_class_shared` keys on the id, so
-        // the weaved/loader-private constructor runs, not the global one.
-        let init_result =
-            super::ensure_class_initialized_shared(self.shared, self.thread, class_id).and_then(
-                |_| {
-                    invoke_on_class_shared(
-                        self.shared,
-                        self.thread,
-                        class_id,
-                        "<init>",
-                        init_desc,
-                        &full,
-                    )
-                },
+            // Ensure the class is initialized (<clinit>) then dispatch `<init>` on
+            // this precise class id — `invoke_on_class_shared` keys on the id, so
+            // the weaved/loader-private constructor runs, not the global one.
+            let init_result = invoke_on_class_shared(
+                self.shared,
+                self.thread,
+                class_id,
+                "<init>",
+                init_desc,
+                &full,
             );
 
-        let forwarded = self
-            .thread
-            .native_pin_roots
-            .get(pin_idx)
-            .copied()
-            .unwrap_or(obj_ref);
-        self.thread.native_pin_roots.truncate(pin_idx);
-
-        init_result?;
-        Ok(Some(Value::Object(Some(forwarded))))
+            let forwarded = self
+                .thread
+                .native_pin_roots
+                .get(obj_pin)
+                .copied()
+                .unwrap_or(obj_ref);
+            init_result?;
+            Ok(Some(Value::Object(Some(forwarded))))
+        })();
+        self.thread.native_pin_roots.truncate(pin_base);
+        result
     }
 
     fn pin_native_root(&mut self, obj: ObjectRef) -> usize {
