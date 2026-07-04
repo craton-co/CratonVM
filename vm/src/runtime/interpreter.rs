@@ -24025,10 +24025,14 @@ fn try_jit_compile_callee_slow(
 /// step. Both are out of scope for this routing increment and gated default-off
 /// behind `CRATONVM_BG_COMPILE` regardless.
 ///
-/// Returns the wall-clock compile time in milliseconds for the tiered stats.
+/// Returns `(wall_clock_compile_time_ms, published)` for the tiered stats.
 /// A compile miss / bail (native shadow, skip-listed, backend bail, or a dropped
-/// VM) simply returns `0` — the queued flag is still cleared by the worker's
-/// `complete_task`, and a later mutator invocation re-attempts.
+/// VM) reports `published = false` — the queued flag is still cleared by the
+/// worker's `complete_task`, but (unlike an earlier version of this code)
+/// `current_tier` is NOT advanced on a failed attempt, so a later mutator
+/// invocation genuinely re-attempts (bounded by
+/// `jit::tiered::MAX_TIER_FAIL_RETRIES` — see `complete_task`) instead of the
+/// method being silently marked "compiled" and stuck interpreting forever.
 ///
 /// ## GC-neutral daemon (wire-tiered-manager increment 3)
 ///
@@ -24062,7 +24066,7 @@ fn ensure_bg_compiler_started(shared: &SharedVm) {
     let weak_vm: std::sync::Weak<SharedVm> =
         shared.self_arc.read().as_ref().cloned().unwrap_or_default();
     crate::jit::tiered::ensure_background_compiler(&shared.tiered_manager, || {
-        Box::new(move |task: &crate::jit::tiered::CompilationTask| -> u64 {
+        Box::new(move |task: &crate::jit::tiered::CompilationTask| -> (u64, bool) {
             background_compile_task(&weak_vm, task)
         })
     });
@@ -24107,13 +24111,13 @@ fn fetch_osr_compile_inputs(
 fn background_compile_task(
     weak_vm: &std::sync::Weak<SharedVm>,
     task: &crate::jit::tiered::CompilationTask,
-) -> u64 {
+) -> (u64, bool) {
     let shared = match weak_vm.upgrade() {
         Some(s) => s,
-        None => return 0, // VM dropped (teardown) — nothing to compile.
+        None => return (0, false), // VM dropped (teardown) — nothing to compile.
     };
     if crate::classloading::any_class_redefined() {
-        return 0;
+        return (0, false);
     }
     let optimized = crate::jit::tiered::tier_uses_optimized_backend(task.target_tier);
     if crate::runtime::env_cache::dbg_jitc() {
@@ -24139,13 +24143,13 @@ fn background_compile_task(
     // loop header it emits, so the compile itself is entry-pc-independent.
     if let Some(osr_bci) = task.osr_bci {
         let start = std::time::Instant::now();
-        if let Some((class_id, padded, max_locals)) = fetch_osr_compile_inputs(
+        let published = if let Some((class_id, padded, max_locals)) = fetch_osr_compile_inputs(
             &shared,
             &task.method_key.class_name,
             &task.method_key.method_name,
             &task.method_key.descriptor,
         ) {
-            let _ = compile_osr_artifact(
+            compile_osr_artifact(
                 &shared,
                 class_id,
                 task.method_key.class_name.to_string(),
@@ -24154,17 +24158,25 @@ fn background_compile_task(
                 &padded,
                 max_locals as usize,
                 osr_bci as usize,
-            );
-        }
+            )
+            .is_some()
+        } else {
+            false
+        };
         // Widening: smaller integer -> 64-bit (zero/sign-extended).
-        return start.elapsed().as_millis() as u64;
+        return (start.elapsed().as_millis() as u64, published);
     }
     let start = std::time::Instant::now();
     // Real codegen + publish into the shared JIT cache. `try_jit_compile_callee`
     // is the by-name entry point shared with the JIT dispatch helpers; it stores
     // the compiled body under `(class, method, descriptor)` so the mutator's
     // `jit_cache` fast-path flips the call site to `Jit` on its next call.
-    let _ = try_jit_compile_callee(
+    // `is_some()` reports whether it actually published one — a `None` (skip-
+    // listed, resolver miss, code-cache cap, concurrent redefine, ...) must
+    // NOT be reported as success, or the tiered manager marks this tier
+    // "done" despite nothing having been compiled (see
+    // `jit::tiered::CompilerCore::complete_task`).
+    let published = try_jit_compile_callee(
         &shared,
         &task.method_key.class_name,
         &task.method_key.method_name,
@@ -24173,9 +24185,10 @@ fn background_compile_task(
         // pipeline), selected by the task's target tier. This is the real
         // backend routing that replaces the former advisory-only hint.
         optimized,
-    );
+    )
+    .is_some();
     // Widening: smaller integer -> 64-bit (zero/sign-extended, value preserved)
-    start.elapsed().as_millis() as u64
+    (start.elapsed().as_millis() as u64, published)
 }
 
 /// Convert a JIT panic payload into a `MethodCallFailed`.
