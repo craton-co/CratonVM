@@ -2443,9 +2443,17 @@ fn find_branch_targets(code: &[u8], code_len: usize) -> Vec<usize> {
                 pc += 3;
             }
             // 5-byte opcodes: invokeinterface (0xb9) — opcode, cp_hi, cp_lo,
-            // count, 0. The trailing count/0 bytes MUST be skipped or a later
-            // branch target would be mis-located (the builder now lowers 0xb9).
-            0xb9 => {
+            // count, 0. invokedynamic (0xba) — opcode, cp_hi, cp_lo, 0, 0. The
+            // trailing operand bytes MUST be skipped or a later branch target
+            // would be mis-located (the builder lowers 0xb9; it bails cleanly
+            // on 0xba via the main loop's `_ => return None`, but this PRE-scan
+            // must still step over 0xba's operand bytes correctly — otherwise
+            // it misreads them as up to 4 phantom opcodes, which can fabricate
+            // or miss real branch targets before the main loop ever reaches the
+            // real 0xba byte and bails. `jit_scan` no longer rejects 0xba
+            // upstream, so this function must handle it explicitly rather than
+            // falling into the "unknown opcode" catch-all below.
+            0xb9 | 0xba => {
                 pc += 5;
             }
             _ => {
@@ -2536,7 +2544,12 @@ fn find_loop_headers(code: &[u8], code_len: usize) -> HashSet<usize> {
             0x11 | 0x14 | 0x84 | 0xb4 | 0xb5 | 0xb6 | 0xb7 | 0xb8 | 0xbb => pc += 3,
             // 5-byte: invokeinterface (0xb9) — skip its count/0 trailer so a
             // backward branch target after it is located correctly.
-            0xb9 => pc += 5,
+            // invokedynamic (0xba) — same 5-byte shape (opcode, cp_hi, cp_lo,
+            // 0, 0); must be stepped explicitly for the same reason as
+            // `find_branch_targets` above — `jit_scan` no longer rejects it
+            // upstream, so falling into the 1-byte catch-all would desync
+            // every subsequent PC in this pre-scan.
+            0xb9 | 0xba => pc += 5,
             _ => pc += 1,
         }
     }
@@ -2555,10 +2568,15 @@ fn find_loop_headers(code: &[u8], code_len: usize) -> HashSet<usize> {
 /// backend on either `build()` or `lower()` returning `None`. That fallback is
 /// the safety net that lets us widen gradually without crashing.
 ///
-/// Invokedynamic is filtered earlier in `jit_scan` (it returns `None`), and
-/// there is no exception-table-aware IR codegen yet (STUB-S8) — the IR builder
-/// has no path that constructs exception edges, so methods with try/catch are
-/// naturally rejected either there or at the bytecode-parse level.
+/// `jit_scan` no longer rejects invokedynamic (0xba) upstream — it is
+/// explicitly excluded here instead (see the `indy_ops` check below), since
+/// the IR builder has no lowering for it (the main opcode loop bails via
+/// `_ => return None`, same as any other unsupported opcode) and a method
+/// containing one always falls back to the x64 single-pass backend, which DOES
+/// lower it (unconditional deopt to `DeoptReason::UnreachedCode`). There is no
+/// exception-table-aware IR codegen yet (STUB-S8) — the IR builder has no path
+/// that constructs exception edges, so methods with try/catch are naturally
+/// rejected either there or at the bytecode-parse level.
 ///
 /// TODO(IR widening): increase caps once differential tests validate.
 pub fn ir_compatible(scan: &super::x64::JitScanResult) -> bool {
@@ -2569,6 +2587,19 @@ pub fn ir_compatible(scan: &super::x64::JitScanResult) -> bool {
     // RBC.6 — the IR pipeline has no athrow lowering; only the x64
     // single-pass backend emits the stash-pending-exception sequence.
     if scan.has_athrow {
+        return false;
+    }
+
+    // invokedynamic-uncommon-trap fix: the IR builder has no lowering for
+    // 0xba (it bails cleanly via the main loop's `_ => return None` if one
+    // slips through), but decline it explicitly here rather than relying
+    // solely on that later bail — this keeps the scope boundary self-
+    // documenting and avoids running the (now 0xba-aware, but still only
+    // IR-builder-adjacent) `find_branch_targets`/`find_loop_headers`
+    // pre-scans on a method the IR path was never going to lower anyway.
+    // Methods containing invokedynamic always fall back to the x64
+    // single-pass backend, which lowers it directly.
+    if !scan.indy_ops.is_empty() {
         return false;
     }
 
@@ -2910,6 +2941,7 @@ mod tests {
             anewarray_ops: vec![],
             non_escaping_new: std::collections::HashSet::new(),
             ldc2w_ops: vec![],
+            indy_ops: vec![],
             has_athrow: false,
             ldc_ops: vec![],
         };
@@ -2931,6 +2963,7 @@ mod tests {
             anewarray_ops: vec![],
             non_escaping_new: std::collections::HashSet::new(),
             ldc2w_ops: vec![],
+            indy_ops: vec![],
             has_athrow: false,
             ldc_ops: vec![],
         };
@@ -2952,6 +2985,7 @@ mod tests {
             anewarray_ops: vec![],
             non_escaping_new: std::collections::HashSet::new(),
             ldc2w_ops: vec![],
+            indy_ops: vec![],
             has_athrow: false,
             ldc_ops: vec![],
         };
@@ -2978,10 +3012,112 @@ mod tests {
             anewarray_ops: vec![],
             non_escaping_new: std::collections::HashSet::new(),
             ldc2w_ops: vec![],
+            indy_ops: vec![],
             has_athrow: false,
             ldc_ops: vec![],
         };
         assert!(ir_compatible_sized(&scan, 200));
         assert!(!ir_compatible_sized(&scan, 201));
+    }
+
+    /// invokedynamic-uncommon-trap fix — regression test: `ir_compatible`
+    /// must decline ANY method containing an invokedynamic (0xba) site,
+    /// even one that satisfies every other cap. The IR builder has no
+    /// lowering for 0xba (it bails cleanly via `_ => return None`), so a
+    /// method with one must always fall back to the x64 single-pass
+    /// backend, which lowers it directly (unconditional deopt to
+    /// `DeoptReason::UnreachedCode`).
+    #[test]
+    fn test_ir_compatible_rejects_invokedynamic() {
+        let scan = super::super::x64::JitScanResult {
+            needs_heap: false,
+            multianewarray_ops: vec![],
+            field_ops: vec![],
+            typecheck_ops: vec![],
+            static_field_ops: vec![],
+            invoke_ops: vec![],
+            new_ops: vec![],
+            anewarray_ops: vec![],
+            non_escaping_new: std::collections::HashSet::new(),
+            ldc2w_ops: vec![],
+            indy_ops: vec![(0, 1)],
+            has_athrow: false,
+            ldc_ops: vec![],
+        };
+        assert!(
+            !ir_compatible(&scan),
+            "a method containing invokedynamic must never be routed through \
+             the IR pipeline — it must fall back to the x64 single-pass \
+             backend, which is the only backend that lowers 0xba"
+        );
+    }
+
+    /// invokedynamic-uncommon-trap fix — regression test for a PC-desync bug
+    /// caught during review: `find_branch_targets`/`find_loop_headers` (the
+    /// two bytecode pre-scans `IrBuilder::build()` runs before its main
+    /// opcode loop) must step over invokedynamic's full 5-byte encoding
+    /// (opcode, cp_hi, cp_lo, 0, 0), exactly like `invokeinterface` (0xb9).
+    /// Before this fix both functions fell through to the generic
+    /// "unknown opcode, skip 1 byte" catch-all for 0xba, which misreads the
+    /// instruction's 4 operand bytes as up to 4 phantom opcodes — corrupting
+    /// branch-target / loop-header detection for the rest of the method.
+    /// (`ir_compatible` now excludes every indy-bearing method from the IR
+    /// path entirely — see `test_ir_compatible_rejects_invokedynamic` — so
+    /// this is defense-in-depth: these two pre-scan functions must stay
+    /// correct on their own terms regardless of that caller-side gate.)
+    #[test]
+    fn test_find_branch_targets_steps_over_invokedynamic() {
+        // pc0: invokedynamic #1 (5 bytes: 0xba 0x00 0x01 0x11 0x00). The 4th
+        // operand byte is 0x11 (sipush, a 3-byte op in this walker's table)
+        // so that a mis-step which treats invokedynamic as 1 byte overshoots
+        // PAST the real pc=5 `goto` and decodes garbage from inside it,
+        // instead of coincidentally realigning: 1 (0xba) + 1 (0x00) + 1
+        // (0x01) + 3 (0x11 sipush consumes pc4,pc5,pc6) lands at pc=7, two
+        // bytes INSIDE the real goto's 3-byte encoding — guaranteed
+        // desync, not a lucky realignment.
+        // pc5: goto +3 (3 bytes: 0xa7 0x00 0x03) -> target pc8
+        // pc8: ireturn (1 byte)
+        let code: Vec<u8> = vec![
+            0xba, 0x00, 0x01, 0x11, 0x00, // 0: invokedynamic #1
+            0xa7, 0x00, 0x03, // 5: goto +3 -> pc 8
+            0xac, // 8: ireturn
+        ];
+        let targets = find_branch_targets(&code, code.len());
+        assert_eq!(
+            targets,
+            vec![8],
+            "goto's target must resolve to pc=8 (the real ireturn); a PC \
+             desync from mis-stepping invokedynamic's operand bytes would \
+             either fabricate a bogus target inside the invokedynamic's own \
+             operand bytes or miss/mis-locate this one entirely"
+        );
+    }
+
+    /// Sibling of the above for `find_loop_headers`: a BACKWARD branch to
+    /// pc=0 (a `goto` after the invokedynamic, jumping back to it) must be
+    /// recognized as a loop header at exactly pc=0 — which only happens if
+    /// invokedynamic's 5-byte length is stepped correctly so the `goto` at
+    /// pc=5 is decoded from the right bytes.
+    #[test]
+    fn test_find_loop_headers_steps_over_invokedynamic() {
+        // pc0: invokedynamic #1 (5 bytes: 0xba 0x00 0x01 0x11 0x00). The 4th
+        // operand byte is 0x11 (sipush, a 3-byte op in this walker's table)
+        // so a mis-step that treats invokedynamic as 1 byte overshoots past
+        // the real pc=5 `goto` instead of coincidentally realigning on it
+        // (see the sibling `find_branch_targets` test above for the same
+        // reasoning) — a genuine regression guard, not a lucky bytestring.
+        // pc5: goto -5 (3 bytes: 0xa7 0xff 0xfb) -> target pc0 (backward)
+        let code: Vec<u8> = vec![
+            0xba, 0x00, 0x01, 0x11, 0x00, // 0: invokedynamic #1
+            0xa7, 0xff, 0xfb, // 5: goto -5 -> pc 0
+        ];
+        let headers = find_loop_headers(&code, code.len());
+        assert!(
+            headers.contains(&0),
+            "the backward goto's target (pc=0) must be recognized as a loop \
+             header; a PC desync from mis-stepping invokedynamic would \
+             decode the goto's offset bytes from the wrong position and \
+             either miss this header or fabricate a wrong one"
+        );
     }
 }

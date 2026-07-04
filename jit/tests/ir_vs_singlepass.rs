@@ -122,7 +122,7 @@ fn compile_opt(
 ) -> Option<CompiledMethod> {
     try_compile(
         cm, None, None, None, None, None, None, None, None, None, helpers, None, None, None, None,
-        optimize, false, false, false, false, false,
+        optimize, false, false, false, false, false, None,
     )
 }
 
@@ -174,7 +174,7 @@ fn compile_long_opt(
 ) -> Option<CompiledMethod> {
     try_compile(
         cm, None, None, None, None, None, None, None, None, None, helpers, None, None, None, None,
-        optimize, false, false, true, false, false,
+        optimize, false, false, true, false, false, None,
     )
 }
 
@@ -188,7 +188,7 @@ fn compile_fp_opt(
 ) -> Option<CompiledMethod> {
     try_compile(
         cm, None, None, None, None, None, None, None, None, None, helpers, None, None, None, None,
-        optimize, false, false, false, false, true,
+        optimize, false, false, false, false, true, None,
     )
 }
 
@@ -432,6 +432,7 @@ fn compile_long_ldc2w(
         true,
         false, // ir_emit_virtual_calls
         false, // ir_emit_fp
+        None,
     )
 }
 
@@ -465,6 +466,7 @@ fn compile_fp_ldc2w(
         true,
         false,
         true, // ir_emit_fp ON
+        None,
     )
 }
 
@@ -1111,6 +1113,7 @@ fn compile_opt_fields(
         false,
         false,
         false, // ir_emit_fp
+        None,
     )
 }
 
@@ -1571,6 +1574,7 @@ fn compile_with_dispatch(
         true,  // ir_emit_long (inc 28 — long call args; inert for non-long callers)
         true,  // ir_emit_virtual_calls (inc 26, invokevirtual/interface)
         false, // ir_emit_fp (inc 30 — inert for these int/long callers)
+        None,
     )
 }
 
@@ -1603,6 +1607,7 @@ fn compile_with_dispatch_fp(
         true, // ir_emit_long
         true, // ir_emit_virtual_calls
         true, // ir_emit_fp (inc 32 — D call returns)
+        None,
     )
 }
 

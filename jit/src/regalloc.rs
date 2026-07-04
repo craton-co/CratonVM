@@ -124,16 +124,19 @@ pub(crate) fn bc_len(code: &[u8], pc: usize) -> usize {
         // 5-byte instructions: invokeinterface (0xb9: opcode, cp_hi, cp_lo,
         // count, 0), invokedynamic (0xba: opcode, cp_hi, cp_lo, 0, 0), and the
         // wide-offset branches goto_w (0xc8) / jsr_w (0xc9: opcode + 4-byte
-        // signed offset). Only `invokeinterface` is currently reachable here;
-        // `invokedynamic`, `goto_w`, and `jsr_w` are rejected by `jit_scan`
-        // (its catch-all returns `None`), so no compiled method contains them
-        // today — but, exactly as for `wide` (0xc4) below, the length table
-        // must stay correct as defense-in-depth so every PC-stepping consumer
-        // (liveness/`bc_len`, branch-target precompute, DCE, OSR/unroll, oop
-        // maps) stays in lockstep if any of them is ever accepted. A missing
-        // entry under-counts the instruction by 4 bytes and desyncs the walk —
-        // the same class of liveness-desync miscompile that the missing-`ldc`
-        // bug caused. Keep the x64.rs `bytecode_len_at` twin in sync.
+        // signed offset). `invokeinterface` and `invokedynamic` are both
+        // reachable here today (`jit_scan` accepts both — invokedynamic
+        // unconditionally deopts to the interpreter at that instruction, see
+        // the x64.rs 0xba codegen arm); `goto_w` and `jsr_w` are still
+        // rejected by `jit_scan` (its catch-all returns `None`), so no
+        // compiled method contains them today — but, exactly as for `wide`
+        // (0xc4) below, the length table must stay correct as defense-in-depth
+        // so every PC-stepping consumer (liveness/`bc_len`, branch-target
+        // precompute, DCE, OSR/unroll, oop maps) stays in lockstep if any of
+        // them is ever accepted. A missing entry under-counts the instruction
+        // by 4 bytes and desyncs the walk — the same class of liveness-desync
+        // miscompile that the missing-`ldc` bug caused. Keep the x64.rs
+        // `bytecode_len_at` twin in sync.
         0xb9 | 0xba | 0xc8 | 0xc9 => 5,
         // wide (0xc4) — prefix modifies the following opcode to use a 2-byte
         // local index. JVMS §6.5 wide: `wide <opcode> <indexbyte1> <indexbyte2>`

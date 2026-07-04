@@ -4197,6 +4197,36 @@ pub fn execute(
                         }
                     }
 
+                    // invokedynamic-uncommon-trap fix: resolve each `indy_ops`
+                    // site's target descriptor to the minimal stack-effect info
+                    // the codegen needs (arg slot count + return type tag) — see
+                    // the `indy_info` field doc on the x64 `Compiler` struct. A
+                    // site that cannot be resolved (class not loaded, malformed
+                    // pool) is simply omitted; the x64 codegen's 0xba arm then
+                    // bails the whole compile (`return false`) rather than
+                    // guessing, exactly like the OSR/hot-path resolvers.
+                    let mut indy_info: Vec<(usize, usize, u8)> = Vec::new();
+                    if !scan.indy_ops.is_empty() {
+                        let cm_lock = shared.class_manager.read();
+                        if let Some(class) = cm_lock.get_class(class_id) {
+                            for &(pc_indy, cp_idx) in &scan.indy_ops {
+                                if let Some(ConstantPoolEntry::InvokeDynamic {
+                                    name_and_type_index,
+                                    ..
+                                }) = class.constant_pool.get(cp_idx)
+                                {
+                                    if let Some((_, descriptor)) =
+                                        class.constant_pool.get_name_and_type(*name_and_type_index)
+                                    {
+                                        let arg_slots = crate::jit::count_param_slots(descriptor);
+                                        let ret_type = crate::jit::return_type(descriptor);
+                                        indy_info.push((pc_indy, arg_slots, ret_type));
+                                    }
+                                }
+                            }
+                        }
+                    }
+
                     // Resolve instance field info for getfield/putfield (M5 fix)
                     let mut field_info: Vec<(usize, usize, u8)> = Vec::new();
                     // Compact reference-field layout: per-pc packed offset + ref-ness
@@ -4392,6 +4422,7 @@ pub fn execute(
                         param_oop_mask,
                         compact_field_info,
                         "", // method_key — eager path disables the per-bci de-spec consult
+                        indy_info,
                     )?;
                     // Attach owned metadata to compiled method
                     cm._jit_strings = owned_jit_strings;
@@ -21555,6 +21586,34 @@ fn compile_osr_artifact(
                 }
             }
 
+            // invokedynamic-uncommon-trap fix: resolve each `indy_ops` site's
+            // target descriptor to the minimal stack-effect info the codegen
+            // needs (arg slot count + return type tag) — see the `indy_info`
+            // field doc on the x64 `Compiler` struct. A site that cannot be
+            // resolved is simply omitted; the x64 codegen's 0xba arm then
+            // bails the whole compile (`return false`) rather than guessing.
+            let mut indy_info: Vec<(usize, usize, u8)> = Vec::new();
+            if !scan.indy_ops.is_empty() {
+                let cm_lock = shared.class_manager.read();
+                if let Some(class) = cm_lock.get_class(class_id) {
+                    for &(pc_indy, cp_idx) in &scan.indy_ops {
+                        if let Some(ConstantPoolEntry::InvokeDynamic {
+                            name_and_type_index,
+                            ..
+                        }) = class.constant_pool.get(cp_idx)
+                        {
+                            if let Some((_, descriptor)) =
+                                class.constant_pool.get_name_and_type(*name_and_type_index)
+                            {
+                                let arg_slots = crate::jit::count_param_slots(descriptor);
+                                let ret_type = crate::jit::return_type(descriptor);
+                                indy_info.push((pc_indy, arg_slots, ret_type));
+                            }
+                        }
+                    }
+                }
+            }
+
             // Eagerly compile invokestatic callees (class_manager lock released)
             for (ipc, callee_class, callee_method, callee_desc, param_count) in
                 pending_callee_compiles
@@ -21841,6 +21900,7 @@ fn compile_osr_artifact(
                 param_oop_mask,
                 compact_field_info,
                 "", // method_key — OSR path disables the per-bci de-spec consult
+                indy_info,
             );
             let Some(mut cm) = cm else {
                 // RBC.2 — a backend bail here is just as permanent as one in
@@ -22747,6 +22807,23 @@ fn try_jit_upgrade_with_gate(
             descriptor.to_string(),
         ))
     };
+    // invokedynamic-uncommon-trap fix: resolves an invokedynamic CP index to
+    // just its target descriptor (no bootstrap/CallSite resolution needed —
+    // the codegen only needs the call site's arg/return stack effect).
+    let indy_descriptor_resolver = |cp_idx: u16| -> Option<String> {
+        let cm = shared.class_manager.read();
+        let class = cm.get_class(class_id)?;
+        match class.constant_pool.get(cp_idx)? {
+            ConstantPoolEntry::InvokeDynamic {
+                name_and_type_index,
+                ..
+            } => class
+                .constant_pool
+                .get_name_and_type(*name_and_type_index)
+                .map(|(_name, descriptor)| descriptor.to_string()),
+            _ => None,
+        }
+    };
     // new/anewarray resolver: maps CP index of `new`/`anewarray` to
     // (class_id_raw, num_fields, has_primitive_init, has_finalizer).
     let new_resolver = |cp_idx: u16| -> Option<(u32, usize, bool, bool)> {
@@ -23041,6 +23118,22 @@ fn try_jit_upgrade_with_gate(
                     descriptor.to_string(),
                 ))
             };
+            // invokedynamic-uncommon-trap fix: resolves an invokedynamic CP
+            // index to its target descriptor for the callee's constant pool.
+            let c_indy_descriptor_resolver = |cp_idx: u16| -> Option<String> {
+                let cm = shared.class_manager.read();
+                let class = cm.get_class(callee_cid)?;
+                match class.constant_pool.get(cp_idx)? {
+                    ConstantPoolEntry::InvokeDynamic {
+                        name_and_type_index,
+                        ..
+                    } => class
+                        .constant_pool
+                        .get_name_and_type(*name_and_type_index)
+                        .map(|(_name, descriptor)| descriptor.to_string()),
+                    _ => None,
+                }
+            };
 
             // new/anewarray resolver for callee's constant pool
             let c_new_resolver = |cp_idx: u16| -> Option<(u32, usize, bool, bool)> {
@@ -23156,6 +23249,9 @@ fn try_jit_upgrade_with_gate(
                 // (bt10/14/16/18 checksums + FP E2E probes). `CRATONVM_JIT_IR_FP=0`
                 // is the opt-out (restores the int/long/ref-only IR path).
                 crate::runtime::env_cache::jit_ir_fp(),
+                // invokedynamic-uncommon-trap fix: resolves an invokedynamic
+                // CP index to its target descriptor for the callee's pool.
+                Some(&c_indy_descriptor_resolver),
             )?;
             let entry = compiled.entry_ptr() as usize; // Cast: JIT entry point to address
             let needs_ctx = compiled.needs_context();
@@ -23279,6 +23375,11 @@ fn try_jit_upgrade_with_gate(
         // inc 30 + Slices A/B/C: double/float XMM value tier. Now default-ON
         // (opcode-complete + validated == HotSpot). `CRATONVM_JIT_IR_FP=0` opts out.
         crate::runtime::env_cache::jit_ir_fp(),
+        // invokedynamic-uncommon-trap fix: resolves an invokedynamic CP index
+        // to its target descriptor so the codegen can lower the instruction
+        // to an unconditional uncommon-trap deopt instead of bailing the
+        // whole method.
+        Some(&indy_descriptor_resolver),
     )?;
     let ret = crate::jit::return_type(&cached.method_descriptor);
     let heap = compiled.needs_heap();
@@ -23764,6 +23865,22 @@ fn try_jit_compile_callee_slow(
             descriptor.to_string(),
         ))
     };
+    // invokedynamic-uncommon-trap fix: resolves an invokedynamic CP index to
+    // its target descriptor (no bootstrap/CallSite resolution needed).
+    let indy_descriptor_resolver = |cp_idx: u16| -> Option<String> {
+        let cm = shared.class_manager.read();
+        let class = cm.get_class(cid)?;
+        match class.constant_pool.get(cp_idx)? {
+            ConstantPoolEntry::InvokeDynamic {
+                name_and_type_index,
+                ..
+            } => class
+                .constant_pool
+                .get_name_and_type(*name_and_type_index)
+                .map(|(_name, descriptor)| descriptor.to_string()),
+            _ => None,
+        }
+    };
     let new_resolver = |cp_idx: u16| -> Option<(u32, usize, bool, bool)> {
         let cm = shared.class_manager.read();
         resolve_jit_new_site(&cm, cid, cp_idx)
@@ -23880,6 +23997,11 @@ fn try_jit_compile_callee_slow(
         // inc 30 + Slices A/B/C: double/float XMM value tier. Now default-ON
         // (opcode-complete + validated == HotSpot). `CRATONVM_JIT_IR_FP=0` opts out.
         crate::runtime::env_cache::jit_ir_fp(),
+        // invokedynamic-uncommon-trap fix: resolves an invokedynamic CP index
+        // to its target descriptor so the codegen can lower the instruction
+        // to an unconditional uncommon-trap deopt instead of bailing the
+        // whole method.
+        Some(&indy_descriptor_resolver),
     )?;
     if crate::runtime::env_cache::dbg_jitc() {
         eprintln!(
