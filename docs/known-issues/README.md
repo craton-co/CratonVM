@@ -9,6 +9,10 @@ angles**; this index is the consolidated map. Read it first.
 
 - [Keycloak non-passed rerun: missing `PreviewFeatures.isPreviewEnabled` native](keycloak-previewfeatures-ispreviewenabled-native.md) - 1044/1044 rerun rows crashed before tests executed; all direct and wrapped signatures reduce to missing `jdk/internal/misc/PreviewFeatures.isPreviewEnabled()Z`.
 
+## 2026-07-03 http.client bug cluster (branch fix/http-client-cluster-azure)
+
+- [http.client cluster: redefine-dispatch fix + JDK 21 gaps](http-client-cluster-redefine-dispatch-and-jdk21-gaps.md) - core fix: two of three "native shadow" dispatch paths never checked whether an ANCESTOR class (not just the receiver) was JVMTI-redefined, so Mockito-mocked concrete classes (e.g. `HttpURLConnection`) silently bypassed their own advice. Plus several JDK 21 real-mode native gaps (`PreviewFeatures`, `JavaLangAccess.defineClass`/`getConstantPool`/`start`, `StackWalker.callStackWalk` overload). 4 residuals documented (Linux-only NIO gaps, a 4-class hang, one order-dependent Mockito state leak, pre-existing `SimpleClientHttpRequestFactoryTests` gaps).
+
 ## Bug-document lifecycle
 
 Every unresolved bug document belongs under `docs/known-issues`. Once the bug

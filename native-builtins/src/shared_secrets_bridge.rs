@@ -355,6 +355,90 @@ fn jla_add_enable_native_access(_ctx: &mut dyn NativeContext, args: &[Value]) ->
     Ok(Some(args.get(1).copied().unwrap_or(Value::Object(None))))
 }
 
+/// `JavaLangAccess.defineClass(ClassLoader, String, byte[], ProtectionDomain,
+/// String)` -> `Class<?>`.
+///
+/// `jdk.internal.reflect.ClassDefiner.defineClass` (used to define
+/// reflection-generated method/constructor accessor classes, and by other
+/// internal callers) invokes this via `invokeinterface JavaLangAccess`.
+/// Without it, real-JDK mode threw `NoSuchMethodError` out of
+/// `ClassDefiner.defineClass`, which aborted the JUnit launcher during
+/// session setup on JDK 21+ (every class in a run collapsed to LOADERR).
+///
+/// Real JDK's `System$1.defineClass` body is just
+/// `loader.defineClass(name, b, 0, b.length, pd)` — delegate to the loader's
+/// own protected 5-arg `defineClass` so this goes through the exact same
+/// path as any other `ClassLoader.defineClass` call.
+///
+/// INSTANCE method: args[0] = receiver (System$1), args[1] = ClassLoader,
+/// args[2] = String name, args[3] = byte[] b, args[4] = ProtectionDomain pd,
+/// args[5] = String source (unused — the real body ignores it too).
+fn jla_define_class(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let loader = args.get(1).copied().unwrap_or(Value::Object(None));
+    let name = args.get(2).copied().unwrap_or(Value::Object(None));
+    let bytes = args.get(3).copied().unwrap_or(Value::Object(None));
+    let pd = args.get(4).copied().unwrap_or(Value::Object(None));
+    let len = match bytes {
+        Value::Object(Some(arr)) => ctx.array_length(arr) as i32,
+        _ => 0,
+    };
+    // `ctx.invoke_virtual` runs the REAL bytecode for `ClassLoader.defineClass`
+    // (that is its whole purpose — bridges use it to deliberately reach real
+    // JDK behavior instead of re-entering the native registry). That bytecode
+    // opens with `preDefineClass(name, pd)`, whose `checkName` rejects any
+    // name containing `/` with `NoClassDefFoundError: IllegalName: ...` — but
+    // ordinary bytecode `invokevirtual` call sites for this exact method
+    // never reach that check at all, because `cl_define_class_pd` (below) is
+    // registered on `java/lang/ClassLoader.defineClass` and wins native
+    // dispatch first. Call it directly so this bridge gets the SAME behavior
+    // any other `loader.defineClass(name, b, off, len, pd)` caller gets,
+    // instead of a divergent bytecode path. Args shape matches a normal
+    // instance call: [receiver=loader, name, bytes, off, len, pd].
+    crate::classloader::cl_define_class_basic(
+        ctx,
+        &[loader, name, bytes, Value::Int(0), Value::Int(len), pd],
+    )
+}
+
+/// `JavaLangAccess.getConstantPool(Class<?>)` -> `jdk.internal.reflect.ConstantPool`.
+///
+/// ByteBuddy's class-file reader consults this via `invokeinterface
+/// JavaLangAccess` when instrumenting a class for Mockito's inline mock
+/// maker (`Instrumentation.redefineClasses`/`retransformClasses`). Without
+/// it, `NoSuchMethodError` on this method aborted the redefine with
+/// `MockitoException: Could not modify all classes [...]`, and every mock()
+/// of a JDK class in this suite failed. Thin passthrough to the existing
+/// `Class.getConstantPool()` native — same synthetic ConstantPool mirror.
+///
+/// INSTANCE method: args[0] = receiver (System$1), args[1] = Class<?>.
+fn jla_get_constant_pool(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let class_obj = args.get(1).copied().unwrap_or(Value::Object(None));
+    crate::lang_class::native_class_get_constant_pool(ctx, &[class_obj])
+}
+
+/// `JavaLangAccess.start(Thread, ThreadContainer)` -> `void`.
+///
+/// `jdk.internal.vm.SharedThreadContainer.start(Thread)` (structured-
+/// concurrency / virtual-thread executor plumbing — e.g. Jetty's thread
+/// pool) calls this via `invokeinterface JavaLangAccess` to start a thread
+/// while registering it with a container that tracks its children. Without
+/// it, `NoSuchMethodError` here aborted every thread-pool-backed HTTP
+/// client (Jetty) at startup. CratonVM does not model thread containers
+/// (no structured-concurrency introspection), so — like the
+/// `defineUnnamedModule`/`addEnableNativeAccess` bridges above — this is a
+/// behavioral passthrough: just start the thread for real.
+///
+/// INSTANCE method: args[0] = receiver (System$1), args[1] = Thread,
+/// args[2] = ThreadContainer (ignored).
+fn jla_start_in_container(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let thread_obj = match args.get(1) {
+        Some(Value::Object(Some(o))) => *o,
+        _ => return Ok(None),
+    };
+    ctx.invoke_virtual(thread_obj, "start", "()V", &[])?;
+    Ok(None)
+}
+
 fn jla_new_string_utf8_no_repl(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     // (byte[] bytes, int offset, int length) -> String
     // Decode the bytes as UTF-8 with no replacement on malformed
@@ -600,6 +684,25 @@ fn register_java_lang_access(registry: &mut NativeMethodRegistry) {
         "(Ljava/lang/Module;)Ljava/lang/Module;",
         jla_add_enable_native_access,
     );
+    // `jdk.internal.reflect.ClassDefiner.defineClass` -> JavaLangAccess.defineClass.
+    registry.register(
+        owner,
+        "defineClass",
+        "(Ljava/lang/ClassLoader;Ljava/lang/String;[BLjava/security/ProtectionDomain;Ljava/lang/String;)Ljava/lang/Class;",
+        jla_define_class,
+    );
+    registry.register(
+        owner,
+        "getConstantPool",
+        "(Ljava/lang/Class;)Ljdk/internal/reflect/ConstantPool;",
+        jla_get_constant_pool,
+    );
+    registry.register(
+        owner,
+        "start",
+        "(Ljava/lang/Thread;Ljdk/internal/vm/ThreadContainer;)V",
+        jla_start_in_container,
+    );
     // Also register on the interface so direct invokeinterface
     // dispatch (when the receiver's concrete class lookup falls
     // back to the interface class) still hits these natives.
@@ -628,6 +731,24 @@ fn register_java_lang_access(registry: &mut NativeMethodRegistry) {
         "addEnableNativeAccess",
         "(Ljava/lang/Module;)Ljava/lang/Module;",
         jla_add_enable_native_access,
+    );
+    registry.register(
+        iface,
+        "defineClass",
+        "(Ljava/lang/ClassLoader;Ljava/lang/String;[BLjava/security/ProtectionDomain;Ljava/lang/String;)Ljava/lang/Class;",
+        jla_define_class,
+    );
+    registry.register(
+        iface,
+        "getConstantPool",
+        "(Ljava/lang/Class;)Ljdk/internal/reflect/ConstantPool;",
+        jla_get_constant_pool,
+    );
+    registry.register(
+        iface,
+        "start",
+        "(Ljava/lang/Thread;Ljdk/internal/vm/ThreadContainer;)V",
+        jla_start_in_container,
     );
 }
 

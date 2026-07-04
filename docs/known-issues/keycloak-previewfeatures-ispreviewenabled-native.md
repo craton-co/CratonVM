@@ -2,9 +2,20 @@
 
 ## Status
 
-Open CratonVM bug. Reproduced on 2026-07-03 on the Azure host
-`victor@20.84.156.31`, remote worktree
-`/home/victor/wt-keycloak-azure-nonpassed-20260703-01`, branch
+**FIXED** (2026-07-03, branch `fix/http-client-cluster-azure`, off dev
+46e56861). Registered `jdk/internal/misc/PreviewFeatures.isPreviewEnabled()Z`
+in `register_essential_natives` (native-builtins/src/lib.rs), returning `false`
+(we never pass `--enable-preview`). Found independently while reproducing the
+`http.client` bug cluster on this same Azure host/JDK 21 — every one of the 12
+target classes hit this exact native before a single test method could run.
+Verified: `PreviewFeaturesProbe` and the Keycloak non-passed batch no longer
+hit `UnsatisfiedLinkError` at this call; JUnit launcher/discovery proceeds
+normally. Move this doc to `docs/internal` per the lifecycle convention once
+someone confirms the Keycloak rerun itself is unblocked end-to-end (this
+session verified the native gap specifically, not a full Keycloak suite run).
+
+Originally reproduced on 2026-07-03 on the Azure host `victor@20.84.156.31`,
+remote worktree `/home/victor/wt-keycloak-azure-nonpassed-20260703-01`, branch
 `codex/keycloak-azure-nonpassed-20260703-01`, branch head `819948842`.
 
 ## Symptom
