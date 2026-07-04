@@ -803,6 +803,16 @@ fn alloc_simple_type_string(ctx: &mut dyn NativeContext) -> ObjectRef {
 ///    `CompositeMapping`-shaped synthetic mapping with the right
 ///    item count. This satisfies `OpenConverter`'s structural checks
 ///    without recursing into per-field type analysis.
+
+/// Identity passthrough for `MXBeanMapping.toOpenValue`/`fromOpenValue` on
+/// our synthetic mapping instances -- see the registration site in
+/// `register_jmx_openmbean_natives` for the full rationale. `args[0]` is the
+/// receiver (the synthetic `MXBeanMapping`), `args[1]` is the value being
+/// converted; both methods just hand it back unchanged.
+fn native_mxbean_mapping_identity(_ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    Ok(Some(args.get(1).copied().unwrap_or(Value::Object(None))))
+}
+
 fn native_mapping_for_type(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     // args[0] = `this` (factory)
     // args[1] = the Type to convert
@@ -1081,6 +1091,50 @@ pub fn register_jmx_openmbean_natives(registry: &mut NativeMethodRegistry) {
         "makeMapping",
         "(Ljava/lang/reflect/Type;Lcom/sun/jmx/mbeanserver/MXBeanMappingFactory;)Lcom/sun/jmx/mbeanserver/MXBeanMapping;",
         native_mapping_for_type,
+    );
+
+    // T19.M1 follow-up: `MXBeanMapping.toOpenValue`/`fromOpenValue` are
+    // ABSTRACT on the base class (see MXBeanMapping.java) -- every synthetic
+    // mapping instance we hand back from `native_mapping_for_type` /
+    // `alloc_identity_mapping` / `alloc_composite_mapping` above is allocated
+    // with class name `com/sun/jmx/mbeanserver/MXBeanMapping` itself (not a
+    // real concrete subclass), so calling either method on one threw
+    // `AbstractMethodError: ... has no Code attribute` the first time a real
+    // attribute/operation VALUE (not just MBeanInfo structure) needed
+    // conversion -- e.g. `MemoryMXBean.getHeapMemoryUsage()` accessed through
+    // a `MXBeanProxy`, once platform-MXBean registration (T19 registration
+    // fix) let real bytecode reach this far for the first time.
+    //
+    // Registering these two directly on the abstract `MXBeanMapping` class
+    // name only ever intercepts OUR synthetic instances: any real JDK
+    // subclass (from `DefaultMXBeanMappingFactory`'s permanent mappings for
+    // String/Integer/etc.) has its own concrete Code-attributed override,
+    // which virtual dispatch resolves first -- same "safe fallback on an
+    // abstract/interface type" pattern already used for `JavaLangAccess`
+    // elsewhere in this codebase.
+    //
+    // Identity passthrough is deliberately the whole implementation: our
+    // mappings are only ever consumed by a `toOpenValue` call on the
+    // MBeanServer side immediately followed by a `fromOpenValue` call on the
+    // client/proxy side of the SAME in-process round trip (there is no wire
+    // protocol in between for the `MBeanServerConnection` used by these
+    // tests), so handing the original Java value straight through
+    // unconverted reproduces the exact value the caller expects without
+    // needing a real `CompositeType`/`CompositeData` implementation. This
+    // matches the design this module's own header already documented
+    // ("fromOpenValue and toOpenValue are no-op identity stubs") -- that
+    // claim just was not backed by an actual registration until now.
+    registry.register(
+        "com/sun/jmx/mbeanserver/MXBeanMapping",
+        "toOpenValue",
+        "(Ljava/lang/Object;)Ljava/lang/Object;",
+        native_mxbean_mapping_identity,
+    );
+    registry.register(
+        "com/sun/jmx/mbeanserver/MXBeanMapping",
+        "fromOpenValue",
+        "(Ljava/lang/Object;)Ljava/lang/Object;",
+        native_mxbean_mapping_identity,
     );
 
     // T19_M1_PLATFORM_MXBEANS — additional defensive overrides on the
