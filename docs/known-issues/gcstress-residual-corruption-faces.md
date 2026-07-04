@@ -52,6 +52,19 @@ run failing is not by itself evidence against a fix.
    vs-slot offset translation, arraycopy fast paths. Next: write-side trap
    in `write_prim_element` (Reference writes with holder-header check) or a
    memory watchpoint on a corrupt-cell address (they are deterministic).
+   **2026-07-03c:** a `Fork6Hard StrTask`-triggered occurrence of this face
+   was observed to fully HANG the process (ForkJoinPool workers parked
+   forever, ~45s total CPU burned over 3+ hours wall-clock — not a spin
+   loop), not just surface as NPE/nullchild as previously documented. The
+   worker that hit the stale-pointer receiver fell back to a placeholder
+   `java/lang/Throwable` (interpreter's stale-pointer recovery path) and
+   the pool then appears to wait forever for that task's real completion
+   signal, which the fallback never produces. Repro binary
+   `cvmp-mapfix2-20260703.exe` (unrelated fix on board — see below), lane
+   `Fork6Hard 128 3 --nojit GC_STRESS=65536`, hang began ~11s into the run
+   and was killed after 3h+ idle. Not yet confirmed whether non-stress or
+   shorter Fork6Hard runs also hang on this face or only fail fast; add to
+   the fork6-fjp A4 investigation as a new symptom class.
 2. **JIT lost-tag int-in-ref-slot.** `JIT dispatch into ForkJoinTask.doExec
    failed: expected object reference, got int(512)` + walker headers like
    `kind=Object array_length=512 num_slots=4 class_id=6` — an A4-family
@@ -76,7 +89,28 @@ run failing is not by itself evidence against a fix.
    `read()` wedged instantly, 0-output). Post-fix, the bootstrap write-drop
    is gone from all runs (0 hits vs deterministic-first-line before).
 
-## Diagnostics available
+4. **Map/HashMap Node alloc-then-stale-local family — FIXED, unrelated to
+   face 1.** Separately from this investigation, an audit of native map
+   mutators found the classic A1 "bare `ObjectRef`/`Value` local held
+   across an allocating call" bug in `native_map_put`, `map_resize`,
+   `native_lhm_put`, `lhm_alloc_node`, `native_tm_put`, and
+   `map_alloc_node` (`native-collections/src/lib.rs`) — each wrote a
+   key/value/bucket-array local into a freshly `alloc_object`'d node
+   *after* the allocation, without pinning, so a moving young GC during
+   the alloc could relocate the arg and the write would store a stale
+   (dangling) reference. Fixed by pinning + re-reading via
+   `native_pin_roots` across each allocation (six commits on
+   `fix/gcstress-residual-diag-20260703`). Validated on the aggressive
+   GC_STRESS lane: went from dozens of corrupt-Value-cell reads + many
+   CELLCORRUPT holder dumps + nullchild/NPE THREWs (pre-fix) to zero
+   escalating corruption (0 corrupt-cell reads, 0 holder dumps) across two
+   full runs post-fix. One PRE-COPY-only flag persisted **byte-identically**
+   (same `src_obj`/`cell`/`raw` bytes) in both the pre- and post-
+   `map_alloc_node` runs — since it never escalates to an actual corrupt
+   read and its class (`class_id=414`, `num_slots=7`) doesn't match the
+   map `$Node` layout (`NODE_NUM_FIELDS=4`), it appears to be an unrelated,
+   likely-benign, deterministic bootstrap-time guard trip — not pursued
+   further here.
 
 `CRATONVM_DBG_MTROOTS=1` (per-GC initiator dump + blocked census),
 `CRATONVM_GC_ARRAY_GUARD_BT=1`, `CRATONVM_DBG_SWEEP_ZERO=1` (returned no hits

@@ -4191,6 +4191,25 @@ impl GenerationalHeap {
                 // over-retains, it can never cause a live object to be freed OR
                 // its non-pointer data to be corrupted").
                 // SAFETY: `addr` is 8-aligned inside mapped from-space.
+                //
+                // Merge note (2026-07-04): dev independently landed a NARROWER
+                // mitigation for this same non-zero-word0 hazard
+                // (`header_reserved_fields_plausible` — reject a candidate
+                // whose always-zero padding/reserved bytes or undefined
+                // gc_flags bits are set, ~1/2^29 false-negative rate on
+                // garbage) and still header-wrote through anything that
+                // passed it. That check is real and kept (used elsewhere by
+                // dev's other hardening below), but it does NOT catch this
+                // fix's target case: a genuine live `Object[]` element cell,
+                // whose bytes are NOT garbage — `_padding`/`_gc_reserved`
+                // read 0 legitimately (they alias the high bytes of an
+                // adjacent element's pointer payload, which is frequently
+                // 0 on a 48-bit address space) and `gc_flags` reads 0 too.
+                // Such a candidate sails through
+                // `header_reserved_fields_plausible` and still gets
+                // header-written. Unconditional side-marking (this fix)
+                // has no such gap: every candidate is treated as
+                // never-write-through, full stop.
                 if side_marks.insert(addr) {
                     worklist.push(ptr);
                 }
@@ -4567,6 +4586,31 @@ impl GenerationalHeap {
                     if header.gc_flags & GC_FLAG_MARKED != 0 && aged && !pinned.contains(&addr) {
                         match old_gen.alloc(total_size, 8) {
                             Some(dst) => {
+                                // gcstress face-1 hunt (no-op unless gated):
+                                // validate the SOURCE body before promoting —
+                                // catching a corrupt cell here pins the
+                                // corruption to BEFORE promotion and reports
+                                // the victim's stable young address.
+                                validate_copy_source_cells(src, header, "promote-src");
+                                {
+                                    let w = crate::heap::cell_watch_addr();
+                                    let d = dst as usize;
+                                    if w != 0 && d <= w && w.wrapping_sub(d) < total_size {
+                                        let src_at = src as usize + (w - d);
+                                        // SAFETY: src object spans total_size bytes.
+                                        let pair =
+                                            unsafe { std::ptr::read(src_at as *const [u64; 2]) };
+                                        crate::heap::cell_watch_check(
+                                            d,
+                                            total_size,
+                                            "selective-promote-evac",
+                                            &format!(
+                                                "src=0x{:x} src[watch]=0x{:016x},0x{:016x}",
+                                                src as usize, pair[0], pair[1]
+                                            ),
+                                        );
+                                    }
+                                }
                                 // SAFETY: src/dst are valid, non-overlapping, total_size bytes.
                                 unsafe { std::ptr::copy_nonoverlapping(src, dst, total_size) };
                                 // Replicate the atomic mark_word through atomic ops
@@ -5886,15 +5930,75 @@ impl GenerationalHeap {
 
         let mut worklist: Vec<*mut u8> = Vec::new();
 
-        // Seed: root ObjectRefs that point into old gen
+        // Seed: root ObjectRefs that point into old gen.
+        //
+        // xt-hardening follow-up (2026-07-03): `roots` includes CONSERVATIVE
+        // candidates (register/stack-scanned guesses — the same `xt_roots`
+        // whose flood exposed the young-gen `mark_young` header-write
+        // corruptor). `OldGen::contains` is a bare bounds check (no
+        // alignment, no header validation), so before this fix ANY garbage
+        // address landing inside old gen's byte range got `gc_flags` blindly
+        // RMW'd — the exact same corruption family, on the OTHER generation.
+        // Reject implausible candidates instead of marking them: mirrors the
+        // already-established pattern in `scan_object_for_old_refs`'s extent
+        // check (skip-on-implausible, never corrupt) — old-gen compaction
+        // decides liveness purely from `gc_flags & GC_FLAG_MARKED`, so unlike
+        // the young sweep there is no side-mark-set escape hatch; the safe
+        // choice for an address that fails these checks is to not mark it
+        // (over-retention is not even at stake here — a failing candidate
+        // was never a valid object to begin with).
+        //
+        // NOTE this predicate deliberately does NOT require a non-zero first
+        // header word (unlike `mark_young`'s zero-word0 side-mark split):
+        // `ClassId(0)` ad-hoc containers (class_id=0, kind=Object=0,
+        // element_type=Reference=0, `_padding`=0) are a first-class supported
+        // shape whose word0 is legitimately all-zero — rejecting them here
+        // broke real promoted objects (major_gc_frees_old_gen_garbage et al).
+        // A zero-word0 candidate additionally passes through
+        // `victim8_neighbor_explains_zero_prefix` — a targeted check for the
+        // dominant real-world shape of this ambiguity, `candidate = victim
+        // − 8`: if the 8 bytes at `candidate` are just the tail
+        // zero-padding/hash-prefix of a SEPARATE, independently-plausible
+        // object starting at `candidate + 8`, `candidate` itself is not a
+        // real header and is rejected. A genuine zero-hash `ClassId(0)`
+        // container's successor 8 bytes are its own body/next-object data,
+        // essentially never a coincidentally-valid, independently-fitting
+        // header — false rejects of real containers are not expected. Old
+        // gen has no side-mark-set escape hatch (compaction PHYSICALLY
+        // SLIDES live objects; treating an unrelated garbage candidate as
+        // live would copy garbage over/into a real neighbor during the
+        // slide — strictly worse than skipping), so reject is the only safe
+        // response to a candidate that fails this check; verified this
+        // session (disassembly + byte-exact match on the fabricated
+        // pointer `0x0000020000000000` = hash(0)‖array_length(512) read
+        // from a corrupted victim's header) to be the mechanism behind the
+        // pre-xt-activation background DoHead crash face.
         for root in roots.iter() {
             let ptr = root.as_ptr();
-            if old_gen.contains(ptr) {
-                // SAFETY: `ptr` is a root ObjectRef in old gen (verified by `contains` above); its header is valid.
+            if (ptr as usize) & 0x7 == 0 && old_gen.contains(ptr) {
+                // SAFETY: `ptr` is 8-aligned and inside old gen (verified by
+                // `contains` above); reading its header is in-bounds.
                 let header = unsafe { &mut *(ptr as *mut ObjectHeader) };
-                if header.gc_flags & GC_FLAG_MARKED == 0 {
-                    header.gc_flags |= GC_FLAG_MARKED;
-                    worklist.push(ptr);
+                let kind_byte = header.kind as u8;
+                let is_array = header.kind == ObjectKind::Array;
+                let word0 = unsafe { *(ptr as *const u64) };
+                let plausible = kind_byte <= 1
+                    && (is_array || header.num_slots <= (1 << 24))
+                    && (!is_array || header.array_length <= i32::MAX as u32)
+                    && header_reserved_fields_plausible(header)
+                    && (word0 != 0
+                        || !victim8_neighbor_explains_zero_prefix(ptr, old_gen));
+                if plausible {
+                    let total = gen_object_total_size(header);
+                    let fits = total >= HEADER_SIZE
+                        // SAFETY: total >= HEADER_SIZE was just checked; the
+                        // addition stays within a sane pointer range for a
+                        // plausibility probe (no dereference here).
+                        && old_gen.contains(unsafe { ptr.add(total - 1) });
+                    if fits && header.gc_flags & GC_FLAG_MARKED == 0 {
+                        header.gc_flags |= GC_FLAG_MARKED;
+                        worklist.push(ptr);
+                    }
                 }
             }
         }
@@ -6676,6 +6780,30 @@ impl GenerationalHeap {
         };
 
         // Copy the entire object
+        // gcstress face-1 hunt (no-op unless gated): validate the source body
+        // (see promote-src) and dump the SOURCE qword pair at the watched
+        // offset, so a copy that IMPORTS corrupt content is distinguishable
+        // from one that copies a clean cell.
+        // SAFETY: `old_ptr` is the live source object under STW.
+        validate_copy_source_cells(old_ptr, unsafe { &*(old_ptr as *const ObjectHeader) }, "cheney-src");
+        {
+            let w = crate::heap::cell_watch_addr();
+            let dst = new_ptr as usize;
+            if w != 0 && dst <= w && w.wrapping_sub(dst) < total_size {
+                let src_at = old_ptr as usize + (w - dst);
+                // SAFETY: src object spans total_size bytes; src_at is within it.
+                let pair = unsafe { std::ptr::read(src_at as *const [u64; 2]) };
+                crate::heap::cell_watch_check(
+                    dst,
+                    total_size,
+                    "cheney-copy",
+                    &format!(
+                        "src=0x{:x} src[watch]=0x{:016x},0x{:016x}",
+                        old_ptr as usize, pair[0], pair[1]
+                    ),
+                );
+            }
+        }
         // SAFETY: `old_ptr` and `new_ptr` are valid, non-overlapping regions of `total_size` bytes.
         unsafe {
             std::ptr::copy_nonoverlapping(old_ptr, new_ptr, total_size);
@@ -7177,11 +7305,22 @@ impl GenerationalHeap {
             self.young_from.lock().contains(holder_addr as *const u8),
             self.old_gen.lock().contains(holder_addr as *const u8),
         );
+        // Neighbor window: a misaligned-by-8 tagged Value write (the bc
+        // math-ec "0x4" family — receiver pointer off by 8) leaves its
+        // discriminant in the PREVIOUS cell's payload word and its payload in
+        // THIS cell's discriminant word; the ±2-cell dump makes that pattern
+        // (small disc at odd word positions) directly visible.
+        // SAFETY: the window lies within the holder's body ± one cell; the
+        // holder is a live validated object and heap arenas pad allocations,
+        // so the reads stay inside mapped arena memory.
+        let win: [u64; 8] = unsafe { std::ptr::read((cell_ptr as usize - 16) as *const [u64; 8]) };
         eprintln!(
             "[CELLCORRUPT] holder=0x{holder_addr:x} (young_from={hyf} old={hog}) \
              class_id={} class={class_name} kind=0x{:02x} num_slots={} array_len={} \
              gc_flags=0x{:x} index={index} raw0=0x{:016x} raw1=0x{:016x} | \
-             raw0-target: young_from={yf} young_to={yt} old={og}\n{}",
+             raw0-target: young_from={yf} young_to={yt} old={og}\n\
+             [CELLCORRUPT]   window cell-1..cell+2: {:016x},{:016x} | {:016x},{:016x} | \
+             {:016x},{:016x} | {:016x},{:016x}\n{}",
             header.class_id.as_u32(),
             header.kind as u8,
             header.num_slots,
@@ -7189,8 +7328,48 @@ impl GenerationalHeap {
             header.gc_flags,
             raw[0],
             raw[1],
+            win[0],
+            win[1],
+            win[2],
+            win[3],
+            win[4],
+            win[5],
+            win[6],
+            win[7],
             std::backtrace::Backtrace::force_capture(),
         );
+        // Shift test — the neighbor windows show corrupt cells decoding as an
+        // 8-BYTE-SHIFTED body ({payload_k, disc_k+1}). Mechanically test: do
+        // this holder's cells parse as valid Values when read at ±8? A
+        // consistent hit means the body content sits 8 bytes off its slots
+        // (overlapping/shifted allocation — the A2 double-serve family), not
+        // a per-cell stray write.
+        {
+            let n = (header.num_slots as usize).min(8);
+            let base = holder_addr + HEADER_SIZE;
+            let mut plus8 = 0usize;
+            let mut minus8 = 0usize;
+            let mut aligned = 0usize;
+            for k in 0..n {
+                let c = base + k * SLOT_SIZE;
+                // SAFETY: within the holder body ±8; arena-mapped.
+                unsafe {
+                    if cratonvm_types::read_value_checked(c as *const Value).is_some() {
+                        aligned += 1;
+                    }
+                    if cratonvm_types::read_value_checked((c + 8) as *const Value).is_some() {
+                        plus8 += 1;
+                    }
+                    if cratonvm_types::read_value_checked((c - 8) as *const Value).is_some() {
+                        minus8 += 1;
+                    }
+                }
+            }
+            eprintln!(
+                "[CELLCORRUPT]   shift-test over {n} cells: valid@aligned={aligned} \
+                 valid@+8={plus8} valid@-8={minus8}",
+            );
+        }
         // If the stale target is still inside a CURRENT generation, dump its
         // header too — its identity often names the mis-writing code path.
         if yf || og {
@@ -7218,6 +7397,41 @@ impl GenerationalHeap {
 fn cell_corrupt_diag_enabled() -> bool {
     static G: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *G.get_or_init(|| std::env::var_os("CRATONVM_DBG_CELLCORRUPT").is_some())
+}
+
+/// gcstress residual face-1 hunt (`CRATONVM_DBG_CELLCORRUPT`) — validate a
+/// legacy object's Value cells at a GC copy SOURCE. A corrupt cell caught
+/// here proves the corruption happened before this copy and reports the
+/// victim's pre-copy (young, often bootstrap-page-stable) address — the
+/// address a follow-up `CRATONVM_DBG_WATCH_CELL` run must watch to catch the
+/// forming write. Rate-capped; no-op unless the gate is set.
+fn validate_copy_source_cells(obj_ptr: *const u8, header: &ObjectHeader, site: &str) {
+    if !cell_corrupt_diag_enabled()
+        || header.kind != ObjectKind::Object
+        || is_compact_object(header)
+    {
+        return;
+    }
+    static HITS: AtomicUsize = AtomicUsize::new(0);
+    for k in 0..header.num_slots as usize {
+        let c = obj_ptr as usize + HEADER_SIZE + k * SLOT_SIZE;
+        // SAFETY: within the source object's body (walk-validated under STW).
+        if unsafe { cratonvm_types::read_value_checked(c as *const Value) }.is_none() {
+            if HITS.fetch_add(1, Ordering::Relaxed) < 16 {
+                // SAFETY: same cell, raw read.
+                let raw = unsafe { std::ptr::read(c as *const [u64; 2]) };
+                eprintln!(
+                    "[CELLCORRUPT:{site}] PRE-COPY corrupt cell: src_obj=0x{:x} class_id={} \
+                     num_slots={} slot={k} cell=0x{c:x} raw={:016x},{:016x}",
+                    obj_ptr as usize,
+                    header.class_id.as_u32(),
+                    header.num_slots,
+                    raw[0],
+                    raw[1],
+                );
+            }
+        }
+    }
 }
 
 impl Default for GenerationalHeap {
@@ -7472,6 +7686,66 @@ fn seedhunt_scan_young(
     count
 }
 
+/// xt-hardening follow-up (2026-07-03): reject a conservative candidate
+/// whose header's ALWAYS-ZERO fields are non-zero. `ObjectHeader::new`
+/// (types/src/heap_types.rs) unconditionally zero-initializes `_padding`
+/// (offset 6-7) and `_gc_reserved` (offset 22-23), and every relocation copy
+/// site (region.rs) and the JIT inline-alloc fast path (x64.rs
+/// `emit_inline_tlab_new`, which explicitly zeroes offset 4-7 as a single
+/// dword even on its fast path — see the "Defensively zero offset 4" comment
+/// there) preserve that invariant; nothing in the codebase ever writes a
+/// non-zero byte into either field. `gc_flags` similarly has only 3 defined
+/// bits (`GC_FLAG_OLD_GEN`/`MARKED`/`COMPACT`); any other bit set is
+/// definitionally corrupt. This closes the residual (rarer, non-zero-word0)
+/// slice of the `mark_young` conservative-candidate false-positive family
+/// that the zero-word0 side-mark-set fix (2026-07-03, same session) does not
+/// cover — a candidate whose garbage predecessor bytes happen to satisfy the
+/// kind/num_slots/array_length/extent bounds but fail this near-free check.
+/// Four bytes of near-uniform-random garbage failing this check is a ~1/2^29
+/// false-negative-on-garbage rate (2 padding bytes + 2 reserved bytes + 5
+/// undefined gc_flags bits); real objects always pass.
+#[inline]
+fn header_reserved_fields_plausible(header: &ObjectHeader) -> bool {
+    header._padding == [0, 0]
+        && header._gc_reserved == [0, 0]
+        && header.gc_flags & !(GC_FLAG_OLD_GEN | GC_FLAG_MARKED | GC_FLAG_COMPACT) == 0
+}
+
+/// xt-hardening follow-up (2026-07-03): targeted defense against the
+/// `candidate = victim − 8` corruptor shape for a zero-word0 old-gen root
+/// candidate — see the call site's comment for the full rationale. Returns
+/// `true` if `candidate + 8` looks like the start of a genuine, independently
+/// plausible object (in which case `candidate`'s all-zero 8 bytes are almost
+/// certainly that object's own leading padding/hash bytes, not a real header
+/// of its own).
+#[inline]
+fn victim8_neighbor_explains_zero_prefix(candidate: *mut u8, old_gen: &OldGen) -> bool {
+    // SAFETY: caller has already verified `candidate` is 8-aligned and
+    // inside old gen; `candidate + 8` stays 8-aligned. Bounds-check before
+    // dereferencing.
+    let neighbor = unsafe { candidate.add(8) };
+    if !old_gen.contains(neighbor) {
+        return false;
+    }
+    // SAFETY: bounds-checked above.
+    let nheader = unsafe { &*(neighbor as *const ObjectHeader) };
+    let nword0 = unsafe { *(neighbor as *const u64) };
+    let kind_byte = nheader.kind as u8;
+    let is_array = nheader.kind == ObjectKind::Array;
+    let plausible = nword0 != 0
+        && kind_byte <= 1
+        && (is_array || nheader.num_slots <= (1 << 24))
+        && (!is_array || nheader.array_length <= i32::MAX as u32)
+        && header_reserved_fields_plausible(nheader);
+    if !plausible {
+        return false;
+    }
+    let total = gen_object_total_size(nheader);
+    total >= HEADER_SIZE
+        // SAFETY: total >= HEADER_SIZE was just checked.
+        && old_gen.contains(unsafe { neighbor.add(total - 1) })
+}
+
 fn gen_object_total_size(header: &ObjectHeader) -> usize {
     if header.kind == ObjectKind::Array {
         match array_data_size(header.array_length as usize, header.element_type) {
@@ -7672,6 +7946,16 @@ pub(crate) unsafe fn forward_ref_slots(
                 let raw: u64 = std::ptr::read(s as *const u64);
                 if raw != 0 {
                     if let Some(n) = forward(raw as usize as *mut u8) {
+                        // gcstress face-1 hunt (no-op unless gated) — a RAW
+                        // 8-byte pointer write; on a MISREAD header (walk
+                        // overshoot family) this arm would spray pointers
+                        // over legacy 16-byte cells.
+                        crate::heap::cell_watch_check(
+                            s as usize,
+                            8,
+                            "forward_ref_slots-refarray",
+                            &(n as usize),
+                        );
                         std::ptr::write(s as *mut u64, n as u64);
                     }
                 }
@@ -7687,6 +7971,13 @@ pub(crate) unsafe fn forward_ref_slots(
             let raw: u64 = std::ptr::read(s as *const u64);
             if raw != 0 {
                 if let Some(n) = forward(raw as usize as *mut u8) {
+                    // gcstress face-1 hunt (no-op unless gated).
+                    crate::heap::cell_watch_check(
+                        s as usize,
+                        8,
+                        "forward_ref_slots-compact",
+                        &(n as usize),
+                    );
                     std::ptr::write(s as *mut u64, n as u64);
                 }
             }
@@ -7696,6 +7987,13 @@ pub(crate) unsafe fn forward_ref_slots(
             let s = obj_ptr.add(HEADER_SIZE + slot_idx * SLOT_SIZE);
             if let Value::Object(Some(r)) = std::ptr::read(s as *const Value) {
                 if let Some(n) = forward(r.as_ptr()) {
+                    // gcstress face-1 hunt (no-op unless gated).
+                    crate::heap::cell_watch_check(
+                        s as usize,
+                        16,
+                        "forward_ref_slots-legacy",
+                        &(n as usize),
+                    );
                     std::ptr::write(s as *mut Value, Value::Object(Some(ObjectRef::from_raw(n))));
                 }
             }
@@ -7970,6 +8268,8 @@ unsafe fn read_slot(ptr: *mut u8) -> Value {
 // SAFETY: caller guarantees `ptr` points to a valid Value slot within a heap object.
 #[inline]
 unsafe fn write_slot(ptr: *mut u8, value: Value) {
+    // gcstress face-1 hunt (no-op unless CRATONVM_DBG_WATCH_CELL is set).
+    crate::heap::cell_watch_check(ptr as usize, 16, "write_slot", &value);
     std::ptr::write(ptr as *mut Value, value);
 }
 

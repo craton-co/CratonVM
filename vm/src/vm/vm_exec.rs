@@ -2848,6 +2848,13 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
         // array's payload of `len` bytes.
         match self.shared.heap.array_data_ptr(arr) {
             Some(base) => unsafe {
+                // gcstress face-1 hunt (no-op unless CRATONVM_DBG_WATCH_CELL set).
+                cratonvm_gc::heap::cell_watch_check(
+                    base.add(dst_off) as usize,
+                    src.len(),
+                    "write_byte_array_from",
+                    &arr.as_ptr(),
+                );
                 std::ptr::copy_nonoverlapping(src.as_ptr(), base.add(dst_off), src.len());
             },
             // G1 humongous byte[]: payload is split across non-contiguous
@@ -11858,6 +11865,51 @@ fn invoke_on_class_shared_inner(
                         // getTypeAnnotationBytes0 + unexposed ConstantPool. Shared
                         // source of truth with `force_native_over_real_jdk_bytecode`.
                         || crate::runtime::interpreter::is_typeuse_annotation_native_override(
+                            class_name,
+                            method_name,
+                            descriptor,
+                        )
+                        || crate::runtime::interpreter::is_antlr_prediction_context_native_override(
+                            class_name,
+                            method_name,
+                            descriptor,
+                        )
+                        || crate::runtime::interpreter::is_bytebuddy_method_token_native_override(
+                            class_name,
+                            method_name,
+                            descriptor,
+                        )
+                        || crate::runtime::interpreter::is_hibernate_testing_util_native_override(
+                            class_name,
+                            method_name,
+                            descriptor,
+                        )
+                        || crate::runtime::interpreter::is_hibernate_models_native_override(
+                            class_name,
+                            method_name,
+                            descriptor,
+                        )
+                        || crate::runtime::interpreter::is_bitset_native_override(
+                            class_name,
+                            method_name,
+                            descriptor,
+                        )
+                        || crate::runtime::interpreter::is_h2_parser_native_override(
+                            class_name,
+                            method_name,
+                            descriptor,
+                        )
+                        || crate::runtime::interpreter::is_jdk_string_native_override(
+                            class_name,
+                            method_name,
+                            descriptor,
+                        )
+                        || crate::runtime::interpreter::is_time_native_override(
+                            class_name,
+                            method_name,
+                            descriptor,
+                        )
+                        || crate::runtime::interpreter::is_jdk_wrapper_math_native_override(
                             class_name,
                             method_name,
                             descriptor,

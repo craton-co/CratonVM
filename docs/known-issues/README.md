@@ -4,6 +4,7 @@ This folder collects CratonVM-only defects found while running upstream Java
 suites. The docs had grown to describe the **same underlying bug from several
 angles**; this index is the consolidated map. Read it first.
 
+
 ## Bug-document lifecycle
 
 Every unresolved bug document belongs under `docs/known-issues`. Once the bug

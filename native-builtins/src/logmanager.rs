@@ -1093,6 +1093,47 @@ fn native_jboss_logger_log_raw(ctx: &mut dyn NativeContext, args: &[Value]) -> M
     Ok(None)
 }
 
+/// `Logger.log(Level, Supplier<String>)` — like `logRaw` above, the real
+/// bytecode dereferences `this.loggerNode` (`isLoggableLevel` check)
+/// BEFORE it ever builds the `ExtLogRecord` and calls `logRaw`, so
+/// intercepting only `logRaw` isn't enough. Confirmed via an isolated
+/// repro (`org.jboss.logmanager.Logger.getLogger(name).log(Level, Supplier)`)
+/// that this overload NPEs the same way `log(LogRecord)` below does — see
+/// that one's doc comment for the actual `testsuite/model`/`KcRunner` crash
+/// this pair fixes. Bypass the loggerNode check entirely, mirroring
+/// `native_jboss_logger_log_raw`'s formatting.
+fn native_jboss_logger_log_level_supplier(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let logger = match args.first() {
+        Some(Value::Object(Some(o))) => match ctx.get_field(*o, LOGGER_FIELD_NAME) {
+            Value::Object(Some(s)) => ctx.read_string(s).unwrap_or_else(|| "<root>".to_string()),
+            _ => "<root>".to_string(),
+        },
+        _ => "<root>".to_string(),
+    };
+    let mut level_name = String::from("INFO");
+    if let Some(Value::Object(Some(lvl))) = args.get(1) {
+        if let Value::Object(Some(s)) = ctx.get_field_by_name(*lvl, "name") {
+            if let Some(n) = ctx.read_string(s) {
+                level_name = n;
+            }
+        }
+    }
+    let tag = match level_name.as_str() {
+        "SEVERE" => "ERROR",
+        "WARNING" => "WARN",
+        "INFO" | "CONFIG" => "INFO",
+        // Suppress fine-grained trace noise (matches the logp interceptor).
+        "FINE" | "FINER" | "FINEST" => return Ok(None),
+        other => other,
+    };
+    let message = match args.get(2) {
+        Some(Value::Object(Some(supplier))) => jul_resolve_msg(ctx, *supplier),
+        _ => String::new(),
+    };
+    eprintln!("{tag} [{logger}] {message}");
+    Ok(None)
+}
+
 /// Surface a throwable that was passed to a logging native. WildFly's
 /// `WFLYSRV0055: Caught exception during boot` is logged with the real
 /// boot exception as the trailing `Throwable` argument — but the previous
@@ -2346,6 +2387,27 @@ pub fn register_logmanager_natives(registry: &mut NativeMethodRegistry) {
     registry.register(
         "org/jboss/logmanager/Logger",
         "logRaw",
+        "(Ljava/util/logging/LogRecord;)V",
+        native_jboss_logger_log_raw,
+    );
+    // log(Level, Supplier<String>) — see native_jboss_logger_log_level_supplier
+    // doc comment: this overload's real bytecode NPEs on `this.loggerNode`
+    // before it ever reaches logRaw.
+    registry.register(
+        "org/jboss/logmanager/Logger",
+        "log",
+        "(Ljava/util/logging/Level;Ljava/util/function/Supplier;)V",
+        native_jboss_logger_log_level_supplier,
+    );
+    // log(LogRecord) — same loggerNode NPE, one level up from logRaw:
+    // JUnit Platform's `LoggerFactory$DelegatingLogger.log` builds a real
+    // `LogRecord` itself (via `createLogRecord`) and calls this overload
+    // directly rather than `logRaw`. `native_jboss_logger_log_raw` already
+    // extracts loggerName/level/message/thrown from a record BY NAME, which
+    // works identically for a plain LogRecord, so reuse it as-is.
+    registry.register(
+        "org/jboss/logmanager/Logger",
+        "log",
         "(Ljava/util/logging/LogRecord;)V",
         native_jboss_logger_log_raw,
     );

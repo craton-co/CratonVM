@@ -83,14 +83,67 @@ long-standing garbage-base/stale-receiver background family. bt16/bt18 checksums
 `C:\craton\CratonVM-dohead-sweep\cvmdhsw-{devpure3,xtfix2,xtfix3}.exe`;
 results `apps/tomcat/.suite/results/dhsw{devpure3,hwoff,xtoff,xtfix2,xtfix3}-*`.
 
-## Residuals / follow-ups
+## Residuals / follow-ups — ALL THREE CLOSED (2026-07-03, branch `fix/xt-followups`, commits `b398046e` + `9e90e2f8`)
 
-- ~1/12 background crash face persists with takeover disabled too (pre-dates
-  activation; the classic garbage-base family).
-- The helper-window pass and A5 band scans still flood roots with
-  conservative candidates each GC (perf/over-retention) — consider scoping to
-  blocked-thread stacks only.
-- Rare non-zero-word0 fake candidates can still take the header-write path
-  (garbage predecessor bytes passing kind/num_slots bounds) — orders of
-  magnitude rarer than the zero case; an allocation-start bitmap remains the
-  structural end-state.
+- **Helper-window/A5 flood → scoped.** `helper_window_pass` now only
+  suspends+scans threads actually `in_blocked_region` (new
+  `ThreadRegistry::blocked_os_tids()`, reusing the OS-tid publication from
+  Fix E). The pass's own doc comment says the blocked-thread gap is its ONLY
+  reason to exist — a cooperatively-arrived mutator already published its
+  JIT roots via `update_root_snapshot` before parking, so re-scanning it was
+  pure redundant candidate-volume/corruption-surface with zero coverage
+  benefit; also skips the suspend/resume round-trip entirely for the
+  (large-majority) non-blocked case. A5's self-scan (`conservative_roots.rs`)
+  was audited and found already properly scoped (bounded band above the
+  registered JIT-entry chain, gated on an actual JIT-return-address hit) —
+  left unchanged.
+
+- **Non-zero-word0 header-write path → hardened.** New
+  `header_reserved_fields_plausible()`: `ObjectHeader::new` always
+  zero-initializes `_padding`/`_gc_reserved` and `gc_flags` has only 3
+  defined bits; nothing in the codebase (including the JIT inline-alloc fast
+  path) ever writes otherwise, so a candidate failing this check is corrupt
+  garbage. Wired into `mark_young` (non-zero-word0 failures now route
+  through the existing side-mark set instead of a blind header write) and
+  into `major_gc`'s old-gen root-seed loop, which — audited during this
+  follow-up — turned out to have **zero** validation at all (a bare
+  `OldGen::contains` bounds check, no alignment, no header check) before a
+  blind `gc_flags` RMW: the same corruption family, unaudited, on the other
+  generation, fed by the same conservative roots.
+
+- **~1/12 background crash face (`read@0x...0018`, thread "Thread-N",
+  pre-dates xt activation) → ROOT-CAUSED and fixed.** Disassembly of 4
+  independent crashed binaries (including the ORIGINAL pre-activation
+  baseline `dhswbase-1`, dev@`e2306927`) showed the identical fault: `rax`/
+  `rcx` = `0x0000020000000000` in every sample, byte-exact for an 8-byte
+  read spanning header offset 8 (`identity_hash_code`=0) + offset 12
+  (`array_length`=512) — the SAME "array_length flipped to 512" signature
+  from the young-gen `mark_young` corruptor, consumed later as a fabricated
+  object reference and dereferenced at `+0x18` by a getfield-style helper.
+  `dhswxtfix2-6` (built WITH the young-gen fix already applied) still hit
+  this exact face, pinning the writer on the **old-gen** root-seed gap
+  above. Old-gen compaction *physically slides* live objects (unlike the
+  young sweep's in-place zero), so the young generation's side-mark-set
+  trick would make things WORSE there (sliding garbage over/into a real
+  neighbor) — ruled out as the fix shape. Instead, new
+  `victim8_neighbor_explains_zero_prefix()`: a zero-word0 old-gen candidate
+  is rejected if `candidate + 8` is itself an independently plausible,
+  extent-fitting header (i.e. the candidate's all-zero bytes are that
+  neighbor's own leading padding/hash, not a real header of its own) — this
+  directly targets the confirmed `candidate = victim − 8` shape. Verified
+  against all 761 gc tests, including the exact `ClassId(0)` ad-hoc
+  container shape (`major_gc_frees_old_gen_garbage` et al.) that the
+  now-removed blanket word0-reject regressed earlier in this follow-up.
+
+DoHead N=18 re-validation with all three fixes: **1/18 crash** (down from
+~1/12 background), same fabricated-pointer family (`rax=
+0x0000020000000000`, thread "Thread-N", 2 corruption-warning occurrences in
+that run's log) — confirms the residual is NOT fully eliminated, only
+reduced. `oldrej=0` across all 18 runs (the old-gen rejection path never
+fired), so this batch did not clearly exercise `major_gc` at all — the
+`victim8_neighbor_explains_zero_prefix` fix's real-world hit rate is
+unconfirmed; the residual crash may be a still-unaudited third write site,
+or a `victim-8` instance where the +8 neighbor did not happen to be
+independently plausible (a false negative of that specific check). bt16/bt18
+checksums exact throughout. Results archived under
+`apps/tomcat/.suite/results/dhswfu2-*`.

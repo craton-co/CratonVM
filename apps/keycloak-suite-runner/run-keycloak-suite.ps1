@@ -211,10 +211,16 @@ function ConvertTo-RepoRelativeModule([string]$Root, [string]$TestClassesDir) {
 }
 
 function Resolve-MavenExe {
-  $cmd = Join-Path $script:KeycloakDir 'mvnw.cmd'
-  if (Test-Path $cmd) { return [System.IO.Path]::GetFullPath($cmd) }
   $sh = Join-Path $script:KeycloakDir 'mvnw'
-  if (Test-Path $sh) { return [System.IO.Path]::GetFullPath($sh) }
+  $cmd = Join-Path $script:KeycloakDir 'mvnw.cmd'
+  $candidates = if ([System.Environment]::OSVersion.Platform -eq [System.PlatformID]::Win32NT) {
+    @($cmd, $sh)
+  } else {
+    @($sh, $cmd)
+  }
+  foreach ($candidate in $candidates) {
+    if (Test-Path $candidate) { return [System.IO.Path]::GetFullPath($candidate) }
+  }
   return 'mvn'
 }
 
@@ -256,14 +262,18 @@ function Add-InferredJUnitRuntimeEntries {
   foreach ($entry in $snapshot) {
     if ($entry -match 'junit-platform-engine[\\/](?<version>[^\\/]+)[\\/]junit-platform-engine-[^\\/]+\.jar$') {
       $version = $Matches.version
-      $launcher = $entry -replace 'junit-platform-engine[\\/][^\\/]+[\\/]junit-platform-engine-[^\\/]+\.jar$', "junit-platform-launcher\$version\junit-platform-launcher-$version.jar"
+      $artifactDir = Split-Path (Split-Path $entry -Parent) -Parent
+      $groupDir = Split-Path $artifactDir -Parent
+      $launcher = Join-Path (Join-Path (Join-Path $groupDir 'junit-platform-launcher') $version) "junit-platform-launcher-$version.jar"
       if (Test-Path $launcher) {
         Add-UniqueClasspathEntry -Entries $Entries -Seen $Seen -Entry $launcher
       }
     }
     if ($entry -match 'junit-jupiter-api[\\/](?<version>[^\\/]+)[\\/]junit-jupiter-api-[^\\/]+\.jar$') {
       $version = $Matches.version
-      $engine = $entry -replace 'junit-jupiter-api[\\/][^\\/]+[\\/]junit-jupiter-api-[^\\/]+\.jar$', "junit-jupiter-engine\$version\junit-jupiter-engine-$version.jar"
+      $artifactDir = Split-Path (Split-Path $entry -Parent) -Parent
+      $groupDir = Split-Path $artifactDir -Parent
+      $engine = Join-Path (Join-Path (Join-Path $groupDir 'junit-jupiter-engine') $version) "junit-jupiter-engine-$version.jar"
       if (Test-Path $engine) {
         Add-UniqueClasspathEntry -Entries $Entries -Seen $Seen -Entry $engine
       }
@@ -276,7 +286,7 @@ function ConvertTo-ManifestClasspathUrl([string]$Entry) {
   if ((Test-Path $full -PathType Container) -and -not ($full.EndsWith('\') -or $full.EndsWith('/'))) {
     $full += [System.IO.Path]::DirectorySeparatorChar
   }
-  return ([System.Uri]$full).AbsoluteUri
+  return ([System.Uri]::new($full, [System.UriKind]::Absolute)).AbsoluteUri
 }
 
 function Split-ManifestLine([string]$Line) {
@@ -305,7 +315,7 @@ function New-PathingJar {
 
   $pathingDir = Join-Path $script:WorkRoot 'pathing-jars'
   New-Item -ItemType Directory -Force -Path $pathingDir | Out-Null
-  $signature = (($Entries | ForEach-Object { [System.IO.Path]::GetFullPath($_) }) -join "`n")
+  $signature = 'pathing-jar-manifest-url-v2' + "`n" + (($Entries | ForEach-Object { [System.IO.Path]::GetFullPath($_) }) -join "`n")
   $hash = (Get-Sha256Hex $signature).Substring(0, 16)
   $stem = ConvertTo-SafeFileStem $(if ($Module) { $Module } else { 'universal' })
   $jarPath = Join-Path $pathingDir "$stem-$hash.jar"
@@ -613,7 +623,8 @@ function Get-LaunchSpec {
   $entries = @(Get-ModuleClasspathEntries -Module $module)
   $separator = [string][System.IO.Path]::PathSeparator
   $cp = ($entries -join $separator)
-  if ($cp.Length -gt 24000) {
+  $usePathingJar = ([System.Environment]::OSVersion.Platform -eq [System.PlatformID]::Win32NT) -and ($cp.Length -gt 24000)
+  if ($usePathingJar) {
     $jar = New-PathingJar -Module $module -Entries $entries
     return [pscustomobject]@{ kind = 'jar'; value = $jar; entries = $entries.Count; length = $cp.Length }
   }
@@ -652,6 +663,32 @@ function Resolve-Jdk {
   return 'C:\Program Files\Java\jdk-25'
 }
 
+function Get-ModuleSystemProperties([string]$Module) {
+  # testsuite/model classes derive from KeycloakModelTest, whose static
+  # initializer requires keycloak.model.parameters to name at least one
+  # org.keycloak.testsuite.model.parameters.* class or it crashes with a
+  # NullPointerException on KeycloakSession.realms() while publishing
+  # PostMigrationEvent (no provider/DB is wired up without it). Upstream
+  # testsuite/model/pom.xml only ever runs this module under one of its
+  # <profiles> (e.g. -Pjpa+infinispan), each of which sets this property plus
+  # the keycloak.connectionsJpa.default.* JDBC properties via Surefire's
+  # <systemPropertyVariables>. We invoke KcRunner directly instead of through
+  # Surefire, so none of that is injected automatically - reproduce the
+  # jpa+infinispan profile's values here.
+  if ($Module -eq 'testsuite/model') {
+    return @(
+      '-Dkeycloak.model.parameters=Infinispan,Jpa',
+      '-Djava.util.logging.manager=org.jboss.logmanager.LogManager',
+      '-Dkeycloak.connectionsJpa.default.driver=org.h2.Driver',
+      '-Dkeycloak.connectionsJpa.default.database=keycloak',
+      '-Dkeycloak.connectionsJpa.default.user=sa',
+      '-Dkeycloak.connectionsJpa.default.password=',
+      '-Dkeycloak.connectionsJpa.default.url=jdbc:h2:mem:test;DB_CLOSE_DELAY=-1'
+    )
+  }
+  return @()
+}
+
 function New-ProcessRecord {
   param(
     [object]$ClassRow,
@@ -671,10 +708,12 @@ function New-ProcessRecord {
   New-Item -ItemType Directory -Force -Path $logDir | Out-Null
   $outFile = Join-Path $logDir "$safe.out.log"
   $errFile = Join-Path $logDir "$safe.err.log"
+  $moduleProps = @(Get-ModuleSystemProperties -Module $module)
 
   if ($Vm -eq 'hotspot') {
     $file = $JavaExe
     $args = @("-Xmx$MaxHeap", '-Dfile.encoding=UTF-8', '-Djava.awt.headless=true')
+    if ($moduleProps.Count -gt 0) { $args += $moduleProps }
     if ($NoJit) { $args += '-Xint' }
     if ($LaunchSpec.kind -eq 'jar') {
       $args += @('-jar', $LaunchSpec.value, $class)
@@ -687,6 +726,7 @@ function New-ProcessRecord {
     if ($NoJit) { $args += '--nojit' }
     if ($CratonArgs.Count -gt 0) { $args += $CratonArgs }
     $args += @('-Dfile.encoding=UTF-8', '-Djava.awt.headless=true')
+    if ($moduleProps.Count -gt 0) { $args += $moduleProps }
     if ($LaunchSpec.kind -eq 'jar') {
       $args += @('--jar', $LaunchSpec.value, $class)
     } else {
@@ -852,8 +892,9 @@ function Invoke-Mode {
   param([object[]]$Classes)
 
   $jdk = Resolve-Jdk
-  $java = Join-Path $jdk 'bin\java.exe'
-  if (-not (Test-Path $java)) { Die "HotSpot java.exe not found: $java" }
+  $javaBin = Join-Path $jdk 'bin'
+  $java = @((Join-Path $javaBin 'java.exe'), (Join-Path $javaBin 'java')) | Where-Object { Test-Path $_ } | Select-Object -First 1
+  if (-not $java) { Die "HotSpot java executable not found under: $javaBin" }
   $craton = ''
   if ($Vm -eq 'craton') { $craton = Resolve-CratonExe }
 
