@@ -2398,6 +2398,36 @@ fn register_re1_socket(r: &mut NativeMethodRegistry) {
         }
         Ok(None)
     });
+    // `Socket.getSoTimeout()` had NO native override, so it fell through to
+    // real bytecode: `Object o = getImpl().getOption(SO_TIMEOUT); ...`.
+    // `getImpl()` reads the real private `impl` field — but our synthetic
+    // `Socket` layout keeps the host STRING at field slot 0 (`SOCK_HOST`,
+    // still needed by `getInetAddress()`), which collides with wherever
+    // real `Socket`'s `impl` field happens to sit. `getImpl()` returned
+    // that host string, and calling `.getOption(int)` on a `String`
+    // produced `NoSuchMethodError: java/lang/String.getOption(I)...` —
+    // breaking Apache HttpClient5's `DefaultManagedHttpClientConnection
+    // .bind()`, which unconditionally calls `getSoTimeout()` on every new
+    // connection. Query the real underlying `TcpStream`'s read timeout
+    // (set by `setSoTimeout` above) directly instead of going through
+    // `getImpl()` at all — same side-table-based approach `setSoTimeout`
+    // already uses.
+    r.register(sock, "getSoTimeout", "()I", |_ctx, args| {
+        let this = obj_arg(args, 0)?;
+        let sid = sock_get(this).stream_id;
+        if sid >= 0 {
+            let reg = s2_registry().lock();
+            if let Some(stream) = reg.streams.get(&sid) {
+                let ms = stream
+                    .read_timeout()
+                    .map_err(|e| ioex(format!("getSoTimeout failed: {e}")))?
+                    .map(|d| d.as_millis() as i32)
+                    .unwrap_or(0);
+                return Ok(Some(Value::Int(ms)));
+            }
+        }
+        Ok(Some(Value::Int(0)))
+    });
 
     r.register(sock, "getPort", "()I", |_ctx, args| {
         let this = obj_arg(args, 0)?;

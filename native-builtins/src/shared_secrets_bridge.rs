@@ -439,6 +439,51 @@ fn jla_start_in_container(ctx: &mut dyn NativeContext, args: &[Value]) -> Method
     Ok(None)
 }
 
+/// `JavaLangAccess.join(String prefix, String suffix, String delimiter,
+/// String[] elements, int size)` -> `String`.
+///
+/// A fast-path helper `String.join(...)`/`StringJoiner`-adjacent code calls
+/// to concatenate `elements[0..size]` with `delimiter` between them and
+/// `prefix`/`suffix` on the ends, bypassing the general `StringJoiner`
+/// machinery. Missing here broke Apache HttpClient5's
+/// `HttpComponentsClientHttpRequestFactoryTests` (`NoSuchMethodError` on
+/// this exact signature).
+///
+/// INSTANCE method: args[0] = receiver (System$1), args[1] = prefix,
+/// args[2] = suffix, args[3] = delimiter, args[4] = String[] elements,
+/// args[5] = int size.
+fn jla_join(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let read = |ctx: &dyn NativeContext, v: Option<&Value>| -> String {
+        match v {
+            Some(Value::Object(Some(s))) => ctx.read_string(*s).unwrap_or_default(),
+            _ => String::new(),
+        }
+    };
+    let prefix = read(ctx, args.get(1));
+    let suffix = read(ctx, args.get(2));
+    let delimiter = read(ctx, args.get(3));
+    let elements = match args.get(4) {
+        Some(Value::Object(Some(arr))) => *arr,
+        _ => {
+            let s = ctx.create_string(&format!("{prefix}{suffix}"));
+            return Ok(Some(Value::Object(Some(s))));
+        }
+    };
+    let size = args.get(5).and_then(|v| v.as_int()).unwrap_or(0).max(0) as usize;
+    let mut out = prefix;
+    for i in 0..size {
+        if i > 0 {
+            out.push_str(&delimiter);
+        }
+        if let Value::Object(Some(s)) = ctx.get_array_element(elements, i) {
+            out.push_str(&ctx.read_string(s).unwrap_or_default());
+        }
+    }
+    out.push_str(&suffix);
+    let s = ctx.create_string(&out);
+    Ok(Some(Value::Object(Some(s))))
+}
+
 fn jla_new_string_utf8_no_repl(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     // (byte[] bytes, int offset, int length) -> String
     // Decode the bytes as UTF-8 with no replacement on malformed
@@ -703,6 +748,12 @@ fn register_java_lang_access(registry: &mut NativeMethodRegistry) {
         "(Ljava/lang/Thread;Ljdk/internal/vm/ThreadContainer;)V",
         jla_start_in_container,
     );
+    registry.register(
+        owner,
+        "join",
+        "(Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;[Ljava/lang/String;I)Ljava/lang/String;",
+        jla_join,
+    );
     // Also register on the interface so direct invokeinterface
     // dispatch (when the receiver's concrete class lookup falls
     // back to the interface class) still hits these natives.
@@ -749,6 +800,12 @@ fn register_java_lang_access(registry: &mut NativeMethodRegistry) {
         "start",
         "(Ljava/lang/Thread;Ljdk/internal/vm/ThreadContainer;)V",
         jla_start_in_container,
+    );
+    registry.register(
+        iface,
+        "join",
+        "(Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;[Ljava/lang/String;I)Ljava/lang/String;",
+        jla_join,
     );
 }
 
