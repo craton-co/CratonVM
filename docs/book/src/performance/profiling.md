@@ -19,8 +19,8 @@ javac -d .bench-cache/quickbench .bench-cache/quickbench/QuickBench.java .bench-
 # CratonVM default
 target/release/cratonvm --classpath .bench-cache/quickbench QuickBench
 
-# CratonVM with OSR + low threshold
-CRATONVM_JIT_OSR=1 CRATONVM_JIT_THRESHOLD=1 target/release/cratonvm --classpath .bench-cache/quickbench QuickBench
+# CratonVM with the default OSR path and a low threshold
+CRATONVM_JIT_THRESHOLD=1 target/release/cratonvm --classpath .bench-cache/quickbench QuickBench
 
 # HotSpot for comparison
 java -cp .bench-cache/quickbench QuickBench
@@ -44,8 +44,8 @@ public class MyBench {
 
 Warm the code up enough that hot methods cross the JIT threshold (default 500
 invocations), lower it with `CRATONVM_JIT_THRESHOLD=1` for short runs, and set
-`CRATONVM_JIT_OSR=1` when you specifically want hot loops to enter compiled code
-mid-method.
+`CRATONVM_JIT_OSR=0` when you specifically want to disable hot-loop OSR during
+diagnosis.
 
 ## JIT knobs that affect timing
 
@@ -53,7 +53,7 @@ mid-method.
 |---------|--------|
 | `--nojit` | Interpreter-only; use to measure the interpreter or isolate JIT effects. |
 | `CRATONVM_JIT_THRESHOLD=<n>` | When methods become JIT-eligible (default 500). |
-| `CRATONVM_JIT_OSR=1` | Enables On-Stack Replacement for hot loop back-edges. |
+| `CRATONVM_JIT_OSR=0` | Disables On-Stack Replacement for hot loop back-edges. |
 | AVX2 SIMD | Auto-detected via CPUID; affects data-parallel reduction loops. |
 
 ## System profilers

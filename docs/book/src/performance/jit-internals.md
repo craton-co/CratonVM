@@ -49,7 +49,7 @@ The work proceeded in numbered "rounds." The highlights:
 | **Compact reference arrays** | `Object[]` stored as raw 8-byte pointers instead of a 16-byte tagged value. |
 | **Bounds-check elimination (BCE)** | One length check before a provably safe loop instead of per element, with an out-of-line throw. |
 | **Virtual/interface/special calls** | A helper bridge for dynamic dispatch, plus direct calls between compiled methods. |
-| **On-Stack Replacement (OSR)** | A hot loop compiled and entered mid-method when `CRATONVM_JIT_OSR=1` is enabled. |
+| **On-Stack Replacement (OSR)** | A hot loop compiled and entered mid-method by default; `CRATONVM_JIT_OSR=0` disables it for diagnosis. |
 | **AVX2 SIMD** | CPUID-gated vectorization of data-parallel reduction loops, with a scalar remainder. |
 | **Structure-of-Arrays value layout** | Operand stack and locals split into separate value and tag arrays for better cache behavior and GC scanning. |
 | **Loop unrolling, speculative BCE, graph-coloring regalloc** | Unrolling small loop bodies, a speculative loop-header bounds guard, and graph-coloring register allocation. |

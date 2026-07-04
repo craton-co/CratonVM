@@ -5246,12 +5246,10 @@ pub(crate) fn try_osr_with_backoff(
     initial_frame_idx: usize,
     entry_pc: usize,
 ) -> OsrBackoffOutcome {
-    // HIB-CV-20 / HIB-CV-21: back-edge OSR is unsound on large real-world
-    // methods (the OSR entry path can resume with corrupted register/stack
-    // state → a silent wrong value → infinite loops in e.g. Xerces XSD parsing).
-    // Gated OFF by default; whole-method JIT is unaffected. `CRATONVM_JIT_OSR=1`
-    // opts back in. This is the canonical entry for BOTH the inline and
-    // background-OSR paths, so the gate disables OSR everywhere.
+    // Back-edge OSR is default-on after the known entry-state corruption
+    // blockers were retired. Whole-method JIT is unaffected. `CRATONVM_JIT_OSR=0`
+    // opts out for diagnosis/bisection. This is the canonical entry for BOTH the
+    // inline and background-OSR paths, so the gate disables OSR everywhere.
     if !crate::runtime::env_cache::osr_backedge_enabled() {
         return OsrBackoffOutcome::Skip;
     }

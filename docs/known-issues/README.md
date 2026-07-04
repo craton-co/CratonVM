@@ -99,6 +99,21 @@ Every unresolved bug document belongs under `docs/known-issues`. Once the bug
 is fixed, resolved, or refuted, move the write-up out of this folder and archive
 it under `docs/internal`.
 
+## 2026-07-04 OSR default flip / archived residuals
+
+- `CRATONVM_JIT_OSR` now defaults on in `vm/src/runtime/env_cache.rs`; set
+  `CRATONVM_JIT_OSR=0` for the old behavior during diagnosis. The historical
+  OSR blocker note moved to
+  [`docs/internal/fixed-suite-bugs/jit-osr-backedge-value-corruption-cluster.md`](../internal/fixed-suite-bugs/jit-osr-backedge-value-corruption-cluster.md).
+- The G1 parallel-evac forwarding/root-remap note moved to
+  [`docs/internal/fixed-suite-bugs/g1-parallel-evac-persistent-forwarding-root-remap.md`](../internal/fixed-suite-bugs/g1-parallel-evac-persistent-forwarding-root-remap.md)
+  because its own current evidence says both bugs are fixed and soak-verified.
+- The XT takeover activation corruption note moved to
+  [`docs/internal/fixed-suite-bugs/xt-takeover-activation-young-corruption.md`](../internal/fixed-suite-bugs/xt-takeover-activation-young-corruption.md).
+  Its remaining 1/18 DoHead crash face is not an XT activation residual and stays
+  tracked by
+  [`dohead-jit-heap-corruption-register-invisibility.md`](dohead-jit-heap-corruption-register-invisibility.md).
+
 ## How many distinct bugs are here?
 
 After consolidation (full re-count 2026-06-18, kafka-bug-B/C status reconciled 2026-07-01),
