@@ -5362,21 +5362,29 @@ fn register_re4_url_http(r: &mut NativeMethodRegistry) {
     // so removing this is Spring-Boot neutral. The real lifecycle runs fine
     // under CratonVM. See CRATONVM_BUGS/BUG-C-*.
 
-    // AbstractFileResolvingResource.customizeConnection(URLConnection) — no-op
-    r.register(
-        "org/springframework/core/io/AbstractFileResolvingResource",
-        "customizeConnection",
-        "(Ljava/net/URLConnection;)V",
-        |_ctx, _args| Ok(None),
-    );
-
-    // AbstractFileResolvingResource.customizeConnection(HttpURLConnection) — no-op
-    r.register(
-        "org/springframework/core/io/AbstractFileResolvingResource",
-        "customizeConnection",
-        "(Ljava/net/HttpURLConnection;)V",
-        |_ctx, _args| Ok(None),
-    );
+    // residual-4 fix: the two `AbstractFileResolvingResource.customizeConnection`
+    // no-ops above were REMOVED. They made `customizeConnection` a complete
+    // no-op for every caller — including `AbstractFileResolvingResource.exists()`/
+    // `contentLength()`/`lastModified()`, which call it directly (not just via
+    // the separately-intercepted `UrlResource.getInputStream()` above) — so a
+    // subclass overriding `customizeConnection(HttpURLConnection)` (e.g. to set
+    // a custom request header) was silently never invoked, and
+    // `useCachesIfNecessary`+the `instanceof HttpURLConnection` dispatch never
+    // ran either. The original S111r24 motivation (`getClass().getSimpleName()`
+    // throwing on a synthetic HttpURLConnection Class mirror, breaking
+    // `UrlResource.getInputStream()`'s uncaught-exception path) is already
+    // covered independently by the `UrlResource.getInputStream()` override
+    // above, which bypasses `customizeConnection` entirely — and empirically,
+    // `getClass().getSimpleName()` on the connection objects `customizeConnection`
+    // actually receives now works fine (verified: real `sun.net.www.protocol.
+    // http.HttpURLConnection`/`HttpsURLConnectionImpl` instances, not a synthetic
+    // mirror). Letting the real bytecode run restores the real JDK contract:
+    // `useCachesIfNecessary` + the `instanceof`-gated dispatch to
+    // `customizeConnection(HttpURLConnection)`, which virtual-dispatches to
+    // whatever subclass override exists (`UrlResource`'s own subclasses use
+    // this to set custom request headers before `exists()`/`getInputStream()`
+    // send the request — `ResourceTests.UrlResourceTests
+    // .canCustomizeHttpUrlConnectionForExists[Fallback]`).
 }
 
 // ===========================================================================
