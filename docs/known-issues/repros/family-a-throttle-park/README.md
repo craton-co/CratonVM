@@ -50,7 +50,7 @@ regression gates.
 
 Dev landed a real, separate, verified fix in this window
 (`abca7a25` + `c224e1a9`, doc:
-`g1-parallel-evac-persistent-forwarding-root-remap.md` §"interpreter
+`docs/internal/fixed-suite-bugs/g1-parallel-evac-persistent-forwarding-root-remap.md` §"interpreter
 retention imprecision RESOLVED") for an *unbounded-retention* interpreter
 root-scan gap: `lstore`/`dstore` left the cat-2 reservation slot `i+1`
 holding a stale object reference, keeping it a GC root forever, plus a new

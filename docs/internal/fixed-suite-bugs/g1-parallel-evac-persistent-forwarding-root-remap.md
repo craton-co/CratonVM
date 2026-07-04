@@ -1,5 +1,10 @@
 # G1 parallel evacuator drops a root-referenced object (persistent `forwarding_ptr` vs per-cycle `pointer_map`)
 
+**Archived:** moved out of `docs/known-issues` on 2026-07-04 because the current
+top-level evidence below says both the dominant root-remap bug and the later
+parallel concurrency residual are fixed and soak-verified. The historical
+"Residual — OPEN" section is retained for investigation context only.
+
 **Status:** 🟢 FIXED (both bugs), soak-verified 2026-07-03. The DOMINANT bug
 (persistent-`forwarding_ptr` root-remap, deterministic ~12.5% on the repro)
 was fixed first (see "Fix" below). The residual **concurrency race** (~5%,

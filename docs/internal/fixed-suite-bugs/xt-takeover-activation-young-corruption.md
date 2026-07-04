@@ -1,10 +1,18 @@
 # xt cross-thread JIT takeover activation → young-gen header corruption + crashes — ROOT-CAUSED + FIXED
 
-Status: **fixed on branch `fix/xt-conservative-mark-hardening-9e0f`**
-(commits `a35ed0ae` + `46763f47`, based at dev@`9e0f613a` because current dev
-carries an unrelated deterministic startup-ArrayStoreException regression in
-the `9e0f613a..4c5ede47` window — bisect chip filed). Merge after that bisect
-lands.
+**Archived:** moved out of `docs/known-issues` on 2026-07-04. The XT takeover
+activation regression is fixed on current `dev`: the source now contains the
+counted-OS-tid barrier excusal, helper-window scoping, side-mark/header
+hardening, moving-young coverage diversion, and old-gen zero-prefix rejection
+described below. The remaining 1/18 DoHead crash face in the last validation is
+not an XT activation residual; it is the separate stale-receiver / fabricated
+base background family that remains tracked by
+[`docs/known-issues/dohead-jit-heap-corruption-register-invisibility.md`](../../known-issues/dohead-jit-heap-corruption-register-invisibility.md).
+
+Historical status: **fixed on branch `fix/xt-conservative-mark-hardening-9e0f`**
+(commits `a35ed0ae` + `46763f47`, based at dev@`9e0f613a` because then-current
+dev carried an unrelated deterministic startup-ArrayStoreException regression in
+the `9e0f613a..4c5ede47` window).
 
 ## Evidence (DoHead idx 38, `-Xmx500m`/150 s, 12 runs per config)
 

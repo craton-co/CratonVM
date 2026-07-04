@@ -96,27 +96,33 @@ pub fn jit_invocation_threshold() -> u32 {
 /// `CRATONVM_JIT_OSR` — master enable for back-edge **On-Stack Replacement**
 /// (entering JIT code mid-loop at a hot back-edge).
 ///
-/// **Default: OFF (disabled).** OSR back-edge compilation is currently unsound on
-/// large real-world methods: the OSR entry path does not perfectly reproduce the
-/// method's prologue state, so the OSR'd frame (or, via the trampoline's
-/// callee-saved handling, its caller) can resume with corrupted register/stack
-/// state — producing a *silent wrong value* rather than a crash. On the Hibernate
-/// ORM suite this is the dominant cause of JIT-on hangs (HIB-CV-20 / HIB-CV-21):
-/// Xerces XSD parsing's content-model DFA construction reads a corrupted value and
-/// loops forever. Regular (whole-method) JIT compilation is unaffected and stays
-/// on — only the mid-loop back-edge OSR trigger is gated here.
+/// **Default: ON.** The blockers that kept back-edge OSR default-off have been
+/// retired: reference parameters are now seeded into the OSR compile's oop mask,
+/// primitive locals that collide with NaN-box object tags round-trip through the
+/// OSR snapshot bit-exactly, and entries with an unsafe dead-local mask are
+/// rejected before the trampoline runs. Regular whole-method JIT remains
+/// unaffected; this gate controls only the mid-loop back-edge trigger.
 ///
-/// The HIB-CV-20 trampoline callee-saved-register fix removes one corruption
-/// source; this gate keeps the remaining (not-yet-hardened) OSR entry paths off by
-/// default so real bytecode runs correctly. Set `CRATONVM_JIT_OSR=1` to re-enable
-/// OSR for benchmarking / development once the entry-state reconstruction is fully
-/// hardened. Empty or `"0"` ⇒ disabled (the safe default). Read once and cached.
+/// Set `CRATONVM_JIT_OSR=0` (or `false`/`off`/`no`) to force OSR off for
+/// diagnosis or bisection. Any other value, and an unset variable, enables OSR.
+/// Read once and cached.
+#[inline]
+fn parse_osr_backedge_enabled(raw: Option<&str>) -> bool {
+    raw.map(|v| {
+        let v = v.trim();
+        !(v == "0"
+            || v.eq_ignore_ascii_case("false")
+            || v.eq_ignore_ascii_case("off")
+            || v.eq_ignore_ascii_case("no"))
+    })
+    .unwrap_or(true)
+}
+
 #[inline]
 pub fn osr_backedge_enabled() -> bool {
     static CACHE: OnceLock<bool> = OnceLock::new();
-    *CACHE.get_or_init(|| match std::env::var("CRATONVM_JIT_OSR") {
-        Ok(v) => !v.is_empty() && v != "0",
-        Err(_) => false,
+    *CACHE.get_or_init(|| {
+        parse_osr_backedge_enabled(std::env::var("CRATONVM_JIT_OSR").ok().as_deref())
     })
 }
 
@@ -799,4 +805,21 @@ pub fn real_bytecode_selector() -> &'static RealSelector {
             .unwrap_or(false);
         RealSelector::parse(real.as_deref(), jca_legacy)
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_osr_backedge_enabled;
+
+    #[test]
+    fn osr_backedge_defaults_on_and_has_explicit_opt_outs() {
+        assert!(parse_osr_backedge_enabled(None));
+        assert!(parse_osr_backedge_enabled(Some("")));
+        assert!(parse_osr_backedge_enabled(Some("1")));
+        assert!(parse_osr_backedge_enabled(Some("true")));
+        assert!(!parse_osr_backedge_enabled(Some("0")));
+        assert!(!parse_osr_backedge_enabled(Some("false")));
+        assert!(!parse_osr_backedge_enabled(Some("OFF")));
+        assert!(!parse_osr_backedge_enabled(Some(" no ")));
+    }
 }

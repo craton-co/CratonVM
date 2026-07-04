@@ -75,8 +75,9 @@ CratonVM code `b80c50b5`.
 | Matrix 500x500       | 336 ms       | 39,078 ms        | 116.3x        | 452 ms                    | 1.35x     |
 | **QuickBench total** | **3,756 ms** | **173,532 ms**   | **46.2x**     | **30,977 ms**             | **8.25x** |
 
-The OSR column sets `CRATONVM_JIT_OSR=1 CRATONVM_JIT_THRESHOLD=1`. Default
-launcher settings leave these one-shot hot loops mostly interpreted.
+This historical table predates the 2026-07-04 OSR default flip. The OSR column
+sets `CRATONVM_JIT_OSR=1 CRATONVM_JIT_THRESHOLD=1`; current `dev` enables OSR
+by default, with `CRATONVM_JIT_OSR=0` as the opt-out.
 
 Backed by a layered Rust/Java test strategy and HotSpot-differential tooling.
 

@@ -76,11 +76,11 @@ This is on by default; the conservative-scan fallback
 
 ## On-Stack Replacement (OSR)
 
-When `CRATONVM_JIT_OSR=1` is set, a long-running loop need not wait for its
-method to be re-entered: when a loop's back-edge counter gets hot, the method is
-compiled and execution transfers from the interpreter into the compiled code
-mid-method, with interpreter locals copied into the JIT frame. Current default
-launcher settings leave this path off.
+By default, a long-running loop need not wait for its method to be re-entered:
+when a loop's back-edge counter gets hot, the method is compiled and execution
+transfers from the interpreter into the compiled code mid-method, with
+interpreter locals copied into the JIT frame. Set `CRATONVM_JIT_OSR=0` to disable
+this path for diagnosis.
 
 ## Code cache
 

@@ -13,10 +13,10 @@ Compiler internals](../internals/jit.md).
 - Each method has an invocation counter. When it reaches the **warmup
   threshold** (`CRATONVM_JIT_THRESHOLD`, default **500**), the method becomes
   eligible for compilation.
-- When `CRATONVM_JIT_OSR=1` is set, long-running loops can trigger
-  **On-Stack Replacement (OSR)**: a hot loop is compiled and execution transfers
-  from the interpreter into the compiled code mid-method, without waiting for the
-  method to be re-entered. Current default launcher settings leave this path off.
+- Long-running loops can trigger **On-Stack Replacement (OSR)** by default: a
+  hot loop is compiled and execution transfers from the interpreter into the
+  compiled code mid-method, without waiting for the method to be re-entered.
+  Set `CRATONVM_JIT_OSR=0` to disable this path for diagnosis.
 - Compiled code is kept in a code cache. When the cache cap is reached, new
   methods stay interpreted.
 
@@ -30,7 +30,7 @@ partial.)
 |------|-----|
 | Disable the JIT entirely (interpreter only) | `--nojit` (or `CRATONVM_DISABLE_JIT=1`) |
 | Change the warmup threshold | `CRATONVM_JIT_THRESHOLD=<n>` (`0` is clamped to `1`) |
-| Enable hot-loop OSR | `CRATONVM_JIT_OSR=1` |
+| Disable hot-loop OSR | `CRATONVM_JIT_OSR=0` |
 | Bound the code cache | `CRATONVM_JIT_CODE_CACHE_MAX_MB=<MiB>` (`0` = unbounded) |
 
 ### Lower the threshold to compile sooner
