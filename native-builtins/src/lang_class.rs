@@ -10699,10 +10699,39 @@ pub(crate) fn native_method_get_parameter_annotations(
         }
         return Ok(Some(Value::Object(Some(outer))));
     }
-    let outer = ctx.new_ref_array(outer_comp, param_annotations.len());
-    for (i, anns) in param_annotations.iter().enumerate() {
-        let inner = build_annotation_array(ctx, anns);
+    // The class file's RuntimeVisibleParameterAnnotations table is written
+    // by javac against the SOURCE-level parameter list, which omits any
+    // synthetic/mandated LEADING parameters the compiler adds to the
+    // descriptor — most commonly a non-static inner class constructor's
+    // implicit outer-instance parameter (`this$0`), and equivalently enum
+    // constructors' synthetic `(String name, int ordinal)` pair. So
+    // `param_annotations.len()` can be SHORTER than the full descriptor
+    // parameter count. Real JDK's `Executable.sharedGetParameterAnnotations`
+    // detects exactly this mismatch and right-shifts the parsed rows,
+    // synthesizing empty leading entries (see `handleParameterNumberMismatch`
+    // in `java.lang.reflect.Executable`); since `Constructor`/`Method`
+    // .getParameterAnnotations() is natively overridden here (real JDK
+    // objects lack the raw `annotations`/`parameterAnnotations` byte[]
+    // fields this class populates from — see the registration comment),
+    // that adjustment has to be reimplemented here instead of inheriting it
+    // from the real bytecode. Without it, callers indexing the returned
+    // array by `Parameter.getDeclaredAnnotations()`'s 0-based descriptor
+    // index (which DOES count the synthetic parameter) read every entry
+    // shifted by one and eventually run off the end —
+    // ArrayIndexOutOfBoundsException on the last (real) parameter.
+    let param_count = count_method_params(&method_desc);
+    let synthetic_leading = param_count.saturating_sub(param_annotations.len());
+    let outer = ctx.new_ref_array(outer_comp, param_count);
+    for i in 0..synthetic_leading {
+        let inner = ctx.new_ref_array(inner_comp, 0);
         ctx.set_array_element(outer, i, Value::Object(Some(inner)));
+    }
+    // Malformed/unexpected case (more raw rows than descriptor params):
+    // clamp rather than write past `outer`'s length.
+    let copy_count = param_annotations.len().min(param_count.saturating_sub(synthetic_leading));
+    for (i, anns) in param_annotations.iter().take(copy_count).enumerate() {
+        let inner = build_annotation_array(ctx, anns);
+        ctx.set_array_element(outer, synthetic_leading + i, Value::Object(Some(inner)));
     }
     Ok(Some(Value::Object(Some(outer))))
 }

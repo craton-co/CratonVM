@@ -1,8 +1,10 @@
 # Elasticsearch vector scorers return zero or wrong scores
 
-Status: open
+Status: fixed
 
 Date observed: 2026-07-02
+
+Date fixed: 2026-07-04
 
 ## Summary
 
@@ -91,6 +93,43 @@ linked above.
 
 Evidence:
 `C:\craton\CratonVM-elasticsearch-current-suite-20260702\apps\elasticsearch-suite-runner\.suite\results\es-segvh-verify-es818-20260703\all-jit\logs\server.org.elasticsearch.index.codec.vectors.es818.ES818BinaryQu.29ee1bcc736c.out.log`
+
+## Resolution 2026-07-04
+
+Root cause: the JDK Vector API bridge stored each synthetic vector as one
+summary integer (`data_hash`) instead of preserving per-lane values. Vector
+loads from primitive arrays, lane-wise arithmetic, FMA, and reductions therefore
+computed from a deterministic hash surrogate rather than the actual vector
+payload. Dot-product style scorer code could collapse to exact zero or produce
+wrong fractional scores even when the underlying vector bytes were correct.
+
+Fix: `native-builtins/src/vector_api.rs` now stores vector lanes in a synthetic
+`long[]` payload, preserving raw integer lanes and raw float/double bit
+patterns. `fromArray`, broadcast, arithmetic, unary ops, FMA, reductions,
+lane access, `withLane`, `toArray`, `intoArray`, compare masks, blend, and
+rearrange now operate on the lane payload. `VectorMask` also carries exact lane
+bits so compare/blend no longer loses lane positions.
+
+Regression coverage:
+
+```powershell
+$env:CARGO_TARGET_DIR='C:\craton\target-es-vector-scorer-zero-results-20260704'
+cargo test -p cratonvm-native-builtins vector_api --lib
+```
+
+Result: `58 passed`; includes
+`test_float_vector_mul_reduce_uses_real_lanes`, which covers
+`fromArray -> mul -> reduceLanes(ADD)` and would have failed under the old
+hash-summary model.
+
+Additional check:
+
+```powershell
+$env:CARGO_TARGET_DIR='C:\craton\target-es-vector-scorer-zero-results-20260704'
+cargo check -p cratonvm-native-builtins
+```
+
+Result: passed.
 
 ## Repro
 

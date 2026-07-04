@@ -13,7 +13,7 @@
 use crate::{alloc_concurrent_synthetic, obj_arg};
 use cratonvm_native_api::{NativeContext, NativeMethodRegistry};
 use cratonvm_types::error::MethodCallResult;
-use cratonvm_types::{ObjectRef, Value};
+use cratonvm_types::{ArrayElementType, ObjectRef, Value};
 
 // ---------------------------------------------------------------------------
 // Element type codes
@@ -176,7 +176,7 @@ fn is_associative(code: i32) -> bool {
 // IntVector/LongVector/FloatVector/DoubleVector layout:
 //   field 0: species_idx (Int)
 //   field 1: lane_count  (Int)
-//   field 2: data_hash   (Int)
+//   field 2: lane payload (long[]; integer lanes sign-extended, float lanes raw bits)
 //   field 3: op_count    (Int)
 
 fn alloc_vector(
@@ -187,15 +187,51 @@ fn alloc_vector(
     data_hash: i32,
     op_count: i32,
 ) -> ObjectRef {
+    let lanes = vec![data_hash as i64; normalized_lane_count(lane_count)];
+    alloc_vector_lanes(ctx, class_name, species_idx, lane_count, &lanes, op_count)
+}
+
+fn alloc_vector_lanes(
+    ctx: &mut dyn NativeContext,
+    class_name: &str,
+    species_idx: i32,
+    lane_count: i32,
+    lanes: &[i64],
+    op_count: i32,
+) -> ObjectRef {
     let obj = alloc_concurrent_synthetic(ctx, class_name, 4);
+    let lane_count_usize = normalized_lane_count(lane_count);
+    let payload = ctx.new_array(ArrayElementType::Long, lane_count_usize);
+    for i in 0..lane_count_usize {
+        let lane = lanes.get(i).copied().unwrap_or(0);
+        ctx.set_array_element(payload, i, Value::Long(lane));
+    }
     ctx.set_field(obj, 0, Value::Int(species_idx));
     ctx.set_field(obj, 1, Value::Int(lane_count));
-    ctx.set_field(obj, 2, Value::Int(data_hash));
+    ctx.set_field(obj, 2, Value::Object(Some(payload)));
     ctx.set_field(obj, 3, Value::Int(op_count));
     obj
 }
 
+fn normalized_lane_count(lane_count: i32) -> usize {
+    usize::try_from(lane_count)
+        .ok()
+        .filter(|n| *n > 0)
+        .unwrap_or(1)
+}
+
+fn summarize_lanes(lanes: &[i64]) -> i32 {
+    lanes.iter().fold(0i32, |acc, lane| {
+        acc.wrapping_mul(31).wrapping_add(*lane as i32)
+    })
+}
+
 fn read_vector_fields(ctx: &mut dyn NativeContext, obj: ObjectRef) -> (i32, i32, i32, i32) {
+    let (species_idx, lane_count, lanes, op_count) = read_vector_lanes(ctx, obj);
+    (species_idx, lane_count, summarize_lanes(&lanes), op_count)
+}
+
+fn read_vector_lanes(ctx: &mut dyn NativeContext, obj: ObjectRef) -> (i32, i32, Vec<i64>, i32) {
     let species_idx = match ctx.get_field(obj, 0) {
         Value::Int(n) => n,
         _ => 0,
@@ -204,15 +240,33 @@ fn read_vector_fields(ctx: &mut dyn NativeContext, obj: ObjectRef) -> (i32, i32,
         Value::Int(n) => n,
         _ => 0,
     };
-    let data_hash = match ctx.get_field(obj, 2) {
-        Value::Int(n) => n,
-        _ => 0,
-    };
     let op_count = match ctx.get_field(obj, 3) {
         Value::Int(n) => n,
         _ => 0,
     };
-    (species_idx, lane_count, data_hash, op_count)
+    let lane_count_usize = normalized_lane_count(lane_count);
+    let lanes = match ctx.get_field(obj, 2) {
+        Value::Object(Some(payload)) => {
+            let payload_len = ctx.array_length(payload);
+            let mut out = Vec::with_capacity(lane_count_usize);
+            for i in 0..lane_count_usize {
+                let lane = if i < payload_len {
+                    match ctx.get_array_element(payload, i) {
+                        Value::Long(n) => n,
+                        Value::Int(n) => n as i64,
+                        _ => 0,
+                    }
+                } else {
+                    0
+                };
+                out.push(lane);
+            }
+            out
+        }
+        Value::Int(n) => vec![n as i64; lane_count_usize],
+        _ => vec![0; lane_count_usize],
+    };
+    (species_idx, lane_count, lanes, op_count)
 }
 
 fn species_idx_from_arg(ctx: &mut dyn NativeContext, args: &[Value]) -> i32 {
@@ -228,6 +282,623 @@ fn species_idx_from_arg(ctx: &mut dyn NativeContext, args: &[Value]) -> i32 {
 fn lane_count_from_species(species_idx: i32) -> i32 {
     let cfg = get_species_config(species_idx as usize);
     cfg.lane_count as i32
+}
+
+fn int_arg(args: &[Value], idx: usize) -> i32 {
+    match args.get(idx) {
+        Some(Value::Int(n)) => *n,
+        Some(Value::Long(n)) => *n as i32,
+        Some(Value::Float(f)) => *f as i32,
+        Some(Value::Double(f)) => *f as i32,
+        _ => 0,
+    }
+}
+
+fn lane_arg_bits(args: &[Value], idx: usize, elem_type: u8) -> i64 {
+    match elem_type {
+        ELEM_BYTE => int_arg(args, idx) as i8 as i64,
+        ELEM_SHORT => int_arg(args, idx) as i16 as i64,
+        ELEM_INT => int_arg(args, idx) as i64,
+        ELEM_LONG => match args.get(idx) {
+            Some(Value::Long(n)) => *n,
+            Some(Value::Int(n)) => *n as i64,
+            _ => 0,
+        },
+        ELEM_FLOAT => match args.get(idx) {
+            Some(Value::Float(f)) => f.to_bits() as i64,
+            Some(Value::Int(n)) => (*n as f32).to_bits() as i64,
+            _ => 0,
+        },
+        ELEM_DOUBLE => match args.get(idx) {
+            Some(Value::Double(f)) => f.to_bits() as i64,
+            Some(Value::Long(n)) => (*n as f64).to_bits() as i64,
+            Some(Value::Int(n)) => (*n as f64).to_bits() as i64,
+            _ => 0,
+        },
+        _ => 0,
+    }
+}
+
+fn array_lane_bits(
+    ctx: &mut dyn NativeContext,
+    arr: ObjectRef,
+    index: usize,
+    elem_type: u8,
+) -> i64 {
+    if index >= ctx.array_length(arr) {
+        return 0;
+    }
+    match (elem_type, ctx.get_array_element(arr, index)) {
+        (ELEM_BYTE, Value::Int(n)) => n as i8 as i64,
+        (ELEM_SHORT, Value::Int(n)) => n as i16 as i64,
+        (ELEM_INT, Value::Int(n)) => n as i64,
+        (ELEM_LONG, Value::Long(n)) => n,
+        (ELEM_LONG, Value::Int(n)) => n as i64,
+        (ELEM_FLOAT, Value::Float(f)) => f.to_bits() as i64,
+        (ELEM_FLOAT, Value::Int(n)) => n as u32 as i64,
+        (ELEM_DOUBLE, Value::Double(f)) => f.to_bits() as i64,
+        (ELEM_DOUBLE, Value::Long(n)) => n,
+        (ELEM_DOUBLE, Value::Int(n)) => n as u64 as i64,
+        (_, Value::Int(n)) => n as i64,
+        (_, Value::Long(n)) => n,
+        _ => 0,
+    }
+}
+
+fn lane_bits_to_value(elem_type: u8, bits: i64) -> Value {
+    match elem_type {
+        ELEM_BYTE => Value::Int(bits as i8 as i32),
+        ELEM_SHORT => Value::Int(bits as i16 as i32),
+        ELEM_INT => Value::Int(bits as i32),
+        ELEM_LONG => Value::Long(bits),
+        ELEM_FLOAT => Value::Float(f32::from_bits(bits as u32)),
+        ELEM_DOUBLE => Value::Double(f64::from_bits(bits as u64)),
+        _ => Value::Int(bits as i32),
+    }
+}
+
+fn wrap_integral_lane(elem_type: u8, value: i64) -> i64 {
+    match elem_type {
+        ELEM_BYTE => value as i8 as i64,
+        ELEM_SHORT => value as i16 as i64,
+        ELEM_INT => value as i32 as i64,
+        ELEM_LONG => value,
+        _ => value,
+    }
+}
+
+fn integral_lane_value(elem_type: u8, bits: i64) -> i64 {
+    match elem_type {
+        ELEM_BYTE => bits as i8 as i64,
+        ELEM_SHORT => bits as i16 as i64,
+        ELEM_INT => bits as i32 as i64,
+        ELEM_LONG => bits,
+        _ => bits,
+    }
+}
+
+fn safe_div_i64(lhs: i64, rhs: i64) -> i64 {
+    if rhs == 0 {
+        lhs
+    } else if lhs == i64::MIN && rhs == -1 {
+        i64::MIN
+    } else {
+        lhs / rhs
+    }
+}
+
+fn safe_abs_i64(value: i64) -> i64 {
+    if value == i64::MIN {
+        i64::MIN
+    } else {
+        value.abs()
+    }
+}
+
+fn integral_binary_lane(elem_type: u8, op_code: i32, lhs_bits: i64, rhs_bits: i64) -> i64 {
+    let lhs = integral_lane_value(elem_type, lhs_bits);
+    let rhs = integral_lane_value(elem_type, rhs_bits);
+    let result = match op_code {
+        OP_ADD => lhs.wrapping_add(rhs),
+        OP_SUB => lhs.wrapping_sub(rhs),
+        OP_MUL => lhs.wrapping_mul(rhs),
+        OP_DIV => safe_div_i64(lhs, rhs),
+        OP_AND => lhs & rhs,
+        OP_OR => lhs | rhs,
+        OP_XOR => lhs ^ rhs,
+        OP_MIN => lhs.min(rhs),
+        OP_MAX => lhs.max(rhs),
+        _ => lhs,
+    };
+    wrap_integral_lane(elem_type, result)
+}
+
+fn integral_unary_lane(elem_type: u8, op_code: i32, bits: i64) -> i64 {
+    let value = integral_lane_value(elem_type, bits);
+    let result = match op_code {
+        OP_NEG => value.wrapping_neg(),
+        OP_ABS => safe_abs_i64(value),
+        OP_NOT => !value,
+        _ => value,
+    };
+    wrap_integral_lane(elem_type, result)
+}
+
+fn float_binary_lane(op_code: i32, lhs_bits: i64, rhs_bits: i64) -> i64 {
+    let lhs = f32::from_bits(lhs_bits as u32);
+    let rhs = f32::from_bits(rhs_bits as u32);
+    let result = match op_code {
+        OP_ADD => lhs + rhs,
+        OP_SUB => lhs - rhs,
+        OP_MUL => lhs * rhs,
+        OP_DIV => lhs / rhs,
+        OP_MIN => lhs.min(rhs),
+        OP_MAX => lhs.max(rhs),
+        _ => lhs,
+    };
+    result.to_bits() as i64
+}
+
+fn float_unary_lane(op_code: i32, bits: i64) -> i64 {
+    let value = f32::from_bits(bits as u32);
+    let result = match op_code {
+        OP_NEG => -value,
+        OP_ABS => value.abs(),
+        OP_SQRT => value.sqrt(),
+        _ => value,
+    };
+    result.to_bits() as i64
+}
+
+fn double_binary_lane(op_code: i32, lhs_bits: i64, rhs_bits: i64) -> i64 {
+    let lhs = f64::from_bits(lhs_bits as u64);
+    let rhs = f64::from_bits(rhs_bits as u64);
+    let result = match op_code {
+        OP_ADD => lhs + rhs,
+        OP_SUB => lhs - rhs,
+        OP_MUL => lhs * rhs,
+        OP_DIV => lhs / rhs,
+        OP_MIN => lhs.min(rhs),
+        OP_MAX => lhs.max(rhs),
+        _ => lhs,
+    };
+    result.to_bits() as i64
+}
+
+fn double_unary_lane(op_code: i32, bits: i64) -> i64 {
+    let value = f64::from_bits(bits as u64);
+    let result = match op_code {
+        OP_NEG => -value,
+        OP_ABS => value.abs(),
+        OP_SQRT => value.sqrt(),
+        _ => value,
+    };
+    result.to_bits() as i64
+}
+
+fn binary_lane(elem_type: u8, op_code: i32, lhs_bits: i64, rhs_bits: i64) -> i64 {
+    match elem_type {
+        ELEM_FLOAT => float_binary_lane(op_code, lhs_bits, rhs_bits),
+        ELEM_DOUBLE => double_binary_lane(op_code, lhs_bits, rhs_bits),
+        _ => integral_binary_lane(elem_type, op_code, lhs_bits, rhs_bits),
+    }
+}
+
+fn unary_lane(elem_type: u8, op_code: i32, bits: i64) -> i64 {
+    match elem_type {
+        ELEM_FLOAT => float_unary_lane(op_code, bits),
+        ELEM_DOUBLE => double_unary_lane(op_code, bits),
+        _ => integral_unary_lane(elem_type, op_code, bits),
+    }
+}
+
+fn vector_zero(ctx: &mut dyn NativeContext, args: &[Value], class_name: &str) -> MethodCallResult {
+    let si = species_idx_from_arg(ctx, args);
+    let lc = lane_count_from_species(si);
+    let lanes = vec![0; normalized_lane_count(lc)];
+    let obj = alloc_vector_lanes(ctx, class_name, si, lc, &lanes, 0);
+    Ok(Some(Value::Object(Some(obj))))
+}
+
+fn vector_broadcast(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+    class_name: &str,
+    elem_type: u8,
+) -> MethodCallResult {
+    let si = species_idx_from_arg(ctx, args);
+    let lc = lane_count_from_species(si);
+    let lane = lane_arg_bits(args, 1, elem_type);
+    let lanes = vec![lane; normalized_lane_count(lc)];
+    let obj = alloc_vector_lanes(ctx, class_name, si, lc, &lanes, 1);
+    Ok(Some(Value::Object(Some(obj))))
+}
+
+fn vector_from_array(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+    class_name: &str,
+    elem_type: u8,
+) -> MethodCallResult {
+    let si = species_idx_from_arg(ctx, args);
+    let lc = lane_count_from_species(si);
+    let offset = int_arg(args, 2).max(0) as usize;
+    let src = match args.get(1) {
+        Some(Value::Object(Some(arr))) => Some(*arr),
+        _ => None,
+    };
+    let lanes = (0..normalized_lane_count(lc))
+        .map(|i| src.map_or(0, |arr| array_lane_bits(ctx, arr, offset + i, elem_type)))
+        .collect::<Vec<_>>();
+    let obj = alloc_vector_lanes(ctx, class_name, si, lc, &lanes, 1);
+    Ok(Some(Value::Object(Some(obj))))
+}
+
+fn vector_binary_op_at(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+    class_name: &str,
+    elem_type: u8,
+    op_code: i32,
+    other_index: usize,
+) -> MethodCallResult {
+    let this = obj_arg(args, 0)?;
+    let other = obj_arg(args, other_index)?;
+    let (si, lc, lhs, c1) = read_vector_lanes(ctx, this);
+    let (_, _, rhs, c2) = read_vector_lanes(ctx, other);
+    let lane_count = normalized_lane_count(lc);
+    let lanes = (0..lane_count)
+        .map(|i| {
+            binary_lane(
+                elem_type,
+                op_code,
+                lhs.get(i).copied().unwrap_or(0),
+                rhs.get(i).copied().unwrap_or(0),
+            )
+        })
+        .collect::<Vec<_>>();
+    let obj = alloc_vector_lanes(ctx, class_name, si, lc, &lanes, c1 + c2 + 1);
+    Ok(Some(Value::Object(Some(obj))))
+}
+
+fn vector_binary_op(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+    class_name: &str,
+    elem_type: u8,
+    op_code: i32,
+) -> MethodCallResult {
+    vector_binary_op_at(ctx, args, class_name, elem_type, op_code, 1)
+}
+
+fn vector_unary_op(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+    class_name: &str,
+    elem_type: u8,
+    op_code: i32,
+) -> MethodCallResult {
+    let this = obj_arg(args, 0)?;
+    let (si, lc, src, c) = read_vector_lanes(ctx, this);
+    let lanes = src
+        .iter()
+        .copied()
+        .map(|lane| unary_lane(elem_type, op_code, lane))
+        .collect::<Vec<_>>();
+    let obj = alloc_vector_lanes(ctx, class_name, si, lc, &lanes, c + 1);
+    Ok(Some(Value::Object(Some(obj))))
+}
+
+fn vector_lanewise_unary(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+    class_name: &str,
+    elem_type: u8,
+) -> MethodCallResult {
+    vector_unary_op(ctx, args, class_name, elem_type, int_arg(args, 1))
+}
+
+fn vector_lanewise_binary(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+    class_name: &str,
+    elem_type: u8,
+) -> MethodCallResult {
+    vector_binary_op_at(ctx, args, class_name, elem_type, int_arg(args, 1), 2)
+}
+
+fn reduce_integral_lanes(elem_type: u8, op_code: i32, lanes: &[i64]) -> i64 {
+    if lanes.is_empty() {
+        return 0;
+    }
+    let mut iter = lanes
+        .iter()
+        .copied()
+        .map(|lane| integral_lane_value(elem_type, lane));
+    match op_code {
+        RED_ADD => wrap_integral_lane(
+            elem_type,
+            iter.fold(0i64, |acc, lane| acc.wrapping_add(lane)),
+        ),
+        RED_MUL => wrap_integral_lane(
+            elem_type,
+            iter.fold(1i64, |acc, lane| acc.wrapping_mul(lane)),
+        ),
+        RED_MIN => wrap_integral_lane(elem_type, iter.min().unwrap_or(0)),
+        RED_MAX => wrap_integral_lane(elem_type, iter.max().unwrap_or(0)),
+        RED_AND => wrap_integral_lane(elem_type, iter.fold(-1i64, |acc, lane| acc & lane)),
+        RED_OR => wrap_integral_lane(elem_type, iter.fold(0i64, |acc, lane| acc | lane)),
+        RED_XOR => wrap_integral_lane(elem_type, iter.fold(0i64, |acc, lane| acc ^ lane)),
+        _ => wrap_integral_lane(elem_type, lanes[0]),
+    }
+}
+
+fn vector_reduce(ctx: &mut dyn NativeContext, args: &[Value], elem_type: u8) -> MethodCallResult {
+    let this = obj_arg(args, 0)?;
+    let op = int_arg(args, 1);
+    let (_, _, lanes, _) = read_vector_lanes(ctx, this);
+    let value = match elem_type {
+        ELEM_FLOAT => {
+            let floats = lanes
+                .iter()
+                .copied()
+                .map(|lane| f32::from_bits(lane as u32));
+            let result = match op {
+                RED_ADD => floats.fold(0.0f32, |acc, lane| acc + lane),
+                RED_MUL => floats.fold(1.0f32, |acc, lane| acc * lane),
+                RED_MIN => floats.reduce(|a, b| a.min(b)).unwrap_or(0.0),
+                RED_MAX => floats.reduce(|a, b| a.max(b)).unwrap_or(0.0),
+                _ => f32::from_bits(lanes.first().copied().unwrap_or(0) as u32),
+            };
+            Value::Float(result)
+        }
+        ELEM_DOUBLE => {
+            let doubles = lanes
+                .iter()
+                .copied()
+                .map(|lane| f64::from_bits(lane as u64));
+            let result = match op {
+                RED_ADD => doubles.fold(0.0f64, |acc, lane| acc + lane),
+                RED_MUL => doubles.fold(1.0f64, |acc, lane| acc * lane),
+                RED_MIN => doubles.reduce(|a, b| a.min(b)).unwrap_or(0.0),
+                RED_MAX => doubles.reduce(|a, b| a.max(b)).unwrap_or(0.0),
+                _ => f64::from_bits(lanes.first().copied().unwrap_or(0) as u64),
+            };
+            Value::Double(result)
+        }
+        ELEM_LONG => Value::Long(reduce_integral_lanes(elem_type, op, &lanes)),
+        _ => Value::Int(reduce_integral_lanes(elem_type, op, &lanes) as i32),
+    };
+    Ok(Some(value))
+}
+
+fn vector_lane(ctx: &mut dyn NativeContext, args: &[Value], elem_type: u8) -> MethodCallResult {
+    let this = obj_arg(args, 0)?;
+    let index = int_arg(args, 1).max(0) as usize;
+    let (_, _, lanes, _) = read_vector_lanes(ctx, this);
+    Ok(Some(lane_bits_to_value(
+        elem_type,
+        lanes.get(index).copied().unwrap_or(0),
+    )))
+}
+
+fn vector_with_lane(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+    class_name: &str,
+    elem_type: u8,
+) -> MethodCallResult {
+    let this = obj_arg(args, 0)?;
+    let index = int_arg(args, 1).max(0) as usize;
+    let lane = lane_arg_bits(args, 2, elem_type);
+    let (si, lc, mut lanes, c) = read_vector_lanes(ctx, this);
+    if index < lanes.len() {
+        lanes[index] = lane;
+    }
+    let obj = alloc_vector_lanes(ctx, class_name, si, lc, &lanes, c + 1);
+    Ok(Some(Value::Object(Some(obj))))
+}
+
+fn vector_to_array(ctx: &mut dyn NativeContext, args: &[Value], elem_type: u8) -> MethodCallResult {
+    let this = obj_arg(args, 0)?;
+    let (_, _, lanes, _) = read_vector_lanes(ctx, this);
+    let arr_type = match elem_type {
+        ELEM_BYTE => ArrayElementType::Byte,
+        ELEM_SHORT => ArrayElementType::Short,
+        ELEM_INT => ArrayElementType::Int,
+        ELEM_LONG => ArrayElementType::Long,
+        ELEM_FLOAT => ArrayElementType::Float,
+        ELEM_DOUBLE => ArrayElementType::Double,
+        _ => ArrayElementType::Int,
+    };
+    let arr = ctx.new_array(arr_type, lanes.len());
+    for (i, lane) in lanes.iter().copied().enumerate() {
+        ctx.set_array_element(arr, i, lane_bits_to_value(elem_type, lane));
+    }
+    Ok(Some(Value::Object(Some(arr))))
+}
+
+fn vector_into_array(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+    elem_type: u8,
+) -> MethodCallResult {
+    let this = obj_arg(args, 0)?;
+    let dest = obj_arg(args, 1)?;
+    let offset = int_arg(args, 2).max(0) as usize;
+    let (_, _, lanes, _) = read_vector_lanes(ctx, this);
+    let dest_len = ctx.array_length(dest);
+    for (i, lane) in lanes.iter().copied().enumerate() {
+        let dest_index = offset + i;
+        if dest_index < dest_len {
+            ctx.set_array_element(dest, dest_index, lane_bits_to_value(elem_type, lane));
+        }
+    }
+    Ok(None)
+}
+
+fn compare_lane(elem_type: u8, cmp_op: i32, lhs_bits: i64, rhs_bits: i64) -> bool {
+    match elem_type {
+        ELEM_FLOAT => {
+            let lhs = f32::from_bits(lhs_bits as u32);
+            let rhs = f32::from_bits(rhs_bits as u32);
+            match cmp_op {
+                CMP_EQ => lhs == rhs,
+                CMP_NE => lhs != rhs,
+                CMP_LT => lhs < rhs,
+                CMP_LE => lhs <= rhs,
+                CMP_GT => lhs > rhs,
+                CMP_GE => lhs >= rhs,
+                _ => false,
+            }
+        }
+        ELEM_DOUBLE => {
+            let lhs = f64::from_bits(lhs_bits as u64);
+            let rhs = f64::from_bits(rhs_bits as u64);
+            match cmp_op {
+                CMP_EQ => lhs == rhs,
+                CMP_NE => lhs != rhs,
+                CMP_LT => lhs < rhs,
+                CMP_LE => lhs <= rhs,
+                CMP_GT => lhs > rhs,
+                CMP_GE => lhs >= rhs,
+                _ => false,
+            }
+        }
+        _ => {
+            let lhs = integral_lane_value(elem_type, lhs_bits);
+            let rhs = integral_lane_value(elem_type, rhs_bits);
+            match cmp_op {
+                CMP_EQ => lhs == rhs,
+                CMP_NE => lhs != rhs,
+                CMP_LT => lhs < rhs,
+                CMP_LE => lhs <= rhs,
+                CMP_GT => lhs > rhs,
+                CMP_GE => lhs >= rhs,
+                _ => false,
+            }
+        }
+    }
+}
+
+fn vector_compare_result(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+    elem_type: u8,
+) -> MethodCallResult {
+    let this = obj_arg(args, 0)?;
+    let cmp_op = int_arg(args, 1);
+    let other = obj_arg(args, 2)?;
+    let (_, lc, lhs, _) = read_vector_lanes(ctx, this);
+    let (_, _, rhs, _) = read_vector_lanes(ctx, other);
+    let mask_lanes = (0..normalized_lane_count(lc))
+        .map(|i| {
+            compare_lane(
+                elem_type,
+                cmp_op,
+                lhs.get(i).copied().unwrap_or(0),
+                rhs.get(i).copied().unwrap_or(0),
+            )
+        })
+        .collect::<Vec<_>>();
+    let mask = alloc_mask_from_lanes(ctx, lc, &mask_lanes);
+    Ok(Some(Value::Object(Some(mask))))
+}
+
+fn vector_blend(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+    class_name: &str,
+    elem_type: u8,
+) -> MethodCallResult {
+    let this = obj_arg(args, 0)?;
+    let other = obj_arg(args, 1)?;
+    let mask = obj_arg(args, 2)?;
+    let (si, lc, lhs, c1) = read_vector_lanes(ctx, this);
+    let (_, _, rhs, c2) = read_vector_lanes(ctx, other);
+    let mask = mask_lane_values(ctx, mask, normalized_lane_count(lc));
+    let lanes = (0..normalized_lane_count(lc))
+        .map(|i| {
+            if mask.get(i).copied().unwrap_or(false) {
+                rhs.get(i).copied().unwrap_or(0)
+            } else {
+                lhs.get(i).copied().unwrap_or(0)
+            }
+        })
+        .collect::<Vec<_>>();
+    let obj = alloc_vector_lanes(ctx, class_name, si, lc, &lanes, c1 + c2 + 1);
+    let _ = elem_type;
+    Ok(Some(Value::Object(Some(obj))))
+}
+
+fn shuffle_lane_source(
+    ctx: &mut dyn NativeContext,
+    shuffle: ObjectRef,
+    index: usize,
+    lane_count: usize,
+) -> usize {
+    let pattern = match ctx.get_field(shuffle, 1) {
+        Value::Int(n) => n,
+        _ => 0,
+    };
+    match pattern {
+        1 => lane_count.saturating_sub(1).saturating_sub(index),
+        2 => 0,
+        _ => index,
+    }
+}
+
+fn vector_rearrange(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+    class_name: &str,
+) -> MethodCallResult {
+    let this = obj_arg(args, 0)?;
+    let shuffle = obj_arg(args, 1)?;
+    let (si, lc, src, c) = read_vector_lanes(ctx, this);
+    let lane_count = normalized_lane_count(lc);
+    let lanes = (0..lane_count)
+        .map(|i| {
+            src.get(shuffle_lane_source(ctx, shuffle, i, lane_count))
+                .copied()
+                .unwrap_or(0)
+        })
+        .collect::<Vec<_>>();
+    let obj = alloc_vector_lanes(ctx, class_name, si, lc, &lanes, c + 1);
+    Ok(Some(Value::Object(Some(obj))))
+}
+
+fn vector_fma(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+    class_name: &str,
+    elem_type: u8,
+) -> MethodCallResult {
+    let this = obj_arg(args, 0)?;
+    let b = obj_arg(args, 1)?;
+    let c_vec = obj_arg(args, 2)?;
+    let (si, lc, a_lanes, c1) = read_vector_lanes(ctx, this);
+    let (_, _, b_lanes, c2) = read_vector_lanes(ctx, b);
+    let (_, _, c_lanes, c3) = read_vector_lanes(ctx, c_vec);
+    let lane_count = normalized_lane_count(lc);
+    let lanes = (0..lane_count)
+        .map(|i| match elem_type {
+            ELEM_DOUBLE => {
+                let a = f64::from_bits(a_lanes.get(i).copied().unwrap_or(0) as u64);
+                let b = f64::from_bits(b_lanes.get(i).copied().unwrap_or(0) as u64);
+                let c = f64::from_bits(c_lanes.get(i).copied().unwrap_or(0) as u64);
+                a.mul_add(b, c).to_bits() as i64
+            }
+            _ => {
+                let a = f32::from_bits(a_lanes.get(i).copied().unwrap_or(0) as u32);
+                let b = f32::from_bits(b_lanes.get(i).copied().unwrap_or(0) as u32);
+                let c = f32::from_bits(c_lanes.get(i).copied().unwrap_or(0) as u32);
+                a.mul_add(b, c).to_bits() as i64
+            }
+        })
+        .collect::<Vec<_>>();
+    let obj = alloc_vector_lanes(ctx, class_name, si, lc, &lanes, c1 + c2 + c3 + 1);
+    Ok(Some(Value::Object(Some(obj))))
 }
 
 // ---------------------------------------------------------------------------
@@ -312,59 +983,19 @@ fn vs_element_size(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRes
 const IV: &str = "jdk/incubator/vector/IntVector";
 
 fn iv_zero(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    let si = species_idx_from_arg(ctx, args);
-    let lc = lane_count_from_species(si);
-    let obj = alloc_vector(ctx, IV, si, lc, 0, 0);
-    Ok(Some(Value::Object(Some(obj))))
+    vector_zero(ctx, args, IV)
 }
 
 fn iv_broadcast(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    let si = species_idx_from_arg(ctx, args);
-    let lc = lane_count_from_species(si);
-    let val = match args.get(1) {
-        Some(Value::Int(n)) => *n,
-        _ => 0,
-    };
-    let hash = val.wrapping_mul(lc);
-    let obj = alloc_vector(ctx, IV, si, lc, hash, 1);
-    Ok(Some(Value::Object(Some(obj))))
+    vector_broadcast(ctx, args, IV, ELEM_INT)
 }
 
 fn iv_from_array(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    let si = species_idx_from_arg(ctx, args);
-    let lc = lane_count_from_species(si);
-    let offset = match args.get(2) {
-        Some(Value::Int(n)) => *n,
-        _ => 0,
-    };
-    let hash = offset.wrapping_mul(31).wrapping_add(lc);
-    let obj = alloc_vector(ctx, IV, si, lc, hash, 1);
-    Ok(Some(Value::Object(Some(obj))))
+    vector_from_array(ctx, args, IV, ELEM_INT)
 }
 
 fn iv_binary_op(ctx: &mut dyn NativeContext, args: &[Value], op_code: i32) -> MethodCallResult {
-    let this = obj_arg(args, 0)?;
-    let other = obj_arg(args, 1)?;
-    let (si, lc, h1, c1) = read_vector_fields(ctx, this);
-    let (_, _, h2, c2) = read_vector_fields(ctx, other);
-    let new_hash = match op_code {
-        OP_ADD => h1.wrapping_add(h2),
-        OP_SUB => h1.wrapping_sub(h2),
-        OP_MUL => h1.wrapping_mul(h2.max(1)),
-        OP_DIV => {
-            if h2 != 0 {
-                h1.wrapping_div(h2)
-            } else {
-                h1
-            }
-        }
-        OP_AND => h1 & h2,
-        OP_OR => h1 | h2,
-        OP_XOR => h1 ^ h2,
-        _ => h1.wrapping_add(h2),
-    };
-    let obj = alloc_vector(ctx, IV, si, lc, new_hash, c1 + c2 + 1);
-    Ok(Some(Value::Object(Some(obj))))
+    vector_binary_op(ctx, args, IV, ELEM_INT, op_code)
 }
 
 fn iv_add(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
@@ -396,140 +1027,39 @@ fn iv_xor(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
 }
 
 fn iv_neg(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    let this = obj_arg(args, 0)?;
-    let (si, lc, h, c) = read_vector_fields(ctx, this);
-    let obj = alloc_vector(ctx, IV, si, lc, h.wrapping_neg(), c + 1);
-    Ok(Some(Value::Object(Some(obj))))
+    vector_unary_op(ctx, args, IV, ELEM_INT, OP_NEG)
 }
 
 fn iv_abs(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    let this = obj_arg(args, 0)?;
-    let (si, lc, h, c) = read_vector_fields(ctx, this);
-    let obj = alloc_vector(ctx, IV, si, lc, h.wrapping_abs(), c + 1);
-    Ok(Some(Value::Object(Some(obj))))
+    vector_unary_op(ctx, args, IV, ELEM_INT, OP_ABS)
 }
 
 fn iv_lanewise_unary(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    let this = obj_arg(args, 0)?;
-    let op = match args.get(1) {
-        Some(Value::Int(n)) => *n,
-        _ => 0,
-    };
-    let (si, lc, h, c) = read_vector_fields(ctx, this);
-    let new_hash = match op {
-        OP_NEG => h.wrapping_neg(),
-        OP_ABS => h.wrapping_abs(),
-        OP_NOT => !h,
-        _ => h,
-    };
-    let obj = alloc_vector(ctx, IV, si, lc, new_hash, c + 1);
-    Ok(Some(Value::Object(Some(obj))))
+    vector_lanewise_unary(ctx, args, IV, ELEM_INT)
 }
 
 fn iv_lanewise_binary(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    let this = obj_arg(args, 0)?;
-    let op = match args.get(1) {
-        Some(Value::Int(n)) => *n,
-        _ => 0,
-    };
-    let other = obj_arg(args, 2)?;
-    let (si, lc, h1, c1) = read_vector_fields(ctx, this);
-    let (_, _, h2, c2) = read_vector_fields(ctx, other);
-    let new_hash = match op {
-        OP_ADD => h1.wrapping_add(h2),
-        OP_SUB => h1.wrapping_sub(h2),
-        OP_MUL => h1.wrapping_mul(h2.max(1)),
-        OP_DIV => {
-            if h2 != 0 {
-                h1.wrapping_div(h2)
-            } else {
-                h1
-            }
-        }
-        OP_AND => h1 & h2,
-        OP_OR => h1 | h2,
-        OP_XOR => h1 ^ h2,
-        OP_MIN => h1.min(h2),
-        OP_MAX => h1.max(h2),
-        _ => h1,
-    };
-    let obj = alloc_vector(ctx, IV, si, lc, new_hash, c1 + c2 + 1);
-    Ok(Some(Value::Object(Some(obj))))
+    vector_lanewise_binary(ctx, args, IV, ELEM_INT)
 }
 
 fn iv_reduce_lanes(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    let this = obj_arg(args, 0)?;
-    let op = match args.get(1) {
-        Some(Value::Int(n)) => *n,
-        _ => 0,
-    };
-    let (_, lc, h, _) = read_vector_fields(ctx, this);
-    let result = match op {
-        RED_ADD => h.wrapping_mul(lc),
-        RED_MUL => {
-            let mut r = 1i32;
-            for _ in 0..lc.min(8) {
-                r = r.wrapping_mul(h.max(1));
-            }
-            r
-        }
-        RED_MIN => h,
-        RED_MAX => h,
-        RED_AND => h,
-        RED_OR => h,
-        RED_XOR => {
-            if lc % 2 == 0 {
-                0
-            } else {
-                h
-            }
-        }
-        _ => h,
-    };
-    Ok(Some(Value::Int(result)))
+    vector_reduce(ctx, args, ELEM_INT)
 }
 
 fn iv_lane(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    let this = obj_arg(args, 0)?;
-    let _idx = match args.get(1) {
-        Some(Value::Int(n)) => *n,
-        _ => 0,
-    };
-    let (_, _, h, _) = read_vector_fields(ctx, this);
-    Ok(Some(Value::Int(h))) // simplified: all lanes have same hash value
+    vector_lane(ctx, args, ELEM_INT)
 }
 
 fn iv_with_lane(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    let this = obj_arg(args, 0)?;
-    let _idx = match args.get(1) {
-        Some(Value::Int(n)) => *n,
-        _ => 0,
-    };
-    let val = match args.get(2) {
-        Some(Value::Int(n)) => *n,
-        _ => 0,
-    };
-    let (si, lc, _h, c) = read_vector_fields(ctx, this);
-    let obj = alloc_vector(ctx, IV, si, lc, val, c + 1);
-    Ok(Some(Value::Object(Some(obj))))
+    vector_with_lane(ctx, args, IV, ELEM_INT)
 }
 
 fn iv_to_array(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    let this = obj_arg(args, 0)?;
-    let (_, lc, hash, _) = read_vector_fields(ctx, this);
-    // Return an int[] filled with the vector's hash-derived lane values.
-    // In a full SIMD impl each lane would be stored separately; here we
-    // replicate the summary hash across lanes for consistency.
-    let lane_count = (lc as usize).max(1);
-    let arr = ctx.new_array(cratonvm_types::ArrayElementType::Int, lane_count);
-    for i in 0..lane_count {
-        ctx.set_array_element(arr, i, Value::Int(hash.wrapping_add(i as i32)));
-    }
-    Ok(Some(Value::Object(Some(arr))))
+    vector_to_array(ctx, args, ELEM_INT)
 }
 
-fn iv_into_array(_ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
-    Ok(None) // void
+fn iv_into_array(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    vector_into_array(ctx, args, ELEM_INT)
 }
 
 fn iv_species(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
@@ -546,45 +1076,37 @@ fn iv_length(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
 
 fn iv_reinterpret_as_longs(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = obj_arg(args, 0)?;
-    let (si, lc, hash, count) = read_vector_fields(ctx, this);
-    // Reinterpret as longs: halve the lane count (2 ints = 1 long).
-    let long_lanes = (lc / 2).max(1);
-    let obj = alloc_vector(ctx, IV, si, long_lanes, hash, count);
+    let (si, lc, lanes, count) = read_vector_lanes(ctx, this);
+    let long_si = match si {
+        0 => 4,
+        1 => 5,
+        2 => 6,
+        3 => 7,
+        _ => 6,
+    };
+    let long_lc = (lc / 2).max(1);
+    let long_lanes = lanes
+        .chunks(2)
+        .map(|chunk| {
+            let lo = chunk.get(0).copied().unwrap_or(0) as u32 as u64;
+            let hi = chunk.get(1).copied().unwrap_or(0) as u32 as u64;
+            ((hi << 32) | lo) as i64
+        })
+        .collect::<Vec<_>>();
+    let obj = alloc_vector_lanes(ctx, LV, long_si, long_lc, &long_lanes, count);
     Ok(Some(Value::Object(Some(obj))))
 }
 
 fn iv_blend(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    let this = obj_arg(args, 0)?;
-    let other = obj_arg(args, 1)?;
-    // mask is args[2]
-    let (si, lc, h1, c1) = read_vector_fields(ctx, this);
-    let (_, _, h2, c2) = read_vector_fields(ctx, other);
-    // blend: mix hashes
-    let new_hash = (h1 & 0xFFFF0000u32 as i32) | (h2 & 0x0000FFFFu32 as i32);
-    let obj = alloc_vector(ctx, IV, si, lc, new_hash, c1 + c2 + 1);
-    Ok(Some(Value::Object(Some(obj))))
+    vector_blend(ctx, args, IV, ELEM_INT)
 }
 
 fn iv_rearrange(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    let this = obj_arg(args, 0)?;
-    let (si, lc, h, c) = read_vector_fields(ctx, this);
-    // shuffle just transforms data_hash
-    let obj = alloc_vector(ctx, IV, si, lc, h.rotate_left(1), c + 1);
-    Ok(Some(Value::Object(Some(obj))))
+    vector_rearrange(ctx, args, IV)
 }
 
 fn iv_compare(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    let this = obj_arg(args, 0)?;
-    let _cmp_op = match args.get(1) {
-        Some(Value::Int(n)) => *n,
-        _ => CMP_EQ,
-    };
-    let other = obj_arg(args, 2)?;
-    let (_, lc, h1, _) = read_vector_fields(ctx, this);
-    let (_, _, h2, _) = read_vector_fields(ctx, other);
-    let true_count = if h1 == h2 { lc } else { 0 };
-    let mask = alloc_mask(ctx, lc, true_count);
-    Ok(Some(Value::Object(Some(mask))))
+    vector_compare_result(ctx, args, ELEM_INT)
 }
 
 // ---------------------------------------------------------------------------
@@ -593,35 +1115,15 @@ fn iv_compare(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
 const LV: &str = "jdk/incubator/vector/LongVector";
 
 fn lv_zero(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    let si = species_idx_from_arg(ctx, args);
-    let lc = lane_count_from_species(si);
-    let obj = alloc_vector(ctx, LV, si, lc, 0, 0);
-    Ok(Some(Value::Object(Some(obj))))
+    vector_zero(ctx, args, LV)
 }
 
 fn lv_broadcast(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    let si = species_idx_from_arg(ctx, args);
-    let lc = lane_count_from_species(si);
-    let val = match args.get(1) {
-        Some(Value::Long(n)) => *n as i32,
-        Some(Value::Int(n)) => *n,
-        _ => 0,
-    };
-    let hash = val.wrapping_mul(lc);
-    let obj = alloc_vector(ctx, LV, si, lc, hash, 1);
-    Ok(Some(Value::Object(Some(obj))))
+    vector_broadcast(ctx, args, LV, ELEM_LONG)
 }
 
 fn lv_from_array(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    let si = species_idx_from_arg(ctx, args);
-    let lc = lane_count_from_species(si);
-    let offset = match args.get(2) {
-        Some(Value::Int(n)) => *n,
-        _ => 0,
-    };
-    let hash = offset.wrapping_mul(31).wrapping_add(lc);
-    let obj = alloc_vector(ctx, LV, si, lc, hash, 1);
-    Ok(Some(Value::Object(Some(obj))))
+    vector_from_array(ctx, args, LV, ELEM_LONG)
 }
 
 fn lv_add(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
@@ -649,85 +1151,27 @@ fn lv_xor(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
 }
 
 fn lv_binary_op(ctx: &mut dyn NativeContext, args: &[Value], op_code: i32) -> MethodCallResult {
-    let this = obj_arg(args, 0)?;
-    let other = obj_arg(args, 1)?;
-    let (si, lc, h1, c1) = read_vector_fields(ctx, this);
-    let (_, _, h2, c2) = read_vector_fields(ctx, other);
-    let new_hash = match op_code {
-        OP_ADD => h1.wrapping_add(h2),
-        OP_SUB => h1.wrapping_sub(h2),
-        OP_MUL => h1.wrapping_mul(h2.max(1)),
-        OP_AND => h1 & h2,
-        OP_OR => h1 | h2,
-        OP_XOR => h1 ^ h2,
-        _ => h1.wrapping_add(h2),
-    };
-    let obj = alloc_vector(ctx, LV, si, lc, new_hash, c1 + c2 + 1);
-    Ok(Some(Value::Object(Some(obj))))
+    vector_binary_op(ctx, args, LV, ELEM_LONG, op_code)
 }
 
 fn lv_neg(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    let this = obj_arg(args, 0)?;
-    let (si, lc, h, c) = read_vector_fields(ctx, this);
-    let obj = alloc_vector(ctx, LV, si, lc, h.wrapping_neg(), c + 1);
-    Ok(Some(Value::Object(Some(obj))))
+    vector_unary_op(ctx, args, LV, ELEM_LONG, OP_NEG)
 }
 
 fn lv_abs(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    let this = obj_arg(args, 0)?;
-    let (si, lc, h, c) = read_vector_fields(ctx, this);
-    let obj = alloc_vector(ctx, LV, si, lc, h.wrapping_abs(), c + 1);
-    Ok(Some(Value::Object(Some(obj))))
+    vector_unary_op(ctx, args, LV, ELEM_LONG, OP_ABS)
 }
 
 fn lv_reduce_lanes(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    let this = obj_arg(args, 0)?;
-    let op = match args.get(1) {
-        Some(Value::Int(n)) => *n,
-        _ => 0,
-    };
-    let (_, lc, h, _) = read_vector_fields(ctx, this);
-    let result = match op {
-        RED_ADD => (h as i64).wrapping_mul(lc as i64),
-        RED_MUL => {
-            let mut r = 1i64;
-            for _ in 0..lc.min(8) {
-                r = r.wrapping_mul((h as i64).max(1));
-            }
-            r
-        }
-        RED_MIN => h as i64,
-        RED_MAX => h as i64,
-        RED_AND => h as i64,
-        RED_OR => h as i64,
-        RED_XOR => {
-            if lc % 2 == 0 {
-                0
-            } else {
-                h as i64
-            }
-        }
-        _ => h as i64,
-    };
-    Ok(Some(Value::Long(result)))
+    vector_reduce(ctx, args, ELEM_LONG)
 }
 
 fn lv_lane(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    let this = obj_arg(args, 0)?;
-    let (_, _, h, _) = read_vector_fields(ctx, this);
-    Ok(Some(Value::Long(h as i64)))
+    vector_lane(ctx, args, ELEM_LONG)
 }
 
 fn lv_with_lane(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    let this = obj_arg(args, 0)?;
-    let val = match args.get(2) {
-        Some(Value::Long(n)) => *n as i32,
-        Some(Value::Int(n)) => *n,
-        _ => 0,
-    };
-    let (si, lc, _, c) = read_vector_fields(ctx, this);
-    let obj = alloc_vector(ctx, LV, si, lc, val, c + 1);
-    Ok(Some(Value::Object(Some(obj))))
+    vector_with_lane(ctx, args, LV, ELEM_LONG)
 }
 
 fn lv_length(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
@@ -748,59 +1192,19 @@ fn lv_species(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
 const FV: &str = "jdk/incubator/vector/FloatVector";
 
 fn fv_zero(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    let si = species_idx_from_arg(ctx, args);
-    let lc = lane_count_from_species(si);
-    let obj = alloc_vector(ctx, FV, si, lc, 0, 0);
-    Ok(Some(Value::Object(Some(obj))))
+    vector_zero(ctx, args, FV)
 }
 
 fn fv_broadcast(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    let si = species_idx_from_arg(ctx, args);
-    let lc = lane_count_from_species(si);
-    let val = match args.get(1) {
-        Some(Value::Float(f)) => f.to_bits() as i32,
-        Some(Value::Int(n)) => *n,
-        _ => 0,
-    };
-    let hash = val.wrapping_mul(lc);
-    let obj = alloc_vector(ctx, FV, si, lc, hash, 1);
-    Ok(Some(Value::Object(Some(obj))))
+    vector_broadcast(ctx, args, FV, ELEM_FLOAT)
 }
 
 fn fv_from_array(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    let si = species_idx_from_arg(ctx, args);
-    let lc = lane_count_from_species(si);
-    let offset = match args.get(2) {
-        Some(Value::Int(n)) => *n,
-        _ => 0,
-    };
-    let hash = offset.wrapping_mul(31).wrapping_add(lc);
-    let obj = alloc_vector(ctx, FV, si, lc, hash, 1);
-    Ok(Some(Value::Object(Some(obj))))
+    vector_from_array(ctx, args, FV, ELEM_FLOAT)
 }
 
 fn fv_binary_op(ctx: &mut dyn NativeContext, args: &[Value], op_code: i32) -> MethodCallResult {
-    let this = obj_arg(args, 0)?;
-    let other = obj_arg(args, 1)?;
-    let (si, lc, h1, c1) = read_vector_fields(ctx, this);
-    let (_, _, h2, c2) = read_vector_fields(ctx, other);
-    let new_hash = match op_code {
-        OP_ADD => h1.wrapping_add(h2),
-        OP_SUB => h1.wrapping_sub(h2),
-        OP_MUL => h1.wrapping_mul(h2.max(1)),
-        OP_DIV => {
-            if h2 != 0 {
-                h1.wrapping_div(h2)
-            } else {
-                h1
-            }
-        }
-        OP_MIN => h1.min(h2),
-        OP_MAX => h1.max(h2),
-        _ => h1.wrapping_add(h2),
-    };
-    let obj = alloc_vector(ctx, FV, si, lc, new_hash, c1 + c2 + 1);
-    Ok(Some(Value::Object(Some(obj))))
+    vector_binary_op(ctx, args, FV, ELEM_FLOAT, op_code)
 }
 
 fn fv_add(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
@@ -828,79 +1232,31 @@ fn fv_max(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
 }
 
 fn fv_neg(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    let this = obj_arg(args, 0)?;
-    let (si, lc, h, c) = read_vector_fields(ctx, this);
-    let obj = alloc_vector(ctx, FV, si, lc, h.wrapping_neg(), c + 1);
-    Ok(Some(Value::Object(Some(obj))))
+    vector_unary_op(ctx, args, FV, ELEM_FLOAT, OP_NEG)
 }
 
 fn fv_abs(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    let this = obj_arg(args, 0)?;
-    let (si, lc, h, c) = read_vector_fields(ctx, this);
-    let obj = alloc_vector(ctx, FV, si, lc, h.wrapping_abs(), c + 1);
-    Ok(Some(Value::Object(Some(obj))))
+    vector_unary_op(ctx, args, FV, ELEM_FLOAT, OP_ABS)
 }
 
 fn fv_sqrt(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    let this = obj_arg(args, 0)?;
-    let (si, lc, h, c) = read_vector_fields(ctx, this);
-    let approx = (h.unsigned_abs() as f64).sqrt() as i32;
-    let obj = alloc_vector(ctx, FV, si, lc, approx, c + 1);
-    Ok(Some(Value::Object(Some(obj))))
+    vector_unary_op(ctx, args, FV, ELEM_FLOAT, OP_SQRT)
 }
 
 fn fv_fma(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    let this = obj_arg(args, 0)?;
-    let b = obj_arg(args, 1)?;
-    let c_vec = obj_arg(args, 2)?;
-    let (si, lc, h1, c1) = read_vector_fields(ctx, this);
-    let (_, _, h2, c2) = read_vector_fields(ctx, b);
-    let (_, _, h3, c3) = read_vector_fields(ctx, c_vec);
-    let new_hash = h1.wrapping_mul(h2.max(1)).wrapping_add(h3);
-    let obj = alloc_vector(ctx, FV, si, lc, new_hash, c1 + c2 + c3 + 1);
-    Ok(Some(Value::Object(Some(obj))))
+    vector_fma(ctx, args, FV, ELEM_FLOAT)
 }
 
 fn fv_reduce_lanes(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    let this = obj_arg(args, 0)?;
-    let op = match args.get(1) {
-        Some(Value::Int(n)) => *n,
-        _ => 0,
-    };
-    let (_, lc, h, _) = read_vector_fields(ctx, this);
-    let fval = f32::from_bits(h as u32);
-    let result = match op {
-        RED_ADD => fval * (lc as f32),
-        RED_MUL => {
-            let mut r = 1.0f32;
-            for _ in 0..lc.min(8) {
-                r *= fval;
-            }
-            r
-        }
-        RED_MIN => fval,
-        RED_MAX => fval,
-        _ => fval,
-    };
-    Ok(Some(Value::Float(result)))
+    vector_reduce(ctx, args, ELEM_FLOAT)
 }
 
 fn fv_lane(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    let this = obj_arg(args, 0)?;
-    let (_, _, h, _) = read_vector_fields(ctx, this);
-    Ok(Some(Value::Float(f32::from_bits(h as u32))))
+    vector_lane(ctx, args, ELEM_FLOAT)
 }
 
 fn fv_with_lane(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    let this = obj_arg(args, 0)?;
-    let val = match args.get(2) {
-        Some(Value::Float(f)) => f.to_bits() as i32,
-        Some(Value::Int(n)) => *n,
-        _ => 0,
-    };
-    let (si, lc, _, c) = read_vector_fields(ctx, this);
-    let obj = alloc_vector(ctx, FV, si, lc, val, c + 1);
-    Ok(Some(Value::Object(Some(obj))))
+    vector_with_lane(ctx, args, FV, ELEM_FLOAT)
 }
 
 fn fv_length(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
@@ -921,59 +1277,19 @@ fn fv_species(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
 const DV: &str = "jdk/incubator/vector/DoubleVector";
 
 fn dv_zero(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    let si = species_idx_from_arg(ctx, args);
-    let lc = lane_count_from_species(si);
-    let obj = alloc_vector(ctx, DV, si, lc, 0, 0);
-    Ok(Some(Value::Object(Some(obj))))
+    vector_zero(ctx, args, DV)
 }
 
 fn dv_broadcast(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    let si = species_idx_from_arg(ctx, args);
-    let lc = lane_count_from_species(si);
-    let val = match args.get(1) {
-        Some(Value::Double(f)) => (*f).to_bits() as i32,
-        Some(Value::Int(n)) => *n,
-        _ => 0,
-    };
-    let hash = val.wrapping_mul(lc);
-    let obj = alloc_vector(ctx, DV, si, lc, hash, 1);
-    Ok(Some(Value::Object(Some(obj))))
+    vector_broadcast(ctx, args, DV, ELEM_DOUBLE)
 }
 
 fn dv_from_array(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    let si = species_idx_from_arg(ctx, args);
-    let lc = lane_count_from_species(si);
-    let offset = match args.get(2) {
-        Some(Value::Int(n)) => *n,
-        _ => 0,
-    };
-    let hash = offset.wrapping_mul(31).wrapping_add(lc);
-    let obj = alloc_vector(ctx, DV, si, lc, hash, 1);
-    Ok(Some(Value::Object(Some(obj))))
+    vector_from_array(ctx, args, DV, ELEM_DOUBLE)
 }
 
 fn dv_binary_op(ctx: &mut dyn NativeContext, args: &[Value], op_code: i32) -> MethodCallResult {
-    let this = obj_arg(args, 0)?;
-    let other = obj_arg(args, 1)?;
-    let (si, lc, h1, c1) = read_vector_fields(ctx, this);
-    let (_, _, h2, c2) = read_vector_fields(ctx, other);
-    let new_hash = match op_code {
-        OP_ADD => h1.wrapping_add(h2),
-        OP_SUB => h1.wrapping_sub(h2),
-        OP_MUL => h1.wrapping_mul(h2.max(1)),
-        OP_DIV => {
-            if h2 != 0 {
-                h1.wrapping_div(h2)
-            } else {
-                h1
-            }
-        }
-        OP_MIN => h1.min(h2),
-        OP_MAX => h1.max(h2),
-        _ => h1.wrapping_add(h2),
-    };
-    let obj = alloc_vector(ctx, DV, si, lc, new_hash, c1 + c2 + 1);
-    Ok(Some(Value::Object(Some(obj))))
+    vector_binary_op(ctx, args, DV, ELEM_DOUBLE, op_code)
 }
 
 fn dv_add(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
@@ -1001,79 +1317,31 @@ fn dv_max(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
 }
 
 fn dv_neg(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    let this = obj_arg(args, 0)?;
-    let (si, lc, h, c) = read_vector_fields(ctx, this);
-    let obj = alloc_vector(ctx, DV, si, lc, h.wrapping_neg(), c + 1);
-    Ok(Some(Value::Object(Some(obj))))
+    vector_unary_op(ctx, args, DV, ELEM_DOUBLE, OP_NEG)
 }
 
 fn dv_abs(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    let this = obj_arg(args, 0)?;
-    let (si, lc, h, c) = read_vector_fields(ctx, this);
-    let obj = alloc_vector(ctx, DV, si, lc, h.wrapping_abs(), c + 1);
-    Ok(Some(Value::Object(Some(obj))))
+    vector_unary_op(ctx, args, DV, ELEM_DOUBLE, OP_ABS)
 }
 
 fn dv_sqrt(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    let this = obj_arg(args, 0)?;
-    let (si, lc, h, c) = read_vector_fields(ctx, this);
-    let approx = (h.unsigned_abs() as f64).sqrt() as i32;
-    let obj = alloc_vector(ctx, DV, si, lc, approx, c + 1);
-    Ok(Some(Value::Object(Some(obj))))
+    vector_unary_op(ctx, args, DV, ELEM_DOUBLE, OP_SQRT)
 }
 
 fn dv_fma(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    let this = obj_arg(args, 0)?;
-    let b = obj_arg(args, 1)?;
-    let c_vec = obj_arg(args, 2)?;
-    let (si, lc, h1, c1) = read_vector_fields(ctx, this);
-    let (_, _, h2, c2) = read_vector_fields(ctx, b);
-    let (_, _, h3, c3) = read_vector_fields(ctx, c_vec);
-    let new_hash = h1.wrapping_mul(h2.max(1)).wrapping_add(h3);
-    let obj = alloc_vector(ctx, DV, si, lc, new_hash, c1 + c2 + c3 + 1);
-    Ok(Some(Value::Object(Some(obj))))
+    vector_fma(ctx, args, DV, ELEM_DOUBLE)
 }
 
 fn dv_reduce_lanes(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    let this = obj_arg(args, 0)?;
-    let op = match args.get(1) {
-        Some(Value::Int(n)) => *n,
-        _ => 0,
-    };
-    let (_, lc, h, _) = read_vector_fields(ctx, this);
-    let dval = f64::from_bits(h as u32 as u64);
-    let result = match op {
-        RED_ADD => dval * (lc as f64),
-        RED_MUL => {
-            let mut r = 1.0f64;
-            for _ in 0..lc.min(8) {
-                r *= dval;
-            }
-            r
-        }
-        RED_MIN => dval,
-        RED_MAX => dval,
-        _ => dval,
-    };
-    Ok(Some(Value::Double(result)))
+    vector_reduce(ctx, args, ELEM_DOUBLE)
 }
 
 fn dv_lane(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    let this = obj_arg(args, 0)?;
-    let (_, _, h, _) = read_vector_fields(ctx, this);
-    Ok(Some(Value::Double(f64::from_bits(h as u32 as u64))))
+    vector_lane(ctx, args, ELEM_DOUBLE)
 }
 
 fn dv_with_lane(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    let this = obj_arg(args, 0)?;
-    let val = match args.get(2) {
-        Some(Value::Double(f)) => f.to_bits() as i32,
-        Some(Value::Int(n)) => *n,
-        _ => 0,
-    };
-    let (si, lc, _, c) = read_vector_fields(ctx, this);
-    let obj = alloc_vector(ctx, DV, si, lc, val, c + 1);
-    Ok(Some(Value::Object(Some(obj))))
+    vector_with_lane(ctx, args, DV, ELEM_DOUBLE)
 }
 
 fn dv_length(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
@@ -1094,52 +1362,19 @@ fn dv_species(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
 const BV: &str = "jdk/incubator/vector/ByteVector";
 
 fn bv_zero(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    let si = species_idx_from_arg(ctx, args);
-    let lc = lane_count_from_species(si);
-    let obj = alloc_vector(ctx, BV, si, lc, 0, 0);
-    Ok(Some(Value::Object(Some(obj))))
+    vector_zero(ctx, args, BV)
 }
 
 fn bv_broadcast(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    let si = species_idx_from_arg(ctx, args);
-    let lc = lane_count_from_species(si);
-    let val = match args.get(1) {
-        Some(Value::Int(n)) => *n,
-        _ => 0,
-    };
-    let hash = val.wrapping_mul(lc);
-    let obj = alloc_vector(ctx, BV, si, lc, hash, 1);
-    Ok(Some(Value::Object(Some(obj))))
+    vector_broadcast(ctx, args, BV, ELEM_BYTE)
 }
 
 fn bv_from_array(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    let si = species_idx_from_arg(ctx, args);
-    let lc = lane_count_from_species(si);
-    let offset = match args.get(2) {
-        Some(Value::Int(n)) => *n,
-        _ => 0,
-    };
-    let hash = offset.wrapping_mul(31).wrapping_add(lc);
-    let obj = alloc_vector(ctx, BV, si, lc, hash, 1);
-    Ok(Some(Value::Object(Some(obj))))
+    vector_from_array(ctx, args, BV, ELEM_BYTE)
 }
 
 fn bv_binary_op(ctx: &mut dyn NativeContext, args: &[Value], op_code: i32) -> MethodCallResult {
-    let this = obj_arg(args, 0)?;
-    let other = obj_arg(args, 1)?;
-    let (si, lc, h1, c1) = read_vector_fields(ctx, this);
-    let (_, _, h2, c2) = read_vector_fields(ctx, other);
-    let new_hash = match op_code {
-        OP_ADD => h1.wrapping_add(h2),
-        OP_SUB => h1.wrapping_sub(h2),
-        OP_MUL => h1.wrapping_mul(h2.max(1)),
-        OP_AND => h1 & h2,
-        OP_OR => h1 | h2,
-        OP_XOR => h1 ^ h2,
-        _ => h1.wrapping_add(h2),
-    };
-    let obj = alloc_vector(ctx, BV, si, lc, new_hash, c1 + c2 + 1);
-    Ok(Some(Value::Object(Some(obj))))
+    vector_binary_op(ctx, args, BV, ELEM_BYTE, op_code)
 }
 
 fn bv_add(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
@@ -1167,66 +1402,23 @@ fn bv_xor(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
 }
 
 fn bv_neg(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    let this = obj_arg(args, 0)?;
-    let (si, lc, h, c) = read_vector_fields(ctx, this);
-    let obj = alloc_vector(ctx, BV, si, lc, h.wrapping_neg(), c + 1);
-    Ok(Some(Value::Object(Some(obj))))
+    vector_unary_op(ctx, args, BV, ELEM_BYTE, OP_NEG)
 }
 
 fn bv_abs(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    let this = obj_arg(args, 0)?;
-    let (si, lc, h, c) = read_vector_fields(ctx, this);
-    let obj = alloc_vector(ctx, BV, si, lc, h.wrapping_abs(), c + 1);
-    Ok(Some(Value::Object(Some(obj))))
+    vector_unary_op(ctx, args, BV, ELEM_BYTE, OP_ABS)
 }
 
 fn bv_reduce_lanes(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    let this = obj_arg(args, 0)?;
-    let op = match args.get(1) {
-        Some(Value::Int(n)) => *n,
-        _ => 0,
-    };
-    let (_, lc, h, _) = read_vector_fields(ctx, this);
-    let result = match op {
-        RED_ADD => h.wrapping_mul(lc),
-        RED_MUL => {
-            let mut r = 1i32;
-            for _ in 0..lc.min(8) {
-                r = r.wrapping_mul(h.max(1));
-            }
-            r
-        }
-        RED_MIN => h,
-        RED_MAX => h,
-        RED_AND => h,
-        RED_OR => h,
-        RED_XOR => {
-            if lc % 2 == 0 {
-                0
-            } else {
-                h
-            }
-        }
-        _ => h,
-    };
-    Ok(Some(Value::Int(result)))
+    vector_reduce(ctx, args, ELEM_BYTE)
 }
 
 fn bv_lane(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    let this = obj_arg(args, 0)?;
-    let (_, _, h, _) = read_vector_fields(ctx, this);
-    Ok(Some(Value::Int(h)))
+    vector_lane(ctx, args, ELEM_BYTE)
 }
 
 fn bv_with_lane(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    let this = obj_arg(args, 0)?;
-    let val = match args.get(2) {
-        Some(Value::Int(n)) => *n,
-        _ => 0,
-    };
-    let (si, lc, _, c) = read_vector_fields(ctx, this);
-    let obj = alloc_vector(ctx, BV, si, lc, val, c + 1);
-    Ok(Some(Value::Object(Some(obj))))
+    vector_with_lane(ctx, args, BV, ELEM_BYTE)
 }
 
 fn bv_length(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
@@ -1248,52 +1440,19 @@ const SV_VEC: &str = "jdk/incubator/vector/ShortVector";
 const VECTOR_SUPPORT: &str = "jdk/internal/vm/vector/VectorSupport";
 
 fn sv_vec_zero(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    let si = species_idx_from_arg(ctx, args);
-    let lc = lane_count_from_species(si);
-    let obj = alloc_vector(ctx, SV_VEC, si, lc, 0, 0);
-    Ok(Some(Value::Object(Some(obj))))
+    vector_zero(ctx, args, SV_VEC)
 }
 
 fn sv_vec_broadcast(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    let si = species_idx_from_arg(ctx, args);
-    let lc = lane_count_from_species(si);
-    let val = match args.get(1) {
-        Some(Value::Int(n)) => *n,
-        _ => 0,
-    };
-    let hash = val.wrapping_mul(lc);
-    let obj = alloc_vector(ctx, SV_VEC, si, lc, hash, 1);
-    Ok(Some(Value::Object(Some(obj))))
+    vector_broadcast(ctx, args, SV_VEC, ELEM_SHORT)
 }
 
 fn sv_vec_from_array(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    let si = species_idx_from_arg(ctx, args);
-    let lc = lane_count_from_species(si);
-    let offset = match args.get(2) {
-        Some(Value::Int(n)) => *n,
-        _ => 0,
-    };
-    let hash = offset.wrapping_mul(31).wrapping_add(lc);
-    let obj = alloc_vector(ctx, SV_VEC, si, lc, hash, 1);
-    Ok(Some(Value::Object(Some(obj))))
+    vector_from_array(ctx, args, SV_VEC, ELEM_SHORT)
 }
 
 fn sv_vec_binary_op(ctx: &mut dyn NativeContext, args: &[Value], op_code: i32) -> MethodCallResult {
-    let this = obj_arg(args, 0)?;
-    let other = obj_arg(args, 1)?;
-    let (si, lc, h1, c1) = read_vector_fields(ctx, this);
-    let (_, _, h2, c2) = read_vector_fields(ctx, other);
-    let new_hash = match op_code {
-        OP_ADD => h1.wrapping_add(h2),
-        OP_SUB => h1.wrapping_sub(h2),
-        OP_MUL => h1.wrapping_mul(h2.max(1)),
-        OP_AND => h1 & h2,
-        OP_OR => h1 | h2,
-        OP_XOR => h1 ^ h2,
-        _ => h1.wrapping_add(h2),
-    };
-    let obj = alloc_vector(ctx, SV_VEC, si, lc, new_hash, c1 + c2 + 1);
-    Ok(Some(Value::Object(Some(obj))))
+    vector_binary_op(ctx, args, SV_VEC, ELEM_SHORT, op_code)
 }
 
 fn sv_vec_add(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
@@ -1321,66 +1480,23 @@ fn sv_vec_xor(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
 }
 
 fn sv_vec_neg(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    let this = obj_arg(args, 0)?;
-    let (si, lc, h, c) = read_vector_fields(ctx, this);
-    let obj = alloc_vector(ctx, SV_VEC, si, lc, h.wrapping_neg(), c + 1);
-    Ok(Some(Value::Object(Some(obj))))
+    vector_unary_op(ctx, args, SV_VEC, ELEM_SHORT, OP_NEG)
 }
 
 fn sv_vec_abs(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    let this = obj_arg(args, 0)?;
-    let (si, lc, h, c) = read_vector_fields(ctx, this);
-    let obj = alloc_vector(ctx, SV_VEC, si, lc, h.wrapping_abs(), c + 1);
-    Ok(Some(Value::Object(Some(obj))))
+    vector_unary_op(ctx, args, SV_VEC, ELEM_SHORT, OP_ABS)
 }
 
 fn sv_vec_reduce_lanes(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    let this = obj_arg(args, 0)?;
-    let op = match args.get(1) {
-        Some(Value::Int(n)) => *n,
-        _ => 0,
-    };
-    let (_, lc, h, _) = read_vector_fields(ctx, this);
-    let result = match op {
-        RED_ADD => h.wrapping_mul(lc),
-        RED_MUL => {
-            let mut r = 1i32;
-            for _ in 0..lc.min(8) {
-                r = r.wrapping_mul(h.max(1));
-            }
-            r
-        }
-        RED_MIN => h,
-        RED_MAX => h,
-        RED_AND => h,
-        RED_OR => h,
-        RED_XOR => {
-            if lc % 2 == 0 {
-                0
-            } else {
-                h
-            }
-        }
-        _ => h,
-    };
-    Ok(Some(Value::Int(result)))
+    vector_reduce(ctx, args, ELEM_SHORT)
 }
 
 fn sv_vec_lane(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    let this = obj_arg(args, 0)?;
-    let (_, _, h, _) = read_vector_fields(ctx, this);
-    Ok(Some(Value::Int(h)))
+    vector_lane(ctx, args, ELEM_SHORT)
 }
 
 fn sv_vec_with_lane(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    let this = obj_arg(args, 0)?;
-    let val = match args.get(2) {
-        Some(Value::Int(n)) => *n,
-        _ => 0,
-    };
-    let (si, lc, _, c) = read_vector_fields(ctx, this);
-    let obj = alloc_vector(ctx, SV_VEC, si, lc, val, c + 1);
-    Ok(Some(Value::Object(Some(obj))))
+    vector_with_lane(ctx, args, SV_VEC, ELEM_SHORT)
 }
 
 fn sv_vec_length(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
@@ -1406,7 +1522,7 @@ fn iv_convert_shape(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRe
         Some(Value::Int(n)) => *n,
         _ => 0,
     };
-    let (si, lc, h, c) = read_vector_fields(ctx, this);
+    let (si, lc, lanes, c) = read_vector_lanes(ctx, this);
     // Conversion ops: 0=ZERO_EXTEND, 1=SIGN_EXTEND, 2=NARROW, 3=FLOAT_TO_INT, 4=INT_TO_FLOAT
     let target_class = match conv_op {
         0 | 1 => LV, // widen int -> long
@@ -1414,18 +1530,40 @@ fn iv_convert_shape(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRe
         4 => FV,     // int -> float
         _ => IV,
     };
-    let obj = alloc_vector(ctx, target_class, si, lc, h, c + 1);
+    let converted = match conv_op {
+        0 => lanes
+            .iter()
+            .copied()
+            .map(|lane| lane as u32 as i64)
+            .collect::<Vec<_>>(),
+        4 => lanes
+            .iter()
+            .copied()
+            .map(|lane| (lane as i32 as f32).to_bits() as i64)
+            .collect::<Vec<_>>(),
+        _ => lanes,
+    };
+    let obj = alloc_vector_lanes(ctx, target_class, si, lc, &converted, c + 1);
     Ok(Some(Value::Object(Some(obj))))
 }
 
 /// `IntVector.castShape(Ljdk/incubator/vector/VectorSpecies;I)Ljdk/incubator/vector/Vector;`
 fn iv_cast_shape(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = obj_arg(args, 0)?;
-    let (_, _, h, c) = read_vector_fields(ctx, this);
+    let (_, _, lanes, c) = read_vector_lanes(ctx, this);
     // Cast to target species element type
     let target_si = species_idx_from_arg(ctx, &args[1..]);
     let target_lc = lane_count_from_species(target_si);
-    let obj = alloc_vector(ctx, IV, target_si, target_lc, h, c + 1);
+    let target_elem = get_species_config(target_si as usize).element_type;
+    let target_class = match target_elem {
+        ELEM_LONG => LV,
+        ELEM_FLOAT => FV,
+        ELEM_DOUBLE => DV,
+        ELEM_BYTE => BV,
+        ELEM_SHORT => SV_VEC,
+        _ => IV,
+    };
+    let obj = alloc_vector_lanes(ctx, target_class, target_si, target_lc, &lanes, c + 1);
     Ok(Some(Value::Object(Some(obj))))
 }
 
@@ -1434,12 +1572,62 @@ fn iv_cast_shape(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResul
 // ---------------------------------------------------------------------------
 const VM: &str = "jdk/incubator/vector/VectorMask";
 
-// VectorMask synthetic: [0]=lane_count (Int), [1]=true_count (Int)
+// VectorMask synthetic: [0]=lane_count (Int), [1]=true_count (Int), [2]=lane payload (long[] 0/1)
 fn alloc_mask(ctx: &mut dyn NativeContext, lane_count: i32, true_count: i32) -> ObjectRef {
-    let obj = alloc_concurrent_synthetic(ctx, VM, 2);
+    let lanes = (0..normalized_lane_count(lane_count))
+        .map(|i| (i as i32) < true_count)
+        .collect::<Vec<_>>();
+    alloc_mask_from_lanes(ctx, lane_count, &lanes)
+}
+
+fn alloc_mask_from_lanes(
+    ctx: &mut dyn NativeContext,
+    lane_count: i32,
+    lanes: &[bool],
+) -> ObjectRef {
+    let obj = alloc_concurrent_synthetic(ctx, VM, 3);
+    let payload_len = normalized_lane_count(lane_count);
+    let payload = ctx.new_array(ArrayElementType::Long, payload_len);
+    let mut true_count = 0i32;
+    for i in 0..payload_len {
+        let set = lanes.get(i).copied().unwrap_or(false);
+        if set {
+            true_count += 1;
+        }
+        ctx.set_array_element(payload, i, Value::Long(if set { 1 } else { 0 }));
+    }
     ctx.set_field(obj, 0, Value::Int(lane_count));
     ctx.set_field(obj, 1, Value::Int(true_count));
+    ctx.set_field(obj, 2, Value::Object(Some(payload)));
     obj
+}
+
+fn mask_lane_values(ctx: &mut dyn NativeContext, mask: ObjectRef, lane_count: usize) -> Vec<bool> {
+    match ctx.get_field(mask, 2) {
+        Value::Object(Some(payload)) => {
+            let payload_len = ctx.array_length(payload);
+            (0..lane_count)
+                .map(|i| {
+                    if i < payload_len {
+                        match ctx.get_array_element(payload, i) {
+                            Value::Long(n) => n != 0,
+                            Value::Int(n) => n != 0,
+                            _ => false,
+                        }
+                    } else {
+                        false
+                    }
+                })
+                .collect()
+        }
+        _ => {
+            let true_count = match ctx.get_field(mask, 1) {
+                Value::Int(n) => n.max(0) as usize,
+                _ => 0,
+            };
+            (0..lane_count).map(|i| i < true_count).collect()
+        }
+    }
 }
 
 fn vm_from_values(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
@@ -1488,12 +1676,16 @@ fn vm_lane_is_set(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResu
         Some(Value::Int(n)) => *n,
         _ => 0,
     };
-    let tc = match ctx.get_field(this, 1) {
-        Value::Int(n) => n,
+    let lc = match ctx.get_field(this, 0) {
+        Value::Int(n) => normalized_lane_count(n),
         _ => 0,
     };
-    // simplified: first tc lanes are set
-    Ok(Some(Value::Int(if idx < tc { 1 } else { 0 })))
+    let lanes = mask_lane_values(ctx, this, lc);
+    let is_set = usize::try_from(idx)
+        .ok()
+        .and_then(|i| lanes.get(i).copied())
+        .unwrap_or(false);
+    Ok(Some(Value::Int(if is_set { 1 } else { 0 })))
 }
 
 fn vm_and(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
@@ -1503,15 +1695,13 @@ fn vm_and(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
         Value::Int(n) => n,
         _ => 0,
     };
-    let tc1 = match ctx.get_field(this, 1) {
-        Value::Int(n) => n,
-        _ => 0,
-    };
-    let tc2 = match ctx.get_field(other, 1) {
-        Value::Int(n) => n,
-        _ => 0,
-    };
-    let mask = alloc_mask(ctx, lc, tc1.min(tc2));
+    let lane_count = normalized_lane_count(lc);
+    let lhs = mask_lane_values(ctx, this, lane_count);
+    let rhs = mask_lane_values(ctx, other, lane_count);
+    let lanes = (0..lane_count)
+        .map(|i| lhs.get(i).copied().unwrap_or(false) && rhs.get(i).copied().unwrap_or(false))
+        .collect::<Vec<_>>();
+    let mask = alloc_mask_from_lanes(ctx, lc, &lanes);
     Ok(Some(Value::Object(Some(mask))))
 }
 
@@ -1522,15 +1712,13 @@ fn vm_or(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
         Value::Int(n) => n,
         _ => 0,
     };
-    let tc1 = match ctx.get_field(this, 1) {
-        Value::Int(n) => n,
-        _ => 0,
-    };
-    let tc2 = match ctx.get_field(other, 1) {
-        Value::Int(n) => n,
-        _ => 0,
-    };
-    let mask = alloc_mask(ctx, lc, tc1.max(tc2));
+    let lane_count = normalized_lane_count(lc);
+    let lhs = mask_lane_values(ctx, this, lane_count);
+    let rhs = mask_lane_values(ctx, other, lane_count);
+    let lanes = (0..lane_count)
+        .map(|i| lhs.get(i).copied().unwrap_or(false) || rhs.get(i).copied().unwrap_or(false))
+        .collect::<Vec<_>>();
+    let mask = alloc_mask_from_lanes(ctx, lc, &lanes);
     Ok(Some(Value::Object(Some(mask))))
 }
 
@@ -1540,11 +1728,12 @@ fn vm_not(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
         Value::Int(n) => n,
         _ => 0,
     };
-    let tc = match ctx.get_field(this, 1) {
-        Value::Int(n) => n,
-        _ => 0,
-    };
-    let mask = alloc_mask(ctx, lc, lc - tc);
+    let lane_count = normalized_lane_count(lc);
+    let lanes = mask_lane_values(ctx, this, lane_count)
+        .into_iter()
+        .map(|set| !set)
+        .collect::<Vec<_>>();
+    let mask = alloc_mask_from_lanes(ctx, lc, &lanes);
     Ok(Some(Value::Object(Some(mask))))
 }
 
@@ -2364,6 +2553,7 @@ fn register_vector_operators(r: &mut NativeMethodRegistry) {
 #[cfg(test)]
 mod vector_api_tests {
     use super::*;
+    use cratonvm_native_api::test_mock::MockNativeContext;
     use cratonvm_native_api::NativeMethodRegistry;
 
     fn make_registry() -> NativeMethodRegistry {
@@ -2505,6 +2695,45 @@ mod vector_api_tests {
         assert!(r
             .find(VECTOR_SUPPORT, "getMaxLaneCount", "(Ljava/lang/Class;)I")
             .is_some());
+    }
+
+    #[test]
+    fn test_float_vector_mul_reduce_uses_real_lanes() {
+        let mut ctx = MockNativeContext::new();
+        let species = alloc_species(&mut ctx, 10);
+        let lhs = ctx.new_array(ArrayElementType::Float, 8);
+        let rhs = ctx.new_array(ArrayElementType::Float, 8);
+        for i in 0..8 {
+            ctx.set_array_element(lhs, i, Value::Float((i + 1) as f32));
+            ctx.set_array_element(rhs, i, Value::Float(0.5));
+        }
+
+        let lhs_vec = fv_from_array(
+            &mut ctx,
+            &[
+                Value::Object(Some(species)),
+                Value::Object(Some(lhs)),
+                Value::Int(0),
+            ],
+        )
+        .unwrap()
+        .unwrap();
+        let rhs_vec = fv_from_array(
+            &mut ctx,
+            &[
+                Value::Object(Some(species)),
+                Value::Object(Some(rhs)),
+                Value::Int(0),
+            ],
+        )
+        .unwrap()
+        .unwrap();
+        let product = fv_mul(&mut ctx, &[lhs_vec, rhs_vec]).unwrap().unwrap();
+        let reduced = fv_reduce_lanes(&mut ctx, &[product, Value::Int(RED_ADD)])
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(reduced.as_float(), Some(18.0));
     }
 
     #[test]
