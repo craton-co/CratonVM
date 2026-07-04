@@ -18209,6 +18209,30 @@ pub(crate) fn is_typeuse_annotation_native_override(
     }
 }
 
+pub(crate) fn is_reflection_access_native_override(
+    class_name: &str,
+    method_name: &str,
+    descriptor: &str,
+) -> bool {
+    matches!(
+        (class_name, method_name, descriptor),
+        (
+            "java/lang/Class",
+            "getDeclaredField",
+            "(Ljava/lang/String;)Ljava/lang/reflect/Field;"
+        ) | (
+            "java/lang/reflect/Field",
+            "get",
+            "(Ljava/lang/Object;)Ljava/lang/Object;"
+        ) | ("java/lang/reflect/Field", "setAccessible", "(Z)V")
+            | (
+                "java/lang/reflect/AccessibleObject",
+                "setAccessible",
+                "(Z)V"
+            )
+    )
+}
+
 pub(crate) fn is_antlr_prediction_context_native_override(
     class_name: &str,
     method_name: &str,
@@ -19029,6 +19053,9 @@ fn force_native_over_real_jdk_bytecode(
     // our null getTypeAnnotationBytes0 + unexposed ConstantPool. Single source
     // of truth — `check_override` (vm_exec.rs) consults the same predicate.
     if is_typeuse_annotation_native_override(class_name, method_name, method_descriptor) {
+        return true;
+    }
+    if is_reflection_access_native_override(class_name, method_name, method_descriptor) {
         return true;
     }
     // Hibernate HQL and Groovy route through ANTLR's prediction-context hot
@@ -24222,9 +24249,11 @@ fn ensure_bg_compiler_started(shared: &SharedVm) {
     let weak_vm: std::sync::Weak<SharedVm> =
         shared.self_arc.read().as_ref().cloned().unwrap_or_default();
     crate::jit::tiered::ensure_background_compiler(&shared.tiered_manager, || {
-        Box::new(move |task: &crate::jit::tiered::CompilationTask| -> (u64, bool) {
-            background_compile_task(&weak_vm, task)
-        })
+        Box::new(
+            move |task: &crate::jit::tiered::CompilationTask| -> (u64, bool) {
+                background_compile_task(&weak_vm, task)
+            },
+        )
     });
 }
 
@@ -26045,7 +26074,11 @@ fn execute_invokevirtual_vtable_fast(
                                     .find(&parent.name, &method_name, &method_descriptor)
                                     .is_some();
                             if has_native {
-                                remember_vtable_native_shadow(thread, native_shadow_cache_key, true);
+                                remember_vtable_native_shadow(
+                                    thread,
+                                    native_shadow_cache_key,
+                                    true,
+                                );
                                 drop(cm);
                                 return Ok(CachedCallResult::CacheMiss);
                             }
