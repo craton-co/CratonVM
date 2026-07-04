@@ -1,12 +1,13 @@
 # JIT regalloc callee-saved-register clobber — the umbrella family behind the skip-list
 
-**Severity:** High (latent) — contained, not currently breaking the suites, but it is the single
-largest source of JIT skip-list bans and caps how much hot code can be JIT-compiled.
-**Status:** 🔴 OPEN (general fix) — managed by ~30+ targeted method bans in
-[`vm/src/jit/skip_list.rs`](../../vm/src/jit/skip_list.rs) `is_known_miscompile`. Individual
-manifestations are lifted as they get individually fixed; the *general* fix is the deferred
-precise-JIT-maps / regalloc project.
-**Mode:** JIT only — every manifestation passes under `--nojit` / `CRATONVM_DISABLE_JIT=1`.
+**Severity:** Historical high — formerly contained by the largest cluster of targeted JIT bans.
+**Status:** ✅ FIXED on dev (2026-07-04) — the x64 JIT no longer assigns integer locals to
+callee-saved GPR homes by default, and the `is_known_miscompile` targeted family is inactive on
+that safe path. The old register-home path remains opt-in only via
+`CRATONVM_JIT_ENABLE_CALLEE_SAVED_GPR_LOCALS=1` for diagnostics, where the targeted guard still
+applies.
+**Mode:** Historical JIT-only — every manifestation passed under `--nojit` /
+`CRATONVM_DISABLE_JIT=1`.
 
 This doc consolidates what is known across the many per-session investigations (W2-CHM, RBC.1,
 SPB.1–3, EXEC.1, NETTY.1, CM-FASTMATH, JUNIT.1, Tomcat Bug B/D, kafka-bug-C). They are not
@@ -145,14 +146,34 @@ what remains open is the **general** clobber.
 
 ## Fix path
 
-- **General:** the **precise-JIT-maps / regalloc project (Stage B/C, deferred)** — precise oop maps
-  + correct callee-saved-register liveness across calls. This closes the whole family and lets the
-  bans be lifted wholesale.
-- **Per-instance:** find a reproducer (or the exact clobbered register via a disasm + live-set dump
-  around the method's calls), fix the specific `emit_invoke_virtual`/`patch_self_calls`/
-  `emit_inline_tlab_new`/`regalloc.rs` site, add a `bench/*` regression witness, then lift that ban.
+- **Landed:** disable callee-saved GPR local homes in the default x64 backend path. Locals now use
+  canonical frame homes unless `CRATONVM_JIT_ENABLE_CALLEE_SAVED_GPR_LOCALS=1` is explicitly set.
+  This removes the stale-register state the umbrella family depended on, trading some throughput
+  for correctness.
+- **Diagnostic legacy path:** the graph-coloring allocator and the historical targeted
+  `is_known_miscompile` table remain available for controlled bisection under the opt-in register
+  homes flag. Do not make that flag a production default without a precise register-liveness/map
+  replacement.
 
 ## Root-cause progress log
+
+### 2026-07-04 — default-off callee-saved GPR local homes
+
+Fixed the umbrella family by removing callee-saved GPR local homes from the default x64 codegen
+path. `jit/src/x64.rs` still runs graph coloring, but unless
+`CRATONVM_JIT_ENABLE_CALLEE_SAVED_GPR_LOCALS=1` is set it replaces the GPR local assignment vector
+with `None` entries and emits no callee-saved GPR save/restore metadata for those homes. XMM local
+allocation and frame-slot locals remain unchanged.
+
+`vm/src/jit/skip_list.rs` now treats `is_known_miscompile` as a legacy guard for the opt-in GPR
+local-home mode. Under the default safe mode the targeted regalloc family methods are JIT-eligible
+again; constructor/interface/default-thread and unrelated package/cold-path guards remain separate.
+
+Validation added:
+- `jit::x64::tests::callee_saved_gpr_local_homes_are_default_off`
+- skip-list tests for HashMap, WeakHashMap spliterators, AQS condition waits, and Keycloak
+  credential lazy getters all assert JIT eligibility under the safe default while preserving the
+  historical targeted table entries.
 
 ### 2026-07-01 — `TckLang.exc_hierarchy` retry no longer reproduces
 

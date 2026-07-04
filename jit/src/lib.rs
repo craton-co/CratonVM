@@ -44,16 +44,18 @@
 //!
 //! ## SAFETY INVARIANT: GC must conservatively re-sweep every JIT frame
 //!
-//! The JIT register allocator may keep a Java local (including an object
-//! reference) **exclusively in a callee-saved GPR** between bytecode
-//! aload/astore opcodes — the value need not be present in the frame's
-//! local slot at any given native PC. The precise oop map
-//! (`OopMapEntry`) describes only *frame-slot* oops; it has **no
-//! register-oop bitmap**. Therefore a register-resident oop is invisible
-//! to any GC scan that walks frame memory alone.
+//! The JIT register allocator's callee-saved GPR local homes are default-off
+//! (`CRATONVM_JIT_ENABLE_CALLEE_SAVED_GPR_LOCALS=1` opts back into the legacy
+//! path for diagnostics). When that legacy path is enabled, a Java local
+//! (including an object reference) may live **exclusively in a callee-saved GPR**
+//! between bytecode aload/astore opcodes — the value need not be present in the
+//! frame's local slot at any given native PC. The precise oop map (`OopMapEntry`)
+//! describes only *frame-slot* oops; it has **no register-oop bitmap**. Therefore
+//! a register-resident oop is invisible to any GC scan that walks frame memory
+//! alone.
 //!
-//! Correctness depends on two cooperating mechanisms, and **both must be
-//! kept**:
+//! Correctness of the legacy opt-in path depends on two cooperating mechanisms,
+//! and **both must be kept**:
 //!
 //! 1. Before every safepoint-causing call, the code generator spills every
 //!    register-resident local back to its canonical frame slot

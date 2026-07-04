@@ -2356,6 +2356,31 @@ fn flush_callee_saved_oops_enabled() -> bool {
     *G.get_or_init(|| std::env::var_os("CRATONVM_JIT_NO_CALLEE_OOP_FLUSH").is_none())
 }
 
+/// Temporary safety gate for the callee-saved GPR local allocator.
+///
+/// The remaining `is_known_miscompile` family is driven by live Java values kept
+/// exclusively in callee-saved GPRs across calls/OSR transitions. Until the
+/// precise register-map allocator work lands, keep those GPR local homes out of
+/// the default codegen path. The graph-coloring allocator still runs for tests
+/// and XMM locals; developers can opt back into the old GPR homes with
+/// `CRATONVM_JIT_ENABLE_CALLEE_SAVED_GPR_LOCALS=1` when bisecting allocator
+/// bugs.
+pub fn callee_saved_gpr_local_homes_enabled() -> bool {
+    use std::sync::OnceLock;
+    static G: OnceLock<bool> = OnceLock::new();
+    *G.get_or_init(|| {
+        std::env::var("CRATONVM_JIT_ENABLE_CALLEE_SAVED_GPR_LOCALS")
+            .ok()
+            .map(|v| {
+                matches!(
+                    v.trim().to_ascii_lowercase().as_str(),
+                    "1" | "true" | "on" | "yes"
+                )
+            })
+            .unwrap_or(false)
+    })
+}
+
 fn compute_branch_targets(code: &[u8], code_len: usize) -> Vec<bool> {
     let mut targets = vec![false; code_len];
     let mut pc = 0usize;
@@ -7476,9 +7501,21 @@ impl Compiler {
         let stack_arg_reserve: i32 = 16;
 
         // Use graph-coloring allocator results
-        let local_assignments = alloc_result.assignments;
+        let raw_local_assignments = alloc_result.assignments;
+        let raw_used_callee_saved = alloc_result.used_callee_saved;
+        let raw_local_assignments_len = raw_local_assignments.len();
+        let gpr_local_homes_enabled = callee_saved_gpr_local_homes_enabled();
+        let local_assignments = if gpr_local_homes_enabled {
+            raw_local_assignments
+        } else {
+            vec![None; raw_local_assignments_len]
+        };
         let osr_block_live_in = alloc_result.block_live_in;
-        let alloc_used_regs = alloc_result.used_callee_saved;
+        let alloc_used_regs = if gpr_local_homes_enabled {
+            raw_used_callee_saved
+        } else {
+            Vec::new()
+        };
         let xmm_assignments = alloc_result.xmm_assignments;
         let alloc_used_xmms = alloc_result.used_xmm_regs;
         let num_reg_locals = local_assignments.iter().filter(|a| a.is_some()).count()
@@ -30937,6 +30974,60 @@ mod tests {
         // Verify other OSR metadata
         assert_eq!(compiled.osr_num_locals, 3);
         assert!(compiled.osr_frame_size > 0, "Frame size should be positive");
+    }
+
+    #[test]
+    fn callee_saved_gpr_local_homes_are_default_off() {
+        if callee_saved_gpr_local_homes_enabled() {
+            return;
+        }
+
+        // int f(int a, int b) { int c = a + b; return c; }
+        let code: Vec<u8> = vec![
+            0x1a, // iload_0
+            0x1b, // iload_1
+            0x60, // iadd
+            0x3d, // istore_2
+            0x1c, // iload_2
+            0xac, // ireturn
+            0, 0,
+        ];
+        let compiled = compile(
+            &code,
+            6,
+            2,
+            3,
+            false,
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            HashMap::new(),
+            HashMap::new(),
+            &test_helpers(),
+            std::collections::HashSet::new(),
+            HashMap::new(),
+            None,
+        )
+        .expect("simple int-local method should compile");
+
+        assert_eq!(compiled.osr_num_reg_locals, 0);
+        assert!(compiled
+            .osr_callee_saved_regs
+            .as_ref()
+            .is_some_and(Vec::is_empty));
+        assert!(compiled
+            .osr_local_assignments
+            .as_ref()
+            .is_some_and(|assignments| assignments.iter().all(Option::is_none)));
     }
 
     #[test]

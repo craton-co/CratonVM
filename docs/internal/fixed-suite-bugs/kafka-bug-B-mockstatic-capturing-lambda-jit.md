@@ -120,7 +120,7 @@ Workaround for affected suites today: run with `--nojit`.
 
 - [`kafka-bug-B-mockito-mockstatic-mock-dispatch.md`](kafka-bug-B-mockito-mockstatic-mock-dispatch.md) — the (now fixed) dispatch/shadowing half of Bug B.
 - The JIT-cache-vs-redefinition theme overlaps the JIT MIC/PIC families in
-  [`jit-regalloc-callee-saved-clobber-family.md`](jit-regalloc-callee-saved-clobber-family.md)
+  [`jit-regalloc-callee-saved-clobber-family.md`](../jit-regalloc-callee-saved-clobber-family.md)
   and the reflection-corruption GC-root family only insofar as both are "JIT caches a stale
   fact across a runtime structural change"; the fix here is specifically redefine-time cache
   invalidation.
