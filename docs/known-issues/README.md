@@ -496,9 +496,15 @@ PreviewFeatures native crash. The remaining non-passed rows are tracked here:
 - [keycloak-quarkus-cmimpl-no-class-def.md](keycloak-quarkus-cmimpl-no-class-def.md) -
   283 `CRASH` rows on generated Quarkus/SmallRye `$$CMImpl` config mapping
   implementation classes (`LogBuildTimeConfig$$CMImpl` and `TestConfig$$CMImpl`).
-- [keycloak-junit-stringutils-anonymousobject-anymatch.md](keycloak-junit-stringutils-anonymousobject-anymatch.md) -
-  64 `FAIL` rows from `StringUtils.containsWhitespace` calling missing
-  `cratonvm/synthetic/AnonymousObject$1.anyMatch(IntPredicate)Z`.
+- ~~keycloak-junit-stringutils-anonymousobject-anymatch.md~~ - FIXED
+  2026-07-04: 64 `FAIL` rows from `StringUtils.containsWhitespace` calling
+  missing `cratonvm/synthetic/AnonymousObject$1.anyMatch(IntPredicate)Z`. Root
+  cause was `String.chars()`/`codePoints()` (`native_string_chars`) allocating
+  its IntStream via a raw `ClassId::new(0)`, which the VM's undersized-object
+  guard silently substituted with a generic `AnonymousObject$1` placeholder
+  instead of the real `IntStream` interface stamp — broke every IntStream op
+  on `chars()`, not just `anyMatch`. Moved to
+  `docs/internal/fixed-suite-bugs/`.
 - [keycloak-model-infinispan-globalconfiguration-isclustered-nosuchmethod.md](keycloak-model-infinispan-globalconfiguration-isclustered-nosuchmethod.md) -
   still reproduces for the `testsuite/model` module: 37 `CRASH` rows plus one
   abstract/no-test `EMPTY` row.
