@@ -3774,7 +3774,7 @@ impl G1Collector {
     ///       collection: the smoking gun.
     ///
     /// ROOT CAUSE (full writeup + ruled-out fixes:
-    /// `docs/known-issues/g1-parallel-evac-persistent-forwarding-root-remap.md`):
+    /// `docs/internal/fixed-suite-bugs/g1-parallel-evac-persistent-forwarding-root-remap.md`):
     /// the parallel evacuator dedups via the PERSISTENT `forwarding_ptr` header
     /// field (serial uses the per-cycle `pointer_map`). A fast-path hit returns a
     /// forward — possibly left over from a PRIOR cycle — WITHOUT recording it in

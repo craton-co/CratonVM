@@ -3777,6 +3777,11 @@ fn read_field_descriptor(
 
 /// Read the CratonVM-specific `accessible` extra slot from a Field object.
 fn read_field_accessible(ctx: &dyn NativeContext, field_obj: cratonvm_types::ObjectRef) -> bool {
+    if let Value::Int(v) = ctx.get_field_by_name(field_obj, "override") {
+        if v != 0 {
+            return true;
+        }
+    }
     let class_id = ctx.class_id_of_object(field_obj);
     let base = field_extra_base(ctx, class_id);
     match ctx.get_field(field_obj, base + FIELD_EXTRA_OFFSET_ACCESSIBLE) {
@@ -4443,6 +4448,35 @@ pub(crate) fn native_field_set_char(
 // Class.getDeclaredFields / getDeclaredField
 // ---------------------------------------------------------------------------
 
+fn synthetic_declared_field_alias(
+    ctx: &dyn NativeContext,
+    class_id: ClassId,
+) -> Option<FieldMetadata> {
+    match ctx.class_name_of_id(class_id).as_deref() {
+        Some("java/util/Collections$UnmodifiableMap" | "cratonvm/internal/UnmodifiableMap") => {
+            Some(FieldMetadata {
+                name: "m".to_string(),
+                descriptor: "Ljava/util/Map;".to_string(),
+                access_flags: 0x0012, // ACC_PRIVATE | ACC_FINAL
+                slot_index: 0,
+                declaring_class_id: class_id,
+                is_static: false,
+            })
+        }
+        _ => None,
+    }
+}
+
+fn declared_fields_with_aliases(ctx: &dyn NativeContext, class_id: ClassId) -> Vec<FieldMetadata> {
+    let mut fields = ctx.declared_fields(class_id);
+    if let Some(alias) = synthetic_declared_field_alias(ctx, class_id) {
+        if fields.iter().all(|field| field.name != alias.name) {
+            fields.push(alias);
+        }
+    }
+    fields
+}
+
 pub(crate) fn native_class_get_declared_fields(
     ctx: &mut dyn NativeContext,
     args: &[Value],
@@ -4474,7 +4508,7 @@ pub(crate) fn native_class_get_declared_fields(
     // `Field.checkAccess` (`obj.getClass()`) on the private instance field
     // `minCompatVersion`. `getDeclaredFields()` passes publicOnly=false.
     let public_only = matches!(args.get(1), Some(Value::Int(v)) if *v != 0);
-    let fields = ctx.declared_fields(class_id);
+    let fields = declared_fields_with_aliases(ctx, class_id);
     let selected: Vec<&FieldMetadata> = fields
         .iter()
         .filter(|m| !public_only || (m.access_flags & (ACC_PUBLIC as u16)) != 0)
@@ -4532,7 +4566,7 @@ pub(crate) fn native_class_get_declared_field(
         // We still walk `declared_fields(decl)` (small per-class vec) so
         // the mirror's `create_field_object` payload (descriptor, mods,
         // signature) matches what a cold miss would have produced.
-        let fields = ctx.declared_fields(decl);
+        let fields = declared_fields_with_aliases(ctx, decl);
         for meta in &fields {
             if meta.name == target_name
                 && meta.slot_index == abs_idx as usize
@@ -4547,7 +4581,7 @@ pub(crate) fn native_class_get_declared_field(
         // rare).
     }
 
-    let fields = ctx.declared_fields(class_id);
+    let fields = declared_fields_with_aliases(ctx, class_id);
     for meta in &fields {
         if meta.name == target_name {
             // Round 9 audit fix (HIGH #7): cache the cold-miss result so
@@ -8677,13 +8711,11 @@ fn wrap_annotation_in_real_proxy(
     // `getClass()`-equal, even once dispatch returns correct hashCode/equals.
     // Mirrors `native_proxy_new_instance`'s `proxy_loader_namespace()` use.
     let ann_mirror = ctx.get_class_mirror(ann_cid);
-    let annotation_loader: Option<ObjectRef> = match native_class_get_class_loader(
-        ctx,
-        &[Value::Object(Some(ann_mirror))],
-    ) {
-        Ok(Some(Value::Object(Some(loader_obj)))) => Some(loader_obj),
-        _ => None,
-    };
+    let annotation_loader: Option<ObjectRef> =
+        match native_class_get_class_loader(ctx, &[Value::Object(Some(ann_mirror))]) {
+            Ok(Some(Value::Object(Some(loader_obj)))) => Some(loader_obj),
+            _ => None,
+        };
     let loader_namespace: u32 = annotation_loader
         .map(|loader_obj| crate::proxy_loader_namespace(ctx, loader_obj))
         .unwrap_or(0);
@@ -8948,7 +8980,11 @@ fn ctx_annotation_values_equal(ctx: &mut dyn NativeContext, a: Value, b: Value) 
 /// logic lives one level up from `annotation_proxy_dispatch_impl` and is out
 /// of scope here); a foreign non-`AnnotationProxy` argument simply compares
 /// unequal, same as calling this before that delegation was added.
-pub(crate) fn ctx_annotation_proxy_equals(ctx: &mut dyn NativeContext, a: ObjectRef, b: Value) -> bool {
+pub(crate) fn ctx_annotation_proxy_equals(
+    ctx: &mut dyn NativeContext,
+    a: ObjectRef,
+    b: Value,
+) -> bool {
     let other = match b {
         Value::Object(Some(o)) => o,
         _ => return false,
@@ -9077,19 +9113,22 @@ fn ctx_format_annotation_array(ctx: &mut dyn NativeContext, arr: ObjectRef) -> S
 }
 
 /// Mirrors `annotation_proxy_to_string` in vm_exec.rs.
-pub(crate) fn ctx_annotation_proxy_to_string(ctx: &mut dyn NativeContext, proxy: ObjectRef) -> String {
+pub(crate) fn ctx_annotation_proxy_to_string(
+    ctx: &mut dyn NativeContext,
+    proxy: ObjectRef,
+) -> String {
     let desc = match ctx.get_field(proxy, ANN_PROXY_TYPE_DESC) {
         Value::Object(Some(s)) => ctx.read_string(s).unwrap_or_default(),
         _ => String::new(),
     };
-    let class_name = if let Some(stripped) = desc.strip_prefix('L').and_then(|s| s.strip_suffix(';'))
-    {
-        stripped.to_string()
-    } else if desc.is_empty() {
-        "<unknown>".to_string()
-    } else {
-        desc.clone()
-    };
+    let class_name =
+        if let Some(stripped) = desc.strip_prefix('L').and_then(|s| s.strip_suffix(';')) {
+            stripped.to_string()
+        } else if desc.is_empty() {
+            "<unknown>".to_string()
+        } else {
+            desc.clone()
+        };
     let dotted = class_name.replace('/', ".");
     let mut elems = ctx_annotation_proxy_elements(ctx, proxy);
     elems.sort_by(|a, b| a.0.cmp(&b.0));
@@ -10728,7 +10767,9 @@ pub(crate) fn native_method_get_parameter_annotations(
     }
     // Malformed/unexpected case (more raw rows than descriptor params):
     // clamp rather than write past `outer`'s length.
-    let copy_count = param_annotations.len().min(param_count.saturating_sub(synthetic_leading));
+    let copy_count = param_annotations
+        .len()
+        .min(param_count.saturating_sub(synthetic_leading));
     for (i, anns) in param_annotations.iter().take(copy_count).enumerate() {
         let inner = build_annotation_array(ctx, anns);
         ctx.set_array_element(outer, synthetic_leading + i, Value::Object(Some(inner)));
@@ -15562,7 +15603,8 @@ mod tests {
         jar_path
     }
 
-    static VENDORED_JAR_SEQ: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+    static VENDORED_JAR_SEQ: std::sync::atomic::AtomicUsize =
+        std::sync::atomic::AtomicUsize::new(0);
 
     #[test]
     fn t19_h10_validate_resource_name_accepts_simple() {

@@ -18,6 +18,14 @@ Hibernate runner is available and the temporal class loop is proven crash-free u
 **Affected classes (5):** `org.hibernate.orm.test.type.temporal.{InstantTests, LocalDateTimeTest,
 OffsetDateTimeTest, OffsetTimeTest, ZonedDateTimeTest}`.
 
+**2026-07-04 OSR-default/residual sweep:** left OPEN. The stale-native-local
+parts above are fixed, but this note's own acceptance condition is still unmet:
+the Hibernate runner is not present in this worktree, and the default-heap
+temporal class loop has not been proven crash-free against the broader
+concurrency/JUnit missed-root residual. Do not move this note to `docs/internal`
+until that validation exists or the residual is split into a separate canonical
+known-issue doc.
+
 This is **NOT** a java.time temporal-type binding bug (no `Timestamp`/`Calendar`/`OffsetDateTime`
 conversion is involved). It is another manifestation of the GC-root-coverage family already documented in
 [`hibernate-bytearraymapping-stackwalk-gc-corruption.md`](../internal/fixed-suite-bugs/hibernate-bytearraymapping-stackwalk-gc-corruption.md):

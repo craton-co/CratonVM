@@ -5246,12 +5246,10 @@ pub(crate) fn try_osr_with_backoff(
     initial_frame_idx: usize,
     entry_pc: usize,
 ) -> OsrBackoffOutcome {
-    // HIB-CV-20 / HIB-CV-21: back-edge OSR is unsound on large real-world
-    // methods (the OSR entry path can resume with corrupted register/stack
-    // state → a silent wrong value → infinite loops in e.g. Xerces XSD parsing).
-    // Gated OFF by default; whole-method JIT is unaffected. `CRATONVM_JIT_OSR=1`
-    // opts back in. This is the canonical entry for BOTH the inline and
-    // background-OSR paths, so the gate disables OSR everywhere.
+    // Back-edge OSR is default-on after the known entry-state corruption
+    // blockers were retired. Whole-method JIT is unaffected. `CRATONVM_JIT_OSR=0`
+    // opts out for diagnosis/bisection. This is the canonical entry for BOTH the
+    // inline and background-OSR paths, so the gate disables OSR everywhere.
     if !crate::runtime::env_cache::osr_backedge_enabled() {
         return OsrBackoffOutcome::Skip;
     }
@@ -18211,6 +18209,30 @@ pub(crate) fn is_typeuse_annotation_native_override(
     }
 }
 
+pub(crate) fn is_reflection_access_native_override(
+    class_name: &str,
+    method_name: &str,
+    descriptor: &str,
+) -> bool {
+    matches!(
+        (class_name, method_name, descriptor),
+        (
+            "java/lang/Class",
+            "getDeclaredField",
+            "(Ljava/lang/String;)Ljava/lang/reflect/Field;"
+        ) | (
+            "java/lang/reflect/Field",
+            "get",
+            "(Ljava/lang/Object;)Ljava/lang/Object;"
+        ) | ("java/lang/reflect/Field", "setAccessible", "(Z)V")
+            | (
+                "java/lang/reflect/AccessibleObject",
+                "setAccessible",
+                "(Z)V"
+            )
+    )
+}
+
 pub(crate) fn is_antlr_prediction_context_native_override(
     class_name: &str,
     method_name: &str,
@@ -19031,6 +19053,9 @@ fn force_native_over_real_jdk_bytecode(
     // our null getTypeAnnotationBytes0 + unexposed ConstantPool. Single source
     // of truth — `check_override` (vm_exec.rs) consults the same predicate.
     if is_typeuse_annotation_native_override(class_name, method_name, method_descriptor) {
+        return true;
+    }
+    if is_reflection_access_native_override(class_name, method_name, method_descriptor) {
         return true;
     }
     // Hibernate HQL and Groovy route through ANTLR's prediction-context hot
@@ -24224,9 +24249,11 @@ fn ensure_bg_compiler_started(shared: &SharedVm) {
     let weak_vm: std::sync::Weak<SharedVm> =
         shared.self_arc.read().as_ref().cloned().unwrap_or_default();
     crate::jit::tiered::ensure_background_compiler(&shared.tiered_manager, || {
-        Box::new(move |task: &crate::jit::tiered::CompilationTask| -> (u64, bool) {
-            background_compile_task(&weak_vm, task)
-        })
+        Box::new(
+            move |task: &crate::jit::tiered::CompilationTask| -> (u64, bool) {
+                background_compile_task(&weak_vm, task)
+            },
+        )
     });
 }
 
@@ -26047,7 +26074,11 @@ fn execute_invokevirtual_vtable_fast(
                                     .find(&parent.name, &method_name, &method_descriptor)
                                     .is_some();
                             if has_native {
-                                remember_vtable_native_shadow(thread, native_shadow_cache_key, true);
+                                remember_vtable_native_shadow(
+                                    thread,
+                                    native_shadow_cache_key,
+                                    true,
+                                );
                                 drop(cm);
                                 return Ok(CachedCallResult::CacheMiss);
                             }
