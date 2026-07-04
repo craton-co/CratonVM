@@ -166,6 +166,7 @@ thiserror.workspace = true
 cratonvm-classloading = { path = "../classloading", version = "0.3.0" }
 
 [dev-dependencies]
+cratonvm-native-api = { path = "../native-api", version = "0.3.0", features = ["test-mock"] }
 # Used by AOT + GraalVM tests for per-test tempdir isolation so
 # parallel runs cannot cross-contaminate on-disk state.
 tempfile = "3"
