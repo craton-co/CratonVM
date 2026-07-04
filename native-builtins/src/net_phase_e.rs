@@ -1927,7 +1927,6 @@ fn register_uri_natives(r: &mut NativeMethodRegistry) {
         } else {
             &raw[proto.len() + 1..]
         };
-        let full_s = ctx.create_string(&raw);
         let proto_s = ctx.create_string(proto);
         let file_s = ctx.create_string(file);
         let host_s = ctx.create_string("");
@@ -1935,7 +1934,22 @@ fn register_uri_natives(r: &mut NativeMethodRegistry) {
         ctx.set_field(url, 1, Value::Object(Some(host_s)));
         ctx.set_field(url, 2, Value::Int(-1));
         ctx.set_field(url, 3, Value::Object(Some(file_s)));
-        ctx.set_field(url, 5, Value::Object(Some(full_s)));
+        // Field 5 is the real `java.net.URL.authority` field — leave it
+        // `null` (as real JDK does for a host-less URL) instead of stuffing
+        // the whole raw URL string there. That anti-pattern (already fixed
+        // once for `jboss_module_loader::build_synthetic_url` — see its doc
+        // comment) makes real bytecode's `getAuthority()` return the entire
+        // URL string, which contains '/'. When this URL is later used as
+        // the *base* in `new URL(URL base, String spec)` (e.g. Woodstox's
+        // `URLUtil.urlFromSystemId(String, URL)`, called while resolving a
+        // DTD's external SYSTEM entity against the document's base URI),
+        // `URLStreamHandler.parseURL`'s merge logic inherits that corrupted
+        // authority into the merged URL and real JDK's own authority
+        // validation rejects it with `MalformedURLException: Illegal
+        // character found in authority: '/'` — even though the merge would
+        // otherwise succeed (systemId is already absolute). See
+        // Jaxb2CollectionHttpMessageConverterTests
+        // .readXmlRootElementExternalEntityEnabled().
         ctx.set_field(url, 6, Value::Object(Some(file_s)));
         Ok(Some(Value::Object(Some(url))))
     });
