@@ -26,13 +26,13 @@ were exhaustively bucketed by exact terminal-error signature (not sampled); see
 `keycloak-07-04/` for every distinct remaining finding.
 
 Fixed from this sweep:
+- [crypto/fips1402 CryptoProvider ServiceLoader bootstrap](../internal/fixed-suite-bugs/keycloak-crypto-fips1402-cryptoprovider-serviceloader.md) - `ServiceLoader` now sees the FIPS `CryptoProvider`; representative classes no longer fail at `CryptoInitRule.before` with `containersFailed=1`. Residual: the module can still fail later after bootstrap (`CryptoIntegration.getProvider(): init first`).
 - [SmallRyeConfig.getConfigMapping(Class) 1-arg bare-interface AbstractMethodError](../internal/fixed-suite-bugs/smallrye-getconfigmapping-1arg-bare-interface-abstractmethoderror.md).
 - [SmallRye Config missing Charset/MemorySize converters](../internal/fixed-suite-bugs/keycloak-smallrye-config-charset-memorysize-converters.md) - `LoggingSetupRecorder.handleFailedStart()` now builds its transient logging config with discovered Quarkus converters. The local 2026-07-04 deep dive also showed this fix exposes a later test-framework/Maven-artifact resolution gap rather than unlocking all `tests/base` classes outright. Residual: [test-framework deployRequestedInstances resolution failure](keycloak-07-04/keycloak-testframework-deploy-requested-instances-resolution.md).
 - [quarkus/runtime CompactValue NaN-box collision SIGSEGV](../internal/fixed-suite-bugs/keycloak-quarkus-compactvalue-nanbox-sigsegv.md) - current `dev` no longer reproduces `rc=139`. Residual: [PicocliTest post-fix hang](keycloak-07-04/quarkus-runtime-picocli-post-compactvalue-hang.md).
 - [System Rules getenv() field 'm' reflection mismatch](../internal/fixed-suite-bugs/keycloak-system-rules-getenv-field-m-reflection.md) - `System.getenv()` now exposes an OpenJDK-shaped unmodifiable map wrapper whose private `m` field points at the backing map.
 
 Open findings from this sweep, in `keycloak-07-04/`, roughly by priority:
-- [crypto/fips1402 CryptoProvider ServiceLoader returns empty](keycloak-07-04/crypto-fips1402-cryptoprovider-serviceloader-empty.md) - 21 classes.
 - [FacadeClassLoader Object.size() NoSuchMethodError + guarded Class-object OOB access](keycloak-07-04/facadeclassloader-object-size-nosuchmethoderror-classoob.md) - confirmed non-fatal but real; root cause not fully pinned.
 - [LoggingConfigurationTest wildcard DEBUG level resolves null](keycloak-07-04/quarkus-runtime-logging-wildcard-debug-level-null.md) - 1 class/sub-test.
 - [SmallRyeConfig.getPropertyNames() surfaces a garbage property name during log-category validation](keycloak-07-04/quarkus-runtime-logging-getpropertynames-garbage-key.md) - 2 sub-tests in the same class as above, plausibly related.
