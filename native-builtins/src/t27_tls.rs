@@ -56,7 +56,7 @@ use rustls::server::{ClientHello, ResolvesServerCert, ServerConnection, WebPkiCl
 use rustls::sign::CertifiedKey;
 use rustls::{ClientConfig, RootCertStore, ServerConfig, StreamOwned};
 
-use cratonvm_native_api::NativeMethodRegistry;
+use cratonvm_native_api::{NativeContext, NativeMethodRegistry};
 use cratonvm_types::error::RuntimeError;
 use cratonvm_types::{ObjectRef, Value};
 
@@ -235,24 +235,28 @@ fn ctx_trust_roots_table() -> &'static Mutex<HashMap<u64, TlsTrustRoots>> {
     T.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
+fn ctx_obj_key(ctx: &mut dyn NativeContext, obj: ObjectRef) -> u64 {
+    crate::gc_stable_lock_key(ctx, obj) as u64
+}
+
 /// `SSLContext.init` calls this to move pending KMF identity and TMF trust
 /// roots onto the SSLContext object's per-context slots.
-pub(crate) fn attach_pending_identity_to_ctx(ctx_obj: ObjectRef) {
+pub(crate) fn attach_pending_identity_to_ctx(ctx: &mut dyn NativeContext, ctx_obj: ObjectRef) {
+    let key = ctx_obj_key(ctx, ctx_obj);
     if let Some(ident) = take_pending_km_identity() {
-        ctx_identity_table()
-            .lock()
-            .insert(engine_objref_key(ctx_obj), ident);
+        ctx_identity_table().lock().insert(key, ident);
     }
     if let Some(roots) = take_pending_tm_trust_roots() {
-        ctx_trust_roots_table()
-            .lock()
-            .insert(engine_objref_key(ctx_obj), roots);
+        ctx_trust_roots_table().lock().insert(key, roots);
     }
 }
 
 /// Look up the identity previously associated with an `SSLContext` object.
-pub(crate) fn ctx_identity(ctx_obj: ObjectRef) -> Option<(String, String)> {
-    let key = engine_objref_key(ctx_obj);
+pub(crate) fn ctx_identity(
+    ctx: &mut dyn NativeContext,
+    ctx_obj: ObjectRef,
+) -> Option<(String, String)> {
+    let key = ctx_obj_key(ctx, ctx_obj);
     let trust_roots = ctx_trust_roots_table().lock().get(&key).cloned();
     set_selected_context_trust_roots(trust_roots);
     ctx_identity_table().lock().get(&key).cloned()
@@ -1348,7 +1352,7 @@ fn register_https_url_connection(r: &mut NativeMethodRegistry) {
         factory: ObjectRef,
     ) {
         if let Value::Object(Some(sslctx)) = ctx.get_field(factory, 0) {
-            set_huc_default_client_identity(ctx_identity(sslctx));
+            set_huc_default_client_identity(ctx_identity(ctx, sslctx));
         }
     }
     r.register(
@@ -1767,17 +1771,18 @@ mod tests {
         set_selected_context_trust_roots(None);
 
         let ctx = fake_object_ref(1);
+        let mut mock_ctx = crate::test_utils::mock_ctx();
         set_pending_tm_trust_roots(vec![ca_der.clone()]);
-        attach_pending_identity_to_ctx(ctx);
+        attach_pending_identity_to_ctx(&mut mock_ctx, ctx);
 
-        assert!(ctx_identity(ctx).is_none());
+        assert!(ctx_identity(&mut mock_ctx, ctx).is_none());
         let selected = selected_context_trust_roots().expect("context trust roots selected");
         assert_eq!(selected.root_ders, vec![ca_der]);
         let root_store = root_store_for_trust_roots(Some(&selected));
         assert_eq!(root_store.roots.len(), 1);
 
         let other_ctx = fake_object_ref(2);
-        assert!(ctx_identity(other_ctx).is_none());
+        assert!(ctx_identity(&mut mock_ctx, other_ctx).is_none());
         assert!(selected_context_trust_roots().is_none());
     }
 

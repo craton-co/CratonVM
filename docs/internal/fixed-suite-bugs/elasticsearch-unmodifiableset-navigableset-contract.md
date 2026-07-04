@@ -1,6 +1,8 @@
 # Elasticsearch UnmodifiableSet sorted/navigable contract break
 
-Status: open
+Status: FIXED
+
+Date fixed: 2026-07-04
 
 Date observed: 2026-07-02
 
@@ -115,3 +117,12 @@ classes. In that partial CratonVM no-JIT run:
 ```text
 C:\craton\CratonVM-elasticsearch-nojit-suite-20260702\apps\elasticsearch-suite-runner\.suite\results\es-nojit-full-20260702\all-nojit\results.tsv
 ```
+## Fix (2026-07-04)
+
+This issue is fixed by the current `dev` implementation of `cratonvm.internal.UnmodifiableSet` in:
+
+- `native-collections/src/lib.rs` (full `NavigableSet`/`SortedSet` interface surface and full method remap)
+- `vm/src/vm/vm_init.rs` (JDK `SortedSet` / `NavigableSet` interface registration)
+
+Residual instances were removed from the active suite-open set and archived here in
+`docs/internal/fixed-suite-bugs`.

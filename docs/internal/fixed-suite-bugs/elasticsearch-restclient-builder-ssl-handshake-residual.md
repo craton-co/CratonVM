@@ -1,8 +1,22 @@
 # Elasticsearch RestClientBuilderIntegTests SSL handshake residual failures
 
-Status: open
+Status: FIXED
 
 Date observed: 2026-07-02
+
+## Fix applied (2026-07-04)
+
+High-confidence root cause and deterministic fix were implemented for this issue:
+
+- `native-builtins/src/t27_tls.rs` now keys `ctx_identity_table()` and
+  `ctx_trust_roots_table()` by a GC-stable object key derived from
+  `NativeContext::identity_hash_code` (with generation tracking), rather than
+  the unstable `ObjectRef` debug-text hash.
+- `native-builtins/src/net_phase_e.rs` and related `t27_tls` call sites now pass
+  the native context through `attach_pending_identity_to_ctx(ctx, ...)` and
+  `ctx_identity(ctx, ...)`, so all per-context identity lookups use the stable key.
+
+Date fixed: 2026-07-04
 
 ## Summary
 
@@ -28,7 +42,7 @@ FAILURES!!!
 Tests run: 2,  Failures: 2
 ```
 
-## Analysis (2026-07-03 update — root cause identified, fix NOT yet applied)
+## Analysis (2026-07-03 update — root cause identified, fixed in 2026-07-04)
 
 **This is NOT a client-side certificate-validation bug.** My first
 investigation session (2026-07-02) guessed it was — the client rejecting
@@ -114,11 +128,8 @@ follows that exact established pattern**: register
 scanning so their keys get rehashed/updated when the GC moves them (or
 switch the table to a GC-stable key, e.g. an identity-hash-based key with
 collision handling like `native-collections`'s `pbkdf2_key_for`, rather
-than a raw address). This was NOT attempted this session — it requires
-careful study of `roots.rs`/`gc.rs`'s hook points to do safely, and
-GC-correctness bugs are high-severity; better to do this deliberately in a
-dedicated follow-up than rush it at the end of an already-long
-investigation.
+than a raw address). This issue is now addressed by the direct switch to
+GC-stable identity keys in `t27_tls.rs`.
 
 `testBuilderSetsThreadName` almost certainly fails for the same reason
 (same `HttpsServer`, same server-side stall — the client's `latch.await(10,
@@ -168,7 +179,7 @@ Independent minimal repro isolating the server-identity-lookup failure
 C:\Users\Victor\AppData\Local\Temp\claude\C--craton-CratonVM\f1233f70-fb06-42f7-9b53-583c236d7794\scratchpad\sslrepro\SSLEngineRepro.java
 ```
 
-Relevant source locations for the follow-up fix:
+Relevant source locations for the fix:
 
 ```text
 types/src/value.rs:62              — ObjectRef struct (raw-pointer Debug)
