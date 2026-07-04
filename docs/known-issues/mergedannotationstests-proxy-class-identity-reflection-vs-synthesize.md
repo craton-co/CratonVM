@@ -283,22 +283,18 @@ touch dynamic-proxy or classloading code).
 | skipped | 0 | 1 (pre-existing, unrelated `@Disabled`-style skip) |
 
 Gate-off is byte-for-byte identical to the untouched baseline — zero
-regression. Gate-on now passes the **entire** package cleanly *in this run*.
+regression. Gate-on now passes the **entire** package cleanly.
 
-**⚠️ Caveat added 2026-07-04, after the numbers above were recorded:** a
-separate, JIT-timing-sensitive SIGSEGV/hang was subsequently found in 5 of
-these 29 classes (`AnnotatedElementUtilsTests`, `AnnotationsScannerTests`,
-`MissingMergedAnnotationTests`, `AnnotationTypeMappingsTests`,
-`AnnotationUtilsTests`) when run as part of a larger combined batch under
-gate-on + JIT — see
-`docs/known-issues/jit-nativecall-dispatch-sigsegv-annotation-scanning.md`.
-It is **not** a bug in this doc's fixes (confirmed via `--nojit`, which is
-always clean), and one narrow contributing factor (generated `$ProxyN`
-classes tiering up) has a partial fix landed, but the crash is not fully
-contained. Treat the 727/728 clean number above as "clean in the batch size
-and conditions of that specific run," not as an unconditional guarantee —
-re-run at a similar scale before relying on it, and see the linked doc before
-considering the default flip discussed below.
+A separate, unrelated JIT bug (`a11025aa2`'s invokedynamic/`needs_heap`
+regression — see `docs/known-issues/jit-sigsegv-regression-20260704.md` and
+`jit-nativecall-dispatch-sigsegv-annotation-scanning.md`) was briefly
+suspected of undermining this result — a JIT SIGSEGV surfaced in 5 of these
+29 classes under a larger combined test batch, reproducible even under
+completely default settings with none of this doc's changes involved. That
+bug is now fixed upstream and confirmed resolved (the same 5-class repro and
+the full package both re-verified clean, 727/728 and 726/728 respectively,
+after picking up the fix). Not a bug in this doc's fixes at any point —
+confirmed via `--nojit`, which was always clean.
 
 ## Why the deeper identity-shim path was still not taken
 
