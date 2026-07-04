@@ -625,6 +625,27 @@ pub(crate) fn register_core_stdlib_extras(r: &mut NativeMethodRegistry) {
     let arrays = "java/util/Arrays";
 
     // Arrays.copyOf(Object[], int) → Object[]
+    //
+    // FMT-STREAMS-CCE: the real JDK's 2-arg `Arrays.copyOf(T[] original, int
+    // newLength)` allocates the copy via `Array.newInstance(original.getClass()
+    // .getComponentType(), newLength)`, so the RESULT preserves `original`'s
+    // exact runtime component type — including nested array types, e.g.
+    // copying an `Object[][]` (as `java.util.stream.SpinedBuffer.ensureCapacity`
+    // does for its `E[][] spine` field) must yield another `Object[][]`, not a
+    // flat `Object[]`. This native previously always allocated a flat
+    // `Object[]` via `ctx.new_array(Reference, ..)` regardless of `src`'s real
+    // type, so callers whose static type is a multi-dimensional array (e.g.
+    // `spine = Arrays.copyOf(spine, n);` where `spine: E[][]`) hit an implicit
+    // erasure checkcast back to `[Ljava/lang/Object;` (2D descriptor) against
+    // the flat 1D result and threw `ClassCastException: java.lang.Object
+    // cannot be cast to [[Ljava.lang.Object;` (format.datetime.standard.
+    // InstantFormatterTests, via LongStream boxing pipeline toArray()).
+    //
+    // Fix: read `src`'s own component ClassId from its heap header (the same
+    // template used by the 3-arg overload below and by
+    // `real_jdk_to_array_typed` for `ArrayList.toArray(T[])`) and propagate it
+    // to the copy via `new_ref_array`, so the result's runtime class matches
+    // `src`'s exactly — including nested array depth.
     r.register(
         arrays,
         "copyOf",
@@ -645,7 +666,8 @@ pub(crate) fn register_core_stdlib_extras(r: &mut NativeMethodRegistry) {
                 _ => 0,
             };
             let src_len = ctx.array_length(src);
-            let dst = ctx.new_array(cratonvm_types::ArrayElementType::Reference, new_len);
+            let comp_cid = ctx.class_id_of_object(src);
+            let dst = ctx.new_ref_array(comp_cid, new_len);
             let copy_len = src_len.min(new_len);
             for i in 0..copy_len {
                 ctx.set_array_element(dst, i, ctx.get_array_element(src, i));
@@ -726,6 +748,12 @@ pub(crate) fn register_core_stdlib_extras(r: &mut NativeMethodRegistry) {
     });
 
     // Arrays.copyOfRange(Object[], int, int) → Object[]
+    //
+    // FMT-STREAMS-CCE: same bug as the 2-arg `copyOf` above — the real JDK's
+    // `copyOfRange(T[] original, int from, int to)` allocates via
+    // `original.getClass()`, preserving nested array types. Propagate `src`'s
+    // own component ClassId (from its heap header) instead of always
+    // allocating a flat `Object[]`.
     r.register(
         arrays,
         "copyOfRange",
@@ -744,7 +772,8 @@ pub(crate) fn register_core_stdlib_extras(r: &mut NativeMethodRegistry) {
                 _ => 0,
             };
             let new_len = to.saturating_sub(from);
-            let dst = ctx.new_array(cratonvm_types::ArrayElementType::Reference, new_len);
+            let comp_cid = ctx.class_id_of_object(src);
+            let dst = ctx.new_ref_array(comp_cid, new_len);
             let src_len = ctx.array_length(src);
             for i in 0..new_len {
                 if from + i < src_len {
