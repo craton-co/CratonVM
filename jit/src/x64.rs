@@ -1473,12 +1473,31 @@ pub fn jit_scan(code: &[u8], code_len: usize, descriptor: &str) -> Option<JitSca
             // today's status quo for that one method. In the common case
             // (assertions disabled, dead branch) the trap is never taken and
             // the surrounding hot method compiles and runs at full JIT speed.
+            //
+            // REGRESSION FIX (2026-07-04): the unconditional-deopt codegen for
+            // this opcode (the `0xba` arm in `compile_bytecode`, and the shared
+            // `emit_deopt_stubs` out-of-line trap it jumps to) calls
+            // `jit_uncommon_trap(vm_ptr, reason, bci)`, and loads `vm_ptr` from
+            // `self.heap_local_offset` -- EXACTLY the same hidden-VM-pointer
+            // frame slot documented above at the `aastore` (0x53) arm. That
+            // slot is only reserved when `needs_heap` is set; otherwise
+            // `heap_local_offset` aliases local slot 0 (see the `aastore`
+            // comment), and the trap helper receives whatever garbage/local
+            // value happens to sit there instead of the real `&SharedVm`,
+            // which it blindly dereferences -- SIGSEGV. A method containing an
+            // invokedynamic but no OTHER heap-requiring opcode (the common
+            // dead-`assert` case is often exactly this shape) left
+            // `needs_heap` false, so the very trap this fix relies on as its
+            // "safe fallback" was itself unsafe. Set `needs_heap = true` here,
+            // mirroring every other opcode whose codegen depends on
+            // `heap_local_offset` (invoke*, new, anewarray, aastore, ...).
             0xba => {
                 if pc + 4 >= code_len {
                     return None;
                 }
                 let cp_idx = ((code[pc + 1] as u16) << 8) | (code[pc + 2] as u16); // Widening: always safe
                 indy_ops.push((pc, cp_idx));
+                needs_heap = true;
                 pc += 5;
             }
             // tableswitch — accept in scanner, emit CMP chain in compiler
