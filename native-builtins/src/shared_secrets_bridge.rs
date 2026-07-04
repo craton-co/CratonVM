@@ -627,6 +627,37 @@ fn jla_define_class(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRe
     crate::classloader::define_class_via_full(ctx, &name, bytes, loader_id, opts, false, None)
 }
 
+/// `JavaLangAccess.findBootstrapClassOrNull(String name)` -> `Class<?>`.
+///
+/// `jdk.internal.loader.BootLoader.loadClassOrNull(String name)` calls this to
+/// check whether the bootstrap loader has already loaded `name` WITHOUT
+/// triggering a fresh load — a pure "is it already loaded" probe, not a
+/// resolve-or-define path. Missing this registration raised
+/// `NoSuchMethodError` on every SSSD Arquillian test row (see
+/// docs/known-issues/keycloak-sssd-system1-findbootstrapclassornull-nosuchmethod.md).
+///
+/// `ctx.class_id_by_name` is a pure lookup against the already-loaded class
+/// table — it does not itself trigger classloading (the same guarantee
+/// `classloader::find_loaded_class_for_loader` relies on for
+/// `ClassLoader.findLoadedClass`/`findLoadedClass0`), so this preserves the
+/// real JDK's "does not trigger loading" contract.
+///
+/// INSTANCE method: args[0] = receiver (System$1), args[1] = name (dotted or
+/// slashed binary name).
+fn jla_find_bootstrap_class_or_null(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    let name = match args.get(1) {
+        Some(Value::Object(Some(s))) => ctx.read_string(*s).unwrap_or_default().replace('.', "/"),
+        _ => return Ok(Some(Value::Object(None))),
+    };
+    match ctx.class_id_by_name(&name) {
+        Some(cid) => Ok(Some(Value::Object(Some(ctx.get_class_mirror(cid))))),
+        None => Ok(Some(Value::Object(None))),
+    }
+}
+
 fn register_java_lang_access(registry: &mut NativeMethodRegistry) {
     let owner = "java/lang/System$1";
     registry.register(
@@ -761,6 +792,14 @@ fn register_java_lang_access(registry: &mut NativeMethodRegistry) {
         "defineClass",
         "(Ljava/lang/ClassLoader;Ljava/lang/String;[BLjava/security/ProtectionDomain;Ljava/lang/String;)Ljava/lang/Class;",
         jla_define_class,
+    );
+    // `jdk.internal.loader.BootLoader.loadClassOrNull` — see
+    // `jla_find_bootstrap_class_or_null` doc comment.
+    registry.register(
+        owner,
+        "findBootstrapClassOrNull",
+        "(Ljava/lang/String;)Ljava/lang/Class;",
+        jla_find_bootstrap_class_or_null,
     );
     // Also register on the interface so direct invokeinterface
     // dispatch (when the receiver's concrete class lookup falls
@@ -2008,6 +2047,27 @@ mod tests {
             )
             .is_some(),
             "JavaLangAccess.defineClass not registered on java/lang/System$1"
+        );
+    }
+
+    #[test]
+    fn java_lang_access_find_bootstrap_class_or_null_registered() {
+        // `jdk.internal.loader.BootLoader.loadClassOrNull` calls
+        // `SharedSecrets.getJavaLangAccess().findBootstrapClassOrNull(name)`,
+        // which dispatches on the `System$1` singleton's concrete class.
+        // Missing this registration raised NoSuchMethodError on every SSSD
+        // Keycloak Arquillian test row (see
+        // docs/known-issues/keycloak-sssd-system1-findbootstrapclassornull-nosuchmethod.md).
+        let mut r = NativeMethodRegistry::new();
+        register_wp1_4_shared_secrets(&mut r);
+        assert!(
+            r.find(
+                "java/lang/System$1",
+                "findBootstrapClassOrNull",
+                "(Ljava/lang/String;)Ljava/lang/Class;",
+            )
+            .is_some(),
+            "JavaLangAccess.findBootstrapClassOrNull not registered on java/lang/System$1"
         );
     }
 }
