@@ -2595,6 +2595,32 @@ impl ClassManager {
                         class_name: name.to_string(),
                     }));
                 }
+                // A name containing "$$" is the universal marker JVM bytecode
+                // generators use for a runtime-synthesized implementation that
+                // is never shipped as a `.class` file — SmallRye Config's
+                // `@ConfigMapping` `<Iface>$$CMImpl` (io.smallrye.config.
+                // ConfigMappingLoader + io.smallrye.common.classloader.
+                // ClassDefiner), CGLIB's `$$EnhancerBy...$$`/`$$FastClassBy...$$`,
+                // ByteBuddy, Mockito's `$MockitoMock$`, etc. These generators all
+                // use the same idiom: try `ClassLoader.loadClass(generatedName)`
+                // first (a cheap check for an already-generated class earlier in
+                // the same run), catch `ClassNotFoundException`, and only then
+                // generate + `Lookup.defineClass`/`Unsafe.defineClass` the real
+                // bytecode. Fabricating an enterprise-prefix synthetic stub here
+                // (as below, for genuinely-missing-jar classes) hands that probe
+                // a bogus non-null `Class` instead of the CNFE it needs to ever
+                // reach the generation step — the real class is never produced,
+                // and any later reference to the same name is permanently stuck
+                // on the wrong stub. Unlike the reflective-probe gate above, this
+                // must fire unconditionally: the generators call plain
+                // `ClassLoader.loadClass`, which never sets that flag. A real,
+                // non-generated class name essentially never contains "$$", so
+                // this can't misclassify a genuine missing-jar case.
+                if name.contains("$$") {
+                    return Err(VmError::ClassFile(ClassFileError::ClassNotFound {
+                        class_name: name.to_string(),
+                    }));
+                }
                 // JDK class not found as a .class file — create a synthetic stub.
                 // Our VM handles JDK classes natively, so we just need a minimal
                 // entry in the ClassStore for the type system to work.
@@ -9260,6 +9286,47 @@ mod tests {
         assert!(!cratonvm_types::reflective_probe::active());
         let _g = cratonvm_types::reflective_probe::ProbeGuard::new();
         assert!(cratonvm_types::reflective_probe::active());
+    }
+
+    // --- keycloak-quarkus-cmimpl-no-class-def: "$$"-marked runtime-generated
+    //     class names must report ClassNotFoundException, not a fabricated
+    //     enterprise stub, even outside a reflective-probe (Class.forName)
+    //     context ---
+
+    #[test]
+    fn double_dollar_generated_class_name_is_not_stubbed() {
+        // No reflective probe active — this is the plain `ClassLoader.loadClass`
+        // path SmallRye Config's `ConfigMappingLoader.loadClass` (and CGLIB/
+        // ByteBuddy/Mockito's identical check-then-generate idiom) actually use.
+        assert!(!cratonvm_types::reflective_probe::active());
+        let mut cm = ClassManager::new(&[], &[], &[]);
+        let result = cm.load_class("io/quarkus/deployment/dev/testing/TestConfig$$CMImpl");
+        match result {
+            Err(VmError::ClassFile(ClassFileError::ClassNotFound { class_name })) => {
+                assert_eq!(
+                    class_name,
+                    "io/quarkus/deployment/dev/testing/TestConfig$$CMImpl"
+                );
+            }
+            other => panic!(
+                "expected ClassNotFound so the generator's catch-CNFE-then-defineClass \
+                 idiom can run, got {other:?}"
+            ),
+        }
+    }
+
+    #[test]
+    fn enterprise_prefix_without_double_dollar_still_gets_a_stub() {
+        // Regression guard: the new "$$" gate must not widen and start
+        // rejecting the existing (bytecode-linkage) enterprise-stub fallback
+        // for ordinary missing-jar classes that don't look generated.
+        let mut cm = ClassManager::new(&[], &[], &[]);
+        let result = cm.load_class("io/quarkus/runtime/Application");
+        assert!(
+            result.is_ok(),
+            "plain enterprise-prefix class (no \"$$\") must still get a synthetic \
+             stub for bytecode linkage: {result:?}"
+        );
     }
 
     // --- bug-06 family 4: synthetic stubs inherit java/lang/Object ---
