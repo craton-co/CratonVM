@@ -452,6 +452,21 @@ fn should_skip_jit_internal(
             });
         }
 
+        // j.u.c. queue-synchronizer family (AbstractQueuedSynchronizer /
+        // AbstractQueuedLongSynchronizer / ReentrantReadWriteLock$Sync) —
+        // deliberately NOT gated by `callee_saved_gpr_local_homes_enabled()`.
+        // See `is_known_miscompile_aqs_family`'s doc comment for why this
+        // family must stay unconditional under Conservative even though the
+        // rest of the targeted list now requires opting back into the legacy
+        // GPR-local-homes allocator. Aggressive still lifts it, same as
+        // every other targeted-list entry, so developers can surface new
+        // miscompiles on purpose.
+        if is_known_miscompile_aqs_family(class_name, method_name)
+            && !package_allowed(class_name, allow_packages)
+        {
+            return Some(SkipReason::JavaUtilCollection);
+        }
+
         // RBC.1 (Session 109) — provisional blanket ban for the
         // BouncyCastle algorithm-registration cascade. BC's
         // `BouncyCastleProvider.<init>` registers ~thousand algorithm
@@ -1435,71 +1450,14 @@ fn is_known_miscompile(class_name: &str, method_name: &str) -> bool {
         | ("java/util/concurrent/CountDownLatch", "await")
         | ("java/util/concurrent/CountDownLatch$Sync", "tryReleaseShared")
         | ("java/util/concurrent/CountDownLatch$Sync", "tryAcquireShared")
-        // AbstractQueuedSynchronizer hot dispatch + node alloc paths.
-        // AQS allocates an `ExclusiveNode` / `ConditionNode` for every
-        // contended acquire/release; that allocate-then-putfield in the
-        // node ctor is the same miscompile signature. The do*/signalNext
-        // inner helpers walk the waiter list and re-link nodes via
-        // putfield-on-fresh-allocation; without skipping them, the
-        // signaling path corrupts the next-pointer and waiters are
-        // never woken (latch.await stays parked indefinitely). The
-        // ConditionObject wait variants are also skipped: when compiled,
-        // awaitNanos can park with the live ConditionNode only in a
-        // callee-saved register, outside the blocked-thread GC snapshot.
-        | ("java/util/concurrent/locks/AbstractQueuedSynchronizer", "acquire")
-        | ("java/util/concurrent/locks/AbstractQueuedSynchronizer", "release")
-        | ("java/util/concurrent/locks/AbstractQueuedSynchronizer", "acquireShared")
-        | ("java/util/concurrent/locks/AbstractQueuedSynchronizer", "releaseShared")
-        | ("java/util/concurrent/locks/AbstractQueuedSynchronizer", "signalNext")
-        | ("java/util/concurrent/locks/AbstractQueuedSynchronizer", "signalNextIfShared")
-        | ("java/util/concurrent/locks/AbstractQueuedSynchronizer$ConditionObject", "signal")
-        | ("java/util/concurrent/locks/AbstractQueuedSynchronizer$ConditionObject", "signalAll")
-        | ("java/util/concurrent/locks/AbstractQueuedSynchronizer$ConditionObject", "doSignal")
-        | ("java/util/concurrent/locks/AbstractQueuedSynchronizer$ConditionObject", "await")
-        | ("java/util/concurrent/locks/AbstractQueuedSynchronizer$ConditionObject", "awaitNanos")
-        | ("java/util/concurrent/locks/AbstractQueuedSynchronizer$ConditionObject", "awaitUntil")
-        | ("java/util/concurrent/locks/AbstractQueuedSynchronizer$ConditionObject", "awaitUninterruptibly")
-        | ("java/util/concurrent/locks/AbstractQueuedSynchronizer$ConditionObject", "newConditionNode")
-        | ("java/util/concurrent/locks/AbstractQueuedSynchronizer$ConditionObject", "enableWait")
-        // AbstractQueuedLongSynchronizer — the 64-bit-state sibling of
-        // AbstractQueuedSynchronizer (JDK 25's `ReentrantReadWriteLock$Sync`
-        // extends this one, not the classic int-state class). It is a
-        // near-line-for-line port with its own `ExclusiveNode`/`ConditionNode`
-        // types, and hits the EXACT SAME allocate-then-putfield miscompile as
-        // its sibling above — but being a textually distinct class name, none
-        // of the entries above match it, so its hot acquire/release/signal
-        // path stayed fully JIT-eligible and silently corrupted the waiter
-        // linked list's next-pointer, permanently losing wakeups (confirmed:
-        // a minimal 4-thread ReentrantReadWriteLock stress repro hangs
-        // completely — CPU-idle, no forward progress — while the equivalent
-        // ReentrantLock repro, which uses the classic already-skipped class,
-        // completes correctly). Method names verified identical to the
-        // classic class via `javap` against the real JDK 25
-        // AbstractQueuedLongSynchronizer(.ConditionObject) — mirror the same
-        // list method-for-method.
-        | ("java/util/concurrent/locks/AbstractQueuedLongSynchronizer", "acquire")
-        | ("java/util/concurrent/locks/AbstractQueuedLongSynchronizer", "release")
-        | ("java/util/concurrent/locks/AbstractQueuedLongSynchronizer", "acquireShared")
-        | ("java/util/concurrent/locks/AbstractQueuedLongSynchronizer", "releaseShared")
-        | ("java/util/concurrent/locks/AbstractQueuedLongSynchronizer", "signalNext")
-        | ("java/util/concurrent/locks/AbstractQueuedLongSynchronizer", "signalNextIfShared")
-        | ("java/util/concurrent/locks/AbstractQueuedLongSynchronizer$ConditionObject", "signal")
-        | ("java/util/concurrent/locks/AbstractQueuedLongSynchronizer$ConditionObject", "signalAll")
-        | ("java/util/concurrent/locks/AbstractQueuedLongSynchronizer$ConditionObject", "doSignal")
-        | ("java/util/concurrent/locks/AbstractQueuedLongSynchronizer$ConditionObject", "await")
-        | ("java/util/concurrent/locks/AbstractQueuedLongSynchronizer$ConditionObject", "awaitNanos")
-        | ("java/util/concurrent/locks/AbstractQueuedLongSynchronizer$ConditionObject", "awaitUntil")
-        | ("java/util/concurrent/locks/AbstractQueuedLongSynchronizer$ConditionObject", "awaitUninterruptibly")
-        | ("java/util/concurrent/locks/AbstractQueuedLongSynchronizer$ConditionObject", "newConditionNode")
-        | ("java/util/concurrent/locks/AbstractQueuedLongSynchronizer$ConditionObject", "enableWait")
-        // ReentrantReadWriteLock's own Sync hot path — same allocate-then-
-        // putfield hazard reached one level up (WriteLock/ReadLock.lock()
-        // call straight into Sync.tryAcquire/tryAcquireShared, which is
-        // where AbstractQueuedLongSynchronizer's acquire() is entered from).
-        | ("java/util/concurrent/locks/ReentrantReadWriteLock$WriteLock", "lock")
-        | ("java/util/concurrent/locks/ReentrantReadWriteLock$WriteLock", "unlock")
-        | ("java/util/concurrent/locks/ReentrantReadWriteLock$ReadLock", "lock")
-        | ("java/util/concurrent/locks/ReentrantReadWriteLock$ReadLock", "unlock")
+        // AbstractQueuedSynchronizer/AbstractQueuedLongSynchronizer's own
+        // hot dispatch + node alloc paths, and ReentrantReadWriteLock's Sync
+        // hot path, are handled by `is_known_miscompile_aqs_family` below —
+        // an UNCONDITIONAL check, not gated by
+        // `callee_saved_gpr_local_homes_enabled()`. See its doc comment for
+        // why: this is a demonstrably distinct, still-reproducing miscompile
+        // family from the callee-saved-GPR-local-homes one `a4913d8b` made
+        // conditional, so it must not be swept behind that same gate.
         // ReentrantLock guards LBQ — every offer/take takes the lock
         | ("java/util/concurrent/locks/ReentrantLock", "lock")
         | ("java/util/concurrent/locks/ReentrantLock", "unlock")
@@ -2113,6 +2071,147 @@ fn is_known_miscompile(class_name: &str, method_name: &str) -> bool {
     )
 }
 
+/// Targeted list for `java.util.concurrent.locks`' queue-synchronizer family
+/// — `AbstractQueuedSynchronizer` (classic, `int state`) and
+/// `AbstractQueuedLongSynchronizer` (JDK 25+, `long state`; used by
+/// `ReentrantReadWriteLock$Sync`), their respective `Node`/`ConditionObject`
+/// inner classes, and `ReentrantReadWriteLock$Sync`/`HoldCounter`/
+/// `ThreadLocalHoldCounter`.
+///
+/// UNCONDITIONAL — deliberately NOT gated by
+/// `callee_saved_gpr_local_homes_enabled()`, unlike the rest of
+/// `is_known_miscompile`. `a4913d8b` ("disable callee-saved GPR local
+/// homes") gated the *entire* targeted list behind that flag on the premise
+/// that every entry was the same callee-saved-GPR-local-home regalloc
+/// family, now closed by making that register-allocation strategy
+/// default-off. That premise does not hold for this family: with the
+/// default (gate OFF, i.e. `is_known_miscompile` a no-op), a heavy-
+/// contention repro reproduces a PERMANENT hang for both
+/// `ReentrantReadWriteLock` (confirmed: two threads parked forever at an
+/// identical bytecode offset 280+ seconds apart in
+/// `AbstractQueuedLongSynchronizer.acquire`) and plain `ReentrantLock`
+/// (confirmed: the classic, `int`-state class — proving this is not
+/// specific to the newer long-state variant either). `CRATONVM_DBG_JITC`
+/// tracing pinned the actually-compiled methods as `Node.getAndUnsetStatus`/
+/// `clearStatus` and the synchronizer's own `tryInitializeHead` — none of
+/// which were ever on the OLD targeted list at all (it only covered
+/// `acquire`/`release`/`acquireShared`/`releaseShared`/`signalNext`/
+/// `signalNextIfShared` and `ConditionObject`'s wait/signal methods, never
+/// the `Node` class itself or the queue-initialization helpers). This
+/// function supersedes and widens that historical list for this specific
+/// family; see the removed entries' history in `is_known_miscompile` for
+/// the original CountDownLatch-driven discovery.
+///
+/// `tryInitializeHead` in particular allocates the CLH queue's sentinel
+/// `ExclusiveNode` and immediately `casHead`s it in — an allocate-then-CAS
+/// hazard structurally identical to the allocate-then-putfield family, but
+/// running only once per lock instance (its first-ever contended acquire),
+/// which is exactly why light-contention repros (a handful of threads,
+/// brief hold times) never trigger it while heavy-contention ones
+/// (many threads, deep contention) reliably do — matching the observed gap
+/// between an initial 4-thread stress repro (passed) and the real
+/// Elasticsearch `LongRandomBinaryDocValuesRangeQueryTests` scenario and a
+/// 16-thread synthetic repro (both hang identically).
+fn is_known_miscompile_aqs_family(class_name: &str, method_name: &str) -> bool {
+    matches!(
+        (class_name, method_name),
+        // --- AbstractQueuedSynchronizer (classic, int state) ---
+        ("java/util/concurrent/locks/AbstractQueuedSynchronizer", "acquire")
+            | ("java/util/concurrent/locks/AbstractQueuedSynchronizer", "release")
+            | ("java/util/concurrent/locks/AbstractQueuedSynchronizer", "acquireShared")
+            | ("java/util/concurrent/locks/AbstractQueuedSynchronizer", "releaseShared")
+            | ("java/util/concurrent/locks/AbstractQueuedSynchronizer", "signalNext")
+            | ("java/util/concurrent/locks/AbstractQueuedSynchronizer", "signalNextIfShared")
+            | ("java/util/concurrent/locks/AbstractQueuedSynchronizer", "tryInitializeHead")
+            | ("java/util/concurrent/locks/AbstractQueuedSynchronizer", "casTail")
+            | ("java/util/concurrent/locks/AbstractQueuedSynchronizer", "enqueue")
+            | ("java/util/concurrent/locks/AbstractQueuedSynchronizer", "isEnqueued")
+            | ("java/util/concurrent/locks/AbstractQueuedSynchronizer", "reacquire")
+            | ("java/util/concurrent/locks/AbstractQueuedSynchronizer", "acquireOnOOME")
+            | ("java/util/concurrent/locks/AbstractQueuedSynchronizer", "cleanQueue")
+            | ("java/util/concurrent/locks/AbstractQueuedSynchronizer", "cancelAcquire")
+            | ("java/util/concurrent/locks/AbstractQueuedSynchronizer$Node", "casPrev")
+            | ("java/util/concurrent/locks/AbstractQueuedSynchronizer$Node", "casNext")
+            | ("java/util/concurrent/locks/AbstractQueuedSynchronizer$Node", "getAndUnsetStatus")
+            | ("java/util/concurrent/locks/AbstractQueuedSynchronizer$Node", "setPrevRelaxed")
+            | ("java/util/concurrent/locks/AbstractQueuedSynchronizer$Node", "setStatusRelaxed")
+            | ("java/util/concurrent/locks/AbstractQueuedSynchronizer$Node", "clearStatus")
+            | ("java/util/concurrent/locks/AbstractQueuedSynchronizer$ConditionObject", "signal")
+            | ("java/util/concurrent/locks/AbstractQueuedSynchronizer$ConditionObject", "signalAll")
+            | ("java/util/concurrent/locks/AbstractQueuedSynchronizer$ConditionObject", "doSignal")
+            | ("java/util/concurrent/locks/AbstractQueuedSynchronizer$ConditionObject", "await")
+            | ("java/util/concurrent/locks/AbstractQueuedSynchronizer$ConditionObject", "awaitNanos")
+            | ("java/util/concurrent/locks/AbstractQueuedSynchronizer$ConditionObject", "awaitUntil")
+            | (
+                "java/util/concurrent/locks/AbstractQueuedSynchronizer$ConditionObject",
+                "awaitUninterruptibly"
+            )
+            | (
+                "java/util/concurrent/locks/AbstractQueuedSynchronizer$ConditionObject",
+                "newConditionNode"
+            )
+            | ("java/util/concurrent/locks/AbstractQueuedSynchronizer$ConditionObject", "enableWait")
+            // --- AbstractQueuedLongSynchronizer (JDK 25+, long state) ---
+            | ("java/util/concurrent/locks/AbstractQueuedLongSynchronizer", "acquire")
+            | ("java/util/concurrent/locks/AbstractQueuedLongSynchronizer", "release")
+            | ("java/util/concurrent/locks/AbstractQueuedLongSynchronizer", "acquireShared")
+            | ("java/util/concurrent/locks/AbstractQueuedLongSynchronizer", "releaseShared")
+            | ("java/util/concurrent/locks/AbstractQueuedLongSynchronizer", "signalNext")
+            | ("java/util/concurrent/locks/AbstractQueuedLongSynchronizer", "signalNextIfShared")
+            | ("java/util/concurrent/locks/AbstractQueuedLongSynchronizer", "tryInitializeHead")
+            | ("java/util/concurrent/locks/AbstractQueuedLongSynchronizer", "casTail")
+            | ("java/util/concurrent/locks/AbstractQueuedLongSynchronizer", "enqueue")
+            | ("java/util/concurrent/locks/AbstractQueuedLongSynchronizer", "isEnqueued")
+            | ("java/util/concurrent/locks/AbstractQueuedLongSynchronizer", "reacquire")
+            | ("java/util/concurrent/locks/AbstractQueuedLongSynchronizer", "acquireOnOOME")
+            | ("java/util/concurrent/locks/AbstractQueuedLongSynchronizer", "cleanQueue")
+            | ("java/util/concurrent/locks/AbstractQueuedLongSynchronizer", "cancelAcquire")
+            | ("java/util/concurrent/locks/AbstractQueuedLongSynchronizer$Node", "casPrev")
+            | ("java/util/concurrent/locks/AbstractQueuedLongSynchronizer$Node", "casNext")
+            | (
+                "java/util/concurrent/locks/AbstractQueuedLongSynchronizer$Node",
+                "getAndUnsetStatus"
+            )
+            | ("java/util/concurrent/locks/AbstractQueuedLongSynchronizer$Node", "setPrevRelaxed")
+            | ("java/util/concurrent/locks/AbstractQueuedLongSynchronizer$Node", "setStatusRelaxed")
+            | ("java/util/concurrent/locks/AbstractQueuedLongSynchronizer$Node", "clearStatus")
+            | ("java/util/concurrent/locks/AbstractQueuedLongSynchronizer$ConditionObject", "signal")
+            | ("java/util/concurrent/locks/AbstractQueuedLongSynchronizer$ConditionObject", "signalAll")
+            | ("java/util/concurrent/locks/AbstractQueuedLongSynchronizer$ConditionObject", "doSignal")
+            | ("java/util/concurrent/locks/AbstractQueuedLongSynchronizer$ConditionObject", "await")
+            | ("java/util/concurrent/locks/AbstractQueuedLongSynchronizer$ConditionObject", "awaitNanos")
+            | ("java/util/concurrent/locks/AbstractQueuedLongSynchronizer$ConditionObject", "awaitUntil")
+            | (
+                "java/util/concurrent/locks/AbstractQueuedLongSynchronizer$ConditionObject",
+                "awaitUninterruptibly"
+            )
+            | (
+                "java/util/concurrent/locks/AbstractQueuedLongSynchronizer$ConditionObject",
+                "newConditionNode"
+            )
+            | (
+                "java/util/concurrent/locks/AbstractQueuedLongSynchronizer$ConditionObject",
+                "enableWait"
+            )
+            // --- ReentrantReadWriteLock ---
+            | ("java/util/concurrent/locks/ReentrantReadWriteLock$WriteLock", "lock")
+            | ("java/util/concurrent/locks/ReentrantReadWriteLock$WriteLock", "unlock")
+            | ("java/util/concurrent/locks/ReentrantReadWriteLock$WriteLock", "tryLock")
+            | ("java/util/concurrent/locks/ReentrantReadWriteLock$ReadLock", "lock")
+            | ("java/util/concurrent/locks/ReentrantReadWriteLock$ReadLock", "unlock")
+            | ("java/util/concurrent/locks/ReentrantReadWriteLock$ReadLock", "tryLock")
+            | ("java/util/concurrent/locks/ReentrantReadWriteLock$Sync", "tryAcquire")
+            | ("java/util/concurrent/locks/ReentrantReadWriteLock$Sync", "tryRelease")
+            | ("java/util/concurrent/locks/ReentrantReadWriteLock$Sync", "tryAcquireShared")
+            | ("java/util/concurrent/locks/ReentrantReadWriteLock$Sync", "tryReleaseShared")
+            | ("java/util/concurrent/locks/ReentrantReadWriteLock$Sync$HoldCounter", "<init>")
+            | (
+                "java/util/concurrent/locks/ReentrantReadWriteLock$Sync$ThreadLocalHoldCounter",
+                "initialValue"
+            )
+    )
+}
+
 fn is_antlr_prediction_context_miscompile(class_name: &str, method_name: &str) -> bool {
     matches!(
         (class_name, method_name),
@@ -2276,11 +2375,18 @@ mod tests {
     }
 
     #[test]
-    fn aqs_condition_wait_variants_lifted_under_safe_default() {
-        // These remain in the historical targeted table for opt-in regalloc
-        // diagnosis, but the safe default has no register-resident GPR locals.
+    fn aqs_condition_wait_variants_stay_skipped_unconditionally() {
+        // Superseded by `is_known_miscompile_aqs_family`: this family is
+        // demonstrably still broken even under the safe (GPR-local-homes-
+        // disabled) default (see that function's doc comment — a heavy-
+        // contention repro of both `ReentrantReadWriteLock` and plain
+        // `ReentrantLock` hangs permanently under exactly this config), so
+        // it must stay skipped under Conservative regardless of
+        // `callee_saved_gpr_local_homes_enabled()`. Aggressive still lifts
+        // it, same as every other targeted-list entry, for developers
+        // deliberately hunting new miscompiles.
         for method in ["await", "awaitNanos", "awaitUntil", "awaitUninterruptibly"] {
-            assert!(is_known_miscompile(
+            assert!(is_known_miscompile_aqs_family(
                 "java/util/concurrent/locks/AbstractQueuedSynchronizer$ConditionObject",
                 method
             ));
@@ -2292,8 +2398,9 @@ mod tests {
                     true,
                     SkipPolicy::Conservative,
                 ),
-                None,
-                "AQS ConditionObject.{method} must be JIT-eligible under the safe default"
+                Some(SkipReason::JavaUtilCollection),
+                "AQS ConditionObject.{method} must stay skipped under Conservative \
+                 regardless of the GPR-local-homes gate"
             );
             assert_eq!(
                 check(
@@ -2304,9 +2411,90 @@ mod tests {
                     SkipPolicy::Aggressive,
                 ),
                 None,
-                "Aggressive policy remains JIT-eligible"
+                "Aggressive policy still deliberately lifts this family"
             );
         }
+    }
+
+    #[test]
+    fn aqs_long_synchronizer_and_rrwl_sync_family_skipped_unconditionally() {
+        // The newly-discovered members of this family (Node helpers,
+        // tryInitializeHead, ReentrantReadWriteLock$Sync/HoldCounter) —
+        // confirmed via a 16-thread heavy-contention repro that these are
+        // the actually-compiled methods (via CRATONVM_DBG_JITC) at the
+        // moment both ReentrantReadWriteLock and ReentrantLock hang.
+        let cases: &[(&str, &str)] = &[
+            (
+                "java/util/concurrent/locks/AbstractQueuedSynchronizer",
+                "tryInitializeHead",
+            ),
+            (
+                "java/util/concurrent/locks/AbstractQueuedSynchronizer$Node",
+                "getAndUnsetStatus",
+            ),
+            (
+                "java/util/concurrent/locks/AbstractQueuedSynchronizer$Node",
+                "clearStatus",
+            ),
+            (
+                "java/util/concurrent/locks/AbstractQueuedLongSynchronizer",
+                "acquire",
+            ),
+            (
+                "java/util/concurrent/locks/AbstractQueuedLongSynchronizer",
+                "tryInitializeHead",
+            ),
+            (
+                "java/util/concurrent/locks/AbstractQueuedLongSynchronizer$Node",
+                "getAndUnsetStatus",
+            ),
+            (
+                "java/util/concurrent/locks/AbstractQueuedLongSynchronizer$Node",
+                "clearStatus",
+            ),
+            (
+                "java/util/concurrent/locks/ReentrantReadWriteLock$WriteLock",
+                "lock",
+            ),
+            (
+                "java/util/concurrent/locks/ReentrantReadWriteLock$Sync",
+                "tryAcquireShared",
+            ),
+        ];
+        for &(class_name, method) in cases {
+            assert!(
+                is_known_miscompile_aqs_family(class_name, method),
+                "{class_name}.{method} must be in the AQS family list"
+            );
+            assert_eq!(
+                check(class_name, method, false, true, SkipPolicy::Conservative),
+                Some(SkipReason::JavaUtilCollection),
+                "{class_name}.{method} must stay skipped under Conservative"
+            );
+            assert_eq!(
+                check(class_name, method, false, true, SkipPolicy::Aggressive),
+                None,
+                "{class_name}.{method} must be lifted under Aggressive"
+            );
+        }
+
+        // `HoldCounter.<init>` is also in the family list (belt-and-suspenders
+        // for the `should_skip_jit_with_init`/OSR path's non-trivial-
+        // constructor check), but under the plain `check()` helper
+        // (`skip_init_check=false`) EVERY `<init>` is unconditionally skipped
+        // by an earlier, more general rule (`skip_list.rs` around the
+        // `if method_name == "<init>" { return Some(SkipReason::Constructor) }`
+        // block) before this family's check is ever reached — so it reports
+        // `Constructor`, not `JavaUtilCollection`, but is still skipped
+        // either way.
+        let class_name = "java/util/concurrent/locks/ReentrantReadWriteLock$Sync$HoldCounter";
+        assert!(is_known_miscompile_aqs_family(class_name, "<init>"));
+        assert_eq!(
+            check(class_name, "<init>", false, true, SkipPolicy::Conservative),
+            Some(SkipReason::Constructor),
+            "HoldCounter.<init> must stay skipped under Conservative (via the general \
+             constructor rule)"
+        );
     }
 
     #[test]
