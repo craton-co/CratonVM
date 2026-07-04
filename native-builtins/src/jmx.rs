@@ -516,41 +516,62 @@ pub fn register_vm_management_impl(r: &mut NativeMethodRegistry) {
 //
 // Implementing the full RMI stack (RMIConnector, JRMP, stub/skeleton,
 // remote method dispatch) is out of scope; we don't have an RMI runtime.
-// Instead, override `newJMXConnector` natively to raise an `IOException`
-// directly — the same class of exception a JMX client gets when the
-// remote host is unreachable. nodetool's existing catch-and-print path
-// then reports:
+//
+// BUT: not every JMX protocol needs the RMI stack. Spring Framework's jmx.*
+// test suite (`ConnectorServerFactoryBeanTests`, `MBeanServerConnectionFactoryBeanTests`,
+// `RemoteMBeanClientInterceptorTests`, ...) connects over `jmxmp`
+// (`service:jmx:jmxmp://...`), backed by `org.glassfish.external:
+// opendmk_jmxremote_optional_jar` — a classic pre-JPMS jar whose
+// `com.sun.jmx.remote.protocol.jmxmp.{ClientProvider,ServerProvider}` classes
+// ARE declared via plain `META-INF/services/javax.management.remote.
+// JMXConnectorProvider` (and `...JMXConnectorServerProvider`) descriptors.
+// That is exactly the classpath-scanning form our own `ServiceLoader`
+// supports — real bytecode for `jmxmp` would work end-to-end if it ran.
+//
+// So: instead of unconditionally raising the canned "not implemented"
+// error, look up real `JMXConnectorProvider` instances ourselves (via the
+// same `ServiceLoader.load` + `iterator()` natives real JDK bytecode would
+// use) and delegate to whichever provider accepts the URL's protocol —
+// this covers `jmxmp` (and any other classpath-declared provider) with
+// the REAL provider implementation, no synthetic stand-in. Only fall back
+// to the "not implemented" IOException when no provider on the classpath
+// claims the protocol (still exactly right for `rmi`, whose provider is a
+// JPMS module our ServiceLoader can't see) — preserving nodetool's
+// existing clean-exit UX:
 //
 //     nodetool: Failed to connect to '127.0.0.1:7199' \
 //         - IOException: 'JMX over RMI is not implemented in CratonVM …'.
-//
-// which is the correct connection-layer outcome for "cannot reach this
-// JMX broker", and lets the launcher exit rc=1 cleanly instead of
-// short-circuiting at URL/provider resolution. Bonus: this also unblocks
-// any other JMX-using Java app from tripping over the same "Unsupported
-// protocol: rmi" error during boot.
 // ---------------------------------------------------------------------------
 fn register_jmx_connector_factory(r: &mut NativeMethodRegistry) {
     let __prev_cat = r.current_category();
     r.set_category(cratonvm_native_api::NativeKind::SyntheticStub);
-    // Static `newJMXConnector(JMXServiceURL, Map) -> JMXConnector` — the
-    // private chain `connect -> newJMXConnector -> ServiceLoader` ends
-    // here on the real JDK. Overriding the public factory method shorts
-    // out the provider lookup that we can't satisfy without parsing
-    // module-info SPI declarations.
     r.register(
         "javax/management/remote/JMXConnectorFactory",
         "newJMXConnector",
         "(Ljavax/management/remote/JMXServiceURL;Ljava/util/Map;)Ljavax/management/remote/JMXConnector;",
         |ctx, args| {
+            let url_val = args.first().copied().unwrap_or(Value::Object(None));
+            let env_val = args.get(1).copied().unwrap_or(Value::Object(None));
+
+            if let Some(connector_or_err) = try_delegate_to_real_provider(
+                ctx,
+                "javax/management/remote/JMXConnectorProvider",
+                "newJMXConnector",
+                "(Ljavax/management/remote/JMXServiceURL;Ljava/util/Map;)Ljavax/management/remote/JMXConnector;",
+                &[url_val, env_val],
+            ) {
+                return connector_or_err;
+            }
+
+            // No classpath-declared provider claimed this protocol.
             // Reconstruct the service URL for the error message. JMXServiceURL
             // is a real-JDK class; its `toString` returns
             // `service:jmx:<protocol>://<host>:<port><path>`. If the call fails
             // (e.g. argument is null) we still raise a meaningful IOException
             // so the caller's catch surfaces the right error class.
-            let url_str = match args.first() {
-                Some(Value::Object(Some(u))) => ctx
-                    .invoke_virtual(*u, "toString", "()Ljava/lang/String;", &[])
+            let url_str = match url_val {
+                Value::Object(Some(u)) => ctx
+                    .invoke_virtual(u, "toString", "()Ljava/lang/String;", &[])
                     .ok()
                     .and_then(|v| v)
                     .and_then(|v| match v {
@@ -567,6 +588,81 @@ fn register_jmx_connector_factory(r: &mut NativeMethodRegistry) {
         },
     );
     r.set_category(__prev_cat);
+}
+
+/// Look up real `provider_iface` instances via `ServiceLoader.load` +
+/// `iterator()` (both already-real natives in `service_loader.rs`) and try
+/// each one's `factory_method(url, env)` in turn, mirroring what real-JDK
+/// `JMXConnectorFactory`/`JMXConnectorServerFactory` bytecode does via
+/// `getConnectorAsService`/`ProviderFinder`.
+///
+/// Returns `None` when no provider was found at all (or every provider
+/// rejected the URL with `MalformedURLException`, meaning "protocol not
+/// recognized by any provider on the classpath") — callers should fall
+/// back to their own "unsupported" handling in that case. Returns
+/// `Some(Ok(v))` on the first provider that successfully produced a
+/// connector/connector-server, or `Some(Err(..))` if a provider raised
+/// some OTHER exception (surfaced as-is, since that is real bytecode's own
+/// diagnosis of a genuine failure, more accurate than a canned message).
+///
+/// Simplification vs. real JDK's `ProviderFinder`: a non-`MalformedURLException`
+/// failure from one provider is remembered but does not stop the search
+/// (real JDK short-circuits immediately on `JMXProviderException`). With
+/// only one provider realistically ever on a classpath (there's no second
+/// JMX transport jar to conflict with), this is behavior-identical in
+/// practice and avoids replicating JDK's internal stream/predicate plumbing.
+fn try_delegate_to_real_provider(
+    ctx: &mut dyn NativeContext,
+    provider_iface: &str,
+    factory_method: &str,
+    factory_descriptor: &str,
+    factory_args: &[Value],
+) -> Option<MethodCallResult> {
+    let iface_id = ctx.ensure_class_initialized(provider_iface).ok()?;
+    let mirror = ctx.get_class_mirror(iface_id);
+    let loader_obj = match ctx.invoke(
+        "java/util/ServiceLoader",
+        "load",
+        "(Ljava/lang/Class;)Ljava/util/ServiceLoader;",
+        &[Value::Object(Some(mirror))],
+    ) {
+        Ok(Some(Value::Object(Some(sl)))) => sl,
+        _ => return None,
+    };
+    let iter_obj = match ctx.invoke_virtual(loader_obj, "iterator", "()Ljava/util/Iterator;", &[])
+    {
+        Ok(Some(Value::Object(Some(it)))) => it,
+        _ => return None,
+    };
+
+    let mut first_exception: Option<ObjectRef> = None;
+    loop {
+        match ctx.invoke_virtual(iter_obj, "hasNext", "()Z", &[]) {
+            Ok(Some(Value::Int(1))) => {}
+            _ => break,
+        }
+        let provider_obj = match ctx.invoke_virtual(iter_obj, "next", "()Ljava/lang/Object;", &[])
+        {
+            Ok(Some(Value::Object(Some(p)))) => p,
+            _ => break,
+        };
+        match ctx.invoke_virtual(provider_obj, factory_method, factory_descriptor, factory_args) {
+            Ok(Some(v)) => return Some(Ok(Some(v))),
+            Ok(None) => {}
+            Err(MethodCallFailed::ExceptionThrown(exc)) => {
+                let is_malformed = ctx
+                    .class_name_of_id(ctx.class_id_of_object(exc))
+                    .as_deref()
+                    == Some("java/net/MalformedURLException");
+                if !is_malformed && first_exception.is_none() {
+                    first_exception = Some(exc);
+                }
+            }
+            Err(internal) => return Some(Err(internal)),
+        }
+    }
+
+    first_exception.map(|exc| Err(MethodCallFailed::ExceptionThrown(exc)))
 }
 
 // ---------------------------------------------------------------------------
@@ -968,6 +1064,25 @@ pub fn register_operating_system_impl(r: &mut NativeMethodRegistry) {
         r.register(mcls, name, "()D", neg_one_double);
     }
     r.register(mcls, "initialize0", "()V", |_ctx, _args| Ok(None));
+
+    // `jdk.internal.platform.CgroupMetrics.isUseContainerSupport()Z` gates
+    // `Metrics.getInstance()`: when it returns `false`, `getInstance()`
+    // returns `null` immediately, without ever calling
+    // `CgroupSubsystemFactory.create()` (which would need real
+    // `/sys/fs/cgroup` file parsing we don't implement). Real JDK takes
+    // this exact path under `-XX:-UseContainerSupport` or outside a
+    // container, and `ManagementFactory`'s callers already handle a null
+    // `Metrics` instance. Reporting container support as off is honest —
+    // CratonVM genuinely does no cgroup accounting — not a fabricated
+    // value, and it was an unregistered native (UnsatisfiedLinkError)
+    // that aborted `ManagementFactory.getPlatformMBeanServer()` before
+    // this fix.
+    r.register(
+        "jdk/internal/platform/CgroupMetrics",
+        "isUseContainerSupport",
+        "()Z",
+        |_ctx, _args| Ok(Some(Value::Int(0))),
+    );
 
     r.set_category(__prev_cat);
 }
