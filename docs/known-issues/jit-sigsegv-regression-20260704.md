@@ -1,9 +1,11 @@
 # New JIT SIGSEGV regression cluster — dev `8f29af96` (2026-07-04)
 
-**Status:** ROOT-CAUSED, candidate fix on branch `fix/jit-sigsegv-regression-a11025aa`
-(NOT merged — needs human sign-off, see "Candidate fix" below). **Severity:
-HIGH** — hard crashes (SIGSEGV), worse than the FAIL/HANG statuses these
-classes previously had.
+**Status:** FIXED and MERGED to `dev` at `042a064c` (merge of
+`fix/jit-sigsegv-regression-a11025aa`, fix commit `839f1ea27`), per explicit
+user sign-off on 2026-07-04 — see "Candidate fix" and "Post-merge
+verification" below for what was (and wasn't) re-checked before landing.
+**Severity: HIGH** — hard crashes (SIGSEGV), worse than the FAIL/HANG statuses
+these classes previously had.
 
 ## How this was found
 Rerunning the 255 non-passed classes from a full Hibernate suite run at dev
@@ -227,14 +229,50 @@ Verified so far:
   any *other* codegen path that reads `heap_local_offset` (this fix only
   addresses the `0xba` arm specifically).
 
-**Guidance for other agents:** avoid relying on JIT-heavy workloads on dev at
-or after `8f29af96` until this lands — 18 Hibernate ORM test classes SIGSEGV
-that did not before, and any method containing a reachable-at-runtime
-invokedynamic with no other heap-touching bytecode is a candidate for the
-same corruption outside Hibernate too (this is a general JIT-codegen bug, not
-Hibernate-specific — Hibernate's ORM test suite just happens to exercise a
-lot of `assert` statements in hot per-call methods). `git log` /
-`git diff 81a31c08..8f29af96` work fine for non-JIT investigation; anything
-that boots and runs sustained JIT-compiled Java code should either pin to
-`81a31c08` (or earlier) or cherry-pick/rebase onto
-`fix/jit-sigsegv-regression-a11025aa` once it has had additional review.
+### Post-merge verification (2026-07-04)
+
+Merged to `dev` at the user's explicit request before the full 255-class
+rerun could complete (a bisection + build cycle already consumed the
+available window). Before merging, additionally ran on the Windows box (on
+top of the already-landed merge of `origin/dev`, which brought in 2 more
+commits — see the "concurrent origin/dev sync" note below):
+- `cargo check --workspace`: clean, zero errors.
+- `cargo test -p cratonvm-jit` (dev profile — the jit crate's suite relies on
+  `debug_assert!`, which is compiled out under `--release`, so 4
+  aarch64-branch-offset-overflow tests spuriously fail in `--release` only;
+  confirmed pre-existing/unrelated to this fix, not a regression): **873
+  passed, 0 failed.**
+
+**Still NOT done** (follow-up, not blocking since the fix is minimal,
+mirrors an established pattern (`needs_heap` on every other opcode touching
+`heap_local_offset`), and passed its own targeted verification pre-merge):
+- Full rerun of all 255 `nonpassed_latest.txt` classes.
+- Full `passed.txt` regression sweep (4498 classes; only 15 sampled
+  pre-merge).
+- Audit of whether any *other* opcode added/changed in
+  `81a31c08..8f29af96` has a similar missing-`needs_heap` gap.
+
+### Concurrent origin/dev sync (found while merging this fix)
+
+While merging this fix branch into `dev`, `origin/dev` had moved 2 commits
+ahead of local `dev` (`b7ea8b93`/`81762470`, a `jla_define_class`
+duplicate-definition cleanup) — unrelated to this bug, but merging it
+surfaced a **silent, non-conflicting** bad auto-merge: local `dev` had
+independently "restored" `jla_define_class` after an earlier bad merge
+sequence, but restored the *wrong* (stale, `cl_define_class_basic`-backed)
+implementation, while `origin/dev` had deliberately kept the correct,
+newer `define_class_via_full`-backed one. Git's merge picked the local
+(wrong) version with no conflict marker since the two diffs didn't
+textually overlap. Fixed as a separate follow-up commit
+(`f081f587`) that replaces it with `origin/dev`'s version — unrelated to
+the JIT fix itself, noted here only because it landed in the same push.
+
+**Guidance for other agents:** the fix is merged — JIT-heavy workloads on
+current `dev` should no longer hit this specific SIGSEGV. That said, any
+method containing a reachable-at-runtime invokedynamic with no other
+heap-touching bytecode was the exposure (general JIT-codegen bug, not
+Hibernate-specific), so treat the "still NOT done" items above as open
+follow-up work rather than fully closed. If a *new* SIGSEGV surfaces in a
+similar shape (deopt-stub / `heap_local_offset`-adjacent), check other
+opcodes for the same missing-`needs_heap` gap before assuming it's a new
+bug.
