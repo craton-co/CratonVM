@@ -15646,11 +15646,28 @@ mod tests {
     }
 
     #[test]
-    fn t19_h10_get_resource_as_stream_rejects_traversal_name() {
+    fn t19_h10_get_resource_as_stream_traversal_name_reaches_find_resource() {
+        // Stale-test fix (this test used to assert the OPPOSITE: that a `..`
+        // name is rejected before `find_resource` is ever consulted). That
+        // was the pre-"residual-1 fix" policy; `t19_h10_validate_resource_name`
+        // now deliberately lets `..` segments through this layer (see its
+        // doc comment above `t19_h10_validate_resource_name_allows_traversal_
+        // rejects_backslash`) because HotSpot tolerates them for legitimate
+        // directory-classpath-root lookups (e.g.
+        // `SomeClass.class.getResourceAsStream("../Sibling.class")`).
+        // Real path-traversal containment is enforced one layer down, in
+        // `ClassPath::find_resource` (`classloading/src/class_path.rs`),
+        // which canonicalizes the resolved path and requires it stay
+        // `starts_with` the classpath root — covered directly by that
+        // crate's own `find_resource_path_traversal_rejected` /
+        // `find_resource_rejects_dotdot_traversal` tests against a REAL
+        // classpath. `MockNativeContext::find_resource` here is a naive
+        // exact-key lookup with no such containment check (it has no
+        // classpath root to canonicalize against), so this test can only
+        // pin the contract at this layer: a `..`-bearing name is NOT
+        // rejected before reaching `find_resource` — it is looked up
+        // as-is, and whatever `find_resource` decides is authoritative.
         let mut ctx = mock_ctx();
-        // Even if a malicious classpath plants a resource at the traversal
-        // target, the validation gate must short-circuit BEFORE find_resource
-        // is consulted.
         ctx.set_resource("../../../etc/passwd", b"oops".to_vec());
         let cid = ctx
             .ensure_class_initialized("org/keycloak/common/Version")
@@ -15663,10 +15680,11 @@ mod tests {
             &[Value::Object(Some(mirror)), Value::Object(Some(name))],
         )
         .unwrap();
-        assert_eq!(
-            r,
-            Some(Value::Object(None)),
-            "traversal name must be rejected, returning null"
+        assert!(
+            matches!(r, Some(Value::Object(Some(_)))),
+            "a `..`-bearing name must reach find_resource unmodified rather than \
+             being rejected at the validation layer — real containment is \
+             ClassPath::find_resource's job, not this native's"
         );
     }
 
