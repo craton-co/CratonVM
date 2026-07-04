@@ -2312,6 +2312,32 @@ fn cl_define_class0(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRe
 /// are pure Java and route through these natives; CGLIB / direct
 /// user code typically calls `defineClass1` because that's what the
 /// public 4-arg / 5-arg overloads delegate to.
+fn jla_system_define_class(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let byte_array = match args.get(4) {
+        Some(Value::Object(Some(arr))) => *arr,
+        _ => {
+            return Err(cratonvm_types::error::RuntimeError::IllegalArgumentException {
+                message: "System$1.defineClass: bytes must not be null".into(),
+            }
+            .into());
+        }
+    };
+    let len = ctx.array_length(byte_array) as i32;
+    let mapped = vec![
+        args.get(1).copied().unwrap_or(Value::Object(None)),
+        args.get(2).copied().unwrap_or(Value::Object(None)),
+        args.get(3).copied().unwrap_or(Value::Object(None)),
+        args.get(4).copied().unwrap_or(Value::Object(None)),
+        Value::Int(0),
+        Value::Int(len),
+        args.get(5).copied().unwrap_or(Value::Object(None)),
+        args.get(6).copied().unwrap_or(Value::Int(0)),
+        args.get(7).copied().unwrap_or(Value::Int(0)),
+        args.get(8).copied().unwrap_or(Value::Object(None)),
+    ];
+    cl_define_class0(ctx, &mapped)
+}
+
 pub fn register_classloader_define_class(r: &mut NativeMethodRegistry) {
     let cl = CL_CLASS;
 
@@ -2341,6 +2367,13 @@ pub fn register_classloader_define_class(r: &mut NativeMethodRegistry) {
         "defineClass0",
         "(Ljava/lang/ClassLoader;Ljava/lang/Class;Ljava/lang/String;[BIILjava/security/ProtectionDomain;ZILjava/lang/Object;)Ljava/lang/Class;",
         cl_define_class0,
+    );
+
+    r.register(
+        "java/lang/System$1",
+        "defineClass",
+        "(Ljava/lang/ClassLoader;Ljava/lang/Class;Ljava/lang/String;[BLjava/security/ProtectionDomain;ZILjava/lang/Object;)Ljava/lang/Class;",
+        jla_system_define_class,
     );
 }
 

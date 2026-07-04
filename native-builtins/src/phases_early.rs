@@ -15,7 +15,8 @@ use crate::lang_misc::register_phase53_record;
 use crate::lang_string::register_phase52_string_buffer;
 use crate::{
     alloc_concurrent_synthetic, build_real_layout_string_hashset, native_noop,
-    native_noop_with_this, native_return_false, native_return_zero, obj_arg,
+    native_noop_with_this, native_return_false, native_return_zero,
+    native_unsafe_ensure_class_initialized, obj_arg,
 };
 use crate::{
     native_return_first_arg, native_return_null, native_synchronized_collection,
@@ -2485,8 +2486,28 @@ pub(crate) fn register_core_stdlib_extras(r: &mut NativeMethodRegistry) {
         unsafe_cls,
         "ensureClassInitialized0",
         "(Ljava/lang/Class;)V",
+        native_unsafe_ensure_class_initialized,
+    );
+
+    // jdk.internal.misc.CDS: CratonVM does not use HotSpot class-data sharing.
+    // Report all dump/sharing modes disabled and make archive hooks no-ops.
+    let cds_cls = "jdk/internal/misc/CDS";
+    r.register(cds_cls, "isDumpingClassList0", "()Z", native_return_false);
+    r.register(cds_cls, "isDumpingArchive0", "()Z", native_return_false);
+    r.register(cds_cls, "isSharingEnabled0", "()Z", native_return_false);
+    r.register(cds_cls, "logLambdaFormInvoker", "(Ljava/lang/String;)V", native_noop);
+    r.register(cds_cls, "initializeFromArchive", "(Ljava/lang/Class;)V", native_noop);
+    r.register(
+        cds_cls,
+        "defineArchivedModules",
+        "(Ljava/lang/ClassLoader;Ljava/lang/ClassLoader;)V",
         native_noop,
     );
+    r.register(cds_cls, "getRandomSeedForDumping", "()J", |_ctx, _args| {
+        Ok(Some(Value::Long(0)))
+    });
+    r.register(cds_cls, "dumpClassList", "(Ljava/lang/String;)V", native_noop);
+    r.register(cds_cls, "dumpDynamicArchive", "(Ljava/lang/String;)V", native_noop);
 
     // jdk.internal.misc.VM natives
     r.register("jdk/internal/misc/VM", "initialize", "()V", native_noop);
