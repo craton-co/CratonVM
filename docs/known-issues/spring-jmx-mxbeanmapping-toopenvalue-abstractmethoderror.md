@@ -63,6 +63,22 @@ CRATONVM_BIN=<built binary> SPRING=/data/cratonvm/apps/spring-framework \
   run --jdk real --jit on --batch 8 --only 'jmx\.'
 ```
 
+## WIP branch (unmerged, incomplete)
+
+`fix/jmx-platform-mxbean-registration` (pushed to origin, not merged) has a
+partial attempt at this: registers `com/sun/jmx/mbeanserver/MXBeanMapping.
+toOpenValue`/`fromOpenValue` as identity-passthrough natives (targeting the
+AbstractMethodError directly), plus makes `MemoryMXBean`'s heap `max` report
+the real configured `-Xmx` instead of the `-1` sentinel. As of the last run
+before that worktree was shut down, the targeted 2-class probe
+(`MBeanClientInterceptorTests` + `RemoteMBeanClientInterceptorTests`, 28
+test methods) was at 13/28 passing (up from 11/28 baseline) -- progress, but
+not resolved. Whoever picks this up next should start from that branch
+rather than re-deriving the `toOpenValue` identity-passthrough approach from
+scratch, but should NOT merge it into `dev` without finishing verification
+against the full jmx suite (`--only 'jmx\\.'`) and the HotSpot 321/321
+baseline.
+
 ## Not yet investigated
 
 - Where CratonVM resolves `com.sun.jmx.mbeanserver.MXBeanMapping` subclasses
