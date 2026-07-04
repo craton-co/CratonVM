@@ -424,6 +424,13 @@ regression):
   and its ByteBuddy proxy collides. loadClass-override isolation itself works; this is deeper
   (core class-store change, broad blast radius). Min repro `.scratch-hhsf/IsoProbe3.java`. Same
   family as **SBR-14** / `SC-custom-classloader`.
+- [hib-bytecode-enhancement-loader-faithful-linking.md](hib-bytecode-enhancement-loader-faithful-linking.md) —
+  🔴 **REOPENED 2026-07-04** (moved back from `docs/internal`, where it was mis-archived as
+  "FIXED / ARCHIVED"). Builds on the proxyclassreuse fix above with superclass/interface linking,
+  `invokespecial` owner dispatch, and SessionFactory-build loader-identity fixes — all confirmed
+  genuinely landed on `dev` by a fresh source audit. But `enhancement.lazy.*`/`mapping.lazytoone.*`
+  remain the single largest open Hibernate-enhancement gap (a fresh 18-class sample: 2/18 PASS,
+  14/18 FAIL, 1/18 HANG), not the "separate residual" the archived doc implied.
 - [hib-sortnatural-persistentsortedset-cascade-drop.md](../internal/hibernate-bugs/hib-sortnatural-persistentsortedset-cascade-drop.md) —
   ✅ **FIXED on dev** (`9ac7ef1d`; moved to docs/internal). `SortNaturalTest` (`sorted.set`/`sorted.map`): a cascaded `@OneToMany SortedSet`
   drops an element on **persist** (only 1 of 2 rows inserted; `size()` 2→1). Core `TreeSet` verified

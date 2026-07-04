@@ -2,9 +2,9 @@
 
 | | |
 |---|---|
-| **Status** | FIXED / ARCHIVED — the loader-faithful issue is fixed on `dev`: eager-enhancement linking, the two gate-on crash regressions, the SessionFactory-build blocker, `enhancement.lazy.*` loader identity, lambda impl dispatch, and `Lookup.defineClass` helper loader registration are all present behind gate `CRATONVM_LOADER_AWARE_RESOLUTION` (default **OFF**, except the namespace-id collision fix). Historical validation: gate-on `gated_subset` PASS **31 → 54** (0 CRASH); **19 `enhancement.lazy.*` pass** (was 0), incl. `LazyBasicFieldAccessTest`. Remaining lazy/lazytoone FAILs mentioned below are separate residual issues, not this loader-faithful bug. |
+| **Status** | 🔴 **REOPENED 2026-07-04** (moved back from `docs/internal`, where it was incorrectly archived as "FIXED / ARCHIVED"). The 6 numbered linking/dispatch fixes described below (superclass/interface linking, `preload_supertypes_via_loader`, verifier hierarchy lookup, `invokespecial` owner dispatch, link-time verification skip-flag, `Lookup.defineClass` namespace inheritance) plus the `allocate_loader_id` KEYSTONE fix are genuinely **landed and verified present** on current `dev` (`c20f6f15`, 2026-07-04 source audit — see "Re-verification 2026-07-04" below). But the doc's framing of the remaining `enhancement.lazy.*`/`mapping.lazytoone.*` FAILs as a "separate residual issue" undersold it: a fresh full-suite run this session (`dev 81a31c08+`, gate default-on) found **PASS 4293/4548**, with the `bytecode.enhancement.lazy.*` (~54 classes) + `mapping.lazytoone.*` (~12 classes) cluster as the **single largest remaining Hibernate-enhancement gap**, not a minor residual — same gate, same test package family, same original bug report. A fresh 18-class sample re-run this session (2026-07-04, current `dev`) confirms it is still overwhelmingly broken: **2/18 genuinely PASS**, 14/18 FAIL, 1/18 (`FetchGraphTest`) now HANGS at 450s (previously documented as FAIL-with-NPE, not a hang — a possible new regression, not yet root-caused). The dominant FAIL signature across the sample is exactly the class-identity mismatch this doc's own "Historical blocker" section describes as unfixed (`Could not build SessionFactory: To-one mapping [...] was mapped with targetEntity=`X`, but the attribute is declared as `X`` — same name, different `Class` identity — followed by `Could not instantiate persister` / `no no-arg constructor in ...$HibernateInstantiator`). See "Re-verification 2026-07-04" for the full sample and counts. |
 | **Area** | VM core — real-JDK-mode loader-faithful resolution: superclass/interface *linking* (not just `new`/checkcast/ldc), `invokespecial` owner dispatch, and link-time verification of trusted runtime-generated classes. |
-| **Builds on** | [hib-proxyclassreuse-loader-blind-class-resolution.md](../../known-issues/hib-proxyclassreuse-loader-blind-class-resolution.md) — the three-layer `CONSTANT_Class` / `defineClass`-namespace / `findLoadedClass` fix and the `resolve_class_loader_aware` mechanism. |
+| **Builds on** | [hib-proxyclassreuse-loader-blind-class-resolution.md](hib-proxyclassreuse-loader-blind-class-resolution.md) — the three-layer `CONSTANT_Class` / `defineClass`-namespace / `findLoadedClass` fix and the `resolve_class_loader_aware` mechanism. That doc's gate is now **default-on** (flipped 2026-07-03) and validated via a Hibernate app-gauntlet soak; this doc describes the *linking/dispatch* layer built on top of it. Both docs describe the same loader-identity mechanism at different depths — read the other doc first for the gate's base three-layer fix, this one for the enhancement-specific linking/dispatch/SessionFactory-build work. |
 
 > **RETRY 2026-07-01:** Source audit on current `dev` confirms the named loader-aware pieces
 > are present (`allocate_loader_id` starts at 3, `lambda_impl_dispatch_override` is wired,
@@ -12,9 +12,77 @@
 > user namespaces). The focused builtin classloader test passed via
 > `cargo test -p cratonvm-native-builtins test_builtin_find_loaded_class -- --nocapture`.
 > A broader `cratonvm-vm` loader test build failed before execution because the linker ran out
-> of disk space, and the Hibernate app fixture is gitignored outside this worktree. This file
-> remains archived; any remaining lazy/lazytoone residual should be tracked in a separate
-> `docs/known-issues` entry if reproduced.
+> of disk space, and the Hibernate app fixture is gitignored outside this worktree.
+
+## Re-verification 2026-07-04 (this doc moved back to `docs/known-issues`)
+
+This doc was filed under `docs/internal/hibernate-bugs/` with status "FIXED /
+ARCHIVED", contradicted by a full Hibernate ORM 8.0 suite run earlier the same
+session (dev `81a31c08+`, real-JDK JIT-on, gate on, TIMEOUT=600s, Azure Linux
+host, 4548 classes): PASS 4293/4548, with `bytecode.enhancement.lazy.*`
+(~54 classes) + `mapping.lazytoone.*` (~12 classes) as the dominant remaining
+FAIL cluster even with the gate on. Re-verified from scratch in a fresh
+worktree (`C:/craton/CratonVM-enhdoc`, branch
+`docs/unarchive-enhancement-loader-linking`) off current `dev` (`c20f6f15`):
+
+**Fix audit — 6 of 6 linking/dispatch fixes + the `allocate_loader_id`
+KEYSTONE confirmed present in current source** (read the actual function
+bodies, not just grepped for the gate name):
+
+1. `define_class_with_options` (`classloading/src/class_manager.rs:2715`,
+   gate logic 2958-2985) — present exactly as described.
+2. `preload_supertypes_via_loader` (`native-builtins/src/lang_system.rs:2779`,
+   gate logic 2816-2831) — present exactly as described.
+3. `ClassStoreHierarchy::lookup` (`classloading/src/class_manager.rs:242`,
+   `UserDefined` branch 309-345) — present exactly as described.
+4. `execute_invoke_kind` `is_special` override
+   (`vm/src/runtime/interpreter.rs:15533`, override at 16573-16593) — present
+   exactly as described.
+5. Link-time verification skip-flag fix — behavior present and correct, but
+   **the doc's function name is stale**: `link_and_initialize` does not exist
+   anywhere in the repo. The actual logic lives in `initialize_class_shared`
+   (`vm/src/vm/vm_util.rs:693`, skip-flag check at 744-761) — same file, same
+   substantive behavior, wrong name below (left uncorrected inline to avoid
+   rewriting historical narrative; this is the accurate pointer).
+6. `inherit_lookup_loader` (`native-builtins/src/lookup_define.rs:184`, gate
+   logic 209-223) — present exactly as described.
+7. `allocate_loader_id` KEYSTONE (`vm/src/vm/vm_exec.rs:6815`) — starts at 3,
+   ungated, confirmed present as described.
+
+**Test re-verification — built `cvenhdoc.exe` from this dev HEAD
+(`C:/craton/CratonVM/apps/hib-suite-runner`, real JDK 25, `common.args`
+classpath, `CratonRunner` harness, gate is default-on so no env var needed).**
+An 18-class representative sample of `gated_subset.txt`'s
+lazy/lazytoone classes (chosen to include the specific classes this doc names
+as historically PASS or as known residuals):
+
+| Result | Count | Classes |
+|---|---|---|
+| PASS | 2/18 | `LazyBasicFieldAccessTest` (2/2, matches doc's historical claim), `LazyInCacheTest` (1/1) |
+| FAIL (harness-counted "PASS", not genuinely green) | 1/18 | `BasicAttributesLazyGroupTest` — `found=5 started=0 ok=0 failed=0`: no test method actually ran (a container-level failure the harness's crude `failed=0 && aborted=0` heuristic miscounts as PASS) |
+| FAIL | 14/18 | `BidirectionalLazyTest`, `LazyLoadingTest`, `LazyCollectionLoadingTest`, `EagerAndLazyBasicUpdateTest` (20/40, down from the doc's claimed 40/40), `OnlyLazyBasicUpdateTest` (10/20, down from the doc's claimed 20/20), `LazyGroupTest`, `LazyGroupOneToOneMappedByTests`, `FinalAccessorProxyFactoryTests`, `LazyGroupWithInheritanceTest`, `MergeProxyTest`, `InstrumentedProxyLazyToOneTest`, `ManyToOneAllowProxyTests`, `OneToOneAllowProxyTests`, `InverseToOneAllowProxyTests` |
+| HANG | 1/18 | `FetchGraphTest` (450s timeout) — this doc's own "5th surface" section describes it as FAIL-with-NPE (a lazy-collection runtime bug), **not a hang**; this may be a new regression since that was last checked, not yet root-caused |
+
+The dominant FAIL signature is the identical class-identity mismatch this
+doc's own "Historical blocker" / "Precise root cause" sections already
+describe as unfixed: `Could not build SessionFactory: To-one mapping [...]
+was mapped with targetEntity=`X`, but the attribute is declared as `X`` (same
+name string, different `Class` identity) → `Could not instantiate persister`
+/ `no no-arg constructor in ...$HibernateInstantiator`. This is the spurious
+un-enhanced Application-loader copy leaking into the name-keyed
+`JavaTypeRegistry`, described in this doc's "So the real fix is upstream of
+dispatch/linking" section — still not fixed.
+
+**Conclusion:** the linking/dispatch fixes are real and landed; do not revert
+them. But this doc's prior "FIXED / ARCHIVED" status was wrong — the
+`enhancement.lazy.*`/`mapping.lazytoone.*` cluster remains the single largest
+open Hibernate-enhancement gap, confirmed both by the full-suite run earlier
+this session and by this fresh 18-class targeted sample. Filing back under
+`docs/known-issues` where it belongs per the triage rule (fixed code →
+`docs/internal`; anything with a live, reproducing FAIL cluster →
+`docs/known-issues`). This is a documentation-only correction (plus the
+`git mv`) — the underlying `enhancement.lazy.*` bug itself was not
+investigated or touched here.
 
 ## Context
 
