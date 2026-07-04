@@ -1,7 +1,10 @@
 # JIT inline-alloc header corruption under Hibernate batch workloads (OOM) — OPEN
 
-**Status:** OPEN — root cause not isolated, only characterized. Two candidate
-mechanisms have now been ruled out (see "Additional evidence" below).
+**Status:** OPEN — multiple mechanisms have been ruled out and several real
+bugs have been fixed, but the broader corruption family is not fully closed.
+This pass fixes a shared GenerationalHeap allocation publish-before-initialize
+race; the original Hibernate batch fixture was not present in this checkout
+for an end-to-end rerun.
 **Discovered:** 2026-07-03, while chasing HIB-CV-38 (see
 [`docs/internal/hibernate-bugs/HIB-CV-38-boolean-type-field-static-slot-corruption-FIXED.md`](../internal/hibernate-bugs/HIB-CV-38-boolean-type-field-static-slot-corruption-FIXED.md)
 for the unrelated bug that doc was originally filed for — that one is fixed).
@@ -157,6 +160,35 @@ codegen path allocated the object in the first place).
   `anewarray` have no inline TLAB fast path in `jit/src/x64.rs` at all — they
   always call `jit_newarray`/`jit_anewarray_object`, which build the header via
   the same non-inline, already-safe `heap.try_alloc_array` the interpreter uses.
+
+## 2026-07-04 — shared allocation-helper publish-before-initialize bug fixed
+
+Root cause fixed in `gc/src/gen_heap.rs`: young allocation reserved bytes from
+`young_from` under the arena lock, released that lock, then zeroed the span and
+let callers write the object/array header later. A concurrent GC/walker could
+acquire the same arena lock in that window and observe a reserved but
+headerless allocation. That matches the stale/zero header warning stream and
+also explains why `CRATONVM_JIT_DISABLE_INLINE_NEW=1` did not suppress the
+bug: JIT helper calls for `new`, `newarray`, and `anewarray` still use the
+shared heap allocation path.
+
+The fix adds `try_alloc_young_initialized` / `alloc_young_initialized`, which
+reserve, zero, and run the caller's header initializer while the `young_from`
+lock is still held. The direct old-generation spill paths now also write
+headers while holding the `old_gen` lock, closing the same
+publish-before-initialize shape for major-GC walks.
+
+Validation from branch `codex/hib-inlinealloc-gc-20260703-001`:
+
+- `cargo test -p cratonvm-gc young_alloc_initializes_header_before_unlocking_arena`
+  passed. The regression test blocks inside the initializer and proves the
+  young arena lock is held until the header write can complete.
+- `cargo test -p cratonvm-gc --lib` passed: 762 tests.
+- `cargo build -p cratonvm-cli --bin cratonvm` passed, and the worktree binary
+  was copied to `cratonvm-hib-inlinealloc-gc-20260703-001.exe`.
+- The original `apps/hib-suite-runner` fixture and `common.args` file named in
+  this note are not present in this checkout, so the Hibernate batch repro
+  itself was not rerun here.
 
 ## 2026-07-03/04 — two real conservative-root-scan bugs found and fixed (session on `fix/family-a-inline-alloc-header`); corruption family only partially closed
 
