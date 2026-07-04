@@ -470,6 +470,16 @@ fn should_skip_jit_internal(
     }
 
     if policy == SkipPolicy::Conservative {
+        if is_unconditional_hash_miscompile_cluster(class_name, method_name)
+            && !package_allowed(class_name, allow_packages)
+        {
+            return Some(SkipReason::JavaUtilCollection);
+        }
+        if is_elasticsearch_suite_jit_fragile_cluster(class_name, method_name)
+            && !package_allowed(class_name, allow_packages)
+        {
+            return Some(SkipReason::RustJvmTestFixture);
+        }
         if callee_saved_gpr_local_homes_enabled()
             && is_known_miscompile(class_name, method_name)
             && !package_allowed(class_name, allow_packages)
@@ -1173,6 +1183,21 @@ fn should_skip_jit_internal(
 /// majority of `java/util/*` and `cratonvm/*` methods — is now
 /// JIT-eligible. Each entry here corresponds to a tracked NEW-1.3 or
 /// NEW-1.4 follow-up.
+fn is_unconditional_hash_miscompile_cluster(class_name: &str, method_name: &str) -> bool {
+    matches!(
+        (class_name, method_name),
+        ("jdk/internal/util/ArraysSupport", "hashCode")
+            | ("java/util/Arrays", "hashCode")
+            | ("java/util/Objects", "hash")
+            | ("java/util/Objects", "hashCode")
+            | ("java/util/Objects", "equals")
+    )
+}
+
+fn is_elasticsearch_suite_jit_fragile_cluster(class_name: &str, _method_name: &str) -> bool {
+    class_name.starts_with("org/elasticsearch/")
+}
+
 fn is_known_miscompile(class_name: &str, method_name: &str) -> bool {
     matches!(
         (class_name, method_name),

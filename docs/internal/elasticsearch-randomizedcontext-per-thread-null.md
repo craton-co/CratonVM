@@ -476,3 +476,13 @@ branch `fix/es-randomizedcontext-per-thread-null` (NOT merged):
 ```text
 docs/internal/repros/randomizedcontext-perthread-null/README.md
 ```
+
+## Resolution: 2026-07-04
+
+The direct `MappingStatsTests` repro is now fixed on the Elasticsearch suite path by keeping the deterministic JIT hazards interpreted under the conservative policy:
+
+- `java/util/Objects.hash`, `java/util/Objects.hashCode`, `java/util/Objects.equals`, `java/util/Arrays.hashCode`, and `jdk/internal/util/ArraysSupport.hashCode` are skipped unconditionally under `SkipPolicy::Conservative` because the hash/equality cluster still corrupts Elasticsearch hash and stream state when JITed.
+- `org/elasticsearch/*` application methods are also skipped under `SkipPolicy::Conservative`; a narrower stats-only skip still reproduced the class-level `RandomizedContext.getPerThread() == null` failure.
+- Both decisions are policy skips rather than semantic VM changes, and both remain liftable with `CRATONVM_JIT_ALLOW_PACKAGES` for future bisection.
+
+Validated with the uniquely named binary `/data/target-es-randomizedcontext-next-20260704/release/cratonvm-es-randomizedcontext-next-azure-20260704` against `org.elasticsearch.action.admin.cluster.stats.MappingStatsTests` using seed `B17AC9D3E1F2A0C4`; result: `OK (14 tests)`.
