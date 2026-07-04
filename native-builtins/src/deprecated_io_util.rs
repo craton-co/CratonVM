@@ -208,6 +208,38 @@ fn to_hex_char(nibble: u8) -> char {
     }
 }
 
+/// `URLEncoder.encode(String, String)` / `(String, Charset)` — same charset
+/// gap as `url_decode_named`, mirrored on the encode side: previously always
+/// percent-escaped the input's raw UTF-8 bytes regardless of the requested
+/// charset, so e.g. `URLEncoder.encode("а", "windows-1251")` produced
+/// `%D0%B0` (UTF-8) instead of the correct single-byte `%E0`. Safe
+/// (unescaped) characters are ASCII and identical across every charset this
+/// VM supports, so only non-safe characters need the charset's own byte
+/// encoding.
+fn url_encode_named(input: &str, charset_name: &str) -> String {
+    let mut result = String::new();
+    for ch in input.chars() {
+        match ch {
+            'A'..='Z' | 'a'..='z' | '0'..='9' | '-' | '_' | '.' | '*' => {
+                result.push(ch);
+            }
+            ' ' => {
+                result.push('+');
+            }
+            _ => {
+                let mut buf = [0u8; 4];
+                let s = ch.encode_utf8(&mut buf);
+                for b in crate::charset::encode_str_named(charset_name, s) {
+                    result.push('%');
+                    result.push(to_hex_char(b >> 4));
+                    result.push(to_hex_char(b & 0x0f));
+                }
+            }
+        }
+    }
+    result
+}
+
 // ---------------------------------------------------------------------------
 // Registration
 // ---------------------------------------------------------------------------
@@ -1602,7 +1634,11 @@ fn register_url_codec(r: &mut NativeMethodRegistry) {
         |ctx, args| {
             let str_obj = obj_arg(args, 0)?;
             let text = ctx.read_string(str_obj).unwrap_or_default();
-            let encoded = url_encode(&text);
+            let charset_name = match args.get(1) {
+                Some(Value::Object(Some(o))) => ctx.read_string(*o).unwrap_or_default(),
+                _ => String::new(),
+            };
+            let encoded = url_encode_named(&text, &charset_name);
             let result = ctx.create_string(&encoded);
             Ok(Some(Value::Object(Some(result))))
         },
@@ -1616,7 +1652,11 @@ fn register_url_codec(r: &mut NativeMethodRegistry) {
         |ctx, args| {
             let str_obj = obj_arg(args, 0)?;
             let text = ctx.read_string(str_obj).unwrap_or_default();
-            let encoded = url_encode(&text);
+            let charset_name = match args.get(1) {
+                Some(v @ Value::Object(Some(_))) => crate::charset::charset_name_of(ctx, *v),
+                _ => String::new(),
+            };
+            let encoded = url_encode_named(&text, &charset_name);
             let result = ctx.create_string(&encoded);
             Ok(Some(Value::Object(Some(result))))
         },

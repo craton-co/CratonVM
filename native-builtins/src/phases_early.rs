@@ -8388,7 +8388,11 @@ pub(crate) fn register_phase52_url_encoding(r: &mut NativeMethodRegistry) {
         "(Ljava/lang/String;Ljava/lang/String;)Ljava/lang/String;",
         |ctx, args| {
             let input = ctx.read_string(obj_arg(args, 0)?).unwrap_or_default();
-            let encoded = p52_url_encode(&input);
+            let charset_name = match args.get(1) {
+                Some(Value::Object(Some(o))) => ctx.read_string(*o).unwrap_or_default(),
+                _ => String::new(),
+            };
+            let encoded = p52_url_encode_named(&input, &charset_name);
             let s = ctx.create_string(&encoded);
             Ok(Some(Value::Object(Some(s))))
         },
@@ -8436,7 +8440,11 @@ pub(crate) fn register_phase52_url_encoding(r: &mut NativeMethodRegistry) {
         "(Ljava/lang/String;Ljava/nio/charset/Charset;)Ljava/lang/String;",
         |ctx, args| {
             let input = ctx.read_string(obj_arg(args, 0)?).unwrap_or_default();
-            let encoded = p52_url_encode(&input);
+            let charset_name = match args.get(1) {
+                Some(v @ Value::Object(Some(_))) => crate::charset::charset_name_of(ctx, *v),
+                _ => String::new(),
+            };
+            let encoded = p52_url_encode_named(&input, &charset_name);
             let s = ctx.create_string(&encoded);
             Ok(Some(Value::Object(Some(s))))
         },
@@ -8481,6 +8489,41 @@ fn p52_url_encode(input: &str) -> String {
                 } else {
                     (b'A' + lo - 10) as char
                 });
+            }
+        }
+    }
+    result
+}
+
+/// `URLEncoder.encode(String, String)` / `(String, Charset)` — charset-aware
+/// counterpart to `url_encode_named` in `deprecated_io_util.rs` (same defect:
+/// this registration previously always percent-escaped raw UTF-8 bytes
+/// regardless of the requested charset).
+fn p52_url_encode_named(input: &str, charset_name: &str) -> String {
+    let mut result = String::with_capacity(input.len() * 3);
+    for ch in input.chars() {
+        match ch {
+            'A'..='Z' | 'a'..='z' | '0'..='9' | '-' | '_' | '.' | '*' => {
+                result.push(ch);
+            }
+            ' ' => result.push('+'),
+            _ => {
+                let mut buf = [0u8; 4];
+                let s = ch.encode_utf8(&mut buf);
+                for b in crate::charset::encode_str_named(charset_name, s) {
+                    result.push('%');
+                    result.push(if (b >> 4) < 10 {
+                        (b'0' + (b >> 4)) as char
+                    } else {
+                        (b'A' + (b >> 4) - 10) as char
+                    });
+                    let lo = b & 0x0F;
+                    result.push(if lo < 10 {
+                        (b'0' + lo) as char
+                    } else {
+                        (b'A' + lo - 10) as char
+                    });
+                }
             }
         }
     }
