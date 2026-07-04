@@ -4344,6 +4344,31 @@ pub(crate) fn native_string_is_blank(
 }
 
 /// chars() — returns IntStream of char values
+///
+/// FMT-REGRESSION-ANONOBJ: previously allocated the result via the raw
+/// `ctx.alloc_object(ClassId::new(0), 1)` fallback instead of stamping it
+/// with the `java/util/stream/IntStream` interface name like every other
+/// synthetic IntStream factory (`make_int_stream`, `native_int_stream_range`,
+/// etc. in native-collections) does. `alloc_object`'s ClassId(0)
+/// defense-in-depth (vm_exec.rs, added to fix a WildFly GC-corruption bug)
+/// now redirects any ClassId(0)+num_fields>0 allocation to a shared
+/// `cratonvm/synthetic/AnonymousObject$N` class instead of leaving it with a
+/// broken/undersized layout -- correct for that fix's own purpose, but it
+/// meant this stream's class name was never `java/util/stream/IntStream`, so
+/// `forEach`/`allMatch`/etc. (registered in native-collections keyed on that
+/// exact class name) resolved to `NoSuchMethodError` on
+/// `AnonymousObject$1.forEach(IntConsumer)` /
+/// `AnonymousObject$1.allMatch(IntPredicate)` for any caller of
+/// `String.chars()`/`codePoints()` (e.g. Spring's
+/// `BasicJsonWriter.write` -> `input.chars().forEach(...)`, used by both
+/// `BasicJsonWriterTests` and `RuntimeHintsWriterTests` via
+/// `RuntimeHintsWriter.write`).
+///
+/// Fix: allocate via `alloc_concurrent_synthetic` stamped with the
+/// `java/util/stream/IntStream` interface name and the standard 2-field
+/// synthetic-stream layout (field 0 = elements, field 1 = close handlers --
+/// see `STREAM_FIELD_ELEMENTS`/`STREAM_FIELD_CLOSE_HANDLERS` in
+/// native-collections/src/lib.rs), matching every other IntStream factory.
 pub(crate) fn native_string_chars(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     use cratonvm_types::ClassId;
 
@@ -4354,22 +4379,23 @@ pub(crate) fn native_string_chars(ctx: &mut dyn NativeContext, args: &[Value]) -
     let s = ctx.read_string(this).unwrap_or_default();
     let char_values: Vec<Value> = s.encode_utf16().map(|c| Value::Int(c as i32)).collect();
 
-    // Create IntStream: 1-field synthetic object stamped with the real
-    // `java/util/stream/IntStream` interface class (field 0 = Object[]
-    // elements) so the IntStream-keyed natives (anyMatch/allMatch/etc., see
-    // native-collections/src/lib.rs register_int_stream_natives) actually
-    // dispatch. Previously this allocated with `ClassId::new(0)` directly,
-    // which trips `alloc_object`'s unresolved-class defense-in-depth and
-    // silently substitutes the shared `cratonvm/synthetic/AnonymousObject$1`
-    // placeholder instead — that placeholder isn't stamped as IntStream, so
-    // every IntStream method call on it fails NoSuchMethodError (JUnit5's
-    // `StringUtils.containsWhitespace` -> `"...".chars().anyMatch(...)`).
-    let stream = alloc_concurrent_synthetic(ctx, "java/util/stream/IntStream", 1);
+    // 2-field synthetic stream layout: field 0 = elements array, field 1 =
+    // close handlers (None -- chars()/codePoints() never register any).
+    // Must be 2 fields (not 1) to match STREAM_NUM_FIELDS in
+    // native-collections/src/lib.rs -- the shared stream layout every other
+    // IntStream factory uses, which reserves field 1 for BaseStream.onClose
+    // handlers; a 1-field object would make any downstream onClose()
+    // registration on one of these streams an out-of-bounds field write.
+    // (A concurrent fix independently found this same root cause -- e.g. it
+    // also breaks `StringUtils.containsWhitespace` -> `"...".chars().anyMatch(...)`
+    // -- via a 1-field allocation; reconciled to the 2-field layout here.)
+    let stream = alloc_concurrent_synthetic(ctx, "java/util/stream/IntStream", 2);
     let arr = ctx.new_ref_array(ClassId::new(0), char_values.len());
     for (i, val) in char_values.iter().enumerate() {
         ctx.set_array_element(arr, i, *val);
     }
     ctx.set_field(stream, 0, Value::Object(Some(arr)));
+    ctx.set_field(stream, 1, Value::Object(None));
     Ok(Some(Value::Object(Some(stream))))
 }
 
