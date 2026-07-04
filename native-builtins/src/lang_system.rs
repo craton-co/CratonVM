@@ -1550,6 +1550,25 @@ fn set_system_env_singleton(obj: ObjectRef) -> ObjectRef {
     }
 }
 
+/// Return the OpenJDK-shaped read-only wrapper used by `System.getenv()`.
+///
+/// The backing object is the real-layout `java/util/HashMap` built below.
+/// HotSpot exposes the no-arg environment as a
+/// `java.util.Collections$UnmodifiableMap` whose private field `m` points at
+/// that backing map. System Rules reflects on that field by name, so the
+/// existing CratonVM unmodifiable-map wrapper deliberately keeps the backing in
+/// slot 0, matching the JDK's `m` field slot.
+fn wrap_system_env_map(ctx: &mut dyn NativeContext, map: ObjectRef) -> ObjectRef {
+    let pin = ctx.pin_native_root(map);
+    let wrapper_class = ctx.ensure_synthetic_class("cratonvm/internal/UnmodifiableMap", 2);
+    let map = ctx.read_native_pin(pin, map);
+    let wrapper = ctx.alloc_object(wrapper_class, 2);
+    let map = ctx.read_native_pin(pin, map);
+    ctx.set_field(wrapper, 0, Value::Object(Some(map)));
+    ctx.unpin_native_roots(pin);
+    wrapper
+}
+
 /// The cached `System.getProperties()` `Properties` singleton, if already built.
 pub fn system_props_singleton() -> Option<ObjectRef> {
     *system_props_store()
@@ -1632,9 +1651,10 @@ pub(crate) fn native_system_getenv_all(
     // Identity: return the cached singleton so `System.getenv() ==
     // System.getenv()` holds (SC-env-classreading RC-A). The process
     // environment is immutable for a running JVM, so the cached snapshot stays
-    // correct. Only the real-layout path below caches (the legacy 3-field
-    // fallback is left uncached so a later call retries once the real
-    // `java/util/HashMap` layout is resolvable).
+    // correct. Only the real-layout path below caches; the legacy 3-field
+    // fallback still returns the OpenJDK-shaped unmodifiable wrapper but is left
+    // uncached so a later call retries once the real `java/util/HashMap` layout
+    // is resolvable.
     if let Some(cached) = system_env_singleton() {
         return Ok(Some(Value::Object(Some(cached))));
     }
@@ -1763,9 +1783,12 @@ pub(crate) fn native_system_getenv_all(
             ctx.set_field(map, f_size, Value::Int(old_size + 1));
         }
 
-        // Cache as the process-wide singleton (double-checked publish).
-        let map = set_system_env_singleton(map);
-        return Ok(Some(Value::Object(Some(map))));
+        // Cache the OpenJDK-shaped process-wide singleton (double-checked
+        // publish). The wrapper's field 0 is the private `m` backing field that
+        // libraries such as System Rules reach via reflection.
+        let env = wrap_system_env_map(ctx, map);
+        let env = set_system_env_singleton(env);
+        return Ok(Some(Value::Object(Some(env))));
     }
 
     // Legacy fallback: synthetic 3-field layout for environments where
@@ -1796,7 +1819,8 @@ pub(crate) fn native_system_getenv_all(
         ctx.set_field(map, 1, Value::Int(old_size + 1));
     }
 
-    Ok(Some(Value::Object(Some(map))))
+    let env = wrap_system_env_map(ctx, map);
+    Ok(Some(Value::Object(Some(env))))
 }
 
 pub(crate) fn native_pb_init(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {

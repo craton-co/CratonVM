@@ -1,5 +1,5 @@
 // Faithful-shape repro for the ORIGINAL G1 parallel-evacuation race
-// (docs/known-issues/g1-parallel-evac-persistent-forwarding-root-remap.md).
+// (docs/internal/fixed-suite-bugs/g1-parallel-evac-persistent-forwarding-root-remap.md).
 //
 // The heavier SteadyChurn.java recreation in this directory adds two garbage
 // Payload allocations per iteration. That drives a young-GC cadence of ~30

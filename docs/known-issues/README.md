@@ -27,8 +27,9 @@ were exhaustively bucketed by exact terminal-error signature (not sampled); see
 
 Fixed from this sweep:
 - [SmallRyeConfig.getConfigMapping(Class) 1-arg bare-interface AbstractMethodError](../internal/fixed-suite-bugs/smallrye-getconfigmapping-1arg-bare-interface-abstractmethoderror.md).
-- [SmallRye Config missing Charset/MemorySize converters](../internal/fixed-suite-bugs/keycloak-smallrye-config-charset-memorysize-converters.md) - `LoggingSetupRecorder.handleFailedStart()` now builds its transient logging config with discovered Quarkus converters. Residual: [test-framework deployRequestedInstances resolution failure](keycloak-07-04/keycloak-testframework-deploy-requested-instances-resolution.md).
+- [SmallRye Config missing Charset/MemorySize converters](../internal/fixed-suite-bugs/keycloak-smallrye-config-charset-memorysize-converters.md) - `LoggingSetupRecorder.handleFailedStart()` now builds its transient logging config with discovered Quarkus converters. The local 2026-07-04 deep dive also showed this fix exposes a later test-framework/Maven-artifact resolution gap rather than unlocking all `tests/base` classes outright. Residual: [test-framework deployRequestedInstances resolution failure](keycloak-07-04/keycloak-testframework-deploy-requested-instances-resolution.md).
 - [quarkus/runtime CompactValue NaN-box collision SIGSEGV](../internal/fixed-suite-bugs/keycloak-quarkus-compactvalue-nanbox-sigsegv.md) - current `dev` no longer reproduces `rc=139`. Residual: [PicocliTest post-fix hang](keycloak-07-04/quarkus-runtime-picocli-post-compactvalue-hang.md).
+- [System Rules getenv() field 'm' reflection mismatch](../internal/fixed-suite-bugs/keycloak-system-rules-getenv-field-m-reflection.md) - `System.getenv()` now exposes an OpenJDK-shaped unmodifiable map wrapper whose private `m` field points at the backing map.
 
 Open findings from this sweep, in `keycloak-07-04/`, roughly by priority:
 - [crypto/fips1402 CryptoProvider ServiceLoader returns empty](keycloak-07-04/crypto-fips1402-cryptoprovider-serviceloader-empty.md) - 21 classes.
@@ -37,7 +38,6 @@ Open findings from this sweep, in `keycloak-07-04/`, roughly by priority:
 - [SmallRyeConfig.getPropertyNames() surfaces a garbage property name during log-category validation](keycloak-07-04/quarkus-runtime-logging-getpropertynames-garbage-key.md) - 2 sub-tests in the same class as above, plausibly related.
 - [TelemetryConfigurationTest telemetry-service-name wrong value](keycloak-07-04/quarkus-runtime-telemetry-service-name-wrong-value.md) - 1 class/sub-test.
 - [IgnoredArtifactsTest.multipleDatasources boolean mismatch](keycloak-07-04/quarkus-runtime-ignoredartifacts-multipledatasources-boolean.md) - 1 class/sub-test.
-- [System Rules getenv() field 'm' reflection mismatch](keycloak-07-04/system-rules-getenv-field-m-reflection.md) - 1 class, narrow.
 - [KcAdmV2HelpTest --help text env-var mentions](keycloak-07-04/kcadmv2-helptext-env-var-mentions.md) - 1 class, possibly a stale test rather than a VM bug.
 - [test-framework deployRequestedInstances resolution failure](keycloak-07-04/keycloak-testframework-deploy-requested-instances-resolution.md) - surfaced after the converter fix.
 - [PicocliTest post-CompactValue-fix hang](keycloak-07-04/quarkus-runtime-picocli-post-compactvalue-hang.md) - residual after the raw SIGSEGV stopped reproducing.
@@ -98,6 +98,21 @@ launcher fix above), not a VM bug.
 Every unresolved bug document belongs under `docs/known-issues`. Once the bug
 is fixed, resolved, or refuted, move the write-up out of this folder and archive
 it under `docs/internal`.
+
+## 2026-07-04 OSR default flip / archived residuals
+
+- `CRATONVM_JIT_OSR` now defaults on in `vm/src/runtime/env_cache.rs`; set
+  `CRATONVM_JIT_OSR=0` for the old behavior during diagnosis. The historical
+  OSR blocker note moved to
+  [`docs/internal/fixed-suite-bugs/jit-osr-backedge-value-corruption-cluster.md`](../internal/fixed-suite-bugs/jit-osr-backedge-value-corruption-cluster.md).
+- The G1 parallel-evac forwarding/root-remap note moved to
+  [`docs/internal/fixed-suite-bugs/g1-parallel-evac-persistent-forwarding-root-remap.md`](../internal/fixed-suite-bugs/g1-parallel-evac-persistent-forwarding-root-remap.md)
+  because its own current evidence says both bugs are fixed and soak-verified.
+- The XT takeover activation corruption note moved to
+  [`docs/internal/fixed-suite-bugs/xt-takeover-activation-young-corruption.md`](../internal/fixed-suite-bugs/xt-takeover-activation-young-corruption.md).
+  Its remaining 1/18 DoHead crash face is not an XT activation residual and stays
+  tracked by
+  [`dohead-jit-heap-corruption-register-invisibility.md`](dohead-jit-heap-corruption-register-invisibility.md).
 
 ## How many distinct bugs are here?
 
@@ -469,9 +484,11 @@ These were open here and are now **fixed / do-not-reproduce**; the detailed writ
 
 ## Standalone — HQL parser rejects chained additive/duration/concat operators
 
-[docs/known-issues/hql-antlr-chained-operator-syntax-error.md](hql-antlr-chained-operator-syntax-error.md)
-— ✅ **FIXED** (branch `fix/hql-chained-operator-parse`, commit `4e2a4493`,
-not yet merged — awaiting sign-off + follow-up verification). `a + b + c`
+✅ **FIXED and MERGED to `dev`** (`3864097b`, `fix/hql-chained-operator-parse`,
+commit `4e2a4493`); fully re-verified 2026-07-04 (all 3 affected classes now
+100% pass, no regressions). Moved to
+[`docs/internal/hql-antlr-chained-operator-syntax-error-FIXED.md`](../internal/hql-antlr-chained-operator-syntax-error-FIXED.md).
+`a + b + c`
 (or `a || b || c`, chained date/duration arithmetic, etc.) failed to parse —
 CratonVM-only, second occurrence of the same operator class rejected with
 ANTLR `SyntaxException: no viable alternative`. **NOT the same bug as

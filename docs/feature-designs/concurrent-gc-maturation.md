@@ -582,7 +582,7 @@ Author note: this doc is grounded in a read of `gc/src/{g1,g1_concurrent,zgc,zgc
       reports nothing and the rate rises under its timing perturbation (the
       original `task_58d60f7a` race). STILL OPEN; needs concurrency tooling.
       Full writeup:
-      `docs/known-issues/g1-parallel-evac-persistent-forwarding-root-remap.md`.
+      `docs/internal/fixed-suite-bugs/g1-parallel-evac-persistent-forwarding-root-remap.md`.
     - **Consequence:** because defect 2 lives in the shared `parallel_evacuate`
       closure that both young and mixed parallel paths drive, **mixed GC stays on
       the SERIAL evacuator** (the earlier plan to un-gate it was reverted — its

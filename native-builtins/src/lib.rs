@@ -14009,6 +14009,12 @@ pub fn register_essential_natives(registry: &mut NativeMethodRegistry) {
     );
     registry.register(
         "java/lang/Class",
+        "getDeclaredField",
+        "(Ljava/lang/String;)Ljava/lang/reflect/Field;",
+        lang_class::native_class_get_declared_field,
+    );
+    registry.register(
+        "java/lang/Class",
         "getDeclaredMethods0",
         "(Z)[Ljava/lang/reflect/Method;",
         lang_class::native_class_get_declared_methods,
@@ -15672,6 +15678,24 @@ pub fn register_essential_natives(registry: &mut NativeMethodRegistry) {
         "getDeclaringClass",
         "()Ljava/lang/Class;",
         lang_class::native_field_get_declaring_class,
+    );
+    registry.register(
+        "java/lang/reflect/Field",
+        "setAccessible",
+        "(Z)V",
+        lang_class::native_field_set_accessible,
+    );
+    registry.register(
+        "java/lang/reflect/Field",
+        "get",
+        "(Ljava/lang/Object;)Ljava/lang/Object;",
+        lang_class::native_field_get,
+    );
+    registry.register(
+        "java/lang/reflect/AccessibleObject",
+        "setAccessible",
+        "(Z)V",
+        lang_reflect::native_accessible_set_accessible,
     );
     // T15: Field.getRoot/getGenericSignature etc. — our synthetic Field
     // is already the "root" (no chain of shared copies), so always return
@@ -19029,12 +19053,9 @@ pub fn register_essential_natives(registry: &mut NativeMethodRegistry) {
     // don't need any native-side state for this — our socket I/O doesn't
     // route through a `UnixDispatcher` table — so a no-op keeps
     // `NioSocketImpl.<clinit>` progressing.
-    registry.register(
-        "sun/nio/ch/UnixDispatcher",
-        "init",
-        "()V",
-        |_ctx, _args| Ok(None),
-    );
+    registry.register("sun/nio/ch/UnixDispatcher", "init", "()V", |_ctx, _args| {
+        Ok(None)
+    });
 
     // Restore the caller's category so later registrars keep their intended tag.
     registry.set_category(prev_category);
@@ -39322,7 +39343,10 @@ fn native_charset_for_name(ctx: &mut dyn NativeContext, args: &[Value]) -> Metho
 /// Construct and throw a real `java.nio.charset.UnsupportedCharsetException`
 /// via its public `(String charsetName)` constructor, matching real JDK's
 /// `Charset.forName` contract for a syntactically valid but unsupported name.
-fn throw_unsupported_charset_exception(ctx: &mut dyn NativeContext, name: &str) -> MethodCallFailed {
+fn throw_unsupported_charset_exception(
+    ctx: &mut dyn NativeContext,
+    name: &str,
+) -> MethodCallFailed {
     match ctx.new_object("java/nio/charset/UnsupportedCharsetException") {
         Ok(Some(Value::Object(Some(exc)))) => {
             let name_str = ctx.create_string(name);
@@ -45031,7 +45055,13 @@ fn quote_uric(s: &str) -> String {
             let allowed = c.is_ascii_alphanumeric()
                 || matches!(
                     c,
-                    '-' | '_' | '.' | '!' | '~' | '*' | '\'' | '('
+                    '-' | '_'
+                        | '.'
+                        | '!'
+                        | '~'
+                        | '*'
+                        | '\''
+                        | '('
                         | ')'
                         | ';'
                         | '/'
@@ -52716,7 +52746,11 @@ fn native_proxy_dispatch_invoke(ctx: &mut dyn NativeContext, args: &[Value]) -> 
                 // real boxed Integer, not a raw `Value::Int` (which isn't a valid
                 // object reference and CHECKCAST/unbox turns into null).
                 let hash = crate::lang_class::ctx_annotation_proxy_hash_code(ctx, handler);
-                return Ok(Some(crate::lang_class::box_value(ctx, Value::Int(hash), "I")));
+                return Ok(Some(crate::lang_class::box_value(
+                    ctx,
+                    Value::Int(hash),
+                    "I",
+                )));
             }
             "equals" => {
                 let other = match args_arr {
@@ -52811,7 +52845,9 @@ fn native_proxy_dispatch_invoke(ctx: &mut dyn NativeContext, args: &[Value]) -> 
             // ("... must be an instance of interface ...") deep inside
             // MergedAnnotations/AnnotatedElementUtils.
             "getClass" | "annotationType" | "getType" => {
-                return Ok(Some(ctx.get_field(handler, crate::lang_class::ANN_PROXY_TYPE_MIRROR)));
+                return Ok(Some(
+                    ctx.get_field(handler, crate::lang_class::ANN_PROXY_TYPE_MIRROR),
+                ));
             }
             _ => {}
         }

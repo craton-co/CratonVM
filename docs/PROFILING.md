@@ -20,8 +20,8 @@ javac -d .bench-cache/quickbench .bench-cache/quickbench/QuickBench.java .bench-
 # CratonVM default
 target/release/cratonvm --classpath .bench-cache/quickbench QuickBench
 
-# CratonVM with OSR + low threshold
-CRATONVM_JIT_OSR=1 CRATONVM_JIT_THRESHOLD=1 target/release/cratonvm --classpath .bench-cache/quickbench QuickBench
+# CratonVM with the default OSR path and a low threshold
+CRATONVM_JIT_THRESHOLD=1 target/release/cratonvm --classpath .bench-cache/quickbench QuickBench
 
 # Compare with HotSpot JDK
 java -cp .bench-cache/quickbench QuickBench
@@ -50,7 +50,7 @@ public class MyBench {
 | Setting | Default | Description |
 |---------|---------|-------------|
 | JIT threshold | 500 invocations | Methods compiled after this many calls (`CRATONVM_JIT_THRESHOLD`). |
-| OSR | Off unless `CRATONVM_JIT_OSR=1` | Enables On-Stack Replacement for hot loop back-edges. |
+| OSR | On unless `CRATONVM_JIT_OSR=0` | Enables On-Stack Replacement for hot loop back-edges. |
 | SIMD | AVX2 (auto-detected) | Vector operations for reduction loops. |
 
 ## Profiling with System Tools
@@ -87,8 +87,9 @@ cargo bench
 - **Ratio = 1.0x**: Performance parity with HotSpot.
 - **Ratio > 1.0x**: CratonVM is slower by that factor.
 
-Current 2026-07-02 snapshot vs JDK 25.0.1 C2 on Windows 11: default
-QuickBench is 46.2x slower; with `CRATONVM_JIT_OSR=1 CRATONVM_JIT_THRESHOLD=1`,
+Historical 2026-07-02 snapshot vs JDK 25.0.1 C2 on Windows 11, before the
+2026-07-04 OSR default flip: default QuickBench is 46.2x slower; with
+`CRATONVM_JIT_OSR=1 CRATONVM_JIT_THRESHOLD=1`,
 QuickBench is 8.25x slower overall, with Arithmetic/Sieve/Matrix near
 1.30x-1.55x and Fibonacci still 13.8x slower. See the README and the mdBook
 benchmark page for the full table.

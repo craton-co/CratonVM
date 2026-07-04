@@ -124,6 +124,19 @@ pub(crate) fn native_accessible_try_set_accessible(
     Ok(Some(Value::Int(1)))
 }
 
+pub(crate) fn native_accessible_set_accessible(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    let this = obj_arg(args, 0)?;
+    let flag = matches!(args.get(1), Some(Value::Int(v)) if *v != 0);
+    crate::lang_class::write_method_accessible_external(ctx, this, flag);
+    crate::lang_class::write_field_accessible_external(ctx, this, flag);
+    crate::lang_class::write_constructor_accessible_external(ctx, this, flag);
+    ctx.set_field_by_name(this, "override", Value::Int(if flag { 1 } else { 0 }));
+    Ok(None)
+}
+
 // ---------------------------------------------------------------------------
 // AccessibleObject.canAccess(Object) — JDK 9+ access check.
 // ---------------------------------------------------------------------------

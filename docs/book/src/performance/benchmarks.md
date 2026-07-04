@@ -7,11 +7,14 @@ with hardware, OS load, JDK version, and VM configuration.
 
 ## QuickBench vs. HotSpot JDK 25 C2
 
-*Measured on Windows 11 against JDK 25.0.1 C2 and CratonVM release builds.
+*Historical pre-2026-07-04-OSR-default-flip snapshot measured on Windows 11
+against JDK 25.0.1 C2 and CratonVM release builds.
 QuickBench rows are from CratonVM code `b80c50b5` on 2026-07-02. The Binary
 Trees CratonVM columns were rechecked on 2026-07-03 at `8292ec9c`, using the
 same 681 ms HotSpot baseline from the 2026-07-02 JDK run. Ratio = CratonVM time
-/ HotSpot time (lower is better; 1.00x is parity). The OSR column sets
+/ HotSpot time (lower is better; 1.00x is parity). The old default column used
+a launcher default where OSR was disabled. Current `dev` enables OSR by default;
+set `CRATONVM_JIT_OSR=0` to reproduce the old OSR-off lane. The OSR column sets
 `CRATONVM_JIT_OSR=1` and `CRATONVM_JIT_THRESHOLD=1`.*
 
 | Benchmark                 | JDK 25 C2    | CratonVM default | Default ratio | CratonVM OSR, threshold=1 | OSR ratio |
@@ -25,10 +28,10 @@ same 681 ms HotSpot baseline from the 2026-07-02 JDK run. Ratio = CratonVM time
 
 **Reading the results:**
 
-- Default launcher settings leave these one-shot hot loops mostly interpreted,
-  so the default QuickBench total is not competitive.
+- In this historical snapshot, default launcher settings left these one-shot hot
+  loops mostly interpreted, so the default QuickBench total was not competitive.
 - With OSR enabled and the invocation threshold lowered, Arithmetic, Sieve, and
-  Matrix are close to HotSpot C2. Recursive Fibonacci remains a call-heavy JIT
+  Matrix were close to HotSpot C2. Recursive Fibonacci remains a call-heavy JIT
   gap, and Binary Trees remains dominated by allocation/GC throughput.
 - Closing the Fibonacci and Binary Trees gaps is a tracked roadmap item; see
   [Roadmap](../contributing/roadmap.md).
@@ -48,8 +51,8 @@ javac -d .bench-cache/quickbench .bench-cache/quickbench/QuickBench.java .bench-
 # CratonVM default.
 target/release/cratonvm --classpath .bench-cache/quickbench QuickBench
 
-# CratonVM with OSR + low threshold.
-CRATONVM_JIT_OSR=1 CRATONVM_JIT_THRESHOLD=1 target/release/cratonvm --classpath .bench-cache/quickbench QuickBench
+# CratonVM with the default OSR path and a low threshold.
+CRATONVM_JIT_THRESHOLD=1 target/release/cratonvm --classpath .bench-cache/quickbench QuickBench
 
 # HotSpot for comparison.
 java -cp .bench-cache/quickbench QuickBench

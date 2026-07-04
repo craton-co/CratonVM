@@ -15,15 +15,17 @@ CratonVM now routes Quarkus `LoggingSetupRecorder.handleFailedStart()` through a
 
 # SmallRye Config missing built-in Converters for Charset / MemorySize
 
-Historical original status: open - highest-impact single lever found in this sweep (blocks 341+ classes). Kept for provenance; resolved by the fix above.
+Historical original status: open - same-day deep dive narrowed downstream
+impact and ruled out ServiceLoader/reflection as the direct mechanism. Kept
+for provenance; resolved by the fix above.
 
 Date observed: 2026-07-04
+Date investigated: 2026-07-04 (same-day deep dive, ~3 hours)
 
 ## Summary
 
-Every Keycloak `testsuite/model` (`tests/base`, `org.keycloak.tests.*`) JUnit
-class dies identically in `@BeforeAll`/container setup, before any `@Test`
-method runs:
+Every Keycloak `tests/base` (`org.keycloak.tests.*`) JUnit class dies
+identically in `@BeforeAll`/container setup, before any `@Test` method runs:
 
 ```
 io.smallrye.config.ConfigValidationException: Configuration validation failed:
@@ -35,108 +37,169 @@ io.smallrye.config.SmallRyeConfig.<init>(SmallRyeConfig.java:126)
 io.smallrye.config.SmallRyeConfigBuilder.build(SmallRyeConfigBuilder.java:785)
 io.quarkus.runtime.logging.LoggingSetupRecorder.handleFailedStart(LoggingSetupRecorder.java:122)
 io.quarkus.runtime.logging.LoggingSetupRecorder.handleFailedStart(LoggingSetupRecorder.java:93)
-org.keycloak.testframework.LogHandler.initializeQuarkusLogging(...)
-org.keycloak.testframework.LogHandler.<init>(...)
+org.keycloak.testframework.LogHandler.initializeQuarkusLogging(LogHandler.java:41)
+org.keycloak.testframework.LogHandler.<init>(LogHandler.java:29)
 org.keycloak.testframework.KeycloakIntegrationTestExtension.lambda$getLogHandler$0(...)
 org.keycloak.testframework.KeycloakIntegrationTestExtension.beforeAll(...)
 ```
 
-`KCRUNNER_RESULT tests=0 failed=0 aborted=0 skipped=0 containersFailed=1` in
-every case — the class is reported FAIL but genuinely zero test methods ever
-run.
+341/341 `tests/base` FAIL rows share this exact signature (exhaustively
+confirmed, every row checked directly against its log, not sampled).
 
-This is the same failure that later blocks `quarkus/deployment` classes once
-two other, now-fixed, earlier blockers are cleared (see
-`docs/internal/fixed-suite-bugs/smallrye-getconfigmapping-1arg-bare-interface-abstractmethoderror.md`)
-— fixing the two `quarkus/deployment` CRASH-class blockers just advances
-those classes far enough to hit this exact same converter gap. It is a single
-shared root cause, not per-class breakage.
+## ⚠️ Corrected impact — read this before working on the fix
 
-## Scale
+**Fixing this bug would NOT flip any of the 341 `tests/base` classes to
+PASS in this test harness environment.** Confirmed by running the identical
+classes under real HotSpot (`-Vm hotspot`) in the same harness: HotSpot's
+`beforeAll` genuinely succeeds (no trace of Charset/MemorySize/SRCFG00013
+anywhere in its log — grepped both stdout and stderr, zero hits), but the
+SAME classes then fail per-test in `beforeEach` with:
 
-- `tests/base` (`org.keycloak.tests.*`): **341/341 FAIL rows — exhaustively
-  confirmed** (every single FAIL row in this module checked directly, not
-  sampled; the two rows that initially looked like exceptions turned out to
-  be a log-lookup script bug on truncated/hashed log filenames for two
-  long class names — both carry the identical ConfigValidationException on
-  direct inspection). 100% of this module's FAILs share this one root cause.
-- `quarkus/deployment` (`PersistenceXmlDatasourcesTest` and siblings): reached
-  after fixing the two CRASH-class blockers ahead of it (see above);
-  confirmed via direct repro on this exact class.
-- `quarkus/runtime` (`LoggingConfigurationTest`, `TelemetryConfigurationTest`,
-  `IgnoredArtifactsTest`): plausibly related — all show config-resolution
-  divergences from expected values, filed as their own docs
-  (`quarkus-runtime-logging-wildcard-debug-level-null.md`,
-  `quarkus-runtime-logging-getpropertynames-garbage-key.md`,
-  `quarkus-runtime-telemetry-service-name-wrong-value.md`,
-  `quarkus-runtime-ignoredartifacts-multipledatasources-boolean.md`); not
-  confirmed to share this exact SRCFG00013 path, flagged for re-triage after
-  this is fixed.
+```
+java.lang.RuntimeException: Failed to resolve artifact: org.keycloak.testframework:keycloak-test-framework-remote-providers
+    org.keycloak.it.utils.Maven.getArtifact(Maven.java:88)
+    org.keycloak.it.utils.Maven.resolveArtifact(Maven.java:51)
+    org.keycloak.testframework.server.ProviderDeployer.getDependencyPath(ProviderDeployer.java:119)
+    org.keycloak.testframework.server.ProviderDeployer.updateDependencies(ProviderDeployer.java:43)
+    org.keycloak.testframework.server.DistributionKeycloakServer.start(DistributionKeycloakServer.java:93)
+Caused by: java.lang.RuntimeException: Failed to resolve artifact [...] from project [org.keycloak:keycloak-parent:pom:999.0.0-SNAPSHOT] dependency graph
+```
 
-## Root cause (not yet pinned)
+This is a Maven reactor/dependency-graph resolution failure — an
+environment/harness gap (this test harness doesn't do a full `mvn install`
+of the whole Keycloak reactor, or lacks the network/repo state Maven's
+resolver needs), **not a CratonVM bug**, and not something either VM can fix
+in isolated Rust code. So even a perfect fix for the Charset/MemorySize gap
+would just move these 341 classes' failure point later (from `beforeAll` to
+`beforeEach`), converging with HotSpot's own failure — not unlocking a
+single PASS. The original "single biggest lever, 341 classes" framing from
+the initial triage was incorrect; this bug's practical value is much lower
+than believed, though it remains a genuine, real CratonVM-vs-HotSpot
+behavioral divergence worth fixing on its own correctness merits.
 
-Real SmallRye Config ships built-in `Converter` implementations for common
-non-primitive types (`Charset`, `MemorySize`, `InetAddress`, `Pattern`, …) via
-`io.smallrye.config.Converters` — a class whose converter table is populated
-either by a static initializer (many entries are method-reference lambdas,
-e.g. effectively `Charset::forName`) or via `ServiceLoader`-discovered
-`META-INF/services/org.eclipse.microprofile.config.spi.Converter` entries
-bundled in `smallrye-config-core-*.jar`. Under CratonVM, at least these two
-types' converters are missing by the time `SmallRyeConfig.buildMappings`
-validates every `@ConfigMapping` property's type — everything else about the
-mapping (including other converters) apparently works, since only these two
-throw.
+## Investigation (extensive, root cause narrowed but not conclusively pinned)
 
-Two working hypotheses, not yet distinguished:
+**Ruled out — CratonVM's ServiceLoader/reflection machinery is NOT broken.**
+Built a standalone repro (`ConverterProbe.java`, tests `getConverter()` for
+all 12 types Quarkus registers via
+`META-INF/services/org.eclipse.microprofile.config.spi.Converter` in
+`quarkus-core-3.33.1.1.jar`) and ran it under CratonVM against `tests/base`'s
+*exact* classpath (`smallrye-config-core-3.16.0.jar` + `quarkus-core-3.33.1.1.jar`).
+With `.addDiscoveredConverters()` explicitly called, **all 11 real converters
+resolve correctly** (`InetSocketAddress`, `Charset`, `InetAddress`, `Pattern`,
+`Path`, `Duration`, `MemorySize`, `Locale`, `ZoneId`, `Level` all FOUND). This
+conclusively rules out a ServiceLoader/classpath/jar-resolution bug on
+CratonVM's side for this exact mechanism — when discovery is actually
+invoked, CratonVM finds and instantiates every provider correctly, matching
+HotSpot byte-for-byte.
 
-1. **Lambda/method-reference gap**: if `Converters`' built-in table is
-   populated via `invokedynamic`-based method references in a static
-   initializer, a CratonVM `LambdaMetafactory`/`invokedynamic` bug for this
-   specific lambda shape could silently drop just these entries while others
-   (built via different call shapes) succeed. CratonVM has prior history of
-   narrow `invokedynamic`/`LambdaMetafactory` gaps (see
-   `reference_reflective_lambdametafactory`,
-   `reference_mh_bound_virtual_unbox` in project memory).
-2. **ServiceLoader gap**: if these two converters are registered via
-   `META-INF/services/org.eclipse.microprofile.config.spi.Converter` inside
-   `smallrye-config-core-*.jar` specifically (as opposed to a hardcoded Java
-   map), this could be the same class of bug as the `crypto/fips1402`
-   `CryptoProvider` ServiceLoader gap in
-   `crypto-fips1402-cryptoprovider-serviceloader-empty.md` — CratonVM's
-   `ServiceLoader`/classpath-resource-discovery not finding a services file
-   inside a specific jar under this harness's classpath assembly.
+**The actual failing code path never calls `addDiscoveredConverters()` at
+all — on either VM, per the bytecode.** Decompiled the full chain:
+- `LogHandler.initializeQuarkusLogging()` (Keycloak's own source, read
+  directly — not decompiled) calls `LoggingSetupRecorder.handleFailedStart()`
+  **unconditionally**, with no try/catch, explicitly "abusing" this
+  Quarkus-internal diagnostic method as a lightweight logging-setup helper
+  (see the class comment: "We do not care about Config that was created by
+  Quarkus' TestConfigProviderResolver... relying on Quarkus' Config is not
+  necessary and might be fragile").
+- `LoggingSetupRecorder.handleFailedStart()` builds `new SmallRyeConfigBuilder()
+  .withCustomizers(new QuarkusConfigBuilderCustomizer()).withMapping(LogBuildTimeConfig.class)
+  .withMapping(LogRuntimeConfig.class).withMapping(ConsoleRuntimeConfig.class)
+  .withSources(new LoggingSetupRecorder$1(existingConfig)).build()`.
+- `QuarkusConfigBuilderCustomizer.configBuilder()` only does
+  `.withDefaultValue(...)`, `.withInterceptorFactories(...)` ×3, and
+  `.withMappingIgnore("quarkus.**")` — **no converter registration of any
+  kind.**
+- `SmallRyeConfigBuilder`'s constructor sets `addDiscoveredConverters = false`
+  by default (confirmed via bytecode: `iconst_0; putfield addDiscoveredConverters`).
+- **Runtime confirmation**: reran the real failing test with
+  `CRATONVM_DIAG_SERVICELOADER=1` (an existing env-gated diagnostic in
+  `native-builtins/src/service_loader.rs`) — the full trace shows **zero**
+  `ServiceLoader.load(org.eclipse.microprofile.config.spi.Converter, ...)`
+  calls anywhere during the entire failing test run. Whatever gives HotSpot
+  its Charset/MemorySize converters here, it is not this mechanism, on
+  either VM.
+- **Runtime confirmation of the actual failure sequence**: reran with
+  `CRATONVM_DBG_ATHROW=1` (dumps every Java exception thrown, in order) — the
+  very first exception in the entire 740-line trace is
+  `NoSuchMethodException: java.nio.charset.Charset.of(java.lang.String)`,
+  followed by 5 more `NoSuchMethodException`s for `of(CharSequence)`,
+  `valueOf(String)`, `valueOf(CharSequence)`, `parse(String)`,
+  `parse(CharSequence)` — this is SmallRye's own `Converters$Implicit`
+  reflection-based fallback trying (and correctly failing, since real
+  `Charset` has none of these methods — only `forName`) every conventional
+  factory-method name before finally throwing SRCFG00013. This is 100%
+  correct, expected SmallRye behavior *given* that no explicit Charset
+  converter was ever registered on this builder instance — there is no
+  CratonVM-specific exception-handling bug in this sequence.
 
-No native shim/override touches `SmallRyeConfigBuilder`'s converter-discovery
-path today (checked — `native-builtins/src/phases_late.rs` only shims
-`getConfigMapping` itself, not converter registration), so whatever's
-happening is either genuine CratonVM behavior on unmodified SmallRye
-bytecode, or a classpath-assembly gap in how the test harness builds this
-module's runtime classpath.
+**What remains unexplained**: found Keycloak's own
+`org.keycloak.testframework.config.Config.initConfig()` (a separate,
+JVM-wide-singleton `SmallRyeConfig`, `private static final ... = initConfig()`)
+which *does* explicitly register `new CharsetConverter()`, `new
+MemorySizeConverter()`, `new InetSocketAddressConverter()` via
+`.withConverters(...)`. `handleFailedStart()` retrieves this exact instance
+via `ConfigProvider.getConfig()` (same-classloader lookup, registered moments
+earlier by `initializeQuarkusLogging`) — but only uses it as a **value
+source** (wrapped in a `ConfigSource`), never as a converter-registry
+template for its own freshly-built `SmallRyeConfigBuilder`. Converters and
+ConfigSources are separate SmallRye concerns; wrapping a config as a source
+does not transfer its converters. Also ruled out a shared/global converter
+cache: `SmallRyeConfig.getConverterOrNull` reads `this.converters` — a
+**per-instance** field-backed `Map`, populated only from what that specific
+builder was given; there is no cross-instance sharing mechanism it could
+fall back to.
 
-## Next steps
+Given all of the above is pure Java bytecode logic with no CratonVM native
+override anywhere in the path (confirmed: `native-builtins/src/phases_late.rs`
+only shims `getConfigMapping`, nothing here), **this should mechanically fail
+identically on any conforming JVM** — yet it demonstrably does not fail on
+HotSpot for these classes in this harness. The remaining candidate
+explanations, none confirmed:
+1. A genuinely CratonVM-specific difference in class-initialization timing/order
+   that causes some *other*, not-yet-identified code path to run (or not run)
+   before `handleFailedStart`, indirectly affecting converter availability.
+2. A latent bug in Keycloak's own test framework (the `handleFailedStart()`
+   abuse pattern) that happens not to manifest on HotSpot in this exact
+   harness for reasons unrelated to VM semantics (e.g. it may depend on
+   something in a real Maven Surefire fork's environment/sysprops that this
+   harness's direct JUnit-Platform-Launcher invocation doesn't replicate
+   identically for both VMs, and CratonVM's manifestation is a side effect
+   rather than a direct cause).
+3. Something in `ConfigProviderResolver.instance()`'s own lazy singleton
+   initialization (confirmed via SL-DBG to correctly ServiceLoader-discover
+   `SmallRyeConfigProviderResolver` on CratonVM) differs subtly in a way not
+   yet traced.
 
-1. `javap -c` decompile `io.smallrye.config.Converters.<clinit>` (from
-   `smallrye-config-core-3.17.2.jar`, in `~/.m2/repository/io/smallrye/config/
-   smallrye-config-core/3.17.2/`) to see exactly how the `Charset`/
-   `MemorySize` entries are constructed, to pick between the two hypotheses
-   above.
-2. Write a small isolated repro: `new SmallRyeConfigBuilder().build()` then
-   `config.getConverter(Charset.class)` — if this alone reproduces the gap
-   without any Keycloak/Quarkus involvement, it narrows the bug to
-   SmallRye-Config-in-isolation under CratonVM, which is a much smaller,
-   more tractable repro than the full Keycloak test harness.
+## Next steps for whoever picks this up
+
+Given the corrected (low) impact above, this is no longer urgent, but if
+pursued: a HotSpot-side JFR class-load/method-entry trace comparison against
+the same CratonVM `CRATONVM_DBG_ATHROW=1` trace, specifically watching for
+what (if anything) populates converters before `handleFailedStart` runs on
+HotSpot, is the most direct remaining lever. Given the fix wouldn't unlock
+any passing tests in this environment regardless, this is better prioritized
+below the Maven-artifact-resolution harness gap and the other, more isolated
+findings in this sweep.
 
 ## Repro
 
 ```
-ssh victor@20.84.156.31   # Azure build host, see reference_azure_build_host
-cd /data/wt-keycloak-full-20260704
-apps/keycloak-suite-runner/run-keycloak-suite.ps1 -Vm craton \
-  -ClassList <(printf 'module\tclass\ntests/base\torg.keycloak.tests.admin.AdminConsoleTest\n') \
-  -TimeoutSec 60 -RunName repro-charset-converter \
-  -Exe target/release/cratonvm-kcfull1124 -JdkHome /home/victor/jdk25
+ssh -i "C:\Users\Victor\.ssh\azure.pem" -o IdentitiesOnly=yes victor@20.84.156.31
+cd /data/wt-converterfix-20260704   # or any fresh worktree off dev with the keycloak checkout rsynced in
+CRATONVM_DBG_ATHROW=1 pwsh -NoProfile -ExecutionPolicy Bypass -File apps/keycloak-suite-runner/run-keycloak-suite.ps1 -Vm craton \
+  -ClassList <(printf 'module\tclass\ntests/base\torg.keycloak.tests.vault.KeycloakKeystoreVaultTest\n') \
+  -TimeoutSec 60 -RunName repro-charset-athrow \
+  -Exe target/release/cratonvm-converterfix -JdkHome /home/victor/jdk25
+
+# HotSpot oracle for comparison (succeeds at beforeAll, fails later at beforeEach on the Maven artifact gap):
+pwsh -NoProfile -ExecutionPolicy Bypass -File apps/keycloak-suite-runner/run-keycloak-suite.ps1 -Vm hotspot \
+  -ClassList <(printf 'module\tclass\ntests/base\torg.keycloak.tests.vault.KeycloakKeystoreVaultTest\n') \
+  -TimeoutSec 60 -RunName repro-charset-hotspot -JdkHome /home/victor/jdk25
 ```
 
 ## Evidence
 
-Full run: `/data/wt-keycloak-full-20260704/apps/keycloak-suite-runner/.suite/results/kcfull-others-1124-20260704-v2/others-jit/` (results.tsv + per-class logs), run 2026-07-04, wall time 2469s for 1124 classes.
+- Original full sweep: `/data/wt-keycloak-full-20260704/apps/keycloak-suite-runner/.suite/results/kcfull-others-1124-20260704-v2/others-jit/` (2026-07-04).
+- This investigation's runs: `/data/wt-converterfix-20260704/apps/keycloak-suite-runner/.suite/results/{repro-charset-2,repro-charset-hotspot,repro-charset-nsme,repro-charset-sldbg,repro-athrow}/` on the Azure build host, branch `fix/smallrye-config-converters-20260704` (off `dev`).
+- Keycloak source read directly: `apps/keycloak/test-framework/core/src/main/java/org/keycloak/testframework/{LogHandler,KeycloakIntegrationTestExtension,config/Config}.java`.

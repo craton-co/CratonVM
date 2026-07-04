@@ -21,13 +21,13 @@ and [Known Limitations](../java-support/limitations.md).
 
 ### How fast is it?
 
-Current performance depends heavily on JIT configuration. With
+Current performance depends heavily on JIT configuration. In the historical
+pre-2026-07-04 OSR-default-flip snapshot, with
 `CRATONVM_JIT_OSR=1 CRATONVM_JIT_THRESHOLD=1`, the Arithmetic, Sieve, and Matrix
 QuickBench kernels are roughly **1.3x-1.6x** slower than HotSpot C2, but
 recursive Fibonacci is still **13.8x** slower and Binary Trees remains much
-slower. Default launcher settings leave the one-shot hot loops mostly
-interpreted, so the default QuickBench total is not competitive. See
-[Benchmarks](../performance/benchmarks.md).
+slower. Current `dev` enables OSR by default; use `CRATONVM_JIT_OSR=0` only when
+you want the old OSR-off lane for diagnosis. See [Benchmarks](../performance/benchmarks.md).
 
 ### Why is my allocation-heavy program slow, or seemingly hung?
 
