@@ -283,7 +283,22 @@ touch dynamic-proxy or classloading code).
 | skipped | 0 | 1 (pre-existing, unrelated `@Disabled`-style skip) |
 
 Gate-off is byte-for-byte identical to the untouched baseline — zero
-regression. Gate-on now passes the **entire** package cleanly.
+regression. Gate-on now passes the **entire** package cleanly *in this run*.
+
+**⚠️ Caveat added 2026-07-04, after the numbers above were recorded:** a
+separate, JIT-timing-sensitive SIGSEGV/hang was subsequently found in 5 of
+these 29 classes (`AnnotatedElementUtilsTests`, `AnnotationsScannerTests`,
+`MissingMergedAnnotationTests`, `AnnotationTypeMappingsTests`,
+`AnnotationUtilsTests`) when run as part of a larger combined batch under
+gate-on + JIT — see
+`docs/known-issues/jit-nativecall-dispatch-sigsegv-annotation-scanning.md`.
+It is **not** a bug in this doc's fixes (confirmed via `--nojit`, which is
+always clean), and one narrow contributing factor (generated `$ProxyN`
+classes tiering up) has a partial fix landed, but the crash is not fully
+contained. Treat the 727/728 clean number above as "clean in the batch size
+and conditions of that specific run," not as an unconditional guarantee —
+re-run at a similar scale before relying on it, and see the linked doc before
+considering the default flip discussed below.
 
 ## Why the deeper identity-shim path was still not taken
 

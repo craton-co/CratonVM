@@ -999,13 +999,21 @@ mod windows_fault {
                 path_buf.len() as u32,
             );
             let loaded = if len > 0 {
+                // DllSize=0 leaves SymFromAddr unable to tell whether a
+                // queried address falls within this module's range (it
+                // reliably fails with ERROR_INVALID_ADDRESS/487 even though
+                // SymLoadModuleExW itself reports success) — pass a
+                // generous over-estimate; SymLoadModuleExW only needs the
+                // registered range to COVER real addresses, not match the
+                // image size exactly.
+                const DLL_SIZE_OVERESTIMATE: u32 = 0x8000000; // 128 MiB
                 SymLoadModuleExW(
                     process,
                     core::ptr::null_mut(),
                     path_buf.as_ptr(),
                     core::ptr::null(),
                     module_base as u64,
-                    0,
+                    DLL_SIZE_OVERESTIMATE,
                     core::ptr::null_mut(),
                     0,
                 )
