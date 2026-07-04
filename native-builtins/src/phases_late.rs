@@ -6169,8 +6169,23 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
         |ctx, args| {
             let path_obj = obj_arg(args, 0)?;
             let p = p57_read_path(ctx, path_obj);
-            let _ = std::fs::create_dir_all(&p);
-            Ok(Some(Value::Object(Some(path_obj))))
+            match std::fs::create_dir_all(&p) {
+                Ok(()) => Ok(Some(Value::Object(Some(path_obj)))),
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                    Err(p57_no_such_file(ctx, &p))
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {
+                    Err(p57_access_denied(ctx, &p))
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                    let exc =
+                        alloc_concurrent_synthetic(ctx, "java/nio/file/FileAlreadyExistsException", 4);
+                    let file_str = ctx.create_string(&p);
+                    ctx.set_field_by_name(exc, "file", Value::Object(Some(file_str)));
+                    Err(MethodCallFailed::ExceptionThrown(exc))
+                }
+                Err(e) => Err(p57_io_error(&e)),
+            }
         },
     );
 
@@ -6181,8 +6196,23 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
         |ctx, args| {
             let path_obj = obj_arg(args, 0)?;
             let p = p57_read_path(ctx, path_obj);
-            let _ = std::fs::create_dir(&p);
-            Ok(Some(Value::Object(Some(path_obj))))
+            match std::fs::create_dir(&p) {
+                Ok(()) => Ok(Some(Value::Object(Some(path_obj)))),
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                    Err(p57_no_such_file(ctx, &p))
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {
+                    Err(p57_access_denied(ctx, &p))
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                    let exc =
+                        alloc_concurrent_synthetic(ctx, "java/nio/file/FileAlreadyExistsException", 4);
+                    let file_str = ctx.create_string(&p);
+                    ctx.set_field_by_name(exc, "file", Value::Object(Some(file_str)));
+                    Err(MethodCallFailed::ExceptionThrown(exc))
+                }
+                Err(e) => Err(p57_io_error(&e)),
+            }
         },
     );
 
