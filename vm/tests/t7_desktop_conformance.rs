@@ -66,6 +66,45 @@ fn t7_1_5_buffered_image_backing_store() {
     eprintln!("[t7] BufferedImage backing store: OK");
 }
 
+#[test]
+fn t7_1_6_imageio_png_jpeg_natives_registered() {
+    use cratonvm_native_api::NativeMethodRegistry;
+
+    let mut registry = NativeMethodRegistry::new();
+    cratonvm_native_awt::register_awt_natives(&mut registry);
+
+    assert!(registry
+        .find(
+            "javax/imageio/ImageIO",
+            "read",
+            "(Ljava/io/InputStream;)Ljava/awt/image/BufferedImage;",
+        )
+        .is_some());
+    assert!(registry
+        .find(
+            "javax/imageio/ImageIO",
+            "read",
+            "(Ljava/io/File;)Ljava/awt/image/BufferedImage;",
+        )
+        .is_some());
+    assert!(registry
+        .find(
+            "javax/imageio/ImageIO",
+            "write",
+            "(Ljava/awt/image/RenderedImage;Ljava/lang/String;Ljava/io/OutputStream;)Z",
+        )
+        .is_some());
+    assert!(registry
+        .find(
+            "javax/imageio/ImageIO",
+            "write",
+            "(Ljava/awt/image/RenderedImage;Ljava/lang/String;Ljava/io/File;)Z",
+        )
+        .is_some());
+
+    eprintln!("[t7] ImageIO PNG/JPEG native surface: OK");
+}
+
 // ---------------------------------------------------------------------------
 // T7.2 — Swing
 // ---------------------------------------------------------------------------

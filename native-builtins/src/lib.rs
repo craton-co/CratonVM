@@ -12360,6 +12360,12 @@ pub fn register_essential_natives(registry: &mut NativeMethodRegistry) {
         "()Ljava/lang/String;",
         lang_string::native_string_intern,
     );
+    registry.register(
+        "java/lang/String",
+        "<init>",
+        "(Ljava/lang/AbstractStringBuilder;Ljava/lang/Void;)V",
+        lang_string::native_string_init_abstract_string_builder,
+    );
     // String.valueOf and Integer.toString overrides: the JDK bytecode path uses
     // Unsafe.putByte for byte-level array access which doesn't map to our
     // slot-based heap model (Unsafe offsets are raw byte offsets in HotSpot).
@@ -19808,6 +19814,7 @@ fn register_annotation_overrides(registry: &mut NativeMethodRegistry) {
     // java/util/logging/LogManager` by ensuring the native always
     // returns a LogManager instance ObjectRef (never a Class mirror).
     logmanager::register_logmanager_natives(registry);
+    register_log4j_stacklocator_bridge(registry);
 
     // WP2.1: java.lang.reflect full coverage — net-new natives
     // (trySetAccessible, canAccess, getEnclosingClass, Parameter
@@ -45939,6 +45946,77 @@ fn native_inet_is_reachable(ctx: &mut dyn NativeContext, args: &[Value]) -> Meth
 // Phase 31: java.util.logging + java.util.Locale
 // ===========================================================================
 
+fn register_log4j_stacklocator_bridge(registry: &mut NativeMethodRegistry) {
+    fn log4j_stack_locator_caller(
+        ctx: &mut dyn NativeContext,
+        args: &[Value],
+        first_string: usize,
+    ) -> MethodCallResult {
+        let fqcn = match args.get(first_string) {
+            Some(Value::Object(Some(s))) => ctx.read_string(*s).unwrap_or_default(),
+            _ => String::new(),
+        };
+        let pkg = match args.get(first_string + 1) {
+            Some(Value::Object(Some(s))) => ctx.read_string(*s).unwrap_or_default(),
+            _ => String::new(),
+        };
+        let fqcn_internal = fqcn.replace('.', "/");
+        let pkg_internal = pkg.replace('.', "/");
+        let trace = ctx.capture_stack_trace(0);
+        let mut seen_fqcn = false;
+        for frame in trace.iter().rev() {
+            if !seen_fqcn {
+                if frame.class_name.as_ref() == fqcn_internal {
+                    seen_fqcn = true;
+                }
+                continue;
+            }
+            if frame.class_name.as_ref() == fqcn_internal {
+                continue;
+            }
+            if pkg_internal.is_empty() || frame.class_name.starts_with(&pkg_internal) {
+                if let Some(cid) = ctx.class_id_by_name(&frame.class_name) {
+                    return Ok(Some(Value::Object(Some(ctx.get_class_mirror(cid)))));
+                }
+            }
+        }
+        for frame in trace.iter().rev() {
+            let class_name = frame.class_name.as_ref();
+            if class_name == "org/apache/logging/log4j/util/StackLocator"
+                || class_name == "org/apache/logging/log4j/util/StackLocatorUtil"
+                || class_name.starts_with("java/lang/StackWalker")
+                || class_name.starts_with("java/lang/StackStreamFactory")
+                || class_name.starts_with("jdk/internal/reflect/")
+                || class_name.starts_with("sun/reflect/")
+            {
+                continue;
+            }
+            if pkg_internal.is_empty() || class_name.starts_with(&pkg_internal) {
+                if let Some(cid) = ctx.class_id_by_name(class_name) {
+                    return Ok(Some(Value::Object(Some(ctx.get_class_mirror(cid)))));
+                }
+            }
+        }
+        let fallback = ctx
+            .class_id_by_name("java/lang/Object")
+            .map(|cid| Value::Object(Some(ctx.get_class_mirror(cid))))
+            .unwrap_or(Value::Object(None));
+        Ok(Some(fallback))
+    }
+    registry.register(
+        "org/apache/logging/log4j/util/StackLocator",
+        "getCallerClass",
+        "(Ljava/lang/String;Ljava/lang/String;)Ljava/lang/Class;",
+        |ctx, args| log4j_stack_locator_caller(ctx, args, 1),
+    );
+    registry.register(
+        "org/apache/logging/log4j/util/StackLocatorUtil",
+        "getCallerClass",
+        "(Ljava/lang/String;Ljava/lang/String;)Ljava/lang/Class;",
+        |ctx, args| log4j_stack_locator_caller(ctx, args, 0),
+    );
+}
+
 fn register_logging_natives(registry: &mut NativeMethodRegistry) {
     let logger = "java/util/logging/Logger";
     let level = "java/util/logging/Level";
@@ -47751,6 +47829,8 @@ fn register_slf4j_natives(registry: &mut NativeMethodRegistry) {
             Ok(Some(Value::Object(Some(logger))))
         },
     );
+
+    register_log4j_stacklocator_bridge(registry);
 
     let log4j_lg = "org/apache/logging/log4j/Logger";
     // Log4j2 trace — instance method, below default threshold. NEW-6.

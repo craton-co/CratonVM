@@ -353,10 +353,11 @@ baseline for every class that showed any failures: `PathResourceTests`
 27/38 on both (unchanged), `PathMatchingResourcePatternResolverTests` 10/22
 baseline vs 15/22 post-fix (+5 improved), `SpringFactoriesLoaderTests` 31/33
 on both (unchanged), `ResourceTests` 59/68 baseline vs 61/68 post-fix (+2,
-this pass's target). `DataBufferTests`/`DataBufferUtilsTests` time out on
-both binaries — a pre-existing, already-documented issue (see
-`databuffertests-stackwalker-log4j-context-recursion-hang.md`), unrelated to
-this pass. No regressions found; one bonus improvement
+this pass's target). At the time of this resource-test run,
+`DataBufferTests`/`DataBufferUtilsTests` timed out on both binaries due to the
+pre-existing Log4j StackWalker issue later archived at
+[`docs/internal/databuffertests-stackwalker-log4j-context-recursion-hang.md`](../internal/databuffertests-stackwalker-log4j-context-recursion-hang.md).
+No regressions found; one bonus improvement
 (`PathMatchingResourcePatternResolverTests`) beyond the target class.
 
 ## Debugging tools added this session (not part of the fix; removed from the shared checkout after use)
