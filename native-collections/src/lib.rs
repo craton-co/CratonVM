@@ -3867,6 +3867,7 @@ fn unwrap_unmod(ctx: &dyn NativeContext, obj: ObjectRef) -> ObjectRef {
         if name == UNMOD_MAP_CLASS
             || name == UNMOD_LIST_CLASS
             || name == UNMOD_SET_CLASS
+            || name == UNMOD_SORTED_SET_CLASS
             || name == UNMOD_COLLECTION_CLASS
         {
             if let Value::Object(Some(inner)) = ctx.get_field(obj, UNMOD_FIELD_BACKING) {
@@ -4482,6 +4483,7 @@ fn is_unmod_wrapper(ctx: &dyn NativeContext, obj: ObjectRef) -> bool {
         Some(UNMOD_MAP_CLASS)
             | Some(UNMOD_LIST_CLASS)
             | Some(UNMOD_SET_CLASS)
+            | Some(UNMOD_SORTED_SET_CLASS)
             | Some(UNMOD_COLLECTION_CLASS)
     )
 }
@@ -22148,6 +22150,7 @@ fn collect_collection_elements(ctx: &mut dyn NativeContext, coll: ObjectRef) -> 
         // and friends see the wrapped elements.
         if cls_name == UNMOD_LIST_CLASS
             || cls_name == UNMOD_SET_CLASS
+            || cls_name == UNMOD_SORTED_SET_CLASS
             || cls_name == UNMOD_COLLECTION_CLASS
         {
             if let Value::Object(Some(inner)) = ctx.get_field(coll, UNMOD_FIELD_BACKING) {
@@ -29629,6 +29632,14 @@ fn native_props_string_property_names(
 /// Synthetic class names for the unmodifiable wrappers.
 const UNMOD_LIST_CLASS: &str = "cratonvm/internal/UnmodifiableList";
 const UNMOD_SET_CLASS: &str = "cratonvm/internal/UnmodifiableSet";
+/// Backs `Collections.unmodifiableSortedSet`/`unmodifiableNavigableSet`
+/// ONLY. Plain `Collections.unmodifiableSet` must use `UNMOD_SET_CLASS`
+/// instead — see the `vm_init.rs` synthetic-class registration comment
+/// for why the two must not share a stamp (a plain wrapped
+/// `LinkedHashSet`/`HashSet` is not a SortedSet, and code that probes
+/// `instanceof SortedSet` before calling `comparator()` would otherwise
+/// call through to a backing class with no such method).
+const UNMOD_SORTED_SET_CLASS: &str = "cratonvm/internal/UnmodifiableSortedSet";
 const UNMOD_MAP_CLASS: &str = "cratonvm/internal/UnmodifiableMap";
 const UNMOD_COLLECTION_CLASS: &str = "cratonvm/internal/UnmodifiableCollection";
 const UNMOD_ITR_CLASS: &str = "cratonvm/internal/UnmodifiableItr";
@@ -29746,9 +29757,15 @@ fn unmod_delegate_rewrap_set(
 ) -> MethodCallResult {
     let res = unmod_delegate(ctx, args, method, descriptor)?;
     match res {
+        // Sub-views (tailSet/headSet/subSet/descendingSet) are only reachable
+        // starting from an already-sorted/navigable set, and the JDK's own
+        // UnmodifiableNavigableSet returns further NavigableSet-typed
+        // sub-views — so re-wrap with UNMOD_SORTED_SET_CLASS (NOT the plain
+        // UNMOD_SET_CLASS), keeping the SortedSet/NavigableSet surface (e.g.
+        // comparator()) available on the result the same way the JDK does.
         Some(Value::Object(Some(s))) => Ok(Some(Value::Object(Some(alloc_unmod_wrapper(
             ctx,
-            UNMOD_SET_CLASS,
+            UNMOD_SORTED_SET_CLASS,
             s,
         ))))),
         other => Ok(other),
@@ -29759,7 +29776,12 @@ fn register_unmodifiable_natives(r: &mut NativeMethodRegistry) {
     let __prev_cat = r.current_category();
     r.set_category(cratonvm_native_api::NativeKind::Bridge);
     // ---- UnmodifiableCollection (also the shared base for List/Set) -------
-    for c in [UNMOD_COLLECTION_CLASS, UNMOD_LIST_CLASS, UNMOD_SET_CLASS] {
+    for c in [
+        UNMOD_COLLECTION_CLASS,
+        UNMOD_LIST_CLASS,
+        UNMOD_SET_CLASS,
+        UNMOD_SORTED_SET_CLASS,
+    ] {
         r.register(c, "size", "()I", native_unmod_size);
         r.register(c, "isEmpty", "()Z", native_unmod_is_empty);
         r.register(
@@ -29933,19 +29955,24 @@ fn register_unmodifiable_natives(r: &mut NativeMethodRegistry) {
         }
     }
 
-    // ---- UnmodifiableSet — NavigableSet/SortedSet read-only surface -------
+    // ---- UnmodifiableSortedSet — NavigableSet/SortedSet read-only surface -
     //
-    // `cratonvm/internal/UnmodifiableSet` also backs `Collections.
+    // `cratonvm/internal/UnmodifiableSortedSet` backs `Collections.
     // unmodifiableSortedSet`/`unmodifiableNavigableSet` (see
-    // `native_collections_unmodifiable_set`), so a wrapped TreeSet navigated
-    // as a NavigableSet needs the same surface `UnmodifiableMap` already gets
-    // for NavigableMap above — e.g. `KnownIndexVersions.<clinit>` calls
+    // `native_collections_unmodifiable_sorted_set`) — NOT plain `Collections.
+    // unmodifiableSet` (that uses `UNMOD_SET_CLASS`, which does NOT implement
+    // SortedSet/NavigableSet; see the `vm_init.rs` synthetic-class comment and
+    // `RequestMappingInfoHandlerMappingTests::getHandlerRequestMethodNotAllowed`,
+    // which crashed with `NoSuchMethodError: LinkedHashSet.comparator()` when
+    // both call sites shared one stamp). A wrapped TreeSet navigated as a
+    // NavigableSet needs the same surface `UnmodifiableMap` already gets for
+    // NavigableMap above — e.g. `KnownIndexVersions.<clinit>` calls
     // `Collections.unmodifiableNavigableSet(new TreeSet<>(...)).tailSet(v,
     // true)`, which previously raised NoSuchMethodError (no method registered
     // on the synthetic wrapper class at all) and aborted every caller's
     // `<clinit>` with ExceptionInInitializerError.
     {
-        let c = UNMOD_SET_CLASS;
+        let c = UNMOD_SORTED_SET_CLASS;
         r.register(c, "first", "()Ljava/lang/Object;", |ctx, args| {
             unmod_delegate(ctx, args, "first", "()Ljava/lang/Object;")
         });
@@ -31044,7 +31071,7 @@ fn register_collections_extras_natives(r: &mut NativeMethodRegistry) {
         c,
         "unmodifiableSortedSet",
         "(Ljava/util/SortedSet;)Ljava/util/SortedSet;",
-        native_collections_unmodifiable_set,
+        native_collections_unmodifiable_sorted_set,
     );
     r.register(
         c,
@@ -31056,7 +31083,7 @@ fn register_collections_extras_natives(r: &mut NativeMethodRegistry) {
         c,
         "unmodifiableNavigableSet",
         "(Ljava/util/NavigableSet;)Ljava/util/NavigableSet;",
-        native_collections_unmodifiable_set,
+        native_collections_unmodifiable_sorted_set,
     );
     r.register(
         c,
@@ -31324,6 +31351,12 @@ fn native_collections_unmodifiable_map(
 }
 
 /// `Collections.unmodifiableSet` — wrap the source set in a live read-only view.
+///
+/// Uses the plain `UNMOD_SET_CLASS` stamp (Set/Collection/Serializable only —
+/// NOT SortedSet/NavigableSet). `unmodifiableSortedSet`/`unmodifiableNavigableSet`
+/// go through `native_collections_unmodifiable_sorted_set` below instead, so a
+/// plain wrapped `LinkedHashSet`/`HashSet` never claims a `comparator()` (etc.)
+/// surface it can't actually delegate (real `LinkedHashSet` has no such method).
 fn native_collections_unmodifiable_set(
     ctx: &mut dyn NativeContext,
     args: &[Value],
@@ -31331,6 +31364,26 @@ fn native_collections_unmodifiable_set(
     match args.first() {
         Some(Value::Object(Some(src))) => {
             let w = alloc_unmod_wrapper(ctx, UNMOD_SET_CLASS, *src);
+            Ok(Some(Value::Object(Some(w))))
+        }
+        _ => Ok(Some(Value::Object(None))),
+    }
+}
+
+/// `Collections.unmodifiableSortedSet`/`unmodifiableNavigableSet` — wrap the
+/// source (already sorted/navigable) set in a live read-only view that also
+/// exposes the SortedSet/NavigableSet surface (`comparator()`, `first()`,
+/// `last()`, `headSet`/`tailSet`/`subSet`, etc. — see the `UNMOD_SORTED_SET_CLASS`
+/// registration block). Distinct from plain `native_collections_unmodifiable_set`
+/// so a non-sorted `Collections.unmodifiableSet` result never mis-reports as
+/// `instanceof SortedSet`.
+fn native_collections_unmodifiable_sorted_set(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    match args.first() {
+        Some(Value::Object(Some(src))) => {
+            let w = alloc_unmod_wrapper(ctx, UNMOD_SORTED_SET_CLASS, *src);
             Ok(Some(Value::Object(Some(w))))
         }
         _ => Ok(Some(Value::Object(None))),

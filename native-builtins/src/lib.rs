@@ -24129,6 +24129,12 @@ enum GetClassDisplay {
     /// family (with a `RandomAccess` check for lists).
     CollList,
     CollSet,
+    /// `cratonvm/internal/UnmodifiableSortedSet` — backs `Collections.
+    /// unmodifiableSortedSet`/`unmodifiableNavigableSet` (distinct from
+    /// `CollSet`, which backs plain `unmodifiableSet` and does NOT implement
+    /// SortedSet/NavigableSet; see `native-collections`' `UNMOD_SORTED_SET_CLASS`
+    /// for why the two stamps must not be shared).
+    CollSortedSet,
     CollMap,
     /// `cratonvm/internal/UnmodifiableCollection` — only ever produced by
     /// `Collections.unmodifiableCollection` (no immutable factory), so it always
@@ -24141,6 +24147,7 @@ fn collection_display_kind(stamp: &str) -> Option<GetClassDisplay> {
     match stamp {
         "cratonvm/internal/UnmodifiableList" => Some(GetClassDisplay::CollList),
         "cratonvm/internal/UnmodifiableSet" => Some(GetClassDisplay::CollSet),
+        "cratonvm/internal/UnmodifiableSortedSet" => Some(GetClassDisplay::CollSortedSet),
         "cratonvm/internal/UnmodifiableMap" => Some(GetClassDisplay::CollMap),
         "cratonvm/internal/UnmodifiableCollection" => Some(GetClassDisplay::CollUnmod),
         _ => None,
@@ -24213,6 +24220,23 @@ fn getclass_backing_is_random_access(ctx: &mut dyn NativeContext, this: ObjectRe
     ctx.is_subclass(backing_cid, ra)
 }
 
+/// Whether the backing set of an unmodifiable-sorted-set wrapper (slot 0,
+/// `UNMOD_FIELD_BACKING`) implements `java.util.NavigableSet` — used to pick
+/// between `Collections$UnmodifiableSortedSet` and the NavigableSet subclass
+/// `Collections$UnmodifiableNavigableSet` for `getClass()` display.
+fn getclass_backing_is_navigable_set(ctx: &mut dyn NativeContext, this: ObjectRef) -> bool {
+    let backing = match ctx.get_field(this, 0) {
+        Value::Object(Some(b)) => b,
+        _ => return false,
+    };
+    let ns = match getclass_resolve_name(ctx, "java/util/NavigableSet") {
+        Some(cid) => cid,
+        None => return false,
+    };
+    let backing_cid = ctx.class_id_of_object(backing);
+    ctx.is_subclass(backing_cid, ns)
+}
+
 /// Resolve the concrete display `ClassId` for an object stamped with `class_id`,
 /// or `None` to use the stamp unchanged. The stamp→strategy classification is
 /// memoised; the size-dependent collection forms are resolved per-object.
@@ -24277,6 +24301,20 @@ pub(crate) fn getclass_display_class_id(
                 }
             } else {
                 "java/util/Collections$UnmodifiableSet"
+            };
+            getclass_resolve_name(ctx, name)
+        }
+        // Real JDK distinguishes `Collections$UnmodifiableSortedSet` (from
+        // `unmodifiableSortedSet`) vs the NavigableSet subclass
+        // `Collections$UnmodifiableNavigableSet` (from `unmodifiableNavigableSet`).
+        // We don't track which factory produced a given wrapper, so use the
+        // backing set's own NavigableSet-ness as a best-effort proxy (matches
+        // the common case of wrapping a TreeSet either way).
+        GetClassDisplay::CollSortedSet => {
+            let name = if getclass_backing_is_navigable_set(ctx, this) {
+                "java/util/Collections$UnmodifiableNavigableSet"
+            } else {
+                "java/util/Collections$UnmodifiableSortedSet"
             };
             getclass_resolve_name(ctx, name)
         }

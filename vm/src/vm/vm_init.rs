@@ -1096,13 +1096,24 @@ impl SharedVm {
                 .load_class("java/util/Set")
                 .expect("java/util/Set must be loadable");
             // `Collections.unmodifiableSortedSet`/`unmodifiableNavigableSet`
-            // also allocate `UnmodifiableSet` (see
-            // `native_collections_unmodifiable_set`), so it must declare these
-            // two interfaces too — otherwise a caller-side `(SortedSet)` /
-            // `(NavigableSet)` checkcast on the returned wrapper (e.g.
-            // `IndexVersionUtils.ALL_VERSIONS` typed as `NavigableSet<...>`)
-            // raises ClassCastException even though the native methods for
-            // both surfaces are registered on the wrapper class.
+            // allocate the separate `UnmodifiableSortedSet` synthetic class
+            // below (see `native_collections_unmodifiable_sorted_set`), which
+            // declares these two interfaces — otherwise a caller-side
+            // `(SortedSet)` / `(NavigableSet)` checkcast on the returned
+            // wrapper (e.g. `IndexVersionUtils.ALL_VERSIONS` typed as
+            // `NavigableSet<...>`) raises ClassCastException even though the
+            // native methods for both surfaces are registered on the wrapper
+            // class.
+            //
+            // IMPORTANT: plain `UnmodifiableSet` (backing `Collections.
+            // unmodifiableSet`) must NOT declare these — a plain
+            // `LinkedHashSet`/`HashSet` wrapped this way is not a SortedSet,
+            // and code that probes `instanceof SortedSet` before calling
+            // `comparator()` (e.g. AssertJ's `AbstractIterableAssert`
+            // constructor) would otherwise call through to a backing class
+            // that genuinely has no such method, crashing with
+            // `NoSuchMethodError: LinkedHashSet.comparator()`. See
+            // `RequestMappingInfoHandlerMappingTests::getHandlerRequestMethodNotAllowed`.
             let sorted_set_id = class_manager
                 .load_class("java/util/SortedSet")
                 .expect("java/util/SortedSet must be loadable");
@@ -1128,7 +1139,7 @@ impl SharedVm {
                 .load_class("java/io/Serializable")
                 .expect("java/io/Serializable must be loadable");
             // (synthetic class name, list of interface ClassIds it implements)
-            let unmod_specs: [(&str, &[ClassId]); 6] = [
+            let unmod_specs: [(&str, &[ClassId]); 7] = [
                 (
                     "cratonvm/internal/UnmodifiableCollection",
                     &[collection_id, serializable_id],
@@ -1139,6 +1150,14 @@ impl SharedVm {
                 ),
                 (
                     "cratonvm/internal/UnmodifiableSet",
+                    &[set_id, collection_id, serializable_id],
+                ),
+                (
+                    // Backs `Collections.unmodifiableSortedSet`/
+                    // `unmodifiableNavigableSet` only — see the comment above
+                    // on `sorted_set_id`. Plain `Collections.unmodifiableSet`
+                    // uses `UnmodifiableSet` (no SortedSet/NavigableSet).
+                    "cratonvm/internal/UnmodifiableSortedSet",
                     &[
                         set_id,
                         sorted_set_id,
