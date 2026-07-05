@@ -178,6 +178,10 @@ pub fn mark_system_props(ctx: &dyn NativeContext, obj: ObjectRef) {
     system_props_keys().lock().insert(key_for(ctx, obj));
 }
 
+pub fn unmark_system_props(ctx: &dyn NativeContext, obj: ObjectRef) {
+    system_props_keys().lock().remove(&key_for(ctx, obj));
+}
+
 fn is_system_props(ctx: &dyn NativeContext, obj: ObjectRef) -> bool {
     system_props_keys().lock().contains(&key_for(ctx, obj))
 }
@@ -1436,6 +1440,16 @@ fn native_properties_clear(ctx: &mut dyn NativeContext, args: &[Value]) -> Metho
     table().lock().remove(&key_for(ctx, this));
     if let Value::Object(Some(chm)) = ctx.get_field_by_name(this, "map") {
         let _ = ctx.invoke_virtual(chm, "clear", "()V", &[]);
+    }
+    if is_system_props(ctx, this) {
+        let old_keys: Vec<String> = ctx
+            .list_system_properties()
+            .into_iter()
+            .map(|(k, _)| k)
+            .collect();
+        for key in old_keys {
+            let _ = ctx.remove_system_property(&key);
+        }
     }
     Ok(None)
 }

@@ -11858,6 +11858,49 @@ pub fn register_essential_natives(registry: &mut NativeMethodRegistry) {
     );
     registry.register(
         "java/lang/System",
+        "setProperties",
+        "(Ljava/util/Properties;)V",
+        |ctx, args| {
+            let entries = match args.first() {
+                Some(Value::Object(Some(props))) => {
+                    crate::properties_sidetable::snapshot_sidetable(ctx, *props)
+                }
+                _ => Vec::new(),
+            };
+
+            // Replace the VM's canonical system-property map, rather than
+            // layering the supplied Properties on top of the old map. Keycloak's
+            // AbstractConfigurationTest captures a baseline clone and resets via
+            // System.setProperties(clone); additive semantics leave stale
+            // kc.config.args values visible to later config builds.
+            let old_keys: Vec<String> = ctx
+                .list_system_properties()
+                .into_iter()
+                .map(|(k, _)| k)
+                .collect();
+            for key in old_keys {
+                let _ = ctx.remove_system_property(&key);
+            }
+            for (key, value) in &entries {
+                let _ = ctx.set_system_property(key, value);
+            }
+
+            let new_singleton = match args.first() {
+                Some(Value::Object(Some(props))) => Some(*props),
+                _ => None,
+            };
+            if let Some(old) = crate::lang_system::replace_system_props_singleton(new_singleton) {
+                crate::properties_sidetable::unmark_system_props(ctx, old);
+            }
+            if let Some(props) = new_singleton {
+                crate::properties_sidetable::mark_system_props(ctx, props);
+                crate::properties_sidetable::replace_sidetable(ctx, props, &entries);
+            }
+            Ok(None)
+        },
+    );
+    registry.register(
+        "java/lang/System",
         "lineSeparator",
         "()Ljava/lang/String;",
         |ctx, _args| {

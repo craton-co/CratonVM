@@ -764,6 +764,12 @@ function New-ProcessRecord {
 
   $module = [string]$ClassRow.module
   $class = [string]$ClassRow.class
+  $workingDirectory = $script:KeycloakDir
+  if ($module) {
+    $modulePath = $module -replace '/', [System.IO.Path]::DirectorySeparatorChar
+    $moduleRoot = Join-Path $script:KeycloakDir $modulePath
+    if (Test-Path $moduleRoot) { $workingDirectory = $moduleRoot }
+  }
   $safe = ConvertTo-SafeFileStem "$module.$class"
   $logDir = Join-Path $ModeOut 'logs'
   New-Item -ItemType Directory -Force -Path $logDir | Out-Null
@@ -797,7 +803,7 @@ function New-ProcessRecord {
 
   $psi = [System.Diagnostics.ProcessStartInfo]::new()
   $psi.FileName = $file
-  $psi.WorkingDirectory = $script:KeycloakDir
+  $psi.WorkingDirectory = $workingDirectory
   $psi.UseShellExecute = $false
   $psi.CreateNoWindow = $true
   $psi.RedirectStandardOutput = $true
