@@ -2,7 +2,7 @@
 
 | | |
 |---|---|
-| **Status** | 🔴 OPEN — not yet root-caused. Confirmed CratonVM-specific (HotSpot passes 1/1). |
+| **Status** | 🟠 PATCHED LOCALLY — root cause identified; exact Hibernate rerun still pending because this checkout has no Hibernate runner. |
 | **Area** | VM — virtual/interface method dispatch for `InputStream.read()` on a JDBC `Blob`'s binary stream |
 | **Symptom** | `java.lang.NoSuchMethodError: java/lang/Object.read()I` |
 | **Severity** | medium — single class, but the failure mode (dispatch landing on `Object`'s non-existent method) suggests a general vtable/interface-dispatch defect that could recur elsewhere. |
@@ -51,6 +51,51 @@ several unrelated docs in this repo
 worth keeping in mind if a common dispatch-fallback bug is ever found, but
 each occurrence so far has had a distinct, unrelated root cause on inspection.
 
+## Root cause / patch (2026-07-05)
+
+Root cause is in the JIT virtual/interface MIC helper, not in H2 or Hibernate.
+`jit_invoke_virtual_mic` derived its dispatch owner from the receiver header.
+For a non-array receiver whose header reports `ClassId(0)`, the class store
+maps id 0 to `java/lang/Object`; a non-Object call such as
+`java/io/InputStream.read()I` could therefore be invoked as
+`java/lang/Object.read()I`. The interpreter path already had a safer rule for
+this case: `ClassId(0)` plus a non-Object method falls back to the CP-resolved
+owner. The JIT MIC path did not mirror that rule.
+
+There was a second cache-safety bug in the same path: MIC/PIC publication was
+still possible for receiver class id 0. PIC slots use class id 0 as their empty
+sentinel, so installing a resolved target under id 0 could turn an "empty" slot
+into a callable inline-cache entry for other corrupted/synthetic receivers.
+
+Patch: `vm/src/jit/helpers.rs` now resolves virtual/interface helper dispatch
+through one shared target selector. `ClassId(0)` non-Object calls fall back to
+the CP owner (`java/io/InputStream` for this call), true Object members still
+dispatch through `java/lang/Object`, and CP-fallback / array / bare-object
+targets are marked non-cacheable so MIC/PIC state is not poisoned.
+
+## Local validation
+
+Validated in isolated worktree
+`C:\craton\CratonVM-hib-jpalargeblob-read-20260705-001`:
+
+```
+CARGO_TARGET_DIR=target\codex-hib-jpalargeblob-20260705-001 \
+  cargo test -p cratonvm-vm --lib virtual_dispatch_target -- --nocapture
+
+CARGO_TARGET_DIR=target\codex-hib-jpalargeblob-20260705-001 \
+  cargo test -p cratonvm-vm --lib jit::helpers -- --nocapture
+
+CARGO_TARGET_DIR=target\codex-hib-jpalargeblob-20260705-001 \
+  cargo build -p cratonvm-cli --bin cratonvm
+```
+
+Unique binary built for external suite rerun:
+`target\codex-hib-jpalargeblob-20260705-001\debug\cratonvm-hib-jpalargeblob-read-20260705-001.exe`.
+
+The exact Hibernate repro was not rerun locally: this checkout contains no
+`apps/hibernate-orm`, no `apps/hib-suite-runner`, and no `/home/victor/hibpkg`
+runner mirror.
+
 ## Repro
 
 Azure host, harness at `/home/victor/hibpkg/runner`:
@@ -60,19 +105,12 @@ CRATONVM_DISABLE_DEFAULT_WATCHDOG=1 CRATONVM_JIT_OSR=1 \
   -Dcraton.batch=1 CratonRunner <(echo org.hibernate.orm.test.lob.JpaLargeBlobTest) 0
 ```
 
-## Next steps (not yet done)
+## Remaining validation
 
-- Identify the concrete runtime class of the `Blob`'s binary stream (H2's
-  `org.h2.jdbc.JdbcBlob` wraps a memory- or file-backed stream — likely
-  `org.h2.value.ValueLob`'s internal stream class, or an H2-internal
-  `RangeInputStream`/`BufferedInputStream` chain).
-- Instrument the invoke-site to see what CP-resolved owner/descriptor the
-  interpreter/JIT used for the `.read()` call, and what vtable index it
-  computed vs. what `Object`'s (empty) method table actually contains at
-  that index — this smells like an interface-dispatch (`invokeinterface`)
-  vtable-index bug rather than a name/loader-resolution bug, given the
-  target is a completely unrelated class (`Object`) rather than a stale or
-  wrong-loader copy of the right class.
-- Check whether `--nojit` avoids it (would confirm/rule out a JIT-specific
-  interface-dispatch codegen bug, matching the session's established
-  pattern of JIT-only dispatch defects).
+- Re-run the exact Azure/Linux Hibernate repro with the unique binary above.
+  Expected result: `JpaLargeBlobTest` should no longer report
+  `java/lang/Object.read()I`.
+- If a failure remains, collect `CRATONVM_DBG_MIC_PROF=1`,
+  `CRATONVM_DBG_NSME=1`, and a focused stack trace around the failing
+  `InputStream.read()` call site; that would indicate a deeper live-receiver
+  corruption after the dispatch-class and cache-sentinel bugs have been fixed.

@@ -918,15 +918,78 @@ unsafe fn bail_to_interpreter(
     }
 }
 
-/// Resolve the runtime dispatch class for a virtual/interface bail
-/// (`bail_to_interpreter`, kinds 0/2). `invoke_or_native` binds to the class
-/// name it is handed rather than re-dispatching on the receiver, so the bail
-/// must hand it the receiver's *runtime* class — not the static call-site type
-/// in `info.class_name`. Mirrors `jit_invoke_virtual_mic`'s receiver
-/// resolution: array receivers dispatch through `java/lang/Object` (JVMS
-/// §4.4.1); a null/non-object receiver or a class id absent from the store
-/// (synthetic alloc, which would derive an empty name) falls back to the
-/// static call-site class so we never dispatch on `""`.
+struct VirtualDispatchTarget {
+    class_name: std::sync::Arc<str>,
+    cacheable_receiver: bool,
+}
+
+/// Resolve the runtime dispatch class for a virtual/interface helper call.
+/// `invoke_or_native` binds to the class name it is handed rather than
+/// re-dispatching on the receiver, so the helper must hand it the receiver's
+/// *runtime* class when that class is trustworthy, or the CP-resolved
+/// call-site class when the receiver carries only an unusable/synthetic id.
+///
+/// `cacheable_receiver` is true only when `class_name` is the receiver class
+/// named by the MIC/PIC key. If the receiver is `ClassId(0)`, an array, or a
+/// bare/interface fallback to the CP class, publishing that result under the
+/// receiver id would poison later inline-cache hits.
+///
+/// SAFETY: `vm` must be live; `receiver` must be a valid heap reference.
+unsafe fn virtual_dispatch_target_for_receiver(
+    vm: &SharedVm,
+    receiver: ObjectRef,
+    info: &JitInvokeInfo,
+) -> VirtualDispatchTarget {
+    if vm.heap.kind_of(receiver) == cratonvm_types::ObjectKind::Array {
+        return VirtualDispatchTarget {
+            class_name: std::sync::Arc::from("java/lang/Object"),
+            cacheable_receiver: false,
+        };
+    }
+
+    let cid = vm.heap.class_id_of(receiver);
+    if cid == ClassId::new(0) {
+        return VirtualDispatchTarget {
+            class_name: if crate::vm::is_object_member(info.method_name, info.descriptor) {
+                std::sync::Arc::from("java/lang/Object")
+            } else {
+                std::sync::Arc::from(info.class_name)
+            },
+            cacheable_receiver: false,
+        };
+    }
+
+    let cm = vm.class_manager.read();
+    let Some(recv_class) = cm.get_class(cid) else {
+        return VirtualDispatchTarget {
+            class_name: std::sync::Arc::from(info.class_name),
+            cacheable_receiver: false,
+        };
+    };
+    let recv_name = recv_class.name.clone();
+    let recv_is_iface = recv_class.is_interface();
+    let recv_is_bare_object = recv_name.as_ref() == "java/lang/Object";
+    let cp_is_not_object = info.class_name != "java/lang/Object";
+    if (recv_is_iface || recv_is_bare_object)
+        && cp_is_not_object
+        && !crate::vm::is_object_member(info.method_name, info.descriptor)
+        && recv_name.as_ref() != info.class_name
+    {
+        VirtualDispatchTarget {
+            class_name: std::sync::Arc::from(info.class_name),
+            cacheable_receiver: false,
+        }
+    } else {
+        VirtualDispatchTarget {
+            class_name: recv_name,
+            cacheable_receiver: true,
+        }
+    }
+}
+
+/// Resolve the dispatch class for a virtual/interface bail
+/// (`bail_to_interpreter`, kinds 0/2). Null/non-object receivers fall back to
+/// the static call-site class so we never dispatch on an empty name.
 ///
 /// SAFETY: `vm` must be a live `SharedVm`; `args[0]` (when present) is the
 /// receiver `Value` decoded by `decode_dispatch_values`/`decode_values`.
@@ -939,14 +1002,7 @@ unsafe fn virtual_dispatch_class(
         Some(Value::Object(Some(obj))) => *obj,
         _ => return std::sync::Arc::from(info.class_name),
     };
-    if vm.heap.kind_of(receiver) == cratonvm_types::ObjectKind::Array {
-        return std::sync::Arc::from("java/lang/Object");
-    }
-    let cid = vm.heap.class_id_of(receiver);
-    let cm = vm.class_manager.read();
-    cm.get_class(cid)
-        .map(|c| c.name.clone())
-        .unwrap_or_else(|| std::sync::Arc::from(info.class_name))
+    virtual_dispatch_target_for_receiver(vm, receiver, info).class_name
 }
 
 /// BUG-H: does the statically-bound callee declare a non-empty exception
@@ -4317,24 +4373,17 @@ pub unsafe extern "C" fn jit_invoke_virtual_mic(
         // `Enum.clone() → CloneNotSupportedException` for every array clone
         // of an enum type. Per JVMS §4.4.1, array classes inherit their
         // method table from `Object`; short-circuit accordingly.
-        let class_name: std::sync::Arc<str> =
-            if vm.heap.kind_of(receiver_ref) == cratonvm_types::ObjectKind::Array {
-                std::sync::Arc::from("java/lang/Object")
-            } else {
-                let guard = mic.cached_class_name.lock();
-                match &*guard {
-                    Some(name) => name.clone(),
-                    None => {
-                        drop(guard);
-                        let cm = vm.class_manager.read();
-                        cm.get_class(receiver_class_id)
-                            .map(|c| c.name.clone())
-                            // Same fallback as the miss path below: never
-                            // dispatch on an empty class name.
-                            .unwrap_or_else(|| std::sync::Arc::from(info.class_name))
-                    }
-                }
-            };
+        let dispatch_target = virtual_dispatch_target_for_receiver(vm, receiver_ref, info);
+        let cacheable_receiver = dispatch_target.cacheable_receiver;
+        let class_name: std::sync::Arc<str> = if cacheable_receiver {
+            let guard = mic.cached_class_name.lock();
+            match &*guard {
+                Some(name) => name.clone(),
+                None => dispatch_target.class_name,
+            }
+        } else {
+            dispatch_target.class_name
+        };
 
         // `decode_values` yields exactly `[receiver, args...]` — the full
         // argument vector `invoke_or_native` expects. (This path previously
@@ -4355,7 +4404,7 @@ pub unsafe extern "C" fn jit_invoke_virtual_mic(
         // unequal (bc-java InterleaveTest, junit assertEquals(Object,Object)).
         // `find_method_recursive` (inside `try_jit_compile_callee`) walks up
         // from the receiver class to the real override.
-        let compile_res = if redefine_jit_quiesced {
+        let compile_res = if redefine_jit_quiesced || !cacheable_receiver {
             None
         } else {
             let _g = mic_prof::CycGuard::new(&mic_prof::CYC_COMPILE_PROBE);
@@ -4451,30 +4500,16 @@ pub unsafe extern "C" fn jit_invoke_virtual_mic(
     // --- Cache miss: full resolution + update cache ---
     mic.record_miss();
 
-    // See the matching block in the cache-hit branch above for the rationale
-    // — array receivers must dispatch through `java/lang/Object` rather than
-    // their component class id, otherwise enum-array `clone()` resolves to
-    // `Enum.clone()` (a JDK-deliberate CNSE thrower).
-    let class_name: std::sync::Arc<str> =
-        if vm.heap.kind_of(receiver_ref) == cratonvm_types::ObjectKind::Array {
-            std::sync::Arc::from("java/lang/Object")
-        } else {
-            let cm = vm.class_manager.read();
-            cm.get_class(receiver_class_id)
-                .map(|c| c.name.clone())
-                // Receiver class id not in the class store (synthetic alloc) —
-                // dispatching on "" would raise a message-less
-                // NoClassDefFoundError; the CP call-site class is the
-                // spec-correct resolution target.
-                .unwrap_or_else(|| std::sync::Arc::from(info.class_name))
-        };
+    let dispatch_target = virtual_dispatch_target_for_receiver(vm, receiver_ref, info);
+    let cacheable_receiver = dispatch_target.cacheable_receiver;
+    let class_name = dispatch_target.class_name;
 
     mic_prof::bump(&mic_prof::MIC_MISS);
     // Try to compile callee for cached entry. Resolve by the RECEIVER's class
     // (`class_name`), not the static `info.class_name` — see the matching
     // VIRTUAL DISPATCH FIX in the cache-hit branch above. `class_name` here is
     // an `Arc<str>`; deref to `&str` for the resolver.
-    let compile_res = if redefine_jit_quiesced {
+    let compile_res = if redefine_jit_quiesced || !cacheable_receiver {
         None
     } else {
         let _g = mic_prof::CycGuard::new(&mic_prof::CYC_COMPILE_PROBE);
@@ -4502,7 +4537,7 @@ pub unsafe extern "C" fn jit_invoke_virtual_mic(
     // helper's `invoke_or_native` path below, which routes the exception
     // through the callee's table correctly. (The statically-bound sibling is
     // gated in the `callee_compiler` closure in `interpreter.rs`.)
-    if !mic_callee_has_exception_table(vm, receiver_class_id, info) {
+    if cacheable_receiver && !mic_callee_has_exception_table(vm, receiver_class_id, info) {
         // Update all MIC fields atomically (needs_ctx must match compiled entry ABI)
         mic.update(receiver_cid, &class_name, entry_ptr, needs_ctx);
 
@@ -4888,6 +4923,51 @@ pub unsafe extern "C" fn jit_uncommon_trap(vm_ptr: i64, reason: i64, bci: i64) -
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn virtual_dispatch_target_uses_cp_class_for_cid0_non_object_method() {
+        use crate::config::VmConfig;
+        use crate::vm::SharedVm;
+
+        let vm = SharedVm::new(VmConfig::default());
+        let receiver = vm.heap.alloc_object(ClassId::new(0), 0);
+        let info = JitInvokeInfo {
+            class_name: "java/io/InputStream",
+            method_name: "read",
+            descriptor: "()I",
+            num_jit_args: 1,
+            return_type: b'I',
+            invoke_kind: 0,
+        };
+
+        let target = unsafe { virtual_dispatch_target_for_receiver(&vm, receiver, &info) };
+        assert_eq!(target.class_name.as_ref(), "java/io/InputStream");
+        assert!(
+            !target.cacheable_receiver,
+            "ClassId(0) is the MIC/PIC empty-slot sentinel and must not be cached"
+        );
+    }
+
+    #[test]
+    fn virtual_dispatch_target_keeps_object_members_on_object_for_cid0() {
+        use crate::config::VmConfig;
+        use crate::vm::SharedVm;
+
+        let vm = SharedVm::new(VmConfig::default());
+        let receiver = vm.heap.alloc_object(ClassId::new(0), 0);
+        let info = JitInvokeInfo {
+            class_name: "java/lang/Object",
+            method_name: "hashCode",
+            descriptor: "()I",
+            num_jit_args: 1,
+            return_type: b'I',
+            invoke_kind: 0,
+        };
+
+        let target = unsafe { virtual_dispatch_target_for_receiver(&vm, receiver, &info) };
+        assert_eq!(target.class_name.as_ref(), "java/lang/Object");
+        assert!(!target.cacheable_receiver);
+    }
 
     #[test]
     fn compiled_entry_reentrant_wrapper_preserves_no_ctx_abi() {

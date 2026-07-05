@@ -8,6 +8,10 @@ angles**; this index is the consolidated map. Read it first.
 
 - [Hibernate UUidV6V7GeneratorTest SIGSEGV after longer timeout](uuid-v6v7-generator-sigsegv.md) - candidate fix: native atomic update loops now pin and re-read references across `UnaryOperator.apply`; original Azure class-level gdb rerun pending.
 
+## 2026-07-05 Hibernate pruned residuals
+
+- [Hibernate JpaLargeBlobTest Object.read() dispatch](hib-jpalargeblobtest-object-read-nosuchmethod.md) - patched locally in the JIT virtual/interface MIC helper: `ClassId(0)` non-Object receivers now fall back to the CP owner and cannot publish MIC/PIC entries under the zero/empty sentinel. Exact Azure Hibernate rerun still pending because this checkout has no Hibernate runner.
+
 ## 2026-07-04 test.context.* cluster (bean/groovy/junit/junit4/testng/web, branch fix/test-context-cluster)
 
 - [Constructor-parameter-annotation offset fix + 3 residuals](test-context-constructor-param-annotation-offset.md) — core fix: `Constructor.getParameterAnnotations()`'s native override didn't account for a synthetic leading parameter (non-static inner-class constructors' implicit outer-instance arg), causing an AIOOBE that crashed 13 of 25 CV-unique classes across the six packages (7 directly + cascading ABEND in 6 more sharing a batch). 3 residuals open: Groovy TestContext script loading (isPresent stub blocks it; removing the stub exposes a separate ANTLR/jarjar class-layout bug — not fixed), `InheritableThreadLocal` not propagated through `Thread(ThreadGroup, Runnable, String[, long])` constructors (breaks `Executors`-backed pools generally, not just these tests), and one JUnit5-parallel-execution TIMEOUT not yet triaged.
