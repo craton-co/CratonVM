@@ -15174,35 +15174,70 @@ pub(crate) fn register_phase54_net_extras(r: &mut NativeMethodRegistry) {
         let this = obj_arg(args, 0)?;
         let raw_ref = obj_arg(args, 1)?;
         let raw = ctx.read_string(raw_ref).unwrap_or_default();
-        // Simple URI parser
-        let (scheme, rest) = if let Some(pos) = raw.find("://") {
-            let s = ctx.create_string(&raw[..pos]);
-            (Value::Object(Some(s)), &raw[pos + 3..])
-        } else {
-            (Value::Object(None), raw.as_str())
+        // JDK URI authority is introduced only by `//` after the optional
+        // scheme. A plain relative URI such as `docProps/core.xml` is all path;
+        // treating `docProps` as an authority drops the first path segment and
+        // corrupts OOXML relationship entries when POI constructs package part
+        // names through `new URI(String)`.
+        let (scheme_text, rest) = match raw.find(':') {
+            Some(pos) => {
+                let candidate = &raw[..pos];
+                let valid_scheme = !candidate.is_empty()
+                    && candidate
+                        .chars()
+                        .next()
+                        .map(|c| c.is_ascii_alphabetic())
+                        .unwrap_or(false)
+                    && candidate
+                        .chars()
+                        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '+' | '-' | '.'));
+                if valid_scheme {
+                    (Some(candidate), &raw[pos + 1..])
+                } else {
+                    (None, raw.as_str())
+                }
+            }
+            None => (None, raw.as_str()),
         };
-        // Split host:port from path
-        let (authority, path_and_rest) = if let Some(pos) = rest.find('/') {
-            (&rest[..pos], &rest[pos..])
+        let scheme = scheme_text
+            .map(|s| Value::Object(Some(ctx.create_string(s))))
+            .unwrap_or(Value::Object(None));
+        let (authority, path_and_rest) = if let Some(after_slashes) = rest.strip_prefix("//") {
+            match after_slashes.find(['/', '?', '#']) {
+                Some(pos) => (Some(&after_slashes[..pos]), &after_slashes[pos..]),
+                None => (Some(after_slashes), ""),
+            }
         } else {
-            (rest, "")
+            (None, rest)
         };
-        let (host, port) = if let Some(colon) = authority.rfind(':') {
-            if let Ok(p) = authority[colon + 1..].parse::<i32>() {
-                let h = ctx.create_string(&authority[..colon]);
-                (Value::Object(Some(h)), Value::Int(p))
+        let (host, port) = if let Some(authority) = authority {
+            if let Some(colon) = authority.rfind(':') {
+                if let Ok(p) = authority[colon + 1..].parse::<i32>() {
+                    let h = ctx.create_string(&authority[..colon]);
+                    (Value::Object(Some(h)), Value::Int(p))
+                } else {
+                    let h = ctx.create_string(authority);
+                    (Value::Object(Some(h)), Value::Int(-1))
+                }
+            } else if authority.is_empty() {
+                (Value::Object(None), Value::Int(-1))
             } else {
                 let h = ctx.create_string(authority);
                 (Value::Object(Some(h)), Value::Int(-1))
             }
-        } else if authority.is_empty() {
-            (Value::Object(None), Value::Int(-1))
         } else {
-            let h = ctx.create_string(authority);
-            (Value::Object(Some(h)), Value::Int(-1))
+            (Value::Object(None), Value::Int(-1))
         };
         // Split path?query#fragment
         let (path_str, query, fragment) = {
+            let path_and_rest = if scheme_text.is_some()
+                && authority.is_none()
+                && !path_and_rest.starts_with('/')
+            {
+                ""
+            } else {
+                path_and_rest
+            };
             let (path_q, frag) = if let Some(hash) = path_and_rest.find('#') {
                 (&path_and_rest[..hash], Some(&path_and_rest[hash + 1..]))
             } else {
@@ -15241,6 +15276,26 @@ pub(crate) fn register_phase54_net_extras(r: &mut NativeMethodRegistry) {
         ctx.set_field(this, 4, query_val);
         ctx.set_field(this, 5, fragment_val);
         ctx.set_field(this, 6, Value::Object(Some(raw_str)));
+        let named_raw = ctx.create_string(&raw);
+        ctx.set_field_by_name(this, "string", Value::Object(Some(named_raw)));
+        if let Some(scheme) = scheme_text {
+            let named_scheme = ctx.create_string(scheme);
+            ctx.set_field_by_name(this, "scheme", Value::Object(Some(named_scheme)));
+            let named_ssp = ctx.create_string(rest);
+            ctx.set_field_by_name(this, "schemeSpecificPart", Value::Object(Some(named_ssp)));
+            let named_dssp = ctx.create_string(rest);
+            ctx.set_field_by_name(
+                this,
+                "decodedSchemeSpecificPart",
+                Value::Object(Some(named_dssp)),
+            );
+        }
+        if !path_str.is_empty() {
+            let named_path = ctx.create_string(path_str);
+            ctx.set_field_by_name(this, "path", Value::Object(Some(named_path)));
+            let named_decoded_path = ctx.create_string(path_str);
+            ctx.set_field_by_name(this, "decodedPath", Value::Object(Some(named_decoded_path)));
+        }
         Ok(Some(Value::Object(None)))
     });
     r.register(
@@ -15308,7 +15363,12 @@ pub(crate) fn register_phase54_net_extras(r: &mut NativeMethodRegistry) {
     });
     r.register(uri, "getPath", "()Ljava/lang/String;", |ctx, args| {
         let this = obj_arg(args, 0)?;
-        Ok(Some(ctx.get_field(this, 3)))
+        let raw = crate::net_phase_e::uri_raw_string(ctx, this);
+        let path = match crate::net_phase_e::uri_select_raw_path(&raw) {
+            Some(path) => path,
+            None => return Ok(Some(Value::Object(None))),
+        };
+        Ok(Some(Value::Object(Some(ctx.create_string(&path)))))
     });
     r.register(uri, "getQuery", "()Ljava/lang/String;", |ctx, args| {
         let this = obj_arg(args, 0)?;
@@ -15347,24 +15407,28 @@ pub(crate) fn register_phase54_net_extras(r: &mut NativeMethodRegistry) {
         ctx.set_field(url_obj, 0, Value::Object(Some(raw_obj)));
         Ok(Some(Value::Object(Some(url_obj))))
     });
+    // equals/hashCode: this registration (phase54, registered LAST — see the
+    // `register_phase54_natives` call site in lib.rs) wins over the identical
+    // pair in `net_phase_e.rs`, so it is the one actually in effect for
+    // real-JDK mode. Delegates to the shared `net_phase_e::uri_equals`/
+    // `uri_hash_code` helpers (component-wise, JDK-matching semantics —
+    // scheme/host compared case-insensitively, everything else exactly) —
+    // see their doc comments for why raw-string equality was wrong (it broke
+    // `UriComponentsTests::toUriWithIpv6HostAlreadyEncoded[WHAT_WG]`, whose
+    // WHATWG-canonicalized lowercase IPv6 host is still `URI.equals()` to the
+    // mixed-case original per real JDK's case-insensitive host comparison).
     r.register(uri, "equals", "(Ljava/lang/Object;)Z", |ctx, args| {
         let this = obj_arg(args, 0)?;
         if let Value::Object(Some(other)) = args[1] {
-            let str1 = crate::net_phase_e::uri_raw_string(ctx, this);
-            let str2 = crate::net_phase_e::uri_raw_string(ctx, other);
-            Ok(Some(Value::Int(if str1 == str2 { 1 } else { 0 })))
+            let eq = crate::net_phase_e::uri_equals(ctx, this, other);
+            Ok(Some(Value::Int(if eq { 1 } else { 0 })))
         } else {
             Ok(Some(Value::Int(0)))
         }
     });
     r.register(uri, "hashCode", "()I", |ctx, args| {
         let this = obj_arg(args, 0)?;
-        let text = crate::net_phase_e::uri_raw_string(ctx, this);
-        let mut hash: i32 = 0;
-        for ch in text.bytes() {
-            hash = hash.wrapping_mul(31).wrapping_add(ch as i32);
-        }
-        Ok(Some(Value::Int(hash)))
+        Ok(Some(Value::Int(crate::net_phase_e::uri_hash_code(ctx, this))))
     });
 
     // --- HttpURLConnection (10-field) ---

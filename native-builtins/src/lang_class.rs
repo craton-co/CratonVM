@@ -3885,6 +3885,19 @@ pub(crate) fn native_field_get_declaring_class(
     Ok(Some(ctx.get_field_by_name(this, "clazz")))
 }
 
+fn ensure_static_field_declaring_class_initialized(
+    ctx: &mut dyn NativeContext,
+    class_id: cratonvm_types::ClassId,
+) -> Result<(), cratonvm_types::error::MethodCallFailed> {
+    if let Some(name) = ctx.class_name_of_id(class_id) {
+        // Reflective access to a static field is an active use of the declaring
+        // class. HotSpot runs <clinit> before Field.get/set returns the value;
+        // XMLBeans depends on this for generated enum `table` fields.
+        ctx.ensure_class_initialized(&name)?;
+    }
+    Ok(())
+}
+
 // --- Field.get(Object) / Field.set(Object, Object) ---
 
 pub(crate) fn native_field_get(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
@@ -3927,6 +3940,7 @@ pub(crate) fn native_field_get(ctx: &mut dyn NativeContext, args: &[Value]) -> M
     }
 
     let raw_value = if is_static {
+        ensure_static_field_declaring_class_initialized(ctx, class_id)?;
         ctx.get_static_field(class_id, slot)
     } else {
         let recv =
@@ -3983,6 +3997,7 @@ pub(crate) fn native_field_set(ctx: &mut dyn NativeContext, args: &[Value]) -> M
     // WP2.1-field вЂ” volatile-aware write fences (no-op for non-volatile).
     volatile_store_fence_pre(modifiers);
     if is_static {
+        ensure_static_field_declaring_class_initialized(ctx, class_id)?;
         ctx.set_static_field(class_id, slot, coerced);
     } else {
         let recv =
@@ -4073,6 +4088,7 @@ fn field_get_raw(
     volatile_load_fence(modifiers);
 
     if is_static {
+        ensure_static_field_declaring_class_initialized(ctx, class_id)?;
         Ok(ctx.get_static_field(class_id, slot))
     } else {
         let recv =
@@ -4282,6 +4298,7 @@ fn field_set_raw(
     // WP2.1-field вЂ” volatile-aware write fences (no-op for non-volatile).
     volatile_store_fence_pre(modifiers);
     if is_static {
+        ensure_static_field_declaring_class_initialized(ctx, class_id)?;
         ctx.set_static_field(class_id, slot, coerced);
     } else {
         let recv =

@@ -4693,6 +4693,13 @@ pub(crate) const MH_KIND_FOLD: i32 = 19;
 /// zero beans with no visible exception.
 pub(crate) const MH_KIND_INVOKER: i32 = 20;
 
+/// Exception-catching adapter produced by `MethodHandles.catchException`.
+/// `MH_BOUND` holds a 3-field wrapper: field 0 = target MH, field 1 = caught
+/// exception `Class`, field 2 = handler MH. On a matching Java exception from
+/// the target, dispatch invokes the handler with the thrown exception followed
+/// by the leading original arguments that fit the handler's type.
+pub(crate) const MH_KIND_CATCH: i32 = 21;
+
 // ---------------------------------------------------------------------------
 // Round-9 perf: LambdaMetafactory CallSite cache.
 // ---------------------------------------------------------------------------
@@ -5264,6 +5271,61 @@ fn mh_dispatch_fold(
     mh_dispatch(ctx, target, &full)
 }
 
+
+fn mh_exception_matches(
+    ctx: &dyn NativeContext,
+    thrown: cratonvm_types::ObjectRef,
+    catch_type: cratonvm_types::ObjectRef,
+) -> bool {
+    let catch_id = match mirror_class_id(ctx, catch_type) {
+        Some(id) => id,
+        None => return false,
+    };
+    let thrown_id = ctx.class_id_of_object(thrown);
+    thrown_id == catch_id || ctx.is_subclass(thrown_id, catch_id)
+}
+
+/// `MethodHandles.catchException` dispatch (`MH_KIND_CATCH`).
+fn mh_dispatch_catch(
+    ctx: &mut dyn NativeContext,
+    bound: Value,
+    extra_args: &[Value],
+) -> MethodCallResult {
+    let wrapper = match bound {
+        Value::Object(Some(w)) => w,
+        _ => return Ok(Some(Value::Object(None))),
+    };
+    let target = match ctx.get_field(wrapper, 0) {
+        Value::Object(Some(t)) => t,
+        _ => return Ok(Some(Value::Object(None))),
+    };
+    let catch_type = match ctx.get_field(wrapper, 1) {
+        Value::Object(Some(c)) => c,
+        _ => return mh_dispatch(ctx, target, extra_args),
+    };
+    let handler = match ctx.get_field(wrapper, 2) {
+        Value::Object(Some(h)) => h,
+        _ => return mh_dispatch(ctx, target, extra_args),
+    };
+
+    match mh_dispatch(ctx, target, extra_args) {
+        Err(MethodCallFailed::ExceptionThrown(thrown)) => {
+            if !mh_exception_matches(ctx, thrown, catch_type) {
+                return Err(MethodCallFailed::ExceptionThrown(thrown));
+            }
+            let hdesc = mh_type_descriptor(ctx, handler)
+                .or_else(|| mh_read_desc(ctx, handler))
+                .unwrap_or_default();
+            let hparams = count_descriptor_params(&hdesc);
+            let forward_n = hparams.saturating_sub(1).min(extra_args.len());
+            let mut hargs = Vec::with_capacity(1 + forward_n);
+            hargs.push(Value::Object(Some(thrown)));
+            hargs.extend_from_slice(&extra_args[..forward_n]);
+            mh_dispatch(ctx, handler, &hargs)
+        }
+        other => other,
+    }
+}
 pub(crate) fn mh_dispatch(
     ctx: &mut dyn NativeContext,
     mh: cratonvm_types::ObjectRef,
@@ -5749,6 +5811,7 @@ pub(crate) fn mh_dispatch(
         }
         MH_KIND_FILTER => mh_dispatch_filter(ctx, bound, extra_args),
         MH_KIND_FOLD => mh_dispatch_fold(ctx, bound, extra_args),
+        MH_KIND_CATCH => mh_dispatch_catch(ctx, bound, extra_args),
         MH_KIND_INVOKER => {
             // `MethodHandles.exactInvoker`/`invoker`/`spreadInvoker`: the
             // target handle is the FIRST incoming argument (not captured at
@@ -7203,9 +7266,26 @@ pub fn register_t28_method_handle_completeness(r: &mut NativeMethodRegistry) {
         mhs,
         "catchException",
         "(Ljava/lang/invoke/MethodHandle;Ljava/lang/Class;Ljava/lang/invoke/MethodHandle;)Ljava/lang/invoke/MethodHandle;",
-        |_ctx, args| {
-            // Return the target MH — exception handling delegated to the interpreter
-            Ok(Some(args.first().copied().unwrap_or(Value::Object(None))))
+        |ctx, args| {
+            let target = match args.first() {
+                Some(Value::Object(Some(t))) => *t,
+                _ => return Ok(Some(Value::Object(None))),
+            };
+            let catch_type = args.get(1).copied().unwrap_or(Value::Object(None));
+            let handler = args.get(2).copied().unwrap_or(Value::Object(None));
+            let wrapper = alloc_concurrent_synthetic(ctx, "__mh_catch_wrapper__", 3);
+            ctx.set_field(wrapper, 0, Value::Object(Some(target)));
+            ctx.set_field(wrapper, 1, catch_type);
+            ctx.set_field(wrapper, 2, handler);
+            let desc = mh_type_descriptor(ctx, target)
+                .or_else(|| mh_read_desc(ctx, target))
+                .unwrap_or_default();
+            let adapter = alloc_method_handle(ctx, "__adapter__", "catch", &desc, MH_KIND_CATCH);
+            ctx.set_field(adapter, MH_BOUND, Value::Object(Some(wrapper)));
+            if let Value::Object(Some(mt)) = ctx.get_field_by_name(target, "type") {
+                ctx.set_field_by_name(adapter, "type", Value::Object(Some(mt)));
+            }
+            Ok(Some(Value::Object(Some(adapter))))
         },
     );
     // `exactInvoker`/`invoker`/`spreadInvoker` all return a live

@@ -4239,6 +4239,91 @@ pub(crate) fn register_object_stream_class_for_phases_late(r: &mut NativeMethodR
 // module's aggregator), this one is also invoked cross-module from `lib.rs`
 // (the real-JCA ByteArrayOutputStream intrinsic wiring), so it must be visible
 // outside this module. Pre-existing `synthetic-jdk`-config build break (E0603).
+
+fn baos_buffer_bytes(ctx: &dyn NativeContext, this: ObjectRef) -> Vec<u8> {
+    let size = match ctx.get_field_by_name(this, "count") {
+        Value::Int(n) => n.max(0) as usize,
+        _ => ctx.get_field(this, 1).as_int().unwrap_or(0).max(0) as usize,
+    };
+    let arr = match ctx.get_field_by_name(this, "buf") {
+        Value::Object(Some(a)) => a,
+        _ => match ctx.get_field(this, 0) {
+            Value::Object(Some(a)) => a,
+            _ => return Vec::new(),
+        },
+    };
+    let len = size.min(ctx.array_length(arr));
+    let mut bytes = Vec::with_capacity(len);
+    for i in 0..len {
+        bytes.push(ctx.get_array_element(arr, i).as_int().unwrap_or(0) as u8);
+    }
+    bytes
+}
+
+fn baos_charset_key(charset: &str) -> String {
+    charset
+        .chars()
+        .filter(|c| *c != '-' && *c != '_' && !c.is_whitespace())
+        .flat_map(|c| c.to_lowercase())
+        .collect()
+}
+
+fn decode_utf16_bytes(bytes: &[u8], little_endian: bool) -> String {
+    let mut units = Vec::with_capacity(bytes.len() / 2);
+    let mut i = 0;
+    while i + 1 < bytes.len() {
+        let pair = [bytes[i], bytes[i + 1]];
+        let unit = if little_endian {
+            u16::from_le_bytes(pair)
+        } else {
+            u16::from_be_bytes(pair)
+        };
+        units.push(unit);
+        i += 2;
+    }
+    let mut out: String = std::char::decode_utf16(units)
+        .map(|r| r.unwrap_or('\u{FFFD}'))
+        .collect();
+    if i < bytes.len() {
+        out.push('\u{FFFD}');
+    }
+    out
+}
+
+fn decode_baos_bytes(bytes: &[u8], charset: &str) -> String {
+    match baos_charset_key(charset).as_str() {
+        "iso88591" | "latin1" | "latin" | "csisolatin1" => {
+            bytes.iter().map(|&b| char::from(b)).collect()
+        }
+        "usascii" | "ascii" => bytes
+            .iter()
+            .map(|&b| if b < 0x80 { char::from(b) } else { '\u{FFFD}' })
+            .collect(),
+        "utf16" | "unicode" => {
+            if bytes.starts_with(&[0xFE, 0xFF]) {
+                decode_utf16_bytes(&bytes[2..], false)
+            } else if bytes.starts_with(&[0xFF, 0xFE]) {
+                decode_utf16_bytes(&bytes[2..], true)
+            } else {
+                decode_utf16_bytes(bytes, false)
+            }
+        }
+        "utf16be" | "unicodebigunmarked" => decode_utf16_bytes(bytes, false),
+        "utf16le" | "unicodelittleunmarked" => decode_utf16_bytes(bytes, true),
+        _ => String::from_utf8_lossy(bytes).into_owned(),
+    }
+}
+
+fn charset_object_name(ctx: &mut dyn NativeContext, charset: ObjectRef) -> Option<String> {
+    match ctx.invoke_virtual(charset, "name", "()Ljava/lang/String;", &[]) {
+        Ok(Some(Value::Object(Some(s)))) => ctx.read_string(s),
+        _ => match ctx.get_field(charset, 0) {
+            Value::Object(Some(s)) => ctx.read_string(s),
+            _ => None,
+        },
+    }
+}
+
 pub(crate) fn register_byte_array_output_stream(r: &mut NativeMethodRegistry) {
     let cls = "java/io/ByteArrayOutputStream";
 
@@ -4340,17 +4425,28 @@ pub(crate) fn register_byte_array_output_stream(r: &mut NativeMethodRegistry) {
     });
     r.register(cls, "toString", "()Ljava/lang/String;", |ctx, args| {
         let this = obj_arg(args, 0)?;
-        let size = ctx.get_field(this, 1).as_int().unwrap_or(0) as usize;
-        let arr = match ctx.get_field(this, 0) {
-            Value::Object(Some(a)) => a,
-            _ => return Ok(Some(Value::Object(Some(ctx.create_string(""))))),
+        let bytes = baos_buffer_bytes(ctx, this);
+        let s = decode_baos_bytes(&bytes, "UTF-8");
+        Ok(Some(Value::Object(Some(ctx.create_string(&s)))))
+    });
+    r.register(cls, "toString", "(Ljava/lang/String;)Ljava/lang/String;", |ctx, args| {
+        let this = obj_arg(args, 0)?;
+        let charset = match args.get(1) {
+            Some(Value::Object(Some(s))) => ctx.read_string(*s).unwrap_or_else(|| "UTF-8".to_string()),
+            _ => "UTF-8".to_string(),
         };
-        let mut bytes = Vec::with_capacity(size);
-        for i in 0..size {
-            let b = ctx.get_array_element(arr, i).as_int().unwrap_or(0);
-            bytes.push(b as u8);
-        }
-        let s = String::from_utf8_lossy(&bytes).to_string();
+        let bytes = baos_buffer_bytes(ctx, this);
+        let s = decode_baos_bytes(&bytes, &charset);
+        Ok(Some(Value::Object(Some(ctx.create_string(&s)))))
+    });
+    r.register(cls, "toString", "(Ljava/nio/charset/Charset;)Ljava/lang/String;", |ctx, args| {
+        let this = obj_arg(args, 0)?;
+        let charset = match args.get(1) {
+            Some(Value::Object(Some(c))) => charset_object_name(ctx, *c).unwrap_or_else(|| "UTF-8".to_string()),
+            _ => "UTF-8".to_string(),
+        };
+        let bytes = baos_buffer_bytes(ctx, this);
+        let s = decode_baos_bytes(&bytes, &charset);
         Ok(Some(Value::Object(Some(ctx.create_string(&s)))))
     });
     r.register(cls, "flush", "()V", |_ctx, _args| Ok(None));

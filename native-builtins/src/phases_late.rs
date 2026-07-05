@@ -15414,7 +15414,94 @@ fn zo_write_zip(ctx: &mut dyn NativeContext, this: ObjectRef) -> Result<(), Meth
     Ok(())
 }
 
-/// Finish GZIP compression: read accumulated data, compress with flate2, write to underlying stream.
+fn p58_crc32(data: &[u8]) -> u32 {
+    let mut c = !0u32;
+    for &b in data {
+        c ^= b as u32;
+        for _ in 0..8 {
+            c = if c & 1 != 0 {
+                (c >> 1) ^ 0xEDB8_8320
+            } else {
+                c >> 1
+            };
+        }
+    }
+    !c
+}
+
+#[cfg(unix)]
+fn p58_zlib_deflate(data: &[u8]) -> Option<Vec<u8>> {
+    use std::ffi::c_void;
+    use std::os::raw::{c_char, c_int, c_ulong};
+
+    type CompressBound = unsafe extern "C" fn(c_ulong) -> c_ulong;
+    type Compress2 = unsafe extern "C" fn(*mut u8, *mut c_ulong, *const u8, c_ulong, c_int) -> c_int;
+
+    unsafe fn sym<T>(handle: *mut c_void, name: &'static [u8]) -> Option<T> {
+        let ptr = libc::dlsym(handle, name.as_ptr() as *const c_char);
+        if ptr.is_null() {
+            None
+        } else {
+            Some(std::mem::transmute_copy(&ptr))
+        }
+    }
+
+    let mut handle = std::ptr::null_mut();
+    for name in [b"libz.so.1\0".as_slice(), b"libz.so\0".as_slice()] {
+        handle = unsafe { libc::dlopen(name.as_ptr() as *const c_char, libc::RTLD_LAZY) };
+        if !handle.is_null() {
+            break;
+        }
+    }
+    if handle.is_null() {
+        return None;
+    }
+
+    let compress_bound: CompressBound = unsafe { sym(handle, b"compressBound\0")? };
+    let compress2: Compress2 = unsafe { sym(handle, b"compress2\0")? };
+
+    let source_len = data.len() as c_ulong;
+    let mut bound = unsafe { compress_bound(source_len) } as usize;
+    if bound == 0 {
+        bound = data.len().saturating_add(64);
+    }
+    let mut z = vec![0u8; bound];
+    let mut z_len = bound as c_ulong;
+    let rc = unsafe { compress2(z.as_mut_ptr(), &mut z_len, data.as_ptr(), source_len, 6) };
+    if rc != 0 || z_len < 6 {
+        return None;
+    }
+    z.truncate(z_len as usize);
+    // zlib wrapper = 2-byte header + raw deflate + 4-byte Adler-32 trailer.
+    Some(z[2..z.len() - 4].to_vec())
+}
+
+#[cfg(not(unix))]
+fn p58_zlib_deflate(_data: &[u8]) -> Option<Vec<u8>> {
+    None
+}
+
+fn p58_gzip_compress(data: &[u8]) -> std::io::Result<Vec<u8>> {
+    let deflated = if let Some(raw) = p58_zlib_deflate(data) {
+        raw
+    } else {
+        use flate2::write::GzEncoder;
+        use flate2::Compression;
+        use std::io::Write;
+        let mut encoder = GzEncoder::new(Vec::new(), Compression::new(6));
+        encoder.write_all(data)?;
+        return encoder.finish();
+    };
+
+    let mut out = Vec::with_capacity(10 + deflated.len() + 8);
+    out.extend_from_slice(&[0x1f, 0x8b, 0x08, 0, 0, 0, 0, 0, 0, 0xff]);
+    out.extend_from_slice(&deflated);
+    out.extend_from_slice(&p58_crc32(data).to_le_bytes());
+    out.extend_from_slice(&(data.len() as u32).to_le_bytes());
+    Ok(out)
+}
+
+/// Finish GZIP compression: read accumulated data, compress, write to underlying stream.
 fn p58_gzip_out_finish(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = obj_arg(args, 0)?;
     let count = ctx.get_field(this, 1).as_int().unwrap_or(0) as usize;
@@ -15429,18 +15516,8 @@ fn p58_gzip_out_finish(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCal
         }
     }
 
-    // Compress with flate2
-    use flate2::write::GzEncoder;
-    use flate2::Compression;
-    use std::io::Write;
-    let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
-    encoder
-        .write_all(&data)
-        .map_err(|e| RuntimeError::IOException {
-            message: format!("GZIP compression failed: {}", e),
-        })?;
-    let compressed = encoder.finish().map_err(|e| RuntimeError::IOException {
-        message: format!("GZIP finish failed: {}", e),
+    let compressed = p58_gzip_compress(&data).map_err(|e| RuntimeError::IOException {
+        message: format!("GZIP compression failed: {}", e),
     })?;
 
     // Write compressed bytes to underlying OutputStream

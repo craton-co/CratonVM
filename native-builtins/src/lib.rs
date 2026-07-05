@@ -1840,10 +1840,14 @@ const GROOVY_ANTLR_PREDICTION_MODE: &str = "groovyjarjarantlr4/v4/runtime/atn/Pr
 const GROOVY_ANTLR_SEMANTIC_CONTEXT: &str = "groovyjarjarantlr4/v4/runtime/atn/SemanticContext";
 const GROOVY_ANTLR_SEMANTIC_AND: &str = "groovyjarjarantlr4/v4/runtime/atn/SemanticContext$AND";
 const GROOVY_ANTLR_SEMANTIC_OR: &str = "groovyjarjarantlr4/v4/runtime/atn/SemanticContext$OR";
-const GROOVY_ANTLR_SEMANTIC_EMPTY: &str = "groovyjarjarantlr4/v4/runtime/atn/SemanticContext$Empty";
+const GROOVY_ANTLR_SEMANTIC_EMPTY: &str = GROOVY_ANTLR_SEMANTIC_CONTEXT;
 const GROOVY_ANTLR_DOUBLE_KEY_MAP: &str = "groovyjarjarantlr4/v4/runtime/misc/DoubleKeyMap";
 const ANTLR_EMPTY_RETURN_STATE: i32 = i32::MAX;
 const ANTLR_SUPPRESS_PRECEDENCE_FILTER: i32 = 0x4000_0000;
+const GROOVY_ATN_ALT_MASK: i32 = 0x00ff_ffff;
+const GROOVY_ATN_DEPTH_MASK: i32 = 0x7f00_0000;
+const GROOVY_ATN_DEPTH_SHIFT: u32 = 24;
+const GROOVY_ATN_SUPPRESS_PRECEDENCE_FILTER: i32 = i32::MIN;
 static ANTLR_NATIVE_NODE_COUNT: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(0);
 
 const BYTEBUDDY_METHOD_TYPE_TOKEN: &str =
@@ -1961,6 +1965,106 @@ fn antlr_is_runtime_class_name(name: &str) -> bool {
 }
 
 #[inline]
+fn antlr_is_groovy_runtime_class_name(name: &str) -> bool {
+    name.starts_with("groovyjarjarantlr4/v4/runtime/")
+}
+
+#[inline]
+fn antlr_is_groovy_atn_config_name(name: &str) -> bool {
+    antlr_is_groovy_runtime_class_name(name) && name.contains("/atn/ATNConfig")
+}
+
+fn antlr_fallback_field_value(ctx: &mut dyn NativeContext, obj: ObjectRef, slot: usize) -> Value {
+    if slot < ctx.object_num_fields(obj) {
+        ctx.get_field(obj, slot)
+    } else {
+        Value::Object(None)
+    }
+}
+
+fn antlr_groovy_packed_atn_value(ctx: &mut dyn NativeContext, obj: ObjectRef) -> i32 {
+    match antlr_fallback_field_value(ctx, obj, 1) {
+        Value::Int(v) => v,
+        _ => 0,
+    }
+}
+
+fn antlr_groovy_atn_alt(ctx: &mut dyn NativeContext, obj: ObjectRef) -> i32 {
+    antlr_groovy_packed_atn_value(ctx, obj) & GROOVY_ATN_ALT_MASK
+}
+
+fn antlr_groovy_atn_reaches(ctx: &mut dyn NativeContext, obj: ObjectRef) -> i32 {
+    let packed = antlr_groovy_packed_atn_value(ctx, obj);
+    let depth = (packed & GROOVY_ATN_DEPTH_MASK) >> GROOVY_ATN_DEPTH_SHIFT;
+    let suppressed = if (packed & GROOVY_ATN_SUPPRESS_PRECEDENCE_FILTER) != 0 {
+        ANTLR_SUPPRESS_PRECEDENCE_FILTER
+    } else {
+        0
+    };
+    depth | suppressed
+}
+
+fn antlr_set_groovy_packed_atn_alt(ctx: &mut dyn NativeContext, obj: ObjectRef, alt: i32) {
+    if ctx.object_num_fields(obj) <= 1 {
+        return;
+    }
+    let packed = antlr_groovy_packed_atn_value(ctx, obj);
+    ctx.set_field(
+        obj,
+        1,
+        Value::Int((packed & !GROOVY_ATN_ALT_MASK) | (alt & GROOVY_ATN_ALT_MASK)),
+    );
+}
+
+fn antlr_set_groovy_packed_atn_reaches(ctx: &mut dyn NativeContext, obj: ObjectRef, reaches: i32) {
+    if ctx.object_num_fields(obj) <= 1 {
+        return;
+    }
+    let packed = antlr_groovy_packed_atn_value(ctx, obj);
+    let depth = (reaches & !ANTLR_SUPPRESS_PRECEDENCE_FILTER).clamp(0, 127);
+    let suppressed = if (reaches & ANTLR_SUPPRESS_PRECEDENCE_FILTER) != 0 {
+        GROOVY_ATN_SUPPRESS_PRECEDENCE_FILTER
+    } else {
+        0
+    };
+    let next = (packed & GROOVY_ATN_ALT_MASK) | (depth << GROOVY_ATN_DEPTH_SHIFT) | suppressed;
+    ctx.set_field(obj, 1, Value::Int(next));
+}
+
+fn antlr_groovy_atn_special_slot(class_name: &str, name: &str) -> Option<usize> {
+    match name {
+        "semanticContext"
+            if class_name.ends_with("ATNConfig$SemanticContextATNConfig")
+                || class_name.ends_with("ATNConfig$ActionSemanticContextATNConfig") =>
+        {
+            Some(3)
+        }
+        "lexerActionExecutor" if class_name.ends_with("ATNConfig$ActionATNConfig") => Some(3),
+        "lexerActionExecutor" if class_name.ends_with("ATNConfig$ActionSemanticContextATNConfig") => {
+            Some(4)
+        }
+        "passedThroughNonGreedyDecision" if class_name.ends_with("ATNConfig$ActionATNConfig") => {
+            Some(4)
+        }
+        "passedThroughNonGreedyDecision"
+            if class_name.ends_with("ATNConfig$ActionSemanticContextATNConfig") =>
+        {
+            Some(5)
+        }
+        _ => None,
+    }
+}
+
+fn antlr_groovy_semantic_none(ctx: &mut dyn NativeContext) -> Option<ObjectRef> {
+    let class_id = ctx.class_id_by_name(GROOVY_ANTLR_SEMANTIC_CONTEXT)?;
+    let field_idx = ctx.static_field_index_by_name(class_id, "NONE")?;
+    match ctx.get_static_field(class_id, field_idx) {
+        Value::Object(obj) => obj,
+        _ => None,
+    }
+}
+
+#[inline]
 fn antlr_class_name_matches(name: &str, simple_suffix: &str) -> bool {
     antlr_is_runtime_class_name(name) && name.ends_with(simple_suffix)
 }
@@ -2056,12 +2160,39 @@ fn antlr_field_value(
         if let Some(slot) = ctx.resolve_field_index(&class_name, name) {
             return ctx.get_field(obj, slot);
         }
+        if antlr_is_groovy_atn_config_name(&class_name) {
+            match name {
+                "alt" => return Value::Int(antlr_groovy_atn_alt(ctx, obj)),
+                "reachesIntoOuterContext" => {
+                    return Value::Int(antlr_groovy_atn_reaches(ctx, obj));
+                }
+                "semanticContext" => {
+                    if let Some(slot) = antlr_groovy_atn_special_slot(&class_name, name) {
+                        return antlr_fallback_field_value(ctx, obj, slot);
+                    }
+                    return Value::Object(antlr_groovy_semantic_none(ctx));
+                }
+                "lexerActionExecutor" => {
+                    if let Some(slot) = antlr_groovy_atn_special_slot(&class_name, name) {
+                        return antlr_fallback_field_value(ctx, obj, slot);
+                    }
+                    return Value::Object(None);
+                }
+                "passedThroughNonGreedyDecision" => {
+                    if let Some(slot) = antlr_groovy_atn_special_slot(&class_name, name) {
+                        return antlr_fallback_field_value(ctx, obj, slot);
+                    }
+                    return Value::Int(0);
+                }
+                _ => {}
+            }
+        }
         if antlr_is_runtime_class_name(&class_name) {
-            return ctx.get_field(obj, fallback_slot);
+            return antlr_fallback_field_value(ctx, obj, fallback_slot);
         }
     }
     match ctx.get_field_by_name(obj, name) {
-        Value::Object(None) => ctx.get_field(obj, fallback_slot),
+        Value::Object(None) => antlr_fallback_field_value(ctx, obj, fallback_slot),
         v => v,
     }
 }
@@ -2078,8 +2209,39 @@ fn antlr_set_field_value(
             ctx.set_field(obj, slot, value);
             return;
         }
+        if antlr_is_groovy_atn_config_name(&class_name) {
+            match (name, value) {
+                ("alt", Value::Int(alt)) => {
+                    antlr_set_groovy_packed_atn_alt(ctx, obj, alt);
+                    return;
+                }
+                ("reachesIntoOuterContext", Value::Int(reaches)) => {
+                    antlr_set_groovy_packed_atn_reaches(ctx, obj, reaches);
+                    return;
+                }
+                ("semanticContext", value) => {
+                    if let Some(slot) = antlr_groovy_atn_special_slot(&class_name, name) {
+                        if slot < ctx.object_num_fields(obj) {
+                            ctx.set_field(obj, slot, value);
+                        }
+                    }
+                    return;
+                }
+                ("lexerActionExecutor", value) | ("passedThroughNonGreedyDecision", value) => {
+                    if let Some(slot) = antlr_groovy_atn_special_slot(&class_name, name) {
+                        if slot < ctx.object_num_fields(obj) {
+                            ctx.set_field(obj, slot, value);
+                        }
+                    }
+                    return;
+                }
+                _ => {}
+            }
+        }
     }
-    ctx.set_field(obj, fallback_slot, value);
+    if fallback_slot < ctx.object_num_fields(obj) {
+        ctx.set_field(obj, fallback_slot, value);
+    }
 }
 
 #[inline]
@@ -3652,10 +3814,16 @@ fn antlr_semantic_context_is_empty(ctx: &mut dyn NativeContext, sem: Option<Obje
     let Some(sem) = sem else {
         return false;
     };
-    ctx.class_name_of_id(ctx.class_id_of_object(sem))
-        .as_deref()
-        .map(|name| antlr_class_name_matches(name, "/atn/SemanticContext$Empty"))
-        .unwrap_or(false)
+    let Some(class_name) = ctx.class_name_of_id(ctx.class_id_of_object(sem)) else {
+        return false;
+    };
+    if antlr_class_name_matches(&class_name, "/atn/SemanticContext$Empty") {
+        return true;
+    }
+    antlr_is_groovy_runtime_class_name(&class_name)
+        && antlr_class_name_matches(&class_name, "/atn/SemanticContext$Predicate")
+        && antlr_int_field(ctx, sem, "ruleIndex", 0) == -1
+        && antlr_int_field(ctx, sem, "predIndex", 1) == -1
 }
 
 fn antlr_semantic_context_is_precedence_predicate(
@@ -5267,6 +5435,15 @@ fn antlr_semantic_empty_instance(
     ctx: &mut dyn NativeContext,
     names: AntlrClassNames,
 ) -> Result<Option<ObjectRef>, MethodCallFailed> {
+    if names.pc == GROOVY_ANTLR_PC {
+        let class_id = ctx.ensure_class_initialized(GROOVY_ANTLR_SEMANTIC_CONTEXT)?;
+        return Ok(ctx
+            .static_field_index_by_name(class_id, "NONE")
+            .and_then(|field_idx| match ctx.get_static_field(class_id, field_idx) {
+                Value::Object(instance) => instance,
+                _ => None,
+            }));
+    }
     let class_id = ctx.ensure_class_initialized(names.semantic_empty)?;
     Ok(ctx
         .static_field_index_by_name(class_id, "Instance")
@@ -11676,6 +11853,11 @@ pub fn register_essential_natives(registry: &mut NativeMethodRegistry) {
       // Also wire the full R3 bundle in essential mode so readLine/lines/close
       // are available during early Maven/Surefire bootstrap.
     register_r3_resource_loading(registry);
+    servlet::register_spring_mock_response_natives(registry);
+    servlet::register_script_engine_manager_natives(registry);
+    servlet::register_jython_thread_state_natives(registry);
+    servlet::register_jython_pyobject_natives(registry);
+    servlet::register_jython_imp_natives(registry);
 
     // S109 Wave3 — `java/lang/Module.canUse(Class)`. The real bytecode reads
     // `this.descriptor` (a real-Module field that does not exist on our
@@ -23411,6 +23593,11 @@ pub fn register_synthetic_overrides(registry: &mut NativeMethodRegistry) {
 
     // --- R3: Resource Loading — Class.getResourceAsStream, InputStreamReader, BufferedReader ---
     register_r3_resource_loading(registry);
+    servlet::register_spring_mock_response_natives(registry);
+    servlet::register_script_engine_manager_natives(registry);
+    servlet::register_jython_thread_state_natives(registry);
+    servlet::register_jython_pyobject_natives(registry);
+    servlet::register_jython_imp_natives(registry);
 
     // --- S1: URLClassLoader + ServiceLoader (real META-INF/services discovery) ---
     register_s1_classloading(registry);
@@ -24856,7 +25043,13 @@ enum GetClassDisplay {
     /// family (with a `RandomAccess` check for lists).
     CollList,
     CollSet,
+    /// `cratonvm/internal/UnmodifiableSortedSet` ? backs
+    /// `Collections.unmodifiableSortedSet` (distinct from `CollSet`, which
+    /// backs plain `unmodifiableSet` and does NOT implement SortedSet).
     CollSortedSet,
+    /// `cratonvm/internal/UnmodifiableNavigableSet` ? backs
+    /// `Collections.unmodifiableNavigableSet` and keeps NavigableSet casts
+    /// separate from plain unmodifiable set wrappers.
     CollNavigableSet,
     CollMap,
     /// `cratonvm/internal/UnmodifiableCollection` — only ever produced by
@@ -24942,6 +25135,23 @@ fn getclass_backing_is_random_access(ctx: &mut dyn NativeContext, this: ObjectRe
     };
     let backing_cid = ctx.class_id_of_object(backing);
     ctx.is_subclass(backing_cid, ra)
+}
+
+/// Whether the backing set of an unmodifiable-sorted-set wrapper (slot 0,
+/// `UNMOD_FIELD_BACKING`) implements `java.util.NavigableSet` — used to pick
+/// between `Collections$UnmodifiableSortedSet` and the NavigableSet subclass
+/// `Collections$UnmodifiableNavigableSet` for `getClass()` display.
+fn getclass_backing_is_navigable_set(ctx: &mut dyn NativeContext, this: ObjectRef) -> bool {
+    let backing = match ctx.get_field(this, 0) {
+        Value::Object(Some(b)) => b,
+        _ => return false,
+    };
+    let ns = match getclass_resolve_name(ctx, "java/util/NavigableSet") {
+        Some(cid) => cid,
+        None => return false,
+    };
+    let backing_cid = ctx.class_id_of_object(backing);
+    ctx.is_subclass(backing_cid, ns)
 }
 
 /// Resolve the concrete display `ClassId` for an object stamped with `class_id`,
@@ -44972,7 +45182,11 @@ fn async_submit_handoff_grace() -> std::time::Duration {
 }
 
 pub(crate) fn async_handoff_sleep_millis(requested: i64) -> i64 {
-    const DEFAULT_ASYNC_HANDOFF_SLEEP_FLOOR_MS: i64 = 100;
+    // Default to preserving the requested delay. Coroutine event loops use
+    // one-millisecond sleeps for progress; stretching those to 100 ms can keep
+    // StepVerifier-style tests from observing scheduled resumes. Suites that
+    // need extra async handoff pacing can still opt in with the env var below.
+    const DEFAULT_ASYNC_HANDOFF_SLEEP_FLOOR_MS: i64 = 1;
     const DEFAULT_ASYNC_WORKER_SHORT_SLEEP_FLOOR_MS: i64 = 3_000;
     const HANDOFF_WINDOW_MS: u64 = 1_000;
 

@@ -1477,7 +1477,14 @@ pub fn verify_class_structure(class: &Class, store: &ClassStore) -> Result<(), L
     // class-hierarchy walk, and other corner cases that our walk misses.
     // Re-enable once the walk matches JVMS §5.4.3.3 method resolution.
     let _ = verify_abstract_method_implementation;
-    verify_inherited_abstract_methods_implemented(class, store)?;
+    // HotSpot does not reject every concrete class that leaves an inherited
+    // abstract superclass method unimplemented; linkage may still proceed and
+    // an AbstractMethodError is raised only if that method is actually invoked.
+    // JAXB's concrete `JAXBContextImpl` is a real-world example: it inherits
+    // the deprecated abstract `JAXBContext.createValidator()` and has no
+    // override, but the class is valid on HotSpot. Keep this checker compiled
+    // for focused tests, but do not enforce it during ordinary class loading.
+    let _ = verify_inherited_abstract_methods_implemented;
     verify_code_attribute_presence(class)?;
     Ok(())
 }

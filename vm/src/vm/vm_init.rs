@@ -1098,7 +1098,9 @@ impl SharedVm {
             // Sorted/navigable unmodifiable-set APIs use separate internal
             // stamps from plain `unmodifiableSet`, so a normal set wrapper
             // does not accidentally satisfy `SortedSet` and invite callers to
-            // invoke `comparator()` on a LinkedHashSet backing.
+            // invoke `comparator()` on a LinkedHashSet backing. The sorted and
+            // navigable stamps both declare the relevant interfaces so caller
+            // checkcasts still match the real JDK wrapper surfaces.
             let sorted_set_id = class_manager
                 .load_class("java/util/SortedSet")
                 .expect("java/util/SortedSet must be loadable");

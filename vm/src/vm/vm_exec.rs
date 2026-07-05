@@ -10221,6 +10221,23 @@ fn invoke_on_class_shared_inner(
     args: &[Value],
     no_retarget: bool,
 ) -> MethodCallResult {
+    if method_name != "<init>" && method_name != "<clinit>" {
+        if let Some(Value::Object(Some(recv))) = args.first().copied() {
+            let recv_cid = shared.heap.class_id_of(recv);
+            if shared.lambda_proxies.read().contains_key(&recv_cid) {
+                if let Some(result) = crate::runtime::interpreter::try_lambda_dispatch(
+                    shared,
+                    thread,
+                    recv,
+                    recv_cid,
+                    method_name,
+                    &args[1..],
+                )? {
+                    return Ok(result);
+                }
+            }
+        }
+    }
     // C25: Virtual dispatch on an interface (or abstract class) вЂ” if the
     // passed class_id names an interface/abstract class and the first arg is
     // a concrete object, re-target dispatch onto the receiver's actual class.
@@ -12172,6 +12189,41 @@ fn invoke_on_class_shared_inner(
                             method_name,
                             descriptor,
                         )
+                        || crate::runtime::interpreter::is_jdk_string_charset_name_constructor_override(
+                            class_name,
+                            method_name,
+                            descriptor,
+                        )
+                        || crate::runtime::interpreter::is_spring_mock_response_native_override(
+                            class_name,
+                            method_name,
+                            descriptor,
+                        )
+                        || crate::runtime::interpreter::is_script_engine_manager_native_override(
+                            class_name,
+                            method_name,
+                            descriptor,
+                        )
+                        || crate::runtime::interpreter::is_jython_thread_state_native_override(
+                            class_name,
+                            method_name,
+                            descriptor,
+                        )
+                        || crate::runtime::interpreter::is_jython_pyobject_native_override(
+                            class_name,
+                            method_name,
+                            descriptor,
+                        )
+                        || crate::runtime::interpreter::is_jython_imp_native_override(
+                            class_name,
+                            method_name,
+                            descriptor,
+                        )
+                        || crate::runtime::interpreter::is_jython_pymodule_native_override(
+                            class_name,
+                            method_name,
+                            descriptor,
+                        )
                         || crate::runtime::interpreter::is_time_native_override(
                             class_name,
                             method_name,
@@ -12206,6 +12258,64 @@ fn invoke_on_class_shared_inner(
                         {
                             native = true;
                             declaring_id_out = class_id;
+                        }
+                    }
+                    if !native
+                        && class_name == "org/python/core/PyObject"
+                        && method_name == "__getattr__"
+                        && descriptor == "(Ljava/lang/String;)Lorg/python/core/PyObject;"
+                    {
+                        if let Some(Value::Object(Some(recv))) = args.first().copied() {
+                            let recv_cid = shared.heap.class_id_of(recv);
+                            let recv_name = store.get(recv_cid).map(|c| &*c.name).unwrap_or("");
+                            if matches!(recv_name, "org/python/core/PyNullImporter" | "org/python/modules/zipimport/zipimporter")
+                                && shared
+                                    .native_methods
+                                    .find(recv_name, method_name, descriptor)
+                                    .is_some()
+                            {
+                                native = true;
+                                declaring_id_out = recv_cid;
+                            }
+                        }
+                    }
+                    if !native
+                        && class_name == "org/python/core/PyObject"
+                        && method_name == "__findattr__"
+                        && descriptor == "(Ljava/lang/String;)Lorg/python/core/PyObject;"
+                    {
+                        if let Some(Value::Object(Some(recv))) = args.first().copied() {
+                            let recv_cid = shared.heap.class_id_of(recv);
+                            let recv_name = store.get(recv_cid).map(|c| &*c.name).unwrap_or("");
+                            if recv_name == "org/python/core/PyModule"
+                                && shared
+                                    .native_methods
+                                    .find(recv_name, method_name, descriptor)
+                                    .is_some()
+                            {
+                                native = true;
+                                declaring_id_out = recv_cid;
+                            }
+                        }
+                    }
+                    if !native
+                        && !no_retarget
+                        && class_name == "org/python/core/PyType"
+                        && method_name == "__findattr_ex__"
+                        && descriptor == "(Ljava/lang/String;)Lorg/python/core/PyObject;"
+                    {
+                        if let Some(Value::Object(Some(recv))) = args.first().copied() {
+                            let recv_cid = shared.heap.class_id_of(recv);
+                            let recv_name = store.get(recv_cid).map(|c| &*c.name).unwrap_or("");
+                            if recv_name == "org/python/core/PyJavaType"
+                                && shared
+                                    .native_methods
+                                    .find(recv_name, method_name, descriptor)
+                                    .is_some()
+                            {
+                                native = true;
+                                declaring_id_out = recv_cid;
+                            }
                         }
                     }
                 }

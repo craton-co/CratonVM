@@ -14032,6 +14032,135 @@ fn int_stream_elements(ctx: &mut dyn NativeContext, stream: ObjectRef) -> Vec<Va
     stream_elements(ctx, stream).unwrap_or_default()
 }
 
+const PRIMITIVE_ITERATOR_FIELD_ELEMENTS: usize = 0;
+const PRIMITIVE_ITERATOR_FIELD_CURSOR: usize = 1;
+
+fn make_primitive_iterator(
+    ctx: &mut dyn NativeContext,
+    iterator_class: &str,
+    elements: &[Value],
+) -> MethodCallResult {
+    let arr = alloc_ref_array(ctx, elements.len());
+    for (i, val) in elements.iter().enumerate() {
+        ctx.set_array_element(arr, i, *val);
+    }
+    let itr = alloc_synthetic(ctx, iterator_class, 2);
+    ctx.set_field(
+        itr,
+        PRIMITIVE_ITERATOR_FIELD_ELEMENTS,
+        Value::Object(Some(arr)),
+    );
+    ctx.set_field(itr, PRIMITIVE_ITERATOR_FIELD_CURSOR, Value::Int(0));
+    Ok(Some(Value::Object(Some(itr))))
+}
+
+fn primitive_iterator_next_value(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> Result<Value, cratonvm_types::error::MethodCallFailed> {
+    let this = match args.first() {
+        Some(Value::Object(Some(obj))) => *obj,
+        _ => {
+            return Err(cratonvm_types::error::RuntimeError::NullPointerException {
+                message: Some("PrimitiveIterator: null receiver".to_string()),
+            }
+            .into())
+        }
+    };
+    let cursor = match ctx.get_field(this, PRIMITIVE_ITERATOR_FIELD_CURSOR) {
+        Value::Int(c) => c.max(0) as usize,
+        _ => 0,
+    };
+    let arr = match ctx.get_field(this, PRIMITIVE_ITERATOR_FIELD_ELEMENTS) {
+        Value::Object(Some(arr)) => arr,
+        _ => {
+            return Err(cratonvm_types::error::RuntimeError::NoSuchElementException {
+                message: "no more elements".to_string(),
+            }
+            .into())
+        }
+    };
+    if cursor >= ctx.array_length(arr) {
+        return Err(cratonvm_types::error::RuntimeError::NoSuchElementException {
+            message: "no more elements".to_string(),
+        }
+        .into());
+    }
+    let val = ctx.get_array_element(arr, cursor);
+    ctx.set_field(
+        this,
+        PRIMITIVE_ITERATOR_FIELD_CURSOR,
+        Value::Int((cursor + 1) as i32),
+    );
+    Ok(val)
+}
+
+fn native_primitive_iterator_has_next(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(obj))) => *obj,
+        _ => return Ok(Some(Value::Int(0))),
+    };
+    let cursor = match ctx.get_field(this, PRIMITIVE_ITERATOR_FIELD_CURSOR) {
+        Value::Int(c) => c.max(0) as usize,
+        _ => 0,
+    };
+    let len = match ctx.get_field(this, PRIMITIVE_ITERATOR_FIELD_ELEMENTS) {
+        Value::Object(Some(arr)) => ctx.array_length(arr),
+        _ => 0,
+    };
+    Ok(Some(Value::Int(if cursor < len { 1 } else { 0 })))
+}
+
+fn native_primitive_iterator_next_int(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    match primitive_iterator_next_value(ctx, args)? {
+        Value::Int(v) => Ok(Some(Value::Int(v))),
+        _ => Ok(Some(Value::Int(0))),
+    }
+}
+
+fn native_primitive_iterator_next_long(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    match primitive_iterator_next_value(ctx, args)? {
+        Value::Long(v) => Ok(Some(Value::Long(v))),
+        Value::Int(v) => Ok(Some(Value::Long(v as i64))),
+        _ => Ok(Some(Value::Long(0))),
+    }
+}
+
+fn native_primitive_iterator_next_double(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    match primitive_iterator_next_value(ctx, args)? {
+        Value::Double(v) => Ok(Some(Value::Double(v))),
+        Value::Float(v) => Ok(Some(Value::Double(v as f64))),
+        Value::Int(v) => Ok(Some(Value::Double(v as f64))),
+        Value::Long(v) => Ok(Some(Value::Double(v as f64))),
+        _ => Ok(Some(Value::Double(0.0))),
+    }
+}
+
+fn native_primitive_iterator_next_boxed(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    let val = primitive_iterator_next_value(ctx, args)?;
+    Ok(Some(
+        box_primitive_stream_elements(ctx, &[val])
+            .into_iter()
+            .next()
+            .unwrap_or(Value::Object(None)),
+    ))
+}
+
 // =============================================================================
 // IntStream — additional intermediate/terminal ops missing from the synthetic
 // surface. The synthetic IntStream is an object stamped with the *interface*
@@ -14269,6 +14398,12 @@ fn register_int_stream_natives(r: &mut NativeMethodRegistry) {
     r.register(c, "sum", "()I", native_int_stream_sum);
     r.register(
         c,
+        "iterator",
+        "()Ljava/util/PrimitiveIterator$OfInt;",
+        native_int_stream_iterator,
+    );
+    r.register(
+        c,
         "reduce",
         "(ILjava/util/function/IntBinaryOperator;)I",
         native_int_stream_reduce_seeded,
@@ -14491,6 +14626,52 @@ fn native_int_stream_range_closed(ctx: &mut dyn NativeContext, args: &[Value]) -
     let count = (end as i64 - start as i64 + 1).max(0);
     let elems = range_int_elements(start as i64, count)?;
     make_int_stream(ctx, &elems)
+}
+
+fn native_int_stream_iterator(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(r))) => *r,
+        _ => return make_primitive_iterator(ctx, "java/util/PrimitiveIterator$OfInt", &[]),
+    };
+    let elements = int_stream_elements(ctx, this);
+    make_primitive_iterator(ctx, "java/util/PrimitiveIterator$OfInt", &elements)
+}
+
+fn register_primitive_iterator_natives(r: &mut NativeMethodRegistry) {
+    let __prev_cat = r.current_category();
+    r.set_category(cratonvm_native_api::NativeKind::Bridge);
+    for c in [
+        "java/util/PrimitiveIterator$OfInt",
+        "java/util/PrimitiveIterator$OfLong",
+        "java/util/PrimitiveIterator$OfDouble",
+    ] {
+        r.register(c, "hasNext", "()Z", native_primitive_iterator_has_next);
+        r.register(
+            c,
+            "next",
+            "()Ljava/lang/Object;",
+            native_primitive_iterator_next_boxed,
+        );
+    }
+    r.register(
+        "java/util/PrimitiveIterator$OfInt",
+        "nextInt",
+        "()I",
+        native_primitive_iterator_next_int,
+    );
+    r.register(
+        "java/util/PrimitiveIterator$OfLong",
+        "nextLong",
+        "()J",
+        native_primitive_iterator_next_long,
+    );
+    r.register(
+        "java/util/PrimitiveIterator$OfDouble",
+        "nextDouble",
+        "()D",
+        native_primitive_iterator_next_double,
+    );
+    r.set_category(__prev_cat);
 }
 
 fn native_int_stream_of(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
@@ -15269,6 +15450,12 @@ fn register_long_stream_natives(r: &mut NativeMethodRegistry) {
     r.register(c, "toArray", "()[J", native_long_stream_to_array);
     r.register(
         c,
+        "iterator",
+        "()Ljava/util/PrimitiveIterator$OfLong;",
+        native_long_stream_iterator,
+    );
+    r.register(
+        c,
         "boxed",
         "()Ljava/util/stream/Stream;",
         native_long_stream_boxed,
@@ -15564,6 +15751,15 @@ fn native_long_stream_boxed(ctx: &mut dyn NativeContext, args: &[Value]) -> Meth
     make_stream(ctx, &boxed)
 }
 
+fn native_long_stream_iterator(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(r))) => *r,
+        _ => return make_primitive_iterator(ctx, "java/util/PrimitiveIterator$OfLong", &[]),
+    };
+    let elements = stream_elements(ctx, this)?;
+    make_primitive_iterator(ctx, "java/util/PrimitiveIterator$OfLong", &elements)
+}
+
 fn native_long_stream_as_double(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = match args.first() {
         Some(Value::Object(Some(r))) => *r,
@@ -15767,6 +15963,12 @@ fn register_double_stream_natives(r: &mut NativeMethodRegistry) {
         native_double_stream_map,
     );
     r.register(c, "toArray", "()[D", native_double_stream_to_array);
+    r.register(
+        c,
+        "iterator",
+        "()Ljava/util/PrimitiveIterator$OfDouble;",
+        native_double_stream_iterator,
+    );
     r.register(
         c,
         "boxed",
@@ -16007,6 +16209,15 @@ fn native_double_stream_boxed(ctx: &mut dyn NativeContext, args: &[Value]) -> Me
     let elements = stream_elements(ctx, this)?;
     let boxed = box_primitive_stream_elements(ctx, &elements);
     make_stream(ctx, &boxed)
+}
+
+fn native_double_stream_iterator(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(r))) => *r,
+        _ => return make_primitive_iterator(ctx, "java/util/PrimitiveIterator$OfDouble", &[]),
+    };
+    let elements = stream_elements(ctx, this)?;
+    make_primitive_iterator(ctx, "java/util/PrimitiveIterator$OfDouble", &elements)
 }
 
 fn native_double_stream_map_to_obj(
@@ -22211,6 +22422,36 @@ fn collect_collection_elements(ctx: &mut dyn NativeContext, coll: ObjectRef) -> 
             }
             return Vec::new();
         }
+        // kotlin.collections.ArrayAsCollection (the backing view Kotlin's
+        // mutableListOf/listOf/setOf(vararg) build via
+        // CollectionsKt.asCollection(array, isVarargs)) has layout
+        // (values: Object[], isVarargs: Boolean). The generic "f0 = array,
+        // f1 = int size" ArrayList-shape heuristic a few lines below reads
+        // field 1 as a Value::Int and matches it regardless of whether the
+        // real field is an int or a boolean (both are stored as Value::Int
+        // on CratonVM) so isVarargs=true gets misread as size=1, and every
+        // new ArrayList<>(kotlin.collections.mutableListOf(a, b, ...)) (or
+        // HashSet(...), etc.) copy silently truncates to just the FIRST
+        // element (isVarargs=false accidentally reads size=0, which falls
+        // through to the correct toArray()-based fallback instead -- only
+        // the true case is silently wrong). This broke Spring's own
+        // InvocableHandlerMethodKotlinTests (a mutableListOf(...) resolver
+        // list lost its second element), and would affect any Kotlin code
+        // building a mutable collection from 2+ vararg literals. Read the
+        // real `values` field by name instead of guessing by slot index.
+        if cls_name == "kotlin/collections/ArrayAsCollection" {
+            if let Value::Object(Some(arr)) = ctx.get_field_by_name(coll, "values") {
+                if ctx.heap_kind_of(arr) == ObjectKind::Array {
+                    let len = ctx.array_length(arr);
+                    let mut out = Vec::with_capacity(len);
+                    for i in 0..len {
+                        out.push(ctx.get_array_element(arr, i));
+                    }
+                    return out;
+                }
+            }
+            return Vec::new();
+        }
         if cls_name.starts_with("java/util/Collections$Unmodifiable")
             || cls_name.starts_with("java/util/Collections$Synchronized")
             || cls_name.starts_with("java/util/Collections$Checked")
@@ -22484,15 +22725,38 @@ fn collect_collection_elements(ctx: &mut dyn NativeContext, coll: ObjectRef) -> 
             }
         }
     }
-    // S111r-bug-fix: Arrays$ArrayList — single field `a` (Object[]), no size.
+    // S111r-bug-fix: Arrays$ArrayList -- single field `a` (Object[]), no size.
     // `Arrays.asList(...)` is heavily used in JDK callers (and Spring uses
     // it indirectly through `Collections.singletonList` / similar wrappers)
     // and has a different layout than `java.util.ArrayList`.
-    if let Value::Object(Some(arr)) = f0 {
+    //
+    // locale-azure fix: in real-JDK mode, Arrays$ArrayList inherits
+    // AbstractList.modCount at slot 0, so its own `a` field is at slot 1 --
+    // NOT slot 0 as this branch originally assumed (that assumption only
+    // held in synthetic-jdk mode, which has no modCount ancestor slot).
+    // Reading f0 here saw `modCount` (an Int, e.g. 0), which is not an
+    // Object, so the branch below silently fell through and
+    // `Arrays.asList(...)` contributed zero elements to any addAll/copy
+    // constructor call sites (e.g. `LinkedList.addAll(Arrays.asList(x))`
+    // returned false and added nothing — MockHttpServletRequest.
+    // setPreferredLocales(Arrays.asList(...)) left its LinkedList<Locale>
+    // empty, so getLocale()'s getFirst() threw NoSuchElementException).
+    // Resolve `a`'s real slot by name and fall back to slot 0 for
+    // synthetic-jdk / resolution-failure cases.
+    let aal_a_slot = ctx
+        .resolve_field_index("java/util/Arrays$ArrayList", "a")
+        .unwrap_or(0);
+    let f_aal_a = if aal_a_slot < n_fields {
+        ctx.get_field(coll, aal_a_slot)
+    } else {
+        Value::Object(None)
+    };
+    if let Value::Object(Some(arr)) = f_aal_a {
         if ctx.heap_kind_of(arr) == ObjectKind::Array {
             let len = ctx.array_length(arr);
             // Heuristic: if this object has at most a couple of fields and
-            // field 0 is a ref-array, treat it as an array-backed wrapper.
+            // the resolved slot is a ref-array, treat it as an array-backed
+            // wrapper.
             let mut elems = Vec::with_capacity(len);
             for i in 0..len {
                 elems.push(ctx.get_array_element(arr, i));
@@ -29790,6 +30054,12 @@ fn unmod_delegate_rewrap_set(
 ) -> MethodCallResult {
     let res = unmod_delegate(ctx, args, method, descriptor)?;
     match res {
+        // Sub-views (tailSet/headSet/subSet/descendingSet) are only reachable
+        // starting from an already-sorted/navigable set, and the JDK's own
+        // UnmodifiableNavigableSet returns further NavigableSet-typed
+        // sub-views — so re-wrap with UNMOD_SORTED_SET_CLASS (NOT the plain
+        // UNMOD_SET_CLASS), keeping the SortedSet/NavigableSet surface (e.g.
+        // comparator()) available on the result the same way the JDK does.
         Some(Value::Object(Some(s))) => Ok(Some(Value::Object(Some(alloc_unmod_wrapper(
             ctx,
             wrapper_class,
@@ -31391,6 +31661,12 @@ fn native_collections_unmodifiable_map(
 }
 
 /// `Collections.unmodifiableSet` — wrap the source set in a live read-only view.
+///
+/// Uses the plain `UNMOD_SET_CLASS` stamp (Set/Collection/Serializable only —
+/// NOT SortedSet/NavigableSet). `unmodifiableSortedSet`/`unmodifiableNavigableSet`
+/// go through `native_collections_unmodifiable_sorted_set` below instead, so a
+/// plain wrapped `LinkedHashSet`/`HashSet` never claims a `comparator()` (etc.)
+/// surface it can't actually delegate (real `LinkedHashSet` has no such method).
 fn native_collections_unmodifiable_set(
     ctx: &mut dyn NativeContext,
     args: &[Value],
@@ -31404,7 +31680,7 @@ fn native_collections_unmodifiable_set(
     }
 }
 
-/// `Collections.unmodifiableSortedSet` — wrap as a read-only SortedSet view.
+/// `Collections.unmodifiableSortedSet` ? wrap as a read-only SortedSet view.
 fn native_collections_unmodifiable_sorted_set(
     ctx: &mut dyn NativeContext,
     args: &[Value],
@@ -32700,6 +32976,7 @@ fn register_iterator_protocol_natives(r: &mut NativeMethodRegistry) {
         "()Ljava/util/Enumeration;",
         native_empty_enumeration,
     );
+    register_primitive_iterator_natives(r);
     r.set_category(__prev_cat);
 }
 
