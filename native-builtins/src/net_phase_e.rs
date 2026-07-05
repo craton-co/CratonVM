@@ -2478,9 +2478,15 @@ fn re1_socket_read_stream(
         eprintln!("[dbg-sock] read: sid={stream_id} want={ln} (blocking on recv...)");
     }
     let mut tmp = vec![0u8; ln];
-    let n = (&*stream)
-        .read(&mut tmp)
-        .map_err(|e| ioex(format!("Socket read failed: {e}")))?;
+    let mut blocked_refs = [Value::Object(Some(buf))];
+    ctx.begin_blocking_region();
+    let read_result = (&*stream).read(&mut tmp);
+    ctx.end_blocking_region_refs(&mut blocked_refs);
+    let buf = match blocked_refs[0] {
+        Value::Object(Some(o)) => o,
+        _ => buf,
+    };
+    let n = read_result.map_err(|e| ioex(format!("Socket read failed: {e}")))?;
     if dbg {
         eprintln!("[dbg-sock] read: sid={stream_id} got={n}");
     }
@@ -2517,12 +2523,14 @@ fn re1_socket_write_stream(
             .ok_or_else(|| ioex("Socket stream not found"))?
             .clone()
     };
-    (&*stream)
-        .write_all(&data)
-        .map_err(|e| ioex(format!("Socket write failed: {e}")))?;
-    (&*stream)
-        .flush()
-        .map_err(|e| ioex(format!("Socket flush failed: {e}")))?;
+    ctx.begin_blocking_region();
+    let write_result = (|| -> std::io::Result<()> {
+        (&*stream).write_all(&data)?;
+        (&*stream).flush()?;
+        Ok(())
+    })();
+    ctx.end_blocking_region();
+    write_result.map_err(|e| ioex(format!("Socket write failed: {e}")))?;
     if std::env::var_os("CRATONVM_DBG_SOCK").is_some() {
         eprintln!(
             "[dbg-sock] write: sid={stream_id} sent={} bytes",

@@ -1347,7 +1347,13 @@ fn native_fis_read(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRes
         Some(fd) => fd,
         None => return Ok(Some(Value::Int(-1))),
     };
-    let result = ctx.fd_table().read_byte(fd).map_err(io_err)?;
+    // FileInputStream also backs System.in and subprocess stdout/stderr.
+    // Those reads can block in the OS pipe, so publish this thread as
+    // GC-safe before entering the kernel wait.
+    ctx.begin_blocking_region();
+    let result = ctx.fd_table().read_byte(fd);
+    ctx.end_blocking_region();
+    let result = result.map_err(io_err)?;
     Ok(Some(Value::Int(result)))
 }
 
@@ -1387,18 +1393,29 @@ fn native_fis_read_bytes(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
     }
     let off = off as usize;
     let len = len as usize;
+    if len == 0 {
+        return Ok(Some(Value::Int(0)));
+    }
     let fd = match fis_get_fd(ctx, this) {
         Some(fd) => fd,
         None => return Ok(Some(Value::Int(-1))),
     };
     let mut buf = vec![0u8; len];
+    let mut largs = args.to_vec();
     let read_start = std::time::Instant::now();
-    let n = ctx.fd_table().read_bytes(fd, &mut buf).map_err(io_err)?;
+    ctx.begin_blocking_region();
+    let n = ctx.fd_table().read_bytes(fd, &mut buf);
+    ctx.end_blocking_region_refs(&mut largs);
+    let n = n.map_err(io_err)?;
     let read_dur = read_start.elapsed();
     ctx.record_file_read(fd as i32, n as i64, n == 0, read_dur.as_nanos() as u64);
     if n == 0 {
         return Ok(Some(Value::Int(-1)));
     }
+    let arr = match largs.get(1) {
+        Some(Value::Object(Some(a))) => *a,
+        _ => return Ok(Some(Value::Int(-1))),
+    };
     // AUDIT 2026-05-17: bulk write via NativeContext intrinsic (round-3
     // perf path) — avoids N virtual dispatches + Value boxing per byte.
     ctx.write_byte_array_from(arr, off, &buf[..n]);
@@ -1425,10 +1442,18 @@ fn native_fis_read_byte_array(ctx: &mut dyn NativeContext, args: &[Value]) -> Me
         None => return Ok(Some(Value::Int(-1))),
     };
     let mut buf = vec![0u8; len];
-    let n = ctx.fd_table().read_bytes(fd, &mut buf).map_err(io_err)?;
+    let mut largs = args.to_vec();
+    ctx.begin_blocking_region();
+    let n = ctx.fd_table().read_bytes(fd, &mut buf);
+    ctx.end_blocking_region_refs(&mut largs);
+    let n = n.map_err(io_err)?;
     if n == 0 {
         return Ok(Some(Value::Int(-1)));
     }
+    let arr = match largs.get(1) {
+        Some(Value::Object(Some(a))) => *a,
+        _ => return Ok(Some(Value::Int(-1))),
+    };
     // AUDIT 2026-05-17: bulk write via NativeContext intrinsic.
     ctx.write_byte_array_from(arr, 0, &buf[..n]);
     Ok(Some(Value::Int(n as i32)))
@@ -1475,7 +1500,10 @@ fn native_fis_skip(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRes
     let mut buf = vec![0u8; CHUNK];
     while remaining > 0 {
         let want = remaining.min(CHUNK as u64) as usize;
-        let read = match ctx.fd_table().read_bytes(fd, &mut buf[..want]) {
+        ctx.begin_blocking_region();
+        let read = ctx.fd_table().read_bytes(fd, &mut buf[..want]);
+        ctx.end_blocking_region();
+        let read = match read {
             Ok(r) => r,
             Err(_) => break,
         };
@@ -2381,7 +2409,10 @@ fn native_br_read(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResu
     // byte. Lock is dropped during the fd_table call to avoid holding
     // the side-table mutex across a potentially blocking read.
     let mut tmp = vec![0u8; BR_BUF_SIZE];
-    let n = ctx.fd_table().read_bytes(fd, &mut tmp).map_err(io_err)?;
+    ctx.begin_blocking_region();
+    let n = ctx.fd_table().read_bytes(fd, &mut tmp);
+    ctx.end_blocking_region();
+    let n = n.map_err(io_err)?;
     if n == 0 {
         // Mark EOF in the side-table so subsequent reads short-circuit.
         let mut table = br_buf_table().lock();
@@ -8078,6 +8109,29 @@ fn register_nio_file_natives(registry: &mut NativeMethodRegistry) {
     let paths = "java/nio/file/Paths";
     let files = "java/nio/file/Files";
 
+    // JDK 25 UnixFileSystem initializes this dispatcher during early real-JDK
+    // filesystem setup. Return no optional capabilities so Java falls back to
+    // portable paths instead of failing class initialization.
+    registry.register(
+        "sun/nio/fs/UnixNativeDispatcher",
+        "init",
+        "()I",
+        |_ctx, _args| Ok(Some(cratonvm_types::Value::Int(0))),
+    );
+    registry.register(
+        "sun/nio/fs/UnixNativeDispatcher",
+        "getcwd",
+        "()[B",
+        |ctx, _args| {
+            let cwd = std::env::current_dir().map_err(io_err)?;
+            let text = cwd.to_string_lossy();
+            let bytes = text.as_bytes();
+            let arr = ctx.new_array(ArrayElementType::Byte, bytes.len());
+            ctx.write_byte_array_from(arr, 0, bytes);
+            Ok(Some(Value::Object(Some(arr))))
+        },
+    );
+
     // Paths factory
     registry.register(
         paths,
@@ -10434,7 +10488,31 @@ fn native_bos_init_size(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCa
     Ok(None)
 }
 
+fn bos_write_lock() -> &'static Mutex<()> {
+    static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+    LOCK.get_or_init(|| Mutex::new(()))
+}
+
+thread_local! {
+    static BOS_WRITE_LOCK_HELD: std::cell::Cell<bool> = std::cell::Cell::new(false);
+}
+
+fn with_bos_write_lock<R>(f: impl FnOnce() -> R) -> R {
+    if BOS_WRITE_LOCK_HELD.with(|held| held.get()) {
+        return f();
+    }
+    let _guard = bos_write_lock().lock();
+    BOS_WRITE_LOCK_HELD.with(|held| held.set(true));
+    let result = f();
+    BOS_WRITE_LOCK_HELD.with(|held| held.set(false));
+    result
+}
+
 fn native_bos_write(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    with_bos_write_lock(|| native_bos_write_locked(ctx, args))
+}
+
+fn native_bos_write_locked(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = match args.first() {
         Some(Value::Object(Some(o))) => *o,
         _ => return Ok(None),
@@ -10469,6 +10547,10 @@ fn native_bos_write(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRe
 }
 
 fn native_bos_write_bulk(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    with_bos_write_lock(|| native_bos_write_bulk_locked(ctx, args))
+}
+
+fn native_bos_write_bulk_locked(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = match args.first() {
         Some(Value::Object(Some(o))) => *o,
         _ => return Ok(None),
@@ -10493,6 +10575,10 @@ fn native_bos_write_bulk(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
 }
 
 fn native_bos_flush(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    with_bos_write_lock(|| native_bos_flush_locked(ctx, args))
+}
+
+fn native_bos_flush_locked(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = match args.first() {
         Some(Value::Object(Some(o))) => *o,
         _ => return Ok(None),

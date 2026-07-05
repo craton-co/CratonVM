@@ -981,6 +981,9 @@ fn normalize_java_launcher_argv(args: Vec<String>) -> Vec<String> {
             out.push("--jar".into());
             out.push(args[i + 1].clone());
             i += 2;
+        } else if a == "-version" || a == "-v" {
+            out.push("--version".into());
+            i += 1;
         } else if (a == "-classpath" || a == "-cp") && i + 1 < args.len() {
             out.push("--classpath".into());
             out.push(args[i + 1].clone());
@@ -2153,6 +2156,12 @@ fn run() -> Result<()> {
     // armed (nothing to cancel).
     let mut _watchdog_completion_guard: Option<WatchdogCompletionGuard> = None;
 
+    if ring_recording_requested {
+        cratonvm_native_api::native_ring::enable(true);
+        vm.shared.native_methods.flush_native_ring_names();
+        cratonvm_vm::dispatch_trace::enable();
+    }
+
     if let Some(secs) = effective_watchdog {
         // Enable the native-call ring buffer so the watchdog's "0 Java
         // threads dumped" fallback can show the last ~64 native methods
@@ -2167,6 +2176,7 @@ fn run() -> Result<()> {
         // frames; ring detail is reserved for runs that asked for it.
         if ring_recording_requested {
             cratonvm_native_api::native_ring::enable(true);
+            vm.shared.native_methods.flush_native_ring_names();
             // T19.H1 — also enable the dispatch-trace ring. The native-call
             // ring records only opaque fn-pointers from two dispatch sites;
             // the dispatch trace records *named* class.method.desc for every
@@ -3927,6 +3937,18 @@ mod tests {
         assert_eq!(insert_program_args_separator(inp.clone()), inp);
         let inp = argv(&["java", "--help"]);
         assert_eq!(insert_program_args_separator(inp.clone()), inp);
+    }
+
+    #[test]
+    fn normalize_version_short_forms() {
+        assert_eq!(
+            normalize_java_launcher_argv(argv(&["java", "-version"])),
+            argv(&["java", "--version"])
+        );
+        assert_eq!(
+            normalize_java_launcher_argv(argv(&["java", "-v"])),
+            argv(&["java", "--version"])
+        );
     }
 
     #[test]
