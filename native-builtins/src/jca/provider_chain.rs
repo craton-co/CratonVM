@@ -38,7 +38,7 @@
 //! (`"25"` not `"25.0"`).
 
 use cratonvm_native_api::{NativeContext, NativeMethodRegistry};
-use cratonvm_types::error::MethodCallResult;
+use cratonvm_types::error::{MethodCallFailed, MethodCallResult, VmError};
 use cratonvm_types::{ObjectRef, Value};
 
 use rustc_hash::FxHashMap;
@@ -592,6 +592,36 @@ fn security_set_property(_ctx: &mut dyn NativeContext, _args: &[Value]) -> Metho
 // args[4]=className args[5]=aliases  args[6]=attributes
 // ---------------------------------------------------------------------------
 
+fn empty_collection_value(
+    ctx: &mut dyn NativeContext,
+    method: &str,
+    descriptor: &str,
+    fallback_class: &str,
+) -> Result<Value, MethodCallFailed> {
+    if let Ok(Some(Value::Object(Some(obj)))) =
+        ctx.invoke("java/util/Collections", method, descriptor, &[])
+    {
+        return Ok(Value::Object(Some(obj)));
+    }
+
+    let cid = ctx.ensure_class_initialized(fallback_class).map_err(|_| {
+        MethodCallFailed::InternalError(VmError::Internal {
+            message: format!("Provider$Service: {fallback_class} not loaded"),
+        })
+    })?;
+    let obj = ctx.alloc_object(cid, ctx.class_num_total_fields(cid).max(4));
+    let obj_pin = ctx.pin_native_root(obj);
+    ctx.invoke(
+        fallback_class,
+        "<init>",
+        "()V",
+        &[Value::Object(Some(obj))],
+    )?;
+    let obj = ctx.read_native_pin(obj_pin, obj);
+    ctx.unpin_native_roots(obj_pin);
+    Ok(Value::Object(Some(obj)))
+}
+
 fn provider_service_init(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = obj_arg(args, 0)?;
 
@@ -599,8 +629,8 @@ fn provider_service_init(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
     let svc_type = args.get(2).copied().unwrap_or(Value::Object(None));
     let algorithm = args.get(3).copied().unwrap_or(Value::Object(None));
     let class_name = args.get(4).copied().unwrap_or(Value::Object(None));
-    let aliases = args.get(5).copied().unwrap_or(Value::Object(None));
-    let attributes = args.get(6).copied().unwrap_or(Value::Object(None));
+    let mut aliases = args.get(5).copied().unwrap_or(Value::Object(None));
+    let mut attributes = args.get(6).copied().unwrap_or(Value::Object(None));
 
     // Real-JDK path: write by field name so the actual class layout is
     // honoured.  Each call is a no-op when the receiver has no field with
@@ -609,8 +639,6 @@ fn provider_service_init(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
     ctx.set_field_by_name(this, "type", svc_type);
     ctx.set_field_by_name(this, "algorithm", algorithm);
     ctx.set_field_by_name(this, "className", class_name);
-    ctx.set_field_by_name(this, "aliases", aliases);
-    ctx.set_field_by_name(this, "attributes", attributes);
     // `engineDescription` left null — see module doc; this is the whole
     // point of the shim.
 
@@ -629,6 +657,34 @@ fn provider_service_init(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
     if nfields > 2 {
         ctx.set_field(this, 2, provider);
     }
+
+    // OpenJDK Provider.Service turns null aliases/attributes into immutable
+    // empty collections. Real provider constructors pass null for the common
+    // no-alias/no-attribute case, and Provider.putService immediately iterates
+    // `getAliases()` and `attributes.entrySet()`. Leaving either field null
+    // makes JDK providers fail during construction.
+    let this_pin = ctx.pin_native_root(this);
+    if matches!(aliases, Value::Object(None)) {
+        aliases = empty_collection_value(
+            ctx,
+            "emptyList",
+            "()Ljava/util/List;",
+            "java/util/ArrayList",
+        )?;
+    }
+    let this_now = ctx.read_native_pin(this_pin, this);
+    ctx.set_field_by_name(this_now, "aliases", aliases);
+    if matches!(attributes, Value::Object(None)) {
+        attributes = empty_collection_value(
+            ctx,
+            "emptyMap",
+            "()Ljava/util/Map;",
+            "java/util/HashMap",
+        )?;
+    }
+    let this_now = ctx.read_native_pin(this_pin, this);
+    ctx.set_field_by_name(this_now, "attributes", attributes);
+    ctx.unpin_native_roots(this_pin);
 
     Ok(None)
 }

@@ -794,11 +794,26 @@ fn jboss_logger_registry() -> &'static Mutex<HashMap<String, u64>> {
     INSTANCE.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
+fn attach_minimal_jboss_logger_node(ctx: &mut dyn NativeContext, logger: ObjectRef) {
+    // Some JIT/real-bytecode paths still execute JBoss Logger methods directly
+    // before the native override gate can short-circuit them. Those methods all
+    // start by dereferencing `this.loggerNode`. We do not model the full
+    // LoggerNode graph, but a tiny node with INFO effective level is enough for
+    // getEffectiveLevel/isLoggable-style reads to be null-safe and conservative.
+    let node = alloc_concurrent_synthetic(ctx, "org/jboss/logmanager/LoggerNode", 16);
+    ctx.set_field_by_name(node, "effectiveLevel", Value::Int(800));
+    ctx.set_field_by_name(node, "effectiveMinLevel", Value::Int(i32::MIN));
+    ctx.set_field_by_name(node, "useParentHandlers", Value::Int(1));
+    ctx.set_field_by_name(node, "useParentFilter", Value::Int(1));
+    ctx.set_field_by_name(logger, "loggerNode", Value::Object(Some(node)));
+}
+
 fn get_or_create_jboss_logger(ctx: &mut dyn NativeContext, name: &str) -> ObjectRef {
     if !is_valid_logger_name(name) {
         let obj = alloc_concurrent_synthetic(ctx, "org/jboss/logmanager/Logger", LOGGER_NUM_FIELDS);
         let name_obj = ctx.create_string("");
         ctx.set_field(obj, LOGGER_FIELD_NAME, Value::Object(Some(name_obj)));
+        attach_minimal_jboss_logger_node(ctx, obj);
         return obj;
     }
     {
@@ -816,6 +831,7 @@ fn get_or_create_jboss_logger(ctx: &mut dyn NativeContext, name: &str) -> Object
     ctx.set_field(obj, LOGGER_FIELD_NAME, Value::Object(Some(name_obj)));
     ctx.set_field(obj, LOGGER_FIELD_LEVEL, Value::Object(None));
     ctx.set_field(obj, LOGGER_FIELD_PARENT, Value::Object(None));
+    attach_minimal_jboss_logger_node(ctx, obj);
     let mut reg = jboss_logger_registry()
         .lock()
         .unwrap_or_else(|e| e.into_inner());

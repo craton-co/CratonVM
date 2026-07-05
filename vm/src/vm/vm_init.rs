@@ -4813,6 +4813,11 @@ impl Vm {
         shared
             .thread_registry
             .set_gc_block_state(ThreadId(0), main_thread.gc_block_state.clone());
+        // Publish the primordial thread's OS id too. A worker can initiate a
+        // multi-threaded STW while the main thread is running JIT code; without
+        // this id the takeover backend can freeze and scan main but cannot prove
+        // it was part of the counted barrier snapshot.
+        shared.thread_registry.set_os_tid_current(ThreadId(0));
 
         // Start JDWP debug server if configured
         #[cfg(feature = "experimental-debug")]

@@ -49,6 +49,9 @@ struct ThreadEntry {
     /// points. Lets another thread read where this one is parked, backing
     /// cross-thread `Thread.getStackTrace()` / `dumpThreads()`.
     frame_trace: Arc<Mutex<Vec<cratonvm_native_api::StackTraceEntry>>>,
+    /// Optional VM-side breadcrumb published by the owning `JvmThread` when
+    /// `CRATONVM_DBG_VM_STATE=1` is enabled.
+    vm_state: Arc<Mutex<String>>,
     /// Blocked-region GC state (shared with the JvmThread, like `root_snapshot`):
     /// lets a GC initiator remap this thread's snapshot and accumulate frame
     /// fixups while the thread is parked in a blocking native. See
@@ -191,6 +194,7 @@ impl ThreadRegistry {
             interrupted: Arc::new(AtomicBool::new(false)),
             root_snapshot: Arc::new(Mutex::new(Vec::new())),
             frame_trace: Arc::new(Mutex::new(Vec::new())),
+            vm_state: Arc::new(Mutex::new(String::new())),
             gc_block_state: Arc::new(GcBlockState::new()),
             async_exception_slot: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             tlab_addr: std::sync::atomic::AtomicUsize::new(0),
@@ -671,6 +675,13 @@ impl ThreadRegistry {
         }
     }
 
+    /// Share the JvmThread's VM-state breadcrumb with the registry.
+    pub fn set_vm_state(&self, thread_id: ThreadId, state: Arc<Mutex<String>>) {
+        if let Some(entry) = self.threads.lock().get_mut(&thread_id) {
+            entry.vm_state = state;
+        }
+    }
+
     /// Read a copy of `thread_id`'s last-published frame trace (call stack),
     /// innermost frame first. Empty if the thread is unknown or never deposited.
     pub fn frame_trace_of(&self, thread_id: ThreadId) -> Vec<cratonvm_native_api::StackTraceEntry> {
@@ -722,6 +733,54 @@ impl ThreadRegistry {
             }
         }
         v
+    }
+
+    /// Debug-only STW census: one line per alive JVM thread with the state that
+    /// matters to stop-the-world accounting. Used when the GC barrier is waiting
+    /// for a cooperative mutator but the cross-thread JIT takeover cannot find a
+    /// live JIT frame to freeze.
+    pub fn debug_thread_census(&self) -> String {
+        use std::fmt::Write as _;
+
+        let threads = self.threads.lock();
+        let mut out = String::new();
+        for (tid, entry) in threads.iter() {
+            if !entry.alive.load(Ordering::Acquire) {
+                continue;
+            }
+
+            let blocked = entry
+                .gc_block_state
+                .in_blocked_region
+                .load(Ordering::Acquire);
+            let snapshot_len = entry.root_snapshot.lock().len();
+            let os_tid = entry.os_tid.load(Ordering::Acquire);
+            let vm_state = {
+                let s = entry.vm_state.lock();
+                if s.is_empty() { "<unset>".to_string() } else { s.clone() }
+            };
+            let trace = entry.frame_trace.lock();
+            let mut top = String::new();
+            for (i, frame) in trace.iter().rev().take(4).enumerate() {
+                if i > 0 {
+                    top.push_str(" <- ");
+                }
+                let _ = write!(
+                    top,
+                    "{}.{}@{}",
+                    frame.class_name, frame.method_name, frame.byte_code_index
+                );
+            }
+            if top.is_empty() {
+                top.push_str("<no-frame-trace>");
+            }
+            let _ = write!(
+                out,
+                "\n  t{} os_tid={} name={:?} blocked={} snapshot={} state={:?} top={}",
+                tid.0, os_tid, entry.name, blocked, snapshot_len, vm_state, top
+            );
+        }
+        out
     }
 
     /// Collect root snapshots from all alive threads.
@@ -969,9 +1028,17 @@ impl ThreadRegistry {
                 entry.os_tid.store(os_tid, Ordering::Release);
             }
         }
-        #[cfg(not(windows))]
+        #[cfg(target_os = "linux")]
         {
-            let _ = thread_id; // takeover machinery is Windows-only
+            let os_tid = unsafe { libc::syscall(libc::SYS_gettid) as u32 };
+            let threads = self.threads.lock();
+            if let Some(entry) = threads.get(&thread_id) {
+                entry.os_tid.store(os_tid, Ordering::Release);
+            }
+        }
+        #[cfg(all(not(windows), not(target_os = "linux")))]
+        {
+            let _ = thread_id; // takeover machinery is currently Windows/Linux-only
         }
     }
 

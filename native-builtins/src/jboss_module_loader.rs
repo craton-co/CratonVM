@@ -69,12 +69,12 @@ use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 
 use cratonvm_native_api::{DefineClassFull, NativeContext, NativeMethodRegistry};
-use cratonvm_types::error::{MethodCallFailed, MethodCallResult, RuntimeError};
+use cratonvm_types::error::{MethodCallFailed, MethodCallResult, RuntimeError, VmError};
 use cratonvm_types::{ObjectRef, Value};
 use parking_lot::Mutex;
 
 use crate::alloc_concurrent_synthetic;
-use crate::jboss_module_xml::{parse_module_xml, ModuleXml};
+use crate::jboss_module_xml::{parse_module_xml, ModuleXml, ServicesDisposition};
 
 // ===========================================================================
 // Class names (kept centralized so anchor strings are easy to spot in greps)
@@ -162,9 +162,9 @@ pub(crate) fn validate_module_name(name: &str) -> Result<(), RuntimeError> {
 // Module-path resolution
 // ===========================================================================
 
-/// Process-wide cache of the canonicalized `-mp` root.  Set lazily on
+/// Process-wide cache of the canonicalized `-mp` roots. Set lazily on
 /// the first `loadModule` call.
-static MP_ROOT_CACHE: OnceLock<Option<PathBuf>> = OnceLock::new();
+static MP_ROOTS_CACHE: OnceLock<Vec<PathBuf>> = OnceLock::new();
 
 /// Process-wide Maven repository hint captured from `-Dmaven.repo.local`.
 /// Build-tree WildFly distributions use `<artifact name="g:a:v"/>` entries in
@@ -223,31 +223,45 @@ fn find_mp_argument() -> Option<String> {
     None
 }
 
-/// Resolve and canonicalize the `-mp` root once.  Subsequent calls
-/// return the cached value.
-fn resolve_mp_root() -> Option<PathBuf> {
-    MP_ROOT_CACHE
+fn split_module_path_entries(raw: &str) -> Vec<String> {
+    let sep = if cfg!(windows) { ';' } else { ':' };
+    raw.split(sep)
+        .map(str::trim)
+        .filter(|entry| !entry.is_empty())
+        .map(ToOwned::to_owned)
+        .collect()
+}
+
+fn canonicalize_module_path_entry(raw: &str) -> PathBuf {
+    let p = Path::new(raw);
+    // `canonicalize` resolves symlinks; if the path doesn't exist we fall back
+    // to a non-canonical path so tests that operate on tempdirs still see a
+    // deterministic root value. In production the path always exists.
+    match std::fs::canonicalize(p) {
+        Ok(c) => c,
+        Err(_) => p.canonicalize().ok().unwrap_or_else(|| p.to_path_buf()),
+    }
+}
+
+/// Resolve and canonicalize every entry in the `-mp` path once. Subsequent
+/// calls return the cached values.
+fn resolve_mp_roots() -> Vec<PathBuf> {
+    MP_ROOTS_CACHE
         .get_or_init(|| {
-            let raw = find_mp_argument()?;
-            // `-mp` accepts a list separated by `;` (Windows) / `:` (Unix).
-            // Take the first entry as the canonical root for path-prefix
-            // checks, but search every entry when looking up modules.
-            let primary = raw.split(if cfg!(windows) { ';' } else { ':' }).next()?;
-            let p = Path::new(primary);
-            // `canonicalize` resolves symlinks; if the path doesn't
-            // exist we fall back to a non-canonical absolute path so
-            // tests that operate on tempdirs still see a deterministic
-            // root value.  In production the path always exists.
-            match std::fs::canonicalize(p) {
-                Ok(c) => Some(c),
-                Err(_) => p.canonicalize().ok().or_else(|| Some(p.to_path_buf())),
-            }
+            find_mp_argument()
+                .map(|raw| {
+                    split_module_path_entries(&raw)
+                        .into_iter()
+                        .map(|entry| canonicalize_module_path_entry(&entry))
+                        .collect()
+                })
+                .unwrap_or_default()
         })
         .clone()
 }
 
-/// Per-test override for the `-mp` root.  When set, takes precedence
-/// over `MP_ROOT_CACHE`.
+/// Per-test override for the `-mp` root. When set, takes precedence over
+/// resolved CLI/env roots.
 #[cfg(test)]
 static MP_ROOT_TEST_OVERRIDE: Mutex<Option<PathBuf>> = Mutex::new(None);
 
@@ -266,12 +280,17 @@ fn current_mp_root_for_test() -> Option<PathBuf> {
     None
 }
 
-/// Active module path root: test override > resolved CLI > None.
-fn module_path_root() -> Option<PathBuf> {
+/// Active module path roots: test override > resolved CLI/env roots.
+fn module_path_roots() -> Vec<PathBuf> {
     if let Some(p) = current_mp_root_for_test() {
-        return Some(p);
+        return vec![p];
     }
-    resolve_mp_root()
+    resolve_mp_roots()
+}
+
+/// Primary module path root for code paths that only need a representative value.
+fn module_path_root() -> Option<PathBuf> {
+    module_path_roots().into_iter().next()
 }
 
 fn maven_repo_candidates() -> Vec<PathBuf> {
@@ -748,10 +767,14 @@ fn build_module_object(
     let name_str = ctx.create_string(name);
     ctx.set_field(module, MOD_SLOT_NAME, Value::Object(Some(name_str)));
     ctx.set_field(module, MOD_SLOT_LOADER, Value::Object(Some(loader)));
+    ctx.set_field_by_name(module, "name", Value::Object(Some(name_str)));
     let arr = build_resource_root_array(ctx, &resolved.resource_roots);
+    ctx.set_field_by_name(module, "moduleLoader", Value::Object(Some(loader)));
     ctx.set_field(module, MOD_SLOT_RESOURCE_ROOTS, Value::Object(Some(arr)));
-    // Class loader is populated lazily on first `getClassLoader()` call.
-    ctx.set_field(module, MOD_SLOT_CLASSLOADER, Value::Object(None));
+    let mcl = alloc_concurrent_synthetic(ctx, CN_MODULE_CLASSLOADER, MCL_FIELD_COUNT);
+    ctx.set_field(mcl, MCL_SLOT_MODULE, Value::Object(Some(module)));
+    ctx.set_field(module, MOD_SLOT_CLASSLOADER, Value::Object(Some(mcl)));
+    ctx.set_field_by_name(module, "moduleClassLoader", Value::Object(Some(mcl)));
 
     // RKC16N.12 — populate `mainClassName` on the real `org.jboss.modules.Module`
     // class layout. The synthetic above only writes our 4 slots, but the real
@@ -946,21 +969,54 @@ pub(crate) fn native_loader_load_module(
     } else {
         Vec::new()
     };
-    if let Some(mp) = module_path_root() {
+    for mp in module_path_roots() {
         if !roots.iter().any(|r| r == &mp) {
             roots.push(mp);
         }
     }
     if roots.is_empty() {
+        if std::env::var_os("CRATONVM_DBG_WF").is_some() {
+            eprintln!("[jboss-module] loadModule({name}) no roots; receiver_has_finders={receiver_has_finders}");
+        }
         return Err(throw_module_not_found(ctx, &name));
     }
 
+    let dbg_wf = std::env::var_os("CRATONVM_DBG_WF").is_some();
+    if dbg_wf {
+        eprintln!(
+            "[jboss-module] loadModule({name}) receiver_has_finders={receiver_has_finders} roots={}",
+            roots.len()
+        );
+        for root in &roots {
+            eprintln!("[jboss-module]   root={}", root.display());
+        }
+    }
     let resolved = match resolve_module_in_roots(&roots, &name) {
-        Ok(r) => r,
+        Ok(r) => {
+            if dbg_wf {
+                eprintln!(
+                    "[jboss-module] loadModule({name}) resolved xml={} resources={}",
+                    r.module_xml_path.display(),
+                    r.resource_roots.len()
+                );
+                for root in &r.resource_roots {
+                    eprintln!("[jboss-module]   resource={}", root.display());
+                }
+            }
+            r
+        }
         Err(RuntimeError::ClassNotFoundException { .. }) => {
+            if dbg_wf {
+                eprintln!("[jboss-module] loadModule({name}) not found in roots");
+            }
             return Err(throw_module_not_found(ctx, &name));
         }
-        Err(e) => return Err(e.into()),
+        Err(e) => {
+            if dbg_wf {
+                eprintln!("[jboss-module] loadModule({name}) failed: {e:?}");
+            }
+            return Err(e.into());
+        }
     };
 
     let module = build_module_object(ctx, &name, this, &resolved);
@@ -1398,8 +1454,11 @@ fn ensure_resolved(name: &str) -> Option<ResolvedModule> {
             return Some(r.clone());
         }
     }
-    let root = module_path_root()?;
-    match resolve_module(&root, name) {
+    let roots = module_path_roots();
+    if roots.is_empty() {
+        return None;
+    }
+    match resolve_module_in_roots(&roots, name) {
         Ok(r) => {
             let mut cache = resolved_modules().lock();
             cache.insert(name.to_string(), r.clone());
@@ -1772,16 +1831,18 @@ fn recursive_collect_jars(dir: &Path, depth: usize, out: &mut Vec<PathBuf>) {
     }
 }
 
-/// Search `roots` (filesystem dirs and JARs) for `entry_path` (a slash-
-/// separated path inside the module).  Returns the absolute path-string of
-/// the first JAR/dir that contains the entry, or None.
-fn find_entry_in_roots(roots: &[PathBuf], entry_path: &str) -> Option<String> {
+/// Resolve all resource-entry hits against a list of roots (JARs or directories).
+/// `entry_path` must be slash-separated and relative (e.g.
+/// `org/example/Foo.class` or `META-INF/services/x`). Returns each JAR/dir
+/// that contains the entry, preserving root order.
+fn find_entries_in_roots(roots: &[PathBuf], entry_path: &str) -> Vec<String> {
+    let mut hits = Vec::new();
     for r in roots {
         // Directory layout: r/<entry_path>
         if r.is_dir() {
             let candidate = r.join(entry_path);
             if candidate.is_file() {
-                return Some(r.to_string_lossy().to_string());
+                hits.push(r.to_string_lossy().to_string());
             }
         } else if r.is_file() {
             // JAR layout — open and check the central directory.
@@ -1794,47 +1855,293 @@ fn find_entry_in_roots(roots: &[PathBuf], entry_path: &str) -> Option<String> {
                 Err(_) => continue,
             };
             if archive.by_name(entry_path).is_ok() {
-                return Some(r.to_string_lossy().to_string());
+                hits.push(r.to_string_lossy().to_string());
             }
         }
+    }
+    hits
+}
+
+/// Resolve a single resource entry against a list of roots (JARs or directories).
+/// `entry_path` must be slash-separated and relative (e.g.
+/// `org/example/Foo.class` or `META-INF/services/x`).  Returns the absolute path-string of
+/// the first JAR/dir that contains the entry, or None.
+fn find_entry_in_roots(roots: &[PathBuf], entry_path: &str) -> Option<String> {
+    find_entries_in_roots(roots, entry_path).into_iter().next()
+}
+
+/// Resources that are private to a JBoss module and must not fall back to the
+/// process-wide dynamic classpath. ServiceLoader descriptors name provider
+/// classes for a specific module; leaking another module's descriptor can make
+/// WildFly register the wrong extension under the current extension name.
+fn is_module_private_resource(entry_path: &str) -> bool {
+    let trimmed = entry_path.trim_start_matches('/');
+    trimmed.starts_with("META-INF/services/")
+        || trimmed == "META-INF/services"
+        || trimmed == "META-INF/services/"
+}
+
+/// Resource roots visible for `META-INF/services/*` lookups from a JBoss module.
+///
+/// Service descriptors are not ordinary class/resources visibility: a module sees
+/// its own descriptors plus dependencies that explicitly opt in with
+/// `services="import"` or `services="export"`. Walking the broader class
+/// visibility closure leaks unrelated WildFly extension providers into the active
+/// module and registers subsystems under the wrong extension name.
+fn module_service_roots(module_name: &str) -> Vec<PathBuf> {
+    let mut roots = Vec::new();
+    let Some(resolved) = ensure_resolved(module_name) else {
+        return roots;
+    };
+    roots.extend(resolved.resource_roots.iter().cloned());
+    for dep in &resolved.mx.dependencies {
+        if !matches!(dep.kind, crate::jboss_module_xml::DependencyKind::Module) {
+            continue;
+        }
+        if !matches!(
+            dep.services,
+            ServicesDisposition::Import | ServicesDisposition::Export
+        ) {
+            continue;
+        }
+        if let Some(dep_resolved) = ensure_resolved(&dep.name) {
+            roots.extend(dep_resolved.resource_roots.iter().cloned());
+        }
+    }
+    roots
+}
+
+fn read_entry_from_root(root: &Path, entry_path: &str) -> Option<Vec<u8>> {
+    use std::io::Read;
+    if root.is_dir() {
+        let candidate = root.join(entry_path);
+        if candidate.is_file() {
+            return std::fs::read(&candidate).ok();
+        }
+    } else if root.is_file() {
+        let f = std::fs::File::open(root).ok()?;
+        let mut archive = zip::ZipArchive::new(f).ok()?;
+        let mut entry = archive.by_name(entry_path).ok()?;
+        let mut buf = Vec::with_capacity(entry.size() as usize);
+        entry.read_to_end(&mut buf).ok()?;
+        return Some(buf);
     }
     None
 }
 
 /// Read entry bytes from `roots[0..]` matching `entry_path`.
 fn read_entry_from_roots(roots: &[PathBuf], entry_path: &str) -> Option<Vec<u8>> {
-    use std::io::Read;
     for r in roots {
-        if r.is_dir() {
-            let candidate = r.join(entry_path);
-            if candidate.is_file() {
-                return std::fs::read(&candidate).ok();
-            }
-        } else if r.is_file() {
-            let f = match std::fs::File::open(r) {
-                Ok(f) => f,
-                Err(_) => continue,
-            };
-            let mut archive = match zip::ZipArchive::new(f) {
-                Ok(a) => a,
-                Err(_) => continue,
-            };
-            let buf_opt = if let Ok(mut entry) = archive.by_name(entry_path) {
-                let mut buf = Vec::with_capacity(entry.size() as usize);
-                if entry.read_to_end(&mut buf).is_ok() {
-                    Some(buf)
-                } else {
-                    None
-                }
-            } else {
-                None
-            };
-            if let Some(buf) = buf_opt {
-                return Some(buf);
-            }
+        if let Some(buf) = read_entry_from_root(r, entry_path) {
+            return Some(buf);
         }
     }
     None
+}
+
+fn is_valid_module_service_provider_name(s: &str) -> bool {
+    !s.is_empty()
+        && s.chars()
+            .all(|c| c.is_alphanumeric() || c == '.' || c == '_' || c == '$')
+}
+
+fn parse_module_service_provider_lines(bytes: &[u8], out: &mut Vec<String>) {
+    let Ok(text) = std::str::from_utf8(bytes) else {
+        return;
+    };
+    for raw in text.lines() {
+        let token = raw.split('#').next().unwrap_or("").trim();
+        if is_valid_module_service_provider_name(token) {
+            out.push(token.to_string());
+        }
+    }
+}
+
+fn collect_module_service_provider_names(roots: &[PathBuf], entry_path: &str) -> Vec<String> {
+    let mut providers = Vec::new();
+    for root in roots {
+        if let Some(bytes) = read_entry_from_root(root, entry_path) {
+            parse_module_service_provider_lines(&bytes, &mut providers);
+        }
+    }
+    providers.sort();
+    providers.dedup();
+    providers
+}
+
+pub(crate) fn module_service_provider_names(module_name: &str, service_name: &str) -> Vec<String> {
+    let resource = format!("META-INF/services/{service_name}");
+    let roots = module_service_roots(module_name);
+    collect_module_service_provider_names(&roots, &resource)
+}
+
+fn alloc_initialized_array_list(ctx: &mut dyn NativeContext) -> Result<ObjectRef, MethodCallFailed> {
+    let al_cls = "java/util/ArrayList";
+    let al_cid = ctx.ensure_class_initialized(al_cls).map_err(|_| {
+        MethodCallFailed::InternalError(VmError::Internal {
+            message: "ArrayList: not loaded".to_string(),
+        })
+    })?;
+    let list = ctx.alloc_object(al_cid, ctx.class_num_total_fields(al_cid).max(4));
+    let list_pin = ctx.pin_native_root(list);
+    ctx.invoke(al_cls, "<init>", "()V", &[Value::Object(Some(list))])?;
+    let list = ctx.read_native_pin(list_pin, list);
+    ctx.unpin_native_roots(list_pin);
+    Ok(list)
+}
+
+fn jboss_services_diag_enabled() -> bool {
+    matches!(
+        std::env::var("CRATONVM_DIAG_JBOSS_SERVICES")
+            .or_else(|_| std::env::var("CRATONVM_DIAG_SERVICELOADER"))
+            .as_deref(),
+        Ok("1") | Ok("true") | Ok("yes")
+    )
+}
+
+fn module_find_services_load_class(
+    ctx: &mut dyn NativeContext,
+    loader: ObjectRef,
+    fqn: &str,
+) -> Option<ObjectRef> {
+    let name = ctx.create_string(fqn);
+    if let Ok(Some(Value::Object(Some(c)))) = ctx.invoke_virtual(
+        loader,
+        "loadClass",
+        "(Ljava/lang/String;)Ljava/lang/Class;",
+        &[Value::Object(Some(name))],
+    ) {
+        return Some(c);
+    }
+
+    let name = ctx.create_string(fqn);
+    if let Ok(Some(Value::Object(Some(c)))) = ctx.invoke(
+        "java/lang/Class",
+        "forName",
+        "(Ljava/lang/String;)Ljava/lang/Class;",
+        &[Value::Object(Some(name))],
+    ) {
+        return Some(c);
+    }
+
+    None
+}
+
+/// `Module.findServices(Class, Predicate, ClassLoader)`.
+///
+/// WildFly's Elytron provider loader uses this JBoss Modules API rather than
+/// `java.util.ServiceLoader` directly. The stock bytecode delegates to
+/// `org.jboss.modules.Utils.findServices`, whose real module graph/resource
+/// model is not present in CratonVM's synthetic module support. Implement the
+/// boundary natively by reading only the active module's own service
+/// descriptors plus dependencies marked `services="import"|"export"`.
+pub(crate) fn native_module_find_services(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    let service_class = match args.first() {
+        Some(Value::Object(Some(c))) => *c,
+        _ => {
+            return Err(RuntimeError::IllegalArgumentException {
+                message: "type is null".to_string(),
+            }
+            .into())
+        }
+    };
+    let _filter = match args.get(1) {
+        Some(Value::Object(Some(f))) => Some(*f),
+        _ => None,
+    };
+    let loader = match args.get(2) {
+        Some(Value::Object(Some(l))) => *l,
+        _ => {
+            return Err(RuntimeError::IllegalArgumentException {
+                message: "loader is null".to_string(),
+            }
+            .into())
+        }
+    };
+
+    let module_name = match module_name_of_mcl(ctx, loader) {
+        Some(name) => name,
+        None => {
+            return ctx.invoke(
+                "java/util/ServiceLoader",
+                "load",
+                "(Ljava/lang/Class;Ljava/lang/ClassLoader;)Ljava/util/ServiceLoader;",
+                &[Value::Object(Some(service_class)), Value::Object(Some(loader))],
+            )
+        }
+    };
+    let service_name_val = ctx.invoke(
+        "java/lang/Class",
+        "getName",
+        "()Ljava/lang/String;",
+        &[Value::Object(Some(service_class))],
+    )?;
+    let service_name = match service_name_val {
+        Some(Value::Object(Some(s))) => ctx.read_string(s).unwrap_or_default(),
+        _ => String::new(),
+    };
+    if service_name.is_empty() {
+        return Err(MethodCallFailed::InternalError(VmError::Internal {
+            message: "Module.findServices: service class has no name".to_string(),
+        }));
+    }
+
+    let providers = module_service_provider_names(&module_name, &service_name);
+    let diag = jboss_services_diag_enabled();
+    if diag {
+        eprintln!(
+            "[JBOSS-SVC] module={module_name} service={service_name} providers={providers:?}"
+        );
+    }
+
+    let mut list = alloc_initialized_array_list(ctx)?;
+    let list_pin = ctx.pin_native_root(list);
+    let loader_pin = ctx.pin_native_root(loader);
+    let mut added = 0usize;
+    for fqn in providers {
+        let loader_now = ctx.read_native_pin(loader_pin, loader);
+        let Some(class_mirror) = module_find_services_load_class(ctx, loader_now, &fqn) else {
+            if diag {
+                eprintln!("[JBOSS-SVC]   skip class-not-found {fqn}");
+            }
+            continue;
+        };
+        let Some(class_id) = ctx.class_id_from_mirror(class_mirror) else {
+            if diag {
+                eprintln!("[JBOSS-SVC]   skip non-class-mirror {fqn}");
+            }
+            continue;
+        };
+        let inst = match ctx.new_object_initialized_with_class_id(class_id, "()V", &[]) {
+            Ok(Some(Value::Object(Some(o)))) => o,
+            other => {
+                if diag {
+                    eprintln!("[JBOSS-SVC]   skip construct {fqn}: {other:?}");
+                }
+                continue;
+            }
+        };
+        list = ctx.read_native_pin(list_pin, list);
+        if let Err(e) = ctx.invoke(
+            "java/util/ArrayList",
+            "add",
+            "(Ljava/lang/Object;)Z",
+            &[Value::Object(Some(list)), Value::Object(Some(inst))],
+        ) {
+            ctx.unpin_native_roots(list_pin);
+            return Err(e);
+        }
+        added += 1;
+    }
+    list = ctx.read_native_pin(list_pin, list);
+    ctx.unpin_native_roots(list_pin);
+    if diag {
+        eprintln!("[JBOSS-SVC] module={module_name} service={service_name} added={added}");
+    }
+    Ok(Some(Value::Object(Some(list))))
 }
 
 // ===========================================================================
@@ -1978,7 +2285,7 @@ pub(crate) fn load_property_bridge_class(
 /// Resolve the Module name behind a ModuleClassLoader instance.
 ///
 /// MCL.slot(0) → Module backref → Module.slot(0) → String name.
-fn module_name_of_mcl(ctx: &dyn NativeContext, mcl: ObjectRef) -> Option<String> {
+pub(crate) fn module_name_of_mcl(ctx: &dyn NativeContext, mcl: ObjectRef) -> Option<String> {
     let module = match ctx.get_field(mcl, MCL_SLOT_MODULE) {
         Value::Object(Some(o)) => o,
         _ => return None,
@@ -2198,15 +2505,21 @@ pub(crate) fn native_module_classloader_get_resource(
         Some(n) => n,
         None => return Ok(Some(Value::Object(None))),
     };
-    let (_modules, roots) = module_visibility_closure(&module_name);
-    register_resource_roots(ctx, &roots);
+    let is_private = is_module_private_resource(&trimmed);
+    let roots = if is_private {
+        module_service_roots(&module_name)
+    } else {
+        let (_modules, roots) = module_visibility_closure(&module_name);
+        register_resource_roots(ctx, &roots);
+        roots
+    };
     let hit_root = match find_entry_in_roots(&roots, &trimmed) {
         Some(s) => s,
         None => {
             // Permit JDK / `java.*` resource lookups to fall through to
             // the parent (system) loader — same parent-first contract as
             // loadClass.  Returns null if the parent doesn't have it.
-            if ctx.find_resource(&trimmed).is_some() {
+            if !is_private && ctx.find_resource(&trimmed).is_some() {
                 let url = alloc_concurrent_synthetic(ctx, "java/net/URL", 6);
                 let full = ctx.create_string(&format!("classpath:/{trimmed}"));
                 ctx.set_field(url, 5, Value::Object(Some(full)));
@@ -2316,9 +2629,15 @@ pub(crate) fn native_module_classloader_find_resources(
 
     let mut urls: Vec<String> = Vec::new();
     if let Some(module_name) = module_name_of_mcl(ctx, this) {
-        let (_modules, roots) = module_visibility_closure(&module_name);
-        register_resource_roots(ctx, &roots);
-        if let Some(hit_root) = find_entry_in_roots(&roots, &trimmed) {
+        let is_private = is_module_private_resource(&trimmed);
+        let roots = if is_private {
+            module_service_roots(&module_name)
+        } else {
+            let (_modules, roots) = module_visibility_closure(&module_name);
+            register_resource_roots(ctx, &roots);
+            roots
+        };
+        for hit_root in find_entries_in_roots(&roots, &trimmed) {
             let url_string = if hit_root.ends_with(".jar") {
                 let path = hit_root.replace('\\', "/");
                 format!("jar:file:/{path}!/{trimmed}")
@@ -2331,7 +2650,7 @@ pub(crate) fn native_module_classloader_find_resources(
     }
     // Fall back to the system loader for `java.*` / boot resources so log4j's
     // property-file probe finds the same set the bootstrap loader sees.
-    if urls.is_empty() {
+    if urls.is_empty() && !is_module_private_resource(&trimmed) {
         let system_urls = ctx.find_all_resource_urls(&trimmed);
         urls.extend(system_urls);
     }
@@ -2373,8 +2692,19 @@ pub(crate) fn native_module_classloader_get_resource_as_stream(
 
     let bytes_opt = match module_name_of_mcl(ctx, this) {
         Some(module_name) => {
-            let (_modules, roots) = module_visibility_closure(&module_name);
-            read_entry_from_roots(&roots, &trimmed).or_else(|| ctx.find_resource(&trimmed))
+            let is_private = is_module_private_resource(&trimmed);
+            let roots = if is_private {
+                module_service_roots(&module_name)
+            } else {
+                let (_modules, roots) = module_visibility_closure(&module_name);
+                roots
+            };
+            let scoped = read_entry_from_roots(&roots, &trimmed);
+            if scoped.is_some() || is_private {
+                scoped
+            } else {
+                ctx.find_resource(&trimmed)
+            }
         }
         None => ctx.find_resource(&trimmed),
     };
@@ -2501,6 +2831,68 @@ pub(crate) fn native_boot_holder_priv_action_run(
     Ok(Some(Value::Object(Some(loader))))
 }
 
+
+fn module_name_arg(ctx: &mut dyn NativeContext, value: Option<&Value>) -> Option<String> {
+    match value {
+        Some(Value::Object(Some(s))) => {
+            if let Some(name) = ctx.read_string(*s) {
+                return Some(name);
+            }
+            match ctx.invoke_virtual(*s, "toString", "()Ljava/lang/String;", &[Value::Object(Some(*s))]) {
+                Ok(Some(Value::Object(Some(text)))) => ctx.read_string(text),
+                _ => None,
+            }
+        }
+        _ => None,
+    }
+}
+
+pub(crate) fn native_module_load_service_from_caller_module_loader(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    let module_name = match module_name_arg(ctx, args.first()) {
+        Some(name) if !name.is_empty() => name,
+        _ => {
+            return Err(RuntimeError::NullPointerException {
+                message: Some("Module.loadServiceFromCallerModuleLoader: module name is null".to_string()),
+            }
+            .into());
+        }
+    };
+    let service = match args.get(1) {
+        Some(Value::Object(Some(c))) => Value::Object(Some(*c)),
+        _ => {
+            return Err(RuntimeError::NullPointerException {
+                message: Some("Module.loadServiceFromCallerModuleLoader: service is null".to_string()),
+            }
+            .into());
+        }
+    };
+
+    let loader = build_local_module_loader(ctx);
+    let name_obj = ctx.create_string(&module_name);
+    let module_val = native_loader_load_module(
+        ctx,
+        &[Value::Object(Some(loader)), Value::Object(Some(name_obj))],
+    )?;
+    let module = match module_val {
+        Some(Value::Object(Some(m))) => m,
+        _ => return Err(throw_module_not_found(ctx, &module_name)),
+    };
+    let class_loader_val = native_module_get_class_loader(ctx, &[Value::Object(Some(module))])?;
+    let class_loader = match class_loader_val {
+        Some(Value::Object(Some(cl))) => cl,
+        _ => return Err(throw_module_not_found(ctx, &module_name)),
+    };
+    ctx.invoke(
+        "java/util/ServiceLoader",
+        "load",
+        "(Ljava/lang/Class;Ljava/lang/ClassLoader;)Ljava/util/ServiceLoader;",
+        &[service, Value::Object(Some(class_loader))],
+    )
+}
+
 /// Install every `LocalModuleLoader` / `Module` / `ModuleClassLoader`
 /// native this module owns.
 pub fn register_jboss_module_loader(registry: &mut NativeMethodRegistry) {
@@ -2547,6 +2939,31 @@ pub fn register_jboss_module_loader(registry: &mut NativeMethodRegistry) {
     }
 
     // Module surface.
+    // Static Module.loadServiceFromCallerModuleLoader(...) normally asks
+    // Module.forClass(caller) for the caller's JBoss module. CratonVM maps Java
+    // classes to java.lang.Module mirrors, not org.jboss.modules.Module objects,
+    // so the real bytecode throws a bare ModuleLoadException. Route directly
+    // through the synthetic boot loader instead.
+    registry.register(
+        CN_MODULE,
+        "loadServiceFromCallerModuleLoader",
+        "(Ljava/lang/String;Ljava/lang/Class;)Ljava/util/ServiceLoader;",
+        native_module_load_service_from_caller_module_loader,
+    );
+    registry.register(
+        CN_MODULE,
+        "loadServiceFromCallerModuleLoader",
+        "(Lorg/jboss/modules/ModuleIdentifier;Ljava/lang/Class;)Ljava/util/ServiceLoader;",
+        native_module_load_service_from_caller_module_loader,
+    );
+
+    registry.register(
+        CN_MODULE,
+        "findServices",
+        "(Ljava/lang/Class;Ljava/util/function/Predicate;Ljava/lang/ClassLoader;)Ljava/lang/Iterable;",
+        native_module_find_services,
+    );
+
     registry.register(
         CN_MODULE,
         "getName",
@@ -3005,6 +3422,18 @@ mod tests {
             Some(p) => std::env::set_var("CRATONVM_JBOSS_MP_ROOT", p),
             None => std::env::remove_var("CRATONVM_JBOSS_MP_ROOT"),
         }
+    }
+
+    /// WildFly domain launchers pass a multi-entry `-mp` where per-test
+    /// `added-modules` directories precede the real WildFly modules root.
+    /// The resolver must retain every entry, not only the first one.
+    #[test]
+    fn wf_domain_split_module_path_keeps_all_entries() {
+        let _g = TEST_LOCK.lock();
+        let sep = if cfg!(windows) { ';' } else { ':' };
+        let raw = format!("/tmp/added-one{sep}/tmp/added-two{sep}/opt/wildfly/modules");
+        let entries = split_module_path_entries(&raw);
+        assert_eq!(entries, vec!["/tmp/added-one", "/tmp/added-two", "/opt/wildfly/modules"]);
     }
 
     // -----------------------------------------------------------------
@@ -4066,6 +4495,55 @@ mod tests {
         );
     }
 
+
+    #[test]
+    fn t19_h16_service_roots_only_include_service_imports() {
+        let _g = TEST_LOCK.lock();
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let start_dir = root.join("start/main");
+
+        write(
+            &start_dir.join("module.xml"),
+            r#"<?xml version="1.0"?>
+<module name="start" xmlns="urn:jboss:module:1.9">
+  <resources><resource-root path="start.jar"/></resources>
+  <dependencies>
+    <module name="svc.imported" services="import"/>
+    <module name="svc.hidden"/>
+    <module name="svc.exported" services="export"/>
+  </dependencies>
+</module>
+"#,
+        );
+        write(&start_dir.join("start.jar"), "PK");
+        write_module_with_deps(root, "svc.imported", &["imported.jar"], &[]);
+        write_module_with_deps(root, "svc.hidden", &["hidden.jar"], &[]);
+        write_module_with_deps(root, "svc.exported", &["exported.jar"], &[]);
+        setup_test_env(root);
+
+        let roots = module_service_roots("start");
+        let names: Vec<String> = roots
+            .iter()
+            .map(|p| p.file_name().unwrap().to_string_lossy().into_owned())
+            .collect();
+        assert!(names.iter().any(|n| n == "start.jar"), "got {:?}", names);
+        assert!(
+            names.iter().any(|n| n == "imported.jar"),
+            "got {:?}",
+            names
+        );
+        assert!(
+            names.iter().any(|n| n == "exported.jar"),
+            "got {:?}",
+            names
+        );
+        assert!(
+            !names.iter().any(|n| n == "hidden.jar"),
+            "service roots must not include ordinary deps; got {:?}",
+            names
+        );
+    }
     /// RKC19/WF39 Task C — Sanity-check that the synthetic class bytes
     /// produced by `build_synthetic_class_with_main` start with the JVM
     /// class file magic and contain the expected method names.  The full

@@ -353,6 +353,19 @@ pub fn ensure_class_initialized_shared(
 
     let current_thread_id = thread.thread_id.0;
 
+    let class_state_name = if JvmThread::vm_state_diagnostics_enabled() {
+        Some(
+            shared
+                .class_manager
+                .read()
+                .get_class(class_id)
+                .map(|c| c.name.to_string())
+                .unwrap_or_else(|| format!("<unknown class {class_id}>")),
+        )
+    } else {
+        None
+    };
+
     loop {
         let (state, init_thread) = {
             let cm = shared.class_manager.read();
@@ -396,6 +409,9 @@ pub fn ensure_class_initialized_shared(
                 // completed."
                 let waiter = shared.class_init_waiters.lock().get(&class_id).cloned();
                 if let Some(pair) = waiter {
+                    if let Some(name) = &class_state_name {
+                        thread.set_vm_state(format!("class-init:wait:{name}"));
+                    }
                     let (lock, cvar) = &*pair;
                     // GC-safety (the H2 TestScript three-way STW deadlock):
                     // the initializing thread may be parked at a GC
@@ -446,6 +462,9 @@ pub fn ensure_class_initialized_shared(
 
             _ => {
                 // Atomically claim this class for initialization by this thread.
+                if let Some(name) = &class_state_name {
+                    thread.set_vm_state(format!("class-init:claim:{name}"));
+                }
                 // Use a write lock to prevent two threads from both entering
                 // initialize_class_shared (TOCTOU race).
                 let claimed = {
@@ -486,6 +505,9 @@ pub fn ensure_class_initialized_shared(
                     }
                 };
                 if claimed {
+                    if let Some(name) = &class_state_name {
+                        thread.set_vm_state(format!("class-init:initialize:{name}"));
+                    }
                     return initialize_class_shared(shared, thread, class_id);
                 }
                 // Another thread claimed it вЂ” loop back to wait

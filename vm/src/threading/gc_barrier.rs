@@ -136,6 +136,12 @@ impl GcBarrier {
         let blocked_u32 = u32::try_from(blocked).unwrap_or(u32::MAX);
         inner.expected = alive_count.saturating_sub(1).saturating_sub(blocked_u32);
         inner.arrived = 0;
+        if std::env::var_os("CRATONVM_DBG_STW_CENSUS").is_some() {
+            eprintln!(
+                "[stw-request] initiator={} alive={} blocked={} expected={}",
+                initiator.0, alive_count, blocked_u32, inner.expected
+            );
+        }
         // NOTE: do NOT clear `pointer_map` here. With generation-keyed waiting
         // (see `arrive_and_wait_inner`), a thread that arrived for the previous
         // generation may not read its remap map until after THIS `request_stw`
@@ -407,6 +413,12 @@ impl GcBarrier {
         // arrived and prematurely release `wait_for_all`.
         if participating {
             inner.arrived += 1;
+            if std::env::var_os("CRATONVM_DBG_STW_CENSUS").is_some() {
+                eprintln!(
+                    "[stw-arrive] tid={} gen={} arrived={} expected={}",
+                    tid.0, arrival_gen, inner.arrived, inner.expected
+                );
+            }
             if inner.arrived >= inner.expected {
                 self.all_arrived.notify_all();
             }

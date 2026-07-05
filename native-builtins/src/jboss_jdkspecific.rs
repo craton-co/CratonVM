@@ -277,9 +277,15 @@ fn build_package_set(ctx: &mut dyn NativeContext, packages: &[&str]) -> ObjectRe
 /// Build a synthetic Module for `name`, bound to the boot layer.
 fn build_module(ctx: &mut dyn NativeContext, name: &str, layer: ObjectRef) -> ObjectRef {
     let module = alloc_concurrent_synthetic(ctx, "java/lang/Module", MODULE_FIELD_COUNT);
+    let pin = ctx.pin_native_root(module);
     let name_str = ctx.create_string(name);
+    let module = ctx.read_native_pin(pin, module);
     ctx.set_field_by_name(module, "name", Value::Object(Some(name_str)));
     ctx.set_field_by_name(module, "layer", Value::Object(Some(layer)));
+    let desc = crate::build_synthetic_module_descriptor(ctx, name);
+    let module = ctx.read_native_pin(pin, module);
+    ctx.set_field_by_name(module, "descriptor", Value::Object(Some(desc)));
+    ctx.unpin_native_roots(pin);
     // Only `java.base` gets the full JDK package set; other synthetic
     // modules get an empty set (callers check `contains` before acting).
     // Recorded off-object in `module_packages_table` (see its doc comment)

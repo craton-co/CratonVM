@@ -65,6 +65,7 @@ pub fn is_enabled() -> bool {
 struct Entry {
     cb_ptr: usize,
     thread_id: u64,
+    os_tid: u64,
     enter_ms: u128,
     exit_ms: u128,
     generation: usize,
@@ -73,6 +74,7 @@ struct Entry {
 const EMPTY: Entry = Entry {
     cb_ptr: 0,
     thread_id: 0,
+    os_tid: 0,
     enter_ms: 0,
     exit_ms: 0,
     generation: 0,
@@ -208,6 +210,7 @@ pub fn record_enter(cb_ptr: usize) -> usize {
         return usize::MAX;
     }
     let tid = thread_id_u64();
+    let os_tid = os_thread_id_u64();
     let mut ring = RING.lock();
     let idx = ring.next;
     let mut generation = ring.next_generation & TOKEN_GENERATION_MASK;
@@ -219,6 +222,7 @@ pub fn record_enter(cb_ptr: usize) -> usize {
     ring.entries[idx] = Entry {
         cb_ptr,
         thread_id: tid,
+        os_tid,
         enter_ms: now_ms(),
         exit_ms: 0,
         generation,
@@ -346,7 +350,10 @@ pub fn dump_to_stderr() {
         } else {
             format!("{}ms", e.exit_ms.saturating_sub(e.enter_ms))
         };
-        eprintln!("  [{:02}] tid={} {} {}", i, e.thread_id, dur, name);
+        eprintln!(
+            "  [{:02}] tid={} os_tid={} {} {}",
+            i, e.thread_id, e.os_tid, dur, name
+        );
     }
     if !any {
         eprintln!("  (empty — no native methods recorded)");
@@ -363,6 +370,17 @@ fn thread_id_u64() -> u64 {
         static TID: u64 = NEXT_TID.fetch_add(1, Ordering::Relaxed);
     }
     TID.with(|t| *t)
+}
+
+#[cfg(target_os = "linux")]
+fn os_thread_id_u64() -> u64 {
+    // SAFETY: gettid has no preconditions and returns the calling kernel TID.
+    unsafe { libc::syscall(libc::SYS_gettid) as u64 }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn os_thread_id_u64() -> u64 {
+    thread_id_u64()
 }
 
 #[cfg(test)]

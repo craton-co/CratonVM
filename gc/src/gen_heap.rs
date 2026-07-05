@@ -1491,14 +1491,29 @@ impl GenerationalHeap {
             ObjectKind::Object | ObjectKind::Array => {}
             ObjectKind::HumongousFiller => return None,
         }
+        // Cheap structural sanity before trusting a conservative root
+        // candidate as an object header. These invariants are written by every
+        // allocator before publication; payload/interior words often satisfy
+        // the loose kind/slot checks below but fail one of these bytes.
+        if !header_reserved_fields_plausible(header) {
+            return None;
+        }
+
         // Cap num_slots at a sanity limit so a stale word can't fool us
         // into "validating" a slot count that would exceed the arena.
         // Multi-array reloc fix (2026-05-22): for arrays, `num_slots` is a
         // mirror of `array_length` (see `alloc_array` and `try_alloc_array`),
         // so a legitimate 256 MB int[] has num_slots = 2^26 > 1<<24 and
         // would be falsely rejected here. Bound num_slots only for non-arrays.
-        const MAX_PLAUSIBLE_SLOTS: u32 = 1 << 24; // 16M slots → 256 MB obj
+        const MAX_PLAUSIBLE_SLOTS: u32 = 1 << 24; // 16M slots -> 256 MB obj
         let is_array = matches!(header.kind, ObjectKind::Array);
+        let is_compact = !is_array && is_compact_object(header);
+        if is_array && header.gc_flags & GC_FLAG_COMPACT != 0 {
+            return None;
+        }
+        if !is_array && !is_compact && header.array_length != 0 {
+            return None;
+        }
         if !is_array && header.num_slots > MAX_PLAUSIBLE_SLOTS {
             return None;
         }
@@ -1509,6 +1524,7 @@ impl GenerationalHeap {
         if is_array && header.array_length > i32::MAX as u32 {
             return None;
         }
+
 
         // Family-A fix (2026-07-03): also validate the object's EXTENT against
         // the arena it claims to live in — the same hardening `mark_young`
@@ -1543,7 +1559,7 @@ impl GenerationalHeap {
                 Err(_) => None,
             }
         } else {
-            HEADER_SIZE.checked_add(header.num_slots as usize * SLOT_SIZE)
+            HEADER_SIZE.checked_add(object_body_size(header))
         };
         let Some(extent) = claimed_extent else {
             return None;

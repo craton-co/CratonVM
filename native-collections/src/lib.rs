@@ -516,7 +516,21 @@ fn alloc_synthetic(ctx: &mut dyn NativeContext, class_name: &str, num_fields: us
     // HashMap.keySet result) and surfaced as a swallowed
     // `NoSuchMethodError Object.iterator()`.
     let cid = match ctx.ensure_class_initialized(class_name) {
-        Ok(class_id) => class_id,
+        Ok(class_id) => {
+            let resolved_name = ctx.class_name_of_id(class_id).unwrap_or_default();
+            if resolved_name == class_name || class_name == "java/lang/Object" {
+                class_id
+            } else {
+                // Some class-loading fallbacks report success with the legacy
+                // java/lang/Object id. A named synthetic helper must keep its
+                // requested identity; otherwise field writes for that helper's
+                // layout land on Object's zero-slot layout.
+                match ctx.class_id_by_name(class_name) {
+                    Some(id) => id,
+                    None => ctx.ensure_synthetic_class(class_name, num_fields),
+                }
+            }
+        }
         Err(_) => match ctx.class_id_by_name(class_name) {
             Some(id) => id,
             // No real or already-registered class with this name. Previously
@@ -1219,6 +1233,12 @@ fn alloc_arraylist_with(ctx: &mut dyn NativeContext, buf: ObjectRef, init_size: 
     list
 }
 
+#[inline]
+fn is_bare_java_lang_object(ctx: &dyn NativeContext, obj: ObjectRef) -> bool {
+    ctx.object_num_fields(obj) == 0
+        && ctx.class_name_of_id(ctx.class_id_of_object(obj)).as_deref() == Some("java/lang/Object")
+}
+
 /// `true` iff `obj` actually has the `java.util.ArrayList` field layout, so
 /// reading `elementData`/`size` at the resolved slots is sound. Real
 /// `ArrayList`s (and subclasses, which inherit the layout) qualify; a known
@@ -1237,7 +1257,9 @@ fn al_is_arraylist_layout(ctx: &dyn NativeContext, obj: ObjectRef) -> bool {
             // Not an ArrayList: reject only when the class is known and named.
             match ctx.class_name_of_id(cid) {
                 None => true, // synthetic / unknown — lenient
-                Some(n) => n.is_empty() || n == "java/lang/Object",
+                Some(n) if n.is_empty() => true,
+                Some(n) if n == "java/lang/Object" => !is_bare_java_lang_object(ctx, obj),
+                Some(_) => false,
             }
         }
         None => true, // ArrayList not loaded (synthetic-jdk) — preserve old behavior
@@ -3090,6 +3112,11 @@ fn map_state(ctx: &dyn NativeContext, this: ObjectRef) -> (Option<ObjectRef>, i3
     // results. Reading map state from the backing is always correct because
     // every wrapper mutator throws — these are read-only callers.
     let this = unwrap_unmod(ctx, this);
+    let nf = ctx.object_num_fields(this);
+    if nf == 0 {
+        return (None, 0, MAP_DEFAULT_CAPACITY as i32);
+    }
+
     let buckets_slot0 = match ctx.get_field(this, MAP_FIELD_BUCKETS) {
         Value::Object(Some(arr)) => {
             if ctx.heap_kind_of(arr) == ObjectKind::Array {
@@ -3157,7 +3184,6 @@ fn map_state(ctx: &dyn NativeContext, this: ObjectRef) -> (Option<ObjectRef>, i3
     // receiver is out of bounds: the GC guard drops the read in-process, but it
     // fires on a hot path (SpEL `ReflectiveIndexAccessor` map indexing) and the
     // batch JVM eventually SIGSEGVs. Probe slot 2 only when the receiver has it.
-    let nf = ctx.object_num_fields(this);
     let size = match size_by_name {
         Some(Value::Int(s)) => s,
         _ => match ctx.get_field(this, MAP_FIELD_SIZE) {
@@ -4551,6 +4577,12 @@ fn native_map_put(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResu
         Some(Value::Object(Some(obj))) => *obj,
         _ => return Ok(Some(Value::Object(None))),
     };
+    if is_bare_java_lang_object(ctx, this) {
+        // Defensive interface-native guard: a java/util/Map.put dispatch on a
+        // plain Object must not synthesize a HashMap bucket layout onto a
+        // zero-field receiver.
+        return Ok(Some(Value::Object(None)));
+    }
     // If a generic `java/util/Map.put` interface native is dispatched on an
     // unmodifiable wrapper receiver, honour the JDK contract and throw rather
     // than mutating (or, worse, `map_resize`-clobbering) the private backing.
@@ -6971,31 +7003,43 @@ fn native_hs_iterator(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
             return Ok(Some(Value::Object(None)));
         }
     };
-    // Collect keys into a snapshot array (source iteration order for an
-    // insertion-ordered LinkedHashMap / sorted TreeMap view; bucket order
-    // otherwise).
+    // Collect once for the count, allocate, then re-collect from the live
+    // backing before storing. `alloc_ref_array` can trigger a moving GC; object
+    // refs held only in the Rust Vec from the first collection would otherwise
+    // go stale and surface as null/stale iterator elements during WildFly MSC
+    // state reporting.
+    let len = collect_view_snapshot_ordered(ctx, backing).len();
+    let backing_pin = ctx.pin_native_root(backing);
+    let keys_arr = alloc_ref_array(ctx, len);
+    let backing = ctx.read_native_pin(backing_pin, backing);
     let keys = collect_view_snapshot_ordered(ctx, backing);
+    ctx.unpin_native_roots(backing_pin);
+    let total = std::cmp::min(len, keys.len());
     if dbg_hs_itr() {
         eprintln!(
             "[HS-ITR-DBG] native_hs_iterator: collected {} keys from backing map {:?}",
-            keys.len(),
+            total,
             backing
         );
     }
-    let keys_arr = alloc_ref_array(ctx, keys.len());
-    for (i, k) in keys.iter().enumerate() {
+    for (i, k) in keys.iter().enumerate().take(total) {
         ctx.set_array_element(keys_arr, i, *k);
     }
+    let keys_arr_pin = ctx.pin_native_root(keys_arr);
+    let this_pin = ctx.pin_native_root(this);
     let itr = alloc_synthetic(ctx, "java/util/HashMap$KeyItr", MAP_KEY_ITR_NUM_FIELDS);
+    let keys_arr = ctx.read_native_pin(keys_arr_pin, keys_arr);
+    let this = ctx.read_native_pin(this_pin, this);
     ctx.set_field(itr, MAP_KEY_ITR_FIELD_KEYS, Value::Object(Some(keys_arr)));
     ctx.set_field(itr, MAP_KEY_ITR_FIELD_CURSOR, Value::Int(0));
-    ctx.set_field(itr, MAP_KEY_ITR_FIELD_TOTAL, Value::Int(keys.len() as i32));
+    ctx.set_field(itr, MAP_KEY_ITR_FIELD_TOTAL, Value::Int(total as i32));
     // Wire backing HashSet for Iterator.remove() — without this, JDK code
     // like MXBeanSupport.findMXBeanInterface (which iterates a HashSet and
     // calls it.remove() inside the loop) throws UnsupportedOperationException
     // because dispatch falls through to the default Iterator.remove().
     ctx.set_field(itr, MAP_KEY_ITR_FIELD_BACKING, Value::Object(Some(this)));
     ctx.set_field(itr, MAP_KEY_ITR_FIELD_LAST_RET, Value::Int(-1));
+    ctx.unpin_native_roots(keys_arr_pin);
     Ok(Some(Value::Object(Some(itr))))
 }
 

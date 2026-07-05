@@ -676,11 +676,417 @@ mod imp {
 #[cfg(windows)]
 pub use imp::{helper_window_pass, resume, take_over_pass};
 
+
+// ---------------------------------------------------------------------------
+// Linux x86-64 implementation (signal rendezvous)
+// ---------------------------------------------------------------------------
+
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+mod imp {
+    use super::*;
+    use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU8, AtomicUsize, Ordering};
+    use std::sync::Once;
+    use std::time::{Duration, Instant};
+
+    const TAKEOVER_SIGNAL: i32 = libc::SIGUSR2;
+    const MAX_SLOTS: usize = 512;
+    const MAX_RANGES: usize = 65_536;
+    const MAX_STACK_SCAN: usize = 8 * 1024 * 1024;
+    const REG_COUNT: usize = 17;
+
+    const STATE_EMPTY: u8 = 0;
+    const STATE_ARMED: u8 = 1;
+    const STATE_PARKED: u8 = 2;
+    const STATE_NOT_JIT: u8 = 3;
+    const STATE_DONE: u8 = 4;
+    const STATE_CANCELLED: u8 = 5;
+
+    struct LinuxSlot {
+        tid: AtomicU32,
+        state: AtomicU8,
+        resume: AtomicU8,
+        rip: AtomicUsize,
+        rsp: AtomicUsize,
+        regs: [AtomicUsize; REG_COUNT],
+    }
+
+    impl LinuxSlot {
+        const fn new() -> Self {
+            Self {
+                tid: AtomicU32::new(0),
+                state: AtomicU8::new(STATE_EMPTY),
+                resume: AtomicU8::new(0),
+                rip: AtomicUsize::new(0),
+                rsp: AtomicUsize::new(0),
+                regs: [const { AtomicUsize::new(0) }; REG_COUNT],
+            }
+        }
+
+        fn arm(&self, tid: u32) {
+            self.tid.store(tid, Ordering::Release);
+            self.resume.store(0, Ordering::Release);
+            self.rip.store(0, Ordering::Release);
+            self.rsp.store(0, Ordering::Release);
+            for reg in &self.regs {
+                reg.store(0, Ordering::Release);
+            }
+            self.state.store(STATE_ARMED, Ordering::Release);
+        }
+
+        fn clear(&self) {
+            self.resume.store(1, Ordering::Release);
+            self.rip.store(0, Ordering::Release);
+            self.rsp.store(0, Ordering::Release);
+            self.tid.store(0, Ordering::Release);
+            self.state.store(STATE_EMPTY, Ordering::Release);
+        }
+    }
+
+    struct AtomicRange {
+        lo: AtomicUsize,
+        hi: AtomicUsize,
+    }
+
+    impl AtomicRange {
+        const fn new() -> Self {
+            Self {
+                lo: AtomicUsize::new(0),
+                hi: AtomicUsize::new(0),
+            }
+        }
+    }
+
+    static INSTALL: Once = Once::new();
+    static ACTIVE: AtomicBool = AtomicBool::new(false);
+    static SLOTS: [LinuxSlot; MAX_SLOTS] = [const { LinuxSlot::new() }; MAX_SLOTS];
+    static RANGES: [AtomicRange; MAX_RANGES] = [const { AtomicRange::new() }; MAX_RANGES];
+    static RANGES_LEN: AtomicUsize = AtomicUsize::new(0);
+
+    #[inline]
+    fn gettid() -> u32 {
+        unsafe { libc::syscall(libc::SYS_gettid) as u32 }
+    }
+
+    #[inline]
+    fn publish_ranges(ranges: &[(usize, usize)]) {
+        let n = ranges.len().min(MAX_RANGES);
+        for (i, &(lo, hi)) in ranges.iter().take(n).enumerate() {
+            RANGES[i].lo.store(lo, Ordering::Release);
+            RANGES[i].hi.store(hi, Ordering::Release);
+        }
+        RANGES_LEN.store(n, Ordering::Release);
+        if dbg() && ranges.len() > MAX_RANGES {
+            eprintln!(
+                "[xt-jit-roots] linux range table capped: {} -> {} ranges",
+                ranges.len(),
+                MAX_RANGES
+            );
+        }
+    }
+
+    #[inline]
+    fn find_slot(tid: u32) -> Option<&'static LinuxSlot> {
+        SLOTS.iter().find(|slot| {
+            slot.tid.load(Ordering::Acquire) == tid
+                && slot.state.load(Ordering::Acquire) != STATE_EMPTY
+        })
+    }
+
+    fn arm_slot(tid: u32) -> Option<&'static LinuxSlot> {
+        for slot in &SLOTS {
+            if slot.state.load(Ordering::Acquire) == STATE_EMPTY {
+                slot.arm(tid);
+                return Some(slot);
+            }
+        }
+        None
+    }
+
+    unsafe extern "C" fn takeover_signal_handler(
+        _sig: i32,
+        _info: *mut libc::siginfo_t,
+        ucontext: *mut libc::c_void,
+    ) {
+        if !ACTIVE.load(Ordering::Acquire) || ucontext.is_null() {
+            return;
+        }
+        let tid = gettid();
+        let Some(slot) = find_slot(tid) else {
+            return;
+        };
+        if slot.state.load(Ordering::Acquire) != STATE_ARMED {
+            return;
+        }
+
+        let uc = &*(ucontext as *const libc::ucontext_t);
+        let g = &uc.uc_mcontext.gregs;
+        let read_reg = |idx: i32| -> usize { g[idx as usize] as usize };
+        let rip = read_reg(libc::REG_RIP);
+        let rsp = read_reg(libc::REG_RSP);
+
+        let mut in_jit = false;
+        let len = RANGES_LEN.load(Ordering::Acquire);
+        let mut i = 0usize;
+        while i < len {
+            let lo = RANGES[i].lo.load(Ordering::Acquire);
+            let hi = RANGES[i].hi.load(Ordering::Acquire);
+            if rip >= lo && rip < hi {
+                in_jit = true;
+                break;
+            }
+            i += 1;
+        }
+        if !in_jit {
+            slot.state.store(STATE_NOT_JIT, Ordering::Release);
+            return;
+        }
+
+        let regs = [
+            libc::REG_R8,
+            libc::REG_R9,
+            libc::REG_R10,
+            libc::REG_R11,
+            libc::REG_R12,
+            libc::REG_R13,
+            libc::REG_R14,
+            libc::REG_R15,
+            libc::REG_RDI,
+            libc::REG_RSI,
+            libc::REG_RBP,
+            libc::REG_RBX,
+            libc::REG_RDX,
+            libc::REG_RAX,
+            libc::REG_RCX,
+            libc::REG_RSP,
+            libc::REG_RIP,
+        ];
+        slot.rip.store(rip, Ordering::Release);
+        slot.rsp.store(rsp, Ordering::Release);
+        for (i, reg) in regs.iter().enumerate() {
+            slot.regs[i].store(read_reg(*reg), Ordering::Release);
+        }
+        slot.state.store(STATE_PARKED, Ordering::Release);
+
+        while slot.resume.load(Ordering::Acquire) == 0 && ACTIVE.load(Ordering::Acquire) {
+            core::hint::spin_loop();
+        }
+        slot.state.store(STATE_DONE, Ordering::Release);
+    }
+
+    fn install_handler() {
+        INSTALL.call_once(|| unsafe {
+            let mut sa: libc::sigaction = std::mem::zeroed();
+            sa.sa_flags = libc::SA_SIGINFO | libc::SA_RESTART;
+            sa.sa_sigaction = takeover_signal_handler as usize;
+            libc::sigemptyset(&mut sa.sa_mask);
+            let rc = libc::sigaction(TAKEOVER_SIGNAL, &sa, std::ptr::null_mut());
+            if rc != 0 {
+                eprintln!(
+                    "[xt-jit-roots] failed to install linux takeover signal handler: errno={}",
+                    *libc::__errno_location()
+                );
+            }
+        });
+    }
+
+    fn list_thread_tids() -> Vec<u32> {
+        let mut tids = Vec::new();
+        let Ok(entries) = std::fs::read_dir("/proc/self/task") else {
+            return tids;
+        };
+        for entry in entries.flatten() {
+            let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
+                continue;
+            };
+            if let Ok(tid) = name.parse::<u32>() {
+                tids.push(tid);
+            }
+        }
+        tids
+    }
+
+    fn send_takeover_signal(tid: u32) -> bool {
+        let rc = unsafe {
+            libc::syscall(
+                libc::SYS_tgkill,
+                libc::getpid(),
+                tid as libc::pid_t,
+                TAKEOVER_SIGNAL,
+            )
+        };
+        rc == 0
+    }
+
+    fn wait_for_response(slot: &LinuxSlot, timeout: Duration) -> u8 {
+        let start = Instant::now();
+        loop {
+            let state = slot.state.load(Ordering::Acquire);
+            if state != STATE_ARMED {
+                return state;
+            }
+            if start.elapsed() >= timeout {
+                slot.resume.store(1, Ordering::Release);
+                slot.state.store(STATE_CANCELLED, Ordering::Release);
+                return STATE_CANCELLED;
+            }
+            std::thread::yield_now();
+        }
+    }
+
+    fn readable_region_end(addr: usize) -> Option<usize> {
+        let maps = std::fs::read_to_string("/proc/self/maps").ok()?;
+        for line in maps.lines() {
+            let mut parts = line.split_whitespace();
+            let range = parts.next()?;
+            let perms = parts.next()?;
+            if !perms.starts_with('r') {
+                continue;
+            }
+            let (lo, hi) = range.split_once('-')?;
+            let lo = usize::from_str_radix(lo, 16).ok()?;
+            let hi = usize::from_str_radix(hi, 16).ok()?;
+            if addr >= lo && addr < hi {
+                return Some(hi.min(addr.saturating_add(MAX_STACK_SCAN)));
+            }
+        }
+        None
+    }
+
+    fn scan_slot<F>(slot: &LinuxSlot, is_obj: &F, roots: &mut Vec<ObjectRef>) -> usize
+    where
+        F: Fn(usize) -> Option<ObjectRef>,
+    {
+        let mut found = 0usize;
+        for reg in &slot.regs {
+            let v = reg.load(Ordering::Acquire);
+            if let Some(o) = is_obj(v) {
+                roots.push(o);
+                found += 1;
+            }
+        }
+
+        let rsp = slot.rsp.load(Ordering::Acquire);
+        if rsp == 0 || rsp & 0x7 != 0 {
+            return found;
+        }
+        let Some(end) = readable_region_end(rsp) else {
+            return found;
+        };
+        let mut p = rsp;
+        while p + 8 <= end {
+            let w = unsafe { (p as *const usize).read_unaligned() };
+            if let Some(o) = is_obj(w) {
+                roots.push(o);
+                found += 1;
+            }
+            p += 8;
+        }
+        found
+    }
+
+    /// Linux implementation of the cross-thread JIT root scan. We cannot use
+    /// Windows' SuspendThread/GetThreadContext primitives, so the collector sends
+    /// a private signal to peer threads. The handler only parks peers interrupted
+    /// inside registered JIT code; interpreter/native peers return immediately
+    /// and remain cooperative barrier participants.
+    pub fn take_over_pass<F>(taken: &mut TakenOver, is_obj: &F, roots: &mut Vec<ObjectRef>) -> usize
+    where
+        F: Fn(usize) -> Option<ObjectRef>,
+    {
+        install_handler();
+        let ranges = crate::jit::jit_code_ranges_snapshot();
+        if ranges.is_empty() {
+            return 0;
+        }
+        publish_ranges(&ranges);
+        ACTIVE.store(true, Ordering::Release);
+
+        let self_tid = gettid();
+        let mut newly = 0usize;
+        let mut examined = 0usize;
+        for tid in list_thread_tids() {
+            if tid == self_tid || taken.contains(tid) {
+                continue;
+            }
+            let Some(slot) = arm_slot(tid) else {
+                break;
+            };
+            examined += 1;
+            if !send_takeover_signal(tid) {
+                slot.clear();
+                continue;
+            }
+            match wait_for_response(slot, Duration::from_millis(20)) {
+                STATE_PARKED => {
+                    let found = scan_slot(slot, is_obj, roots);
+                    taken.handles.push(0);
+                    taken.tids.push(tid);
+                    newly += 1;
+                    XT_THREADS_TAKEN_OVER.fetch_add(1, Ordering::Relaxed);
+                    XT_ROOTS_FOUND.fetch_add(found as u64, Ordering::Relaxed);
+                    if dbg() {
+                        eprintln!(
+                            "[xt-jit-roots] linux took over tid={tid} rip=0x{:x}: {found} conservative roots",
+                            slot.rip.load(Ordering::Acquire)
+                        );
+                    }
+                }
+                _ => slot.clear(),
+            }
+        }
+        if taken.tids.is_empty() {
+            ACTIVE.store(false, Ordering::Release);
+            RANGES_LEN.store(0, Ordering::Release);
+        }
+        if dbg() {
+            eprintln!(
+                "[xt-jit-roots] linux pass: signaled {examined} peer(s), {newly} newly taken over; {} code ranges; any_thread_in_jit={} jit_gate={}",
+                ranges.len(),
+                crate::jit::conservative_roots::any_thread_in_jit(),
+                cratonvm_jit::xt_jit_root_scan_enabled(),
+            );
+        }
+        newly
+    }
+
+    pub fn resume(taken: TakenOver) {
+        for tid in taken.tids {
+            if let Some(slot) = find_slot(tid) {
+                slot.resume.store(1, Ordering::Release);
+                let start = Instant::now();
+                while slot.state.load(Ordering::Acquire) == STATE_PARKED
+                    && start.elapsed() < Duration::from_millis(100)
+                {
+                    std::thread::yield_now();
+                }
+                slot.clear();
+            }
+        }
+        ACTIVE.store(false, Ordering::Release);
+        RANGES_LEN.store(0, Ordering::Release);
+    }
+
+    pub fn helper_window_pass<F>(
+        _taken: &TakenOver,
+        _is_obj: &F,
+        _roots: &mut Vec<ObjectRef>,
+        _blocked_os_tids: &[u32],
+    ) -> (usize, usize)
+    where
+        F: Fn(usize) -> Option<ObjectRef>,
+    {
+        (0, 0)
+    }
+}
+
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+pub use imp::{helper_window_pass, resume, take_over_pass};
+
 // ---------------------------------------------------------------------------
 // Non-Windows stubs (the OS-suspend primitive is Windows-only here)
 // ---------------------------------------------------------------------------
 
-#[cfg(not(windows))]
+#[cfg(not(any(windows, all(target_os = "linux", target_arch = "x86_64"))))]
 pub fn take_over_pass<F>(_taken: &mut TakenOver, _is_obj: &F, _roots: &mut Vec<ObjectRef>) -> usize
 where
     F: Fn(usize) -> Option<ObjectRef>,
@@ -688,10 +1094,10 @@ where
     0
 }
 
-#[cfg(not(windows))]
+#[cfg(not(any(windows, all(target_os = "linux", target_arch = "x86_64"))))]
 pub fn resume(_taken: TakenOver) {}
 
-#[cfg(not(windows))]
+#[cfg(not(any(windows, all(target_os = "linux", target_arch = "x86_64"))))]
 pub fn helper_window_pass<F>(
     _taken: &TakenOver,
     _is_obj: &F,

@@ -562,6 +562,7 @@ version = "0.3.0"
 dependencies = [
  "cratonvm-types",
  "encoding_rs",
+ "libc",
  "native-tls",
  "parking_lot",
  "rustc-hash",

@@ -1455,14 +1455,272 @@ fn native_ihs_iter_next(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCa
             },
         )));
     }
-    let value = ctx.get_array_element(table, next_idx as usize);
-    // current = next; next++; hasNext = false
-    ctx.set_field_by_name(this, "current", Value::Int(next_idx));
-    ctx.set_field_by_name(this, "next", Value::Int(next_idx + 1));
+    let mut idx = next_idx;
+    while idx < len {
+        let value = ctx.get_array_element(table, idx as usize);
+        if !matches!(value, Value::Object(None)) {
+            // current = idx; next = idx + 1; hasNext = false
+            ctx.set_field_by_name(this, "current", Value::Int(idx));
+            ctx.set_field_by_name(this, "next", Value::Int(idx + 1));
+            ctx.set_field_by_name(this, "hasNext", Value::Int(0));
+            return Ok(Some(value));
+        }
+        idx += 1;
+    }
+    ctx.set_field_by_name(this, "next", Value::Int(len));
     ctx.set_field_by_name(this, "hasNext", Value::Int(0));
-    // Skip nulls between current and next call (best-effort) and keep
-    // expectedCount synced — the outer set may have shifted entries.
-    Ok(Some(value))
+    Err(MethodCallFailed::InternalError(VmError::Runtime(
+        RuntimeError::NoSuchElementException {
+            message: "IdentityHashSet iterator exhausted".to_string(),
+        },
+    )))
+}
+
+
+fn opt_obj_arg(args: &[Value], index: usize) -> Option<ObjectRef> {
+    match args.get(index) {
+        Some(Value::Object(Some(o))) => Some(*o),
+        _ => None,
+    }
+}
+
+fn copy_non_null_identity_hash_set(
+    ctx: &mut dyn NativeContext,
+    source: Option<ObjectRef>,
+    dest: Option<ObjectRef>,
+    label: &str,
+) -> Result<(usize, usize), MethodCallFailed> {
+    let (Some(source), Some(dest)) = (source, dest) else {
+        return Ok((0, 0));
+    };
+    let table = match ctx.get_field_by_name(source, "table") {
+        Value::Object(Some(t)) => t,
+        _ => return Ok((0, 0)),
+    };
+    let len = ctx.array_length(table);
+    let mut entries = Vec::new();
+    let mut skipped_null = 0usize;
+    for i in 0..len {
+        match ctx.get_array_element(table, i) {
+            Value::Object(Some(o)) => entries.push(o),
+            Value::Object(None) => skipped_null += 1,
+            _ => {}
+        }
+    }
+    if entries.is_empty() {
+        if msc_dbg() && skipped_null != 0 {
+            eprintln!("[msc] awaitStability copy {label}: skipped {skipped_null} null slots");
+        }
+        return Ok((0, skipped_null));
+    }
+
+    let base = ctx.pin_native_root(dest);
+    let handles: Vec<usize> = entries.iter().map(|o| ctx.pin_native_root(*o)).collect();
+    let mut dest_cur = dest;
+    for (entry, handle) in entries.iter().zip(handles.iter()) {
+        dest_cur = ctx.read_native_pin(base, dest_cur);
+        let entry_cur = ctx.read_native_pin(*handle, *entry);
+        if let Err(e) = ctx.invoke_virtual(
+            dest_cur,
+            "add",
+            "(Ljava/lang/Object;)Z",
+            &[Value::Object(Some(entry_cur))],
+        ) {
+            ctx.unpin_native_roots(base);
+            return Err(e);
+        }
+    }
+    ctx.unpin_native_roots(base);
+    if msc_dbg() {
+        eprintln!(
+            "[msc] awaitStability copy {label}: copied {} skipped_null={skipped_null}",
+            entries.len()
+        );
+    }
+    Ok((entries.len(), skipped_null))
+}
+
+fn time_unit_to_nanos(ctx: &mut dyn NativeContext, unit: ObjectRef, timeout: i64) -> i128 {
+    match ctx.invoke_virtual(unit, "toNanos", "(J)J", &[Value::Long(timeout)]) {
+        Ok(Some(Value::Long(nanos))) => nanos as i128,
+        _ => timeout.max(0) as i128 * 1_000_000,
+    }
+}
+
+
+fn remove_null_service_controller_from_set(
+    ctx: &mut dyn NativeContext,
+    dest: Option<ObjectRef>,
+    label: &str,
+) -> Result<(), MethodCallFailed> {
+    let Some(dest) = dest else {
+        return Ok(());
+    };
+    let removed = ctx.invoke_virtual(
+        dest,
+        "remove",
+        "(Ljava/lang/Object;)Z",
+        &[Value::Object(None)],
+    )?;
+    if msc_dbg() && matches!(removed, Some(Value::Int(v)) if v != 0) {
+        eprintln!("[msc] awaitStability copy {label}: removed impossible null controller");
+    }
+    Ok(())
+}
+
+fn await_stability_lock(ctx: &dyn NativeContext, this: ObjectRef) -> Option<ObjectRef> {
+    for field in ["lock", "stabilityLock"] {
+        if let Value::Object(Some(lock)) = ctx.get_field_by_name(this, field) {
+            return Some(lock);
+        }
+    }
+    None
+}
+
+fn native_service_container_await_stability_common(
+    ctx: &mut dyn NativeContext,
+    this: ObjectRef,
+    timeout_nanos: Option<i128>,
+    failed_dest: Option<ObjectRef>,
+    problems_dest: Option<ObjectRef>,
+) -> Result<bool, MethodCallFailed> {
+    let lock = match await_stability_lock(ctx, this) {
+        Some(lock) => lock,
+        None => return Ok(true),
+    };
+
+    let base = ctx.pin_native_root(this);
+    let lock_pin = ctx.pin_native_root(lock);
+    let failed_pin = failed_dest.map(|o| ctx.pin_native_root(o));
+    let problems_pin = problems_dest.map(|o| ctx.pin_native_root(o));
+
+    let mut remaining_nanos = timeout_nanos;
+    let mut stable = false;
+    let mut wait_error = None;
+
+    let mut lock_cur = ctx.read_native_pin(lock_pin, lock);
+    ctx.monitor_enter(lock_cur);
+    loop {
+        let this_cur = ctx.read_native_pin(base, this);
+        let unstable = match ctx.get_field_by_name(this_cur, "unstableServices") {
+            Value::Int(i) => i,
+            _ => 0,
+        };
+        if unstable == 0 {
+            stable = true;
+            break;
+        }
+
+        match remaining_nanos.as_mut() {
+            Some(remaining) => {
+                if *remaining <= 0 {
+                    break;
+                }
+                let wait_ms = ((*remaining + 999_999) / 1_000_000)
+                    .max(1)
+                    .min(u64::MAX as i128) as u64;
+                lock_cur = ctx.read_native_pin(lock_pin, lock_cur);
+                let before = Instant::now();
+                if let Err(e) = ctx.monitor_wait(lock_cur, Some(wait_ms)) {
+                    wait_error = Some(e);
+                    break;
+                }
+                let elapsed = before.elapsed().as_nanos() as i128;
+                *remaining = remaining.saturating_sub(elapsed);
+            }
+            None => {
+                lock_cur = ctx.read_native_pin(lock_pin, lock_cur);
+                if let Err(e) = ctx.monitor_wait(lock_cur, None) {
+                    wait_error = Some(e);
+                    break;
+                }
+            }
+        }
+    }
+    lock_cur = ctx.read_native_pin(lock_pin, lock_cur);
+    ctx.monitor_exit(lock_cur);
+
+    if let Some(e) = wait_error {
+        ctx.unpin_native_roots(base);
+        return Err(e);
+    }
+    if !stable {
+        ctx.unpin_native_roots(base);
+        return Ok(false);
+    }
+
+    let this_cur = ctx.read_native_pin(base, this);
+    let failed_source = match ctx.get_field_by_name(this_cur, "failed") {
+        Value::Object(Some(o)) => Some(o),
+        _ => None,
+    };
+    let failed_dest_cur = failed_pin.map(|h| ctx.read_native_pin(h, failed_dest.unwrap()));
+    let failed_copy = copy_non_null_identity_hash_set(ctx, failed_source, failed_dest_cur, "failed");
+    if let Err(e) = failed_copy {
+        ctx.unpin_native_roots(base);
+        return Err(e);
+    }
+    if let Err(e) = remove_null_service_controller_from_set(ctx, failed_dest_cur, "failed") {
+        ctx.unpin_native_roots(base);
+        return Err(e);
+    }
+
+    let this_cur = ctx.read_native_pin(base, this);
+    let problems_source = match ctx.get_field_by_name(this_cur, "problems") {
+        Value::Object(Some(o)) => Some(o),
+        _ => None,
+    };
+    let problems_dest_cur = problems_pin.map(|h| ctx.read_native_pin(h, problems_dest.unwrap()));
+    let problems_copy = copy_non_null_identity_hash_set(ctx, problems_source, problems_dest_cur, "problems");
+    if let Err(e) = problems_copy {
+        ctx.unpin_native_roots(base);
+        return Err(e);
+    }
+    let cleanup = remove_null_service_controller_from_set(ctx, problems_dest_cur, "problems");
+    ctx.unpin_native_roots(base);
+    cleanup.map(|_| true)
+}
+
+fn native_service_container_await_stability_sets(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    let this = obj_arg(args, 0)?;
+    let failed_dest = opt_obj_arg(args, 1);
+    let problems_dest = opt_obj_arg(args, 2);
+    match native_service_container_await_stability_common(ctx, this, None, failed_dest, problems_dest)
+    {
+        Ok(_) => Ok(None),
+        Err(e) => Err(e),
+    }
+}
+
+fn native_service_container_await_stability_timed(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    let this = obj_arg(args, 0)?;
+    let timeout = match args.get(1) {
+        Some(Value::Long(v)) => *v,
+        _ => 0,
+    };
+    let unit = opt_obj_arg(args, 2);
+    let failed_dest = opt_obj_arg(args, 3);
+    let problems_dest = opt_obj_arg(args, 4);
+    let timeout_nanos = unit
+        .map(|u| time_unit_to_nanos(ctx, u, timeout))
+        .unwrap_or_else(|| timeout.max(0) as i128 * 1_000_000);
+    match native_service_container_await_stability_common(
+        ctx,
+        this,
+        Some(timeout_nanos),
+        failed_dest,
+        problems_dest,
+    ) {
+        Ok(true) => Ok(Some(Value::Int(1))),
+        Ok(false) => Ok(Some(Value::Int(0))),
+        Err(e) => Err(e),
+    }
 }
 
 /// Bind an externally-allocated `ServiceController` Java object to a
@@ -2071,6 +2329,37 @@ pub fn register_jboss_msc_natives(r: &mut NativeMethodRegistry) {
         native_service_container_add_service,
     );
     r.register(cont, "shutdown", "()V", native_service_container_shutdown);
+    for stability_class in [
+        cont,
+        "org/jboss/msc/service/ServiceContainerImpl",
+        "org/jboss/msc/service/StabilityMonitor",
+    ] {
+        r.register(
+            stability_class,
+            "awaitStability",
+            "(Ljava/util/Set;Ljava/util/Set;)V",
+            native_service_container_await_stability_sets,
+        );
+        r.register(
+            stability_class,
+            "awaitStability",
+            "(JLjava/util/concurrent/TimeUnit;Ljava/util/Set;Ljava/util/Set;)Z",
+            native_service_container_await_stability_timed,
+        );
+    }
+    let stability_monitor = "org/jboss/msc/service/StabilityMonitor";
+    r.register(
+        stability_monitor,
+        "awaitStability",
+        "(Ljava/util/Set;Ljava/util/Set;Lorg/jboss/msc/service/StabilityStatistics;)V",
+        native_service_container_await_stability_sets,
+    );
+    r.register(
+        stability_monitor,
+        "awaitStability",
+        "(JLjava/util/concurrent/TimeUnit;Ljava/util/Set;Ljava/util/Set;Lorg/jboss/msc/service/StabilityStatistics;)Z",
+        native_service_container_await_stability_timed,
+    );
 
     let ctrl = "org/jboss/msc/service/ServiceController";
     r.register(
