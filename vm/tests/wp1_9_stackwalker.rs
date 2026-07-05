@@ -25,7 +25,9 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 const LOG4J_CALLER_PROBE: &str = "StackWalkerLog4jCallerProbe";
+const LOG4J_STRESS_PROBE: &str = "StackWalkerLog4jStressProbe";
 const LOG4J_CALLER_TIMEOUT: Duration = Duration::from_secs(45);
+const LOG4J_STRESS_TIMEOUT: Duration = Duration::from_secs(60);
 
 #[test]
 fn stack_trace_entry_carries_bci_and_line_number() {
@@ -241,20 +243,17 @@ fn java_home() -> Option<PathBuf> {
     None
 }
 
-fn classpath_dir() -> Option<PathBuf> {
+fn classpath_dir(probe: &str) -> Option<PathBuf> {
     if let Some(compiled) = option_env!("CRATONVM_TEST_CLASSES_DIR") {
         let p = PathBuf::from(compiled);
-        if p.join("cratonvm")
-            .join(format!("{LOG4J_CALLER_PROBE}.class"))
-            .exists()
-        {
+        if p.join("cratonvm").join(format!("{probe}.class")).exists() {
             return Some(p);
         }
     }
     let committed = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/resources");
     if committed
         .join("cratonvm")
-        .join(format!("{LOG4J_CALLER_PROBE}.class"))
+        .join(format!("{probe}.class"))
         .exists()
     {
         return Some(committed);
@@ -262,23 +261,20 @@ fn classpath_dir() -> Option<PathBuf> {
     None
 }
 
-#[test]
-fn stackwalker_log4j_shape_resolves_declaring_caller_under_jit() {
+fn run_stackwalker_probe(probe: &str, timeout: Duration) -> (String, String) {
     let Some(bin) = cratonvm_binary() else {
         eprintln!(
             "[wp1_9_stackwalker] cratonvm binary missing; build -p cratonvm-cli or set CRATONVM_BIN"
         );
-        return;
+        return (String::new(), String::new());
     };
     let Some(jh) = java_home() else {
         eprintln!("[wp1_9_stackwalker] JDK 25 java-home missing; skipping Log4j caller probe");
-        return;
+        return (String::new(), String::new());
     };
-    let Some(cp) = classpath_dir() else {
-        eprintln!(
-            "[wp1_9_stackwalker] {LOG4J_CALLER_PROBE}.class missing; javac likely unavailable"
-        );
-        return;
+    let Some(cp) = classpath_dir(probe) else {
+        eprintln!("[wp1_9_stackwalker] {probe}.class missing; javac likely unavailable");
+        return (String::new(), String::new());
     };
 
     let mut child = Command::new(&bin)
@@ -286,7 +282,7 @@ fn stackwalker_log4j_shape_resolves_declaring_caller_under_jit() {
         .arg(&jh)
         .arg("-c")
         .arg(&cp)
-        .arg(format!("cratonvm.{LOG4J_CALLER_PROBE}"))
+        .arg(format!("cratonvm.{probe}"))
         .env_remove("CRATONVM_DISABLE_JIT")
         .env("CRATONVM_JIT_ALLOW_PACKAGES", "cratonvm/")
         .env("CRATONVM_JIT_THRESHOLD", "1")
@@ -301,13 +297,13 @@ fn stackwalker_log4j_shape_resolves_declaring_caller_under_jit() {
         match child.try_wait() {
             Ok(Some(_)) => break,
             Ok(None) => {
-                if start.elapsed() > LOG4J_CALLER_TIMEOUT {
+                if start.elapsed() > timeout {
                     let _ = child.kill();
                     let _ = child.wait();
                     panic!(
-                        "[wp1_9_stackwalker] {LOG4J_CALLER_PROBE} timed out after \
-                         {LOG4J_CALLER_TIMEOUT:?}; StackWalker caller resolution may \
-                         be recursing"
+                        "[wp1_9_stackwalker] {probe} timed out after {timeout:?}; \
+                         StackWalker caller resolution may be recursing or cloning \
+                         transient traces excessively"
                     );
                 }
                 std::thread::sleep(Duration::from_millis(25));
@@ -324,12 +320,34 @@ fn stackwalker_log4j_shape_resolves_declaring_caller_under_jit() {
     let combined = format!("{stdout}\n{stderr}");
     assert!(
         output.status.success(),
-        "{LOG4J_CALLER_PROBE} exited with {:?}\n\n{combined}",
+        "{probe} exited with {:?}\n\n{combined}",
         output.status.code()
     );
+    (stdout, combined)
+}
+
+#[test]
+fn stackwalker_log4j_shape_resolves_declaring_caller_under_jit() {
+    let (stdout, combined) = run_stackwalker_probe(LOG4J_CALLER_PROBE, LOG4J_CALLER_TIMEOUT);
+    if stdout.is_empty() {
+        return;
+    }
     assert!(
         stdout.contains("caller=cratonvm.StackWalkerLog4jCallerProbe$LoggerFactory")
             && stdout.contains("STACKWALKER_LOG4J_CALLER_OK"),
         "{LOG4J_CALLER_PROBE} did not resolve the expected caller class\n\n{combined}"
+    );
+}
+
+#[test]
+fn stackwalker_log4j_deep_repeated_walks_finish_under_jit() {
+    let (stdout, combined) = run_stackwalker_probe(LOG4J_STRESS_PROBE, LOG4J_STRESS_TIMEOUT);
+    if stdout.is_empty() {
+        return;
+    }
+    assert!(
+        stdout.contains("caller=cratonvm.StackWalkerLog4jStressProbe$LoggerFactory")
+            && stdout.contains("STACKWALKER_LOG4J_STRESS_OK"),
+        "{LOG4J_STRESS_PROBE} did not complete the repeated deep walk stress\n\n{combined}"
     );
 }
