@@ -1,8 +1,8 @@
 # Spring `jmx.access` MXBean proxy: `getThreadInfo(long)` operation-signature mismatch
 
-**Status:** OPEN (narrow residual — the platform-MXBean registration gap and
-the `MXBeanMapping.toOpenValue`/`fromOpenValue` `AbstractMethodError` that
-this doc originally tracked are both FIXED and merged to dev).
+**Status:** FIXED (2026-07-05) - primitive JMX operation signatures now
+match `ThreadMXBean.getThreadInfo(long)`, and the real-JDK `ThreadImpl`
+native path returns a non-null `ThreadInfo` with a non-null stack trace.
 
 ## Symptom
 
@@ -56,8 +56,21 @@ CRATONVM_BIN=<built binary> SPRING=/data/cratonvm/apps/spring-framework \
   run --jdk real --jit on --batch 1 --only 'jmx\.access\.MBeanClientInterceptorTests'
 ```
 
-## Not yet investigated
+## Resolution
 
-- Where CratonVM builds the JMX operation signature (parameter type name
-  list) used for `MBeanServer.invoke()` dispatch matching, and whether it
-  mishandles primitive `long`/overloaded native methods.
+- `native-builtins/src/jmx_openmbean.rs` now builds `ConvertingMethod.paramMappings`
+  from the reflected Java parameter types so JMX operation signatures publish
+  `long`, `[J`, `long,int`, etc. instead of empty signatures.
+- Primitive and primitive-array parameter mappings keep the original `Class`
+  mirror as `openClass`, matching the names used by HotSpot dispatch.
+- `sun.management.ThreadImpl.getThreadInfo1([JI[ThreadInfo])` now populates
+  the output array with a minimal real `ThreadInfo` object, and Craton's
+  real-JDK current thread object exposes a positive `tid`.
+
+## Verification
+
+- Probe: `MBeanServer.invoke(..., signature=["long"])` returns
+  `java.lang.management.ThreadInfo`; `signature=["java.lang.Long"]` still
+  fails as expected.
+- Spring slice: `jmx.access.*MBeanClientInterceptorTests`, JIT real-JDK mode,
+  2 classes OK, 28/28 methods passed.

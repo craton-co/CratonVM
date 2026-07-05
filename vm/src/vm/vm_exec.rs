@@ -4507,11 +4507,10 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
                     .set_field(thread_obj, slot, Value::Object(Some(name_str)));
             }
             if let Some(slot) = tid_slot {
-                self.shared.heap.set_field(
-                    thread_obj,
-                    slot,
-                    Value::Long(self.thread.thread_id.0 as i64),
-                );
+                let tid = self.thread.thread_id.0.max(1);
+                self.shared
+                    .heap
+                    .set_field(thread_obj, slot, Value::Long(tid as i64));
             }
             if let Some(slot) = priority_slot {
                 // In JDK 19+ priority lives on FieldHolder, but older
