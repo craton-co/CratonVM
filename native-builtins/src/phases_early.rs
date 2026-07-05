@@ -15327,24 +15327,28 @@ pub(crate) fn register_phase54_net_extras(r: &mut NativeMethodRegistry) {
         ctx.set_field(url_obj, 0, Value::Object(Some(raw_obj)));
         Ok(Some(Value::Object(Some(url_obj))))
     });
+    // equals/hashCode: this registration (phase54, registered LAST — see the
+    // `register_phase54_natives` call site in lib.rs) wins over the identical
+    // pair in `net_phase_e.rs`, so it is the one actually in effect for
+    // real-JDK mode. Delegates to the shared `net_phase_e::uri_equals`/
+    // `uri_hash_code` helpers (component-wise, JDK-matching semantics —
+    // scheme/host compared case-insensitively, everything else exactly) —
+    // see their doc comments for why raw-string equality was wrong (it broke
+    // `UriComponentsTests::toUriWithIpv6HostAlreadyEncoded[WHAT_WG]`, whose
+    // WHATWG-canonicalized lowercase IPv6 host is still `URI.equals()` to the
+    // mixed-case original per real JDK's case-insensitive host comparison).
     r.register(uri, "equals", "(Ljava/lang/Object;)Z", |ctx, args| {
         let this = obj_arg(args, 0)?;
         if let Value::Object(Some(other)) = args[1] {
-            let str1 = crate::net_phase_e::uri_raw_string(ctx, this);
-            let str2 = crate::net_phase_e::uri_raw_string(ctx, other);
-            Ok(Some(Value::Int(if str1 == str2 { 1 } else { 0 })))
+            let eq = crate::net_phase_e::uri_equals(ctx, this, other);
+            Ok(Some(Value::Int(if eq { 1 } else { 0 })))
         } else {
             Ok(Some(Value::Int(0)))
         }
     });
     r.register(uri, "hashCode", "()I", |ctx, args| {
         let this = obj_arg(args, 0)?;
-        let text = crate::net_phase_e::uri_raw_string(ctx, this);
-        let mut hash: i32 = 0;
-        for ch in text.bytes() {
-            hash = hash.wrapping_mul(31).wrapping_add(ch as i32);
-        }
-        Ok(Some(Value::Int(hash)))
+        Ok(Some(Value::Int(crate::net_phase_e::uri_hash_code(ctx, this))))
     });
 
     // --- HttpURLConnection (10-field) ---

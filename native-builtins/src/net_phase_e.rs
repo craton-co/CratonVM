@@ -1139,6 +1139,141 @@ pub(crate) fn uri_raw_string(ctx: &dyn NativeContext, uri: ObjectRef) -> String 
     }
 }
 
+/// `java.net.URI.equals(Object)` — component-wise comparison, NOT raw-string
+/// equality. Real JDK (`java.net.URI.equals`, see `java.base/java/net/URI.java`)
+/// compares `scheme` and (for a server-based authority) `host`
+/// case-INsensitively; `fragment`, `path`, `query`, `userInfo`, `port`, and a
+/// registry-based `authority` are compared case-sensitively/exactly. Raw
+/// string equality (the previous implementation here and in
+/// `phases_early.rs`) collapses this into one exact-match test, which is only
+/// an approximation — it under-fires whenever two URIs differ solely by
+/// scheme/host case. That over-strictness is exactly what broke
+/// `UriComponentsTests::toUriWithIpv6HostAlreadyEncoded[WHAT_WG]`: the WHATWG
+/// URL Standard mandates lowercase IPv6 hosts in its canonical serialization
+/// (`WhatWgUrlParser$Ipv6Address.serialize`, `Integer.toHexString` is always
+/// lowercase), so `UriComponentsBuilder.fromUriString(..., WHAT_WG)` legitimately
+/// lowercases a mixed-case IPv6 host like `5ABC` to `5abc` — but real JDK's
+/// `URI.equals` still considers that URI equal to one with the original mixed
+/// case, because host comparison ignores case. Raw-string equality does not,
+/// so it reported the (correctly-lowercased) actual URI as unequal to the
+/// (intentionally mixed-case) expected URI in the test.
+pub(crate) fn uri_equals(ctx: &dyn NativeContext, a: ObjectRef, b: ObjectRef) -> bool {
+    if a == b {
+        return true;
+    }
+    let ra = uri_raw_string(ctx, a);
+    let rb = uri_raw_string(ctx, b);
+    if ra == rb {
+        return true; // fast path — identical raw text is trivially equal
+    }
+    let (a_scheme, a_auth, a_path, a_query, a_frag) = uri_split(&ra);
+    let (b_scheme, b_auth, b_path, b_query, b_frag) = uri_split(&rb);
+
+    if !opt_str_eq_ignore_case(&a_scheme, &b_scheme) {
+        return false;
+    }
+    if a_frag != b_frag {
+        return false;
+    }
+
+    let a_opaque = a_scheme.is_some() && a_auth.is_none() && !a_path.starts_with('/');
+    let b_opaque = b_scheme.is_some() && b_auth.is_none() && !b_path.starts_with('/');
+    if a_opaque != b_opaque {
+        return false;
+    }
+    if a_opaque {
+        // `a_path` holds the scheme-specific part in this case (see `uri_split`).
+        return a_path == b_path;
+    }
+
+    if a_path != b_path || a_query != b_query {
+        return false;
+    }
+
+    match (&a_auth, &b_auth) {
+        (None, None) => true,
+        (Some(aa), Some(ba)) => {
+            let (a_user, a_host, a_port) = uri_parse_authority(aa);
+            let (b_user, b_host, b_port) = uri_parse_authority(ba);
+            match (&a_host, &b_host) {
+                (Some(_), Some(_)) => {
+                    // Server-based authority: userInfo/port exact, host
+                    // case-insensitive (RFC 3986 §3.2.2 — host is
+                    // case-insensitive; this is the fix for the WHATWG
+                    // IPv6-casing case above).
+                    a_user == b_user
+                        && opt_str_eq_ignore_case(&a_host, &b_host)
+                        && a_port == b_port
+                }
+                // Registry-based (or unparsable) authority: compare the raw
+                // authority string exactly, matching JDK's fallback branch.
+                _ => aa == ba,
+            }
+        }
+        _ => false,
+    }
+}
+
+/// `java.net.URI.hashCode()` companion to [`uri_equals`] — MUST agree with it
+/// (equal objects must have equal hashes). Hashes scheme/host as lowercase so
+/// two URIs that `uri_equals` considers equal (differing only in scheme/host
+/// case) also hash the same, mirroring real JDK's `hashIgnoringCase`.
+pub(crate) fn uri_hash_code(ctx: &dyn NativeContext, uri: ObjectRef) -> i32 {
+    let raw = uri_raw_string(ctx, uri);
+    let (scheme, auth, path, query, frag) = uri_split(&raw);
+    let mut h: i32 = 0;
+    h = hash_str_ignore_case(h, scheme.as_deref());
+    h = hash_str(h, frag.as_deref());
+    let opaque = scheme.is_some() && auth.is_none() && !path.starts_with('/');
+    if opaque {
+        h = hash_str(h, Some(&path));
+        return h;
+    }
+    h = hash_str(h, Some(&path));
+    h = hash_str(h, query.as_deref());
+    match &auth {
+        Some(a) => {
+            let (user, host, port) = uri_parse_authority(a);
+            if host.is_some() {
+                h = hash_str(h, user.as_deref());
+                h = hash_str_ignore_case(h, host.as_deref());
+                h = h.wrapping_add(1949i32.wrapping_mul(port));
+            } else {
+                h = hash_str(h, Some(a));
+            }
+        }
+        None => {}
+    }
+    h
+}
+
+fn opt_str_eq_ignore_case(a: &Option<String>, b: &Option<String>) -> bool {
+    match (a, b) {
+        (None, None) => true,
+        (Some(x), Some(y)) => x.eq_ignore_ascii_case(y),
+        _ => false,
+    }
+}
+
+fn hash_str(h: i32, s: Option<&str>) -> i32 {
+    match s {
+        Some(s) => s
+            .bytes()
+            .fold(h, |acc, b| acc.wrapping_mul(31).wrapping_add(b as i32)),
+        None => h,
+    }
+}
+
+fn hash_str_ignore_case(h: i32, s: Option<&str>) -> i32 {
+    match s {
+        Some(s) => s.bytes().fold(h, |acc, b| {
+            acc.wrapping_mul(31)
+                .wrapping_add(b.to_ascii_lowercase() as i32)
+        }),
+        None => h,
+    }
+}
+
 /// Percent-decode a URI component the way `java.net.URI` getters do: each
 /// `%XX` triplet is one byte, the byte sequence is interpreted as UTF-8, and
 /// every other character (INCLUDING `+`, which URI leaves literal — unlike
@@ -1959,26 +2094,25 @@ fn register_uri_natives(r: &mut NativeMethodRegistry) {
         Ok(Some(Value::Int(0)))
     });
 
-    // equals(Object) → reference equality
+    // equals(Object) — see `uri_equals` doc comment: real JDK compares
+    // scheme/host case-insensitively, everything else case-sensitively; raw
+    // string equality over-fires on exactly that mismatch (e.g. WHATWG IPv6
+    // hosts, which the WHATWG URL Standard canonicalizes to lowercase).
     r.register(uri, "equals", "(Ljava/lang/Object;)Z", |ctx, args| {
         let this = obj_arg(args, 0)?;
         let other = match args.get(1) {
             Some(Value::Object(Some(o))) => *o,
             _ => return Ok(Some(Value::Int(0))),
         };
-        let a = uri_raw_string(ctx, this);
-        let b = uri_raw_string(ctx, other);
-        Ok(Some(Value::Int(if a == b { 1 } else { 0 })))
+        Ok(Some(Value::Int(if uri_equals(ctx, this, other) { 1 } else { 0 })))
     });
 
-    // hashCode() → hash of raw string
+    // hashCode() — must agree with `equals` (see `uri_hash_code`): hashing the
+    // raw string breaks the equals/hashCode contract for URIs that differ
+    // only by scheme/host case, since those compare equal.
     r.register(uri, "hashCode", "()I", |ctx, args| {
         let this = obj_arg(args, 0)?;
-        let raw = uri_raw_string(ctx, this);
-        let h = raw
-            .bytes()
-            .fold(0i32, |acc, b| acc.wrapping_mul(31).wrapping_add(b as i32));
-        Ok(Some(Value::Int(h)))
+        Ok(Some(Value::Int(uri_hash_code(ctx, this))))
     });
 
     // normalize() → RFC 3986 §5.2.4 remove-dot-segments on the PATH component
