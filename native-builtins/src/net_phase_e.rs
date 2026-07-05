@@ -4202,7 +4202,24 @@ fn register_re4_url_http(r: &mut NativeMethodRegistry) {
                 buf
             };
             buf
-        } else if let Some(rest) = url_str.strip_prefix("file:") {
+        } else if let Some(raw_rest) = url_str.strip_prefix("file:") {
+            // HotSpot's `sun.net.www.protocol.file.FileURLConnection` decodes
+            // the URL's raw (percent-escaped) file component via
+            // `ParseUtil.decode(url.getFile())` before touching the
+            // filesystem, so a `file:` URL like
+            // `file:/…/foo%20with%20spaces.css` (produced by
+            // `UrlResource`/`UriUtils.encodePath`) resolves to the file
+            // literally named "foo with spaces.css". We previously used the
+            // still-encoded `raw_rest`/`path` verbatim, so `std::fs::read`
+            // looked for a path containing a literal "%20" — always missing
+            // — and any caller expecting content (e.g.
+            // `ResourceHttpRequestHandlerIntegrationTests
+            // .classpathLocationWithEncodedPath`, `pathPrefix="/url"`) got an
+            // empty/404 response instead of the file's bytes. Decode once,
+            // up front, the same way URI handling elsewhere in this file
+            // does (`uri_percent_decode`).
+            let rest_owned = uri_percent_decode(raw_rest);
+            let rest = rest_owned.as_str();
             let path = rest.trim_start_matches('/');
             // On Windows, MSYS/Cygwin-style `/c/...` (URL `file:/c/...`)
             // needs the drive-letter colon reinjected: `c/foo` → `c:/foo`.
