@@ -8,6 +8,7 @@
 //! as ARGB u32 arrays regardless of the declared `ImageType`.
 
 use std::cell::Cell;
+use std::io::Cursor;
 use std::sync::OnceLock;
 
 use parking_lot::Mutex;
@@ -49,6 +50,35 @@ impl ImageType {
             self,
             ImageType::IntArgb | ImageType::IntArgbPre | ImageType::Byte4Abgr | ImageType::Custom
         )
+    }
+}
+
+/// Encoded image formats handled by the native `javax.imageio.ImageIO` bridge.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EncodedImageFormat {
+    Png,
+    Jpeg,
+}
+
+impl EncodedImageFormat {
+    pub fn parse(name: &str) -> Option<Self> {
+        match name
+            .trim()
+            .trim_start_matches("image/")
+            .to_ascii_lowercase()
+            .as_str()
+        {
+            "png" => Some(Self::Png),
+            "jpg" | "jpeg" => Some(Self::Jpeg),
+            _ => None,
+        }
+    }
+
+    fn image_format(self) -> image_crate::ImageFormat {
+        match self {
+            Self::Png => image_crate::ImageFormat::Png,
+            Self::Jpeg => image_crate::ImageFormat::Jpeg,
+        }
     }
 }
 
@@ -115,6 +145,93 @@ impl BufferedImageData {
             pixels,
             next_graphics_id: 1,
         })
+    }
+
+    /// Build an image from already-materialised ARGB pixels.
+    pub fn from_argb_pixels(
+        width: u32,
+        height: u32,
+        image_type: ImageType,
+        pixels: Vec<u32>,
+    ) -> Option<Self> {
+        let len = width.checked_mul(height)? as usize;
+        if len > MAX_IMAGE_PIXELS || pixels.len() != len {
+            return None;
+        }
+        Some(BufferedImageData {
+            image_type,
+            width,
+            height,
+            pixels,
+            next_graphics_id: 1,
+        })
+    }
+
+    /// Decode a PNG/JPEG byte stream into CratonVM's canonical ARGB raster.
+    pub fn decode_encoded(bytes: &[u8]) -> Result<Self, String> {
+        let decoded =
+            image_crate::load_from_memory(bytes).map_err(|err| format!("decode failed: {err}"))?;
+        let rgba = decoded.to_rgba8();
+        let (width, height) = rgba.dimensions();
+        let len = width
+            .checked_mul(height)
+            .ok_or_else(|| format!("decoded image dimensions overflow: {width}x{height}"))?
+            as usize;
+        let mut pixels = Vec::new();
+        pixels
+            .try_reserve_exact(len)
+            .map_err(|_| format!("decoded image too large: {width}x{height}"))?;
+        for px in rgba.pixels() {
+            let [r, g, b, a] = px.0;
+            pixels.push(((a as u32) << 24) | ((r as u32) << 16) | ((g as u32) << 8) | (b as u32));
+        }
+        Self::from_argb_pixels(width, height, ImageType::IntArgb, pixels)
+            .ok_or_else(|| format!("decoded image too large: {width}x{height}"))
+    }
+
+    /// Encode this raster as PNG/JPEG bytes.
+    pub fn encode(&self, format: EncodedImageFormat) -> Result<Vec<u8>, String> {
+        let mut out = Cursor::new(Vec::new());
+        match format {
+            EncodedImageFormat::Png => {
+                let mut rgba = Vec::with_capacity(self.pixels.len() * 4);
+                for &argb in &self.pixels {
+                    rgba.push(((argb >> 16) & 0xFF) as u8);
+                    rgba.push(((argb >> 8) & 0xFF) as u8);
+                    rgba.push((argb & 0xFF) as u8);
+                    rgba.push(((argb >> 24) & 0xFF) as u8);
+                }
+                let image = image_crate::RgbaImage::from_raw(self.width, self.height, rgba)
+                    .ok_or_else(|| {
+                        format!(
+                            "invalid RGBA image dimensions: {}x{}",
+                            self.width, self.height
+                        )
+                    })?;
+                image_crate::DynamicImage::ImageRgba8(image)
+                    .write_to(&mut out, format.image_format())
+                    .map_err(|err| format!("encode failed: {err}"))?;
+            }
+            EncodedImageFormat::Jpeg => {
+                let mut rgb = Vec::with_capacity(self.pixels.len() * 3);
+                for &argb in &self.pixels {
+                    rgb.push(((argb >> 16) & 0xFF) as u8);
+                    rgb.push(((argb >> 8) & 0xFF) as u8);
+                    rgb.push((argb & 0xFF) as u8);
+                }
+                let image = image_crate::RgbImage::from_raw(self.width, self.height, rgb)
+                    .ok_or_else(|| {
+                        format!(
+                            "invalid RGB image dimensions: {}x{}",
+                            self.width, self.height
+                        )
+                    })?;
+                image_crate::DynamicImage::ImageRgb8(image)
+                    .write_to(&mut out, format.image_format())
+                    .map_err(|err| format!("encode failed: {err}"))?;
+            }
+        }
+        Ok(out.into_inner())
     }
 
     // ── Accessors ────────────────────────────────────────────────────
@@ -730,6 +847,41 @@ mod tests {
         img2.set_rgb(0, 0, 0x11223344);
         assert_eq!(img.get_rgb(0, 0), 0xAABBCCDD);
         assert_eq!(img2.get_rgb(0, 0), 0x11223344);
+    }
+
+    #[test]
+    fn png_encode_decode_preserves_argb_pixels() {
+        let mut img = BufferedImageData::new(2, 2, ImageType::IntArgb);
+        img.set_rgb(0, 0, 0xFFFF_0000);
+        img.set_rgb(1, 0, 0xFF00_FF00);
+        img.set_rgb(0, 1, 0xFF00_00FF);
+        img.set_rgb(1, 1, 0x8040_3020);
+
+        let encoded = img.encode(EncodedImageFormat::Png).expect("encode png");
+        assert!(encoded.starts_with(b"\x89PNG"));
+
+        let decoded = BufferedImageData::decode_encoded(&encoded).expect("decode png");
+        assert_eq!(decoded.width(), 2);
+        assert_eq!(decoded.height(), 2);
+        assert_eq!(decoded.get_rgb(0, 0), 0xFFFF_0000);
+        assert_eq!(decoded.get_rgb(1, 0), 0xFF00_FF00);
+        assert_eq!(decoded.get_rgb(0, 1), 0xFF00_00FF);
+        assert_eq!(decoded.get_rgb(1, 1), 0x8040_3020);
+    }
+
+    #[test]
+    fn jpeg_encode_decode_round_trips_dimensions() {
+        let mut img = BufferedImageData::new(3, 2, ImageType::IntRgb);
+        img.set_rgb(0, 0, 0xFFFF_0000);
+        img.set_rgb(1, 0, 0xFF00_FF00);
+        img.set_rgb(2, 0, 0xFF00_00FF);
+
+        let encoded = img.encode(EncodedImageFormat::Jpeg).expect("encode jpeg");
+        assert!(encoded.starts_with(&[0xFF, 0xD8]));
+
+        let decoded = BufferedImageData::decode_encoded(&encoded).expect("decode jpeg");
+        assert_eq!(decoded.width(), 3);
+        assert_eq!(decoded.height(), 2);
     }
 
     // ── Registry tests ───────────────────────────────────────────────

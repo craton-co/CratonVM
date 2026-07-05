@@ -33,6 +33,8 @@
 //! fields) and return a sentinel anchor / count compatible with the
 //! real `AbstractStackWalker.Decoder` ring-buffer protocol.
 
+use std::rc::Rc;
+
 use cratonvm_native_api::{NativeContext, NativeMethodRegistry, StackTraceEntry};
 use cratonvm_types::error::MethodCallResult;
 use cratonvm_types::Value;
@@ -59,7 +61,7 @@ thread_local! {
     /// context-creation recursion → native-stack/value-stack corruption
     /// (Hibernate `ByteArrayMappingTests` SIGSEGV). Caching the clean list
     /// keeps every batch the user sees identical to HotSpot's.
-    static SW_FRAME_CACHE: std::cell::RefCell<Vec<Vec<StackTraceEntry>>> =
+    static SW_FRAME_CACHE: std::cell::RefCell<Vec<Rc<Vec<StackTraceEntry>>>> =
         const { std::cell::RefCell::new(Vec::new()) };
 }
 
@@ -321,7 +323,7 @@ pub(crate) fn native_call_stack_walk(
     let slack = buf_len.saturating_sub(start_index);
     let capacity = if batch == 0 { slack } else { slack.min(batch) };
 
-    let ordered = ordered_stack_walk_frames(&trace);
+    let ordered = Rc::new(ordered_stack_walk_frames(&trace));
     if std::env::var_os("CRATONVM_DEBUG_STACKWALK").is_some() {
         eprintln!("[SW-DBG] ordered len={}", ordered.len());
         for (i, e) in ordered.iter().enumerate() {
@@ -384,7 +386,7 @@ pub(crate) fn native_call_stack_walk(
         // thread paused deeper inside `doStackWalk`) indexes it instead of
         // re-capturing a polluted live stack. Pushed/popped as a stack to
         // tolerate nested walks (walks can re-enter during frame resolution).
-        SW_FRAME_CACHE.with(|c| c.borrow_mut().push(ordered.clone()));
+        SW_FRAME_CACHE.with(|c| c.borrow_mut().push(Rc::clone(&ordered)));
         let r = ctx.invoke(
             "java/lang/StackStreamFactory$AbstractStackWalker",
             "doStackWalk",
@@ -483,7 +485,7 @@ pub(crate) fn native_fetch_stack_frames(
         Some(o) => o,
         None => {
             let trace = ctx.capture_stack_trace(0);
-            ordered_stack_walk_frames(&trace)
+            Rc::new(ordered_stack_walk_frames(&trace))
         }
     };
     if std::env::var_os("CRATONVM_DEBUG_STACKWALK").is_some() {
@@ -504,9 +506,7 @@ pub(crate) fn native_fetch_stack_frames(
     // allocating `populate_sfi` loop and re-read the forwarded reference.
     let buf_pin = ctx.pin_native_root(buffer);
     let mut buffer = buffer;
-    let entries: Vec<cratonvm_native_api::StackTraceEntry> =
-        ordered.iter().skip(cursor).cloned().collect();
-    for entry in &entries {
+    for entry in ordered.iter().skip(cursor) {
         if written >= slack {
             break;
         }

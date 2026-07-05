@@ -16660,21 +16660,19 @@ fn execute_invoke_kind(
 
     if let Some(value) = result {
         let ret = crate::jit::return_type(&method_descriptor);
-        let value = if ret != b'V' {
-            coerce_value_for_return(value, ret)
-        } else {
-            value
-        };
-        // T18.K4 — tag-exact push for J/D fallback invoke return values.
-        push_invoke_return_value(&mut thread.frames[frame_idx].stack, value)?;
-        // Hypothesis (b): a `safe_native_call` reached via `invoke_shared`
-        // (recursive slow path) sets `thread.native_pending_return` on object
-        // returns but the clear-after-push helper is only invoked in the
-        // stackless dispatch arms. Once the value lives on the operand stack
-        // (or a local), the stale pinned reference can outlive a subsequent
-        // minor GC and re-surface in `update_root_snapshot`. Clear it here so
-        // every slow-path consumer mirrors the stackless invariant.
-        crate::vm::native_return_pushed_to_stack(shared, thread);
+        if ret != b'V' {
+            let value = coerce_value_for_return(value, ret);
+            // T18.K4 — tag-exact push for J/D fallback invoke return values.
+            push_invoke_return_value(&mut thread.frames[frame_idx].stack, value)?;
+            // Hypothesis (b): a `safe_native_call` reached via `invoke_shared`
+            // (recursive slow path) sets `thread.native_pending_return` on object
+            // returns but the clear-after-push helper is only invoked in the
+            // stackless dispatch arms. Once the value lives on the operand stack
+            // (or a local), the stale pinned reference can outlive a subsequent
+            // minor GC and re-surface in `update_root_snapshot`. Clear it here so
+            // every slow-path consumer mirrors the stackless invariant.
+            crate::vm::native_return_pushed_to_stack(shared, thread);
+        }
     }
 
     // Populate cache for future fast-path hits
@@ -18998,6 +18996,48 @@ fn force_native_over_real_jdk_bytecode(
     if class_name == "java/text/Normalizer" && matches!(method_name, "normalize" | "isNormalized") {
         return true;
     }
+    // java.awt.image.BufferedImage side-table raster. CratonVM stores pixels in
+    // native-awt's ARGB registry and stamps the Java object with an imageId;
+    // the real JDK methods expect populated Raster/ColorModel internals.
+    if class_name == "java/awt/image/BufferedImage"
+        && matches!(
+            (method_name, method_descriptor),
+            ("<init>", "(III)V")
+                | ("getWidth", "()I")
+                | ("getHeight", "()I")
+                | ("getRGB", "(II)I")
+                | ("setRGB", "(III)V")
+                | ("getType", "()I")
+                | ("createGraphics", "()Ljava/awt/Graphics2D;")
+                | ("flush", "()V")
+                | ("getRGB", "(IIII[III)[I")
+        )
+    {
+        return true;
+    }
+    // javax.imageio.ImageIO codec bridge. The real-JDK ImageIO SPI expects
+    // raster/color-model internals that CratonVM's memory-backed BufferedImage
+    // does not populate. Force the native bridge so Spring and desktop code can
+    // read/write the ARGB side-table image data through PNG/JPEG codecs.
+    if class_name == "javax/imageio/ImageIO"
+        && matches!(
+            (method_name, method_descriptor),
+            (
+                "read",
+                "(Ljava/io/InputStream;)Ljava/awt/image/BufferedImage;"
+            ) | ("read", "(Ljava/io/File;)Ljava/awt/image/BufferedImage;")
+                | (
+                    "write",
+                    "(Ljava/awt/image/RenderedImage;Ljava/lang/String;Ljava/io/OutputStream;)Z"
+                )
+                | (
+                    "write",
+                    "(Ljava/awt/image/RenderedImage;Ljava/lang/String;Ljava/io/File;)Z"
+                )
+        )
+    {
+        return true;
+    }
     // SBR-02 / bug-03: fast native regex. The real-JDK `String.replaceAll` /
     // `replaceFirst` / `matches` bodies run `Pattern.compile(...).matcher(...)`
     // in the interpreter (java.util.regex), which is 30–600× slower than
@@ -19532,7 +19572,7 @@ fn intercept_force_registered_native(
     let ret_type = crate::jit::return_type(method_descriptor);
     Some((|| {
         let result = crate::vm::safe_native_call(shared, thread, cb, args)?;
-        if let Some(value) = result {
+        if let Some(value) = result.filter(|_| ret_type != b'V') {
             push_invoke_return_value(
                 &mut thread.frames[frame_idx].stack,
                 coerce_value_for_return(value, ret_type),
@@ -19757,7 +19797,7 @@ fn try_stackless_invoke(
                 .find("java/lang/reflect/Method", method_name, descriptor)
         {
             let result = safe_native_call(shared, thread, callback, args)?;
-            if let Some(value) = result {
+            if let Some(value) = result.filter(|_| ret_type != b'V') {
                 push_invoke_return_value(
                     &mut thread.frames[frame_idx].stack,
                     coerce_value_for_return(value, ret_type),
