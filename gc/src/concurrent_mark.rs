@@ -26,7 +26,8 @@ use std::sync::Arc;
 use parking_lot::Mutex;
 
 use crate::heap::{
-    ArrayElementType, ObjectHeader, ObjectKind, HEADER_SIZE, REF_ELEMENT_SIZE, SLOT_SIZE,
+    array_data_size, ArrayElementType, ObjectHeader, ObjectKind, HEADER_SIZE, REF_ELEMENT_SIZE,
+    SLOT_SIZE,
 };
 use crate::mark_bitmap::MarkBitmap;
 use crate::old_gen::OldGen;
@@ -478,7 +479,11 @@ impl ConcurrentMarker {
         let mut scanned = 0;
 
         while let Some(obj_ptr) = self.queue.pop() {
-            self.scan_object(obj_ptr, old_gen);
+            if !self.scan_object(obj_ptr, old_gen) {
+                self.mark_all_old_gen(old_gen);
+                self.queue.clear();
+                break;
+            }
             scanned += 1;
         }
 
@@ -593,7 +598,11 @@ impl ConcurrentMarker {
 
         // Drain the queue fully (mark transitive closure).
         while let Some(obj_ptr) = self.queue.pop() {
-            self.scan_object(obj_ptr, old_gen);
+            if !self.scan_object(obj_ptr, old_gen) {
+                self.mark_all_old_gen(old_gen);
+                self.queue.clear();
+                return discovered;
+            }
             discovered += 1;
         }
 
@@ -635,13 +644,21 @@ impl ConcurrentMarker {
                 if self.bitmap.is_marked(obj_ptr as usize) {
                     // Already gray/black: re-scan its outgoing refs to
                     // pick up children we may have dropped.
-                    self.scan_object(obj_ptr, old_gen);
+                    if !self.scan_object(obj_ptr, old_gen) {
+                        self.mark_all_old_gen(old_gen);
+                        self.queue.clear();
+                        return discovered;
+                    }
                     discovered += 1;
                 }
             }
             // Drain anything the rescan re-enqueued.
             while let Some(obj_ptr) = self.queue.pop() {
-                self.scan_object(obj_ptr, old_gen);
+                if !self.scan_object(obj_ptr, old_gen) {
+                    self.mark_all_old_gen(old_gen);
+                    self.queue.clear();
+                    return discovered;
+                }
                 discovered += 1;
             }
         }
@@ -679,12 +696,56 @@ impl ConcurrentMarker {
         freed_count
     }
 
+    fn mark_all_old_gen(&self, old_gen: &OldGen) -> usize {
+        let mut marked = 0;
+        for (obj_ptr, _size) in old_gen.walk_objects() {
+            if self.bitmap.try_mark(obj_ptr as usize) {
+                marked += 1;
+            }
+        }
+        marked
+    }
+
     /// Scan an object's reference fields and mark any old-gen targets.
-    fn scan_object(&self, obj_ptr: *mut u8, old_gen: &OldGen) {
+    ///
+    /// Returns `false` when the queued pointer names an object with an
+    /// inconsistent or implausible header. Callers respond by marking every
+    /// old-gen object for this cycle, retaining garbage rather than under-marking
+    /// live objects or dereferencing a bogus field extent.
+    fn scan_object(&self, obj_ptr: *mut u8, old_gen: &OldGen) -> bool {
         // SAFETY: obj_ptr was popped from the mark queue, which only contains
         // pointers to valid old-gen objects verified by old_gen.contains() before
         // being enqueued. The header is readable for the lifetime of the GC cycle.
         let header = unsafe { &*(obj_ptr as *const ObjectHeader) };
+        let Some(total_size) = concurrent_mark_object_size(header) else {
+            tracing::warn!(
+                "concurrent mark: skipping object at {:p} with inconsistent header \
+                 (kind={:?}, class_id={}, array_length={}, num_slots={}); marking all old-gen \
+                 objects for this cycle",
+                obj_ptr,
+                header.kind,
+                header.class_id.as_u32(),
+                header.array_length,
+                header.num_slots,
+            );
+            return false;
+        };
+        if total_size < HEADER_SIZE
+            || !old_gen.contains(unsafe { obj_ptr.add(total_size.saturating_sub(1)) })
+        {
+            tracing::warn!(
+                "concurrent mark: skipping object at {:p} with implausible extent {} \
+                 (kind={:?}, class_id={}, array_length={}, num_slots={}); marking all old-gen \
+                 objects for this cycle",
+                obj_ptr,
+                total_size,
+                header.kind,
+                header.class_id.as_u32(),
+                header.array_length,
+                header.num_slots,
+            );
+            return false;
+        }
 
         if header.kind == ObjectKind::Array {
             if header.element_type == ArrayElementType::Reference {
@@ -784,6 +845,7 @@ impl ConcurrentMarker {
                 }
             }
         }
+        true
     }
 
     /// Run all four phases of a concurrent GC cycle.
@@ -799,6 +861,23 @@ impl ConcurrentMarker {
         let swept = self.concurrent_sweep(old_gen);
         (initial + concurrent + remark, swept)
     }
+}
+
+fn concurrent_mark_object_size(header: &ObjectHeader) -> Option<usize> {
+    if header.kind == ObjectKind::Array {
+        let data_size = array_data_size(header.array_length as usize, header.element_type).ok()?;
+        return HEADER_SIZE.checked_add(data_size);
+    }
+
+    if let Some((_layout, body)) = crate::heap::compact_oop_scan(header) {
+        return HEADER_SIZE.checked_add(body);
+    }
+
+    if header.array_length != 0 || header.num_slots > (1 << 24) {
+        return None;
+    }
+    let fields_size = (header.num_slots as usize).checked_mul(SLOT_SIZE)?;
+    HEADER_SIZE.checked_add(fields_size)
 }
 
 impl std::fmt::Debug for ConcurrentMarker {
@@ -836,6 +915,25 @@ mod tests {
             header.gc_flags = 0x01; // GC_FLAG_OLD_GEN
         }
         (og, ptr)
+    }
+
+    #[test]
+    fn concurrent_mark_object_size_rejects_inconsistent_object_header() {
+        let mut header = ObjectHeader::new(
+            ClassId::new(240),
+            ObjectKind::Object,
+            ArrayElementType::Reference,
+            1,
+            0,
+            2,
+        );
+        assert_eq!(
+            concurrent_mark_object_size(&header),
+            Some(HEADER_SIZE + 2 * SLOT_SIZE)
+        );
+
+        header.array_length = 258;
+        assert_eq!(concurrent_mark_object_size(&header), None);
     }
 
     #[test]
