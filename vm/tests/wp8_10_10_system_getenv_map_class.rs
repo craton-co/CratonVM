@@ -1,93 +1,130 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2024-2026 Craton Software Company
 
-//! WP8.10.10 — `System.getenv()` regression: ensure the returned Map carries
-//! a real `java/util/HashMap` class_id so virtual dispatch on
-//! `Map.get(key)` resolves to the registered native instead of bottoming
-//! out at `java/lang/Object`.
+//! WP8.10.10 -- `System.getenv()` regression: ensure the returned Map is the
+//! OpenJDK-shaped unmodifiable wrapper whose private backing field `m` points
+//! at a real `java/util/HashMap`.
 //!
-//! Pre-fix the `native_system_getenv_all` helper allocated the backing
-//! object with `ClassId::new(0)`. The dispatcher's stale-pointer detector
-//! (header-bytes==0) reads a non-zero header (identity hash + kind=Object)
-//! and falls through to "Genuinely java.lang.Object", which then routes
-//! `Map.get(key)` invokeinterface dispatch to `java/lang/Object`. Since
-//! `Object` declares no `get(Object)Object` method, the slow path emits
-//! `WARN NoSuchMethodError method="java/lang/Object.get(Object)Object"` —
-//! observed during KC16 boot inside
-//! `org.jboss.as.server.ServerEnvironment.configureQualifiedHostName`
-//! against the `WildFlySecurityManager.getSystemEnvironmentPrivileged()`
-//! Map (Session 95 live status).
-//!
-//! Acceptance:
-//! 1. `System.getenv()` returns a non-null reference.
-//! 2. The returned object's `class_id_of` resolves to a class whose name
-//!    is `java/util/HashMap` (so virtual dispatch finds the registered
-//!    `HashMap.get(Object)Object` native).
-//! 3. The `java/util/HashMap` native registry contains a
-//!    `get(Object)Object` entry — sanity-check that the dispatch target
-//!    actually exists on the class we now allocate against.
+//! The wrapper preserves the prior HashMap-dispatch fix because all map reads
+//! delegate to the backing map, while also matching libraries such as System
+//! Rules that reflect on `System.getenv().getClass().getDeclaredField("m")`.
 
+use cratonvm_native_api::NativeContext;
 use cratonvm_vm::config::VmConfig;
 use cratonvm_vm::types::Value;
 use cratonvm_vm::vm::{NativeContextImpl, Vm};
 
-/// Pin the WP8.10.10 fix: `System.getenv()` returns a Map whose
-/// `class_id_of` resolves to a real, named class (`java/util/HashMap`),
-/// not the all-zero `ClassId(0)` that the dispatcher reads as
-/// `java/lang/Object`.
-///
-/// Pre-fix the returned object had `class_id == 0`. The dispatcher's
-/// stale-pointer detector saw a non-zero header (identity hash etc.)
-/// and fell through to the "Genuinely java.lang.Object" branch, which
-/// then routed `Map.get(key)` invokeinterface dispatch to
-/// `java/lang/Object`. Since `Object` declares no
-/// `get(Object)Object` method, the slow path emitted
-/// `WARN NoSuchMethodError method="java/lang/Object.get(Object)Object"`,
-/// observed in KC16 boot under
-/// `org.jboss.as.server.ServerEnvironment.configureQualifiedHostName`.
 #[test]
-fn system_getenv_returns_hashmap_typed_object() {
+fn system_getenv_returns_unmodifiable_map_with_hashmap_backing() {
     let mut vm = Vm::new(VmConfig::default());
 
-    let cb = vm
+    let getenv = vm
         .shared
         .native_methods
         .find("java/lang/System", "getenv", "()Ljava/util/Map;")
         .expect("System.getenv()Map must be registered");
+    let object_get_class = vm
+        .shared
+        .native_methods
+        .find("java/lang/Object", "getClass", "()Ljava/lang/Class;")
+        .expect("Object.getClass must be registered");
+    let class_get_name = vm
+        .shared
+        .native_methods
+        .find("java/lang/Class", "getName", "()Ljava/lang/String;")
+        .expect("Class.getName must be registered");
 
-    let map_ref = {
-        let mut ctx = NativeContextImpl {
-            shared: &vm.shared,
-            thread: &mut vm.main_thread,
-        };
-        let r = cb(&mut ctx, &[]).expect("getenv must not error");
-        match r {
-            Some(Value::Object(Some(o))) => o,
-            other => panic!("System.getenv() must return non-null Map, got {other:?}"),
-        }
+    let mut ctx = NativeContextImpl {
+        shared: &vm.shared,
+        thread: &mut vm.main_thread,
     };
 
-    let class_id = vm.shared.heap.class_id_of(map_ref);
-    assert_ne!(
-        class_id.as_u32(),
-        0,
-        "WP8.10.10: System.getenv()'s Map must NOT carry ClassId(0). \
-         A zero class_id makes the dispatcher resolve `Map.get(key)` \
-         to `java/lang/Object`, which has no `get(Object)Object` \
-         method — surfaces as `NoSuchMethodError` during KC16 boot."
-    );
+    let map_ref = match getenv(&mut ctx, &[]).expect("getenv must not error") {
+        Some(Value::Object(Some(o))) => o,
+        other => panic!("System.getenv() must return non-null Map, got {other:?}"),
+    };
 
-    let class_name = {
-        let cm = vm.shared.class_manager.read();
-        cm.get_class(class_id)
-            .map(|c| c.name.to_string())
-            .unwrap_or_default()
+    let map_class = match object_get_class(&mut ctx, &[Value::Object(Some(map_ref))])
+        .expect("Object.getClass must not error")
+    {
+        Some(Value::Object(Some(o))) => o,
+        other => panic!("System.getenv().getClass() returned {other:?}"),
+    };
+    let class_name_obj = match class_get_name(&mut ctx, &[Value::Object(Some(map_class))])
+        .expect("Class.getName must not error")
+    {
+        Some(Value::Object(Some(o))) => o,
+        other => panic!("Class.getName returned {other:?}"),
     };
     assert_eq!(
-        class_name, "java/util/HashMap",
-        "WP8.10.10: System.getenv()'s Map should be tagged with the \
-         real java/util/HashMap class_id so virtual dispatch on \
-         `Map.get(key)` lands on HashMap (real-JDK bytecode or \
-         registered native), not on `java/lang/Object`. Got {class_name:?}."
+        ctx.read_string(class_name_obj).as_deref(),
+        Some("java.util.Collections$UnmodifiableMap"),
+        "System.getenv() should report the same wrapper class shape as HotSpot"
     );
+
+    let m_name = ctx.create_string("m");
+    let m_field = match ctx
+        .invoke_virtual(
+            map_class,
+            "getDeclaredField",
+            "(Ljava/lang/String;)Ljava/lang/reflect/Field;",
+            &[Value::Object(Some(m_name))],
+        )
+        .expect("getDeclaredField(\"m\") must not throw")
+    {
+        Some(Value::Object(Some(o))) => o,
+        other => panic!("getDeclaredField(\"m\") returned {other:?}"),
+    };
+    let field_name_obj = match ctx
+        .invoke_virtual(m_field, "getName", "()Ljava/lang/String;", &[])
+        .expect("Field.getName must not error")
+    {
+        Some(Value::Object(Some(o))) => o,
+        other => panic!("Field.getName returned {other:?}"),
+    };
+    assert_eq!(ctx.read_string(field_name_obj).as_deref(), Some("m"));
+
+    ctx.invoke_virtual(m_field, "setAccessible", "(Z)V", &[Value::Int(1)])
+        .expect("Field.setAccessible(true) must not throw");
+    let backing_ref = match ctx
+        .invoke_virtual(
+            m_field,
+            "get",
+            "(Ljava/lang/Object;)Ljava/lang/Object;",
+            &[Value::Object(Some(map_ref))],
+        )
+        .expect("Field.get(System.getenv()) must not throw")
+    {
+        Some(Value::Object(Some(o))) => o,
+        other => panic!("Field.get(System.getenv()) returned {other:?}"),
+    };
+
+    let backing_class_id = ctx.class_id_of_object(backing_ref);
+    let backing_class_name = ctx
+        .class_name_of_id(backing_class_id)
+        .unwrap_or_else(|| "<unknown>".to_string());
+    assert_eq!(
+        backing_class_name, "java/util/HashMap",
+        "the OpenJDK-compatible `m` field must expose the real HashMap backing"
+    );
+
+    let map_get = vm
+        .shared
+        .native_methods
+        .find(
+            "cratonvm/internal/UnmodifiableMap",
+            "get",
+            "(Ljava/lang/Object;)Ljava/lang/Object;",
+        )
+        .expect("UnmodifiableMap.get must be registered");
+    let path_key = ctx.create_string(if cfg!(windows) { "Path" } else { "PATH" });
+    let _ = match map_get(
+        &mut ctx,
+        &[Value::Object(Some(map_ref)), Value::Object(Some(path_key))],
+    )
+    .expect("UnmodifiableMap.get must delegate to the backing map")
+    {
+        Some(Value::Object(_)) => (),
+        other => panic!("UnmodifiableMap.get returned unexpected value {other:?}"),
+    };
 }

@@ -1968,9 +1968,19 @@ pub fn native_al_to_array(ctx: &mut dyn NativeContext, args: &[Value]) -> Method
             elems = collect_via_real_iterator(ctx, this);
         }
     }
+    // GC-SAFETY: `elems` contains bare object refs collected before the
+    // result array allocation. `alloc_ref_array` can trigger a moving GC;
+    // pin and refresh every object element before storing it into the new
+    // array, otherwise callers can later iterate stale refs that report as
+    // `java/lang/Object` and fail erased writer/checkcast bridges.
+    let (pin_base, elem_handles) = pin_value_slice(ctx, &elems);
     let result = alloc_ref_array(ctx, elems.len());
+    let elems = read_value_slice(ctx, &elem_handles, &elems);
     for (i, val) in elems.iter().enumerate() {
         ctx.set_array_element(result, i, *val);
+    }
+    if pin_base != usize::MAX {
+        ctx.unpin_native_roots(pin_base);
     }
     Ok(Some(Value::Object(Some(result))))
 }
@@ -2035,13 +2045,17 @@ pub fn native_al_to_array_typed(ctx: &mut dyn NativeContext, args: &[Value]) -> 
             matches!(template, Value::Object(Some(_)))
         );
     }
+    // GC-SAFETY: the target allocation below can move object refs already
+    // captured in `elems`; refresh them from native pins before storing into
+    // the returned array. This mirrors the zero-arg `toArray()` path above.
+    let (pin_base, elem_handles) = pin_value_slice(ctx, &elems);
     let target = match template {
         Value::Object(Some(arr)) if ctx.array_length(arr) >= size => arr,
         // Template too small: allocate a NEW array of the template's runtime
         // component type (JDK contract `Arrays.copyOf(elementData, size,
         // a.getClass())`), NOT a bare `Object[]`. For an array object the heap
         // header stores its component class id, so `class_id_of_object(arr)` IS
-        // the component class id `new_ref_array` wants — preserving multi-dim
+        // the component class id `new_ref_array` wants ? preserving multi-dim
         // types (`Value[][]` for H2 SortOrder.sort, not `Object[]`).
         Value::Object(Some(arr)) => {
             let comp = ctx.class_id_of_object(arr);
@@ -2049,12 +2063,16 @@ pub fn native_al_to_array_typed(ctx: &mut dyn NativeContext, args: &[Value]) -> 
         }
         _ => alloc_ref_array(ctx, size),
     };
+    let elems = read_value_slice(ctx, &elem_handles, &elems);
     for (i, val) in elems.iter().enumerate() {
         ctx.set_array_element(target, i, *val);
     }
     let target_len = ctx.array_length(target);
     if target_len > size {
         ctx.set_array_element(target, size, Value::Object(None));
+    }
+    if pin_base != usize::MAX {
+        ctx.unpin_native_roots(pin_base);
     }
     Ok(Some(Value::Object(Some(target))))
 }
@@ -30649,8 +30667,26 @@ fn native_unmod_sub_list(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
     Ok(sub)
 }
 
-/// `iterator()` returns a read-only iterator wrapping the backing iterator.
+/// `iterator()` returns a read-only iterator.
 fn native_unmod_iterator(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(o))) => *o,
+        _ => return Ok(Some(Value::Object(None))),
+    };
+    let is_list_wrapper = ctx
+        .class_name_of_id(ctx.class_id_of_object(this))
+        .map(|n| n == UNMOD_LIST_CLASS)
+        .unwrap_or(false);
+    if is_list_wrapper {
+        let snapshot = match unmod_list_snapshot(ctx, args) {
+            Some(a) => a,
+            None => return Ok(Some(Value::Object(None))),
+        };
+        return Ok(Some(Value::Object(Some(alloc_unmod_list_itr(
+            ctx, snapshot, 0,
+        )))));
+    }
+
     let inner = unmod_delegate(ctx, args, "iterator", "()Ljava/util/Iterator;")?;
     if let Some(Value::Object(Some(itr))) = inner {
         let w = alloc_unmod_wrapper(ctx, UNMOD_ITR_CLASS, itr);

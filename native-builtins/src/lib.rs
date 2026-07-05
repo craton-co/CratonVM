@@ -39,6 +39,43 @@ pub(crate) fn bootstrap_property_fallback(key: &str) -> Option<String> {
     }
 }
 
+pub(crate) fn native_unsafe_ensure_class_initialized(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    let class_mirror = args.iter().find_map(|v| match v {
+        Value::Object(Some(obj)) => {
+            let obj_cid = ctx.class_id_of_object(*obj);
+            let is_class_mirror = ctx
+                .class_name_of_id(obj_cid)
+                .map(|n| n == "java/lang/Class")
+                .unwrap_or(false);
+            if is_class_mirror && crate::lang_class::mirror_class_id(ctx, *obj).is_some() {
+                Some(*obj)
+            } else {
+                None
+            }
+        }
+        _ => None,
+    });
+    let Some(class_mirror) = class_mirror else {
+        return Ok(None);
+    };
+    let Some(class_name) = crate::lang_class::mirror_class_name(ctx, class_mirror) else {
+        return Ok(None);
+    };
+    if class_name.starts_with('[') {
+        return Ok(None);
+    }
+    match class_name.as_str() {
+        "boolean" | "byte" | "char" | "short" | "int" | "long" | "float" | "double"
+        | "void" => return Ok(None),
+        _ => {}
+    }
+    ctx.ensure_class_initialized(&class_name)?;
+    Ok(None)
+}
+
 fn register_test_harness_natives(registry: &mut NativeMethodRegistry) {
     registry.register(
         "cratonvm/test/Util",
@@ -11736,6 +11773,19 @@ pub fn register_essential_natives(registry: &mut NativeMethodRegistry) {
             let key = ctx.read_string(key_obj).unwrap_or_default();
             let val = ctx.read_string(val_obj).unwrap_or_default();
             let old = ctx.set_system_property(&key, &val);
+            // Keep the cached `System.getProperties()` singleton's side-table in
+            // sync (SC-web-method-spel RC-A): a caller that already holds a
+            // reference to that singleton (e.g. Spring's `systemProperties` bean,
+            // registered once at ApplicationContext refresh time) never calls
+            // `System.getProperties()` again, so the resync-on-call logic in the
+            // `getProperties` native never re-fires. Without this, a later
+            // `System.setProperty(...)` is invisible through that stale
+            // reference -- SpEL's `#{systemProperties.foo}` (routed through
+            // `MapAccessor.canRead` -> `Properties.containsKey`) then reports the
+            // property as absent even though `System.getProperty("foo")` sees it.
+            if let Some(props) = crate::lang_system::system_props_singleton() {
+                crate::properties_sidetable::store_property_in_sidetable(ctx, props, &key, &val);
+            }
             match old {
                 Some(v) => Ok(Some(Value::Object(Some(ctx.create_string(&v))))),
                 None => Ok(Some(Value::Object(None))),
@@ -11757,7 +11807,13 @@ pub fn register_essential_natives(registry: &mut NativeMethodRegistry) {
             // "" — keycloak's `${name}` placeholder resolution (and any code that
             // distinguishes unset from empty) depends on the key being absent.
             // Returns the prior value, matching `Hashtable.remove`.
-            match ctx.remove_system_property(&key) {
+            let result = ctx.remove_system_property(&key);
+            // Mirror the removal into the cached singleton's side-table -- see
+            // the matching comment in `setProperty` above (SC-web-method-spel RC-A).
+            if let Some(props) = crate::lang_system::system_props_singleton() {
+                crate::properties_sidetable::remove_property_from_sidetable(ctx, props, &key);
+            }
+            match result {
                 Some(v) => Ok(Some(Value::Object(Some(ctx.create_string(&v))))),
                 None => Ok(Some(Value::Object(None))),
             }
@@ -13972,6 +14028,12 @@ pub fn register_essential_natives(registry: &mut NativeMethodRegistry) {
     );
     registry.register(
         "java/lang/Class",
+        "getDeclaredField",
+        "(Ljava/lang/String;)Ljava/lang/reflect/Field;",
+        lang_class::native_class_get_declared_field,
+    );
+    registry.register(
+        "java/lang/Class",
         "getDeclaredMethods0",
         "(Z)[Ljava/lang/reflect/Method;",
         lang_class::native_class_get_declared_methods,
@@ -14132,6 +14194,18 @@ pub fn register_essential_natives(registry: &mut NativeMethodRegistry) {
         "getAnnotation",
         "(Ljava/lang/Class;)Ljava/lang/annotation/Annotation;",
         lang_class::native_annotated_type_get_annotation,
+    );
+    // `AnnotatedParameterizedType.getAnnotatedActualTypeArguments()` --
+    // surfaces TYPE_ARGUMENT-level annotations (e.g. `@Valid` in
+    // `List<@Valid Person>`) that real-JDK's null `getTypeAnnotationBytes0`
+    // stub can never recover. See
+    // `native_annotated_parameterized_type_get_annotated_actual_type_arguments`
+    // doc comment for the full rationale (SC-web-method-validation RC-B).
+    registry.register(
+        "sun/reflect/annotation/AnnotatedTypeFactory$AnnotatedParameterizedTypeImpl",
+        "getAnnotatedActualTypeArguments",
+        "()[Ljava/lang/reflect/AnnotatedType;",
+        lang_class::native_annotated_parameterized_type_get_annotated_actual_type_arguments,
     );
     registry.register(
         "java/lang/Class",
@@ -14952,6 +15026,18 @@ pub fn register_essential_natives(registry: &mut NativeMethodRegistry) {
     // matching the JDK's "not a built-in" contract. Without this, the JDK's
     // NativeLibraries bootstrap throws UnsatisfiedLinkError during
     // Inflater.<clinit>, which cascades into downstream Unsafe panics.
+    // Linux real-JDK boot classes such as `java.net.NetworkInterface` call
+    // `BootLoader.loadLibrary("net")` during <clinit>. CratonVM implements the
+    // Java-visible networking natives itself, and the lower-level
+    // `NativeLibraries.load` fallback is already non-fatal, but the JDK
+    // bytecode can block indefinitely before reaching it while acquiring the
+    // native-library lock. Short-circuit the boot-loader entry point directly.
+    registry.register(
+        "jdk/internal/loader/BootLoader",
+        "loadLibrary",
+        "(Ljava/lang/String;)V",
+        |_ctx, _args| Ok(None),
+    );
     registry.register(
         "jdk/internal/loader/NativeLibraries",
         "findBuiltinLib",
@@ -15624,6 +15710,24 @@ pub fn register_essential_natives(registry: &mut NativeMethodRegistry) {
         "()Ljava/lang/Class;",
         lang_class::native_field_get_declaring_class,
     );
+    registry.register(
+        "java/lang/reflect/Field",
+        "setAccessible",
+        "(Z)V",
+        lang_class::native_field_set_accessible,
+    );
+    registry.register(
+        "java/lang/reflect/Field",
+        "get",
+        "(Ljava/lang/Object;)Ljava/lang/Object;",
+        lang_class::native_field_get,
+    );
+    registry.register(
+        "java/lang/reflect/AccessibleObject",
+        "setAccessible",
+        "(Z)V",
+        lang_reflect::native_accessible_set_accessible,
+    );
     // T15: Field.getRoot/getGenericSignature etc. — our synthetic Field
     // is already the "root" (no chain of shared copies), so always return
     // null to pass the `copyField` "non-root" check in ReflectionFactory.
@@ -15917,7 +16021,7 @@ pub fn register_essential_natives(registry: &mut NativeMethodRegistry) {
         u2,
         "ensureClassInitialized0",
         "(Ljava/lang/Class;)V",
-        native_noop_with_this,
+        native_unsafe_ensure_class_initialized,
     );
     registry.register(
         u2,
@@ -17262,6 +17366,33 @@ pub fn register_essential_natives(registry: &mut NativeMethodRegistry) {
     // WP5.3 — X509KeyManager + X509TrustManager with EKU-aware alias selection
     //         and RFC 5280 chain validation backed by rustls-native-certs.
     x509_manager::register_x509_manager_real(registry);
+    // Cert-code fix (real-JDK AbstractMethodError): java.security.cert.
+    // Certificate / X509Certificate generic accessors (getEncoded, getType,
+    // checkValidity, getNotBefore/getNotAfter, ...) and CertificateFactory.
+    // getInstance/generateCertificate* are registered by
+    // phases_late::register_p68_security_cert, but that function is
+    // reachable ONLY via register_phase68_natives -> register_synthetic_
+    // overrides, which is #[cfg(feature = "synthetic-jdk")] and therefore
+    // compiled OUT of the default real-JDK CLI. The synthetic X509Certificate
+    // mirror objects that keystore.rs::make_x509_mirror (fallback path),
+    // x509_manager.rs::make_x509_mirror, and t27_tls.rs's
+    // getAcceptedIssuers/getCertificateChain allocate are instances of the
+    // real, ABSTRACT java/security/cert/X509Certificate class -- so
+    // Certificate.getEncoded() (declared abstract on Certificate, never
+    // overridden by X509Certificate itself) resolves to a Code-less method
+    // and every rescue path (the resolved-class native check and the
+    // receiver-own-class walk in interpreter.rs) finds nothing, throwing
+    // AbstractMethodError: method java/security/cert/Certificate.getEncoded()
+    // [B has no Code attribute. Repro: TrustManagerFactory.getInstance(...)
+    // .init((KeyStore) null) then ((X509TrustManager) tmf.getTrustManagers()
+    // [0]).getAcceptedIssuers()[i].getEncoded() -- exactly what OkHttp's
+    // Platform.platformTrustManager() does on every OkHttpClient
+    // construction (spring-webflux InvalidHttpMethodIntegrationTests
+    // Jetty-Core/Tomcat variants). Call the security.cert registration here
+    // too so it reaches the real-mode registry (mirrors the
+    // register_sslengine_real / register_ssl_session_real precedent for the
+    // analogous SSLSession bug, BUG-TC0622).
+    crate::phases_late::register_p68_security_cert(registry);
     // WP5.4 — TLS ALPN extension (`h2` / `http/1.1`) and SNI dispatch.
     t27_tls::register_alpn_real(registry);
     // WP5.5 — JDK 11+ java.net.http.HttpClient (sync + async, HTTP/1.1 + HTTP/2).
@@ -18980,12 +19111,9 @@ pub fn register_essential_natives(registry: &mut NativeMethodRegistry) {
     // don't need any native-side state for this — our socket I/O doesn't
     // route through a `UnixDispatcher` table — so a no-op keeps
     // `NioSocketImpl.<clinit>` progressing.
-    registry.register(
-        "sun/nio/ch/UnixDispatcher",
-        "init",
-        "()V",
-        |_ctx, _args| Ok(None),
-    );
+    registry.register("sun/nio/ch/UnixDispatcher", "init", "()V", |_ctx, _args| {
+        Ok(None)
+    });
 
     // Restore the caller's category so later registrars keep their intended tag.
     registry.set_category(prev_category);
@@ -26683,16 +26811,36 @@ fn register_unsafe_natives(r: &mut NativeMethodRegistry) {
         u,
         "ensureClassInitialized",
         "(Ljava/lang/Class;)V",
-        native_noop_with_this,
+        native_unsafe_ensure_class_initialized,
     );
     r.register(
         u2,
         "ensureClassInitialized",
         "(Ljava/lang/Class;)V",
-        native_noop_with_this,
+        native_unsafe_ensure_class_initialized,
     );
 
     // defineClass — define a class from byte array (delegate to ClassLoader)
+    // jdk.internal.misc.CDS: CratonVM does not support HotSpot CDS archives.
+    // Return disabled for all query natives and no-op archive hooks.
+    let cds_cls = "jdk/internal/misc/CDS";
+    r.register(cds_cls, "isDumpingClassList0", "()Z", native_return_false);
+    r.register(cds_cls, "isDumpingArchive0", "()Z", native_return_false);
+    r.register(cds_cls, "isSharingEnabled0", "()Z", native_return_false);
+    r.register(cds_cls, "logLambdaFormInvoker", "(Ljava/lang/String;)V", native_noop);
+    r.register(cds_cls, "initializeFromArchive", "(Ljava/lang/Class;)V", native_noop);
+    r.register(
+        cds_cls,
+        "defineArchivedModules",
+        "(Ljava/lang/ClassLoader;Ljava/lang/ClassLoader;)V",
+        native_noop,
+    );
+    r.register(cds_cls, "getRandomSeedForDumping", "()J", |_ctx, _args| {
+        Ok(Some(Value::Long(0)))
+    });
+    r.register(cds_cls, "dumpClassList", "(Ljava/lang/String;)V", native_noop);
+    r.register(cds_cls, "dumpDynamicArchive", "(Ljava/lang/String;)V", native_noop);
+
     r.register(u, "defineClass", "(Ljava/lang/String;[BIILjava/lang/ClassLoader;Ljava/security/ProtectionDomain;)Ljava/lang/Class;", |_ctx, _args| Ok(Some(Value::Object(None))));
     r.register(u2, "defineClass0", "(Ljava/lang/String;[BIILjava/lang/ClassLoader;Ljava/security/ProtectionDomain;)Ljava/lang/Class;", |_ctx, _args| Ok(Some(Value::Object(None))));
 
@@ -39253,7 +39401,10 @@ fn native_charset_for_name(ctx: &mut dyn NativeContext, args: &[Value]) -> Metho
 /// Construct and throw a real `java.nio.charset.UnsupportedCharsetException`
 /// via its public `(String charsetName)` constructor, matching real JDK's
 /// `Charset.forName` contract for a syntactically valid but unsupported name.
-fn throw_unsupported_charset_exception(ctx: &mut dyn NativeContext, name: &str) -> MethodCallFailed {
+fn throw_unsupported_charset_exception(
+    ctx: &mut dyn NativeContext,
+    name: &str,
+) -> MethodCallFailed {
     match ctx.new_object("java/nio/charset/UnsupportedCharsetException") {
         Ok(Some(Value::Object(Some(exc)))) => {
             let name_str = ctx.create_string(name);
@@ -44962,7 +45113,13 @@ fn quote_uric(s: &str) -> String {
             let allowed = c.is_ascii_alphanumeric()
                 || matches!(
                     c,
-                    '-' | '_' | '.' | '!' | '~' | '*' | '\'' | '('
+                    '-' | '_'
+                        | '.'
+                        | '!'
+                        | '~'
+                        | '*'
+                        | '\''
+                        | '('
                         | ')'
                         | ';'
                         | '/'
@@ -52647,7 +52804,11 @@ fn native_proxy_dispatch_invoke(ctx: &mut dyn NativeContext, args: &[Value]) -> 
                 // real boxed Integer, not a raw `Value::Int` (which isn't a valid
                 // object reference and CHECKCAST/unbox turns into null).
                 let hash = crate::lang_class::ctx_annotation_proxy_hash_code(ctx, handler);
-                return Ok(Some(crate::lang_class::box_value(ctx, Value::Int(hash), "I")));
+                return Ok(Some(crate::lang_class::box_value(
+                    ctx,
+                    Value::Int(hash),
+                    "I",
+                )));
             }
             "equals" => {
                 let other = match args_arr {
@@ -52742,7 +52903,9 @@ fn native_proxy_dispatch_invoke(ctx: &mut dyn NativeContext, args: &[Value]) -> 
             // ("... must be an instance of interface ...") deep inside
             // MergedAnnotations/AnnotatedElementUtils.
             "getClass" | "annotationType" | "getType" => {
-                return Ok(Some(ctx.get_field(handler, crate::lang_class::ANN_PROXY_TYPE_MIRROR)));
+                return Ok(Some(
+                    ctx.get_field(handler, crate::lang_class::ANN_PROXY_TYPE_MIRROR),
+                ));
             }
             _ => {}
         }

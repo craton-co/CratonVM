@@ -1847,6 +1847,31 @@ pub trait NativeContext {
         Vec::new()
     }
 
+    /// Get the runtime-visible TYPE_USE annotations that target a method
+    /// formal parameter's type ARGUMENTS (JVMS 4.7.20 `target_type` 0x16,
+    /// METHOD_FORMAL_PARAMETER, with a `type_path` whose *last* entry has
+    /// `type_path_kind == 3`, TYPE_ARGUMENT) -- e.g. the `@Valid` in
+    /// `List<@Valid Person> persons`, which annotates the type argument
+    /// `Person`, not the top-level `List` parameter type.
+    ///
+    /// The outer `Vec` is indexed by `formal_parameter_index`; the inner
+    /// `Vec` is indexed by `type_argument_index` (0-based, per JVMS
+    /// 4.7.20.2); entries with no annotations are empty `Vec`s. Backs
+    /// `((AnnotatedParameterizedType) method.getAnnotatedParameterTypes()[i])
+    /// .getAnnotatedActualTypeArguments()[j].getDeclaredAnnotations()`, which
+    /// Spring's `HandlerMethod.MethodValidationInitializer
+    /// .getContainerElementAnnotations` walks to decide whether e.g.
+    /// `addPeople(List<@Valid Person> persons)` needs method validation.
+    /// Default impl returns an empty `Vec`.
+    fn method_parameter_type_argument_annotations(
+        &self,
+        _class_id: ClassId,
+        _method_name: &str,
+        _method_desc: &str,
+    ) -> Vec<Vec<Vec<AnnotationData>>> {
+        Vec::new()
+    }
+
     /// Get the generic Signature attribute for a class (if present).
     fn class_signature(&self, class_id: ClassId) -> Option<String>;
 

@@ -6101,6 +6101,25 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
         Vec::new()
     }
 
+    fn method_parameter_type_argument_annotations(
+        &self,
+        class_id: ClassId,
+        method_name: &str,
+        method_desc: &str,
+    ) -> Vec<Vec<Vec<crate::native::registry::AnnotationData>>> {
+        let cm = self.shared.class_manager.read();
+        let class = match cm.get_class(class_id) {
+            Some(c) => c,
+            None => return Vec::new(),
+        };
+        for m in &class.methods {
+            if &*m.name == method_name && &*m.descriptor == method_desc {
+                return extract_parameter_type_argument_annotations(&m.attributes, &class.constant_pool);
+            }
+        }
+        Vec::new()
+    }
+
     fn method_annotation_default(
         &self,
         class_id: ClassId,
@@ -7072,6 +7091,69 @@ pub(super) fn extract_parameter_type_annotations(
                         out.resize(idx + 1, Vec::new());
                     }
                     out[idx].push(data);
+                }
+            }
+            return out;
+        }
+    }
+    Vec::new()
+}
+
+/// Extract TYPE_USE annotations targeting method formal parameters'
+/// TYPE ARGUMENTS (`target_type` 0x16, METHOD_FORMAL_PARAMETER) whose
+/// `type_path` is a single TYPE_ARGUMENT entry (`type_path_kind == 3`) --
+/// i.e. an annotation on a generic type argument like the `@Valid` in
+/// `List<@Valid Person> persons`, as opposed to
+/// [`extract_parameter_type_annotations`] which only keeps the
+/// empty-`type_path` (top-level parameter type) annotations.
+///
+/// Outer `Vec` indexed by `formal_parameter_index`; inner `Vec` indexed by
+/// `type_argument_index` (0-based, JVMS 4.7.20.2). Multi-level nesting
+/// (e.g. `Map<String, @Valid List<Person>>`, `type_path` length > 1) is not
+/// modeled -- only a direct, single-level type argument is recognized,
+/// which covers the common `List<@Valid T>` / `Map<K, @Valid V>` cases.
+/// Backs `AnnotatedParameterizedType.getAnnotatedActualTypeArguments()`
+/// for method parameters.
+pub(super) fn extract_parameter_type_argument_annotations(
+    attributes: &[cratonvm_reader::attribute::LazyAttribute],
+    cp: &cratonvm_reader::constant_pool::ConstantPool,
+) -> Vec<Vec<Vec<crate::native::registry::AnnotationData>>> {
+    use cratonvm_reader::attribute::Attribute;
+    const TARGET_METHOD_FORMAL_PARAMETER: u8 = 0x16;
+    const TYPE_PATH_KIND_TYPE_ARGUMENT: u8 = 3;
+    for lazy in attributes {
+        let attr = match lazy.decoded_or_decode(cp) {
+            Some(a) => a,
+            None => continue,
+        };
+        if let Attribute::RuntimeVisibleTypeAnnotations(tas) = attr.as_ref() {
+            let mut out: Vec<Vec<Vec<crate::native::registry::AnnotationData>>> = Vec::new();
+            for ta in tas {
+                if ta.target_type != TARGET_METHOD_FORMAL_PARAMETER {
+                    continue;
+                }
+                // Only a single-level type-argument path: exactly one
+                // type_path entry, and it must be a TYPE_ARGUMENT.
+                let type_arg_idx = match ta.type_path.as_slice() {
+                    [entry] if entry.type_path_kind == TYPE_PATH_KIND_TYPE_ARGUMENT => {
+                        entry.type_argument_index as usize
+                    }
+                    _ => continue,
+                };
+                // target_info for METHOD_FORMAL_PARAMETER is a single u1 index.
+                let param_idx = match ta.target_info.first() {
+                    Some(&i) => i as usize,
+                    None => continue,
+                };
+                if let Some(data) = convert_annotation(&ta.annotation, cp) {
+                    if out.len() <= param_idx {
+                        out.resize(param_idx + 1, Vec::new());
+                    }
+                    let type_args = &mut out[param_idx];
+                    if type_args.len() <= type_arg_idx {
+                        type_args.resize(type_arg_idx + 1, Vec::new());
+                    }
+                    type_args[type_arg_idx].push(data);
                 }
             }
             return out;
@@ -11920,6 +12002,11 @@ fn invoke_on_class_shared_inner(
                         // getTypeAnnotationBytes0 + unexposed ConstantPool. Shared
                         // source of truth with `force_native_over_real_jdk_bytecode`.
                         || crate::runtime::interpreter::is_typeuse_annotation_native_override(
+                            class_name,
+                            method_name,
+                            descriptor,
+                        )
+                        || crate::runtime::interpreter::is_reflection_access_native_override(
                             class_name,
                             method_name,
                             descriptor,

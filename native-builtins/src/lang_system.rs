@@ -646,6 +646,60 @@ pub(crate) fn native_thread_start0(
             ctx.set_field_by_name(this, "contextClassLoader", Value::Object(Some(parent_ccl)));
         }
     }
+    // test-context-round2: real JDK `Thread.<init>`'s InheritableThreadLocal
+    // copy (`this.inheritableThreadLocals = ThreadLocal.createInheritedMap(
+    // parent.inheritableThreadLocals)`) silently doesn't take effect for a
+    // still-unexplained interpreter reason specifically when BOTH the
+    // ThreadGroup and name constructor arguments are explicitly non-null at
+    // the same time — confirmed via minimal repro: `Thread(Runnable)` and
+    // `Thread(ThreadGroup, Runnable)` alone each correctly propagate;
+    // `Thread(ThreadGroup, Runnable, String[, long])` — exactly what
+    // `Executors.defaultThreadFactory()` uses for every pooled worker —
+    // does not, losing the parent's InheritableThreadLocal values entirely
+    // (name/group/priority/contextClassLoader are all unaffected; only this
+    // one field is dropped). The two-condition trigger rules out a native
+    // registration gap (the constructors aren't natively overridden at all;
+    // this is real bytecode misbehaving) — root-causing it further needs
+    // interpreter-level bytecode tracing, out of scope here. Apply the copy
+    // here at start0-time instead, mirroring the TC0622 CCL fix above.
+    //
+    // Known trade-off: `characteristics` (which flags an explicit
+    // `Thread(group, target, name, stackSize, false)` opt-out of
+    // inheritance) isn't retained anywhere observable post-construction, so
+    // this can't distinguish "buggy" from "intentionally opted out". A
+    // legitimate opt-out combined with non-null group+name would incorrectly
+    // regain inheritance. That combination is rare in practice (the 5-arg
+    // opt-out constructor itself is rarely used); documented pending a real
+    // interpreter-level fix. Opt-out: `CRATONVM_INHERIT_TL_WORKAROUND=0`.
+    let apply_itl_workaround = match std::env::var("CRATONVM_INHERIT_TL_WORKAROUND") {
+        Ok(v) => v != "0" && !v.eq_ignore_ascii_case("false"),
+        Err(_) => true,
+    };
+    // The buggy path doesn't leave this field as `Object(None)` (the normal
+    // "never written" value real bytecode `getfield` would observe) — a raw
+    // native heap read here sees `Int(0)` instead, matching CratonVM's
+    // zero-fill representation for a slot the constructor's `putfield`
+    // (offset 201 in the real master constructor) never actually reached.
+    // Treat either as "not yet inherited".
+    let child_itl_unset = matches!(
+        ctx.get_field_by_name(this, "inheritableThreadLocals"),
+        Value::Object(None) | Value::Int(0)
+    );
+    if apply_itl_workaround && child_itl_unset {
+        let parent = ctx.current_thread_object();
+        if let Value::Object(Some(parent_map)) =
+            ctx.get_field_by_name(parent, "inheritableThreadLocals")
+        {
+            if let Ok(Some(new_map)) = ctx.invoke(
+                "java/lang/ThreadLocal",
+                "createInheritedMap",
+                "(Ljava/lang/ThreadLocal$ThreadLocalMap;)Ljava/lang/ThreadLocal$ThreadLocalMap;",
+                &[Value::Object(Some(parent_map))],
+            ) {
+                ctx.set_field_by_name(this, "inheritableThreadLocals", new_map);
+            }
+        }
+    }
     ctx.thread_start(this)
 }
 
@@ -1550,6 +1604,25 @@ fn set_system_env_singleton(obj: ObjectRef) -> ObjectRef {
     }
 }
 
+/// Return the OpenJDK-shaped read-only wrapper used by `System.getenv()`.
+///
+/// The backing object is the real-layout `java/util/HashMap` built below.
+/// HotSpot exposes the no-arg environment as a
+/// `java.util.Collections$UnmodifiableMap` whose private field `m` points at
+/// that backing map. System Rules reflects on that field by name, so the
+/// existing CratonVM unmodifiable-map wrapper deliberately keeps the backing in
+/// slot 0, matching the JDK's `m` field slot.
+fn wrap_system_env_map(ctx: &mut dyn NativeContext, map: ObjectRef) -> ObjectRef {
+    let pin = ctx.pin_native_root(map);
+    let wrapper_class = ctx.ensure_synthetic_class("cratonvm/internal/UnmodifiableMap", 2);
+    let map = ctx.read_native_pin(pin, map);
+    let wrapper = ctx.alloc_object(wrapper_class, 2);
+    let map = ctx.read_native_pin(pin, map);
+    ctx.set_field(wrapper, 0, Value::Object(Some(map)));
+    ctx.unpin_native_roots(pin);
+    wrapper
+}
+
 /// The cached `System.getProperties()` `Properties` singleton, if already built.
 pub fn system_props_singleton() -> Option<ObjectRef> {
     *system_props_store()
@@ -1632,9 +1705,10 @@ pub(crate) fn native_system_getenv_all(
     // Identity: return the cached singleton so `System.getenv() ==
     // System.getenv()` holds (SC-env-classreading RC-A). The process
     // environment is immutable for a running JVM, so the cached snapshot stays
-    // correct. Only the real-layout path below caches (the legacy 3-field
-    // fallback is left uncached so a later call retries once the real
-    // `java/util/HashMap` layout is resolvable).
+    // correct. Only the real-layout path below caches; the legacy 3-field
+    // fallback still returns the OpenJDK-shaped unmodifiable wrapper but is left
+    // uncached so a later call retries once the real `java/util/HashMap` layout
+    // is resolvable.
     if let Some(cached) = system_env_singleton() {
         return Ok(Some(Value::Object(Some(cached))));
     }
@@ -1763,9 +1837,12 @@ pub(crate) fn native_system_getenv_all(
             ctx.set_field(map, f_size, Value::Int(old_size + 1));
         }
 
-        // Cache as the process-wide singleton (double-checked publish).
-        let map = set_system_env_singleton(map);
-        return Ok(Some(Value::Object(Some(map))));
+        // Cache the OpenJDK-shaped process-wide singleton (double-checked
+        // publish). The wrapper's field 0 is the private `m` backing field that
+        // libraries such as System Rules reach via reflection.
+        let env = wrap_system_env_map(ctx, map);
+        let env = set_system_env_singleton(env);
+        return Ok(Some(Value::Object(Some(env))));
     }
 
     // Legacy fallback: synthetic 3-field layout for environments where
@@ -1796,7 +1873,8 @@ pub(crate) fn native_system_getenv_all(
         ctx.set_field(map, 1, Value::Int(old_size + 1));
     }
 
-    Ok(Some(Value::Object(Some(map))))
+    let env = wrap_system_env_map(ctx, map);
+    Ok(Some(Value::Object(Some(env))))
 }
 
 pub(crate) fn native_pb_init(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {

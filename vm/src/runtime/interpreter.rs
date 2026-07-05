@@ -5246,12 +5246,10 @@ pub(crate) fn try_osr_with_backoff(
     initial_frame_idx: usize,
     entry_pc: usize,
 ) -> OsrBackoffOutcome {
-    // HIB-CV-20 / HIB-CV-21: back-edge OSR is unsound on large real-world
-    // methods (the OSR entry path can resume with corrupted register/stack
-    // state → a silent wrong value → infinite loops in e.g. Xerces XSD parsing).
-    // Gated OFF by default; whole-method JIT is unaffected. `CRATONVM_JIT_OSR=1`
-    // opts back in. This is the canonical entry for BOTH the inline and
-    // background-OSR paths, so the gate disables OSR everywhere.
+    // Back-edge OSR is default-on after the known entry-state corruption
+    // blockers were retired. Whole-method JIT is unaffected. `CRATONVM_JIT_OSR=0`
+    // opts out for diagnosis/bisection. This is the canonical entry for BOTH the
+    // inline and background-OSR paths, so the gate disables OSR everywhere.
     if !crate::runtime::env_cache::osr_backedge_enabled() {
         return OsrBackoffOutcome::Skip;
     }
@@ -17948,19 +17946,35 @@ pub(crate) fn try_lambda_dispatch(
                 .map(|c| c.num_total_fields)
                 .unwrap_or(0);
             let new_obj = gc_alloc_object(shared, thread, class_id, num_fields)?;
-            // Build <init> args: [new_obj, ...full_args]
-            let mut init_args = Vec::with_capacity(1 + full_args.len());
-            init_args.push(Value::Object(Some(new_obj)));
-            init_args.extend_from_slice(&full_args);
-            invoke_on_class_shared(
-                shared,
-                thread,
-                class_id,
-                &call_site.impl_handle.member_name,
-                &call_site.impl_handle.descriptor,
-                &init_args,
-            )?;
-            Ok(Some(Some(Value::Object(Some(new_obj)))))
+            // Build <init> args: [new_obj, ...full_args]. The constructor body
+            // can allocate and trigger a moving GC; the Java frame/locals are
+            // remapped, but this Rust local `new_obj` is not. Pin the receiver
+            // across `<init>` and return the forwarded object ref, mirroring the
+            // MethodHandle `newInvokeSpecial` path in `vm_exec.rs`.
+            let new_obj_pin = thread.native_pin_roots.len();
+            thread.native_pin_roots.push(new_obj);
+            let init_result = (|| -> Result<(), MethodCallFailed> {
+                let mut init_args = Vec::with_capacity(1 + full_args.len());
+                init_args.push(Value::Object(Some(new_obj)));
+                init_args.extend_from_slice(&full_args);
+                invoke_on_class_shared(
+                    shared,
+                    thread,
+                    class_id,
+                    &call_site.impl_handle.member_name,
+                    &call_site.impl_handle.descriptor,
+                    &init_args,
+                )?;
+                Ok(())
+            })();
+            let forwarded = thread
+                .native_pin_roots
+                .get(new_obj_pin)
+                .copied()
+                .unwrap_or(new_obj);
+            thread.native_pin_roots.truncate(new_obj_pin);
+            init_result?;
+            Ok(Some(Some(Value::Object(Some(forwarded)))))
         }
         MethodHandleKind::GetField => {
             // Field getter: first arg is the object, return the field value.
@@ -18209,6 +18223,30 @@ pub(crate) fn is_typeuse_annotation_native_override(
         ),
         _ => false,
     }
+}
+
+pub(crate) fn is_reflection_access_native_override(
+    class_name: &str,
+    method_name: &str,
+    descriptor: &str,
+) -> bool {
+    matches!(
+        (class_name, method_name, descriptor),
+        (
+            "java/lang/Class",
+            "getDeclaredField",
+            "(Ljava/lang/String;)Ljava/lang/reflect/Field;"
+        ) | (
+            "java/lang/reflect/Field",
+            "get",
+            "(Ljava/lang/Object;)Ljava/lang/Object;"
+        ) | ("java/lang/reflect/Field", "setAccessible", "(Z)V")
+            | (
+                "java/lang/reflect/AccessibleObject",
+                "setAccessible",
+                "(Z)V"
+            )
+    )
 }
 
 pub(crate) fn is_antlr_prediction_context_native_override(
@@ -19031,6 +19069,9 @@ fn force_native_over_real_jdk_bytecode(
     // our null getTypeAnnotationBytes0 + unexposed ConstantPool. Single source
     // of truth — `check_override` (vm_exec.rs) consults the same predicate.
     if is_typeuse_annotation_native_override(class_name, method_name, method_descriptor) {
+        return true;
+    }
+    if is_reflection_access_native_override(class_name, method_name, method_descriptor) {
         return true;
     }
     // Hibernate HQL and Groovy route through ANTLR's prediction-context hot
@@ -24224,9 +24265,11 @@ fn ensure_bg_compiler_started(shared: &SharedVm) {
     let weak_vm: std::sync::Weak<SharedVm> =
         shared.self_arc.read().as_ref().cloned().unwrap_or_default();
     crate::jit::tiered::ensure_background_compiler(&shared.tiered_manager, || {
-        Box::new(move |task: &crate::jit::tiered::CompilationTask| -> (u64, bool) {
-            background_compile_task(&weak_vm, task)
-        })
+        Box::new(
+            move |task: &crate::jit::tiered::CompilationTask| -> (u64, bool) {
+                background_compile_task(&weak_vm, task)
+            },
+        )
     });
 }
 
@@ -26047,7 +26090,11 @@ fn execute_invokevirtual_vtable_fast(
                                     .find(&parent.name, &method_name, &method_descriptor)
                                     .is_some();
                             if has_native {
-                                remember_vtable_native_shadow(thread, native_shadow_cache_key, true);
+                                remember_vtable_native_shadow(
+                                    thread,
+                                    native_shadow_cache_key,
+                                    true,
+                                );
                                 drop(cm);
                                 return Ok(CachedCallResult::CacheMiss);
                             }

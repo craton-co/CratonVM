@@ -286,8 +286,8 @@ Gate-off is byte-for-byte identical to the untouched baseline — zero
 regression. Gate-on now passes the **entire** package cleanly.
 
 A separate, unrelated JIT bug (`a11025aa2`'s invokedynamic/`needs_heap`
-regression — see `docs/known-issues/jit-sigsegv-regression-20260704.md` and
-`jit-nativecall-dispatch-sigsegv-annotation-scanning.md`) was briefly
+regression — see `docs/internal/jit-sigsegv-regression-20260704-FIXED.md` and
+`docs/internal/jit-nativecall-dispatch-sigsegv-annotation-scanning-RESOLVED.md`) was briefly
 suspected of undermining this result — a JIT SIGSEGV surfaced in 5 of these
 29 classes under a larger combined test batch, reproducible even under
 completely default settings with none of this doc's changes involved. That

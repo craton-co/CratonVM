@@ -1,7 +1,18 @@
 # CRATONVM_JIT_OSR regression cluster — value corruption across OSR entry-state reconstruction
 
-**Status:** OPEN. **Severity:** high (silent value corruption, one case a hang).
-**Flag under test:** `CRATONVM_JIT_OSR` (default **off**; see `vm/src/runtime/env_cache.rs::osr_backedge_enabled()`).
+**Status:** ARCHIVED / RESOLVED on current `dev` (2026-07-04). The issue was
+retired as a default-on blocker by three later fixes plus one reclassification:
+OSR compiles now seed reference parameters into the oop mask, collision-shaped
+primitive locals round-trip bit-exact through OSR snapshots, unsafe dead-local
+entries are rejected before entering the trampoline, and the Tomcat
+DirResourceSet case was refuted as a non-OSR stale-baseline regression. The
+historical Tomcat sweep remains below for context; its original default-off
+recommendation is superseded by `vm/src/runtime/env_cache.rs`, where
+`CRATONVM_JIT_OSR` now defaults on and `CRATONVM_JIT_OSR=0` is the opt-out.
+
+**Historical severity:** high (silent value corruption, one case a hang).
+**Flag under test:** `CRATONVM_JIT_OSR` (was default **off** at the time of this
+investigation; now default **on**).
 **Tasks:** [task_4d21c2f7](#3-testdirresourceset-family-6-classes--case-sensitivity-check-bypassed) (DirResourceSet case-sensitivity bypass), [task_24621ee7](#4-testwebxmlordering--indefinite-hang-compactvalue-nan-box-collision) (TestWebXmlOrdering hang / CompactValue collision).
 
 ## Summary
@@ -144,7 +155,7 @@ characterized elsewhere in this suite's investigation:
 - `org.apache.coyote.http2.TestHttpServlet`
 - `org.apache.coyote.http2.TestRfc9218`
 
-## Recommendation
+## Historical recommendation (superseded)
 
 **Keep `CRATONVM_JIT_OSR` default-off.** This sweep confirms the gate's own
 documented risk is real and not merely theoretical: 4 distinct, reproducible
@@ -155,3 +166,7 @@ NaN-box type-tag collision) rather than a vague "sometimes it's wrong."
 Revisit the default once `task_4d21c2f7` and `task_24621ee7` land — and
 re-run this same full-suite sweep as the acceptance check before flipping
 the gate on by default.
+
+Superseded 2026-07-04: the later fixes and reclassification listed at the top
+retire this note as a known issue, and OSR is now the default with an explicit
+`CRATONVM_JIT_OSR=0` opt-out.

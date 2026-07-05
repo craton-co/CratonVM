@@ -415,12 +415,17 @@ function Get-Classpath([string]$Module) {
   $modulePath = $Module -replace '/', [System.IO.Path]::DirectorySeparatorChar
   $cpFile = Join-Path (Join-Path $script:ElasticsearchDir $modulePath) 'build\craton-testcp.txt'
   if (-not (Test-Path $cpFile)) { return '' }
-  return (Get-Content -Path $cpFile -Raw).Trim()
+  $entries = @(Get-Content -Path $cpFile | ForEach-Object { $_.Trim() } | Where-Object { $_ })
+  if ($entries.Count -eq 0) { return '' }
+  if ($entries.Count -eq 1) { return $entries[0] }
+  return ($entries -join [System.IO.Path]::PathSeparator)
 }
 
 function Get-EsJavaArgs([bool]$HotSpot) {
+  $esHome = [System.IO.Path]::GetFullPath($script:ElasticsearchDir)
   $args = @(
     "-Dtests.seed=$Seed",
+    "-Des.path.home=$esHome",
     '-Djava.awt.headless=true',
     '-Djna.nosys=true',
     '-Dtests.logger.level=WARN',
@@ -676,8 +681,9 @@ function Invoke-Mode {
   param([object[]]$Classes)
 
   $jdk = Resolve-Jdk
-  $java = Join-Path $jdk 'bin\java.exe'
-  if (-not (Test-Path $java)) { Die "HotSpot java.exe not found: $java" }
+  $javaName = if ($IsWindows) { 'bin\java.exe' } else { 'bin/java' }
+  $java = Join-Path $jdk $javaName
+  if (-not (Test-Path $java)) { Die "HotSpot java not found: $java" }
   $craton = ''
   if ($Vm -eq 'craton') { $craton = Resolve-CratonExe }
 
