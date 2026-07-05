@@ -314,12 +314,11 @@ fn register_forkjoin_extras(r: &mut NativeMethodRegistry) {
 // condvars — one to wake takers waiting for a put, one to wake putters
 // waiting for the slot to drain.
 //
-// The synthetic-JDK tests (`synchronous_queue_put_take_p58`,
-// `synchronous_queue_offer_poll_p58`) run on a single thread and expect
-// the item to be available after `put` so `take` returns immediately.
-// The existing p58 stub already satisfies that with a buffered slot. Our
-// hardened path adds genuine blocking so cross-thread producer/consumer
-// pairs rendezvous correctly.
+// The legacy synthetic-JDK `put`/`take` test runs on a single thread and
+// expects a `put` to be observable by a following `take`, so `put` retains a
+// bounded compatibility buffer. `offer`, however, must stay zero-capacity:
+// ThreadPoolExecutor relies on a failed SynchronousQueue.offer to spawn a new
+// worker instead of silently queuing work.
 
 struct SqSlot {
     /// Primitive payload for `tag == 2` (Int) / `tag == 3` (Long). For
@@ -341,6 +340,7 @@ struct SqSlot {
     /// primitive payload — none of which is a heap pointer.
     item_bits: i64,
     has_item: bool,
+    waiting_takers: usize,
     tag: u8, // 0=None, 1=Object, 2=Int, 3=Long
 }
 
@@ -356,6 +356,7 @@ impl SyncSlot {
             state: Mutex::new(SqSlot {
                 item_bits: 0,
                 has_item: false,
+                waiting_takers: 0,
                 tag: 0,
             }),
             put_cv: Condvar::new(),
@@ -564,19 +565,17 @@ fn register_synchronous_queue_extras(r: &mut NativeMethodRegistry) {
         Ok(None)
     });
 
-    // offer(E) — non-blocking variant; returns true if the slot was empty.
+    // offer(E) — non-blocking variant. A real SynchronousQueue has no capacity:
+    // offer only succeeds when a taker is already waiting.
     r.register(sq, "offer", "(Ljava/lang/Object;)Z", |ctx, args| {
         let this = obj_arg(args, 0)?;
         let item = args.get(1).copied().unwrap_or(Value::Object(None));
         let slot = get_or_create_slot(this);
         let mut state = slot.state.lock();
-        // offer always "succeeds" by placing the item; paired take/poll
-        // drains it. Matches existing p58 stub semantics so
-        // `synchronous_queue_offer_poll_p58` continues to pass. The Object
-        // item is stored only in the GC-tracked mirror field 0 by
-        // `deposit_item` (bug nb-concurrent-extras), so the deposited
-        // reference survives a moving GC after this non-blocking offer
-        // returns and the producer frame unwinds.
+        if state.waiting_takers == 0 || state.has_item {
+            return Ok(Some(Value::Int(0)));
+        }
+        // A taker is parked in take()/timed poll(); fill the slot and wake one.
         deposit_item(ctx, this, &mut state, item);
         slot.take_cv.notify_one();
         if ctx.object_num_fields(this) > 1 {
@@ -601,8 +600,9 @@ fn register_synchronous_queue_extras(r: &mut NativeMethodRegistry) {
                     return Ok(Some(item));
                 }
             }
-            // Block (bounded) waiting for a put.
+            // Block (bounded) waiting for a put/offer.
             let deadline = Instant::now() + SQ_BLOCK_CAP;
+            state.waiting_takers += 1;
             while !state.has_item {
                 let remaining = deadline.saturating_duration_since(Instant::now());
                 if remaining.is_zero() {
@@ -611,6 +611,7 @@ fn register_synchronous_queue_extras(r: &mut NativeMethodRegistry) {
                 let wait = remaining.min(SQ_POLL);
                 slot.take_cv.wait_for(&mut state, wait);
             }
+            state.waiting_takers = state.waiting_takers.saturating_sub(1);
         }
         if state.has_item {
             // GC-safe drain: read the forwarded Object reference back from
@@ -692,8 +693,9 @@ fn register_synchronous_queue_extras(r: &mut NativeMethodRegistry) {
             };
             let block_dur = Duration::from_nanos(nanos.max(0) as u64);
             let mut state = slot.state.lock();
-            if !state.has_item {
+            if !state.has_item && !block_dur.is_zero() {
                 let deadline = Instant::now() + block_dur.min(SQ_BLOCK_CAP);
+                state.waiting_takers += 1;
                 while !state.has_item {
                     let remaining = deadline.saturating_duration_since(Instant::now());
                     if remaining.is_zero() {
@@ -702,6 +704,7 @@ fn register_synchronous_queue_extras(r: &mut NativeMethodRegistry) {
                     let wait = remaining.min(SQ_POLL);
                     slot.take_cv.wait_for(&mut state, wait);
                 }
+                state.waiting_takers = state.waiting_takers.saturating_sub(1);
             }
             if state.has_item {
                 // GC-safe drain: forward the Object from mirror field 0 (bug
@@ -838,8 +841,60 @@ mod tests {
         SqSlot {
             item_bits: 0,
             has_item: false,
+            waiting_takers: 0,
             tag: 0,
         }
+    }
+
+    fn sq_offer_callback() -> cratonvm_native_api::NativeCallback {
+        let mut registry = NativeMethodRegistry::new();
+        register_synchronous_queue_extras(&mut registry);
+        registry
+            .find(
+                "java/util/concurrent/SynchronousQueue",
+                "offer",
+                "(Ljava/lang/Object;)Z",
+            )
+            .expect("SynchronousQueue.offer must be registered")
+    }
+
+    #[test]
+    fn sq_offer_without_waiting_taker_does_not_buffer() {
+        let mut ctx = crate::test_utils::MockNativeContext::new();
+        let this = alloc_queue(&mut ctx);
+        reset_slot(this);
+
+        let result = sq_offer_callback()(
+            &mut ctx,
+            &[Value::Object(Some(this)), Value::Int(77)],
+        )
+        .unwrap();
+
+        assert_eq!(result, Some(Value::Int(0)));
+        let slot = get_or_create_slot(this);
+        let state = slot.state.lock();
+        assert!(!state.has_item, "failed offer must not buffer the item");
+        assert_eq!(ctx.get_field(this, 1), Value::Int(0));
+    }
+
+    #[test]
+    fn sq_offer_with_waiting_taker_deposits_item() {
+        let mut ctx = crate::test_utils::MockNativeContext::new();
+        let this = alloc_queue(&mut ctx);
+        reset_slot(this);
+        let slot = get_or_create_slot(this);
+        slot.state.lock().waiting_takers = 1;
+
+        let result = sq_offer_callback()(
+            &mut ctx,
+            &[Value::Object(Some(this)), Value::Int(77)],
+        )
+        .unwrap();
+
+        assert_eq!(result, Some(Value::Int(1)));
+        let mut state = slot.state.lock();
+        assert!(state.has_item, "offer must hand off to the waiting taker");
+        assert_eq!(consume_item(&mut ctx, this, &mut state), Value::Int(77));
     }
 
     /// Depositing an Object stores it in the GC-tracked mirror field 0 (NOT a

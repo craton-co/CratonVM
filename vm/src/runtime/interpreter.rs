@@ -18911,6 +18911,23 @@ pub(crate) fn is_jdk_wrapper_math_native_override(
     }
 }
 
+pub(crate) fn is_count_down_latch_native_override(
+    class_name: &str,
+    method_name: &str,
+    descriptor: &str,
+) -> bool {
+    class_name == "java/util/concurrent/CountDownLatch"
+        && matches!(
+            (method_name, descriptor),
+            ("<init>", "(I)V")
+                | ("countDown", "()V")
+                | ("await", "()V")
+                | ("await", "(JLjava/util/concurrent/TimeUnit;)Z")
+                | ("getCount", "()J")
+                | ("toString", "()Ljava/lang/String;")
+        )
+}
+
 fn force_native_over_real_jdk_bytecode(
     class_name: &str,
     method_name: &str,
@@ -19198,6 +19215,14 @@ fn force_native_over_real_jdk_bytecode(
     // collection reductions such as Hibernate's JoinedList constructor do not
     // spin through one-frame interpreted helpers.
     if is_jdk_wrapper_math_native_override(class_name, method_name, method_descriptor) {
+        return true;
+    }
+    // CountDownLatch is registered as a synthetic monitor-backed native because
+    // the real JDK body stores an AQS Sync object and parks through Unsafe /
+    // LockSupport machinery CratonVM does not model completely. Force the full
+    // public surface, including <init>, so the synthetic int[] holder is
+    // installed before await/countDown read it.
+    if is_count_down_latch_native_override(class_name, method_name, method_descriptor) {
         return true;
     }
     // Surefire fork bootstrap/teardown: bypass ServiceLoader decoder discovery
@@ -28284,6 +28309,34 @@ mod tests {
             jit_native_shadow_invoke_index(&Instruction::Invokedynamic(19)),
             None
         );
+    }
+
+    #[test]
+    fn count_down_latch_force_native_covers_registered_surface() {
+        let cdl = "java/util/concurrent/CountDownLatch";
+        for (name, descriptor) in [
+            ("<init>", "(I)V"),
+            ("countDown", "()V"),
+            ("await", "()V"),
+            ("await", "(JLjava/util/concurrent/TimeUnit;)Z"),
+            ("getCount", "()J"),
+            ("toString", "()Ljava/lang/String;"),
+        ] {
+            assert!(
+                is_count_down_latch_native_override(cdl, name, descriptor),
+                "{name}{descriptor} must route to the registered native"
+            );
+        }
+        assert!(!is_count_down_latch_native_override(
+            cdl,
+            "await",
+            "(JLjava/time/Duration;)Z"
+        ));
+        assert!(!is_count_down_latch_native_override(
+            "java/util/concurrent/Semaphore",
+            "await",
+            "()V"
+        ));
     }
 
     // -----------------------------------------------------------------------

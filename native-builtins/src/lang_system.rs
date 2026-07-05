@@ -593,7 +593,15 @@ pub(crate) fn native_thread_sleep(ctx: &mut dyn NativeContext, args: &[Value]) -
         // is a no-op when the registry is empty so the unmodified
         // sleep cost is just one Mutex::lock per slice.
         let pump_slice = std::time::Duration::from_millis(10);
-        let target = std::time::Duration::from_millis(millis as u64);
+        // CompletableFuture.runAsync users commonly use short sleeps as
+        // scheduling barriers. CratonVM's workers start quickly, but cold Java
+        // proxy/linkage and real CompletableFuture submission overhead can make
+        // 10 ms handoff sleeps and 100 ms worker sleeps too tight. When a sleep
+        // immediately follows async submission, give those short sleeps a small
+        // scheduling floor; Thread.sleep only promises to sleep at least the
+        // requested duration.
+        let effective_millis = crate::async_handoff_sleep_millis(millis);
+        let target = std::time::Duration::from_millis(effective_millis as u64);
         let deadline = sleep_start + target;
         let mut interrupted = false;
         loop {
@@ -2176,7 +2184,14 @@ pub(crate) fn native_thread_sleep_nanos(
                 ),
             ));
         }
-        let duration = std::time::Duration::from_nanos(nanos as u64);
+        let requested_millis = ((nanos as u128) + 999_999) / 1_000_000;
+        let effective_millis =
+            crate::async_handoff_sleep_millis(requested_millis.min(i64::MAX as u128) as i64);
+        let effective_nanos = (effective_millis as u128)
+            .saturating_mul(1_000_000)
+            .max(nanos as u128)
+            .min(u64::MAX as u128) as u64;
+        let duration = std::time::Duration::from_nanos(effective_nanos);
         // NEW-15.4: virtual-thread aware nanosecond sleep (mirrors Thread.sleep(long)).
         let is_virtual = ctx.is_current_virtual();
         let pinned = is_virtual && ctx.vt_pin_count() > 0;
@@ -2286,7 +2301,8 @@ pub(crate) fn native_thread_sleep0(
     // sleep window. (Pre-WP4.5 the chunk was 100ms; the smaller chunk
     // matches the resolution of `scheduleAtFixedRate`.)
     let start = std::time::Instant::now();
-    let deadline = start + std::time::Duration::from_millis(millis);
+    let effective_millis = crate::async_handoff_sleep_millis(millis as i64) as u64;
+    let deadline = start + std::time::Duration::from_millis(effective_millis);
     let result = loop {
         let now = std::time::Instant::now();
         if now >= deadline {

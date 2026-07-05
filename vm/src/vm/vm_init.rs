@@ -1095,14 +1095,10 @@ impl SharedVm {
             let set_id = class_manager
                 .load_class("java/util/Set")
                 .expect("java/util/Set must be loadable");
-            // `Collections.unmodifiableSortedSet`/`unmodifiableNavigableSet`
-            // also allocate `UnmodifiableSet` (see
-            // `native_collections_unmodifiable_set`), so it must declare these
-            // two interfaces too — otherwise a caller-side `(SortedSet)` /
-            // `(NavigableSet)` checkcast on the returned wrapper (e.g.
-            // `IndexVersionUtils.ALL_VERSIONS` typed as `NavigableSet<...>`)
-            // raises ClassCastException even though the native methods for
-            // both surfaces are registered on the wrapper class.
+            // Sorted/navigable unmodifiable-set APIs use separate internal
+            // stamps from plain `unmodifiableSet`, so a normal set wrapper
+            // does not accidentally satisfy `SortedSet` and invite callers to
+            // invoke `comparator()` on a LinkedHashSet backing.
             let sorted_set_id = class_manager
                 .load_class("java/util/SortedSet")
                 .expect("java/util/SortedSet must be loadable");
@@ -1128,7 +1124,7 @@ impl SharedVm {
                 .load_class("java/io/Serializable")
                 .expect("java/io/Serializable must be loadable");
             // (synthetic class name, list of interface ClassIds it implements)
-            let unmod_specs: [(&str, &[ClassId]); 6] = [
+            let unmod_specs: [(&str, &[ClassId]); 8] = [
                 (
                     "cratonvm/internal/UnmodifiableCollection",
                     &[collection_id, serializable_id],
@@ -1139,6 +1135,14 @@ impl SharedVm {
                 ),
                 (
                     "cratonvm/internal/UnmodifiableSet",
+                    &[set_id, collection_id, serializable_id],
+                ),
+                (
+                    "cratonvm/internal/UnmodifiableSortedSet",
+                    &[set_id, sorted_set_id, collection_id, serializable_id],
+                ),
+                (
+                    "cratonvm/internal/UnmodifiableNavigableSet",
                     &[
                         set_id,
                         sorted_set_id,

@@ -42577,7 +42577,8 @@ mod tests {
             &[Value::Object(Some(sq))],
         )
         .unwrap();
-        // Offer
+        // Non-blocking offer on a SynchronousQueue only succeeds when a taker
+        // is already waiting.
         let ok = call_native(
             &shared,
             &mut thread,
@@ -42588,7 +42589,7 @@ mod tests {
         )
         .unwrap()
         .unwrap();
-        assert_eq!(ok, Value::Int(1));
+        assert_eq!(ok, Value::Int(0));
         // Poll
         let val = call_native(
             &shared,
@@ -42600,7 +42601,7 @@ mod tests {
         )
         .unwrap()
         .unwrap();
-        assert_eq!(val, Value::Int(77));
+        assert_eq!(val, Value::Object(None));
         // isEmpty should be true
         let empty = call_native(
             &shared,

@@ -3006,27 +3006,77 @@ fn netty_unix_socket_false_native(
     Ok(Some(Value::Int(0)))
 }
 
+#[cfg(target_os = "linux")]
+fn epollin_const() -> i32 {
+    libc::EPOLLIN
+}
+
+#[cfg(not(target_os = "linux"))]
+fn epollin_const() -> i32 {
+    0x001
+}
+
+#[cfg(target_os = "linux")]
+fn epollout_const() -> i32 {
+    libc::EPOLLOUT
+}
+
+#[cfg(not(target_os = "linux"))]
+fn epollout_const() -> i32 {
+    0x004
+}
+
+#[cfg(target_os = "linux")]
+fn epollrdhup_const() -> i32 {
+    libc::EPOLLRDHUP
+}
+
+#[cfg(not(target_os = "linux"))]
+fn epollrdhup_const() -> i32 {
+    0x2000
+}
+
+#[cfg(target_os = "linux")]
+fn epollet_const() -> i32 {
+    libc::EPOLLET
+}
+
+#[cfg(not(target_os = "linux"))]
+fn epollet_const() -> i32 {
+    0x8000_0000u32 as i32
+}
+
+#[cfg(target_os = "linux")]
+fn epollerr_const() -> i32 {
+    libc::EPOLLERR
+}
+
+#[cfg(not(target_os = "linux"))]
+fn epollerr_const() -> i32 {
+    0x008
+}
+
 fn netty_epoll_const_epollin(_ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
-    Ok(Some(Value::Int(libc::EPOLLIN)))
+    Ok(Some(Value::Int(epollin_const())))
 }
 
 fn netty_epoll_const_epollout(_ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
-    Ok(Some(Value::Int(libc::EPOLLOUT)))
+    Ok(Some(Value::Int(epollout_const())))
 }
 
 fn netty_epoll_const_epollrdhup(
     _ctx: &mut dyn NativeContext,
     _args: &[Value],
 ) -> MethodCallResult {
-    Ok(Some(Value::Int(libc::EPOLLRDHUP)))
+    Ok(Some(Value::Int(epollrdhup_const())))
 }
 
 fn netty_epoll_const_epollet(_ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
-    Ok(Some(Value::Int(libc::EPOLLET)))
+    Ok(Some(Value::Int(epollet_const())))
 }
 
 fn netty_epoll_const_epollerr(_ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
-    Ok(Some(Value::Int(libc::EPOLLERR)))
+    Ok(Some(Value::Int(epollerr_const())))
 }
 
 fn netty_epoll_kernel_version(ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
