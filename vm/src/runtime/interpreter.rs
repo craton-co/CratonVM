@@ -3247,7 +3247,12 @@ pub fn execute(
                     .read()
                     .class_redefine_generation(class_id)
                     > 0
-                && !redefine_immune_reflection_native(&class_name_owned, method_name);
+                && !redefine_immune_reflection_native(&class_name_owned, method_name)
+                && !redefine_immune_string_builder_native(
+                    &class_name_owned,
+                    method_name,
+                    method_descriptor,
+                );
             if method_name != "<init>" && method_name != "<clinit>" && !class_redefined {
                 if let Some(cb) =
                     shared
@@ -19471,6 +19476,17 @@ fn redefine_immune_reflection_native(class_name: &str, method_name: &str) -> boo
     )
 }
 
+fn redefine_immune_string_builder_native(
+    class_name: &str,
+    method_name: &str,
+    _method_descriptor: &str,
+) -> bool {
+    matches!(
+        class_name,
+        "java/lang/StringBuilder" | "java/lang/StringBuffer" | "java/lang/AbstractStringBuilder"
+    ) && matches!(method_name, "<init>" | "append" | "toString")
+}
+
 /// Dispatch a force-native override via `safe_native_call`, pushing any return
 /// value onto the caller operand stack.
 #[inline]
@@ -19503,6 +19519,7 @@ fn intercept_force_registered_native(
     // bytecode cannot reproduce them under CratonVM.
     if native_shadow_suppressed_by_redefine(shared, class_name)
         && !redefine_immune_reflection_native(class_name, method_name)
+        && !redefine_immune_string_builder_native(class_name, method_name, method_descriptor)
     {
         return None;
     }
@@ -19842,6 +19859,7 @@ fn try_stackless_invoke(
             // receiver-class check does.
             if native_shadow_suppressed_by_redefine(shared, &parent.name)
                 && !redefine_immune_reflection_native(&parent.name, method_name)
+                && !redefine_immune_string_builder_native(&parent.name, method_name, descriptor)
             {
                 return None;
             }
@@ -19862,6 +19880,7 @@ fn try_stackless_invoke(
     // `redefine_immune_reflection_native`).
     let native_cb = if native_shadow_suppressed_by_redefine(shared, class_name)
         && !redefine_immune_reflection_native(class_name, method_name)
+        && !redefine_immune_string_builder_native(class_name, method_name, descriptor)
     {
         None
     } else {
@@ -20040,7 +20059,8 @@ fn try_stackless_invoke(
     // `java.lang.reflect.Method` must not disable annotation reflection.
     if !(declaring_is_interface && !is_static)
         && (!native_shadow_suppressed_by_redefine(shared, &class_name_arc)
-            || redefine_immune_reflection_native(&class_name_arc, method_name))
+            || redefine_immune_reflection_native(&class_name_arc, method_name)
+            || redefine_immune_string_builder_native(&class_name_arc, method_name, descriptor))
     {
         if let Some(callback) = shared
             .native_methods
@@ -25828,22 +25848,28 @@ fn execute_invokevirtual_vtable_fast(
             store,
         )
         .and_then(|(_m, declaring_id)| {
+            let declaring_class = store.get(declaring_id)?;
             // A class redefined in place by a JVMTI agent (e.g. a Mockito
             // inline mock) has authoritative woven bytecode — do not shadow
             // it with the Rust intrinsic, or the advice never runs.
             if crate::classloading::any_class_redefined()
                 && cm.class_redefine_generation(declaring_id) > 0
-            {
-                return Some(false);
-            }
-            store.get(declaring_id).map(|c| {
-                cratonvm_native_builtins::intrinsics::lookup(
-                    &c.name,
+                && !redefine_immune_string_builder_native(
+                    &declaring_class.name,
                     &method_name,
                     &method_descriptor,
                 )
-                .is_some()
-            })
+            {
+                return Some(false);
+            }
+            Some(
+                cratonvm_native_builtins::intrinsics::lookup(
+                    &declaring_class.name,
+                    &method_name,
+                    &method_descriptor,
+                )
+                .is_some(),
+            )
         })
         .unwrap_or(false);
         drop(cm);
@@ -25886,7 +25912,12 @@ fn execute_invokevirtual_vtable_fast(
             // disable `Method.getDeclaredAnnotations()` for every method object.
             let receiver_redefined = crate::classloading::any_class_redefined()
                 && cm.class_redefine_generation(receiver_class_id) > 0
-                && !redefine_immune_reflection_native(rcv_name, &method_name);
+                && !redefine_immune_reflection_native(rcv_name, &method_name)
+                && !redefine_immune_string_builder_native(
+                    rcv_name,
+                    &method_name,
+                    &method_descriptor,
+                );
             // WP2.7 — annotation proxies have no real bytecode for
             // equals/hashCode/toString. Force fall-through to the slow path
             // so `execute_invoke`'s annotation_proxy interception layer
@@ -26081,9 +26112,14 @@ fn execute_invokevirtual_vtable_fast(
                                 .is_some();
                             // Suppress an inherited native shadow when the declaring
                             // parent has been redefined by an agent (woven bytecode wins).
-                            let parent_redefined = crate::classloading::any_class_redefined()
-                                && cm.class_redefine_generation(parent_id) > 0
-                                && !redefine_immune_reflection_native(&parent.name, &method_name);
+            let parent_redefined = crate::classloading::any_class_redefined()
+                && cm.class_redefine_generation(parent_id) > 0
+                && !redefine_immune_reflection_native(&parent.name, &method_name)
+                && !redefine_immune_string_builder_native(
+                    &parent.name,
+                    &method_name,
+                    &method_descriptor,
+                );
                             let has_native = !parent_redefined
                                 && shared
                                     .native_methods
@@ -27264,7 +27300,12 @@ fn populate_virtual_invoke_cache(
                     // the fix has to be here, where the entry is created.
                     let parent_redefined = crate::classloading::any_class_redefined()
                         && cm.class_redefine_generation(parent_id) > 0
-                        && !redefine_immune_reflection_native(&parent_name, &method_name);
+                        && !redefine_immune_reflection_native(&parent_name, &method_name)
+                        && !redefine_immune_string_builder_native(
+                            &parent_name,
+                            &method_name,
+                            &descriptor,
+                        );
                     if parent_redefined {
                         break;
                     }

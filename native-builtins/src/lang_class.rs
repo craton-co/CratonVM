@@ -1,9 +1,9 @@
-// SPDX-License-Identifier: Apache-2.0
+﻿// SPDX-License-Identifier: Apache-2.0
 // Copyright 2024-2026 Craton Software Company
 
 //! Class, reflect.Method, reflect.Field, reflect.Constructor native method implementations.
 
-use cratonvm_native_api::{FieldMetadata, MethodMetadata, NativeContext};
+use cratonvm_native_api::{AnnotationData, FieldMetadata, MethodMetadata, NativeContext};
 use cratonvm_types::error::{MethodCallFailed, MethodCallResult};
 use cratonvm_types::{ClassId, ObjectRef, Value};
 
@@ -27,7 +27,7 @@ use crate::obj_arg;
 // `CRATONVM_DBG_BB` on every invocation to decide whether to emit ByteBuddy
 // debug traces. These natives sit on the hot reflection path (ByteBuddy
 // agents call them tens of thousands of times during JDK boot), so we
-// cache the boolean in a `OnceLock<bool>` — same pattern as
+// cache the boolean in a `OnceLock<bool>` вЂ” same pattern as
 // `vm::runtime::exceptions::iae_trace_enabled`. The env var is a debug
 // switch that must be set at process start; changing it after the first
 // reflection native runs intentionally has no effect.
@@ -43,13 +43,13 @@ pub(crate) fn dbg_bb_enabled() -> bool {
 //
 // Many hot `Class.*` natives derive a string form from the internal slashed
 // class name returned by `NativeContext::class_name_of_id`:
-//   * `Class.getName()` / `Object.toString()` callees — dotted form
-//     (`java/lang/Object` → `java.lang.Object`).
-//   * `Class.getPackageName()` / `Class.getPackage()` — dotted package
-//     prefix (the substring before the final `/`, with `/` → `.`).
-//   * `Class.getSimpleName()` — last segment after `/`, `.`, or `$`.
-//   * `Class.getCanonicalName()` — dotted form with `$` → `.` too.
-//   * `Class.getTypeName()` — same as `getName()` for non-array (dotted).
+//   * `Class.getName()` / `Object.toString()` callees вЂ” dotted form
+//     (`java/lang/Object` в†’ `java.lang.Object`).
+//   * `Class.getPackageName()` / `Class.getPackage()` вЂ” dotted package
+//     prefix (the substring before the final `/`, with `/` в†’ `.`).
+//   * `Class.getSimpleName()` вЂ” last segment after `/`, `.`, or `$`.
+//   * `Class.getCanonicalName()` вЂ” dotted form with `$` в†’ `.` too.
+//   * `Class.getTypeName()` вЂ” same as `getName()` for non-array (dotted).
 //
 // Every one of these derivations is pure: the slashed internal name of a
 // given `ClassId` never changes for the lifetime of the program, classes
@@ -90,7 +90,7 @@ fn cache_insert(cache: &ClassNameCache, class_id: ClassId, value: Arc<str>) -> A
     value
 }
 
-/// Dotted form of a class's internal slashed name (`java/lang/Object` →
+/// Dotted form of a class's internal slashed name (`java/lang/Object` в†’
 /// `java.lang.Object`). Cached per `ClassId`. Used by `Class.getName()` and
 /// any other native that needs the dotted name.
 ///
@@ -164,7 +164,7 @@ pub(crate) fn simple_class_name(class_id: ClassId, raw: &str) -> Arc<str> {
     cache_insert(&SIMPLE_CLASS_NAME_CACHE, class_id, simple)
 }
 
-/// Canonical name: dotted form plus inner-class `$` → `.` substitution.
+/// Canonical name: dotted form plus inner-class `$` в†’ `.` substitution.
 /// Cached per `ClassId`.
 pub(crate) fn canonical_class_name(class_id: ClassId, slashed: &str) -> Arc<str> {
     if let Some(arc) = cache_get(&CANONICAL_CLASS_NAME_CACHE, class_id) {
@@ -206,20 +206,20 @@ use cratonvm_types::access_flags::{
     ACC_VOLATILE_I32 as ACC_VOLATILE,
 };
 
-/// WP2.1-field — final-field write check for `Field.set*`.
+/// WP2.1-field вЂ” final-field write check for `Field.set*`.
 ///
-/// Per `java.lang.reflect.Field.set` Javadoc and JLS §15.26.1:
+/// Per `java.lang.reflect.Field.set` Javadoc and JLS В§15.26.1:
 ///   * Writing a non-static `final` field via reflection requires
 ///     `setAccessible(true)`. Without it, throws IllegalAccessException.
 ///   * Writing a `static final` field is **always** disallowed via the
-///     plain `Field.set*` path — even with `setAccessible(true)`. (The
+///     plain `Field.set*` path вЂ” even with `setAccessible(true)`. (The
 ///     escape hatch is `Unsafe.staticFieldBase`/`putReference` or
 ///     `MethodHandles.Lookup.findStaticVarHandle`, neither of which
 ///     route through `Field.set`.)
 ///   * Records, hidden classes, and `enum` constants are likewise pinned
 ///     via final fields; we treat them under the same rule. The
 ///     fine-grained record/hidden-class differentiation belongs in a
-///     follow-up — for now we conservatively reject the write.
+///     follow-up вЂ” for now we conservatively reject the write.
 fn check_final_for_set(
     modifiers: i32,
     accessible: bool,
@@ -256,7 +256,7 @@ fn check_final_for_set(
     Ok(())
 }
 
-/// WP2.1-field — volatile-aware load barrier.
+/// WP2.1-field вЂ” volatile-aware load barrier.
 ///
 /// `Field.get` / `Field.getInt` / `Field.getLong` etc. observe the
 /// volatile read semantics of the field, which on the JDK delegate
@@ -270,7 +270,7 @@ fn volatile_load_fence(modifiers: i32) {
     }
 }
 
-/// WP2.1-field — volatile-aware store barrier.
+/// WP2.1-field вЂ” volatile-aware store barrier.
 ///
 /// Mirrors `Unsafe.putReferenceVolatile` / `putIntVolatile` etc.:
 /// emit a `Release` fence before the store and a `SeqCst` full fence
@@ -322,10 +322,10 @@ fn check_access(
 // declaring class to query `NativeContext::check_deep_reflection_access`.
 //
 // The check is invoked in two places:
-//   1. `AccessibleObject.setAccessible(true)` — where JEP 403 specifies that
+//   1. `AccessibleObject.setAccessible(true)` вЂ” where JEP 403 specifies that
 //      deep reflection is gated (throws InaccessibleObjectException).
 //   2. `Method.invoke` / `Field.get|set` / `Constructor.newInstance` when
-//      `accessible == false` — so non-public members in non-exported
+//      `accessible == false` вЂ” so non-public members in non-exported
 //      packages of a different module are not silently reachable.
 
 /// Reflection-internal class-name prefixes that must be skipped when
@@ -341,14 +341,14 @@ const REFLECTION_INTERNAL_CLASSES: &[&str] = &[
 ];
 
 /// Walk the current Java call stack and return the ClassId of the first
-/// non-reflection frame — i.e. the user code that invoked the reflection
+/// non-reflection frame вЂ” i.e. the user code that invoked the reflection
 /// native. Returns `None` if the stack contains no such frame (which
 /// happens when the VM is bootstrapping or when reflection is called from
 /// a pure native context).
 ///
 /// The stack trace comes from `NativeContext::capture_stack_trace(0)` which
 /// returns entries **outermost-first** (`trace[0]` is `main`, the last entry is
-/// the innermost / current frame — the same order the exception printer uses).
+/// the innermost / current frame вЂ” the same order the exception printer uses).
 /// The *immediate* caller of the reflection API is therefore at the END of the
 /// trace, so we iterate in reverse, skip every entry whose `class_name` matches
 /// a reflection-internal prefix, and resolve the first remaining (innermost)
@@ -392,7 +392,7 @@ const LOADER_ID_BOOTSTRAP: i32 = 0;
 const LOADER_ID_PLATFORM: i32 = 1;
 
 /// Does `class_name` look like a boot/JDK package name? This is necessary but
-/// **not** sufficient on its own — a user class loader can define a class with
+/// **not** sufficient on its own вЂ” a user class loader can define a class with
 /// a `jdk/` or `sun/` package name, so callers must additionally confirm the
 /// class was actually defined by a trusted (Bootstrap/Platform) loader before
 /// treating it as JDK-internal. See `caller_is_jdk_internal`.
@@ -405,7 +405,7 @@ fn looks_like_jdk_package(class_name: &str) -> bool {
 
 /// Decide whether a reflective access whose caller has been resolved to
 /// `accessor_name` / `accessor_loader_id` should be treated as a genuine
-/// JDK-internal (boot-path) caller — the only callers permitted to bypass the
+/// JDK-internal (boot-path) caller вЂ” the only callers permitted to bypass the
 /// deep-reflection module check.
 ///
 /// Pure function (no `ctx`) so it can be unit-tested directly. The policy is:
@@ -429,24 +429,24 @@ fn caller_is_jdk_internal(accessor_name: Option<&str>, accessor_loader_id: i32) 
 /// `accessible_override` indicates whether the caller has already passed
 /// `setAccessible(true)` on the AccessibleObject. Per JEP 403, once the
 /// override flag is set the subsequent `invoke/get/set` bypasses the deep
-/// check — the check has already been paid at `setAccessible` time.
+/// check вЂ” the check has already been paid at `setAccessible` time.
 ///
 /// Returns the `Err` variant that the caller should propagate:
-///   * when called from `setAccessible` → caller turns it into
+///   * when called from `setAccessible` в†’ caller turns it into
 ///     `InaccessibleObjectException`
 ///   * when called from `invoke/get/set` with `accessible_override == false`
-///     → caller turns it into `IllegalAccessException`
+///     в†’ caller turns it into `IllegalAccessException`
 ///
-/// Policy (H4 hardening — the decision is keyed on the *caller*, never on the
+/// Policy (H4 hardening вЂ” the decision is keyed on the *caller*, never on the
 /// target class name):
-///   * `accessible_override == true` → allow (JEP 403: check already paid).
-///   * No resolvable Java caller frame → VM bootstrap, nothing to check
-///     against → allow.
+///   * `accessible_override == true` в†’ allow (JEP 403: check already paid).
+///   * No resolvable Java caller frame в†’ VM bootstrap, nothing to check
+///     against в†’ allow.
 ///   * Caller is a genuine JDK-internal/boot-path caller (defined by the
-///     Bootstrap or Platform loader AND in a boot package) → allow, so
+///     Bootstrap or Platform loader AND in a boot package) в†’ allow, so
 ///     legitimate JDK-internal-to-JDK-internal reflection keeps working.
 ///   * Otherwise the caller is user code (Application / UserDefined loader):
-///       - if the target class is not loaded → fail CLOSED (deny);
+///       - if the target class is not loaded в†’ fail CLOSED (deny);
 ///       - else delegate to `NativeContext::check_deep_reflection_access`.
 fn check_reflection_module_access(
     ctx: &mut dyn NativeContext,
@@ -455,14 +455,14 @@ fn check_reflection_module_access(
 ) -> Result<(), String> {
     if accessible_override {
         // Once setAccessible(true) has been granted, subsequent reflective
-        // operations trust the override flag (JEP 403 §"API changes").
+        // operations trust the override flag (JEP 403 В§"API changes").
         return Ok(());
     }
     // Resolve the caller FIRST: the access decision is keyed entirely on who
     // is performing the reflection, never on the name of the target class.
     let accessor_cid = match resolve_caller_class_id(ctx) {
         Some(cid) => cid,
-        // No user frame — either VM bootstrap or all frames are reflection
+        // No user frame вЂ” either VM bootstrap or all frames are reflection
         // internals. Allow; we are not invoked from Java code.
         None => return Ok(()),
     };
@@ -470,7 +470,7 @@ fn check_reflection_module_access(
     let accessor_loader_id = ctx.loader_id_of_class(accessor_cid);
 
     // Genuine JDK-internal callers (java.base classes performing reflection on
-    // their own private types — e.g. `StackStreamFactory$StackFrameBuffer.fill`
+    // their own private types вЂ” e.g. `StackStreamFactory$StackFrameBuffer.fill`
     // constructing `StackFrameInfo` via `Constructor.newInstance`) must not be
     // subject to the unnamed-module check: our class loader does not always
     // populate `module_name` for JDK inner classes, so the same-module rule
@@ -544,7 +544,7 @@ fn enforce_module_check_on_field(
 ) -> Result<(), cratonvm_types::error::MethodCallFailed> {
     // JEP 403/261 distinction (same pattern as Method.invoke /
     // Constructor.newInstance): a PUBLIC field needs only `exports`,
-    // not `opens` — only non-public fields require the deep check.
+    // not `opens` вЂ” only non-public fields require the deep check.
     let field_modifiers = match ctx.get_field_by_name(this, "modifiers") {
         Value::Int(v) => v,
         _ => 0,
@@ -577,9 +577,9 @@ fn enforce_module_check_on_field(
 /// (`<defining-class-dotted>$$Lambda/0x<id>`), or `None` if `class_id` is not a
 /// lambda proxy. Mirrors JDK 15+ hidden-class lambda names; the real JDK uses a
 /// per-run hidden-class address after `/0x` (so it is never byte-stable across
-/// runs anyway) — we use the stable proxy class id instead. The returned name
+/// runs anyway) вЂ” we use the stable proxy class id instead. The returned name
 /// is already dotted and MUST be used verbatim: it intentionally contains a `/`
-/// (before `0x`) that the usual internal→dotted `/`→`.` rewrite would corrupt.
+/// (before `0x`) that the usual internalв†’dotted `/`в†’`.` rewrite would corrupt.
 fn lambda_proxy_class_name(ctx: &dyn NativeContext, class_id: ClassId) -> Option<String> {
     // Fast reject for ordinary classes (avoids the `lambda_proxies` read lock on
     // the hot getName path): lambda proxy ids are always >= 0x8000_0000.
@@ -667,7 +667,7 @@ pub(crate) fn native_class_get_name(
         }
     }
 
-    // bytebuddy_probe (agent-bb4) — STRICT-NAME-FIRST.
+    // bytebuddy_probe (agent-bb4) вЂ” STRICT-NAME-FIRST.
     //
     // ByteBuddy's `TypeDescription.ForLoadedType` hierarchy walker raises
     // `IllegalStateException("Failed to resolve super class class
@@ -705,12 +705,12 @@ pub(crate) fn native_class_get_name(
         }
     }
 
-    // Strict path returned nothing — use the reverse-map / class_id path.
+    // Strict path returned nothing вЂ” use the reverse-map / class_id path.
     match mirror_class_id(ctx, this) {
         Some(class_id) => {
             // Fast path: use the cache only when the VM reverse map
             // (`class_id_from_mirror`) resolved the mirror to its ClassId
-            // — i.e. this is a real-VM class that the class manager
+            // вЂ” i.e. this is a real-VM class that the class manager
             // owns. The synthetic field-0-Int fallback path used by unit
             // tests can collide many distinct names onto ClassId(0); we
             // bypass the cache for those to preserve byte-identical
@@ -759,8 +759,8 @@ pub(crate) fn native_class_get_name(
             Ok(Some(Value::Object(Some(name_obj))))
         }
         None => {
-            // Primitive mirror or unknown — last-resort: read name via the
-            // permissive helper (which still tries slot 1 → reverse-map).
+            // Primitive mirror or unknown вЂ” last-resort: read name via the
+            // permissive helper (which still tries slot 1 в†’ reverse-map).
             // For array-class mirrors (e.g. `[Ljava/lang/String;`) the internal
             // name uses '/' separators; `Class.getName()` must report the
             // dotted form (`[Ljava.lang.String;`) so Spring's
@@ -769,8 +769,8 @@ pub(crate) fn native_class_get_name(
             // Plain primitive names like "int"/"void" contain no '/', so the
             // replace is a no-op for them.
             //
-            // No `ClassId` here to cache against — primitive mirrors don't
-            // have one — so this path still allocates per call. In practice
+            // No `ClassId` here to cache against вЂ” primitive mirrors don't
+            // have one вЂ” so this path still allocates per call. In practice
             // this is rare (only primitive `getName()` calls; user code
             // usually goes through the `Some(class_id)` arm above).
             if let Some(prim_name) = mirror_class_name(ctx, this) {
@@ -818,7 +818,7 @@ pub(crate) fn native_class_get_primitive_class(
 /// reading field 0 as Int(class_id) for legacy/synthetic compatibility.
 ///
 /// Returns `None` for primitive mirrors (not in the reverse map and
-/// field 0 is no longer Int(-1) — it's Object(None) in real-JDK mode).
+/// field 0 is no longer Int(-1) вЂ” it's Object(None) in real-JDK mode).
 pub(crate) fn mirror_class_id(
     ctx: &dyn NativeContext,
     mirror: cratonvm_types::ObjectRef,
@@ -837,8 +837,8 @@ pub(crate) fn mirror_class_id(
 /// Helper: read the **internal** class name from a Class mirror (`pkg/Cls`,
 /// `[I`, etc.).
 ///
-/// Prefer the VM reverse-map (`class_id_from_mirror` → [`NativeContext::class_name_of_id`])
-/// for real `java.lang.Class` instances — JDK 25 may store something other
+/// Prefer the VM reverse-map (`class_id_from_mirror` в†’ [`NativeContext::class_name_of_id`])
+/// for real `java.lang.Class` instances вЂ” JDK 25 may store something other
 /// than the internal name at slot 1, which broke `getPackage` and reflective
 /// constructor matching for Spring Boot.
 ///
@@ -869,10 +869,10 @@ pub(crate) fn mirror_class_name(
 ///
 /// Symmetric with [`mirror_class_name`] but inverts the priority: read the
 /// internal name from **slot 1** first, only falling back to the reverse-map
-/// (`class_id_from_mirror` → `class_name_of_id`) or field-0 ClassId when
+/// (`class_id_from_mirror` в†’ `class_name_of_id`) or field-0 ClassId when
 /// slot 1 is missing/empty.
 ///
-/// bytebuddy_probe (agent-bb4) — ByteBuddy's hierarchy walker raises
+/// bytebuddy_probe (agent-bb4) вЂ” ByteBuddy's hierarchy walker raises
 /// `IllegalStateException("Failed to resolve super class class
 /// java.lang.Object from [class java.lang.Object]")` when `getName()` and
 /// `getSuperclass()` disagree on a non-Object class C: if our reverse-map
@@ -882,7 +882,7 @@ pub(crate) fn mirror_class_name(
 /// `C.getName() == Object.getName()` and treats C as its own super.
 ///
 /// The strict reader sidesteps that corruption by trusting the slot-1
-/// String that was set at mirror-allocation time — that string was written
+/// String that was set at mirror-allocation time вЂ” that string was written
 /// from the *real* internal name and is not aliased through the reverse
 /// map. Use this in any place where reading the mirror's identity must
 /// not be silently re-aliased to Object.
@@ -928,21 +928,21 @@ pub(crate) fn native_class_is_sealed(
 // ---------------------------------------------------------------------------
 // T19_H10_RESOURCE_VALIDATION: shared resource-name guard used by both
 // `Class.getResourceAsStream` and `Class.getResource` (and any future
-// `getResource[s]` delegator).  Returns `None` on rejection — caller should
+// `getResource[s]` delegator).  Returns `None` on rejection вЂ” caller should
 // surface that as a null InputStream / null URL, exactly matching what the
 // real JDK does for resources that fail policy.
 //
 // Hardening rules (all per the T19.H10 brief, security section):
-//   * Empty / >256 byte name → reject. The 256-byte cap is conservative;
+//   * Empty / >256 byte name в†’ reject. The 256-byte cap is conservative;
 //     `keycloak-version.properties` is 28 bytes, the longest legitimate JDK
 //     resource we've observed (`META-INF/services/java.security.Provider`)
 //     is 49 bytes, and the JLS does not bound the name so we pick a length
 //     that is comfortably above legitimate usage but small enough to keep
 //     a malicious caller from forcing a large allocation in `find_resource`.
-//   * Any byte < 0x20 or == 0x7F (DEL) → reject. NUL injects through native
+//   * Any byte < 0x20 or == 0x7F (DEL) в†’ reject. NUL injects through native
 //     POSIX paths; the rest are control bytes that have no business in a
 //     resource name and tend to indicate a corrupted constant-pool entry.
-//   * Backslash → reject. Resource paths are forward-slash on every JVM
+//   * Backslash в†’ reject. Resource paths are forward-slash on every JVM
 //     platform; backslash here is a Windows-path-injection signal.
 //
 // `..` segments are intentionally NOT rejected here (residual-1 fix):
@@ -952,7 +952,7 @@ pub(crate) fn native_class_is_sealed(
 // path-traversal backstop already lives one layer down in
 // `find_resource`/`find_all_resource_urls` (`classloading/src/class_path.rs`),
 // which canonicalize the resolved path and reject it unless it stays
-// `starts_with` the canonicalized classpath root — the exact same
+// `starts_with` the canonicalized classpath root вЂ” the exact same
 // archive-vs-directory split (`is_safe_resource_name` vs
 // `is_directory_resolvable_resource_name`) already governs jar-entry lookups
 // there, so rejecting `..` again here only broke the legitimate case without
@@ -1018,7 +1018,7 @@ fn t19_h10_resolve_resource_name(
 /// path so the two stay layout-identical (`buf=0, pos=1, mark=2, count=3`).
 ///
 /// The dual-write (slot index + by-name) handles the case where the class
-/// hasn't been loaded yet — `set_field_by_name` is a no-op pre-load — while
+/// hasn't been loaded yet вЂ” `set_field_by_name` is a no-op pre-load вЂ” while
 /// staying correct for a real-JDK BAIS once loaded.
 pub(crate) fn t19_h10_alloc_byte_array_input_stream(
     ctx: &mut dyn NativeContext,
@@ -1041,7 +1041,7 @@ pub(crate) fn t19_h10_alloc_byte_array_input_stream(
     stream
 }
 
-/// T14/T15 + T19.H10: `Class.getResourceAsStream(String)` — bypasses the
+/// T14/T15 + T19.H10: `Class.getResourceAsStream(String)` вЂ” bypasses the
 /// Module-based resolution path in real JDK 25 bytecode and delegates
 /// directly to the resource lookup, returning a `ByteArrayInputStream`
 /// over the resource bytes.
@@ -1051,7 +1051,7 @@ pub(crate) fn t19_h10_alloc_byte_array_input_stream(
 ///     backslash names are rejected before reaching `find_resource`,
 ///     preventing a malicious classpath caller from coercing the lookup
 ///     into a path-traversal probe or a large-allocation request.
-///   * Null `name` argument now returns null (matches JDK 25 spec —
+///   * Null `name` argument now returns null (matches JDK 25 spec вЂ”
 ///     `Class.getResourceAsStream(null)` throws NPE in the JDK, but the
 ///     callers that actually hit this native always pass a non-null
 ///     constant-pool string; the bytecode-level NPE is the right answer
@@ -1091,23 +1091,23 @@ pub(crate) fn native_class_get_resource_as_stream(
     }
 }
 
-/// T14/T15 + T19.H10: `Class.getResource(String)` — returns a URL pointing
+/// T14/T15 + T19.H10: `Class.getResource(String)` вЂ” returns a URL pointing
 /// at the resource, or null if absent.
 ///
 /// This builds a REAL, parseable URL (`jar:file:...!/...` or `file:...` or
 /// `jrt:/...`) the same way `ClassLoader.getResource` does, instead of a
 /// bespoke `resource:` scheme. The old `resource:` scheme broke apps that
 /// locate their install root via
-/// `SomeClass.class.getResource(...)` → `new File(url.toURI())` →
+/// `SomeClass.class.getResource(...)` в†’ `new File(url.toURI())` в†’
 /// `getParentFile()`: `getPath()` produced a non-existent path and
-/// `getParentFile()` eventually returned null → NPE.
+/// `getParentFile()` eventually returned null в†’ NPE.
 ///
 /// We resolve the resource name (absolute names with a leading `/` are used
 /// verbatim minus the slash; class-package-relative names are prefixed with
 /// the declaring class's package) via the shared `t19_h10_resolve_resource_name`
 /// helper, then ask the classpath for the structured URL list with
 /// `find_all_resource_urls` and build the `java.net.URL` from the first hit
-/// via `build_synthetic_url` — keeping `Class.getResource` and
+/// via `build_synthetic_url` вЂ” keeping `Class.getResource` and
 /// `ClassLoader.getResource` returning the same URL form for the same name.
 /// If the resource does not exist we return null, as before.
 pub(crate) fn native_class_get_resource(
@@ -1153,10 +1153,10 @@ pub(crate) fn native_class_get_resource(
     Ok(Some(Value::Object(Some(url))))
 }
 
-/// RKC16r23 — detect jboss-logging's i18n localized-logger fallback names.
+/// RKC16r23 вЂ” detect jboss-logging's i18n localized-logger fallback names.
 ///
 /// jboss-logging generates classes named `<base>_$logger` and walks the
-/// `Class.forName` chain `_$logger_<lang>_<country>` → `_$logger_<lang>` →
+/// `Class.forName` chain `_$logger_<lang>_<country>` в†’ `_$logger_<lang>` в†’
 /// `_$logger` (then a parallel `_$bundle` chain). Only the base names ship
 /// in app jars; the locale-suffixed variants always CNFE.
 ///
@@ -1187,14 +1187,14 @@ fn i18n_logger_locale_suffix(name: &str) -> bool {
         None => true, // `_$logger_<lang>`
         Some(country) => {
             // `_$logger_<lang>_<country>` (no further parts; variant possible
-            // but rare — accept country=2 upper or 2-3 alphanum).
+            // but rare вЂ” accept country=2 upper or 2-3 alphanum).
             let ok = country.len() == 2 && country.chars().all(|c| c.is_ascii_uppercase());
             ok && parts.next().is_none()
         }
     }
 }
 
-/// RKC16r23 — gate the verbose `Class.forName` diagnostic prints behind an
+/// RKC16r23 вЂ” gate the verbose `Class.forName` diagnostic prints behind an
 /// env var so they don't pollute boot logs in normal runs. Set
 /// `CRATONVM_S111_DBG=1` to re-enable.
 fn s111_dbg_enabled() -> bool {
@@ -1211,7 +1211,7 @@ macro_rules! s111_dbg {
 }
 
 // ---------------------------------------------------------------------------
-// WF7 — `Class.forName` synthesis for WildFly / Keycloak / JBoss-Modules
+// WF7 вЂ” `Class.forName` synthesis for WildFly / Keycloak / JBoss-Modules
 // entry classes.
 //
 // Background: WF6 added a synthetic-`main`-shim in `getDeclaredMethod`, but
@@ -1232,12 +1232,12 @@ macro_rules! s111_dbg {
 // / reflective `invoke` calls then walk a real method list rather than
 // surfacing NSME.
 //
-// We do *not* short-circuit when the class is already defined — if a real
+// We do *not* short-circuit when the class is already defined вЂ” if a real
 // `org/jboss/as/server/Main` exists on the classpath we still defer to the
 // regular resolution path. The synthesis only fires as a fallback.
 // ---------------------------------------------------------------------------
 
-/// WF7 — internal-form (slash-separated) fragments of classes we treat as
+/// WF7 вЂ” internal-form (slash-separated) fragments of classes we treat as
 /// WildFly / JBoss / Keycloak entry points. Matching by `contains` keeps
 /// the predicate forgiving across version-suffix or module-prefix moves
 /// (e.g. `org/jboss/as/server/Main` vs `org/jboss/modules/Main`).
@@ -1248,10 +1248,10 @@ const WF7_ENTRY_FRAGMENTS: &[&str] = &[
     "keycloak/Main",
 ];
 
-/// WF7 — build a minimal Java 8 class file for `class_name_internal` that
+/// WF7 вЂ” build a minimal Java 8 class file for `class_name_internal` that
 /// exposes a public no-op `<init>()V` plus a public-static no-op
 /// `main([Ljava/lang/String;)V`. The bytes are a direct re-implementation
-/// of `jboss_module_loader::build_synthetic_class_with_main` — we copy the
+/// of `jboss_module_loader::build_synthetic_class_with_main` вЂ” we copy the
 /// logic here because `lang_class.rs` must not depend on
 /// `jboss_module_loader` (the latter pulls in module-XML parsing and
 /// resource-root state we don't want to thread through the
@@ -1364,7 +1364,7 @@ fn wf7_build_minimal_main_class(class_name_internal: &str) -> Vec<u8> {
     bytes.extend_from_slice(&[0x00, 0x01]);
     // -- Code attribute --
     bytes.extend_from_slice(&[0x00, 0x0B]); // attribute_name_index = "Code"
-                                            // Body: return (0xB1) — len = 1
+                                            // Body: return (0xB1) вЂ” len = 1
     let main_code: [u8; 1] = [0xB1];
     let main_attr_len: u32 = 2 + 2 + 4 + (main_code.len() as u32) + 2 + 2;
     bytes.extend_from_slice(&main_attr_len.to_be_bytes());
@@ -1386,7 +1386,7 @@ fn wf7_build_minimal_main_class(class_name_internal: &str) -> Vec<u8> {
     bytes
 }
 
-/// WF7 — if `internal_name` looks like a WildFly/Keycloak entry-class FQCN
+/// WF7 вЂ” if `internal_name` looks like a WildFly/Keycloak entry-class FQCN
 /// (slash-separated) and the class isn't already defined, build a minimal
 /// stub with a no-op `main` and register it via
 /// `NativeContext::define_class_from_bytes`. Returns the class mirror on
@@ -1401,7 +1401,7 @@ fn wf7_synthesise_entry_class_if_missing(
     // by default. It defined a 191-byte synthetic class with a no-op
     // `main([Ljava/lang/String;)V` whenever `Class.forName` for a
     // WildFly/Keycloak entry-class name missed. That synthetic class
-    // would then be invoked as the entry-point — short-circuiting any
+    // would then be invoked as the entry-point вЂ” short-circuiting any
     // real boot. The guard above ("if class already loaded, return None")
     // limits scope, but the gate-off is the safer default.
     if std::env::var("CRATONVM_USE_WILDFLY_SYNTH_BYTECODE").as_deref() != Ok("1") {
@@ -1415,7 +1415,7 @@ fn wf7_synthesise_entry_class_if_missing(
     {
         return None;
     }
-    // If the class is already loaded, defer to the real one — synthesis is
+    // If the class is already loaded, defer to the real one вЂ” synthesis is
     // a fallback, never a replacement.
     if ctx.class_id_by_name(internal_name).is_some() {
         return None;
@@ -1425,7 +1425,7 @@ fn wf7_synthesise_entry_class_if_missing(
     Some(ctx.get_class_mirror(cid))
 }
 
-/// Security hardening — reject `Class.forName` names that look like a
+/// Security hardening вЂ” reject `Class.forName` names that look like a
 /// class-load / path-traversal injection rather than a legitimate binary
 /// class name.
 ///
@@ -1437,17 +1437,17 @@ fn wf7_synthesise_entry_class_if_missing(
 /// the loader and probe the host filesystem. This helper centralizes the
 /// check so both paths enforce the same rules.
 ///
-/// A binary class name (JLS §13.1 / JVMS §4.2.1) never contains:
+/// A binary class name (JLS В§13.1 / JVMS В§4.2.1) never contains:
 ///   * a NUL, any other control byte (`< 0x20`), or DEL (`0x7F`);
 ///   * a forward slash `/` or backslash `\` in its *dotted* form (the dotted
-///     form uses `.` as the package separator — a literal `/`/`\` is a path
+///     form uses `.` as the package separator вЂ” a literal `/`/`\` is a path
 ///     character, not a package separator);
 ///   * an empty package segment, i.e. a `..` run (which in dotted form means
 ///     a zero-length identifier and is the canonical filesystem
 ///     parent-directory traversal token).
 /// Empty names are likewise rejected.
 ///
-/// On rejection we return `ClassNotFoundException(dotted_name)` — the same
+/// On rejection we return `ClassNotFoundException(dotted_name)` вЂ” the same
 /// exception the primary overloads raise for any other unresolved name, so
 /// a rejected probe is indistinguishable from an ordinary miss and leaks no
 /// information about why it failed.
@@ -1494,23 +1494,23 @@ pub(crate) fn native_class_for_name(
         }
     };
     let dotted_name = ctx.read_string(name_obj).unwrap_or_default();
-    // Security hardening — screen the requested name for control bytes and
+    // Security hardening вЂ” screen the requested name for control bytes and
     // path-traversal separators before it reaches any class loader. See
     // `validate_for_name_dotted`.
     validate_for_name_dotted(&dotted_name)?;
     let internal_name = dotted_name.replace('.', "/");
 
-    // BUG-06 — mark this thread as inside a reflective class-existence probe for
+    // BUG-06 вЂ” mark this thread as inside a reflective class-existence probe for
     // the duration of resolution. The class loader consults this flag and
     // refuses to fabricate a synthetic enterprise-framework stub (org/jboss/,
-    // io/smallrye/, …) for a class that is not actually on the classpath, so
+    // io/smallrye/, вЂ¦) for a class that is not actually on the classpath, so
     // `Class.forName` / `ClassUtils.isPresent` correctly report it absent (CNFE)
     // instead of a false positive. The guard clears on every return path,
     // including the wf7 entry-class synthesis below (which is unaffected: it
     // runs only after `loadClass` itself yields null/CNFE).
     let _probe_guard = cratonvm_types::reflective_probe::ProbeGuard::new();
 
-    // RKC16r23 — jboss-logging i18n localized-logger lookup short-circuit.
+    // RKC16r23 вЂ” jboss-logging i18n localized-logger lookup short-circuit.
     //
     // jboss-logging's `Messages.getBundle` / `LoggerProviders.doGetMessageLogger`
     // walks a fallback chain of `<FQCN>_$logger_<lang>_<country>`,
@@ -1521,7 +1521,7 @@ pub(crate) fn native_class_for_name(
     // Inside CratonVM, each `loadClass` round-trip for a missing class is
     // expensive: ModuleClassLoader's `loadClass` walks the dependency graph,
     // tries every resource-root JAR, fails, throws CNFE. For Keycloak this
-    // happens on every WARN/ERROR log call — turning what should be a no-op
+    // happens on every WARN/ERROR log call вЂ” turning what should be a no-op
     // cached negative into a tight loop of class-loader walks that visibly
     // dominates boot time.
     //
@@ -1529,7 +1529,7 @@ pub(crate) fn native_class_for_name(
     // own `Messages` infrastructure caches the resolved bundle Class per
     // `Class<?>` key, so the chain only walks once per bundle interface. In
     // our run the cache lookup isn't hitting (likely the `Messages` static
-    // field is being re-clinit'd or the WeakReference clears) — and rather
+    // field is being re-clinit'd or the WeakReference clears) вЂ” and rather
     // than reverse-engineer jboss-logging's internals, we short-circuit the
     // negative answer at the VM boundary: any name matching the
     // `<...>_$logger_<lang>(_<country>)?` suffix where the suffix's
@@ -1544,14 +1544,14 @@ pub(crate) fn native_class_for_name(
         );
     }
 
-    // RKC16N.12 — when `Class.forName` is invoked with an explicit non-null
+    // RKC16N.12 вЂ” when `Class.forName` is invoked with an explicit non-null
     // classloader, route through `loader.loadClass(name)` so module-scoped
     // loaders (notably `org.jboss.modules.ModuleClassLoader`) get their
     // visibility-closure search. Without this, JBoss Modules' boot path
-    // (`Module.run` → `Class.forName(mainClass, false, mcl)` at PC 40 of
+    // (`Module.run` в†’ `Class.forName(mainClass, false, mcl)` at PC 40 of
     // `Module.run(String,String[])`) bypasses the module's resource-roots
     // and the bootstrap classpath has no entry for module-private classes
-    // like `org.jboss.as.server.Main` — so KC16 boot dies with CNFE before
+    // like `org.jboss.as.server.Main` вЂ” so KC16 boot dies with CNFE before
     // reaching `Main.main`.
     //
     // Argument layout per JDK 25 `Class.forName0(String,boolean,ClassLoader,Class)`:
@@ -1581,13 +1581,13 @@ pub(crate) fn native_class_for_name(
                     "[S111-DBG] loadClass({}) succeeded via invoke_virtual",
                     dotted_name
                 );
-                // HIB-CV-26 — honour the `initialize` flag (args[1]).
+                // HIB-CV-26 вЂ” honour the `initialize` flag (args[1]).
                 // `ClassLoader.loadClass` only loads + links the class; it does
                 // NOT run static initialisers. The JDK contract for
                 // `Class.forName(name, true, loader)` is that the class IS
                 // initialised before the call returns (this is exactly the
                 // distinction HHH-7272 relies on: `loadClass` skips `<clinit>`,
-                // `Class.forName(.., true, ..)` runs it — so a JDBC driver's
+                // `Class.forName(.., true, ..)` runs it вЂ” so a JDBC driver's
                 // self-registering static block fires). Without this, drivers
                 // loaded via the 3-arg overload never register and
                 // `DriverManager.getDriver` throws "No suitable driver".
@@ -1618,7 +1618,7 @@ pub(crate) fn native_class_for_name(
             // (per spec it must throw CNFE) but defensively translate it.
             Ok(None) => {
                 s111_dbg!("[S111-DBG] loadClass({}) returned null", dotted_name);
-                // WF7 — see the matching block at the bottom of this
+                // WF7 вЂ” see the matching block at the bottom of this
                 // function for the rationale: synthesise an entry-class
                 // stub when the module loader yields nothing for a name
                 // we recognise as a WildFly / Keycloak boot entry.
@@ -1637,7 +1637,7 @@ pub(crate) fn native_class_for_name(
                     .into(),
                 );
             }
-            // S111r12 — NSME on `loader.loadClass` rescue. Spring Boot 2's
+            // S111r12 вЂ” NSME on `loader.loadClass` rescue. Spring Boot 2's
             // SB2 launcher path delivers a `LaunchedURLClassLoader`
             // instance whose `class_id_of` returns `java/lang/Comparable`
             // (the loader inherited that stub class_id somewhere in the
@@ -1656,7 +1656,7 @@ pub(crate) fn native_class_for_name(
                 );
                 // Fall through to bootstrap-style ensure_class_initialized below.
             }
-            // S111r20 — Spring Boot 2.x LaunchedURLClassLoader.loadClass
+            // S111r20 вЂ” Spring Boot 2.x LaunchedURLClassLoader.loadClass
             // fails in CratonVM because the JDK bytecode for URLClassPath
             // walks nested-JAR URLs (jar:file:/fat.jar!/BOOT-INF/lib/foo.jar!/)
             // via JarURLConnection + the Spring Boot custom jar: Handler. These
@@ -1667,7 +1667,7 @@ pub(crate) fn native_class_for_name(
             // scanner (which already extracted the nested JARs from BOOT-INF/lib).
             //
             // We do NOT apply this rescue to module-aware class loaders like
-            // org.jboss.modules.ModuleClassLoader — for those, CNFE is the
+            // org.jboss.modules.ModuleClassLoader вЂ” for those, CNFE is the
             // authoritative answer about module visibility. Detect Spring Boot's
             // LaunchedURLClassLoader by class name prefix.
             Err(cratonvm_types::error::MethodCallFailed::ExceptionThrown(exc_ref)) => {
@@ -1686,13 +1686,13 @@ pub(crate) fn native_class_for_name(
                     // Fall through to ensure_class_initialized below.
                 } else {
                     // For module-scoped loaders (JBoss Modules, OSGi, etc.)
-                    // the CNFE is authoritative — propagate it.
-                    // WF7 — but FIRST try entry-class synthesis: jboss-modules'
+                    // the CNFE is authoritative вЂ” propagate it.
+                    // WF7 вЂ” but FIRST try entry-class synthesis: jboss-modules'
                     // `ModuleClassLoader.loadClass("org.jboss.as.server.Main")`
                     // fails because the module's resource-roots don't list a
                     // real `Main` (KC16 + WF deliver it via a different path
                     // CratonVM doesn't reproduce). Synthesising a stub here is
-                    // the whole point of WF7 — let the bootstrap finish.
+                    // the whole point of WF7 вЂ” let the bootstrap finish.
                     if let Some(mirror) = wf7_synthesise_entry_class_if_missing(ctx, &internal_name)
                     {
                         tracing::warn!(
@@ -1702,7 +1702,7 @@ pub(crate) fn native_class_for_name(
                         );
                         return Ok(Some(Value::Object(Some(mirror))));
                     }
-                    // The loader threw a Java exception — propagate it as-is.
+                    // The loader threw a Java exception вЂ” propagate it as-is.
                     // For a class-load failure it already names the missing
                     // class (CNFE/NCDFE), and for any other failure type the
                     // raw exception is more informative than a synthesized
@@ -1730,7 +1730,7 @@ pub(crate) fn native_class_for_name(
 
     match ctx.ensure_class_initialized(&internal_name) {
         Ok(class_id) => {
-            // WP2.10 — JDK 25 spec: hidden classes (created via
+            // WP2.10 вЂ” JDK 25 spec: hidden classes (created via
             // Lookup.defineHiddenClass) are NOT discoverable by name.
             // `Class.forName` must throw ClassNotFoundException for them
             // even though they are loaded.
@@ -1769,12 +1769,12 @@ pub(crate) fn native_class_for_name(
             } else {
                 s111_dbg!("[FORNAME-ERR] name={} err={:?}", dotted_name, e);
             }
-            // WF7 — last-ditch: if this is a known WildFly/Keycloak entry
+            // WF7 вЂ” last-ditch: if this is a known WildFly/Keycloak entry
             // class, synthesise a minimal stub class with a no-op `main` so
             // jboss-modules' bootstrap (`Class.forName(mainClass, false, mcl)`
             // followed by `getDeclaredMethod("main", String[].class).invoke`)
             // can complete instead of dying on NSME. See WF7 strategy notes
-            // at the top of this module for the rationale — the WF6
+            // at the top of this module for the rationale вЂ” the WF6
             // `getDeclaredMethod` shim never fires because the class
             // *appears* loaded by the time `getDeclaredMethod` runs (it just
             // doesn't have a `main`); by injecting a real class earlier we
@@ -1788,7 +1788,7 @@ pub(crate) fn native_class_for_name(
                 return Ok(Some(Value::Object(Some(mirror))));
             }
             // If a Java exception was raised during load/link/init, it is the
-            // authoritative diagnostic — propagate it unchanged. JVMS lets
+            // authoritative diagnostic вЂ” propagate it unchanged. JVMS lets
             // `Class.forName` surface the underlying `LinkageError` (commonly
             // `NoClassDefFoundError` naming the missing transitive class), and
             // HotSpot does exactly that. The previous behaviour of synthesizing
@@ -1801,7 +1801,7 @@ pub(crate) fn native_class_for_name(
             ) {
                 return Err(e);
             }
-            // No Java exception was raised — the class file simply could not
+            // No Java exception was raised вЂ” the class file simply could not
             // be located on any source on the classpath. Throw `CNFE(dotted)`.
             Err(
                 cratonvm_types::error::RuntimeError::ClassNotFoundException {
@@ -1819,7 +1819,7 @@ pub(crate) fn native_class_for_name_3(
 ) -> MethodCallResult {
     // Same as forName(String) but ignores initialize flag and classLoader.
     //
-    // Security hardening — screen the requested name here as well, BEFORE any
+    // Security hardening вЂ” screen the requested name here as well, BEFORE any
     // class loader sees it. Delegation to `native_class_for_name` already
     // re-runs `validate_for_name_dotted`, but performing the check up-front
     // keeps the guarantee local to this entry point and resilient to future
@@ -1834,7 +1834,7 @@ pub(crate) fn native_class_for_name_3(
     native_class_for_name(ctx, args)
 }
 
-// T19_H12_FORNAME_MODULE — `Class.forName(Module, String)` per JDK 25 spec.
+// T19_H12_FORNAME_MODULE вЂ” `Class.forName(Module, String)` per JDK 25 spec.
 //
 // JDK's stock bytecode for this overload resolves `module.getClassLoader()`
 // then invokes `cl.loadClass(module, name)`. Our synthetic `java.lang.Module`
@@ -1853,9 +1853,9 @@ pub(crate) fn native_class_for_name_3(
 // branch in real JDK anyway.
 //
 // Per JEP 261 / Class.forName(Module, String) javadoc:
-//   - If `module` is null → NullPointerException
-//   - If `name` is null → NullPointerException
-//   - If the class is not found in the module → return null (NOT throw CNFE)
+//   - If `module` is null в†’ NullPointerException
+//   - If `name` is null в†’ NullPointerException
+//   - If the class is not found in the module в†’ return null (NOT throw CNFE)
 //   - Hidden classes are not discoverable
 pub(crate) fn native_class_for_name_module(
     ctx: &mut dyn NativeContext,
@@ -1928,12 +1928,12 @@ pub(crate) fn native_class_is_instance(
     };
     let target_class_id = ctx.class_id_of_object(target);
 
-    // S111r17 — Array-aware isInstance.  Heap-stored `class_id_of` for an
+    // S111r17 вЂ” Array-aware isInstance.  Heap-stored `class_id_of` for an
     // array returns the COMPONENT class id (e.g. `java/lang/Class` for a
     // `Class[]` array), NOT the synthetic `[Lcomponent;` array class id.
     // Without this branch, `Class[].isInstance(myClassArray)` reduces to
     // `is_subclass(java/lang/Class, [Ljava/lang/Class;)` which is always
-    // false — the same bug that the interpreter's `instanceof` bytecode
+    // false вЂ” the same bug that the interpreter's `instanceof` bytecode
     // already works around in `array_descriptor_of` /
     // `array_is_assignable_to`.  Mirror that logic here so reflection
     // callers (Spring's `TypeMappedAnnotation.adapt`, which throws
@@ -1948,7 +1948,7 @@ pub(crate) fn native_class_is_instance(
         }
         // Fall through to legacy id-based check below (covers some
         // edge cases where the target is an array but the type mirror
-        // is a non-array Class — those reduce to assignable-to-Object
+        // is a non-array Class вЂ” those reduce to assignable-to-Object
         // via `array_is_assignable` already, so this is just defensive).
     }
 
@@ -1992,7 +1992,7 @@ pub(crate) fn native_class_is_instance(
     // `Class[]`). Mirror the interpreter's `proxy_instance_satisfies_target`
     // (checkcast/instanceof admission) here so reflective `Class.isInstance` /
     // `Class.cast` agree. Without this, `Class.cast` on a proxy throws a
-    // ClassCastException — e.g. Gradle's logging `ListenerBroadcast.getSource()`
+    // ClassCastException вЂ” e.g. Gradle's logging `ListenerBroadcast.getSource()`
     // proxy cast to `OutputEventListener` killed every test worker.
     if let Some(target_name) = ctx.class_name_of_id(target_class_id) {
         if target_name == "java/lang/reflect/Proxy$Instance" {
@@ -2050,7 +2050,7 @@ pub(crate) fn native_class_is_instance(
     // `getClass()`, so also test the object's display class id. Spring's
     // `GenericConversionService.convert` does `sourceType.getObjectType()
     // .isInstance(source)` and throws "Source to convert from must be an
-    // instance of […]" when this disagrees — breaking every conversion whose
+    // instance of [вЂ¦]" when this disagrees вЂ” breaking every conversion whose
     // source is an immutable collection.
     if let Some(disp) = crate::getclass_display_class_id(ctx, target_class_id, target) {
         if disp == this_class_id || ctx.is_subclass(disp, this_class_id) {
@@ -2060,13 +2060,13 @@ pub(crate) fn native_class_is_instance(
     Ok(Some(Value::Int(0)))
 }
 
-/// S111r17 — Build the JVMS array descriptor (e.g. `[Ljava/lang/Class;`,
+/// S111r17 вЂ” Build the JVMS array descriptor (e.g. `[Ljava/lang/Class;`,
 /// `[I`, `[[Ljava/lang/String;`) for an array heap object.  Mirrors the
 /// interpreter's `array_descriptor_of` (vm/src/runtime/interpreter.rs)
 /// but lives in NativeContext-land so reflection natives can use it.
 /// pub(crate): also used by the Object.toString native (lib.rs) so the
 /// default `Name@hash` rendering of arrays matches HotSpot
-/// (`[Ljava.lang.Class;@…`, not the component class name).
+/// (`[Ljava.lang.Class;@вЂ¦`, not the component class name).
 pub(crate) fn array_descriptor_for(
     ctx: &dyn NativeContext,
     obj: cratonvm_types::ObjectRef,
@@ -2096,10 +2096,10 @@ pub(crate) fn array_descriptor_for(
     }
 }
 
-/// S111r17 — Recursive array assignability check, mirroring the
+/// S111r17 вЂ” Recursive array assignability check, mirroring the
 /// interpreter's `array_is_assignable_to`.  `target_name` is a
 /// "raw" class name (slash-separated, no `L...;` wrapping for
-/// non-array types) — matches what `mirror_class_name` returns.
+/// non-array types) вЂ” matches what `mirror_class_name` returns.
 fn array_is_assignable(ctx: &dyn NativeContext, src_desc: &str, target_name: &str) -> bool {
     if target_name == "java/lang/Object"
         || target_name == "java/io/Serializable"
@@ -2156,7 +2156,7 @@ fn array_is_assignable(ctx: &dyn NativeContext, src_desc: &str, target_name: &st
     // `Class.getMethod`: comparing a covariant bridge `Object[] getValues()`
     // against the real `Integer[] getValues()`, BOTH directions reported
     // assignable, so neither was deemed more specific and the synthetic bridge
-    // could win (BridgeMethodResolverTests.findBridgedMethodWith…). The
+    // could win (BridgeMethodResolverTests.findBridgedMethodWithвЂ¦). The
     // forward direction (`Object[]` IS assignable from a subtype array like
     // `Integer[]`) is handled by the `is_subclass` check below; this mirrors
     // the interpreter's strict (non-lenient) `array_is_assignable_to_impl`.
@@ -2198,7 +2198,7 @@ pub(crate) fn native_class_is_assignable_from(
     ctx: &mut dyn NativeContext,
     args: &[Value],
 ) -> MethodCallResult {
-    // Reentrancy / recursion guard — see comment on IS_ASSIGNABLE_DEPTH.
+    // Reentrancy / recursion guard вЂ” see comment on IS_ASSIGNABLE_DEPTH.
     let prev_depth = IS_ASSIGNABLE_DEPTH.with(|d| {
         let v = d.get();
         d.set(v + 1);
@@ -2226,7 +2226,7 @@ pub(crate) fn native_class_is_assignable_from(
             }
         };
 
-        // S111r17 — Array-aware isAssignableFrom.  Same root cause as
+        // S111r17 вЂ” Array-aware isAssignableFrom.  Same root cause as
         // `native_class_is_instance` above: when `this` represents an array
         // Class (descriptor like `[Lfoo;` recoverable from the mirror's
         // name field) and `other` represents an array Class, the simple
@@ -2235,7 +2235,7 @@ pub(crate) fn native_class_is_assignable_from(
         // Annotation[]`).  Reuse the same descriptor / assignability
         // helpers we added for `isInstance`.  Spring 5.x's
         // `Assert.isAssignable(supertype, subtype)` is the visible caller
-        // — it throws `IllegalArgumentException` from
+        // вЂ” it throws `IllegalArgumentException` from
         // `assignableCheckFailed` when this returns false, masking the
         // underlying type-system gap.
         let this_name = mirror_class_name(ctx, this).unwrap_or_default();
@@ -2267,12 +2267,12 @@ pub(crate) fn native_class_is_assignable_from(
             }
             // Fall through to id-based check below for non-array vs array
             // mismatches (e.g. `String.class.isAssignableFrom(stringArray.class)`
-            // → false, handled by the legacy is_subclass which always
+            // в†’ false, handled by the legacy is_subclass which always
             // returns false for these).
         }
 
         // bytebuddy_probe + WildFly: primitive Class mirrors (`int.class`,
-        // `boolean.class`, etc.) don't have a real ClassId — `mirror_class_id`
+        // `boolean.class`, etc.) don't have a real ClassId вЂ” `mirror_class_id`
         // returns None. Falling through returned 0, breaking
         // `int.class.isAssignableFrom(int.class)`, which ByteBuddy uses to
         // validate proxy return types, and WildFly uses for reflection
@@ -2303,7 +2303,7 @@ pub(crate) fn native_class_is_assignable_from(
         let this_class_id = match mirror_class_id(ctx, this) {
             Some(id) => id,
             None => {
-                // Fallback: same non-empty name → assignable. Handles missing
+                // Fallback: same non-empty name в†’ assignable. Handles missing
                 // class_id for primitives and synthetic mirrors.
                 if !this_name.is_empty() && this_name == other_name {
                     return Ok(Some(Value::Int(1)));
@@ -2367,7 +2367,7 @@ pub(crate) fn native_class_is_primitive(
         _ => return Ok(Some(Value::Int(0))),
     };
     // WP4.2: real-JDK Class layout stores `primitive:boolean` at instance
-    // slot 7 — `get_or_create_primitive_mirror` writes Int(1) there for
+    // slot 7 вЂ” `get_or_create_primitive_mirror` writes Int(1) there for
     // primitive mirrors. Prefer that over the name-based check, because
     // the name slot can be observed as a stale Int after early-boot
     // descriptor-aware coercion runs (the legacy Int(-1) sentinel that
@@ -2403,7 +2403,7 @@ pub(crate) fn native_class_get_superclass(
         }
     };
 
-    // bytebuddy_probe (agent-bb3) — Object/array/primitive name short-circuits
+    // bytebuddy_probe (agent-bb3) вЂ” Object/array/primitive name short-circuits
     // BEFORE the class_id lookup. ByteBuddy's `TypeDescription.ForLoadedType`
     // hierarchy walk calls `Class.getSuperclass()` repeatedly; if our shim
     // ever returns Object's own mirror as the superclass of Object (a cycle),
@@ -2414,7 +2414,7 @@ pub(crate) fn native_class_get_superclass(
     // mirror is a synthetic/duplicate one whose reverse-map entry points
     // at a different ClassId-than-canonical-Object instance.
     //
-    // bytebuddy_probe (agent-bb4) — read the name via the STRICT helper
+    // bytebuddy_probe (agent-bb4) вЂ” read the name via the STRICT helper
     // so a corrupted reverse-map that aliases a non-Object class to
     // Object's ClassId does NOT make us short-circuit a non-Object class
     // to null. The strict reader trusts the slot-1 String that was set
@@ -2473,10 +2473,10 @@ pub(crate) fn native_class_get_superclass(
         }
     };
     // Synthetic lambda proxies (class id >= 0x8000_0000) are not in the class
-    // store, so `superclass_of` returns None → a null superclass. But a lambda's
+    // store, so `superclass_of` returns None в†’ a null superclass. But a lambda's
     // concrete runtime class extends Object; real JVMs never report a null
     // superclass for a concrete (non-interface) class, and Gradle's listener
-    // type-walk does `listener.getClass().getSuperclass().isInterface()` →
+    // type-walk does `listener.getClass().getSuperclass().isInterface()` в†’
     // "Cannot invoke isInterface on null" (SB-14). Return Object.
     if ctx.lambda_functional_interface(class_id).is_some() {
         if let Some(obj_id) = ctx.class_id_by_name("java/lang/Object") {
@@ -2490,7 +2490,7 @@ pub(crate) fn native_class_get_superclass(
             return Ok(Some(Value::Object(Some(mirror))));
         }
     }
-    // bytebuddy_probe (agent-bb3) — second-line defence: even after name
+    // bytebuddy_probe (agent-bb3) вЂ” second-line defence: even after name
     // resolution above, if the resolved ClassId IS Object's canonical id,
     // bail out null. This catches the case where `mirror_class_name`
     // returned something empty/unexpected but the reverse-map still points
@@ -2517,12 +2517,12 @@ pub(crate) fn native_class_get_superclass(
     // (the real JDK Java method that backs `Class.getMethods()`) walks
     // into Object's public methods for an interface and returns 14
     // entries (Object's `toString`/`hashCode`/`getClass`/`notify`/
-    // `notifyAll`/`wait`/etc. — most 0-arg). ByteBuddy's
+    // `notifyAll`/`wait`/etc. вЂ” most 0-arg). ByteBuddy's
     // `JavaDispatcher$DynamicClassLoader.invoker()` then computes
     // `parameterTypes.length - 1` and `anewarray Type[-1]`, raising
     // `NegativeArraySizeException` from `JavaDispatcher.<clinit>`.
     //
-    // Real JDK 25 returns `null` here for interfaces — we must match.
+    // Real JDK 25 returns `null` here for interfaces вЂ” we must match.
     if ctx.is_interface_class(class_id) {
         if dbg_bb {
             eprintln!("[bb-dbg] getSuperclass({}) -> null [interface]", this_name);
@@ -2531,7 +2531,7 @@ pub(crate) fn native_class_get_superclass(
     }
     match ctx.superclass_of(class_id) {
         Some(parent_id) => {
-            // bytebuddy_probe (agent-bb2) cycle guard — if the class
+            // bytebuddy_probe (agent-bb2) cycle guard вЂ” if the class
             // manager ever reports a class as its OWN superclass (a stale
             // reload, a double-registration, or a legacy
             // `super_class = self_index` constant-pool entry), refuse to
@@ -2649,10 +2649,10 @@ pub(crate) fn native_class_new_instance(
             .into())
         }
     };
-    // GC-safe allocate + `<init>()V` — pins the new object across the
+    // GC-safe allocate + `<init>()V` вЂ” pins the new object across the
     // constructor under the moving collector (see `new_object_initialized`).
     // Allocate by the mirror's EXACT class id (not its name) so per-loader
-    // class identity is preserved (JVMS §5.3); the name-based path collapses
+    // class identity is preserved (JVMS В§5.3); the name-based path collapses
     // to the first/global definer of that name.
     match ctx.new_object_initialized_with_class_id(class_id, "()V", &[])? {
         Some(v @ Value::Object(Some(_))) => Ok(Some(v)),
@@ -2671,20 +2671,20 @@ pub(crate) fn native_class_new_instance(
 
 /// Convert a JVM type descriptor to a Class mirror object.
 ///
-/// Handles primitives ("I" → int.class), object types ("Ljava/lang/String;" → String.class),
-/// array types ("[I" → int[].class), and void ("V" → void.class).
+/// Handles primitives ("I" в†’ int.class), object types ("Ljava/lang/String;" в†’ String.class),
+/// array types ("[I" в†’ int[].class), and void ("V" в†’ void.class).
 /// Loader-faithful variant of [`descriptor_to_class_mirror`]: for an `L`-form
 /// reference type, resolve the class through the loader that DEFINED
 /// `declaring_class_id` (its own namespace) when the loader-aware gate is on, so
 /// reflective `Method`/`Field`/`Constructor` type accessors on a class defined
 /// by a child / bytecode-enhancing loader report THAT loader's copy of the type
-/// — matching `Class.forName` and the entity metamodel.
+/// вЂ” matching `Class.forName` and the entity metamodel.
 ///
 /// Without this, a bytecode-enhanced Hibernate entity (`Country`, defined by the
 /// `EnhancingClassLoader`) had `getContinent().getReturnType()` resolve the
 /// *un-enhanced* `Continent` through the flat global store, while the to-one
 /// target type (resolved via `Class.forName` through the same enhancing loader)
-/// was the *enhanced* copy — so `ToOneAttributeMapping`'s
+/// was the *enhanced* copy вЂ” so `ToOneAttributeMapping`'s
 /// `declaredType.isAssignableFrom(targetType)` validation failed with a
 /// "mapped with targetEntity=`X`, but the attribute is declared as `X`" error
 /// (same name, divergent loader identity).
@@ -2742,7 +2742,7 @@ pub(crate) fn descriptor_to_class_mirror(
             }
         }
         s if s.starts_with('[') => {
-            // WP2.2-X: Array type — return the *canonical* Class mirror
+            // WP2.2-X: Array type вЂ” return the *canonical* Class mirror
             // (same one ldc/anewarray/etc. produce). This is required for
             // reference identity used by JDK Class.java's `arrayContentsEq`
             // in `searchMethods` (compares `Class<?>` references with `!=`).
@@ -2759,7 +2759,7 @@ pub(crate) fn descriptor_to_class_mirror(
             }
         }
         _ => {
-            // Unknown descriptor — return a synthetic mirror.
+            // Unknown descriptor вЂ” return a synthetic mirror.
             synthetic_class_mirror(ctx, desc)
         }
     }
@@ -2772,7 +2772,7 @@ pub(crate) fn descriptor_to_class_mirror(
 /// on the returned mirror walks up Object's superclass chain and raises
 /// `NoSuchMethodError: java/lang/Object.isArray()Z`.
 fn synthetic_class_mirror(ctx: &mut dyn NativeContext, name: &str) -> cratonvm_types::ObjectRef {
-    // Resolve java/lang/Class — ensure it's loaded so we get its real ClassId.
+    // Resolve java/lang/Class вЂ” ensure it's loaded so we get its real ClassId.
     let class_class_id = ctx
         .ensure_class_initialized("java/lang/Class")
         .unwrap_or(cratonvm_types::ClassId::new(0));
@@ -2797,11 +2797,11 @@ fn synthetic_class_mirror(ctx: &mut dyn NativeContext, name: &str) -> cratonvm_t
 
 /// Parse a method descriptor into (parameter type descriptors, return type descriptor).
 ///
-/// e.g. "(ILjava/lang/String;)V" → (["I", "Ljava/lang/String;"], "V")
+/// e.g. "(ILjava/lang/String;)V" в†’ (["I", "Ljava/lang/String;"], "V")
 pub(crate) fn parse_descriptor_param_and_return(desc: &str) -> (Vec<String>, String) {
     let mut params = Vec::new();
     // Tolerant: an empty / malformed descriptor (no leading `(`) yields an
-    // empty param list and `"V"` return — the same shape Spring's
+    // empty param list and `"V"` return вЂ” the same shape Spring's
     // `SerializableTypeWrapper` proxy handler expects when it has no
     // descriptor cached for an internally-synthesised method.
     if desc.is_empty() || !desc.starts_with('(') {
@@ -2848,7 +2848,7 @@ pub(crate) fn parse_descriptor_param_and_return(desc: &str) -> (Vec<String>, Str
 
 /// Box a VM Value into a wrapper object for reflection returns.
 ///
-/// e.g. Value::Int(42) with type "I" → Integer.valueOf(42) object
+/// e.g. Value::Int(42) with type "I" в†’ Integer.valueOf(42) object
 pub(crate) fn box_value(ctx: &mut dyn NativeContext, value: Value, type_desc: &str) -> Value {
     match type_desc {
         "I" => {
@@ -2891,14 +2891,14 @@ pub(crate) fn box_value(ctx: &mut dyn NativeContext, value: Value, type_desc: &s
             ctx.set_field(obj, 0, value);
             Value::Object(Some(obj))
         }
-        "V" => Value::Object(None), // void → null
+        "V" => Value::Object(None), // void в†’ null
         _ => value,                 // already an object reference
     }
 }
 
 /// Unbox a wrapper object to a primitive Value.
 ///
-/// e.g. Integer object → Value::Int(42)
+/// e.g. Integer object в†’ Value::Int(42)
 pub(crate) fn unbox_value(ctx: &dyn NativeContext, obj: cratonvm_types::ObjectRef) -> Value {
     let class_id = ctx.class_id_of_object(obj);
     let class_name = ctx.class_name_of_id(class_id).unwrap_or_default();
@@ -2946,9 +2946,9 @@ pub(crate) fn unbox_arg(ctx: &dyn NativeContext, value: Value, expected_desc: &s
 }
 
 // ---------------------------------------------------------------------------
-// Strict reflective coercion — used by Method.invoke / Constructor.newInstance
+// Strict reflective coercion вЂ” used by Method.invoke / Constructor.newInstance
 // / Field.set to enforce IllegalArgumentException on type mismatches, as
-// specified by JLS §15.12.4.2 and `java.lang.reflect` Javadoc.
+// specified by JLS В§15.12.4.2 and `java.lang.reflect` Javadoc.
 // ---------------------------------------------------------------------------
 
 /// Test whether a class name (slash-form, e.g. "java/lang/Integer") refers
@@ -2967,7 +2967,7 @@ fn wrapper_matches_primitive(wrapper: &str, prim_desc: &str) -> bool {
     )
 }
 
-/// Widening-primitive-conversion rules (JLS §5.1.2) for reflective
+/// Widening-primitive-conversion rules (JLS В§5.1.2) for reflective
 /// `Field.setInt` / `Method.invoke` coercion. Returns true iff a value
 /// whose runtime primitive tag is `src` can be silently widened to `dst`.
 fn widening_allowed(src: &str, dst: &str) -> bool {
@@ -2975,17 +2975,17 @@ fn widening_allowed(src: &str, dst: &str) -> bool {
         return true;
     }
     match (src, dst) {
-        // byte → short, int, long, float, double
+        // byte в†’ short, int, long, float, double
         ("B", "S" | "I" | "J" | "F" | "D") => true,
-        // short → int, long, float, double
+        // short в†’ int, long, float, double
         ("S", "I" | "J" | "F" | "D") => true,
-        // char → int, long, float, double
+        // char в†’ int, long, float, double
         ("C", "I" | "J" | "F" | "D") => true,
-        // int → long, float, double
+        // int в†’ long, float, double
         ("I", "J" | "F" | "D") => true,
-        // long → float, double
+        // long в†’ float, double
         ("J", "F" | "D") => true,
-        // float → double
+        // float в†’ double
         ("F", "D") => true,
         _ => false,
     }
@@ -3058,10 +3058,10 @@ pub(crate) fn coerce_arg_strict(
     expected_desc: &str,
     context: &str,
 ) -> Result<Value, MethodCallFailed> {
-    // WP2.1-field — operand-stack tag-erasure recovery for J/D.
+    // WP2.1-field вЂ” operand-stack tag-erasure recovery for J/D.
     //
     // `CompactValue::to_value()` on an untagged 64-bit slot cannot tell
-    // a small-magnitude long from a denormal double — both round-trip
+    // a small-magnitude long from a denormal double вЂ” both round-trip
     // identical bits.  When the operand stack pops a J-typed slot whose
     // bit pattern doesn't match a NaN-tagged subform, the resulting
     // `Value` is tagged `Double` even though the slot holds a long
@@ -3070,7 +3070,7 @@ pub(crate) fn coerce_arg_strict(
     // descriptor-aware sibling `decode_by_descriptor`.
     //
     // For typed setters, the method descriptor tells us the declared
-    // type — reinterpret the bits accordingly so widening checks below
+    // type вЂ” reinterpret the bits accordingly so widening checks below
     // see the right tag.  This sits at the native edge so the
     // VM-internal call-frame plumbing stays untouched.
     let value = match (expected_desc, value) {
@@ -3084,7 +3084,7 @@ pub(crate) fn coerce_arg_strict(
             match value {
                 Value::Int(_) if matches!(expected_desc, "I" | "Z" | "B" | "S" | "C") => {
                     // boolean/byte/short/char/int share the same VM stack
-                    // representation (Value::Int) — the caller already holds
+                    // representation (Value::Int) вЂ” the caller already holds
                     // a legal payload for any of these slots, so pass it
                     // through without re-checking widening. Typed setter
                     // natives (e.g. setByte) mask the input to the field's
@@ -3092,14 +3092,14 @@ pub(crate) fn coerce_arg_strict(
                     Ok(value)
                 }
                 Value::Int(_) | Value::Long(_) | Value::Float(_) | Value::Double(_) => {
-                    // Cross-category coercion (e.g. int → long, int → double):
-                    // honour JLS §5.1.2 widening; narrowing is rejected.
+                    // Cross-category coercion (e.g. int в†’ long, int в†’ double):
+                    // honour JLS В§5.1.2 widening; narrowing is rejected.
                     let src = primitive_tag_of(value);
                     // JDK faithful: `jdk.internal.reflect` accessors throw
                     // `IllegalArgumentException("argument type mismatch")` for ALL
                     // reflective arg-coercion failures (Method.invoke /
                     // Constructor.newInstance). Hibernate's HHH-20261 error message
-                    // appends this verbatim ("…due to: argument type mismatch"), so
+                    // appends this verbatim ("вЂ¦due to: argument type mismatch"), so
                     // a descriptive message would diverge from HotSpot.
                     let _ = src;
                     widen_primitive_value(value, src, expected_desc)
@@ -3137,7 +3137,7 @@ pub(crate) fn coerce_arg_strict(
                 ))),
             }
         }
-        // Reference type expected — null and assignable references are OK.
+        // Reference type expected вЂ” null and assignable references are OK.
         _ => match value {
             // null is assignable to any reference type.
             Value::Object(None) => Ok(value),
@@ -3147,7 +3147,7 @@ pub(crate) fn coerce_arg_strict(
                 // mismatch")` BEFORE dispatch when a reference argument is not
                 // assignable to the formal parameter (field) type. CratonVM
                 // dispatches without a per-arg `checkcast`, so an unassignable
-                // reference would otherwise flow silently into the callee — e.g.
+                // reference would otherwise flow silently into the callee вЂ” e.g.
                 // an `Integer` handed to a `String` parameter runs the body and
                 // returns a bogus value instead of throwing. (Spring's
                 // `SimpleInstantiationStrategy` relies on this IAE to surface
@@ -3157,7 +3157,7 @@ pub(crate) fn coerce_arg_strict(
                 // can positively resolve the formal type to a concrete
                 // (non-interface) class and prove the argument is not a subtype.
                 // Pass through whenever the formal type is `Object`, an
-                // interface, an array, or unresolvable — those are either always
+                // interface, an array, or unresolvable вЂ” those are either always
                 // assignable or cannot be checked safely here. This mirrors the
                 // receiver assignability check in `native_method_invoke`.
                 if expected_desc.starts_with('L') && expected_desc.ends_with(';') {
@@ -3241,7 +3241,7 @@ pub(crate) fn illegal_arg_exc_null_to_primitive(
 /// behaviour for `Method.invoke` and `Constructor.newInstance`.
 ///
 /// If `failure` is an `InternalError` (VM bug or non-Java runtime error),
-/// propagate it unchanged — wrapping would hide the defect.
+/// propagate it unchanged вЂ” wrapping would hide the defect.
 ///
 /// If `failure` is an `ExceptionThrown`, allocate a new
 /// `InvocationTargetException`, set its `cause` / target via Throwable's
@@ -3254,9 +3254,9 @@ pub(crate) fn wrap_as_invocation_target_exception(
 ) -> MethodCallFailed {
     let original = match failure {
         MethodCallFailed::ExceptionThrown(obj) => obj,
-        // A genuine Java `Error` raised by the invoked code — most notably an
+        // A genuine Java `Error` raised by the invoked code вЂ” most notably an
         // `OutOfMemoryError` from a huge allocation inside the constructor /
-        // method body (e.g. `new ArrayList(Integer.MAX_VALUE)`) — surfaces as a
+        // method body (e.g. `new ArrayList(Integer.MAX_VALUE)`) вЂ” surfaces as a
         // VM-internal `RuntimeError` rather than a materialized `Throwable`.
         // HotSpot's `Constructor.newInstance` / `Method.invoke` wrap ANY
         // Throwable the callee throws (Errors included) in
@@ -3275,7 +3275,7 @@ pub(crate) fn wrap_as_invocation_target_exception(
                 &[Value::Object(Some(msg_obj))],
             ) {
                 Ok(Some(Value::Object(Some(obj)))) => obj,
-                // Couldn't materialize the throwable — propagate the original
+                // Couldn't materialize the throwable вЂ” propagate the original
                 // internal error rather than swallow it.
                 _ => {
                     return cratonvm_types::error::RuntimeError::OutOfMemoryError { message }.into()
@@ -3300,7 +3300,7 @@ pub(crate) fn wrap_as_invocation_target_exception(
 
     // When `InvocationTargetException` is still a synthetic JDK stub (no
     // real `<init>` bytecode), allocate and wire the `target` field without
-    // going through `invoke` — the stub's Throwable-shaped native `<init>`
+    // going through `invoke` вЂ” the stub's Throwable-shaped native `<init>`
     // list does not model JDK 7+ `InvocationTargetException(Throwable)`.
     let target_class = "java/lang/reflect/InvocationTargetException";
     if ctx.is_class_synthetic_stub(target_class) {
@@ -3338,7 +3338,7 @@ pub(crate) fn wrap_as_invocation_target_exception(
     match init_result {
         Ok(_) => MethodCallFailed::ExceptionThrown(wrapper),
         // If the two-arg constructor is unavailable, fall back to the
-        // original — still catchable by Java code, just not wrapped.
+        // original вЂ” still catchable by Java code, just not wrapped.
         Err(_) => MethodCallFailed::ExceptionThrown(original),
     }
 }
@@ -3355,9 +3355,9 @@ pub(crate) fn wrap_as_invocation_target_exception(
 ///   2. Resolve the caller class by walking the Java stack, skipping
 ///      reflection-internal frames.
 ///   3. Delegate to `NativeContext::check_deep_reflection_access` for the
-///      `accessor → target` edge.
+///      `accessor в†’ target` edge.
 ///   4. On failure, throw `java.lang.reflect.InaccessibleObjectException`
-///      with a message identifying the denied module/package — matching
+///      with a message identifying the denied module/package вЂ” matching
 ///      HotSpot's message format closely enough to be recognizable.
 ///
 /// When `flag == false` the check is skipped (clearing the override cannot
@@ -3370,7 +3370,7 @@ fn set_accessible_impl(
 ) -> MethodCallResult {
     let this = match args.first() {
         Some(Value::Object(Some(o))) => *o,
-        _ => return Ok(None), // Java would have NPE'd earlier — be lenient
+        _ => return Ok(None), // Java would have NPE'd earlier вЂ” be lenient
     };
     let flag = match args.get(1) {
         Some(Value::Int(v)) => *v,
@@ -3408,7 +3408,7 @@ fn set_accessible_impl(
     Ok(None)
 }
 
-/// Field.setAccessible(boolean) — writes the accessible flag.
+/// Field.setAccessible(boolean) вЂ” writes the accessible flag.
 /// Throws `InaccessibleObjectException` when the caller's module is not
 /// granted deep-reflection access to the declaring class's package.
 ///
@@ -3456,7 +3456,7 @@ pub(crate) fn native_field_set_accessible(
     Ok(None)
 }
 
-/// Method.setAccessible(boolean) — sets the accessible flag.
+/// Method.setAccessible(boolean) вЂ” sets the accessible flag.
 /// Throws `InaccessibleObjectException` when the caller's module is not
 /// granted deep-reflection access to the declaring class's package.
 ///
@@ -3471,7 +3471,7 @@ pub(crate) fn native_method_set_accessible(
     })
 }
 
-/// Constructor.setAccessible(boolean) — sets the accessible flag.
+/// Constructor.setAccessible(boolean) вЂ” sets the accessible flag.
 /// Throws `InaccessibleObjectException` when the caller's module is not
 /// granted deep-reflection access to the declaring class's package.
 ///
@@ -3532,30 +3532,30 @@ fn set_method_like_accessible_impl(
 }
 
 // ---------------------------------------------------------------------------
-// java.lang.reflect.Field — object layout and natives
+// java.lang.reflect.Field вЂ” object layout and natives
 // ---------------------------------------------------------------------------
 
 /// Number of "extra" slots appended after the JDK Field layout to hold
 /// CratonVM-specific metadata that doesn't exist on real JDK Field:
-///   +0 → String (raw descriptor, e.g. "J" or "Ljava/lang/String;")
-///   +1 → Int (CratonVM slot_index — absolute heap index for instance
+///   +0 в†’ String (raw descriptor, e.g. "J" or "Ljava/lang/String;")
+///   +1 в†’ Int (CratonVM slot_index вЂ” absolute heap index for instance
 ///            fields, or field_index for static fields)
-///   +2 → Int (accessible flag, 0 or 1)
+///   +2 в†’ Int (accessible flag, 0 or 1)
 const FIELD_EXTRA_SLOTS: usize = 3;
 const FIELD_EXTRA_OFFSET_DESC: usize = 0;
 const FIELD_EXTRA_OFFSET_RJ_SLOT: usize = 1;
 const FIELD_EXTRA_OFFSET_ACCESSIBLE: usize = 2;
 
-/// Legacy synthetic Field width — kept as a floor so older code paths
+/// Legacy synthetic Field width вЂ” kept as a floor so older code paths
 /// that still read slots 0..=6 directly don't stumble over a too-small
-/// heap object. The real JDK layout is always ≥ 14, so in practice this
+/// heap object. The real JDK layout is always в‰Ґ 14, so in practice this
 /// floor is only meaningful for synthetic stub classes where
 /// `class_num_total_fields` returns 0.
 const FIELD_NUM_FIELDS_LEGACY_FLOOR: usize = 7;
 /// Legacy alias kept for the test-helper `make_field_mirror` which still
 /// uses the synthetic 7-slot layout directly (the mock `NativeContext`
 /// doesn't populate a real class-hierarchy so `get_field_by_name` would
-/// fall back to slot 0 — instead the tests index by the synthetic slots).
+/// fall back to slot 0 вЂ” instead the tests index by the synthetic slots).
 #[cfg(test)]
 const FIELD_NUM_FIELDS: usize = FIELD_NUM_FIELDS_LEGACY_FLOOR;
 
@@ -3576,7 +3576,7 @@ fn field_extra_base(ctx: &dyn NativeContext, class_id: ClassId) -> usize {
 /// `name` at 4, `type` at 5, `modifiers` at 6, etc. When Java-layer code
 /// (e.g. `MethodHandles.Lookup.unreflectField`) did `Getfield clazz` /
 /// `Getfield modifiers`, the interpreter resolved those real JDK offsets
-/// and read our synthetic values — so `modifiers` came back as our
+/// and read our synthetic values вЂ” so `modifiers` came back as our
 /// `slot_index` and `isStatic()` silently returned false, producing the
 /// `expected a static field: ... from class java.lang.Object (null)`
 /// IllegalAccessException for every `unreflectGetter(serialVersionUID)`.
@@ -3588,16 +3588,16 @@ fn field_extra_base(ctx: &dyn NativeContext, class_id: ClassId) -> usize {
 /// JDK fields and via the extra-slot helpers for our metadata.
 /// GC-safe construction of a reference array whose `len` elements are produced
 /// by an allocating factory (`create_field_object` / `create_method_object` /
-/// `descriptor_to_class_mirror` / …).
+/// `descriptor_to_class_mirror` / вЂ¦).
 ///
 /// The freshly-allocated array is held only in a Rust local, so it is invisible
 /// to the GC root scan. Every per-element factory call allocates and can trigger
 /// a moving young GC that relocates the array, leaving the raw `ObjectRef` stale
-/// — it then resolves to a reused, usually `java/lang/Object`, slot. That is the
+/// вЂ” it then resolves to a reused, usually `java/lang/Object`, slot. That is the
 /// WildFly bug-06 family: a reflective `Field[]`/`Method[]`/`Class[]` corrupted
 /// mid-build, surfacing later as `NoSuchMethodError Object.getName()`,
 /// `PreconditionViolationException: annotationType/Member must not be null`, or
-/// `ClassCastException: java/lang/Object cannot be cast to [L…;`.
+/// `ClassCastException: java/lang/Object cannot be cast to [LвЂ¦;`.
 ///
 /// Fix: pin the array as a GC root across the fill loop and re-read the
 /// forwarded reference before each store. Each element, once stored into the
@@ -3730,7 +3730,7 @@ pub(crate) fn read_field_meta(
     };
 
     // `slot_index` is stashed in our CratonVM extra slots (not a real JDK
-    // field — the JDK `slot` field has different semantics).
+    // field вЂ” the JDK `slot` field has different semantics).
     let field_class_id = {
         // Determine the object's class to locate the extra-slot base.
         // We don't have a direct `class_id_of` on `NativeContext`; fall
@@ -3771,10 +3771,10 @@ fn read_field_rj_slot(
     let val_at_base = ctx.get_field(field_obj, base + FIELD_EXTRA_OFFSET_RJ_SLOT);
     match val_at_base {
         Value::Int(v) => Some(v as usize),
-        // T19.H1 — defensive scan. Historically the base used at creation
-        // time (Field.class not yet linked → class_num_total_fields returns
-        // 0 → base=7) could differ from the base used at read time
-        // (Field.class now linked → base=14). Rather than always storing at
+        // T19.H1 вЂ” defensive scan. Historically the base used at creation
+        // time (Field.class not yet linked в†’ class_num_total_fields returns
+        // 0 в†’ base=7) could differ from the base used at read time
+        // (Field.class now linked в†’ base=14). Rather than always storing at
         // the larger fixed base, we scan the likely extra-slot range for a
         // plausible slot_index value. Finding a non-negative Int in the
         // extra-slot range beats livelocking every CAS loop that depends on
@@ -3928,7 +3928,7 @@ pub(crate) fn native_field_get(ctx: &mut dyn NativeContext, args: &[Value]) -> M
     // NEW-19: module-level opens check (JPMS)
     enforce_module_check_on_field(ctx, this, accessible, "Field.get")?;
 
-    // WP2.1-field — volatile-aware read fence: matches what the JDK does
+    // WP2.1-field вЂ” volatile-aware read fence: matches what the JDK does
     // internally via `Unsafe.getReferenceVolatile`/`getIntVolatile`. No-op
     // for non-volatile fields so the plain-read path stays cheap.
     volatile_load_fence(modifiers);
@@ -3976,7 +3976,7 @@ pub(crate) fn native_field_set(ctx: &mut dyn NativeContext, args: &[Value]) -> M
     };
     let accessible = read_field_accessible(ctx, this);
     check_access(modifiers, accessible, &format!("Field.set({})", descriptor))?;
-    // WP2.1-field — final-field write check (must run AFTER access check
+    // WP2.1-field вЂ” final-field write check (must run AFTER access check
     // so the more specific error message wins on a public-final field).
     check_final_for_set(modifiers, accessible, &format!("Field.set({})", descriptor))?;
     // NEW-19: module-level opens check (JPMS)
@@ -3984,10 +3984,10 @@ pub(crate) fn native_field_set(ctx: &mut dyn NativeContext, args: &[Value]) -> M
 
     // Strictly coerce the value if the field expects a primitive (including
     // widening); this raises IllegalArgumentException if the wrapper type
-    // cannot be narrowed/widened to the target primitive per JLS §5.1.2.
+    // cannot be narrowed/widened to the target primitive per JLS В§5.1.2.
     let coerced = coerce_arg_strict(ctx, new_value, &descriptor, "Field.set")?;
 
-    // WP2.1-field — volatile-aware write fences (no-op for non-volatile).
+    // WP2.1-field вЂ” volatile-aware write fences (no-op for non-volatile).
     volatile_store_fence_pre(modifiers);
     if is_static {
         ctx.set_static_field(class_id, slot, coerced);
@@ -4019,7 +4019,7 @@ pub(crate) fn native_field_set(ctx: &mut dyn NativeContext, args: &[Value]) -> M
 /// `accepted` is the set of descriptor characters that the caller's typed
 /// getter is allowed to widen from. e.g. for `getInt`: `&['B','S','C','I']`.
 /// Reference / array descriptors (descriptors starting with `L` or `[`) are
-/// always rejected — typed primitive getters can never read a reference.
+/// always rejected вЂ” typed primitive getters can never read a reference.
 fn validate_field_descriptor(
     descriptor: &str,
     accepted: &[u8],
@@ -4035,7 +4035,7 @@ fn validate_field_descriptor(
         return Ok(());
     }
     // JDK-canonical message: "Attempt to get <prim> field with illegal data
-    // type conversion" — the JDK actually emits a slightly different phrasing
+    // type conversion" вЂ” the JDK actually emits a slightly different phrasing
     // depending on the source/target pair, but every variant is an IAE and
     // mentions both the Field method and the underlying type. Match closely.
     Err(illegal_arg_exc(format!(
@@ -4076,7 +4076,7 @@ fn field_get_raw(
     // but the real JDK layout puts `clazz` elsewhere. Wrap with a helper.
     enforce_module_check_on_field(ctx, this, accessible, "Field typed getter")?;
 
-    // WP2.1-field — volatile-aware read fence (no-op for non-volatile).
+    // WP2.1-field вЂ” volatile-aware read fence (no-op for non-volatile).
     volatile_load_fence(modifiers);
 
     if is_static {
@@ -4099,7 +4099,7 @@ pub(crate) fn native_field_get_int(
     args: &[Value],
 ) -> MethodCallResult {
     // Field.getInt accepts byte/short/char/int fields (all represented as
-    // Value::Int on our stack) — but NOT long, float, or double, per
+    // Value::Int on our stack) вЂ” but NOT long, float, or double, per
     // `java.lang.reflect.Field.getInt` javadoc (IllegalArgumentException on
     // non-int-compatible types).
     //
@@ -4211,7 +4211,7 @@ pub(crate) fn native_field_get_boolean(
     ctx: &mut dyn NativeContext,
     args: &[Value],
 ) -> MethodCallResult {
-    // getBoolean only accepts boolean fields (per javadoc — no widening).
+    // getBoolean only accepts boolean fields (per javadoc вЂ” no widening).
     // We detect non-boolean fields by reading the descriptor alongside.
     let this = match args.first() {
         Some(Value::Object(Some(obj))) => *obj,
@@ -4232,7 +4232,7 @@ pub(crate) fn native_field_get_boolean(
     match val {
         // Round-7 MED-11 fix: validate the underlying int is strictly 0 or 1.
         // Previously any non-zero int was silently coerced to `true`, which
-        // masks heap-corruption bugs and diverges from the JDK contract —
+        // masks heap-corruption bugs and diverges from the JDK contract вЂ”
         // `Field.getBoolean` on a non-boolean storage value throws IAE with
         // exactly this message ("Argument is not of type Boolean").
         Value::Int(0) => Ok(Some(Value::Int(0))),
@@ -4275,7 +4275,7 @@ fn field_set_raw(
     };
     let accessible = read_field_accessible(ctx, this);
     check_access(modifiers, accessible, "Field typed setter")?;
-    // WP2.1-field — final-field write check (matches Field.set on the
+    // WP2.1-field вЂ” final-field write check (matches Field.set on the
     // generic `set(Object,Object)` path).
     check_final_for_set(modifiers, accessible, "Field typed setter")?;
     // NEW-19: module-level opens check (JPMS)
@@ -4286,7 +4286,7 @@ fn field_set_raw(
     // and the like, producing IllegalArgumentException as per javadoc.
     let coerced = coerce_arg_strict(ctx, new_value, &descriptor, "Field typed setter")?;
 
-    // WP2.1-field — volatile-aware write fences (no-op for non-volatile).
+    // WP2.1-field вЂ” volatile-aware write fences (no-op for non-volatile).
     volatile_store_fence_pre(modifiers);
     if is_static {
         ctx.set_static_field(class_id, slot, coerced);
@@ -4356,7 +4356,7 @@ pub(crate) fn native_field_get_byte(
     ctx: &mut dyn NativeContext,
     args: &[Value],
 ) -> MethodCallResult {
-    // Field.getByte: only `B` is JLS-legal (no widening from C/S/I — those throw IAE).
+    // Field.getByte: only `B` is JLS-legal (no widening from C/S/I вЂ” those throw IAE).
     let this = match args.first() {
         Some(Value::Object(Some(obj))) => *obj,
         _ => {
@@ -4382,7 +4382,7 @@ pub(crate) fn native_field_get_short(
     args: &[Value],
 ) -> MethodCallResult {
     // Field.getShort: accepts byte (widening) or short. Rejects char (JLS forbids
-    // char→short narrowing without explicit cast), int, long, boolean, refs.
+    // charв†’short narrowing without explicit cast), int, long, boolean, refs.
     let this = match args.first() {
         Some(Value::Object(Some(obj))) => *obj,
         _ => {
@@ -4407,7 +4407,7 @@ pub(crate) fn native_field_get_char(
     ctx: &mut dyn NativeContext,
     args: &[Value],
 ) -> MethodCallResult {
-    // Field.getChar: only `C` is legal — char is unsigned 16-bit and JLS does
+    // Field.getChar: only `C` is legal вЂ” char is unsigned 16-bit and JLS does
     // not permit widening into it from byte/short/int.
     let this = match args.first() {
         Some(Value::Object(Some(obj))) => *obj,
@@ -4530,17 +4530,17 @@ pub(crate) fn native_class_get_declared_fields(
     let class_id = match mirror_class_id(ctx, this) {
         Some(id) => id,
         None => {
-            // Primitive or array type — no declared fields
+            // Primitive or array type вЂ” no declared fields
             let arr = ctx.new_ref_array(cratonvm_types::ClassId::new(0), 0);
             return Ok(Some(Value::Object(Some(arr))));
         }
     };
 
     // `getDeclaredFields0(boolean publicOnly)` (JVMS-internal). The real JDK
-    // `Class.getFields()` → `privateGetPublicFields()` calls this with
+    // `Class.getFields()` в†’ `privateGetPublicFields()` calls this with
     // publicOnly=true and TRUSTS it to return only public fields (it does not
     // re-filter by access). Honour the flag, else private fields leak into
-    // `getFields()` — e.g. ES `Version.<clinit>` iterates `getFields()` and
+    // `getFields()` вЂ” e.g. ES `Version.<clinit>` iterates `getFields()` and
     // does `field.get(null)` on every Version-typed field, which NPEs in
     // `Field.checkAccess` (`obj.getClass()`) on the private instance field
     // `minCompatVersion`. `getDeclaredFields()` passes publicOnly=false.
@@ -4551,7 +4551,7 @@ pub(crate) fn native_class_get_declared_fields(
         .filter(|m| !public_only || (m.access_flags & (ACC_PUBLIC as u16)) != 0)
         .collect();
     // GC-safe: `create_field_object` allocates, so the array must be pinned
-    // across the fill loop (see `build_mirror_array` — WildFly bug-06).
+    // across the fill loop (see `build_mirror_array` вЂ” WildFly bug-06).
     let arr = build_mirror_array(ctx, selected.len(), |ctx, i| {
         create_field_object(ctx, selected[i])
     });
@@ -4599,7 +4599,7 @@ pub(crate) fn native_class_get_declared_field(
     if let Some((decl, abs_idx, is_static)) =
         ctx.link_resolver_get_field(class_id, &target_name, "")
     {
-        // Cache hit — re-fetch the metadata to build the Field mirror.
+        // Cache hit вЂ” re-fetch the metadata to build the Field mirror.
         // We still walk `declared_fields(decl)` (small per-class vec) so
         // the mirror's `create_field_object` payload (descriptor, mods,
         // signature) matches what a cold miss would have produced.
@@ -4643,14 +4643,14 @@ pub(crate) fn native_class_get_declared_field(
 }
 
 // ---------------------------------------------------------------------------
-// java.lang.reflect.Method — object layout and natives
+// java.lang.reflect.Method вЂ” object layout and natives
 // ---------------------------------------------------------------------------
 
 /// Number of "extra" slots appended after the JDK Method layout to hold
 /// CratonVM-specific metadata that doesn't exist on real JDK Method:
-///   +0 → String (raw descriptor, e.g. "(II)I")
-///   +1 → Int    (parameter count — cached)
-///   +2 → Int    (accessible flag, 0 or 1)
+///   +0 в†’ String (raw descriptor, e.g. "(II)I")
+///   +1 в†’ Int    (parameter count вЂ” cached)
+///   +2 в†’ Int    (accessible flag, 0 or 1)
 const METHOD_EXTRA_SLOTS: usize = 3;
 const METHOD_EXTRA_OFFSET_DESC: usize = 0;
 const METHOD_EXTRA_OFFSET_PARAM_COUNT: usize = 1;
@@ -4672,16 +4672,16 @@ const METHOD_LEGACY_SLOT_ANNOTATIONS: usize = 10;
 const METHOD_LEGACY_SLOT_PARAMETER_ANNOTATIONS: usize = 11;
 const METHOD_LEGACY_SLOT_ANNOTATION_DEFAULT: usize = 12;
 
-/// Legacy synthetic Method width — kept as a floor so the allocated
+/// Legacy synthetic Method width вЂ” kept as a floor so the allocated
 /// object is always large enough to host the synthetic writes made by
 /// tests (via MockNativeContext which maps field names to these slots)
 /// and to avoid underallocation when `class_num_total_fields` returns 0
 /// (class not loaded yet).
-// G2: bumped from 8 → 12 to accommodate the 4 additional non-null array
+// G2: bumped from 8 в†’ 12 to accommodate the 4 additional non-null array
 // fields populated by `create_method_object` (`exceptionTypes`,
 // `annotations`, `parameterAnnotations`, `annotationDefault`). The mock
 // `MockNativeContext` maps these names to slots 9..=12 (see
-// `mock_jdk_field_slot`); the floor must be ≥ those slots so the heap
+// `mock_jdk_field_slot`); the floor must be в‰Ґ those slots so the heap
 // allocation reserves room.
 const METHOD_NUM_FIELDS_LEGACY_FLOOR: usize = 13;
 
@@ -4701,16 +4701,16 @@ fn method_extra_base(ctx: &dyn NativeContext, class_id: ClassId) -> usize {
 /// C6 fix: Previously the Method object was allocated with only 8 slots
 /// and the synthetic layout was written at slots 0..=7 by index. But real
 /// JDK `java.lang.reflect.Method` inherits from
-/// `java.lang.reflect.Executable` → `AccessibleObject`, so its declared
+/// `java.lang.reflect.Executable` в†’ `AccessibleObject`, so its declared
 /// instance-field layout puts `clazz` at a higher absolute slot (not 0).
 /// When real-JDK bytecode did `Getfield clazz` / `Getfield modifiers`
-/// (e.g. `Method.isCallerSensitive` → `getDeclaringClass`), the
+/// (e.g. `Method.isCallerSensitive` в†’ `getDeclaringClass`), the
 /// interpreter resolved those real JDK offsets and read our synthetic
-/// values — so a `GETFIELD clazz` landed on a slot holding an
+/// values вЂ” so a `GETFIELD clazz` landed on a slot holding an
 /// `Int(1)` residue, producing the
 /// `expected object reference, got int(1)` crash observed in stream +
-/// enum reflection paths (EnumMap.<init> → getEnumConstantsShared →
-/// Method.invoke → isCallerSensitive → getDeclaringClass).
+/// enum reflection paths (EnumMap.<init> в†’ getEnumConstantsShared в†’
+/// Method.invoke в†’ isCallerSensitive в†’ getDeclaringClass).
 ///
 /// Fix: populate the real JDK-named fields via `set_field_by_name` and
 /// store CratonVM-specific metadata (raw descriptor, cached parameter
@@ -4743,7 +4743,7 @@ pub(crate) fn create_method_object(
 
     // Parameter type mirrors array. GC-safe: `descriptor_to_class_mirror`
     // allocates/loads classes, so the array is pinned across the fill loop
-    // (see `build_mirror_array` — WildFly bug-06).
+    // (see `build_mirror_array` вЂ” WildFly bug-06).
     let class_comp = class_component_id(ctx);
     let decl_cid = meta.declaring_class_id;
     let param_arr = build_mirror_array_comp(ctx, class_comp, param_descs.len(), |ctx, i| {
@@ -4755,12 +4755,12 @@ pub(crate) fn create_method_object(
     // byte-array fields (`annotations`, `parameterAnnotations`,
     // `annotationDefault`). If these are left as the default `null`,
     // any caller doing `arr.length` or `arr.clone()` or even just
-    // iterating will NPE — most notably ByteBuddy's
+    // iterating will NPE вЂ” most notably ByteBuddy's
     // `JavaDispatcher.<clinit>` which does `arraylength` on a `Method`-
     // returned array. The real JDK guarantees these fields are non-null
     // (initialised by the `Method` constructor); we mirror that.
     //
-    // WP2.1 — populate `exceptionTypes` from the JVMS §4.7.5 `Exceptions`
+    // WP2.1 вЂ” populate `exceptionTypes` from the JVMS В§4.7.5 `Exceptions`
     // attribute when present, so `Method.getExceptionTypes()` (which the
     // JDK Java code implements by `return exceptionTypes.clone();`)
     // returns the actual throws-clause types instead of always-empty.
@@ -4784,7 +4784,7 @@ pub(crate) fn create_method_object(
     ctx.set_field_by_name(obj, "parameterTypes", Value::Object(Some(param_arr)));
     // G2 + WP2.1: exceptionTypes is a non-null Class[] populated from the
     // `Exceptions` class-file attribute (or empty if no throws clause).
-    // `Method.getExceptionTypes()` does `exceptionTypes.clone()` — if this
+    // `Method.getExceptionTypes()` does `exceptionTypes.clone()` вЂ” if this
     // were null, ByteBuddy / Mockito / Spring AOP clinit paths would NPE.
     ctx.set_field_by_name(obj, "exceptionTypes", Value::Object(Some(exception_arr)));
     ctx.set_field_by_name(obj, "modifiers", Value::Int(meta.access_flags as i32));
@@ -4793,7 +4793,7 @@ pub(crate) fn create_method_object(
     // `callerSensitive` is a byte cache; 0 means "not yet computed".
     ctx.set_field_by_name(obj, "callerSensitive", Value::Int(0));
     // Annotation raw-byte fields (`annotations`, `parameterAnnotations`,
-    // `annotationDefault`) — all `byte[]` on JDK 25. These MUST be `null`
+    // `annotationDefault`) вЂ” all `byte[]` on JDK 25. These MUST be `null`
     // when no annotation bytes are present, NOT empty arrays.
     //
     // CratonVM serves method-annotation reflection via dedicated natives
@@ -4803,16 +4803,16 @@ pub(crate) fn create_method_object(
     // native shadow on `java/lang/reflect/Method.getDeclaredAnnotations`
     // is suppressed and the real JDK bytecode runs instead:
     //   `Executable.declaredAnnotations()`
-    //     -> `AnnotationParser.parseAnnotations(getAnnotationBytes(), …)`.
+    //     -> `AnnotationParser.parseAnnotations(getAnnotationBytes(), вЂ¦)`.
     // `parseAnnotations` short-circuits only on a `null` byte[]; a non-null
     // EMPTY array flows into `parseAnnotations2`, whose very first read is
-    // `buf.getShort()` (the 2-byte annotation count) — a 0-length buffer
+    // `buf.getShort()` (the 2-byte annotation count) вЂ” a 0-length buffer
     // underflows, surfacing as `AnnotationFormatError: Unexpected end of
     // annotations.` That aborts `Mockito.mock(Method.class)` and any test
     // class (e.g. spring-aop `MethodMatchersTests`) that mocks a reflection
     // type in `<clinit>`. The class-level `getRawAnnotations` native already
     // returns `null` for the same reason, and `create_field_object` /
-    // `create_constructor_object` leave these fields `null` — matching
+    // `create_constructor_object` leave these fields `null` вЂ” matching
     // HotSpot, where an unannotated member's annotation bytes are `null`.
     // The earlier "empty, not null" rationale was mistaken:
     // `AnnotationParser` does not read `arr.length`, and the JDK getters for
@@ -4878,15 +4878,15 @@ pub(crate) fn create_method_object(
         );
     }
 
-    // WP2.1: populate the JDK `signature` field from the JVMS §4.7.9 Signature
+    // WP2.1: populate the JDK `signature` field from the JVMS В§4.7.9 Signature
     // attribute when the method is generic. The real JDK `Method.getGenericReturnType()`
     // / `getGenericParameterTypes()` are pure-Java methods that read this field
     // via `getGenericSignature()`; when it is null they fall back to the erased
     // `returnType` / `parameterTypes`. CratonVM dispatches those reflective
     // getters to the JDK bytecode (not the registered natives), so leaving
-    // `signature` null made every generic method type come back erased — which
-    // breaks Jackson bean-property type resolution (`Map<String,Foo>` getter →
-    // `LinkedHashMap` values → ClassCastException). Setting it here makes the
+    // `signature` null made every generic method type come back erased вЂ” which
+    // breaks Jackson bean-property type resolution (`Map<String,Foo>` getter в†’
+    // `LinkedHashMap` values в†’ ClassCastException). Setting it here makes the
     // JDK Java code recover the full `ParameterizedType`, matching real-JVM
     // behaviour. Mirrors how `create_field_object` relies on the field
     // Signature attribute for `Field.getGenericType()`.
@@ -4928,8 +4928,8 @@ pub(crate) fn read_method_descriptor(
     }
 }
 
-/// Single type token for a `java.lang.Class` mirror (`java/lang/String` →
-/// `Ljava/lang/String;`, `[I` → `[I`, primitives → `I`/`J`/…).
+/// Single type token for a `java.lang.Class` mirror (`java/lang/String` в†’
+/// `Ljava/lang/String;`, `[I` в†’ `[I`, primitives в†’ `I`/`J`/вЂ¦).
 fn mirror_to_jvm_descriptor_token(ctx: &dyn NativeContext, mirror: ObjectRef) -> String {
     let name = mirror_class_name(ctx, mirror).unwrap_or_default();
     if name.is_empty() {
@@ -4953,8 +4953,8 @@ fn mirror_to_jvm_descriptor_token(ctx: &dyn NativeContext, mirror: ObjectRef) ->
 /// Real JDK `java.lang.reflect.Method` instances do not populate our extra
 /// descriptor slot (`METHOD_EXTRA_OFFSET_DESC`). Without a descriptor,
 /// `Method.invoke` used to assume `()V` when `returnType` could not be read,
-/// and [`box_value`] turned every reference return into `null` — breaking
-/// Surefire's `LazyLauncher` (`getLauncher()` → null). Missing `returnType`
+/// and [`box_value`] turned every reference return into `null` вЂ” breaking
+/// Surefire's `LazyLauncher` (`getLauncher()` в†’ null). Missing `returnType`
 /// now falls back to `Ljava/lang/Object;` while still honouring
 /// `parameterTypes`.
 fn compose_method_descriptor_from_type_fields(
@@ -4964,7 +4964,7 @@ fn compose_method_descriptor_from_type_fields(
     // When `returnType` is missing (layout mismatch on some `Method`
     // mirrors), returning an empty string made `parse_descriptor_param_and_return`
     // treat the return as `void`, so `Method.invoke` boxed real reference
-    // results as `null` — Surefire `LazyLauncher` then kept a null delegate
+    // results as `null` вЂ” Surefire `LazyLauncher` then kept a null delegate
     // (`Cannot invoke discover on null`). Default missing return to
     // `java.lang.Object` (still correct for `void`: the invoke path returns
     // `None` before boxing).
@@ -4997,7 +4997,7 @@ fn compose_method_descriptor_from_type_fields(
 /// count)`. For real `java.lang.reflect.Method` instances the extra slot
 /// index can still land **inside** the JDK instance layout (below the true
 /// tail). That slot may hold an unrelated reference (e.g. `signature`) that
-/// `read_string` turns into garbage — **not** starting with `(`. We must
+/// `read_string` turns into garbage вЂ” **not** starting with `(`. We must
 /// not treat that as a JVM method descriptor or `Method.invoke` boxes
 /// reference returns as `null` (wrong `()V` shape).
 pub(crate) fn method_descriptor_for_invoke(
@@ -5023,7 +5023,7 @@ pub(crate) fn method_descriptor_for_invoke(
             // Only trust the CratonVM extra-slot descriptor when it agrees with
             // the Executable mirrors (`parameterTypes` / `returnType`). If the
             // slot lands on an unrelated `String` (C6), it can look like a
-            // valid JVM descriptor but disagree — e.g. bogus `()V` while the
+            // valid JVM descriptor but disagree вЂ” e.g. bogus `()V` while the
             // method returns `Launcher` (Surefire `LazyLauncher` NPE).
             if slot_params.len() != comp_params.len() || slot_ret != comp_ret {
                 return composed;
@@ -5046,7 +5046,7 @@ fn read_method_param_count(ctx: &dyn NativeContext, method_obj: cratonvm_types::
 
 /// Read the CratonVM-specific accessible flag extra slot.
 ///
-/// In real JDK 25, `Method.setAccessible(boolean)` is NOT a native — it's
+/// In real JDK 25, `Method.setAccessible(boolean)` is NOT a native вЂ” it's
 /// inherited from `AccessibleObject.setAccessible(boolean)` which sets the
 /// `override` field directly via Java putfield. When dispatch routes through
 /// the Java method (or some other path that bypasses `native_method_set_accessible`),
@@ -5057,11 +5057,11 @@ fn read_method_param_count(ctx: &dyn NativeContext, method_obj: cratonvm_types::
 ///      `get_field_by_name` so it works whether stored as Int(0/1) or other
 ///      truthy encodings).
 ///   2. The CratonVM extra-slot fallback (kept for paths that only set the
-///      extra slot — e.g. internal write helpers).
+///      extra slot вЂ” e.g. internal write helpers).
 ///
 /// Either being truthy is enough to treat the Method as accessible.
 fn read_method_accessible(ctx: &dyn NativeContext, method_obj: cratonvm_types::ObjectRef) -> bool {
-    // Check the JDK `override` field first — this is what JDK 25's
+    // Check the JDK `override` field first вЂ” this is what JDK 25's
     // AccessibleObject.setAccessible writes via Java bytecode.
     if let Value::Int(v) =
         method_int_field_value_or_legacy(ctx, method_obj, "override", METHOD_LEGACY_SLOT_OVERRIDE)
@@ -5306,7 +5306,7 @@ fn args_match_descriptor_exactly(
             (Value::Float(_), "F") => {}
             (Value::Double(_), "D") => {}
             // Reference parameter:
-            //   * null is assignable to any reference type — fast-path OK.
+            //   * null is assignable to any reference type вЂ” fast-path OK.
             //   * non-null: runtime class name must equal the descriptor's
             //     declared inner class. Subtype assignability requires the
             //     slow path's class-hierarchy walk.
@@ -5424,7 +5424,7 @@ pub(crate) fn native_method_invoke(
     let declaring_mirror = match method_clazz_value(ctx, this) {
         Value::Object(Some(m)) => m,
         other => {
-            // CRATONVM_DBG_MINVOKE=1 — dump everything knowable about the
+            // CRATONVM_DBG_MINVOKE=1 вЂ” dump everything knowable about the
             // degraded Method object so the producer can be identified
             // (observed: Gradle DefaultServiceRegistry configure-method
             // dispatch receiving a Method whose clazz slot reads null).
@@ -5457,7 +5457,7 @@ pub(crate) fn native_method_invoke(
     // Serializable-lambda support: `ObjectOutputStream` reflectively invokes
     // the synthetic `writeReplace()` we expose on lambda proxies (see
     // `declared_methods_with_synthetic`) to obtain a `SerializedLambda`
-    // stand-in. Handle it before the access check — the synthetic method is
+    // stand-in. Handle it before the access check вЂ” the synthetic method is
     // private and `ObjectStreamClass` may invoke it without first toggling the
     // reflective `accessible` flag, which would otherwise raise
     // IllegalAccessException. Build the record from the proxy's call-site
@@ -5489,7 +5489,7 @@ pub(crate) fn native_method_invoke(
     //
     // JEP 403/261 distinction: PUBLIC methods of EXPORTED packages need
     // only `exports`, not `opens`. Only enforce the deep check when the
-    // method is non-public (ACC_PUBLIC = 0x0001) — that's the case where
+    // method is non-public (ACC_PUBLIC = 0x0001) вЂ” that's the case where
     // setAccessible / opens is required.
     let is_public = (modifiers & 0x0001) != 0;
     if !is_public {
@@ -5503,7 +5503,7 @@ pub(crate) fn native_method_invoke(
         }
     }
 
-    // Get descriptor — stored in CratonVM extra slot (not a real JDK field).
+    // Get descriptor вЂ” stored in CratonVM extra slot (not a real JDK field).
     let descriptor = method_descriptor_for_invoke(ctx, this);
 
     // Parse parameter types from descriptor
@@ -5535,7 +5535,7 @@ pub(crate) fn native_method_invoke(
             )?;
         // JDK contract: `Method.invoke` throws `IllegalArgumentException`
         // ("object is not an instance of declaring class") when the receiver
-        // is not assignable to the Method's declaring class — and it does so
+        // is not assignable to the Method's declaring class вЂ” and it does so
         // BEFORE any dispatch. CratonVM dispatches instance invokes virtually
         // by name on the receiver's runtime class (see `use_virtual_dispatch`
         // below), so a wrong-type receiver previously fell through to a
@@ -5546,7 +5546,7 @@ pub(crate) fn native_method_invoke(
         // and rely on the JDK IAE being swallowed (e.g. Hibernate 8's
         // `UniqueSlotExtractor.collectModelPartColumnValues`, which decomposes
         // every attribute during flush and tolerates a mismatched bidirectional
-        // getter) instead saw the `Error` escape — breaking flush/commit and
+        // getter) instead saw the `Error` escape вЂ” breaking flush/commit and
         // cascading into unrelated failures. Restore the JDK ordering and
         // throwable here.
         //
@@ -5554,7 +5554,7 @@ pub(crate) fn native_method_invoke(
         // just the superclass chain. A bare `is_subclass` walks the class
         // hierarchy and (for synthetic lambda proxies) the lambda table, but
         // NOT dynamic `java.lang.reflect.Proxy` instances, annotation proxies,
-        // or synthetic collection display classes — so this reuses the same
+        // or synthetic collection display classes вЂ” so this reuses the same
         // robust admission rule as `Class.isInstance` (`native_class_is_instance`)
         // to avoid false IAEs on those legitimate interface receivers.
         //
@@ -5563,7 +5563,7 @@ pub(crate) fn native_method_invoke(
         // interface implementation. That left a wrong-type receiver on an
         // interface-declared `Method` to fall through to name-based virtual
         // dispatch and surface an *uncatchable* `NoSuchMethodError` (a
-        // VM-internal `Error`, not a Java throwable) — which aborts the whole
+        // VM-internal `Error`, not a Java throwable) вЂ” which aborts the whole
         // VM. ByteBuddy's `JavaDispatcher` reflectively invokes JDK reflect
         // *default* methods (e.g. `AnnotatedType.getAnnotatedOwnerType()`) on
         // sentinel receivers that do NOT implement the declaring interface
@@ -5608,7 +5608,7 @@ pub(crate) fn native_method_invoke(
     }
 
     // Validate argument-array length matches parameter count (HotSpot throws
-    // IllegalArgumentException when they differ — except when the target is
+    // IllegalArgumentException when they differ вЂ” except when the target is
     // varargs and the last parameter receives the tail). This matches
     // `java.lang.reflect.Method.invoke` semantics.
     let actual_arg_count = match args_array {
@@ -5630,7 +5630,7 @@ pub(crate) fn native_method_invoke(
     // the formal parameter types 1:1; in that case `coerce_arg_strict`'s
     // wrapper-class / widening machinery is pure overhead.
     //
-    // Pre-materialise the raw args (cheap — single array load each) so the
+    // Pre-materialise the raw args (cheap вЂ” single array load each) so the
     // fast-path predicate can inspect them without a second pass.
     let raw_args: Vec<Value> = (0..param_descs.len())
         .map(|i| match args_array {
@@ -5639,7 +5639,7 @@ pub(crate) fn native_method_invoke(
         })
         .collect();
     if args_match_descriptor_exactly(ctx, &raw_args, &param_descs) {
-        // No coercion needed — push each arg straight through.
+        // No coercion needed вЂ” push each arg straight through.
         for v in raw_args {
             invoke_args.push(v);
         }
@@ -5674,7 +5674,7 @@ pub(crate) fn native_method_invoke(
                     } else {
                         e
                     };
-                    // CRATONVM_DBG_INVOKE_COERCE=1 — dump the method, formal
+                    // CRATONVM_DBG_INVOKE_COERCE=1 вЂ” dump the method, formal
                     // descriptors, actual arg runtime types, and innermost Java
                     // caller frames on a coercion mismatch. Env-gated.
                     if std::env::var("CRATONVM_DBG_INVOKE_COERCE").as_deref() == Ok("1") {
@@ -5718,12 +5718,12 @@ pub(crate) fn native_method_invoke(
     // Invoke the method. Any Java exception thrown by the callee must be
     // wrapped in InvocationTargetException per the Method.invoke contract.
     //
-    // Per JLS §15.12.4.4 / `Method.invoke` Javadoc: "If the underlying method
+    // Per JLS В§15.12.4.4 / `Method.invoke` Javadoc: "If the underlying method
     // is an instance method, it is invoked using dynamic method lookup ...
     // overriding based on the runtime type of the target object will occur."
     //
     // So for non-static, non-private, non-`<init>` instance methods we MUST
-    // perform virtual dispatch on the receiver's runtime class — even when
+    // perform virtual dispatch on the receiver's runtime class вЂ” even when
     // the cached Method points at a concrete declaring class (e.g.
     // `Super.class.getDeclaredMethod("hello")` on a `SubB` receiver should
     // call `SubB.hello`, not `Super.hello`).
@@ -5736,12 +5736,12 @@ pub(crate) fn native_method_invoke(
     let is_protected = (modifiers & ACC_PROTECTED) != 0;
     let is_init = method_name == "<init>";
 
-    // JLS §8.4.8.1: a package-private (default-access) method is only
+    // JLS В§8.4.8.1: a package-private (default-access) method is only
     // overridden by a same-named/same-descriptor subclass method in the SAME
     // runtime package as the declaring class. Virtual dispatch by name on
     // the receiver's runtime class can therefore resolve to a completely
     // unrelated, independently-declared same-named package-private method
-    // there instead of the exact method this `Method` mirror represents —
+    // there instead of the exact method this `Method` mirror represents вЂ”
     // exactly the javax.inject/jakarta.inject TCK's package-private-across-
     // packages cases (SpringAtInjectTckTests). When that's the situation,
     // `Method.invoke` must invoke the EXACT declaring-class method (no
@@ -5797,7 +5797,7 @@ pub(crate) fn native_method_invoke(
         // Private instance methods bypass virtual dispatch AND must never be
         // retargeted to a subclass's same-name method. `ctx.invoke`
         // (invoke_on_class_shared) retargets a call whose declaring class is
-        // abstract/interface onto the receiver's concrete class — correct for
+        // abstract/interface onto the receiver's concrete class вЂ” correct for
         // an abstract/interface method with no Code, but WRONG for a private
         // concrete method that merely lives in an abstract class. Reflectively
         // invoking `AbstractSharedSessionContract.writeObject` (private, in an
@@ -5805,8 +5805,8 @@ pub(crate) fn native_method_invoke(
         // `SessionImpl.writeObject`, so `ObjectStreamClass.invokeWriteObject`
         // skipped the superclass slot's hook: Hibernate never wrote the
         // SessionFactory UUID and deserialization reconnected a null factory
-        // → NPE (HIB-DEV-05). `invoke_special` resolves to the declaring class
-        // with no retarget — exactly the invokespecial semantics a private
+        // в†’ NPE (HIB-DEV-05). `invoke_special` resolves to the declaring class
+        // with no retarget вЂ” exactly the invokespecial semantics a private
         // method requires, and exactly what a cross-package package-private
         // method also needs (see `crosses_package` above).
         match ctx.invoke_special(&class_name, &method_name, &descriptor, &invoke_args) {
@@ -5859,7 +5859,7 @@ pub(crate) fn native_method_invoke(
 // Class.getDeclaredMethods / getDeclaredMethod
 // ---------------------------------------------------------------------------
 
-/// F2 — synthetic-JDK reflection augmentation table.
+/// F2 вЂ” synthetic-JDK reflection augmentation table.
 ///
 /// When a JDK class is loaded as a synthetic stub (no real `.class` file
 /// found on the classpath, see `class_manager::create_synthetic_stub`)
@@ -5871,7 +5871,7 @@ pub(crate) fn native_method_invoke(
 ///
 /// This table provides the missing public/protected method signatures
 /// for the well-known JDK classes that real-world frameworks reflect on.
-/// CGLIB's `ReflectUtils.<clinit>` is the canonical caller — it does:
+/// CGLIB's `ReflectUtils.<clinit>` is the canonical caller вЂ” it does:
 ///
 ///   ClassLoader.class.getDeclaredMethod(
 ///       "defineClass",
@@ -5882,17 +5882,17 @@ pub(crate) fn native_method_invoke(
 /// stub had no declared methods.
 ///
 /// The augmentation is applied **only** when a method is missing from
-/// `ctx.declared_methods(...)` — real-class loading (when the JDK
+/// `ctx.declared_methods(...)` вЂ” real-class loading (when the JDK
 /// bytecode is present) takes precedence, exactly as the JDK contract
 /// demands.
 ///
-/// Each entry is `(name, descriptor, access_flags)` — `access_flags`
+/// Each entry is `(name, descriptor, access_flags)` вЂ” `access_flags`
 /// uses the JVM bit values (ACC_PUBLIC=0x1, ACC_PROTECTED=0x4,
 /// ACC_FINAL=0x10, ACC_NATIVE=0x100, ACC_STATIC=0x8). The flags
 /// reflect the OpenJDK 25 declarations.
 fn synthetic_jdk_method_decls(class_name: &str) -> &'static [(&'static str, &'static str, u16)] {
     match class_name {
-        // java.lang.ClassLoader — surface the public/protected `defineClass`
+        // java.lang.ClassLoader вЂ” surface the public/protected `defineClass`
         // overloads + companion methods that frameworks reflect on. Access
         // flags match OpenJDK 25 `java/lang/ClassLoader.java`.
         //
@@ -5901,13 +5901,13 @@ fn synthetic_jdk_method_decls(class_name: &str) -> &'static [(&'static str, &'st
         // ACC_PUBLIC|ACC_STATIC   = 0x09
         "java/lang/ClassLoader" => &[
             // protected final Class<?> defineClass(byte[] b, int off, int len)
-            //   — DEPRECATED legacy overload (no name).
+            //   вЂ” DEPRECATED legacy overload (no name).
             ("defineClass", "([BII)Ljava/lang/Class;", 0x14),
             // protected final Class<?> defineClass(String name, byte[] b, int off, int len)
             ("defineClass", "(Ljava/lang/String;[BII)Ljava/lang/Class;", 0x14),
             // protected final Class<?> defineClass(String name, byte[] b, int off, int len,
             //                                      ProtectionDomain protectionDomain)
-            //   — the overload CGLIB's ReflectUtils.<clinit> reflects on.
+            //   вЂ” the overload CGLIB's ReflectUtils.<clinit> reflects on.
             (
                 "defineClass",
                 "(Ljava/lang/String;[BIILjava/security/ProtectionDomain;)Ljava/lang/Class;",
@@ -5957,7 +5957,7 @@ fn synthetic_jdk_method_decls(class_name: &str) -> &'static [(&'static str, &'st
                 0x01,
             ),
         ],
-        // G2: java/lang/reflect/Method — surface canonical declared
+        // G2: java/lang/reflect/Method вЂ” surface canonical declared
         // methods so that frameworks (ByteBuddy, Mockito) which call
         // `Method.class.getDeclaredMethods()` get a non-empty array.
         // ByteBuddy's `JavaDispatcher.<clinit>` iterates these and
@@ -5965,7 +5965,7 @@ fn synthetic_jdk_method_decls(class_name: &str) -> &'static [(&'static str, &'st
         // (or null) array.
         //
         // ACC_PUBLIC = 0x01; ACC_PUBLIC|ACC_NATIVE = 0x101.
-        // All Method methods are public (final on a few — 0x11).
+        // All Method methods are public (final on a few вЂ” 0x11).
         "java/lang/reflect/Method" => &[
             ("getName", "()Ljava/lang/String;", 0x01),
             ("getDeclaringClass", "()Ljava/lang/Class;", 0x01),
@@ -5993,7 +5993,7 @@ fn synthetic_jdk_method_decls(class_name: &str) -> &'static [(&'static str, &'st
             ("hashCode", "()I", 0x01),
             ("toShortSignature", "()Ljava/lang/String;", 0x00),
         ],
-        // G2: java/lang/reflect/Field — same rationale.
+        // G2: java/lang/reflect/Field вЂ” same rationale.
         "java/lang/reflect/Field" => &[
             ("getName", "()Ljava/lang/String;", 0x01),
             ("getDeclaringClass", "()Ljava/lang/Class;", 0x01),
@@ -6028,7 +6028,7 @@ fn synthetic_jdk_method_decls(class_name: &str) -> &'static [(&'static str, &'st
             ("equals", "(Ljava/lang/Object;)Z", 0x01),
             ("hashCode", "()I", 0x01),
         ],
-        // G2: java/lang/reflect/Constructor — same rationale.
+        // G2: java/lang/reflect/Constructor вЂ” same rationale.
         "java/lang/reflect/Constructor" => &[
             ("getName", "()Ljava/lang/String;", 0x01),
             ("getDeclaringClass", "()Ljava/lang/Class;", 0x01),
@@ -6069,7 +6069,7 @@ fn synthetic_jdk_method_decls(class_name: &str) -> &'static [(&'static str, &'st
             ("isSynthetic", "()Z", 0x01),
             ("toGenericString", "()Ljava/lang/String;", 0x401),
         ],
-        // WP2.1-narrow — JDBC SPI interface methods. The native registry
+        // WP2.1-narrow вЂ” JDBC SPI interface methods. The native registry
         // already pins the canonical natives (see WP7.2 anchor tests
         // `each_jdbc_core_type_has_registered_natives` /
         // `each_jdbc_core_type_has_multiple_anchor_natives` in
@@ -6080,7 +6080,7 @@ fn synthetic_jdk_method_decls(class_name: &str) -> &'static [(&'static str, &'st
         // the documented hook (see [`synthetic_jdk_method_decls`] header)
         // for surfacing those declarations to the reflection layer when
         // real JDK bytecode is unavailable. All flags are
-        // ACC_PUBLIC|ACC_ABSTRACT (0x401) — these are interface methods.
+        // ACC_PUBLIC|ACC_ABSTRACT (0x401) вЂ” these are interface methods.
         //
         // The lists below are subsets of the JDBC SPI surface, chosen to
         // mirror the WP7.2 width-of-surface anchors so frameworks holding
@@ -6192,20 +6192,20 @@ fn synthetic_jdk_method_decls(class_name: &str) -> &'static [(&'static str, &'st
             ("getJDBCMinorVersion", "()I", 0x401),
             ("getConnection", "()Ljava/sql/Connection;", 0x401),
         ],
-        // WP2.1-class-modern — surface the modern `java.lang.Class` API
-        // methods (Java 11–25 sealed-class / record-class / nest-mate
+        // WP2.1-class-modern вЂ” surface the modern `java.lang.Class` API
+        // methods (Java 11вЂ“25 sealed-class / record-class / nest-mate
         // accessors plus the canonical reflection-info methods) so
         // ByteBuddy's `TypeDescription.forLoadedType(Class.class)` and
         // Hibernate's record/sealed scanners see a non-empty
         // declared-method list when the synthetic-JDK `Class` stub is in
         // use. The natives backing each entry are already registered in
-        // `lib.rs` / `phases_early.rs` / `lang_reflect.rs` — this table
+        // `lib.rs` / `phases_early.rs` / `lang_reflect.rs` вЂ” this table
         // surfaces them to the reflection layer.
         //
         // Flags: 0x01 ACC_PUBLIC, 0x11 ACC_PUBLIC|ACC_FINAL,
         //        0x101 ACC_PUBLIC|ACC_NATIVE.
         // `Class` itself is final, so all instance methods are effectively
-        // final — but the JDK source marks only a few that way; we follow
+        // final вЂ” but the JDK source marks only a few that way; we follow
         // the OpenJDK 25 declarations to stay byte-compatible.
         "java/lang/Class" => &[
             // Identity / naming
@@ -6249,7 +6249,7 @@ fn synthetic_jdk_method_decls(class_name: &str) -> &'static [(&'static str, &'st
             ("getPermittedSubclasses", "()[Ljava/lang/Class;", 0x01),
             // Record API (Java 16+)
             ("getRecordComponents", "()[Ljava/lang/reflect/RecordComponent;", 0x01),
-            // Reflection — declared / inherited members
+            // Reflection вЂ” declared / inherited members
             ("getDeclaredFields", "()[Ljava/lang/reflect/Field;", 0x01),
             ("getDeclaredMethods", "()[Ljava/lang/reflect/Method;", 0x01),
             ("getDeclaredConstructors", "()[Ljava/lang/reflect/Constructor;", 0x01),
@@ -6392,7 +6392,7 @@ fn synthetic_jdk_method_decls(class_name: &str) -> &'static [(&'static str, &'st
     }
 }
 
-/// F2 — build a `MethodMetadata` for a synthetic JDK declaration.
+/// F2 вЂ” build a `MethodMetadata` for a synthetic JDK declaration.
 fn synthetic_method_meta(
     decl: &(&'static str, &'static str, u16),
     declaring_class_id: ClassId,
@@ -6406,14 +6406,14 @@ fn synthetic_method_meta(
     }
 }
 
-/// F2 — return the merged `declared_methods` for `class_id`, augmenting
+/// F2 вЂ” return the merged `declared_methods` for `class_id`, augmenting
 /// with the synthetic JDK declarations from
 /// [`synthetic_jdk_method_decls`] whenever the class file shipped no
 /// matching method (typical of synthetic-stub bootstrap loading).
 ///
 /// A method is considered "already present" if a (name, descriptor)
 /// pair exists in `ctx.declared_methods`; the synthetic entry is then
-/// skipped. This preserves real-class precedence — when JDK bytecode
+/// skipped. This preserves real-class precedence вЂ” when JDK bytecode
 /// is loaded, its declarations win.
 fn declared_methods_with_synthetic(
     ctx: &dyn NativeContext,
@@ -6435,8 +6435,8 @@ fn declared_methods_with_synthetic(
         // The SAM method itself (e.g. `Supplier.get()`) has no real bytecode
         // on the synthetic lambda proxy class, so it never shows up in
         // `ctx.declared_methods`. Reflective callers that enumerate methods
-        // to find advisable targets — notably AspectJ pointcut matching
-        // during Spring autoproxying (`execution(* ...Supplier+.get())`) —
+        // to find advisable targets вЂ” notably AspectJ pointcut matching
+        // during Spring autoproxying (`execution(* ...Supplier+.get())`) вЂ”
         // see an empty candidate set and conclude no advisor applies, so the
         // lambda is never wrapped in a proxy at all (`AopUtils.isAopProxy`
         // false). Synthesize the entry the same way `getInterfaces()` already
@@ -6494,19 +6494,19 @@ fn declared_methods_with_synthetic(
 // bytebuddy_probe stack-overflow guard (agent15).
 //
 // `Class.getDeclaredMethods` / `Class.getMethods` are heavy ByteBuddy hot
-// paths. The work each call does (`create_method_object` → allocate a
-// reflect.Method mirror per declared method → `descriptor_to_class_mirror`
-// per parameter → potentially `load_class` + `ensure_class_initialized` on
-// each parameter type → run that class's `<clinit>` via the interpreter)
+// paths. The work each call does (`create_method_object` в†’ allocate a
+// reflect.Method mirror per declared method в†’ `descriptor_to_class_mirror`
+// per parameter в†’ potentially `load_class` + `ensure_class_initialized` on
+// each parameter type в†’ run that class's `<clinit>` via the interpreter)
 // can re-enter these natives when ByteBuddy's `JavaDispatcher`,
 // SpringFactoriesLoader, or Mockito's `MockMethodInterceptor` walk the
 // declared-method table of every class they touch during bootstrap.
 //
 // The existing depth guards on `native_method_invoke_boxed` (lang_reflect)
 // and `native_class_is_assignable_from` (this file) do not cover the
-// recursion that flows: native_class_get_declared_methods →
-// create_method_object → descriptor_to_class_mirror → load_class →
-// <clinit> → ByteBuddy.run() → native_class_get_declared_methods … which
+// recursion that flows: native_class_get_declared_methods в†’
+// create_method_object в†’ descriptor_to_class_mirror в†’ load_class в†’
+// <clinit> в†’ ByteBuddy.run() в†’ native_class_get_declared_methods вЂ¦ which
 // is purely Rust-stack recursion that bypasses both invoke guards.
 //
 // Mirror the same pattern: a thread-local depth counter, bail with a
@@ -6522,7 +6522,7 @@ pub(crate) fn native_class_get_declared_methods(
     ctx: &mut dyn NativeContext,
     args: &[Value],
 ) -> MethodCallResult {
-    // Reentrancy / recursion guard — see comment on GET_DECLARED_METHODS_DEPTH.
+    // Reentrancy / recursion guard вЂ” see comment on GET_DECLARED_METHODS_DEPTH.
     let prev_depth = GET_DECLARED_METHODS_DEPTH.with(|d| {
         let v = d.get();
         d.set(v + 1);
@@ -6555,7 +6555,7 @@ pub(crate) fn native_class_get_declared_methods(
         };
 
         let methods = declared_methods_with_synthetic(ctx, class_id);
-        // `getDeclaredMethods0(boolean publicOnly)` — the real JDK calls this
+        // `getDeclaredMethods0(boolean publicOnly)` вЂ” the real JDK calls this
         // with publicOnly=true on the `Class.getMethods()` / `getMethod()` path
         // (`privateGetPublicMethods`) and TRUSTS it to return only PUBLIC
         // methods (mirroring `getDeclaredFields0`, which already honours the
@@ -6563,7 +6563,7 @@ pub(crate) fn native_class_get_declared_methods(
         // package-private/protected methods and `getMethod("get", int)` resolved
         // a non-public method instead of throwing NoSuchMethodException
         // (ReflectiveIndexAccessorTests.nonPublicReadMethod). The synthetic
-        // one-arg `getDeclaredMethods()` wrapper passes no flag → publicOnly=false.
+        // one-arg `getDeclaredMethods()` wrapper passes no flag в†’ publicOnly=false.
         let public_only = matches!(args.get(1), Some(Value::Int(v)) if *v != 0);
         // Filter out <init> and <clinit>, plus non-public when publicOnly.
         let mut visible: Vec<&MethodMetadata> = methods
@@ -6574,7 +6574,7 @@ pub(crate) fn native_class_get_declared_methods(
 
         // Bridge-method adjacency ordering. A compiler-generated bridge method
         // (ACC_BRIDGE, 0x40) is emitted AFTER its bridged counterpart in the
-        // class file, but typically as the LAST method of the class — so a
+        // class file, but typically as the LAST method of the class вЂ” so a
         // bridged method and its bridge are not adjacent. HotSpot's
         // `getDeclaredMethods` (symbol-table order) keeps the bridge right after
         // its same-name bridged method, and two kinds of Spring code rely on
@@ -6653,7 +6653,7 @@ pub(crate) fn native_class_get_declared_method(
     };
     let target_name = ctx.read_string(name_obj).unwrap_or_default();
 
-    // Parameter types array (args[2]) — may be null or empty
+    // Parameter types array (args[2]) вЂ” may be null or empty
     let param_types_arr = match args.get(2) {
         Some(Value::Object(Some(arr))) => Some(*arr),
         _ => None,
@@ -6662,7 +6662,7 @@ pub(crate) fn native_class_get_declared_method(
     let class_id = match mirror_class_id(ctx, this) {
         Some(id) => id,
         None => {
-            // WF6 — even if the class id can't be resolved, try to short-circuit
+            // WF6 вЂ” even if the class id can't be resolved, try to short-circuit
             // for known WildFly/Keycloak entry-class `main(String[])` lookups so
             // that jboss-modules' bootstrap progresses past the NoSuchMethod
             // wall. Fall through to the existing NSME otherwise.
@@ -6685,11 +6685,11 @@ pub(crate) fn native_class_get_declared_method(
 
     // Round 9 audit fix (HIGH #7): build a cache key string from the
     // requested parameter-type mirrors. The key is a synthetic
-    // `;`-delimited list of dotted class names — not a JVM descriptor,
+    // `;`-delimited list of dotted class names вЂ” not a JVM descriptor,
     // but unique within `(class_id, name)` so identical Spring /
     // Hibernate / ByteBuddy probes hit the cache instead of re-walking.
     // A `None` `param_types_arr` is semantically identical to an empty
-    // array (both mean "match a no-arg method" — see the cold-walk loop
+    // array (both mean "match a no-arg method" вЂ” see the cold-walk loop
     // below), so both map to the same empty cache key, which is correct.
     // The cached entry stays valid as long as the class hasn't been
     // redefined (the round-8 invalidation hook drops every entry keyed on
@@ -6722,7 +6722,7 @@ pub(crate) fn native_class_get_declared_method(
     };
 
     // Probe the LinkResolver cache. On hit, re-fetch the metadata vec
-    // and pick the entry at the cached index — much faster than
+    // and pick the entry at the cached index вЂ” much faster than
     // re-running the parameter-type comparison loop.
     if cache_key_ok {
         if let Some((decl, idx)) =
@@ -6737,7 +6737,7 @@ pub(crate) fn native_class_get_declared_method(
                 }
             }
             // Cached entry no longer applicable (synthetic-method table
-            // mutated, redefine raced past our invalidation window, etc.) —
+            // mutated, redefine raced past our invalidation window, etc.) вЂ”
             // fall through to the cold walk.
         }
     }
@@ -6749,18 +6749,18 @@ pub(crate) fn native_class_get_declared_method(
         }
 
         // JDK semantics: a `null` parameterTypes argument is treated as a
-        // ZERO-length array — `Class.getDeclaredMethod(name, (Class[])null)`
+        // ZERO-length array вЂ” `Class.getDeclaredMethod(name, (Class[])null)`
         // matches ONLY a no-arg method. `Class.searchMethods` compares the
         // query types against each candidate via `arrayContentsEq(null, p)`,
         // which is true iff `p` is empty. Previously a `None` array skipped
         // the arity/type check entirely and returned the FIRST same-named
         // method regardless of parameter count, so a no-arg
-        // `getDeclaredMethod("writeReplace")` probe — exactly what
+        // `getDeclaredMethod("writeReplace")` probe вЂ” exactly what
         // `java.io.ObjectStreamClass.getInheritableMethod` issues with
         // `argTypes == null` while resolving the serialization replacement
-        // hook — wrongly matched a 1-arg `writeReplace(Object)` overload.
+        // hook вЂ” wrongly matched a 1-arg `writeReplace(Object)` overload.
         // `ObjectStreamClass.invokeWriteReplace` then called it with 0 args
-        // → `Method.invoke` IllegalArgumentException (HIB-CV-36). Treat a
+        // в†’ `Method.invoke` IllegalArgumentException (HIB-CV-36). Treat a
         // missing array as "expected zero parameters".
         let (param_descs, _) = parse_descriptor_param_and_return(&meta.descriptor);
         let expected_count = match param_types_arr {
@@ -6810,7 +6810,7 @@ pub(crate) fn native_class_get_declared_method(
         return Ok(Some(Value::Object(Some(method_obj))));
     }
 
-    // WF6 — last-resort synthesis for jboss-modules / WildFly / Keycloak.
+    // WF6 вЂ” last-resort synthesis for jboss-modules / WildFly / Keycloak.
     //
     // The jboss-modules launcher resolves the module's main entry point as:
     //
@@ -6823,7 +6823,7 @@ pub(crate) fn native_class_get_declared_method(
     // `NoSuchMethodException`, which jboss-modules wraps and rethrows as a
     // fatal startup error. Earlier waves stuffed a synthetic class definition
     // in the loader; this didn't help because `getDeclaredMethod` walks the
-    // class file's own method table — which is still empty for the synthetic
+    // class file's own method table вЂ” which is still empty for the synthetic
     // stub. Synthesise a no-op `main(String[])` Method *here* so the launcher
     // can invoke it (the invoke is intercepted natively elsewhere).
     if let Some(method_obj) = wf_shim_synth_main_method(ctx, this, &target_name, param_types_arr) {
@@ -6836,7 +6836,7 @@ pub(crate) fn native_class_get_declared_method(
     .into())
 }
 
-/// WF6 — short-circuit `Class.getDeclaredMethod` / `Class.getMethod` for the
+/// WF6 вЂ” short-circuit `Class.getDeclaredMethod` / `Class.getMethod` for the
 /// jboss-modules / WildFly / Keycloak launcher pattern
 /// `getDeclaredMethod("main", String[].class)`.
 ///
@@ -6895,7 +6895,7 @@ fn wf_shim_synth_main_method(
     }
 
     let class_name = mirror_class_name(ctx, this).unwrap_or_default();
-    // Normalise — `mirror_class_name` may return either dotted or
+    // Normalise вЂ” `mirror_class_name` may return either dotted or
     // slash-separated form depending on how the mirror was created. We
     // match on a fragment of either.
     let cn = class_name.replace('.', "/");
@@ -6911,7 +6911,7 @@ fn wf_shim_synth_main_method(
     // Synthesise a public-static no-op `main([Ljava/lang/String;)V`. We
     // need a `declaring_class_id` for `create_method_object`: prefer the
     // mirror's real class id when available, otherwise fall back to id 0
-    // (the `unwrap_or` is just defensive — by the time we get here the
+    // (the `unwrap_or` is just defensive вЂ” by the time we get here the
     // class mirror has at least been allocated).
     let declaring_class_id = mirror_class_id(ctx, this).unwrap_or(ClassId::new(0));
     let meta = MethodMetadata {
@@ -6930,7 +6930,7 @@ fn wf_shim_synth_main_method(
 }
 
 // ---------------------------------------------------------------------------
-// java.lang.reflect.Constructor — object layout and natives
+// java.lang.reflect.Constructor вЂ” object layout and natives
 // ---------------------------------------------------------------------------
 
 /// Stable metadata for `java.lang.reflect.Constructor` mirrors created by
@@ -6941,9 +6941,9 @@ fn wf_shim_synth_main_method(
 /// When `ClassManager::upgrade_synthetic_class` replaces the stub with the real
 /// JDK class, `num_total_fields` grows (Wave 3-B: `max(old, new)`), so the
 /// absolute indices used at **allocation time** no longer match the indices
-/// computed at **read time** — `read_constructor_descriptor` returns `None`,
+/// computed at **read time** вЂ” `read_constructor_descriptor` returns `None`,
 /// `Constructor.newInstance` falls back to `()V`, and only `Object.<init>` runs
-/// (Surefire: `JUnitPlatformProvider.launcher` stays null →
+/// (Surefire: `JUnitPlatformProvider.launcher` stays null в†’
 /// `TestPlanScannerFilter` NPE on `discover`).
 ///
 /// The side table is keyed by the mirror object's identity (`ObjectRef` bits);
@@ -6960,7 +6960,7 @@ struct ConstructorMirrorSideMeta {
 }
 
 // FxHashMap instead of std::HashMap: SipHash on a pointer-derived `usize`
-// key is pure overhead — pointers are already well-distributed and need
+// key is pure overhead вЂ” pointers are already well-distributed and need
 // no cryptographic strength. FxHash is a couple of multiply/xor ops.
 fn constructor_mirror_side_table() -> &'static Mutex<FxHashMap<usize, ConstructorMirrorSideMeta>> {
     static TABLE: OnceLock<Mutex<FxHashMap<usize, ConstructorMirrorSideMeta>>> = OnceLock::new();
@@ -6997,15 +6997,15 @@ fn peek_constructor_mirror_side(obj: ObjectRef) -> Option<ConstructorMirrorSideM
 
 /// Number of "extra" slots appended after the JDK Constructor layout to
 /// hold CratonVM-specific metadata (not present on real JDK Constructor):
-///   +0 → String (raw descriptor, e.g. "(I)V")
-///   +1 → Int    (parameter count — cached)
-///   +2 → Int    (accessible flag, 0 or 1)
+///   +0 в†’ String (raw descriptor, e.g. "(I)V")
+///   +1 в†’ Int    (parameter count вЂ” cached)
+///   +2 в†’ Int    (accessible flag, 0 or 1)
 const CONSTRUCTOR_EXTRA_SLOTS: usize = 3;
 const CONSTRUCTOR_EXTRA_OFFSET_DESC: usize = 0;
 const CONSTRUCTOR_EXTRA_OFFSET_PARAM_COUNT: usize = 1;
 const CONSTRUCTOR_EXTRA_OFFSET_ACCESSIBLE: usize = 2;
 
-/// Legacy synthetic Constructor width — kept as a floor so the object
+/// Legacy synthetic Constructor width вЂ” kept as a floor so the object
 /// is always large enough for the synthetic writes and so tests using
 /// the MockNativeContext (which returns 0 for `class_num_total_fields`)
 /// still have room.
@@ -7053,11 +7053,11 @@ pub(crate) fn create_constructor_object(
     });
     let desc_str = ctx.create_string(&meta.descriptor);
 
-    // WP2.1 — populate `exceptionTypes` from the JVMS §4.7.5 `Exceptions`
+    // WP2.1 вЂ” populate `exceptionTypes` from the JVMS В§4.7.5 `Exceptions`
     // attribute. The JDK `Constructor.getExceptionTypes()` Java method
     // does `return exceptionTypes.clone();`, which NPEs if null. CGLib's
     // Enhancer.emitConstructors calls this on every superclass constructor
-    // during proxy class generation — see ReflectUtils.getExceptionTypes
+    // during proxy class generation вЂ” see ReflectUtils.getExceptionTypes
     // (ReflectUtils.java:133/605).
     let exception_names =
         ctx.method_exceptions(meta.declaring_class_id, &meta.name, &meta.descriptor);
@@ -7076,7 +7076,7 @@ pub(crate) fn create_constructor_object(
     ctx.set_field_by_name(obj, "modifiers", Value::Int(meta.access_flags as i32));
     ctx.set_field_by_name(obj, "slot", Value::Int(0));
 
-    // SBR-06: populate the JDK `signature` field from the JVMS §4.7.9 Signature
+    // SBR-06: populate the JDK `signature` field from the JVMS В§4.7.9 Signature
     // attribute, mirroring `create_method_object`. `Parameter.getParameterizedType()`
     // runs JDK bytecode (`executable.getAllGenericParameterTypes()`), which checks
     // `hasGenericInformation()` (i.e. `getGenericSignature() != null`) FIRST and
@@ -7127,9 +7127,9 @@ pub(crate) fn read_constructor_descriptor(
     }
 }
 
-/// Build an `<init>` descriptor `(…)V` from the JDK `Constructor.parameterTypes`
-/// mirrors. Used when the CratonVM extra-slot descriptor is unreadable (C6 —
-/// `class_num_total_fields` grew after stub→real upgrade); falling back to
+/// Build an `<init>` descriptor `(вЂ¦)V` from the JDK `Constructor.parameterTypes`
+/// mirrors. Used when the CratonVM extra-slot descriptor is unreadable (C6 вЂ”
+/// `class_num_total_fields` grew after stubв†’real upgrade); falling back to
 /// `()V` would run only `Object.<init>` and leave subclass fields unset
 /// (Surefire fork: `JUnitPlatformProvider.launcher == null`).
 fn compose_init_descriptor_from_parameter_types(
@@ -7155,7 +7155,7 @@ fn compose_init_descriptor_from_parameter_types(
 
 /// Descriptor for `Constructor.newInstance`: extra slot / side table when
 /// trustworthy; otherwise reconstruct from `parameterTypes` (never guess
-/// `()V` alone — see `compose_init_descriptor_from_parameter_types`).
+/// `()V` alone вЂ” see `compose_init_descriptor_from_parameter_types`).
 fn constructor_descriptor_for_new_instance(
     ctx: &dyn NativeContext,
     ctor_obj: cratonvm_types::ObjectRef,
@@ -7199,11 +7199,11 @@ fn constructor_descriptor_for_new_instance(
     }
 
     if composed == "()V" {
-        // `compose_…` yields "()V" for BOTH a genuine no-arg constructor
+        // `compose_вЂ¦` yields "()V" for BOTH a genuine no-arg constructor
         // (present-but-empty `parameterTypes`) and a read-FAILURE (the field
         // layout mismatch case this fallback targets). Only recover via the
         // unique public `<init>` when `parameterTypes` was actually unreadable
-        // — otherwise `newInstance()` on a class's real no-arg constructor
+        // вЂ” otherwise `newInstance()` on a class's real no-arg constructor
         // wrongly adopts the parameter list of its (unique public) OTHER
         // constructor. Hibernate instantiates entities via the no-arg ctor, so
         // any entity that also declares a unique public ctor (e.g. the
@@ -7251,12 +7251,12 @@ fn read_constructor_accessible(
             return true;
         }
     }
-    // Also consult the JDK-standard `override` field — that's what
+    // Also consult the JDK-standard `override` field вЂ” that's what
     // `AccessibleObject.setAccessible(boolean)` writes (registered in
     // `lib.rs::native_set_accessible_write_override`). Apache Ignite's
     // `GridUnsafe.<clinit>` calls `ctor.setAccessible(true)` on a
     // `java.nio.DirectByteBuffer` constructor and then
-    // `ctor.newInstance(...)` — without this read the extra slot stays at
+    // `ctor.newInstance(...)` вЂ” without this read the extra slot stays at
     // 0, the deep-reflection check denies the access, and Ignite throws
     // `IllegalAccessException: module java.base does not "opens java.nio"`
     // even though setAccessible already paid the check. (`read_method_accessible`
@@ -7377,12 +7377,12 @@ pub(crate) fn native_constructor_new_instance(
     // MethodHandle `target` is a `DirectMethodHandle$Constructor` that allocates
     // `cl` itself (its `instanceClass` field) and runs only the ancestor `<init>`.
     // Allocating `clazz` here would produce a bare `java.lang.Object`, so the JDK
-    // field-setter then throws `cannot assign … in instance of java.lang.Object`
+    // field-setter then throws `cannot assign вЂ¦ in instance of java.lang.Object`
     // (keycloak SkeletonKeyTokenTest.testSerialization). We can't invoke the
     // MethodHandle directly (`DirectMethodHandle$Constructor.invokeExact` is
     // unimplemented), so we read `instanceClass` off the target handle, allocate
     // that type without running its own ctor, and run the ancestor `<init>`
-    // (`clazz`) — exactly the serialization contract. Ordinary CratonVM reflective
+    // (`clazz`) вЂ” exactly the serialization contract. Ordinary CratonVM reflective
     // constructors have no accessor object installed (the field holds a non-object
     // sentinel), so they fall through to the native allocation path below.
     if let Value::Object(Some(acc)) = ctx.get_field_by_name(this, "constructorAccessor") {
@@ -7433,7 +7433,7 @@ pub(crate) fn native_constructor_new_instance(
     // Capture the declaring class's EXACT id from the mirror up front (before
     // any allocation that could relocate the mirror). Allocation below uses
     // this id directly so a loader-private / load-time-weaved class is
-    // instantiated as itself (JVMS §5.3), not as the same-named class some
+    // instantiated as itself (JVMS В§5.3), not as the same-named class some
     // other loader defined first (which the name-based allocation collapses
     // to). See `new_object_initialized_with_class_id`.
     let declaring_cid = mirror_class_id(ctx, declaring_mirror);
@@ -7462,7 +7462,7 @@ pub(crate) fn native_constructor_new_instance(
     // CratonVM extra slot; when true the check is already paid (JEP 403).
     //
     // JEP 403/261 distinction (same pattern as Method.invoke): a PUBLIC
-    // constructor needs only `exports`, not `opens` — e.g.
+    // constructor needs only `exports`, not `opens` вЂ” e.g.
     // `ArrayList.class.getConstructor(int.class).newInstance(16)` must
     // succeed without any --add-opens (java.base exports java.util).
     // kafka's ListDeserializer constructs its backing list exactly this
@@ -7488,11 +7488,11 @@ pub(crate) fn native_constructor_new_instance(
     }
 
     // Descriptor: extra slot / side table, or rebuild from `parameterTypes`
-    // (C6 / Surefire fork — never default to bare `()V`; see
+    // (C6 / Surefire fork вЂ” never default to bare `()V`; see
     // `constructor_descriptor_for_new_instance`).
     let descriptor = constructor_descriptor_for_new_instance(ctx, this);
 
-    // Reject abstract classes / interfaces before allocating — matches
+    // Reject abstract classes / interfaces before allocating вЂ” matches
     // `java.lang.reflect.Constructor.newInstance` which throws
     // InstantiationException on abstract targets.
     if let Some(cid) = ctx.class_id_by_name(&class_name) {
@@ -7602,7 +7602,7 @@ pub(crate) fn native_class_get_declared_constructors(
             .into())
         }
     };
-    // JDK `Class.getDeclaredConstructors0(boolean publicOnly)` — when true,
+    // JDK `Class.getDeclaredConstructors0(boolean publicOnly)` вЂ” when true,
     // returns only ACC_PUBLIC <init> (used by `Class.getConstructors()`).
     // When this native is invoked from the synthetic `getDeclaredConstructors()`
     // wrapper (args.len()==1), publicOnly is false.
@@ -7693,7 +7693,7 @@ pub(crate) fn native_class_get_declared_constructor(
                 continue;
             }
         } else {
-            // No param types specified — match no-arg constructor
+            // No param types specified вЂ” match no-arg constructor
             if !param_descs.is_empty() {
                 continue;
             }
@@ -7710,7 +7710,7 @@ pub(crate) fn native_class_get_declared_constructor(
 }
 
 // ---------------------------------------------------------------------------
-// Inherited enumeration — getFields/getMethods/getConstructors
+// Inherited enumeration вЂ” getFields/getMethods/getConstructors
 // ---------------------------------------------------------------------------
 
 /// Collect all public fields from the class hierarchy (this class +
@@ -7737,7 +7737,7 @@ fn collect_public_fields(
                 result.push(create_field_object(ctx, meta));
             }
         }
-        // Walk superclass — skipped for interfaces (see
+        // Walk superclass вЂ” skipped for interfaces (see
         // `collect_public_methods` rationale).
         if !ctx.is_interface_class(cid) {
             if let Some(parent) = ctx.superclass_of(cid) {
@@ -7758,15 +7758,15 @@ fn collect_public_fields(
 /// * For a **class**: walk declared public methods + super-interfaces +
 ///   superclass chain.
 /// * For an **interface**: walk declared public methods + super-interfaces
-///   only — **NEVER** the superclass (which is `java/lang/Object` per
-///   JVMS but is intentionally skipped — see `Class.java`:
+///   only вЂ” **NEVER** the superclass (which is `java/lang/Object` per
+///   JVMS but is intentionally skipped вЂ” see `Class.java`:
 ///   `Class<?> sc = isInterface() ? null : getSuperclass();`).
 ///
 /// G2-fix (NegativeArraySizeException): walking the superclass chain for
 /// an interface pulled in `java/lang/Object`'s public 0-arg methods
 /// (`toString`, `hashCode`, `getClass`, `notify`, `notifyAll`). ByteBuddy's
 /// `JavaDispatcher$DynamicClassLoader.invoker()` then calls
-/// `parameterTypes.length - 1` and `anewarray` on the result —
+/// `parameterTypes.length - 1` and `anewarray` on the result вЂ”
 /// underflowing to `-1` and triggering `NegativeArraySizeException`.
 /// Real JDK 25 returns only the 2 declared `Invoker` methods; this fix
 /// matches.
@@ -7874,7 +7874,7 @@ pub(crate) fn native_class_get_field(
 
     // Round 9 audit fix (HIGH #7): probe the LinkResolver for the
     // resolved hierarchy walk. `getField` keys on `(class_id, name, "")`
-    // — same shape as JNI `GetFieldID` with a null signature. On a cache
+    // вЂ” same shape as JNI `GetFieldID` with a null signature. On a cache
     // hit we still re-fetch the metadata from the declaring class so
     // `create_field_object` produces a faithful mirror.
     if let Some((decl, abs_idx, is_static)) =
@@ -7934,7 +7934,7 @@ pub(crate) fn native_class_get_methods(
     ctx: &mut dyn NativeContext,
     args: &[Value],
 ) -> MethodCallResult {
-    // bytebuddy_probe stack-overflow guard (agent15) — see comment on
+    // bytebuddy_probe stack-overflow guard (agent15) вЂ” see comment on
     // GET_DECLARED_METHODS_DEPTH above. `getMethods` walks the super/iface
     // chain (collect_public_methods) so it can recurse even more deeply
     // than `getDeclaredMethods` once any superclass mirror's `<clinit>`
@@ -8008,7 +8008,7 @@ pub(crate) fn native_class_get_method(
     let class_id = match mirror_class_id(ctx, this) {
         Some(id) => id,
         None => {
-            // WF6 — same short-circuit as getDeclaredMethod: synth a no-op
+            // WF6 вЂ” same short-circuit as getDeclaredMethod: synth a no-op
             // `main(String[])` Method for jboss-modules / WildFly /
             // Keycloak entry-class lookups so the launcher progresses past
             // the NoSuchMethod wall instead of fataling.
@@ -8028,7 +8028,7 @@ pub(crate) fn native_class_get_method(
     // key as `getDeclaredMethod` and probe the LinkResolver before
     // walking. Public-method lookups can also straddle several
     // superclass rungs, but the cache key uses the *origin* class_id
-    // (where the user queried from) — that's the natural dedupe axis.
+    // (where the user queried from) вЂ” that's the natural dedupe axis.
     let mut cache_key_ok = true;
     let cache_key_desc: String = match param_types_arr {
         None => String::new(),
@@ -8056,7 +8056,7 @@ pub(crate) fn native_class_get_method(
             ctx.link_resolver_get_method(class_id, &target_name, &cache_key_desc)
         {
             // Refetch the cached entry's metadata vec on the declaring
-            // class and verify the (name, public) constraints — if the
+            // class and verify the (name, public) constraints вЂ” if the
             // entry still applies we can short-circuit the hierarchy walk.
             let methods = declared_methods_with_synthetic(ctx, decl);
             if let Some(meta) = methods.get(idx as usize) {
@@ -8093,7 +8093,7 @@ pub(crate) fn native_class_get_method(
                 continue;
             }
             // Check parameter types. A `null` array is treated as a
-            // ZERO-length one (JDK `Class.searchMethods` semantics — see
+            // ZERO-length one (JDK `Class.searchMethods` semantics вЂ” see
             // `getDeclaredMethod` above / HIB-CV-36): it matches ONLY a
             // no-arg method, never the first same-named overload.
             let (param_descs, _) = parse_descriptor_param_and_return(&meta.descriptor);
@@ -8150,7 +8150,7 @@ pub(crate) fn native_class_get_method(
         }
     }
 
-    // WF6 — same last-resort synthesis as `getDeclaredMethod`. Keycloak's
+    // WF6 вЂ” same last-resort synthesis as `getDeclaredMethod`. Keycloak's
     // launcher path occasionally hits `getMethod` instead of
     // `getDeclaredMethod`; both must produce a usable Method mirror for the
     // boot to continue.
@@ -8293,20 +8293,20 @@ pub(crate) fn native_class_get_interfaces(
     // return the most recently created proxy's interfaces array
     // (stored by `native_proxy_new_instance`). All proxies currently
     // share this class id, so we can't return per-instance interfaces
-    // off the class itself — see the doc-comment in
+    // off the class itself вЂ” see the doc-comment in
     // `vm::runtime::proxy` for the last-wins limitation and the
     // Strategy-A path forward.
     if let Value::Object(Some(name_ref)) = ctx.get_field(this, 1) {
         if let Some(name) = ctx.read_string(name_ref) {
             if name == "java/lang/reflect/Proxy$Instance" {
-                // bug nb-lib-gckeys §2: read the GC-tracked last-proxy
+                // bug nb-lib-gckeys В§2: read the GC-tracked last-proxy
                 // interfaces array (rooted + remapped by the annotation-proxy
                 // GC hooks) instead of the old raw `AtomicU64` pointer that
                 // was never rooted and could dangle after a moving GC.
                 if let Some(arr_ref) = proxy_last_interfaces() {
                     return Ok(Some(Value::Object(Some(arr_ref))));
                 }
-                // No proxy has been created yet — fall through and
+                // No proxy has been created yet вЂ” fall through and
                 // return an empty array.
                 let empty = ctx.new_ref_array(cratonvm_types::ClassId::new(0), 0);
                 return Ok(Some(Value::Object(Some(empty))));
@@ -8314,15 +8314,15 @@ pub(crate) fn native_class_get_interfaces(
         }
     }
 
-    // bytebuddy_probe (agent-bb3) — Object short-circuit. Real JDK returns
+    // bytebuddy_probe (agent-bb3) вЂ” Object short-circuit. Real JDK returns
     // an empty Class[] for java/lang/Object. If our class manager ever
     // hands back interfaces for Object (e.g. due to a synthetic-mirror
     // mixup where the reverse-map points at the wrong ClassId), the
     // ByteBuddy hierarchy walker treats them as super-types of Object
     // and the IllegalStateException reasserts. Force-empty here.
     //
-    // bytebuddy_probe (agent-bb4) — read name via the STRICT helper so a
-    // reverse-map alias of non-Object → Object does NOT spuriously
+    // bytebuddy_probe (agent-bb4) вЂ” read name via the STRICT helper so a
+    // reverse-map alias of non-Object в†’ Object does NOT spuriously
     // return an empty interfaces array for a non-Object class C (which
     // legitimately implements interfaces). See `mirror_class_name_strict`.
     let strict_name = mirror_class_name_strict(ctx, this).unwrap_or_default();
@@ -8418,7 +8418,7 @@ fn array_element_access_bits(ctx: &mut dyn NativeContext, name: &str) -> i32 {
     const ACCESS_MASK: u16 = 0x0001 | 0x0002 | 0x0004; // PUBLIC|PRIVATE|PROTECTED
     let elem = name.trim_start_matches('[');
     if elem.starts_with('L') && elem.ends_with(';') {
-        // Reference element: L<internal-name>; — look up its access flags.
+        // Reference element: L<internal-name>; вЂ” look up its access flags.
         let internal = elem[1..elem.len() - 1].replace('.', "/");
         if let Some(cid) = ctx.class_id_by_name(&internal) {
             return (ctx.class_access_flags(cid) & ACCESS_MASK) as i32;
@@ -8427,7 +8427,7 @@ fn array_element_access_bits(ctx: &mut dyn NativeContext, name: &str) -> i32 {
         // and HotSpot for the public-element arrays that dominate).
         0x0001
     } else {
-        // Primitive element (I, Z, J, ...) — primitives are PUBLIC.
+        // Primitive element (I, Z, J, ...) вЂ” primitives are PUBLIC.
         0x0001
     }
 }
@@ -8443,13 +8443,13 @@ pub(crate) fn native_class_get_modifiers(
 
     // Primitive types and `void`: HotSpot's JVM_GetClassModifiers returns
     // PUBLIC|FINAL|ABSTRACT (0x411). CratonVM's primitive mirrors carry no
-    // class access_flags, so without this they read back as 0 — i.e.
+    // class access_flags, so without this they read back as 0 вЂ” i.e.
     // "package-private". That breaks reflective callers that test the access
     // of a method's primitive *return* or *parameter* types. Concretely,
     // ByteBuddy's `isPackagePrivate()` element-matcher, which Mockito uses in
     // `ignoreAlso(returns(isPackagePrivate()).or(hasParameters(whereAny(
     // hasType(isPackagePrivate())))))`, was matching every primitive-signature
-    // method, so Mockito left them unimplemented on the generated mock →
+    // method, so Mockito left them unimplemented on the generated mock в†’
     // `AbstractMethodError` at first use (kafka suite bug-09).
     const ACC_PUBLIC: i32 = 0x0001;
     const ACC_FINAL: i32 = 0x0010;
@@ -8474,7 +8474,7 @@ pub(crate) fn native_class_get_modifiers(
         None => return Ok(Some(Value::Int(0))),
     };
 
-    // Lambda proxies are JVM hidden classes — HotSpot reports them as
+    // Lambda proxies are JVM hidden classes вЂ” HotSpot reports them as
     // `final synthetic` (0x1010, verified on JDK 25). Without this they carry no
     // class-store access flags and read back 0, so `Class.isSynthetic()` is false
     // and Spring's `ClassUtils.isLambdaClass()` (which requires `isSynthetic()`)
@@ -8485,20 +8485,20 @@ pub(crate) fn native_class_get_modifiers(
     }
 
     // Array classes: HotSpot's JVM_GetClassModifiers returns the element type's
-    // accessibility (PUBLIC/PROTECTED/PRIVATE) OR'd with FINAL|ABSTRACT — every
+    // accessibility (PUBLIC/PROTECTED/PRIVATE) OR'd with FINAL|ABSTRACT вЂ” every
     // array class is `final abstract`. Our array Class mirrors carry only the
     // PUBLIC|FINAL bits in their access_flags (ABSTRACT 0x400 is dropped), so
     // `int[].class.getModifiers()` returned 0x11 vs HotSpot's 0x411. Because
     // `getModifiers()` feeds `ObjectStreamClass.computeDefaultSUID`, the missing
-    // ABSTRACT bit produced a WRONG serialVersionUID for every array class —
+    // ABSTRACT bit produced a WRONG serialVersionUID for every array class вЂ”
     // e.g. a worker writing a `byte[]`/`int[]`/`String[]` message field gets a
     // SUID the peer rejects with InvalidClassException, desyncing the Gradle
-    // worker↔daemon stream. Synthesize the JVM-faithful value here.
+    // workerв†”daemon stream. Synthesize the JVM-faithful value here.
     if let Some(name) = mirror_class_name(ctx, this) {
         if name.starts_with('[') {
             let comp = name.trim_start_matches('[');
-            // Object element → use the element class's accessibility bits;
-            // primitive element (B/I/J/…) → public.
+            // Object element в†’ use the element class's accessibility bits;
+            // primitive element (B/I/J/вЂ¦) в†’ public.
             let access =
                 if let Some(stripped) = comp.strip_prefix('L').and_then(|s| s.strip_suffix(';')) {
                     ctx.class_id_by_name(stripped)
@@ -8512,9 +8512,9 @@ pub(crate) fn native_class_get_modifiers(
         }
     }
 
-    // JVMS §4.7.6: for nested classes, Class.getModifiers() returns the
+    // JVMS В§4.7.6: for nested classes, Class.getModifiers() returns the
     // `inner_class_access_flags` from the InnerClasses attribute entry whose
-    // `inner_class_info_index` points at this class — NOT the class's own
+    // `inner_class_info_index` points at this class вЂ” NOT the class's own
     // `access_flags`. The class's own access_flags does not carry ACC_STATIC
     // (our `ClassAccessFlags` bitflag set does not even contain a STATIC
     // variant, since STATIC is not legal in the top-level ClassFile flags),
@@ -8544,7 +8544,7 @@ pub(crate) fn native_class_get_modifiers(
     // (JVM_RECOGNIZED_CLASS_MODIFIERS excludes 0x0020), so `getModifiers()`
     // returns e.g. 0x1 (public) not 0x21. ByteBuddy validates generated-subclass
     // modifiers against its recognized set and throws "Illegal modifiers 33" when
-    // the 0x20 bit leaks through `Note.class.getModifiers()` — breaking
+    // the 0x20 bit leaks through `Note.class.getModifiers()` вЂ” breaking
     // Hibernate's ByteBuddy lazy-proxy generation. (ACC_SUPER never appears in
     // InnerClasses access flags, so masking is safe on the nested-class path too.)
     let masked = effective_flags & !0x0020u16;
@@ -8559,7 +8559,7 @@ pub(crate) fn native_class_get_modifiers(
 ///   field 0 = String (annotation type descriptor, e.g. "Ljava/lang/Override;")
 ///   field 1 = Class mirror (annotation type class, or null)
 ///   field 2 = String[] (element names)
-///   field 3 = Object[] (element values — boxed primitives, Strings, Class mirrors, etc.)
+///   field 3 = Object[] (element values вЂ” boxed primitives, Strings, Class mirrors, etc.)
 pub const ANN_PROXY_FIELDS: usize = 4;
 pub const ANN_PROXY_TYPE_DESC: usize = 0;
 pub const ANN_PROXY_TYPE_MIRROR: usize = 1;
@@ -8582,14 +8582,14 @@ fn annotation_desc_to_class_name(desc: &str) -> Option<&str> {
 // HotSpot caches annotation instances per class (`Class.annotationData`), so
 // repeated `getAnnotation(X)` / `getDeclaredAnnotations()` on the SAME class
 // return the SAME instance (`a1 == a2`). CratonVM previously rebuilt a fresh
-// proxy on every call, so `getAnnotation(X) != getAnnotation(X)` — breaking
+// proxy on every call, so `getAnnotation(X) != getAnnotation(X)` вЂ” breaking
 // identity-sensitive callers (annotations used as `IdentityHashMap` keys, or
 // caches keyed on the annotation instance).
 //
 // We cache the proxy keyed by (queried class id, annotation type descriptor),
 // mirroring HotSpot's per-class `annotationData`. The cached `ObjectRef`s live
 // only in this process-global side-table, invisible to the heap field scan, so
-// they MUST be GC-rooted and remapped — see `gc_scan_annotation_proxy_roots`
+// they MUST be GC-rooted and remapped вЂ” see `gc_scan_annotation_proxy_roots`
 // (roots.rs) and `gc_update_annotation_proxy_refs` (gc.rs). Without that, a
 // moving young GC would relocate a cached proxy and the next read would return
 // a stale `ObjectRef` (use-after-free).
@@ -8601,7 +8601,7 @@ fn annotation_proxy_cache() -> &'static Mutex<FxHashMap<(u32, String), ObjectRef
 }
 
 // ---------------------------------------------------------------------------
-// Last-created-proxy interfaces array (Pattern-A fix, bug nb-lib-gckeys §2)
+// Last-created-proxy interfaces array (Pattern-A fix, bug nb-lib-gckeys В§2)
 //
 // `Class.getInterfaces()` on the shared `Proxy$Instance` class mirror returns
 // the most-recently-created proxy's interfaces array (the "last-wins"
@@ -8616,7 +8616,7 @@ fn annotation_proxy_cache() -> &'static Mutex<FxHashMap<(u32, String), ObjectRef
 // and fold it into the SAME GC scan / remap hooks that already keep the
 // annotation-proxy cache live (`gc_scan_annotation_proxy_roots` /
 // `gc_update_annotation_proxy_refs`, wired into roots.rs + gc.rs). No new GC
-// wiring is needed — the array is now a tracked root and is repointed after
+// wiring is needed вЂ” the array is now a tracked root and is repointed after
 // every relocation, so the read below is always valid.
 fn proxy_last_interfaces_cell() -> &'static Mutex<Option<ObjectRef>> {
     static C: OnceLock<Mutex<Option<ObjectRef>>> = OnceLock::new();
@@ -8625,7 +8625,7 @@ fn proxy_last_interfaces_cell() -> &'static Mutex<Option<ObjectRef>> {
 
 /// Record the interfaces array of the most recently created proxy so a later
 /// `Class.getInterfaces()` on the shared `Proxy$Instance` mirror can return it
-/// (GC-tracked — see [`proxy_last_interfaces`]). Called from
+/// (GC-tracked вЂ” see [`proxy_last_interfaces`]). Called from
 /// `lib.rs::native_proxy_new_instance`.
 pub fn set_proxy_last_interfaces(arr: ObjectRef) {
     *proxy_last_interfaces_cell()
@@ -8645,7 +8645,7 @@ pub fn proxy_last_interfaces() -> Option<ObjectRef> {
 /// Build-or-fetch the cached annotation proxy for `ann` as seen on
 /// `queried_class_id`. The cache lock is NEVER held across
 /// `create_annotation_proxy` (which allocates and may trigger a GC whose root
-/// scan re-locks this cache — that would deadlock). On a concurrent first-build
+/// scan re-locks this cache вЂ” that would deadlock). On a concurrent first-build
 /// race the loser's proxy is dropped (still reachable from the caller's stack
 /// until the next GC), exactly as `OscCache` documents.
 fn cached_annotation_proxy(
@@ -8696,7 +8696,7 @@ pub fn gc_scan_annotation_proxy_roots(out: &mut Vec<ObjectRef>) {
         .lock()
         .unwrap_or_else(|e| e.into_inner());
     out.extend(guard.values().copied());
-    // bug nb-lib-gckeys §2: also root the last-proxy interfaces array so the
+    // bug nb-lib-gckeys В§2: also root the last-proxy interfaces array so the
     // shared-mirror `Class.getInterfaces()` fallback never dereferences a
     // reclaimed/relocated array.
     if let Some(arr) = *proxy_last_interfaces_cell()
@@ -8725,7 +8725,7 @@ pub fn gc_update_annotation_proxy_refs(pointer_map: &HashMap<usize, usize>) {
         }
     }
     drop(guard);
-    // bug nb-lib-gckeys §2: remap the last-proxy interfaces array alongside
+    // bug nb-lib-gckeys В§2: remap the last-proxy interfaces array alongside
     // the annotation-proxy cache (it shares this hook). Without the repoint
     // the shared-mirror `getInterfaces()` would hand back a stale pointer.
     let mut cell = proxy_last_interfaces_cell()
@@ -8762,7 +8762,7 @@ fn wrap_annotation_in_real_proxy(
     handler: ObjectRef,
 ) -> Option<ObjectRef> {
     // Cache under the SAME namespace `Proxy.newProxyInstance(annotationType
-    // .getClassLoader(), [annotationType], handler)` would use — this is
+    // .getClassLoader(), [annotationType], handler)` would use вЂ” this is
     // exactly the call Spring's `synthesize()` makes. A hardcoded `0` here
     // put every real-annotation proxy in the bootstrap-loader bucket
     // regardless of the annotation's actual defining loader, so a
@@ -8783,7 +8783,7 @@ fn wrap_annotation_in_real_proxy(
         crate::ProxyClassOutcome::Real(cid) => cid,
         // Gate-off degrade or a generation failure: fall back to the bare
         // AnnotationProxy. This annotation path degrades gracefully and is
-        // independently gated (CRATONVM_REAL_ANNOTATIONS) — it never throws,
+        // independently gated (CRATONVM_REAL_ANNOTATIONS) вЂ” it never throws,
         // even when the proxy STRICT mode is on.
         _ => return None,
     };
@@ -8796,7 +8796,7 @@ fn wrap_annotation_in_real_proxy(
         );
     }
     // Register the annotation type's defining loader as the generated proxy
-    // class's defining loader too, mirroring `native_proxy_new_instance` —
+    // class's defining loader too, mirroring `native_proxy_new_instance` вЂ”
     // otherwise `proxyClass.getClassLoader()` falls back to the app-loader
     // default (`defining_loader_for` returns None) even when the annotation
     // was loaded by a user-defined loader
@@ -8823,17 +8823,17 @@ fn wrap_annotation_in_real_proxy(
 //
 // `native_proxy_dispatch_invoke` (native-builtins/src/lib.rs) is reached when
 // a real `$ProxyN`'s generated hashCode/equals/toString body (bytecode that
-// calls `Proxy$Dispatch.invokeProxy`) runs — this happens for every call once
+// calls `Proxy$Dispatch.invokeProxy`) runs вЂ” this happens for every call once
 // the JIT has compiled that generated body, bypassing the interpreter's
 // primary AnnotationProxy dispatch hook. That hook's logic lives in
 // `annotation_proxy_hash_code` / `annotation_proxy_equals` /
 // `annotation_proxy_to_string` / the `"getClass"` arm of
 // `annotation_proxy_dispatch_impl` (`vm/src/vm/vm_exec.rs`), which operate on
 // `&SharedVm` directly. `native-builtins` cannot call into `vm` (the crate
-// dependency only goes the other way — `vm` depends on `native-builtins`),
+// dependency only goes the other way вЂ” `vm` depends on `native-builtins`),
 // and threading a `NativeContext` into the `vm`-side functions would mean
 // touching the primary proxy-dispatch hot path used by every proxy consumer
-// in the VM — out of scope for this narrow fix. These are therefore
+// in the VM вЂ” out of scope for this narrow fix. These are therefore
 // self-contained re-implementations against `NativeContext`, kept minimal on
 // purpose (the common member-value shapes: primitives, String, Class, nested
 // AnnotationProxy, boxed wrappers, arrays, enum-like objects). Keep in sync
@@ -8860,7 +8860,7 @@ fn ctx_wrapper_class_to_primitive(class_name: &str) -> Option<&'static str> {
     })
 }
 
-/// Java-spec `String.hashCode()` — `s[0]*31^(n-1) + ... + s[n-1]`.
+/// Java-spec `String.hashCode()` вЂ” `s[0]*31^(n-1) + ... + s[n-1]`.
 fn ctx_java_string_hash(s: &str) -> i32 {
     let mut h: i32 = 0;
     for ch in s.encode_utf16() {
@@ -8922,7 +8922,7 @@ fn ctx_annotation_value_hash(ctx: &mut dyn NativeContext, val: Value) -> i32 {
                 return ctx_annotation_proxy_hash_code(ctx, obj);
             }
             // Class mirror, Enum constant, and any other reference-typed
-            // member hash via `value.hashCode()` — identity hash, matching
+            // member hash via `value.hashCode()` вЂ” identity hash, matching
             // `annotation_value_hash` in vm_exec.rs (Class/Enum do not
             // override `Object.hashCode()`).
             ctx.identity_hash_code(obj)
@@ -9017,7 +9017,7 @@ fn ctx_annotation_values_equal(ctx: &mut dyn NativeContext, a: Value, b: Value) 
                 let yv = ctx.get_field(y, 0);
                 return ctx_annotation_values_equal(ctx, xv, yv);
             }
-            // Enum / generic — compare name field if present.
+            // Enum / generic вЂ” compare name field if present.
             if let (Value::Object(Some(xn)), Value::Object(Some(yn))) =
                 (ctx.get_field(x, 0), ctx.get_field(y, 0))
             {
@@ -9033,7 +9033,7 @@ fn ctx_annotation_values_equal(ctx: &mut dyn NativeContext, a: Value, b: Value) 
     }
 }
 
-/// Mirrors `annotation_proxy_equals` in vm_exec.rs — the plain same-type
+/// Mirrors `annotation_proxy_equals` in vm_exec.rs вЂ” the plain same-type
 /// structural comparison `annotation_proxy_dispatch_impl`'s `"equals"` arm
 /// uses. Does NOT implement the cross-type delegation to a foreign proxy's
 /// own `equals` that `annotation_proxy_invoke_shared` layers on top (that
@@ -9213,7 +9213,7 @@ pub(crate) fn ctx_annotation_proxy_to_string(
 /// Build a `java.lang.TypeNotPresentException(typeName, cause)` to store as a
 /// Class-valued annotation member that could NOT be resolved through the
 /// declaring class's loader (classloader-isolation / filtering). It is stored as
-/// the member value, NOT thrown here — `annotation_proxy_dispatch_impl` detects
+/// the member value, NOT thrown here вЂ” `annotation_proxy_dispatch_impl` detects
 /// it and throws it when the member is accessed, mirroring HotSpot's deferred
 /// `TypeNotPresentExceptionProxy` (so `getAnnotations()` does not throw, only the
 /// member accessor does). `type_name` is the binary (dotted) name; `cause` is the
@@ -9248,7 +9248,7 @@ fn make_type_not_present_exception(
 /// class's (`container`) loader, mirroring HotSpot's
 /// `AnnotationParser.parseClassValue(sig, container)`. Returns `Ok(mirror)` on
 /// success and `Err(Some(cnfe))` when the loader raised a
-/// `ClassNotFoundException` (→ a deferred `TypeNotPresentException`).
+/// `ClassNotFoundException` (в†’ a deferred `TypeNotPresentException`).
 /// `Err(None)` for any other failure (caller falls back to the global resolve).
 fn resolve_annotation_class_via_loader(
     ctx: &mut dyn NativeContext,
@@ -9265,9 +9265,9 @@ fn resolve_annotation_class_via_loader(
     ) {
         Ok(Some(Value::Object(Some(mirror)))) => Ok(mirror),
         Ok(_) => Err(None),
-        // The loader threw — typically ClassNotFoundException (the filter case).
+        // The loader threw вЂ” typically ClassNotFoundException (the filter case).
         Err(cratonvm_types::error::MethodCallFailed::ExceptionThrown(exc)) => Err(Some(exc)),
-        // Internal VM error — don't synthesize; let the caller fall back.
+        // Internal VM error вЂ” don't synthesize; let the caller fall back.
         Err(_) => Err(None),
     }
 }
@@ -9295,7 +9295,7 @@ fn create_annotation_proxy(
 
     let mut ann_class_id_opt = None;
     // Try to get the Class mirror for the annotation type. Load the annotation
-    // class on demand if it hasn't been loaded yet — JUnit4's TestClass scanner
+    // class on demand if it hasn't been loaded yet вЂ” JUnit4's TestClass scanner
     // calls Annotation.annotationType() expecting a non-null Class (C44). If
     // this field is null, BlockJUnit4ClassRunner reports a dummy failure
     // because runsTopToBottom(Class) NPEs on equals().
@@ -9330,18 +9330,18 @@ fn create_annotation_proxy(
             ann_class_id_opt = Some(cid);
             ctx.set_field(proxy, ANN_PROXY_TYPE_MIRROR, Value::Object(Some(mirror)));
         } else if std::env::var("CRATONVM_IAE_TRACE").is_ok() {
-            eprintln!("ANN-PROXY-NULL-MIRROR: annotation={} type_descriptor={} class_name={class_name} — type mirror NOT set (class load failed)",
+            eprintln!("ANN-PROXY-NULL-MIRROR: annotation={} type_descriptor={} class_name={class_name} вЂ” type mirror NOT set (class load failed)",
                 ann.type_descriptor, ann.type_descriptor);
         }
     } else if std::env::var("CRATONVM_IAE_TRACE").is_ok() {
-        eprintln!("ANN-PROXY-NULL-MIRROR: type_descriptor={} — annotation_desc_to_class_name returned None",
+        eprintln!("ANN-PROXY-NULL-MIRROR: type_descriptor={} вЂ” annotation_desc_to_class_name returned None",
             ann.type_descriptor);
     }
 
     // Collect explicit elements with their declared return-type descriptor
     // (read from the annotation interface's abstract method, when available).
     // The descriptor is used as a fallback hint when the element value is an
-    // EMPTY array — we'd otherwise pick `java/lang/Object` as the component
+    // EMPTY array вЂ” we'd otherwise pick `java/lang/Object` as the component
     // class, which trips Spring's `AnnotationUtils.adaptValue` into treating
     // the array as `Annotation[]` (under the lenient `Object` fallback in
     // `array_is_assignable`) and converts the empty `Object[]` into an empty
@@ -9391,7 +9391,7 @@ fn create_annotation_proxy(
     }
 
     // ---------------------------------------------------------------------
-    // (REMOVED) CGLIB-γ override that forced `@Configuration(proxyBeanMethods
+    // (REMOVED) CGLIB-Оі override that forced `@Configuration(proxyBeanMethods
     // =false)`. That shim put Spring into "lite" mode globally because CratonVM
     // had no CGLIB bytecode-rewriter, so the default "full" semantics (inter-
     // `@Bean`-method calls returning the shared singleton) were not realisable
@@ -9401,12 +9401,12 @@ fn create_annotation_proxy(
     // enhanced subclass (the `$$beanFactory` field + per-method overrides that
     // route inter-bean references through `beanFactory.getBean`), so full mode
     // works. We therefore let `proxyBeanMethods` resolve to its real annotation
-    // value (default `true`) — Spring enhances the `@Configuration` class and
+    // value (default `true`) вЂ” Spring enhances the `@Configuration` class and
     // our interceptor gives correct shared-singleton semantics (SB-03 /
     // S03_ConfigProxy).
     // ---------------------------------------------------------------------
 
-    // Store element name→value pairs as parallel arrays
+    // Store element nameв†’value pairs as parallel arrays
     let n = all_elements.len();
     let names_arr = ctx.new_ref_array(ClassId::new(0), n);
     let values_arr = ctx.new_ref_array(ClassId::new(0), n);
@@ -9451,7 +9451,7 @@ pub(crate) fn annotation_element_to_java(
     annotation_element_to_java_typed(ctx, val, None, None)
 }
 
-/// S111r19 — typed variant: when called for a known annotation-element method,
+/// S111r19 вЂ” typed variant: when called for a known annotation-element method,
 /// the caller passes the method's return-type descriptor (e.g.
 /// `[Ljava/lang/String;`).  Used to recover the array component class for
 /// **empty** array values, which would otherwise default to
@@ -9513,18 +9513,18 @@ pub(crate) fn annotation_element_to_java_typed(
         }
         AnnotationElementValue::Enum(type_desc, const_name) => {
             // Resolve the enum class from the type descriptor and create the constant.
-            // type_desc is like "Ljava/lang/annotation/RetentionPolicy;" — strip L and ;
+            // type_desc is like "Ljava/lang/annotation/RetentionPolicy;" вЂ” strip L and ;
             let class_name = type_desc
                 .strip_prefix('L')
                 .and_then(|s| s.strip_suffix(';'))
                 .unwrap_or(type_desc);
-            // S111r19 — load the enum class on demand if not yet loaded.
+            // S111r19 вЂ” load the enum class on demand if not yet loaded.
             // Annotation proxies are materialised eagerly during the
             // declaring class's load, but the enum class referenced by the
             // annotation's element values (e.g. `FilterType` in
             // `@ComponentScan.Filter.type`) often is **not** yet loaded.
             // Previously we fell straight through to the synthetic fallback
-            // which writes ordinal=0 — collapsing `FilterType.CUSTOM`
+            // which writes ordinal=0 вЂ” collapsing `FilterType.CUSTOM`
             // (real ordinal 4) onto `ANNOTATION` (ordinal 0) and sending
             // Spring's `ComponentScanAnnotationParser.typeFiltersFor` into
             // the wrong switch case, surfacing as `IllegalArgumentException`
@@ -9606,10 +9606,10 @@ pub(crate) fn annotation_element_to_java_typed(
                             ) {
                                 return Value::Object(Some(tnpe));
                             }
-                            // Could not build the sentinel — fall through to global.
+                            // Could not build the sentinel вЂ” fall through to global.
                         }
                         Err(None) => {
-                            // Loader returned null / internal error — fall through
+                            // Loader returned null / internal error вЂ” fall through
                             // to the global resolution below (best-effort).
                         }
                     }
@@ -9634,11 +9634,11 @@ pub(crate) fn annotation_element_to_java_typed(
                 if iae_trace_cls {
                     eprintln!("ANN-CLASS desc={desc} class={class_name} RETURNING-NULL");
                 }
-                // Unloadable object class — preserve the existing null return.
+                // Unloadable object class вЂ” preserve the existing null return.
                 return Value::Object(None);
             }
             // `annotation_desc_to_class_name` returned None: the descriptor is
-            // a primitive (`I`/`J`/...), `void` (`V`), or an array (`[...`) —
+            // a primitive (`I`/`J`/...), `void` (`V`), or an array (`[...`) вЂ”
             // most notably `default void.class`, used by ByteBuddy's
             // `@Advice.FieldValue.declaringType()`. Returning null here made the
             // annotation member read back as null, so ByteBuddy's
@@ -9662,7 +9662,7 @@ pub(crate) fn annotation_element_to_java_typed(
             // downstream `instanceof "[Lfoo;"` checks correctly distinguish
             // between e.g. `String[]` and `Annotation[]`. Spring's
             // `AnnotationUtils.adaptValue` runs an `instanceof
-            // "[Ljava/lang/annotation/Annotation;"` chain — if the array's
+            // "[Ljava/lang/annotation/Annotation;"` chain вЂ” if the array's
             // component class is bare `Object` (cid=0), the lenient
             // assignability fallback in `array_is_assignable_to`
             // (interpreter.rs `if src_comp == "java/lang/Object" { return
@@ -9671,14 +9671,14 @@ pub(crate) fn annotation_element_to_java_typed(
             // `String.annotationType()` NSME inside
             // `retrieveAnnotationAttributes`.
             //
-            // Pick by inspecting the first element variant — annotation
-            // attribute arrays are homogeneous per JLS §9.6.1.
+            // Pick by inspecting the first element variant вЂ” annotation
+            // attribute arrays are homogeneous per JLS В§9.6.1.
             //
-            // S111r18 — for nested-annotation arrays, use the annotation
+            // S111r18 вЂ” for nested-annotation arrays, use the annotation
             // interface type (e.g. `F4` for `@CScan(excludeFilters=@F4...)`)
             // as the component class, NOT the bare `AnnotationProxy` synthetic.
             // Spring's `MergedAnnotation.adaptForAttribute` walks
-            // `returnType.componentType().isAnnotation()` — when our array
+            // `returnType.componentType().isAnnotation()` вЂ” when our array
             // reports its component as `AnnotationProxy` (which is
             // `isAnnotation()=false`), the adapt-array branch is taken on
             // returnType but the receiving array allocation in the same
@@ -9690,12 +9690,12 @@ pub(crate) fn annotation_element_to_java_typed(
             // `F4.class`, which `isAnnotation()` returns `true` for, and the
             // synthesize loop then runs as expected.
             use cratonvm_native_api::AnnotationElementValue as AEV;
-            // SB-02b — primitive annotation arrays (`int[] mv()`, `boolean[]`,
-            // `long[]`, …) must materialise as REAL primitive arrays, not boxed
+            // SB-02b вЂ” primitive annotation arrays (`int[] mv()`, `boolean[]`,
+            // `long[]`, вЂ¦) must materialise as REAL primitive arrays, not boxed
             // wrapper arrays. The canonical tripwire is `@kotlin.Metadata.mv()`
             // (the metadata version, declared `int[]`): kotlin-reflect reads it
             // as a primitive `int[]` (`iaload`), so a boxed `Integer[]` reads
-            // back as all-zeros → version parses as `(0,0,0)` → kotlin-reflect
+            // back as all-zeros в†’ version parses as `(0,0,0)` в†’ kotlin-reflect
             // treats the class metadata as invalid/legacy and falls back to
             // Java-reflection platform types. That silently corrupts every
             // Kotlin reflective query (return-type nullability, `isSuspend`,
@@ -9747,7 +9747,7 @@ pub(crate) fn annotation_element_to_java_typed(
                     return Value::Object(Some(arr));
                 }
             }
-            // S111r19 — when the array is **empty** (no first element to
+            // S111r19 вЂ” when the array is **empty** (no first element to
             // probe), fall back to the caller-provided method return-type
             // descriptor.  This recovers the right component class for
             // empty `String[]` / `Class[]` defaults like `@Filter.pattern()`
@@ -9769,18 +9769,18 @@ pub(crate) fn annotation_element_to_java_typed(
                     .to_string(),
                 // Primitive arrays in annotations (`int[]`, `boolean[]`, etc.)
                 // are still allocated as boxed wrapper arrays here per
-                // pre-existing behaviour — pick the wrapper class.
+                // pre-existing behaviour вЂ” pick the wrapper class.
                 //
                 // spring-bug-01: AEV::Int is overloaded for Z/B/C/S/I (the
                 // `.class` AnnotationDefault encodes them all as int constants).
                 // The element values below are already boxed into the correct
                 // wrapper via `elem_desc`, but the ARRAY's component class was
-                // hardcoded to Integer here — so a `char[]` default became an
+                // hardcoded to Integer here вЂ” so a `char[]` default became an
                 // `Integer[]`-typed array holding Character values, and Spring's
                 // `AnnotationTypeMapping.adapt` rejected it ("should be compatible
                 // with char[] but a java.lang.Integer[] value was returned").
                 // Derive the component wrapper from the array's component
-                // descriptor so `[C`→Character[], `[Z`→Boolean[], etc. (which
+                // descriptor so `[C`в†’Character[], `[Z`в†’Boolean[], etc. (which
                 // Spring then coerces to the primitive array).
                 Some(AEV::Int(_)) => match return_type_desc.and_then(|rd| rd.strip_prefix('[')) {
                     Some("Z") => "java/lang/Boolean".to_string(),
@@ -9793,7 +9793,7 @@ pub(crate) fn annotation_element_to_java_typed(
                 Some(AEV::Float(_)) => "java/lang/Float".to_string(),
                 Some(AEV::Double(_)) => "java/lang/Double".to_string(),
                 None => {
-                    // Empty array — derive component from method return type.
+                    // Empty array вЂ” derive component from method return type.
                     if let Some(rd) = return_type_desc {
                         if let Some(comp) = rd.strip_prefix('[') {
                             if let Some(stripped) =
@@ -9801,7 +9801,7 @@ pub(crate) fn annotation_element_to_java_typed(
                             {
                                 stripped.to_string()
                             } else if comp.len() == 1 && "ZBCSIJFD".contains(&comp[..1]) {
-                                // Empty primitive array — boxed wrapper
+                                // Empty primitive array вЂ” boxed wrapper
                                 // (matches the non-empty primitive arms).
                                 match &comp[..1] {
                                     "Z" => "java/lang/Boolean".to_string(),
@@ -9836,7 +9836,7 @@ pub(crate) fn annotation_element_to_java_typed(
             let arr = ctx.new_ref_array(comp_cid, elems.len());
             // Round 18: derive the per-element return-type descriptor from
             // the array descriptor (strip leading `[`) so primitive elements
-            // box into the correct wrapper (Z/B/C/S → Boolean/Byte/Char/Short
+            // box into the correct wrapper (Z/B/C/S в†’ Boolean/Byte/Char/Short
             // instead of always Integer).
             let elem_desc: Option<String> = return_type_desc
                 .and_then(|rd| rd.strip_prefix('['))
@@ -9875,7 +9875,7 @@ fn annotation_component_class_id(ctx: &mut dyn NativeContext) -> ClassId {
 }
 
 /// Resolve the `ClassId` of `Annotation[]` (`[Ljava/lang/annotation/Annotation;`)
-/// — the component type of an `Annotation[][]` (the `getParameterAnnotations()`
+/// вЂ” the component type of an `Annotation[][]` (the `getParameterAnnotations()`
 /// return type). See [`annotation_component_class_id`].
 ///
 /// Array class names aren't always pre-loaded by `class_id_by_name`, so as a
@@ -9889,7 +9889,7 @@ fn annotation_array_component_class_id(ctx: &mut dyn NativeContext) -> ClassId {
     // registers the array class correctly. The previous derive-via-sample path
     // (`class_id_of_object(new_ref_array(Annotation, 0))`) mis-resolved the
     // array class on COLD use, returning the `Annotation` component id instead
-    // of `[Annotation` — so the FIRST `getParameterAnnotations()` call built a
+    // of `[Annotation` вЂ” so the FIRST `getParameterAnnotations()` call built a
     // 1-D `Annotation[]` outer array instead of `Annotation[][]`. kotlin-reflect's
     // `ReflectClassStructure.loadMethodAnnotations` then `checkcast`s the result
     // to `[[Annotation` and throws ClassCastException (only on the first method
@@ -9906,12 +9906,12 @@ fn annotation_array_component_class_id(ctx: &mut dyn NativeContext) -> ClassId {
 /// Whether an annotation's declared type can be loaded. The JDK's
 /// `sun.reflect.annotation.AnnotationParser` OMITS any annotation whose type
 /// class is not resolvable (e.g. a compile-only annotation like
-/// `org.apiguardian.api.API`, whose jar isn't on the runtime classpath) — it
+/// `org.apiguardian.api.API`, whose jar isn't on the runtime classpath) вЂ” it
 /// does NOT surface a broken/null annotation. CratonVM must do the same;
 /// otherwise `getDeclaredAnnotations()` returns a proxy with a null type mirror
-/// (`annotationType()`/`getClass()` → null), which breaks every annotation
+/// (`annotationType()`/`getClass()` в†’ null), which breaks every annotation
 /// walker (e.g. JUnit's `AnnotationUtils.findRepeatableAnnotations` NPEs on
-/// `annotationType().equals(...)` during test discovery → 0 tests found).
+/// `annotationType().equals(...)` during test discovery в†’ 0 tests found).
 fn annotation_type_loadable(
     ctx: &mut dyn NativeContext,
     ann: &cratonvm_native_api::AnnotationData,
@@ -9938,7 +9938,7 @@ fn build_annotation_array(
         .filter(|a| annotation_type_loadable(ctx, a))
         .collect();
     // GC-safe: `create_annotation_proxy` allocates (see `build_mirror_array`).
-    // No container class here (non-cached array path) → global Class resolution.
+    // No container class here (non-cached array path) в†’ global Class resolution.
     build_mirror_array_comp(ctx, comp, resolvable.len(), |ctx, i| {
         create_annotation_proxy(ctx, resolvable[i], None)
     })
@@ -9948,13 +9948,13 @@ fn build_annotation_array(
 /// identity cache, so `getDeclaredAnnotations()` / `getAnnotations()` return the
 /// SAME instances `getAnnotation()` returns for `queried_class_id`. Used only by
 /// the CLASS-level annotation natives (field/method annotation arrays keep the
-/// fresh-build path — their key space is different).
+/// fresh-build path вЂ” their key space is different).
 fn build_class_annotation_array(
     ctx: &mut dyn NativeContext,
     queried_class_id: ClassId,
     annotations: &[cratonvm_native_api::AnnotationData],
 ) -> ObjectRef {
-    // Omit annotations whose type isn't loadable — see `annotation_type_loadable`.
+    // Omit annotations whose type isn't loadable вЂ” see `annotation_type_loadable`.
     let resolvable: Vec<&cratonvm_native_api::AnnotationData> = annotations
         .iter()
         .filter(|a| annotation_type_loadable(ctx, a))
@@ -9965,7 +9965,7 @@ fn build_class_annotation_array(
     })
 }
 
-/// Class.getDeclaredAnnotations() — only this class's own annotations.
+/// Class.getDeclaredAnnotations() вЂ” only this class's own annotations.
 pub(crate) fn native_class_get_declared_annotations(
     ctx: &mut dyn NativeContext,
     args: &[Value],
@@ -10001,7 +10001,7 @@ pub(crate) fn native_class_get_declared_annotations(
     Ok(Some(Value::Object(Some(arr))))
 }
 
-/// Class.getAnnotations() — includes @Inherited annotations from superclasses.
+/// Class.getAnnotations() вЂ” includes @Inherited annotations from superclasses.
 pub(crate) fn native_class_get_annotations(
     ctx: &mut dyn NativeContext,
     args: &[Value],
@@ -10072,7 +10072,7 @@ fn is_inherited_annotation(ctx: &mut dyn NativeContext, ann_type_desc: &str) -> 
         .any(|a| a.type_descriptor == "Ljava/lang/annotation/Inherited;")
 }
 
-/// Class.getDeclaredAnnotation(Class) — only this class's own annotations.
+/// Class.getDeclaredAnnotation(Class) вЂ” only this class's own annotations.
 pub(crate) fn native_class_get_declared_annotation(
     ctx: &mut dyn NativeContext,
     args: &[Value],
@@ -10108,7 +10108,7 @@ pub(crate) fn native_class_get_declared_annotation(
     Ok(Some(Value::Object(None)))
 }
 
-/// Class.getAnnotation(Class) — searches superclass chain for @Inherited.
+/// Class.getAnnotation(Class) вЂ” searches superclass chain for @Inherited.
 pub(crate) fn native_class_get_annotation(
     ctx: &mut dyn NativeContext,
     args: &[Value],
@@ -10164,7 +10164,7 @@ pub(crate) fn native_class_get_annotation(
     Ok(Some(Value::Object(None)))
 }
 
-/// Class.isAnnotationPresent(Class) — searches superclass chain for @Inherited.
+/// Class.isAnnotationPresent(Class) вЂ” searches superclass chain for @Inherited.
 pub(crate) fn native_class_is_annotation_present(
     ctx: &mut dyn NativeContext,
     args: &[Value],
@@ -10212,7 +10212,7 @@ pub(crate) fn native_class_is_annotation_present(
     Ok(Some(Value::Int(0)))
 }
 
-/// Class.isAnnotation() — checks if the class itself is an annotation type
+/// Class.isAnnotation() вЂ” checks if the class itself is an annotation type
 pub(crate) fn native_class_is_annotation(
     ctx: &mut dyn NativeContext,
     args: &[Value],
@@ -10276,7 +10276,7 @@ fn directly_and_indirectly_present(
         None => indirect,
         Some(dpos) => {
             let direct_ann = annotations[dpos].clone();
-            // Container declared before the direct annotation ⇒ contained first.
+            // Container declared before the direct annotation в‡’ contained first.
             let container_first = container_pos.map_or(false, |cpos| cpos < dpos);
             if container_first {
                 indirect.push(direct_ann);
@@ -10310,7 +10310,7 @@ fn repeatable_container_desc(ctx: &mut dyn NativeContext, ann_class_id: ClassId)
 /// and `Class.getDeclaredAnnotationsByType` (`inherit = false`).
 ///
 /// Both merge the directly-present annotation with the contents of its
-/// `@Repeatable` container — see [`directly_and_indirectly_present`]. The prior
+/// `@Repeatable` container вЂ” see [`directly_and_indirectly_present`]. The prior
 /// implementation only unwrapped the container when there was NO direct match,
 /// so `@Foo("A") @FooContainer({@Foo("B"),@Foo("C")})` returned just `[A]`
 /// instead of `[A, B, C]`; and it never followed the `@Inherited` chain, so a
@@ -10377,7 +10377,7 @@ fn class_annotations_by_type_impl(
     Ok(Some(Value::Object(Some(arr))))
 }
 
-/// `Class.getAnnotationsByType(Class)` — associated annotations: direct +
+/// `Class.getAnnotationsByType(Class)` вЂ” associated annotations: direct +
 /// `@Repeatable` container contents, following the `@Inherited` superclass chain.
 pub(crate) fn native_class_get_annotations_by_type(
     ctx: &mut dyn NativeContext,
@@ -10386,7 +10386,7 @@ pub(crate) fn native_class_get_annotations_by_type(
     class_annotations_by_type_impl(ctx, args, true)
 }
 
-/// `Class.getDeclaredAnnotationsByType(Class)` — like `getAnnotationsByType` but
+/// `Class.getDeclaredAnnotationsByType(Class)` вЂ” like `getAnnotationsByType` but
 /// limited to THIS class's own annotations (no `@Inherited` superclass walk).
 pub(crate) fn native_class_get_declared_annotations_by_type(
     ctx: &mut dyn NativeContext,
@@ -10395,13 +10395,13 @@ pub(crate) fn native_class_get_declared_annotations_by_type(
     class_annotations_by_type_impl(ctx, args, false)
 }
 
-/// `Method.getAnnotationsByType(Class)` / `getDeclaredAnnotationsByType` —
+/// `Method.getAnnotationsByType(Class)` / `getDeclaredAnnotationsByType` вЂ”
 /// same direct-match + @Repeatable-container unwrap as
 /// `native_class_get_annotations_by_type`, but over METHOD annotations.
 /// Without this native the call falls through to the real
 /// `Executable.getAnnotationsByType` bytecode, whose `declaredAnnotations()`
-/// re-parses raw class-file annotation bytes via `AnnotationParser` — bytes
-/// our synthetic Method objects don't carry — and dies with
+/// re-parses raw class-file annotation bytes via `AnnotationParser` вЂ” bytes
+/// our synthetic Method objects don't carry вЂ” and dies with
 /// `AnnotationFormatError: Unexpected end of annotations.` (JUnit's
 /// `findRepeatableAnnotations` walks this for @ParameterizedTest argument
 /// sources; Spring Boot buildSrc DependencyVersionUpgradeTests ran 0 of 63
@@ -10494,8 +10494,8 @@ pub(crate) fn method_class_name_desc(
             // describes is always `<init>`. Detect by the receiver's runtime
             // class so a genuinely malformed `Method` still returns `None`.
             // This lets the shared Method annotation natives
-            // (getDeclaredAnnotations / getParameterAnnotations / …), when
-            // registered for Constructor too, resolve the `<init>` metadata —
+            // (getDeclaredAnnotations / getParameterAnnotations / вЂ¦), when
+            // registered for Constructor too, resolve the `<init>` metadata вЂ”
             // otherwise constructor annotations fall through to real JDK
             // bytecode that reads raw `annotations`/`parameterAnnotations`
             // byte[] fields CratonVM never populates (Jackson "no Creators").
@@ -10514,8 +10514,8 @@ pub(crate) fn method_class_name_desc(
     // defaults a missing `returnType` to `Ljava/lang/Object;` (a Constructor
     // reflective object has no `returnType` field), and
     // `method_descriptor_for_invoke` then prefers that mismatched composed
-    // descriptor — so the `<init>` lookup below would key on `(…)Ljava/lang/
-    // Object;` and never match the real `(…)V` method metadata. Coerce the
+    // descriptor вЂ” so the `<init>` lookup below would key on `(вЂ¦)Ljava/lang/
+    // Object;` and never match the real `(вЂ¦)V` method metadata. Coerce the
     // return to `V` so annotation/param-annotation lookups for `<init>` hit.
     if name == "<init>" {
         if let Some(close) = desc.find(')') {
@@ -10581,7 +10581,7 @@ pub(crate) fn native_field_is_annotation_present(
     Ok(Some(Value::Int(if present { 1 } else { 0 })))
 }
 
-/// Field.getAnnotation(Class) — returns a single annotation proxy or null.
+/// Field.getAnnotation(Class) вЂ” returns a single annotation proxy or null.
 pub(crate) fn native_field_get_annotation(
     ctx: &mut dyn NativeContext,
     args: &[Value],
@@ -10747,7 +10747,7 @@ pub(crate) fn native_method_get_annotation(
     Ok(Some(Value::Object(None)))
 }
 
-/// Annotation.annotationType() — returns the Class mirror of the annotation type
+/// Annotation.annotationType() вЂ” returns the Class mirror of the annotation type
 pub(crate) fn native_annotation_annotation_type(
     ctx: &mut dyn NativeContext,
     args: &[Value],
@@ -10761,7 +10761,7 @@ pub(crate) fn native_annotation_annotation_type(
     Ok(Some(mirror))
 }
 
-/// Method.getParameterAnnotations() — returns Annotation[][] (one row per parameter).
+/// Method.getParameterAnnotations() вЂ” returns Annotation[][] (one row per parameter).
 pub(crate) fn native_method_get_parameter_annotations(
     ctx: &mut dyn NativeContext,
     args: &[Value],
@@ -10788,53 +10788,88 @@ pub(crate) fn native_method_get_parameter_annotations(
     let outer_comp = annotation_array_component_class_id(ctx);
     let inner_comp = annotation_component_class_id(ctx);
     let param_annotations = ctx.method_parameter_annotations(class_id, &method_name, &method_desc);
-    if param_annotations.is_empty() {
-        // Return an Annotation[param_count][0] — count params from descriptor
-        let param_count = count_method_params(&method_desc);
-        let outer = ctx.new_ref_array(outer_comp, param_count);
-        for i in 0..param_count {
-            let inner = ctx.new_ref_array(inner_comp, 0);
-            ctx.set_array_element(outer, i, Value::Object(Some(inner)));
+    let aligned_annotations =
+        align_parameter_annotations(ctx, class_id, &method_name, &method_desc, param_annotations);
+    let outer = ctx.new_ref_array(outer_comp, aligned_annotations.len());
+    for i in 0..aligned_annotations.len() {
+        let anns = aligned_annotations
+            .get(i)
+            .map(|a| build_annotation_array(ctx, a))
+            .unwrap_or_else(|| ctx.new_ref_array(inner_comp, 0));
+        ctx.set_array_element(outer, i, Value::Object(Some(anns)));
+    }
+    Ok(Some(Value::Object(Some(outer))))}
+
+/// Access flags for method-parameter metadata from `MethodParameters`.
+const PARAMETER_MODIFIER_SYNTHETIC: u16 = 0x1000;
+const PARAMETER_MODIFIER_MANDATED: u16 = 0x8000;
+
+/// Class access flags used when deciding constructor synthetic-shift policy.
+const CLASS_ACCESS_STATIC: u16 = 0x0008;
+const CLASS_ACCESS_ENUM: u16 = 0x4000;
+
+/// Normalize raw parameter-annotation rows to JVM `Executable.getParameterAnnotations()`.
+///
+/// HotSpot accepts class-files where constructor synthetic/mandated parameters are
+/// absent from `RuntimeVisibleParameterAnnotations`, and shifts rows right so
+/// descriptor-indexed slots align.
+fn align_parameter_annotations(
+    ctx: &mut dyn NativeContext,
+    class_id: ClassId,
+    method_name: &str,
+    method_desc: &str,
+    param_annotations: Vec<Vec<AnnotationData>>,
+) -> Vec<Vec<AnnotationData>> {
+    let param_count = count_method_params(method_desc);
+    let mut normalized = if param_annotations.len() > param_count {
+        param_annotations.into_iter().take(param_count).collect()
+    } else {
+        param_annotations
+    };
+
+    if method_name != "<init>" || param_count == 0 {
+        normalized.resize(param_count, Vec::new());
+        return normalized;
+    }
+
+    let class_name = ctx.class_name_of_id(class_id).unwrap_or_default();
+    let class_flags = ctx.class_access_flags(class_id) as u16;
+    let is_nested_class = class_name.contains('$');
+    let is_static_nested = (class_flags & CLASS_ACCESS_STATIC) != 0;
+    let is_enum = (class_flags & CLASS_ACCESS_ENUM) != 0;
+    let has_enclosing_method = ctx.enclosing_method(class_id).is_some();
+
+    let shift = if is_enum && normalized.len() + 2 == param_count {
+        param_count.saturating_sub(normalized.len())
+    } else if !is_enum
+        && normalized.len() + 1 == param_count
+        && !is_static_nested
+        && is_nested_class
+        && !has_enclosing_method
+    {
+        let param_meta = ctx.method_parameters(class_id, method_name, method_desc);
+        if param_meta
+            .first()
+            .is_some_and(|(_, flags)| (*flags & (PARAMETER_MODIFIER_SYNTHETIC | PARAMETER_MODIFIER_MANDATED)) != 0)
+        {
+            param_count.saturating_sub(normalized.len())
+        } else {
+            0
         }
-        return Ok(Some(Value::Object(Some(outer))));
+    } else {
+        0
+    };
+
+    if shift > 0 {
+        let mut shifted = vec![Vec::new(); param_count];
+        for (i, ann) in normalized.iter().enumerate() {
+            shifted[i + shift] = ann.clone();
+        }
+        shifted
+    } else {
+        normalized.resize(param_count, Vec::new());
+        normalized
     }
-    // The class file's RuntimeVisibleParameterAnnotations table is written
-    // by javac against the SOURCE-level parameter list, which omits any
-    // synthetic/mandated LEADING parameters the compiler adds to the
-    // descriptor — most commonly a non-static inner class constructor's
-    // implicit outer-instance parameter (`this$0`), and equivalently enum
-    // constructors' synthetic `(String name, int ordinal)` pair. So
-    // `param_annotations.len()` can be SHORTER than the full descriptor
-    // parameter count. Real JDK's `Executable.sharedGetParameterAnnotations`
-    // detects exactly this mismatch and right-shifts the parsed rows,
-    // synthesizing empty leading entries (see `handleParameterNumberMismatch`
-    // in `java.lang.reflect.Executable`); since `Constructor`/`Method`
-    // .getParameterAnnotations() is natively overridden here (real JDK
-    // objects lack the raw `annotations`/`parameterAnnotations` byte[]
-    // fields this class populates from — see the registration comment),
-    // that adjustment has to be reimplemented here instead of inheriting it
-    // from the real bytecode. Without it, callers indexing the returned
-    // array by `Parameter.getDeclaredAnnotations()`'s 0-based descriptor
-    // index (which DOES count the synthetic parameter) read every entry
-    // shifted by one and eventually run off the end —
-    // ArrayIndexOutOfBoundsException on the last (real) parameter.
-    let param_count = count_method_params(&method_desc);
-    let synthetic_leading = param_count.saturating_sub(param_annotations.len());
-    let outer = ctx.new_ref_array(outer_comp, param_count);
-    for i in 0..synthetic_leading {
-        let inner = ctx.new_ref_array(inner_comp, 0);
-        ctx.set_array_element(outer, i, Value::Object(Some(inner)));
-    }
-    // Malformed/unexpected case (more raw rows than descriptor params):
-    // clamp rather than write past `outer`'s length.
-    let copy_count = param_annotations
-        .len()
-        .min(param_count.saturating_sub(synthetic_leading));
-    for (i, anns) in param_annotations.iter().take(copy_count).enumerate() {
-        let inner = build_annotation_array(ctx, anns);
-        ctx.set_array_element(outer, synthetic_leading + i, Value::Object(Some(inner)));
-    }
-    Ok(Some(Value::Object(Some(outer))))
 }
 
 /// Count the number of parameters in a method descriptor.
@@ -10860,7 +10895,7 @@ fn count_method_params(desc: &str) -> usize {
                 i += 1;
             }
             b'[' => {
-                // array dimension — don't count, advance to element type
+                // array dimension вЂ” don't count, advance to element type
                 i += 1;
             }
             _ => {
@@ -10877,7 +10912,7 @@ fn count_method_params(desc: &str) -> usize {
 // Generics / Type reflection (Session 19)
 // ---------------------------------------------------------------------------
 
-/// Class.getTypeParameters() — returns TypeVariable[] from class signature.
+/// Class.getTypeParameters() вЂ” returns TypeVariable[] from class signature.
 pub(crate) fn native_class_get_type_parameters(
     ctx: &mut dyn NativeContext,
     args: &[Value],
@@ -10919,7 +10954,7 @@ pub(crate) fn native_class_get_type_parameters(
     Ok(Some(Value::Object(Some(arr))))
 }
 
-/// Class.getGenericSuperclass() — returns Type for the generic superclass.
+/// Class.getGenericSuperclass() вЂ” returns Type for the generic superclass.
 pub(crate) fn native_class_get_generic_superclass(
     ctx: &mut dyn NativeContext,
     args: &[Value],
@@ -10928,14 +10963,14 @@ pub(crate) fn native_class_get_generic_superclass(
         Some(Value::Object(Some(obj))) => *obj,
         _ => return Ok(Some(Value::Object(None))),
     };
-    // bytebuddy_probe (agent-bb3) — apply the SAME Object/interface/array
+    // bytebuddy_probe (agent-bb3) вЂ” apply the SAME Object/interface/array
     // short-circuits as native_class_get_superclass. ByteBuddy's hierarchy
     // walk uses `getGenericSuperclass()` in addition to `getSuperclass()`;
     // without this guard the IllegalStateException cycle returns via the
     // generic path even when the plain path is now protected.
     //
-    // bytebuddy_probe (agent-bb4) — read name via the STRICT helper so a
-    // reverse-map alias of non-Object → Object does NOT short-circuit
+    // bytebuddy_probe (agent-bb4) вЂ” read name via the STRICT helper so a
+    // reverse-map alias of non-Object в†’ Object does NOT short-circuit
     // a non-Object class. See `mirror_class_name_strict` for rationale.
     let strict_name = mirror_class_name_strict(ctx, this).unwrap_or_default();
     let this_name = if !strict_name.is_empty() {
@@ -10988,7 +11023,7 @@ pub(crate) fn native_class_get_generic_superclass(
         return Ok(Some(Value::Object(None)));
     }
     // Synthetic lambda proxies (class id >= 0x8000_0000) are not in the class
-    // store, so the `superclass_of` fallback below returns None → a *null*
+    // store, so the `superclass_of` fallback below returns None в†’ a *null*
     // generic superclass. But a lambda's concrete runtime class extends Object,
     // and HotSpot's `getGenericSuperclass()` returns the raw `Object` superclass
     // for a class with no Signature attribute. `getSuperclass()` already special-
@@ -11036,7 +11071,7 @@ pub(crate) fn native_class_get_generic_superclass(
     }
     // Fallback: return the raw superclass as a Class mirror
     if let Some(super_id) = ctx.superclass_of(class_id) {
-        // Self-cycle guard — symmetric with native_class_get_superclass.
+        // Self-cycle guard вЂ” symmetric with native_class_get_superclass.
         if super_id == class_id {
             if dbg_bb {
                 eprintln!(
@@ -11066,7 +11101,7 @@ pub(crate) fn native_class_get_generic_superclass(
     }
 }
 
-/// Class.getGenericInterfaces() — returns Type[] for generic interfaces.
+/// Class.getGenericInterfaces() вЂ” returns Type[] for generic interfaces.
 pub(crate) fn native_class_get_generic_interfaces(
     ctx: &mut dyn NativeContext,
     args: &[Value],
@@ -11078,8 +11113,8 @@ pub(crate) fn native_class_get_generic_interfaces(
             return Ok(Some(Value::Object(Some(arr))));
         }
     };
-    // bytebuddy_probe (agent-bb3) — Object short-circuit (empty Type[]).
-    // bytebuddy_probe (agent-bb4) — strict-name first; see other helpers.
+    // bytebuddy_probe (agent-bb3) вЂ” Object short-circuit (empty Type[]).
+    // bytebuddy_probe (agent-bb4) вЂ” strict-name first; see other helpers.
     let strict_name = mirror_class_name_strict(ctx, this).unwrap_or_default();
     let this_name = if !strict_name.is_empty() {
         strict_name.clone()
@@ -11126,14 +11161,14 @@ pub(crate) fn native_class_get_generic_interfaces(
     // Synthetic lambda proxies aren't in the class store (so `class_interfaces`
     // is empty below), but a lambda's concrete class implements exactly its
     // functional (SAM) interface. Mirror `native_class_get_interfaces`'s
-    // special case so `getGenericInterfaces()` — which must return the same
-    // raw `[SAM]` per the JDK contract when there's no generic Signature —
+    // special case so `getGenericInterfaces()` вЂ” which must return the same
+    // raw `[SAM]` per the JDK contract when there's no generic Signature вЂ”
     // doesn't silently fall through to an empty array. An empty array here
     // broke AspectJ's `execution(* Supplier+.get())` pointcut matching against
     // a lambda's own SAM-method Method object: AspectJ's reflection-based
     // world consults `getGenericInterfaces()` (not just `getInterfaces()`)
     // when resolving the declaring class's supertype closure, concluded the
-    // lambda implemented no interfaces at all, and returned "never matches" —
+    // lambda implemented no interfaces at all, and returned "never matches" вЂ”
     // silently skipping the advisor (Spring's `AnnotationAwareAspectJAutoProxyCreator`
     // then never proxies the lambda bean at all).
     if let Some(iface_name) = ctx.lambda_functional_interface(class_id) {
@@ -11152,7 +11187,7 @@ pub(crate) fn native_class_get_generic_interfaces(
     // contract, `getGenericInterfaces()` returns the RAW direct superinterfaces
     // (the same `Class[]` as `getInterfaces()`), NOT an empty array. Returning
     // empty broke any type-closure / hierarchy walk that uses
-    // `getGenericInterfaces()` on a non-generic interface — e.g. Weld's
+    // `getGenericInterfaces()` on a non-generic interface вЂ” e.g. Weld's
     // `HierarchyDiscovery` for `BeanManager extends BeanContainer`, which then
     // omitted `BeanContainer` from the closure and rejected every container
     // lifecycle observer with `WELD-000409` (HIB-CV-20).
@@ -11166,7 +11201,7 @@ pub(crate) fn native_class_get_generic_interfaces(
     Ok(Some(Value::Object(Some(arr))))
 }
 
-/// Method.getGenericParameterTypes() — returns Type[] from method signature.
+/// Method.getGenericParameterTypes() вЂ” returns Type[] from method signature.
 pub(crate) fn native_method_get_generic_param_types(
     ctx: &mut dyn NativeContext,
     args: &[Value],
@@ -11212,7 +11247,7 @@ pub(crate) fn native_method_get_generic_param_types(
     Ok(Some(param_types))
 }
 
-/// Method.getGenericReturnType() — returns Type from method signature.
+/// Method.getGenericReturnType() вЂ” returns Type from method signature.
 pub(crate) fn native_method_get_generic_return_type(
     ctx: &mut dyn NativeContext,
     args: &[Value],
@@ -11242,7 +11277,7 @@ pub(crate) fn native_method_get_generic_return_type(
     Ok(Some(method_return_type_value(ctx, this)))
 }
 
-/// Method.getTypeParameters() — returns TypeVariable[] from method signature.
+/// Method.getTypeParameters() вЂ” returns TypeVariable[] from method signature.
 pub(crate) fn native_method_get_type_parameters(
     ctx: &mut dyn NativeContext,
     args: &[Value],
@@ -11279,9 +11314,9 @@ pub(crate) fn native_method_get_type_parameters(
     Ok(Some(Value::Object(Some(arr))))
 }
 
-/// Field.getGenericType() — returns Type from field signature.
+/// Field.getGenericType() вЂ” returns Type from field signature.
 ///
-/// WP2.1 (FAIL-10): Parses the JVMS §4.7.9 Signature attribute on the field
+/// WP2.1 (FAIL-10): Parses the JVMS В§4.7.9 Signature attribute on the field
 /// (when present, e.g. `Ljava/util/List<Ljava/lang/String;>;` for
 /// `List<String> list`) into a `ParameterizedType` runtime object. When no
 /// Signature attribute is present (non-generic field), falls back to the
@@ -11304,29 +11339,29 @@ pub(crate) fn native_field_get_generic_type(
             let _gscope = crate::generics::GenericDeclScope::new(Value::Object(Some(
                 ctx.get_class_mirror(class_id),
             )));
-            // SB-02b-#3: build a REAL `sun.reflect…ParameterizedTypeImpl` (not the
+            // SB-02b-#3: build a REAL `sun.reflectвЂ¦ParameterizedTypeImpl` (not the
             // bare-interface synthetic) so a nested generic field type like
             // `Map<String, List<String>>` renders its `getTypeName()`/`toString()`
-            // identically to HotSpot instead of `java.lang.reflect.ParameterizedType@…`.
+            // identically to HotSpot instead of `java.lang.reflect.ParameterizedType@вЂ¦`.
             let val = crate::generics::typesig_to_real_type(ctx, &field_sig);
             return Ok(Some(val));
         }
     }
-    // Fallback: when no Signature attribute, getGenericType() ≡ getType().
+    // Fallback: when no Signature attribute, getGenericType() в‰Ў getType().
     // The `type` field is the Class<?> mirror at the JDK-native layout slot.
     Ok(Some(ctx.get_field_by_name(this, "type")))
 }
 
-/// RecordComponent.getGenericType() — returns Type from the component's
+/// RecordComponent.getGenericType() вЂ” returns Type from the component's
 /// Signature attribute.
 ///
 /// A record component named `n` of type `T` shares its name and generic
 /// signature with the synthesized `private final T n` field, so we parse
-/// that field's JVMS §4.7.9 Signature directly (mirrors
+/// that field's JVMS В§4.7.9 Signature directly (mirrors
 /// `native_field_get_generic_type`). The real-JDK `RecordComponent`
 /// bytecode delegates to a `sun.reflect.generics` repository CratonVM
 /// doesn't implement, so without this override `getGenericType()` collapsed
-/// e.g. `List<TestSlice>` to the raw `List` Class — which made Jackson (and
+/// e.g. `List<TestSlice>` to the raw `List` Class вЂ” which made Jackson (and
 /// any record introspector) lose the element type and deserialize a nested
 /// record list into `List<LinkedHashMap>`. Falls back to the raw `type`
 /// Class mirror when no Signature attribute is present.
@@ -11353,13 +11388,13 @@ pub(crate) fn native_record_component_get_generic_type(
                     ctx.get_class_mirror(class_id),
                 )));
                 // SB-02b-#3: real ParameterizedTypeImpl for nested record-component
-                // generics (e.g. `Map<String, List<X>>`) — see field path above.
+                // generics (e.g. `Map<String, List<X>>`) вЂ” see field path above.
                 let val = crate::generics::typesig_to_real_type(ctx, &field_sig);
                 return Ok(Some(val));
             }
         }
     }
-    // Fallback: getGenericType() ≡ getType().
+    // Fallback: getGenericType() в‰Ў getType().
     Ok(Some(ctx.get_field_by_name(this, "type")))
 }
 
@@ -11597,7 +11632,7 @@ pub(crate) fn native_class_get_component_type(
             return Ok(Some(Value::Object(None)));
         }
     };
-    // bytebuddy_probe (agent-bb4) — STRICT-NAME read. If the strict reader
+    // bytebuddy_probe (agent-bb4) вЂ” STRICT-NAME read. If the strict reader
     // gives us a non-array name (Object included), short-circuit null
     // without consulting the reverse-map (which may alias to an array
     // type and incorrectly return a component class for Object).
@@ -11625,7 +11660,7 @@ pub(crate) fn native_class_get_component_type(
             }
             _ => component,
         };
-        // Primitive types don't have loadable classes — use primitive_class_mirror
+        // Primitive types don't have loadable classes вЂ” use primitive_class_mirror
         match comp_name {
             "int" | "long" | "float" | "double" | "boolean" | "byte" | "char" | "short"
             | "void" => {
@@ -11636,7 +11671,7 @@ pub(crate) fn native_class_get_component_type(
                 if let Ok(cid) = ctx.ensure_class_initialized(comp_name) {
                     return Ok(Some(Value::Object(Some(ctx.get_class_mirror(cid)))));
                 }
-                // SB3.2 — when the component class can't be loaded
+                // SB3.2 вЂ” when the component class can't be loaded
                 // (e.g. nested array `[[L...;`, or absent class), still
                 // return a non-null Class mirror so callers that assume
                 // `array.componentType() != null` (Spring's
@@ -11651,7 +11686,7 @@ pub(crate) fn native_class_get_component_type(
     Ok(Some(Value::Object(None)))
 }
 
-/// `Class.arrayType()` — return a `Class` mirror that represents the
+/// `Class.arrayType()` вЂ” return a `Class` mirror that represents the
 /// array type whose component is `this`.
 ///
 /// JDK's bytecode implementation is `Array.newInstance(this, 0).getClass()`,
@@ -11672,7 +11707,7 @@ pub(crate) fn native_class_array_type(
         _ => return Ok(Some(Value::Object(None))),
     };
     let name = mirror_class_name(ctx, this).unwrap_or_default();
-    // Primitive component → "[I", "[J", … ; object/array component → "[L<name>;" or "[<arrayname>".
+    // Primitive component в†’ "[I", "[J", вЂ¦ ; object/array component в†’ "[L<name>;" or "[<arrayname>".
     let array_name = match name.as_str() {
         "int" => "[I".to_string(),
         "long" => "[J".to_string(),
@@ -11686,7 +11721,7 @@ pub(crate) fn native_class_array_type(
         other if other.starts_with('[') => format!("[{other}"),
         other => format!("[L{};", other),
     };
-    // Return the CANONICAL array-class mirror — the same `ClassId`-backed
+    // Return the CANONICAL array-class mirror вЂ” the same `ClassId`-backed
     // mirror that the `T[].class` constant (`ldc`), `anewarray`, and an array
     // object's `getClass()` all resolve to. The old path went straight to
     // `primitive_class_mirror`, which mints a SEPARATE, non-interned mirror;
@@ -11719,7 +11754,7 @@ pub(crate) fn native_class_get_package_name(
         Some(Value::Object(Some(o))) => *o,
         _ => return Ok(Some(Value::Object(None))),
     };
-    // Cache the dotted package prefix per `ClassId` — invariant for the
+    // Cache the dotted package prefix per `ClassId` вЂ” invariant for the
     // program's lifetime. Cache-eligible mirrors are those owned by the
     // VM reverse map (rules out test-fixture ClassId(0) collisions).
     if let Some(class_id) = ctx.class_id_from_mirror(this) {
@@ -11730,7 +11765,7 @@ pub(crate) fn native_class_get_package_name(
         // `class_name_of_id` below misses them and this whole branch used to
         // fall through to the empty-string fallback further down (which reads
         // via the same class-store-backed `mirror_class_name` and gets nothing
-        // either). Derive the package from the lambda's HOST class instead —
+        // either). Derive the package from the lambda's HOST class instead вЂ”
         // matches HotSpot, whose hidden lambda class lives in the host's
         // package. See `lambda_proxy_class_name` for the analogous `getName()`
         // special case.
@@ -11746,7 +11781,7 @@ pub(crate) fn native_class_get_package_name(
             return Ok(Some(Value::Object(Some(ctx.create_string(&pkg)))));
         }
     }
-    // Fallback (test fixtures, primitives) — original per-call derivation.
+    // Fallback (test fixtures, primitives) вЂ” original per-call derivation.
     let name = mirror_class_name(ctx, this).unwrap_or_default();
     let pkg = if let Some(pos) = name.rfind('/') {
         name[..pos].replace('/', ".")
@@ -11757,17 +11792,17 @@ pub(crate) fn native_class_get_package_name(
 }
 
 // ---------------------------------------------------------------------------
-// T19_H10_GET_PACKAGE: real `Class.getPackage()` — was `native_return_null`,
+// T19_H10_GET_PACKAGE: real `Class.getPackage()` вЂ” was `native_return_null`,
 // which broke any code path that did
 // `Foo.class.getPackage().getImplementationVersion()` (a popular way to
-// discover the version of a library at runtime — Hibernate, Logback, JBoss
+// discover the version of a library at runtime вЂ” Hibernate, Logback, JBoss
 // LogManager all do this in `<clinit>` and would previously NPE on the
 // `.getImplementationVersion()` deref).
 //
 // We synthesise a `java.lang.Package` object with:
-//   * `name` — the dotted package name (e.g. `org.keycloak.common`).
+//   * `name` вЂ” the dotted package name (e.g. `org.keycloak.common`).
 //   * `implementationTitle`/`implementationVersion`/`specificationTitle`/
-//     `specificationVersion`/`specificationVendor`/`implementationVendor` —
+//     `specificationVersion`/`specificationVendor`/`implementationVendor` вЂ”
 //     read from the manifest, best-effort (see caveat below).
 //
 // The lookup is best-effort: if the class is loaded from the boot classpath
@@ -11780,7 +11815,7 @@ pub(crate) fn native_class_get_package_name(
 // (`Package$VersionInfo`, bundling specTitle/specVersion/specVendor/
 // implTitle/implVersion/implVendor/sealBase) and `packageInfo` (`Class<?>`,
 // the cached `<pkg>.package-info` lookup). There is NO direct `specTitle` /
-// `implVersion` / etc. field on `Package` itself in JDK 9+ — those manifest
+// `implVersion` / etc. field on `Package` itself in JDK 9+ вЂ” those manifest
 // attributes live inside the nested `VersionInfo` record.
 //
 // We therefore write fields ONLY by name, never by raw slot index (past
@@ -11789,13 +11824,13 @@ pub(crate) fn native_class_get_package_name(
 // manifest attributes by raw index (1..6), on the mistaken assumption
 // that `Package` declares six flat manifest fields at those slots. Under
 // the real JDK 25 layout those indices are actually `module` (1),
-// `versionInfo` (2), and `packageInfo` (3) — the index-3 write silently
+// `versionInfo` (2), and `packageInfo` (3) вЂ” the index-3 write silently
 // overwrote `packageInfo` with a `String` (the `Specification-Vendor`
 // manifest value, whenever a jar's manifest set one), which is not a
 // `Class`. Real `Package.getAnnotation()`/`isAnnotationPresent()` bytecode
 // treats `packageInfo` as a `Class<?>` receiver unconditionally once it is
 // non-null (`getPackageInfo()`'s lazy-load only fires when the field is
-// still null) — so `pkg.getAnnotation(X)` on any such Package dispatched
+// still null) вЂ” so `pkg.getAnnotation(X)` on any such Package dispatched
 // `getAnnotation` on a `String` receiver, throwing `NoSuchMethodError:
 // java/lang/String.getAnnotation`. This is exactly what tripped up
 // Arquillian's `EventTestRunnerAdaptor` bootstrap (MOXy JAXB asks
@@ -11809,20 +11844,20 @@ pub(crate) fn native_class_get_package_name(
 // (rather than crashing, which is what the raw-index write did). Properly
 // populating them would require constructing a real `Package$VersionInfo`
 // via its private `getInstance(...)` factory, which needs a static-invoke
-// capability this native layer doesn't currently expose — left as a
+// capability this native layer doesn't currently expose вЂ” left as a
 // follow-up. We do wire `versionInfo` to the `NULL_VERSION_INFO` sentinel
 // (matching the real 2-arg `Package(String, Module)` constructor) so that
 // sentinel, not a raw null, backs `getSpecificationTitle()` / `isSealed()`
-// / etc. — avoiding a NullPointerException in their place.
+// / etc. вЂ” avoiding a NullPointerException in their place.
 // ---------------------------------------------------------------------------
 
 /// Read a manifest attribute by name from the class's source jar, if any.
 /// Returns `None` for classes loaded from a directory or the boot path.
 ///
 /// Supports three CodeSource URL forms:
-///   * `file:/C:/.../foo.jar`                              — plain jar
-///   * `jar:file:/C:/.../outer.jar!/BOOT-INF/lib/inner.jar!/` — Spring Boot 2.x
-///   * `jar:nested:/C:/.../outer.jar/!BOOT-INF/lib/inner.jar!/` — Spring Boot 3.x
+///   * `file:/C:/.../foo.jar`                              вЂ” plain jar
+///   * `jar:file:/C:/.../outer.jar!/BOOT-INF/lib/inner.jar!/` вЂ” Spring Boot 2.x
+///   * `jar:nested:/C:/.../outer.jar/!BOOT-INF/lib/inner.jar!/` вЂ” Spring Boot 3.x
 ///
 /// For the nested forms, opens the outer jar, extracts the inner jar entry
 /// to a byte buffer, reads `META-INF/MANIFEST.MF` from the inner zip, and
@@ -11933,7 +11968,7 @@ fn plain_jar_manifest_attr(path: &std::path::Path, attr: &str) -> Option<String>
 /// `getPackage()` once per package level for every class it touches.
 /// Without caching, each call re-opens the outer 30-100MB JAR, parses its
 /// central directory, extracts an inner ~5MB JAR into memory, parses ITS
-/// central directory, and reads the MANIFEST.MF — taking 1-3 seconds each.
+/// central directory, and reads the MANIFEST.MF вЂ” taking 1-3 seconds each.
 /// That blows up to minute-scale wait times during Tomcat init and is what
 /// caused `insurance-backend` to never reach the Spring "Started" banner
 /// within the 60s timeout.
@@ -11946,8 +11981,8 @@ fn nested_manifest_cache() -> &'static Mutex<HashMap<String, HashMap<String, Str
 /// the requested `META-INF/MANIFEST.MF` attribute from inside the inner jar.
 /// Returns `None` on any I/O / format failure (best-effort). Caches the
 /// parsed manifest per `(outer_jar, inner_entry)` so repeated lookups of
-/// different attributes on the same nested jar — the common case during
-/// Spring Boot startup — are O(1) hash lookups.
+/// different attributes on the same nested jar вЂ” the common case during
+/// Spring Boot startup вЂ” are O(1) hash lookups.
 fn nested_jar_manifest_attr(
     outer_jar: &std::path::Path,
     inner_entry: &str,
@@ -12006,7 +12041,7 @@ fn parse_nested_jar_manifest(
     Some(map)
 }
 
-/// Real `Class.getPackage()` native — returns a `java.lang.Package` mirror
+/// Real `Class.getPackage()` native вЂ” returns a `java.lang.Package` mirror
 /// or null when the class has no resolvable package (primitive / array of
 /// primitive). Always non-null for a real reference type.
 pub(crate) fn native_class_get_package(
@@ -12034,7 +12069,7 @@ pub(crate) fn native_class_get_package(
     } else if let Some(pos) = name.rfind('/') {
         Arc::from(name[..pos].replace('/', "."))
     } else {
-        // Default package — return a Package object whose name is the empty
+        // Default package вЂ” return a Package object whose name is the empty
         // string, matching JDK 25 (`Class.forName("Foo").getPackage()`
         // yields a Package with `getName().equals("")`).
         Arc::from("")
@@ -12057,12 +12092,12 @@ pub(crate) fn native_class_get_package(
     // Slot 0: name (synthetic-mode layout used by `getPackageName`/`getName`
     // shims pre-real-class-load). Also happens to be `NamedPackage.name`'s
     // real slot, so the by-index write is harmless there; every other field
-    // below is by-name ONLY — see the raw-index corruption note above.
+    // below is by-name ONLY вЂ” see the raw-index corruption note above.
     let name_str = ctx.create_string(&pkg_name);
     ctx.set_field(pkg, 0, Value::Object(Some(name_str)));
     ctx.set_field_by_name(pkg, "name", Value::Object(Some(name_str)));
     // Manifest-derived attributes. NOT written by raw slot index (see the
-    // function-level comment above) — `Package` has no flat `specTitle` /
+    // function-level comment above) вЂ” `Package` has no flat `specTitle` /
     // `implVersion` / etc. fields in real JDK 9+, so these by-name writes
     // currently no-op for a real-class Package (tracked as a follow-up);
     // what matters here is that they can never clobber `module` /
@@ -12089,7 +12124,7 @@ pub(crate) fn native_class_get_package(
     // `versionInfo` unconditionally) throw NullPointerException instead of
     // HotSpot's null/false. Best-effort: if `Package$VersionInfo` can't be
     // resolved (e.g. pure synthetic-JDK mode with no real `java.lang.Package`
-    // on the classpath), leave `versionInfo` unset — real bytecode isn't
+    // on the classpath), leave `versionInfo` unset вЂ” real bytecode isn't
     // running against this object in that mode anyway.
     if let Ok(vi_cid) = ctx.ensure_class_initialized("java/lang/Package$VersionInfo") {
         if let Some(idx) = ctx.static_field_index_by_name(vi_cid, "NULL_VERSION_INFO") {
@@ -12122,7 +12157,7 @@ pub(crate) fn native_class_get_package(
     // as JSpecify `@NullMarked` / `@NullUnmarked`. Without this, `getPackageInfo()`
     // calls `Class.forName(<pkg>.package-info, false, module.getClassLoader())`
     // with a *null* loader (our unnamed module reports no class loader), fails
-    // to locate the class, and caches the empty `PackageInfoProxy` sentinel —
+    // to locate the class, and caches the empty `PackageInfoProxy` sentinel вЂ”
     // leaving every package annotation invisible. Loading via the same path the
     // declaring class used works (best-effort: most packages have no
     // package-info, in which case `load_class` errors and we leave the field
@@ -12137,7 +12172,7 @@ pub(crate) fn native_class_get_package(
 }
 
 // ---------------------------------------------------------------------------
-// I2 — ClassLoader package-management overrides
+// I2 вЂ” ClassLoader package-management overrides
 //
 // Background: in real-JDK mode the JDK's `ClassLoader` Java code reads its
 // private `packages: ConcurrentHashMap<String, NamedPackage>` field from
@@ -12162,7 +12197,7 @@ pub(crate) fn native_class_get_package(
 // `postDefineClass` and `Class.getPackage()` keep working without depending
 // on `packages` being non-null.
 
-/// `ClassLoader.getDefinedPackage(String name) -> Package` — returns null
+/// `ClassLoader.getDefinedPackage(String name) -> Package` вЂ” returns null
 /// (no package is defined on this classloader). JDK semantics: returning
 /// null is correct when the classloader has not previously defined a
 /// package by that name. ByteBuddy's `Resolver$ForModuleSystem.accept`
@@ -12174,7 +12209,7 @@ pub(crate) fn i2_classloader_get_defined_package(
     Ok(Some(Value::Object(None)))
 }
 
-/// `ClassLoader.getDefinedPackages() -> Package[]` — returns an empty array.
+/// `ClassLoader.getDefinedPackages() -> Package[]` вЂ” returns an empty array.
 pub(crate) fn i2_classloader_get_defined_packages(
     ctx: &mut dyn NativeContext,
     _args: &[Value],
@@ -12200,7 +12235,7 @@ fn i2_alloc_synthetic_package(ctx: &mut dyn NativeContext, name: &str) -> Object
 /// the `packages` map and inserts a new `NamedPackage` if absent; we
 /// synthesise a fresh one without ever touching `packages`. Matches
 /// `Package` (which extends `NamedPackage`) so the cast at the call site
-/// is benign — callers ignore the result anyway (the value is `pop`ped
+/// is benign вЂ” callers ignore the result anyway (the value is `pop`ped
 /// in `postDefineClass`).
 pub(crate) fn i2_classloader_get_named_package(
     ctx: &mut dyn NativeContext,
@@ -12219,7 +12254,7 @@ pub(crate) fn i2_classloader_get_named_package(
     Ok(Some(Value::Object(Some(pkg))))
 }
 
-/// `ClassLoader.definePackage(String name, Module m) -> Package` — same
+/// `ClassLoader.definePackage(String name, Module m) -> Package` вЂ” same
 /// shape as `getNamedPackage` but typed as `Package`. The JDK's bytecode
 /// also reads the `packages` map; we bypass it entirely.
 pub(crate) fn i2_classloader_define_package_string_module(
@@ -12237,7 +12272,7 @@ pub(crate) fn i2_classloader_define_package_string_module(
     Ok(Some(Value::Object(Some(pkg))))
 }
 
-/// `ClassLoader.definePackage(Class<?>) -> Package` — derives the package
+/// `ClassLoader.definePackage(Class<?>) -> Package` вЂ” derives the package
 /// name from `c.getPackageName()` and synthesises a Package. This is the
 /// single-arg overload called by `Class.getPackage()`'s JDK Java body
 /// when the native override (registered separately for `Class.getPackage`)
@@ -12245,7 +12280,7 @@ pub(crate) fn i2_classloader_define_package_string_module(
 ///
 /// Also populates the manifest-derived fields (`implementationTitle`,
 /// `implementationVersion`, `specification*`, `implementationVendor`) from
-/// the class's source jar — same data path as `native_class_get_package`.
+/// the class's source jar вЂ” same data path as `native_class_get_package`.
 /// Without this, callers like `Foo.class.getPackage().getImplementationVersion()`
 /// in real-JDK mode see slot 5 = null (because real `Class.getPackage()`
 /// delegates here), even though the synthetic-jdk override correctly
@@ -12266,7 +12301,7 @@ pub(crate) fn i2_classloader_define_package_class(
         return Ok(Some(Value::Object(None)));
     }
     // Cache the dotted package prefix per `ClassId` for VM-registered
-    // mirrors only — same rationale as `native_class_get_package`.
+    // mirrors only вЂ” same rationale as `native_class_get_package`.
     let pkg_name: Arc<str> = if let Some(class_id) = ctx.class_id_from_mirror(class_arg) {
         if let Some(arc) = cache_get(&PACKAGE_NAME_CACHE, class_id) {
             arc
@@ -12293,7 +12328,7 @@ pub(crate) fn i2_classloader_define_package_class(
             (None, None, None, None, None, None)
         };
     let pkg = i2_alloc_synthetic_package(ctx, &pkg_name);
-    // By-name only — NOT by raw slot index. See the corruption note on
+    // By-name only вЂ” NOT by raw slot index. See the corruption note on
     // `native_class_get_package` above: real JDK 9+ `Package` has no flat
     // `specTitle`/etc. fields at slots 1-6 (those live inside the nested
     // `versionInfo` object; slots 1-3 are actually `module`/`versionInfo`/
@@ -12341,7 +12376,7 @@ pub fn i2_register_classloader_package_natives(r: &mut cratonvm_native_api::Nati
         "()[Ljava/lang/Package;",
         i2_classloader_get_defined_packages,
     );
-    // `ClassLoader.getPackages()` — real JDK bytecode is
+    // `ClassLoader.getPackages()` вЂ” real JDK bytecode is
     // `return packages().toArray(Package[]::new)`. In our boot the stream
     // pipeline leaks a `ReferencePipeline$Head` into the caller's local
     // typed as `Package[]`, NPE-ing on arraylength inside
@@ -12446,7 +12481,7 @@ pub fn i2_register_classloader_package_natives(r: &mut cratonvm_native_api::Nati
     );
 }
 
-/// `ClassLoader.checkCerts(String, CodeSource)` (private) — no-op. The JDK's
+/// `ClassLoader.checkCerts(String, CodeSource)` (private) вЂ” no-op. The JDK's
 /// implementation reads the `package2certs: ConcurrentHashMap` field which
 /// also stays null on user-instantiated subclasses, NPE-ing inside
 /// `preDefineClass`. We skip the check entirely (we don't enforce
@@ -12483,7 +12518,7 @@ pub(crate) fn native_class_get_canonical_name(
         Some(Value::Object(Some(o))) => *o,
         _ => return Ok(Some(Value::Object(None))),
     };
-    // Lambda proxies are JVM hidden classes — HotSpot's `getCanonicalName()`
+    // Lambda proxies are JVM hidden classes вЂ” HotSpot's `getCanonicalName()`
     // returns null for them (no canonical name). Without this the fallback
     // below would leak "unknown_<id>". bug-06 fam5 #1.
     if let Some(class_id) = mirror_class_id(ctx, this) {
@@ -12521,7 +12556,7 @@ pub(crate) fn native_class_get_type_name(
         }
     }
     // Arrays: `getTypeName()` is the element's `getName()` plus one `[]` per
-    // dimension — e.g. `[[Ljava/lang/String;` -> `java.lang.String[][]` and
+    // dimension вЂ” e.g. `[[Ljava/lang/String;` -> `java.lang.String[][]` and
     // `[I` -> `int[]`. This differs from `getName()`'s descriptor form
     // (`[[Ljava.lang.String;`), so it must NOT reuse the
     // `DOTTED_CLASS_NAME_CACHE` (which mirrors `getName()`). Surfaced by
@@ -12541,7 +12576,7 @@ pub(crate) fn native_class_get_type_name(
     }
     // `Class.getTypeName()` returns the dotted form for non-array refs. It is a
     // pure derivation from the slashed internal name and equals what
-    // `dotted_class_name` produces — share the same cache as `Class.getName()`.
+    // `dotted_class_name` produces вЂ” share the same cache as `Class.getName()`.
     if let Some(class_id) = ctx.class_id_from_mirror(this) {
         if let Some(arc) = cache_get(&DOTTED_CLASS_NAME_CACHE, class_id) {
             return Ok(Some(Value::Object(Some(ctx.create_string(&arc)))));
@@ -12566,11 +12601,11 @@ pub(crate) fn native_class_get_enum_constants(
 ) -> MethodCallResult {
     // Real implementation: read the synthetic `$VALUES` static field
     // populated by the enum's `<clinit>`, then return a fresh Object[]
-    // clone so callers (e.g. EnumMap.getKeyUniverse → arraylength) see a
+    // clone so callers (e.g. EnumMap.getKeyUniverse в†’ arraylength) see a
     // non-null, fully-populated array.
     //
     // This is the target of both `Class.getEnumConstants()` and the
-    // package-private `Class.getEnumConstantsShared()` — both bytecode
+    // package-private `Class.getEnumConstantsShared()` вЂ” both bytecode
     // paths in the real JDK ultimately need the enum's `$VALUES` array,
     // and our earlier stub that returned an empty array broke every
     // `EnumMap.<init>(Class)` call (e.g. StreamOpFlag.<clinit>).
@@ -12593,12 +12628,12 @@ pub(crate) fn native_class_get_enum_constants(
         None => return Ok(Some(Value::Object(None))),
     };
     if let Err(_e) = ctx.ensure_class_initialized(&class_name) {
-        // Fall through — we can still try to read $VALUES if it was
+        // Fall through вЂ” we can still try to read $VALUES if it was
         // populated before the failure (common after silent-swallow).
     }
     // Read the synthetic enum-values array static field.  `javac` names it
-    // `$VALUES`; the Eclipse JDT compiler (`ecj`) — used to build several
-    // WildFly modules — emits `ENUM$VALUES` (ACC_SYNTHETIC) instead.  The
+    // `$VALUES`; the Eclipse JDT compiler (`ecj`) вЂ” used to build several
+    // WildFly modules вЂ” emits `ENUM$VALUES` (ACC_SYNTHETIC) instead.  The
     // real JDK sidesteps the name entirely by invoking the generated
     // `values()` accessor reflectively, so it is compiler-agnostic; we read
     // the field directly (our reflective `values()` invoke historically
@@ -12630,13 +12665,13 @@ pub(crate) fn native_class_get_enum_constants(
         }
     };
     // Clone into a new array whose component type is the enum class
-    // itself (matches `getEnumConstantsShared().clone()` semantics —
+    // itself (matches `getEnumConstantsShared().clone()` semantics вЂ”
     // `$VALUES` is typed `[LEnumClass;`). Callers of `getEnumConstants`
     // then `checkcast [Ljava/lang/Enum;`, which requires the component
     // class to be a subclass of `java/lang/Enum`. Using a plain
     // `Object[]` makes that checkcast fail silently (returning the array
     // as-is from non-strict casts elsewhere, then yielding 0-length
-    // streams downstream — observed as
+    // streams downstream вЂ” observed as
     // `Utils.enumOptions(SecurityProtocol.class)` returning empty,
     // which caused Kafka's `ReplicationConfigs.<clinit>` to throw
     // `ConfigException: Invalid value PLAINTEXT for configuration
@@ -12658,12 +12693,12 @@ pub(crate) fn native_class_cast(_ctx: &mut dyn NativeContext, args: &[Value]) ->
 
 /// Native override for `java.lang.Class.getClassLoader()`.
 ///
-/// JVM spec §5.3: classes loaded by the bootstrap loader return `null`,
+/// JVM spec В§5.3: classes loaded by the bootstrap loader return `null`,
 /// otherwise return the defining loader.  In CratonVM:
 ///
-/// - Bootstrap classes (java/*, javax/*, jdk/*, sun/*, com/sun/*) → null.
+/// - Bootstrap classes (java/*, javax/*, jdk/*, sun/*, com/sun/*) в†’ null.
 /// - Anything else (app classpath via `-c`, user-defined hidden classes,
-///   synthetic test fixtures, primitive-mirror lookups that arrive here) →
+///   synthetic test fixtures, primitive-mirror lookups that arrive here) в†’
 ///   the singleton application `ClassLoader` instance.  This must be
 ///   non-null so callers like `commons-logging`'s
 ///   `LogFactory.<clinit>` (which does
@@ -12697,7 +12732,7 @@ pub(crate) fn native_class_get_class_loader(
     let class_id = match class_id_opt {
         Some(cid) => cid,
         None => {
-            // No resolvable ClassId — return the app loader so
+            // No resolvable ClassId вЂ” return the app loader so
             // `Class.getClassLoader()` is never null for a non-bootstrap
             // class.  The only path that yields null is the explicit
             // bootstrap-package case below.
@@ -12706,7 +12741,7 @@ pub(crate) fn native_class_get_class_loader(
         }
     };
     // A class defined through a user-defined `ClassLoader.defineClass` records
-    // its exact defining loader instance — return that, not the app-loader
+    // its exact defining loader instance вЂ” return that, not the app-loader
     // fallback below. Without this, ByteBuddy's `ByteArrayClassLoader.load`
     // sanity check (`Class.forName(name, false, cl).getClassLoader() == cl`)
     // fails with "Class already loaded" and Hibernate's proxy generation breaks.
@@ -12721,7 +12756,7 @@ pub(crate) fn native_class_get_class_loader(
         || class_name.starts_with("sun/")
         || class_name.starts_with("com/sun/");
     if loader_type == 0 && is_jdk_pkg {
-        // Bootstrap loader → null per JVM spec.
+        // Bootstrap loader в†’ null per JVM spec.
         return Ok(Some(Value::Object(None)));
     }
     if loader_type == 0 && !is_jdk_pkg {
@@ -12732,7 +12767,7 @@ pub(crate) fn native_class_get_class_loader(
         //       there and then asserts `getClassLoader() == null`), or
         //   (b) a synthetic stub of an app-level class (those default to the
         //       bootstrap loader id but are really application placeholders).
-        // For (a) — a real, fully-loaded class — the spec says the loader is
+        // For (a) вЂ” a real, fully-loaded class вЂ” the spec says the loader is
         // null. For (b) keep the app-loader fallback below so a stubbed app
         // class never spuriously reports a null loader.
         if !ctx.is_class_synthetic_stub(&class_name) {
@@ -12740,7 +12775,7 @@ pub(crate) fn native_class_get_class_loader(
         }
     }
     if loader_type == 1 {
-        // Platform/extension loader — return singleton.
+        // Platform/extension loader вЂ” return singleton.
         let cl = crate::classloader::get_or_create_platform_loader(ctx);
         return Ok(Some(Value::Object(Some(cl))));
     }
@@ -12789,7 +12824,7 @@ pub(crate) fn native_class_descriptor_string(
 }
 
 // ---------------------------------------------------------------------------
-// T13 — java/lang/Class JDK 25 native method implementations
+// T13 вЂ” java/lang/Class JDK 25 native method implementations
 // ---------------------------------------------------------------------------
 
 /// `java/lang/Class.getDeclaringClass0()Ljava/lang/Class;`
@@ -12801,7 +12836,7 @@ pub(crate) fn native_class_get_declaring_class(
     args: &[Value],
 ) -> MethodCallResult {
     let this = obj_arg(args, 0)?;
-    // bytebuddy_probe (agent-bb4) — Object short-circuit. The real JDK
+    // bytebuddy_probe (agent-bb4) вЂ” Object short-circuit. The real JDK
     // returns null for Object.getDeclaringClass(). If our reverse-map is
     // aliased so that a synthetic mirror points at Object's ClassId, and
     // Object's `declaring_class` accidentally resolves to a non-null
@@ -12827,7 +12862,7 @@ pub(crate) fn native_class_get_declaring_class(
 
     // Slow path (SBR-07): the enclosing class is NOT yet loaded. This is the
     // common shape for `Class.forName("Pkg.Outer$Inner")` where the inner class
-    // is resolved by name without ever referencing `Outer` — e.g. Kotlin's
+    // is resolved by name without ever referencing `Outer` вЂ” e.g. Kotlin's
     // protobuf-generated `ProtoBuf$StringTable`. `Vm::declaring_class` resolves
     // the outer-class name through `find_class_by_name`, which only sees
     // already-loaded classes, so it returns `None` and the real-JDK
@@ -12836,7 +12871,7 @@ pub(crate) fn native_class_get_declaring_class(
     // *loads* the enclosing class here; mirror that by walking this class's own
     // `InnerClasses` attribute for the entry naming itself and loading the
     // recorded outer class (same resolve-then-load pattern as
-    // `getDeclaredClasses0`). A non-member class (anonymous/local — empty
+    // `getDeclaredClasses0`). A non-member class (anonymous/local вЂ” empty
     // `outer_class`/`inner_name`) has no such entry and correctly stays `null`.
     let class_name = match ctx.class_name_of_id(class_id) {
         Some(n) => n,
@@ -12856,7 +12891,7 @@ pub(crate) fn native_class_get_declaring_class(
                 let mirror = ctx.get_class_mirror(outer_id);
                 return Ok(Some(Value::Object(Some(mirror))));
             }
-            // Found the member entry but couldn't load the outer class — match
+            // Found the member entry but couldn't load the outer class вЂ” match
             // HotSpot's class-load-failure suppression at this site and stop.
             break;
         }
@@ -12889,7 +12924,7 @@ pub(crate) fn native_class_get_simple_binary_name(
     for (inner_class, _outer_class, inner_name, _flags) in &inner_classes {
         if inner_class == &class_name {
             if inner_name.is_empty() {
-                // Anonymous class — no simple binary name
+                // Anonymous class вЂ” no simple binary name
                 return Ok(Some(Value::Object(None)));
             }
             let name_obj = ctx.create_string(inner_name);
@@ -12897,7 +12932,7 @@ pub(crate) fn native_class_get_simple_binary_name(
         }
     }
 
-    // Not an inner class — return null
+    // Not an inner class вЂ” return null
     Ok(Some(Value::Object(None)))
 }
 
@@ -13027,7 +13062,7 @@ pub(crate) fn native_class_get_raw_type_annotations(
 ///
 /// Returns a ConstantPool mirror object. In our implementation, we allocate
 /// a synthetic object that holds a reference to the class ID. The JDK uses
-/// this for annotation parsing — we return null for now and handle annotation
+/// this for annotation parsing вЂ” we return null for now and handle annotation
 /// parsing through getRawAnnotations().
 pub(crate) fn native_class_get_constant_pool(
     ctx: &mut dyn NativeContext,
@@ -13051,15 +13086,15 @@ pub(crate) fn native_class_get_constant_pool(
 /// `java/lang/Class.getDeclaredClasses0()[Ljava/lang/Class;`
 ///
 /// Returns an array of Class mirrors for the immediate member classes /
-/// interfaces declared inside this class (JLS §8.5). Walks this class's
-/// `InnerClasses` attribute (JVMS §4.7.6) and selects entries whose
+/// interfaces declared inside this class (JLS В§8.5). Walks this class's
+/// `InnerClasses` attribute (JVMS В§4.7.6) and selects entries whose
 /// `outer_class_info` matches this class AND whose `inner_name` is non-empty
-/// — the empty-`inner_name` case denotes an anonymous class, which `Class.
+/// вЂ” the empty-`inner_name` case denotes an anonymous class, which `Class.
 /// getDeclaredClasses` MUST exclude (HotSpot's `getDeclaredClasses0` checks
 /// the same predicate).
 ///
 /// Each surviving entry is then *resolved* through `load_class` so the inner
-/// class actually has a `ClassId` (and therefore a mirror) — without this,
+/// class actually has a `ClassId` (and therefore a mirror) вЂ” without this,
 /// calling `getDeclaredClasses()` on a class whose members haven't been
 /// referenced yet would always return an empty array, because
 /// `class_id_by_name` only finds already-loaded classes. Unresolvable entries
@@ -13091,14 +13126,14 @@ pub(crate) fn native_class_get_declared_classes(
             continue;
         }
         if inner_name.is_empty() {
-            // Anonymous (and most local) classes — JLS-defined exclusion.
+            // Anonymous (and most local) classes вЂ” JLS-defined exclusion.
             continue;
         }
         if !seen.insert(inner_class.clone()) {
             continue;
         }
         // Resolve the inner class. Prefer the already-loaded id; otherwise
-        // ask the VM to load it (without initializing — `load_class` calls
+        // ask the VM to load it (without initializing вЂ” `load_class` calls
         // `load_class_concurrent`, which stops before <clinit>). Failures are
         // dropped, matching HotSpot's behaviour for missing inner classes.
         let inner_id = match ctx.class_id_by_name(inner_class) {
@@ -13157,7 +13192,7 @@ pub(crate) fn native_class_get_nest_host(
                 None => Ok(Some(Value::Object(Some(this)))),
             }
         }
-        // No NestHost attribute — this class is its own nest host
+        // No NestHost attribute вЂ” this class is its own nest host
         None => Ok(Some(Value::Object(Some(this)))),
     }
 }
@@ -13183,12 +13218,12 @@ pub(crate) fn native_class_get_nest_members(
 
     let members = ctx.nest_member_names(class_id);
     if members.is_empty() {
-        // Not a nest host — return [self]
+        // Not a nest host вЂ” return [self]
         let arr = ctx.new_array(cratonvm_types::ArrayElementType::Reference, 1);
         ctx.set_array_element(arr, 0, Value::Object(Some(this)));
         Ok(Some(Value::Object(Some(arr))))
     } else {
-        // Nest host — return [self] + resolved members
+        // Nest host вЂ” return [self] + resolved members
         let mut mirrors: Vec<ObjectRef> = vec![ctx.get_class_mirror(class_id)];
         for member_name in &members {
             if let Some(member_id) = ctx.class_id_by_name(member_name) {
@@ -13212,11 +13247,11 @@ pub(crate) fn native_class_get_nest_members(
 ///   * Record classes: returns array of RecordComponent objects.
 ///
 /// The fields populated on each RecordComponent are:
-///   * clazz   — the declaring record Class mirror
-///   * name    — the component name (String)
-///   * type    — the component type (Class mirror, resolved from descriptor)
-///   * accessor — null (computed lazily by the Java side via getDeclaredMethod)
-///   * signature, annotations, typeAnnotations — null/zero-length
+///   * clazz   вЂ” the declaring record Class mirror
+///   * name    вЂ” the component name (String)
+///   * type    вЂ” the component type (Class mirror, resolved from descriptor)
+///   * accessor вЂ” null (computed lazily by the Java side via getDeclaredMethod)
+///   * signature, annotations, typeAnnotations вЂ” null/zero-length
 ///
 /// Fields are populated via `set_field_by_name` so the impl works with both
 /// the real-JDK layout (where Class.getName etc. is pure-Java reading
@@ -13256,7 +13291,7 @@ pub(crate) fn native_class_get_record_components(
     // For `record Foo(int a, String b)`, the Record attribute lists
     // (a, I) and (b, Ljava/lang/String;); the synthesized accessors are
     // `int a()` (descriptor `()I`) and `String b()` (descriptor
-    // `()Ljava/lang/String;`) — i.e. zero-arg, return type matches the
+    // `()Ljava/lang/String;`) вЂ” i.e. zero-arg, return type matches the
     // component descriptor.
     let declared = ctx.declared_methods(class_id);
 
@@ -13344,7 +13379,7 @@ pub(crate) fn native_class_get_permitted_subclasses(
 /// of this Class. Synthetic best-effort impl: builds a minimal
 /// `AnnotatedType` whose backing `Type` is the superclass `Class` mirror,
 /// with no type-annotations attached. Returns null for `Object`, primitive
-/// types, void, array types, and interfaces — matching the JDK contract.
+/// types, void, array types, and interfaces вЂ” matching the JDK contract.
 ///
 /// The returned object is a synthetic 2-field stand-in:
 ///   * slot 0: backing `Type` (the superclass `Class` mirror)
@@ -13386,12 +13421,12 @@ pub(crate) fn native_class_get_annotated_superclass(
 /// `java/lang/Class.getAnnotatedInterfaces()[Ljava/lang/reflect/AnnotatedType;`
 ///
 /// WP2.1-class-modern: returns an `AnnotatedType[]` mirroring the
-/// `getGenericInterfaces()` array (residual-2 fix — see below for why the
+/// `getGenericInterfaces()` array (residual-2 fix вЂ” see below for why the
 /// erased `getInterfaces()` array is wrong here). Each element is a
-/// synthetic `AnnotatedType` wrapping the corresponding interface Type — see
+/// synthetic `AnnotatedType` wrapping the corresponding interface Type вЂ” see
 /// [`make_annotated_type`] for the layout.
 ///
-/// Always returns a non-null (possibly zero-length) array — matching the
+/// Always returns a non-null (possibly zero-length) array вЂ” matching the
 /// JDK contract. Frameworks (ByteBuddy, JMX OpenMBean introspector) rely
 /// on the non-null guarantee; throwing or returning null here breaks
 /// `MBeanIntrospector.getMethods` recursion.
@@ -13403,7 +13438,7 @@ pub(crate) fn native_class_get_annotated_superclass(
 /// `annotated_type_impl_class_name`, so a generic interface such as
 /// `Comparable<Path>`/`Iterable<Path>` (two of `java.nio.file.Path`'s direct
 /// superinterfaces) got wrapped in the base `AnnotatedTypeBaseImpl` instead
-/// of `AnnotatedParameterizedTypeImpl` — the same ByteBuddy `AnnotatedType`
+/// of `AnnotatedParameterizedTypeImpl` вЂ” the same ByteBuddy `AnnotatedType`
 /// dispatch mismatch the ES bytebuddy-annotatedtype fix addressed for
 /// methods/fields/parameters (see
 /// `docs/known-issues/elasticsearch-bytebuddy-annotatedtype-proxy-mismatch.md`),
@@ -13435,13 +13470,13 @@ pub(crate) fn native_class_get_annotated_interfaces(
 /// (typically a `Class` mirror).
 ///
 /// Layout (2 fields, by-name + slot-fallback):
-///   * `type` — the wrapped `Type` (slot 0)
-///   * `annotations` — empty `Annotation[]` (slot 1)
+///   * `type` вЂ” the wrapped `Type` (slot 0)
+///   * `annotations` вЂ” empty `Annotation[]` (slot 1)
 ///
 /// `AnnotatedType` is an interface in the JDK; its concrete impl class is
 /// `sun.reflect.annotation.AnnotatedTypeFactory$AnnotatedTypeBaseImpl` /
 /// `AnnotatedTypeImpl`. We allocate against `java/lang/reflect/AnnotatedType`
-/// — the dispatch path treats this as a synthetic-stub instance.
+/// вЂ” the dispatch path treats this as a synthetic-stub instance.
 /// `getType()` reads slot 0 ; downstream frameworks only need that
 /// accessor + non-null-ness.
 /// Fill the real-JDK `AnnotatedTypeBaseImpl` bookkeeping fields that the
@@ -13449,10 +13484,10 @@ pub(crate) fn native_class_get_annotated_interfaces(
 /// be non-null: `AnnotatedTypeBaseImpl.getAnnotatedOwnerType()` (not overridden)
 /// does `getLocation().popLocation((byte)1)` and NPEs on a null `location`.
 /// ByteBuddy walks owner types of parameterized method types (mock generation),
-/// hitting exactly this path — surfaced as
-/// `MockitoException … NullPointerException … AnnotatedTypeFactory.getLocation()`
+/// hitting exactly this path вЂ” surfaced as
+/// `MockitoException вЂ¦ NullPointerException вЂ¦ AnnotatedTypeFactory.getLocation()`
 /// (`UUidV6V7GeneratorTest`). Seed `location` with `LocationInfo.BASE_LOCATION`
-/// (depth 0 → `popLocation` returns null → the owner is rebuilt with
+/// (depth 0 в†’ `popLocation` returns null в†’ the owner is rebuilt with
 /// BASE_LOCATION by real-JDK code) and `allOnSameTargetTypeAnnotations` with an
 /// empty array so `getTypeAnnotations()` never returns null either.
 fn annotated_type_fill_bookkeeping(ctx: &mut dyn NativeContext, obj: ObjectRef) {
@@ -13476,13 +13511,13 @@ fn annotated_type_fill_bookkeeping(ctx: &mut dyn NativeContext, obj: ObjectRef) 
 /// Which real-JDK `sun.reflect.annotation.AnnotatedTypeFactory` impl class
 /// should back an `AnnotatedType` wrapping `backing_type`, mirroring
 /// `AnnotatedTypeFactory.buildAnnotatedType`'s own dispatch: an array `Type`
-/// (array `Class` or `GenericArrayType`) → `AnnotatedArrayTypeImpl`,
-/// `TypeVariable` → `AnnotatedTypeVariableImpl`, `ParameterizedType` →
-/// `AnnotatedParameterizedTypeImpl`, `WildcardType` → `AnnotatedWildcardTypeImpl`,
-/// else (plain `Class`) → the base impl. All four subclasses extend
+/// (array `Class` or `GenericArrayType`) в†’ `AnnotatedArrayTypeImpl`,
+/// `TypeVariable` в†’ `AnnotatedTypeVariableImpl`, `ParameterizedType` в†’
+/// `AnnotatedParameterizedTypeImpl`, `WildcardType` в†’ `AnnotatedWildcardTypeImpl`,
+/// else (plain `Class`) в†’ the base impl. All four subclasses extend
 /// `AnnotatedTypeBaseImpl` and declare no extra fields, so the base class's
 /// 4-field layout (`type`, `location`, `allOnSameTargetTypeAnnotations`,
-/// `annotations`) is inherited unchanged — picking the right subclass only
+/// `annotations`) is inherited unchanged вЂ” picking the right subclass only
 /// changes which `AnnotatedXxxType` sub-interface the constructed object
 /// satisfies via `instanceof`.
 ///
@@ -13492,7 +13527,7 @@ fn annotated_type_fill_bookkeeping(ctx: &mut dyn NativeContext, obj: ObjectRef) 
 /// `instanceof AnnotatedParameterizedType` / calling
 /// `getAnnotatedActualTypeArguments()`, which only that subclass declares)
 /// and fail with a receiver-type mismatch a few frames up the call chain
-/// when handed a plain `AnnotatedTypeBaseImpl` instead — see
+/// when handed a plain `AnnotatedTypeBaseImpl` instead вЂ” see
 /// `docs/known-issues/elasticsearch-bytebuddy-annotatedtype-proxy-mismatch.md`.
 fn annotated_type_impl_class_name(
     ctx: &mut dyn NativeContext,
@@ -13654,9 +13689,9 @@ fn take_annotated_type_argument_anns(
 /// not an array.
 ///
 /// A real-JDK `AnnotatedTypeBaseImpl` (built by bytecode paths we don't
-/// intercept) stores a `Map` here, not an `Annotation[]` — `object_is_array`
+/// intercept) stores a `Map` here, not an `Annotation[]` вЂ” `object_is_array`
 /// distinguishes the two by heap object kind (a class-name check can't: a
-/// heap reference array reports its *component* class, not a `[L…;` class).
+/// heap reference array reports its *component* class, not a `[LвЂ¦;` class).
 /// Those real instances carry no top-level type annotations anyway, since
 /// `getTypeAnnotationBytes0` is null, so reporting them as empty is correct.
 fn annotated_type_stashed_anns(
@@ -13678,13 +13713,13 @@ fn annotated_type_stashed_anns(
 /// Builds an AnnotatedType wrapping the return type and carrying the
 /// method's METHOD_RETURN TYPE_USE annotations. Uses the GENERIC return type
 /// (`getGenericReturnType()`, falling back to the erased `Class` only when
-/// that call yields nothing) — not the erased one — so a parameterized/
+/// that call yields nothing) вЂ” not the erased one вЂ” so a parameterized/
 /// array/type-variable/wildcard return type reifies as a real
 /// `ParameterizedType`/`GenericArrayType`/etc. and `make_annotated_type_with_anns`
 /// can pick the matching `AnnotatedXxxType` impl class (see
 /// `annotated_type_impl_class_name`). Building the AnnotatedType from the
 /// erased type reflects a plain `Class` even for a generic return type,
-/// which real JDK never does — third-party reflective readers that check
+/// which real JDK never does вЂ” third-party reflective readers that check
 /// `instanceof AnnotatedParameterizedType` (ByteBuddy's `JavaDispatcher`,
 /// used by Mockito) then diverge from HotSpot.
 pub(crate) fn native_method_get_annotated_return_type(
@@ -13712,7 +13747,7 @@ pub(crate) fn native_method_get_annotated_return_type(
     Ok(Some(Value::Object(Some(at))))
 }
 
-/// `Parameter.getType()`, as a `Class` mirror — the fallback backing `Type`
+/// `Parameter.getType()`, as a `Class` mirror вЂ” the fallback backing `Type`
 /// for [`native_parameter_get_annotated_type`] when the declaring
 /// executable's generic parameter type isn't available.
 fn parameter_erased_type_mirror(ctx: &mut dyn NativeContext, this: ObjectRef) -> ObjectRef {
@@ -13727,7 +13762,7 @@ fn parameter_erased_type_mirror(ctx: &mut dyn NativeContext, this: ObjectRef) ->
 /// Builds an AnnotatedType wrapping the parameter's type and carrying that
 /// parameter's METHOD_FORMAL_PARAMETER TYPE_USE annotations. Prefers the
 /// GENERIC parameter type (the `idx`'th element of the declaring
-/// executable's `getGenericParameterTypes()`) over the erased one — see
+/// executable's `getGenericParameterTypes()`) over the erased one вЂ” see
 /// `native_method_get_annotated_return_type` for why; falls back to the
 /// erased `getType()` when the generic array is unavailable or the index is
 /// out of range (e.g. a synthetic/mandated parameter with no Signature
@@ -13775,8 +13810,8 @@ pub(crate) fn native_parameter_get_annotated_type(
 ///
 /// One AnnotatedType per declared parameter, each carrying that parameter's
 /// METHOD_FORMAL_PARAMETER TYPE_USE annotations. Prefers the GENERIC
-/// parameter types (`getGenericParameterTypes()`) over the erased ones —
-/// see `native_method_get_annotated_return_type` for why — falling back
+/// parameter types (`getGenericParameterTypes()`) over the erased ones вЂ”
+/// see `native_method_get_annotated_return_type` for why вЂ” falling back
 /// per-element to the erased mirror when the generic array's length
 /// doesn't match the erased one (e.g. synthetic/mandated parameters).
 pub(crate) fn native_executable_get_annotated_parameter_types(
@@ -13857,7 +13892,7 @@ pub(crate) fn native_executable_get_annotated_parameter_types(
 ///
 /// Builds an AnnotatedType wrapping the field's type and carrying the
 /// field's FIELD-target TYPE_USE annotations. Prefers the GENERIC field type
-/// (`getGenericType()`) over the erased one — see
+/// (`getGenericType()`) over the erased one вЂ” see
 /// `native_method_get_annotated_return_type` for why.
 pub(crate) fn native_field_get_annotated_type(
     ctx: &mut dyn NativeContext,
@@ -13891,7 +13926,7 @@ pub(crate) fn native_annotated_type_get_declared_annotations(
     let stashed = annotated_type_stashed_anns(ctx, this);
     if let Some((arr, len)) = stashed {
         if len > 0 {
-            // The field holds an actual `Annotation[]` (length>0 ⇒ array kind);
+            // The field holds an actual `Annotation[]` (length>0 в‡’ array kind);
             // return it directly.
             return Ok(Some(Value::Object(Some(arr))));
         }
@@ -13901,7 +13936,7 @@ pub(crate) fn native_annotated_type_get_declared_annotations(
     Ok(Some(Value::Object(Some(empty))))
 }
 
-/// `AnnotatedType.getAnnotation(Class)` override — scans the stashed proxy
+/// `AnnotatedType.getAnnotation(Class)` override вЂ” scans the stashed proxy
 /// array for one whose `annotationType()` matches the requested class.
 pub(crate) fn native_annotated_type_get_annotation(
     ctx: &mut dyn NativeContext,
@@ -14006,7 +14041,7 @@ pub(crate) fn native_annotated_parameterized_type_get_annotated_actual_type_argu
 /// Build a non-null, empty `java.security.Permissions` collection.
 ///
 /// We allocate the real-layout object and run its no-arg constructor so the
-/// internal `permsMap` is initialised — this makes `PermissionCollection`'s
+/// internal `permsMap` is initialised вЂ” this makes `PermissionCollection`'s
 /// `elements()` / `toString()` work and renders as HotSpot's
 /// `java.security.Permissions@HASH ( )` for an app class with no policy
 /// grants. The constructor run is best-effort: even if it fails the object is
@@ -14026,7 +14061,7 @@ pub(crate) fn build_empty_permissions(ctx: &mut dyn NativeContext) -> ObjectRef 
 /// `codesource` / `classloader` / `permissions` / `principals` fields.
 ///
 /// Writes BOTH the synthetic field layout (slot 0 = codesource, 1 =
-/// permissions, 2 = classloader, 3 = principals — see `class_manager.rs`) AND
+/// permissions, 2 = classloader, 3 = principals вЂ” see `class_manager.rs`) AND
 /// the real-JDK layout (slot 0 = codesource, 1 = classloader, 2 = principals,
 /// 3 = permissions) by name. The slot writes land first; the by-name writes
 /// run last and are authoritative, so a real-JDK-loaded `ProtectionDomain`
@@ -14034,7 +14069,7 @@ pub(crate) fn build_empty_permissions(ctx: &mut dyn NativeContext) -> ObjectRef 
 /// object actually has.
 ///
 /// `classloader` is the class's defining loader (matching
-/// `Class.getClassLoader()`); previously this slot was left null or — worse —
+/// `Class.getClassLoader()`); previously this slot was left null or вЂ” worse вЂ”
 /// clobbered with the permissions object (SBR-13).
 pub(crate) fn populate_protection_domain_fields(
     ctx: &mut dyn NativeContext,
@@ -14052,7 +14087,7 @@ pub(crate) fn populate_protection_domain_fields(
     ctx.set_field(pd, 1, perms_v);
     ctx.set_field(pd, 2, classloader);
     ctx.set_field(pd, 3, principals_v);
-    // Real-JDK layout by name (authoritative — runs last).
+    // Real-JDK layout by name (authoritative вЂ” runs last).
     ctx.set_field_by_name(pd, "codesource", codesource);
     ctx.set_field_by_name(pd, "permissions", perms_v);
     ctx.set_field_by_name(pd, "classloader", classloader);
@@ -14088,11 +14123,11 @@ pub(crate) fn native_class_get_class_file_version(
 //   * `getProtectionDomain0()` returns a lightweight `ProtectionDomain`
 //     whose `CodeSource` carries the class's load URL and any signer
 //     certificates.  Bootstrap / synthetic classes (empty or `class:`
-//     code-base) return null — matching HotSpot for boot classes.
+//     code-base) return null вЂ” matching HotSpot for boot classes.
 //
 //   * `getSigners()` returns the raw signer-certificate blocks as
 //     `byte[]` elements of an `Object[]`, or null for unsigned classes.
-//     Real JDK returns `Certificate[]` — we approximate with byte arrays
+//     Real JDK returns `Certificate[]` вЂ” we approximate with byte arrays
 //     since our synthetic-JDK surface doesn't fully implement
 //     `java.security.cert.Certificate`.
 //
@@ -14106,14 +14141,14 @@ pub(crate) fn native_class_get_class_file_version(
 /// Returns the `ProtectionDomain` for this class.
 ///
 /// * For classes loaded from the bootstrap loader (no CodeSource URL, or a
-///   synthetic `class:...` placeholder URL), returns null — matching HotSpot
+///   synthetic `class:...` placeholder URL), returns null вЂ” matching HotSpot
 ///   where the boot loader's PD is `null`.
 /// * For classes with a real CodeSource URL (typically `file:/...` from a
 ///   JAR or directory classpath entry), allocates a minimal-viable
 ///   `java/security/ProtectionDomain` with a 1-field `CodeSource` child
 ///   holding the URL and any signer certs.  Permissions and class loader
 ///   fields are left null which the JDK spec treats as "all permissions,
-///   bootstrap loader" — the safest default for a non-enforcing policy.
+///   bootstrap loader" вЂ” the safest default for a non-enforcing policy.
 pub(crate) fn native_class_get_protection_domain0(
     ctx: &mut dyn NativeContext,
     args: &[Value],
@@ -14149,7 +14184,7 @@ pub(crate) fn native_class_get_protection_domain0(
     // `file:/opt/app.jar`). The transforms below rewrite `code_base` into a
     // HotSpot-style filesystem path for the synthetic `java.net.URL` object,
     // which loses the source URL. `CodeSource.location` (slot 0 / the
-    // `location` field) must carry the load URL itself — `getCodeSource()
+    // `location` field) must carry the load URL itself вЂ” `getCodeSource()
     // .getLocation()` callers and our tests read it as the code base URL,
     // not a derived path.
     let location_url = code_base.clone();
@@ -14164,7 +14199,7 @@ pub(crate) fn native_class_get_protection_domain0(
         code_base
     };
 
-    // HotSpot-style path inside the `file:` URL (always `/C:/…` on Windows).
+    // HotSpot-style path inside the `file:` URL (always `/C:/вЂ¦` on Windows).
     let raw_path = code_base
         .strip_prefix("file:")
         .map(str::to_string)
@@ -14176,7 +14211,7 @@ pub(crate) fn native_class_get_protection_domain0(
         fwd
     };
 
-    // Build CodeSource(url=location, certs=[]) — signer certs are attached
+    // Build CodeSource(url=location, certs=[]) вЂ” signer certs are attached
     // as raw byte[] blocks so the reflective surface survives
     // `getCodeSource().getCertificates()` without requiring a full
     // `java.security.cert.Certificate` implementation.
@@ -14240,7 +14275,7 @@ pub(crate) fn native_class_get_protection_domain0(
     let pd_num_fields = ctx.class_num_total_fields(pd_cid).max(4);
     let pd = ctx.alloc_object(pd_cid, pd_num_fields);
     // Resolve the class's defining loader exactly like `Class.getClassLoader()`
-    // (bootstrap → null, app classpath → the singleton AppClassLoader).
+    // (bootstrap в†’ null, app classpath в†’ the singleton AppClassLoader).
     let classloader = native_class_get_class_loader(ctx, args)
         .ok()
         .flatten()
@@ -14281,7 +14316,7 @@ pub(crate) fn native_class_get_signers(
 
     let arr = ctx.new_array(cratonvm_types::ArrayElementType::Reference, certs.len());
     for (i, cert) in certs.iter().enumerate() {
-        // Fresh byte[] copy — never leak the internal `CodeSource.certificates`
+        // Fresh byte[] copy вЂ” never leak the internal `CodeSource.certificates`
         // Vec<Vec<u8>> pointer to the caller.
         let cert_arr = ctx.new_array(cratonvm_types::ArrayElementType::Byte, cert.len());
         for (j, &b) in cert.iter().enumerate() {
@@ -14323,7 +14358,7 @@ pub(crate) fn native_class_set_signers(
         target: "cratonvm_native_builtins::lang_class",
         class = %class_name,
         signer_count = signer_count,
-        "Class.setSigners called — documented no-op (signers not mutable post-define)"
+        "Class.setSigners called вЂ” documented no-op (signers not mutable post-define)"
     );
     Ok(None)
 }
@@ -14548,7 +14583,7 @@ mod tests {
     #[test]
     fn non_jdk_caller_never_trusted() {
         // Even a Bootstrap-loaded class with a non-JDK name is not trusted
-        // (defensive — should not normally occur).
+        // (defensive вЂ” should not normally occur).
         assert!(!caller_is_jdk_internal(
             Some("com/acme/App"),
             LOADER_ID_BOOTSTRAP
@@ -14678,8 +14713,8 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // C14: Class.getEnumConstants{,Shared} — must read `$VALUES`, not
-    // return a stub empty array (which broke `EnumMap.<init>` →
+    // C14: Class.getEnumConstants{,Shared} вЂ” must read `$VALUES`, not
+    // return a stub empty array (which broke `EnumMap.<init>` в†’
     // `StreamOpFlag.<clinit>`).
     // -----------------------------------------------------------------------
 
@@ -14695,7 +14730,7 @@ mod tests {
 
     #[test]
     fn class_get_enum_constants_returns_populated_timeunit_array() {
-        // Simulates `Class.getEnumConstantsShared(TimeUnit.class)` —
+        // Simulates `Class.getEnumConstantsShared(TimeUnit.class)` вЂ”
         // asserts that the native sees ACC_ENUM set, reads `$VALUES`,
         // and returns a fresh Object[] with 7 non-null elements.
         use cratonvm_types::ArrayElementType;
@@ -14707,7 +14742,7 @@ mod tests {
         unsafe {
             (*ctx.class_flags_override.get()).insert(cid.as_u32(), 0x4000);
         }
-        // Populate a synthetic `$VALUES` array with 7 non-null entries —
+        // Populate a synthetic `$VALUES` array with 7 non-null entries вЂ”
         // one per TimeUnit constant (NANOSECONDS .. DAYS).
         let values_arr = ctx.new_array(ArrayElementType::Reference, 7);
         for i in 0..7 {
@@ -14916,7 +14951,7 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // T13 — getDeclaringClass0
+    // T13 вЂ” getDeclaringClass0
     // -----------------------------------------------------------------------
 
     #[test]
@@ -14925,7 +14960,7 @@ mod tests {
         let cid = ctx.ensure_class_initialized("com/example/Foo").unwrap();
         let mirror = make_class_mirror(&mut ctx, cid.as_u32(), "com/example/Foo");
         let r = native_class_get_declaring_class(&mut ctx, &[Value::Object(Some(mirror))]);
-        // Default mock returns None for declaring_class → null
+        // Default mock returns None for declaring_class в†’ null
         assert_eq!(r.unwrap(), Some(Value::Object(None)));
     }
 
@@ -14937,7 +14972,7 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // T13 — getSimpleBinaryName0
+    // T13 вЂ” getSimpleBinaryName0
     // -----------------------------------------------------------------------
 
     #[test]
@@ -14946,7 +14981,7 @@ mod tests {
         let cid = ctx.ensure_class_initialized("com/example/Foo").unwrap();
         let mirror = make_class_mirror(&mut ctx, cid.as_u32(), "com/example/Foo");
         let r = native_class_get_simple_binary_name(&mut ctx, &[Value::Object(Some(mirror))]);
-        // No inner_classes data → null
+        // No inner_classes data в†’ null
         assert_eq!(r.unwrap(), Some(Value::Object(None)));
     }
 
@@ -14958,7 +14993,7 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // T13 — getEnclosingMethod0
+    // T13 вЂ” getEnclosingMethod0
     // -----------------------------------------------------------------------
 
     #[test]
@@ -14967,7 +15002,7 @@ mod tests {
         let cid = ctx.ensure_class_initialized("com/example/Foo").unwrap();
         let mirror = make_class_mirror(&mut ctx, cid.as_u32(), "com/example/Foo");
         let r = native_class_get_enclosing_method(&mut ctx, &[Value::Object(Some(mirror))]);
-        // Default mock returns None for enclosing_method → null
+        // Default mock returns None for enclosing_method в†’ null
         assert_eq!(r.unwrap(), Some(Value::Object(None)));
     }
 
@@ -14979,7 +15014,7 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // T13 — getGenericSignature0
+    // T13 вЂ” getGenericSignature0
     // -----------------------------------------------------------------------
 
     #[test]
@@ -14988,7 +15023,7 @@ mod tests {
         let cid = ctx.ensure_class_initialized("com/example/Foo").unwrap();
         let mirror = make_class_mirror(&mut ctx, cid.as_u32(), "com/example/Foo");
         let r = native_class_get_generic_signature(&mut ctx, &[Value::Object(Some(mirror))]);
-        // Default mock returns None for class_signature → null
+        // Default mock returns None for class_signature в†’ null
         assert_eq!(r.unwrap(), Some(Value::Object(None)));
     }
 
@@ -15000,7 +15035,7 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // T13 — getRawAnnotations
+    // T13 вЂ” getRawAnnotations
     // -----------------------------------------------------------------------
 
     #[test]
@@ -15009,7 +15044,7 @@ mod tests {
         let cid = ctx.ensure_class_initialized("com/example/Foo").unwrap();
         let mirror = make_class_mirror(&mut ctx, cid.as_u32(), "com/example/Foo");
         let r = native_class_get_raw_annotations(&mut ctx, &[Value::Object(Some(mirror))]);
-        // Default mock returns empty Vec → null (matches OpenJDK; empty byte[] would
+        // Default mock returns empty Vec в†’ null (matches OpenJDK; empty byte[] would
         // crash AnnotationParser.parseAnnotations with BufferUnderflowException).
         match r.unwrap() {
             Some(Value::Object(None)) => (),
@@ -15025,7 +15060,7 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // T13 — getRawTypeAnnotations
+    // T13 вЂ” getRawTypeAnnotations
     // -----------------------------------------------------------------------
 
     #[test]
@@ -15042,7 +15077,7 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // T13 — getConstantPool
+    // T13 вЂ” getConstantPool
     // -----------------------------------------------------------------------
 
     #[test]
@@ -15069,7 +15104,7 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // T13 — getDeclaredClasses0
+    // T13 вЂ” getDeclaredClasses0
     // -----------------------------------------------------------------------
 
     #[test]
@@ -15082,12 +15117,12 @@ mod tests {
             Some(Value::Object(Some(a))) => a,
             other => panic!("expected array, got {other:?}"),
         };
-        // No inner_classes data → empty array
+        // No inner_classes data в†’ empty array
         assert_eq!(ctx.array_length(arr), 0);
     }
 
     // -----------------------------------------------------------------------
-    // T13 — getNestHost0
+    // T13 вЂ” getNestHost0
     // -----------------------------------------------------------------------
 
     #[test]
@@ -15096,7 +15131,7 @@ mod tests {
         let cid = ctx.ensure_class_initialized("com/example/Foo").unwrap();
         let mirror = make_class_mirror(&mut ctx, cid.as_u32(), "com/example/Foo");
         let r = native_class_get_nest_host(&mut ctx, &[Value::Object(Some(mirror))]);
-        // No nest host attribute → returns self
+        // No nest host attribute в†’ returns self
         let result = match r.unwrap() {
             Some(Value::Object(Some(o))) => o,
             other => panic!("expected Object, got {other:?}"),
@@ -15105,7 +15140,7 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // T13 — getNestMembers0
+    // T13 вЂ” getNestMembers0
     // -----------------------------------------------------------------------
 
     #[test]
@@ -15118,14 +15153,14 @@ mod tests {
             Some(Value::Object(Some(a))) => a,
             other => panic!("expected array, got {other:?}"),
         };
-        // Not a nest host → returns [self]
+        // Not a nest host в†’ returns [self]
         assert_eq!(ctx.array_length(arr), 1);
         let first = ctx.get_array_element(arr, 0);
         assert_eq!(first, Value::Object(Some(mirror)));
     }
 
     // -----------------------------------------------------------------------
-    // T13 — getPermittedSubclasses0
+    // T13 вЂ” getPermittedSubclasses0
     // -----------------------------------------------------------------------
 
     #[test]
@@ -15134,12 +15169,12 @@ mod tests {
         let cid = ctx.ensure_class_initialized("com/example/Foo").unwrap();
         let mirror = make_class_mirror(&mut ctx, cid.as_u32(), "com/example/Foo");
         let r = native_class_get_permitted_subclasses(&mut ctx, &[Value::Object(Some(mirror))]);
-        // Not sealed → null
+        // Not sealed в†’ null
         assert_eq!(r.unwrap(), Some(Value::Object(None)));
     }
 
     // -----------------------------------------------------------------------
-    // T13 — getClassFileVersion0
+    // T13 вЂ” getClassFileVersion0
     // -----------------------------------------------------------------------
 
     #[test]
@@ -15160,7 +15195,7 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // Phase C hardening — wrapper matching, widening, strict coercion
+    // Phase C hardening вЂ” wrapper matching, widening, strict coercion
     // -----------------------------------------------------------------------
 
     #[test]
@@ -15184,7 +15219,7 @@ mod tests {
 
     #[test]
     fn widening_allowed_spec_table() {
-        // JLS §5.1.2 widening conversions
+        // JLS В§5.1.2 widening conversions
         assert!(widening_allowed("B", "S"));
         assert!(widening_allowed("B", "I"));
         assert!(widening_allowed("B", "J"));
@@ -15214,7 +15249,7 @@ mod tests {
         // boolean does not widen to anything else.
         assert!(!widening_allowed("Z", "I"));
         assert!(!widening_allowed("I", "Z"));
-        // short does not widen to char per JLS §5.1.2 (explicit cast only).
+        // short does not widen to char per JLS В§5.1.2 (explicit cast only).
         assert!(!widening_allowed("S", "C"));
         assert!(!widening_allowed("C", "S"));
     }
@@ -15252,12 +15287,12 @@ mod tests {
         let mut ctx = mock_ctx();
         let v = coerce_arg_strict(&ctx, Value::Int(7), "I", "test").unwrap();
         assert_eq!(v, Value::Int(7));
-        // int → long widening is allowed implicitly.
+        // int в†’ long widening is allowed implicitly.
         let v = coerce_arg_strict(&ctx, Value::Int(7), "J", "test").unwrap();
         assert_eq!(v, Value::Long(7));
-        // long → int is narrowing and must fail.
+        // long в†’ int is narrowing and must fail.
         let r = coerce_arg_strict(&ctx, Value::Long(7), "I", "test");
-        assert!(r.is_err(), "narrowing long → int should be rejected");
+        assert!(r.is_err(), "narrowing long в†’ int should be rejected");
         drop(ctx);
     }
 
@@ -15301,7 +15336,7 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // Phase C — typed Field setters narrow via storage-size mask
+    // Phase C вЂ” typed Field setters narrow via storage-size mask
     // -----------------------------------------------------------------------
 
     /// Helper: allocate a Field mirror object that references a storage
@@ -15350,7 +15385,7 @@ mod tests {
         let mut ctx = mock_ctx();
         let field = make_field_mirror(&mut ctx, "b", "B", ACC_PUBLIC, 0);
         let target = ctx.alloc_object(ClassId::new(1), 1);
-        // Write 0x1_FF (511) — must narrow to signed byte value = -1.
+        // Write 0x1_FF (511) вЂ” must narrow to signed byte value = -1.
         let r = native_field_set_byte(
             &mut ctx,
             &[
@@ -15404,7 +15439,7 @@ mod tests {
         let mut ctx = mock_ctx();
         let field = make_field_mirror(&mut ctx, "b", "B", ACC_PUBLIC, 0);
         let target = ctx.alloc_object(ClassId::new(1), 1);
-        // Stored as int 0xFF (255) — getByte must reinterpret as -1.
+        // Stored as int 0xFF (255) вЂ” getByte must reinterpret as -1.
         ctx.set_field(target, 0, Value::Int(0xFF));
         let r = native_field_get_byte(
             &mut ctx,
@@ -15467,7 +15502,7 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // C5 — Field.getDeclaringClass must return the *declared* class mirror
+    // C5 вЂ” Field.getDeclaringClass must return the *declared* class mirror
     //
     // Regression test for the FieldLookup reproducer:
     //   java.lang.reflect.Field f = String.class.getDeclaredField("serialVersionUID");
@@ -15485,7 +15520,7 @@ mod tests {
             .expect("mock ensure_class_initialized must succeed");
 
         // Build a FieldMetadata for a static final long field. Access
-        // flags = 0x1A → ACC_PRIVATE | ACC_STATIC | ACC_FINAL (0x2|0x8|0x10).
+        // flags = 0x1A в†’ ACC_PRIVATE | ACC_STATIC | ACC_FINAL (0x2|0x8|0x10).
         let meta = FieldMetadata {
             name: "serialVersionUID".to_string(),
             descriptor: "J".to_string(),
@@ -15497,7 +15532,7 @@ mod tests {
 
         let field_obj = create_field_object(&mut ctx, &meta);
 
-        // getDeclaringClass → should return the String class mirror whose
+        // getDeclaringClass в†’ should return the String class mirror whose
         // name is "java/lang/String", NOT "java/lang/Object".
         let r =
             native_field_get_declaring_class(&mut ctx, &[Value::Object(Some(field_obj))]).unwrap();
@@ -15511,7 +15546,7 @@ mod tests {
             "C5: Field.getDeclaringClass must resolve to the declared class"
         );
 
-        // getModifiers → must read our access flags (verifies we don't
+        // getModifiers в†’ must read our access flags (verifies we don't
         // land on the wrong JDK Field slot, which would previously return
         // slot_index or 0).
         let mods = native_field_get_modifiers(&mut ctx, &[Value::Object(Some(field_obj))]).unwrap();
@@ -15521,7 +15556,7 @@ mod tests {
             "C5: Field.getModifiers must return the original access flags"
         );
 
-        // getName → "serialVersionUID".
+        // getName в†’ "serialVersionUID".
         let n = native_field_get_name(&mut ctx, &[Value::Object(Some(field_obj))]).unwrap();
         let name_obj = match n {
             Some(Value::Object(Some(o))) => o,
@@ -15541,7 +15576,7 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // C6 — Method.getDeclaringClass must return the declared class mirror.
+    // C6 вЂ” Method.getDeclaringClass must return the declared class mirror.
     //
     // Regression test for the MRTest reproducer:
     //   Method m = String.class.getDeclaredMethod("length");
@@ -15572,7 +15607,7 @@ mod tests {
 
         let method_obj = create_method_object(&mut ctx, &meta);
 
-        // getDeclaringClass → returns the String class mirror (name
+        // getDeclaringClass в†’ returns the String class mirror (name
         // "java/lang/String"), NOT java/lang/Object.
         let r = native_method_get_declaring_class(&mut ctx, &[Value::Object(Some(method_obj))])
             .unwrap();
@@ -15586,7 +15621,7 @@ mod tests {
             "C6: Method.getDeclaringClass must resolve to the declared class"
         );
 
-        // getModifiers → ACC_PUBLIC.
+        // getModifiers в†’ ACC_PUBLIC.
         let mods =
             native_method_get_modifiers(&mut ctx, &[Value::Object(Some(method_obj))]).unwrap();
         assert_eq!(
@@ -15595,7 +15630,7 @@ mod tests {
             "C6: Method.getModifiers must return the original access flags"
         );
 
-        // getName → "length".
+        // getName в†’ "length".
         let n = native_method_get_name(&mut ctx, &[Value::Object(Some(method_obj))]).unwrap();
         let name_obj = match n {
             Some(Value::Object(Some(o))) => o,
@@ -15617,7 +15652,7 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // T19.N1: Class security natives — getProtectionDomain0 / getSigners /
+    // T19.N1: Class security natives вЂ” getProtectionDomain0 / getSigners /
     // setSigners.  These exercise the CodeSource-driven code paths introduced
     // in Session 86 plus the synthetic ProtectionDomain allocation added
     // alongside the natives.
@@ -15626,7 +15661,7 @@ mod tests {
     #[test]
     fn t19_n1_class_get_protection_domain0_bootstrap_returns_null() {
         // Bootstrap / jimage classes have no CodeSource URL; the mock's
-        // default `class_code_base` returns None → getProtectionDomain0
+        // default `class_code_base` returns None в†’ getProtectionDomain0
         // must surface null (matches HotSpot for boot classes).
         let mut ctx = mock_ctx();
         let cid = ctx.ensure_class_initialized("java/lang/Object").unwrap();
@@ -15690,7 +15725,7 @@ mod tests {
 
     #[test]
     fn t19_n1_class_get_signers_unsigned_returns_null() {
-        // No cert override → unsigned class → getSigners returns null.
+        // No cert override в†’ unsigned class в†’ getSigners returns null.
         let mut ctx = mock_ctx();
         let cid = ctx
             .ensure_class_initialized("com/example/Unsigned")
@@ -15706,7 +15741,7 @@ mod tests {
 
     #[test]
     fn t19_n1_class_get_signers_with_certs_returns_byte_arrays() {
-        // Seed a class with two signer blocks — getSigners must return an
+        // Seed a class with two signer blocks вЂ” getSigners must return an
         // Object[2] whose elements are byte[] copies of the raw cert bytes.
         let mut ctx = mock_ctx();
         let cid = ctx.ensure_class_initialized("com/example/Signed").unwrap();
@@ -15778,7 +15813,7 @@ mod tests {
         .unwrap();
         assert_eq!(r, None, "setSigners returns void (None)");
         // After the documented-noop setSigners, getSigners still reflects
-        // the (absent) override → null.
+        // the (absent) override в†’ null.
         let g = native_class_get_signers(&mut ctx, &[Value::Object(Some(mirror))]).unwrap();
         assert_eq!(
             g,
@@ -15792,8 +15827,8 @@ mod tests {
     //
     // These tests cover the Keycloak `org.keycloak.common.Version.<clinit>`
     // codepath:
-    //   `Class.getResourceAsStream("/keycloak-version.properties")` →
-    //   bytes → `Properties.load(InputStream)`. The pre-T19.H10 stub
+    //   `Class.getResourceAsStream("/keycloak-version.properties")` в†’
+    //   bytes в†’ `Properties.load(InputStream)`. The pre-T19.H10 stub
     //   returned a stream that LineReader could read, but the resource
     //   validation gates and `Class.getPackage()` were missing, causing
     //   downstream NPEs in libraries that probe `getImplementationVersion()`.
@@ -15812,9 +15847,9 @@ mod tests {
     }
 
     /// Writes a real jar (unique per `label`) whose `META-INF/MANIFEST.MF`
-    /// sets all six `Specification-*`/`Implementation-*` attributes —
+    /// sets all six `Specification-*`/`Implementation-*` attributes вЂ”
     /// mirroring the JBoss-vendored jars (`Specification-Vendor: JBoss by
-    /// Red Hat`) that tripped the Package-field-corruption bug — and
+    /// Red Hat`) that tripped the Package-field-corruption bug вЂ” and
     /// returns the jar's path. Used by the regression tests below.
     fn t19_h10_write_vendored_test_jar(label: &str) -> std::path::PathBuf {
         use std::io::Write as _;
@@ -15883,7 +15918,7 @@ mod tests {
 
     #[test]
     fn t19_h10_validate_resource_name_allows_traversal_rejects_backslash() {
-        // `..` segments are accepted here — HotSpot tolerates them for
+        // `..` segments are accepted here вЂ” HotSpot tolerates them for
         // directory-classpath-root lookups, and the real containment check
         // lives downstream in `find_resource`/`find_all_resource_urls`
         // (canonicalize + `starts_with` the classpath root), same as an
@@ -15900,7 +15935,7 @@ mod tests {
             t19_h10_validate_resource_name("foo\\bar").is_none(),
             "backslash must be rejected (Windows-path-injection)"
         );
-        // `..` substring inside a filename is fine — only the segment is.
+        // `..` substring inside a filename is fine вЂ” only the segment is.
         assert!(
             t19_h10_validate_resource_name("foo..bar.txt").is_some(),
             "`..` substring inside filename must be accepted"
@@ -15996,14 +16031,14 @@ mod tests {
         // Real path-traversal containment is enforced one layer down, in
         // `ClassPath::find_resource` (`classloading/src/class_path.rs`),
         // which canonicalizes the resolved path and requires it stay
-        // `starts_with` the classpath root — covered directly by that
+        // `starts_with` the classpath root вЂ” covered directly by that
         // crate's own `find_resource_path_traversal_rejected` /
         // `find_resource_rejects_dotdot_traversal` tests against a REAL
         // classpath. `MockNativeContext::find_resource` here is a naive
         // exact-key lookup with no such containment check (it has no
         // classpath root to canonicalize against), so this test can only
         // pin the contract at this layer: a `..`-bearing name is NOT
-        // rejected before reaching `find_resource` — it is looked up
+        // rejected before reaching `find_resource` вЂ” it is looked up
         // as-is, and whatever `find_resource` decides is authoritative.
         let mut ctx = mock_ctx();
         ctx.set_resource("../../../etc/passwd", b"oops".to_vec());
@@ -16021,7 +16056,7 @@ mod tests {
         assert!(
             matches!(r, Some(Value::Object(Some(_)))),
             "a `..`-bearing name must reach find_resource unmodified rather than \
-             being rejected at the validation layer — real containment is \
+             being rejected at the validation layer вЂ” real containment is \
              ClassPath::find_resource's job, not this native's"
         );
     }
@@ -16030,7 +16065,7 @@ mod tests {
     fn t19_h10_get_resource_as_stream_relative_uses_package_prefix() {
         let mut ctx = mock_ctx();
         // For `Foo.class.getResourceAsStream("bar.txt")` the resolved path
-        // is the package path joined with `bar.txt` — i.e. the same as
+        // is the package path joined with `bar.txt` вЂ” i.e. the same as
         // `Foo.class.getResourceAsStream("/org/keycloak/common/bar.txt")`.
         ctx.set_resource("org/keycloak/common/bar.txt", b"hello".to_vec());
         let cid = ctx
@@ -16071,7 +16106,7 @@ mod tests {
             Some(Value::Object(Some(o))) => o,
             other => panic!("expected non-null URL, got {other:?}"),
         };
-        // The URL synthetic stores file at field by-name `file` — but the
+        // The URL synthetic stores file at field by-name `file` вЂ” but the
         // mock context's set_field_by_name routes back to slot lookups
         // that the mock doesn't model.  Instead verify the URL is non-null
         // (pre-T19.H10 returned null even when the resource was present).
@@ -16151,10 +16186,10 @@ mod tests {
         // manifest-attribute writes must land ONLY on their named fields,
         // never on raw slots 1-6. Real JDK 9+ `java.lang.Package` has no
         // flat `specTitle`/`specVersion`/`specVendor`/`implTitle`/
-        // `implVersion`/`implVendor` fields at those slots — they are
+        // `implVersion`/`implVendor` fields at those slots вЂ” they are
         // `module` (1), `versionInfo` (2, itself bundling the manifest
         // strings), and `packageInfo` (3, a `Class<?>`). A stray by-index
-        // write there — e.g. writing `specVendor` to slot 3 — clobbers
+        // write there вЂ” e.g. writing `specVendor` to slot 3 вЂ” clobbers
         // `packageInfo` with a raw `String`, and real `getAnnotation()`/
         // `isAnnotationPresent()` bytecode then dispatches on that String
         // receiver instead of a `Class`, throwing `NoSuchMethodError`.
@@ -16194,7 +16229,7 @@ mod tests {
             assert_eq!(
                 ctx.get_field(pkg, slot),
                 Value::Int(0),
-                "slot {slot} must be untouched by manifest-attribute writes — a raw-index \
+                "slot {slot} must be untouched by manifest-attribute writes вЂ” a raw-index \
                  write there corrupts real Package fields (module/versionInfo/packageInfo)"
             );
         }
@@ -16203,7 +16238,7 @@ mod tests {
     #[test]
     fn i2_define_package_class_manifest_writes_do_not_corrupt_module_or_package_info() {
         // Same regression as above, for the sibling `ClassLoader
-        // .definePackage(Class)` Package builder — it had an identical
+        // .definePackage(Class)` Package builder вЂ” it had an identical
         // by-index write bug.
         let jar_path = t19_h10_write_vendored_test_jar("define_package");
         let mut ctx = mock_ctx();
@@ -16237,7 +16272,7 @@ mod tests {
             assert_eq!(
                 ctx.get_field(pkg, slot),
                 Value::Int(0),
-                "slot {slot} must be untouched by manifest-attribute writes — a raw-index \
+                "slot {slot} must be untouched by manifest-attribute writes вЂ” a raw-index \
                  write there corrupts real Package fields (module/versionInfo/packageInfo)"
             );
         }
@@ -16277,7 +16312,7 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // F2 — `Class.getDeclaredMethod` reflection visibility for
+    // F2 вЂ” `Class.getDeclaredMethod` reflection visibility for
     // `ClassLoader.defineClass` overloads (WP2.3 follow-up).
     //
     // CGLIB's `ReflectUtils.<clinit>` does:
@@ -16288,8 +16323,8 @@ mod tests {
     //
     // Before this fix, `java/lang/ClassLoader` was loaded as a synthetic
     // stub (no `.class` file shipped in synthetic-jdk mode), so its
-    // `class.methods` was empty → `declared_methods` returned an empty
-    // list → `getDeclaredMethod` threw `NoSuchMethodException`.  The fix
+    // `class.methods` was empty в†’ `declared_methods` returned an empty
+    // list в†’ `getDeclaredMethod` threw `NoSuchMethodException`.  The fix
     // augments `declared_methods` for known synthetic-stub JDK classes
     // with their canonical method declarations, surfacing the JDK
     // contract through reflection without requiring real bytecode.
@@ -16460,33 +16495,33 @@ mod tests {
             define_class_descs
                 .iter()
                 .any(|d| d == "([BII)Ljava/lang/Class;"),
-            "F2: legacy 3-arg defineClass([B,I,I) overload missing — got {:?}",
+            "F2: legacy 3-arg defineClass([B,I,I) overload missing вЂ” got {:?}",
             define_class_descs,
         );
         assert!(
             define_class_descs
                 .iter()
                 .any(|d| d == "(Ljava/lang/String;[BII)Ljava/lang/Class;"),
-            "F2: 4-arg defineClass(String,[B,I,I) overload missing — got {:?}",
+            "F2: 4-arg defineClass(String,[B,I,I) overload missing вЂ” got {:?}",
             define_class_descs,
         );
         assert!(
             define_class_descs.iter().any(|d| d
                 == "(Ljava/lang/String;[BIILjava/security/ProtectionDomain;)Ljava/lang/Class;"),
-            "F2: 5-arg defineClass(...,ProtectionDomain) overload missing — got {:?}",
+            "F2: 5-arg defineClass(...,ProtectionDomain) overload missing вЂ” got {:?}",
             define_class_descs,
         );
         assert!(
             define_class_descs.iter().any(|d| d
                 == "(Ljava/lang/String;Ljava/nio/ByteBuffer;Ljava/security/ProtectionDomain;)Ljava/lang/Class;"),
-            "F2: 3-arg ByteBuffer defineClass overload missing — got {:?}",
+            "F2: 3-arg ByteBuffer defineClass overload missing вЂ” got {:?}",
             define_class_descs,
         );
     }
 
     #[test]
     fn f2_synthetic_decls_do_not_clobber_real_class_methods() {
-        // Real bytecode declarations take precedence — the augmentation
+        // Real bytecode declarations take precedence вЂ” the augmentation
         // must skip a method already present in `declared_methods`.
         let mut ctx = mock_ctx();
         let cl_cid = ctx
@@ -16494,7 +16529,7 @@ mod tests {
             .expect("mock ensure_class_initialized must succeed");
 
         // Inject a "real" methods record for ClassLoader containing only the
-        // 5-arg defineClass — but with different access flags (e.g. ACC_PUBLIC
+        // 5-arg defineClass вЂ” but with different access flags (e.g. ACC_PUBLIC
         // = 0x1 instead of synthetic's protected/final = 0x14). The merged
         // result must keep the real flags, not duplicate.
         let real_meta = MethodMetadata {
@@ -16528,7 +16563,7 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // G2 — `Class.getDeclaredMethods0` returning null array (ByteBuddy +
+    // G2 вЂ” `Class.getDeclaredMethods0` returning null array (ByteBuddy +
     // Mockito blocker after WP2.3+F3 landed).
     //
     // After F3 cleared the verifier false positive, ByteBuddy advanced
@@ -16539,11 +16574,11 @@ mod tests {
     // `annotations`). G2 ensures:
     //   * `getDeclaredMethods0` for `java/lang/reflect/Method` returns a
     //     non-null, non-empty array (synthetic decls for canonical
-    //     `getName`, `invoke`, …).
+    //     `getName`, `invoke`, вЂ¦).
     //   * Every Method object created via `create_method_object` has all
     //     its array-typed fields initialised to non-null empty arrays
     //     (matching the real-JDK constructor invariant).
-    //   * The same applies to `Field`, `Constructor`, and `Executable` —
+    //   * The same applies to `Field`, `Constructor`, and `Executable` вЂ”
     //     so frameworks like Mockito that reflect on these classes
     //     don't NPE either.
     // -----------------------------------------------------------------------
@@ -16619,7 +16654,7 @@ mod tests {
         //   Method[] methods = Method.class.getDeclaredMethods();
         //   for (Method m : methods) { ... }
         //
-        // The native MUST return a non-null array — even an empty one
+        // The native MUST return a non-null array вЂ” even an empty one
         // is acceptable, but null is not.
         let mut ctx = mock_ctx();
         let cid = ctx
@@ -16637,7 +16672,7 @@ mod tests {
         let len = ctx.array_length(arr);
         assert!(
             len > 0,
-            "G2: Method.class.getDeclaredMethods() must surface ≥1 method (canonical synthetic decls)",
+            "G2: Method.class.getDeclaredMethods() must surface в‰Ґ1 method (canonical synthetic decls)",
         );
     }
 
@@ -16717,7 +16752,7 @@ mod tests {
         // The real JDK Method constructor initializes `exceptionTypes`
         // to a non-null array; we mirror that invariant. ByteBuddy and
         // similar frameworks sometimes call `Method.getExceptionTypes()`
-        // which does `exceptionTypes.clone()` — that NPEs on null.
+        // which does `exceptionTypes.clone()` вЂ” that NPEs on null.
         let mut ctx = mock_ctx();
         let declaring_cid = ctx
             .ensure_class_initialized("java/lang/Object")
@@ -16780,12 +16815,12 @@ mod tests {
         // HIB-CV-36: `Class.getDeclaredMethod(name, (Class[])null)` is the
         // form `java.io.ObjectStreamClass.getInheritableMethod` uses to
         // resolve the serialization `writeReplace` hook. Per JDK semantics
-        // a null parameterTypes array is equivalent to an EMPTY one — it
+        // a null parameterTypes array is equivalent to an EMPTY one вЂ” it
         // must match ONLY a no-arg method, never a same-named overload that
         // takes parameters. Previously the native skipped the arity check
         // when the array was null and returned the FIRST same-named method,
         // so a no-arg `getDeclaredMethod("writeReplace")` matched a 1-arg
-        // `writeReplace(Object)` → later invoked with 0 args → IAE.
+        // `writeReplace(Object)` в†’ later invoked with 0 args в†’ IAE.
         let mut ctx = mock_ctx();
         let cid = ctx
             .ensure_class_initialized("com/example/WriteReplaceOnly")
@@ -16805,7 +16840,7 @@ mod tests {
         let name = ctx.create_string("writeReplace");
 
         // Null argTypes (args[2] absent / None) must NOT match the 1-arg
-        // overload — it must throw NoSuchMethodException.
+        // overload вЂ” it must throw NoSuchMethodException.
         let r = native_class_get_declared_method(
             &mut ctx,
             &[
@@ -16856,7 +16891,7 @@ mod tests {
             match ctx.get_field_by_name(m, field) {
                 Value::Object(None) => {}
                 other => panic!(
-                    "Method.{field} MUST be null (was {other:?}) — a non-null \
+                    "Method.{field} MUST be null (was {other:?}) вЂ” a non-null \
                      empty byte[] underflows AnnotationParser",
                 ),
             }
@@ -16887,7 +16922,7 @@ mod tests {
         let r = native_class_get_superclass(&mut ctx, &[Value::Object(Some(mirror))])
             .expect("native_class_get_superclass must succeed for interface");
         match r {
-            Some(Value::Object(None)) => {} // null — correct
+            Some(Value::Object(None)) => {} // null вЂ” correct
             other => {
                 panic!("G2: getSuperclass() on an interface MUST return null (was {other:?})",)
             }
@@ -16905,13 +16940,13 @@ mod tests {
             .ensure_class_initialized("com/example/Foo")
             .expect("ensure Foo");
         ctx.set_superclass(cls_cid, object_cid);
-        // is_interface defaults to false — no override needed.
+        // is_interface defaults to false вЂ” no override needed.
 
         let mirror = ctx.get_class_mirror(cls_cid);
         let r = native_class_get_superclass(&mut ctx, &[Value::Object(Some(mirror))])
             .expect("native_class_get_superclass on class");
         match r {
-            Some(Value::Object(Some(_super_mirror))) => {} // non-null — correct
+            Some(Value::Object(Some(_super_mirror))) => {} // non-null вЂ” correct
             other => panic!(
                 "G2: getSuperclass() on a regular class MUST return its parent (was {other:?})",
             ),
@@ -16933,7 +16968,7 @@ mod tests {
         )
         .expect("i2_classloader_get_defined_package must succeed");
         match r {
-            Some(Value::Object(None)) => {} // null — correct
+            Some(Value::Object(None)) => {} // null вЂ” correct
             other => panic!("I2: getDefinedPackage MUST return null (was {other:?})",),
         }
     }
@@ -16988,7 +17023,7 @@ mod tests {
         .expect("i2_classloader_check_certs must succeed");
         assert!(
             r.is_none(),
-            "I2: checkCerts MUST return None (void) — got {r:?}",
+            "I2: checkCerts MUST return None (void) вЂ” got {r:?}",
         );
     }
 
@@ -16996,7 +17031,7 @@ mod tests {
     fn g2_collect_public_methods_skips_object_methods_for_interface() {
         // Test that collect_public_methods (backing Class.getMethods())
         // does NOT walk Object's public methods when the entry class is
-        // an interface. Real JDK semantics — see
+        // an interface. Real JDK semantics вЂ” see
         // `Class.privateGetPublicMethods()` source for the
         // `isInterface() ? null : getSuperclass()` pattern.
         let mut ctx = mock_ctx();
@@ -17039,7 +17074,7 @@ mod tests {
         ctx.set_is_interface(iface_cid, true);
 
         let methods = collect_public_methods(&mut ctx, iface_cid);
-        // Only `doIt` from the interface — Object methods are skipped.
+        // Only `doIt` from the interface вЂ” Object methods are skipped.
         assert_eq!(
             methods.len(),
             1,
@@ -17050,7 +17085,7 @@ mod tests {
 
     #[test]
     fn g2_synthetic_decls_for_method_class_does_not_clobber_real_class_methods() {
-        // Real-class methods take precedence — same invariant as F2's
+        // Real-class methods take precedence вЂ” same invariant as F2's
         // ClassLoader test, applied to Method.
         let mut ctx = mock_ctx();
         let m_cid = ctx
@@ -17087,7 +17122,7 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // T19_H12_ — Class.forName(Module, String) native
+    // T19_H12_ вЂ” Class.forName(Module, String) native
     // -----------------------------------------------------------------------
 
     #[test]
@@ -17147,7 +17182,7 @@ mod tests {
     #[test]
     fn t19_h12_class_for_name_module_miss_does_not_throw_cnfe() {
         // Per JDK 25 spec, `Class.forName(Module, String)` returns null on
-        // miss and does NOT throw ClassNotFoundException — distinguishing
+        // miss and does NOT throw ClassNotFoundException вЂ” distinguishing
         // it from `Class.forName(String)`. The mock's
         // `ensure_class_initialized` auto-creates classes, so we can't
         // hit a real miss here; instead we verify that the API contract
@@ -17162,7 +17197,7 @@ mod tests {
                 Value::Object(Some(name_str)),
             ],
         );
-        // Must NOT be an Err — never CNFE for this overload.
+        // Must NOT be an Err вЂ” never CNFE for this overload.
         assert!(
             r.is_ok(),
             "Class.forName(Module, String) must not throw CNFE: {:?}",
@@ -17238,21 +17273,21 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // WP2.1-field — final-write check + volatile-aware fence helpers.
+    // WP2.1-field вЂ” final-write check + volatile-aware fence helpers.
     // -----------------------------------------------------------------------
     //
     // These are pure-Rust helpers, so the tests are tiny but they pin the
     // semantics that `Field.set*` enforces:
-    //   * non-static final without setAccessible → IllegalAccessException
-    //   * static final ALWAYS → IllegalAccessException (even with
-    //     setAccessible — the escape hatch is Unsafe / VarHandle)
-    //   * non-final fields → no error, regardless of accessible
+    //   * non-static final without setAccessible в†’ IllegalAccessException
+    //   * static final ALWAYS в†’ IllegalAccessException (even with
+    //     setAccessible вЂ” the escape hatch is Unsafe / VarHandle)
+    //   * non-final fields в†’ no error, regardless of accessible
     //   * volatile fences are emitted only when ACC_VOLATILE is set on
     //     the field's modifiers (avoiding the perf hit on plain reads).
 
     #[test]
     fn wp21_field_check_final_non_final_passes() {
-        // Plain int field, public, no final bit set — should pass.
+        // Plain int field, public, no final bit set вЂ” should pass.
         let modifiers = ACC_PUBLIC; // 0x0001
         assert!(check_final_for_set(modifiers, false, "x").is_ok());
         assert!(check_final_for_set(modifiers, true, "x").is_ok());
@@ -17276,7 +17311,7 @@ mod tests {
 
     #[test]
     fn wp21_field_check_final_instance_final_with_access_passes() {
-        // Mirrors `ff.setAccessible(true); ff.setInt(o, 11);` — must succeed.
+        // Mirrors `ff.setAccessible(true); ff.setInt(o, 11);` вЂ” must succeed.
         let modifiers = ACC_PUBLIC | ACC_FINAL;
         assert!(check_final_for_set(modifiers, true, "Y").is_ok());
     }
@@ -17289,11 +17324,11 @@ mod tests {
             check_final_for_set(modifiers, false, "K").is_err(),
             "static final without setAccessible MUST throw"
         );
-        // WITH setAccessible — must still throw.
+        // WITH setAccessible вЂ” must still throw.
         let r = check_final_for_set(modifiers, true, "K");
         assert!(
             r.is_err(),
-            "static final WITH setAccessible MUST also throw — only Unsafe / VarHandle bypasses",
+            "static final WITH setAccessible MUST also throw вЂ” only Unsafe / VarHandle bypasses",
         );
         let msg = format!("{:?}", r.unwrap_err());
         assert!(
@@ -17315,7 +17350,7 @@ mod tests {
 
     #[test]
     fn wp21_field_volatile_fence_emitted_on_volatile_field() {
-        // Same shape — exercises the path that issues the fence. We can't
+        // Same shape вЂ” exercises the path that issues the fence. We can't
         // observe the memory ordering directly from a single thread, but
         // we can pin that the call doesn't panic and the bit-test is
         // exercised end-to-end. The integration test in
@@ -17349,7 +17384,7 @@ mod tests {
 
     #[test]
     fn for_name_rejects_control_bytes() {
-        // NUL terminator — the classic class-load injection.
+        // NUL terminator вЂ” the classic class-load injection.
         assert!(validate_for_name_dotted("java.lang.String\0extra").is_err());
         // Other C0 control byte (newline) and DEL (0x7F).
         assert!(validate_for_name_dotted("java.lang\n.String").is_err());
@@ -17375,7 +17410,7 @@ mod tests {
     #[test]
     fn for_name_rejection_is_class_not_found() {
         // Rejection must surface as ClassNotFoundException carrying the
-        // (dotted) name — indistinguishable from an ordinary miss.
+        // (dotted) name вЂ” indistinguishable from an ordinary miss.
         match validate_for_name_dotted("java/lang/String") {
             Err(MethodCallFailed::ExceptionThrown(_)) | Err(MethodCallFailed::InternalError(_)) => {
                 // The conversion of RuntimeError::ClassNotFoundException into
@@ -17387,3 +17422,4 @@ mod tests {
         }
     }
 }
+

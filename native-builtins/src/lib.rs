@@ -12360,6 +12360,12 @@ pub fn register_essential_natives(registry: &mut NativeMethodRegistry) {
         "()Ljava/lang/String;",
         lang_string::native_string_intern,
     );
+    registry.register(
+        "java/lang/String",
+        "<init>",
+        "(Ljava/lang/AbstractStringBuilder;Ljava/lang/Void;)V",
+        lang_string::native_string_init_abstract_string_builder,
+    );
     // String.valueOf and Integer.toString overrides: the JDK bytecode path uses
     // Unsafe.putByte for byte-level array access which doesn't map to our
     // slot-based heap model (Unsafe offsets are raw byte offsets in HotSpot).

@@ -855,6 +855,55 @@ pub(crate) fn native_string_intern(
     Ok(Some(Value::Object(Some(interned))))
 }
 
+/// `String(AbstractStringBuilder, Void)` — private/package constructor used by
+/// real-JDK `StringBuilder.toString()`.
+///
+/// CratonVM's StringBuilder/StringBuffer natives keep a synthetic
+/// `char[] + count` layout, while JDK 25 `StringBuilder.toString()` assumes
+/// `AbstractStringBuilder.value` is a compact-string `byte[]`. Byte Buddy can
+/// execute that real bytecode while retransformation is in progress, so bridge
+/// the constructor at the String boundary: read the builder through the
+/// synthetic helper and write this String's real compact fields directly.
+pub(crate) fn native_string_init_abstract_string_builder(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    use cratonvm_types::ArrayElementType;
+
+    let this = match args.first() {
+        Some(Value::Object(Some(obj))) => *obj,
+        _ => return Ok(None),
+    };
+    let chars = match args.get(1) {
+        Some(Value::Object(Some(builder))) => sb_read_chars(ctx, *builder),
+        _ => Vec::new(),
+    };
+    let latin1 = chars.iter().all(|&u| u <= 0xFF);
+    let byte_len = if latin1 { chars.len() } else { chars.len() * 2 };
+
+    let this_pin = ctx.pin_native_root(this);
+    let value = ctx.new_array(ArrayElementType::Byte, byte_len);
+    let this = ctx.read_native_pin(this_pin, this);
+    ctx.unpin_native_roots(this_pin);
+
+    if latin1 {
+        for (i, &u) in chars.iter().enumerate() {
+            ctx.set_array_element(value, i, Value::Int((u & 0xFF) as i32));
+        }
+    } else {
+        for (i, &u) in chars.iter().enumerate() {
+            ctx.set_array_element(value, i * 2, Value::Int((u & 0xFF) as i32));
+            ctx.set_array_element(value, i * 2 + 1, Value::Int(((u >> 8) & 0xFF) as i32));
+        }
+    }
+
+    ctx.set_field(this, 0, Value::Object(Some(value)));
+    ctx.set_field(this, 1, Value::Int(if latin1 { 0 } else { 1 }));
+    ctx.set_field(this, 2, Value::Int(0));
+    ctx.set_field(this, 3, Value::Int(0));
+    Ok(None)
+}
+
 pub(crate) fn native_string_hash_code(
     ctx: &mut dyn NativeContext,
     args: &[Value],
@@ -1362,11 +1411,26 @@ pub(crate) fn sb_state(
         Value::Object(Some(arr)) => Some(arr),
         _ => None,
     };
-    let count = match ctx.get_field(this, 1) {
+    let count = match ctx.get_field(this, 2) {
         Value::Int(v) => v,
-        _ => 0,
+        _ => match ctx.get_field(this, 1) {
+            Value::Int(v) => v,
+            _ => 0,
+        },
     };
     (buf, count)
+}
+
+/// Helper: write the StringBuilder count in the JDK 9+ field slot.
+///
+/// The real JDK layout is `value: byte[]`, `coder: byte`, `count: int`
+/// at slots 0/1/2. CratonVM keeps slot 0 as a synthetic `char[]`, but real
+/// bytecode can still run during Byte Buddy retransformation. Keep slot 1 as
+/// a plausible LATIN1 coder and mirror the count into slot 2 so that direct
+/// JDK `AbstractStringBuilder` bytecode does not read garbage capacity/counts.
+fn sb_set_count(ctx: &mut dyn NativeContext, this: cratonvm_types::ObjectRef, count: i32) {
+    ctx.set_field(this, 1, Value::Int(0));
+    ctx.set_field(this, 2, Value::Int(count));
 }
 
 /// Helper: ensure the StringBuilder has capacity for `additional` more chars.
@@ -1426,7 +1490,7 @@ pub(crate) fn sb_append_chars(
     for (i, &ch) in chars.iter().enumerate() {
         ctx.set_array_element(buf, count + i, Value::Int(ch as i32));
     }
-    ctx.set_field(this, 1, Value::Int((count + chars.len()) as i32));
+    sb_set_count(ctx, this, (count + chars.len()) as i32);
 }
 
 /// Helper: append a Rust string to a StringBuilder.
@@ -1455,7 +1519,7 @@ pub(crate) fn native_sb_init_default(
     let this = ctx.read_native_pin(this_pin, this);
     ctx.unpin_native_roots(this_pin);
     ctx.set_field(this, 0, Value::Object(Some(buf)));
-    ctx.set_field(this, 1, Value::Int(0));
+    sb_set_count(ctx, this, 0);
     Ok(None)
 }
 
@@ -1482,7 +1546,7 @@ pub(crate) fn native_sb_init_string(
         ctx.set_array_element(buf, i, Value::Int(ch as i32));
     }
     ctx.set_field(this, 0, Value::Object(Some(buf)));
-    ctx.set_field(this, 1, Value::Int(chars.len() as i32));
+    sb_set_count(ctx, this, chars.len() as i32);
     Ok(None)
 }
 
@@ -1525,7 +1589,7 @@ pub(crate) fn native_sb_init_charsequence(
         ctx.set_array_element(buf, i, Value::Int(ch as i32));
     }
     ctx.set_field(this, 0, Value::Object(Some(buf)));
-    ctx.set_field(this, 1, Value::Int(chars.len() as i32));
+    sb_set_count(ctx, this, chars.len() as i32);
     Ok(None)
 }
 
@@ -1559,7 +1623,7 @@ pub(crate) fn native_sb_init_capacity(
     let this = ctx.read_native_pin(this_pin, this);
     ctx.unpin_native_roots(this_pin);
     ctx.set_field(this, 0, Value::Object(Some(buf)));
-    ctx.set_field(this, 1, Value::Int(0));
+    sb_set_count(ctx, this, 0);
     Ok(None)
 }
 
@@ -1772,7 +1836,7 @@ pub(crate) fn native_sb_append_char_array_off_len(
     let (_, count) = sb_state(ctx, this);
     let count = count as usize;
     let _ = ctx.bulk_array_copy(arr, start, buf, count, copy_len);
-    ctx.set_field(this, 1, Value::Int((count + copy_len) as i32));
+    sb_set_count(ctx, this, (count + copy_len) as i32);
     Ok(Some(Value::Object(Some(this))))
 }
 
@@ -1796,7 +1860,7 @@ pub(crate) fn native_sb_append_char_array(
     let (_, count) = sb_state(ctx, this);
     let count = count as usize;
     let _ = ctx.bulk_array_copy(arr, 0, buf, count, n);
-    ctx.set_field(this, 1, Value::Int((count + n) as i32));
+    sb_set_count(ctx, this, (count + n) as i32);
     Ok(Some(Value::Object(Some(this))))
 }
 
@@ -2498,7 +2562,7 @@ pub(crate) fn sb_write_chars(
     for (i, &ch) in chars.iter().enumerate() {
         ctx.set_array_element(buf, i, Value::Int(ch as i32));
     }
-    ctx.set_field(this, 1, Value::Int(chars.len() as i32));
+    sb_set_count(ctx, this, chars.len() as i32);
 }
 
 /// insert(int, String) — insert string at offset
@@ -2741,7 +2805,7 @@ pub(crate) fn native_sb_set_length(
         for i in count..new_len {
             ctx.set_array_element(buf, i, Value::Int(0));
         }
-        ctx.set_field(this, 1, Value::Int(new_len as i32));
+        sb_set_count(ctx, this, new_len as i32);
     } else {
         if new_len < count {
             // Just zero the excess (optional for correctness), but must update count
@@ -2751,7 +2815,7 @@ pub(crate) fn native_sb_set_length(
                 }
             }
         }
-        ctx.set_field(this, 1, Value::Int(new_len as i32));
+        sb_set_count(ctx, this, new_len as i32);
     }
     Ok(None)
 }
