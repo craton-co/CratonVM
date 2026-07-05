@@ -445,6 +445,65 @@ fn require_target(args: &[Value], idx: usize) -> Result<ObjectRef, MethodCallFai
     arg_obj_or_npe(args, idx, "target")
 }
 
+fn pinned_object_value(ctx: &mut dyn NativeContext, value: Value) -> Option<(usize, ObjectRef)> {
+    match value {
+        Value::Object(Some(obj)) => Some((ctx.pin_native_root(obj), obj)),
+        _ => None,
+    }
+}
+
+fn read_pinned_object_value(
+    ctx: &dyn NativeContext,
+    pin: Option<(usize, ObjectRef)>,
+    fallback: Value,
+) -> Value {
+    match pin {
+        Some((handle, obj)) => Value::Object(Some(ctx.read_native_pin(handle, obj))),
+        None => fallback,
+    }
+}
+
+fn arfu_update_with_operator(
+    ctx: &mut dyn NativeContext,
+    target: ObjectRef,
+    slot: usize,
+    op: ObjectRef,
+    return_new: bool,
+) -> MethodCallResult {
+    let target_pin = ctx.pin_native_root(target);
+    let op_pin = ctx.pin_native_root(op);
+    let mut target_cur = target;
+    let mut op_cur = op;
+    loop {
+        target_cur = ctx.read_native_pin(target_pin, target_cur);
+        op_cur = ctx.read_native_pin(op_pin, op_cur);
+        let prev = ctx.get_field_volatile(target_cur, slot);
+        let prev_pin = pinned_object_value(ctx, prev);
+        let arg = read_pinned_object_value(ctx, prev_pin, prev);
+        let new_val = match ctx.invoke_virtual(
+            op_cur,
+            "apply",
+            "(Ljava/lang/Object;)Ljava/lang/Object;",
+            &[arg],
+        ) {
+            Ok(v) => v.unwrap_or(Value::Object(None)),
+            Err(e) => {
+                ctx.unpin_native_roots(target_pin);
+                return Err(e);
+            }
+        };
+        target_cur = ctx.read_native_pin(target_pin, target_cur);
+        let expected = read_pinned_object_value(ctx, prev_pin, prev);
+        if let Some((handle, _)) = prev_pin {
+            ctx.unpin_native_roots(handle);
+        }
+        if ctx.compare_and_swap_field(target_cur, slot, expected, new_val) {
+            ctx.unpin_native_roots(target_pin);
+            return Ok(Some(if return_new { new_val } else { expected }));
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Reference-variant accessors
 // ---------------------------------------------------------------------------
@@ -522,20 +581,7 @@ fn native_arfu_get_and_update(ctx: &mut dyn NativeContext, args: &[Value]) -> Me
     // after a fixed retry count (the previous behaviour) abandoned the
     // update under contention, leaving the field unchanged but pretending
     // success — a lost update.
-    loop {
-        let prev = ctx.get_field_volatile(target, slot);
-        let new_val = ctx
-            .invoke_virtual(
-                op,
-                "apply",
-                "(Ljava/lang/Object;)Ljava/lang/Object;",
-                &[prev],
-            )?
-            .unwrap_or(Value::Object(None));
-        if ctx.compare_and_swap_field(target, slot, prev, new_val) {
-            return Ok(Some(prev));
-        }
-    }
+    arfu_update_with_operator(ctx, target, slot, op, false)
 }
 
 fn native_arfu_update_and_get(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
@@ -546,20 +592,7 @@ fn native_arfu_update_and_get(ctx: &mut dyn NativeContext, args: &[Value]) -> Me
     // Unbounded recompute-and-CAS-retry (see native_arfu_get_and_update):
     // bailing after a fixed retry count would abandon the update and
     // return a value never actually stored.
-    loop {
-        let prev = ctx.get_field_volatile(target, slot);
-        let new_val = ctx
-            .invoke_virtual(
-                op,
-                "apply",
-                "(Ljava/lang/Object;)Ljava/lang/Object;",
-                &[prev],
-            )?
-            .unwrap_or(Value::Object(None));
-        if ctx.compare_and_swap_field(target, slot, prev, new_val) {
-            return Ok(Some(new_val));
-        }
-    }
+    arfu_update_with_operator(ctx, target, slot, op, true)
 }
 
 // ---------------------------------------------------------------------------
@@ -1222,6 +1255,7 @@ fn register_alfu(r: &mut NativeMethodRegistry) {
 mod tests {
     use super::*;
     use crate::test_utils::{mock_ctx, MockNativeContext};
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     /// Build a Class mirror in the mock and return both the mirror ref
     /// and the underlying ClassId for assertion convenience.
@@ -1685,6 +1719,53 @@ mod tests {
         make_class_mirror(&mut um.inner, name)
     }
 
+    static ARFU_TARGET_OLD: AtomicUsize = AtomicUsize::new(0);
+    static ARFU_TARGET_NEW: AtomicUsize = AtomicUsize::new(0);
+    static ARFU_OP_OLD: AtomicUsize = AtomicUsize::new(0);
+    static ARFU_OP_NEW: AtomicUsize = AtomicUsize::new(0);
+    static ARFU_PREV_OLD: AtomicUsize = AtomicUsize::new(0);
+    static ARFU_PREV_NEW: AtomicUsize = AtomicUsize::new(0);
+    static ARFU_APPLIED: AtomicUsize = AtomicUsize::new(0);
+    static ARFU_APPLY_CALLS: AtomicUsize = AtomicUsize::new(0);
+
+    fn relocating_arfu_apply(
+        ctx: &mut MockNativeContext,
+        receiver: ObjectRef,
+        method_name: &str,
+        descriptor: &str,
+        args: &[Value],
+    ) -> Option<MethodCallResult> {
+        if (method_name, descriptor) != ("apply", "(Ljava/lang/Object;)Ljava/lang/Object;") {
+            return None;
+        }
+        ARFU_APPLY_CALLS.fetch_add(1, Ordering::SeqCst);
+        assert_eq!(
+            receiver.as_ptr() as usize,
+            ARFU_OP_OLD.load(Ordering::SeqCst)
+        );
+        assert_eq!(
+            args.first().copied(),
+            Some(Value::Object(Some(unsafe {
+                ObjectRef::from_raw(ARFU_PREV_OLD.load(Ordering::SeqCst) as *mut u8)
+            })))
+        );
+        ctx.remap_native_pin_addr_for_test(
+            ARFU_TARGET_OLD.load(Ordering::SeqCst),
+            ARFU_TARGET_NEW.load(Ordering::SeqCst),
+        );
+        ctx.remap_native_pin_addr_for_test(
+            ARFU_OP_OLD.load(Ordering::SeqCst),
+            ARFU_OP_NEW.load(Ordering::SeqCst),
+        );
+        ctx.remap_native_pin_addr_for_test(
+            ARFU_PREV_OLD.load(Ordering::SeqCst),
+            ARFU_PREV_NEW.load(Ordering::SeqCst),
+        );
+        Some(Ok(Some(Value::Object(Some(unsafe {
+            ObjectRef::from_raw(ARFU_APPLIED.load(Ordering::SeqCst) as *mut u8)
+        })))))
+    }
+
     // -----------------------------------------------------------------
     // T19.H5: validation-only tests
     // -----------------------------------------------------------------
@@ -1721,6 +1802,46 @@ mod tests {
         assert!(descriptor_is_reference("Ljava/lang/Object;"));
         assert!(descriptor_is_reference("[I"));
         assert!(!descriptor_is_reference("I"));
+    }
+
+    #[test]
+    fn t19_h5_arfu_update_rereads_pins_after_operator_gc() {
+        let mut ctx = mock_ctx();
+        let target_old = ctx.fresh_object_ref();
+        let target_new = ctx.fresh_object_ref();
+        let op_old = ctx.fresh_object_ref();
+        let op_new = ctx.fresh_object_ref();
+        let prev_old = ctx.fresh_object_ref();
+        let prev_new = ctx.fresh_object_ref();
+        let applied = ctx.fresh_object_ref();
+        let slot = 1;
+
+        ctx.set_field(target_old, slot, Value::Object(Some(prev_old)));
+        ctx.set_field(target_new, slot, Value::Object(Some(prev_new)));
+
+        ARFU_TARGET_OLD.store(target_old.as_ptr() as usize, Ordering::SeqCst);
+        ARFU_TARGET_NEW.store(target_new.as_ptr() as usize, Ordering::SeqCst);
+        ARFU_OP_OLD.store(op_old.as_ptr() as usize, Ordering::SeqCst);
+        ARFU_OP_NEW.store(op_new.as_ptr() as usize, Ordering::SeqCst);
+        ARFU_PREV_OLD.store(prev_old.as_ptr() as usize, Ordering::SeqCst);
+        ARFU_PREV_NEW.store(prev_new.as_ptr() as usize, Ordering::SeqCst);
+        ARFU_APPLIED.store(applied.as_ptr() as usize, Ordering::SeqCst);
+        ARFU_APPLY_CALLS.store(0, Ordering::SeqCst);
+        ctx.set_invoke_virtual_hook(relocating_arfu_apply);
+
+        let result = arfu_update_with_operator(&mut ctx, target_old, slot, op_old, true);
+
+        assert_eq!(result.unwrap(), Some(Value::Object(Some(applied))));
+        assert_eq!(ARFU_APPLY_CALLS.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            ctx.get_field(target_new, slot),
+            Value::Object(Some(applied))
+        );
+        assert_eq!(
+            ctx.get_field(target_old, slot),
+            Value::Object(Some(prev_old))
+        );
+        assert_eq!(ctx.native_pin_count_for_test(), 0);
     }
 
     // -----------------------------------------------------------------
