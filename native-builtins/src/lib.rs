@@ -61,6 +61,38 @@ fn register_test_harness_natives(registry: &mut NativeMethodRegistry) {
     );
 }
 
+
+fn register_spring_codec_intrinsics(registry: &mut NativeMethodRegistry) {
+    registry.register(
+        "org/springframework/core/codec/CharSequenceEncoder",
+        "calculateCapacity",
+        "(Ljava/lang/CharSequence;Ljava/nio/charset/Charset;)I",
+        native_spring_char_sequence_encoder_calculate_capacity,
+    );
+}
+
+fn native_spring_char_sequence_encoder_calculate_capacity(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    let seq = match args.get(1) {
+        Some(Value::Object(Some(obj))) => *obj,
+        _ => return Ok(Some(Value::Int(0))),
+    };
+
+    let len = if let Some(text) = ctx.read_string(seq) {
+        text.encode_utf16().count() as i64
+    } else {
+        match ctx.invoke_virtual(seq, "length", "()I", &[])? {
+            Some(Value::Int(n)) if n > 0 => n as i64,
+            _ => 0,
+        }
+    };
+
+    let capacity = len.saturating_mul(8).min(i32::MAX as i64) as i32;
+    Ok(Some(Value::Int(capacity)))
+}
+
 /// Native `Duration.parse(CharSequence)` for real-JDK mode.
 ///
 /// JDK 25's `Duration.parse` (Duration.java:395) drives a compiled regex
@@ -10267,6 +10299,10 @@ pub fn register_essential_natives(registry: &mut NativeMethodRegistry) {
     // Integration-test harness support. These classes are not part of the JDK,
     // but test VMs use real-JDK mode and still need the print capture natives.
     register_test_harness_natives(registry);
+
+    registry.with_category(cratonvm_native_api::NativeKind::Intrinsic, |registry| {
+        register_spring_codec_intrinsics(registry);
+    });
 
     // JDK 25 VectorSupport declares these three ACC_NATIVE methods in
     // java.base. Keep them in the real-JDK essential path; the broader
@@ -28182,6 +28218,14 @@ macro_rules! unsafe_multibyte_get {
     ($name:ident, $width:expr, $assemble:expr) => {
         pub(crate) fn $name(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
             let offset = unsafe_offset(args, 2);
+            if unsafe_obj(args, 1).is_none() {
+                let addr = unsafe_raw_addr(args, 2);
+                let mut bytes = [0u8; $width];
+                if ctx.copy_from_native_memory(addr, &mut bytes) {
+                    let v: i64 = $assemble(&bytes, unsafe_big_endian_arg(args));
+                    return Ok(Some(Value::Int(v as i32)));
+                }
+            }
             if let Some(obj) = unsafe_obj(args, 1) {
                 if let Some(bytes) = unsafe_read_bytes_from_array(ctx, obj, offset, $width) {
                     let big_endian = unsafe_big_endian_arg(args);
@@ -28189,7 +28233,7 @@ macro_rules! unsafe_multibyte_get {
                     return Ok(Some(Value::Int(v as i32)));
                 }
             }
-            // Not a primitive-array target — generic element/field access.
+            // Not a primitive-array/direct-memory target: generic element/field access.
             native_unsafe_get_int(ctx, args)
         }
     };
@@ -28230,6 +28274,19 @@ pub(crate) fn native_unsafe_get_long_mb(
     ctx: &mut dyn NativeContext,
     args: &[Value],
 ) -> MethodCallResult {
+    if unsafe_obj(args, 1).is_none() {
+        let addr = unsafe_raw_addr(args, 2);
+        let mut b = [0u8; 8];
+        if ctx.copy_from_native_memory(addr, &mut b) {
+            let big_endian = unsafe_big_endian_arg(args);
+            let v = if big_endian {
+                i64::from_be_bytes(b)
+            } else {
+                i64::from_le_bytes(b)
+            };
+            return Ok(Some(Value::Long(v)));
+        }
+    }
     let offset = unsafe_offset(args, 2);
     if let Some(obj) = unsafe_obj(args, 1) {
         if let Some(b) = unsafe_read_bytes_from_array(ctx, obj, offset, 8) {
@@ -28284,29 +28341,35 @@ macro_rules! unsafe_multibyte_put {
             args: &[Value],
         ) -> MethodCallResult {
             let offset = unsafe_offset(args, 2);
-            if let Some(obj) = unsafe_obj(args, 1) {
-                if ctx.heap_kind_of(obj) == cratonvm_types::ObjectKind::Array
-                    && matches!(
-                        ctx.heap_element_type_of(obj),
-                        cratonvm_types::ArrayElementType::Byte
-                            | cratonvm_types::ArrayElementType::Boolean
-                    )
-                {
-                    let val = args.get(3).and_then(|v| v.as_int()).unwrap_or(0);
-                    // The bigEndian flag, when present, is args[4].
-                    let big_endian = matches!(args.get(4), Some(Value::Int(z)) if *z != 0);
-                    let raw = (val as u32) & ((1u64 << ($width * 8)) - 1) as u32;
-                    let mut bytes = [0u8; $width];
-                    if big_endian {
-                        for i in 0..$width {
-                            bytes[$width - 1 - i] = (raw >> (i * 8)) as u8;
-                        }
-                    } else {
-                        for i in 0..$width {
-                            bytes[i] = (raw >> (i * 8)) as u8;
-                        }
+            let val = args.get(3).and_then(|v| v.as_int()).unwrap_or(0);
+            // The bigEndian flag, when present, is args[4].
+            let big_endian = matches!(args.get(4), Some(Value::Int(z)) if *z != 0);
+            let raw = (val as u32) & ((1u64 << ($width * 8)) - 1) as u32;
+            let mut bytes = [0u8; $width];
+            if big_endian {
+                for i in 0..$width {
+                    bytes[$width - 1 - i] = (raw >> (i * 8)) as u8;
+                }
+            } else {
+                for i in 0..$width {
+                    bytes[i] = (raw >> (i * 8)) as u8;
+                }
+            }
+            match unsafe_obj(args, 1) {
+                None => {
+                    if ctx.copy_to_native_memory(unsafe_raw_addr(args, 2), &bytes) {
+                        return Ok(None);
                     }
-                    if unsafe_write_bytes_to_byte_array(ctx, obj, offset, &bytes) {
+                }
+                Some(obj) => {
+                    if ctx.heap_kind_of(obj) == cratonvm_types::ObjectKind::Array
+                        && matches!(
+                            ctx.heap_element_type_of(obj),
+                            cratonvm_types::ArrayElementType::Byte
+                                | cratonvm_types::ArrayElementType::Boolean
+                        )
+                        && unsafe_write_bytes_to_byte_array(ctx, obj, offset, &bytes)
+                    {
                         return Ok(None);
                     }
                 }
@@ -28325,6 +28388,23 @@ pub(crate) fn native_unsafe_put_long_mb(
     ctx: &mut dyn NativeContext,
     args: &[Value],
 ) -> MethodCallResult {
+    if unsafe_obj(args, 1).is_none() {
+        let val = match args.get(3) {
+            Some(Value::Long(l)) => *l,
+            Some(Value::Int(i)) => *i as i64,
+            _ => 0,
+        };
+        // For putLong the bigEndian flag is args[4].
+        let big_endian = matches!(args.get(4), Some(Value::Int(z)) if *z != 0);
+        let bytes = if big_endian {
+            (val as u64).to_be_bytes()
+        } else {
+            (val as u64).to_le_bytes()
+        };
+        if ctx.copy_to_native_memory(unsafe_raw_addr(args, 2), &bytes) {
+            return Ok(None);
+        }
+    }
     let offset = unsafe_offset(args, 2);
     if let Some(obj) = unsafe_obj(args, 1) {
         if ctx.heap_kind_of(obj) == cratonvm_types::ObjectKind::Array
@@ -37236,7 +37316,12 @@ fn native_cdl_await_timeout(ctx: &mut dyn NativeContext, args: &[Value]) -> Meth
         if remaining.is_zero() {
             return Ok(Some(Value::Int(0))); // false — timed out
         }
-        let wait_ms = remaining.as_millis().min(10) as u64;
+        // `monitor_wait(..., Some(0))` means an indefinite wait in the VM.
+        // A small positive timeout (for example CountDownLatch.await(1, MILLISECONDS))
+        // can have less than one whole millisecond remaining after the bookkeeping
+        // above, and `Duration::as_millis()` truncates that to 0. Round positive
+        // sub-millisecond waits up to 1 ms so timed latch waits cannot park forever.
+        let wait_ms = remaining.as_millis().clamp(1, 10) as u64;
         ctx.monitor_enter(this);
         ctx.monitor_wait(this, Some(wait_ms))?;
         ctx.monitor_exit(this);

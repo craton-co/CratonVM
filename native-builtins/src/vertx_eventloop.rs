@@ -65,6 +65,7 @@
 
 #![allow(clippy::needless_pass_by_value, dead_code)]
 
+use std::cell::{Cell, RefCell};
 use std::cmp::Reverse;
 use std::collections::{BinaryHeap, HashMap, VecDeque};
 use std::panic::{catch_unwind, AssertUnwindSafe};
@@ -106,6 +107,13 @@ pub const NEL_FIELD_EVENT_LOOP_ID: usize = 0;
 pub const NEL_FIELD_STATE: usize = 1;
 pub const NEL_FIELD_PARENT: usize = 2;
 pub const NEL_NUM_SLOTS: usize = 3;
+
+const NEL_EXEC_DRAIN_LIMIT: usize = 16_384;
+
+thread_local! {
+    static NEL_EXEC_DEPTH: Cell<usize> = const { Cell::new(0) };
+    static NEL_EXEC_QUEUE: RefCell<VecDeque<ObjectRef>> = RefCell::new(VecDeque::new());
+}
 
 // State codes
 pub const STATE_NOT_STARTED: i32 = 0;
@@ -1071,6 +1079,69 @@ fn native_nel_run(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResu
     Ok(None)
 }
 
+fn method_call_failed_summary(ctx: &mut dyn NativeContext, err: &MethodCallFailed) -> String {
+    match err {
+        MethodCallFailed::ExceptionThrown(obj) => {
+            let class_id = ctx.class_id_of_object(*obj);
+            let class_name = ctx
+                .class_name_of_id(class_id)
+                .unwrap_or_else(|| format!("<class:{}>", class_id.as_u32()));
+            format!("{}@{:p}", class_name, obj.as_ptr())
+        }
+        MethodCallFailed::InternalError(inner) => inner.to_string(),
+    }
+}
+
+fn invoke_nel_runnable(ctx: &mut dyn NativeContext, runnable: ObjectRef, operation: &'static str) {
+    if let Err(e) = ctx.invoke_virtual(runnable, "run", "()V", &[]) {
+        let error_summary = method_call_failed_summary(ctx, &e);
+        tracing::warn!(
+            error = ?e,
+            java_error = %error_summary,
+            operation = operation,
+            "NioEventLoop Runnable.run() threw; swallowing per execute/schedule contract",
+        );
+    }
+}
+
+fn run_or_enqueue_nel_runnable(
+    ctx: &mut dyn NativeContext,
+    runnable: ObjectRef,
+    operation: &'static str,
+) {
+    let nested = NEL_EXEC_DEPTH.with(|depth| {
+        if depth.get() > 0 {
+            NEL_EXEC_QUEUE.with(|queue| queue.borrow_mut().push_back(runnable));
+            true
+        } else {
+            depth.set(1);
+            false
+        }
+    });
+    if nested {
+        return;
+    }
+
+    invoke_nel_runnable(ctx, runnable, operation);
+
+    let mut drained = 0usize;
+    loop {
+        let next = NEL_EXEC_QUEUE.with(|queue| queue.borrow_mut().pop_front());
+        let Some(next) = next else { break };
+        drained += 1;
+        if drained > NEL_EXEC_DRAIN_LIMIT {
+            tracing::warn!(
+                limit = NEL_EXEC_DRAIN_LIMIT,
+                "NioEventLoop execute trampoline reached drain limit; leaving remaining tasks queued",
+            );
+            break;
+        }
+        invoke_nel_runnable(ctx, next, operation);
+    }
+
+    NEL_EXEC_DEPTH.with(|depth| depth.set(0));
+}
+
 /// `*.execute(Ljava/lang/Runnable;)V`
 ///
 /// B1 FIX: previously this enqueued a Rust no-op stub onto the loop's
@@ -1108,19 +1179,12 @@ fn native_nel_execute(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
             el.stats.tasks_run.fetch_add(1, Ordering::Relaxed);
         }
     }
-    match ctx.invoke_virtual(runnable, "run", "()V", &[]) {
-        Ok(_) => Ok(None),
-        Err(e) => {
-            // Do not propagate: `execute()` is fire-and-forget; a task failure
-            // must not break the submitter. Mirror Netty's "rejected/uncaught
-            // task" handling by logging and returning normally.
-            tracing::warn!(
-                error = ?e,
-                "NioEventLoop.execute: submitted Runnable.run() threw; swallowing per execute() contract",
-            );
-            Ok(None)
-        }
-    }
+    // Nested Netty tasks often call execute() again while the current task is
+    // still running. Running those recursively on the Java stack can overflow;
+    // trampoline nested submissions through a per-thread FIFO and drain them
+    // iteratively with the current NativeContext.
+    run_or_enqueue_nel_runnable(ctx, runnable, "execute");
+    Ok(None)
 }
 
 /// `*.schedule(Ljava/lang/Runnable;JLjava/util/concurrent/TimeUnit;)Ljava/util/concurrent/ScheduledFuture;`
@@ -1168,15 +1232,7 @@ fn native_nel_schedule(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCal
     // violate the delay contract — invoking deferred Java tasks on the carrier
     // is the broader gap tracked separately.
     if delay_ms == 0 {
-        match ctx.invoke_virtual(runnable, "run", "()V", &[]) {
-            Ok(_) => {}
-            Err(e) => {
-                tracing::warn!(
-                    error = ?e,
-                    "NioEventLoop.schedule(delay=0): Runnable.run() threw; swallowing",
-                );
-            }
-        }
+        run_or_enqueue_nel_runnable(ctx, runnable, "schedule(delay=0)");
     } else if let Some(el) = lookup_vertx_loop(raw) {
         // Best-effort: register the timer so loop bookkeeping (deadline,
         // wakeups) stays consistent. The fired closure cannot itself invoke
@@ -1191,6 +1247,9 @@ fn native_nel_schedule(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCal
 
 /// `*.inEventLoop()Z`
 fn native_nel_in_event_loop(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    if NEL_EXEC_DEPTH.with(|depth| depth.get() > 0) {
+        return Ok(Some(Value::Int(1)));
+    }
     let this = obj_arg(args, 0)?;
     let raw = match ctx.get_field(this, NEL_FIELD_EVENT_LOOP_ID) {
         Value::Long(v) => v,
@@ -1270,8 +1329,13 @@ pub fn register_vertx_eventloop_natives(registry: &mut NativeMethodRegistry) {
     );
     registry.register(CLS_VERTX_IMPL, "close", "()V", native_vertx_close);
 
-    // NioEventLoop + DefaultEventLoop + SingleThreadEventExecutor share the same surface.
-    for cls in [CLS_NIO_EVENT_LOOP, CLS_DEFAULT_EVENT_LOOP, CLS_STE] {
+    // Keep the synthetic event-loop shim off real Netty NIO. Registering this
+    // surface on `NioEventLoop` or its `SingleThreadEventExecutor` superclass
+    // intercepts real Netty's Java selector loop and runs connect/register
+    // tasks inline on the caller, leaving no event-loop thread to complete
+    // non-blocking connect/read/write. DefaultEventLoop remains synthetic-only
+    // for the Vert.x/boot paths that need this shim.
+    for cls in [CLS_DEFAULT_EVENT_LOOP] {
         registry.register(cls, "run", "()V", native_nel_run);
         registry.register(
             cls,

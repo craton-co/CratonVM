@@ -102,7 +102,6 @@ fn sel_dbg_enabled() -> bool {
 /// in `kernel_select_windows`). Default OFF (probe ENABLED) — set
 /// `CRATONVM_NO_SELECTOR_CONNECT_PROBE=1` to fall back to pure WSAPoll readiness
 /// for A/B debugging.
-#[cfg(windows)]
 fn connect_probe_disabled() -> bool {
     static OFF: OnceLock<bool> = OnceLock::new();
     *OFF.get_or_init(|| {
@@ -116,10 +115,10 @@ fn connect_probe_disabled() -> bool {
 }
 
 /// Coarse cap (ms) applied to an otherwise-INDEFINITE `Selector.select()` so a
-/// missed wakeup self-heals (see the call site). Default 1000 ms — matches the
-/// reactor's usual finite select timeout, clears a stuck worker within ~1 s
-/// (well under thread-leak detectors' linger window), and costs only ~1 idle
-/// wakeup/sec per blocked selector. Overridable via CRATONVM_SELECT_MAX_BLOCK_MS.
+/// missed wakeup self-heals (see the call site). Default 50 ms — low enough
+/// that reactor request/response tests do not burn their whole verifier budget
+/// across a handful of missed wakeups, while still avoiding a tight idle spin.
+/// Overridable via CRATONVM_SELECT_MAX_BLOCK_MS.
 fn select_infinite_cap_ms() -> i32 {
     static CAP: OnceLock<i32> = OnceLock::new();
     *CAP.get_or_init(|| {
@@ -127,7 +126,7 @@ fn select_infinite_cap_ms() -> i32 {
             .ok()
             .and_then(|s| s.trim().parse::<i32>().ok())
             .filter(|&n| n > 0)
-            .unwrap_or(1000)
+            .unwrap_or(50)
     })
 }
 
@@ -153,7 +152,6 @@ pub const OP_ACCEPT: i32 = 16;
 /// for completion (see `kernel_select_windows` Phase 1b). Small enough that a
 /// completed connect is surfaced near-instantly even if WSAPoll never reports
 /// the cloned handle's POLLOUT edge; large enough to avoid a busy spin.
-#[cfg(windows)]
 const CONNECT_REPOLL_MS: i32 = 50;
 
 // ---------------------------------------------------------------------------
@@ -767,6 +765,9 @@ fn linux_ready_for(events: i32, interest: i32, is_listener: bool) -> i32 {
         if interest & OP_WRITE != 0 {
             r |= OP_WRITE;
         }
+        if !is_listener && interest & OP_CONNECT != 0 {
+            r |= OP_CONNECT;
+        }
     }
     r
 }
@@ -781,9 +782,9 @@ fn linux_ready_for(events: i32, interest: i32, is_listener: bool) -> i32 {
 #[cfg(target_os = "linux")]
 fn kernel_select_linux(id: i32, timeout_ms: i32) -> Result<i32, MethodCallFailed> {
     // Phase 1: snapshot prerequisites under the lock — fd, interest map,
-    // listener-set, current epoll fd.  Then release the lock so wakeup()
-    // can hit it during the actual epoll_wait.
-    let (efd, interests, listeners) = {
+    // listener-set, connect candidates, current epoll fd. Then release the lock
+    // so wakeup() can hit it during the actual epoll_wait.
+    let (efd, interests, listeners, connect_candidates) = {
         let regs = selectors().read();
         let Some(s) = regs.get(&id) else {
             return Err(closed_selector());
@@ -831,12 +832,54 @@ fn kernel_select_linux(id: i32, timeout_ms: i32) -> Result<i32, MethodCallFailed
         };
         let mut interests = HashMap::with_capacity(st.keys.len());
         let mut listeners = HashMap::with_capacity(st.keys.len());
+        // net_fds of keys with OP_CONNECT interest backed by a non-blocking
+        // connect. epoll usually reports connect-completion as EPOLLOUT, but
+        // the selector polls a cloned fd while finishConnect() operates on the
+        // original tcp_registry fd. Probe the original too so an already-finished
+        // loopback connect cannot be missed and strand Netty's event loop.
+        let mut connect_candidates: Vec<i32> = Vec::new();
         for (net_fd, k) in st.keys.iter() {
             interests.insert(*net_fd, k.interest_ops);
             listeners.insert(*net_fd, k.handle.is_listener());
+            if !k.handle.is_listener() && k.interest_ops & OP_CONNECT != 0 && k.net_fd > 0 {
+                connect_candidates.push(k.net_fd);
+            }
         }
-        (efd, interests, listeners)
+        (efd, interests, listeners, connect_candidates)
     };
+
+    // Phase 1b: actively probe each OP_CONNECT candidate's original socket for
+    // connect completion. This mirrors the Windows selector path: relying only
+    // on the cloned fd's writable edge can miss a connect that completed before
+    // registration or before this epoll_wait arms, which leaves reactors parked
+    // forever waiting for finishConnect() to run. A completed or failed connect
+    // is delivered as OP_CONNECT-ready this cycle; a still-pending connect caps
+    // the blocking wait so we re-probe promptly.
+    let mut timeout_ms = timeout_ms;
+    let mut conn_ready: Vec<i32> = Vec::new();
+    if !connect_probe_disabled() {
+        let mut had_pending = false;
+        let mut not_connecting = 0usize;
+        let ncand = connect_candidates.len();
+        for net_fd in connect_candidates {
+            match crate::socket_channel::probe_connect_status(net_fd) {
+                crate::socket_channel::SelectorConnectProbe::Ready => conn_ready.push(net_fd),
+                crate::socket_channel::SelectorConnectProbe::Pending => had_pending = true,
+                crate::socket_channel::SelectorConnectProbe::NotConnecting => not_connecting += 1,
+            }
+        }
+        if sel_dbg_enabled() && ncand > 0 {
+            sel_dbg(format!(
+                "linux connect-probe cand={ncand} ready={} pending={had_pending} notconn={not_connecting}",
+                conn_ready.len()
+            ));
+        }
+        if !conn_ready.is_empty() {
+            timeout_ms = 0;
+        } else if had_pending && (timeout_ms < 0 || timeout_ms > CONNECT_REPOLL_MS) {
+            timeout_ms = CONNECT_REPOLL_MS;
+        }
+    }
 
     // Phase 2: epoll_wait without any selector lock held.
     let mut events: [libc::epoll_event; 64] = unsafe { std::mem::zeroed() };
@@ -906,6 +949,45 @@ fn kernel_select_linux(id: i32, timeout_ms: i32) -> Result<i32, MethodCallFailed
         }
     }
     for (fd, stream) in accepted_streams {
+        st.pending_accepted.push_back((fd, stream));
+    }
+
+    // Deliver OP_CONNECT readiness detected by the original-fd probe. This is
+    // idempotent with epoll-derived readiness: only count the key once.
+    for net_fd in conn_ready {
+        if let Some(k) = st.keys.get_mut(&net_fd) {
+            if k.interest_ops & OP_CONNECT != 0 {
+                let was_zero = k.ready_ops == 0;
+                k.ready_ops |= OP_CONNECT;
+                if was_zero {
+                    count += 1;
+                }
+            }
+        }
+    }
+
+    // Safety net for readiness edges missed around register/interest changes.
+    // Netty can register/bind/connect and immediately enqueue work on another
+    // event-loop thread; if the epoll edge lands before the fd is fully armed,
+    // the selector may otherwise sleep until a later wakeup and reactor tests
+    // observe request timeouts. The nonblocking probe is the same conservative
+    // readiness check used by the generic selector fallback, applied only to
+    // keys that epoll/connect-probe have not already marked ready this cycle.
+    let mut probed_accepts: Vec<(i32, TcpStream)> = Vec::new();
+    for (fd, k) in st.keys.iter_mut() {
+        if k.cancelled || k.ready_ops != 0 || k.interest_ops == 0 {
+            continue;
+        }
+        let (ready, accepted) = probe_handle(&k.handle, k.interest_ops);
+        if ready != 0 {
+            k.ready_ops = ready;
+            count += 1;
+        }
+        if let Some(stream) = accepted {
+            probed_accepts.push((*fd, stream));
+        }
+    }
+    for (fd, stream) in probed_accepts {
         st.pending_accepted.push_back((fd, stream));
     }
 
@@ -1804,7 +1886,28 @@ fn refresh_selector_handles(ctx: &mut dyn NativeContext, id: i32) {
         if let Some(mut ks) = st.keys.remove(&old_fd) {
             ks.net_fd = new_fd;
             ks.handle = handle;
+            #[cfg(target_os = "linux")]
+            let epoll_update = st.epoll_fd.and_then(|efd| {
+                ks.handle.os_handle().map(|os| {
+                    (efd, os, ks.handle.is_listener(), ks.interest_ops)
+                })
+            });
             st.keys.insert(new_fd, ks);
+            #[cfg(target_os = "linux")]
+            if let Some((efd, os, is_listener, interest_ops)) = epoll_update {
+                let mut ev = libc::epoll_event {
+                    events: linux_events_for(interest_ops, is_listener) as u32,
+                    u64: new_fd as u64,
+                };
+                let rc = unsafe {
+                    libc::epoll_ctl(efd, libc::EPOLL_CTL_ADD, os as libc::c_int, &mut ev)
+                };
+                if rc < 0 {
+                    let _ = unsafe {
+                        libc::epoll_ctl(efd, libc::EPOLL_CTL_MOD, os as libc::c_int, &mut ev)
+                    };
+                }
+            }
         }
     }
 }
@@ -2650,6 +2753,146 @@ fn ioutil_fdval_native(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCal
 // no-op for those targets.
 // ---------------------------------------------------------------------------
 
+fn eventfd0_native(_ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
+    #[cfg(target_os = "linux")]
+    {
+        let fd = unsafe { libc::eventfd(0, libc::EFD_NONBLOCK | libc::EFD_CLOEXEC) };
+        if fd < 0 {
+            return Err(ioex(format!("eventfd: {}", std::io::Error::last_os_error())));
+        }
+        return Ok(Some(Value::Int(fd as i32)));
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        return Err(ioex("EventFD.eventfd0: not supported on this platform"));
+    }
+}
+
+fn eventfd_set0_native(_ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    #[cfg(target_os = "linux")]
+    {
+        let fd = match args.first() {
+            Some(Value::Int(v)) => *v as libc::c_int,
+            _ => return Ok(Some(Value::Int(-1))),
+        };
+        let value: u64 = 1;
+        let rc = unsafe {
+            libc::write(
+                fd,
+                (&value as *const u64).cast::<libc::c_void>(),
+                std::mem::size_of::<u64>(),
+            )
+        };
+        if rc < 0 {
+            let err = std::io::Error::last_os_error();
+            if err.raw_os_error() == Some(libc::EAGAIN) {
+                return Ok(Some(Value::Int(0)));
+            }
+            return Err(ioex(format!("eventfd write: {err}")));
+        }
+        return Ok(Some(Value::Int(0)));
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = args;
+        return Err(ioex("EventFD.set0: not supported on this platform"));
+    }
+}
+
+fn ioutil_drain_native(_ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    #[cfg(unix)]
+    {
+        let fd = match args.first() {
+            Some(Value::Int(v)) => *v as libc::c_int,
+            _ => return Ok(Some(Value::Int(0))),
+        };
+        let mut drained = false;
+        loop {
+            let mut value: u64 = 0;
+            let rc = unsafe {
+                libc::read(
+                    fd,
+                    (&mut value as *mut u64).cast::<libc::c_void>(),
+                    std::mem::size_of::<u64>(),
+                )
+            };
+            if rc > 0 {
+                drained = true;
+                continue;
+            }
+            if rc == 0 {
+                break;
+            }
+            let err = std::io::Error::last_os_error();
+            match err.raw_os_error() {
+                Some(libc::EAGAIN) => break,
+                Some(libc::EINTR) => continue,
+                _ => return Err(ioex(format!("IOUtil.drain: {err}"))),
+            }
+        }
+        return Ok(Some(Value::Int(if drained { 1 } else { 0 })));
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = args;
+        return Ok(Some(Value::Int(0)));
+    }
+}
+
+fn fd_close_int_fd_native(_ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    #[cfg(unix)]
+    {
+        let fd = match args.first() {
+            Some(Value::Int(v)) => *v as libc::c_int,
+            _ => return Ok(None),
+        };
+        if fd >= 0 {
+            let rc = unsafe { libc::close(fd) };
+            if rc < 0 {
+                return Err(ioex(format!("closeIntFD: {}", std::io::Error::last_os_error())));
+            }
+        }
+        return Ok(None);
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = args;
+        return Ok(None);
+    }
+}
+
+fn epoll_event_size_native(_ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
+    #[cfg(target_os = "linux")]
+    {
+        return Ok(Some(Value::Int(std::mem::size_of::<libc::epoll_event>() as i32)));
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        return Ok(Some(Value::Int(0)));
+    }
+}
+
+fn epoll_events_offset_native(_ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
+    Ok(Some(Value::Int(0)))
+}
+
+fn epoll_data_offset_native(_ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
+    #[cfg(target_os = "linux")]
+    {
+        let event = std::mem::MaybeUninit::<libc::epoll_event>::uninit();
+        let base = event.as_ptr();
+        let offset = unsafe {
+            let data = std::ptr::addr_of!((*base).u64);
+            data as usize - base as usize
+        };
+        return Ok(Some(Value::Int(offset as i32)));
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        return Ok(Some(Value::Int(0)));
+    }
+}
+
 fn epoll_create_native(_ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
     #[cfg(target_os = "linux")]
     {
@@ -2730,6 +2973,67 @@ fn epoll_wait_native(_ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCal
     }
 }
 
+
+fn netty_epoll_unavailable_native(
+    _ctx: &mut dyn NativeContext,
+    _args: &[Value],
+) -> MethodCallResult {
+    Err(RuntimeError::UnsatisfiedLinkError {
+        message: "io.netty.channel.epoll.Native is not supported by CratonVM; use JDK NIO selector"
+            .to_string(),
+    }
+    .into())
+}
+
+fn netty_epoll_register_unix_native(
+    _ctx: &mut dyn NativeContext,
+    _args: &[Value],
+) -> MethodCallResult {
+    Ok(Some(Value::Int(0)))
+}
+
+fn netty_epoll_false_native(
+    _ctx: &mut dyn NativeContext,
+    _args: &[Value],
+) -> MethodCallResult {
+    Ok(Some(Value::Int(0)))
+}
+
+fn netty_unix_socket_false_native(
+    _ctx: &mut dyn NativeContext,
+    _args: &[Value],
+) -> MethodCallResult {
+    Ok(Some(Value::Int(0)))
+}
+
+fn netty_epoll_const_epollin(_ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
+    Ok(Some(Value::Int(libc::EPOLLIN)))
+}
+
+fn netty_epoll_const_epollout(_ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
+    Ok(Some(Value::Int(libc::EPOLLOUT)))
+}
+
+fn netty_epoll_const_epollrdhup(
+    _ctx: &mut dyn NativeContext,
+    _args: &[Value],
+) -> MethodCallResult {
+    Ok(Some(Value::Int(libc::EPOLLRDHUP)))
+}
+
+fn netty_epoll_const_epollet(_ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
+    Ok(Some(Value::Int(libc::EPOLLET)))
+}
+
+fn netty_epoll_const_epollerr(_ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
+    Ok(Some(Value::Int(libc::EPOLLERR)))
+}
+
+fn netty_epoll_kernel_version(ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
+    let obj = ctx.create_string_uninterned("0.0.0-cratonvm");
+    Ok(Some(Value::Object(Some(obj))))
+}
+
 // ---------------------------------------------------------------------------
 // Windows-only WindowsSelectorImpl.SubSelector.poll0 — defer to the
 // process-wide selector implementation by mapping the supplied fd-array
@@ -2799,12 +3103,18 @@ pub fn register_nio_selector_real(r: &mut NativeMethodRegistry) {
     // (a `Selector`/`AbstractSelector`), bypassing the WEPoll path entirely.
     // `selector_open_native` ignores its receiver arg, so the instance form is
     // safe. (The matching `WEPollSelectorImpl` natives are never reached.)
-    r.register(
+    for prov in [
         "sun/nio/ch/WEPollSelectorProvider",
-        "openSelector",
-        "()Ljava/nio/channels/spi/AbstractSelector;",
-        selector_open_native,
-    );
+        "sun/nio/ch/EPollSelectorProvider",
+        "sun/nio/ch/SelectorProviderImpl",
+    ] {
+        r.register(
+            prov,
+            "openSelector",
+            "()Ljava/nio/channels/spi/AbstractSelector;",
+            selector_open_native,
+        );
+    }
     r.register(sel, "close0", "()V", selector_close_native);
     r.register(sel, "wakeup0", "()V", selector_wakeup_native);
     r.register(sel, "select0", "(J)I", selector_select_native);
@@ -2947,23 +3257,114 @@ pub fn register_nio_selector_real(r: &mut NativeMethodRegistry) {
         ioutil_fdval_native,
     );
 
+    r.register("sun/nio/ch/EventFD", "eventfd0", "()I", eventfd0_native);
+    r.register("sun/nio/ch/EventFD", "set0", "(I)I", eventfd_set0_native);
+    r.register("sun/nio/ch/IOUtil", "drain", "(I)Z", ioutil_drain_native);
+    r.register(
+        "sun/nio/ch/FileDispatcherImpl",
+        "closeIntFD",
+        "(I)V",
+        fd_close_int_fd_native,
+    );
+
     // Linux: sun.nio.ch.EPoll static natives. Registered unconditionally
     // (so JDK static-init resolves on any host) but only the Linux
     // implementation actually performs the syscall; on Windows / macOS
     // the methods return an IOException, which matches the JDK's behavior
     // when EPoll is unavailable.
+    r.register("sun/nio/ch/EPoll", "eventSize", "()I", epoll_event_size_native);
+    r.register("sun/nio/ch/EPoll", "eventsOffset", "()I", epoll_events_offset_native);
+    r.register("sun/nio/ch/EPoll", "dataOffset", "()I", epoll_data_offset_native);
     r.register(
         "sun/nio/ch/EPoll",
         "epollCreate",
         "()I",
         epoll_create_native,
     );
+    r.register("sun/nio/ch/EPoll", "create", "()I", epoll_create_native);
     r.register("sun/nio/ch/EPoll", "epollCtl", "(IIII)I", epoll_ctl_native);
+    r.register("sun/nio/ch/EPoll", "ctl", "(IIII)I", epoll_ctl_native);
     r.register(
         "sun/nio/ch/EPoll",
         "epollWait",
         "(IJII)I",
         epoll_wait_native,
+    );
+    r.register("sun/nio/ch/EPoll", "wait", "(IJII)I", epoll_wait_native);
+
+    // Netty ships a separate JNI epoll transport (`io.netty.channel.epoll.Native`).
+    // CratonVM supports the JDK's selector-facing EPoll surface above, but not
+    // Netty's full native transport ABI. Make Netty's availability probe fail
+    // explicitly so Reactor/Netty falls back to the JDK NIO selector path instead
+    // of half-initializing native epoll and then dropping event-loop tasks.
+    let netty_epoll = "io/netty/channel/epoll/Native";
+    r.register(netty_epoll, "registerUnix", "()I", netty_epoll_register_unix_native);
+    r.register(netty_epoll, "sizeofEpollEvent", "()I", epoll_event_size_native);
+    r.register(netty_epoll, "offsetofEpollData", "()I", epoll_data_offset_native);
+    r.register(
+        netty_epoll,
+        "isSupportingUdpSegment",
+        "()Z",
+        netty_epoll_false_native,
+    );
+    for (name, sig) in [("epollCreate", "()I"), ("eventFd", "()I"), ("timerFd", "()I")] {
+        r.register(netty_epoll, name, sig, netty_epoll_unavailable_native);
+    }
+
+
+    // Netty's shared Unix helper initializes even when the native epoll transport
+    // is unavailable. Keep its static IPv6 probes harmless so the NIO transport
+    // can continue to bootstrap on top of CratonVM's JDK channel shims.
+    let netty_unix_socket = "io/netty/channel/unix/Socket";
+    r.register(
+        netty_unix_socket,
+        "isIPv6Preferred0",
+        "(Z)Z",
+        netty_unix_socket_false_native,
+    );
+    r.register(netty_unix_socket, "isIPv6", "(I)Z", netty_unix_socket_false_native);
+
+
+    let netty_epoll_static = "io/netty/channel/epoll/NativeStaticallyReferencedJniMethods";
+    r.register(netty_epoll_static, "epollin", "()I", netty_epoll_const_epollin);
+    r.register(netty_epoll_static, "epollout", "()I", netty_epoll_const_epollout);
+    r.register(
+        netty_epoll_static,
+        "epollrdhup",
+        "()I",
+        netty_epoll_const_epollrdhup,
+    );
+    r.register(netty_epoll_static, "epollet", "()I", netty_epoll_const_epollet);
+    r.register(netty_epoll_static, "epollerr", "()I", netty_epoll_const_epollerr);
+    r.register(
+        netty_epoll_static,
+        "tcpMd5SigMaxKeyLen",
+        "()I",
+        netty_epoll_false_native,
+    );
+    r.register(
+        netty_epoll_static,
+        "isSupportingSendmmsg",
+        "()Z",
+        netty_epoll_false_native,
+    );
+    r.register(
+        netty_epoll_static,
+        "isSupportingRecvmmsg",
+        "()Z",
+        netty_epoll_false_native,
+    );
+    r.register(
+        netty_epoll_static,
+        "tcpFastopenMode",
+        "()I",
+        netty_epoll_false_native,
+    );
+    r.register(
+        netty_epoll_static,
+        "kernelVersion",
+        "()Ljava/lang/String;",
+        netty_epoll_kernel_version,
     );
 
     // Windows: WindowsSelectorImpl.SubSelector internals — registered on

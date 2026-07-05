@@ -11893,6 +11893,15 @@ fn invoke_on_class_shared_inner(
                         // native.
                         || (class_name == "java/lang/invoke/CallSite"
                             && method_name == "makeUninitializedCallSite")
+                        // SPRING-RSOCKET: `CharSequenceEncoder.calculateCapacity` is
+                        // concrete bytecode but is registered as a conservative native
+                        // capacity helper in real-JDK mode. See the companion
+                        // `force_native_over_real_jdk_bytecode` entry for the race this
+                        // avoids in Spring RSocket async setup payload encoding.
+                        || (class_name == "org/springframework/core/codec/CharSequenceEncoder"
+                            && method_name == "calculateCapacity"
+                            && descriptor
+                                == "(Ljava/lang/CharSequence;Ljava/nio/charset/Charset;)I")
                         // RECORD DESERIALIZATION: `ObjectInputStream.readRecord`
                         // calls `ObjectStreamClass$RecordSupport.deserializationCtr`
                         // (concrete bytecode) to get a record-rebuild MethodHandle

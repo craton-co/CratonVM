@@ -799,9 +799,10 @@ fn native_unsafe_set_memory_consolidated(
 }
 
 /// SECURITY FIX (V5): copyMemory(Object,long,Object,long,long). The fully
-/// off-heap form (both objects null) copies through the single arena store
-/// with per-byte bounds checks; any form touching a heap object delegates to
-/// the existing bounds-checked lib.rs handler.
+/// off-heap form (both objects null) copies through the NativeContext memory
+/// bridge so arena handles and real direct-memory pointers both work; any form
+/// touching a heap object delegates to the existing bounds-checked lib.rs
+/// handler.
 pub(crate) fn native_unsafe_copy_memory_consolidated(
     ctx: &mut dyn NativeContext,
     args: &[Value],
@@ -896,38 +897,50 @@ pub(crate) fn native_unsafe_copy_memory_consolidated(
         return Ok(None);
     }
 
-    // Read the source bytes first (handles overlapping ranges within the
-    // same arena correctly), then write them into the destination. Every
-    // access is bounds-checked by the arena accessors.
-    let mut buf = Vec::with_capacity(bytes);
-    for i in 0..bytes as i64 {
-        match crate::unsafe_arena_try_get_byte(src_addr + i) {
-            Some(v) => buf.push(v),
-            None => {
-                invalidate_arena_cache();
-                return Err(RuntimeError::IllegalArgumentException {
-                    message: format!(
-                        "Unsafe.copyMemory: src address 0x{:x} is not in any live arena",
-                        src_addr + i
-                    ),
-                }
-                .into());
-            }
+    // Fully off-heap copy. Source/destination may be either tagged VM arena
+    // handles (`Unsafe.allocateMemory`) or real native pointers used by direct
+    // buffers. Keep tagged-but-not-live handles on the arena error path so a
+    // freed/shrunk arena is never dereferenced as a raw pointer.
+    if crate::unsafe_arena_addr_is_tagged(src_addr) && !crate::unsafe_arena_contains(src_addr) {
+        invalidate_arena_cache();
+        return Err(RuntimeError::IllegalArgumentException {
+            message: format!(
+                "Unsafe.copyMemory: src address 0x{src_addr:x} is not in any live arena"
+            ),
         }
+        .into());
     }
-    for (i, b) in buf.iter().enumerate() {
-        if !crate::unsafe_arena_put_byte(dst_addr + i as i64, *b) {
-            invalidate_arena_cache();
-            return Err(RuntimeError::IllegalArgumentException {
-                message: format!(
-                    "Unsafe.copyMemory: dst address 0x{:x} is not in any live arena",
-                    dst_addr + i as i64
-                ),
-            }
-            .into());
+    if crate::unsafe_arena_addr_is_tagged(dst_addr) && !crate::unsafe_arena_contains(dst_addr) {
+        invalidate_arena_cache();
+        return Err(RuntimeError::IllegalArgumentException {
+            message: format!(
+                "Unsafe.copyMemory: dst address 0x{dst_addr:x} is not in any live arena"
+            ),
         }
+        .into());
     }
-    refresh_arena_cache(dst_addr, bytes);
+
+    // Read the full source range before writing the destination. That preserves
+    // memmove-like behaviour for overlapping arena/native ranges and lets the
+    // NativeContext do the arena-vs-real-pointer dispatch in one place.
+    let mut buf = vec![0u8; bytes];
+    if !ctx.copy_from_native_memory(src_addr, &mut buf) {
+        invalidate_arena_cache();
+        return Err(RuntimeError::IllegalArgumentException {
+            message: format!("Unsafe.copyMemory: src address 0x{src_addr:x} is not addressable"),
+        }
+        .into());
+    }
+    if !ctx.copy_to_native_memory(dst_addr, &buf) {
+        invalidate_arena_cache();
+        return Err(RuntimeError::IllegalArgumentException {
+            message: format!("Unsafe.copyMemory: dst address 0x{dst_addr:x} is not addressable"),
+        }
+        .into());
+    }
+    if crate::unsafe_arena_contains(dst_addr) {
+        refresh_arena_cache(dst_addr, bytes);
+    }
     Ok(None)
 }
 

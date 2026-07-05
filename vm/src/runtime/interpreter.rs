@@ -18892,6 +18892,19 @@ fn force_native_over_real_jdk_bytecode(
     {
         return true;
     }
+    // Spring RSocket async setup can encode data and metadata strings on two
+    // Reactor workers at the same time. The real `CharSequenceEncoder` lazily
+    // computes a charset capacity through a per-instance cache; under CratonVM
+    // that cold concurrent path can strand one worker before the setup payload
+    // zip completes. Force the conservative native capacity helper registered in
+    // `native-builtins` so the normal Spring `DataBuffer.write` still performs
+    // the actual encoding, but the fragile lazy cache path is bypassed.
+    if class_name == "org/springframework/core/codec/CharSequenceEncoder"
+        && method_name == "calculateCapacity"
+        && method_descriptor == "(Ljava/lang/CharSequence;Ljava/nio/charset/Charset;)I"
+    {
+        return true;
+    }
     // BUG-15: `sun.util.locale.provider.LocaleResources.getDateTimePattern(int,
     // int, Calendar)` reads its pattern arrays through `LocaleData
     // .getDateFormatData` → `Bundles.of(...)`, the jdk.localedata class-based

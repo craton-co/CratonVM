@@ -12193,6 +12193,49 @@ pub(crate) fn i2_classloader_define_package_class(
     Ok(Some(Value::Object(Some(pkg))))
 }
 
+fn package_name_from_package_obj(ctx: &dyn NativeContext, pkg: ObjectRef) -> Option<String> {
+    match ctx.get_field(pkg, 0) {
+        Value::Object(Some(name_obj)) => ctx.read_string(name_obj),
+        _ => None,
+    }
+}
+
+fn java_string_hash(s: &str) -> i32 {
+    let mut h = 0i32;
+    for ch in s.encode_utf16() {
+        h = h.wrapping_mul(31).wrapping_add(ch as i32);
+    }
+    h
+}
+
+fn native_package_equals(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(o))) => *o,
+        _ => return Ok(Some(Value::Int(0))),
+    };
+    let other = match args.get(1) {
+        Some(Value::Object(Some(o))) => *o,
+        _ => return Ok(Some(Value::Int(0))),
+    };
+    if this.as_ptr() == other.as_ptr() {
+        return Ok(Some(Value::Int(1)));
+    }
+    let this_name = package_name_from_package_obj(ctx, this);
+    let other_name = package_name_from_package_obj(ctx, other);
+    Ok(Some(Value::Int((this_name.is_some() && this_name == other_name) as i32)))
+}
+
+fn native_package_hash_code(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(o))) => *o,
+        _ => return Ok(Some(Value::Int(0))),
+    };
+    let hash = package_name_from_package_obj(ctx, this)
+        .map(|name| java_string_hash(&name))
+        .unwrap_or(0);
+    Ok(Some(Value::Int(hash)))
+}
+
 /// Wire up I2 ClassLoader package overrides. Invoked from
 /// `lang_invoke::register_t28_method_handle_completeness` so they land in
 /// both real-JDK and synthetic-jdk registration paths without any
@@ -12233,6 +12276,18 @@ pub fn i2_register_classloader_package_natives(r: &mut cratonvm_native_api::Nati
         "getPackages",
         "()[Ljava/lang/Package;",
         i2_classloader_get_defined_packages,
+    );
+    r.register(
+        "java/lang/Package",
+        "equals",
+        "(Ljava/lang/Object;)Z",
+        native_package_equals,
+    );
+    r.register(
+        "java/lang/Package",
+        "hashCode",
+        "()I",
+        native_package_hash_code,
     );
     r.register(
         cl,

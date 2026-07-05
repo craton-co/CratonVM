@@ -375,6 +375,13 @@ pub fn make_iterator_from_array(
     Ok(Some(Value::Object(Some(itr))))
 }
 
+fn native_unsorted_set_comparator(
+    _ctx: &mut dyn NativeContext,
+    _args: &[Value],
+) -> MethodCallResult {
+    Ok(Some(Value::Object(None)))
+}
+
 /// Register all collection native methods.
 pub fn register_collections_natives(registry: &mut NativeMethodRegistry) {
     let __prev_cat = registry.current_category();
@@ -382,6 +389,19 @@ pub fn register_collections_natives(registry: &mut NativeMethodRegistry) {
     register_arraylist_natives(registry);
     register_hashmap_natives(registry);
     register_hashset_natives(registry);
+    // Guard against an invokeinterface/assignability edge where AssertJ's
+    // SortedSet fast path can incorrectly dispatch `SortedSet.comparator()`
+    // against a plain HashSet/LinkedHashSet receiver in real-JDK mode.
+    // Returning null matches the Comparator contract for natural/no explicit
+    // ordering and avoids a spurious NoSuchMethodError on unsorted sets.
+    for set_class in ["java/util/HashSet", "java/util/LinkedHashSet"] {
+        registry.register(
+            set_class,
+            "comparator",
+            "()Ljava/util/Comparator;",
+            native_unsorted_set_comparator,
+        );
+    }
     register_iterator_natives(registry);
     register_arrays_natives(registry);
     register_optional_natives(registry);
