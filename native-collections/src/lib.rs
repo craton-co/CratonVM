@@ -550,6 +550,19 @@ fn alloc_ref_array(ctx: &mut dyn NativeContext, length: usize) -> ObjectRef {
     ctx.new_ref_array(ClassId::new(0), length)
 }
 
+fn alloc_ref_array_or_oom(
+    ctx: &mut dyn NativeContext,
+    length: usize,
+) -> Result<ObjectRef, MethodCallFailed> {
+    ctx.try_new_ref_array(ClassId::new(0), length)
+        .ok_or_else(|| {
+            RuntimeError::OutOfMemoryError {
+                message: "Java heap space".to_string(),
+            }
+            .into()
+        })
+}
+
 /// GC-SAFETY helper: pin every object-typed `Value` in `vals` so a subsequent
 /// allocating call cannot relocate/collect them while they sit in a bare Rust
 /// `Vec`. Returns the base handle for [`NativeContext::unpin_native_roots`]
@@ -24347,7 +24360,7 @@ fn native_tm_init(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResu
     };
     // Seed identity-hash so the side-table key survives GC moves.
     ih_seed(ctx, this);
-    let buf = alloc_ref_array(ctx, TM_DEFAULT_CAPACITY * 2);
+    let buf = alloc_ref_array_or_oom(ctx, TM_DEFAULT_CAPACITY * 2)?;
     tm_set_slot(ctx, this, TM_FIELD_DATA, Value::Object(Some(buf)));
     tm_set_slot(ctx, this, TM_FIELD_SIZE, Value::Int(0));
     tm_set_slot(ctx, this, TM_FIELD_COMPARATOR, Value::Object(None));
@@ -24361,7 +24374,7 @@ fn native_tm_init_comparator(ctx: &mut dyn NativeContext, args: &[Value]) -> Met
     };
     ih_seed(ctx, this);
     let cmp = args.get(1).copied().unwrap_or(Value::Object(None));
-    let buf = alloc_ref_array(ctx, TM_DEFAULT_CAPACITY * 2);
+    let buf = alloc_ref_array_or_oom(ctx, TM_DEFAULT_CAPACITY * 2)?;
     tm_set_slot(ctx, this, TM_FIELD_DATA, Value::Object(Some(buf)));
     tm_set_slot(ctx, this, TM_FIELD_SIZE, Value::Int(0));
     tm_set_slot(ctx, this, TM_FIELD_COMPARATOR, cmp);

@@ -4,10 +4,6 @@ This folder collects CratonVM-only defects found while running upstream Java
 suites. The docs had grown to describe the **same underlying bug from several
 angles**; this index is the consolidated map. Read it first.
 
-## 2026-07-05 Hibernate UUID v6/v7 SIGSEGV
-
-- [Hibernate UUidV6V7GeneratorTest SIGSEGV after longer timeout](uuid-v6v7-generator-sigsegv.md) - candidate fix: native atomic update loops now pin and re-read references across `UnaryOperator.apply`; original Azure class-level gdb rerun pending.
-
 ## 2026-07-05 Hibernate pruned residuals
 
 - [Hibernate JpaLargeBlobTest Object.read() dispatch](hib-jpalargeblobtest-object-read-nosuchmethod.md) - patched locally in the JIT virtual/interface MIC helper: `ClassId(0)` non-Object receivers now fall back to the CP owner and cannot publish MIC/PIC entries under the zero/empty sentinel. Local Windows Hibernate probe no longer reproduces `java/lang/Object.read()I`, but the class remains open on a later no-JIT-independent `GenHeap::set_array_element` object-vs-array assertion in H2 `IOUtils.readFully`.

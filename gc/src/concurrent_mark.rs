@@ -19,14 +19,15 @@
 //! 4. **Concurrent Sweep:** Walk the old generation, freeing unmarked objects
 //!    back to the free list. Application threads continue running.
 
-use std::collections::VecDeque;
+use std::collections::{HashSet, VecDeque};
 use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::sync::Arc;
 
 use parking_lot::Mutex;
 
 use crate::heap::{
-    ArrayElementType, ObjectHeader, ObjectKind, HEADER_SIZE, REF_ELEMENT_SIZE, SLOT_SIZE,
+    array_data_size, ArrayElementType, ObjectHeader, ObjectKind, GC_FLAG_COMPACT, GC_FLAG_MARKED,
+    GC_FLAG_OLD_GEN, HEADER_SIZE, REF_ELEMENT_SIZE, SLOT_SIZE,
 };
 use crate::mark_bitmap::MarkBitmap;
 use crate::old_gen::OldGen;
@@ -450,10 +451,10 @@ impl ConcurrentMarker {
         self.bitmap.clear();
         self.queue.clear();
 
+        let object_starts = old_gen_object_starts(old_gen);
         let mut count = 0;
         for &root_ptr in roots {
-            if !root_ptr.is_null()
-                && old_gen.contains(root_ptr)
+            if markable_old_object(root_ptr, &object_starts)
                 && self.bitmap.try_mark(root_ptr as usize)
             {
                 self.queue.push(root_ptr);
@@ -476,9 +477,14 @@ impl ConcurrentMarker {
     /// Returns the number of objects scanned.
     pub fn concurrent_mark(&self, old_gen: &OldGen) -> usize {
         let mut scanned = 0;
+        let object_starts = old_gen_object_starts(old_gen);
 
         while let Some(obj_ptr) = self.queue.pop() {
-            self.scan_object(obj_ptr, old_gen);
+            if !self.scan_object(obj_ptr, old_gen, &object_starts) {
+                self.mark_all_old_gen(old_gen);
+                self.queue.clear();
+                break;
+            }
             scanned += 1;
         }
 
@@ -494,6 +500,7 @@ impl ConcurrentMarker {
     pub fn remark(&self, roots: &[*mut u8], old_gen: &OldGen) -> usize {
         self.state.set_phase(ConcurrentGcPhase::Remark);
         let mut discovered = 0;
+        let object_starts = old_gen_object_starts(old_gen);
 
         // Process SATB entries: these are old reference values that were
         // overwritten during concurrent marking. We must mark them to
@@ -521,7 +528,8 @@ impl ConcurrentMarker {
         // gate is allowed to go INACTIVE. See the closing block.
         let satb_entries = self.satb_queue.drain();
         for addr in satb_entries {
-            if addr != 0 && old_gen.contains(addr as *const u8) && self.bitmap.try_mark(addr) {
+            let ptr = addr as *mut u8;
+            if markable_old_object(ptr, &object_starts) && self.bitmap.try_mark(addr) {
                 self.queue.push(addr as *mut u8);
                 discovered += 1;
             }
@@ -529,8 +537,7 @@ impl ConcurrentMarker {
 
         // Re-scan roots (some may have changed during concurrent mark).
         for &root_ptr in roots {
-            if !root_ptr.is_null()
-                && old_gen.contains(root_ptr)
+            if markable_old_object(root_ptr, &object_starts)
                 && self.bitmap.try_mark(root_ptr as usize)
             {
                 self.queue.push(root_ptr);
@@ -544,7 +551,7 @@ impl ConcurrentMarker {
         // `deactivate_and_drain()`), so any reference a mutator overwrites
         // while we compute this closure is logged and will be captured by
         // the final drain below.
-        discovered += self.drain_closure(old_gen);
+        discovered += self.drain_closure(old_gen, &object_starts);
 
         // gc-concmark HIGH fix — final quiescing drain.
         //
@@ -567,7 +574,8 @@ impl ConcurrentMarker {
         // reaps the stragglers. Either way the bitmap is final on exit.
         let late_entries = self.satb_queue.deactivate_and_drain();
         for addr in late_entries {
-            if addr != 0 && old_gen.contains(addr as *const u8) && self.bitmap.try_mark(addr) {
+            let ptr = addr as *mut u8;
+            if markable_old_object(ptr, &object_starts) && self.bitmap.try_mark(addr) {
                 self.queue.push(addr as *mut u8);
                 discovered += 1;
             }
@@ -576,7 +584,7 @@ impl ConcurrentMarker {
         // overflow fallback). The gate is INACTIVE now, but mutators are
         // quiesced past the drain barrier, so no further live overwrite can
         // escape the bitmap.
-        discovered += self.drain_closure(old_gen);
+        discovered += self.drain_closure(old_gen, &object_starts);
 
         self.state.set_phase(ConcurrentGcPhase::ConcurrentSweep);
 
@@ -588,12 +596,16 @@ impl ConcurrentMarker {
     /// overflowed. Returns the number of objects scanned. Extracted so the
     /// remark closure can be re-run after the final SATB quiescing drain
     /// (gc-concmark fix) without duplicating the overflow logic.
-    fn drain_closure(&self, old_gen: &OldGen) -> usize {
+    fn drain_closure(&self, old_gen: &OldGen, object_starts: &HashSet<usize>) -> usize {
         let mut discovered = 0;
 
         // Drain the queue fully (mark transitive closure).
         while let Some(obj_ptr) = self.queue.pop() {
-            self.scan_object(obj_ptr, old_gen);
+            if !self.scan_object(obj_ptr, old_gen, object_starts) {
+                self.mark_all_old_gen(old_gen);
+                self.queue.clear();
+                return discovered;
+            }
             discovered += 1;
         }
 
@@ -635,13 +647,21 @@ impl ConcurrentMarker {
                 if self.bitmap.is_marked(obj_ptr as usize) {
                     // Already gray/black: re-scan its outgoing refs to
                     // pick up children we may have dropped.
-                    self.scan_object(obj_ptr, old_gen);
+                    if !self.scan_object(obj_ptr, old_gen, object_starts) {
+                        self.mark_all_old_gen(old_gen);
+                        self.queue.clear();
+                        return discovered;
+                    }
                     discovered += 1;
                 }
             }
             // Drain anything the rescan re-enqueued.
             while let Some(obj_ptr) = self.queue.pop() {
-                self.scan_object(obj_ptr, old_gen);
+                if !self.scan_object(obj_ptr, old_gen, object_starts) {
+                    self.mark_all_old_gen(old_gen);
+                    self.queue.clear();
+                    return discovered;
+                }
                 discovered += 1;
             }
         }
@@ -679,12 +699,68 @@ impl ConcurrentMarker {
         freed_count
     }
 
+    fn mark_all_old_gen(&self, old_gen: &OldGen) -> usize {
+        let mut marked = 0;
+        for (obj_ptr, _size) in old_gen.walk_objects() {
+            if self.bitmap.try_mark(obj_ptr as usize) {
+                marked += 1;
+            }
+        }
+        marked
+    }
+
     /// Scan an object's reference fields and mark any old-gen targets.
-    fn scan_object(&self, obj_ptr: *mut u8, old_gen: &OldGen) {
+    ///
+    /// Returns `false` when the queued pointer names an object with an
+    /// inconsistent or implausible header. Callers respond by marking every
+    /// old-gen object for this cycle, retaining garbage rather than under-marking
+    /// live objects or dereferencing a bogus field extent.
+    fn scan_object(
+        &self,
+        obj_ptr: *mut u8,
+        old_gen: &OldGen,
+        object_starts: &HashSet<usize>,
+    ) -> bool {
         // SAFETY: obj_ptr was popped from the mark queue, which only contains
         // pointers to valid old-gen objects verified by old_gen.contains() before
         // being enqueued. The header is readable for the lifetime of the GC cycle.
-        let header = unsafe { &*(obj_ptr as *const ObjectHeader) };
+        let header_ptr = obj_ptr as *const ObjectHeader;
+        let Some(total_size) = concurrent_mark_object_size(header_ptr) else {
+            let snapshot = ConcurrentMarkHeaderSnapshot::read(header_ptr);
+            tracing::warn!(
+                "concurrent mark: skipping object at {:p} with inconsistent header \
+                 (kind_tag={}, element_tag={}, class_id={}, array_length={}, num_slots={}, \
+                 gc_flags=0x{:02x}); marking all old-gen objects for this cycle",
+                obj_ptr,
+                snapshot.kind_tag,
+                snapshot.element_tag,
+                snapshot.class_id,
+                snapshot.array_length,
+                snapshot.num_slots,
+                snapshot.gc_flags,
+            );
+            return false;
+        };
+        if total_size < HEADER_SIZE
+            || !old_gen.contains(unsafe { obj_ptr.add(total_size.saturating_sub(1)) })
+        {
+            let snapshot = ConcurrentMarkHeaderSnapshot::read(header_ptr);
+            tracing::warn!(
+                "concurrent mark: skipping object at {:p} with implausible extent {} \
+                 (kind_tag={}, element_tag={}, class_id={}, array_length={}, num_slots={}, \
+                 gc_flags=0x{:02x}); marking all old-gen objects for this cycle",
+                obj_ptr,
+                total_size,
+                snapshot.kind_tag,
+                snapshot.element_tag,
+                snapshot.class_id,
+                snapshot.array_length,
+                snapshot.num_slots,
+                snapshot.gc_flags,
+            );
+            return false;
+        }
+        let header = unsafe { &*header_ptr };
 
         if header.kind == ObjectKind::Array {
             if header.element_type == ArrayElementType::Reference {
@@ -696,7 +772,9 @@ impl ConcurrentMarker {
                     let raw: u64 = unsafe { std::ptr::read(slot_ptr as *const u64) };
                     if raw != 0 {
                         let ref_ptr = raw as usize as *mut u8;
-                        if old_gen.contains(ref_ptr) && self.bitmap.try_mark(ref_ptr as usize) {
+                        if markable_old_object(ref_ptr, object_starts)
+                            && self.bitmap.try_mark(ref_ptr as usize)
+                        {
                             self.queue.push(ref_ptr);
                         }
                     }
@@ -718,7 +796,9 @@ impl ConcurrentMarker {
                 let raw: u64 = unsafe { std::ptr::read(slot_ptr as *const u64) };
                 if raw != 0 {
                     let ref_ptr = raw as usize as *mut u8;
-                    if old_gen.contains(ref_ptr) && self.bitmap.try_mark(ref_ptr as usize) {
+                    if markable_old_object(ref_ptr, object_starts)
+                        && self.bitmap.try_mark(ref_ptr as usize)
+                    {
                         self.queue.push(ref_ptr);
                     }
                 }
@@ -778,12 +858,15 @@ impl ConcurrentMarker {
                 std::sync::atomic::fence(Ordering::SeqCst);
                 if let Value::Object(Some(ref_obj)) = value {
                     let ref_ptr = ref_obj.as_ptr();
-                    if old_gen.contains(ref_ptr) && self.bitmap.try_mark(ref_ptr as usize) {
+                    if markable_old_object(ref_ptr, object_starts)
+                        && self.bitmap.try_mark(ref_ptr as usize)
+                    {
                         self.queue.push(ref_ptr);
                     }
                 }
             }
         }
+        true
     }
 
     /// Run all four phases of a concurrent GC cycle.
@@ -798,6 +881,89 @@ impl ConcurrentMarker {
         let remark = self.remark(roots, old_gen);
         let swept = self.concurrent_sweep(old_gen);
         (initial + concurrent + remark, swept)
+    }
+}
+
+fn concurrent_mark_object_size(header: *const ObjectHeader) -> Option<usize> {
+    let snapshot = ConcurrentMarkHeaderSnapshot::read(header);
+    match snapshot.kind_tag {
+        tag if tag == ObjectKind::Array as u8 => {
+            let element_type = array_element_type_from_tag(snapshot.element_tag)?;
+            let data_size = array_data_size(snapshot.array_length as usize, element_type).ok()?;
+            HEADER_SIZE.checked_add(data_size)
+        }
+        tag if tag == ObjectKind::Object as u8 => {
+            let known_flags = GC_FLAG_OLD_GEN | GC_FLAG_MARKED | GC_FLAG_COMPACT;
+            if snapshot.gc_flags & !known_flags != 0 {
+                return None;
+            }
+            if snapshot.gc_flags & GC_FLAG_COMPACT != 0 {
+                return HEADER_SIZE.checked_add(snapshot.array_length as usize);
+            }
+            if snapshot.array_length != 0 || snapshot.num_slots > (1 << 24) {
+                return None;
+            }
+            let fields_size = (snapshot.num_slots as usize).checked_mul(SLOT_SIZE)?;
+            HEADER_SIZE.checked_add(fields_size)
+        }
+        _ => None,
+    }
+}
+
+fn old_gen_object_starts(old_gen: &OldGen) -> HashSet<usize> {
+    old_gen
+        .walk_objects()
+        .into_iter()
+        .map(|(ptr, _size)| ptr as usize)
+        .collect()
+}
+
+fn markable_old_object(ptr: *mut u8, object_starts: &HashSet<usize>) -> bool {
+    !ptr.is_null() && object_starts.contains(&(ptr as usize))
+}
+
+struct ConcurrentMarkHeaderSnapshot {
+    class_id: u32,
+    kind_tag: u8,
+    element_tag: u8,
+    array_length: u32,
+    num_slots: u32,
+    gc_flags: u8,
+}
+
+impl ConcurrentMarkHeaderSnapshot {
+    fn read(header: *const ObjectHeader) -> Self {
+        unsafe {
+            Self {
+                class_id: std::ptr::addr_of!((*header).class_id)
+                    .read_unaligned()
+                    .as_u32(),
+                kind_tag: std::ptr::addr_of!((*header).kind)
+                    .cast::<u8>()
+                    .read_unaligned(),
+                element_tag: std::ptr::addr_of!((*header).element_type)
+                    .cast::<u8>()
+                    .read_unaligned(),
+                array_length: std::ptr::addr_of!((*header).array_length).read_unaligned(),
+                num_slots: std::ptr::addr_of!((*header).num_slots).read_unaligned(),
+                gc_flags: std::ptr::addr_of!((*header).gc_flags).read_unaligned(),
+            }
+        }
+    }
+}
+
+fn array_element_type_from_tag(tag: u8) -> Option<ArrayElementType> {
+    match tag {
+        tag if tag == ArrayElementType::Reference as u8 => Some(ArrayElementType::Reference),
+        tag if tag == ArrayElementType::Boolean as u8 => Some(ArrayElementType::Boolean),
+        tag if tag == ArrayElementType::Char as u8 => Some(ArrayElementType::Char),
+        tag if tag == ArrayElementType::Float as u8 => Some(ArrayElementType::Float),
+        tag if tag == ArrayElementType::Double as u8 => Some(ArrayElementType::Double),
+        tag if tag == ArrayElementType::Byte as u8 => Some(ArrayElementType::Byte),
+        tag if tag == ArrayElementType::Short as u8 => Some(ArrayElementType::Short),
+        tag if tag == ArrayElementType::Int as u8 => Some(ArrayElementType::Int),
+        tag if tag == ArrayElementType::Long as u8 => Some(ArrayElementType::Long),
+        _ => None,
     }
 }
 
@@ -836,6 +1002,36 @@ mod tests {
             header.gc_flags = 0x01; // GC_FLAG_OLD_GEN
         }
         (og, ptr)
+    }
+
+    #[test]
+    fn concurrent_mark_object_size_rejects_inconsistent_object_header() {
+        let mut header = ObjectHeader::new(
+            ClassId::new(240),
+            ObjectKind::Object,
+            ArrayElementType::Reference,
+            1,
+            0,
+            2,
+        );
+        assert_eq!(
+            concurrent_mark_object_size(&header),
+            Some(HEADER_SIZE + 2 * SLOT_SIZE)
+        );
+
+        header.array_length = 258;
+        assert_eq!(concurrent_mark_object_size(&header), None);
+    }
+
+    #[test]
+    fn initial_mark_rejects_interior_old_gen_pointer() {
+        let (og, obj_ptr) = make_old_gen_with_object(2);
+        let marker = ConcurrentMarker::new(og.base_ptr() as usize, og.capacity());
+        let interior = unsafe { obj_ptr.add(8) };
+
+        assert_eq!(marker.initial_mark(&[interior], &og), 0);
+        assert!(!marker.bitmap.is_marked(interior as usize));
+        assert!(!marker.bitmap.is_marked(obj_ptr as usize));
     }
 
     #[test]
@@ -1472,8 +1668,9 @@ mod tests {
         };
 
         // Reader: scan A many times concurrently with the writer.
+        let object_starts = old_gen_object_starts(&og);
         for _ in 0..50_000 {
-            marker.scan_object(a_addr as *mut u8, &og);
+            marker.scan_object(a_addr as *mut u8, &og, &object_starts);
         }
         stop.store(true, Ordering::Relaxed);
         writer.join().unwrap();
