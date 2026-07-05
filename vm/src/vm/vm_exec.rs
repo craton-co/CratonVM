@@ -2019,7 +2019,15 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
             .get_class(class_id)
             .map(|c| c.num_total_fields)
             .unwrap_or(0);
-        let obj_ref = self.shared.heap.alloc_object(class_id, num_fields);
+        let obj_ref = self
+            .shared
+            .heap
+            .try_alloc_object_full(class_id, num_fields)
+            .ok_or_else(|| {
+                MethodCallFailed::InternalError(VmError::Runtime(RuntimeError::OutOfMemoryError {
+                    message: format!("Java heap space (new_object {class_name})"),
+                }))
+            })?;
         crate::runtime::interpreter::init_primitive_fields(self.shared, obj_ref, class_id);
         Ok(Some(Value::Object(Some(obj_ref))))
     }
@@ -2041,7 +2049,19 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
                 .get_class(class_id)
                 .map(|c| c.num_total_fields)
                 .unwrap_or(0);
-            let obj_ref = self.shared.heap.alloc_object(class_id, num_fields);
+            let obj_ref = self
+                .shared
+                .heap
+                .try_alloc_object_full(class_id, num_fields)
+                .ok_or_else(|| {
+                    MethodCallFailed::InternalError(VmError::Runtime(
+                        RuntimeError::OutOfMemoryError {
+                            message: format!(
+                                "Java heap space (new_object_initialized {class_name})"
+                            ),
+                        },
+                    ))
+                })?;
             crate::runtime::interpreter::init_primitive_fields(self.shared, obj_ref, class_id);
 
             // Keep the new object and constructor object arguments rooted until
@@ -6197,7 +6217,10 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
         };
         for m in &class.methods {
             if &*m.name == method_name && &*m.descriptor == method_desc {
-                return extract_parameter_type_argument_annotations(&m.attributes, &class.constant_pool);
+                return extract_parameter_type_argument_annotations(
+                    &m.attributes,
+                    &class.constant_pool,
+                );
             }
         }
         Vec::new()
@@ -13176,34 +13199,34 @@ fn invoke_on_class_shared_inner(
             eprintln!("[invoke_on_class_shared L5271] class_name_for_override={} method={} desc={} found={}",
                       class_name_for_override, method_name, descriptor, found);
         }
-        let force_ffm_value_layout_interface_native =
-            (class_name_for_override == "java/lang/foreign/ValueLayout"
-                || class_name_for_override.starts_with("java/lang/foreign/ValueLayout$"))
-                && matches!(
-                    method_name,
-                    "byteSize"
-                        | "byteAlignment"
-                        | "withByteAlignment"
-                        | "withName"
-                        | "withOrder"
-                        | "varHandle"
-                );
-        let force_ffm_memory_segment_interface_native =
-            class_name_for_override == "java/lang/foreign/MemorySegment"
-                && matches!(
-                    method_name,
-                    "byteSize"
-                        | "address"
-                        | "get"
-                        | "set"
-                        | "getAtIndex"
-                        | "setAtIndex"
-                        | "asSlice"
-                        | "isNative"
-                        | "isMapped"
-                        | "isReadOnly"
-                        | "scope"
-                );
+        let force_ffm_value_layout_interface_native = (class_name_for_override
+            == "java/lang/foreign/ValueLayout"
+            || class_name_for_override.starts_with("java/lang/foreign/ValueLayout$"))
+            && matches!(
+                method_name,
+                "byteSize"
+                    | "byteAlignment"
+                    | "withByteAlignment"
+                    | "withName"
+                    | "withOrder"
+                    | "varHandle"
+            );
+        let force_ffm_memory_segment_interface_native = class_name_for_override
+            == "java/lang/foreign/MemorySegment"
+            && matches!(
+                method_name,
+                "byteSize"
+                    | "address"
+                    | "get"
+                    | "set"
+                    | "getAtIndex"
+                    | "setAtIndex"
+                    | "asSlice"
+                    | "isNative"
+                    | "isMapped"
+                    | "isReadOnly"
+                    | "scope"
+            );
         let override_cb = if declaring_is_interface
             && !is_static
             && !force_ffm_value_layout_interface_native
