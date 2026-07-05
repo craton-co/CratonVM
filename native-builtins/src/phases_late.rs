@@ -12235,10 +12235,10 @@ pub fn register_phase57_file(r: &mut NativeMethodRegistry) {
     // `ProtocolResolver` probe: `GenericApplicationContextTests.
     // getResourceWithCustomResourceLoader` relies on `FileSystemResource`'s
     // `this.file.toPath()` throwing for exactly this). See
-    // `p57_validate_windows_path` (registered alongside `Paths.get` above)
-    // for the same check — duplicated here rather than shared because this
-    // registration builds a differently-shaped synthetic Path (2 fields via
-    // `alloc_concurrent_synthetic` directly, not `p57_alloc_path`).
+    // `p57_validate_windows_path` (registered alongside `Paths.get` above).
+    // Allocate through `p57_alloc_path` so File paths use the same internal
+    // separator canonicalisation as `Paths.get(...)`; Windows `File` display
+    // paths contain `\`, but `Path.toUri()` must render `/`, not `%5C`.
     r.register(file, "toPath", "()Ljava/nio/file/Path;", |ctx, args| {
         let this = obj_arg(args, 0)?;
         let path = file_read_path(ctx, this);
@@ -12265,10 +12265,7 @@ pub fn register_phase57_file(r: &mut NativeMethodRegistry) {
                 .into()),
             };
         }
-        let p = alloc_concurrent_synthetic(ctx, "java/nio/file/Path", 2);
-        let s = ctx.create_string(&path);
-        ctx.set_field(p, 0, Value::Object(Some(s)));
-        Ok(Some(Value::Object(Some(p))))
+        Ok(Some(Value::Object(Some(p57_alloc_path(ctx, &path)))))
     });
     r.register(file, "toURI", "()Ljava/net/URI;", |ctx, args| {
         let this = obj_arg(args, 0)?;

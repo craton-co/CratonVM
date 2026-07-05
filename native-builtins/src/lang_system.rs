@@ -1647,6 +1647,17 @@ pub fn set_system_props_singleton(obj: ObjectRef) -> ObjectRef {
     }
 }
 
+/// Replace the cached `System.getProperties()` singleton. Used by
+/// `System.setProperties(Properties)`, which HotSpot implements as a global
+/// swap of `System.props`, not as a mutation of the previous Properties object.
+/// Returns the previous singleton so callers can drop any system-props marker.
+pub fn replace_system_props_singleton(obj: Option<ObjectRef>) -> Option<ObjectRef> {
+    let mut g = system_props_store()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    std::mem::replace(&mut *g, obj)
+}
+
 /// GC root scan for the `System.getenv()` / `System.getProperties()` singletons
 /// (companion to [`gc_update_system_singleton_refs`]). Mirrors
 /// `classloader::gc_scan_loader_singleton_roots`.
