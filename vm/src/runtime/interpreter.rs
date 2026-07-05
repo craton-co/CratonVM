@@ -13882,6 +13882,28 @@ fn synthetic_implements(shared: &SharedVm, obj_class_id: ClassId, target_class_n
     }
 
     // Iterable implementations (all Collection types)
+    //
+    // `java/util/Collections$*` (the utility class's nested helper/view
+    // types — SingletonMap, UnmodifiableMap, SingletonSet, ...) must be
+    // excluded from this substring probe: "Collections" itself contains the
+    // substring "Collection", so e.g. `Collections$SingletonMap` (a Map,
+    // NOT a Collection) matched `obj_name.contains("Collection")` below and
+    // was misreported as `instanceof java.util.Collection`/`Iterable`. That
+    // broke Groovy's `DefaultTypeTransformation.asCollection`, which checks
+    // `instanceof Collection` before `instanceof Map` — it took the
+    // Collection branch, cast the SingletonMap to Collection unchanged, and
+    // called `.iterator()` directly on it, crashing GroovyMarkupConfigurer
+    // bean creation with `NoSuchMethodError: Collections$SingletonMap.
+    // iterator()`. This name-based fallback only exists for genuinely
+    // synthetic classes with no real interface data (see the function doc);
+    // every `Collections$*` class reaching this point is either a REAL
+    // loaded JDK class (whose hierarchy the earlier `is_subclass_of` check
+    // already resolved precisely) or one of CratonVM's own `cratonvm/
+    // internal/Unmodifiable*` stamps (which declare their own accurate
+    // interfaces in `vm_init.rs`), so it never needs this heuristic.
+    if obj_name.starts_with("java/util/Collections$") {
+        return false;
+    }
     if target_class_name == "java/lang/Iterable" {
         return obj_name.starts_with("java/util/")
             && (obj_name.contains("List")
