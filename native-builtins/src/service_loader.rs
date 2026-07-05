@@ -189,23 +189,97 @@ fn sl_non_builtin_loader(
     ctx: &mut dyn NativeContext,
     sl: cratonvm_types::ObjectRef,
 ) -> Option<cratonvm_types::ObjectRef> {
-    let v = match ctx.get_field_by_name(sl, "loader") {
-        Value::Object(Some(r)) => Some(r),
-        _ => match ctx.get_field(sl, 1) {
-            Value::Object(Some(r)) => Some(r),
-            _ => return None,
-        },
-    };
-    v.and_then(|r| {
+    fn usable_loader(
+        ctx: &mut dyn NativeContext,
+        r: cratonvm_types::ObjectRef,
+    ) -> Option<cratonvm_types::ObjectRef> {
         let name = ctx
             .class_name_of_id(ctx.class_id_of_object(r))
             .unwrap_or_default();
-        if crate::classloader::is_builtin_loader_class(&name) {
+        if !name.contains("ClassLoader") || crate::classloader::is_builtin_loader_class(&name) {
             None
         } else {
             Some(r)
         }
-    })
+    }
+
+    if let Value::Object(Some(r)) = ctx.get_field_by_name(sl, "loader") {
+        if let Some(loader) = usable_loader(ctx, r) {
+            return Some(loader);
+        }
+    }
+    // Synthetic ServiceLoader instances built by build_service_loader keep the
+    // loader in legacy slot 1. Real JDK ServiceLoader objects use named fields;
+    // with load(layer, service), slot 1 is not a ClassLoader and must not be
+    // treated as one.
+    if matches!(ctx.get_field_by_name(sl, "layer"), Value::Object(Some(_))) {
+        return None;
+    }
+    match ctx.get_field(sl, 1) {
+        Value::Object(Some(r)) => usable_loader(ctx, r),
+        _ => None,
+    }
+}
+
+fn load_provider_class_from_loader_jars(
+    ctx: &mut dyn NativeContext,
+    loader: cratonvm_types::ObjectRef,
+    internal_name: &str,
+) -> Option<cratonvm_types::ObjectRef> {
+    if let Some(cid) = ctx.class_id_by_name(internal_name) {
+        return Some(ctx.get_class_mirror(cid));
+    }
+    let class_file = format!("{internal_name}.class");
+    let Value::Object(Some(jm_list_r)) = ctx.get_field_by_name(loader, "jarMetas") else {
+        return None;
+    };
+    let size = match ctx.invoke(
+        "java/util/List",
+        "size",
+        "()I",
+        &[Value::Object(Some(jm_list_r))],
+    ) {
+        Ok(Some(Value::Int(n))) => n,
+        _ => 0,
+    };
+    for i in 0..size {
+        let jm = match ctx.invoke(
+            "java/util/List",
+            "get",
+            "(I)Ljava/lang/Object;",
+            &[Value::Object(Some(jm_list_r)), Value::Int(i)],
+        ) {
+            Ok(Some(Value::Object(Some(r)))) => r,
+            _ => continue,
+        };
+        let prefix = match ctx.invoke_virtual(jm, "prefix", "()Ljava/lang/String;", &[]) {
+            Ok(Some(Value::Object(Some(s)))) => ctx.read_string(s).unwrap_or_default(),
+            _ => continue,
+        };
+        if prefix.is_empty() {
+            continue;
+        }
+        let path = format!("{prefix}/{class_file}");
+        let mut candidates = ctx.find_all_resource_bytes(&path);
+        if candidates.is_empty() {
+            if let Some(bytes) = ctx.find_resource(&path) {
+                candidates.push(bytes);
+            }
+        }
+        for class_bytes in candidates {
+            let opts = cratonvm_native_api::DefineClassFull {
+                skip_verification: true,
+                ..Default::default()
+            };
+            if let Ok(cid) = ctx.define_class_full(internal_name, &class_bytes, 0, opts) {
+                return Some(ctx.get_class_mirror(cid));
+            }
+            if let Some(cid) = ctx.class_id_by_name(internal_name) {
+                return Some(ctx.get_class_mirror(cid));
+            }
+        }
+    }
+    None
 }
 
 /// Load a provider class by FQN, first via the flat `Class.forName(fqn)` scan
@@ -229,6 +303,15 @@ fn load_provider_class(
     // forName failed — try loader.loadClass(fqn) if we have a custom loader
     // (e.g. EmbeddedImplClassLoader for embedded-JAR provider classes).
     if let Some(loader_r) = loader {
+        let find_name = ctx.create_string(fqn);
+        if let Ok(Some(Value::Object(Some(c)))) = ctx.invoke_virtual(
+            loader_r,
+            "findClass",
+            "(Ljava/lang/String;)Ljava/lang/Class;",
+            &[Value::Object(Some(find_name))],
+        ) {
+            return Some(c);
+        }
         let name2 = ctx.create_string(fqn);
         if let Ok(Some(Value::Object(Some(c)))) = ctx.invoke_virtual(
             loader_r,
@@ -236,6 +319,9 @@ fn load_provider_class(
             "(Ljava/lang/String;)Ljava/lang/Class;",
             &[Value::Object(Some(name2))],
         ) {
+            return Some(c);
+        }
+        if let Some(c) = load_provider_class_from_loader_jars(ctx, loader_r, &fqn.replace('.', "/")) {
             return Some(c);
         }
     }
@@ -303,6 +389,87 @@ fn discover_providers(
     let resource = format!("META-INF/services/{}", service_name);
 
     let mut providers: Vec<String> = Vec::new();
+
+    // JPMS layer-backed ServiceLoader.load(layer, service). Real JDK
+    // ServiceLoader discovers these providers from ModuleLayer.servicesCatalog,
+    // not from META-INF/services resources. CratonVM overrides iterator()/stream(),
+    // so reproduce that source here and remember the module loader for provider
+    // class instantiation below.
+    if let Value::Object(Some(layer)) = ctx.get_field_by_name(sl, "layer") {
+        let sl_pin = ctx.pin_native_root(sl);
+        let layer_pin = ctx.pin_native_root(layer);
+        let layer = ctx.read_native_pin(layer_pin, layer);
+        let _ = ctx.invoke(
+            "java/lang/ModuleLayer",
+            "modules",
+            "()Ljava/util/Set;",
+            &[Value::Object(Some(layer))],
+        );
+        let layer = ctx.read_native_pin(layer_pin, layer);
+        if let Value::Object(Some(catalog)) = ctx.get_field_by_name(layer, "servicesCatalog") {
+            let catalog_pin = ctx.pin_native_root(catalog);
+            let service_name_obj = ctx.create_string(&service_name);
+            let catalog = ctx.read_native_pin(catalog_pin, catalog);
+            if let Ok(Some(Value::Object(Some(service_list)))) = ctx.invoke(
+                "jdk/internal/module/ServicesCatalog",
+                "findServices",
+                "(Ljava/lang/String;)Ljava/util/List;",
+                &[Value::Object(Some(catalog)), Value::Object(Some(service_name_obj))],
+            ) {
+                let list_pin = ctx.pin_native_root(service_list);
+                let size = match ctx.invoke(
+                    "java/util/List",
+                    "size",
+                    "()I",
+                    &[Value::Object(Some(service_list))],
+                ) {
+                    Ok(Some(Value::Int(n))) => n,
+                    _ => 0,
+                };
+                for i in 0..size {
+                    let service_list = ctx.read_native_pin(list_pin, service_list);
+                    let sp = match ctx.invoke(
+                        "java/util/List",
+                        "get",
+                        "(I)Ljava/lang/Object;",
+                        &[Value::Object(Some(service_list)), Value::Int(i)],
+                    ) {
+                        Ok(Some(Value::Object(Some(sp)))) => sp,
+                        _ => continue,
+                    };
+                    if let Value::Object(Some(provider_name)) =
+                        ctx.get_field_by_name(sp, "providerName")
+                    {
+                        let fqn = ctx.read_string(provider_name).unwrap_or_default();
+                        if !fqn.is_empty() {
+                            providers.push(fqn);
+                        }
+                    }
+                    if let Value::Object(Some(module)) = ctx.get_field_by_name(sp, "module") {
+                        if let Value::Object(Some(loader)) = ctx.get_field_by_name(module, "loader") {
+                            let loader_class = ctx
+                                .class_name_of_id(ctx.class_id_of_object(loader))
+                                .unwrap_or_default();
+                            if loader_class.contains("ClassLoader")
+                                && !crate::classloader::is_builtin_loader_class(&loader_class)
+                            {
+                                let sl_current = ctx.read_native_pin(sl_pin, sl);
+                                ctx.set_field_by_name(
+                                    sl_current,
+                                    "loader",
+                                    Value::Object(Some(loader)),
+                                );
+                            }
+                        }
+                    }
+                }
+                ctx.unpin_native_roots(list_pin);
+            }
+            ctx.unpin_native_roots(catalog_pin);
+        }
+        ctx.unpin_native_roots(layer_pin);
+        ctx.unpin_native_roots(sl_pin);
+    }
 
     // When the ServiceLoader was created with a user-defined ClassLoader
     // (e.g. ES's EmbeddedImplClassLoader which stores providers inside
