@@ -37,7 +37,6 @@ Fixed from this sweep:
 - [System Rules getenv() field 'm' reflection mismatch](../internal/fixed-suite-bugs/keycloak-system-rules-getenv-field-m-reflection.md) - `System.getenv()` now exposes an OpenJDK-shaped unmodifiable map wrapper whose private `m` field points at the backing map.
 
 Open findings from this sweep, in `keycloak-07-04/`, roughly by priority:
-- [FacadeClassLoader Object.size() NoSuchMethodError + guarded Class-object OOB access](keycloak-07-04/facadeclassloader-object-size-nosuchmethoderror-classoob.md) - confirmed non-fatal but real; root cause not fully pinned.
 - [LoggingConfigurationTest wildcard DEBUG level resolves null](keycloak-07-04/quarkus-runtime-logging-wildcard-debug-level-null.md) - 1 class/sub-test.
 - [SmallRyeConfig.getPropertyNames() surfaces a garbage property name during log-category validation](keycloak-07-04/quarkus-runtime-logging-getpropertynames-garbage-key.md) - 2 sub-tests in the same class as above, plausibly related.
 - [TelemetryConfigurationTest telemetry-service-name wrong value](keycloak-07-04/quarkus-runtime-telemetry-service-name-wrong-value.md) - 1 class/sub-test.
