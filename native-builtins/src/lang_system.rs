@@ -193,10 +193,8 @@ pub(crate) fn native_system_arraycopy(
         // identities for the element-type mismatch. Env-gated; default output
         // unchanged. Used to localize the Hibernate/H2 "src=Char, dest=Byte"
         // cluster (an array mislabeled at its allocation site).
-        if matches!(
-            src_elem,
-            ArrayElementType::Byte | ArrayElementType::Boolean
-        ) && dest_elem == ArrayElementType::Char
+        if matches!(src_elem, ArrayElementType::Byte | ArrayElementType::Boolean)
+            && dest_elem == ArrayElementType::Char
             && is_abstract_string_builder_append_copy(ctx)
         {
             for i in 0..length {
@@ -4076,4 +4074,3 @@ mod checkexec_security_tests {
         let _ = set_security_manager_for_test(prev);
     }
 }
-

@@ -5655,14 +5655,18 @@ pub(crate) fn native_method_invoke(
                     // though the exception TYPE matches. See
                     // `illegal_arg_exc_null_to_primitive`.
                     let e = if matches!(arg_val, Value::Object(None))
-                        && matches!(pdesc.as_str(), "I" | "J" | "F" | "D" | "Z" | "B" | "S" | "C")
+                        && matches!(
+                            pdesc.as_str(),
+                            "I" | "J" | "F" | "D" | "Z" | "B" | "S" | "C"
+                        )
                         && matches!(
                             &e,
-                            MethodCallFailed::InternalError(cratonvm_types::error::VmError::Runtime(
-                                cratonvm_types::error::RuntimeError::IllegalArgumentException { .. }
-                            ))
-                        )
-                    {
+                            MethodCallFailed::InternalError(
+                                cratonvm_types::error::VmError::Runtime(
+                                    cratonvm_types::error::RuntimeError::IllegalArgumentException { .. }
+                                )
+                            )
+                        ) {
                         illegal_arg_exc_null_to_primitive(ctx, "argument type mismatch".to_string())
                     } else {
                         e
@@ -10791,7 +10795,8 @@ pub(crate) fn native_method_get_parameter_annotations(
             .unwrap_or_else(|| ctx.new_ref_array(inner_comp, 0));
         ctx.set_array_element(outer, i, Value::Object(Some(anns)));
     }
-    Ok(Some(Value::Object(Some(outer))))}
+    Ok(Some(Value::Object(Some(outer))))
+}
 
 /// Access flags for method-parameter metadata from `MethodParameters`.
 const PARAMETER_MODIFIER_SYNTHETIC: u16 = 0x1000;
@@ -10841,10 +10846,9 @@ fn align_parameter_annotations(
         && !has_enclosing_method
     {
         let param_meta = ctx.method_parameters(class_id, method_name, method_desc);
-        if param_meta
-            .first()
-            .is_some_and(|(_, flags)| (*flags & (PARAMETER_MODIFIER_SYNTHETIC | PARAMETER_MODIFIER_MANDATED)) != 0)
-        {
+        if param_meta.first().is_some_and(|(_, flags)| {
+            (*flags & (PARAMETER_MODIFIER_SYNTHETIC | PARAMETER_MODIFIER_MANDATED)) != 0
+        }) {
             param_count.saturating_sub(normalized.len())
         } else {
             0
@@ -17526,4 +17530,3 @@ mod tests {
         }
     }
 }
-

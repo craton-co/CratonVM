@@ -2495,8 +2495,18 @@ pub(crate) fn register_core_stdlib_extras(r: &mut NativeMethodRegistry) {
     r.register(cds_cls, "isDumpingClassList0", "()Z", native_return_false);
     r.register(cds_cls, "isDumpingArchive0", "()Z", native_return_false);
     r.register(cds_cls, "isSharingEnabled0", "()Z", native_return_false);
-    r.register(cds_cls, "logLambdaFormInvoker", "(Ljava/lang/String;)V", native_noop);
-    r.register(cds_cls, "initializeFromArchive", "(Ljava/lang/Class;)V", native_noop);
+    r.register(
+        cds_cls,
+        "logLambdaFormInvoker",
+        "(Ljava/lang/String;)V",
+        native_noop,
+    );
+    r.register(
+        cds_cls,
+        "initializeFromArchive",
+        "(Ljava/lang/Class;)V",
+        native_noop,
+    );
     r.register(
         cds_cls,
         "defineArchivedModules",
@@ -2506,8 +2516,18 @@ pub(crate) fn register_core_stdlib_extras(r: &mut NativeMethodRegistry) {
     r.register(cds_cls, "getRandomSeedForDumping", "()J", |_ctx, _args| {
         Ok(Some(Value::Long(0)))
     });
-    r.register(cds_cls, "dumpClassList", "(Ljava/lang/String;)V", native_noop);
-    r.register(cds_cls, "dumpDynamicArchive", "(Ljava/lang/String;)V", native_noop);
+    r.register(
+        cds_cls,
+        "dumpClassList",
+        "(Ljava/lang/String;)V",
+        native_noop,
+    );
+    r.register(
+        cds_cls,
+        "dumpDynamicArchive",
+        "(Ljava/lang/String;)V",
+        native_noop,
+    );
 
     // jdk.internal.misc.VM natives
     r.register("jdk/internal/misc/VM", "initialize", "()V", native_noop);

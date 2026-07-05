@@ -2738,12 +2738,7 @@ fn throw_cannot_load_bean_class_exception(
 /// type) rather than propagating an unrelated error from exception
 /// construction itself.
 fn resource_description_of(ctx: &mut dyn NativeContext, mbd: ObjectRef) -> Option<String> {
-    match ctx.invoke_virtual(
-        mbd,
-        "getResourceDescription",
-        "()Ljava/lang/String;",
-        &[],
-    ) {
+    match ctx.invoke_virtual(mbd, "getResourceDescription", "()Ljava/lang/String;", &[]) {
         Ok(Some(Value::Object(Some(s)))) => ctx.read_string(s),
         _ => None,
     }

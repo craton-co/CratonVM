@@ -504,12 +504,7 @@ pub(crate) fn register_string_builder_natives(registry: &mut NativeMethodRegistr
         "(I)I",
         native_sb_code_point_before,
     );
-    registry.register(
-        class,
-        "codePointCount",
-        "(II)I",
-        native_sb_code_point_count,
-    );
+    registry.register(class, "codePointCount", "(II)I", native_sb_code_point_count);
     registry.register(
         class,
         "appendCodePoint",
@@ -6177,10 +6172,7 @@ mod tests {
             ("append", "([C)Ljava/lang/AbstractStringBuilder;"),
             ("append", "([CII)Ljava/lang/AbstractStringBuilder;"),
             ("append", "(I)Ljava/lang/AbstractStringBuilder;"),
-            (
-                "appendCodePoint",
-                "(I)Ljava/lang/AbstractStringBuilder;",
-            ),
+            ("appendCodePoint", "(I)Ljava/lang/AbstractStringBuilder;"),
             ("repeat", "(II)Ljava/lang/AbstractStringBuilder;"),
             (
                 "repeat",
@@ -6201,7 +6193,11 @@ mod tests {
         let mut registry = NativeMethodRegistry::new();
         register_string_builder_natives(&mut registry, "java/lang/StringBuilder");
         assert!(registry
-            .find("java/lang/StringBuilder", "append", "(C)Ljava/lang/Appendable;")
+            .find(
+                "java/lang/StringBuilder",
+                "append",
+                "(C)Ljava/lang/Appendable;"
+            )
             .is_some());
         assert!(registry
             .find(

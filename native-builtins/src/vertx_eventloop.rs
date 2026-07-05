@@ -1191,7 +1191,10 @@ fn native_nel_execute(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
 /// only for diagnostic logging (never propagated). Falls back to the plain
 /// `Display` impl (which just prints the raw pointer) if the Throwable's own
 /// `toString()` can't be resolved.
-fn describe_thrown(ctx: &mut dyn NativeContext, e: &cratonvm_types::error::MethodCallFailed) -> String {
+fn describe_thrown(
+    ctx: &mut dyn NativeContext,
+    e: &cratonvm_types::error::MethodCallFailed,
+) -> String {
     if let cratonvm_types::error::MethodCallFailed::ExceptionThrown(obj) = e {
         if let Ok(Some(Value::Object(Some(s)))) =
             ctx.invoke_virtual(*obj, "toString", "()Ljava/lang/String;", &[])

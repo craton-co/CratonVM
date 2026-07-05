@@ -696,7 +696,11 @@ fn build_locale_chain(
     let mut chain: Vec<(String, String, String)> = Vec::new();
     chain.push((bundle_name.to_string(), String::new(), String::new()));
     if !lang.is_empty() {
-        chain.push((format!("{bundle_name}_{lang}"), lang.to_string(), String::new()));
+        chain.push((
+            format!("{bundle_name}_{lang}"),
+            lang.to_string(),
+            String::new(),
+        ));
     }
     if !lang.is_empty() && !country.is_empty() {
         chain.push((
@@ -756,7 +760,12 @@ fn resolve_fallback_locale(
         // took no explicit Locale (e.g. `getBundle(String, Control)`).
         let locale_obj = match requested_locale_obj {
             Some(o) => o,
-            None => match ctx.invoke("java/util/Locale", "getDefault", "()Ljava/util/Locale;", &[]) {
+            None => match ctx.invoke(
+                "java/util/Locale",
+                "getDefault",
+                "()Ljava/util/Locale;",
+                &[],
+            ) {
                 Ok(Some(Value::Object(Some(o)))) => o,
                 _ => return None,
             },
@@ -779,7 +788,12 @@ fn resolve_fallback_locale(
 
     // No Control argument: standard JDK default-Control behavior — fall back
     // to Locale.getDefault() when it differs from the requested locale.
-    let default_obj = match ctx.invoke("java/util/Locale", "getDefault", "()Ljava/util/Locale;", &[]) {
+    let default_obj = match ctx.invoke(
+        "java/util/Locale",
+        "getDefault",
+        "()Ljava/util/Locale;",
+        &[],
+    ) {
         Ok(Some(Value::Object(Some(o)))) => o,
         _ => return None,
     };

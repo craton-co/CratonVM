@@ -395,13 +395,12 @@ fn jla_define_class(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRe
         }
     };
     let len = ctx.array_length(byte_array);
-    let bytes = crate::classloader::read_byte_array_slice(ctx, byte_array, 0, len).map_err(
-        |_msg| {
+    let bytes =
+        crate::classloader::read_byte_array_slice(ctx, byte_array, 0, len).map_err(|_msg| {
             cratonvm_types::error::MethodCallFailed::from(
                 RuntimeError::ArrayIndexOutOfBoundsException { index: 0 },
             )
-        },
-    )?;
+        })?;
 
     let mut opts = cratonvm_native_api::DefineClassFull::default();
     // `System$1` is the JDK's trusted JavaLangAccess implementation. HotSpot
@@ -440,13 +439,12 @@ fn jla_define_class_hidden(ctx: &mut dyn NativeContext, args: &[Value]) -> Metho
         }
     };
     let len = ctx.array_length(byte_array);
-    let bytes = crate::classloader::read_byte_array_slice(ctx, byte_array, 0, len).map_err(
-        |_msg| {
+    let bytes =
+        crate::classloader::read_byte_array_slice(ctx, byte_array, 0, len).map_err(|_msg| {
             cratonvm_types::error::MethodCallFailed::from(
                 RuntimeError::ArrayIndexOutOfBoundsException { index: 0 },
             )
-        },
-    )?;
+        })?;
 
     let mut opts = cratonvm_native_api::DefineClassFull::default();
     if let Some(Value::Object(Some(pd))) = args.get(5) {
@@ -478,7 +476,9 @@ fn jla_define_class_hidden(ctx: &mut dyn NativeContext, args: &[Value]) -> Metho
     if (flags & NESTMATE) != 0 {
         if let Some(lk) = lookup_mirror {
             if let Some(cid) = crate::lang_class::mirror_class_id(ctx, lk) {
-                opts.nest_host_class_name = ctx.nest_host_name(cid).or_else(|| ctx.class_name_of_id(cid));
+                opts.nest_host_class_name = ctx
+                    .nest_host_name(cid)
+                    .or_else(|| ctx.class_name_of_id(cid));
             }
         }
     }
@@ -487,12 +487,15 @@ fn jla_define_class_hidden(ctx: &mut dyn NativeContext, args: &[Value]) -> Metho
         _ => None,
     };
 
-    let loader_id = if name.starts_with("java/") || name.starts_with("jdk/") || name.starts_with("sun/") {
-        0
-    } else {
-        crate::classloader::loader_id_for(ctx, loader)
-    };
-    crate::classloader::define_class_via_full(ctx, &name, bytes, loader_id, opts, initialize, class_data)
+    let loader_id =
+        if name.starts_with("java/") || name.starts_with("jdk/") || name.starts_with("sun/") {
+            0
+        } else {
+            crate::classloader::loader_id_for(ctx, loader)
+        };
+    crate::classloader::define_class_via_full(
+        ctx, &name, bytes, loader_id, opts, initialize, class_data,
+    )
 }
 
 /// `JavaLangAccess.getConstantPool(Class<?>)` -> `jdk.internal.reflect.ConstantPool`.

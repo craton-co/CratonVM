@@ -914,7 +914,10 @@ fn alloc_simple_type_string(ctx: &mut dyn NativeContext) -> ObjectRef {
 /// `register_jmx_openmbean_natives` for the full rationale. `args[0]` is the
 /// receiver (the synthetic `MXBeanMapping`), `args[1]` is the value being
 /// converted; both methods just hand it back unchanged.
-fn native_mxbean_mapping_identity(_ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+fn native_mxbean_mapping_identity(
+    _ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
     Ok(Some(args.get(1).copied().unwrap_or(Value::Object(None))))
 }
 

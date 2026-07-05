@@ -665,8 +665,7 @@ fn try_delegate_to_real_provider(
         Ok(Some(Value::Object(Some(sl)))) => sl,
         _ => return None,
     };
-    let iter_obj = match ctx.invoke_virtual(loader_obj, "iterator", "()Ljava/util/Iterator;", &[])
-    {
+    let iter_obj = match ctx.invoke_virtual(loader_obj, "iterator", "()Ljava/util/Iterator;", &[]) {
         Ok(Some(Value::Object(Some(it)))) => it,
         _ => return None,
     };
@@ -677,18 +676,20 @@ fn try_delegate_to_real_provider(
             Ok(Some(Value::Int(1))) => {}
             _ => break,
         }
-        let provider_obj = match ctx.invoke_virtual(iter_obj, "next", "()Ljava/lang/Object;", &[])
-        {
+        let provider_obj = match ctx.invoke_virtual(iter_obj, "next", "()Ljava/lang/Object;", &[]) {
             Ok(Some(Value::Object(Some(p)))) => p,
             _ => break,
         };
-        match ctx.invoke_virtual(provider_obj, factory_method, factory_descriptor, factory_args) {
+        match ctx.invoke_virtual(
+            provider_obj,
+            factory_method,
+            factory_descriptor,
+            factory_args,
+        ) {
             Ok(Some(v)) => return Some(Ok(Some(v))),
             Ok(None) => {}
             Err(MethodCallFailed::ExceptionThrown(exc)) => {
-                let is_malformed = ctx
-                    .class_name_of_id(ctx.class_id_of_object(exc))
-                    .as_deref()
+                let is_malformed = ctx.class_name_of_id(ctx.class_id_of_object(exc)).as_deref()
                     == Some("java/net/MalformedURLException");
                 if !is_malformed && first_exception.is_none() {
                     first_exception = Some(exc);

@@ -4154,7 +4154,11 @@ fn class_mirror_by_name(ctx: &mut dyn NativeContext, name: &str) -> Option<Objec
     Some(ctx.get_class_mirror(class_id))
 }
 
-fn static_object_field(ctx: &mut dyn NativeContext, class_name: &str, field_name: &str) -> Option<ObjectRef> {
+fn static_object_field(
+    ctx: &mut dyn NativeContext,
+    class_name: &str,
+    field_name: &str,
+) -> Option<ObjectRef> {
     let class_id = ctx.ensure_class_initialized(class_name).ok()?;
     let field_index = ctx.static_field_index_by_name(class_id, field_name)?;
     match ctx.get_static_field(class_id, field_index) {
@@ -4250,10 +4254,11 @@ fn native_quarkus_logging_handle_failed_start(
         &[],
     )?;
 
-    let customizer = match ctx.new_object("io/quarkus/runtime/configuration/QuarkusConfigBuilderCustomizer") {
-        Ok(Some(Value::Object(Some(o)))) => o,
-        _ => return Ok(None),
-    };
+    let customizer =
+        match ctx.new_object("io/quarkus/runtime/configuration/QuarkusConfigBuilderCustomizer") {
+            Ok(Some(Value::Object(Some(o)))) => o,
+            _ => return Ok(None),
+        };
     ctx.invoke(
         "io/quarkus/runtime/configuration/QuarkusConfigBuilderCustomizer",
         "<init>",
@@ -4292,12 +4297,16 @@ fn native_quarkus_logging_handle_failed_start(
         "io/quarkus/runtime/logging/LoggingSetupRecorder$1",
         "<init>",
         "(Lio/smallrye/config/SmallRyeConfig;)V",
-        &[Value::Object(Some(source)), Value::Object(Some(base_config))],
+        &[
+            Value::Object(Some(source)),
+            Value::Object(Some(base_config)),
+        ],
     )?;
-    let config_source_id = match ctx.ensure_class_initialized("org/eclipse/microprofile/config/spi/ConfigSource") {
-        Ok(cid) => cid,
-        Err(_) => return Ok(None),
-    };
+    let config_source_id =
+        match ctx.ensure_class_initialized("org/eclipse/microprofile/config/spi/ConfigSource") {
+            Ok(cid) => cid,
+            Err(_) => return Ok(None),
+        };
     let sources = ctx.new_ref_array(config_source_id, 1);
     ctx.set_array_element(sources, 0, Value::Object(Some(source)));
     ctx.invoke_virtual(
@@ -4317,7 +4326,8 @@ fn native_quarkus_logging_handle_failed_start(
         _ => return Ok(None),
     };
 
-    let log_build = match class_mirror_by_name(ctx, "io/quarkus/runtime/logging/LogBuildTimeConfig") {
+    let log_build = match class_mirror_by_name(ctx, "io/quarkus/runtime/logging/LogBuildTimeConfig")
+    {
         Some(cls) => match ctx.invoke_virtual(
             logging_config,
             "getConfigMapping",
@@ -4329,7 +4339,8 @@ fn native_quarkus_logging_handle_failed_start(
         },
         None => return Ok(None),
     };
-    let log_runtime = match class_mirror_by_name(ctx, "io/quarkus/runtime/logging/LogRuntimeConfig") {
+    let log_runtime = match class_mirror_by_name(ctx, "io/quarkus/runtime/logging/LogRuntimeConfig")
+    {
         Some(cls) => match ctx.invoke_virtual(
             logging_config,
             "getConfigMapping",
@@ -4341,18 +4352,19 @@ fn native_quarkus_logging_handle_failed_start(
         },
         None => return Ok(None),
     };
-    let console_runtime = match class_mirror_by_name(ctx, "io/quarkus/runtime/console/ConsoleRuntimeConfig") {
-        Some(cls) => match ctx.invoke_virtual(
-            logging_config,
-            "getConfigMapping",
-            "(Ljava/lang/Class;)Ljava/lang/Object;",
-            &[Value::Object(Some(cls))],
-        )? {
-            Some(Value::Object(Some(o))) => o,
-            _ => return Ok(None),
-        },
-        None => return Ok(None),
-    };
+    let console_runtime =
+        match class_mirror_by_name(ctx, "io/quarkus/runtime/console/ConsoleRuntimeConfig") {
+            Some(cls) => match ctx.invoke_virtual(
+                logging_config,
+                "getConfigMapping",
+                "(Ljava/lang/Class;)Ljava/lang/Object;",
+                &[Value::Object(Some(cls))],
+            )? {
+                Some(Value::Object(Some(o))) => o,
+                _ => return Ok(None),
+            },
+            None => return Ok(None),
+        };
 
     let log_runtime_rv = match new_runtime_value(ctx, Value::Object(Some(log_runtime))) {
         Some(o) => o,
@@ -4395,7 +4407,8 @@ fn native_quarkus_logging_handle_failed_start(
         Some(v) => v,
         None => return Ok(None),
     };
-    let launch_mode = match static_object_field(ctx, "io/quarkus/runtime/LaunchMode", "DEVELOPMENT") {
+    let launch_mode = match static_object_field(ctx, "io/quarkus/runtime/LaunchMode", "DEVELOPMENT")
+    {
         Some(o) => o,
         None => return Ok(None),
     };
@@ -4423,7 +4436,6 @@ fn native_quarkus_logging_handle_failed_start(
 
     Ok(None)
 }
-
 
 pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
     let __prev_cat = r.current_category();
@@ -6471,8 +6483,11 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
                     Err(p57_access_denied(ctx, &p))
                 }
                 Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
-                    let exc =
-                        alloc_concurrent_synthetic(ctx, "java/nio/file/FileAlreadyExistsException", 4);
+                    let exc = alloc_concurrent_synthetic(
+                        ctx,
+                        "java/nio/file/FileAlreadyExistsException",
+                        4,
+                    );
                     let file_str = ctx.create_string(&p);
                     ctx.set_field_by_name(exc, "file", Value::Object(Some(file_str)));
                     Err(MethodCallFailed::ExceptionThrown(exc))
@@ -6498,8 +6513,11 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
                     Err(p57_access_denied(ctx, &p))
                 }
                 Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
-                    let exc =
-                        alloc_concurrent_synthetic(ctx, "java/nio/file/FileAlreadyExistsException", 4);
+                    let exc = alloc_concurrent_synthetic(
+                        ctx,
+                        "java/nio/file/FileAlreadyExistsException",
+                        4,
+                    );
                     let file_str = ctx.create_string(&p);
                     ctx.set_field_by_name(exc, "file", Value::Object(Some(file_str)));
                     Err(MethodCallFailed::ExceptionThrown(exc))
@@ -11282,7 +11300,10 @@ fn win_case_correct(full: &str) -> String {
         _alt_name: [u16; 14],
     }
     extern "system" {
-        fn FindFirstFileW(lp_file_name: *const u16, lp_find_file_data: *mut Win32FindDataW) -> *mut std::ffi::c_void;
+        fn FindFirstFileW(
+            lp_file_name: *const u16,
+            lp_find_file_data: *mut Win32FindDataW,
+        ) -> *mut std::ffi::c_void;
         fn FindClose(h_find_file: *mut std::ffi::c_void) -> i32;
     }
     const INVALID_HANDLE_VALUE: *mut std::ffi::c_void = -1isize as *mut std::ffi::c_void;
@@ -11303,8 +11324,16 @@ fn win_case_correct(full: &str) -> String {
                 return None;
             }
             FindClose(handle);
-            let end = data.file_name.iter().position(|&c| c == 0).unwrap_or(data.file_name.len());
-            Some(std::ffi::OsString::from_wide(&data.file_name[..end]).to_string_lossy().into_owned())
+            let end = data
+                .file_name
+                .iter()
+                .position(|&c| c == 0)
+                .unwrap_or(data.file_name.len());
+            Some(
+                std::ffi::OsString::from_wide(&data.file_name[..end])
+                    .to_string_lossy()
+                    .into_owned(),
+            )
         }
     }
 
@@ -11316,7 +11345,10 @@ fn win_case_correct(full: &str) -> String {
     };
     // Consume the RootDir component that follows a drive/UNC prefix, if present.
     let mut current = prefix;
-    let had_root = matches!(components.clone().next(), Some(std::path::Component::RootDir));
+    let had_root = matches!(
+        components.clone().next(),
+        Some(std::path::Component::RootDir)
+    );
     if had_root {
         components.next();
         current.push('\\');

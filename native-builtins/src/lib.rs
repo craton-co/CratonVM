@@ -12537,6 +12537,18 @@ pub fn register_essential_natives(registry: &mut NativeMethodRegistry) {
         "(Ljava/lang/Class;)Z",
         native_test_plan_scanner_filter_accept,
     );
+    registry.register(
+        "org/apache/maven/surefire/common/junit4/JUnit4Reflector",
+        "createDescription",
+        "(Ljava/lang/String;)Lorg/junit/runner/Description;",
+        native_surefire_junit4_reflector_create_description,
+    );
+    registry.register(
+        "org/apache/maven/surefire/common/junit4/JUnit4Reflector",
+        "createDescription",
+        "(Ljava/lang/String;[Ljava/lang/annotation/Annotation;)Lorg/junit/runner/Description;",
+        native_surefire_junit4_reflector_create_description,
+    );
     // SystemPropertyManager.loadProperties(InputStream) — Surefire reads
     // its provider configuration via `Properties p = new Properties();
     // p.load(stream); for (k : p.stringPropertyNames()) map.put(k,
@@ -24049,6 +24061,79 @@ fn native_surefire_properties_wrapper_set_as_system_properties(
     Ok(None)
 }
 
+fn native_surefire_junit4_reflector_create_description(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    const DESC: &str = "org/junit/runner/Description";
+    const METHOD: &str = "createSuiteDescription";
+    const DESC_STRING: &str = "(Ljava/lang/String;)Lorg/junit/runner/Description;";
+    const DESC_STRING_ANN: &str =
+        "(Ljava/lang/String;[Ljava/lang/annotation/Annotation;)Lorg/junit/runner/Description;";
+
+    let name_ref = match args.first().copied() {
+        Some(Value::Object(Some(name))) => Some(name),
+        _ => None,
+    };
+    let provided_ann_ref = match args.get(1).copied() {
+        Some(Value::Object(Some(annotations))) => Some(annotations),
+        _ => None,
+    };
+
+    let mut root_base = None;
+    let mut name_handle = None;
+    if let Some(name) = name_ref {
+        let handle = ctx.pin_native_root(name);
+        root_base = Some(handle);
+        name_handle = Some(handle);
+    }
+    let mut ann_handle = None;
+    if let Some(annotations) = provided_ann_ref {
+        let handle = ctx.pin_native_root(annotations);
+        root_base.get_or_insert(handle);
+        ann_handle = Some(handle);
+    }
+
+    let load_result = ctx.load_class(DESC);
+    if let Err(err) = load_result {
+        if let Some(base) = root_base {
+            ctx.unpin_native_roots(base);
+        }
+        return Err(err);
+    }
+
+    let name_arg = match (name_ref, name_handle) {
+        (Some(name), Some(handle)) => Value::Object(Some(ctx.read_native_pin(handle, name))),
+        _ => Value::Object(None),
+    };
+
+    let result = if ctx.method_exists(DESC, METHOD, DESC_STRING_ANN) {
+        let ann_ref = match provided_ann_ref {
+            Some(annotations) => annotations,
+            None => {
+                let ann_cid = ctx
+                    .class_id_by_name("java/lang/annotation/Annotation")
+                    .unwrap_or_else(|| ClassId::new(0));
+                ctx.new_ref_array(ann_cid, 0)
+            }
+        };
+        let ann_handle = ann_handle.unwrap_or_else(|| {
+            let handle = ctx.pin_native_root(ann_ref);
+            root_base.get_or_insert(handle);
+            handle
+        });
+        let ann_arg = Value::Object(Some(ctx.read_native_pin(ann_handle, ann_ref)));
+        ctx.invoke(DESC, METHOD, DESC_STRING_ANN, &[name_arg, ann_arg])
+    } else {
+        ctx.invoke(DESC, METHOD, DESC_STRING, &[name_arg])
+    };
+
+    if let Some(base) = root_base {
+        ctx.unpin_native_roots(base);
+    }
+    result
+}
+
 /// Native impl for `SystemPropertyManager.loadProperties(InputStream)
 ///   -> PropertiesWrapper`. Bypasses the bytecode round-trip through
 /// `Properties.load → stringPropertyNames → ConcurrentHashMap.put` —
@@ -24402,6 +24487,12 @@ fn native_surefire_forkedbooter_run(
             return Ok(None);
         }
     }
+    // In CratonVM's fork-shim mode the test set is already materialized by
+    // setupBooter. Keeping Surefire's command reader live makes JUnit4Provider
+    // wait in CommandReader.awaitStarted(), but there is no interactive master
+    // command stream for the single-class runner. Null it before provider
+    // construction so the provider skips that wait path.
+    ctx.set_field_by_name(booter, "commandReader", Value::Object(None));
     let exec = ctx.invoke_special(
         "org/apache/maven/surefire/booter/ForkedBooter",
         "execute",

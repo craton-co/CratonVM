@@ -1102,7 +1102,10 @@ fn native_jboss_logger_log_raw(ctx: &mut dyn NativeContext, args: &[Value]) -> M
 /// that one's doc comment for the actual `testsuite/model`/`KcRunner` crash
 /// this pair fixes. Bypass the loggerNode check entirely, mirroring
 /// `native_jboss_logger_log_raw`'s formatting.
-fn native_jboss_logger_log_level_supplier(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+fn native_jboss_logger_log_level_supplier(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
     let logger = match args.first() {
         Some(Value::Object(Some(o))) => match ctx.get_field(*o, LOGGER_FIELD_NAME) {
             Value::Object(Some(s)) => ctx.read_string(s).unwrap_or_else(|| "<root>".to_string()),

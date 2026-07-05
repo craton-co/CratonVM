@@ -16256,9 +16256,6 @@ fn execute_invoke_kind(
                                 | "canRead"
                                 | "canWrite"
                                 | "canExecute"
-                                | "delete"
-                                | "mkdir"
-                                | "mkdirs"
                         ) {
                             thread.frames[frame_idx].stack.push(Value::Int(0))?;
                             return Ok(CachedCallResult::Handled);
