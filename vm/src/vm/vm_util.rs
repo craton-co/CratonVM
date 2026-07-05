@@ -1882,11 +1882,25 @@ fn prepare_class_shared(shared: &SharedVm, class_id: ClassId) -> Result<(), VmEr
         match seed {
             Some(CvSeed::Primitive(v)) => statics[static_idx] = *v,
             Some(CvSeed::StringUtf8(text)) => {
-                let str_ref = super::vm_object::create_java_string(shared, text);
+                let str_ref =
+                    super::vm_object::try_create_java_string(shared, text).ok_or_else(|| {
+                        VmError::Runtime(RuntimeError::OutOfMemoryError {
+                            message: format!(
+                                "Java heap space (prepare_class {class_name}.{field_name} ConstantValue String)"
+                            ),
+                        })
+                    })?;
                 statics[static_idx] = Value::Object(Some(str_ref));
             }
             Some(CvSeed::StringUtf16(units)) => {
-                let str_ref = super::vm_object::create_java_string_from_units(shared, units);
+                let str_ref = super::vm_object::try_create_java_string_from_units(shared, units)
+                    .ok_or_else(|| {
+                        VmError::Runtime(RuntimeError::OutOfMemoryError {
+                            message: format!(
+                                "Java heap space (prepare_class {class_name}.{field_name} ConstantValue String)"
+                            ),
+                        })
+                    })?;
                 statics[static_idx] = Value::Object(Some(str_ref));
             }
             None => {}

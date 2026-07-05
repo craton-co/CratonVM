@@ -104,6 +104,11 @@ pub fn create_java_string_from_units(shared: &SharedVm, units: &[u16]) -> Object
     alloc_java_string_object_from_units(shared, units)
 }
 
+/// Fallible twin of [`create_java_string_from_units`].
+pub fn try_create_java_string_from_units(shared: &SharedVm, units: &[u16]) -> Option<ObjectRef> {
+    try_alloc_java_string_object_from_units(shared, units)
+}
+
 /// Allocate and populate a fresh `java/lang/String` object for `text`.
 /// Performs no pool lookup or insertion — callers decide pooling policy.
 fn alloc_java_string_object(shared: &SharedVm, text: &str) -> ObjectRef {
