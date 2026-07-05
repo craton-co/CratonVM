@@ -126,3 +126,24 @@ longer regresses into `O(depth)` for this test profile. The remaining
 runtime gap is only the separate `RandomizedContext.getPerThread()` residual
 currently documented in
 [`elasticsearch-randomizedcontext-per-thread-null.md`](elasticsearch-randomizedcontext-per-thread-null.md).
+
+## 2026-07-05 recheck after RandomizedContext policy fix
+
+This note is still open. The earlier "Deterministic closure" section only closed the A5 unregistered-JIT-frame safety-net bottleneck; it did not close the suite-level hang.
+
+Rechecked `org.elasticsearch.index.engine.ShuffleForcedMergePolicyTests` directly from current `origin/dev` (`0833a4766`) using the uniquely named binary:
+
+```text
+/data/target-es-engine-closure-20260705/release/cratonvm-es-engine-closure-azure-20260705
+```
+
+The run was killed by a 360-second outer timeout before any JUnit completion line, so it still exceeds the suite runner's 300-second hang threshold. The log advanced through Elasticsearch/Lucene bootstrap and then remained in the slow test body; this is not fixed by the already-retired RandomizedContext issue.
+
+New diagnostic signal near timeout:
+
+```text
+GC: inconsistent header - kind=Object but array_length=512 (num_slots=0, class_id=0); inline-alloc forgot to set kind=Array. Treating as corrupt so the walker can re-sync.
+mark_young: rejecting object ... implausible extent ... corrupt header, not marked/scanned
+```
+
+This mirrors the corrupt-header warning previously noted during the binary-doc-values/AQS investigation and suggests a remaining JIT/GC allocation-header corruption or stale-reference path can surface in this reflection/classloading-heavy engine test. It is not yet isolated enough for a code fix in this pass.
