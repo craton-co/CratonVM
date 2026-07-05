@@ -4507,11 +4507,10 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
                     .set_field(thread_obj, slot, Value::Object(Some(name_str)));
             }
             if let Some(slot) = tid_slot {
-                self.shared.heap.set_field(
-                    thread_obj,
-                    slot,
-                    Value::Long(self.thread.thread_id.0 as i64),
-                );
+                let tid = self.thread.thread_id.0.max(1);
+                self.shared
+                    .heap
+                    .set_field(thread_obj, slot, Value::Long(tid as i64));
             }
             if let Some(slot) = priority_slot {
                 // In JDK 19+ priority lives on FieldHolder, but older
@@ -11983,6 +11982,15 @@ fn invoke_on_class_shared_inner(
                         // native.
                         || (class_name == "java/lang/invoke/CallSite"
                             && method_name == "makeUninitializedCallSite")
+                        // SPRING-RSOCKET: `CharSequenceEncoder.calculateCapacity` is
+                        // concrete bytecode but is registered as a conservative native
+                        // capacity helper in real-JDK mode. See the companion
+                        // `force_native_over_real_jdk_bytecode` entry for the race this
+                        // avoids in Spring RSocket async setup payload encoding.
+                        || (class_name == "org/springframework/core/codec/CharSequenceEncoder"
+                            && method_name == "calculateCapacity"
+                            && descriptor
+                                == "(Ljava/lang/CharSequence;Ljava/nio/charset/Charset;)I")
                         // RECORD DESERIALIZATION: `ObjectInputStream.readRecord`
                         // calls `ObjectStreamClass$RecordSupport.deserializationCtr`
                         // (concrete bytecode) to get a record-rebuild MethodHandle

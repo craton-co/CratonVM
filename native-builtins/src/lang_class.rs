@@ -12345,6 +12345,49 @@ pub(crate) fn i2_classloader_define_package_class(
     Ok(Some(Value::Object(Some(pkg))))
 }
 
+fn package_name_from_package_obj(ctx: &dyn NativeContext, pkg: ObjectRef) -> Option<String> {
+    match ctx.get_field(pkg, 0) {
+        Value::Object(Some(name_obj)) => ctx.read_string(name_obj),
+        _ => None,
+    }
+}
+
+fn java_string_hash(s: &str) -> i32 {
+    let mut h = 0i32;
+    for ch in s.encode_utf16() {
+        h = h.wrapping_mul(31).wrapping_add(ch as i32);
+    }
+    h
+}
+
+fn native_package_equals(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(o))) => *o,
+        _ => return Ok(Some(Value::Int(0))),
+    };
+    let other = match args.get(1) {
+        Some(Value::Object(Some(o))) => *o,
+        _ => return Ok(Some(Value::Int(0))),
+    };
+    if this.as_ptr() == other.as_ptr() {
+        return Ok(Some(Value::Int(1)));
+    }
+    let this_name = package_name_from_package_obj(ctx, this);
+    let other_name = package_name_from_package_obj(ctx, other);
+    Ok(Some(Value::Int((this_name.is_some() && this_name == other_name) as i32)))
+}
+
+fn native_package_hash_code(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(o))) => *o,
+        _ => return Ok(Some(Value::Int(0))),
+    };
+    let hash = package_name_from_package_obj(ctx, this)
+        .map(|name| java_string_hash(&name))
+        .unwrap_or(0);
+    Ok(Some(Value::Int(hash)))
+}
+
 /// Wire up I2 ClassLoader package overrides. Invoked from
 /// `lang_invoke::register_t28_method_handle_completeness` so they land in
 /// both real-JDK and synthetic-jdk registration paths without any
@@ -12440,6 +12483,18 @@ pub fn i2_register_classloader_package_natives(r: &mut cratonvm_native_api::Nati
             };
             Ok(Some(Value::Int(eq as i32)))
         },
+    );
+    r.register(
+        "java/lang/Package",
+        "equals",
+        "(Ljava/lang/Object;)Z",
+        native_package_equals,
+    );
+    r.register(
+        "java/lang/Package",
+        "hashCode",
+        "()I",
+        native_package_hash_code,
     );
     r.register(
         cl,
@@ -13529,7 +13584,8 @@ fn annotated_type_impl_class_name(
 
     let cid = ctx.class_id_of_object(backing_type);
     match ctx.class_name_of_id(cid).unwrap_or_default().as_str() {
-        "java/lang/reflect/GenericArrayType" => ARRAY,
+        "java/lang/reflect/GenericArrayType"
+        | "sun/reflect/generics/reflectiveObjects/GenericArrayTypeImpl" => ARRAY,
         "java/lang/reflect/TypeVariable"
         | "sun/reflect/generics/reflectiveObjects/TypeVariableImpl" => TYPE_VAR,
         "java/lang/reflect/ParameterizedType"
@@ -13949,6 +14005,61 @@ pub(crate) fn native_annotated_type_get_annotation(
             }
         }
     }
+    Ok(Some(Value::Object(None)))
+}
+
+/// `AnnotatedType.getAnnotatedOwnerType()` override for CratonVM-built
+/// `AnnotatedTypeBaseImpl` instances.
+///
+/// The real JDK implementation reconstructs the owner from type-annotation
+/// location state. CratonVM constructs these wrappers directly from an already
+/// reified `Type` and does not populate the full location graph, so falling
+/// through into that bytecode can confuse reflective readers such as ByteBuddy's
+/// JavaDispatcher during Mockito inline mock generation. For the top-level
+/// types used by `java.nio.file.Path` this is simply null; for parameterized
+/// nested types, preserve the useful case by wrapping `ParameterizedType`'s
+/// owner type when one exists.
+pub(crate) fn native_annotated_type_get_annotated_owner_type(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    let this = obj_arg(args, 0)?;
+    let backing_type = match ctx.get_field_by_name(this, "type") {
+        Value::Object(Some(t)) => t,
+        _ => return Ok(Some(Value::Object(None))),
+    };
+
+    let backing_cid = ctx.class_id_of_object(backing_type);
+    let backing_name = ctx.class_name_of_id(backing_cid).unwrap_or_default();
+
+    if matches!(
+        backing_name.as_str(),
+        "java/lang/reflect/ParameterizedType"
+            | "sun/reflect/generics/reflectiveObjects/ParameterizedTypeImpl"
+    ) {
+        if let Ok(Some(Value::Object(Some(owner)))) = ctx.invoke_virtual(
+            backing_type,
+            "getOwnerType",
+            "()Ljava/lang/reflect/Type;",
+            &[],
+        ) {
+            let at = make_annotated_type(ctx, owner);
+            return Ok(Some(Value::Object(Some(at))));
+        }
+    }
+
+    if backing_name == "java/lang/Class" {
+        if let Ok(Some(Value::Object(Some(owner)))) = ctx.invoke_virtual(
+            backing_type,
+            "getDeclaringClass",
+            "()Ljava/lang/Class;",
+            &[],
+        ) {
+            let at = make_annotated_type(ctx, owner);
+            return Ok(Some(Value::Object(Some(at))));
+        }
+    }
+
     Ok(Some(Value::Object(None)))
 }
 

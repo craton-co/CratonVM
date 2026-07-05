@@ -585,6 +585,38 @@ fn native_lucene_byte_buffers_data_input_slice(
     Ok(Some(Value::Object(Some(new_obj))))
 }
 
+
+fn register_spring_codec_intrinsics(registry: &mut NativeMethodRegistry) {
+    registry.register(
+        "org/springframework/core/codec/CharSequenceEncoder",
+        "calculateCapacity",
+        "(Ljava/lang/CharSequence;Ljava/nio/charset/Charset;)I",
+        native_spring_char_sequence_encoder_calculate_capacity,
+    );
+}
+
+fn native_spring_char_sequence_encoder_calculate_capacity(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    let seq = match args.get(1) {
+        Some(Value::Object(Some(obj))) => *obj,
+        _ => return Ok(Some(Value::Int(0))),
+    };
+
+    let len = if let Some(text) = ctx.read_string(seq) {
+        text.encode_utf16().count() as i64
+    } else {
+        match ctx.invoke_virtual(seq, "length", "()I", &[])? {
+            Some(Value::Int(n)) if n > 0 => n as i64,
+            _ => 0,
+        }
+    };
+
+    let capacity = len.saturating_mul(8).min(i32::MAX as i64) as i32;
+    Ok(Some(Value::Int(capacity)))
+}
+
 /// Native `Duration.parse(CharSequence)` for real-JDK mode.
 ///
 /// JDK 25's `Duration.parse` (Duration.java:395) drives a compiled regex
@@ -10802,6 +10834,10 @@ pub fn register_essential_natives(registry: &mut NativeMethodRegistry) {
     // but test VMs use real-JDK mode and still need the print capture natives.
     register_test_harness_natives(registry);
 
+    registry.with_category(cratonvm_native_api::NativeKind::Intrinsic, |registry| {
+        register_spring_codec_intrinsics(registry);
+    });
+
     // JDK 25 VectorSupport declares these three ACC_NATIVE methods in
     // java.base. Keep them in the real-JDK essential path; the broader
     // incubator Vector API shims remain synthetic-only overrides.
@@ -12310,6 +12346,49 @@ pub fn register_essential_natives(registry: &mut NativeMethodRegistry) {
                 Some(v) => Ok(Some(Value::Object(Some(ctx.create_string(&v))))),
                 None => Ok(Some(Value::Object(None))),
             }
+        },
+    );
+    registry.register(
+        "java/lang/System",
+        "setProperties",
+        "(Ljava/util/Properties;)V",
+        |ctx, args| {
+            let entries = match args.first() {
+                Some(Value::Object(Some(props))) => {
+                    crate::properties_sidetable::snapshot_sidetable(ctx, *props)
+                }
+                _ => Vec::new(),
+            };
+
+            // Replace the VM's canonical system-property map, rather than
+            // layering the supplied Properties on top of the old map. Keycloak's
+            // AbstractConfigurationTest captures a baseline clone and resets via
+            // System.setProperties(clone); additive semantics leave stale
+            // kc.config.args values visible to later config builds.
+            let old_keys: Vec<String> = ctx
+                .list_system_properties()
+                .into_iter()
+                .map(|(k, _)| k)
+                .collect();
+            for key in old_keys {
+                let _ = ctx.remove_system_property(&key);
+            }
+            for (key, value) in &entries {
+                let _ = ctx.set_system_property(key, value);
+            }
+
+            let new_singleton = match args.first() {
+                Some(Value::Object(Some(props))) => Some(*props),
+                _ => None,
+            };
+            if let Some(old) = crate::lang_system::replace_system_props_singleton(new_singleton) {
+                crate::properties_sidetable::unmark_system_props(ctx, old);
+            }
+            if let Some(props) = new_singleton {
+                crate::properties_sidetable::mark_system_props(ctx, props);
+                crate::properties_sidetable::replace_sidetable(ctx, props, &entries);
+            }
+            Ok(None)
         },
     );
     registry.register(
@@ -14063,6 +14142,9 @@ pub fn register_essential_natives(registry: &mut NativeMethodRegistry) {
         "()Ljava/lang/module/ModuleDescriptor;",
         |ctx, args| {
             let this = obj_arg(args, 0)?;
+            if let Value::Object(Some(desc)) = ctx.get_field_by_name(this, "descriptor") {
+                return Ok(Some(Value::Object(Some(desc))));
+            }
             let module_name = module_name_of_mirror(ctx, this);
             if module_name.is_empty() {
                 // Unnamed module — matches real Module.getDescriptor()'s null.
@@ -14098,6 +14180,12 @@ pub fn register_essential_natives(registry: &mut NativeMethodRegistry) {
             ctx.set_field(desc, 0, name_val); // legacy synthetic slot
             ctx.set_field(desc, 1, Value::Int(0)); // legacy synthetic slot
             ctx.set_field_by_name(desc, "name", name_val);
+            for field in ["modifiers", "requires", "exports", "opens", "provides", "packages"] {
+                let empty = cratonvm_native_collections::make_hashset_with_elements(ctx, &[]);
+                let desc = ctx.read_native_pin(pin, desc);
+                ctx.set_field_by_name(desc, field, Value::Object(Some(empty)));
+            }
+            let desc = ctx.read_native_pin(pin, desc);
             ctx.set_field_by_name(desc, "uses", Value::Object(Some(uses_set)));
             ctx.set_field_by_name(desc, "open", Value::Int(if is_open { 1 } else { 0 }));
             // `automatic` deliberately left at its Java default (`false`) and
@@ -14694,6 +14782,12 @@ pub fn register_essential_natives(registry: &mut NativeMethodRegistry) {
         "(Ljava/lang/Class;)Ljava/lang/annotation/Annotation;",
         lang_class::native_annotated_type_get_annotation,
     );
+    registry.register(
+        "sun/reflect/annotation/AnnotatedTypeFactory$AnnotatedTypeBaseImpl",
+        "getAnnotatedOwnerType",
+        "()Ljava/lang/reflect/AnnotatedType;",
+        lang_class::native_annotated_type_get_annotated_owner_type,
+    );
     // `AnnotatedParameterizedType.getAnnotatedActualTypeArguments()` --
     // surfaces TYPE_ARGUMENT-level annotations (e.g. `@Valid` in
     // `List<@Valid Person>`) that real-JDK's null `getTypeAnnotationBytes0`
@@ -14941,30 +15035,37 @@ pub fn register_essential_natives(registry: &mut NativeMethodRegistry) {
     // returns "file" instead of "/C:/.../quarkus-run.jar", and Quarkus's
     // `Path.of(URLDecoder.decode(getPath(), UTF_8)).getParent().getParent().getParent()`
     // NPEs at QuarkusEntryPoint.doRun:67.
-    fn url_path_or_file_field(ctx: &mut dyn NativeContext, url: ObjectRef) -> Value {
+    fn url_path_or_file_field(
+        ctx: &mut dyn NativeContext,
+        url: ObjectRef,
+        prefer_file: bool,
+    ) -> Value {
         let n = ctx.object_num_fields(url);
         if n == 1 {
             // legacy synthetic URL: slot 0 holds the path String.
             return ctx.get_field(url, 0);
         }
-        // Real-JDK layout: read by name. Prefer "path"; fall back to "file".
-        let v = ctx.get_field_by_name(url, "path");
+        let named_first = if prefer_file { "file" } else { "path" };
+        let named_second = if prefer_file { "path" } else { "file" };
+        let slot_first = if prefer_file { 3 } else { 6 };
+        let slot_second = if prefer_file { 6 } else { 3 };
+
+        let v = ctx.get_field_by_name(url, named_first);
         if let Value::Object(Some(_)) = v {
             return v;
         }
-        let v = ctx.get_field_by_name(url, "file");
-        if let Value::Object(Some(_)) = v {
-            return v;
-        }
-        // Last-ditch: slot 3 (file) then slot 6 (path) for the JDK layout.
-        if n > 6 {
-            let v = ctx.get_field(url, 6);
+        if n > slot_first {
+            let v = ctx.get_field(url, slot_first);
             if let Value::Object(Some(_)) = v {
                 return v;
             }
         }
-        if n > 3 {
-            let v = ctx.get_field(url, 3);
+        let v = ctx.get_field_by_name(url, named_second);
+        if let Value::Object(Some(_)) = v {
+            return v;
+        }
+        if n > slot_second {
+            let v = ctx.get_field(url, slot_second);
             if let Value::Object(Some(_)) = v {
                 return v;
             }
@@ -14976,7 +15077,7 @@ pub fn register_essential_natives(registry: &mut NativeMethodRegistry) {
         "getPath",
         "()Ljava/lang/String;",
         |ctx, args| match args.first() {
-            Some(Value::Object(Some(url))) => Ok(Some(url_path_or_file_field(ctx, *url))),
+            Some(Value::Object(Some(url))) => Ok(Some(url_path_or_file_field(ctx, *url, false))),
             _ => Ok(Some(Value::Object(None))),
         },
     );
@@ -14985,7 +15086,7 @@ pub fn register_essential_natives(registry: &mut NativeMethodRegistry) {
         "getFile",
         "()Ljava/lang/String;",
         |ctx, args| match args.first() {
-            Some(Value::Object(Some(url))) => Ok(Some(url_path_or_file_field(ctx, *url))),
+            Some(Value::Object(Some(url))) => Ok(Some(url_path_or_file_field(ctx, *url, true))),
             _ => Ok(Some(Value::Object(None))),
         },
     );
@@ -29239,10 +29340,10 @@ macro_rules! unsafe_multibyte_get {
             if unsafe_obj(args, 1).is_none() {
                 let addr = unsafe_raw_addr(args, 2);
                 let mut bytes = [0u8; $width];
-                ctx.copy_from_native_memory(addr, &mut bytes);
-                let big_endian = unsafe_big_endian_arg(args);
-                let v: i64 = $assemble(&bytes, big_endian);
-                return Ok(Some(Value::Int(v as i32)));
+                if ctx.copy_from_native_memory(addr, &mut bytes) {
+                    let v: i64 = $assemble(&bytes, unsafe_big_endian_arg(args));
+                    return Ok(Some(Value::Int(v as i32)));
+                }
             }
             if let Some(obj) = unsafe_obj(args, 1) {
                 if let Some(bytes) = unsafe_read_bytes_from_array(ctx, obj, offset, $width) {
@@ -29251,7 +29352,7 @@ macro_rules! unsafe_multibyte_get {
                     return Ok(Some(Value::Int(v as i32)));
                 }
             }
-            // Not a primitive-array target — generic element/field access.
+            // Not a primitive-array/direct-memory target: generic element/field access.
             native_unsafe_get_int(ctx, args)
         }
     };
@@ -29296,14 +29397,15 @@ pub(crate) fn native_unsafe_get_long_mb(
     if unsafe_obj(args, 1).is_none() {
         let addr = unsafe_raw_addr(args, 2);
         let mut b = [0u8; 8];
-        ctx.copy_from_native_memory(addr, &mut b);
-        let big_endian = unsafe_big_endian_arg(args);
-        let v = if big_endian {
-            i64::from_be_bytes(b)
-        } else {
-            i64::from_le_bytes(b)
-        };
-        return Ok(Some(Value::Long(v)));
+        if ctx.copy_from_native_memory(addr, &mut b) {
+            let big_endian = unsafe_big_endian_arg(args);
+            let v = if big_endian {
+                i64::from_be_bytes(b)
+            } else {
+                i64::from_le_bytes(b)
+            };
+            return Ok(Some(Value::Long(v)));
+        }
     }
     if let Some(obj) = unsafe_obj(args, 1) {
         if let Some(b) = unsafe_read_bytes_from_array(ctx, obj, offset, 8) {
@@ -29358,47 +29460,35 @@ macro_rules! unsafe_multibyte_put {
             args: &[Value],
         ) -> MethodCallResult {
             let offset = unsafe_offset(args, 2);
-            if unsafe_obj(args, 1).is_none() {
-                let addr = unsafe_raw_addr(args, 2);
-                let val = args.get(3).and_then(|v| v.as_int()).unwrap_or(0);
-                let big_endian = matches!(args.get(4), Some(Value::Int(z)) if *z != 0);
-                let raw = (val as u32) & ((1u64 << ($width * 8)) - 1) as u32;
-                let mut bytes = [0u8; $width];
-                if big_endian {
-                    for i in 0..$width {
-                        bytes[$width - 1 - i] = (raw >> (i * 8)) as u8;
-                    }
-                } else {
-                    for i in 0..$width {
-                        bytes[i] = (raw >> (i * 8)) as u8;
+            let val = args.get(3).and_then(|v| v.as_int()).unwrap_or(0);
+            // The bigEndian flag, when present, is args[4].
+            let big_endian = matches!(args.get(4), Some(Value::Int(z)) if *z != 0);
+            let raw = (val as u32) & ((1u64 << ($width * 8)) - 1) as u32;
+            let mut bytes = [0u8; $width];
+            if big_endian {
+                for i in 0..$width {
+                    bytes[$width - 1 - i] = (raw >> (i * 8)) as u8;
+                }
+            } else {
+                for i in 0..$width {
+                    bytes[i] = (raw >> (i * 8)) as u8;
+                }
+            }
+            match unsafe_obj(args, 1) {
+                None => {
+                    if ctx.copy_to_native_memory(unsafe_raw_addr(args, 2), &bytes) {
+                        return Ok(None);
                     }
                 }
-                ctx.copy_to_native_memory(addr, &bytes);
-                return Ok(None);
-            }
-            if let Some(obj) = unsafe_obj(args, 1) {
-                if ctx.heap_kind_of(obj) == cratonvm_types::ObjectKind::Array
-                    && matches!(
-                        ctx.heap_element_type_of(obj),
-                        cratonvm_types::ArrayElementType::Byte
-                            | cratonvm_types::ArrayElementType::Boolean
-                    )
-                {
-                    let val = args.get(3).and_then(|v| v.as_int()).unwrap_or(0);
-                    // The bigEndian flag, when present, is args[4].
-                    let big_endian = matches!(args.get(4), Some(Value::Int(z)) if *z != 0);
-                    let raw = (val as u32) & ((1u64 << ($width * 8)) - 1) as u32;
-                    let mut bytes = [0u8; $width];
-                    if big_endian {
-                        for i in 0..$width {
-                            bytes[$width - 1 - i] = (raw >> (i * 8)) as u8;
-                        }
-                    } else {
-                        for i in 0..$width {
-                            bytes[i] = (raw >> (i * 8)) as u8;
-                        }
-                    }
-                    if unsafe_write_bytes_to_byte_array(ctx, obj, offset, &bytes) {
+                Some(obj) => {
+                    if ctx.heap_kind_of(obj) == cratonvm_types::ObjectKind::Array
+                        && matches!(
+                            ctx.heap_element_type_of(obj),
+                            cratonvm_types::ArrayElementType::Byte
+                                | cratonvm_types::ArrayElementType::Boolean
+                        )
+                        && unsafe_write_bytes_to_byte_array(ctx, obj, offset, &bytes)
+                    {
                         return Ok(None);
                     }
                 }
@@ -29418,21 +29508,21 @@ pub(crate) fn native_unsafe_put_long_mb(
     args: &[Value],
 ) -> MethodCallResult {
     let offset = unsafe_offset(args, 2);
+    let val = match args.get(3) {
+        Some(Value::Long(l)) => *l,
+        Some(Value::Int(i)) => *i as i64,
+        _ => 0,
+    };
+    let big_endian = matches!(args.get(4), Some(Value::Int(z)) if *z != 0);
+    let bytes = if big_endian {
+        (val as u64).to_be_bytes()
+    } else {
+        (val as u64).to_le_bytes()
+    };
     if unsafe_obj(args, 1).is_none() {
-        let addr = unsafe_raw_addr(args, 2);
-        let val = match args.get(3) {
-            Some(Value::Long(l)) => *l,
-            Some(Value::Int(i)) => *i as i64,
-            _ => 0,
-        };
-        let big_endian = matches!(args.get(4), Some(Value::Int(z)) if *z != 0);
-        let bytes = if big_endian {
-            (val as u64).to_be_bytes()
-        } else {
-            (val as u64).to_le_bytes()
-        };
-        ctx.copy_to_native_memory(addr, &bytes);
-        return Ok(None);
+        if ctx.copy_to_native_memory(unsafe_raw_addr(args, 2), &bytes) {
+            return Ok(None);
+        }
     }
     if let Some(obj) = unsafe_obj(args, 1) {
         if ctx.heap_kind_of(obj) == cratonvm_types::ObjectKind::Array
@@ -29441,18 +29531,6 @@ pub(crate) fn native_unsafe_put_long_mb(
                 cratonvm_types::ArrayElementType::Byte | cratonvm_types::ArrayElementType::Boolean
             )
         {
-            let val = match args.get(3) {
-                Some(Value::Long(l)) => *l,
-                Some(Value::Int(i)) => *i as i64,
-                _ => 0,
-            };
-            // For putLong the bigEndian flag is args[4].
-            let big_endian = matches!(args.get(4), Some(Value::Int(z)) if *z != 0);
-            let bytes = if big_endian {
-                (val as u64).to_be_bytes()
-            } else {
-                (val as u64).to_le_bytes()
-            };
             if unsafe_write_bytes_to_byte_array(ctx, obj, offset, &bytes) {
                 return Ok(None);
             }
@@ -34551,6 +34629,7 @@ fn register_t19_h2_shared_secrets_shim(registry: &mut NativeMethodRegistry) {
 // is robust to either the real-JDK private-field layout or our
 // synthetic minimum-field allocation.
 
+
 fn module_builder_alloc_with_named_fields(
     ctx: &mut dyn NativeContext,
     class_name: &str,
@@ -34566,14 +34645,84 @@ fn module_builder_alloc_with_named_fields(
     obj
 }
 
+fn module_builder_empty_set(ctx: &mut dyn NativeContext) -> Value {
+    Value::Object(Some(cratonvm_native_collections::make_hashset_with_elements(
+        ctx,
+        &[],
+    )))
+}
+
+fn module_builder_set_or_empty(ctx: &mut dyn NativeContext, value: Value) -> Value {
+    match value {
+        Value::Object(Some(_)) => value,
+        _ => module_builder_empty_set(ctx),
+    }
+}
+
+
+fn module_descriptor_set_field(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+    field: &str,
+) -> MethodCallResult {
+    let this = match args.first().copied() {
+        Some(Value::Object(Some(o))) => o,
+        _ => return Ok(Some(Value::Object(None))),
+    };
+    if let Value::Object(Some(value)) = ctx.get_field_by_name(this, field) {
+        return Ok(Some(Value::Object(Some(value))));
+    }
+    let this_pin = ctx.pin_native_root(this);
+    let empty = module_builder_empty_set(ctx);
+    let this = ctx.read_native_pin(this_pin, this);
+    ctx.set_field_by_name(this, field, empty);
+    ctx.unpin_native_roots(this_pin);
+    Ok(Some(empty))
+}
+
+fn native_module_descriptor_modifiers(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    module_descriptor_set_field(ctx, args, "modifiers")
+}
+
+fn native_module_descriptor_requires(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    module_descriptor_set_field(ctx, args, "requires")
+}
+
+fn native_module_descriptor_exports(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    module_descriptor_set_field(ctx, args, "exports")
+}
+
+fn native_module_descriptor_opens(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    module_descriptor_set_field(ctx, args, "opens")
+}
+
+fn native_module_descriptor_uses(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    module_descriptor_set_field(ctx, args, "uses")
+}
+
+fn native_module_descriptor_provides(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    module_descriptor_set_field(ctx, args, "provides")
+}
+
+fn native_module_descriptor_packages(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    module_descriptor_set_field(ctx, args, "packages")
+}
+
+
 fn native_module_builder_new_exports_qualified(
     ctx: &mut dyn NativeContext,
     args: &[Value],
 ) -> MethodCallResult {
     // (Set<Modifier>, String source, Set<String> targets) -> Exports
-    let mods = args.first().copied().unwrap_or(Value::Object(None));
+    let mods = module_builder_set_or_empty(
+        ctx,
+        args.first().copied().unwrap_or(Value::Object(None)),
+    );
     let source = args.get(1).copied().unwrap_or(Value::Object(None));
-    let targets = args.get(2).copied().unwrap_or(Value::Object(None));
+    let targets = module_builder_set_or_empty(
+        ctx,
+        args.get(2).copied().unwrap_or(Value::Object(None)),
+    );
     let obj = module_builder_alloc_with_named_fields(
         ctx,
         "java/lang/module/ModuleDescriptor$Exports",
@@ -34581,29 +34730,41 @@ fn native_module_builder_new_exports_qualified(
     );
     Ok(Some(Value::Object(Some(obj))))
 }
+
 
 fn native_module_builder_new_exports_unqualified(
     ctx: &mut dyn NativeContext,
     args: &[Value],
 ) -> MethodCallResult {
     // (Set<Modifier>, String source) -> Exports
-    let mods = args.first().copied().unwrap_or(Value::Object(None));
+    let mods = module_builder_set_or_empty(
+        ctx,
+        args.first().copied().unwrap_or(Value::Object(None)),
+    );
     let source = args.get(1).copied().unwrap_or(Value::Object(None));
+    let targets = module_builder_empty_set(ctx);
     let obj = module_builder_alloc_with_named_fields(
         ctx,
         "java/lang/module/ModuleDescriptor$Exports",
-        &[("mods", mods), ("source", source)],
+        &[("mods", mods), ("source", source), ("targets", targets)],
     );
     Ok(Some(Value::Object(Some(obj))))
 }
+
 
 fn native_module_builder_new_opens_qualified(
     ctx: &mut dyn NativeContext,
     args: &[Value],
 ) -> MethodCallResult {
-    let mods = args.first().copied().unwrap_or(Value::Object(None));
+    let mods = module_builder_set_or_empty(
+        ctx,
+        args.first().copied().unwrap_or(Value::Object(None)),
+    );
     let source = args.get(1).copied().unwrap_or(Value::Object(None));
-    let targets = args.get(2).copied().unwrap_or(Value::Object(None));
+    let targets = module_builder_set_or_empty(
+        ctx,
+        args.get(2).copied().unwrap_or(Value::Object(None)),
+    );
     let obj = module_builder_alloc_with_named_fields(
         ctx,
         "java/lang/module/ModuleDescriptor$Opens",
@@ -34612,26 +34773,35 @@ fn native_module_builder_new_opens_qualified(
     Ok(Some(Value::Object(Some(obj))))
 }
 
+
 fn native_module_builder_new_opens_unqualified(
     ctx: &mut dyn NativeContext,
     args: &[Value],
 ) -> MethodCallResult {
-    let mods = args.first().copied().unwrap_or(Value::Object(None));
+    let mods = module_builder_set_or_empty(
+        ctx,
+        args.first().copied().unwrap_or(Value::Object(None)),
+    );
     let source = args.get(1).copied().unwrap_or(Value::Object(None));
+    let targets = module_builder_empty_set(ctx);
     let obj = module_builder_alloc_with_named_fields(
         ctx,
         "java/lang/module/ModuleDescriptor$Opens",
-        &[("mods", mods), ("source", source)],
+        &[("mods", mods), ("source", source), ("targets", targets)],
     );
     Ok(Some(Value::Object(Some(obj))))
 }
+
 
 fn native_module_builder_new_requires_versioned(
     ctx: &mut dyn NativeContext,
     args: &[Value],
 ) -> MethodCallResult {
     // (Set<Modifier>, String mn, String compiledVersion) -> Requires
-    let mods = args.first().copied().unwrap_or(Value::Object(None));
+    let mods = module_builder_set_or_empty(
+        ctx,
+        args.first().copied().unwrap_or(Value::Object(None)),
+    );
     let mn = args.get(1).copied().unwrap_or(Value::Object(None));
     let compiled = args.get(2).copied().unwrap_or(Value::Object(None));
     let obj = module_builder_alloc_with_named_fields(
@@ -34642,12 +34812,16 @@ fn native_module_builder_new_requires_versioned(
     Ok(Some(Value::Object(Some(obj))))
 }
 
+
 fn native_module_builder_new_requires_short(
     ctx: &mut dyn NativeContext,
     args: &[Value],
 ) -> MethodCallResult {
     // (Set<Modifier>, String mn) -> Requires
-    let mods = args.first().copied().unwrap_or(Value::Object(None));
+    let mods = module_builder_set_or_empty(
+        ctx,
+        args.first().copied().unwrap_or(Value::Object(None)),
+    );
     let mn = args.get(1).copied().unwrap_or(Value::Object(None));
     let obj = module_builder_alloc_with_named_fields(
         ctx,
@@ -34686,14 +34860,16 @@ fn native_module_builder_new_version(
     Ok(Some(Value::Object(Some(obj))))
 }
 
+
 fn native_module_builder_build(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     // Instance method: build(int hashCode) -> ModuleDescriptor
     // args[0] = this (Builder), args[1] = hashCode int
-    // The real impl calls JLMA.newModuleDescriptor(name, version, …) — JLMA
-    // is null in our boot.  Allocate a synthetic ModuleDescriptor and copy
+    // The real impl calls JLMA.newModuleDescriptor(name, version, ...) - JLMA
+    // is null in our boot. Allocate a synthetic ModuleDescriptor and copy
     // over the readable Builder state into matching named fields.
     let this = args.first().copied().unwrap_or(Value::Object(None));
     let md = alloc_concurrent_synthetic(ctx, "java/lang/module/ModuleDescriptor", 16);
+    let md_pin = ctx.pin_native_root(md);
     if let Value::Object(Some(builder)) = this {
         for f in [
             "name",
@@ -34707,12 +34883,32 @@ fn native_module_builder_build(ctx: &mut dyn NativeContext, args: &[Value]) -> M
             "mainClass",
         ] {
             let v = ctx.get_field_by_name(builder, f);
+            let md = ctx.read_native_pin(md_pin, md);
             ctx.set_field_by_name(md, f, v);
         }
     }
+    for field in [
+        "modifiers",
+        "requires",
+        "exports",
+        "opens",
+        "uses",
+        "provides",
+        "packages",
+    ] {
+        let md_current = ctx.read_native_pin(md_pin, md);
+        if !matches!(ctx.get_field_by_name(md_current, field), Value::Object(Some(_))) {
+            let empty = module_builder_empty_set(ctx);
+            let md_current = ctx.read_native_pin(md_pin, md);
+            ctx.set_field_by_name(md_current, field, empty);
+        }
+    }
     if let Some(Value::Int(h)) = args.get(1) {
+        let md = ctx.read_native_pin(md_pin, md);
         ctx.set_field_by_name(md, "hashCode", Value::Int(*h));
     }
+    let md = ctx.read_native_pin(md_pin, md);
+    ctx.unpin_native_roots(md_pin);
     Ok(Some(Value::Object(Some(md))))
 }
 
@@ -34987,13 +35183,30 @@ fn register_module_builder_overrides(registry: &mut NativeMethodRegistry) {
         if let Value::Object(Some(d)) = ctx.get_field_by_name(this, "descriptor") {
             return Ok(Some(Value::Object(Some(d))));
         }
-        // Lazy allocate a synthetic ModuleDescriptor with a non-null
-        // `name` so the immediate downstream `.name()` call cannot
-        // NPE. Cache it on the ModuleReference instance.
+        // Lazy allocate a synthetic ModuleDescriptor with non-null fields so
+        // downstream real-JDK module/layer code can call `name()`, `opens()`,
+        // `exports()`, `uses()`, `provides()`, and hash/equals methods without
+        // tripping on partially initialized descriptor state. Cache it on the
+        // ModuleReference instance.
         let md = alloc_concurrent_synthetic(ctx, "java/lang/module/ModuleDescriptor", 16);
+        let md_pin = ctx.pin_native_root(md);
         let name_str = ctx.create_string("synthetic");
+        let md = ctx.read_native_pin(md_pin, md);
         ctx.set_field_by_name(md, "name", Value::Object(Some(name_str)));
+        for field in ["modifiers", "requires", "exports", "opens", "uses", "provides", "packages"] {
+            let empty = match ctx.new_object_initialized("java/util/HashSet", "()V", &[])? {
+                Some(Value::Object(Some(o))) => o,
+                _ => {
+                    ctx.unpin_native_roots(md_pin);
+                    return Ok(Some(Value::Object(Some(md))));
+                }
+            };
+            let md = ctx.read_native_pin(md_pin, md);
+            ctx.set_field_by_name(md, field, Value::Object(Some(empty)));
+        }
+        let md = ctx.read_native_pin(md_pin, md);
         ctx.set_field_by_name(this, "descriptor", Value::Object(Some(md)));
+        ctx.unpin_native_roots(md_pin);
         Ok(Some(Value::Object(Some(md))))
     };
     registry.register(
@@ -35028,6 +35241,43 @@ fn register_module_builder_overrides(registry: &mut NativeMethodRegistry) {
             Ok(Some(Value::Object(Some(s))))
         },
     );
+    for (method, callback) in [
+        (
+            "modifiers",
+            native_module_descriptor_modifiers as cratonvm_native_api::NativeCallback,
+        ),
+        (
+            "requires",
+            native_module_descriptor_requires as cratonvm_native_api::NativeCallback,
+        ),
+        (
+            "exports",
+            native_module_descriptor_exports as cratonvm_native_api::NativeCallback,
+        ),
+        (
+            "opens",
+            native_module_descriptor_opens as cratonvm_native_api::NativeCallback,
+        ),
+        (
+            "uses",
+            native_module_descriptor_uses as cratonvm_native_api::NativeCallback,
+        ),
+        (
+            "provides",
+            native_module_descriptor_provides as cratonvm_native_api::NativeCallback,
+        ),
+        (
+            "packages",
+            native_module_descriptor_packages as cratonvm_native_api::NativeCallback,
+        ),
+    ] {
+        registry.register(
+            "java/lang/module/ModuleDescriptor",
+            method,
+            "()Ljava/util/Set;",
+            callback,
+        );
+    }
     registry.set_category(__prev_cat);
 }
 
@@ -38462,7 +38712,12 @@ fn native_cdl_await_timeout(ctx: &mut dyn NativeContext, args: &[Value]) -> Meth
         if remaining.is_zero() {
             return Ok(Some(Value::Int(0))); // false — timed out
         }
-        let wait_ms = remaining.as_millis().min(10) as u64;
+        // `monitor_wait(..., Some(0))` means an indefinite wait in the VM.
+        // A small positive timeout (for example CountDownLatch.await(1, MILLISECONDS))
+        // can have less than one whole millisecond remaining after the bookkeeping
+        // above, and `Duration::as_millis()` truncates that to 0. Round positive
+        // sub-millisecond waits up to 1 ms so timed latch waits cannot park forever.
+        let wait_ms = remaining.as_millis().clamp(1, 10) as u64;
         ctx.monitor_enter(this);
         ctx.monitor_wait(this, Some(wait_ms))?;
         ctx.monitor_exit(this);
@@ -45627,15 +45882,40 @@ pub(crate) fn url_parse(ctx: &mut dyn NativeContext, this: ObjectRef, url_str: &
     // which used to leave `URI` field 5 empty and broke
     // `getSchemeSpecificPart() -> new File(...)` for Spring Boot's launcher.
     if let Some(rest) = url_str.strip_prefix("file:") {
-        let path_str = rest.to_string();
-        let path_obj = ctx.create_string(&path_str);
+        let (without_ref, ref_part) = if let Some(pos) = rest.find('#') {
+            (&rest[..pos], Some(&rest[pos + 1..]))
+        } else {
+            (rest, None)
+        };
+        let (path_str, query_part) = if let Some(pos) = without_ref.find('?') {
+            (&without_ref[..pos], Some(&without_ref[pos + 1..]))
+        } else {
+            (without_ref, None)
+        };
+        let file_str = if let Some(query) = query_part {
+            format!("{path_str}?{query}")
+        } else {
+            path_str.to_string()
+        };
+        let file_obj = ctx.create_string(&file_str);
+        let path_obj = ctx.create_string(path_str);
+        let query_obj = query_part
+            .filter(|query| !query.is_empty())
+            .map(|query| ctx.create_string(query));
+        let ref_obj = ref_part
+            .filter(|fragment| !fragment.is_empty())
+            .map(|fragment| ctx.create_string(fragment));
         let proto_obj = ctx.create_string("file");
         let host_empty = ctx.create_string("");
         ctx.set_field(this, URL_FIELD_PROTOCOL, Value::Object(Some(proto_obj)));
         ctx.set_field(this, URL_FIELD_HOST, Value::Object(Some(host_empty)));
         ctx.set_field(this, URL_FIELD_PORT, Value::Int(-1));
         ctx.set_field(this, URL_FIELD_PATH, Value::Object(Some(path_obj)));
-        ctx.set_field(this, URL_FIELD_QUERY, Value::Object(None));
+        ctx.set_field(this, URL_FIELD_QUERY, Value::Object(query_obj));
+        ctx.set_field_by_name(this, "file", Value::Object(Some(file_obj)));
+        ctx.set_field_by_name(this, "path", Value::Object(Some(path_obj)));
+        ctx.set_field_by_name(this, "query", Value::Object(query_obj));
+        ctx.set_field_by_name(this, "ref", Value::Object(ref_obj));
         // Intentionally skip writing `URL_FIELD_FULL` (slot index 5): for a
         // real-JDK URL instance that index aliases the real `authority`
         // field (see the sibling `jar:` fast path below, which already
@@ -45717,10 +45997,16 @@ pub(crate) fn url_parse(ctx: &mut dyn NativeContext, this: ObjectRef, url_str: &
     let proto_obj = ctx.create_string(protocol);
     let host_obj = ctx.create_string(host);
     let path_obj = ctx.create_string(path);
-    let query_obj = if query.is_empty() {
-        Value::Object(None)
+    let file_str = if query.is_empty() {
+        path.to_string()
     } else {
-        Value::Object(Some(ctx.create_string(query)))
+        format!("{path}?{query}")
+    };
+    let file_obj = ctx.create_string(&file_str);
+    let query_obj = if query.is_empty() {
+        None
+    } else {
+        Some(ctx.create_string(query))
     };
     let full_obj = ctx.create_string(url_str);
 
@@ -45728,8 +46014,11 @@ pub(crate) fn url_parse(ctx: &mut dyn NativeContext, this: ObjectRef, url_str: &
     ctx.set_field(this, URL_FIELD_HOST, Value::Object(Some(host_obj)));
     ctx.set_field(this, URL_FIELD_PORT, Value::Int(port));
     ctx.set_field(this, URL_FIELD_PATH, Value::Object(Some(path_obj)));
-    ctx.set_field(this, URL_FIELD_QUERY, query_obj);
+    ctx.set_field(this, URL_FIELD_QUERY, Value::Object(query_obj));
     ctx.set_field(this, URL_FIELD_FULL, Value::Object(Some(full_obj)));
+    ctx.set_field_by_name(this, "file", Value::Object(Some(file_obj)));
+    ctx.set_field_by_name(this, "path", Value::Object(Some(path_obj)));
+    ctx.set_field_by_name(this, "query", Value::Object(query_obj));
 }
 
 fn native_url_init(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
@@ -45806,6 +46095,9 @@ fn native_url_get_path(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCal
         Some(Value::Object(Some(o))) => *o,
         _ => return Ok(Some(Value::Object(None))),
     };
+    if let Value::Object(Some(path)) = ctx.get_field_by_name(this, "path") {
+        return Ok(Some(Value::Object(Some(path))));
+    }
     Ok(Some(ctx.get_field(this, URL_FIELD_PATH)))
 }
 fn native_url_get_query(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
@@ -45813,6 +46105,9 @@ fn native_url_get_query(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCa
         Some(Value::Object(Some(o))) => *o,
         _ => return Ok(Some(Value::Object(None))),
     };
+    if let Value::Object(Some(query)) = ctx.get_field_by_name(this, "query") {
+        return Ok(Some(Value::Object(Some(query))));
+    }
     Ok(Some(ctx.get_field(this, URL_FIELD_QUERY)))
 }
 fn native_url_get_file(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
@@ -45820,6 +46115,9 @@ fn native_url_get_file(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCal
         Some(Value::Object(Some(o))) => *o,
         _ => return Ok(Some(Value::Object(None))),
     };
+    if let Value::Object(Some(file)) = ctx.get_field_by_name(this, "file") {
+        return Ok(Some(Value::Object(Some(file))));
+    }
     let path = match ctx.get_field(this, URL_FIELD_PATH) {
         Value::Object(Some(s)) => ctx.read_string(s).unwrap_or_default(),
         _ => String::new(),

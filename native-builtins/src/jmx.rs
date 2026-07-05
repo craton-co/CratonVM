@@ -730,7 +730,36 @@ pub fn register_thread_impl(r: &mut NativeMethodRegistry) {
     r.set_category(cratonvm_native_api::NativeKind::SyntheticStub);
     let cls = "sun/management/ThreadImpl";
 
-    // No-op population helpers ([JI..., [J[J...) — all leave their output
+    // ThreadImpl.getThreadInfo(long, int) allocates an output array and asks
+    // this native to populate it. Fill a minimal but real ThreadInfo so callers
+    // that only need a stack-trace object do not see a fabricated null thread.
+    r.register(
+        cls,
+        "getThreadInfo1",
+        "([JI[Ljava/lang/management/ThreadInfo;)V",
+        |ctx, args| {
+            let ids = obj_arg(args, 0)?;
+            let out = obj_arg(args, 2)?;
+            let ids_pin = ctx.pin_native_root(ids);
+            let out_pin = ctx.pin_native_root(out);
+            let len = ctx.array_length(ids).min(ctx.array_length(out));
+            for i in 0..len {
+                let ids = ctx.read_native_pin(ids_pin, ids);
+                let thread_id = match ctx.get_array_element(ids, i) {
+                    Value::Long(id) if id > 0 => id,
+                    Value::Int(id) if id > 0 => id as i64,
+                    _ => continue,
+                };
+                let info = alloc_basic_thread_info(ctx, thread_id)?;
+                let out = ctx.read_native_pin(out_pin, out);
+                ctx.set_array_element(out, i, Value::Object(Some(info)));
+            }
+            ctx.unpin_native_roots(ids_pin);
+            Ok(None)
+        },
+    );
+
+    // No-op population helpers ([J[J...) — all leave their output
     // arrays untouched. This is honest, NOT fabricated: per-thread CPU
     // time, user time, allocated-memory, and contention monitoring are
     // genuinely unsupported (VMManagementImpl.isThreadCpuTimeSupported etc.
@@ -740,7 +769,6 @@ pub fn register_thread_impl(r: &mut NativeMethodRegistry) {
     let void_noop: fn(&mut dyn NativeContext, &[Value]) -> MethodCallResult =
         |_ctx, _args| Ok(None);
     for (name, desc) in [
-        ("getThreadInfo1", "([JI[Ljava/lang/management/ThreadInfo;)V"),
         ("getThreadTotalCpuTime0", "([J[J)V"),
         ("getThreadUserCpuTime0", "([J[J)V"),
         ("getThreadAllocatedMemory1", "([J[J)V"),
@@ -1690,6 +1718,62 @@ fn register_memory_usage(r: &mut NativeMethodRegistry) {
 // 5. ThreadMXBean — 6-field synthetic
 // ---------------------------------------------------------------------------
 
+fn jmx_class_id_or_object(ctx: &mut dyn NativeContext, class_name: &str) -> ClassId {
+    ctx.ensure_class_initialized(class_name)
+        .unwrap_or(ClassId::new(0))
+}
+
+fn alloc_basic_thread_info(
+    ctx: &mut dyn NativeContext,
+    thread_id: i64,
+) -> Result<ObjectRef, MethodCallFailed> {
+    if thread_id <= 0 {
+        return Err(RuntimeError::IllegalArgumentException {
+            message: "Invalid thread ID parameter".into(),
+        }
+        .into());
+    }
+
+    let stack_element_cid = jmx_class_id_or_object(ctx, "java/lang/StackTraceElement");
+    let monitor_info_cid = jmx_class_id_or_object(ctx, "java/lang/management/MonitorInfo");
+    let lock_info_cid = jmx_class_id_or_object(ctx, "java/lang/management/LockInfo");
+
+    let thread_name = ctx.create_string("main");
+    let name_pin = ctx.pin_native_root(thread_name);
+    let stack_trace = ctx.new_ref_array(stack_element_cid, 0);
+    let stack_pin = ctx.pin_native_root(stack_trace);
+    let locked_monitors = ctx.new_ref_array(monitor_info_cid, 0);
+    let monitors_pin = ctx.pin_native_root(locked_monitors);
+    let locked_synchronizers = ctx.new_ref_array(lock_info_cid, 0);
+    let synchronizers_pin = ctx.pin_native_root(locked_synchronizers);
+
+    let info = alloc_concurrent_synthetic(ctx, "java/lang/management/ThreadInfo", 18);
+
+    let thread_name = ctx.read_native_pin(name_pin, thread_name);
+    let stack_trace = ctx.read_native_pin(stack_pin, stack_trace);
+    let locked_monitors = ctx.read_native_pin(monitors_pin, locked_monitors);
+    let locked_synchronizers = ctx.read_native_pin(synchronizers_pin, locked_synchronizers);
+
+    ctx.set_field_by_name(info, "threadName", Value::Object(Some(thread_name)));
+    ctx.set_field_by_name(info, "threadId", Value::Long(thread_id));
+    ctx.set_field_by_name(info, "blockedTime", Value::Long(-1));
+    ctx.set_field_by_name(info, "blockedCount", Value::Long(0));
+    ctx.set_field_by_name(info, "waitedTime", Value::Long(-1));
+    ctx.set_field_by_name(info, "waitedCount", Value::Long(0));
+    ctx.set_field_by_name(info, "lockOwnerId", Value::Long(-1));
+    ctx.set_field_by_name(info, "priority", Value::Int(5));
+    ctx.set_field_by_name(info, "stackTrace", Value::Object(Some(stack_trace)));
+    ctx.set_field_by_name(info, "lockedMonitors", Value::Object(Some(locked_monitors)));
+    ctx.set_field_by_name(
+        info,
+        "lockedSynchronizers",
+        Value::Object(Some(locked_synchronizers)),
+    );
+
+    ctx.unpin_native_roots(name_pin);
+    Ok(info)
+}
+
 fn alloc_thread_mxbean(ctx: &mut dyn NativeContext) -> ObjectRef {
     let obj = alloc_concurrent_synthetic(ctx, "java/lang/management/ThreadMXBean", 6);
     let thread_count = ctx.active_thread_count();
@@ -1764,7 +1848,18 @@ fn register_thread_mxbean(r: &mut NativeMethodRegistry) {
         cls,
         "getThreadInfo",
         "(J)Ljava/lang/management/ThreadInfo;",
-        |_ctx, _args| Ok(Some(Value::Object(None))),
+        |ctx, args| {
+            let thread_id = args
+                .iter()
+                .find_map(|arg| match arg {
+                    Value::Long(id) => Some(*id),
+                    Value::Int(id) => Some(*id as i64),
+                    _ => None,
+                })
+                .unwrap_or_else(|| ctx.thread_id().max(1) as i64);
+            let info = alloc_basic_thread_info(ctx, thread_id)?;
+            Ok(Some(Value::Object(Some(info))))
+        },
     );
     // Surefire ForkedBooter.generateThreadDump: getThreadInfo([J, I) returns
     // a per-id ThreadInfo array. Returning an empty array (rather than null)

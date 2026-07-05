@@ -1,16 +1,47 @@
 # `ResourceTests` residuals — 5 distinct pre-existing bugs beyond the reported cluster
 
-Status: 3 of 5 FIXED (branch `fix/resourcetests-residuals`); 2 of 5 still open — see below.
+Status: FIXED (5 of 5 residuals). Moved to `docs/internal` after the 2026-07-05 follow-up pass.
 
 ## Summary
 
 The `core` bug-cluster report listed `org.springframework.core.io.ResourceTests`
 as one failing class (`AssertionError`, generic). Root-causing it surfaced
 several independent bugs. A first pass fixed the originally-reported cluster
-and got the class to 58/68 (see git history — not repeated here). This pass
-fixed 3 of the 5 documented residuals, getting the class to **61/68** with
-`--jdk real --jit on`. Two residuals remain open, documented in detail below
-for a follow-up pass.
+and got the class to 58/68 (see git history - not repeated here), then fixed
+3 of the 5 residuals documented here, getting the class to **61/68** with
+`--jdk real --jit on`.
+
+The 2026-07-05 follow-up pass fixed the remaining two documented residuals and
+one newly-visible URL filename parsing failure, getting the class to **65/68**.
+The remaining failures are separate HTTP URL/network issues now tracked in
+`docs/known-issues/resourcetests-remaining-http-url-failures.md`.
+
+## Resolution update - 2026-07-05
+
+The follow-up branch `fix/resourcetests-residuals-20260705-resourcetests-13506`
+closed the two open residuals from this document:
+
+- Residual 2 (`getFilePath()` Mockito/ByteBuddy): fixed annotated generic-array
+  type wrapping for `GenericArrayTypeImpl`, added the missing base annotated
+  owner native, and preserved `Path.toString()` native dispatch after Mockito
+  redefines `java.nio.file.Path`.
+- Residual 5 (`resourceCreateRelativeUnknown`): fixed the duplicate
+  `Files.size(Path)` native by routing it through the normalized VFS-aware path
+  helper and mapping missing files to typed `NoSuchFileException` behavior.
+- Also fixed the newly-visible `UrlResourceTests#filenameIsExtractedFromFilePath`
+  failure by splitting `file:` URL/URI synthetic fields into `file`, `path`,
+  `query`, and `ref` instead of leaking `?query` into `getPath()`.
+
+Verification on `/data/cratonvm-resourcetests-residuals-20260705-13506`:
+
+- `ResourceTests$UrlResourceTests#filenameIsExtractedFromFilePath`: 1/1 OK.
+- `ResourceTests$FileSystemResourceTests#getFilePath` followed by
+  `urlAndUriAreNormalizedWhenCreatedFromFile`: 2/2 OK in the same JVM.
+- Full `org.springframework.core.io.ResourceTests`: found=68, passed=65,
+  failed=3 (`res-residuals-13506-urlfix-jit-real-all-20260705-060934`).
+
+The remaining 3 failures are all HTTP URL/network cases, not the residuals
+tracked here.
 
 ## FIXED — Residual 1: `ClassPathResource.createRelative("../X.class")` fails `getURL()`
 

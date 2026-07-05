@@ -6125,15 +6125,7 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
         },
     );
 
-    r.register(files, "size", "(Ljava/nio/file/Path;)J", |ctx, args| {
-        let path_obj = obj_arg(args, 0)?;
-        let p = p57_read_path(ctx, path_obj);
-        let size = match vfs_read(&p) {
-            Some(r) => r.map(|b| b.len() as u64).unwrap_or(0),
-            None => std::fs::metadata(&p).map(|m| m.len()).unwrap_or(0),
-        };
-        Ok(Some(Value::Long(size as i64)))
-    });
+    r.register(files, "size", "(Ljava/nio/file/Path;)J", p59_files_size);
 
     // `Files.list` / `Files.walk` return a `Stream<Path>` built (in the real
     // JDK) by wrapping `newDirectoryStream(dir).iterator()` in a
@@ -12235,10 +12227,10 @@ pub fn register_phase57_file(r: &mut NativeMethodRegistry) {
     // `ProtocolResolver` probe: `GenericApplicationContextTests.
     // getResourceWithCustomResourceLoader` relies on `FileSystemResource`'s
     // `this.file.toPath()` throwing for exactly this). See
-    // `p57_validate_windows_path` (registered alongside `Paths.get` above)
-    // for the same check — duplicated here rather than shared because this
-    // registration builds a differently-shaped synthetic Path (2 fields via
-    // `alloc_concurrent_synthetic` directly, not `p57_alloc_path`).
+    // `p57_validate_windows_path` (registered alongside `Paths.get` above).
+    // Allocate through `p57_alloc_path` so File paths use the same internal
+    // separator canonicalisation as `Paths.get(...)`; Windows `File` display
+    // paths contain `\`, but `Path.toUri()` must render `/`, not `%5C`.
     r.register(file, "toPath", "()Ljava/nio/file/Path;", |ctx, args| {
         let this = obj_arg(args, 0)?;
         let path = file_read_path(ctx, this);
@@ -12265,10 +12257,7 @@ pub fn register_phase57_file(r: &mut NativeMethodRegistry) {
                 .into()),
             };
         }
-        let p = alloc_concurrent_synthetic(ctx, "java/nio/file/Path", 2);
-        let s = ctx.create_string(&path);
-        ctx.set_field(p, 0, Value::Object(Some(s)));
-        Ok(Some(Value::Object(Some(p))))
+        Ok(Some(Value::Object(Some(p57_alloc_path(ctx, &path)))))
     });
     r.register(file, "toURI", "()Ljava/net/URI;", |ctx, args| {
         let this = obj_arg(args, 0)?;
@@ -21121,6 +21110,27 @@ fn extract_path_string(ctx: &mut dyn NativeContext, arg: Option<&Value>) -> Stri
     p57_to_os_path(&raw)
 }
 
+fn p59_files_size(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let path_str = extract_path_string(ctx, args.first());
+    if let Some(bytes) = vfs_read(&path_str) {
+        return match bytes {
+            Ok(b) => Ok(Some(Value::Long(b.len() as i64))),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                Err(p57_no_such_file(ctx, &path_str))
+            }
+            Err(e) => Err(p57_io_error(&e)),
+        };
+    }
+
+    match std::fs::metadata(&path_str) {
+        Ok(meta) => Ok(Some(Value::Long(meta.len() as i64))),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            Err(p57_no_such_file(ctx, &path_str))
+        }
+        Err(e) => Err(p57_io_error(&e)),
+    }
+}
+
 /// Convert a SystemTime to epoch millis
 fn system_time_to_millis(t: std::time::SystemTime) -> i64 {
     t.duration_since(std::time::UNIX_EPOCH)
@@ -23844,23 +23854,7 @@ pub(crate) fn register_p61_files_path(r: &mut NativeMethodRegistry) {
             }
         },
     );
-    r.register(files, "size", "(Ljava/nio/file/Path;)J", |ctx, args| {
-        if let Some(Value::Object(Some(path_ref))) = args.first() {
-            let path_str = match ctx.get_field(*path_ref, 0) {
-                Value::Object(Some(s)) => ctx.read_string(s).unwrap_or_default(),
-                _ => return Ok(Some(Value::Long(0))),
-            };
-            let size = match vfs_read(&path_str) {
-                Some(r) => r.map(|b| b.len() as i64).unwrap_or(0),
-                None => std::fs::metadata(&path_str)
-                    .map(|m| m.len() as i64)
-                    .unwrap_or(0),
-            };
-            Ok(Some(Value::Long(size)))
-        } else {
-            Ok(Some(Value::Long(0)))
-        }
-    });
+    r.register(files, "size", "(Ljava/nio/file/Path;)J", p59_files_size);
     r.register(
         files,
         "isReadable",
@@ -30747,9 +30741,12 @@ pub(crate) fn register_p66_thread_builder(r: &mut NativeMethodRegistry) {
             Ok(Some(Value::Int(0)))
         }
     });
-    // Thread.threadId() — Java 19
+    // Thread.threadId() — Java 19. Some single-threaded launcher paths do not
+    // have a positive VM thread id yet; expose the same main-thread id that the
+    // ThreadMXBean stubs publish from getAllThreadIds().
     r.register(t, "threadId", "()J", |ctx, _args| {
-        Ok(Some(Value::Long(ctx.thread_id() as i64)))
+        let tid = ctx.thread_id().max(1);
+        Ok(Some(Value::Long(tid as i64)))
     });
     r.set_category(__prev_cat);
 }
@@ -34385,19 +34382,19 @@ pub(crate) fn register_p67_misc(r: &mut NativeMethodRegistry) {
         sw,
         "forEach",
         "(Ljava/util/function/Consumer;)V",
-        native_noop_with_this,
+        p59_sw_for_each,
     );
     r.register(
         sw,
         "walk",
         "(Ljava/util/function/Function;)Ljava/lang/Object;",
-        |_ctx, _args| Ok(Some(Value::Object(None))),
+        p59_sw_walk,
     );
     r.register(
         sw,
         "getCallerClass",
         "()Ljava/lang/Class;",
-        |_ctx, _args| Ok(Some(Value::Object(None))),
+        p59_sw_get_caller_class,
     );
 
     // StackWalker.Option enum

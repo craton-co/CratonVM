@@ -224,11 +224,31 @@ fn module_packages_evict_if_needed(t: &mut std::collections::HashMap<i32, Vec<St
     }
 }
 
-/// Build the singleton boot ModuleLayer.
-fn build_boot_layer(ctx: &mut dyn NativeContext) -> ObjectRef {
+/// Build a synthetic boot ModuleLayer with the real JDK collection fields
+/// initialized. Older code treated ModuleLayer as a one-slot synthetic object,
+/// but real JDK bytecode reads fields such as `parents` when defining child
+/// layers.
+fn build_boot_layer(
+    ctx: &mut dyn NativeContext,
+) -> Result<ObjectRef, cratonvm_types::error::MethodCallFailed> {
     let layer = alloc_concurrent_synthetic(ctx, "java/lang/ModuleLayer", MODULE_LAYER_FIELD_COUNT);
-    ctx.set_field(layer, 0, Value::Int(1));
-    layer
+    let layer_pin = ctx.pin_native_root(layer);
+
+    let parents = new_initialized_object(ctx, "java/util/ArrayList", "()V", &[], "layer parents")?;
+    let layer = ctx.read_native_pin(layer_pin, layer);
+    ctx.set_field_by_name(layer, "parents", Value::Object(Some(parents)));
+
+    let name_to_module =
+        new_initialized_object(ctx, "java/util/HashMap", "()V", &[], "layer nameToModule")?;
+    let layer = ctx.read_native_pin(layer_pin, layer);
+    ctx.set_field_by_name(layer, "nameToModule", Value::Object(Some(name_to_module)));
+
+    let modules = new_initialized_object(ctx, "java/util/HashSet", "()V", &[], "layer modules")?;
+    let layer = ctx.read_native_pin(layer_pin, layer);
+    ctx.set_field_by_name(layer, "modules", Value::Object(Some(modules)));
+
+    ctx.unpin_native_roots(layer_pin);
+    Ok(layer)
 }
 
 /// Build a `java.util.HashSet<String>` pre-populated with `packages`, backed
@@ -290,7 +310,7 @@ pub(crate) fn native_module_layer_boot(
     ctx: &mut dyn NativeContext,
     _args: &[Value],
 ) -> MethodCallResult {
-    let layer = build_boot_layer(ctx);
+    let layer = build_boot_layer(ctx)?;
     Ok(Some(Value::Object(Some(layer))))
 }
 
@@ -322,7 +342,7 @@ pub(crate) fn native_module_layer_find_module(
 
     let layer_ref = match args.first() {
         Some(Value::Object(Some(l))) => *l,
-        _ => build_boot_layer(ctx),
+        _ => build_boot_layer(ctx)?,
     };
     let module = build_module(ctx, &name, layer_ref);
     let opt = wrap_optional_present(ctx, module);
@@ -383,7 +403,7 @@ pub(crate) fn native_module_get_layer(
     let this = match args.first() {
         Some(Value::Object(Some(o))) => *o,
         _ => {
-            let layer = build_boot_layer(ctx);
+            let layer = build_boot_layer(ctx)?;
             return Ok(Some(Value::Object(Some(layer))));
         }
     };
@@ -391,7 +411,7 @@ pub(crate) fn native_module_get_layer(
     if let Value::Object(Some(_)) = existing {
         return Ok(Some(existing));
     }
-    let layer = build_boot_layer(ctx);
+    let layer = build_boot_layer(ctx)?;
     ctx.set_field_by_name(this, "layer", Value::Object(Some(layer)));
     Ok(Some(Value::Object(Some(layer))))
 }
@@ -405,8 +425,85 @@ pub(crate) fn native_module_get_layer(
 /// in real-JDK mode where we don't model JPMS module graphs.
 pub(crate) fn native_module_layer_modules(
     ctx: &mut dyn NativeContext,
-    _args: &[Value],
+    args: &[Value],
 ) -> MethodCallResult {
+    if let Some(Value::Object(Some(layer))) = args.first() {
+        // Real layers produced by ModuleLayer.defineModules populate the
+        // canonical nameToModule map even when their cached modules set is
+        // still null. Derive and cache modules from that map so
+        // ServiceLoader.load(layer, service) can scan provider modules.
+        if let Value::Object(Some(name_to_module)) = ctx.get_field_by_name(*layer, "nameToModule") {
+            let layer_pin = ctx.pin_native_root(*layer);
+            let map_pin = ctx.pin_native_root(name_to_module);
+            let map = ctx.read_native_pin(map_pin, name_to_module);
+            let values_result = ctx.invoke_virtual(map, "values", "()Ljava/util/Collection;", &[])?;
+            if let Some(Value::Object(Some(values))) = values_result {
+                let values_pin = ctx.pin_native_root(values);
+                let values = ctx.read_native_pin(values_pin, values);
+                let modules = new_initialized_object(
+                    ctx,
+                    "java/util/HashSet",
+                    "(Ljava/util/Collection;)V",
+                    &[Value::Object(Some(values))],
+                    "layer modules",
+                )?;
+                let catalog = match ctx.invoke(
+                    "jdk/internal/module/ServicesCatalog",
+                    "create",
+                    "()Ljdk/internal/module/ServicesCatalog;",
+                    &[],
+                )? {
+                    Some(Value::Object(Some(catalog))) => Some(catalog),
+                    _ => None,
+                };
+                if let Some(catalog) = catalog {
+                    let catalog_pin = ctx.pin_native_root(catalog);
+                    let values = ctx.read_native_pin(values_pin, values);
+                    if let Some(Value::Object(Some(iter))) =
+                        ctx.invoke_virtual(values, "iterator", "()Ljava/util/Iterator;", &[])?
+                    {
+                        let iter_pin = ctx.pin_native_root(iter);
+                        loop {
+                            let iter = ctx.read_native_pin(iter_pin, iter);
+                            let has_next = ctx.invoke_virtual(iter, "hasNext", "()Z", &[])?;
+                            let has_next = matches!(has_next, Some(Value::Int(v)) if v != 0);
+                            if !has_next {
+                                break;
+                            }
+                            let iter = ctx.read_native_pin(iter_pin, iter);
+                            if let Some(Value::Object(Some(module))) =
+                                ctx.invoke_virtual(iter, "next", "()Ljava/lang/Object;", &[])?
+                            {
+                                let catalog = ctx.read_native_pin(catalog_pin, catalog);
+                                ctx.invoke(
+                                    "jdk/internal/module/ServicesCatalog",
+                                    "register",
+                                    "(Ljava/lang/Module;)V",
+                                    &[Value::Object(Some(catalog)), Value::Object(Some(module))],
+                                )?;
+                            }
+                        }
+                        ctx.unpin_native_roots(iter_pin);
+                    }
+                    let layer = ctx.read_native_pin(layer_pin, *layer);
+                    let catalog = ctx.read_native_pin(catalog_pin, catalog);
+                    ctx.set_field_by_name(layer, "servicesCatalog", Value::Object(Some(catalog)));
+                    ctx.unpin_native_roots(catalog_pin);
+                }
+                let layer = ctx.read_native_pin(layer_pin, *layer);
+                ctx.set_field_by_name(layer, "modules", Value::Object(Some(modules)));
+                ctx.unpin_native_roots(values_pin);
+                ctx.unpin_native_roots(map_pin);
+                ctx.unpin_native_roots(layer_pin);
+                return Ok(Some(Value::Object(Some(modules))));
+            }
+            ctx.unpin_native_roots(map_pin);
+            ctx.unpin_native_roots(layer_pin);
+        }
+        if let Value::Object(Some(modules)) = ctx.get_field_by_name(*layer, "modules") {
+            return Ok(Some(Value::Object(Some(modules))));
+        }
+    }
     // Build a REAL empty HashSet via its constructor. A synthetic HashSet with
     // slot-based fields breaks in real-JDK mode: the real `HashSet.iterator()`
     // bytecode reads `this.map` (a HashMap) which our synthetic object never
@@ -415,6 +512,134 @@ pub(crate) fn native_module_layer_modules(
     // scan (StandardJarScanner.doScanClassPath) NPE'd on `iterator.hasNext()`,
     // failing every embedded-server context start.
     ctx.new_object_initialized("java/util/HashSet", "()V", &[])
+}
+
+fn new_initialized_object(
+    ctx: &mut dyn NativeContext,
+    class_name: &str,
+    descriptor: &str,
+    args: &[Value],
+    label: &str,
+) -> Result<ObjectRef, cratonvm_types::error::MethodCallFailed> {
+    match ctx.new_object_initialized(class_name, descriptor, args)? {
+        Some(Value::Object(Some(o))) => Ok(o),
+        _ => Err(RuntimeError::IllegalStateException {
+            message: format!("ModuleLayer.configuration: could not allocate {label}"),
+        }
+        .into()),
+    }
+}
+
+fn collection_add(
+    ctx: &mut dyn NativeContext,
+    collection: ObjectRef,
+    value: ObjectRef,
+) -> Result<(), cratonvm_types::error::MethodCallFailed> {
+    ctx.invoke(
+        "java/util/HashSet",
+        "add",
+        "(Ljava/lang/Object;)Z",
+        &[Value::Object(Some(collection)), Value::Object(Some(value))],
+    )?;
+    Ok(())
+}
+
+fn map_put(
+    ctx: &mut dyn NativeContext,
+    map: ObjectRef,
+    key: ObjectRef,
+    value: ObjectRef,
+) -> Result<(), cratonvm_types::error::MethodCallFailed> {
+    ctx.invoke(
+        "java/util/HashMap",
+        "put",
+        "(Ljava/lang/Object;Ljava/lang/Object;)Ljava/lang/Object;",
+        &[
+            Value::Object(Some(map)),
+            Value::Object(Some(key)),
+            Value::Object(Some(value)),
+        ],
+    )?;
+    Ok(())
+}
+
+fn build_unqualified_export(
+    ctx: &mut dyn NativeContext,
+    package_name: &str,
+) -> Result<ObjectRef, cratonvm_types::error::MethodCallFailed> {
+    let export = alloc_concurrent_synthetic(
+        ctx,
+        "java/lang/module/ModuleDescriptor$Exports",
+        4,
+    );
+    let export_pin = ctx.pin_native_root(export);
+    let mods = new_initialized_object(ctx, "java/util/HashSet", "()V", &[], "export mods")?;
+    let targets = new_initialized_object(ctx, "java/util/HashSet", "()V", &[], "export targets")?;
+    let source = ctx.create_string(package_name);
+    let export = ctx.read_native_pin(export_pin, export);
+    ctx.set_field_by_name(export, "mods", Value::Object(Some(mods)));
+    ctx.set_field_by_name(export, "source", Value::Object(Some(source)));
+    ctx.set_field_by_name(export, "targets", Value::Object(Some(targets)));
+    ctx.unpin_native_roots(export_pin);
+    Ok(export)
+}
+
+fn build_java_base_resolved_module(
+    ctx: &mut dyn NativeContext,
+    cfg: ObjectRef,
+) -> Result<ObjectRef, cratonvm_types::error::MethodCallFailed> {
+    let cfg_pin = ctx.pin_native_root(cfg);
+    let md = alloc_concurrent_synthetic(ctx, "java/lang/module/ModuleDescriptor", 16);
+    let md_pin = ctx.pin_native_root(md);
+    let java_base = ctx.create_string("java.base");
+    let md = ctx.read_native_pin(md_pin, md);
+    ctx.set_field_by_name(md, "name", Value::Object(Some(java_base)));
+
+    // Keep descriptor collection accessors from observing null if downstream
+    // resolver or layer code asks for packages/exports/opens/etc. We only need
+    // an identity-correct java.base descriptor here, so empty collections are
+    // sufficient and match the previous empty-configuration policy.
+    for field in ["modifiers", "requires", "exports", "opens", "uses", "provides", "packages"] {
+        let empty = new_initialized_object(ctx, "java/util/HashSet", "()V", &[], field)?;
+        let md = ctx.read_native_pin(md_pin, md);
+        ctx.set_field_by_name(md, field, Value::Object(Some(empty)));
+    }
+
+    let exports = new_initialized_object(ctx, "java/util/HashSet", "()V", &[], "java.base exports")?;
+    let exports_pin = ctx.pin_native_root(exports);
+    let packages = new_initialized_object(ctx, "java/util/HashSet", "()V", &[], "java.base packages")?;
+    let packages_pin = ctx.pin_native_root(packages);
+    for package_name in BOOT_JDK_PACKAGES {
+        let export = build_unqualified_export(ctx, package_name)?;
+        let exports = ctx.read_native_pin(exports_pin, exports);
+        collection_add(ctx, exports, export)?;
+
+        let package_string = ctx.create_string(package_name);
+        let packages = ctx.read_native_pin(packages_pin, packages);
+        collection_add(ctx, packages, package_string)?;
+    }
+    let md = ctx.read_native_pin(md_pin, md);
+    let exports = ctx.read_native_pin(exports_pin, exports);
+    let packages = ctx.read_native_pin(packages_pin, packages);
+    ctx.set_field_by_name(md, "exports", Value::Object(Some(exports)));
+    ctx.set_field_by_name(md, "packages", Value::Object(Some(packages)));
+    ctx.unpin_native_roots(packages_pin);
+    ctx.unpin_native_roots(exports_pin);
+
+    let mref = alloc_concurrent_synthetic(ctx, "jdk/internal/module/ModuleReferenceImpl", 8);
+    let mref_pin = ctx.pin_native_root(mref);
+    let md = ctx.read_native_pin(md_pin, md);
+    ctx.set_field_by_name(mref, "descriptor", Value::Object(Some(md)));
+
+    let resolved = alloc_concurrent_synthetic(ctx, "java/lang/module/ResolvedModule", 2);
+    let cfg = ctx.read_native_pin(cfg_pin, cfg);
+    let mref = ctx.read_native_pin(mref_pin, mref);
+    ctx.set_field_by_name(resolved, "cf", Value::Object(Some(cfg)));
+    ctx.set_field_by_name(resolved, "mref", Value::Object(Some(mref)));
+    ctx.unpin_native_roots(mref_pin);
+    ctx.unpin_native_roots(md_pin);
+    ctx.unpin_native_roots(cfg_pin);
+    Ok(resolved)
 }
 
 /// `ModuleLayer.configuration()` ? return an empty synthetic `Configuration`.
@@ -426,66 +651,71 @@ pub(crate) fn native_module_layer_modules(
 /// `Configuration.findModule` dereferences private caches such as
 /// `nameToModule`. A one-slot synthetic object left those caches null and
 /// failed before module descriptor checks could run. Seed the real private
-/// collection fields with empty, initialized JDK collections so the bytecode
-/// path sees an empty boot configuration instead of a corrupt one.
+/// collection fields with initialized JDK collections and include the one
+/// mandatory boot module, `java.base`, so named application/provider modules
+/// can resolve their implicit base-module dependency.
 pub(crate) fn native_module_layer_configuration(
     ctx: &mut dyn NativeContext,
-    _args: &[Value],
+    args: &[Value],
 ) -> MethodCallResult {
+    let layer = match args.first() {
+        Some(Value::Object(Some(o))) => Some(*o),
+        _ => None,
+    };
+    if let Some(layer) = layer {
+        if let Value::Object(Some(cfg)) = ctx.get_field_by_name(layer, "cf") {
+            return Ok(Some(Value::Object(Some(cfg))));
+        }
+    }
+
     let cfg = alloc_concurrent_synthetic(ctx, "java/lang/module/Configuration", 5);
     let cfg_pin = ctx.pin_native_root(cfg);
 
-    let parents = match ctx.new_object_initialized("java/util/ArrayList", "()V", &[])? {
-        Some(Value::Object(Some(o))) => o,
-        _ => {
-            ctx.unpin_native_roots(cfg_pin);
-            return Err(RuntimeError::IllegalStateException {
-                message: "ModuleLayer.configuration: could not allocate parents".to_string(),
-            }
-            .into());
-        }
-    };
+    let parents = new_initialized_object(ctx, "java/util/ArrayList", "()V", &[], "parents")?;
     let cfg = ctx.read_native_pin(cfg_pin, cfg);
     ctx.set_field_by_name(cfg, "parents", Value::Object(Some(parents)));
 
-    let graph = match ctx.new_object_initialized("java/util/HashMap", "()V", &[])? {
-        Some(Value::Object(Some(o))) => o,
-        _ => {
-            ctx.unpin_native_roots(cfg_pin);
-            return Err(RuntimeError::IllegalStateException {
-                message: "ModuleLayer.configuration: could not allocate graph".to_string(),
-            }
-            .into());
-        }
-    };
+    let graph = new_initialized_object(ctx, "java/util/HashMap", "()V", &[], "graph")?;
+    let graph_pin = ctx.pin_native_root(graph);
     let cfg = ctx.read_native_pin(cfg_pin, cfg);
     ctx.set_field_by_name(cfg, "graph", Value::Object(Some(graph)));
 
-    let modules = match ctx.new_object_initialized("java/util/HashSet", "()V", &[])? {
-        Some(Value::Object(Some(o))) => o,
-        _ => {
-            ctx.unpin_native_roots(cfg_pin);
-            return Err(RuntimeError::IllegalStateException {
-                message: "ModuleLayer.configuration: could not allocate modules".to_string(),
-            }
-            .into());
-        }
-    };
+    let modules = new_initialized_object(ctx, "java/util/HashSet", "()V", &[], "modules")?;
+    let modules_pin = ctx.pin_native_root(modules);
     let cfg = ctx.read_native_pin(cfg_pin, cfg);
     ctx.set_field_by_name(cfg, "modules", Value::Object(Some(modules)));
 
-    let name_to_module = match ctx.new_object_initialized("java/util/HashMap", "()V", &[])? {
-        Some(Value::Object(Some(o))) => o,
-        _ => {
-            ctx.unpin_native_roots(cfg_pin);
-            return Err(RuntimeError::IllegalStateException {
-                message: "ModuleLayer.configuration: could not allocate nameToModule".to_string(),
-            }
-            .into());
-        }
-    };
+    let name_to_module =
+        new_initialized_object(ctx, "java/util/HashMap", "()V", &[], "nameToModule")?;
+    let name_to_module_pin = ctx.pin_native_root(name_to_module);
     let cfg = ctx.read_native_pin(cfg_pin, cfg);
     ctx.set_field_by_name(cfg, "nameToModule", Value::Object(Some(name_to_module)));
+
+    let java_base = build_java_base_resolved_module(ctx, cfg)?;
+    let java_base_pin = ctx.pin_native_root(java_base);
+    let modules = ctx.read_native_pin(modules_pin, modules);
+    let java_base = ctx.read_native_pin(java_base_pin, java_base);
+    collection_add(ctx, modules, java_base)?;
+
+    let empty_reads = new_initialized_object(ctx, "java/util/HashSet", "()V", &[], "java.base reads")?;
+    let graph = ctx.read_native_pin(graph_pin, graph);
+    let java_base = ctx.read_native_pin(java_base_pin, java_base);
+    map_put(ctx, graph, java_base, empty_reads)?;
+
+    let key = ctx.create_string("java.base");
+    let name_to_module = ctx.read_native_pin(name_to_module_pin, name_to_module);
+    let java_base = ctx.read_native_pin(java_base_pin, java_base);
+    map_put(ctx, name_to_module, key, java_base)?;
+
+    if let Some(layer) = layer {
+        let cfg = ctx.read_native_pin(cfg_pin, cfg);
+        ctx.set_field_by_name(layer, "cf", Value::Object(Some(cfg)));
+    }
+
+    ctx.unpin_native_roots(java_base_pin);
+    ctx.unpin_native_roots(name_to_module_pin);
+    ctx.unpin_native_roots(modules_pin);
+    ctx.unpin_native_roots(graph_pin);
     ctx.unpin_native_roots(cfg_pin);
 
     Ok(Some(Value::Object(Some(cfg))))
@@ -558,6 +788,39 @@ pub fn register_jboss_jdkspecific(registry: &mut NativeMethodRegistry) {
         "getLayer",
         "()Ljava/lang/ModuleLayer;",
         native_module_get_layer,
+    );
+    // VM-sync hook used by the real JDK Module/ModuleLayer constructors after
+    // they have already initialized the Java-side Module object. CratonVM's
+    // access/readability checks are backed by its own ModuleRegistry and the
+    // synthetic layer fields, so there is no extra VM module table to update.
+    registry.register(
+        m,
+        "defineModule0",
+        "(Ljava/lang/Module;ZLjava/lang/String;Ljava/lang/String;[Ljava/lang/Object;)V",
+        |_ctx, _args| Ok(None),
+    );
+    registry.register(
+        m,
+        "addExportsToAll0",
+        "(Ljava/lang/Module;Ljava/lang/String;)V",
+        |_ctx, _args| Ok(None),
+    );
+    registry.register(
+        "java/lang/module/ResolvedModule",
+        "getDescriptor",
+        "()Ljava/lang/module/ModuleDescriptor;",
+        |ctx, args| {
+            let this = match args.first().copied() {
+                Some(Value::Object(Some(o))) => o,
+                _ => return Ok(Some(Value::Object(None))),
+            };
+            if let Value::Object(Some(mref)) = ctx.get_field_by_name(this, "mref") {
+                if let Value::Object(Some(desc)) = ctx.get_field_by_name(mref, "descriptor") {
+                    return Ok(Some(Value::Object(Some(desc))));
+                }
+            }
+            Ok(Some(Value::Object(None)))
+        },
     );
     // T19_H12_MODULE_GETCLASSLOADER — `java.lang.Module.getClassLoader()`.
     //
