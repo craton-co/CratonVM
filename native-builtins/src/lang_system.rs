@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: Apache-2.0
+﻿// SPDX-License-Identifier: Apache-2.0
 // Copyright 2024-2026 Craton Software Company
 
 //! System, Runtime, ProcessBuilder, and Thread native method implementations.
@@ -30,7 +30,7 @@ static PRE_EXIT_HOOK: std::sync::OnceLock<PreExitHook> = std::sync::OnceLock::ne
 /// Install a pre-`std::process::exit` callback that fires from
 /// `native_system_exit` / `native_runtime_exit` immediately before the
 /// process is torn down. Intended for diagnostic dumps (dispatch_trace
-/// ring, last-N-bytecodes printout). First-installer wins — subsequent
+/// ring, last-N-bytecodes printout). First-installer wins вЂ” subsequent
 /// calls are silent no-ops, matching `OnceLock` semantics.
 pub fn set_pre_exit_hook(hook: PreExitHook) {
     let _ = PRE_EXIT_HOOK.set(hook);
@@ -164,20 +164,51 @@ pub(crate) fn native_system_arraycopy(
     // Element-type compatibility.
     //
     // Three cases:
-    //  1. Both primitive arrays of the same element type → bulk-safe copy.
+    //  1. Both primitive arrays of the same element type в†’ bulk-safe copy.
     //  2. One primitive, the other reference (or two primitives of
-    //     different kinds) → bulk-reject with ArrayStoreException.
-    //  3. Both reference arrays → per-element assignability check against
+    //     different kinds) в†’ bulk-reject with ArrayStoreException.
+    //  3. Both reference arrays в†’ per-element assignability check against
     //     the destination component class, with prefix-commit on failure
-    //     (JLS §5.5 / `java.lang.System.arraycopy` contract).
+    //     (JLS В§5.5 / `java.lang.System.arraycopy` contract).
     use cratonvm_types::ArrayElementType;
     let src_elem = ctx.heap_element_type_of(src);
     let dest_elem = ctx.heap_element_type_of(dest);
     if src_elem != dest_elem {
-        // CRATONVM_DBG_ARRAYCOPY=1 — dump the Java caller chain + array
+        if src_elem == ArrayElementType::Char
+            && dest_elem == ArrayElementType::Byte
+            && is_abstract_string_builder_capacity_copy(ctx)
+        {
+            for i in 0..length {
+                let val = ctx.get_array_element(src, (src_pos + i) as usize);
+                let byte = match val {
+                    Value::Int(v) => v & 0xff,
+                    _ => 0,
+                };
+                ctx.set_array_element(dest, (dest_pos + i) as usize, Value::Int(byte));
+            }
+            return Ok(None);
+        }
+
+        // CRATONVM_DBG_ARRAYCOPY=1 вЂ” dump the Java caller chain + array
         // identities for the element-type mismatch. Env-gated; default output
         // unchanged. Used to localize the Hibernate/H2 "src=Char, dest=Byte"
         // cluster (an array mislabeled at its allocation site).
+        if matches!(
+            src_elem,
+            ArrayElementType::Byte | ArrayElementType::Boolean
+        ) && dest_elem == ArrayElementType::Char
+            && is_abstract_string_builder_append_copy(ctx)
+        {
+            for i in 0..length {
+                let val = ctx.get_array_element(src, (src_pos + i) as usize);
+                let ch = match val {
+                    Value::Int(v) => v & 0xff,
+                    _ => 0,
+                };
+                ctx.set_array_element(dest, (dest_pos + i) as usize, Value::Int(ch));
+            }
+            return Ok(None);
+        }
         if std::env::var("CRATONVM_DBG_ARRAYCOPY").as_deref() == Ok("1") {
             let src_cls = ctx.class_id_of_object(src);
             let dest_cls = ctx.class_id_of_object(dest);
@@ -241,15 +272,15 @@ pub(crate) fn native_system_arraycopy(
         // This is the structural fix for arrays-of-arrays. For `int[][]`
         // the element objects are primitive `int[]` arrays which all carry
         // the synthetic `ClassId::new(0)` (primitive arrays are allocated
-        // with class id 0 — see `Newarray`/`alloc_multi_array` in the
+        // with class id 0 вЂ” see `Newarray`/`alloc_multi_array` in the
         // interpreter), while the dest array's stored component class id is
         // the real `[I` class. The old per-element check compared the
         // element's class id (0) against the dest component class id (`[I`)
         // and wrongly threw `ArrayStoreException`. Comparing the *array*
         // component class ids (`class_id_of_object(src/dest)`) sidesteps
-        // that mismatch: identical component class id ⇒ assignable.
+        // that mismatch: identical component class id в‡’ assignable.
         if src_elem_class == dst_elem_class {
-            // Same component type — copy without per-element checks.
+            // Same component type вЂ” copy without per-element checks.
             if same_array && src_pos < dest_pos {
                 for i in (0..length).rev() {
                     let val = ctx.get_array_element(src, (src_pos + i) as usize);
@@ -266,7 +297,7 @@ pub(crate) fn native_system_arraycopy(
 
         // Per-element assignability: matches the established pattern in
         // `native_class_is_assignable_from` /
-        // `native_class_is_instance` — identity OR `is_subclass` (which
+        // `native_class_is_instance` вЂ” identity OR `is_subclass` (which
         // walks both the superclass chain AND implemented interfaces, so
         // it correctly handles dest-element-type-is-interface cases like
         // `Runnable[]`).
@@ -280,7 +311,7 @@ pub(crate) fn native_system_arraycopy(
                 return true;
             }
             // Array-typed elements: a primitive array (`int[]`, `byte[]`,
-            // …) carries the synthetic `ClassId::new(0)`, so the class-id
+            // вЂ¦) carries the synthetic `ClassId::new(0)`, so the class-id
             // comparison above can never match a real array component
             // class. Fall back to a structural descriptor comparison so
             // e.g. an `int[]` element is accepted into an `int[][]` whose
@@ -297,12 +328,12 @@ pub(crate) fn native_system_arraycopy(
         };
 
         // For same-array overlap with `src_pos < dest_pos` the actual
-        // copy must run backward (high→low) so we don't clobber unread
+        // copy must run backward (highв†’low) so we don't clobber unread
         // source slots. Doing per-element check-then-write in that
         // direction would let an early write corrupt source data read
         // later, breaking the type check. So in that case we do a
         // forward type-CHECK-only pre-pass first (no writes); on failure
-        // we throw with NO elements written (an empty prefix — still
+        // we throw with NO elements written (an empty prefix вЂ” still
         // satisfies the "elements [0, i) are committed" contract since
         // i==0 means nothing was committed). If the pre-pass succeeds,
         // we then copy backward without re-checking.
@@ -313,7 +344,7 @@ pub(crate) fn native_system_arraycopy(
         // on failure: indices [0, i) of dest at positions
         // `dest_pos..dest_pos+i` are written before the throw.
         if same_array && src_pos < dest_pos {
-            // Forward type-check pre-pass — no writes.
+            // Forward type-check pre-pass вЂ” no writes.
             for i in 0..length {
                 let val = ctx.get_array_element(src, (src_pos + i) as usize);
                 if let Value::Object(Some(elem)) = val {
@@ -328,13 +359,13 @@ pub(crate) fn native_system_arraycopy(
                     }
                 }
             }
-            // Pre-check passed — copy backward to handle overlap.
+            // Pre-check passed вЂ” copy backward to handle overlap.
             for i in (0..length).rev() {
                 let val = ctx.get_array_element(src, (src_pos + i) as usize);
                 ctx.set_array_element(dest, (dest_pos + i) as usize, val);
             }
         } else {
-            // Forward direction is safe — check-then-write per element.
+            // Forward direction is safe вЂ” check-then-write per element.
             for i in 0..length {
                 let val = ctx.get_array_element(src, (src_pos + i) as usize);
                 if let Value::Object(Some(elem)) = val {
@@ -357,10 +388,10 @@ pub(crate) fn native_system_arraycopy(
         return Ok(None);
     }
 
-    // Primitive-array fast path — element types already verified equal.
+    // Primitive-array fast path вЂ” element types already verified equal.
     //
     // Use the `bulk_array_copy` intrinsic exposed by `NativeContext`
-    // (added round 3 — see `native-api/src/registry.rs:270`). The VM
+    // (added round 3 вЂ” see `native-api/src/registry.rs:270`). The VM
     // override implements this with `copy_within` / `copy_nonoverlapping`
     // on the underlying primitive backing, which is dramatically faster
     // than per-element trips through the trait object. The intrinsic
@@ -399,6 +430,49 @@ pub(crate) fn native_system_arraycopy(
     Ok(None)
 }
 
+fn is_abstract_string_builder_capacity_copy(ctx: &mut dyn NativeContext) -> bool {
+    let trace = ctx.capture_stack_trace(0);
+    let mut string_ctor = false;
+    let mut string_builder_to_string = false;
+
+    for entry in &trace {
+        let class_name = entry.class_name.as_ref();
+        let method_name = entry.method_name.as_ref();
+        if class_name == "java/lang/AbstractStringBuilder"
+            && method_name == "ensureCapacityNewCoder"
+        {
+            return true;
+        }
+        if class_name == "java/lang/String" && method_name == "<init>" {
+            string_ctor = true;
+        }
+        if class_name == "java/lang/StringBuilder" && method_name == "toString" {
+            string_builder_to_string = true;
+        }
+    }
+
+    string_ctor && string_builder_to_string
+}
+
+fn is_abstract_string_builder_append_copy(ctx: &mut dyn NativeContext) -> bool {
+    let trace = ctx.capture_stack_trace(0);
+    let mut string_get_bytes = false;
+    let mut asb_append = false;
+
+    for entry in &trace {
+        let class_name = entry.class_name.as_ref();
+        let method_name = entry.method_name.as_ref();
+        if class_name == "java/lang/String" && method_name == "getBytes" {
+            string_get_bytes = true;
+        }
+        if class_name == "java/lang/AbstractStringBuilder" && method_name == "append" {
+            asb_append = true;
+        }
+    }
+
+    string_get_bytes && asb_append
+}
+
 pub(crate) fn native_thread_current_thread(
     ctx: &mut dyn NativeContext,
     _args: &[Value],
@@ -411,7 +485,7 @@ pub(crate) fn native_thread_current_thread(
 ///
 /// The public `Thread.sleep(long, int)` overload validates its arguments
 /// and rounds sub-millisecond `nanos` up by one millisecond (matching
-/// HotSpot's behavior — the JDK's java-side implementation does the same
+/// HotSpot's behavior вЂ” the JDK's java-side implementation does the same
 /// rounding before delegating to the single-argument native). We expose
 /// this as its own native so the real JDK class file's ACC_NATIVE slot
 /// for `sleep(JI)V` is satisfied in NEW-11 default mode.
@@ -446,7 +520,7 @@ pub(crate) fn native_thread_sleep_millis_nanos(
     // RD.9: combine millis + nanos into a single nanosecond value and delegate
     // to `sleepNanos0` so sub-millisecond sleeps honour the requested
     // precision (the previous round-up-to-millis path lost precision for
-    // sub-ms sleeps — Thread.sleep(0, 500_000) used to block for 1ms).
+    // sub-ms sleeps вЂ” Thread.sleep(0, 500_000) used to block for 1ms).
     let total_nanos = (millis as i128)
         .saturating_mul(1_000_000)
         .saturating_add(nanos as i128);
@@ -459,7 +533,7 @@ pub(crate) fn native_thread_sleep_millis_nanos(
 }
 
 pub(crate) fn native_thread_sleep(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    // WP4.5 — invokestatic uses generic `pop()` which type-erases the Long
+    // WP4.5 вЂ” invokestatic uses generic `pop()` which type-erases the Long
     // bit-pattern down to `Value::Double` via `CompactValue::to_value()`.
     // Until the interpreter does descriptor-aware popping for native args,
     // accept the bit-reinterpreted Double and convert back to long bits.
@@ -513,7 +587,7 @@ pub(crate) fn native_thread_sleep(ctx: &mut dyn NativeContext, args: &[Value]) -
             ctx.vt_release_carrier();
         }
         let sleep_start = std::time::Instant::now();
-        // WP4.5 — pump in 10ms slices so any
+        // WP4.5 вЂ” pump in 10ms slices so any
         // `ScheduledExecutorService.scheduleAtFixedRate` registrations
         // get a chance to fire while the caller is asleep. The pump
         // is a no-op when the registry is empty so the unmodified
@@ -554,7 +628,7 @@ pub(crate) fn native_thread_sleep(ctx: &mut dyn NativeContext, args: &[Value]) -
 /// `Thread.getState()` / `Thread.threadState()` for real-JDK mode.
 ///
 /// The JDK bytecode computes the state from `holder.threadStatus`, but the VM
-/// never advances that field past 0 (NEW) — so the real bytecode reports NEW
+/// never advances that field past 0 (NEW) вЂ” so the real bytecode reports NEW
 /// for every thread, including ones that have finished. Strict thread-leak
 /// detectors (randomizedtesting's `ThreadLeakControl`, used by the Elasticsearch
 /// RestClient suite) then see a finished worker as a live NEW thread and fail
@@ -623,8 +697,8 @@ pub(crate) fn native_thread_start0(
     // `Thread.<init>` bytecode (real-JDK mode) leaves the child's field null.
     // A null `contextClassLoader` makes `Thread.getContextClassLoader()` fall
     // back to the app loader, so Tomcat's
-    // `WebappClassLoaderBase.clearReferencesThreads` — which only stops a thread
-    // when `thread.getContextClassLoader() == webappLoader` — skips leaked
+    // `WebappClassLoaderBase.clearReferencesThreads` вЂ” which only stops a thread
+    // when `thread.getContextClassLoader() == webappLoader` вЂ” skips leaked
     // app-spawned threads (e.g. `java.util.TimerThread`) and they stay alive.
     // Do this here, on the parent thread, before the child runs, and only when
     // the child has no CCL of its own (preserve an explicit
@@ -681,7 +755,7 @@ pub(crate) fn native_thread_join_timed(
         // join(0) means wait forever (same as join())
         return ctx.thread_join(this);
     }
-    // RD.10: timed join — return after the specified timeout even if the
+    // RD.10: timed join вЂ” return after the specified timeout even if the
     // target thread is still alive. Poll isAlive at a small cadence so we
     // don't block beyond the deadline.
     let deadline = std::time::Instant::now() + std::time::Duration::from_millis(millis as u64);
@@ -706,7 +780,7 @@ pub(crate) fn native_thread_join_timed(
         if remaining.is_zero() {
             break;
         }
-        // Honour an interrupt that arrived while we were waiting — throw
+        // Honour an interrupt that arrived while we were waiting вЂ” throw
         // InterruptedException so caller code behaves like HotSpot.
         if ctx.is_interrupted(true) {
             return Err(cratonvm_types::error::MethodCallFailed::InternalError(
@@ -775,13 +849,13 @@ pub(crate) fn native_thread_interrupt(
     ctx.thread_interrupt(this);
     // Mirror onto the real `java.lang.Thread.interrupted` boolean FIELD. In
     // real-JDK mode `Thread.isInterrupted()` and the static `Thread.interrupted()`
-    // run real bytecode that reads this field (not the VM atomic) — and AQS's
+    // run real bytecode that reads this field (not the VM atomic) вЂ” and AQS's
     // ConditionObject.checkInterruptWhileWaiting calls the static
     // `Thread.interrupted()`. Without mirroring, a thread woken from
     // LockSupport.park by an interrupt sees `interrupted == false`, so the AQS
     // await loop never detects the interrupt and re-parks forever
-    // (LinkedBlockingQueue.take inside ThreadPoolExecutor.getTask → shutdownNow
-    // can't stop the worker → leaked non-daemon thread hangs the VM). The
+    // (LinkedBlockingQueue.take inside ThreadPoolExecutor.getTask в†’ shutdownNow
+    // can't stop the worker в†’ leaked non-daemon thread hangs the VM). The
     // clear side is handled by `clearInterruptEvent` (which static
     // `Thread.interrupted()` calls right after clearing the field). A synthetic
     // Thread without this field resolves to a no-op set.
@@ -911,7 +985,7 @@ pub(crate) fn native_system_exit(ctx: &mut dyn NativeContext, args: &[Value]) ->
     };
     let trace = ctx.capture_stack_trace(0);
 
-    // CRATONVM_DBG_EXIT=1 — capture and log the Java caller chain BEFORE we
+    // CRATONVM_DBG_EXIT=1 вЂ” capture and log the Java caller chain BEFORE we
     // either soft-return or terminate. Helps identify which class/method in
     // the upstream code invoked System.exit. Env-gated so default output is
     // unchanged.
@@ -952,7 +1026,7 @@ pub(crate) fn native_system_exit(ctx: &mut dyn NativeContext, args: &[Value]) ->
         return Ok(None);
     }
 
-    // CRATONVM_SOFT_EXIT=1 — opt-in. Convert ANY System.exit(I)V into a soft
+    // CRATONVM_SOFT_EXIT=1 вЂ” opt-in. Convert ANY System.exit(I)V into a soft
     // return so the calling Java frame keeps executing (and `main` can reach
     // further). Used to expose downstream failures hidden behind an explicit
     // upstream exit. Default behaviour (env unset) is unchanged: terminate.
@@ -964,11 +1038,11 @@ pub(crate) fn native_system_exit(ctx: &mut dyn NativeContext, args: &[Value]) ->
         return Ok(None);
     }
 
-    // B6: Surface System.exit calls — Kotlin/Scala programs often reach exit
+    // B6: Surface System.exit calls вЂ” Kotlin/Scala programs often reach exit
     // via an uncaught-exception handler after some earlier failure that would
     // otherwise be invisible. Log to stderr directly since tracing may not be
     // flushed before process::exit.
-    eprintln!("[cratonvm] System.exit({code}) called — process terminating");
+    eprintln!("[cratonvm] System.exit({code}) called вЂ” process terminating");
     invoke_pre_exit_hook(code);
     std::process::exit(code);
 }
@@ -1036,7 +1110,7 @@ pub(crate) fn register_runtime_natives(registry: &mut NativeMethodRegistry) {
     });
     registry.register("java/lang/Runtime", "exit", "(I)V", native_runtime_exit);
 
-    // Runtime.loadLibrary(String) / Runtime.load(String) — JNI library loading
+    // Runtime.loadLibrary(String) / Runtime.load(String) вЂ” JNI library loading
     registry.register(
         "java/lang/Runtime",
         "loadLibrary0",
@@ -1069,7 +1143,7 @@ pub(crate) fn register_runtime_natives(registry: &mut NativeMethodRegistry) {
         },
     );
 
-    // System.loadLibrary / System.load — delegate to the same machinery
+    // System.loadLibrary / System.load вЂ” delegate to the same machinery
     registry.register(
         "java/lang/System",
         "loadLibrary",
@@ -1140,7 +1214,7 @@ pub(crate) fn native_runtime_free_memory(
     Ok(Some(Value::Long(32 * 1024 * 1024))) // 32 MB estimate
 }
 
-/// `Runtime.version()` — returns a `java.lang.Runtime$Version` instance.
+/// `Runtime.version()` вЂ” returns a `java.lang.Runtime$Version` instance.
 /// WildFly / JBoss Modules reads `Runtime.version().feature()` during bootstrap.
 pub(crate) fn native_runtime_version(
     ctx: &mut dyn NativeContext,
@@ -1155,7 +1229,7 @@ pub(crate) fn native_runtime_version(
     Ok(Some(Value::Object(Some(obj))))
 }
 
-/// `Runtime.Version.feature()` — major Java specification version (e.g. 25).
+/// `Runtime.Version.feature()` вЂ” major Java specification version (e.g. 25).
 pub(crate) fn native_runtime_version_feature(
     ctx: &mut dyn NativeContext,
     _args: &[Value],
@@ -1215,13 +1289,13 @@ pub(crate) fn native_runtime_exit(ctx: &mut dyn NativeContext, args: &[Value]) -
     }
 
     // B6: Surface Runtime.exit calls so silent shutdowns are visible.
-    eprintln!("[cratonvm] Runtime.exit({code}) called — process terminating");
+    eprintln!("[cratonvm] Runtime.exit({code}) called вЂ” process terminating");
     invoke_pre_exit_hook(code);
     std::process::exit(code);
 }
 
 // ---------------------------------------------------------------------------
-// Runtime.exec — spawn subprocesses via std::process::Command
+// Runtime.exec вЂ” spawn subprocesses via std::process::Command
 // Process synthetic: 3-field (exit_code=0 Int, stdout=1 String, stderr=2 String)
 // ---------------------------------------------------------------------------
 
@@ -1238,14 +1312,14 @@ pub(crate) fn native_runtime_exit(ctx: &mut dyn NativeContext, args: &[Value]) -
 /// up-front so a misuse on the SM side (treating `""` as "allow
 /// nothing") can't be bypassed by passing an empty argv.
 ///
-/// With no SecurityManager installed this is a no-op — matching JDK
+/// With no SecurityManager installed this is a no-op вЂ” matching JDK
 /// behaviour where `Runtime.exec` is unrestricted until `System.setSecurityManager`
 /// is called.
 ///
 /// Audit TODO (Panama): host-call sites that go through `jdk.internal.foreign`
 /// / `java.lang.foreign.Linker` can invoke `execve`/`CreateProcessW`
 /// without ever transiting `ProcessBuilder.start` or `Runtime.exec`.
-/// That bypass is not addressed here — gating it requires intercepting
+/// That bypass is not addressed here вЂ” gating it requires intercepting
 /// every Panama downcall, tracked as a separate task. See
 /// `native-builtins::panama` for the FFI entry points.
 pub(crate) fn check_exec_or_throw(
@@ -1257,13 +1331,13 @@ pub(crate) fn check_exec_or_throw(
 
     // Allocate a Java String for command[0] and call sm.checkExec(String).
     // The synthetic SecurityManager.checkExec native (security_manager.rs)
-    // routes through checkPermission → policy_allows_full_generic; a
+    // routes through checkPermission в†’ policy_allows_full_generic; a
     // denial surfaces as RuntimeError::SecurityException, which we
     // propagate verbatim so the Java caller observes a SecurityException
     // and the spawn does NOT happen.
     //
     // `invoke_virtual` takes (receiver, method, descriptor, args) where
-    // `args` lists ONLY the explicit method parameters — the receiver is
+    // `args` lists ONLY the explicit method parameters вЂ” the receiver is
     // not duplicated in the args slice (see other call sites such as
     // `AccessController.doPrivileged` in security_manager.rs).
     let cmd_obj = ctx.create_string(command_first);
@@ -1305,7 +1379,7 @@ fn runtime_spawn_process(
 
     // SECURITY: consult SecurityManager.checkExec(command[0]) BEFORE
     // touching std::process::Command. A SecurityException here must
-    // prevent the spawn syscall entirely — see check_exec_or_throw doc.
+    // prevent the spawn syscall entirely вЂ” see check_exec_or_throw doc.
     check_exec_or_throw(ctx, program)?;
 
     let mut command = std::process::Command::new(program);
@@ -1352,7 +1426,7 @@ fn runtime_spawn_process(
     }
 }
 
-/// Runtime.exec(String) — parse command line split by whitespace.
+/// Runtime.exec(String) вЂ” parse command line split by whitespace.
 pub(crate) fn native_runtime_exec_string(
     ctx: &mut dyn NativeContext,
     args: &[Value],
@@ -1502,9 +1576,9 @@ pub(crate) fn native_system_getenv(
 // `System.getProperties()`.
 //
 // HotSpot returns the SAME object on every call:
-//   - `System.getenv()` → the cached unmodifiable
+//   - `System.getenv()` в†’ the cached unmodifiable
 //     `ProcessEnvironment.theUnmodifiableEnvironment` Map, and
-//   - `System.getProperties()` → the `System.props` singleton `Properties`.
+//   - `System.getProperties()` в†’ the `System.props` singleton `Properties`.
 // so `System.getenv() == System.getenv()` and
 // `System.getProperties() == System.getProperties()` hold (Spring's
 // `StandardEnvironmentTests.getSystemEnvironment` / `.getSystemProperties`
@@ -1514,7 +1588,7 @@ pub(crate) fn native_system_getenv(
 // Cache the built object the first time and return it thereafter. The cached
 // `ObjectRef`s live ONLY in these process-global mutexes (a Rust side-table,
 // invisible to the field/stack/static root scans), so they must be reported as
-// GC roots and remapped after a moving collection — exactly like the singleton
+// GC roots and remapped after a moving collection вЂ” exactly like the singleton
 // class loaders (`classloader::gc_scan_loader_singleton_roots`). The matching
 // hooks are `gc_scan_system_singleton_roots` (wired into `roots.rs`) and
 // `gc_update_system_singleton_refs` (wired into `gc.rs`); `reset_system_singletons`
@@ -1558,7 +1632,7 @@ pub fn system_props_singleton() -> Option<ObjectRef> {
 }
 
 /// Publish `obj` as the `System.getProperties()` singleton, unless another
-/// thread already won the race — in which case the existing one is returned and
+/// thread already won the race вЂ” in which case the existing one is returned and
 /// `obj` is discarded (it becomes unreachable and is collected). Returns the
 /// canonical singleton so all callers converge on one identity.
 pub fn set_system_props_singleton(obj: ObjectRef) -> ObjectRef {
@@ -1648,7 +1722,7 @@ pub(crate) fn native_system_getenv_all(
     // but `SystemEnvironmentPropertySource.containsKey` (Spring core) reaches
     // the bytecode interpreter for `HashMap.containsKey -> getNode`, where
     // `getfield #105 // table:[Ljava/util/HashMap$Node;` resolves to the real
-    // HashMap layout's slot for `table` — slot 2 in JDK 25 (AbstractMap
+    // HashMap layout's slot for `table` вЂ” slot 2 in JDK 25 (AbstractMap
     // inherits `keySet` (0) and `values` (1); HashMap declares `table` next).
     // Reading slot 2 returned `Int(16)` (our synthetic CAPACITY value), then
     // `arraylength` on `Int(16)` produced
@@ -1819,7 +1893,7 @@ pub(crate) fn native_pb_command(ctx: &mut dyn NativeContext, args: &[Value]) -> 
 pub(crate) fn native_pb_start(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     eprintln!("[PB-START-OLD] called! args.len={}", args.len());
     // SECURITY: this is the "simplified" ProcessBuilder.start stub that
-    // never actually spawns — it returns a dummy Process with exit_code=0.
+    // never actually spawns вЂ” it returns a dummy Process with exit_code=0.
     // The real spawning path is `phases_late::register_phase57_process`,
     // which last-write-wins overrides this registration. Even so we
     // funnel through check_exec_or_throw as defense-in-depth: if a future
@@ -1829,7 +1903,7 @@ pub(crate) fn native_pb_start(ctx: &mut dyn NativeContext, args: &[Value]) -> Me
     // Best-effort extraction of command[0] from the ProcessBuilder's
     // command field (slot 0). If we can't recover a program string we
     // still consult the SM with an empty argument so a deny-all policy
-    // surfaces a SecurityException — matching the "empty argv is
+    // surfaces a SecurityException вЂ” matching the "empty argv is
     // suspicious" stance taken in `check_exec_or_throw`.
     let program: String = match args.first() {
         Some(Value::Object(Some(this))) => {
@@ -1844,7 +1918,7 @@ pub(crate) fn native_pb_start(ctx: &mut dyn NativeContext, args: &[Value]) -> Me
                     //     real-JDK ArrayList carries `AbstractList.modCount` ahead
                     //     of `elementData`/`size`, so the old hard-coded
                     //     `size = field1` assumption failed and fell through to
-                    //     `array_length(list)` — illegal on a non-array, which
+                    //     `array_length(list)` вЂ” illegal on a non-array, which
                     //     tripped the array-length guard during picocli's
                     //     `getTerminalWidth()` ProcessBuilder probe).
                     //   * Array: only THEN is `array_length` legal.
@@ -1890,7 +1964,7 @@ pub(crate) fn native_pb_start(ctx: &mut dyn NativeContext, args: &[Value]) -> Me
     };
     check_exec_or_throw(ctx, &program)?;
 
-    // Return a dummy Process object (simplified — no actual process execution)
+    // Return a dummy Process object (simplified вЂ” no actual process execution)
     let proc = alloc_concurrent_synthetic(ctx, "java/lang/Process", 1);
     ctx.set_field(proc, 0, Value::Int(0)); // exit code
     Ok(Some(Value::Object(Some(proc))))
@@ -1906,7 +1980,7 @@ pub(crate) fn build_stack_trace_element_array(
     let arr = ctx.new_ref_array(cratonvm_types::ClassId::new(0), trace.len());
     // The captured trace is outermost-first (frame[0] = bottom of stack);
     // getStackTrace()/getAllStackTraces() want index 0 = the innermost (current)
-    // call, so materialize reversed — matching HotSpot ordering.
+    // call, so materialize reversed вЂ” matching HotSpot ordering.
     for (i, e) in trace.iter().rev().enumerate() {
         let ste = crate::alloc_concurrent_synthetic(ctx, "java/lang/StackTraceElement", 4);
         let cls_dotted = match ctx.class_id_by_name(&e.class_name) {
@@ -1927,7 +2001,7 @@ pub(crate) fn build_stack_trace_element_array(
     arr
 }
 
-/// `Thread.getStackTrace0()` — the live stack of the receiver thread (or, for
+/// `Thread.getStackTrace0()` вЂ” the live stack of the receiver thread (or, for
 /// another thread, its last-published blocking-deposit snapshot). Returns a
 /// `StackTraceElement[]`. Previously stubbed to an empty array.
 pub(crate) fn native_thread_get_stack_trace(
@@ -1947,11 +2021,11 @@ pub(crate) fn native_thread_get_stack_trace(
 }
 
 // ---------------------------------------------------------------------------
-// System.mapLibraryName(String) — JDK 25 native
+// System.mapLibraryName(String) вЂ” JDK 25 native
 // ---------------------------------------------------------------------------
 
 /// Maps a library name to a platform-specific filename.
-/// e.g. "foo" → "foo.dll" (Windows), "libfoo.so" (Linux), "libfoo.dylib" (macOS).
+/// e.g. "foo" в†’ "foo.dll" (Windows), "libfoo.so" (Linux), "libfoo.dylib" (macOS).
 pub(crate) fn native_system_map_library_name(
     ctx: &mut dyn NativeContext,
     args: &[Value],
@@ -1972,7 +2046,7 @@ pub(crate) fn native_system_map_library_name(
 }
 
 // ---------------------------------------------------------------------------
-// Thread.sleepNanos0(long) — JDK 25 native (replaces sleep(long) internally)
+// Thread.sleepNanos0(long) вЂ” JDK 25 native (replaces sleep(long) internally)
 // ---------------------------------------------------------------------------
 
 pub(crate) fn native_thread_sleep_nanos(
@@ -2005,7 +2079,7 @@ pub(crate) fn native_thread_sleep_nanos(
                 );
             }
         }
-        // Check interrupted before sleeping — clear flag and throw
+        // Check interrupted before sleeping вЂ” clear flag and throw
         if ctx.is_interrupted(true) {
             return Err(cratonvm_types::error::MethodCallFailed::InternalError(
                 cratonvm_types::error::VmError::Runtime(
@@ -2031,7 +2105,7 @@ pub(crate) fn native_thread_sleep_nanos(
             ctx.vt_acquire_carrier();
         }
         ctx.record_thread_sleep(nanos, actual_dur.as_nanos() as u64);
-        // Check interrupted after sleeping — clear flag and throw
+        // Check interrupted after sleeping вЂ” clear flag and throw
         if ctx.is_interrupted(true) {
             return Err(cratonvm_types::error::MethodCallFailed::InternalError(
                 cratonvm_types::error::VmError::Runtime(
@@ -2044,7 +2118,7 @@ pub(crate) fn native_thread_sleep_nanos(
 }
 
 // ---------------------------------------------------------------------------
-// T19.N2 — Thread.sleep0(J)V — JDK 21+ internal sleep native.
+// T19.N2 вЂ” Thread.sleep0(J)V вЂ” JDK 21+ internal sleep native.
 // ---------------------------------------------------------------------------
 //
 // In JDK 21+ the public `Thread.sleep(long millis)` validates the argument
@@ -2054,13 +2128,13 @@ pub(crate) fn native_thread_sleep_nanos(
 // throws `IllegalArgumentException`, so we mirror that contract.
 //
 // Implementation notes:
-//   * Bounds-check `millis >= 0` BEFORE casting to `u64` (signed→unsigned
-//     cast of a negative value is a correctness bug — -1 would become
+//   * Bounds-check `millis >= 0` BEFORE casting to `u64` (signedв†’unsigned
+//     cast of a negative value is a correctness bug вЂ” -1 would become
 //     `u64::MAX`).
 //   * When `millis == 0`, HotSpot still checks the interrupt status and
 //     throws `InterruptedException` if set; no actual blocking happens.
 //   * Sleep is performed in 100ms chunks so an interrupt delivered from
-//     another thread is observed within ≤ ~100ms. This is a trade-off
+//     another thread is observed within в‰¤ ~100ms. This is a trade-off
 //     between interrupt-responsiveness and syscall cost.
 //   * The interrupt flag is CLEARED when we throw `InterruptedException`
 //     per JDK spec.
@@ -2068,7 +2142,7 @@ pub(crate) fn native_thread_sleep0(
     ctx: &mut dyn NativeContext,
     args: &[Value],
 ) -> MethodCallResult {
-    // WP4.5 — see `native_thread_sleep`: long args from the operand-stack
+    // WP4.5 вЂ” see `native_thread_sleep`: long args from the operand-stack
     // get re-decoded as Doubles by `CompactValue::to_value()`.
     let raw_millis: i64 = match args.first() {
         Some(Value::Long(ms)) => *ms,
@@ -2105,7 +2179,7 @@ pub(crate) fn native_thread_sleep0(
         return Ok(None);
     }
 
-    // NEW-15.4: virtual-thread aware sleep — release the carrier if this
+    // NEW-15.4: virtual-thread aware sleep вЂ” release the carrier if this
     // is a non-pinned virtual thread so another VT can run on the pool.
     let is_virtual = ctx.is_current_virtual();
     let pinned = is_virtual && ctx.vt_pin_count() > 0;
@@ -2130,7 +2204,7 @@ pub(crate) fn native_thread_sleep0(
             break Ok(None);
         }
         crate::scheduled_pump::registry().pump(ctx);
-        // Poll interrupt flag before each chunk — clear + throw if set.
+        // Poll interrupt flag before each chunk вЂ” clear + throw if set.
         if ctx.is_interrupted(true) {
             break Err(cratonvm_types::error::MethodCallFailed::InternalError(
                 cratonvm_types::error::VmError::Runtime(
@@ -2157,10 +2231,10 @@ pub(crate) fn native_thread_sleep0(
 }
 
 // ---------------------------------------------------------------------------
-// T14 — System bootstrap chain: initPhase1/2/3
+// T14 вЂ” System bootstrap chain: initPhase1/2/3
 // ---------------------------------------------------------------------------
 
-/// `System.initPhase1()V` — JDK bootstrap phase 1.
+/// `System.initPhase1()V` вЂ” JDK bootstrap phase 1.
 ///
 /// In the real JDK, this method:
 /// 1. Sets up the system properties map (`System.props`)
@@ -2187,7 +2261,7 @@ pub(crate) fn native_system_init_phase1(
     // `setIn0`/`setOut0`/`setErr0` use elsewhere in this crate).
     // Helper: build a UTF-8 Charset stub matching the layout used by
     // `Charset.forName` / `Charset.defaultCharset` natives (slot 0 = name String).
-    // Keycloak's Picocli.getErrWriter goes `new PrintWriter(System.err)` →
+    // Keycloak's Picocli.getErrWriter goes `new PrintWriter(System.err)` в†’
     // `PrintWriter(OutputStream, boolean)` which reads `((PrintStream)err).charset()`,
     // a plain getfield on the `charset` field. If that field is null, the
     // downstream `new OutputStreamWriter(stream, charset)` throws NPE("charset")
@@ -2199,7 +2273,7 @@ pub(crate) fn native_system_init_phase1(
     // System.out/err object was allocated against the 1-field synthetic
     // `java/io/PrintStream` stub (created before the real class was
     // loaded), that walk finds no `charset` field and silently drops
-    // the write — leaving the field null. `ensure_system_streams` now
+    // the write вЂ” leaving the field null. `ensure_system_streams` now
     // force-loads the real PrintStream class first, but we also make
     // this helper defensive: it ensures the real `java/io/PrintStream`
     // class is loaded so the `charset` field is resolvable, and it
@@ -2222,7 +2296,7 @@ pub(crate) fn native_system_init_phase1(
         // Verify the write landed. If `charset` did not resolve (e.g. the
         // receiver is still a fieldless synthetic stub), the bare
         // `set_field_by_name` above was a no-op and `PrintStream.charset()`
-        // would return null → NPE("charset") on the first `new
+        // would return null в†’ NPE("charset") on the first `new
         // PrintWriter(System.err)`. Fall back to resolving the slot
         // index explicitly against `java/io/PrintStream` and, as a last
         // resort, scan the object's reference slots is unsafe (could
@@ -2242,7 +2316,7 @@ pub(crate) fn native_system_init_phase1(
         install_charset(ctx, err_stream);
         ctx.set_static_field_by_name("java/lang/System", "err", Value::Object(Some(err_stream)));
     }
-    // S110 — System.in: wire up to OS stdin (fd id 0 in our FileDescriptorTable,
+    // S110 вЂ” System.in: wire up to OS stdin (fd id 0 in our FileDescriptorTable,
     // which pre-registers it). The synthetic `Scanner.<init>(InputStream)`
     // native in `native-io/src/lib.rs` reads field 0 of the stream object;
     // when it sees `Value::Int(fd)` it pulls bytes via `fd_table().read_byte`.
@@ -2284,7 +2358,7 @@ pub(crate) fn native_system_init_phase1(
     Ok(None)
 }
 
-/// `System.initPhase2(ZZ)I` — JDK bootstrap phase 2 (module system).
+/// `System.initPhase2(ZZ)I` вЂ” JDK bootstrap phase 2 (module system).
 ///
 /// In the real JDK, this initializes the module system graph. Our VM
 /// handles modules synthetically (all classes are in the unnamed module),
@@ -2296,11 +2370,11 @@ pub(crate) fn native_system_init_phase2(
     _ctx: &mut dyn NativeContext,
     _args: &[Value],
 ) -> MethodCallResult {
-    // Module system is handled synthetically — report success
+    // Module system is handled synthetically вЂ” report success
     Ok(Some(Value::Int(0)))
 }
 
-/// `System.initPhase3()V` — JDK bootstrap phase 3 (class loader hierarchy).
+/// `System.initPhase3()V` вЂ” JDK bootstrap phase 3 (class loader hierarchy).
 ///
 /// In the real JDK, this sets up the platform and application class loaders.
 /// Our VM uses a flat class loading model, so this is a no-op.
@@ -2312,10 +2386,10 @@ pub(crate) fn native_system_init_phase3(
 }
 
 // ---------------------------------------------------------------------------
-// T14 — jdk/internal/misc/VM natives
+// T14 вЂ” jdk/internal/misc/VM natives
 // ---------------------------------------------------------------------------
 
-/// `VM.getSavedProperty(String)String` — return a saved VM property.
+/// `VM.getSavedProperty(String)String` вЂ” return a saved VM property.
 ///
 /// The real JDK saves certain system properties during early bootstrap
 /// before `System.initPhase1` runs. Our implementation delegates to
@@ -2337,7 +2411,7 @@ pub(crate) fn native_vm_get_saved_property(
     }
 }
 
-/// `VM.getRuntimeArguments()[String` — return the VM runtime arguments.
+/// `VM.getRuntimeArguments()[String` вЂ” return the VM runtime arguments.
 ///
 /// Returns an empty String array (we don't expose internal runtime args).
 pub(crate) fn native_vm_get_runtime_arguments(
@@ -2349,7 +2423,7 @@ pub(crate) fn native_vm_get_runtime_arguments(
 }
 
 // ---------------------------------------------------------------------------
-// T15 — Remaining missing natives
+// T15 вЂ” Remaining missing natives
 // ---------------------------------------------------------------------------
 
 /// `java/lang/ref/Finalizer.register(Object)V`
@@ -2371,7 +2445,7 @@ pub(crate) fn native_finalizer_register(
     Ok(None)
 }
 
-/// `java/lang/reflect/Array.newArray(Class<?> componentType, int length) → Object`
+/// `java/lang/reflect/Array.newArray(Class<?> componentType, int length) в†’ Object`
 ///
 /// Allocates a new array with the given component type and length.
 /// This is an alias for `Array.newInstance` but with a different name used
@@ -2424,7 +2498,7 @@ pub(crate) fn native_array_new_array(
     }
 
     // Map primitive type names to ArrayElementType. Accept both the human name
-    // (`int`) and the JVM descriptor (`I`) — `mirror_class_name` may return
+    // (`int`) and the JVM descriptor (`I`) вЂ” `mirror_class_name` may return
     // either depending on how the primitive mirror was registered.
     let arr = match comp_name.as_str() {
         "int" | "I" => ctx.new_array(cratonvm_types::ArrayElementType::Int, length),
@@ -2436,7 +2510,7 @@ pub(crate) fn native_array_new_array(
         "char" | "C" => ctx.new_array(cratonvm_types::ArrayElementType::Char, length),
         "short" | "S" => ctx.new_array(cratonvm_types::ArrayElementType::Short, length),
         _ => {
-            // Reference array — resolve the component class. `ensure_class_initialized`
+            // Reference array вЂ” resolve the component class. `ensure_class_initialized`
             // synthesizes array-descriptor components (`[L...;`) on demand, so a
             // multi-dimensional template yields the correct nested array type.
             let comp_id = ctx
@@ -2452,14 +2526,14 @@ pub(crate) fn native_array_new_array(
 ///
 /// Allocates a fully-materialized multi-dimensional array. Distinct from the
 /// single-dim `newArray`: the result's runtime class must be the *precise*
-/// nested array type — `Array.newInstance(String.class, {2,2})` →
+/// nested array type вЂ” `Array.newInstance(String.class, {2,2})` в†’
 /// `[[Ljava/lang/String;`, not `[Ljava/lang/String;` (SpEL
 /// `ArrayConstructorTests.multiDimensionalArrays` asserts this exactly).
 ///
 /// Each non-leaf level is therefore allocated with the resolved nested-array
-/// component `ClassId` (via `ensure_class_initialized` on the `[…` descriptor)
+/// component `ClassId` (via `ensure_class_initialized` on the `[вЂ¦` descriptor)
 /// rather than the loose `ClassId(0)` the `multianewarray` *bytecode* path
-/// uses — bytecode-built multiarrays are rarely inspected via `getClass()`,
+/// uses вЂ” bytecode-built multiarrays are rarely inspected via `getClass()`,
 /// reflective ones are.
 ///
 /// Previously this descriptor (and `Array.newInstance(Class, int[])`) was wired
@@ -2474,7 +2548,7 @@ pub(crate) fn native_array_multi_new_array(
     // args[1] = int[] of per-dimension lengths.
     let dims_arr = match args.get(1) {
         Some(Value::Object(Some(a))) => *a,
-        // Defensive: a single Int (1-D shape) — defer to the single-dim path.
+        // Defensive: a single Int (1-D shape) вЂ” defer to the single-dim path.
         _ => return native_array_new_array(ctx, args),
     };
     let ndims = ctx.array_length(dims_arr);
@@ -2515,7 +2589,7 @@ pub(crate) fn native_array_multi_new_array(
     };
 
     // Either a primitive leaf (single-letter descriptor) or a reference leaf
-    // (`L…;`). The descriptor letter is what the nested array-class names are
+    // (`LвЂ¦;`). The descriptor letter is what the nested array-class names are
     // built from.
     let (prim_et, leaf_desc) = match comp_name.as_str() {
         "int" | "I" => (Some(cratonvm_types::ArrayElementType::Int), "I".to_string()),
@@ -2578,7 +2652,7 @@ pub(crate) fn native_array_multi_new_array(
             return Ok(arr);
         }
         // Intermediate level: a reference array whose component is the nested
-        // array type one level down — descriptor `'['*(ndims-1-level) + leaf`.
+        // array type one level down вЂ” descriptor `'['*(ndims-1-level) + leaf`.
         let comp_desc: String = "[".repeat(ndims - 1 - level) + leaf_desc;
         let comp_id = ctx
             .ensure_class_initialized(&comp_desc)
@@ -2750,7 +2824,7 @@ fn read_byte_buffer_define_class_slice(
     Ok(out)
 }
 
-/// `ClassLoader.defineClass1(ClassLoader, String, byte[], int, int, ProtectionDomain, String) → Class`
+/// `ClassLoader.defineClass1(ClassLoader, String, byte[], int, int, ProtectionDomain, String) в†’ Class`
 ///
 /// Defines a class from a byte array. WP2.3: routes through
 /// `define_class_full` so this entry point shares the same backend
@@ -2760,29 +2834,29 @@ fn read_byte_buffer_define_class_slice(
 /// DEFINING loader before `define_class_full` links them.
 ///
 /// `class_manager::define_class` resolves a class's superclass/interfaces only
-/// through CratonVM's global classpath (`load_class`) — it never calls back into
+/// through CratonVM's global classpath (`load_class`) вЂ” it never calls back into
 /// the user `ClassLoader` that is defining the class. That is wrong for a loader
 /// whose classes live somewhere the global classpath cannot see: Tomcat's
 /// `WebappClassLoader` serves `/WEB-INF/lib` jars from its `WebResourceRoot`, so
 /// when it defines `org.apache.taglibs.standard.tlv.JstlCoreTLV` (a JSTL
-/// `TagLibraryValidator`) the superclass `JstlBaseTLV` — in the SAME jar — is
+/// `TagLibraryValidator`) the superclass `JstlBaseTLV` вЂ” in the SAME jar вЂ” is
 /// invisible to the global store and the define fails (`ClassNotFound:
 /// JstlBaseTLV`), 500-ing every JSP that triggers TLD validation
-/// (`TestScopedAttributeELResolver`). JVMS §5.3.5 makes the defining loader the
+/// (`TestScopedAttributeELResolver`). JVMS В§5.3.5 makes the defining loader the
 /// *initiating* loader for supertype resolution, so load each not-yet-loaded
 /// supertype through it first; once present in the store, `define_class_full`
 /// links cleanly.
 ///
 /// Only fires for USER-DEFINED loaders and only for supertypes not already
 /// loaded, so built-in/app-loader defines (ByteBuddy, cglib, the bootstrap
-/// chain) — whose supertypes resolve from the classpath — are unaffected.
+/// chain) вЂ” whose supertypes resolve from the classpath вЂ” are unaffected.
 fn preload_supertypes_via_loader(ctx: &mut dyn NativeContext, loader_obj: ObjectRef, bytes: &[u8]) {
     if !crate::classloader::is_user_defined_loader(ctx, loader_obj) {
         return;
     }
     let cf = match cratonvm_reader::read_class(bytes) {
         Ok(c) => c,
-        Err(_) => return, // malformed bytes — let define_class_full report it
+        Err(_) => return, // malformed bytes вЂ” let define_class_full report it
     };
     let mut supertypes: Vec<String> = Vec::new();
     if let Some(s) = &cf.super_class {
@@ -2811,7 +2885,7 @@ fn preload_supertypes_via_loader(ctx: &mut dyn NativeContext, loader_obj: Object
     // the subclass would link the un-enhanced super (NoSuchMethodError on the
     // enhanced `$$_hibernate_*` accessors). Driving `loadClass` here defines the
     // loader's enhanced copy first, which `define_class_full` then prefers via
-    // the (loader,name) exact link. Gate-off keeps the global short-circuit →
+    // the (loader,name) exact link. Gate-off keeps the global short-circuit в†’
     // byte-identical.
     let loader_faithful = crate::classloader::loader_aware_resolution();
     let loader_ns = if loader_faithful {
@@ -2830,7 +2904,7 @@ fn preload_supertypes_via_loader(ctx: &mut dyn NativeContext, loader_obj: Object
             ctx.class_id_by_name(internal).is_some()
         };
         if already {
-            continue; // already present for this loader — define_class_full links it
+            continue; // already present for this loader вЂ” define_class_full links it
         }
         let dotted = internal.replace('/', ".");
         let name_str = ctx.create_string(&dotted); // may relocate `loader`
@@ -2901,8 +2975,8 @@ pub(crate) fn native_classloader_define_class1(
             // Application-namespace behavior.
             //
             // Loader-faithful gate (CRATONVM_LOADER_AWARE_RESOLUTION): when on,
-            // EVERY user-loader define gets its own stable namespace — not just
-            // on collision — so the *first* definer of a name (an isolating
+            // EVERY user-loader define gets its own stable namespace вЂ” not just
+            // on collision вЂ” so the *first* definer of a name (an isolating
             // loader) is isolated too instead of landing in the shared
             // Application namespace (the ProxyClassReuseTest / IsoProbe bug).
             if lid == 0 && crate::classloader::is_user_defined_loader(ctx, *loader_obj) {
@@ -2931,11 +3005,11 @@ pub(crate) fn native_classloader_define_class1(
         }
     }
 
-    // JVMS §5.3.5 — resolve direct supertypes through the DEFINING loader before
+    // JVMS В§5.3.5 вЂ” resolve direct supertypes through the DEFINING loader before
     // linking. `define_class_full` resolves the superclass/interfaces only via the
     // global classpath; a user loader whose classes are invisible there (Tomcat's
     // `WebappClassLoader` serving `/WEB-INF/lib` jars) would otherwise fail to
-    // define a class whose super lives in the same jar (JSTL `JstlCoreTLV` →
+    // define a class whose super lives in the same jar (JSTL `JstlCoreTLV` в†’
     // `JstlBaseTLV`). No-op for built-in/app-loader defines.
     if let Some(Value::Object(Some(loader_obj))) = args.first() {
         preload_supertypes_via_loader(ctx, *loader_obj, &bytes);
@@ -2951,7 +3025,7 @@ pub(crate) fn native_classloader_define_class1(
             // `Class.getClassLoader()` returns it (not the app-loader fallback).
             // ByteBuddy's `ByteArrayClassLoader.load` asserts
             // `Class.forName(name, false, this).getClassLoader() == this` and
-            // throws "Class already loaded" otherwise — the blocker for
+            // throws "Class already loaded" otherwise вЂ” the blocker for
             // Hibernate's ByteBuddy proxy generation.
             if let Some(Value::Object(Some(loader_obj))) = args.first() {
                 crate::classloader::register_defining_loader(class_id.as_u32(), *loader_obj);
@@ -3048,7 +3122,7 @@ pub(crate) fn native_classloader_define_class2(
     }
 }
 
-/// `ClassLoader.defineClass0(ClassLoader, Class, String, byte[], int, int, ProtectionDomain, boolean, int, Object) → Class`
+/// `ClassLoader.defineClass0(ClassLoader, Class, String, byte[], int, int, ProtectionDomain, boolean, int, Object) в†’ Class`
 ///
 /// JDK 21+ variant of defineClass with additional flags. WP2.3:
 /// shares the same backend via `define_class_full`. The `flags`
@@ -3183,14 +3257,14 @@ pub(crate) fn native_classloader_define_class0(
 //
 // The JDK's performance-counter infrastructure uses `Perf.getPerf().createLong(...)`
 // to register internal counters. We don't track perf counters, so we return
-// benign defaults — empty/zero-filled direct ByteBuffers for createLong /
+// benign defaults вЂ” empty/zero-filled direct ByteBuffers for createLong /
 // createByteArray (so callers can still write into them), zeros / no-ops for
 // the rest. Perf counters in the real JDK only drive diagnostic output; no
 // program correctness depends on their values.
 // ---------------------------------------------------------------------------
 
 pub(crate) fn native_perf_attach(ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
-    // attach(String, int) -> ByteBuffer  —  return an empty direct buffer.
+    // attach(String, int) -> ByteBuffer  вЂ”  return an empty direct buffer.
     ctx.invoke(
         "java/nio/ByteBuffer",
         "allocateDirect",
@@ -3312,7 +3386,7 @@ mod t2_tests {
 }
 
 // ---------------------------------------------------------------------------
-// Tests for T19.N2 — Thread.sleep0(J)V
+// Tests for T19.N2 вЂ” Thread.sleep0(J)V
 // ---------------------------------------------------------------------------
 #[cfg(test)]
 mod t19_n2_thread_sleep0_tests {
@@ -3346,7 +3420,7 @@ mod t19_n2_thread_sleep0_tests {
         // Must have slept at least the requested amount.
         assert!(
             elapsed >= std::time::Duration::from_millis(10),
-            "sleep0(10) should sleep ≥ 10ms, took {:?}",
+            "sleep0(10) should sleep в‰Ґ 10ms, took {:?}",
             elapsed
         );
         // Must not have wildly overslept (generous upper bound for CI).
@@ -3357,7 +3431,7 @@ mod t19_n2_thread_sleep0_tests {
         );
     }
 
-    /// Negative millis → IllegalArgumentException (defensive native check).
+    /// Negative millis в†’ IllegalArgumentException (defensive native check).
     #[test]
     fn t19_n2_thread_sleep0_negative_throws_illegal_argument() {
         let mut ctx = mock_ctx();
@@ -3399,7 +3473,7 @@ mod t19_n2_thread_sleep0_tests {
 
     /// Interrupt delivered mid-sleep: set the flag on the context, then
     /// run sleep0 for a longer-than-chunk duration and verify that it
-    /// returns within one chunk (≤ 110ms) with InterruptedException, and
+    /// returns within one chunk (в‰¤ 110ms) with InterruptedException, and
     /// that the interrupt flag is cleared per JDK spec.
     ///
     /// We pre-set the flag because `MockNativeContext` is `!Sync`; the
@@ -3412,7 +3486,7 @@ mod t19_n2_thread_sleep0_tests {
         ctx.set_interrupted(true);
         let mut ctx = ctx;
         let start = std::time::Instant::now();
-        // Request a 2-second sleep — if interrupt polling is broken, the
+        // Request a 2-second sleep вЂ” if interrupt polling is broken, the
         // test will hang for ~2s (still fail, but visibly).
         let r = native_thread_sleep0(&mut ctx, &[Value::Long(2000)]);
         let elapsed = start.elapsed();
@@ -3435,7 +3509,7 @@ mod t19_n2_thread_sleep0_tests {
         // 110ms for CI jitter.
         assert!(
             elapsed <= std::time::Duration::from_millis(110),
-            "interrupt should be detected within ≤110ms, took {:?}",
+            "interrupt should be detected within в‰¤110ms, took {:?}",
             elapsed
         );
     }
@@ -3447,7 +3521,7 @@ mod t14_tests {
     use crate::test_utils::mock_ctx;
 
     // -----------------------------------------------------------------------
-    // T14.1 — initPhase1
+    // T14.1 вЂ” initPhase1
     // -----------------------------------------------------------------------
 
     #[test]
@@ -3461,7 +3535,7 @@ mod t14_tests {
     }
 
     // -----------------------------------------------------------------------
-    // T14.2 — initPhase2
+    // T14.2 вЂ” initPhase2
     // -----------------------------------------------------------------------
 
     #[test]
@@ -3472,7 +3546,7 @@ mod t14_tests {
     }
 
     // -----------------------------------------------------------------------
-    // T14.3 — initPhase3
+    // T14.3 вЂ” initPhase3
     // -----------------------------------------------------------------------
 
     #[test]
@@ -3484,7 +3558,7 @@ mod t14_tests {
     }
 
     // -----------------------------------------------------------------------
-    // T14.4 — VM.getSavedProperty
+    // T14.4 вЂ” VM.getSavedProperty
     // -----------------------------------------------------------------------
 
     #[test]
@@ -3516,7 +3590,7 @@ mod t14_tests {
     }
 
     // -----------------------------------------------------------------------
-    // T14.5 — VM.getRuntimeArguments
+    // T14.5 вЂ” VM.getRuntimeArguments
     // -----------------------------------------------------------------------
 
     #[test]
@@ -3537,7 +3611,7 @@ mod t15_tests {
     use crate::test_utils::mock_ctx;
 
     // -----------------------------------------------------------------------
-    // T15.1.5 — Finalizer.register
+    // T15.1.5 вЂ” Finalizer.register
     // -----------------------------------------------------------------------
 
     #[test]
@@ -3557,7 +3631,7 @@ mod t15_tests {
     }
 
     // -----------------------------------------------------------------------
-    // T15.1.6 — Array.newArray
+    // T15.1.6 вЂ” Array.newArray
     // -----------------------------------------------------------------------
 
     #[test]
@@ -3584,7 +3658,7 @@ mod t15_tests {
     }
 
     // -----------------------------------------------------------------------
-    // T15.1.3 — ClassLoader.defineClass0/1/2
+    // T15.1.3 вЂ” ClassLoader.defineClass0/1/2
     // -----------------------------------------------------------------------
 
     #[test]
@@ -3718,7 +3792,7 @@ mod t15_tests {
 // `check_exec_or_throw` regresses these tests.
 //
 // MockNativeContext.invoke_virtual returns whatever's pre-armed in
-// `invoke_virtual_result` (taken once), defaulting to `Ok(None)` —
+// `invoke_virtual_result` (taken once), defaulting to `Ok(None)` вЂ”
 // matching JDK's "no exception thrown == allowed" semantics. This lets us
 // simulate both deny (pre-arm an Err) and allow (default).
 #[cfg(test)]
@@ -3729,7 +3803,7 @@ mod checkexec_security_tests {
     use cratonvm_types::error::{MethodCallFailed, RuntimeError, VmError};
 
     /// Helper: assert the failure is a SecurityException (regardless of
-    /// the exact message — the wrapping is `MethodCallFailed::InternalError(
+    /// the exact message вЂ” the wrapping is `MethodCallFailed::InternalError(
     /// VmError::Runtime(RuntimeError::SecurityException { .. }))`).
     fn assert_security_exception(err: &MethodCallFailed) {
         match err {
@@ -3741,12 +3815,12 @@ mod checkexec_security_tests {
     }
 
     // -----------------------------------------------------------------------
-    // (1) No SecurityManager — spawn gate is a no-op.
+    // (1) No SecurityManager вЂ” spawn gate is a no-op.
     // -----------------------------------------------------------------------
 
     #[test]
     fn no_security_manager_allows_check_exec() {
-        // Ensure no SM is installed (defensive — other tests may have set one).
+        // Ensure no SM is installed (defensive вЂ” other tests may have set one).
         let prev = set_security_manager_for_test(None);
 
         let mut ctx = mock_ctx();
@@ -3760,7 +3834,7 @@ mod checkexec_security_tests {
     }
 
     // -----------------------------------------------------------------------
-    // (2) SecurityManager that denies every checkExec — SecurityException
+    // (2) SecurityManager that denies every checkExec вЂ” SecurityException
     //     propagates AND the spawn does NOT happen.
     // -----------------------------------------------------------------------
 
@@ -3790,7 +3864,7 @@ mod checkexec_security_tests {
     #[test]
     fn denying_sm_blocks_runtime_exec_before_spawn() {
         // End-to-end check: a deny-all SM must short-circuit
-        // native_runtime_exec_string with SecurityException — std::process::Command
+        // native_runtime_exec_string with SecurityException вЂ” std::process::Command
         // is never invoked. Using a bogus program path proves no fallback
         // "Runtime.exec failed: ..." IOException can leak through, because
         // if the SM check is skipped the spawn would attempt the path and
@@ -3857,7 +3931,7 @@ mod checkexec_security_tests {
     }
 
     // -----------------------------------------------------------------------
-    // (3) Allow-specific-path SecurityManager — only listed paths spawn.
+    // (3) Allow-specific-path SecurityManager вЂ” only listed paths spawn.
     // -----------------------------------------------------------------------
     //
     // The MockNativeContext's `invoke_virtual_result` is consumed by
@@ -3886,7 +3960,7 @@ mod checkexec_security_tests {
         assert_security_exception(&err);
 
         // Second call: invoke_virtual_result was take()n on the previous
-        // call, so the mock now falls back to its default Ok(None) —
+        // call, so the mock now falls back to its default Ok(None) вЂ”
         // simulating the allow-list permitting this program.
         let allowed = check_exec_or_throw(&mut ctx, "/bin/allowed-program");
         assert!(
@@ -3897,3 +3971,4 @@ mod checkexec_security_tests {
         let _ = set_security_manager_for_test(prev);
     }
 }
+

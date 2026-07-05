@@ -3,7 +3,7 @@
 
 //! Class, reflect.Method, reflect.Field, reflect.Constructor native method implementations.
 
-use cratonvm_native_api::{FieldMetadata, MethodMetadata, NativeContext};
+use cratonvm_native_api::{AnnotationData, FieldMetadata, MethodMetadata, NativeContext};
 use cratonvm_types::error::{MethodCallFailed, MethodCallResult};
 use cratonvm_types::{ClassId, ObjectRef, Value};
 
@@ -10689,22 +10689,89 @@ pub(crate) fn native_method_get_parameter_annotations(
     let outer_comp = annotation_array_component_class_id(ctx);
     let inner_comp = annotation_component_class_id(ctx);
     let param_annotations = ctx.method_parameter_annotations(class_id, &method_name, &method_desc);
-    if param_annotations.is_empty() {
-        // Return an Annotation[param_count][0] — count params from descriptor
-        let param_count = count_method_params(&method_desc);
-        let outer = ctx.new_ref_array(outer_comp, param_count);
-        for i in 0..param_count {
-            let inner = ctx.new_ref_array(inner_comp, 0);
-            ctx.set_array_element(outer, i, Value::Object(Some(inner)));
-        }
-        return Ok(Some(Value::Object(Some(outer))));
-    }
-    let outer = ctx.new_ref_array(outer_comp, param_annotations.len());
-    for (i, anns) in param_annotations.iter().enumerate() {
-        let inner = build_annotation_array(ctx, anns);
-        ctx.set_array_element(outer, i, Value::Object(Some(inner)));
+    let aligned_annotations =
+        align_parameter_annotations(ctx, class_id, &method_name, &method_desc, param_annotations);
+    let outer = ctx.new_ref_array(outer_comp, aligned_annotations.len());
+    for i in 0..aligned_annotations.len() {
+        let anns = aligned_annotations
+            .get(i)
+            .map(|a| build_annotation_array(ctx, a))
+            .unwrap_or_else(|| ctx.new_ref_array(inner_comp, 0));
+        ctx.set_array_element(outer, i, Value::Object(Some(anns)));
     }
     Ok(Some(Value::Object(Some(outer))))
+}
+
+/// Access flags for method-parameter metadata from `MethodParameters`.
+const PARAMETER_MODIFIER_SYNTHETIC: u16 = 0x1000;
+const PARAMETER_MODIFIER_MANDATED: u16 = 0x8000;
+
+/// Class access flags used when deciding constructor synthetic-shift policy.
+const CLASS_ACCESS_STATIC: u16 = 0x0008;
+const CLASS_ACCESS_ENUM: u16 = 0x4000;
+
+/// Normalize raw parameter-annotation rows to JVM `Executable.getParameterAnnotations()`.
+///
+/// HotSpot accepts class-files where constructor synthetic/mandated parameters are
+/// absent from `RuntimeVisibleParameterAnnotations`, and shifts rows right so
+/// descriptor-indexed slots align.
+fn align_parameter_annotations(
+    ctx: &mut dyn NativeContext,
+    class_id: ClassId,
+    method_name: &str,
+    method_desc: &str,
+    param_annotations: Vec<Vec<AnnotationData>>,
+) -> Vec<Vec<AnnotationData>> {
+    let param_count = count_method_params(method_desc);
+    let mut normalized = if param_annotations.len() > param_count {
+        param_annotations.into_iter().take(param_count).collect()
+    } else {
+        param_annotations
+    };
+
+    if method_name != "<init>" || param_count == 0 {
+        normalized.resize(param_count, Vec::new());
+        return normalized;
+    }
+
+    let class_name = ctx.class_name_of_id(class_id).unwrap_or_default();
+    let class_flags = ctx.class_access_flags(class_id) as u16;
+    let is_nested_class = class_name.contains('$');
+    let is_static_nested = (class_flags & CLASS_ACCESS_STATIC) != 0;
+    let is_enum = (class_flags & CLASS_ACCESS_ENUM) != 0;
+    let has_enclosing_method = ctx.enclosing_method(class_id).is_some();
+
+    let shift = if is_enum && normalized.len() + 2 == param_count {
+        param_count.saturating_sub(normalized.len())
+    } else if !is_enum
+        && normalized.len() + 1 == param_count
+        && !is_static_nested
+        && is_nested_class
+        && !has_enclosing_method
+    {
+        let param_meta = ctx.method_parameters(class_id, method_name, method_desc);
+        if param_meta
+            .first()
+            .is_some_and(|(_, flags)| (*flags & (PARAMETER_MODIFIER_SYNTHETIC | PARAMETER_MODIFIER_MANDATED)) != 0)
+        {
+            param_count.saturating_sub(normalized.len())
+        } else {
+            0
+        }
+    } else {
+        0
+    };
+
+    if shift > 0 {
+        let mut shifted = vec![Vec::new(); param_count];
+        for (i, ann) in normalized.iter().enumerate() {
+            shifted[i + shift] = ann.clone();
+        }
+        shifted
+    } else {
+        normalized.resize(param_count, Vec::new());
+        normalized
+    }
 }
 
 /// Count the number of parameters in a method descriptor.
