@@ -417,17 +417,77 @@ pub(crate) fn native_module_layer_modules(
     ctx.new_object_initialized("java/util/HashSet", "()V", &[])
 }
 
-/// `ModuleLayer.configuration()` — return a synthetic `Configuration`.
+/// `ModuleLayer.configuration()` ? return an empty synthetic `Configuration`.
 ///
 /// Spring's `findAllModulePathResources` enumerates modules via
-/// `boot().configuration().modules()`. We don't model JPMS configurations,
-/// so a synthetic one-field `Configuration` is enough — its `modules()`
-/// override returns an empty Set.
+/// `boot().configuration().modules()`. Elasticsearch's provider locator goes
+/// one step further and calls `boot().configuration().resolve(...)`; real JDK
+/// `Configuration.resolve` asks the parent configuration to `findModule`, and
+/// `Configuration.findModule` dereferences private caches such as
+/// `nameToModule`. A one-slot synthetic object left those caches null and
+/// failed before module descriptor checks could run. Seed the real private
+/// collection fields with empty, initialized JDK collections so the bytecode
+/// path sees an empty boot configuration instead of a corrupt one.
 pub(crate) fn native_module_layer_configuration(
     ctx: &mut dyn NativeContext,
     _args: &[Value],
 ) -> MethodCallResult {
-    let cfg = alloc_concurrent_synthetic(ctx, "java/lang/module/Configuration", 1);
+    let cfg = alloc_concurrent_synthetic(ctx, "java/lang/module/Configuration", 5);
+    let cfg_pin = ctx.pin_native_root(cfg);
+
+    let parents = match ctx.new_object_initialized("java/util/ArrayList", "()V", &[])? {
+        Some(Value::Object(Some(o))) => o,
+        _ => {
+            ctx.unpin_native_roots(cfg_pin);
+            return Err(RuntimeError::IllegalStateException {
+                message: "ModuleLayer.configuration: could not allocate parents".to_string(),
+            }
+            .into());
+        }
+    };
+    let cfg = ctx.read_native_pin(cfg_pin, cfg);
+    ctx.set_field_by_name(cfg, "parents", Value::Object(Some(parents)));
+
+    let graph = match ctx.new_object_initialized("java/util/HashMap", "()V", &[])? {
+        Some(Value::Object(Some(o))) => o,
+        _ => {
+            ctx.unpin_native_roots(cfg_pin);
+            return Err(RuntimeError::IllegalStateException {
+                message: "ModuleLayer.configuration: could not allocate graph".to_string(),
+            }
+            .into());
+        }
+    };
+    let cfg = ctx.read_native_pin(cfg_pin, cfg);
+    ctx.set_field_by_name(cfg, "graph", Value::Object(Some(graph)));
+
+    let modules = match ctx.new_object_initialized("java/util/HashSet", "()V", &[])? {
+        Some(Value::Object(Some(o))) => o,
+        _ => {
+            ctx.unpin_native_roots(cfg_pin);
+            return Err(RuntimeError::IllegalStateException {
+                message: "ModuleLayer.configuration: could not allocate modules".to_string(),
+            }
+            .into());
+        }
+    };
+    let cfg = ctx.read_native_pin(cfg_pin, cfg);
+    ctx.set_field_by_name(cfg, "modules", Value::Object(Some(modules)));
+
+    let name_to_module = match ctx.new_object_initialized("java/util/HashMap", "()V", &[])? {
+        Some(Value::Object(Some(o))) => o,
+        _ => {
+            ctx.unpin_native_roots(cfg_pin);
+            return Err(RuntimeError::IllegalStateException {
+                message: "ModuleLayer.configuration: could not allocate nameToModule".to_string(),
+            }
+            .into());
+        }
+    };
+    let cfg = ctx.read_native_pin(cfg_pin, cfg);
+    ctx.set_field_by_name(cfg, "nameToModule", Value::Object(Some(name_to_module)));
+    ctx.unpin_native_roots(cfg_pin);
+
     Ok(Some(Value::Object(Some(cfg))))
 }
 
