@@ -22180,6 +22180,36 @@ fn collect_collection_elements(ctx: &mut dyn NativeContext, coll: ObjectRef) -> 
             }
             return Vec::new();
         }
+        // kotlin.collections.ArrayAsCollection (the backing view Kotlin's
+        // mutableListOf/listOf/setOf(vararg) build via
+        // CollectionsKt.asCollection(array, isVarargs)) has layout
+        // (values: Object[], isVarargs: Boolean). The generic "f0 = array,
+        // f1 = int size" ArrayList-shape heuristic a few lines below reads
+        // field 1 as a Value::Int and matches it regardless of whether the
+        // real field is an int or a boolean (both are stored as Value::Int
+        // on CratonVM) so isVarargs=true gets misread as size=1, and every
+        // new ArrayList<>(kotlin.collections.mutableListOf(a, b, ...)) (or
+        // HashSet(...), etc.) copy silently truncates to just the FIRST
+        // element (isVarargs=false accidentally reads size=0, which falls
+        // through to the correct toArray()-based fallback instead -- only
+        // the true case is silently wrong). This broke Spring's own
+        // InvocableHandlerMethodKotlinTests (a mutableListOf(...) resolver
+        // list lost its second element), and would affect any Kotlin code
+        // building a mutable collection from 2+ vararg literals. Read the
+        // real `values` field by name instead of guessing by slot index.
+        if cls_name == "kotlin/collections/ArrayAsCollection" {
+            if let Value::Object(Some(arr)) = ctx.get_field_by_name(coll, "values") {
+                if ctx.heap_kind_of(arr) == ObjectKind::Array {
+                    let len = ctx.array_length(arr);
+                    let mut out = Vec::with_capacity(len);
+                    for i in 0..len {
+                        out.push(ctx.get_array_element(arr, i));
+                    }
+                    return out;
+                }
+            }
+            return Vec::new();
+        }
         if cls_name.starts_with("java/util/Collections$Unmodifiable")
             || cls_name.starts_with("java/util/Collections$Synchronized")
             || cls_name.starts_with("java/util/Collections$Checked")
