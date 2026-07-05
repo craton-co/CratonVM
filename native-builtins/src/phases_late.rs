@@ -30392,9 +30392,12 @@ pub(crate) fn register_p66_thread_builder(r: &mut NativeMethodRegistry) {
             Ok(Some(Value::Int(0)))
         }
     });
-    // Thread.threadId() — Java 19
+    // Thread.threadId() — Java 19. Some single-threaded launcher paths do not
+    // have a positive VM thread id yet; expose the same main-thread id that the
+    // ThreadMXBean stubs publish from getAllThreadIds().
     r.register(t, "threadId", "()J", |ctx, _args| {
-        Ok(Some(Value::Long(ctx.thread_id() as i64)))
+        let tid = ctx.thread_id().max(1);
+        Ok(Some(Value::Long(tid as i64)))
     });
     r.set_category(__prev_cat);
 }

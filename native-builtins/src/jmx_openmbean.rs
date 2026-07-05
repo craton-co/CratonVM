@@ -707,22 +707,127 @@ fn native_converting_method_from(ctx: &mut dyn NativeContext, args: &[Value]) ->
         // Skip — caller stores null.
         return Ok(Some(Value::Object(None)));
     }
-    // Build a minimal ConvertingMethod with a no-op identity mapping.
+    // Build a minimal ConvertingMethod with enough type metadata for the JDK's
+    // MXBeanIntrospector lookup tables. In particular, getOpenSignature() is
+    // derived from paramMappings[*].openClass, so an empty mapping array makes
+    // overloaded operations such as ThreadMXBean.getThreadInfo(long) uncallable.
     let cvt = alloc_concurrent_synthetic(ctx, "com/sun/jmx/mbeanserver/ConvertingMethod", 4);
     // Field 0: method
     ctx.set_field(cvt, 0, Value::Object(Some(method_obj)));
-    // Field 1: returnMapping — synthetic identity mapping.
+    // Field 1: returnMapping — keep the previous identity mapping. The open
+    // return-type table still has broader CompositeType gaps; this fix is scoped
+    // to operation dispatch signatures, which are keyed from paramMappings.
     let ret_mapping = alloc_identity_mapping(ctx);
     ctx.set_field(cvt, 1, Value::Object(Some(ret_mapping)));
-    // Field 2: paramMappings — empty MXBeanMapping[].
-    let mapping_class_id = ctx
-        .ensure_class_initialized("com/sun/jmx/mbeanserver/MXBeanMapping")
-        .unwrap_or(cratonvm_types::ClassId::new(0));
-    let empty_params = ctx.new_ref_array(mapping_class_id, 0);
-    ctx.set_field(cvt, 2, Value::Object(Some(empty_params)));
+    // Field 2: paramMappings.
+    let param_mappings = converting_method_param_mappings(ctx, method_obj);
+    ctx.set_field(cvt, 2, Value::Object(Some(param_mappings)));
     // Field 3: paramConversionIsIdentity = true
     ctx.set_field(cvt, 3, Value::Int(1));
     Ok(Some(Value::Object(Some(cvt))))
+}
+
+fn converting_method_param_mappings(ctx: &mut dyn NativeContext, method_obj: ObjectRef) -> ObjectRef {
+    let mapping_class_id = ctx
+        .ensure_class_initialized("com/sun/jmx/mbeanserver/MXBeanMapping")
+        .unwrap_or(cratonvm_types::ClassId::new(0));
+
+    let Some(mut param_types_arr) = invoke_reflect_type_array(
+        ctx,
+        method_obj,
+        "getGenericParameterTypes",
+        "()[Ljava/lang/reflect/Type;",
+    )
+    .or_else(|| {
+        invoke_reflect_type_array(ctx, method_obj, "getParameterTypes", "()[Ljava/lang/Class;")
+    }) else {
+        return ctx.new_ref_array(mapping_class_id, 0);
+    };
+
+    let param_types_pin = ctx.pin_native_root(param_types_arr);
+    param_types_arr = ctx.read_native_pin(param_types_pin, param_types_arr);
+    let len = ctx.array_length(param_types_arr);
+    let mut out = ctx.new_ref_array(mapping_class_id, len);
+    let out_pin = ctx.pin_native_root(out);
+
+    for i in 0..len {
+        param_types_arr = ctx.read_native_pin(param_types_pin, param_types_arr);
+        let type_obj = match ctx.get_array_element(param_types_arr, i) {
+            Value::Object(Some(t)) => t,
+            _ => {
+                let mapping = alloc_identity_mapping(ctx);
+                out = ctx.read_native_pin(out_pin, out);
+                ctx.set_array_element(out, i, Value::Object(Some(mapping)));
+                continue;
+            }
+        };
+        let preserve_original_open_class = primitive_or_primitive_array_class_mirror(ctx, type_obj);
+        let mapping = alloc_mapping_for_type_object(ctx, type_obj);
+        if preserve_original_open_class {
+            param_types_arr = ctx.read_native_pin(param_types_pin, param_types_arr);
+            if let Value::Object(Some(open_class)) = ctx.get_array_element(param_types_arr, i) {
+                ctx.set_field(mapping, 2, Value::Object(Some(open_class)));
+            }
+        }
+        out = ctx.read_native_pin(out_pin, out);
+        ctx.set_array_element(out, i, Value::Object(Some(mapping)));
+    }
+
+    out = ctx.read_native_pin(out_pin, out);
+    ctx.unpin_native_roots(out_pin);
+    ctx.unpin_native_roots(param_types_pin);
+    out
+}
+
+fn invoke_reflect_type_array(
+    ctx: &mut dyn NativeContext,
+    method_obj: ObjectRef,
+    name: &str,
+    desc: &str,
+) -> Option<ObjectRef> {
+    match ctx.invoke_virtual(method_obj, name, desc, &[]) {
+        Ok(Some(Value::Object(Some(arr)))) => Some(arr),
+        _ => None,
+    }
+}
+
+fn alloc_mapping_for_type_object(ctx: &mut dyn NativeContext, type_obj: ObjectRef) -> ObjectRef {
+    let pin = ctx.pin_native_root(type_obj);
+    let type_obj = ctx.read_native_pin(pin, type_obj);
+    let mapping = match native_mapping_for_type(
+        ctx,
+        &[
+            Value::Object(None),
+            Value::Object(Some(type_obj)),
+            Value::Object(None),
+        ],
+    ) {
+        Ok(Some(Value::Object(Some(mapping)))) => mapping,
+        _ => alloc_identity_mapping(ctx),
+    };
+    ctx.unpin_native_roots(pin);
+    mapping
+}
+
+fn primitive_or_primitive_array_class_mirror(ctx: &dyn NativeContext, type_obj: ObjectRef) -> bool {
+    crate::lang_class::mirror_class_name(ctx, type_obj)
+        .map(|name| primitive_or_primitive_array_name(&name))
+        .unwrap_or(false)
+}
+
+fn primitive_or_primitive_array_name(name: &str) -> bool {
+    match name {
+        "boolean" | "byte" | "char" | "double" | "float" | "int" | "long" | "short"
+        | "void" => true,
+        s if s.starts_with('[') => {
+            let elem = s.trim_start_matches('[');
+            matches!(
+                elem.as_bytes().first(),
+                Some(b'Z' | b'B' | b'C' | b'D' | b'F' | b'I' | b'J' | b'S')
+            )
+        }
+        _ => false,
+    }
 }
 
 /// Allocate a synthetic `MXBeanMapping` instance backed by
@@ -1723,6 +1828,15 @@ mod tests {
             ]
         );
         assert_eq!(ret, "[I");
+    }
+
+    #[test]
+    fn test_primitive_or_primitive_array_name_for_jmx_signatures() {
+        assert!(primitive_or_primitive_array_name("long"));
+        assert!(primitive_or_primitive_array_name("[J"));
+        assert!(primitive_or_primitive_array_name("[[I"));
+        assert!(!primitive_or_primitive_array_name("java/lang/String"));
+        assert!(!primitive_or_primitive_array_name("[Ljava/lang/String;"));
     }
 
     #[test]
