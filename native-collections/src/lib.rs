@@ -14000,6 +14000,135 @@ fn int_stream_elements(ctx: &mut dyn NativeContext, stream: ObjectRef) -> Vec<Va
     stream_elements(ctx, stream).unwrap_or_default()
 }
 
+const PRIMITIVE_ITERATOR_FIELD_ELEMENTS: usize = 0;
+const PRIMITIVE_ITERATOR_FIELD_CURSOR: usize = 1;
+
+fn make_primitive_iterator(
+    ctx: &mut dyn NativeContext,
+    iterator_class: &str,
+    elements: &[Value],
+) -> MethodCallResult {
+    let arr = alloc_ref_array(ctx, elements.len());
+    for (i, val) in elements.iter().enumerate() {
+        ctx.set_array_element(arr, i, *val);
+    }
+    let itr = alloc_synthetic(ctx, iterator_class, 2);
+    ctx.set_field(
+        itr,
+        PRIMITIVE_ITERATOR_FIELD_ELEMENTS,
+        Value::Object(Some(arr)),
+    );
+    ctx.set_field(itr, PRIMITIVE_ITERATOR_FIELD_CURSOR, Value::Int(0));
+    Ok(Some(Value::Object(Some(itr))))
+}
+
+fn primitive_iterator_next_value(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> Result<Value, cratonvm_types::error::MethodCallFailed> {
+    let this = match args.first() {
+        Some(Value::Object(Some(obj))) => *obj,
+        _ => {
+            return Err(cratonvm_types::error::RuntimeError::NullPointerException {
+                message: Some("PrimitiveIterator: null receiver".to_string()),
+            }
+            .into())
+        }
+    };
+    let cursor = match ctx.get_field(this, PRIMITIVE_ITERATOR_FIELD_CURSOR) {
+        Value::Int(c) => c.max(0) as usize,
+        _ => 0,
+    };
+    let arr = match ctx.get_field(this, PRIMITIVE_ITERATOR_FIELD_ELEMENTS) {
+        Value::Object(Some(arr)) => arr,
+        _ => {
+            return Err(cratonvm_types::error::RuntimeError::NoSuchElementException {
+                message: "no more elements".to_string(),
+            }
+            .into())
+        }
+    };
+    if cursor >= ctx.array_length(arr) {
+        return Err(cratonvm_types::error::RuntimeError::NoSuchElementException {
+            message: "no more elements".to_string(),
+        }
+        .into());
+    }
+    let val = ctx.get_array_element(arr, cursor);
+    ctx.set_field(
+        this,
+        PRIMITIVE_ITERATOR_FIELD_CURSOR,
+        Value::Int((cursor + 1) as i32),
+    );
+    Ok(val)
+}
+
+fn native_primitive_iterator_has_next(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(obj))) => *obj,
+        _ => return Ok(Some(Value::Int(0))),
+    };
+    let cursor = match ctx.get_field(this, PRIMITIVE_ITERATOR_FIELD_CURSOR) {
+        Value::Int(c) => c.max(0) as usize,
+        _ => 0,
+    };
+    let len = match ctx.get_field(this, PRIMITIVE_ITERATOR_FIELD_ELEMENTS) {
+        Value::Object(Some(arr)) => ctx.array_length(arr),
+        _ => 0,
+    };
+    Ok(Some(Value::Int(if cursor < len { 1 } else { 0 })))
+}
+
+fn native_primitive_iterator_next_int(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    match primitive_iterator_next_value(ctx, args)? {
+        Value::Int(v) => Ok(Some(Value::Int(v))),
+        _ => Ok(Some(Value::Int(0))),
+    }
+}
+
+fn native_primitive_iterator_next_long(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    match primitive_iterator_next_value(ctx, args)? {
+        Value::Long(v) => Ok(Some(Value::Long(v))),
+        Value::Int(v) => Ok(Some(Value::Long(v as i64))),
+        _ => Ok(Some(Value::Long(0))),
+    }
+}
+
+fn native_primitive_iterator_next_double(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    match primitive_iterator_next_value(ctx, args)? {
+        Value::Double(v) => Ok(Some(Value::Double(v))),
+        Value::Float(v) => Ok(Some(Value::Double(v as f64))),
+        Value::Int(v) => Ok(Some(Value::Double(v as f64))),
+        Value::Long(v) => Ok(Some(Value::Double(v as f64))),
+        _ => Ok(Some(Value::Double(0.0))),
+    }
+}
+
+fn native_primitive_iterator_next_boxed(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    let val = primitive_iterator_next_value(ctx, args)?;
+    Ok(Some(
+        box_primitive_stream_elements(ctx, &[val])
+            .into_iter()
+            .next()
+            .unwrap_or(Value::Object(None)),
+    ))
+}
+
 // =============================================================================
 // IntStream — additional intermediate/terminal ops missing from the synthetic
 // surface. The synthetic IntStream is an object stamped with the *interface*
@@ -14237,6 +14366,12 @@ fn register_int_stream_natives(r: &mut NativeMethodRegistry) {
     r.register(c, "sum", "()I", native_int_stream_sum);
     r.register(
         c,
+        "iterator",
+        "()Ljava/util/PrimitiveIterator$OfInt;",
+        native_int_stream_iterator,
+    );
+    r.register(
+        c,
         "reduce",
         "(ILjava/util/function/IntBinaryOperator;)I",
         native_int_stream_reduce_seeded,
@@ -14459,6 +14594,52 @@ fn native_int_stream_range_closed(ctx: &mut dyn NativeContext, args: &[Value]) -
     let count = (end as i64 - start as i64 + 1).max(0);
     let elems = range_int_elements(start as i64, count)?;
     make_int_stream(ctx, &elems)
+}
+
+fn native_int_stream_iterator(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(r))) => *r,
+        _ => return make_primitive_iterator(ctx, "java/util/PrimitiveIterator$OfInt", &[]),
+    };
+    let elements = int_stream_elements(ctx, this);
+    make_primitive_iterator(ctx, "java/util/PrimitiveIterator$OfInt", &elements)
+}
+
+fn register_primitive_iterator_natives(r: &mut NativeMethodRegistry) {
+    let __prev_cat = r.current_category();
+    r.set_category(cratonvm_native_api::NativeKind::Bridge);
+    for c in [
+        "java/util/PrimitiveIterator$OfInt",
+        "java/util/PrimitiveIterator$OfLong",
+        "java/util/PrimitiveIterator$OfDouble",
+    ] {
+        r.register(c, "hasNext", "()Z", native_primitive_iterator_has_next);
+        r.register(
+            c,
+            "next",
+            "()Ljava/lang/Object;",
+            native_primitive_iterator_next_boxed,
+        );
+    }
+    r.register(
+        "java/util/PrimitiveIterator$OfInt",
+        "nextInt",
+        "()I",
+        native_primitive_iterator_next_int,
+    );
+    r.register(
+        "java/util/PrimitiveIterator$OfLong",
+        "nextLong",
+        "()J",
+        native_primitive_iterator_next_long,
+    );
+    r.register(
+        "java/util/PrimitiveIterator$OfDouble",
+        "nextDouble",
+        "()D",
+        native_primitive_iterator_next_double,
+    );
+    r.set_category(__prev_cat);
 }
 
 fn native_int_stream_of(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
@@ -15237,6 +15418,12 @@ fn register_long_stream_natives(r: &mut NativeMethodRegistry) {
     r.register(c, "toArray", "()[J", native_long_stream_to_array);
     r.register(
         c,
+        "iterator",
+        "()Ljava/util/PrimitiveIterator$OfLong;",
+        native_long_stream_iterator,
+    );
+    r.register(
+        c,
         "boxed",
         "()Ljava/util/stream/Stream;",
         native_long_stream_boxed,
@@ -15532,6 +15719,15 @@ fn native_long_stream_boxed(ctx: &mut dyn NativeContext, args: &[Value]) -> Meth
     make_stream(ctx, &boxed)
 }
 
+fn native_long_stream_iterator(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(r))) => *r,
+        _ => return make_primitive_iterator(ctx, "java/util/PrimitiveIterator$OfLong", &[]),
+    };
+    let elements = stream_elements(ctx, this)?;
+    make_primitive_iterator(ctx, "java/util/PrimitiveIterator$OfLong", &elements)
+}
+
 fn native_long_stream_as_double(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = match args.first() {
         Some(Value::Object(Some(r))) => *r,
@@ -15735,6 +15931,12 @@ fn register_double_stream_natives(r: &mut NativeMethodRegistry) {
         native_double_stream_map,
     );
     r.register(c, "toArray", "()[D", native_double_stream_to_array);
+    r.register(
+        c,
+        "iterator",
+        "()Ljava/util/PrimitiveIterator$OfDouble;",
+        native_double_stream_iterator,
+    );
     r.register(
         c,
         "boxed",
@@ -15975,6 +16177,15 @@ fn native_double_stream_boxed(ctx: &mut dyn NativeContext, args: &[Value]) -> Me
     let elements = stream_elements(ctx, this)?;
     let boxed = box_primitive_stream_elements(ctx, &elements);
     make_stream(ctx, &boxed)
+}
+
+fn native_double_stream_iterator(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(r))) => *r,
+        _ => return make_primitive_iterator(ctx, "java/util/PrimitiveIterator$OfDouble", &[]),
+    };
+    let elements = stream_elements(ctx, this)?;
+    make_primitive_iterator(ctx, "java/util/PrimitiveIterator$OfDouble", &elements)
 }
 
 fn native_double_stream_map_to_obj(
@@ -32711,6 +32922,7 @@ fn register_iterator_protocol_natives(r: &mut NativeMethodRegistry) {
         "()Ljava/util/Enumeration;",
         native_empty_enumeration,
     );
+    register_primitive_iterator_natives(r);
     r.set_category(__prev_cat);
 }
 

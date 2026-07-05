@@ -31,7 +31,7 @@ use std::sync::OnceLock;
 use cratonvm_native_api::{NativeContext, NativeMethodRegistry};
 use cratonvm_types::error::{MethodCallResult, RuntimeError};
 use cratonvm_types::{ArrayElementType, ObjectRef, Value};
-use flate2::{Compress, Compression, Decompress, FlushCompress, FlushDecompress};
+use flate2::{Decompress, FlushDecompress};
 
 // ---------------------------------------------------------------------------
 // Handle tables
@@ -46,7 +46,11 @@ struct InflaterState {
 }
 
 struct DeflaterState {
-    comp: Compress,
+    level: i32,
+    zlib_header: bool,
+    pending_input: Vec<u8>,
+    pending_output: Vec<u8>,
+    finished: bool,
 }
 
 fn inflater_table() -> &'static Mutex<HashMap<i64, InflaterState>> {
@@ -113,6 +117,7 @@ fn read_byte_array(ctx: &dyn NativeContext, arr: ObjectRef, off: usize, len: usi
     out
 }
 
+
 fn write_byte_array(ctx: &mut dyn NativeContext, arr: ObjectRef, off: usize, data: &[u8]) -> usize {
     let arr_len = ctx.array_length(arr);
     let mut written = 0usize;
@@ -125,6 +130,95 @@ fn write_byte_array(ctx: &mut dyn NativeContext, arr: ObjectRef, off: usize, dat
         written += 1;
     }
     written
+}
+
+fn defl_effective_level(level_raw: i32) -> i32 {
+    if (0..=9).contains(&level_raw) {
+        level_raw
+    } else {
+        6
+    }
+}
+
+#[cfg(unix)]
+fn defl_zlib_compress(data: &[u8], level: i32, zlib_header: bool) -> Option<Vec<u8>> {
+    use std::ffi::c_void;
+    use std::os::raw::{c_char, c_int, c_ulong};
+
+    type CompressBound = unsafe extern "C" fn(c_ulong) -> c_ulong;
+    type Compress2 = unsafe extern "C" fn(*mut u8, *mut c_ulong, *const u8, c_ulong, c_int) -> c_int;
+
+    unsafe fn sym<T>(handle: *mut c_void, name: &'static [u8]) -> Option<T> {
+        let ptr = libc::dlsym(handle, name.as_ptr() as *const c_char);
+        if ptr.is_null() {
+            None
+        } else {
+            Some(std::mem::transmute_copy(&ptr))
+        }
+    }
+
+    let mut handle = std::ptr::null_mut();
+    for name in [b"libz.so.1\0".as_slice(), b"libz.so\0".as_slice()] {
+        handle = unsafe { libc::dlopen(name.as_ptr() as *const c_char, libc::RTLD_LAZY) };
+        if !handle.is_null() {
+            break;
+        }
+    }
+    if handle.is_null() {
+        return None;
+    }
+
+    let compress_bound: CompressBound = unsafe { sym(handle, b"compressBound\0")? };
+    let compress2: Compress2 = unsafe { sym(handle, b"compress2\0")? };
+
+    let source_len = data.len() as c_ulong;
+    let mut bound = unsafe { compress_bound(source_len) } as usize;
+    if bound == 0 {
+        bound = data.len().saturating_add(64);
+    }
+    let mut z = vec![0u8; bound];
+    let mut z_len = bound as c_ulong;
+    let rc = unsafe {
+        compress2(
+            z.as_mut_ptr(),
+            &mut z_len,
+            data.as_ptr(),
+            source_len,
+            defl_effective_level(level) as c_int,
+        )
+    };
+    if rc != 0 || z_len < 6 {
+        return None;
+    }
+    z.truncate(z_len as usize);
+    if zlib_header {
+        Some(z)
+    } else {
+        Some(z[2..z.len() - 4].to_vec())
+    }
+}
+
+#[cfg(not(unix))]
+fn defl_zlib_compress(_data: &[u8], _level: i32, _zlib_header: bool) -> Option<Vec<u8>> {
+    None
+}
+
+fn defl_compress_finished(data: &[u8], level: i32, zlib_header: bool) -> std::io::Result<Vec<u8>> {
+    if let Some(out) = defl_zlib_compress(data, level, zlib_header) {
+        return Ok(out);
+    }
+
+    use std::io::Write;
+    let level = flate2::Compression::new(defl_effective_level(level) as u32);
+    if zlib_header {
+        let mut encoder = flate2::write::ZlibEncoder::new(Vec::new(), level);
+        encoder.write_all(data)?;
+        encoder.finish()
+    } else {
+        let mut encoder = flate2::write::DeflateEncoder::new(Vec::new(), level);
+        encoder.write_all(data)?;
+        encoder.finish()
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -354,14 +448,12 @@ fn defl_init(_ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let level_raw = arg_int(args, 0);
     let _strategy = arg_int(args, 1);
     let nowrap = arg_bool(args, 2);
-    let level = if (0..=9).contains(&level_raw) {
-        Compression::new(level_raw as u32)
-    } else {
-        Compression::default()
-    };
-    let zlib_header = !nowrap;
     let state = DeflaterState {
-        comp: Compress::new(level, zlib_header),
+        level: defl_effective_level(level_raw),
+        zlib_header: !nowrap,
+        pending_input: Vec::new(),
+        pending_output: Vec::new(),
+        finished: false,
     };
     let handle = next_handle();
     deflater_table()
@@ -392,44 +484,61 @@ fn defl_deflate_bytes_bytes(ctx: &mut dyn NativeContext, args: &[Value]) -> Meth
     let out_off = arg_int(args, 6).max(0) as usize;
     let out_len = arg_int(args, 7).max(0) as usize;
     let flush_code = arg_int(args, 8);
-    // params (level + strategy) ignored for now.
+    let params = arg_int(args, 9);
 
-    let flush = match flush_code {
-        0 => FlushCompress::None,
-        2 => FlushCompress::Sync,
-        3 => FlushCompress::Full,
-        4 => FlushCompress::Finish,
-        _ => FlushCompress::None,
-    };
     let input_data = match input_arr {
         Some(a) => read_byte_array(ctx, a, in_off, in_len),
         None => Vec::new(),
     };
-    let mut output_buf = vec![0u8; out_len];
 
-    let mut tbl = deflater_table().lock().unwrap_or_else(|e| e.into_inner());
-    let st = match tbl.get_mut(&addr) {
-        Some(s) => s,
-        None => return Ok(Some(Value::Long(0))),
+    let (input_consumed, output_bytes, finished) = {
+        let mut tbl = deflater_table().lock().unwrap_or_else(|e| e.into_inner());
+        let st = match tbl.get_mut(&addr) {
+            Some(s) => s,
+            None => return Ok(Some(Value::Long(0))),
+        };
+
+        if params != 0 {
+            // JDK packs params as: bit0=set, bits1..2=strategy, bits3..=level.
+            st.level = defl_effective_level(params >> 3);
+        }
+
+        if !input_data.is_empty() {
+            st.pending_input.extend_from_slice(&input_data);
+        }
+
+        if flush_code == 4 && !st.finished && st.pending_output.is_empty() {
+            st.pending_output = defl_compress_finished(
+                &st.pending_input,
+                st.level,
+                st.zlib_header,
+            )
+            .map_err(|e| RuntimeError::IOException {
+                message: format!("Deflater compression failed: {}", e),
+            })?;
+            st.pending_input.clear();
+            st.finished = true;
+        }
+
+        let take = out_len.min(st.pending_output.len());
+        let output = if take == 0 {
+            Vec::new()
+        } else {
+            st.pending_output.drain(..take).collect::<Vec<u8>>()
+        };
+        let finished = st.finished && st.pending_output.is_empty();
+        (input_data.len() as u32, output, finished)
     };
 
-    let total_in_before = st.comp.total_in();
-    let total_out_before = st.comp.total_out();
-    let status = st.comp.compress(&input_data, &mut output_buf, flush);
-    let input_consumed = (st.comp.total_in() - total_in_before) as u32;
-    let output_consumed = (st.comp.total_out() - total_out_before) as u32;
-    let finished = matches!(status, Ok(flate2::Status::StreamEnd));
-
-    drop(tbl);
-
     if let Some(a) = output_arr {
-        if output_consumed > 0 {
-            write_byte_array(ctx, a, out_off, &output_buf[..output_consumed as usize]);
+        if !output_bytes.is_empty() {
+            write_byte_array(ctx, a, out_off, &output_bytes);
         }
     }
+
     Ok(Some(Value::Long(pack_deflate_result(
         input_consumed,
-        output_consumed,
+        output_bytes.len() as u32,
         finished,
     ))))
 }
@@ -469,7 +578,9 @@ fn defl_reset(_ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult 
     let addr = arg_long(args, 0);
     let mut tbl = deflater_table().lock().unwrap_or_else(|e| e.into_inner());
     if let Some(st) = tbl.get_mut(&addr) {
-        st.comp.reset();
+        st.pending_input.clear();
+        st.pending_output.clear();
+        st.finished = false;
     }
     Ok(None)
 }

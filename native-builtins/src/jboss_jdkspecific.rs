@@ -108,6 +108,36 @@ const BOOT_JDK_PACKAGES: &[&str] = &[
     "sun.security.util",
 ];
 
+/// Public packages owned by `java.xml` that are visible to dynamic translet
+/// modules created by Xalan's `TemplatesImpl`.
+const JAVA_XML_PACKAGES: &[&str] = &[
+    "javax.xml",
+    "javax.xml.catalog",
+    "javax.xml.datatype",
+    "javax.xml.namespace",
+    "javax.xml.parsers",
+    "javax.xml.stream",
+    "javax.xml.stream.events",
+    "javax.xml.stream.util",
+    "javax.xml.transform",
+    "javax.xml.transform.dom",
+    "javax.xml.transform.sax",
+    "javax.xml.transform.stax",
+    "javax.xml.transform.stream",
+    "javax.xml.validation",
+    "javax.xml.xpath",
+    "org.w3c.dom",
+    "org.w3c.dom.bootstrap",
+    "org.w3c.dom.events",
+    "org.w3c.dom.ls",
+    "org.w3c.dom.ranges",
+    "org.w3c.dom.traversal",
+    "org.w3c.dom.views",
+    "org.xml.sax",
+    "org.xml.sax.ext",
+    "org.xml.sax.helpers",
+];
+
 /// Reject module names that a downstream API could interpret as a path
 /// traversal, a Windows UNC share, or an unexpected control sequence.
 ///
@@ -280,15 +310,15 @@ fn build_module(ctx: &mut dyn NativeContext, name: &str, layer: ObjectRef) -> Ob
     let name_str = ctx.create_string(name);
     ctx.set_field_by_name(module, "name", Value::Object(Some(name_str)));
     ctx.set_field_by_name(module, "layer", Value::Object(Some(layer)));
-    // Only `java.base` gets the full JDK package set; other synthetic
-    // modules get an empty set (callers check `contains` before acting).
+    // Known boot modules get their package sets; other synthetic modules get
+    // an empty set (callers check `contains` before acting).
     // Recorded off-object in `module_packages_table` (see its doc comment)
-    // instead of a field slot — `native_module_get_packages` reads it back
+    // instead of a field slot; `native_module_get_packages` reads it back
     // the same way.
-    let packages: Vec<String> = if name == "java.base" {
-        BOOT_JDK_PACKAGES.iter().map(|s| s.to_string()).collect()
-    } else {
-        Vec::new()
+    let packages: Vec<String> = match name {
+        "java.base" => BOOT_JDK_PACKAGES.iter().map(|s| s.to_string()).collect(),
+        "java.xml" => JAVA_XML_PACKAGES.iter().map(|s| s.to_string()).collect(),
+        _ => Vec::new(),
     };
     let id = ctx.identity_hash_code(module);
     let mut t = module_packages_table().lock().unwrap();
@@ -584,32 +614,33 @@ fn build_unqualified_export(
     Ok(export)
 }
 
-fn build_java_base_resolved_module(
+fn build_boot_resolved_module(
     ctx: &mut dyn NativeContext,
     cfg: ObjectRef,
+    name: &str,
+    package_names: &[&str],
 ) -> Result<ObjectRef, cratonvm_types::error::MethodCallFailed> {
     let cfg_pin = ctx.pin_native_root(cfg);
     let md = alloc_concurrent_synthetic(ctx, "java/lang/module/ModuleDescriptor", 16);
     let md_pin = ctx.pin_native_root(md);
-    let java_base = ctx.create_string("java.base");
+    let module_name = ctx.create_string(name);
     let md = ctx.read_native_pin(md_pin, md);
-    ctx.set_field_by_name(md, "name", Value::Object(Some(java_base)));
+    ctx.set_field_by_name(md, "name", Value::Object(Some(module_name)));
 
     // Keep descriptor collection accessors from observing null if downstream
-    // resolver or layer code asks for packages/exports/opens/etc. We only need
-    // an identity-correct java.base descriptor here, so empty collections are
-    // sufficient and match the previous empty-configuration policy.
+    // resolver or layer code asks for packages/exports/opens/etc. Empty
+    // collections are sufficient for the boot-configuration resolver paths.
     for field in ["modifiers", "requires", "exports", "opens", "uses", "provides", "packages"] {
         let empty = new_initialized_object(ctx, "java/util/HashSet", "()V", &[], field)?;
         let md = ctx.read_native_pin(md_pin, md);
         ctx.set_field_by_name(md, field, Value::Object(Some(empty)));
     }
 
-    let exports = new_initialized_object(ctx, "java/util/HashSet", "()V", &[], "java.base exports")?;
+    let exports = new_initialized_object(ctx, "java/util/HashSet", "()V", &[], "boot module exports")?;
     let exports_pin = ctx.pin_native_root(exports);
-    let packages = new_initialized_object(ctx, "java/util/HashSet", "()V", &[], "java.base packages")?;
+    let packages = new_initialized_object(ctx, "java/util/HashSet", "()V", &[], "boot module packages")?;
     let packages_pin = ctx.pin_native_root(packages);
-    for package_name in BOOT_JDK_PACKAGES {
+    for package_name in package_names {
         let export = build_unqualified_export(ctx, package_name)?;
         let exports = ctx.read_native_pin(exports_pin, exports);
         collection_add(ctx, exports, export)?;
@@ -642,6 +673,20 @@ fn build_java_base_resolved_module(
     Ok(resolved)
 }
 
+fn build_java_base_resolved_module(
+    ctx: &mut dyn NativeContext,
+    cfg: ObjectRef,
+) -> Result<ObjectRef, cratonvm_types::error::MethodCallFailed> {
+    build_boot_resolved_module(ctx, cfg, "java.base", BOOT_JDK_PACKAGES)
+}
+
+fn build_java_xml_resolved_module(
+    ctx: &mut dyn NativeContext,
+    cfg: ObjectRef,
+) -> Result<ObjectRef, cratonvm_types::error::MethodCallFailed> {
+    build_boot_resolved_module(ctx, cfg, "java.xml", JAVA_XML_PACKAGES)
+}
+
 /// `ModuleLayer.configuration()` ? return an empty synthetic `Configuration`.
 ///
 /// Spring's `findAllModulePathResources` enumerates modules via
@@ -651,9 +696,10 @@ fn build_java_base_resolved_module(
 /// `Configuration.findModule` dereferences private caches such as
 /// `nameToModule`. A one-slot synthetic object left those caches null and
 /// failed before module descriptor checks could run. Seed the real private
-/// collection fields with initialized JDK collections and include the one
-/// mandatory boot module, `java.base`, so named application/provider modules
-/// can resolve their implicit base-module dependency.
+/// collection fields with initialized JDK collections and include the boot
+/// modules that downstream dynamic-module resolution depends on. `java.base`
+/// is mandatory for every named module; `java.xml` is required by Xalan's
+/// transient `jdk.translet` module when XMLUnit/Spring compare XML content.
 pub(crate) fn native_module_layer_configuration(
     ctx: &mut dyn NativeContext,
     args: &[Value],
@@ -693,25 +739,43 @@ pub(crate) fn native_module_layer_configuration(
 
     let java_base = build_java_base_resolved_module(ctx, cfg)?;
     let java_base_pin = ctx.pin_native_root(java_base);
+    let java_xml = build_java_xml_resolved_module(ctx, cfg)?;
+    let java_xml_pin = ctx.pin_native_root(java_xml);
     let modules = ctx.read_native_pin(modules_pin, modules);
     let java_base = ctx.read_native_pin(java_base_pin, java_base);
     collection_add(ctx, modules, java_base)?;
+    let modules = ctx.read_native_pin(modules_pin, modules);
+    let java_xml = ctx.read_native_pin(java_xml_pin, java_xml);
+    collection_add(ctx, modules, java_xml)?;
 
     let empty_reads = new_initialized_object(ctx, "java/util/HashSet", "()V", &[], "java.base reads")?;
     let graph = ctx.read_native_pin(graph_pin, graph);
     let java_base = ctx.read_native_pin(java_base_pin, java_base);
     map_put(ctx, graph, java_base, empty_reads)?;
 
+    let java_xml_reads = new_initialized_object(ctx, "java/util/HashSet", "()V", &[], "java.xml reads")?;
+    let java_base = ctx.read_native_pin(java_base_pin, java_base);
+    collection_add(ctx, java_xml_reads, java_base)?;
+    let graph = ctx.read_native_pin(graph_pin, graph);
+    let java_xml = ctx.read_native_pin(java_xml_pin, java_xml);
+    map_put(ctx, graph, java_xml, java_xml_reads)?;
+
     let key = ctx.create_string("java.base");
     let name_to_module = ctx.read_native_pin(name_to_module_pin, name_to_module);
     let java_base = ctx.read_native_pin(java_base_pin, java_base);
     map_put(ctx, name_to_module, key, java_base)?;
+
+    let key = ctx.create_string("java.xml");
+    let name_to_module = ctx.read_native_pin(name_to_module_pin, name_to_module);
+    let java_xml = ctx.read_native_pin(java_xml_pin, java_xml);
+    map_put(ctx, name_to_module, key, java_xml)?;
 
     if let Some(layer) = layer {
         let cfg = ctx.read_native_pin(cfg_pin, cfg);
         ctx.set_field_by_name(layer, "cf", Value::Object(Some(cfg)));
     }
 
+    ctx.unpin_native_roots(java_xml_pin);
     ctx.unpin_native_roots(java_base_pin);
     ctx.unpin_native_roots(name_to_module_pin);
     ctx.unpin_native_roots(modules_pin);
@@ -801,7 +865,19 @@ pub fn register_jboss_jdkspecific(registry: &mut NativeMethodRegistry) {
     );
     registry.register(
         m,
+        "addExports0",
+        "(Ljava/lang/Module;Ljava/lang/String;Ljava/lang/Module;)V",
+        |_ctx, _args| Ok(None),
+    );
+    registry.register(
+        m,
         "addExportsToAll0",
+        "(Ljava/lang/Module;Ljava/lang/String;)V",
+        |_ctx, _args| Ok(None),
+    );
+    registry.register(
+        m,
+        "addExportsToAllUnnamed0",
         "(Ljava/lang/Module;Ljava/lang/String;)V",
         |_ctx, _args| Ok(None),
     );

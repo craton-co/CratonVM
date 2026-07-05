@@ -16546,6 +16546,31 @@ fn execute_invoke_kind(
         return res;
     }
 
+    if let Some(res) = intercept_jython_pymodule_findattr(
+        shared,
+        thread,
+        frame_idx,
+        method_name.as_ref(),
+        method_descriptor.as_ref(),
+        receiver_class_id,
+        &args,
+    ) {
+        return res;
+    }
+
+    if let Some(res) = intercept_jython_pyjavatype_findattr_ex(
+        shared,
+        thread,
+        frame_idx,
+        method_name.as_ref(),
+        method_descriptor.as_ref(),
+        receiver_class_id,
+        is_special,
+        &args,
+    ) {
+        return res;
+    }
+
     // `URLClassLoader.findClass` called from inside a subclass override (e.g.
     // Jasper's `JasperLoader.loadClass` → `findClass`) names the subclass in its
     // CP methodref, so the static-class force-native gate above misses it. Force
@@ -18896,6 +18921,106 @@ pub(crate) fn is_jdk_string_native_override(
     class_name == "java/lang/StringLatin1" && (method_name, descriptor) == ("inflate", "([BI[CII)V")
 }
 
+pub(crate) fn is_jdk_string_charset_name_constructor_override(
+    class_name: &str,
+    method_name: &str,
+    descriptor: &str,
+) -> bool {
+    class_name == "java/lang/String"
+        && method_name == "<init>"
+        && matches!(
+            descriptor,
+            "([BLjava/lang/String;)V" | "([BIILjava/lang/String;)V"
+        )
+}
+
+pub(crate) fn is_spring_mock_response_native_override(
+    class_name: &str,
+    method_name: &str,
+    descriptor: &str,
+) -> bool {
+    matches!(
+        class_name,
+        "org/springframework/mock/web/MockHttpServletResponse"
+            | "org/springframework/web/testfixture/servlet/MockHttpServletResponse"
+    ) && method_name == "getContentAsString"
+        && matches!(
+            descriptor,
+            "()Ljava/lang/String;" | "(Ljava/nio/charset/Charset;)Ljava/lang/String;"
+        )
+}
+
+
+pub(crate) fn is_script_engine_manager_native_override(
+    class_name: &str,
+    method_name: &str,
+    descriptor: &str,
+) -> bool {
+    class_name == "javax/script/ScriptEngineManager"
+        && matches!(
+            (method_name, descriptor),
+            ("getEngineByName", "(Ljava/lang/String;)Ljavax/script/ScriptEngine;")
+                | ("getEngineByExtension", "(Ljava/lang/String;)Ljavax/script/ScriptEngine;")
+                | ("getEngineByMimeType", "(Ljava/lang/String;)Ljavax/script/ScriptEngine;")
+        )
+}
+
+pub(crate) fn is_jython_thread_state_native_override(
+    class_name: &str,
+    method_name: &str,
+    descriptor: &str,
+) -> bool {
+    class_name == "org/python/core/Py"
+        && matches!(
+            (method_name, descriptor),
+            ("importSiteIfSelected", "()Z")
+                | ("getSystemState", "()Lorg/python/core/PySystemState;")
+                | (
+                    "setSystemState",
+                    "(Lorg/python/core/PySystemState;)Lorg/python/core/PySystemState;",
+                )
+                | ("getThreadState", "()Lorg/python/core/ThreadState;")
+                | (
+                    "getThreadState",
+                    "(Lorg/python/core/PySystemState;)Lorg/python/core/ThreadState;",
+                )
+        )
+}
+
+pub(crate) fn is_jython_pyobject_native_override(
+    class_name: &str,
+    method_name: &str,
+    descriptor: &str,
+) -> bool {
+    class_name == "org/python/core/PyObject"
+        && ((matches!(method_name, "_is" | "_isnot" | "_eq" | "_ne")
+            && descriptor == "(Lorg/python/core/PyObject;)Lorg/python/core/PyObject;")
+            || (method_name == "invoke"
+                && descriptor
+                    == "(Ljava/lang/String;Lorg/python/core/PyObject;)Lorg/python/core/PyObject;"))
+}
+
+
+pub(crate) fn is_jython_imp_native_override(
+    class_name: &str,
+    method_name: &str,
+    descriptor: &str,
+) -> bool {
+    class_name == "org/python/core/imp"
+        && method_name == "addModule"
+        && descriptor == "(Ljava/lang/String;)Lorg/python/core/PyModule;"
+}
+
+pub(crate) fn is_jython_pymodule_native_override(
+    class_name: &str,
+    method_name: &str,
+    descriptor: &str,
+) -> bool {
+    class_name == "org/python/core/PyModule"
+        && method_name == "__findattr_ex__"
+        && descriptor == "(Ljava/lang/String;)Lorg/python/core/PyObject;"
+}
+
 pub(crate) fn is_time_native_override(
     class_name: &str,
     method_name: &str,
@@ -18966,6 +19091,24 @@ fn force_native_over_real_jdk_bytecode(
     // `ModuleRegistry`'s parsed `uses`.
     if class_name == "java/lang/Module"
         && matches!(method_name, "isExported" | "isOpen" | "getDescriptor")
+    {
+        return true;
+    }
+    // ByteArrayOutputStream is frequently subclassed by JDK internals. The VM
+    // already forces these intrinsics in the slow shared-invocation path; keep
+    // the interpreter cache gate in sync so ordinary bytecode dispatch also
+    // uses the registered native overloads, including charset-aware toString.
+    if class_name == "java/io/ByteArrayOutputStream"
+        && matches!(method_name, "write" | "toByteArray" | "size" | "reset" | "toString")
+    {
+        return true;
+    }
+    if is_spring_mock_response_native_override(class_name, method_name, method_descriptor)
+        || is_script_engine_manager_native_override(class_name, method_name, method_descriptor)
+        || is_jython_thread_state_native_override(class_name, method_name, method_descriptor)
+        || is_jython_pyobject_native_override(class_name, method_name, method_descriptor)
+        || is_jython_imp_native_override(class_name, method_name, method_descriptor)
+        || is_jython_pymodule_native_override(class_name, method_name, method_descriptor)
     {
         return true;
     }
@@ -19199,7 +19342,13 @@ fn force_native_over_real_jdk_bytecode(
     // most of its time in `StringLatin1.inflate`. The native is bytecode-
     // equivalent for the Latin-1 byte[] -> char[] copy and avoids millions of
     // interpreted inner-loop frames.
-    if is_jdk_string_native_override(class_name, method_name, method_descriptor) {
+    if is_jdk_string_native_override(class_name, method_name, method_descriptor)
+        || is_jdk_string_charset_name_constructor_override(
+            class_name,
+            method_name,
+            method_descriptor,
+        )
+    {
         return true;
     }
     // H2 calls `Instant.now()` for every SQL statement command swap during
@@ -19618,6 +19767,90 @@ fn intercept_force_registered_native(
     })())
 }
 
+#[inline]
+fn intercept_jython_pyjavatype_findattr_ex(
+    shared: &SharedVm,
+    thread: &mut JvmThread,
+    frame_idx: usize,
+    method_name: &str,
+    method_descriptor: &str,
+    receiver_class_id: Option<ClassId>,
+    is_special: bool,
+    args: &[Value],
+) -> Option<Result<CachedCallResult, MethodCallFailed>> {
+    if is_special {
+        return None;
+    }
+    if method_name != "__findattr_ex__"
+        || method_descriptor != "(Ljava/lang/String;)Lorg/python/core/PyObject;"
+    {
+        return None;
+    }
+    let recv_cid = receiver_class_id?;
+    let recv_name = {
+        let cm = shared.class_manager.read();
+        cm.get_class(recv_cid).map(|c| c.name.to_string())?
+    };
+    if recv_name != "org/python/core/PyJavaType" {
+        return None;
+    }
+    let cb = shared
+        .native_methods
+        .find("org/python/core/PyJavaType", method_name, method_descriptor)?;
+    let ret_type = crate::jit::return_type(method_descriptor);
+    Some((|| {
+        let result = crate::vm::safe_native_call(shared, thread, cb, args)?;
+        if let Some(value) = result.filter(|_| ret_type != b'V') {
+            push_invoke_return_value(
+                &mut thread.frames[frame_idx].stack,
+                coerce_value_for_return(value, ret_type),
+            )?;
+            crate::vm::native_return_pushed_to_stack(shared, thread);
+        }
+        Ok(CachedCallResult::Handled)
+    })())
+}
+
+#[inline]
+fn intercept_jython_pymodule_findattr(
+    shared: &SharedVm,
+    thread: &mut JvmThread,
+    frame_idx: usize,
+    method_name: &str,
+    method_descriptor: &str,
+    receiver_class_id: Option<ClassId>,
+    args: &[Value],
+) -> Option<Result<CachedCallResult, MethodCallFailed>> {
+    if method_name != "__findattr__"
+        || method_descriptor != "(Ljava/lang/String;)Lorg/python/core/PyObject;"
+    {
+        return None;
+    }
+    let recv_cid = receiver_class_id?;
+    let recv_name = {
+        let cm = shared.class_manager.read();
+        cm.get_class(recv_cid).map(|c| c.name.to_string())?
+    };
+    if recv_name != "org/python/core/PyModule" {
+        return None;
+    }
+    let cb = shared
+        .native_methods
+        .find("org/python/core/PyModule", method_name, method_descriptor)?;
+    let ret_type = crate::jit::return_type(method_descriptor);
+    Some((|| {
+        let result = crate::vm::safe_native_call(shared, thread, cb, args)?;
+        if let Some(value) = result.filter(|_| ret_type != b'V') {
+            push_invoke_return_value(
+                &mut thread.frames[frame_idx].stack,
+                coerce_value_for_return(value, ret_type),
+            )?;
+            crate::vm::native_return_pushed_to_stack(shared, thread);
+        }
+        Ok(CachedCallResult::Handled)
+    })())
+}
+
 /// `URLClassLoader.findClass(String)` invoked on a SUBCLASS receiver whose CP
 /// methodref names that subclass (so the static-class force-native gate, keyed
 /// on the methodref class, never matches). The canonical case is Jasper's
@@ -19907,23 +20140,16 @@ fn try_stackless_invoke(
         loop {
             let parent_id = cm.get_class(cid)?.superclass?;
             let parent = cm.get_class(parent_id)?;
-            // S107 collection-toString fix: if this parent has its own
-            // bytecode for the method (e.g. AbstractCollection.toString),
-            // the bytecode override wins over any deeper native ancestor
-            // (e.g. Object.toString). Stop walking — return None so the
-            // bytecode dispatch path executes.
-            if parent.find_method(method_name, descriptor).is_some() {
-                return None;
-            }
+            let has_bytecode = parent.find_method(method_name, descriptor).is_some();
             // JVMTI redefine guard, per ancestor. Mockito's inline mock
             // maker mocks a CONCRETE class (e.g. `java.net.HttpURLConnection`)
             // by redefining that class directly and weaving advice into its
             // methods, then instantiating a trivial marker SUBCLASS (which
             // declares only a couple of identity/interceptor-plumbing
-            // methods — it does NOT override every mockable method the way
+            // methods; it does NOT override every mockable method the way
             // an interface mock's generated subclass does). So the RECEIVER
             // here is that marker subclass, which itself was never redefined
-            // — only the ANCESTOR (`HttpURLConnection`) was. The top-level
+            // Only the ANCESTOR (`HttpURLConnection`) was. The top-level
             // `native_shadow_suppressed_by_redefine(shared, class_name)`
             // check below only inspects the receiver's own class and misses
             // this entirely, so a native registered on the redefined
@@ -19932,17 +20158,22 @@ fn try_stackless_invoke(
             // calls) silently bypassed the mock's advice and ran the real
             // native instead. Skip an ancestor's native the same way the
             // receiver-class check does.
-            if native_shadow_suppressed_by_redefine(shared, &parent.name)
+            let parent_redefined = native_shadow_suppressed_by_redefine(shared, &parent.name)
                 && !redefine_immune_reflection_native(&parent.name, method_name)
-                && !redefine_immune_string_builder_native(&parent.name, method_name, descriptor)
-            {
-                return None;
+                && !redefine_immune_string_builder_native(&parent.name, method_name, descriptor);
+            if !parent_redefined {
+                if let Some(cb) = shared
+                    .native_methods
+                    .find(&parent.name, method_name, descriptor)
+                {
+                    return Some(cb);
+                }
             }
-            if let Some(cb) = shared
-                .native_methods
-                .find(&parent.name, method_name, descriptor)
-            {
-                return Some(cb);
+            // S107 collection-toString fix: if this parent has bytecode and no
+            // same-parent native override, bytecode wins over deeper native
+            // ancestors (e.g. AbstractCollection.toString over Object.toString).
+            if has_bytecode {
+                return None;
             }
             cid = parent_id;
         }
@@ -26250,6 +26481,23 @@ fn execute_invokevirtual_vtable_fast(
             Some(c) => Arc::clone(c),
             None => return Ok(CachedCallResult::CacheMiss),
         };
+        let declaring_name = shared
+            .class_manager
+            .read()
+            .get_class(cratonvm_types::ClassId::new(entry.declaring_class_id as u32))
+            .map(|c| c.name.to_string())
+            .unwrap_or_else(|| cached.class_name.to_string());
+        if force_native_over_real_jdk_bytecode(
+            &declaring_name,
+            &method_name,
+            &method_descriptor,
+        ) && shared
+            .native_methods
+            .find(&declaring_name, &method_name, &method_descriptor)
+            .is_some()
+        {
+            return Ok(CachedCallResult::CacheMiss);
+        }
         (cached, entry.is_native)
     };
     let _ = entry_is_native; // silence unused
@@ -27552,6 +27800,78 @@ fn populate_virtual_invoke_cache(
     // `Constructor.newInstance`; the monomorphic fast path skips
     // `try_stackless_invoke` and would execute JDK bytecode instead of the
     // Rust overrides registered in `register_essential_natives`.
+    let declaring_for_jython = store.get(declaring_id).map(|c| &*c.name).unwrap_or("");
+    if declaring_for_jython == "org/python/core/PyObject"
+        && method_name.as_ref() == "__findattr__"
+        && descriptor.as_ref() == "(Ljava/lang/String;)Lorg/python/core/PyObject;"
+    {
+        let receiver_name = store
+            .get(receiver_class_id)
+            .map(|c| &*c.name)
+            .unwrap_or("");
+        if receiver_name == "org/python/core/PyModule" {
+            if let Some(callback) = shared.native_methods.find(
+                "org/python/core/PyModule",
+                &method_name,
+                &descriptor,
+            ) {
+                let gate = RedefineGate::snapshot(
+                    cm.class_redefine_generation_handle(receiver_class_id),
+                );
+                drop(cm);
+                let target = CachedInvokeTarget::VirtualNative {
+                    receiver_class_id,
+                    callback,
+                    num_params: num_params as u16,
+                    gate,
+                };
+                shared
+                    .shared_resolution
+                    .insert_promoted_invoke(promoted_key, target.clone());
+                thread
+                    .invoke_cache
+                    .put(caller_class_id, cp_index, false, target);
+                return;
+            }
+        }
+    }
+
+    let declaring_for_pyjavatype = store.get(declaring_id).map(|c| &*c.name).unwrap_or("");
+    if declaring_for_pyjavatype == "org/python/core/PyType"
+        && method_name.as_ref() == "__findattr_ex__"
+        && descriptor.as_ref() == "(Ljava/lang/String;)Lorg/python/core/PyObject;"
+    {
+        let receiver_name = store
+            .get(receiver_class_id)
+            .map(|c| &*c.name)
+            .unwrap_or("");
+        if receiver_name == "org/python/core/PyJavaType" {
+            if let Some(callback) = shared.native_methods.find(
+                "org/python/core/PyJavaType",
+                &method_name,
+                &descriptor,
+            ) {
+                let gate = RedefineGate::snapshot(
+                    cm.class_redefine_generation_handle(receiver_class_id),
+                );
+                drop(cm);
+                let target = CachedInvokeTarget::VirtualNative {
+                    receiver_class_id,
+                    callback,
+                    num_params: num_params as u16,
+                    gate,
+                };
+                shared
+                    .shared_resolution
+                    .insert_promoted_invoke(promoted_key, target.clone());
+                thread
+                    .invoke_cache
+                    .put(caller_class_id, cp_index, false, target);
+                return;
+            }
+        }
+    }
+
     let declaring_for_reflect = store.get(declaring_id).map(|c| &*c.name).unwrap_or("");
     if let Some(callback) = native_override_for_cached_reflect_invoke(
         shared,

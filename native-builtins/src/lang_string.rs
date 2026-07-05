@@ -4890,22 +4890,28 @@ pub(crate) fn native_string_region_matches_ic(
         Some(Value::Int(v)) => *v != 0,
         _ => false,
     };
-    let toffset = match args.get(2) {
-        Some(Value::Int(v)) => *v as usize,
+    let toffset_i = match args.get(2) {
+        Some(Value::Int(v)) => *v,
         _ => 0,
     };
     let other = match args.get(3) {
         Some(Value::Object(Some(obj))) => ctx.read_string(*obj).unwrap_or_default(),
         _ => return Ok(Some(Value::Int(0))),
     };
-    let ooffset = match args.get(4) {
-        Some(Value::Int(v)) => *v as usize,
+    let ooffset_i = match args.get(4) {
+        Some(Value::Int(v)) => *v,
         _ => 0,
     };
-    let len = match args.get(5) {
-        Some(Value::Int(v)) => *v as usize,
+    let len_i = match args.get(5) {
+        Some(Value::Int(v)) => *v,
         _ => 0,
     };
+    if toffset_i < 0 || ooffset_i < 0 || len_i < 0 {
+        return Ok(Some(Value::Int(0)));
+    }
+    let toffset = toffset_i as usize;
+    let ooffset = ooffset_i as usize;
+    let len = len_i as usize;
 
     let s = ctx.read_string(this).unwrap_or_default();
     // bug nb-lang-string: regionMatches offsets/len are in UTF-16 code UNITS,
@@ -4913,7 +4919,11 @@ pub(crate) fn native_string_region_matches_ic(
     let s_units: Vec<u16> = s.encode_utf16().collect();
     let o_units: Vec<u16> = other.encode_utf16().collect();
 
-    if toffset + len > s_units.len() || ooffset + len > o_units.len() {
+    if toffset.checked_add(len).map_or(true, |end| end > s_units.len())
+        || ooffset
+            .checked_add(len)
+            .map_or(true, |end| end > o_units.len())
+    {
         return Ok(Some(Value::Int(0)));
     }
 
@@ -4957,22 +4967,28 @@ pub(crate) fn native_string_region_matches(
         Some(Value::Object(Some(obj))) => *obj,
         _ => return Ok(Some(Value::Int(0))),
     };
-    let toffset = match args.get(1) {
-        Some(Value::Int(v)) => *v as usize,
+    let toffset_i = match args.get(1) {
+        Some(Value::Int(v)) => *v,
         _ => 0,
     };
     let other = match args.get(2) {
         Some(Value::Object(Some(obj))) => ctx.read_string(*obj).unwrap_or_default(),
         _ => return Ok(Some(Value::Int(0))),
     };
-    let ooffset = match args.get(3) {
-        Some(Value::Int(v)) => *v as usize,
+    let ooffset_i = match args.get(3) {
+        Some(Value::Int(v)) => *v,
         _ => 0,
     };
-    let len = match args.get(4) {
-        Some(Value::Int(v)) => *v as usize,
+    let len_i = match args.get(4) {
+        Some(Value::Int(v)) => *v,
         _ => 0,
     };
+    if toffset_i < 0 || ooffset_i < 0 || len_i < 0 {
+        return Ok(Some(Value::Int(0)));
+    }
+    let toffset = toffset_i as usize;
+    let ooffset = ooffset_i as usize;
+    let len = len_i as usize;
 
     let s = ctx.read_string(this).unwrap_or_default();
     // bug nb-lang-string: regionMatches offsets/len are in UTF-16 code UNITS,
@@ -4980,7 +4996,11 @@ pub(crate) fn native_string_region_matches(
     let s_units: Vec<u16> = s.encode_utf16().collect();
     let o_units: Vec<u16> = other.encode_utf16().collect();
 
-    if toffset + len > s_units.len() || ooffset + len > o_units.len() {
+    if toffset.checked_add(len).map_or(true, |end| end > s_units.len())
+        || ooffset
+            .checked_add(len)
+            .map_or(true, |end| end > o_units.len())
+    {
         return Ok(Some(Value::Int(0)));
     }
 

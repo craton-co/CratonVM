@@ -1247,6 +1247,117 @@ pub(crate) fn uri_hash_code(ctx: &dyn NativeContext, uri: ObjectRef) -> i32 {
     h
 }
 
+fn cmp_order(o: std::cmp::Ordering) -> i32 {
+    match o {
+        std::cmp::Ordering::Less => -1,
+        std::cmp::Ordering::Equal => 0,
+        std::cmp::Ordering::Greater => 1,
+    }
+}
+
+fn cmp_i32(a: i32, b: i32) -> i32 {
+    cmp_order(a.cmp(&b))
+}
+
+fn cmp_str(a: &str, b: &str) -> i32 {
+    cmp_order(a.cmp(b))
+}
+
+fn cmp_opt_str(a: Option<&str>, b: Option<&str>) -> i32 {
+    match (a, b) {
+        (None, None) => 0,
+        (None, Some(_)) => -1,
+        (Some(_), None) => 1,
+        (Some(x), Some(y)) => cmp_str(x, y),
+    }
+}
+
+fn cmp_opt_str_ci(a: Option<&str>, b: Option<&str>) -> i32 {
+    match (a, b) {
+        (None, None) => 0,
+        (None, Some(_)) => -1,
+        (Some(_), None) => 1,
+        (Some(x), Some(y)) => cmp_str(&x.to_ascii_lowercase(), &y.to_ascii_lowercase()),
+    }
+}
+
+/// `java.net.URI.compareTo(URI)` companion to `uri_equals`.
+///
+/// The real JDK orders URIs by components rather than by object identity. A
+/// placeholder native used to return zero for every pair, which made callers
+/// such as Apache POI treat `/xl/_rels/workbook.xml.rels` as equal to
+/// `/_rels/.rels` and serialize package relationships relative to `/`.
+fn uri_compare(ctx: &dyn NativeContext, a: ObjectRef, b: ObjectRef) -> i32 {
+    if a == b {
+        return 0;
+    }
+    let ra = uri_raw_string(ctx, a);
+    let rb = uri_raw_string(ctx, b);
+    if ra == rb {
+        return 0;
+    }
+    let (a_scheme, a_auth, a_path, a_query, a_frag) = uri_split(&ra);
+    let (b_scheme, b_auth, b_path, b_query, b_frag) = uri_split(&rb);
+
+    let c = cmp_opt_str_ci(a_scheme.as_deref(), b_scheme.as_deref());
+    if c != 0 {
+        return c;
+    }
+
+    let a_opaque = a_scheme.is_some() && a_auth.is_none() && !a_path.starts_with('/');
+    let b_opaque = b_scheme.is_some() && b_auth.is_none() && !b_path.starts_with('/');
+    if a_opaque != b_opaque {
+        return if a_opaque { 1 } else { -1 };
+    }
+
+    if a_opaque {
+        let c = cmp_str(&a_path, &b_path);
+        if c != 0 {
+            return c;
+        }
+        return cmp_opt_str(a_frag.as_deref(), b_frag.as_deref());
+    }
+
+    match (&a_auth, &b_auth) {
+        (Some(aa), Some(ba)) => {
+            let (a_user, a_host, a_port) = uri_parse_authority(aa);
+            let (b_user, b_host, b_port) = uri_parse_authority(ba);
+            if a_host.is_some() && b_host.is_some() {
+                let c = cmp_opt_str(a_user.as_deref(), b_user.as_deref());
+                if c != 0 {
+                    return c;
+                }
+                let c = cmp_opt_str_ci(a_host.as_deref(), b_host.as_deref());
+                if c != 0 {
+                    return c;
+                }
+                let c = cmp_i32(a_port, b_port);
+                if c != 0 {
+                    return c;
+                }
+            } else {
+                let c = cmp_str(aa, ba);
+                if c != 0 {
+                    return c;
+                }
+            }
+        }
+        (None, Some(_)) => return -1,
+        (Some(_), None) => return 1,
+        (None, None) => {}
+    }
+
+    let c = cmp_str(&a_path, &b_path);
+    if c != 0 {
+        return c;
+    }
+    let c = cmp_opt_str(a_query.as_deref(), b_query.as_deref());
+    if c != 0 {
+        return c;
+    }
+    cmp_opt_str(a_frag.as_deref(), b_frag.as_deref())
+}
+
 fn opt_str_eq_ignore_case(a: &Option<String>, b: &Option<String>) -> bool {
     match (a, b) {
         (None, None) => true,
@@ -2089,9 +2200,24 @@ fn register_uri_natives(r: &mut NativeMethodRegistry) {
         Ok(Some(Value::Object(Some(url))))
     });
 
-    // compareTo(URI) → 0 (always equal — caller uses this for identity checks)
-    r.register(uri, "compareTo", "(Ljava/net/URI;)I", |_ctx, _args| {
-        Ok(Some(Value::Int(0)))
+    // compareTo(URI) -> component-wise ordering consistent with equals.
+    r.register(uri, "compareTo", "(Ljava/net/URI;)I", |ctx, args| {
+        let this = obj_arg(args, 0)?;
+        let other = match args.get(1) {
+            Some(Value::Object(Some(o))) => *o,
+            _ => return Err(iae("URI.compareTo null")),
+        };
+        Ok(Some(Value::Int(uri_compare(ctx, this, other))))
+    });
+
+    // Bridge form used by erased Comparable call sites.
+    r.register(uri, "compareTo", "(Ljava/lang/Object;)I", |ctx, args| {
+        let this = obj_arg(args, 0)?;
+        let other = match args.get(1) {
+            Some(Value::Object(Some(o))) => *o,
+            _ => return Err(iae("URI.compareTo null")),
+        };
+        Ok(Some(Value::Int(uri_compare(ctx, this, other))))
     });
 
     // equals(Object) — see `uri_equals` doc comment: real JDK compares
@@ -2190,6 +2316,50 @@ fn register_uri_natives(r: &mut NativeMethodRegistry) {
             };
             let resolved = uri_resolve_ref(&base, &reference);
             Ok(Some(Value::Object(Some(make_uri(ctx, &resolved)))))
+        },
+    );
+
+    // relativize(URI) -> JDK-compatible prefix relativization for hierarchical
+    // URIs. Real bytecode reads URI internals that our synthetic constructors do
+    // not always populate, so run this from the raw text instead.
+    r.register(
+        uri,
+        "relativize",
+        "(Ljava/net/URI;)Ljava/net/URI;",
+        |ctx, args| {
+            let this = obj_arg(args, 0)?;
+            let other = match args.get(1) {
+                Some(Value::Object(Some(o))) => *o,
+                _ => return Ok(Some(Value::Object(Some(this)))),
+            };
+            let base = uri_raw_string(ctx, this);
+            let target = uri_raw_string(ctx, other);
+            let (b_scheme, b_auth, b_path, _b_query, _b_frag) = uri_split(&base);
+            let (t_scheme, t_auth, t_path, t_query, t_frag) = uri_split(&target);
+            let b_opaque = b_scheme.is_some() && b_auth.is_none() && !b_path.starts_with('/');
+            let t_opaque = t_scheme.is_some() && t_auth.is_none() && !t_path.starts_with('/');
+            if b_opaque
+                || t_opaque
+                || !opt_str_eq_ignore_case(&b_scheme, &t_scheme)
+                || b_auth != t_auth
+            {
+                return Ok(Some(Value::Object(Some(other))));
+            }
+            let b_norm = uri_remove_dot_segments(&b_path);
+            let t_norm = uri_remove_dot_segments(&t_path);
+            if !t_norm.starts_with(&b_norm) {
+                return Ok(Some(Value::Object(Some(other))));
+            }
+            let rel = &t_norm[b_norm.len()..];
+            if rel.is_empty() {
+                return Ok(Some(Value::Object(Some(make_uri(ctx, "")))));
+            }
+            if !b_norm.ends_with('/') && !rel.starts_with('/') {
+                return Ok(Some(Value::Object(Some(other))));
+            }
+            let rel = rel.strip_prefix('/').unwrap_or(rel);
+            let recomposed = uri_recompose(&None, &None, rel, &t_query, &t_frag);
+            Ok(Some(Value::Object(Some(make_uri(ctx, &recomposed)))))
         },
     );
 

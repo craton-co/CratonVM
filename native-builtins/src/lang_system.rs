@@ -3070,6 +3070,7 @@ pub(crate) fn native_classloader_define_class1(
             // Application namespace (the ProxyClassReuseTest / IsoProbe bug).
             if lid == 0 && crate::classloader::is_user_defined_loader(ctx, *loader_obj) {
                 if crate::classloader::loader_aware_resolution()
+                    || name.is_empty()
                     || ctx.class_id_by_name(&name).is_some()
                 {
                     lid = crate::classloader::loader_namespace_id(ctx, *loader_obj);
@@ -3165,6 +3166,7 @@ pub(crate) fn native_classloader_define_class2(
             };
             if lid == 0 && crate::classloader::is_user_defined_loader(ctx, *loader_obj) {
                 if crate::classloader::loader_aware_resolution()
+                    || name.is_empty()
                     || ctx.class_id_by_name(&name).is_some()
                 {
                     lid = crate::classloader::loader_namespace_id(ctx, *loader_obj);
@@ -3259,6 +3261,7 @@ pub(crate) fn native_classloader_define_class0(
             // definer is isolated too.
             if lid == 0 && crate::classloader::is_user_defined_loader(ctx, *loader_obj) {
                 if crate::classloader::loader_aware_resolution()
+                    || name.is_empty()
                     || ctx.class_id_by_name(&name).is_some()
                 {
                     lid = crate::classloader::loader_namespace_id(ctx, *loader_obj);
