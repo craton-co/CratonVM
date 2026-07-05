@@ -22453,15 +22453,38 @@ fn collect_collection_elements(ctx: &mut dyn NativeContext, coll: ObjectRef) -> 
             }
         }
     }
-    // S111r-bug-fix: Arrays$ArrayList — single field `a` (Object[]), no size.
+    // S111r-bug-fix: Arrays$ArrayList -- single field `a` (Object[]), no size.
     // `Arrays.asList(...)` is heavily used in JDK callers (and Spring uses
     // it indirectly through `Collections.singletonList` / similar wrappers)
     // and has a different layout than `java.util.ArrayList`.
-    if let Value::Object(Some(arr)) = f0 {
+    //
+    // locale-azure fix: in real-JDK mode, Arrays$ArrayList inherits
+    // AbstractList.modCount at slot 0, so its own `a` field is at slot 1 --
+    // NOT slot 0 as this branch originally assumed (that assumption only
+    // held in synthetic-jdk mode, which has no modCount ancestor slot).
+    // Reading f0 here saw `modCount` (an Int, e.g. 0), which is not an
+    // Object, so the branch below silently fell through and
+    // `Arrays.asList(...)` contributed zero elements to any addAll/copy
+    // constructor call sites (e.g. `LinkedList.addAll(Arrays.asList(x))`
+    // returned false and added nothing — MockHttpServletRequest.
+    // setPreferredLocales(Arrays.asList(...)) left its LinkedList<Locale>
+    // empty, so getLocale()'s getFirst() threw NoSuchElementException).
+    // Resolve `a`'s real slot by name and fall back to slot 0 for
+    // synthetic-jdk / resolution-failure cases.
+    let aal_a_slot = ctx
+        .resolve_field_index("java/util/Arrays$ArrayList", "a")
+        .unwrap_or(0);
+    let f_aal_a = if aal_a_slot < n_fields {
+        ctx.get_field(coll, aal_a_slot)
+    } else {
+        Value::Object(None)
+    };
+    if let Value::Object(Some(arr)) = f_aal_a {
         if ctx.heap_kind_of(arr) == ObjectKind::Array {
             let len = ctx.array_length(arr);
             // Heuristic: if this object has at most a couple of fields and
-            // field 0 is a ref-array, treat it as an array-backed wrapper.
+            // the resolved slot is a ref-array, treat it as an array-backed
+            // wrapper.
             let mut elems = Vec::with_capacity(len);
             for i in 0..len {
                 elems.push(ctx.get_array_element(arr, i));
