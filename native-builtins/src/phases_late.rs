@@ -5951,6 +5951,1774 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
         },
     );
 
+    // --- picocli CommandLine$Help$Ansi$Text.concat(Text) ---
+    // Keycloak's PicocliTest builds large help/usage strings through picocli's
+    // immutable-ish `Ansi.Text` API. The Java `concat(Text)` path clones the
+    // receiver, slices two `StringBuilder`s, allocates a fresh `ArrayList`, and
+    // re-materializes every `StyledSection` through a tiny constructor. Under
+    // CratonVM this hot path dominated the class enough to look like a hang;
+    // HotSpot JIT finishes the same class quickly. Keep the optimization
+    // app-scoped: preserve Picocli's object shape, but perform the clone/slice
+    // and section reindexing in one native pass.
+    #[derive(Clone)]
+    struct PicocliStyledSectionData {
+        start_index: i32,
+        length: i32,
+        start_styles: String,
+        end_styles: String,
+    }
+
+    fn picocli_i32_field(ctx: &dyn NativeContext, obj: ObjectRef, name: &str) -> i32 {
+        match ctx.get_field_by_name(obj, name) {
+            Value::Int(v) => v,
+            _ => 0,
+        }
+    }
+
+    fn picocli_obj_field(ctx: &dyn NativeContext, obj: ObjectRef, name: &str) -> Option<ObjectRef> {
+        match ctx.get_field_by_name(obj, name) {
+            Value::Object(Some(o)) => Some(o),
+            _ => None,
+        }
+    }
+
+    fn picocli_string_field(ctx: &dyn NativeContext, obj: ObjectRef, name: &str) -> String {
+        picocli_obj_field(ctx, obj, name)
+            .and_then(|s| ctx.read_string(s))
+            .unwrap_or_default()
+    }
+
+    fn picocli_utf16_len(s: &str) -> i32 {
+        s.encode_utf16().count().min(i32::MAX as usize) as i32
+    }
+
+    fn picocli_utf16_slice(s: &str, from: i32, len: i32) -> String {
+        let units: Vec<u16> = s.encode_utf16().collect();
+        let total = units.len();
+        let start = (from.max(0) as usize).min(total);
+        let wanted = len.max(0) as usize;
+        let end = start.saturating_add(wanted).min(total);
+        String::from_utf16_lossy(&units[start..end])
+    }
+
+    fn picocli_list_size(ctx: &mut dyn NativeContext, list: ObjectRef) -> usize {
+        match ctx.get_field_by_name(list, "size") {
+            Value::Int(n) if n > 0 => n as usize,
+            Value::Int(_) => 0,
+            _ => match ctx.invoke_virtual(list, "size", "()I", &[]) {
+                Ok(Some(Value::Int(n))) if n > 0 => n as usize,
+                _ => 0,
+            },
+        }
+    }
+
+    fn picocli_list_get(
+        ctx: &mut dyn NativeContext,
+        list: ObjectRef,
+        index: usize,
+    ) -> Option<ObjectRef> {
+        if let Value::Object(Some(data)) = ctx.get_field_by_name(list, "elementData") {
+            if index < ctx.array_length(data) {
+                if let Value::Object(Some(o)) = ctx.get_array_element(data, index) {
+                    return Some(o);
+                }
+            }
+        }
+        match ctx.invoke_virtual(
+            list,
+            "get",
+            "(I)Ljava/lang/Object;",
+            &[Value::Int(index.min(i32::MAX as usize) as i32)],
+        ) {
+            Ok(Some(Value::Object(Some(o)))) => Some(o),
+            _ => None,
+        }
+    }
+
+    fn picocli_collect_sections(
+        ctx: &mut dyn NativeContext,
+        list: Option<ObjectRef>,
+        delta: i32,
+    ) -> Vec<PicocliStyledSectionData> {
+        let Some(list) = list else {
+            return Vec::new();
+        };
+        let count = picocli_list_size(ctx, list).min(100_000);
+        let mut out = Vec::with_capacity(count);
+        for idx in 0..count {
+            let Some(section) = picocli_list_get(ctx, list, idx) else {
+                continue;
+            };
+            out.push(PicocliStyledSectionData {
+                start_index: picocli_i32_field(ctx, section, "startIndex").saturating_add(delta),
+                length: picocli_i32_field(ctx, section, "length"),
+                start_styles: picocli_string_field(ctx, section, "startStyles"),
+                end_styles: picocli_string_field(ctx, section, "endStyles"),
+            });
+        }
+        out
+    }
+
+    fn picocli_text_plain_slice(ctx: &mut dyn NativeContext, text: ObjectRef) -> String {
+        let full = match picocli_obj_field(ctx, text, "plain") {
+            Some(plain) => crate::lang_string::invoke_to_string(ctx, plain).unwrap_or_default(),
+            None => String::new(),
+        };
+        let from = picocli_i32_field(ctx, text, "from");
+        let len = picocli_i32_field(ctx, text, "length");
+        picocli_utf16_slice(&full, from, len)
+    }
+
+    fn picocli_new_styled_section_value(
+        ctx: &mut dyn NativeContext,
+        start_index: i32,
+        length: i32,
+        start_styles: &str,
+        end_styles: &str,
+    ) -> MethodCallResult {
+        let obj = match ctx.new_object("picocli/CommandLine$Help$Ansi$StyledSection")? {
+            Some(Value::Object(Some(o))) => o,
+            _ => return Ok(Some(Value::Object(None))),
+        };
+        let pin = ctx.pin_native_root(obj);
+        let cur = ctx.read_native_pin(pin, obj);
+        ctx.set_field_by_name(cur, "startIndex", Value::Int(start_index));
+        ctx.set_field_by_name(cur, "length", Value::Int(length));
+
+        let start_obj = ctx.create_string(start_styles);
+        let cur = ctx.read_native_pin(pin, obj);
+        ctx.set_field_by_name(cur, "startStyles", Value::Object(Some(start_obj)));
+
+        let end_obj = ctx.create_string(end_styles);
+        let cur = ctx.read_native_pin(pin, obj);
+        ctx.set_field_by_name(cur, "endStyles", Value::Object(Some(end_obj)));
+        let cur = ctx.read_native_pin(pin, obj);
+        ctx.unpin_native_roots(pin);
+        Ok(Some(Value::Object(Some(cur))))
+    }
+
+    fn native_picocli_styled_section_init(
+        ctx: &mut dyn NativeContext,
+        args: &[Value],
+    ) -> MethodCallResult {
+        let this = match args.first() {
+            Some(Value::Object(Some(o))) => *o,
+            _ => return Ok(None),
+        };
+        let start = match args.get(1) {
+            Some(Value::Int(v)) => *v,
+            _ => 0,
+        };
+        let len = match args.get(2) {
+            Some(Value::Int(v)) => *v,
+            _ => 0,
+        };
+        ctx.set_field_by_name(this, "startIndex", Value::Int(start));
+        ctx.set_field_by_name(this, "length", Value::Int(len));
+        ctx.set_field_by_name(
+            this,
+            "startStyles",
+            args.get(3).copied().unwrap_or(Value::Object(None)),
+        );
+        ctx.set_field_by_name(
+            this,
+            "endStyles",
+            args.get(4).copied().unwrap_or(Value::Object(None)),
+        );
+        Ok(None)
+    }
+
+    fn native_picocli_styled_section_with_start_index(
+        ctx: &mut dyn NativeContext,
+        args: &[Value],
+    ) -> MethodCallResult {
+        let this = match args.first() {
+            Some(Value::Object(Some(o))) => *o,
+            _ => return Ok(Some(Value::Object(None))),
+        };
+        let new_start = match args.get(1) {
+            Some(Value::Int(v)) => *v,
+            _ => 0,
+        };
+        let len = picocli_i32_field(ctx, this, "length");
+        let start_styles = picocli_string_field(ctx, this, "startStyles");
+        let end_styles = picocli_string_field(ctx, this, "endStyles");
+        picocli_new_styled_section_value(ctx, new_start, len, &start_styles, &end_styles)
+    }
+
+    fn native_picocli_text_concat_text(
+        ctx: &mut dyn NativeContext,
+        args: &[Value],
+    ) -> MethodCallResult {
+        let this = match args.first() {
+            Some(Value::Object(Some(o))) => *o,
+            _ => return Ok(Some(Value::Object(None))),
+        };
+        let other = match args.get(1) {
+            Some(Value::Object(Some(o))) => *o,
+            _ => return Ok(Some(Value::Object(Some(this)))),
+        };
+
+        let root_pin = ctx.pin_native_root(this);
+        let other_pin = ctx.pin_native_root(other);
+
+        let left = picocli_text_plain_slice(ctx, this);
+        let right = picocli_text_plain_slice(ctx, other);
+        let left_len = picocli_utf16_len(&left);
+        let self_from = picocli_i32_field(ctx, this, "from");
+        let other_from = picocli_i32_field(ctx, other, "from");
+        let this_sections = picocli_obj_field(ctx, this, "sections");
+        let other_sections = picocli_obj_field(ctx, other, "sections");
+        let mut sections = picocli_collect_sections(ctx, this_sections, self_from.saturating_neg());
+        sections.extend(picocli_collect_sections(
+            ctx,
+            other_sections,
+            left_len.saturating_sub(other_from),
+        ));
+        ctx.unpin_native_roots(other_pin);
+
+        let combined = format!("{left}{right}");
+        let combined_len = picocli_utf16_len(&combined);
+        let combined_string = ctx.create_string(&combined);
+        let string_pin = ctx.pin_native_root(combined_string);
+        let combined_string = ctx.read_native_pin(string_pin, combined_string);
+        let plain = match ctx.new_object_initialized(
+            "java/lang/StringBuilder",
+            "(Ljava/lang/String;)V",
+            &[Value::Object(Some(combined_string))],
+        )? {
+            Some(Value::Object(Some(o))) => o,
+            _ => {
+                ctx.unpin_native_roots(string_pin);
+                ctx.unpin_native_roots(root_pin);
+                return Ok(Some(Value::Object(None)));
+            }
+        };
+        ctx.unpin_native_roots(string_pin);
+
+        let section_list = match ctx.new_object_initialized("java/util/ArrayList", "()V", &[])? {
+            Some(Value::Object(Some(o))) => o,
+            _ => {
+                ctx.unpin_native_roots(root_pin);
+                return Ok(Some(Value::Object(None)));
+            }
+        };
+        let list_pin = ctx.pin_native_root(section_list);
+        for section in sections {
+            let section_val = picocli_new_styled_section_value(
+                ctx,
+                section.start_index,
+                section.length,
+                &section.start_styles,
+                &section.end_styles,
+            )?;
+            if let Some(Value::Object(Some(section_obj))) = section_val {
+                let list = ctx.read_native_pin(list_pin, section_list);
+                let _ = ctx.invoke_virtual(
+                    list,
+                    "add",
+                    "(Ljava/lang/Object;)Z",
+                    &[Value::Object(Some(section_obj))],
+                );
+            }
+        }
+        let section_list = ctx.read_native_pin(list_pin, section_list);
+        ctx.unpin_native_roots(list_pin);
+
+        let plain_pin = ctx.pin_native_root(plain);
+        let section_list_pin = ctx.pin_native_root(section_list);
+        let result = match ctx.new_object("picocli/CommandLine$Help$Ansi$Text")? {
+            Some(Value::Object(Some(o))) => o,
+            _ => {
+                ctx.unpin_native_roots(plain_pin);
+                ctx.unpin_native_roots(section_list_pin);
+                ctx.unpin_native_roots(root_pin);
+                return Ok(Some(Value::Object(None)));
+            }
+        };
+        let plain = ctx.read_native_pin(plain_pin, plain);
+        let section_list = ctx.read_native_pin(section_list_pin, section_list);
+        ctx.unpin_native_roots(plain_pin);
+
+        let this = ctx.read_native_pin(root_pin, this);
+        ctx.set_field_by_name(result, "this$0", ctx.get_field_by_name(this, "this$0"));
+        ctx.set_field_by_name(result, "maxLength", ctx.get_field_by_name(this, "maxLength"));
+        ctx.set_field_by_name(result, "from", Value::Int(0));
+        ctx.set_field_by_name(result, "length", Value::Int(combined_len));
+        ctx.set_field_by_name(result, "plain", Value::Object(Some(plain)));
+        ctx.set_field_by_name(result, "sections", Value::Object(Some(section_list)));
+        ctx.unpin_native_roots(section_list_pin);
+        ctx.set_field_by_name(result, "colorScheme", ctx.get_field_by_name(this, "colorScheme"));
+        ctx.unpin_native_roots(root_pin);
+        Ok(Some(Value::Object(Some(result))))
+    }
+
+
+
+    fn picocli_is_code_point_cjk(cp: i32) -> bool {
+        cp == 0x00B1
+            || (0x3040..=0x309F).contains(&cp)
+            || (0x30A0..=0x30FF).contains(&cp)
+            || (0x31F0..=0x31FF).contains(&cp)
+            || (0x3130..=0x318F).contains(&cp)
+            || (0x1100..=0x11FF).contains(&cp)
+            || (0xAC00..=0xD7AF).contains(&cp)
+            || (0x4E00..=0x9FFF).contains(&cp)
+            || (0x3400..=0x4DBF).contains(&cp)
+            || (0x20000..=0x2A6DF).contains(&cp)
+            || (0xFE30..=0xFE4F).contains(&cp)
+            || (0xF900..=0xFAFF).contains(&cp)
+            || (0x2E80..=0x2EFF).contains(&cp)
+            || (0x3000..=0x303F).contains(&cp)
+            || (0x3200..=0x32FF).contains(&cp)
+            || (0xFF00..=0xFF60).contains(&cp)
+    }
+
+    fn picocli_cjk_adjusted_len(s: &str) -> i32 {
+        let mut width: i32 = 0;
+        for ch in s.chars() {
+            width = width.saturating_add(if picocli_is_code_point_cjk(ch as i32) { 2 } else { 1 });
+        }
+        width
+    }
+
+    fn picocli_text_plain_slice_with_len(
+        ctx: &mut dyn NativeContext,
+        text: ObjectRef,
+        len: i32,
+    ) -> String {
+        let full = match picocli_obj_field(ctx, text, "plain") {
+            Some(plain) => crate::lang_string::invoke_to_string(ctx, plain).unwrap_or_default(),
+            None => String::new(),
+        };
+        let from = picocli_i32_field(ctx, text, "from");
+        picocli_utf16_slice(&full, from, len)
+    }
+
+    fn native_picocli_is_code_point_cjk(
+        _ctx: &mut dyn NativeContext,
+        args: &[Value],
+    ) -> MethodCallResult {
+        let cp = match args.first() {
+            Some(Value::Int(v)) => *v,
+            _ => 0,
+        };
+        Ok(Some(Value::Int(if picocli_is_code_point_cjk(cp) { 1 } else { 0 })))
+    }
+
+    fn native_picocli_text_get_cjk_adjusted_length(
+        ctx: &mut dyn NativeContext,
+        args: &[Value],
+    ) -> MethodCallResult {
+        let this = match args.first() {
+            Some(Value::Object(Some(o))) => *o,
+            _ => return Ok(Some(Value::Int(0))),
+        };
+        let len = match args.get(2) {
+            Some(Value::Int(v)) => *v,
+            _ => picocli_i32_field(ctx, this, "length"),
+        };
+        let text = picocli_text_plain_slice_with_len(ctx, this, len);
+        Ok(Some(Value::Int(picocli_cjk_adjusted_len(&text))))
+    }
+
+    r.register(
+        "picocli/CommandLine$Help$Ansi$StyledSection",
+        "<init>",
+        "(IILjava/lang/String;Ljava/lang/String;)V",
+        native_picocli_styled_section_init,
+    );
+    r.register(
+        "picocli/CommandLine$Help$Ansi$StyledSection",
+        "withStartIndex",
+        "(I)Lpicocli/CommandLine$Help$Ansi$StyledSection;",
+        native_picocli_styled_section_with_start_index,
+    );
+    r.register(
+        "picocli/CommandLine$Help$Ansi$Text",
+        "concat",
+        "(Lpicocli/CommandLine$Help$Ansi$Text;)Lpicocli/CommandLine$Help$Ansi$Text;",
+        native_picocli_text_concat_text,
+    );
+
+    r.register(
+        "picocli/CommandLine$Model$UsageMessageSpec",
+        "isCodePointCJK",
+        "(I)Z",
+        native_picocli_is_code_point_cjk,
+    );
+    r.register(
+        "picocli/CommandLine$Help$Ansi$Text",
+        "getCJKAdjustedLength",
+        "()I",
+        native_picocli_text_get_cjk_adjusted_length,
+    );
+    r.register(
+        "picocli/CommandLine$Help$Ansi$Text",
+        "getCJKAdjustedLength",
+        "(II)I",
+        native_picocli_text_get_cjk_adjusted_length,
+    );
+
+
+    // --- Keycloak PropertyMappers$WildcardMappersConfig.get(String) ---
+    // `PicocliTest` repeatedly walks SmallRye config property names while
+    // sanitizing command mappers. The Java implementation routes every kc.* /
+    // quarkus.* key through `wildcardMappers.stream().filter(...).toList()`;
+    // under CratonVM that stream/lambda path can spin at the predicate. Mirror
+    // the simple Keycloak logic directly over the backing set and keep returning
+    // the original mapper objects.
+    fn keycloak_wildcard_value_valid(value: &str) -> bool {
+        !value.is_empty()
+            && value.chars().all(|ch| {
+                ch.is_ascii_alphanumeric()
+                    || matches!(ch, '[' | ']' | '$' | '-' | '.' | '_')
+            })
+    }
+
+    fn keycloak_wildcard_mapper_matches(
+        ctx: &dyn NativeContext,
+        mapper: ObjectRef,
+        key: &str,
+    ) -> bool {
+        let from_prefix = picocli_string_field(ctx, mapper, "fromPrefix");
+        if !from_prefix.is_empty() && key.starts_with(&from_prefix) {
+            return keycloak_wildcard_value_valid(&key[from_prefix.len()..]);
+        }
+
+        let to_prefix = picocli_string_field(ctx, mapper, "toPrefix");
+        let to_suffix = picocli_string_field(ctx, mapper, "toSuffix");
+        if to_prefix.is_empty()
+            || !key.starts_with(&to_prefix)
+            || !key.ends_with(&to_suffix)
+            || key.len() < to_prefix.len().saturating_add(to_suffix.len())
+        {
+            return false;
+        }
+        let end = key.len().saturating_sub(to_suffix.len());
+        keycloak_wildcard_value_valid(&key[to_prefix.len()..end])
+    }
+
+    fn keycloak_empty_array_list(ctx: &mut dyn NativeContext) -> MethodCallResult {
+        match ctx.new_object_initialized("java/util/ArrayList", "()V", &[])? {
+            Some(Value::Object(Some(list))) => Ok(Some(Value::Object(Some(list)))),
+            _ => Ok(Some(Value::Object(None))),
+        }
+    }
+
+    fn native_keycloak_wildcard_mappers_get(
+        ctx: &mut dyn NativeContext,
+        args: &[Value],
+    ) -> MethodCallResult {
+        let this = match args.first() {
+            Some(Value::Object(Some(o))) => *o,
+            _ => return keycloak_empty_array_list(ctx),
+        };
+        let key = match args.get(1) {
+            Some(Value::Object(Some(s))) => ctx.read_string(*s).unwrap_or_default(),
+            _ => String::new(),
+        };
+
+        let list = match ctx.new_object_initialized("java/util/ArrayList", "()V", &[])? {
+            Some(Value::Object(Some(list))) => list,
+            _ => return Ok(Some(Value::Object(None))),
+        };
+        if !(key.starts_with("kc.") || key.starts_with("quarkus.")) {
+            return Ok(Some(Value::Object(Some(list))));
+        }
+
+        let Some(set) = picocli_obj_field(ctx, this, "wildcardMappers") else {
+            return Ok(Some(Value::Object(Some(list))));
+        };
+        let iterator = match ctx.invoke_virtual(set, "iterator", "()Ljava/util/Iterator;", &[])? {
+            Some(Value::Object(Some(iterator))) => iterator,
+            _ => return Ok(Some(Value::Object(Some(list)))),
+        };
+
+        let list_pin = ctx.pin_native_root(list);
+        let iterator_pin = ctx.pin_native_root(iterator);
+        for _ in 0..10_000 {
+            let iterator = ctx.read_native_pin(iterator_pin, iterator);
+            let has_next = match ctx.invoke_virtual(iterator, "hasNext", "()Z", &[])? {
+                Some(Value::Int(v)) => v != 0,
+                _ => false,
+            };
+            if !has_next {
+                break;
+            }
+
+            let iterator = ctx.read_native_pin(iterator_pin, iterator);
+            let mapper = match ctx.invoke_virtual(iterator, "next", "()Ljava/lang/Object;", &[])? {
+                Some(Value::Object(Some(mapper))) => mapper,
+                _ => continue,
+            };
+            if keycloak_wildcard_mapper_matches(ctx, mapper, &key) {
+                let mapper_pin = ctx.pin_native_root(mapper);
+                let mapper = ctx.read_native_pin(mapper_pin, mapper);
+                let list = ctx.read_native_pin(list_pin, list);
+                let _ = ctx.invoke_virtual(
+                    list,
+                    "add",
+                    "(Ljava/lang/Object;)Z",
+                    &[Value::Object(Some(mapper))],
+                )?;
+                ctx.unpin_native_roots(mapper_pin);
+            }
+        }
+
+        let list = ctx.read_native_pin(list_pin, list);
+        ctx.unpin_native_roots(iterator_pin);
+        ctx.unpin_native_roots(list_pin);
+        Ok(Some(Value::Object(Some(list))))
+    }
+
+    fn keycloak_optional_string(ctx: &mut dyn NativeContext, value: Option<String>) -> Value {
+        let optional = alloc_concurrent_synthetic(ctx, "java/util/Optional", 1);
+        let optional_value = value
+            .map(|s| Value::Object(Some(ctx.create_string(&s))))
+            .unwrap_or(Value::Object(None));
+        ctx.set_field(optional, 0, optional_value);
+        Value::Object(Some(optional))
+    }
+
+
+    fn keycloak_is_not_blank(value: &str) -> bool {
+        value.chars().any(|ch| !ch.is_whitespace())
+    }
+
+    fn keycloak_prefixed_optional_field(
+        ctx: &mut dyn NativeContext,
+        obj: ObjectRef,
+        field_name: &str,
+        prefix: &str,
+    ) -> MethodCallResult {
+        let value = match ctx.get_field_by_name(obj, field_name) {
+            Value::Object(Some(s)) => ctx.read_string(s).unwrap_or_default(),
+            _ => String::new(),
+        };
+        let result = if keycloak_is_not_blank(&value) {
+            Some(format!("{prefix}{value}"))
+        } else {
+            None
+        };
+        Ok(Some(keycloak_optional_string(ctx, result)))
+    }
+
+    fn native_keycloak_property_mapper_get_enabled_when(
+        ctx: &mut dyn NativeContext,
+        args: &[Value],
+    ) -> MethodCallResult {
+        let this = match args.first() {
+            Some(Value::Object(Some(o))) => *o,
+            _ => return Ok(Some(keycloak_optional_string(ctx, None))),
+        };
+        keycloak_prefixed_optional_field(ctx, this, "enabledWhen", "Available only when ")
+    }
+
+    fn native_keycloak_property_mapper_get_required_when(
+        ctx: &mut dyn NativeContext,
+        args: &[Value],
+    ) -> MethodCallResult {
+        let this = match args.first() {
+            Some(Value::Object(Some(o))) => *o,
+            _ => return Ok(Some(keycloak_optional_string(ctx, None))),
+        };
+        keycloak_prefixed_optional_field(ctx, this, "requiredWhen", "Required when ")
+    }
+
+    fn native_keycloak_wildcard_is_valid_value(
+        ctx: &mut dyn NativeContext,
+        args: &[Value],
+    ) -> MethodCallResult {
+        let value = match args.first() {
+            Some(Value::Object(Some(s))) => ctx.read_string(*s).unwrap_or_default(),
+            _ => String::new(),
+        };
+        Ok(Some(Value::Int(if keycloak_wildcard_value_valid(&value) {
+            1
+        } else {
+            0
+        })))
+    }
+
+    fn native_keycloak_wildcard_extract_value(
+        ctx: &mut dyn NativeContext,
+        args: &[Value],
+    ) -> MethodCallResult {
+        let this = match args.first() {
+            Some(Value::Object(Some(o))) => *o,
+            _ => return Ok(Some(keycloak_optional_string(ctx, None))),
+        };
+        let key = match args.get(1) {
+            Some(Value::Object(Some(s))) => ctx.read_string(*s).unwrap_or_default(),
+            _ => String::new(),
+        };
+        let from_prefix = picocli_string_field(ctx, this, "fromPrefix");
+        let candidate = if !from_prefix.is_empty() && key.starts_with(&from_prefix) {
+            Some(key[from_prefix.len()..].to_string())
+        } else {
+            let to_prefix = picocli_string_field(ctx, this, "toPrefix");
+            let to_suffix = picocli_string_field(ctx, this, "toSuffix");
+            if !to_prefix.is_empty()
+                && key.starts_with(&to_prefix)
+                && key.ends_with(&to_suffix)
+                && key.len() >= to_prefix.len().saturating_add(to_suffix.len())
+            {
+                let end = key.len().saturating_sub(to_suffix.len());
+                Some(key[to_prefix.len()..end].to_string())
+            } else {
+                None
+            }
+        }
+        .filter(|s| keycloak_wildcard_value_valid(s));
+        Ok(Some(keycloak_optional_string(ctx, candidate)))
+    }
+
+    r.register(
+        "org/keycloak/quarkus/runtime/configuration/mappers/PropertyMappers$WildcardMappersConfig",
+        "get",
+        "(Ljava/lang/String;)Ljava/util/List;",
+        native_keycloak_wildcard_mappers_get,
+    );
+    r.register(
+        "org/keycloak/quarkus/runtime/configuration/mappers/WildcardPropertyMapper",
+        "isValidWildcardValue",
+        "(Ljava/lang/String;)Z",
+        native_keycloak_wildcard_is_valid_value,
+    );
+    r.register(
+        "org/keycloak/quarkus/runtime/configuration/mappers/WildcardPropertyMapper",
+        "extractWildcardValue",
+        "(Ljava/lang/String;)Ljava/util/Optional;",
+        native_keycloak_wildcard_extract_value,
+    );
+
+
+    // --- SmallRyeConfigSources.getValue / MapBackedConfigValueConfigSource.getConfigValue ---
+    // These methods are tiny dispatch loops in SmallRye config, but Picocli's
+    // validation path calls them enough that CratonVM can spend minutes in the
+    // interpreted interface chain. Keep the semantics intact: walk the exact
+    // `configSources` list, return the first non-null ConfigValue, then delegate
+    // to the interceptor context.
+    fn native_smallrye_map_backed_get_config_value(
+        ctx: &mut dyn NativeContext,
+        args: &[Value],
+    ) -> MethodCallResult {
+        let this = match args.first() {
+            Some(Value::Object(Some(o))) => *o,
+            _ => return Ok(Some(Value::Object(None))),
+        };
+        let key = args.get(1).copied().unwrap_or(Value::Object(None));
+        let Some(properties) = picocli_obj_field(ctx, this, "properties") else {
+            return Ok(Some(Value::Object(None)));
+        };
+        ctx.invoke_virtual(
+            properties,
+            "get",
+            "(Ljava/lang/Object;)Ljava/lang/Object;",
+            &[key],
+        )
+    }
+
+    fn native_smallrye_config_sources_get_value(
+        ctx: &mut dyn NativeContext,
+        args: &[Value],
+    ) -> MethodCallResult {
+        let this = match args.first() {
+            Some(Value::Object(Some(o))) => *o,
+            _ => return Ok(Some(Value::Object(None))),
+        };
+        let context = match args.get(1) {
+            Some(Value::Object(Some(o))) => *o,
+            _ => return Ok(Some(Value::Object(None))),
+        };
+        let key = args.get(2).copied().unwrap_or(Value::Object(None));
+        let Some(config_sources) = picocli_obj_field(ctx, this, "configSources") else {
+            return ctx.invoke_virtual(
+                context,
+                "proceed",
+                "(Ljava/lang/String;)Lio/smallrye/config/ConfigValue;",
+                &[key],
+            );
+        };
+
+        let count = picocli_list_size(ctx, config_sources).min(100_000);
+        for idx in 0..count {
+            let Some(source) = picocli_list_get(ctx, config_sources, idx) else {
+                continue;
+            };
+            let value = ctx.invoke_virtual(
+                source,
+                "getConfigValue",
+                "(Ljava/lang/String;)Lio/smallrye/config/ConfigValue;",
+                &[key],
+            )?;
+            if matches!(value, Some(Value::Object(Some(_)))) {
+                return Ok(value);
+            }
+        }
+
+        ctx.invoke_virtual(
+            context,
+            "proceed",
+            "(Ljava/lang/String;)Lio/smallrye/config/ConfigValue;",
+            &[key],
+        )
+    }
+
+    r.register(
+        "io/smallrye/config/MapBackedConfigValueConfigSource",
+        "getConfigValue",
+        "(Ljava/lang/String;)Lio/smallrye/config/ConfigValue;",
+        native_smallrye_map_backed_get_config_value,
+    );
+    r.register(
+        "io/smallrye/config/SmallRyeConfigSources",
+        "getValue",
+        "(Lio/smallrye/config/ConfigSourceInterceptorContext;Ljava/lang/String;)Lio/smallrye/config/ConfigValue;",
+        native_smallrye_config_sources_get_value,
+    );
+
+    // --- SmallRye simple property helpers ---
+    // These preserve SmallRye's object shape while avoiding repeated Java
+    // interpreter trips through trivial constructors/accessors on Picocli's
+    // validation path. The relaxed-name matching bytecode still runs normally.
+    fn smallrye_property_name_hash(name: &str) -> i32 {
+        let mut hash = 0i32;
+        let mut in_quote = false;
+        for ch in name.encode_utf16() {
+            if in_quote {
+                if ch == b'"' as u16 {
+                    in_quote = false;
+                }
+            } else if ch == b'"' as u16 {
+                in_quote = true;
+            } else if ch == b'[' as u16 || ch == b']' as u16 {
+                hash = hash.wrapping_mul(31).wrapping_add(ch as i32);
+            }
+        }
+        hash
+    }
+
+    fn native_smallrye_property_name_init(
+        ctx: &mut dyn NativeContext,
+        args: &[Value],
+    ) -> MethodCallResult {
+        let this = obj_arg(args, 0)?;
+        let name_value = args.get(1).copied().unwrap_or(Value::Object(None));
+        let hash = match name_value {
+            Value::Object(Some(s)) => ctx
+                .read_string(s)
+                .map(|name| smallrye_property_name_hash(&name))
+                .unwrap_or(0),
+            _ => 0,
+        };
+        ctx.set_field_by_name(this, "name", name_value);
+        ctx.set_field_by_name(this, "hashCode", Value::Int(hash));
+        Ok(None)
+    }
+
+    fn native_smallrye_property_name_hash_code(
+        ctx: &mut dyn NativeContext,
+        args: &[Value],
+    ) -> MethodCallResult {
+        let this = obj_arg(args, 0)?;
+        Ok(Some(ctx.get_field_by_name(this, "hashCode")))
+    }
+
+    fn native_smallrye_property_name_string_field(
+        ctx: &mut dyn NativeContext,
+        args: &[Value],
+    ) -> MethodCallResult {
+        let this = obj_arg(args, 0)?;
+        Ok(Some(ctx.get_field_by_name(this, "name")))
+    }
+
+    fn native_smallrye_sysprop_get_system_property(
+        ctx: &mut dyn NativeContext,
+        args: &[Value],
+        key_index: usize,
+    ) -> MethodCallResult {
+        let key = match args.get(key_index) {
+            Some(Value::Object(Some(s))) => ctx.read_string(*s).unwrap_or_default(),
+            _ => return Ok(Some(Value::Object(None))),
+        };
+        Ok(Some(match ctx.get_system_property(&key) {
+            Some(value) => Value::Object(Some(ctx.create_string(&value))),
+            None => Value::Object(None),
+        }))
+    }
+
+    r.register(
+        "io/smallrye/config/PropertyName",
+        "<init>",
+        "(Ljava/lang/String;)V",
+        native_smallrye_property_name_init,
+    );
+    r.register(
+        "io/smallrye/config/PropertyName",
+        "hashCode",
+        "()I",
+        native_smallrye_property_name_hash_code,
+    );
+    r.register(
+        "io/smallrye/config/PropertyName",
+        "getName",
+        "()Ljava/lang/String;",
+        native_smallrye_property_name_string_field,
+    );
+    r.register(
+        "io/smallrye/config/PropertyName",
+        "toString",
+        "()Ljava/lang/String;",
+        native_smallrye_property_name_string_field,
+    );
+    r.register(
+        "io/smallrye/config/SysPropConfigSource",
+        "getValue",
+        "(Ljava/lang/String;)Ljava/lang/String;",
+        |ctx, args| native_smallrye_sysprop_get_system_property(ctx, args, 1),
+    );
+    r.register(
+        "io/smallrye/config/SysPropConfigSource",
+        "getSystemProperty",
+        "(Ljava/lang/String;)Ljava/lang/String;",
+        |ctx, args| native_smallrye_sysprop_get_system_property(ctx, args, 0),
+    );
+
+    fn native_keycloak_transform_datasource_to(
+        ctx: &mut dyn NativeContext,
+        args: &[Value],
+    ) -> MethodCallResult {
+        let input_obj = match args.first() {
+            Some(Value::Object(Some(s))) => *s,
+            _ => return Ok(Some(Value::Object(None))),
+        };
+        let input = ctx.read_string(input_obj).unwrap_or_default();
+        if input.trim().is_empty() {
+            return Ok(Some(Value::Object(None)));
+        }
+        let output = if let Some(rest) = input.strip_prefix("quarkus.datasource.") {
+            format!("quarkus.datasource.\"<datasource>\".{rest}")
+        } else if input.starts_with("kc.db-") {
+            format!("{input}-<datasource>")
+        } else {
+            input
+        };
+        Ok(Some(Value::Object(Some(ctx.create_string(&output)))))
+    }
+
+    r.register(
+        "org/keycloak/quarkus/runtime/configuration/mappers/DatabasePropertyMappers$Datasources",
+        "transformDatasourceTo",
+        "(Ljava/lang/String;)Ljava/lang/String;",
+        native_keycloak_transform_datasource_to,
+    );
+
+
+    fn native_keycloak_property_mapping_has_inferred_value(
+        _ctx: &mut dyn NativeContext,
+        _args: &[Value],
+    ) -> MethodCallResult {
+        Ok(Some(Value::Int(0)))
+    }
+
+    fn native_keycloak_false_boolean(
+        _ctx: &mut dyn NativeContext,
+        _args: &[Value],
+    ) -> MethodCallResult {
+        Ok(Some(Value::Int(0)))
+    }
+
+    fn keycloak_cli_args_property(ctx: &mut dyn NativeContext) -> String {
+        let key = ctx.create_string("kc.config.args");
+        match ctx.invoke(
+            "java/lang/System",
+            "getProperty",
+            "(Ljava/lang/String;)Ljava/lang/String;",
+            &[Value::Object(Some(key))],
+        ) {
+            Ok(Some(Value::Object(Some(s)))) => ctx.read_string(s).unwrap_or_default(),
+            _ => String::new(),
+        }
+    }
+
+    fn keycloak_cli_args(ctx: &mut dyn NativeContext) -> Vec<String> {
+        let raw = keycloak_cli_args_property(ctx);
+        if raw.is_empty() {
+            return Vec::new();
+        }
+        let mut result = Vec::new();
+        let mut escaped = false;
+        let mut arg = String::new();
+        for ch in raw.chars() {
+            if ch == ',' {
+                if escaped {
+                    arg.push(ch);
+                }
+                escaped = !escaped;
+            } else if ch == ' ' {
+                if escaped {
+                    result.push(std::mem::take(&mut arg));
+                    escaped = false;
+                } else {
+                    arg.push(ch);
+                }
+            } else {
+                arg.push(ch);
+            }
+        }
+        if !arg.is_empty() || !result.is_empty() {
+            result.push(arg);
+        }
+        result
+    }
+
+    fn keycloak_cli_value(ctx: &mut dyn NativeContext, key: &str) -> Option<String> {
+        let prefix = format!("--{}=", key);
+        keycloak_cli_args(ctx)
+            .into_iter()
+            .rev()
+            .find_map(|arg| arg.strip_prefix(&prefix).map(str::to_string))
+    }
+
+    fn keycloak_cli_bool(ctx: &mut dyn NativeContext, key: &str) -> Option<bool> {
+        keycloak_cli_value(ctx, key).map(|v| v.eq_ignore_ascii_case("true"))
+    }
+
+    fn keycloak_log_handler_enabled(ctx: &mut dyn NativeContext, handler: &str) -> bool {
+        let handlers = keycloak_cli_value(ctx, "log").unwrap_or_else(|| "console".to_string());
+        handlers
+            .split(',')
+            .any(|h| h.trim().eq_ignore_ascii_case(handler))
+    }
+
+    fn keycloak_log_async_enabled(
+        ctx: &mut dyn NativeContext,
+        handler: &str,
+        handler_key: &str,
+    ) -> bool {
+        keycloak_log_handler_enabled(ctx, handler)
+            && keycloak_cli_bool(ctx, handler_key)
+                .or_else(|| keycloak_cli_bool(ctx, "log-async"))
+                .unwrap_or(false)
+    }
+
+    fn keycloak_log_output_json(
+        ctx: &mut dyn NativeContext,
+        handler: &str,
+        output_key: &str,
+    ) -> bool {
+        keycloak_log_handler_enabled(ctx, handler)
+            && keycloak_cli_value(ctx, output_key)
+                .map(|v| v.eq_ignore_ascii_case("json"))
+                .unwrap_or(false)
+    }
+
+    fn native_keycloak_log_console_enabled(
+        ctx: &mut dyn NativeContext,
+        _args: &[Value],
+    ) -> MethodCallResult {
+        Ok(Some(Value::Int(if keycloak_log_handler_enabled(ctx, "console") {
+            1
+        } else {
+            0
+        })))
+    }
+
+    fn native_keycloak_log_file_enabled(
+        ctx: &mut dyn NativeContext,
+        _args: &[Value],
+    ) -> MethodCallResult {
+        Ok(Some(Value::Int(if keycloak_log_handler_enabled(ctx, "file") {
+            1
+        } else {
+            0
+        })))
+    }
+
+    fn native_keycloak_log_syslog_enabled(
+        ctx: &mut dyn NativeContext,
+        _args: &[Value],
+    ) -> MethodCallResult {
+        Ok(Some(Value::Int(if keycloak_log_handler_enabled(ctx, "syslog") {
+            1
+        } else {
+            0
+        })))
+    }
+
+    fn native_keycloak_log_console_async_enabled(
+        ctx: &mut dyn NativeContext,
+        _args: &[Value],
+    ) -> MethodCallResult {
+        Ok(Some(Value::Int(if keycloak_log_async_enabled(
+            ctx,
+            "console",
+            "log-console-async",
+        ) {
+            1
+        } else {
+            0
+        })))
+    }
+
+    fn native_keycloak_log_file_async_enabled(
+        ctx: &mut dyn NativeContext,
+        _args: &[Value],
+    ) -> MethodCallResult {
+        Ok(Some(Value::Int(if keycloak_log_async_enabled(
+            ctx,
+            "file",
+            "log-file-async",
+        ) {
+            1
+        } else {
+            0
+        })))
+    }
+
+    fn native_keycloak_log_syslog_async_enabled(
+        ctx: &mut dyn NativeContext,
+        _args: &[Value],
+    ) -> MethodCallResult {
+        Ok(Some(Value::Int(if keycloak_log_async_enabled(
+            ctx,
+            "syslog",
+            "log-syslog-async",
+        ) {
+            1
+        } else {
+            0
+        })))
+    }
+
+    fn native_keycloak_log_console_json_enabled(
+        ctx: &mut dyn NativeContext,
+        _args: &[Value],
+    ) -> MethodCallResult {
+        Ok(Some(Value::Int(if keycloak_log_output_json(
+            ctx,
+            "console",
+            "log-console-output",
+        ) {
+            1
+        } else {
+            0
+        })))
+    }
+
+    fn native_keycloak_log_file_json_enabled(
+        ctx: &mut dyn NativeContext,
+        _args: &[Value],
+    ) -> MethodCallResult {
+        Ok(Some(Value::Int(if keycloak_log_output_json(
+            ctx,
+            "file",
+            "log-file-output",
+        ) {
+            1
+        } else {
+            0
+        })))
+    }
+
+    fn native_keycloak_log_syslog_json_enabled(
+        ctx: &mut dyn NativeContext,
+        _args: &[Value],
+    ) -> MethodCallResult {
+        Ok(Some(Value::Int(if keycloak_log_output_json(
+            ctx,
+            "syslog",
+            "log-syslog-output",
+        ) {
+            1
+        } else {
+            0
+        })))
+    }
+
+    fn native_keycloak_log_file_rotation_enabled(
+        ctx: &mut dyn NativeContext,
+        _args: &[Value],
+    ) -> MethodCallResult {
+        Ok(Some(Value::Int(if keycloak_log_handler_enabled(ctx, "file")
+            && keycloak_cli_bool(ctx, "log-file-rotation-enabled").unwrap_or(false)
+        {
+            1
+        } else {
+            0
+        })))
+    }
+
+    fn native_keycloak_log_mdc_active(
+        ctx: &mut dyn NativeContext,
+        _args: &[Value],
+    ) -> MethodCallResult {
+        Ok(Some(Value::Int(if keycloak_cli_bool(ctx, "log-mdc-enabled").unwrap_or(false) {
+            1
+        } else {
+            0
+        })))
+    }
+
+    fn keycloak_boolean_result(enabled: bool) -> Value {
+        Value::Int(if enabled { 1 } else { 0 })
+    }
+
+    fn keycloak_metrics_enabled(ctx: &mut dyn NativeContext) -> bool {
+        keycloak_cli_bool(ctx, "metrics-enabled").unwrap_or(false)
+    }
+
+    fn keycloak_tracing_enabled(ctx: &mut dyn NativeContext) -> bool {
+        keycloak_cli_bool(ctx, "tracing-enabled").unwrap_or(false)
+    }
+
+    fn keycloak_cache_set_to_infinispan(ctx: &mut dyn NativeContext) -> bool {
+        if keycloak_cli_value(ctx, "cache-remote-host").is_some() {
+            return false;
+        }
+        keycloak_cli_value(ctx, "cache")
+            .map(|v| v.eq_ignore_ascii_case("ispn"))
+            .unwrap_or(true)
+    }
+
+    fn keycloak_telemetry_logs_enabled(ctx: &mut dyn NativeContext) -> bool {
+        keycloak_cli_bool(ctx, "telemetry-logs-enabled").unwrap_or(false)
+    }
+
+    fn keycloak_telemetry_metrics_enabled(ctx: &mut dyn NativeContext) -> bool {
+        keycloak_metrics_enabled(ctx)
+            && keycloak_cli_bool(ctx, "telemetry-metrics-enabled").unwrap_or(false)
+    }
+
+    fn keycloak_telemetry_enabled(ctx: &mut dyn NativeContext) -> bool {
+        keycloak_telemetry_logs_enabled(ctx)
+            || keycloak_telemetry_metrics_enabled(ctx)
+            || keycloak_tracing_enabled(ctx)
+    }
+
+    fn native_keycloak_metrics_enabled(
+        ctx: &mut dyn NativeContext,
+        _args: &[Value],
+    ) -> MethodCallResult {
+        Ok(Some(keycloak_boolean_result(keycloak_metrics_enabled(ctx))))
+    }
+
+    fn native_keycloak_cache_set_to_infinispan(
+        ctx: &mut dyn NativeContext,
+        _args: &[Value],
+    ) -> MethodCallResult {
+        Ok(Some(keycloak_boolean_result(keycloak_cache_set_to_infinispan(ctx))))
+    }
+
+    fn native_keycloak_tracing_enabled(
+        ctx: &mut dyn NativeContext,
+        _args: &[Value],
+    ) -> MethodCallResult {
+        Ok(Some(keycloak_boolean_result(keycloak_tracing_enabled(ctx))))
+    }
+
+    fn native_keycloak_tracing_infinispan_enabled(
+        ctx: &mut dyn NativeContext,
+        _args: &[Value],
+    ) -> MethodCallResult {
+        Ok(Some(keycloak_boolean_result(
+            keycloak_tracing_enabled(ctx) && keycloak_cache_set_to_infinispan(ctx),
+        )))
+    }
+
+    fn native_keycloak_telemetry_enabled(
+        ctx: &mut dyn NativeContext,
+        _args: &[Value],
+    ) -> MethodCallResult {
+        Ok(Some(keycloak_boolean_result(keycloak_telemetry_enabled(ctx))))
+    }
+
+    fn native_keycloak_telemetry_logs_enabled(
+        ctx: &mut dyn NativeContext,
+        _args: &[Value],
+    ) -> MethodCallResult {
+        Ok(Some(keycloak_boolean_result(keycloak_telemetry_logs_enabled(ctx))))
+    }
+
+    fn native_keycloak_telemetry_metrics_enabled(
+        ctx: &mut dyn NativeContext,
+        _args: &[Value],
+    ) -> MethodCallResult {
+        Ok(Some(keycloak_boolean_result(keycloak_telemetry_metrics_enabled(ctx))))
+    }
+
+    fn native_jaxrs_multivalued_map_add(
+        ctx: &mut dyn NativeContext,
+        args: &[Value],
+    ) -> MethodCallResult {
+        let this = match args.first() {
+            Some(Value::Object(Some(o))) => *o,
+            _ => return Ok(None),
+        };
+        let key = args.get(1).copied().unwrap_or(Value::Object(None));
+        let value = args.get(2).copied().unwrap_or(Value::Object(None));
+        let store = match ctx.get_field_by_name(this, "store") {
+            Value::Object(Some(o)) => o,
+            _ => return Ok(None),
+        };
+
+        let base_pin = ctx.pin_native_root(this);
+        let store_pin = ctx.pin_native_root(store);
+        let key_pin = match key {
+            Value::Object(Some(o)) => Some(ctx.pin_native_root(o)),
+            _ => None,
+        };
+        let value_pin = match value {
+            Value::Object(Some(o)) => Some(ctx.pin_native_root(o)),
+            _ => None,
+        };
+
+        let current_key = match (key, key_pin) {
+            (Value::Object(Some(o)), Some(pin)) => Value::Object(Some(ctx.read_native_pin(pin, o))),
+            _ => key,
+        };
+        let current_store = ctx.read_native_pin(store_pin, store);
+        let list_value = ctx.invoke_virtual(
+            current_store,
+            "get",
+            "(Ljava/lang/Object;)Ljava/lang/Object;",
+            &[current_key],
+        )?;
+
+        let list = match list_value {
+            Some(Value::Object(Some(o))) => o,
+            _ => {
+                let new_list = match ctx.new_object_initialized("java/util/LinkedList", "()V", &[])? {
+                    Some(Value::Object(Some(o))) => o,
+                    _ => {
+                        ctx.unpin_native_roots(base_pin);
+                        return Ok(None);
+                    }
+                };
+                let list_pin = ctx.pin_native_root(new_list);
+                let current_key = match (key, key_pin) {
+                    (Value::Object(Some(o)), Some(pin)) => {
+                        Value::Object(Some(ctx.read_native_pin(pin, o)))
+                    }
+                    _ => key,
+                };
+                let current_store = ctx.read_native_pin(store_pin, store);
+                let current_list = ctx.read_native_pin(list_pin, new_list);
+                let _ = ctx.invoke_virtual(
+                    current_store,
+                    "put",
+                    "(Ljava/lang/Object;Ljava/lang/Object;)Ljava/lang/Object;",
+                    &[current_key, Value::Object(Some(current_list))],
+                )?;
+                ctx.read_native_pin(list_pin, new_list)
+            }
+        };
+        let list_pin = ctx.pin_native_root(list);
+
+        let current_value = match (value, value_pin) {
+            (Value::Object(Some(o)), Some(pin)) => Value::Object(Some(ctx.read_native_pin(pin, o))),
+            _ => value,
+        };
+        let current_list = ctx.read_native_pin(list_pin, list);
+        if matches!(current_value, Value::Object(None)) {
+            let current_this = ctx.read_native_pin(base_pin, this);
+            let _ = ctx.invoke_virtual(
+                current_this,
+                "addNull",
+                "(Ljava/util/List;)V",
+                &[Value::Object(Some(current_list))],
+            )?;
+        } else {
+            let _ = ctx.invoke_virtual(
+                current_list,
+                "add",
+                "(Ljava/lang/Object;)Z",
+                &[current_value],
+            )?;
+        }
+        ctx.unpin_native_roots(base_pin);
+        Ok(None)
+    }
+
+    fn picocli_annotation_desc_is_member(desc: &str) -> bool {
+        matches!(
+            desc,
+            "Lpicocli/CommandLine$Option;"
+                | "Lpicocli/CommandLine$Parameters;"
+                | "Lpicocli/CommandLine$ArgGroup;"
+                | "Lpicocli/CommandLine$Unmatched;"
+                | "Lpicocli/CommandLine$Mixin;"
+                | "Lpicocli/CommandLine$Spec;"
+                | "Lpicocli/CommandLine$ParentCommand;"
+        )
+    }
+
+    fn native_picocli_typed_member_is_annotated(
+        ctx: &mut dyn NativeContext,
+        args: &[Value],
+    ) -> MethodCallResult {
+        let element = match args.first() {
+            Some(Value::Object(Some(o))) => *o,
+            _ => return Ok(Some(Value::Int(0))),
+        };
+        let element_class = ctx.class_name_of_id(ctx.class_id_of_object(element));
+        match element_class.as_deref() {
+            Some("java/lang/reflect/Field") => {
+                if let Some((class_id, field_name)) = crate::lang_class::field_class_and_name(ctx, element) {
+                    let present = ctx
+                        .field_annotations(class_id, &field_name)
+                        .iter()
+                        .any(|ann| picocli_annotation_desc_is_member(&ann.type_descriptor));
+                    return Ok(Some(Value::Int(if present { 1 } else { 0 })));
+                }
+            }
+            Some("java/lang/reflect/Method") | Some("java/lang/reflect/Constructor") => {
+                if let Some((class_id, method_name, method_desc)) =
+                    crate::lang_class::method_class_name_desc(ctx, element)
+                {
+                    let present = ctx
+                        .method_annotations(class_id, &method_name, &method_desc)
+                        .iter()
+                        .any(|ann| picocli_annotation_desc_is_member(&ann.type_descriptor));
+                    return Ok(Some(Value::Int(if present { 1 } else { 0 })));
+                }
+            }
+            _ => {}
+        }
+
+        let annotation_classes = [
+            "picocli/CommandLine$Option",
+            "picocli/CommandLine$Parameters",
+            "picocli/CommandLine$ArgGroup",
+            "picocli/CommandLine$Unmatched",
+            "picocli/CommandLine$Mixin",
+            "picocli/CommandLine$Spec",
+            "picocli/CommandLine$ParentCommand",
+        ];
+        let element_pin = ctx.pin_native_root(element);
+        for annotation_class in annotation_classes {
+            let mirror = match ctx.ensure_class_initialized(annotation_class) {
+                Ok(class_id) => ctx.get_class_mirror(class_id),
+                Err(_) => continue,
+            };
+            let mirror_pin = ctx.pin_native_root(mirror);
+            let current_element = ctx.read_native_pin(element_pin, element);
+            let current_mirror = ctx.read_native_pin(mirror_pin, mirror);
+            let result = ctx.invoke_virtual(
+                current_element,
+                "isAnnotationPresent",
+                "(Ljava/lang/Class;)Z",
+                &[Value::Object(Some(current_mirror))],
+            )?;
+            if matches!(result, Some(Value::Int(v)) if v != 0) {
+                ctx.unpin_native_roots(element_pin);
+                return Ok(Some(Value::Int(1)));
+            }
+        }
+        ctx.unpin_native_roots(element_pin);
+        Ok(Some(Value::Int(0)))
+    }
+
+    fn native_picocli_usage_interpolate_string(
+        ctx: &mut dyn NativeContext,
+        args: &[Value],
+    ) -> MethodCallResult {
+        let this = match args.first() {
+            Some(Value::Object(Some(o))) => *o,
+            _ => return Ok(args.get(1).copied()),
+        };
+        let text = match args.get(1) {
+            Some(Value::Object(Some(o))) => *o,
+            _ => return Ok(Some(Value::Object(None))),
+        };
+        let value = ctx.read_string(text).unwrap_or_default();
+        if !value.contains("${") {
+            return Ok(Some(Value::Object(Some(text))));
+        }
+        let interpolator = match ctx.get_field_by_name(this, "interpolator") {
+            Value::Object(Some(o)) => o,
+            _ => return Ok(Some(Value::Object(Some(text)))),
+        };
+        let text_pin = ctx.pin_native_root(text);
+        let interpolator_pin = ctx.pin_native_root(interpolator);
+        let current_interpolator = ctx.read_native_pin(interpolator_pin, interpolator);
+        let current_text = ctx.read_native_pin(text_pin, text);
+        let result = ctx.invoke_virtual(
+            current_interpolator,
+            "interpolate",
+            "(Ljava/lang/String;)Ljava/lang/String;",
+            &[Value::Object(Some(current_text))],
+        );
+        ctx.unpin_native_roots(text_pin);
+        result
+    }
+
+    fn native_picocli_model_is_non_default(
+        ctx: &mut dyn NativeContext,
+        args: &[Value],
+    ) -> MethodCallResult {
+        let value = args.first().copied().unwrap_or(Value::Object(None));
+        let default_value = args.get(1).copied().unwrap_or(Value::Object(None));
+        if value == default_value {
+            return Ok(Some(Value::Int(0)));
+        }
+        let default_obj = match default_value {
+            Value::Object(Some(o)) => o,
+            _ => return Ok(Some(Value::Int(1))),
+        };
+        if let (Value::Object(Some(value_obj)), Some(default_string)) =
+            (value, ctx.read_string(default_obj))
+        {
+            if let Some(value_string) = ctx.read_string(value_obj) {
+                return Ok(Some(Value::Int(if value_string != default_string { 1 } else { 0 })));
+            }
+        }
+
+        let default_pin = ctx.pin_native_root(default_obj);
+        let value_pin = match value {
+            Value::Object(Some(o)) => Some(ctx.pin_native_root(o)),
+            _ => None,
+        };
+        let current_default = ctx.read_native_pin(default_pin, default_obj);
+        let current_value = match (value, value_pin) {
+            (Value::Object(Some(o)), Some(pin)) => Value::Object(Some(ctx.read_native_pin(pin, o))),
+            _ => value,
+        };
+        let equals = ctx.invoke_virtual(
+            current_default,
+            "equals",
+            "(Ljava/lang/Object;)Z",
+            &[current_value],
+        )?;
+        ctx.unpin_native_roots(default_pin);
+        Ok(Some(Value::Int(match equals {
+            Some(Value::Int(v)) if v != 0 => 0,
+            _ => 1,
+        })))
+    }
+
+    fn native_picocli_model_array_is_non_default(
+        ctx: &mut dyn NativeContext,
+        args: &[Value],
+    ) -> MethodCallResult {
+        let value = args.first().copied().unwrap_or(Value::Object(None));
+        let default_value = args.get(1).copied().unwrap_or(Value::Object(None));
+        if value == default_value {
+            return Ok(Some(Value::Int(0)));
+        }
+        if matches!(default_value, Value::Object(None)) {
+            return Ok(Some(Value::Int(1)));
+        }
+        let equals = ctx.invoke(
+            "java/util/Arrays",
+            "equals",
+            "([Ljava/lang/Object;[Ljava/lang/Object;)Z",
+            &[default_value, value],
+        )?;
+        Ok(Some(Value::Int(match equals {
+            Some(Value::Int(v)) if v != 0 => 0,
+            _ => 1,
+        })))
+    }
+
+
+    fn keycloak_similarity_bigram_frequency(s: &str) -> rustc_hash::FxHashMap<(u16, u16), i32> {
+        let units: Vec<u16> = s.encode_utf16().collect();
+        let mut freq = rustc_hash::FxHashMap::default();
+        if units.len() < 2 {
+            return freq;
+        }
+        for pair in units.windows(2) {
+            *freq.entry((pair[0], pair[1])).or_insert(0) += 1;
+        }
+        freq
+    }
+
+    fn keycloak_similarity_dot(
+        left: &rustc_hash::FxHashMap<(u16, u16), i32>,
+        right: &rustc_hash::FxHashMap<(u16, u16), i32>,
+    ) -> f64 {
+        left.iter()
+            .map(|(key, value)| (*value as f64) * (*right.get(key).unwrap_or(&0) as f64))
+            .sum()
+    }
+
+    fn keycloak_cosine_similarity(lower_input_freq: &rustc_hash::FxHashMap<(u16, u16), i32>, candidate: &str) -> f64 {
+        let candidate_lower = candidate.to_lowercase();
+        let candidate_freq = keycloak_similarity_bigram_frequency(&candidate_lower);
+        let dot = keycloak_similarity_dot(lower_input_freq, &candidate_freq);
+        let norm_input = keycloak_similarity_dot(lower_input_freq, lower_input_freq);
+        let norm_candidate = keycloak_similarity_dot(&candidate_freq, &candidate_freq);
+        let denominator = (norm_input * norm_candidate).sqrt();
+        if denominator == 0.0 { 0.0 } else { dot / denominator }
+    }
+
+    fn keycloak_similarity_result_list(
+        ctx: &mut dyn NativeContext,
+        input: String,
+        candidates: ObjectRef,
+        max_suggestions: usize,
+        min_similarity: f64,
+    ) -> MethodCallResult {
+        let lower_input = input.to_lowercase();
+        let lower_input_freq = keycloak_similarity_bigram_frequency(&lower_input);
+        let count = picocli_list_size(ctx, candidates).min(100_000);
+        let mut scored: Vec<(f64, usize, String)> = Vec::new();
+        for idx in 0..count {
+            let Some(candidate_obj) = picocli_list_get(ctx, candidates, idx) else {
+                continue;
+            };
+            let Some(candidate) = ctx.read_string(candidate_obj) else {
+                continue;
+            };
+            let score = keycloak_cosine_similarity(&lower_input_freq, &candidate);
+            if score >= min_similarity {
+                scored.push((score, idx, candidate));
+            }
+        }
+        scored.sort_by(|a, b| {
+            b.0.partial_cmp(&a.0)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| a.1.cmp(&b.1))
+        });
+
+        let list = match ctx.new_object_initialized("java/util/ArrayList", "()V", &[])? {
+            Some(Value::Object(Some(list))) => list,
+            _ => return Ok(Some(Value::Object(None))),
+        };
+        let list_pin = ctx.pin_native_root(list);
+        for (_, _, candidate) in scored.into_iter().take(max_suggestions) {
+            let candidate_string = ctx.create_string(&candidate);
+            let string_pin = ctx.pin_native_root(candidate_string);
+            let current_list = ctx.read_native_pin(list_pin, list);
+            let current_string = ctx.read_native_pin(string_pin, candidate_string);
+            let _ = ctx.invoke_virtual(
+                current_list,
+                "add",
+                "(Ljava/lang/Object;)Z",
+                &[Value::Object(Some(current_string))],
+            )?;
+            ctx.unpin_native_roots(string_pin);
+        }
+        let list = ctx.read_native_pin(list_pin, list);
+        ctx.unpin_native_roots(list_pin);
+        Ok(Some(Value::Object(Some(list))))
+    }
+
+    fn native_keycloak_similarity_find_similar_default(
+        ctx: &mut dyn NativeContext,
+        args: &[Value],
+    ) -> MethodCallResult {
+        let input = match args.first() {
+            Some(Value::Object(Some(s))) => ctx.read_string(*s).unwrap_or_default(),
+            _ => String::new(),
+        };
+        let candidates = match args.get(1) {
+            Some(Value::Object(Some(list))) => *list,
+            _ => return keycloak_empty_array_list(ctx),
+        };
+        keycloak_similarity_result_list(ctx, input, candidates, 5, 0.4)
+    }
+
+    fn native_keycloak_similarity_find_similar(
+        ctx: &mut dyn NativeContext,
+        args: &[Value],
+    ) -> MethodCallResult {
+        let input = match args.first() {
+            Some(Value::Object(Some(s))) => ctx.read_string(*s).unwrap_or_default(),
+            _ => String::new(),
+        };
+        let candidates = match args.get(1) {
+            Some(Value::Object(Some(list))) => *list,
+            _ => return keycloak_empty_array_list(ctx),
+        };
+        let max_suggestions = match args.get(2) {
+            Some(Value::Int(v)) if *v > 0 => *v as usize,
+            _ => 0,
+        };
+        let min_similarity = match args.get(3) {
+            Some(Value::Double(v)) => *v,
+            Some(Value::Float(v)) => *v as f64,
+            _ => 0.0,
+        };
+        keycloak_similarity_result_list(ctx, input, candidates, max_suggestions, min_similarity)
+    }
+
+    r.register(
+        "org/keycloak/quarkus/runtime/configuration/PropertyMappingInterceptor",
+        "hasInferredValue",
+        "(Lorg/keycloak/quarkus/runtime/configuration/mappers/PropertyMapper;Lio/smallrye/config/ConfigSourceInterceptorContext;)Z",
+        native_keycloak_property_mapping_has_inferred_value,
+    );
+
+    r.register(
+        "org/keycloak/quarkus/runtime/configuration/mappers/PropertyMapper",
+        "getEnabledWhen",
+        "()Ljava/util/Optional;",
+        native_keycloak_property_mapper_get_enabled_when,
+    );
+    r.register(
+        "org/keycloak/quarkus/runtime/configuration/mappers/PropertyMapper",
+        "getRequiredWhen",
+        "()Ljava/util/Optional;",
+        native_keycloak_property_mapper_get_required_when,
+    );
+
+    r.register(
+        "org/keycloak/quarkus/runtime/configuration/mappers/LoggingPropertyMappers",
+        "isConsoleEnabled",
+        "()Z",
+        native_keycloak_log_console_enabled,
+    );
+    r.register(
+        "org/keycloak/quarkus/runtime/configuration/mappers/LoggingPropertyMappers",
+        "isFileEnabled",
+        "()Z",
+        native_keycloak_log_file_enabled,
+    );
+    r.register(
+        "org/keycloak/quarkus/runtime/configuration/mappers/LoggingPropertyMappers",
+        "isSyslogEnabled",
+        "()Z",
+        native_keycloak_log_syslog_enabled,
+    );
+    r.register(
+        "org/keycloak/quarkus/runtime/configuration/mappers/LoggingPropertyMappers",
+        "isConsoleAsyncEnabled",
+        "()Z",
+        native_keycloak_log_console_async_enabled,
+    );
+    r.register(
+        "org/keycloak/quarkus/runtime/configuration/mappers/LoggingPropertyMappers",
+        "isFileAsyncEnabled",
+        "()Z",
+        native_keycloak_log_file_async_enabled,
+    );
+    r.register(
+        "org/keycloak/quarkus/runtime/configuration/mappers/LoggingPropertyMappers",
+        "isSyslogAsyncEnabled",
+        "()Z",
+        native_keycloak_log_syslog_async_enabled,
+    );
+    r.register(
+        "org/keycloak/quarkus/runtime/configuration/mappers/LoggingPropertyMappers",
+        "isConsoleJsonEnabled",
+        "()Z",
+        native_keycloak_log_console_json_enabled,
+    );
+    r.register(
+        "org/keycloak/quarkus/runtime/configuration/mappers/LoggingPropertyMappers",
+        "isFileJsonEnabled",
+        "()Z",
+        native_keycloak_log_file_json_enabled,
+    );
+    r.register(
+        "org/keycloak/quarkus/runtime/configuration/mappers/LoggingPropertyMappers",
+        "isSyslogJsonEnabled",
+        "()Z",
+        native_keycloak_log_syslog_json_enabled,
+    );
+    r.register(
+        "org/keycloak/quarkus/runtime/configuration/mappers/LoggingPropertyMappers",
+        "isFileRotationEnabled",
+        "()Z",
+        native_keycloak_log_file_rotation_enabled,
+    );
+    r.register(
+        "org/keycloak/quarkus/runtime/configuration/mappers/LoggingPropertyMappers",
+        "isMdcActive",
+        "()Z",
+        native_keycloak_log_mdc_active,
+    );
+    r.register(
+        "org/keycloak/quarkus/runtime/configuration/mappers/MetricsPropertyMappers",
+        "metricsEnabled",
+        "()Z",
+        native_keycloak_metrics_enabled,
+    );
+    r.register(
+        "org/keycloak/quarkus/runtime/configuration/mappers/CachingPropertyMappers",
+        "cacheSetToInfinispan",
+        "()Z",
+        native_keycloak_cache_set_to_infinispan,
+    );
+    r.register(
+        "org/keycloak/quarkus/runtime/configuration/mappers/TracingPropertyMappers",
+        "isTracingEnabled",
+        "()Z",
+        native_keycloak_tracing_enabled,
+    );
+    r.register(
+        "org/keycloak/quarkus/runtime/configuration/mappers/TracingPropertyMappers",
+        "isTracingAndEmbeddedInfinispanEnabled",
+        "()Z",
+        native_keycloak_tracing_infinispan_enabled,
+    );
+    r.register(
+        "org/keycloak/quarkus/runtime/configuration/mappers/TelemetryPropertyMappers",
+        "isTelemetryEnabled",
+        "()Z",
+        native_keycloak_telemetry_enabled,
+    );
+    r.register(
+        "org/keycloak/quarkus/runtime/configuration/mappers/TelemetryPropertyMappers",
+        "isTelemetryLogsEnabled",
+        "()Z",
+        native_keycloak_telemetry_logs_enabled,
+    );
+    r.register(
+        "org/keycloak/quarkus/runtime/configuration/mappers/TelemetryPropertyMappers",
+        "isTelemetryMetricsEnabled",
+        "()Z",
+        native_keycloak_telemetry_metrics_enabled,
+    );
+    r.register(
+        "jakarta/ws/rs/core/AbstractMultivaluedMap",
+        "add",
+        "(Ljava/lang/Object;Ljava/lang/Object;)V",
+        native_jaxrs_multivalued_map_add,
+    );
+    r.register(
+        "picocli/CommandLine$Model$TypedMember",
+        "isAnnotated",
+        "(Ljava/lang/reflect/AnnotatedElement;)Z",
+        native_picocli_typed_member_is_annotated,
+    );
+    r.register(
+        "picocli/CommandLine$Model$UsageMessageSpec",
+        "interpolate",
+        "(Ljava/lang/String;)Ljava/lang/String;",
+        native_picocli_usage_interpolate_string,
+    );
+    r.register(
+        "picocli/CommandLine$Model",
+        "isNonDefault",
+        "(Ljava/lang/Object;Ljava/lang/Object;)Z",
+        native_picocli_model_is_non_default,
+    );
+    r.register(
+        "picocli/CommandLine$Model",
+        "isNonDefault",
+        "([Ljava/lang/Object;[Ljava/lang/Object;)Z",
+        native_picocli_model_array_is_non_default,
+    );
+
+    r.register(
+        "org/keycloak/quarkus/runtime/configuration/SimilarityUtil",
+        "findSimilar",
+        "(Ljava/lang/String;Ljava/util/List;)Ljava/util/List;",
+        native_keycloak_similarity_find_similar_default,
+    );
+    r.register(
+        "org/keycloak/quarkus/runtime/configuration/SimilarityUtil",
+        "findSimilar",
+        "(Ljava/lang/String;Ljava/util/List;ID)Ljava/util/List;",
+        native_keycloak_similarity_find_similar,
+    );
+
+
     // --- picocli CommandLine$Help$Ansi$Style.fg(String) / .bg(String) ---
     // Round 92: Keycloak's startup banner contains markup like `@|red ...|@`,
     // which picocli parses via `Ansi.string` -> `Style.parse` -> `Style.fg("red")`.
@@ -6066,6 +7834,203 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
                 _ => return Ok(Some(Value::Object(None))),
             };
             Ok(Some(picocli_style_lookup(ctx, "bg_", name_obj)))
+        },
+    );
+
+    fn picocli_regex_word_hyphen(s: &str) -> bool {
+        !s.is_empty()
+            && s.chars()
+                .all(|ch| ch.is_ascii_alphanumeric() || ch == '_' || ch == '-')
+    }
+
+    fn picocli_regex_transform(input: &str, synopsis: bool) -> String {
+        if let Some(rest) = input.strip_prefix("--no-") {
+            if picocli_regex_word_hyphen(rest) {
+                return if synopsis {
+                    format!("--[no-]{}", rest)
+                } else {
+                    format!("--{}", rest)
+                };
+            }
+        }
+        if let Some(rest) = input.strip_prefix("--") {
+            if picocli_regex_word_hyphen(rest) {
+                return if synopsis {
+                    format!("--[no-]{}", rest)
+                } else {
+                    format!("--no-{}", rest)
+                };
+            }
+        }
+
+        let (prefix, rest) = if let Some(rest) = input.strip_prefix("--") {
+            ("--", rest)
+        } else if let Some(rest) = input.strip_prefix('-') {
+            ("-", rest)
+        } else {
+            return input.to_string();
+        };
+        let Some(colon) = rest.find(':') else {
+            return input.to_string();
+        };
+        if !rest[..colon]
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || ch == '_')
+        {
+            return input.to_string();
+        }
+        let after_colon = &rest[colon + 1..];
+        let (replacement_sign, value) = if let Some(value) = after_colon.strip_prefix('+') {
+            ('-', value)
+        } else if let Some(value) = after_colon.strip_prefix('-') {
+            ('+', value)
+        } else {
+            return input.to_string();
+        };
+        if !picocli_regex_word_hyphen(value) {
+            return input.to_string();
+        }
+        if synopsis {
+            format!("{}{}:(+|-){}", prefix, &rest[..colon], value)
+        } else {
+            format!("{}{}:{}{}", prefix, &rest[..colon], replacement_sign, value)
+        }
+    }
+
+    fn picocli_new_regex_transformer(ctx: &mut dyn NativeContext) -> MethodCallResult {
+        let obj = alloc_concurrent_synthetic(ctx, "picocli/CommandLine$RegexTransformer", 2);
+        if let Ok(Some(empty_map)) = ctx.invoke("java/util/Collections", "emptyMap", "()Ljava/util/Map;", &[]) {
+            ctx.set_field_by_name(obj, "replacements", empty_map);
+            ctx.set_field_by_name(obj, "synopsis", empty_map);
+        }
+        Ok(Some(Value::Object(Some(obj))))
+    }
+
+    fn native_picocli_regex_transform_negative(
+        ctx: &mut dyn NativeContext,
+        args: &[Value],
+    ) -> MethodCallResult {
+        let input = match args.get(1) {
+            Some(Value::Object(Some(s))) => ctx.read_string(*s).unwrap_or_default(),
+            _ => String::new(),
+        };
+        let out = ctx.create_string(&picocli_regex_transform(&input, false));
+        Ok(Some(Value::Object(Some(out))))
+    }
+
+    fn native_picocli_regex_transform_synopsis(
+        ctx: &mut dyn NativeContext,
+        args: &[Value],
+    ) -> MethodCallResult {
+        let input = match args.get(1) {
+            Some(Value::Object(Some(s))) => ctx.read_string(*s).unwrap_or_default(),
+            _ => String::new(),
+        };
+        let out = ctx.create_string(&picocli_regex_transform(&input, true));
+        Ok(Some(Value::Object(Some(out))))
+    }
+
+    r.register(
+        "picocli/CommandLine$RegexTransformer",
+        "createDefault",
+        "()Lpicocli/CommandLine$RegexTransformer;",
+        |ctx, _args| picocli_new_regex_transformer(ctx),
+    );
+    r.register(
+        "picocli/CommandLine$RegexTransformer",
+        "createCaseInsensitive",
+        "()Lpicocli/CommandLine$RegexTransformer;",
+        |ctx, _args| picocli_new_regex_transformer(ctx),
+    );
+    r.register(
+        "picocli/CommandLine$RegexTransformer",
+        "makeNegative",
+        "(Ljava/lang/String;Lpicocli/CommandLine$Model$CommandSpec;)Ljava/lang/String;",
+        native_picocli_regex_transform_negative,
+    );
+    r.register(
+        "picocli/CommandLine$RegexTransformer",
+        "makeSynopsis",
+        "(Ljava/lang/String;Lpicocli/CommandLine$Model$CommandSpec;)Ljava/lang/String;",
+        native_picocli_regex_transform_synopsis,
+    );
+
+    r.register(
+        "java/util/Arrays$ArrayList",
+        "<init>",
+        "([Ljava/lang/Object;)V",
+        |ctx, args| {
+            let this = obj_arg(args, 0)?;
+            let array = args.get(1).copied().unwrap_or(Value::Object(None));
+            ctx.set_field_by_name(this, "a", array);
+            Ok(None)
+        },
+    );
+    r.register(
+        "java/util/Arrays$ArrayList",
+        "toArray",
+        "()[Ljava/lang/Object;",
+        |ctx, args| {
+            let this = obj_arg(args, 0)?;
+            let backing = match ctx.get_field_by_name(this, "a") {
+                Value::Object(Some(arr)) => arr,
+                _ => {
+                    let empty = ctx.new_ref_array(ClassId::new(0), 0);
+                    return Ok(Some(Value::Object(Some(empty))));
+                }
+            };
+            let len = ctx.array_length(backing);
+            let out = ctx.new_ref_array(ClassId::new(0), len);
+            for i in 0..len {
+                let value = ctx.get_array_element(backing, i);
+                ctx.set_array_element(out, i, value);
+            }
+            Ok(Some(Value::Object(Some(out))))
+        },
+    );
+
+    r.register(
+        "picocli/CommandLine$Model$CaseAwareLinkedMap",
+        "containsKey",
+        "(Ljava/lang/Object;)Z",
+        |ctx, args| {
+            let this = obj_arg(args, 0)?;
+            let key = args.get(1).copied().unwrap_or(Value::Object(None));
+            let key_for_lookup = if matches!(ctx.get_field_by_name(this, "caseInsensitive"), Value::Int(v) if v != 0) {
+                match key {
+                    Value::Object(Some(key_obj))
+                        if ctx
+                            .class_name_of_id(ctx.class_id_of_object(key_obj))
+                            .as_deref()
+                            == Some("java/lang/String") =>
+                    {
+                        let lowered = ctx
+                            .read_string(key_obj)
+                            .unwrap_or_default()
+                            .to_ascii_lowercase();
+                        Value::Object(Some(ctx.create_string(&lowered)))
+                    }
+                    Value::Object(None) => Value::Object(None),
+                    _ => return Ok(Some(Value::Int(0))),
+                }
+            } else {
+                key
+            };
+            let map_field = if matches!(ctx.get_field_by_name(this, "caseInsensitive"), Value::Int(v) if v != 0) {
+                "keyMap"
+            } else {
+                "targetMap"
+            };
+            let map = match picocli_obj_field(ctx, this, map_field) {
+                Some(map) => map,
+                None => return Ok(Some(Value::Int(0))),
+            };
+            ctx.invoke_virtual(
+                map,
+                "containsKey",
+                "(Ljava/lang/Object;)Z",
+                &[key_for_lookup],
+            )
         },
     );
 
@@ -23886,6 +25851,14 @@ pub(crate) fn register_p61_reflect(r: &mut NativeMethodRegistry) {
     );
 
     // --- Method annotation methods (real implementations in lib.rs) ---
+    fn java_utf16_hash(s: &str) -> i32 {
+        let mut h = 0i32;
+        for ch in s.encode_utf16() {
+            h = h.wrapping_mul(31).wrapping_add(ch as i32);
+        }
+        h
+    }
+
     let method = "java/lang/reflect/Method";
     r.register(
         method,
@@ -23905,6 +25878,36 @@ pub(crate) fn register_p61_reflect(r: &mut NativeMethodRegistry) {
         "(Ljava/lang/Class;)Z",
         crate::lang_class::native_method_is_annotation_present,
     );
+    r.register(method, "hashCode", "()I", |ctx, args| {
+        let this = obj_arg(args, 0)?;
+        let Some((class_id, method_name, _method_desc)) =
+            crate::lang_class::method_class_name_desc(ctx, this)
+        else {
+            return Ok(Some(Value::Int(0)));
+        };
+        let class_name = ctx.class_name_of_id(class_id).unwrap_or_default();
+        Ok(Some(Value::Int(
+            java_utf16_hash(&class_name.replace('/', ".")) ^ java_utf16_hash(&method_name),
+        )))
+    });
+    r.register(method, "equals", "(Ljava/lang/Object;)Z", |ctx, args| {
+        let this = obj_arg(args, 0)?;
+        let other = match args.get(1) {
+            Some(Value::Object(Some(o))) => *o,
+            _ => return Ok(Some(Value::Int(0))),
+        };
+        if this == other {
+            return Ok(Some(Value::Int(1)));
+        }
+        if ctx.class_name_of_id(ctx.class_id_of_object(other)).as_deref()
+            != Some("java/lang/reflect/Method")
+        {
+            return Ok(Some(Value::Int(0)));
+        }
+        let left = crate::lang_class::method_class_name_desc(ctx, this);
+        let right = crate::lang_class::method_class_name_desc(ctx, other);
+        Ok(Some(Value::Int(if left.is_some() && left == right { 1 } else { 0 })))
+    });
     r.register(
         method,
         "getParameterAnnotations",

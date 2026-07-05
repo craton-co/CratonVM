@@ -506,6 +506,27 @@ fn should_skip_jit_internal(
             return Some(SkipReason::JavaUtilCollection);
         }
 
+        // KC26-PIC.1 (2026-07-05) — Keycloak PicocliTest post-CompactValue
+        // residual timeout. The class no longer hits the old raw CompactValue
+        // SIGSEGV, but default JIT spends the watchdog window cycling through
+        // Picocli command reflection and Keycloak/SmallRye configuration
+        // mapper iteration. Direct controls on the Keycloak 26.6.1 runtime
+        // classpath: `--nojit` completes the class in ~172s with the known
+        // behavioral failures; default JIT times out at 265s;
+        // `CRATONVM_JIT_DENY=org/keycloak/,picocli/,io/smallrye/` completes
+        // in ~168s with the same failures. Disabling inline allocation does
+        // not help, so this is not the old inline-new header race. Keep these
+        // app/config packages interpreted under Conservative until the exact
+        // JIT throughput/correctness defect is narrowed. Liftable with e.g.
+        // `CRATONVM_JIT_ALLOW_PACKAGES=org/keycloak/,picocli/,io/smallrye/`.
+        if (class_name.starts_with("org/keycloak/")
+            || class_name.starts_with("picocli/")
+            || class_name.starts_with("io/smallrye/"))
+            && !package_allowed(class_name, allow_packages)
+        {
+            return Some(SkipReason::RustJvmTestFixture);
+        }
+
         // RBC.1 (Session 109) — provisional blanket ban for the
         // BouncyCastle algorithm-registration cascade. BC's
         // `BouncyCastleProvider.<init>` registers ~thousand algorithm
@@ -2701,6 +2722,41 @@ mod tests {
             ),
             None
         );
+    }
+
+    #[test]
+    fn keycloak_picocli_smallrye_packages_skip_under_conservative() {
+        for (class_name, allow) in [
+            (
+                "org/keycloak/quarkus/runtime/cli/Picocli",
+                "org/keycloak/",
+            ),
+            ("picocli/CommandLine", "picocli/"),
+            ("io/smallrye/config/SmallRyeConfig", "io/smallrye/"),
+        ] {
+            assert_eq!(
+                check(class_name, "example", false, true, SkipPolicy::Conservative),
+                Some(SkipReason::RustJvmTestFixture),
+                "{class_name} must stay interpreted under the conservative policy"
+            );
+            assert_eq!(
+                check(class_name, "example", false, true, SkipPolicy::Aggressive),
+                None,
+                "aggressive policy must lift {class_name}"
+            );
+            assert_eq!(
+                check_with(
+                    class_name,
+                    "example",
+                    false,
+                    true,
+                    SkipPolicy::Conservative,
+                    &[allow],
+                ),
+                None,
+                "allow-package entry must lift {class_name}"
+            );
+        }
     }
 
     #[test]

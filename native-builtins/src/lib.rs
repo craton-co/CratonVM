@@ -14549,6 +14549,7 @@ pub fn register_essential_natives(registry: &mut NativeMethodRegistry) {
         native_class_is_primitive,
     );
     registry.register("java/lang/Class", "isArray", "()Z", native_class_is_array);
+    registry.register("java/lang/Class", "isEnum", "()Z", native_class_is_enum);
     // JDK 25 native methods needed for real Class bootstrap:
     registry.register(
         "java/lang/Class",
@@ -22996,6 +22997,7 @@ pub fn register_synthetic_overrides(registry: &mut NativeMethodRegistry) {
         native_class_is_assignable_from,
     );
     registry.register("java/lang/Class", "isArray", "()Z", native_class_is_array);
+    registry.register("java/lang/Class", "isEnum", "()Z", native_class_is_enum);
     registry.register(
         "java/lang/Class",
         "isInterface",

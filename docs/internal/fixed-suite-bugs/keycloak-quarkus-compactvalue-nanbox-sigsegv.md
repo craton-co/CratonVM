@@ -6,7 +6,7 @@ Status: fixed on current `dev` before this branch; validated 2026-07-04 while ta
 
 `quarkus/runtime :: org.keycloak.quarkus.runtime.cli.PicocliTest` no longer exits with `rc=139` after the compact-long local-kind fix present on `dev`. The focused run with `cratonvm-keycloak-0704-172634` reached a 120s timeout instead of the raw native crash.
 
-The post-crash residual is tracked separately in `docs/known-issues/keycloak-07-04/quarkus-runtime-picocli-post-compactvalue-hang.md`.
+The post-crash PicocliTest timeout residual was fixed later; see `docs/internal/fixed-suite-bugs/quarkus-runtime-picocli-post-compactvalue-hang.md`.
 
 ---
 
