@@ -105,7 +105,7 @@ const FACTORIES: &[(&str, &str, &str)] = &[
     (
         "getJavaNioAccess",
         "Ljdk/internal/access/JavaNioAccess;",
-        "java/nio/Buffer$1",
+        "java/nio/Buffer$2",
     ),
     (
         "getJavaSecurityAccess",
@@ -228,7 +228,7 @@ fn make_factory_callback(owner_class: &'static str) -> cratonvm_native_api::Nati
     gen_factory!(f_jiofd, "java/io/FileDescriptor$1");
     gen_factory!(f_jniaa, "java/net/InetAddress$1");
     gen_factory!(f_jnuri, "cratonvm/internal/ss/JavaNetUriAccess$1");
-    gen_factory!(f_jnio, "java/nio/Buffer$1");
+    gen_factory!(f_jnio, "java/nio/Buffer$2");
     gen_factory!(f_jsec, "java/security/AccessController$1");
     gen_factory!(f_jujar, "cratonvm/internal/ss/JavaUtilJarAccess$1");
     gen_factory!(f_juzf, "java/util/zip/ZipFile$1");
@@ -246,7 +246,7 @@ fn make_factory_callback(owner_class: &'static str) -> cratonvm_native_api::Nati
         "java/io/FileDescriptor$1" => f_jiofd,
         "java/net/InetAddress$1" => f_jniaa,
         "cratonvm/internal/ss/JavaNetUriAccess$1" => f_jnuri,
-        "java/nio/Buffer$1" => f_jnio,
+        "java/nio/Buffer$2" => f_jnio,
         "java/security/AccessController$1" => f_jsec,
         "cratonvm/internal/ss/JavaUtilJarAccess$1" => f_jujar,
         "java/util/zip/ZipFile$1" => f_juzf,
@@ -1460,8 +1460,8 @@ fn jnio_get_buffer_pool(ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodC
 fn jnio_new_direct_byte_buffer(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     // JavaNioAccess.newDirectByteBuffer(long addr, int cap[, Object att,
     // MemorySegment seg]) -> a DirectByteBuffer wrapping the native address.
-    // args = [this(Buffer$1), addr, cap, ...]. JDK-25 has no `DirectByteBuffer(long,int)`
-    // ctor; the real `Buffer$1` does `new DirectByteBuffer(addr, cap, att, seg)`
+    // args = [this(Buffer$2), addr, cap, ...]. JDK-25 has no `DirectByteBuffer(long,int)`
+    // ctor; the real `Buffer$2` does `new DirectByteBuffer(addr, cap, att, seg)`
     // via the 4-arg `(JILjava/lang/Object;Ljava/lang/foreign/MemorySegment;)V`
     // constructor. (The old handler invoked a non-existent `(JI)V` ctor on the
     // wrong receiver and returned an uninitialized buffer.)
@@ -1601,7 +1601,7 @@ fn vm_buffer_pool_get_memory_used(
 }
 
 fn register_java_nio_access(registry: &mut NativeMethodRegistry) {
-    let owner = "java/nio/Buffer$1";
+    let owner = "java/nio/Buffer$2";
     registry.register(
         owner,
         "getBufferPool",
@@ -2090,7 +2090,7 @@ mod tests {
                 "(Ljava/lang/String;Ljava/lang/String;)Ljava/net/URI;",
             ),
             (
-                "java/nio/Buffer$1",
+                "java/nio/Buffer$2",
                 "getBufferPool",
                 "()Ljava/lang/management/BufferPoolMXBean;",
             ),

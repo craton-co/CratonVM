@@ -3920,6 +3920,12 @@ pub(crate) fn native_field_get(ctx: &mut dyn NativeContext, args: &[Value]) -> M
     // for non-volatile fields so the plain-read path stays cheap.
     volatile_load_fence(modifiers);
 
+    if is_static {
+        if let Some(class_name) = ctx.class_name_of_id(class_id) {
+            ctx.ensure_class_initialized(&class_name)?;
+        }
+    }
+
     let raw_value = if is_static {
         ctx.get_static_field(class_id, slot)
     } else {

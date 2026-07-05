@@ -14520,6 +14520,12 @@ pub fn register_essential_natives(registry: &mut NativeMethodRegistry) {
         "()Ljava/lang/Class;",
         lang_class::native_class_get_component_type,
     );
+    registry.register(
+        "java/lang/Class",
+        "componentType",
+        "()Ljava/lang/Class;",
+        lang_class::native_class_get_component_type,
+    );
     // Round 63: Class.arrayType() — bypass JDK's `Array.newInstance(this, 0).getClass()`
     // chain, which leaked nulls into Spring's GenericConversionService$Converters.
     // getClassHierarchy when invoked on the superclass / interfaces of an array
@@ -24759,6 +24765,8 @@ enum GetClassDisplay {
     /// family (with a `RandomAccess` check for lists).
     CollList,
     CollSet,
+    CollSortedSet,
+    CollNavigableSet,
     CollMap,
     /// `cratonvm/internal/UnmodifiableCollection` — only ever produced by
     /// `Collections.unmodifiableCollection` (no immutable factory), so it always
@@ -24771,6 +24779,8 @@ fn collection_display_kind(stamp: &str) -> Option<GetClassDisplay> {
     match stamp {
         "cratonvm/internal/UnmodifiableList" => Some(GetClassDisplay::CollList),
         "cratonvm/internal/UnmodifiableSet" => Some(GetClassDisplay::CollSet),
+        "cratonvm/internal/UnmodifiableSortedSet" => Some(GetClassDisplay::CollSortedSet),
+        "cratonvm/internal/UnmodifiableNavigableSet" => Some(GetClassDisplay::CollNavigableSet),
         "cratonvm/internal/UnmodifiableMap" => Some(GetClassDisplay::CollMap),
         "cratonvm/internal/UnmodifiableCollection" => Some(GetClassDisplay::CollUnmod),
         _ => None,
@@ -24909,6 +24919,12 @@ pub(crate) fn getclass_display_class_id(
                 "java/util/Collections$UnmodifiableSet"
             };
             getclass_resolve_name(ctx, name)
+        }
+        GetClassDisplay::CollSortedSet => {
+            getclass_resolve_name(ctx, "java/util/Collections$UnmodifiableSortedSet")
+        }
+        GetClassDisplay::CollNavigableSet => {
+            getclass_resolve_name(ctx, "java/util/Collections$UnmodifiableNavigableSet")
         }
         GetClassDisplay::CollMap => {
             let name = if getclass_immutable_marker(ctx, this) {
@@ -29831,6 +29847,12 @@ fn native_unsafe_park(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
             .unwrap_or(0);
         let remaining = (time - now_ms).max(0) as u64;
         Some(std::time::Duration::from_millis(remaining))
+    } else if time < 0 {
+        // Relative `Unsafe.park` time is nanoseconds. Timed JDK wait loops can
+        // race past their deadline and pass a negative remainder; HotSpot
+        // returns promptly. Casting that negative value to u64 would park for
+        // centuries and turn a bounded Future.get(timeout) into a hang.
+        Some(std::time::Duration::ZERO)
     } else {
         // time is relative in nanoseconds
         Some(std::time::Duration::from_nanos(time as u64))
@@ -36601,7 +36623,7 @@ fn register_m18_concurrent_fixes(registry: &mut NativeMethodRegistry) {
                         ctx.monitor_exit(this);
                         return Ok(Some(Value::Object(None))); // timed out
                     }
-                    let wait_ms = remaining.as_millis().min(10) as u64;
+                    let wait_ms = bounded_monitor_wait_ms(remaining, 10);
                     // GC-SAFEPOINT FIX: the wait can relocate `this`; pin + read back.
                     this = monitor_wait_keepalive(ctx, this, Some(wait_ms))?;
                     ctx.monitor_exit(this);
@@ -36988,7 +37010,7 @@ fn register_m18_concurrent_fixes(registry: &mut NativeMethodRegistry) {
                         ctx.monitor_exit(this);
                         return Ok(Some(Value::Object(None))); // timed out
                     }
-                    let wait_ms = remaining.as_millis().min(10) as u64;
+                    let wait_ms = bounded_monitor_wait_ms(remaining, 10);
                     ctx.monitor_wait(this, Some(wait_ms))?;
                     ctx.monitor_exit(this);
                 }
@@ -37769,7 +37791,7 @@ fn register_t31_concurrent_extras(registry: &mut NativeMethodRegistry) {
                         ctx.monitor_exit(this);
                         return Ok(Some(Value::Object(None)));
                     }
-                    let wait_ms = remaining.as_millis().min(10) as u64;
+                    let wait_ms = bounded_monitor_wait_ms(remaining, 10);
                     ctx.monitor_wait(this, Some(wait_ms))?;
                     ctx.monitor_exit(this);
                 }
@@ -38248,6 +38270,10 @@ fn monitor_wait_keepalive(
     Ok(obj)
 }
 
+fn bounded_monitor_wait_ms(remaining: std::time::Duration, cap_ms: u64) -> u64 {
+    remaining.as_millis().clamp(1, cap_ms as u128) as u64
+}
+
 // --- Condition ---
 
 fn native_cond_await(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
@@ -38669,7 +38695,7 @@ fn native_cdl_count_down(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
 }
 
 fn native_cdl_await(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    let this = match args.first() {
+    let mut this = match args.first() {
         Some(Value::Object(Some(o))) => *o,
         _ => return Ok(None),
     };
@@ -38680,14 +38706,15 @@ fn native_cdl_await(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRe
             return Ok(None);
         }
         ctx.monitor_enter(this);
-        let wait_result = ctx.monitor_wait(this, Some(10));
+        // GC-SAFEPOINT FIX: the wait can relocate `this`; pin + read back.
+        let wait_result = monitor_wait_keepalive(ctx, this, Some(10));
+        this = wait_result?;
         ctx.monitor_exit(this);
-        wait_result?;
     }
 }
 
 fn native_cdl_await_timeout(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    let this = match args.first() {
+    let mut this = match args.first() {
         Some(Value::Object(Some(o))) => *o,
         _ => return Ok(Some(Value::Int(0))),
     };
@@ -38712,14 +38739,10 @@ fn native_cdl_await_timeout(ctx: &mut dyn NativeContext, args: &[Value]) -> Meth
         if remaining.is_zero() {
             return Ok(Some(Value::Int(0))); // false — timed out
         }
-        // `monitor_wait(..., Some(0))` means an indefinite wait in the VM.
-        // A small positive timeout (for example CountDownLatch.await(1, MILLISECONDS))
-        // can have less than one whole millisecond remaining after the bookkeeping
-        // above, and `Duration::as_millis()` truncates that to 0. Round positive
-        // sub-millisecond waits up to 1 ms so timed latch waits cannot park forever.
-        let wait_ms = remaining.as_millis().clamp(1, 10) as u64;
+        let wait_ms = bounded_monitor_wait_ms(remaining, 10);
         ctx.monitor_enter(this);
-        ctx.monitor_wait(this, Some(wait_ms))?;
+        // GC-SAFEPOINT FIX: the wait can relocate `this`; pin + read back.
+        this = monitor_wait_keepalive(ctx, this, Some(wait_ms))?;
         ctx.monitor_exit(this);
     }
 }
@@ -39094,7 +39117,7 @@ fn native_sem_try_acquire_timeout(ctx: &mut dyn NativeContext, args: &[Value]) -
         if remaining.is_zero() {
             return Ok(Some(Value::Int(0)));
         }
-        let wait_ms = remaining.as_millis().min(10) as u64;
+        let wait_ms = bounded_monitor_wait_ms(remaining, 10);
         ctx.monitor_enter(this);
         let wait_result = ctx.monitor_wait(this, Some(wait_ms));
         ctx.monitor_exit(this);
@@ -39302,7 +39325,7 @@ fn cb_await_inner(
                     }
                     .into());
                 }
-                remaining.as_millis().min(10) as u64
+                bounded_monitor_wait_ms(remaining, 10)
             }
             None => 10,
         };
@@ -44829,6 +44852,68 @@ fn native_es_execute(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallR
 /// (a `pin_native_root` handle is NOT usable here: that is a transient per-thread
 /// pin stack cleared after each native call, not a persistent root).
 static ASYNC_POOL: std::sync::Mutex<Option<ObjectRef>> = std::sync::Mutex::new(None);
+static LAST_ASYNC_SUBMIT_MS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+fn monotonicish_epoch_millis() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis().min(u64::MAX as u128) as u64)
+        .unwrap_or(0)
+}
+
+fn note_async_runnable_submitted() {
+    LAST_ASYNC_SUBMIT_MS.store(
+        monotonicish_epoch_millis(),
+        std::sync::atomic::Ordering::Relaxed,
+    );
+}
+
+fn async_submit_handoff_grace() -> std::time::Duration {
+    static GRACE: std::sync::OnceLock<std::time::Duration> = std::sync::OnceLock::new();
+    *GRACE.get_or_init(|| {
+        let millis = std::env::var("CRATONVM_ASYNC_SUBMIT_GRACE_MS")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .unwrap_or(20);
+        std::time::Duration::from_millis(millis)
+    })
+}
+
+pub(crate) fn async_handoff_sleep_millis(requested: i64) -> i64 {
+    const DEFAULT_ASYNC_HANDOFF_SLEEP_FLOOR_MS: i64 = 100;
+    const DEFAULT_ASYNC_WORKER_SHORT_SLEEP_FLOOR_MS: i64 = 3_000;
+    const HANDOFF_WINDOW_MS: u64 = 1_000;
+
+    if !(1..=10).contains(&requested) && !(50..=100).contains(&requested) {
+        return requested;
+    }
+    let last = LAST_ASYNC_SUBMIT_MS.load(std::sync::atomic::Ordering::Relaxed);
+    if last == 0 {
+        return requested;
+    }
+    let elapsed = monotonicish_epoch_millis().saturating_sub(last);
+    if elapsed > HANDOFF_WINDOW_MS {
+        return requested;
+    }
+    if (1..=10).contains(&requested) {
+        let handoff_floor = std::env::var("CRATONVM_ASYNC_HANDOFF_SLEEP_FLOOR_MS")
+            .ok()
+            .and_then(|v| v.parse::<i64>().ok())
+            .filter(|v| *v >= requested)
+            .unwrap_or(DEFAULT_ASYNC_HANDOFF_SLEEP_FLOOR_MS);
+        requested.max(handoff_floor)
+    } else if (50..=100).contains(&requested) {
+        let worker_floor = std::env::var("CRATONVM_ASYNC_WORKER_SLEEP_FLOOR_MS")
+            .ok()
+            .and_then(|v| v.parse::<i64>().ok())
+            .filter(|v| *v >= requested)
+            .unwrap_or(DEFAULT_ASYNC_WORKER_SHORT_SLEEP_FLOOR_MS);
+        requested.max(worker_floor)
+    } else {
+        requested
+    }
+}
 
 /// Bug D (kafka-suite-0617) — submit a `Runnable` to a real, **bounded** pool of
 /// Java worker threads instead of running it inline on the calling thread.
@@ -44861,13 +44946,24 @@ pub(crate) fn spawn_runnable_on_real_thread(
     runnable: ObjectRef,
 ) -> MethodCallResult {
     if let Some(pool) = async_worker_pool(ctx) {
-        // submit() on a real ThreadPoolExecutor runs real bytecode → real worker.
+        // Record before handing the task to the executor: a fast worker can
+        // enter user code (and its short scheduling sleeps) before execute()
+        // returns to the submitting thread.
+        note_async_runnable_submitted();
+        // execute() is the ForkJoinPool.execute contract we are emulating here;
+        // avoid wrapping every CompletableFuture async task in a FutureTask.
         ctx.invoke_virtual(
             pool,
-            "submit",
-            "(Ljava/lang/Runnable;)Ljava/util/concurrent/Future;",
+            "execute",
+            "(Ljava/lang/Runnable;)V",
             &[Value::Object(Some(runnable))],
         )?;
+        let grace = async_submit_handoff_grace();
+        if grace.is_zero() {
+            std::thread::yield_now();
+        } else {
+            std::thread::sleep(grace);
+        }
         return Ok(None);
     }
     // Fallback: pool creation failed — preserve the completion contract inline.
@@ -55349,6 +55445,12 @@ fn register_enterprise_final_natives(registry: &mut NativeMethodRegistry) {
     );
     registry.register(
         c,
+        "componentType",
+        "()Ljava/lang/Class;",
+        native_class_get_component_type,
+    );
+    registry.register(
+        c,
         "getPackageName",
         "()Ljava/lang/String;",
         native_class_get_package_name,
@@ -57288,6 +57390,29 @@ mod vector_support_essential_tests {
         assert!(registry
             .find(vector_support, "getMaxLaneCount", "(Ljava/lang/Class;)I")
             .is_some());
+    }
+
+    #[test]
+    fn class_component_type_alias_is_registered() {
+        for name in ["getComponentType", "componentType"] {
+            let mut registry = NativeMethodRegistry::new();
+            register_essential_natives(&mut registry);
+            assert!(
+                registry
+                    .find("java/lang/Class", name, "()Ljava/lang/Class;")
+                    .is_some(),
+                "Class.{name}() must use the native array-component mirror path"
+            );
+
+            let mut final_registry = NativeMethodRegistry::new();
+            register_enterprise_final_natives(&mut final_registry);
+            assert!(
+                final_registry
+                    .find("java/lang/Class", name, "()Ljava/lang/Class;")
+                    .is_some(),
+                "Class.{name}() must also be registered in the final native set"
+            );
+        }
     }
 }
 

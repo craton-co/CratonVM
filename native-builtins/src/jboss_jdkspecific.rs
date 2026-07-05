@@ -1023,7 +1023,7 @@ mod tests {
     #[test]
     fn module_get_packages_returns_populated_set_for_java_base() {
         let mut ctx = MockNativeContext::new();
-        let layer = build_boot_layer(&mut ctx);
+        let layer = build_boot_layer(&mut ctx).expect("boot layer should build");
         let module = build_module(&mut ctx, "java.base", layer);
         let result = native_module_get_packages(&mut ctx, &[Value::Object(Some(module))])
             .unwrap()
@@ -1057,7 +1057,7 @@ mod tests {
         // build_module records an EMPTY package list for any non-java.base
         // name (module_packages_table) — getPackages() must still return a
         // valid (non-null) Set, not null/panic.
-        let layer = build_boot_layer(&mut ctx);
+        let layer = build_boot_layer(&mut ctx).expect("boot layer should build");
         let module = build_module(&mut ctx, "java.sql", layer);
         let result = native_module_get_packages(&mut ctx, &[Value::Object(Some(module))])
             .unwrap()
@@ -1071,7 +1071,7 @@ mod tests {
     #[test]
     fn module_get_name_returns_string() {
         let mut ctx = MockNativeContext::new();
-        let layer = build_boot_layer(&mut ctx);
+        let layer = build_boot_layer(&mut ctx).expect("boot layer should build");
         let module = build_module(&mut ctx, "java.base", layer);
         let result = native_module_get_name(&mut ctx, &[Value::Object(Some(module))])
             .unwrap()
@@ -1117,7 +1117,7 @@ mod tests {
             )
             .expect("Module.getClassLoader must be registered");
         let mut ctx = MockNativeContext::new();
-        let layer = build_boot_layer(&mut ctx);
+        let layer = build_boot_layer(&mut ctx).expect("boot layer should build");
         let module = build_module(&mut ctx, "java.base", layer);
         let result = cb(&mut ctx, &[Value::Object(Some(module))])
             .unwrap()
@@ -1149,7 +1149,7 @@ mod tests {
             )
             .expect("Module.getClassLoader must be registered");
         let mut ctx = MockNativeContext::new();
-        let layer = build_boot_layer(&mut ctx);
+        let layer = build_boot_layer(&mut ctx).expect("boot layer should build");
         // Build a fully-populated module (java.base records the full JDK package list).
         let module = build_module(&mut ctx, "java.base", layer);
         // Sanity: getPackages() reflects the recorded data for this module.

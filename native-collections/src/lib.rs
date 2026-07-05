@@ -3885,7 +3885,7 @@ fn unwrap_unmod(ctx: &dyn NativeContext, obj: ObjectRef) -> ObjectRef {
     if let Some(name) = ctx.class_name_of_id(cid) {
         if name == UNMOD_MAP_CLASS
             || name == UNMOD_LIST_CLASS
-            || name == UNMOD_SET_CLASS
+            || is_unmod_set_class(&name)
             || name == UNMOD_COLLECTION_CLASS
         {
             if let Value::Object(Some(inner)) = ctx.get_field(obj, UNMOD_FIELD_BACKING) {
@@ -4501,6 +4501,8 @@ fn is_unmod_wrapper(ctx: &dyn NativeContext, obj: ObjectRef) -> bool {
         Some(UNMOD_MAP_CLASS)
             | Some(UNMOD_LIST_CLASS)
             | Some(UNMOD_SET_CLASS)
+            | Some(UNMOD_SORTED_SET_CLASS)
+            | Some(UNMOD_NAVIGABLE_SET_CLASS)
             | Some(UNMOD_COLLECTION_CLASS)
     )
 }
@@ -22166,7 +22168,7 @@ fn collect_collection_elements(ctx: &mut dyn NativeContext, coll: ObjectRef) -> 
         // collection at slot 0 — recurse into it so `new HashSet(unmodList)`
         // and friends see the wrapped elements.
         if cls_name == UNMOD_LIST_CLASS
-            || cls_name == UNMOD_SET_CLASS
+            || is_unmod_set_class(&cls_name)
             || cls_name == UNMOD_COLLECTION_CLASS
         {
             if let Value::Object(Some(inner)) = ctx.get_field(coll, UNMOD_FIELD_BACKING) {
@@ -29648,6 +29650,8 @@ fn native_props_string_property_names(
 /// Synthetic class names for the unmodifiable wrappers.
 const UNMOD_LIST_CLASS: &str = "cratonvm/internal/UnmodifiableList";
 const UNMOD_SET_CLASS: &str = "cratonvm/internal/UnmodifiableSet";
+const UNMOD_SORTED_SET_CLASS: &str = "cratonvm/internal/UnmodifiableSortedSet";
+const UNMOD_NAVIGABLE_SET_CLASS: &str = "cratonvm/internal/UnmodifiableNavigableSet";
 const UNMOD_MAP_CLASS: &str = "cratonvm/internal/UnmodifiableMap";
 const UNMOD_COLLECTION_CLASS: &str = "cratonvm/internal/UnmodifiableCollection";
 const UNMOD_ITR_CLASS: &str = "cratonvm/internal/UnmodifiableItr";
@@ -29665,6 +29669,13 @@ const UNMOD_FIELD_BACKING: usize = 0;
 /// `getclass_immutable_marker` in native-builtins (the `getClass()` display
 /// map); keep the two in sync.
 const UNMOD_FIELD_IMMUTABLE: usize = 1;
+
+fn is_unmod_set_class(name: &str) -> bool {
+    matches!(
+        name,
+        UNMOD_SET_CLASS | UNMOD_SORTED_SET_CLASS | UNMOD_NAVIGABLE_SET_CLASS
+    )
+}
 
 /// Build an `UnsupportedOperationException` error for a blocked mutator.
 fn unsupported_op() -> MethodCallFailed {
@@ -29762,23 +29773,48 @@ fn unmod_delegate_rewrap_set(
     args: &[Value],
     method: &str,
     descriptor: &str,
+    wrapper_class: &str,
 ) -> MethodCallResult {
     let res = unmod_delegate(ctx, args, method, descriptor)?;
     match res {
         Some(Value::Object(Some(s))) => Ok(Some(Value::Object(Some(alloc_unmod_wrapper(
             ctx,
-            UNMOD_SET_CLASS,
+            wrapper_class,
             s,
         ))))),
         other => Ok(other),
     }
 }
 
+fn unmod_delegate_rewrap_sorted_set(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+    method: &str,
+    descriptor: &str,
+) -> MethodCallResult {
+    unmod_delegate_rewrap_set(ctx, args, method, descriptor, UNMOD_SORTED_SET_CLASS)
+}
+
+fn unmod_delegate_rewrap_navigable_set(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+    method: &str,
+    descriptor: &str,
+) -> MethodCallResult {
+    unmod_delegate_rewrap_set(ctx, args, method, descriptor, UNMOD_NAVIGABLE_SET_CLASS)
+}
+
 fn register_unmodifiable_natives(r: &mut NativeMethodRegistry) {
     let __prev_cat = r.current_category();
     r.set_category(cratonvm_native_api::NativeKind::Bridge);
     // ---- UnmodifiableCollection (also the shared base for List/Set) -------
-    for c in [UNMOD_COLLECTION_CLASS, UNMOD_LIST_CLASS, UNMOD_SET_CLASS] {
+    for c in [
+        UNMOD_COLLECTION_CLASS,
+        UNMOD_LIST_CLASS,
+        UNMOD_SET_CLASS,
+        UNMOD_SORTED_SET_CLASS,
+        UNMOD_NAVIGABLE_SET_CLASS,
+    ] {
         r.register(c, "size", "()I", native_unmod_size);
         r.register(c, "isEmpty", "()Z", native_unmod_is_empty);
         r.register(
@@ -29952,28 +29988,65 @@ fn register_unmodifiable_natives(r: &mut NativeMethodRegistry) {
         }
     }
 
-    // ---- UnmodifiableSet — NavigableSet/SortedSet read-only surface -------
+    // ---- UnmodifiableSortedSet / NavigableSet read-only surfaces ----------
     //
-    // `cratonvm/internal/UnmodifiableSet` also backs `Collections.
-    // unmodifiableSortedSet`/`unmodifiableNavigableSet` (see
-    // `native_collections_unmodifiable_set`), so a wrapped TreeSet navigated
-    // as a NavigableSet needs the same surface `UnmodifiableMap` already gets
-    // for NavigableMap above — e.g. `KnownIndexVersions.<clinit>` calls
-    // `Collections.unmodifiableNavigableSet(new TreeSet<>(...)).tailSet(v,
-    // true)`, which previously raised NoSuchMethodError (no method registered
-    // on the synthetic wrapper class at all) and aborted every caller's
-    // `<clinit>` with ExceptionInInitializerError.
+    // Plain `Collections.unmodifiableSet` must not satisfy `SortedSet`; AssertJ
+    // checks that guard before calling `comparator()`. Sorted/navigable APIs use
+    // distinct stamps so those casts keep working without broadening every
+    // unmodifiable set view.
     {
-        let c = UNMOD_SET_CLASS;
-        r.register(c, "first", "()Ljava/lang/Object;", |ctx, args| {
-            unmod_delegate(ctx, args, "first", "()Ljava/lang/Object;")
-        });
-        r.register(c, "last", "()Ljava/lang/Object;", |ctx, args| {
-            unmod_delegate(ctx, args, "last", "()Ljava/lang/Object;")
-        });
-        r.register(c, "comparator", "()Ljava/util/Comparator;", |ctx, args| {
-            unmod_delegate(ctx, args, "comparator", "()Ljava/util/Comparator;")
-        });
+        for c in [UNMOD_SORTED_SET_CLASS, UNMOD_NAVIGABLE_SET_CLASS] {
+            r.register(c, "first", "()Ljava/lang/Object;", |ctx, args| {
+                unmod_delegate(ctx, args, "first", "()Ljava/lang/Object;")
+            });
+            r.register(c, "last", "()Ljava/lang/Object;", |ctx, args| {
+                unmod_delegate(ctx, args, "last", "()Ljava/lang/Object;")
+            });
+            r.register(c, "comparator", "()Ljava/util/Comparator;", |ctx, args| {
+                unmod_delegate(ctx, args, "comparator", "()Ljava/util/Comparator;")
+            });
+            r.register(
+                c,
+                "headSet",
+                "(Ljava/lang/Object;)Ljava/util/SortedSet;",
+                |ctx, args| {
+                    unmod_delegate_rewrap_sorted_set(
+                        ctx,
+                        args,
+                        "headSet",
+                        "(Ljava/lang/Object;)Ljava/util/SortedSet;",
+                    )
+                },
+            );
+            r.register(
+                c,
+                "tailSet",
+                "(Ljava/lang/Object;)Ljava/util/SortedSet;",
+                |ctx, args| {
+                    unmod_delegate_rewrap_sorted_set(
+                        ctx,
+                        args,
+                        "tailSet",
+                        "(Ljava/lang/Object;)Ljava/util/SortedSet;",
+                    )
+                },
+            );
+            r.register(
+                c,
+                "subSet",
+                "(Ljava/lang/Object;Ljava/lang/Object;)Ljava/util/SortedSet;",
+                |ctx, args| {
+                    unmod_delegate_rewrap_sorted_set(
+                        ctx,
+                        args,
+                        "subSet",
+                        "(Ljava/lang/Object;Ljava/lang/Object;)Ljava/util/SortedSet;",
+                    )
+                },
+            );
+        }
+
+        let c = UNMOD_NAVIGABLE_SET_CLASS;
         for m in ["ceiling", "floor", "higher", "lower"] {
             let desc = "(Ljava/lang/Object;)Ljava/lang/Object;";
             let cb: cratonvm_native_api::NativeCallback = match m {
@@ -29998,56 +30071,18 @@ fn register_unmodifiable_natives(r: &mut NativeMethodRegistry) {
             "()Ljava/util/Iterator;",
             |ctx, args| unmod_delegate(ctx, args, "descendingIterator", "()Ljava/util/Iterator;"),
         );
-        // Mutators — unmodifiable, so throw like the other poll*/mutators above.
         r.register(c, "pollFirst", "()Ljava/lang/Object;", native_unmod_throw);
         r.register(c, "pollLast", "()Ljava/lang/Object;", native_unmod_throw);
-        // Sub-views — re-wrap the backing set's result as unmodifiable too
-        // (mirrors the JDK's UnmodifiableNavigableSet.tailSet/headSet/subSet/
-        // descendingSet, which never leak a mutable view of the backing set).
         r.register(
             c,
             "descendingSet",
             "()Ljava/util/NavigableSet;",
             |ctx, args| {
-                unmod_delegate_rewrap_set(ctx, args, "descendingSet", "()Ljava/util/NavigableSet;")
-            },
-        );
-        r.register(
-            c,
-            "headSet",
-            "(Ljava/lang/Object;)Ljava/util/SortedSet;",
-            |ctx, args| {
-                unmod_delegate_rewrap_set(
+                unmod_delegate_rewrap_navigable_set(
                     ctx,
                     args,
-                    "headSet",
-                    "(Ljava/lang/Object;)Ljava/util/SortedSet;",
-                )
-            },
-        );
-        r.register(
-            c,
-            "tailSet",
-            "(Ljava/lang/Object;)Ljava/util/SortedSet;",
-            |ctx, args| {
-                unmod_delegate_rewrap_set(
-                    ctx,
-                    args,
-                    "tailSet",
-                    "(Ljava/lang/Object;)Ljava/util/SortedSet;",
-                )
-            },
-        );
-        r.register(
-            c,
-            "subSet",
-            "(Ljava/lang/Object;Ljava/lang/Object;)Ljava/util/SortedSet;",
-            |ctx, args| {
-                unmod_delegate_rewrap_set(
-                    ctx,
-                    args,
-                    "subSet",
-                    "(Ljava/lang/Object;Ljava/lang/Object;)Ljava/util/SortedSet;",
+                    "descendingSet",
+                    "()Ljava/util/NavigableSet;",
                 )
             },
         );
@@ -30056,7 +30091,7 @@ fn register_unmodifiable_natives(r: &mut NativeMethodRegistry) {
             "headSet",
             "(Ljava/lang/Object;Z)Ljava/util/NavigableSet;",
             |ctx, args| {
-                unmod_delegate_rewrap_set(
+                unmod_delegate_rewrap_navigable_set(
                     ctx,
                     args,
                     "headSet",
@@ -30069,7 +30104,7 @@ fn register_unmodifiable_natives(r: &mut NativeMethodRegistry) {
             "tailSet",
             "(Ljava/lang/Object;Z)Ljava/util/NavigableSet;",
             |ctx, args| {
-                unmod_delegate_rewrap_set(
+                unmod_delegate_rewrap_navigable_set(
                     ctx,
                     args,
                     "tailSet",
@@ -30082,7 +30117,7 @@ fn register_unmodifiable_natives(r: &mut NativeMethodRegistry) {
             "subSet",
             "(Ljava/lang/Object;ZLjava/lang/Object;Z)Ljava/util/NavigableSet;",
             |ctx, args| {
-                unmod_delegate_rewrap_set(
+                unmod_delegate_rewrap_navigable_set(
                     ctx,
                     args,
                     "subSet",
@@ -31063,7 +31098,7 @@ fn register_collections_extras_natives(r: &mut NativeMethodRegistry) {
         c,
         "unmodifiableSortedSet",
         "(Ljava/util/SortedSet;)Ljava/util/SortedSet;",
-        native_collections_unmodifiable_set,
+        native_collections_unmodifiable_sorted_set,
     );
     r.register(
         c,
@@ -31075,7 +31110,7 @@ fn register_collections_extras_natives(r: &mut NativeMethodRegistry) {
         c,
         "unmodifiableNavigableSet",
         "(Ljava/util/NavigableSet;)Ljava/util/NavigableSet;",
-        native_collections_unmodifiable_set,
+        native_collections_unmodifiable_navigable_set,
     );
     r.register(
         c,
@@ -31350,6 +31385,34 @@ fn native_collections_unmodifiable_set(
     match args.first() {
         Some(Value::Object(Some(src))) => {
             let w = alloc_unmod_wrapper(ctx, UNMOD_SET_CLASS, *src);
+            Ok(Some(Value::Object(Some(w))))
+        }
+        _ => Ok(Some(Value::Object(None))),
+    }
+}
+
+/// `Collections.unmodifiableSortedSet` — wrap as a read-only SortedSet view.
+fn native_collections_unmodifiable_sorted_set(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    match args.first() {
+        Some(Value::Object(Some(src))) => {
+            let w = alloc_unmod_wrapper(ctx, UNMOD_SORTED_SET_CLASS, *src);
+            Ok(Some(Value::Object(Some(w))))
+        }
+        _ => Ok(Some(Value::Object(None))),
+    }
+}
+
+/// `Collections.unmodifiableNavigableSet` — wrap as a read-only NavigableSet view.
+fn native_collections_unmodifiable_navigable_set(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    match args.first() {
+        Some(Value::Object(Some(src))) => {
+            let w = alloc_unmod_wrapper(ctx, UNMOD_NAVIGABLE_SET_CLASS, *src);
             Ok(Some(Value::Object(Some(w))))
         }
         _ => Ok(Some(Value::Object(None))),

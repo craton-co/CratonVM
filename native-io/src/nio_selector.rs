@@ -3006,82 +3006,77 @@ fn netty_unix_socket_false_native(
     Ok(Some(Value::Int(0)))
 }
 
-fn netty_epoll_in_const() -> i32 {
-    #[cfg(target_os = "linux")]
-    {
-        libc::EPOLLIN
-    }
-    #[cfg(not(target_os = "linux"))]
-    {
-        0x001
-    }
+#[cfg(target_os = "linux")]
+fn epollin_const() -> i32 {
+    libc::EPOLLIN
 }
 
-fn netty_epoll_out_const() -> i32 {
-    #[cfg(target_os = "linux")]
-    {
-        libc::EPOLLOUT
-    }
-    #[cfg(not(target_os = "linux"))]
-    {
-        0x004
-    }
+#[cfg(not(target_os = "linux"))]
+fn epollin_const() -> i32 {
+    0x001
 }
 
-fn netty_epoll_rdhup_const() -> i32 {
-    #[cfg(target_os = "linux")]
-    {
-        libc::EPOLLRDHUP
-    }
-    #[cfg(not(target_os = "linux"))]
-    {
-        0x2000
-    }
+#[cfg(target_os = "linux")]
+fn epollout_const() -> i32 {
+    libc::EPOLLOUT
 }
 
-fn netty_epoll_et_const() -> i32 {
-    #[cfg(target_os = "linux")]
-    {
-        libc::EPOLLET
-    }
-    #[cfg(not(target_os = "linux"))]
-    {
-        i32::MIN
-    }
+#[cfg(not(target_os = "linux"))]
+fn epollout_const() -> i32 {
+    0x004
 }
 
-fn netty_epoll_err_const() -> i32 {
-    #[cfg(target_os = "linux")]
-    {
-        libc::EPOLLERR
-    }
-    #[cfg(not(target_os = "linux"))]
-    {
-        0x008
-    }
+#[cfg(target_os = "linux")]
+fn epollrdhup_const() -> i32 {
+    libc::EPOLLRDHUP
+}
+
+#[cfg(not(target_os = "linux"))]
+fn epollrdhup_const() -> i32 {
+    0x2000
+}
+
+#[cfg(target_os = "linux")]
+fn epollet_const() -> i32 {
+    libc::EPOLLET
+}
+
+#[cfg(not(target_os = "linux"))]
+fn epollet_const() -> i32 {
+    0x8000_0000u32 as i32
+}
+
+#[cfg(target_os = "linux")]
+fn epollerr_const() -> i32 {
+    libc::EPOLLERR
+}
+
+#[cfg(not(target_os = "linux"))]
+fn epollerr_const() -> i32 {
+    0x008
 }
 
 fn netty_epoll_const_epollin(_ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
-    Ok(Some(Value::Int(netty_epoll_in_const())))
+    Ok(Some(Value::Int(epollin_const())))
 }
 
 fn netty_epoll_const_epollout(_ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
-    Ok(Some(Value::Int(netty_epoll_out_const())))
+    Ok(Some(Value::Int(epollout_const())))
 }
 
 fn netty_epoll_const_epollrdhup(
     _ctx: &mut dyn NativeContext,
     _args: &[Value],
 ) -> MethodCallResult {
-    Ok(Some(Value::Int(netty_epoll_rdhup_const())))
+    Ok(Some(Value::Int(epollrdhup_const())))
 }
 
 fn netty_epoll_const_epollet(_ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
-    Ok(Some(Value::Int(netty_epoll_et_const())))
+    Ok(Some(Value::Int(epollet_const())))
 }
 
 fn netty_epoll_const_epollerr(_ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
-    Ok(Some(Value::Int(netty_epoll_err_const())))
+    Ok(Some(Value::Int(epollerr_const())))
 }
 
 fn netty_epoll_kernel_version(ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {

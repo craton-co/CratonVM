@@ -156,7 +156,7 @@ impl SharedSecretsInterface {
             Self::JavaIORandomAccessFile => "cratonvm/internal/ss/JavaIORandomAccessFileAccess$1",
             Self::JavaNetInetAddress => "java/net/InetAddress$1",
             Self::JavaNetUri => "cratonvm/internal/ss/JavaNetUriAccess$1",
-            Self::JavaNio => "java/nio/Buffer$1",
+            Self::JavaNio => "java/nio/Buffer$2",
             Self::JavaSecurity => "java/security/AccessController$1",
             Self::JavaUtilJar => "cratonvm/internal/ss/JavaUtilJarAccess$1",
             Self::JavaUtilZipFile => "java/util/zip/ZipFile$1",
@@ -334,5 +334,17 @@ mod tests {
     fn all_contains_exactly_fifteen_entries() {
         assert_eq!(SharedSecretsInterface::all().len(), 15);
         assert_eq!(SHARED_SECRETS_OWNERS.len(), 15);
+    }
+
+    #[test]
+    fn java_nio_owner_is_access_impl_not_formatter() {
+        // JDK 25's `java.nio.Buffer$1` is the IOOBE formatter Function.
+        // `JavaNioAccess` is implemented by `Buffer$2`; using the formatter as
+        // the SharedSecrets singleton makes calls such as scaleShifts(Buffer)
+        // dispatch to the wrong receiver class.
+        assert_eq!(
+            SharedSecretsInterface::JavaNio.owner_class(),
+            "java/nio/Buffer$2"
+        );
     }
 }

@@ -64,6 +64,17 @@ fn debug_log_thread_mirror_identity(shared: &SharedVm, thread_id: u64, obj: Obje
     }
 }
 
+fn thread_start_handoff_grace() -> std::time::Duration {
+    static GRACE: std::sync::OnceLock<std::time::Duration> = std::sync::OnceLock::new();
+    *GRACE.get_or_init(|| {
+        let millis = std::env::var("CRATONVM_THREAD_START_GRACE_MS")
+            .ok()
+            .and_then(|s| s.parse::<u64>().ok())
+            .unwrap_or(80);
+        std::time::Duration::from_millis(millis)
+    })
+}
+
 // ---------------------------------------------------------------------------
 // CP-resolved-interface plumbing for the default-method rescue
 // ---------------------------------------------------------------------------
@@ -1602,6 +1613,51 @@ impl<'a> NativeContextImpl<'a> {
             // back to the safe default (non-daemon).
             _ => None,
         }
+    }
+
+    pub(crate) fn read_thread_task_object(&self, thread_obj: ObjectRef) -> Option<ObjectRef> {
+        let header = self.shared.heap.get_header(thread_obj);
+        let cm = self.shared.class_manager.read();
+        if let Some(holder_slot) =
+            resolve_field_index_in_hierarchy(header.class_id, "holder", &cm.class_store)
+        {
+            if let Value::Object(Some(holder_obj)) =
+                self.shared.heap.get_field(thread_obj, holder_slot)
+            {
+                let holder_header = self.shared.heap.get_header(holder_obj);
+                if let Some(task_slot) = resolve_field_index_in_hierarchy(
+                    holder_header.class_id,
+                    "task",
+                    &cm.class_store,
+                ) {
+                    if let Value::Object(Some(task)) =
+                        self.shared.heap.get_field(holder_obj, task_slot)
+                    {
+                        return Some(task);
+                    }
+                }
+            }
+        }
+        if header.num_slots > 3 {
+            if let Value::Object(Some(task)) = self.shared.heap.get_field(thread_obj, 3) {
+                return Some(task);
+            }
+        }
+        None
+    }
+
+    pub(crate) fn is_thread_pool_executor_worker_thread(&self, thread_obj: ObjectRef) -> bool {
+        let Some(task) = self.read_thread_task_object(thread_obj) else {
+            return false;
+        };
+        let task_cid = self.shared.heap.class_id_of(task);
+        self.shared
+            .class_manager
+            .read()
+            .class_store
+            .get(task_cid)
+            .map(|c| &*c.name == "java/util/concurrent/ThreadPoolExecutor$Worker")
+            .unwrap_or(false)
     }
 
     /// Build a `java.lang.Thread$FieldHolder` populated with sensible
@@ -3945,6 +4001,7 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
                 .unwrap_or(false)
         };
         let is_virtual = is_virtual_synthetic || is_virtual_real_jdk;
+        let is_executor_worker = self.is_thread_pool_executor_worker_thread(thread_obj);
 
         // T19.K1 вЂ” read the Java-side daemon flag so the registry can
         // tell `wait_for_non_daemon_threads()` whether the process must
@@ -3955,8 +4012,11 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
         // `java.lang.Thread$FieldHolder`). Virtual threads (JEP 444)
         // are always daemon per the spec вЂ” we set that unconditionally
         // so a buggy `BoundVirtualThread` constructor can't keep the VM
-        // alive past `main()`.
-        let is_daemon = if is_virtual {
+        // alive past `main()`. Registry-daemonize real ThreadPoolExecutor
+        // workers too: Spring's contexts have already closed by main return,
+        // but CratonVM's ExecutorService.shutdown shim can leave idle workers
+        // parked in getTask()->take(), which should not hold the suite process.
+        let is_daemon = if is_virtual || is_executor_worker {
             true
         } else {
             self.read_thread_daemon_flag(thread_obj).unwrap_or(false)
@@ -4315,6 +4375,22 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
         .expect("failed to spawn child Java thread (OS refused; check ulimit / thread count)");
 
         self.shared.thread_registry.set_join_handle(tid, handle);
+        if !is_executor_worker {
+            // Give newly-started plain Java workers a short handoff window before
+            // the parent immediately closes an async context or enters a tight
+            // timed wait. Spring's @Async tests expose this under OSR: diagnostic
+            // ring recording or the watchdog thread adds enough pacing; without
+            // it, a Mockito-backed SimpleAsyncTaskExecutor worker can be starved
+            // long enough to hang class execution. Do not apply this to real
+            // ThreadPoolExecutor workers: CompletableFuture concurrency-limit
+            // tests depend on their first tasks entering within a 10 ms window.
+            let grace = thread_start_handoff_grace();
+            if grace.is_zero() {
+                std::thread::yield_now();
+            } else {
+                std::thread::sleep(grace);
+            }
+        }
         Ok(None)
     }
 
@@ -11555,6 +11631,17 @@ fn invoke_on_class_shared_inner(
                         || (class_name == "java/util/concurrent/LinkedBlockingQueue"
                             && method_name == "clear"
                             && descriptor == "()V")
+                        // Spring Reactor StepVerifier uses timed
+                        // CountDownLatch.await during cancel/timeout tests. The
+                        // real JDK latch parks through AQS/Unsafe machinery; the
+                        // registered native stores count in a synthetic holder
+                        // and waits on the object monitor. Keep this slow-path
+                        // gate in sync with force_native_over_real_jdk_bytecode.
+                        || crate::runtime::interpreter::is_count_down_latch_native_override(
+                            class_name,
+                            method_name,
+                            descriptor,
+                        )
                         // Logback / Spring: `new SimpleDateFormat(pattern)` on real-JDK
                         // `java.text` classes can hit NSME during early bootstrap.
                         || (class_name == "java/text/SimpleDateFormat"
