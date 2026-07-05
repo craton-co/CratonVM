@@ -279,6 +279,21 @@ fn native_fd_close0(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRe
 /// closing. Used by the JDK's `AbstractInterruptibleChannel` to
 /// interrupt a blocking read. Noop here since our reads are blocking
 /// but synchronous.
+fn native_file_cleanable_cleanup_close0(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    let fd = int_arg(args, 0);
+    if fd > 2 {
+        let _ = ctx.fd_table().close(fd as FdId);
+    }
+    let handle = long_arg(args, 1);
+    if handle > 2 && handle < u32::MAX as i64 && handle as i32 != fd {
+        let _ = ctx.fd_table().close(handle as FdId);
+    }
+    Ok(None)
+}
+
 fn native_fd_preclose0(_ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
     Ok(None)
 }
@@ -940,6 +955,13 @@ pub fn register_nio_natives_real(r: &mut NativeMethodRegistry) {
             native_fc_allocation_granularity0,
         );
     }
+
+    r.register(
+        "java/io/FileCleanable",
+        "cleanupClose0",
+        "(IJ)V",
+        native_file_cleanable_cleanup_close0,
+    );
 
     // --- FileChannelImpl (legacy names for older JDKs that carried the
     // natives directly on this class). The map0 / unmap0 / transferTo0 /

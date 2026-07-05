@@ -589,6 +589,62 @@ fn should_skip_jit_internal(
             return Some(SkipReason::RustJvmTestFixture);
         }
 
+        // LUCENE-POSTINGS.1 (2026-07-05) — fail-closed JIT bans for the Lucene
+        // postings validation path used by Elasticsearch's ES812 postings-format
+        // focused repro (`B17AC9D3E1F2A0C4`,
+        // `testDocsAndFreqsAndPositionsAndPayloads`). With normal JIT the worker
+        // threads throw AIOOBE with byte-swapped-looking postings indices and can
+        // later SIGSEGV from poisoned state. The same binary with
+        // `CRATONVM_DISABLE_JIT=1` passes the method in ~64s; focused
+        // MMapDirectory scalar/bulk/random-access probes match HotSpot, so this
+        // is a JIT execution bug above the FFM read primitives.
+        //
+        // Bisection evidence:
+        // - `CRATONVM_JIT_BISECT_ONLY=org/apache/lucene/codecs/` passes in
+        //   isolation, but with Lucene index and ES postings packages skipped
+        //   the remaining compiled hot path is still codecs-side
+        //   `Impact.toString`, so keep codecs interpreted as part of this
+        //   fail-closed postings cluster.
+        // - `CRATONVM_JIT_BISECT_ONLY=org/apache/lucene/index/` reproduces the
+        //   crash, dominated by `SlowImpactsEnum.nextDoc/freq`.
+        // - Skipping only `SlowImpactsEnum.nextDoc/freq` exposes corrupted
+        //   receiver state (`PForUtil` where a postings enum receiver is
+        //   expected), so the producer is broader than those leaf methods.
+        //
+        // Later JIT-entry summaries with index/codecs/postings already skipped
+        // showed remaining compiled Lucene store/util/backward-codecs methods
+        // (`IndexInput.toString`, `BytesRef.compareTo`, `DataInput.readVInt`,
+        // block-tree frame helpers) before the same postings corruption. The
+        // exact producer is still unresolved, so keep all Lucene bytecode
+        // interpreted for correctness. This is broad but bounded to Lucene and
+        // the focused repro still completes comfortably under the 300s suite
+        // timeout. Liftable via `CRATONVM_JIT_ALLOW_PACKAGES=org/apache/lucene/`.
+        if class_name.starts_with("org/apache/lucene/")
+            && !package_allowed("org/apache/lucene/", allow_packages)
+        {
+            return Some(SkipReason::RustJvmTestFixture);
+        }
+        if class_name.starts_with("com/carrotsearch/randomizedtesting/")
+            && !package_allowed("com/carrotsearch/randomizedtesting/", allow_packages)
+        {
+            return Some(SkipReason::RustJvmTestFixture);
+        }
+
+        if class_name.starts_with("org/apache/logging/log4j/")
+            && !package_allowed("org/apache/logging/log4j/", allow_packages)
+        {
+            return Some(SkipReason::RustJvmTestFixture);
+        }
+
+        if class_name.starts_with("org/junit/") && !package_allowed("org/junit/", allow_packages)
+        {
+            return Some(SkipReason::RustJvmTestFixture);
+        }
+
+        if class_name.starts_with("junit/") && !package_allowed("junit/", allow_packages) {
+            return Some(SkipReason::RustJvmTestFixture);
+        }
+
         // SPB.1 (Session 112) — provisional blanket ban for the Spring
         // Framework `org/springframework/util/` package. `ClassUtils.
         // <clinit>` runs `registerCommonClasses(...)` ~10 times for

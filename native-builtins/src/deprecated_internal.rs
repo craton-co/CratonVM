@@ -884,6 +884,12 @@ fn register_reflection_natives(r: &mut NativeMethodRegistry) {
         "(Ljava/lang/Class;)I",
         |_ctx, _args| Ok(Some(Value::Int(0x0001))),
     );
+    r.register(
+        refl2,
+        "ensureNativeAccess",
+        "(Ljava/lang/Class;Ljava/lang/Class;Ljava/lang/String;Z)V",
+        |_ctx, _args| Ok(None),
+    );
 
     // ClassLoader.registerAsParallelCapable()Z — called from every
     // ClassLoader subclass's <clinit>.  The JDK implementation walks the

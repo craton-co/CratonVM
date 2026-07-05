@@ -19009,6 +19009,9 @@ const VH_FIELD_INDEX: usize = 1;
 const VH_IS_STATIC: usize = 2;
 const VH_NUM_FIELDS: usize = 3;
 const VH_KIND_ARRAY: i32 = 2;
+const VH_KIND_MEMORY_SEGMENT: i32 = 3;
+const VH_KIND_BYTE_ARRAY_VIEW_LE: i32 = 4;
+const VH_KIND_BYTE_ARRAY_VIEW_BE: i32 = 5;
 
 /// Resolve the field index for a named field in a class (instance fields only).
 /// Walks the inheritance chain. Returns `None` if not found.
@@ -19177,6 +19180,268 @@ fn vh_array_set(ctx: &mut dyn NativeContext, args: &[Value], value_arg_index: us
     }
 }
 
+
+fn vh_byte_array_view_width(elem: u8) -> usize {
+    match elem {
+        b'J' | b'D' => 8,
+        b'I' | b'F' => 4,
+        b'S' | b'C' => 2,
+        _ => 1,
+    }
+}
+
+fn vh_byte_array_view_elem_from_mirror(ctx: &dyn NativeContext, arg: Option<&Value>) -> u8 {
+    let Some(Value::Object(Some(mirror))) = arg else {
+        return b'J';
+    };
+    let name = crate::lang_class::mirror_class_name(ctx, *mirror).unwrap_or_default();
+    if let Some(desc) = name.strip_prefix('[') {
+        return desc.as_bytes().first().copied().unwrap_or(b'J');
+    }
+    match name.as_str() {
+        "long" | "java/lang/Long" => b'J',
+        "int" | "java/lang/Integer" => b'I',
+        "short" | "java/lang/Short" => b'S',
+        "char" | "java/lang/Character" => b'C',
+        "float" | "java/lang/Float" => b'F',
+        "double" | "java/lang/Double" => b'D',
+        "byte" | "java/lang/Byte" => b'B',
+        _ => b'J',
+    }
+}
+
+fn vh_byte_order_is_little(ctx: &dyn NativeContext, arg: Option<&Value>) -> bool {
+    let Some(Value::Object(Some(order))) = arg else {
+        return true;
+    };
+    if let Value::Object(Some(name_obj)) = ctx.get_field_by_name(*order, "name") {
+        if let Some(name) = ctx.read_string(name_obj) {
+            if name.contains("LITTLE") {
+                return true;
+            }
+            if name.contains("BIG") {
+                return false;
+            }
+        }
+    }
+    ctx.get_field(*order, 0).as_int().map(|v| v != 0).unwrap_or(true)
+}
+
+fn vh_byte_array_view_target(args: &[Value]) -> Option<(ObjectRef, usize)> {
+    let arr = match args.get(1) {
+        Some(Value::Object(Some(a))) => *a,
+        _ => return None,
+    };
+    let idx = match args.get(2) {
+        Some(Value::Int(i)) if *i >= 0 => *i as usize,
+        Some(Value::Long(i)) if *i >= 0 => *i as usize,
+        _ => return None,
+    };
+    Some((arr, idx))
+}
+
+fn vh_byte_array_view_meta(ctx: &dyn NativeContext, vh: ObjectRef) -> (u8, bool) {
+    let elem = ctx
+        .get_field(vh, VH_CLASS_OR_TARGET)
+        .as_int()
+        .map(|v| v as u8)
+        .unwrap_or(b'J');
+    let le = vh_kind(ctx, vh) != VH_KIND_BYTE_ARRAY_VIEW_BE;
+    (elem, le)
+}
+
+fn vh_byte_array_view_get(ctx: &dyn NativeContext, vh: ObjectRef, args: &[Value]) -> Value {
+    let Some((arr, idx)) = vh_byte_array_view_target(args) else {
+        return Value::Object(None);
+    };
+    let (elem, le) = vh_byte_array_view_meta(ctx, vh);
+    let width = vh_byte_array_view_width(elem);
+    let mut raw = 0u64;
+    for i in 0..width {
+        let b = ctx.get_array_element(arr, idx + i).as_int().unwrap_or(0) as u8 as u64;
+        if le {
+            raw |= b << (8 * i);
+        } else {
+            raw = (raw << 8) | b;
+        }
+    }
+    match elem {
+        b'J' => Value::Long(raw as i64),
+        b'D' => Value::Double(f64::from_bits(raw)),
+        b'I' => Value::Int(raw as u32 as i32),
+        b'F' => Value::Float(f32::from_bits(raw as u32)),
+        b'S' => Value::Int(raw as u16 as i16 as i32),
+        b'C' => Value::Int(raw as u16 as i32),
+        _ => Value::Int(raw as u8 as i8 as i32),
+    }
+}
+
+fn vh_byte_array_view_set(
+    ctx: &mut dyn NativeContext,
+    vh: ObjectRef,
+    args: &[Value],
+    value_arg_index: usize,
+) {
+    let Some((arr, idx)) = vh_byte_array_view_target(args) else {
+        return;
+    };
+    let (elem, le) = vh_byte_array_view_meta(ctx, vh);
+    let width = vh_byte_array_view_width(elem);
+    let value = args.get(value_arg_index).copied().unwrap_or(Value::Int(0));
+    let raw = match value {
+        Value::Long(v) => v as u64,
+        Value::Double(v) => v.to_bits(),
+        Value::Int(v) => v as u32 as u64,
+        Value::Float(v) => v.to_bits() as u64,
+        _ => 0,
+    };
+    for i in 0..width {
+        let shift = if le { 8 * i } else { 8 * (width - 1 - i) };
+        let b = ((raw >> shift) & 0xff) as u8 as i8 as i32;
+        ctx.set_array_element(arr, idx + i, Value::Int(b));
+    }
+}
+
+fn vh_memory_segment_target(
+    ctx: &dyn NativeContext,
+    args: &[Value],
+) -> Option<(i64, i64, i64, i64)> {
+    let seg = match args.get(1) {
+        Some(Value::Object(Some(seg))) => *seg,
+        _ => return None,
+    };
+    if ctx.object_num_fields(seg) < 6 {
+        return None;
+    }
+    let offset = match args.get(2) {
+        Some(Value::Long(v)) => *v,
+        Some(Value::Int(v)) => *v as i64,
+        _ => 0,
+    };
+    let ptr = match ctx.get_field(seg, 0) {
+        Value::Long(v) => v,
+        _ => return None,
+    };
+    let size = match ctx.get_field(seg, 1) {
+        Value::Long(v) => v,
+        _ => return None,
+    };
+    let base_offset = match ctx.get_field(seg, 5) {
+        Value::Long(v) => v,
+        _ => 0,
+    };
+    Some((ptr, size, base_offset, offset))
+}
+
+fn vh_memory_segment_get(ctx: &dyn NativeContext, vh: ObjectRef, args: &[Value]) -> Value {
+    let width = ctx
+        .get_field(vh, VH_FIELD_INDEX)
+        .as_int()
+        .unwrap_or(1)
+        .clamp(1, 8) as i64;
+    let little_endian = ctx
+        .get_field(vh, VH_CLASS_OR_TARGET)
+        .as_int()
+        .map(|v| v != 0)
+        .unwrap_or(false);
+    let Some((ptr, size, base_offset, offset)) = vh_memory_segment_target(ctx, args) else {
+        return Value::Int(0);
+    };
+    if ptr == 0 || offset < 0 || offset.saturating_add(width) > size {
+        return Value::Int(0);
+    }
+    let absolute_offset = base_offset.saturating_add(offset);
+    let addr = (ptr as usize).wrapping_add(absolute_offset as usize) as *const u8;
+    unsafe {
+        match width {
+            1 => Value::Int(*(addr as *const i8) as i32),
+            2 => {
+                let bytes = [*addr, *addr.add(1)];
+                let v = if little_endian {
+                    i16::from_le_bytes(bytes)
+                } else {
+                    i16::from_be_bytes(bytes)
+                };
+                Value::Int(v as i32)
+            }
+            4 => {
+                let bytes = [*addr, *addr.add(1), *addr.add(2), *addr.add(3)];
+                let v = if little_endian {
+                    i32::from_le_bytes(bytes)
+                } else {
+                    i32::from_be_bytes(bytes)
+                };
+                Value::Int(v)
+            }
+            8 => {
+                let bytes = [
+                    *addr,
+                    *addr.add(1),
+                    *addr.add(2),
+                    *addr.add(3),
+                    *addr.add(4),
+                    *addr.add(5),
+                    *addr.add(6),
+                    *addr.add(7),
+                ];
+                let v = if little_endian {
+                    i64::from_le_bytes(bytes)
+                } else {
+                    i64::from_be_bytes(bytes)
+                };
+                Value::Long(v)
+            }
+            _ => Value::Int(0),
+        }
+    }
+}
+
+fn vh_memory_segment_set(ctx: &dyn NativeContext, vh: ObjectRef, args: &[Value]) {
+    let width = ctx
+        .get_field(vh, VH_FIELD_INDEX)
+        .as_int()
+        .unwrap_or(1)
+        .clamp(1, 8) as i64;
+    let little_endian = ctx
+        .get_field(vh, VH_CLASS_OR_TARGET)
+        .as_int()
+        .map(|v| v != 0)
+        .unwrap_or(false);
+    let Some((ptr, size, base_offset, offset)) = vh_memory_segment_target(ctx, args) else {
+        return;
+    };
+    if ptr == 0 || offset < 0 || offset.saturating_add(width) > size {
+        return;
+    }
+    let value = args.get(3).copied().unwrap_or(Value::Int(0));
+    let absolute_offset = base_offset.saturating_add(offset);
+    let addr = (ptr as usize).wrapping_add(absolute_offset as usize) as *mut u8;
+    unsafe {
+        match (width, value) {
+            (1, Value::Int(v)) => {
+                *addr = v as u8;
+            }
+            (2, Value::Int(v)) => {
+                let bytes = if little_endian {
+                    (v as i16).to_le_bytes()
+                } else {
+                    (v as i16).to_be_bytes()
+                };
+                addr.copy_from_nonoverlapping(bytes.as_ptr(), 2);
+            }
+            (4, Value::Int(v)) => {
+                let bytes = if little_endian { v.to_le_bytes() } else { v.to_be_bytes() };
+                addr.copy_from_nonoverlapping(bytes.as_ptr(), 4);
+            }
+            (8, Value::Long(v)) => {
+                let bytes = if little_endian { v.to_le_bytes() } else { v.to_be_bytes() };
+                addr.copy_from_nonoverlapping(bytes.as_ptr(), 8);
+            }
+            _ => {}
+        }
+    }
+}
+
 /// Auto-box a primitive Value into its wrapper object for signature-polymorphic
 /// VarHandle returns. When the call-site expects Ljava/lang/Object;, primitives
 /// must be wrapped (e.g. Int(42) → Integer object with field 0 = Int(42)).
@@ -19217,6 +19482,15 @@ pub(crate) fn register_p59_varhandle(r: &mut NativeMethodRegistry) {
         if ctx.object_num_fields(this) < VH_NUM_FIELDS {
             return Ok(Some(ctx.get_array_element(this, 0)));
         }
+        if vh_kind(ctx, this) == VH_KIND_MEMORY_SEGMENT {
+            return Ok(Some(vh_memory_segment_get(ctx, this, args)));
+        }
+        if matches!(
+            vh_kind(ctx, this),
+            VH_KIND_BYTE_ARRAY_VIEW_LE | VH_KIND_BYTE_ARRAY_VIEW_BE
+        ) {
+            return Ok(Some(vh_byte_array_view_get(ctx, this, args)));
+        }
         if vh_kind(ctx, this) == VH_KIND_ARRAY {
             return Ok(Some(vh_array_get(ctx, args)));
         }
@@ -19238,6 +19512,17 @@ pub(crate) fn register_p59_varhandle(r: &mut NativeMethodRegistry) {
         let this = obj_arg(args, 0)?;
         if ctx.object_num_fields(this) < VH_NUM_FIELDS {
             return Ok(Some(ctx.get_array_element(this, 0)));
+        }
+        if vh_kind(ctx, this) == VH_KIND_MEMORY_SEGMENT {
+            fence(Ordering::SeqCst);
+            return Ok(Some(vh_memory_segment_get(ctx, this, args)));
+        }
+        if matches!(
+            vh_kind(ctx, this),
+            VH_KIND_BYTE_ARRAY_VIEW_LE | VH_KIND_BYTE_ARRAY_VIEW_BE
+        ) {
+            fence(Ordering::SeqCst);
+            return Ok(Some(vh_byte_array_view_get(ctx, this, args)));
         }
         if vh_kind(ctx, this) == VH_KIND_ARRAY {
             fence(Ordering::SeqCst);
@@ -19262,6 +19547,19 @@ pub(crate) fn register_p59_varhandle(r: &mut NativeMethodRegistry) {
         let this = obj_arg(args, 0)?;
         if ctx.object_num_fields(this) < VH_NUM_FIELDS {
             return Ok(Some(ctx.get_array_element(this, 0)));
+        }
+        if vh_kind(ctx, this) == VH_KIND_MEMORY_SEGMENT {
+            let v = vh_memory_segment_get(ctx, this, args);
+            fence(Ordering::Acquire);
+            return Ok(Some(v));
+        }
+        if matches!(
+            vh_kind(ctx, this),
+            VH_KIND_BYTE_ARRAY_VIEW_LE | VH_KIND_BYTE_ARRAY_VIEW_BE
+        ) {
+            let v = vh_byte_array_view_get(ctx, this, args);
+            fence(Ordering::Acquire);
+            return Ok(Some(v));
         }
         if vh_kind(ctx, this) == VH_KIND_ARRAY {
             let v = vh_array_get(ctx, args);
@@ -19321,6 +19619,17 @@ pub(crate) fn register_p59_varhandle(r: &mut NativeMethodRegistry) {
             ctx.set_array_element(this, 0, val);
             return Ok(None);
         }
+        if vh_kind(ctx, this) == VH_KIND_MEMORY_SEGMENT {
+            vh_memory_segment_set(ctx, this, args);
+            return Ok(None);
+        }
+        if matches!(
+            vh_kind(ctx, this),
+            VH_KIND_BYTE_ARRAY_VIEW_LE | VH_KIND_BYTE_ARRAY_VIEW_BE
+        ) {
+            vh_byte_array_view_set(ctx, this, args, 3);
+            return Ok(None);
+        }
         if vh_kind(ctx, this) == VH_KIND_ARRAY {
             vh_array_set(ctx, args, 3);
             return Ok(None);
@@ -19345,6 +19654,19 @@ pub(crate) fn register_p59_varhandle(r: &mut NativeMethodRegistry) {
         if ctx.object_num_fields(this) < VH_NUM_FIELDS {
             let val = args.get(1).copied().unwrap_or(Value::Object(None));
             ctx.set_array_element(this, 0, val);
+            return Ok(None);
+        }
+        if vh_kind(ctx, this) == VH_KIND_MEMORY_SEGMENT {
+            vh_memory_segment_set(ctx, this, args);
+            fence(Ordering::SeqCst);
+            return Ok(None);
+        }
+        if matches!(
+            vh_kind(ctx, this),
+            VH_KIND_BYTE_ARRAY_VIEW_LE | VH_KIND_BYTE_ARRAY_VIEW_BE
+        ) {
+            vh_byte_array_view_set(ctx, this, args, 3);
+            fence(Ordering::SeqCst);
             return Ok(None);
         }
         if vh_kind(ctx, this) == VH_KIND_ARRAY {
@@ -19373,6 +19695,19 @@ pub(crate) fn register_p59_varhandle(r: &mut NativeMethodRegistry) {
         if ctx.object_num_fields(this) < VH_NUM_FIELDS {
             let val = args.get(1).copied().unwrap_or(Value::Object(None));
             ctx.set_array_element(this, 0, val);
+            return Ok(None);
+        }
+        if vh_kind(ctx, this) == VH_KIND_MEMORY_SEGMENT {
+            fence(Ordering::Release);
+            vh_memory_segment_set(ctx, this, args);
+            return Ok(None);
+        }
+        if matches!(
+            vh_kind(ctx, this),
+            VH_KIND_BYTE_ARRAY_VIEW_LE | VH_KIND_BYTE_ARRAY_VIEW_BE
+        ) {
+            fence(Ordering::Release);
+            vh_byte_array_view_set(ctx, this, args, 3);
             return Ok(None);
         }
         if vh_kind(ctx, this) == VH_KIND_ARRAY {
@@ -19423,6 +19758,23 @@ pub(crate) fn register_p59_varhandle(r: &mut NativeMethodRegistry) {
             let success = values_equal(&current, &expected);
             if success {
                 ctx.set_array_element(this, 0, new_val);
+            }
+            return Ok(Some(Value::Int(if success { 1 } else { 0 })));
+        }
+        if matches!(
+            vh_kind(ctx, this),
+            VH_KIND_BYTE_ARRAY_VIEW_LE | VH_KIND_BYTE_ARRAY_VIEW_BE
+        ) {
+            let current = vh_byte_array_view_get(ctx, this, args);
+            let expected = args.get(3).copied().unwrap_or(Value::Object(None));
+            let new_val = args.get(4).copied().unwrap_or(Value::Object(None));
+            let success = values_equal(&current, &expected);
+            if success {
+                let mut set_args = args.to_vec();
+                if set_args.len() > 3 {
+                    set_args[3] = new_val;
+                }
+                vh_byte_array_view_set(ctx, this, &set_args, 3);
             }
             return Ok(Some(Value::Int(if success { 1 } else { 0 })));
         }
@@ -19504,6 +19856,22 @@ pub(crate) fn register_p59_varhandle(r: &mut NativeMethodRegistry) {
             }
             return Ok(Some(current));
         }
+        if matches!(
+            vh_kind(ctx, this),
+            VH_KIND_BYTE_ARRAY_VIEW_LE | VH_KIND_BYTE_ARRAY_VIEW_BE
+        ) {
+            let current = vh_byte_array_view_get(ctx, this, args);
+            let expected = args.get(3).copied().unwrap_or(Value::Object(None));
+            let new_val = args.get(4).copied().unwrap_or(Value::Object(None));
+            if values_equal(&current, &expected) {
+                let mut set_args = args.to_vec();
+                if set_args.len() > 3 {
+                    set_args[3] = new_val;
+                }
+                vh_byte_array_view_set(ctx, this, &set_args, 3);
+            }
+            return Ok(Some(current));
+        }
         if vh_kind(ctx, this) == VH_KIND_ARRAY {
             let (arr, idx) = match vh_array_target(args) {
                 Some(p) => p,
@@ -19563,6 +19931,14 @@ pub(crate) fn register_p59_varhandle(r: &mut NativeMethodRegistry) {
     // getAndSet — atomically swap, return old value
     let vh_get_and_set_impl = |ctx: &mut dyn NativeContext, args: &[Value]| -> MethodCallResult {
         let this = obj_arg(args, 0)?;
+        if matches!(
+            vh_kind(ctx, this),
+            VH_KIND_BYTE_ARRAY_VIEW_LE | VH_KIND_BYTE_ARRAY_VIEW_BE
+        ) {
+            let old = vh_byte_array_view_get(ctx, this, args);
+            vh_byte_array_view_set(ctx, this, args, 3);
+            return Ok(Some(old));
+        }
         if vh_kind(ctx, this) == VH_KIND_ARRAY {
             let (arr, idx) = match vh_array_target(args) {
                 Some(p) => p,
@@ -19703,6 +20079,33 @@ pub(crate) fn register_p59_varhandle(r: &mut NativeMethodRegistry) {
             Ok(Some(Value::Object(Some(vh_obj))))
         },
     );
+    r.register(
+        mhs,
+        "byteArrayViewVarHandle",
+        "(Ljava/lang/Class;Ljava/nio/ByteOrder;)Ljava/lang/invoke/VarHandle;",
+        |ctx, args| {
+            let elem = vh_byte_array_view_elem_from_mirror(ctx, args.get(0));
+            let le = vh_byte_order_is_little(ctx, args.get(1));
+            let vh_obj =
+                alloc_concurrent_synthetic(ctx, "java/lang/invoke/VarHandle", VH_NUM_FIELDS);
+            ctx.set_field(vh_obj, VH_CLASS_OR_TARGET, Value::Int(elem as i32));
+            ctx.set_field(
+                vh_obj,
+                VH_FIELD_INDEX,
+                Value::Int(vh_byte_array_view_width(elem) as i32),
+            );
+            ctx.set_field(
+                vh_obj,
+                VH_IS_STATIC,
+                Value::Int(if le {
+                    VH_KIND_BYTE_ARRAY_VIEW_LE
+                } else {
+                    VH_KIND_BYTE_ARRAY_VIEW_BE
+                }),
+            );
+            Ok(Some(Value::Object(Some(vh_obj))))
+        },
+    );
 
     // MethodHandles.Lookup VarHandle factory — instance field
     let lk = "java/lang/invoke/MethodHandles$Lookup";
@@ -19764,6 +20167,18 @@ pub(crate) fn register_p59_varhandle(r: &mut NativeMethodRegistry) {
             ctx.set_field(vh_obj, VH_IS_STATIC, Value::Int(1));
             Ok(Some(Value::Object(Some(vh_obj))))
         },
+    );
+    r.register(
+        vh,
+        "withInvokeExactBehavior",
+        "()Ljava/lang/invoke/VarHandle;",
+        |_ctx, args| Ok(Some(args.first().copied().unwrap_or(Value::Object(None)))),
+    );
+    r.register(
+        vh,
+        "withInvokeBehavior",
+        "()Ljava/lang/invoke/VarHandle;",
+        |_ctx, args| Ok(Some(args.first().copied().unwrap_or(Value::Object(None)))),
     );
     r.set_category(__prev_cat);
 }
@@ -25480,68 +25895,14 @@ pub(crate) fn register_p63_weak_hash_map(r: &mut NativeMethodRegistry) {
         whm,
         "get",
         "(Ljava/lang/Object;)Ljava/lang/Object;",
-        |ctx, args| {
-            // Delegate to native_map_get logic
-            let this = obj_arg(args, 0)?;
-            let size = match ctx.get_field(this, 1) {
-                Value::Int(v) => v as usize,
-                _ => 0,
-            };
-            if size == 0 {
-                return Ok(Some(Value::Object(None)));
-            }
-            let buckets = match ctx.get_field(this, 0) {
-                Value::Object(Some(b)) => b,
-                _ => return Ok(Some(Value::Object(None))),
-            };
-            let key = args.get(1).copied().unwrap_or(Value::Object(None));
-            let cap = match ctx.get_field(this, 2) {
-                Value::Int(v) => v as usize,
-                _ => 16,
-            };
-            let hash = p63_simple_hash(key);
-            let bucket_idx = hash % cap;
-            let mut node_val = ctx.get_array_element(buckets, bucket_idx);
-            while let Value::Object(Some(node)) = node_val {
-                let nk = ctx.get_field(node, 0);
-                if nk == key {
-                    return Ok(Some(ctx.get_field(node, 1)));
-                }
-                node_val = ctx.get_field(node, 3);
-            }
-            Ok(Some(Value::Object(None)))
-        },
+        cratonvm_native_collections::native_map_get_pub,
     );
-    r.register(whm, "containsKey", "(Ljava/lang/Object;)Z", |ctx, args| {
-        let this = obj_arg(args, 0)?;
-        let size = match ctx.get_field(this, 1) {
-            Value::Int(v) => v as usize,
-            _ => 0,
-        };
-        if size == 0 {
-            return Ok(Some(Value::Int(0)));
-        }
-        let buckets = match ctx.get_field(this, 0) {
-            Value::Object(Some(b)) => b,
-            _ => return Ok(Some(Value::Int(0))),
-        };
-        let key = args.get(1).copied().unwrap_or(Value::Object(None));
-        let cap = match ctx.get_field(this, 2) {
-            Value::Int(v) => v as usize,
-            _ => 16,
-        };
-        let hash = p63_simple_hash(key);
-        let bucket_idx = hash % cap;
-        let mut node_val = ctx.get_array_element(buckets, bucket_idx);
-        while let Value::Object(Some(node)) = node_val {
-            let nk = ctx.get_field(node, 0);
-            if nk == key {
-                return Ok(Some(Value::Int(1)));
-            }
-            node_val = ctx.get_field(node, 3);
-        }
-        Ok(Some(Value::Int(0)))
-    });
+    r.register(
+        whm,
+        "containsKey",
+        "(Ljava/lang/Object;)Z",
+        cratonvm_native_collections::native_map_contains_key_pub,
+    );
     r.register(whm, "clear", "()V", |ctx, args| {
         let this = obj_arg(args, 0)?;
         ctx.set_field(this, 0, Value::Object(None));
@@ -25563,15 +25924,6 @@ pub(crate) fn register_p63_weak_hash_map(r: &mut NativeMethodRegistry) {
         Ok(Some(Value::Object(Some(al))))
     });
     r.set_category(__prev_cat);
-}
-
-fn p63_simple_hash(key: Value) -> usize {
-    match key {
-        Value::Int(v) => v as usize,
-        Value::Long(v) => v as usize,
-        Value::Object(Some(r)) => r.as_ptr() as usize,
-        _ => 0,
-    }
 }
 
 // =============================================================================
@@ -31940,9 +32292,663 @@ pub(crate) fn register_p67_async_channels(r: &mut NativeMethodRegistry) {
 // Stub implementations for Arena, MemorySegment, MemoryLayout, ValueLayout, Linker
 // =============================================================================
 
+fn p67_layout_object(
+    ctx: &mut dyn NativeContext,
+    class_name: &str,
+    byte_size: i64,
+    byte_alignment: i64,
+) -> ObjectRef {
+    let obj = alloc_concurrent_synthetic(ctx, class_name, 3);
+    ctx.set_field(obj, 0, Value::Long(byte_size));
+    ctx.set_field(obj, 1, Value::Long(byte_alignment));
+    ctx.set_field(obj, 2, Value::Int(0));
+    obj
+}
+
+fn p67_set_value_layout_static(
+    ctx: &mut dyn NativeContext,
+    field_name: &str,
+    class_name: &str,
+    byte_size: i64,
+    byte_alignment: i64,
+) {
+    let obj = p67_layout_object(ctx, class_name, byte_size, byte_alignment);
+    ctx.set_static_field_by_name(
+        "java/lang/foreign/ValueLayout",
+        field_name,
+        Value::Object(Some(obj)),
+    );
+}
+
+fn p67_value_layout_clinit(ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
+    for (field_name, class_name, byte_size, byte_alignment) in [
+        ("ADDRESS", "java/lang/foreign/AddressLayout", 8_i64, 8_i64),
+        ("JAVA_BYTE", "java/lang/foreign/ValueLayout$OfByte", 1_i64, 1_i64),
+        (
+            "JAVA_BOOLEAN",
+            "java/lang/foreign/ValueLayout$OfBoolean",
+            1_i64,
+            1_i64,
+        ),
+        ("JAVA_CHAR", "java/lang/foreign/ValueLayout$OfChar", 2_i64, 2_i64),
+        ("JAVA_SHORT", "java/lang/foreign/ValueLayout$OfShort", 2_i64, 2_i64),
+        ("JAVA_INT", "java/lang/foreign/ValueLayout$OfInt", 4_i64, 4_i64),
+        ("JAVA_LONG", "java/lang/foreign/ValueLayout$OfLong", 8_i64, 8_i64),
+        ("JAVA_FLOAT", "java/lang/foreign/ValueLayout$OfFloat", 4_i64, 4_i64),
+        (
+            "JAVA_DOUBLE",
+            "java/lang/foreign/ValueLayout$OfDouble",
+            8_i64,
+            8_i64,
+        ),
+        (
+            "ADDRESS_UNALIGNED",
+            "java/lang/foreign/AddressLayout",
+            8_i64,
+            1_i64,
+        ),
+        (
+            "JAVA_CHAR_UNALIGNED",
+            "java/lang/foreign/ValueLayout$OfChar",
+            2_i64,
+            1_i64,
+        ),
+        (
+            "JAVA_SHORT_UNALIGNED",
+            "java/lang/foreign/ValueLayout$OfShort",
+            2_i64,
+            1_i64,
+        ),
+        (
+            "JAVA_INT_UNALIGNED",
+            "java/lang/foreign/ValueLayout$OfInt",
+            4_i64,
+            1_i64,
+        ),
+        (
+            "JAVA_LONG_UNALIGNED",
+            "java/lang/foreign/ValueLayout$OfLong",
+            8_i64,
+            1_i64,
+        ),
+        (
+            "JAVA_FLOAT_UNALIGNED",
+            "java/lang/foreign/ValueLayout$OfFloat",
+            4_i64,
+            1_i64,
+        ),
+        (
+            "JAVA_DOUBLE_UNALIGNED",
+            "java/lang/foreign/ValueLayout$OfDouble",
+            8_i64,
+            1_i64,
+        ),
+    ] {
+        p67_set_value_layout_static(ctx, field_name, class_name, byte_size, byte_alignment);
+    }
+    Ok(None)
+}
+
+fn p67_layout_byte_size(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = obj_arg(args, 0)?;
+    Ok(Some(ctx.get_field(this, 0)))
+}
+
+fn p67_layout_byte_alignment(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = obj_arg(args, 0)?;
+    let value = ctx.get_field(this, 1);
+    match value {
+        Value::Long(_) => Ok(Some(value)),
+        _ => Ok(Some(ctx.get_field(this, 0))),
+    }
+}
+
+fn p67_return_this(_ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    Ok(Some(args.first().copied().unwrap_or(Value::Object(None))))
+}
+
+fn p67_layout_is_little(ctx: &dyn NativeContext, layout: ObjectRef) -> bool {
+    if ctx.object_num_fields(layout) <= 2 {
+        return true;
+    }
+    ctx.get_field(layout, 2)
+        .as_int()
+        .map(|v| v != 0)
+        .unwrap_or(true)
+}
+
+fn p67_layout_with_order(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = obj_arg(args, 0)?;
+    let class_name = ctx
+        .class_name_of_id(ctx.class_id_of_object(this))
+        .unwrap_or_else(|| "java/lang/foreign/ValueLayout".to_string());
+    let byte_size = match ctx.get_field(this, 0) {
+        Value::Long(v) => v,
+        Value::Int(v) => v as i64,
+        _ => 1,
+    };
+    let byte_alignment = match ctx.get_field(this, 1) {
+        Value::Long(v) => v,
+        Value::Int(v) => v as i64,
+        _ => byte_size,
+    };
+    let obj = p67_layout_object(ctx, &class_name, byte_size, byte_alignment);
+    ctx.set_field(
+        obj,
+        2,
+        Value::Int(if vh_byte_order_is_little(ctx, args.get(1)) { 1 } else { 0 }),
+    );
+    Ok(Some(Value::Object(Some(obj))))
+}
+
+fn p67_memory_session(ctx: &mut dyn NativeContext) -> Value {
+    let obj = alloc_concurrent_synthetic(ctx, "jdk/internal/foreign/MemorySessionImpl", 1);
+    ctx.set_field(obj, 0, Value::Int(1));
+    Value::Object(Some(obj))
+}
+
+fn p67_layout_width(ctx: &dyn NativeContext, args: &[Value]) -> i32 {
+    let Some(Value::Object(Some(layout))) = args.first() else {
+        return 1;
+    };
+    match ctx.get_field(*layout, 0) {
+        Value::Long(v) if (1..=8).contains(&v) => v as i32,
+        Value::Int(_) => match ctx.get_field(*layout, 1) {
+            Value::Int(v) if (1..=8).contains(&v) => v,
+            Value::Long(v) if (1..=8).contains(&v) => v as i32,
+            _ => 1,
+        },
+        _ => 1,
+    }
+}
+
+fn p67_var_handle(ctx: &mut dyn NativeContext, args: &[Value]) -> Value {
+    let width = p67_layout_width(ctx, args);
+    let little_endian = match args.first() {
+        Some(Value::Object(Some(layout))) => p67_layout_is_little(ctx, *layout),
+        _ => true,
+    };
+    let vh = alloc_concurrent_synthetic(ctx, "java/lang/invoke/VarHandle", VH_NUM_FIELDS);
+    ctx.set_field(vh, VH_CLASS_OR_TARGET, Value::Int(if little_endian { 1 } else { 0 }));
+    ctx.set_field(vh, VH_FIELD_INDEX, Value::Int(width));
+    ctx.set_field(vh, VH_IS_STATIC, Value::Int(VH_KIND_MEMORY_SEGMENT));
+    Value::Object(Some(vh))
+}
+
+fn p67_segment_parts(
+    ctx: &dyn NativeContext,
+    seg: ObjectRef,
+    offset: i64,
+    width: i64,
+) -> Option<(*mut u8, i64)> {
+    if let Value::Long(ptr) = ctx.get_field_by_name(seg, "min") {
+        let size = match ctx.get_field_by_name(seg, "length") {
+            Value::Long(v) => v,
+            _ => 0,
+        };
+        if ptr == 0 || offset < 0 || offset.saturating_add(width) > size {
+            return None;
+        }
+        return Some(((ptr as usize).wrapping_add(offset as usize) as *mut u8, size));
+    }
+    if ctx.object_num_fields(seg) >= 4 {
+        if let (Value::Long(size), Value::Long(ptr)) = (ctx.get_field(seg, 0), ctx.get_field(seg, 3))
+        {
+            if ptr == 0 || offset < 0 || offset.saturating_add(width) > size {
+                return None;
+            }
+            return Some(((ptr as usize).wrapping_add(offset as usize) as *mut u8, size));
+        }
+    }
+    if ctx.object_num_fields(seg) < 6 {
+        return None;
+    }
+    let ptr = match ctx.get_field(seg, 0) {
+        Value::Long(v) => v,
+        _ => return None,
+    };
+    let size = match ctx.get_field(seg, 1) {
+        Value::Long(v) => v,
+        _ => return None,
+    };
+    let base_offset = match ctx.get_field(seg, 5) {
+        Value::Long(v) => v,
+        _ => 0,
+    };
+    if ptr == 0 || offset < 0 || offset.saturating_add(width) > size {
+        return None;
+    }
+    let absolute_offset = base_offset.saturating_add(offset);
+    Some(((ptr as usize).wrapping_add(absolute_offset as usize) as *mut u8, size))
+}
+
+fn p67_segment_byte_size(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = obj_arg(args, 0)?;
+    if let Value::Long(v) = ctx.get_field_by_name(this, "length") {
+        return Ok(Some(Value::Long(v)));
+    }
+    if ctx.object_num_fields(this) >= 4 {
+        if let Value::Long(v) = ctx.get_field(this, 0) {
+            return Ok(Some(Value::Long(v)));
+        }
+    }
+    if ctx.object_num_fields(this) >= 6 {
+        Ok(Some(ctx.get_field(this, 1)))
+    } else {
+        Ok(Some(ctx.get_field(this, 0)))
+    }
+}
+
+fn p67_segment_address(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = obj_arg(args, 0)?;
+    if let Value::Long(v) = ctx.get_field_by_name(this, "min") {
+        return Ok(Some(Value::Long(v)));
+    }
+    if ctx.object_num_fields(this) >= 4 {
+        if let Value::Long(v) = ctx.get_field(this, 3) {
+            return Ok(Some(Value::Long(v)));
+        }
+    }
+    if ctx.object_num_fields(this) >= 6 {
+        let ptr = match ctx.get_field(this, 0) {
+            Value::Long(v) => v,
+            _ => 0,
+        };
+        let offset = match ctx.get_field(this, 5) {
+            Value::Long(v) => v,
+            _ => 0,
+        };
+        Ok(Some(Value::Long(ptr + offset)))
+    } else {
+        Ok(Some(ctx.get_field(this, 1)))
+    }
+}
+
+fn p67_segment_get_width(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+    width: i64,
+) -> MethodCallResult {
+    let seg = obj_arg(args, 0)?;
+    let offset = match args.get(2) {
+        Some(Value::Long(v)) => *v,
+        Some(Value::Int(v)) => *v as i64,
+        _ => 0,
+    };
+    let little_endian = match args.get(1) {
+        Some(Value::Object(Some(layout))) => p67_layout_is_little(ctx, *layout),
+        _ => false,
+    };
+    let Some((addr, _size)) = p67_segment_parts(ctx, seg, offset, width) else {
+        return Ok(Some(if width == 8 { Value::Long(0) } else { Value::Int(0) }));
+    };
+    unsafe {
+        Ok(Some(match width {
+            1 => Value::Int(*(addr as *const i8) as i32),
+            2 => {
+                let bytes = [*addr, *addr.add(1)];
+                let v = if little_endian {
+                    i16::from_le_bytes(bytes)
+                } else {
+                    i16::from_be_bytes(bytes)
+                };
+                Value::Int(v as i32)
+            }
+            4 => {
+                let bytes = [*addr, *addr.add(1), *addr.add(2), *addr.add(3)];
+                let v = if little_endian {
+                    i32::from_le_bytes(bytes)
+                } else {
+                    i32::from_be_bytes(bytes)
+                };
+                Value::Int(v)
+            }
+            8 => {
+                let bytes = [
+                    *addr,
+                    *addr.add(1),
+                    *addr.add(2),
+                    *addr.add(3),
+                    *addr.add(4),
+                    *addr.add(5),
+                    *addr.add(6),
+                    *addr.add(7),
+                ];
+                let v = if little_endian {
+                    i64::from_le_bytes(bytes)
+                } else {
+                    i64::from_be_bytes(bytes)
+                };
+                Value::Long(v)
+            }
+            _ => Value::Int(0),
+        }))
+    }
+}
+
+fn p67_segment_set_width(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+    width: i64,
+    value_arg_index: usize,
+) -> MethodCallResult {
+    let seg = obj_arg(args, 0)?;
+    let offset = match args.get(2) {
+        Some(Value::Long(v)) => *v,
+        Some(Value::Int(v)) => *v as i64,
+        _ => 0,
+    };
+    let little_endian = match args.get(1) {
+        Some(Value::Object(Some(layout))) => p67_layout_is_little(ctx, *layout),
+        _ => false,
+    };
+    let Some((addr, _size)) = p67_segment_parts(ctx, seg, offset, width) else {
+        return Ok(None);
+    };
+    let value = args.get(value_arg_index).copied().unwrap_or(Value::Int(0));
+    unsafe {
+        match (width, value) {
+            (1, Value::Int(v)) => {
+                *addr = v as u8;
+            }
+            (2, Value::Int(v)) => {
+                let bytes = if little_endian {
+                    (v as i16).to_le_bytes()
+                } else {
+                    (v as i16).to_be_bytes()
+                };
+                addr.copy_from_nonoverlapping(bytes.as_ptr(), 2);
+            }
+            (4, Value::Int(v)) => {
+                let bytes = if little_endian { v.to_le_bytes() } else { v.to_be_bytes() };
+                addr.copy_from_nonoverlapping(bytes.as_ptr(), 4);
+            }
+            (8, Value::Long(v)) => {
+                let bytes = if little_endian { v.to_le_bytes() } else { v.to_be_bytes() };
+                addr.copy_from_nonoverlapping(bytes.as_ptr(), 8);
+            }
+            _ => {}
+        }
+    }
+    Ok(None)
+}
+
+fn p67_segment_copy_to_array(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let src = obj_arg(args, 0)?;
+    let layout = obj_arg(args, 1)?;
+    let src_offset = match args.get(2) {
+        Some(Value::Long(v)) => *v,
+        Some(Value::Int(v)) => *v as i64,
+        _ => 0,
+    };
+    let dst = obj_arg(args, 3)?;
+    let dst_index = match args.get(4) {
+        Some(Value::Int(v)) => *v as usize,
+        Some(Value::Long(v)) => *v as usize,
+        _ => 0,
+    };
+    let count = match args.get(5) {
+        Some(Value::Int(v)) => *v as usize,
+        Some(Value::Long(v)) => *v as usize,
+        _ => 0,
+    };
+    let width = match ctx.get_field(layout, 0) {
+        Value::Long(v) if (1..=8).contains(&v) => v,
+        Value::Int(_) => match ctx.get_field(layout, 1) {
+            Value::Int(v) if (1..=8).contains(&v) => v as i64,
+            Value::Long(v) if (1..=8).contains(&v) => v,
+            _ => 1,
+        },
+        _ => 1,
+    };
+    let little_endian = p67_layout_is_little(ctx, layout);
+    for i in 0..count {
+        let offset = src_offset + (i as i64 * width);
+        let Some((addr, _size)) = p67_segment_parts(ctx, src, offset, width) else {
+            break;
+        };
+        let value = unsafe {
+            match width {
+                1 => Value::Int(*(addr as *const i8) as i32),
+                2 => {
+                    let bytes = [*addr, *addr.add(1)];
+                    let v = if little_endian {
+                        i16::from_le_bytes(bytes)
+                    } else {
+                        i16::from_be_bytes(bytes)
+                    };
+                    Value::Int(v as i32)
+                }
+                4 => {
+                    let bytes = [*addr, *addr.add(1), *addr.add(2), *addr.add(3)];
+                    let v = if little_endian {
+                        i32::from_le_bytes(bytes)
+                    } else {
+                        i32::from_be_bytes(bytes)
+                    };
+                    Value::Int(v)
+                }
+                8 => {
+                    let bytes = [
+                        *addr,
+                        *addr.add(1),
+                        *addr.add(2),
+                        *addr.add(3),
+                        *addr.add(4),
+                        *addr.add(5),
+                        *addr.add(6),
+                        *addr.add(7),
+                    ];
+                    let v = if little_endian {
+                        i64::from_le_bytes(bytes)
+                    } else {
+                        i64::from_be_bytes(bytes)
+                    };
+                    Value::Long(v)
+                }
+                _ => Value::Int(0),
+            }
+        };
+        ctx.set_array_element(dst, dst_index + i, value);
+    }
+    Ok(None)
+}
+
+fn lucene_buffered_checksum_flush(ctx: &mut dyn NativeContext, this: ObjectRef) {
+    let buffer = match ctx.get_field_by_name(this, "buffer") {
+        Value::Object(Some(buffer)) => buffer,
+        _ => return,
+    };
+    let upto = ctx.get_field_by_name(this, "upto").as_int().unwrap_or(0).max(0) as usize;
+    if upto == 0 {
+        return;
+    }
+    if let Value::Object(Some(checksum)) = ctx.get_field_by_name(this, "in") {
+        let _ = ctx.invoke_virtual(
+            checksum,
+            "update",
+            "([BII)V",
+            &[
+                Value::Object(Some(buffer)),
+                Value::Int(0),
+                Value::Int(upto as i32),
+            ],
+        );
+    }
+    ctx.set_field_by_name(this, "upto", Value::Int(0));
+}
+
+fn lucene_buffered_checksum_write(ctx: &mut dyn NativeContext, this: ObjectRef, bytes: &[u8]) {
+    let buffer = match ctx.get_field_by_name(this, "buffer") {
+        Value::Object(Some(buffer)) => buffer,
+        _ => return,
+    };
+    let cap = ctx.array_length(buffer);
+    let mut upto = ctx.get_field_by_name(this, "upto").as_int().unwrap_or(0).max(0) as usize;
+    if upto.saturating_add(bytes.len()) > cap {
+        lucene_buffered_checksum_flush(ctx, this);
+        upto = ctx.get_field_by_name(this, "upto").as_int().unwrap_or(0).max(0) as usize;
+    }
+    if upto.saturating_add(bytes.len()) > cap {
+        return;
+    }
+    for (i, b) in bytes.iter().enumerate() {
+        ctx.set_array_element(buffer, upto + i, Value::Int(*b as i8 as i32));
+    }
+    ctx.set_field_by_name(this, "upto", Value::Int((upto + bytes.len()) as i32));
+}
+
+fn lucene_buffered_checksum_update_int(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = obj_arg(args, 0)?;
+    let value = args.get(1).and_then(|v| v.as_int()).unwrap_or(0);
+    lucene_buffered_checksum_write(ctx, this, &value.to_le_bytes());
+    Ok(None)
+}
+
+fn lucene_buffered_checksum_update_long(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = obj_arg(args, 0)?;
+    let value = match args.get(1) {
+        Some(Value::Long(v)) => *v,
+        Some(Value::Int(v)) => *v as i64,
+        _ => 0,
+    };
+    lucene_buffered_checksum_write(ctx, this, &value.to_le_bytes());
+    Ok(None)
+}
+
+fn lucene_buffered_checksum_update_longs(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = obj_arg(args, 0)?;
+    let arr = obj_arg(args, 1)?;
+    let mut off = args.get(2).and_then(|v| v.as_int()).unwrap_or(0).max(0) as usize;
+    let len = args.get(3).and_then(|v| v.as_int()).unwrap_or(0).max(0) as usize;
+    for _ in 0..len {
+        let value = match ctx.get_array_element(arr, off) {
+            Value::Long(v) => v,
+            Value::Int(v) => v as i64,
+            _ => 0,
+        };
+        lucene_buffered_checksum_write(ctx, this, &value.to_le_bytes());
+        off += 1;
+    }
+    Ok(None)
+}
+
+fn lucene_crc32_step(mut crc: u32, data: &[u8]) -> u32 {
+    for &b in data {
+        crc ^= b as u32;
+        for _ in 0..8 {
+            let mask = 0u32.wrapping_sub(crc & 1);
+            crc = (crc >> 1) ^ (0xedb8_8320 & mask);
+        }
+    }
+    crc
+}
+
+fn lucene_crc32_update_public(public_crc: u32, data: &[u8]) -> u32 {
+    !lucene_crc32_step(!public_crc, data)
+}
+
+fn lucene_buffered_checksum_index_input_get_checksum(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    let this = obj_arg(args, 0)?;
+    let main = match ctx.get_field_by_name(this, "main") {
+        Value::Object(Some(main)) => main,
+        _ => return Ok(Some(Value::Long(0))),
+    };
+    let main_length = match ctx.invoke_virtual(main, "length", "()J", &[])? {
+        Some(Value::Long(v)) => v,
+        Some(Value::Int(v)) => v as i64,
+        _ => 0,
+    };
+    let main_position = match ctx.invoke_virtual(main, "getFilePointer", "()J", &[])? {
+        Some(Value::Long(v)) => v,
+        Some(Value::Int(v)) => v as i64,
+        _ => 0,
+    };
+    if main_length <= 8 || main_position < main_length - 8 {
+        return match ctx.get_field_by_name(this, "digest") {
+            Value::Object(Some(digest)) => ctx.invoke_virtual(digest, "getValue", "()J", &[]),
+            _ => Ok(Some(Value::Long(0))),
+        };
+    }
+    let input0 = match ctx.invoke_virtual(
+        main,
+        "clone",
+        "()Lorg/apache/lucene/store/IndexInput;",
+        &[],
+    )? {
+        Some(Value::Object(Some(clone))) => clone,
+        _ => main,
+    };
+    let input_pin = ctx.pin_native_root(input0);
+    let result: MethodCallResult = (|| {
+        let mut input = ctx.read_native_pin(input_pin, input0);
+        ctx.invoke_virtual(input, "seek", "(J)V", &[Value::Long(0)])?;
+        input = ctx.read_native_pin(input_pin, input);
+
+        let chunk_len = 8192usize;
+        let chunk = ctx.new_array(cratonvm_types::ArrayElementType::Byte, chunk_len);
+        let chunk_pin = ctx.pin_native_root(chunk);
+        let mut remaining = main_length - 8;
+        let mut crc = 0u32;
+        while remaining > 0 {
+            input = ctx.read_native_pin(input_pin, input);
+            let chunk = ctx.read_native_pin(chunk_pin, chunk);
+            let want = remaining.min(chunk_len as i64) as usize;
+            ctx.invoke_virtual(
+                input,
+                "readBytes",
+                "([BII)V",
+                &[
+                    Value::Object(Some(chunk)),
+                    Value::Int(0),
+                    Value::Int(want as i32),
+                ],
+            )?;
+            let chunk = ctx.read_native_pin(chunk_pin, chunk);
+            let mut bytes = vec![0u8; want];
+            let copied = ctx.read_byte_array_into(chunk, 0, &mut bytes);
+            if copied != want {
+                break;
+            }
+            crc = lucene_crc32_update_public(crc, &bytes);
+            remaining -= want as i64;
+        }
+        Ok(Some(Value::Long((crc as u64 & 0xffff_ffff) as i64)))
+    })();
+    ctx.unpin_native_roots(input_pin);
+    result
+}
+
 pub(crate) fn register_p67_foreign_memory(r: &mut NativeMethodRegistry) {
     let __prev_cat = r.current_category();
     r.set_category(cratonvm_native_api::NativeKind::Bridge);
+    r.register(
+        "org/apache/lucene/store/BufferedChecksumIndexInput",
+        "getChecksum",
+        "()J",
+        lucene_buffered_checksum_index_input_get_checksum,
+    );
+    r.register(
+        "org/apache/lucene/store/BufferedChecksum",
+        "updateInt",
+        "(I)V",
+        lucene_buffered_checksum_update_int,
+    );
+    r.register(
+        "org/apache/lucene/store/BufferedChecksum",
+        "updateLong",
+        "(J)V",
+        lucene_buffered_checksum_update_long,
+    );
+    r.register(
+        "org/apache/lucene/store/BufferedChecksum",
+        "updateLongs",
+        "([JII)V",
+        lucene_buffered_checksum_update_longs,
+    );
     // Arena = 1-field (open=0 Int)
     let arena = "java/lang/foreign/Arena";
     r.register(
@@ -32037,58 +33043,159 @@ pub(crate) fn register_p67_foreign_memory(r: &mut NativeMethodRegistry) {
         ctx.set_field(this, 0, Value::Int(0));
         Ok(None)
     });
+    r.register(
+        arena,
+        "scope",
+        "()Ljava/lang/foreign/MemorySegment$Scope;",
+        |ctx, _args| Ok(Some(p67_memory_session(ctx))),
+    );
+    let session = "jdk/internal/foreign/MemorySessionImpl";
+    r.register(
+        session,
+        "toMemorySession",
+        "(Ljava/lang/foreign/Arena;)Ljdk/internal/foreign/MemorySessionImpl;",
+        |ctx, _args| Ok(Some(p67_memory_session(ctx))),
+    );
+    r.register(
+        session,
+        "createConfined",
+        "(Ljava/lang/Thread;)Ljdk/internal/foreign/MemorySessionImpl;",
+        |ctx, _args| Ok(Some(p67_memory_session(ctx))),
+    );
+    r.register(
+        session,
+        "createShared",
+        "()Ljdk/internal/foreign/MemorySessionImpl;",
+        |ctx, _args| Ok(Some(p67_memory_session(ctx))),
+    );
+    r.register(
+        session,
+        "createImplicit",
+        "(Ljava/lang/ref/Cleaner;)Ljdk/internal/foreign/MemorySessionImpl;",
+        |ctx, _args| Ok(Some(p67_memory_session(ctx))),
+    );
+    r.register(
+        session,
+        "createHeap",
+        "(Ljava/lang/Object;)Ljdk/internal/foreign/MemorySessionImpl;",
+        |ctx, _args| Ok(Some(p67_memory_session(ctx))),
+    );
+    r.register(
+        session,
+        "addCloseAction",
+        "(Ljava/lang/Runnable;)V",
+        native_noop_with_this,
+    );
+    r.register(
+        session,
+        "addOrCleanupIfFail",
+        "(Ljdk/internal/foreign/MemorySessionImpl$ResourceList$ResourceCleanup;)V",
+        native_noop_with_this,
+    );
+    r.register(
+        session,
+        "addInternal",
+        "(Ljdk/internal/foreign/MemorySessionImpl$ResourceList$ResourceCleanup;)V",
+        native_noop_with_this,
+    );
+    r.register(session, "release0", "()V", native_noop_with_this);
+    r.register(session, "acquire0", "()V", native_noop_with_this);
+    r.register(
+        session,
+        "whileAlive",
+        "(Ljava/lang/Runnable;)V",
+        native_noop_with_this,
+    );
+    r.register(session, "ownerThread", "()Ljava/lang/Thread;", |ctx, _args| {
+        Ok(Some(Value::Object(Some(ctx.current_thread_object()))))
+    });
+    r.register(
+        session,
+        "isAccessibleBy",
+        "(Ljava/lang/Thread;)Z",
+        |_ctx, _args| Ok(Some(Value::Int(1))),
+    );
+    r.register(session, "isAlive", "()Z", |_ctx, _args| {
+        Ok(Some(Value::Int(1)))
+    });
+    r.register(session, "checkValidStateRaw", "()V", native_noop_with_this);
+    r.register(session, "checkValidState", "()V", native_noop_with_this);
+    r.register(
+        session,
+        "checkValidState",
+        "(Ljava/lang/foreign/MemorySegment;)V",
+        |_ctx, _args| Ok(None),
+    );
+    r.register(session, "isCloseable", "()Z", |_ctx, _args| {
+        Ok(Some(Value::Int(1)))
+    });
+    r.register(session, "close", "()V", native_noop_with_this);
+    r.register(session, "justClose", "()V", native_noop_with_this);
 
     // MemorySegment = 2-field (byteSize=0 Long, address=1 Long)
     let ms = "java/lang/foreign/MemorySegment";
-    r.register(ms, "byteSize", "()J", |ctx, args| {
-        let this = obj_arg(args, 0)?;
-        Ok(Some(ctx.get_field(this, 0)))
-    });
-    r.register(ms, "address", "()J", |ctx, args| {
-        let this = obj_arg(args, 0)?;
-        Ok(Some(ctx.get_field(this, 1)))
-    });
+    r.register(ms, "byteSize", "()J", p67_segment_byte_size);
+    r.register(ms, "address", "()J", p67_segment_address);
+    r.register(
+        ms,
+        "copy",
+        "(Ljava/lang/foreign/MemorySegment;Ljava/lang/foreign/ValueLayout;JLjava/lang/Object;II)V",
+        p67_segment_copy_to_array,
+    );
     r.register(
         ms,
         "get",
         "(Ljava/lang/foreign/ValueLayout$OfByte;J)B",
-        |_ctx, _args| Ok(Some(Value::Int(0))),
+        |ctx, args| p67_segment_get_width(ctx, args, 1),
+    );
+    r.register(
+        ms,
+        "get",
+        "(Ljava/lang/foreign/ValueLayout$OfShort;J)S",
+        |ctx, args| p67_segment_get_width(ctx, args, 2),
     );
     r.register(
         ms,
         "get",
         "(Ljava/lang/foreign/ValueLayout$OfInt;J)I",
-        |_ctx, _args| Ok(Some(Value::Int(0))),
+        |ctx, args| p67_segment_get_width(ctx, args, 4),
     );
     r.register(
         ms,
         "get",
         "(Ljava/lang/foreign/ValueLayout$OfLong;J)J",
-        |_ctx, _args| Ok(Some(Value::Long(0))),
+        |ctx, args| p67_segment_get_width(ctx, args, 8),
     );
     r.register(
         ms,
         "set",
         "(Ljava/lang/foreign/ValueLayout$OfByte;JB)V",
-        native_noop_with_this,
+        |ctx, args| p67_segment_set_width(ctx, args, 1, 3),
+    );
+    r.register(
+        ms,
+        "set",
+        "(Ljava/lang/foreign/ValueLayout$OfShort;JS)V",
+        |ctx, args| p67_segment_set_width(ctx, args, 2, 3),
     );
     r.register(
         ms,
         "set",
         "(Ljava/lang/foreign/ValueLayout$OfInt;JI)V",
-        native_noop_with_this,
+        |ctx, args| p67_segment_set_width(ctx, args, 4, 3),
     );
     r.register(
         ms,
         "set",
         "(Ljava/lang/foreign/ValueLayout$OfLong;JJ)V",
-        native_noop_with_this,
+        |ctx, args| p67_segment_set_width(ctx, args, 8, 3),
     );
     r.register(
         ms,
         "asSlice",
         "(JJ)Ljava/lang/foreign/MemorySegment;",
         |ctx, args| {
+            let this = obj_arg(args, 0)?;
             let offset = match args.get(1) {
                 Some(Value::Long(v)) => *v,
                 _ => 0,
@@ -32097,10 +33204,29 @@ pub(crate) fn register_p67_foreign_memory(r: &mut NativeMethodRegistry) {
                 Some(Value::Long(v)) => *v,
                 _ => 0,
             };
-            let seg = alloc_concurrent_synthetic(ctx, "java/lang/foreign/MemorySegment", 2);
-            ctx.set_field(seg, 0, Value::Long(size));
-            ctx.set_field(seg, 1, Value::Long(offset));
-            Ok(Some(Value::Object(Some(seg))))
+            if ctx.object_num_fields(this) >= 6 {
+                let base_ptr = match ctx.get_field(this, 0) {
+                    Value::Long(v) => v,
+                    _ => 0,
+                };
+                let base_off = match ctx.get_field(this, 5) {
+                    Value::Long(v) => v,
+                    _ => 0,
+                };
+                let seg = alloc_concurrent_synthetic(ctx, "java/lang/foreign/MemorySegment", 6);
+                ctx.set_field(seg, 0, Value::Long(base_ptr));
+                ctx.set_field(seg, 1, Value::Long(size));
+                ctx.set_field(seg, 2, ctx.get_field(this, 2));
+                ctx.set_field(seg, 3, ctx.get_field(this, 3));
+                ctx.set_field(seg, 4, Value::Int(1));
+                ctx.set_field(seg, 5, Value::Long(base_off + offset));
+                Ok(Some(Value::Object(Some(seg))))
+            } else {
+                let seg = alloc_concurrent_synthetic(ctx, "java/lang/foreign/MemorySegment", 2);
+                ctx.set_field(seg, 0, Value::Long(size));
+                ctx.set_field(seg, 1, Value::Long(offset));
+                Ok(Some(Value::Object(Some(seg))))
+            }
         },
     );
     r.register(ms, "isNative", "()Z", |_ctx, _args| Ok(Some(Value::Int(0))));
@@ -32115,7 +33241,7 @@ pub(crate) fn register_p67_foreign_memory(r: &mut NativeMethodRegistry) {
         ms,
         "scope",
         "()Ljava/lang/foreign/MemorySegment$Scope;",
-        |_ctx, _args| Ok(Some(Value::Object(None))),
+        |ctx, _args| Ok(Some(p67_memory_session(ctx))),
     );
     r.register(
         ms,
@@ -32128,16 +33254,86 @@ pub(crate) fn register_p67_foreign_memory(r: &mut NativeMethodRegistry) {
             Ok(Some(Value::Object(Some(seg))))
         },
     );
+    for ms_impl in [
+        "jdk/internal/foreign/AbstractMemorySegmentImpl",
+        "jdk/internal/foreign/NativeMemorySegmentImpl",
+        "jdk/internal/foreign/MappedMemorySegmentImpl",
+    ] {
+        r.register(ms_impl, "byteSize", "()J", p67_segment_byte_size);
+        r.register(ms_impl, "address", "()J", p67_segment_address);
+        r.register(
+            ms_impl,
+            "get",
+            "(Ljava/lang/foreign/ValueLayout$OfByte;J)B",
+            |ctx, args| p67_segment_get_width(ctx, args, 1),
+        );
+        r.register(
+            ms_impl,
+            "get",
+            "(Ljava/lang/foreign/ValueLayout$OfShort;J)S",
+            |ctx, args| p67_segment_get_width(ctx, args, 2),
+        );
+        r.register(
+            ms_impl,
+            "get",
+            "(Ljava/lang/foreign/ValueLayout$OfInt;J)I",
+            |ctx, args| p67_segment_get_width(ctx, args, 4),
+        );
+        r.register(
+            ms_impl,
+            "get",
+            "(Ljava/lang/foreign/ValueLayout$OfLong;J)J",
+            |ctx, args| p67_segment_get_width(ctx, args, 8),
+        );
+        r.register(ms_impl, "isNative", "()Z", |_ctx, _args| Ok(Some(Value::Int(1))));
+        r.register(ms_impl, "isMapped", "()Z", |_ctx, _args| Ok(Some(Value::Int(1))));
+        r.register(ms_impl, "isReadOnly", "()Z", |_ctx, _args| {
+            Ok(Some(Value::Int(0)))
+        });
+        r.register(
+            ms_impl,
+            "scope",
+            "()Ljava/lang/foreign/MemorySegment$Scope;",
+            |ctx, _args| Ok(Some(p67_memory_session(ctx))),
+        );
+    }
 
     // ValueLayout constants
     let vl = "java/lang/foreign/ValueLayout";
+    r.register(vl, "<clinit>", "()V", p67_value_layout_clinit);
     r.register(
         vl,
         "JAVA_BYTE",
         "Ljava/lang/foreign/ValueLayout$OfByte;",
         |ctx, _args| {
-            let obj = alloc_concurrent_synthetic(ctx, "java/lang/foreign/ValueLayout$OfByte", 1);
-            ctx.set_field(obj, 0, Value::Long(1));
+            let obj = p67_layout_object(ctx, "java/lang/foreign/ValueLayout$OfByte", 1, 1);
+            Ok(Some(Value::Object(Some(obj))))
+        },
+    );
+    r.register(
+        vl,
+        "JAVA_BOOLEAN",
+        "Ljava/lang/foreign/ValueLayout$OfBoolean;",
+        |ctx, _args| {
+            let obj = p67_layout_object(ctx, "java/lang/foreign/ValueLayout$OfBoolean", 1, 1);
+            Ok(Some(Value::Object(Some(obj))))
+        },
+    );
+    r.register(
+        vl,
+        "JAVA_CHAR",
+        "Ljava/lang/foreign/ValueLayout$OfChar;",
+        |ctx, _args| {
+            let obj = p67_layout_object(ctx, "java/lang/foreign/ValueLayout$OfChar", 2, 2);
+            Ok(Some(Value::Object(Some(obj))))
+        },
+    );
+    r.register(
+        vl,
+        "JAVA_SHORT",
+        "Ljava/lang/foreign/ValueLayout$OfShort;",
+        |ctx, _args| {
+            let obj = p67_layout_object(ctx, "java/lang/foreign/ValueLayout$OfShort", 2, 2);
             Ok(Some(Value::Object(Some(obj))))
         },
     );
@@ -32146,8 +33342,7 @@ pub(crate) fn register_p67_foreign_memory(r: &mut NativeMethodRegistry) {
         "JAVA_INT",
         "Ljava/lang/foreign/ValueLayout$OfInt;",
         |ctx, _args| {
-            let obj = alloc_concurrent_synthetic(ctx, "java/lang/foreign/ValueLayout$OfInt", 1);
-            ctx.set_field(obj, 0, Value::Long(4));
+            let obj = p67_layout_object(ctx, "java/lang/foreign/ValueLayout$OfInt", 4, 4);
             Ok(Some(Value::Object(Some(obj))))
         },
     );
@@ -32156,8 +33351,7 @@ pub(crate) fn register_p67_foreign_memory(r: &mut NativeMethodRegistry) {
         "JAVA_LONG",
         "Ljava/lang/foreign/ValueLayout$OfLong;",
         |ctx, _args| {
-            let obj = alloc_concurrent_synthetic(ctx, "java/lang/foreign/ValueLayout$OfLong", 1);
-            ctx.set_field(obj, 0, Value::Long(8));
+            let obj = p67_layout_object(ctx, "java/lang/foreign/ValueLayout$OfLong", 8, 8);
             Ok(Some(Value::Object(Some(obj))))
         },
     );
@@ -32166,8 +33360,7 @@ pub(crate) fn register_p67_foreign_memory(r: &mut NativeMethodRegistry) {
         "JAVA_FLOAT",
         "Ljava/lang/foreign/ValueLayout$OfFloat;",
         |ctx, _args| {
-            let obj = alloc_concurrent_synthetic(ctx, "java/lang/foreign/ValueLayout$OfFloat", 1);
-            ctx.set_field(obj, 0, Value::Long(4));
+            let obj = p67_layout_object(ctx, "java/lang/foreign/ValueLayout$OfFloat", 4, 4);
             Ok(Some(Value::Object(Some(obj))))
         },
     );
@@ -32176,8 +33369,7 @@ pub(crate) fn register_p67_foreign_memory(r: &mut NativeMethodRegistry) {
         "JAVA_DOUBLE",
         "Ljava/lang/foreign/ValueLayout$OfDouble;",
         |ctx, _args| {
-            let obj = alloc_concurrent_synthetic(ctx, "java/lang/foreign/ValueLayout$OfDouble", 1);
-            ctx.set_field(obj, 0, Value::Long(8));
+            let obj = p67_layout_object(ctx, "java/lang/foreign/ValueLayout$OfDouble", 8, 8);
             Ok(Some(Value::Object(Some(obj))))
         },
     );
@@ -32186,8 +33378,7 @@ pub(crate) fn register_p67_foreign_memory(r: &mut NativeMethodRegistry) {
         "ADDRESS",
         "Ljava/lang/foreign/AddressLayout;",
         |ctx, _args| {
-            let obj = alloc_concurrent_synthetic(ctx, "java/lang/foreign/AddressLayout", 1);
-            ctx.set_field(obj, 0, Value::Long(8));
+            let obj = p67_layout_object(ctx, "java/lang/foreign/AddressLayout", 8, 8);
             Ok(Some(Value::Object(Some(obj))))
         },
     );
@@ -32195,17 +33386,222 @@ pub(crate) fn register_p67_foreign_memory(r: &mut NativeMethodRegistry) {
     // ValueLayout.OfByte/OfInt/OfLong — byteSize
     for class in [
         "java/lang/foreign/ValueLayout$OfByte",
+        "java/lang/foreign/ValueLayout$OfBoolean",
+        "java/lang/foreign/ValueLayout$OfChar",
+        "java/lang/foreign/ValueLayout$OfShort",
         "java/lang/foreign/ValueLayout$OfInt",
         "java/lang/foreign/ValueLayout$OfLong",
         "java/lang/foreign/ValueLayout$OfFloat",
         "java/lang/foreign/ValueLayout$OfDouble",
         "java/lang/foreign/AddressLayout",
     ] {
-        r.register(class, "byteSize", "()J", |ctx, args| {
-            let this = obj_arg(args, 0)?;
-            Ok(Some(ctx.get_field(this, 0)))
+        r.register(class, "byteSize", "()J", p67_layout_byte_size);
+        r.register(class, "byteAlignment", "()J", p67_layout_byte_alignment);
+        r.register(class, "varHandle", "()Ljava/lang/invoke/VarHandle;", |ctx, args| {
+            Ok(Some(p67_var_handle(ctx, args)))
         });
     }
+    for (class, specific_desc) in [
+        (
+            "java/lang/foreign/ValueLayout$OfByte",
+            "Ljava/lang/foreign/ValueLayout$OfByte;",
+        ),
+        (
+            "java/lang/foreign/ValueLayout$OfBoolean",
+            "Ljava/lang/foreign/ValueLayout$OfBoolean;",
+        ),
+        (
+            "java/lang/foreign/ValueLayout$OfChar",
+            "Ljava/lang/foreign/ValueLayout$OfChar;",
+        ),
+        (
+            "java/lang/foreign/ValueLayout$OfShort",
+            "Ljava/lang/foreign/ValueLayout$OfShort;",
+        ),
+        (
+            "java/lang/foreign/ValueLayout$OfInt",
+            "Ljava/lang/foreign/ValueLayout$OfInt;",
+        ),
+        (
+            "java/lang/foreign/ValueLayout$OfLong",
+            "Ljava/lang/foreign/ValueLayout$OfLong;",
+        ),
+        (
+            "java/lang/foreign/ValueLayout$OfFloat",
+            "Ljava/lang/foreign/ValueLayout$OfFloat;",
+        ),
+        (
+            "java/lang/foreign/ValueLayout$OfDouble",
+            "Ljava/lang/foreign/ValueLayout$OfDouble;",
+        ),
+    ] {
+        let with_alignment_specific = format!("(J){specific_desc}");
+        r.register(
+            class,
+            "withByteAlignment",
+            &with_alignment_specific,
+            p67_return_this,
+        );
+        let with_name_specific = format!("(Ljava/lang/String;){specific_desc}");
+        r.register(class, "withName", &with_name_specific, p67_return_this);
+        let with_order_specific = format!("(Ljava/nio/ByteOrder;){specific_desc}");
+        r.register(class, "withOrder", &with_order_specific, p67_layout_with_order);
+        r.register(
+            class,
+            "withByteAlignment",
+            "(J)Ljava/lang/foreign/MemoryLayout;",
+            p67_return_this,
+        );
+        r.register(
+            class,
+            "withByteAlignment",
+            "(J)Ljava/lang/foreign/ValueLayout;",
+            p67_return_this,
+        );
+        r.register(
+            class,
+            "withName",
+            "(Ljava/lang/String;)Ljava/lang/foreign/MemoryLayout;",
+            p67_return_this,
+        );
+        r.register(
+            class,
+            "withName",
+            "(Ljava/lang/String;)Ljava/lang/foreign/ValueLayout;",
+            p67_return_this,
+        );
+        r.register(
+            class,
+            "withOrder",
+            "(Ljava/nio/ByteOrder;)Ljava/lang/foreign/ValueLayout;",
+            p67_layout_with_order,
+        );
+    }
+    r.register(
+        "java/lang/foreign/AddressLayout",
+        "withTargetLayout",
+        "(Ljava/lang/foreign/MemoryLayout;)Ljava/lang/foreign/AddressLayout;",
+        |ctx, args| {
+            let this = obj_arg(args, 0)?;
+            let _target = args.get(1).copied().unwrap_or(Value::Object(None));
+            Ok(Some(Value::Object(Some(this))))
+        },
+    );
+    r.register(
+        "java/lang/foreign/MemoryLayout",
+        "withByteAlignment",
+        "(J)Ljava/lang/foreign/MemoryLayout;",
+        |_ctx, args| Ok(Some(args.first().copied().unwrap_or(Value::Object(None)))),
+    );
+    r.register(
+        "java/lang/foreign/ValueLayout",
+        "withByteAlignment",
+        "(J)Ljava/lang/foreign/ValueLayout;",
+        |_ctx, args| Ok(Some(args.first().copied().unwrap_or(Value::Object(None)))),
+    );
+    r.register(
+        "java/lang/foreign/ValueLayout",
+        "withName",
+        "(Ljava/lang/String;)Ljava/lang/foreign/ValueLayout;",
+        |_ctx, args| Ok(Some(args.first().copied().unwrap_or(Value::Object(None)))),
+    );
+    r.register(
+        "java/lang/foreign/AddressLayout",
+        "withByteAlignment",
+        "(J)Ljava/lang/foreign/AddressLayout;",
+        |_ctx, args| Ok(Some(args.first().copied().unwrap_or(Value::Object(None)))),
+    );
+    r.register(
+        "java/lang/foreign/AddressLayout",
+        "withName",
+        "(Ljava/lang/String;)Ljava/lang/foreign/AddressLayout;",
+        |_ctx, args| Ok(Some(args.first().copied().unwrap_or(Value::Object(None)))),
+    );
+    for (class, specific_desc) in [
+        (
+            "jdk/internal/foreign/layout/ValueLayouts$OfAddressImpl",
+            "Ljava/lang/foreign/AddressLayout;",
+        ),
+        (
+            "jdk/internal/foreign/layout/ValueLayouts$OfByteImpl",
+            "Ljava/lang/foreign/ValueLayout$OfByte;",
+        ),
+        (
+            "jdk/internal/foreign/layout/ValueLayouts$OfBooleanImpl",
+            "Ljava/lang/foreign/ValueLayout$OfBoolean;",
+        ),
+        (
+            "jdk/internal/foreign/layout/ValueLayouts$OfCharImpl",
+            "Ljava/lang/foreign/ValueLayout$OfChar;",
+        ),
+        (
+            "jdk/internal/foreign/layout/ValueLayouts$OfShortImpl",
+            "Ljava/lang/foreign/ValueLayout$OfShort;",
+        ),
+        (
+            "jdk/internal/foreign/layout/ValueLayouts$OfIntImpl",
+            "Ljava/lang/foreign/ValueLayout$OfInt;",
+        ),
+        (
+            "jdk/internal/foreign/layout/ValueLayouts$OfLongImpl",
+            "Ljava/lang/foreign/ValueLayout$OfLong;",
+        ),
+        (
+            "jdk/internal/foreign/layout/ValueLayouts$OfFloatImpl",
+            "Ljava/lang/foreign/ValueLayout$OfFloat;",
+        ),
+        (
+            "jdk/internal/foreign/layout/ValueLayouts$OfDoubleImpl",
+            "Ljava/lang/foreign/ValueLayout$OfDouble;",
+        ),
+    ] {
+        let byte_alignment_specific = format!("(J){specific_desc}");
+        r.register(class, "withByteAlignment", &byte_alignment_specific, |_ctx, args| {
+            Ok(Some(args.first().copied().unwrap_or(Value::Object(None))))
+        });
+        let with_name_specific = format!("(Ljava/lang/String;){specific_desc}");
+        r.register(class, "withName", &with_name_specific, |_ctx, args| {
+            Ok(Some(args.first().copied().unwrap_or(Value::Object(None))))
+        });
+        let with_order_specific = format!("(Ljava/nio/ByteOrder;){specific_desc}");
+        r.register(class, "withOrder", &with_order_specific, p67_layout_with_order);
+        r.register(
+            class,
+            "withByteAlignment",
+            "(J)Ljava/lang/foreign/MemoryLayout;",
+            |_ctx, args| Ok(Some(args.first().copied().unwrap_or(Value::Object(None)))),
+        );
+        r.register(
+            class,
+            "withByteAlignment",
+            "(J)Ljava/lang/foreign/ValueLayout;",
+            |_ctx, args| Ok(Some(args.first().copied().unwrap_or(Value::Object(None)))),
+        );
+        r.register(
+            class,
+            "withName",
+            "(Ljava/lang/String;)Ljava/lang/foreign/MemoryLayout;",
+            |_ctx, args| Ok(Some(args.first().copied().unwrap_or(Value::Object(None)))),
+        );
+        r.register(
+            class,
+            "withName",
+            "(Ljava/lang/String;)Ljava/lang/foreign/ValueLayout;",
+            |_ctx, args| Ok(Some(args.first().copied().unwrap_or(Value::Object(None)))),
+        );
+        r.register(
+            class,
+            "withOrder",
+            "(Ljava/nio/ByteOrder;)Ljava/lang/foreign/ValueLayout;",
+            p67_layout_with_order,
+        );
+    }
+    r.register(
+        "jdk/internal/foreign/layout/ValueLayouts$OfAddressImpl",
+        "withTargetLayout",
+        "(Ljava/lang/foreign/MemoryLayout;)Ljava/lang/foreign/AddressLayout;",
+        |_ctx, args| Ok(Some(args.first().copied().unwrap_or(Value::Object(None)))),
+    );
 
     // MemoryLayout
     let ml = "java/lang/foreign/MemoryLayout";
@@ -32266,6 +33662,15 @@ pub(crate) fn register_p67_foreign_memory(r: &mut NativeMethodRegistry) {
         "()Ljava/lang/foreign/Linker;",
         |ctx, _args| {
             let obj = alloc_concurrent_synthetic(ctx, "java/lang/foreign/Linker", 0);
+            Ok(Some(Value::Object(Some(obj))))
+        },
+    );
+    r.register(
+        linker,
+        "defaultLookup",
+        "()Ljava/lang/foreign/SymbolLookup;",
+        |ctx, _args| {
+            let obj = alloc_concurrent_synthetic(ctx, "java/lang/foreign/SymbolLookup", 0);
             Ok(Some(Value::Object(Some(obj))))
         },
     );

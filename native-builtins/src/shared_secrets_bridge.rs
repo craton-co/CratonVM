@@ -404,6 +404,12 @@ fn jla_define_class(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRe
     )?;
 
     let mut opts = cratonvm_native_api::DefineClassFull::default();
+    // `System$1` is the JDK's trusted JavaLangAccess implementation. HotSpot
+    // routes this path around ClassLoader.preDefineClass' protected-package
+    // guard for generated core-library helpers, including
+    // java/lang/invoke/BoundMethodHandle$Species_* classes used by FFM
+    // VarHandle setup. Treat it like the other JVM-internal define paths.
+    opts.privileged_define = true;
     if let Some(Value::Object(Some(pd))) = args.get(4) {
         opts.code_source_url = crate::classloader::extract_pd_code_source_url(ctx, *pd);
     }

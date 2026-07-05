@@ -3247,19 +3247,6 @@ pub(crate) fn wrap_as_invocation_target_exception(
         }
         other => return other,
     };
-    if std::env::var_os("CRATONVM_IAE_TRACE").is_some() {
-        let exc_class_id = ctx.class_id_of_object(original);
-        let exc_class_name = ctx.class_name_of_id(exc_class_id).unwrap_or_default();
-        let msg_field = ctx.get_field_by_name(original, "detailMessage");
-        let msg = match msg_field {
-            Value::Object(Some(s)) => ctx.read_string(s).unwrap_or_default(),
-            _ => String::new(),
-        };
-        eprintln!(
-            "[wrap_ITE] original exception: {} \"{}\"",
-            exc_class_name, msg
-        );
-    }
 
     // When `InvocationTargetException` is still a synthetic JDK stub (no
     // real `<init>` bytecode), allocate and wire the `target` field without

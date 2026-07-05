@@ -2463,12 +2463,24 @@ fn register_pe2_struct_layouts(r: &mut NativeMethodRegistry) {
         "([Ljava/lang/foreign/MemoryLayout;)Ljava/lang/foreign/MemoryLayout;",
         pe_struct_layout,
     );
+    r.register(
+        ml,
+        "structLayout",
+        "([Ljava/lang/foreign/MemoryLayout;)Ljava/lang/foreign/StructLayout;",
+        pe_struct_layout,
+    );
 
     // MemoryLayout.unionLayout(members...) → UnionLayout
     r.register(
         ml,
         "unionLayout",
         "([Ljava/lang/foreign/MemoryLayout;)Ljava/lang/foreign/MemoryLayout;",
+        pe_union_layout,
+    );
+    r.register(
+        ml,
+        "unionLayout",
+        "([Ljava/lang/foreign/MemoryLayout;)Ljava/lang/foreign/UnionLayout;",
         pe_union_layout,
     );
 
@@ -2479,12 +2491,34 @@ fn register_pe2_struct_layouts(r: &mut NativeMethodRegistry) {
         "(JLjava/lang/foreign/MemoryLayout;)Ljava/lang/foreign/MemoryLayout;",
         pe_sequence_layout,
     );
+    r.register(
+        ml,
+        "sequenceLayout",
+        "(JLjava/lang/foreign/MemoryLayout;)Ljava/lang/foreign/SequenceLayout;",
+        pe_sequence_layout,
+    );
 
     // MemoryLayout.paddingLayout(bytes) → PaddingLayout
     r.register(
         ml,
         "paddingLayout",
         "(J)Ljava/lang/foreign/MemoryLayout;",
+        |ctx, args| {
+            let bytes = match args.first() {
+                Some(Value::Long(n)) => *n,
+                _ => 0,
+            };
+            let layout = alloc_concurrent_synthetic(ctx, "java/lang/foreign/MemoryLayout", 6);
+            ctx.set_field(layout, 0, Value::Int(LAYOUT_PADDING));
+            ctx.set_field(layout, 1, Value::Long(bytes));
+            ctx.set_field(layout, 5, Value::Long(1)); // alignment=1
+            Ok(Some(Value::Object(Some(layout))))
+        },
+    );
+    r.register(
+        ml,
+        "paddingLayout",
+        "(J)Ljava/lang/foreign/PaddingLayout;",
         |ctx, args| {
             let bytes = match args.first() {
                 Some(Value::Long(n)) => *n,
