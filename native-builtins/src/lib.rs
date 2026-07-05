@@ -14290,6 +14290,12 @@ pub fn register_essential_natives(registry: &mut NativeMethodRegistry) {
         "(Ljava/lang/Class;)Ljava/lang/annotation/Annotation;",
         lang_class::native_annotated_type_get_annotation,
     );
+    registry.register(
+        "sun/reflect/annotation/AnnotatedTypeFactory$AnnotatedTypeBaseImpl",
+        "getAnnotatedOwnerType",
+        "()Ljava/lang/reflect/AnnotatedType;",
+        lang_class::native_annotated_type_get_annotated_owner_type,
+    );
     // `AnnotatedParameterizedType.getAnnotatedActualTypeArguments()` --
     // surfaces TYPE_ARGUMENT-level annotations (e.g. `@Valid` in
     // `List<@Valid Person>`) that real-JDK's null `getTypeAnnotationBytes0`
@@ -14537,30 +14543,37 @@ pub fn register_essential_natives(registry: &mut NativeMethodRegistry) {
     // returns "file" instead of "/C:/.../quarkus-run.jar", and Quarkus's
     // `Path.of(URLDecoder.decode(getPath(), UTF_8)).getParent().getParent().getParent()`
     // NPEs at QuarkusEntryPoint.doRun:67.
-    fn url_path_or_file_field(ctx: &mut dyn NativeContext, url: ObjectRef) -> Value {
+    fn url_path_or_file_field(
+        ctx: &mut dyn NativeContext,
+        url: ObjectRef,
+        prefer_file: bool,
+    ) -> Value {
         let n = ctx.object_num_fields(url);
         if n == 1 {
             // legacy synthetic URL: slot 0 holds the path String.
             return ctx.get_field(url, 0);
         }
-        // Real-JDK layout: read by name. Prefer "path"; fall back to "file".
-        let v = ctx.get_field_by_name(url, "path");
+        let named_first = if prefer_file { "file" } else { "path" };
+        let named_second = if prefer_file { "path" } else { "file" };
+        let slot_first = if prefer_file { 3 } else { 6 };
+        let slot_second = if prefer_file { 6 } else { 3 };
+
+        let v = ctx.get_field_by_name(url, named_first);
         if let Value::Object(Some(_)) = v {
             return v;
         }
-        let v = ctx.get_field_by_name(url, "file");
-        if let Value::Object(Some(_)) = v {
-            return v;
-        }
-        // Last-ditch: slot 3 (file) then slot 6 (path) for the JDK layout.
-        if n > 6 {
-            let v = ctx.get_field(url, 6);
+        if n > slot_first {
+            let v = ctx.get_field(url, slot_first);
             if let Value::Object(Some(_)) = v {
                 return v;
             }
         }
-        if n > 3 {
-            let v = ctx.get_field(url, 3);
+        let v = ctx.get_field_by_name(url, named_second);
+        if let Value::Object(Some(_)) = v {
+            return v;
+        }
+        if n > slot_second {
+            let v = ctx.get_field(url, slot_second);
             if let Value::Object(Some(_)) = v {
                 return v;
             }
@@ -14572,7 +14585,7 @@ pub fn register_essential_natives(registry: &mut NativeMethodRegistry) {
         "getPath",
         "()Ljava/lang/String;",
         |ctx, args| match args.first() {
-            Some(Value::Object(Some(url))) => Ok(Some(url_path_or_file_field(ctx, *url))),
+            Some(Value::Object(Some(url))) => Ok(Some(url_path_or_file_field(ctx, *url, false))),
             _ => Ok(Some(Value::Object(None))),
         },
     );
@@ -14581,7 +14594,7 @@ pub fn register_essential_natives(registry: &mut NativeMethodRegistry) {
         "getFile",
         "()Ljava/lang/String;",
         |ctx, args| match args.first() {
-            Some(Value::Object(Some(url))) => Ok(Some(url_path_or_file_field(ctx, *url))),
+            Some(Value::Object(Some(url))) => Ok(Some(url_path_or_file_field(ctx, *url, true))),
             _ => Ok(Some(Value::Object(None))),
         },
     );
@@ -45192,15 +45205,40 @@ pub(crate) fn url_parse(ctx: &mut dyn NativeContext, this: ObjectRef, url_str: &
     // which used to leave `URI` field 5 empty and broke
     // `getSchemeSpecificPart() -> new File(...)` for Spring Boot's launcher.
     if let Some(rest) = url_str.strip_prefix("file:") {
-        let path_str = rest.to_string();
-        let path_obj = ctx.create_string(&path_str);
+        let (without_ref, ref_part) = if let Some(pos) = rest.find('#') {
+            (&rest[..pos], Some(&rest[pos + 1..]))
+        } else {
+            (rest, None)
+        };
+        let (path_str, query_part) = if let Some(pos) = without_ref.find('?') {
+            (&without_ref[..pos], Some(&without_ref[pos + 1..]))
+        } else {
+            (without_ref, None)
+        };
+        let file_str = if let Some(query) = query_part {
+            format!("{path_str}?{query}")
+        } else {
+            path_str.to_string()
+        };
+        let file_obj = ctx.create_string(&file_str);
+        let path_obj = ctx.create_string(path_str);
+        let query_obj = query_part
+            .filter(|query| !query.is_empty())
+            .map(|query| ctx.create_string(query));
+        let ref_obj = ref_part
+            .filter(|fragment| !fragment.is_empty())
+            .map(|fragment| ctx.create_string(fragment));
         let proto_obj = ctx.create_string("file");
         let host_empty = ctx.create_string("");
         ctx.set_field(this, URL_FIELD_PROTOCOL, Value::Object(Some(proto_obj)));
         ctx.set_field(this, URL_FIELD_HOST, Value::Object(Some(host_empty)));
         ctx.set_field(this, URL_FIELD_PORT, Value::Int(-1));
         ctx.set_field(this, URL_FIELD_PATH, Value::Object(Some(path_obj)));
-        ctx.set_field(this, URL_FIELD_QUERY, Value::Object(None));
+        ctx.set_field(this, URL_FIELD_QUERY, Value::Object(query_obj));
+        ctx.set_field_by_name(this, "file", Value::Object(Some(file_obj)));
+        ctx.set_field_by_name(this, "path", Value::Object(Some(path_obj)));
+        ctx.set_field_by_name(this, "query", Value::Object(query_obj));
+        ctx.set_field_by_name(this, "ref", Value::Object(ref_obj));
         // Intentionally skip writing `URL_FIELD_FULL` (slot index 5): for a
         // real-JDK URL instance that index aliases the real `authority`
         // field (see the sibling `jar:` fast path below, which already
@@ -45282,10 +45320,16 @@ pub(crate) fn url_parse(ctx: &mut dyn NativeContext, this: ObjectRef, url_str: &
     let proto_obj = ctx.create_string(protocol);
     let host_obj = ctx.create_string(host);
     let path_obj = ctx.create_string(path);
-    let query_obj = if query.is_empty() {
-        Value::Object(None)
+    let file_str = if query.is_empty() {
+        path.to_string()
     } else {
-        Value::Object(Some(ctx.create_string(query)))
+        format!("{path}?{query}")
+    };
+    let file_obj = ctx.create_string(&file_str);
+    let query_obj = if query.is_empty() {
+        None
+    } else {
+        Some(ctx.create_string(query))
     };
     let full_obj = ctx.create_string(url_str);
 
@@ -45293,8 +45337,11 @@ pub(crate) fn url_parse(ctx: &mut dyn NativeContext, this: ObjectRef, url_str: &
     ctx.set_field(this, URL_FIELD_HOST, Value::Object(Some(host_obj)));
     ctx.set_field(this, URL_FIELD_PORT, Value::Int(port));
     ctx.set_field(this, URL_FIELD_PATH, Value::Object(Some(path_obj)));
-    ctx.set_field(this, URL_FIELD_QUERY, query_obj);
+    ctx.set_field(this, URL_FIELD_QUERY, Value::Object(query_obj));
     ctx.set_field(this, URL_FIELD_FULL, Value::Object(Some(full_obj)));
+    ctx.set_field_by_name(this, "file", Value::Object(Some(file_obj)));
+    ctx.set_field_by_name(this, "path", Value::Object(Some(path_obj)));
+    ctx.set_field_by_name(this, "query", Value::Object(query_obj));
 }
 
 fn native_url_init(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
@@ -45371,6 +45418,9 @@ fn native_url_get_path(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCal
         Some(Value::Object(Some(o))) => *o,
         _ => return Ok(Some(Value::Object(None))),
     };
+    if let Value::Object(Some(path)) = ctx.get_field_by_name(this, "path") {
+        return Ok(Some(Value::Object(Some(path))));
+    }
     Ok(Some(ctx.get_field(this, URL_FIELD_PATH)))
 }
 fn native_url_get_query(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
@@ -45378,6 +45428,9 @@ fn native_url_get_query(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCa
         Some(Value::Object(Some(o))) => *o,
         _ => return Ok(Some(Value::Object(None))),
     };
+    if let Value::Object(Some(query)) = ctx.get_field_by_name(this, "query") {
+        return Ok(Some(Value::Object(Some(query))));
+    }
     Ok(Some(ctx.get_field(this, URL_FIELD_QUERY)))
 }
 fn native_url_get_file(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
@@ -45385,6 +45438,9 @@ fn native_url_get_file(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCal
         Some(Value::Object(Some(o))) => *o,
         _ => return Ok(Some(Value::Object(None))),
     };
+    if let Value::Object(Some(file)) = ctx.get_field_by_name(this, "file") {
+        return Ok(Some(Value::Object(Some(file))));
+    }
     let path = match ctx.get_field(this, URL_FIELD_PATH) {
         Value::Object(Some(s)) => ctx.read_string(s).unwrap_or_default(),
         _ => String::new(),

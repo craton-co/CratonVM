@@ -13597,7 +13597,8 @@ fn annotated_type_impl_class_name(
 
     let cid = ctx.class_id_of_object(backing_type);
     match ctx.class_name_of_id(cid).unwrap_or_default().as_str() {
-        "java/lang/reflect/GenericArrayType" => ARRAY,
+        "java/lang/reflect/GenericArrayType"
+        | "sun/reflect/generics/reflectiveObjects/GenericArrayTypeImpl" => ARRAY,
         "java/lang/reflect/TypeVariable"
         | "sun/reflect/generics/reflectiveObjects/TypeVariableImpl" => TYPE_VAR,
         "java/lang/reflect/ParameterizedType"
@@ -14017,6 +14018,61 @@ pub(crate) fn native_annotated_type_get_annotation(
             }
         }
     }
+    Ok(Some(Value::Object(None)))
+}
+
+/// `AnnotatedType.getAnnotatedOwnerType()` override for CratonVM-built
+/// `AnnotatedTypeBaseImpl` instances.
+///
+/// The real JDK implementation reconstructs the owner from type-annotation
+/// location state. CratonVM constructs these wrappers directly from an already
+/// reified `Type` and does not populate the full location graph, so falling
+/// through into that bytecode can confuse reflective readers such as ByteBuddy's
+/// JavaDispatcher during Mockito inline mock generation. For the top-level
+/// types used by `java.nio.file.Path` this is simply null; for parameterized
+/// nested types, preserve the useful case by wrapping `ParameterizedType`'s
+/// owner type when one exists.
+pub(crate) fn native_annotated_type_get_annotated_owner_type(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    let this = obj_arg(args, 0)?;
+    let backing_type = match ctx.get_field_by_name(this, "type") {
+        Value::Object(Some(t)) => t,
+        _ => return Ok(Some(Value::Object(None))),
+    };
+
+    let backing_cid = ctx.class_id_of_object(backing_type);
+    let backing_name = ctx.class_name_of_id(backing_cid).unwrap_or_default();
+
+    if matches!(
+        backing_name.as_str(),
+        "java/lang/reflect/ParameterizedType"
+            | "sun/reflect/generics/reflectiveObjects/ParameterizedTypeImpl"
+    ) {
+        if let Ok(Some(Value::Object(Some(owner)))) = ctx.invoke_virtual(
+            backing_type,
+            "getOwnerType",
+            "()Ljava/lang/reflect/Type;",
+            &[],
+        ) {
+            let at = make_annotated_type(ctx, owner);
+            return Ok(Some(Value::Object(Some(at))));
+        }
+    }
+
+    if backing_name == "java/lang/Class" {
+        if let Ok(Some(Value::Object(Some(owner)))) = ctx.invoke_virtual(
+            backing_type,
+            "getDeclaringClass",
+            "()Ljava/lang/Class;",
+            &[],
+        ) {
+            let at = make_annotated_type(ctx, owner);
+            return Ok(Some(Value::Object(Some(at))));
+        }
+    }
+
     Ok(Some(Value::Object(None)))
 }
 

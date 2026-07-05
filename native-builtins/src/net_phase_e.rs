@@ -1927,13 +1927,31 @@ fn register_uri_natives(r: &mut NativeMethodRegistry) {
         } else {
             &raw[proto.len() + 1..]
         };
+        let (file_without_ref, ref_part) = if let Some(pos) = file.find('#') {
+            (&file[..pos], Some(&file[pos + 1..]))
+        } else {
+            (file, None)
+        };
+        let (path, query_part) = if let Some(pos) = file_without_ref.find('?') {
+            (&file_without_ref[..pos], Some(&file_without_ref[pos + 1..]))
+        } else {
+            (file_without_ref, None)
+        };
         let proto_s = ctx.create_string(proto);
-        let file_s = ctx.create_string(file);
+        let file_s = ctx.create_string(file_without_ref);
+        let path_s = ctx.create_string(path);
+        let query_s = query_part
+            .filter(|query| !query.is_empty())
+            .map(|query| ctx.create_string(query));
+        let ref_s = ref_part
+            .filter(|fragment| !fragment.is_empty())
+            .map(|fragment| ctx.create_string(fragment));
         let host_s = ctx.create_string("");
         ctx.set_field(url, 0, Value::Object(Some(proto_s)));
         ctx.set_field(url, 1, Value::Object(Some(host_s)));
         ctx.set_field(url, 2, Value::Int(-1));
         ctx.set_field(url, 3, Value::Object(Some(file_s)));
+        ctx.set_field(url, 4, Value::Object(query_s));
         // Field 5 is the real `java.net.URL.authority` field — leave it
         // `null` (as real JDK does for a host-less URL) instead of stuffing
         // the whole raw URL string there. That anti-pattern (already fixed
@@ -1950,7 +1968,8 @@ fn register_uri_natives(r: &mut NativeMethodRegistry) {
         // otherwise succeed (systemId is already absolute). See
         // Jaxb2CollectionHttpMessageConverterTests
         // .readXmlRootElementExternalEntityEnabled().
-        ctx.set_field(url, 6, Value::Object(Some(file_s)));
+        ctx.set_field(url, 6, Value::Object(Some(path_s)));
+        ctx.set_field(url, 8, Value::Object(ref_s));
         Ok(Some(Value::Object(Some(url))))
     });
 

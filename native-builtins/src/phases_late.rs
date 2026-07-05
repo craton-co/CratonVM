@@ -6125,15 +6125,7 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
         },
     );
 
-    r.register(files, "size", "(Ljava/nio/file/Path;)J", |ctx, args| {
-        let path_obj = obj_arg(args, 0)?;
-        let p = p57_read_path(ctx, path_obj);
-        let size = match vfs_read(&p) {
-            Some(r) => r.map(|b| b.len() as u64).unwrap_or(0),
-            None => std::fs::metadata(&p).map(|m| m.len()).unwrap_or(0),
-        };
-        Ok(Some(Value::Long(size as i64)))
-    });
+    r.register(files, "size", "(Ljava/nio/file/Path;)J", p59_files_size);
 
     // `Files.list` / `Files.walk` return a `Stream<Path>` built (in the real
     // JDK) by wrapping `newDirectoryStream(dir).iterator()` in a
@@ -20703,6 +20695,27 @@ fn extract_path_string(ctx: &mut dyn NativeContext, arg: Option<&Value>) -> Stri
     p57_to_os_path(&raw)
 }
 
+fn p59_files_size(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let path_str = extract_path_string(ctx, args.first());
+    if let Some(bytes) = vfs_read(&path_str) {
+        return match bytes {
+            Ok(b) => Ok(Some(Value::Long(b.len() as i64))),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                Err(p57_no_such_file(ctx, &path_str))
+            }
+            Err(e) => Err(p57_io_error(&e)),
+        };
+    }
+
+    match std::fs::metadata(&path_str) {
+        Ok(meta) => Ok(Some(Value::Long(meta.len() as i64))),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            Err(p57_no_such_file(ctx, &path_str))
+        }
+        Err(e) => Err(p57_io_error(&e)),
+    }
+}
+
 /// Convert a SystemTime to epoch millis
 fn system_time_to_millis(t: std::time::SystemTime) -> i64 {
     t.duration_since(std::time::UNIX_EPOCH)
@@ -23426,23 +23439,7 @@ pub(crate) fn register_p61_files_path(r: &mut NativeMethodRegistry) {
             }
         },
     );
-    r.register(files, "size", "(Ljava/nio/file/Path;)J", |ctx, args| {
-        if let Some(Value::Object(Some(path_ref))) = args.first() {
-            let path_str = match ctx.get_field(*path_ref, 0) {
-                Value::Object(Some(s)) => ctx.read_string(s).unwrap_or_default(),
-                _ => return Ok(Some(Value::Long(0))),
-            };
-            let size = match vfs_read(&path_str) {
-                Some(r) => r.map(|b| b.len() as i64).unwrap_or(0),
-                None => std::fs::metadata(&path_str)
-                    .map(|m| m.len() as i64)
-                    .unwrap_or(0),
-            };
-            Ok(Some(Value::Long(size)))
-        } else {
-            Ok(Some(Value::Long(0)))
-        }
-    });
+    r.register(files, "size", "(Ljava/nio/file/Path;)J", p59_files_size);
     r.register(
         files,
         "isReadable",

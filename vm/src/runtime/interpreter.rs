@@ -3252,7 +3252,8 @@ pub fn execute(
                     &class_name_owned,
                     method_name,
                     method_descriptor,
-                );
+                )
+                && !redefine_immune_path_native(&class_name_owned, method_name, method_descriptor);
             if method_name != "<init>" && method_name != "<clinit>" && !class_redefined {
                 if let Some(cb) =
                     shared
@@ -18223,6 +18224,10 @@ pub(crate) fn is_typeuse_annotation_native_override(
                     "getDeclaredAnnotations",
                     "()[Ljava/lang/annotation/Annotation;"
                 )
+                | (
+                    "getAnnotatedOwnerType",
+                    "()Ljava/lang/reflect/AnnotatedType;"
+                )
         ),
         _ => false,
     }
@@ -19540,6 +19545,16 @@ fn redefine_immune_string_builder_native(
     ) && matches!(method_name, "<init>" | "append" | "toString")
 }
 
+fn redefine_immune_path_native(
+    class_name: &str,
+    method_name: &str,
+    method_descriptor: &str,
+) -> bool {
+    class_name == "java/nio/file/Path"
+        && method_name == "toString"
+        && method_descriptor == "()Ljava/lang/String;"
+}
+
 /// Dispatch a force-native override via `safe_native_call`, pushing any return
 /// value onto the caller operand stack.
 #[inline]
@@ -19573,6 +19588,7 @@ fn intercept_force_registered_native(
     if native_shadow_suppressed_by_redefine(shared, class_name)
         && !redefine_immune_reflection_native(class_name, method_name)
         && !redefine_immune_string_builder_native(class_name, method_name, method_descriptor)
+        && !redefine_immune_path_native(class_name, method_name, method_descriptor)
     {
         return None;
     }
@@ -19913,6 +19929,7 @@ fn try_stackless_invoke(
             if native_shadow_suppressed_by_redefine(shared, &parent.name)
                 && !redefine_immune_reflection_native(&parent.name, method_name)
                 && !redefine_immune_string_builder_native(&parent.name, method_name, descriptor)
+                && !redefine_immune_path_native(&parent.name, method_name, descriptor)
             {
                 return None;
             }
@@ -19934,6 +19951,7 @@ fn try_stackless_invoke(
     let native_cb = if native_shadow_suppressed_by_redefine(shared, class_name)
         && !redefine_immune_reflection_native(class_name, method_name)
         && !redefine_immune_string_builder_native(class_name, method_name, descriptor)
+        && !redefine_immune_path_native(class_name, method_name, descriptor)
     {
         None
     } else {
@@ -20113,7 +20131,8 @@ fn try_stackless_invoke(
     if !(declaring_is_interface && !is_static)
         && (!native_shadow_suppressed_by_redefine(shared, &class_name_arc)
             || redefine_immune_reflection_native(&class_name_arc, method_name)
-            || redefine_immune_string_builder_native(&class_name_arc, method_name, descriptor))
+            || redefine_immune_string_builder_native(&class_name_arc, method_name, descriptor)
+            || redefine_immune_path_native(&class_name_arc, method_name, descriptor))
     {
         if let Some(callback) = shared
             .native_methods
@@ -25912,6 +25931,11 @@ fn execute_invokevirtual_vtable_fast(
                     &method_name,
                     &method_descriptor,
                 )
+                && !redefine_immune_path_native(
+                    &declaring_class.name,
+                    &method_name,
+                    &method_descriptor,
+                )
             {
                 return Some(false);
             }
@@ -25970,7 +25994,8 @@ fn execute_invokevirtual_vtable_fast(
                     rcv_name,
                     &method_name,
                     &method_descriptor,
-                );
+                )
+                && !redefine_immune_path_native(rcv_name, &method_name, &method_descriptor);
             // WP2.7 — annotation proxies have no real bytecode for
             // equals/hashCode/toString. Force fall-through to the slow path
             // so `execute_invoke`'s annotation_proxy interception layer
@@ -26172,7 +26197,8 @@ fn execute_invokevirtual_vtable_fast(
                     &parent.name,
                     &method_name,
                     &method_descriptor,
-                );
+                )
+                && !redefine_immune_path_native(&parent.name, &method_name, &method_descriptor);
                             let has_native = !parent_redefined
                                 && shared
                                     .native_methods
@@ -27358,7 +27384,8 @@ fn populate_virtual_invoke_cache(
                             &parent_name,
                             &method_name,
                             &descriptor,
-                        );
+                        )
+                        && !redefine_immune_path_native(&parent_name, &method_name, &descriptor);
                     if parent_redefined {
                         break;
                     }
