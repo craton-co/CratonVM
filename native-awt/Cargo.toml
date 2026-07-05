@@ -26,6 +26,7 @@ tracing = { version = "0.1", features = ["release_max_level_info"] }
 parking_lot.workspace = true
 bitflags = "2"
 rustc-hash.workspace = true
+image_crate = { package = "image", version = "0.25", default-features = false, features = ["jpeg", "png"] }
 # fontdue is pure Rust — used by the X11 and Cocoa backends for glyph
 # rasterization. Declared at the top level so it is available on all
 # target platforms that need it (Linux, macOS). The Windows backend uses

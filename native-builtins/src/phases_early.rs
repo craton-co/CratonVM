@@ -3201,6 +3201,122 @@ pub(crate) fn register_phase50_natives(registry: &mut NativeMethodRegistry) {
     registry.set_category(__prev_cat);
 }
 
+fn atomic_int_update_with_operator(
+    ctx: &mut dyn NativeContext,
+    this: ObjectRef,
+    op: ObjectRef,
+    return_new: bool,
+) -> MethodCallResult {
+    let this_pin = ctx.pin_native_root(this);
+    let op_pin = ctx.pin_native_root(op);
+    let mut this_cur = this;
+    let mut op_cur = op;
+    loop {
+        this_cur = ctx.read_native_pin(this_pin, this_cur);
+        op_cur = ctx.read_native_pin(op_pin, op_cur);
+        let cur = ctx.get_field_volatile(this_cur, 0);
+        let applied = match ctx.invoke_virtual(op_cur, "applyAsInt", "(I)I", &[cur]) {
+            Ok(v) => v.unwrap_or(Value::Int(0)),
+            Err(e) => {
+                ctx.unpin_native_roots(this_pin);
+                return Err(e);
+            }
+        };
+        this_cur = ctx.read_native_pin(this_pin, this_cur);
+        if ctx.compare_and_swap_field(this_cur, 0, cur, applied) {
+            ctx.unpin_native_roots(this_pin);
+            return Ok(Some(if return_new { applied } else { cur }));
+        }
+    }
+}
+
+fn atomic_long_update_with_operator(
+    ctx: &mut dyn NativeContext,
+    this: ObjectRef,
+    op: ObjectRef,
+    return_new: bool,
+) -> MethodCallResult {
+    let this_pin = ctx.pin_native_root(this);
+    let op_pin = ctx.pin_native_root(op);
+    let mut this_cur = this;
+    let mut op_cur = op;
+    loop {
+        this_cur = ctx.read_native_pin(this_pin, this_cur);
+        op_cur = ctx.read_native_pin(op_pin, op_cur);
+        let cur = ctx.get_field_volatile(this_cur, 0);
+        let applied = match ctx.invoke_virtual(op_cur, "applyAsLong", "(J)J", &[cur]) {
+            Ok(v) => v.unwrap_or(Value::Long(0)),
+            Err(e) => {
+                ctx.unpin_native_roots(this_pin);
+                return Err(e);
+            }
+        };
+        this_cur = ctx.read_native_pin(this_pin, this_cur);
+        if ctx.compare_and_swap_field(this_cur, 0, cur, applied) {
+            ctx.unpin_native_roots(this_pin);
+            return Ok(Some(if return_new { applied } else { cur }));
+        }
+    }
+}
+
+fn pinned_object_value(ctx: &mut dyn NativeContext, value: Value) -> Option<(usize, ObjectRef)> {
+    match value {
+        Value::Object(Some(obj)) => Some((ctx.pin_native_root(obj), obj)),
+        _ => None,
+    }
+}
+
+fn read_pinned_object_value(
+    ctx: &dyn NativeContext,
+    pin: Option<(usize, ObjectRef)>,
+    fallback: Value,
+) -> Value {
+    match pin {
+        Some((handle, obj)) => Value::Object(Some(ctx.read_native_pin(handle, obj))),
+        None => fallback,
+    }
+}
+
+fn atomic_reference_update_with_operator(
+    ctx: &mut dyn NativeContext,
+    this: ObjectRef,
+    op: ObjectRef,
+    return_new: bool,
+) -> MethodCallResult {
+    let this_pin = ctx.pin_native_root(this);
+    let op_pin = ctx.pin_native_root(op);
+    let mut this_cur = this;
+    let mut op_cur = op;
+    loop {
+        this_cur = ctx.read_native_pin(this_pin, this_cur);
+        op_cur = ctx.read_native_pin(op_pin, op_cur);
+        let cur = ctx.get_field_volatile(this_cur, 0);
+        let cur_pin = pinned_object_value(ctx, cur);
+        let arg = read_pinned_object_value(ctx, cur_pin, cur);
+        let applied = match ctx.invoke_virtual(
+            op_cur,
+            "apply",
+            "(Ljava/lang/Object;)Ljava/lang/Object;",
+            &[arg],
+        ) {
+            Ok(v) => v.unwrap_or(Value::Object(None)),
+            Err(e) => {
+                ctx.unpin_native_roots(this_pin);
+                return Err(e);
+            }
+        };
+        this_cur = ctx.read_native_pin(this_pin, this_cur);
+        let expected = read_pinned_object_value(ctx, cur_pin, cur);
+        if let Some((handle, _)) = cur_pin {
+            ctx.unpin_native_roots(handle);
+        }
+        if ctx.compare_and_swap_field(this_cur, 0, expected, applied) {
+            ctx.unpin_native_roots(this_pin);
+            return Ok(Some(if return_new { applied } else { expected }));
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // ThreadLocal — per-thread storage (audit-round7 CRIT fixes 1/2/3).
 // ---------------------------------------------------------------------------
@@ -13936,15 +14052,7 @@ pub(crate) fn register_phase54_atomics(r: &mut NativeMethodRegistry) {
                     .into())
                 }
             };
-            loop {
-                let cur = ctx.get_field_volatile(this, 0);
-                let applied = ctx
-                    .invoke_virtual(op, "applyAsInt", "(I)I", &[cur])?
-                    .unwrap_or(Value::Int(0));
-                if ctx.compare_and_swap_field(this, 0, cur, applied) {
-                    return Ok(Some(cur));
-                }
-            }
+            atomic_int_update_with_operator(ctx, this, op, false)
         },
     );
     r.register(
@@ -13962,15 +14070,7 @@ pub(crate) fn register_phase54_atomics(r: &mut NativeMethodRegistry) {
                     .into())
                 }
             };
-            loop {
-                let cur = ctx.get_field_volatile(this, 0);
-                let applied = ctx
-                    .invoke_virtual(op, "applyAsInt", "(I)I", &[cur])?
-                    .unwrap_or(Value::Int(0));
-                if ctx.compare_and_swap_field(this, 0, cur, applied) {
-                    return Ok(Some(applied));
-                }
-            }
+            atomic_int_update_with_operator(ctx, this, op, true)
         },
     );
     r.register(ai, "getAcquire", "()I", |ctx, args| {
@@ -14184,15 +14284,7 @@ pub(crate) fn register_phase54_atomics(r: &mut NativeMethodRegistry) {
                     .into())
                 }
             };
-            loop {
-                let cur = ctx.get_field_volatile(this, 0);
-                let applied = ctx
-                    .invoke_virtual(op, "applyAsLong", "(J)J", &[cur])?
-                    .unwrap_or(Value::Long(0));
-                if ctx.compare_and_swap_field(this, 0, cur, applied) {
-                    return Ok(Some(cur));
-                }
-            }
+            atomic_long_update_with_operator(ctx, this, op, false)
         },
     );
     r.register(
@@ -14210,15 +14302,7 @@ pub(crate) fn register_phase54_atomics(r: &mut NativeMethodRegistry) {
                     .into())
                 }
             };
-            loop {
-                let cur = ctx.get_field_volatile(this, 0);
-                let applied = ctx
-                    .invoke_virtual(op, "applyAsLong", "(J)J", &[cur])?
-                    .unwrap_or(Value::Long(0));
-                if ctx.compare_and_swap_field(this, 0, cur, applied) {
-                    return Ok(Some(applied));
-                }
-            }
+            atomic_long_update_with_operator(ctx, this, op, true)
         },
     );
     r.register(al, "intValue", "()I", |ctx, args| {
@@ -14423,20 +14507,7 @@ pub(crate) fn register_phase54_atomics(r: &mut NativeMethodRegistry) {
                     .into())
                 }
             };
-            loop {
-                let cur = ctx.get_field_volatile(this, 0);
-                let applied = ctx
-                    .invoke_virtual(
-                        op,
-                        "apply",
-                        "(Ljava/lang/Object;)Ljava/lang/Object;",
-                        &[cur],
-                    )?
-                    .unwrap_or(Value::Object(None));
-                if ctx.compare_and_swap_field(this, 0, cur, applied) {
-                    return Ok(Some(cur));
-                }
-            }
+            atomic_reference_update_with_operator(ctx, this, op, false)
         },
     );
     r.register(
@@ -14454,20 +14525,7 @@ pub(crate) fn register_phase54_atomics(r: &mut NativeMethodRegistry) {
                     .into())
                 }
             };
-            loop {
-                let cur = ctx.get_field_volatile(this, 0);
-                let applied = ctx
-                    .invoke_virtual(
-                        op,
-                        "apply",
-                        "(Ljava/lang/Object;)Ljava/lang/Object;",
-                        &[cur],
-                    )?
-                    .unwrap_or(Value::Object(None));
-                if ctx.compare_and_swap_field(this, 0, cur, applied) {
-                    return Ok(Some(applied));
-                }
-            }
+            atomic_reference_update_with_operator(ctx, this, op, true)
         },
     );
     r.register(ar, "toString", "()Ljava/lang/String;", |ctx, args| {
@@ -17422,6 +17480,7 @@ mod t2_tests {
     use super::*;
     use crate::test_utils::{mock_ctx, MockNativeContext};
     use cratonvm_types::{ArrayElementType, ObjectRef};
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     // -----------------------------------------------------------------------
     // T2.3.13: StringTokenizer.countTokens — O(n) single pass
@@ -17590,6 +17649,86 @@ mod t2_tests {
             .wrapping_mul(31)
             .wrapping_add(11);
         assert_eq!(result.unwrap(), Some(Value::Int(expected)));
+    }
+
+    static ATOMIC_REF_TARGET_OLD: AtomicUsize = AtomicUsize::new(0);
+    static ATOMIC_REF_TARGET_NEW: AtomicUsize = AtomicUsize::new(0);
+    static ATOMIC_REF_OP_OLD: AtomicUsize = AtomicUsize::new(0);
+    static ATOMIC_REF_OP_NEW: AtomicUsize = AtomicUsize::new(0);
+    static ATOMIC_REF_CUR_OLD: AtomicUsize = AtomicUsize::new(0);
+    static ATOMIC_REF_CUR_NEW: AtomicUsize = AtomicUsize::new(0);
+    static ATOMIC_REF_APPLIED: AtomicUsize = AtomicUsize::new(0);
+    static ATOMIC_REF_APPLY_CALLS: AtomicUsize = AtomicUsize::new(0);
+
+    fn relocating_atomic_ref_apply(
+        ctx: &mut MockNativeContext,
+        receiver: ObjectRef,
+        method_name: &str,
+        descriptor: &str,
+        args: &[Value],
+    ) -> Option<MethodCallResult> {
+        if (method_name, descriptor) != ("apply", "(Ljava/lang/Object;)Ljava/lang/Object;") {
+            return None;
+        }
+        ATOMIC_REF_APPLY_CALLS.fetch_add(1, Ordering::SeqCst);
+        assert_eq!(
+            receiver.as_ptr() as usize,
+            ATOMIC_REF_OP_OLD.load(Ordering::SeqCst)
+        );
+        assert_eq!(
+            args.first().copied(),
+            Some(Value::Object(Some(unsafe {
+                ObjectRef::from_raw(ATOMIC_REF_CUR_OLD.load(Ordering::SeqCst) as *mut u8)
+            })))
+        );
+        ctx.remap_native_pin_addr_for_test(
+            ATOMIC_REF_TARGET_OLD.load(Ordering::SeqCst),
+            ATOMIC_REF_TARGET_NEW.load(Ordering::SeqCst),
+        );
+        ctx.remap_native_pin_addr_for_test(
+            ATOMIC_REF_OP_OLD.load(Ordering::SeqCst),
+            ATOMIC_REF_OP_NEW.load(Ordering::SeqCst),
+        );
+        ctx.remap_native_pin_addr_for_test(
+            ATOMIC_REF_CUR_OLD.load(Ordering::SeqCst),
+            ATOMIC_REF_CUR_NEW.load(Ordering::SeqCst),
+        );
+        Some(Ok(Some(Value::Object(Some(unsafe {
+            ObjectRef::from_raw(ATOMIC_REF_APPLIED.load(Ordering::SeqCst) as *mut u8)
+        })))))
+    }
+
+    #[test]
+    fn atomic_reference_update_rereads_pins_after_operator_gc() {
+        let mut ctx = mock_ctx();
+        let target_old = ctx.fresh_object_ref();
+        let target_new = ctx.fresh_object_ref();
+        let op_old = ctx.fresh_object_ref();
+        let op_new = ctx.fresh_object_ref();
+        let cur_old = ctx.fresh_object_ref();
+        let cur_new = ctx.fresh_object_ref();
+        let applied = ctx.fresh_object_ref();
+
+        ctx.set_field(target_old, 0, Value::Object(Some(cur_old)));
+        ctx.set_field(target_new, 0, Value::Object(Some(cur_new)));
+
+        ATOMIC_REF_TARGET_OLD.store(target_old.as_ptr() as usize, Ordering::SeqCst);
+        ATOMIC_REF_TARGET_NEW.store(target_new.as_ptr() as usize, Ordering::SeqCst);
+        ATOMIC_REF_OP_OLD.store(op_old.as_ptr() as usize, Ordering::SeqCst);
+        ATOMIC_REF_OP_NEW.store(op_new.as_ptr() as usize, Ordering::SeqCst);
+        ATOMIC_REF_CUR_OLD.store(cur_old.as_ptr() as usize, Ordering::SeqCst);
+        ATOMIC_REF_CUR_NEW.store(cur_new.as_ptr() as usize, Ordering::SeqCst);
+        ATOMIC_REF_APPLIED.store(applied.as_ptr() as usize, Ordering::SeqCst);
+        ATOMIC_REF_APPLY_CALLS.store(0, Ordering::SeqCst);
+        ctx.set_invoke_virtual_hook(relocating_atomic_ref_apply);
+
+        let result = atomic_reference_update_with_operator(&mut ctx, target_old, op_old, true);
+
+        assert_eq!(result.unwrap(), Some(Value::Object(Some(applied))));
+        assert_eq!(ATOMIC_REF_APPLY_CALLS.load(Ordering::SeqCst), 1);
+        assert_eq!(ctx.get_field(target_new, 0), Value::Object(Some(applied)));
+        assert_eq!(ctx.get_field(target_old, 0), Value::Object(Some(cur_old)));
+        assert_eq!(ctx.native_pin_count_for_test(), 0);
     }
 
     /// Reference 31-mul-accumulating hash that mirrors the Java formula.

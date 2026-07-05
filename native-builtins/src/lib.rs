@@ -68,8 +68,9 @@ pub(crate) fn native_unsafe_ensure_class_initialized(
         return Ok(None);
     }
     match class_name.as_str() {
-        "boolean" | "byte" | "char" | "short" | "int" | "long" | "float" | "double"
-        | "void" => return Ok(None),
+        "boolean" | "byte" | "char" | "short" | "int" | "long" | "float" | "double" | "void" => {
+            return Ok(None)
+        }
         _ => {}
     }
     ctx.ensure_class_initialized(&class_name)?;
@@ -12396,6 +12397,12 @@ pub fn register_essential_natives(registry: &mut NativeMethodRegistry) {
         "()Ljava/lang/String;",
         lang_string::native_string_intern,
     );
+    registry.register(
+        "java/lang/String",
+        "<init>",
+        "(Ljava/lang/AbstractStringBuilder;Ljava/lang/Void;)V",
+        lang_string::native_string_init_abstract_string_builder,
+    );
     // String.valueOf and Integer.toString overrides: the JDK bytecode path uses
     // Unsafe.putByte for byte-level array access which doesn't map to our
     // slot-based heap model (Unsafe offsets are raw byte offsets in HotSpot).
@@ -13600,6 +13607,9 @@ pub fn register_essential_natives(registry: &mut NativeMethodRegistry) {
         "()Ljava/lang/module/ModuleDescriptor;",
         |ctx, args| {
             let this = obj_arg(args, 0)?;
+            if let Value::Object(Some(desc)) = ctx.get_field_by_name(this, "descriptor") {
+                return Ok(Some(Value::Object(Some(desc))));
+            }
             let module_name = module_name_of_mirror(ctx, this);
             if module_name.is_empty() {
                 // Unnamed module — matches real Module.getDescriptor()'s null.
@@ -13635,6 +13645,12 @@ pub fn register_essential_natives(registry: &mut NativeMethodRegistry) {
             ctx.set_field(desc, 0, name_val); // legacy synthetic slot
             ctx.set_field(desc, 1, Value::Int(0)); // legacy synthetic slot
             ctx.set_field_by_name(desc, "name", name_val);
+            for field in ["modifiers", "requires", "exports", "opens", "provides", "packages"] {
+                let empty = cratonvm_native_collections::make_hashset_with_elements(ctx, &[]);
+                let desc = ctx.read_native_pin(pin, desc);
+                ctx.set_field_by_name(desc, field, Value::Object(Some(empty)));
+            }
+            let desc = ctx.read_native_pin(pin, desc);
             ctx.set_field_by_name(desc, "uses", Value::Object(Some(uses_set)));
             ctx.set_field_by_name(desc, "open", Value::Int(if is_open { 1 } else { 0 }));
             // `automatic` deliberately left at its Java default (`false`) and
@@ -15498,6 +15514,47 @@ pub fn register_essential_natives(registry: &mut NativeMethodRegistry) {
     registry.register("jdk/internal/misc/VM", "isBooted", "()Z", |_ctx, _args| {
         Ok(Some(Value::Int(1)))
     });
+    // The real JDK predicates read VM.classFileMajorVersion, a private static
+    // normally initialized by HotSpot during early boot. CratonVM does not run
+    // that path, so the field remains zero and JDK module-info parsing rejects
+    // every descriptor as "Unsupported major.minor version 53.0" before
+    // Elasticsearch's embedded provider modules can load. Mirror JDK 21+'s
+    // predicate semantics but use the classfile ceiling this VM advertises via
+    // java.class.version / multi-release handling: Java 25 => major 69.
+    registry.register(
+        "jdk/internal/misc/VM",
+        "isSupportedClassFileVersion",
+        "(II)Z",
+        |_ctx, args| {
+            let major = match args.first() {
+                Some(Value::Int(v)) => *v,
+                _ => 0,
+            };
+            let minor = match args.get(1) {
+                Some(Value::Int(v)) => *v,
+                _ => 0,
+            };
+            let ok = (45..=69).contains(&major) && (major < 56 || minor == 0 || minor == 65535);
+            Ok(Some(Value::Int(ok as i32)))
+        },
+    );
+    registry.register(
+        "jdk/internal/misc/VM",
+        "isSupportedModuleDescriptorVersion",
+        "(II)Z",
+        |_ctx, args| {
+            let major = match args.first() {
+                Some(Value::Int(v)) => *v,
+                _ => 0,
+            };
+            let minor = match args.get(1) {
+                Some(Value::Int(v)) => *v,
+                _ => 0,
+            };
+            let ok = (53..=69).contains(&major) && (major < 56 || minor == 0 || minor == 65535);
+            Ok(Some(Value::Int(ok as i32)))
+        },
+    );
     // WP1.3: awaitInitLevel(int) blocks on the process-wide condvar
     // until the level reaches `n`.  Matches HotSpot's
     // `JVM_AwaitInitLevel` — used by JDK internals (e.g. the
@@ -16033,7 +16090,7 @@ pub fn register_essential_natives(registry: &mut NativeMethodRegistry) {
         u2,
         "staticFieldOffset0",
         "(Ljava/lang/reflect/Field;)J",
-        native_unsafe_object_field_offset,
+        native_unsafe_static_field_offset,
     );
     registry.register(
         u2,
@@ -19803,6 +19860,7 @@ fn register_annotation_overrides(registry: &mut NativeMethodRegistry) {
     // java/util/logging/LogManager` by ensuring the native always
     // returns a LogManager instance ObjectRef (never a Class mirror).
     logmanager::register_logmanager_natives(registry);
+    register_log4j_stacklocator_bridge(registry);
 
     // WP2.1: java.lang.reflect full coverage — net-new natives
     // (trySetAccessible, canAccess, getEnclosingClass, Parameter
@@ -26066,7 +26124,7 @@ fn register_unsafe_natives(r: &mut NativeMethodRegistry) {
         u,
         "staticFieldOffset",
         "(Ljava/lang/reflect/Field;)J",
-        native_unsafe_object_field_offset,
+        native_unsafe_static_field_offset,
     );
     r.register(
         u,
@@ -26406,7 +26464,7 @@ fn register_unsafe_natives(r: &mut NativeMethodRegistry) {
         u2,
         "staticFieldOffset",
         "(Ljava/lang/reflect/Field;)J",
-        native_unsafe_object_field_offset,
+        native_unsafe_static_field_offset,
     );
     r.register(
         u2,
@@ -26863,8 +26921,18 @@ fn register_unsafe_natives(r: &mut NativeMethodRegistry) {
     r.register(cds_cls, "isDumpingClassList0", "()Z", native_return_false);
     r.register(cds_cls, "isDumpingArchive0", "()Z", native_return_false);
     r.register(cds_cls, "isSharingEnabled0", "()Z", native_return_false);
-    r.register(cds_cls, "logLambdaFormInvoker", "(Ljava/lang/String;)V", native_noop);
-    r.register(cds_cls, "initializeFromArchive", "(Ljava/lang/Class;)V", native_noop);
+    r.register(
+        cds_cls,
+        "logLambdaFormInvoker",
+        "(Ljava/lang/String;)V",
+        native_noop,
+    );
+    r.register(
+        cds_cls,
+        "initializeFromArchive",
+        "(Ljava/lang/Class;)V",
+        native_noop,
+    );
     r.register(
         cds_cls,
         "defineArchivedModules",
@@ -26874,8 +26942,18 @@ fn register_unsafe_natives(r: &mut NativeMethodRegistry) {
     r.register(cds_cls, "getRandomSeedForDumping", "()J", |_ctx, _args| {
         Ok(Some(Value::Long(0)))
     });
-    r.register(cds_cls, "dumpClassList", "(Ljava/lang/String;)V", native_noop);
-    r.register(cds_cls, "dumpDynamicArchive", "(Ljava/lang/String;)V", native_noop);
+    r.register(
+        cds_cls,
+        "dumpClassList",
+        "(Ljava/lang/String;)V",
+        native_noop,
+    );
+    r.register(
+        cds_cls,
+        "dumpDynamicArchive",
+        "(Ljava/lang/String;)V",
+        native_noop,
+    );
 
     r.register(u, "defineClass", "(Ljava/lang/String;[BIILjava/lang/ClassLoader;Ljava/security/ProtectionDomain;)Ljava/lang/Class;", |_ctx, _args| Ok(Some(Value::Object(None))));
     r.register(u2, "defineClass0", "(Ljava/lang/String;[BIILjava/lang/ClassLoader;Ljava/security/ProtectionDomain;)Ljava/lang/Class;", |_ctx, _args| Ok(Some(Value::Object(None))));
@@ -27279,6 +27357,59 @@ fn synthetic_offset_for(class_name: &str, field_name: &str) -> usize {
     off
 }
 
+#[derive(Clone, Copy)]
+struct UnsafeStaticFieldTarget {
+    class_id: u32,
+    field_index: usize,
+}
+
+fn unsafe_static_field_targets() -> &'static UnsafeShardedMap<usize, UnsafeStaticFieldTarget> {
+    static T: std::sync::OnceLock<UnsafeShardedMap<usize, UnsafeStaticFieldTarget>> =
+        std::sync::OnceLock::new();
+    T.get_or_init(new_unsafe_sharded_map)
+}
+
+fn remember_unsafe_static_field_offset(offset: usize, class_id: ClassId, field_index: usize) {
+    lock_unsafe_shard_usize(unsafe_static_field_targets(), offset).insert(
+        offset,
+        UnsafeStaticFieldTarget {
+            class_id: class_id.as_u32(),
+            field_index,
+        },
+    );
+}
+
+fn unsafe_static_field_target(offset: usize) -> Option<(ClassId, usize)> {
+    let target = lock_unsafe_shard_usize(unsafe_static_field_targets(), offset)
+        .get(&offset)
+        .copied()?;
+    Some((ClassId::new(target.class_id), target.field_index))
+}
+
+fn unsafe_static_field_target_for_base(
+    ctx: &dyn NativeContext,
+    obj: ObjectRef,
+    offset: usize,
+) -> Option<(ClassId, usize)> {
+    let (class_id, field_index) = unsafe_static_field_target(offset)?;
+    if ctx.class_id_from_mirror(obj) == Some(class_id) {
+        return Some((class_id, field_index));
+    }
+    let obj_class = ctx.class_id_of_object(obj);
+    let is_class_mirror = ctx
+        .class_name_of_id(obj_class)
+        .map(|name| name == "java/lang/Class")
+        .unwrap_or(false);
+    if is_class_mirror {
+        if let Value::Int(raw) = ctx.get_field(obj, 0) {
+            if raw >= 0 && ClassId::new(raw as u32) == class_id {
+                return Some((class_id, field_index));
+            }
+        }
+    }
+    None
+}
+
 /// Per-object side store for fields stored at a synthetic offset.  Keyed
 /// by `(identity_hash, offset)` so each receiver has its own slot and
 /// CAS sees a consistent value across the load and the compare-and-store.
@@ -27307,6 +27438,9 @@ pub(crate) fn synthetic_get(
     obj: cratonvm_types::ObjectRef,
     offset: usize,
 ) -> Value {
+    if let Some((class_id, field_index)) = unsafe_static_field_target_for_base(ctx, obj, offset) {
+        return ctx.get_static_field(class_id, field_index);
+    }
     // Round-9 Bug 7: identity hash is GC-stable; raw pointer is not.
     let id = ctx.identity_hash_code(obj);
     let map = synthetic_field_store().lock();
@@ -27321,9 +27455,24 @@ pub(crate) fn synthetic_put(
     offset: usize,
     val: Value,
 ) {
+    if let Some((class_id, field_index)) = unsafe_static_field_target_for_base(ctx, obj, offset) {
+        ctx.set_static_field(class_id, field_index, val);
+        return;
+    }
     let id = ctx.identity_hash_code(obj);
     let mut map = synthetic_field_store().lock();
     map.insert((id, offset), val);
+}
+
+fn unsafe_cas_values_equal(cur: Value, expected: Value) -> bool {
+    match (cur, expected) {
+        (Value::Object(a), Value::Object(b)) => a == b,
+        (Value::Object(None), Value::Int(0)) | (Value::Int(0), Value::Object(None)) => true,
+        (Value::Object(None), Value::Long(0)) | (Value::Long(0), Value::Object(None)) => true,
+        (Value::Int(a), Value::Int(b)) => a == b,
+        (Value::Long(a), Value::Long(b)) => a == b,
+        _ => false,
+    }
 }
 
 /// CAS on the synthetic per-object slot.  Returns true on success.  The
@@ -27336,20 +27485,21 @@ pub(crate) fn synthetic_cas(
     expected: Value,
     new_val: Value,
 ) -> bool {
+    if let Some((class_id, field_index)) = unsafe_static_field_target_for_base(ctx, obj, offset) {
+        let cur = ctx.get_static_field(class_id, field_index);
+        let ok = unsafe_cas_values_equal(cur, expected);
+        if ok {
+            ctx.set_static_field(class_id, field_index, new_val);
+        }
+        return ok;
+    }
     let id = ctx.identity_hash_code(obj);
     let mut map = synthetic_field_store().lock();
     let cur = map
         .get(&(id, offset))
         .copied()
         .unwrap_or(Value::Object(None));
-    let eq = match (cur, expected) {
-        (Value::Object(a), Value::Object(b)) => a == b,
-        (Value::Object(None), Value::Int(0)) | (Value::Int(0), Value::Object(None)) => true,
-        (Value::Object(None), Value::Long(0)) | (Value::Long(0), Value::Object(None)) => true,
-        (Value::Int(a), Value::Int(b)) => a == b,
-        (Value::Long(a), Value::Long(b)) => a == b,
-        _ => false,
-    };
+    let eq = unsafe_cas_values_equal(cur, expected);
     if eq {
         map.insert((id, offset), new_val);
     }
@@ -27790,6 +27940,31 @@ fn native_unsafe_object_field_offset(
         return Ok(Some(Value::Long(effective_slot as i64)));
     }
     Ok(Some(Value::Long(0)))
+}
+
+fn native_unsafe_static_field_offset(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    let Some(Value::Object(Some(field_obj))) = args.get(1) else {
+        return Ok(Some(Value::Long(0)));
+    };
+    let (is_static, meta_class_id, meta_slot, _desc) =
+        crate::lang_class::read_field_meta(ctx, *field_obj);
+    if !is_static {
+        return native_unsafe_object_field_offset(ctx, args);
+    }
+
+    let (class_id, field_name) = crate::lang_class::field_class_and_name(ctx, *field_obj)
+        .unwrap_or_else(|| (meta_class_id, format!("slot#{meta_slot}")));
+    let field_index = ctx
+        .static_field_index_by_name(class_id, &field_name)
+        .unwrap_or(meta_slot);
+    let class_name = ctx.class_name_of_id(class_id).unwrap_or_default();
+    let synthetic_key = format!("static:{field_name}");
+    let offset = synthetic_offset_for(&class_name, &synthetic_key);
+    remember_unsafe_static_field_offset(offset, class_id, field_index);
+    Ok(Some(Value::Long(offset as i64)))
 }
 
 // Sentinel offset (chosen in the usize-sparse high range to not collide
@@ -28643,6 +28818,12 @@ pub(crate) fn native_unsafe_get_int(
             return Ok(Some(Value::Int(map.get(&offset).copied().unwrap_or(0))));
         }
     };
+    if is_synthetic_offset(offset) {
+        return Ok(Some(match synthetic_get(ctx, obj, offset) {
+            Value::Int(v) => Value::Int(v),
+            _ => Value::Int(0),
+        }));
+    }
     if ctx.heap_kind_of(obj) == cratonvm_types::ObjectKind::Array {
         match unsafe_checked_array_index(ctx, obj, offset) {
             Some(idx) => Ok(Some(ctx.get_array_element(obj, idx))),
@@ -28667,6 +28848,10 @@ pub(crate) fn native_unsafe_put_int(
             return Ok(None);
         }
     };
+    if is_synthetic_offset(offset) {
+        synthetic_put(ctx, obj, offset, val);
+        return Ok(None);
+    }
     if ctx.heap_kind_of(obj) == cratonvm_types::ObjectKind::Array {
         if let Some(idx) = unsafe_checked_array_index(ctx, obj, offset) {
             ctx.set_array_element(obj, idx, val);
@@ -28798,6 +28983,13 @@ pub(crate) fn native_unsafe_get_long(
             return Ok(Some(Value::Long(map.get(&offset).copied().unwrap_or(0))));
         }
     };
+    if is_synthetic_offset(offset) {
+        return Ok(Some(match synthetic_get(ctx, obj, offset) {
+            Value::Long(v) => Value::Long(v),
+            Value::Int(v) => Value::Long(v as i64),
+            _ => Value::Long(0),
+        }));
+    }
     let v = if ctx.heap_kind_of(obj) == cratonvm_types::ObjectKind::Array {
         match unsafe_checked_array_index(ctx, obj, offset) {
             Some(idx) => ctx.get_array_element(obj, idx),
@@ -28829,6 +29021,10 @@ pub(crate) fn native_unsafe_put_long(
             return Ok(None);
         }
     };
+    if is_synthetic_offset(offset) {
+        synthetic_put(ctx, obj, offset, val);
+        return Ok(None);
+    }
     if ctx.heap_kind_of(obj) == cratonvm_types::ObjectKind::Array {
         if let Some(idx) = unsafe_checked_array_index(ctx, obj, offset) {
             ctx.set_array_element(obj, idx, val);
@@ -28943,6 +29139,23 @@ pub(crate) fn native_unsafe_get_and_add_int(
             return Ok(Some(Value::Int(old)));
         }
     };
+    if is_synthetic_offset(offset) {
+        for attempt in 0.. {
+            let current = synthetic_get(ctx, obj, offset);
+            if let Value::Int(old) = current {
+                let new_val = Value::Int(old.wrapping_add(delta));
+                if synthetic_cas(ctx, obj, offset, current, new_val) {
+                    return Ok(Some(Value::Int(old)));
+                }
+            } else {
+                return Ok(Some(Value::Int(0)));
+            }
+            if attempt > 0 && attempt % CAS_MAX_RETRIES == 0 {
+                std::thread::yield_now();
+            }
+        }
+        unreachable!();
+    }
     if ctx.heap_kind_of(obj) == cratonvm_types::ObjectKind::Array {
         // OOB offset => return 0 without touching the heap.
         let idx = match unsafe_checked_array_index(ctx, obj, offset) {
@@ -28987,6 +29200,11 @@ fn native_unsafe_get_and_set_int(ctx: &mut dyn NativeContext, args: &[Value]) ->
             return Ok(Some(Value::Int(prev)));
         }
     };
+    if is_synthetic_offset(offset) {
+        let prev = synthetic_get(ctx, obj, offset);
+        synthetic_put(ctx, obj, offset, new_val);
+        return Ok(Some(prev));
+    }
     if ctx.heap_kind_of(obj) == cratonvm_types::ObjectKind::Array {
         // OOB offset => return Int(0) without touching the heap.
         let idx = match unsafe_checked_array_index(ctx, obj, offset) {
@@ -29015,6 +29233,14 @@ fn native_unsafe_get_float(ctx: &mut dyn NativeContext, args: &[Value]) -> Metho
         Some(o) => o,
         None => return Ok(Some(Value::Float(0.0))),
     };
+    if is_synthetic_offset(offset) {
+        let val = synthetic_get(ctx, obj, offset);
+        return Ok(Some(match val {
+            Value::Float(_) => val,
+            Value::Int(bits) => Value::Float(f32::from_bits(bits as u32)),
+            _ => Value::Float(0.0),
+        }));
+    }
     let val = ctx.get_field(obj, offset);
     match val {
         Value::Float(_) => Ok(Some(val)),
@@ -29030,6 +29256,10 @@ fn native_unsafe_put_float(ctx: &mut dyn NativeContext, args: &[Value]) -> Metho
         Some(o) => o,
         None => return Ok(None),
     };
+    if is_synthetic_offset(offset) {
+        synthetic_put(ctx, obj, offset, val);
+        return Ok(None);
+    }
     ctx.set_field(obj, offset, val);
     Ok(None)
 }
@@ -29040,6 +29270,14 @@ fn native_unsafe_get_double(ctx: &mut dyn NativeContext, args: &[Value]) -> Meth
         Some(o) => o,
         None => return Ok(Some(Value::Double(0.0))),
     };
+    if is_synthetic_offset(offset) {
+        let val = synthetic_get(ctx, obj, offset);
+        return Ok(Some(match val {
+            Value::Double(_) => val,
+            Value::Long(bits) => Value::Double(f64::from_bits(bits as u64)),
+            _ => Value::Double(0.0),
+        }));
+    }
     let val = ctx.get_field(obj, offset);
     match val {
         Value::Double(_) => Ok(Some(val)),
@@ -29055,6 +29293,10 @@ fn native_unsafe_put_double(ctx: &mut dyn NativeContext, args: &[Value]) -> Meth
         Some(o) => o,
         None => return Ok(None),
     };
+    if is_synthetic_offset(offset) {
+        synthetic_put(ctx, obj, offset, val);
+        return Ok(None);
+    }
     ctx.set_field(obj, offset, val);
     Ok(None)
 }
@@ -29078,6 +29320,23 @@ fn native_unsafe_get_and_add_long(ctx: &mut dyn NativeContext, args: &[Value]) -
             return Ok(Some(Value::Long(old)));
         }
     };
+    if is_synthetic_offset(offset) {
+        for attempt in 0.. {
+            let current = synthetic_get(ctx, obj, offset);
+            if let Value::Long(old) = current {
+                let new_val = Value::Long(old.wrapping_add(delta));
+                if synthetic_cas(ctx, obj, offset, current, new_val) {
+                    return Ok(Some(Value::Long(old)));
+                }
+            } else {
+                return Ok(Some(Value::Long(0)));
+            }
+            if attempt > 0 && attempt % CAS_MAX_RETRIES == 0 {
+                std::thread::yield_now();
+            }
+        }
+        unreachable!();
+    }
     if ctx.heap_kind_of(obj) == cratonvm_types::ObjectKind::Array {
         // OOB offset => return 0 without touching the heap.
         let idx = match unsafe_checked_array_index(ctx, obj, offset) {
@@ -29120,6 +29379,11 @@ fn native_unsafe_get_and_set_long(ctx: &mut dyn NativeContext, args: &[Value]) -
             return Ok(Some(Value::Long(prev)));
         }
     };
+    if is_synthetic_offset(offset) {
+        let prev = synthetic_get(ctx, obj, offset);
+        synthetic_put(ctx, obj, offset, new_val);
+        return Ok(Some(prev));
+    }
     if ctx.heap_kind_of(obj) == cratonvm_types::ObjectKind::Array {
         // OOB offset => return Long(0) without touching the heap.
         let idx = match unsafe_checked_array_index(ctx, obj, offset) {
@@ -29161,6 +29425,11 @@ fn native_unsafe_get_and_set_object(
             return Ok(Some(Value::Object(prev)));
         }
     };
+    if is_synthetic_offset(offset) {
+        let prev = synthetic_get(ctx, obj, offset);
+        synthetic_put(ctx, obj, offset, new_val);
+        return Ok(Some(prev));
+    }
     if ctx.heap_kind_of(obj) == cratonvm_types::ObjectKind::Array {
         // OOB offset => return null without touching the heap.
         let idx = match unsafe_checked_array_index(ctx, obj, offset) {
@@ -30077,10 +30346,18 @@ fn native_unsafe_compare_and_exchange_int(
         _ => 0,
     };
     if let Some(obj_ref) = obj {
-        let old = ctx.get_field_volatile(obj_ref, offset);
+        let old = if is_synthetic_offset(offset) {
+            synthetic_get(ctx, obj_ref, offset)
+        } else {
+            ctx.get_field_volatile(obj_ref, offset)
+        };
         if let Value::Int(old_val) = old {
             if old_val == expected {
-                ctx.set_field_volatile(obj_ref, offset, Value::Int(update));
+                if is_synthetic_offset(offset) {
+                    synthetic_put(ctx, obj_ref, offset, Value::Int(update));
+                } else {
+                    ctx.set_field_volatile(obj_ref, offset, Value::Int(update));
+                }
             }
             return Ok(Some(Value::Int(old_val)));
         }
@@ -30104,10 +30381,18 @@ fn native_unsafe_compare_and_exchange_long(
         _ => 0,
     };
     if let Some(obj_ref) = obj {
-        let old = ctx.get_field_volatile(obj_ref, offset);
+        let old = if is_synthetic_offset(offset) {
+            synthetic_get(ctx, obj_ref, offset)
+        } else {
+            ctx.get_field_volatile(obj_ref, offset)
+        };
         if let Value::Long(old_val) = old {
             if old_val == expected {
-                ctx.set_field_volatile(obj_ref, offset, Value::Long(update));
+                if is_synthetic_offset(offset) {
+                    synthetic_put(ctx, obj_ref, offset, Value::Long(update));
+                } else {
+                    ctx.set_field_volatile(obj_ref, offset, Value::Long(update));
+                }
             }
             return Ok(Some(Value::Long(old_val)));
         }
@@ -30123,7 +30408,11 @@ fn native_unsafe_compare_and_exchange_reference(
     let obj = unsafe_obj(args, 1);
     let offset = unsafe_offset(args, 2);
     if let Some(obj_ref) = obj {
-        let old = ctx.get_field_volatile(obj_ref, offset);
+        let old = if is_synthetic_offset(offset) {
+            synthetic_get(ctx, obj_ref, offset)
+        } else {
+            ctx.get_field_volatile(obj_ref, offset)
+        };
         // Compare by reference identity
         let expected_ref = match args.get(3) {
             Some(Value::Object(r)) => *r,
@@ -30139,7 +30428,11 @@ fn native_unsafe_compare_and_exchange_reference(
                 Some(v) => v.clone(),
                 None => Value::Object(None),
             };
-            ctx.set_field_volatile(obj_ref, offset, update);
+            if is_synthetic_offset(offset) {
+                synthetic_put(ctx, obj_ref, offset, update);
+            } else {
+                ctx.set_field_volatile(obj_ref, offset, update);
+            }
         }
         return Ok(Some(old));
     }
@@ -33603,6 +33896,7 @@ fn register_t19_h2_shared_secrets_shim(registry: &mut NativeMethodRegistry) {
 // is robust to either the real-JDK private-field layout or our
 // synthetic minimum-field allocation.
 
+
 fn module_builder_alloc_with_named_fields(
     ctx: &mut dyn NativeContext,
     class_name: &str,
@@ -33618,14 +33912,84 @@ fn module_builder_alloc_with_named_fields(
     obj
 }
 
+fn module_builder_empty_set(ctx: &mut dyn NativeContext) -> Value {
+    Value::Object(Some(cratonvm_native_collections::make_hashset_with_elements(
+        ctx,
+        &[],
+    )))
+}
+
+fn module_builder_set_or_empty(ctx: &mut dyn NativeContext, value: Value) -> Value {
+    match value {
+        Value::Object(Some(_)) => value,
+        _ => module_builder_empty_set(ctx),
+    }
+}
+
+
+fn module_descriptor_set_field(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+    field: &str,
+) -> MethodCallResult {
+    let this = match args.first().copied() {
+        Some(Value::Object(Some(o))) => o,
+        _ => return Ok(Some(Value::Object(None))),
+    };
+    if let Value::Object(Some(value)) = ctx.get_field_by_name(this, field) {
+        return Ok(Some(Value::Object(Some(value))));
+    }
+    let this_pin = ctx.pin_native_root(this);
+    let empty = module_builder_empty_set(ctx);
+    let this = ctx.read_native_pin(this_pin, this);
+    ctx.set_field_by_name(this, field, empty);
+    ctx.unpin_native_roots(this_pin);
+    Ok(Some(empty))
+}
+
+fn native_module_descriptor_modifiers(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    module_descriptor_set_field(ctx, args, "modifiers")
+}
+
+fn native_module_descriptor_requires(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    module_descriptor_set_field(ctx, args, "requires")
+}
+
+fn native_module_descriptor_exports(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    module_descriptor_set_field(ctx, args, "exports")
+}
+
+fn native_module_descriptor_opens(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    module_descriptor_set_field(ctx, args, "opens")
+}
+
+fn native_module_descriptor_uses(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    module_descriptor_set_field(ctx, args, "uses")
+}
+
+fn native_module_descriptor_provides(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    module_descriptor_set_field(ctx, args, "provides")
+}
+
+fn native_module_descriptor_packages(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    module_descriptor_set_field(ctx, args, "packages")
+}
+
+
 fn native_module_builder_new_exports_qualified(
     ctx: &mut dyn NativeContext,
     args: &[Value],
 ) -> MethodCallResult {
     // (Set<Modifier>, String source, Set<String> targets) -> Exports
-    let mods = args.first().copied().unwrap_or(Value::Object(None));
+    let mods = module_builder_set_or_empty(
+        ctx,
+        args.first().copied().unwrap_or(Value::Object(None)),
+    );
     let source = args.get(1).copied().unwrap_or(Value::Object(None));
-    let targets = args.get(2).copied().unwrap_or(Value::Object(None));
+    let targets = module_builder_set_or_empty(
+        ctx,
+        args.get(2).copied().unwrap_or(Value::Object(None)),
+    );
     let obj = module_builder_alloc_with_named_fields(
         ctx,
         "java/lang/module/ModuleDescriptor$Exports",
@@ -33633,29 +33997,41 @@ fn native_module_builder_new_exports_qualified(
     );
     Ok(Some(Value::Object(Some(obj))))
 }
+
 
 fn native_module_builder_new_exports_unqualified(
     ctx: &mut dyn NativeContext,
     args: &[Value],
 ) -> MethodCallResult {
     // (Set<Modifier>, String source) -> Exports
-    let mods = args.first().copied().unwrap_or(Value::Object(None));
+    let mods = module_builder_set_or_empty(
+        ctx,
+        args.first().copied().unwrap_or(Value::Object(None)),
+    );
     let source = args.get(1).copied().unwrap_or(Value::Object(None));
+    let targets = module_builder_empty_set(ctx);
     let obj = module_builder_alloc_with_named_fields(
         ctx,
         "java/lang/module/ModuleDescriptor$Exports",
-        &[("mods", mods), ("source", source)],
+        &[("mods", mods), ("source", source), ("targets", targets)],
     );
     Ok(Some(Value::Object(Some(obj))))
 }
+
 
 fn native_module_builder_new_opens_qualified(
     ctx: &mut dyn NativeContext,
     args: &[Value],
 ) -> MethodCallResult {
-    let mods = args.first().copied().unwrap_or(Value::Object(None));
+    let mods = module_builder_set_or_empty(
+        ctx,
+        args.first().copied().unwrap_or(Value::Object(None)),
+    );
     let source = args.get(1).copied().unwrap_or(Value::Object(None));
-    let targets = args.get(2).copied().unwrap_or(Value::Object(None));
+    let targets = module_builder_set_or_empty(
+        ctx,
+        args.get(2).copied().unwrap_or(Value::Object(None)),
+    );
     let obj = module_builder_alloc_with_named_fields(
         ctx,
         "java/lang/module/ModuleDescriptor$Opens",
@@ -33664,26 +34040,35 @@ fn native_module_builder_new_opens_qualified(
     Ok(Some(Value::Object(Some(obj))))
 }
 
+
 fn native_module_builder_new_opens_unqualified(
     ctx: &mut dyn NativeContext,
     args: &[Value],
 ) -> MethodCallResult {
-    let mods = args.first().copied().unwrap_or(Value::Object(None));
+    let mods = module_builder_set_or_empty(
+        ctx,
+        args.first().copied().unwrap_or(Value::Object(None)),
+    );
     let source = args.get(1).copied().unwrap_or(Value::Object(None));
+    let targets = module_builder_empty_set(ctx);
     let obj = module_builder_alloc_with_named_fields(
         ctx,
         "java/lang/module/ModuleDescriptor$Opens",
-        &[("mods", mods), ("source", source)],
+        &[("mods", mods), ("source", source), ("targets", targets)],
     );
     Ok(Some(Value::Object(Some(obj))))
 }
+
 
 fn native_module_builder_new_requires_versioned(
     ctx: &mut dyn NativeContext,
     args: &[Value],
 ) -> MethodCallResult {
     // (Set<Modifier>, String mn, String compiledVersion) -> Requires
-    let mods = args.first().copied().unwrap_or(Value::Object(None));
+    let mods = module_builder_set_or_empty(
+        ctx,
+        args.first().copied().unwrap_or(Value::Object(None)),
+    );
     let mn = args.get(1).copied().unwrap_or(Value::Object(None));
     let compiled = args.get(2).copied().unwrap_or(Value::Object(None));
     let obj = module_builder_alloc_with_named_fields(
@@ -33694,12 +34079,16 @@ fn native_module_builder_new_requires_versioned(
     Ok(Some(Value::Object(Some(obj))))
 }
 
+
 fn native_module_builder_new_requires_short(
     ctx: &mut dyn NativeContext,
     args: &[Value],
 ) -> MethodCallResult {
     // (Set<Modifier>, String mn) -> Requires
-    let mods = args.first().copied().unwrap_or(Value::Object(None));
+    let mods = module_builder_set_or_empty(
+        ctx,
+        args.first().copied().unwrap_or(Value::Object(None)),
+    );
     let mn = args.get(1).copied().unwrap_or(Value::Object(None));
     let obj = module_builder_alloc_with_named_fields(
         ctx,
@@ -33738,14 +34127,16 @@ fn native_module_builder_new_version(
     Ok(Some(Value::Object(Some(obj))))
 }
 
+
 fn native_module_builder_build(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     // Instance method: build(int hashCode) -> ModuleDescriptor
     // args[0] = this (Builder), args[1] = hashCode int
-    // The real impl calls JLMA.newModuleDescriptor(name, version, …) — JLMA
-    // is null in our boot.  Allocate a synthetic ModuleDescriptor and copy
+    // The real impl calls JLMA.newModuleDescriptor(name, version, ...) - JLMA
+    // is null in our boot. Allocate a synthetic ModuleDescriptor and copy
     // over the readable Builder state into matching named fields.
     let this = args.first().copied().unwrap_or(Value::Object(None));
     let md = alloc_concurrent_synthetic(ctx, "java/lang/module/ModuleDescriptor", 16);
+    let md_pin = ctx.pin_native_root(md);
     if let Value::Object(Some(builder)) = this {
         for f in [
             "name",
@@ -33759,12 +34150,32 @@ fn native_module_builder_build(ctx: &mut dyn NativeContext, args: &[Value]) -> M
             "mainClass",
         ] {
             let v = ctx.get_field_by_name(builder, f);
+            let md = ctx.read_native_pin(md_pin, md);
             ctx.set_field_by_name(md, f, v);
         }
     }
+    for field in [
+        "modifiers",
+        "requires",
+        "exports",
+        "opens",
+        "uses",
+        "provides",
+        "packages",
+    ] {
+        let md_current = ctx.read_native_pin(md_pin, md);
+        if !matches!(ctx.get_field_by_name(md_current, field), Value::Object(Some(_))) {
+            let empty = module_builder_empty_set(ctx);
+            let md_current = ctx.read_native_pin(md_pin, md);
+            ctx.set_field_by_name(md_current, field, empty);
+        }
+    }
     if let Some(Value::Int(h)) = args.get(1) {
+        let md = ctx.read_native_pin(md_pin, md);
         ctx.set_field_by_name(md, "hashCode", Value::Int(*h));
     }
+    let md = ctx.read_native_pin(md_pin, md);
+    ctx.unpin_native_roots(md_pin);
     Ok(Some(Value::Object(Some(md))))
 }
 
@@ -34039,13 +34450,30 @@ fn register_module_builder_overrides(registry: &mut NativeMethodRegistry) {
         if let Value::Object(Some(d)) = ctx.get_field_by_name(this, "descriptor") {
             return Ok(Some(Value::Object(Some(d))));
         }
-        // Lazy allocate a synthetic ModuleDescriptor with a non-null
-        // `name` so the immediate downstream `.name()` call cannot
-        // NPE. Cache it on the ModuleReference instance.
+        // Lazy allocate a synthetic ModuleDescriptor with non-null fields so
+        // downstream real-JDK module/layer code can call `name()`, `opens()`,
+        // `exports()`, `uses()`, `provides()`, and hash/equals methods without
+        // tripping on partially initialized descriptor state. Cache it on the
+        // ModuleReference instance.
         let md = alloc_concurrent_synthetic(ctx, "java/lang/module/ModuleDescriptor", 16);
+        let md_pin = ctx.pin_native_root(md);
         let name_str = ctx.create_string("synthetic");
+        let md = ctx.read_native_pin(md_pin, md);
         ctx.set_field_by_name(md, "name", Value::Object(Some(name_str)));
+        for field in ["modifiers", "requires", "exports", "opens", "uses", "provides", "packages"] {
+            let empty = match ctx.new_object_initialized("java/util/HashSet", "()V", &[])? {
+                Some(Value::Object(Some(o))) => o,
+                _ => {
+                    ctx.unpin_native_roots(md_pin);
+                    return Ok(Some(Value::Object(Some(md))));
+                }
+            };
+            let md = ctx.read_native_pin(md_pin, md);
+            ctx.set_field_by_name(md, field, Value::Object(Some(empty)));
+        }
+        let md = ctx.read_native_pin(md_pin, md);
         ctx.set_field_by_name(this, "descriptor", Value::Object(Some(md)));
+        ctx.unpin_native_roots(md_pin);
         Ok(Some(Value::Object(Some(md))))
     };
     registry.register(
@@ -34080,6 +34508,43 @@ fn register_module_builder_overrides(registry: &mut NativeMethodRegistry) {
             Ok(Some(Value::Object(Some(s))))
         },
     );
+    for (method, callback) in [
+        (
+            "modifiers",
+            native_module_descriptor_modifiers as cratonvm_native_api::NativeCallback,
+        ),
+        (
+            "requires",
+            native_module_descriptor_requires as cratonvm_native_api::NativeCallback,
+        ),
+        (
+            "exports",
+            native_module_descriptor_exports as cratonvm_native_api::NativeCallback,
+        ),
+        (
+            "opens",
+            native_module_descriptor_opens as cratonvm_native_api::NativeCallback,
+        ),
+        (
+            "uses",
+            native_module_descriptor_uses as cratonvm_native_api::NativeCallback,
+        ),
+        (
+            "provides",
+            native_module_descriptor_provides as cratonvm_native_api::NativeCallback,
+        ),
+        (
+            "packages",
+            native_module_descriptor_packages as cratonvm_native_api::NativeCallback,
+        ),
+    ] {
+        registry.register(
+            "java/lang/module/ModuleDescriptor",
+            method,
+            "()Ljava/util/Set;",
+            callback,
+        );
+    }
     registry.set_category(__prev_cat);
 }
 
@@ -45983,6 +46448,77 @@ fn native_inet_is_reachable(ctx: &mut dyn NativeContext, args: &[Value]) -> Meth
 // Phase 31: java.util.logging + java.util.Locale
 // ===========================================================================
 
+fn register_log4j_stacklocator_bridge(registry: &mut NativeMethodRegistry) {
+    fn log4j_stack_locator_caller(
+        ctx: &mut dyn NativeContext,
+        args: &[Value],
+        first_string: usize,
+    ) -> MethodCallResult {
+        let fqcn = match args.get(first_string) {
+            Some(Value::Object(Some(s))) => ctx.read_string(*s).unwrap_or_default(),
+            _ => String::new(),
+        };
+        let pkg = match args.get(first_string + 1) {
+            Some(Value::Object(Some(s))) => ctx.read_string(*s).unwrap_or_default(),
+            _ => String::new(),
+        };
+        let fqcn_internal = fqcn.replace('.', "/");
+        let pkg_internal = pkg.replace('.', "/");
+        let trace = ctx.capture_stack_trace(0);
+        let mut seen_fqcn = false;
+        for frame in trace.iter().rev() {
+            if !seen_fqcn {
+                if frame.class_name.as_ref() == fqcn_internal {
+                    seen_fqcn = true;
+                }
+                continue;
+            }
+            if frame.class_name.as_ref() == fqcn_internal {
+                continue;
+            }
+            if pkg_internal.is_empty() || frame.class_name.starts_with(&pkg_internal) {
+                if let Some(cid) = ctx.class_id_by_name(&frame.class_name) {
+                    return Ok(Some(Value::Object(Some(ctx.get_class_mirror(cid)))));
+                }
+            }
+        }
+        for frame in trace.iter().rev() {
+            let class_name = frame.class_name.as_ref();
+            if class_name == "org/apache/logging/log4j/util/StackLocator"
+                || class_name == "org/apache/logging/log4j/util/StackLocatorUtil"
+                || class_name.starts_with("java/lang/StackWalker")
+                || class_name.starts_with("java/lang/StackStreamFactory")
+                || class_name.starts_with("jdk/internal/reflect/")
+                || class_name.starts_with("sun/reflect/")
+            {
+                continue;
+            }
+            if pkg_internal.is_empty() || class_name.starts_with(&pkg_internal) {
+                if let Some(cid) = ctx.class_id_by_name(class_name) {
+                    return Ok(Some(Value::Object(Some(ctx.get_class_mirror(cid)))));
+                }
+            }
+        }
+        let fallback = ctx
+            .class_id_by_name("java/lang/Object")
+            .map(|cid| Value::Object(Some(ctx.get_class_mirror(cid))))
+            .unwrap_or(Value::Object(None));
+        Ok(Some(fallback))
+    }
+    registry.register(
+        "org/apache/logging/log4j/util/StackLocator",
+        "getCallerClass",
+        "(Ljava/lang/String;Ljava/lang/String;)Ljava/lang/Class;",
+        |ctx, args| log4j_stack_locator_caller(ctx, args, 1),
+    );
+    registry.register(
+        "org/apache/logging/log4j/util/StackLocatorUtil",
+        "getCallerClass",
+        "(Ljava/lang/String;Ljava/lang/String;)Ljava/lang/Class;",
+        |ctx, args| log4j_stack_locator_caller(ctx, args, 0),
+    );
+}
+
 fn register_logging_natives(registry: &mut NativeMethodRegistry) {
     let logger = "java/util/logging/Logger";
     let level = "java/util/logging/Level";
@@ -47795,6 +48331,8 @@ fn register_slf4j_natives(registry: &mut NativeMethodRegistry) {
             Ok(Some(Value::Object(Some(logger))))
         },
     );
+
+    register_log4j_stacklocator_bridge(registry);
 
     let log4j_lg = "org/apache/logging/log4j/Logger";
     // Log4j2 trace — instance method, below default threshold. NEW-6.
@@ -56039,6 +56577,76 @@ mod module_can_read_essential_tests {
              essential (real-JDK) native path, not just the \
              synthetic-jdk-only register_p59_module"
         );
+    }
+}
+
+#[cfg(test)]
+mod unsafe_static_field_offset_tests {
+    use super::*;
+    use crate::test_utils::MockNativeContext;
+    use cratonvm_native_api::FieldMetadata;
+
+    #[test]
+    fn static_field_offset_uses_static_storage_not_class_mirror_slots() {
+        let mut ctx = MockNativeContext::new();
+        let class_id = ctx
+            .ensure_class_initialized("sun/misc/Unsafe")
+            .expect("mock class id");
+        let meta = FieldMetadata {
+            name: "memoryAccessWarned".to_string(),
+            descriptor: "Z".to_string(),
+            access_flags: 0x0008,
+            slot_index: 24,
+            declaring_class_id: class_id,
+            is_static: true,
+        };
+        ctx.set_static_field(class_id, 24, Value::Int(0));
+
+        let field = crate::lang_class::create_field_object(&mut ctx, &meta);
+        let offset = match native_unsafe_static_field_offset(
+            &mut ctx,
+            &[Value::Object(None), Value::Object(Some(field))],
+        )
+        .expect("staticFieldOffset")
+        .expect("offset value")
+        {
+            Value::Long(offset) => offset as usize,
+            other => panic!("unexpected offset value: {other:?}"),
+        };
+
+        assert!(is_synthetic_offset(offset));
+        assert_ne!(offset, 24);
+
+        let base = ctx.get_class_mirror(class_id);
+        ctx.set_field(base, 24, Value::Int(77));
+
+        let before = native_unsafe_get_int_volatile(
+            &mut ctx,
+            &[
+                Value::Object(None),
+                Value::Object(Some(base)),
+                Value::Long(offset as i64),
+            ],
+        )
+        .expect("getBooleanVolatile")
+        .expect("read value");
+        assert_eq!(before, Value::Int(0));
+
+        let cas = native_unsafe_cas_int(
+            &mut ctx,
+            &[
+                Value::Object(None),
+                Value::Object(Some(base)),
+                Value::Long(offset as i64),
+                Value::Int(0),
+                Value::Int(1),
+            ],
+        )
+        .expect("compareAndSetBoolean")
+        .expect("cas value");
+        assert_eq!(cas, Value::Int(1));
+        assert_eq!(ctx.get_static_field(class_id, 24), Value::Int(1));
+        assert_eq!(ctx.get_field(base, 24), Value::Int(77));
     }
 }
 

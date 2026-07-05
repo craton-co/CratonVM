@@ -4,6 +4,10 @@ This folder collects CratonVM-only defects found while running upstream Java
 suites. The docs had grown to describe the **same underlying bug from several
 angles**; this index is the consolidated map. Read it first.
 
+## 2026-07-05 Hibernate UUID v6/v7 SIGSEGV
+
+- [Hibernate UUidV6V7GeneratorTest SIGSEGV after longer timeout](uuid-v6v7-generator-sigsegv.md) - candidate fix: native atomic update loops now pin and re-read references across `UnaryOperator.apply`; original Azure class-level gdb rerun pending.
+
 ## 2026-07-04 test.context.* cluster (bean/groovy/junit/junit4/testng/web, branch fix/test-context-cluster)
 
 - [Constructor-parameter-annotation offset fix + 3 residuals](test-context-constructor-param-annotation-offset.md) — core fix: `Constructor.getParameterAnnotations()`'s native override didn't account for a synthetic leading parameter (non-static inner-class constructors' implicit outer-instance arg), causing an AIOOBE that crashed 13 of 25 CV-unique classes across the six packages (7 directly + cascading ABEND in 6 more sharing a batch). 3 residuals open: Groovy TestContext script loading (isPresent stub blocks it; removing the stub exposes a separate ANTLR/jarjar class-layout bug — not fixed), `InheritableThreadLocal` not propagated through `Thread(ThreadGroup, Runnable, String[, long])` constructors (breaks `Executors`-backed pools generally, not just these tests), and one JUnit5-parallel-execution TIMEOUT not yet triaged.
@@ -33,7 +37,6 @@ Fixed from this sweep:
 - [System Rules getenv() field 'm' reflection mismatch](../internal/fixed-suite-bugs/keycloak-system-rules-getenv-field-m-reflection.md) - `System.getenv()` now exposes an OpenJDK-shaped unmodifiable map wrapper whose private `m` field points at the backing map.
 
 Open findings from this sweep, in `keycloak-07-04/`, roughly by priority:
-- [FacadeClassLoader Object.size() NoSuchMethodError + guarded Class-object OOB access](keycloak-07-04/facadeclassloader-object-size-nosuchmethoderror-classoob.md) - confirmed non-fatal but real; root cause not fully pinned.
 - [LoggingConfigurationTest wildcard DEBUG level resolves null](keycloak-07-04/quarkus-runtime-logging-wildcard-debug-level-null.md) - 1 class/sub-test.
 - [SmallRyeConfig.getPropertyNames() surfaces a garbage property name during log-category validation](keycloak-07-04/quarkus-runtime-logging-getpropertynames-garbage-key.md) - 2 sub-tests in the same class as above, plausibly related.
 - [TelemetryConfigurationTest telemetry-service-name wrong value](keycloak-07-04/quarkus-runtime-telemetry-service-name-wrong-value.md) - 1 class/sub-test.
