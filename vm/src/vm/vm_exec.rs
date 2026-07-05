@@ -2476,9 +2476,17 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
                 eprintln!("  STTRACE_DBG_CAP[{i}] {}.{}", e.class_name, e.method_name);
             }
         }
-        self.thread
-            .throwable_stacks
-            .insert(throwable_hash, trace.clone());
+        // Hash 0 is the VM's ephemeral stack-walk sentinel used by
+        // StackWalker/caller-sensitive helpers. Those callers consume the
+        // returned trace immediately and never retrieve it through
+        // get_stack_trace(), so cloning the full vector into the throwable
+        // trace map on every walk only adds work to hot logging/framework
+        // bootstrap paths.
+        if throwable_hash != 0 {
+            self.thread
+                .throwable_stacks
+                .insert(throwable_hash, trace.clone());
+        }
         trace
     }
 
