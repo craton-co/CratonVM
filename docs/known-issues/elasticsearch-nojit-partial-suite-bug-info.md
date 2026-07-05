@@ -85,3 +85,33 @@ C:\craton\CratonVM-elasticsearch-nojit-suite-20260702\apps\elasticsearch-suite-r
 C:\craton\CratonVM-elasticsearch-nojit-suite-20260702\apps\elasticsearch-suite-runner\.suite\results\es-nojit-full-20260702\all-nojit\logs
 C:\craton\CratonVM-elasticsearch-full-suite-20260702\apps\elasticsearch-suite-runner\.suite\results\es-full-hotspot-20260702\hotspot-jit\results.tsv
 ```
+
+## 2026-07-05 follow-up: ProviderLocator / module descriptor path
+
+Targeted the largest deterministic signature from the partial no-JIT sweep: `XContentProvider ModuleDescriptor.uses null` through Elasticsearch's provider/module loading path.
+
+Findings on current `dev` before this patch:
+
+- A focused module-layer probe failed before descriptor access because `ModuleLayer.boot().configuration()` returned a synthetic `java.lang.module.Configuration` whose private `nameToModule` cache was null. Real JDK `Configuration.findModule` dereferenced it during `Configuration.resolve`, producing `NullPointerException: Cannot invoke "java.util.Map.get(Object)" because "this.nameToModule" is null`.
+- After initializing the synthetic configuration caches, the same path reached module-info parsing, where JDK `ModuleDescriptor.read` rejected even Java 9 `module-info.class` with `InvalidModuleDescriptorException: Unsupported major.minor version 53.0`. Root cause: `jdk.internal.misc.VM.isSupportedModuleDescriptorVersion(int,int)` and `isSupportedClassFileVersion(int,int)` real bytecode read an uninitialized `classFileMajorVersion` static, so every module descriptor version was rejected.
+
+Patch applied:
+
+- `native-builtins/src/jboss_jdkspecific.rs`: `ModuleLayer.configuration()` now seeds `parents`, `graph`, `modules`, and `nameToModule` with initialized empty JDK collections, so real `Configuration.findModule` returns `Optional.empty()` instead of NPEing on null caches.
+- `native-builtins/src/lib.rs`: registered native overrides for `jdk/internal/misc/VM.isSupportedClassFileVersion(II)Z` and `isSupportedModuleDescriptorVersion(II)Z`, using the VM's advertised Java 25 classfile ceiling (`major 69`) and the JDK minor-version rules.
+
+Validation with `/data/target-es-nojit-partial-next-20260705/release/cratonvm-es-nojit-partial-next-azure-20260705`:
+
+```text
+ModuleFixesProbe OK findModule=Optional.empty descriptor=x.foo.impl uses=[java.util.function.IntSupplier]
+```
+
+Residual, still open:
+
+A closer Elasticsearch `ProviderLocator` embedded-module probe now gets past both prior failures but stops at the next JPMS modeling gap:
+
+```text
+java.lang.module.FindException: Module java.base not found, required by x.foo.impl
+```
+
+So this note remains in `docs/known-issues`: the deterministic module descriptor/cache failures are fixed, but the Elasticsearch provider module path still needs a synthetic boot configuration that can satisfy at least `java.base` resolution before the original no-JIT roll-up can be retired.

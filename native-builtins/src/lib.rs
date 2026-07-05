@@ -15462,6 +15462,47 @@ pub fn register_essential_natives(registry: &mut NativeMethodRegistry) {
     registry.register("jdk/internal/misc/VM", "isBooted", "()Z", |_ctx, _args| {
         Ok(Some(Value::Int(1)))
     });
+    // The real JDK predicates read VM.classFileMajorVersion, a private static
+    // normally initialized by HotSpot during early boot. CratonVM does not run
+    // that path, so the field remains zero and JDK module-info parsing rejects
+    // every descriptor as "Unsupported major.minor version 53.0" before
+    // Elasticsearch's embedded provider modules can load. Mirror JDK 21+'s
+    // predicate semantics but use the classfile ceiling this VM advertises via
+    // java.class.version / multi-release handling: Java 25 => major 69.
+    registry.register(
+        "jdk/internal/misc/VM",
+        "isSupportedClassFileVersion",
+        "(II)Z",
+        |_ctx, args| {
+            let major = match args.first() {
+                Some(Value::Int(v)) => *v,
+                _ => 0,
+            };
+            let minor = match args.get(1) {
+                Some(Value::Int(v)) => *v,
+                _ => 0,
+            };
+            let ok = (45..=69).contains(&major) && (major < 56 || minor == 0 || minor == 65535);
+            Ok(Some(Value::Int(ok as i32)))
+        },
+    );
+    registry.register(
+        "jdk/internal/misc/VM",
+        "isSupportedModuleDescriptorVersion",
+        "(II)Z",
+        |_ctx, args| {
+            let major = match args.first() {
+                Some(Value::Int(v)) => *v,
+                _ => 0,
+            };
+            let minor = match args.get(1) {
+                Some(Value::Int(v)) => *v,
+                _ => 0,
+            };
+            let ok = (53..=69).contains(&major) && (major < 56 || minor == 0 || minor == 65535);
+            Ok(Some(Value::Int(ok as i32)))
+        },
+    );
     // WP1.3: awaitInitLevel(int) blocks on the process-wide condvar
     // until the level reaches `n`.  Matches HotSpot's
     // `JVM_AwaitInitLevel` — used by JDK internals (e.g. the
