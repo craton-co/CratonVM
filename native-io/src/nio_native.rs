@@ -791,6 +791,18 @@ fn native_iou_write_max_size(_ctx: &mut dyn NativeContext, _args: &[Value]) -> M
     Ok(Some(Value::Long(i32::MAX as i64)))
 }
 
+fn native_iou_fd_limit(_ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
+    #[cfg(unix)]
+    {
+        let limit = unsafe { libc::sysconf(libc::_SC_OPEN_MAX) };
+        if limit > 0 {
+            return Ok(Some(Value::Int(limit.min(i32::MAX as i64) as i32)));
+        }
+    }
+
+    Ok(Some(Value::Int(1024)))
+}
+
 fn native_iou_init_ids(_ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
     Ok(None)
 }
@@ -973,6 +985,7 @@ pub fn register_nio_natives_real(r: &mut NativeMethodRegistry) {
     let iou = "sun/nio/ch/IOUtil";
     r.register(iou, "iovMax", "()I", native_iou_iov_max);
     r.register(iou, "writevMax", "()J", native_iou_write_max_size);
+    r.register(iou, "fdLimit", "()I", native_iou_fd_limit);
     r.register(iou, "initIDs", "()V", native_iou_init_ids);
     r.set_category(__prev_cat);
 }

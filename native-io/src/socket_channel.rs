@@ -1864,6 +1864,7 @@ pub fn register_socket_channel_real(r: &mut NativeMethodRegistry) {
     // form is safe.
     for prov in [
         "sun/nio/ch/WEPollSelectorProvider",
+        "sun/nio/ch/EPollSelectorProvider",
         "sun/nio/ch/SelectorProviderImpl",
     ] {
         r.register(

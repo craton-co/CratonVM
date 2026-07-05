@@ -139,6 +139,11 @@ const VH_KIND_ARRAY: i32 = 2;
 // without growing `VarHandleMeta`. See `byte_view_{get,set}`.
 const VH_KIND_BYTE_VIEW_LE: i32 = 3;
 const VH_KIND_BYTE_VIEW_BE: i32 = 4;
+// ByteBuffer-view VarHandle (`MethodHandles.byteBufferViewVarHandle`). Same
+// element/endianness metadata as byte-array views, but coordinates are
+// `(ByteBuffer, byteIndex)` and direct buffers must hit native memory.
+const VH_KIND_BYTE_BUFFER_VIEW_LE: i32 = 5;
+const VH_KIND_BYTE_BUFFER_VIEW_BE: i32 = 6;
 
 // ---------------------------------------------------------------------------
 // WP4.2 — VarHandle metadata side table
@@ -806,6 +811,55 @@ pub fn register_phase54_method_handle(r: &mut NativeMethodRegistry) {
         },
     );
 
+
+    // byteBufferViewVarHandle(<T>[].class, ByteOrder) -- view a ByteBuffer as
+    // wider primitives at a BYTE index. Netty 4.2 uses these VarHandles for
+    // direct ByteBuf multi-byte headers when USE_VAR_HANDLE is true.
+    r.register(
+        mhs,
+        "byteBufferViewVarHandle",
+        "(Ljava/lang/Class;Ljava/nio/ByteOrder;)Ljava/lang/invoke/VarHandle;",
+        |ctx, args| {
+            let elem = match args.first() {
+                Some(Value::Object(Some(mirror))) => {
+                    let cid = ctx.class_id_from_mirror(*mirror);
+                    let name = cid.and_then(|c| ctx.class_name_of_id(c));
+                    name.and_then(|n| n.as_bytes().get(1).copied())
+                        .unwrap_or(b'J')
+                }
+                _ => b'J',
+            };
+            let le = match args.get(1) {
+                Some(Value::Object(Some(bo))) => match ctx.get_field_by_name(*bo, "name") {
+                    Value::Object(Some(s)) => ctx
+                        .read_string(s)
+                        .map(|n| n.contains("LITTLE"))
+                        .unwrap_or(true),
+                    _ => true,
+                },
+                _ => true,
+            };
+            let vh = alloc_concurrent_synthetic(ctx, "java/lang/invoke/VarHandle", VH_FIELD_COUNT);
+            vh_meta_put(
+                ctx,
+                vh,
+                VarHandleMeta {
+                    kind: if le {
+                        VH_KIND_BYTE_BUFFER_VIEW_LE
+                    } else {
+                        VH_KIND_BYTE_BUFFER_VIEW_BE
+                    },
+                    class_name: String::new(),
+                    field_name: String::new(),
+                    field_desc: (elem as char).to_string(),
+                    field_index: -1,
+                    class_id: 0,
+                },
+            );
+            Ok(Some(Value::Object(Some(vh))))
+        },
+    );
+
     // --- MethodHandles.Lookup ---
     //
     // Note: findVirtual/findStatic/findGetter/findSetter/findConstructor and
@@ -1247,6 +1301,123 @@ fn byte_view_kind(meta: Option<&VarHandleMeta>) -> Option<(u8, bool)> {
         _ => return None,
     };
     Some((*m.field_desc.as_bytes().first().unwrap_or(&b'J'), le))
+}
+
+
+/// If `meta` is a byte-buffer-view VarHandle, return `(element_desc, little_endian)`.
+fn byte_buffer_view_kind(meta: Option<&VarHandleMeta>) -> Option<(u8, bool)> {
+    let m = meta?;
+    let le = match m.kind {
+        VH_KIND_BYTE_BUFFER_VIEW_LE => true,
+        VH_KIND_BYTE_BUFFER_VIEW_BE => false,
+        _ => return None,
+    };
+    Some((*m.field_desc.as_bytes().first().unwrap_or(&b'J'), le))
+}
+
+fn byte_view_decode(elem: u8, le: bool, bytes: &[u8]) -> Value {
+    let mut raw: u64 = 0;
+    if le {
+        for (i, &b) in bytes.iter().enumerate() {
+            raw |= (b as u64) << (8 * i);
+        }
+    } else {
+        for &b in bytes {
+            raw = (raw << 8) | b as u64;
+        }
+    }
+    match elem {
+        b'J' => Value::Long(raw as i64),
+        b'D' => Value::Double(f64::from_bits(raw)),
+        b'I' => Value::Int(raw as u32 as i32),
+        b'F' => Value::Float(f32::from_bits(raw as u32)),
+        b'S' => Value::Int((raw as u16) as i16 as i32),
+        b'C' => Value::Int((raw as u16) as i32),
+        _ => Value::Int(raw as u8 as i8 as i32),
+    }
+}
+
+fn byte_view_encode(elem: u8, le: bool, value: &Value) -> [u8; 8] {
+    let w = byte_view_width(elem);
+    let raw: u64 = match value {
+        Value::Long(v) => *v as u64,
+        Value::Double(v) => v.to_bits(),
+        Value::Int(v) => *v as u32 as u64,
+        Value::Float(v) => v.to_bits() as u64,
+        _ => 0,
+    };
+    let mut bytes = [0u8; 8];
+    for i in 0..w {
+        let shift = if le { 8 * i } else { 8 * (w - 1 - i) };
+        bytes[i] = ((raw >> shift) & 0xff) as u8;
+    }
+    bytes
+}
+
+fn byte_buffer_view_addr(ctx: &mut dyn NativeContext, bb: ObjectRef, idx: usize) -> Option<i64> {
+    let base = match ctx.get_field_by_name(bb, "address") {
+        Value::Long(a) if a > 0 => a,
+        _ => return None,
+    };
+    base.checked_add(idx as i64)
+}
+
+fn byte_buffer_view_heap_array(
+    ctx: &mut dyn NativeContext,
+    bb: ObjectRef,
+    idx: usize,
+) -> Option<(ObjectRef, usize)> {
+    let arr = match ctx.get_field_by_name(bb, "hb") {
+        Value::Object(Some(a)) => a,
+        _ => return None,
+    };
+    let off = match ctx.get_field_by_name(bb, "offset") {
+        Value::Int(i) if i >= 0 => i as usize,
+        _ => 0,
+    };
+    Some((arr, off + idx))
+}
+
+fn byte_buffer_view_get(
+    ctx: &mut dyn NativeContext,
+    bb: ObjectRef,
+    idx: usize,
+    elem: u8,
+    le: bool,
+) -> Option<Value> {
+    let w = byte_view_width(elem);
+    if let Some(addr) = byte_buffer_view_addr(ctx, bb, idx) {
+        let mut bytes = [0u8; 8];
+        if ctx.copy_from_native_memory(addr, &mut bytes[..w]) {
+            return Some(byte_view_decode(elem, le, &bytes[..w]));
+        }
+    }
+    if let Some((arr, start)) = byte_buffer_view_heap_array(ctx, bb, idx) {
+        return Some(byte_view_get(ctx, arr, start, elem, le));
+    }
+    None
+}
+
+fn byte_buffer_view_set(
+    ctx: &mut dyn NativeContext,
+    bb: ObjectRef,
+    idx: usize,
+    elem: u8,
+    le: bool,
+    value: &Value,
+) {
+    let w = byte_view_width(elem);
+    let bytes = byte_view_encode(elem, le, value);
+    if let Some(addr) = byte_buffer_view_addr(ctx, bb, idx) {
+        if ctx.copy_to_native_memory(addr, &bytes[..w]) {
+            return;
+        }
+    }
+    if let Some((arr, start)) = byte_buffer_view_heap_array(ctx, bb, idx) {
+        for (i, &b) in bytes[..w].iter().enumerate() {
+            ctx.set_array_element(arr, start + i, Value::Int(b as i8 as i32));
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1706,6 +1877,19 @@ fn varhandle_get(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResul
         };
         return Ok(Some(byte_view_get(ctx, arr, idx, elem, le)));
     }
+    if let Some((elem, le)) = byte_buffer_view_kind(meta.as_deref()) {
+        let bb = match args.get(1) {
+            Some(Value::Object(Some(b))) => *b,
+            _ => return Ok(Some(Value::Object(None))),
+        };
+        let idx = match args.get(2) {
+            Some(Value::Int(i)) if *i >= 0 => *i as usize,
+            _ => 0,
+        };
+        return Ok(Some(
+            byte_buffer_view_get(ctx, bb, idx, elem, le).unwrap_or(Value::Object(None)),
+        ));
+    }
     // C38: Array-element VarHandle call — detected by args[1] being an array
     // and args[2] being an Int. Handles real-JDK VarHandleLongs$Array and the
     // other primitive-array VarHandle subclasses produced by
@@ -1827,6 +2011,17 @@ fn varhandle_set(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResul
             };
             let value = args.get(3).cloned().unwrap_or(Value::Int(0));
             byte_view_set(ctx, *arr, idx, elem, le, &value);
+        }
+        return Ok(None);
+    }
+    if let Some((elem, le)) = byte_buffer_view_kind(meta.as_deref()) {
+        if let Some(Value::Object(Some(bb))) = args.get(1) {
+            let idx = match args.get(2) {
+                Some(Value::Int(i)) if *i >= 0 => *i as usize,
+                _ => 0,
+            };
+            let value = args.get(3).cloned().unwrap_or(Value::Int(0));
+            byte_buffer_view_set(ctx, *bb, idx, elem, le, &value);
         }
         return Ok(None);
     }

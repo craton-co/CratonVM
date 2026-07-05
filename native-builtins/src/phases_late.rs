@@ -32980,19 +32980,19 @@ pub(crate) fn register_p67_misc(r: &mut NativeMethodRegistry) {
         sw,
         "forEach",
         "(Ljava/util/function/Consumer;)V",
-        native_noop_with_this,
+        p59_sw_for_each,
     );
     r.register(
         sw,
         "walk",
         "(Ljava/util/function/Function;)Ljava/lang/Object;",
-        |_ctx, _args| Ok(Some(Value::Object(None))),
+        p59_sw_walk,
     );
     r.register(
         sw,
         "getCallerClass",
         "()Ljava/lang/Class;",
-        |_ctx, _args| Ok(Some(Value::Object(None))),
+        p59_sw_get_caller_class,
     );
 
     // StackWalker.Option enum
