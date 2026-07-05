@@ -18947,6 +18947,150 @@ fn force_native_over_real_jdk_bytecode(
     {
         return true;
     }
+    // FFM layout factories: JDK 25's real `MemoryLayout.sequenceLayout` runs
+    // through `jdk/internal/foreign/Utils` while `SharedUtils.<clinit>` is still
+    // building its `C_POINTER` constant. That circular path re-enters
+    // `SharedUtils` before `ValueLayout.JAVA_BYTE` has been populated and
+    // `Objects.requireNonNull(elementLayout)` throws a bare NPE. The registered
+    // native factories are bytecode-equivalent for CratonVM's supported Panama
+    // layout model and avoid that bootstrap cycle.
+    if class_name == "java/lang/foreign/MemoryLayout"
+        && matches!(
+            (method_name, method_descriptor),
+            (
+                "sequenceLayout",
+                "(JLjava/lang/foreign/MemoryLayout;)Ljava/lang/foreign/SequenceLayout;"
+            ) | (
+                "sequenceLayout",
+                "(JLjava/lang/foreign/MemoryLayout;)Ljava/lang/foreign/MemoryLayout;"
+            ) | (
+                "structLayout",
+                "([Ljava/lang/foreign/MemoryLayout;)Ljava/lang/foreign/StructLayout;"
+            ) | (
+                "structLayout",
+                "([Ljava/lang/foreign/MemoryLayout;)Ljava/lang/foreign/MemoryLayout;"
+            ) | (
+                "unionLayout",
+                "([Ljava/lang/foreign/MemoryLayout;)Ljava/lang/foreign/UnionLayout;"
+            ) | (
+                "unionLayout",
+                "([Ljava/lang/foreign/MemoryLayout;)Ljava/lang/foreign/MemoryLayout;"
+            ) | ("paddingLayout", "(J)Ljava/lang/foreign/PaddingLayout;")
+                | ("paddingLayout", "(J)Ljava/lang/foreign/MemoryLayout;")
+        )
+    {
+        return true;
+    }
+    // FFM ValueLayout subinterfaces are abstract/covariant in the real JDK
+    // surface. CratonVM backs the supported layouts with small synthetic
+    // objects, so calls such as `ValueLayout$OfFloat.withByteAlignment(J)`
+    // must be served by the registered layout shims instead of falling through
+    // to an abstract interface method with no Code attribute.
+    if (class_name == "java/lang/foreign/ValueLayout"
+        || class_name.starts_with("java/lang/foreign/ValueLayout$"))
+        && matches!(
+            method_name,
+            "byteSize"
+                | "byteAlignment"
+                | "withByteAlignment"
+                | "withName"
+                | "withOrder"
+                | "varHandle"
+        )
+    {
+        return true;
+    }
+    if class_name == "java/lang/foreign/MemorySegment"
+        && matches!(
+            method_name,
+            "byteSize"
+                | "address"
+                | "copy"
+                | "get"
+                | "set"
+                | "getAtIndex"
+                | "setAtIndex"
+                | "asSlice"
+                | "isNative"
+                | "isMapped"
+                | "isReadOnly"
+                | "scope"
+        )
+    {
+        return true;
+    }
+    if matches!(
+        class_name,
+        "jdk/internal/foreign/AbstractMemorySegmentImpl"
+            | "jdk/internal/foreign/NativeMemorySegmentImpl"
+            | "jdk/internal/foreign/MappedMemorySegmentImpl"
+    ) && matches!(
+        method_name,
+        "byteSize" | "address" | "get" | "isNative" | "isMapped" | "isReadOnly" | "scope"
+    ) {
+        return true;
+    }
+    if class_name == "jdk/internal/foreign/MemorySessionImpl"
+        && matches!(
+            method_name,
+            "toMemorySession"
+                | "createConfined"
+                | "createShared"
+                | "createImplicit"
+                | "createHeap"
+                | "addCloseAction"
+                | "addOrCleanupIfFail"
+                | "addInternal"
+                | "release0"
+                | "acquire0"
+                | "whileAlive"
+                | "ownerThread"
+                | "isAccessibleBy"
+                | "isAlive"
+                | "checkValidStateRaw"
+                | "checkValidState"
+                | "isCloseable"
+                | "close"
+                | "justClose"
+        )
+    {
+        return true;
+    }
+    if class_name == "jdk/internal/misc/ScopedMemoryAccess"
+        && matches!(
+            method_name,
+            "getByte"
+                | "getByteInternal"
+                | "putByte"
+                | "putByteInternal"
+                | "getShort"
+                | "getShortInternal"
+                | "getShortUnaligned"
+                | "getShortUnalignedInternal"
+                | "putShort"
+                | "putShortInternal"
+                | "putShortUnaligned"
+                | "putShortUnalignedInternal"
+                | "getInt"
+                | "getIntInternal"
+                | "getIntUnaligned"
+                | "getIntUnalignedInternal"
+                | "putInt"
+                | "putIntInternal"
+                | "putIntUnaligned"
+                | "putIntUnalignedInternal"
+                | "getLong"
+                | "getLongInternal"
+                | "getLongUnaligned"
+                | "getLongUnalignedInternal"
+                | "putLong"
+                | "putLongInternal"
+                | "putLongUnaligned"
+                | "putLongUnalignedInternal"
+        )
+    {
+        return true;
+    }
     // BUG-15: `sun.util.locale.provider.LocaleResources.getDateTimePattern(int,
     // int, Calendar)` reads its pattern arrays through `LocaleData
     // .getDateFormatData` → `Bundles.of(...)`, the jdk.localedata class-based
@@ -20438,6 +20582,18 @@ fn execute_invokestatic(
         let pd_byte = pd.as_bytes().first().copied().unwrap_or(b'L');
         let v = decode_arg_kind_aware(cv, is_long, pd_byte);
         args.push(coerce_invoke_arg_for_descriptor(pd, v));
+    }
+
+    if let Some(res) = intercept_force_registered_native(
+        shared,
+        thread,
+        frame_idx,
+        &method_class_name,
+        method_name.as_ref(),
+        method_descriptor.as_ref(),
+        &args,
+    ) {
+        return res;
     }
 
     // GPU offload hook (Part E). Behind `gpu-offload`: with the

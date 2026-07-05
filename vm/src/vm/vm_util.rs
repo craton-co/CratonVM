@@ -950,6 +950,14 @@ fn initialize_class_shared(
         .get_class(class_id)
         .map(|c| c.name.clone())
         .unwrap_or_default();
+    // FFM bootstrap guard: preparation pre-seeds the supported ValueLayout
+    // statics (ADDRESS, JAVA_INT, unaligned variants, etc.) with synthetic
+    // layout objects. Running the real JDK 25 interface <clinit> is unsafe in
+    // CratonVM because it rebuilds ADDRESS through Unsafe.ADDRESS_SIZE before
+    // HotSpot-style UnsafeConstants backfill is available, producing alignment
+    // 0 and poisoning SharedUtils.<clinit>. Treat the preseeded interface as a
+    // no-<clinit> class so normal finalization/JFR handling below still runs.
+    let has_clinit = has_clinit && &*class_name_for_jfr != "java/lang/foreign/ValueLayout";
     let init_start = std::time::Instant::now();
 
     // AOT training: record class load event for pre-linking
@@ -1772,6 +1780,47 @@ fn initialize_class_shared(
 /// - `Double`  в†’ double slot
 /// - `String`  в†’ resolves the Utf8, allocates a Java String via the VM's
 ///   string pool, and stores the reference in the slot.
+fn value_layout_preseed(field_name: &str) -> Option<(&'static str, i64, i64)> {
+    match field_name {
+        "ADDRESS" => Some(("java/lang/foreign/AddressLayout", 8, 8)),
+        "JAVA_BYTE" => Some(("java/lang/foreign/ValueLayout$OfByte", 1, 1)),
+        "JAVA_BOOLEAN" => Some(("java/lang/foreign/ValueLayout$OfBoolean", 1, 1)),
+        "JAVA_CHAR" => Some(("java/lang/foreign/ValueLayout$OfChar", 2, 2)),
+        "JAVA_SHORT" => Some(("java/lang/foreign/ValueLayout$OfShort", 2, 2)),
+        "JAVA_INT" => Some(("java/lang/foreign/ValueLayout$OfInt", 4, 4)),
+        "JAVA_LONG" => Some(("java/lang/foreign/ValueLayout$OfLong", 8, 8)),
+        "JAVA_FLOAT" => Some(("java/lang/foreign/ValueLayout$OfFloat", 4, 4)),
+        "JAVA_DOUBLE" => Some(("java/lang/foreign/ValueLayout$OfDouble", 8, 8)),
+        "ADDRESS_UNALIGNED" => Some(("java/lang/foreign/AddressLayout", 8, 1)),
+        "JAVA_CHAR_UNALIGNED" => Some(("java/lang/foreign/ValueLayout$OfChar", 2, 1)),
+        "JAVA_SHORT_UNALIGNED" => Some(("java/lang/foreign/ValueLayout$OfShort", 2, 1)),
+        "JAVA_INT_UNALIGNED" => Some(("java/lang/foreign/ValueLayout$OfInt", 4, 1)),
+        "JAVA_LONG_UNALIGNED" => Some(("java/lang/foreign/ValueLayout$OfLong", 8, 1)),
+        "JAVA_FLOAT_UNALIGNED" => Some(("java/lang/foreign/ValueLayout$OfFloat", 4, 1)),
+        "JAVA_DOUBLE_UNALIGNED" => Some(("java/lang/foreign/ValueLayout$OfDouble", 8, 1)),
+        _ => None,
+    }
+}
+
+fn make_prepared_value_layout(
+    shared: &SharedVm,
+    class_name: &str,
+    byte_size: i64,
+    byte_alignment: i64,
+) -> Option<ObjectRef> {
+    let layout_class_id = shared.load_class_concurrent(class_name).ok()?;
+    let num_fields = shared
+        .class_manager
+        .read()
+        .get_class(layout_class_id)
+        .map(|c| c.num_total_fields.max(2))
+        .unwrap_or(2);
+    let obj = shared.heap.alloc_object(layout_class_id, num_fields);
+    shared.heap.set_field(obj, 0, Value::Long(byte_size));
+    shared.heap.set_field(obj, 1, Value::Long(byte_alignment));
+    Some(obj)
+}
+
 fn prepare_class_shared(shared: &SharedVm, class_id: ClassId) -> Result<(), VmError> {
     use cratonvm_reader::constant_pool::ConstantPoolEntry;
 
@@ -1786,7 +1835,7 @@ fn prepare_class_shared(shared: &SharedVm, class_id: ClassId) -> Result<(), VmEr
         StringUtf16(Vec<u16>),
     }
 
-    let static_field_info: Vec<(String, Option<CvSeed>)> = {
+    let (class_name, static_field_info): (String, Vec<(String, String, Option<CvSeed>)>) = {
         let cm = shared.class_manager.read();
         let class = cm.get_class(class_id).ok_or_else(|| VmError::Internal {
             message: format!("prepare_class: class {class_id} not found"),
@@ -1814,10 +1863,10 @@ fn prepare_class_shared(shared: &SharedVm, class_id: ClassId) -> Result<(), VmEr
                         }
                         _ => None,
                     });
-                info.push((field.descriptor.to_string(), seed));
+                info.push((field.name.to_string(), field.descriptor.to_string(), seed));
             }
         }
-        info
+        (class.name.to_string(), info)
     };
 
     // Allocate static field slots with default values, then overlay any
@@ -1827,7 +1876,7 @@ fn prepare_class_shared(shared: &SharedVm, class_id: ClassId) -> Result<(), VmEr
     let num_static = static_field_info.len();
     let mut statics = vec![Value::Int(0); num_static];
 
-    for (static_idx, (descriptor, seed)) in static_field_info.iter().enumerate() {
+    for (static_idx, (field_name, descriptor, seed)) in static_field_info.iter().enumerate() {
         statics[static_idx] = default_value_for_descriptor(descriptor);
 
         match seed {
@@ -1841,6 +1890,18 @@ fn prepare_class_shared(shared: &SharedVm, class_id: ClassId) -> Result<(), VmEr
                 statics[static_idx] = Value::Object(Some(str_ref));
             }
             None => {}
+        }
+
+        if class_name == "java/lang/foreign/ValueLayout" {
+            if let Some((layout_class, byte_size, byte_alignment)) =
+                value_layout_preseed(field_name)
+            {
+                if let Some(obj) =
+                    make_prepared_value_layout(shared, layout_class, byte_size, byte_alignment)
+                {
+                    statics[static_idx] = Value::Object(Some(obj));
+                }
+            }
         }
     }
 

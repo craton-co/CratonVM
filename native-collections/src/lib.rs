@@ -3375,6 +3375,12 @@ fn element_hash_code(ctx: &mut dyn NativeContext, v: &Value) -> i32 {
     }
 }
 
+fn class_name_is(ctx: &dyn NativeContext, obj: ObjectRef, expected: &str) -> bool {
+    ctx.class_name_of_id(ctx.class_id_of_object(obj))
+        .as_deref()
+        == Some(expected)
+}
+
 /// Check if two keys are equal.
 ///
 /// MED fix: when the user-supplied `equals(Object)` throws (i.e.
@@ -3393,6 +3399,19 @@ fn map_keys_equal(
     b: ObjectRef,
 ) -> Result<bool, MethodCallFailed> {
     if std::ptr::eq(a.as_ptr(), b.as_ptr()) {
+        return Ok(true);
+    }
+    // `java.lang.Thread` mirrors are VM-owned identity objects. A moving GC
+    // preserves the header identity hash, but some real-JDK weak-key paths can
+    // still compare an older mirror address against the current thread mirror
+    // after relocation. Treat equal Thread identity hashes as the same logical
+    // thread so RandomizedTesting's WeakHashMap<Thread, ...> per-thread context
+    // survives mirror relocation. This is intentionally Thread-only; general
+    // Object.equals identity semantics still use pointer equality.
+    if class_name_is(ctx, a, "java/lang/Thread")
+        && class_name_is(ctx, b, "java/lang/Thread")
+        && ctx.identity_hash_code(a) == ctx.identity_hash_code(b)
+    {
         return Ok(true);
     }
     // String value equality (the common case, checked first).

@@ -4314,6 +4314,33 @@ fn lk_has_private_access(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
     })))
 }
 
+fn lk_ensure_initialized(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let _this = obj_arg(args, 0)?;
+    let target_class = match args.get(1) {
+        Some(Value::Object(Some(o))) => *o,
+        _ => {
+            return Err(cratonvm_types::error::RuntimeError::NullPointerException {
+                message: Some("Lookup.ensureInitialized target class is null".to_string()),
+            }
+            .into());
+        }
+    };
+    let class_id =
+        crate::lang_class::mirror_class_id(ctx, target_class).ok_or_else(|| {
+            cratonvm_types::error::RuntimeError::IllegalArgumentException {
+                message: "Lookup.ensureInitialized target is not a Class mirror".to_string(),
+            }
+        })?;
+    ctx.initialize_class(class_id).map_err(|message| {
+        cratonvm_types::error::MethodCallFailed::InternalError(
+            cratonvm_types::error::VmError::Internal {
+                message: format!("Lookup.ensureInitialized failed: {message}"),
+            },
+        )
+    })?;
+    Ok(Some(Value::Object(Some(target_class))))
+}
+
 fn lk_define_class(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     // Lookup.defineClass(byte[]) -> Class
     // WP2.3: routes through `define_class_full`. Differs from
@@ -5543,6 +5570,12 @@ pub(crate) fn register_classloader_natives(r: &mut NativeMethodRegistry) {
         lk_has_full_privilege_access,
     );
     r.register(lk, "hasPrivateAccess", "()Z", lk_has_private_access);
+    r.register(
+        lk,
+        "ensureInitialized",
+        "(Ljava/lang/Class;)Ljava/lang/Class;",
+        lk_ensure_initialized,
+    );
     r.register(lk, "defineClass", "([B)Ljava/lang/Class;", lk_define_class);
     r.register(lk, "defineHiddenClass", "([BZ[Ljava/lang/invoke/MethodHandles$Lookup$ClassOption;)Ljava/lang/invoke/MethodHandles$Lookup;", lk_define_hidden_class);
     // findVirtual/findStatic/findConstructor/findGetter/findSetter/findSpecial/
@@ -6266,6 +6299,18 @@ mod classloader_tests {
     fn test_cl_init_default_registered() {
         let r = make_registry();
         assert!(r.find(CL_CLASS, "<init>", "()V").is_some());
+    }
+
+    #[test]
+    fn test_lookup_ensure_initialized_registered() {
+        let r = make_registry();
+        assert!(r
+            .find(
+                LK_CLASS,
+                "ensureInitialized",
+                "(Ljava/lang/Class;)Ljava/lang/Class;"
+            )
+            .is_some());
     }
 
     #[test]

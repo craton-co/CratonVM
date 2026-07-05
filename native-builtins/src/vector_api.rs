@@ -1855,9 +1855,12 @@ fn vector_support_get_max_lane_count(
     _ctx: &mut dyn NativeContext,
     _args: &[Value],
 ) -> MethodCallResult {
-    // Conservative fallback: expose at most 64-bit vectors through the JDK 25
-    // VectorSupport sizing path unless a wider implementation is wired later.
-    Ok(Some(Value::Int(2)))
+    // JDK 25's VectorShape.S_Max_BIT derives its bit size from
+    // getMaxLaneCount(byte.class) * Byte.SIZE. CratonVM's vector bridge is a
+    // scalar-correct implementation, so expose the minimum 128-bit byte-lane
+    // count instead of disabling Lucene's vector path with a spurious 64-bit
+    // preferred shape.
+    Ok(Some(Value::Int(16)))
 }
 
 // ---------------------------------------------------------------------------

@@ -13081,7 +13081,39 @@ fn invoke_on_class_shared_inner(
             eprintln!("[invoke_on_class_shared L5271] class_name_for_override={} method={} desc={} found={}",
                       class_name_for_override, method_name, descriptor, found);
         }
-        let override_cb = if declaring_is_interface && !is_static {
+        let force_ffm_value_layout_interface_native =
+            (class_name_for_override == "java/lang/foreign/ValueLayout"
+                || class_name_for_override.starts_with("java/lang/foreign/ValueLayout$"))
+                && matches!(
+                    method_name,
+                    "byteSize"
+                        | "byteAlignment"
+                        | "withByteAlignment"
+                        | "withName"
+                        | "withOrder"
+                        | "varHandle"
+                );
+        let force_ffm_memory_segment_interface_native =
+            class_name_for_override == "java/lang/foreign/MemorySegment"
+                && matches!(
+                    method_name,
+                    "byteSize"
+                        | "address"
+                        | "get"
+                        | "set"
+                        | "getAtIndex"
+                        | "setAtIndex"
+                        | "asSlice"
+                        | "isNative"
+                        | "isMapped"
+                        | "isReadOnly"
+                        | "scope"
+                );
+        let override_cb = if declaring_is_interface
+            && !is_static
+            && !force_ffm_value_layout_interface_native
+            && !force_ffm_memory_segment_interface_native
+        {
             None
         } else {
             shared

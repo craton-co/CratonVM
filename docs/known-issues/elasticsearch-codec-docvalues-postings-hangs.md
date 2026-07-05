@@ -4,6 +4,25 @@ Status: open
 
 Date observed: 2026-07-02. Re-verified still open: 2026-07-04.
 
+2026-07-05 update: the focused postings correctness failures uncovered during
+this retry were fixed separately from the class-level timeout. The retry added
+the missing FFM/Lucene checksum bridges and a conservative Lucene/JUnit test
+stack JIT skip, then validated:
+
+```text
+ES812PostingsFormatTests.testDocsAndFreqsAndPositionsAndPayloads: OK (76.8s)
+ES85BloomFilterPostingsFormatTests.testInvertedWrite: OK (46.3s)
+ES87BloomFilterPostingsFormatTests.testInvertedWrite: OK (46.5s)
+MMap endian/random-access and BufferedChecksumIndexInput side-effect/footer probes: OK
+```
+
+The broader issue remains open. A full
+`ES85BloomFilterPostingsFormatTests` class run still hits the 300-second
+timeout, and `testRandom` also reproduces a separate
+`java.nio.file.FileAlreadyExistsException` even with `CRATONVM_DISABLE_JIT=1`.
+That means the historical class-level suite timeout is not closed by the
+focused correctness fixes.
+
 ## Summary
 
 `ES85BloomFilterPostingsFormatTests`, `ES87BloomFilterPostingsFormatTests`,

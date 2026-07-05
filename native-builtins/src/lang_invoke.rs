@@ -2820,6 +2820,38 @@ pub fn register_p63_method_handles_lookup(r: &mut NativeMethodRegistry) {
         Ok(Some(Value::Int(modes)))
     });
 
+    r.register(
+        lk,
+        "ensureInitialized",
+        "(Ljava/lang/Class;)Ljava/lang/Class;",
+        |ctx, args| {
+            let _this = obj_arg(args, 0)?;
+            let target_class = match args.get(1) {
+                Some(Value::Object(Some(o))) => *o,
+                _ => {
+                    return Err(cratonvm_types::error::RuntimeError::NullPointerException {
+                        message: Some("Lookup.ensureInitialized target class is null".to_string()),
+                    }
+                    .into());
+                }
+            };
+            let class_id =
+                crate::lang_class::mirror_class_id(ctx, target_class).ok_or_else(|| {
+                    cratonvm_types::error::RuntimeError::IllegalArgumentException {
+                        message: "Lookup.ensureInitialized target is not a Class mirror"
+                            .to_string(),
+                    }
+                })?;
+            ctx.initialize_class(class_id).map_err(|message| {
+                cratonvm_types::error::MethodCallFailed::InternalError(
+                    cratonvm_types::error::VmError::Internal {
+                        message: format!("Lookup.ensureInitialized failed: {message}"),
+                    },
+                )
+            })?;
+            Ok(Some(Value::Object(Some(target_class))))
+        },
+    );
     // Lookup.in(targetClass) — create Lookup with reduced access for a different class
     r.register(
         lk,
