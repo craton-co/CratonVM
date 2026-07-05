@@ -1,6 +1,6 @@
 # Elasticsearch no-JIT partial suite bug sweep
 
-Status: open
+Status: fixed
 
 Date observed: 2026-07-02
 
@@ -115,3 +115,33 @@ java.lang.module.FindException: Module java.base not found, required by x.foo.im
 ```
 
 So this note remains in `docs/known-issues`: the deterministic module descriptor/cache failures are fixed, but the Elasticsearch provider module path still needs a synthetic boot configuration that can satisfy at least `java.base` resolution before the original no-JIT roll-up can be retired.
+
+## 2026-07-05 follow-up: java.base provider-module gap fixed
+
+The residual `ProviderLocator` module path gap is now closed for the deterministic Elasticsearch-shaped provider path.
+
+Additional fixes applied after the earlier `ModuleDescriptor.uses` and supported-version fixes:
+
+- `java.lang.ModuleLayer.boot().configuration()` now models the mandatory `java.base` resolved module, including non-null descriptor collections and enough exported `java.base` packages for provider module resolution.
+- `java.lang.module.ModuleDescriptor` set-valued accessors now lazily return non-null empty sets for partially initialized descriptors.
+- `java.lang.ModuleLayer.modules()` now derives real module objects from `nameToModule`, caches the set, and seeds `servicesCatalog` so `ServiceLoader.load(layer, service)` can see module-declared providers.
+- `java.lang.Module.getDescriptor()` now preserves a real module descriptor when one is present, so `provides` and `packages` are not lost on modules defined by `ModuleLayer.defineModules`.
+- Added narrow module-system bridges required by this path: `Module.defineModule0`, `Module.addExportsToAll0`, and `ResolvedModule.getDescriptor()`.
+- Native `ServiceLoader` now includes JPMS layer `servicesCatalog` providers and can load Elasticsearch embedded provider classes through the existing IMPL-JARS path.
+
+Validation binary:
+
+```text
+/data/target-es-nojit-javabase-20260705/release/cratonvm-es-nojit-javabase-azure-20260705
+```
+
+Focused validation:
+
+```text
+ProviderLocatorXContentOkProbe OK impl=xcontent-provider implModule=unnamed module @513
+[cratonvm] main-vm run() returned Ok - VM main exiting normally
+```
+
+The temporary probe initializes Elasticsearch logging explicitly with `LoggerFactory.setInstance(new LoggerFactoryImpl())`; the earlier `LoggerFactory.provider()` null case is already documented as non-VM / setup-related in `docs/internal/elasticsearch-suite/elasticsearch-loggerfactory-provider-null.md`.
+
+One non-blocking observation remains: the synthetic probe's provider implementation class is instantiated through CratonVM's embedded-byte fallback and reports an unnamed class mirror. The `ProviderLocator` contract itself now succeeds and the original no-JIT `ModuleDescriptor.uses` / `java.base` provider-module blocker is resolved, so this roll-up note is retired from `docs/known-issues`.
