@@ -26,8 +26,8 @@ use std::sync::Arc;
 use parking_lot::Mutex;
 
 use crate::heap::{
-    array_data_size, ArrayElementType, ObjectHeader, ObjectKind, HEADER_SIZE, REF_ELEMENT_SIZE,
-    SLOT_SIZE,
+    array_data_size, ArrayElementType, ObjectHeader, ObjectKind, GC_FLAG_COMPACT, GC_FLAG_MARKED,
+    GC_FLAG_OLD_GEN, HEADER_SIZE, REF_ELEMENT_SIZE, SLOT_SIZE,
 };
 use crate::mark_bitmap::MarkBitmap;
 use crate::old_gen::OldGen;
@@ -716,36 +716,43 @@ impl ConcurrentMarker {
         // SAFETY: obj_ptr was popped from the mark queue, which only contains
         // pointers to valid old-gen objects verified by old_gen.contains() before
         // being enqueued. The header is readable for the lifetime of the GC cycle.
-        let header = unsafe { &*(obj_ptr as *const ObjectHeader) };
-        let Some(total_size) = concurrent_mark_object_size(header) else {
+        let header_ptr = obj_ptr as *const ObjectHeader;
+        let Some(total_size) = concurrent_mark_object_size(header_ptr) else {
+            let snapshot = ConcurrentMarkHeaderSnapshot::read(header_ptr);
             tracing::warn!(
                 "concurrent mark: skipping object at {:p} with inconsistent header \
-                 (kind={:?}, class_id={}, array_length={}, num_slots={}); marking all old-gen \
-                 objects for this cycle",
+                 (kind_tag={}, element_tag={}, class_id={}, array_length={}, num_slots={}, \
+                 gc_flags=0x{:02x}); marking all old-gen objects for this cycle",
                 obj_ptr,
-                header.kind,
-                header.class_id.as_u32(),
-                header.array_length,
-                header.num_slots,
+                snapshot.kind_tag,
+                snapshot.element_tag,
+                snapshot.class_id,
+                snapshot.array_length,
+                snapshot.num_slots,
+                snapshot.gc_flags,
             );
             return false;
         };
         if total_size < HEADER_SIZE
             || !old_gen.contains(unsafe { obj_ptr.add(total_size.saturating_sub(1)) })
         {
+            let snapshot = ConcurrentMarkHeaderSnapshot::read(header_ptr);
             tracing::warn!(
                 "concurrent mark: skipping object at {:p} with implausible extent {} \
-                 (kind={:?}, class_id={}, array_length={}, num_slots={}); marking all old-gen \
-                 objects for this cycle",
+                 (kind_tag={}, element_tag={}, class_id={}, array_length={}, num_slots={}, \
+                 gc_flags=0x{:02x}); marking all old-gen objects for this cycle",
                 obj_ptr,
                 total_size,
-                header.kind,
-                header.class_id.as_u32(),
-                header.array_length,
-                header.num_slots,
+                snapshot.kind_tag,
+                snapshot.element_tag,
+                snapshot.class_id,
+                snapshot.array_length,
+                snapshot.num_slots,
+                snapshot.gc_flags,
             );
             return false;
         }
+        let header = unsafe { &*header_ptr };
 
         if header.kind == ObjectKind::Array {
             if header.element_type == ArrayElementType::Reference {
@@ -863,21 +870,75 @@ impl ConcurrentMarker {
     }
 }
 
-fn concurrent_mark_object_size(header: &ObjectHeader) -> Option<usize> {
-    if header.kind == ObjectKind::Array {
-        let data_size = array_data_size(header.array_length as usize, header.element_type).ok()?;
-        return HEADER_SIZE.checked_add(data_size);
+fn concurrent_mark_object_size(header: *const ObjectHeader) -> Option<usize> {
+    let snapshot = ConcurrentMarkHeaderSnapshot::read(header);
+    match snapshot.kind_tag {
+        tag if tag == ObjectKind::Array as u8 => {
+            let element_type = array_element_type_from_tag(snapshot.element_tag)?;
+            let data_size = array_data_size(snapshot.array_length as usize, element_type).ok()?;
+            HEADER_SIZE.checked_add(data_size)
+        }
+        tag if tag == ObjectKind::Object as u8 => {
+            let known_flags = GC_FLAG_OLD_GEN | GC_FLAG_MARKED | GC_FLAG_COMPACT;
+            if snapshot.gc_flags & !known_flags != 0 {
+                return None;
+            }
+            if snapshot.gc_flags & GC_FLAG_COMPACT != 0 {
+                return HEADER_SIZE.checked_add(snapshot.array_length as usize);
+            }
+            if snapshot.array_length != 0 || snapshot.num_slots > (1 << 24) {
+                return None;
+            }
+            let fields_size = (snapshot.num_slots as usize).checked_mul(SLOT_SIZE)?;
+            HEADER_SIZE.checked_add(fields_size)
+        }
+        _ => None,
     }
+}
 
-    if let Some((_layout, body)) = crate::heap::compact_oop_scan(header) {
-        return HEADER_SIZE.checked_add(body);
-    }
+struct ConcurrentMarkHeaderSnapshot {
+    class_id: u32,
+    kind_tag: u8,
+    element_tag: u8,
+    array_length: u32,
+    num_slots: u32,
+    gc_flags: u8,
+}
 
-    if header.array_length != 0 || header.num_slots > (1 << 24) {
-        return None;
+impl ConcurrentMarkHeaderSnapshot {
+    fn read(header: *const ObjectHeader) -> Self {
+        unsafe {
+            Self {
+                class_id: std::ptr::addr_of!((*header).class_id)
+                    .read_unaligned()
+                    .as_u32(),
+                kind_tag: std::ptr::addr_of!((*header).kind)
+                    .cast::<u8>()
+                    .read_unaligned(),
+                element_tag: std::ptr::addr_of!((*header).element_type)
+                    .cast::<u8>()
+                    .read_unaligned(),
+                array_length: std::ptr::addr_of!((*header).array_length).read_unaligned(),
+                num_slots: std::ptr::addr_of!((*header).num_slots).read_unaligned(),
+                gc_flags: std::ptr::addr_of!((*header).gc_flags).read_unaligned(),
+            }
+        }
     }
-    let fields_size = (header.num_slots as usize).checked_mul(SLOT_SIZE)?;
-    HEADER_SIZE.checked_add(fields_size)
+}
+
+fn array_element_type_from_tag(tag: u8) -> Option<ArrayElementType> {
+    match tag {
+        tag if tag == ArrayElementType::Reference as u8 => Some(ArrayElementType::Reference),
+        tag if tag == ArrayElementType::Boolean as u8 => Some(ArrayElementType::Boolean),
+        tag if tag == ArrayElementType::Char as u8 => Some(ArrayElementType::Char),
+        tag if tag == ArrayElementType::Float as u8 => Some(ArrayElementType::Float),
+        tag if tag == ArrayElementType::Double as u8 => Some(ArrayElementType::Double),
+        tag if tag == ArrayElementType::Byte as u8 => Some(ArrayElementType::Byte),
+        tag if tag == ArrayElementType::Short as u8 => Some(ArrayElementType::Short),
+        tag if tag == ArrayElementType::Int as u8 => Some(ArrayElementType::Int),
+        tag if tag == ArrayElementType::Long as u8 => Some(ArrayElementType::Long),
+        _ => None,
+    }
 }
 
 impl std::fmt::Debug for ConcurrentMarker {
