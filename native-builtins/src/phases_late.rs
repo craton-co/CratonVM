@@ -20943,6 +20943,61 @@ pub(crate) fn native_module_add_opens(
     Ok(Some(Value::Object(Some(this))))
 }
 
+fn module_add_exports_or_opens_void(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+    open: bool,
+    target_index: Option<usize>,
+) -> MethodCallResult {
+    let this = obj_arg(args, 0)?;
+    let module_name = read_module_name(ctx, this);
+    let pkg_name = match args.get(1) {
+        Some(Value::Object(Some(s))) => ctx.read_string(*s).unwrap_or_default(),
+        _ => return Ok(None),
+    };
+    let target = target_index
+        .and_then(|idx| match args.get(idx) {
+            Some(Value::Object(Some(m))) => Some(read_module_name(ctx, *m)),
+            _ => None,
+        })
+        .unwrap_or_default();
+    let pkg_slash = pkg_name.replace('.', "/");
+    if open {
+        ctx.module_add_opens(&module_name, &pkg_slash, &target);
+    } else {
+        ctx.module_add_exports(&module_name, &pkg_slash, &target);
+    }
+    Ok(None)
+}
+
+pub(crate) fn native_module_impl_add_exports_all(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    module_add_exports_or_opens_void(ctx, args, false, None)
+}
+
+pub(crate) fn native_module_impl_add_exports_to_module(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    module_add_exports_or_opens_void(ctx, args, false, Some(2))
+}
+
+pub(crate) fn native_module_impl_add_opens_all(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    module_add_exports_or_opens_void(ctx, args, true, None)
+}
+
+pub(crate) fn native_module_impl_add_opens_to_module(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    module_add_exports_or_opens_void(ctx, args, true, Some(2))
+}
+
 pub(crate) fn register_p59_module(r: &mut NativeMethodRegistry) {
     let __prev_cat = r.current_category();
     r.set_category(cratonvm_native_api::NativeKind::Bridge);

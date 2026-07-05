@@ -39,6 +39,50 @@ pub(crate) fn bootstrap_property_fallback(key: &str) -> Option<String> {
     }
 }
 
+fn os_env_bytes(s: &std::ffi::OsStr) -> Vec<u8> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::ffi::OsStrExt;
+        s.as_bytes().to_vec()
+    }
+    #[cfg(not(unix))]
+    {
+        s.to_string_lossy().into_owned().into_bytes()
+    }
+}
+
+fn native_process_environment_environ(
+    ctx: &mut dyn NativeContext,
+    _args: &[Value],
+) -> MethodCallResult {
+    let mut cells: Vec<Vec<u8>> = Vec::new();
+    for (key, value) in std::env::vars_os() {
+        let key = os_env_bytes(&key);
+        let value = os_env_bytes(&value);
+        if key.iter().any(|b| *b == b'=' || *b == 0) || value.iter().any(|b| *b == 0) {
+            continue;
+        }
+        cells.push(key);
+        cells.push(value);
+    }
+
+    let outer = ctx.new_array(cratonvm_types::ArrayElementType::Reference, cells.len());
+    let outer_root = ctx.pin_native_root(outer);
+    for (idx, bytes) in cells.iter().enumerate() {
+        let arr = ctx.new_array(cratonvm_types::ArrayElementType::Byte, bytes.len());
+        if !ctx.write_byte_array_from(arr, 0, bytes) {
+            for (i, &b) in bytes.iter().enumerate() {
+                ctx.set_array_element(arr, i, Value::Int(b as i32));
+            }
+        }
+        let outer_now = ctx.read_native_pin(outer_root, outer);
+        ctx.set_array_element(outer_now, idx, Value::Object(Some(arr)));
+    }
+    let outer = ctx.read_native_pin(outer_root, outer);
+    ctx.unpin_native_roots(outer_root);
+    Ok(Some(Value::Object(Some(outer))))
+}
+
 pub(crate) fn native_unsafe_ensure_class_initialized(
     ctx: &mut dyn NativeContext,
     args: &[Value],
@@ -1148,6 +1192,12 @@ fn register_printstream_fallback_natives(registry: &mut NativeMethodRegistry) {
         "write",
         "([BII)V",
         native_printstream_write,
+    );
+    registry.register(
+        "java/io/PrintStream",
+        "write",
+        "(I)V",
+        native_printstream_write_int,
     );
     registry.register(
         "java/io/PrintStream",
@@ -11258,6 +11308,54 @@ pub fn register_essential_natives(registry: &mut NativeMethodRegistry) {
         "(Ljava/lang/String;Ljava/lang/Module;)Ljava/lang/Module;",
         crate::phases_late::native_module_add_opens,
     );
+    registry.register(
+        "java/lang/Module",
+        "implAddExports",
+        "(Ljava/lang/String;)V",
+        crate::phases_late::native_module_impl_add_exports_all,
+    );
+    registry.register(
+        "java/lang/Module",
+        "implAddExports",
+        "(Ljava/lang/String;Ljava/lang/Module;)V",
+        crate::phases_late::native_module_impl_add_exports_to_module,
+    );
+    registry.register(
+        "java/lang/Module",
+        "implAddExportsToAllUnnamed",
+        "(Ljava/lang/String;)V",
+        crate::phases_late::native_module_impl_add_exports_all,
+    );
+    registry.register(
+        "java/lang/Module",
+        "implAddExportsNoSync",
+        "(Ljava/lang/String;)V",
+        crate::phases_late::native_module_impl_add_exports_all,
+    );
+    registry.register(
+        "java/lang/Module",
+        "implAddExportsNoSync",
+        "(Ljava/lang/String;Ljava/lang/Module;)V",
+        crate::phases_late::native_module_impl_add_exports_to_module,
+    );
+    registry.register(
+        "java/lang/Module",
+        "implAddOpens",
+        "(Ljava/lang/String;)V",
+        crate::phases_late::native_module_impl_add_opens_all,
+    );
+    registry.register(
+        "java/lang/Module",
+        "implAddOpens",
+        "(Ljava/lang/String;Ljava/lang/Module;)V",
+        crate::phases_late::native_module_impl_add_opens_to_module,
+    );
+    registry.register(
+        "java/lang/Module",
+        "implAddOpensToAllUnnamed",
+        "(Ljava/lang/String;)V",
+        crate::phases_late::native_module_impl_add_opens_all,
+    );
 
     registry.register(
         "java/lang/String",
@@ -12000,6 +12098,18 @@ pub fn register_essential_natives(registry: &mut NativeMethodRegistry) {
         "accept",
         "(Ljava/lang/Class;)Z",
         native_test_plan_scanner_filter_accept,
+    );
+    registry.register(
+        "org/apache/maven/surefire/common/junit4/JUnit4Reflector",
+        "createDescription",
+        "(Ljava/lang/String;)Lorg/junit/runner/Description;",
+        native_surefire_junit4_reflector_create_description,
+    );
+    registry.register(
+        "org/apache/maven/surefire/common/junit4/JUnit4Reflector",
+        "createDescription",
+        "(Ljava/lang/String;[Ljava/lang/annotation/Annotation;)Lorg/junit/runner/Description;",
+        native_surefire_junit4_reflector_create_description,
     );
     // SystemPropertyManager.loadProperties(InputStream) — Surefire reads
     // its provider configuration via `Properties p = new Properties();
@@ -13441,16 +13551,21 @@ pub fn register_essential_natives(registry: &mut NativeMethodRegistry) {
             // in both modes.
             ctx.set_field(m_obj, 0, module_name_val);
             ctx.set_field_by_name(m_obj, "name", module_name_val);
+            if let Some(name) = module_name.as_deref() {
+                let desc = build_synthetic_module_descriptor(ctx, name);
+                let m_obj = ctx.read_native_pin(pin, m_obj);
+                ctx.set_field_by_name(m_obj, "descriptor", Value::Object(Some(desc)));
+            }
+            let m_obj = ctx.read_native_pin(pin, m_obj);
             ctx.unpin_native_roots(pin);
             // Publish as the canonical mirror for this module name so future
             // getModule() calls (and the JDK's identity comparisons) see the
             // same instance. The VM registers it as a permanent GC root.
             //
-            // NOTE: this named Module deliberately has a NULL `descriptor`. Real
-            // `java.lang.Module.isExported/isOpen` bytecode would dereference it
-            // (NPE), so those four access-check methods are overridden to a
-            // permissive native below (CratonVM has no real JPMS module-path
-            // encapsulation — every class is effectively on the class path).
+            // Keep named synthetic Modules' real `descriptor` field non-null.
+            // Public access checks are still native-backed, but JDK private
+            // helpers and module-definition code read `this.descriptor`
+            // directly before calling ModuleDescriptor accessors.
             ctx.cache_module_mirror(module_name.as_deref(), m_obj);
             Ok(Some(Value::Object(Some(m_obj))))
         },
@@ -13602,53 +13717,14 @@ pub fn register_essential_natives(registry: &mut NativeMethodRegistry) {
             let this = obj_arg(args, 0)?;
             let module_name = module_name_of_mirror(ctx, this);
             if module_name.is_empty() {
-                // Unnamed module — matches real Module.getDescriptor()'s null.
+                // Unnamed module: matches real Module.getDescriptor()'s null.
                 return Ok(Some(Value::Object(None)));
             }
-            // Dot-format binary class names, matching `Class.getName()` (the
-            // boot `ModuleRegistry` stores JVM-internal slash format parsed
-            // straight from the module-info `uses` directives).
-            let uses: Vec<String> = ctx
-                .module_uses(&module_name)
-                .into_iter()
-                .map(|s| s.replace('/', "."))
-                .collect();
-            // `is_open` mirrors the real `ACC_MODULE_OPEN` flag parsed off
-            // module-info.class (classloading/src/module.rs), so it's a
-            // faithful per-module fact — unlike `automatic` below, which is
-            // intentionally NOT surfaced here.
-            let is_open = ctx.module_is_open(&module_name);
-            let desc = alloc_concurrent_synthetic(ctx, "java/lang/module/ModuleDescriptor", 2);
-            // GC-safety: pin `desc` across the allocations inside
-            // `build_string_set` (same pattern as `getModule()` above).
-            let pin = ctx.pin_native_root(desc);
-            let uses_set = crate::phases_late::build_string_set(ctx, uses);
-            let desc = ctx.read_native_pin(pin, desc);
-            // `this` is a live incoming argument for the duration of this
-            // native call, so re-reading its field here (after the
-            // allocations above) is GC-safe without a separate pin.
-            let name_val = ctx.get_field_by_name(this, "name");
-            let name_val = match name_val {
-                Value::Object(Some(_)) => name_val,
-                _ => ctx.get_field(this, 0),
-            };
-            ctx.set_field(desc, 0, name_val); // legacy synthetic slot
-            ctx.set_field(desc, 1, Value::Int(0)); // legacy synthetic slot
-            ctx.set_field_by_name(desc, "name", name_val);
-            ctx.set_field_by_name(desc, "uses", Value::Object(Some(uses_set)));
-            ctx.set_field_by_name(desc, "open", Value::Int(if is_open { 1 } else { 0 }));
-            // `automatic` deliberately left at its Java default (`false`) and
-            // NOT wired to `ModuleRegistry`'s internal `automatic` flag: that
-            // flag means "classpath-loaded, given lenient JPMS-automatic
-            // ACCESS semantics" (CratonVM has no real module path), which is
-            // a different concept from the real `ModuleDescriptor.isAutomatic()`
-            // — true automatic descriptors are synthesized for plain jars
-            // with NO module-info.class at all (empty exports/uses/provides),
-            // which never reaches this code path (`try_register_module_info`,
-            // class_manager.rs, only registers modules it successfully parsed
-            // a real module-info.class for). So `isAutomatic()` is correctly
-            // `false` here for every module this native ever sees.
-            ctx.unpin_native_roots(pin);
+            if let Value::Object(Some(desc)) = ctx.get_field_by_name(this, "descriptor") {
+                return Ok(Some(Value::Object(Some(desc))));
+            }
+            let desc = build_synthetic_module_descriptor(ctx, &module_name);
+            ctx.set_field_by_name(this, "descriptor", Value::Object(Some(desc)));
             Ok(Some(Value::Object(Some(desc))))
         },
     );
@@ -15829,6 +15905,13 @@ pub fn register_essential_natives(registry: &mut NativeMethodRegistry) {
         "(Ljava/lang/reflect/Constructor;)Ljava/lang/reflect/Constructor;",
         |_ctx, args| Ok(Some(args.get(1).copied().unwrap_or(Value::Object(None)))),
     );
+    registry.register(
+        "java/lang/ProcessEnvironment",
+        "environ",
+        "()[[B",
+        native_process_environment_environ,
+    );
+    registry.register("java/lang/ProcessImpl", "init", "()V", native_noop);
     // java/lang/ProcessEnvironment (Windows) — environmentBlock returns the
     // process's env vars as a null-separated string.  Build it from Rust.
     registry.register(
@@ -21506,7 +21589,7 @@ pub fn register_synthetic_overrides(registry: &mut NativeMethodRegistry) {
         "java/io/PrintStream",
         "write",
         "(I)V",
-        native_noop_with_this,
+        native_printstream_write_int,
     );
     registry.register(
         "java/io/PrintStream",
@@ -23312,6 +23395,79 @@ fn native_surefire_properties_wrapper_set_as_system_properties(
     Ok(None)
 }
 
+fn native_surefire_junit4_reflector_create_description(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    const DESC: &str = "org/junit/runner/Description";
+    const METHOD: &str = "createSuiteDescription";
+    const DESC_STRING: &str = "(Ljava/lang/String;)Lorg/junit/runner/Description;";
+    const DESC_STRING_ANN: &str =
+        "(Ljava/lang/String;[Ljava/lang/annotation/Annotation;)Lorg/junit/runner/Description;";
+
+    let name_ref = match args.first().copied() {
+        Some(Value::Object(Some(name))) => Some(name),
+        _ => None,
+    };
+    let provided_ann_ref = match args.get(1).copied() {
+        Some(Value::Object(Some(annotations))) => Some(annotations),
+        _ => None,
+    };
+
+    let mut root_base = None;
+    let mut name_handle = None;
+    if let Some(name) = name_ref {
+        let handle = ctx.pin_native_root(name);
+        root_base = Some(handle);
+        name_handle = Some(handle);
+    }
+    let mut ann_handle = None;
+    if let Some(annotations) = provided_ann_ref {
+        let handle = ctx.pin_native_root(annotations);
+        root_base.get_or_insert(handle);
+        ann_handle = Some(handle);
+    }
+
+    let load_result = ctx.load_class(DESC);
+    if let Err(err) = load_result {
+        if let Some(base) = root_base {
+            ctx.unpin_native_roots(base);
+        }
+        return Err(err);
+    }
+
+    let name_arg = match (name_ref, name_handle) {
+        (Some(name), Some(handle)) => Value::Object(Some(ctx.read_native_pin(handle, name))),
+        _ => Value::Object(None),
+    };
+
+    let result = if ctx.method_exists(DESC, METHOD, DESC_STRING_ANN) {
+        let ann_ref = match provided_ann_ref {
+            Some(annotations) => annotations,
+            None => {
+                let ann_cid = ctx
+                    .class_id_by_name("java/lang/annotation/Annotation")
+                    .unwrap_or_else(|| ClassId::new(0));
+                ctx.new_ref_array(ann_cid, 0)
+            }
+        };
+        let ann_handle = ann_handle.unwrap_or_else(|| {
+            let handle = ctx.pin_native_root(ann_ref);
+            root_base.get_or_insert(handle);
+            handle
+        });
+        let ann_arg = Value::Object(Some(ctx.read_native_pin(ann_handle, ann_ref)));
+        ctx.invoke(DESC, METHOD, DESC_STRING_ANN, &[name_arg, ann_arg])
+    } else {
+        ctx.invoke(DESC, METHOD, DESC_STRING, &[name_arg])
+    };
+
+    if let Some(base) = root_base {
+        ctx.unpin_native_roots(base);
+    }
+    result
+}
+
 /// Native impl for `SystemPropertyManager.loadProperties(InputStream)
 ///   -> PropertiesWrapper`. Bypasses the bytecode round-trip through
 /// `Properties.load → stringPropertyNames → ConcurrentHashMap.put` —
@@ -23665,6 +23821,12 @@ fn native_surefire_forkedbooter_run(
             return Ok(None);
         }
     }
+    // In CratonVM's fork-shim mode the test set is already materialized by
+    // setupBooter. Keeping Surefire's command reader live makes JUnit4Provider
+    // wait in CommandReader.awaitStarted(), but there is no interactive master
+    // command stream for the single-class runner. Null it before provider
+    // construction so the provider skips that wait path.
+    ctx.set_field_by_name(booter, "commandReader", Value::Object(None));
     let exec = ctx.invoke_special(
         "org/apache/maven/surefire/booter/ForkedBooter",
         "execute",
@@ -24787,6 +24949,87 @@ fn native_object_notify_all(ctx: &mut dyn NativeContext, args: &[Value]) -> Meth
 // java.io.PrintStream natives
 // ---------------------------------------------------------------------------
 
+fn stdio_print_lock() -> &'static parking_lot::Mutex<()> {
+    static LOCK: std::sync::OnceLock<parking_lot::Mutex<()>> = std::sync::OnceLock::new();
+    LOCK.get_or_init(|| parking_lot::Mutex::new(()))
+}
+
+thread_local! {
+    static STDIO_PRINT_LOCK_HELD: std::cell::Cell<bool> = std::cell::Cell::new(false);
+}
+
+fn with_stdio_print_lock<R>(f: impl FnOnce() -> R) -> R {
+    if STDIO_PRINT_LOCK_HELD.with(|held| held.get()) {
+        return f();
+    }
+    let _guard = stdio_print_lock().lock();
+    STDIO_PRINT_LOCK_HELD.with(|held| held.set(true));
+    let result = f();
+    STDIO_PRINT_LOCK_HELD.with(|held| held.set(false));
+    result
+}
+
+const SUREFIRE_FORWARDING_PRINT_STREAM: &str =
+    "org/apache/maven/surefire/api/report/ConsoleOutputCapture$ForwardingPrintStream";
+
+fn is_surefire_forwarding_print_stream(ctx: &dyn NativeContext, stream: ObjectRef) -> bool {
+    ctx.class_name_of_id(ctx.class_id_of_object(stream))
+        .as_deref()
+        == Some(SUREFIRE_FORWARDING_PRINT_STREAM)
+}
+
+fn surefire_forwarding_write(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+    text: &str,
+    newline: bool,
+) -> bool {
+    let this = match args.first() {
+        Some(Value::Object(Some(o))) => *o,
+        _ => return false,
+    };
+    if !is_surefire_forwarding_print_stream(ctx, this) {
+        return false;
+    }
+
+    let text_obj = ctx.create_string(text);
+    let text_root = ctx.pin_native_root(text_obj);
+    let entry = match ctx.new_object("org/apache/maven/surefire/api/report/TestOutputReportEntry") {
+        Ok(Some(Value::Object(Some(o)))) => o,
+        _ => {
+            ctx.unpin_native_roots(text_root);
+            return false;
+        }
+    };
+
+    let text_obj = ctx.read_native_pin(text_root, text_obj);
+    ctx.unpin_native_roots(text_root);
+
+    let target = match ctx.get_field_by_name(this, "target") {
+        Value::Object(Some(o)) => o,
+        _ => return false,
+    };
+    let is_stdout = matches!(ctx.get_field_by_name(this, "isStdout"), Value::Int(v) if v != 0);
+
+    ctx.set_field_by_name(entry, "log", Value::Object(Some(text_obj)));
+    ctx.set_field_by_name(
+        entry,
+        "isStdOut",
+        Value::Int(if is_stdout { 1 } else { 0 }),
+    );
+    ctx.set_field_by_name(entry, "newLine", Value::Int(if newline { 1 } else { 0 }));
+    ctx.set_field_by_name(entry, "runMode", Value::Object(None));
+    ctx.set_field_by_name(entry, "testRunId", Value::Object(None));
+
+    ctx.invoke_virtual(
+        target,
+        "writeTestOutput",
+        "(Lorg/apache/maven/surefire/api/report/OutputReportEntry;)V",
+        &[Value::Object(Some(entry))],
+    )
+    .is_ok()
+}
+
 /// Detect if a PrintStream / PrintWriter is (or wraps) a system stream
 /// (stdout fd=1, stderr fd=2).  Returns the fd_id if so, None otherwise.
 ///
@@ -24948,12 +25191,17 @@ fn route_write_through_out(ctx: &mut dyn NativeContext, args: &[Value], bytes: &
 }
 
 fn stream_write(ctx: &mut dyn NativeContext, args: &[Value], text: &str) {
-    if route_write_through_out(ctx, args, text.as_bytes()) {
-        return;
-    }
-    if let Some(fd) = stream_fd(ctx, args) {
-        let _ = ctx.fd_table().write_string(fd, text);
-    }
+    with_stdio_print_lock(|| {
+        if surefire_forwarding_write(ctx, args, text, false) {
+            return;
+        }
+        if route_write_through_out(ctx, args, text.as_bytes()) {
+            return;
+        }
+        if let Some(fd) = stream_fd(ctx, args) {
+            let _ = ctx.fd_table().write_string(fd, text);
+        }
+    });
 }
 
 /// Return the current JVM line separator, respecting any
@@ -24969,17 +25217,22 @@ fn host_line_separator(ctx: &dyn NativeContext) -> String {
 /// underlying `stream_write` writes UTF-8 bytes raw, which is what Java
 /// specifies for println).
 fn stream_writeln(ctx: &mut dyn NativeContext, args: &[Value], text: &str) {
-    let sep = host_line_separator(ctx);
-    // User/Tee streams: write text+separator as one buffer through `out`.
-    let mut buf = text.as_bytes().to_vec();
-    buf.extend_from_slice(sep.as_bytes());
-    if route_write_through_out(ctx, args, &buf) {
-        return;
-    }
-    if let Some(fd) = stream_fd(ctx, args) {
-        let _ = ctx.fd_table().write_string(fd, text);
-        let _ = ctx.fd_table().write_string(fd, &sep);
-    }
+    with_stdio_print_lock(|| {
+        let sep = host_line_separator(ctx);
+        if surefire_forwarding_write(ctx, args, text, true) {
+            return;
+        }
+        // User/Tee streams: write text+separator as one buffer through `out`.
+        let mut buf = text.as_bytes().to_vec();
+        buf.extend_from_slice(sep.as_bytes());
+        if route_write_through_out(ctx, args, &buf) {
+            return;
+        }
+        if let Some(fd) = stream_fd(ctx, args) {
+            let _ = ctx.fd_table().write_string(fd, text);
+            let _ = ctx.fd_table().write_string(fd, &sep);
+        }
+    });
 }
 
 fn native_println_string(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
@@ -25373,12 +25626,44 @@ fn native_printstream_write(ctx: &mut dyn NativeContext, args: &[Value]) -> Meth
     }
     // User/Tee streams route through the real underlying stream; canonical
     // synthetic out/err (out==null) write to the fd directly.
-    if route_write_through_out(ctx, args, &buf) {
-        return Ok(None);
-    }
-    if let Some(fd) = stream_fd(ctx, args) {
-        let _ = ctx.fd_table().write_bytes(fd, &buf);
-    }
+    with_stdio_print_lock(|| {
+        let text = String::from_utf8_lossy(&buf);
+        if surefire_forwarding_write(ctx, args, &text, false) {
+            return;
+        }
+        if route_write_through_out(ctx, args, &buf) {
+            return;
+        }
+        if let Some(fd) = stream_fd(ctx, args) {
+            let _ = ctx.fd_table().write_bytes(fd, &buf);
+        }
+    });
+    Ok(None)
+}
+
+fn native_printstream_write_int(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    // args[0]=this, args[1]=int. Java PrintStream.write(int) writes the low
+    // eight bits of the argument to the underlying byte stream.
+    let b = match args.get(1) {
+        Some(Value::Int(v)) => (*v & 0xff) as u8,
+        _ => 0,
+    };
+    let buf = [b];
+    with_stdio_print_lock(|| {
+        let text = String::from_utf8_lossy(&buf);
+        if surefire_forwarding_write(ctx, args, &text, false) {
+            return;
+        }
+        if route_write_through_out(ctx, args, &buf) {
+            return;
+        }
+        if let Some(fd) = stream_fd(ctx, args) {
+            let _ = ctx.fd_table().write_bytes(fd, &buf);
+        }
+    });
     Ok(None)
 }
 
@@ -33618,6 +33903,127 @@ fn module_builder_alloc_with_named_fields(
     obj
 }
 
+
+fn module_descriptor_empty_set(ctx: &mut dyn NativeContext) -> ObjectRef {
+    crate::phases_late::build_string_set(ctx, Vec::new())
+}
+
+pub(crate) fn build_synthetic_module_descriptor(
+    ctx: &mut dyn NativeContext,
+    module_name: &str,
+) -> ObjectRef {
+    let desc = alloc_concurrent_synthetic(ctx, "java/lang/module/ModuleDescriptor", 16);
+    let pin = ctx.pin_native_root(desc);
+    let name = ctx.create_string(module_name);
+    let desc = ctx.read_native_pin(pin, desc);
+    let name_val = Value::Object(Some(name));
+    ctx.set_field(desc, 0, name_val);
+    ctx.set_field(desc, 1, Value::Int(0));
+    ctx.set_field_by_name(desc, "name", name_val);
+    ctx.set_field_by_name(desc, "open", Value::Int(0));
+    ctx.set_field_by_name(desc, "automatic", Value::Int(0));
+
+    let empty = module_descriptor_empty_set(ctx);
+    let desc = ctx.read_native_pin(pin, desc);
+    let empty_val = Value::Object(Some(empty));
+    for field in ["requires", "exports", "opens", "uses", "provides", "packages"] {
+        ctx.set_field_by_name(desc, field, empty_val);
+    }
+    ctx.unpin_native_roots(pin);
+    desc
+}
+
+fn module_descriptor_set_field(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+    field: &str,
+) -> MethodCallResult {
+    let this = match args.first().copied() {
+        Some(Value::Object(Some(o))) => o,
+        _ => return Ok(Some(Value::Object(Some(module_descriptor_empty_set(ctx))))),
+    };
+    if let Value::Object(Some(v)) = ctx.get_field_by_name(this, field) {
+        return Ok(Some(Value::Object(Some(v))));
+    }
+    let empty = module_descriptor_empty_set(ctx);
+    ctx.set_field_by_name(this, field, Value::Object(Some(empty)));
+    Ok(Some(Value::Object(Some(empty))))
+}
+
+fn native_module_descriptor_is_automatic(
+    _ctx: &mut dyn NativeContext,
+    _args: &[Value],
+) -> MethodCallResult {
+    Ok(Some(Value::Int(0)))
+}
+
+fn native_module_descriptor_is_open(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    let this = match args.first().copied() {
+        Some(Value::Object(Some(o))) => o,
+        _ => return Ok(Some(Value::Int(0))),
+    };
+    if let Value::Int(v) = ctx.get_field_by_name(this, "open") {
+        return Ok(Some(Value::Int(if v != 0 { 1 } else { 0 })));
+    }
+    let flags = match ctx.get_field(this, 1) {
+        Value::Int(v) => v,
+        _ => 0,
+    };
+    Ok(Some(Value::Int(flags & 1)))
+}
+
+fn native_module_descriptor_packages(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    module_descriptor_set_field(ctx, args, "packages")
+}
+
+fn native_module_descriptor_exports(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    module_descriptor_set_field(ctx, args, "exports")
+}
+
+fn native_module_descriptor_opens(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    module_descriptor_set_field(ctx, args, "opens")
+}
+
+fn native_module_descriptor_uses(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    module_descriptor_set_field(ctx, args, "uses")
+}
+
+fn native_module_descriptor_provides(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    module_descriptor_set_field(ctx, args, "provides")
+}
+
+fn native_module_descriptor_requires(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    module_descriptor_set_field(ctx, args, "requires")
+}
+
+fn native_module_descriptor_optional_empty(
+    ctx: &mut dyn NativeContext,
+    _args: &[Value],
+) -> MethodCallResult {
+    ctx.invoke("java/util/Optional", "empty", "()Ljava/util/Optional;", &[])
+}
+
 fn native_module_builder_new_exports_qualified(
     ctx: &mut dyn NativeContext,
     args: &[Value],
@@ -34079,6 +34485,72 @@ fn register_module_builder_overrides(registry: &mut NativeMethodRegistry) {
             ctx.set_field_by_name(this, "name", Value::Object(Some(s)));
             Ok(Some(Value::Object(Some(s))))
         },
+    );
+    registry.register(
+        "java/lang/module/ModuleDescriptor",
+        "isAutomatic",
+        "()Z",
+        native_module_descriptor_is_automatic,
+    );
+    registry.register(
+        "java/lang/module/ModuleDescriptor",
+        "isOpen",
+        "()Z",
+        native_module_descriptor_is_open,
+    );
+    registry.register(
+        "java/lang/module/ModuleDescriptor",
+        "packages",
+        "()Ljava/util/Set;",
+        native_module_descriptor_packages,
+    );
+    registry.register(
+        "java/lang/module/ModuleDescriptor",
+        "exports",
+        "()Ljava/util/Set;",
+        native_module_descriptor_exports,
+    );
+    registry.register(
+        "java/lang/module/ModuleDescriptor",
+        "opens",
+        "()Ljava/util/Set;",
+        native_module_descriptor_opens,
+    );
+    registry.register(
+        "java/lang/module/ModuleDescriptor",
+        "uses",
+        "()Ljava/util/Set;",
+        native_module_descriptor_uses,
+    );
+    registry.register(
+        "java/lang/module/ModuleDescriptor",
+        "provides",
+        "()Ljava/util/Set;",
+        native_module_descriptor_provides,
+    );
+    registry.register(
+        "java/lang/module/ModuleDescriptor",
+        "requires",
+        "()Ljava/util/Set;",
+        native_module_descriptor_requires,
+    );
+    registry.register(
+        "java/lang/module/ModuleDescriptor",
+        "version",
+        "()Ljava/util/Optional;",
+        native_module_descriptor_optional_empty,
+    );
+    registry.register(
+        "java/lang/module/ModuleDescriptor",
+        "rawVersion",
+        "()Ljava/util/Optional;",
+        native_module_descriptor_optional_empty,
+    );
+    registry.register(
+        "java/lang/module/ModuleDescriptor",
+        "mainClass",
+        "()Ljava/util/Optional;",
+        native_module_descriptor_optional_empty,
     );
     registry.set_category(__prev_cat);
 }

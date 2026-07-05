@@ -564,6 +564,17 @@ pub fn safe_native_call(
     // native dispatch path, so recording here (rather than only at the
     // two interpreter call sites) means a hang inside *any* native
     // leaves a `STILL-IN-NATIVE` breadcrumb the watchdog can dump.
+    let native_state = if JvmThread::vm_state_diagnostics_enabled() {
+        Some(
+            cratonvm_native_api::native_ring::name_of(callback as usize)
+                .unwrap_or_else(|| format!("<cb@{:#x}>", callback as usize)),
+        )
+    } else {
+        None
+    };
+    if let Some(name) = &native_state {
+        thread.set_vm_state(format!("native:{name}"));
+    }
     let _ring_idx = cratonvm_native_api::native_ring::record_enter(callback as usize);
 
     // DBG (CRATONVM_DBG_STRAYSTACK): track the innermost native name on a
@@ -589,6 +600,9 @@ pub fn safe_native_call(
         });
     }
     cratonvm_native_api::native_ring::record_exit(_ring_idx);
+    if native_state.is_some() {
+        thread.set_vm_state("native:return");
+    }
 
     // DBG (bc math-ec, CRATONVM_DBG_ECWATCH_NATIVE): the native callback above
     // is the suspected raw-writer of `0x4` into an EC reference field. Re-read
@@ -863,6 +877,73 @@ pub(crate) fn monitor_enter_blocking(
         .unwrap_or(obj);
     ctx.thread.native_pin_roots.truncate(pin_base);
     fixed
+}
+
+/// GC-safe acquire for an `ACC_SYNCHRONIZED` method monitor.
+///
+/// Synchronized invoke paths pop arguments into Rust locals before pushing the
+/// callee frame. If the method monitor is contended, a stop-the-world GC can
+/// run while those arguments are no longer visible in any Java frame. Pin and
+/// remap them across the contended wait, and mark the thread GC-blocked so the
+/// collector does not wait for a mutator parked on a Java monitor.
+pub(crate) fn monitor_enter_synchronized_method(
+    shared: &SharedVm,
+    thread: &mut JvmThread,
+    obj: ObjectRef,
+    args: &mut [Value],
+) -> ObjectRef {
+    let Some(monitor) = shared.monitors.enter_or_contend(obj, thread.thread_id) else {
+        return obj;
+    };
+
+    let pin_base = thread.native_pin_roots.len();
+    let monitor_pin = thread.native_pin_roots.len();
+    thread.native_pin_roots.push(obj);
+
+    let mut arg_root_indices = Vec::with_capacity(args.len());
+    for arg in args.iter() {
+        let before = thread.native_pin_roots.len();
+        pin_value_for_native_call(shared, &mut thread.native_pin_roots, arg);
+        arg_root_indices.push((thread.native_pin_roots.len() > before).then_some(before));
+    }
+
+    let tid = thread.thread_id;
+    let mut ctx = NativeContextImpl { shared, thread };
+    ctx.deposit_root_snapshot();
+    // A parked contender must not retain a TLAB into a young arena that a
+    // concurrent STW can grow/reallocate while this thread is blocked.
+    ctx.thread.tlab.retire();
+    {
+        let blk = ctx.shared.gc_barrier.enter_blocked();
+        if blk.pre_stw {
+            let _ = ctx.shared.gc_barrier.arrive_and_wait(tid);
+        }
+        monitor.block_enter(tid);
+        drop(blk);
+    }
+    ctx.check_post_block_gc();
+
+    let fixed_monitor = ctx
+        .thread
+        .native_pin_roots
+        .get(monitor_pin)
+        .copied()
+        .unwrap_or(obj);
+    for (idx, root_idx) in arg_root_indices.into_iter().enumerate() {
+        let Some(root_idx) = root_idx else {
+            continue;
+        };
+        let Some(remapped) = ctx.thread.native_pin_roots.get(root_idx).copied() else {
+            continue;
+        };
+        match args[idx] {
+            Value::Object(Some(_)) => args[idx] = Value::Object(Some(remapped)),
+            Value::Long(_) => args[idx] = Value::Long(remapped.as_ptr() as i64),
+            _ => {}
+        }
+    }
+    ctx.thread.native_pin_roots.truncate(pin_base);
+    fixed_monitor
 }
 
 // ---------------------------------------------------------------------------
@@ -4099,6 +4180,10 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
             shared_arc
                 .thread_registry
                 .set_frame_trace(tid, jvm_thread.frame_trace.clone());
+            // Share the optional VM-side breadcrumb for STW diagnostics.
+            shared_arc
+                .thread_registry
+                .set_vm_state(tid, jvm_thread.vm_state.clone());
             // Share blocked-region GC state so initiators can maintain this
             // thread's roots while it parks in a blocking native.
             shared_arc
@@ -4117,6 +4202,14 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
             // ThreadRegistry::set_os_tid_current). Must precede any Java/JIT
             // execution on this thread.
             shared_arc.thread_registry.set_os_tid_current(tid);
+            jvm_thread.set_vm_state("thread-start:registered");
+            if shared_arc
+                .gc_barrier
+                .stw_requested
+                .load(std::sync::atomic::Ordering::Acquire)
+            {
+                crate::runtime::interpreter::safepoint_check(&shared_arc, &mut jvm_thread);
+            }
             // WP4.8: For real-JDK virtual threads (e.g.
             // `java.lang.ThreadBuilders$BoundVirtualThread`), `Thread.run()`
             // is overridden вЂ” `BoundVirtualThread.run()` invokes the user's
@@ -4132,7 +4225,11 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
             // `class_id_of(thread_obj)` so dispatch starts at the real
             // runtime class (e.g. BoundVirtualThread) and naturally finds
             // the override before falling back to Thread.run().
-            let recv_cid = shared_arc.heap.class_id_of(thread_obj_for_spawn);
+            let mut run_thread_obj = shared_arc
+                .thread_registry
+                .java_thread_obj(tid)
+                .unwrap_or(thread_obj_for_spawn);
+            let recv_cid = shared_arc.heap.class_id_of(run_thread_obj);
             // Gated diagnostic (CRATONVM_DBG_THREADSTART): log each spawned
             // thread's run-class on entry and its result on exit — surfaces
             // threads that never start their target or block inside run().
@@ -4147,16 +4244,30 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
                     .unwrap_or_default();
                 eprintln!("[THREADSTART] tid={} name={:?} run-class={}", tid.0, name, cn);
             }
+            jvm_thread.set_vm_state("thread-start:ensure-run-class-init");
             // Class is already loaded (heap entry exists); ensure init runs.
             let _ = super::ensure_class_initialized_shared(&shared_arc, &mut jvm_thread, recv_cid);
+            jvm_thread.set_vm_state("thread-start:invoke-run");
+            if shared_arc
+                .gc_barrier
+                .stw_requested
+                .load(std::sync::atomic::Ordering::Acquire)
+            {
+                crate::runtime::interpreter::safepoint_check(&shared_arc, &mut jvm_thread);
+            }
+            run_thread_obj = shared_arc
+                .thread_registry
+                .java_thread_obj(tid)
+                .unwrap_or(thread_obj_for_spawn);
             let result = invoke_on_class_shared(
                 &shared_arc,
                 &mut jvm_thread,
                 recv_cid,
                 "run",
                 "()V",
-                &[Value::Object(Some(thread_obj_for_spawn))],
+                &[Value::Object(Some(run_thread_obj))],
             );
+            jvm_thread.set_vm_state("thread-start:run-returned");
             if dbg_ts {
                 eprintln!(
                     "[THREADEND] tid={} name={:?} result={}",
@@ -4184,7 +4295,12 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
                         "dispatchUncaughtException",
                         "(Ljava/lang/Throwable;)V",
                         &[
-                            Value::Object(Some(thread_obj_for_spawn)),
+                            Value::Object(Some(
+                                shared_arc
+                                    .thread_registry
+                                    .java_thread_obj(tid)
+                                    .unwrap_or(thread_obj_for_spawn),
+                            )),
                             Value::Object(Some(exc_ref)),
                         ],
                     );
@@ -12772,7 +12888,9 @@ fn invoke_on_class_shared_inner(
     // The previous `let _ = shared.monitors.exit(...)` after `result` (a)
     // leaked the monitor entirely if `result` panicked (the line never
     // executed), and (b) silently swallowed the error on the normal path.
+    let mut synchronized_args: Option<Vec<Value>> = None;
     let _sync_guard = if is_synchronized {
+        let sync_args = synchronized_args.get_or_insert_with(|| args.to_vec());
         let obj = if is_static {
             // Static synchronized: the monitor is the class's `Class` mirror
             // (JVMS §2.11.10) — the SAME object user code locks via
@@ -12784,7 +12902,7 @@ fn invoke_on_class_shared_inner(
             super::get_or_create_class_mirror(shared, declaring_class_id)
         } else {
             // Instance synchronized: use args[0] (the `this` reference)
-            match args.first() {
+            match sync_args.first() {
                 Some(Value::Object(Some(obj_ref))) => *obj_ref,
                 _ => {
                     return Err(MethodCallFailed::InternalError(VmError::Internal {
@@ -12794,17 +12912,7 @@ fn invoke_on_class_shared_inner(
                 }
             }
         };
-        // NOTE deliberately NOT monitor_enter_blocking: the caller-held
-        // `args: &[Value]` slice (this + parameters, already popped off the
-        // operand stack) is unrooted, un-remappable Rust memory — letting a
-        // GC complete while we block here would both expose those objects
-        // to collection and build the callee frame from stale refs. We
-        // block as an EXPECTED mutator instead: a concurrent STW waits for
-        // us (the residual, pre-existing owner-parked-at-safepoint wedge is
-        // documented in docs/internal/h2-testscript-segv-findings.md; the
-        // proper fix needs an interpreter-level participation loop that can
-        // remap the args).
-        shared.monitors.enter(obj, thread.thread_id);
+        let obj = monitor_enter_synchronized_method(shared, thread, obj, sync_args);
         Some(SynchronizedMethodGuard {
             monitor_pool: &shared.monitors,
             obj,
@@ -12813,6 +12921,7 @@ fn invoke_on_class_shared_inner(
     } else {
         None
     };
+    let args = synchronized_args.as_deref().unwrap_or(args);
 
     let result = if is_native {
         // Look up native implementation

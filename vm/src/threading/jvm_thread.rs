@@ -21,7 +21,7 @@
 
 use std::collections::HashMap;
 use std::sync::atomic::AtomicBool;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 use parking_lot::{Condvar as PLCondvar, Mutex as PLMutex};
 
@@ -275,6 +275,11 @@ pub struct JvmThread {
     /// Line-less (see `stackwalker::capture_frames_no_lines`) to stay lock-free.
     pub frame_trace: Arc<parking_lot::Mutex<Vec<cratonvm_native_api::StackTraceEntry>>>,
 
+    /// Optional diagnostic breadcrumb shared with the thread registry. When
+    /// `CRATONVM_DBG_VM_STATE=1` is set, long-running VM helper paths publish a
+    /// compact state here so STW census can identify non-bytecode stalls.
+    pub vm_state: Arc<parking_lot::Mutex<String>>,
+
     /// Opt-in root-snapshot cache (`CRATONVM_ROOTSNAP_CACHE`): per *frozen*
     /// frame, `((frame.seq, frame.exec_epoch), that frame's scanned GC roots)`,
     /// indexed parallel to `frames[0..rs_cache.len()]`. Lets
@@ -458,6 +463,21 @@ impl JvmThread {
         })
     }
 
+    /// Whether VM-state breadcrumbs should be published.
+    #[inline]
+    pub fn vm_state_diagnostics_enabled() -> bool {
+        static ENABLED: OnceLock<bool> = OnceLock::new();
+        *ENABLED.get_or_init(|| std::env::var_os("CRATONVM_DBG_VM_STATE").is_some())
+    }
+
+    /// Publish a short diagnostic state for STW census. No-op unless enabled.
+    #[inline]
+    pub fn set_vm_state<S: Into<String>>(&self, state: S) {
+        if Self::vm_state_diagnostics_enabled() {
+            *self.vm_state.lock() = state.into();
+        }
+    }
+
     /// Create a new thread with the given id and name.
     pub fn new(thread_id: ThreadId, name: &str) -> Self {
         Self {
@@ -475,6 +495,7 @@ impl JvmThread {
             park_state: Arc::new(ParkState::new()),
             root_snapshot: Arc::new(parking_lot::Mutex::new(Vec::new())),
             frame_trace: Arc::new(parking_lot::Mutex::new(Vec::new())),
+            vm_state: Arc::new(parking_lot::Mutex::new(String::new())),
             rs_cache: Vec::new(),
             rs_cache_gen: 0,
             gc_block_state: Arc::new(GcBlockState::new()),

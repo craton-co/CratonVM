@@ -59,6 +59,7 @@
 //! (cargo check) plus the integration test `wp1_12_process.rs`.
 
 use std::collections::HashMap;
+use std::fs::{File, OpenOptions};
 use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::OnceLock;
@@ -135,6 +136,141 @@ const PROC_FIELD_COUNT: usize = 6;
 /// first seen as picocli's terminal-width probe failing during
 /// `junit-platform-console --help` (docs/gaps/gap-anonymous-object-getinputstream.md).
 const SYNTHETIC_PROCESS_CLASS: &str = "cratonvm/synthetic/Process";
+
+fn pb_debug_enabled() -> bool {
+    std::env::var_os("CRATONVM_DBG_PB").is_some()
+}
+
+#[derive(Clone, Debug)]
+enum StdioRedirect {
+    Pipe,
+    Inherit,
+    Null,
+    ReadFile(String),
+    WriteFile { path: String, append: bool },
+}
+
+#[derive(Clone, Debug)]
+struct ProcessRedirects {
+    stdin: StdioRedirect,
+    stdout: StdioRedirect,
+    stderr: StdioRedirect,
+}
+
+impl Default for ProcessRedirects {
+    fn default() -> Self {
+        Self {
+            stdin: StdioRedirect::Pipe,
+            stdout: StdioRedirect::Pipe,
+            stderr: StdioRedirect::Pipe,
+        }
+    }
+}
+
+fn redirect_io_error(op: &str, path: &str, err: impl std::fmt::Display) -> RuntimeError {
+    RuntimeError::IOException {
+        message: format!("ProcessBuilder.{op} failed for {path:?}: {err}"),
+    }
+}
+
+fn validate_redirect_path(path: &str, op: &str) -> Result<String, RuntimeError> {
+    crate::validate_path(path).map_err(|_| RuntimeError::IOException {
+        message: format!("ProcessBuilder.{op}: redirect path rejected by sandbox: {path}"),
+    })
+}
+
+fn open_redirect_input(path: &str) -> Result<File, RuntimeError> {
+    let validated = validate_redirect_path(path, "redirectInput")?;
+    File::open(&validated).map_err(|e| redirect_io_error("redirectInput", path, e))
+}
+
+fn open_redirect_output(path: &str, append: bool) -> Result<File, RuntimeError> {
+    let validated = validate_redirect_path(path, "redirectOutput")?;
+    OpenOptions::new()
+        .create(true)
+        .write(true)
+        .append(append)
+        .truncate(!append)
+        .open(&validated)
+        .map_err(|e| redirect_io_error("redirectOutput", path, e))
+}
+
+fn stdin_stdio(spec: &StdioRedirect) -> Result<(Stdio, bool), RuntimeError> {
+    match spec {
+        StdioRedirect::Pipe => Ok((Stdio::piped(), true)),
+        StdioRedirect::Inherit => Ok((Stdio::inherit(), false)),
+        StdioRedirect::Null => Ok((Stdio::null(), false)),
+        StdioRedirect::ReadFile(path) => Ok((Stdio::from(open_redirect_input(path)?), false)),
+        StdioRedirect::WriteFile { path, .. } => Err(RuntimeError::IOException {
+            message: format!("ProcessBuilder.redirectInput cannot read from output redirect: {path}"),
+        }),
+    }
+}
+
+fn output_stdio(spec: &StdioRedirect, op: &str) -> Result<(Stdio, bool), RuntimeError> {
+    match spec {
+        StdioRedirect::Pipe => Ok((Stdio::piped(), true)),
+        StdioRedirect::Inherit => Ok((Stdio::inherit(), false)),
+        StdioRedirect::Null => Ok((Stdio::null(), false)),
+        StdioRedirect::WriteFile { path, append } => {
+            Ok((Stdio::from(open_redirect_output(path, *append)?), false))
+        }
+        StdioRedirect::ReadFile(path) => Err(RuntimeError::IOException {
+            message: format!("ProcessBuilder.{op} cannot write to input redirect: {path}"),
+        }),
+    }
+}
+
+fn configure_stdio(
+    command: &mut Command,
+    redirects: &ProcessRedirects,
+    redirect_error_stream: bool,
+) -> Result<(bool, bool, bool, Option<std::io::PipeReader>), RuntimeError> {
+    let (stdin, stdin_piped) = stdin_stdio(&redirects.stdin)?;
+    command.stdin(stdin);
+
+    if redirect_error_stream {
+        match &redirects.stdout {
+            StdioRedirect::Pipe => {
+                let (reader, writer) = std::io::pipe().map_err(|e| RuntimeError::IOException {
+                    message: format!("ProcessBuilder.redirectErrorStream pipe failed: {e}"),
+                })?;
+                let writer2 = writer.try_clone().map_err(|e| RuntimeError::IOException {
+                    message: format!("ProcessBuilder.redirectErrorStream pipe clone failed: {e}"),
+                })?;
+                command.stdout(Stdio::from(writer));
+                command.stderr(Stdio::from(writer2));
+                Ok((stdin_piped, false, false, Some(reader)))
+            }
+            StdioRedirect::Inherit => {
+                command.stdout(Stdio::inherit());
+                command.stderr(Stdio::inherit());
+                Ok((stdin_piped, false, false, None))
+            }
+            StdioRedirect::Null => {
+                command.stdout(Stdio::null());
+                command.stderr(Stdio::null());
+                Ok((stdin_piped, false, false, None))
+            }
+            StdioRedirect::WriteFile { path, append } => {
+                let file = open_redirect_output(path, *append)?;
+                let file2 = file.try_clone().map_err(|e| redirect_io_error("redirectError", path, e))?;
+                command.stdout(Stdio::from(file));
+                command.stderr(Stdio::from(file2));
+                Ok((stdin_piped, false, false, None))
+            }
+            StdioRedirect::ReadFile(path) => Err(RuntimeError::IOException {
+                message: format!("ProcessBuilder.redirectOutput cannot write to input redirect: {path}"),
+            }),
+        }
+    } else {
+        let (stdout, stdout_piped) = output_stdio(&redirects.stdout, "redirectOutput")?;
+        let (stderr, stderr_piped) = output_stdio(&redirects.stderr, "redirectError")?;
+        command.stdout(stdout);
+        command.stderr(stderr);
+        Ok((stdin_piped, stdout_piped, stderr_piped, None))
+    }
+}
 
 // ---------------------------------------------------------------------------
 // Spawn + teardown primitives
@@ -232,6 +368,29 @@ pub fn spawn_and_wrap(
     clear_env: bool,
     redirect_error_stream: bool,
 ) -> MethodCallResult {
+    let redirects = ProcessRedirects::default();
+    spawn_and_wrap_with_redirects(
+        ctx,
+        program,
+        args,
+        work_dir,
+        env_vars,
+        clear_env,
+        redirect_error_stream,
+        &redirects,
+    )
+}
+
+fn spawn_and_wrap_with_redirects(
+    ctx: &mut dyn NativeContext,
+    program: &str,
+    args: &[String],
+    work_dir: Option<&str>,
+    env_vars: Option<&[(String, String)]>,
+    clear_env: bool,
+    redirect_error_stream: bool,
+    redirects: &ProcessRedirects,
+) -> MethodCallResult {
     if program.is_empty() {
         return Err(RuntimeError::IllegalArgumentException {
             message: "ProcessBuilder: empty program".to_string(),
@@ -267,39 +426,23 @@ pub fn spawn_and_wrap(
         return Err(RuntimeError::IOException { message: detail }.into());
     }
 
+    if pb_debug_enabled() {
+        eprintln!(
+            "[PB-SPAWN] program={:?} args={:?} work_dir={:?} clear_env={} envc={} redirect_error_stream={}",
+            program,
+            args,
+            work_dir,
+            clear_env,
+            env_vars.map(|v| v.len()).unwrap_or(0),
+            redirect_error_stream
+        );
+    }
+
     let mut command = Command::new(program);
     command.args(args);
-    command.stdin(Stdio::piped());
-    // redirectErrorStream(true) == `2>&1`: hand the write-end of a single OS pipe
-    // to BOTH the child's stdout and stderr so the merged output reads through one
-    // fd (getInputStream); getErrorStream is then empty. Spring Boot buildpack
-    // CredentialHelper reads docker-credential errors (written to stderr) via the
-    // merged getInputStream(). Falls back to separate pipes if pipe creation fails.
-    let merged_reader: Option<std::io::PipeReader> = if redirect_error_stream {
-        match std::io::pipe() {
-            Ok((reader, writer)) => match writer.try_clone() {
-                Ok(writer2) => {
-                    command.stdout(Stdio::from(writer));
-                    command.stderr(Stdio::from(writer2));
-                    Some(reader)
-                }
-                Err(_) => {
-                    command.stdout(Stdio::piped());
-                    command.stderr(Stdio::piped());
-                    None
-                }
-            },
-            Err(_) => {
-                command.stdout(Stdio::piped());
-                command.stderr(Stdio::piped());
-                None
-            }
-        }
-    } else {
-        command.stdout(Stdio::piped());
-        command.stderr(Stdio::piped());
-        None
-    };
+    let (stdin_piped, stdout_piped, stderr_piped, merged_reader) =
+        configure_stdio(&mut command, redirects, redirect_error_stream)
+            .map_err(cratonvm_types::error::MethodCallFailed::from)?;
 
     if clear_env {
         command.env_clear();
@@ -350,39 +493,57 @@ pub fn spawn_and_wrap(
         }
     };
 
-    // Pull the three pipe handles out of `child` so we can hand them
-    // to the fd_table.  They are all `Option`s because `stdin`/`stdout`/
-    // `stderr` are inherited by default; `spawn()` only populates them
-    // because we explicitly requested `Stdio::piped()` above.
-    let stdin_fd = child
-        .stdin
-        .take()
-        .map(|s| ctx.fd_table().insert_child_stdin(s))
-        .map(|fd| fd as i32)
-        .unwrap_or(-1);
+    // Pull only the pipe handles Java requested. Inherited, file, and discard
+    // redirects do not have guest-visible process streams, matching HotSpot's
+    // ProcessPipeInputStream/NullInputStream behavior closely enough for the
+    // WildFly launchers.
+    let stdin_fd = if stdin_piped {
+        child
+            .stdin
+            .take()
+            .map(|s| ctx.fd_table().insert_child_stdin(s))
+            .map(|fd| fd as i32)
+            .unwrap_or(-1)
+    } else {
+        -1
+    };
     // When redirectErrorStream merged the pipes, child.stdout/stderr are None
     // (we gave the child a custom pipe); expose the merged reader as the stdout
     // fd and leave stderr empty (-1).
     let (stdout_fd, stderr_fd) = if let Some(reader) = merged_reader {
         (ctx.fd_table().insert_child_merged(reader) as i32, -1)
     } else {
-        let so = child
-            .stdout
-            .take()
-            .map(|s| ctx.fd_table().insert_child_stdout(s))
-            .map(|fd| fd as i32)
-            .unwrap_or(-1);
-        let se = child
-            .stderr
-            .take()
-            .map(|s| ctx.fd_table().insert_child_stderr(s))
-            .map(|fd| fd as i32)
-            .unwrap_or(-1);
+        let so = if stdout_piped {
+            child
+                .stdout
+                .take()
+                .map(|s| ctx.fd_table().insert_child_stdout(s))
+                .map(|fd| fd as i32)
+                .unwrap_or(-1)
+        } else {
+            -1
+        };
+        let se = if stderr_piped {
+            child
+                .stderr
+                .take()
+                .map(|s| ctx.fd_table().insert_child_stderr(s))
+                .map(|fd| fd as i32)
+                .unwrap_or(-1)
+        } else {
+            -1
+        };
         (so, se)
     };
 
     let pid = child.id() as i64;
     let handle = NEXT_HANDLE.fetch_add(1, Ordering::Relaxed);
+    if pb_debug_enabled() {
+        eprintln!(
+            "[PB-SPAWNED] handle={} pid={} stdin_fd={} stdout_fd={} stderr_fd={}",
+            handle, pid, stdin_fd, stdout_fd, stderr_fd
+        );
+    }
     process_table().lock().insert(handle, child);
     exit_cache().lock().insert(
         handle,
@@ -575,6 +736,150 @@ fn tokenize_command_line(cmd_line: &str) -> Vec<String> {
         out.push(cur);
     }
     out
+}
+
+fn file_path_of(ctx: &mut dyn NativeContext, file_obj: ObjectRef) -> Option<String> {
+    match ctx.get_field_by_name(file_obj, "path") {
+        Value::Object(Some(s)) => ctx.read_string(s),
+        _ => match ctx.get_field(file_obj, 0) {
+            Value::Object(Some(s)) => ctx.read_string(s),
+            _ => None,
+        },
+    }
+}
+
+fn object_to_string(ctx: &mut dyn NativeContext, obj: ObjectRef) -> Option<String> {
+    if let Some(s) = ctx.read_string(obj) {
+        return Some(s);
+    }
+    match ctx.invoke_virtual(obj, "toString", "()Ljava/lang/String;", &[]) {
+        Ok(Some(Value::Object(Some(s)))) => ctx.read_string(s),
+        _ => None,
+    }
+}
+
+fn enum_ordinal(ctx: &mut dyn NativeContext, enum_obj: ObjectRef) -> Option<i32> {
+    if let Value::Int(v) = ctx.get_field_by_name(enum_obj, "ordinal") {
+        return Some(v);
+    }
+    match ctx.invoke_virtual(enum_obj, "ordinal", "()I", &[]) {
+        Ok(Some(Value::Int(v))) => Some(v),
+        _ => None,
+    }
+}
+
+fn read_process_redirect(ctx: &mut dyn NativeContext, redirect_obj: ObjectRef) -> StdioRedirect {
+    let type_obj = match ctx.invoke_virtual(
+        redirect_obj,
+        "type",
+        "()Ljava/lang/ProcessBuilder$Redirect$Type;",
+        &[],
+    ) {
+        Ok(Some(Value::Object(Some(o)))) => o,
+        _ => return StdioRedirect::Pipe,
+    };
+    let ordinal = enum_ordinal(ctx, type_obj).unwrap_or(0);
+    match ordinal {
+        // Redirect.Type.PIPE
+        0 => StdioRedirect::Pipe,
+        // Redirect.Type.INHERIT
+        1 => StdioRedirect::Inherit,
+        // Redirect.Type.READ
+        2 => match ctx.invoke_virtual(redirect_obj, "file", "()Ljava/io/File;", &[]) {
+            Ok(Some(Value::Object(Some(file)))) => file_path_of(ctx, file)
+                .map(StdioRedirect::ReadFile)
+                .unwrap_or(StdioRedirect::Pipe),
+            _ => StdioRedirect::Pipe,
+        },
+        // Redirect.Type.WRITE / APPEND. DISCARD is represented by WRITE to the
+        // JDK's null file, so this path also handles Redirect.DISCARD.
+        3 | 4 => match ctx.invoke_virtual(redirect_obj, "file", "()Ljava/io/File;", &[]) {
+            Ok(Some(Value::Object(Some(file)))) => {
+                let append = ordinal == 4
+                    || matches!(
+                        ctx.invoke_virtual(redirect_obj, "append", "()Z", &[]),
+                        Ok(Some(Value::Int(v))) if v != 0
+                    );
+                file_path_of(ctx, file)
+                    .map(|path| StdioRedirect::WriteFile { path, append })
+                    .unwrap_or(StdioRedirect::Null)
+            }
+            _ => StdioRedirect::Null,
+        },
+        _ => StdioRedirect::Pipe,
+    }
+}
+
+fn read_process_redirects(ctx: &mut dyn NativeContext, builder: ObjectRef) -> ProcessRedirects {
+    let mut redirects = ProcessRedirects::default();
+    let arr = match ctx.get_field_by_name(builder, "redirects") {
+        Value::Object(Some(arr)) => arr,
+        _ => return redirects,
+    };
+    if ctx.heap_kind_of(arr) != cratonvm_types::ObjectKind::Array {
+        return redirects;
+    }
+    let len = ctx.array_length(arr);
+    if len > 0 {
+        if let Value::Object(Some(r)) = ctx.get_array_element(arr, 0) {
+            redirects.stdin = read_process_redirect(ctx, r);
+        }
+    }
+    if len > 1 {
+        if let Value::Object(Some(r)) = ctx.get_array_element(arr, 1) {
+            redirects.stdout = read_process_redirect(ctx, r);
+        }
+    }
+    if len > 2 {
+        if let Value::Object(Some(r)) = ctx.get_array_element(arr, 2) {
+            redirects.stderr = read_process_redirect(ctx, r);
+        }
+    }
+    redirects
+}
+
+fn read_process_environment(
+    ctx: &mut dyn NativeContext,
+    builder: ObjectRef,
+) -> Option<Vec<(String, String)>> {
+    let env_obj = match ctx.get_field_by_name(builder, "environment") {
+        Value::Object(Some(o)) => o,
+        _ => return None,
+    };
+    let entry_set = match ctx.invoke_virtual(env_obj, "entrySet", "()Ljava/util/Set;", &[]) {
+        Ok(Some(Value::Object(Some(o)))) => o,
+        _ => return None,
+    };
+    let iter = match ctx.invoke_virtual(entry_set, "iterator", "()Ljava/util/Iterator;", &[]) {
+        Ok(Some(Value::Object(Some(o)))) => o,
+        _ => return None,
+    };
+    let mut out = Vec::new();
+    for _ in 0..100_000 {
+        let has_next = matches!(
+            ctx.invoke_virtual(iter, "hasNext", "()Z", &[]),
+            Ok(Some(Value::Int(v))) if v != 0
+        );
+        if !has_next {
+            break;
+        }
+        let entry = match ctx.invoke_virtual(iter, "next", "()Ljava/lang/Object;", &[]) {
+            Ok(Some(Value::Object(Some(o)))) => o,
+            _ => break,
+        };
+        let key = match ctx.invoke_virtual(entry, "getKey", "()Ljava/lang/Object;", &[]) {
+            Ok(Some(Value::Object(Some(o)))) => object_to_string(ctx, o),
+            _ => None,
+        };
+        let value = match ctx.invoke_virtual(entry, "getValue", "()Ljava/lang/Object;", &[]) {
+            Ok(Some(Value::Object(Some(o)))) => object_to_string(ctx, o),
+            _ => None,
+        };
+        if let (Some(k), Some(v)) = (key, value) {
+            out.push((k, v));
+        }
+    }
+    Some(out)
 }
 
 /// Return the process-table handle stored in a `java/lang/Process` synthetic,
@@ -1283,6 +1588,9 @@ pub fn register_process_natives(registry: &mut NativeMethodRegistry) {
 /// ProcessBuilder synthetic lays out in phases_late, then spawns the
 /// child via `spawn_and_wrap`.
 fn native_process_builder_start(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    if pb_debug_enabled() {
+        eprintln!("[PB-START-IO] ProcessBuilder.start via native-io");
+    }
     let this = match args.first() {
         Some(Value::Object(Some(o))) => *o,
         _ => {
@@ -1357,6 +1665,9 @@ fn native_process_builder_start(ctx: &mut dyn NativeContext, args: &[Value]) -> 
         }
         .into());
     }
+    if pb_debug_enabled() {
+        eprintln!("[PB-CMD] {:?}", cmd_strings);
+    }
 
     // --- Field 1: directory (File) ---
     // B5: read the File's path string BY NAME (`path`) — a real-JDK
@@ -1376,6 +1687,8 @@ fn native_process_builder_start(ctx: &mut dyn NativeContext, args: &[Value]) -> 
     };
 
     // --- Spawn ---
+    let env_vars = read_process_environment(ctx, this);
+    let redirects = read_process_redirects(ctx, this);
     let program = cmd_strings[0].clone();
     let rest: Vec<String> = cmd_strings.into_iter().skip(1).collect();
     // Honor ProcessBuilder.redirectErrorStream(true) (`2>&1`).
@@ -1383,14 +1696,15 @@ fn native_process_builder_start(ctx: &mut dyn NativeContext, args: &[Value]) -> 
         ctx.get_field_by_name(this, "redirectErrorStream"),
         Value::Int(v) if v != 0
     );
-    spawn_and_wrap(
+    spawn_and_wrap_with_redirects(
         ctx,
         &program,
         &rest,
         work_dir.as_deref(),
-        None,
-        false,
+        env_vars.as_deref(),
+        env_vars.is_some(),
         redirect_err,
+        &redirects,
     )
 }
 

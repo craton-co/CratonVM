@@ -11,7 +11,7 @@ use std::collections::VecDeque;
 use std::fs;
 use std::io::{self, BufReader, BufWriter, Read, Write};
 use std::sync::atomic::{AtomicU32, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
 // ---------------------------------------------------------------------------
@@ -24,6 +24,11 @@ const PIPE_BUFFER_INITIAL_CAPACITY: usize = 8192;
 /// Hard cap for in-memory pipes. Writers get partial progress or WouldBlock
 /// instead of growing the VecDeque without bound.
 const PIPE_BUFFER_CAPACITY: usize = 64 * 1024;
+
+fn stdio_write_lock() -> &'static Mutex<()> {
+    static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+    LOCK.get_or_init(|| Mutex::new(()))
+}
 
 /// Connect to `addr`, trying IPv4 candidate addresses before IPv6.
 ///
@@ -527,10 +532,12 @@ impl FileDescriptorTable {
             .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "bad fd"))?;
         match &*entry {
             FileEntry::Stdout(stdout) => {
+                let _stdio_guard = stdio_write_lock().lock();
                 stdout.lock().write_all(&[b])?;
                 Ok(())
             }
             FileEntry::Stderr(stderr) => {
+                let _stdio_guard = stdio_write_lock().lock();
                 stderr.lock().write_all(&[b])?;
                 Ok(())
             }
@@ -558,10 +565,12 @@ impl FileDescriptorTable {
             .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "bad fd"))?;
         match &*entry {
             FileEntry::Stdout(stdout) => {
+                let _stdio_guard = stdio_write_lock().lock();
                 stdout.lock().write_all(data)?;
                 Ok(())
             }
             FileEntry::Stderr(stderr) => {
+                let _stdio_guard = stdio_write_lock().lock();
                 stderr.lock().write_all(data)?;
                 Ok(())
             }
@@ -615,10 +624,12 @@ impl FileDescriptorTable {
         };
         match &*entry {
             FileEntry::Stdout(stdout) => {
+                let _stdio_guard = stdio_write_lock().lock();
                 stdout.lock().flush()?;
                 Ok(())
             }
             FileEntry::Stderr(stderr) => {
+                let _stdio_guard = stdio_write_lock().lock();
                 stderr.lock().flush()?;
                 Ok(())
             }

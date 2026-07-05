@@ -472,7 +472,11 @@ fn stw_take_over_and_wait(
     let mut warned = false;
     loop {
         let tids_before = taken.tids.len();
-        let newly = xt::take_over_pass(&mut taken, &|a| shared.heap.is_object_address(a), xt_roots);
+        let newly = if crate::jit::conservative_roots::any_thread_in_jit() {
+            xt::take_over_pass(&mut taken, &|a| shared.heap.is_object_address(a), xt_roots)
+        } else {
+            0
+        };
         if newly > 0 {
             // xt-hardening (2026-07-03): identity-based excusal. Only excuse
             // frozen peers that were actually COUNTED in the barrier's
@@ -509,12 +513,27 @@ fn stw_take_over_and_wait(
             break;
         }
         if !warned && rounds >= WARN_AFTER_ROUNDS {
+            let pending = shared.gc_barrier.pending_count();
             tracing::warn!(
                 rounds,
-                pending = shared.gc_barrier.pending_count(),
+                pending,
                 taken = taken.count(),
                 "STW cross-thread JIT takeover is still waiting for cooperative mutators"
             );
+            if std::env::var_os("CRATONVM_DBG_STW_CENSUS").is_some()
+                || std::env::var_os("CRATONVM_DBG_XT_JIT_ROOT_SCAN").is_some()
+            {
+                eprintln!(
+                    "[stw-census] rounds={rounds} pending={pending} taken={} blocked={} alive={}{}",
+                    taken.count(),
+                    shared.gc_barrier.blocked_count(),
+                    shared.thread_registry.alive_count(),
+                    shared.thread_registry.debug_thread_census()
+                );
+                if std::env::var_os("CRATONVM_DBG_STW_NATIVE_RING").is_some() {
+                    cratonvm_native_api::native_ring::dump_to_stderr();
+                }
+            }
             warned = true;
         }
     }
@@ -4934,6 +4953,13 @@ pub fn execute(
         );
     }
     push_frame_and_fire_entry(thread, frame);
+    if shared
+        .gc_barrier
+        .stw_requested
+        .load(std::sync::atomic::Ordering::Acquire)
+    {
+        safepoint_check(shared, thread);
+    }
 
     // If the JIT early-compile path encountered a Java exception from a callee,
     // route it through this method's exception table before interpreter execution.
@@ -5382,6 +5408,18 @@ fn execute_frame(shared: &SharedVm, thread: &mut JvmThread) -> MethodCallResult 
         // re-entered).
         // Feature-gated (off by default) — see vm/Cargo.toml
         // (See above — diagnostic block removed.)
+
+        // A newly-started or long straight-line frame may not hit an allocation
+        // or backward-branch poll before another thread requests STW. Keep the
+        // hot path to one atomic load; call the full safepoint machinery only
+        // while a pause is actually active.
+        if shared
+            .gc_barrier
+            .stw_requested
+            .load(std::sync::atomic::Ordering::Acquire)
+        {
+            safepoint_check(shared, thread);
+        }
 
         // Handle any pending Java exception from a previous invoke (e.g. JIT dispatch).
         if let Some((exc, invoke_pc)) = pending_java_exception.take() {
@@ -16250,9 +16288,6 @@ fn execute_invoke_kind(
                                 | "canRead"
                                 | "canWrite"
                                 | "canExecute"
-                                | "delete"
-                                | "mkdir"
-                                | "mkdirs"
                         ) {
                             thread.frames[frame_idx].stack.push(Value::Int(0))?;
                             return Ok(CachedCallResult::Handled);
@@ -18940,10 +18975,56 @@ fn force_native_over_real_jdk_bytecode(
     // module and otherwise builds a descriptor backed by the boot
     // `ModuleRegistry`'s parsed `uses`.
     if class_name == "java/lang/Module"
-        && matches!(method_name, "isExported" | "isOpen" | "getDescriptor")
+        && matches!(
+            method_name,
+            "isExported"
+                | "isOpen"
+                | "getDescriptor"
+                | "addExports"
+                | "addOpens"
+                | "implAddExports"
+                | "implAddExportsToAllUnnamed"
+                | "implAddExportsNoSync"
+                | "implAddOpens"
+                | "implAddOpensToAllUnnamed"
+        )
     {
         return true;
     }
+    // JBoss LogManager fallback. CratonVM often creates synthetic
+    // `org.jboss.logmanager.Logger` instances without a real `LoggerNode` graph.
+    // The native-builtins logmanager shim already registers null-safe
+    // `getEffectiveLevel()I` and `isLoggable(Level)` natives, but the real
+    // jboss-logmanager bytecode dereferences `this.loggerNode` first. Force the
+    // natives for real-JDK class bodies too, matching the existing null-safe
+    // logRaw / handler overrides in `native-builtins::logmanager`.
+    if (class_name == "org/jboss/logmanager/Logger"
+        || class_name == "org.jboss.logmanager.Logger")
+        && matches!(
+            (method_name, method_descriptor),
+            ("getEffectiveLevel", "()I") | ("isLoggable", "(Ljava/util/logging/Level;)Z")
+        )
+    {
+        return true;
+    }
+
+    // JBoss Modules asks Module.forClass(caller) to locate the caller's
+    // org.jboss.modules.Module before service-loading extension modules.
+    // CratonVM tracks java.lang.Module mirrors there instead, so the real
+    // bytecode can throw a bare ModuleLoadException for valid WildFly modules.
+    // Force the native bridge that loads through the synthetic boot loader.
+    if class_name == "org/jboss/modules/Module"
+        && method_name == "loadServiceFromCallerModuleLoader"
+        && matches!(
+            method_descriptor,
+            "(Ljava/lang/String;Ljava/lang/Class;)Ljava/util/ServiceLoader;"
+                | "(Lorg/jboss/modules/ModuleIdentifier;Ljava/lang/Class;)Ljava/util/ServiceLoader;"
+        )
+    {
+        return true;
+    }
+
+
     // Spring RSocket async setup can encode data and metadata strings on two
     // Reactor workers at the same time. The real `CharSequenceEncoder` lazily
     // computes a charset capacity through a per-instance cache; under CratonVM
@@ -20073,7 +20154,9 @@ fn try_stackless_invoke(
     }
 
     // 7. Handle synchronized: acquire monitor before pushing frame
+    let mut synchronized_args: Option<Vec<Value>> = None;
     let monitor_obj: Option<ObjectRef> = if is_synchronized {
+        let sync_args = synchronized_args.get_or_insert_with(|| args.to_vec());
         let obj = if is_static {
             // JVMS §2.11.10: a `static synchronized` method's monitor is the
             // `Class` object — the SAME object `ldc class`, `synchronized(X.class)`,
@@ -20082,7 +20165,7 @@ fn try_stackless_invoke(
             // `X.class.notifyAll()` would throw IllegalMonitorStateException.
             get_or_create_class_mirror(shared, declaring_id)
         } else {
-            match args.first() {
+            match sync_args.first() {
                 Some(Value::Object(Some(obj_ref))) => *obj_ref,
                 _ => {
                     return Err(MethodCallFailed::InternalError(VmError::Internal {
@@ -20092,11 +20175,13 @@ fn try_stackless_invoke(
                 }
             }
         };
-        shared.monitors.enter(obj, thread.thread_id);
-        Some(obj)
+        Some(crate::vm::monitor_enter_synchronized_method(
+            shared, thread, obj, sync_args,
+        ))
     } else {
         None
     };
+    let args = synchronized_args.as_deref().unwrap_or(args);
 
     // 8. Tail-call elimination: if the caller's next instruction is a matching
     // return, replace the current frame instead of pushing a new one.
@@ -21187,13 +21272,13 @@ fn execute_invokestatic_cached(
             let pd_byte = |i: usize| -> u8 { nth_param_tag_byte(&cached.method_descriptor, i) };
             let mut args_buf = [Value::Uninitialized; MAX_INLINE_ARGS];
             let mut args_vec: Vec<Value> = Vec::new();
-            let args_slice: &[Value] = if num_params <= MAX_INLINE_ARGS {
+            let args_slice: &mut [Value] = if num_params <= MAX_INLINE_ARGS {
                 for i in (0..num_params).rev() {
                     args_buf[i] = thread.frames[frame_idx]
                         .stack
                         .pop_arg_for_descriptor_checked(pd_byte(i))?;
                 }
-                &args_buf[..num_params]
+                &mut args_buf[..num_params]
             } else {
                 args_vec.resize(num_params, Value::Uninitialized);
                 for i in (0..num_params).rev() {
@@ -21201,7 +21286,7 @@ fn execute_invokestatic_cached(
                         .stack
                         .pop_arg_for_descriptor_checked(pd_byte(i))?;
                 }
-                &args_vec
+                &mut args_vec
             };
 
             // Acquire monitor for synchronized methods
@@ -21216,8 +21301,9 @@ fn execute_invokestatic_cached(
                         _ => return Ok(CachedCallResult::CacheMiss),
                     }
                 };
-                shared.monitors.enter(obj, thread.thread_id);
-                Some(obj)
+                Some(crate::vm::monitor_enter_synchronized_method(
+                    shared, thread, obj, args_slice,
+                ))
             } else {
                 None
             };
@@ -26192,13 +26278,13 @@ fn execute_invokevirtual_vtable_fast(
     };
     let mut args_buf = [Value::Uninitialized; MAX_INLINE_ARGS];
     let mut args_vec: Vec<Value> = Vec::new();
-    let args_slice: &[Value] = if total_args <= MAX_INLINE_ARGS {
+    let args_slice: &mut [Value] = if total_args <= MAX_INLINE_ARGS {
         for i in (0..total_args).rev() {
             args_buf[i] = thread.frames[frame_idx]
                 .stack
                 .pop_arg_for_descriptor_checked(arg_desc_byte(i))?;
         }
-        &args_buf[..total_args]
+        &mut args_buf[..total_args]
     } else {
         args_vec.resize(total_args, Value::Uninitialized);
         for i in (0..total_args).rev() {
@@ -26206,7 +26292,7 @@ fn execute_invokevirtual_vtable_fast(
                 .stack
                 .pop_arg_for_descriptor_checked(arg_desc_byte(i))?;
         }
-        &args_vec
+        &mut args_vec
     };
 
     if let Some(res) = intercept_classloader_set_default_assertion_status(
@@ -26223,8 +26309,10 @@ fn execute_invokevirtual_vtable_fast(
         // Non-static virtual — receiver owns the monitor.
         match args_slice.first() {
             Some(Value::Object(Some(r))) => {
-                shared.monitors.enter(*r, thread.thread_id);
-                Some(*r)
+                let obj = *r;
+                Some(crate::vm::monitor_enter_synchronized_method(
+                    shared, thread, obj, args_slice,
+                ))
             }
             _ => None,
         }
@@ -26469,13 +26557,13 @@ fn execute_invokevirtual_cached(
                     };
                     let mut args_buf = [Value::Uninitialized; MAX_INLINE_ARGS];
                     let mut args_vec: Vec<Value> = Vec::new();
-                    let args_slice: &[Value] = if total_args <= MAX_INLINE_ARGS {
+                    let args_slice: &mut [Value] = if total_args <= MAX_INLINE_ARGS {
                         for i in (0..total_args).rev() {
                             args_buf[i] = thread.frames[frame_idx]
                                 .stack
                                 .pop_arg_for_descriptor_checked(arg_desc_byte(i))?;
                         }
-                        &args_buf[..total_args]
+                        &mut args_buf[..total_args]
                     } else {
                         args_vec.resize(total_args, Value::Uninitialized);
                         for i in (0..total_args).rev() {
@@ -26483,7 +26571,7 @@ fn execute_invokevirtual_cached(
                                 .stack
                                 .pop_arg_for_descriptor_checked(arg_desc_byte(i))?;
                         }
-                        &args_vec
+                        &mut args_vec
                     };
 
                     if let Some(res) = intercept_classloader_set_default_assertion_status(
@@ -26637,8 +26725,9 @@ fn execute_invokevirtual_cached(
                                 _ => return Ok(CachedCallResult::CacheMiss),
                             }
                         };
-                        shared.monitors.enter(obj, thread.thread_id);
-                        Some(obj)
+                        Some(crate::vm::monitor_enter_synchronized_method(
+                            shared, thread, obj, args_slice,
+                        ))
                     } else {
                         None
                     };
@@ -26846,13 +26935,13 @@ fn execute_invokevirtual_cached(
             };
             let mut args_buf = [Value::Uninitialized; MAX_INLINE_ARGS];
             let mut args_vec: Vec<Value> = Vec::new();
-            let args_slice: &[Value] = if total_args <= MAX_INLINE_ARGS {
+            let args_slice: &mut [Value] = if total_args <= MAX_INLINE_ARGS {
                 for i in (0..total_args).rev() {
                     args_buf[i] = thread.frames[frame_idx]
                         .stack
                         .pop_arg_for_descriptor_checked(arg_desc_byte(i))?;
                 }
-                &args_buf[..total_args]
+                &mut args_buf[..total_args]
             } else {
                 args_vec.resize(total_args, Value::Uninitialized);
                 for i in (0..total_args).rev() {
@@ -26860,7 +26949,7 @@ fn execute_invokevirtual_cached(
                         .stack
                         .pop_arg_for_descriptor_checked(arg_desc_byte(i))?;
                 }
-                &args_vec
+                &mut args_vec
             };
 
             if let Some(res) = intercept_classloader_set_default_assertion_status(
@@ -26903,8 +26992,9 @@ fn execute_invokevirtual_cached(
                         _ => return Ok(CachedCallResult::CacheMiss),
                     }
                 };
-                shared.monitors.enter(obj, thread.thread_id);
-                Some(obj)
+                Some(crate::vm::monitor_enter_synchronized_method(
+                    shared, thread, obj, args_slice,
+                ))
             } else {
                 None
             };

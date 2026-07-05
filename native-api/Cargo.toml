@@ -25,6 +25,7 @@ parking_lot.workspace = true
 socket2 = { version = "0.5", features = ["all"] }
 native-tls = "0.2"
 rustc-hash.workspace = true
+libc = "0.2"
 # Legacy / CJK multi-byte charset transcoding (Shift_JIS, EUC-JP/KR, Big5,
 # GBK/GB18030, ISO-2022-JP, …). The hand-written codecs in `charset.rs` only
 # cover the single-byte / Unicode families; encoding_rs (the Gecko/Servo

@@ -77,13 +77,115 @@ fn build_service_loader(
         }
         Err(_) => ctx.alloc_object(cratonvm_types::ClassId::new(0), 2),
     };
-    // Synthetic slots: [0]=serviceClass, [1]=loader.
+    let obj = initialize_real_service_loader_fields(ctx, obj, service, loader)?;
+    Ok(Some(Value::Object(Some(obj))))
+}
+
+fn alloc_initialized_array_list(
+    ctx: &mut dyn NativeContext,
+) -> Result<cratonvm_types::ObjectRef, MethodCallFailed> {
+    let al_cls = "java/util/ArrayList";
+    let al_cid = ctx.ensure_class_initialized(al_cls).map_err(|_| {
+        MethodCallFailed::InternalError(VmError::Internal {
+            message: "ArrayList: not loaded".to_string(),
+        })
+    })?;
+    let list = ctx.alloc_object(al_cid, ctx.class_num_total_fields(al_cid).max(4));
+    let list_pin = ctx.pin_native_root(list);
+    ctx.invoke(al_cls, "<init>", "()V", &[Value::Object(Some(list))])?;
+    let list = ctx.read_native_pin(list_pin, list);
+    ctx.unpin_native_roots(list_pin);
+    Ok(list)
+}
+
+fn initialize_real_service_loader_fields(
+    ctx: &mut dyn NativeContext,
+    obj: cratonvm_types::ObjectRef,
+    service: Value,
+    loader: Value,
+) -> Result<cratonvm_types::ObjectRef, MethodCallFailed> {
+    // Synthetic compatibility slots used by this native file.
     ctx.set_field(obj, 0, service);
     ctx.set_field(obj, 1, loader);
-    // Dual-write for real-JDK ServiceLoader field names.
+
+    // Real-JDK ServiceLoader.load(...) is native-overridden here, so it bypasses
+    // the private constructor and the field initializers. Fill the same fields
+    // that JDK 25 reload()/iterator()/stream() expect; absent names are no-ops
+    // on older or synthetic layouts.
     ctx.set_field_by_name(obj, "service", service);
     ctx.set_field_by_name(obj, "loader", loader);
-    Ok(Some(Value::Object(Some(obj))))
+    ctx.set_field_by_name(obj, "layer", Value::Object(None));
+    ctx.set_field_by_name(obj, "lookupIterator1", Value::Object(None));
+    ctx.set_field_by_name(obj, "lookupIterator2", Value::Object(None));
+    ctx.set_field_by_name(obj, "loadedAllProviders", Value::Int(0));
+    ctx.set_field_by_name(obj, "reloadCount", Value::Int(0));
+
+    let obj_pin = ctx.pin_native_root(obj);
+    let service_name = ctx
+        .invoke(
+            "java/lang/Class",
+            "getName",
+            "()Ljava/lang/String;",
+            &[service],
+        )?
+        .unwrap_or(Value::Object(None));
+    let mut obj = ctx.read_native_pin(obj_pin, obj);
+    ctx.set_field_by_name(obj, "serviceName", service_name);
+
+    let instantiated = alloc_initialized_array_list(ctx)?;
+    obj = ctx.read_native_pin(obj_pin, obj);
+    ctx.set_field_by_name(
+        obj,
+        "instantiatedProviders",
+        Value::Object(Some(instantiated)),
+    );
+
+    let loaded = alloc_initialized_array_list(ctx)?;
+    obj = ctx.read_native_pin(obj_pin, obj);
+    ctx.set_field_by_name(obj, "loadedProviders", Value::Object(Some(loaded)));
+    ctx.unpin_native_roots(obj_pin);
+    Ok(obj)
+}
+
+fn native_sl_reload(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let sl = match args.first() {
+        Some(Value::Object(Some(o))) => *o,
+        _ => return Ok(None),
+    };
+    let sl_pin = ctx.pin_native_root(sl);
+    for field in ["instantiatedProviders", "loadedProviders"] {
+        let sl_now = ctx.read_native_pin(sl_pin, sl);
+        match ctx.get_field_by_name(sl_now, field) {
+            Value::Object(Some(list)) => {
+                let list_pin = ctx.pin_native_root(list);
+                let list_now = ctx.read_native_pin(list_pin, list);
+                ctx.invoke(
+                    "java/util/List",
+                    "clear",
+                    "()V",
+                    &[Value::Object(Some(list_now))],
+                )?;
+                ctx.unpin_native_roots(list_pin);
+            }
+            _ => {
+                let list = alloc_initialized_array_list(ctx)?;
+                let sl_now = ctx.read_native_pin(sl_pin, sl);
+                ctx.set_field_by_name(sl_now, field, Value::Object(Some(list)));
+            }
+        }
+    }
+    let sl_now = ctx.read_native_pin(sl_pin, sl);
+    ctx.set_field_by_name(sl_now, "lookupIterator1", Value::Object(None));
+    ctx.set_field_by_name(sl_now, "lookupIterator2", Value::Object(None));
+    ctx.set_field_by_name(sl_now, "loadedAllProviders", Value::Int(0));
+    let reload_count = ctx
+        .get_field_by_name(sl_now, "reloadCount")
+        .as_int()
+        .unwrap_or(0)
+        .saturating_add(1);
+    ctx.set_field_by_name(sl_now, "reloadCount", Value::Int(reload_count));
+    ctx.unpin_native_roots(sl_pin);
+    Ok(None)
 }
 
 /// Derive candidate IMPL-JARS module directory names from a service/class FQN.
@@ -334,13 +436,44 @@ fn discover_providers(
             None => None,
         }
     };
+    let loader_is_jboss_module = loader_ref_opt
+        .map(|r| {
+            ctx.class_name_of_id(ctx.class_id_of_object(r))
+                .as_deref()
+                == Some("org/jboss/modules/ModuleClassLoader")
+        })
+        .unwrap_or(false);
+
+    let diag_sl = matches!(
+        std::env::var("CRATONVM_DIAG_SERVICELOADER").as_deref(),
+        Ok("1") | Ok("true") | Ok("yes")
+    );
+
+    if loader_is_jboss_module {
+        if let Some(loader_r) = loader_ref_opt {
+            if let Some(module_name) = crate::jboss_module_loader::module_name_of_mcl(ctx, loader_r) {
+                providers.extend(crate::jboss_module_loader::module_service_provider_names(
+                    &module_name,
+                    &service_name,
+                ));
+                providers.sort();
+                providers.dedup();
+                if diag_sl {
+                    eprintln!(
+                        "[SL-LOADER-DBG] JBoss module service module={} service={} providers={} ({:?})",
+                        module_name,
+                        service_name,
+                        providers.len(),
+                        providers
+                    );
+                }
+            } else if diag_sl {
+                eprintln!("[SL-LOADER-DBG] JBoss ModuleClassLoader has no module backref");
+            }
+        }
+    }
 
     if let Some(loader_r) = loader_ref_opt {
-        let diag_sl = matches!(
-            std::env::var("CRATONVM_DIAG_SERVICELOADER").as_deref(),
-            Ok("1") | Ok("true") | Ok("yes")
-        );
-
         // Primary path: call loader.findResources(resource) → Enumeration<URL>,
         // then extract the entry path from each URL and read bytes directly.
         let res_name_val = Value::Object(Some(ctx.create_string(&resource)));
@@ -423,6 +556,10 @@ fn discover_providers(
                 if !entry_path.is_empty() {
                     let mut got = false;
                     // A plain `file:` URL (no `!/` jar separator) names a real
+                    if let Some(bytes) = read_jar_url_entry(&ext_str) {
+                        parse_provider_lines(&bytes, &mut providers);
+                        got = true;
+                    }
                     // filesystem path, NOT a classpath-relative resource. The
                     // `find_*_resource_bytes` helpers only search the classpath, so
                     // an absolute path like `C:/…/META-INF/services/<spi>` misses
@@ -578,12 +715,16 @@ fn discover_providers(
     // Flat classpath scan: providers listed directly at
     // META-INF/services/<svc> on the classpath (normal case for
     // non-embedded loaders and JDK built-in providers).
-    let descriptors = ctx.find_all_resource_bytes(&resource);
+    let descriptors = if loader_is_jboss_module {
+        Vec::new()
+    } else {
+        ctx.find_all_resource_bytes(&resource)
+    };
     for bytes in &descriptors {
         parse_provider_lines(bytes, &mut providers);
     }
     // Test mocks may stub `find_resource` without populating the bytes list.
-    if descriptors.is_empty() {
+    if descriptors.is_empty() && !loader_is_jboss_module {
         if let Some(bytes) = ctx.find_resource(&resource) {
             parse_provider_lines(&bytes, &mut providers);
         }
@@ -663,6 +804,38 @@ fn percent_decode(s: &str) -> String {
         i += 1;
     }
     String::from_utf8_lossy(&out).into_owned()
+}
+
+fn file_url_path_to_fs_path(file_url: &str) -> Option<String> {
+    let raw = if let Some(rest) = file_url.strip_prefix("file://") {
+        rest
+    } else if let Some(rest) = file_url.strip_prefix("file:/") {
+        rest
+    } else {
+        return None;
+    };
+    if raw.is_empty() {
+        return None;
+    }
+    let decoded = percent_decode(raw);
+    if decoded.starts_with('/') || decoded.as_bytes().get(1).copied() == Some(b':') {
+        Some(decoded)
+    } else {
+        Some(format!("/{decoded}"))
+    }
+}
+
+fn read_jar_url_entry(ext_str: &str) -> Option<Vec<u8>> {
+    let rest = ext_str.strip_prefix("jar:")?;
+    let (jar_url, entry_path) = rest.split_once("!/")?;
+    let jar_path = file_url_path_to_fs_path(jar_url)?;
+    let file = std::fs::File::open(jar_path).ok()?;
+    let mut archive = zip::ZipArchive::new(file).ok()?;
+    let mut entry = archive.by_name(entry_path).ok()?;
+    let mut buf = Vec::with_capacity(entry.size() as usize);
+    use std::io::Read;
+    entry.read_to_end(&mut buf).ok()?;
+    Some(buf)
 }
 
 fn is_valid_provider_name(s: &str) -> bool {
@@ -1561,6 +1734,7 @@ pub fn register_service_loader_natives(r: &mut NativeMethodRegistry) {
         "()Ljava/util/Optional;",
         native_sl_find_first,
     );
+    r.register(sl, "reload", "()V", native_sl_reload);
 
     // Re-register `StreamSupport.stream(Spliterator, boolean)` — see the
     // header comment on `native_stream_support_stream_from_spliterator`. This
@@ -1636,6 +1810,30 @@ mod tests {
         assert!(out.is_empty());
     }
 
+
+    #[test]
+    fn read_jar_url_entry_reads_exact_jar_descriptor() {
+        let tmp = tempfile::tempdir().unwrap();
+        let jar_path = tmp.path().join("svc.jar");
+        let file = std::fs::File::create(&jar_path).unwrap();
+        let mut zw = zip::ZipWriter::new(file);
+        zw.start_file(
+            "META-INF/services/com.acme.Service",
+            zip::write::SimpleFileOptions::default(),
+        )
+        .unwrap();
+        use std::io::Write;
+        zw.write_all(b"com.acme.Provider\n").unwrap();
+        zw.finish().unwrap();
+
+        let raw_path = jar_path.to_string_lossy();
+        let synthetic_linux_url = format!(
+            "jar:file://{}!/META-INF/services/com.acme.Service",
+            raw_path.trim_start_matches('/')
+        );
+        let bytes = read_jar_url_entry(&synthetic_linux_url).unwrap();
+        assert_eq!(bytes, b"com.acme.Provider\n");
+    }
     #[test]
     fn discover_providers_includes_jpms_module_provides_entries() {
         let mut ctx = mock_ctx();

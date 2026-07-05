@@ -532,7 +532,9 @@ pub(crate) fn native_thread_sleep(ctx: &mut dyn NativeContext, args: &[Value]) -
                 interrupted = true;
                 break;
             }
+            ctx.begin_blocking_region();
             std::thread::sleep(remaining.min(pump_slice));
+            ctx.end_blocking_region();
         }
         let actual_dur = sleep_start.elapsed();
         if release {
@@ -2103,7 +2105,9 @@ pub(crate) fn native_thread_sleep_nanos(
             ctx.vt_release_carrier();
         }
         let sleep_start = std::time::Instant::now();
+        ctx.begin_blocking_region();
         std::thread::sleep(duration);
+        ctx.end_blocking_region();
         let actual_dur = sleep_start.elapsed();
         if release {
             ctx.vt_acquire_carrier();
@@ -2218,7 +2222,9 @@ pub(crate) fn native_thread_sleep0(
         }
         let remaining = deadline - now;
         let chunk = std::cmp::min(remaining, std::time::Duration::from_millis(10));
+        ctx.begin_blocking_region();
         std::thread::sleep(chunk);
+        ctx.end_blocking_region();
     };
 
     let actual_dur = start.elapsed();

@@ -812,6 +812,17 @@ fn register_java_lang_access(registry: &mut NativeMethodRegistry) {
         "(Ljava/lang/String;)[B",
         jla_get_bytes_utf8_no_repl,
     );
+    // JDK 25 UnixPath encodes filesystem paths through JavaLangAccess with an
+    // explicit Charset argument. We currently support the UTF-8/ASCII paths
+    // WildFly uses and ignore the Charset object.
+    for name in ["getBytesNoRepl", "uncheckedGetBytesNoRepl"] {
+        registry.register(
+            owner,
+            name,
+            "(Ljava/lang/String;Ljava/nio/charset/Charset;)[B",
+            jla_get_bytes_utf8_no_repl,
+        );
+    }
     registry.register(
         owner,
         "newStackTraceElement",
@@ -948,6 +959,14 @@ fn register_java_lang_access(registry: &mut NativeMethodRegistry) {
         "(Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;[Ljava/lang/String;I)Ljava/lang/String;",
         jla_join,
     );
+    for name in ["getBytesNoRepl", "uncheckedGetBytesNoRepl"] {
+        registry.register(
+            iface,
+            name,
+            "(Ljava/lang/String;Ljava/nio/charset/Charset;)[B",
+            jla_get_bytes_utf8_no_repl,
+        );
+    }
 }
 
 // JavaLangInvokeAccess --------------------------------------------------------
