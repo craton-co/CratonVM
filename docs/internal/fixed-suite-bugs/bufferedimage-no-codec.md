@@ -1,8 +1,34 @@
 # http.converter.BufferedImageHttpMessageConverterTests — no ImageIO/JPEG/PNG codec
 
-Status: open
+Status: fixed
 
 Date observed: 2026-07-04
+
+Date fixed: 2026-07-05
+
+## Fixed
+
+CratonVM now routes the `BufferedImage` side-table methods and the public
+`javax.imageio.ImageIO` PNG/JPEG read/write overloads through registered
+natives in real-JDK mode. The fix adds PNG/JPEG encode/decode helpers to
+`native-awt/src/image.rs`, stream/file `ImageIO.read` and `ImageIO.write`
+bridges in `native-awt/src/natives.rs`, and force-native dispatch entries in
+`vm/src/runtime/interpreter.rs`.
+
+The real-JDK `BufferedImage` class has no synthetic `imageId` field, so the
+native AWT bridge now also records `BufferedImage` object identity hash to
+native image id. That preserves the existing synthetic-field path while making
+real-JDK `new BufferedImage(...).setRGB(...)`, `ImageIO.write(...)`, and
+`ImageIO.read(...)` share the same ARGB backing store.
+
+Validation:
+
+- `cargo check -p cratonvm-native-awt -p cratonvm-vm`
+- `cargo test -p cratonvm-native-awt encode_decode -- --nocapture`
+- `cargo test -p cratonvm-vm --test t7_desktop_conformance imageio -- --nocapture`
+- One-off Java probe through a uniquely named binary
+  `cratonvm-bufferedimage-codecs-20260705-001.exe`: PNG stream write/read,
+  JPEG stream write/read, and PNG file write/read all passed.
 
 ## Summary
 
@@ -62,12 +88,12 @@ KRUN_STACK=1 <cratonvm-binary> --java-home <jdk21-or-25> \
   -cp "$SPRINGWEB_TESTCP" KRun org.springframework.http.converter.BufferedImageHttpMessageConverterTests
 ```
 
-## Fix scope (not attempted)
+## Original fix scope
 
-A real fix needs: (1) a vendored JPEG decoder and PNG encoder/decoder (e.g.
-`zune-jpeg`/`zune-png`, or the `image` crate), and (2) real
-`Raster`/`ColorModel`/`SampleModel`/`DataBuffer` native wiring so
-`BufferedImage.getRaster()`/`getColorModel()` return objects the real JDK
-`ImageIO` SPI can consume — not just patching the existing raster-stub. This
-is a multi-day undertaking, out of scope for a single bug-cluster fix
-session; tracked here rather than attempted piecemeal.
+The original note assumed a real fix required full
+`Raster`/`ColorModel`/`SampleModel`/`DataBuffer` native wiring. The implemented
+fix instead bypasses the real JDK ImageIO SPI for the supported PNG/JPEG
+surface and encodes/decodes directly from CratonVM's authoritative ARGB
+side-table. Full raster/color-model object parity remains outside this fixed
+codec bug, but is no longer required for the Spring
+`BufferedImageHttpMessageConverterTests` ImageIO path.

@@ -10,8 +10,8 @@
 use std::sync::{Arc, OnceLock};
 
 use cratonvm_native_api::{NativeContext, NativeMethodRegistry};
-use cratonvm_types::error::{MethodCallResult, RuntimeError};
-use cratonvm_types::{ObjectRef, Value};
+use cratonvm_types::error::{MethodCallFailed, MethodCallResult, RuntimeError};
+use cratonvm_types::{ArrayElementType, ObjectRef, Value};
 use parking_lot::Mutex;
 use rustc_hash::FxHashMap;
 
@@ -1310,7 +1310,7 @@ fn register_graphics_natives(registry: &mut NativeMethodRegistry) {
                 if let Some(this) = get_obj(args, 0) {
                     if let Some(img) = get_obj(args, 1) {
                         let (x, y) = (get_int(args, 2), get_int(args, 3));
-                        if let Value::Long(id) = ctx.get_field_by_name(img, "imageId") {
+                        if let Some(id) = buffered_image_id(ctx, img) {
                             // Acquire locks in the same order as `dispose_gfx`
                             // (Gfx entry first, then image registry) so the two
                             // can't deadlock when racing on the same Graphics2D.
@@ -1321,7 +1321,7 @@ fn register_graphics_natives(registry: &mut NativeMethodRegistry) {
                             let handle = gfx_handle_for(ctx, this);
                             let mut entry = handle.lock();
                             let reg = image::image_registry();
-                            if let Some(bimg) = reg.get(ImageId(id as u64)) {
+                            if let Some(bimg) = reg.get(id) {
                                 let pixels: &[u32] = bimg.get_data_buffer();
                                 let (w, h) = (bimg.width(), bimg.height());
                                 if !pixels.is_empty() {
@@ -1657,6 +1657,201 @@ fn register_graphics_natives(registry: &mut NativeMethodRegistry) {
 /// worst case) — large requests are rejected instead of aborting the process.
 const MAX_IMAGE_DIM: i32 = 32767;
 
+const IMAGEIO_STREAM_BUFFER_SIZE: usize = 8192;
+const IMAGEIO_MAX_STREAM_BYTES: usize = 128 * 1024 * 1024;
+
+fn imageio_io_error(message: impl Into<String>) -> MethodCallFailed {
+    RuntimeError::IOException {
+        message: message.into(),
+    }
+    .into()
+}
+
+fn imageio_illegal_arg(message: impl Into<String>) -> MethodCallFailed {
+    RuntimeError::IllegalArgumentException {
+        message: message.into(),
+    }
+    .into()
+}
+
+fn read_all_from_input_stream(
+    ctx: &mut dyn NativeContext,
+    input: ObjectRef,
+) -> Result<Vec<u8>, MethodCallFailed> {
+    let base = ctx.pin_native_root(input);
+    let result = (|| {
+        let scratch = ctx.new_array(ArrayElementType::Byte, IMAGEIO_STREAM_BUFFER_SIZE);
+        let scratch_pin = ctx.pin_native_root(scratch);
+        let mut out = Vec::new();
+        let mut zero_reads = 0usize;
+
+        loop {
+            let input = ctx.read_native_pin(base, input);
+            let scratch = ctx.read_native_pin(scratch_pin, scratch);
+            let read = ctx.invoke_virtual(
+                input,
+                "read",
+                "([BII)I",
+                &[
+                    Value::Object(Some(scratch)),
+                    Value::Int(0),
+                    Value::Int(IMAGEIO_STREAM_BUFFER_SIZE as i32),
+                ],
+            )?;
+            let n = match read {
+                Some(Value::Int(n)) => n,
+                _ => return Err(imageio_io_error("InputStream.read did not return int")),
+            };
+            if n < 0 {
+                break;
+            }
+            if n == 0 {
+                zero_reads += 1;
+                if zero_reads > 16 {
+                    return Err(imageio_io_error(
+                        "InputStream.read returned repeated zero bytes",
+                    ));
+                }
+                continue;
+            }
+            zero_reads = 0;
+            let n = n as usize;
+            if n > IMAGEIO_STREAM_BUFFER_SIZE {
+                return Err(imageio_io_error(format!(
+                    "InputStream.read returned {n} bytes into {IMAGEIO_STREAM_BUFFER_SIZE}-byte buffer"
+                )));
+            }
+            if out
+                .len()
+                .checked_add(n)
+                .map_or(true, |len| len > IMAGEIO_MAX_STREAM_BYTES)
+            {
+                return Err(imageio_io_error(format!(
+                    "ImageIO input exceeds {IMAGEIO_MAX_STREAM_BYTES} byte native limit"
+                )));
+            }
+            let scratch = ctx.read_native_pin(scratch_pin, scratch);
+            let mut chunk = vec![0u8; n];
+            let copied = ctx.read_byte_array_into(scratch, 0, &mut chunk);
+            if copied != n {
+                return Err(imageio_io_error("failed to copy InputStream bytes"));
+            }
+            out.extend_from_slice(&chunk);
+        }
+
+        Ok(out)
+    })();
+    ctx.unpin_native_roots(base);
+    result
+}
+
+fn write_all_to_output_stream(
+    ctx: &mut dyn NativeContext,
+    output: ObjectRef,
+    bytes: &[u8],
+) -> Result<(), MethodCallFailed> {
+    let base = ctx.pin_native_root(output);
+    let result = (|| {
+        let scratch_len = bytes.len().min(IMAGEIO_STREAM_BUFFER_SIZE).max(1);
+        let scratch = ctx.new_array(ArrayElementType::Byte, scratch_len);
+        let scratch_pin = ctx.pin_native_root(scratch);
+        let mut offset = 0usize;
+
+        while offset < bytes.len() {
+            let n = (bytes.len() - offset).min(scratch_len);
+            let scratch = ctx.read_native_pin(scratch_pin, scratch);
+            if !ctx.write_byte_array_from(scratch, 0, &bytes[offset..offset + n]) {
+                return Err(imageio_io_error(
+                    "failed to populate OutputStream write buffer",
+                ));
+            }
+            let output = ctx.read_native_pin(base, output);
+            let scratch = ctx.read_native_pin(scratch_pin, scratch);
+            ctx.invoke_virtual(
+                output,
+                "write",
+                "([BII)V",
+                &[
+                    Value::Object(Some(scratch)),
+                    Value::Int(0),
+                    Value::Int(n as i32),
+                ],
+            )?;
+            offset += n;
+        }
+
+        let output = ctx.read_native_pin(base, output);
+        ctx.invoke_virtual(output, "flush", "()V", &[])?;
+        Ok(())
+    })();
+    ctx.unpin_native_roots(base);
+    result
+}
+
+fn buffered_image_ids() -> &'static Mutex<FxHashMap<i32, ImageId>> {
+    static INSTANCE: OnceLock<Mutex<FxHashMap<i32, ImageId>>> = OnceLock::new();
+    INSTANCE.get_or_init(|| Mutex::new(FxHashMap::default()))
+}
+
+fn bind_buffered_image(ctx: &dyn NativeContext, obj: ObjectRef, image_id: ImageId) {
+    buffered_image_ids()
+        .lock()
+        .insert(ctx.identity_hash_code(obj), image_id);
+}
+
+fn buffered_image_id(ctx: &dyn NativeContext, obj: ObjectRef) -> Option<ImageId> {
+    if let Value::Long(id) = ctx.get_field_by_name(obj, "imageId") {
+        return Some(ImageId(id as u64));
+    }
+    buffered_image_ids()
+        .lock()
+        .get(&ctx.identity_hash_code(obj))
+        .copied()
+}
+
+fn decode_buffered_image(ctx: &mut dyn NativeContext, bytes: &[u8]) -> MethodCallResult {
+    let decoded = image::BufferedImageData::decode_encoded(bytes).map_err(imageio_io_error)?;
+    let created = ctx.new_object_initialized(
+        "java/awt/image/BufferedImage",
+        "(III)V",
+        &[
+            Value::Int(decoded.width() as i32),
+            Value::Int(decoded.height() as i32),
+            Value::Int(ImageType::IntArgb as i32),
+        ],
+    )?;
+    let Some(Value::Object(Some(obj))) = created else {
+        return null_ok();
+    };
+    let Some(id) = buffered_image_id(ctx, obj) else {
+        return null_ok();
+    };
+    let mut reg = image::image_registry();
+    let Some(dst) = reg.get_mut(id) else {
+        return null_ok();
+    };
+    decoded.copy_to(dst);
+    obj_ok(obj)
+}
+
+fn encode_rendered_image(
+    ctx: &dyn NativeContext,
+    image_obj: ObjectRef,
+    format: image::EncodedImageFormat,
+) -> Result<Vec<u8>, MethodCallFailed> {
+    let Some(id) = buffered_image_id(ctx, image_obj) else {
+        return Err(imageio_illegal_arg(
+            "ImageIO.write only supports CratonVM BufferedImage-backed RenderedImage instances",
+        ));
+    };
+    let image = {
+        let reg = image::image_registry();
+        reg.get(id).cloned()
+    }
+    .ok_or_else(|| imageio_illegal_arg("BufferedImage backing store is missing"))?;
+    image.encode(format).map_err(imageio_io_error)
+}
+
 fn register_image_natives(registry: &mut NativeMethodRegistry) {
     registry.register("java/awt/image/BufferedImage", "<init>", "(III)V", |ctx, args| {
         if let Some(this) = get_obj(args, 0) {
@@ -1692,6 +1887,7 @@ fn register_image_natives(registry: &mut NativeMethodRegistry) {
             ctx.set_field_by_name(this, "imageId", Value::Long(img_id.0 as i64));
             ctx.set_field_by_name(this, "width", Value::Int(w as i32));
             ctx.set_field_by_name(this, "height", Value::Int(h as i32));
+            bind_buffered_image(ctx, this, img_id);
         }
         void_ok()
     });
@@ -1703,6 +1899,12 @@ fn register_image_natives(registry: &mut NativeMethodRegistry) {
             if let Some(this) = get_obj(args, 0) {
                 if let Value::Int(w) = ctx.get_field_by_name(this, "width") {
                     return int_ok(w);
+                }
+                if let Some(id) = buffered_image_id(ctx, this) {
+                    let reg = image::image_registry();
+                    if let Some(img) = reg.get(id) {
+                        return int_ok(img.width() as i32);
+                    }
                 }
             }
             int_ok(0)
@@ -1716,6 +1918,12 @@ fn register_image_natives(registry: &mut NativeMethodRegistry) {
             if let Some(this) = get_obj(args, 0) {
                 if let Value::Int(h) = ctx.get_field_by_name(this, "height") {
                     return int_ok(h);
+                }
+                if let Some(id) = buffered_image_id(ctx, this) {
+                    let reg = image::image_registry();
+                    if let Some(img) = reg.get(id) {
+                        return int_ok(img.height() as i32);
+                    }
                 }
             }
             int_ok(0)
@@ -1732,9 +1940,9 @@ fn register_image_natives(registry: &mut NativeMethodRegistry) {
                 // wrapping to a huge index. Mirrors `BufferedImage.getRGB`'s
                 // documented `ArrayIndexOutOfBoundsException` contract.
                 let (x, y) = (get_int(args, 1), get_int(args, 2));
-                if let Value::Long(id) = ctx.get_field_by_name(this, "imageId") {
+                if let Some(id) = buffered_image_id(ctx, this) {
                     let reg = image::image_registry();
-                    if let Some(img) = reg.get(image::ImageId(id as u64)) {
+                    if let Some(img) = reg.get(id) {
                         let (w, h) = (img.width() as i32, img.height() as i32);
                         if x < 0 || y < 0 || x >= w || y >= h {
                             // Match the JDK: the index reported is the offending
@@ -1760,9 +1968,9 @@ fn register_image_natives(registry: &mut NativeMethodRegistry) {
             if let Some(this) = get_obj(args, 0) {
                 // Validate signed coordinates before casting (see `getRGB`).
                 let (x, y, argb) = (get_int(args, 1), get_int(args, 2), get_int(args, 3) as u32);
-                if let Value::Long(id) = ctx.get_field_by_name(this, "imageId") {
+                if let Some(id) = buffered_image_id(ctx, this) {
                     let mut reg = image::image_registry();
-                    if let Some(img) = reg.get_mut(image::ImageId(id as u64)) {
+                    if let Some(img) = reg.get_mut(id) {
                         let (w, h) = (img.width() as i32, img.height() as i32);
                         if x < 0 || y < 0 || x >= w || y >= h {
                             let index = (y as i64) * (w as i64) + (x as i64);
@@ -1784,9 +1992,9 @@ fn register_image_natives(registry: &mut NativeMethodRegistry) {
         "()I",
         |ctx, args| {
             if let Some(this) = get_obj(args, 0) {
-                if let Value::Long(id) = ctx.get_field_by_name(this, "imageId") {
+                if let Some(id) = buffered_image_id(ctx, this) {
                     let reg = image::image_registry();
-                    if let Some(img) = reg.get(image::ImageId(id as u64)) {
+                    if let Some(img) = reg.get(id) {
                         return int_ok(img.image_type() as i32);
                     }
                 }
@@ -1800,8 +2008,7 @@ fn register_image_natives(registry: &mut NativeMethodRegistry) {
         "()Ljava/awt/Graphics2D;",
         |ctx, args| {
             if let Some(this) = get_obj(args, 0) {
-                if let Value::Long(id) = ctx.get_field_by_name(this, "imageId") {
-                    let image_id = ImageId(id as u64);
+                if let Some(image_id) = buffered_image_id(ctx, this) {
                     let gfx = ctx.new_object("java/awt/Graphics2D")?;
                     if let Some(Value::Object(Some(gfx_obj))) = &gfx {
                         register_gfx_for_image(ctx, *gfx_obj, image_id);
@@ -1824,8 +2031,8 @@ fn register_image_natives(registry: &mut NativeMethodRegistry) {
         "()V",
         |ctx, args| {
             if let Some(this) = get_obj(args, 0) {
-                if let Value::Long(id) = ctx.get_field_by_name(this, "imageId") {
-                    flush_image(ImageId(id as u64));
+                if let Some(id) = buffered_image_id(ctx, this) {
+                    flush_image(id);
                 }
             }
             void_ok()
@@ -1853,11 +2060,11 @@ fn register_image_natives(registry: &mut NativeMethodRegistry) {
                 }
                 .into());
             }
-            let Value::Long(id) = ctx.get_field_by_name(this, "imageId") else {
+            let Some(id) = buffered_image_id(ctx, this) else {
                 return null_ok();
             };
             let reg = image::image_registry();
-            let Some(img) = reg.get(image::ImageId(id as u64)) else {
+            let Some(img) = reg.get(id) else {
                 return null_ok();
             };
             let (iw, ih) = (img.width() as i32, img.height() as i32);
@@ -1898,6 +2105,93 @@ fn register_image_natives(registry: &mut NativeMethodRegistry) {
                 }
             }
             obj_ok(arr)
+        },
+    );
+
+    registry.register(
+        "javax/imageio/ImageIO",
+        "read",
+        "(Ljava/io/InputStream;)Ljava/awt/image/BufferedImage;",
+        |ctx, args| {
+            let input = get_obj(args, 0).ok_or_else(|| imageio_illegal_arg("input == null!"))?;
+            let bytes = read_all_from_input_stream(ctx, input)?;
+            decode_buffered_image(ctx, &bytes)
+        },
+    );
+    registry.register(
+        "javax/imageio/ImageIO",
+        "read",
+        "(Ljava/io/File;)Ljava/awt/image/BufferedImage;",
+        |ctx, args| {
+            let file = get_obj(args, 0).ok_or_else(|| imageio_illegal_arg("input == null!"))?;
+            let created = ctx.new_object_initialized(
+                "java/io/FileInputStream",
+                "(Ljava/io/File;)V",
+                &[Value::Object(Some(file))],
+            )?;
+            let Some(Value::Object(Some(stream))) = created else {
+                return null_ok();
+            };
+            let base = ctx.pin_native_root(stream);
+            let result = (|| {
+                let stream = ctx.read_native_pin(base, stream);
+                let bytes = read_all_from_input_stream(ctx, stream)?;
+                let stream = ctx.read_native_pin(base, stream);
+                ctx.invoke_virtual(stream, "close", "()V", &[])?;
+                decode_buffered_image(ctx, &bytes)
+            })();
+            ctx.unpin_native_roots(base);
+            result
+        },
+    );
+    registry.register(
+        "javax/imageio/ImageIO",
+        "write",
+        "(Ljava/awt/image/RenderedImage;Ljava/lang/String;Ljava/io/OutputStream;)Z",
+        |ctx, args| {
+            let image_obj = get_obj(args, 0).ok_or_else(|| imageio_illegal_arg("im == null!"))?;
+            let format_name = read_string(ctx, args, 1)
+                .ok_or_else(|| imageio_illegal_arg("formatName == null!"))?;
+            let output = get_obj(args, 2).ok_or_else(|| imageio_illegal_arg("output == null!"))?;
+            let Some(format) = image::EncodedImageFormat::parse(&format_name) else {
+                return bool_ok(false);
+            };
+            let bytes = encode_rendered_image(ctx, image_obj, format)?;
+            write_all_to_output_stream(ctx, output, &bytes)?;
+            bool_ok(true)
+        },
+    );
+    registry.register(
+        "javax/imageio/ImageIO",
+        "write",
+        "(Ljava/awt/image/RenderedImage;Ljava/lang/String;Ljava/io/File;)Z",
+        |ctx, args| {
+            let image_obj = get_obj(args, 0).ok_or_else(|| imageio_illegal_arg("im == null!"))?;
+            let format_name = read_string(ctx, args, 1)
+                .ok_or_else(|| imageio_illegal_arg("formatName == null!"))?;
+            let file = get_obj(args, 2).ok_or_else(|| imageio_illegal_arg("output == null!"))?;
+            let Some(format) = image::EncodedImageFormat::parse(&format_name) else {
+                return bool_ok(false);
+            };
+            let bytes = encode_rendered_image(ctx, image_obj, format)?;
+            let created = ctx.new_object_initialized(
+                "java/io/FileOutputStream",
+                "(Ljava/io/File;)V",
+                &[Value::Object(Some(file))],
+            )?;
+            let Some(Value::Object(Some(stream))) = created else {
+                return bool_ok(false);
+            };
+            let base = ctx.pin_native_root(stream);
+            let result = (|| {
+                let stream = ctx.read_native_pin(base, stream);
+                write_all_to_output_stream(ctx, stream, &bytes)?;
+                let stream = ctx.read_native_pin(base, stream);
+                ctx.invoke_virtual(stream, "close", "()V", &[])?;
+                bool_ok(true)
+            })();
+            ctx.unpin_native_roots(base);
+            result
         },
     );
 
