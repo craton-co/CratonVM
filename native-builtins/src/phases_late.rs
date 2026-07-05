@@ -29722,18 +29722,50 @@ fn bi_alloc_kind(ctx: &mut dyn NativeContext, kind: i32) -> ObjectRef {
     obj
 }
 
+fn java_text_len(text: &str) -> usize {
+    text.encode_utf16().count()
+}
+
+fn java_text_pos_to_byte(text: &str, pos: usize) -> usize {
+    let mut units = 0;
+    for (byte_idx, ch) in text.char_indices() {
+        if units >= pos {
+            return byte_idx;
+        }
+        units += ch.len_utf16();
+        if units > pos {
+            return byte_idx;
+        }
+    }
+    text.len()
+}
+
+fn byte_pos_to_java_text_pos(text: &str, pos: usize) -> usize {
+    let mut units = 0;
+    for (byte_idx, ch) in text.char_indices() {
+        if byte_idx >= pos {
+            return units;
+        }
+        units += ch.len_utf16();
+    }
+    units
+}
+
 /// Find the next break boundary after `pos` in `text` for the given iterator kind.
 fn bi_find_next(text: &str, pos: usize, kind: i32) -> Option<usize> {
-    if pos >= text.len() {
+    let text_len = java_text_len(text);
+    if pos >= text_len {
         return None;
     }
     let bytes = text.as_bytes();
+    let start = java_text_pos_to_byte(text, pos);
     match kind {
         BI_WORD => {
             // Word boundary: transition between word chars and non-word chars
             let at_word =
-                pos < bytes.len() && (bytes[pos].is_ascii_alphanumeric() || bytes[pos] == b'_');
-            let mut i = pos;
+                start < bytes.len()
+                    && (bytes[start].is_ascii_alphanumeric() || bytes[start] == b'_');
+            let mut i = start;
             if at_word {
                 // Skip word chars to find end of word
                 while i < bytes.len() && (bytes[i].is_ascii_alphanumeric() || bytes[i] == b'_') {
@@ -29745,11 +29777,11 @@ fn bi_find_next(text: &str, pos: usize, kind: i32) -> Option<usize> {
                     i += 1;
                 }
             }
-            Some(i)
+            Some(byte_pos_to_java_text_pos(text, i))
         }
         BI_SENTENCE => {
             // Sentence boundary: after .!? followed by whitespace
-            let mut i = pos;
+            let mut i = start;
             while i < bytes.len() {
                 if bytes[i] == b'.' || bytes[i] == b'!' || bytes[i] == b'?' {
                     i += 1;
@@ -29757,29 +29789,41 @@ fn bi_find_next(text: &str, pos: usize, kind: i32) -> Option<usize> {
                     while i < bytes.len() && bytes[i].is_ascii_whitespace() {
                         i += 1;
                     }
-                    return Some(i);
+                    return Some(byte_pos_to_java_text_pos(text, i));
                 }
                 i += 1;
             }
-            Some(text.len())
+            Some(text_len)
         }
         BI_CHARACTER => {
             // Character boundary: next Unicode codepoint
-            let ch = text[pos..].chars().next()?;
-            Some(pos + ch.len_utf8())
+            let ch = text[start..].chars().next()?;
+            Some(pos + ch.len_utf16())
         }
         BI_LINE => {
-            // Line break opportunity: after whitespace, hyphens, or punctuation
-            let mut i = pos + 1;
+            // Line break opportunity: after whitespace or hyphens. HotSpot's
+            // line iterator reports the boundary after the separating
+            // whitespace/hyphen run, not inside it; Picocli relies on that to
+            // avoid hard-wrapping option names and env-var tokens.
+            let mut i = start;
             while i < bytes.len() {
-                if bytes[i].is_ascii_whitespace() || bytes[i - 1] == b'-' {
-                    return Some(i);
+                if bytes[i].is_ascii_whitespace() {
+                    while i < bytes.len() && bytes[i].is_ascii_whitespace() {
+                        i += 1;
+                    }
+                    return Some(byte_pos_to_java_text_pos(text, i));
+                }
+                if bytes[i] == b'-' {
+                    while i < bytes.len() && bytes[i] == b'-' {
+                        i += 1;
+                    }
+                    return Some(byte_pos_to_java_text_pos(text, i));
                 }
                 i += 1;
             }
-            Some(text.len())
+            Some(text_len)
         }
-        _ => Some(text.len()),
+        _ => Some(text_len),
     }
 }
 
@@ -29791,7 +29835,7 @@ fn bi_find_prev(text: &str, pos: usize, kind: i32) -> Option<usize> {
     let bytes = text.as_bytes();
     match kind {
         BI_WORD => {
-            let mut i = pos;
+            let mut i = java_text_pos_to_byte(text, pos);
             // Move back one step
             if i > 0 {
                 i -= 1;
@@ -29806,14 +29850,17 @@ fn bi_find_prev(text: &str, pos: usize, kind: i32) -> Option<usize> {
                     i -= 1;
                 }
             }
-            Some(i)
+            Some(byte_pos_to_java_text_pos(text, i))
         }
         BI_SENTENCE => {
-            let mut i = if pos > 0 { pos - 1 } else { 0 };
+            let mut i = java_text_pos_to_byte(text, pos);
+            if i > 0 {
+                i -= 1;
+            }
             // Find the previous sentence-ending punctuation
             while i > 0 {
                 if bytes[i - 1] == b'.' || bytes[i - 1] == b'!' || bytes[i - 1] == b'?' {
-                    return Some(i);
+                    return Some(byte_pos_to_java_text_pos(text, i));
                 }
                 i -= 1;
             }
@@ -29831,16 +29878,98 @@ fn bi_find_prev(text: &str, pos: usize, kind: i32) -> Option<usize> {
             Some(i)
         }
         BI_LINE => {
-            let mut i = if pos > 0 { pos - 1 } else { 0 };
+            let mut i = java_text_pos_to_byte(text, pos);
             while i > 0 {
-                if bytes[i].is_ascii_whitespace() || bytes[i] == b'-' {
-                    return Some(i + 1);
+                let idx = i - 1;
+                if bytes[idx].is_ascii_whitespace() {
+                    let mut start = idx;
+                    while start > 0 && bytes[start - 1].is_ascii_whitespace() {
+                        start -= 1;
+                    }
+                    let boundary = byte_pos_to_java_text_pos(text, idx + 1);
+                    if boundary < pos {
+                        return Some(boundary);
+                    }
+                    i = start;
+                    continue;
+                }
+                if bytes[idx] == b'-' {
+                    let mut start = idx;
+                    while start > 0 && bytes[start - 1] == b'-' {
+                        start -= 1;
+                    }
+                    let boundary = byte_pos_to_java_text_pos(text, idx + 1);
+                    if boundary < pos {
+                        return Some(boundary);
+                    }
+                    i = start;
+                    continue;
                 }
                 i -= 1;
             }
             Some(0)
         }
         _ => Some(0),
+    }
+}
+
+#[cfg(test)]
+mod break_iterator_line_boundary_tests {
+    use super::*;
+
+    const HELP_TEXT: &str =
+        "specified, --user is used, and the env variable KC_CLI_PASSWORD is not defined";
+    const PICOCLI_BREAK_TEXT: &str =
+        "specified, \u{00ff}\u{00ff}user is used, and the env variable KC_CLI_PASSWORD is not defined";
+
+    fn collect_line_boundaries(text: &str) -> Vec<usize> {
+        let text_len = java_text_len(text);
+        let mut pos = 0;
+        let mut out = Vec::new();
+        while let Some(next) = bi_find_next(text, pos, BI_LINE) {
+            assert!(next > pos, "line boundary did not advance from {pos}");
+            out.push(next);
+            if next == text_len {
+                break;
+            }
+            pos = next;
+        }
+        out
+    }
+
+    #[test]
+    fn line_next_boundaries_match_hotspot_for_cli_help_text() {
+        assert_eq!(
+            collect_line_boundaries(HELP_TEXT),
+            vec![11, 13, 18, 21, 27, 31, 35, 39, 48, 64, 67, 71, 78]
+        );
+    }
+
+    #[test]
+    fn line_boundaries_do_not_split_env_var_after_whitespace() {
+        assert_eq!(bi_find_next(HELP_TEXT, 47, BI_LINE), Some(48));
+        assert_eq!(bi_find_next(HELP_TEXT, 48, BI_LINE), Some(64));
+        assert_eq!(bi_find_prev(HELP_TEXT, 48, BI_LINE), Some(39));
+        assert_eq!(bi_find_prev(HELP_TEXT, 49, BI_LINE), Some(48));
+    }
+
+    #[test]
+    fn line_boundaries_treat_hyphen_runs_as_one_separator() {
+        assert_eq!(bi_find_next(HELP_TEXT, 11, BI_LINE), Some(13));
+        assert_eq!(bi_find_prev(HELP_TEXT, 13, BI_LINE), Some(11));
+        assert_eq!(bi_find_prev(HELP_TEXT, 14, BI_LINE), Some(13));
+    }
+
+    #[test]
+    fn line_boundaries_return_java_offsets_for_non_ascii_replacement_text() {
+        assert_eq!(
+            collect_line_boundaries(PICOCLI_BREAK_TEXT),
+            vec![11, 18, 21, 27, 31, 35, 39, 48, 64, 67, 71, 78]
+        );
+        assert_eq!(bi_find_next(PICOCLI_BREAK_TEXT, 39, BI_LINE), Some(48));
+        assert_eq!(bi_find_next(PICOCLI_BREAK_TEXT, 48, BI_LINE), Some(64));
+        assert_eq!(bi_find_prev(PICOCLI_BREAK_TEXT, 48, BI_LINE), Some(39));
+        assert_eq!(bi_find_prev(PICOCLI_BREAK_TEXT, 49, BI_LINE), Some(48));
     }
 }
 
