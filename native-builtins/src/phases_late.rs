@@ -6,7 +6,9 @@
 use std::sync::atomic::{fence, Ordering};
 
 use cratonvm_native_api::{NativeContext, NativeMethodRegistry};
-use cratonvm_types::error::{MethodCallFailed, MethodCallResult, RuntimeError};
+use cratonvm_types::error::{
+    LinkageError, MethodCallFailed, MethodCallResult, RuntimeError, VmError,
+};
 use cratonvm_types::ClassId;
 use cratonvm_types::{ObjectRef, Value};
 
@@ -30115,6 +30117,45 @@ fn p98_walk_file_tree(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
     Ok(Some(path_val))
 }
 
+fn p98_is_missing_visitor_method(
+    err: &MethodCallFailed,
+    method_name: &str,
+    descriptor: &str,
+) -> bool {
+    matches!(
+        err,
+        MethodCallFailed::InternalError(VmError::Linkage(LinkageError::NoSuchMethodError {
+            method_name: missing_name,
+            method_descriptor,
+            ..
+        })) if missing_name == method_name && method_descriptor == descriptor
+    )
+}
+
+fn p98_invoke_file_visitor(
+    ctx: &mut dyn NativeContext,
+    visitor: ObjectRef,
+    method_name: &str,
+    concrete_descriptor: &str,
+    erased_descriptor: &str,
+    path_obj: ObjectRef,
+    second_arg: Value,
+) -> Result<Option<ObjectRef>, MethodCallFailed> {
+    let args = [Value::Object(Some(path_obj)), second_arg];
+    let result = ctx.invoke_virtual(visitor, method_name, concrete_descriptor, &args);
+    let value = match result {
+        Ok(value) => value,
+        Err(err) if p98_is_missing_visitor_method(&err, method_name, concrete_descriptor) => {
+            ctx.invoke_virtual(visitor, method_name, erased_descriptor, &args)?
+        }
+        Err(err) => return Err(err),
+    };
+    Ok(match value {
+        Some(Value::Object(Some(result))) => Some(result),
+        _ => None,
+    })
+}
+
 fn p98_walk_dir(
     ctx: &mut dyn NativeContext,
     dir: &str,
@@ -30123,10 +30164,16 @@ fn p98_walk_dir(
 ) -> Result<bool, MethodCallFailed> {
     let attrs = alloc_concurrent_synthetic(ctx, "java/nio/file/attribute/BasicFileAttributes", 0);
     // preVisitDirectory
-    let pre = ctx.invoke_virtual(visitor, "preVisitDirectory",
+    let pre = p98_invoke_file_visitor(
+        ctx,
+        visitor,
+        "preVisitDirectory",
+        "(Ljava/nio/file/Path;Ljava/nio/file/attribute/BasicFileAttributes;)Ljava/nio/file/FileVisitResult;",
         "(Ljava/lang/Object;Ljava/nio/file/attribute/BasicFileAttributes;)Ljava/nio/file/FileVisitResult;",
-        &[Value::Object(Some(dir_path_obj)), Value::Object(Some(attrs))])?;
-    if let Some(Value::Object(Some(r))) = pre {
+        dir_path_obj,
+        Value::Object(Some(attrs)),
+    )?;
+    if let Some(r) = pre {
         let ord = ctx.get_field(r, 1).as_int().unwrap_or(0);
         if ord == 1 {
             return Ok(false);
@@ -30155,10 +30202,16 @@ fn p98_walk_dir(
                     "java/nio/file/attribute/BasicFileAttributes",
                     0,
                 );
-                let vr = ctx.invoke_virtual(visitor, "visitFile",
+                let vr = p98_invoke_file_visitor(
+                    ctx,
+                    visitor,
+                    "visitFile",
+                    "(Ljava/nio/file/Path;Ljava/nio/file/attribute/BasicFileAttributes;)Ljava/nio/file/FileVisitResult;",
                     "(Ljava/lang/Object;Ljava/nio/file/attribute/BasicFileAttributes;)Ljava/nio/file/FileVisitResult;",
-                    &[Value::Object(Some(epo)), Value::Object(Some(fa))])?;
-                if let Some(Value::Object(Some(r))) = vr {
+                    epo,
+                    Value::Object(Some(fa)),
+                )?;
+                if let Some(r) = vr {
                     if ctx.get_field(r, 1).as_int().unwrap_or(0) == 1 {
                         return Ok(false);
                     }
@@ -30182,10 +30235,16 @@ fn p98_walk_dir(
                     "java/nio/file/attribute/BasicFileAttributes",
                     0,
                 );
-                let vr = ctx.invoke_virtual(visitor, "visitFile",
+                let vr = p98_invoke_file_visitor(
+                    ctx,
+                    visitor,
+                    "visitFile",
+                    "(Ljava/nio/file/Path;Ljava/nio/file/attribute/BasicFileAttributes;)Ljava/nio/file/FileVisitResult;",
                     "(Ljava/lang/Object;Ljava/nio/file/attribute/BasicFileAttributes;)Ljava/nio/file/FileVisitResult;",
-                    &[Value::Object(Some(epo)), Value::Object(Some(fa))])?;
-                if let Some(Value::Object(Some(r))) = vr {
+                    epo,
+                    Value::Object(Some(fa)),
+                )?;
+                if let Some(r) = vr {
                     if ctx.get_field(r, 1).as_int().unwrap_or(0) == 1 {
                         return Ok(false);
                     }
@@ -30209,10 +30268,16 @@ fn p98_walk_dir(
                     "java/nio/file/attribute/BasicFileAttributes",
                     0,
                 );
-                let vr = ctx.invoke_virtual(visitor, "visitFile",
+                let vr = p98_invoke_file_visitor(
+                    ctx,
+                    visitor,
+                    "visitFile",
+                    "(Ljava/nio/file/Path;Ljava/nio/file/attribute/BasicFileAttributes;)Ljava/nio/file/FileVisitResult;",
                     "(Ljava/lang/Object;Ljava/nio/file/attribute/BasicFileAttributes;)Ljava/nio/file/FileVisitResult;",
-                    &[Value::Object(Some(epo)), Value::Object(Some(fa))])?;
-                if let Some(Value::Object(Some(r))) = vr {
+                    epo,
+                    Value::Object(Some(fa)),
+                )?;
+                if let Some(r) = vr {
                     if ctx.get_field(r, 1).as_int().unwrap_or(0) == 1 {
                         return Ok(false);
                     }
@@ -30220,13 +30285,16 @@ fn p98_walk_dir(
             }
         }
     }
-    let post = ctx.invoke_virtual(
+    let post = p98_invoke_file_visitor(
+        ctx,
         visitor,
         "postVisitDirectory",
+        "(Ljava/nio/file/Path;Ljava/io/IOException;)Ljava/nio/file/FileVisitResult;",
         "(Ljava/lang/Object;Ljava/io/IOException;)Ljava/nio/file/FileVisitResult;",
-        &[Value::Object(Some(dir_path_obj)), Value::Object(None)],
+        dir_path_obj,
+        Value::Object(None),
     )?;
-    if let Some(Value::Object(Some(r))) = post {
+    if let Some(r) = post {
         if ctx.get_field(r, 1).as_int().unwrap_or(0) == 1 {
             return Ok(false);
         }

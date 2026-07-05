@@ -2,7 +2,7 @@
 
 Status: open
 
-Date observed: 2026-07-02. Re-verified still open: 2026-07-04.
+Date observed: 2026-07-02. Re-verified still open: 2026-07-05.
 
 2026-07-05 update: the focused postings correctness failures uncovered during
 this retry were fixed separately from the class-level timeout. The retry added
@@ -17,11 +17,26 @@ MMap endian/random-access and BufferedChecksumIndexInput side-effect/footer prob
 ```
 
 The broader issue remains open. A full
-`ES85BloomFilterPostingsFormatTests` class run still hits the 300-second
-timeout, and `testRandom` also reproduces a separate
-`java.nio.file.FileAlreadyExistsException` even with `CRATONVM_DISABLE_JIT=1`.
-That means the historical class-level suite timeout is not closed by the
-focused correctness fixes.
+`ES85BloomFilterPostingsFormatTests` class run still hits the timeout.
+
+2026-07-05 follow-up: the separate no-JIT
+`ES85BloomFilterPostingsFormatTests.testRandom`
+`java.nio.file.FileAlreadyExistsException` was fixed by correcting
+`Files.walkFileTree` visitor dispatch to prefer concrete `Path` overrides
+before falling back to erased `Object` visitor methods. Validation against
+`/data/cratonvm/cratonvm-es85-fileexists-20260705-walktree`:
+
+```text
+CRATONVM_DISABLE_JIT=1 ES85BloomFilterPostingsFormatTests.testRandom: OK (83.677s)
+log: /data/tmp/es85-testRandom-nojit-walktree-20260705.log
+```
+
+The full class remains unresolved after the requested longer retry:
+
+```text
+ES85BloomFilterPostingsFormatTests full class: TIMEOUT (timeout 600s, RC=124)
+log: /data/tmp/es85-full-600-walktree-20260705.log
+```
 
 ## Summary
 
