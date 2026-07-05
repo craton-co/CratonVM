@@ -2,7 +2,7 @@
 
 | | |
 |---|---|
-| **Status** | 🟠 PATCHED LOCALLY — root cause identified; exact Hibernate rerun still pending because this checkout has no Hibernate runner. |
+| **Status** | 🟠 PATCHED LOCALLY / OPEN RESIDUAL — root cause identified; local Hibernate runner probe no longer reproduces `java/lang/Object.read()I`, but the class still fails later with a no-JIT-independent GC array-kind assertion. |
 | **Area** | VM — virtual/interface method dispatch for `InputStream.read()` on a JDBC `Blob`'s binary stream |
 | **Symptom** | `java.lang.NoSuchMethodError: java/lang/Object.read()I` |
 | **Severity** | medium — single class, but the failure mode (dispatch landing on `Object`'s non-existent method) suggests a general vtable/interface-dispatch defect that could recur elsewhere. |
@@ -92,9 +92,28 @@ CARGO_TARGET_DIR=target\codex-hib-jpalargeblob-20260705-001 \
 Unique binary built for external suite rerun:
 `target\codex-hib-jpalargeblob-20260705-001\debug\cratonvm-hib-jpalargeblob-read-20260705-001.exe`.
 
-The exact Hibernate repro was not rerun locally: this checkout contains no
-`apps/hibernate-orm`, no `apps/hib-suite-runner`, and no `/home/victor/hibpkg`
-runner mirror.
+Focused local runner probe on this box (2026-07-05), using
+`apps/hib-suite-runner` and a one-line class list:
+
+```
+CRATONVM_DISABLE_DEFAULT_WATCHDOG=1 CRATONVM_JIT_OSR=1 \
+  target\codex-hib-jpalargeblob-20260705-001\debug\cratonvm-hib-jpalargeblob-read-20260705-001.exe \
+  --java-home "C:/Program Files/Java/jdk-25" --Xmx 1500m \
+  @common.args CratonRunner codex-jpalargeblob-oneclass-20260705.txt 0
+```
+
+Result: the original `java/lang/Object.read()I` failure did not reproduce. The
+run reached H2's BLOB read path and then failed later in native/GC code:
+
+```
+Native method panic caught: assertion `left == right` failed
+  left: Object
+ right: Array
+(native invoked from org/h2/util/IOUtils.readFully(Ljava/io/InputStream;[BI)I)
+```
+
+The same one-class probe with `--nojit` failed with the same assertion, so the
+remaining class failure is not the JIT virtual-dispatch bug fixed here.
 
 ## Repro
 
@@ -107,10 +126,11 @@ CRATONVM_DISABLE_DEFAULT_WATCHDOG=1 CRATONVM_JIT_OSR=1 \
 
 ## Remaining validation
 
-- Re-run the exact Azure/Linux Hibernate repro with the unique binary above.
-  Expected result: `JpaLargeBlobTest` should no longer report
-  `java/lang/Object.read()I`.
-- If a failure remains, collect `CRATONVM_DBG_MIC_PROF=1`,
-  `CRATONVM_DBG_NSME=1`, and a focused stack trace around the failing
-  `InputStream.read()` call site; that would indicate a deeper live-receiver
-  corruption after the dispatch-class and cache-sentinel bugs have been fixed.
+- Re-run the exact Azure/Linux Hibernate repro with the unique binary above to
+  confirm the local Windows result on the original host. Expected result for
+  this specific bug: no `java/lang/Object.read()I`.
+- Track the new residual separately if it persists on release/optimized builds:
+  `GenHeap::set_array_element` receives an object where an array is required
+  while H2 is executing `IOUtils.readFully(InputStream, byte[], int)`. Because
+  the same assertion appears with `--nojit`, start from native/GC array-write
+  handling rather than JIT interface dispatch.
