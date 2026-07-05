@@ -210,6 +210,22 @@ fn mock_parameter_field_slot(name: &str) -> Option<usize> {
     }
 }
 
+fn mock_classloader_field_slot(class_name: Option<&str>, name: &str) -> Option<usize> {
+    match (class_name, name) {
+        (
+            Some(
+                "java/lang/ClassLoader"
+                | "java/net/URLClassLoader"
+                | "io/quarkus/bootstrap/classloading/QuarkusClassLoader",
+            ),
+            "ucp",
+        ) => Some(0),
+        (Some("jdk/internal/loader/URLClassPath" | "sun/misc/URLClassPath"), "path") => Some(0),
+        (Some("java/net/URL"), "path") => Some(0),
+        _ => None,
+    }
+}
+
 pub(crate) type InvokeVirtualHook =
     fn(&mut MockNativeContext, ObjectRef, &str, &str, &[Value]) -> Option<MethodCallResult>;
 
@@ -251,6 +267,9 @@ pub(crate) struct MockNativeContext {
     /// `getEnumConstantsShared` native test to verify the non-null
     /// array is returned with the right number of elements.
     pub(crate) enum_values_override: UnsafeCell<HashMap<u32, ObjectRef>>,
+    /// Generic static-field backing store for tests that exercise
+    /// reflection/Unsafe paths without a full VM static block.
+    pub(crate) static_fields_override: UnsafeCell<HashMap<(u32, usize), Value>>,
     /// T19.N2: settable interrupt flag for the mock current thread.
     /// Exposed via `set_interrupted` helpers so tests (notably
     /// `Thread.sleep0` interrupt-handling) can simulate an interrupt
@@ -392,6 +411,7 @@ impl MockNativeContext {
             last_defined_class_name: UnsafeCell::new(None),
             class_flags_override: UnsafeCell::new(HashMap::new()),
             enum_values_override: UnsafeCell::new(HashMap::new()),
+            static_fields_override: UnsafeCell::new(HashMap::new()),
             interrupted_flag: UnsafeCell::new(false),
             code_base_override: UnsafeCell::new(HashMap::new()),
             code_source_certs_override: UnsafeCell::new(HashMap::new()),
@@ -766,6 +786,13 @@ impl NativeContext for MockNativeContext {
         }
     }
 
+    fn class_id_from_mirror(&self, mirror: ObjectRef) -> Option<ClassId> {
+        match self.get_field(mirror, 0) {
+            Value::Int(raw) if raw >= 0 => Some(ClassId::new(raw as u32)),
+            _ => None,
+        }
+    }
+
     fn capture_stack_trace(&mut self, _throwable_hash: i32) -> Vec<StackTraceEntry> {
         Vec::new()
     }
@@ -803,14 +830,12 @@ impl NativeContext for MockNativeContext {
         // path still reads the right value. Unknown names are treated as
         // absent (returning `Int(0)` rather than silently shadowing slot
         // 0, which would corrupt slot-0 test state).
-        let slot = if self
-            .class_name_of_id(self.class_id_of_object(obj))
-            .as_deref()
-            == Some("java/lang/reflect/Parameter")
-        {
+        let class_name = self.class_name_of_id(self.class_id_of_object(obj));
+        let slot = if class_name.as_deref() == Some("java/lang/reflect/Parameter") {
             mock_parameter_field_slot(field_name).or_else(|| mock_jdk_field_slot(field_name))
         } else {
-            mock_jdk_field_slot(field_name)
+            mock_classloader_field_slot(class_name.as_deref(), field_name)
+                .or_else(|| mock_jdk_field_slot(field_name))
         };
         match slot {
             Some(slot) => self.get_field(obj, slot),
@@ -819,14 +844,12 @@ impl NativeContext for MockNativeContext {
     }
 
     fn set_field_by_name(&self, obj: ObjectRef, field_name: &str, value: Value) {
-        let slot = if self
-            .class_name_of_id(self.class_id_of_object(obj))
-            .as_deref()
-            == Some("java/lang/reflect/Parameter")
-        {
+        let class_name = self.class_name_of_id(self.class_id_of_object(obj));
+        let slot = if class_name.as_deref() == Some("java/lang/reflect/Parameter") {
             mock_parameter_field_slot(field_name).or_else(|| mock_jdk_field_slot(field_name))
         } else {
-            mock_jdk_field_slot(field_name)
+            mock_classloader_field_slot(class_name.as_deref(), field_name)
+                .or_else(|| mock_jdk_field_slot(field_name))
         };
         if let Some(slot) = slot {
             self.set_field(obj, slot, value);
@@ -1260,7 +1283,16 @@ impl NativeContext for MockNativeContext {
     }
 
     fn static_field_index_by_name(&self, class_id: ClassId, field_name: &str) -> Option<usize> {
-        // C14: only `$VALUES` is tracked in the mock, at synthetic slot 0.
+        let fields = unsafe { &*self.declared_fields_override.get() };
+        if let Some(slot) = fields.get(&class_id.as_u32()).and_then(|fields| {
+            fields
+                .iter()
+                .find(|f| f.is_static && f.name == field_name)
+                .map(|f| f.slot_index)
+        }) {
+            return Some(slot);
+        }
+
         let overrides = unsafe { &*self.enum_values_override.get() };
         if field_name == "$VALUES" && overrides.contains_key(&class_id.as_u32()) {
             Some(0)
@@ -1270,6 +1302,11 @@ impl NativeContext for MockNativeContext {
     }
 
     fn get_static_field(&self, class_id: ClassId, field_index: usize) -> Value {
+        let statics = unsafe { &*self.static_fields_override.get() };
+        if let Some(value) = statics.get(&(class_id.as_u32(), field_index)) {
+            return *value;
+        }
+
         let overrides = unsafe { &*self.enum_values_override.get() };
         if field_index == 0 {
             if let Some(&arr) = overrides.get(&class_id.as_u32()) {
@@ -1279,7 +1316,10 @@ impl NativeContext for MockNativeContext {
         Value::Int(0)
     }
 
-    fn set_static_field(&mut self, _class_id: ClassId, _field_index: usize, _value: Value) {}
+    fn set_static_field(&mut self, class_id: ClassId, field_index: usize, value: Value) {
+        let statics = unsafe { &mut *self.static_fields_override.get() };
+        statics.insert((class_id.as_u32(), field_index), value);
+    }
 
     fn primitive_class_mirror(&mut self, name: &str) -> ObjectRef {
         let name_obj = self.create_string(name);

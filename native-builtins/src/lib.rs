@@ -68,8 +68,9 @@ pub(crate) fn native_unsafe_ensure_class_initialized(
         return Ok(None);
     }
     match class_name.as_str() {
-        "boolean" | "byte" | "char" | "short" | "int" | "long" | "float" | "double"
-        | "void" => return Ok(None),
+        "boolean" | "byte" | "char" | "short" | "int" | "long" | "float" | "double" | "void" => {
+            return Ok(None)
+        }
         _ => {}
     }
     ctx.ensure_class_initialized(&class_name)?;
@@ -15997,7 +15998,7 @@ pub fn register_essential_natives(registry: &mut NativeMethodRegistry) {
         u2,
         "staticFieldOffset0",
         "(Ljava/lang/reflect/Field;)J",
-        native_unsafe_object_field_offset,
+        native_unsafe_static_field_offset,
     );
     registry.register(
         u2,
@@ -26030,7 +26031,7 @@ fn register_unsafe_natives(r: &mut NativeMethodRegistry) {
         u,
         "staticFieldOffset",
         "(Ljava/lang/reflect/Field;)J",
-        native_unsafe_object_field_offset,
+        native_unsafe_static_field_offset,
     );
     r.register(
         u,
@@ -26370,7 +26371,7 @@ fn register_unsafe_natives(r: &mut NativeMethodRegistry) {
         u2,
         "staticFieldOffset",
         "(Ljava/lang/reflect/Field;)J",
-        native_unsafe_object_field_offset,
+        native_unsafe_static_field_offset,
     );
     r.register(
         u2,
@@ -26827,8 +26828,18 @@ fn register_unsafe_natives(r: &mut NativeMethodRegistry) {
     r.register(cds_cls, "isDumpingClassList0", "()Z", native_return_false);
     r.register(cds_cls, "isDumpingArchive0", "()Z", native_return_false);
     r.register(cds_cls, "isSharingEnabled0", "()Z", native_return_false);
-    r.register(cds_cls, "logLambdaFormInvoker", "(Ljava/lang/String;)V", native_noop);
-    r.register(cds_cls, "initializeFromArchive", "(Ljava/lang/Class;)V", native_noop);
+    r.register(
+        cds_cls,
+        "logLambdaFormInvoker",
+        "(Ljava/lang/String;)V",
+        native_noop,
+    );
+    r.register(
+        cds_cls,
+        "initializeFromArchive",
+        "(Ljava/lang/Class;)V",
+        native_noop,
+    );
     r.register(
         cds_cls,
         "defineArchivedModules",
@@ -26838,8 +26849,18 @@ fn register_unsafe_natives(r: &mut NativeMethodRegistry) {
     r.register(cds_cls, "getRandomSeedForDumping", "()J", |_ctx, _args| {
         Ok(Some(Value::Long(0)))
     });
-    r.register(cds_cls, "dumpClassList", "(Ljava/lang/String;)V", native_noop);
-    r.register(cds_cls, "dumpDynamicArchive", "(Ljava/lang/String;)V", native_noop);
+    r.register(
+        cds_cls,
+        "dumpClassList",
+        "(Ljava/lang/String;)V",
+        native_noop,
+    );
+    r.register(
+        cds_cls,
+        "dumpDynamicArchive",
+        "(Ljava/lang/String;)V",
+        native_noop,
+    );
 
     r.register(u, "defineClass", "(Ljava/lang/String;[BIILjava/lang/ClassLoader;Ljava/security/ProtectionDomain;)Ljava/lang/Class;", |_ctx, _args| Ok(Some(Value::Object(None))));
     r.register(u2, "defineClass0", "(Ljava/lang/String;[BIILjava/lang/ClassLoader;Ljava/security/ProtectionDomain;)Ljava/lang/Class;", |_ctx, _args| Ok(Some(Value::Object(None))));
@@ -27243,6 +27264,59 @@ fn synthetic_offset_for(class_name: &str, field_name: &str) -> usize {
     off
 }
 
+#[derive(Clone, Copy)]
+struct UnsafeStaticFieldTarget {
+    class_id: u32,
+    field_index: usize,
+}
+
+fn unsafe_static_field_targets() -> &'static UnsafeShardedMap<usize, UnsafeStaticFieldTarget> {
+    static T: std::sync::OnceLock<UnsafeShardedMap<usize, UnsafeStaticFieldTarget>> =
+        std::sync::OnceLock::new();
+    T.get_or_init(new_unsafe_sharded_map)
+}
+
+fn remember_unsafe_static_field_offset(offset: usize, class_id: ClassId, field_index: usize) {
+    lock_unsafe_shard_usize(unsafe_static_field_targets(), offset).insert(
+        offset,
+        UnsafeStaticFieldTarget {
+            class_id: class_id.as_u32(),
+            field_index,
+        },
+    );
+}
+
+fn unsafe_static_field_target(offset: usize) -> Option<(ClassId, usize)> {
+    let target = lock_unsafe_shard_usize(unsafe_static_field_targets(), offset)
+        .get(&offset)
+        .copied()?;
+    Some((ClassId::new(target.class_id), target.field_index))
+}
+
+fn unsafe_static_field_target_for_base(
+    ctx: &dyn NativeContext,
+    obj: ObjectRef,
+    offset: usize,
+) -> Option<(ClassId, usize)> {
+    let (class_id, field_index) = unsafe_static_field_target(offset)?;
+    if ctx.class_id_from_mirror(obj) == Some(class_id) {
+        return Some((class_id, field_index));
+    }
+    let obj_class = ctx.class_id_of_object(obj);
+    let is_class_mirror = ctx
+        .class_name_of_id(obj_class)
+        .map(|name| name == "java/lang/Class")
+        .unwrap_or(false);
+    if is_class_mirror {
+        if let Value::Int(raw) = ctx.get_field(obj, 0) {
+            if raw >= 0 && ClassId::new(raw as u32) == class_id {
+                return Some((class_id, field_index));
+            }
+        }
+    }
+    None
+}
+
 /// Per-object side store for fields stored at a synthetic offset.  Keyed
 /// by `(identity_hash, offset)` so each receiver has its own slot and
 /// CAS sees a consistent value across the load and the compare-and-store.
@@ -27271,6 +27345,9 @@ pub(crate) fn synthetic_get(
     obj: cratonvm_types::ObjectRef,
     offset: usize,
 ) -> Value {
+    if let Some((class_id, field_index)) = unsafe_static_field_target_for_base(ctx, obj, offset) {
+        return ctx.get_static_field(class_id, field_index);
+    }
     // Round-9 Bug 7: identity hash is GC-stable; raw pointer is not.
     let id = ctx.identity_hash_code(obj);
     let map = synthetic_field_store().lock();
@@ -27285,9 +27362,24 @@ pub(crate) fn synthetic_put(
     offset: usize,
     val: Value,
 ) {
+    if let Some((class_id, field_index)) = unsafe_static_field_target_for_base(ctx, obj, offset) {
+        ctx.set_static_field(class_id, field_index, val);
+        return;
+    }
     let id = ctx.identity_hash_code(obj);
     let mut map = synthetic_field_store().lock();
     map.insert((id, offset), val);
+}
+
+fn unsafe_cas_values_equal(cur: Value, expected: Value) -> bool {
+    match (cur, expected) {
+        (Value::Object(a), Value::Object(b)) => a == b,
+        (Value::Object(None), Value::Int(0)) | (Value::Int(0), Value::Object(None)) => true,
+        (Value::Object(None), Value::Long(0)) | (Value::Long(0), Value::Object(None)) => true,
+        (Value::Int(a), Value::Int(b)) => a == b,
+        (Value::Long(a), Value::Long(b)) => a == b,
+        _ => false,
+    }
 }
 
 /// CAS on the synthetic per-object slot.  Returns true on success.  The
@@ -27300,20 +27392,21 @@ pub(crate) fn synthetic_cas(
     expected: Value,
     new_val: Value,
 ) -> bool {
+    if let Some((class_id, field_index)) = unsafe_static_field_target_for_base(ctx, obj, offset) {
+        let cur = ctx.get_static_field(class_id, field_index);
+        let ok = unsafe_cas_values_equal(cur, expected);
+        if ok {
+            ctx.set_static_field(class_id, field_index, new_val);
+        }
+        return ok;
+    }
     let id = ctx.identity_hash_code(obj);
     let mut map = synthetic_field_store().lock();
     let cur = map
         .get(&(id, offset))
         .copied()
         .unwrap_or(Value::Object(None));
-    let eq = match (cur, expected) {
-        (Value::Object(a), Value::Object(b)) => a == b,
-        (Value::Object(None), Value::Int(0)) | (Value::Int(0), Value::Object(None)) => true,
-        (Value::Object(None), Value::Long(0)) | (Value::Long(0), Value::Object(None)) => true,
-        (Value::Int(a), Value::Int(b)) => a == b,
-        (Value::Long(a), Value::Long(b)) => a == b,
-        _ => false,
-    };
+    let eq = unsafe_cas_values_equal(cur, expected);
     if eq {
         map.insert((id, offset), new_val);
     }
@@ -27754,6 +27847,31 @@ fn native_unsafe_object_field_offset(
         return Ok(Some(Value::Long(effective_slot as i64)));
     }
     Ok(Some(Value::Long(0)))
+}
+
+fn native_unsafe_static_field_offset(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    let Some(Value::Object(Some(field_obj))) = args.get(1) else {
+        return Ok(Some(Value::Long(0)));
+    };
+    let (is_static, meta_class_id, meta_slot, _desc) =
+        crate::lang_class::read_field_meta(ctx, *field_obj);
+    if !is_static {
+        return native_unsafe_object_field_offset(ctx, args);
+    }
+
+    let (class_id, field_name) = crate::lang_class::field_class_and_name(ctx, *field_obj)
+        .unwrap_or_else(|| (meta_class_id, format!("slot#{meta_slot}")));
+    let field_index = ctx
+        .static_field_index_by_name(class_id, &field_name)
+        .unwrap_or(meta_slot);
+    let class_name = ctx.class_name_of_id(class_id).unwrap_or_default();
+    let synthetic_key = format!("static:{field_name}");
+    let offset = synthetic_offset_for(&class_name, &synthetic_key);
+    remember_unsafe_static_field_offset(offset, class_id, field_index);
+    Ok(Some(Value::Long(offset as i64)))
 }
 
 // Sentinel offset (chosen in the usize-sparse high range to not collide
@@ -28563,6 +28681,12 @@ pub(crate) fn native_unsafe_get_int(
             return Ok(Some(Value::Int(map.get(&offset).copied().unwrap_or(0))));
         }
     };
+    if is_synthetic_offset(offset) {
+        return Ok(Some(match synthetic_get(ctx, obj, offset) {
+            Value::Int(v) => Value::Int(v),
+            _ => Value::Int(0),
+        }));
+    }
     if ctx.heap_kind_of(obj) == cratonvm_types::ObjectKind::Array {
         match unsafe_checked_array_index(ctx, obj, offset) {
             Some(idx) => Ok(Some(ctx.get_array_element(obj, idx))),
@@ -28587,6 +28711,10 @@ pub(crate) fn native_unsafe_put_int(
             return Ok(None);
         }
     };
+    if is_synthetic_offset(offset) {
+        synthetic_put(ctx, obj, offset, val);
+        return Ok(None);
+    }
     if ctx.heap_kind_of(obj) == cratonvm_types::ObjectKind::Array {
         if let Some(idx) = unsafe_checked_array_index(ctx, obj, offset) {
             ctx.set_array_element(obj, idx, val);
@@ -28718,6 +28846,13 @@ pub(crate) fn native_unsafe_get_long(
             return Ok(Some(Value::Long(map.get(&offset).copied().unwrap_or(0))));
         }
     };
+    if is_synthetic_offset(offset) {
+        return Ok(Some(match synthetic_get(ctx, obj, offset) {
+            Value::Long(v) => Value::Long(v),
+            Value::Int(v) => Value::Long(v as i64),
+            _ => Value::Long(0),
+        }));
+    }
     let v = if ctx.heap_kind_of(obj) == cratonvm_types::ObjectKind::Array {
         match unsafe_checked_array_index(ctx, obj, offset) {
             Some(idx) => ctx.get_array_element(obj, idx),
@@ -28749,6 +28884,10 @@ pub(crate) fn native_unsafe_put_long(
             return Ok(None);
         }
     };
+    if is_synthetic_offset(offset) {
+        synthetic_put(ctx, obj, offset, val);
+        return Ok(None);
+    }
     if ctx.heap_kind_of(obj) == cratonvm_types::ObjectKind::Array {
         if let Some(idx) = unsafe_checked_array_index(ctx, obj, offset) {
             ctx.set_array_element(obj, idx, val);
@@ -28863,6 +29002,23 @@ pub(crate) fn native_unsafe_get_and_add_int(
             return Ok(Some(Value::Int(old)));
         }
     };
+    if is_synthetic_offset(offset) {
+        for attempt in 0.. {
+            let current = synthetic_get(ctx, obj, offset);
+            if let Value::Int(old) = current {
+                let new_val = Value::Int(old.wrapping_add(delta));
+                if synthetic_cas(ctx, obj, offset, current, new_val) {
+                    return Ok(Some(Value::Int(old)));
+                }
+            } else {
+                return Ok(Some(Value::Int(0)));
+            }
+            if attempt > 0 && attempt % CAS_MAX_RETRIES == 0 {
+                std::thread::yield_now();
+            }
+        }
+        unreachable!();
+    }
     if ctx.heap_kind_of(obj) == cratonvm_types::ObjectKind::Array {
         // OOB offset => return 0 without touching the heap.
         let idx = match unsafe_checked_array_index(ctx, obj, offset) {
@@ -28907,6 +29063,11 @@ fn native_unsafe_get_and_set_int(ctx: &mut dyn NativeContext, args: &[Value]) ->
             return Ok(Some(Value::Int(prev)));
         }
     };
+    if is_synthetic_offset(offset) {
+        let prev = synthetic_get(ctx, obj, offset);
+        synthetic_put(ctx, obj, offset, new_val);
+        return Ok(Some(prev));
+    }
     if ctx.heap_kind_of(obj) == cratonvm_types::ObjectKind::Array {
         // OOB offset => return Int(0) without touching the heap.
         let idx = match unsafe_checked_array_index(ctx, obj, offset) {
@@ -28935,6 +29096,14 @@ fn native_unsafe_get_float(ctx: &mut dyn NativeContext, args: &[Value]) -> Metho
         Some(o) => o,
         None => return Ok(Some(Value::Float(0.0))),
     };
+    if is_synthetic_offset(offset) {
+        let val = synthetic_get(ctx, obj, offset);
+        return Ok(Some(match val {
+            Value::Float(_) => val,
+            Value::Int(bits) => Value::Float(f32::from_bits(bits as u32)),
+            _ => Value::Float(0.0),
+        }));
+    }
     let val = ctx.get_field(obj, offset);
     match val {
         Value::Float(_) => Ok(Some(val)),
@@ -28950,6 +29119,10 @@ fn native_unsafe_put_float(ctx: &mut dyn NativeContext, args: &[Value]) -> Metho
         Some(o) => o,
         None => return Ok(None),
     };
+    if is_synthetic_offset(offset) {
+        synthetic_put(ctx, obj, offset, val);
+        return Ok(None);
+    }
     ctx.set_field(obj, offset, val);
     Ok(None)
 }
@@ -28960,6 +29133,14 @@ fn native_unsafe_get_double(ctx: &mut dyn NativeContext, args: &[Value]) -> Meth
         Some(o) => o,
         None => return Ok(Some(Value::Double(0.0))),
     };
+    if is_synthetic_offset(offset) {
+        let val = synthetic_get(ctx, obj, offset);
+        return Ok(Some(match val {
+            Value::Double(_) => val,
+            Value::Long(bits) => Value::Double(f64::from_bits(bits as u64)),
+            _ => Value::Double(0.0),
+        }));
+    }
     let val = ctx.get_field(obj, offset);
     match val {
         Value::Double(_) => Ok(Some(val)),
@@ -28975,6 +29156,10 @@ fn native_unsafe_put_double(ctx: &mut dyn NativeContext, args: &[Value]) -> Meth
         Some(o) => o,
         None => return Ok(None),
     };
+    if is_synthetic_offset(offset) {
+        synthetic_put(ctx, obj, offset, val);
+        return Ok(None);
+    }
     ctx.set_field(obj, offset, val);
     Ok(None)
 }
@@ -28998,6 +29183,23 @@ fn native_unsafe_get_and_add_long(ctx: &mut dyn NativeContext, args: &[Value]) -
             return Ok(Some(Value::Long(old)));
         }
     };
+    if is_synthetic_offset(offset) {
+        for attempt in 0.. {
+            let current = synthetic_get(ctx, obj, offset);
+            if let Value::Long(old) = current {
+                let new_val = Value::Long(old.wrapping_add(delta));
+                if synthetic_cas(ctx, obj, offset, current, new_val) {
+                    return Ok(Some(Value::Long(old)));
+                }
+            } else {
+                return Ok(Some(Value::Long(0)));
+            }
+            if attempt > 0 && attempt % CAS_MAX_RETRIES == 0 {
+                std::thread::yield_now();
+            }
+        }
+        unreachable!();
+    }
     if ctx.heap_kind_of(obj) == cratonvm_types::ObjectKind::Array {
         // OOB offset => return 0 without touching the heap.
         let idx = match unsafe_checked_array_index(ctx, obj, offset) {
@@ -29040,6 +29242,11 @@ fn native_unsafe_get_and_set_long(ctx: &mut dyn NativeContext, args: &[Value]) -
             return Ok(Some(Value::Long(prev)));
         }
     };
+    if is_synthetic_offset(offset) {
+        let prev = synthetic_get(ctx, obj, offset);
+        synthetic_put(ctx, obj, offset, new_val);
+        return Ok(Some(prev));
+    }
     if ctx.heap_kind_of(obj) == cratonvm_types::ObjectKind::Array {
         // OOB offset => return Long(0) without touching the heap.
         let idx = match unsafe_checked_array_index(ctx, obj, offset) {
@@ -29081,6 +29288,11 @@ fn native_unsafe_get_and_set_object(
             return Ok(Some(Value::Object(prev)));
         }
     };
+    if is_synthetic_offset(offset) {
+        let prev = synthetic_get(ctx, obj, offset);
+        synthetic_put(ctx, obj, offset, new_val);
+        return Ok(Some(prev));
+    }
     if ctx.heap_kind_of(obj) == cratonvm_types::ObjectKind::Array {
         // OOB offset => return null without touching the heap.
         let idx = match unsafe_checked_array_index(ctx, obj, offset) {
@@ -29997,10 +30209,18 @@ fn native_unsafe_compare_and_exchange_int(
         _ => 0,
     };
     if let Some(obj_ref) = obj {
-        let old = ctx.get_field_volatile(obj_ref, offset);
+        let old = if is_synthetic_offset(offset) {
+            synthetic_get(ctx, obj_ref, offset)
+        } else {
+            ctx.get_field_volatile(obj_ref, offset)
+        };
         if let Value::Int(old_val) = old {
             if old_val == expected {
-                ctx.set_field_volatile(obj_ref, offset, Value::Int(update));
+                if is_synthetic_offset(offset) {
+                    synthetic_put(ctx, obj_ref, offset, Value::Int(update));
+                } else {
+                    ctx.set_field_volatile(obj_ref, offset, Value::Int(update));
+                }
             }
             return Ok(Some(Value::Int(old_val)));
         }
@@ -30024,10 +30244,18 @@ fn native_unsafe_compare_and_exchange_long(
         _ => 0,
     };
     if let Some(obj_ref) = obj {
-        let old = ctx.get_field_volatile(obj_ref, offset);
+        let old = if is_synthetic_offset(offset) {
+            synthetic_get(ctx, obj_ref, offset)
+        } else {
+            ctx.get_field_volatile(obj_ref, offset)
+        };
         if let Value::Long(old_val) = old {
             if old_val == expected {
-                ctx.set_field_volatile(obj_ref, offset, Value::Long(update));
+                if is_synthetic_offset(offset) {
+                    synthetic_put(ctx, obj_ref, offset, Value::Long(update));
+                } else {
+                    ctx.set_field_volatile(obj_ref, offset, Value::Long(update));
+                }
             }
             return Ok(Some(Value::Long(old_val)));
         }
@@ -30043,7 +30271,11 @@ fn native_unsafe_compare_and_exchange_reference(
     let obj = unsafe_obj(args, 1);
     let offset = unsafe_offset(args, 2);
     if let Some(obj_ref) = obj {
-        let old = ctx.get_field_volatile(obj_ref, offset);
+        let old = if is_synthetic_offset(offset) {
+            synthetic_get(ctx, obj_ref, offset)
+        } else {
+            ctx.get_field_volatile(obj_ref, offset)
+        };
         // Compare by reference identity
         let expected_ref = match args.get(3) {
             Some(Value::Object(r)) => *r,
@@ -30059,7 +30291,11 @@ fn native_unsafe_compare_and_exchange_reference(
                 Some(v) => v.clone(),
                 None => Value::Object(None),
             };
-            ctx.set_field_volatile(obj_ref, offset, update);
+            if is_synthetic_offset(offset) {
+                synthetic_put(ctx, obj_ref, offset, update);
+            } else {
+                ctx.set_field_volatile(obj_ref, offset, update);
+            }
         }
         return Ok(Some(old));
     }
@@ -55954,6 +56190,76 @@ mod module_can_read_essential_tests {
              essential (real-JDK) native path, not just the \
              synthetic-jdk-only register_p59_module"
         );
+    }
+}
+
+#[cfg(test)]
+mod unsafe_static_field_offset_tests {
+    use super::*;
+    use crate::test_utils::MockNativeContext;
+    use cratonvm_native_api::FieldMetadata;
+
+    #[test]
+    fn static_field_offset_uses_static_storage_not_class_mirror_slots() {
+        let mut ctx = MockNativeContext::new();
+        let class_id = ctx
+            .ensure_class_initialized("sun/misc/Unsafe")
+            .expect("mock class id");
+        let meta = FieldMetadata {
+            name: "memoryAccessWarned".to_string(),
+            descriptor: "Z".to_string(),
+            access_flags: 0x0008,
+            slot_index: 24,
+            declaring_class_id: class_id,
+            is_static: true,
+        };
+        ctx.set_static_field(class_id, 24, Value::Int(0));
+
+        let field = crate::lang_class::create_field_object(&mut ctx, &meta);
+        let offset = match native_unsafe_static_field_offset(
+            &mut ctx,
+            &[Value::Object(None), Value::Object(Some(field))],
+        )
+        .expect("staticFieldOffset")
+        .expect("offset value")
+        {
+            Value::Long(offset) => offset as usize,
+            other => panic!("unexpected offset value: {other:?}"),
+        };
+
+        assert!(is_synthetic_offset(offset));
+        assert_ne!(offset, 24);
+
+        let base = ctx.get_class_mirror(class_id);
+        ctx.set_field(base, 24, Value::Int(77));
+
+        let before = native_unsafe_get_int_volatile(
+            &mut ctx,
+            &[
+                Value::Object(None),
+                Value::Object(Some(base)),
+                Value::Long(offset as i64),
+            ],
+        )
+        .expect("getBooleanVolatile")
+        .expect("read value");
+        assert_eq!(before, Value::Int(0));
+
+        let cas = native_unsafe_cas_int(
+            &mut ctx,
+            &[
+                Value::Object(None),
+                Value::Object(Some(base)),
+                Value::Long(offset as i64),
+                Value::Int(0),
+                Value::Int(1),
+            ],
+        )
+        .expect("compareAndSetBoolean")
+        .expect("cas value");
+        assert_eq!(cas, Value::Int(1));
+        assert_eq!(ctx.get_static_field(class_id, 24), Value::Int(1));
+        assert_eq!(ctx.get_field(base, 24), Value::Int(77));
     }
 }
 

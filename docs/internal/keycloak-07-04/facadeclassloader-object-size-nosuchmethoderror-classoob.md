@@ -1,8 +1,25 @@
 # FacadeClassLoader.<init>: spurious Object.size() NoSuchMethodError + guarded Class-object OOB access
 
-Status: open — confirmed non-fatal (guard-protected), root cause not fully pinned
+Status: fixed - archived
 
 Date observed: 2026-07-04
+
+Date fixed: 2026-07-05
+
+## Resolution
+
+Fixed in CratonVM by splitting `Unsafe.staticFieldOffset` from instance-field
+synthetic offsets and by hardening the custom-handler `ClassLoader` resource
+fallback so it only treats `ucp.path` as a URL list when `ucp` is a real
+`URLClassPath` and `path` is a real `ArrayList`. The remote r7 probe binary
+`cratonvm-keycloak-facade-oob-20260705-r7-ucpguard` removes both tracked
+signatures in JIT-on and no-JIT runs:
+
+- no `NSME_DBG` / `java/lang/Object.size()I`
+- no `OOBFIELD_ASRTAG` / guarded `java/lang/Class` slot 24 access
+
+The class still fails later with `org.hibernate.boot.MappingException: Could
+not locate root element`; that is a separate residual Keycloak/Hibernate issue.
 
 ## Summary
 
