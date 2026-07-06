@@ -13721,7 +13721,17 @@ mod tests {
         // marked/moved by GC and crash. It now coerces to `null`; a real
         // jobject-as-jlong handle must go through
         // `coerce_value_for_return_validated`, which checks heap membership.
+        //
+        // `jlong_bits_as_aligned_object_ptr` only recognizes bits that have
+        // actually crossed the `ObjectRef::from_raw`/`from_raw_nonnull`
+        // provenance boundary (see `types/src/value.rs`) — a bare untouched
+        // constant has no provenance entry and correctly returns `None`. So
+        // register this address first, exactly like the analogous
+        // `jlong_bits_as_aligned_object_ptr_matches_coerce_contract` test in
+        // `types/src/value.rs` does, to exercise the "known, aligned, but
+        // still not heap-validated" case this test is actually about.
         let aligned = 0x4000_0000u64; // != 0 and 8-aligned
+        let _known = unsafe { ObjectRef::from_raw(aligned as *mut u8) };
         assert!(jlong_bits_as_aligned_object_ptr(aligned).is_some());
         assert_eq!(
             coerce_value_for_return(Value::Long(aligned as i64), b'L'),
