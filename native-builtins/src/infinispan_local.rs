@@ -1231,16 +1231,16 @@ fn native_cache_replace(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCa
 }
 
 // ConfigurationBuilder.build() — return the builder as a Configuration.
+//
+// This identity wrapper is intentionally KEPT (unlike
+// `GlobalConfigurationBuilder.build()` below): `native_dcm_define_configuration`
+// reads `CONFIG_FIELD_SIZE_LIMIT`/`CONFIG_FIELD_TTL_MS` off the `Configuration`
+// object by raw synthetic-layout slot index. If real `ConfigurationBuilder`
+// bytecode ran instead, it would return a genuine `Configuration` with the
+// REAL (much larger) field layout, and those raw-index reads would silently
+// read the wrong slot (or panic) — so this class pair stays fully synthetic
+// until the cache-manager natives are taught the real field layout too.
 fn native_cfg_build(_ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    let this = match obj_arg(args, 0) {
-        Some(o) => o,
-        None => return Ok(Some(Value::Object(None))),
-    };
-    Ok(Some(Value::Object(Some(this))))
-}
-
-// GlobalConfigurationBuilder.build() — same identity wrapper.
-fn native_global_cfg_build(_ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = match obj_arg(args, 0) {
         Some(o) => o,
         None => return Ok(Some(Value::Object(None))),
@@ -1380,19 +1380,31 @@ pub fn register_infinispan_natives(registry: &mut NativeMethodRegistry) {
         );
     }
 
-    // ConfigurationBuilder / GlobalConfigurationBuilder .build()
+    // ConfigurationBuilder.build() — see `native_cfg_build` doc comment for
+    // why this one stays shimmed.
     registry.register(
         CLS_CONFIG_BUILDER,
         "build",
         "()Lorg/infinispan/configuration/cache/Configuration;",
         native_cfg_build,
     );
-    registry.register(
-        CLS_GLOBAL_CONFIG_BUILDER,
-        "build",
-        "()Lorg/infinispan/configuration/global/GlobalConfiguration;",
-        native_global_cfg_build,
-    );
+    // GlobalConfigurationBuilder.build() is intentionally NOT overridden here.
+    // It used to be shimmed as an identity wrapper (return `this` relabeled
+    // as the return type), which left the returned object's REAL runtime
+    // class as `GlobalConfigurationBuilder` instead of a genuine
+    // `GlobalConfiguration`. Real Infinispan's `GlobalConfigurationBuilder`
+    // has no `isClustered()` method (only `GlobalConfiguration` does), so any
+    // caller that invoked `isClustered()` on the "GlobalConfiguration" the
+    // shim handed back hit a real `NoSuchMethodError` naming
+    // `GlobalConfigurationBuilder` — e.g. Infinispan's own
+    // `CoreConfigurationSerializer.writeJGroups`, which every
+    // `testsuite/model` Keycloak test reaches during cache bootstrap. Unlike
+    // `ConfigurationBuilder`/`Configuration` above, nothing in this file reads
+    // `GlobalConfiguration`'s fields by synthetic slot index (`GC_FIELD_*` are
+    // declared but never read; `native_dcm_init` ignores its
+    // `GlobalConfiguration` argument entirely), so it is safe to let the real,
+    // correct `GlobalConfigurationBuilder.build()` bytecode run and construct
+    // a genuinely distinct, correctly-typed `GlobalConfiguration` instance.
     registry.set_category(__prev_cat);
 }
 
