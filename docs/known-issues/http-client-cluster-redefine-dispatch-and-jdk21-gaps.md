@@ -199,3 +199,153 @@ cd apps/spring-suite-runner
 CRATONVM_BIN=<your built .exe> KRUN_STACK=1 \
   ./run-suite.sh run --jdk real --jit on --batch 1 --only 'http\.client\.'
 ```
+
+## Session follow-up (2026-07-06, branch `fix/httpclient-residuals-20260706`)
+
+Re-verified the 12-class cluster against current `dev` (Azure host, worktree
+`/data/data/wt-httpclient-residuals-20260706`, JDK 25 real mode). Two changes
+in status, one real fix landed, and two residuals got precise root-cause
+evidence (still unfixed — documenting for whoever picks this up next).
+
+### Fixed this session: `HashMap`/`HashSet` chain-walk guard gap
+
+`native_map_remove`, `native_map_get`, and `native_map_contains_key`
+(`native-collections/src/lib.rs`) walked their bucket chain with **no
+cycle/length guard**, while `native_map_put`, `map_resize_inner`, and
+`native_map_contains_value` already had one (a `CHAIN_WALK_LIMIT = 4096`
+counter that throws `IllegalStateException` instead of spinning forever —
+see the existing comments on `put` referencing a past hash-collision-DoS
+incident). Added the same guard to the three missing methods, matching the
+existing convention exactly. This is a real, standalone robustness fix
+(confirmed via a Linux `gdb -p <pid>` capture of a `ThreadPoolExecutor`
+worker permanently stuck inside `HashSet.remove()` during
+`processWorkerExit`, racing `interruptIdleWorkers()` on the main thread over
+the same `workers` set — see prior revision of this doc's investigation
+notes) — **but empirically it does NOT fix the intermittent hang below**;
+re-running with the guard in place, the hang still reproduces at the same
+rate and the guard never trips (confirmed via its `[HM-*-GUARD]` stderr
+markers never firing across a dozen repro runs). The real cause of that hang
+is a separate, deeper bug (next section). Kept anyway since it closes a
+genuine latent gap independent of this investigation.
+
+### Residual A superseded: no more deterministic 3/18 failure, but a new intermittent hang
+
+The previously-documented `HttpComponentsClientHttpRequestFactoryTests`
+"Mockito cannot mock CloseableHttpClient" 3/18 failure (no nested cause) **no
+longer reproduces** — clean runs are 18/18 OK. This looks like it was fixed
+incidentally by an unrelated later change on `dev` (not investigated
+further; not this session's work).
+
+In its place: the class now **hangs intermittently (~50-60% of runs)**
+during `@AfterEach` teardown (`MockWebServer.close()`). This is a genuine
+blocking deadlock, not a throughput problem — confirmed via `time`: a killed
+run shows `user 0m1.1s` of CPU burned across 5 minutes of wall-clock time.
+
+**Root cause, confirmed via `gdb -p <pid> -batch -ex 'thread apply all bt'`
+on a live hung process** (no `--stack-dump-on-timeout` involved — the
+watchdog signal mechanism is not the cause): three threads are permanently
+blocked waiting on the same `SharedVm.class_manager` `parking_lot::RwLock`
+(`vm/src/vm/vm_init.rs`, `load_class_concurrent`, around line 3542's
+`self.class_manager.write()` / the `.read()` call sites elsewhere) — the
+main thread wants the **exclusive** lock (via `alloc_synthetic` →
+`ensure_class_initialized` → `load_class_concurrent`, itself reached from a
+`Stream.filter` lambda dispatch), and two other threads want the **shared**
+lock (one via `try_stackless_invoke`, one via
+`execute_invokevirtual_vtable_fast`). **No thread in the process holds the
+lock at the time of the snapshot** — i.e. whoever last held it released
+(or "released") without waking the waiters, or never released at all.
+
+Working hypothesis (not yet confirmed by a live capture of the actual
+holder): a Java thread was holding the write or read guard on
+`class_manager` when it got torn down — this test class's teardown
+interrupts/terminates `ThreadPoolExecutor` workers and `TaskRunner` threads
+(the same code paths flagged in the earlier `HashSet.remove()` investigation
+above), and if the underlying OS thread for one of those Java threads is
+torn down non-cooperatively while it happens to be inside `load_class`
+(holding the `RwLockWriteGuard`/`RwLockReadGuard`), the guard's `Drop` would
+never run and the lock leaks forever. **Not yet proven** — would need a
+capture that catches the actual holder mid-teardown (hard, since the window
+is narrow and the holder thread is the one that then exits). Next step:
+instrument `load_class_concurrent`'s write-lock acquisition
+(`self.class_manager.write()`) and the `.read()` call sites with a
+thread-id + timestamp log, then correlate against
+`ThreadPoolExecutor`/`TaskRunner` worker teardown timing in a repro run.
+
+Repro (Azure host, real JDK, from a fresh worktree off `dev`):
+```bash
+CP="$(cat /data/data/spring-framework-shared/spring-web/build/cratonvm-testcp.txt)"
+# for i in 1..N:
+timeout 60 ./target/release/<binary> --java-home /data/data/jdk25-real \
+  -cp "/data/data/spring-suite-runner-shared:$CP" \
+  KRun org.springframework.http.client.HttpComponentsClientHttpRequestFactoryTests
+# ~50-60% of runs hang forever (near-zero CPU) instead of finishing in ~3s.
+# Capture with: sudo gdb -p <pid> -batch -ex 'thread apply all bt'
+```
+
+### Residual D confirmed + two new findings in `SimpleClientHttpResponseTests`
+
+The documented 4/5 `shouldNotCloseConnectionWhenResponseClosed` /
+`UnfinishedVerificationException` failure **still reproduces** exactly as
+described (confirmed in 3/3 fresh runs this session).
+
+Two things NOT previously documented:
+
+1. **This test class is pathologically slow**: all 3 repro runs took
+   ~72-73 seconds to run 5 trivial mock-based tests (vs. low-single-digit
+   seconds for comparable classes). A `gdb` capture mid-run shows the main
+   thread legitimately executing (not blocked) inside a very deep (170+
+   frame) recursive `try_lambda_dispatch` → `invoke_or_native` →
+   `execute_frame` chain driven by nested `Stream`/`ArrayList.forEach`
+   operations (`native_al_for_each`, `native_stream_map`,
+   `drain_spliterator_to_array_capped`), with `Frame::scan_local_objects` /
+   `update_root_snapshot` re-run on every nested native call. This matches
+   the already-known, unresolved throughput issue described in
+   `docs/internal/app-jvm-bugs/bug-01-junit-reflection-heavy-jit-frame-scan-throughput.md`
+   (precise-maps root-scan tax compounding through deep reflection/stream
+   call chains) — not a new bug, just a new confirmed instance of it. This
+   also explains why earlier ad-hoc repros of this class looked like
+   "hangs" under a 45-60s `timeout` wrapper: they were just this slow, not
+   stuck forever.
+
+2. **Intermittent alternate failure**: on some runs (not all), instead of
+   (or before) the documented `UnfinishedVerificationException`, the class
+   throws `NoSuchMethodError: java/lang/Object.write(I)V` out of
+   `shouldNotDrainWhenErrorStreamClosed()`, from inside Mockito's
+   `InstrumentationMemberAccessor$Dispatcher$ByteBuddy$<hash>.invokeWithArguments(MethodHandle,Object[])`
+   — a plain bytecode call to `MethodHandle.invokeWithArguments(Object...)`
+   that dispatches to a completely unrelated method name+descriptor. A
+   dedicated investigation traced the message-construction path
+   (`vm/src/vm/vm_exec.rs:13015-13029`, `vm/src/runtime/exceptions.rs:1465-1472`)
+   and confirmed dispatch is name/descriptor-based (not vtable-slot-index
+   based, ruling out a slot collision), and that `MethodHandle`
+   signature-polymorphic handling correctly covers `invokeWithArguments`
+   (`vm/src/vm/vm_exec.rs:12478-12545`, native at
+   `native-builtins/src/lang_invoke.rs:6608-6652`) — so the bug is not in
+   that native itself. Leading hypothesis: the same "receiver `ClassId(0)`
+   collapses to `java/lang/Object`" mechanism already fixed for the **JIT**
+   path in commit `b09fea46` (`vm/src/jit/helpers.rs:938-988`,
+   `virtual_dispatch_target_for_receiver`) has an analogous gap in the
+   **interpreter's plain (non-JIT, non-lambda) `invokevirtual`** dispatch —
+   `vm/src/vm/vm_exec.rs:12684`'s `class_name == "java/lang/Object"` rescue
+   only fires when the CP-resolved static class is itself `Object` (e.g. the
+   `S111r7`/synthetic-receiver-rescue case just above it), not when the
+   **receiver's** class id collapses to `Object` while the CP class is
+   `MethodHandle` — the reverse direction from what `virtual_dispatch_target_for_receiver`
+   guards against. Not fixed this session — the method-name/descriptor
+   mismatch (`write(I)V` vs. the call site's actual
+   `invokeWithArguments([Ljava/lang/Object;)Ljava/lang/Object;`) is not yet
+   fully explained by this hypothesis alone and needs a live capture (e.g.
+   a temporary debug print of the resolved `class_id`/cp_index at the
+   `invoke_on_class_shared_inner` call in question) to confirm before
+   attempting a fix analogous to the JIT one.
+
+### Current environment note
+
+This session's Azure host (`victor@20.83.144.174`) uses `/data/data/cratonvm`
+as the shared main worktree and `/data/data/spring-framework-shared` +
+`/data/data/spring-suite-runner-shared` as the pre-built spring-framework
+checkout (per-module `build/cratonvm-testcp.txt` files already generated) —
+different paths from the `/opt/cratonvm`-based host referenced in the
+Reproduction section above (that host/session is unrelated to this one).
+Build a fresh worktree off `dev` and point at the `-shared` checkouts rather
+than trying to reuse the old `/opt/cratonvm` paths.
