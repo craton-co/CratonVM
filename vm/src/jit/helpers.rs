@@ -6014,7 +6014,16 @@ pub unsafe extern "C" fn jit_self_call_stack_guard(vm_ptr: i64) -> i64 {
     }
     // SAFETY: vm_ptr originates from JIT code and points to the live SharedVm.
     let vm = &*(vm_ptr as *const SharedVm);
-    raise_jit_stack_overflow(vm)
+    let rc = raise_jit_stack_overflow(vm);
+    if crate::runtime::env_cache::dbg_jitc() {
+        eprintln!(
+            "[cratonvm-jitc] self-call stack guard TRIP sp={:#x} floor={:#x} pending={}",
+            sp_now,
+            floor,
+            jit_pending_exception_is_set(),
+        );
+    }
+    rc
 }
 
 /// spring-bug-10 watchpoint: arm a hardware data WRITE breakpoint (DR0) on the
