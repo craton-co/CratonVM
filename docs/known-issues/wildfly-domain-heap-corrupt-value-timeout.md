@@ -1,6 +1,6 @@
 # WildFly domain startup timeout with repeated corrupt `Value` cell guard
 
-Status: OPEN (root-cause candidate identified 2026-07-06, needs full-suite confirmation)
+Status: LIKELY FIXED for the timeout/hang (2026-07-06, branch `fix/wildfly-cv-corrupt-value-20260706`) — a real, confirmed, reliably-reproducing deadlock was found and fixed; needs a full WildFly domain-mode E2E rerun to close out fully (still blocked on Maven/wildfly-core availability, same as prior sessions). The `HIB-CV-32` "corrupt Value cell" log line's own exact trigger remains not independently re-confirmed post-fix (see below).
 Severity: High
 First confirmed: 2026-07-05 on Azure worktree `codex/wildfly-nonpassed-probes-20260705-035722`
 
@@ -186,3 +186,90 @@ standalone trigger. If another synthetic attempt is still preferred over waiting
 infra, first confirm the arraycopy intrinsic guard is even being exercised (e.g. add a
 `CRATONVM_DBG_JITC`/direct disassembly check that `ArraycopyPrimitive`'s guard code is
 actually emitted and taken) before investing further iteration count.
+
+## 2026-07-06 update (fourth session) — deadlock root-caused and fixed via a new,
+## WildFly-independent repro; distinct from Hypotheses 1/2 above
+
+Rather than continue iterating on Hypothesis 2's synthetic-repro dead end (three
+sessions' worth of JDT-idiom mirrors never fired the guard), this session took a
+different approach: reproduce the *shape* of `EEConcurrencyExecutorShutdownTestCase`
+directly — a real `ExecutorService` thread pool, no WildFly/Spring needed — and see
+what actually breaks under real concurrent OS-thread execution + GC pressure with the
+JIT enabled (the prior sessions' repros were single-threaded or JIT-off).
+
+**New repro:** `docs/known-issues/repros/wildfly-domain-startup-timeout/FieldSpawn.java`
+— a real `Executors.newFixedThreadPool(8)` where every worker hammers plain
+putfield/getfield on a small shared array of heap-object fields (mirroring
+`ManagedExecutorService` usage), under constant allocation and small-heap GC pressure
+(`-Xmx48m`), JIT enabled (no `--nojit`).
+
+**Result: on unmodified `dev`, this reliably DEADLOCKS within the first round** (3/3
+repro runs hung; confirmed not a "just slow" false read via `ps -o pcpu` showing 0% CPU
+across every worker thread). A live capture via `gdb -p <pid> -batch -ex 'thread apply
+all bt'` (same technique the independent HttpClient-hang investigation used — see
+memory note `httpclient-hangs-are-classmanager-rwlock-deadlock-and-methodhandle-dispatch`,
+which hit the *same lock family* from a different angle and left it unconfirmed) showed
+a textbook **AB-BA lock-order inversion** between `SharedVm.class_manager` and
+`SharedVm.vtable_manager` (both `parking_lot::RwLock`s):
+
+- **Class definition** (`ClassManager::define_class_with_options` →
+  `fire_vtable_install_hook` → `vtable_install_adapter`, `vm/src/runtime/vtable.rs`):
+  holds `class_manager` (write, for the whole definition) → then takes `vtable_manager`
+  (write, `manager.write().install_vtable(...)`).
+- **Virtual-dispatch fast path** (`execute_invokevirtual_vtable_fast`,
+  `vm/src/runtime/interpreter.rs` ~26840-26880): took `vtable_manager` (read) and, while
+  STILL HOLDING that guard, ALSO took `class_manager` (read) to resolve the declaring
+  class's name for a native-shadow check — the exact OPPOSITE lock order.
+
+One thread mid-class-definition (holding `class_manager` write, blocked acquiring
+`vtable_manager` write) and one thread mid-dispatch (holding `vtable_manager` read,
+blocked acquiring `class_manager` read) deadlock each other permanently. This directly
+violates `resolve_virtual_slot`'s own documented invariant — a test in `vm.rs` right
+next to it states "the vtable must be queryable without taking the class_manager lock" —
+so this was a real regression against the component's own stated contract, not a new
+design question.
+
+**Fix (branch `fix/wildfly-cv-corrupt-value-20260706`):** `execute_invokevirtual_vtable_fast`
+now copies out the small pieces of data it needs (`declaring_class_id`, `is_native`, the
+cloned `Arc<CachedBytecodeMethod>`) and explicitly `drop(guard)`s the `vtable_manager`
+read lock *before* acquiring `class_manager` — the two locks are never held nested
+after this fix, in either direction.
+
+**Validated:**
+- Same repro against the fix: 5/5 clean runs, full completion (200 rounds / 320,000 ops
+  each, `failed=false`), vs. 3/3 reliable hangs on the pre-fix baseline binary with
+  identical arguments.
+- `cargo check -p cratonvm-vm` clean (no new warnings); `cratonvm-cli` release build
+  succeeds.
+- (Heavier `cargo test --release` integration-test compile OOM-killed on the build host
+  under `lto=fat`/`codegen-units=1` — an environment resource limit unrelated to this
+  change, not attempted further; the functional repro is stronger evidence for a
+  concurrency bug than a single-threaded unit test would be regardless.)
+- Incidentally re-confirmed a separate, already-documented JIT bug while building this
+  repro: string concatenation (`invokedynamic`/`StringConcatFactory`) inside the same
+  hot loop as the workload silently truncates the loop's remaining iterations
+  (`UnreachedCode` uncommon-trap on the dead branch) — same family the third session
+  flagged. Worked around here by not concatenating inside the round loop; still an open
+  item for whoever picks up JIT invokedynamic/uncommon-trap work next.
+
+**How this relates to Hypotheses 1/2 above:** this is a genuinely different bug (a plain
+lock-ordering defect, no tearing or GC/oop-marking involved) that reliably reproduces
+under the same real-concurrency + GC-pressure + JIT-enabled conditions the WildFly test
+needs, and explains the *timeout/hang* shape of the symptom
+(`TimeoutException: Managed servers were not started within [120] seconds`) extremely
+well — a wedged VM thread during concurrent classloading matches a domain boot that
+stalls while the management client keeps retrying. **Not separately re-confirmed:**
+whether this exact deadlock is *also* the literal trigger for the repeated `HIB-CV-32`
+"corrupt Value cell" log line — across all 5 post-fix repro runs the guard never fired
+(only the unrelated, benign `mark_young: rejecting ... implausible extent` conservative-
+root-candidate rejection noise did, which is expected/by-design per `gen_heap.rs`'s own
+comments). It's plausible both symptoms share a common trigger condition (heavy
+concurrent classloading + dispatch under GC pressure during domain startup) without
+being the same code path.
+
+**Recommended next step:** re-run `EEConcurrencyExecutorShutdownTestCase` end-to-end
+against `dev` + this fix once Maven/`wildfly-core` availability (or bug-15) is resolved
+— same blocker as every prior session. If the timeout is gone, close this out
+referencing the lock-order fix; if the `HIB-CV-32` guard still fires, Hypothesis 2's
+residual mystery (a not-yet-identified consumer that skips the safe `Value`-matching
+CratonVM otherwise uses everywhere) remains open and worth another pass.
