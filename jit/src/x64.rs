@@ -19144,6 +19144,16 @@ impl Compiler {
                         self.patch_rel32_to_here(done_compact_patch);
                         self.patch_rel32_to_here(done_legacy_patch);
                         self.push_from_rax();
+                        // T1.1.a — a reference field's loaded value is a live
+                        // oop; the `push_from_rax` fast path always pushes a
+                        // hard-coded `false` mark, which left this getfield
+                        // result (and everything computed from it) unrooted
+                        // for the GC / precise-deopt oop map. `c_is_ref` is
+                        // authoritative here regardless of which sub-path
+                        // (compact or legacy cell) actually loaded it.
+                        if c_is_ref {
+                            self.mark_top_as_oop();
+                        }
                         pc += 3;
                     } else if let Some(&info_idx) = self
                         .field_info_idx
@@ -19222,6 +19232,21 @@ impl Compiler {
                         // Join: result in RAX.
                         self.patch_rel32_to_here(done_patch);
                         self.push_from_rax();
+                        // T1.1.a — see the compact-getfield arm above: a
+                        // reference-typed field's loaded value is a live oop
+                        // and must not be left with the default `false` mark
+                        // `push_from_rax` assigns, or it decodes as a plain
+                        // `Int` (not `Object`) in the precise GC/deopt oop
+                        // map — the root cause of the JDT `Parser`
+                        // stack-corruption bug (docs/known-issues/
+                        // jasper-jdt-parser-arrayindexoutofbounds.md): a
+                        // `char[][]` field read this way, then used live
+                        // across an always-deopting `System.arraycopy`
+                        // reference-array call, resumed in the interpreter as
+                        // a raw integer instead of an object reference.
+                        if type_tag == b'L' || type_tag == b'[' {
+                            self.mark_top_as_oop();
+                        }
                         pc += 3;
                     } else {
                         // No statically-resolved field metadata for this
@@ -20131,7 +20156,34 @@ impl Compiler {
                         // ===== INTRINSIC REGION END: LONG_BITS =====
 
                         // ===== INTRINSIC REGION BEGIN: ARRAYCOPY =====
+                        //
+                        // De-spec guard: a call site whose src/dst are ALWAYS
+                        // a reference-element array (e.g. `char[][]`) fails
+                        // Guard 4 below on every single invocation, so this
+                        // speculative fast path deopts every call. Each deopt
+                        // evicts the artifact and triggers a background
+                        // recompile that re-emits the SAME unconditional
+                        // guard, so the method deopts forever — creating a
+                        // continuous compile/evict race window. If the
+                        // resume's epoch-staleness check ever loses that race
+                        // (the live epoch was bumped by an in-flight
+                        // recompile), the deopt falls back to the documented
+                        // whole-method re-run, which DOUBLE-EXECUTES every
+                        // side effect the method already performed before
+                        // reaching this call (e.g. a `stack[ptr--]` decrement
+                        // already committed to the heap) — the mechanism
+                        // behind the JDT `Parser` stack-corruption bug
+                        // (docs/known-issues/jasper-jdt-parser-arrayindexoutofbounds.md).
+                        // `real_frame_deopt_resume_and_despeculate` already
+                        // records this bci in the de-spec registry after
+                        // `PER_BCI_DESPEC_LIMIT` deopts, exactly like the
+                        // loop-header speculative-BCE guards (see
+                        // `despec_contains` above); this intrinsic just needs
+                        // to honor it on recompile — bail to the generic
+                        // (non-speculative) call dispatch below instead of
+                        // re-emitting a guard proven to always fail.
                         else if callee_entry == super::JitIntrinsic::ArraycopyPrimitive.as_entry()
+                            && !crate::deopt::despec_contains(&self.method_key, pc as u32)
                         {
                             // Phase 2 — System.arraycopy(src, srcPos, dst,
                             // dstPos, len). The descriptor is type-erased;
@@ -20427,15 +20479,110 @@ impl Compiler {
                             // --- done ---
                             self.patch_rel32_to_here(zero_len_skip);
 
-                            // Wire every bail branch to a shared deopt stub
-                            // (reason 2 = DEOPT_REASON_BOUNDS_CHECK). The
-                            // emit_deopt_stubs pass coalesces equal
-                            // (bci, reason) pairs into one stub, so all the
-                            // bail edges share a single trap.
-                            for patch in bail_patches {
-                                self.deopt_stubs.push((patch, pc, 2));
+                            // Every bail branch (null, non-array,
+                            // reference-element array, mismatched kind, or
+                            // out-of-bounds) is a NORMAL, valid outcome for
+                            // `System.arraycopy` — either a real exception or
+                            // a successful reference-array copy — not an
+                            // "uncommon" condition that should re-run the
+                            // method. Route them through the SAME safe
+                            // native-dispatch CALL an ordinary
+                            // non-intrinsic `invokestatic` site uses
+                            // (registered for this exact pc alongside the
+                            // intrinsic — see the `ArraycopyPrimitive` match
+                            // arm in `jit_scan`'s caller), so a guard failure
+                            // throws/succeeds via normal call semantics
+                            // instead of a deopt trap whose only resume
+                            // strategy (whole-method re-run) can
+                            // DOUBLE-EXECUTE a side effect the method already
+                            // performed before reaching this call (e.g. a
+                            // `stack[ptr--]` decrement already committed to
+                            // the heap) — the mechanism behind the JDT
+                            // `Parser` stack-corruption bug (docs/
+                            // known-issues/jasper-jdt-parser-arrayindexoutofbounds.md).
+                            // Falls back to the historical deopt trap only if
+                            // the dispatch info wasn't registered (defensive;
+                            // should not happen for this intrinsic).
+                            let dispatch_info = self
+                                .invoke_info_idx
+                                .get(&pc)
+                                .map(|&i| self.invoke_info[i].1);
+                            match dispatch_info.map(|info| (info, self.reserve_spill_slots(5))) {
+                                Some((info, Some(args_base))) => {
+                                    let skip_dispatch = self.emit_jmp_rel32_patch();
+                                    for &patch in &bail_patches {
+                                        self.patch_rel32_to_here(patch);
+                                    }
+                                    // Reload the five original operands from
+                                    // their pinned scratch homes (untouched
+                                    // by the guard sequence above) into the
+                                    // freshly reserved, contiguous args
+                                    // buffer in the layout `jit_invoke_
+                                    // dispatch` expects: arg[0] at the
+                                    // highest offset (lowest address),
+                                    // arg[n-1] at the lowest offset —
+                                    // mirrors the generic invokestatic
+                                    // dispatch site's buffer construction.
+                                    // ALIASING HAZARD: `args_base` reuses the
+                                    // SAME frame region as `s_src..s_len`
+                                    // (arraycopy's scratch homes never
+                                    // advanced `next_spill_offset` — see the
+                                    // "arraycopy pushes nothing" comment
+                                    // above), and the target buffer order is
+                                    // the REVERSE of the scratch-home order,
+                                    // so a naive per-index load-then-store
+                                    // would overwrite a not-yet-read home
+                                    // (e.g. writing arg[0] to `s_len`'s
+                                    // address before arg[4] has read `s_len`).
+                                    // Defeat it exactly like the fast-path
+                                    // guard setup above: load ALL five
+                                    // operands into distinct registers FIRST,
+                                    // then store.
+                                    self.emit_load_local(RAX, s_src);
+                                    self.emit_load_local(RCX, s_src_pos);
+                                    self.emit_load_local(RDX, s_dst);
+                                    self.emit_load_local(R10, s_dst_pos);
+                                    self.emit_load_local(R11, s_len);
+                                    self.emit_store_local(args_base + 4 * 8, RAX); // Cast: x86-64 immediate encoding
+                                    self.emit_store_local(args_base + 3 * 8, RCX); // Cast: x86-64 immediate encoding
+                                    self.emit_store_local(args_base + 2 * 8, RDX); // Cast: x86-64 immediate encoding
+                                    self.emit_store_local(args_base + 1 * 8, R10); // Cast: x86-64 immediate encoding
+                                    self.emit_store_local(args_base, R11);
+                                    // SAFETY: info comes from self.invoke_info, which holds
+                                    // pointers to JitInvokeInfo structs kept alive by the
+                                    // caller for the duration of compilation.
+                                    self.emit_load_local(ARG_REGS[0], self.heap_local_offset);
+                                    self.emit_mov_imm64(ARG_REGS[1], info as *const _ as i64); // Cast: function pointer for JIT call target
+                                    let buf_start = args_base + 4 * 8; // Cast: x86-64 immediate encoding
+                                    self.emit_lea_frame_slot(ARG_REGS[2], buf_start);
+                                    self.emit_mov_imm32_sx(ARG_REGS[3], 5);
+                                    self.emit_pre_safepoint_spill();
+                                    self.emit_call_absolute(self.helpers.invoke_dispatch);
+                                    self.emit_oop_map_for_safepoint();
+                                    self.emit_post_invoke_exception_check(b'V');
+                                    // arraycopy returns void: nothing pushed;
+                                    // the args buffer is dead, reclaim it.
+                                    self.next_spill_offset = args_base;
+                                    self.patch_rel32_to_here(skip_dispatch);
+                                }
+                                Some((_, None)) => {
+                                    // Spill region exhausted — bail the whole
+                                    // compile (always safe: the method falls
+                                    // back to the interpreter).
+                                    self.failed = true;
+                                    return false;
+                                }
+                                None => {
+                                    // Wire every bail branch to a shared deopt stub
+                                    // (reason 2 = DEOPT_REASON_BOUNDS_CHECK). The
+                                    // emit_deopt_stubs pass coalesces equal
+                                    // (bci, reason) pairs into one stub, so all the
+                                    // bail edges share a single trap.
+                                    for patch in bail_patches {
+                                        self.deopt_stubs.push((patch, pc, 2));
+                                    }
+                                }
                             }
-                            // arraycopy returns void: nothing is pushed.
                         }
                         // ===== INTRINSIC REGION END: ARRAYCOPY =====
 

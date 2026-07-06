@@ -5953,6 +5953,48 @@ fn try_compile_inner(
                     if let Some((entry, num_params, ret)) =
                         try_resolve_intrinsic(&class_name, &method_name, &descriptor)
                     {
+                        // `ArraycopyPrimitive`'s speculative fast path bails
+                        // (null/non-array/reference-element/mismatched-kind/
+                        // out-of-bounds) via a deopt trap whose ONLY
+                        // historical resume strategy is a whole-method
+                        // re-run — safe only when nothing observable
+                        // happened before this call, an invariant this scan
+                        // cannot verify and the JDT `Parser` stack-corruption
+                        // bug violates (docs/known-issues/
+                        // jasper-jdt-parser-arrayindexoutofbounds.md: a
+                        // `stack[ptr--]` decrement already committed earlier
+                        // in the same method gets re-executed on re-run).
+                        // Register an ordinary `JitInvokeInfo` dispatch
+                        // fallback for this same pc — identical to what a
+                        // non-intrinsic `invokestatic` site gets below — so
+                        // the codegen can route EVERY guard failure through
+                        // a normal native-dispatch CALL (which throws or
+                        // succeeds exactly like the interpreter's native
+                        // registry, with ordinary exception propagation)
+                        // instead of a deopt trap. No re-run, so no
+                        // double-executed side effect.
+                        if entry == JitIntrinsic::ArraycopyPrimitive.as_entry() {
+                            let class_box: Box<str> = class_name.clone().into_boxed_str();
+                            let method_box: Box<str> = method_name.clone().into_boxed_str();
+                            let desc_box: Box<str> = descriptor.clone().into_boxed_str();
+                            let class_ref = &*class_box as *const str;
+                            let method_ref = &*method_box as *const str;
+                            let desc_ref = &*desc_box as *const str;
+                            owned_strings.push(class_box);
+                            owned_strings.push(method_box);
+                            owned_strings.push(desc_box);
+                            let info = Box::new(JitInvokeInfo {
+                                class_name: unsafe { &*class_ref },
+                                method_name: unsafe { &*method_ref },
+                                descriptor: unsafe { &*desc_ref },
+                                num_jit_args: num_params,
+                                return_type: ret,
+                                invoke_kind,
+                            });
+                            let info_ptr: *const JitInvokeInfo = &*info;
+                            owned_invoke_infos.push(info);
+                            invoke_info.push((pc, info_ptr));
+                        }
                         direct_calls.push((
                             pc,
                             JitDirectCall {
@@ -6225,7 +6267,23 @@ fn try_compile_inner(
     // complete-coverage shadow map must include an oop parameter live across an
     // EARLY safepoint (before any `astore` rewrites its slot), or the moving copy
     // would leave that register/slot stale (HIB-CV-20).
-    let param_oop_mask = if x64::precise_jit_maps_enabled() || x64::moving_young_enabled() {
+    // Also seed it under `deopt_real_enabled()` (default ON): `local_kinds`
+    // (below) classifies `this`/reference params as `LocalKind::Ref`, and
+    // `typed_local_frame_value` only trusts that classification when the
+    // precise oop mask CONFIRMS it — an unseeded mask leaves every deopt
+    // point's `this` (or any live reference parameter) as `FrameValue::
+    // Unsupported`, which `resume_real_ir_deopt` cannot resume. Every such
+    // deopt then silently falls back to the whole-method re-run, which
+    // DOUBLE-EXECUTES every side effect already committed before the trap —
+    // e.g. a `stack[ptr--]` decrement already written to the heap. This was
+    // the root cause of the JDT `Parser` stack-corruption bug
+    // (docs/known-issues/jasper-jdt-parser-arrayindexoutofbounds.md): an
+    // always-deopting reference-array `System.arraycopy` call inside a method
+    // with a live `this` made every single invocation re-run from entry.
+    let param_oop_mask = if x64::precise_jit_maps_enabled()
+        || x64::moving_young_enabled()
+        || deopt_real_enabled()
+    {
         compute_param_oop_mask(&cached.method_descriptor, cached.is_static)
     } else {
         0
