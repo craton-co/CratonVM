@@ -19540,7 +19540,10 @@ pub fn register_essential_natives(registry: &mut NativeMethodRegistry) {
             "HST" => Some(-10 * 3600),
             "America/Sao_Paulo" | "America/Argentina/Buenos_Aires" => Some(-3 * 3600),
             "America/Santiago" => Some(-4 * 3600),
-            "Europe/Paris" | "Europe/Berlin" | "Europe/Rome" | "Europe/Madrid" | "CET" => {
+            "Europe/Paris" | "Europe/Berlin" | "Europe/Rome" | "Europe/Madrid" | "CET"
+            | "Europe/Oslo" | "Europe/Amsterdam" | "Europe/Brussels" | "Europe/Vienna"
+            | "Europe/Copenhagen" | "Europe/Stockholm" | "Europe/Zurich" | "Europe/Warsaw"
+            | "Europe/Prague" | "Europe/Budapest" => {
                 Some(3600)
             }
             "Europe/Athens" | "Europe/Bucharest" | "Europe/Helsinki" | "EET" => Some(2 * 3600),
