@@ -538,6 +538,23 @@ pub trait NativeContext {
     /// into `SharedVm::var_handle_roots`.
     fn register_var_handle_root(&mut self, _vh: ObjectRef) {}
 
+    /// Read back the CURRENT address of a persistent native root previously
+    /// registered with [`register_var_handle_root`], keyed by the value
+    /// [`identity_hash_code`] returned for it at registration time.
+    ///
+    /// Rationale: `register_var_handle_root` keeps the object alive and the
+    /// GC remaps the registry entry after a move — but it cannot rewrite raw
+    /// `ObjectRef` copies cached in native `static`s (`ASYNC_POOL`,
+    /// `SYSTEM_CL`, `SECURITY_MANAGER`). Such long-lived-native-singleton
+    /// caches must store the identity key alongside the raw ref and re-read
+    /// through this method at every use; using only the cached raw ref is a
+    /// use-after-move once a moving young GC or a promotion relocates the
+    /// object. Default `None` for non-VM contexts (callers fall back to the
+    /// cached ref, matching the mock heaps that never move objects).
+    fn read_var_handle_root(&self, _identity_key: i32) -> Option<ObjectRef> {
+        None
+    }
+
     /// Store a value into the test output buffer (for `tempPrint`).
     fn record_printed_value(&mut self, value: Value);
 

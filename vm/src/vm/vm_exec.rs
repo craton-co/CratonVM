@@ -2365,6 +2365,17 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
         self.shared.var_handle_roots.write().insert(key, vh);
     }
 
+    fn read_var_handle_root(&self, identity_key: i32) -> Option<ObjectRef> {
+        // The GC remaps the registry entry after a move (memory/gc.rs); raw
+        // ObjectRef copies cached in native statics do NOT get rewritten, so
+        // long-lived native singletons re-read the current address here.
+        self.shared
+            .var_handle_roots
+            .read()
+            .get(&identity_key)
+            .copied()
+    }
+
     fn record_printed_value(&mut self, value: Value) {
         self.thread.printed.push(value);
     }
