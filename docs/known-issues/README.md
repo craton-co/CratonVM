@@ -4,6 +4,10 @@ This folder collects CratonVM-only defects found while running upstream Java
 suites. The docs had grown to describe the **same underlying bug from several
 angles**; this index is the consolidated map. Read it first.
 
+## 2026-07-06 vm crate unit-test residuals (branch fix/vm-monitor-test-object-heap-uaf)
+
+- [vm crate unit-test residuals post-monitor-fix](vm-unit-test-residuals-post-monitor-fix.md) - after fixing a test-helper use-after-free SIGSEGV that was crashing `cargo test -p cratonvm-vm --release --lib` before it could finish, the suite surfaced 16-17 masked failures. 8 were a false alarm (lock_order enforcement gated behind debug_assertions, disabled under --release), 3 were stale hardcoded bootstrap-class/native counts (FIXED here — a legitimate recent feature grew the count from 5 to 25 classes), 1 didn't reproduce in debug (not investigated). 4 remain open: virtual_scheduler over-release accounting (design question), vm_exec object-pointer-provenance test predates a security hardening, runtime::frame CompactValue long/upper-half slot-tearing-adjacent bug, and a jit::skip_list Keycloak over-match not yet traced to its exact matching branch.
+
 ## 2026-07-05 Hibernate pruned residuals
 
 - [Hibernate JpaLargeBlobTest Object.read() dispatch](hib-jpalargeblobtest-object-read-nosuchmethod.md) - patched locally in the JIT virtual/interface MIC helper: `ClassId(0)` non-Object receivers now fall back to the CP owner and cannot publish MIC/PIC entries under the zero/empty sentinel. Local Windows Hibernate probe no longer reproduces `java/lang/Object.read()I`, but the class remains open on a later no-JIT-independent `GenHeap::set_array_element` object-vs-array assertion in H2 `IOUtils.readFully`.

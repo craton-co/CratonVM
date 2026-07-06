@@ -5735,10 +5735,18 @@ mod tests {
     fn shared_vm_default_config() {
         let shared = SharedVm::new(VmConfig::default());
         assert!(shared.native_methods.len() > 0);
-        // C25 synthetic stubs plus wired super/interfaces: `Enumeration$Impl`,
+        // C25 synthetic stubs plus wired super/interfaces (`Enumeration$Impl`,
         // `java/lang/Object`, `java/util/Enumeration`, `Comparator$Native`,
-        // `java/util/Comparator`.
-        assert_eq!(shared.class_manager.read().loaded_count(), 5);
+        // `java/util/Comparator`), PLUS the unmodifiable-collection-view
+        // bootstrap (`Collection`/`List`/`Set`/`SortedSet`/`NavigableSet`/
+        // `Map`/`ListIterator`/`Serializable` and the 8
+        // `cratonvm/internal/Unmodifiable*` synthetic stamps, see
+        // `d3474b3e`/`c2d68883`) plus `AssertionError` and `Iterator` and
+        // their transitively-loaded superinterfaces. This count legitimately
+        // grew from 5 as that bootstrap work landed; if it changes again,
+        // verify the new value against `SharedVm::new`'s class-loading calls
+        // rather than assuming a regression.
+        assert_eq!(shared.class_manager.read().loaded_count(), 25);
         assert!(shared.statics.read().is_empty());
         assert!(shared.string_pool.read().is_empty());
         assert!(shared.class_mirrors.read().is_empty());
@@ -5886,7 +5894,7 @@ mod tests {
         // self_arc should be set, and get_arc should work
         let arc = vm.shared.get_arc();
         // Same bootstrap class set as `shared_vm_default_config`.
-        assert_eq!(arc.class_manager.read().loaded_count(), 5);
+        assert_eq!(arc.class_manager.read().loaded_count(), 25);
     }
 
     #[test]
@@ -6222,11 +6230,14 @@ mod tests {
         let shared = SharedVm::new(config);
         // Essential-only mode should stay well below full `register_builtins`
         // synthetic coverage. The ceiling is a soft guard that rises as the
-        // real-JDK native bundle grows (currently ~6200); synthetic-jdk builds
-        // still register thousands more on top of this baseline.
+        // real-JDK native bundle grows (currently ~8800, up from ~6200 after
+        // the unmodifiable-collection-view bootstrap added a proportional
+        // slice of `List`/`Set`/`Map`/etc. natives, see `d3474b3e`/
+        // `c2d68883`); synthetic-jdk builds still register thousands more on
+        // top of this baseline.
         assert!(
-            shared.native_methods.len() < 7000,
-            "Real JDK mode should have < 7000 natives, got {}",
+            shared.native_methods.len() < 9500,
+            "Real JDK mode should have < 9500 natives, got {}",
             shared.native_methods.len()
         );
     }
