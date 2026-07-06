@@ -14,7 +14,7 @@ use cratonvm_types::{ObjectRef, Value};
 
 use crate::{alloc_concurrent_synthetic, native_noop, native_noop_with_this, obj_arg};
 use crate::{native_cf_then_accept, native_cf_then_apply};
-use crate::{BI_FIELD_SIGNUM, BI_FIELD_VALUE, FUT_FIELD_DONE, FUT_FIELD_RESULT};
+use crate::{BI_FIELD_SIGNUM, BI_FIELD_VALUE, CHARSET_FIELD_NAME, FUT_FIELD_DONE, FUT_FIELD_RESULT};
 
 // Helpers defined in lib.rs that we need
 use crate::bi_alloc;
@@ -17878,10 +17878,16 @@ pub fn register_p58_charset_coder(r: &mut NativeMethodRegistry) {
         "()Ljava/nio/charset/CharsetEncoder;",
         |ctx, args| {
             let this = obj_arg(args, 0)?;
+            let name = match ctx.get_field(this, CHARSET_FIELD_NAME) {
+                Value::Object(Some(s)) => ctx.read_string(s).unwrap_or_else(|| "UTF-8".to_string()),
+                _ => "UTF-8".to_string(),
+            };
+            let avg = cratonvm_native_api::charset::average_bytes_per_char(&name);
+            let max = cratonvm_native_api::charset::max_bytes_per_char(&name);
             let enc_obj = alloc_concurrent_synthetic(ctx, "java/nio/charset/CharsetEncoder", 3);
             ctx.set_field(enc_obj, 0, Value::Object(Some(this)));
-            ctx.set_field(enc_obj, 1, Value::Float(1.0));
-            ctx.set_field(enc_obj, 2, Value::Float(4.0));
+            ctx.set_field(enc_obj, 1, Value::Float(avg));
+            ctx.set_field(enc_obj, 2, Value::Float(max));
             seed_coder_error_actions(ctx, enc_obj);
             Ok(Some(Value::Object(Some(enc_obj))))
         },
@@ -17892,10 +17898,16 @@ pub fn register_p58_charset_coder(r: &mut NativeMethodRegistry) {
         "()Ljava/nio/charset/CharsetDecoder;",
         |ctx, args| {
             let this = obj_arg(args, 0)?;
+            let name = match ctx.get_field(this, CHARSET_FIELD_NAME) {
+                Value::Object(Some(s)) => ctx.read_string(s).unwrap_or_else(|| "UTF-8".to_string()),
+                _ => "UTF-8".to_string(),
+            };
+            let avg = cratonvm_native_api::charset::average_chars_per_byte(&name);
+            let max = cratonvm_native_api::charset::max_chars_per_byte(&name);
             let dec_obj = alloc_concurrent_synthetic(ctx, "java/nio/charset/CharsetDecoder", 3);
             ctx.set_field(dec_obj, 0, Value::Object(Some(this)));
-            ctx.set_field(dec_obj, 1, Value::Float(1.0));
-            ctx.set_field(dec_obj, 2, Value::Float(1.0));
+            ctx.set_field(dec_obj, 1, Value::Float(avg));
+            ctx.set_field(dec_obj, 2, Value::Float(max));
             seed_coder_error_actions(ctx, dec_obj);
             Ok(Some(Value::Object(Some(dec_obj))))
         },
