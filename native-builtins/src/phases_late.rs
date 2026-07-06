@@ -38767,6 +38767,61 @@ pub(crate) fn register_p68_ssl(r: &mut NativeMethodRegistry) {
             }
         },
     );
+    // FIX (httpserver-pkcs12-20260706): getSupportedCipherSuites/getSupportedProtocols
+    // were never registered on javax/net/ssl/SSLEngine (only getEnabled* above), the
+    // same "missing accessor" shape as the earlier SSLSocket
+    // getSupportedCipherSuites/getEnabledCipherSuites gap (see
+    // docs/internal/CRATONVM_BUGS/BUG-interfacedispatch-mbeanserver-sslsocket-realmode-shadow.md).
+    // ssleng_alloc allocates every SSLEngine directly on this abstract class (never a
+    // concrete subclass), so an unregistered method here always throws
+    // AbstractMethodError on any real-JDK caller. Netty's JdkSslContext.<clinit> (via
+    // JdkSslContext$Defaults.init -> supportedCiphers) calls
+    // SSLContext.getDefault().createSSLEngine().getSupportedCipherSuites() to validate
+    // its configured cipher list against the engine's supported set — every
+    // ServerHttpsRequestIntegrationTests run (Reactor Netty server backend) hits this
+    // during server bootstrap. Mirrors the same fuller suite list already used by
+    // SSLSocketFactory.getSupportedCipherSuites/SSLSocket's supported-suites native for
+    // consistency (this synthetic engine has no negotiated-state distinction between
+    // "supported" and "enabled defaults" beyond what's already modeled by the
+    // getEnabledCipherSuites default branch above).
+    r.register(
+        ssleng,
+        "getSupportedCipherSuites",
+        "()[Ljava/lang/String;",
+        |ctx, _args| {
+            let suites = [
+                "TLS_AES_128_GCM_SHA256",
+                "TLS_AES_256_GCM_SHA384",
+                "TLS_CHACHA20_POLY1305_SHA256",
+                "TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256",
+                "TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256",
+                "TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384",
+                "TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384",
+                "TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305_SHA256",
+                "TLS_ECDHE_RSA_WITH_CHACHA20_POLY1305_SHA256",
+            ];
+            let arr = ctx.new_array(cratonvm_types::ArrayElementType::Reference, suites.len());
+            for (i, &s) in suites.iter().enumerate() {
+                let str_obj = ctx.create_string(s);
+                ctx.set_array_element(arr, i, Value::Object(Some(str_obj)));
+            }
+            Ok(Some(Value::Object(Some(arr))))
+        },
+    );
+    r.register(
+        ssleng,
+        "getSupportedProtocols",
+        "()[Ljava/lang/String;",
+        |ctx, _args| {
+            let protos = ["TLSv1.3", "TLSv1.2"];
+            let arr = ctx.new_array(cratonvm_types::ArrayElementType::Reference, protos.len());
+            for (i, &p) in protos.iter().enumerate() {
+                let str_obj = ctx.create_string(p);
+                ctx.set_array_element(arr, i, Value::Object(Some(str_obj)));
+            }
+            Ok(Some(Value::Object(Some(arr))))
+        },
+    );
     r.register(ssleng, "beginHandshake", "()V", |ctx, args| {
         let this = obj_arg(args, 0)?;
         // Transition from NOT_HANDSHAKING (0) to NEED_WRAP (1) for client, NEED_UNWRAP (2) for server
