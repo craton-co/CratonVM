@@ -140,13 +140,32 @@ mod tests {
         sched.acquire();
         assert_eq!(sched.available(), 0);
 
-        // One release restores one permit, not more even after extra releases.
+        // Two releases matching the two acquires above are both legitimate
+        // and fully restore the pool to capacity. (An earlier version of this
+        // test asserted `1` here, expecting the second release to be treated
+        // as a "double release" — but with 2 real acquires outstanding, both
+        // releases genuinely pair with one, so both must count. Real callers
+        // pair acquire/release per blocking event (see
+        // `vt_acquire_carrier`/`vt_release_carrier` in `vm_exec.rs`), so two
+        // *different* virtual threads legitimately releasing back-to-back
+        // with no acquire in between is an expected pattern, not a bug —
+        // discounting the second release here would silently drop a real
+        // permit and starve the scheduler over time.)
         sched.release();
         sched.release();
         assert_eq!(
             sched.available(),
-            1,
-            "double release adds at most one permit"
+            2,
+            "two releases matching two prior acquires must fully restore the pool"
+        );
+
+        // A further release with no corresponding acquire is a genuine
+        // over-release and is still clamped rather than accumulated.
+        sched.release();
+        assert_eq!(
+            sched.available(),
+            2,
+            "an over-release beyond carrier_count is clamped, not accumulated"
         );
     }
 

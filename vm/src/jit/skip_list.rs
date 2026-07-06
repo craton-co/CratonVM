@@ -519,9 +519,23 @@ fn should_skip_jit_internal(
         // app/config packages interpreted under Conservative until the exact
         // JIT throughput/correctness defect is narrowed. Liftable with e.g.
         // `CRATONVM_JIT_ALLOW_PACKAGES=org/keycloak/,picocli/,io/smallrye/`.
+        //
+        // Carve-out: `org/keycloak/models/credential/` (the credential
+        // DTO/model classes, e.g. `PasswordCredentialData`,
+        // `PasswordSecretData`, `CredentialModel`) is unrelated to the
+        // Picocli-command / SmallRye-config-mapper timeout this ban targets
+        // — it's plain data-holder getters. KC-CRED.LAZY (2026-07-01,
+        // above in `is_known_miscompile`) already deliberately narrowed a
+        // real correctness bug in exactly two of these methods to a targeted
+        // entry gated behind `callee_saved_gpr_local_homes_enabled()`
+        // (default off), i.e. these getters were already meant to be
+        // JIT-eligible under the safe Conservative default. Without this
+        // carve-out this later, broader ban silently re-skip-lists them,
+        // regressing that earlier decision.
         if (class_name.starts_with("org/keycloak/")
             || class_name.starts_with("picocli/")
             || class_name.starts_with("io/smallrye/"))
+            && !class_name.starts_with("org/keycloak/models/credential/")
             && !package_allowed(class_name, allow_packages)
         {
             return Some(SkipReason::RustJvmTestFixture);
