@@ -1416,16 +1416,43 @@ pub(crate) fn sb_state(
     (buf, count)
 }
 
-/// Helper: write the StringBuilder count in the JDK 9+ field slot.
+/// Helper: write the StringBuilder count in the layout-appropriate slot.
 ///
-/// The real JDK layout is `value: byte[]`, `coder: byte`, `count: int`
-/// at slots 0/1/2. CratonVM keeps slot 0 as a synthetic `char[]`, but real
-/// bytecode can still run during Byte Buddy retransformation. Keep slot 1 as
-/// a plausible LATIN1 coder and mirror the count into slot 2 so that direct
-/// JDK `AbstractStringBuilder` bytecode does not read garbage capacity/counts.
+/// CratonVM's own synthetic StringBuilder/StringBuffer layout is 2 slots:
+/// `value: char[]` @0, `count: int` @1 (see `instance_fields(2)` in
+/// `classloading/src/class_manager.rs`) — this is the layout every object
+/// actually gets allocated with unless real `AbstractStringBuilder`
+/// bytecode itself constructs one (e.g. during Byte Buddy
+/// retransformation), which uses the real JDK 9+ 3-slot layout `value:
+/// byte[]` @0, `coder: byte` @1, `count: int` @2 instead.
+///
+/// A prior version of this helper unconditionally wrote slot 1 = 0 (as a
+/// LATIN1 `coder` placeholder) and mirrored `count` into slot 2, on the
+/// assumption every StringBuilder has the 3-slot real layout. Every
+/// StringBuilder actually allocated through CratonVM's own 2-slot
+/// synthetic path (i.e. essentially all of them) instead had its *real*
+/// count slot (slot 1) stomped to 0 on every append/insert/setLength call,
+/// and the slot-2 mirror silently dropped by the `gen_heap` OOB-write
+/// guard (num_slots=2 < index 2) — so `StringBuilder.length()` always
+/// read back 0 immediately after the write that was supposed to grow it.
+/// Java code with a growth loop keyed on `sb.length()` (e.g.
+/// `while (sb.length() < n) sb.append(c);`, seen during real
+/// `java.desktop`/`java.beans` clinit) never observed the length increase
+/// and spun forever, hammering the OOB guard on every iteration.
+///
+/// `object_num_fields` reports the object's *actual* allocated slot count
+/// (matching the `class_num_total_fields` idiom used elsewhere to avoid
+/// hard-coding a layout — see the `Timestamp` nanos-field fix), so branch
+/// on it instead of assuming either shape.
 fn sb_set_count(ctx: &mut dyn NativeContext, this: cratonvm_types::ObjectRef, count: i32) {
-    ctx.set_field(this, 1, Value::Int(0));
-    ctx.set_field(this, 2, Value::Int(count));
+    if ctx.object_num_fields(this) >= 3 {
+        // Real JDK 9+ layout: value@0, coder@1, count@2.
+        ctx.set_field(this, 1, Value::Int(0));
+        ctx.set_field(this, 2, Value::Int(count));
+    } else {
+        // CratonVM synthetic layout: value(char[])@0, count@1.
+        ctx.set_field(this, 1, Value::Int(count));
+    }
 }
 
 /// Helper: ensure the StringBuilder has capacity for `additional` more chars.
@@ -6462,7 +6489,17 @@ mod tests {
             ctx.set_array_element(buf, i, Value::Int(i32::from(c)));
         }
         ctx.set_field(sb, 0, Value::Object(Some(buf)));
-        ctx.set_field(sb, 1, Value::Int(chars.len() as i32));
+        // `make_sb` allocates 4 slots (mimicking the real JDK
+        // value/coder/count layout width), so the count belongs in slot 2,
+        // not slot 1 -- go through `sb_set_count` rather than poking a
+        // slot directly so this stays correct regardless of the mock's
+        // allocated width. A raw `set_field(sb, 1, ...)` here only wrote
+        // the slot `sb_state` reads as a *fallback*, which a 4-slot object
+        // never falls back to (slot 2 already holds a valid Int from
+        // `make_sb`'s `native_sb_init_default` call) -- every
+        // `sb_get_chars`/`sb_get_value`/`sb_get_coder` test using this
+        // helper silently saw count=0 regardless of `text`.
+        sb_set_count(ctx, sb, chars.len() as i32);
         sb
     }
 
