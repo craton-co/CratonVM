@@ -65,9 +65,16 @@ Already-tracked, not re-documented: the 37 `testsuite/model` CRASHes were the
 now **FIXED** (2026-07-06) — moved to `docs/internal/fixed-suite-bugs/`. The
 same identity-wrapper bug shape one step deeper in the same boot path,
 [Infinispan ConfigurationBuilder.build() ClassCastException](../internal/fixed-suite-bugs/keycloak-model-infinispan-configurationbuilder-classcastexception.md),
-is now **also FIXED** (2026-07-06). `RealmModelTest` now reaches a distinct,
-unrelated residual one layer deeper:
-[Netty PlatformDependent0 reflective setAccessible(true) disabled](keycloak-model-netty-reflective-setaccessible-disabled.md).
+is now **also FIXED** (2026-07-06). `RealmModelTest` then reached a residual
+that was initially misdiagnosed as a Netty `PlatformDependent0` setAccessible
+bug -- that diagnosis was wrong (refuted via bytecode decompilation + A/B
+testing against real JDK 25); the actual cause,
+[Infinispan JGroupsTransport.start() never invoked](../internal/fixed-suite-bugs/keycloak-model-jgroupstransport-start-never-invoked-FIXED.md)
+(a `DefaultCacheManager.start()`/`stop()` native shim intercepting real
+objects unconditionally), is now **also FIXED** (2026-07-06). `RealmModelTest`
+now reaches a distinct residual one layer deeper, in the same "synthetic
+native shim intercepts a real object" family:
+[Infinispan Cache.config null after real DefaultCacheManager.start()](keycloak-model-infinispan-cache-config-null-after-real-start.md).
 Not CratonVM bugs: 543 FAILs (`testsuite/integration-arquillian/tests/base`
 + `tests/other/sssd`, exhaustively confirmed - 543/544 exact match, the 544th
 is the System Rules finding above) are "Not found frontend container:
@@ -680,8 +687,11 @@ PreviewFeatures native crash. The remaining non-passed rows are tracked here:
   instead of a raw synthetic slot index, then removing the identity-wrapper
   native the same way as `GlobalConfigurationBuilder.build()`. Moved to
   `docs/internal/fixed-suite-bugs/keycloak-model-infinispan-configurationbuilder-classcastexception.md`.
-  `RealmModelTest` now reaches a distinct, unrelated residual tracked in
-  [keycloak-model-netty-reflective-setaccessible-disabled.md](keycloak-model-netty-reflective-setaccessible-disabled.md).
+  `RealmModelTest` then reached a residual initially misdiagnosed as a Netty
+  setAccessible bug; the actual cause was
+  [Infinispan JGroupsTransport.start() never invoked](../internal/fixed-suite-bugs/keycloak-model-jgroupstransport-start-never-invoked-FIXED.md),
+  now FIXED. `RealmModelTest` now reaches a distinct residual tracked in
+  [keycloak-model-infinispan-cache-config-null-after-real-start.md](keycloak-model-infinispan-cache-config-null-after-real-start.md).
 - [keycloak-sssd-system1-findbootstrapclassornull-nosuchmethod.md](keycloak-sssd-system1-findbootstrapclassornull-nosuchmethod.md) -
   2 `FAIL` rows in the SSSD module, missing
   `java/lang/System$1.findBootstrapClassOrNull(String)Class`.
