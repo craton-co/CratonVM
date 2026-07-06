@@ -4480,6 +4480,128 @@ pub fn register_io_natives(registry: &mut NativeMethodRegistry) {
     // Releases the OS fd stashed on the descriptor's own `fd`/`handle`.
     registry.register("java/io/FileDescriptor", "close0", "()V", native_fd_close0);
 
+    // sun.nio.ch.UnixDispatcher.close0(FileDescriptor) — the static
+    // NativeDispatcher-family close used by java.net.MulticastSocket's
+    // underlying DatagramChannelImpl (reached e.g. via JGroups'
+    // DiagnosticsHandler/UDP transport standing up a multicast socket).
+    // `UnixDispatcher.init()` was already a no-op above since our socket
+    // I/O doesn't route through a native dispatcher table, but `close0`
+    // itself was never registered, so a real MulticastSocket close hit an
+    // UnsatisfiedLinkError. Same calling convention as the instance
+    // `FileDescriptor.close0()V` above — `args[0]` is the FileDescriptor
+    // either way (an explicit static parameter here vs. `this` there) —
+    // so the same handler applies unchanged.
+    registry.register(
+        "sun/nio/ch/UnixDispatcher",
+        "close0",
+        "(Ljava/io/FileDescriptor;)V",
+        native_fd_close0,
+    );
+
+    // sun.nio.ch.NativeSocketAddress's 12 native probes -- struct layout
+    // constants for the platform's `sockaddr_in`/`sockaddr_in6`, used by
+    // the newer native-memory-based socket address encoding that
+    // MulticastSocket/DatagramChannel routes through (reached e.g. by
+    // JGroups' UDP transport creating a multicast socket). These are fixed
+    // platform ABI values, not runtime-computed state, so read them
+    // straight off Rust's own `libc::sockaddr_in`/`sockaddr_in6` layout
+    // (compiled for the same target CratonVM runs on) instead of
+    // hardcoding platform-specific magic numbers.
+    registry.register("sun/nio/ch/NativeSocketAddress", "AFINET", "()I", |_ctx, _args| {
+        Ok(Some(Value::Int(libc::AF_INET)))
+    });
+    registry.register("sun/nio/ch/NativeSocketAddress", "AFINET6", "()I", |_ctx, _args| {
+        Ok(Some(Value::Int(libc::AF_INET6)))
+    });
+    registry.register(
+        "sun/nio/ch/NativeSocketAddress",
+        "sizeofSockAddr4",
+        "()I",
+        |_ctx, _args| Ok(Some(Value::Int(std::mem::size_of::<libc::sockaddr_in>() as i32))),
+    );
+    registry.register(
+        "sun/nio/ch/NativeSocketAddress",
+        "sizeofSockAddr6",
+        "()I",
+        |_ctx, _args| Ok(Some(Value::Int(std::mem::size_of::<libc::sockaddr_in6>() as i32))),
+    );
+    registry.register(
+        "sun/nio/ch/NativeSocketAddress",
+        "sizeofFamily",
+        "()I",
+        |_ctx, _args| Ok(Some(Value::Int(std::mem::size_of::<libc::sa_family_t>() as i32))),
+    );
+    registry.register(
+        "sun/nio/ch/NativeSocketAddress",
+        "offsetFamily",
+        "()I",
+        |_ctx, _args| {
+            Ok(Some(Value::Int(
+                std::mem::offset_of!(libc::sockaddr_in, sin_family) as i32,
+            )))
+        },
+    );
+    registry.register(
+        "sun/nio/ch/NativeSocketAddress",
+        "offsetSin4Port",
+        "()I",
+        |_ctx, _args| {
+            Ok(Some(Value::Int(
+                std::mem::offset_of!(libc::sockaddr_in, sin_port) as i32,
+            )))
+        },
+    );
+    registry.register(
+        "sun/nio/ch/NativeSocketAddress",
+        "offsetSin4Addr",
+        "()I",
+        |_ctx, _args| {
+            Ok(Some(Value::Int(
+                std::mem::offset_of!(libc::sockaddr_in, sin_addr) as i32,
+            )))
+        },
+    );
+    registry.register(
+        "sun/nio/ch/NativeSocketAddress",
+        "offsetSin6Port",
+        "()I",
+        |_ctx, _args| {
+            Ok(Some(Value::Int(
+                std::mem::offset_of!(libc::sockaddr_in6, sin6_port) as i32,
+            )))
+        },
+    );
+    registry.register(
+        "sun/nio/ch/NativeSocketAddress",
+        "offsetSin6Addr",
+        "()I",
+        |_ctx, _args| {
+            Ok(Some(Value::Int(
+                std::mem::offset_of!(libc::sockaddr_in6, sin6_addr) as i32,
+            )))
+        },
+    );
+    registry.register(
+        "sun/nio/ch/NativeSocketAddress",
+        "offsetSin6ScopeId",
+        "()I",
+        |_ctx, _args| {
+            Ok(Some(Value::Int(
+                std::mem::offset_of!(libc::sockaddr_in6, sin6_scope_id) as i32,
+            )))
+        },
+    );
+    registry.register(
+        "sun/nio/ch/NativeSocketAddress",
+        "offsetSin6FlowInfo",
+        "()I",
+        |_ctx, _args| {
+            Ok(Some(Value::Int(
+                std::mem::offset_of!(libc::sockaddr_in6, sin6_flowinfo) as i32,
+            )))
+        },
+    );
+
     // P69-Cleaner-realfix: the `FileCleanable.register` no-op was removed.
     // It existed because the synthetic `java.lang.ref.Cleaner` left a
     // bogus `impl` field, so the real `PhantomCleanable.<init>` ->

@@ -987,13 +987,74 @@ fn native_dcm_define_configuration(
     ))
 }
 
+/// Distinguish a REAL `DefaultCacheManager` (built via the un-shimmed
+/// `(ConfigurationBuilderHolder, boolean)` constructor -- the overload
+/// Keycloak's own `DefaultInfinispanConnectionProviderFactory` actually
+/// uses, see `native_dcm_init`'s doc comment; that overload is NOT
+/// registered there) from one built by `native_dcm_init`'s synthetic
+/// shim, for `native_dcm_start`/`native_dcm_stop` below.
+///
+/// Checking `DCM_FIELD_HANDLE` (field 0, "caches" on the real class) by
+/// raw index doesn't round-trip reliably: this class's synthetic 3-slot
+/// (handle/config_name/started) layout registration overrides field-type
+/// metadata for its first few indices, so a zero-initialized *reference*
+/// field there decodes as `Value::Int(0)` instead of `Value::Object(None)`
+/// -- indistinguishable from a real, not-yet-set field of a different
+/// type. `globalComponentRegistry` sits well past that range: the real
+/// constructor sets it unconditionally, early, and `native_dcm_init`
+/// never touches it, so it reliably reads `Object(None)` for a synthetic
+/// instance and a real `GlobalComponentRegistry` reference for a
+/// fully-constructed real one.
+fn is_real_dcm(ctx: &dyn NativeContext, this: ObjectRef) -> bool {
+    !matches!(
+        ctx.get_field_by_name(this, "globalComponentRegistry"),
+        Value::Object(None)
+    )
+}
+
 /// `DefaultCacheManager.start()` / `stop()`.
-fn native_dcm_start(_ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
+///
+/// This native is registered unconditionally on the class (native dispatch
+/// is keyed by class+method+descriptor, not by which constructor built the
+/// receiver), so it also intercepts `.start()`/`.stop()` on a REAL
+/// `DefaultCacheManager` (see `is_real_dcm` above). Left unguarded, a real
+/// object's `.start()` call was silently swallowed: the synthetic
+/// `global_manager().start()` ran against the unrelated process-wide
+/// synthetic cache, while the real object's own `internalStart(boolean)`
+/// (which starts `GlobalComponentRegistry` -- module lifecycles, JGroups
+/// transport, etc.) never executed. That left `JGroupsTransport.channel`
+/// permanently null, surfacing later as an NPE in
+/// `DefaultInfinispanConnectionProviderFactory.createEmbeddedCacheManager`
+/// (see docs/known-issues/keycloak-model-netty-reflective-setaccessible-disabled.md).
+///
+/// For a real object, delegate directly to the real
+/// `internalStart(boolean)`/`internalStop()` (bypassing the
+/// natively-overridden `start()`/`stop()` bytecode itself, which would
+/// just re-enter this native) -- this is what `start()`/`stop()`'s own
+/// real bytecode calls after an `authorizer.checkPermission(...)` guard we
+/// don't replicate here; skipping it is safe since it's a no-op whenever
+/// `GlobalSecurityConfiguration` authorization isn't enabled (Infinispan's
+/// default, and Keycloak's local cache manager doesn't enable it).
+fn native_dcm_start(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match obj_arg(args, 0) {
+        Some(o) => o,
+        None => return Ok(None),
+    };
+    if is_real_dcm(ctx, this) {
+        return ctx.invoke_virtual(this, "internalStart", "(Z)V", &[Value::Int(1)]);
+    }
     global_manager().start();
     Ok(None)
 }
 
-fn native_dcm_stop(_ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
+fn native_dcm_stop(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match obj_arg(args, 0) {
+        Some(o) => o,
+        None => return Ok(None),
+    };
+    if is_real_dcm(ctx, this) {
+        return ctx.invoke_virtual(this, "internalStop", "()V", &[]);
+    }
     global_manager().stop();
     Ok(None)
 }
