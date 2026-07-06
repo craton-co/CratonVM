@@ -32,14 +32,38 @@ pub struct FreeBlock {
 /// prefer those holes (first sufficiently-large block) before bumping
 /// the cursor. A full-arena [`Arena::reset`] clears both the cursor and
 /// the free list.
+/// Tier boundary for the segregated free lists: blocks smaller than this go
+/// on `free_small`, the rest on `free_large`. Motivation (binarytrees-18
+/// profile, 2026-07-06): a single first-fit free list mixes ~100k node-sized
+/// holes with a handful of big coalesced spans, so TLAB-refill-sized requests
+/// scanned the entire small-hole prefix before reaching a span (70% of wall
+/// clock split between `Arena::alloc` and the young allocation probe). With
+/// the split, object-sized requests first-fit the small list at ~index 0
+/// (holes are node-sized) and chunk-sized requests consult ONLY the short
+/// span list. 4 KiB sits far above any normal object (72 B nodes) and far
+/// below the minimum TLAB refill (16 KiB+).
+const LARGE_BLOCK_MIN: usize = 4096;
+
+/// Per-allocation scan budget for the small-hole tier — see
+/// [`Arena::first_fit`]. 16 keeps the uniform-hole case (hit at ~index 0)
+/// untouched while capping the dust-prefix walk at a handful of compares;
+/// a miss falls through to the bump tail / caller's old-gen spill.
+const SMALL_TIER_SCAN_BUDGET: usize = 16;
+
 pub struct Arena {
     /// Backing storage. Pre-allocated to `capacity` bytes.
     data: Vec<u8>,
     /// Next free byte offset within `data` (bump-allocation high-water mark).
     cursor: usize,
-    /// Reclaimed regions below `cursor`, produced by the non-moving sweep.
+    /// Reclaimed regions below `cursor` SMALLER than [`LARGE_BLOCK_MIN`],
+    /// produced by the non-moving sweep (typically object-sized holes).
     /// Empty unless a JIT-frame-safe mark-sweep has run.
-    free_list: Vec<FreeBlock>,
+    free_small: Vec<FreeBlock>,
+    /// Reclaimed regions of at least [`LARGE_BLOCK_MIN`] bytes — the
+    /// coalesced spans TLAB refills and array allocations carve from. Stays
+    /// short (the post-sweep coalescer merges adjacent holes into a handful
+    /// of spans), so scanning it is cheap.
+    free_large: Vec<FreeBlock>,
     /// Conservative UPPER BOUND on the size of the largest free-list block
     /// (`actual_max <= max_free_upper` always). Maintained so hot callers can
     /// answer "no block of >= size exists" in O(1) instead of scanning the
@@ -70,9 +94,78 @@ impl Arena {
         Self {
             data,
             cursor: 0,
-            free_list: Vec::new(),
+            free_small: Vec::new(),
+            free_large: Vec::new(),
             max_free_upper: 0,
         }
+    }
+
+    /// Route a block to its size tier. Does NOT touch `max_free_upper` — the
+    /// callers that can GROW the true maximum ([`Self::add_free_block`]) bump
+    /// it themselves; split remainders are strictly smaller than the block
+    /// they came from, so routing them leaves the bound valid.
+    #[inline]
+    fn push_block_routed(&mut self, block: FreeBlock) {
+        if block.size == 0 {
+            return;
+        }
+        if block.size < LARGE_BLOCK_MIN {
+            self.free_small.push(block);
+        } else {
+            self.free_large.push(block);
+        }
+    }
+
+    /// First-fit scan of ONE tier, visiting at most `max_scan` blocks. On a
+    /// fit: removes the block (O(1) `swap_remove`), returns the aligned
+    /// allocation offset plus up to two remainder blocks (head alignment
+    /// padding, tail leftover) for the caller to re-route by size. `None` =
+    /// nothing within the scan budget fits.
+    ///
+    /// The budget exists for the SMALL tier: `swap_remove` back-fills with
+    /// the most recently pushed block, so tiny split remainders ("dust")
+    /// drift toward the scan prefix, and an unbounded first-fit paid an
+    /// ever-growing dust walk on every object-sized allocation
+    /// (binarytrees-18: `Arena::alloc` was 47% of wall). A bounded scan
+    /// keeps the uniform-hole hit at ~index 0 while a dusty prefix gives up
+    /// quickly — the caller falls through to the bump tail / old-gen spill,
+    /// both valid homes for the object. Skipped blocks stay on the list, so
+    /// the sweep walker's hole map (`free_blocks_sorted`) is unaffected.
+    #[inline]
+    fn first_fit(
+        list: &mut Vec<FreeBlock>,
+        base: usize,
+        size: usize,
+        align: usize,
+        max_scan: usize,
+    ) -> Option<(usize, [Option<FreeBlock>; 2])> {
+        for i in 0..list.len().min(max_scan) {
+            let block = list[i];
+            let block_addr = base + block.offset;
+            let aligned_addr = (block_addr + align - 1) & !(align - 1);
+            let padding = aligned_addr - block_addr;
+            // Overflow means this block can't satisfy the request; skip it
+            // rather than aborting the whole `alloc` (the bump path below
+            // may still succeed).
+            let Some(total_needed) = padding.checked_add(size) else {
+                continue;
+            };
+            if total_needed <= block.size {
+                let alloc_offset = block.offset + padding;
+                let remaining = block.size - padding - size;
+                list.swap_remove(i);
+                let head = (padding > 0).then_some(FreeBlock {
+                    offset: block.offset,
+                    size: padding,
+                });
+                let tail = (remaining > 0).then_some(FreeBlock {
+                    offset: alloc_offset + size,
+                    size: remaining,
+                });
+                return Some((alloc_offset, [head, tail]));
+            }
+        }
+        None
     }
 
     /// Bump-allocate `size` bytes with the given alignment.
@@ -92,67 +185,54 @@ impl Arena {
         // O(1) fail-fast: padding >= 0 means every block needs
         // `total_needed >= size`; if even the (upper bound of the) largest
         // block is smaller than `size`, no block can satisfy the request —
-        // skip the scan entirely and go straight to the bump path. This is
-        // the common case for large requests against a fragmented young
-        // free list (e.g. TLAB-refill-sized carves).
-        if !self.free_list.is_empty() && size <= self.max_free_upper {
+        // skip the scans entirely and go straight to the bump path.
+        if (!self.free_small.is_empty() || !self.free_large.is_empty())
+            && size <= self.max_free_upper
+        {
             let base = self.data.as_ptr() as usize;
-            // Track the exact max while scanning so a FAILED scan tightens
-            // `max_free_upper` — the next same-or-larger request then
-            // fail-fasts in O(1) instead of re-scanning.
-            let mut scan_max = 0usize;
-            for i in 0..self.free_list.len() {
-                let block = self.free_list[i];
-                scan_max = scan_max.max(block.size);
-                let block_addr = base + block.offset;
-                let aligned_addr = (block_addr + align - 1) & !(align - 1);
-                let padding = aligned_addr - block_addr;
-                // Overflow here means this block can't satisfy the request;
-                // skip it rather than aborting the whole `alloc` (the bump
-                // path below may still succeed).
-                let Some(total_needed) = padding.checked_add(size) else {
-                    continue;
-                };
-                if total_needed <= block.size {
-                    let alloc_offset = block.offset + padding;
-                    let remaining = block.size - padding - size;
-                    // Perf (Fix A follow-up): the hot case is an 8-aligned request
-                    // (padding == 0) carved off the FRONT of a large coalesced span
-                    // — bintrees' Node churn out of the post-sweep free list. Shrink
-                    // the block IN PLACE (advance offset, reduce size) instead of
-                    // swap_remove + push, so a big span allocates at ~bump speed
-                    // (no per-allocation Vec churn). The general (head-padding) case
-                    // keeps the split-and-reinsert path.
-                    if padding == 0 {
-                        if remaining > 0 {
-                            self.free_list[i].offset = alloc_offset + size;
-                            self.free_list[i].size = remaining;
-                        } else {
-                            self.free_list.swap_remove(i); // span exactly consumed
-                        }
-                    } else {
-                        // swap_remove keeps this O(1).
-                        self.free_list.swap_remove(i);
-                        self.free_list.push(FreeBlock {
-                            offset: block.offset,
-                            size: padding,
-                        });
-                        if remaining > 0 {
-                            self.free_list.push(FreeBlock {
-                                offset: alloc_offset + size,
-                                size: remaining,
-                            });
-                        }
-                    }
-                    // SAFETY: `alloc_offset + size <= block.offset + block.size`
-                    // and the block came from a region inside the buffer.
-                    return Some(unsafe { self.data.as_mut_ptr().add(alloc_offset) });
+            // Tier selection: a request whose worst-case need (size + max
+            // alignment padding) reaches LARGE_BLOCK_MIN can never be served
+            // by a small block — skip the (potentially long) small list
+            // entirely. Smaller requests try the small tier first: its
+            // blocks are object-sized holes, so a same-shaped request
+            // first-fits at ~index 0.
+            let worst_need = size.saturating_add(align - 1);
+            let hit = if worst_need < LARGE_BLOCK_MIN {
+                Self::first_fit(
+                    &mut self.free_small,
+                    base,
+                    size,
+                    align,
+                    SMALL_TIER_SCAN_BUDGET,
+                )
+                .or_else(|| {
+                    Self::first_fit(&mut self.free_large, base, size, align, usize::MAX)
+                })
+            } else {
+                Self::first_fit(&mut self.free_large, base, size, align, usize::MAX)
+            };
+            if let Some((alloc_offset, remainders)) = hit {
+                for r in remainders.into_iter().flatten() {
+                    self.push_block_routed(r);
                 }
+                // SAFETY: `alloc_offset + size` lies within the consumed
+                // block, which came from a region inside the buffer.
+                return Some(unsafe { self.data.as_mut_ptr().add(alloc_offset) });
             }
-            // Full scan found no fit: `scan_max` is now the EXACT largest
-            // block size, so tighten the upper bound (sound — alloc only
-            // shrinks/splits blocks; only add_free_block can raise it again).
-            self.max_free_upper = scan_max;
+            // No fit. Tighten the upper bound only when the failure was a
+            // FULL view of the relevant tiers (a bounded small-tier scan
+            // may have skipped bigger blocks, so its miss proves nothing).
+            if worst_need >= LARGE_BLOCK_MIN {
+                // The whole span tier was scanned; the small tier caps below
+                // LARGE_BLOCK_MIN <= worst_need by construction.
+                let large_max = self.free_large.iter().map(|b| b.size).max().unwrap_or(0);
+                let small_cap = if self.free_small.is_empty() {
+                    0
+                } else {
+                    LARGE_BLOCK_MIN - 1
+                };
+                self.max_free_upper = self.max_free_upper.min(large_max.max(small_cap));
+            }
         }
 
         // Bump-allocation path: align the cursor up (checked to prevent
@@ -190,19 +270,21 @@ impl Arena {
             return;
         }
         self.max_free_upper = self.max_free_upper.max(size);
-        self.free_list.push(FreeBlock { offset, size });
+        self.push_block_routed(FreeBlock { offset, size });
     }
 
     /// Drop every reclaimed region. Called when the arena is about to be
     /// swapped or reset so the next collection cycle starts clean.
     pub fn clear_free_list(&mut self) {
-        self.free_list.clear();
+        self.free_small.clear();
+        self.free_large.clear();
         self.max_free_upper = 0;
     }
 
-    /// Total bytes currently held on the free list (reclaimed but unallocated).
+    /// Total bytes currently held on the free lists (reclaimed but unallocated).
     pub fn free_list_bytes(&self) -> usize {
-        self.free_list.iter().map(|b| b.size).sum()
+        self.free_small.iter().map(|b| b.size).sum::<usize>()
+            + self.free_large.iter().map(|b| b.size).sum::<usize>()
     }
 
     /// Size of the largest single free-list block (0 if the free list is
@@ -214,44 +296,75 @@ impl Arena {
     /// allocation can actually use (the free list is non-coalescing across
     /// blocks within one request).
     pub fn largest_free_block(&self) -> usize {
-        self.free_list.iter().map(|b| b.size).max().unwrap_or(0)
+        self.free_small
+            .iter()
+            .chain(self.free_large.iter())
+            .map(|b| b.size)
+            .max()
+            .unwrap_or(0)
     }
 
-    /// Early-exit probe: is there any single free-list block of at least
-    /// `size` bytes?
+    /// Early-exit probe: is there any single free block of at least `size`
+    /// bytes?
     ///
     /// Semantically `largest_free_block() >= size`, but cheap on the hot
     /// allocation-probe path:
     /// * O(1) "no" when `size > max_free_upper` (the cached upper bound).
-    /// * Early-exit "yes" at the first satisfying block — for small object
-    ///   sizes against a fragmented free list this is usually the first
-    ///   block, where `largest_free_block` always walked the entire list.
+    /// * O(1) "yes" for any sub-[`LARGE_BLOCK_MIN`] request while the span
+    ///   tier is non-empty (every span is bigger by definition).
+    /// * `size >= LARGE_BLOCK_MIN` consults ONLY the short span tier — the
+    ///   long small-hole tier can never satisfy it.
     /// * A full failed scan tightens `max_free_upper` to the exact maximum,
     ///   so subsequent same-or-larger probes become O(1).
     pub fn has_free_block_at_least(&mut self, size: usize) -> bool {
         if size == 0 {
-            return !self.free_list.is_empty();
+            return !self.free_small.is_empty() || !self.free_large.is_empty();
         }
         if size > self.max_free_upper {
             return false;
         }
-        let mut scan_max = 0usize;
-        for b in &self.free_list {
-            if b.size >= size {
-                return true;
+        if size < LARGE_BLOCK_MIN {
+            if !self.free_large.is_empty() {
+                return true; // every span is >= LARGE_BLOCK_MIN > size
             }
-            scan_max = scan_max.max(b.size);
+            let mut scan_max = 0usize;
+            for b in &self.free_small {
+                if b.size >= size {
+                    return true;
+                }
+                scan_max = scan_max.max(b.size);
+            }
+            self.max_free_upper = scan_max;
+            false
+        } else {
+            let mut scan_max = 0usize;
+            for b in &self.free_large {
+                if b.size >= size {
+                    return true;
+                }
+                scan_max = scan_max.max(b.size);
+            }
+            // The small tier caps below LARGE_BLOCK_MIN; fold it into the
+            // tightened bound conservatively rather than scanning it.
+            self.max_free_upper = scan_max.max(if self.free_small.is_empty() {
+                0
+            } else {
+                LARGE_BLOCK_MIN - 1
+            });
+            false
         }
-        self.max_free_upper = scan_max;
-        false
     }
 
     /// Snapshot of the current free list as `(offset, size)` pairs,
     /// sorted by ascending offset. Used by the non-moving sweep's object
     /// walker to skip holes the same way `OldGen::walk_objects` does.
     pub fn free_blocks_sorted(&self) -> Vec<(usize, usize)> {
-        let mut v: Vec<(usize, usize)> =
-            self.free_list.iter().map(|b| (b.offset, b.size)).collect();
+        let mut v: Vec<(usize, usize)> = self
+            .free_small
+            .iter()
+            .chain(self.free_large.iter())
+            .map(|b| (b.offset, b.size))
+            .collect();
         v.sort_by_key(|&(off, _)| off);
         v
     }
@@ -290,7 +403,8 @@ impl Arena {
         // Zero out used region for safety (prevents stale data reads)
         self.data[..self.cursor].fill(0);
         self.cursor = 0;
-        self.free_list.clear();
+        self.free_small.clear();
+        self.free_large.clear();
         self.max_free_upper = 0;
     }
 
@@ -312,7 +426,8 @@ impl Arena {
     #[allow(dead_code)]
     pub unsafe fn reset_no_zero(&mut self) {
         self.cursor = 0;
-        self.free_list.clear();
+        self.free_small.clear();
+        self.free_large.clear();
         self.max_free_upper = 0;
     }
 
@@ -535,6 +650,50 @@ mod tests {
         arena.clear_free_list();
         assert!(!arena.has_free_block_at_least(1));
         assert!(arena.has_free_block_at_least(0) == false);
+    }
+
+    #[test]
+    fn arena_tiered_free_lists_route_and_serve_by_size() {
+        let mut arena = Arena::new(64 * 1024);
+        let cap = arena.capacity();
+        assert!(arena.alloc(cap, 8).is_some()); // exhaust bump tail
+
+        // A big coalesced span + a pile of node-sized holes.
+        arena.add_free_block(0, 32 * 1024); // → free_large
+        for i in 0..100 {
+            arena.add_free_block(40 * 1024 + i * 72, 72); // → free_small
+        }
+
+        // Chunk-sized request is served from the span tier (the small holes
+        // can never satisfy it and must not be scanned — behaviorally: it
+        // just succeeds).
+        assert!(arena.alloc(16 * 1024, 8).is_some());
+        // Object-sized requests are served from the hole tier.
+        assert!(arena.alloc(72, 8).is_some());
+        assert!(arena.alloc(72, 8).is_some());
+
+        // Probes: sub-tier-boundary probe answers O(1)-yes while a span
+        // remains; chunk-sized probe consults spans only.
+        assert!(arena.has_free_block_at_least(72));
+        assert!(arena.has_free_block_at_least(8 * 1024));
+        assert!(!arena.has_free_block_at_least(33 * 1024));
+
+        // Consume the span remainder; chunk probes now answer false while
+        // hole-sized probes still answer true.
+        assert!(arena.alloc(16 * 1024 - 16, 8).is_some());
+        assert!(!arena.has_free_block_at_least(LARGE_BLOCK_MIN));
+        assert!(arena.has_free_block_at_least(72));
+
+        // Splitting a span routes a sub-tier remainder to the small list:
+        // reclaim a 5 KiB block, carve 4.5 KiB → ~0.5 KiB remainder must
+        // still be findable by a small request.
+        let mut a2 = Arena::new(8 * 1024);
+        let c2 = a2.capacity();
+        assert!(a2.alloc(c2, 8).is_some());
+        a2.add_free_block(0, 5 * 1024);
+        assert!(a2.alloc(4 * 1024 + 512, 8).is_some());
+        assert!(a2.has_free_block_at_least(256));
+        assert!(a2.alloc(256, 8).is_some());
     }
 
     #[test]

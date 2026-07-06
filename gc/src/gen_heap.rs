@@ -6453,6 +6453,20 @@ impl GenerationalHeap {
         false
     }
 
+    /// Amortized-O(1) probe: could a young `refill_tlab(size)` be served from
+    /// the RECLAIMED free list right now? Early-exits at the first
+    /// sufficiently-large block and fail-fasts through the cached
+    /// `max_free_upper` bound (`Arena::has_free_block_at_least`), so unlike
+    /// `largest_free_block` it is safe to consult per allocation. Paired with
+    /// [`Self::young_bump_headroom`] this is the JIT TLAB-refill gate: after
+    /// a non-moving sweep + coalesce the young free list is a handful of big
+    /// spans, so refills keep flowing out of reclaimed space without forcing
+    /// a GC — while a genuinely-full young answers `false` in O(1) and the
+    /// caller takes the old-gen spill exactly as before.
+    pub fn young_has_free_block(&self, size: usize) -> bool {
+        self.young_from.lock().has_free_block_at_least(size)
+    }
+
     /// Carve out a TLAB-sized chunk from the young from-space.
     ///
     /// Returns `Some((ptr, size))` on success, where `ptr` is the start of
