@@ -1,10 +1,12 @@
 # Elasticsearch Lucene binary doc-values range query hangs
 
 Status: open (root causes #1 and #2 FIXED; a narrower residual stall in
-`testAllEqual` remains, not yet isolated)
+`testAllEqual` remains — confirmed NOT JIT-related, reproduces identically
+under `--nojit`; strong new evidence points to `ReentrantReadWriteLock`'s
+read-lock hold-count bookkeeping, not yet isolated to a specific fix)
 
 Date observed: 2026-07-02
-Date updated: 2026-07-04 (third update, same day)
+Date updated: 2026-07-05 (fourth update)
 
 ## Summary
 
@@ -78,44 +80,74 @@ Root-caused to **two independent bugs** stacked in the same test run:
    -p cratonvm-jit`/`-p cratonvm-vm` (115 test groups) green on both rounds
    and after merging. `bt18` checksum unchanged (`68332206`).
 
-3. **OPEN, narrower residual**: with #1 and #2 (both rounds) fixed and
-   merged, the real `LongRandomBinaryDocValuesRangeQueryTests` now makes
-   *substantial, concrete* progress — it used to stall permanently on the
-   very first test method (`testRandomTiny`); it now runs through most of
-   the class and reaches `testAllEqual` before stalling. At that point two
-   threads (the main test-runner thread and one `TaskExecutor` pool worker)
-   are permanently parked at the identical bytecode offset in
-   `AbstractQueuedLongSynchronizer.acquire`, contending for the same
-   `LRUQueryCache` write lock, confirmed unmoving across a 600-second window
-   (only one stack dump each, no redump churn, vs. hundreds of redumps for
-   the unrelated `ThreadLeakControl` monitor thread — i.e. genuinely parked,
-   not slow).
+3. **OPEN, narrower residual — now root-caused to read-lock hold-count
+   bookkeeping**: with #1 and #2 (both rounds) fixed and merged, the real
+   `LongRandomBinaryDocValuesRangeQueryTests` now makes *substantial,
+   concrete* progress — it used to stall permanently on the very first test
+   method (`testRandomTiny`); it now runs through most of the class and
+   reaches `testAllEqual` before stalling. At that point two `TaskExecutor`
+   pool worker threads are permanently parked at the identical bytecode
+   offset (bci 368, the `LockSupport.park(this)` call site) inside
+   `AbstractQueuedLongSynchronizer.acquire`'s 6-arg overload, contending for
+   the same `LRUQueryCache` write lock via `LRUQueryCache.putIfAbsent` →
+   `ReentrantReadWriteLock$WriteLock.lock()`. No thread holds/uses the lock
+   at dump time — a genuine lost wakeup, not slowness.
+
+   **Re-ran on 2026-07-05 against current `dev` tip** with a direct
+   `-Dtests.method=testAllEqual` `org.junit.runner.JUnitCore` invocation and
+   a 90s `--stack-dump-on-timeout`: the hang reproduces identically, and
+   **reproduces byte-for-byte identically with `--nojit`** (interpreter
+   only) — this rules out the JIT/skip-list entirely. One specific
+   hypothesis (the `ThreadRegistry::thread_obj_to_park` reverse-index keyed
+   by a raw, GC-move-sensitive pointer) was checked and ruled out —
+   `update_thread_objs_after_gc` (`vm/src/threading/thread_registry.rs`)
+   already re-keys it on every moving GC, wired up at
+   `vm/src/memory/gc.rs:568`. Likewise `MonitorTable::cas_locks`
+   (`vm/src/threading/monitor.rs`) has an equivalent, well-tested
+   `remap_after_gc`. A hypothesis that `Unsafe.compareAndSetReference`'s
+   argument-recovery path (`recover_object_arg`,
+   `native-builtins/src/lib.rs`) silently coerces a corrupted CAS argument to
+   `null` was also checked with temporary diagnostic logging and did **not**
+   fire during the repro — ruled out.
+
+   **Breakthrough**: adding temporary `tracing::warn!` calls to `park()`/
+   `unpark()` (`vm/src/vm/vm_exec.rs`) to trace the exact call sequence
+   changed the race's timing enough that, instead of hanging, the exact same
+   repro threw a **real, concrete exception**:
+   `java.lang.IllegalMonitorStateException: attempt to unlock read lock, not
+   locked by current thread` — thrown by
+   `ReentrantReadWriteLock$Sync.tryReleaseShared` (via its private
+   `unmatchedUnlockException()` helper) when a thread's read-lock hold count,
+   as tracked by the `firstReader`/`firstReaderHoldCount` fast-path fields or
+   the `cachedHoldCounter`/`readHolds` (`ThreadLocal<HoldCounter>`) fallback,
+   doesn't show a positive count for the releasing thread. `testAllEqual`
+   hits the cache via the **read** lock (`LRUQueryCache.get`) on 999 of its
+   1000 identical searches (only the first is a miss going through the write
+   lock), so this points squarely at read-lock hold-count tracking under
+   heavy read contention — a substantially more tractable lead than "silent
+   hang, cause unknown". Leading theory: `firstReader`/`firstReaderHoldCount`
+   are plain (non-volatile) fields in real JDK source, whose correctness
+   relies on a subtle happens-before relationship established by the
+   surrounding CAS on `state` — if CratonVM's interpreter/JIT does not
+   preserve that exact plain-write-then-CAS ordering relationship for
+   cross-thread visibility, this specific fast-path optimization could
+   observe stale/wrong counts under contention even though `ThreadLocal`
+   and CAS each work correctly in isolation. Not yet fixed — the temporary
+   diagnostic tracing was reverted (not committed) after confirming the
+   finding; needs a fix targeting that ordering guarantee, then
+   reconfirmation that the hang (not just the exception under perturbed
+   timing) is resolved.
 
    `testAllEqual`'s shape: `Arrays.fill()` of `atLeast(1000)` range entries
-   with a single random range repeated identically, then `verify()` — so
-   every leaf search during verification uses an `equals()`-identical query,
+   with a single random range repeated identically, then `verify()` — every
+   leaf search during verification uses an `equals()`-identical query,
    hammering the *same* `LRUQueryCache` entry far more intensely than the
-   varied-bounds tests. Two increasingly targeted standalone Lucene-only
-   repros were built to isolate this in isolation from the full ES/
-   randomizedtesting harness (both real `IndexSearcher`/`LRUQueryCache`/
-   `ExecutorService`, no ES-specific code):
-   - A generic cache-stress repro (8 segments, 500 searches, 5 rotating
-     queries) — completed correctly, no hang.
-   - A repro shaped exactly like `testAllEqual` (2 segments so
-     `IndexSearcher.search` splits into exactly 1 inline + 1 pooled
-     partition, matching the observed 2-thread contention; 1000 identical
-     repeated searches against the same query object) — also completed
-     correctly, no hang.
-
-   Neither reproduced the stall, so the real trigger is narrower or
-   different from what's been tried — possibly requiring the actual
-   `atLeast(1000)` scaling (can be considerably larger than 1000 under
-   certain random seeds/multipliers), the specific `BinaryDocValuesRangeQuery`
-   query type rather than a plain `TermQuery`, or some interaction with
-   `RandomIndexWriter`/`AssertingIndexSearcher`/`AssertingWeight`'s extra
-   wrapping layers that the minimal repros don't exercise. Not yet
-   distinguished; needs either a bigger/more faithful standalone repro or a
-   fresh stack-dump-based investigation targeting `testAllEqual` specifically.
+   varied-bounds tests (more contended acquire/release cycles → higher
+   chance of hitting the race). Two increasingly targeted standalone
+   Lucene-only repros built earlier to isolate this outside the full
+   ES/randomizedtesting harness did NOT reproduce it standalone — consistent
+   with this being a narrow, heavy-contention-only ordering race rather than
+   a structural bug reachable by any read/write mix.
 
    Separately and NOT believed related (no code in this investigation
    touches GC header-writing, only JIT compile-eligibility): a `bt18` run
