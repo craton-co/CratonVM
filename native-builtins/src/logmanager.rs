@@ -1566,6 +1566,109 @@ fn native_jul_logger_log_level_msg(
     Ok(None)
 }
 
+/// `java/util/logging/Logger.log(Level, String, Object)` — single-param
+/// sibling of `log(Level, String, Object[])` (JDK wraps `param1` in a
+/// one-element array internally before building the LogRecord). Same
+/// `loggerBundle` NPE risk without a native; reuse the `{0}` substitution.
+fn native_jul_logger_log_param(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(o)) => *o,
+        _ => None,
+    };
+    let level_obj = match args.get(1) {
+        Some(Value::Object(o)) => *o,
+        _ => None,
+    };
+    let message_obj = match args.get(2) {
+        Some(Value::Object(o)) => *o,
+        _ => None,
+    };
+    let param_obj = args.get(3).copied().unwrap_or(Value::Object(None));
+    let logger_name = this
+        .and_then(|o| match ctx.get_field(o, LOGGER_FIELD_NAME) {
+            Value::Object(Some(s)) => ctx.read_string(s),
+            _ => None,
+        })
+        .unwrap_or_default();
+    let tag = jul_level_tag(ctx, level_obj);
+    let template = message_obj
+        .and_then(|o| ctx.read_string(o))
+        .unwrap_or_default();
+    let rendered = match param_obj {
+        Value::Object(Some(o)) => jul_resolve_msg(ctx, o),
+        _ => String::new(),
+    };
+    let message = template.replace("{0}", &rendered);
+    eprintln!("{tag} [{logger_name}] {message}");
+    Ok(None)
+}
+
+/// `java/util/logging/Logger.log(Level, String, Object[])` — the
+/// `MessageFormat`-style parameterized overload. The real JDK builds a
+/// `LogRecord`, resolves `{0}`/`{1}`/... placeholders against the
+/// `Object[] params` via `java.text.MessageFormat`, and routes it through
+/// the (unwired) handler chain. Without a native here the call fell
+/// through to the real bytecode's private `Logger.getEffectiveLoggerBundle()`
+/// (via `doLog`), which reads the instance field `loggerBundle` — never
+/// populated on our synthetic 3-field `Logger` (see `LOGGER_NUM_FIELDS`
+/// doc above) — and NPEs (`Cannot invoke
+/// "Logger$LoggerBundle.isSystemBundle()" because "lb" is null"`).
+///
+/// Jython 2.7.4's `org.python.core.PrePy.maybeWrite` is exactly this
+/// caller: `logger.log(level, "{0}: {1}", new Object[]{a, b})` for every
+/// warning/error Jython prints during `PySystemState` bootstrap
+/// (`initConsole` → `writeConsoleWarning`), so any embedder that boots a
+/// `PythonInterpreter`/JSR-223 `jython` engine hit this NPE before a
+/// single line of Python ever ran. Do the same `{n}`-placeholder
+/// substitution `MessageFormat` would (params are logged messages, not
+/// user format strings — a plain positional replace is sufficient here,
+/// we don't need MessageFormat's quoting/choice-format machinery).
+fn native_jul_logger_log_params(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(o)) => *o,
+        _ => None,
+    };
+    let level_obj = match args.get(1) {
+        Some(Value::Object(o)) => *o,
+        _ => None,
+    };
+    let message_obj = match args.get(2) {
+        Some(Value::Object(o)) => *o,
+        _ => None,
+    };
+    let params_arr = match args.get(3) {
+        Some(Value::Object(o)) => *o,
+        _ => None,
+    };
+    let logger_name = this
+        .and_then(|o| match ctx.get_field(o, LOGGER_FIELD_NAME) {
+            Value::Object(Some(s)) => ctx.read_string(s),
+            _ => None,
+        })
+        .unwrap_or_default();
+    let tag = jul_level_tag(ctx, level_obj);
+    let template = message_obj
+        .and_then(|o| ctx.read_string(o))
+        .unwrap_or_default();
+    let message = match params_arr {
+        Some(arr) => {
+            let n = ctx.array_length(arr);
+            let mut out = template;
+            for i in 0..n {
+                let rendered = match ctx.get_array_element(arr, i) {
+                    Value::Object(Some(o)) => jul_resolve_msg(ctx, o),
+                    _ => String::new(),
+                };
+                out = out.replace(&format!("{{{i}}}"), &rendered);
+            }
+            out
+        }
+        None => template,
+    };
+    eprintln!("{tag} [{logger_name}] {message}");
+    Ok(None)
+}
+
 /// `java/util/logging/Logger.logp(Level, sourceClass, sourceMethod, msg)`
 /// intercept. JULI's `DirectJDKLog` (used by Tomcat for every
 /// `log.warn/error/info(...)` call) delegates to this method instead of
@@ -2651,6 +2754,26 @@ pub fn register_logmanager_natives(registry: &mut NativeMethodRegistry) {
         "log",
         "(Ljava/util/logging/Level;Ljava/lang/String;)V",
         native_jul_logger_log_level_msg,
+    );
+    // `log(Level, String, Object)` — single-parameter overload; the JDK
+    // wraps `param1` in a one-element array before building the LogRecord.
+    registry.register(
+        CLS_JUL_LOGGER,
+        "log",
+        "(Ljava/util/logging/Level;Ljava/lang/String;Ljava/lang/Object;)V",
+        native_jul_logger_log_param,
+    );
+    // `log(Level, String, Object[])` — MessageFormat-style parameterized
+    // overload. See `native_jul_logger_log_params` doc comment: this is
+    // the exact call Jython 2.7.4's `PrePy.maybeWrite` makes on every
+    // startup warning, and its absence was a real (non-clinit-ordering)
+    // NPE in `Logger.getEffectiveLoggerBundle()` reading the never-populated
+    // `loggerBundle` field on our synthetic Logger shape.
+    registry.register(
+        CLS_JUL_LOGGER,
+        "log",
+        "(Ljava/util/logging/Level;Ljava/lang/String;[Ljava/lang/Object;)V",
+        native_jul_logger_log_params,
     );
     registry.register(
         CLS_JUL_LOGGER,
