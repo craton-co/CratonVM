@@ -146,60 +146,45 @@ thread_local! {
     /// entering JIT code and cleared immediately after.
     static JIT_THREAD: Cell<*mut JvmThread> = const { Cell::new(std::ptr::null_mut()) };
 
-    /// Pending Java exception from JIT dispatch. When `jit_invoke_dispatch` calls
-    /// a method that throws, we store the exception here instead of swallowing it.
-    /// The interpreter checks this after JIT code returns and propagates it through
-    /// the normal exception handling path (exception tables, frame unwinding).
-    static JIT_PENDING_EXCEPTION: Cell<Option<ObjectRef>> = const { Cell::new(None) };
-
-    /// Pending AIOOBE from JIT bounds check.  Set by `jit_throw_aioobe`,
-    /// consumed by the interpreter after JIT code returns `i64::MIN`.
-    static JIT_PENDING_AIOOBE: Cell<Option<(i64, i64)>> = const { Cell::new(None) };
-
-    /// Pending `ArithmeticException` ("/ by zero") from a JIT integer-division
-    /// zero-divisor guard. Set by `jit_throw_arithmetic`, consumed by the
-    /// interpreter post-JIT-return path the same way as `JIT_PENDING_AIOOBE`:
-    /// the helper returns `i64::MIN` to signal deopt; the interpreter detects the
-    /// sentinel, takes this flag, and throws a real `ArithmeticException` through
-    /// the method's exception table — instead of re-running the method from entry
-    /// (which double-executed side effects preceding the trap).
-    static JIT_PENDING_ARITHMETIC: Cell<bool> = const { Cell::new(false) };
-
-    /// Pending NullPointerException from a JIT array helper (`jit_iaload`,
-    /// `jit_aaload`, `jit_arraylength` called with a null array reference).
-    /// Consumed by the interpreter post-JIT-return path the same way as
-    /// `JIT_PENDING_AIOOBE`. The helper returns `i64::MIN` to signal deopt;
-    /// the interpreter detects the sentinel, takes this flag, and throws a
-    /// real `NullPointerException` through the method's exception table.
-    static JIT_PENDING_NPE: Cell<bool> = const { Cell::new(false) };
-
-    /// JEP 358 (partial) — the *operation kind* that raised the pending JIT NPE,
-    /// as a `helpful_npe::jit_action` code (`0` = none). Set in lockstep with
-    /// `JIT_PENDING_NPE` so the interpreter's drain can attach an action-only
-    /// JEP-358 message (e.g. "Cannot load from int array") to a JIT-originated
-    /// NPE — the deopt-independent fallback for the (unstarted) precise-bci
-    /// path. Reset to `0` by every `set_jit_pending_npe()` so a stale code can
-    /// never leak onto an unrelated NPE.
-    static JIT_PENDING_NPE_ACTION: Cell<u8> = const { Cell::new(0) };
-
-    /// Out-of-band deopt/exception signal (MEDIUM fix: `i64::MIN` sentinel
-    /// collision). The JIT signals exception/deopt to its caller by returning
-    /// `i64::MIN` in RAX, and the interpreter's post-invoke check
-    /// (`vm/src/runtime/interpreter.rs`) treats an `i64::MIN` return as
-    /// "deopt / pending exception — re-run or route". But a method that
-    /// *legitimately* returns `Long.MIN_VALUE` (or a `double`/`float`/`int`
-    /// whose JIT-ABI bit pattern equals `i64::MIN`) would FALSELY trip that
-    /// check, causing a spurious interpreter re-run that double-executes the
-    /// method's side effects.
+    /// ALL out-of-band JIT→interpreter signals for this thread, consolidated
+    /// in ONE thread-local. `execute_jit_call`'s post-return drain used to
+    /// pay SIX separate thread-local accesses (pending exception, AIOOBE,
+    /// arithmetic, NPE, NPE action, deopt flag) on EVERY JIT invocation —
+    /// ~50-60ns, the single largest constant in the interpreter→JIT entry
+    /// overhead on short-callee shapes. One struct = one TLS address
+    /// computation for the whole drain (`take_all_jit_signals`).
     ///
-    /// To disambiguate, every JIT path that produces the `i64::MIN` deopt
-    /// sentinel ALSO sets this flag (via [`set_jit_deopt_pending`]) — both the
-    /// Rust helpers that `return i64::MIN` and the out-of-line stubs emitted in
-    /// `jit/src/x64.rs` (which call a helper that sets it). The interpreter
-    /// reads+clears this flag with [`take_jit_deopt_pending`]: an `i64::MIN`
-    /// return is treated as a real value when the flag is clear, and as a
-    /// deopt/exception signal only when it is set.
-    static JIT_DEOPT_PENDING: Cell<bool> = const { Cell::new(false) };
+    /// Field semantics (formerly the individual statics):
+    /// * `exception` — pending Java exception from JIT dispatch; the
+    ///   interpreter routes it through exception tables after JIT returns.
+    /// * `aioobe` — pending AIOOBE `(index, length)` from a JIT bounds
+    ///   check (`jit_throw_aioobe`), consumed on the `i64::MIN` sentinel.
+    /// * `arithmetic` — pending `ArithmeticException` ("/ by zero") from
+    ///   the integer-division zero-divisor guard; drained like `aioobe`
+    ///   (throwing through the exception table instead of re-running the
+    ///   method, which double-executed prior side effects).
+    /// * `npe` — pending NullPointerException from a JIT array helper on a
+    ///   null array reference; drained like `aioobe`.
+    /// * `npe_action` — JEP 358 (partial): the *operation kind* that raised
+    ///   the pending JIT NPE (`helpful_npe::jit_action` code, `0` = none),
+    ///   set in lockstep with `npe` so the drain can attach an action-only
+    ///   message; reset by every bare `set_jit_pending_npe()` so a stale
+    ///   code never leaks onto an unrelated NPE.
+    /// * `deopt` — the out-of-band deopt/exception signal (`i64::MIN`
+    ///   sentinel collision disambiguation): every JIT path producing the
+    ///   `i64::MIN` deopt sentinel ALSO sets this, so a method legitimately
+    ///   returning `Long.MIN_VALUE` is not mistaken for a deopt (which
+    ///   would spuriously re-run it, double-executing side effects).
+    static JIT_SIGNALS: JitSignals = const {
+        JitSignals {
+            exception: Cell::new(None),
+            aioobe: Cell::new(None),
+            arithmetic: Cell::new(false),
+            npe: Cell::new(false),
+            npe_action: Cell::new(0),
+            deopt: Cell::new(false),
+        }
+    };
 
     /// Debug-only reentrancy guard for [`jit_thread_mut`]. Set while a
     /// `&mut JvmThread` handed out by `jit_thread_mut` is considered live, and
@@ -410,10 +395,55 @@ pub fn clear_jit_thread() {
     JIT_THREAD.with(|t| t.set(std::ptr::null_mut()));
 }
 
+/// The consolidated out-of-band JIT→interpreter signal block — see the
+/// [`JIT_SIGNALS`] thread-local for field semantics.
+struct JitSignals {
+    exception: Cell<Option<ObjectRef>>,
+    aioobe: Cell<Option<(i64, i64)>>,
+    arithmetic: Cell<bool>,
+    npe: Cell<bool>,
+    npe_action: Cell<u8>,
+    deopt: Cell<bool>,
+}
+
+/// One-shot snapshot-and-clear of EVERY out-of-band JIT signal, produced by
+/// [`take_all_jit_signals`] in a single thread-local access. The
+/// interpreter's post-JIT-return drain consumes this instead of six separate
+/// `take_*` calls.
+pub(crate) struct DrainedJitSignals {
+    pub exception: Option<ObjectRef>,
+    pub aioobe: Option<(i64, i64)>,
+    pub arithmetic: bool,
+    pub npe: bool,
+    /// Drained alongside `npe` for hygiene (a stale action code must not
+    /// outlive its NPE), but not yet consumed by the JIT-return drains —
+    /// they throw the bare NPE exactly as before this consolidation
+    /// (attaching the JEP-358 action message here is a follow-up).
+    #[allow(dead_code)]
+    pub npe_action: u8,
+    pub deopt: bool,
+}
+
+/// Snapshot-and-clear ALL JIT signals in ONE thread-local access. Draining
+/// everything unconditionally is deliberate: a signal surviving into the
+/// next unrelated JIT call was the recurring Round-8..11 leak-bug class, and
+/// clearing a flag nobody set is free.
+#[inline]
+pub(crate) fn take_all_jit_signals() -> DrainedJitSignals {
+    JIT_SIGNALS.with(|s| DrainedJitSignals {
+        exception: s.exception.take(),
+        aioobe: s.aioobe.take(),
+        arithmetic: s.arithmetic.take(),
+        npe: s.npe.take(),
+        npe_action: s.npe_action.take(),
+        deopt: s.deopt.take(),
+    })
+}
+
 /// Store a pending Java exception from JIT dispatch. Called when
 /// `jit_invoke_dispatch` encounters an `ExceptionThrown` error.
 fn set_jit_pending_exception(exc: ObjectRef) {
-    JIT_PENDING_EXCEPTION.with(|e| e.set(Some(exc)));
+    JIT_SIGNALS.with(|s| s.exception.set(Some(exc)));
 }
 
 /// Round-9 vm CRIT fix (audit `round9-vm.md` CRIT-2): re-stash a previously
@@ -438,13 +468,13 @@ pub(crate) fn stash_jit_pending_npe() {
 /// taken pending-AIOOBE payload. See `stash_jit_pending_exception` for the
 /// OSR drain-without-route rationale.
 pub(crate) fn stash_jit_pending_aioobe(index: i64, length: i64) {
-    JIT_PENDING_AIOOBE.with(|e| e.set(Some((index, length))));
+    JIT_SIGNALS.with(|s| s.aioobe.set(Some((index, length))));
 }
 
 /// Take (consume) any pending Java exception set by JIT dispatch.
 /// Returns `Some(ObjectRef)` if an exception was pending, `None` otherwise.
 pub fn take_jit_pending_exception() -> Option<ObjectRef> {
-    JIT_PENDING_EXCEPTION.with(|e| e.take())
+    JIT_SIGNALS.with(|s| s.exception.take())
 }
 
 /// Non-consuming peek: returns `true` if a pending Java exception is set.
@@ -455,10 +485,10 @@ pub fn take_jit_pending_exception() -> Option<ObjectRef> {
 /// stashed exception through the method's exception table — instead of
 /// returning a bogus `0` that the JIT would keep computing with.
 pub(crate) fn jit_pending_exception_is_set() -> bool {
-    JIT_PENDING_EXCEPTION.with(|e| {
-        let v = e.take();
+    JIT_SIGNALS.with(|s| {
+        let v = s.exception.take();
         let present = v.is_some();
-        e.set(v);
+        s.exception.set(v);
         present
     })
 }
@@ -466,7 +496,7 @@ pub(crate) fn jit_pending_exception_is_set() -> bool {
 /// Take (consume) a pending AIOOBE from JIT bounds check.
 /// Returns `Some((index, length))` if an AIOOBE was pending.
 pub fn take_jit_pending_aioobe() -> Option<(i64, i64)> {
-    JIT_PENDING_AIOOBE.with(|e| e.take())
+    JIT_SIGNALS.with(|s| s.aioobe.take())
 }
 
 /// Take (consume) a pending `ArithmeticException` ("/ by zero") set by the JIT
@@ -474,7 +504,7 @@ pub fn take_jit_pending_aioobe() -> Option<(i64, i64)> {
 /// Mirrors [`take_jit_pending_aioobe`]; the interpreter's post-JIT drain throws
 /// a real `ArithmeticException` through the method's exception table.
 pub fn take_jit_pending_arithmetic() -> bool {
-    JIT_PENDING_ARITHMETIC.with(|e| e.take())
+    JIT_SIGNALS.with(|s| s.arithmetic.take())
 }
 
 /// Re-stash a previously taken pending-arithmetic flag. Mirrors
@@ -482,7 +512,7 @@ pub fn take_jit_pending_arithmetic() -> bool {
 /// div-by-zero raised in OSR-compiled code with no in-frame handler survives the
 /// OSR→interpreter handoff and is surfaced by the next JIT-return drain.
 pub(crate) fn stash_jit_pending_arithmetic() {
-    JIT_PENDING_ARITHMETIC.with(|e| e.set(true));
+    JIT_SIGNALS.with(|s| s.arithmetic.set(true));
 }
 
 /// Take (consume) a pending NPE from a JIT array helper (`jit_iaload`,
@@ -496,7 +526,7 @@ pub(crate) fn stash_jit_pending_arithmetic() {
 /// `java/lang/NullPointerException` and routes it through the method's
 /// exception table — same pattern as `take_jit_pending_aioobe`.
 pub fn take_jit_pending_npe() -> bool {
-    JIT_PENDING_NPE.with(|e| e.take())
+    JIT_SIGNALS.with(|s| s.npe.take())
 }
 
 /// Take (consume) the JEP-358 *action code* recorded alongside a pending JIT
@@ -505,7 +535,7 @@ pub fn take_jit_pending_npe() -> bool {
 /// drain calls this right after [`take_jit_pending_npe`] to build the
 /// action-only message.
 pub fn take_jit_pending_npe_action() -> u8 {
-    JIT_PENDING_NPE_ACTION.with(|e| e.take())
+    JIT_SIGNALS.with(|s| s.npe_action.take())
 }
 
 /// Internal: set the pending-NPE flag with no action code (the existing bare
@@ -513,8 +543,10 @@ pub fn take_jit_pending_npe_action() -> u8 {
 /// code from a prior op can never leak onto this NPE.
 #[inline]
 fn set_jit_pending_npe() {
-    JIT_PENDING_NPE.with(|e| e.set(true));
-    JIT_PENDING_NPE_ACTION.with(|e| e.set(0));
+    JIT_SIGNALS.with(|s| {
+        s.npe.set(true);
+        s.npe_action.set(0);
+    });
 }
 
 /// Internal: set the pending-NPE flag *with* a JEP-358 action code
@@ -523,8 +555,10 @@ fn set_jit_pending_npe() {
 /// JEP-358 message to the JIT-originated NPE.
 #[inline]
 fn set_jit_pending_npe_action(code: u8) {
-    JIT_PENDING_NPE.with(|e| e.set(true));
-    JIT_PENDING_NPE_ACTION.with(|e| e.set(code));
+    JIT_SIGNALS.with(|s| {
+        s.npe.set(true);
+        s.npe_action.set(code);
+    });
 }
 
 /// Re-stash a previously-taken JIT NPE action code (OSR drain-without-route
@@ -543,7 +577,7 @@ pub(crate) fn stash_jit_pending_npe_action(code: u8) {
 /// through a tiny `extern "C"` helper that sets it (see [`jit_set_deopt_pending`]).
 #[inline]
 pub(crate) fn set_jit_deopt_pending() {
-    JIT_DEOPT_PENDING.with(|e| e.set(true));
+    JIT_SIGNALS.with(|s| s.deopt.set(true));
 }
 
 /// Read+clear the out-of-band deopt/exception signal. The interpreter's
@@ -553,7 +587,7 @@ pub(crate) fn set_jit_deopt_pending() {
 /// and must be pushed verbatim. See [`set_jit_deopt_pending`].
 #[inline]
 pub fn take_jit_deopt_pending() -> bool {
-    JIT_DEOPT_PENDING.with(|e| e.take())
+    JIT_SIGNALS.with(|s| s.deopt.take())
 }
 
 /// `extern "C"` trampoline for the out-of-line deopt/exception stubs emitted in
@@ -604,11 +638,14 @@ pub extern "C" fn jit_set_deopt_pending() {
 /// SAFETY: no pointer arguments; only reads thread-locals. Safe to call from
 /// JIT-compiled code immediately after a dispatch returns `i64::MIN`.
 pub extern "C" fn jit_dispatch_threw() -> i64 {
-    let pending = jit_pending_exception_is_set()
-        || JIT_PENDING_NPE.with(|e| e.get())
-        || JIT_PENDING_AIOOBE.with(|e| e.get().is_some())
-        || JIT_DEOPT_PENDING.with(|e| e.get())
-        || cratonvm_jit::deopt::has_last_deopt();
+    let pending = JIT_SIGNALS.with(|s| {
+        // Non-destructive peek across the whole signal block in ONE
+        // thread-local access (the former per-flag statics cost four).
+        let exc = s.exception.take();
+        let exc_set = exc.is_some();
+        s.exception.set(exc);
+        exc_set || s.npe.get() || s.aioobe.get().is_some() || s.deopt.get()
+    }) || cratonvm_jit::deopt::has_last_deopt();
     if pending {
         1
     } else {
@@ -1729,17 +1766,47 @@ pub unsafe extern "C" fn jit_new_object(vm_ptr: i64, class_id_raw: i64, num_fiel
             &format!("Java heap space (new_object class_id {class_id_raw} fields {num_fields})"),
         );
     }
-    // NOTE (JIT TLAB refill — attempted 2026-07-06, REVERTED): routing this
-    // slow path through the interpreter's TLAB refill (`tlab_alloc_object`)
-    // made small binarytrees runs ~10x faster (bt16 3s → 0.33s) but was
-    // pathological at bt18 scale: young-gen churn against a large live set
-    // under the non-moving sweep (and O(free-list) probes once young
-    // fragmented) turned 10.6s into 40-460s depending on the refill gate
-    // (even an O(1) bump-tail-only gate — `VmHeap::young_bump_headroom`,
-    // kept in the gc crate — still ended at ~119s). Restoring the historical
-    // behaviour (no refill here; old-gen spill under pressure) until TLAB
-    // refill is co-designed with young promotion/cursor semantics.
-    //
+    // JIT TLAB refill, round 2 (round 1 was reverted the same day: the
+    // unconditional/naively-gated refill collapsed bt18 10.6s→40-460s from
+    // young churn + per-allocation O(free-list) probes). This round routes
+    // the slow path through `tlab_alloc_object_guarded_refill`, whose refill
+    // arm only fires when young can supply the chunk WITHOUT a GC — an O(1)
+    // bump-tail check plus the amortized-O(1) cached-bound early-exit
+    // reclaimed-span probe (`young_has_free_block`) that round 1 lacked.
+    // Post-sweep+coalesce young is a handful of big spans, so refills flow
+    // at bump speed and the JIT's INLINE bump fast path comes back to life
+    // for the following allocations; a genuinely-full young answers `false`
+    // in O(1) and falls through to the historical old-gen spill below.
+    if total_size <= cratonvm_gc::tlab::tlab_max_alloc() {
+        if let Some((thread, _guard)) = jit_thread_mut() {
+            if let Some(obj_ref) = crate::runtime::interpreter::tlab_alloc_object_guarded_refill(
+                thread,
+                vm,
+                class_id,
+                num_fields as usize,
+                total_size,
+            ) {
+                jit_init_primitive_fields(vm, obj_ref, class_id);
+                let has_fin = vm
+                    .class_manager
+                    .read()
+                    .class_store
+                    .get(class_id)
+                    .map_or(false, |c| c.has_finalizer);
+                if has_fin {
+                    vm.register_finalizable(obj_ref.as_ptr() as usize);
+                }
+                if dbg_jit_alloc_filter() == Some(class_id_raw as u32) {
+                    eprintln!(
+                        "[JIT_ALLOC] new_object(tlab) class_id={} obj=0x{:x}",
+                        class_id_raw,
+                        obj_ref.as_ptr() as usize
+                    );
+                }
+                return obj_ref.as_ptr() as i64;
+            }
+        }
+    }
     // Fallible young → old-gen alloc (preserves alloc_object's old-gen spill);
     // on exhaustion surface a catchable OutOfMemoryError instead of the hard
     // abort in alloc_young. The `new` codegen's emit_post_alloc_oom_check bails
@@ -1920,7 +1987,7 @@ pub unsafe extern "C" fn jit_baload(array_ptr: i64, index: i64) -> i64 {
         // AIOOBE and return the `i64::MIN` deopt sentinel so the post-JIT interpreter
         // path constructs the real exception and routes it through the method's
         // exception table.
-        JIT_PENDING_AIOOBE.with(|e| e.set(Some((index, length))));
+        JIT_SIGNALS.with(|s| s.aioobe.set(Some((index, length))));
         return i64::MIN;
     }
     let elem_ptr = ptr.add(HEADER_SIZE + index as usize);
@@ -1991,7 +2058,7 @@ pub unsafe extern "C" fn jit_bastore(array_ptr: i64, index: i64, val: i64) {
         // like the void-return null arm above — we set the pending-AIOOBE flag and
         // return; the interpreter's post-JIT drain surfaces the exception at this
         // method (see `take_jit_pending_aioobe` in runtime/interpreter.rs).
-        JIT_PENDING_AIOOBE.with(|e| e.set(Some((index, length))));
+        JIT_SIGNALS.with(|s| s.aioobe.set(Some((index, length))));
         return;
     }
     let elem_ptr = ptr.add(HEADER_SIZE + index as usize);
@@ -2025,7 +2092,7 @@ pub unsafe extern "C" fn jit_iaload(array_ptr: i64, index: i64) -> i64 {
         // JVMS §iaload: throw ArrayIndexOutOfBoundsException on an out-of-bounds
         // index (same protocol as `jit_throw_aioobe`). Previously returned 0,
         // silently fabricating a zero element and masking real OOB bugs.
-        JIT_PENDING_AIOOBE.with(|e| e.set(Some((index, length))));
+        JIT_SIGNALS.with(|s| s.aioobe.set(Some((index, length))));
         return i64::MIN;
     }
     let elem_ptr = ptr.add(HEADER_SIZE + index as usize * 4) as *const i32;
@@ -2062,7 +2129,7 @@ pub unsafe extern "C" fn jit_iastore(array_ptr: i64, index: i64, val: i64) {
         // flag and return — the void return cannot carry the deopt sentinel, so the
         // interpreter's post-JIT drain surfaces the exception (same void-arm protocol
         // as the null case above).
-        JIT_PENDING_AIOOBE.with(|e| e.set(Some((index, length))));
+        JIT_SIGNALS.with(|s| s.aioobe.set(Some((index, length))));
         return;
     }
     let elem_ptr = ptr.add(HEADER_SIZE + index as usize * 4) as *mut i32;
@@ -2096,7 +2163,7 @@ pub unsafe extern "C" fn jit_aaload(array_ptr: i64, index: i64) -> i64 {
         // JVMS §aaload: throw ArrayIndexOutOfBoundsException on an out-of-bounds
         // index (same protocol as `jit_throw_aioobe`). Previously returned 0 (null),
         // silently fabricating a null element and masking real OOB bugs.
-        JIT_PENDING_AIOOBE.with(|e| e.set(Some((index, length))));
+        JIT_SIGNALS.with(|s| s.aioobe.set(Some((index, length))));
         return i64::MIN;
     }
     let elem_ptr = ptr.add(HEADER_SIZE + index as usize * REF_ELEMENT_SIZE) as *const u64;
@@ -2145,7 +2212,7 @@ pub unsafe extern "C" fn jit_aastore(vm_ptr: i64, array_ptr: i64, index: i64, va
         // flag and return BEFORE the SATB barrier / write below (no element is read
         // or written on the OOB path). The void return cannot carry the deopt
         // sentinel, so the interpreter's post-JIT drain surfaces the exception.
-        JIT_PENDING_AIOOBE.with(|e| e.set(Some((index, length))));
+        JIT_SIGNALS.with(|s| s.aioobe.set(Some((index, length))));
         return;
     }
     // JVMS §aastore covariance check: a non-null element whose runtime type is
@@ -3287,7 +3354,7 @@ pub unsafe extern "C" fn jit_throw_aioobe(index: i64, length: i64) -> i64 {
     // WS1: Rust<->JIT boundary — invalidate the per-thread JIT-scan cache
     // (see conservative_roots::note_jit_boundary).
     crate::jit::conservative_roots::note_jit_boundary();
-    JIT_PENDING_AIOOBE.with(|e| e.set(Some((index, length))));
+    JIT_SIGNALS.with(|s| s.aioobe.set(Some((index, length))));
     // Out-of-band deopt signal: this `i64::MIN` IS the bounds-check stub's
     // method return value, so flag it as a genuine deopt so the interpreter
     // doesn't mistake a method legitimately returning `Long.MIN_VALUE` for one.
@@ -3314,7 +3381,7 @@ pub unsafe extern "C" fn jit_throw_arithmetic() -> i64 {
     // WS1: Rust<->JIT boundary — invalidate the per-thread JIT-scan cache
     // (see conservative_roots::note_jit_boundary).
     crate::jit::conservative_roots::note_jit_boundary();
-    JIT_PENDING_ARITHMETIC.with(|e| e.set(true));
+    JIT_SIGNALS.with(|s| s.arithmetic.set(true));
     set_jit_deopt_pending();
     i64::MIN // deopt sentinel — interpreter will detect and throw ArithmeticException
 }
@@ -3396,6 +3463,10 @@ thread_local! {
     /// decremented (RAII) on return. Compared against
     /// `interpreter::jit_dispatch_depth_ceiling()`.
     static JIT_DISPATCH_DEPTH: Cell<u32> = const { Cell::new(0) };
+
+    /// Last C1→C2 supersede epoch this thread's DISPATCH_CACHE was flushed
+    /// at — see the flush in `jit_invoke_dispatch`.
+    static DISPATCH_CACHE_SUPERSEDE_EPOCH: Cell<u32> = const { Cell::new(0) };
 }
 
 /// RAII guard that decrements [`JIT_DISPATCH_DEPTH`] when dropped. Constructed
@@ -3783,6 +3854,21 @@ pub unsafe extern "C" fn jit_invoke_dispatch(
     let redefine_jit_quiesced = crate::classloading::any_class_redefined();
     if redefine_jit_quiesced {
         DISPATCH_CACHE.with(|dc| dc.borrow_mut().clear());
+    }
+    // C1→C2 supersede: the dispatch cache holds raw entry pointers captured
+    // at first resolution. When the background worker publishes a replacing
+    // C2 body it bumps the global supersede epoch — flush this thread's
+    // cache once per bump so subsequent dispatches re-probe the jit cache
+    // and pick up the upgraded body. (Stale entries were never unsound —
+    // superseded code is retained forever — merely stuck on the C1 body.)
+    {
+        let epoch = crate::classloading::jit_supersede_epoch();
+        DISPATCH_CACHE_SUPERSEDE_EPOCH.with(|e| {
+            if e.get() != epoch {
+                e.set(epoch);
+                DISPATCH_CACHE.with(|dc| dc.borrow_mut().clear());
+            }
+        });
     }
     let cached_entry = if statically_bound && !redefine_jit_quiesced {
         DISPATCH_CACHE.with(|dc| {

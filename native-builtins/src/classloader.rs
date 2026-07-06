@@ -722,17 +722,24 @@ pub(crate) fn loader_unload_enabled() -> bool {
     })
 }
 
-/// `CRATONVM_LOADER_AWARE_RESOLUTION` gate (default OFF). Mirrors
+/// `CRATONVM_LOADER_AWARE_RESOLUTION` gate (default ON). Mirrors
 /// `cratonvm_vm::runtime::env_cache::loader_aware_resolution` so the
 /// native-builtins half of loader-faithful class resolution (per-user-loader
-/// namespace assignment in `defineClass`, exact `findLoadedClass`) stays in
-/// lock-step with the interpreter half. When off, every loader-identity path
-/// keeps its exact pre-gate behavior. Empty / `"0"` ⇒ off; any other value ⇒ on.
+/// namespace assignment in `defineClass`, exact `findLoadedClass`,
+/// `descriptor_to_class_mirror_via_loader` for reflective Field/Method/
+/// Constructor types, annotation Class-value resolution) stays in lock-step
+/// with the interpreter half. This copy had drifted out of lock-step (still
+/// default OFF) after `env_cache::loader_aware_resolution` flipped to default
+/// ON for the `context.groovy` bug-cluster fix, which silently disabled this
+/// crate's share of the loader-faithful fixes by default — see
+/// `docs/known-issues/hib-bytecode-enhancement-loader-faithful-linking.md`.
+/// When off, every loader-identity path keeps its exact pre-gate behavior.
+/// Empty / `"0"` ⇒ off; any other value ⇒ on.
 pub(crate) fn loader_aware_resolution() -> bool {
     static GATE: OnceLock<bool> = OnceLock::new();
     *GATE.get_or_init(|| match std::env::var("CRATONVM_LOADER_AWARE_RESOLUTION") {
         Ok(v) => !v.is_empty() && v != "0",
-        Err(_) => false,
+        Err(_) => true,
     })
 }
 

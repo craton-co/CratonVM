@@ -2,7 +2,7 @@
 
 | | |
 |---|---|
-| **Status** | 🔴 **REOPENED 2026-07-04** (moved back from `docs/internal`, where it was incorrectly archived as "FIXED / ARCHIVED"). The 6 numbered linking/dispatch fixes described below (superclass/interface linking, `preload_supertypes_via_loader`, verifier hierarchy lookup, `invokespecial` owner dispatch, link-time verification skip-flag, `Lookup.defineClass` namespace inheritance) plus the `allocate_loader_id` KEYSTONE fix are genuinely **landed and verified present** on current `dev` (`c20f6f15`, 2026-07-04 source audit — see "Re-verification 2026-07-04" below). But the doc's framing of the remaining `enhancement.lazy.*`/`mapping.lazytoone.*` FAILs as a "separate residual issue" undersold it: a fresh full-suite run this session (`dev 81a31c08+`, gate default-on) found **PASS 4293/4548**, with the `bytecode.enhancement.lazy.*` (~54 classes) + `mapping.lazytoone.*` (~12 classes) cluster as the **single largest remaining Hibernate-enhancement gap**, not a minor residual — same gate, same test package family, same original bug report. A fresh 18-class sample re-run this session (2026-07-04, current `dev`) confirms it is still overwhelmingly broken: **2/18 genuinely PASS**, 14/18 FAIL, 1/18 (`FetchGraphTest`) now HANGS at 450s (previously documented as FAIL-with-NPE, not a hang — a possible new regression, not yet root-caused). The dominant FAIL signature across the sample is exactly the class-identity mismatch this doc's own "Historical blocker" section describes as unfixed (`Could not build SessionFactory: To-one mapping [...] was mapped with targetEntity=`X`, but the attribute is declared as `X`` — same name, different `Class` identity — followed by `Could not instantiate persister` / `no no-arg constructor in ...$HibernateInstantiator`). See "Re-verification 2026-07-04" for the full sample and counts. |
+| **Status** | 🟡 **PARTIALLY FIXED 2026-07-06** — root cause of the 2026-07-04 REOPENED regression found and fixed: `CRATONVM_LOADER_AWARE_RESOLUTION` is implemented as **three independent copies** of the same gate function (`classloading/src/class_manager.rs`, `native-builtins/src/classloader.rs`, `vm/src/runtime/env_cache.rs`), each with a doc comment asserting it "stays in lock-step" with the others. Only the `vm` crate's copy was ever flipped from default-OFF to default-ON (the `context.groovy` fix, `docs/known-issues/hib-proxyclassreuse-loader-blind-class-resolution.md`); the other two silently stayed default-OFF, so most of the actual loader-faithful fixes for THIS bug — which live in `classloading` (superclass/interface linking, verifier hierarchy lookup) and `native-builtins` (`preload_supertypes_via_loader`, `inherit_lookup_loader`, annotation Class-value resolution, `descriptor_to_class_mirror_via_loader` for reflective Field/Method/Constructor types) — were disabled by default despite being genuinely landed and correct. This fully explains the 2026-07-04 "REOPENED" finding: nobody had actually exercised the gate as globally on. Fix (branch `fix/hib-enhancement-annotation-classvalue-loader-20260706`): flipped the two stale copies' `Err(_) => false` to `Err(_) => true`, restoring the lock-step invariant. Verified on a fresh worktree (Azure host, dev `9f1db39d`+): `gated_subset.txt` (131 classes) went from **PASS 40 / HANG 13 / FAIL 78** (baseline) to **PASS 86 / HANG 7 / ABORTED 2 / FAIL 36** (fixed), with the dominant `targetEntity=X, but the attribute is declared as X` class-identity-mismatch signature **eliminated from the FAIL set entirely**. Status is "partially fixed" (not fully closed) because ~36 FAILs + 7 HANGs remain — see "UPDATE 2026-07-06" below for the residual breakdown; these are distinct, separate bugs one layer downstream of the one just fixed, matching this doc's established pattern of layered fixes. |
 | **Area** | VM core — real-JDK-mode loader-faithful resolution: superclass/interface *linking* (not just `new`/checkcast/ldc), `invokespecial` owner dispatch, and link-time verification of trusted runtime-generated classes. |
 | **Builds on** | [hib-proxyclassreuse-loader-blind-class-resolution.md](hib-proxyclassreuse-loader-blind-class-resolution.md) — the three-layer `CONSTANT_Class` / `defineClass`-namespace / `findLoadedClass` fix and the `resolve_class_loader_aware` mechanism. That doc's gate is now **default-on** (flipped 2026-07-03) and validated via a Hibernate app-gauntlet soak; this doc describes the *linking/dispatch* layer built on top of it. Both docs describe the same loader-identity mechanism at different depths — read the other doc first for the gate's base three-layer fix, this one for the enhancement-specific linking/dispatch/SessionFactory-build work. |
 
@@ -83,6 +83,105 @@ this session and by this fresh 18-class targeted sample. Filing back under
 `docs/known-issues`). This is a documentation-only correction (plus the
 `git mv`) — the underlying `enhancement.lazy.*` bug itself was not
 investigated or touched here.
+
+## UPDATE 2026-07-06 — root cause of the REOPENED regression found: gate lock-step drift
+
+Investigated the `enhancement.lazy.*`/`mapping.lazytoone.*` FAIL cluster from
+the 2026-07-04 re-verification above (Azure host, worktree
+`/data/data/wt-hib-enh-classvalue-20260706`, branch
+`fix/hib-enhancement-annotation-classvalue-loader-20260706`, off dev
+`9f1db39d`). Live instrumentation (a temporary debug print in Hibernate's
+`ToOneAttributeMapping` constructor, `hibernate-core/src/main/java/org/hibernate/metamodel/mapping/internal/ToOneAttributeMapping.java:268-283`)
+on the reproducing `LazyGroupTest`/`FetchGraphTest` classes showed the
+`targetEntity=X, but the attribute is declared as X` mismatch is between:
+
+- `declaredType = propertyAccess.getGetter().getReturnTypeClass()` → literally
+  `Field.getType()` (`GetterFieldImpl.getReturnTypeClass()`) — resolved to the
+  **un-enhanced** copy, `loader=jdk.internal.loader.ClassLoaders$AppClassLoader`.
+- `targetType = entityMappingType.getMappedJavaType().getJavaTypeClass()` →
+  Hibernate's `JavaTypeRegistry`-backed `EntityJavaType` — correctly resolved
+  to the **enhanced** copy, `loader=...BytecodeEnhancedClassUtils$EnhancingClassLoader`.
+
+This is the *opposite* of what the doc's "Precise root cause" section above
+hypothesized (that the JavaType registry caches the wrong copy) — for this
+code path, the registry's answer is right and the reflective `Field.getType()`
+is wrong. But `native-builtins/src/lang_class.rs` already has a correctly
+loader-aware helper for exactly this,
+`descriptor_to_class_mirror_via_loader` (~line 2699), which `create_field_object`
+(~line 3645) already calls — gated on `crate::classloader::loader_aware_resolution()`.
+The fix was seemingly already written and wired up. Forcing
+`CRATONVM_LOADER_AWARE_RESOLUTION=1` explicitly made `LazyGroupTest` pass
+(`ok=2/2`) on the otherwise-unmodified dev binary, proving the logic was
+correct but not engaging by default — which sent the investigation to the gate
+itself rather than to reflection code.
+
+**Root cause:** `loader_aware_resolution()` is implemented **three times**,
+once per crate that needs it (no shared lower-level crate to put a single copy
+in): `classloading/src/class_manager.rs:124`, `native-builtins/src/classloader.rs:731`,
+and `vm/src/runtime/env_cache.rs:205`. Each doc comment explicitly says it
+"mirrors"/"stays in lock-step with" the others. `vm::env_cache`'s copy was
+deliberately flipped from default-off to default-on for the `context.groovy`
+Groovy-DSL bug cluster (see `hib-proxyclassreuse-loader-blind-class-resolution.md`,
+soak-tested 2026-07-03/04) — its own doc comment even cites this doc's
+`bytecode.enhancement`/`lazytoone` cluster as an already-known, unaffected
+pre-existing failure. But the OTHER two copies (`classloading`,
+`native-builtins`) were never updated to match — they still read `Err(_) =>
+false` and their doc comments still say "default OFF". Since most of the
+concrete fixes for THIS bug (superclass/interface linking, verifier hierarchy
+lookup in `classloading`; `preload_supertypes_via_loader`,
+`inherit_lookup_loader`, annotation Class-value resolution, and
+`descriptor_to_class_mirror_via_loader` for reflective Field/Method/Constructor
+types in `native-builtins`) are gated by the STALE copies, they were silently
+disabled by default the whole time — nobody had actually run the full suite
+with the gate globally on, despite the 2026-07-04 re-verification and the
+`env_cache` comment both believing it was.
+
+**Fix:** flip the two stale copies' `Err(_) => false` to `Err(_) => true`
+(`classloading/src/class_manager.rs`, `native-builtins/src/classloader.rs`),
+restoring the "lock-step" invariant their own comments already assert. No
+change to the `Ok(v)` branch (explicit `CRATONVM_LOADER_AWARE_RESOLUTION=0`
+still forces gate-off everywhere, unchanged).
+
+**Verification** (Azure host, `apps/hib-suite-runner`, real JDK 25, JIT on,
+`gated_subset.txt` = 131 classes, `TIMEOUT=300s`, neither run set
+`CRATONVM_LOADER_AWARE_RESOLUTION` — testing the actual default):
+
+| | PASS | HANG | ABORTED | FAIL |
+|---|---|---|---|---|
+| baseline (dev `9f1db39d`, pre-fix) | 40 | 13 | 0 | 78 |
+| fixed (this branch) | 86 | 7 | 2 | 36 |
+
+The `targetEntity=X, but the attribute is declared as X` signature — the
+dominant FAIL cluster in every prior re-verification of this doc — is **gone
+from the FAIL set entirely**. `LazyGroupTest` and `FetchGraphTest` (this doc's
+own repro classes) both now build their `SessionFactory` successfully.
+
+**Residuals — distinct, separate bugs, not addressed by this fix** (from the
+36 remaining FAILs + 7 HANGs in the fixed run):
+
+1. **`InstantiationException: no no-arg constructor in .../$HibernateInstantiator`**
+   (6 classes, e.g. `OnlyLazyBasicUpdateTest`, `EagerAndLazyBasicUpdateTest`,
+   `SimpleLazyGroupUpdateTest`) — traced to a recurring
+   `Lookup.defineClass: ... already defined by user-defined(N) loader`
+   collision on repeat `SessionFactory` builds within the same test class
+   (each `@Test` method rebuilds a fresh `SessionFactory`, and a subsequent
+   `getReflectionOptimizer()` call re-attempts to define the SAME
+   `$HibernateInstantiator` helper under the SAME loader namespace instead of
+   reusing the first-built one). This looks like the same family as the
+   "UPDATE (4th surface)" `Lookup.defineClass` duplicate-define fix above
+   (`b2317b72`), but that fix does not cover this recurrence — not
+   investigated further this session.
+2. **`NoSuchMethodError: ...asManagedEntity()`/`...asPersistentAttributeInterceptable`**
+   (~8 classes, e.g. `FetchGraphTest`, `BatchFetchProxyTest`,
+   `LazyCollectionLoadingTest`) — `SessionFactory` now builds successfully
+   (this fix's direct effect) but a downstream runtime dispatch gap remains.
+   Likely the same "5th surface" lazy-collection enhancement-runtime bug this
+   doc's `FetchGraphTest` residual note already describes, now newly visible
+   on more classes because they get further than before.
+3. A handful of `IllegalArgumentException: Object of type 'class ...'`
+   mismatches in `enhancement.detached.*` tests — not investigated, may be a
+   related but distinct class-identity gap in detached-entity merge/contains
+   checks.
 
 ## Context
 

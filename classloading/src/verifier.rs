@@ -2191,7 +2191,18 @@ mod tests {
             vec![], // no implementation of doThing
         );
         let child = store.get(child_id).unwrap();
-        assert!(verify_class_structure(child, &store).is_err());
+        // The FOCUSED checker still rejects the shape...
+        assert!(verify_inherited_abstract_methods_implemented(child, &store).is_err());
+        // ...but ordinary class loading deliberately does NOT enforce it
+        // (HotSpot parity: linkage proceeds and AbstractMethodError is
+        // raised only if the missing method is actually invoked — see the
+        // `let _ = verify_inherited_abstract_methods_implemented;` note in
+        // `verify_class_structure`; JAXB's `JAXBContextImpl`, which leaves
+        // the deprecated abstract `createValidator()` unimplemented, is a
+        // real-world class that must keep loading). This assertion pins the
+        // deliberate non-enforcement so a future re-enable is a conscious
+        // choice.
+        assert!(verify_class_structure(child, &store).is_ok());
     }
 
     #[test]

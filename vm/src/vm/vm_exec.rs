@@ -2365,6 +2365,17 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
         self.shared.var_handle_roots.write().insert(key, vh);
     }
 
+    fn read_var_handle_root(&self, identity_key: i32) -> Option<ObjectRef> {
+        // The GC remaps the registry entry after a move (memory/gc.rs); raw
+        // ObjectRef copies cached in native statics do NOT get rewritten, so
+        // long-lived native singletons re-read the current address here.
+        self.shared
+            .var_handle_roots
+            .read()
+            .get(&identity_key)
+            .copied()
+    }
+
     fn record_printed_value(&mut self, value: Value) {
         self.thread.printed.push(value);
     }
@@ -7984,12 +7995,54 @@ pub fn invoke_shared(
     descriptor: &str,
     args: &[Value],
 ) -> MethodCallResult {
+    // GC-safety: class loading and <clinit> below can run arbitrary Java and
+    // trigger a MOVING young GC while `args` still sit in a raw Rust slice —
+    // invisible to the collector, so any object arg would be left dangling
+    // and the callee would receive a stale (relocated/reclaimed) pointer
+    // (native stale-local family, VM-level instance; repro: a native invoking
+    // a static on a not-yet-initialized class, e.g. Spliterators.spliterator
+    // from the synthetic stream bridges under CRATONVM_DBG_GC_STRESS).
+    // Pin object args, then re-read the GC-forwarded addresses after the
+    // load+clinit window before dispatching.
+    let pin_base = thread.native_pin_roots.len();
+    let mut has_obj_args = false;
+    for a in args {
+        if let Value::Object(Some(o)) = a {
+            thread.native_pin_roots.push(*o);
+            has_obj_args = true;
+        }
+    }
+
     // Thread-safe class loading with per-class-name lock (Session 30)
-    let class_id = shared.load_class_concurrent(class_name)?;
-    // Ensure the class is initialized (runs <clinit>) per JVM spec В§5.5.
+    let class_id = match shared.load_class_concurrent(class_name) {
+        Ok(cid) => cid,
+        Err(e) => {
+            thread.native_pin_roots.truncate(pin_base);
+            return Err(e.into());
+        }
+    };
+    // Ensure the class is initialized (runs <clinit>) per JVM spec §5.5.
     // This is required for static methods and field access to work correctly.
-    super::ensure_class_initialized_shared(shared, thread, class_id)?;
-    invoke_on_class_shared(shared, thread, class_id, method_name, descriptor, args)
+    if let Err(e) = super::ensure_class_initialized_shared(shared, thread, class_id) {
+        thread.native_pin_roots.truncate(pin_base);
+        return Err(e);
+    }
+
+    let result = if has_obj_args {
+        let mut fresh: Vec<Value> = args.to_vec();
+        let mut k = pin_base;
+        for v in fresh.iter_mut() {
+            if let Value::Object(Some(_)) = v {
+                *v = Value::Object(Some(thread.native_pin_roots[k]));
+                k += 1;
+            }
+        }
+        invoke_on_class_shared(shared, thread, class_id, method_name, descriptor, &fresh)
+    } else {
+        invoke_on_class_shared(shared, thread, class_id, method_name, descriptor, args)
+    };
+    thread.native_pin_roots.truncate(pin_base);
+    result
 }
 
 /// WP2.9 вЂ” Invoke a method with invokespecial semantics (no virtual dispatch).
@@ -8017,9 +8070,30 @@ pub fn invoke_special_shared(
             .map(|v| coerce_native_return(v, descriptor));
     }
 
+    // GC-safety: pin object args across class load + <clinit> and re-read the
+    // forwarded addresses before dispatch — same moving-GC stale-args window
+    // as `invoke_shared` above.
+    let pin_base = thread.native_pin_roots.len();
+    let mut has_obj_args = false;
+    for a in args {
+        if let Value::Object(Some(o)) = a {
+            thread.native_pin_roots.push(*o);
+            has_obj_args = true;
+        }
+    }
+
     // Resolve and initialize the class.
-    let class_id = shared.load_class_concurrent(class_name)?;
-    super::ensure_class_initialized_shared(shared, thread, class_id)?;
+    let class_id = match shared.load_class_concurrent(class_name) {
+        Ok(cid) => cid,
+        Err(e) => {
+            thread.native_pin_roots.truncate(pin_base);
+            return Err(e.into());
+        }
+    };
+    if let Err(e) = super::ensure_class_initialized_shared(shared, thread, class_id) {
+        thread.native_pin_roots.truncate(pin_base);
+        return Err(e);
+    }
 
     // For default-method super-call: walk the hierarchy to the declaring
     // class so we land on the interface that owns the bytecode. This
@@ -8033,14 +8107,35 @@ pub fn invoke_special_shared(
         }
     };
 
-    invoke_on_class_shared_no_retarget(
-        shared,
-        thread,
-        target_class_id,
-        method_name,
-        descriptor,
-        args,
-    )
+    let result = if has_obj_args {
+        let mut fresh: Vec<Value> = args.to_vec();
+        let mut k = pin_base;
+        for v in fresh.iter_mut() {
+            if let Value::Object(Some(_)) = v {
+                *v = Value::Object(Some(thread.native_pin_roots[k]));
+                k += 1;
+            }
+        }
+        invoke_on_class_shared_no_retarget(
+            shared,
+            thread,
+            target_class_id,
+            method_name,
+            descriptor,
+            &fresh,
+        )
+    } else {
+        invoke_on_class_shared_no_retarget(
+            shared,
+            thread,
+            target_class_id,
+            method_name,
+            descriptor,
+            args,
+        )
+    };
+    thread.native_pin_roots.truncate(pin_base);
+    result
 }
 
 // ---------------------------------------------------------------------------

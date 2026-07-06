@@ -4,10 +4,18 @@ This folder collects CratonVM-only defects found while running upstream Java
 suites. The docs had grown to describe the **same underlying bug from several
 angles**; this index is the consolidated map. Read it first.
 
+## 2026-07-06 http.client class_manager RwLock writer starvation (branch fix/httpclient-vtable-classmanager-abba-deadlock-0706c)
+
+- [class-manager-rwlock-writer-starvation.md](class-manager-rwlock-writer-starvation.md) -- follow-up to the AB-BA `vtable_manager`/`class_manager` lock-order deadlock FIXED this session (commit `caa4ee65`, cut `HttpComponentsClientHttpRequestFactoryTests` hang rate from 65% to 25%): the residual hangs are a separate, still-open bug -- `execute_invokestatic`'s `class_manager` read guard, held across a superclass-chain walk, can starve a queued writer (`load_class_concurrent`) under heavy concurrent read pressure, since `parking_lot::RwLock`'s default (non-`_fair`) mode is not strictly writer-preferring. Confirmed via two live gdb captures 2 seconds apart showing identical thread state (rules out a snapshot artifact). Next step: cache the native-override lookup per call site the same way the vtable fast path already does, rather than re-acquiring the read lock on every `invokestatic`.
+
 ## 2026-07-06 Hibernate `others.txt` non-passed rerun (OSR allocation-region gate branch)
 
-- [hib-inpredicatetest-criteria-values-null-npe.md](hib-inpredicatetest-criteria-values-null-npe.md) — root-caused this session: `getNames()`'s 100k-iteration allocating loop OSR-compiles; the local (non-parameter) `names` reference falls into the same CompactValue NaN-box collision family as the already-patched HIB-CV-20 (which only seeded reference PARAMETERS into the OSR oop mask, not plain locals). Candidate fix: cherry-pick the previously-unmerged OSR allocation-region gate (`4c3cf821`, branch `claude/practical-golick-ff73f1`), which rejects back-edge OSR for any allocating/calling region — staged on `fix/hib-inpredicate-criteria-values-null-20260705`, not yet merged to `dev`.
+- ✅ FIXED 2026-07-06 (`fix/hib-inpredicate-criteria-values-null-20260706`, commit `084c8ffb`): the `values`-null NPE was `try_osr()` in `vm/src/runtime/interpreter.rs` misreading the invokedynamic uncommon-trap's `i64::MIN` deopt sentinel as a genuine reference return value (no CompactValue/register-staleness involved — reproduced standalone, no Hibernate needed). Full analysis moved to [`docs/internal/hib-inpredicatetest-criteria-values-null-npe-FIXED.md`](../internal/hib-inpredicatetest-criteria-values-null-npe-FIXED.md); the previously-noted candidate cherry-pick (`4c3cf821` / `fix/hib-inpredicate-criteria-values-null-20260705`) is superseded and unneeded. `InPredicateTest` still doesn't fully pass — it now hits a distinct, unrelated `NoSuchMethodError` in `LinkedHashMap.removeEldestEntry` dispatch, tracked separately: [hib-domainparameterxref-lhm-removeeldestentry-nsme.md](hib-domainparameterxref-lhm-removeeldestentry-nsme.md).
 - A 50-class rerun of `others.txt` (4 shards, 1200s per-class timeout) otherwise reconfirmed several already-tracked bugs with no new symptoms: HIB-CV-30 (`MultiLevelCascadeCollectionEmbeddableTest`/`IdClassTest`), the H2/javac `File.pathSeparator` cluster (`SessionDelegatorBaseImplTest` + 4 stored-procedure classes, fix exists on an unmerged branch), `ProxyClassReuseTest`, and `JpaLargeBlobTest`. `SortNaturalTest` showed `HANG` in the parallel sweep but passed cleanly (`ok=1`, 10.5s) in an isolated rerun — a shared-host contention artifact, not a regression of its 2026-06-22 fix. `DelayedCdiSupportTest` (originally reported alongside this rerun as a genuine hang, see `docs/internal/hib-delayedcdisupporttest-weld-bootstrap-hang-NOT-A-BUG.md`) was later REFUTED as the same contention artifact -- it and all sibling CDI-strategy tests pass cleanly in 2-8s when the host is not under load.
+
+## 2026-07-06 WildFly Host Controller org.jboss.as.jmx module-load NPE
+
+- ✅ FIXED 2026-07-06 (`fix/wildfly-module-descriptor-null-20260706`, commit `657ee914`): `Module.canUse`/`addUses` read `this.descriptor` directly in real bytecode and were missing from `force_native_over_real_jdk_bytecode`, so a registered-but-shadowed native never protected real-JDK mode against a named Module with an unset `descriptor` field. Verified with a standalone repro that fails pre-fix and passes post-fix, plus existing module test suites all passing. Full analysis moved to [`docs/internal/fixed-suite-bugs/wildfly-module-descriptor-null-host-controller.md`](../internal/fixed-suite-bugs/wildfly-module-descriptor-null-host-controller.md); live re-confirmation via `HostExcludesTestCase` end to end remains blocked by the domain-mode MSC real-start gap noted below (orthogonal to this fix, doesn't block closing it).
 
 ## 2026-07-06 WildFly domain-mode corrupt-Value-cell root cause + MSC real-start gate
 
@@ -21,7 +29,7 @@ angles**; this index is the consolidated map. Read it first.
 
 ## 2026-07-05 Hibernate pruned residuals
 
-- [Hibernate JpaLargeBlobTest Object.read() dispatch](hib-jpalargeblobtest-object-read-nosuchmethod.md) - patched locally in the JIT virtual/interface MIC helper: `ClassId(0)` non-Object receivers now fall back to the CP owner and cannot publish MIC/PIC entries under the zero/empty sentinel. Local Windows Hibernate probe no longer reproduces `java/lang/Object.read()I`, but the class remains open on a later no-JIT-independent `GenHeap::set_array_element` object-vs-array assertion in H2 `IOUtils.readFully`.
+- Hibernate JpaLargeBlobTest Object.read() dispatch — now **FIXED** (2026-07-06), moved to [`docs/internal/fixed-suite-bugs/hib-jpalargeblobtest-object-read-nosuchmethod.md`](../internal/fixed-suite-bugs/hib-jpalargeblobtest-object-read-nosuchmethod.md). Two distinct bugs: (1) JIT virtual/interface MIC helper resolving `ClassId(0)` non-Object receivers to `java/lang/Object` (merged `b09fea46`), and (2) a residual GC-staleness bug — `native_bais_read_bytes`/`native_dis_read_bytes` in `native-io/src/lib.rs` held unpinned `ObjectRef` locals across re-entrant `invoke_virtual` calls, so a moving GC mid-loop could strand them (fixed with `pin_native_root`/`read_native_pin`).
 
 ## 2026-07-04 test.context.* cluster (bean/groovy/junit/junit4/testng/web, branch fix/test-context-cluster)
 
@@ -235,18 +243,20 @@ initialization gap was fixed 2026-07-02), grouped as:
       "Unexpected failure during bean definition parsing", "Unnamed bean definition", spring-jdbc
       mass-TIMEOUT, scheduler `StringIndexOutOfBounds`, and `DataBufferUtilsTests` TIMEOUT
       (heavy-reactive). (The prior `springsuite-0619-open-candidates.md` link was already dangling.)
-15. **[GC: moving-collector lost-tag missed root](gc-moving-interpreter-lost-tag-missed-root.md)** — 🔴 **OPEN**
-    (benign in practice). Under `-Xmx1g` GC pressure the **moving** young collector zeroes a live object
-    whose only reference is a frame slot tagged non-`Object` at the marking snapshot ("all-zero header" /
-    `Stale pointer … StringBuilder.flush`). Localized **deterministically** to `RandomizedRunner.invoke
-    local[3]` by a new gated `CRATONVM_GC_VERIFY_STALE` per-parked-thread verifier. Same *class* as the
-    Family-A "lost-tag interpreter local" (A4) but on the `--nojit` moving path.
+15. **[GC: moving-collector lost-tag missed root](../internal/gc-moving-interpreter-lost-tag-missed-root.md)** —
+    ✅ **FIXED on dev** (`0abb64ba`, 2026-07-01; doc already archived under `docs/internal/`). The **moving**
+    young collector zeroed a live object whose only reference was a frame slot tagged non-`Object` at the
+    marking snapshot. Fixed in `Frame::scan_local_objects`/`update_local_refs`: non-object-tagged locals are
+    probed via `lost_tag_local_candidates` + the strict `is_object_address` header check, then rooted and
+    remapped. Unit-tested (`scan_local_objects_roots_lost_tag_other_local`,
+    `update_local_refs_remaps_lost_tag_other_local`); the `CRATONVM_GC_VERIFY_STALE` verifier is retained.
 16. **[GC: rs_cache-presence reactor-shutdown timing race](gc-rscache-reactor-shutdown-timing-race.md)** —
-    🔴 **OPEN** (workaround validated). The ES RestClient reactor-worker `ThreadLeakError` at
-    `restClient.close()`: GC-frequency-driven and `rs_cache`-PRESENCE-triggered (a latent
-    GC-STW-vs-reactor-shutdown race exposed by snapshot timing), **NOT** a socket/OP_WRITE bug and **NOT** an
-    rs_cache correctness bug. Reliably avoided by `CRATONVM_ROOTSNAP_CACHE=0` (suite-level — do NOT flip the
-    global default). Supersedes the former `reactor-worker-thread-leak-at-shutdown.md` (removed — see git history).
+    🟢 **FIX LANDED on dev** (`323a3ba6`, 2026-07-01: thread exit serialized against STW —
+    `request_stw_counted` computes `alive_count` under the barrier lock, blocked→dead transition is atomic,
+    thread teardown uses a stable inflated `Arc<Monitor>`; unit-tested). The doc stays here only because its
+    own acceptance gate — the ES `RestClientSingleHostIntegTests` soak at `-Xmx1g` with the default rootsnap
+    cache — has not been rerun; the `CRATONVM_ROOTSNAP_CACHE=0` workaround should no longer be needed once
+    that soak confirms. **NOT** a socket/OP_WRITE bug and **NOT** an rs_cache correctness bug.
 17. **[CompletableFuture untimed `get()` never wakes on cross-thread completion](../internal/app-jvm-bugs/gc-gen-promotion-completablefuture-completion-loss.md)** —
     ✅ **FIXED on dev** (moved to `docs/internal/app-jvm-bugs/`). The original gen-GC "lost young `Signaller`"
     theory was **refuted** (the hang is deterministic + GC-independent); the real cause was the synthetic

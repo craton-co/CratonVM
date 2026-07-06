@@ -1,6 +1,10 @@
 # GC: rs_cache-presence-triggered GC-STW-vs-reactor-shutdown timing race (reactor worker leak)
 
-**Status:** 🟡 **FIX CANDIDATE** (root cause pinned 2026-07-01); **reliable workaround validated** (`CRATONVM_ROOTSNAP_CACHE=0`).
+**Status:** 🟢 **FIX LANDED on dev** (`323a3ba6`, 2026-07-01 — "fix(gc): serialize thread exit against stw";
+the "Fix candidate" section below is what landed, incl. the `blocked_dead_transition_*` /
+`inflated_handle_survives_object_remap_*` unit tests, verified present on dev 2026-07-06). Kept in
+`known-issues` ONLY pending this doc's own acceptance gate (the ES RestClient `-Xmx1g` default-cache soak,
+see "Next step"); **reliable workaround validated** (`CRATONVM_ROOTSNAP_CACHE=0`), expected unnecessary post-fix.
 Found/characterized 2026-06-20 (branch `fix/es-restclient-gc-safety`). Supersedes an earlier
 investigation pass (the former `reactor-worker-thread-leak-at-shutdown.md`, now removed — see git history).
 `--nojit` (moving young collector), GC-pressure-dependent.
@@ -23,7 +27,8 @@ worker.)
   callee frame's `seq`) did NOT reduce the leak (~5/20 with the cache on) and is in fact **redundant** —
   a frame's `seq` is stable, so the existing seq-prefix-closure already implies the callee matched.
 - **Not the separate teardown corruption.** The lost-tag "all-zero header" miss
-  ([gc-moving-interpreter-lost-tag-missed-root.md](gc-moving-interpreter-lost-tag-missed-root.md)) is
+  ([gc-moving-interpreter-lost-tag-missed-root.md](../internal/gc-moving-interpreter-lost-tag-missed-root.md),
+  since FIXED `0abb64ba` and archived) is
   INDEPENDENT: a leak occurred with **zero** corruption, and green runs occurred with corruption.
 
 ## Root cause (pinned 2026-07-01)
@@ -102,5 +107,5 @@ green across the prior failure envelope, move this doc to `docs/internal`.
 ## Related
 
 - Prior (superseded) investigation passes: the former `reactor-worker-thread-leak-at-shutdown.md` (removed; see git history).
-- The co-occurring benign corruption: [gc-moving-interpreter-lost-tag-missed-root.md](gc-moving-interpreter-lost-tag-missed-root.md).
+- The co-occurring benign corruption: [gc-moving-interpreter-lost-tag-missed-root.md](../internal/gc-moving-interpreter-lost-tag-missed-root.md) (FIXED `0abb64ba`, archived).
 - `Thread.getState()` fix (predecessor): commit `16d23e7b`.

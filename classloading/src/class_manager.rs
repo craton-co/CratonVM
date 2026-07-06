@@ -113,20 +113,25 @@ fn loaded_classes_probe(
         .map(|(_, &id)| id)
 }
 
-/// `CRATONVM_LOADER_AWARE_RESOLUTION` gate (default OFF). Mirrors
+/// `CRATONVM_LOADER_AWARE_RESOLUTION` gate (default ON). Mirrors
 /// `cratonvm_vm::runtime::env_cache::loader_aware_resolution` and the
 /// native-builtins twin so the classloading half of loader-faithful class
 /// resolution (loader-faithful supertype linking in `define_class_with_options`)
-/// stays in lock-step. Default OFF keeps every define byte-identical; flip on to
-/// link an enhanced subclass to its same-loader (enhanced) supertype copy rather
-/// than the un-enhanced global one returned by `get_loaded_class_id`. Empty /
-/// `"0"` ⇒ off; any other value ⇒ on.
+/// stays in lock-step. This copy had drifted out of lock-step (still default
+/// OFF) after `env_cache::loader_aware_resolution` flipped to default ON for
+/// the `context.groovy` bug-cluster fix, which silently disabled this crate's
+/// share of the loader-faithful fixes (superclass/interface linking, verifier
+/// hierarchy lookup) by default — see
+/// `docs/known-issues/hib-bytecode-enhancement-loader-faithful-linking.md`.
+/// Flip on links an enhanced subclass to its same-loader (enhanced) supertype
+/// copy rather than the un-enhanced global one returned by
+/// `get_loaded_class_id`. Empty / `"0"` ⇒ off; any other value ⇒ on.
 fn loader_aware_resolution() -> bool {
     use std::sync::OnceLock;
     static GATE: OnceLock<bool> = OnceLock::new();
     *GATE.get_or_init(|| match std::env::var("CRATONVM_LOADER_AWARE_RESOLUTION") {
         Ok(v) => !v.is_empty() && v != "0",
-        Err(_) => false,
+        Err(_) => true,
     })
 }
 
@@ -675,6 +680,30 @@ static ANY_CLASS_REDEFINED: AtomicBool = AtomicBool::new(false);
 #[inline]
 pub fn any_class_redefined() -> bool {
     ANY_CLASS_REDEFINED.load(Ordering::Relaxed)
+}
+
+/// C1→C2 supersede epoch. Bumped by the VM's background compile worker each
+/// time it PUBLISHES an optimizing (C2/IR) recompile that replaces an
+/// already-published C1 body in the jit cache. Per-thread invoke-cache
+/// entries that flipped a call site to a compiled body snapshot this counter
+/// at construction (`CachedInvokeTarget::Jit::supersede_epoch`); a later
+/// mismatch tells the call site its cached `Arc<CompiledMethod>` may be the
+/// superseded C1 artifact, so it evicts and re-resolves from the jit cache
+/// (picking up the C2 body). The old artifact stays alive forever
+/// (executable code is retained-by-design — see `ExecutableBuffer::drop`),
+/// so a stale entry is merely slower, never unsound; the epoch is what makes
+/// the upgrade actually reach already-flipped call sites.
+static JIT_SUPERSEDE_EPOCH: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
+/// Current supersede epoch — see [`JIT_SUPERSEDE_EPOCH`].
+#[inline]
+pub fn jit_supersede_epoch() -> u32 {
+    JIT_SUPERSEDE_EPOCH.load(Ordering::Acquire)
+}
+
+/// Advance the supersede epoch after publishing a replacing C2 body.
+pub fn bump_jit_supersede_epoch() {
+    JIT_SUPERSEDE_EPOCH.fetch_add(1, Ordering::AcqRel);
 }
 
 /// Install the JIT-invalidate hook. Called once by the VM during

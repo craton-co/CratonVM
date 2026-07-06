@@ -2804,9 +2804,21 @@ fn native_bais_read_bytes(ctx: &mut dyn NativeContext, args: &[Value]) -> Method
         if len == 0 {
             return Ok(Some(Value::Int(0)));
         }
+        // PIN: `this`/`buf` are re-used across `invoke_virtual` below, which
+        // runs real bytecode and can trigger a moving GC on every iteration
+        // -- an unpinned `ObjectRef` goes stale and the eventual
+        // `set_array_element` then writes through a dangling pointer (see
+        // docs/known-issues/hib-jpalargeblobtest-object-read-nosuchmethod.md).
+        let this_pin = ctx.pin_native_root(this);
+        let buf_pin = ctx.pin_native_root(buf);
+        let mut this = this;
+        let mut buf = buf;
         let mut i: usize = 0;
         while i < len {
-            match ctx.invoke_virtual(this, "read", "()I", &[])? {
+            let read_result = ctx.invoke_virtual(this, "read", "()I", &[])?;
+            this = ctx.read_native_pin(this_pin, this);
+            buf = ctx.read_native_pin(buf_pin, buf);
+            match read_result {
                 Some(Value::Int(-1)) => break,
                 Some(Value::Int(b)) => {
                     ctx.set_array_element(buf, off + i, Value::Int(b & 0xFF));
@@ -2815,6 +2827,7 @@ fn native_bais_read_bytes(ctx: &mut dyn NativeContext, args: &[Value]) -> Method
                 _ => break,
             }
         }
+        ctx.unpin_native_roots(this_pin);
         if i == 0 {
             return Ok(Some(Value::Int(-1)));
         }
@@ -4498,108 +4511,155 @@ pub fn register_io_natives(registry: &mut NativeMethodRegistry) {
         native_fd_close0,
     );
 
+    /// Platform `sockaddr_in`/`sockaddr_in6` ABI facts for the
+    /// `sun.nio.ch.NativeSocketAddress` probes below. Unix reads them off
+    /// the `libc` crate's struct layout for the compile target; Windows
+    /// (no `libc` dependency — unconditional `libc::` here broke
+    /// `cargo check` on Windows with 12 E0433s) uses the fixed Winsock
+    /// ws2def.h/ws2ipdef.h layout as literals, cross-checked against
+    /// `SOCKADDR_IN`/`SOCKADDR_IN6`: family/port are u16, `sin_zero[8]`
+    /// pads v4 to 16 bytes, v6 is 28 bytes with flowinfo at 4, addr at 8,
+    /// scope_id at 24. AF_INET6 genuinely differs per platform (23 on
+    /// Windows, 10 on Linux) — exactly why these must not be hardcoded
+    /// from one platform's headers.
+    mod sockaddr_abi {
+        #[cfg(unix)]
+        pub const AF_INET: i32 = libc::AF_INET;
+        #[cfg(unix)]
+        pub const AF_INET6: i32 = libc::AF_INET6;
+        #[cfg(unix)]
+        pub const SIZEOF_SOCKADDR4: i32 = std::mem::size_of::<libc::sockaddr_in>() as i32;
+        #[cfg(unix)]
+        pub const SIZEOF_SOCKADDR6: i32 = std::mem::size_of::<libc::sockaddr_in6>() as i32;
+        #[cfg(unix)]
+        pub const SIZEOF_FAMILY: i32 = std::mem::size_of::<libc::sa_family_t>() as i32;
+        #[cfg(unix)]
+        pub const OFFSET_FAMILY: i32 =
+            std::mem::offset_of!(libc::sockaddr_in, sin_family) as i32;
+        #[cfg(unix)]
+        pub const OFFSET_SIN4_PORT: i32 =
+            std::mem::offset_of!(libc::sockaddr_in, sin_port) as i32;
+        #[cfg(unix)]
+        pub const OFFSET_SIN4_ADDR: i32 =
+            std::mem::offset_of!(libc::sockaddr_in, sin_addr) as i32;
+        #[cfg(unix)]
+        pub const OFFSET_SIN6_PORT: i32 =
+            std::mem::offset_of!(libc::sockaddr_in6, sin6_port) as i32;
+        #[cfg(unix)]
+        pub const OFFSET_SIN6_ADDR: i32 =
+            std::mem::offset_of!(libc::sockaddr_in6, sin6_addr) as i32;
+        #[cfg(unix)]
+        pub const OFFSET_SIN6_SCOPE_ID: i32 =
+            std::mem::offset_of!(libc::sockaddr_in6, sin6_scope_id) as i32;
+        #[cfg(unix)]
+        pub const OFFSET_SIN6_FLOWINFO: i32 =
+            std::mem::offset_of!(libc::sockaddr_in6, sin6_flowinfo) as i32;
+
+        #[cfg(windows)]
+        pub const AF_INET: i32 = 2;
+        #[cfg(windows)]
+        pub const AF_INET6: i32 = 23;
+        #[cfg(windows)]
+        pub const SIZEOF_SOCKADDR4: i32 = 16;
+        #[cfg(windows)]
+        pub const SIZEOF_SOCKADDR6: i32 = 28;
+        #[cfg(windows)]
+        pub const SIZEOF_FAMILY: i32 = 2;
+        #[cfg(windows)]
+        pub const OFFSET_FAMILY: i32 = 0;
+        #[cfg(windows)]
+        pub const OFFSET_SIN4_PORT: i32 = 2;
+        #[cfg(windows)]
+        pub const OFFSET_SIN4_ADDR: i32 = 4;
+        #[cfg(windows)]
+        pub const OFFSET_SIN6_PORT: i32 = 2;
+        #[cfg(windows)]
+        pub const OFFSET_SIN6_ADDR: i32 = 8;
+        #[cfg(windows)]
+        pub const OFFSET_SIN6_SCOPE_ID: i32 = 24;
+        #[cfg(windows)]
+        pub const OFFSET_SIN6_FLOWINFO: i32 = 4;
+    }
+
     // sun.nio.ch.NativeSocketAddress's 12 native probes -- struct layout
     // constants for the platform's `sockaddr_in`/`sockaddr_in6`, used by
     // the newer native-memory-based socket address encoding that
     // MulticastSocket/DatagramChannel routes through (reached e.g. by
     // JGroups' UDP transport creating a multicast socket). These are fixed
-    // platform ABI values, not runtime-computed state, so read them
-    // straight off Rust's own `libc::sockaddr_in`/`sockaddr_in6` layout
-    // (compiled for the same target CratonVM runs on) instead of
-    // hardcoding platform-specific magic numbers.
+    // platform ABI values, not runtime-computed state. On unix they are
+    // read straight off Rust's own `libc` layout (compiled for the same
+    // target CratonVM runs on); on Windows — where the `libc` crate is not
+    // a dependency and the original unconditional `libc::` references broke
+    // `cargo check` outright — the equivalent Winsock `SOCKADDR_IN`/
+    // `SOCKADDR_IN6` values are fixed by the ws2def.h/ws2ipdef.h ABI and
+    // are provided as literals in `sockaddr_abi` below (note AF_INET6 is
+    // 23 on Windows vs 10 on Linux).
+    use sockaddr_abi as sa;
     registry.register("sun/nio/ch/NativeSocketAddress", "AFINET", "()I", |_ctx, _args| {
-        Ok(Some(Value::Int(libc::AF_INET)))
+        Ok(Some(Value::Int(sa::AF_INET)))
     });
     registry.register("sun/nio/ch/NativeSocketAddress", "AFINET6", "()I", |_ctx, _args| {
-        Ok(Some(Value::Int(libc::AF_INET6)))
+        Ok(Some(Value::Int(sa::AF_INET6)))
     });
     registry.register(
         "sun/nio/ch/NativeSocketAddress",
         "sizeofSockAddr4",
         "()I",
-        |_ctx, _args| Ok(Some(Value::Int(std::mem::size_of::<libc::sockaddr_in>() as i32))),
+        |_ctx, _args| Ok(Some(Value::Int(sa::SIZEOF_SOCKADDR4))),
     );
     registry.register(
         "sun/nio/ch/NativeSocketAddress",
         "sizeofSockAddr6",
         "()I",
-        |_ctx, _args| Ok(Some(Value::Int(std::mem::size_of::<libc::sockaddr_in6>() as i32))),
+        |_ctx, _args| Ok(Some(Value::Int(sa::SIZEOF_SOCKADDR6))),
     );
     registry.register(
         "sun/nio/ch/NativeSocketAddress",
         "sizeofFamily",
         "()I",
-        |_ctx, _args| Ok(Some(Value::Int(std::mem::size_of::<libc::sa_family_t>() as i32))),
+        |_ctx, _args| Ok(Some(Value::Int(sa::SIZEOF_FAMILY))),
     );
     registry.register(
         "sun/nio/ch/NativeSocketAddress",
         "offsetFamily",
         "()I",
-        |_ctx, _args| {
-            Ok(Some(Value::Int(
-                std::mem::offset_of!(libc::sockaddr_in, sin_family) as i32,
-            )))
-        },
+        |_ctx, _args| Ok(Some(Value::Int(sa::OFFSET_FAMILY))),
     );
     registry.register(
         "sun/nio/ch/NativeSocketAddress",
         "offsetSin4Port",
         "()I",
-        |_ctx, _args| {
-            Ok(Some(Value::Int(
-                std::mem::offset_of!(libc::sockaddr_in, sin_port) as i32,
-            )))
-        },
+        |_ctx, _args| Ok(Some(Value::Int(sa::OFFSET_SIN4_PORT))),
     );
     registry.register(
         "sun/nio/ch/NativeSocketAddress",
         "offsetSin4Addr",
         "()I",
-        |_ctx, _args| {
-            Ok(Some(Value::Int(
-                std::mem::offset_of!(libc::sockaddr_in, sin_addr) as i32,
-            )))
-        },
+        |_ctx, _args| Ok(Some(Value::Int(sa::OFFSET_SIN4_ADDR))),
     );
     registry.register(
         "sun/nio/ch/NativeSocketAddress",
         "offsetSin6Port",
         "()I",
-        |_ctx, _args| {
-            Ok(Some(Value::Int(
-                std::mem::offset_of!(libc::sockaddr_in6, sin6_port) as i32,
-            )))
-        },
+        |_ctx, _args| Ok(Some(Value::Int(sa::OFFSET_SIN6_PORT))),
     );
     registry.register(
         "sun/nio/ch/NativeSocketAddress",
         "offsetSin6Addr",
         "()I",
-        |_ctx, _args| {
-            Ok(Some(Value::Int(
-                std::mem::offset_of!(libc::sockaddr_in6, sin6_addr) as i32,
-            )))
-        },
+        |_ctx, _args| Ok(Some(Value::Int(sa::OFFSET_SIN6_ADDR))),
     );
     registry.register(
         "sun/nio/ch/NativeSocketAddress",
         "offsetSin6ScopeId",
         "()I",
-        |_ctx, _args| {
-            Ok(Some(Value::Int(
-                std::mem::offset_of!(libc::sockaddr_in6, sin6_scope_id) as i32,
-            )))
-        },
+        |_ctx, _args| Ok(Some(Value::Int(sa::OFFSET_SIN6_SCOPE_ID))),
     );
     registry.register(
         "sun/nio/ch/NativeSocketAddress",
         "offsetSin6FlowInfo",
         "()I",
-        |_ctx, _args| {
-            Ok(Some(Value::Int(
-                std::mem::offset_of!(libc::sockaddr_in6, sin6_flowinfo) as i32,
-            )))
-        },
+        |_ctx, _args| Ok(Some(Value::Int(sa::OFFSET_SIN6_FLOWINFO))),
     );
 
     // P69-Cleaner-realfix: the `FileCleanable.register` no-op was removed.
@@ -7512,17 +7572,27 @@ fn native_dis_read_bytes(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
         Value::Object(Some(s)) => s,
         _ => return Ok(Some(Value::Int(-1))),
     };
+    // PIN: `this`/`buf` are re-used after the re-entrant `invoke_virtual`
+    // calls below, which run real bytecode and can trigger a moving GC --
+    // an unpinned `ObjectRef` goes stale and the eventual `set_array_element`
+    // then writes through a dangling pointer (see
+    // docs/known-issues/hib-jpalargeblobtest-object-read-nosuchmethod.md).
+    let this_pin = ctx.pin_native_root(this);
+    let buf_pin = ctx.pin_native_root(buf);
     let result = ctx.invoke_virtual(
         inner,
         "read",
         "([BII)I",
         &[Value::Object(Some(buf)), Value::Int(off), Value::Int(len)],
     )?;
-    match result {
+    let this = ctx.read_native_pin(this_pin, this);
+    let buf = ctx.read_native_pin(buf_pin, buf);
+    let out = match result {
         Some(Value::Int(v)) if v > 0 => Ok(Some(Value::Int(v))),
         Some(Value::Int(0)) => {
             // Bulk returned 0 — try single byte
             let b = dis_read_one(ctx, this)?;
+            let buf = ctx.read_native_pin(buf_pin, buf);
             if b == -1 {
                 Ok(Some(Value::Int(-1)))
             } else {
@@ -7531,7 +7601,9 @@ fn native_dis_read_bytes(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
             }
         }
         _ => Ok(Some(Value::Int(-1))),
-    }
+    };
+    ctx.unpin_native_roots(this_pin);
+    out
 }
 
 fn native_dis_read_boolean(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {

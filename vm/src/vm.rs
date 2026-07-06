@@ -71842,6 +71842,7 @@ public class SkippedTest {
             class_name: "com/example/Foo".to_string(),
             method_name: "bar".to_string(),
             descriptor: "(I)I".to_string(),
+            elided_invoke_pcs: vec![5],
         };
 
         assert_eq!(site.callee_code_len, 2);
