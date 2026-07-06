@@ -369,6 +369,23 @@ pub(crate) fn build_engine_client_config_with_identity(
     build_client_config(roots, alpn, client_identity)
 }
 
+/// As `build_engine_client_config_with_identity`, but additionally restricts
+/// the negotiable cipher suites to `enabled_ciphers` when non-empty. Used by
+/// `SSLSocket.setEnabledCipherSuites` (net_phase_e.rs) to reconnect a socket
+/// created via `SSLSocketFactory.createSocket` under a real cipher
+/// restriction — callers rely on the JDK contract that a socket rejects the
+/// handshake when restricted to a suite the server doesn't support (e.g.
+/// Tomcat's `TesterSupport.ClientSSLSocketFactory`).
+pub(crate) fn build_engine_client_config_with_identity_ciphers(
+    alpn: &[&str],
+    client_identity: Option<(&str, &str)>,
+    enabled_ciphers: &[String],
+) -> Result<Arc<ClientConfig>, String> {
+    let trust_roots = active_client_trust_roots();
+    let roots = root_store_for_trust_roots(trust_roots.as_ref());
+    build_client_config_ciphers(roots, alpn, client_identity, enabled_ciphers)
+}
+
 // The client identity (cert_pem, key_pem) installed via
 // `HttpsURLConnection.setDefaultSSLSocketFactory`. The native HttpsURLConnection
 // client (`http_url_connection::perform`) does not route through
@@ -952,6 +969,19 @@ fn cipher_provider_for(enabled: &[String]) -> Arc<rustls::crypto::CryptoProvider
     Arc::new(restricted)
 }
 
+/// True if at least one of `ciphers` maps to a real rustls `CipherSuite` (see
+/// `java_cipher_name_to_suite`). Classic TLS 1.2 `TLS_DHE_RSA_*` names never
+/// map — rustls has never implemented finite-field DHE key exchange in any of
+/// its crypto providers (`ring`/`aws-lc-rs` only ship ECDHE + TLS 1.3), which
+/// is a real upstream library limitation, not an oversight here. Callers that
+/// would otherwise silently fall back to an unrestricted connection (see
+/// `cipher_provider_for`) should use this to detect that case up front and
+/// leave an existing connection alone instead of tearing it down for a
+/// restriction that cannot actually be enforced through rustls.
+pub(crate) fn any_cipher_mappable(ciphers: &[String]) -> bool {
+    ciphers.iter().any(|n| java_cipher_name_to_suite(n).is_some())
+}
+
 /// A `ClientCertVerifier` that accepts any structurally-valid, correctly
 /// SIGNED client certificate WITHOUT validating its chain against a trust
 /// anchor. Used exclusively when Tomcat's `trustManagerClassName` mechanism
@@ -1108,6 +1138,20 @@ pub(crate) fn rustls_client_connect(
 
     // Drive the handshake to completion so the negotiated fields are
     // populated before we read them.
+    //
+    // FIX (client-cipher-restriction): `read_tls` returns `Ok(0)` — not an
+    // `Err` — when the peer has closed the connection (rustls's documented
+    // contract; its own examples all check for a zero return). This loop
+    // previously ignored the return value entirely, so a server that rejects
+    // the handshake and closes (e.g. no cipher suite in common — exactly
+    // what a real restriction via `SSLSocket.setEnabledCipherSuites` is
+    // supposed to cause) left `is_handshaking()` stuck `true` forever: every
+    // subsequent `read_tls` on the already-closed socket returns `Ok(0)`
+    // instantly, so the loop busy-spins at ~100% CPU rather than blocking or
+    // erroring — a live-lock, not a hang-then-timeout. This was unreachable
+    // before this fix (nothing previously drove a client through this path
+    // to a server that legitimately rejects and closes mid-handshake), so
+    // the gap was latent.
     while stream.conn.is_handshaking() {
         // A single byte read is the canonical way to pump the rustls state
         // machine across a blocking socket without reading any app data.
@@ -1118,10 +1162,17 @@ pub(crate) fn rustls_client_connect(
                 .map_err(|e| format!("handshake write: {}", e))?;
         }
         if stream.conn.wants_read() {
-            stream
+            let n = stream
                 .conn
                 .read_tls(&mut stream.sock)
                 .map_err(|e| format!("handshake read: {}", e))?;
+            if n == 0 {
+                return Err(
+                    "connection closed by peer during handshake (likely a rejected \
+                     handshake, e.g. no cipher suite in common)"
+                        .to_string(),
+                );
+            }
             stream
                 .conn
                 .process_new_packets()

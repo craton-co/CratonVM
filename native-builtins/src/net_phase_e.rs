@@ -200,6 +200,18 @@ fn sock_set<F: FnOnce(&mut SockSide)>(this: ObjectRef, f: F) {
     f(entry);
 }
 
+/// FIX (client-cipher-restriction): read the `s2_registry`/rustls stream id
+/// backing a `Socket`/`SSLSocket` object created through this module (-1 if
+/// not connected/tracked). Used by `http_url_connection::perform` to route
+/// HTTPS I/O through a socket obtained by up-calling a real, caller-installed
+/// `SSLSocketFactory.createSocket` (instead of `perform`'s own internal
+/// connection) when that factory might apply configuration — like cipher
+/// restriction via `SSLSocket.setEnabledCipherSuites` — that only takes
+/// effect through the real Java call chain.
+pub(crate) fn sock_stream_id_for_upcall(this: ObjectRef) -> i32 {
+    sock_get(this).stream_id
+}
+
 fn ss_get(this: ObjectRef) -> SsSide {
     let t = ss_side_table().lock();
     t.get(&this).copied().unwrap_or(SsSide {
@@ -7079,10 +7091,29 @@ fn register_re6_ssl_context(r: &mut NativeMethodRegistry) {
             }
             // Per-context client identity (mTLS): the SSLContext stashed on the
             // factory by getSocketFactory (field 0) may carry a client cert+key.
+            //
+            // FIX (client-cipher-restriction): field 0 is only the owning
+            // SSLContext for the bare placeholder `getSocketFactory()`
+            // itself returns. When this `createSocket` is reached via an
+            // up-call on a real, user-defined `SSLSocketFactory` SUBCLASS
+            // (e.g. Tomcat's `TesterSupport.ClientSSLSocketFactory`, wrapping
+            // the placeholder — see `http_url_connection
+            // ::huc_upcall_create_socket_if_custom_factory`), field 0 is
+            // whatever THAT class declares first (for `ClientSSLSocketFactory`,
+            // its own `delegate` field, a *different* SSLSocketFactory
+            // object) — `ctx_identity` then looks up identity keyed by the
+            // wrong object's identity and always misses, so the up-called
+            // path silently dropped client-cert presentation entirely. Fall
+            // back to the same global `huc_default_client_identity()` that
+            // `http_url_connection::perform`'s own (non-up-called) connect
+            // already relies on — populated by the same `getSocketFactory()`
+            // call, just read through a path that isn't sensitive to which
+            // object ends up at field 0.
             let client_ident = match ctx.get_field(this_factory, 0) {
                 Value::Object(Some(sslctx)) => crate::t27_tls::ctx_identity(ctx, sslctx),
                 _ => None,
-            };
+            }
+            .or_else(crate::t27_tls::huc_default_client_identity);
             // Use the rustls client path rather than a default native-tls
             // connector: (1) trust the gathered test/truststore roots (the
             // native-tls default trusts only the OS root store, so it cannot
@@ -7093,8 +7124,18 @@ fn register_re6_ssl_context(r: &mut NativeMethodRegistry) {
                 client_ident.as_ref().map(|(c, k)| (c.as_str(), k.as_str())),
             )
             .map_err(|e| ioex(format!("client TLS config: {e}")))?;
-            let rid = crate::t27_tls::rustls_client_connect(cfg, &host, port as u16)
-                .map_err(|e| ioex(format!("TLS connect: {e}")))?;
+            // T19.H1: TCP connect + full TLS handshake blocks for real, and this
+            // native can now be reached via an up-call from
+            // `http_url_connection::huc_upcall_create_socket_if_custom_factory`
+            // that runs BEFORE the caller's own blocking region (it needs `ctx`,
+            // which a blocking region must not hold) — without announcing our
+            // own blocking region here, a concurrent stop-the-world GC would wait
+            // forever for this thread to reach a safepoint it can't reach until
+            // the (now-deadlocked-behind-the-GC) network call returns.
+            ctx.begin_blocking_region();
+            let connect_result = crate::t27_tls::rustls_client_connect(cfg, &host, port as u16);
+            ctx.end_blocking_region();
+            let rid = connect_result.map_err(|e| ioex(format!("TLS connect: {e}")))?;
             let id = crate::servlet::RUSTLS_SOCK_ID_BASE + rid;
             let sock = alloc_concurrent_synthetic(ctx, "javax/net/ssl/SSLSocket", 5);
             let host_s = ctx.create_string(&host);
@@ -7106,6 +7147,89 @@ fn register_re6_ssl_context(r: &mut NativeMethodRegistry) {
                 s.stream_id = id;
             });
             Ok(Some(Value::Object(Some(sock))))
+        },
+    );
+    // FIX (client-cipher-restriction): a socket from `createSocket` above
+    // already completed its handshake unrestricted. The JDK contract
+    // callers rely on (e.g. Tomcat's `TesterSupport.ClientSSLSocketFactory`,
+    // which calls this immediately after `createSocket` returns, before any
+    // I/O) is that restricting to a suite the server doesn't support makes
+    // the connection fail — so the only way to honor it is to tear down and
+    // reconnect under the restriction.
+    //
+    // Only do this when at least one requested suite maps to a real rustls
+    // `CipherSuite` (`any_cipher_mappable`) — classic TLS 1.2 `TLS_DHE_RSA_*`
+    // names never do, because rustls has no finite-field DHE support in any
+    // crypto provider (a real upstream limitation, not a gap in this
+    // mapping). For an unmappable list, leave the existing (unrestricted)
+    // connection alone rather than reconnect into a config that would
+    // silently fall back to unrestricted anyway (see `cipher_provider_for`'s
+    // own empty-`wanted` fallback) — that would tear down a working
+    // connection for no enforcement benefit. Known, currently unclosable gap
+    // for TLS 1.2 DHE-suite restriction specifically; see
+    // docs/known-issues/tls-ocsp-clientcert-validation-not-enforced.md.
+    r.register(
+        "javax/net/ssl/SSLSocket",
+        "setEnabledCipherSuites",
+        "([Ljava/lang/String;)V",
+        |ctx, args| {
+            let this = obj_arg(args, 0)?;
+            let mut ciphers: Vec<String> = Vec::new();
+            if let Some(Value::Object(Some(arr))) = args.get(1) {
+                let len = ctx.array_length(*arr);
+                for i in 0..len {
+                    if let Value::Object(Some(s)) = ctx.get_array_element(*arr, i) {
+                        if let Some(t) = ctx.read_string(s) {
+                            ciphers.push(t);
+                        }
+                    }
+                }
+            }
+            if ciphers.is_empty() || !crate::t27_tls::any_cipher_mappable(&ciphers) {
+                return Ok(None);
+            }
+            let host = read_field_string_or(ctx, this, SOCK_HOST, "");
+            let side = sock_get(this);
+            if host.is_empty() || side.port <= 0 {
+                return Ok(None);
+            }
+            let client_ident = crate::t27_tls::huc_default_client_identity();
+            let cfg = match crate::t27_tls::build_engine_client_config_with_identity_ciphers(
+                &["http/1.1"],
+                client_ident.as_ref().map(|(c, k)| (c.as_str(), k.as_str())),
+                &ciphers,
+            ) {
+                Ok(cfg) => cfg,
+                Err(msg) => {
+                    return Err(crate::phases_early::throw_jca_exc(
+                        ctx,
+                        "javax/net/ssl/SSLHandshakeException",
+                        &msg,
+                    ));
+                }
+            };
+            // T19.H1: see the matching comment on `createSocket` above — this
+            // reconnect blocks on real network I/O too and must announce it.
+            ctx.begin_blocking_region();
+            let connect_result = crate::t27_tls::rustls_client_connect(cfg, &host, side.port as u16);
+            ctx.end_blocking_region();
+            match connect_result {
+                Ok(rid) => {
+                    if side.stream_id >= 0 {
+                        let _ = crate::servlet::s2_tls_close(side.stream_id);
+                    }
+                    let new_id = crate::servlet::RUSTLS_SOCK_ID_BASE + rid;
+                    sock_set(this, |s| {
+                        s.stream_id = new_id;
+                    });
+                    Ok(None)
+                }
+                Err(msg) => Err(crate::phases_early::throw_jca_exc(
+                    ctx,
+                    "javax/net/ssl/SSLHandshakeException",
+                    &msg,
+                )),
+            }
         },
     );
     r.register(
