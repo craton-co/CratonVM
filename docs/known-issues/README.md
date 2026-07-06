@@ -602,17 +602,25 @@ JIT divide-by-zero re-run) has since been fixed; the other two remain open:
   `microprofile-config-api-3.1.jar` were entirely absent from
   `kc-universal-cp.txt`; both added). Historical record moved to
   [../internal/keycloak-smallrye-configbuilder-defaultsources-linkage-crashes.md](../internal/keycloak-smallrye-configbuilder-defaultsources-linkage-crashes.md).
-- [keycloak-testframework-quarkus-config-classpath-gap.md](keycloak-testframework-quarkus-config-classpath-gap.md) —
-  🔴 open. Uncovered by the fixes above: `org.keycloak.testframework.config.Config`
-  needs `quarkus-core` (for `CharsetConverter`/`MemorySizeConverter`/
-  `InetSocketAddressConverter`, and — per the `assertNotNull` fix above —
-  `opentelemetry.runtime.config.build.SamplerType`), which is entirely absent from
-  `kc-universal-cp.txt`. Both fixes above still bottom out on this same gap one
-  layer further in (`SamplerType` for `testsuite/model` classes via
-  `KeycloakModelTest`; `CharsetConverter`'s `SRCFG00012` "not parameterized with a
-  type" for the `tests/db`/`tests/clustering` classes via
-  `SmallRyeConfigBuilder.withConverters`) — not new bugs, both covered by this
-  doc's existing next steps.
+- ✅ **`org.keycloak.testframework.config.Config` Quarkus classpath gap** — FIXED
+  (2026-07-06). `quarkus-core` and four more layers behind it (the full
+  `smallrye-common-*` family, `org.ow2.asm:asm`, `jboss-logmanager`,
+  `quarkus-bootstrap-runner`) were entirely absent from `kc-universal-cp.txt`;
+  all added. `AccountConsoleDisabledTest` now runs past `Config.initConfig()`
+  and Quarkus logging bootstrap into real JUnit 5 test execution. Also added
+  `apps/keycloak-suite-runner/generate-kc-universal-cp.ps1` (a dry-run-by-default
+  helper that pulls a named module's already-resolved `cratonvm-full-cp.txt`
+  jars into `kc-universal-cp.txt`, per this doc's "no in-repo generator"
+  ask) — see it for why a blind full-repo union isn't used by default.
+  Historical record moved to
+  [../internal/fixed-suite-bugs/keycloak-testframework-quarkus-config-classpath-gap.md](../internal/fixed-suite-bugs/keycloak-testframework-quarkus-config-classpath-gap.md).
+- [keycloak-testframework-enterprisedb-supplier-noclassdef.md](keycloak-testframework-enterprisedb-supplier-noclassdef.md) —
+  🔴 open. Residual uncovered by the fix above: `Registry`'s extension-supplier
+  discovery now runs (it couldn't before) and immediately fails with
+  `NoClassDefFoundError: org/keycloak/testframework/database/EnterpriseDbDatabaseSupplier`
+  — puzzling because the class/jar/classpath-dir all genuinely exist; possibly
+  the same misleading-diagnostic pattern as the Infinispan `isClustered()` bug
+  below, or a missing Testcontainers jar. Not yet root-caused.
 
 ## Keycloak post-PreviewFeatures rerun (2026-07-03)
 
