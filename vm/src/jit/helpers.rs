@@ -415,6 +415,11 @@ pub(crate) struct DrainedJitSignals {
     pub aioobe: Option<(i64, i64)>,
     pub arithmetic: bool,
     pub npe: bool,
+    /// Drained alongside `npe` for hygiene (a stale action code must not
+    /// outlive its NPE), but not yet consumed by the JIT-return drains —
+    /// they throw the bare NPE exactly as before this consolidation
+    /// (attaching the JEP-358 action message here is a follow-up).
+    #[allow(dead_code)]
     pub npe_action: u8,
     pub deopt: bool,
 }
