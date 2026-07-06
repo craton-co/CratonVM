@@ -4860,7 +4860,24 @@ fn native_map_get(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResu
     // S111r27: Use layout-aware helpers so that JDK-created nodes
     // (hash=0, key=1, value=2, next=3) are handled correctly alongside
     // legacy-created nodes (key=0, value=1, hash=2, next=3).
+    //
+    // Chain-walk cycle guard: mirrors native_map_put's CHAIN_WALK_LIMIT.
+    // Without this, a corrupted (cyclic) bucket chain spins this native
+    // call forever with no way to recover or diagnose.
+    const CHAIN_WALK_LIMIT: usize = 4096;
+    let mut walk_count: usize = 0;
     while let Value::Object(Some(node)) = node_val {
+        walk_count += 1;
+        if walk_count > CHAIN_WALK_LIMIT {
+            eprintln!(
+                "[HM-GET-GUARD] aborting chain walk at {} nodes (suspected cycle); map={:?} idx={} cap={}",
+                walk_count, this, idx, cap
+            );
+            return Err(cratonvm_types::error::RuntimeError::IllegalStateException {
+                message: "hashmap chain exceeded safety cap; possible corruption".to_string(),
+            }
+            .into());
+        }
         let node_key_field = get_node_key(ctx, node);
         if is_null_key {
             if matches!(node_key_field, Value::Object(None)) {
@@ -4970,11 +4987,33 @@ fn native_map_remove(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallR
             return Ok(Some(old_value));
         }
 
-        // Walk chain
+        // Walk chain.
+        //
+        // Chain-walk cycle guard: mirrors native_map_put's CHAIN_WALK_LIMIT.
+        // Without this, a corrupted (cyclic) bucket chain spins this native
+        // call forever with no way to recover or diagnose -- this is
+        // exactly what a --stack-dump-on-timeout capture showed: a
+        // ThreadPoolExecutor worker permanently stuck inside
+        // HashSet.remove() during processWorkerExit, racing
+        // interruptIdleWorkers() on the main thread over the same
+        // `workers` set.
+        const CHAIN_WALK_LIMIT: usize = 4096;
+        let mut walk_count: usize = 0;
         let mut prev = head;
         let mut curr_val = ctx.get_field(head, NODE_FIELD_NEXT);
 
         while let Value::Object(Some(curr)) = curr_val {
+            walk_count += 1;
+            if walk_count > CHAIN_WALK_LIMIT {
+                eprintln!(
+                    "[HM-REMOVE-GUARD] aborting chain walk at {} nodes (suspected cycle); map={:?} idx={} cap={}",
+                    walk_count, this, idx, cap
+                );
+                return Err(cratonvm_types::error::RuntimeError::IllegalStateException {
+                    message: "hashmap chain exceeded safety cap; possible corruption".to_string(),
+                }
+                .into());
+            }
             if node_matches_inner(ctx, curr, is_null_key, key_ref)? {
                 let next = ctx.get_field(curr, NODE_FIELD_NEXT);
                 ctx.set_field(prev, NODE_FIELD_NEXT, next);
@@ -5029,7 +5068,21 @@ fn native_map_contains_key(ctx: &mut dyn NativeContext, args: &[Value]) -> Metho
     let idx = map_bucket_index(hash, cap);
     let mut node_val = ctx.get_array_element(buckets, idx);
 
+    // Chain-walk cycle guard: mirrors native_map_put's CHAIN_WALK_LIMIT.
+    const CHAIN_WALK_LIMIT: usize = 4096;
+    let mut walk_count: usize = 0;
     while let Value::Object(Some(node)) = node_val {
+        walk_count += 1;
+        if walk_count > CHAIN_WALK_LIMIT {
+            eprintln!(
+                "[HM-CONTAINSKEY-GUARD] aborting chain walk at {} nodes (suspected cycle); map={:?} idx={} cap={}",
+                walk_count, this, idx, cap
+            );
+            return Err(cratonvm_types::error::RuntimeError::IllegalStateException {
+                message: "hashmap chain exceeded safety cap; possible corruption".to_string(),
+            }
+            .into());
+        }
         let node_key_field = get_node_key(ctx, node);
         if is_null_key {
             if matches!(node_key_field, Value::Object(None)) {
