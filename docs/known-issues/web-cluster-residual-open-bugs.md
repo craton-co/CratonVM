@@ -1,38 +1,20 @@
-# web/test.web cluster — residual OPEN bugs (2026-07-06)
+# web/test.web cluster — residual bugs (2026-07-06)
 
 Found via a full Spring suite sweep of `test.web`, `web.client`, `web.context`,
 `web.method`, `web.reactive.function`, `web.reactive.resource`,
 `web.reactive.result`, `web.servlet`, `web.util` (653 classes, jit-real mode).
 This supersedes an earlier version of this doc that was lost when the Azure
-build host's ephemeral disk was wiped mid-session before it could be pushed;
-most of what it listed has since been fixed (see the FIXED section below) —
-only 2 items remain genuinely open (a 3rd, `XlsViewTests::xlsxView`, no
-longer reproduces as of 2026-07-06 — see the FIXED section).
+build host's ephemeral disk was wiped mid-session before it could be pushed.
+**All 3 items from the original OPEN list have since been fixed or confirmed
+not-reproducing** — see the FIXED section below. No items remain open from
+this sweep as of 2026-07-06.
 
-## Real CratonVM bugs still OPEN
+## Real CratonVM bugs — all resolved (moved to FIXED section below)
 
-- **`ResourceHttpRequestHandlerTests::partialContentByteRangeWithEncodedResource(GzippedFiles)`**
-  — `expected "bytes 0-1/66", was "bytes 0-1/69"`. CratonVM's `flate2`-backed
-  `Deflater` (`native-builtins/src/zip_real.rs`) produces 69 bytes for the
-  test fixture at every compression level, while real gzip/zlib produces
-  exactly 66 — `flate2`'s default `miniz_oxide` backend, while spec-correct,
-  isn't byte-identical to zlib's output. A real fix (switching to the
-  `flate2/zlib` feature with vendored zlib) has workspace-wide blast radius
-  and cross-platform (Windows) build risk — needs validation on both Linux
-  and Windows before landing.
-- **`DefaultFragmentsRenderingTests::render()`** (`ExceptionInInitializerError`)
-  and **`FragmentRenderingStreamTests`** (`streamWithFlux`/`streamWithSseEmitter`,
-  `IllegalStateException: Failed to send [...ResponseBodyEmitter$DataWithMediaType...]`)
-  — same root cause: `Caused by: ExceptionInInitializerError` at
-  `PyType.fromClass` → `PyJavaType.<clinit>` → NPE on `Py.threadStateMapping`.
-  Confirmed CratonVM-specific (identical jar+JDK25 works under real HotSpot).
-  Traced to a circular class-init dependency inside Jython 2.7.4's
-  `Py.<clinit>`: constructing `PyNotImplemented`/`PyEllipsis` triggers
-  `PyType.fromClass` → `PyJavaType` before `Py`'s own clinit reaches the
-  `threadStateMapping` assignment. Needs the same kind of "pre-initialize
-  before claim" workaround already used for the `PrimitiveClassDescImpl`/
-  `ConstantDescs` cycle — the precise trigger point wasn't pinned down
-  confidently enough yet to write a safe patch.
+(Originally 3 open items here: gzip/zlib byte-count mismatch, Jython
+Py.<clinit> circular dependency, and XlsViewTests POI ClassCastException.
+All 3 are now resolved — see items 15-16 and the XlsViewTests note in the
+FIXED section.)
 
 ## Not CratonVM bugs — environment/test-classpath gaps (skip)
 
@@ -114,6 +96,25 @@ longer reproduces as of 2026-07-06 — see the FIXED section).
 14. `IntStream`/`LongStream`/`DoubleStream.iterator()` had no native
     registration — dispatched to the abstract `BaseStream.iterator()`
     interface declaration → `AbstractMethodError` (`XlsViewTests::xlsxStreamingView`).
+15. `java.util.logging.Logger.log(Level, String, Object[])` (and the
+    single-`Object` overload) had no native override — CratonVM's synthetic
+    `Logger` objects bypass the real constructor, leaving instance field
+    `loggerBundle` uninitialized, so the unshimmed call fell through to real
+    JDK bytecode (`Logger.doLog` → `getEffectiveLoggerBundle()`) and NPE'd
+    reading the never-initialized field. Jython 2.7.4's `PySystemState`
+    bootstrap (`PrePy.maybeWrite` → `writeConsoleWarning`) calls exactly this
+    overload on every `PythonInterpreter`/JSR-223 `jython` engine bootstrap,
+    breaking `DefaultFragmentsRenderingTests` and `FragmentRenderingStreamTests`.
+    (Not the class-initialization-ordering race originally hypothesized —
+    confirmed via direct repro against the actual Jython jar.)
+16. `flate2`'s default `rust_backend` (`miniz_oxide`) DEFLATE encoder,
+    while spec-correct, isn't byte-identical to real zlib's output —
+    `ResourceHttpRequestHandlerTests::partialContentByteRangeWithEncodedResource`
+    expected a 66-byte gzip stream (matching real zlib) but got 69 bytes.
+    Fixed by switching the workspace's `flate2` feature to `zlib-rs` (a pure-
+    Rust, no-system-dependency zlib reimplementation, bit-for-bit compatible
+    with real zlib) — verified with a side-by-side baseline-vs-fixed build
+    comparison to confirm zero regressions.
 
 `JAXBContextImpl.createValidator` `VerifyError` (from the original bug list)
 did not reproduce on a clean build — the check that would produce it
