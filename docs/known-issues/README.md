@@ -22,7 +22,7 @@ angles**; this index is the consolidated map. Read it first.
 
 ## 2026-07-05 Hibernate pruned residuals
 
-- [Hibernate JpaLargeBlobTest Object.read() dispatch](hib-jpalargeblobtest-object-read-nosuchmethod.md) - patched locally in the JIT virtual/interface MIC helper: `ClassId(0)` non-Object receivers now fall back to the CP owner and cannot publish MIC/PIC entries under the zero/empty sentinel. Local Windows Hibernate probe no longer reproduces `java/lang/Object.read()I`, but the class remains open on a later no-JIT-independent `GenHeap::set_array_element` object-vs-array assertion in H2 `IOUtils.readFully`.
+- Hibernate JpaLargeBlobTest Object.read() dispatch — now **FIXED** (2026-07-06), moved to [`docs/internal/fixed-suite-bugs/hib-jpalargeblobtest-object-read-nosuchmethod.md`](../internal/fixed-suite-bugs/hib-jpalargeblobtest-object-read-nosuchmethod.md). Two distinct bugs: (1) JIT virtual/interface MIC helper resolving `ClassId(0)` non-Object receivers to `java/lang/Object` (merged `b09fea46`), and (2) a residual GC-staleness bug — `native_bais_read_bytes`/`native_dis_read_bytes` in `native-io/src/lib.rs` held unpinned `ObjectRef` locals across re-entrant `invoke_virtual` calls, so a moving GC mid-loop could strand them (fixed with `pin_native_root`/`read_native_pin`).
 
 ## 2026-07-04 test.context.* cluster (bean/groovy/junit/junit4/testng/web, branch fix/test-context-cluster)
 
