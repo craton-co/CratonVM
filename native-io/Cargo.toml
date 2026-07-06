@@ -43,6 +43,14 @@ rustc-hash.workspace = true
 # `native-builtins/src/servlet.rs`), so no extra Windows-specific crate is
 # needed. An IOCP-backed `WindowsAsyncSelector` for AsynchronousSocketChannel
 # is a separate WP.
+#
+# Unlike `native-builtins`'s `libc` dependency (used only for `poll(2)`/
+# `WSAPoll`, which the `libc` crate exposes on both platforms), this crate's
+# `sun.nio.ch.NativeSocketAddress` natives read `libc::sockaddr_in`/
+# `sockaddr_in6`/`AF_INET6` — types the `libc` crate does NOT define on
+# Windows (Windows sockaddr types live in `winsock2.h`, not in `libc`'s
+# Windows surface). Keep this Unix-only; see the `#[cfg(windows)]` companion
+# block in `src/lib.rs` (hardcoded WinSock2 ABI constants) for that platform.
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
 

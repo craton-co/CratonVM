@@ -4503,104 +4503,195 @@ pub fn register_io_natives(registry: &mut NativeMethodRegistry) {
     // the newer native-memory-based socket address encoding that
     // MulticastSocket/DatagramChannel routes through (reached e.g. by
     // JGroups' UDP transport creating a multicast socket). These are fixed
-    // platform ABI values, not runtime-computed state, so read them
-    // straight off Rust's own `libc::sockaddr_in`/`sockaddr_in6` layout
-    // (compiled for the same target CratonVM runs on) instead of
-    // hardcoding platform-specific magic numbers.
-    registry.register("sun/nio/ch/NativeSocketAddress", "AFINET", "()I", |_ctx, _args| {
-        Ok(Some(Value::Int(libc::AF_INET)))
-    });
-    registry.register("sun/nio/ch/NativeSocketAddress", "AFINET6", "()I", |_ctx, _args| {
-        Ok(Some(Value::Int(libc::AF_INET6)))
-    });
-    registry.register(
-        "sun/nio/ch/NativeSocketAddress",
-        "sizeofSockAddr4",
-        "()I",
-        |_ctx, _args| Ok(Some(Value::Int(std::mem::size_of::<libc::sockaddr_in>() as i32))),
-    );
-    registry.register(
-        "sun/nio/ch/NativeSocketAddress",
-        "sizeofSockAddr6",
-        "()I",
-        |_ctx, _args| Ok(Some(Value::Int(std::mem::size_of::<libc::sockaddr_in6>() as i32))),
-    );
-    registry.register(
-        "sun/nio/ch/NativeSocketAddress",
-        "sizeofFamily",
-        "()I",
-        |_ctx, _args| Ok(Some(Value::Int(std::mem::size_of::<libc::sa_family_t>() as i32))),
-    );
-    registry.register(
-        "sun/nio/ch/NativeSocketAddress",
-        "offsetFamily",
-        "()I",
-        |_ctx, _args| {
-            Ok(Some(Value::Int(
-                std::mem::offset_of!(libc::sockaddr_in, sin_family) as i32,
-            )))
-        },
-    );
-    registry.register(
-        "sun/nio/ch/NativeSocketAddress",
-        "offsetSin4Port",
-        "()I",
-        |_ctx, _args| {
-            Ok(Some(Value::Int(
-                std::mem::offset_of!(libc::sockaddr_in, sin_port) as i32,
-            )))
-        },
-    );
-    registry.register(
-        "sun/nio/ch/NativeSocketAddress",
-        "offsetSin4Addr",
-        "()I",
-        |_ctx, _args| {
-            Ok(Some(Value::Int(
-                std::mem::offset_of!(libc::sockaddr_in, sin_addr) as i32,
-            )))
-        },
-    );
-    registry.register(
-        "sun/nio/ch/NativeSocketAddress",
-        "offsetSin6Port",
-        "()I",
-        |_ctx, _args| {
-            Ok(Some(Value::Int(
-                std::mem::offset_of!(libc::sockaddr_in6, sin6_port) as i32,
-            )))
-        },
-    );
-    registry.register(
-        "sun/nio/ch/NativeSocketAddress",
-        "offsetSin6Addr",
-        "()I",
-        |_ctx, _args| {
-            Ok(Some(Value::Int(
-                std::mem::offset_of!(libc::sockaddr_in6, sin6_addr) as i32,
-            )))
-        },
-    );
-    registry.register(
-        "sun/nio/ch/NativeSocketAddress",
-        "offsetSin6ScopeId",
-        "()I",
-        |_ctx, _args| {
-            Ok(Some(Value::Int(
-                std::mem::offset_of!(libc::sockaddr_in6, sin6_scope_id) as i32,
-            )))
-        },
-    );
-    registry.register(
-        "sun/nio/ch/NativeSocketAddress",
-        "offsetSin6FlowInfo",
-        "()I",
-        |_ctx, _args| {
-            Ok(Some(Value::Int(
-                std::mem::offset_of!(libc::sockaddr_in6, sin6_flowinfo) as i32,
-            )))
-        },
-    );
+    // platform ABI values, not runtime-computed state.
+    //
+    // Unix: read them straight off Rust's own `libc::sockaddr_in`/
+    // `sockaddr_in6` layout (compiled for the same target CratonVM runs on).
+    // Windows: the `libc` crate does not define `sockaddr_in`/`sockaddr_in6`/
+    // `AF_INET6` on this platform (those live in `winsock2.h`, outside
+    // `libc`'s Windows surface — this previously broke the Windows build
+    // entirely with "cannot find type `sockaddr_in` in crate `libc`"), so
+    // hardcode WinSock2's own struct layout instead. That ABI is a stable,
+    // public contract (unchanged since Winsock2 shipped), so hardcoding it is
+    // exactly as safe as reading it off `libc` on Unix.
+    #[cfg(unix)]
+    {
+        registry.register("sun/nio/ch/NativeSocketAddress", "AFINET", "()I", |_ctx, _args| {
+            Ok(Some(Value::Int(libc::AF_INET)))
+        });
+        registry.register("sun/nio/ch/NativeSocketAddress", "AFINET6", "()I", |_ctx, _args| {
+            Ok(Some(Value::Int(libc::AF_INET6)))
+        });
+        registry.register(
+            "sun/nio/ch/NativeSocketAddress",
+            "sizeofSockAddr4",
+            "()I",
+            |_ctx, _args| Ok(Some(Value::Int(std::mem::size_of::<libc::sockaddr_in>() as i32))),
+        );
+        registry.register(
+            "sun/nio/ch/NativeSocketAddress",
+            "sizeofSockAddr6",
+            "()I",
+            |_ctx, _args| Ok(Some(Value::Int(std::mem::size_of::<libc::sockaddr_in6>() as i32))),
+        );
+        registry.register(
+            "sun/nio/ch/NativeSocketAddress",
+            "sizeofFamily",
+            "()I",
+            |_ctx, _args| Ok(Some(Value::Int(std::mem::size_of::<libc::sa_family_t>() as i32))),
+        );
+        registry.register(
+            "sun/nio/ch/NativeSocketAddress",
+            "offsetFamily",
+            "()I",
+            |_ctx, _args| {
+                Ok(Some(Value::Int(
+                    std::mem::offset_of!(libc::sockaddr_in, sin_family) as i32,
+                )))
+            },
+        );
+        registry.register(
+            "sun/nio/ch/NativeSocketAddress",
+            "offsetSin4Port",
+            "()I",
+            |_ctx, _args| {
+                Ok(Some(Value::Int(
+                    std::mem::offset_of!(libc::sockaddr_in, sin_port) as i32,
+                )))
+            },
+        );
+        registry.register(
+            "sun/nio/ch/NativeSocketAddress",
+            "offsetSin4Addr",
+            "()I",
+            |_ctx, _args| {
+                Ok(Some(Value::Int(
+                    std::mem::offset_of!(libc::sockaddr_in, sin_addr) as i32,
+                )))
+            },
+        );
+        registry.register(
+            "sun/nio/ch/NativeSocketAddress",
+            "offsetSin6Port",
+            "()I",
+            |_ctx, _args| {
+                Ok(Some(Value::Int(
+                    std::mem::offset_of!(libc::sockaddr_in6, sin6_port) as i32,
+                )))
+            },
+        );
+        registry.register(
+            "sun/nio/ch/NativeSocketAddress",
+            "offsetSin6Addr",
+            "()I",
+            |_ctx, _args| {
+                Ok(Some(Value::Int(
+                    std::mem::offset_of!(libc::sockaddr_in6, sin6_addr) as i32,
+                )))
+            },
+        );
+        registry.register(
+            "sun/nio/ch/NativeSocketAddress",
+            "offsetSin6ScopeId",
+            "()I",
+            |_ctx, _args| {
+                Ok(Some(Value::Int(
+                    std::mem::offset_of!(libc::sockaddr_in6, sin6_scope_id) as i32,
+                )))
+            },
+        );
+        registry.register(
+            "sun/nio/ch/NativeSocketAddress",
+            "offsetSin6FlowInfo",
+            "()I",
+            |_ctx, _args| {
+                Ok(Some(Value::Int(
+                    std::mem::offset_of!(libc::sockaddr_in6, sin6_flowinfo) as i32,
+                )))
+            },
+        );
+    }
+    #[cfg(windows)]
+    {
+        // WinSock2 ABI (winsock2.h / ws2ipdef.h), 4-byte-aligned, matching
+        // MSVC's actual struct layout:
+        //   struct sockaddr_in  { short sin_family; u_short sin_port;
+        //                         struct in_addr sin_addr; char sin_zero[8]; }
+        //     => family@0 (2 bytes), port@2, addr@4, sizeof=16
+        //   struct sockaddr_in6 { short sin6_family; u_short sin6_port;
+        //                         u_long sin6_flowinfo; struct in6_addr sin6_addr;
+        //                         u_long sin6_scope_id; }
+        //     => family@0, port@2, flowinfo@4, addr@8 (16 bytes), scope_id@24,
+        //        sizeof=28
+        const AF_INET_WIN: i32 = 2;
+        const AF_INET6_WIN: i32 = 23;
+        registry.register("sun/nio/ch/NativeSocketAddress", "AFINET", "()I", |_ctx, _args| {
+            Ok(Some(Value::Int(AF_INET_WIN)))
+        });
+        registry.register("sun/nio/ch/NativeSocketAddress", "AFINET6", "()I", |_ctx, _args| {
+            Ok(Some(Value::Int(AF_INET6_WIN)))
+        });
+        registry.register(
+            "sun/nio/ch/NativeSocketAddress",
+            "sizeofSockAddr4",
+            "()I",
+            |_ctx, _args| Ok(Some(Value::Int(16))),
+        );
+        registry.register(
+            "sun/nio/ch/NativeSocketAddress",
+            "sizeofSockAddr6",
+            "()I",
+            |_ctx, _args| Ok(Some(Value::Int(28))),
+        );
+        registry.register(
+            "sun/nio/ch/NativeSocketAddress",
+            "sizeofFamily",
+            "()I",
+            |_ctx, _args| Ok(Some(Value::Int(2))),
+        );
+        registry.register(
+            "sun/nio/ch/NativeSocketAddress",
+            "offsetFamily",
+            "()I",
+            |_ctx, _args| Ok(Some(Value::Int(0))),
+        );
+        registry.register(
+            "sun/nio/ch/NativeSocketAddress",
+            "offsetSin4Port",
+            "()I",
+            |_ctx, _args| Ok(Some(Value::Int(2))),
+        );
+        registry.register(
+            "sun/nio/ch/NativeSocketAddress",
+            "offsetSin4Addr",
+            "()I",
+            |_ctx, _args| Ok(Some(Value::Int(4))),
+        );
+        registry.register(
+            "sun/nio/ch/NativeSocketAddress",
+            "offsetSin6Port",
+            "()I",
+            |_ctx, _args| Ok(Some(Value::Int(2))),
+        );
+        registry.register(
+            "sun/nio/ch/NativeSocketAddress",
+            "offsetSin6Addr",
+            "()I",
+            |_ctx, _args| Ok(Some(Value::Int(8))),
+        );
+        registry.register(
+            "sun/nio/ch/NativeSocketAddress",
+            "offsetSin6ScopeId",
+            "()I",
+            |_ctx, _args| Ok(Some(Value::Int(24))),
+        );
+        registry.register(
+            "sun/nio/ch/NativeSocketAddress",
+            "offsetSin6FlowInfo",
+            "()I",
+            |_ctx, _args| Ok(Some(Value::Int(4))),
+        );
+    }
 
     // P69-Cleaner-realfix: the `FileCleanable.register` no-op was removed.
     // It existed because the synthetic `java.lang.ref.Cleaner` left a
