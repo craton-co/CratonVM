@@ -2372,6 +2372,47 @@ pub const MAX_INLINE_BYTECODE_SIZE: usize = 35;
 /// Total inlined bytecode budget per compiled method.
 pub const MAX_INLINE_BUDGET: usize = 250;
 
+/// C1→C2 supersede eligibility: would an `optimize=true` recompile of this
+/// method actually take the optimizing IR pipeline AND be expected to produce
+/// better code than the single-pass body it replaces?
+///
+/// Mirrors the IR gate in `try_compile_inner` (`ir_compatible` + the
+/// category-2/FP admission clauses) with one deliberate extra restriction:
+/// only CALL-FREE and ALLOCATION-FREE methods qualify. The IR path lowers
+/// every invoke through the generic `invoke_dispatch` helper (no inline
+/// caches, no direct calls, no direct self-recursive CALL) and its
+/// allocation lowering differs from the single-pass inline-TLAB fast path —
+/// for such methods an "optimizing" recompile can be a net REGRESSION over
+/// the single-pass body (which has direct self-calls, ctor inlining, and the
+/// inline TLAB bump). Pure compute (int/long/FP arithmetic over locals,
+/// arrays and fields — sieve/matrix/reduction loop shapes) is where the IR
+/// backend reliably wins; that is exactly what this admits.
+pub fn c2_upgrade_would_engage(
+    code: &[u8],
+    code_len: usize,
+    descriptor: &str,
+    ir_emit_long: bool,
+    ir_emit_fp: bool,
+) -> bool {
+    let Some(scan) = x64::jit_scan(code, code_len, descriptor) else {
+        return false;
+    };
+    if !scan.invoke_ops.is_empty()
+        || !scan.new_ops.is_empty()
+        || !scan.anewarray_ops.is_empty()
+        || !scan.indy_ops.is_empty()
+    {
+        return false;
+    }
+    if !ir::ir_compatible(&scan) {
+        return false;
+    }
+    let fp_free = !method_uses_fp(code, code_len, descriptor);
+    (!method_uses_category2(code, code_len, descriptor) && fp_free)
+        || (ir_emit_long && fp_free)
+        || (ir_emit_fp && fp_in_body(code, code_len))
+}
+
 /// Resolved metadata for a method eligible for inlining at a specific call site.
 #[derive(Clone)]
 pub struct InlineSite {
@@ -2403,6 +2444,18 @@ pub struct InlineSite {
     pub method_name: String,
     /// Descriptor of the inlined callee.
     pub descriptor: String,
+    /// Callee PCs of `invokespecial` instructions the resolver PROVED are
+    /// no-ops and may be elided: calls to `java/lang/Object.<init>()V` or to
+    /// a super constructor whose body is exactly
+    /// `aload_0; invokespecial Object.<init>; return` (the
+    /// `is_elidable_construction` predicate). This is what makes CONSTRUCTOR
+    /// bodies inlineable — every ctor starts with such a super call, which
+    /// historically caused a blanket 0xb7 rejection in the inline resolver,
+    /// so no constructor could ever inline and every `new C(args)` paid a
+    /// full `jit_invoke_dispatch` round trip per allocation. The inline body
+    /// emitter pops the receiver the preceding `aload_0` pushed and emits
+    /// NOTHING for these PCs; any 0xb7 NOT in this list still bails.
+    pub elided_invoke_pcs: Vec<usize>,
 }
 
 /// Compile-time resolved field layout of `java/lang/String`, for the

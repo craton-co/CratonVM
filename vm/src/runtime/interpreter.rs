@@ -21625,6 +21625,7 @@ fn execute_invokestatic_cached(
             needs_heap,
             cached,
             gate: _,
+            supersede_epoch: _,
         } => execute_jit_call(
             shared,
             thread,
@@ -21661,6 +21662,7 @@ fn execute_invokestatic_cached(
                         needs_heap: heap,
                         cached: cached.clone(),
                         gate: entry_gate.clone(),
+                        supersede_epoch: crate::classloading::jit_supersede_epoch(),
                     };
                     drop(jit_cache);
                     thread
@@ -21673,6 +21675,7 @@ fn execute_invokestatic_cached(
                         needs_heap,
                         cached,
                         gate: _,
+                        supersede_epoch: _,
                     } = jit_target
                     {
                         return execute_jit_call(
@@ -21837,6 +21840,7 @@ fn execute_invokestatic_cached(
                             needs_heap,
                             cached,
                             gate: _,
+                            supersede_epoch: _,
                         } = jit_target
                         {
                             return execute_jit_call(
@@ -23553,6 +23557,7 @@ fn try_jit_upgrade_with_gate(
                 needs_heap: heap,
                 cached: cached.clone(),
                 gate,
+                supersede_epoch: crate::classloading::jit_supersede_epoch(),
             });
         }
     }
@@ -24262,6 +24267,7 @@ fn try_jit_upgrade_with_gate(
         needs_heap: heap,
         cached: cached.clone(),
         gate,
+        supersede_epoch: crate::classloading::jit_supersede_epoch(),
     })
 }
 
@@ -25019,7 +25025,7 @@ fn ensure_bg_compiler_started(shared: &SharedVm) {
         shared.self_arc.read().as_ref().cloned().unwrap_or_default();
     crate::jit::tiered::ensure_background_compiler(&shared.tiered_manager, || {
         Box::new(
-            move |task: &crate::jit::tiered::CompilationTask| -> (u64, bool) {
+            move |task: &crate::jit::tiered::CompilationTask| -> crate::jit::tiered::CompileOutcome {
                 background_compile_task(&weak_vm, task)
             },
         )
@@ -25065,13 +25071,19 @@ fn fetch_osr_compile_inputs(
 fn background_compile_task(
     weak_vm: &std::sync::Weak<SharedVm>,
     task: &crate::jit::tiered::CompilationTask,
-) -> (u64, bool) {
+) -> crate::jit::tiered::CompileOutcome {
+    use crate::jit::tiered::CompileOutcome;
+    let fail = |compile_time_ms: u64| CompileOutcome {
+        compile_time_ms,
+        published: false,
+        c2_upgrade_candidate: false,
+    };
     let shared = match weak_vm.upgrade() {
         Some(s) => s,
-        None => return (0, false), // VM dropped (teardown) — nothing to compile.
+        None => return fail(0), // VM dropped (teardown) — nothing to compile.
     };
     if crate::classloading::any_class_redefined() {
-        return (0, false);
+        return fail(0);
     }
     let optimized = crate::jit::tiered::tier_uses_optimized_backend(task.target_tier);
     if crate::runtime::env_cache::dbg_jitc() {
@@ -25117,8 +25129,14 @@ fn background_compile_task(
         } else {
             false
         };
-        // Widening: smaller integer -> 64-bit (zero/sign-extended).
-        return (start.elapsed().as_millis() as u64, published);
+        return CompileOutcome {
+            // Widening: smaller integer -> 64-bit (zero/sign-extended).
+            compile_time_ms: start.elapsed().as_millis() as u64,
+            published,
+            // OSR artifacts serve loop entry; the invocation path re-tiers
+            // separately, so an OSR task never seeds a C2 upgrade.
+            c2_upgrade_candidate: false,
+        };
     }
     let start = std::time::Instant::now();
     // Real codegen + publish into the shared JIT cache. `try_jit_compile_callee`
@@ -25141,8 +25159,56 @@ fn background_compile_task(
         optimized,
     )
     .is_some();
-    // Widening: smaller integer -> 64-bit (zero/sign-extended, value preserved)
-    (start.elapsed().as_millis() as u64, published)
+    // C1→C2 supersede, publish side: a freshly-published C2 body REPLACED the
+    // C1 entry in `jit_cache` (JitCache::put overwrites by key; the old
+    // artifact is retained forever — executable code is never freed). Bump
+    // the global supersede epoch so per-thread invoke-cache `Jit` entries
+    // (which snapshot the epoch at IC-fill time) report stale on their next
+    // hit, self-evict, and re-resolve to the C2 body. Without this, call
+    // sites that already flipped to the C1 artifact would run it forever.
+    if published && optimized {
+        crate::classloading::bump_jit_supersede_epoch();
+        if crate::runtime::env_cache::dbg_jitc() {
+            eprintln!(
+                "[cratonvm-jitc] c2-supersede published {}.{}{} (epoch={})",
+                task.method_key.class_name,
+                task.method_key.method_name,
+                task.method_key.descriptor,
+                crate::classloading::jit_supersede_epoch(),
+            );
+        }
+    }
+    // C1→C2 supersede, trigger side: report whether this method would take
+    // the optimizing IR pipeline (and is expected to benefit) so the worker
+    // loop enqueues a Low-priority C2 recompile after it records this C1
+    // publish. Evaluated only on a successful non-optimized publish — the
+    // scan + predicate are cheap and run once per method.
+    let c2_upgrade_candidate = published
+        && !optimized
+        && crate::runtime::env_cache::c2_supersede()
+        && fetch_osr_compile_inputs(
+            &shared,
+            &task.method_key.class_name,
+            &task.method_key.method_name,
+            &task.method_key.descriptor,
+        )
+        .map(|(_, padded, _)| {
+            let code_len = padded.len().saturating_sub(2);
+            cratonvm_jit::c2_upgrade_would_engage(
+                &padded,
+                code_len,
+                &task.method_key.descriptor,
+                crate::runtime::env_cache::jit_ir_long(),
+                crate::runtime::env_cache::jit_ir_fp(),
+            )
+        })
+        .unwrap_or(false);
+    CompileOutcome {
+        // Widening: smaller integer -> 64-bit (zero/sign-extended, value preserved)
+        compile_time_ms: start.elapsed().as_millis() as u64,
+        published,
+        c2_upgrade_candidate,
+    }
 }
 
 /// Convert a JIT panic payload into a `MethodCallFailed`.
@@ -25263,6 +25329,15 @@ fn resolve_inline_site(
     // getstatic" — but excluding them is the safe conservative fix until it is
     // isolated. `CRATONVM_INLINE_ALLOW_STATIC=1` re-enables them for debugging.
     let inline_no_static = !crate::runtime::env_cache::inline_allow_static();
+    // invokespecial sites deferred for elidability validation once the
+    // callee's constant pool is available below: (callee_pc, cp_idx). Only
+    // no-op super-constructor calls (`java/lang/Object.<init>()V` directly,
+    // or a target passing `is_elidable_construction`) survive — anything
+    // else rejects the whole site. This is what admits CONSTRUCTOR bodies
+    // (which always begin `aload_0; invokespecial super.<init>`) to
+    // inlining; the blanket 0xb7 rejection made every ctor un-inlineable,
+    // so each `new C(args)` paid a full dispatch round trip per allocation.
+    let mut special_sites: Vec<(usize, u16)> = Vec::new();
     while scan_pc < code_len {
         match code[scan_pc] {
             0xaa | 0xab => return None,        // tableswitch, lookupswitch
@@ -25271,7 +25346,18 @@ fn resolve_inline_site(
             0xc0 | 0xc1 => return None,        // checkcast, instanceof
             0xc2 | 0xc3 => return None,        // monitorenter, monitorexit
             0xb6 | 0xb9 => return None,        // invokevirtual, invokeinterface
-            0xb7 | 0xb8 => return None,        // invokespecial, invokestatic
+            0xb8 => return None,               // invokestatic
+            0xb7 => {
+                // invokespecial — defer: elidable no-op super-ctor calls are
+                // allowed (validated below), everything else rejects.
+                if scan_pc + 2 >= code_len {
+                    return None;
+                }
+                let cp_idx = ((code[scan_pc + 1] as u16) << 8) | code[scan_pc + 2] as u16; // Cast: bytecode operand decoding
+                special_sites.push((scan_pc, cp_idx));
+                scan_pc += 3;
+                continue;
+            }
             0xba => return None,               // invokedynamic
             // Array loads/stores + arraylength need a bounds check (and AIOOBE
             // path) that the inline codegen (`x64::try_emit_inline_body`) does
@@ -25321,6 +25407,44 @@ fn resolve_inline_site(
     }
 
     let callee_class_info = cm.get_class(declaring_id)?;
+
+    // Validate the deferred invokespecial sites: every one must be a
+    // resolver-PROVEN no-op super-constructor call, or the whole callee is
+    // rejected. Proven means the target is `java/lang/Object.<init>()V`
+    // directly, or a `<init>()V` whose body is exactly
+    // `aload_0; invokespecial Object.<init>; return`
+    // (`is_elidable_construction` — the same predicate the elidable-ctor
+    // call-site rewrite uses). The surviving PCs are recorded so the inline
+    // body emitter pops the receiver and emits nothing at those sites.
+    let mut elided_invoke_pcs: Vec<usize> = Vec::new();
+    for &(spc, cp_idx) in &special_sites {
+        let (ref_class_idx, nat_idx) = match callee_class_info.constant_pool.get(cp_idx) {
+            Some(ConstantPoolEntry::MethodReference {
+                class_index,
+                name_and_type_index,
+                ..
+            }) => (*class_index, *name_and_type_index),
+            _ => return None,
+        };
+        let target_class = callee_class_info
+            .constant_pool
+            .get_class_name(ref_class_idx)?;
+        let (target_name, target_desc) =
+            callee_class_info.constant_pool.get_name_and_type(nat_idx)?;
+        if target_name != "<init>" || target_desc != "()V" {
+            return None;
+        }
+        let elidable = target_class == "java/lang/Object" || {
+            match cm.find_class_by_name(target_class) {
+                Some(tid) => is_elidable_construction(&cm, tid),
+                None => false,
+            }
+        };
+        if !elidable {
+            return None;
+        }
+        elided_invoke_pcs.push(spc);
+    }
 
     // Lock-order discipline (audit follow-up to the H2 ABBA fix): collect
     // the constant-pool facts for field ops HERE (they borrow `cm`), but
@@ -25472,6 +25596,7 @@ fn resolve_inline_site(
         class_name: callee_class.to_string(),
         method_name: callee_method.to_string(),
         descriptor: callee_desc.to_string(),
+        elided_invoke_pcs,
     })
 }
 

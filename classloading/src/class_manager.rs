@@ -677,6 +677,30 @@ pub fn any_class_redefined() -> bool {
     ANY_CLASS_REDEFINED.load(Ordering::Relaxed)
 }
 
+/// C1→C2 supersede epoch. Bumped by the VM's background compile worker each
+/// time it PUBLISHES an optimizing (C2/IR) recompile that replaces an
+/// already-published C1 body in the jit cache. Per-thread invoke-cache
+/// entries that flipped a call site to a compiled body snapshot this counter
+/// at construction (`CachedInvokeTarget::Jit::supersede_epoch`); a later
+/// mismatch tells the call site its cached `Arc<CompiledMethod>` may be the
+/// superseded C1 artifact, so it evicts and re-resolves from the jit cache
+/// (picking up the C2 body). The old artifact stays alive forever
+/// (executable code is retained-by-design — see `ExecutableBuffer::drop`),
+/// so a stale entry is merely slower, never unsound; the epoch is what makes
+/// the upgrade actually reach already-flipped call sites.
+static JIT_SUPERSEDE_EPOCH: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
+/// Current supersede epoch — see [`JIT_SUPERSEDE_EPOCH`].
+#[inline]
+pub fn jit_supersede_epoch() -> u32 {
+    JIT_SUPERSEDE_EPOCH.load(Ordering::Acquire)
+}
+
+/// Advance the supersede epoch after publishing a replacing C2 body.
+pub fn bump_jit_supersede_epoch() {
+    JIT_SUPERSEDE_EPOCH.fetch_add(1, Ordering::AcqRel);
+}
+
 /// Install the JIT-invalidate hook. Called once by the VM during
 /// `SharedVm::new`. Idempotent.
 pub fn install_jit_invalidate_hook(hook: JitInvalidateHook) {

@@ -1174,6 +1174,15 @@ pub enum CachedInvokeTarget {
         /// installed bytecode (the JIT cache itself is invalidated by
         /// `fire_jit_invalidate_hook` in `redefine_class` step 8).
         gate: RedefineGate,
+        /// C1→C2 supersede epoch snapshot (`jit_supersede_epoch()` at
+        /// IC-fill time). When the background worker publishes an optimizing
+        /// recompile that replaces a C1 body, it bumps the global epoch;
+        /// `is_stale` then reports this entry stale on its next hit, the
+        /// cache self-evicts it, and re-resolution picks up the C2 artifact
+        /// from the jit cache. The superseded artifact is retained forever
+        /// (code is never freed), so a not-yet-evicted entry is merely the
+        /// slower C1 body — never a dangling pointer.
+        supersede_epoch: u32,
     },
     /// Interpreter intrinsic: a hot JDK method resolved once at IC-fill time
     /// to a direct intrinsic handler. Steady-state dispatch pays no native
@@ -1219,8 +1228,21 @@ impl CachedInvokeTarget {
             | CachedInvokeTarget::Native { gate, .. }
             | CachedInvokeTarget::VirtualBytecode { gate, .. }
             | CachedInvokeTarget::VirtualNative { gate, .. }
-            | CachedInvokeTarget::Jit { gate, .. }
             | CachedInvokeTarget::Intrinsic { gate, .. } => gate.is_stale(),
+            // A Jit entry is additionally stale once a C1→C2 supersede has
+            // been published anywhere (global epoch advanced): the cached
+            // `Arc<CompiledMethod>` may be the replaced C1 body, so evict
+            // and re-resolve from the jit cache. `InvokeCache::get` performs
+            // this check on every hit and self-evicts, so no dispatch arm
+            // needs supersede-specific handling.
+            CachedInvokeTarget::Jit {
+                gate,
+                supersede_epoch,
+                ..
+            } => {
+                gate.is_stale()
+                    || *supersede_epoch != crate::class_manager::jit_supersede_epoch()
+            }
         }
     }
 }

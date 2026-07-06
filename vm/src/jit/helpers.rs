@@ -3377,6 +3377,10 @@ thread_local! {
     /// decremented (RAII) on return. Compared against
     /// `interpreter::jit_dispatch_depth_ceiling()`.
     static JIT_DISPATCH_DEPTH: Cell<u32> = const { Cell::new(0) };
+
+    /// Last C1→C2 supersede epoch this thread's DISPATCH_CACHE was flushed
+    /// at — see the flush in `jit_invoke_dispatch`.
+    static DISPATCH_CACHE_SUPERSEDE_EPOCH: Cell<u32> = const { Cell::new(0) };
 }
 
 /// RAII guard that decrements [`JIT_DISPATCH_DEPTH`] when dropped. Constructed
@@ -3764,6 +3768,21 @@ pub unsafe extern "C" fn jit_invoke_dispatch(
     let redefine_jit_quiesced = crate::classloading::any_class_redefined();
     if redefine_jit_quiesced {
         DISPATCH_CACHE.with(|dc| dc.borrow_mut().clear());
+    }
+    // C1→C2 supersede: the dispatch cache holds raw entry pointers captured
+    // at first resolution. When the background worker publishes a replacing
+    // C2 body it bumps the global supersede epoch — flush this thread's
+    // cache once per bump so subsequent dispatches re-probe the jit cache
+    // and pick up the upgraded body. (Stale entries were never unsound —
+    // superseded code is retained forever — merely stuck on the C1 body.)
+    {
+        let epoch = crate::classloading::jit_supersede_epoch();
+        DISPATCH_CACHE_SUPERSEDE_EPOCH.with(|e| {
+            if e.get() != epoch {
+                e.set(epoch);
+                DISPATCH_CACHE.with(|dc| dc.borrow_mut().clear());
+            }
+        });
     }
     let cached_entry = if statically_bound && !redefine_jit_quiesced {
         DISPATCH_CACHE.with(|dc| {

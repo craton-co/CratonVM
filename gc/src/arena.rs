@@ -40,6 +40,25 @@ pub struct Arena {
     /// Reclaimed regions below `cursor`, produced by the non-moving sweep.
     /// Empty unless a JIT-frame-safe mark-sweep has run.
     free_list: Vec<FreeBlock>,
+    /// Conservative UPPER BOUND on the size of the largest free-list block
+    /// (`actual_max <= max_free_upper` always). Maintained so hot callers can
+    /// answer "no block of >= size exists" in O(1) instead of scanning the
+    /// whole free list — the young-gen allocation probe runs once per JIT
+    /// slow-path allocation and its former full `largest_free_block` scan was
+    /// ~7% of a binarytrees-18 run (and 55% when probed with TLAB-refill
+    /// sizes).
+    ///
+    /// Soundness of the bound:
+    /// * [`Self::add_free_block`] raises it to at least the new block's size.
+    /// * [`Self::alloc`] only shrinks/splits/removes blocks (the split
+    ///   remainders it pushes are strictly smaller than the consumed block),
+    ///   so the true max never grows there and the bound stays valid.
+    /// * Failed full scans ([`Self::has_free_block_at_least`],
+    ///   [`Self::largest_free_block_tightening`]) tighten it to the exact max
+    ///   observed, so repeated "no" answers become O(1).
+    /// * [`Self::clear_free_list`] / [`Self::reset`] / [`Self::reset_no_zero`]
+    ///   zero it alongside the list.
+    max_free_upper: usize,
 }
 
 impl Arena {
@@ -52,6 +71,7 @@ impl Arena {
             data,
             cursor: 0,
             free_list: Vec::new(),
+            max_free_upper: 0,
         }
     }
 
@@ -69,10 +89,21 @@ impl Arena {
         // is silently lost. This is checked first because the cursor may
         // already be at the arena's high-water mark after a sweep that
         // could not move survivors.
-        if !self.free_list.is_empty() {
+        // O(1) fail-fast: padding >= 0 means every block needs
+        // `total_needed >= size`; if even the (upper bound of the) largest
+        // block is smaller than `size`, no block can satisfy the request —
+        // skip the scan entirely and go straight to the bump path. This is
+        // the common case for large requests against a fragmented young
+        // free list (e.g. TLAB-refill-sized carves).
+        if !self.free_list.is_empty() && size <= self.max_free_upper {
             let base = self.data.as_ptr() as usize;
+            // Track the exact max while scanning so a FAILED scan tightens
+            // `max_free_upper` — the next same-or-larger request then
+            // fail-fasts in O(1) instead of re-scanning.
+            let mut scan_max = 0usize;
             for i in 0..self.free_list.len() {
                 let block = self.free_list[i];
+                scan_max = scan_max.max(block.size);
                 let block_addr = base + block.offset;
                 let aligned_addr = (block_addr + align - 1) & !(align - 1);
                 let padding = aligned_addr - block_addr;
@@ -118,6 +149,10 @@ impl Arena {
                     return Some(unsafe { self.data.as_mut_ptr().add(alloc_offset) });
                 }
             }
+            // Full scan found no fit: `scan_max` is now the EXACT largest
+            // block size, so tighten the upper bound (sound — alloc only
+            // shrinks/splits blocks; only add_free_block can raise it again).
+            self.max_free_upper = scan_max;
         }
 
         // Bump-allocation path: align the cursor up (checked to prevent
@@ -154,6 +189,7 @@ impl Arena {
         if size == 0 {
             return;
         }
+        self.max_free_upper = self.max_free_upper.max(size);
         self.free_list.push(FreeBlock { offset, size });
     }
 
@@ -161,6 +197,7 @@ impl Arena {
     /// swapped or reset so the next collection cycle starts clean.
     pub fn clear_free_list(&mut self) {
         self.free_list.clear();
+        self.max_free_upper = 0;
     }
 
     /// Total bytes currently held on the free list (reclaimed but unallocated).
@@ -178,6 +215,35 @@ impl Arena {
     /// blocks within one request).
     pub fn largest_free_block(&self) -> usize {
         self.free_list.iter().map(|b| b.size).max().unwrap_or(0)
+    }
+
+    /// Early-exit probe: is there any single free-list block of at least
+    /// `size` bytes?
+    ///
+    /// Semantically `largest_free_block() >= size`, but cheap on the hot
+    /// allocation-probe path:
+    /// * O(1) "no" when `size > max_free_upper` (the cached upper bound).
+    /// * Early-exit "yes" at the first satisfying block — for small object
+    ///   sizes against a fragmented free list this is usually the first
+    ///   block, where `largest_free_block` always walked the entire list.
+    /// * A full failed scan tightens `max_free_upper` to the exact maximum,
+    ///   so subsequent same-or-larger probes become O(1).
+    pub fn has_free_block_at_least(&mut self, size: usize) -> bool {
+        if size == 0 {
+            return !self.free_list.is_empty();
+        }
+        if size > self.max_free_upper {
+            return false;
+        }
+        let mut scan_max = 0usize;
+        for b in &self.free_list {
+            if b.size >= size {
+                return true;
+            }
+            scan_max = scan_max.max(b.size);
+        }
+        self.max_free_upper = scan_max;
+        false
     }
 
     /// Snapshot of the current free list as `(offset, size)` pairs,
@@ -225,6 +291,7 @@ impl Arena {
         self.data[..self.cursor].fill(0);
         self.cursor = 0;
         self.free_list.clear();
+        self.max_free_upper = 0;
     }
 
     /// Reset the arena without zeroing memory.
@@ -246,6 +313,7 @@ impl Arena {
     pub unsafe fn reset_no_zero(&mut self) {
         self.cursor = 0;
         self.free_list.clear();
+        self.max_free_upper = 0;
     }
 
     /// Returns true if the given pointer falls within this arena's storage.
@@ -419,5 +487,65 @@ mod tests {
         arena.cursor = usize::MAX - 2;
         // align=8 means cursor + 7 would overflow usize
         assert!(arena.alloc(1, 8).is_none());
+    }
+
+    #[test]
+    fn arena_free_list_alloc_and_probe() {
+        let mut arena = Arena::new(256);
+        // Consume the whole bump region so only the free list can serve.
+        assert!(arena.alloc(256, 8).is_some());
+        assert!(arena.alloc(8, 8).is_none());
+
+        // Reclaim two holes: 24B and 64B.
+        arena.add_free_block(0, 24);
+        arena.add_free_block(64, 64);
+        assert_eq!(arena.largest_free_block(), 64);
+        assert!(arena.has_free_block_at_least(24));
+        assert!(arena.has_free_block_at_least(64));
+        assert!(!arena.has_free_block_at_least(65));
+
+        // Allocation from the 64B hole succeeds and leaves the remainder.
+        assert!(arena.alloc(48, 8).is_some());
+        assert_eq!(arena.largest_free_block(), 24);
+    }
+
+    #[test]
+    fn arena_max_free_upper_bound_tightens_and_fails_fast() {
+        let mut arena = Arena::new(256);
+        assert!(arena.alloc(256, 8).is_some()); // exhaust bump tail
+        arena.add_free_block(0, 32);
+        arena.add_free_block(64, 16);
+
+        // Upper bound reflects the largest add (32).
+        assert!(!arena.has_free_block_at_least(33)); // full scan → tightens to 32
+        assert!(arena.has_free_block_at_least(32));
+
+        // Consume the 32B block entirely; the cached bound (32) is now an
+        // over-estimate but stays a SOUND upper bound: a 20B probe scans,
+        // finds only the 16B block, answers false, and tightens to 16.
+        assert!(arena.alloc(32, 8).is_some());
+        assert!(!arena.has_free_block_at_least(20));
+        assert!(arena.has_free_block_at_least(16));
+
+        // A fresh add raises the bound again.
+        arena.add_free_block(96, 40);
+        assert!(arena.has_free_block_at_least(40));
+
+        // clear/reset zero the bound → O(1) false.
+        arena.clear_free_list();
+        assert!(!arena.has_free_block_at_least(1));
+        assert!(arena.has_free_block_at_least(0) == false);
+    }
+
+    #[test]
+    fn arena_alloc_fail_fast_skips_scan_for_oversized_requests() {
+        let mut arena = Arena::new(128);
+        assert!(arena.alloc(128, 8).is_some()); // exhaust bump tail
+        arena.add_free_block(0, 24);
+        // Larger than any block AND no bump room → None (via the O(1)
+        // fail-fast; behaviorally identical to the historical full scan).
+        assert!(arena.alloc(64, 8).is_none());
+        // Fits the hole → allocates from the free list.
+        assert!(arena.alloc(16, 8).is_some());
     }
 }

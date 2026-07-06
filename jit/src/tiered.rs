@@ -399,6 +399,36 @@ impl CompilerCore {
         self.wake.notify_one();
     }
 
+    /// C1→C2 supersede: enqueue a Low-priority C2 recompile for a method
+    /// whose C1 body just published. Idempotent: skipped when the method is
+    /// already queued, already at C2, has bailed out of C2, or has exhausted
+    /// its compile retries. Called by the worker loop AFTER
+    /// [`Self::complete_task`] cleared the C1 task's queued flag.
+    fn request_c2_upgrade(&self, key: &MethodKey) {
+        {
+            let mut methods = self.methods.lock();
+            let Some(state) = methods.get_mut(key) else {
+                return;
+            };
+            if state.queued_for_compilation
+                || state.current_tier >= CompilationTier::C2
+                || state.c2_bailout
+                || state.tier_fail_count >= MAX_TIER_FAIL_RETRIES
+            {
+                return;
+            }
+            state.queued_for_compilation = true;
+            state.queued_tier = Some(CompilationTier::C2);
+        }
+        self.enqueue(CompilationTask {
+            method_key: key.clone(),
+            target_tier: CompilationTier::C2,
+            priority: CompilationPriority::Low,
+            enqueue_time_ms: 0,
+            osr_bci: None,
+        });
+    }
+
     /// Pop the highest-priority task, or `None` if the queue is empty.
     fn dequeue(&self) -> Option<CompilationTask> {
         self.queue.lock().dequeue()
@@ -458,14 +488,28 @@ impl CompilerCore {
     }
 }
 
+/// Result of one background compile attempt, reported by the VM's
+/// [`CompileFn`] callback.
+#[derive(Debug, Clone, Copy)]
+pub struct CompileOutcome {
+    /// Wall-clock compile time in milliseconds.
+    pub compile_time_ms: u64,
+    /// `true` only if the attempt actually published a compiled body (see
+    /// [`CompilerCore::complete_task`] for why this must not be conflated
+    /// with "the task was processed").
+    pub published: bool,
+    /// C1→C2 supersede: the VM judged this method would take the optimizing
+    /// IR pipeline at C2 AND is expected to benefit (see the VM-side
+    /// `c2_upgrade_would_engage` predicate). After a successful C1-family
+    /// publish the worker loop enqueues a Low-priority C2 recompile whose
+    /// publish REPLACES the C1 body in the jit cache.
+    pub c2_upgrade_candidate: bool,
+}
+
 /// A compile callback invoked on the background thread for each drained task.
-///
-/// Returns `(wall_clock_compile_time_ms, success)` — `success` is `true` only
-/// if the attempt actually published a compiled body (see
-/// [`CompilerCore::complete_task`] for why this must not be conflated with
-/// "the task was processed"). The actual codegen is supplied by the VM at
-/// startup; `tiered.rs` only owns the scheduling.
-pub type CompileFn = Box<dyn Fn(&CompilationTask) -> (u64, bool) + Send + 'static>;
+/// The actual codegen is supplied by the VM at startup; `tiered.rs` only owns
+/// the scheduling.
+pub type CompileFn = Box<dyn Fn(&CompilationTask) -> CompileOutcome + Send + 'static>;
 
 /// Whether a target tier should use the **optimized** (C2-equivalent) backend.
 ///
@@ -1083,8 +1127,28 @@ impl TieredCompilationManager {
             // Compile off the mutator thread with NO lock held by this frame
             // (`q` was dropped above), then publish completion. `compile_fn`
             // bounds its own VM-lock scopes internally.
-            let (compile_time_ms, success) = compile_fn(&task);
-            core.complete_task(&task.method_key, task.target_tier, compile_time_ms, success);
+            let outcome = compile_fn(&task);
+            core.complete_task(
+                &task.method_key,
+                task.target_tier,
+                outcome.compile_time_ms,
+                outcome.published,
+            );
+            // C1→C2 supersede: a freshly-published C1-family body whose
+            // method the VM judged IR-eligible gets a Low-priority C2
+            // recompile. Enqueued AFTER complete_task so the C1 task's
+            // `queued_for_compilation` flag has been cleared (otherwise the
+            // idempotence gate would drop the upgrade). OSR tasks are
+            // excluded (their artifacts serve loop entry; the invocation
+            // path re-tiers separately), as are tasks already at an
+            // optimized tier.
+            if outcome.published
+                && outcome.c2_upgrade_candidate
+                && task.osr_bci.is_none()
+                && !tier_uses_optimized_backend(task.target_tier)
+            {
+                core.request_c2_upgrade(&task.method_key);
+            }
         }
     }
 
@@ -2082,10 +2146,15 @@ mod tests {
         // the test thread, proving the work happened off the "mutator".
         let (tx, rx) = mpsc::channel::<(CompilationTier, std::thread::ThreadId)>();
         let bg = mgr
-            .start_background_compiler(Box::new(move |task: &CompilationTask| -> (u64, bool) {
+            .start_background_compiler(Box::new(move |task: &CompilationTask| -> CompileOutcome {
                 tx.send((task.target_tier, std::thread::current().id()))
                     .unwrap();
-                (7, true) // pretend the compile took 7ms and published
+                // pretend the compile took 7ms and published
+                CompileOutcome {
+                    compile_time_ms: 7,
+                    published: true,
+                    c2_upgrade_candidate: false,
+                }
             }))
             .expect("worker should start");
 
@@ -2157,6 +2226,62 @@ mod tests {
         assert!(tier_uses_optimized_backend(CompilationTier::C2));
     }
 
+    // ── C1→C2 supersede: candidate C1 publish auto-enqueues a C2 recompile ──
+
+    #[test]
+    fn c1_publish_with_upgrade_candidate_enqueues_c2_supersede() {
+        use std::sync::mpsc;
+        let policy = CompilationPolicy {
+            c1_threshold: 1,
+            c2_threshold: u32::MAX,
+            c2_min_invocations: u32::MAX,
+            osr_threshold: u32::MAX,
+            tiered_enabled: true,
+            c1_profiling: true,
+        };
+        let mgr = TieredCompilationManager::new(policy);
+        let key = test_key();
+
+        let (tx, rx) = mpsc::channel::<CompilationTier>();
+        let bg = mgr
+            .start_background_compiler(Box::new(move |task: &CompilationTask| -> CompileOutcome {
+                tx.send(task.target_tier).unwrap();
+                CompileOutcome {
+                    compile_time_ms: 1,
+                    published: true,
+                    // Models the VM-side predicate: judged IR-eligible on the
+                    // C1 pass; a C2 task never re-seeds an upgrade.
+                    c2_upgrade_candidate: !tier_uses_optimized_backend(task.target_tier),
+                }
+            }))
+            .expect("worker should start");
+
+        // Cross c1_threshold=1 → C1 task enqueued.
+        assert_eq!(mgr.on_method_invocation(&key), Some(CompilationTier::C1));
+
+        // Worker compiles C1, then the loop auto-enqueues + compiles the C2
+        // supersede (Low priority). Deterministic via the channel.
+        let first = rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("C1 compile must run");
+        assert_eq!(first, CompilationTier::C1);
+        let second = rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("C2 supersede compile must follow a candidate C1 publish");
+        assert_eq!(second, CompilationTier::C2);
+
+        // Both completions recorded; tier settles at C2; nothing re-queued
+        // (request_c2_upgrade is idempotent and gated on current_tier < C2).
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while mgr.completed_compilations() < 2 && std::time::Instant::now() < deadline {
+            std::thread::yield_now();
+        }
+        assert_eq!(mgr.completed_compilations(), 2);
+        assert_eq!(mgr.current_tier(&key), CompilationTier::C2);
+        assert!(mgr.queue_empty(), "no repeat upgrade churn");
+        drop(bg);
+    }
+
     // ── Increment 2: flag-gated off-thread compile publishes the Jit target ──
 
     /// wire-tiered-manager increment 2: with background compilation enabled, a
@@ -2191,14 +2316,18 @@ mod tests {
         let (tx, rx) = mpsc::channel::<(CompilationTier, bool, std::thread::ThreadId)>();
         let published_w = Arc::clone(&published);
         let bg = mgr
-            .start_background_compiler(Box::new(move |task: &CompilationTask| -> (u64, bool) {
+            .start_background_compiler(Box::new(move |task: &CompilationTask| -> CompileOutcome {
                 // Real compile_fn shape: pick the backend by tier (Step 3),
                 // "publish" the Jit target, and report back off-thread.
                 let optimized = tier_uses_optimized_backend(task.target_tier);
                 published_w.lock().push(task.method_key.clone());
                 tx.send((task.target_tier, optimized, std::thread::current().id()))
                     .unwrap();
-                (3, true)
+                CompileOutcome {
+                    compile_time_ms: 3,
+                    published: true,
+                    c2_upgrade_candidate: false,
+                }
             }))
             .expect("worker should start");
 
@@ -2302,7 +2431,7 @@ mod tests {
         let vm_lock_w = StdArc::clone(&vm_lock);
         let release_w = StdArc::clone(&release);
         let bg = mgr
-            .start_background_compiler(Box::new(move |_task: &CompilationTask| -> (u64, bool) {
+            .start_background_compiler(Box::new(move |_task: &CompilationTask| -> CompileOutcome {
                 // (1) Bounded VM-lock scope: acquire, read, DROP — exactly the
                 // shape `try_jit_compile_callee_slow` uses for class_manager /
                 // jit_cache. The guard must NOT survive into the blocking wait.
@@ -2315,7 +2444,11 @@ mod tests {
                 // or a `load_class_concurrent` condvar wait. If a VM lock were
                 // still held here, the STW thread below would deadlock.
                 release_w.wait();
-                (4, true)
+                CompileOutcome {
+                    compile_time_ms: 4,
+                    published: true,
+                    c2_upgrade_candidate: false,
+                }
             }))
             .expect("worker should start");
 
