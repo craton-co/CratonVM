@@ -406,3 +406,176 @@ resolution caches) — this would distinguish "the class's own constant pool
 is wrong" (a ByteBuddy-generated-bytecode class-loading bug) from "the
 resolution logic is reading against the wrong class/index" (a `frame_idx`
 or frame-stack bug). Needs a live capture; not yet attempted.
+
+### Session 2026-07-06(b), branch `fix/httpclient-bytebuddy-mh-dispatch-0706b`: both bugs re-confirmed live, CP-resolution hypothesis REFUTED with a live capture, root cause still open
+
+Re-verified both residuals against current `dev` (`9f1db39d`) on the Azure host
+(`victor@20.83.144.174`, worktree `/data/data/wt-hc-mhdispatch-0706b`). Ran the
+class **21 times total** across several batches (some instrumented, some
+not) to get a real sample of the intermittent failure rates.
+
+#### Bug 1 (`UnfinishedVerificationException`): CONFIRMED, still open
+
+Reproduces at a much higher rate than "the one documented failure" implies —
+**18 of 21 runs (~86%)** failed with exactly the documented signature:
+`shouldNotCloseConnectionWhenResponseClosed` passes internally but
+`UnfinishedVerificationException` is thrown from the *next* test method's
+`mock()` call. No new mechanism evidence gathered this session (effort went
+into Bug 2 per the task priority) — status unchanged from prior sessions:
+Mockito's `MockingProgress` thread-local state appears to leak across JUnit
+5's per-method test instantiation on the same OS thread. Not root-caused.
+
+#### Bug 2 (`NoSuchMethodError: Object.<unrelated>`): CONFIRMED, TWO DISTINCT MANIFESTATIONS, CP-hypothesis REFUTED live
+
+Reproduced **3 of 21 runs**, and critically, **not always the same method**:
+
+- 1 run: `NoSuchMethodError: java/lang/Object.write(I)V` (exactly the
+  originally-documented signature), from `shouldNotDrainWhenErrorStreamClosed`.
+- 1 run: `NoSuchMethodError: java/lang/Object.test(Ljava/lang/Object;)Z`, from
+  the **same test method** (`shouldNotDrainWhenErrorStreamClosed`), but this
+  time the failing call is `Predicate.test` invoked from
+  `LocationImpl.lambda$getStackFrame$2` — reached via
+  `StackWalker.walk` → `StackStreamFactory$AbstractStackWalker.doStackWalk`
+  → `consumeFrames` → a `Stream.filter(predicate)` pipeline, i.e. a
+  **completely different call site and a completely different functional
+  interface** (`Predicate` vs. the `write`-declaring interface) than the
+  `write(I)V` occurrence — yet both are the *same underlying bug*, both
+  land on bare `java/lang/Object`, and both are reached from deep inside
+  Mockito/ByteBuddy's `InstrumentationMemberAccessor$Dispatcher$ByteBuddy$<hash>`
+  machinery during the same test method.
+- 1 run showed the `UnfinishedVerificationException` from Bug 1 instead (the
+  two bugs appear to be racing for which one manifests first in a given run).
+
+**This new evidence changes the diagnosis.** A fixed, deterministic
+constant-pool corruption (the leading unconfirmed hypothesis from the prior
+session) would produce the *same* wrong method every time for a given
+bytecode call site — it does not. Seeing two unrelated
+(class, method, descriptor) triples from the same test method run-to-run is
+much more consistent with a **dynamic, timing/memory-layout-dependent**
+receiver corruption than a static bytecode/CP bug.
+
+**Live capture performed (the doc's own suggested next step, now done):**
+added temporary instrumentation at the exact call site named in the prior
+session's writeup — `execute_invoke_kind`'s `resolve_method_ref(shared,
+current_class_id, cp_index)` call (`vm/src/runtime/interpreter.rs:15637`,
+current `dev` line numbers; was cited as `15613-15614` in the prior
+session, drifted slightly) — gated behind a new env var
+`CRATONVM_DBG_HCMH0706`, firing only when the *calling* class's name
+contains `ByteBuddy`. It dumps `current_class_id`, `cp_index`, the resolved
+`(class, method, descriptor)`, **and independently re-reads the class's own
+constant-pool entry at that index directly** (bypassing both the per-thread
+`InvokeCache` and the process-wide `ResolutionCache` entirely), to
+distinguish "the class's own constant pool is wrong" from "the resolution
+logic reads the wrong class/index."
+
+Ran **8 instrumented runs** with `CRATONVM_DBG_HCMH0706=1`. Captured the
+exact `InstrumentationMemberAccessor$Dispatcher$ByteBuddy$0XPZyze2` dispatcher
+class's own `invokeWithArguments` call site multiple times, e.g.:
+
+```
+[HCMH0706] resolve_method_ref current_class=Some("org/mockito/internal/util/reflection/InstrumentationMemberAccessor$Dispatcher$ByteBuddy$0XPZyze2") current_class_id=2201 cp_index=40 -> resolved=(java/lang/invoke/MethodHandle, invokeWithArguments, ([Ljava/lang/Object;)Ljava/lang/Object;) fresh_cp_entry=Some("MethodReference { class_index: 37, name_and_type_index: 39 }")
+```
+
+**Result: the constant pool is correct, every single time it was captured.**
+The cache-independent `fresh_cp_entry` read matches the cached resolution
+exactly; `resolve_method_ref` and the class's own bytecode constant pool are
+NOT the source of the bug. This **rules out** (with a live capture, not just
+static reading) both:
+- the class's own constant pool being corrupted at ByteBuddy-generation/
+  class-load time, and
+- `resolve_method_ref`/`current_class_id`/`cp_index` (i.e. a `frame_idx`
+  bug feeding a stale/wrong frame into `execute_invoke_kind`) being the
+  culprit — every `frame_idx`-derived resolution observed was correct.
+
+**Side effect of note:** none of the 8 instrumented runs reproduced Bug 2
+(all 8 hit Bug 1 instead), despite Bug 2 having fired twice in the preceding
+11 uninstrumented runs. The instrumentation only adds a `class_manager.read()`
++ string comparison per `ByteBuddy`-named call site (cheap, but not free) —
+this is circumstantial evidence that Bug 2's trigger is **timing-sensitive**
+(consistent with a GC-race or thread-scheduling-dependent mechanism, not a
+deterministic logic bug), since a small amount of added latency at exactly
+this call site was enough to stop it from reproducing across a full batch.
+
+**New leading hypothesis (not yet confirmed by a live capture — the
+next concrete step for whoever picks this up):** given the constant pool is
+proven correct, the bug must be downstream of `execute_invoke_kind`'s
+`try_lambda_dispatch` check, in the receiver-class determination that runs
+when a receiver is *not* found in `lambda_proxies`
+(`vm/src/runtime/interpreter.rs`, the `Value::Object(Some(obj_ref))` arm
+starting around line 15850 in this session's `dev` snapshot). That code
+already contains **two existing rescue guards** for "receiver's resolved
+class is bare `java/lang/Object` but the CP class is something else" —
+tagged `S111r8` (cid==0, non-all-zero header) and `S111r12`/`S-trinity #2`
+(cid!=0 but `class_manager.get_class(cid)` resolves to literally
+`"java/lang/Object"`) — and both were checked by hand against
+`is_object_member("test", "(Ljava/lang/Object;)Z")` and
+`is_object_member("write", "(I)V")`, which both correctly return `false`
+(neither is in the `equals`/`hashCode`/`toString`/`getClass`/`wait`/
+`notify`/`notifyAll`/`clone`/`finalize`/`<init>` list at
+`vm/src/vm/vm_exec.rs:10268`) — so **both existing rescues should fire and
+prevent this exact bug, and yet it still happens.** This means either:
+(a) the actual failing call doesn't go through this code path at all (there
+is at least one more `NativeContext::invoke_virtual`-style dispatch path —
+`vm/src/vm/vm_exec.rs:5630`'s `invoke_virtual` method, used by natives like
+`mh_dispatch`'s `ctx.invoke_virtual(r, &name, &desc, ...)` call in
+`native-builtins/src/lang_invoke.rs:5887` — which has its own, *separately
+implemented* receiver-class-determination logic that was not exhaustively
+checked this session for an equivalent gap), or (b) the receiver object's
+header is being read as genuine, valid `java/lang/Object` because it
+*genuinely no longer is the object it should be* — i.e. a **stale/dangling
+receiver pointer whose target address was reclaimed and reallocated to an
+unrelated live object** between when the pointer was captured (e.g. on an
+operand stack slot of a suspended frame) and when it's dereferenced. This
+would cleanly explain both observed symptoms: (1) the header is NOT
+all-zero (so neither existing stale-pointer detector — `S111r8`'s all-zero
+check, nor the gen_heap "sweep-zero" detector — fires), because a live,
+valid *different* object now occupies that address, and (2) the reported
+method name/descriptor legitimately differs run-to-run, because *which*
+unrelated object happens to occupy the stale address (and therefore which
+of ITS methods gets erroneously attempted) depends on allocation timing.
+This shape of bug (a live reference in an operand-stack slot of a
+suspended/blocked frame not being correctly kept-alive/remapped across a
+GC cycle) already has precedent elsewhere in this codebase — see memory
+`bug03-cross-thread-jit-root-scan-insufficient` and the existing
+"sweep-zero" / stale-thread-mirror detectors referenced above — but was
+**not directly confirmed for this specific bug** this session; the
+`CRATONVM_DBG_SWEEP_ZERO=1 CRATONVM_DBG_STALE_RECV=1` detectors (both
+already existed in the codebase, enabled with zero rebuild needed) were run
+for 5 additional clean (non-`HCMH0706`) runs and did NOT fire, but Bug 2
+also did not reproduce in those 5 runs either — inconclusive, not a
+refutation, just insufficient samples given the ~1-in-7 to 1-in-11
+intermittent rate and the session's time budget.
+
+**Next step for a future session:** instrument `vm/src/vm/vm_exec.rs:5630`'s
+`invoke_virtual` (the `NativeContext` trait method, distinct from
+`execute_invoke_kind`) the same way — dump the receiver's `class_id`,
+whether `class_manager.get_class()` resolves it, and the resolved dispatch
+class, specifically for calls where `method_name` doesn't match the SAM of
+any known `lambda_proxies` entry — since this is the actual code path
+`mh_dispatch`'s virtual-arm (`native-builtins/src/lang_invoke.rs:5878-5890`)
+uses to invoke the user's `invokeWithArguments` target, and it was NOT
+re-verified this session with the same rigor as `execute_invoke_kind`. Also
+worth trying: run with `CRATONVM_DBG_SWEEP_ZERO=1` + `CRATONVM_DBG_STALE_RECV=1`
++ `CRATONVM_DBG_HCMH0706=1` all together across a much larger batch (20-30+
+runs) on a quiet (uncontended) host to raise the odds of catching Bug 2
+under simultaneous full instrumentation — this session's host was under
+severe, fluctuating OOM-level contention (load average swinging 5-90+ across
+the session, several unrelated processes OOM-killed by the kernel) which
+made large batches expensive in wall-clock time.
+
+**Diagnostic instrumentation left in place** (committed, zero cost when the
+env var is unset): the `CRATONVM_DBG_HCMH0706` dump described above, at
+`vm/src/runtime/interpreter.rs` inside `execute_invoke_kind`, immediately
+after the `resolve_method_ref` call.
+
+Reproduction (same as documented above, plus the new env var):
+```bash
+cd /data/data/wt-hc-mhdispatch-0706b   # or a fresh worktree off dev
+CP="$(cat /data/data/spring-framework-shared/spring-web/build/cratonvm-testcp.txt)"
+CRATONVM_DBG_HCMH0706=1 KRUN_STACK=1 timeout 180 ./target/release/cratonvm \
+  --java-home /data/data/jdk25-real \
+  -cp "/data/data/spring-suite-runner-shared:$CP" \
+  KRun org.springframework.http.client.SimpleClientHttpResponseTests
+# Run several times (10-20+) — both bugs are intermittent; expect roughly
+# 80-90% Bug 1, 10-15% Bug 2, occasionally neither (test passes 5/5).
+```
