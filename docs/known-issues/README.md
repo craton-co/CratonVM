@@ -4,12 +4,6 @@ This folder collects CratonVM-only defects found while running upstream Java
 suites. The docs had grown to describe the **same underlying bug from several
 angles**; this index is the consolidated map. Read it first.
 
-## 2026-07-06 Hibernate `others.txt` non-passed rerun (OSR allocation-region gate branch)
-
-- [hib-inpredicatetest-criteria-values-null-npe.md](hib-inpredicatetest-criteria-values-null-npe.md) — root-caused this session: `getNames()`'s 100k-iteration allocating loop OSR-compiles; the local (non-parameter) `names` reference falls into the same CompactValue NaN-box collision family as the already-patched HIB-CV-20 (which only seeded reference PARAMETERS into the OSR oop mask, not plain locals). Candidate fix: cherry-pick the previously-unmerged OSR allocation-region gate (`4c3cf821`, branch `claude/practical-golick-ff73f1`), which rejects back-edge OSR for any allocating/calling region — staged on `fix/hib-inpredicate-criteria-values-null-20260705`, not yet merged to `dev`.
-- [hib-delayedcdisupporttest-weld-bootstrap-hang.md](hib-delayedcdisupporttest-weld-bootstrap-hang.md) — new: `DelayedCdiSupportTest` hangs deterministically (confirmed in isolation, not shared-host contention) shortly after Weld SE container init, never reaching the test body. Not yet root-caused. A stale 2026-06-22 inventory recorded a different symptom for this class (a clean `RuntimeException`), so this may be a regression in failure mode, not a brand-new defect.
-- A 50-class rerun of `others.txt` (4 shards, 1200s per-class timeout) otherwise reconfirmed several already-tracked bugs with no new symptoms: HIB-CV-30 (`MultiLevelCascadeCollectionEmbeddableTest`/`IdClassTest`), the H2/javac `File.pathSeparator` cluster (`SessionDelegatorBaseImplTest` + 4 stored-procedure classes, fix exists on an unmerged branch), `ProxyClassReuseTest`, and `JpaLargeBlobTest`. `SortNaturalTest` showed `HANG` in the parallel sweep but passed cleanly (`ok=1`, 10.5s) in an isolated rerun — a shared-host contention artifact, not a regression of its 2026-06-22 fix.
-
 ## 2026-07-06 WildFly domain-mode corrupt-Value-cell root cause + MSC real-start gate
 
 - [wildfly-domain-heap-corrupt-value-timeout.md](wildfly-domain-heap-corrupt-value-timeout.md) — root-caused: the repeated `gen_heap::read_slot: corrupt Value cell` guard hit during domain-mode boot is the plain-field 16-byte `Value`-slot tearing bug, fixed on `dev` by `2dfdfddc`/`5198fccd` (landed the day after this doc's evidence). Live re-confirmation is blocked by a deeper, separately-tracked gap (below); see the doc for the full analysis and the pre/post-fix code diff.
@@ -48,7 +42,7 @@ were exhaustively bucketed by exact terminal-error signature (not sampled); see
 Fixed from this sweep:
 - [crypto/fips1402 CryptoProvider ServiceLoader bootstrap](../internal/fixed-suite-bugs/keycloak-crypto-fips1402-cryptoprovider-serviceloader.md) - `ServiceLoader` now sees the FIPS `CryptoProvider`; representative classes no longer fail at `CryptoInitRule.before` with `containersFailed=1`. Residual: the module can still fail later after bootstrap (`CryptoIntegration.getProvider(): init first`).
 - [SmallRyeConfig.getConfigMapping(Class) 1-arg bare-interface AbstractMethodError](../internal/fixed-suite-bugs/smallrye-getconfigmapping-1arg-bare-interface-abstractmethoderror.md).
-- [SmallRye Config missing Charset/MemorySize converters](../internal/fixed-suite-bugs/keycloak-smallrye-config-charset-memorysize-converters.md) - `LoggingSetupRecorder.handleFailedStart()` now builds its transient logging config with discovered Quarkus converters. The local 2026-07-04 deep dive also showed this fix exposes a later test-framework/Maven-artifact resolution gap rather than unlocking all `tests/base` classes outright. That gap is also now fixed: [test-framework deployRequestedInstances resolution failure](../internal/fixed-suite-bugs/keycloak-testframework-linkedlist-addall-deployrequestedinstances-FIXED.md) (root cause: `LinkedList.addAll(LinkedList)` silently dropped elements). Residual: [Phaser/ForkJoinPool hang in SmallRye Sisu bean loading](keycloak-07-04/keycloak-testframework-phaser-forkjoinpool-sisu-hang.md).
+- [SmallRye Config missing Charset/MemorySize converters](../internal/fixed-suite-bugs/keycloak-smallrye-config-charset-memorysize-converters.md) - `LoggingSetupRecorder.handleFailedStart()` now builds its transient logging config with discovered Quarkus converters. The local 2026-07-04 deep dive also showed this fix exposes a later test-framework/Maven-artifact resolution gap rather than unlocking all `tests/base` classes outright. Residual: [test-framework deployRequestedInstances resolution failure](keycloak-07-04/keycloak-testframework-deploy-requested-instances-resolution.md).
 - [quarkus/runtime CompactValue NaN-box collision SIGSEGV](../internal/fixed-suite-bugs/keycloak-quarkus-compactvalue-nanbox-sigsegv.md) - current `dev` no longer reproduces `rc=139`. The post-crash PicocliTest timeout residual is also fixed in [PicocliTest post-CompactValue-fix hang](../internal/fixed-suite-bugs/quarkus-runtime-picocli-post-compactvalue-hang.md).
 - [System Rules getenv() field 'm' reflection mismatch](../internal/fixed-suite-bugs/keycloak-system-rules-getenv-field-m-reflection.md) - `System.getenv()` now exposes an OpenJDK-shaped unmodifiable map wrapper whose private `m` field points at the backing map.
 - [KcAdmV2HelpTest --help text env-var mentions](../internal/keycloak-07-04/kcadmv2-helptext-env-var-mentions.md) - synthetic `BreakIterator.getLineInstance()` now returns Java UTF-16 text offsets after complete whitespace/hyphen runs, so Picocli no longer hard-wraps `KC_CLI_*` env-var names.
@@ -58,7 +52,7 @@ Fixed from this sweep:
 - [TelemetryConfigurationTest telemetry-service-name wrong value](../internal/fixed-suite-bugs/quarkus-runtime-telemetry-service-name-wrong-value.md) - fixed by System-properties replacement/reset semantics.
 
 Open findings from this sweep, in `keycloak-07-04/`, roughly by priority:
-- [test-framework Phaser/ForkJoinPool hang in SmallRye Sisu bean loading](keycloak-07-04/keycloak-testframework-phaser-forkjoinpool-sisu-hang.md) - surfaced after fixing the `LinkedList.addAll` bug that previously masked it.
+- [test-framework deployRequestedInstances resolution failure](keycloak-07-04/keycloak-testframework-deploy-requested-instances-resolution.md) - surfaced after the converter fix.
 
 Already-tracked, not re-documented: the 37 `testsuite/model` CRASHes were the
 [Infinispan GlobalConfigurationBuilder.isClustered() NoSuchMethodError](../internal/fixed-suite-bugs/keycloak-model-infinispan-globalconfiguration-isclustered-nosuchmethod-FIXED.md),
@@ -67,7 +61,7 @@ same identity-wrapper bug shape one step deeper in the same boot path,
 [Infinispan ConfigurationBuilder.build() ClassCastException](../internal/fixed-suite-bugs/keycloak-model-infinispan-configurationbuilder-classcastexception.md),
 is now **also FIXED** (2026-07-06). `RealmModelTest` then reached a residual
 that was initially misdiagnosed as a Netty `PlatformDependent0` setAccessible
-bug — that diagnosis was wrong (refuted via bytecode decompilation + A/B
+bug -- that diagnosis was wrong (refuted via bytecode decompilation + A/B
 testing against real JDK 25); the actual cause,
 [Infinispan JGroupsTransport.start() never invoked](../internal/fixed-suite-bugs/keycloak-model-jgroupstransport-start-never-invoked-FIXED.md)
 (a `DefaultCacheManager.start()`/`stop()` native shim intercepting real
@@ -687,8 +681,11 @@ PreviewFeatures native crash. The remaining non-passed rows are tracked here:
   instead of a raw synthetic slot index, then removing the identity-wrapper
   native the same way as `GlobalConfigurationBuilder.build()`. Moved to
   `docs/internal/fixed-suite-bugs/keycloak-model-infinispan-configurationbuilder-classcastexception.md`.
-  `RealmModelTest` now reaches a distinct, unrelated residual tracked in
-  [keycloak-model-netty-reflective-setaccessible-disabled.md](keycloak-model-netty-reflective-setaccessible-disabled.md).
+  `RealmModelTest` then reached a residual initially misdiagnosed as a Netty
+  setAccessible bug; the actual cause was
+  [Infinispan JGroupsTransport.start() never invoked](../internal/fixed-suite-bugs/keycloak-model-jgroupstransport-start-never-invoked-FIXED.md),
+  now FIXED. `RealmModelTest` now reaches a distinct residual tracked in
+  [keycloak-model-infinispan-cache-config-null-after-real-start.md](keycloak-model-infinispan-cache-config-null-after-real-start.md).
 - [keycloak-sssd-system1-findbootstrapclassornull-nosuchmethod.md](keycloak-sssd-system1-findbootstrapclassornull-nosuchmethod.md) -
   2 `FAIL` rows in the SSSD module, missing
   `java/lang/System$1.findBootstrapClassOrNull(String)Class`.
