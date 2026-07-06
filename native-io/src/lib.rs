@@ -2804,9 +2804,21 @@ fn native_bais_read_bytes(ctx: &mut dyn NativeContext, args: &[Value]) -> Method
         if len == 0 {
             return Ok(Some(Value::Int(0)));
         }
+        // PIN: `this`/`buf` are re-used across `invoke_virtual` below, which
+        // runs real bytecode and can trigger a moving GC on every iteration
+        // -- an unpinned `ObjectRef` goes stale and the eventual
+        // `set_array_element` then writes through a dangling pointer (see
+        // docs/known-issues/hib-jpalargeblobtest-object-read-nosuchmethod.md).
+        let this_pin = ctx.pin_native_root(this);
+        let buf_pin = ctx.pin_native_root(buf);
+        let mut this = this;
+        let mut buf = buf;
         let mut i: usize = 0;
         while i < len {
-            match ctx.invoke_virtual(this, "read", "()I", &[])? {
+            let read_result = ctx.invoke_virtual(this, "read", "()I", &[])?;
+            this = ctx.read_native_pin(this_pin, this);
+            buf = ctx.read_native_pin(buf_pin, buf);
+            match read_result {
                 Some(Value::Int(-1)) => break,
                 Some(Value::Int(b)) => {
                     ctx.set_array_element(buf, off + i, Value::Int(b & 0xFF));
@@ -2815,6 +2827,7 @@ fn native_bais_read_bytes(ctx: &mut dyn NativeContext, args: &[Value]) -> Method
                 _ => break,
             }
         }
+        ctx.unpin_native_roots(this_pin);
         if i == 0 {
             return Ok(Some(Value::Int(-1)));
         }
@@ -7512,17 +7525,27 @@ fn native_dis_read_bytes(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
         Value::Object(Some(s)) => s,
         _ => return Ok(Some(Value::Int(-1))),
     };
+    // PIN: `this`/`buf` are re-used after the re-entrant `invoke_virtual`
+    // calls below, which run real bytecode and can trigger a moving GC --
+    // an unpinned `ObjectRef` goes stale and the eventual `set_array_element`
+    // then writes through a dangling pointer (see
+    // docs/known-issues/hib-jpalargeblobtest-object-read-nosuchmethod.md).
+    let this_pin = ctx.pin_native_root(this);
+    let buf_pin = ctx.pin_native_root(buf);
     let result = ctx.invoke_virtual(
         inner,
         "read",
         "([BII)I",
         &[Value::Object(Some(buf)), Value::Int(off), Value::Int(len)],
     )?;
-    match result {
+    let this = ctx.read_native_pin(this_pin, this);
+    let buf = ctx.read_native_pin(buf_pin, buf);
+    let out = match result {
         Some(Value::Int(v)) if v > 0 => Ok(Some(Value::Int(v))),
         Some(Value::Int(0)) => {
             // Bulk returned 0 — try single byte
             let b = dis_read_one(ctx, this)?;
+            let buf = ctx.read_native_pin(buf_pin, buf);
             if b == -1 {
                 Ok(Some(Value::Int(-1)))
             } else {
@@ -7531,7 +7554,9 @@ fn native_dis_read_bytes(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
             }
         }
         _ => Ok(Some(Value::Int(-1))),
-    }
+    };
+    ctx.unpin_native_roots(this_pin);
+    out
 }
 
 fn native_dis_read_boolean(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
