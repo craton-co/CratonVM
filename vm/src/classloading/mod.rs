@@ -18,7 +18,8 @@ pub use cratonvm_classloading::verify_insn;
 pub use cratonvm_classloading::vtype;
 
 pub use cratonvm_classloading::{
-    any_class_redefined, find_field_recursive, find_method_recursive, jdk_superclass_lookup, Class,
+    any_class_redefined, bump_jit_supersede_epoch, find_field_recursive, find_method_recursive,
+    jdk_superclass_lookup, jit_supersede_epoch, Class,
     ClassId, ClassLoaderId, ClassManager, ClassPath, ClassState, ClassStore, ManifestInfo,
     ModuleDescriptor, ModuleRegistry, RecordComponentInfo,
 };

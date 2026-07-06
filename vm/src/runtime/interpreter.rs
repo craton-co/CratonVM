@@ -21602,6 +21602,7 @@ fn execute_invokestatic_cached(
             needs_heap,
             cached,
             gate: _,
+            supersede_epoch: _,
         } => execute_jit_call(
             shared,
             thread,
@@ -21638,6 +21639,7 @@ fn execute_invokestatic_cached(
                         needs_heap: heap,
                         cached: cached.clone(),
                         gate: entry_gate.clone(),
+                        supersede_epoch: crate::classloading::jit_supersede_epoch(),
                     };
                     drop(jit_cache);
                     thread
@@ -21650,6 +21652,7 @@ fn execute_invokestatic_cached(
                         needs_heap,
                         cached,
                         gate: _,
+                        supersede_epoch: _,
                     } = jit_target
                     {
                         return execute_jit_call(
@@ -21814,6 +21817,7 @@ fn execute_invokestatic_cached(
                             needs_heap,
                             cached,
                             gate: _,
+                            supersede_epoch: _,
                         } = jit_target
                         {
                             return execute_jit_call(
@@ -23497,6 +23501,7 @@ fn try_jit_upgrade_with_gate(
                 needs_heap: heap,
                 cached: cached.clone(),
                 gate,
+                supersede_epoch: crate::classloading::jit_supersede_epoch(),
             });
         }
     }
@@ -24206,6 +24211,7 @@ fn try_jit_upgrade_with_gate(
         needs_heap: heap,
         cached: cached.clone(),
         gate,
+        supersede_epoch: crate::classloading::jit_supersede_epoch(),
     })
 }
 
@@ -24963,7 +24969,7 @@ fn ensure_bg_compiler_started(shared: &SharedVm) {
         shared.self_arc.read().as_ref().cloned().unwrap_or_default();
     crate::jit::tiered::ensure_background_compiler(&shared.tiered_manager, || {
         Box::new(
-            move |task: &crate::jit::tiered::CompilationTask| -> (u64, bool) {
+            move |task: &crate::jit::tiered::CompilationTask| -> crate::jit::tiered::CompileOutcome {
                 background_compile_task(&weak_vm, task)
             },
         )
@@ -25009,13 +25015,19 @@ fn fetch_osr_compile_inputs(
 fn background_compile_task(
     weak_vm: &std::sync::Weak<SharedVm>,
     task: &crate::jit::tiered::CompilationTask,
-) -> (u64, bool) {
+) -> crate::jit::tiered::CompileOutcome {
+    use crate::jit::tiered::CompileOutcome;
+    let fail = |compile_time_ms: u64| CompileOutcome {
+        compile_time_ms,
+        published: false,
+        c2_upgrade_candidate: false,
+    };
     let shared = match weak_vm.upgrade() {
         Some(s) => s,
-        None => return (0, false), // VM dropped (teardown) — nothing to compile.
+        None => return fail(0), // VM dropped (teardown) — nothing to compile.
     };
     if crate::classloading::any_class_redefined() {
-        return (0, false);
+        return fail(0);
     }
     let optimized = crate::jit::tiered::tier_uses_optimized_backend(task.target_tier);
     if crate::runtime::env_cache::dbg_jitc() {
@@ -25061,8 +25073,14 @@ fn background_compile_task(
         } else {
             false
         };
-        // Widening: smaller integer -> 64-bit (zero/sign-extended).
-        return (start.elapsed().as_millis() as u64, published);
+        return CompileOutcome {
+            // Widening: smaller integer -> 64-bit (zero/sign-extended).
+            compile_time_ms: start.elapsed().as_millis() as u64,
+            published,
+            // OSR artifacts serve loop entry; the invocation path re-tiers
+            // separately, so an OSR task never seeds a C2 upgrade.
+            c2_upgrade_candidate: false,
+        };
     }
     let start = std::time::Instant::now();
     // Real codegen + publish into the shared JIT cache. `try_jit_compile_callee`
@@ -25085,8 +25103,56 @@ fn background_compile_task(
         optimized,
     )
     .is_some();
-    // Widening: smaller integer -> 64-bit (zero/sign-extended, value preserved)
-    (start.elapsed().as_millis() as u64, published)
+    // C1→C2 supersede, publish side: a freshly-published C2 body REPLACED the
+    // C1 entry in `jit_cache` (JitCache::put overwrites by key; the old
+    // artifact is retained forever — executable code is never freed). Bump
+    // the global supersede epoch so per-thread invoke-cache `Jit` entries
+    // (which snapshot the epoch at IC-fill time) report stale on their next
+    // hit, self-evict, and re-resolve to the C2 body. Without this, call
+    // sites that already flipped to the C1 artifact would run it forever.
+    if published && optimized {
+        crate::classloading::bump_jit_supersede_epoch();
+        if crate::runtime::env_cache::dbg_jitc() {
+            eprintln!(
+                "[cratonvm-jitc] c2-supersede published {}.{}{} (epoch={})",
+                task.method_key.class_name,
+                task.method_key.method_name,
+                task.method_key.descriptor,
+                crate::classloading::jit_supersede_epoch(),
+            );
+        }
+    }
+    // C1→C2 supersede, trigger side: report whether this method would take
+    // the optimizing IR pipeline (and is expected to benefit) so the worker
+    // loop enqueues a Low-priority C2 recompile after it records this C1
+    // publish. Evaluated only on a successful non-optimized publish — the
+    // scan + predicate are cheap and run once per method.
+    let c2_upgrade_candidate = published
+        && !optimized
+        && crate::runtime::env_cache::c2_supersede()
+        && fetch_osr_compile_inputs(
+            &shared,
+            &task.method_key.class_name,
+            &task.method_key.method_name,
+            &task.method_key.descriptor,
+        )
+        .map(|(_, padded, _)| {
+            let code_len = padded.len().saturating_sub(2);
+            cratonvm_jit::c2_upgrade_would_engage(
+                &padded,
+                code_len,
+                &task.method_key.descriptor,
+                crate::runtime::env_cache::jit_ir_long(),
+                crate::runtime::env_cache::jit_ir_fp(),
+            )
+        })
+        .unwrap_or(false);
+    CompileOutcome {
+        // Widening: smaller integer -> 64-bit (zero/sign-extended, value preserved)
+        compile_time_ms: start.elapsed().as_millis() as u64,
+        published,
+        c2_upgrade_candidate,
+    }
 }
 
 /// Convert a JIT panic payload into a `MethodCallFailed`.

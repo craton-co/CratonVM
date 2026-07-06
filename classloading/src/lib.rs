@@ -40,6 +40,7 @@ pub use class::{
 };
 pub use class_manager::{
     any_class_redefined,
+    bump_jit_supersede_epoch,
     install_class_file_load_hook,
     install_class_load_hook,
     install_class_prepare_hook,
@@ -49,6 +50,7 @@ pub use class_manager::{
     install_vtable_override_hook,
     is_builtin_classloader_name,
     jdk_superclass_lookup,
+    jit_supersede_epoch,
     register_builtin_classloaders,
     ClassFileLoadHook,
     ClassManager,

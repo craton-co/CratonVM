@@ -670,6 +670,20 @@ pub fn jit_scalar_new() -> bool {
     *CACHE.get_or_init(|| std::env::var("CRATONVM_JIT_SCALAR_NEW").map_or(true, |v| v != "0"))
 }
 
+/// C1→C2 supersede (default-ON): after the background worker publishes a C1
+/// body for a call-free/allocation-free IR-eligible method, it enqueues a
+/// Low-priority C2 recompile whose publish replaces the C1 body and bumps
+/// the supersede epoch (per-thread invoke caches re-resolve on their next
+/// hit). `=0`/`false` keeps every method at its first-published tier (the
+/// pre-supersede behaviour) — the safety net while the upgrade soaks.
+#[inline]
+pub fn c2_supersede() -> bool {
+    static CACHE: OnceLock<bool> = OnceLock::new();
+    *CACHE.get_or_init(|| {
+        std::env::var("CRATONVM_C2_SUPERSEDE").map_or(true, |v| v != "0" && v != "false")
+    })
+}
+
 #[inline]
 pub fn jit_ir_call() -> bool {
     static CACHE: OnceLock<bool> = OnceLock::new();
