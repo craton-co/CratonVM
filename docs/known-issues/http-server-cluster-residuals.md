@@ -265,21 +265,47 @@ Caused by: java.io.IOException: getSecretKey failed: Empty password
 Caused by: java.security.spec.InvalidKeySpecException: Empty password
 ```
 
-Not investigated further this session — out of scope (this is a distinct,
-unrelated bug from the `CertificateFactory` one this session targeted).
-Hypothesis for a future session: CratonVM's PBE/PKCS12 key-protection
-native path likely doesn't handle an empty-password `PBEKey` derivation the
-way real HotSpot's `PKCS12KeyStore.getPBEKey`/`encryptPrivateKey` does —
-worth confirming first whether real HotSpot JDK 25 actually accepts an
-empty password here at all (Netty's in-memory keystore construction may
-rely on specific PBE parameters CratonVM's crypto natives don't yet
-support), before assuming it's a CratonVM-only gap. **Net effect:
+Not investigated to a fix this session — out of scope (this is a distinct,
+unrelated bug from the `CertificateFactory` one this session targeted) —
+but the exact root cause WAS located, narrowing the future session's job
+to a one-function edit:
+
+`native-builtins/src/phases_early.rs`'s `pbe_generate_secret` (the
+`SecretKeyFactory.generateSecret(PBEKeySpec)` native for the PKCS#5 v1.5
+PBE family, including the bare `"PBE"` algorithm `PKCS12KeyStore.getPBEKey`
+requests) has a deliberate `if pw.is_empty() { throw
+InvalidKeySpecException("Empty password") }` guard (~line 11375). Its own
+doc comment says this was an intentional simplification: *"the real PBEKey
+permits an empty password (encoded = empty byte[]); [no known caller] ever
+uses an empty password with a PBE algorithm, so route the empty case to
+[an exception] rather than minting a spec that would throw a less-faithful
+IllegalArgumentException"* — i.e. CratonVM deliberately diverges from real
+`com.sun.crypto.provider.PBEKey` behavior here because, at the time, no
+exercised caller needed the empty-password case. Netty's `JdkSslServerContext`
+building an in-memory PKCS12 keystore for a self-signed cert (empty
+`char[]` password is the normal/common case for an ephemeral keystore) is
+a second caller that DOES need it, and trips the guard.
+
+**Not yet confirmed against real HotSpot JDK 25** whether
+`PKCS12KeyStore.getPBEKey`/`PBEKey` genuinely accepts an empty password
+end-to-end in this exact call path (the existing doc comment asserts it as
+fact, uncited) — that is the one thing a future session should verify
+first (e.g. via a standalone empty-password `PBEKeySpec` ->
+`SecretKeyFactory.getInstance("PBE").generateSecret(...)` repro against
+real HotSpot) before changing the guard, since removing it incorrectly
+could let a genuinely-invalid empty password silently produce a bogus key
+instead of failing loudly. If confirmed, the fix is likely: return a real
+`SecretKeySpec` with an empty encoded byte array instead of throwing, when
+`pw.is_empty()` — mirroring the same real-`PBEKey`-permits-empty-password
+contract already documented as the target semantics. **Net effect:
 `ServerHttpsRequestIntegrationTests` still FAILS**, but the failure has
 moved twice now and is much narrower than the original report — a future
-session should start at CratonVM's PKCS12/PBE key-protection natives (grep
-for `PKCS12` / `PBEKey` / `getSecretKey` handling) rather than anywhere
-in the JCA provider/service-lookup layer (which is now confirmed working
-correctly for this test's `CertificateFactory` usage).
+session should start at `pbe_generate_secret` in
+`native-builtins/src/phases_early.rs` rather than anywhere in the JCA
+provider/service-lookup layer (which is now confirmed working correctly
+for this test's `CertificateFactory` usage) or the PKCS12 keystore code
+itself (the throw happens one level up, at key-derivation time, not in
+`PKCS12KeyStore` proper).
 
 The original "all-NUL PEM payload" / base64 / file-I/O leads from the prior
 session are now believed to be **red herrings** — with BC actually reachable
