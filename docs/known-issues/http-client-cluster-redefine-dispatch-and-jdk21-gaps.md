@@ -349,3 +349,60 @@ different paths from the `/opt/cratonvm`-based host referenced in the
 Reproduction section above (that host/session is unrelated to this one).
 Build a fresh worktree off `dev` and point at the `-shared` checkouts rather
 than trying to reuse the old `/opt/cratonvm` paths.
+
+### Follow-up: `write(I)V` dispatch bug — `ClassId(0)`-collapse hypothesis REFUTED
+
+The leading hypothesis recorded above for the `SimpleClientHttpResponseTests`
+`NoSuchMethodError: java/lang/Object.write(I)V` bug — that it's the same
+"receiver `ClassId(0)` collapses to `java/lang/Object`" mechanism already
+fixed for the JIT path in commit `b09fea46`
+(`vm/src/jit/helpers.rs:938-988`, `virtual_dispatch_target_for_receiver`) —
+**does not hold up**, checked directly against the code (not re-derived from
+scratch, no new live capture done — this is a static-reading refutation,
+next step is still a live capture per below):
+
+1. **The interpreter's uncached dispatch path already has the equivalent
+   guard.** `vm/src/runtime/interpreter.rs:16077-16105` (tagged `S111r8`)
+   handles exactly this case: receiver `class_id == ClassId::new(0)` with a
+   non-all-zero header falls back to the CP-resolved static class name
+   (not bare `"java/lang/Object"`) whenever the method isn't an `Object`
+   member. This is the interpreter-side counterpart to the JIT fix — it
+   already exists, just wasn't cross-referenced by name before.
+2. **Even setting that aside, a `ClassId(0)`-collapse bug is the wrong
+   shape of bug for this symptom.** It would produce
+   `NoSuchMethodError: java/lang/Object.invokeWithArguments(...)` — same
+   method name/descriptor, wrong class. The actual error names a
+   *completely different method* (`write(I)V` vs.
+   `invokeWithArguments([Ljava/lang/Object;)Ljava/lang/Object;`) — the
+   whole `(class, method, descriptor)` triple is substituted, not just the
+   class.
+
+Two follow-up hypotheses for a full-triple substitution were also checked
+and refuted by reading the actual data structures (not live-tested):
+
+- **ClassId reuse** (a freshly-defined ByteBuddy class inheriting a stale
+  numeric id from an unloaded class, poisoning a `(ClassId, cp_index)`-keyed
+  cache with an unrelated entry) — refuted: `classloading/src/class.rs:756`
+  (`ClassStore::next_id`) documents ClassIds as strictly monotonic
+  (`ClassId::new(self.classes.len())` on an append-only `Vec`), never
+  recycled.
+- **Hash-collision returning the wrong cache entry** in either the
+  per-thread `InvokeCache` (`classloading/src/resolution.rs:1246`, keyed on
+  `(ClassId, u16, bool)`) or the process-wide `ResolutionCache`
+  (`classloading/src/resolution.rs:336`, keyed on `(ClassId, u16)`) — both
+  are `FxHashMap`s (a faster hasher, not a weaker one); Rust's `HashMap`
+  API always does a full key-equality check on lookup, so a hash collision
+  cannot silently return an unrelated entry.
+
+**Status: root cause still open.** The relevant resolution point is
+`execute_invoke_kind` (`vm/src/runtime/interpreter.rs:15603`), specifically
+`resolve_method_ref(shared, current_class_id, cp_index)` at line
+15613-15614, where `current_class_id = thread.frames[frame_idx].class_id`
+(line 15611). Next step (not done this session): temporarily instrument
+this call site, gated to fire only when the resolving class's name contains
+`ByteBuddy`, and dump `current_class_id`, `cp_index`, and what that class's
+*own* constant pool actually contains at that index (independently of the
+resolution caches) — this would distinguish "the class's own constant pool
+is wrong" (a ByteBuddy-generated-bytecode class-loading bug) from "the
+resolution logic is reading against the wrong class/index" (a `frame_idx`
+or frame-stack bug). Needs a live capture; not yet attempted.

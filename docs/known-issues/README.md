@@ -50,10 +50,12 @@ Open findings from this sweep, in `keycloak-07-04/`, roughly by priority:
 
 Already-tracked, not re-documented: the 37 `testsuite/model` CRASHes were the
 [Infinispan GlobalConfigurationBuilder.isClustered() NoSuchMethodError](../internal/fixed-suite-bugs/keycloak-model-infinispan-globalconfiguration-isclustered-nosuchmethod-FIXED.md),
-now **FIXED** (2026-07-06) — moved to `docs/internal/fixed-suite-bugs/`. A new
-residual, the same identity-wrapper bug shape one step deeper in the same
-boot path, is now separately tracked:
-[Infinispan ConfigurationBuilder.build() ClassCastException](keycloak-model-infinispan-configurationbuilder-classcastexception.md).
+now **FIXED** (2026-07-06) — moved to `docs/internal/fixed-suite-bugs/`. The
+same identity-wrapper bug shape one step deeper in the same boot path,
+[Infinispan ConfigurationBuilder.build() ClassCastException](../internal/fixed-suite-bugs/keycloak-model-infinispan-configurationbuilder-classcastexception.md),
+is now **also FIXED** (2026-07-06). `RealmModelTest` now reaches a distinct,
+unrelated residual one layer deeper:
+[Netty PlatformDependent0 reflective setAccessible(true) disabled](keycloak-model-netty-reflective-setaccessible-disabled.md).
 Not CratonVM bugs: 543 FAILs (`testsuite/integration-arquillian/tests/base`
 + `tests/other/sssd`, exhaustively confirmed - 543/544 exact match, the 544th
 is the System Rules finding above) are "Not found frontend container:
@@ -658,9 +660,16 @@ PreviewFeatures native crash. The remaining non-passed rows are tracked here:
   distinct `GlobalConfiguration`), so `isClustered()` correctly-but-confusingly
   NoSuchMethodError'd against the Builder's genuine runtime class. Moved to
   `docs/internal/fixed-suite-bugs/keycloak-model-infinispan-globalconfiguration-isclustered-nosuchmethod-FIXED.md`.
-  A residual `ConfigurationBuilder`/`Configuration` `ClassCastException` one
-  step deeper in the same path is now separately tracked in
-  [keycloak-model-infinispan-configurationbuilder-classcastexception.md](keycloak-model-infinispan-configurationbuilder-classcastexception.md).
+- ~~keycloak-model-infinispan-configurationbuilder-classcastexception.md~~ -
+  FIXED 2026-07-06: same identity-wrapper bug shape one step deeper in the
+  same path (`ConfigurationBuilder.build()`). Fixed by reworking
+  `native_dcm_define_configuration` to read size/ttl via `Configuration`'s
+  real accessor API (`memory().maxCount()` / `expiration().lifespan()`)
+  instead of a raw synthetic slot index, then removing the identity-wrapper
+  native the same way as `GlobalConfigurationBuilder.build()`. Moved to
+  `docs/internal/fixed-suite-bugs/keycloak-model-infinispan-configurationbuilder-classcastexception.md`.
+  `RealmModelTest` now reaches a distinct, unrelated residual tracked in
+  [keycloak-model-netty-reflective-setaccessible-disabled.md](keycloak-model-netty-reflective-setaccessible-disabled.md).
 - [keycloak-sssd-system1-findbootstrapclassornull-nosuchmethod.md](keycloak-sssd-system1-findbootstrapclassornull-nosuchmethod.md) -
   2 `FAIL` rows in the SSSD module, missing
   `java/lang/System$1.findBootstrapClassOrNull(String)Class`.
