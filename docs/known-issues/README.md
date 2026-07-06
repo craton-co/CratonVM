@@ -47,9 +47,9 @@ Open findings from this sweep, in `keycloak-07-04/`, roughly by priority:
 Already-tracked, not re-documented: the 37 `testsuite/model` CRASHes were the
 [Infinispan GlobalConfigurationBuilder.isClustered() NoSuchMethodError](../internal/fixed-suite-bugs/keycloak-model-infinispan-globalconfiguration-isclustered-nosuchmethod-FIXED.md),
 now **FIXED** (2026-07-06) — moved to `docs/internal/fixed-suite-bugs/`. A new
-residual `ConfigurationBuilder`/`Configuration` `ClassCastException` was
-unmasked one step deeper in the same boot path; see that doc's "Residual"
-section (not yet independently filed here).
+residual, the same identity-wrapper bug shape one step deeper in the same
+boot path, is now separately tracked:
+[Infinispan ConfigurationBuilder.build() ClassCastException](keycloak-model-infinispan-configurationbuilder-classcastexception.md).
 Not CratonVM bugs: 543 FAILs (`testsuite/integration-arquillian/tests/base`
 + `tests/other/sssd`, exhaustively confirmed - 543/544 exact match, the 544th
 is the System Rules finding above) are "Not found frontend container:
@@ -647,7 +647,8 @@ PreviewFeatures native crash. The remaining non-passed rows are tracked here:
   NoSuchMethodError'd against the Builder's genuine runtime class. Moved to
   `docs/internal/fixed-suite-bugs/keycloak-model-infinispan-globalconfiguration-isclustered-nosuchmethod-FIXED.md`.
   A residual `ConfigurationBuilder`/`Configuration` `ClassCastException` one
-  step deeper in the same path is tracked in that doc's "Residual" section.
+  step deeper in the same path is now separately tracked in
+  [keycloak-model-infinispan-configurationbuilder-classcastexception.md](keycloak-model-infinispan-configurationbuilder-classcastexception.md).
 - [keycloak-sssd-system1-findbootstrapclassornull-nosuchmethod.md](keycloak-sssd-system1-findbootstrapclassornull-nosuchmethod.md) -
   2 `FAIL` rows in the SSSD module, missing
   `java/lang/System$1.findBootstrapClassOrNull(String)Class`.
