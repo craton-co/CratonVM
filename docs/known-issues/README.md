@@ -44,8 +44,12 @@ Fixed from this sweep:
 Open findings from this sweep, in `keycloak-07-04/`, roughly by priority:
 - [test-framework deployRequestedInstances resolution failure](keycloak-07-04/keycloak-testframework-deploy-requested-instances-resolution.md) - surfaced after the converter fix.
 
-Already-tracked, not re-documented: the 37 `testsuite/model` CRASHes are the
-existing [Infinispan GlobalConfigurationBuilder.isClustered() NoSuchMethodError](keycloak-model-infinispan-globalconfiguration-isclustered-nosuchmethod.md).
+Already-tracked, not re-documented: the 37 `testsuite/model` CRASHes were the
+[Infinispan GlobalConfigurationBuilder.isClustered() NoSuchMethodError](../internal/fixed-suite-bugs/keycloak-model-infinispan-globalconfiguration-isclustered-nosuchmethod-FIXED.md),
+now **FIXED** (2026-07-06) — moved to `docs/internal/fixed-suite-bugs/`. A new
+residual, the same identity-wrapper bug shape one step deeper in the same
+boot path, is now separately tracked:
+[Infinispan ConfigurationBuilder.build() ClassCastException](keycloak-model-infinispan-configurationbuilder-classcastexception.md).
 Not CratonVM bugs: 543 FAILs (`testsuite/integration-arquillian/tests/base`
 + `tests/other/sssd`, exhaustively confirmed - 543/544 exact match, the 544th
 is the System Rules finding above) are "Not found frontend container:
@@ -643,9 +647,16 @@ PreviewFeatures native crash. The remaining non-passed rows are tracked here:
   instead of the real `IntStream` interface stamp — broke every IntStream op
   on `chars()`, not just `anyMatch`. Moved to
   `docs/internal/fixed-suite-bugs/`.
-- [keycloak-model-infinispan-globalconfiguration-isclustered-nosuchmethod.md](keycloak-model-infinispan-globalconfiguration-isclustered-nosuchmethod.md) -
-  still reproduces for the `testsuite/model` module: 37 `CRASH` rows plus one
-  abstract/no-test `EMPTY` row.
+- ~~keycloak-model-infinispan-globalconfiguration-isclustered-nosuchmethod.md~~ - FIXED
+  2026-07-06: was 37 `CRASH` rows plus one abstract/no-test `EMPTY` row for the
+  `testsuite/model` module. Root cause was `GlobalConfigurationBuilder.build()`
+  being natively shimmed as an identity wrapper (returned `this` instead of a
+  distinct `GlobalConfiguration`), so `isClustered()` correctly-but-confusingly
+  NoSuchMethodError'd against the Builder's genuine runtime class. Moved to
+  `docs/internal/fixed-suite-bugs/keycloak-model-infinispan-globalconfiguration-isclustered-nosuchmethod-FIXED.md`.
+  A residual `ConfigurationBuilder`/`Configuration` `ClassCastException` one
+  step deeper in the same path is now separately tracked in
+  [keycloak-model-infinispan-configurationbuilder-classcastexception.md](keycloak-model-infinispan-configurationbuilder-classcastexception.md).
 - [keycloak-sssd-system1-findbootstrapclassornull-nosuchmethod.md](keycloak-sssd-system1-findbootstrapclassornull-nosuchmethod.md) -
   2 `FAIL` rows in the SSSD module, missing
   `java/lang/System$1.findBootstrapClassOrNull(String)Class`.
