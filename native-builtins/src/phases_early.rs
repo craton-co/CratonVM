@@ -11342,6 +11342,33 @@ pub(crate) fn pbkdf2_generate_secret(
 /// ASCII (`0x20..=0x7E`); anything else raises `InvalidKeySpecException`, exactly
 /// as the real `PBEKey` constructor does. The bytes are wrapped in a real
 /// `SecretKeySpec(bytes, alg)` so `getEncoded()` returns them.
+///
+/// Empty password: confirmed against real JDK 25 source
+/// (`javax.crypto.spec.PBEKeySpec` and `com.sun.crypto.provider.PBEKey`) that
+/// HotSpot explicitly ALLOWS this — `PBEKeySpec(char[])` normalises a
+/// null/0-length password to `new char[0]` rather than rejecting it, and
+/// `PBEKey`'s constructor comment reads verbatim "Should allow an empty
+/// password.", producing a key whose `getEncoded()` is a 0-length `byte[]`.
+/// This matters for real callers: Netty's `JdkSslServerContext` builds an
+/// in-memory PKCS12 keystore for an ephemeral self-signed cert protected by
+/// an empty `char[]` password, and `PKCS12KeyStore.getPBEKey` /
+/// `.setKeyEntry` route straight through this exact native
+/// (`SecretKeyFactory.getInstance("PBE").generateSecret(...)`) — a prior
+/// pass here mistakenly treated the empty case as unreachable and routed it
+/// to `InvalidKeySpecException` instead, which is what broke that flow
+/// (see `ServerHttpsRequestIntegrationTests`,
+/// docs/known-issues/http-server-cluster-residuals.md).
+///
+/// `javax/crypto/spec/SecretKeySpec`'s real `<init>` throws
+/// `IllegalArgumentException("Empty key")` on a 0-length array (that
+/// restriction is genuine and specific to `SecretKeySpec`, not to
+/// `SecretKey` in general — real `PBEKey` has no such check), so an empty
+/// password can't be routed through that constructor. Instead we allocate
+/// the same 2-field shape (`encoded` @0, `algorithm` @1) directly, bypassing
+/// only the constructor's validation — every other native that reads this
+/// shape (`getEncoded`/`getAlgorithm` on this class, plus
+/// `jca::cipher::extract_key_bytes`'s field-0 read with its `getEncoded()`
+/// fallback) already tolerates a 0-length byte[] in slot 0.
 fn pbe_generate_secret(
     ctx: &mut dyn NativeContext,
     spec: ObjectRef,
@@ -11367,17 +11394,16 @@ fn pbe_generate_secret(
             }
         }
     }
-    // SecretKeySpec rejects an empty key; the real PBEKey permits an empty
-    // password (encoded = empty byte[]). The Tomcat realm test never uses an
-    // empty password with a PBE algorithm, so route the empty case to the same
-    // InvalidKeySpecException the handler already catches rather than minting a
-    // spec that would throw a less-faithful IllegalArgumentException.
     if pw.is_empty() {
-        return Err(throw_jca_exc(
-            ctx,
-            "java/security/spec/InvalidKeySpecException",
-            "Empty password",
-        ));
+        let key_arr = make_byte_array(ctx, &pw);
+        let kpin = ctx.pin_native_root(key_arr);
+        let algo_s = ctx.create_string(alg);
+        let key_arr_r = ctx.read_native_pin(kpin, key_arr);
+        let sk = alloc_concurrent_synthetic(ctx, "javax/crypto/spec/SecretKeySpec", 2);
+        ctx.set_field(sk, 0, Value::Object(Some(key_arr_r)));
+        ctx.set_field(sk, 1, Value::Object(Some(algo_s)));
+        ctx.unpin_native_roots(kpin);
+        return Ok(Some(Value::Object(Some(sk))));
     }
     let key_arr = make_byte_array(ctx, &pw);
     let kpin = ctx.pin_native_root(key_arr);

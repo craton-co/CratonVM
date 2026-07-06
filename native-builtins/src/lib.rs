@@ -18366,6 +18366,58 @@ pub fn register_essential_natives(registry: &mut NativeMethodRegistry) {
         |_ctx, _args| Ok(None),
     );
 
+    // FIX (httpserver-pkcs12-20260706): register_p68_ssl (javax.net.ssl.{SSLContext,
+    // SSLSocketFactory,SSLSocket,SSLEngine,TrustManager} real-native-tls backing) was ONLY
+    // ever reachable from register_synthetic_overrides, which is
+    // #[cfg(feature = "synthetic-jdk")]-gated and therefore compiled out of the default
+    // cratonvm-cli real-JDK build entirely (see vm/src/native/builtins.rs's no-op shim for
+    // that function in non-synthetic builds). So in real-JDK mode -- the default, and what
+    // every --jdk real suite run uses -- none of its natives were ever registered, despite
+    // several of them (register_p68_ssl in particular) being explicitly authored and
+    // doc-commented as "real-mode reachable via register_essential_natives" (see the
+    // historical MBeanServer/SSLSocket AbstractMethodError fix doc). This broke real-JDK
+    // client-side TLS: SSLContext.getSocketFactory() still correctly returns a synthetic
+    // javax/net/ssl/SSLSocketFactory object (that allocation lives in register_p68_ssl too,
+    // so it was equally unreachable), and calling createSocket(Socket,String,int,boolean) on
+    // it resolved to the abstract SSLSocketFactory declaration (no synthetic subclass, no
+    // registered native) and threw AbstractMethodError. Concretely: Apache HttpClient5's
+    // SSLConnectionSocketFactory.createLayeredSocket, used by Spring's
+    // ServerHttpsRequestIntegrationTests (see docs/known-issues/http-server-cluster-residuals.md)
+    // via org.apache.hc.core5.ssl.SSLContextBuilder.build().getSocketFactory().
+    //
+    // Fix: call register_p68_ssl here too (real-JDK path), matching the existing pattern
+    // register_p68_security_cert already uses a few lines below (also pulled out of
+    // register_phase68_natives/register_synthetic_overrides into its own explicit
+    // real-mode call, rather than pulling in the WHOLE register_phase68_natives umbrella).
+    // Deliberately narrow: register_phase68_natives ALSO bundles register_p68_xml, whose
+    // SAXParserFactory.newSAXParser() is a synthetic-only stub (a bespoke hand-rolled SAX
+    // walker, not real bytecode) missing SAXParser.getXMLReader() entirely. Calling the
+    // whole umbrella function here was tried first and directly regressed Tomcat's
+    // StandardServer.initInternal (parses server.xml via SAX): once reachable in real
+    // mode, that XML stub pre-empted the real bytecode's newSAXParser() (which, absent any
+    // native override, would have run real JDK bytecode constructing a genuine
+    // com.sun.org.apache.xerces...SAXParserImpl with a real getXMLReader()), throwing
+    // AbstractMethodError: SAXParser.getXMLReader()... has no Code attribute and failing
+    // EchoHandlerIntegrationTests/ErrorHandlerIntegrationTests's Tomcat-backend
+    // parameterization. register_p68_ssl alone does not carry that risk -- see below for
+    // the ordering note re: net_phase_e.
+    register_p68_ssl(registry);
+    // IMPORTANT: called here (BEFORE net_phase_e::register_phase_e_networking
+    // below), not at the end of this function. register_p68_ssl registers a fake,
+    // non-cryptographic SSLContext.createSSLEngine() stub (allocates a bare
+    // javax/net/ssl/SSLEngine whose wrap()/unwrap() just echo bytes -- no real TLS at all)
+    // alongside several other SSLContext/SSLSocketFactory/SSLEngine natives that ARE
+    // correct real implementations (SSLSocketFactory.createSocket,
+    // getSupportedCipherSuites/getSupportedProtocols, etc). net_phase_e.rs's OWN
+    // createSSLEngine (a few lines below) allocates the REAL rustls-backed
+    // sun/security/ssl/SSLEngineImpl instead and must win via last-writer-wins -- if
+    // register_p68_ssl ran AFTER net_phase_e, its fake stub would silently overwrite the
+    // real engine and every TLS handshake driven through SSLEngine.wrap/unwrap (Netty's
+    // standard NIO SSL pattern -- e.g. Reactor Netty's server bootstrap in
+    // ServerHttpsRequestIntegrationTests) would send garbage bytes instead of a real
+    // handshake, failing with "unexpected EOF" downstream. See
+    // docs/known-issues/http-server-cluster-residuals.md.
+
     // --- Phase E (roadmap RE.1..RE.10): real networking natives for
     // Socket / ServerSocket / InetAddress / URL + HttpURLConnection /
     // HttpClient / SSLContext / DatagramSocket / NetworkInterface /

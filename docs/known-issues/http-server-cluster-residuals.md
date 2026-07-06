@@ -7,15 +7,19 @@ merged to `dev`. Reproduced and iterated on both Windows + JDK25 (the
 platform the original bug report was captured on, via
 `apps/spring-suite-runner`) and the Azure Linux host for fast iteration.
 10 of 12 classes are fully fixed; 2 have residual issues, updated across
-two 2026-07-06 follow-up passes below. `ServerHttpsRequestIntegrationTests`:
-two distinct bugs found and fixed this session (a `Provider.putService`
-gap + per-instance `containsKey` isolation, and a `CertificateFactory`
-real-SPI delegation gap), but the test still fails — a third, unrelated
-bug (PKCS12/PBE empty-password handling in Netty's JDK-native SSL context
-path) was uncovered once the first two were fixed, and remains open for a
-future session. `ZeroCopyIntegrationTests`'s original reported failure did
-not reproduce, but an unrelated pre-existing flakiness was found and
-documented instead — see "Update (2026-07-06 session)" below.
+three 2026-07-06 follow-up passes below. `ServerHttpsRequestIntegrationTests`:
+FOUR real bugs found and fixed across sessions (a `Provider.putService`
+gap + per-instance `containsKey` isolation; a `CertificateFactory` real-SPI
+delegation gap; a PKCS12/PBE empty-password guard that threw instead of
+producing a 0-length key; and a widespread real-JDK-mode native
+unreachability bug — `register_phase68_natives`/`register_p68_ssl`, which
+back `SecretKeyFactory`/`KeyStore.setKeyEntry`/`SSLEngine` real TLS
+plumbing, were compiled out of every non-synthetic-JDK build entirely).
+The test STILL fails — a fifth, distinct bug in the rustls `SSLEngine`
+wrap/unwrap byte-pumping loop itself remains open, see "Update (2026-07-06
+session, part 3)" below. `ZeroCopyIntegrationTests`'s original reported
+failure did not reproduce, but an unrelated pre-existing flakiness was
+found and documented instead — see "Update (2026-07-06 session)" below.
 
 ## Root causes fixed
 
@@ -134,7 +138,7 @@ bcpkix-jdk18on")`, confirmed present via a regenerated Linux-native
 `bcprov-jdk18on-1.72.jar`, `bcutil-jdk18on-1.72.jar`). This changes the
 original "Residual 1" diagnosis materially — see below.
 
-### `ServerHttpsRequestIntegrationTests` — TWO bugs found+fixed this session, ONE new bug remains open
+### `ServerHttpsRequestIntegrationTests` — FOUR bugs found+fixed across sessions, ONE new bug remains open (2026-07-06, third pass)
 
 **Follow-up (same-day, second pass)**: the `CertificateFactory`
 delegation bug described below (originally left open at the end of the
@@ -245,73 +249,207 @@ with, ignoring `certFacSpi` entirely.
   unconditionally, which is what made it special-cased and worth this
   targeted fix rather than a shared one.
 
-**Third bug — found this session, NOT fixed, new residual**: with the
-`certFacSpi` delegation fix above, the `AbstractMethodError` / empty-cert
-failure is gone — confirmed via the standalone repros and a live run of
-`ServerHttpsRequestIntegrationTests` — but the test still fails, now
-further down the chain, inside Netty's **JDK-native** SSL context setup
-(`JdkSslServerContext`, a different code path from BC's own SSL context —
-this one builds an in-memory PKCS12 keystore via the JDK's own
-`sun.security.pkcs12.PKCS12KeyStore`):
+**Third bug — FIXED this session (2026-07-06, third pass)**: the
+`pw.is_empty()` guard described above was confirmed against real JDK 25
+source (`javax.crypto.spec.PBEKeySpec` explicitly normalises a null/0-length
+password to `new char[0]` rather than rejecting it; `com.sun.crypto.provider
+.PBEKey`'s constructor comment reads verbatim `// Should allow an empty
+password.`) AND against a live standalone repro on real HotSpot JDK 25
+(`SecretKeyFactory.getInstance("PBE").generateSecret(new
+PBEKeySpec(new char[0]))` succeeds, `getEncoded().length == 0`; a full
+`KeyStore` PKCS12 `setEntry`/`store`/`load`/`getKey` round trip with an
+empty password also succeeds end-to-end) — so the guard was a genuine
+CratonVM bug, not a JDK restriction. Fixed in `pbe_generate_secret`
+(`native-builtins/src/phases_early.rs`): the empty-password case now
+allocates the same 2-field `javax/crypto/spec/SecretKeySpec` shape directly
+via `alloc_concurrent_synthetic` (bypassing only the real `<init>`'s own
+`IllegalArgumentException("Empty key")` guard, which is genuine and
+specific to `SecretKeySpec` — NOT to `SecretKey`/`PBEKey` in general)
+instead of throwing.
+
+**Fourth bug — FIXED this session**: with the PBE guard fixed, the test
+still failed, now with `AbstractMethodError: SSLSocketFactory.createSocket
+(...)... has no Code attribute` — reproducible in an 8-line standalone
+repro (`SSLContext.getInstance("TLS").getSocketFactory().createSocket(...)`).
+Root cause: `register_phase68_natives` (in `native-builtins/src/phases_late.rs`
+— covers `javax.crypto.Mac`, the entire `javax.net.ssl.*` real-native-TLS
+family, `java.security.cert`, JDBC, XML stubs) was reachable ONLY from
+`register_synthetic_overrides`, which is `#[cfg(feature = "synthetic-jdk")]`
+-gated and therefore **compiled entirely out of the default `cratonvm-cli`
+real-JDK build** (`vm/src/native/builtins.rs` supplies a no-op shim for
+non-synthetic builds). So in real-JDK mode — the default, and what every
+`--jdk real` suite run uses — none of `register_p68_ssl`'s natives
+(`SSLContext.getSocketFactory`/`createSSLEngine`, `SSLSocketFactory
+.createSocket`, `SSLEngine` accessors, etc.) were EVER registered, despite
+several being explicitly doc-commented as "real-mode reachable via
+register_essential_natives" (a stale claim from an earlier, unrelated
+MBeanServer/SSLSocket fix — see
+`docs/internal/CRATONVM_BUGS/BUG-interfacedispatch-mbeanserver-sslsocket-realmode-shadow.md`).
+
+  Fix: call `register_p68_ssl` (NOT the whole `register_phase68_natives`
+  umbrella — see the "narrow, not broad" note below) directly from
+  `register_essential_natives` (`native-builtins/src/lib.rs`), positioned
+  BEFORE `net_phase_e::register_phase_e_networking` so `net_phase_e`'s own,
+  correct `SSLContext.createSSLEngine()` registration (which allocates a
+  real rustls-backed `sun/security/ssl/SSLEngineImpl`, not the abstract
+  `javax/net/ssl/SSLEngine`) wins via last-writer-wins over
+  `register_p68_ssl`'s fake, non-cryptographic `SSLEngine` wrap/unwrap stub
+  (a hardcoded fake-ClientHello echo, no real TLS at all — this was ALSO
+  silently shadowing the real engine in every real-JDK build until this
+  fix, a second, independent bug hiding behind the first).
+
+  **"narrow, not broad" note**: the first attempt at this fix called the
+  whole `register_phase68_natives` umbrella (matching how
+  `register_p68_security_cert` — a sibling function — was already
+  separately made real-mode-reachable by a prior session). This directly
+  regressed Tomcat's `StandardServer.initInternal` (parses `server.xml` via
+  SAX): `register_phase68_natives` also bundles `register_p68_xml`, whose
+  `SAXParserFactory.newSAXParser()` is a synthetic-only stub (a bespoke
+  hand-rolled SAX walker, not real bytecode) missing `SAXParser
+  .getXMLReader()` entirely — once reachable in real mode, it pre-empted
+  the real bytecode path that would otherwise have constructed a genuine
+  `com.sun.org.apache.xerces...SAXParserImpl` (which DOES have a real
+  `getXMLReader()`), throwing `AbstractMethodError` and turning several
+  previously-passing classes (`EchoHandlerIntegrationTests`,
+  `ErrorHandlerIntegrationTests`, `MultipartHttpHandlerIntegrationTests`,
+  and others hitting Tomcat's `[4]` backend parameterization) into
+  FAIL/TIMEOUT. Narrowing to `register_p68_ssl` only resolved this — see
+  Verification below.
+
+**Fifth bug — found this session, NOT fixed, new residual**: with bugs 3+4
+fixed, `SSLContext.createSSLEngine()` now correctly returns a real
+`sun.security.ssl.SSLEngineImpl` (confirmed via a standalone repro:
+`engine.getClass().getName()` -> `sun.security.ssl.SSLEngineImpl`,
+`getSupportedCipherSuites().length` -> 9) and `KeyStore.setKeyEntry`'s
+identity correctly reaches the native TLS layer's `runtime_tls_identity`
+slot (see below) — but the test STILL fails, now with:
 
 ```
-reactor.core.Exceptions$ReactiveException: javax.net.ssl.SSLException: failed to initialize the server-side SSL context
-  at io.netty.handler.ssl.JdkSslServerContext.newSSLContext(JdkSslServerContext.java:350)
-Caused by: java.security.KeyStoreException: Key protection algorithm not found: java.security.UnrecoverableKeyException: Encrypt Private Key failed: getSecretKey failed: Empty password
-  at sun.security.pkcs12.PKCS12KeyStore.setKeyEntry(PKCS12KeyStore.java:719)
-Caused by: java.security.UnrecoverableKeyException: Encrypt Private Key failed: getSecretKey failed: Empty password
-Caused by: java.io.IOException: getSecretKey failed: Empty password
-  at sun.security.pkcs12.PKCS12KeyStore.getPBEKey(PKCS12KeyStore.java:851)
-Caused by: java.security.spec.InvalidKeySpecException: Empty password
+org.springframework.web.client.ResourceAccessException: I/O error on POST request for "https://localhost:PORT/foo": TLS handshake failed: unexpected EOF
 ```
 
-Not investigated to a fix this session — out of scope (this is a distinct,
-unrelated bug from the `CertificateFactory` one this session targeted) —
-but the exact root cause WAS located, narrowing the future session's job
-to a one-function edit:
+This is a genuinely new, distinct layer, deep inside the rustls-backed
+`SSLEngine.wrap()`/`unwrap()` implementation in
+`native-builtins/src/t27_tls.rs` (`do_wrap`/`do_unwrap`, ~line 4381/4591),
+NOT anywhere in the JCA/keystore/registration-reachability layers this
+session otherwise fixed. Confirmed via targeted tracing (temporarily
+instrumented and since fully removed — no net diff in `t27_tls.rs`):
 
-`native-builtins/src/phases_early.rs`'s `pbe_generate_secret` (the
-`SecretKeyFactory.generateSecret(PBEKeySpec)` native for the PKCS#5 v1.5
-PBE family, including the bare `"PBE"` algorithm `PKCS12KeyStore.getPBEKey`
-requests) has a deliberate `if pw.is_empty() { throw
-InvalidKeySpecException("Empty password") }` guard (~line 11375). Its own
-doc comment says this was an intentional simplification: *"the real PBEKey
-permits an empty password (encoded = empty byte[]); [no known caller] ever
-uses an empty password with a PBE algorithm, so route the empty case to
-[an exception] rather than minting a spec that would throw a less-faithful
-IllegalArgumentException"* — i.e. CratonVM deliberately diverges from real
-`com.sun.crypto.provider.PBEKey` behavior here because, at the time, no
-exercised caller needed the empty-password case. Netty's `JdkSslServerContext`
-building an in-memory PKCS12 keystore for a self-signed cert (empty
-`char[]` password is the normal/common case for an ephemeral keystore) is
-a second caller that DOES need it, and trips the guard.
+- The server engine's handshake genuinely begins (`engine_begin` runs with
+  `is_client=false`, `identity_override` populated — real cert/key data IS
+  reaching rustls).
+- The client's TLS ClientHello IS delivered to the server and `do_unwrap`
+  processes it (confirmed: "called" fires, real record-parsing code runs).
+- `do_wrap` is then called twice by the Java/Netty side to produce a
+  ServerHello etc. — but **on the very FIRST `do_wrap` call, `s.closed_outbound`
+  is ALREADY `true`**, so `do_wrap` short-circuits immediately (`SR_CLOSED`
+  result, zero bytes produced) without ever emitting the ServerHello. Since
+  `closed_outbound` is only ever set by the `SSLEngine.closeOutbound()`
+  native (`native-builtins/src/t27_tls.rs`, ~line 4132) — i.e. JAVA CODE
+  (Netty) is itself calling `closeOutbound()` right after the first
+  `unwrap()` — this means Netty's `SslHandler` is reacting to something
+  about the FIRST `unwrap()`'s `SSLEngineResult` (status/handshakeStatus)
+  that makes it believe the handshake has failed, and it aborts by closing
+  outbound before ever trying to send a server response.
+- Frustratingly, `do_unwrap`'s actual result (status/handshakeStatus/
+  consumed/produced) could not be captured directly — every explicit
+  `return` path in `do_unwrap` was instrumented (pending-plaintext drain,
+  `dst_cap==0`, engine-handle-missing, rustls `process_new_packets` error,
+  and the final normal-path return) and NONE of them fired despite
+  `do_unwrap`'s entry logging 3 times across 3 calls, no Rust panic was
+  logged (panics ARE caught by `vm_exec.rs::safe_native_call`'s
+  `catch_unwind` and, outside the bootstrap-quiet path, print to stderr —
+  none did), and disabling the JIT (`--nojit`) made no difference. This
+  looks like either a very subtle control-flow path in `do_unwrap` not yet
+  identified, or a threading/stderr-ordering artifact (Netty's server event
+  loop runs `do_wrap`/`do_unwrap` on a different OS thread than the
+  JUnit/client thread — plausible but not confirmed to fully explain a
+  100%-reproducible zero-hits-on-every-explicit-return result across
+  repeated runs).
 
-**Not yet confirmed against real HotSpot JDK 25** whether
-`PKCS12KeyStore.getPBEKey`/`PBEKey` genuinely accepts an empty password
-end-to-end in this exact call path (the existing doc comment asserts it as
-fact, uncited) — that is the one thing a future session should verify
-first (e.g. via a standalone empty-password `PBEKeySpec` ->
-`SecretKeyFactory.getInstance("PBE").generateSecret(...)` repro against
-real HotSpot) before changing the guard, since removing it incorrectly
-could let a genuinely-invalid empty password silently produce a bogus key
-instead of failing loudly. If confirmed, the fix is likely: return a real
-`SecretKeySpec` with an empty encoded byte array instead of throwing, when
-`pw.is_empty()` — mirroring the same real-`PBEKey`-permits-empty-password
-contract already documented as the target semantics. **Net effect:
-`ServerHttpsRequestIntegrationTests` still FAILS**, but the failure has
-moved twice now and is much narrower than the original report — a future
-session should start at `pbe_generate_secret` in
-`native-builtins/src/phases_early.rs` rather than anywhere in the JCA
-provider/service-lookup layer (which is now confirmed working correctly
-for this test's `CertificateFactory` usage) or the PKCS12 keystore code
-itself (the throw happens one level up, at key-derivation time, not in
-`PKCS12KeyStore` proper).
+**Not investigated further this session** — this is now a genuinely
+separate, pre-existing bug in the rustls engine plumbing itself
+(`t27_tls.rs`'s `do_wrap`/`do_unwrap`/`engine_begin`), unrelated to the
+JCA/keystore/registration-reachability chain this session's other four
+fixes targeted. A future session should: (1) get `do_unwrap`'s actual
+first-call `SSLEngineResult` (status + handshakeStatus) safely into view —
+try a synchronous single-threaded repro (a bare `SSLEngine` pair driven
+manually via `wrap`/`unwrap` in one thread, no Netty/Reactor involved, to
+rule out the threading-order hypothesis) rather than tracing through the
+full Netty stack; (2) once the actual result is known, compare against what
+real JSSE's `SSLEngineImpl.unwrap()` would legitimately return for a raw
+ClientHello record fed into a fresh server-mode engine, to find the
+semantic mismatch that's making Netty give up early.
 
-The original "all-NUL PEM payload" / base64 / file-I/O leads from the prior
-session are now believed to be **red herrings** — with BC actually reachable
-(once `putService` exists), the failure never gets far enough to reach any
-PEM-encoding or file-I/O step; it fails earlier, inside certificate-object
-construction itself.
+### PKCS12/PBE + TLS-registration fixes — files changed
+
+- `native-builtins/src/phases_early.rs` — `pbe_generate_secret`: empty
+  password no longer throws; allocates a 2-field `SecretKeySpec` shape
+  directly for the 0-length-key case.
+- `native-builtins/src/keystore.rs` — new `keystore_set_key_entry` +
+  `engineSetKeyEntry` native (`KeyStore.setKeyEntry(String, Key, char[],
+  Certificate[])` was entirely unregistered before this session, so real
+  bytecode ran but never told CratonVM's native TLS bridge about the new
+  identity); `unwrap_keystore_spi` (KeyManagerFactory.init/TrustManagerFactory
+  .init receive the `java.security.KeyStore` wrapper, not the `KeyStoreSpi`
+  the native `engine*` methods run on and stamp their store-id side-table
+  against — `keystore_set_pending_km_identity` was unwrapping the WRONG
+  object and always read back store-id 0); `keystore_get_first_private_key`
+  fallback (a keystore built via `load(null,null)` then `setKeyEntry(...)`
+  has an empty load-time identity snapshot even though a real entry was
+  since added — scan the live registry instead of only the stale
+  snapshot); `engine_set_key_entry` also calls
+  `t27_tls::install_identity_from_der` to populate the process-wide
+  "runtime server identity" the native TLS listener actually consumes for
+  the accept-side handshake (previously only `engineLoad`, the byte-stream
+  path, did this).
+- `native-builtins/src/lib.rs` — `register_essential_natives` now calls
+  `register_p68_ssl` directly (positioned before
+  `net_phase_e::register_phase_e_networking`), making
+  `SecretKeyFactory`/`SSLContext`/`SSLSocketFactory`/`SSLEngine`/`SSLSocket`
+  real-TLS natives reachable in real-JDK mode for the first time.
+- `native-builtins/src/phases_late.rs` — added `SSLEngine.getSupportedCipherSuites`
+  / `getSupportedProtocols` (present on `SSLSocket`/`SSLSocketFactory`
+  already, missing on `SSLEngine` — same "missing accessor"
+  `AbstractMethodError` shape as the historical SSLSocket fix).
+
+Branch `fix/httpserver-pkcs12-20260706`, off `dev`. See git log for the
+actual merge commit hash once landed.
+
+### Verification (2026-07-06, third pass) — full `http.server.` cluster regression check
+
+Ran the full `--only 'http\.server\.'` cluster (33 classes) twice: once
+with an intermediate (buggy) build that called the whole
+`register_phase68_natives` umbrella too early, and once with the corrected
+`register_p68_ssl`-only fix. Tally: `LOADERR=2, OK=24, FAIL=2, TIMEOUT=5`
+on the corrected build (vs `LOADERR=2, OK=21, FAIL=3, TIMEOUT=7` on the
+buggy intermediate build) — `EchoHandlerIntegrationTests` and
+`MultipartHttpHandlerIntegrationTests` moved from broken (SAXParser
+regression, see the "narrow, not broad" note above) to fully passing.
+
+The 2 `LOADERR`s (`org.springframework.mock.http.server.reactive
+.MockServerHttpRequestTests`/`MockServerHttpResponseTests`,
+`ClassNotFoundException`) are a pre-existing test-classpath gap, unrelated
+to any VM code.
+
+The remaining 5 `TIMEOUT`s (`AsyncIntegrationTests`,
+`ErrorHandlerIntegrationTests`, `RandomHandlerIntegrationTests`,
+`ServerHttpRequestIntegrationTests`, `WriteOnlyHandlerIntegrationTests`)
+and the `CookieIntegrationTests` partial-`FAIL` (`[3] Reactor Netty`,
+"failed to respond") were all individually re-run against a freshly-built,
+completely unmodified `dev` baseline (commit `aafdaec8`) — **every single
+one reproduces identically on baseline** (`AsyncIntegrationTests` and
+`CookieIntegrationTests` both TIMEOUT at 180s on baseline in one run;
+`ErrorHandlerIntegrationTests`/`RandomHandlerIntegrationTests` passed
+cleanly and `ServerHttpRequestIntegrationTests` TIMED OUT on baseline in a
+second run). All 6 of these classes share the same
+`AbstractHttpHandlerIntegrationTests` 4-way-parameterized base class this
+doc's `ZeroCopyIntegrationTests` section already documents as intermittently
+(40-60%) hanging on this Azure Linux host due to a pre-existing
+ByteBuddy/AssertJ dynamic-class-generation race — confirmed to be the same
+family of flakiness, NOT a regression from this session's diff. Net: this
+session's fixes introduce zero regressions in the broader `http.server.`
+cluster.
 
 ### `ZeroCopyIntegrationTests` — Jetty Core backend: ORIGINAL bug NOT reproduced; UNRELATED pre-existing flakiness found instead
 

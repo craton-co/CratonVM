@@ -186,6 +186,38 @@ pub fn keystore_set_cert_entry(id: i32, alias: &str, cert_der: Vec<u8>) -> bool 
     }
 }
 
+/// Insert/replace a private-key entry in an already-registered store
+/// (in-memory `KeyStore.setKeyEntry(String, Key, char[], Certificate[])`).
+/// Companion to `keystore_set_cert_entry` for the PrivateKey case -- same
+/// rationale: the real `PKCS12KeyStoreSpi.engineSetKeyEntry` bytecode (when
+/// reached without a native override) mutates the real SPI object's own
+/// `entries` field, invisible to CratonVM's side-table-backed reads
+/// (`engineAliases`/`engineSize`/`keystore_get_private_key`) and, critically,
+/// to `keystore_set_pending_km_identity` -- so `KeyManagerFactory.init`
+/// found no identity to stage for the TLS layer. Returns true if the store
+/// existed.
+pub fn keystore_set_key_entry(
+    id: i32,
+    alias: &str,
+    key_der: Vec<u8>,
+    chain: Vec<Vec<u8>>,
+) -> bool {
+    let mut g = registry().write();
+    if let Some(store) = g.stores.get_mut(&id) {
+        store.entries.insert(
+            alias.to_string(),
+            KeyStoreEntry {
+                alias: alias.to_string(),
+                creation_time_ms: 0,
+                kind: EntryKind::PrivateKey { key_der, chain },
+            },
+        );
+        true
+    } else {
+        false
+    }
+}
+
 /// Remove an entry from a registered store (`KeyStore.deleteEntry`).
 pub fn keystore_delete_entry(id: i32, alias: &str) {
     let mut g = registry().write();
@@ -1003,6 +1035,22 @@ fn register_engine_surface(r: &mut NativeMethodRegistry, fqn: &'static str) {
         engine_set_certificate_entry,
     );
 
+    // engineSetKeyEntry(String, Key, char[], Certificate[]) — companion to
+    // engineSetCertificateEntry above for the PrivateKey case. See
+    // keystore_set_key_entry's doc comment: without this, KeyManagerFactory
+    // found no staged identity for an in-memory-only keystore built via
+    // getInstance()+load(null,null)+setKeyEntry(...) (Netty's
+    // JdkSslServerContext.buildKeyStore ephemeral self-signed-cert pattern),
+    // and SSLContext.init produced a server-side SSLContext with no
+    // certificate to present — the TLS handshake then failed immediately
+    // ("unexpected EOF" on the client side). See
+    // docs/known-issues/http-server-cluster-residuals.md.
+    r.register(
+        fqn,
+        "engineSetKeyEntry",
+        "(Ljava/lang/String;Ljava/security/Key;[C[Ljava/security/cert/Certificate;)V",
+        engine_set_key_entry,
+    );
     // engineDeleteEntry(String) — companion in-memory removal.
     r.register(
         fqn,
@@ -1477,7 +1525,83 @@ fn engine_set_certificate_entry(ctx: &mut dyn NativeContext, args: &[Value]) -> 
     Ok(None)
 }
 
-/// engineDeleteEntry(String alias) — in-memory removal (companion to
+/// engineSetKeyEntry(String alias, Key key, char[] password, Certificate[]
+/// chain) -- in-memory PrivateKey entry (companion to
+/// engine_set_certificate_entry; see keystore_set_key_entry's doc comment
+/// for why this matters). The key's PKCS#8 DER comes from the real
+/// `PrivateKey.getEncoded()`; each chain cert's DER from the real
+/// `Certificate.getEncoded()`, same extraction pattern
+/// engine_set_certificate_entry already uses for a single cert.
+fn engine_set_key_entry(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = this_arg(args)?;
+    let id = get_store_id(ctx, this);
+    let alias = args
+        .get(1)
+        .and_then(|v| read_string_arg(ctx, v))
+        .unwrap_or_default();
+    let key = match args.get(2) {
+        Some(Value::Object(Some(k))) => *k,
+        _ => return Ok(None),
+    };
+    let key_der = match ctx.invoke_virtual(key, "getEncoded", "()[B", &[]) {
+        Ok(Some(Value::Object(Some(arr)))) => {
+            let len = ctx.array_length(arr);
+            let mut v = Vec::with_capacity(len);
+            for i in 0..len {
+                if let Value::Int(b) = ctx.get_array_element(arr, i) {
+                    v.push(b as u8);
+                }
+            }
+            v
+        }
+        _ => Vec::new(),
+    };
+    if key_der.is_empty() {
+        // No PKCS#8 encoding available (e.g. a PKCS#11/HSM-backed key with
+        // getEncoded() == null) -- nothing we can stage natively. Lenient,
+        // matches the same leniency engine_set_certificate_entry takes.
+        return Ok(None);
+    }
+    let mut chain: Vec<Vec<u8>> = Vec::new();
+    if let Some(Value::Object(Some(chain_arr))) = args.get(4) {
+        let len = ctx.array_length(*chain_arr);
+        for i in 0..len {
+            if let Value::Object(Some(cert)) = ctx.get_array_element(*chain_arr, i) {
+                if let Ok(Some(Value::Object(Some(cert_bytes)))) =
+                    ctx.invoke_virtual(cert, "getEncoded", "()[B", &[])
+                {
+                    let clen = ctx.array_length(cert_bytes);
+                    let mut cv = Vec::with_capacity(clen);
+                    for j in 0..clen {
+                        if let Value::Int(b) = ctx.get_array_element(cert_bytes, j) {
+                            cv.push(b as u8);
+                        }
+                    }
+                    chain.push(cv);
+                }
+            }
+        }
+    }
+    // FIX (httpserver-pkcs12-20260706): also install this as the process-wide
+    // "runtime server identity" the native TLS listener consumes for the
+    // actual accept-side handshake (io_native_tls's rustls ServerConfig),
+    // exactly like engineLoad does for the byte-stream-load case. Without
+    // this, a keystore built purely in-memory (getInstance() + load(null,
+    // null) + setKeyEntry(...) -- Netty's JdkSslServerContext.buildKeyStore
+    // ephemeral self-signed-cert pattern) staged an identity for
+    // KeyManagerFactory/SSLContext's per-context bookkeeping (see
+    // keystore_set_pending_km_identity's live-scan fallback above) but the
+    // actual server socket had no certificate to present at all, and every
+    // TLS handshake against it failed immediately ("unexpected EOF" on the
+    // client side). See docs/known-issues/http-server-cluster-residuals.md.
+    if !chain.is_empty() {
+        crate::t27_tls::install_identity_from_der(&key_der, &chain);
+    }
+    keystore_set_key_entry(id, &alias, key_der, chain);
+    Ok(None)
+}
+
+/// engineDeleteEntry(String alias) -- in-memory removal (companion to
 /// engine_set_certificate_entry; same side-table consistency rationale).
 fn engine_delete_entry(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = this_arg(args)?;
@@ -1611,6 +1735,32 @@ fn store_identity_pem_map(
     T.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
 }
 
+/// Unwrap a `java.security.KeyStore` wrapper down to its real `KeyStoreSpi`
+/// instance (the private `keyStoreSpi` field, real KeyStore's 3rd of 3 fields:
+/// `type`, `provider`, `keyStoreSpi`). `KeyManagerFactory.init(KeyStore,
+/// char[])` (and `TrustManagerFactory.init(KeyStore)`) receive the outer
+/// wrapper, but `engineLoad`/`engineSetKeyEntry`/etc. run natively on the SPI
+/// object itself (registered on the SPI's own class name) and stamp the
+/// store-id side-table keyed off the SPI's identity -- calling
+/// `get_store_id` directly on the wrapper looks at the WRONG object (the
+/// wrapper's own fields/identity hash have nothing to do with the SPI's), so
+/// it always read back id=0 and every staged identity was silently dropped.
+/// Falls back to the wrapper object itself if the field can't be read (e.g.
+/// a non-standard `KeyStore` subclass), preserving old behaviour for any
+/// caller that doesn't hit this real-bytecode shape.
+fn unwrap_keystore_spi(ctx: &mut dyn NativeContext, keystore_obj: ObjectRef) -> ObjectRef {
+    if let Value::Object(Some(spi)) = ctx.get_field_by_name(keystore_obj, "keyStoreSpi") {
+        return spi;
+    }
+    // Fallback: real KeyStore's field order is type(0)/provider(1)/keyStoreSpi(2).
+    if ctx.object_num_fields(keystore_obj) > 2 {
+        if let Value::Object(Some(spi)) = ctx.get_field(keystore_obj, 2) {
+            return spi;
+        }
+    }
+    keystore_obj
+}
+
 /// `KeyManagerFactory.init(KeyStore, char[])` calls this so the keystore's
 /// identity is staged for the next `SSLContext.init` on this thread (see
 /// `t27_tls::set_pending_km_identity`).
@@ -1618,14 +1768,45 @@ pub(crate) fn keystore_set_pending_km_identity(
     ctx: &mut dyn NativeContext,
     keystore_obj: ObjectRef,
 ) {
-    let id = get_store_id(ctx, keystore_obj);
+    let spi = unwrap_keystore_spi(ctx, keystore_obj);
+    let id = get_store_id(ctx, spi);
     if id == 0 {
         return;
     }
     let ident = store_identity_pem_map().lock().unwrap().get(&id).cloned();
     if let Some((cert, key)) = ident {
         crate::t27_tls::set_pending_km_identity(cert, key);
+        return;
     }
+    // FIX (httpserver-pkcs12-20260706): store_identity_pem_map is a
+    // load-time snapshot (populated only by engineLoad's entries scan). A
+    // keystore built via getInstance()+load(null,null)+setKeyEntry(...) --
+    // Netty's JdkSslServerContext.buildKeyStore ephemeral self-signed-cert
+    // pattern -- has an empty snapshot at that id (load(null,null) sees zero
+    // entries) even though setKeyEntry has since added a real PrivateKey
+    // entry via keystore_set_key_entry. Fall back to scanning the LIVE
+    // registry (keystore_get_first_private_key) so this identity isn't
+    // silently dropped -- without this, SSLContext.init produced a
+    // server-side context with no certificate to present and the TLS
+    // handshake failed immediately.
+    if let Some((key_der, chain)) = keystore_get_first_private_key(id) {
+        let (cert_pem, key_pem) = crate::t27_tls::der_identity_to_pem(&key_der, &chain);
+        crate::t27_tls::set_pending_km_identity(cert_pem, key_pem);
+    }
+}
+
+/// Fetch the PKCS#8 DER + cert chain of the first `PrivateKey` entry in a
+/// registered store, scanning the LIVE registry rather than the load-time
+/// snapshot `store_identity_pem_map` relies on. See
+/// `keystore_set_pending_km_identity`'s fallback for why this is needed.
+fn keystore_get_first_private_key(id: i32) -> Option<(Vec<u8>, Vec<Vec<u8>>)> {
+    let store = registry().read().stores.get(&id).cloned()?;
+    for entry in store.entries.values() {
+        if let EntryKind::PrivateKey { key_der, chain } = &entry.kind {
+            return Some((key_der.clone(), chain.clone()));
+        }
+    }
+    None
 }
 
 fn get_store_id(ctx: &mut dyn NativeContext, this: ObjectRef) -> i32 {
