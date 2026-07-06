@@ -1659,17 +1659,27 @@ pub unsafe extern "C" fn jit_post_tlab_init(
         vm.register_finalizable(obj_ref.as_ptr() as usize);
     }
 
-    if let Ok(filter) = std::env::var("CRATONVM_DBG_JIT_ALLOC") {
-        if let Ok(want) = filter.parse::<u32>() {
-            if class_id_raw as u32 == want {
-                eprintln!(
-                    "[JIT_ALLOC] post_tlab_init class_id={} obj=0x{:x}",
-                    class_id_raw, obj_ptr
-                );
-            }
-        }
+    if dbg_jit_alloc_filter() == Some(class_id_raw as u32) {
+        eprintln!(
+            "[JIT_ALLOC] post_tlab_init class_id={} obj=0x{:x}",
+            class_id_raw, obj_ptr
+        );
     }
     obj_ptr
+}
+
+/// Cached `CRATONVM_DBG_JIT_ALLOC` class-id filter (`None` = unset or
+/// unparseable). PERF: the previous per-call `std::env::var` in the two
+/// allocation helpers was ~13% of binarytrees-18 wall time — getenv does a
+/// linear scan of `environ` on every call.
+fn dbg_jit_alloc_filter() -> Option<u32> {
+    use std::sync::OnceLock;
+    static F: OnceLock<Option<u32>> = OnceLock::new();
+    *F.get_or_init(|| {
+        std::env::var("CRATONVM_DBG_JIT_ALLOC")
+            .ok()
+            .and_then(|v| v.trim().parse::<u32>().ok())
+    })
 }
 
 // SAFETY: Called from JIT-compiled code. vm_ptr must be a valid SharedVm pointer.
@@ -1719,6 +1729,46 @@ pub unsafe extern "C" fn jit_new_object(vm_ptr: i64, class_id_raw: i64, num_fiel
             &format!("Java heap space (new_object class_id {class_id_raw} fields {num_fields})"),
         );
     }
+    // TLAB refill-aware allocation — mirrors the interpreter's
+    // `gc_alloc_object` medium path. The inline JIT bump only consumes an
+    // EXISTING TLAB: once it filled, this helper previously routed EVERY
+    // subsequent allocation through the global `try_alloc_object_full`
+    // (lock + arena scan) without ever installing a fresh TLAB, so
+    // allocation-heavy compiled code paid the full slow chain per object
+    // (~25% of binarytrees-18 wall time in the slow-alloc call graph).
+    // `tlab_alloc_object` bump-allocates and adaptively refills the thread's
+    // TLAB, which also restores the JIT's INLINE bump fast path for the
+    // following allocations.
+    if total_size <= cratonvm_gc::tlab::tlab_max_alloc() {
+        if let Some((thread, _guard)) = jit_thread_mut() {
+            if let Some(obj_ref) = crate::runtime::interpreter::tlab_alloc_object(
+                thread,
+                vm,
+                class_id,
+                num_fields as usize,
+                total_size,
+            ) {
+                jit_init_primitive_fields(vm, obj_ref, class_id);
+                let has_fin = vm
+                    .class_manager
+                    .read()
+                    .class_store
+                    .get(class_id)
+                    .map_or(false, |c| c.has_finalizer);
+                if has_fin {
+                    vm.register_finalizable(obj_ref.as_ptr() as usize);
+                }
+                if dbg_jit_alloc_filter() == Some(class_id_raw as u32) {
+                    eprintln!(
+                        "[JIT_ALLOC] new_object(tlab) class_id={} obj=0x{:x}",
+                        class_id_raw,
+                        obj_ref.as_ptr() as usize
+                    );
+                }
+                return obj_ref.as_ptr() as i64;
+            }
+        }
+    }
     // Fallible young → old-gen alloc (preserves alloc_object's old-gen spill);
     // on exhaustion surface a catchable OutOfMemoryError instead of the hard
     // abort in alloc_young. The `new` codegen's emit_post_alloc_oom_check bails
@@ -1743,16 +1793,12 @@ pub unsafe extern "C" fn jit_new_object(vm_ptr: i64, class_id_raw: i64, num_fiel
     if has_fin {
         vm.register_finalizable(obj_ref.as_ptr() as usize);
     }
-    if let Ok(filter) = std::env::var("CRATONVM_DBG_JIT_ALLOC") {
-        if let Ok(want) = filter.parse::<u32>() {
-            if class_id_raw as u32 == want {
-                eprintln!(
-                    "[JIT_ALLOC] new_object class_id={} obj=0x{:x}",
-                    class_id_raw,
-                    obj_ref.as_ptr() as usize
-                );
-            }
-        }
+    if dbg_jit_alloc_filter() == Some(class_id_raw as u32) {
+        eprintln!(
+            "[JIT_ALLOC] new_object class_id={} obj=0x{:x}",
+            class_id_raw,
+            obj_ref.as_ptr() as usize
+        );
     }
     obj_ref.as_ptr() as i64
 }

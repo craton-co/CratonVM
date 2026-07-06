@@ -1034,14 +1034,19 @@ fn note_gc_productivity(shared: &SharedVm, before_live: usize) {
 /// `UseGCOverheadLimit`. Disabled (always `false`) when
 /// `CRATONVM_GC_OVERHEAD_LIMIT=0`.
 pub fn gc_overhead_limit_exceeded(shared: &SharedVm) -> bool {
-    let limit = match std::env::var("CRATONVM_GC_OVERHEAD_LIMIT") {
-        Ok(v) => match v.trim().parse::<u32>() {
-            Ok(0) => return false, // explicitly disabled
-            Ok(n) => n,
-            Err(_) => GC_OVERHEAD_LIMIT_CYCLES,
-        },
+    // PERF: this runs on the per-allocation slow path (`jit_new_object` and
+    // the interpreter allocation sites). An uncached `std::env::var` here was
+    // ~6% of binarytrees-18 wall time (getenv does a linear environ scan) —
+    // read the knob once. `Some(0)` = explicitly disabled.
+    use std::sync::OnceLock;
+    static LIMIT: OnceLock<u32> = OnceLock::new();
+    let limit = *LIMIT.get_or_init(|| match std::env::var("CRATONVM_GC_OVERHEAD_LIMIT") {
+        Ok(v) => v.trim().parse::<u32>().unwrap_or(GC_OVERHEAD_LIMIT_CYCLES),
         Err(_) => GC_OVERHEAD_LIMIT_CYCLES,
-    };
+    });
+    if limit == 0 {
+        return false; // explicitly disabled
+    }
     shared
         .gc_unproductive_streak
         .load(std::sync::atomic::Ordering::Relaxed)
@@ -1680,7 +1685,7 @@ pub fn init_primitive_fields(shared: &SharedVm, obj: ObjectRef, class_id: ClassI
 /// `shared.tlab_refill_count` so operators can spot-check the
 /// refill rate against the hit-rate target.
 #[inline(always)]
-fn tlab_alloc_object(
+pub(crate) fn tlab_alloc_object(
     thread: &mut JvmThread,
     shared: &SharedVm,
     class_id: ClassId,
