@@ -37621,7 +37621,13 @@ fn p68_extract_trust_manager_roots(
                     _ => continue,
                 },
             };
-            let state = crate::x509_manager::build_trust_manager_state(ks_id);
+            // FIX (tls-residuals): this id is a `tm_registry` id (from
+            // `x509_manager::register_trust_manager_state`) for the live
+            // PKIXFactory/SimpleFactory path, not necessarily a raw KeyStore
+            // registry id — see `tls.rs::validate_cert_chain`'s matching fix
+            // for the full explanation of the two-id-space collision this
+            // closes.
+            let state = crate::x509_manager::trust_manager_state_by_id(ks_id);
             if !state.anchor_ders.is_empty() {
                 return Some(state.anchor_ders);
             }

@@ -204,13 +204,26 @@ pub(crate) fn set_pending_tm_trust_roots(root_ders: Vec<Vec<u8>>) {
             deduped.push(der);
         }
     }
+    if std::env::var("CRATONVM_DBG_TLS_AUTH").is_ok() {
+        eprintln!(
+            "[dbg-tls-auth] set_pending_tm_trust_roots count={}",
+            deduped.len()
+        );
+    }
     PENDING_TM_TRUST_ROOTS.with(|c| {
         *c.borrow_mut() = Some(TlsTrustRoots { root_ders: deduped });
     });
 }
 
 fn take_pending_tm_trust_roots() -> Option<TlsTrustRoots> {
-    PENDING_TM_TRUST_ROOTS.with(|c| c.borrow_mut().take())
+    let out = PENDING_TM_TRUST_ROOTS.with(|c| c.borrow_mut().take());
+    if std::env::var("CRATONVM_DBG_TLS_AUTH").is_ok() {
+        eprintln!(
+            "[dbg-tls-auth] take_pending_tm_trust_roots -> {:?}",
+            out.as_ref().map(|r| r.root_ders.len())
+        );
+    }
+    out
 }
 
 fn set_selected_context_trust_roots(roots: Option<TlsTrustRoots>) {
@@ -297,7 +310,19 @@ pub(crate) fn attach_pending_identity_to_ctx(ctx: &mut dyn NativeContext, ctx_ob
         ctx_identity_table().lock().insert(key, ident);
     }
     if let Some(roots) = take_pending_tm_trust_roots() {
+        if std::env::var("CRATONVM_DBG_TLS_AUTH").is_ok() {
+            eprintln!(
+                "[dbg-tls-auth] attach_pending_identity_to_ctx key={} storing {} roots",
+                key,
+                roots.root_ders.len()
+            );
+        }
         ctx_trust_roots_table().lock().insert(key, roots);
+    } else if std::env::var("CRATONVM_DBG_TLS_AUTH").is_ok() {
+        eprintln!(
+            "[dbg-tls-auth] attach_pending_identity_to_ctx key={} NO pending roots to store",
+            key
+        );
     }
 }
 
@@ -308,6 +333,13 @@ pub(crate) fn ctx_identity(
 ) -> Option<(String, String)> {
     let key = ctx_obj_key(ctx, ctx_obj);
     let trust_roots = ctx_trust_roots_table().lock().get(&key).cloned();
+    if std::env::var("CRATONVM_DBG_TLS_AUTH").is_ok() {
+        eprintln!(
+            "[dbg-tls-auth] ctx_identity key={} trust_roots={:?}",
+            key,
+            trust_roots.as_ref().map(|r| r.root_ders.len())
+        );
+    }
     set_selected_context_trust_roots(trust_roots);
     ctx_identity_table().lock().get(&key).cloned()
 }
@@ -355,7 +387,14 @@ fn huc_default_trust_roots_slot() -> &'static Mutex<Option<TlsTrustRoots>> {
 
 pub(crate) fn set_huc_default_client_identity(ident: Option<(String, String)>) {
     *huc_default_identity_slot().lock() = ident;
-    *huc_default_trust_roots_slot().lock() = selected_context_trust_roots();
+    let roots = selected_context_trust_roots();
+    if std::env::var("CRATONVM_DBG_TLS_AUTH").is_ok() {
+        eprintln!(
+            "[dbg-tls-auth] set_huc_default_client_identity capturing roots={:?}",
+            roots.as_ref().map(|r| r.root_ders.len())
+        );
+    }
+    *huc_default_trust_roots_slot().lock() = roots;
     set_selected_context_trust_roots(None);
 }
 
@@ -468,7 +507,15 @@ fn root_store_for_trust_roots(trust_roots: Option<&TlsTrustRoots>) -> RootCertSt
 }
 
 fn active_client_trust_roots() -> Option<TlsTrustRoots> {
-    take_selected_context_trust_roots().or_else(huc_default_trust_roots)
+    let selected = take_selected_context_trust_roots();
+    let result = selected.or_else(huc_default_trust_roots);
+    if std::env::var("CRATONVM_DBG_TLS_AUTH").is_ok() {
+        eprintln!(
+            "[dbg-tls-auth] active_client_trust_roots -> {:?}",
+            result.as_ref().map(|r| r.root_ders.len())
+        );
+    }
+    result
 }
 
 /// Concatenate scoped trust anchors (DER) into a PEM bundle. Used as the

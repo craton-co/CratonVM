@@ -1667,6 +1667,39 @@ fn get_store_id(ctx: &mut dyn NativeContext, this: ObjectRef) -> i32 {
     0
 }
 
+/// FIX (tls-residuals): the robust, three-tier id lookup `tls.rs`'s own doc
+/// comment on `read_keystore_registry_id` asked for ("a `pub fn
+/// keystore::keystore_id_from_object` ... that reuses `get_store_id`").
+/// `x509_manager::read_keystore_id`/`tls::read_keystore_registry_id` each
+/// re-implemented a SUBSET of `get_store_id`'s lookup (named field + a slot
+/// index) but never the identity-hash side-table tier — the ONLY tier that
+/// resolves a real `java.security.KeyStore` object in real-JDK mode, since
+/// its real 4-field layout (`type`/`provider`/`keyStoreSpi`/`initialized`)
+/// has no room for a pseudo-field and `set_field_by_name` no-ops on a real
+/// class. Without this, `TrustManagerFactory.init(KeyStore)` (both the
+/// SimpleFactory and PKIXFactory SPI paths) always resolved id 0 for a
+/// caller-supplied truststore, silently falling back to the ~100+ platform
+/// root certs instead of the caller's actual (possibly test-only/private) CA
+/// — the client then rejects ANY peer certificate signed by that CA with
+/// `UnknownIssuer`, regardless of any other TLS/OCSP configuration.
+pub(crate) fn keystore_id_from_object(ctx: &mut dyn NativeContext, ks_obj: ObjectRef) -> i32 {
+    let id = get_store_id(ctx, ks_obj);
+    if id != 0 {
+        return id;
+    }
+    // `engineLoad` (this file) is registered on the KeyStoreSpi delegate
+    // class, so `set_store_id`'s identity-hash tier stamps the SPI
+    // instance's identity — a DIFFERENT object from the public
+    // `java.security.KeyStore` wrapper callers like
+    // `TrustManagerFactory.init(KeyStore)` actually receive. Re-run the same
+    // lookup against the wrapper's `keyStoreSpi` delegate field so that tier
+    // has a chance to match.
+    if let Value::Object(Some(spi)) = ctx.get_field_by_name(ks_obj, "keyStoreSpi") {
+        return get_store_id(ctx, spi);
+    }
+    0
+}
+
 fn set_store_id(ctx: &mut dyn NativeContext, this: ObjectRef, id: i32) {
     ctx.set_field_by_name(this, "cratonvm$keystore$storeId", Value::Int(id));
     let n = ctx.object_num_fields(this);
