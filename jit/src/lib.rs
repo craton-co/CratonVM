@@ -6103,6 +6103,28 @@ fn try_compile_inner(
                 continue;
             }
 
+            // BUG-1 companion — when the dedicated self-call stack guard is
+            // wired (`helpers.self_call_stack_guard`), NON-tail static
+            // self-recursive sites also stay on the raw direct-CALL path:
+            // the x64 self-call arm emits one cheap guard call (which raises
+            // a catchable StackOverflowError near native-stack exhaustion)
+            // before the rel32 CALL, replacing the full `jit_invoke_dispatch`
+            // round trip these sites were routed through purely to reach the
+            // dispatch depth guard. That round trip is the dominant cost of
+            // recursive workloads: fib(42) and binarytrees' `make`/`check`
+            // pay it on every level. `needs_heap` guarantees the vm_ptr frame
+            // slot the guard is called with. Mutual-recursion cycle targets
+            // (`recursive_cycle_target`) keep the dispatch route — a direct
+            // call into ANOTHER method's artifact is a different hazard the
+            // guard does not cover.
+            if invoke_kind == 3
+                && is_same_method_recursive_call
+                && helpers.self_call_stack_guard != 0
+            {
+                needs_heap = true;
+                continue;
+            }
+
             // Trivial-constructor elision (callee/IR tier, via try_compile): an
             // elidable `invokespecial C.<init>()V` is emitted AS
             // `java/lang/Object.<init>` so the single-pass `0xb7` codegen elision
@@ -7140,6 +7162,134 @@ pub fn invokestatic_self_call_uses_tail_jump(code: &[u8], code_len: usize, pc: u
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// BUG-1 companion — routing of NON-tail static self-recursive call sites.
+    ///
+    /// With `helpers.self_call_stack_guard` wired, the site must stay on the
+    /// raw direct-CALL path with the guard baked in (no `invoke_dispatch`
+    /// round trip); unwired, it must keep the historical dispatch routing.
+    /// Proven from the emitted machine code: `emit_call_absolute` bakes the
+    /// helper address as a `MOV RAX, imm64`, so the 8-byte LE address pattern
+    /// appearing in the code identifies which helper the site calls.
+    #[test]
+    fn self_recursive_nontail_site_routes_direct_with_guard() {
+        use std::sync::Arc;
+
+        // `static int f(int n) { return n <= 0 ? 0 : f(n - 1) + 1; }`
+        //  0: iload_0
+        //  1: ifgt  -> 6
+        //  4: iconst_0
+        //  5: ireturn
+        //  6: iload_0
+        //  7: iconst_1
+        //  8: isub
+        //  9: invokestatic #1   (self — NON-tail: iadd follows)
+        // 12: iconst_1
+        // 13: iadd
+        // 14: ireturn
+        let code: &[u8] = &[
+            0x1a, 0x9d, 0x00, 0x05, 0x03, 0xac, 0x1a, 0x04, 0x64, 0xb8, 0x00, 0x01, 0x04, 0x60,
+            0xac,
+        ];
+        let cached = CachedBytecodeMethod {
+            declaring_class_id: cratonvm_types::ClassId::new(1),
+            class_name: Arc::from("pkg/Rec"),
+            method_name: Arc::from("f"),
+            method_descriptor: Arc::from("(I)I"),
+            source_file: None,
+            code: Arc::from(code),
+            exception_table: Arc::from(Vec::new().as_slice()),
+            max_stack: 3,
+            max_locals: 1,
+            num_params: 1,
+            is_synchronized: false,
+            is_static: true,
+        };
+        let resolver = |idx: u16| -> Option<(String, String, String)> {
+            (idx == 1).then(|| ("pkg/Rec".to_string(), "f".to_string(), "(I)I".to_string()))
+        };
+        // Distinctive fake addresses — the code is never executed, only
+        // pattern-searched. SAFETY (zeroed): all-usize #[repr(C)] struct.
+        const GUARD_ADDR: usize = 0x7161_7264_5f61_6472; // "qard_adr"-ish tag
+        const DISPATCH_ADDR: usize = 0x6469_7370_5f61_6472;
+        let contains = |hay: &[u8], addr: usize| -> bool {
+            let needle = (addr as u64).to_le_bytes();
+            hay.windows(needle.len()).any(|w| w == needle)
+        };
+
+        // (a) Guard WIRED → direct self-call: guard baked, no dispatch.
+        let mut helpers: JitRuntimeHelpers = unsafe { std::mem::zeroed() };
+        helpers.self_call_stack_guard = GUARD_ADDR;
+        helpers.invoke_dispatch = DISPATCH_ADDR;
+        let compiled = try_compile(
+            &cached,
+            None,
+            None,
+            None,
+            Some(&resolver),
+            None,
+            None,
+            None,
+            None,
+            None,
+            &helpers,
+            None,
+            None,
+            None,
+            None,
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+            None,
+        )
+        .expect("guard-wired self-recursive method must compile");
+        let bytes = compiled.code_bytes().to_vec();
+        assert!(
+            contains(&bytes, GUARD_ADDR),
+            "wired guard must be baked at the self-call site"
+        );
+        assert!(
+            !contains(&bytes, DISPATCH_ADDR),
+            "wired guard must remove the invoke_dispatch round trip"
+        );
+
+        // (b) Guard UNWIRED → historical dispatch routing.
+        let mut helpers_off: JitRuntimeHelpers = unsafe { std::mem::zeroed() };
+        helpers_off.invoke_dispatch = DISPATCH_ADDR;
+        let compiled_off = try_compile(
+            &cached,
+            None,
+            None,
+            None,
+            Some(&resolver),
+            None,
+            None,
+            None,
+            None,
+            None,
+            &helpers_off,
+            None,
+            None,
+            None,
+            None,
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+            None,
+        )
+        .expect("guard-unwired self-recursive method must compile");
+        let bytes_off = compiled_off.code_bytes().to_vec();
+        assert!(
+            contains(&bytes_off, DISPATCH_ADDR),
+            "unwired guard must keep the historical invoke_dispatch routing"
+        );
+    }
 
     /// deopt-osr Step 9 follow-up (a): `stamp_deopt_epoch_guard` writes the
     /// creation epoch + live-cell pointer into the artifact's retained guard, and

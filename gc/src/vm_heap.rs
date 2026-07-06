@@ -1066,6 +1066,24 @@ impl VmHeap {
         }
     }
 
+    /// O(1) probe: can the young-gen BUMP TAIL supply `size` bytes right now?
+    ///
+    /// Unlike [`Self::try_alloc_young_probe`], this never consults the young
+    /// free list (`largest_free_block` is an O(free-blocks) scan — calling it
+    /// per allocation from the JIT TLAB-refill gate was ~55% of a
+    /// binarytrees-18 run once young fragmented). Used to decide whether a
+    /// TLAB refill is worth attempting: a fragmented-but-full young (the
+    /// non-moving-sweep steady state, whose cursor can never retreat) answers
+    /// `false`, sending the caller to the old-gen spill path instead of
+    /// scanning the free list on every allocation.
+    pub fn young_bump_headroom(&self, size: usize) -> bool {
+        match self {
+            VmHeap::Generational(h) => h.young_bump_headroom(size),
+            // G1's Eden is region-granular; reuse the reserve signal.
+            VmHeap::G1(_) => !self.needs_gc(),
+        }
+    }
+
     /// Returns whether this heap is using the G1 collector.
     pub fn is_g1(&self) -> bool {
         matches!(self, VmHeap::G1(_))

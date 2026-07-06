@@ -302,6 +302,29 @@ pub struct JitRuntimeHelpers {
     /// remainder from XMM0. Appended at the END of the struct so all prior
     /// golden offsets stay stable.
     pub jit_drem: usize,
+    /// Native-stack headroom guard for direct self-recursive calls —
+    /// `extern "C" fn(vm_ptr: i64) -> i64`.
+    ///
+    /// Historically every non-tail self-recursive `invokestatic` was routed
+    /// through `invoke_dispatch` solely so its thread-local depth guard could
+    /// convert runaway compiled recursion into a catchable
+    /// `StackOverflowError` (BUG-1). That made every recursive call pay the
+    /// full dispatch-helper round trip (TLS scan-cache invalidation, SATB
+    /// flush, dispatch-cache lookup, …) — ~10-30x the cost of the `CALL`
+    /// itself, the dominant term in recursive workloads (fib, binarytrees).
+    ///
+    /// With this helper wired, the backend instead emits a direct rel32
+    /// self-`CALL` preceded by one `CALL` to this guard. The guard compares
+    /// the current native stack pointer against a per-thread floor (queried
+    /// from the OS once per thread and cached): comfortably above the floor
+    /// it returns `0` and the site proceeds to the direct self-call; at
+    /// exhaustion it stashes a catchable `java/lang/StackOverflowError`
+    /// (exactly like the dispatch depth guard) and returns the `i64::MIN`
+    /// deopt sentinel, which the site routes through the existing post-invoke
+    /// sentinel check. `0` = not wired → the jit crate keeps routing self
+    /// calls through `invoke_dispatch` (historical behaviour). Appended at
+    /// the END of the struct so all prior golden offsets stay stable.
+    pub self_call_stack_guard: usize,
 }
 
 /// Classifies each field of [`JitRuntimeHelpers`] for the validator.
@@ -437,6 +460,7 @@ helper_fields! {
     (dispatch_threw,                 FieldKind::RequiredPtr),
     (jit_frem,                       FieldKind::RequiredPtr),
     (jit_drem,                       FieldKind::RequiredPtr),
+    (self_call_stack_guard,          FieldKind::OptionalPtr),
 }
 
 // Compile-time integrity check: the macro-generated NUM_FIELDS must
@@ -462,7 +486,7 @@ const _: () = assert!(
 // struct field AND its macro entry simultaneously would still satisfy
 // the ratio assert above and silently change the JIT ABI.
 const _: () = assert!(
-    JitRuntimeHelpers::NUM_FIELDS == 46,
+    JitRuntimeHelpers::NUM_FIELDS == 47,
     "JitRuntimeHelpers field count changed — bump the literal here and update \
      the golden-offset test in mod tests if the change is intentional",
 );
@@ -616,6 +640,7 @@ mod tests {
             dispatch_threw: 0x1128,
             jit_frem: 0x1130,
             jit_drem: 0x1138,
+            self_call_stack_guard: 0x1140,
         }
     }
 
@@ -833,6 +858,7 @@ mod tests {
             dispatch_threw: 0,
             jit_frem: 0,
             jit_drem: 0,
+            self_call_stack_guard: 0,
         };
         assert_eq!(h.newarray, 0);
         assert_eq!(h.write_barrier, 0);
@@ -1008,8 +1034,8 @@ mod tests {
             std::mem::size_of::<JitRuntimeHelpers>(),
             JitRuntimeHelpers::NUM_FIELDS * FIELD_WIDTH,
         );
-        // And the macro-driven count is the canonical 46.
-        assert_eq!(JitRuntimeHelpers::NUM_FIELDS, 46);
+        // And the macro-driven count is the canonical 47.
+        assert_eq!(JitRuntimeHelpers::NUM_FIELDS, 47);
     }
 
     #[test]
@@ -1237,6 +1263,11 @@ mod tests {
                 "jit_drem",
                 std::mem::offset_of!(JitRuntimeHelpers, jit_drem),
             ),
+            (
+                46,
+                "self_call_stack_guard",
+                std::mem::offset_of!(JitRuntimeHelpers, self_call_stack_guard),
+            ),
         ];
 
         // (a) Each field is at its documented sequential byte offset.
@@ -1274,7 +1305,7 @@ mod tests {
     #[test]
     fn jit_runtime_helpers_all_fields_classified() {
         // The macro must classify every field. 39 RequiredPtr + 4
-        // Offset + 3 OptionalPtr = 46. A new field whose classification
+        // Offset + 4 OptionalPtr = 47. A new field whose classification
         // is omitted will fail to compile (the macro requires both
         // arms); this test pins the *counts* so a reclassification
         // (e.g. demoting a RequiredPtr to OptionalPtr) is also a
@@ -1291,7 +1322,7 @@ mod tests {
             .count();
         let off = f.iter().filter(|e| e.kind == FieldKind::Offset).count();
         assert_eq!(req, 39, "required-pointer count drifted");
-        assert_eq!(opt, 3, "optional-pointer count drifted");
+        assert_eq!(opt, 4, "optional-pointer count drifted");
         assert_eq!(off, 4, "offset-field count drifted");
         assert_eq!(req + opt + off, JitRuntimeHelpers::NUM_FIELDS);
     }

@@ -1034,14 +1034,19 @@ fn note_gc_productivity(shared: &SharedVm, before_live: usize) {
 /// `UseGCOverheadLimit`. Disabled (always `false`) when
 /// `CRATONVM_GC_OVERHEAD_LIMIT=0`.
 pub fn gc_overhead_limit_exceeded(shared: &SharedVm) -> bool {
-    let limit = match std::env::var("CRATONVM_GC_OVERHEAD_LIMIT") {
-        Ok(v) => match v.trim().parse::<u32>() {
-            Ok(0) => return false, // explicitly disabled
-            Ok(n) => n,
-            Err(_) => GC_OVERHEAD_LIMIT_CYCLES,
-        },
+    // PERF: this runs on the per-allocation slow path (`jit_new_object` and
+    // the interpreter allocation sites). An uncached `std::env::var` here was
+    // ~6% of binarytrees-18 wall time (getenv does a linear environ scan) —
+    // read the knob once. `Some(0)` = explicitly disabled.
+    use std::sync::OnceLock;
+    static LIMIT: OnceLock<u32> = OnceLock::new();
+    let limit = *LIMIT.get_or_init(|| match std::env::var("CRATONVM_GC_OVERHEAD_LIMIT") {
+        Ok(v) => v.trim().parse::<u32>().unwrap_or(GC_OVERHEAD_LIMIT_CYCLES),
         Err(_) => GC_OVERHEAD_LIMIT_CYCLES,
-    };
+    });
+    if limit == 0 {
+        return false; // explicitly disabled
+    }
     shared
         .gc_unproductive_streak
         .load(std::sync::atomic::Ordering::Relaxed)
@@ -3793,7 +3798,14 @@ pub fn execute(
                                 method_name,
                                 method_descriptor,
                             );
-                            let _ = shared.tiered_manager.on_method_invocation(&tiered_key);
+                            // Pass the REAL per-method invocation count: this
+                            // hook only fires at stride boundaries, and the
+                            // manager's historical `+= 1` counting deflated its
+                            // hotness view 64x (first C1 recommendation at
+                            // ~threshold + 64×c1_threshold real calls).
+                            let _ = shared
+                                .tiered_manager
+                                .on_method_invocation_observed(&tiered_key, n as u64);
                         }
                         c2_not_hot = true; // keep the counter running; do not seal
                         return None; // interpret — the worker compiles off-thread
@@ -4006,6 +4018,18 @@ pub fn execute(
                                     &padded, code_len, pc,
                                 );
                             if use_raw_tail_self_call {
+                                continue;
+                            }
+                            // BUG-1 companion (eager first-call compile parity
+                            // with `jit::try_compile`'s routing): NON-tail
+                            // static self-recursive sites stay on the raw
+                            // direct-CALL path — the backend emits the cheap
+                            // `self_call_stack_guard` call (always wired via
+                            // `build_helpers`) instead of the full
+                            // `jit_invoke_dispatch` round trip. `scan.needs_heap`
+                            // is already true (every invoke op sets it), so the
+                            // guard's vm_ptr frame slot exists.
+                            if invoke_kind == 3 && is_recursive_call {
                                 continue;
                             }
                             // Math.sqrt intrinsic: inline as SQRTSD (no dispatch overhead)
@@ -21734,7 +21758,13 @@ fn execute_invokestatic_cached(
                     // `ensure_bg_compiler_started` for the closure / GC rationale.
                     ensure_bg_compiler_started(shared);
                 }
-                let recommended_tier = shared.tiered_manager.on_method_invocation(&tiered_key);
+                // Pass the REAL per-method invocation count — this hook runs
+                // only at stride boundaries, and the manager's historical
+                // `+= 1` counting deflated its hotness view 64x (first C1
+                // recommendation at ~threshold + 64×c1_threshold real calls).
+                let recommended_tier = shared
+                    .tiered_manager
+                    .on_method_invocation_observed(&tiered_key, invoc_count as u64);
                 if let Some(tier) = recommended_tier {
                     if crate::runtime::env_cache::dbg_jitc() {
                         eprintln!(
@@ -22242,6 +22272,17 @@ fn compile_osr_artifact(
                         && is_recursive_call
                         && crate::jit::invokestatic_self_call_uses_tail_jump(code, code_len, pc);
                     if use_raw_tail_self_call {
+                        continue;
+                    }
+                    // BUG-1 companion (OSR/callee tier parity with
+                    // `jit::try_compile`'s routing): NON-tail static
+                    // self-recursive sites stay on the raw direct-CALL path —
+                    // the backend emits the cheap `self_call_stack_guard` call
+                    // (always wired via `build_helpers`) instead of the full
+                    // `jit_invoke_dispatch` round trip. `scan.needs_heap` is
+                    // already true (every invoke op sets it), so the guard's
+                    // vm_ptr frame slot exists.
+                    if invoke_kind == 3 && is_recursive_call {
                         continue;
                     }
 
@@ -27277,7 +27318,12 @@ fn execute_invokevirtual_cached(
                                         cached.method_name.as_ref(),
                                         cached.method_descriptor.as_ref(),
                                     );
-                                    let _ = shared.tiered_manager.on_method_invocation(&tiered_key);
+                                    // Real invocation count — see the invokestatic
+                                    // twin: stride-boundary `+= 1` counting deflated
+                                    // the manager's hotness view 64x.
+                                    let _ = shared
+                                        .tiered_manager
+                                        .on_method_invocation_observed(&tiered_key, cnt as u64);
                                 } else if let Some(CachedInvokeTarget::Jit { compiled, .. }) =
                                     try_jit_upgrade_with_gate(shared, &cached, entry_gate.clone())
                                 {

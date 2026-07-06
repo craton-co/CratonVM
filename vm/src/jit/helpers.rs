@@ -1659,17 +1659,27 @@ pub unsafe extern "C" fn jit_post_tlab_init(
         vm.register_finalizable(obj_ref.as_ptr() as usize);
     }
 
-    if let Ok(filter) = std::env::var("CRATONVM_DBG_JIT_ALLOC") {
-        if let Ok(want) = filter.parse::<u32>() {
-            if class_id_raw as u32 == want {
-                eprintln!(
-                    "[JIT_ALLOC] post_tlab_init class_id={} obj=0x{:x}",
-                    class_id_raw, obj_ptr
-                );
-            }
-        }
+    if dbg_jit_alloc_filter() == Some(class_id_raw as u32) {
+        eprintln!(
+            "[JIT_ALLOC] post_tlab_init class_id={} obj=0x{:x}",
+            class_id_raw, obj_ptr
+        );
     }
     obj_ptr
+}
+
+/// Cached `CRATONVM_DBG_JIT_ALLOC` class-id filter (`None` = unset or
+/// unparseable). PERF: the previous per-call `std::env::var` in the two
+/// allocation helpers was ~13% of binarytrees-18 wall time — getenv does a
+/// linear scan of `environ` on every call.
+fn dbg_jit_alloc_filter() -> Option<u32> {
+    use std::sync::OnceLock;
+    static F: OnceLock<Option<u32>> = OnceLock::new();
+    *F.get_or_init(|| {
+        std::env::var("CRATONVM_DBG_JIT_ALLOC")
+            .ok()
+            .and_then(|v| v.trim().parse::<u32>().ok())
+    })
 }
 
 // SAFETY: Called from JIT-compiled code. vm_ptr must be a valid SharedVm pointer.
@@ -1719,6 +1729,17 @@ pub unsafe extern "C" fn jit_new_object(vm_ptr: i64, class_id_raw: i64, num_fiel
             &format!("Java heap space (new_object class_id {class_id_raw} fields {num_fields})"),
         );
     }
+    // NOTE (JIT TLAB refill — attempted 2026-07-06, REVERTED): routing this
+    // slow path through the interpreter's TLAB refill (`tlab_alloc_object`)
+    // made small binarytrees runs ~10x faster (bt16 3s → 0.33s) but was
+    // pathological at bt18 scale: young-gen churn against a large live set
+    // under the non-moving sweep (and O(free-list) probes once young
+    // fragmented) turned 10.6s into 40-460s depending on the refill gate
+    // (even an O(1) bump-tail-only gate — `VmHeap::young_bump_headroom`,
+    // kept in the gc crate — still ended at ~119s). Restoring the historical
+    // behaviour (no refill here; old-gen spill under pressure) until TLAB
+    // refill is co-designed with young promotion/cursor semantics.
+    //
     // Fallible young → old-gen alloc (preserves alloc_object's old-gen spill);
     // on exhaustion surface a catchable OutOfMemoryError instead of the hard
     // abort in alloc_young. The `new` codegen's emit_post_alloc_oom_check bails
@@ -1743,16 +1764,12 @@ pub unsafe extern "C" fn jit_new_object(vm_ptr: i64, class_id_raw: i64, num_fiel
     if has_fin {
         vm.register_finalizable(obj_ref.as_ptr() as usize);
     }
-    if let Ok(filter) = std::env::var("CRATONVM_DBG_JIT_ALLOC") {
-        if let Ok(want) = filter.parse::<u32>() {
-            if class_id_raw as u32 == want {
-                eprintln!(
-                    "[JIT_ALLOC] new_object class_id={} obj=0x{:x}",
-                    class_id_raw,
-                    obj_ref.as_ptr() as usize
-                );
-            }
-        }
+    if dbg_jit_alloc_filter() == Some(class_id_raw as u32) {
+        eprintln!(
+            "[JIT_ALLOC] new_object class_id={} obj=0x{:x}",
+            class_id_raw,
+            obj_ref.as_ptr() as usize
+        );
     }
     obj_ref.as_ptr() as i64
 }
@@ -5874,6 +5891,158 @@ pub unsafe extern "C" fn jit_get_current_thread() -> *mut JvmThread {
     JIT_THREAD.with(|t| t.get())
 }
 
+// ===========================================================================
+// BUG-1 companion — native-stack headroom guard for DIRECT self-recursive
+// calls.
+//
+// The dispatch helpers contain the thread-local depth guard (`enter_jit_
+// dispatch`) that converts runaway compiled recursion into a catchable
+// `StackOverflowError`. Routing every non-tail self-recursive `invokestatic`
+// through `jit_invoke_dispatch` purely to reach that guard made each
+// recursive call pay the full dispatch round trip (scan-cache invalidation,
+// SATB flush, dispatch-cache lookup, borrow bookkeeping, …) — the dominant
+// cost of recursive workloads (fib(42) ran ~10x slower than with a direct
+// CALL; binarytrees pays it on both `make` and `check`).
+//
+// This guard is the cheap replacement the backend calls immediately before
+// a direct rel32 self-CALL: compare the current native stack pointer against
+// a per-thread floor (queried from the OS once per thread and cached in
+// TLS). Comfortably above the floor → return 0 and the compiled site
+// proceeds with the direct CALL. At exhaustion → stash a catchable
+// `java/lang/StackOverflowError` (identical to the dispatch depth guard) and
+// return the `i64::MIN` deopt sentinel, which the call site routes through
+// its existing post-invoke sentinel check.
+// ===========================================================================
+thread_local! {
+    /// Cached self-call guard floor for the current thread.
+    /// `usize::MAX` = not yet computed.
+    static JIT_SELF_CALL_STACK_FLOOR: Cell<usize> = const { Cell::new(usize::MAX) };
+}
+
+/// Query the current thread's native stack bounds `(low, high)` from the OS.
+/// `None` when the platform query is unavailable/fails — the caller falls
+/// back to a conservative offset from the first observed stack pointer.
+#[cfg(windows)]
+fn thread_stack_bounds() -> Option<(usize, usize)> {
+    extern "system" {
+        fn GetCurrentThreadStackLimits(low: *mut usize, high: *mut usize);
+    }
+    let mut low = 0usize;
+    let mut high = 0usize;
+    // SAFETY: plain out-pointer Win32 call on the current thread.
+    unsafe { GetCurrentThreadStackLimits(&mut low, &mut high) };
+    if low != 0 && high > low {
+        Some((low, high))
+    } else {
+        None
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn thread_stack_bounds() -> Option<(usize, usize)> {
+    // SAFETY: standard pthread attr query on the current thread; attr is
+    // initialized by pthread_getattr_np on success and destroyed after use.
+    unsafe {
+        let mut attr: libc::pthread_attr_t = std::mem::zeroed();
+        if libc::pthread_getattr_np(libc::pthread_self(), &mut attr) != 0 {
+            return None;
+        }
+        let mut addr: *mut libc::c_void = std::ptr::null_mut();
+        let mut size: libc::size_t = 0;
+        let rc = libc::pthread_attr_getstack(&mut attr, &mut addr, &mut size);
+        libc::pthread_attr_destroy(&mut attr);
+        if rc != 0 || addr.is_null() || size == 0 {
+            return None;
+        }
+        Some((addr as usize, addr as usize + size))
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn thread_stack_bounds() -> Option<(usize, usize)> {
+    // SAFETY: both are infallible pthread queries on the current thread.
+    unsafe {
+        let top = libc::pthread_get_stackaddr_np(libc::pthread_self()) as usize;
+        let size = libc::pthread_get_stacksize_np(libc::pthread_self());
+        if top == 0 || size == 0 {
+            return None;
+        }
+        Some((top - size, top))
+    }
+}
+
+#[cfg(not(any(windows, target_os = "linux", target_os = "macos")))]
+fn thread_stack_bounds() -> Option<(usize, usize)> {
+    None
+}
+
+/// Compute the guard floor for this thread: the lowest stack pointer at which
+/// a compiled self-recursive site may still CALL one level deeper.
+///
+/// The headroom below the floor must cover everything that can run once the
+/// guard trips: the `StackOverflowError` construction (class load + alloc),
+/// the compiled frames' unwind back through the sentinel checks, and any
+/// interpreter/exception-table routing above. 1 MiB is generous for all of
+/// those; it is clamped to a quarter of the stack (min 64 KiB) so small
+/// carrier stacks keep most of their space usable.
+#[cold]
+fn compute_self_call_stack_floor(sp_now: usize) -> usize {
+    const HEADROOM: usize = 1 << 20; // 1 MiB
+    match thread_stack_bounds() {
+        Some((low, high)) => {
+            let size = high - low;
+            let margin = HEADROOM.min(size / 4).max(64 * 1024);
+            low.saturating_add(margin)
+        }
+        // No OS query available: assume at least ~4 MiB of stack below the
+        // first observed SP (threads here default to 8 MiB). This still
+        // converts unbounded recursion into a catchable error well before
+        // a typical guard page.
+        None => sp_now.saturating_sub(4 << 20),
+    }
+}
+
+/// The self-call stack guard baked before every direct self-recursive CALL.
+/// Returns `0` (proceed) or the `i64::MIN` deopt sentinel with a catchable
+/// `java/lang/StackOverflowError` stashed in `JIT_PENDING_EXCEPTION`.
+///
+// SAFETY: called from JIT-compiled code; `vm_ptr` is the SharedVm pointer the
+// compiled frame received at entry (same contract as `jit_invoke_dispatch`).
+#[no_mangle]
+pub unsafe extern "C" fn jit_self_call_stack_guard(vm_ptr: i64) -> i64 {
+    // Rust<->JIT boundary — invalidate the per-thread JIT-scan cache (same
+    // single TLS bump `jit_get_current_thread` performs on the inline-TLAB
+    // fast path).
+    crate::jit::conservative_roots::note_jit_boundary();
+    let probe = 0u8;
+    let sp_now = &probe as *const u8 as usize;
+    let floor = JIT_SELF_CALL_STACK_FLOOR.with(|f| {
+        let v = f.get();
+        if v != usize::MAX {
+            v
+        } else {
+            let computed = compute_self_call_stack_floor(sp_now);
+            f.set(computed);
+            computed
+        }
+    });
+    if sp_now > floor {
+        return 0;
+    }
+    // SAFETY: vm_ptr originates from JIT code and points to the live SharedVm.
+    let vm = &*(vm_ptr as *const SharedVm);
+    let rc = raise_jit_stack_overflow(vm);
+    if crate::runtime::env_cache::dbg_jitc() {
+        eprintln!(
+            "[cratonvm-jitc] self-call stack guard TRIP sp={:#x} floor={:#x} pending={}",
+            sp_now,
+            floor,
+            jit_pending_exception_is_set(),
+        );
+    }
+    rc
+}
+
 /// spring-bug-10 watchpoint: arm a hardware data WRITE breakpoint (DR0) on the
 /// savebase frame slot at `addr` for the CURRENT thread, so the vectored
 /// exception handler can report the RIP that writes the corrupt `0xFFFF…FFFE`.
@@ -6171,6 +6340,9 @@ pub fn build_helpers() -> JitRuntimeHelpers {
         // IR `Op::Rem` Float/Double arms (operands in XMM0/XMM1, result XMM0).
         jit_frem: jit_frem as *const () as usize,
         jit_drem: jit_drem as *const () as usize,
+        // BUG-1 companion — native-stack headroom guard enabling direct
+        // (non-dispatch) self-recursive CALLs. See `jit_self_call_stack_guard`.
+        self_call_stack_guard: jit_self_call_stack_guard as *const () as usize,
     }
 }
 

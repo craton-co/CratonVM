@@ -628,12 +628,37 @@ impl TieredCompilationManager {
     /// Increments the counter and checks if compilation should be triggered.
     /// Returns the target tier if compilation was enqueued.
     pub fn on_method_invocation(&self, key: &MethodKey) -> Option<CompilationTier> {
+        self.on_method_invocation_observed(key, 0)
+    }
+
+    /// [`Self::on_method_invocation`], but fast-forwarded to an externally
+    /// observed invocation count.
+    ///
+    /// The interpreter counts every invocation in its own profile store but
+    /// consults the tiered manager only at stride boundaries (the
+    /// `JIT_RETRY_STRIDE = 64` schedule past the warmup threshold). With the
+    /// plain `+= 1` counting, the manager's view of "hotness" was therefore
+    /// 64x DEFLATED: a method needed `c1_threshold (200) × 64 ≈ 12,800` real
+    /// invocations past warmup before the manager recommended its first C1
+    /// compile (observed live: `tiered-enqueue … invoc_count=13236` for a
+    /// `CRATONVM_JIT_THRESHOLD=500` run). Passing the interpreter's real
+    /// per-method count lets the recommendation fire at the intended
+    /// thresholds. `observed_count == 0` (or a stale/smaller value) degrades
+    /// to the historical `+= 1` behaviour.
+    pub fn on_method_invocation_observed(
+        &self,
+        key: &MethodKey,
+        observed_count: u64,
+    ) -> Option<CompilationTier> {
         let mut methods = self.core.methods.lock();
         let state = methods
             .entry(key.clone())
             .or_insert_with(|| MethodState::new(key.clone()));
         state.invocation_count += 1;
         state.profile.profiled_invocations += 1;
+        if observed_count > state.invocation_count {
+            state.invocation_count = observed_count;
+        }
 
         if state.queued_for_compilation {
             return None;
@@ -1203,6 +1228,48 @@ mod tests {
         assert_eq!(p.osr_threshold, d.osr_threshold);
         assert_eq!(p.c2_min_invocations, d.c2_min_invocations);
         assert_eq!(p.tiered_enabled, d.tiered_enabled);
+    }
+
+    // ── observed-count fast-forward (stride-boundary deflation fix) ──────
+
+    #[test]
+    fn observed_count_fast_forwards_hotness() {
+        let mgr = TieredCompilationManager::with_default_policy();
+
+        // Plain counting: a single visit is far below c1_threshold → None.
+        let cold = test_key();
+        assert_eq!(mgr.on_method_invocation(&cold), None);
+
+        // Observed-count fast-forward: the interpreter has REALLY seen 5,000
+        // invocations of this method but only consults the manager at stride
+        // boundaries — the recommendation must fire on this single visit
+        // instead of after another c1_threshold visits (64x deflation).
+        let hot = test_key2();
+        let rec = mgr.on_method_invocation_observed(&hot, 5_000);
+        assert!(
+            rec.is_some(),
+            "observed=5000 must produce a tier recommendation on the first visit"
+        );
+
+        // A stale/smaller observed value never rewinds the counter.
+        let state_count = mgr
+            .method_states()
+            .into_iter()
+            .find(|(k, _, _)| *k == hot)
+            .map(|(_, _, c)| c)
+            .expect("state for hot key");
+        assert!(state_count >= 5_000);
+        let _ = mgr.on_method_invocation_observed(&hot, 3);
+        let state_count_after = mgr
+            .method_states()
+            .into_iter()
+            .find(|(k, _, _)| *k == hot)
+            .map(|(_, _, c)| c)
+            .expect("state for hot key");
+        assert!(
+            state_count_after > state_count.saturating_sub(1),
+            "smaller observed count must not rewind the counter"
+        );
     }
 
     // ── wire-tiered-manager Step 5: request_osr ──────────────────────────
