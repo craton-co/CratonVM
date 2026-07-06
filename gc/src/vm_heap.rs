@@ -1084,6 +1084,21 @@ impl VmHeap {
         }
     }
 
+    /// Amortized-O(1) probe: could a young TLAB refill of `size` bytes be
+    /// served from RECLAIMED young space right now? See
+    /// `GenerationalHeap::young_has_free_block` — early-exit scan behind the
+    /// cached largest-block upper bound, safe to consult per allocation.
+    /// Together with [`Self::young_bump_headroom`] this forms the JIT
+    /// TLAB-refill gate.
+    pub fn young_has_free_block(&self, size: usize) -> bool {
+        match self {
+            VmHeap::Generational(h) => h.young_has_free_block(size),
+            // G1 refills carve whole-region chunks from Eden; the reserve
+            // signal is the applicable "room without forcing a GC" answer.
+            VmHeap::G1(_) => !self.needs_gc(),
+        }
+    }
+
     /// Returns whether this heap is using the G1 collector.
     pub fn is_g1(&self) -> bool {
         matches!(self, VmHeap::G1(_))

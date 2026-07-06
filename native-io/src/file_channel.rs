@@ -527,7 +527,12 @@ fn transfer_via_copy_file_range(
                     }
                     return Ok(Some(transferred));
                 }
-                Some(libc::EAGAIN) | Some(libc::EWOULDBLOCK) => {
+                // Match-guard form rather than `EAGAIN | EWOULDBLOCK` patterns:
+                // on Linux the two constants are EQUAL, so the second or-pattern
+                // is an `unreachable_patterns` lint error under `-D warnings`
+                // (while other unixes keep them distinct — the guard covers both
+                // without tripping either build).
+                Some(e) if e == libc::EAGAIN || e == libc::EWOULDBLOCK => {
                     if transferred > 0 {
                         return Ok(Some(transferred));
                     }
@@ -627,7 +632,12 @@ fn transfer_via_sendfile(
         } else {
             let err = std::io::Error::last_os_error();
             match err.raw_os_error() {
-                Some(libc::EAGAIN) | Some(libc::EWOULDBLOCK) => {
+                // Match-guard form rather than `EAGAIN | EWOULDBLOCK` patterns:
+                // on Linux the two constants are EQUAL, so the second or-pattern
+                // is an `unreachable_patterns` lint error under `-D warnings`
+                // (while other unixes keep them distinct — the guard covers both
+                // without tripping either build).
+                Some(e) if e == libc::EAGAIN || e == libc::EWOULDBLOCK => {
                     if transferred > 0 {
                         return Ok(Some(transferred));
                     }

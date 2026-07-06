@@ -1692,6 +1692,49 @@ fn tlab_alloc_object(
     num_fields: usize,
     total_size: usize,
 ) -> Option<ObjectRef> {
+    tlab_alloc_object_inner(thread, shared, class_id, num_fields, total_size, false)
+}
+
+/// [`tlab_alloc_object`] for the JIT allocation slow path (`jit_new_object`):
+/// identical bump allocation, but the REFILL arm first asks — in O(1) —
+/// whether young can supply the chunk WITHOUT another GC (bump-tail headroom
+/// OR a coalesced reclaimed span via the cached-bound early-exit probe), and
+/// bails to the caller's old-gen spill when it cannot.
+///
+/// History (why the gate looks like this): the JIT slow path historically
+/// never refilled TLABs — once the inline bump's TLAB filled, EVERY
+/// allocation took the global slow chain. Round 1 (2026-07-06) tried the
+/// interpreter's unconditional refill: bt16 got 10x faster but bt18 (large
+/// LIVE young set under the non-moving sweep) collapsed 10.6s→463s; gating
+/// on `try_alloc_young_probe(requested)` still 39s (its
+/// `largest_free_block` fallback FULL-SCANNED the fragmented free list per
+/// allocation — 55% of wall); a bump-tail-only gate still ~119s. Round 2
+/// uses the machinery that did not exist then: `young_has_free_block`
+/// early-exits at the first satisfying span and fail-fasts through the
+/// cached `Arena::max_free_upper` bound, so a post-sweep+coalesce young (a
+/// handful of big spans) serves refills at bump speed, while a
+/// genuinely-full young answers `false` in O(1) → old-gen spill exactly
+/// like the historical no-refill behaviour.
+#[inline(always)]
+pub(crate) fn tlab_alloc_object_guarded_refill(
+    thread: &mut JvmThread,
+    shared: &SharedVm,
+    class_id: ClassId,
+    num_fields: usize,
+    total_size: usize,
+) -> Option<ObjectRef> {
+    tlab_alloc_object_inner(thread, shared, class_id, num_fields, total_size, true)
+}
+
+#[inline(always)]
+fn tlab_alloc_object_inner(
+    thread: &mut JvmThread,
+    shared: &SharedVm,
+    class_id: ClassId,
+    num_fields: usize,
+    total_size: usize,
+    refill_needs_young_room: bool,
+) -> Option<ObjectRef> {
     use std::sync::atomic::Ordering;
 
     // Fast path: bump-allocate from the current TLAB without taking
@@ -1734,6 +1777,18 @@ fn tlab_alloc_object(
         // somehow returns zero (pathological input).
         n.max(cratonvm_gc::tlab::min_tlab_size())
     };
+
+    // JIT slow path (`tlab_alloc_object_guarded_refill`): carve a fresh TLAB
+    // only when young can supply the chunk WITHOUT a GC — the O(1) bump-tail
+    // check, then the amortized-O(1) reclaimed-span probe. Otherwise bail to
+    // the caller's non-TLAB fallback (old-gen spill). See the wrapper doc
+    // for the failure modes this gate was shaped by.
+    if refill_needs_young_room
+        && !shared.heap.young_bump_headroom(requested)
+        && !shared.heap.young_has_free_block(requested)
+    {
+        return None;
+    }
 
     // Bug-D fix (TLAB tail-filler on refill, 2026-06-12): retire the OUTGOING
     // TLAB *before* replacing it. The fast path above returned `None` because
@@ -25823,7 +25878,14 @@ fn execute_jit_call(
     // `try_call`/`try_call_with_context`. JIT runtime invocation failures
     // (invalid code pointer / too-many-args) surface as
     // `MethodCallFailed::InternalError` instead of silent 0-returns.
-    let result = if !compiled.has_dispatch {
+    // PERF (JIT-entry drain consolidation): every return path below used to
+    // pay SIX separate thread-local accesses draining the out-of-band signal
+    // flags. Both arms now snapshot-and-clear the whole signal block in ONE
+    // TLS access (`take_all_jit_signals`) and the drains consume the local
+    // snapshot — semantics identical (everything was drained on every path
+    // anyway; that unconditional draining IS the Round-8..11 leak-fix
+    // discipline), minus the repeated TLS walks per call.
+    let (result, sig) = if !compiled.has_dispatch {
         // NEW-1.5 + T1.1.a: even on the fast path, a JIT call may
         // transitively trigger GC via a helper. Push the entry guard
         // so the root scanner can find spill slots in this frame;
@@ -25840,8 +25902,9 @@ fn execute_jit_call(
                 }
             }
         };
+        let sig = crate::jit::helpers::take_all_jit_signals();
         match fast_result {
-            Ok(v) => v,
+            Ok(v) => (v, sig),
             Err(jit_err) => {
                 return Err(MethodCallFailed::InternalError(VmError::Internal {
                     message: format!("JIT call failed: {jit_err}"),
@@ -25875,12 +25938,13 @@ fn execute_jit_call(
         // cannot spuriously swallow exceptions thrown outside their
         // protected region, while still allowing typed handlers to match
         // by exception class.
-        if let Some(exc) = crate::jit::helpers::take_jit_pending_exception() {
-            // The exception consumes the deopt — clear the out-of-band deopt
-            // signal (MEDIUM `i64::MIN`-collision fix) so it cannot leak to the
-            // next JIT call. The dispatch helper that stashed this exception
-            // also set the deopt flag before returning `i64::MIN`.
-            let _ = crate::jit::helpers::take_jit_deopt_pending();
+        let mut sig = crate::jit::helpers::take_all_jit_signals();
+        if let Some(exc) = sig.exception.take() {
+            // The exception consumes the deopt — the one-shot drain above
+            // already cleared the out-of-band deopt signal (MEDIUM
+            // `i64::MIN`-collision fix) so it cannot leak to the next JIT
+            // call. The dispatch helper that stashed this exception also set
+            // the deopt flag before returning `i64::MIN`.
             let exc_locals = jit_saved_args_to_values(cached, &saved_args, np);
             return route_jit_exception_through_method(
                 shared,
@@ -25893,7 +25957,7 @@ fn execute_jit_call(
             );
         }
         match jit_result {
-            Ok(Ok(v)) => v,
+            Ok(Ok(v)) => (v, sig),
             Ok(Err(jit_err)) => {
                 // task #44: try_call/try_call_with_context surface invalid
                 // code pointer / too-many-args as Err; propagate instead
@@ -25920,8 +25984,8 @@ fn execute_jit_call(
     // so it can never leak to the next JIT call; the `result == i64::MIN` arm
     // below consults `deopt_signaled` instead of overloading the value. (The
     // slow-path exception drain above already early-returned for the pending-
-    // exception case and clears the flag itself.)
-    let deopt_signaled = crate::jit::helpers::take_jit_deopt_pending();
+    // exception case; the one-shot drain cleared the flag.)
+    let deopt_signaled = sig.deopt;
 
     // Round-8 CRIT fix (NPE leak): drain the pending-NPE flag on EVERY
     // JIT return path, not only the `i64::MIN` deopt sentinel arm. A
@@ -25943,7 +26007,7 @@ fn execute_jit_call(
     // means the routing function skips catch-all (`finally`) entries
     // (which can't safely match without a known PC) but still matches
     // typed handlers by exception class.
-    if crate::jit::helpers::take_jit_pending_npe() {
+    if sig.npe {
         match crate::runtime::exceptions::throw_runtime_error(
             shared,
             thread,
@@ -25979,7 +26043,7 @@ fn execute_jit_call(
     // in-method `catch (ArrayIndexOutOfBoundsException ...)` actually
     // observes the throw. `usize::MAX` for `throw_pc` mirrors the NPE path
     // (skip catch-all `finally` entries, still match typed handlers).
-    if let Some((index, length)) = crate::jit::helpers::take_jit_pending_aioobe() {
+    if let Some((index, length)) = sig.aioobe {
         let msg = format!("Index {index} out of bounds for length {length}");
         match crate::runtime::exceptions::create_exception_object(
             shared,
@@ -26012,7 +26076,7 @@ fn execute_jit_call(
     // preceded the trap (the prior `uncommon_trap` behaviour, a HotSpot
     // divergence). `usize::MAX` throw_pc mirrors the NPE/AIOOBE blocks (match
     // typed handlers by class, skip catch-all `finally`).
-    if crate::jit::helpers::take_jit_pending_arithmetic() {
+    if sig.arithmetic {
         match crate::runtime::exceptions::throw_runtime_error(
             shared,
             thread,
@@ -26278,8 +26342,9 @@ fn execute_jit_call_decoded(
     let args_jit = &jit_args[..np];
     let vm_ptr = shared as *const _ as i64; // Cast: JIT ABI -- pointer to i64 register
 
-    // Run the compiled body. Mirrors execute_jit_call's run+exception logic.
-    let result = if !compiled.has_dispatch {
+    // Run the compiled body. Mirrors execute_jit_call's run+exception logic
+    // (including its one-shot signal drain — see the PERF note there).
+    let (result, sig) = if !compiled.has_dispatch {
         // SAFETY: compiled is a finalized JIT CompiledMethod with a validated entry; args match its JVM descriptor (receiver-aware).
         let fast_result: Result<i64, cratonvm_jit::CompileError> = {
             let _jit_root_guard =
@@ -26292,8 +26357,9 @@ fn execute_jit_call_decoded(
                 }
             }
         };
+        let sig = crate::jit::helpers::take_all_jit_signals();
         match fast_result {
-            Ok(v) => v,
+            Ok(v) => (v, sig),
             Err(jit_err) => {
                 return Err(MethodCallFailed::InternalError(VmError::Internal {
                     message: format!("JIT call failed: {jit_err}"),
@@ -26317,11 +26383,12 @@ fn execute_jit_call_decoded(
             }))
         };
         crate::jit::helpers::restore_jit_thread(saved_jit_thread);
-        if let Some(exc) = crate::jit::helpers::take_jit_pending_exception() {
-            // Clear the out-of-band deopt signal (MEDIUM `i64::MIN`-collision
-            // fix) so it cannot leak to the next JIT call — the exception
-            // consumes the deopt. Mirrors `execute_jit_call`.
-            let _ = crate::jit::helpers::take_jit_deopt_pending();
+        let mut sig = crate::jit::helpers::take_all_jit_signals();
+        if let Some(exc) = sig.exception.take() {
+            // The one-shot drain already cleared the out-of-band deopt signal
+            // (MEDIUM `i64::MIN`-collision fix) so it cannot leak to the next
+            // JIT call — the exception consumes the deopt. Mirrors
+            // `execute_jit_call`.
             return route_jit_exception_through_method(
                 shared,
                 thread,
@@ -26334,7 +26401,7 @@ fn execute_jit_call_decoded(
             .map(Some);
         }
         match jit_result {
-            Ok(Ok(v)) => v,
+            Ok(Ok(v)) => (v, sig),
             Ok(Err(jit_err)) => {
                 return Err(MethodCallFailed::InternalError(VmError::Internal {
                     message: format!("JIT call failed: {jit_err}"),
@@ -26346,14 +26413,14 @@ fn execute_jit_call_decoded(
         }
     };
 
-    // MEDIUM fix (i64::MIN deopt-sentinel collision): capture+clear the
-    // out-of-band deopt signal once, before the flag-consuming drains below.
-    // See the matching block in `execute_jit_call` for the full rationale.
-    let deopt_signaled = crate::jit::helpers::take_jit_deopt_pending();
+    // MEDIUM fix (i64::MIN deopt-sentinel collision): the one-shot drain
+    // above captured+cleared the out-of-band deopt signal. See the matching
+    // block in `execute_jit_call` for the full rationale.
+    let deopt_signaled = sig.deopt;
 
     // Drain pending NPE / AIOOBE set by void-return store helpers (same as
     // execute_jit_call) — route through the JIT'd method's exception table.
-    if crate::jit::helpers::take_jit_pending_npe() {
+    if sig.npe {
         match crate::runtime::exceptions::throw_runtime_error(
             shared,
             thread,
@@ -26374,7 +26441,7 @@ fn execute_jit_call_decoded(
             other => return Err(other),
         }
     }
-    if let Some((index, length)) = crate::jit::helpers::take_jit_pending_aioobe() {
+    if let Some((index, length)) = sig.aioobe {
         let msg = format!("Index {index} out of bounds for length {length}");
         match crate::runtime::exceptions::create_exception_object(
             shared,
@@ -26400,7 +26467,7 @@ fn execute_jit_call_decoded(
     // Divide-by-zero direct-throw drain (sibling of the AIOOBE block above; see
     // the matching block in `execute_jit_call`). Throw `ArithmeticException`
     // through the method's exception table instead of re-running from entry.
-    if crate::jit::helpers::take_jit_pending_arithmetic() {
+    if sig.arithmetic {
         match crate::runtime::exceptions::throw_runtime_error(
             shared,
             thread,
