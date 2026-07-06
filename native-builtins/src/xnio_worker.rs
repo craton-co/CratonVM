@@ -729,6 +729,29 @@ fn native_xnio_create_worker(ctx: &mut dyn NativeContext, _args: &[Value]) -> Me
     Ok(Some(Value::Object(Some(obj))))
 }
 
+// --- Xnio.build(XnioWorker$Builder) ---
+//
+// The modern (XNIO 3.8.x) builder-style worker factory:
+// `xnio.createWorkerBuilder().setWorkerName(...)...build()`, where
+// `XnioWorker.Builder.build()` (real bytecode) calls back into
+// `xnio.build(this)`. `Xnio.build` is declared `protected abstract` on
+// the real `org.xnio.Xnio` class; the singleton this VM hands back from
+// `getInstance()` (`alloc_xnio_mirror`, above) is stamped with the
+// abstract `Xnio` class itself (not a concrete subclass), so any real
+// dispatch of `build` legitimately has no Code attribute to find —
+// same shape as `createWorker` needing its own native rather than real
+// bytecode ever running. Same simplification as
+// `native_xnio_create_worker`: build a default worker and ignore the
+// `Builder`'s configured pool sizes/name for now.
+fn native_xnio_build_worker(ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
+    let xnio = Xnio::get_instance();
+    let worker = xnio.create_worker(OptionMap::default());
+    let worker_arc = worker.clone();
+    register_worker(worker_arc);
+    let obj = alloc_worker_mirror(ctx, CLS_XNIO_WORKER, &worker);
+    Ok(Some(Value::Object(Some(obj))))
+}
+
 // --- XnioWorker.getIoThread / getIoThreads ---
 
 fn native_worker_get_io_thread(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
@@ -875,6 +898,12 @@ pub fn register_xnio_worker_natives(r: &mut NativeMethodRegistry) {
         "createWorker",
         "(Lorg/xnio/OptionMap;)Lorg/xnio/XnioWorker;",
         native_xnio_create_worker,
+    );
+    r.register(
+        CLS_XNIO,
+        "build",
+        "(Lorg/xnio/XnioWorker$Builder;)Lorg/xnio/XnioWorker;",
+        native_xnio_build_worker,
     );
 
     r.register(
