@@ -22820,6 +22820,24 @@ fn try_osr(
     };
 
     crate::jit::helpers::restore_jit_thread(saved_jit_thread);
+
+    // FIX (OSR uncommon-trap fallthrough, HHH-15895 `InPredicateTest`):
+    // `jit_uncommon_trap` (used by, among others, the invokedynamic 0xba arm's
+    // unconditional deopt stub — see its `DeoptReason::UnreachedCode` doc
+    // comment) signals a deopt via `set_jit_deopt_pending()` alone; unlike the
+    // guard-based `x64_deopt_entry` / `ir_deopt_entry` trampolines, it does NOT
+    // stash a frame in `cratonvm_jit::deopt::LAST_DEOPT`. Drain the flag now,
+    // before the exception-specific drains below, so the `result_i64 ==
+    // i64::MIN` check further down can distinguish "a real uncommon-trap
+    // deopt with no reconstructed frame" from "a genuine `Long.MIN_VALUE`
+    // return". Without this, the former fell through to the return-value
+    // conversion, which for a reference-typed method reinterprets the raw
+    // `i64::MIN` sentinel bits as a heap pointer — observed as `values` (a
+    // live, non-empty `List` local read back null) in Hibernate's
+    // `InPredicateTest`, whose `getNames()`-style hot loop contains a live
+    // (non-dead-assert) invokedynamic string concatenation.
+    let deopt_signaled = crate::jit::helpers::take_jit_deopt_pending();
+
     // Round-9 vm CRIT fix (audit `round9-vm.md` CRIT-2): the previous OSR
     // exit drain *consumed* the pending-exception, pending-NPE, and
     // pending-AIOOBE flags with `let _ =` / `if let Some(_exc)` on the
@@ -23023,7 +23041,22 @@ fn try_osr(
             }
             return None;
         }
-        // No stashed deopt frame: a genuine `Long.MIN_VALUE` method result — fall
+        // No stashed deopt frame. If the uncommon-trap path signaled a deopt
+        // (`jit_uncommon_trap`'s `set_jit_deopt_pending`, e.g. `UnreachedCode`
+        // for a live invokedynamic — see the fix note above), this is NOT a
+        // genuine method result: safe-reject exactly like the stashed-frame
+        // case above, so the interpreter resumes THIS frame from where it
+        // was instead of reinterpreting the `i64::MIN` sentinel as a value.
+        if deopt_signaled {
+            if std::env::var_os("CRATONVM_DBG_DEOPT").is_some() {
+                eprintln!(
+                    "[cratonvm-deopt] OSR-exit bail rejected (uncommon trap, no frame) {}.{}{} entry_pc={}",
+                    &*class_name_arc, &*method_name_arc, &*descriptor_arc, entry_pc
+                );
+            }
+            return None;
+        }
+        // Otherwise this is a genuine `Long.MIN_VALUE` method result — fall
         // through to the normal return-value conversion below.
     }
 
