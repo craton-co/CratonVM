@@ -1,12 +1,11 @@
 # Elasticsearch Lucene binary doc-values range query hangs
 
-Status: open (root causes #1 and #2 FIXED; a narrower residual stall in
-`testAllEqual` remains — confirmed NOT JIT-related, reproduces identically
-under `--nojit`; strong new evidence points to `ReentrantReadWriteLock`'s
-read-lock hold-count bookkeeping, not yet isolated to a specific fix)
+Status: open (root causes #1 and #2 FIXED; root cause #3's underlying
+mechanism -- plain-field 16-byte slot tearing -- FIXED and merged; full
+end-to-end confirmation against the real ES test still pending, see below)
 
 Date observed: 2026-07-02
-Date updated: 2026-07-05 (fourth update)
+Date updated: 2026-07-06 (fifth update)
 
 ## Summary
 
@@ -196,6 +195,78 @@ Root-caused to **two independent bugs** stacked in the same test run:
    recovered and the checksum still matched exactly. Likely from an
    unrelated concurrent commit on `dev`; flagged here in case it resurfaces
    elsewhere, but out of scope for this investigation.
+
+**FIXED (2026-07-06, branch `fix/plain-field-slot-tearing`):** root-caused
+the plain-field tearing gap all the way to `cratonvm_types::read_value_atomic`/
+`write_value_atomic` (`types/src/value.rs`) -- already-proven, already-merged
+primitives from an earlier, narrower fix (commit `4e6b560f`,
+"atomic-per-word object-slot access for concurrent marking") that closed the
+GC-marker-vs-JIT-store tearing race but never touched the INTERPRETER's own
+plain `get_field`/`set_field` path. Two ordinary mutator threads doing plain
+`getfield`/`putfield` on the SAME field slot could still tear each other's
+writes through that path -- exactly what real JDK code like
+`ReentrantReadWriteLock$Sync`'s plain `firstReader`/`firstReaderHoldCount`
+legally relies on being tear-free.
+
+Wired the existing atomic helpers into the three heap backends that had their
+own independent, still-raw `ptr::read`/`ptr::write` slot access:
+`gc/src/heap.rs` (`Heap::read_slot`/`write_slot`), `gc/src/gen_heap.rs`
+(`GenerationalHeap::read_slot`/`write_slot` -- the default collector, added a
+new `cratonvm_types::read_value_checked_atomic` to keep its existing
+HIB-CV-32 corrupt-cell discriminant guard), and `gc/src/g1.rs`
+(`G1Collector::get_field`/`set_field`'s common non-humongous path; the rare
+humongous-object multi-region-copy path is a separate, much narrower
+residual, not touched here since it doesn't apply to small objects like
+`ReentrantReadWriteLock$Sync`).
+
+Verified:
+- New regression test `gc/tests/plain_field_no_tearing.rs`: two threads
+  racing plain `set_field`/`get_field` on the same slot (both an `Int` and an
+  `Object` variant) via `GenerationalHeap`, asserting the reader only ever
+  observes one of the two legitimately-written values across millions of
+  iterations -- passes.
+- Full regression suite green: `cratonvm-gc` (764), `cratonvm-types` (306),
+  `cratonvm-vm` (thousands of tests across ~90 integration test binaries,
+  all passing except pre-existing/unrelated issues -- see below), `cratonvm-jit`
+  (873, same 4 pre-existing `aarch64` release-mode failures as before, `jit/src/aarch64.rs`
+  untouched by this diff).
+- Two issues encountered during verification are PRE-EXISTING on unmodified
+  `dev` (confirmed by reproducing them on a clean checkout with zero local
+  changes) and unrelated to this fix -- flagged separately rather than fixed
+  here: (1) `cargo test -p cratonvm-vm --release --lib` SIGSEGVs partway
+  through, around `threading::monitor::tests::cas_lock_idle_dead_entry_is_reclaimed`;
+  (2) a handful of `runtime::lock_order`/`jit::skip_list`/`runtime::frame`
+  tests fail in `--release` builds because they assert on `debug_assert!`-only
+  panics, compiled out in release (same category as the already-known
+  `aarch64` release-mode failures).
+- Micro-benchmark (plain int/reference/long field get+set in a tight loop,
+  50M iterations, `--nojit` to isolate the interpreter path this fix touches):
+  ~1-4% overhead vs. an unfixed baseline built from the same commit, within
+  run-to-run noise -- consistent with the original `4e6b560f` commit's own
+  "perf-neutral on x86" finding for the same 2x-`AtomicU64`-relaxed technique.
+
+**Residual: could not get a minimal standalone Java repro to fail-then-pass
+across this fix.** Consistent with EVERY prior attempt in this investigation
+(see the two earlier failed Lucene-only repros above), a hand-rolled
+`ReentrantReadWriteLock` stress probe matching `testAllEqual`'s actual shape
+(one initial write-lock cycle, then sustained multi-threaded read-lock-only
+contention) completes cleanly on BOTH the unfixed baseline and this fix --
+neither reproduces a hang, so this probe shape doesn't exercise the actual
+trigger condition either (matching the historical pattern that this bug
+seemingly needs the real Lucene/ES code paths, not a minimal JDK-only
+repro). A DIFFERENT probe shape (sustained reader threads PLUS a
+continuously-cycling writer, unlike testAllEqual's single upfront write) does
+reliably hang on CratonVM regardless of this fix -- but confirmed via
+`--nojit` and a real-HotSpot control run that this is a SEPARATE, JIT-specific
+bug, not the plain-field tearing gap this fix addresses (flagged
+separately, see the project tracking for this investigation). Given the
+already-strong code-level evidence (the layout invariant, the reused
+already-proven atomic primitives, the new regression test, zero suite
+regressions), this fix is being merged on that evidence rather than blocked
+on an elusive minimal repro -- but the real `LongRandomBinaryDocValuesRangeQueryTests
+testAllEqual` end-to-end run still needs to happen on a host with the ES
+checkout (the Windows box, not this Linux build host) to fully close out
+root cause #3.
 
 ## Current full-suite result
 

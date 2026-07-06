@@ -8286,20 +8286,24 @@ unsafe fn read_slot(ptr: *mut u8) -> Value {
     // for a primitive slot) plus a rate-limited diagnostic, turning an
     // unrecoverable crash into a localizable one. The fast path is one aligned
     // 32-bit load + a predictable compare on top of the read already happening.
-    match cratonvm_types::read_value_checked(ptr as *const Value) {
+    match cratonvm_types::read_value_checked_atomic(ptr as *const Value) {
         Some(v) => v,
         None => {
             static CORRUPT_HITS: std::sync::atomic::AtomicU64 =
                 std::sync::atomic::AtomicU64::new(0);
             let n = CORRUPT_HITS.fetch_add(1, Ordering::Relaxed);
             if n < 32 || std::env::var_os("CRATONVM_DIAG_HIB32").is_some() {
-                // SAFETY: `ptr` is a readable 16-byte slot (caller contract).
-                let raw = std::ptr::read(ptr as *const [u64; 2]);
+                // SAFETY: `ptr` is a readable, 8-byte-aligned 16-byte slot
+                // (caller contract) -- read atomically (PLAIN-SLOT TEARING
+                // FIX, 2026-07-06) so this diagnostic dump itself can't tear
+                // against a concurrent plain writer on another thread.
+                let raw0 = (*(ptr as *const AtomicU64)).load(Ordering::Relaxed);
+                let raw1 = (*(ptr.add(8) as *const AtomicU64)).load(Ordering::Relaxed);
                 tracing::error!(
                     target: "cratonvm::gc::guard",
                     slot = ?ptr,
-                    raw0 = format!("{:#018x}", raw[0]),
-                    raw1 = format!("{:#018x}", raw[1]),
+                    raw0 = format!("{:#018x}", raw0),
+                    raw1 = format!("{:#018x}", raw1),
                     "gen_heap::read_slot: corrupt Value cell (out-of-range \
                      discriminant) — returning null instead of a UB-on-match \
                      Value. Heap reference-integrity defect (see HIB-CV-32).",
@@ -8321,7 +8325,12 @@ unsafe fn read_slot(ptr: *mut u8) -> Value {
 unsafe fn write_slot(ptr: *mut u8, value: Value) {
     // gcstress face-1 hunt (no-op unless CRATONVM_DBG_WATCH_CELL is set).
     crate::heap::cell_watch_check(ptr as usize, 16, "write_slot", &value);
-    std::ptr::write(ptr as *mut Value, value);
+    // PLAIN-SLOT TEARING FIX (2026-07-06): was a bare `ptr::write::<Value>`,
+    // a non-atomic 16-byte copy that could tear against a concurrent plain
+    // `get_field` from another mutator thread -- see
+    // docs/known-issues/elasticsearch-lucene-binary-docvalues-range-hangs.md
+    // #3 and commit 4e6b560f (the GC-marker-vs-JIT-store counterpart fix).
+    cratonvm_types::write_value_atomic(ptr as *mut Value, value);
 }
 
 // ---------------------------------------------------------------------------
