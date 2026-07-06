@@ -6104,8 +6104,15 @@ impl GarbageCollector for G1Collector {
 
         // SAFETY: `index < num_slots` (checked above) so the slot lies within
         // the object's allocated, single-region backing store.
+        //
+        // PLAIN-SLOT TEARING FIX (2026-07-06): was a bare `ptr::read::<Value>`,
+        // a non-atomic 16-byte copy that could tear against a concurrent
+        // plain `set_field` from another mutator thread -- see
+        // docs/known-issues/elasticsearch-lucene-binary-docvalues-range-hangs.md
+        // #3 and commit 4e6b560f (the GC-marker-vs-JIT-store counterpart fix,
+        // which covered g1::scan_object_refs but not this mutator-side path).
         let ptr = unsafe { obj.as_ptr().add(HEADER_SIZE + payload_off) };
-        unsafe { std::ptr::read(ptr as *const Value) }
+        unsafe { cratonvm_types::read_value_atomic(ptr as *const Value) }
     }
 
     fn set_field(&self, obj: ObjectRef, index: usize, value: Value) {
@@ -6176,9 +6183,13 @@ impl GarbageCollector for G1Collector {
             } else {
                 // SAFETY: `index < num_slots`, so the slot is in-bounds of the
                 // object's single-region backing store.
+                //
+                // PLAIN-SLOT TEARING FIX (2026-07-06): was a bare
+                // `ptr::write::<Value>` -- see the matching note on
+                // `get_field`'s read side above.
                 let ptr = unsafe { obj.as_ptr().add(HEADER_SIZE + payload_off) };
                 unsafe {
-                    std::ptr::write(ptr as *mut Value, value);
+                    cratonvm_types::write_value_atomic(ptr as *mut Value, value);
                 }
                 true
             }

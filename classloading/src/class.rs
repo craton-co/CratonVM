@@ -1665,6 +1665,113 @@ mod tests {
         assert!(find_method_recursive(foo_id, "bar", "()V", &store).is_none());
     }
 
+    /// Regression test for the Infinispan `GlobalConfiguration` /
+    /// `GlobalConfigurationBuilder` `isClustered()` `NoSuchMethodError` bug
+    /// (docs/known-issues/keycloak-model-infinispan-globalconfiguration-isclustered-nosuchmethod.md).
+    ///
+    /// Two closely-named, UNRELATED classes (no inheritance between them,
+    /// both extend plain `Object` — mirroring the real
+    /// `org.infinispan.configuration.global.GlobalConfiguration` /
+    /// `GlobalConfigurationBuilder` pair, which are siblings in the same
+    /// package with overlapping names but no subclass relationship). Only
+    /// `WidgetConfig` (standing in for `GlobalConfiguration`) declares
+    /// `isClustered()Z`; `WidgetConfigBuilder` (standing in for
+    /// `GlobalConfigurationBuilder`) does not.
+    ///
+    /// The actual root cause of the bug was NOT in `find_method_recursive` —
+    /// it was a native `build()` override that returned the receiver
+    /// (`WidgetConfigBuilder`) itself instead of constructing a genuinely
+    /// distinct `WidgetConfig`, so runtime dispatch correctly-but-confusingly
+    /// resolved `isClustered()` against the Builder's (real) class identity
+    /// and threw NoSuchMethodError naming the Builder. This test pins the
+    /// class-resolution invariant that guards against a REGRESSION in the
+    /// other direction: `find_method_recursive` must resolve `isClustered()`
+    /// on the class that actually declares it and must NEVER silently
+    /// satisfy the lookup from the similarly-named sibling class, however the
+    /// receiver's class_id was obtained.
+    #[test]
+    fn find_method_recursive_does_not_confuse_similarly_named_sibling_classes() {
+        let mut store = ClassStore::new();
+
+        let object_id = store.next_id();
+        store.add(make_class(
+            object_id,
+            "java/lang/Object",
+            None,
+            vec![],
+            vec![],
+            vec![make_method("toString", "()Ljava/lang/String;")],
+            0,
+            0,
+        ));
+
+        // WidgetConfigBuilder — mirrors GlobalConfigurationBuilder: siblings
+        // with WidgetConfig (same package, overlapping name prefix), NOT its
+        // superclass or subclass. Deliberately does NOT declare isClustered().
+        let builder_id = store.next_id();
+        store.add(make_class(
+            builder_id,
+            "com/example/config/WidgetConfigBuilder",
+            Some(object_id),
+            vec![],
+            vec![],
+            vec![make_method(
+                "build",
+                "()Lcom/example/config/WidgetConfig;",
+            )],
+            0,
+            0,
+        ));
+
+        // WidgetConfig — mirrors GlobalConfiguration. Only this class
+        // declares isClustered().
+        let config_id = store.next_id();
+        store.add(make_class(
+            config_id,
+            "com/example/config/WidgetConfig",
+            Some(object_id),
+            vec![],
+            vec![],
+            vec![make_method("isClustered", "()Z")],
+            0,
+            0,
+        ));
+
+        // Resolving isClustered() on the class that actually declares it
+        // (WidgetConfig) must succeed and must be attributed to WidgetConfig.
+        let (method, declaring) =
+            find_method_recursive(config_id, "isClustered", "()Z", &store)
+                .expect("isClustered() must resolve on WidgetConfig, the declaring class");
+        assert_eq!(&*method.name, "isClustered");
+        assert_eq!(declaring, config_id);
+
+        // The similarly-named sibling (WidgetConfigBuilder) genuinely lacks
+        // isClustered() — resolving it there must fail (a real
+        // NoSuchMethodError), never silently succeed by picking up
+        // WidgetConfig's method.
+        assert!(find_method_recursive(builder_id, "isClustered", "()Z", &store).is_none());
+
+        // Sanity: build() is where WidgetConfigBuilder and WidgetConfig
+        // actually connect in real Infinispan bytecode. It resolves on the
+        // Builder and is absent from WidgetConfig.
+        let (method, declaring) = find_method_recursive(
+            builder_id,
+            "build",
+            "()Lcom/example/config/WidgetConfig;",
+            &store,
+        )
+        .expect("build() must resolve on WidgetConfigBuilder");
+        assert_eq!(&*method.name, "build");
+        assert_eq!(declaring, builder_id);
+        assert!(find_method_recursive(
+            config_id,
+            "build",
+            "()Lcom/example/config/WidgetConfig;",
+            &store
+        )
+        .is_none());
+    }
+
     #[test]
     fn class_display() {
         let class = make_class(

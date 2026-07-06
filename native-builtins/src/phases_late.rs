@@ -21139,6 +21139,24 @@ pub(crate) fn register_synthetic_stream_spliterators(r: &mut NativeMethodRegistr
         "()Ljava/util/Spliterator;",
         p_obj_stream_spliterator,
     );
+    r.register(
+        "java/util/stream/IntStream",
+        "iterator",
+        "()Ljava/util/PrimitiveIterator$OfInt;",
+        p_int_stream_iterator,
+    );
+    r.register(
+        "java/util/stream/LongStream",
+        "iterator",
+        "()Ljava/util/PrimitiveIterator$OfLong;",
+        p_long_stream_iterator,
+    );
+    r.register(
+        "java/util/stream/DoubleStream",
+        "iterator",
+        "()Ljava/util/PrimitiveIterator$OfDouble;",
+        p_double_stream_iterator,
+    );
     r.set_category(__prev);
 }
 
@@ -21281,6 +21299,115 @@ pub(crate) fn p_obj_stream_spliterator(
             Value::Int(n as i32),
             Value::Int(0),
         ],
+    )
+}
+
+/// `{Int,Long,Double}Stream.iterator()` on a SYNTHETIC stream object (slot 0 =
+/// element array). Same "no Code attribute" family as `spliterator()` above —
+/// the receiver is stamped with the bare `java/util/stream/*Stream` interface,
+/// so `iterator()` (declared on `BaseStream`, no override) dispatches to the
+/// abstract interface method → AbstractMethodError. Build a real primitive
+/// array and delegate to `java.util.Arrays.stream(...)`, which returns a
+/// genuine, bytecode-backed JDK stream implementation; calling `iterator()` on
+/// THAT object is a normal virtual/interface dispatch that resolves to the
+/// real JDK's own Code-attributed method (not this native), so there is no
+/// re-entrancy risk.
+pub(crate) fn p_int_stream_iterator(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    let this = obj_arg(args, 0)?;
+    let elems = p56_read_stream_elems(ctx, this);
+    let n = elems.len();
+    let arr = ctx.new_array(cratonvm_types::ArrayElementType::Int, n);
+    for (i, v) in elems.into_iter().enumerate() {
+        let iv = match v {
+            Value::Int(x) => Value::Int(x),
+            Value::Object(Some(o)) => ctx.get_field(o, 0),
+            _ => Value::Int(0),
+        };
+        ctx.set_array_element(arr, i, iv);
+    }
+    let real_stream = ctx.invoke(
+        "java/util/Arrays",
+        "stream",
+        "([I)Ljava/util/stream/IntStream;",
+        &[Value::Object(Some(arr))],
+    )?;
+    let Some(real_stream) = real_stream else {
+        return Ok(None);
+    };
+    ctx.invoke(
+        "java/util/stream/IntStream",
+        "iterator",
+        "()Ljava/util/PrimitiveIterator$OfInt;",
+        &[real_stream],
+    )
+}
+
+pub(crate) fn p_long_stream_iterator(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    let this = obj_arg(args, 0)?;
+    let elems = p56_read_stream_elems(ctx, this);
+    let n = elems.len();
+    let arr = ctx.new_array(cratonvm_types::ArrayElementType::Long, n);
+    for (i, v) in elems.into_iter().enumerate() {
+        let lv = match v {
+            Value::Long(x) => Value::Long(x),
+            Value::Object(Some(o)) => ctx.get_field(o, 0),
+            _ => Value::Long(0),
+        };
+        ctx.set_array_element(arr, i, lv);
+    }
+    let real_stream = ctx.invoke(
+        "java/util/Arrays",
+        "stream",
+        "([J)Ljava/util/stream/LongStream;",
+        &[Value::Object(Some(arr))],
+    )?;
+    let Some(real_stream) = real_stream else {
+        return Ok(None);
+    };
+    ctx.invoke(
+        "java/util/stream/LongStream",
+        "iterator",
+        "()Ljava/util/PrimitiveIterator$OfLong;",
+        &[real_stream],
+    )
+}
+
+pub(crate) fn p_double_stream_iterator(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    let this = obj_arg(args, 0)?;
+    let elems = p56_read_stream_elems(ctx, this);
+    let n = elems.len();
+    let arr = ctx.new_array(cratonvm_types::ArrayElementType::Double, n);
+    for (i, v) in elems.into_iter().enumerate() {
+        let dv = match v {
+            Value::Double(x) => Value::Double(x),
+            Value::Object(Some(o)) => ctx.get_field(o, 0),
+            _ => Value::Double(0.0),
+        };
+        ctx.set_array_element(arr, i, dv);
+    }
+    let real_stream = ctx.invoke(
+        "java/util/Arrays",
+        "stream",
+        "([D)Ljava/util/stream/DoubleStream;",
+        &[Value::Object(Some(arr))],
+    )?;
+    let Some(real_stream) = real_stream else {
+        return Ok(None);
+    };
+    ctx.invoke(
+        "java/util/stream/DoubleStream",
+        "iterator",
+        "()Ljava/util/PrimitiveIterator$OfDouble;",
+        &[real_stream],
     )
 }
 
