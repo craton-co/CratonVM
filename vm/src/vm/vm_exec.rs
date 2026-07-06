@@ -11895,9 +11895,21 @@ fn invoke_on_class_shared_inner(
                             && matches!(method_name, "onApplicationEvent" | "destroy"))
                         // wildfly: jboss module-loader short-circuits.
                         || (class_name == "org/jboss/modules/Module"
-                            && matches!(method_name, "loadClass" | "getClassLoader"))
+                            && matches!(method_name, "loadClass" | "getClassLoader" | "loadService"))
+                        // ModuleClassLoader.getResources/findResources: real bytecode
+                        // reads internal ResourceLoader state our synthetic
+                        // ModuleClassLoader never populates (constructed via
+                        // alloc_concurrent_synthetic, bypassing the real constructor),
+                        // so it silently returns an empty Enumeration instead of the
+                        // module's own META-INF/services entries. This makes
+                        // ServiceLoader.load(...) via Module.loadService/loadServices
+                        // find zero providers for real WildFly extension modules
+                        // (e.g. org.jboss.as.jmx's Extension provider), surfacing as
+                        // "Failed to load module" further up the call stack. Force the
+                        // registered natives that walk the module's resolved resource
+                        // roots directly.
                         || (class_name == "org/jboss/modules/ModuleClassLoader"
-                            && method_name == "findClass")
+                            && matches!(method_name, "findClass" | "getResources" | "findResources" | "getResource" | "findResource"))
                         || (class_name == "org/jboss/modules/PathFilter"
                             && method_name == "accept")
                         || (class_name == "org/jboss/modules/Resource"
