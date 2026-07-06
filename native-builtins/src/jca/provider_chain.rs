@@ -788,6 +788,40 @@ fn provider_properties() -> &'static parking_lot::Mutex<FxHashMap<(String, Strin
     MAP.get_or_init(|| parking_lot::Mutex::new(FxHashMap::default()))
 }
 
+/// Per-INSTANCE raw keys a `Provider` object has itself `put`/`putService`d,
+/// keyed `(identity_hash_of_receiver, exact_put_key) → ()`. `identity_hash_code`
+/// is GC-move-stable (header word seeded on first read — see
+/// `native-collections/src/identity_hash.rs` and `System.identityHashCode`'s
+/// native), unlike a raw `ObjectRef`/pointer, so this table stays correct
+/// across a moving-GC relocation of the receiver.
+///
+/// Why this exists alongside the name-keyed `provider_properties()` table:
+/// that table is intentionally shared across every `Provider` object with the
+/// same name, because `Security.getProvider(name)` hands back a *fresh*
+/// synthetic object on every call (`make_provider` above) and property reads
+/// (`getProperty`/aliases) need to see what any same-named instance wrote.
+/// But real providers that are constructed directly by Java code (never
+/// routed through `Security.addProvider`) — e.g. BouncyCastle's own
+/// `BCJcaJceHelper` internally does `new BouncyCastleProvider()` on top of
+/// whatever instance the caller already cached elsewhere — are genuinely
+/// separate objects with independent `legacyMap`/`serviceMap` state on real
+/// HotSpot. `BouncyCastleProvider.addAlgorithm` calls `containsKey(key)`
+/// *before* registering each algorithm and throws `IllegalStateException:
+/// duplicate provider key` if it's already present — real JDK never trips
+/// this for a second `new BouncyCastleProvider()` because its per-instance
+/// map starts empty, but our shared-by-name table did, spuriously (see
+/// `provider_put_service_native` doc comment for the concrete repro this
+/// fixed). Scoping `containsKey`'s view to the receiver's own identity hash
+/// restores per-instance isolation while leaving the name-keyed table (and
+/// every other consumer of it) untouched.
+fn provider_instance_keys() -> &'static parking_lot::Mutex<std::collections::HashSet<(i64, String)>>
+{
+    use std::sync::OnceLock;
+    static SET: OnceLock<parking_lot::Mutex<std::collections::HashSet<(i64, String)>>> =
+        OnceLock::new();
+    SET.get_or_init(|| parking_lot::Mutex::new(std::collections::HashSet::new()))
+}
+
 /// Engine type normalisation: ASCII uppercase, no leading/trailing dots.
 /// JDK's `Provider$ServiceKey` uses case-insensitive comparison for both
 /// type and algorithm.
@@ -1312,6 +1346,10 @@ fn provider_put_native(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCal
     provider_properties()
         .lock()
         .insert((provider_name.clone(), key.clone()), value.clone());
+    let ihash = ctx.identity_hash_code(this) as i64;
+    provider_instance_keys()
+        .lock()
+        .insert((ihash, key.clone()));
     apply_legacy_put(&provider_name, &key, &value);
     // Hashtable.put contract: return previous value (null on first put).
     Ok(Some(Value::Object(None)))
@@ -1343,7 +1381,69 @@ fn provider_parse_legacy_put_native(
     provider_properties()
         .lock()
         .insert((provider_name.clone(), name.clone()), value.clone());
+    let ihash = ctx.identity_hash_code(this) as i64;
+    provider_instance_keys()
+        .lock()
+        .insert((ihash, name.clone()));
     apply_legacy_put(&provider_name, &name, &value);
+    Ok(None)
+}
+
+/// `java.security.Provider.putService(Provider$Service)` native.
+///
+/// Modern providers (BouncyCastle's `Mappings.configure()` chain among
+/// them — see e.g. `GOST3411$Mappings`) register services by
+/// constructing a real `Provider.Service` object and calling this
+/// method directly, bypassing the legacy `put`/`parseLegacyPut(String,
+/// String)` surface entirely. Before this native existed, the call fell
+/// through to real inherited `Provider.putService` bytecode, which
+/// reads/writes the real `legacyMap`/`serviceMap` fields — but those are
+/// never initialized on our synthetic `Provider` instances (the real
+/// `Provider` constructor never runs for them; see `seed_sunec_services`
+/// doc comment above for the same observation re: SunEC). Operating on
+/// those uninitialized maps made the real bytecode's own duplicate-key
+/// bookkeeping misfire on ordinary re-registration, throwing
+/// `IllegalStateException: duplicate provider key (...) found` wrapped
+/// in an `InternalError` — even though the exact same provider code
+/// runs fine on real HotSpot, whose `Provider` maps are properly
+/// constructed.
+///
+/// Fix: read the `Service`'s `type`/`algorithm`/`className` fields
+/// directly and route them through the same `put_service` side-table
+/// `put`/`parseLegacyPut` already use — which is a plain `HashMap`
+/// `insert` (last-write-wins, never throws on a duplicate key), matching
+/// real `Provider.putService`'s actual observable behaviour (replacing
+/// any previous registration for the same provider/type/algorithm).
+fn provider_put_service_native(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = obj_arg(args, 0)?;
+    let service = match args.get(1) {
+        Some(Value::Object(Some(s))) => *s,
+        _ => return Ok(None),
+    };
+    let read_str_field = |ctx: &mut dyn NativeContext, field: &str| -> String {
+        match ctx.get_field_by_name(service, field) {
+            Value::Object(Some(s)) => ctx.read_string(s).unwrap_or_default(),
+            _ => String::new(),
+        }
+    };
+    let type_str = read_str_field(ctx, "type");
+    let algorithm = read_str_field(ctx, "algorithm");
+    let class_name = read_str_field(ctx, "className");
+    if type_str.is_empty() || algorithm.is_empty() {
+        // Malformed/partial Service — nothing sensible to register.
+        return Ok(None);
+    }
+    let provider_name = provider_name_of(ctx, this);
+    put_service(&provider_name, &type_str, &algorithm, &class_name);
+    // Mirror the legacy `put` path's raw-property bookkeeping so
+    // `getProperty`/`containsKey` on the equivalent legacy key also see
+    // this registration (some providers query back via either surface).
+    let legacy_key = format!("{type_str}.{algorithm}");
+    provider_properties()
+        .lock()
+        .insert((provider_name, legacy_key.clone()), class_name);
+    let ihash = ctx.identity_hash_code(this) as i64;
+    provider_instance_keys().lock().insert((ihash, legacy_key));
     Ok(None)
 }
 
@@ -1374,14 +1474,28 @@ fn provider_get_property(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
 /// primary provider keys this way before registering aliases. Our `put` native
 /// records raw properties in a side table instead of the inherited Hashtable, so
 /// the inherited bytecode would falsely report "missing" for keys just put.
+///
+/// Scoped to the RECEIVER's own identity hash (`provider_instance_keys()`),
+/// not the shared by-name `provider_properties()` table. `addAlgorithm`
+/// (BouncyCastle's `ConfigurableProvider` implementation) calls
+/// `containsKey(key)` first and throws `IllegalStateException: duplicate
+/// provider key` if it's already true — real HotSpot never trips this for a
+/// second, independent `new BouncyCastleProvider()` because each instance's
+/// backing map starts empty. Reading the name-shared table here would make
+/// one BC instance's registrations spuriously "poison" every other
+/// same-named instance's `addAlgorithm` calls, which is exactly what
+/// happened when `JcaX509CertificateConverter`'s internal `BCJcaJceHelper`
+/// constructs its own separate `BouncyCastleProvider` on top of one already
+/// cached elsewhere (see `ServerHttpsRequestIntegrationTests`'s self-signed
+/// cert generation path, which does exactly this).
 fn provider_contains_key(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = obj_arg(args, 0)?;
     let key = match args.get(1) {
         Some(Value::Object(Some(s))) => ctx.read_string(*s).unwrap_or_default(),
         _ => return Ok(Some(Value::Int(0))),
     };
-    let pname = provider_name_of(ctx, this);
-    let found = provider_properties().lock().contains_key(&(pname, key));
+    let ihash = ctx.identity_hash_code(this) as i64;
+    let found = provider_instance_keys().lock().contains(&(ihash, key));
     Ok(Some(Value::Int(if found { 1 } else { 0 })))
 }
 
@@ -2003,6 +2117,21 @@ pub(crate) fn register(r: &mut NativeMethodRegistry) {
         "parseLegacyPut",
         "(Ljava/lang/String;Ljava/lang/String;)V",
         provider_parse_legacy_put_native,
+    );
+    // `putService(Provider$Service)` — the modern registration surface some
+    // providers (e.g. BouncyCastle's `*$Mappings.configure()`, including the
+    // GOST3411 digest that originally surfaced this gap) call directly
+    // instead of going through `put`/`parseLegacyPut`. Without this native,
+    // the call falls through to real inherited bytecode operating on the
+    // never-initialized `legacyMap`/`serviceMap` fields of our synthetic
+    // `Provider` instances, which spuriously throws `IllegalStateException:
+    // duplicate provider key` on ordinary re-registration (see doc comment
+    // on `provider_put_service_native` above).
+    r.register(
+        prov,
+        "putService",
+        "(Ljava/security/Provider$Service;)V",
+        provider_put_service_native,
     );
     r.register(
         prov,
