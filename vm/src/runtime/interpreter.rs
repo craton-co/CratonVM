@@ -4401,8 +4401,14 @@ pub fn execute(
                                 .map(|m| m.is_static())
                         })
                         .unwrap_or(false);
+                    // Also seed under `deopt_real_enabled()` — see the matching
+                    // comment at the hot-path `jit::try_compile` seed site
+                    // (jit/src/lib.rs) for why an unseeded mask makes every
+                    // deopt at this compile silently double-execute side
+                    // effects via the whole-method re-run fallback.
                     let param_oop_mask = if crate::jit::x64::precise_jit_maps_enabled()
                         || crate::jit::x64::moving_young_enabled()
+                        || cratonvm_jit::deopt_real_enabled()
                     {
                         crate::jit::compute_param_oop_mask(method_descriptor, early_is_static)
                     } else {
@@ -19359,6 +19365,38 @@ fn force_native_over_real_jdk_bytecode(
         return true;
     }
 
+    // `Module.loadService(Class)` (the instance method, distinct from the
+    // static bridge above) walks `getClass().getModule().addUses(...)` in
+    // real jboss-modules bytecode before ever reading `moduleClassLoader` —
+    // a JDK-module-system bookkeeping call CratonVM's permissive module
+    // model doesn't need. Force the native reimplementation that skips
+    // straight to `ServiceLoader.load(serviceType, moduleClassLoader)`.
+    if class_name == "org/jboss/modules/Module"
+        && method_name == "loadService"
+        && method_descriptor == "(Ljava/lang/Class;)Ljava/util/ServiceLoader;"
+    {
+        return true;
+    }
+
+    // `ModuleClassLoader.getResources`/`findResources` (and the singular
+    // `getResource`/`findResource`): our synthetic ModuleClassLoader
+    // instances are allocated via `alloc_concurrent_synthetic`, bypassing
+    // the real constructor, so real bytecode's internal `ResourceLoader`
+    // state is never populated and these methods silently return empty
+    // results instead of the module's own resources (notably
+    // `META-INF/services/*`, which `ServiceLoader.load` needs — e.g. WildFly
+    // extension modules like `org.jboss.as.jmx` register their `Extension`
+    // provider there). Force the registered natives that walk the module's
+    // resolved resource roots directly instead.
+    if class_name == "org/jboss/modules/ModuleClassLoader"
+        && matches!(
+            method_name,
+            "findClass" | "getResources" | "findResources" | "getResource" | "findResource"
+        )
+    {
+        return true;
+    }
+
     // Spring RSocket async setup can encode data and metadata strings on two
     // Reactor workers at the same time. The real `CharSequenceEncoder` lazily
     // computes a charset capacity through a per-instance cache; under CratonVM
@@ -22549,8 +22587,14 @@ fn compile_osr_artifact(
             // Seed it via `compile_with_param_slots` (legacy `&[]`/`0` slot layout,
             // unchanged) so the reload covers oop params too. Gate on the precise-
             // maps flag so the gate-off path stays byte-identical (mask = 0).
+            // Also seed under `deopt_real_enabled()` — see the matching
+            // comment at the hot-path `jit::try_compile` seed site
+            // (jit/src/lib.rs) for why an unseeded mask makes every deopt at
+            // this compile silently double-execute side effects via the
+            // whole-method re-run fallback.
             let param_oop_mask = if crate::jit::x64::precise_jit_maps_enabled()
                 || crate::jit::x64::moving_young_enabled()
+                || cratonvm_jit::deopt_real_enabled()
             {
                 crate::jit::compute_param_oop_mask(&method_descriptor, osr_method_is_static)
             } else {

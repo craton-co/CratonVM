@@ -4860,7 +4860,24 @@ fn native_map_get(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResu
     // S111r27: Use layout-aware helpers so that JDK-created nodes
     // (hash=0, key=1, value=2, next=3) are handled correctly alongside
     // legacy-created nodes (key=0, value=1, hash=2, next=3).
+    //
+    // Chain-walk cycle guard: mirrors native_map_put's CHAIN_WALK_LIMIT.
+    // Without this, a corrupted (cyclic) bucket chain spins this native
+    // call forever with no way to recover or diagnose.
+    const CHAIN_WALK_LIMIT: usize = 4096;
+    let mut walk_count: usize = 0;
     while let Value::Object(Some(node)) = node_val {
+        walk_count += 1;
+        if walk_count > CHAIN_WALK_LIMIT {
+            eprintln!(
+                "[HM-GET-GUARD] aborting chain walk at {} nodes (suspected cycle); map={:?} idx={} cap={}",
+                walk_count, this, idx, cap
+            );
+            return Err(cratonvm_types::error::RuntimeError::IllegalStateException {
+                message: "hashmap chain exceeded safety cap; possible corruption".to_string(),
+            }
+            .into());
+        }
         let node_key_field = get_node_key(ctx, node);
         if is_null_key {
             if matches!(node_key_field, Value::Object(None)) {
@@ -4970,11 +4987,33 @@ fn native_map_remove(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallR
             return Ok(Some(old_value));
         }
 
-        // Walk chain
+        // Walk chain.
+        //
+        // Chain-walk cycle guard: mirrors native_map_put's CHAIN_WALK_LIMIT.
+        // Without this, a corrupted (cyclic) bucket chain spins this native
+        // call forever with no way to recover or diagnose -- this is
+        // exactly what a --stack-dump-on-timeout capture showed: a
+        // ThreadPoolExecutor worker permanently stuck inside
+        // HashSet.remove() during processWorkerExit, racing
+        // interruptIdleWorkers() on the main thread over the same
+        // `workers` set.
+        const CHAIN_WALK_LIMIT: usize = 4096;
+        let mut walk_count: usize = 0;
         let mut prev = head;
         let mut curr_val = ctx.get_field(head, NODE_FIELD_NEXT);
 
         while let Value::Object(Some(curr)) = curr_val {
+            walk_count += 1;
+            if walk_count > CHAIN_WALK_LIMIT {
+                eprintln!(
+                    "[HM-REMOVE-GUARD] aborting chain walk at {} nodes (suspected cycle); map={:?} idx={} cap={}",
+                    walk_count, this, idx, cap
+                );
+                return Err(cratonvm_types::error::RuntimeError::IllegalStateException {
+                    message: "hashmap chain exceeded safety cap; possible corruption".to_string(),
+                }
+                .into());
+            }
             if node_matches_inner(ctx, curr, is_null_key, key_ref)? {
                 let next = ctx.get_field(curr, NODE_FIELD_NEXT);
                 ctx.set_field(prev, NODE_FIELD_NEXT, next);
@@ -5029,7 +5068,21 @@ fn native_map_contains_key(ctx: &mut dyn NativeContext, args: &[Value]) -> Metho
     let idx = map_bucket_index(hash, cap);
     let mut node_val = ctx.get_array_element(buckets, idx);
 
+    // Chain-walk cycle guard: mirrors native_map_put's CHAIN_WALK_LIMIT.
+    const CHAIN_WALK_LIMIT: usize = 4096;
+    let mut walk_count: usize = 0;
     while let Value::Object(Some(node)) = node_val {
+        walk_count += 1;
+        if walk_count > CHAIN_WALK_LIMIT {
+            eprintln!(
+                "[HM-CONTAINSKEY-GUARD] aborting chain walk at {} nodes (suspected cycle); map={:?} idx={} cap={}",
+                walk_count, this, idx, cap
+            );
+            return Err(cratonvm_types::error::RuntimeError::IllegalStateException {
+                message: "hashmap chain exceeded safety cap; possible corruption".to_string(),
+            }
+            .into());
+        }
         let node_key_field = get_node_key(ctx, node);
         if is_null_key {
             if matches!(node_key_field, Value::Object(None)) {
@@ -7102,7 +7155,19 @@ fn native_hs_to_string(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCal
 
 const AL_ITR_FIELD_LIST: usize = 0;
 const AL_ITR_FIELD_CURSOR: usize = 1;
-const AL_ITR_NUM_FIELDS: usize = 2;
+// Dedicated fallback slot for `lastRet` (see `al_itr_last_ret_slot` below).
+// Previously absent: `al_itr_last_ret_slot`'s fallback defaulted to slot 1,
+// which collides with `AL_ITR_FIELD_CURSOR` -- every `next()` call's
+// `lastRet = cursor` write (using the PRE-increment cursor value) then
+// clobbered the `cursor = cursor + 1` write one line above it, so cursor
+// never advanced past 0 and `hasNext()` (`cursor < size`) stayed true
+// forever. Real WildFly repro: any Java loop draining a ServiceLoader-
+// backed ArrayList$Itr (e.g. `Module.loadService(Extension.class)`
+// iteration during `org.wildfly.extension.core-management`'s real
+// `java.desktop`-dependent clinit) spun forever re-appending the same
+// element, hammering the (uncapped) `set_field` OOB-write guard.
+const AL_ITR_FIELD_LAST_RET: usize = 2;
+const AL_ITR_NUM_FIELDS: usize = 3;
 
 /// Resolve ArrayList$Itr field slots: returns (cursor_slot, list_slot, n_fields).
 /// Real-JDK layout: cursor (slot 0), lastRet (slot 1), expectedModCount (slot 2),
@@ -7133,7 +7198,7 @@ fn al_itr_slots(ctx: &dyn NativeContext) -> (usize, usize, usize) {
 #[inline]
 fn al_itr_last_ret_slot(ctx: &dyn NativeContext) -> usize {
     ctx.resolve_field_index("java/util/ArrayList$Itr", "lastRet")
-        .unwrap_or(1)
+        .unwrap_or(AL_ITR_FIELD_LAST_RET)
 }
 
 const MAP_KEY_ITR_FIELD_KEYS: usize = 0;
@@ -38257,7 +38322,14 @@ mod tests {
     fn iterator_field_layout_valid() {
         assert_eq!(AL_ITR_FIELD_LIST, 0);
         assert_eq!(AL_ITR_FIELD_CURSOR, 1);
-        assert_eq!(AL_ITR_NUM_FIELDS, 2);
+        assert_eq!(AL_ITR_FIELD_LAST_RET, 2);
+        assert_eq!(AL_ITR_NUM_FIELDS, 3);
+        // The three field slots must be pairwise distinct -- this is
+        // exactly the invariant a prior version of this layout violated
+        // (LAST_RET's fallback collided with CURSOR).
+        assert_ne!(AL_ITR_FIELD_CURSOR, AL_ITR_FIELD_LAST_RET);
+        assert_ne!(AL_ITR_FIELD_LIST, AL_ITR_FIELD_LAST_RET);
+        assert_ne!(AL_ITR_FIELD_LIST, AL_ITR_FIELD_CURSOR);
     }
 
     // -----------------------------------------------------------------------

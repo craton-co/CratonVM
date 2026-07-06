@@ -2,12 +2,20 @@
 
 ## Status
 
-**Mostly fixed** on branch `fix/http-server-cluster` (off dev `81762470`).
-Reproduced and iterated on both Windows + JDK25 (the platform the original
-bug report was captured on, via `apps/spring-suite-runner`) and the Azure
-Linux host (`victor@20.84.156.31`, `/data/wt/wt-httpserver-cluster`, JDK25 at
-`/home/victor/jdk25`) for fast iteration. 10 of 12 classes are fully fixed;
-2 have residual issues documented below.
+**Mostly fixed** on branch `fix/http-server-cluster` (off dev `81762470`),
+merged to `dev`. Reproduced and iterated on both Windows + JDK25 (the
+platform the original bug report was captured on, via
+`apps/spring-suite-runner`) and the Azure Linux host for fast iteration.
+10 of 12 classes are fully fixed; 2 have residual issues, updated across
+two 2026-07-06 follow-up passes below. `ServerHttpsRequestIntegrationTests`:
+two distinct bugs found and fixed this session (a `Provider.putService`
+gap + per-instance `containsKey` isolation, and a `CertificateFactory`
+real-SPI delegation gap), but the test still fails — a third, unrelated
+bug (PKCS12/PBE empty-password handling in Netty's JDK-native SSL context
+path) was uncovered once the first two were fixed, and remains open for a
+future session. `ZeroCopyIntegrationTests`'s original reported failure did
+not reproduce, but an unrelated pre-existing flakiness was found and
+documented instead — see "Update (2026-07-06 session)" below.
 
 ## Root causes fixed
 
@@ -117,77 +125,230 @@ Linux host (`victor@20.84.156.31`, `/data/wt/wt-httpserver-cluster`, JDK25 at
   expected to reproduce on the Windows+JDK25 target the original bug report
   was captured on.
 
-## Residual — NOT fixed this session
+## Update (2026-07-06 session) — ZeroCopy re-scoped, BC provider bug found+partially fixed
 
-### `ServerHttpsRequestIntegrationTests` — `CertificateEncodingException`
+This session re-investigated both residuals with BouncyCastle actually on
+the classpath (`spring-web`'s `testFixturesImplementation("org.bouncycastle:
+bcpkix-jdk18on")`, confirmed present via a regenerated Linux-native
+`cratonvm-testcp.txt` — 204 classpath entries including `bcpkix-jdk18on-1.72.jar`,
+`bcprov-jdk18on-1.72.jar`, `bcutil-jdk18on-1.72.jar`). This changes the
+original "Residual 1" diagnosis materially — see below.
+
+### `ServerHttpsRequestIntegrationTests` — TWO bugs found+fixed this session, ONE new bug remains open
+
+**Follow-up (same-day, second pass)**: the `CertificateFactory`
+delegation bug described below (originally left open at the end of the
+first pass) has since been fixed too — see "Second bug — FIXED this
+session (follow-up, same day)" further down. A third, distinct bug
+(PKCS12/PBE empty-password handling in Nettys JDK-native SSL context path)
+was found once that got fixed, and remains open — see the end of this
+section. Net count: 2 bugs fixed, 1 new residual, test still fails
+end-to-end for the new reason.
+
+The original diagnosis (OpenJDK-reflection fallback `X509CertImpl` signing,
+`CertificateFactory` parse failure on truncated PEM) does not match what
+actually happens with BC on the classpath. Confirmed via minimal standalone
+repros (`new BouncyCastleProvider()` etc., compiled directly against the
+Netty/BC jars):
+
+**Bug found + FIXED this session**: `java.security.Provider.putService
+(Provider$Service)` had no native shim at all, so real inherited `Provider`
+bytecode ran against `legacyMap`/`serviceMap` fields that are never
+initialized for CratonVM's synthetic `Provider` objects (the real `Provider`
+constructor never runs for them). Modern providers that register services
+via `putService` directly instead of the legacy `put`/`parseLegacyPut`
+surface — e.g. BouncyCastle's `GOST3411$Mappings.configure()` — hit this
+gap. Worse: BouncyCastle's own `addAlgorithm(String, String)` (the
+`ConfigurableProvider` method `Mappings.configure()` calls) does
+`containsKey(key)` first and throws `IllegalStateException: duplicate
+provider key (...) found` **itself** if true — and CratonVM's `containsKey`
+shim read a process-wide table keyed only by provider **name** (`"BC"`),
+shared across every `Provider` object with that name. Real BC code
+legitimately constructs more than one independent `BouncyCastleProvider`
+instance in a single call flow (Netty's `BouncyCastleUtil.getBcProviderJce()`
+caches one; BC's own internal `BCJcaJceHelper` — used by
+`JcaX509CertificateConverter.getCertificate()` — constructs a second,
+separate one via reflection). On real HotSpot each instance's per-object
+service map starts empty, so the second construction is unaffected; on
+CratonVM the shared-by-name table already had entries from the first
+instance, so the second instance's `addAlgorithm("MessageDigest.GOST3411",
+...)` call saw `containsKey(...) == true` and threw — reproducible in an
+8-line standalone repro (`new BouncyCastleProvider()` twice in one process).
+
+  Fix: added the missing `putService` native (`native-builtins/src/jca/
+  provider_chain.rs`), and — since that alone did not fix the crash, the
+  second construction still saw the first's leftover entries — added a
+  second, PER-INSTANCE side table (`provider_instance_keys()`, keyed
+  `(identity_hash_of_receiver, key)`, using the existing GC-move-stable
+  `ctx.identity_hash_code()` — the same mechanism `System.identityHashCode`
+  and the pre-existing `service_classname_table` already rely on) and
+  routed `containsKey` through it instead of the shared name-keyed table.
+  This preserves the name-keyed `provider_properties()` table for its
+  existing job (bridging `Security.getProvider(name).getProperty(...)`
+  reads across the *fresh* synthetic `Provider` object `make_provider()`
+  hands out on every call — a different, legitimate cross-instance-by-name
+  use this fix does not disturb) while giving `containsKey`'s duplicate-key
+  guard correct per-object isolation. Verified: the 8-line double-construct
+  repro passes consistently (3/3 runs) after the fix; failed 100% before.
+
+  **NOT a ZeroCopy regression** — see below, that flakiness is pre-existing
+  and reproduces identically on the unmodified baseline binary.
+
+**Second bug — FIXED this session (follow-up, same day)**: with the
+`putService`/`containsKey` fix above, `BouncyCastleSelfSignedCertGenerator
+.generate()` got further but still failed in `JcaX509CertificateConverter
+.getCertificate()` -> `CertificateFactory.getInstance("X509", bcProvider)`.
+On real HotSpot this returns a `org.bouncycastle.jcajce.provider.asymmetric
+.x509.X509CertificateObject` (BC's own concrete SPI class, `encoded len =
+688`). On CratonVM it returned a bare `java.security.cert.X509Certificate`
+— the abstract class itself — with `cert.getEncoded().length == 0`,
+surfacing downstream as `AbstractMethodError: Certificate.verify
+(PublicKey)`.
+
+Root cause: `CertificateFactory` objects built via the real-bytecode
+`getInstance(algo, Provider)` / `getInstance(algo, providerName)` paths
+(which route through `sun.security.jca.GetInstance` ->
+`getinstance_instance_provider[_obj]` in `native-builtins/src/jca/
+provider_chain.rs`, running the class's real constructor) do end up with a
+genuine `certFacSpi` field pointing at BC's real SPI (BC registers it via
+the now-working `putService`). But `register_p68_security_cert` in
+`native-builtins/src/phases_late.rs` — which implements `generateCertificate`
+/ `generateCertificates` — always ran its own hardcoded synthetic DER
+parser regardless of what SPI the `CertificateFactory` was actually built
+with, ignoring `certFacSpi` entirely.
+
+  Fix (`native-builtins/src/phases_late.rs`, `register_p68_security_cert`,
+  commit `8355ad22` on `fix/httpserver-certfactory-20260706`, merged to
+  `dev`): both `generateCertificate` and `generateCertificates` now check
+  for a real `certFacSpi` field first and, if present, delegate to it via
+  `invoke_virtual` (`engineGenerateCertificate` / `engineGenerateCertificates`),
+  running the genuine provider bytecode and producing the provider's own
+  concrete `Certificate` subclass. Falls through to the legacy synthetic
+  DER parser only when `certFacSpi` is null (the old 1-arg
+  `getInstance(String)` synthetic-stub path, which is unchanged), so this
+  does not regress that path. Repros used: `CertFactoryRepro.java` (probes
+  all three `getInstance` overloads + the private `certFacSpi` field via
+  reflection) and `CertConvertRepro.java` (full BC `X509v3CertificateBuilder`
+  -> `JcaX509CertificateConverter` -> `cert.verify()` chain matching Spring's
+  actual usage), both under `/data/data/tmp-httpserver/` on the Azure host
+  (not committed — standalone scratch repros).
+
+  This fix was scoped to `CertificateFactory` only; it was NOT generalized
+  to other JCA engine types (`Signature`/`KeyFactory`/`MessageDigest`/etc.)
+  in this session. Those engine types already have their own dispatch via
+  the `ec_real`-gated `getinstance_instance_provider_obj` /
+  `build_jca_instance` mechanism in `provider_chain.rs` (EC-family only by
+  design, see that file's doc comments) and were not found to share this
+  specific bug — `CertificateFactory` is a different top-level class
+  (`java.security.cert.CertificateFactory`, not `sun.security.jca.
+  GetInstance`) with its own always-on synthetic native that intercepted
+  unconditionally, which is what made it special-cased and worth this
+  targeted fix rather than a shared one.
+
+**Third bug — found this session, NOT fixed, new residual**: with the
+`certFacSpi` delegation fix above, the `AbstractMethodError` / empty-cert
+failure is gone — confirmed via the standalone repros and a live run of
+`ServerHttpsRequestIntegrationTests` — but the test still fails, now
+further down the chain, inside Netty's **JDK-native** SSL context setup
+(`JdkSslServerContext`, a different code path from BC's own SSL context —
+this one builds an in-memory PKCS12 keystore via the JDK's own
+`sun.security.pkcs12.PKCS12KeyStore`):
 
 ```
-java.security.cert.CertificateEncodingException: java.security.cert.CertificateException:
-Could not parse certificate: java.io.IOException: java.lang.IllegalArgumentException:
-Illegal base64 character 0
-    at io.netty.handler.ssl.util.SelfSignedCertificate.<init>(SelfSignedCertificate.java:242)
+reactor.core.Exceptions$ReactiveException: javax.net.ssl.SSLException: failed to initialize the server-side SSL context
+  at io.netty.handler.ssl.JdkSslServerContext.newSSLContext(JdkSslServerContext.java:350)
+Caused by: java.security.KeyStoreException: Key protection algorithm not found: java.security.UnrecoverableKeyException: Encrypt Private Key failed: getSecretKey failed: Empty password
+  at sun.security.pkcs12.PKCS12KeyStore.setKeyEntry(PKCS12KeyStore.java:719)
+Caused by: java.security.UnrecoverableKeyException: Encrypt Private Key failed: getSecretKey failed: Empty password
+Caused by: java.io.IOException: getSecretKey failed: Empty password
+  at sun.security.pkcs12.PKCS12KeyStore.getPBEKey(PKCS12KeyStore.java:851)
+Caused by: java.security.spec.InvalidKeySpecException: Empty password
 ```
 
-Traced (not fixed) to: the test's `ReactorHttpsServer.initServer()` calls
-`new SelfSignedCertificate()`, which — with BouncyCastle unavailable —
-falls back to `OpenJdkSelfSignedCertGenerator` (reflection into
-`sun.security.x509.*` to build and sign an `X509CertImpl`), then
-`SelfSignedCertificate.newSelfSignedCertificate` PEM-encodes `cert.getEncoded()`
-via Netty's own `io.netty.handler.codec.base64.Base64` + `ByteBuf.toString()`,
-writes it to a temp `.crt` file via plain `FileOutputStream`, and the outer
-constructor reads it back via `FileInputStream` +
-`CertificateFactory.getInstance("X509").generateCertificate(...)` (real
-`sun.security.provider.X509Factory` bytecode — the literal error string
-`"Could not parse certificate: "` is hardcoded there, confirmed via
-`src.zip`, not this codebase).
+Not investigated to a fix this session — out of scope (this is a distinct,
+unrelated bug from the `CertificateFactory` one this session targeted) —
+but the exact root cause WAS located, narrowing the future session's job
+to a one-function edit:
 
-**Ruled out** (isolated minimal repros, both byte-identical to HotSpot on
-CratonVM):
-- `Unpooled.wrappedBuffer(bytes)` → `Base64.encode(buf, true)` →
-  `toString(US_ASCII)` — no NUL corruption, 0 in every test.
-- Plain `FileOutputStream.write(pemBytes)` → `FileInputStream` →
-  `CertificateFactory.generateCertificate` round-trip on synthetic DER — byte
-  for byte identical to what was written, same benign parse error as
-  HotSpot for deliberately-invalid fake DER.
+`native-builtins/src/phases_early.rs`'s `pbe_generate_secret` (the
+`SecretKeyFactory.generateSecret(PBEKeySpec)` native for the PKCS#5 v1.5
+PBE family, including the bare `"PBE"` algorithm `PKCS12KeyStore.getPBEKey`
+requests) has a deliberate `if pw.is_empty() { throw
+InvalidKeySpecException("Empty password") }` guard (~line 11375). Its own
+doc comment says this was an intentional simplification: *"the real PBEKey
+permits an empty password (encoded = empty byte[]); [no known caller] ever
+uses an empty password with a PBE algorithm, so route the empty case to
+[an exception] rather than minting a spec that would throw a less-faithful
+IllegalArgumentException"* — i.e. CratonVM deliberately diverges from real
+`com.sun.crypto.provider.PBEKey` behavior here because, at the time, no
+exercised caller needed the empty-password case. Netty's `JdkSslServerContext`
+building an in-memory PKCS12 keystore for a self-signed cert (empty
+`char[]` password is the normal/common case for an ephemeral keystore) is
+a second caller that DOES need it, and trips the guard.
 
-Both the general Netty-ByteBuf/Base64 path and the general file-I/O +
-CertificateFactory path are clean. The remaining suspects (not yet isolated):
-the OpenJDK reflective cert-signing chain itself (`X509CertInfo`/
-`X509CertImpl.sign` via reflection — does `cert.getEncoded()` on the
-resulting object return correct DER when the object was built this way under
-CratonVM?), or something specific to the exact interleaving of
-`Unpooled.wrappedBuffer(cert.getEncoded())` immediately after that reflective
-construction. Old leftover `keyutil_localhost_*.crt` temp files found on the
-Azure host (from an unrelated prior run, likely without BouncyCastle on the
-classpath either) show a suspicious pattern worth following up on: correct
-total file size, correct `-----BEGIN CERTIFICATE-----\n` header (28 bytes),
-then **all-NUL content** for the rest of the file — i.e. the header write
-landed but the base64 payload write did not, which doesn't match either of
-the two ruled-out paths and points at something upstream of both (possibly
-the reflective sign()/getEncoded() chain, or PlatformDependent's temp-file
-creation path specifically). Needs a repro run with BouncyCastle actually on
-the classpath (spring-framework's real test dependency) captured live, not a
-simplified standalone harness.
+**Not yet confirmed against real HotSpot JDK 25** whether
+`PKCS12KeyStore.getPBEKey`/`PBEKey` genuinely accepts an empty password
+end-to-end in this exact call path (the existing doc comment asserts it as
+fact, uncited) — that is the one thing a future session should verify
+first (e.g. via a standalone empty-password `PBEKeySpec` ->
+`SecretKeyFactory.getInstance("PBE").generateSecret(...)` repro against
+real HotSpot) before changing the guard, since removing it incorrectly
+could let a genuinely-invalid empty password silently produce a bogus key
+instead of failing loudly. If confirmed, the fix is likely: return a real
+`SecretKeySpec` with an empty encoded byte array instead of throwing, when
+`pw.is_empty()` — mirroring the same real-`PBEKey`-permits-empty-password
+contract already documented as the target semantics. **Net effect:
+`ServerHttpsRequestIntegrationTests` still FAILS**, but the failure has
+moved twice now and is much narrower than the original report — a future
+session should start at `pbe_generate_secret` in
+`native-builtins/src/phases_early.rs` rather than anywhere in the JCA
+provider/service-lookup layer (which is now confirmed working correctly
+for this test's `CertificateFactory` usage) or the PKCS12 keystore code
+itself (the throw happens one level up, at key-derivation time, not in
+`PKCS12KeyStore` proper).
 
-### `ZeroCopyIntegrationTests` — Jetty Core backend, `written 0 < N content-length`
+The original "all-NUL PEM payload" / base64 / file-I/O leads from the prior
+session are now believed to be **red herrings** — with BC actually reachable
+(once `putService` exists), the failure never gets far enough to reach any
+PEM-encoding or file-I/O step; it fails earlier, inside certificate-object
+construction itself.
 
-```
-java.lang.AssertionError: <html>...<title>Error 500 java.io.IOException: written 0 &lt; 951 content-length</title>...
-```
+### `ZeroCopyIntegrationTests` — Jetty Core backend: ORIGINAL bug NOT reproduced; UNRELATED pre-existing flakiness found instead
 
-Only the "Jetty Core" parameterization fails (Reactor Netty's failure on
-Linux is the `fdLimit` gap above, not this). `JettyCoreServerHttpResponse.writeWith(Path, long, long)`
-uses Jetty's own `Content.copy(Content.Source.from(null, file, position, count), this.response, callback)`
-— a different code path from the `FileChannel.transferTo`-based zero-copy
-natives in `native-io/src/file_channel.rs` (which are exercised by the
-Reactor Netty backend and are known-correct there: real
-`copy_file_range`/`sendfile` on Linux, a correctness-preserving userspace
-copy loop on Windows). Jetty's `Content.Source`/`IteratingCallback`/
-`Callback.Completable` machinery for a `Path`-backed source wasn't traced
-this session — the "0 bytes written" symptom means either the `FileChannel`
-read inside Jetty's `Content.Source` came back empty, or the write to the
-response (`Response.write`) silently dropped the buffer. Needs a dedicated
-trace of Jetty 12's `PathContentSource`/`Response.write` native touchpoints.
+This session could not reproduce the originally-reported `written 0 < N
+content-length` failure on the Jetty Core backend at all — every successful
+run (i.e. the ones that didn't hit the flakiness described below) passed
+both non-assumption-skipped parameterizations (Reactor Netty, Jetty Core)
+cleanly: `found=4 succ=2 fail=0 skip=0 abort=2`. This may mean it was already
+fixed by an unrelated `dev` merge since the prior session documented it, or
+it may be environment-dependent (the original report was captured on
+Windows+JDK25; this session's verification host is Azure Linux) — not
+re-confirmed either way, so **not** moved to a "fixed" section; it simply
+did not reproduce here despite specific, repeated attempts.
+
+**New, unrelated finding**: `ZeroCopyIntegrationTests` is **flaky** on this
+Azure Linux host — roughly 40-60% of standalone runs hang indefinitely
+(no further output after the JVM's early startup log lines) until an
+external timeout kills the process. This reproduces **identically on the
+completely unmodified `dev` baseline binary** (built before any change in
+this session — confirmed via a direct A/B: baseline binary hung 2/5 runs,
+a binary with this session's `Provider`/BC fix hung 3/5 runs, a third
+intermediate binary hung 4/5 runs — all in the same ballpark, no
+statistically meaningful difference, i.e. **this is not caused by this
+session's `provider_chain.rs` change**). A `--stack-dump-on-timeout` capture
+of a hung run shows the stuck thread deep inside ByteBuddy's dynamic-class
+generation (`net.bytebuddy.dynamic.scaffold.TypeWriter$Default.make` →
+`MethodDelegationBinder` → `StackManipulation$Compound.apply` →
+`TypeList$Generic$AbstractBase.getStackSize` → `AbstractList$Itr.next`),
+triggered by AssertJ's `Assumptions.assumeThat(...)` the FIRST time it's
+called in a process (it lazily generates and caches a proxy class via
+`net.bytebuddy.TypeCache.findOrInsert`) — i.e. this looks like a real,
+pre-existing CratonVM concurrency/timing bug in ByteBuddy dynamic-class
+generation (possibly a genuine race in interpreter/JIT state during
+class-generation bytecode analysis), NOT specific to `ZeroCopyIntegrationTests`
+or to anything touched this session. Worth a dedicated investigation in a
+future session, but out of scope here — flagged so it isn't mistaken for a
+regression from this session's diff.
 
 ## Repro
 

@@ -1037,6 +1037,45 @@ pub fn build_trust_manager_state(keystore_id: i32) -> TrustManagerState {
     state
 }
 
+/// Register a fully-built `TrustManagerState` under a fresh id in the shared
+/// `tm_registry`. Every `TrustManagerFactory`-SPI path that produces a
+/// `TrustManager` object (`tmf_engine_init`/`tmf_engine_init_params` below,
+/// and `tls.rs`'s SimpleFactory-style `getTrustManagers()`) MUST go through
+/// this instead of stamping a raw KeyStore registry id onto
+/// `cratonvm$x509tm$id` directly. Both `next_tm_id()` (this module) and
+/// `keystore::keystore_register`'s counter (a DIFFERENT registry) start at 1
+/// and increment independently — stamping either kind of id onto the same
+/// field, ambiguously, meant `validate_cert_chain`
+/// (`tls.rs::checkClientTrusted`/`checkServerTrusted`) could resolve a real,
+/// correctly-populated `TrustManagerState` (e.g. one built from
+/// `CertPathTrustManagerParameters`/OCSP config, which has no backing
+/// keystore at all) against a numerically-coincident but UNRELATED keystore
+/// — or, far more commonly, against NO keystore at all, silently emptying
+/// the trust-anchor set for a fully valid PKIX-configured connector (see
+/// `trust_manager_state_by_id`'s doc for the read side of this fix).
+pub(crate) fn register_trust_manager_state(state: TrustManagerState) -> i32 {
+    let id = next_tm_id();
+    tm_registry().write().insert(id, state);
+    id
+}
+
+/// Resolve a `cratonvm$x509tm$id` field value to its `TrustManagerState`.
+/// Checks `tm_registry` FIRST — the id space every `TrustManagerFactory` SPI
+/// path here now populates via `register_trust_manager_state` — and only
+/// falls back to treating `id` as a raw KeyStore registry id (matching
+/// `build_trust_manager_state`'s historical contract) when nothing is
+/// registered under it: id 0 (no `init()`/default trust store), or a caller
+/// that stamped a keystore id directly without going through
+/// `register_trust_manager_state`.
+pub(crate) fn trust_manager_state_by_id(id: i32) -> TrustManagerState {
+    if id != 0 {
+        if let Some(state) = tm_registry().read().get(&id).cloned() {
+            return state;
+        }
+    }
+    build_trust_manager_state(id)
+}
+
 fn insert_anchor(state: &mut TrustManagerState, der: Vec<u8>) {
     let parsed = match parse_certificate(&der) {
         Ok(p) => p,
@@ -1974,6 +2013,7 @@ const FQN_X509_TM: &str = "sun/security/ssl/X509TrustManagerImpl";
 const FQN_PKIX_VALIDATOR: &str = "sun/security/validator/PKIXValidator";
 const FQN_KMF_SUN_X509: &str = "sun/security/ssl/KeyManagerFactoryImpl$SunX509";
 const FQN_TMF_SIMPLE: &str = "sun/security/ssl/TrustManagerFactoryImpl$SimpleFactory";
+const FQN_TMF_PKIX: &str = "sun/security/ssl/TrustManagerFactoryImpl$PKIXFactory";
 
 // ---------------------------------------------------------------------------
 // Public registration entry point
@@ -2095,6 +2135,119 @@ fn register_tmf(r: &mut NativeMethodRegistry) {
         "()[Ljavax/net/ssl/TrustManager;",
         tmf_engine_get_trust_managers,
     );
+    // "PKIX" algorithm factory — `TrustManagerFactory.getDefaultAlgorithm()`
+    // is "PKIX" on modern JDKs, and Tomcat's `SSLUtilBase.getTrustManagers()`
+    // uses it explicitly, calling `engineInit(ManagerFactoryParameters)`
+    // whenever a CRL file or OCSP revocation checker is configured (wrapping
+    // a `PKIXBuilderParameters` in a `CertPathTrustManagerParameters`), and
+    // `engineInit(KeyStore)` otherwise. Real JDK dispatches BOTH overloads to
+    // the methods `TrustManagerFactoryImpl` (the common base class) declares
+    // — `PKIXFactory` doesn't override them — but this interpreter's native-
+    // override dispatch is keyed by the RECEIVER's runtime class, so without
+    // an explicit registration here `PKIXFactory` instances run the REAL
+    // (unintercepted) JDK bytecode for both methods, producing a REAL
+    // `X509TrustManagerImpl` whose `checkClientTrusted`/`checkServerTrusted`
+    // (still natively overridden by class name — see `FQN_X509_TM`) finds no
+    // `tm_registry` entry for it and silently falls back to a system-only
+    // trust state, rejecting any certificate signed by a private/test CA.
+    // This was invisible until `t27_tls::engine_run_trust_check` started
+    // actually calling `checkClientTrusted`/`checkServerTrusted` post-
+    // handshake — nothing did before.
+    r.register(
+        FQN_TMF_PKIX,
+        "engineInit",
+        "(Ljava/security/KeyStore;)V",
+        tmf_engine_init,
+    );
+    r.register(
+        FQN_TMF_PKIX,
+        "engineInit",
+        "(Ljavax/net/ssl/ManagerFactoryParameters;)V",
+        tmf_engine_init_params,
+    );
+    r.register(
+        FQN_TMF_PKIX,
+        "engineGetTrustManagers",
+        "()[Ljavax/net/ssl/TrustManager;",
+        tmf_engine_get_trust_managers,
+    );
+}
+
+/// `engineInit(ManagerFactoryParameters)` — see `register_tmf`'s doc for why
+/// this overload needs its own handler. Walks
+/// `CertPathTrustManagerParameters.getParameters()` (real runtime type
+/// `PKIXParameters`/`PKIXBuilderParameters`) -> `.getTrustAnchors()` -> each
+/// `TrustAnchor.getTrustedCert()` -> `.getEncoded()` to recover the same
+/// trust-anchor DER set `tmf_engine_init` gets from a plain `KeyStore` —
+/// `PKIXParameters` retains no back-reference to the original `KeyStore`
+/// object, so this is the only way to recover the anchors from this overload.
+fn tmf_engine_init_params(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = this_arg(args)?;
+    let mut state = TrustManagerState::default();
+    if let Some(Value::Object(Some(mfp))) = args.get(1) {
+        for der in extract_pkix_trust_anchor_ders(ctx, *mfp) {
+            insert_anchor(&mut state, der);
+        }
+    }
+    crate::t27_tls::set_pending_tm_trust_roots(state.anchor_ders.clone());
+    let id = register_trust_manager_state(state);
+    set_tm_id(ctx, this, id);
+    Ok(None)
+}
+
+fn extract_pkix_trust_anchor_ders(ctx: &mut dyn NativeContext, mfp: ObjectRef) -> Vec<Vec<u8>> {
+    let mut out = Vec::new();
+    let params = match ctx.invoke_virtual(
+        mfp,
+        "getParameters",
+        "()Ljava/security/cert/CertPathParameters;",
+        &[],
+    ) {
+        Ok(Some(Value::Object(Some(p)))) => p,
+        _ => return out,
+    };
+    let anchors = match ctx.invoke_virtual(params, "getTrustAnchors", "()Ljava/util/Set;", &[]) {
+        Ok(Some(Value::Object(Some(s)))) => s,
+        _ => return out,
+    };
+    let iter_obj = match ctx.invoke_virtual(anchors, "iterator", "()Ljava/util/Iterator;", &[]) {
+        Ok(Some(Value::Object(Some(it)))) => it,
+        _ => return out,
+    };
+    loop {
+        match ctx.invoke_virtual(iter_obj, "hasNext", "()Z", &[]) {
+            Ok(Some(Value::Int(1))) => {}
+            _ => break,
+        }
+        let anchor = match ctx.invoke_virtual(iter_obj, "next", "()Ljava/lang/Object;", &[]) {
+            Ok(Some(Value::Object(Some(a)))) => a,
+            _ => break,
+        };
+        let cert = match ctx.invoke_virtual(
+            anchor,
+            "getTrustedCert",
+            "()Ljava/security/cert/X509Certificate;",
+            &[],
+        ) {
+            Ok(Some(Value::Object(Some(c)))) => c,
+            _ => continue,
+        };
+        if let Ok(Some(Value::Object(Some(arr)))) =
+            ctx.invoke_virtual(cert, "getEncoded", "()[B", &[])
+        {
+            let alen = ctx.array_length(arr);
+            let mut der = Vec::with_capacity(alen);
+            for i in 0..alen {
+                if let Value::Int(b) = ctx.get_array_element(arr, i) {
+                    der.push(b as u8);
+                }
+            }
+            if !der.is_empty() {
+                out.push(der);
+            }
+        }
+    }
+    out
 }
 
 // ---------------------------------------------------------------------------
@@ -2167,6 +2320,25 @@ fn read_cert_der(ctx: &mut dyn NativeContext, cert: ObjectRef) -> Option<Vec<u8>
             return Some(out);
         }
     }
+    // Fallback: a REAL certificate object (e.g. `sun.security.x509.X509CertImpl`,
+    // as built by `keystore::make_x509_mirror`'s preferred path) has neither of
+    // the synthetic-mirror shapes above — its internal fields are the real
+    // JDK's own DER-parsed representation, not a raw byte[]. Call its real
+    // `getEncoded()` method (real bytecode, always present on any
+    // `java.security.cert.Certificate`) to get the DER bytes instead.
+    if let Ok(Some(Value::Object(Some(arr)))) = ctx.invoke_virtual(cert, "getEncoded", "()[B", &[])
+    {
+        let alen = ctx.array_length(arr);
+        let mut out = Vec::with_capacity(alen);
+        for i in 0..alen {
+            if let Value::Int(b) = ctx.get_array_element(arr, i) {
+                out.push(b as u8);
+            }
+        }
+        if !out.is_empty() {
+            return Some(out);
+        }
+    }
     None
 }
 
@@ -2213,6 +2385,34 @@ fn set_km_id(ctx: &mut dyn NativeContext, this: ObjectRef, id: i32) {
     }
 }
 
+/// Identity-hash-keyed fallback for `get_tm_id`/`set_tm_id` — mirrors
+/// `keystore.rs::store_id_by_identity`/`get_store_id`/`set_store_id` exactly.
+///
+/// FIX (tls-residuals): without this, `get_tm_id`/`set_tm_id` relied solely
+/// on a named pseudo-field (`cratonvm$x509tm$id`) and slot 0 — both of which
+/// silently fail to round-trip on a REAL bytecode `TrustManagerFactorySpi`
+/// subclass (e.g. `sun.security.ssl.TrustManagerFactoryImpl$PKIXFactory`,
+/// the "real Java default" instance `TrustManagerFactory.getInstance("PKIX")`
+/// actually produces): `set_field_by_name` cannot add a field a real class
+/// never declared, and slot 0 (if it exists at all on the real layout) is
+/// whatever field the real class puts there, not necessarily an `Int`.
+/// Confirmed by direct repro: `tmf_engine_init` stamped id=1 on a `this`
+/// pointer, and the VERY NEXT call to `tmf_engine_get_trust_managers` on the
+/// SAME pointer read back id=0 — so the returned `TrustManager`'s
+/// `checkClientTrusted`/`checkServerTrusted` (`do_check_trusted`) always
+/// missed `tm_registry`, fell back to `build_trust_manager_state(0)` (~120
+/// platform roots, no custom CA), and rejected any peer cert signed by that
+/// CA with "no trust anchor found for chain" — even after the
+/// `keystore_id_from_object`/id-unification fixes above, which only fixed
+/// the KeyStore-id and tm_registry-vs-keystore-id-namespace halves of this
+/// same family of bug, not this THIRD occurrence (KeyManager's
+/// `cratonvm$x509km$id`/`get_km_id`/`set_km_id` a few lines up likely has the
+/// identical gap, but is out of scope here — no repro hit it this session).
+fn tm_id_by_identity() -> &'static std::sync::Mutex<std::collections::HashMap<i32, i32>> {
+    static T: OnceLock<std::sync::Mutex<std::collections::HashMap<i32, i32>>> = OnceLock::new();
+    T.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+}
+
 fn get_tm_id(ctx: &mut dyn NativeContext, this: ObjectRef) -> i32 {
     let by_name = ctx.get_field_by_name(this, "cratonvm$x509tm$id");
     if let Value::Int(i) = by_name {
@@ -2228,6 +2428,16 @@ fn get_tm_id(ctx: &mut dyn NativeContext, this: ObjectRef) -> i32 {
             }
         }
     }
+    let ih = ctx.identity_hash_code(this);
+    if ih != 0 {
+        if let Some(&id) = tm_id_by_identity()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&ih)
+        {
+            return id;
+        }
+    }
     0
 }
 
@@ -2237,32 +2447,27 @@ fn set_tm_id(ctx: &mut dyn NativeContext, this: ObjectRef, id: i32) {
     if n > 0 {
         ctx.set_field(this, 0, Value::Int(id));
     }
+    let ih = ctx.identity_hash_code(this);
+    if ih != 0 {
+        tm_id_by_identity()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(ih, id);
+    }
 }
 
-/// Pull the `storeId` out of a Java `KeyStore` mirror. Real-JDK packs it in a
-/// dedicated field; our `keystore.rs` stash convention sets it both by name
-/// and at slot index 4.
+/// Pull the `storeId` out of a Java `KeyStore` mirror.
+///
+/// FIX (tls-residuals): delegate to `keystore::keystore_id_from_object`,
+/// which ALSO checks the identity-hash side-table `keystore.rs::set_store_id`
+/// falls back to for a real `java.security.KeyStore` — this function's old
+/// named-field/slot-4-only check never matched a real KeyStore wrapper
+/// object (real 4-field layout, no room for a pseudo-field), so
+/// `TrustManagerFactory.init(KeyStore)` always resolved id 0 for a
+/// caller-supplied truststore and silently fell back to platform roots only,
+/// rejecting any peer cert signed by that (private/test) CA.
 fn read_keystore_id(ctx: &mut dyn NativeContext, ks: ObjectRef) -> i32 {
-    let by_name = ctx.get_field_by_name(ks, "cratonvm$keystore$storeId");
-    if let Value::Int(i) = by_name {
-        if i != 0 {
-            return i;
-        }
-    }
-    if let Value::Long(l) = ctx.get_field_by_name(ks, "cratonvm$keystore$storeId") {
-        if l != 0 {
-            return l as i32;
-        }
-    }
-    let n = ctx.object_num_fields(ks);
-    if n > 4 {
-        match ctx.get_field(ks, 4) {
-            Value::Int(i) => return i,
-            Value::Long(l) => return l as i32,
-            _ => {}
-        }
-    }
-    0
+    crate::keystore::keystore_id_from_object(ctx, ks)
 }
 
 fn make_x509_mirror(ctx: &mut dyn NativeContext, alias: &str, der: &[u8]) -> ObjectRef {
@@ -2517,19 +2722,29 @@ fn do_check_trusted(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRe
         return Err(cert_exception("certificate chain is empty".into()));
     }
 
-    let trust = {
+    let (trust, hit) = {
         let registry = tm_registry().read();
         match registry.get(&id) {
-            Some(s) => s.clone(),
+            Some(s) => (s.clone(), true),
             None => {
                 // Fallback to a system-only trust state — better than denying
                 // everything when init() was bypassed (which real-JDK permits
                 // for the implicit default trust manager).
                 drop(registry);
-                build_trust_manager_state(0)
+                (build_trust_manager_state(0), false)
             }
         }
     };
+    if std::env::var("CRATONVM_DBG_TLS_AUTH").is_ok() {
+        eprintln!(
+            "[dbg-tls-auth] do_check_trusted id={} registry_hit={} anchor_ders={} anchors_groups={} chain_len={}",
+            id,
+            hit,
+            trust.anchor_ders.len(),
+            trust.anchors.len(),
+            chain.len()
+        );
+    }
 
     match validate_chain(&chain, &trust) {
         Ok(()) => Ok(None),
@@ -2633,8 +2848,15 @@ fn tmf_engine_init(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRes
     };
     let state = build_trust_manager_state(ks_id);
     crate::t27_tls::set_pending_tm_trust_roots(state.anchor_ders.clone());
-    let id = next_tm_id();
-    tm_registry().write().insert(id, state);
+    let id = register_trust_manager_state(state);
+    if std::env::var("CRATONVM_DBG_TLS_AUTH").is_ok() {
+        eprintln!(
+            "[dbg-tls-auth] tmf_engine_init this_ptr={:?} ks_id={} new_tm_id={}",
+            this.as_ptr(),
+            ks_id,
+            id
+        );
+    }
     set_tm_id(ctx, this, id);
     Ok(Some(Value::Object(None)))
 }
@@ -2642,6 +2864,13 @@ fn tmf_engine_init(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRes
 fn tmf_engine_get_trust_managers(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = this_arg(args)?;
     let id = get_tm_id(ctx, this);
+    if std::env::var("CRATONVM_DBG_TLS_AUTH").is_ok() {
+        eprintln!(
+            "[dbg-tls-auth] tmf_engine_get_trust_managers this_ptr={:?} read_id={}",
+            this.as_ptr(),
+            id
+        );
+    }
 
     let cls_id = ctx
         .ensure_class_initialized("javax/net/ssl/TrustManager")
@@ -2649,6 +2878,13 @@ fn tmf_engine_get_trust_managers(ctx: &mut dyn NativeContext, args: &[Value]) ->
     let arr = ctx.new_ref_array(cls_id, 1);
     let tm = alloc_concurrent_synthetic(ctx, FQN_X509_TM, 2);
     set_tm_id(ctx, tm, id);
+    if std::env::var("CRATONVM_DBG_TLS_AUTH").is_ok() {
+        eprintln!(
+            "[dbg-tls-auth] tmf_engine_get_trust_managers stamped tm_ptr={:?} id={}",
+            tm.as_ptr(),
+            id
+        );
+    }
     ctx.set_array_element(arr, 0, Value::Object(Some(tm)));
     Ok(Some(Value::Object(Some(arr))))
 }

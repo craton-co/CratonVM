@@ -1,5 +1,16 @@
 # Tomcat `TestHttpServletDoHead*` — JIT-only young-gen heap corruption / SIGSEGV (FIX LANDED)
 
+**Note (2026-07-06):** at a long-enough timeout (1200s) that the crash/hang
+this doc describes doesn't mask it, `TestHttpServletDoHeadInvalidWrite1024ValidWrite512`
+completes and shows 16 deterministic, non-flaky test failures — a completely
+SEPARATE root cause (a `StreamEncoder` real-mode shim eager-flush bug that
+broke `NoBodyOutputStream.checkCommit()`'s byte-count-based commit
+threshold), confirmed unrelated by log-line evidence (the one GC corruption
+WARN in the baseline run falls between two unrelated `testDoHeadHttp2`
+parameterizations, nowhere near the 16 failing cases). See
+`dohead-streamencoder-eager-flush-commit-threshold.md` for that fix. Do not
+conflate the two when triaging future DoHead failures.
+
 Status: **FATAL LAYER FIXED** on branch `fix/dohead-sweep-freelist` (commit
 `928cc5b3`, 2026-07-02): the crash was NOT (only) the register-invisible root —
 that is Layer 1, survivable. The FATAL layer was the **young from-space

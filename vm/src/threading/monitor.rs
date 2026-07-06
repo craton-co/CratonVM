@@ -1603,8 +1603,18 @@ mod tests {
     use crate::memory::heap::Heap;
 
     /// Helper to create a test object on the heap.
+    ///
+    /// Leaks the backing `Heap`: dropping it here would free its two
+    /// (multi-MB) arenas out from under the returned `ObjectRef`, which
+    /// every caller dereferences well after this function returns. That was
+    /// a real, reproducible use-after-free — SIGSEGV inside
+    /// `MonitorTable::enter_inflated_or_contend` -> `ensure_inflated` ->
+    /// `header_of` reading the (freed) mark word — that crashed the test
+    /// binary partway through this module's suite once the freed arena
+    /// mapping got unmapped/reused. A tiny capacity keeps the per-call leak
+    /// negligible (this helper is called from ~20 tests).
     fn test_object() -> ObjectRef {
-        let heap = Heap::new();
+        let heap: &'static Heap = Box::leak(Box::new(Heap::with_capacity(4096)));
         heap.alloc_object(ClassId::new(0), 0)
     }
 

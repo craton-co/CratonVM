@@ -14,7 +14,7 @@ use cratonvm_types::{ObjectRef, Value};
 
 use crate::{alloc_concurrent_synthetic, native_noop, native_noop_with_this, obj_arg};
 use crate::{native_cf_then_accept, native_cf_then_apply};
-use crate::{BI_FIELD_SIGNUM, BI_FIELD_VALUE, FUT_FIELD_DONE, FUT_FIELD_RESULT};
+use crate::{BI_FIELD_SIGNUM, BI_FIELD_VALUE, CHARSET_FIELD_NAME, FUT_FIELD_DONE, FUT_FIELD_RESULT};
 
 // Helpers defined in lib.rs that we need
 use crate::bi_alloc;
@@ -17878,10 +17878,16 @@ pub fn register_p58_charset_coder(r: &mut NativeMethodRegistry) {
         "()Ljava/nio/charset/CharsetEncoder;",
         |ctx, args| {
             let this = obj_arg(args, 0)?;
+            let name = match ctx.get_field(this, CHARSET_FIELD_NAME) {
+                Value::Object(Some(s)) => ctx.read_string(s).unwrap_or_else(|| "UTF-8".to_string()),
+                _ => "UTF-8".to_string(),
+            };
+            let avg = cratonvm_native_api::charset::average_bytes_per_char(&name);
+            let max = cratonvm_native_api::charset::max_bytes_per_char(&name);
             let enc_obj = alloc_concurrent_synthetic(ctx, "java/nio/charset/CharsetEncoder", 3);
             ctx.set_field(enc_obj, 0, Value::Object(Some(this)));
-            ctx.set_field(enc_obj, 1, Value::Float(1.0));
-            ctx.set_field(enc_obj, 2, Value::Float(4.0));
+            ctx.set_field(enc_obj, 1, Value::Float(avg));
+            ctx.set_field(enc_obj, 2, Value::Float(max));
             seed_coder_error_actions(ctx, enc_obj);
             Ok(Some(Value::Object(Some(enc_obj))))
         },
@@ -17892,10 +17898,16 @@ pub fn register_p58_charset_coder(r: &mut NativeMethodRegistry) {
         "()Ljava/nio/charset/CharsetDecoder;",
         |ctx, args| {
             let this = obj_arg(args, 0)?;
+            let name = match ctx.get_field(this, CHARSET_FIELD_NAME) {
+                Value::Object(Some(s)) => ctx.read_string(s).unwrap_or_else(|| "UTF-8".to_string()),
+                _ => "UTF-8".to_string(),
+            };
+            let avg = cratonvm_native_api::charset::average_chars_per_byte(&name);
+            let max = cratonvm_native_api::charset::max_chars_per_byte(&name);
             let dec_obj = alloc_concurrent_synthetic(ctx, "java/nio/charset/CharsetDecoder", 3);
             ctx.set_field(dec_obj, 0, Value::Object(Some(this)));
-            ctx.set_field(dec_obj, 1, Value::Float(1.0));
-            ctx.set_field(dec_obj, 2, Value::Float(1.0));
+            ctx.set_field(dec_obj, 1, Value::Float(avg));
+            ctx.set_field(dec_obj, 2, Value::Float(max));
             seed_coder_error_actions(ctx, dec_obj);
             Ok(Some(Value::Object(Some(dec_obj))))
         },
@@ -21139,6 +21151,24 @@ pub(crate) fn register_synthetic_stream_spliterators(r: &mut NativeMethodRegistr
         "()Ljava/util/Spliterator;",
         p_obj_stream_spliterator,
     );
+    r.register(
+        "java/util/stream/IntStream",
+        "iterator",
+        "()Ljava/util/PrimitiveIterator$OfInt;",
+        p_int_stream_iterator,
+    );
+    r.register(
+        "java/util/stream/LongStream",
+        "iterator",
+        "()Ljava/util/PrimitiveIterator$OfLong;",
+        p_long_stream_iterator,
+    );
+    r.register(
+        "java/util/stream/DoubleStream",
+        "iterator",
+        "()Ljava/util/PrimitiveIterator$OfDouble;",
+        p_double_stream_iterator,
+    );
     r.set_category(__prev);
 }
 
@@ -21281,6 +21311,115 @@ pub(crate) fn p_obj_stream_spliterator(
             Value::Int(n as i32),
             Value::Int(0),
         ],
+    )
+}
+
+/// `{Int,Long,Double}Stream.iterator()` on a SYNTHETIC stream object (slot 0 =
+/// element array). Same "no Code attribute" family as `spliterator()` above —
+/// the receiver is stamped with the bare `java/util/stream/*Stream` interface,
+/// so `iterator()` (declared on `BaseStream`, no override) dispatches to the
+/// abstract interface method → AbstractMethodError. Build a real primitive
+/// array and delegate to `java.util.Arrays.stream(...)`, which returns a
+/// genuine, bytecode-backed JDK stream implementation; calling `iterator()` on
+/// THAT object is a normal virtual/interface dispatch that resolves to the
+/// real JDK's own Code-attributed method (not this native), so there is no
+/// re-entrancy risk.
+pub(crate) fn p_int_stream_iterator(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    let this = obj_arg(args, 0)?;
+    let elems = p56_read_stream_elems(ctx, this);
+    let n = elems.len();
+    let arr = ctx.new_array(cratonvm_types::ArrayElementType::Int, n);
+    for (i, v) in elems.into_iter().enumerate() {
+        let iv = match v {
+            Value::Int(x) => Value::Int(x),
+            Value::Object(Some(o)) => ctx.get_field(o, 0),
+            _ => Value::Int(0),
+        };
+        ctx.set_array_element(arr, i, iv);
+    }
+    let real_stream = ctx.invoke(
+        "java/util/Arrays",
+        "stream",
+        "([I)Ljava/util/stream/IntStream;",
+        &[Value::Object(Some(arr))],
+    )?;
+    let Some(real_stream) = real_stream else {
+        return Ok(None);
+    };
+    ctx.invoke(
+        "java/util/stream/IntStream",
+        "iterator",
+        "()Ljava/util/PrimitiveIterator$OfInt;",
+        &[real_stream],
+    )
+}
+
+pub(crate) fn p_long_stream_iterator(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    let this = obj_arg(args, 0)?;
+    let elems = p56_read_stream_elems(ctx, this);
+    let n = elems.len();
+    let arr = ctx.new_array(cratonvm_types::ArrayElementType::Long, n);
+    for (i, v) in elems.into_iter().enumerate() {
+        let lv = match v {
+            Value::Long(x) => Value::Long(x),
+            Value::Object(Some(o)) => ctx.get_field(o, 0),
+            _ => Value::Long(0),
+        };
+        ctx.set_array_element(arr, i, lv);
+    }
+    let real_stream = ctx.invoke(
+        "java/util/Arrays",
+        "stream",
+        "([J)Ljava/util/stream/LongStream;",
+        &[Value::Object(Some(arr))],
+    )?;
+    let Some(real_stream) = real_stream else {
+        return Ok(None);
+    };
+    ctx.invoke(
+        "java/util/stream/LongStream",
+        "iterator",
+        "()Ljava/util/PrimitiveIterator$OfLong;",
+        &[real_stream],
+    )
+}
+
+pub(crate) fn p_double_stream_iterator(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    let this = obj_arg(args, 0)?;
+    let elems = p56_read_stream_elems(ctx, this);
+    let n = elems.len();
+    let arr = ctx.new_array(cratonvm_types::ArrayElementType::Double, n);
+    for (i, v) in elems.into_iter().enumerate() {
+        let dv = match v {
+            Value::Double(x) => Value::Double(x),
+            Value::Object(Some(o)) => ctx.get_field(o, 0),
+            _ => Value::Double(0.0),
+        };
+        ctx.set_array_element(arr, i, dv);
+    }
+    let real_stream = ctx.invoke(
+        "java/util/Arrays",
+        "stream",
+        "([D)Ljava/util/stream/DoubleStream;",
+        &[Value::Object(Some(arr))],
+    )?;
+    let Some(real_stream) = real_stream else {
+        return Ok(None);
+    };
+    ctx.invoke(
+        "java/util/stream/DoubleStream",
+        "iterator",
+        "()Ljava/util/PrimitiveIterator$OfDouble;",
+        &[real_stream],
     )
 }
 
@@ -37482,7 +37621,13 @@ fn p68_extract_trust_manager_roots(
                     _ => continue,
                 },
             };
-            let state = crate::x509_manager::build_trust_manager_state(ks_id);
+            // FIX (tls-residuals): this id is a `tm_registry` id (from
+            // `x509_manager::register_trust_manager_state`) for the live
+            // PKIXFactory/SimpleFactory path, not necessarily a raw KeyStore
+            // registry id — see `tls.rs::validate_cert_chain`'s matching fix
+            // for the full explanation of the two-id-space collision this
+            // closes.
+            let state = crate::x509_manager::trust_manager_state_by_id(ks_id);
             if !state.anchor_ders.is_empty() {
                 return Some(state.anchor_ders);
             }
@@ -39123,6 +39268,37 @@ pub(crate) fn register_p68_security_cert(r: &mut NativeMethodRegistry) {
         "generateCertificate",
         "(Ljava/io/InputStream;)Ljava/security/cert/Certificate;",
         |ctx, args| {
+            // Real-SPI fast path: a `CertificateFactory` built via
+            // `getInstance(algo, Provider)` / `getInstance(algo, providerName)`
+            // (both flow through `sun/security/jca/GetInstance.getInstance` ->
+            // `getinstance_instance_provider[_obj]` in `jca::provider_chain`,
+            // which run the class's REAL constructor) carries a genuine
+            // `certFacSpi` field pointing at the provider's real
+            // `CertificateFactorySpi` (e.g. BouncyCastle's
+            // `org.bouncycastle.jcajce.provider.asymmetric.x509.CertificateFactory`).
+            // Real `CertificateFactory.generateCertificate` is one line:
+            // `return certFacSpi.engineGenerateCertificate(is)`. Delegating to
+            // it here runs the genuine provider bytecode and produces the
+            // provider's own concrete `Certificate` subclass — critical for
+            // callers like BC's `JcaX509CertificateConverter.getCertificate`
+            // that need a real `X509CertificateObject` (`getEncoded()`,
+            // `verify()`, etc. are abstract on the bare `Certificate`/
+            // `X509Certificate` classes and throw `AbstractMethodError`
+            // otherwise). Only the OLD synthetic path — where `getInstance`
+            // (1-arg, no provider) handed out the 1-field
+            // `alloc_concurrent_synthetic` stub with no `certFacSpi` — falls
+            // through to the legacy ad-hoc DER parser below.
+            if let Some(Value::Object(Some(this))) = args.first() {
+                if let Value::Object(Some(spi)) = ctx.get_field_by_name(*this, "certFacSpi") {
+                    return ctx.invoke_virtual(
+                        spi,
+                        "engineGenerateCertificate",
+                        "(Ljava/io/InputStream;)Ljava/security/cert/Certificate;",
+                        &args[1..],
+                    );
+                }
+            }
+
             // X509Certificate: 3 fields (subject_str=0, issuer_str=1, cert_id=2)
             let cert = alloc_concurrent_synthetic(ctx, "java/security/cert/X509Certificate", 3);
 
@@ -39191,6 +39367,19 @@ pub(crate) fn register_p68_security_cert(r: &mut NativeMethodRegistry) {
         "generateCertificates",
         "(Ljava/io/InputStream;)Ljava/util/Collection;",
         |ctx, args| {
+            // Real-SPI fast path — see the matching comment on
+            // `generateCertificate` above; same rationale, same field.
+            if let Some(Value::Object(Some(this))) = args.first() {
+                if let Value::Object(Some(spi)) = ctx.get_field_by_name(*this, "certFacSpi") {
+                    return ctx.invoke_virtual(
+                        spi,
+                        "engineGenerateCertificates",
+                        "(Ljava/io/InputStream;)Ljava/util/Collection;",
+                        &args[1..],
+                    );
+                }
+            }
+
             // Try to parse a single certificate and return it in a list
             let al = alloc_concurrent_synthetic(ctx, "java/util/ArrayList", 2);
             let arr = ctx.new_array(cratonvm_types::ArrayElementType::Reference, 10);

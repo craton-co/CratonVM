@@ -4,6 +4,16 @@ This folder collects CratonVM-only defects found while running upstream Java
 suites. The docs had grown to describe the **same underlying bug from several
 angles**; this index is the consolidated map. Read it first.
 
+## 2026-07-06 WildFly domain-mode corrupt-Value-cell root cause + MSC real-start gate
+
+- [wildfly-domain-heap-corrupt-value-timeout.md](wildfly-domain-heap-corrupt-value-timeout.md) — root-caused: the repeated `gen_heap::read_slot: corrupt Value cell` guard hit during domain-mode boot is the plain-field 16-byte `Value`-slot tearing bug, fixed on `dev` by `2dfdfddc`/`5198fccd` (landed the day after this doc's evidence). Live re-confirmation is blocked by a deeper, separately-tracked gap (below); see the doc for the full analysis and the pre/post-fix code diff.
+- [wildfly-domain-managed-servers-timeout.md](wildfly-domain-managed-servers-timeout.md) — updated: the corrupt-cell mechanism above is fixed, but hand-driving `standalone.sh`/`domain.sh` directly (no Maven/wildfly-core checkout was available) shows CratonVM cannot reach real sustained service execution at all without `CRATONVM_MSC_REAL_START=1` (default off, an existing in-progress effort — see [handoff-wildfly-msc-service-start.md](../internal/app-jvm-bugs/handoff-wildfly-msc-service-start.md)), and even with that flag on hits a new `ServiceNotFoundException`/domain-mode hang — tracked as [bug-15](../internal/wildfly-suite-bugs/bug-15-msc-real-start-servicenotfound-and-domain-hang.md).
+
+
+## 2026-07-06 vm crate unit-test residuals (branch fix/vm-monitor-test-object-heap-uaf)
+
+- [vm crate unit-test residuals post-monitor-fix](vm-unit-test-residuals-post-monitor-fix.md) - after fixing a test-helper use-after-free SIGSEGV that was crashing `cargo test -p cratonvm-vm --release --lib` before it could finish, the suite surfaced 16-17 masked failures. 8 were a false alarm (lock_order enforcement gated behind debug_assertions, disabled under --release), 3 were stale hardcoded bootstrap-class/native counts (FIXED here — a legitimate recent feature grew the count from 5 to 25 classes), 1 didn't reproduce in debug (not investigated). 4 remain open: virtual_scheduler over-release accounting (design question), vm_exec object-pointer-provenance test predates a security hardening, runtime::frame CompactValue long/upper-half slot-tearing-adjacent bug, and a jit::skip_list Keycloak over-match not yet traced to its exact matching branch.
+
 ## 2026-07-05 Hibernate pruned residuals
 
 - [Hibernate JpaLargeBlobTest Object.read() dispatch](hib-jpalargeblobtest-object-read-nosuchmethod.md) - patched locally in the JIT virtual/interface MIC helper: `ClassId(0)` non-Object receivers now fall back to the CP owner and cannot publish MIC/PIC entries under the zero/empty sentinel. Local Windows Hibernate probe no longer reproduces `java/lang/Object.read()I`, but the class remains open on a later no-JIT-independent `GenHeap::set_array_element` object-vs-array assertion in H2 `IOUtils.readFully`.
@@ -44,8 +54,14 @@ Fixed from this sweep:
 Open findings from this sweep, in `keycloak-07-04/`, roughly by priority:
 - [test-framework deployRequestedInstances resolution failure](keycloak-07-04/keycloak-testframework-deploy-requested-instances-resolution.md) - surfaced after the converter fix.
 
-Already-tracked, not re-documented: the 37 `testsuite/model` CRASHes are the
-existing [Infinispan GlobalConfigurationBuilder.isClustered() NoSuchMethodError](keycloak-model-infinispan-globalconfiguration-isclustered-nosuchmethod.md).
+Already-tracked, not re-documented: the 37 `testsuite/model` CRASHes were the
+[Infinispan GlobalConfigurationBuilder.isClustered() NoSuchMethodError](../internal/fixed-suite-bugs/keycloak-model-infinispan-globalconfiguration-isclustered-nosuchmethod-FIXED.md),
+now **FIXED** (2026-07-06) — moved to `docs/internal/fixed-suite-bugs/`. The
+same identity-wrapper bug shape one step deeper in the same boot path,
+[Infinispan ConfigurationBuilder.build() ClassCastException](../internal/fixed-suite-bugs/keycloak-model-infinispan-configurationbuilder-classcastexception.md),
+is now **also FIXED** (2026-07-06). `RealmModelTest` now reaches a distinct,
+unrelated residual one layer deeper:
+[Netty PlatformDependent0 reflective setAccessible(true) disabled](keycloak-model-netty-reflective-setaccessible-disabled.md).
 Not CratonVM bugs: 543 FAILs (`testsuite/integration-arquillian/tests/base`
 + `tests/other/sssd`, exhaustively confirmed - 543/544 exact match, the 544th
 is the System Rules finding above) are "Not found frontend container:
@@ -602,17 +618,25 @@ JIT divide-by-zero re-run) has since been fixed; the other two remain open:
   `microprofile-config-api-3.1.jar` were entirely absent from
   `kc-universal-cp.txt`; both added). Historical record moved to
   [../internal/keycloak-smallrye-configbuilder-defaultsources-linkage-crashes.md](../internal/keycloak-smallrye-configbuilder-defaultsources-linkage-crashes.md).
-- [keycloak-testframework-quarkus-config-classpath-gap.md](keycloak-testframework-quarkus-config-classpath-gap.md) —
-  🔴 open. Uncovered by the fixes above: `org.keycloak.testframework.config.Config`
-  needs `quarkus-core` (for `CharsetConverter`/`MemorySizeConverter`/
-  `InetSocketAddressConverter`, and — per the `assertNotNull` fix above —
-  `opentelemetry.runtime.config.build.SamplerType`), which is entirely absent from
-  `kc-universal-cp.txt`. Both fixes above still bottom out on this same gap one
-  layer further in (`SamplerType` for `testsuite/model` classes via
-  `KeycloakModelTest`; `CharsetConverter`'s `SRCFG00012` "not parameterized with a
-  type" for the `tests/db`/`tests/clustering` classes via
-  `SmallRyeConfigBuilder.withConverters`) — not new bugs, both covered by this
-  doc's existing next steps.
+- ✅ **`org.keycloak.testframework.config.Config` Quarkus classpath gap** — FIXED
+  (2026-07-06). `quarkus-core` and four more layers behind it (the full
+  `smallrye-common-*` family, `org.ow2.asm:asm`, `jboss-logmanager`,
+  `quarkus-bootstrap-runner`) were entirely absent from `kc-universal-cp.txt`;
+  all added. `AccountConsoleDisabledTest` now runs past `Config.initConfig()`
+  and Quarkus logging bootstrap into real JUnit 5 test execution. Also added
+  `apps/keycloak-suite-runner/generate-kc-universal-cp.ps1` (a dry-run-by-default
+  helper that pulls a named module's already-resolved `cratonvm-full-cp.txt`
+  jars into `kc-universal-cp.txt`, per this doc's "no in-repo generator"
+  ask) — see it for why a blind full-repo union isn't used by default.
+  Historical record moved to
+  [../internal/fixed-suite-bugs/keycloak-testframework-quarkus-config-classpath-gap.md](../internal/fixed-suite-bugs/keycloak-testframework-quarkus-config-classpath-gap.md).
+- [keycloak-testframework-enterprisedb-supplier-noclassdef.md](keycloak-testframework-enterprisedb-supplier-noclassdef.md) —
+  🔴 open. Residual uncovered by the fix above: `Registry`'s extension-supplier
+  discovery now runs (it couldn't before) and immediately fails with
+  `NoClassDefFoundError: org/keycloak/testframework/database/EnterpriseDbDatabaseSupplier`
+  — puzzling because the class/jar/classpath-dir all genuinely exist; possibly
+  the same misleading-diagnostic pattern as the Infinispan `isClustered()` bug
+  below, or a missing Testcontainers jar. Not yet root-caused.
 
 ## Keycloak post-PreviewFeatures rerun (2026-07-03)
 
@@ -635,9 +659,23 @@ PreviewFeatures native crash. The remaining non-passed rows are tracked here:
   instead of the real `IntStream` interface stamp — broke every IntStream op
   on `chars()`, not just `anyMatch`. Moved to
   `docs/internal/fixed-suite-bugs/`.
-- [keycloak-model-infinispan-globalconfiguration-isclustered-nosuchmethod.md](keycloak-model-infinispan-globalconfiguration-isclustered-nosuchmethod.md) -
-  still reproduces for the `testsuite/model` module: 37 `CRASH` rows plus one
-  abstract/no-test `EMPTY` row.
+- ~~keycloak-model-infinispan-globalconfiguration-isclustered-nosuchmethod.md~~ - FIXED
+  2026-07-06: was 37 `CRASH` rows plus one abstract/no-test `EMPTY` row for the
+  `testsuite/model` module. Root cause was `GlobalConfigurationBuilder.build()`
+  being natively shimmed as an identity wrapper (returned `this` instead of a
+  distinct `GlobalConfiguration`), so `isClustered()` correctly-but-confusingly
+  NoSuchMethodError'd against the Builder's genuine runtime class. Moved to
+  `docs/internal/fixed-suite-bugs/keycloak-model-infinispan-globalconfiguration-isclustered-nosuchmethod-FIXED.md`.
+- ~~keycloak-model-infinispan-configurationbuilder-classcastexception.md~~ -
+  FIXED 2026-07-06: same identity-wrapper bug shape one step deeper in the
+  same path (`ConfigurationBuilder.build()`). Fixed by reworking
+  `native_dcm_define_configuration` to read size/ttl via `Configuration`'s
+  real accessor API (`memory().maxCount()` / `expiration().lifespan()`)
+  instead of a raw synthetic slot index, then removing the identity-wrapper
+  native the same way as `GlobalConfigurationBuilder.build()`. Moved to
+  `docs/internal/fixed-suite-bugs/keycloak-model-infinispan-configurationbuilder-classcastexception.md`.
+  `RealmModelTest` now reaches a distinct, unrelated residual tracked in
+  [keycloak-model-netty-reflective-setaccessible-disabled.md](keycloak-model-netty-reflective-setaccessible-disabled.md).
 - [keycloak-sssd-system1-findbootstrapclassornull-nosuchmethod.md](keycloak-sssd-system1-findbootstrapclassornull-nosuchmethod.md) -
   2 `FAIL` rows in the SSSD module, missing
   `java/lang/System$1.findBootstrapClassOrNull(String)Class`.

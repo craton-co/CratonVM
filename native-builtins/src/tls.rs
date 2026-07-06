@@ -860,30 +860,19 @@ fn register_ssl_parameters(r: &mut NativeMethodRegistry) {
 ///   1. the KeyStore object's own `cratonvm$keystore$storeId` named field;
 ///   2. its `keyStoreSpi` delegate's `cratonvm$keystore$storeId` named field.
 ///
-/// CROSS-FILE NOTE: the identity-side-table fallback in
-/// `keystore.rs::get_store_id` is private; if a future real-JDK JKS mirror
-/// carries the id *only* in that side-table (no usable named field), this probe
-/// returns 0 and the trust manager falls back to system roots. The robust fix
-/// is a `pub fn keystore::keystore_id_from_object(ctx, ks_obj) -> i32` exported
-/// from `keystore.rs` that reuses `get_store_id` over the `keyStoreSpi`
-/// delegate; this helper should prefer that once it exists. Flagged for
-/// keystore.rs.
+/// FIX (tls-residuals): this now delegates to `keystore::keystore_id_from_object`
+/// (the exact helper this doc comment used to ask for — see git history for
+/// the prior TODO). That helper's identity-hash side-table tier is the ONLY
+/// one that resolves a real `java.security.KeyStore` in real-JDK mode (its
+/// real 4-field layout has no room for a pseudo-field, so both the named-field
+/// and `keyStoreSpi`-delegate probes below used to always miss). Confirmed via
+/// a minimal repro: `TrustManagerFactory.getInstance("PKIX").init(caTrustStore)`
+/// resolved id 0 and validated peers against the ~100+ platform roots instead
+/// of `caTrustStore`, so a peer cert signed by a private/test CA always failed
+/// with `UnknownIssuer` — independent of and unaffected by any OCSP/cipher/
+/// client-cert configuration.
 pub(crate) fn read_keystore_registry_id(ctx: &mut dyn NativeContext, ks_obj: ObjectRef) -> i32 {
-    // (1) directly on the KeyStore object.
-    if let Value::Int(i) = ctx.get_field_by_name(ks_obj, "cratonvm$keystore$storeId") {
-        if i != 0 {
-            return i;
-        }
-    }
-    // (2) on the SPI delegate referenced by `keyStoreSpi`.
-    if let Value::Object(Some(spi)) = ctx.get_field_by_name(ks_obj, "keyStoreSpi") {
-        if let Value::Int(i) = ctx.get_field_by_name(spi, "cratonvm$keystore$storeId") {
-            if i != 0 {
-                return i;
-            }
-        }
-    }
-    0
+    crate::keystore::keystore_id_from_object(ctx, ks_obj)
 }
 
 fn register_trust_manager_factory(r: &mut NativeMethodRegistry) {
@@ -998,13 +987,23 @@ fn register_trust_manager_factory(r: &mut NativeMethodRegistry) {
                 Value::Long(l) => l as i32,
                 _ => 0,
             };
-            // Allocate a 1-field X509TrustManager and stamp the bound keystore id
-            // so its validation picks up those anchors. Both the named field
+            // FIX (tls-residuals): register through the SAME `tm_registry` id
+            // space `x509_manager`'s PKIXFactory/SimpleFactory SPI path uses
+            // (`register_trust_manager_state`), rather than stamping this raw
+            // KeyStore registry id directly onto `cratonvm$x509tm$id`. Both
+            // counters start at 1 and increment independently, so stamping
+            // either kind of id onto the same field let
+            // `validate_cert_chain` misresolve a `tm_registry`-sourced id as
+            // a keystore id (or vice versa) whenever this path is live.
+            let state = crate::x509_manager::build_trust_manager_state(ks_id);
+            let tm_id = crate::x509_manager::register_trust_manager_state(state);
+            // Allocate a 1-field X509TrustManager and stamp the unified id so
+            // its validation picks up those anchors. Both the named field
             // (preferred by read_trust_manager_id_from_obj) and slot 0 (its
             // fallback) carry the id.
             let tm = alloc_concurrent_synthetic(ctx, "javax/net/ssl/X509TrustManager", 1);
-            ctx.set_field_by_name(tm, "cratonvm$x509tm$id", Value::Int(ks_id));
-            ctx.set_field(tm, 0, Value::Int(ks_id));
+            ctx.set_field_by_name(tm, "cratonvm$x509tm$id", Value::Int(tm_id));
+            ctx.set_field(tm, 0, Value::Int(tm_id));
             let arr = ctx.new_ref_array(ClassId::new(0), 1);
             ctx.set_array_element(arr, 0, Value::Object(Some(tm)));
             Ok(Some(Value::Object(Some(arr))))
@@ -1707,15 +1706,37 @@ fn validate_cert_chain(
     }
 
     // Build the trust-anchor set. Prefer the anchors the application bound to
-    // this trust manager (via its KeyStore); fall back to the system trust
-    // store (keystore id 0 has no user entries) so the implicit default trust
-    // manager still validates — exactly what real-JDK does when init() is
-    // bypassed.
+    // this trust manager (via its KeyStore or PKIX params); fall back to the
+    // system trust store (keystore id 0 has no user entries) so the implicit
+    // default trust manager still validates — exactly what real-JDK does when
+    // init() is bypassed.
+    //
+    // FIX (tls-residuals): `trust_manager_state_by_id` (NOT
+    // `build_trust_manager_state` directly) — `tm_id` is a `tm_registry` id
+    // (from `x509_manager::register_trust_manager_state`) for the live
+    // PKIXFactory/SimpleFactory path, NOT a raw KeyStore registry id.
+    // Calling `build_trust_manager_state(tm_id)` directly treated it as one
+    // anyway, so `keystore::keystore_lookup` either hit an unrelated keystore
+    // that coincidentally shared the same small integer, or (far more often)
+    // found nothing — silently emptying the trust-anchor set and rejecting
+    // every chain for a fully valid PKIX-configured connector (e.g. Tomcat's
+    // OCSP-enabled connectors, which always go through
+    // `engineInit(ManagerFactoryParameters)` — no backing keystore at all).
     let tm_id = match this_obj {
         Some(Value::Object(Some(this_ref))) => read_trust_manager_id_from_obj(ctx, *this_ref),
         _ => 0,
     };
-    let trust = crate::x509_manager::build_trust_manager_state(tm_id);
+    let trust = crate::x509_manager::trust_manager_state_by_id(tm_id);
+    if std::env::var("CRATONVM_DBG_TLS_AUTH").is_ok() {
+        eprintln!(
+            "[dbg-tls-auth] validate_cert_chain tm_id={} anchor_ders={} anchors_groups={} keystore_id={} chain_len={}",
+            tm_id,
+            trust.anchor_ders.len(),
+            trust.anchors.len(),
+            trust.keystore_id,
+            chain_der.len()
+        );
+    }
 
     match crate::x509_manager::validate_chain(&chain_der, &trust) {
         Ok(()) => Ok(None),

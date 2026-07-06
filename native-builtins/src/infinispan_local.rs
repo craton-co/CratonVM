@@ -33,8 +33,17 @@
 //! |-------------------------------------------------------------|-------------|---------------|----------|
 //! | `org.infinispan.manager.DefaultCacheManager`                 | handle (J)  | config_name    | started  |
 //! | `org.infinispan.Cache`                                       | handle (J)  | name           | manager  |
-//! | `org.infinispan.configuration.cache.Configuration`           | name        | size_limit (I) | ttl_ms (J)|
-//! | `org.infinispan.configuration.global.GlobalConfiguration`    | site_name   | jmx_enabled    | reserved |
+//!
+//! `org.infinispan.configuration.cache.{Configuration,ConfigurationBuilder}`
+//! and `org.infinispan.configuration.global.{GlobalConfiguration,
+//! GlobalConfigurationBuilder}` are no longer backed by a synthetic field
+//! layout: their `build()` methods run real Infinispan bytecode (see
+//! `native_dcm_define_configuration` for how the real `Configuration`'s
+//! size/ttl are read back out via its real accessor API instead of a raw
+//! slot index). `class_manager::synthetic_stub_fields` still lists a 3-field
+//! layout for these four class names as a harmless padding floor (real
+//! Infinispan's field count is far larger, so the padding is a no-op) —
+//! see the "Wave 3-B (RE.4)" comment there.
 //!
 //! ## Why RwLock + VecDeque over a dedicated LRU crate
 //!
@@ -89,11 +98,6 @@ pub(crate) const CACHE_FIELD_HANDLE: usize = 0;
 pub(crate) const CACHE_FIELD_NAME: usize = 1;
 pub(crate) const CACHE_FIELD_MANAGER: usize = 2;
 pub(crate) const CACHE_NUM_FIELDS: usize = 3;
-
-pub(crate) const CONFIG_FIELD_NAME: usize = 0;
-pub(crate) const CONFIG_FIELD_SIZE_LIMIT: usize = 1;
-pub(crate) const CONFIG_FIELD_TTL_MS: usize = 2;
-pub(crate) const CONFIG_NUM_FIELDS: usize = 3;
 
 pub(crate) const GC_FIELD_SITE_NAME: usize = 0;
 pub(crate) const GC_FIELD_JMX_ENABLED: usize = 1;
@@ -895,8 +899,23 @@ fn native_dcm_cache_exists(ctx: &mut dyn NativeContext, args: &[Value]) -> Metho
     Ok(Some(Value::Int(if exists { 1 } else { 0 })))
 }
 
-/// `DefaultCacheManager.defineConfiguration(String, Configuration)` — we
-/// read the size/ttl fields off the Configuration object and stash.
+/// `DefaultCacheManager.defineConfiguration(String, Configuration)` — read
+/// the size/ttl back out of the real `Configuration` object via its real
+/// accessor API: `configuration.memory().maxCount()` and
+/// `configuration.expiration().lifespan()`, both via `invoke_virtual`.
+///
+/// `ConfigurationBuilder.build()` used to be shimmed as an identity wrapper
+/// (`native_cfg_build`, now removed) that returned the Builder itself
+/// relabeled as a `Configuration`, precisely so this function could read
+/// `CONFIG_FIELD_SIZE_LIMIT`/`CONFIG_FIELD_TTL_MS` off it by raw synthetic
+/// slot index. That shim caused a `ClassCastException` one call site up
+/// (real Infinispan code casting the "Configuration" back to its real type)
+/// once other code started reaching this path — see
+/// docs/known-issues/keycloak-model-infinispan-configurationbuilder-classcastexception.md.
+/// The fix: let real `ConfigurationBuilder.build()` bytecode construct a
+/// genuine `Configuration` (real field layout, ~18 nested config-section
+/// fields with no relation to size/ttl by position), and read size/ttl back
+/// out through its real API instead of a raw slot index.
 fn native_dcm_define_configuration(
     ctx: &mut dyn NativeContext,
     args: &[Value],
@@ -913,12 +932,40 @@ fn native_dcm_define_configuration(
     let config = obj_arg(args, 2);
     let (size, ttl_ms) = match config {
         Some(obj) => {
-            let s = match ctx.get_field(obj, CONFIG_FIELD_SIZE_LIMIT) {
-                Value::Int(v) if v >= 0 => v as usize,
+            let s = match ctx
+                .invoke_virtual(
+                    obj,
+                    "memory",
+                    "()Lorg/infinispan/configuration/cache/MemoryConfiguration;",
+                    &[],
+                )
+                .ok()
+                .flatten()
+            {
+                Some(Value::Object(Some(mem))) => {
+                    match ctx.invoke_virtual(mem, "maxCount", "()J", &[]).ok().flatten() {
+                        Some(Value::Long(v)) if v > 0 => v as usize,
+                        _ => DEFAULT_SIZE_LIMIT,
+                    }
+                }
                 _ => DEFAULT_SIZE_LIMIT,
             };
-            let t = match ctx.get_field(obj, CONFIG_FIELD_TTL_MS) {
-                Value::Long(v) if v > 0 => Some(Duration::from_millis(v as u64)),
+            let t = match ctx
+                .invoke_virtual(
+                    obj,
+                    "expiration",
+                    "()Lorg/infinispan/configuration/cache/ExpirationConfiguration;",
+                    &[],
+                )
+                .ok()
+                .flatten()
+            {
+                Some(Value::Object(Some(exp))) => {
+                    match ctx.invoke_virtual(exp, "lifespan", "()J", &[]).ok().flatten() {
+                        Some(Value::Long(v)) if v > 0 => Some(Duration::from_millis(v as u64)),
+                        _ => None,
+                    }
+                }
                 _ => None,
             };
             (s, t)
@@ -1230,24 +1277,6 @@ fn native_cache_replace(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCa
     Ok(Some(ret))
 }
 
-// ConfigurationBuilder.build() — return the builder as a Configuration.
-fn native_cfg_build(_ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    let this = match obj_arg(args, 0) {
-        Some(o) => o,
-        None => return Ok(Some(Value::Object(None))),
-    };
-    Ok(Some(Value::Object(Some(this))))
-}
-
-// GlobalConfigurationBuilder.build() — same identity wrapper.
-fn native_global_cfg_build(_ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    let this = match obj_arg(args, 0) {
-        Some(o) => o,
-        None => return Ok(Some(Value::Object(None))),
-    };
-    Ok(Some(Value::Object(Some(this))))
-}
-
 // ---------------------------------------------------------------------------
 // Public registration.
 // ---------------------------------------------------------------------------
@@ -1380,19 +1409,39 @@ pub fn register_infinispan_natives(registry: &mut NativeMethodRegistry) {
         );
     }
 
-    // ConfigurationBuilder / GlobalConfigurationBuilder .build()
-    registry.register(
-        CLS_CONFIG_BUILDER,
-        "build",
-        "()Lorg/infinispan/configuration/cache/Configuration;",
-        native_cfg_build,
-    );
-    registry.register(
-        CLS_GLOBAL_CONFIG_BUILDER,
-        "build",
-        "()Lorg/infinispan/configuration/global/GlobalConfiguration;",
-        native_global_cfg_build,
-    );
+    // ConfigurationBuilder.build() is intentionally NOT overridden here (as
+    // of this fix). It used to be shimmed as an identity wrapper
+    // (`native_cfg_build`, return `this` relabeled as the return type),
+    // which left the returned object's REAL runtime class as
+    // `ConfigurationBuilder` instead of a genuine `Configuration`. Real
+    // Infinispan code that casts the "Configuration" back to its real type —
+    // `CoreConfigurationSerializer.writeCacheContainer` does exactly that —
+    // hit a real `ClassCastException` naming `ConfigurationBuilder`, reached
+    // once the sibling `GlobalConfigurationBuilder.build()` fix (below) let
+    // Keycloak's cache bootstrap get this far. See
+    // docs/known-issues/keycloak-model-infinispan-configurationbuilder-classcastexception.md
+    // (now fixed) and `native_dcm_define_configuration`'s doc comment for how
+    // its raw synthetic-slot-index reads of `Configuration`'s size/ttl were
+    // reworked to use `Configuration`'s real accessor API instead, which is
+    // what let this identity wrapper be safely removed too.
+    //
+    // GlobalConfigurationBuilder.build() is intentionally NOT overridden here.
+    // It used to be shimmed as an identity wrapper (return `this` relabeled
+    // as the return type), which left the returned object's REAL runtime
+    // class as `GlobalConfigurationBuilder` instead of a genuine
+    // `GlobalConfiguration`. Real Infinispan's `GlobalConfigurationBuilder`
+    // has no `isClustered()` method (only `GlobalConfiguration` does), so any
+    // caller that invoked `isClustered()` on the "GlobalConfiguration" the
+    // shim handed back hit a real `NoSuchMethodError` naming
+    // `GlobalConfigurationBuilder` — e.g. Infinispan's own
+    // `CoreConfigurationSerializer.writeJGroups`, which every
+    // `testsuite/model` Keycloak test reaches during cache bootstrap. Unlike
+    // `ConfigurationBuilder`/`Configuration` above, nothing in this file reads
+    // `GlobalConfiguration`'s fields by synthetic slot index (`GC_FIELD_*` are
+    // declared but never read; `native_dcm_init` ignores its
+    // `GlobalConfiguration` argument entirely), so it is safe to let the real,
+    // correct `GlobalConfigurationBuilder.build()` bytecode run and construct
+    // a genuinely distinct, correctly-typed `GlobalConfiguration` instance.
     registry.set_category(__prev_cat);
 }
 
@@ -1764,6 +1813,74 @@ mod tests {
             StoredValue::Primitive(Value::Int(3)),
         );
         assert_eq!(cache.size(), 2, "size_limit=2 must be honoured");
+    }
+
+    /// Regression test for the `ConfigurationBuilder.build()`
+    /// `ClassCastException` fix
+    /// (docs/known-issues/keycloak-model-infinispan-configurationbuilder-classcastexception.md,
+    /// now fixed): `native_dcm_define_configuration` must read size/ttl off
+    /// a `Configuration` object through its real accessor API
+    /// (`memory().maxCount()` / `expiration().lifespan()`, both via
+    /// `invoke_virtual`) rather than a raw synthetic slot index. This test
+    /// stands in for a real `Configuration` object with a mock whose
+    /// `invoke_virtual` hook only understands those four real method names —
+    /// it has NO synthetic slots at all, so if the native regressed back to
+    /// `ctx.get_field(obj, N)` this test's mock would return `Value::Int(0)`
+    /// (the mock's zeroed default) for every field read, silently passing
+    /// with the wrong (default) values instead of the scripted 777/45000 —
+    /// so the test also asserts the values are NOT the size/ttl defaults.
+    #[test]
+    fn t19_10_define_configuration_reads_via_real_accessor_api_not_raw_slots() {
+        let _g = test_lock();
+        reset_manager_for_tests();
+
+        fn hook(
+            ctx: &mut crate::test_utils::MockNativeContext,
+            _receiver: ObjectRef,
+            method_name: &str,
+            _descriptor: &str,
+            _args: &[Value],
+        ) -> Option<MethodCallResult> {
+            match method_name {
+                "memory" => Some(Ok(Some(Value::Object(Some(ctx.fresh_object_ref()))))),
+                "maxCount" => Some(Ok(Some(Value::Long(777)))),
+                "expiration" => Some(Ok(Some(Value::Object(Some(ctx.fresh_object_ref()))))),
+                "lifespan" => Some(Ok(Some(Value::Long(45_000)))),
+                _ => None,
+            }
+        }
+
+        let mut ctx = mock_ctx();
+        ctx.set_invoke_virtual_hook(hook);
+
+        let name_obj = ctx.create_string("real-cfg-cache");
+        // Stand-in for the real `Configuration` object real
+        // `ConfigurationBuilder.build()` bytecode would construct — its own
+        // fields are irrelevant since the fix reads through `invoke_virtual`,
+        // never `get_field`, on this object.
+        let config_obj = ctx.fresh_object_ref();
+
+        let result = native_dcm_define_configuration(
+            &mut ctx,
+            &[
+                Value::Object(None),
+                Value::Object(Some(name_obj)),
+                Value::Object(Some(config_obj)),
+            ],
+        );
+        assert!(result.is_ok(), "defineConfiguration must succeed: {result:?}");
+
+        let cache = global_manager().get_cache("real-cfg-cache").unwrap();
+        assert_eq!(
+            cache.size_limit, 777,
+            "size_limit must come from memory().maxCount(), not a default/garbage slot read"
+        );
+        assert_eq!(
+            cache.default_ttl,
+            Some(Duration::from_millis(45_000)),
+            "default_ttl must come from expiration().lifespan(), not a default/garbage slot read"
+        );
+        assert_ne!(cache.size_limit, DEFAULT_SIZE_LIMIT);
     }
 
     #[test]

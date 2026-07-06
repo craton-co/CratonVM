@@ -1,6 +1,6 @@
 # WildFly domain startup timeout with repeated corrupt `Value` cell guard
 
-Status: OPEN
+Status: OPEN (root-cause candidate identified 2026-07-06, needs full-suite confirmation)
 Severity: High
 First confirmed: 2026-07-05 on Azure worktree `codex/wildfly-nonpassed-probes-20260705-035722`
 
@@ -47,3 +47,142 @@ wall-clock=128s
 ## Notes
 
 This is distinct from the fixed process-controller module-path bug. The old immediate `ModuleNotFoundException` and `MDC.put` linkage failure are gone with `cratonvm-wildfly-nonpassed-20260705-035722-mpmulti2`; the remaining failure is a real 120-second domain startup timeout with a repeated guarded heap-corruption signature.
+
+This bug report and the `gen_heap::read_slot` HIB-CV-32 discriminant guard it references were both added in the same commit (`a3728860`, 2026-07-05, "Fix WildFly non-passed suite blockers") — that commit's `gen_heap.rs` changes are unrelated conservative-root-candidate hardening (Family-A), not a fix for this guard's trigger. The root cause of *why* the slot decodes to an out-of-range discriminant (`0x...09` here, valid range is `0..=6`) was left open.
+
+## 2026-07-06 investigation (this session)
+
+Evidence-gathering only — no reproduction achieved, no code change made. Recorded so the next session doesn't re-walk the same ruled-out path.
+
+**Hypothesis 1 (ruled out): plain-field 16-byte `Value` slot tearing.** Same day this doc was filed, three commits closed a real mutator-vs-mutator tearing gap in plain (non-volatile) `getfield`/`putfield`: interpreter `read_slot`/`write_slot` across all three heap backends (`2dfdfddc`), the older JIT `jit_putfield_*` fix (`4e6b560f`), and JIT `jit_getfield`'s read side (`5198fccd`, landed via `investigate/aqs-rwl-writer-contention-jit-hang`) — all now on `dev`. `EEConcurrencyExecutorShutdownTestCase`'s concurrent-executor shape is exactly the kind of code this bug hits, so this looked like the fix at first.
+
+It is **not**, on closer reading of `types/src/value.rs`'s own doc comments (`read_value_atomic`/`write_value_atomic`, `read_value_checked_atomic`): "for a statistically-typed Java field the discriminant word is invariant across stores, so even a cross-word 'torn' pair reconstructs to a valid `Object(ptr-or-null)`/primitive — **never a spliced garbage pointer**." A single Java field only ever stores one `Value` variant, so tearing between two writes to the *same* field can produce a stale or torn *payload*, but never an out-of-range *discriminant* — the exact HIB-CV-32 guard this report's log line trips. Confirmed empirically too: a synthetic repro (two real OS threads, one hammering `h.x = A/B` on a shared `int` field via a JIT-OSR-compiled loop, one reading it, `CRATONVM_DIAG_HIB32=1`) ran ~200M iterations/side with `bad=0` on both a pre-tearing-fix baseline build (`164264c8`) and current `dev` — consistent with this bug class only affecting payload staleness, not discriminant validity. Array element access was also audited (two independent passes) and confirmed **not** to share this bug class at all: array elements are packed native-width primitives or bare 8-byte pointers, never the 16-byte tagged `Value` layout object fields use.
+
+**Hypothesis 2 (best candidate, unconfirmed): JIT `getfield` reference-oop mistagging.** Commit `e60b7a5c` (2026-07-06, `fix/jasper-jdt-parser-aioobe-20260706`, already on `dev`) fixed a *different*, more topically-relevant bug: `getfield`'s three x86-64 codegen paths never marked a reference-typed field's loaded value as a GC oop on the JIT operand stack, so it silently decayed to a plain `Int` (holding the raw pointer bits) at any GC-safepoint or deopt boundary that captured it while uncommitted — confirmed in that investigation via `CRATONVM_DBG_DEOPT=1` showing a `char[][]` field's value captured as `Int(4332917944)` instead of `Object(...)`. This is precisely the shape of "heap reference-integrity defect" HIB-CV-32 exists to survive: a live reference silently mistyped, subsequently mis-relocated/mis-collected/misused, eventually landing on a slot read that decodes bytes belonging to something else (e.g. an object header's `num_slots`/flags fields — `raw0=0x0000000100000009` reads suspiciously like `num_slots=9, some 1-valued flag` rather than any real `Value` encoding). The fix is unconditional (no feature flag), so it applies to any reference-typed `getfield`, not just the JDT parser call sites that surfaced it — plausible for WildFly's heavy dynamic-module/executor code under GC pressure during domain startup.
+
+**Not yet confirmed empirically.** Two synthetic repros were attempted against the pre-fix baseline (`164264c8`, predates `e60b7a5c`): a generic reference-field-getfield-plus-allocation loop, and a closer mirror of the original JDT idiom (`this.intStack[this.intPtr--]` immediately followed by a reference-element-array `System.arraycopy`, inside an OSR-compiled instance-method loop, matching the exact shape documented in `docs/internal/jasper-jdt-parser-arrayindexoutofbounds.md`). Both ran to 200k+ iterations with zero mismatches and no HIB-CV-32 guard hits, confirming OSR-compilation occurred (`CRATONVM_DBG_JITC=1` showed `OSR-compile`/`bg-compile tier=C2`) but not exercising whatever precise interleaving is needed. This matches that same JDT investigation's own account: even the team that root-caused and fixed bug #1 "could not get a minimal standalone Java repro to fail-then-pass" for the *tearing* commit, and needed 12 purpose-built, iteratively-refined synthetic probes (T3–T14) to reliably trigger *this* bug family at all — a repro budget well beyond what this session could allocate as a side-investigation.
+
+**Recommended next step:** re-run `EEConcurrencyExecutorShutdownTestCase` (and ideally the full WildFly domain-mode slice) end-to-end against current `dev` (which now includes `e60b7a5c` and all three tearing fixes). This needs a rebuilt WildFly distribution + Arquillian domain harness on a build host — the prior evidence run's artifacts and the Azure host's WildFly build were both lost to disk-pressure cleanup since 2026-07-05, so this is a from-scratch rebuild (WildFly `install -DskipTests` alone took ~54 min in the original suite run), out of scope for this session. If the guard diagnostic and timeout are gone, close this out referencing `e60b7a5c`; if not, the synthetic repros in `docs/known-issues/repros/wildfly-domain-startup-timeout/` (`FieldTearRepro.java`, `ParserIdiomRepro.java`) are a starting point to iterate into a reliable standalone trigger, same as the JDT investigation's T-series did.
+
+## 2026-07-06 update (parallel session) — boot-infrastructure blocker found; live E2E still not reachable
+
+A second, independent investigation this same day tried the "rebuild the WildFly
+distribution and re-run E2E" next step above via a shortcut: rather than a full
+`wildfly-core` testsuite + Maven build (not available on the Azure probe host used),
+it downloaded a **binary** WildFly 32.0.1.Final distribution from GitHub releases (no
+Maven build needed) and drove `bin/standalone.sh`/`bin/domain.sh` directly under a fresh
+`dev`-HEAD `cratonvm`, using the same real-JDK/`--nojit` configuration
+`apps/wildfly-suite-runner/run-suite.sh` uses.
+
+This did not reach far enough to re-observe (or rule out) either hypothesis above: both
+boots stall **before** any application-level service does real, sustained work.
+CratonVM only drives the real `Service.start(StartContext)` MSC callback when
+`CRATONVM_MSC_REAL_START=1` is set (default off — see
+`docs/internal/app-jvm-bugs/handoff-wildfly-msc-service-start.md`, an existing,
+separately-tracked, explicitly-incomplete effort). `run-suite.sh` never sets this flag,
+so with the default configuration the very first application-level MSC service install
+after `WFLYSRV0049 ... starting` never signals completion and the boot hangs
+indefinitely — confirmed via `CRATONVM_DEFAULT_WATCHDOG_SEC` + the built-in stack-dump
+watchdog to be a genuine parked wait (all non-daemon threads idle in
+`EnhancedQueueExecutor$ThreadBody.run`, near-0% CPU), not slow interpretation. Turning
+the flag on gets standalone mode further, but into an unrelated
+`ServiceNotFoundException` (`BootstrapImpl.internalBootstrap` failing to resolve
+`Services.JBOSS_AS`) within ~3 seconds, and makes domain mode hang even earlier with no
+error at all. Filed as
+[bug-15](../internal/wildfly-suite-bugs/bug-15-msc-real-start-servicenotfound-and-domain-hang.md)
+— a boot-infrastructure gap orthogonal to both hypotheses above, but one that must be
+resolved (or Maven + the real testsuite restored) before *either* hypothesis can be
+confirmed or refuted against a live, sustained-load domain-mode process again.
+
+**Combined recommended next step:** whoever picks this up next needs one of (a) Maven +
+a `wildfly-core` testsuite checkout to rerun the actual Arquillian test, or (b) progress
+on bug-15 (the MSC real-start gate) so a hand-driven binary-distribution boot can reach
+real sustained concurrent execution — only then can Hypothesis 2 above (or a new one) be
+tested against a live process again. The `FieldTearRepro.java`/`ParserIdiomRepro.java`
+synthetic repros remain the fastest path to iterate on Hypothesis 2 without either.
+
+## 2026-07-06 update (third session) — Hypothesis 2 traced end-to-end at the code level; weakened
+
+Rather than another blind synthetic-repro attempt, this session traced Hypothesis 2's
+actual runtime consequence through the code, since a repro couldn't be forced (see below)
+and the previous two sessions' repro attempts had already come up empty:
+
+1. **The mistagged value genuinely reaches the resumed interpreter frame — this part of
+   Hypothesis 2 is confirmed, not speculative.** A getfield result left unmarked as an
+   oop on the JIT operand stack is captured at deopt as `FrameValue::Int(raw_pointer)`,
+   and `fv_to_value` (`vm/src/runtime/interpreter.rs`) maps `FrameValue::Int` straight to
+   `Value::Int` — unlike `FrameValue::Unsupported` (the *locals*-only failure mode from
+   the *separate* bug #2 in the same `e60b7a5c` fix), which `ir_deopt_frame_values`/
+   `ir_deopt_locals` reject outright (the whole `.collect()` short-circuits to `None`,
+   forcing a safe whole-method re-run instead). Bug #1 (operand stack) and bug #2
+   (locals/params) are two different oop-tracking mechanisms with two different failure
+   modes — only #2's failure is caught by that reject-on-`Unsupported` safety net. So a
+   `Value::Int(raw_pointer_bits)` really does land on the resumed interpreter's operand
+   stack where bytecode expects an `Object`, exactly as the original write-up describes.
+
+2. **But the JDT idiom's own next consumer — `System.arraycopy` — is type-safe against
+   this, so it can't be the vector for THIS specific symptom.**
+   `native_system_arraycopy` (`native-builtins/src/lang_system.rs`) extracts `src`/`dest`
+   via `match args.first() { Some(Value::Object(Some(obj))) => *obj, _ => return
+   NullPointerException }` — a mistagged `Value::Int` here throws a benign (if
+   misleadingly-worded) NPE, not a wild pointer dereference. Whatever the JDT
+   investigation's `CRATONVM_DBG_DEOPT` trace captured, it did not go on to corrupt
+   memory via this call; the JDT bug's own observed symptom (AIOOBE) is fully explained
+   by bug #3 (the unsafe re-run double-executing `stack[ptr--]`), independent of whether
+   bug #1's mistagging ever caused any further harm.
+
+3. **Under CratonVM's DEFAULT configuration — what WildFly's suite runner and both prior
+   hand-driven repro attempts use — bug #1's oop-marking gap has no GC-liveness
+   consequence at all.** `vm/src/jit/conservative_roots.rs`'s own module doc: while
+   `CRATONVM_PRECISE_JIT_MAPS` is unset (default), active JIT frames are scanned
+   *conservatively* — every 8-byte-aligned stack qword is treated as a *possible* heap
+   pointer and validated via `is_object_address`, independent of any oop mark ("false
+   negatives are impossible... every real reference is at an 8-byte aligned spill slot").
+   So a getfield result missing `mark_top_as_oop()` is still found and kept alive by a
+   plain GC pause — the oop mark only matters for `CRATONVM_PRECISE_JIT_MAPS`/
+   `CRATONVM_MOVING_YOUNG` (both default-off) or a deopt (see #1/#2 above). This rules
+   out the "prematurely collected while unrooted, then dereferenced through reused
+   memory" mechanism as the DEFAULT-config explanation — that mechanism is real but only
+   fires under those non-default flags.
+
+**Net effect: Hypothesis 2, as literally stated (`e60b7a5c`'s getfield-oop-marking fix),
+does not by itself explain how an out-of-range *discriminant* — not just a wrong *value*
+— appears in a heap `Value` cell under CratonVM's default configuration.** A mistagged
+reference produces a `Value::Int` holding raw pointer bits, which is a real, distinct
+correctness bug (wrong value, right discriminant tag) but not the literal "16-byte cell
+whose bytes don't form any valid `Value`" signature this guard fires on, at least not via
+the two consumer paths traced here (arraycopy call, GC root scan). Something must still
+either (a) feed that mistagged `Value::Int` into some OTHER, not-yet-identified consumer
+that skips the safe `Value`-matching CratonVM otherwise uses everywhere (a raw,
+untagged machine-code dereference in re-JIT-compiled continuation code is the most
+likely remaining candidate, not yet traced), or (b) be a mechanism unrelated to either
+hypothesis investigated so far.
+
+**Repro-engineering attempt (also inconclusive, recorded to save the next session the
+same dead end):** built a from-scratch mirror of the JDT idiom
+(`this.intStack[this.intPtr--]` immediately followed by `System.arraycopy` on a
+reference-element `char[][]`), tried three variants against the pre-fix baseline
+(`164264c8`) — a version with the hot loop and the idiom in separate methods, an inlined
+single-method version, and both a zero-length and a `len=4` real reference-array copy
+(the zero-length call turned out to bypass the element-kind guard entirely via the
+intrinsic's own dedicated zero-length fast exit — worth knowing if reused). None of the
+three ever produced a single `[cratonvm-deopt]` trace line for the arraycopy call site
+across 200,000 iterations each (`CRATONVM_DBG_DEOPT=1`) — the guard this session expected
+to fail on every call, per the original bug write-up, never visibly fired. Did not
+resolve why (candidates: the intrinsic wasn't applied to this exact call shape at all,
+`consumeLike()`-as-separate-method never got hot enough to compile independently even
+after 200k calls — confirmed no `bg-compile GetfieldOopRepro.consumeLike` line ever
+appeared, only `runLoop`'s own OSR-compile — or a precondition specific to real JDT
+bytecode this synthetic mirror doesn't reproduce). Separately hit and worked around an
+unrelated JIT footgun: `println`/string-concatenation (`invokedynamic`) inside the same
+hot loop triggers an `UnreachedCode` uncommon-trap on the *dead* `StringConcatFactory`
+branch that silently truncates the loop's remaining iterations without any exception —
+harmless once known, but worth flagging for whoever writes the next synthetic probe here.
+
+**Recommended next step:** the fastest remaining path is very likely a full Arquillian
+E2E rerun (still blocked on Maven/wildfly-core availability and bug-15), since three
+sessions' worth of synthetic-repro and code-tracing effort has not yet nailed a minimal
+standalone trigger. If another synthetic attempt is still preferred over waiting on
+infra, first confirm the arraycopy intrinsic guard is even being exercised (e.g. add a
+`CRATONVM_DBG_JITC`/direct disassembly check that `ArraycopyPrimitive`'s guard code is
+actually emitted and taken) before investing further iteration count.

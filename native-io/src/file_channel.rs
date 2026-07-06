@@ -794,6 +794,21 @@ pub fn register_file_channel_real(r: &mut NativeMethodRegistry) {
         "(Ljava/io/FileDescriptor;[I)V",
         native_filekey_init,
     );
+    // Real Unix OpenJDK's `FileKey` (confirmed via javap against an actual
+    // JDK 25 install) does NOT use the Windows-shaped int[3] convention
+    // above at all — it's `private static native void init(FileDescriptor,
+    // long[])` filling `result[0]=st_dev`, `result[1]=st_ino`, consumed by a
+    // 2-arg `FileKey(long, long)` ctor. Without this second overload,
+    // `FileKey.init` resolves to a real (unintercepted) JDK method with no
+    // matching native for the ACTUAL descriptor the class file declares ->
+    // `UnsatisfiedLinkError` on the first `FileChannel.lock()`/`tryLock()` in
+    // real-JDK mode on Linux (e.g. Tomcat's `OcspBaseTest` responder lock).
+    r.register(
+        "sun/nio/ch/FileKey",
+        "init",
+        "(Ljava/io/FileDescriptor;[J)V",
+        native_filekey_init_longs,
+    );
     r.set_category(__prev_cat);
 }
 
@@ -907,6 +922,53 @@ fn native_filekey_init(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCal
         ctx.set_array_element(arr, 2, Value::Int(lo as i32));
     }
     Ok(None)
+}
+
+/// `sun/nio/ch/FileKey.init(FileDescriptor fd, long[] result)` — the real
+/// Unix JDK overload (see the module comment's update above): fill
+/// `result[0]=st_dev`, `result[1]=st_ino`. Distinct from
+/// `native_filekey_init`'s invented int[3] convention, which only matches a
+/// Windows-shaped `FileKey` class and is never the descriptor a real Unix
+/// JDK class file declares.
+fn native_filekey_init_longs(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let fd_obj = fd_arg(args, 0)?;
+    let arr = match args.get(1) {
+        Some(Value::Object(Some(a))) => *a,
+        _ => return Err(io_error("FileKey.init: null result array")),
+    };
+    let fd = fd_from_descriptor(ctx, fd_obj)
+        .ok_or_else(|| io_error("FileKey.init: FileDescriptor has no open handle"))?;
+    let (dev, ino) = file_identity_pair(ctx, fd);
+    if ctx.array_length(arr) >= 2 {
+        ctx.set_array_element(arr, 0, Value::Long(dev));
+        ctx.set_array_element(arr, 1, Value::Long(ino));
+    }
+    Ok(None)
+}
+
+/// Resolve `(st_dev, st_ino)` for an open fd — the real Unix JDK's own
+/// `FileKey` identity pair, no repacking into 32-bit halves. Falls back to
+/// the fd id (never fails), same infallibility contract as
+/// `file_identity_triple`.
+fn file_identity_pair(ctx: &mut dyn NativeContext, fd: FdId) -> (i64, i64) {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        if let Ok(file) = ctx.fd_table().clone_file(fd) {
+            if let Ok(md) = file.metadata() {
+                return (md.dev() as i64, md.ino() as i64);
+            }
+        }
+    }
+    #[cfg(windows)]
+    {
+        // The real Windows `FileKey` uses the int[]-based overload
+        // (`native_filekey_init`) exclusively — this descriptor is a
+        // Unix-only real-JDK signature and should never be called here, but
+        // stay infallible for consistency with its sibling.
+        let _ = ctx;
+    }
+    (fd as i64, fd as i64)
 }
 
 /// Variant of `map0` for legacy FileChannelImpl signatures where

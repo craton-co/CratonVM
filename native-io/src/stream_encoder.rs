@@ -10,22 +10,57 @@
 //! internals we don't cover; this synthetic implementation keeps its
 //! state in three indexed scratch fields:
 //!
-//! | slot | meaning                                    |
-//! |------|--------------------------------------------|
-//! | 0    | underlying `java.io.OutputStream`          |
-//! | 1    | `java.lang.String` — canonical charset name|
-//! | 2    | `int` — `1` if closed, `0` otherwise        |
+//! | slot | meaning                                              |
+//! |------|-------------------------------------------------------|
+//! | 0    | underlying `java.io.OutputStream`                     |
+//! | 1    | `java.lang.String` — canonical charset name            |
+//! | 2    | `int` — side-table id for the pending-bytes buffer (see `SE_ID` below) |
 //!
 //! Cross-call surrogate carry uses the REAL `sun.nio.cs.StreamEncoder` fields
 //! `haveLeftoverChar` (boolean) and `leftoverChar` (char) by name — the exact
 //! mechanism the JDK's own `StreamEncoder` uses to hold an unmatched high
 //! surrogate between writes. They must be the real primitive fields (not an
 //! indexed scratch slot): the encoder is allocated with the real class id, so
-//! low indexed slots alias the real reference-typed fields (`cs`/`encoder`/`bb`)
-//! and would not round-trip a primitive `int`. Without this carry, a surrogate
-//! pair split across two writes (e.g. a servlet `Writer` writing one char at a
+//! `ctx.get_field`/`set_field` at an index are descriptor-aware and address
+//! whichever real field the VM's internal layout puts at that index — see the
+//! `SE_ID` constant's doc comment for how the three indices actually used
+//! here (0, 1, 2) were verified safe. Without the surrogate carry, a pair
+//! split across two writes (e.g. a servlet `Writer` writing one char at a
 //! time) encodes each half as a lone surrogate and corrupts supplementary-plane
 //! text to U+FFFD (Tomcat BUG-TC0622).
+//!
+//! ## Output buffering (byte-count-based commit-threshold fidelity)
+//!
+//! Earlier versions of this shim called the underlying `OutputStream.write`
+//! on EVERY `write(String|char[]|int)` call — i.e. no internal buffering at
+//! all. The real JDK `sun.nio.cs.StreamEncoder` buffers encoded bytes into an
+//! internal `ByteBuffer` (`INITIAL_BYTE_BUFFER_CAPACITY = 512`, growable up to
+//! `MAX_BYTE_BUFFER_CAPACITY = 8192`) and only calls the underlying stream's
+//! `write` when that buffer actually fills — e.g. writing 1024 separate
+//! 16-byte `Writer.print()` calls reaches the underlying stream via a HANDFUL
+//! of ~512-byte batched writes on real HotSpot, not 1024 individual 16-byte
+//! writes.
+//!
+//! This distinction is directly observable through
+//! `HttpServlet`'s legacy `NoBodyOutputStream.checkCommit()`, which flips the
+//! response to committed the first time its running byte counter exceeds the
+//! configured buffer size — a counter fed by however many bytes arrive per
+//! underlying-stream `write` call. Flushing eagerly (one small write per
+//! `Writer` call) overshoots that threshold on a different byte boundary than
+//! real HotSpot's batched flush, decoupling CratonVM's commit timing from
+//! upstream Tomcat's carefully-tuned `bufferSize` adjustment formula in
+//! `HttpServletDoHeadBaseTest` (see
+//! `docs/known-issues/dohead-streamencoder-eager-flush-commit-threshold.md`).
+//!
+//! The Rust-side `SeState.pending` buffer below reproduces the real
+//! 512-byte-initial / 8192-byte-max growable-buffer behaviour so the
+//! underlying stream sees the same write-call granularity as real HotSpot.
+//! It cannot live in an object field (see the GC-safety note on
+//! [`crate::stream_decoder`] — the encoder is allocated with the REAL
+//! `sun/nio/cs/StreamEncoder` class id, so the collector scans it via that
+//! class's real reference map and would not root an extra scratch-slot
+//! reference), so it lives in the same kind of side-table keyed by a stable
+//! `int` id that `stream_decoder.rs` uses for its charset name / carry state.
 
 use cratonvm_native_api::charset as engine;
 use cratonvm_native_api::{NativeContext, NativeMethodRegistry};
@@ -34,8 +69,62 @@ use cratonvm_types::{ArrayElementType, ClassId, ObjectRef, Value};
 
 const SE_OUTPUT: usize = 0;
 const SE_NAME: usize = 1;
-const SE_CLOSED: usize = 2;
+// The encoder is allocated with the REAL `sun/nio/cs/StreamEncoder` class id
+// (see `alloc_stream_encoder`), so `ctx.get_field(obj, N)` / `set_field(obj,
+// N, _)` are descriptor-aware and address the REAL class's Nth declared
+// instance field (whatever that real field's actual type is) — NOT a bare
+// scratch slot. Writing a `Value::Int` to a slot whose real field is
+// reference-typed silently coerces to `Object(None)` on readback instead of
+// erroring, so an unsafe slot choice fails silently rather than loudly.
+//
+// This slot was chosen by EMPIRICAL probing (temporarily writing sentinel
+// ints 0..9 and comparing before/after each by-name write this file makes —
+// `encoder`, `haveLeftoverChar`, `leftoverChar` — see git history for the
+// probe if this ever needs re-verifying after a JDK field-layout change):
+// only indices 2, 6, and 8 round-trip an `Int` at all (the rest are
+// reference-typed and coerce to `Object(None)`), and none of the three
+// by-name writes above touch index 2. Do NOT assume `javap`'s declaration
+// order matches this VM's internal slot order — an earlier version of this
+// fix picked index 4 by reasoning from `javap sun.nio.cs.StreamEncoder`
+// output alone (predicting `maxBufferCapacity`, a primitive int) and it
+// turned out to be reference-typed in this VM's actual layout, so the id
+// silently coerced to `Object(None)` = 0 for every encoder, i.e. two
+// concurrent StreamEncoders (e.g. the invalid-write loop's encoder and the
+// post-`resp.reset()` valid-write loop's fresh encoder in the legacy
+// `HttpServlet.doHead()` tests) shared one side-table entry — see
+// docs/known-issues/dohead-streamencoder-eager-flush-commit-threshold.md.
+const SE_ID: usize = 2;
 const SE_NUM_FIELDS: usize = 3;
+
+/// Mirrors `sun.nio.cs.StreamEncoder.INITIAL_BYTE_BUFFER_CAPACITY`.
+const INITIAL_BYTE_BUFFER_CAPACITY: usize = 512;
+/// Mirrors `sun.nio.cs.StreamEncoder.MAX_BYTE_BUFFER_CAPACITY`.
+const MAX_BYTE_BUFFER_CAPACITY: usize = 8192;
+
+/// Per-encoder pending-bytes buffer, side-tabled by a stable id (see the
+/// module doc's GC-safety note). Mirrors the real StreamEncoder's `bb`
+/// growable `ByteBuffer` field closely enough to reproduce its flush
+/// granularity: starts at 512 bytes, grows (capped at 8192) only when a
+/// pending encode would overflow the current capacity, and is flushed to the
+/// underlying stream only when actually full — never eagerly per `write()`
+/// call.
+#[derive(Default)]
+struct SeState {
+    pending: Vec<u8>,
+    capacity: usize,
+}
+
+fn se_table() -> &'static std::sync::Mutex<std::collections::HashMap<i32, SeState>> {
+    static T: std::sync::OnceLock<std::sync::Mutex<std::collections::HashMap<i32, SeState>>> =
+        std::sync::OnceLock::new();
+    T.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+}
+
+static SE_NEXT_ID: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(1);
+
+fn se_id(ctx: &dyn NativeContext, this: ObjectRef) -> i32 {
+    ctx.get_field(this, SE_ID).as_int().unwrap_or(0)
+}
 
 fn obj_arg(args: &[Value], i: usize) -> Option<ObjectRef> {
     match args.get(i) {
@@ -151,7 +240,15 @@ pub(crate) fn alloc_stream_encoder(
     let name = ctx.create_string(charset_name);
     ctx.set_field(obj, SE_OUTPUT, Value::Object(Some(os)));
     ctx.set_field(obj, SE_NAME, Value::Object(Some(name)));
-    ctx.set_field(obj, SE_CLOSED, Value::Int(0));
+    let id = SE_NEXT_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    ctx.set_field(obj, SE_ID, Value::Int(id));
+    se_table().lock().unwrap().insert(
+        id,
+        SeState {
+            pending: Vec::with_capacity(INITIAL_BYTE_BUFFER_CAPACITY),
+            capacity: INITIAL_BYTE_BUFFER_CAPACITY,
+        },
+    );
     // No pending high surrogate yet (real-field carry, cleared explicitly).
     clear_pending(ctx, obj);
     obj
@@ -385,18 +482,105 @@ fn write_bytes(
     }
     let to_encode = &combined[..encode_len];
 
-    let os = match ctx.get_field(this, SE_OUTPUT) {
-        Value::Object(Some(s)) => s,
-        _ => return Ok(()),
-    };
     let name = name_of(ctx, this);
     let bytes = encode_for_stream(ctx, this, &name, to_encode)?;
     if bytes.is_empty() {
         return Ok(());
     }
+    buffer_and_maybe_flush(ctx, this, &name, &bytes)?;
+    Ok(())
+}
+
+/// Append `bytes` to this encoder's pending buffer (side-tabled — see the
+/// module doc), growing it the way real `StreamEncoder.growByteBufferIfNeeded`
+/// does, and flush the accumulated bytes to the underlying stream only when
+/// the buffer is actually full. This reproduces the real JDK's write-call
+/// granularity to the underlying `OutputStream` (batches of up to
+/// `MAX_BYTE_BUFFER_CAPACITY` bytes) instead of one underlying `write` per
+/// `Writer` call — see the module doc for why that granularity matters
+/// (`NoBodyOutputStream.checkCommit`'s byte-count-based commit threshold).
+///
+/// `name` is accepted (unused beyond documentation intent) for symmetry with
+/// the real method's signature, which estimates the grow target from
+/// `maxBytesPerChar()`; here we already have the real encoded byte length so
+/// no per-charset estimate is needed.
+fn buffer_and_maybe_flush(
+    ctx: &mut dyn NativeContext,
+    this: ObjectRef,
+    _name: &str,
+    bytes: &[u8],
+) -> Result<(), cratonvm_types::error::MethodCallFailed> {
+    let id = se_id(ctx, this);
+
+    // A single write larger than the max buffer capacity is written straight
+    // through (after flushing anything already pending), rather than
+    // growing the buffer unboundedly — mirrors real StreamEncoder's overflow
+    // handling, which never grows `bb` past `maxBufferCapacity`.
+    if bytes.len() > MAX_BYTE_BUFFER_CAPACITY {
+        flush_pending_buffer(ctx, this)?;
+        return write_through(ctx, this, bytes);
+    }
+
+    let flushed = {
+        let mut table = se_table().lock().unwrap();
+        let state = table.entry(id).or_insert_with(|| SeState {
+            pending: Vec::with_capacity(INITIAL_BYTE_BUFFER_CAPACITY),
+            capacity: INITIAL_BYTE_BUFFER_CAPACITY,
+        });
+        // Grow toward (but never past) MAX_BYTE_BUFFER_CAPACITY if the
+        // incoming bytes wouldn't fit in the buffer's CURRENT capacity —
+        // mirrors `growByteBufferIfNeeded` only reallocating when needed.
+        if state.capacity < MAX_BYTE_BUFFER_CAPACITY && bytes.len() > state.capacity {
+            state.capacity = bytes.len().min(MAX_BYTE_BUFFER_CAPACITY);
+        }
+        if bytes.len() > state.capacity.saturating_sub(state.pending.len()) {
+            // Doesn't fit in the remaining space even after growth: flush
+            // what's pending first, then place `bytes` into the now-empty
+            // buffer (it fits, since bytes.len() <= MAX_BYTE_BUFFER_CAPACITY
+            // <= capacity after growth, checked above).
+            let flushed = std::mem::take(&mut state.pending);
+            state.pending.extend_from_slice(bytes);
+            Some(flushed)
+        } else {
+            state.pending.extend_from_slice(bytes);
+            None
+        }
+    };
+    if let Some(flushed) = flushed {
+        write_through(ctx, this, &flushed)?;
+    }
+
+    // Deliberately do NOT flush here even if the buffer is now exactly full.
+    // Real `StreamEncoder.implWrite` only calls `writeBytes()` when the NEXT
+    // encode attempt overflows (`CoderResult.isOverflow()`) — an exactly-full
+    // `bb` sits unflushed until something tries to add more to it. This
+    // matters: a request that stops writing right when the buffer reaches
+    // capacity (e.g. the last of N fixed-size `Writer` calls) never triggers
+    // that extra flush on real HotSpot, so the underlying stream sees one
+    // fewer batch than an eager "flush when full" implementation would
+    // produce — which changes `NoBodyOutputStream.checkCommit`'s observed
+    // byte count and the resulting commit timing (see the module doc).
+    Ok(())
+}
+
+/// Perform the actual `OutputStream.write([BII)V` call. Split out from
+/// [`buffer_and_maybe_flush`] so both the batched-flush path and the
+/// oversize-direct-write fallback share one call site.
+fn write_through(
+    ctx: &mut dyn NativeContext,
+    this: ObjectRef,
+    bytes: &[u8],
+) -> Result<(), cratonvm_types::error::MethodCallFailed> {
+    if bytes.is_empty() {
+        return Ok(());
+    }
+    let os = match ctx.get_field(this, SE_OUTPUT) {
+        Value::Object(Some(s)) => s,
+        _ => return Ok(()),
+    };
     let buf = ctx.new_array(ArrayElementType::Byte, bytes.len());
     // AUDIT 2026-05-17: bulk write via NativeContext intrinsic.
-    ctx.write_byte_array_from(buf, 0, &bytes);
+    ctx.write_byte_array_from(buf, 0, bytes);
     ctx.invoke_virtual(
         os,
         "write",
@@ -408,6 +592,25 @@ fn write_bytes(
         ],
     )?;
     Ok(())
+}
+
+/// Flush any bytes sitting in the pending buffer to the underlying stream
+/// (but do NOT flush/close the stream itself — callers do that). Used by
+/// `flush()`/`flushBuffer()`/`close()`/`implClose()` so buffered bytes are
+/// not lost when the caller expects them to have been delivered.
+fn flush_pending_buffer(
+    ctx: &mut dyn NativeContext,
+    this: ObjectRef,
+) -> Result<(), cratonvm_types::error::MethodCallFailed> {
+    let id = se_id(ctx, this);
+    let pending = {
+        let mut table = se_table().lock().unwrap();
+        match table.get_mut(&id) {
+            Some(state) => std::mem::take(&mut state.pending),
+            None => return Ok(()),
+        }
+    };
+    write_through(ctx, this, &pending)
 }
 
 /// `write(char[], int, int)`.
@@ -474,6 +677,11 @@ fn native_se_flush(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRes
         Some(o) => o,
         None => return Ok(None),
     };
+    // Deliver any bytes still sitting in the pending buffer before flushing
+    // the underlying stream, or `flush()` would be a no-op from the caller's
+    // point of view (real `StreamEncoder.implFlush` does the same:
+    // `implFlushBuffer()` then `out.flush()`).
+    flush_pending_buffer(ctx, this)?;
     if let Value::Object(Some(os)) = ctx.get_field(this, SE_OUTPUT) {
         let _ = ctx.invoke_virtual(os, "flush", "()V", &[]);
     }
@@ -491,12 +699,20 @@ fn native_se_close(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRes
     // the JDK's encoder.encode(.., endOfInput=true) + flush at close. Done
     // before the stream is flushed/closed so the bytes actually go out.
     flush_pending_surrogate(ctx, this)?;
+    // Deliver any bytes still sitting in the pending buffer — without this
+    // the last partial batch (< buffer capacity) would be silently dropped
+    // on close, matching real `StreamEncoder.implClose`'s final
+    // `implFlushBuffer()` before closing `out`.
+    flush_pending_buffer(ctx, this)?;
     if let Value::Object(Some(os)) = ctx.get_field(this, SE_OUTPUT) {
         let _ = ctx.invoke_virtual(os, "flush", "()V", &[]);
         let _ = ctx.invoke_virtual(os, "close", "()V", &[]);
     }
+    // Read the id BEFORE clearing SE_OUTPUT/removing the table entry — SE_ID
+    // (slot 2) is the side-table key, not a "closed" flag (see the constant's
+    // doc comment for why this slot was repurposed).
+    se_table().lock().unwrap().remove(&se_id(ctx, this));
     ctx.set_field(this, SE_OUTPUT, Value::Object(None));
-    ctx.set_field(this, SE_CLOSED, Value::Int(1));
     Ok(None)
 }
 

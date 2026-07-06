@@ -204,13 +204,26 @@ pub(crate) fn set_pending_tm_trust_roots(root_ders: Vec<Vec<u8>>) {
             deduped.push(der);
         }
     }
+    if std::env::var("CRATONVM_DBG_TLS_AUTH").is_ok() {
+        eprintln!(
+            "[dbg-tls-auth] set_pending_tm_trust_roots count={}",
+            deduped.len()
+        );
+    }
     PENDING_TM_TRUST_ROOTS.with(|c| {
         *c.borrow_mut() = Some(TlsTrustRoots { root_ders: deduped });
     });
 }
 
 fn take_pending_tm_trust_roots() -> Option<TlsTrustRoots> {
-    PENDING_TM_TRUST_ROOTS.with(|c| c.borrow_mut().take())
+    let out = PENDING_TM_TRUST_ROOTS.with(|c| c.borrow_mut().take());
+    if std::env::var("CRATONVM_DBG_TLS_AUTH").is_ok() {
+        eprintln!(
+            "[dbg-tls-auth] take_pending_tm_trust_roots -> {:?}",
+            out.as_ref().map(|r| r.root_ders.len())
+        );
+    }
+    out
 }
 
 fn set_selected_context_trust_roots(roots: Option<TlsTrustRoots>) {
@@ -235,8 +248,58 @@ fn ctx_trust_roots_table() -> &'static Mutex<HashMap<u64, TlsTrustRoots>> {
     T.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
+/// The `TrustManager[]` objects passed to `SSLContext.init(km, tms, random)`,
+/// keyed the same way as `ctx_trust_roots_table`. Populated by
+/// `attach_trust_managers_to_ctx`, consulted post-handshake via
+/// `ctx_trust_managers`/`engine_run_trust_check`. Holds live `ObjectRef`s —
+/// unlike its sibling tables here (which only ever held derived PEM/DER
+/// bytes) — so it MUST stay in the GC root set: see
+/// `gc_scan_tls_ctx_trust_manager_roots`/`gc_update_tls_ctx_trust_manager_refs`
+/// (wired into `vm/src/memory/roots.rs` and `gc.rs`).
+fn ctx_trust_managers_table() -> &'static Mutex<HashMap<u64, Vec<ObjectRef>>> {
+    static T: OnceLock<Mutex<HashMap<u64, Vec<ObjectRef>>>> = OnceLock::new();
+    T.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
 fn ctx_obj_key(ctx: &mut dyn NativeContext, obj: ObjectRef) -> u64 {
     crate::gc_stable_lock_key(ctx, obj) as u64
+}
+
+/// `SSLContext.init(km, tms, random)` calls this with the raw `tms` array
+/// argument (may be `None`/empty) to stash the actual `TrustManager` Java
+/// objects against this context, keyed the same way as the KMF identity /
+/// TMF trust-root PEM tables. See the `EngineState::trust_managers_ctx_key`
+/// doc for why the engine only ever stores the KEY, never these `ObjectRef`s
+/// directly.
+pub(crate) fn attach_trust_managers_to_ctx(
+    ctx: &mut dyn NativeContext,
+    ctx_obj: ObjectRef,
+    tms_array: Option<ObjectRef>,
+) {
+    let key = ctx_obj_key(ctx, ctx_obj);
+    let mut list = Vec::new();
+    if let Some(arr) = tms_array {
+        let len = ctx.array_length(arr);
+        for i in 0..len {
+            if let Value::Object(Some(tm)) = ctx.get_array_element(arr, i) {
+                list.push(tm);
+            }
+        }
+    }
+    if std::env::var("CRATONVM_DBG_TLS_AUTH").is_ok() {
+        eprintln!(
+            "[dbg-tls-auth] attach_trust_managers_to_ctx key={} tms_array_present={} count={}",
+            key,
+            tms_array.is_some(),
+            list.len()
+        );
+    }
+    let mut table = ctx_trust_managers_table().lock();
+    if list.is_empty() {
+        table.remove(&key);
+    } else {
+        table.insert(key, list);
+    }
 }
 
 /// `SSLContext.init` calls this to move pending KMF identity and TMF trust
@@ -247,7 +310,19 @@ pub(crate) fn attach_pending_identity_to_ctx(ctx: &mut dyn NativeContext, ctx_ob
         ctx_identity_table().lock().insert(key, ident);
     }
     if let Some(roots) = take_pending_tm_trust_roots() {
+        if std::env::var("CRATONVM_DBG_TLS_AUTH").is_ok() {
+            eprintln!(
+                "[dbg-tls-auth] attach_pending_identity_to_ctx key={} storing {} roots",
+                key,
+                roots.root_ders.len()
+            );
+        }
         ctx_trust_roots_table().lock().insert(key, roots);
+    } else if std::env::var("CRATONVM_DBG_TLS_AUTH").is_ok() {
+        eprintln!(
+            "[dbg-tls-auth] attach_pending_identity_to_ctx key={} NO pending roots to store",
+            key
+        );
     }
 }
 
@@ -258,6 +333,13 @@ pub(crate) fn ctx_identity(
 ) -> Option<(String, String)> {
     let key = ctx_obj_key(ctx, ctx_obj);
     let trust_roots = ctx_trust_roots_table().lock().get(&key).cloned();
+    if std::env::var("CRATONVM_DBG_TLS_AUTH").is_ok() {
+        eprintln!(
+            "[dbg-tls-auth] ctx_identity key={} trust_roots={:?}",
+            key,
+            trust_roots.as_ref().map(|r| r.root_ders.len())
+        );
+    }
     set_selected_context_trust_roots(trust_roots);
     ctx_identity_table().lock().get(&key).cloned()
 }
@@ -305,7 +387,14 @@ fn huc_default_trust_roots_slot() -> &'static Mutex<Option<TlsTrustRoots>> {
 
 pub(crate) fn set_huc_default_client_identity(ident: Option<(String, String)>) {
     *huc_default_identity_slot().lock() = ident;
-    *huc_default_trust_roots_slot().lock() = selected_context_trust_roots();
+    let roots = selected_context_trust_roots();
+    if std::env::var("CRATONVM_DBG_TLS_AUTH").is_ok() {
+        eprintln!(
+            "[dbg-tls-auth] set_huc_default_client_identity capturing roots={:?}",
+            roots.as_ref().map(|r| r.root_ders.len())
+        );
+    }
+    *huc_default_trust_roots_slot().lock() = roots;
     set_selected_context_trust_roots(None);
 }
 
@@ -418,7 +507,15 @@ fn root_store_for_trust_roots(trust_roots: Option<&TlsTrustRoots>) -> RootCertSt
 }
 
 fn active_client_trust_roots() -> Option<TlsTrustRoots> {
-    take_selected_context_trust_roots().or_else(huc_default_trust_roots)
+    let selected = take_selected_context_trust_roots();
+    let result = selected.or_else(huc_default_trust_roots);
+    if std::env::var("CRATONVM_DBG_TLS_AUTH").is_ok() {
+        eprintln!(
+            "[dbg-tls-auth] active_client_trust_roots -> {:?}",
+            result.as_ref().map(|r| r.root_ders.len())
+        );
+    }
+    result
 }
 
 /// Concatenate scoped trust anchors (DER) into a PEM bundle. Used as the
@@ -672,10 +769,37 @@ pub(crate) fn build_server_config_single_cert_ex(
     optional_client_cert: bool,
     client_ca_pem: Option<&str>,
 ) -> Result<Arc<ServerConfig>, String> {
+    build_server_config_single_cert_ex_ciphers(
+        cert_pem,
+        key_pem,
+        alpn_protocols,
+        require_client_cert,
+        optional_client_cert,
+        client_ca_pem,
+        &[],
+    )
+}
+
+/// As `build_server_config_single_cert_ex`, but restricts the negotiable
+/// cipher suites to `enabled_ciphers` (Java `SSLEngine.setEnabledCipherSuites`
+/// names) when non-empty — an empty list keeps the unrestricted `ring`
+/// default, identical to `build_server_config_single_cert_ex`.
+pub(crate) fn build_server_config_single_cert_ex_ciphers(
+    cert_pem: &str,
+    key_pem: &str,
+    alpn_protocols: &[&str],
+    require_client_cert: bool,
+    optional_client_cert: bool,
+    client_ca_pem: Option<&str>,
+    enabled_ciphers: &[String],
+) -> Result<Arc<ServerConfig>, String> {
     let chain = parse_cert_chain_pem(cert_pem)?;
     let key = parse_private_key_pem(key_pem)?;
 
-    let builder = ServerConfig::builder();
+    let provider = cipher_provider_for(enabled_ciphers);
+    let builder = ServerConfig::builder_with_provider(provider)
+        .with_safe_default_protocol_versions()
+        .map_err(|e| format!("with_safe_default_protocol_versions failed: {}", e))?;
     let builder = if require_client_cert || optional_client_cert {
         let ca_pem = client_ca_pem
             .ok_or_else(|| "client auth requested but client_ca_pem is None".to_string())?;
@@ -758,6 +882,192 @@ pub(crate) fn build_client_config(
     client_auth: Option<(&str, &str)>,
 ) -> Result<Arc<ClientConfig>, String> {
     let builder = ClientConfig::builder().with_root_certificates(roots);
+    let mut config = match client_auth {
+        Some((cert_pem, key_pem)) => {
+            let chain = parse_cert_chain_pem(cert_pem)?;
+            let key = parse_private_key_pem(key_pem)?;
+            builder
+                .with_client_auth_cert(chain, key)
+                .map_err(|e| format!("with_client_auth_cert failed: {}", e))?
+        }
+        None => builder.with_no_client_auth(),
+    };
+    config.alpn_protocols = alpn_protocols
+        .iter()
+        .map(|s| s.as_bytes().to_vec())
+        .collect();
+    Ok(Arc::new(config))
+}
+
+/// Map a Java `SSLEngine.setEnabledCipherSuites` name to the matching rustls
+/// `CipherSuite`. Only covers the suites this module ever advertises via
+/// `getSupportedCipherSuites`/`getEnabledCipherSuites` (see the two identical
+/// 9-entry lists elsewhere in this file) — the full negotiable set for the
+/// `ring` crypto provider. TLS 1.3 suite names differ (Java drops the "13"
+/// infix rustls uses), everything else matches verbatim.
+fn java_cipher_name_to_suite(name: &str) -> Option<rustls::CipherSuite> {
+    use rustls::CipherSuite::*;
+    Some(match name {
+        "TLS_AES_128_GCM_SHA256" => TLS13_AES_128_GCM_SHA256,
+        "TLS_AES_256_GCM_SHA384" => TLS13_AES_256_GCM_SHA384,
+        "TLS_CHACHA20_POLY1305_SHA256" => TLS13_CHACHA20_POLY1305_SHA256,
+        "TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256" => TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256,
+        "TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256" => TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256,
+        "TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384" => TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384,
+        "TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384" => TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384,
+        "TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305_SHA256" => {
+            TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305_SHA256
+        }
+        "TLS_ECDHE_RSA_WITH_CHACHA20_POLY1305_SHA256" => {
+            TLS_ECDHE_RSA_WITH_CHACHA20_POLY1305_SHA256
+        }
+        _ => return None,
+    })
+}
+
+/// Build a `CryptoProvider` restricted to `enabled` (Java cipher-suite names),
+/// falling back to the unrestricted `ring` default when `enabled` is empty or
+/// maps to nothing we recognize — so an unmappable/empty list can never starve
+/// the connection down to zero usable suites (which would make the builder
+/// error out instead of just failing to restrict as intended).
+fn cipher_provider_for(enabled: &[String]) -> Arc<rustls::crypto::CryptoProvider> {
+    let base = rustls::crypto::ring::default_provider();
+    if enabled.is_empty() {
+        return Arc::new(base);
+    }
+    let wanted: Vec<rustls::CipherSuite> = enabled
+        .iter()
+        .filter_map(|n| java_cipher_name_to_suite(n))
+        .collect();
+    if wanted.is_empty() {
+        return Arc::new(base);
+    }
+    let mut restricted = base;
+    restricted
+        .cipher_suites
+        .retain(|cs| wanted.contains(&cs.suite()));
+    if restricted.cipher_suites.is_empty() {
+        return Arc::new(rustls::crypto::ring::default_provider());
+    }
+    Arc::new(restricted)
+}
+
+/// A `ClientCertVerifier` that accepts any structurally-valid, correctly
+/// SIGNED client certificate WITHOUT validating its chain against a trust
+/// anchor. Used exclusively when Tomcat's `trustManagerClassName` mechanism
+/// is configured: that feature's whole point is to delegate the trust
+/// decision to a Java `TrustManager` class INSTEAD OF a keystore-backed
+/// truststore, so there is no CA data here for `WebPkiClientVerifier` to
+/// build a `RootCertStore` from.
+///
+/// Accepting a certificate here does NOT mean the connection is ultimately
+/// trusted — it only means the client proved possession of the leaf
+/// certificate's private key (`verify_tls12/13_signature` still do real
+/// cryptographic signature verification via the same webpki primitives
+/// `WebPkiClientVerifier` uses). The actual trust decision is made
+/// afterwards, synchronously, by `engine_run_trust_check` calling the real
+/// Java `TrustManager.checkClientTrusted` once the handshake completes —
+/// which aborts the connection (`SSLHandshakeException`) on rejection. This
+/// verifier must therefore ONLY be selected when a Java `TrustManager` is
+/// actually registered for the owning engine (see `engine_begin`'s
+/// `use_passthrough_client_verifier` check) — never as a general fallback for
+/// "no truststore configured", which would be a fail-open regression.
+#[derive(Debug)]
+struct PassthroughClientCertVerifier {
+    mandatory: bool,
+    algorithms: rustls::crypto::WebPkiSupportedAlgorithms,
+}
+
+impl rustls::server::danger::ClientCertVerifier for PassthroughClientCertVerifier {
+    fn offer_client_auth(&self) -> bool {
+        true
+    }
+    fn client_auth_mandatory(&self) -> bool {
+        self.mandatory
+    }
+    fn root_hint_subjects(&self) -> &[rustls::DistinguishedName] {
+        &[]
+    }
+    fn verify_client_cert(
+        &self,
+        _end_entity: &CertificateDer<'_>,
+        _intermediates: &[CertificateDer<'_>],
+        _now: rustls::pki_types::UnixTime,
+    ) -> Result<rustls::server::danger::ClientCertVerified, rustls::Error> {
+        Ok(rustls::server::danger::ClientCertVerified::assertion())
+    }
+    fn verify_tls12_signature(
+        &self,
+        message: &[u8],
+        cert: &CertificateDer<'_>,
+        dss: &rustls::DigitallySignedStruct,
+    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        rustls::crypto::verify_tls12_signature(message, cert, dss, &self.algorithms)
+    }
+    fn verify_tls13_signature(
+        &self,
+        message: &[u8],
+        cert: &CertificateDer<'_>,
+        dss: &rustls::DigitallySignedStruct,
+    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        rustls::crypto::verify_tls13_signature(message, cert, dss, &self.algorithms)
+    }
+    fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
+        self.algorithms.supported_schemes()
+    }
+}
+
+/// As `build_server_config_single_cert_ex_ciphers`, but requests/requires a
+/// client certificate using `PassthroughClientCertVerifier` instead of
+/// `WebPkiClientVerifier` — for the `trustManagerClassName` case where there
+/// is no truststore-derived CA. Only call this when the caller has confirmed
+/// a Java `TrustManager` is registered for the owning engine (see
+/// `engine_begin`).
+fn build_server_config_single_cert_passthrough_client_auth(
+    cert_pem: &str,
+    key_pem: &str,
+    alpn_protocols: &[&str],
+    require_client_cert: bool,
+    enabled_ciphers: &[String],
+) -> Result<Arc<ServerConfig>, String> {
+    let chain = parse_cert_chain_pem(cert_pem)?;
+    let key = parse_private_key_pem(key_pem)?;
+    let provider = cipher_provider_for(enabled_ciphers);
+    let algorithms = provider.signature_verification_algorithms;
+    let verifier: Arc<dyn rustls::server::danger::ClientCertVerifier> =
+        Arc::new(PassthroughClientCertVerifier {
+            mandatory: require_client_cert,
+            algorithms,
+        });
+    let mut config = ServerConfig::builder_with_provider(provider)
+        .with_safe_default_protocol_versions()
+        .map_err(|e| format!("with_safe_default_protocol_versions failed: {}", e))?
+        .with_client_cert_verifier(verifier)
+        .with_single_cert(chain, key)
+        .map_err(|e| format!("ServerConfig with_single_cert failed: {}", e))?;
+    config.alpn_protocols = alpn_protocols
+        .iter()
+        .map(|s| s.as_bytes().to_vec())
+        .collect();
+    Ok(Arc::new(config))
+}
+
+/// As `build_client_config`, but restricts the negotiable cipher suites to
+/// `enabled_ciphers` (Java `SSLEngine.setEnabledCipherSuites` names) when
+/// non-empty. Used by the `SSLEngine` path (`engine_begin`) so a connector's
+/// configured cipher restriction is actually enforced during the handshake,
+/// not just echoed back by `getEnabledCipherSuites`.
+pub(crate) fn build_client_config_ciphers(
+    roots: RootCertStore,
+    alpn_protocols: &[&str],
+    client_auth: Option<(&str, &str)>,
+    enabled_ciphers: &[String],
+) -> Result<Arc<ClientConfig>, String> {
+    let provider = cipher_provider_for(enabled_ciphers);
+    let builder = ClientConfig::builder_with_provider(provider)
+        .with_safe_default_protocol_versions()
+        .map_err(|e| format!("with_safe_default_protocol_versions failed: {}", e))?
+        .with_root_certificates(roots);
     let mut config = match client_auth {
         Some((cert_pem, key_pem)) => {
             let chain = parse_cert_chain_pem(cert_pem)?;
@@ -2725,6 +3035,35 @@ pub(crate) struct EngineState {
     /// (mTLS) — Tomcat's SSLAuthenticator reads it via
     /// `SSLSession.getPeerCertificates()` to authenticate/authorize the client.
     peer_cert_chain_der: Vec<Vec<u8>>,
+    /// GC-stable key (see `ctx_obj_key`/`gc_stable_lock_key`) of the `SSLContext`
+    /// that created this engine, used to look up its `TrustManager[]` in
+    /// `ctx_trust_managers_table` once the handshake finishes. Deliberately a
+    /// plain `u64`, NOT the `ObjectRef`s themselves: `do_wrap`/`do_unwrap` call
+    /// allocating helpers (e.g. `throw_jca_exc`) while holding
+    /// `engine_registry()`'s write lock, so anything reachable through
+    /// `EngineState` that needed GC-root scanning would make that lock
+    /// GC-relevant — and a GC triggered by an allocation *while the same
+    /// thread already holds that lock* would self-deadlock trying to
+    /// re-acquire it during root scanning. Keeping only a `u64` here avoids
+    /// that hazard entirely; the real `ObjectRef`s live solely in
+    /// `ctx_trust_managers_table`, which no allocating call ever locks
+    /// concurrently with `engine_registry()`.
+    ///
+    /// rustls's own `WebPkiClientVerifier`/root-store check only verifies the
+    /// certificate CHAIN against a trust anchor; it never consults an
+    /// application-supplied `TrustManager`, so a custom `TrustManager` (e.g.
+    /// one wrapping a revocation-aware `PKIXRevocationChecker` for OCSP/CRL,
+    /// or a fully custom `X509TrustManager` like Tomcat's
+    /// `TrustManagerClassName` tests use) was silently never invoked — a
+    /// fail-open gap. `engine_run_trust_check` calls
+    /// `checkClientTrusted`/`checkServerTrusted` on each configured manager
+    /// once the crypto handshake completes, so a rejection there still aborts
+    /// the handshake.
+    trust_managers_ctx_key: Option<u64>,
+    /// Set once the post-handshake trust-manager consultation has run for this
+    /// engine (whether it passed, failed, or found nothing to check) so it
+    /// only happens once per connection.
+    trust_check_done: bool,
 }
 
 impl Default for EngineState {
@@ -2750,6 +3089,8 @@ impl Default for EngineState {
             trust_roots_override: None,
             plaintext_pending: Vec::new(),
             peer_cert_chain_der: Vec::new(),
+            trust_managers_ctx_key: None,
+            trust_check_done: false,
         }
     }
 }
@@ -3134,7 +3475,12 @@ fn engine_begin(state: &mut EngineState) -> Result<(), String> {
                         .clone()
                         .or_else(take_selected_context_trust_roots);
                     let roots = root_store_for_trust_roots(trust_roots.as_ref());
-                    build_client_config(roots, &alpn_strs, Some((cert, key)))?
+                    build_client_config_ciphers(
+                        roots,
+                        &alpn_strs,
+                        Some((cert, key)),
+                        &state.enabled_ciphers,
+                    )?
                 }
                 None => default_engine_client_config(&state.alpn_protocols)?,
             },
@@ -3174,16 +3520,61 @@ fn engine_begin(state: &mut EngineState) -> Result<(), String> {
                     } else {
                         None
                     };
-                    build_server_config_single_cert_ex(
-                        cert,
-                        key,
-                        &alpn_strs,
-                        state.need_client_auth,
-                        state.want_client_auth && !state.need_client_auth,
-                        client_ca.as_deref(),
-                    )?
+                    // Tomcat's `trustManagerClassName` mechanism delegates the
+                    // trust decision to a Java class and deliberately has NO
+                    // keystore-derived truststore, so `client_ca` above is
+                    // legitimately empty. Detect that a real Java
+                    // `TrustManager` IS registered for this engine (so
+                    // `engine_run_trust_check` will actually enforce trust
+                    // post-handshake) and, only then, fall back to a
+                    // passthrough verifier instead of failing the config
+                    // build outright.
+                    let has_custom_trust_managers = request
+                        && client_ca.is_none()
+                        && state
+                            .trust_managers_ctx_key
+                            .map(|k| {
+                                ctx_trust_managers_table()
+                                    .lock()
+                                    .get(&k)
+                                    .map(|v| !v.is_empty())
+                                    .unwrap_or(false)
+                            })
+                            .unwrap_or(false);
+                    if std::env::var("CRATONVM_DBG_TLS_AUTH").is_ok() {
+                        eprintln!(
+                            "[dbg-tls-auth] engine_begin request={} client_ca_none={} trust_ctx_key={:?} has_custom_trust_managers={}",
+                            request, client_ca.is_none(), state.trust_managers_ctx_key, has_custom_trust_managers
+                        );
+                    }
+                    let built = if has_custom_trust_managers {
+                        build_server_config_single_cert_passthrough_client_auth(
+                            cert,
+                            key,
+                            &alpn_strs,
+                            state.need_client_auth,
+                            &state.enabled_ciphers,
+                        )
+                    } else {
+                        build_server_config_single_cert_ex_ciphers(
+                            cert,
+                            key,
+                            &alpn_strs,
+                            state.need_client_auth,
+                            state.want_client_auth && !state.need_client_auth,
+                            client_ca.as_deref(),
+                            &state.enabled_ciphers,
+                        )
+                    };
+                    built?
                 }
                 None => {
+                    if std::env::var("CRATONVM_DBG_TLS_AUTH").is_ok() {
+                        eprintln!(
+                            "[dbg-tls-auth] engine_begin(default_engine_server_config) need={} want={}",
+                            state.need_client_auth, state.want_client_auth
+                        );
+                    }
                     default_engine_server_config(&state.alpn_protocols, state.need_client_auth)?
                 }
             },
@@ -3312,6 +3703,172 @@ fn engine_capture_negotiation(state: &mut EngineState) {
             state.peer_cert_chain_der = certs.iter().map(|c| c.as_ref().to_vec()).collect();
         }
     }
+}
+
+/// Data extracted from an `EngineState` (while the registry lock is still
+/// held) needed to run the post-handshake `TrustManager` consultation. Plain
+/// owned data only — no `ObjectRef`s here except by GC-safe `u64` key
+/// (`trust_ctx_key`), so this can safely cross the lock-drop boundary before
+/// `engine_run_trust_check` (which calls into Java) runs.
+struct PendingTrustCheck {
+    is_client: bool,
+    peer_chain_der: Vec<Vec<u8>>,
+    trust_ctx_key: u64,
+    negotiated_cipher_suite_name: Option<String>,
+}
+
+/// Called right after the crypto handshake reports FINISHED for the first
+/// time, WHILE STILL HOLDING the engine registry lock — extracts what's
+/// needed and returns `Some` at most once per engine (gated by
+/// `trust_check_done`). The caller MUST drop the registry lock before acting
+/// on the result: looking up `ctx_trust_managers_table` and invoking Java is
+/// deferred to `engine_run_trust_check` specifically so no allocating/GC-
+/// triggering call ever happens while this lock is held (see
+/// `EngineState::trust_managers_ctx_key`'s doc for why that matters).
+fn engine_take_pending_trust_check(state: &mut EngineState) -> Option<PendingTrustCheck> {
+    if state.trust_check_done {
+        return None;
+    }
+    let finished = state
+        .conn
+        .as_ref()
+        .map(|c| !c.is_handshaking())
+        .unwrap_or(false);
+    if !finished {
+        return None;
+    }
+    state.trust_check_done = true;
+    let trust_ctx_key = state.trust_managers_ctx_key?;
+    if state.peer_cert_chain_der.is_empty() {
+        // No peer certificate was presented (e.g. optional client auth and
+        // the client declined) — nothing for a TrustManager to check.
+        return None;
+    }
+    let cipher_name = state
+        .conn
+        .as_ref()
+        .and_then(|c| c.negotiated_cipher_suite())
+        .map(|cs| format!("{:?}", cs.suite()));
+    Some(PendingTrustCheck {
+        is_client: state.is_client,
+        peer_chain_der: state.peer_cert_chain_der.clone(),
+        trust_ctx_key,
+        negotiated_cipher_suite_name: cipher_name,
+    })
+}
+
+/// Run the post-handshake `TrustManager` consultation captured by
+/// `engine_take_pending_trust_check`. MUST be called with the engine registry
+/// lock NOT held. Looks up the real `TrustManager[]` for the owning
+/// `SSLContext` and, for each one, calls the real Java
+/// `checkClientTrusted`/`checkServerTrusted` (matching JSSE's contract: the
+/// server checks the client's chain, the client checks the server's) with the
+/// peer's certificate chain. Any thrown exception is treated as a rejection
+/// and surfaces as `SSLHandshakeException` — matching real JSSE, which aborts
+/// the handshake the same way when a configured `TrustManager` (e.g. one
+/// wrapping OCSP/CRL revocation checking, or a fully custom
+/// `X509TrustManager`) rejects the chain.
+fn engine_run_trust_check(
+    ctx: &mut dyn NativeContext,
+    pending: PendingTrustCheck,
+) -> Result<(), cratonvm_types::error::MethodCallFailed> {
+    let trust_managers = ctx_trust_managers_table()
+        .lock()
+        .get(&pending.trust_ctx_key)
+        .cloned()
+        .unwrap_or_default();
+    if trust_managers.is_empty() {
+        // No custom TrustManager/TrustManagerFactory installed on this
+        // context — rustls's own chain-of-trust check is the only
+        // verification, matching prior (pre-fix) behavior exactly.
+        return Ok(());
+    }
+
+    // Real JSSE authType is the key-exchange/signature algorithm; we don't
+    // track it precisely, so derive a best-effort guess from the negotiated
+    // cipher suite name. TrustManager implementations use this only for
+    // logging/branching, not as a security check, so an approximation here
+    // does not weaken validation.
+    let auth_type = match pending.negotiated_cipher_suite_name.as_deref() {
+        Some(s) if s.contains("ECDSA") => "ECDSA",
+        _ => "RSA",
+    };
+
+    let arr = ctx.new_ref_array(cratonvm_types::ClassId::new(0), pending.peer_chain_der.len());
+    for (i, der) in pending.peer_chain_der.iter().enumerate() {
+        let mirror = crate::keystore::make_x509_mirror(ctx, "peer", der);
+        ctx.set_array_element(arr, i, Value::Object(Some(mirror)));
+    }
+    let auth_type_str = ctx.create_string(auth_type);
+
+    // Pin the chain array, the authType string, and every TrustManager we're
+    // about to call — each `invoke_virtual` below can allocate/GC, and a
+    // stale ObjectRef from an earlier loop iteration would silently resolve
+    // to a reused slot after a move (see `pin_native_root`'s doc). Mirrors
+    // the existing multi-call pin pattern in `net_phase_e.rs`'s
+    // group-collector native.
+    let base = ctx.pin_native_root(arr);
+    let _ = ctx.pin_native_root(auth_type_str);
+    let tm_pins: Vec<usize> = trust_managers
+        .iter()
+        .map(|tm| ctx.pin_native_root(*tm))
+        .collect();
+
+    let method = if pending.is_client {
+        "checkServerTrusted"
+    } else {
+        "checkClientTrusted"
+    };
+    let dbg = std::env::var("CRATONVM_DBG_TLS_AUTH").is_ok();
+    if dbg {
+        eprintln!(
+            "[dbg-tls-auth] engine_run_trust_check: {} trust manager(s), method={}, chain_len={}, auth_type={}",
+            trust_managers.len(),
+            method,
+            pending.peer_chain_der.len(),
+            auth_type
+        );
+    }
+    let mut rejected = false;
+    for (i, _tm) in trust_managers.iter().enumerate() {
+        let arr_now = ctx.read_native_pin(base, arr);
+        let auth_now = ctx.read_native_pin(base + 1, auth_type_str);
+        let tm_now = ctx.read_native_pin(tm_pins[i], trust_managers[i]);
+        let result = ctx.invoke_virtual(
+            tm_now,
+            method,
+            "([Ljava/security/cert/X509Certificate;Ljava/lang/String;)V",
+            &[Value::Object(Some(arr_now)), Value::Object(Some(auth_now))],
+        );
+        if dbg {
+            eprintln!(
+                "[dbg-tls-auth] engine_run_trust_check: invoke_virtual[{}] -> {}",
+                i,
+                match &result {
+                    Ok(_) => "Ok".to_string(),
+                    Err(cratonvm_types::error::MethodCallFailed::ExceptionThrown(exc)) => {
+                        let cls = ctx.class_name_of_id(ctx.class_id_of_object(*exc));
+                        format!("ExceptionThrown(class={:?})", cls)
+                    }
+                    Err(e) => format!("Err({:?})", e),
+                }
+            );
+        }
+        if result.is_err() {
+            rejected = true;
+            break;
+        }
+    }
+    ctx.unpin_native_roots(base);
+
+    if rejected {
+        return Err(crate::phases_early::throw_jca_exc(
+            ctx,
+            "javax/net/ssl/SSLHandshakeException",
+            "TrustManager rejected the peer certificate chain",
+        ));
+    }
+    Ok(())
 }
 
 /// Public accessor for the negotiated ALPN of an engine — used by other
@@ -3915,7 +4472,7 @@ fn do_wrap(
     let (_dst_arr, dst_pos, dst_lim, _dst_cap) = bb_view(ctx, dst);
     let dst_remaining = dst_lim.saturating_sub(dst_pos);
 
-    let (consumed_inner, status, hs, drained) = {
+    let (consumed_inner, status, hs, drained, pending_trust_check) = {
         let mut g = engine_registry().write();
         let s = match g.get_mut(&id) {
             Some(s) => s,
@@ -3948,8 +4505,14 @@ fn do_wrap(
         if hs == HS_FINISHED_R {
             s.handshake_finished_reported = true;
         }
-        (cons, status, hs, drained)
+        // Extract-only — see `engine_take_pending_trust_check`'s doc for why
+        // the actual Java call must happen after this lock is dropped.
+        let pending_trust_check = engine_take_pending_trust_check(s);
+        (cons, status, hs, drained, pending_trust_check)
     };
+    if let Some(pending) = pending_trust_check {
+        engine_run_trust_check(ctx, pending)?;
+    }
 
     // Step 3: write the drained bytes into dst.
     let produced = if !drained.is_empty() {
@@ -4142,7 +4705,7 @@ fn do_unwrap(
     let (src_arr, src_pos, src_lim, _) = bb_view(ctx, src);
     let mut offset = src_pos;
 
-    let (status, hs, plaintext) = {
+    let (status, hs, plaintext, pending_trust_check) = {
         let mut g = engine_registry().write();
         let s = match g.get_mut(&id) {
             Some(s) => s,
@@ -4205,7 +4768,17 @@ fn do_unwrap(
                 if !fed_ok {
                     break;
                 }
-                if let Err(e) = conn.process_new_packets() {
+                let __pnp_result = conn.process_new_packets();
+                if std::env::var("CRATONVM_DBG_TLS_AUTH").is_ok() {
+                    eprintln!(
+                        "[dbg-tls-auth] do_unwrap id={} process_new_packets -> {} is_handshaking={} peer_certs_present={}",
+                        id,
+                        if __pnp_result.is_ok() { "Ok".to_string() } else { format!("Err({:?})", __pnp_result.as_ref().err()) },
+                        conn.is_handshaking(),
+                        conn.peer_certificates().map(|c| c.len()).unwrap_or(0)
+                    );
+                }
+                if let Err(e) = __pnp_result {
                     // A rustls protocol error surfacing while the handshake is
                     // still in progress (e.g. `InvalidCertificate` — the peer's
                     // certificate failed validation against the trust store)
@@ -4259,8 +4832,14 @@ fn do_unwrap(
         if hs == HS_FINISHED_R {
             s.handshake_finished_reported = true;
         }
-        (status, hs, plaintext)
+        // Extract-only — see `engine_take_pending_trust_check`'s doc for why
+        // the actual Java call must happen after this lock is dropped.
+        let pending_trust_check = engine_take_pending_trust_check(s);
+        (status, hs, plaintext, pending_trust_check)
     };
+    if let Some(pending) = pending_trust_check {
+        engine_run_trust_check(ctx, pending)?;
+    }
     let consumed = offset - src_pos;
     bb_set_pos(ctx, src, offset);
 
@@ -4403,6 +4982,12 @@ fn register_apply_parameters(r: &mut NativeMethodRegistry) {
                     .as_int()
                     .unwrap_or(0)
                     != 0;
+                if std::env::var("CRATONVM_DBG_TLS_AUTH").is_ok() {
+                    eprintln!(
+                        "[dbg-tls-auth] setSSLParameters id={} need={} want={}",
+                        id, need, want
+                    );
+                }
                 with_engine(id, |s| {
                     if need {
                         s.need_client_auth = true;
@@ -4517,6 +5102,64 @@ pub(crate) fn set_engine_identity_override(
         s.identity_override = Some((cert_pem, key_pem));
         s.trust_roots_override = trust_roots;
     });
+}
+
+/// Record which `SSLContext` (by its GC-stable key) created this engine, so
+/// the post-handshake trust check can later look up that context's
+/// `TrustManager[]` in `ctx_trust_managers_table`. Called alongside
+/// `set_engine_identity_override` from `createSSLEngine`, but unconditionally
+/// (a context can carry trust managers without carrying a KMF identity, e.g.
+/// a pure client with no client certificate).
+pub(crate) fn set_engine_trust_ctx_key(
+    ctx: &mut dyn NativeContext,
+    engine_obj: ObjectRef,
+    ctx_obj: ObjectRef,
+) {
+    let key = ctx_obj_key(ctx, ctx_obj);
+    let id = engine_id_or_alloc(engine_obj);
+    if std::env::var("CRATONVM_DBG_TLS_AUTH").is_ok() {
+        let has_entry = ctx_trust_managers_table().lock().contains_key(&key);
+        eprintln!(
+            "[dbg-tls-auth] set_engine_trust_ctx_key engine_id={} ctx_key={} table_has_entry={}",
+            id, key, has_entry
+        );
+    }
+    with_engine(id, |s| {
+        s.trust_managers_ctx_key = Some(key);
+    });
+}
+
+/// GC root scan for `ctx_trust_managers_table` — see the table's doc for why
+/// this exists (the only ObjectRef-holding side-table in this module that
+/// isn't purely derived PEM/DER bytes).
+pub fn gc_scan_tls_ctx_trust_manager_roots(roots: &mut Vec<ObjectRef>) {
+    let table = ctx_trust_managers_table().lock();
+    for list in table.values() {
+        for tm in list {
+            if !tm.as_ptr().is_null() {
+                roots.push(*tm);
+            }
+        }
+    }
+}
+
+/// Post-move remap companion to `gc_scan_tls_ctx_trust_manager_roots`.
+pub fn gc_update_tls_ctx_trust_manager_refs(map: &std::collections::HashMap<usize, usize>) {
+    if map.is_empty() {
+        return;
+    }
+    let mut table = ctx_trust_managers_table().lock();
+    for list in table.values_mut() {
+        for tm in list.iter_mut() {
+            let old = tm.as_ptr() as usize;
+            if let Some(&new) = map.get(&old) {
+                debug_assert!(new != 0, "GC pointer map contains null address");
+                // SAFETY: `new` is a live, 8-byte-aligned heap address produced
+                // by the moving collector for the object previously at `old`.
+                *tm = unsafe { ObjectRef::from_raw(new as *mut u8) };
+            }
+        }
+    }
 }
 
 pub fn register_sslengine_real(r: &mut NativeMethodRegistry) {
