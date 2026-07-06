@@ -1974,6 +1974,7 @@ const FQN_X509_TM: &str = "sun/security/ssl/X509TrustManagerImpl";
 const FQN_PKIX_VALIDATOR: &str = "sun/security/validator/PKIXValidator";
 const FQN_KMF_SUN_X509: &str = "sun/security/ssl/KeyManagerFactoryImpl$SunX509";
 const FQN_TMF_SIMPLE: &str = "sun/security/ssl/TrustManagerFactoryImpl$SimpleFactory";
+const FQN_TMF_PKIX: &str = "sun/security/ssl/TrustManagerFactoryImpl$PKIXFactory";
 
 // ---------------------------------------------------------------------------
 // Public registration entry point
@@ -2095,6 +2096,120 @@ fn register_tmf(r: &mut NativeMethodRegistry) {
         "()[Ljavax/net/ssl/TrustManager;",
         tmf_engine_get_trust_managers,
     );
+    // "PKIX" algorithm factory — `TrustManagerFactory.getDefaultAlgorithm()`
+    // is "PKIX" on modern JDKs, and Tomcat's `SSLUtilBase.getTrustManagers()`
+    // uses it explicitly, calling `engineInit(ManagerFactoryParameters)`
+    // whenever a CRL file or OCSP revocation checker is configured (wrapping
+    // a `PKIXBuilderParameters` in a `CertPathTrustManagerParameters`), and
+    // `engineInit(KeyStore)` otherwise. Real JDK dispatches BOTH overloads to
+    // the methods `TrustManagerFactoryImpl` (the common base class) declares
+    // — `PKIXFactory` doesn't override them — but this interpreter's native-
+    // override dispatch is keyed by the RECEIVER's runtime class, so without
+    // an explicit registration here `PKIXFactory` instances run the REAL
+    // (unintercepted) JDK bytecode for both methods, producing a REAL
+    // `X509TrustManagerImpl` whose `checkClientTrusted`/`checkServerTrusted`
+    // (still natively overridden by class name — see `FQN_X509_TM`) finds no
+    // `tm_registry` entry for it and silently falls back to a system-only
+    // trust state, rejecting any certificate signed by a private/test CA.
+    // This was invisible until `t27_tls::engine_run_trust_check` started
+    // actually calling `checkClientTrusted`/`checkServerTrusted` post-
+    // handshake — nothing did before.
+    r.register(
+        FQN_TMF_PKIX,
+        "engineInit",
+        "(Ljava/security/KeyStore;)V",
+        tmf_engine_init,
+    );
+    r.register(
+        FQN_TMF_PKIX,
+        "engineInit",
+        "(Ljavax/net/ssl/ManagerFactoryParameters;)V",
+        tmf_engine_init_params,
+    );
+    r.register(
+        FQN_TMF_PKIX,
+        "engineGetTrustManagers",
+        "()[Ljavax/net/ssl/TrustManager;",
+        tmf_engine_get_trust_managers,
+    );
+}
+
+/// `engineInit(ManagerFactoryParameters)` — see `register_tmf`'s doc for why
+/// this overload needs its own handler. Walks
+/// `CertPathTrustManagerParameters.getParameters()` (real runtime type
+/// `PKIXParameters`/`PKIXBuilderParameters`) -> `.getTrustAnchors()` -> each
+/// `TrustAnchor.getTrustedCert()` -> `.getEncoded()` to recover the same
+/// trust-anchor DER set `tmf_engine_init` gets from a plain `KeyStore` —
+/// `PKIXParameters` retains no back-reference to the original `KeyStore`
+/// object, so this is the only way to recover the anchors from this overload.
+fn tmf_engine_init_params(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = this_arg(args)?;
+    let mut state = TrustManagerState::default();
+    if let Some(Value::Object(Some(mfp))) = args.get(1) {
+        for der in extract_pkix_trust_anchor_ders(ctx, *mfp) {
+            insert_anchor(&mut state, der);
+        }
+    }
+    crate::t27_tls::set_pending_tm_trust_roots(state.anchor_ders.clone());
+    let id = next_tm_id();
+    tm_registry().write().insert(id, state);
+    set_tm_id(ctx, this, id);
+    Ok(None)
+}
+
+fn extract_pkix_trust_anchor_ders(ctx: &mut dyn NativeContext, mfp: ObjectRef) -> Vec<Vec<u8>> {
+    let mut out = Vec::new();
+    let params = match ctx.invoke_virtual(
+        mfp,
+        "getParameters",
+        "()Ljava/security/cert/CertPathParameters;",
+        &[],
+    ) {
+        Ok(Some(Value::Object(Some(p)))) => p,
+        _ => return out,
+    };
+    let anchors = match ctx.invoke_virtual(params, "getTrustAnchors", "()Ljava/util/Set;", &[]) {
+        Ok(Some(Value::Object(Some(s)))) => s,
+        _ => return out,
+    };
+    let iter_obj = match ctx.invoke_virtual(anchors, "iterator", "()Ljava/util/Iterator;", &[]) {
+        Ok(Some(Value::Object(Some(it)))) => it,
+        _ => return out,
+    };
+    loop {
+        match ctx.invoke_virtual(iter_obj, "hasNext", "()Z", &[]) {
+            Ok(Some(Value::Int(1))) => {}
+            _ => break,
+        }
+        let anchor = match ctx.invoke_virtual(iter_obj, "next", "()Ljava/lang/Object;", &[]) {
+            Ok(Some(Value::Object(Some(a)))) => a,
+            _ => break,
+        };
+        let cert = match ctx.invoke_virtual(
+            anchor,
+            "getTrustedCert",
+            "()Ljava/security/cert/X509Certificate;",
+            &[],
+        ) {
+            Ok(Some(Value::Object(Some(c)))) => c,
+            _ => continue,
+        };
+        if let Ok(Some(Value::Object(Some(arr)))) =
+            ctx.invoke_virtual(cert, "getEncoded", "()[B", &[])
+        {
+            let alen = ctx.array_length(arr);
+            let mut der = Vec::with_capacity(alen);
+            for i in 0..alen {
+                if let Value::Int(b) = ctx.get_array_element(arr, i) {
+                    der.push(b as u8);
+                }
+            }
+            if !der.is_empty() {
+                out.push(der);
+            }
+        }
+    }
+    out
 }
 
 // ---------------------------------------------------------------------------
@@ -2156,6 +2271,25 @@ fn read_cert_der(ctx: &mut dyn NativeContext, cert: ObjectRef) -> Option<Vec<u8>
     // Fallback: by-name probe.
     let by_name = ctx.get_field_by_name(cert, "encoded");
     if let Value::Object(Some(arr)) = by_name {
+        let alen = ctx.array_length(arr);
+        let mut out = Vec::with_capacity(alen);
+        for i in 0..alen {
+            if let Value::Int(b) = ctx.get_array_element(arr, i) {
+                out.push(b as u8);
+            }
+        }
+        if !out.is_empty() {
+            return Some(out);
+        }
+    }
+    // Fallback: a REAL certificate object (e.g. `sun.security.x509.X509CertImpl`,
+    // as built by `keystore::make_x509_mirror`'s preferred path) has neither of
+    // the synthetic-mirror shapes above — its internal fields are the real
+    // JDK's own DER-parsed representation, not a raw byte[]. Call its real
+    // `getEncoded()` method (real bytecode, always present on any
+    // `java.security.cert.Certificate`) to get the DER bytes instead.
+    if let Ok(Some(Value::Object(Some(arr)))) = ctx.invoke_virtual(cert, "getEncoded", "()[B", &[])
+    {
         let alen = ctx.array_length(arr);
         let mut out = Vec::with_capacity(alen);
         for i in 0..alen {

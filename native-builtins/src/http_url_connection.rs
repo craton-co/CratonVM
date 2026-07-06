@@ -326,6 +326,16 @@ fn huc_real_perform(
             }
             Err(socket_timeout_ex("Read timed out"))
         }
+        // A TLS handshake-phase failure (see `TLS_HANDSHAKE_FAILURE_SENTINEL`'s
+        // doc) must reach Java as `SSLHandshakeException` — real JSSE never
+        // silently reports "-1" for a rejected/aborted handshake, and several
+        // Tomcat tests specifically assert on catching that exception type
+        // (e.g. a required client certificate that was not presented).
+        Err(ref e) if e.starts_with(TLS_HANDSHAKE_FAILURE_SENTINEL) => Err(crate::phases_early::throw_jca_exc(
+            ctx,
+            "javax/net/ssl/SSLHandshakeException",
+            e.trim_start_matches(TLS_HANDSHAKE_FAILURE_SENTINEL),
+        )),
         // Other I/O failures (premature EOF, connection refused) follow the
         // real JDK's `getResponseCode` contract of returning -1.
         Err(_) => Ok(-1),
@@ -632,6 +642,16 @@ fn find_subslice(haystack: &[u8], needle: &[u8]) -> Option<usize> {
 /// folding it into the generic `-1`/IOException path.
 const READ_TIMEOUT_SENTINEL: &str = "__cratonvm_read_timeout__";
 
+/// Prefix on an error string returned by [`perform`]'s HTTPS branch when the
+/// failure happened during the TLS handshake itself, or the connection closed
+/// with zero response bytes immediately after the client's side of a TLS 1.3
+/// handshake completed optimistically (see the doc at the `read_response`
+/// call in `perform`). `huc_real_perform` recognises this prefix and raises
+/// `javax.net.ssl.SSLHandshakeException` (real-JDK/JSSE behaviour) instead of
+/// folding it into the generic "-1" contract used for other connection
+/// failures (e.g. a malformed-but-present HTTP response).
+const TLS_HANDSHAKE_FAILURE_SENTINEL: &str = "__cratonvm_tls_handshake_failure__: ";
+
 /// Map a socket-read `io::Error` to an error string, flagging a timeout via
 /// [`READ_TIMEOUT_SENTINEL`]. A blocking `read` that hits `SO_RCVTIMEO`
 /// surfaces as `WouldBlock` (Unix) or `TimedOut` (Windows).
@@ -871,28 +891,47 @@ fn perform(
         let deadline = std::time::Instant::now() + HANDSHAKE_TIMEOUT;
         while stream.conn.is_handshaking() {
             if std::time::Instant::now() > deadline {
-                return Err("TLS handshake timed out".into());
+                return Err(format!("{TLS_HANDSHAKE_FAILURE_SENTINEL}TLS handshake timed out"));
             }
             if stream.conn.wants_write() {
-                stream
-                    .conn
-                    .write_tls(&mut stream.sock)
-                    .map_err(|e| format!("handshake write: {e}"))?;
+                stream.conn.write_tls(&mut stream.sock).map_err(|e| {
+                    format!("{TLS_HANDSHAKE_FAILURE_SENTINEL}handshake write: {e}")
+                })?;
             }
             if stream.conn.wants_read() {
-                stream
-                    .conn
-                    .read_tls(&mut stream.sock)
-                    .map_err(|e| format!("handshake read: {e}"))?;
-                stream
-                    .conn
-                    .process_new_packets()
-                    .map_err(|e| format!("handshake process: {e}"))?;
+                stream.conn.read_tls(&mut stream.sock).map_err(|e| {
+                    format!("{TLS_HANDSHAKE_FAILURE_SENTINEL}handshake read: {e}")
+                })?;
+                stream.conn.process_new_packets().map_err(|e| {
+                    format!("{TLS_HANDSHAKE_FAILURE_SENTINEL}handshake process: {e}")
+                })?;
             }
         }
         stream.write_all(&req).map_err(|e| format!("write: {e}"))?;
         stream.flush().map_err(|e| format!("flush: {e}"))?;
-        read_response(&mut stream, head)
+        // A TLS 1.3 client considers ITS side of the handshake finished (and so
+        // `is_handshaking()` above already flipped false) as soon as it has sent
+        // its own Finished — the server can still reject afterwards (e.g. a
+        // required-but-missing client certificate: `NoCertificatesPresented`)
+        // and close the connection without ever sending an HTTP response. Real
+        // JSSE surfaces that as `SSLHandshakeException`/`SSLException`, not a
+        // silent empty/malformed response, so a connection that closes before
+        // a single response byte arrives — immediately after our own optimistic
+        // handshake completion — is classified the same way here rather than
+        // falling through to `huc_real_perform`'s generic "-1" contract (which
+        // is correct for a genuinely malformed-but-present HTTP response, not
+        // for zero bytes at all).
+        read_response(&mut stream, head).map_err(|e| {
+            if e == "connection closed before response head" {
+                format!(
+                    "{TLS_HANDSHAKE_FAILURE_SENTINEL}connection closed immediately after the \
+                     TLS handshake with no response — the peer likely rejected the handshake \
+                     (e.g. a required client certificate was not presented): {e}"
+                )
+            } else {
+                e
+            }
+        })
     } else {
         let mut s = tcp;
         s.write_all(&req).map_err(|e| format!("write: {e}"))?;
