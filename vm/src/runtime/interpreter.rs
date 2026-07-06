@@ -1773,10 +1773,13 @@ fn tlab_alloc_object_inner(
     };
 
     // JIT slow path (`tlab_alloc_object_guarded_refill`): carve a fresh TLAB
-    // only when young gen can spare the chunk WITHOUT another GC — otherwise
-    // let the caller take its non-TLAB fallback (old-gen spill), preserving
-    // the pre-refill behaviour under young pressure. See the wrapper doc.
-    if refill_needs_young_headroom && shared.heap.try_alloc_young_probe(requested).is_none() {
+    // only when the young BUMP TAIL can spare the chunk — an O(1) check.
+    // Otherwise let the caller take its non-TLAB fallback (old-gen spill),
+    // preserving the pre-refill behaviour under young pressure. Probing the
+    // young FREE LIST here instead (try_alloc_young_probe →
+    // largest_free_block) re-scanned a fragmented free list on every slow
+    // allocation — 55% of a binarytrees-18 run. See the wrapper doc.
+    if refill_needs_young_headroom && !shared.heap.young_bump_headroom(requested) {
         return None;
     }
 

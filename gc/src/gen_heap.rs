@@ -6435,6 +6435,20 @@ impl GenerationalHeap {
         }
     }
 
+    /// O(1) bump-tail-only headroom probe — see `VmHeap::young_bump_headroom`.
+    /// Deliberately does NOT fall back to the free list: this feeds the JIT
+    /// TLAB-refill gate, where a per-allocation `largest_free_block` scan of a
+    /// fragmented young free list is exactly the pathology being avoided.
+    pub fn young_bump_headroom(&self, size: usize) -> bool {
+        let from = self.young_from.lock();
+        if let Some(aligned) = from.used().checked_add(7).map(|v| v & !7) {
+            if let Some(end) = aligned.checked_add(size) {
+                return end <= from.capacity();
+            }
+        }
+        false
+    }
+
     /// Carve out a TLAB-sized chunk from the young from-space.
     ///
     /// Returns `Some((ptr, size))` on success, where `ptr` is the start of
