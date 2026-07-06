@@ -2373,7 +2373,18 @@ pub unsafe extern "C" fn jit_getfield(obj_ptr: i64, field_index: i64) -> i64 {
                 0
             };
         }
-        let val: Value = std::ptr::read(ptr as *const Value);
+        // PLAIN-SLOT TEARING FIX (2026-07-06): was `std::ptr::read(ptr as
+        // *const Value)` -- a non-atomic 16-byte copy that can tear against a
+        // concurrent plain putfield on the SAME slot from another mutator
+        // thread (interpreted OR JIT-compiled -- `jit_putfield_*` already
+        // uses `write_value_atomic`, see commit 4e6b560f, but this read side
+        // was never updated to match). Real JDK library code legally relies
+        // on a plain field read/write being tear-free (e.g.
+        // `ReentrantReadWriteLock$Sync`'s plain `firstReader`/
+        // `firstReaderHoldCount`) -- see
+        // docs/known-issues/elasticsearch-lucene-binary-docvalues-range-hangs.md
+        // #3 for the interpreter-side counterpart of this same gap.
+        let val: Value = cratonvm_types::read_value_atomic(ptr as *const Value);
         return match val {
             Value::Int(i) => i as i64,
             Value::Long(l) => l,
@@ -2398,7 +2409,10 @@ pub unsafe extern "C" fn jit_getfield(obj_ptr: i64, field_index: i64) -> i64 {
     // verified < num_slots, so HEADER_SIZE + field_index * SLOT_SIZE is within the
     // object's allocated region.
     let ptr = (obj_ptr as *const u8).add(HEADER_SIZE + field_index as usize * SLOT_SIZE);
-    let val: Value = std::ptr::read(ptr as *const Value);
+    // PLAIN-SLOT TEARING FIX (2026-07-06): see the matching note on the
+    // compact-layout branch above -- was `std::ptr::read(ptr as *const
+    // Value)`, non-atomic, tearable against a concurrent plain putfield.
+    let val: Value = cratonvm_types::read_value_atomic(ptr as *const Value);
     let result = match val {
         Value::Int(i) => i as i64,
         Value::Long(l) => l,
@@ -5463,6 +5477,76 @@ mod tests {
         assert!(
             !take_jit_pending_npe(),
             "an in-bounds getfield must not raise NPE"
+        );
+    }
+
+    // Regression test for the PLAIN-SLOT TEARING FIX (2026-07-06, see
+    // docs/known-issues/elasticsearch-lucene-binary-docvalues-range-hangs.md
+    // #3): `jit_getfield` used to read a 16-byte `Value` slot via a bare,
+    // non-atomic `ptr::read`, asymmetric with `jit_putfield_*`'s already-
+    // atomic `write_value_atomic` (commit 4e6b560f). Two threads hammering
+    // the same field slot -- one via `jit_putfield_int` (mirroring a
+    // JIT-compiled `putfield`), one via `jit_getfield` (mirroring a
+    // JIT-compiled `getfield`) -- must never observe a torn value.
+    #[test]
+    fn jit_getfield_never_tears_against_concurrent_jit_putfield_int() {
+        use crate::config::VmConfig;
+        use crate::vm::SharedVm;
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::Arc;
+
+        let vm_box: Arc<SharedVm> = Arc::new(SharedVm::new(VmConfig::default()));
+        let obj = vm_box.heap.alloc_object(ClassId::new(0), 1);
+        let obj_ptr = obj.as_ptr() as i64;
+
+        const A: i32 = 0x1111_1111;
+        const B: i32 = 0x2222_2222_u32 as i32;
+        const ITERATIONS: usize = 2_000_000;
+        let stop = Arc::new(AtomicBool::new(false));
+
+        let writer = {
+            let stop = Arc::clone(&stop);
+            std::thread::spawn(move || {
+                for i in 0..ITERATIONS {
+                    let v = if i % 2 == 0 { A } else { B };
+                    // SAFETY: obj_ptr is a live, single-field object; slot 0
+                    // is in bounds.
+                    unsafe { jit_putfield_int(obj_ptr, 0, v as i64) };
+                }
+                stop.store(true, Ordering::Release);
+            })
+        };
+
+        let reader = {
+            let stop = Arc::clone(&stop);
+            std::thread::spawn(move || {
+                let mut seen_a = 0usize;
+                let mut seen_b = 0usize;
+                while !stop.load(Ordering::Acquire) {
+                    // SAFETY: obj_ptr is a live, single-field object; slot 0
+                    // is in bounds.
+                    let v = unsafe { jit_getfield(obj_ptr, 0) } as i32;
+                    if v == A {
+                        seen_a += 1;
+                    } else if v == B {
+                        seen_b += 1;
+                    } else {
+                        panic!(
+                            "torn read: observed {v:#x}, neither of the two \
+                             legitimate written values ({A:#x}, {B:#x})"
+                        );
+                    }
+                }
+                (seen_a, seen_b)
+            })
+        };
+
+        writer.join().unwrap();
+        let (seen_a, seen_b) = reader.join().unwrap();
+        assert!(
+            seen_a > 0 && seen_b > 0,
+            "reader never observed both written values (seen_a={seen_a}, \
+             seen_b={seen_b}) -- test may not be exercising real contention"
         );
     }
 
