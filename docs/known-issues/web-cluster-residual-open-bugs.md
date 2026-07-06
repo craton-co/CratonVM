@@ -6,7 +6,8 @@ Found via a full Spring suite sweep of `test.web`, `web.client`, `web.context`,
 This supersedes an earlier version of this doc that was lost when the Azure
 build host's ephemeral disk was wiped mid-session before it could be pushed;
 most of what it listed has since been fixed (see the FIXED section below) —
-only 3 items remain genuinely open.
+only 2 items remain genuinely open (a 3rd, `XlsViewTests::xlsxView`, no
+longer reproduces as of 2026-07-06 — see the FIXED section).
 
 ## Real CratonVM bugs still OPEN
 
@@ -32,13 +33,6 @@ only 3 items remain genuinely open.
   before claim" workaround already used for the `PrimitiveClassDescImpl`/
   `ConstantDescs` cycle — the precise trigger point wasn't pinned down
   confidently enough yet to write a safe patch.
-- **`XlsViewTests::xlsxView`** — `ClassCastException: StringEnumValue cannot
-  be cast to STCellType$Enum`. Traced to `SchemaTypeImpl.ensureStringEnumInfo()`
-  reflectively reading a static `table` field via `Class.getField("table").get(null)`;
-  this fails under CratonVM in the full POI/XSSFWorkbook context but succeeds
-  in an isolated repro using identical jars/classpath — the divergence is
-  context-dependent on the exact object graph POI builds, needs deeper tracing
-  than a first pass gave it.
 
 ## Not CratonVM bugs — environment/test-classpath gaps (skip)
 
@@ -127,3 +121,24 @@ did not reproduce on a clean build — the check that would produce it
 is already disabled on `dev`, precisely because of this JAXB scenario. No fix
 needed. `CookieLocaleResolverTests`'s invalid-timezone tests also did not
 reproduce — already fixed by unrelated prior `TimeZone` native work.
+
+`XlsViewTests::xlsxView`'s `ClassCastException: StringEnumValue cannot be
+cast to STCellType$Enum` (traced to `SchemaTypeImpl.ensureStringEnumInfo()`'s
+reflective `Class.getField("table").get(null)` read on the XmlBeans-generated
+`STCellType$Enum`) also did **not** reproduce on a fresh `dev` build
+(HEAD `1fcd2feb`, 2026-07-06). Verified via a dedicated
+`fix/xls-poi-local` worktree: built a clean baseline binary and ran
+`XlsViewTests` alone (3/3 pass, including `xlsxView`) and again as part of the
+full `org.springframework.web.servlet.view.*` package (28 classes) — `OK 3 3
+0 0 0` both times, with the other pre-existing failures in that sweep
+(FreeMarker, Jython/JRuby, Groovy, `MarshallingViewTests`,
+`DefaultFragmentsRenderingTests`, `ScriptTemplateViewTests` timeout)
+reproducing exactly as documented elsewhere in this file, confirming the
+binary/harness behaved normally rather than silently skipping the test.
+Bisecting the intervening commits wasn't done, but the `ensure_class_initialized`
+call added ahead of every static `Field.get`/`Field.set` in `native-builtins/
+src/lang_class.rs` (`ensure_static_field_declaring_class_initialized`, landed
+in `50119adb` — already an ancestor of both this run and the run that found
+the bug OPEN) plus later reflection/classloading hardening merged into `dev`
+since (e.g. `489b0f88`, the `codex/web-residual-all-20260705-001` merge)
+apparently fixed this as a side effect. No code change was needed or made.
