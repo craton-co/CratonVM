@@ -100,3 +100,89 @@ on bug-15 (the MSC real-start gate) so a hand-driven binary-distribution boot ca
 real sustained concurrent execution — only then can Hypothesis 2 above (or a new one) be
 tested against a live process again. The `FieldTearRepro.java`/`ParserIdiomRepro.java`
 synthetic repros remain the fastest path to iterate on Hypothesis 2 without either.
+
+## 2026-07-06 update (third session) — Hypothesis 2 traced end-to-end at the code level; weakened
+
+Rather than another blind synthetic-repro attempt, this session traced Hypothesis 2's
+actual runtime consequence through the code, since a repro couldn't be forced (see below)
+and the previous two sessions' repro attempts had already come up empty:
+
+1. **The mistagged value genuinely reaches the resumed interpreter frame — this part of
+   Hypothesis 2 is confirmed, not speculative.** A getfield result left unmarked as an
+   oop on the JIT operand stack is captured at deopt as `FrameValue::Int(raw_pointer)`,
+   and `fv_to_value` (`vm/src/runtime/interpreter.rs`) maps `FrameValue::Int` straight to
+   `Value::Int` — unlike `FrameValue::Unsupported` (the *locals*-only failure mode from
+   the *separate* bug #2 in the same `e60b7a5c` fix), which `ir_deopt_frame_values`/
+   `ir_deopt_locals` reject outright (the whole `.collect()` short-circuits to `None`,
+   forcing a safe whole-method re-run instead). Bug #1 (operand stack) and bug #2
+   (locals/params) are two different oop-tracking mechanisms with two different failure
+   modes — only #2's failure is caught by that reject-on-`Unsupported` safety net. So a
+   `Value::Int(raw_pointer_bits)` really does land on the resumed interpreter's operand
+   stack where bytecode expects an `Object`, exactly as the original write-up describes.
+
+2. **But the JDT idiom's own next consumer — `System.arraycopy` — is type-safe against
+   this, so it can't be the vector for THIS specific symptom.**
+   `native_system_arraycopy` (`native-builtins/src/lang_system.rs`) extracts `src`/`dest`
+   via `match args.first() { Some(Value::Object(Some(obj))) => *obj, _ => return
+   NullPointerException }` — a mistagged `Value::Int` here throws a benign (if
+   misleadingly-worded) NPE, not a wild pointer dereference. Whatever the JDT
+   investigation's `CRATONVM_DBG_DEOPT` trace captured, it did not go on to corrupt
+   memory via this call; the JDT bug's own observed symptom (AIOOBE) is fully explained
+   by bug #3 (the unsafe re-run double-executing `stack[ptr--]`), independent of whether
+   bug #1's mistagging ever caused any further harm.
+
+3. **Under CratonVM's DEFAULT configuration — what WildFly's suite runner and both prior
+   hand-driven repro attempts use — bug #1's oop-marking gap has no GC-liveness
+   consequence at all.** `vm/src/jit/conservative_roots.rs`'s own module doc: while
+   `CRATONVM_PRECISE_JIT_MAPS` is unset (default), active JIT frames are scanned
+   *conservatively* — every 8-byte-aligned stack qword is treated as a *possible* heap
+   pointer and validated via `is_object_address`, independent of any oop mark ("false
+   negatives are impossible... every real reference is at an 8-byte aligned spill slot").
+   So a getfield result missing `mark_top_as_oop()` is still found and kept alive by a
+   plain GC pause — the oop mark only matters for `CRATONVM_PRECISE_JIT_MAPS`/
+   `CRATONVM_MOVING_YOUNG` (both default-off) or a deopt (see #1/#2 above). This rules
+   out the "prematurely collected while unrooted, then dereferenced through reused
+   memory" mechanism as the DEFAULT-config explanation — that mechanism is real but only
+   fires under those non-default flags.
+
+**Net effect: Hypothesis 2, as literally stated (`e60b7a5c`'s getfield-oop-marking fix),
+does not by itself explain how an out-of-range *discriminant* — not just a wrong *value*
+— appears in a heap `Value` cell under CratonVM's default configuration.** A mistagged
+reference produces a `Value::Int` holding raw pointer bits, which is a real, distinct
+correctness bug (wrong value, right discriminant tag) but not the literal "16-byte cell
+whose bytes don't form any valid `Value`" signature this guard fires on, at least not via
+the two consumer paths traced here (arraycopy call, GC root scan). Something must still
+either (a) feed that mistagged `Value::Int` into some OTHER, not-yet-identified consumer
+that skips the safe `Value`-matching CratonVM otherwise uses everywhere (a raw,
+untagged machine-code dereference in re-JIT-compiled continuation code is the most
+likely remaining candidate, not yet traced), or (b) be a mechanism unrelated to either
+hypothesis investigated so far.
+
+**Repro-engineering attempt (also inconclusive, recorded to save the next session the
+same dead end):** built a from-scratch mirror of the JDT idiom
+(`this.intStack[this.intPtr--]` immediately followed by `System.arraycopy` on a
+reference-element `char[][]`), tried three variants against the pre-fix baseline
+(`164264c8`) — a version with the hot loop and the idiom in separate methods, an inlined
+single-method version, and both a zero-length and a `len=4` real reference-array copy
+(the zero-length call turned out to bypass the element-kind guard entirely via the
+intrinsic's own dedicated zero-length fast exit — worth knowing if reused). None of the
+three ever produced a single `[cratonvm-deopt]` trace line for the arraycopy call site
+across 200,000 iterations each (`CRATONVM_DBG_DEOPT=1`) — the guard this session expected
+to fail on every call, per the original bug write-up, never visibly fired. Did not
+resolve why (candidates: the intrinsic wasn't applied to this exact call shape at all,
+`consumeLike()`-as-separate-method never got hot enough to compile independently even
+after 200k calls — confirmed no `bg-compile GetfieldOopRepro.consumeLike` line ever
+appeared, only `runLoop`'s own OSR-compile — or a precondition specific to real JDT
+bytecode this synthetic mirror doesn't reproduce). Separately hit and worked around an
+unrelated JIT footgun: `println`/string-concatenation (`invokedynamic`) inside the same
+hot loop triggers an `UnreachedCode` uncommon-trap on the *dead* `StringConcatFactory`
+branch that silently truncates the loop's remaining iterations without any exception —
+harmless once known, but worth flagging for whoever writes the next synthetic probe here.
+
+**Recommended next step:** the fastest remaining path is very likely a full Arquillian
+E2E rerun (still blocked on Maven/wildfly-core availability and bug-15), since three
+sessions' worth of synthetic-repro and code-tracing effort has not yet nailed a minimal
+standalone trigger. If another synthetic attempt is still preferred over waiting on
+infra, first confirm the arraycopy intrinsic guard is even being exercised (e.g. add a
+`CRATONVM_DBG_JITC`/direct disassembly check that `ArraycopyPrimitive`'s guard code is
+actually emitted and taken) before investing further iteration count.
