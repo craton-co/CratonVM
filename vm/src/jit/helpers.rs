@@ -5502,6 +5502,12 @@ mod tests {
         const A: i32 = 0x1111_1111;
         const B: i32 = 0x2222_2222_u32 as i32;
         const ITERATIONS: usize = 2_000_000;
+        // Establish A as the slot'''s initial value BEFORE spawning the reader:
+        // a freshly-allocated slot is zero-initialized (decodes as Value::Int(0)),
+        // and 0 is neither A nor B, so a reader started before the writer'''s
+        // first store would see a legitimate-but-unaccounted-for transient
+        // value -- a test-harness race, not a torn read.
+        unsafe { jit_putfield_int(obj_ptr, 0, A as i64) };
         let stop = Arc::new(AtomicBool::new(false));
 
         let writer = {
