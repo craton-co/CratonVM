@@ -103,8 +103,10 @@
 #![allow(clippy::needless_range_loop)]
 
 use std::collections::HashMap;
+use std::io::{Read as _, Write as _};
+use std::net::TcpStream;
 use std::sync::OnceLock;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use cratonvm_native_api::{NativeContext, NativeMethodRegistry};
 use cratonvm_types::error::{MethodCallFailed, MethodCallResult, RuntimeError};
@@ -149,8 +151,51 @@ pub struct TrustManagerState {
     pub anchors: HashMap<Vec<u8>, Vec<AnchorInfo>>,
     /// The full DER of every trust anchor, in registration order.
     pub anchor_ders: Vec<Vec<u8>>,
-    /// Whether to consult CRLs during validation. Disabled by default.
-    pub enable_crl: bool,
+    /// Real OCSP/CRL revocation-checking configuration, extracted from a
+    /// `java.security.cert.PKIXRevocationChecker` attached via
+    /// `PKIXBuilderParameters.addCertPathChecker(...)`. `None` means
+    /// revocation checking is not configured for this trust manager (matches
+    /// real-JDK's default: `PKIXParameters.isRevocationEnabled()` defaults to
+    /// `true` for `CertPathValidator`, but SunJSSE's `TrustManagerFactory`
+    /// path never attaches a revocation checker unless the caller explicitly
+    /// builds one — see `validate_chain`'s "Step 7" doc for the enforcement
+    /// semantics once this is `Some`).
+    pub revocation: Option<RevocationConfig>,
+}
+
+/// Extracted `java.security.cert.PKIXRevocationChecker` configuration (see
+/// `extract_revocation_checker` for how this is read off the real JDK
+/// object). Drives `validate_chain`'s OCSP/CRL step.
+#[derive(Clone, Debug, Default)]
+pub struct RevocationConfig {
+    /// `PKIXRevocationChecker.getOcspResponder()` — an explicit responder URI
+    /// override. When `None`, the responder URL is read per-certificate from
+    /// its Authority Information Access extension (OID 1.3.6.1.5.5.7.1.1,
+    /// `id-ad-ocsp` access method).
+    pub responder_uri: Option<String>,
+    /// `PKIXRevocationChecker.getOcspResponderCert()` DER — an explicitly
+    /// trusted OCSP responder certificate. When present, a `BasicOCSPResponse`
+    /// signed by this exact cert is trusted directly (no further chain-to-CA
+    /// check on the responder cert is required, matching real-JDK semantics
+    /// for this option).
+    pub responder_cert_der: Option<Vec<u8>>,
+    /// `PKIXRevocationChecker.Option.ONLY_END_ENTITY` — only the leaf
+    /// (end-entity) certificate is revocation-checked; CA certificates in the
+    /// chain are skipped.
+    pub only_end_entity: bool,
+    /// `PKIXRevocationChecker.Option.PREFER_CRLS` — try CRL before OCSP
+    /// (default is OCSP-first, CRL as fallback).
+    pub prefer_crls: bool,
+    /// `PKIXRevocationChecker.Option.NO_FALLBACK` — do not fall back to the
+    /// other mechanism (CRL when OCSP is unavailable, or vice versa with
+    /// `PREFER_CRLS`).
+    pub no_fallback: bool,
+    /// `PKIXRevocationChecker.Option.SOFT_FAIL` — treat "no answer obtainable"
+    /// (network error, timeout, malformed response, responder-side error
+    /// status, `unknown` cert status) as non-fatal and continue validation.
+    /// A definite `revoked` answer is NEVER soft-failed, regardless of this
+    /// flag — soft-fail only covers failure to *obtain* an answer.
+    pub soft_fail: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -237,6 +282,18 @@ pub struct ParsedCert {
     /// certificates that carry it. Drives RFC 5280 §4.2.1.10 enforcement of
     /// every subordinate certificate's names. `None` = no constraints imposed.
     pub name_constraints: Option<NameConstraints>,
+    /// Raw big-endian bytes of `tbsCertificate.serialNumber` (the DER
+    /// INTEGER content, minimal two's-complement encoding — i.e. exactly what
+    /// `X509Certificate.getSerialNumber().toByteArray()` would return). Needed
+    /// verbatim (not as an `i64`) for OCSP `CertID.serialNumber`, which must
+    /// byte-match what the responder computed from the same certificate.
+    pub serial_der: Vec<u8>,
+    /// First `id-ad-ocsp` (OID 1.3.6.1.5.5.7.48.1) `accessLocation` URI found
+    /// in the Authority Information Access extension (OID 1.3.6.1.5.5.7.1.1),
+    /// if any. This is where `validate_chain`'s OCSP step sends the request
+    /// when the active `RevocationConfig` has no explicit responder-URI
+    /// override.
+    pub ocsp_responder_uri: Option<String>,
 }
 
 /// RFC 5280 §4.2.1.10 `GeneralSubtrees`, split by the `GeneralName` types this
@@ -305,6 +362,15 @@ const TAG_SEQUENCE: u8 = 0x30;
 const TAG_SET: u8 = 0x31;
 const TAG_CONTEXT_0: u8 = 0xa0;
 const TAG_CONTEXT_3: u8 = 0xa3;
+const TAG_ENUMERATED: u8 = 0x0a;
+/// OCSP `CertStatus ::= CHOICE { ..., revoked [1] IMPLICIT RevokedInfo, ... }`
+/// — `RevokedInfo` is a SEQUENCE, so this IMPLICIT tag is constructed
+/// (context class 0x80 | constructed 0x20 | tag number 1).
+const TAG_CONTEXT_1_CONSTRUCTED: u8 = 0xa1;
+/// OCSP `CertStatus ::= CHOICE { ..., unknown [2] IMPLICIT UnknownInfo }` —
+/// `UnknownInfo ::= NULL`, so this IMPLICIT tag is primitive (context class
+/// 0x80 | tag number 2, no constructed bit).
+const TAG_CONTEXT_2_PRIMITIVE: u8 = 0x82;
 
 /// EKU OIDs we recognise. DER form (OID body, no tag/length).
 ///   id-kp-serverAuth: 1.3.6.1.5.5.7.3.1
@@ -315,6 +381,9 @@ pub const OID_KP_CLIENT_AUTH: &[u8] = &[0x2b, 0x06, 0x01, 0x05, 0x05, 0x07, 0x03
 pub const OID_KP_CODE_SIGNING: &[u8] = &[0x2b, 0x06, 0x01, 0x05, 0x05, 0x07, 0x03, 0x03];
 ///   id-kp-emailProtection: 1.3.6.1.5.5.7.3.4
 pub const OID_KP_EMAIL_PROTECTION: &[u8] = &[0x2b, 0x06, 0x01, 0x05, 0x05, 0x07, 0x03, 0x04];
+///   id-kp-OCSPSigning: 1.3.6.1.5.5.7.3.9 — required EKU on a delegated OCSP
+///   responder certificate (RFC 6960 §4.2.2.2).
+pub const OID_KP_OCSP_SIGNING: &[u8] = &[0x2b, 0x06, 0x01, 0x05, 0x05, 0x07, 0x03, 0x09];
 
 /// Public-key algorithm OIDs.
 ///   1.2.840.113549.1.1.1 — RSA
@@ -339,6 +408,10 @@ const OID_EXT_BASIC_CONSTRAINTS: &[u8] = &[0x55, 0x1d, 0x13];
 const OID_EXT_SUBJECT_ALT_NAME: &[u8] = &[0x55, 0x1d, 0x11];
 ///   2.5.29.30 — NameConstraints
 const OID_EXT_NAME_CONSTRAINTS: &[u8] = &[0x55, 0x1d, 0x1e];
+///   1.3.6.1.5.5.7.1.1 — AuthorityInfoAccess (RFC 5280 §4.2.2.1)
+const OID_EXT_AUTHORITY_INFO_ACCESS: &[u8] = &[0x2b, 0x06, 0x01, 0x05, 0x05, 0x07, 0x01, 0x01];
+///   1.3.6.1.5.5.7.48.1 — id-ad-ocsp `AccessDescription.accessMethod`
+const OID_AD_OCSP: &[u8] = &[0x2b, 0x06, 0x01, 0x05, 0x05, 0x07, 0x30, 0x01];
 
 /// AttributeType OID `2.5.4.3` — commonName (CN), used as the legacy
 /// fallback identity when a leaf carries no `dNSName` SubjectAltName.
@@ -506,6 +579,7 @@ pub fn parse_certificate(der: &[u8]) -> Result<ParsedCert, CertParseError> {
 
     // serialNumber
     let serial = read_tlv_tagged(cursor, TAG_INTEGER)?;
+    let serial_der = serial.content.to_vec();
     cursor = serial.rest;
 
     // signature AlgorithmIdentifier
@@ -548,6 +622,7 @@ pub fn parse_certificate(der: &[u8]) -> Result<ParsedCert, CertParseError> {
     let mut san_uris: Vec<String> = Vec::new();
     let mut san_dir_names: Vec<Vec<u8>> = Vec::new();
     let mut name_constraints: Option<NameConstraints> = None;
+    let mut ocsp_responder_uri: Option<String> = None;
 
     while !cursor.is_empty() {
         let tlv = read_tlv(cursor)?;
@@ -670,6 +745,41 @@ pub fn parse_certificate(der: &[u8]) -> Result<ParsedCert, CertParseError> {
                     if let Ok(nc) = parse_name_constraints(value_tlv.content) {
                         name_constraints = Some(nc);
                     }
+                } else if oid.content == OID_EXT_AUTHORITY_INFO_ACCESS {
+                    // AuthorityInfoAccessSyntax ::= SEQUENCE SIZE (1..MAX) OF
+                    //   AccessDescription
+                    // AccessDescription ::= SEQUENCE { accessMethod OID,
+                    //   accessLocation GeneralName }
+                    // We want the first `accessLocation` whose `accessMethod`
+                    // is id-ad-ocsp (1.3.6.1.5.5.7.48.1) and whose
+                    // `accessLocation` is a uniformResourceIdentifier ([6]).
+                    // A malformed AIA is non-fatal, same lenient treatment as
+                    // SubjectAltName above.
+                    if let Ok(seq) = read_tlv_tagged(value_tlv.content, TAG_SEQUENCE) {
+                        let mut ac = seq.content;
+                        while !ac.is_empty() {
+                            let ad = match read_tlv_tagged(ac, TAG_SEQUENCE) {
+                                Ok(t) => t,
+                                Err(_) => break,
+                            };
+                            ac = ad.rest;
+                            let method = match read_tlv_tagged(ad.content, TAG_OID) {
+                                Ok(t) => t,
+                                Err(_) => continue,
+                            };
+                            if method.content == OID_AD_OCSP {
+                                if let Ok(loc) = read_tlv(method.rest) {
+                                    if loc.tag == GN_TAG_URI {
+                                        if let Ok(s) = std::str::from_utf8(loc.content) {
+                                            if ocsp_responder_uri.is_none() {
+                                                ocsp_responder_uri = Some(s.to_string());
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
                 }
             }
         }
@@ -699,6 +809,8 @@ pub fn parse_certificate(der: &[u8]) -> Result<ParsedCert, CertParseError> {
         san_uris,
         san_dir_names,
         name_constraints,
+        serial_der,
+        ocsp_responder_uri,
     })
 }
 
@@ -975,7 +1087,6 @@ pub fn build_key_manager_state(keystore_id: i32) -> KeyManagerState {
 pub fn build_trust_manager_state(keystore_id: i32) -> TrustManagerState {
     let mut state = TrustManagerState {
         keystore_id,
-        enable_crl: false,
         ..Default::default()
     };
 
@@ -1205,6 +1316,22 @@ pub enum TrustError {
         kind: NcViolation,
     },
     Parse(CertParseError),
+    /// An OCSP responder returned a definite `revoked` `CertStatus` for the
+    /// certificate at chain index `at` (0 = leaf). Never suppressed by
+    /// `SOFT_FAIL` — soft-fail only covers failure to *obtain* an answer.
+    Revoked {
+        at: usize,
+    },
+    /// Revocation checking was configured (`RevocationConfig` present) but no
+    /// definite answer could be obtained for the certificate at chain index
+    /// `at` — responder unreachable, timed out, returned a malformed/erroring
+    /// response, or answered `unknown` — and `SOFT_FAIL` was not set. `reason`
+    /// carries a human-readable diagnostic (network error text, parse
+    /// failure, HTTP status, etc.).
+    RevocationCheckFailed {
+        at: usize,
+        reason: String,
+    },
 }
 
 /// The specific name that triggered a [`TrustError::NameConstraintViolation`].
@@ -1269,6 +1396,16 @@ impl std::fmt::Display for TrustError {
                 )
             }
             TrustError::Parse(e) => write!(f, "parse: {}", e),
+            TrustError::Revoked { at } => {
+                write!(f, "certificate at index {} has been revoked (OCSP)", at)
+            }
+            TrustError::RevocationCheckFailed { at, reason } => {
+                write!(
+                    f,
+                    "revocation check failed at index {} and SOFT_FAIL is not set: {}",
+                    at, reason
+                )
+            }
         }
     }
 }
@@ -1390,6 +1527,18 @@ pub fn validate_chain(chain: &[Vec<u8>], trust: &TrustManagerState) -> Result<()
             anchor.spki_der.as_slice()
         };
         verify_one_signature(i, &parsed[i], issuer_spki)?;
+    }
+
+    // Step 7: OCSP revocation checking. Only runs when the active trust
+    // manager carries a `RevocationConfig` (i.e. the caller attached a
+    // `PKIXRevocationChecker` via `PKIXBuilderParameters.addCertPathChecker`
+    // — see `extract_revocation_checker`). Absent that, this step is a no-op:
+    // a structurally- and cryptographically-valid chain from a trusted CA is
+    // accepted without a revocation opinion, matching the historical
+    // behaviour of every trust manager that never asked for revocation
+    // checking in the first place.
+    if let Some(revocation) = &trust.revocation {
+        check_revocation(&parsed, anchor, last_is_anchor, revocation)?;
     }
 
     Ok(())
@@ -1794,6 +1943,706 @@ fn verify_one_signature(
 }
 
 // ---------------------------------------------------------------------------
+// OCSP revocation checking (RFC 6960)
+// ---------------------------------------------------------------------------
+//
+// Real OCSP: a DER `OCSPRequest` is POSTed to a responder over plain HTTP
+// (RFC 6960 Appendix A.1 — OCSP has its own MIME types and does not require
+// TLS; responders are conventionally plain HTTP, and that is what the test
+// harness's `TesterOcspResponderServlet` exposes), the DER `OCSPResponse` is
+// parsed, and the embedded `BasicOCSPResponse`'s signature is verified
+// against either the issuing CA's key directly, or a delegated responder
+// certificate (carried in the response's own `certs` field, itself signed by
+// the issuing CA, or matching an explicitly configured
+// `PKIXRevocationChecker.setOcspResponderCert(...)`).
+//
+// `CertID` uses SHA-1 (RFC 6960's own conventional default — deliberately
+// weak-hash-tolerant because it hashes only public, non-secret identifiers:
+// issuer name and issuer public key, not anything an attacker could forge a
+// preimage for that would matter cryptographically here) unless a future
+// caller negotiates something else; this verifier only ever emits SHA-1
+// `CertID`s, matching what `TesterOcspResponderServlet`
+// (`RespID(..., digestCalculatorProvider.get(SHA-1))`, "Only SHA-1
+// supported") and every other OCSP responder in practice expects.
+
+/// OID for `id-pkix-ocsp-basic` (1.3.6.1.5.5.7.48.1.1) — the
+/// `ResponseBytes.responseType` value whose `response` OCTET STRING content
+/// is a DER `BasicOCSPResponse`. The only response type this verifier (or
+/// any responder we've seen) produces.
+const OID_OCSP_BASIC_RESPONSE: &[u8] = &[0x2b, 0x06, 0x01, 0x05, 0x05, 0x07, 0x30, 0x01, 0x01];
+
+/// SHA-1 `AlgorithmIdentifier` OID (1.3.14.3.2.26) used for `CertID`'s
+/// `hashAlgorithm` — RFC 6960's conventional default.
+const OID_SHA1: &[u8] = &[0x2b, 0x0e, 0x03, 0x02, 0x1a];
+
+/// Outcome of checking one certificate's revocation status against an OCSP
+/// responder.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum OcspOutcome {
+    /// `CertStatus ::= good [0] IMPLICIT NULL` — definitely not revoked.
+    Good,
+    /// `CertStatus ::= revoked [1] IMPLICIT RevokedInfo` — definitely revoked.
+    /// Never soft-failed, even when `SOFT_FAIL` is configured.
+    Revoked,
+    /// The responder could not be reached, timed out, returned a transport
+    /// error, returned a malformed response, returned a non-`successful`
+    /// `OCSPResponseStatus` (`tryLater`, `internalError`, ...), or returned
+    /// `unknown [2]` for this specific cert. Soft-failable when `SOFT_FAIL`
+    /// is configured; otherwise treated as a hard validation failure.
+    Indeterminate(String),
+}
+
+/// A minimal parsed `CertID` — the fields needed to build an `OCSPRequest`
+/// for one certificate. `issuer_name_hash`/`issuer_key_hash` are SHA-1(DER
+/// issuer Name) / SHA-1(issuer SPKI's `subjectPublicKey` BIT STRING content,
+/// i.e. the raw key bytes without the unused-bits-count byte) per RFC 6960
+/// §4.1.1.
+struct CertId {
+    issuer_name_hash: [u8; 20],
+    issuer_key_hash: [u8; 20],
+    serial_der: Vec<u8>,
+}
+
+fn sha1(data: &[u8]) -> [u8; 20] {
+    use sha1::Digest;
+    let mut h = sha1::Sha1::new();
+    h.update(data);
+    h.finalize().into()
+}
+
+/// Build the `CertID` for `subject` (a chain certificate), whose issuer is
+/// `issuer_spki_der`/`issuer_subject_der` (either the next cert up the chain,
+/// or the matched trust anchor's own cert when `subject` is signed directly
+/// by the anchor).
+fn build_cert_id(subject: &ParsedCert, issuer_subject_der: &[u8], issuer_spki_der: &[u8]) -> Option<CertId> {
+    // issuer_key_hash = SHA-1 over the raw key bits (the SubjectPublicKeyInfo
+    // BIT STRING's content, minus its leading unused-bits-count byte) — NOT
+    // over the whole SPKI SEQUENCE. RFC 6960 §4.1.1 defines this as
+    // SHA-1(the value of the BIT STRING subjectPublicKey, excluding tag,
+    // length, and unused-bits).
+    let spki = read_tlv_tagged(issuer_spki_der, TAG_SEQUENCE).ok()?;
+    let alg = read_tlv_tagged(spki.content, TAG_SEQUENCE).ok()?;
+    let bs = read_tlv_tagged(alg.rest, TAG_BIT_STRING).ok()?;
+    if bs.content.is_empty() {
+        return None;
+    }
+    let key_bits = &bs.content[1..];
+    Some(CertId {
+        issuer_name_hash: sha1(issuer_subject_der),
+        issuer_key_hash: sha1(key_bits),
+        serial_der: subject.serial_der.clone(),
+    })
+}
+
+// ---- Minimal DER encoder (production path — the `#[cfg(test)]` fixture
+// builders below in `mod tests` are not visible outside that module) ----
+
+fn der_encode_length(len: usize, out: &mut Vec<u8>) {
+    if len < 0x80 {
+        out.push(len as u8);
+    } else {
+        let bytes = len.to_be_bytes();
+        let first_nonzero = bytes.iter().position(|&b| b != 0).unwrap_or(bytes.len() - 1);
+        let sig = &bytes[first_nonzero..];
+        out.push(0x80 | sig.len() as u8);
+        out.extend_from_slice(sig);
+    }
+}
+
+fn der_tlv_encode(tag: u8, body: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(body.len() + 4);
+    out.push(tag);
+    der_encode_length(body.len(), &mut out);
+    out.extend_from_slice(body);
+    out
+}
+
+fn der_seq_encode(body: Vec<u8>) -> Vec<u8> {
+    der_tlv_encode(TAG_SEQUENCE, &body)
+}
+
+fn der_oid_encode(body: &[u8]) -> Vec<u8> {
+    der_tlv_encode(TAG_OID, body)
+}
+
+fn der_octet_encode(body: &[u8]) -> Vec<u8> {
+    der_tlv_encode(TAG_OCTET_STRING, body)
+}
+
+fn der_null_encode() -> Vec<u8> {
+    der_tlv_encode(TAG_NULL, &[])
+}
+
+/// Minimal-length two's-complement `INTEGER` encoding for a serial that is
+/// already stored as raw (already-minimal, non-negative per RFC 5280) DER
+/// integer content bytes — re-wrap with tag/length only, no re-minimisation
+/// (the source is itself DER, already minimal).
+fn der_integer_from_content(content: &[u8]) -> Vec<u8> {
+    let body: &[u8] = if content.is_empty() { &[0u8] } else { content };
+    der_tlv_encode(TAG_INTEGER, body)
+}
+
+/// Build a DER `OCSPRequest` (RFC 6960 §4.1.1) for a single `CertID`:
+///
+/// ```text
+/// OCSPRequest     ::= SEQUENCE { tbsRequest TBSRequest }
+/// TBSRequest      ::= SEQUENCE { requestList SEQUENCE OF Request }
+/// Request         ::= SEQUENCE { reqCert CertID }
+/// CertID          ::= SEQUENCE {
+///     hashAlgorithm   AlgorithmIdentifier,
+///     issuerNameHash  OCTET STRING,
+///     issuerKeyHash   OCTET STRING,
+///     serialNumber    CertificateSerialNumber }
+/// ```
+///
+/// No `requestorName`, no `requestExtensions` (in particular, no nonce — the
+/// test responder does not echo one, and omitting it is valid per RFC 6960).
+fn build_ocsp_request(id: &CertId) -> Vec<u8> {
+    let hash_alg = der_seq_encode({
+        let mut v = der_oid_encode(OID_SHA1);
+        v.extend_from_slice(&der_null_encode());
+        v
+    });
+    let cert_id = der_seq_encode({
+        let mut v = hash_alg;
+        v.extend_from_slice(&der_octet_encode(&id.issuer_name_hash));
+        v.extend_from_slice(&der_octet_encode(&id.issuer_key_hash));
+        v.extend_from_slice(&der_integer_from_content(&id.serial_der));
+        v
+    });
+    let request = der_seq_encode(cert_id);
+    let request_list = der_seq_encode(request);
+    let tbs_request = der_seq_encode(request_list);
+    der_seq_encode(tbs_request)
+}
+
+/// A single `SingleResponse` extracted from a parsed `BasicOCSPResponse`.
+#[derive(Debug)]
+struct SingleResponse {
+    cert_id_serial: Vec<u8>,
+    status: OcspStatusTag,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum OcspStatusTag {
+    Good,
+    Revoked,
+    Unknown,
+}
+
+/// A parsed `BasicOCSPResponse` (RFC 6960 §4.2.1), enough of it to verify the
+/// signature and read every `SingleResponse`'s status.
+#[derive(Debug)]
+struct BasicOcspResponse {
+    tbs_response_data_der: Vec<u8>,
+    signature_algorithm_oid: Vec<u8>,
+    signature: Vec<u8>,
+    /// Optional `certs [0]` — delegated responder certificate chain, leaf
+    /// (the actual signer) first, in document order.
+    certs: Vec<Vec<u8>>,
+    responses: Vec<SingleResponse>,
+}
+
+/// Parse a DER `OCSPResponse` all the way down to a `BasicOcspResponse`, or
+/// `Err` with a human-readable reason (surfaced through
+/// `OcspOutcome::Indeterminate` so callers can decide soft-fail).
+///
+/// ```text
+/// OCSPResponse ::= SEQUENCE {
+///    responseStatus   OCSPResponseStatus,
+///    responseBytes    [0] EXPLICIT ResponseBytes OPTIONAL }
+/// OCSPResponseStatus ::= ENUMERATED {
+///    successful (0), malformedRequest (1), internalError (2),
+///    tryLater (3), (4 unused), sigRequired (5), unauthorized (6) }
+/// ResponseBytes ::= SEQUENCE {
+///    responseType   OBJECT IDENTIFIER,
+///    response       OCTET STRING }
+/// ```
+fn parse_ocsp_response(der: &[u8]) -> Result<BasicOcspResponse, String> {
+    let outer = read_tlv_tagged(der, TAG_SEQUENCE).map_err(|e| format!("OCSPResponse: {e}"))?;
+    let status = read_tlv_tagged(outer.content, TAG_ENUMERATED)
+        .map_err(|e| format!("responseStatus: {e}"))?;
+    let status_code = status.content.first().copied().unwrap_or(0xff);
+    if status_code != 0 {
+        let name = match status_code {
+            1 => "malformedRequest",
+            2 => "internalError",
+            3 => "tryLater",
+            5 => "sigRequired",
+            6 => "unauthorized",
+            _ => "unknown-status",
+        };
+        return Err(format!("responder returned non-successful status: {name} ({status_code})"));
+    }
+    let rb_outer = read_tlv(status.rest).map_err(|e| format!("responseBytes: {e}"))?;
+    if rb_outer.tag != TAG_CONTEXT_0 {
+        return Err("successful response with no responseBytes".to_string());
+    }
+    let rb = read_tlv_tagged(rb_outer.content, TAG_SEQUENCE).map_err(|e| format!("ResponseBytes: {e}"))?;
+    let response_type = read_tlv_tagged(rb.content, TAG_OID).map_err(|e| format!("responseType: {e}"))?;
+    if response_type.content != OID_OCSP_BASIC_RESPONSE {
+        return Err("unsupported OCSP responseType (not id-pkix-ocsp-basic)".to_string());
+    }
+    let response_octets =
+        read_tlv_tagged(response_type.rest, TAG_OCTET_STRING).map_err(|e| format!("response: {e}"))?;
+
+    // BasicOCSPResponse ::= SEQUENCE { tbsResponseData, signatureAlgorithm,
+    //   signature BIT STRING, certs [0] EXPLICIT SEQUENCE OF Certificate OPTIONAL }
+    let basic =
+        read_tlv_tagged(response_octets.content, TAG_SEQUENCE).map_err(|e| format!("BasicOCSPResponse: {e}"))?;
+    let tbs_response_data =
+        read_tlv_tagged(basic.content, TAG_SEQUENCE).map_err(|e| format!("tbsResponseData: {e}"))?;
+    let tbs_response_data_der = tbs_response_data.full.to_vec();
+
+    let sig_alg = read_tlv_tagged(tbs_response_data.rest, TAG_SEQUENCE).map_err(|e| format!("signatureAlgorithm: {e}"))?;
+    let sig_alg_oid = read_tlv_tagged(sig_alg.content, TAG_OID).map_err(|e| format!("sigAlg OID: {e}"))?;
+    let signature_algorithm_oid = sig_alg_oid.content.to_vec();
+
+    let sig_bs = read_tlv_tagged(sig_alg.rest, TAG_BIT_STRING).map_err(|e| format!("signature: {e}"))?;
+    let signature = if sig_bs.content.is_empty() {
+        Vec::new()
+    } else {
+        sig_bs.content[1..].to_vec()
+    };
+
+    // Optional certs [0] EXPLICIT SEQUENCE OF Certificate
+    let mut certs = Vec::new();
+    if !sig_bs.rest.is_empty() {
+        if let Ok(certs_ctx) = read_tlv_tagged(sig_bs.rest, TAG_CONTEXT_0) {
+            if let Ok(seq) = read_tlv_tagged(certs_ctx.content, TAG_SEQUENCE) {
+                let mut cc = seq.content;
+                while !cc.is_empty() {
+                    let c = read_tlv(cc).map_err(|e| format!("certs[]: {e}"))?;
+                    certs.push(c.full.to_vec());
+                    cc = c.rest;
+                }
+            }
+        }
+    }
+
+    // ---- Parse ResponseData ::= SEQUENCE { version [0] EXPLICIT INTEGER
+    //   DEFAULT v1, responderID ResponderID, producedAt GeneralizedTime,
+    //   responses SEQUENCE OF SingleResponse, responseExtensions [1]
+    //   EXPLICIT Extensions OPTIONAL } ----
+    let mut rd_cursor = tbs_response_data.content;
+    let first = read_tlv(rd_cursor).map_err(|e| format!("ResponseData: {e}"))?;
+    if first.tag == TAG_CONTEXT_0 {
+        rd_cursor = first.rest;
+    }
+    // responderID CHOICE { byName [1] Name, byKey [2] OCTET STRING } —
+    // context-tagged, either way; skip via generic TLV read.
+    let responder_id = read_tlv(rd_cursor).map_err(|e| format!("responderID: {e}"))?;
+    rd_cursor = responder_id.rest;
+    // producedAt GeneralizedTime
+    let produced_at = read_tlv_tagged(rd_cursor, TAG_GENERALIZED_TIME).map_err(|e| format!("producedAt: {e}"))?;
+    rd_cursor = produced_at.rest;
+    // responses SEQUENCE OF SingleResponse
+    let responses_seq = read_tlv_tagged(rd_cursor, TAG_SEQUENCE).map_err(|e| format!("responses: {e}"))?;
+
+    let mut responses = Vec::new();
+    let mut sc = responses_seq.content;
+    while !sc.is_empty() {
+        // SingleResponse ::= SEQUENCE { certID CertID, certStatus CertStatus,
+        //   thisUpdate GeneralizedTime, nextUpdate [0] EXPLICIT
+        //   GeneralizedTime OPTIONAL, singleExtensions [1] EXPLICIT
+        //   Extensions OPTIONAL }
+        let sr = read_tlv_tagged(sc, TAG_SEQUENCE).map_err(|e| format!("SingleResponse: {e}"))?;
+        sc = sr.rest;
+
+        // CertID ::= SEQUENCE { hashAlgorithm, issuerNameHash OCTET STRING,
+        //   issuerKeyHash OCTET STRING, serialNumber INTEGER }
+        let cert_id = read_tlv_tagged(sr.content, TAG_SEQUENCE).map_err(|e| format!("CertID: {e}"))?;
+        let hash_alg = read_tlv_tagged(cert_id.content, TAG_SEQUENCE).map_err(|e| format!("CertID.hashAlgorithm: {e}"))?;
+        let issuer_name_hash =
+            read_tlv_tagged(hash_alg.rest, TAG_OCTET_STRING).map_err(|e| format!("issuerNameHash: {e}"))?;
+        let issuer_key_hash =
+            read_tlv_tagged(issuer_name_hash.rest, TAG_OCTET_STRING).map_err(|e| format!("issuerKeyHash: {e}"))?;
+        let serial =
+            read_tlv_tagged(issuer_key_hash.rest, TAG_INTEGER).map_err(|e| format!("CertID.serialNumber: {e}"))?;
+        let cert_id_serial = serial.content.to_vec();
+
+        // certStatus ::= CHOICE { good [0] IMPLICIT NULL (primitive, 0x80),
+        //   revoked [1] IMPLICIT RevokedInfo (constructed SEQUENCE, 0xa1),
+        //   unknown [2] IMPLICIT UnknownInfo (primitive NULL, 0x82) }
+        let cert_status = read_tlv(cert_id.rest).map_err(|e| format!("certStatus: {e}"))?;
+        let status = match cert_status.tag {
+            0x80 => OcspStatusTag::Good,
+            TAG_CONTEXT_1_CONSTRUCTED => OcspStatusTag::Revoked,
+            TAG_CONTEXT_2_PRIMITIVE => OcspStatusTag::Unknown,
+            other => return Err(format!("unrecognised certStatus tag {other:#x}")),
+        };
+
+        responses.push(SingleResponse {
+            cert_id_serial,
+            status,
+        });
+    }
+
+    Ok(BasicOcspResponse {
+        tbs_response_data_der,
+        signature_algorithm_oid,
+        signature,
+        certs,
+        responses,
+    })
+}
+
+/// Verify a `BasicOcspResponse`'s signature and return the trusted verdict
+/// for `wanted_serial`'s `CertID` — or `Err` (soft-failable) when the
+/// signature cannot be verified (bad crypto, no usable signer key found, or
+/// this cert's serial has no `SingleResponse` at all).
+///
+/// Trust chain for the signer:
+///   1. If the active `RevocationConfig` has an explicit
+///      `responder_cert_der` (`PKIXRevocationChecker.setOcspResponderCert`),
+///      the response MUST be signed by exactly that key — no further chain
+///      check (matches real-JDK: an explicitly pinned responder cert is
+///      trusted directly).
+///   2. Otherwise, if the response carries a `certs[]` chain, its first
+///      entry is the signer; that signer cert must (a) verify the response
+///      signature, (b) carry the `id-kp-OCSPSigning` EKU, and (c) itself be
+///      signed by `issuer_spki_der` (the CA that issued the certificate
+///      being checked) — the standard "delegated responder" trust model
+///      (RFC 6960 §4.2.2.2).
+///   3. Otherwise, the issuing CA's own key must have produced the
+///      signature directly.
+fn verify_ocsp_response_signature(
+    resp: &BasicOcspResponse,
+    issuer_spki_der: &[u8],
+    explicit_responder_cert_der: Option<&[u8]>,
+) -> Result<(), String> {
+    let verify_with_spki = |spki: &[u8]| -> bool {
+        match resp.signature_algorithm_oid.as_slice() {
+            oid if oid == OID_SIG_SHA256_RSA => {
+                let Some(pk) = crate::crypto_impl::parse_rsa_public_key(spki) else {
+                    return false;
+                };
+                crate::crypto_impl::Rsa::verify_sha256(&pk, &resp.tbs_response_data_der, &resp.signature)
+            }
+            oid if oid == OID_SIG_ECDSA_SHA256 => {
+                let Some(pk) = crate::crypto_impl::parse_ecdsa_public_key(spki) else {
+                    return false;
+                };
+                let digest = crate::crypto_impl::Sha256::digest(&resp.tbs_response_data_der);
+                crate::crypto_impl::Ecdsa::verify_with_digest(&pk, &digest, &resp.signature)
+            }
+            _ => false,
+        }
+    };
+
+    if let Some(pinned_der) = explicit_responder_cert_der {
+        let pinned = parse_certificate(pinned_der).map_err(|e| format!("pinned responder cert: {e}"))?;
+        return if verify_with_spki(&pinned.spki_der) {
+            Ok(())
+        } else {
+            Err("OCSP response signature does not verify against the pinned responder cert".to_string())
+        };
+    }
+
+    if let Some(signer_der) = resp.certs.first() {
+        let signer = parse_certificate(signer_der).map_err(|e| format!("responder cert: {e}"))?;
+        if !verify_with_spki(&signer.spki_der) {
+            return Err("OCSP response signature does not verify against embedded responder cert".to_string());
+        }
+        if !signer.ext_key_usage.iter().any(|eku| eku.as_slice() == OID_KP_OCSP_SIGNING) {
+            return Err("embedded OCSP responder cert lacks id-kp-OCSPSigning EKU".to_string());
+        }
+        // The delegated responder cert must itself be signed by the same CA
+        // that issued the certificate under check.
+        if signer.signature_value.is_empty() {
+            return Err("responder cert has no signature".to_string());
+        }
+        return match verify_one_signature(0, &signer, issuer_spki_der) {
+            Ok(()) => Ok(()),
+            Err(e) => Err(format!("embedded responder cert not signed by issuing CA: {e}")),
+        };
+    }
+
+    // No embedded chain and no pinned cert: the issuing CA must have signed
+    // the response directly.
+    if verify_with_spki(issuer_spki_der) {
+        Ok(())
+    } else {
+        Err("OCSP response signature does not verify against the issuing CA".to_string())
+    }
+}
+
+/// POST `request_der` to `responder_url` (plain HTTP — OCSP responders are
+/// conventionally unencrypted, matching `TesterOcspResponderServlet`'s
+/// bare-HTTP `Connector`) and return the raw DER response body.
+///
+/// Hand-rolled HTTP/1.1 rather than reusing `http_client.rs`/
+/// `http_url_connection.rs`: those are TLS-capable, redirect-following,
+/// connection-pooling clients built for the `java.net.http`/
+/// `HttpURLConnection` surface — considerably more machinery than a
+/// single-shot, same-process, plain-HTTP POST needs, and neither exposes a
+/// `pub` entry point at the byte-in/byte-out granularity this call wants.
+fn ocsp_http_post(responder_url: &str, request_der: &[u8], timeout: Duration) -> Result<Vec<u8>, String> {
+    let rest = responder_url
+        .strip_prefix("http://")
+        .ok_or_else(|| format!("unsupported OCSP responder URL scheme: {responder_url}"))?;
+    let (authority, path) = match rest.find('/') {
+        Some(i) => (&rest[..i], &rest[i..]),
+        None => (rest, "/"),
+    };
+    let (host, port) = match authority.rfind(':') {
+        Some(i) => {
+            let port: u16 = authority[i + 1..]
+                .parse()
+                .map_err(|_| format!("bad port in OCSP responder URL: {responder_url}"))?;
+            (&authority[..i], port)
+        }
+        None => (authority, 80u16),
+    };
+
+    let addr = format!("{host}:{port}");
+    let mut stream = TcpStream::connect(&addr).map_err(|e| format!("connect {addr}: {e}"))?;
+    stream
+        .set_read_timeout(Some(timeout))
+        .map_err(|e| format!("set_read_timeout: {e}"))?;
+    stream
+        .set_write_timeout(Some(timeout))
+        .map_err(|e| format!("set_write_timeout: {e}"))?;
+
+    let mut req = Vec::with_capacity(256 + request_der.len());
+    req.extend_from_slice(format!("POST {path} HTTP/1.1\r\n").as_bytes());
+    req.extend_from_slice(format!("Host: {host}:{port}\r\n").as_bytes());
+    req.extend_from_slice(b"Content-Type: application/ocsp-request\r\n");
+    req.extend_from_slice(format!("Content-Length: {}\r\n", request_der.len()).as_bytes());
+    req.extend_from_slice(b"Connection: close\r\n\r\n");
+    req.extend_from_slice(request_der);
+
+    stream.write_all(&req).map_err(|e| format!("write: {e}"))?;
+
+    let mut all = Vec::with_capacity(4096);
+    let mut buf = [0u8; 4096];
+    loop {
+        match stream.read(&mut buf) {
+            Ok(0) => break,
+            Ok(n) => all.extend_from_slice(&buf[..n]),
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(e) => return Err(format!("read: {e}")),
+        }
+    }
+
+    let sep = all
+        .windows(4)
+        .position(|w| w == b"\r\n\r\n")
+        .ok_or_else(|| "OCSP HTTP response: no header terminator".to_string())?;
+    let head = std::str::from_utf8(&all[..sep]).map_err(|e| format!("OCSP HTTP response headers: {e}"))?;
+    let mut lines = head.split("\r\n");
+    let status_line = lines.next().unwrap_or("");
+    let status: i32 = status_line
+        .splitn(3, ' ')
+        .nth(1)
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0);
+    if status != 200 {
+        return Err(format!("OCSP responder returned HTTP {status}"));
+    }
+    let mut content_length: Option<usize> = None;
+    let mut chunked = false;
+    for line in lines {
+        if let Some((k, v)) = line.split_once(':') {
+            let k = k.trim();
+            let v = v.trim();
+            if k.eq_ignore_ascii_case("content-length") {
+                content_length = v.parse().ok();
+            }
+            if k.eq_ignore_ascii_case("transfer-encoding") && v.eq_ignore_ascii_case("chunked") {
+                chunked = true;
+            }
+        }
+    }
+    let body = &all[sep + 4..];
+    if chunked {
+        return decode_chunked_body(body);
+    }
+    match content_length {
+        Some(n) if n <= body.len() => Ok(body[..n].to_vec()),
+        _ => Ok(body.to_vec()),
+    }
+}
+
+/// Decode an HTTP/1.1 `Transfer-Encoding: chunked` body. Tomcat (the OCSP
+/// test responder) sometimes chunks small servlet responses rather than
+/// pre-computing `Content-Length`.
+fn decode_chunked_body(mut data: &[u8]) -> Result<Vec<u8>, String> {
+    let mut out = Vec::with_capacity(data.len());
+    loop {
+        let nl = data
+            .windows(2)
+            .position(|w| w == b"\r\n")
+            .ok_or_else(|| "chunked body: bad chunk header".to_string())?;
+        let size_str = std::str::from_utf8(&data[..nl]).map_err(|e| format!("chunk size: {e}"))?;
+        let size_str = size_str.split(';').next().unwrap_or("").trim();
+        let size = usize::from_str_radix(size_str, 16).map_err(|e| format!("chunk size: {e}"))?;
+        data = &data[nl + 2..];
+        if size == 0 {
+            break;
+        }
+        if data.len() < size {
+            return Err("chunked body: truncated chunk".to_string());
+        }
+        out.extend_from_slice(&data[..size]);
+        data = &data[size..];
+        if data.len() >= 2 && &data[..2] == b"\r\n" {
+            data = &data[2..];
+        }
+    }
+    Ok(out)
+}
+
+/// Check one certificate's revocation status via OCSP.
+///
+/// `issuer_subject_der`/`issuer_spki_der` describe the certificate that
+/// issued `subject` (either the next chain cert, or the matched trust
+/// anchor). Returns `Ok(OcspOutcome)` for any outcome this function was able
+/// to determine one way or the other (including "indeterminate" reasons);
+/// the only `Err` case is "no responder URL could be determined at all",
+/// which callers should also treat as indeterminate/soft-failable.
+fn check_ocsp(
+    subject: &ParsedCert,
+    issuer_subject_der: &[u8],
+    issuer_spki_der: &[u8],
+    revocation: &RevocationConfig,
+    timeout: Duration,
+) -> OcspOutcome {
+    let responder_url = revocation
+        .responder_uri
+        .clone()
+        .or_else(|| subject.ocsp_responder_uri.clone());
+    let Some(responder_url) = responder_url else {
+        return OcspOutcome::Indeterminate(
+            "no OCSP responder URI (no PKIXRevocationChecker override and no AIA extension)".to_string(),
+        );
+    };
+
+    let Some(cert_id) = build_cert_id(subject, issuer_subject_der, issuer_spki_der) else {
+        return OcspOutcome::Indeterminate("could not build CertID from issuer SPKI".to_string());
+    };
+
+    let request_der = build_ocsp_request(&cert_id);
+
+    let response_der = match ocsp_http_post(&responder_url, &request_der, timeout) {
+        Ok(bytes) => bytes,
+        Err(e) => return OcspOutcome::Indeterminate(format!("OCSP request to {responder_url} failed: {e}")),
+    };
+
+    let parsed = match parse_ocsp_response(&response_der) {
+        Ok(p) => p,
+        Err(e) => return OcspOutcome::Indeterminate(format!("OCSP response from {responder_url}: {e}")),
+    };
+
+    let explicit_cert = revocation.responder_cert_der.as_deref();
+    if let Err(e) = verify_ocsp_response_signature(&parsed, issuer_spki_der, explicit_cert) {
+        return OcspOutcome::Indeterminate(format!("OCSP response signature check failed: {e}"));
+    }
+
+    let matching = parsed
+        .responses
+        .iter()
+        .find(|r| r.cert_id_serial == cert_id.serial_der);
+    match matching {
+        Some(r) => match r.status {
+            OcspStatusTag::Good => OcspOutcome::Good,
+            OcspStatusTag::Revoked => OcspOutcome::Revoked,
+            OcspStatusTag::Unknown => {
+                OcspOutcome::Indeterminate("OCSP responder returned status 'unknown'".to_string())
+            }
+        },
+        None => OcspOutcome::Indeterminate(
+            "OCSP response did not include a SingleResponse for the requested serial".to_string(),
+        ),
+    }
+}
+
+/// Step 7 of `validate_chain`: real OCSP revocation checking, run when the
+/// active `TrustManagerState` carries a `RevocationConfig`.
+///
+/// For every certificate in `parsed` except the trust anchor itself (a
+/// trust anchor's own revocation status is not meaningful — RFC 5280
+/// §6.1.1 begins the path *below* the anchor), and — when
+/// `ONLY_END_ENTITY` is set — every cert except the leaf, this asks the
+/// OCSP responder whether the cert is revoked.
+///
+/// `PREFER_CRLS`/`NO_FALLBACK`: this verifier does not implement CRL
+/// fetch/parse, so both options currently collapse to "OCSP only" — see the
+/// module doc / known-issues doc for this documented simplification. A
+/// `NO_FALLBACK`-without-`PREFER_CRLS` configuration behaves identically to
+/// the same configuration without `NO_FALLBACK`, since there is no CRL
+/// fallback to suppress in the first place.
+fn check_revocation(
+    parsed: &[ParsedCert],
+    anchor: &AnchorInfo,
+    last_is_anchor: bool,
+    revocation: &RevocationConfig,
+) -> Result<(), TrustError> {
+    let n = parsed.len();
+    // Certs subject to a revocation check: everything except the trust
+    // anchor itself. When the anchor is presented in-chain (last_is_anchor),
+    // that final entry is excluded; otherwise every parsed cert is checked
+    // (the true anchor lives outside `parsed`/`chain` entirely).
+    let checked_count = if last_is_anchor { n.saturating_sub(1) } else { n };
+
+    // 30s is generous for a same-host/LAN OCSP responder and matches the
+    // ballpark of real-JDK's `com.sun.security.ocsp.timeout` default (15s) —
+    // erring longer here since `SSLHostConfig.setOcspTimeout` (server side)
+    // is threaded through the Tomcat-level config, not this native layer;
+    // this is only the client-side (`PKIXRevocationChecker`) default.
+    let timeout = Duration::from_secs(30);
+
+    for i in 0..checked_count {
+        if revocation.only_end_entity && i != 0 {
+            continue;
+        }
+        let subject = &parsed[i];
+        let (issuer_subject_der, issuer_spki_der): (&[u8], &[u8]) = if i + 1 < n {
+            (parsed[i + 1].subject_der.as_slice(), parsed[i + 1].spki_der.as_slice())
+        } else {
+            (anchor.subject_der.as_slice(), anchor.spki_der.as_slice())
+        };
+
+        let outcome = check_ocsp(subject, issuer_subject_der, issuer_spki_der, revocation, timeout);
+        if std::env::var("CRATONVM_DBG_TLS_AUTH").is_ok() {
+            eprintln!(
+                "[dbg-tls-auth] check_revocation cert_index={} outcome={:?}",
+                i, outcome
+            );
+        }
+        match outcome {
+            OcspOutcome::Good => continue,
+            OcspOutcome::Revoked => {
+                return Err(TrustError::Revoked { at: i });
+            }
+            OcspOutcome::Indeterminate(reason) => {
+                if revocation.soft_fail {
+                    continue;
+                }
+                return Err(TrustError::RevocationCheckFailed { at: i, reason });
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Public entry point for `t27_tls::OcspAwareServerCertVerifier` — the native
+/// `HttpURLConnection` client path's rustls verifier calls this directly
+/// (rather than going through `validate_chain`, which expects raw chain DER
+/// plus a full `TrustManagerState`) since it already has a parsed chain and
+/// only needs the revocation step. Returns a display-formatted error string
+/// rather than `TrustError` so the caller (a different module, working with
+/// `rustls::Error`) doesn't need to depend on this module's error enum.
+pub(crate) fn check_revocation_for_verifier(
+    parsed: &[ParsedCert],
+    anchor: &AnchorInfo,
+    last_is_anchor: bool,
+    revocation: &RevocationConfig,
+) -> Result<(), String> {
+    check_revocation(parsed, anchor, last_is_anchor, revocation).map_err(|e| e.to_string())
+}
+
+// ---------------------------------------------------------------------------
 // Endpoint identification (RFC 6125 / RFC 2818 hostname verification)
 // ---------------------------------------------------------------------------
 //
@@ -2188,11 +3037,155 @@ fn tmf_engine_init_params(ctx: &mut dyn NativeContext, args: &[Value]) -> Method
         for der in extract_pkix_trust_anchor_ders(ctx, *mfp) {
             insert_anchor(&mut state, der);
         }
+        state.revocation = extract_revocation_config(ctx, *mfp);
+        if std::env::var("CRATONVM_DBG_TLS_AUTH").is_ok() {
+            eprintln!(
+                "[dbg-tls-auth] tmf_engine_init_params revocation_config={:?}",
+                state.revocation
+            );
+        }
     }
+    crate::t27_tls::set_pending_tm_revocation(state.revocation.clone());
     crate::t27_tls::set_pending_tm_trust_roots(state.anchor_ders.clone());
     let id = register_trust_manager_state(state);
     set_tm_id(ctx, this, id);
     Ok(None)
+}
+
+/// Walk `CertPathTrustManagerParameters.getParameters()` (a
+/// `PKIXParameters`/`PKIXBuilderParameters`) for a `PKIXCertPathChecker` that
+/// is a `java.security.cert.PKIXRevocationChecker`, and extract its
+/// configuration into a `RevocationConfig`. Returns `None` when there is no
+/// such checker attached (the common case: `TrustManagerFactory.init` with a
+/// plain `KeyStore`, or `CertPathTrustManagerParameters` without a
+/// revocation checker) — `validate_chain` then skips revocation checking
+/// entirely, matching real-JDK's behaviour when the caller never asked for
+/// it.
+///
+/// Every read here goes through the real object's public API
+/// (`getCertPathCheckers()`, `getOcspResponder()`, etc.) via `invoke_virtual`
+/// — never raw field access — because `PKIXRevocationChecker` is a REAL
+/// `java.base` object (`sun.security.provider.certpath.RevocationChecker` at
+/// runtime; confirmed via `javap` against the actual JDK, not guessed), and
+/// this file's own hard-learned lesson (see the identity-hash-side-table
+/// pattern used elsewhere in this crate) is that field-poking a real
+/// bytecode object silently no-ops or misreads. Calling its genuine getters
+/// is the same "real reflection-style" approach `extract_pkix_trust_anchor_ders`
+/// already uses for `getTrustAnchors()`/`getTrustedCert()`/`getEncoded()`.
+fn extract_revocation_config(ctx: &mut dyn NativeContext, mfp: ObjectRef) -> Option<RevocationConfig> {
+    let params = match ctx.invoke_virtual(
+        mfp,
+        "getParameters",
+        "()Ljava/security/cert/CertPathParameters;",
+        &[],
+    ) {
+        Ok(Some(Value::Object(Some(p)))) => p,
+        _ => return None,
+    };
+    let checkers = match ctx.invoke_virtual(params, "getCertPathCheckers", "()Ljava/util/List;", &[]) {
+        Ok(Some(Value::Object(Some(l)))) => l,
+        _ => return None,
+    };
+    let iter_obj = match ctx.invoke_virtual(checkers, "iterator", "()Ljava/util/Iterator;", &[]) {
+        Ok(Some(Value::Object(Some(it)))) => it,
+        _ => return None,
+    };
+    loop {
+        match ctx.invoke_virtual(iter_obj, "hasNext", "()Z", &[]) {
+            Ok(Some(Value::Int(1))) => {}
+            _ => return None,
+        }
+        let checker = match ctx.invoke_virtual(iter_obj, "next", "()Ljava/lang/Object;", &[]) {
+            Ok(Some(Value::Object(Some(c)))) => c,
+            _ => return None,
+        };
+        // Identify a PKIXRevocationChecker by walking the class hierarchy for
+        // the well-known name, rather than assuming a specific concrete impl
+        // class — `getRevocationChecker()` returns
+        // `sun.security.provider.certpath.RevocationChecker` on the JDK this
+        // was verified against, but the public contract only guarantees a
+        // `PKIXRevocationChecker` subclass, and we'd rather match on that
+        // supertype than hard-code the internal impl name.
+        if !is_pkix_revocation_checker(ctx, checker) {
+            continue;
+        }
+        return Some(read_revocation_checker_config(ctx, checker));
+    }
+}
+
+/// True when `obj`'s class, or any superclass, is named
+/// `java/security/cert/PKIXRevocationChecker`.
+fn is_pkix_revocation_checker(ctx: &mut dyn NativeContext, obj: ObjectRef) -> bool {
+    let mut cls_id = ctx.class_id_of_object(obj);
+    loop {
+        match ctx.class_name_of_id(cls_id) {
+            Some(name) if name == "java/security/cert/PKIXRevocationChecker" => return true,
+            Some(_) => {}
+            None => return false,
+        }
+        match ctx.superclass_of(cls_id) {
+            Some(sup) => cls_id = sup,
+            None => return false,
+        }
+    }
+}
+
+/// Read a confirmed `PKIXRevocationChecker` object's configuration via its
+/// public getters: `getOcspResponder()` (URI), `getOcspResponderCert()`
+/// (X509Certificate), `getOptions()` (`Set<Option>`).
+fn read_revocation_checker_config(ctx: &mut dyn NativeContext, checker: ObjectRef) -> RevocationConfig {
+    let mut cfg = RevocationConfig::default();
+
+    if let Ok(Some(Value::Object(Some(uri)))) =
+        ctx.invoke_virtual(checker, "getOcspResponder", "()Ljava/net/URI;", &[])
+    {
+        if let Ok(Some(Value::Object(Some(s)))) =
+            ctx.invoke_virtual(uri, "toString", "()Ljava/lang/String;", &[])
+        {
+            cfg.responder_uri = ctx.read_string(s);
+        }
+    }
+
+    if let Ok(Some(Value::Object(Some(cert)))) = ctx.invoke_virtual(
+        checker,
+        "getOcspResponderCert",
+        "()Ljava/security/cert/X509Certificate;",
+        &[],
+    ) {
+        cfg.responder_cert_der = read_cert_der(ctx, cert);
+    }
+
+    if let Ok(Some(Value::Object(Some(options_set)))) =
+        ctx.invoke_virtual(checker, "getOptions", "()Ljava/util/Set;", &[])
+    {
+        if let Ok(Some(Value::Object(Some(it)))) =
+            ctx.invoke_virtual(options_set, "iterator", "()Ljava/util/Iterator;", &[])
+        {
+            loop {
+                match ctx.invoke_virtual(it, "hasNext", "()Z", &[]) {
+                    Ok(Some(Value::Int(1))) => {}
+                    _ => break,
+                }
+                let opt = match ctx.invoke_virtual(it, "next", "()Ljava/lang/Object;", &[]) {
+                    Ok(Some(Value::Object(Some(o)))) => o,
+                    _ => break,
+                };
+                let name = match ctx.invoke_virtual(opt, "name", "()Ljava/lang/String;", &[]) {
+                    Ok(Some(Value::Object(Some(s)))) => ctx.read_string(s),
+                    _ => None,
+                };
+                match name.as_deref() {
+                    Some("ONLY_END_ENTITY") => cfg.only_end_entity = true,
+                    Some("PREFER_CRLS") => cfg.prefer_crls = true,
+                    Some("NO_FALLBACK") => cfg.no_fallback = true,
+                    Some("SOFT_FAIL") => cfg.soft_fail = true,
+                    _ => {}
+                }
+            }
+        }
+    }
+
+    cfg
 }
 
 fn extract_pkix_trust_anchor_ders(ctx: &mut dyn NativeContext, mfp: ObjectRef) -> Vec<Vec<u8>> {
@@ -4393,5 +5386,203 @@ mod tests {
         let mut trust = TrustManagerState::default();
         insert_anchor(&mut trust, root.clone());
         validate_chain(&[leaf, root], &trust).expect("unconstrained chain must validate");
+    }
+
+    // -------------------------------------------------------------------
+    // OCSP (RFC 6960) — DER encode/decode round-trip and signature check.
+    // Network I/O (`ocsp_http_post`/`check_ocsp`) is exercised by the real
+    // Tomcat OCSP suites (TestSecurity2017Ocsp, TestOcspEnabled,
+    // TestOcspSoftFail*) rather than here; these tests cover the pure
+    // ASN.1 + crypto primitives in isolation.
+    // -------------------------------------------------------------------
+
+    fn sample_cert_id() -> CertId {
+        CertId {
+            issuer_name_hash: [0x11; 20],
+            issuer_key_hash: [0x22; 20],
+            serial_der: vec![0x10, 0x03],
+        }
+    }
+
+    #[test]
+    fn build_ocsp_request_is_well_formed_der() {
+        let req = build_ocsp_request(&sample_cert_id());
+        // OCSPRequest ::= SEQUENCE { tbsRequest TBSRequest }
+        let outer = read_tlv_tagged(&req, TAG_SEQUENCE).expect("outer SEQUENCE");
+        let tbs = read_tlv_tagged(outer.content, TAG_SEQUENCE).expect("tbsRequest SEQUENCE");
+        let request_list = read_tlv_tagged(tbs.content, TAG_SEQUENCE).expect("requestList SEQUENCE");
+        let request = read_tlv_tagged(request_list.content, TAG_SEQUENCE).expect("Request SEQUENCE");
+        let cert_id = read_tlv_tagged(request.content, TAG_SEQUENCE).expect("CertID SEQUENCE");
+        let hash_alg = read_tlv_tagged(cert_id.content, TAG_SEQUENCE).expect("hashAlgorithm SEQUENCE");
+        let oid = read_tlv_tagged(hash_alg.content, TAG_OID).expect("hashAlgorithm OID");
+        assert_eq!(oid.content, OID_SHA1, "CertID must use SHA-1 per RFC 6960 convention");
+        // `oid.rest` is the hashAlgorithm's NULL parameter, still inside the
+        // hashAlgorithm SEQUENCE; issuerNameHash is `hash_alg.rest` (CertID's
+        // next sibling field, after the whole hashAlgorithm SEQUENCE).
+        let name_hash = read_tlv_tagged(hash_alg.rest, TAG_OCTET_STRING).expect("issuerNameHash");
+        assert_eq!(name_hash.content, &[0x11; 20]);
+        let key_hash = read_tlv_tagged(name_hash.rest, TAG_OCTET_STRING).expect("issuerKeyHash");
+        assert_eq!(key_hash.content, &[0x22; 20]);
+        let serial = read_tlv_tagged(key_hash.rest, TAG_INTEGER).expect("serialNumber");
+        assert_eq!(serial.content, &[0x10, 0x03]);
+    }
+
+    #[test]
+    fn sha1_matches_known_vector() {
+        // RFC 3174 test vector: SHA-1("abc") = a9993e364706816aba3e25717850c26c9cd0d89
+        let digest = sha1(b"abc");
+        assert_eq!(
+            digest,
+            [
+                0xa9, 0x99, 0x3e, 0x36, 0x47, 0x06, 0x81, 0x6a, 0xba, 0x3e, 0x25, 0x71, 0x78, 0x50,
+                0xc2, 0x6c, 0x9c, 0xd0, 0xd8, 0x9d
+            ]
+        );
+    }
+
+    /// Build a minimal, well-formed `BasicOCSPResponse` DER wrapped in an
+    /// `OCSPResponse` (`responseStatus = successful`), signed directly by
+    /// `issuer_sk` (no delegated responder cert) over a single
+    /// `SingleResponse` for `serial_der` with the given `status_tag`.
+    fn build_test_ocsp_response(
+        issuer_sk: &RsaPrivateKey,
+        serial_der: &[u8],
+        status_tag: u8,
+    ) -> Vec<u8> {
+        // responderID: byName [1] EXPLICIT Name -- content doesn't matter for
+        // these tests, use an empty SEQUENCE (valid, if unusual, RDNSequence).
+        let responder_id = der_tlv_encode(0xa1, &der_seq_encode(Vec::new()));
+        let produced_at = der_tlv_encode(TAG_GENERALIZED_TIME, b"20200101000000Z");
+
+        let cert_id = der_seq_encode({
+            let mut h = der_seq_encode({
+                let mut hh = der_oid_encode(OID_SHA1);
+                hh.extend_from_slice(&der_null_encode());
+                hh
+            });
+            h.extend_from_slice(&der_octet_encode(&[0x11; 20]));
+            h.extend_from_slice(&der_octet_encode(&[0x22; 20]));
+            h.extend_from_slice(&der_integer_from_content(serial_der));
+            h
+        });
+        // certStatus: good=0x80 (primitive NULL), revoked=0xa1 (constructed,
+        // needs a RevokedInfo body), unknown=0x82 (primitive NULL).
+        let cert_status = match status_tag {
+            0x80 => vec![0x80, 0x00],
+            TAG_CONTEXT_1_CONSTRUCTED => {
+                // RevokedInfo ::= SEQUENCE { revocationTime GeneralizedTime }
+                der_tlv_encode(
+                    TAG_CONTEXT_1_CONSTRUCTED,
+                    &der_tlv_encode(TAG_GENERALIZED_TIME, b"20200101000000Z"),
+                )
+            }
+            TAG_CONTEXT_2_PRIMITIVE => vec![0x82, 0x00],
+            _ => panic!("unsupported status_tag in test helper"),
+        };
+        // SingleResponse ::= SEQUENCE { certID, certStatus, thisUpdate,
+        //   [nextUpdate], [singleExtensions] } -- `produced_at`'s DER shape
+        // (a GeneralizedTime TLV) is reused verbatim for thisUpdate.
+        let single_response = der_seq_encode({
+            let mut v = cert_id;
+            v.extend_from_slice(&cert_status);
+            v.extend_from_slice(&produced_at);
+            v
+        });
+
+        let responses = der_seq_encode(single_response);
+        let response_data = der_seq_encode({
+            let mut v = responder_id;
+            v.extend_from_slice(&produced_at);
+            v.extend_from_slice(&responses);
+            v
+        });
+
+        let sig_alg = der_seq_encode({
+            let mut v = der_oid_encode(OID_SIG_SHA256_RSA);
+            v.extend_from_slice(&der_null_encode());
+            v
+        });
+        let signature = Rsa::sign_sha256(issuer_sk, &response_data);
+        let sig_bitstring = der_tlv_encode(TAG_BIT_STRING, &{
+            let mut v = vec![0u8];
+            v.extend_from_slice(&signature);
+            v
+        });
+
+        let basic_response = der_seq_encode({
+            let mut v = response_data;
+            v.extend_from_slice(&sig_alg);
+            v.extend_from_slice(&sig_bitstring);
+            v
+        });
+
+        let response_bytes = der_seq_encode({
+            let mut v = der_oid_encode(OID_OCSP_BASIC_RESPONSE);
+            v.extend_from_slice(&der_octet_encode(&basic_response));
+            v
+        });
+
+        der_seq_encode({
+            let mut v = vec![TAG_ENUMERATED, 0x01, 0x00]; // responseStatus = successful(0)
+            v.extend_from_slice(&der_tlv_encode(TAG_CONTEXT_0, &response_bytes));
+            v
+        })
+    }
+
+    #[test]
+    fn ocsp_response_good_status_parses_and_verifies() {
+        let (_pk, sk) = shared_rsa_root();
+        let serial = vec![0x10, 0x03];
+        let der = build_test_ocsp_response(sk, &serial, 0x80);
+        let parsed = parse_ocsp_response(&der).expect("parse should succeed");
+        assert_eq!(parsed.responses.len(), 1);
+        assert_eq!(parsed.responses[0].status, OcspStatusTag::Good);
+        assert_eq!(parsed.responses[0].cert_id_serial, serial);
+
+        let root_spki = Rsa::public_key_to_der(&shared_rsa_root().0);
+        verify_ocsp_response_signature(&parsed, &root_spki, None)
+            .expect("signature must verify against the real issuer key");
+    }
+
+    #[test]
+    fn ocsp_response_revoked_status_parses() {
+        let (_pk, sk) = shared_rsa_root();
+        let serial = vec![0x10, 0x03];
+        let der = build_test_ocsp_response(sk, &serial, TAG_CONTEXT_1_CONSTRUCTED);
+        let parsed = parse_ocsp_response(&der).expect("parse should succeed");
+        assert_eq!(parsed.responses[0].status, OcspStatusTag::Revoked);
+    }
+
+    #[test]
+    fn ocsp_response_unknown_status_parses() {
+        let (_pk, sk) = shared_rsa_root();
+        let serial = vec![0x10, 0x03];
+        let der = build_test_ocsp_response(sk, &serial, TAG_CONTEXT_2_PRIMITIVE);
+        let parsed = parse_ocsp_response(&der).expect("parse should succeed");
+        assert_eq!(parsed.responses[0].status, OcspStatusTag::Unknown);
+    }
+
+    #[test]
+    fn ocsp_response_signature_rejected_against_wrong_key() {
+        let (_pk, sk) = shared_rsa_root();
+        let serial = vec![0x10, 0x03];
+        let der = build_test_ocsp_response(sk, &serial, 0x80);
+        let parsed = parse_ocsp_response(&der).expect("parse should succeed");
+
+        // A different keypair's SPKI must NOT validate this response's signature.
+        let (other_pk, _other_sk) = Rsa::generate_keypair(1024);
+        let wrong_spki = Rsa::public_key_to_der(&other_pk);
+        let err = verify_ocsp_response_signature(&parsed, &wrong_spki, None)
+            .expect_err("signature must NOT verify against an unrelated key");
+        assert!(err.contains("does not verify"), "unexpected error text: {err}");
+    }
+
+    #[test]
+    fn ocsp_response_try_later_status_is_rejected() {
+        // responseStatus = tryLater(3), no responseBytes at all — matches
+        // TesterOcspResponderServlet's TRY_LATER fixed-response shape.
+        let der = der_seq_encode(vec![TAG_ENUMERATED, 0x01, 0x03]);
+        let err = parse_ocsp_response(&der).expect_err("tryLater must not parse as successful");
+        assert!(err.contains("tryLater"), "unexpected error text: {err}");
     }
 }

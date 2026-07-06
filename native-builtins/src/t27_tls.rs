@@ -189,9 +189,22 @@ fn take_pending_km_identity() -> Option<(String, String)> {
     PENDING_KM_IDENTITY.with(|c| c.borrow_mut().take())
 }
 
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, Default)]
 struct TlsTrustRoots {
     root_ders: Vec<Vec<u8>>,
+    /// OCSP revocation-checking configuration for this trust manager, if any
+    /// was attached via `PKIXBuilderParameters.addCertPathChecker(...)`. Set
+    /// separately from `root_ders` (via `set_pending_tm_revocation`, called
+    /// right alongside `set_pending_tm_trust_roots` from
+    /// `x509_manager::tmf_engine_init_params` — the only producer that ever
+    /// has a non-`None` `RevocationConfig`) and carried through the same
+    /// thread-local/HUC-identity-capture lifecycle so the native
+    /// `HttpURLConnection` client path (`http_url_connection.rs`), which
+    /// never calls back into Java `TrustManager.checkServerTrusted` and so
+    /// never reaches `x509_manager::validate_chain` on its own, still gets a
+    /// chance to perform real OCSP checking (see
+    /// `OcspAwareServerCertVerifier`).
+    revocation: Option<crate::x509_manager::RevocationConfig>,
 }
 
 /// `TrustManagerFactory.init` calls this with the exact anchor set that should
@@ -211,7 +224,38 @@ pub(crate) fn set_pending_tm_trust_roots(root_ders: Vec<Vec<u8>>) {
         );
     }
     PENDING_TM_TRUST_ROOTS.with(|c| {
-        *c.borrow_mut() = Some(TlsTrustRoots { root_ders: deduped });
+        let mut slot = c.borrow_mut();
+        // Preserve a revocation config set via `set_pending_tm_revocation`
+        // for the same pending trust-manager init, whichever order the two
+        // calls happen in (today `set_pending_tm_revocation` is always
+        // called first by `tmf_engine_init_params`, but this is defensive).
+        let revocation = slot.take().and_then(|prev| prev.revocation);
+        *slot = Some(TlsTrustRoots {
+            root_ders: deduped,
+            revocation,
+        });
+    });
+}
+
+/// `tmf_engine_init_params` calls this (right before/after
+/// `set_pending_tm_trust_roots`) with the `RevocationConfig` extracted from
+/// any `PKIXRevocationChecker` attached to the `PKIXBuilderParameters`. Every
+/// other `TrustManagerState` producer never has a `RevocationConfig` to
+/// contribute, so this is a separate setter rather than a new parameter on
+/// `set_pending_tm_trust_roots` (which has several call sites that would
+/// otherwise need an unused `None` threaded through them).
+pub(crate) fn set_pending_tm_revocation(revocation: Option<crate::x509_manager::RevocationConfig>) {
+    PENDING_TM_TRUST_ROOTS.with(|c| {
+        let mut slot = c.borrow_mut();
+        match slot.as_mut() {
+            Some(existing) => existing.revocation = revocation,
+            None => {
+                *slot = Some(TlsTrustRoots {
+                    root_ders: Vec::new(),
+                    revocation,
+                });
+            }
+        }
     });
 }
 
@@ -359,14 +403,24 @@ pub fn der_identity_to_pem(key_pkcs8_der: &[u8], chain_der: &[Vec<u8>]) -> (Stri
 /// Build a rustls client config that trusts the roots scoped to the selected
 /// SSLContext, or the platform roots when no context trust is configured, and
 /// optionally presents a client certificate.
-/// Used by the rustls-backed `SSLSocketFactory.createSocket` client path.
+///
+/// Used by the native `HttpURLConnection` client path
+/// (`http_url_connection.rs`, `net_phase_e.rs`) — which, unlike the
+/// `SSLSocketFactory.createSocket`/`SSLEngine` path, never invokes Java's
+/// `X509TrustManager.checkServerTrusted` and so never reaches
+/// `x509_manager::validate_chain` on its own. When the scoped trust roots
+/// carry a `RevocationConfig` (a `PKIXRevocationChecker` was attached to the
+/// `TrustManagerFactory` this connection's identity/roots came from), this
+/// installs `OcspAwareServerCertVerifier` so revoked server certificates are
+/// still rejected on this path.
 pub(crate) fn build_engine_client_config_with_identity(
     alpn: &[&str],
     client_identity: Option<(&str, &str)>,
 ) -> Result<Arc<ClientConfig>, String> {
     let trust_roots = active_client_trust_roots();
+    let revocation = trust_roots.as_ref().and_then(|r| r.revocation.clone());
     let roots = root_store_for_trust_roots(trust_roots.as_ref());
-    build_client_config(roots, alpn, client_identity)
+    build_client_config_with_revocation(roots, alpn, client_identity, revocation)
 }
 
 // The client identity (cert_pem, key_pem) installed via
@@ -882,6 +936,165 @@ pub(crate) fn build_client_config(
     client_auth: Option<(&str, &str)>,
 ) -> Result<Arc<ClientConfig>, String> {
     let builder = ClientConfig::builder().with_root_certificates(roots);
+    let mut config = match client_auth {
+        Some((cert_pem, key_pem)) => {
+            let chain = parse_cert_chain_pem(cert_pem)?;
+            let key = parse_private_key_pem(key_pem)?;
+            builder
+                .with_client_auth_cert(chain, key)
+                .map_err(|e| format!("with_client_auth_cert failed: {}", e))?
+        }
+        None => builder.with_no_client_auth(),
+    };
+    config.alpn_protocols = alpn_protocols
+        .iter()
+        .map(|s| s.as_bytes().to_vec())
+        .collect();
+    Ok(Arc::new(config))
+}
+
+/// A `ServerCertVerifier` that performs the normal rustls/webpki structural
+/// chain validation (via a delegate `WebPkiServerVerifier`), and — when it
+/// succeeds — additionally runs real OCSP revocation checking
+/// (`x509_manager::check_ocsp`) against every certificate in the presented
+/// chain except the trust anchor.
+///
+/// This exists because the native `HttpURLConnection` client path
+/// (`http_url_connection.rs::perform`) builds its own rustls `ClientConfig`
+/// directly and never calls back into Java's
+/// `X509TrustManager.checkServerTrusted` — so it never reaches
+/// `x509_manager::validate_chain`, the ONLY place revocation checking was
+/// otherwise wired up. Without this verifier, a
+/// `PKIXRevocationChecker`-configured `TrustManagerFactory` used only for
+/// `HttpsURLConnection.setDefaultSSLSocketFactory` would silently accept a
+/// revoked server certificate — exactly the fail-open gap this feature
+/// fixes. See `docs/known-issues/tls-ocsp-clientcert-validation-not-enforced.md`.
+#[derive(Debug)]
+struct OcspAwareServerCertVerifier {
+    inner: Arc<dyn rustls::client::danger::ServerCertVerifier>,
+    revocation: crate::x509_manager::RevocationConfig,
+}
+
+impl rustls::client::danger::ServerCertVerifier for OcspAwareServerCertVerifier {
+    fn verify_server_cert(
+        &self,
+        end_entity: &CertificateDer<'_>,
+        intermediates: &[CertificateDer<'_>],
+        server_name: &ServerName<'_>,
+        ocsp_response: &[u8],
+        now: rustls::pki_types::UnixTime,
+    ) -> Result<rustls::client::danger::ServerCertVerified, rustls::Error> {
+        // Structural validation first (chain-to-root, expiry, hostname) —
+        // never weaken this: OCSP checking only runs on an already-trusted
+        // chain, same ordering `x509_manager::validate_chain` uses (revocation
+        // is its "Step 7", after signature verification).
+        let verified =
+            self.inner
+                .verify_server_cert(end_entity, intermediates, server_name, ocsp_response, now)?;
+
+        let mut chain_der: Vec<Vec<u8>> = Vec::with_capacity(1 + intermediates.len());
+        chain_der.push(end_entity.as_ref().to_vec());
+        chain_der.extend(intermediates.iter().map(|c| c.as_ref().to_vec()));
+
+        let parsed: Vec<crate::x509_manager::ParsedCert> = match chain_der
+            .iter()
+            .map(|d| crate::x509_manager::parse_certificate(d))
+            .collect::<Result<Vec<_>, _>>()
+        {
+            Ok(p) => p,
+            // Structural validation above already accepted this chain via a
+            // different (webpki) parser; if our own DER walker can't parse
+            // it, fail closed rather than silently skip revocation checking.
+            Err(e) => {
+                return Err(rustls::Error::General(format!(
+                    "OCSP revocation check: could not parse presented chain: {e}"
+                )));
+            }
+        };
+
+        // The anchor is whichever root in `inner`'s store actually issued the
+        // last presented cert; we don't have that identity directly from
+        // `ServerCertVerifier`'s contract, so reuse the last presented cert's
+        // own issuer as the "anchor-equivalent" identity for CertID purposes
+        // when the chain doesn't include the root itself (the common case —
+        // servers don't usually ship their own trust anchor). When the chain
+        // DOES end in a self-signed cert, that cert is its own issuer, so
+        // `parsed.last()` already carries the right subject/SPKI either way.
+        let anchor_like = crate::x509_manager::AnchorInfo {
+            subject_der: parsed.last().map(|c| c.issuer_der.clone()).unwrap_or_default(),
+            spki_der: parsed.last().map(|c| c.spki_der.clone()).unwrap_or_default(),
+            full_cert_der: None,
+        };
+        // The last presented cert's issuer is outside `parsed` (it wasn't
+        // shipped) unless the chain is self-signed, matching
+        // `validate_chain`'s `last_is_anchor` semantics.
+        let last_is_self_signed = parsed
+            .last()
+            .map(|c| c.issuer_der == c.subject_der)
+            .unwrap_or(false);
+
+        if let Err(e) = crate::x509_manager::check_revocation_for_verifier(
+            &parsed,
+            &anchor_like,
+            last_is_self_signed,
+            &self.revocation,
+        ) {
+            return Err(rustls::Error::General(format!(
+                "OCSP revocation check failed: {e}"
+            )));
+        }
+
+        Ok(verified)
+    }
+
+    fn verify_tls12_signature(
+        &self,
+        message: &[u8],
+        cert: &CertificateDer<'_>,
+        dss: &rustls::DigitallySignedStruct,
+    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        self.inner.verify_tls12_signature(message, cert, dss)
+    }
+
+    fn verify_tls13_signature(
+        &self,
+        message: &[u8],
+        cert: &CertificateDer<'_>,
+        dss: &rustls::DigitallySignedStruct,
+    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        self.inner.verify_tls13_signature(message, cert, dss)
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
+        self.inner.supported_verify_schemes()
+    }
+}
+
+/// As `build_client_config`, but installs `OcspAwareServerCertVerifier` when
+/// `revocation` is `Some` — real OCSP checking for the native
+/// `HttpURLConnection` client path, which (unlike the `SSLEngine`/
+/// `SSLSocketFactory` path) never invokes Java's `checkServerTrusted` and so
+/// never reaches `x509_manager::validate_chain` on its own.
+pub(crate) fn build_client_config_with_revocation(
+    roots: RootCertStore,
+    alpn_protocols: &[&str],
+    client_auth: Option<(&str, &str)>,
+    revocation: Option<crate::x509_manager::RevocationConfig>,
+) -> Result<Arc<ClientConfig>, String> {
+    let Some(revocation) = revocation else {
+        return build_client_config(roots, alpn_protocols, client_auth);
+    };
+
+    let roots = Arc::new(roots);
+    let inner = rustls::client::WebPkiServerVerifier::builder(roots.clone())
+        .build()
+        .map_err(|e| format!("WebPkiServerVerifier::builder failed: {e}"))?;
+    let verifier: Arc<dyn rustls::client::danger::ServerCertVerifier> =
+        Arc::new(OcspAwareServerCertVerifier { inner, revocation });
+
+    let builder = ClientConfig::builder()
+        .dangerous()
+        .with_custom_certificate_verifier(verifier);
     let mut config = match client_auth {
         Some((cert_pem, key_pem)) => {
             let chain = parse_cert_chain_pem(cert_pem)?;
