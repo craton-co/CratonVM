@@ -45590,8 +45590,30 @@ fn native_es_submit_callable(ctx: &mut dyn NativeContext, args: &[Value]) -> Met
 }
 
 fn native_es_execute(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    // HANGS-0706b: `Executor.execute(Runnable)` is a fire-and-forget contract --
+    // callers are entitled to assume the submitted task runs independently of
+    // the calling thread. The prior eager-inline body (`runnable.run()` on the
+    // caller) silently violated that contract for every executor created via
+    // `Executors.newSingleThreadExecutor()` / `newFixedThreadPool()` /
+    // `newCachedThreadPool()` (the only factories intercepted here -- see
+    // `native_new_single_thread` et al., always CratonVM's synthetic 2-field
+    // executor, never a real `ThreadPoolExecutor`). Any task that blocks
+    // waiting for a signal only the SUBMITTING thread can later deliver -- e.g.
+    // Spring's `OutputStreamPublisher`/`SubscriberInputStream` Flow adapters,
+    // whose `LockSupport.park()`/`resume()` handshake assumes the publisher
+    // body runs on a thread other than the one calling `subscribe()` -- self-
+    // deadlocks permanently: confirmed via a live `gdb` capture showing the
+    // main VM thread parked forever in `native_lock_support_park`, reached
+    // through the executed Runnable's own call chain, with no other thread
+    // ever positioned to call `resume()`/`request()` because the "async" work
+    // never left the caller's stack. This is the exact same class of bug
+    // already fixed for the ForkJoinPool/CompletableFuture path (Bug D,
+    // kafka-suite-0617, see `spawn_runnable_on_real_thread`'s doc comment) --
+    // apply the same fix here: hand the task to the shared bounded real
+    // `ThreadPoolExecutor` so it runs on an actual worker thread and the
+    // caller returns immediately, matching HotSpot's `execute()` semantics.
     if let Some(Value::Object(Some(runnable))) = args.get(1) {
-        let _ = ctx.invoke_virtual(*runnable, "run", "()V", &[]);
+        return spawn_runnable_on_real_thread(ctx, *runnable);
     }
     Ok(None)
 }
