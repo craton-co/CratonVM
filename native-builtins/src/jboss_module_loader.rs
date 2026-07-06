@@ -2894,7 +2894,13 @@ pub(crate) fn native_module_load_service_from_caller_module_loader(
 }
 
 /// `Module.loadService(Class)` — the public instance method (distinct from
-/// the static `loadServiceFromCallerModuleLoader` above).
+/// the static `loadServiceFromCallerModuleLoader` above). WildFly's
+/// `org.jboss.as.controller.parsing.DeferredExtensionContext` (the
+/// host-excludes / domain-mode deferred extension loading path exercised
+/// by `HostExcludesTestCase`) calls this directly — verified against the
+/// constant pool of `DeferredExtensionContext.class` in
+/// `wildfly-controller-24.0.1.Final.jar`, which does
+/// `moduleLoader.loadModule(name).loadService(Extension.class)`.
 ///
 /// Real jboss-modules bytecode is:
 ///   getClass().getModule().addUses(serviceType);
@@ -2907,7 +2913,13 @@ pub(crate) fn native_module_load_service_from_caller_module_loader(
 /// model doesn't enforce. Skip it and reimplement the observable contract
 /// directly via the module's own `moduleClassLoader` (read through
 /// `native_module_get_class_loader`, which lazily builds one instead of
-/// reading a possibly-unset field directly).
+/// reading a possibly-unset field directly). This mirrors
+/// `native_module_load_service_from_caller_module_loader` above, which
+/// exercises the same `ServiceLoader.load(Class, ClassLoader)` native and
+/// is already covered by module-scoping regression tests; the ClassLoader
+/// this delegates to is a `ModuleClassLoader` scoped to `this` module, so
+/// `discover_providers`'s JBoss-module branch in service_loader.rs applies
+/// identically here — no separate scoping logic is needed.
 pub(crate) fn native_module_load_service(
     ctx: &mut dyn NativeContext,
     args: &[Value],
@@ -2925,7 +2937,7 @@ pub(crate) fn native_module_load_service(
         Some(Value::Object(Some(c))) => *c,
         _ => {
             return Err(RuntimeError::NullPointerException {
-                message: Some("Module.loadService: serviceType is null".to_string()),
+                message: Some("Module.loadService: serviceType must not be null".to_string()),
             }
             .into());
         }
@@ -4601,6 +4613,60 @@ mod tests {
             names
         );
     }
+
+    #[test]
+    fn wildfly_jboss_modules_service_provider_leak_real_dist_scoping() {
+        // Regression guard for
+        // docs/known-issues/wildfly-jboss-modules-service-provider-leak.md,
+        // exercised against a *real* WildFly 32.0.1.Final distribution's
+        // modules/ tree (not a synthetic fixture) so the exact conflicting
+        // pair from the original repro -- org.jboss.as.jmx and
+        // org.wildfly.extension.core-management, neither of which depends
+        // on the other, each shipping its own
+        // META-INF/services/org.jboss.as.controller.Extension descriptor
+        // -- is covered verbatim. Skips (rather than fails) when the
+        // distribution isn't staged on this machine.
+        let _g = TEST_LOCK.lock();
+        let real_root = std::path::Path::new(
+            "/data/data/wildfly-dist/wildfly-32.0.1.Final/modules",
+        );
+        if !real_root.is_dir() {
+            eprintln!(
+                "wildfly_jboss_modules_service_provider_leak_real_dist_scoping: \
+                 real WildFly dist not present at {}, skipping",
+                real_root.display()
+            );
+            return;
+        }
+        setup_test_env(real_root);
+        let jmx = module_service_provider_names(
+            "org.jboss.as.jmx",
+            "org.jboss.as.controller.Extension",
+        );
+        let cm = module_service_provider_names(
+            "org.wildfly.extension.core-management",
+            "org.jboss.as.controller.Extension",
+        );
+        assert_eq!(
+            jmx,
+            vec!["org.jboss.as.jmx.JMXExtension".to_string()],
+            "org.jboss.as.jmx's Extension providers must be scoped to its \
+             own module; got {:?}. Any entry from \
+             org.wildfly.extension.core-management reproduces the \
+             cross-module service-provider leak.",
+            jmx
+        );
+        assert_eq!(
+            cm,
+            vec!["org.wildfly.extension.core.management.CoreManagementExtension".to_string()],
+            "org.wildfly.extension.core-management's Extension providers \
+             must be scoped to its own module; got {:?}. Any entry from \
+             org.jboss.as.jmx reproduces the cross-module \
+             service-provider leak.",
+            cm
+        );
+    }
+
     /// RKC19/WF39 Task C — Sanity-check that the synthetic class bytes
     /// produced by `build_synthetic_class_with_main` start with the JVM
     /// class file magic and contain the expected method names.  The full
