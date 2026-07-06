@@ -4015,6 +4015,18 @@ pub fn execute(
                             if use_raw_tail_self_call {
                                 continue;
                             }
+                            // BUG-1 companion (eager first-call compile parity
+                            // with `jit::try_compile`'s routing): NON-tail
+                            // static self-recursive sites stay on the raw
+                            // direct-CALL path — the backend emits the cheap
+                            // `self_call_stack_guard` call (always wired via
+                            // `build_helpers`) instead of the full
+                            // `jit_invoke_dispatch` round trip. `scan.needs_heap`
+                            // is already true (every invoke op sets it), so the
+                            // guard's vm_ptr frame slot exists.
+                            if invoke_kind == 3 && is_recursive_call {
+                                continue;
+                            }
                             // Math.sqrt intrinsic: inline as SQRTSD (no dispatch overhead)
                             if invoke_kind == 3
                                 && target_class == "java/lang/Math"
@@ -22255,6 +22267,17 @@ fn compile_osr_artifact(
                         && is_recursive_call
                         && crate::jit::invokestatic_self_call_uses_tail_jump(code, code_len, pc);
                     if use_raw_tail_self_call {
+                        continue;
+                    }
+                    // BUG-1 companion (OSR/callee tier parity with
+                    // `jit::try_compile`'s routing): NON-tail static
+                    // self-recursive sites stay on the raw direct-CALL path —
+                    // the backend emits the cheap `self_call_stack_guard` call
+                    // (always wired via `build_helpers`) instead of the full
+                    // `jit_invoke_dispatch` round trip. `scan.needs_heap` is
+                    // already true (every invoke op sets it), so the guard's
+                    // vm_ptr frame slot exists.
+                    if invoke_kind == 3 && is_recursive_call {
                         continue;
                     }
 
