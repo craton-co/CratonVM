@@ -27508,6 +27508,38 @@ const _CHM_FIELD_SEGMENT_MASK: usize = 1;
 const _CHM_NUM_FIELDS: usize = 2;
 const CHM_DEFAULT_SEGMENTS: usize = 16;
 const CHM_DEFAULT_SEGMENT_CAP: usize = 4;
+/// Segment count for the no-arg `ConcurrentHashMap()` constructor ONLY
+/// (`native_chm_init_default`) — chosen so that
+/// `CHM_DEFAULT_INIT_SEGMENTS * CHM_DEFAULT_SEGMENT_CAP == 16`, matching real
+/// JDK's `ConcurrentHashMap.DEFAULT_CAPACITY` (the lazily-allocated
+/// single-table size on first `put`, before any resize).
+///
+/// `chm_total_capacity` sums live segment bucket-array lengths as a proxy
+/// for "what a real flat table would currently be sized to" (see
+/// `chm_reorder_by_virtual_bucket`), so the STARTING total must match
+/// HotSpot's real default (16), not the previous placeholder
+/// (`CHM_DEFAULT_SEGMENTS * CHM_DEFAULT_SEGMENT_CAP` = 64) — the mismatch
+/// silently reordered `entrySet()`/`keySet()`/`values()` relative to
+/// HotSpot for any freshly-constructed default map with few entries (e.g.
+/// Hibernate's `EntityPersisterConcurrentMap`, which caused
+/// `SoftDeleteFetchModeTests` to skip a cross-entity validation check that
+/// depends on processing order).
+///
+/// Using 16 segments at capacity 1 each (also totalling 16) was tried and
+/// rejected: `native_map_put`'s resize check is `size + 1 > (cap * 3) / 4`,
+/// which for `cap == 1` integer-truncates the threshold to 0 — ANY first
+/// insert into a segment immediately triggers a resize, so the segment
+/// capacities (and therefore the sum `chm_total_capacity` reads) no longer
+/// stay at their intended starting total even for a handful of entries.
+/// 4 segments of capacity 4 keeps the same total (16) but tolerates up to 3
+/// entries per segment before resizing, matching real JDK's actual
+/// behaviour for lightly-loaded maps. The cost is reduced write-striping
+/// concurrency (4-way instead of 16-way) for maps that are never given an
+/// explicit initial capacity — deemed an acceptable trade-off for
+/// correctness of iteration order, which explicit-capacity constructors
+/// (`native_chm_init_capacity`/`native_chm_init_full`, unaffected by this
+/// constant) are unaffected by.
+const CHM_DEFAULT_INIT_SEGMENTS: usize = 4;
 
 /// Compute hash for a key value (reuses map_hash_key for object keys).
 ///
@@ -28096,7 +28128,7 @@ fn native_chm_init_default(ctx: &mut dyn NativeContext, args: &[Value]) -> Metho
         Some(Value::Object(Some(o))) => *o,
         _ => return Ok(None),
     };
-    chm_init_segments(ctx, this, CHM_DEFAULT_SEGMENTS, CHM_DEFAULT_SEGMENT_CAP);
+    chm_init_segments(ctx, this, CHM_DEFAULT_INIT_SEGMENTS, CHM_DEFAULT_SEGMENT_CAP);
     Ok(None)
 }
 
