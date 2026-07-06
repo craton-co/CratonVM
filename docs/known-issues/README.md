@@ -4,6 +4,10 @@ This folder collects CratonVM-only defects found while running upstream Java
 suites. The docs had grown to describe the **same underlying bug from several
 angles**; this index is the consolidated map. Read it first.
 
+## 2026-07-06 http.client class_manager RwLock writer starvation (branch fix/httpclient-vtable-classmanager-abba-deadlock-0706c)
+
+- [class-manager-rwlock-writer-starvation.md](class-manager-rwlock-writer-starvation.md) -- follow-up to the AB-BA `vtable_manager`/`class_manager` lock-order deadlock FIXED this session (commit `caa4ee65`, cut `HttpComponentsClientHttpRequestFactoryTests` hang rate from 65% to 25%): the residual hangs are a separate, still-open bug -- `execute_invokestatic`'s `class_manager` read guard, held across a superclass-chain walk, can starve a queued writer (`load_class_concurrent`) under heavy concurrent read pressure, since `parking_lot::RwLock`'s default (non-`_fair`) mode is not strictly writer-preferring. Confirmed via two live gdb captures 2 seconds apart showing identical thread state (rules out a snapshot artifact). Next step: cache the native-override lookup per call site the same way the vtable fast path already does, rather than re-acquiring the read lock on every `invokestatic`.
+
 ## 2026-07-06 Hibernate `others.txt` non-passed rerun (OSR allocation-region gate branch)
 
 - [hib-inpredicatetest-criteria-values-null-npe.md](hib-inpredicatetest-criteria-values-null-npe.md) — root-caused this session: `getNames()`'s 100k-iteration allocating loop OSR-compiles; the local (non-parameter) `names` reference falls into the same CompactValue NaN-box collision family as the already-patched HIB-CV-20 (which only seeded reference PARAMETERS into the OSR oop mask, not plain locals). Candidate fix: cherry-pick the previously-unmerged OSR allocation-region gate (`4c3cf821`, branch `claude/practical-golick-ff73f1`), which rejects back-edge OSR for any allocating/calling region — staged on `fix/hib-inpredicate-criteria-values-null-20260705`, not yet merged to `dev`.
