@@ -384,26 +384,32 @@ fn load_provider_class_from_loader_jars(
     None
 }
 
-/// Load a provider class by FQN, first via the flat `Class.forName(fqn)` scan
-/// and, if that fails, via `loader.loadClass(fqn)` for non-builtin loaders
-/// (e.g. ES's `EmbeddedImplClassLoader` which stores classes inside embedded
-/// JAR trees invisible to the flat classpath scan).
+/// Load a provider class by FQN. When a specific `loader` is known (the
+/// common case — JBoss Modules' `ModuleClassLoader`, Elasticsearch's
+/// `EmbeddedImplClassLoader`, etc.), try it FIRST via `loader.findClass`/
+/// `loader.loadClass`, falling back to the context-free flat
+/// `Class.forName(fqn)` scan only if the loader can't resolve it (or no
+/// loader was given at all).
+///
+/// Order matters here: `Class.forName(fqn)` (1-arg) resolves against
+/// whatever classloader CratonVM treats as the "caller" for a native-invoked
+/// call — NOT `loader`. If that context-free attempt reaches far enough to
+/// define the class but then fails `<clinit>` (e.g. because a dependency
+/// only visible through `loader`'s own module-scoped resolution can't be
+/// found from the wrong context), the class's `ClassState` is permanently
+/// poisoned to `InitializationError` — and JVM class state never resets.
+/// A LATER, correct resolution via `loader` then returns the mirror for that
+/// SAME already-poisoned `ClassId` (`Class.forName`/`loadClass` return the
+/// existing class once it's defined, regardless of which loader asks), so
+/// `load_provider_class` reports success but `Constructor.newInstance()`
+/// throws `NoClassDefFoundError` on first real use. Trying the correct
+/// loader first avoids ever touching the wrong-context path when we already
+/// know the right one.
 fn load_provider_class(
     ctx: &mut dyn NativeContext,
     fqn: &str,
     loader: Option<cratonvm_types::ObjectRef>,
 ) -> Option<cratonvm_types::ObjectRef> {
-    let name = ctx.create_string(fqn);
-    if let Ok(Some(Value::Object(Some(c)))) = ctx.invoke(
-        "java/lang/Class",
-        "forName",
-        "(Ljava/lang/String;)Ljava/lang/Class;",
-        &[Value::Object(Some(name))],
-    ) {
-        return Some(c);
-    }
-    // forName failed — try loader.loadClass(fqn) if we have a custom loader
-    // (e.g. EmbeddedImplClassLoader for embedded-JAR provider classes).
     if let Some(loader_r) = loader {
         let find_name = ctx.create_string(fqn);
         if let Ok(Some(Value::Object(Some(c)))) = ctx.invoke_virtual(
@@ -426,6 +432,17 @@ fn load_provider_class(
         if let Some(c) = load_provider_class_from_loader_jars(ctx, loader_r, &fqn.replace('.', "/")) {
             return Some(c);
         }
+    }
+    // No loader, or the loader couldn't resolve it — fall back to the
+    // context-free flat scan.
+    let name = ctx.create_string(fqn);
+    if let Ok(Some(Value::Object(Some(c)))) = ctx.invoke(
+        "java/lang/Class",
+        "forName",
+        "(Ljava/lang/String;)Ljava/lang/Class;",
+        &[Value::Object(Some(name))],
+    ) {
+        return Some(c);
     }
     // Final fallback: IMPL-JARS nested-JAR scan.
     impl_jars_load_class(ctx, &fqn.replace('.', "/"))
@@ -1109,15 +1126,33 @@ fn native_sl_iterator(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
                 .unwrap_or(cratonvm_types::ClassId::new(0)),
             0,
         );
-        let inst = ctx
-            .invoke(
-                "java/lang/reflect/Constructor",
-                "newInstance",
-                "([Ljava/lang/Object;)Ljava/lang/Object;",
-                &[Value::Object(Some(ctor)), Value::Object(Some(empty_args))],
-            )
-            .ok()
-            .and_then(|v| v);
+        let inst_result = ctx.invoke(
+            "java/lang/reflect/Constructor",
+            "newInstance",
+            "([Ljava/lang/Object;)Ljava/lang/Object;",
+            &[Value::Object(Some(ctor)), Value::Object(Some(empty_args))],
+        );
+        // An `InternalError` here (Linkage/NoClassDefFoundError, etc.) is a
+        // genuine VM-side failure -- the class was resolved successfully
+        // moments ago (`load_provider_class` above found it), so a linkage
+        // failure now means something is actually broken (e.g. a poisoned
+        // `ClassState` from an earlier failed resolution attempt through a
+        // different code path), not a legitimately-missing/malformed
+        // provider entry. Silently treating it as "provider not found"
+        // (the pre-existing behavior) hides real bugs behind an empty
+        // ServiceLoader result. Surface it loudly, unconditionally -- this
+        // is cheap (one `tracing::warn!`) and the alternative is a silent
+        // correctness gap that looks identical to a normal missing provider.
+        if let Err(MethodCallFailed::InternalError(ref e)) = inst_result {
+            tracing::warn!(
+                provider = %fqn,
+                error = ?e,
+                "ServiceLoader: Constructor.newInstance failed with an internal VM error \
+                 (not a provider-specific reflective failure) -- skipping this provider, \
+                 but this likely indicates a real bug, not a missing/malformed provider"
+            );
+        }
+        let inst = inst_result.ok().and_then(|v| v);
         let inst = match inst {
             Some(Value::Object(Some(o))) => o,
             _ => {
