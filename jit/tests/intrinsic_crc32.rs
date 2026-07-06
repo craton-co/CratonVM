@@ -172,6 +172,7 @@ fn stub_helpers() -> JitRuntimeHelpers {
         dispatch_threw: s,
         jit_frem: s,
         jit_drem: s,
+        self_call_stack_guard: 0,
     }
 }
 

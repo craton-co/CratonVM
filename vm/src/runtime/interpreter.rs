@@ -3793,7 +3793,14 @@ pub fn execute(
                                 method_name,
                                 method_descriptor,
                             );
-                            let _ = shared.tiered_manager.on_method_invocation(&tiered_key);
+                            // Pass the REAL per-method invocation count: this
+                            // hook only fires at stride boundaries, and the
+                            // manager's historical `+= 1` counting deflated its
+                            // hotness view 64x (first C1 recommendation at
+                            // ~threshold + 64×c1_threshold real calls).
+                            let _ = shared
+                                .tiered_manager
+                                .on_method_invocation_observed(&tiered_key, n as u64);
                         }
                         c2_not_hot = true; // keep the counter running; do not seal
                         return None; // interpret — the worker compiles off-thread
@@ -21734,7 +21741,13 @@ fn execute_invokestatic_cached(
                     // `ensure_bg_compiler_started` for the closure / GC rationale.
                     ensure_bg_compiler_started(shared);
                 }
-                let recommended_tier = shared.tiered_manager.on_method_invocation(&tiered_key);
+                // Pass the REAL per-method invocation count — this hook runs
+                // only at stride boundaries, and the manager's historical
+                // `+= 1` counting deflated its hotness view 64x (first C1
+                // recommendation at ~threshold + 64×c1_threshold real calls).
+                let recommended_tier = shared
+                    .tiered_manager
+                    .on_method_invocation_observed(&tiered_key, invoc_count as u64);
                 if let Some(tier) = recommended_tier {
                     if crate::runtime::env_cache::dbg_jitc() {
                         eprintln!(
@@ -27277,7 +27290,12 @@ fn execute_invokevirtual_cached(
                                         cached.method_name.as_ref(),
                                         cached.method_descriptor.as_ref(),
                                     );
-                                    let _ = shared.tiered_manager.on_method_invocation(&tiered_key);
+                                    // Real invocation count — see the invokestatic
+                                    // twin: stride-boundary `+= 1` counting deflated
+                                    // the manager's hotness view 64x.
+                                    let _ = shared
+                                        .tiered_manager
+                                        .on_method_invocation_observed(&tiered_key, cnt as u64);
                                 } else if let Some(CachedInvokeTarget::Jit { compiled, .. }) =
                                     try_jit_upgrade_with_gate(shared, &cached, entry_gate.clone())
                                 {

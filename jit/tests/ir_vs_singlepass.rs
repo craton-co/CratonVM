@@ -82,6 +82,7 @@ fn dummy_helpers() -> JitRuntimeHelpers {
         dispatch_threw: s,
         jit_frem: s,
         jit_drem: s,
+        self_call_stack_guard: 0,
     }
 }
 
@@ -2292,6 +2293,7 @@ fn frem_helpers() -> JitRuntimeHelpers {
     JitRuntimeHelpers {
         jit_frem: test_frem as *const () as usize,
         jit_drem: test_drem as *const () as usize,
+        self_call_stack_guard: 0,
         ..dummy_helpers()
     }
 }

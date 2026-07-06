@@ -21322,6 +21322,53 @@ impl Compiler {
                             continue;
                         }
 
+                        // BUG-1 companion — native-stack headroom guard for the
+                        // direct self-recursive CALL below. Historically every
+                        // NON-tail self-recursive site was routed through
+                        // `jit_invoke_dispatch` purely so the dispatch depth
+                        // guard could convert runaway compiled recursion into a
+                        // catchable StackOverflowError; that made each recursive
+                        // call pay the full dispatch-helper round trip (the
+                        // dominant cost of fib/binarytrees-style recursion).
+                        // With the dedicated guard helper wired, the site stays
+                        // a direct CALL and pays one cheap leaf helper call:
+                        //   MOV  ARG0, [RBP - heap_local]   ; vm_ptr
+                        //   CALL self_call_stack_guard      ; 0 = ok
+                        //   TEST RAX, RAX
+                        //   JNZ  merge                      ; RAX = i64::MIN →
+                        //                                   ; post-invoke check
+                        //                                   ; routes the stashed
+                        //                                   ; StackOverflowError
+                        // The guard's overflow arm allocates (SOE construction),
+                        // so it is bracketed like a call safepoint: defensive
+                        // callee-saved spill before, and — under precise/shadow
+                        // modes — an oop map (whose shadow RELOAD pairs with the
+                        // spill's PUSH) at its return PC. The JNZ target sits
+                        // AFTER `emit_stack_arg_cleanup`, so the overflow path
+                        // skips arg setup + CALL + cleanup as one balanced unit
+                        // (no RSP adjustment happens on that path). `arg_slots`
+                        // are call-safe across the guard CALL: the
+                        // `flush_scratch_registers()` at the 0xb8 arm entry
+                        // moved scratch GPR/XMM stack slots into frame slots.
+                        // Requires `needs_heap` (the routing in `try_compile`
+                        // sets it for every raw-routed self-call site) — the
+                        // vm_ptr frame slot is what the guard is called with.
+                        // Unwired helper (tests, historical callers): emits
+                        // nothing, byte-identical legacy code.
+                        let guard_skip_patch = if self.helpers.self_call_stack_guard != 0
+                            && self.needs_heap
+                        {
+                            self.emit_pre_safepoint_spill();
+                            self.emit_load_local(ARG_REGS[0], self.heap_local_offset);
+                            self.emit_call_absolute(self.helpers.self_call_stack_guard);
+                            if self.precise_maps || self.shadow_enabled {
+                                self.emit_oop_map_for_safepoint();
+                            }
+                            self.emit_test_r64_r64(RAX);
+                            Some(self.emit_jcc_rel32_patch(0x85)) // JNE merge
+                        } else {
+                            None
+                        };
                         // Round-8 wave-3 HIGH fix: stack-arg setup for
                         // self-recursive direct calls past ARG_REGS.
                         let total_sub = self.emit_stack_arg_setup(&arg_slots, self.needs_heap);
@@ -21357,6 +21404,12 @@ impl Compiler {
                             self.emit_oop_map_for_safepoint();
                         }
                         self.emit_stack_arg_cleanup(total_sub);
+                        // Stack-guard merge point: the overflow JNE lands here
+                        // with RAX = i64::MIN, flowing straight into the
+                        // sentinel check below (exactly as if the callee threw).
+                        if let Some(p) = guard_skip_patch {
+                            self.patch_rel32_to_here(p);
+                        }
                         // A self-recursive compiled call that throws (or
                         // deopts) returns the `i64::MIN` sentinel — same
                         // hazard as the direct/dispatch invokestatic paths
@@ -25638,6 +25691,9 @@ mod tests {
             dispatch_threw: sentinel,
             jit_frem: sentinel,
             jit_drem: sentinel,
+            // Unwired (0) — the self-call arm emits the legacy direct CALL
+            // with no stack guard, keeping these tests byte-identical.
+            self_call_stack_guard: 0,
         }
     }
 
