@@ -39262,6 +39262,37 @@ pub(crate) fn register_p68_security_cert(r: &mut NativeMethodRegistry) {
         "generateCertificate",
         "(Ljava/io/InputStream;)Ljava/security/cert/Certificate;",
         |ctx, args| {
+            // Real-SPI fast path: a `CertificateFactory` built via
+            // `getInstance(algo, Provider)` / `getInstance(algo, providerName)`
+            // (both flow through `sun/security/jca/GetInstance.getInstance` ->
+            // `getinstance_instance_provider[_obj]` in `jca::provider_chain`,
+            // which run the class's REAL constructor) carries a genuine
+            // `certFacSpi` field pointing at the provider's real
+            // `CertificateFactorySpi` (e.g. BouncyCastle's
+            // `org.bouncycastle.jcajce.provider.asymmetric.x509.CertificateFactory`).
+            // Real `CertificateFactory.generateCertificate` is one line:
+            // `return certFacSpi.engineGenerateCertificate(is)`. Delegating to
+            // it here runs the genuine provider bytecode and produces the
+            // provider's own concrete `Certificate` subclass — critical for
+            // callers like BC's `JcaX509CertificateConverter.getCertificate`
+            // that need a real `X509CertificateObject` (`getEncoded()`,
+            // `verify()`, etc. are abstract on the bare `Certificate`/
+            // `X509Certificate` classes and throw `AbstractMethodError`
+            // otherwise). Only the OLD synthetic path — where `getInstance`
+            // (1-arg, no provider) handed out the 1-field
+            // `alloc_concurrent_synthetic` stub with no `certFacSpi` — falls
+            // through to the legacy ad-hoc DER parser below.
+            if let Some(Value::Object(Some(this))) = args.first() {
+                if let Value::Object(Some(spi)) = ctx.get_field_by_name(*this, "certFacSpi") {
+                    return ctx.invoke_virtual(
+                        spi,
+                        "engineGenerateCertificate",
+                        "(Ljava/io/InputStream;)Ljava/security/cert/Certificate;",
+                        &args[1..],
+                    );
+                }
+            }
+
             // X509Certificate: 3 fields (subject_str=0, issuer_str=1, cert_id=2)
             let cert = alloc_concurrent_synthetic(ctx, "java/security/cert/X509Certificate", 3);
 
@@ -39330,6 +39361,19 @@ pub(crate) fn register_p68_security_cert(r: &mut NativeMethodRegistry) {
         "generateCertificates",
         "(Ljava/io/InputStream;)Ljava/util/Collection;",
         |ctx, args| {
+            // Real-SPI fast path — see the matching comment on
+            // `generateCertificate` above; same rationale, same field.
+            if let Some(Value::Object(Some(this))) = args.first() {
+                if let Value::Object(Some(spi)) = ctx.get_field_by_name(*this, "certFacSpi") {
+                    return ctx.invoke_virtual(
+                        spi,
+                        "engineGenerateCertificates",
+                        "(Ljava/io/InputStream;)Ljava/util/Collection;",
+                        &args[1..],
+                    );
+                }
+            }
+
             // Try to parse a single certificate and return it in a list
             let al = alloc_concurrent_synthetic(ctx, "java/util/ArrayList", 2);
             let arr = ctx.new_array(cratonvm_types::ArrayElementType::Reference, 10);

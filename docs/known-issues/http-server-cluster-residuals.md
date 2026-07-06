@@ -6,12 +6,16 @@
 merged to `dev`. Reproduced and iterated on both Windows + JDK25 (the
 platform the original bug report was captured on, via
 `apps/spring-suite-runner`) and the Azure Linux host for fast iteration.
-10 of 12 classes are fully fixed; 2 have residual issues, updated in the
-2026-07-06 follow-up session below (one genuine bug found+fixed, one
-narrower bug found+documented but still open, both under
-`ServerHttpsRequestIntegrationTests`; `ZeroCopyIntegrationTests`'s original
-reported failure did not reproduce, but an unrelated pre-existing flakiness
-was found and documented instead — see "Update (2026-07-06 session)" below).
+10 of 12 classes are fully fixed; 2 have residual issues, updated across
+two 2026-07-06 follow-up passes below. `ServerHttpsRequestIntegrationTests`:
+two distinct bugs found and fixed this session (a `Provider.putService`
+gap + per-instance `containsKey` isolation, and a `CertificateFactory`
+real-SPI delegation gap), but the test still fails — a third, unrelated
+bug (PKCS12/PBE empty-password handling in Netty's JDK-native SSL context
+path) was uncovered once the first two were fixed, and remains open for a
+future session. `ZeroCopyIntegrationTests`'s original reported failure did
+not reproduce, but an unrelated pre-existing flakiness was found and
+documented instead — see "Update (2026-07-06 session)" below.
 
 ## Root causes fixed
 
@@ -130,7 +134,16 @@ bcpkix-jdk18on")`, confirmed present via a regenerated Linux-native
 `bcprov-jdk18on-1.72.jar`, `bcutil-jdk18on-1.72.jar`). This changes the
 original "Residual 1" diagnosis materially — see below.
 
-### `ServerHttpsRequestIntegrationTests` — real root cause found, ONE bug fixed, ONE bug remains open
+### `ServerHttpsRequestIntegrationTests` — TWO bugs found+fixed this session, ONE new bug remains open
+
+**Follow-up (same-day, second pass)**: the `CertificateFactory`
+delegation bug described below (originally left open at the end of the
+first pass) has since been fixed too — see "Second bug — FIXED this
+session (follow-up, same day)" further down. A third, distinct bug
+(PKCS12/PBE empty-password handling in Nettys JDK-native SSL context path)
+was found once that got fixed, and remains open — see the end of this
+section. Net count: 2 bugs fixed, 1 new residual, test still fails
+end-to-end for the new reason.
 
 The original diagnosis (OpenJDK-reflection fallback `X509CertImpl` signing,
 `CertificateFactory` parse failure on truncated PEM) does not match what
@@ -181,43 +194,92 @@ instance, so the second instance's `addAlgorithm("MessageDigest.GOST3411",
   **NOT a ZeroCopy regression** — see below, that flakiness is pre-existing
   and reproduces identically on the unmodified baseline binary.
 
-**Second, deeper bug found — NOT fixed, blocks the test from passing
-end-to-end**: with the above fixed, `BouncyCastleSelfSignedCertGenerator
-.generate()` still fails, now further along the call chain, in
-`JcaX509CertificateConverter.getCertificate()` →
-`CertificateFactory.getInstance("X509", bcProvider)`. On real HotSpot this
-returns a `org.bouncycastle.jcajce.provider.asymmetric.x509
-.X509CertificateObject` (BC's own concrete SPI class, `encoded len = 688`).
-On CratonVM it returns a bare `java.security.cert.X509Certificate` — **the
-abstract class itself** — with `cert.getEncoded().length == 0`. Root cause
-not yet located: CratonVM's `CertificateFactory.getInstance(String,
-Provider)` / engine-class-instantiation path (`native-builtins/src/jca/
-provider_chain.rs` only seeds a `CertificateFactory` service for the `SUN`
-provider around line 1151 — BC's own `CertificateFactory` SPI class,
-`org.bouncycastle.jcajce.provider.asymmetric.x509.CertificateFactory`, is
-registered by BC itself via the now-working `putService` path, but whatever
-consumes `getInstance(algo, Provider)` doesn't appear to route through the
-provider's actual registered service to pick BC's SPI, falling back to some
-generic/synthetic stub instead. This surfaces later as `AbstractMethodError:
-Certificate.verify(PublicKey)` in an even-more-minimal repro, confirming the
-returned object is not a real concrete `Certificate` subclass. This second
-bug still causes `generateBc()` to fail (now for a different reason),
-falling through Netty's provider chain to `generateKeytool()` (no keytool
-binary in this env) and finally `generateSunMiscSecurity()` (the original
-OpenJDK-reflection path) — which independently reproduces
-`UnsupportedOperationException: OpenJdkSelfSignedCertGenerator not supported
-on the used JDK version` on **real HotSpot JDK 25 too** (`sun.security.x509
-.CertificateIssuerName` no longer exists on JDK 25 — confirmed via a
-standalone reflection probe against both HotSpot and CratonVM, identical
-result) — so that path is a dead end on any JDK 25 target, not a CratonVM
-bug, and was never expected to succeed; BC (or `generateCertificateBuilder`)
-is the only viable path forward. **Net effect: `ServerHttpsRequestIntegrationTests`
-still FAILs** with the same outer message as before
-(`CertificateException: No provider succeeded to generate a self-signed
-certificate`), but the actually-broken step has moved and narrowed
-considerably. A future session should start at `CertificateFactory
-.getInstance(String, Provider)` dispatch in `provider_chain.rs` /
-wherever JCA engine-class instantiation happens for non-seeded providers.
+**Second bug — FIXED this session (follow-up, same day)**: with the
+`putService`/`containsKey` fix above, `BouncyCastleSelfSignedCertGenerator
+.generate()` got further but still failed in `JcaX509CertificateConverter
+.getCertificate()` -> `CertificateFactory.getInstance("X509", bcProvider)`.
+On real HotSpot this returns a `org.bouncycastle.jcajce.provider.asymmetric
+.x509.X509CertificateObject` (BC's own concrete SPI class, `encoded len =
+688`). On CratonVM it returned a bare `java.security.cert.X509Certificate`
+— the abstract class itself — with `cert.getEncoded().length == 0`,
+surfacing downstream as `AbstractMethodError: Certificate.verify
+(PublicKey)`.
+
+Root cause: `CertificateFactory` objects built via the real-bytecode
+`getInstance(algo, Provider)` / `getInstance(algo, providerName)` paths
+(which route through `sun.security.jca.GetInstance` ->
+`getinstance_instance_provider[_obj]` in `native-builtins/src/jca/
+provider_chain.rs`, running the class's real constructor) do end up with a
+genuine `certFacSpi` field pointing at BC's real SPI (BC registers it via
+the now-working `putService`). But `register_p68_security_cert` in
+`native-builtins/src/phases_late.rs` — which implements `generateCertificate`
+/ `generateCertificates` — always ran its own hardcoded synthetic DER
+parser regardless of what SPI the `CertificateFactory` was actually built
+with, ignoring `certFacSpi` entirely.
+
+  Fix (`native-builtins/src/phases_late.rs`, `register_p68_security_cert`,
+  commit `8355ad22` on `fix/httpserver-certfactory-20260706`, merged to
+  `dev`): both `generateCertificate` and `generateCertificates` now check
+  for a real `certFacSpi` field first and, if present, delegate to it via
+  `invoke_virtual` (`engineGenerateCertificate` / `engineGenerateCertificates`),
+  running the genuine provider bytecode and producing the provider's own
+  concrete `Certificate` subclass. Falls through to the legacy synthetic
+  DER parser only when `certFacSpi` is null (the old 1-arg
+  `getInstance(String)` synthetic-stub path, which is unchanged), so this
+  does not regress that path. Repros used: `CertFactoryRepro.java` (probes
+  all three `getInstance` overloads + the private `certFacSpi` field via
+  reflection) and `CertConvertRepro.java` (full BC `X509v3CertificateBuilder`
+  -> `JcaX509CertificateConverter` -> `cert.verify()` chain matching Spring's
+  actual usage), both under `/data/data/tmp-httpserver/` on the Azure host
+  (not committed — standalone scratch repros).
+
+  This fix was scoped to `CertificateFactory` only; it was NOT generalized
+  to other JCA engine types (`Signature`/`KeyFactory`/`MessageDigest`/etc.)
+  in this session. Those engine types already have their own dispatch via
+  the `ec_real`-gated `getinstance_instance_provider_obj` /
+  `build_jca_instance` mechanism in `provider_chain.rs` (EC-family only by
+  design, see that file's doc comments) and were not found to share this
+  specific bug — `CertificateFactory` is a different top-level class
+  (`java.security.cert.CertificateFactory`, not `sun.security.jca.
+  GetInstance`) with its own always-on synthetic native that intercepted
+  unconditionally, which is what made it special-cased and worth this
+  targeted fix rather than a shared one.
+
+**Third bug — found this session, NOT fixed, new residual**: with the
+`certFacSpi` delegation fix above, the `AbstractMethodError` / empty-cert
+failure is gone — confirmed via the standalone repros and a live run of
+`ServerHttpsRequestIntegrationTests` — but the test still fails, now
+further down the chain, inside Netty's **JDK-native** SSL context setup
+(`JdkSslServerContext`, a different code path from BC's own SSL context —
+this one builds an in-memory PKCS12 keystore via the JDK's own
+`sun.security.pkcs12.PKCS12KeyStore`):
+
+```
+reactor.core.Exceptions$ReactiveException: javax.net.ssl.SSLException: failed to initialize the server-side SSL context
+  at io.netty.handler.ssl.JdkSslServerContext.newSSLContext(JdkSslServerContext.java:350)
+Caused by: java.security.KeyStoreException: Key protection algorithm not found: java.security.UnrecoverableKeyException: Encrypt Private Key failed: getSecretKey failed: Empty password
+  at sun.security.pkcs12.PKCS12KeyStore.setKeyEntry(PKCS12KeyStore.java:719)
+Caused by: java.security.UnrecoverableKeyException: Encrypt Private Key failed: getSecretKey failed: Empty password
+Caused by: java.io.IOException: getSecretKey failed: Empty password
+  at sun.security.pkcs12.PKCS12KeyStore.getPBEKey(PKCS12KeyStore.java:851)
+Caused by: java.security.spec.InvalidKeySpecException: Empty password
+```
+
+Not investigated further this session — out of scope (this is a distinct,
+unrelated bug from the `CertificateFactory` one this session targeted).
+Hypothesis for a future session: CratonVM's PBE/PKCS12 key-protection
+native path likely doesn't handle an empty-password `PBEKey` derivation the
+way real HotSpot's `PKCS12KeyStore.getPBEKey`/`encryptPrivateKey` does —
+worth confirming first whether real HotSpot JDK 25 actually accepts an
+empty password here at all (Netty's in-memory keystore construction may
+rely on specific PBE parameters CratonVM's crypto natives don't yet
+support), before assuming it's a CratonVM-only gap. **Net effect:
+`ServerHttpsRequestIntegrationTests` still FAILS**, but the failure has
+moved twice now and is much narrower than the original report — a future
+session should start at CratonVM's PKCS12/PBE key-protection natives (grep
+for `PKCS12` / `PBEKey` / `getSecretKey` handling) rather than anywhere
+in the JCA provider/service-lookup layer (which is now confirmed working
+correctly for this test's `CertificateFactory` usage).
 
 The original "all-NUL PEM payload" / base64 / file-I/O leads from the prior
 session are now believed to be **red herrings** — with BC actually reachable
