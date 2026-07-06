@@ -4,6 +4,12 @@ This folder collects CratonVM-only defects found while running upstream Java
 suites. The docs had grown to describe the **same underlying bug from several
 angles**; this index is the consolidated map. Read it first.
 
+## 2026-07-06 WildFly domain-mode corrupt-Value-cell root cause + MSC real-start gate
+
+- [wildfly-domain-heap-corrupt-value-timeout.md](wildfly-domain-heap-corrupt-value-timeout.md) — root-caused: the repeated `gen_heap::read_slot: corrupt Value cell` guard hit during domain-mode boot is the plain-field 16-byte `Value`-slot tearing bug, fixed on `dev` by `2dfdfddc`/`5198fccd` (landed the day after this doc's evidence). Live re-confirmation is blocked by a deeper, separately-tracked gap (below); see the doc for the full analysis and the pre/post-fix code diff.
+- [wildfly-domain-managed-servers-timeout.md](wildfly-domain-managed-servers-timeout.md) — updated: the corrupt-cell mechanism above is fixed, but hand-driving `standalone.sh`/`domain.sh` directly (no Maven/wildfly-core checkout was available) shows CratonVM cannot reach real sustained service execution at all without `CRATONVM_MSC_REAL_START=1` (default off, an existing in-progress effort — see [handoff-wildfly-msc-service-start.md](../internal/app-jvm-bugs/handoff-wildfly-msc-service-start.md)), and even with that flag on hits a new `ServiceNotFoundException`/domain-mode hang — tracked as [bug-15](../internal/wildfly-suite-bugs/bug-15-msc-real-start-servicenotfound-and-domain-hang.md).
+
+
 ## 2026-07-06 vm crate unit-test residuals (branch fix/vm-monitor-test-object-heap-uaf)
 
 - [vm crate unit-test residuals post-monitor-fix](vm-unit-test-residuals-post-monitor-fix.md) - after fixing a test-helper use-after-free SIGSEGV that was crashing `cargo test -p cratonvm-vm --release --lib` before it could finish, the suite surfaced 16-17 masked failures. 8 were a false alarm (lock_order enforcement gated behind debug_assertions, disabled under --release), 3 were stale hardcoded bootstrap-class/native counts (FIXED here — a legitimate recent feature grew the count from 5 to 25 classes), 1 didn't reproduce in debug (not investigated). 4 remain open: virtual_scheduler over-release accounting (design question), vm_exec object-pointer-provenance test predates a security hardening, runtime::frame CompactValue long/upper-half slot-tearing-adjacent bug, and a jit::skip_list Keycloak over-match not yet traced to its exact matching branch.

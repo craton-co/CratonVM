@@ -63,3 +63,40 @@ It is **not**, on closer reading of `types/src/value.rs`'s own doc comments (`re
 **Not yet confirmed empirically.** Two synthetic repros were attempted against the pre-fix baseline (`164264c8`, predates `e60b7a5c`): a generic reference-field-getfield-plus-allocation loop, and a closer mirror of the original JDT idiom (`this.intStack[this.intPtr--]` immediately followed by a reference-element-array `System.arraycopy`, inside an OSR-compiled instance-method loop, matching the exact shape documented in `docs/internal/jasper-jdt-parser-arrayindexoutofbounds.md`). Both ran to 200k+ iterations with zero mismatches and no HIB-CV-32 guard hits, confirming OSR-compilation occurred (`CRATONVM_DBG_JITC=1` showed `OSR-compile`/`bg-compile tier=C2`) but not exercising whatever precise interleaving is needed. This matches that same JDT investigation's own account: even the team that root-caused and fixed bug #1 "could not get a minimal standalone Java repro to fail-then-pass" for the *tearing* commit, and needed 12 purpose-built, iteratively-refined synthetic probes (T3–T14) to reliably trigger *this* bug family at all — a repro budget well beyond what this session could allocate as a side-investigation.
 
 **Recommended next step:** re-run `EEConcurrencyExecutorShutdownTestCase` (and ideally the full WildFly domain-mode slice) end-to-end against current `dev` (which now includes `e60b7a5c` and all three tearing fixes). This needs a rebuilt WildFly distribution + Arquillian domain harness on a build host — the prior evidence run's artifacts and the Azure host's WildFly build were both lost to disk-pressure cleanup since 2026-07-05, so this is a from-scratch rebuild (WildFly `install -DskipTests` alone took ~54 min in the original suite run), out of scope for this session. If the guard diagnostic and timeout are gone, close this out referencing `e60b7a5c`; if not, the synthetic repros in `docs/known-issues/repros/wildfly-domain-startup-timeout/` (`FieldTearRepro.java`, `ParserIdiomRepro.java`) are a starting point to iterate into a reliable standalone trigger, same as the JDT investigation's T-series did.
+
+## 2026-07-06 update (parallel session) — boot-infrastructure blocker found; live E2E still not reachable
+
+A second, independent investigation this same day tried the "rebuild the WildFly
+distribution and re-run E2E" next step above via a shortcut: rather than a full
+`wildfly-core` testsuite + Maven build (not available on the Azure probe host used),
+it downloaded a **binary** WildFly 32.0.1.Final distribution from GitHub releases (no
+Maven build needed) and drove `bin/standalone.sh`/`bin/domain.sh` directly under a fresh
+`dev`-HEAD `cratonvm`, using the same real-JDK/`--nojit` configuration
+`apps/wildfly-suite-runner/run-suite.sh` uses.
+
+This did not reach far enough to re-observe (or rule out) either hypothesis above: both
+boots stall **before** any application-level service does real, sustained work.
+CratonVM only drives the real `Service.start(StartContext)` MSC callback when
+`CRATONVM_MSC_REAL_START=1` is set (default off — see
+`docs/internal/app-jvm-bugs/handoff-wildfly-msc-service-start.md`, an existing,
+separately-tracked, explicitly-incomplete effort). `run-suite.sh` never sets this flag,
+so with the default configuration the very first application-level MSC service install
+after `WFLYSRV0049 ... starting` never signals completion and the boot hangs
+indefinitely — confirmed via `CRATONVM_DEFAULT_WATCHDOG_SEC` + the built-in stack-dump
+watchdog to be a genuine parked wait (all non-daemon threads idle in
+`EnhancedQueueExecutor$ThreadBody.run`, near-0% CPU), not slow interpretation. Turning
+the flag on gets standalone mode further, but into an unrelated
+`ServiceNotFoundException` (`BootstrapImpl.internalBootstrap` failing to resolve
+`Services.JBOSS_AS`) within ~3 seconds, and makes domain mode hang even earlier with no
+error at all. Filed as
+[bug-15](../internal/wildfly-suite-bugs/bug-15-msc-real-start-servicenotfound-and-domain-hang.md)
+— a boot-infrastructure gap orthogonal to both hypotheses above, but one that must be
+resolved (or Maven + the real testsuite restored) before *either* hypothesis can be
+confirmed or refuted against a live, sustained-load domain-mode process again.
+
+**Combined recommended next step:** whoever picks this up next needs one of (a) Maven +
+a `wildfly-core` testsuite checkout to rerun the actual Arquillian test, or (b) progress
+on bug-15 (the MSC real-start gate) so a hand-driven binary-distribution boot can reach
+real sustained concurrent execution — only then can Hypothesis 2 above (or a new one) be
+tested against a live process again. The `FieldTearRepro.java`/`ParserIdiomRepro.java`
+synthetic repros remain the fastest path to iterate on Hypothesis 2 without either.
