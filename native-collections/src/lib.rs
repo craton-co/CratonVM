@@ -22873,29 +22873,46 @@ fn collect_collection_elements(ctx: &mut dyn NativeContext, coll: ObjectRef) -> 
             return elems;
         }
     }
-    // Try LinkedList layout (field 0 = head Node, field 2 = Int size).
-    // Guarded so a 1- or 2-slot non-LL receiver doesn't trigger an OOB probe
-    // on slot 2.
-    if LL_FIELD_SIZE < n_fields {
-        if let Value::Int(size) = ctx.get_field(coll, LL_FIELD_SIZE) {
-            if size > 0 && LL_FIELD_HEAD < n_fields {
-                let mut elems = Vec::with_capacity(size as usize);
-                let mut cur = ctx.get_field(coll, LL_FIELD_HEAD);
-                while let Value::Object(Some(node)) = cur {
-                    // Per-node guard: a real LL node has 3 slots
-                    // (prev/next/elem). A non-node reached here (e.g. via the
-                    // false-positive size match above) would OOB-probe on
-                    // slot 2 / slot 1.
-                    let node_fields = ctx.object_num_fields(node);
-                    if LL_NODE_ELEM >= node_fields || LL_NODE_NEXT >= node_fields {
-                        break;
-                    }
-                    elems.push(ctx.get_field(node, LL_NODE_ELEM));
-                    cur = ctx.get_field(node, LL_NODE_NEXT);
+    // LinkedList: its real head/tail/size live in the identity-hash-keyed
+    // `ll_overlay()` side-table, not in the object's raw field slots (see the
+    // ll_get/ll_set block comment above) — once the real java.util.LinkedList
+    // class is loaded, the synthetic slot indices (LL_FIELD_HEAD/SIZE) alias
+    // real-JDK declared fields instead. Reading those slots directly here
+    // (as a prior version of this branch did) saw garbage/zero for a
+    // native-populated LinkedList, so `size > 0` never matched and this
+    // function fell through to `Vec::new()` — e.g.
+    // `someLinkedList.addAll(anotherLinkedList)` (both native_ll_add_all and
+    // native_al_add_all route element collection through here) silently
+    // added nothing and returned false. Detect a real LinkedList (or
+    // subclass) explicitly and read through the overlay-aware ll_get(), the
+    // same accessor ll_snapshot_array/native_ll_* already use.
+    let is_linkedlist_like = ctx
+        .class_id_by_name("java/util/LinkedList")
+        .map(|ll| cid == ll || ctx.is_subclass(cid, ll))
+        .unwrap_or(false);
+    if is_linkedlist_like {
+        let size = ll_size(ctx, coll);
+        if size > 0 {
+            let mut elems = Vec::with_capacity(size as usize);
+            let mut cur = match ll_get(ctx, coll, "head") {
+                Value::Object(Some(r)) => Some(r),
+                _ => None,
+            };
+            while let Some(node) = cur {
+                // Per-node guard: a real LL node has 3 slots (item/next/prev).
+                let node_fields = ctx.object_num_fields(node);
+                if LL_NODE_ELEM >= node_fields || LL_NODE_NEXT >= node_fields {
+                    break;
                 }
-                return elems;
+                elems.push(ctx.get_field(node, LL_NODE_ELEM));
+                cur = match ctx.get_field(node, LL_NODE_NEXT) {
+                    Value::Object(Some(n)) => Some(n),
+                    _ => None,
+                };
             }
+            return elems;
         }
+        return Vec::new();
     }
     // S111r28: HashSet / LinkedHashSet — field 0 = backing map. Collect the
     // backing map's keys (in iteration order).
