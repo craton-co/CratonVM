@@ -1246,6 +1246,9 @@ fn engine_load(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult 
     for entry in store.entries.values() {
         match &entry.kind {
             EntryKind::PrivateKey { key_der, chain } => {
+                if std::env::var_os("CRATONVM_DBG_TLS_HS").is_some() {
+                    eprintln!("[dbg-tls-hs] install_identity_from_der CALLER=engineLoad(byte-stream) key_len={}", key_der.len());
+                }
                 crate::t27_tls::install_identity_from_der(key_der, chain);
                 if first_key_identity.is_none() {
                     first_key_identity = Some((key_der.clone(), chain.clone()));
@@ -1595,6 +1598,9 @@ fn engine_set_key_entry(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCa
     // TLS handshake against it failed immediately ("unexpected EOF" on the
     // client side). See docs/known-issues/http-server-cluster-residuals.md.
     if !chain.is_empty() {
+        if std::env::var_os("CRATONVM_DBG_TLS_HS").is_some() {
+            eprintln!("[dbg-tls-hs] install_identity_from_der CALLER=engine_set_key_entry(direct-API) key_len={}", key_der.len());
+        }
         crate::t27_tls::install_identity_from_der(&key_der, &chain);
     }
     keystore_set_key_entry(id, &alias, key_der, chain);

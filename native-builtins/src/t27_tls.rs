@@ -602,9 +602,67 @@ fn trust_roots_pem(trust_roots: Option<&TlsTrustRoots>) -> String {
     pem
 }
 
-/// Install the runtime server identity from a PKCS#8 private key DER + DER cert
-/// chain (leaf first), converting to the PEM the rustls server-config builder
-/// consumes. Called from the keystore load path when a key entry is present.
+/// Best-effort sniff of a raw private-key DER's actual ASN.1 encoding.
+/// `PrivateKey.getEncoded()` is NOT guaranteed to be PKCS#8 for every JCA
+/// provider/key type -- observed live: BouncyCastle-generated self-signed
+/// server identities intermittently hand back a raw PKCS#1 (RSA) or SEC1
+/// (EC) encoding rather than a PKCS#8-wrapped one. Blindly labeling every
+/// DER as PKCS#8 (the prior behavior) makes rustls's `with_single_cert`
+/// fail with a generic "failed to parse private key as RSA, ECDSA, or
+/// EdDSA" the moment the actual bytes aren't PKCS#8 -- this is the root
+/// cause of the intermittent `ServerHttpsRequestIntegrationTests` TLS
+/// handshake failure ("unexpected EOF"): `engine_begin` silently returned
+/// `Err` before ever touching the network, and Netty's `SslHandler`
+/// reacted to the resulting broken engine by tearing the connection down
+/// on the very first `unwrap()`.
+///
+/// Distinguishes the three shapes by looking at what immediately follows
+/// the outer SEQUENCE's version INTEGER: a nested SEQUENCE means a PKCS#8
+/// `AlgorithmIdentifier` follows; a nested OCTET STRING means a SEC1
+/// `ECPrivateKey.privateKey` field; anything else (typically another
+/// INTEGER, RSA's modulus `n`) means PKCS#1. Defaults to PKCS#8 (the prior
+/// hardcoded assumption) if the DER doesn't parse as expected, so this is
+/// strictly additive -- it can only recognize MORE valid keys, never fewer.
+fn sniff_private_key_pem_header(der: &[u8]) -> &'static str {
+    fn tlv_value_offset(buf: &[u8], tag_pos: usize) -> Option<usize> {
+        if tag_pos + 1 >= buf.len() {
+            return None;
+        }
+        let len_byte = buf[tag_pos + 1];
+        let mut p = tag_pos + 2;
+        if len_byte & 0x80 != 0 {
+            let n = (len_byte & 0x7f) as usize;
+            if n > 4 || p + n > buf.len() {
+                return None;
+            }
+            p += n;
+        }
+        Some(p)
+    }
+    (|| -> Option<&'static str> {
+        if *der.first()? != 0x30 {
+            return None; // must be a top-level SEQUENCE
+        }
+        let after_outer = tlv_value_offset(der, 0)?;
+        if *der.get(after_outer)? != 0x02 {
+            return None; // version INTEGER
+        }
+        let after_version = tlv_value_offset(der, after_outer)?;
+        match der.get(after_version) {
+            Some(0x30) => Some("PRIVATE KEY"),     // PKCS#8 AlgorithmIdentifier
+            Some(0x04) => Some("EC PRIVATE KEY"),  // SEC1 privateKey OCTET STRING
+            Some(0x02) => Some("RSA PRIVATE KEY"), // PKCS#1 modulus INTEGER
+            _ => None,
+        }
+    })()
+    .unwrap_or("PRIVATE KEY")
+}
+
+/// Install the runtime server identity from a private key DER (PKCS#8,
+/// PKCS#1, or SEC1 -- auto-detected, see `sniff_private_key_pem_header`) +
+/// DER cert chain (leaf first), converting to the PEM the rustls
+/// server-config builder consumes. Called from the keystore load path when
+/// a key entry is present.
 pub fn install_identity_from_der(key_pkcs8_der: &[u8], chain_der: &[Vec<u8>]) {
     if key_pkcs8_der.is_empty() || chain_der.is_empty() {
         return;
@@ -613,7 +671,16 @@ pub fn install_identity_from_der(key_pkcs8_der: &[u8], chain_der: &[Vec<u8>]) {
     for c in chain_der {
         cert_pem.push_str(&der_to_pem("CERTIFICATE", c));
     }
-    let key_pem = der_to_pem("PRIVATE KEY", key_pkcs8_der);
+    let __sniffed = sniff_private_key_pem_header(key_pkcs8_der);
+    if std::env::var_os("CRATONVM_DBG_TLS_HS").is_some() {
+        eprintln!(
+            "[dbg-tls-hs] install_identity_from_der: key_der_len={} full_hex={} sniffed_header={}",
+            key_pkcs8_der.len(),
+            key_pkcs8_der.iter().map(|b| format!("{:02x}", b)).collect::<String>(),
+            __sniffed
+        );
+    }
+    let key_pem = der_to_pem(__sniffed, key_pkcs8_der);
     set_runtime_tls_identity(Some(RuntimeTlsIdentity {
         cert_pem,
         key_pem,
@@ -3496,6 +3563,25 @@ pub(crate) fn real_handshake_status_enum(
     )
 }
 
+fn status_name(sr: i32) -> &'static str {
+    match sr {
+        SR_BUFFER_OVERFLOW => "BUFFER_OVERFLOW",
+        SR_BUFFER_UNDERFLOW => "BUFFER_UNDERFLOW",
+        SR_CLOSED => "CLOSED",
+        _ => "OK",
+    }
+}
+
+fn hs_name(hs: i32) -> &'static str {
+    match hs {
+        HS_FINISHED_R => "FINISHED",
+        HS_NEED_TASK_R => "NEED_TASK",
+        HS_NEED_WRAP_R => "NEED_WRAP",
+        HS_NEED_UNWRAP_R => "NEED_UNWRAP",
+        _ => "NOT_HANDSHAKING",
+    }
+}
+
 fn alloc_engine_result(
     ctx: &mut dyn cratonvm_native_api::NativeContext,
     status: i32,
@@ -4435,6 +4521,13 @@ fn register_engine_impl_natives(r: &mut NativeMethodRegistry) {
     r.register(cls_impl, "closeOutbound", "()V", |_ctx, args| {
         let this = obj_arg(args, 0)?;
         let id = engine_id_or_alloc(this);
+        if std::env::var("CRATONVM_DBG_TLS_HS").is_ok() {
+            eprintln!(
+                "[dbg-tls-hs] thread={:?} JAVA_CALLED closeOutbound() id={}",
+                std::thread::current().id(),
+                id
+            );
+        }
         with_engine(id, |s| {
             s.closed_outbound = true;
             if let Some(c) = s.conn.as_mut() {
@@ -4692,10 +4785,25 @@ fn do_wrap(
     dst: ObjectRef,
 ) -> cratonvm_types::error::MethodCallResult {
     let id = engine_id_or_alloc(this);
+    let __dbg_hs = std::env::var("CRATONVM_DBG_TLS_HS").is_ok();
+    if __dbg_hs {
+        eprintln!(
+            "[dbg-tls-hs] thread={:?} do_wrap ENTER id={}",
+            std::thread::current().id(),
+            id
+        );
+    }
 
     // Closed-outbound short-circuit.
     let closed = with_engine(id, |s| s.closed_outbound).unwrap_or(false);
     if closed {
+        if __dbg_hs {
+            eprintln!(
+                "[dbg-tls-hs] thread={:?} do_wrap id={} CLOSED_OUTBOUND_SHORT_CIRCUIT",
+                std::thread::current().id(),
+                id
+            );
+        }
         let result = alloc_engine_result(ctx, SR_CLOSED, HS_NOT_HANDSHAKING_R, 0, 0);
         return Ok(Some(Value::Object(Some(result))));
     }
@@ -4706,6 +4814,12 @@ fn do_wrap(
         if let Some(s) = g.get_mut(&id) {
             if s.conn.is_none() {
                 if let Err(e) = engine_begin(s) {
+                    if std::env::var("CRATONVM_DBG_TLS_HS").is_ok() {
+                        eprintln!(
+                            "[dbg-tls-hs] thread={:?} do_unwrap/do_wrap id={} RETURN(engine_begin ERROR) err={}",
+                            std::thread::current().id(), id, e
+                        );
+                    }
                     return Err(RuntimeError::IOException { message: e }.into());
                 }
             }
@@ -4786,6 +4900,17 @@ fn do_wrap(
     };
 
     let total_consumed = consumed_app.max(consumed_inner) as i32;
+    if __dbg_hs {
+        eprintln!(
+            "[dbg-tls-hs] thread={:?} do_wrap id={} RESULT status={} hs={} consumed={} produced={}",
+            std::thread::current().id(),
+            id,
+            status_name(status),
+            hs_name(hs),
+            total_consumed,
+            produced
+        );
+    }
     let result = alloc_engine_result(ctx, status, hs, total_consumed, produced as i32);
     Ok(Some(Value::Object(Some(result))))
 }
@@ -4882,9 +5007,24 @@ fn do_unwrap(
     dsts: Vec<ObjectRef>,
 ) -> cratonvm_types::error::MethodCallResult {
     let id = engine_id_or_alloc(this);
+    let __dbg_hs = std::env::var("CRATONVM_DBG_TLS_HS").is_ok();
+    if __dbg_hs {
+        eprintln!(
+            "[dbg-tls-hs] thread={:?} do_unwrap ENTER id={}",
+            std::thread::current().id(),
+            id
+        );
+    }
 
     let closed = with_engine(id, |s| s.closed_inbound).unwrap_or(false);
     if closed {
+        if __dbg_hs {
+            eprintln!(
+                "[dbg-tls-hs] thread={:?} do_unwrap id={} CLOSED_INBOUND_SHORT_CIRCUIT",
+                std::thread::current().id(),
+                id
+            );
+        }
         let result = alloc_engine_result(ctx, SR_CLOSED, HS_NOT_HANDSHAKING_R, 0, 0);
         return Ok(Some(Value::Object(Some(result))));
     }
@@ -4894,6 +5034,12 @@ fn do_unwrap(
         if let Some(s) = g.get_mut(&id) {
             if s.conn.is_none() {
                 if let Err(e) = engine_begin(s) {
+                    if std::env::var("CRATONVM_DBG_TLS_HS").is_ok() {
+                        eprintln!(
+                            "[dbg-tls-hs] thread={:?} do_unwrap/do_wrap id={} RETURN(engine_begin ERROR) err={}",
+                            std::thread::current().id(), id, e
+                        );
+                    }
                     return Err(RuntimeError::IOException { message: e }.into());
                 }
             }
@@ -4947,6 +5093,16 @@ fn do_unwrap(
         } else {
             SR_OK
         };
+        if __dbg_hs {
+            eprintln!(
+                "[dbg-tls-hs] thread={:?} do_unwrap id={} RETURN(pending-drain) status={} hs={} consumed=0 produced={}",
+                std::thread::current().id(),
+                id,
+                status_name(status),
+                hs_name(hs),
+                idx
+            );
+        }
         let result = alloc_engine_result(ctx, status, hs, 0, idx as i32);
         return Ok(Some(Value::Object(Some(result))));
     }
@@ -4962,6 +5118,14 @@ fn do_unwrap(
     .unwrap_or(true);
     if dst_cap == 0 && !handshaking {
         let hs = with_engine(id, |s| handshake_status_of(s)).unwrap_or(HS_NOT_HANDSHAKING_R);
+        if __dbg_hs {
+            eprintln!(
+                "[dbg-tls-hs] thread={:?} do_unwrap id={} RETURN(dst_cap==0) status=BUFFER_OVERFLOW hs={} consumed=0 produced=0",
+                std::thread::current().id(),
+                id,
+                hs_name(hs)
+            );
+        }
         let result = alloc_engine_result(ctx, SR_BUFFER_OVERFLOW, hs, 0, 0);
         return Ok(Some(Value::Object(Some(result))));
     }
@@ -4974,6 +5138,13 @@ fn do_unwrap(
         let s = match g.get_mut(&id) {
             Some(s) => s,
             None => {
+                if __dbg_hs {
+                    eprintln!(
+                        "[dbg-tls-hs] thread={:?} do_unwrap id={} RETURN(engine-handle-missing ERROR)",
+                        std::thread::current().id(),
+                        id
+                    );
+                }
                 return Err(RuntimeError::IOException {
                     message: "engine handle missing".into(),
                 }
@@ -5057,6 +5228,15 @@ fn do_unwrap(
                     // connection teardown that follows can surface as an
                     // unrelated `ConnectionClosedException` instead
                     // (RestClientBuilderIntegTests.testBuilderUsesDefaultSSLContext).
+                    if __dbg_hs {
+                        eprintln!(
+                            "[dbg-tls-hs] thread={:?} do_unwrap id={} RETURN(process_new_packets ERROR) is_handshaking={} err={:?}",
+                            std::thread::current().id(),
+                            id,
+                            conn.is_handshaking(),
+                            e
+                        );
+                    }
                     if conn.is_handshaking() {
                         return Err(crate::phases_early::throw_jca_exc(
                             ctx,
@@ -5142,6 +5322,17 @@ fn do_unwrap(
         status
     };
 
+    if __dbg_hs {
+        eprintln!(
+            "[dbg-tls-hs] thread={:?} do_unwrap id={} RETURN(normal) status={} hs={} consumed={} produced={}",
+            std::thread::current().id(),
+            id,
+            status_name(final_status),
+            hs_name(hs),
+            consumed,
+            produced_total
+        );
+    }
     let result = alloc_engine_result(
         ctx,
         final_status,
