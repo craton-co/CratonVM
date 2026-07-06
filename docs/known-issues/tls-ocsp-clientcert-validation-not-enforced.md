@@ -1,225 +1,205 @@
 # TLS/mTLS/OCSP validation doesn't reject invalid handshakes (security-relevant)
 
-**Status:** PARTIALLY FIXED (branch `fix/tls-ocsp-clientcert-validation-not-enforced-20260706`).
-The core fail-open architecture gap is fixed and verified; several narrower,
-pre-existing residuals were discovered along the way and are documented below,
-not yet fixed. **Severity of what remains: reduced from high to
-low/medium** — the remaining failures are fail-**closed** (reject a
-connection that should succeed) or narrow feature gaps, not fail-**open**
-(accept a connection that should be rejected), with one exception noted below.
+**Status:** PARTIALLY FIXED, follow-up session (branch
+`fix/tls-residuals-followup-20260706`, based on the original
+`fix/tls-ocsp-clientcert-validation-not-enforced-20260706` work). The
+thread-local cross-contamination this doc's residuals #1/#4 blamed was a
+plausible but ultimately WRONG diagnosis — the real root cause was two
+separate identity/id round-trip bugs (below), now fixed and verified:
+`TestOcspEnabled` improved from 15/116 to 5/116 failures, and the
+order-dependent `TestCustomSslTrustManager` flakiness has not recurred across
+repeated isolated reruns. The remaining 5/116 (plus `TestSecurity2017Ocsp`,
+which now correctly *fails*) trace to a **newly discovered, distinct, and
+more serious gap: OCSP/CRL revocation checking is not implemented at all** —
+see "New finding" below. Residuals #2 (`chooseClientAlias`) and #3
+(client-side cipher restriction) are untouched, confirmed still open.
 
 **Related:** [BUG-DF06](../internal/CRATONVM_BUGS/BUG-DF06-certpath-pkix-not-implemented.md)
-(FIXED — routed `CertPathValidator PKIX` to the real Sun SPI, a prerequisite
-for the OCSP fix below) and
+(FIXED) and
 [BUG-DF02](../internal/CRATONVM_BUGS/BUG-DF02-stale-zeroed-oop-receiver-dispatch-segv.md)
 (OPEN, unrelated memory-safety bug — not hit by any of this work).
 
-## Root cause (confirmed)
+## This session's fixes (verified)
 
-CratonVM's rustls-based TLS engine (`native-builtins/src/t27_tls.rs`) built its
-own certificate verifier directly from keystore/truststore PEM data and never
-consulted the actual Java `TrustManager` objects passed to
-`SSLContext.init(km, tms, random)`. Concretely, three independent gaps, all
-now fixed:
+Root-caused via a fast, isolated Java repro (~1s per iteration, `/tmp/tlsrepro`
+on the Azure host — a standalone client+`HttpsServer`/mutual-TLS program
+against the same test keystores, instead of the ~4min full Tomcat suite) once
+`CRATONVM_DBG_TLS_AUTH=1` tracing on the real suite showed the failure was
+100% reproducible and parameter-independent, not the intermittent
+thread-local race the prior session's residuals #1/#4 hypothesized.
 
-1. **`SSLEngine.setEnabledCipherSuites()` was stored but never applied** to
-   the rustls `ClientConfig`/`ServerConfig` — a connector's cipher restriction
-   was purely cosmetic (only echoed back by `getEnabledCipherSuites()`).
-2. **The Java `TrustManager[]` array was captured (for extracting trust-anchor
-   PEM data) but the objects themselves were discarded** — so a
-   revocation-aware `PKIXRevocationChecker` (OCSP/CRL, attached via
-   `SSLUtilBase.getParameters()`/`PKIXBuilderParameters.addCertPathChecker`)
-   or a fully custom `TrustManager` class (Tomcat's `trustManagerClassName`)
-   was silently never invoked.
-3. **A required-but-missing client certificate wasn't detected as a handshake
-   failure on the client.** rustls's server-side `WebPkiClientVerifier`
-   *did* correctly detect `NoCertificatesPresented` and abort — but
-   `native-builtins/src/http_url_connection.rs`'s blocking TLS client driver
-   (`perform()`) exits its handshake-wait loop as soon as
-   `ClientConnection::is_handshaking()` flips false (which happens once the
-   client sends its own TLS 1.3 Finished, *before* it can know the server will
-   subsequently reject over the same connection), then silently folded the
-   resulting "connection closed before response head" into
-   `huc_real_perform`'s generic `Err(_) => Ok(-1)` contract instead of
-   surfacing `SSLHandshakeException`.
+1. **`keystore::keystore_id_from_object`** (`keystore.rs`, new): a real
+   `java.security.KeyStore` wrapper object has no room for CratonVM's
+   `cratonvm$keystore$storeId` pseudo-field (`set_field_by_name` silently
+   no-ops on a real bytecode class's undeclared field) and no reliable slot-4
+   fallback (the real 4-field layout — `type`/`provider`/`keyStoreSpi`/
+   `initialized` — has different semantics per index). The ONLY tier that
+   actually resolves it is the identity-hash side table
+   `keystore.rs::store_id_by_identity` already built for exactly this reason
+   (see its own doc comment) — but `x509_manager::read_keystore_id` and
+   `tls::read_keystore_registry_id` each reimplemented a subset of the lookup
+   and never consulted that table (`tls.rs`'s own doc comment flagged this
+   exact gap and asked for exactly this helper — it just hadn't been written
+   yet). Result before this fix: `TrustManagerFactory.init(KeyStore)`
+   *always* resolved keystore id 0 for a caller-supplied truststore, silently
+   validating peers against the ~120 platform root certs instead of the
+   caller's actual (test/private) CA — any peer cert signed by that CA was
+   rejected with `UnknownIssuer`, unconditionally, regardless of OCSP/cipher/
+   client-cert configuration. Both callers now delegate to the new helper.
+2. **`x509_manager::get_tm_id`/`set_tm_id`** (identity-hash side table added,
+   mirroring `keystore.rs`'s pattern exactly): the SAME bug, one level up.
+   `TrustManagerFactory.getInstance("PKIX")` in real-JDK mode really does
+   return a real `sun.security.ssl.TrustManagerFactoryImpl$PKIXFactory` SPI
+   instance (confirmed by direct pointer tracing), and
+   `set_tm_id(ctx, this, id)` — called from `tmf_engine_init`/
+   `tmf_engine_init_params` to stamp the id this factory was just built
+   with — hit the identical named-field/slot-0 no-op problem. The very next
+   call, `tmf_engine_get_trust_managers`, read back id **0** from the *same
+   object pointer* that had just been stamped with a real, non-zero id one
+   line earlier. Every `TrustManager` returned by `getTrustManagers()`
+   therefore carried id 0; `do_check_trusted`
+   (`checkClientTrusted`/`checkServerTrusted`) resolved that to
+   `build_trust_manager_state(0)` (platform roots only) and rejected any
+   chain signed by the caller's actual CA with "no trust anchor found for
+   chain" — this is what a mutual-TLS repro (server validating a *valid*
+   client cert) surfaced directly.
+3. **`x509_manager::register_trust_manager_state`/`trust_manager_state_by_id`**
+   (new, `x509_manager.rs`): a real but distinct bug from #1/#2 — TWO
+   independent id counters (`x509_manager`'s own `tm_registry`/`next_tm_id`,
+   and `keystore.rs`'s keystore-registration counter) both start at 1 and
+   were being stamped onto the *same* `cratonvm$x509tm$id` field by different
+   producers (`tls.rs`'s `getTrustManagers()` stamped a raw keystore id;
+   `x509_manager.rs`'s `tmf_engine_get_trust_managers` stamped a `tm_registry`
+   id), while consumers (`tls::validate_cert_chain`,
+   `phases_late::p68_extract_trust_manager_roots`) uniformly called
+   `build_trust_manager_state(id)`, which only knows how to interpret `id` as
+   a keystore id. A `tm_registry`-sourced id would either resolve to nothing
+   (empty anchors, fail-closed) or — worse — to a numerically-coincident,
+   totally unrelated keystore. Fixed by unifying both producers onto the
+   `tm_registry` id space and both consumers onto a single
+   `trust_manager_state_by_id` lookup.
 
-## Fixes landed (verified)
+None of the above is the thread-local (`PENDING_TM_TRUST_ROOTS`) mechanism
+residuals #1/#4 blamed — that relay was, on inspection, working correctly for
+the sequential, single-threaded call patterns these tests exercise. It's
+still fragile in the abstract (no ownership/expiry check) and worth hardening
+if it ever causes a *confirmed* incident, but it was not the cause here — the
+real bugs were the two identity/id round-trip gaps above, both now closed.
 
-- **Cipher-suite restriction is now enforced.** `t27_tls.rs`: new
-  `cipher_provider_for`/`java_cipher_name_to_suite` build a `CryptoProvider`
-  restricted to the Java-requested suites; `build_client_config_ciphers`/
-  `build_server_config_single_cert_ex_ciphers` use it via
-  `ClientConfig::builder_with_provider`/`ServerConfig::builder_with_provider`,
-  wired into `engine_begin`.
-- **Post-handshake `TrustManager` consultation.** `SSLContext.init` now
-  captures the real `TrustManager[]` objects into a new, GC-rooted
-  `ctx_trust_managers_table` (`t27_tls.rs`; root-scan/update wired into
-  `vm/src/memory/roots.rs`/`gc.rs`). `EngineState` stores only a GC-stable
-  `u64` key to this table (deliberately **not** the `ObjectRef`s themselves —
-  `do_wrap`/`do_unwrap` call allocating helpers while holding
-  `engine_registry()`'s write lock, so anything reachable through
-  `EngineState` needing GC-root scanning would make that lock GC-relevant and
-  risk a self-deadlock). `engine_take_pending_trust_check`/
-  `engine_run_trust_check` call the real `checkClientTrusted`/
-  `checkServerTrusted` once the handshake finishes (lock dropped first), and
-  convert a thrown exception into `SSLHandshakeException`.
-- **`PassthroughClientCertVerifier`** (`t27_tls.rs`): when Tomcat's
-  `trustManagerClassName` mechanism is used (by design, no backing
-  truststore), building `WebPkiClientVerifier` is impossible (no CA data).
-  Detecting a registered custom `TrustManager` for the engine, the server
-  config now uses a verifier that accepts any signed cert structurally and
-  delegates the real trust decision entirely to the post-handshake check
-  above — never used as a general fallback (would be fail-open) and only
-  selected when the Java-side check is guaranteed to run.
-- **`read_cert_der` (`x509_manager.rs`) now handles real certificate
-  objects**, not just CratonVM's synthetic mirror shape — added a
-  `getEncoded()` fallback. Without this, the chain built via
-  `keystore::make_x509_mirror` looked "empty" to CratonVM's native
-  `checkClientTrusted`/`checkServerTrusted` handler (registered on
-  `sun.security.ssl.X509TrustManagerImpl` by class name), throwing
-  `CertificateException: certificate chain is empty` for every connection —
-  a regression this same session introduced and fixed before it shipped.
-- **`TrustManagerFactoryImpl$PKIXFactory` registration** (`x509_manager.rs`):
-  CratonVM only ever registered `engineInit`/`engineGetTrustManagers` on
-  `TrustManagerFactoryImpl$SimpleFactory` (the "SunX509"-equivalent). Since
-  this interpreter's native-override dispatch is keyed by the *receiver's
-  runtime class*, and `PKIXFactory` (used for `TrustManagerFactory.getInstance
-  ("PKIX")` — the default algorithm, and what Tomcat's
-  `SSLUtilBase.getTrustManagers()` uses explicitly) doesn't override those
-  methods, it ran as real, unintercepted JDK bytecode, producing a real
-  `X509TrustManagerImpl` whose `checkClientTrusted`/`checkServerTrusted`
-  (*still* natively overridden, by class name) found no `tm_registry` entry
-  and silently fell back to a system-only trust state — rejecting any
-  certificate signed by a private/test CA. This was invisible until this
-  session's TrustManager-consultation fix started actually *calling*
-  `checkClientTrusted` post-handshake; nothing did before. Added
-  `tmf_engine_init_params`/`extract_pkix_trust_anchor_ders` (walks
-  `CertPathTrustManagerParameters.getParameters()` → `PKIXParameters
-  .getTrustAnchors()` → each `TrustAnchor.getTrustedCert()` → `.getEncoded()`)
-  plus registrations for both `engineInit` overloads and
-  `engineGetTrustManagers` on `PKIXFactory`, mirroring `SimpleFactory`'s.
-- **`SSLHandshakeException` classification in the HTTPS client path**
-  (`http_url_connection.rs`): a new `TLS_HANDSHAKE_FAILURE_SENTINEL`-prefixed
-  error class distinguishes a TLS-handshake-phase failure (including the
-  "closed with zero response bytes right after our own optimistic handshake
-  completion" case above) from other connection failures, and
-  `huc_real_perform` now raises `SSLHandshakeException` for it instead of
-  silently returning `-1`.
+## New finding: OCSP/CRL revocation checking is not implemented (open, more severe than the residuals it replaces)
 
-### Verified test outcomes (JSSE variant; OpenSSL/OpenSSL-FFM variants
-still skip — native `ssl.dll`/tomcat-native not installed, environmental,
-unrelated)
+`x509_manager::validate_chain` performs full structural PKIX validation
+(chain continuity, expiry, `BasicConstraints`, name constraints, signature
+verification, trust-anchor matching) but **never checks revocation status at
+all** — `TrustManagerState.enable_crl` is a field that gets set (always to
+`false`) and is never read anywhere in the crate. There is no OCSP responder
+query, no CRL check, nothing: a structurally valid chain from a trusted CA is
+accepted regardless of whether the leaf certificate has been revoked.
+
+This was invisible before this session's fixes because `TestOcspEnabled`
+resolved trust anchors incorrectly for essentially every configuration (see
+above), so revoked-cert test cases "passed" by accident (rejected for the
+wrong reason: unknown issuer, not revocation). With trust-anchor resolution
+now correct, the previously-clean `TestSecurity2017Ocsp` (5/5 pass) now
+correctly **fails** its one meaningful assertion,
+`testCVE_2017_15698` (a revoked client cert must be rejected — it is now
+accepted), and `TestOcspEnabled` still shows 5/116 failures, all
+`serverOk=false, verifyServer=true` (a revoked *server* cert, with client-side
+revocation checking enabled, is wrongly accepted) — this is a genuine
+**fail-open** result, more severe than any residual this doc previously
+tracked. `TestOcspSoftFail`/`TestOcspSoftFailInternalError`/
+`TestOcspSoftFailTryLater` show a mix of newly-passing and newly-failing
+cases consistent with the same root cause (soft-fail semantics only make
+sense once revocation checking exists to soft-fail *from*).
+
+Implementing real revocation checking (OCSP responder HTTP round-trip and/or
+CRL fetch-and-parse, wired through `PKIXRevocationChecker`'s options —
+`NO_FALLBACK`, soft-fail, etc.) is a substantial new feature, not a bug fix,
+and needs its own dedicated session — this doc merely upgrades the
+diagnosis from "unconfirmed, might be fail-closed-by-accident" (the prior
+session's caveat) to "confirmed unimplemented."
+
+### Verified test outcomes (JSSE variant; OpenSSL/OpenSSL-FFM variants still
+skip — native `ssl.dll`/tomcat-native not installed, environmental, unrelated)
 
 | Class | Before this session | After |
 |---|---|---|
-| `TestSslHandshakeFailure` | 1/1 fail (fail-open: no cert, no exception) | **OK (1/1)** |
-| `TestSecurity2017Ocsp` | 1/5 fail (fail-open) | **OK (5/5)** (unconfirmed stability — see below) |
-| `TestOcspEnabled` | 20/116 fail | 15/116 fail (see residual #1) |
-| `TestOcspSoftFail` | 3/15 fail | 2/15 fail |
-| `TestOcspSoftFailInternalError` | 4/20 fail | 2/20 fail |
-| `TestOcspSoftFailTryLater` | 4/20 fail | 2/20 fail |
-| `TestClientCert` | **NOSUMMARY/hang** (never completed) | 13/18 pass, 5/18 fail (see residual #2) |
-| `TestSSLHostConfigCipher` | 2/12 fail | 2/12 fail, unchanged (see residual #3) |
-| `TestCustomSslTrustManager` | 2/9 fail | 2–3/9 fail, **order-dependent — see residual #4, needs attention** |
+| `TestSslHandshakeFailure` | OK (1/1) | OK (1/1) — confirmed no regression (one batch run showed a flake, isolated rerun passed cleanly, matching this suite's known shared-host batch-contention behavior) |
+| `TestSecurity2017Ocsp` | OK (5/5) (flagged as unconfirmed) | **1/5 fail** — `testCVE_2017_15698` now correctly exposes the revocation-checking gap above (not a regression — the prior "pass" was fail-closed-by-accident) |
+| `TestOcspEnabled` | 15/116 fail | **5/116 fail**, all `serverOk=false,verifyServer=true` (revocation-checking gap, not the id-resolution bugs fixed this session) |
+| `TestOcspSoftFail` | 2/15 fail | 1/15 fail |
+| `TestOcspSoftFailInternalError` | 2/20 fail | 2/20 fail |
+| `TestOcspSoftFailTryLater` | 2/20 fail | 4/20 fail (also revocation-checking-gap-shaped; not re-investigated in detail) |
+| `TestClientCert` | 13/18 pass, 5/18 fail | 13/18 pass, 5/18 fail — unchanged, same known `chooseClientAlias` gap (residual #2, still open) |
+| `TestSSLHostConfigCipher` | 2/12 fail | not rerun this session — no code touched here, no reason to expect a change (residual #3, still open) |
+| `TestCustomSslTrustManager` | 2–3/9 fail, order-dependent | **2/9 fail, consistently** (`testCustomTrustManagerCA`/`All`, the known `chooseClientAlias` gap) — `testCustomTrustManagerNone`'s order-dependent flake did not recur |
 
-## Residuals (open, root-caused to varying depth — none are the original
-fail-open bug; do not re-close this doc as fully fixed)
+## Residuals still open (unchanged from before this session)
 
-**1. `TestOcspEnabled`'s remaining 15/116 (and the ~2/class in the
-`SoftFail*` variants) fail with "Handshake failed when not expected to do
-so"** — a **fail-closed** regression surfaced (not introduced net-negative —
-counts strictly improved) by the `PKIXFactory` fix above: even after that
-fix, some parameter combinations still hit the system-only-trust-anchor
-fallback. Not fully root-caused — candidates not yet ruled out: a *second*,
-still-unregistered TrustManagerFactory entry point; possible thread-local
-cross-contamination in `set_pending_tm_trust_roots`/
-`attach_pending_identity_to_ctx` (a `PENDING_TM_TRUST_ROOTS` thread-local
-written by one `TrustManagerFactory.init()` call and consumed by an unrelated
-later `SSLContext.init()` on the same thread if the two aren't 1:1 — see
-residual #4, which looks like the same family). `TestSecurity2017Ocsp`
-passing cleanly is *not* strong evidence the mechanism is fully correct: its
-single meaningful assertion (`testCVE_2017_15698`, a revoked client cert
-should be rejected) would *also* "pass" if the trust check spuriously rejects
-every connection — needs a dedicated positive-case regression test to confirm
-it's testing what it claims.
+**Residual #2 — client-side `KeyManager.chooseClientAlias` never
+consulted.** `TestClientCert`'s 5/18 and `TestCustomSslTrustManager`'s
+`testCustomTrustManagerCA`/`All` (2/9). CratonVM's client TLS path presents a
+fixed, pre-configured certificate instead of calling back into Java
+mid-handshake to match the server's `CertificateRequest` acceptable-issuer
+list. Needs a custom `rustls::client::ResolvesClientCert` calling back into
+Java *synchronously during the handshake* — a materially riskier change
+(GC/re-entrancy safety mid-handshake) than anything in this session; still
+recommended as its own dedicated session.
 
-**2. `TestClientCert`'s remaining 5/18 failures — "Checking requested client
-issuer against ..."** — a **separate, deep, NOT fixed** architecture gap:
-the client-side `X509ExtendedKeyManager.chooseClientAlias`/
-`chooseEngineClientAlias` is never consulted at all. CratonVM's client TLS
-path presents a fixed, pre-configured certificate directly
-(`build_client_config`/`identity_override`) instead of calling back into Java
-mid-handshake to let the real `KeyManager` pick a certificate matching the
-server's `CertificateRequest` acceptable-issuer list. Fixing this requires a
-custom `rustls::client::ResolvesClientCert` implementation that calls back
-into Java *synchronously during the handshake* (unlike the post-handshake
-`TrustManager` check above, this can't be deferred) — a materially riskier
-change (GC/re-entrancy safety mid-handshake) that deserves its own dedicated
-session. `TestCustomSslTrustManager`'s `testCustomTrustManagerCA` also hits
-this same gap for its own issuer-check assertion.
-
-**3. `TestSSLHostConfigCipher`'s 2/12 failures are unchanged** —
-`testTls12CipherNotAvailable`/`testTls13CipherNotAvailable` still don't
-reject: the **client**-side cipher restriction
-(`TesterSupport.ClientSSLSocketFactory.setCipher()`, consumed through
-`SSLSocketFactory.createSocket`, *not* the `SSLEngine` path this session's
-cipher fix targeled) is a separate, narrower, not-yet-touched gap. The
-**server**-side restriction (this session's fix) works correctly in
-isolation — confirmed via a clean, non-timing-out standalone rerun (a batch
-run reported a false "TIMEOUT" here that was shared-build-machine contention,
-not a hang — reran alone in 27s).
-
-**4. `TestCustomSslTrustManager` — needs follow-up, count is order-dependent.**
-Isolated reruns consistently showed 2/9 failures
-(`testCustomTrustManagerAll`/`CA`, both "connection closed immediately after
-the TLS handshake with no response" — traced precisely to an SSLContext
-*identity mismatch*: `attach_trust_managers_to_ctx` recorded the custom
-`TrustManager` against one `SSLContext` object's GC-stable key, but
-`createSSLEngine()` for the actual connection resolved to a *different*
-context-key with no registered entry, so the `PassthroughClientCertVerifier`
-path never activates and the original "`client_ca_pem` is `None`" config
-error still fires). One later run (immediately after the `PKIXFactory` fix,
-in a longer batch) showed **3/9** — `testCustomTrustManagerNone` newly
-failing with `SSLHandshakeException: ... invalid peer certificate:
-UnknownIssuer` instead of the expected `rc != 200` outcome via a config
-error. This is consistent with the thread-local cross-contamination theory
-in residual #1: a *stale* `PENDING_TM_TRUST_ROOTS` value (left over from an
-unrelated `TrustManagerFactory.init()` earlier in the same test-class run,
-possibly newly exercised by the `PKIXFactory` fix's added `engineInit`
-registrations) being incorrectly claimed by this test's `SSLContext.init()`,
-making `client_ca` non-empty when it should be `None`. **Not confirmed
-deterministic — needs a dedicated, isolated investigation** before trusting
-this test class's behavior. Recommended starting point: audit
-`set_pending_tm_trust_roots`/`take_pending_tm_trust_roots` and
-`attach_pending_identity_to_ctx` for a scenario where `TrustManagerFactory
-.init()` fires without an immediately-following, corresponding
-`SSLContext.init()` on the same thread (e.g. Tomcat's own config-validation
-code calling `getTrustManagers()` standalone) — the thread-local has no
-expiry/ownership check, so it will attach to whatever `SSLContext.init()`
-happens next.
+**Residual #3 — client-side cipher-suite restriction unfixed.**
+`TesterSupport.ClientSSLSocketFactory.setCipher()`, consumed through
+`SSLSocketFactory.createSocket`/`http_url_connection::perform`, is a separate
+code path from the `SSLEngine`-based cipher restriction fixed previously.
+Not rerun this session (no code touched here).
 
 ## Reproduction
 
-```powershell
-cd C:\craton\CratonVM\apps\tomcat
-$CP = (Get-Content .suite\cp.txt -Raw).Trim()
-$env:CRATONVM_REAL_NET_SOCKETS="1"; $env:CRATONVM_REAL_AQS="1"; $env:CRATONVM_DISABLE_DEFAULT_WATCHDOG="1"
-.\cratonvm.exe -Xmx2g -cp $CP org.junit.runner.JUnitCore org.apache.tomcat.util.net.ocsp.TestOcspEnabled
+```bash
+# On the Azure host (victor@20.83.144.174), or equivalent Linux box with a
+# real JDK (pass --java-home explicitly — see the JDK-detection note below):
+cd /data/data/apps/tomcat  # or wherever the compiled Tomcat test tree + cp.txt live
+CP=$(cat .suite/cp.txt)
+CRATONVM_REAL_NET_SOCKETS=1 CRATONVM_REAL_AQS=1 CRATONVM_DISABLE_DEFAULT_WATCHDOG=1 \
+  ./cratonvm --java-home /path/to/jdk25 -Xmx2g -cp "$CP" \
+  org.junit.runner.JUnitCore org.apache.tomcat.util.net.ocsp.TestOcspEnabled
 # Set CRATONVM_DBG_TLS_AUTH=1 for verbose native-side tracing of the
-# TrustManager-consultation pipeline (t27_tls.rs) added this session.
+# TrustManager-consultation pipeline (t27_tls.rs / x509_manager.rs) — this
+# session added tracing to tmf_engine_init/tmf_engine_get_trust_managers/
+# do_check_trusted/validate_cert_chain, in addition to what already existed.
 ```
+
+**Environment note (unrelated to the TLS bug, but blocks all testing until
+understood):** on a fresh Linux host, if `JAVA_HOME`/`java` aren't visible in
+the *exact* environment the process runs under (common for non-interactive
+SSH commands — an interactive shell's `JAVA_HOME` doesn't propagate),
+`vm/src/config.rs::detect_real_jdk()` silently falls back to CratonVM's
+synthetic-JDK mode, which has a stale 2-field `StringBuilder` layout
+(pre-dating JDK 9 compact strings) — this throws `NoSuchFieldError` on
+*any* JDK9+-compiled invokedynamic string concatenation, even a trivial
+`"a" + "b"`. Always pass `--java-home` explicitly on a host you haven't
+verified. Separately, `sun/nio/ch/FileKey.init` was only registered for the
+Windows-shaped `(FileDescriptor, int[])` overload — a real Unix JDK's
+`FileKey` (confirmed via `javap`) uses `(FileDescriptor, long[2])` filling
+`st_dev`/`st_ino`; this was missing entirely and caused an
+`UnsatisfiedLinkError` on the first `FileChannel.lock()`/`tryLock()` in
+real-JDK mode on Linux (blocked `OcspBaseTest`'s responder lock file).
+Both fixed this session (`native-io/src/file_channel.rs`).
 
 ## Recommendation for follow-up sessions
 
-1. Root-cause and fix the thread-local trust-root cross-contamination
-   (residuals #1 and #4 both point here) — likely the single highest-value
-   remaining fix, as it may explain most of the residual OCSP failures too.
-2. Add a positive-case regression test alongside `TestSecurity2017Ocsp` (a
-   *valid*, non-revoked client cert that must be accepted) to confirm the
-   OCSP mechanism isn't just fail-closed-by-accident.
-3. `TestClientCert`/`TestCustomSslTrustManager`'s issuer-check gap
-   (client-side `KeyManager.chooseClientAlias` never consulted) is a
-   substantial, separate feature — needs its own dedicated session given the
-   mid-handshake re-entrancy/GC-safety considerations.
-4. Client-side cipher-suite restriction (`SSLSocketFactory.createSocket` /
+1. **Implement real OCSP/CRL revocation checking** in
+   `x509_manager::validate_chain` — the highest-value remaining fix, now that
+   trust-anchor resolution itself is correct. `TrustManagerState.enable_crl`
+   already exists as a hook point but is unused; needs an actual OCSP
+   responder HTTP round-trip (or CRL fetch) wired through
+   `PKIXRevocationChecker`'s configured options (`NO_FALLBACK`, soft-fail).
+2. `TestClientCert`/`TestCustomSslTrustManager`'s issuer-check gap
+   (client-side `KeyManager.chooseClientAlias` never consulted) — substantial,
+   separate feature, needs its own dedicated session (mid-handshake
+   re-entrancy/GC-safety).
+3. Client-side cipher-suite restriction (`SSLSocketFactory.createSocket` /
    `http_url_connection::perform`, not the `SSLEngine` path) is unfixed.
+4. If `get_km_id`/`set_km_id` (KeyManager id, `x509_manager.rs`) is ever
+   implicated in a bug report, apply the same identity-hash-side-table fix as
+   `get_tm_id`/`set_tm_id` preemptively — it's presumably the same gap, just
+   not yet hit by a failing test.
