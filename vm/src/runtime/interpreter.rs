@@ -19176,12 +19176,35 @@ fn force_native_over_real_jdk_bytecode(
     // isExported/isOpen above), which returns null only for the true unnamed
     // module and otherwise builds a descriptor backed by the boot
     // `ModuleRegistry`'s parsed `uses`.
+    // `canUse`/`addUses` have the SAME null-descriptor problem as
+    // `getDescriptor` above: their real bytecode reads `this.descriptor`
+    // directly (`return descriptor.isAutomatic() || descriptor.uses()
+    // .contains(sn);` for `canUse`; a similar direct field read for
+    // `addUses`) rather than going through the `getDescriptor()` accessor,
+    // so forcing `getDescriptor` alone does not protect them. A named
+    // Module mirror (`isNamed()` true) whose `descriptor` field is unset
+    // NPEs the moment either method runs -- observed via WildFly Host
+    // Controller's parallel extension loader (`DeferredExtensionContext
+    // .load()`): loading `org.jboss.as.jmx` (which depends on the real
+    // platform module `java.management`) reaches JDK-internal module
+    // helper code that calls `Module.canUse`/`addUses` on a Module the VM
+    // handed out without a populated descriptor, surfacing as
+    // `NullPointerException: Cannot invoke "ModuleDescriptor.isAutomatic()"
+    // because "this.descriptor" is null` wrapped in an `ExecutionException`
+    // from the extension loader's `Future.get()`, which
+    // `ControllerLogger.failedToLoadModule` re-reports as `WFLYCTL0083:
+    // Failed to load module org.jboss.as.jmx`. `canUse` already had a
+    // registered native (S109 Wave3, `native-builtins::lib`) that was never
+    // added here, so it was silently shadowed by the real bytecode in
+    // real-JDK mode; `addUses` had no native at all until this fix.
     if class_name == "java/lang/Module"
         && matches!(
             method_name,
             "isExported"
                 | "isOpen"
                 | "getDescriptor"
+                | "canUse"
+                | "addUses"
                 | "addExports"
                 | "addOpens"
                 | "implAddExports"

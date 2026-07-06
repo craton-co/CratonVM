@@ -11916,8 +11916,19 @@ pub fn register_essential_natives(registry: &mut NativeMethodRegistry) {
     // during `Console.instantiateConsole()` static-init. The override
     // returns true (every module is treated as permissively
     // `uses`-declared); null-receiver returns false; null service-class
-    // throws NPE per spec. Registered universally so both real-JDK and
-    // synthetic-jdk modes are protected — see vm/tests/wave3_console_module.rs.
+    // throws NPE per spec.
+    //
+    // This registration alone does NOT protect real-JDK mode: real bytecode
+    // wins over a registered native unless the triple is also listed in
+    // `interpreter.rs::force_native_over_real_jdk_bytecode`, and `canUse` was
+    // missing from that list until the WildFly Host Controller
+    // `org.jboss.as.jmx` module-load NPE investigation added it alongside
+    // `addUses` below (see that function's doc comment for the full trace:
+    // `DeferredExtensionContext.load()` -> JDK-internal module helper code ->
+    // `Module.canUse`/`addUses` on a named Module mirror with a null
+    // `descriptor` field -> `NullPointerException: ... "this.descriptor" is
+    // null`). Synthetic-jdk mode has no competing real bytecode, so this
+    // native always took effect there — see vm/tests/wave3_console_module.rs.
     registry.register(
         "java/lang/Module",
         "canUse",
@@ -11931,6 +11942,40 @@ pub fn register_essential_natives(registry: &mut NativeMethodRegistry) {
                 Some(Value::Object(Some(_))) => Ok(Some(Value::Int(1))),
                 _ => Err(cratonvm_types::error::RuntimeError::NullPointerException {
                     message: Some("Module.canUse: service class is null".into()),
+                }
+                .into()),
+            }
+        },
+    );
+
+    // `java/lang/Module.addUses(Class)` — companion to `canUse` above, same
+    // null-descriptor gap (real bytecode reads `this.descriptor` to decide
+    // whether the module already implicitly "uses" everything as an
+    // automatic module before recording an explicit service-use edge).
+    // CratonVM does not enforce `uses`/`provides` reachability beyond what
+    // `canUse`/`getDescriptor` already answer permissively, so this is a
+    // pure identity passthrough: validate the service-class argument (per
+    // spec, NPEs on null) and hand back the receiver unchanged for
+    // chaining. Force-listed alongside `canUse` in
+    // `interpreter.rs::force_native_over_real_jdk_bytecode`.
+    registry.register(
+        "java/lang/Module",
+        "addUses",
+        "(Ljava/lang/Class;)Ljava/lang/Module;",
+        |_ctx, args| {
+            let this = match args.first() {
+                Some(Value::Object(Some(m))) => *m,
+                _ => {
+                    return Err(cratonvm_types::error::RuntimeError::NullPointerException {
+                        message: Some("Module.addUses: receiver is null".into()),
+                    }
+                    .into())
+                }
+            };
+            match args.get(1) {
+                Some(Value::Object(Some(_))) => Ok(Some(Value::Object(Some(this)))),
+                _ => Err(cratonvm_types::error::RuntimeError::NullPointerException {
+                    message: Some("Module.addUses: service class is null".into()),
                 }
                 .into()),
             }

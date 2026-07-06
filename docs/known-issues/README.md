@@ -4,6 +4,10 @@ This folder collects CratonVM-only defects found while running upstream Java
 suites. The docs had grown to describe the **same underlying bug from several
 angles**; this index is the consolidated map. Read it first.
 
+## 2026-07-06 WildFly Host Controller org.jboss.as.jmx module-load NPE
+
+- [wildfly-module-descriptor-null-host-controller.md](wildfly-module-descriptor-null-host-controller.md) — root-cause mechanism fixed: `Module.canUse`/`addUses` read `this.descriptor` directly in real bytecode and were missing from `force_native_over_real_jdk_bytecode`, so a registered-but-shadowed native never protected real-JDK mode against a named Module with an unset `descriptor` field. Verified with a standalone repro; live re-confirmation via `HostExcludesTestCase` blocked by the same MSC real-start gap referenced below.
+
 ## 2026-07-06 WildFly domain-mode corrupt-Value-cell root cause + MSC real-start gate
 
 - [wildfly-domain-heap-corrupt-value-timeout.md](wildfly-domain-heap-corrupt-value-timeout.md) — root-caused: the repeated `gen_heap::read_slot: corrupt Value cell` guard hit during domain-mode boot is the plain-field 16-byte `Value`-slot tearing bug, fixed on `dev` by `2dfdfddc`/`5198fccd` (landed the day after this doc's evidence). Live re-confirmation is blocked by a deeper, separately-tracked gap (below); see the doc for the full analysis and the pre/post-fix code diff.
