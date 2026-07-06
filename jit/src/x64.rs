@@ -14185,6 +14185,23 @@ impl Compiler {
                     cpc += 3;
                 }
 
+                // invokespecial (0xb7) — ONLY resolver-proven no-op super
+                // constructor calls (`site.elided_invoke_pcs`): the target is
+                // `java/lang/Object.<init>()V` (or an elidable trivial chain
+                // to it), so the call has no observable effect. Pop the
+                // receiver the preceding `aload_0` pushed — a compile-time
+                // stack-model adjustment, no machine code — and continue.
+                // This is what admits CONSTRUCTOR bodies to inlining. Any
+                // other invokespecial bails to the dispatch fallback.
+                0xb7 => {
+                    if cpc + 2 >= callee_len || !site.elided_invoke_pcs.contains(&cpc) {
+                        self.next_spill_offset = callee_local_base;
+                        return false;
+                    }
+                    let _ = self.pop_stack();
+                    cpc += 3;
+                }
+
                 // Unsupported opcode in inline context — bail out
                 _ => {
                     // Restore spill offset and return false to fall back to a call
@@ -34491,7 +34508,83 @@ mod tests {
             class_name: "Test".to_string(),
             method_name: "inlined".to_string(),
             descriptor: "()I".to_string(),
+            elided_invoke_pcs: Vec::new(),
         }
+    }
+
+    #[test]
+    fn s31_inline_ctor_with_elided_super_call() {
+        // Constructor-shaped callee: `void <init>() { super(); }` —
+        //   aload_0 (0x2a); invokespecial #2 (0xb7, pc=1, ELIDED); return (0xb1)
+        // Caller: `int f(ref obj) { obj.<init>(); return 5; }` —
+        //   aload_0; invokespecial #1 (pc=1, inline site); iconst_5; ireturn
+        //
+        // Self-proving: with the elided-super-call support the site inlines
+        // to nothing (pop the receiver, no code) and f returns 5. Without it,
+        // try_emit_inline bails and the site falls back to the dispatch
+        // helper — which in these tests is the panicking stub, so try_call
+        // would abort.
+        let caller_code: Vec<u8> = vec![
+            0x2a, // 0: aload_0
+            0xb7, 0x00, 0x01, // 1: invokespecial #1
+            0x08, // 4: iconst_5
+            0xac, // 5: ireturn
+            0, 0, // padding
+        ];
+        let caller_len = 6;
+
+        let mut callee = make_inline_site(
+            &[0x2a, 0xb7, 0x00, 0x02, 0xb1], // aload_0; invokespecial #2; return
+            1,     // max_locals (receiver)
+            1,     // num_args (receiver)
+            false, // instance method
+            b'V',  // void return
+        );
+        callee.elided_invoke_pcs = vec![1];
+
+        let mut sites = HashMap::new();
+        sites.insert(1, callee);
+
+        let compiled = compile_with_inlines(&caller_code, caller_len, 1, 1, sites)
+            .expect("ctor-shaped callee with elided super call must compile");
+
+        // SAFETY: Calling JIT-compiled machine code in a test; the CompiledMethod was
+        // produced by the JIT compiler from valid bytecode and the mmap region is executable.
+        unsafe {
+            assert_eq!(compiled.try_call(&[0x1000]).expect("test JIT call"), 5);
+        }
+    }
+
+    #[test]
+    fn s31_inline_ctor_non_elided_super_call_bails_cleanly() {
+        // Same shape but the invokespecial pc is NOT in elided_invoke_pcs:
+        // try_emit_inline must bail (rollback) without corrupting the
+        // compile. The site then needs a dispatch fallback which this
+        // harness does not provide — we only assert the compiler survives
+        // (Some or None both acceptable shapes at this layer, but it must
+        // not panic and must not emit the inline body).
+        let caller_code: Vec<u8> = vec![
+            0x2a, // 0: aload_0
+            0xb7, 0x00, 0x01, // 1: invokespecial #1
+            0x08, // 4: iconst_5
+            0xac, // 5: ireturn
+            0, 0,
+        ];
+        let caller_len = 6;
+
+        let callee = make_inline_site(
+            &[0x2a, 0xb7, 0x00, 0x02, 0xb1],
+            1,
+            1,
+            false,
+            b'V',
+        );
+        // elided_invoke_pcs deliberately empty.
+
+        let mut sites = HashMap::new();
+        sites.insert(1, callee);
+
+        let _ = compile_with_inlines(&caller_code, caller_len, 1, 1, sites);
     }
 
     #[test]

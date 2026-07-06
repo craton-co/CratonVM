@@ -25207,6 +25207,15 @@ fn resolve_inline_site(
     // getstatic" — but excluding them is the safe conservative fix until it is
     // isolated. `CRATONVM_INLINE_ALLOW_STATIC=1` re-enables them for debugging.
     let inline_no_static = !crate::runtime::env_cache::inline_allow_static();
+    // invokespecial sites deferred for elidability validation once the
+    // callee's constant pool is available below: (callee_pc, cp_idx). Only
+    // no-op super-constructor calls (`java/lang/Object.<init>()V` directly,
+    // or a target passing `is_elidable_construction`) survive — anything
+    // else rejects the whole site. This is what admits CONSTRUCTOR bodies
+    // (which always begin `aload_0; invokespecial super.<init>`) to
+    // inlining; the blanket 0xb7 rejection made every ctor un-inlineable,
+    // so each `new C(args)` paid a full dispatch round trip per allocation.
+    let mut special_sites: Vec<(usize, u16)> = Vec::new();
     while scan_pc < code_len {
         match code[scan_pc] {
             0xaa | 0xab => return None,        // tableswitch, lookupswitch
@@ -25215,7 +25224,18 @@ fn resolve_inline_site(
             0xc0 | 0xc1 => return None,        // checkcast, instanceof
             0xc2 | 0xc3 => return None,        // monitorenter, monitorexit
             0xb6 | 0xb9 => return None,        // invokevirtual, invokeinterface
-            0xb7 | 0xb8 => return None,        // invokespecial, invokestatic
+            0xb8 => return None,               // invokestatic
+            0xb7 => {
+                // invokespecial — defer: elidable no-op super-ctor calls are
+                // allowed (validated below), everything else rejects.
+                if scan_pc + 2 >= code_len {
+                    return None;
+                }
+                let cp_idx = ((code[scan_pc + 1] as u16) << 8) | code[scan_pc + 2] as u16; // Cast: bytecode operand decoding
+                special_sites.push((scan_pc, cp_idx));
+                scan_pc += 3;
+                continue;
+            }
             0xba => return None,               // invokedynamic
             // Array loads/stores + arraylength need a bounds check (and AIOOBE
             // path) that the inline codegen (`x64::try_emit_inline_body`) does
@@ -25265,6 +25285,44 @@ fn resolve_inline_site(
     }
 
     let callee_class_info = cm.get_class(declaring_id)?;
+
+    // Validate the deferred invokespecial sites: every one must be a
+    // resolver-PROVEN no-op super-constructor call, or the whole callee is
+    // rejected. Proven means the target is `java/lang/Object.<init>()V`
+    // directly, or a `<init>()V` whose body is exactly
+    // `aload_0; invokespecial Object.<init>; return`
+    // (`is_elidable_construction` — the same predicate the elidable-ctor
+    // call-site rewrite uses). The surviving PCs are recorded so the inline
+    // body emitter pops the receiver and emits nothing at those sites.
+    let mut elided_invoke_pcs: Vec<usize> = Vec::new();
+    for &(spc, cp_idx) in &special_sites {
+        let (ref_class_idx, nat_idx) = match callee_class_info.constant_pool.get(cp_idx) {
+            Some(ConstantPoolEntry::MethodReference {
+                class_index,
+                name_and_type_index,
+                ..
+            }) => (*class_index, *name_and_type_index),
+            _ => return None,
+        };
+        let target_class = callee_class_info
+            .constant_pool
+            .get_class_name(ref_class_idx)?;
+        let (target_name, target_desc) =
+            callee_class_info.constant_pool.get_name_and_type(nat_idx)?;
+        if target_name != "<init>" || target_desc != "()V" {
+            return None;
+        }
+        let elidable = target_class == "java/lang/Object" || {
+            match cm.find_class_by_name(target_class) {
+                Some(tid) => is_elidable_construction(&cm, tid),
+                None => false,
+            }
+        };
+        if !elidable {
+            return None;
+        }
+        elided_invoke_pcs.push(spc);
+    }
 
     // Lock-order discipline (audit follow-up to the H2 ABBA fix): collect
     // the constant-pool facts for field ops HERE (they borrow `cm`), but
@@ -25416,6 +25474,7 @@ fn resolve_inline_site(
         class_name: callee_class.to_string(),
         method_name: callee_method.to_string(),
         descriptor: callee_desc.to_string(),
+        elided_invoke_pcs,
     })
 }
 

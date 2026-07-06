@@ -6417,7 +6417,7 @@ impl GenerationalHeap {
     /// each reclaiming nothing). Falling back to the free list here lets the
     /// allocation proceed from reclaimed space without a spurious GC.
     pub fn try_alloc_young_probe(&self, size: usize) -> Option<()> {
-        let from = self.young_from.lock();
+        let mut from = self.young_from.lock();
         // Bump tail.
         if let Some(aligned) = from.used().checked_add(7).map(|v| v & !7) {
             if let Some(end) = aligned.checked_add(size) {
@@ -6428,7 +6428,11 @@ impl GenerationalHeap {
         }
         // Reclaimed free-list space (only reached when the bump tail can't
         // satisfy the request — keeps the common path a single cursor compare).
-        if from.largest_free_block() >= size {
+        // `has_free_block_at_least` early-exits at the first satisfying block
+        // and answers repeated too-large requests in O(1) via the cached
+        // upper bound — the former `largest_free_block()` full scan here ran
+        // once per JIT slow-path allocation (~7% of binarytrees-18).
+        if from.has_free_block_at_least(size) {
             Some(())
         } else {
             None

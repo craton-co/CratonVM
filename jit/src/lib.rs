@@ -2403,6 +2403,18 @@ pub struct InlineSite {
     pub method_name: String,
     /// Descriptor of the inlined callee.
     pub descriptor: String,
+    /// Callee PCs of `invokespecial` instructions the resolver PROVED are
+    /// no-ops and may be elided: calls to `java/lang/Object.<init>()V` or to
+    /// a super constructor whose body is exactly
+    /// `aload_0; invokespecial Object.<init>; return` (the
+    /// `is_elidable_construction` predicate). This is what makes CONSTRUCTOR
+    /// bodies inlineable — every ctor starts with such a super call, which
+    /// historically caused a blanket 0xb7 rejection in the inline resolver,
+    /// so no constructor could ever inline and every `new C(args)` paid a
+    /// full `jit_invoke_dispatch` round trip per allocation. The inline body
+    /// emitter pops the receiver the preceding `aload_0` pushed and emits
+    /// NOTHING for these PCs; any 0xb7 NOT in this list still bails.
+    pub elided_invoke_pcs: Vec<usize>,
 }
 
 /// Compile-time resolved field layout of `java/lang/String`, for the
