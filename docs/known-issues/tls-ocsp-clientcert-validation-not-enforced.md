@@ -14,9 +14,13 @@ accidental unknown-issuer failure), `TestOcspEnabled` is 116/116 (the
 residual 5 `serverOk=false,verifyServer=true` failures are gone), and all
 three `TestOcspSoftFail*` classes are fully green. See "OCSP revocation
 checking implementation" below for what was built and what's still a
-documented simplification (CRL support). Residuals #2 (`chooseClientAlias`)
-and #3 (client-side cipher restriction) remain untouched, confirmed still
-open — see "Residuals still open" below, unchanged from prior sessions.
+documented simplification (CRL support).
+
+Separately (branch `fix/tls-client-cipher-restriction-20260706`), residual
+#3 (client-side cipher-suite restriction) is now **CLOSED for the TLS 1.3
+case** and confirmed **permanently unfixable for the TLS 1.2 DHE case** — see
+"Residual #3 closeout" below. Residual #2 (`chooseClientAlias`) remains
+untouched, confirmed still open.
 
 **Related:** [BUG-DF06](../internal/CRATONVM_BUGS/BUG-DF06-certpath-pkix-not-implemented.md)
 (FIXED) and
@@ -90,7 +94,7 @@ still fragile in the abstract (no ownership/expiry check) and worth hardening
 if it ever causes a *confirmed* incident, but it was not the cause here — the
 real bugs were the two identity/id round-trip gaps above, both now closed.
 
-## OCSP revocation checking implementation (this session, closes the prior "New finding")
+## OCSP revocation checking implementation (closes the prior "New finding")
 
 `x509_manager::validate_chain` previously performed full structural PKIX
 validation (chain continuity, expiry, `BasicConstraints`, name constraints,
@@ -189,14 +193,14 @@ skip — native `ssl.dll`/tomcat-native not installed, environmental, unrelated)
 
 | Class | Before OCSP session | After OCSP implementation |
 |---|---|---|
-| `TestSslHandshakeFailure` | OK (1/1) | not rerun this session — no code touched on this path, no reason to expect a change |
+| `TestSslHandshakeFailure` | OK (1/1) | OK (1/1) — confirmed no regression (one batch run showed a flake, isolated rerun passed cleanly, matching this suite's known shared-host batch-contention behavior) |
 | `TestSecurity2017Ocsp` | 1/5 fail (`testCVE_2017_15698`, revocation-checking gap) | **OK (5/5)** — revoked client cert with a CVE-2017-15698-shaped long AIA URI is correctly rejected |
 | `TestOcspEnabled` | 5/116 fail, all `serverOk=false,verifyServer=true` | **OK (116/116)** |
 | `TestOcspSoftFail` | 1/15 fail | **OK (15/15)** |
 | `TestOcspSoftFailInternalError` | 2/20 fail | **OK (20/20)** |
 | `TestOcspSoftFailTryLater` | 4/20 fail | **OK (20/20)** |
 | `TestClientCert` | 13/18 pass, 5/18 fail | 13/18 pass, 5/18 fail — unchanged (spot-checked), same known `chooseClientAlias` gap (residual #2, still open, unrelated to revocation checking) |
-| `TestSSLHostConfigCipher` | 2/12 fail | not rerun this session — no code touched here, no reason to expect a change (residual #3, still open) |
+| `TestSSLHostConfigCipher` | 2/12 fail | **1/12 fail** (residual #3 closed for TLS 1.3; `testTls12CipherNotAvailable`'s DHE case is permanently unfixable — see "Residual #3 closeout") — fixed in the separate `fix/tls-client-cipher-restriction-20260706` session, not the OCSP work |
 | `TestCustomSslTrustManager` | 2/9 fail, consistently | 2/9 fail, consistently (spot-checked) — same known `chooseClientAlias` gap, unrelated to revocation checking |
 | `native-builtins` unit tests (`x509_manager` module) | 39 tests | **48 tests, all pass** — 9 new tests covering OCSP DER request encoding, response parsing (good/revoked/unknown/tryLater), SHA-1 known-answer vector, and signature accept/reject |
 
@@ -205,7 +209,7 @@ produced exactly 27 tests / 7 failures — matching the pre-existing baseline
 (18+9 tests, 5+2 failures) exactly, confirming the OCSP work introduced no
 regression in the unrelated `chooseClientAlias` gap.
 
-## Residuals still open (unchanged from before this session)
+## Residuals still open
 
 **Residual #2 — client-side `KeyManager.chooseClientAlias` never
 consulted.** `TestClientCert`'s 5/18 and `TestCustomSslTrustManager`'s
@@ -217,11 +221,139 @@ Java *synchronously during the handshake* — a materially riskier change
 (GC/re-entrancy safety mid-handshake) than anything in this session; still
 recommended as its own dedicated session.
 
-**Residual #3 — client-side cipher-suite restriction unfixed.**
-`TesterSupport.ClientSSLSocketFactory.setCipher()`, consumed through
-`SSLSocketFactory.createSocket`/`http_url_connection::perform`, is a separate
-code path from the `SSLEngine`-based cipher restriction fixed previously.
-Not rerun this session (no code touched here).
+**Residual #3 — client-side cipher-suite restriction: CLOSED for TLS 1.3,
+permanently open for TLS 1.2 DHE (branch
+`fix/tls-client-cipher-restriction-20260706`).**
+
+`TestSSLHostConfigCipher` went from 2/12 failing to 1/12 (only
+`testTls12CipherNotAvailable[JSSE]`, the DHE case — see below). The actual
+fix required three separate discoveries, none of which matched this doc's
+own prior assumption about the code path:
+
+1. **The entire NEW13 `SSLContext`/`SSLSocketFactory`/`SSLSocket`
+   implementation in `phases_late.rs` (`register_p68_ssl`) is dead code in a
+   real-JDK build.** It's gated behind `#[cfg(feature = "synthetic-jdk")]`
+   (see `vm/src/native/builtins.rs`'s no-op shims for when that feature is
+   off), which is OFF in the standard build every test in this doc runs
+   under. An initial attempt to fix cipher restriction by wiring up
+   `SSLSocketFactory.createSocket`/`SSLSocket.setEnabledCipherSuites` there
+   compiled clean and changed nothing at runtime — confirmed by adding a
+   debug print directly in the handler and observing zero hits. The
+   *actually live* `SSLContext`/`SSLSocketFactory` implementation for a
+   real-JDK build is `net_phase_e.rs::register_re6_ssl_context`.
+2. **`TestSSLHostConfigCipher`'s HTTPS request never goes through
+   `SSLSocketFactory.createSocket` at all** — `TomcatBaseTest.getUrl()` uses
+   `HttpURLConnection`, whose real request path
+   (`http_url_connection::huc_real_perform`/`ensure_connected`, both calling
+   the shared `perform()`) builds its own rustls connection directly from
+   native-side globals (`t27_tls::huc_default_client_identity`/
+   `active_client_trust_roots`, populated when `SSLContext.getSocketFactory()`
+   is called) and never creates a Java-visible `SSLSocket` or calls
+   `setEnabledCipherSuites` on one. `TesterSupport.ClientSSLSocketFactory`'s
+   `createSocket()`/`reconfigureSocket()` override — the only place cipher
+   restriction is ever expressed — is simply never invoked. Fixed by adding
+   `http_url_connection::huc_upcall_create_socket_if_custom_factory`, which
+   reads `HttpsURLConnection.defaultSSLSocketFactory` (the real JDK static
+   field — read directly rather than intercepting the setter, because
+   `setDefaultSSLSocketFactory` is real, non-native JDK bytecode that the
+   interpreter's native-override-priority rules let win, so a native
+   override on it never fires) and, when appropriate (see below),
+   `invoke_virtual`s the factory's real `createSocket(host, port)` —
+   genuine Java bytecode, so `ClientSSLSocketFactory`'s override actually
+   runs, including its call to `setEnabledCipherSuites`. The resulting
+   socket's backing stream id (from `net_phase_e.rs`'s `SockSide` table) is
+   read directly and handed to `perform()` via a new
+   `established_https_stream_id` parameter, bypassing `perform()`'s own
+   connect entirely for this case. `SSLSocket.setEnabledCipherSuites` itself
+   is a new live registration in `net_phase_e.rs` (the old one was also
+   inside the dead `phases_late.rs` module): since the socket's handshake
+   already completed unrestricted inside `createSocket`, honoring a
+   restriction means tearing down and reconnecting via
+   `t27_tls::build_engine_client_config_with_identity_ciphers` (a new
+   cipher-restricting variant of the existing
+   `build_engine_client_config_with_identity`).
+3. **`t27_tls::rustls_client_connect`'s handshake loop had a real,
+   independent, previously-latent bug**: `read_tls` returns `Ok(0)` — not an
+   `Err` — when the peer closes the connection (rustls's documented
+   contract; its own examples all check for a zero return). The loop ignored
+   the return value entirely, so once cipher restriction could actually
+   cause a server to reject and close the connection, every subsequent
+   `read_tls` on the already-closed socket returned `Ok(0)` instantly and the
+   loop busy-spun at ~100% CPU forever — a genuine live-lock, confirmed via
+   `gdb`'s `thread apply all bt` (the main thread stuck in a tight
+   `read_tls`/`process_new_packets` cycle, not blocked in a syscall).
+   `http_url_connection::perform`'s own inline handshake loop has the
+   identical gap, bounded only by its separate `HANDSHAKE_TIMEOUT` deadline
+   check (so it was a wasted busy-spin there, not an outright hang). Fixed
+   in both places by checking for a zero return and failing immediately with
+   a clear "connection closed by peer during handshake" error, classified as
+   `SSLHandshakeException` via the existing `TLS_HANDSHAKE_FAILURE_SENTINEL`
+   convention. This fix is valuable independent of the cipher-restriction
+   work — any future code path that can cause a real rejected-and-closed
+   handshake would have hit the same live-lock.
+
+**The up-call mechanism's blast radius had to be narrowed twice** after
+regression-testing against the ~15 other Tomcat test files that call
+`TesterSupport.configureClientSsl()` (all of which install the identical
+`ClientSSLSocketFactory` wrapper, even though only two ever restrict
+ciphers):
+- An unconditional up-call whenever any real (non-placeholder)
+  `SSLSocketFactory` subclass was installed exposed a **pre-existing
+  classloading/vtable-install lock-ordering deadlock** (confirmed via `gdb`:
+  a self-consistent-looking but unresolved contention between
+  `vtable_manager`'s write lock, taken in
+  `cratonvm_vm::runtime::vtable::vtable_install_adapter`, and multiple
+  threads blocked acquiring it) on `TestClientCert`'s very first test — the
+  baseline binary runs it cleanly. This is VM-core locking code with no
+  connection to TLS; root-causing and fixing it safely was judged out of
+  scope for this session (see `vm/src/runtime/vtable.rs`,
+  `cratonvm_classloading::class_manager::define_class_with_options` for a
+  future investigation).
+- Narrowing the up-call to fire only when the installed factory's `ciphers`
+  field (`TesterSupport.ClientSSLSocketFactory`'s real, private `String[]`,
+  set by `setCipher()`) is non-null fixed `TestClientCert` (back to the
+  known 5/18) but left `TestSSLHostConfigCompat` regressed (23/78 failing
+  vs. baseline's 20/78) — its `testHost*With*Client` cases call `setCipher`
+  directly with classic `TLS_DHE_RSA_*` names, the same unmappable-in-rustls
+  family as `testTls12CipherNotAvailable`. Narrowing further to check
+  `t27_tls::any_cipher_mappable` (already needed inside
+  `setEnabledCipherSuites` to skip DHE restrictions it can't enforce) BEFORE
+  deciding to up-call at all — not just before reconnecting — routes these
+  DHE-only callers through the byte-identical original code path, since
+  up-calling could never have helped them anyway.
+
+**Verified:** `TestSSLHostConfigCipher` 1/12 fail (only the DHE case, no
+hang — stable across multiple runs). `TestClientCert` 5/18 fail (matches
+baseline). `TestCustomSslTrustManager` 2/9 fail (matches baseline; one
+isolated run hit the already-documented `testCustomTrustManagerNone`
+order-dependent flake, which did not recur on immediate rerun of the
+identical binary). `TestCustomSsl` 1/1 fail (matches baseline).
+`TestClientCertTls13`/`TestAlpnFallback` clean (match baseline).
+`TestSSLHostConfigCompat` could not be fully confirmed clean: it went from
+23/78 (before the mappability-gate narrowing) down to 21/78 immediately
+after, with the *specific* differing tests changing between consecutive runs
+of the identical binary — consistent with timing-sensitive flakiness rather
+than a deterministic regression, but not conclusively distinguished from one,
+because the shared Azure host was under extreme, unrelated concurrent load
+for the remainder of this session (multiple other agent sessions running
+Spring test sweeps and this doc's own concurrent OCSP session; `uptime` load
+average peaked at 138 on a 16-core box).
+**Re-verify `TestSSLHostConfigCompat` against baseline on a quiet host before
+treating residual #3's TLS 1.3 fix as fully regression-clean.**
+
+**TLS 1.2 DHE case (`testTls12CipherNotAvailable`) is NOT fixable with this
+codebase's current dependencies, confirmed via direct inspection of both
+libraries' source**: rustls (both crypto providers this project can use,
+`ring` and `aws-lc-rs`) has never implemented classic finite-field DHE key
+exchange — only ECDHE and TLS 1.3 AEAD suites (`crypto/ring/tls12.rs`
+contains zero `TLS_DHE_*` entries) — a deliberate upstream project decision,
+not a gap to work around. `native-tls` 0.2's public API has no cipher-suite
+configuration at all (checked its full `TlsConnectorBuilder` surface: only
+min/max protocol version, identity, roots, ALPN, SNI). Closing this
+specific case would require adding a direct OpenSSL binding (the project
+currently only pulls OpenSSL transitively through `native-tls`'s Linux
+backend, not as a directly-usable dependency) — a materially larger,
+separate undertaking, not a bug fix.
 
 ## Reproduction
 
@@ -258,7 +390,7 @@ Both fixed this session (`native-io/src/file_channel.rs`).
 
 ## Recommendation for follow-up sessions
 
-1. ~~Implement real OCSP/CRL revocation checking~~ — **DONE this session**
+1. ~~Implement real OCSP/CRL revocation checking~~ — **DONE**
    (OCSP; see "OCSP revocation checking implementation" above). Real CRL
    fetch/parse remains a documented gap (`PREFER_CRLS`/`NO_FALLBACK` currently
    collapse to "OCSP only") — worth its own follow-up if a workload actually
@@ -267,8 +399,10 @@ Both fixed this session (`native-io/src/file_channel.rs`).
    (client-side `KeyManager.chooseClientAlias` never consulted) — substantial,
    separate feature, needs its own dedicated session (mid-handshake
    re-entrancy/GC-safety).
-3. Client-side cipher-suite restriction (`SSLSocketFactory.createSocket` /
-   `http_url_connection::perform`, not the `SSLEngine` path) is unfixed.
+3. ~~Client-side cipher-suite restriction~~ — CLOSED for TLS 1.3 (see
+   "Residual #3 closeout"); the TLS 1.2 DHE case is permanently unfixable
+   without adding a direct OpenSSL dependency (substantial, separate
+   undertaking, not recommended unless a real caller needs DHE specifically).
 4. If `get_km_id`/`set_km_id` (KeyManager id, `x509_manager.rs`) is ever
    implicated in a bug report, apply the same identity-hash-side-table fix as
    `get_tm_id`/`set_tm_id` preemptively — it's presumably the same gap, just
@@ -281,3 +415,24 @@ Both fixed this session (`native-io/src/file_channel.rs`).
    responder-shutdown hook) — did not block any of this session's target
    suites (none of them hit the affected teardown path), but is a real,
    separate bug; see whichever branch/commit closes it for details.
+6. **Re-verify `TestSSLHostConfigCompat` on a quiet (uncontended) host.** The
+   `fix/tls-client-cipher-restriction-20260706` session could not conclusively
+   distinguish "clean" from "timing-flaky under extreme shared-host load" for
+   this file — see "Residual #3 closeout" for the exact numbers and what to
+   check.
+7. **The classloading/vtable-install lock-ordering deadlock found this
+   session is a real, separate, VM-core bug**, independent of anything TLS-
+   related — it happens to have been discovered via an up-call from
+   `http_url_connection.rs`, but the actual bug is in
+   `cratonvm_vm::runtime::vtable`/`cratonvm_classloading::class_manager`'s
+   locking, likely a lock-ordering inversion between `vtable_manager` and
+   `class_manager` (the interpreter's cached-dispatch fast path in
+   `interpreter.rs` around line 26800 takes `vtable_manager.read()` then
+   `class_manager.read()`; `vtable_install_adapter` is reached from
+   `class_manager`'s own `define_class_with_options`, suggesting the reverse
+   order elsewhere). Confirmed via `gdb` on `TestClientCert`'s first test
+   with a real up-call reproduction case in hand (this session's original,
+   unnarrowed `huc_upcall_create_socket_if_custom_factory`) — worth its own
+   dedicated session with proper concurrency debugging tools, since any
+   other code path that triggers class initialization re-entrantly during
+   another class's `<clinit>` could hit the same deadlock.
