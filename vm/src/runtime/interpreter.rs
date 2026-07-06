@@ -26859,10 +26859,28 @@ fn execute_invokevirtual_vtable_fast(
             Some(c) => Arc::clone(c),
             None => return Ok(CachedCallResult::CacheMiss),
         };
+        let declaring_class_id = entry.declaring_class_id;
+        let is_native = entry.is_native;
+        // Lock-order fix: drop the `vtable_manager` read guard BEFORE
+        // taking `class_manager` below. `vtable_install_adapter` (called
+        // from `ClassManager::define_class_with_options` while defining a
+        // class) takes the locks in the OPPOSITE order - class_manager
+        // (held for the whole definition) then vtable_manager (to install
+        // the new vtable). Holding both here in vtable-then-class order
+        // was a real AB-BA deadlock under concurrent class loading +
+        // virtual dispatch (confirmed live via gdb: a class-loading
+        // thread blocked acquiring vtable_manager for write while holding
+        // class_manager for write, and a dispatching thread blocked here
+        // acquiring class_manager for read while holding vtable_manager
+        // for read). `resolve_virtual_slot`'s own doc/test
+        // (`vm.rs` vtable fast-path test) already establishes the
+        // invariant that the vtable must be queryable WITHOUT holding
+        // class_manager - this restores it.
+        drop(guard);
         let declaring_name = shared
             .class_manager
             .read()
-            .get_class(cratonvm_types::ClassId::new(entry.declaring_class_id as u32))
+            .get_class(cratonvm_types::ClassId::new(declaring_class_id as u32))
             .map(|c| c.name.to_string())
             .unwrap_or_else(|| cached.class_name.to_string());
         if force_native_over_real_jdk_bytecode(
@@ -26876,7 +26894,7 @@ fn execute_invokevirtual_vtable_fast(
         {
             return Ok(CachedCallResult::CacheMiss);
         }
-        (cached, entry.is_native)
+        (cached, is_native)
     };
     let _ = entry_is_native; // silence unused
 
