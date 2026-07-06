@@ -243,18 +243,20 @@ initialization gap was fixed 2026-07-02), grouped as:
       "Unexpected failure during bean definition parsing", "Unnamed bean definition", spring-jdbc
       mass-TIMEOUT, scheduler `StringIndexOutOfBounds`, and `DataBufferUtilsTests` TIMEOUT
       (heavy-reactive). (The prior `springsuite-0619-open-candidates.md` link was already dangling.)
-15. **[GC: moving-collector lost-tag missed root](gc-moving-interpreter-lost-tag-missed-root.md)** — 🔴 **OPEN**
-    (benign in practice). Under `-Xmx1g` GC pressure the **moving** young collector zeroes a live object
-    whose only reference is a frame slot tagged non-`Object` at the marking snapshot ("all-zero header" /
-    `Stale pointer … StringBuilder.flush`). Localized **deterministically** to `RandomizedRunner.invoke
-    local[3]` by a new gated `CRATONVM_GC_VERIFY_STALE` per-parked-thread verifier. Same *class* as the
-    Family-A "lost-tag interpreter local" (A4) but on the `--nojit` moving path.
+15. **[GC: moving-collector lost-tag missed root](../internal/gc-moving-interpreter-lost-tag-missed-root.md)** —
+    ✅ **FIXED on dev** (`0abb64ba`, 2026-07-01; doc already archived under `docs/internal/`). The **moving**
+    young collector zeroed a live object whose only reference was a frame slot tagged non-`Object` at the
+    marking snapshot. Fixed in `Frame::scan_local_objects`/`update_local_refs`: non-object-tagged locals are
+    probed via `lost_tag_local_candidates` + the strict `is_object_address` header check, then rooted and
+    remapped. Unit-tested (`scan_local_objects_roots_lost_tag_other_local`,
+    `update_local_refs_remaps_lost_tag_other_local`); the `CRATONVM_GC_VERIFY_STALE` verifier is retained.
 16. **[GC: rs_cache-presence reactor-shutdown timing race](gc-rscache-reactor-shutdown-timing-race.md)** —
-    🔴 **OPEN** (workaround validated). The ES RestClient reactor-worker `ThreadLeakError` at
-    `restClient.close()`: GC-frequency-driven and `rs_cache`-PRESENCE-triggered (a latent
-    GC-STW-vs-reactor-shutdown race exposed by snapshot timing), **NOT** a socket/OP_WRITE bug and **NOT** an
-    rs_cache correctness bug. Reliably avoided by `CRATONVM_ROOTSNAP_CACHE=0` (suite-level — do NOT flip the
-    global default). Supersedes the former `reactor-worker-thread-leak-at-shutdown.md` (removed — see git history).
+    🟢 **FIX LANDED on dev** (`323a3ba6`, 2026-07-01: thread exit serialized against STW —
+    `request_stw_counted` computes `alive_count` under the barrier lock, blocked→dead transition is atomic,
+    thread teardown uses a stable inflated `Arc<Monitor>`; unit-tested). The doc stays here only because its
+    own acceptance gate — the ES `RestClientSingleHostIntegTests` soak at `-Xmx1g` with the default rootsnap
+    cache — has not been rerun; the `CRATONVM_ROOTSNAP_CACHE=0` workaround should no longer be needed once
+    that soak confirms. **NOT** a socket/OP_WRITE bug and **NOT** an rs_cache correctness bug.
 17. **[CompletableFuture untimed `get()` never wakes on cross-thread completion](../internal/app-jvm-bugs/gc-gen-promotion-completablefuture-completion-loss.md)** —
     ✅ **FIXED on dev** (moved to `docs/internal/app-jvm-bugs/`). The original gen-GC "lost young `Signaller`"
     theory was **refuted** (the hang is deterministic + GC-independent); the real cause was the synthetic

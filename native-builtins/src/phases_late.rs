@@ -63,6 +63,49 @@ use crate::lang_misc::register_p60_record;
 const BR_MAX_PER_READER_BYTES: usize = 16 * 1024 * 1024;
 const BR_MAX_READERS: usize = 10_000;
 
+// GC-safety helpers (mirrors phases_early.rs): pin an object-typed `Value`
+// held in a Rust local across a potentially-allocating ctx call (invoke /
+// alloc / create_string) so a moving young GC cannot leave the raw
+// `ObjectRef` stale, then read the forwarded ref back before the next use.
+fn pinned_object_value(ctx: &mut dyn NativeContext, value: Value) -> Option<(usize, ObjectRef)> {
+    match value {
+        Value::Object(Some(obj)) => Some((ctx.pin_native_root(obj), obj)),
+        _ => None,
+    }
+}
+
+fn read_pinned_object_value(
+    ctx: &dyn NativeContext,
+    pin: Option<(usize, ObjectRef)>,
+    fallback: Value,
+) -> Value {
+    match pin {
+        Some((handle, obj)) => Value::Object(Some(ctx.read_native_pin(handle, obj))),
+        None => fallback,
+    }
+}
+
+/// Pin every object-typed element of `vals` (slice counterpart of
+/// [`pinned_object_value`]); primitives yield `None` and need no pin.
+fn pin_object_values(
+    ctx: &mut dyn NativeContext,
+    vals: &[Value],
+) -> Vec<Option<(usize, ObjectRef)>> {
+    vals.iter().map(|v| pinned_object_value(ctx, *v)).collect()
+}
+
+/// Read the forwarded (post-GC) value for each pinned element.
+fn read_pinned_object_values(
+    ctx: &dyn NativeContext,
+    pins: &[Option<(usize, ObjectRef)>],
+    vals: &[Value],
+) -> Vec<Value> {
+    vals.iter()
+        .zip(pins)
+        .map(|(v, p)| read_pinned_object_value(ctx, *p, *v))
+        .collect()
+}
+
 fn br_sidetable() -> &'static parking_lot::Mutex<rustc_hash::FxHashMap<usize, (Vec<u16>, usize)>> {
     use std::sync::OnceLock;
     static T: OnceLock<parking_lot::Mutex<rustc_hash::FxHashMap<usize, (Vec<u16>, usize)>>> =
@@ -252,8 +295,13 @@ pub(crate) fn register_phase55_charset(r: &mut NativeMethodRegistry) {
                 return Err(RuntimeError::IllegalArgumentException { message: raw_name }.into());
             }
             let obj = alloc_concurrent_synthetic(ctx, "java/nio/charset/Charset", 1);
+            // Pin across the create_string below — a moving young GC there
+            // would relocate the fresh Charset (native stale-local family).
+            let obj_pin = ctx.pin_native_root(obj);
             let canon = ctx.create_string(&normalized);
+            let obj = ctx.read_native_pin(obj_pin, obj);
             ctx.set_field(obj, 0, Value::Object(Some(canon)));
+            ctx.unpin_native_roots(obj_pin);
             Ok(Some(Value::Object(Some(obj))))
         },
     );
@@ -271,8 +319,13 @@ pub(crate) fn register_phase55_charset(r: &mut NativeMethodRegistry) {
         "()Ljava/nio/charset/Charset;",
         |ctx, _args| {
             let obj = alloc_concurrent_synthetic(ctx, "java/nio/charset/Charset", 1);
+            // Pin across the create_string below — a moving young GC there
+            // would relocate the fresh Charset (native stale-local family).
+            let obj_pin = ctx.pin_native_root(obj);
             let name = ctx.create_string("UTF-8");
+            let obj = ctx.read_native_pin(obj_pin, obj);
             ctx.set_field(obj, 0, Value::Object(Some(name)));
+            ctx.unpin_native_roots(obj_pin);
             Ok(Some(Value::Object(Some(obj))))
         },
     );
@@ -326,8 +379,13 @@ pub(crate) fn register_phase55_charset(r: &mut NativeMethodRegistry) {
     let sc = "java/nio/charset/StandardCharsets";
     r.register(sc, "UTF_8", "Ljava/nio/charset/Charset;", |ctx, _args| {
         let obj = alloc_concurrent_synthetic(ctx, "java/nio/charset/Charset", 1);
+        // Pin across the create_string below — a moving young GC there would
+        // relocate the fresh Charset (native stale-local family).
+        let obj_pin = ctx.pin_native_root(obj);
         let name = ctx.create_string("UTF-8");
+        let obj = ctx.read_native_pin(obj_pin, obj);
         ctx.set_field(obj, 0, Value::Object(Some(name)));
+        ctx.unpin_native_roots(obj_pin);
         Ok(Some(Value::Object(Some(obj))))
     });
     r.register(
@@ -336,8 +394,13 @@ pub(crate) fn register_phase55_charset(r: &mut NativeMethodRegistry) {
         "Ljava/nio/charset/Charset;",
         |ctx, _args| {
             let obj = alloc_concurrent_synthetic(ctx, "java/nio/charset/Charset", 1);
+            // Pin across the create_string below — a moving young GC there
+            // would relocate the fresh Charset (native stale-local family).
+            let obj_pin = ctx.pin_native_root(obj);
             let name = ctx.create_string("US-ASCII");
+            let obj = ctx.read_native_pin(obj_pin, obj);
             ctx.set_field(obj, 0, Value::Object(Some(name)));
+            ctx.unpin_native_roots(obj_pin);
             Ok(Some(Value::Object(Some(obj))))
         },
     );
@@ -347,15 +410,25 @@ pub(crate) fn register_phase55_charset(r: &mut NativeMethodRegistry) {
         "Ljava/nio/charset/Charset;",
         |ctx, _args| {
             let obj = alloc_concurrent_synthetic(ctx, "java/nio/charset/Charset", 1);
+            // Pin across the create_string below — a moving young GC there
+            // would relocate the fresh Charset (native stale-local family).
+            let obj_pin = ctx.pin_native_root(obj);
             let name = ctx.create_string("ISO-8859-1");
+            let obj = ctx.read_native_pin(obj_pin, obj);
             ctx.set_field(obj, 0, Value::Object(Some(name)));
+            ctx.unpin_native_roots(obj_pin);
             Ok(Some(Value::Object(Some(obj))))
         },
     );
     r.register(sc, "UTF_16", "Ljava/nio/charset/Charset;", |ctx, _args| {
         let obj = alloc_concurrent_synthetic(ctx, "java/nio/charset/Charset", 1);
+        // Pin across the create_string below — a moving young GC there would
+        // relocate the fresh Charset (native stale-local family).
+        let obj_pin = ctx.pin_native_root(obj);
         let name = ctx.create_string("UTF-16");
+        let obj = ctx.read_native_pin(obj_pin, obj);
         ctx.set_field(obj, 0, Value::Object(Some(name)));
+        ctx.unpin_native_roots(obj_pin);
         Ok(Some(Value::Object(Some(obj))))
     });
     r.register(
@@ -364,8 +437,13 @@ pub(crate) fn register_phase55_charset(r: &mut NativeMethodRegistry) {
         "Ljava/nio/charset/Charset;",
         |ctx, _args| {
             let obj = alloc_concurrent_synthetic(ctx, "java/nio/charset/Charset", 1);
+            // Pin across the create_string below — a moving young GC there
+            // would relocate the fresh Charset (native stale-local family).
+            let obj_pin = ctx.pin_native_root(obj);
             let name = ctx.create_string("UTF-16BE");
+            let obj = ctx.read_native_pin(obj_pin, obj);
             ctx.set_field(obj, 0, Value::Object(Some(name)));
+            ctx.unpin_native_roots(obj_pin);
             Ok(Some(Value::Object(Some(obj))))
         },
     );
@@ -375,8 +453,13 @@ pub(crate) fn register_phase55_charset(r: &mut NativeMethodRegistry) {
         "Ljava/nio/charset/Charset;",
         |ctx, _args| {
             let obj = alloc_concurrent_synthetic(ctx, "java/nio/charset/Charset", 1);
+            // Pin across the create_string below — a moving young GC there
+            // would relocate the fresh Charset (native stale-local family).
+            let obj_pin = ctx.pin_native_root(obj);
             let name = ctx.create_string("UTF-16LE");
+            let obj = ctx.read_native_pin(obj_pin, obj);
             ctx.set_field(obj, 0, Value::Object(Some(name)));
+            ctx.unpin_native_roots(obj_pin);
             Ok(Some(Value::Object(Some(obj))))
         },
     );
@@ -412,7 +495,7 @@ pub(crate) fn register_phase55_executors(r: &mut NativeMethodRegistry) {
 
     // get() — lazy execution: if not done and not cancelled, execute the stored task
     r.register(future, "get", "()Ljava/lang/Object;", |ctx, args| {
-        let this = obj_arg(args, 0)?;
+        let mut this = obj_arg(args, 0)?;
         let cancelled = ctx.get_field(this, 2).as_int().unwrap_or(0);
         if cancelled != 0 {
             return Err(RuntimeError::IllegalStateException {
@@ -423,19 +506,27 @@ pub(crate) fn register_phase55_executors(r: &mut NativeMethodRegistry) {
         let done = ctx.get_field(this, 1).as_int().unwrap_or(0);
         if done == 0 {
             // Lazy execution: run the stored task now
-            if let Value::Object(Some(task)) = ctx.get_field(this, 3) {
+            if let Value::Object(Some(mut task)) = ctx.get_field(this, 3) {
+                // Pin across the task callback below — a moving young GC there
+                // would relocate `this`/`task` (native stale-local family).
+                let this_pin = ctx.pin_native_root(this);
+                let task_pin = ctx.pin_native_root(task);
                 // Try Callable.call() first, fall back to Runnable.run()
                 let result = ctx.invoke_virtual(task, "call", "()Ljava/lang/Object;", &[]);
+                this = ctx.read_native_pin(this_pin, this);
                 match result {
                     Ok(val) => {
                         ctx.set_field(this, 0, val.unwrap_or(Value::Object(None)));
                     }
                     Err(_) => {
                         // Might be a Runnable, not a Callable
+                        task = ctx.read_native_pin(task_pin, task);
                         let _ = ctx.invoke_virtual(task, "run", "()V", &[]);
+                        this = ctx.read_native_pin(this_pin, this);
                         ctx.set_field(this, 0, Value::Object(None));
                     }
                 }
+                ctx.unpin_native_roots(this_pin);
             }
             ctx.set_field(this, 1, Value::Int(1)); // mark done
         }
@@ -446,7 +537,7 @@ pub(crate) fn register_phase55_executors(r: &mut NativeMethodRegistry) {
         "get",
         "(JLjava/util/concurrent/TimeUnit;)Ljava/lang/Object;",
         |ctx, args| {
-            let this = obj_arg(args, 0)?;
+            let mut this = obj_arg(args, 0)?;
             let cancelled = ctx.get_field(this, 2).as_int().unwrap_or(0);
             if cancelled != 0 {
                 return Err(RuntimeError::IllegalStateException {
@@ -456,15 +547,24 @@ pub(crate) fn register_phase55_executors(r: &mut NativeMethodRegistry) {
             }
             let done = ctx.get_field(this, 1).as_int().unwrap_or(0);
             if done == 0 {
-                if let Value::Object(Some(task)) = ctx.get_field(this, 3) {
+                if let Value::Object(Some(mut task)) = ctx.get_field(this, 3) {
+                    // Pin across the task callback below — a moving young GC
+                    // there would relocate `this`/`task` (native stale-local
+                    // family).
+                    let this_pin = ctx.pin_native_root(this);
+                    let task_pin = ctx.pin_native_root(task);
                     let result = ctx.invoke_virtual(task, "call", "()Ljava/lang/Object;", &[]);
+                    this = ctx.read_native_pin(this_pin, this);
                     match result {
                         Ok(val) => ctx.set_field(this, 0, val.unwrap_or(Value::Object(None))),
                         Err(_) => {
+                            task = ctx.read_native_pin(task_pin, task);
                             let _ = ctx.invoke_virtual(task, "run", "()V", &[]);
+                            this = ctx.read_native_pin(this_pin, this);
                             ctx.set_field(this, 0, Value::Object(None));
                         }
                     }
+                    ctx.unpin_native_roots(this_pin);
                 }
                 ctx.set_field(this, 1, Value::Int(1));
             }
@@ -511,20 +611,32 @@ pub(crate) fn register_phase55_executors(r: &mut NativeMethodRegistry) {
         |ctx, args| {
             let supplier = obj_arg(args, 0)?;
             let result = ctx.invoke_virtual(supplier, "get", "()Ljava/lang/Object;", &[]);
-            let future =
+            // Pin across the CF alloc / create_string below — a moving young GC
+            // there would relocate the supplied value and the fresh CF (native
+            // stale-local family).
+            let val = match &result {
+                Ok(v) => (*v).unwrap_or(Value::Object(None)),
+                Err(_) => Value::Object(None),
+            };
+            let val_pin = pinned_object_value(ctx, val);
+            let mut future =
                 alloc_concurrent_synthetic(ctx, "java/util/concurrent/CompletableFuture", 3);
+            let future_pin = ctx.pin_native_root(future);
             match result {
-                Ok(val) => {
-                    ctx.set_field(future, 0, val.unwrap_or(Value::Object(None)));
+                Ok(_) => {
+                    let val = read_pinned_object_value(ctx, val_pin, val);
+                    ctx.set_field(future, 0, val);
                     ctx.set_field(future, 2, Value::Object(None));
                 }
                 Err(e) => {
                     ctx.set_field(future, 0, Value::Object(None));
                     let err_str = ctx.create_string(&format!("{:?}", e));
+                    future = ctx.read_native_pin(future_pin, future);
                     ctx.set_field(future, 2, Value::Object(Some(err_str)));
                 }
             }
             ctx.set_field(future, 1, Value::Int(1));
+            ctx.unpin_native_roots(val_pin.map(|(h, _)| h).unwrap_or(future_pin));
             Ok(Some(Value::Object(Some(future))))
         },
     );
@@ -545,20 +657,32 @@ pub(crate) fn register_phase55_executors(r: &mut NativeMethodRegistry) {
             // with no value — that would trade a scheduling difference for a
             // correctness bug. A faithful fix needs the real carrier scheduler.
             let result = ctx.invoke_virtual(supplier, "get", "()Ljava/lang/Object;", &[]);
-            let future =
+            // Pin across the CF alloc / create_string below — a moving young GC
+            // there would relocate the supplied value and the fresh CF (native
+            // stale-local family).
+            let val = match &result {
+                Ok(v) => (*v).unwrap_or(Value::Object(None)),
+                Err(_) => Value::Object(None),
+            };
+            let val_pin = pinned_object_value(ctx, val);
+            let mut future =
                 alloc_concurrent_synthetic(ctx, "java/util/concurrent/CompletableFuture", 3);
+            let future_pin = ctx.pin_native_root(future);
             match result {
-                Ok(val) => {
-                    ctx.set_field(future, 0, val.unwrap_or(Value::Object(None)));
+                Ok(_) => {
+                    let val = read_pinned_object_value(ctx, val_pin, val);
+                    ctx.set_field(future, 0, val);
                     ctx.set_field(future, 2, Value::Object(None));
                 }
                 Err(e) => {
                     ctx.set_field(future, 0, Value::Object(None));
                     let err_str = ctx.create_string(&format!("{:?}", e));
+                    future = ctx.read_native_pin(future_pin, future);
                     ctx.set_field(future, 2, Value::Object(Some(err_str)));
                 }
             }
             ctx.set_field(future, 1, Value::Int(1));
+            ctx.unpin_native_roots(val_pin.map(|(h, _)| h).unwrap_or(future_pin));
             Ok(Some(Value::Object(Some(future))))
         },
     );
@@ -569,17 +693,23 @@ pub(crate) fn register_phase55_executors(r: &mut NativeMethodRegistry) {
         |ctx, args| {
             let runnable = obj_arg(args, 0)?;
             let result = ctx.invoke_virtual(runnable, "run", "()V", &[]);
-            let future =
+            let mut future =
                 alloc_concurrent_synthetic(ctx, "java/util/concurrent/CompletableFuture", 3);
+            // Pin across the create_string in the Err branch below — a moving
+            // young GC there would relocate the fresh CF (native stale-local
+            // family).
+            let future_pin = ctx.pin_native_root(future);
             ctx.set_field(future, 0, Value::Object(None));
             ctx.set_field(future, 1, Value::Int(1));
             match result {
                 Ok(_) => ctx.set_field(future, 2, Value::Object(None)),
                 Err(e) => {
                     let err_str = ctx.create_string(&format!("{:?}", e));
+                    future = ctx.read_native_pin(future_pin, future);
                     ctx.set_field(future, 2, Value::Object(Some(err_str)));
                 }
             }
+            ctx.unpin_native_roots(future_pin);
             Ok(Some(Value::Object(Some(future))))
         },
     );
@@ -594,17 +724,23 @@ pub(crate) fn register_phase55_executors(r: &mut NativeMethodRegistry) {
             // completes with the correct (void) outcome — see the supplyAsync
             // overload above for why we do not route through executor.execute().
             let result = ctx.invoke_virtual(runnable, "run", "()V", &[]);
-            let future =
+            let mut future =
                 alloc_concurrent_synthetic(ctx, "java/util/concurrent/CompletableFuture", 3);
+            // Pin across the create_string in the Err branch below — a moving
+            // young GC there would relocate the fresh CF (native stale-local
+            // family).
+            let future_pin = ctx.pin_native_root(future);
             ctx.set_field(future, 0, Value::Object(None));
             ctx.set_field(future, 1, Value::Int(1));
             match result {
                 Ok(_) => ctx.set_field(future, 2, Value::Object(None)),
                 Err(e) => {
                     let err_str = ctx.create_string(&format!("{:?}", e));
+                    future = ctx.read_native_pin(future_pin, future);
                     ctx.set_field(future, 2, Value::Object(Some(err_str)));
                 }
             }
+            ctx.unpin_native_roots(future_pin);
             Ok(Some(Value::Object(Some(future))))
         },
     );
@@ -643,14 +779,23 @@ pub(crate) fn register_phase55_executors(r: &mut NativeMethodRegistry) {
                     );
                 }
             }
-            let future =
+            // Pin across the CF alloc / create_string below — a moving young GC
+            // there would relocate `arr` and the fresh CF (native stale-local
+            // family).
+            let arr_pin = match args.first() {
+                Some(Value::Object(Some(a))) => Some((ctx.pin_native_root(*a), *a)),
+                _ => None,
+            };
+            let mut future =
                 alloc_concurrent_synthetic(ctx, "java/util/concurrent/CompletableFuture", 3);
+            let future_pin = ctx.pin_native_root(future);
             // Check if any constituent CF has an exception
             let mut has_exception = false;
-            if let Some(Value::Object(Some(arr))) = args.first() {
-                let len = ctx.array_length(*arr);
+            if let Some((h, orig)) = arr_pin {
+                let arr = ctx.read_native_pin(h, orig);
+                let len = ctx.array_length(arr);
                 for i in 0..len {
-                    if let Value::Object(Some(cf_ref)) = ctx.get_array_element(*arr, i) {
+                    if let Value::Object(Some(cf_ref)) = ctx.get_array_element(arr, i) {
                         if let Value::Object(Some(_)) = ctx.get_field(cf_ref, 2) {
                             has_exception = true;
                             break;
@@ -662,10 +807,12 @@ pub(crate) fn register_phase55_executors(r: &mut NativeMethodRegistry) {
             ctx.set_field(future, 1, Value::Int(1));
             if has_exception {
                 let err = ctx.create_string("One or more CompletableFutures failed");
+                future = ctx.read_native_pin(future_pin, future);
                 ctx.set_field(future, 2, Value::Object(Some(err)));
             } else {
                 ctx.set_field(future, 2, Value::Object(None));
             }
+            ctx.unpin_native_roots(arr_pin.map(|(h, _)| h).unwrap_or(future_pin));
             Ok(Some(Value::Object(Some(future))))
         },
     );
@@ -682,14 +829,23 @@ pub(crate) fn register_phase55_executors(r: &mut NativeMethodRegistry) {
                 if let Value::Object(Some(cf_ref)) = first {
                     let result = ctx.get_field(cf_ref, 0);
                     let exc = ctx.get_field(cf_ref, 2);
+                    // Pin across the CF alloc below — a moving young GC there
+                    // would relocate them (native stale-local family).
+                    let result_pin = pinned_object_value(ctx, result);
+                    let exc_pin = pinned_object_value(ctx, exc);
                     let future = alloc_concurrent_synthetic(
                         ctx,
                         "java/util/concurrent/CompletableFuture",
                         3,
                     );
+                    let result = read_pinned_object_value(ctx, result_pin, result);
+                    let exc = read_pinned_object_value(ctx, exc_pin, exc);
                     ctx.set_field(future, 0, result);
                     ctx.set_field(future, 1, Value::Int(1));
                     ctx.set_field(future, 2, exc);
+                    if let Some((h, _)) = result_pin.or(exc_pin) {
+                        ctx.unpin_native_roots(h);
+                    }
                     return Ok(Some(Value::Object(Some(future))));
                 }
             }
@@ -707,11 +863,18 @@ pub(crate) fn register_phase55_executors(r: &mut NativeMethodRegistry) {
         "(Ljava/lang/Object;)Ljava/util/concurrent/CompletableFuture;",
         |ctx, args| {
             let value = args[0];
+            // Pin across the CF alloc below — a moving young GC there would
+            // relocate it (native stale-local family).
+            let value_pin = pinned_object_value(ctx, value);
             let future =
                 alloc_concurrent_synthetic(ctx, "java/util/concurrent/CompletableFuture", 3);
+            let value = read_pinned_object_value(ctx, value_pin, value);
             ctx.set_field(future, 0, value);
             ctx.set_field(future, 1, Value::Int(1));
             ctx.set_field(future, 2, Value::Object(None));
+            if let Some((h, _)) = value_pin {
+                ctx.unpin_native_roots(h);
+            }
             Ok(Some(Value::Object(Some(future))))
         },
     );
@@ -721,11 +884,18 @@ pub(crate) fn register_phase55_executors(r: &mut NativeMethodRegistry) {
         "(Ljava/lang/Throwable;)Ljava/util/concurrent/CompletableFuture;",
         |ctx, args| {
             let exc = args[0];
+            // Pin across the CF alloc below — a moving young GC there would
+            // relocate it (native stale-local family).
+            let exc_pin = pinned_object_value(ctx, exc);
             let future =
                 alloc_concurrent_synthetic(ctx, "java/util/concurrent/CompletableFuture", 3);
+            let exc = read_pinned_object_value(ctx, exc_pin, exc);
             ctx.set_field(future, 0, Value::Object(None));
             ctx.set_field(future, 1, Value::Int(1));
             ctx.set_field(future, 2, exc); // store exception
+            if let Some((h, _)) = exc_pin {
+                ctx.unpin_native_roots(h);
+            }
             Ok(Some(Value::Object(Some(future))))
         },
     );
@@ -776,11 +946,16 @@ pub(crate) fn register_phase55_executors(r: &mut NativeMethodRegistry) {
             let func = obj_arg(args, 1)?;
             // Check if this CF has an exception — propagate it
             if let Value::Object(Some(_)) = ctx.get_field(this, 2) {
+                // Pin across the CF alloc below — a moving young GC there would
+                // relocate `this` (native stale-local family).
+                let this_pin = ctx.pin_native_root(this);
                 let new_cf =
                     alloc_concurrent_synthetic(ctx, "java/util/concurrent/CompletableFuture", 3);
+                let this = ctx.read_native_pin(this_pin, this);
                 ctx.set_field(new_cf, 0, Value::Object(None));
                 ctx.set_field(new_cf, 1, Value::Int(1));
                 ctx.set_field(new_cf, 2, ctx.get_field(this, 2));
+                ctx.unpin_native_roots(this_pin);
                 return Ok(Some(Value::Object(Some(new_cf))));
             }
             let val = ctx.get_field(this, 0);
@@ -810,11 +985,19 @@ pub(crate) fn register_phase55_executors(r: &mut NativeMethodRegistry) {
                     "(Ljava/lang/Object;)Ljava/lang/Object;",
                     &[Value::Object(Some(exc))],
                 )?;
+                // Pin across the CF alloc below — a moving young GC there would
+                // relocate the handler's result (native stale-local family).
+                let result = result.unwrap_or(Value::Object(None));
+                let result_pin = pinned_object_value(ctx, result);
                 let new_cf =
                     alloc_concurrent_synthetic(ctx, "java/util/concurrent/CompletableFuture", 3);
-                ctx.set_field(new_cf, 0, result.unwrap_or(Value::Object(None)));
+                let result = read_pinned_object_value(ctx, result_pin, result);
+                ctx.set_field(new_cf, 0, result);
                 ctx.set_field(new_cf, 1, Value::Int(1));
                 ctx.set_field(new_cf, 2, Value::Object(None));
+                if let Some((h, _)) = result_pin {
+                    ctx.unpin_native_roots(h);
+                }
                 Ok(Some(Value::Object(Some(new_cf))))
             } else {
                 // No exception — pass through
@@ -838,11 +1021,19 @@ pub(crate) fn register_phase55_executors(r: &mut NativeMethodRegistry) {
                 "(Ljava/lang/Object;Ljava/lang/Object;)Ljava/lang/Object;",
                 &[val, exc],
             )?;
+            // Pin across the CF alloc below — a moving young GC there would
+            // relocate the handler's result (native stale-local family).
+            let result = result.unwrap_or(Value::Object(None));
+            let result_pin = pinned_object_value(ctx, result);
             let new_cf =
                 alloc_concurrent_synthetic(ctx, "java/util/concurrent/CompletableFuture", 3);
-            ctx.set_field(new_cf, 0, result.unwrap_or(Value::Object(None)));
+            let result = read_pinned_object_value(ctx, result_pin, result);
+            ctx.set_field(new_cf, 0, result);
             ctx.set_field(new_cf, 1, Value::Int(1));
             ctx.set_field(new_cf, 2, Value::Object(None));
+            if let Some((h, _)) = result_pin {
+                ctx.unpin_native_roots(h);
+            }
             Ok(Some(Value::Object(Some(new_cf))))
         },
     );
@@ -882,11 +1073,16 @@ pub(crate) fn register_phase55_executors(r: &mut NativeMethodRegistry) {
         "()Ljava/util/concurrent/ExecutorService;",
         |ctx, _args| {
             let es = alloc_concurrent_synthetic(ctx, "java/util/concurrent/ExecutorService", 4);
+            // Pin across the queue alloc below — a moving young GC there would
+            // relocate the fresh executor (native stale-local family).
+            let es_pin = ctx.pin_native_root(es);
             ctx.set_field(es, 0, Value::Int(0)); // not shutdown
             ctx.set_field(es, 1, Value::Int(1)); // pool size = 1
             let queue = ctx.new_array(cratonvm_types::ArrayElementType::Reference, 64);
+            let es = ctx.read_native_pin(es_pin, es);
             ctx.set_field(es, 2, Value::Object(Some(queue)));
             ctx.set_field(es, 3, Value::Int(0)); // task count
+            ctx.unpin_native_roots(es_pin);
             Ok(Some(Value::Object(Some(es))))
         },
     );
@@ -897,11 +1093,16 @@ pub(crate) fn register_phase55_executors(r: &mut NativeMethodRegistry) {
         |ctx, args| {
             let pool_size = args.first().and_then(|v| v.as_int()).unwrap_or(4);
             let es = alloc_concurrent_synthetic(ctx, "java/util/concurrent/ExecutorService", 4);
+            // Pin across the queue alloc below — a moving young GC there would
+            // relocate the fresh executor (native stale-local family).
+            let es_pin = ctx.pin_native_root(es);
             ctx.set_field(es, 0, Value::Int(0));
             ctx.set_field(es, 1, Value::Int(pool_size));
             let queue = ctx.new_array(cratonvm_types::ArrayElementType::Reference, 64);
+            let es = ctx.read_native_pin(es_pin, es);
             ctx.set_field(es, 2, Value::Object(Some(queue)));
             ctx.set_field(es, 3, Value::Int(0));
+            ctx.unpin_native_roots(es_pin);
             Ok(Some(Value::Object(Some(es))))
         },
     );
@@ -911,11 +1112,16 @@ pub(crate) fn register_phase55_executors(r: &mut NativeMethodRegistry) {
         "()Ljava/util/concurrent/ExecutorService;",
         |ctx, _args| {
             let es = alloc_concurrent_synthetic(ctx, "java/util/concurrent/ExecutorService", 4);
+            // Pin across the queue alloc below — a moving young GC there would
+            // relocate the fresh executor (native stale-local family).
+            let es_pin = ctx.pin_native_root(es);
             ctx.set_field(es, 0, Value::Int(0));
             ctx.set_field(es, 1, Value::Int(i32::MAX)); // unbounded
             let queue = ctx.new_array(cratonvm_types::ArrayElementType::Reference, 64);
+            let es = ctx.read_native_pin(es_pin, es);
             ctx.set_field(es, 2, Value::Object(Some(queue)));
             ctx.set_field(es, 3, Value::Int(0));
+            ctx.unpin_native_roots(es_pin);
             Ok(Some(Value::Object(Some(es))))
         },
     );
@@ -927,11 +1133,16 @@ pub(crate) fn register_phase55_executors(r: &mut NativeMethodRegistry) {
             let pool_size = args.first().and_then(|v| v.as_int()).unwrap_or(1);
             let es =
                 alloc_concurrent_synthetic(ctx, "java/util/concurrent/ScheduledExecutorService", 4);
+            // Pin across the queue alloc below — a moving young GC there would
+            // relocate the fresh executor (native stale-local family).
+            let es_pin = ctx.pin_native_root(es);
             ctx.set_field(es, 0, Value::Int(0));
             ctx.set_field(es, 1, Value::Int(pool_size));
             let queue = ctx.new_array(cratonvm_types::ArrayElementType::Reference, 64);
+            let es = ctx.read_native_pin(es_pin, es);
             ctx.set_field(es, 2, Value::Object(Some(queue)));
             ctx.set_field(es, 3, Value::Int(0));
+            ctx.unpin_native_roots(es_pin);
             Ok(Some(Value::Object(Some(es))))
         },
     );
@@ -941,11 +1152,16 @@ pub(crate) fn register_phase55_executors(r: &mut NativeMethodRegistry) {
         "()Ljava/util/concurrent/ExecutorService;",
         |ctx, _args| {
             let es = alloc_concurrent_synthetic(ctx, "java/util/concurrent/ExecutorService", 4);
+            // Pin across the queue alloc below — a moving young GC there would
+            // relocate the fresh executor (native stale-local family).
+            let es_pin = ctx.pin_native_root(es);
             ctx.set_field(es, 0, Value::Int(0));
             ctx.set_field(es, 1, Value::Int(i32::MAX));
             let queue = ctx.new_array(cratonvm_types::ArrayElementType::Reference, 64);
+            let es = ctx.read_native_pin(es_pin, es);
             ctx.set_field(es, 2, Value::Object(Some(queue)));
             ctx.set_field(es, 3, Value::Int(0));
+            ctx.unpin_native_roots(es_pin);
             Ok(Some(Value::Object(Some(es))))
         },
     );
@@ -953,7 +1169,7 @@ pub(crate) fn register_phase55_executors(r: &mut NativeMethodRegistry) {
     // --- ExecutorService ---
     let es = "java/util/concurrent/ExecutorService";
     r.register(es, "shutdown", "()V", |ctx, args| {
-        let this = obj_arg(args, 0)?;
+        let mut this = obj_arg(args, 0)?;
         // Real ThreadPoolExecutor: leave its lifecycle to real bytecode (the
         // synthetic slot writes below would corrupt real fields, and reading
         // field 3 as a task count yields garbage). shutdownNow() (called by
@@ -966,16 +1182,26 @@ pub(crate) fn register_phase55_executors(r: &mut NativeMethodRegistry) {
         let task_count = ctx.get_field(this, 3).as_int().unwrap_or(0);
         if task_count > 0 {
             if let Value::Object(Some(queue)) = ctx.get_field(this, 2) {
+                // Pin across the task callbacks below — a moving young GC there
+                // would relocate them (native stale-local family).
+                let this_pin = ctx.pin_native_root(this);
+                let queue_pin = ctx.pin_native_root(queue);
                 for i in 0..(task_count as usize) {
+                    let queue = ctx.read_native_pin(queue_pin, queue);
                     if let Value::Object(Some(task)) = ctx.get_array_element(queue, i) {
+                        let task_pin = ctx.pin_native_root(task);
                         let _: MethodCallResult = ctx
                             .invoke_virtual(task, "call", "()Ljava/lang/Object;", &[])
                             .or_else(|_| {
+                                let task = ctx.read_native_pin(task_pin, task);
                                 ctx.invoke_virtual(task, "run", "()V", &[])?;
                                 Ok(None)
                             });
+                        ctx.unpin_native_roots(task_pin);
                     }
                 }
+                this = ctx.read_native_pin(this_pin, this);
+                ctx.unpin_native_roots(this_pin);
             }
             ctx.set_field(this, 3, Value::Int(0));
         }
@@ -989,15 +1215,25 @@ pub(crate) fn register_phase55_executors(r: &mut NativeMethodRegistry) {
         // real executor. Return an empty pending-tasks list.
         if crate::interrupt_executor_workers(ctx, this) {
             let empty = ctx.new_array(cratonvm_types::ArrayElementType::Reference, 0);
+            // Pin across the list alloc below — a moving young GC there would
+            // relocate the fresh array (native stale-local family).
+            let empty_pin = ctx.pin_native_root(empty);
             let list = alloc_concurrent_synthetic(ctx, "java/util/ArrayList", 2);
+            let empty = ctx.read_native_pin(empty_pin, empty);
             ctx.set_field(list, 0, Value::Object(Some(empty)));
             ctx.set_field(list, 1, Value::Int(0));
+            ctx.unpin_native_roots(empty_pin);
             return Ok(Some(Value::Object(Some(list))));
         }
         ctx.set_field(this, 0, Value::Int(1));
         // Return list of pending (unexecuted) tasks
         let task_count = ctx.get_field(this, 3).as_int().unwrap_or(0) as usize;
+        // Pin across the array/list allocs below — a moving young GC there
+        // would relocate `this`/`pending` (native stale-local family).
+        let this_pin = ctx.pin_native_root(this);
         let pending = ctx.new_array(cratonvm_types::ArrayElementType::Reference, task_count);
+        let pending_pin = ctx.pin_native_root(pending);
+        let this = ctx.read_native_pin(this_pin, this);
         if task_count > 0 {
             if let Value::Object(Some(queue)) = ctx.get_field(this, 2) {
                 for i in 0..task_count {
@@ -1008,8 +1244,10 @@ pub(crate) fn register_phase55_executors(r: &mut NativeMethodRegistry) {
         }
         ctx.set_field(this, 3, Value::Int(0));
         let list = alloc_concurrent_synthetic(ctx, "java/util/ArrayList", 2);
+        let pending = ctx.read_native_pin(pending_pin, pending);
         ctx.set_field(list, 0, Value::Object(Some(pending)));
         ctx.set_field(list, 1, Value::Int(task_count as i32));
+        ctx.unpin_native_roots(this_pin);
         Ok(Some(Value::Object(Some(list))))
     });
     r.register(es, "isShutdown", "()Z", |ctx, args| {
@@ -1031,21 +1269,31 @@ pub(crate) fn register_phase55_executors(r: &mut NativeMethodRegistry) {
         "awaitTermination",
         "(JLjava/util/concurrent/TimeUnit;)Z",
         |ctx, args| {
-            let this = obj_arg(args, 0)?;
+            let mut this = obj_arg(args, 0)?;
             // Execute any pending tasks
             let task_count = ctx.get_field(this, 3).as_int().unwrap_or(0);
             if task_count > 0 {
                 if let Value::Object(Some(queue)) = ctx.get_field(this, 2) {
+                    // Pin across the task callbacks below — a moving young GC
+                    // there would relocate them (native stale-local family).
+                    let this_pin = ctx.pin_native_root(this);
+                    let queue_pin = ctx.pin_native_root(queue);
                     for i in 0..(task_count as usize) {
+                        let queue = ctx.read_native_pin(queue_pin, queue);
                         if let Value::Object(Some(task)) = ctx.get_array_element(queue, i) {
+                            let task_pin = ctx.pin_native_root(task);
                             let _: Result<Option<Value>, MethodCallFailed> = ctx
                                 .invoke_virtual(task, "call", "()Ljava/lang/Object;", &[])
                                 .or_else(|_| {
+                                    let task = ctx.read_native_pin(task_pin, task);
                                     ctx.invoke_virtual(task, "run", "()V", &[])?;
                                     Ok(None)
                                 });
+                            ctx.unpin_native_roots(task_pin);
                         }
                     }
+                    this = ctx.read_native_pin(this_pin, this);
+                    ctx.unpin_native_roots(this_pin);
                 }
                 ctx.set_field(this, 3, Value::Int(0));
             }
@@ -1066,8 +1314,14 @@ pub(crate) fn register_phase55_executors(r: &mut NativeMethodRegistry) {
                 }
                 .into());
             }
+            // Pin across the Future alloc below — a moving young GC there would
+            // relocate `this`/`callable` (native stale-local family).
+            let this_pin = ctx.pin_native_root(this);
+            let callable_pin = ctx.pin_native_root(callable);
             // Create a Future with the task stored for lazy execution
             let future = alloc_concurrent_synthetic(ctx, "java/util/concurrent/Future", 4);
+            let this = ctx.read_native_pin(this_pin, this);
+            let callable = ctx.read_native_pin(callable_pin, callable);
             ctx.set_field(future, 0, Value::Object(None)); // result (not yet computed)
             ctx.set_field(future, 1, Value::Int(0)); // not done
             ctx.set_field(future, 2, Value::Int(0)); // not cancelled
@@ -1081,6 +1335,7 @@ pub(crate) fn register_phase55_executors(r: &mut NativeMethodRegistry) {
                     ctx.set_field(this, 3, Value::Int((task_count + 1) as i32));
                 }
             }
+            ctx.unpin_native_roots(this_pin);
             Ok(Some(Value::Object(Some(future))))
         },
     );
@@ -1098,7 +1353,13 @@ pub(crate) fn register_phase55_executors(r: &mut NativeMethodRegistry) {
                 }
                 .into());
             }
+            // Pin across the Future alloc below — a moving young GC there would
+            // relocate `this`/`runnable` (native stale-local family).
+            let this_pin = ctx.pin_native_root(this);
+            let runnable_pin = ctx.pin_native_root(runnable);
             let future = alloc_concurrent_synthetic(ctx, "java/util/concurrent/Future", 4);
+            let this = ctx.read_native_pin(this_pin, this);
+            let runnable = ctx.read_native_pin(runnable_pin, runnable);
             ctx.set_field(future, 0, Value::Object(None));
             ctx.set_field(future, 1, Value::Int(0));
             ctx.set_field(future, 2, Value::Int(0));
@@ -1111,6 +1372,7 @@ pub(crate) fn register_phase55_executors(r: &mut NativeMethodRegistry) {
                     ctx.set_field(this, 3, Value::Int((task_count + 1) as i32));
                 }
             }
+            ctx.unpin_native_roots(this_pin);
             Ok(Some(Value::Object(Some(future))))
         },
     );
@@ -1460,8 +1722,14 @@ pub(crate) fn register_phase55_collection_extras(r: &mut NativeMethodRegistry) {
         "(Ljava/lang/Object;)Ljava/util/Set;",
         |ctx, args| {
             let elem = args[0];
+            // Pin across the set/array allocs below — a moving young GC there
+            // would relocate them (native stale-local family).
+            let elem_pin = pinned_object_value(ctx, elem);
             let set = alloc_concurrent_synthetic(ctx, "java/util/HashSet", 3);
+            let set_pin = ctx.pin_native_root(set);
             let arr = ctx.new_array(cratonvm_types::ArrayElementType::Reference, 16);
+            let set = ctx.read_native_pin(set_pin, set);
+            let elem = read_pinned_object_value(ctx, elem_pin, elem);
             ctx.set_field(set, 0, Value::Object(Some(arr)));
             ctx.set_field(set, 1, Value::Int(0));
             ctx.set_field(set, 2, Value::Int(16));
@@ -1469,6 +1737,7 @@ pub(crate) fn register_phase55_collection_extras(r: &mut NativeMethodRegistry) {
             // But we can't call it directly here. Just allocate and put manually:
             ctx.set_array_element(arr, 0, elem);
             ctx.set_field(set, 1, Value::Int(1));
+            ctx.unpin_native_roots(elem_pin.map(|(h, _)| h).unwrap_or(set_pin));
             Ok(Some(Value::Object(Some(set))))
         },
     );
@@ -1478,11 +1747,18 @@ pub(crate) fn register_phase55_collection_extras(r: &mut NativeMethodRegistry) {
         "(Ljava/lang/Object;)Ljava/util/List;",
         |ctx, args| {
             let elem = args[0];
+            // Pin across the list/array allocs below — a moving young GC there
+            // would relocate them (native stale-local family).
+            let elem_pin = pinned_object_value(ctx, elem);
             let list = alloc_concurrent_synthetic(ctx, "java/util/ArrayList", 2);
+            let list_pin = ctx.pin_native_root(list);
             let arr = ctx.new_array(cratonvm_types::ArrayElementType::Reference, 1);
+            let list = ctx.read_native_pin(list_pin, list);
+            let elem = read_pinned_object_value(ctx, elem_pin, elem);
             ctx.set_array_element(arr, 0, elem);
             ctx.set_field(list, 0, Value::Object(Some(arr)));
             ctx.set_field(list, 1, Value::Int(1));
+            ctx.unpin_native_roots(elem_pin.map(|(h, _)| h).unwrap_or(list_pin));
             Ok(Some(Value::Object(Some(list))))
         },
     );
@@ -1493,19 +1769,35 @@ pub(crate) fn register_phase55_collection_extras(r: &mut NativeMethodRegistry) {
         |ctx, args| {
             let key = args[0];
             let val = args[1];
+            // Pin across the map/array/node allocs below — a moving young GC
+            // there would relocate them (native stale-local family).
+            let key_pin = pinned_object_value(ctx, key);
+            let val_pin = pinned_object_value(ctx, val);
             let map = alloc_concurrent_synthetic(ctx, "java/util/HashMap", 3);
+            let map_pin = ctx.pin_native_root(map);
             let arr = ctx.new_array(cratonvm_types::ArrayElementType::Reference, 16);
+            let arr_pin = ctx.pin_native_root(arr);
+            let map = ctx.read_native_pin(map_pin, map);
             ctx.set_field(map, 0, Value::Object(Some(arr)));
             ctx.set_field(map, 1, Value::Int(0));
             ctx.set_field(map, 2, Value::Int(16));
             // Simple: put at bucket 0
             let node = alloc_concurrent_synthetic(ctx, "java/util/HashMap$Node", 4);
+            let key = read_pinned_object_value(ctx, key_pin, key);
+            let val = read_pinned_object_value(ctx, val_pin, val);
+            let map = ctx.read_native_pin(map_pin, map);
+            let arr = ctx.read_native_pin(arr_pin, arr);
             ctx.set_field(node, 0, key);
             ctx.set_field(node, 1, val);
             ctx.set_field(node, 2, Value::Int(0)); // hash
             ctx.set_field(node, 3, Value::Object(None)); // next
             ctx.set_array_element(arr, 0, Value::Object(Some(node)));
             ctx.set_field(map, 1, Value::Int(1));
+            let first_pin = key_pin
+                .map(|(h, _)| h)
+                .or(val_pin.map(|(h, _)| h))
+                .unwrap_or(map_pin);
+            ctx.unpin_native_roots(first_pin);
             Ok(Some(Value::Object(Some(map))))
         },
     );
@@ -1516,13 +1808,20 @@ pub(crate) fn register_phase55_collection_extras(r: &mut NativeMethodRegistry) {
         |ctx, args| {
             let n = args[0].as_int().unwrap_or(0) as usize;
             let elem = args[1];
+            // Pin across the list/array allocs below — a moving young GC there
+            // would relocate them (native stale-local family).
+            let elem_pin = pinned_object_value(ctx, elem);
             let list = alloc_concurrent_synthetic(ctx, "java/util/ArrayList", 2);
+            let list_pin = ctx.pin_native_root(list);
             let arr = ctx.new_array(cratonvm_types::ArrayElementType::Reference, n);
+            let list = ctx.read_native_pin(list_pin, list);
+            let elem = read_pinned_object_value(ctx, elem_pin, elem);
             for i in 0..n {
                 ctx.set_array_element(arr, i, elem);
             }
             ctx.set_field(list, 0, Value::Object(Some(arr)));
             ctx.set_field(list, 1, Value::Int(n as i32));
+            ctx.unpin_native_roots(elem_pin.map(|(h, _)| h).unwrap_or(list_pin));
             Ok(Some(Value::Object(Some(list))))
         },
     );
@@ -1567,10 +1866,15 @@ pub(crate) fn register_phase55_collection_extras(r: &mut NativeMethodRegistry) {
 fn native_al_init_default_for_map(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = obj_arg(args, 0)?;
     let cap = 16;
+    // Pin across the array alloc below — a moving young GC there would
+    // relocate `this` (native stale-local family).
+    let this_pin = ctx.pin_native_root(this);
     let arr = ctx.new_array(cratonvm_types::ArrayElementType::Reference, cap);
+    let this = ctx.read_native_pin(this_pin, this);
     ctx.set_field(this, 0, Value::Object(Some(arr)));
     ctx.set_field(this, 1, Value::Int(0));
     ctx.set_field(this, 2, Value::Int(cap as i32));
+    ctx.unpin_native_roots(this_pin);
     Ok(Some(Value::Object(None)))
 }
 
@@ -2015,12 +2319,21 @@ pub(crate) fn p56_build_stream(
 ) -> ObjectRef {
     use cratonvm_types::ArrayElementType;
     let len = elems.len();
+    // Pin across the array/stream allocs below — a moving young GC there
+    // would relocate the object elements and the fresh array (native
+    // stale-local family).
+    let pins = pin_object_values(ctx, &elems);
+    let first_pin = pins.iter().flatten().next().map(|(h, _)| *h);
     let arr = ctx.new_array(ArrayElementType::Reference, len);
-    for (i, v) in elems.into_iter().enumerate() {
+    let arr_pin = ctx.pin_native_root(arr);
+    for (i, (v, p)) in elems.iter().zip(&pins).enumerate() {
+        let v = read_pinned_object_value(ctx, *p, *v);
         ctx.set_array_element(arr, i, v);
     }
     let stream = alloc_concurrent_synthetic(ctx, class, 1);
+    let arr = ctx.read_native_pin(arr_pin, arr);
     ctx.set_field(stream, 0, Value::Object(Some(arr)));
+    ctx.unpin_native_roots(first_pin.unwrap_or(arr_pin));
     stream
 }
 
@@ -2029,10 +2342,21 @@ fn p56_stream_peek(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRes
     let this = obj_arg(args, 0)?;
     let consumer = obj_arg(args, 1)?;
     let elems = p56_read_stream_elems(ctx, this);
+    // Pin across the consumer callbacks below — a moving young GC there would
+    // relocate `consumer` and the object elements (native stale-local family).
+    let consumer_pin = ctx.pin_native_root(consumer);
+    let pins = pin_object_values(ctx, &elems);
     // Apply consumer to each element for side effect
-    for v in &elems {
-        ctx.invoke_virtual(consumer, "accept", "(Ljava/lang/Object;)V", &[*v])?;
+    for (v, p) in elems.iter().zip(&pins) {
+        let c = ctx.read_native_pin(consumer_pin, consumer);
+        let v = read_pinned_object_value(ctx, *p, *v);
+        if let Err(e) = ctx.invoke_virtual(c, "accept", "(Ljava/lang/Object;)V", &[v]) {
+            ctx.unpin_native_roots(consumer_pin);
+            return Err(e);
+        }
     }
+    let elems = read_pinned_object_values(ctx, &pins, &elems);
+    ctx.unpin_native_roots(consumer_pin);
     // Return new stream with same elements
     let result = p56_build_stream(ctx, elems, "java/util/stream/Stream");
     Ok(Some(Value::Object(Some(result))))
@@ -2043,14 +2367,28 @@ fn p56_stream_take_while(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
     let this = obj_arg(args, 0)?;
     let predicate = obj_arg(args, 1)?;
     let elems = p56_read_stream_elems(ctx, this);
-    let mut result = Vec::new();
-    for v in elems {
-        let test = ctx.invoke_virtual(predicate, "test", "(Ljava/lang/Object;)Z", &[v])?;
+    // Pin across the predicate callbacks below — a moving young GC there would
+    // relocate `predicate` and the object elements (native stale-local family).
+    let predicate_pin = ctx.pin_native_root(predicate);
+    let pins = pin_object_values(ctx, &elems);
+    let mut taken = 0usize;
+    for (v, p) in elems.iter().zip(&pins) {
+        let pred = ctx.read_native_pin(predicate_pin, predicate);
+        let v = read_pinned_object_value(ctx, *p, *v);
+        let test = match ctx.invoke_virtual(pred, "test", "(Ljava/lang/Object;)Z", &[v]) {
+            Ok(t) => t,
+            Err(e) => {
+                ctx.unpin_native_roots(predicate_pin);
+                return Err(e);
+            }
+        };
         if test.unwrap_or(Value::Int(0)) == Value::Int(0) {
             break;
         }
-        result.push(v);
+        taken += 1;
     }
+    let result = read_pinned_object_values(ctx, &pins[..taken], &elems[..taken]);
+    ctx.unpin_native_roots(predicate_pin);
     let s = p56_build_stream(ctx, result, "java/util/stream/Stream");
     Ok(Some(Value::Object(Some(s))))
 }
@@ -2060,18 +2398,28 @@ fn p56_stream_drop_while(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
     let this = obj_arg(args, 0)?;
     let predicate = obj_arg(args, 1)?;
     let elems = p56_read_stream_elems(ctx, this);
-    let mut dropping = true;
-    let mut result = Vec::new();
-    for v in elems {
-        if dropping {
-            let test = ctx.invoke_virtual(predicate, "test", "(Ljava/lang/Object;)Z", &[v])?;
-            if test.unwrap_or(Value::Int(0)) != Value::Int(0) {
-                continue;
+    // Pin across the predicate callbacks below — a moving young GC there would
+    // relocate `predicate` and the object elements (native stale-local family).
+    let predicate_pin = ctx.pin_native_root(predicate);
+    let pins = pin_object_values(ctx, &elems);
+    let mut start = elems.len();
+    for (i, (v, p)) in elems.iter().zip(&pins).enumerate() {
+        let pred = ctx.read_native_pin(predicate_pin, predicate);
+        let v = read_pinned_object_value(ctx, *p, *v);
+        let test = match ctx.invoke_virtual(pred, "test", "(Ljava/lang/Object;)Z", &[v]) {
+            Ok(t) => t,
+            Err(e) => {
+                ctx.unpin_native_roots(predicate_pin);
+                return Err(e);
             }
-            dropping = false;
+        };
+        if test.unwrap_or(Value::Int(0)) == Value::Int(0) {
+            start = i;
+            break;
         }
-        result.push(v);
     }
+    let result = read_pinned_object_values(ctx, &pins[start..], &elems[start..]);
+    ctx.unpin_native_roots(predicate_pin);
     let s = p56_build_stream(ctx, result, "java/util/stream/Stream");
     Ok(Some(Value::Object(Some(s))))
 }
@@ -2081,9 +2429,19 @@ fn p56_stream_for_each_ordered(ctx: &mut dyn NativeContext, args: &[Value]) -> M
     let this = obj_arg(args, 0)?;
     let consumer = obj_arg(args, 1)?;
     let elems = p56_read_stream_elems(ctx, this);
-    for v in elems {
-        ctx.invoke_virtual(consumer, "accept", "(Ljava/lang/Object;)V", &[v])?;
+    // Pin across the consumer callbacks below — a moving young GC there would
+    // relocate `consumer` and the object elements (native stale-local family).
+    let consumer_pin = ctx.pin_native_root(consumer);
+    let pins = pin_object_values(ctx, &elems);
+    for (v, p) in elems.iter().zip(&pins) {
+        let c = ctx.read_native_pin(consumer_pin, consumer);
+        let v = read_pinned_object_value(ctx, *p, *v);
+        if let Err(e) = ctx.invoke_virtual(c, "accept", "(Ljava/lang/Object;)V", &[v]) {
+            ctx.unpin_native_roots(consumer_pin);
+            return Err(e);
+        }
     }
+    ctx.unpin_native_roots(consumer_pin);
     Ok(None)
 }
 
@@ -2112,18 +2470,36 @@ fn p56_stream_of_nullable(ctx: &mut dyn NativeContext, args: &[Value]) -> Method
 fn p56_stream_iterate(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let seed = args[0];
     let op = obj_arg(args, 1)?;
+    // Pin across the operator callbacks below — a moving young GC there would
+    // relocate `op` and the loop-carried elements (native stale-local family);
+    // each freshly produced element is pinned as it materialises.
+    let op_pin = ctx.pin_native_root(op);
     let mut elems = Vec::with_capacity(256);
+    let mut pins = Vec::with_capacity(256);
     let mut current = seed;
+    let mut current_pin = pinned_object_value(ctx, current);
     for _ in 0..256 {
         elems.push(current);
-        let next = ctx.invoke_virtual(
-            op,
+        pins.push(current_pin);
+        let op_cur = ctx.read_native_pin(op_pin, op);
+        let arg = read_pinned_object_value(ctx, current_pin, current);
+        let next = match ctx.invoke_virtual(
+            op_cur,
             "apply",
             "(Ljava/lang/Object;)Ljava/lang/Object;",
-            &[current],
-        )?;
+            &[arg],
+        ) {
+            Ok(v) => v,
+            Err(e) => {
+                ctx.unpin_native_roots(op_pin);
+                return Err(e);
+            }
+        };
         current = next.unwrap_or(Value::Object(None));
+        current_pin = pinned_object_value(ctx, current);
     }
+    let elems = read_pinned_object_values(ctx, &pins, &elems);
+    ctx.unpin_native_roots(op_pin);
     let s = p56_build_stream(ctx, elems, "java/util/stream/Stream");
     Ok(Some(Value::Object(Some(s))))
 }
@@ -2133,22 +2509,50 @@ fn p56_stream_iterate_predicate(ctx: &mut dyn NativeContext, args: &[Value]) -> 
     let seed = args[0];
     let has_next = obj_arg(args, 1)?;
     let op = obj_arg(args, 2)?;
+    // Pin across the predicate/operator callbacks below — a moving young GC
+    // there would relocate them and the loop-carried elements (native
+    // stale-local family); each freshly produced element is pinned as it
+    // materialises.
+    let has_next_pin = ctx.pin_native_root(has_next);
+    let op_pin = ctx.pin_native_root(op);
     let mut elems = Vec::new();
+    let mut pins = Vec::new();
     let mut current = seed;
+    let mut current_pin = pinned_object_value(ctx, current);
     for _ in 0..10000 {
-        let test = ctx.invoke_virtual(has_next, "test", "(Ljava/lang/Object;)Z", &[current])?;
+        let hn = ctx.read_native_pin(has_next_pin, has_next);
+        let arg = read_pinned_object_value(ctx, current_pin, current);
+        let test = match ctx.invoke_virtual(hn, "test", "(Ljava/lang/Object;)Z", &[arg]) {
+            Ok(t) => t,
+            Err(e) => {
+                ctx.unpin_native_roots(has_next_pin);
+                return Err(e);
+            }
+        };
         if test.unwrap_or(Value::Int(0)) == Value::Int(0) {
             break;
         }
         elems.push(current);
-        let next = ctx.invoke_virtual(
-            op,
+        pins.push(current_pin);
+        let op_cur = ctx.read_native_pin(op_pin, op);
+        let arg = read_pinned_object_value(ctx, current_pin, current);
+        let next = match ctx.invoke_virtual(
+            op_cur,
             "apply",
             "(Ljava/lang/Object;)Ljava/lang/Object;",
-            &[current],
-        )?;
+            &[arg],
+        ) {
+            Ok(v) => v,
+            Err(e) => {
+                ctx.unpin_native_roots(has_next_pin);
+                return Err(e);
+            }
+        };
         current = next.unwrap_or(Value::Object(None));
+        current_pin = pinned_object_value(ctx, current);
     }
+    let elems = read_pinned_object_values(ctx, &pins, &elems);
+    ctx.unpin_native_roots(has_next_pin);
     let s = p56_build_stream(ctx, elems, "java/util/stream/Stream");
     Ok(Some(Value::Object(Some(s))))
 }
@@ -2156,11 +2560,26 @@ fn p56_stream_iterate_predicate(ctx: &mut dyn NativeContext, args: &[Value]) -> 
 // --- Stream.generate(Supplier) — generate 256 elements ---
 fn p56_stream_generate(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let supplier = obj_arg(args, 0)?;
+    // Pin across the supplier callbacks below — a moving young GC there would
+    // relocate `supplier` and the already-produced elements (native
+    // stale-local family); each fresh element is pinned as it materialises.
+    let supplier_pin = ctx.pin_native_root(supplier);
     let mut elems = Vec::with_capacity(256);
+    let mut pins = Vec::with_capacity(256);
     for _ in 0..256 {
-        let v = ctx.invoke_virtual(supplier, "get", "()Ljava/lang/Object;", &[])?;
-        elems.push(v.unwrap_or(Value::Object(None)));
+        let s = ctx.read_native_pin(supplier_pin, supplier);
+        let v = match ctx.invoke_virtual(s, "get", "()Ljava/lang/Object;", &[]) {
+            Ok(v) => v.unwrap_or(Value::Object(None)),
+            Err(e) => {
+                ctx.unpin_native_roots(supplier_pin);
+                return Err(e);
+            }
+        };
+        pins.push(pinned_object_value(ctx, v));
+        elems.push(v);
     }
+    let elems = read_pinned_object_values(ctx, &pins, &elems);
+    ctx.unpin_native_roots(supplier_pin);
     let s = p56_build_stream(ctx, elems, "java/util/stream/Stream");
     Ok(Some(Value::Object(Some(s))))
 }
@@ -2170,19 +2589,32 @@ fn p56_stream_flat_map_to_int(ctx: &mut dyn NativeContext, args: &[Value]) -> Me
     let this = obj_arg(args, 0)?;
     let func = obj_arg(args, 1)?;
     let elems = p56_read_stream_elems(ctx, this);
+    // Pin across the mapper callbacks below — a moving young GC there would
+    // relocate `func` and the object elements (native stale-local family).
+    let func_pin = ctx.pin_native_root(func);
+    let pins = pin_object_values(ctx, &elems);
     let mut ints = Vec::new();
-    for v in elems {
-        let int_stream_val = ctx.invoke_virtual(
-            func,
+    for (v, p) in elems.iter().zip(&pins) {
+        let f = ctx.read_native_pin(func_pin, func);
+        let v = read_pinned_object_value(ctx, *p, *v);
+        let int_stream_val = match ctx.invoke_virtual(
+            f,
             "apply",
             "(Ljava/lang/Object;)Ljava/lang/Object;",
             &[v],
-        )?;
+        ) {
+            Ok(r) => r,
+            Err(e) => {
+                ctx.unpin_native_roots(func_pin);
+                return Err(e);
+            }
+        };
         if let Some(Value::Object(Some(is))) = int_stream_val {
             let inner = p56_read_stream_elems(ctx, is);
             ints.extend(inner);
         }
     }
+    ctx.unpin_native_roots(func_pin);
     let s = p56_build_stream(ctx, ints, "java/util/stream/IntStream");
     Ok(Some(Value::Object(Some(s))))
 }
@@ -2192,19 +2624,32 @@ fn p56_stream_flat_map_to_long(ctx: &mut dyn NativeContext, args: &[Value]) -> M
     let this = obj_arg(args, 0)?;
     let func = obj_arg(args, 1)?;
     let elems = p56_read_stream_elems(ctx, this);
+    // Pin across the mapper callbacks below — a moving young GC there would
+    // relocate `func` and the object elements (native stale-local family).
+    let func_pin = ctx.pin_native_root(func);
+    let pins = pin_object_values(ctx, &elems);
     let mut longs = Vec::new();
-    for v in elems {
-        let long_stream_val = ctx.invoke_virtual(
-            func,
+    for (v, p) in elems.iter().zip(&pins) {
+        let f = ctx.read_native_pin(func_pin, func);
+        let v = read_pinned_object_value(ctx, *p, *v);
+        let long_stream_val = match ctx.invoke_virtual(
+            f,
             "apply",
             "(Ljava/lang/Object;)Ljava/lang/Object;",
             &[v],
-        )?;
+        ) {
+            Ok(r) => r,
+            Err(e) => {
+                ctx.unpin_native_roots(func_pin);
+                return Err(e);
+            }
+        };
         if let Some(Value::Object(Some(ls))) = long_stream_val {
             let inner = p56_read_stream_elems(ctx, ls);
             longs.extend(inner);
         }
     }
+    ctx.unpin_native_roots(func_pin);
     let s = p56_build_stream(ctx, longs, "java/util/stream/LongStream");
     Ok(Some(Value::Object(Some(s))))
 }
@@ -2214,19 +2659,32 @@ fn p56_stream_flat_map_to_double(ctx: &mut dyn NativeContext, args: &[Value]) ->
     let this = obj_arg(args, 0)?;
     let func = obj_arg(args, 1)?;
     let elems = p56_read_stream_elems(ctx, this);
+    // Pin across the mapper callbacks below — a moving young GC there would
+    // relocate `func` and the object elements (native stale-local family).
+    let func_pin = ctx.pin_native_root(func);
+    let pins = pin_object_values(ctx, &elems);
     let mut doubles = Vec::new();
-    for v in elems {
-        let dbl_stream_val = ctx.invoke_virtual(
-            func,
+    for (v, p) in elems.iter().zip(&pins) {
+        let f = ctx.read_native_pin(func_pin, func);
+        let v = read_pinned_object_value(ctx, *p, *v);
+        let dbl_stream_val = match ctx.invoke_virtual(
+            f,
             "apply",
             "(Ljava/lang/Object;)Ljava/lang/Object;",
             &[v],
-        )?;
+        ) {
+            Ok(r) => r,
+            Err(e) => {
+                ctx.unpin_native_roots(func_pin);
+                return Err(e);
+            }
+        };
         if let Some(Value::Object(Some(ds))) = dbl_stream_val {
             let inner = p56_read_stream_elems(ctx, ds);
             doubles.extend(inner);
         }
     }
+    ctx.unpin_native_roots(func_pin);
     let s = p56_build_stream(ctx, doubles, "java/util/stream/DoubleStream");
     Ok(Some(Value::Object(Some(s))))
 }
@@ -2236,11 +2694,24 @@ fn p56_stream_map_to_int(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
     let this = obj_arg(args, 0)?;
     let func = obj_arg(args, 1)?;
     let elems = p56_read_stream_elems(ctx, this);
+    // Pin across the mapper callbacks below — a moving young GC there would
+    // relocate `func` and the object elements (native stale-local family).
+    let func_pin = ctx.pin_native_root(func);
+    let pins = pin_object_values(ctx, &elems);
     let mut ints = Vec::new();
-    for v in elems {
-        let r = ctx.invoke_virtual(func, "applyAsInt", "(Ljava/lang/Object;)I", &[v])?;
+    for (v, p) in elems.iter().zip(&pins) {
+        let f = ctx.read_native_pin(func_pin, func);
+        let v = read_pinned_object_value(ctx, *p, *v);
+        let r = match ctx.invoke_virtual(f, "applyAsInt", "(Ljava/lang/Object;)I", &[v]) {
+            Ok(r) => r,
+            Err(e) => {
+                ctx.unpin_native_roots(func_pin);
+                return Err(e);
+            }
+        };
         ints.push(r.unwrap_or(Value::Int(0)));
     }
+    ctx.unpin_native_roots(func_pin);
     let s = p56_build_stream(ctx, ints, "java/util/stream/IntStream");
     Ok(Some(Value::Object(Some(s))))
 }
@@ -2250,11 +2721,24 @@ fn p56_stream_map_to_long(ctx: &mut dyn NativeContext, args: &[Value]) -> Method
     let this = obj_arg(args, 0)?;
     let func = obj_arg(args, 1)?;
     let elems = p56_read_stream_elems(ctx, this);
+    // Pin across the mapper callbacks below — a moving young GC there would
+    // relocate `func` and the object elements (native stale-local family).
+    let func_pin = ctx.pin_native_root(func);
+    let pins = pin_object_values(ctx, &elems);
     let mut longs = Vec::new();
-    for v in elems {
-        let r = ctx.invoke_virtual(func, "applyAsLong", "(Ljava/lang/Object;)J", &[v])?;
+    for (v, p) in elems.iter().zip(&pins) {
+        let f = ctx.read_native_pin(func_pin, func);
+        let v = read_pinned_object_value(ctx, *p, *v);
+        let r = match ctx.invoke_virtual(f, "applyAsLong", "(Ljava/lang/Object;)J", &[v]) {
+            Ok(r) => r,
+            Err(e) => {
+                ctx.unpin_native_roots(func_pin);
+                return Err(e);
+            }
+        };
         longs.push(r.unwrap_or(Value::Long(0)));
     }
+    ctx.unpin_native_roots(func_pin);
     let s = p56_build_stream(ctx, longs, "java/util/stream/LongStream");
     Ok(Some(Value::Object(Some(s))))
 }
@@ -2264,11 +2748,24 @@ fn p56_stream_map_to_double(ctx: &mut dyn NativeContext, args: &[Value]) -> Meth
     let this = obj_arg(args, 0)?;
     let func = obj_arg(args, 1)?;
     let elems = p56_read_stream_elems(ctx, this);
+    // Pin across the mapper callbacks below — a moving young GC there would
+    // relocate `func` and the object elements (native stale-local family).
+    let func_pin = ctx.pin_native_root(func);
+    let pins = pin_object_values(ctx, &elems);
     let mut doubles = Vec::new();
-    for v in elems {
-        let r = ctx.invoke_virtual(func, "applyAsDouble", "(Ljava/lang/Object;)D", &[v])?;
+    for (v, p) in elems.iter().zip(&pins) {
+        let f = ctx.read_native_pin(func_pin, func);
+        let v = read_pinned_object_value(ctx, *p, *v);
+        let r = match ctx.invoke_virtual(f, "applyAsDouble", "(Ljava/lang/Object;)D", &[v]) {
+            Ok(r) => r,
+            Err(e) => {
+                ctx.unpin_native_roots(func_pin);
+                return Err(e);
+            }
+        };
         doubles.push(r.unwrap_or(Value::Double(0.0)));
     }
+    ctx.unpin_native_roots(func_pin);
     let s = p56_build_stream(ctx, doubles, "java/util/stream/DoubleStream");
     Ok(Some(Value::Object(Some(s))))
 }
@@ -2278,9 +2775,17 @@ fn p56_int_stream_peek(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCal
     let this = obj_arg(args, 0)?;
     let consumer = obj_arg(args, 1)?;
     let elems = p56_read_stream_elems(ctx, this);
+    // Pin across the consumer callbacks below — a moving young GC there would
+    // relocate `consumer` (native stale-local family; elements are primitive).
+    let consumer_pin = ctx.pin_native_root(consumer);
     for v in &elems {
-        ctx.invoke_virtual(consumer, "accept", "(I)V", &[*v])?;
+        let c = ctx.read_native_pin(consumer_pin, consumer);
+        if let Err(e) = ctx.invoke_virtual(c, "accept", "(I)V", &[*v]) {
+            ctx.unpin_native_roots(consumer_pin);
+            return Err(e);
+        }
     }
+    ctx.unpin_native_roots(consumer_pin);
     let result = p56_build_stream(ctx, elems, "java/util/stream/IntStream");
     Ok(Some(Value::Object(Some(result))))
 }
@@ -2290,14 +2795,25 @@ fn p56_int_stream_take_while(ctx: &mut dyn NativeContext, args: &[Value]) -> Met
     let this = obj_arg(args, 0)?;
     let predicate = obj_arg(args, 1)?;
     let elems = p56_read_stream_elems(ctx, this);
+    // Pin across the predicate callbacks below — a moving young GC there would
+    // relocate `predicate` (native stale-local family; elements are primitive).
+    let predicate_pin = ctx.pin_native_root(predicate);
     let mut result = Vec::new();
     for v in elems {
-        let test = ctx.invoke_virtual(predicate, "test", "(I)Z", &[v])?;
+        let pred = ctx.read_native_pin(predicate_pin, predicate);
+        let test = match ctx.invoke_virtual(pred, "test", "(I)Z", &[v]) {
+            Ok(t) => t,
+            Err(e) => {
+                ctx.unpin_native_roots(predicate_pin);
+                return Err(e);
+            }
+        };
         if test.unwrap_or(Value::Int(0)) == Value::Int(0) {
             break;
         }
         result.push(v);
     }
+    ctx.unpin_native_roots(predicate_pin);
     let s = p56_build_stream(ctx, result, "java/util/stream/IntStream");
     Ok(Some(Value::Object(Some(s))))
 }
@@ -2307,11 +2823,21 @@ fn p56_int_stream_drop_while(ctx: &mut dyn NativeContext, args: &[Value]) -> Met
     let this = obj_arg(args, 0)?;
     let predicate = obj_arg(args, 1)?;
     let elems = p56_read_stream_elems(ctx, this);
+    // Pin across the predicate callbacks below — a moving young GC there would
+    // relocate `predicate` (native stale-local family; elements are primitive).
+    let predicate_pin = ctx.pin_native_root(predicate);
     let mut dropping = true;
     let mut result = Vec::new();
     for v in elems {
         if dropping {
-            let test = ctx.invoke_virtual(predicate, "test", "(I)Z", &[v])?;
+            let pred = ctx.read_native_pin(predicate_pin, predicate);
+            let test = match ctx.invoke_virtual(pred, "test", "(I)Z", &[v]) {
+                Ok(t) => t,
+                Err(e) => {
+                    ctx.unpin_native_roots(predicate_pin);
+                    return Err(e);
+                }
+            };
             if test.unwrap_or(Value::Int(0)) != Value::Int(0) {
                 continue;
             }
@@ -2319,6 +2845,7 @@ fn p56_int_stream_drop_while(ctx: &mut dyn NativeContext, args: &[Value]) -> Met
         }
         result.push(v);
     }
+    ctx.unpin_native_roots(predicate_pin);
     let s = p56_build_stream(ctx, result, "java/util/stream/IntStream");
     Ok(Some(Value::Object(Some(s))))
 }
@@ -2341,12 +2868,25 @@ fn p56_int_stream_sorted(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
 fn p56_int_stream_boxed(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = obj_arg(args, 0)?;
     let elems = p56_read_stream_elems(ctx, this);
-    // Each Int is already a Value::Int, box by wrapping in Integer wrapper
+    // Each Int is already a Value::Int, box by wrapping in Integer wrapper.
+    // Pin each wrapper across the subsequent allocs — a moving young GC there
+    // would relocate the earlier wrappers (native stale-local family).
     let mut boxed = Vec::with_capacity(elems.len());
+    let mut pins = Vec::with_capacity(elems.len());
+    let mut first_pin = None;
     for v in elems {
         let wrapper = alloc_concurrent_synthetic(ctx, "java/lang/Integer", 1);
+        let h = ctx.pin_native_root(wrapper);
+        if first_pin.is_none() {
+            first_pin = Some(h);
+        }
         ctx.set_field(wrapper, 0, v);
         boxed.push(Value::Object(Some(wrapper)));
+        pins.push(Some((h, wrapper)));
+    }
+    let boxed = read_pinned_object_values(ctx, &pins, &boxed);
+    if let Some(h) = first_pin {
+        ctx.unpin_native_roots(h);
     }
     let s = p56_build_stream(ctx, boxed, "java/util/stream/Stream");
     Ok(Some(Value::Object(Some(s))))
@@ -2400,9 +2940,17 @@ fn p56_int_stream_for_each_ordered(
     let this = obj_arg(args, 0)?;
     let consumer = obj_arg(args, 1)?;
     let elems = p56_read_stream_elems(ctx, this);
+    // Pin across the consumer callbacks below — a moving young GC there would
+    // relocate `consumer` (native stale-local family; elements are primitive).
+    let consumer_pin = ctx.pin_native_root(consumer);
     for v in elems {
-        ctx.invoke_virtual(consumer, "accept", "(I)V", &[v])?;
+        let c = ctx.read_native_pin(consumer_pin, consumer);
+        if let Err(e) = ctx.invoke_virtual(c, "accept", "(I)V", &[v]) {
+            ctx.unpin_native_roots(consumer_pin);
+            return Err(e);
+        }
     }
+    ctx.unpin_native_roots(consumer_pin);
     Ok(None)
 }
 
@@ -2411,9 +2959,17 @@ fn p56_long_stream_peek(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCa
     let this = obj_arg(args, 0)?;
     let consumer = obj_arg(args, 1)?;
     let elems = p56_read_stream_elems(ctx, this);
+    // Pin across the consumer callbacks below — a moving young GC there would
+    // relocate `consumer` (native stale-local family; elements are primitive).
+    let consumer_pin = ctx.pin_native_root(consumer);
     for v in &elems {
-        ctx.invoke_virtual(consumer, "accept", "(J)V", &[*v])?;
+        let c = ctx.read_native_pin(consumer_pin, consumer);
+        if let Err(e) = ctx.invoke_virtual(c, "accept", "(J)V", &[*v]) {
+            ctx.unpin_native_roots(consumer_pin);
+            return Err(e);
+        }
     }
+    ctx.unpin_native_roots(consumer_pin);
     let result = p56_build_stream(ctx, elems, "java/util/stream/LongStream");
     Ok(Some(Value::Object(Some(result))))
 }
@@ -2423,14 +2979,25 @@ fn p56_long_stream_take_while(ctx: &mut dyn NativeContext, args: &[Value]) -> Me
     let this = obj_arg(args, 0)?;
     let predicate = obj_arg(args, 1)?;
     let elems = p56_read_stream_elems(ctx, this);
+    // Pin across the predicate callbacks below — a moving young GC there would
+    // relocate `predicate` (native stale-local family; elements are primitive).
+    let predicate_pin = ctx.pin_native_root(predicate);
     let mut result = Vec::new();
     for v in elems {
-        let test = ctx.invoke_virtual(predicate, "test", "(J)Z", &[v])?;
+        let pred = ctx.read_native_pin(predicate_pin, predicate);
+        let test = match ctx.invoke_virtual(pred, "test", "(J)Z", &[v]) {
+            Ok(t) => t,
+            Err(e) => {
+                ctx.unpin_native_roots(predicate_pin);
+                return Err(e);
+            }
+        };
         if test.unwrap_or(Value::Int(0)) == Value::Int(0) {
             break;
         }
         result.push(v);
     }
+    ctx.unpin_native_roots(predicate_pin);
     let s = p56_build_stream(ctx, result, "java/util/stream/LongStream");
     Ok(Some(Value::Object(Some(s))))
 }
@@ -2440,11 +3007,21 @@ fn p56_long_stream_drop_while(ctx: &mut dyn NativeContext, args: &[Value]) -> Me
     let this = obj_arg(args, 0)?;
     let predicate = obj_arg(args, 1)?;
     let elems = p56_read_stream_elems(ctx, this);
+    // Pin across the predicate callbacks below — a moving young GC there would
+    // relocate `predicate` (native stale-local family; elements are primitive).
+    let predicate_pin = ctx.pin_native_root(predicate);
     let mut dropping = true;
     let mut result = Vec::new();
     for v in elems {
         if dropping {
-            let test = ctx.invoke_virtual(predicate, "test", "(J)Z", &[v])?;
+            let pred = ctx.read_native_pin(predicate_pin, predicate);
+            let test = match ctx.invoke_virtual(pred, "test", "(J)Z", &[v]) {
+                Ok(t) => t,
+                Err(e) => {
+                    ctx.unpin_native_roots(predicate_pin);
+                    return Err(e);
+                }
+            };
             if test.unwrap_or(Value::Int(0)) != Value::Int(0) {
                 continue;
             }
@@ -2452,6 +3029,7 @@ fn p56_long_stream_drop_while(ctx: &mut dyn NativeContext, args: &[Value]) -> Me
         }
         result.push(v);
     }
+    ctx.unpin_native_roots(predicate_pin);
     let s = p56_build_stream(ctx, result, "java/util/stream/LongStream");
     Ok(Some(Value::Object(Some(s))))
 }
@@ -2460,11 +3038,24 @@ fn p56_long_stream_drop_while(ctx: &mut dyn NativeContext, args: &[Value]) -> Me
 fn p56_long_stream_boxed(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = obj_arg(args, 0)?;
     let elems = p56_read_stream_elems(ctx, this);
+    // Pin each wrapper across the subsequent allocs — a moving young GC there
+    // would relocate the earlier wrappers (native stale-local family).
     let mut boxed = Vec::with_capacity(elems.len());
+    let mut pins = Vec::with_capacity(elems.len());
+    let mut first_pin = None;
     for v in elems {
         let wrapper = alloc_concurrent_synthetic(ctx, "java/lang/Long", 1);
+        let h = ctx.pin_native_root(wrapper);
+        if first_pin.is_none() {
+            first_pin = Some(h);
+        }
         ctx.set_field(wrapper, 0, v);
         boxed.push(Value::Object(Some(wrapper)));
+        pins.push(Some((h, wrapper)));
+    }
+    let boxed = read_pinned_object_values(ctx, &pins, &boxed);
+    if let Some(h) = first_pin {
+        ctx.unpin_native_roots(h);
     }
     let s = p56_build_stream(ctx, boxed, "java/util/stream/Stream");
     Ok(Some(Value::Object(Some(s))))
@@ -2480,11 +3071,26 @@ fn p56_long_stream_map_to_obj(ctx: &mut dyn NativeContext, args: &[Value]) -> Me
     let this = obj_arg(args, 0)?;
     let func = obj_arg(args, 1)?;
     let elems = p56_read_stream_elems(ctx, this);
+    // Pin across the mapper callbacks below — a moving young GC there would
+    // relocate `func` and the already-mapped results (native stale-local
+    // family); each fresh result is pinned as it materialises.
+    let func_pin = ctx.pin_native_root(func);
     let mut out = Vec::with_capacity(elems.len());
+    let mut pins = Vec::with_capacity(elems.len());
     for v in elems {
-        let mapped = ctx.invoke_virtual(func, "apply", "(J)Ljava/lang/Object;", &[v])?;
-        out.push(mapped.unwrap_or(Value::Object(None)));
+        let f = ctx.read_native_pin(func_pin, func);
+        let mapped = match ctx.invoke_virtual(f, "apply", "(J)Ljava/lang/Object;", &[v]) {
+            Ok(m) => m.unwrap_or(Value::Object(None)),
+            Err(e) => {
+                ctx.unpin_native_roots(func_pin);
+                return Err(e);
+            }
+        };
+        pins.push(pinned_object_value(ctx, mapped));
+        out.push(mapped);
     }
+    let out = read_pinned_object_values(ctx, &pins, &out);
+    ctx.unpin_native_roots(func_pin);
     let s = p56_build_stream(ctx, out, "java/util/stream/Stream");
     Ok(Some(Value::Object(Some(s))))
 }
@@ -2494,11 +3100,26 @@ fn p56_double_stream_map_to_obj(ctx: &mut dyn NativeContext, args: &[Value]) -> 
     let this = obj_arg(args, 0)?;
     let func = obj_arg(args, 1)?;
     let elems = p56_read_stream_elems(ctx, this);
+    // Pin across the mapper callbacks below — a moving young GC there would
+    // relocate `func` and the already-mapped results (native stale-local
+    // family); each fresh result is pinned as it materialises.
+    let func_pin = ctx.pin_native_root(func);
     let mut out = Vec::with_capacity(elems.len());
+    let mut pins = Vec::with_capacity(elems.len());
     for v in elems {
-        let mapped = ctx.invoke_virtual(func, "apply", "(D)Ljava/lang/Object;", &[v])?;
-        out.push(mapped.unwrap_or(Value::Object(None)));
+        let f = ctx.read_native_pin(func_pin, func);
+        let mapped = match ctx.invoke_virtual(f, "apply", "(D)Ljava/lang/Object;", &[v]) {
+            Ok(m) => m.unwrap_or(Value::Object(None)),
+            Err(e) => {
+                ctx.unpin_native_roots(func_pin);
+                return Err(e);
+            }
+        };
+        pins.push(pinned_object_value(ctx, mapped));
+        out.push(mapped);
     }
+    let out = read_pinned_object_values(ctx, &pins, &out);
+    ctx.unpin_native_roots(func_pin);
     let s = p56_build_stream(ctx, out, "java/util/stream/Stream");
     Ok(Some(Value::Object(Some(s))))
 }
@@ -2533,9 +3154,17 @@ fn p56_double_stream_peek(ctx: &mut dyn NativeContext, args: &[Value]) -> Method
     let this = obj_arg(args, 0)?;
     let consumer = obj_arg(args, 1)?;
     let elems = p56_read_stream_elems(ctx, this);
+    // Pin across the consumer callbacks below — a moving young GC there would
+    // relocate `consumer` (native stale-local family; elements are primitive).
+    let consumer_pin = ctx.pin_native_root(consumer);
     for v in &elems {
-        ctx.invoke_virtual(consumer, "accept", "(D)V", &[*v])?;
+        let c = ctx.read_native_pin(consumer_pin, consumer);
+        if let Err(e) = ctx.invoke_virtual(c, "accept", "(D)V", &[*v]) {
+            ctx.unpin_native_roots(consumer_pin);
+            return Err(e);
+        }
     }
+    ctx.unpin_native_roots(consumer_pin);
     let result = p56_build_stream(ctx, elems, "java/util/stream/DoubleStream");
     Ok(Some(Value::Object(Some(result))))
 }
@@ -2545,14 +3174,25 @@ fn p56_double_stream_take_while(ctx: &mut dyn NativeContext, args: &[Value]) -> 
     let this = obj_arg(args, 0)?;
     let predicate = obj_arg(args, 1)?;
     let elems = p56_read_stream_elems(ctx, this);
+    // Pin across the predicate callbacks below — a moving young GC there would
+    // relocate `predicate` (native stale-local family; elements are primitive).
+    let predicate_pin = ctx.pin_native_root(predicate);
     let mut result = Vec::new();
     for v in elems {
-        let test = ctx.invoke_virtual(predicate, "test", "(D)Z", &[v])?;
+        let pred = ctx.read_native_pin(predicate_pin, predicate);
+        let test = match ctx.invoke_virtual(pred, "test", "(D)Z", &[v]) {
+            Ok(t) => t,
+            Err(e) => {
+                ctx.unpin_native_roots(predicate_pin);
+                return Err(e);
+            }
+        };
         if test.unwrap_or(Value::Int(0)) == Value::Int(0) {
             break;
         }
         result.push(v);
     }
+    ctx.unpin_native_roots(predicate_pin);
     let s = p56_build_stream(ctx, result, "java/util/stream/DoubleStream");
     Ok(Some(Value::Object(Some(s))))
 }
@@ -2562,11 +3202,21 @@ fn p56_double_stream_drop_while(ctx: &mut dyn NativeContext, args: &[Value]) -> 
     let this = obj_arg(args, 0)?;
     let predicate = obj_arg(args, 1)?;
     let elems = p56_read_stream_elems(ctx, this);
+    // Pin across the predicate callbacks below — a moving young GC there would
+    // relocate `predicate` (native stale-local family; elements are primitive).
+    let predicate_pin = ctx.pin_native_root(predicate);
     let mut dropping = true;
     let mut result = Vec::new();
     for v in elems {
         if dropping {
-            let test = ctx.invoke_virtual(predicate, "test", "(D)Z", &[v])?;
+            let pred = ctx.read_native_pin(predicate_pin, predicate);
+            let test = match ctx.invoke_virtual(pred, "test", "(D)Z", &[v]) {
+                Ok(t) => t,
+                Err(e) => {
+                    ctx.unpin_native_roots(predicate_pin);
+                    return Err(e);
+                }
+            };
             if test.unwrap_or(Value::Int(0)) != Value::Int(0) {
                 continue;
             }
@@ -2574,6 +3224,7 @@ fn p56_double_stream_drop_while(ctx: &mut dyn NativeContext, args: &[Value]) -> 
         }
         result.push(v);
     }
+    ctx.unpin_native_roots(predicate_pin);
     let s = p56_build_stream(ctx, result, "java/util/stream/DoubleStream");
     Ok(Some(Value::Object(Some(s))))
 }
@@ -2582,11 +3233,24 @@ fn p56_double_stream_drop_while(ctx: &mut dyn NativeContext, args: &[Value]) -> 
 fn p56_double_stream_boxed(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = obj_arg(args, 0)?;
     let elems = p56_read_stream_elems(ctx, this);
+    // Pin each wrapper across the subsequent allocs — a moving young GC there
+    // would relocate the earlier wrappers (native stale-local family).
     let mut boxed = Vec::with_capacity(elems.len());
+    let mut pins = Vec::with_capacity(elems.len());
+    let mut first_pin = None;
     for v in elems {
         let wrapper = alloc_concurrent_synthetic(ctx, "java/lang/Double", 1);
+        let h = ctx.pin_native_root(wrapper);
+        if first_pin.is_none() {
+            first_pin = Some(h);
+        }
         ctx.set_field(wrapper, 0, v);
         boxed.push(Value::Object(Some(wrapper)));
+        pins.push(Some((h, wrapper)));
+    }
+    let boxed = read_pinned_object_values(ctx, &pins, &boxed);
+    if let Some(h) = first_pin {
+        ctx.unpin_native_roots(h);
     }
     let s = p56_build_stream(ctx, boxed, "java/util/stream/Stream");
     Ok(Some(Value::Object(Some(s))))
@@ -3033,9 +3697,16 @@ pub(crate) fn register_phase56_collectors_extras(r: &mut NativeMethodRegistry) {
         "(Ljava/util/Comparator;)Ljava/util/stream/Collector;",
         |ctx, args| {
             let comparator = args[0];
+            // Pin across the Collector alloc below — a moving young GC there
+            // would relocate it (native stale-local family).
+            let comparator_pin = pinned_object_value(ctx, comparator);
             let c = alloc_concurrent_synthetic(ctx, "java/util/stream/Collector", 3);
+            let comparator = read_pinned_object_value(ctx, comparator_pin, comparator);
             ctx.set_field(c, 0, Value::Int(P56_COLLECTOR_MAX_BY));
             ctx.set_field(c, 1, comparator);
+            if let Some((h, _)) = comparator_pin {
+                ctx.unpin_native_roots(h);
+            }
             Ok(Some(Value::Object(Some(c))))
         },
     );
@@ -3047,9 +3718,16 @@ pub(crate) fn register_phase56_collectors_extras(r: &mut NativeMethodRegistry) {
         "(Ljava/util/Comparator;)Ljava/util/stream/Collector;",
         |ctx, args| {
             let comparator = args[0];
+            // Pin across the Collector alloc below — a moving young GC there
+            // would relocate it (native stale-local family).
+            let comparator_pin = pinned_object_value(ctx, comparator);
             let c = alloc_concurrent_synthetic(ctx, "java/util/stream/Collector", 3);
+            let comparator = read_pinned_object_value(ctx, comparator_pin, comparator);
             ctx.set_field(c, 0, Value::Int(P56_COLLECTOR_MIN_BY));
             ctx.set_field(c, 1, comparator);
+            if let Some((h, _)) = comparator_pin {
+                ctx.unpin_native_roots(h);
+            }
             Ok(Some(Value::Object(Some(c))))
         },
     );
@@ -3060,10 +3738,23 @@ pub(crate) fn register_phase56_collectors_extras(r: &mut NativeMethodRegistry) {
         "mapping",
         "(Ljava/util/function/Function;Ljava/util/stream/Collector;)Ljava/util/stream/Collector;",
         |ctx, args| {
+            let func = args[0];
+            let downstream = args[1];
+            // Pin across the Collector alloc below — a moving young GC there
+            // would relocate them (native stale-local family).
+            let func_pin = pinned_object_value(ctx, func);
+            let downstream_pin = pinned_object_value(ctx, downstream);
             let c = alloc_concurrent_synthetic(ctx, "java/util/stream/Collector", 3);
             ctx.set_field(c, 0, Value::Int(P56_COLLECTOR_MAPPING));
-            ctx.set_field(c, 1, args[0]); // Function
-            ctx.set_field(c, 2, args[1]); // downstream Collector
+            ctx.set_field(c, 1, read_pinned_object_value(ctx, func_pin, func)); // Function
+            ctx.set_field(
+                c,
+                2,
+                read_pinned_object_value(ctx, downstream_pin, downstream),
+            ); // downstream Collector
+            if let Some((h, _)) = func_pin.or(downstream_pin) {
+                ctx.unpin_native_roots(h);
+            }
             Ok(Some(Value::Object(Some(c))))
         },
     );
@@ -3074,10 +3765,23 @@ pub(crate) fn register_phase56_collectors_extras(r: &mut NativeMethodRegistry) {
         "filtering",
         "(Ljava/util/function/Predicate;Ljava/util/stream/Collector;)Ljava/util/stream/Collector;",
         |ctx, args| {
+            let pred = args[0];
+            let downstream = args[1];
+            // Pin across the Collector alloc below — a moving young GC there
+            // would relocate them (native stale-local family).
+            let pred_pin = pinned_object_value(ctx, pred);
+            let downstream_pin = pinned_object_value(ctx, downstream);
             let c = alloc_concurrent_synthetic(ctx, "java/util/stream/Collector", 3);
             ctx.set_field(c, 0, Value::Int(P56_COLLECTOR_FILTERING));
-            ctx.set_field(c, 1, args[0]); // Predicate
-            ctx.set_field(c, 2, args[1]); // downstream Collector
+            ctx.set_field(c, 1, read_pinned_object_value(ctx, pred_pin, pred)); // Predicate
+            ctx.set_field(
+                c,
+                2,
+                read_pinned_object_value(ctx, downstream_pin, downstream),
+            ); // downstream Collector
+            if let Some((h, _)) = pred_pin.or(downstream_pin) {
+                ctx.unpin_native_roots(h);
+            }
             Ok(Some(Value::Object(Some(c))))
         },
     );
@@ -3088,9 +3792,16 @@ pub(crate) fn register_phase56_collectors_extras(r: &mut NativeMethodRegistry) {
         "summarizingInt",
         "(Ljava/util/function/ToIntFunction;)Ljava/util/stream/Collector;",
         |ctx, args| {
+            let func = args[0];
+            // Pin across the Collector alloc below — a moving young GC there
+            // would relocate it (native stale-local family).
+            let func_pin = pinned_object_value(ctx, func);
             let c = alloc_concurrent_synthetic(ctx, "java/util/stream/Collector", 3);
             ctx.set_field(c, 0, Value::Int(P56_COLLECTOR_SUMMARIZING_INT));
-            ctx.set_field(c, 1, args[0]);
+            ctx.set_field(c, 1, read_pinned_object_value(ctx, func_pin, func));
+            if let Some((h, _)) = func_pin {
+                ctx.unpin_native_roots(h);
+            }
             Ok(Some(Value::Object(Some(c))))
         },
     );
@@ -3101,9 +3812,16 @@ pub(crate) fn register_phase56_collectors_extras(r: &mut NativeMethodRegistry) {
         "summarizingLong",
         "(Ljava/util/function/ToLongFunction;)Ljava/util/stream/Collector;",
         |ctx, args| {
+            let func = args[0];
+            // Pin across the Collector alloc below — a moving young GC there
+            // would relocate it (native stale-local family).
+            let func_pin = pinned_object_value(ctx, func);
             let c = alloc_concurrent_synthetic(ctx, "java/util/stream/Collector", 3);
             ctx.set_field(c, 0, Value::Int(P56_COLLECTOR_SUMMARIZING_LONG));
-            ctx.set_field(c, 1, args[0]);
+            ctx.set_field(c, 1, read_pinned_object_value(ctx, func_pin, func));
+            if let Some((h, _)) = func_pin {
+                ctx.unpin_native_roots(h);
+            }
             Ok(Some(Value::Object(Some(c))))
         },
     );
@@ -3114,9 +3832,16 @@ pub(crate) fn register_phase56_collectors_extras(r: &mut NativeMethodRegistry) {
         "summarizingDouble",
         "(Ljava/util/function/ToDoubleFunction;)Ljava/util/stream/Collector;",
         |ctx, args| {
+            let func = args[0];
+            // Pin across the Collector alloc below — a moving young GC there
+            // would relocate it (native stale-local family).
+            let func_pin = pinned_object_value(ctx, func);
             let c = alloc_concurrent_synthetic(ctx, "java/util/stream/Collector", 3);
             ctx.set_field(c, 0, Value::Int(P56_COLLECTOR_SUMMARIZING_DOUBLE));
-            ctx.set_field(c, 1, args[0]);
+            ctx.set_field(c, 1, read_pinned_object_value(ctx, func_pin, func));
+            if let Some((h, _)) = func_pin {
+                ctx.unpin_native_roots(h);
+            }
             Ok(Some(Value::Object(Some(c))))
         },
     );
@@ -3151,10 +3876,23 @@ pub(crate) fn register_phase56_collectors_extras(r: &mut NativeMethodRegistry) {
         "collectingAndThen",
         "(Ljava/util/stream/Collector;Ljava/util/function/Function;)Ljava/util/stream/Collector;",
         |ctx, args| {
+            let downstream = args[0];
+            let finisher = args[1];
+            // Pin across the Collector alloc below — a moving young GC there
+            // would relocate them (native stale-local family).
+            let downstream_pin = pinned_object_value(ctx, downstream);
+            let finisher_pin = pinned_object_value(ctx, finisher);
             let c = alloc_concurrent_synthetic(ctx, "java/util/stream/Collector", 3);
             ctx.set_field(c, 0, Value::Int(P56_COLLECTOR_COLLECTING_AND_THEN));
-            ctx.set_field(c, 1, args[0]); // downstream Collector
-            ctx.set_field(c, 2, args[1]); // finisher Function
+            ctx.set_field(
+                c,
+                1,
+                read_pinned_object_value(ctx, downstream_pin, downstream),
+            ); // downstream Collector
+            ctx.set_field(c, 2, read_pinned_object_value(ctx, finisher_pin, finisher)); // finisher Function
+            if let Some((h, _)) = downstream_pin.or(finisher_pin) {
+                ctx.unpin_native_roots(h);
+            }
             Ok(Some(Value::Object(Some(c))))
         },
     );
@@ -3167,9 +3905,16 @@ pub(crate) fn register_phase56_collectors_extras(r: &mut NativeMethodRegistry) {
         "averagingInt",
         "(Ljava/util/function/ToIntFunction;)Ljava/util/stream/Collector;",
         |ctx, args| {
+            let func = args[0];
+            // Pin across the Collector alloc below — a moving young GC there
+            // would relocate it (native stale-local family).
+            let func_pin = pinned_object_value(ctx, func);
             let c = alloc_concurrent_synthetic(ctx, "java/util/stream/Collector", 3);
             ctx.set_field(c, 0, Value::Int(19)); // AVERAGING_INT
-            ctx.set_field(c, 1, args[0]);
+            ctx.set_field(c, 1, read_pinned_object_value(ctx, func_pin, func));
+            if let Some((h, _)) = func_pin {
+                ctx.unpin_native_roots(h);
+            }
             Ok(Some(Value::Object(Some(c))))
         },
     );
@@ -3178,9 +3923,16 @@ pub(crate) fn register_phase56_collectors_extras(r: &mut NativeMethodRegistry) {
         "averagingLong",
         "(Ljava/util/function/ToLongFunction;)Ljava/util/stream/Collector;",
         |ctx, args| {
+            let func = args[0];
+            // Pin across the Collector alloc below — a moving young GC there
+            // would relocate it (native stale-local family).
+            let func_pin = pinned_object_value(ctx, func);
             let c = alloc_concurrent_synthetic(ctx, "java/util/stream/Collector", 3);
             ctx.set_field(c, 0, Value::Int(20)); // AVERAGING_LONG
-            ctx.set_field(c, 1, args[0]);
+            ctx.set_field(c, 1, read_pinned_object_value(ctx, func_pin, func));
+            if let Some((h, _)) = func_pin {
+                ctx.unpin_native_roots(h);
+            }
             Ok(Some(Value::Object(Some(c))))
         },
     );
@@ -3189,9 +3941,16 @@ pub(crate) fn register_phase56_collectors_extras(r: &mut NativeMethodRegistry) {
         "averagingDouble",
         "(Ljava/util/function/ToDoubleFunction;)Ljava/util/stream/Collector;",
         |ctx, args| {
+            let func = args[0];
+            // Pin across the Collector alloc below — a moving young GC there
+            // would relocate it (native stale-local family).
+            let func_pin = pinned_object_value(ctx, func);
             let c = alloc_concurrent_synthetic(ctx, "java/util/stream/Collector", 3);
             ctx.set_field(c, 0, Value::Int(21)); // AVERAGING_DOUBLE
-            ctx.set_field(c, 1, args[0]);
+            ctx.set_field(c, 1, read_pinned_object_value(ctx, func_pin, func));
+            if let Some((h, _)) = func_pin {
+                ctx.unpin_native_roots(h);
+            }
             Ok(Some(Value::Object(Some(c))))
         },
     );
@@ -3202,9 +3961,16 @@ pub(crate) fn register_phase56_collectors_extras(r: &mut NativeMethodRegistry) {
         "summingInt",
         "(Ljava/util/function/ToIntFunction;)Ljava/util/stream/Collector;",
         |ctx, args| {
+            let func = args[0];
+            // Pin across the Collector alloc below — a moving young GC there
+            // would relocate it (native stale-local family).
+            let func_pin = pinned_object_value(ctx, func);
             let c = alloc_concurrent_synthetic(ctx, "java/util/stream/Collector", 3);
             ctx.set_field(c, 0, Value::Int(22)); // SUMMING_INT
-            ctx.set_field(c, 1, args[0]);
+            ctx.set_field(c, 1, read_pinned_object_value(ctx, func_pin, func));
+            if let Some((h, _)) = func_pin {
+                ctx.unpin_native_roots(h);
+            }
             Ok(Some(Value::Object(Some(c))))
         },
     );
@@ -3213,9 +3979,16 @@ pub(crate) fn register_phase56_collectors_extras(r: &mut NativeMethodRegistry) {
         "summingLong",
         "(Ljava/util/function/ToLongFunction;)Ljava/util/stream/Collector;",
         |ctx, args| {
+            let func = args[0];
+            // Pin across the Collector alloc below — a moving young GC there
+            // would relocate it (native stale-local family).
+            let func_pin = pinned_object_value(ctx, func);
             let c = alloc_concurrent_synthetic(ctx, "java/util/stream/Collector", 3);
             ctx.set_field(c, 0, Value::Int(23)); // SUMMING_LONG
-            ctx.set_field(c, 1, args[0]);
+            ctx.set_field(c, 1, read_pinned_object_value(ctx, func_pin, func));
+            if let Some((h, _)) = func_pin {
+                ctx.unpin_native_roots(h);
+            }
             Ok(Some(Value::Object(Some(c))))
         },
     );
@@ -3224,9 +3997,16 @@ pub(crate) fn register_phase56_collectors_extras(r: &mut NativeMethodRegistry) {
         "summingDouble",
         "(Ljava/util/function/ToDoubleFunction;)Ljava/util/stream/Collector;",
         |ctx, args| {
+            let func = args[0];
+            // Pin across the Collector alloc below — a moving young GC there
+            // would relocate it (native stale-local family).
+            let func_pin = pinned_object_value(ctx, func);
             let c = alloc_concurrent_synthetic(ctx, "java/util/stream/Collector", 3);
             ctx.set_field(c, 0, Value::Int(24)); // SUMMING_DOUBLE
-            ctx.set_field(c, 1, args[0]);
+            ctx.set_field(c, 1, read_pinned_object_value(ctx, func_pin, func));
+            if let Some((h, _)) = func_pin {
+                ctx.unpin_native_roots(h);
+            }
             Ok(Some(Value::Object(Some(c))))
         },
     );
@@ -3343,10 +4123,21 @@ pub(crate) fn register_phase56_function_extras(r: &mut NativeMethodRegistry) {
         "maxBy",
         "(Ljava/util/Comparator;)Ljava/util/function/BinaryOperator;",
         |ctx, args| {
+            let comparator = args[0];
+            // Pin across the proxy alloc below — a moving young GC there would
+            // relocate it (native stale-local family).
+            let comparator_pin = pinned_object_value(ctx, comparator);
             // Store comparator in a 1-field synthetic
             let proxy =
                 alloc_concurrent_synthetic(ctx, "java/util/function/BinaryOperator$MaxBy", 1);
-            ctx.set_field(proxy, 0, args[0]);
+            ctx.set_field(
+                proxy,
+                0,
+                read_pinned_object_value(ctx, comparator_pin, comparator),
+            );
+            if let Some((h, _)) = comparator_pin {
+                ctx.unpin_native_roots(h);
+            }
             Ok(Some(Value::Object(Some(proxy))))
         },
     );
@@ -3357,9 +4148,20 @@ pub(crate) fn register_phase56_function_extras(r: &mut NativeMethodRegistry) {
         "minBy",
         "(Ljava/util/Comparator;)Ljava/util/function/BinaryOperator;",
         |ctx, args| {
+            let comparator = args[0];
+            // Pin across the proxy alloc below — a moving young GC there would
+            // relocate it (native stale-local family).
+            let comparator_pin = pinned_object_value(ctx, comparator);
             let proxy =
                 alloc_concurrent_synthetic(ctx, "java/util/function/BinaryOperator$MinBy", 1);
-            ctx.set_field(proxy, 0, args[0]);
+            ctx.set_field(
+                proxy,
+                0,
+                read_pinned_object_value(ctx, comparator_pin, comparator),
+            );
+            if let Some((h, _)) = comparator_pin {
+                ctx.unpin_native_roots(h);
+            }
             Ok(Some(Value::Object(Some(proxy))))
         },
     );
@@ -3560,9 +4362,15 @@ pub(crate) fn register_phase56_function_extras(r: &mut NativeMethodRegistry) {
         |ctx, args| {
             let this = obj_arg(args, 0)?;
             let other = args[1];
+            // Pin across the composite alloc below — a moving young GC there
+            // would relocate them (native stale-local family).
+            let this_pin = ctx.pin_native_root(this);
+            let other_pin = pinned_object_value(ctx, other);
             let composite = alloc_concurrent_synthetic(ctx, "java/util/function/Predicate$And", 2);
+            let this = ctx.read_native_pin(this_pin, this);
             ctx.set_field(composite, 0, Value::Object(Some(this)));
-            ctx.set_field(composite, 1, other);
+            ctx.set_field(composite, 1, read_pinned_object_value(ctx, other_pin, other));
+            ctx.unpin_native_roots(this_pin);
             Ok(Some(Value::Object(Some(composite))))
         },
     );
@@ -3573,9 +4381,15 @@ pub(crate) fn register_phase56_function_extras(r: &mut NativeMethodRegistry) {
         |ctx, args| {
             let this = obj_arg(args, 0)?;
             let other = args[1];
+            // Pin across the composite alloc below — a moving young GC there
+            // would relocate them (native stale-local family).
+            let this_pin = ctx.pin_native_root(this);
+            let other_pin = pinned_object_value(ctx, other);
             let composite = alloc_concurrent_synthetic(ctx, "java/util/function/Predicate$Or", 2);
+            let this = ctx.read_native_pin(this_pin, this);
             ctx.set_field(composite, 0, Value::Object(Some(this)));
-            ctx.set_field(composite, 1, other);
+            ctx.set_field(composite, 1, read_pinned_object_value(ctx, other_pin, other));
+            ctx.unpin_native_roots(this_pin);
             Ok(Some(Value::Object(Some(composite))))
         },
     );
@@ -3585,9 +4399,14 @@ pub(crate) fn register_phase56_function_extras(r: &mut NativeMethodRegistry) {
         "()Ljava/util/function/Predicate;",
         |ctx, args| {
             let this = obj_arg(args, 0)?;
+            // Pin across the composite alloc below — a moving young GC there
+            // would relocate `this` (native stale-local family).
+            let this_pin = ctx.pin_native_root(this);
             let composite =
                 alloc_concurrent_synthetic(ctx, "java/util/function/Predicate$Negate", 1);
+            let this = ctx.read_native_pin(this_pin, this);
             ctx.set_field(composite, 0, Value::Object(Some(this)));
+            ctx.unpin_native_roots(this_pin);
             Ok(Some(Value::Object(Some(composite))))
         },
     );
@@ -3598,9 +4417,15 @@ pub(crate) fn register_phase56_function_extras(r: &mut NativeMethodRegistry) {
         "(Ljava/util/function/Predicate;)Ljava/util/function/Predicate;",
         |ctx, args| {
             let target = args[0];
+            // Pin across the composite alloc below — a moving young GC there
+            // would relocate it (native stale-local family).
+            let target_pin = pinned_object_value(ctx, target);
             let composite =
                 alloc_concurrent_synthetic(ctx, "java/util/function/Predicate$Negate", 1);
-            ctx.set_field(composite, 0, target);
+            ctx.set_field(composite, 0, read_pinned_object_value(ctx, target_pin, target));
+            if let Some((h, _)) = target_pin {
+                ctx.unpin_native_roots(h);
+            }
             Ok(Some(Value::Object(Some(composite))))
         },
     );
@@ -3614,12 +4439,30 @@ pub(crate) fn register_phase56_function_extras(r: &mut NativeMethodRegistry) {
         "(Ljava/lang/Object;)Z",
         |ctx, args| {
             let this = obj_arg(args, 0)?;
-            let input = args[1];
+            let mut input = args[1];
             let first = ctx.get_field(this, 0);
-            let second = ctx.get_field(this, 1);
+            let mut second = ctx.get_field(this, 1);
             if let Value::Object(Some(first_ref)) = first {
+                // Pin across the first test() below — a moving young GC there
+                // would relocate `second`/`input` (native stale-local family).
+                let second_pin = pinned_object_value(ctx, second);
+                let input_pin = pinned_object_value(ctx, input);
                 let r1 =
-                    ctx.invoke_virtual(first_ref, "test", "(Ljava/lang/Object;)Z", &[input])?;
+                    match ctx.invoke_virtual(first_ref, "test", "(Ljava/lang/Object;)Z", &[input])
+                    {
+                        Ok(r) => r,
+                        Err(e) => {
+                            if let Some((h, _)) = second_pin.or(input_pin) {
+                                ctx.unpin_native_roots(h);
+                            }
+                            return Err(e);
+                        }
+                    };
+                second = read_pinned_object_value(ctx, second_pin, second);
+                input = read_pinned_object_value(ctx, input_pin, input);
+                if let Some((h, _)) = second_pin.or(input_pin) {
+                    ctx.unpin_native_roots(h);
+                }
                 if r1 == Some(Value::Int(0)) {
                     return Ok(Some(Value::Int(0)));
                 }
@@ -3638,12 +4481,30 @@ pub(crate) fn register_phase56_function_extras(r: &mut NativeMethodRegistry) {
         "(Ljava/lang/Object;)Z",
         |ctx, args| {
             let this = obj_arg(args, 0)?;
-            let input = args[1];
+            let mut input = args[1];
             let first = ctx.get_field(this, 0);
-            let second = ctx.get_field(this, 1);
+            let mut second = ctx.get_field(this, 1);
             if let Value::Object(Some(first_ref)) = first {
+                // Pin across the first test() below — a moving young GC there
+                // would relocate `second`/`input` (native stale-local family).
+                let second_pin = pinned_object_value(ctx, second);
+                let input_pin = pinned_object_value(ctx, input);
                 let r1 =
-                    ctx.invoke_virtual(first_ref, "test", "(Ljava/lang/Object;)Z", &[input])?;
+                    match ctx.invoke_virtual(first_ref, "test", "(Ljava/lang/Object;)Z", &[input])
+                    {
+                        Ok(r) => r,
+                        Err(e) => {
+                            if let Some((h, _)) = second_pin.or(input_pin) {
+                                ctx.unpin_native_roots(h);
+                            }
+                            return Err(e);
+                        }
+                    };
+                second = read_pinned_object_value(ctx, second_pin, second);
+                input = read_pinned_object_value(ctx, input_pin, input);
+                if let Some((h, _)) = second_pin.or(input_pin) {
+                    ctx.unpin_native_roots(h);
+                }
                 if r1 == Some(Value::Int(1)) {
                     return Ok(Some(Value::Int(1)));
                 }
@@ -3686,10 +4547,16 @@ pub(crate) fn register_phase56_function_extras(r: &mut NativeMethodRegistry) {
         |ctx, args| {
             let this = obj_arg(args, 0)?;
             let before = args[1];
+            // Pin across the composite alloc below — a moving young GC there
+            // would relocate them (native stale-local family).
+            let this_pin = ctx.pin_native_root(this);
+            let before_pin = pinned_object_value(ctx, before);
             let composite =
                 alloc_concurrent_synthetic(ctx, "java/util/function/Function$Compose", 2);
+            let this = ctx.read_native_pin(this_pin, this);
             ctx.set_field(composite, 0, Value::Object(Some(this)));
-            ctx.set_field(composite, 1, before);
+            ctx.set_field(composite, 1, read_pinned_object_value(ctx, before_pin, before));
+            ctx.unpin_native_roots(this_pin);
             Ok(Some(Value::Object(Some(composite))))
         },
     );
@@ -3700,10 +4567,16 @@ pub(crate) fn register_phase56_function_extras(r: &mut NativeMethodRegistry) {
         |ctx, args| {
             let this = obj_arg(args, 0)?;
             let after = args[1];
+            // Pin across the composite alloc below — a moving young GC there
+            // would relocate them (native stale-local family).
+            let this_pin = ctx.pin_native_root(this);
+            let after_pin = pinned_object_value(ctx, after);
             let composite =
                 alloc_concurrent_synthetic(ctx, "java/util/function/Function$AndThen", 2);
+            let this = ctx.read_native_pin(this_pin, this);
             ctx.set_field(composite, 0, Value::Object(Some(this)));
-            ctx.set_field(composite, 1, after);
+            ctx.set_field(composite, 1, read_pinned_object_value(ctx, after_pin, after));
+            ctx.unpin_native_roots(this_pin);
             Ok(Some(Value::Object(Some(composite))))
         },
     );
@@ -3727,10 +4600,16 @@ pub(crate) fn register_phase56_function_extras(r: &mut NativeMethodRegistry) {
         |ctx, args| {
             let this = obj_arg(args, 0)?;
             let after = args[1];
+            // Pin across the composite alloc below — a moving young GC there
+            // would relocate them (native stale-local family).
+            let this_pin = ctx.pin_native_root(this);
+            let after_pin = pinned_object_value(ctx, after);
             let composite =
                 alloc_concurrent_synthetic(ctx, "java/util/function/Consumer$AndThen", 2);
+            let this = ctx.read_native_pin(this_pin, this);
             ctx.set_field(composite, 0, Value::Object(Some(this)));
-            ctx.set_field(composite, 1, after);
+            ctx.set_field(composite, 1, read_pinned_object_value(ctx, after_pin, after));
+            ctx.unpin_native_roots(this_pin);
             Ok(Some(Value::Object(Some(composite))))
         },
     );
@@ -3751,14 +4630,29 @@ pub(crate) fn register_phase56_function_extras(r: &mut NativeMethodRegistry) {
                 Value::Object(Some(r)) => r,
                 _ => return Ok(Some(input)),
             };
+            // Pin across the first apply() below — a moving young GC there
+            // would relocate `after` (native stale-local family).
+            let after_pin = pinned_object_value(ctx, after);
             // Use invoke_virtual to support lambda proxy dispatch
-            let mid = ctx.invoke_virtual(
+            let mid = match ctx.invoke_virtual(
                 first_ref,
                 "apply",
                 "(Ljava/lang/Object;)Ljava/lang/Object;",
                 &[input],
-            )?;
+            ) {
+                Ok(m) => m,
+                Err(e) => {
+                    if let Some((h, _)) = after_pin {
+                        ctx.unpin_native_roots(h);
+                    }
+                    return Err(e);
+                }
+            };
             let mid_val = mid.unwrap_or(Value::Object(None));
+            let after = read_pinned_object_value(ctx, after_pin, after);
+            if let Some((h, _)) = after_pin {
+                ctx.unpin_native_roots(h);
+            }
             let after_ref = match after {
                 Value::Object(Some(r)) => r,
                 _ => return Ok(Some(mid_val)),
@@ -3786,14 +4680,29 @@ pub(crate) fn register_phase56_function_extras(r: &mut NativeMethodRegistry) {
                 Value::Object(Some(r)) => r,
                 _ => return Ok(Some(input)),
             };
+            // Pin across the before apply() below — a moving young GC there
+            // would relocate `first` (native stale-local family).
+            let first_pin = pinned_object_value(ctx, first);
             // Use invoke_virtual to support lambda proxy dispatch
-            let mid = ctx.invoke_virtual(
+            let mid = match ctx.invoke_virtual(
                 before_ref,
                 "apply",
                 "(Ljava/lang/Object;)Ljava/lang/Object;",
                 &[input],
-            )?;
+            ) {
+                Ok(m) => m,
+                Err(e) => {
+                    if let Some((h, _)) = first_pin {
+                        ctx.unpin_native_roots(h);
+                    }
+                    return Err(e);
+                }
+            };
             let mid_val = mid.unwrap_or(Value::Object(None));
+            let first = read_pinned_object_value(ctx, first_pin, first);
+            if let Some((h, _)) = first_pin {
+                ctx.unpin_native_roots(h);
+            }
             let first_ref = match first {
                 Value::Object(Some(r)) => r,
                 _ => return Ok(Some(mid_val)),
@@ -3822,12 +4731,28 @@ pub(crate) fn register_phase56_function_extras(r: &mut NativeMethodRegistry) {
         "(Ljava/lang/Object;)V",
         |ctx, args| {
             let this = obj_arg(args, 0)?;
-            let input = args[1];
+            let mut input = args[1];
             let first = ctx.get_field(this, 0);
-            let after = ctx.get_field(this, 1);
+            let mut after = ctx.get_field(this, 1);
             // Use invoke_virtual to support lambda proxy dispatch
             if let Value::Object(Some(first_ref)) = first {
-                ctx.invoke_virtual(first_ref, "accept", "(Ljava/lang/Object;)V", &[input])?;
+                // Pin across the first accept() below — a moving young GC there
+                // would relocate `after`/`input` (native stale-local family).
+                let after_pin = pinned_object_value(ctx, after);
+                let input_pin = pinned_object_value(ctx, input);
+                if let Err(e) =
+                    ctx.invoke_virtual(first_ref, "accept", "(Ljava/lang/Object;)V", &[input])
+                {
+                    if let Some((h, _)) = after_pin.or(input_pin) {
+                        ctx.unpin_native_roots(h);
+                    }
+                    return Err(e);
+                }
+                after = read_pinned_object_value(ctx, after_pin, after);
+                input = read_pinned_object_value(ctx, input_pin, input);
+                if let Some((h, _)) = after_pin.or(input_pin) {
+                    ctx.unpin_native_roots(h);
+                }
             }
             if let Value::Object(Some(after_ref)) = after {
                 ctx.invoke_virtual(after_ref, "accept", "(Ljava/lang/Object;)V", &[input])?;
@@ -3934,37 +4859,50 @@ fn cm_lookup_registered(
     cls: ObjectRef,
     prefix: Value,
 ) -> Option<Value> {
-    let impl_cls = match ctx.invoke(
-        "io/smallrye/config/ConfigMappingLoader",
-        "getConfigMappingClass",
-        "(Ljava/lang/Class;)Ljava/lang/Class;",
-        &[Value::Object(Some(cls))],
-    ) {
-        Ok(Some(Value::Object(Some(o)))) => o,
-        _ => return None,
-    };
-    let mappings = match ctx.invoke_virtual(this, "getMappings", "()Ljava/util/Map;", &[]) {
-        Ok(Some(Value::Object(Some(o)))) => o,
-        _ => return None,
-    };
-    let inner = match ctx.invoke_virtual(
-        mappings,
-        "get",
-        "(Ljava/lang/Object;)Ljava/lang/Object;",
-        &[Value::Object(Some(impl_cls))],
-    ) {
-        Ok(Some(Value::Object(Some(o)))) => o,
-        _ => return None,
-    };
-    match ctx.invoke_virtual(
-        inner,
-        "get",
-        "(Ljava/lang/Object;)Ljava/lang/Object;",
-        &[prefix],
-    ) {
-        Ok(Some(Value::Object(Some(o)))) => Some(Value::Object(Some(o))),
-        _ => None,
-    }
+    // Pin across the chained invokes below — a moving young GC there would
+    // relocate them (native stale-local family). One batch unpin at the end
+    // covers every early return inside the closure.
+    let this_pin = ctx.pin_native_root(this);
+    let prefix_pin = pinned_object_value(ctx, prefix);
+    let result = (|| {
+        let impl_cls = match ctx.invoke(
+            "io/smallrye/config/ConfigMappingLoader",
+            "getConfigMappingClass",
+            "(Ljava/lang/Class;)Ljava/lang/Class;",
+            &[Value::Object(Some(cls))],
+        ) {
+            Ok(Some(Value::Object(Some(o)))) => o,
+            _ => return None,
+        };
+        let impl_cls_pin = ctx.pin_native_root(impl_cls);
+        let this = ctx.read_native_pin(this_pin, this);
+        let mappings = match ctx.invoke_virtual(this, "getMappings", "()Ljava/util/Map;", &[]) {
+            Ok(Some(Value::Object(Some(o)))) => o,
+            _ => return None,
+        };
+        let impl_cls = ctx.read_native_pin(impl_cls_pin, impl_cls);
+        let inner = match ctx.invoke_virtual(
+            mappings,
+            "get",
+            "(Ljava/lang/Object;)Ljava/lang/Object;",
+            &[Value::Object(Some(impl_cls))],
+        ) {
+            Ok(Some(Value::Object(Some(o)))) => o,
+            _ => return None,
+        };
+        let prefix = read_pinned_object_value(ctx, prefix_pin, prefix);
+        match ctx.invoke_virtual(
+            inner,
+            "get",
+            "(Ljava/lang/Object;)Ljava/lang/Object;",
+            &[prefix],
+        ) {
+            Ok(Some(Value::Object(Some(o)))) => Some(Value::Object(Some(o))),
+            _ => None,
+        }
+    })();
+    ctx.unpin_native_roots(this_pin);
+    result
 }
 
 /// `SmallRyeConfig.getConfigMapping(Class, String)` — register the mapping with
@@ -3983,9 +4921,16 @@ fn native_smallrye_get_config_mapping(
     };
     let prefix = args.get(2).copied().unwrap_or(Value::Object(None));
 
+    // Pin across the helper invokes below — a moving young GC there would
+    // relocate them (native stale-local family).
+    let this_pin = ctx.pin_native_root(this);
+    let cls_pin = ctx.pin_native_root(cls);
+    let prefix_pin = pinned_object_value(ctx, prefix);
+
     // Fast path: already in the config's mapping registry (e.g. if a real
     // Quarkus config-build ever populates it) — return that instance.
     if let Some(v) = cm_lookup_registered(ctx, this, cls, prefix) {
+        ctx.unpin_native_roots(this_pin);
         return Ok(Some(v));
     }
 
@@ -3994,11 +4939,17 @@ fn native_smallrye_get_config_mapping(
     // cross-mapping unknown-property validation that `registerConfigMappings`/
     // `buildMappings` perform (which can't pass until ALL mappings are
     // registered together — the deeper config-build gap).
+    let this = ctx.read_native_pin(this_pin, this);
+    let cls = ctx.read_native_pin(cls_pin, cls);
+    let prefix = read_pinned_object_value(ctx, prefix_pin, prefix);
     if let Some(v) = cm_construct_via_context(ctx, this, cls, prefix) {
+        ctx.unpin_native_roots(this_pin);
         return Ok(Some(v));
     }
     // Could not build the real impl — defensive fallback so this call site
     // doesn't hard-crash (preserves prior shim behaviour).
+    let cls = ctx.read_native_pin(cls_pin, cls);
+    ctx.unpin_native_roots(this_pin);
     cm_fallback_alloc(ctx, cls)
 }
 
@@ -4019,86 +4970,114 @@ fn cm_construct_via_context(
     cls: ObjectRef,
     prefix: Value,
 ) -> Option<Value> {
-    let builder = match ctx.new_object("io/smallrye/config/SmallRyeConfigBuilder") {
-        Ok(Some(Value::Object(Some(o)))) => o,
-        _ => return None,
-    };
-    ctx.invoke(
-        "io/smallrye/config/SmallRyeConfigBuilder",
-        "<init>",
-        "()V",
-        &[Value::Object(Some(builder))],
-    )
-    .ok()?;
-    // Register the mapping in the builder (computes its @WithDefault values).
-    let config_class = match ctx.invoke(
-        "io/smallrye/config/ConfigMappings$ConfigClass",
-        "configClass",
-        "(Ljava/lang/Class;Ljava/lang/String;)Lio/smallrye/config/ConfigMappings$ConfigClass;",
-        &[Value::Object(Some(cls)), prefix],
-    ) {
-        Ok(Some(Value::Object(Some(o)))) => o,
-        _ => return None,
-    };
-    ctx.invoke_virtual(
-        builder,
-        "withMapping",
-        "(Lio/smallrye/config/ConfigMappings$ConfigClass;)Lio/smallrye/config/SmallRyeConfigBuilder;",
-        &[Value::Object(Some(config_class))],
-    )
-    .ok()?;
-    // Merge the mapping's default values into the live config's default source so
-    // `getValue` sees them while building the impl (mapConfiguration step 2).
-    if let Ok(Some(Value::Object(Some(dvcs)))) = ctx.invoke_virtual(
-        this,
-        "getDefaultValues",
-        "()Lio/smallrye/config/DefaultValuesConfigSource;",
-        &[],
-    ) {
-        if let Ok(Some(Value::Object(Some(bdefs)))) =
-            ctx.invoke_virtual(builder, "getDefaultValues", "()Ljava/util/Map;", &[])
-        {
-            let _ = ctx.invoke_virtual(
-                dvcs,
-                "addDefaults",
-                "(Ljava/util/Map;)V",
-                &[Value::Object(Some(bdefs))],
-            );
+    // Pin across the builder/context construction below — a moving young GC
+    // there would relocate them (native stale-local family). One batch unpin
+    // at the end covers every early return inside the closure.
+    let this_pin = ctx.pin_native_root(this);
+    let cls_pin = ctx.pin_native_root(cls);
+    let prefix_pin = pinned_object_value(ctx, prefix);
+    let result = (|| {
+        let builder = match ctx.new_object("io/smallrye/config/SmallRyeConfigBuilder") {
+            Ok(Some(Value::Object(Some(o)))) => o,
+            _ => return None,
+        };
+        let builder_pin = ctx.pin_native_root(builder);
+        ctx.invoke(
+            "io/smallrye/config/SmallRyeConfigBuilder",
+            "<init>",
+            "()V",
+            &[Value::Object(Some(builder))],
+        )
+        .ok()?;
+        // Register the mapping in the builder (computes its @WithDefault values).
+        let cls_cur = ctx.read_native_pin(cls_pin, cls);
+        let prefix_cur = read_pinned_object_value(ctx, prefix_pin, prefix);
+        let config_class = match ctx.invoke(
+            "io/smallrye/config/ConfigMappings$ConfigClass",
+            "configClass",
+            "(Ljava/lang/Class;Ljava/lang/String;)Lio/smallrye/config/ConfigMappings$ConfigClass;",
+            &[Value::Object(Some(cls_cur)), prefix_cur],
+        ) {
+            Ok(Some(Value::Object(Some(o)))) => o,
+            _ => return None,
+        };
+        let builder_cur = ctx.read_native_pin(builder_pin, builder);
+        ctx.invoke_virtual(
+            builder_cur,
+            "withMapping",
+            "(Lio/smallrye/config/ConfigMappings$ConfigClass;)Lio/smallrye/config/SmallRyeConfigBuilder;",
+            &[Value::Object(Some(config_class))],
+        )
+        .ok()?;
+        // Merge the mapping's default values into the live config's default source so
+        // `getValue` sees them while building the impl (mapConfiguration step 2).
+        let this_cur = ctx.read_native_pin(this_pin, this);
+        if let Ok(Some(Value::Object(Some(dvcs)))) = ctx.invoke_virtual(
+            this_cur,
+            "getDefaultValues",
+            "()Lio/smallrye/config/DefaultValuesConfigSource;",
+            &[],
+        ) {
+            let dvcs_pin = ctx.pin_native_root(dvcs);
+            let builder_cur = ctx.read_native_pin(builder_pin, builder);
+            if let Ok(Some(Value::Object(Some(bdefs)))) =
+                ctx.invoke_virtual(builder_cur, "getDefaultValues", "()Ljava/util/Map;", &[])
+            {
+                let dvcs_cur = ctx.read_native_pin(dvcs_pin, dvcs);
+                let _ = ctx.invoke_virtual(
+                    dvcs_cur,
+                    "addDefaults",
+                    "(Ljava/util/Map;)V",
+                    &[Value::Object(Some(bdefs))],
+                );
+            }
         }
-    }
-    let mb = match ctx.invoke_virtual(
-        builder,
-        "getMappingsBuilder",
-        "()Lio/smallrye/config/SmallRyeConfigBuilder$MappingBuilder;",
-        &[],
-    ) {
-        Ok(Some(Value::Object(Some(o)))) => o,
-        _ => return None,
-    };
-    let context = match ctx.new_object("io/smallrye/config/ConfigMappingContext") {
-        Ok(Some(Value::Object(Some(o)))) => o,
-        _ => return None,
-    };
-    ctx.invoke(
-        "io/smallrye/config/ConfigMappingContext",
-        "<init>",
-        "(Lio/smallrye/config/SmallRyeConfig;Lio/smallrye/config/SmallRyeConfigBuilder$MappingBuilder;)V",
-        &[
-            Value::Object(Some(context)),
-            Value::Object(Some(this)),
-            Value::Object(Some(mb)),
-        ],
-    )
-    .ok()?;
-    match ctx.invoke(
-        "io/smallrye/config/ConfigMappingLoader",
-        "configMappingObject",
-        "(Ljava/lang/Class;Lio/smallrye/config/ConfigMappingContext;)Ljava/lang/Object;",
-        &[Value::Object(Some(cls)), Value::Object(Some(context))],
-    ) {
-        Ok(Some(Value::Object(Some(o)))) => Some(Value::Object(Some(o))),
-        _ => None,
-    }
+        let builder_cur = ctx.read_native_pin(builder_pin, builder);
+        let mb = match ctx.invoke_virtual(
+            builder_cur,
+            "getMappingsBuilder",
+            "()Lio/smallrye/config/SmallRyeConfigBuilder$MappingBuilder;",
+            &[],
+        ) {
+            Ok(Some(Value::Object(Some(o)))) => o,
+            _ => return None,
+        };
+        let mb_pin = ctx.pin_native_root(mb);
+        let context = match ctx.new_object("io/smallrye/config/ConfigMappingContext") {
+            Ok(Some(Value::Object(Some(o)))) => o,
+            _ => return None,
+        };
+        let context_pin = ctx.pin_native_root(context);
+        let this_cur = ctx.read_native_pin(this_pin, this);
+        let mb_cur = ctx.read_native_pin(mb_pin, mb);
+        ctx.invoke(
+            "io/smallrye/config/ConfigMappingContext",
+            "<init>",
+            "(Lio/smallrye/config/SmallRyeConfig;Lio/smallrye/config/SmallRyeConfigBuilder$MappingBuilder;)V",
+            &[
+                Value::Object(Some(context)),
+                Value::Object(Some(this_cur)),
+                Value::Object(Some(mb_cur)),
+            ],
+        )
+        .ok()?;
+        let cls_cur = ctx.read_native_pin(cls_pin, cls);
+        let context_cur = ctx.read_native_pin(context_pin, context);
+        match ctx.invoke(
+            "io/smallrye/config/ConfigMappingLoader",
+            "configMappingObject",
+            "(Ljava/lang/Class;Lio/smallrye/config/ConfigMappingContext;)Ljava/lang/Object;",
+            &[
+                Value::Object(Some(cls_cur)),
+                Value::Object(Some(context_cur)),
+            ],
+        ) {
+            Ok(Some(Value::Object(Some(o)))) => Some(Value::Object(Some(o))),
+            _ => None,
+        }
+    })();
+    ctx.unpin_native_roots(this_pin);
+    result
 }
 
 /// Last-resort fallback retained from the Round-87 shim: allocate a synthetic of
@@ -4125,6 +5104,9 @@ fn cm_fallback_alloc(ctx: &mut dyn NativeContext, cls: ObjectRef) -> MethodCallR
 /// JUnit test discovery — the identical failure class as the 2-arg Gap 6 bug,
 /// just reached through the 1-arg overload this fallback never covered).
 fn config_mapping_prefix(ctx: &mut dyn NativeContext, cls: ObjectRef) -> Value {
+    // Pin across the forName invoke below — a moving young GC there would
+    // relocate `cls` (native stale-local family).
+    let cls_pin = ctx.pin_native_root(cls);
     let name_str = ctx.create_string("io.smallrye.config.ConfigMapping");
     let ann_cls = match ctx.invoke(
         "java/lang/Class",
@@ -4133,8 +5115,13 @@ fn config_mapping_prefix(ctx: &mut dyn NativeContext, cls: ObjectRef) -> Value {
         &[Value::Object(Some(name_str))],
     ) {
         Ok(Some(Value::Object(Some(c)))) => c,
-        _ => return Value::Object(None),
+        _ => {
+            ctx.unpin_native_roots(cls_pin);
+            return Value::Object(None);
+        }
     };
+    let cls = ctx.read_native_pin(cls_pin, cls);
+    ctx.unpin_native_roots(cls_pin);
     let ann = match ctx.invoke_virtual(
         cls,
         "getAnnotation",
@@ -4168,17 +5155,29 @@ fn static_object_field(
 }
 
 fn new_runtime_value(ctx: &mut dyn NativeContext, value: Value) -> Option<ObjectRef> {
+    // Pin across the RuntimeValue alloc/ctor below — a moving young GC there
+    // would relocate them (native stale-local family).
+    let value_pin = pinned_object_value(ctx, value);
     let rv = match ctx.new_object("io/quarkus/runtime/RuntimeValue") {
         Ok(Some(Value::Object(Some(o)))) => o,
-        _ => return None,
+        _ => {
+            if let Some((h, _)) = value_pin {
+                ctx.unpin_native_roots(h);
+            }
+            return None;
+        }
     };
-    ctx.invoke(
+    let rv_pin = ctx.pin_native_root(rv);
+    let value = read_pinned_object_value(ctx, value_pin, value);
+    let init = ctx.invoke(
         "io/quarkus/runtime/RuntimeValue",
         "<init>",
         "(Ljava/lang/Object;)V",
         &[Value::Object(Some(rv)), value],
-    )
-    .ok()?;
+    );
+    let rv = ctx.read_native_pin(rv_pin, rv);
+    ctx.unpin_native_roots(value_pin.map(|(h, _)| h).unwrap_or(rv_pin));
+    init.ok()?;
     Some(rv)
 }
 
@@ -4211,230 +5210,288 @@ fn native_quarkus_logging_handle_failed_start(
         },
     };
 
-    let smallrye_config_cls = match class_mirror_by_name(ctx, "io/smallrye/config/SmallRyeConfig") {
-        Some(o) => o,
-        None => return Ok(None),
-    };
-    let config = match ctx.invoke(
-        "org/eclipse/microprofile/config/ConfigProvider",
-        "getConfig",
-        "()Lorg/eclipse/microprofile/config/Config;",
-        &[],
-    )? {
-        Some(Value::Object(Some(o))) => o,
-        _ => return Ok(None),
-    };
-    let base_config = match ctx.invoke_virtual(
-        config,
-        "unwrap",
-        "(Ljava/lang/Class;)Ljava/lang/Object;",
-        &[Value::Object(Some(smallrye_config_cls))],
-    )? {
-        Some(Value::Object(Some(o))) => o,
-        _ => return Ok(None),
-    };
+    // Pin across the long recorder-construction chain below — a moving young
+    // GC there would relocate them (native stale-local family). One batch
+    // unpin at the end covers every early return inside the closure.
+    let supplier_rv_pin = ctx.pin_native_root(supplier_rv);
+    let result = (|| {
+        let smallrye_config_cls =
+            match class_mirror_by_name(ctx, "io/smallrye/config/SmallRyeConfig") {
+                Some(o) => o,
+                None => return Ok(None),
+            };
+        let smallrye_cls_pin = ctx.pin_native_root(smallrye_config_cls);
+        let config = match ctx.invoke(
+            "org/eclipse/microprofile/config/ConfigProvider",
+            "getConfig",
+            "()Lorg/eclipse/microprofile/config/Config;",
+            &[],
+        )? {
+            Some(Value::Object(Some(o))) => o,
+            _ => return Ok(None),
+        };
+        let smallrye_config_cls = ctx.read_native_pin(smallrye_cls_pin, smallrye_config_cls);
+        let base_config = match ctx.invoke_virtual(
+            config,
+            "unwrap",
+            "(Ljava/lang/Class;)Ljava/lang/Object;",
+            &[Value::Object(Some(smallrye_config_cls))],
+        )? {
+            Some(Value::Object(Some(o))) => o,
+            _ => return Ok(None),
+        };
+        let base_config_pin = ctx.pin_native_root(base_config);
 
-    let builder = match ctx.new_object("io/smallrye/config/SmallRyeConfigBuilder") {
-        Ok(Some(Value::Object(Some(o)))) => o,
-        _ => return Ok(None),
-    };
-    ctx.invoke(
-        "io/smallrye/config/SmallRyeConfigBuilder",
-        "<init>",
-        "()V",
-        &[Value::Object(Some(builder))],
-    )?;
-
-    // This is the compatibility fix: the recorder's transient builder needs
-    // Quarkus' service-loaded converters for LogRuntimeConfig mappings.
-    ctx.invoke_virtual(
-        builder,
-        "addDiscoveredConverters",
-        "()Lio/smallrye/config/SmallRyeConfigBuilder;",
-        &[],
-    )?;
-
-    let customizer =
-        match ctx.new_object("io/quarkus/runtime/configuration/QuarkusConfigBuilderCustomizer") {
+        let builder = match ctx.new_object("io/smallrye/config/SmallRyeConfigBuilder") {
             Ok(Some(Value::Object(Some(o)))) => o,
             _ => return Ok(None),
         };
-    ctx.invoke(
-        "io/quarkus/runtime/configuration/QuarkusConfigBuilderCustomizer",
-        "<init>",
-        "()V",
-        &[Value::Object(Some(customizer))],
-    )?;
-    ctx.invoke_virtual(
-        customizer,
-        "configBuilder",
-        "(Lio/smallrye/config/SmallRyeConfigBuilder;)V",
-        &[Value::Object(Some(builder))],
-    )?;
-
-    for class_name in [
-        "io/quarkus/runtime/logging/LogBuildTimeConfig",
-        "io/quarkus/runtime/logging/LogRuntimeConfig",
-        "io/quarkus/runtime/console/ConsoleRuntimeConfig",
-    ] {
-        let mirror = match class_mirror_by_name(ctx, class_name) {
-            Some(o) => o,
-            None => return Ok(None),
-        };
-        ctx.invoke_virtual(
-            builder,
-            "withMapping",
-            "(Ljava/lang/Class;)Lio/smallrye/config/SmallRyeConfigBuilder;",
-            &[Value::Object(Some(mirror))],
+        let builder_pin = ctx.pin_native_root(builder);
+        ctx.invoke(
+            "io/smallrye/config/SmallRyeConfigBuilder",
+            "<init>",
+            "()V",
+            &[Value::Object(Some(builder))],
         )?;
-    }
 
-    let source = match ctx.new_object("io/quarkus/runtime/logging/LoggingSetupRecorder$1") {
-        Ok(Some(Value::Object(Some(o)))) => o,
-        _ => return Ok(None),
-    };
-    ctx.invoke(
-        "io/quarkus/runtime/logging/LoggingSetupRecorder$1",
-        "<init>",
-        "(Lio/smallrye/config/SmallRyeConfig;)V",
-        &[
-            Value::Object(Some(source)),
-            Value::Object(Some(base_config)),
-        ],
-    )?;
-    let config_source_id =
-        match ctx.ensure_class_initialized("org/eclipse/microprofile/config/spi/ConfigSource") {
+        // This is the compatibility fix: the recorder's transient builder needs
+        // Quarkus' service-loaded converters for LogRuntimeConfig mappings.
+        let builder_cur = ctx.read_native_pin(builder_pin, builder);
+        ctx.invoke_virtual(
+            builder_cur,
+            "addDiscoveredConverters",
+            "()Lio/smallrye/config/SmallRyeConfigBuilder;",
+            &[],
+        )?;
+
+        let customizer = match ctx
+            .new_object("io/quarkus/runtime/configuration/QuarkusConfigBuilderCustomizer")
+        {
+            Ok(Some(Value::Object(Some(o)))) => o,
+            _ => return Ok(None),
+        };
+        let customizer_pin = ctx.pin_native_root(customizer);
+        ctx.invoke(
+            "io/quarkus/runtime/configuration/QuarkusConfigBuilderCustomizer",
+            "<init>",
+            "()V",
+            &[Value::Object(Some(customizer))],
+        )?;
+        let customizer_cur = ctx.read_native_pin(customizer_pin, customizer);
+        let builder_cur = ctx.read_native_pin(builder_pin, builder);
+        ctx.invoke_virtual(
+            customizer_cur,
+            "configBuilder",
+            "(Lio/smallrye/config/SmallRyeConfigBuilder;)V",
+            &[Value::Object(Some(builder_cur))],
+        )?;
+
+        for class_name in [
+            "io/quarkus/runtime/logging/LogBuildTimeConfig",
+            "io/quarkus/runtime/logging/LogRuntimeConfig",
+            "io/quarkus/runtime/console/ConsoleRuntimeConfig",
+        ] {
+            let mirror = match class_mirror_by_name(ctx, class_name) {
+                Some(o) => o,
+                None => return Ok(None),
+            };
+            let builder_cur = ctx.read_native_pin(builder_pin, builder);
+            ctx.invoke_virtual(
+                builder_cur,
+                "withMapping",
+                "(Ljava/lang/Class;)Lio/smallrye/config/SmallRyeConfigBuilder;",
+                &[Value::Object(Some(mirror))],
+            )?;
+        }
+
+        let source = match ctx.new_object("io/quarkus/runtime/logging/LoggingSetupRecorder$1") {
+            Ok(Some(Value::Object(Some(o)))) => o,
+            _ => return Ok(None),
+        };
+        let source_pin = ctx.pin_native_root(source);
+        let base_config_cur = ctx.read_native_pin(base_config_pin, base_config);
+        ctx.invoke(
+            "io/quarkus/runtime/logging/LoggingSetupRecorder$1",
+            "<init>",
+            "(Lio/smallrye/config/SmallRyeConfig;)V",
+            &[
+                Value::Object(Some(source)),
+                Value::Object(Some(base_config_cur)),
+            ],
+        )?;
+        let config_source_id = match ctx
+            .ensure_class_initialized("org/eclipse/microprofile/config/spi/ConfigSource")
+        {
             Ok(cid) => cid,
             Err(_) => return Ok(None),
         };
-    let sources = ctx.new_ref_array(config_source_id, 1);
-    ctx.set_array_element(sources, 0, Value::Object(Some(source)));
-    ctx.invoke_virtual(
-        builder,
-        "withSources",
-        "([Lorg/eclipse/microprofile/config/spi/ConfigSource;)Lio/smallrye/config/SmallRyeConfigBuilder;",
-        &[Value::Object(Some(sources))],
-    )?;
+        let sources = ctx.new_ref_array(config_source_id, 1);
+        let source_cur = ctx.read_native_pin(source_pin, source);
+        ctx.set_array_element(sources, 0, Value::Object(Some(source_cur)));
+        let builder_cur = ctx.read_native_pin(builder_pin, builder);
+        ctx.invoke_virtual(
+            builder_cur,
+            "withSources",
+            "([Lorg/eclipse/microprofile/config/spi/ConfigSource;)Lio/smallrye/config/SmallRyeConfigBuilder;",
+            &[Value::Object(Some(sources))],
+        )?;
 
-    let logging_config = match ctx.invoke_virtual(
-        builder,
-        "build",
-        "()Lio/smallrye/config/SmallRyeConfig;",
-        &[],
-    )? {
-        Some(Value::Object(Some(o))) => o,
-        _ => return Ok(None),
-    };
-
-    let log_build = match class_mirror_by_name(ctx, "io/quarkus/runtime/logging/LogBuildTimeConfig")
-    {
-        Some(cls) => match ctx.invoke_virtual(
-            logging_config,
-            "getConfigMapping",
-            "(Ljava/lang/Class;)Ljava/lang/Object;",
-            &[Value::Object(Some(cls))],
+        let builder_cur = ctx.read_native_pin(builder_pin, builder);
+        let logging_config = match ctx.invoke_virtual(
+            builder_cur,
+            "build",
+            "()Lio/smallrye/config/SmallRyeConfig;",
+            &[],
         )? {
             Some(Value::Object(Some(o))) => o,
             _ => return Ok(None),
-        },
-        None => return Ok(None),
-    };
-    let log_runtime = match class_mirror_by_name(ctx, "io/quarkus/runtime/logging/LogRuntimeConfig")
-    {
-        Some(cls) => match ctx.invoke_virtual(
-            logging_config,
-            "getConfigMapping",
-            "(Ljava/lang/Class;)Ljava/lang/Object;",
-            &[Value::Object(Some(cls))],
-        )? {
-            Some(Value::Object(Some(o))) => o,
-            _ => return Ok(None),
-        },
-        None => return Ok(None),
-    };
-    let console_runtime =
-        match class_mirror_by_name(ctx, "io/quarkus/runtime/console/ConsoleRuntimeConfig") {
-            Some(cls) => match ctx.invoke_virtual(
-                logging_config,
-                "getConfigMapping",
-                "(Ljava/lang/Class;)Ljava/lang/Object;",
-                &[Value::Object(Some(cls))],
-            )? {
-                Some(Value::Object(Some(o))) => o,
-                _ => return Ok(None),
-            },
+        };
+        let logging_config_pin = ctx.pin_native_root(logging_config);
+
+        let log_build =
+            match class_mirror_by_name(ctx, "io/quarkus/runtime/logging/LogBuildTimeConfig") {
+                Some(cls) => {
+                    let logging_config_cur =
+                        ctx.read_native_pin(logging_config_pin, logging_config);
+                    match ctx.invoke_virtual(
+                        logging_config_cur,
+                        "getConfigMapping",
+                        "(Ljava/lang/Class;)Ljava/lang/Object;",
+                        &[Value::Object(Some(cls))],
+                    )? {
+                        Some(Value::Object(Some(o))) => o,
+                        _ => return Ok(None),
+                    }
+                }
+                None => return Ok(None),
+            };
+        let log_build_pin = ctx.pin_native_root(log_build);
+        let log_runtime =
+            match class_mirror_by_name(ctx, "io/quarkus/runtime/logging/LogRuntimeConfig") {
+                Some(cls) => {
+                    let logging_config_cur =
+                        ctx.read_native_pin(logging_config_pin, logging_config);
+                    match ctx.invoke_virtual(
+                        logging_config_cur,
+                        "getConfigMapping",
+                        "(Ljava/lang/Class;)Ljava/lang/Object;",
+                        &[Value::Object(Some(cls))],
+                    )? {
+                        Some(Value::Object(Some(o))) => o,
+                        _ => return Ok(None),
+                    }
+                }
+                None => return Ok(None),
+            };
+        let log_runtime_pin = ctx.pin_native_root(log_runtime);
+        let console_runtime =
+            match class_mirror_by_name(ctx, "io/quarkus/runtime/console/ConsoleRuntimeConfig") {
+                Some(cls) => {
+                    let logging_config_cur =
+                        ctx.read_native_pin(logging_config_pin, logging_config);
+                    match ctx.invoke_virtual(
+                        logging_config_cur,
+                        "getConfigMapping",
+                        "(Ljava/lang/Class;)Ljava/lang/Object;",
+                        &[Value::Object(Some(cls))],
+                    )? {
+                        Some(Value::Object(Some(o))) => o,
+                        _ => return Ok(None),
+                    }
+                }
+                None => return Ok(None),
+            };
+        let console_runtime_pin = ctx.pin_native_root(console_runtime);
+
+        let log_runtime_cur = ctx.read_native_pin(log_runtime_pin, log_runtime);
+        let log_runtime_rv = match new_runtime_value(ctx, Value::Object(Some(log_runtime_cur))) {
+            Some(o) => o,
             None => return Ok(None),
         };
+        let log_runtime_rv_pin = ctx.pin_native_root(log_runtime_rv);
+        let console_runtime_cur = ctx.read_native_pin(console_runtime_pin, console_runtime);
+        let console_runtime_rv =
+            match new_runtime_value(ctx, Value::Object(Some(console_runtime_cur))) {
+                Some(o) => o,
+                None => return Ok(None),
+            };
+        let console_runtime_rv_pin = ctx.pin_native_root(console_runtime_rv);
+        let recorder = match ctx.new_object("io/quarkus/runtime/logging/LoggingSetupRecorder") {
+            Ok(Some(Value::Object(Some(o)))) => o,
+            _ => return Ok(None),
+        };
+        let recorder_pin = ctx.pin_native_root(recorder);
+        let log_build_cur = ctx.read_native_pin(log_build_pin, log_build);
+        let log_runtime_rv_cur = ctx.read_native_pin(log_runtime_rv_pin, log_runtime_rv);
+        let console_runtime_rv_cur = ctx.read_native_pin(console_runtime_rv_pin, console_runtime_rv);
+        ctx.invoke(
+            "io/quarkus/runtime/logging/LoggingSetupRecorder",
+            "<init>",
+            "(Lio/quarkus/runtime/logging/LogBuildTimeConfig;Lio/quarkus/runtime/RuntimeValue;Lio/quarkus/runtime/RuntimeValue;)V",
+            &[
+                Value::Object(Some(recorder)),
+                Value::Object(Some(log_build_cur)),
+                Value::Object(Some(log_runtime_rv_cur)),
+                Value::Object(Some(console_runtime_rv_cur)),
+            ],
+        )?;
 
-    let log_runtime_rv = match new_runtime_value(ctx, Value::Object(Some(log_runtime))) {
-        Some(o) => o,
-        None => return Ok(None),
-    };
-    let console_runtime_rv = match new_runtime_value(ctx, Value::Object(Some(console_runtime))) {
-        Some(o) => o,
-        None => return Ok(None),
-    };
-    let recorder = match ctx.new_object("io/quarkus/runtime/logging/LoggingSetupRecorder") {
-        Ok(Some(Value::Object(Some(o)))) => o,
-        _ => return Ok(None),
-    };
-    ctx.invoke(
-        "io/quarkus/runtime/logging/LoggingSetupRecorder",
-        "<init>",
-        "(Lio/quarkus/runtime/logging/LogBuildTimeConfig;Lio/quarkus/runtime/RuntimeValue;Lio/quarkus/runtime/RuntimeValue;)V",
-        &[
-            Value::Object(Some(recorder)),
-            Value::Object(Some(log_build)),
-            Value::Object(Some(log_runtime_rv)),
-            Value::Object(Some(console_runtime_rv)),
-        ],
-    )?;
+        let components = match ctx.invoke(
+            "io/quarkus/runtime/logging/DiscoveredLogComponents",
+            "ofEmpty",
+            "()Lio/quarkus/runtime/logging/DiscoveredLogComponents;",
+            &[],
+        )? {
+            Some(Value::Object(Some(o))) => o,
+            _ => return Ok(None),
+        };
+        let components_pin = ctx.pin_native_root(components);
+        let empty_map = match invoke_collections_value(ctx, "emptyMap", "()Ljava/util/Map;") {
+            Some(v) => v,
+            None => return Ok(None),
+        };
+        let empty_map_pin = pinned_object_value(ctx, empty_map);
+        let empty_list = match invoke_collections_value(ctx, "emptyList", "()Ljava/util/List;") {
+            Some(v) => v,
+            None => return Ok(None),
+        };
+        let empty_list_pin = pinned_object_value(ctx, empty_list);
+        let launch_mode =
+            match static_object_field(ctx, "io/quarkus/runtime/LaunchMode", "DEVELOPMENT") {
+                Some(o) => o,
+                None => return Ok(None),
+            };
 
-    let components = match ctx.invoke(
-        "io/quarkus/runtime/logging/DiscoveredLogComponents",
-        "ofEmpty",
-        "()Lio/quarkus/runtime/logging/DiscoveredLogComponents;",
-        &[],
-    )? {
-        Some(Value::Object(Some(o))) => o,
-        _ => return Ok(None),
-    };
-    let empty_map = match invoke_collections_value(ctx, "emptyMap", "()Ljava/util/Map;") {
-        Some(v) => v,
-        None => return Ok(None),
-    };
-    let empty_list = match invoke_collections_value(ctx, "emptyList", "()Ljava/util/List;") {
-        Some(v) => v,
-        None => return Ok(None),
-    };
-    let launch_mode = match static_object_field(ctx, "io/quarkus/runtime/LaunchMode", "DEVELOPMENT")
-    {
-        Some(o) => o,
-        None => return Ok(None),
-    };
+        let recorder_cur = ctx.read_native_pin(recorder_pin, recorder);
+        let components_cur = ctx.read_native_pin(components_pin, components);
+        let empty_map_cur = read_pinned_object_value(ctx, empty_map_pin, empty_map);
+        let empty_list_cur = read_pinned_object_value(ctx, empty_list_pin, empty_list);
+        let supplier_rv_cur = ctx.read_native_pin(supplier_rv_pin, supplier_rv);
+        ctx.invoke_virtual(
+            recorder_cur,
+            "initializeLogging",
+            "(Lio/quarkus/runtime/logging/DiscoveredLogComponents;Ljava/util/Map;ZLio/quarkus/runtime/RuntimeValue;Ljava/util/List;Ljava/util/List;Ljava/util/List;Ljava/util/List;Ljava/util/List;Ljava/util/List;Lio/quarkus/runtime/RuntimeValue;Lio/quarkus/runtime/LaunchMode;Z)Lio/quarkus/runtime/shutdown/ShutdownListener;",
+            &[
+                Value::Object(Some(components_cur)),
+                empty_map_cur,
+                Value::Int(0),
+                Value::Object(None),
+                empty_list_cur,
+                empty_list_cur,
+                empty_list_cur,
+                empty_list_cur,
+                empty_list_cur,
+                empty_list_cur,
+                Value::Object(Some(supplier_rv_cur)),
+                Value::Object(Some(launch_mode)),
+                Value::Int(0),
+            ],
+        )?;
 
-    ctx.invoke_virtual(
-        recorder,
-        "initializeLogging",
-        "(Lio/quarkus/runtime/logging/DiscoveredLogComponents;Ljava/util/Map;ZLio/quarkus/runtime/RuntimeValue;Ljava/util/List;Ljava/util/List;Ljava/util/List;Ljava/util/List;Ljava/util/List;Ljava/util/List;Lio/quarkus/runtime/RuntimeValue;Lio/quarkus/runtime/LaunchMode;Z)Lio/quarkus/runtime/shutdown/ShutdownListener;",
-        &[
-            Value::Object(Some(components)),
-            empty_map,
-            Value::Int(0),
-            Value::Object(None),
-            empty_list,
-            empty_list,
-            empty_list,
-            empty_list,
-            empty_list,
-            empty_list,
-            Value::Object(Some(supplier_rv)),
-            Value::Object(Some(launch_mode)),
-            Value::Int(0),
-        ],
-    )?;
-
-    Ok(None)
+        Ok(None)
+    })();
+    ctx.unpin_native_roots(supplier_rv_pin);
+    result
 }
 
 pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
@@ -4561,8 +5618,13 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
         let this = obj_arg(args, 0)?;
         let p = p57_read_path(ctx, this);
         let file = alloc_concurrent_synthetic(ctx, "java/io/File", 1);
+        // Pin across the create_string below — a moving young GC there would
+        // relocate the fresh File (native stale-local family).
+        let file_pin = ctx.pin_native_root(file);
         let s = ctx.create_string(&p);
+        let file = ctx.read_native_pin(file_pin, file);
         ctx.set_field(file, 0, Value::Object(Some(s)));
+        ctx.unpin_native_roots(file_pin);
         Ok(Some(Value::Object(Some(file))))
     });
 
@@ -5201,8 +6263,13 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
             };
             let provider =
                 alloc_concurrent_synthetic(ctx, "java/nio/file/spi/FileSystemProvider", 1);
+            // Pin across the create_string below — a moving young GC there
+            // would relocate the fresh provider (native stale-local family).
+            let provider_pin = ctx.pin_native_root(provider);
             let scheme = ctx.create_string(scheme_str);
+            let provider = ctx.read_native_pin(provider_pin, provider);
             ctx.set_field(provider, 0, Value::Object(Some(scheme)));
+            ctx.unpin_native_roots(provider_pin);
             Ok(Some(Value::Object(Some(provider))))
         },
     );
@@ -5239,10 +6306,15 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
         |ctx, _args| {
             use cratonvm_types::ArrayElementType;
             let arr = ctx.new_array(ArrayElementType::Reference, 0);
+            // Pin across the list alloc below — a moving young GC there would
+            // relocate the fresh array (native stale-local family).
+            let arr_pin = ctx.pin_native_root(arr);
             let list = alloc_concurrent_synthetic(ctx, "java/util/ArrayList", 3);
+            let arr = ctx.read_native_pin(arr_pin, arr);
             ctx.set_field(list, 0, Value::Int(0));
             ctx.set_field(list, 1, Value::Object(Some(arr)));
             ctx.set_field(list, 2, Value::Int(0));
+            ctx.unpin_native_roots(arr_pin);
             Ok(Some(Value::Object(Some(list))))
         },
     );
@@ -5279,17 +6351,18 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
             // making in-process compilation fail. Use the real-JDK `ArrayList`
             // layout instead (same as `installedProviders`), which iterates
             // correctly.
-            let jar_field = obj_arg(args, 0)
-                .ok()
-                .map(|this| ctx.get_field(this, P57_FS_JAR_FIELD));
-            let jrt_field = obj_arg(args, 0)
-                .ok()
-                .map(|this| ctx.get_field(this, P57_FS_JRT_FIELD));
+            // Pin across the path/array/list allocs below — a moving young GC
+            // there would relocate `this` and the fresh objects (native
+            // stale-local family).
+            let this_pin = obj_arg(args, 0).ok().map(|t| (ctx.pin_native_root(t), t));
+            let jar_field = this_pin.map(|(_, this)| ctx.get_field(this, P57_FS_JAR_FIELD));
+            let jrt_field = this_pin.map(|(_, this)| ctx.get_field(this, P57_FS_JRT_FIELD));
             let root_path = match (jar_field, jrt_field) {
                 (Some(Value::Object(Some(s))), _) => {
                     let jar = ctx.read_string(s).unwrap_or_default();
                     let rp = p57_alloc_path(ctx, &jarfs_encode(&jar, ""));
-                    if let Ok(this) = obj_arg(args, 0) {
+                    if let Some((h, orig)) = this_pin {
+                        let this = ctx.read_native_pin(h, orig);
                         ctx.set_field(rp, P57_PATH_FS_FIELD, Value::Object(Some(this)));
                     }
                     rp
@@ -5299,7 +6372,8 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
                     // `/modules` (javac walks `/modules/<module>/...`).
                     let jh = ctx.read_string(s).unwrap_or_default();
                     let rp = p57_alloc_path(ctx, &jrtfs_encode(&jh, ""));
-                    if let Ok(this) = obj_arg(args, 0) {
+                    if let Some((h, orig)) = this_pin {
+                        let this = ctx.read_native_pin(h, orig);
                         ctx.set_field(rp, P57_PATH_FS_FIELD, Value::Object(Some(this)));
                     }
                     rp
@@ -5309,14 +6383,19 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
                     p57_alloc_path(ctx, root)
                 }
             };
+            let root_path_pin = ctx.pin_native_root(root_path);
             let arr = ctx.new_array(ArrayElementType::Reference, 1);
+            let arr_pin = ctx.pin_native_root(arr);
+            let root_path = ctx.read_native_pin(root_path_pin, root_path);
             ctx.set_array_element(arr, 0, Value::Object(Some(root_path)));
             // Real ArrayList field layout in real-JDK mode:
             //   [0]=AbstractList.modCount (int), [1]=elementData (Object[]), [2]=size (int).
             let list = alloc_concurrent_synthetic(ctx, "java/util/ArrayList", 3);
+            let arr = ctx.read_native_pin(arr_pin, arr);
             ctx.set_field(list, 0, Value::Int(0));
             ctx.set_field(list, 1, Value::Object(Some(arr)));
             ctx.set_field(list, 2, Value::Int(1));
+            ctx.unpin_native_roots(this_pin.map(|(h, _)| h).unwrap_or(root_path_pin));
             Ok(Some(Value::Object(Some(list))))
         },
     );
@@ -5389,10 +6468,15 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
                 .ok()
                 .map(|p| p57_read_path(ctx, p))
                 .unwrap_or_default();
-            let fs = p57_alloc_default_filesystem(ctx);
+            let mut fs = p57_alloc_default_filesystem(ctx);
             if !jar_path.is_empty() {
+                // Pin across the create_string below — a moving young GC there
+                // would relocate the fresh FileSystem (native stale-local family).
+                let fs_pin = ctx.pin_native_root(fs);
                 let jp = ctx.create_string(&jar_path);
+                fs = ctx.read_native_pin(fs_pin, fs);
                 ctx.set_field(fs, P57_FS_JAR_FIELD, Value::Object(Some(jp)));
+                ctx.unpin_native_roots(fs_pin);
             }
             Ok(Some(Value::Object(Some(fs))))
         },
@@ -5420,13 +6504,19 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
                 let fs = p57_alloc_jrt_filesystem(ctx, &jh);
                 return Ok(Some(Value::Object(Some(fs))));
             }
-            let fs = p57_alloc_default_filesystem(ctx);
+            let mut fs = p57_alloc_default_filesystem(ctx);
             if let Some(jar) = p57_jar_uri_to_os_path(&text) {
                 // Only mount paths that exist as regular files — a `file:`
                 // URI naming a directory is not a mountable archive.
                 if std::path::Path::new(&jar).is_file() {
+                    // Pin across the create_string below — a moving young GC
+                    // there would relocate the fresh FileSystem (native
+                    // stale-local family).
+                    let fs_pin = ctx.pin_native_root(fs);
                     let jp = ctx.create_string(&jar);
+                    fs = ctx.read_native_pin(fs_pin, fs);
                     ctx.set_field(fs, P57_FS_JAR_FIELD, Value::Object(Some(jp)));
+                    ctx.unpin_native_roots(fs_pin);
                 }
             }
             Ok(Some(Value::Object(Some(fs))))
@@ -5485,8 +6575,13 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
             } else {
                 "java/nio/file/attribute/BasicFileAttributeView"
             };
+            // Pin across the view alloc below — a moving young GC there would
+            // relocate the Path (native stale-local family).
+            let path_pin = ctx.pin_native_root(path_obj);
             let view = alloc_concurrent_synthetic(ctx, vclass, 1);
+            let path_obj = ctx.read_native_pin(path_pin, path_obj);
             ctx.set_field(view, 0, Value::Object(Some(path_obj)));
+            ctx.unpin_native_roots(path_pin);
             Ok(Some(Value::Object(Some(view))))
         },
     );
@@ -5522,12 +6617,17 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
             // then re-home them into a DosFileAttributes instance.
             let bfa = p59_files_read_attributes(ctx, &[path_obj])?;
             if let Some(Value::Object(Some(bfa_obj))) = bfa {
+                // Pin across the Dos alloc below — a moving young GC there
+                // would relocate the basic attrs (native stale-local family).
+                let bfa_pin = ctx.pin_native_root(bfa_obj);
                 let dos =
                     alloc_concurrent_synthetic(ctx, "java/nio/file/attribute/DosFileAttributes", 5);
+                let bfa_obj = ctx.read_native_pin(bfa_pin, bfa_obj);
                 for i in 0..5 {
                     let v = ctx.get_field(bfa_obj, i);
                     ctx.set_field(dos, i, v);
                 }
+                ctx.unpin_native_roots(bfa_pin);
                 return Ok(Some(Value::Object(Some(dos))));
             }
             Ok(Some(Value::Object(None)))
@@ -5746,8 +6846,13 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
             use cratonvm_types::ArrayElementType;
             let mk_provider = |ctx: &mut dyn NativeContext, scheme: &str| {
                 let p = alloc_concurrent_synthetic(ctx, "java/nio/file/spi/FileSystemProvider", 1);
+                // Pin across the create_string below — a moving young GC there
+                // would relocate the fresh provider (native stale-local family).
+                let p_pin = ctx.pin_native_root(p);
                 let s = ctx.create_string(scheme);
+                let p = ctx.read_native_pin(p_pin, p);
                 ctx.set_field(p, 0, Value::Object(Some(s)));
+                ctx.unpin_native_roots(p_pin);
                 p
             };
             // "jrt" lets `FileSystems.getFileSystem(URI.create("jrt:/"))` resolve
@@ -5755,18 +6860,27 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
             // in-process compiler can read platform classes from the runtime
             // image (HIB-CV-27).
             let file_p = mk_provider(ctx, "file");
+            let file_pin = ctx.pin_native_root(file_p);
             let jar_p = mk_provider(ctx, "jar");
+            let jar_pin = ctx.pin_native_root(jar_p);
             let jrt_p = mk_provider(ctx, "jrt");
+            let jrt_pin = ctx.pin_native_root(jrt_p);
             let arr = ctx.new_array(ArrayElementType::Reference, 3);
+            let arr_pin = ctx.pin_native_root(arr);
+            let file_p = ctx.read_native_pin(file_pin, file_p);
+            let jar_p = ctx.read_native_pin(jar_pin, jar_p);
+            let jrt_p = ctx.read_native_pin(jrt_pin, jrt_p);
             ctx.set_array_element(arr, 0, Value::Object(Some(file_p)));
             ctx.set_array_element(arr, 1, Value::Object(Some(jar_p)));
             ctx.set_array_element(arr, 2, Value::Object(Some(jrt_p)));
             // Real ArrayList field layout in real-JDK mode:
             //   [0]=AbstractList.modCount (int), [1]=elementData (Object[]), [2]=size (int).
             let list = alloc_concurrent_synthetic(ctx, "java/util/ArrayList", 3);
+            let arr = ctx.read_native_pin(arr_pin, arr);
             ctx.set_field(list, 0, Value::Int(0));
             ctx.set_field(list, 1, Value::Object(Some(arr)));
             ctx.set_field(list, 2, Value::Int(3));
+            ctx.unpin_native_roots(file_pin);
             Ok(Some(Value::Object(Some(list))))
         },
     );
@@ -5874,10 +6988,15 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
         |ctx, _args| {
             use cratonvm_types::ArrayElementType;
             let arr = ctx.new_array(ArrayElementType::Reference, 0);
+            // Pin across the list alloc below — a moving young GC there would
+            // relocate the fresh array (native stale-local family).
+            let arr_pin = ctx.pin_native_root(arr);
             let list = alloc_concurrent_synthetic(ctx, "java/util/ArrayList", 3);
+            let arr = ctx.read_native_pin(arr_pin, arr);
             ctx.set_field(list, 0, Value::Int(0));
             ctx.set_field(list, 1, Value::Object(Some(arr)));
             ctx.set_field(list, 2, Value::Int(0));
+            ctx.unpin_native_roots(arr_pin);
             Ok(Some(Value::Object(Some(list))))
         },
     );
@@ -5919,10 +7038,22 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
                 Some(Value::Object(Some(c))) => *c,
                 _ => return Ok(Some(Value::Object(None))),
             };
+            // Pin across the annotation-prefix lookup below — a moving young
+            // GC there would relocate them (native stale-local family).
+            let this_val = args[0];
+            let this_pin = pinned_object_value(ctx, this_val);
+            let mirror_pin = ctx.pin_native_root(class_mirror);
             let prefix = config_mapping_prefix(ctx, class_mirror);
+            let this_val = read_pinned_object_value(ctx, this_pin, this_val);
+            let class_mirror = ctx.read_native_pin(mirror_pin, class_mirror);
+            if let Some((h, _)) = this_pin {
+                ctx.unpin_native_roots(h);
+            } else {
+                ctx.unpin_native_roots(mirror_pin);
+            }
             native_smallrye_get_config_mapping(
                 ctx,
-                &[args[0], Value::Object(Some(class_mirror)), prefix],
+                &[this_val, Value::Object(Some(class_mirror)), prefix],
             )
         },
     );
@@ -6419,23 +7550,37 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
             _ => String::new(),
         };
 
+        // Pin across the ArrayList ctor / iterator invokes below — a moving
+        // young GC there would relocate `this`/`list` (native stale-local
+        // family).
+        let this_pin = ctx.pin_native_root(this);
         let list = match ctx.new_object_initialized("java/util/ArrayList", "()V", &[])? {
             Some(Value::Object(Some(list))) => list,
-            _ => return Ok(Some(Value::Object(None))),
+            _ => {
+                ctx.unpin_native_roots(this_pin);
+                return Ok(Some(Value::Object(None)));
+            }
         };
+        let list_pin = ctx.pin_native_root(list);
+        let this = ctx.read_native_pin(this_pin, this);
         if !(key.starts_with("kc.") || key.starts_with("quarkus.")) {
+            ctx.unpin_native_roots(this_pin);
             return Ok(Some(Value::Object(Some(list))));
         }
 
         let Some(set) = picocli_obj_field(ctx, this, "wildcardMappers") else {
+            ctx.unpin_native_roots(this_pin);
             return Ok(Some(Value::Object(Some(list))));
         };
         let iterator = match ctx.invoke_virtual(set, "iterator", "()Ljava/util/Iterator;", &[])? {
             Some(Value::Object(Some(iterator))) => iterator,
-            _ => return Ok(Some(Value::Object(Some(list)))),
+            _ => {
+                let list = ctx.read_native_pin(list_pin, list);
+                ctx.unpin_native_roots(this_pin);
+                return Ok(Some(Value::Object(Some(list))));
+            }
         };
 
-        let list_pin = ctx.pin_native_root(list);
         let iterator_pin = ctx.pin_native_root(iterator);
         for _ in 0..10_000 {
             let iterator = ctx.read_native_pin(iterator_pin, iterator);
@@ -6467,17 +7612,21 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
         }
 
         let list = ctx.read_native_pin(list_pin, list);
-        ctx.unpin_native_roots(iterator_pin);
-        ctx.unpin_native_roots(list_pin);
+        ctx.unpin_native_roots(this_pin);
         Ok(Some(Value::Object(Some(list))))
     }
 
     fn keycloak_optional_string(ctx: &mut dyn NativeContext, value: Option<String>) -> Value {
         let optional = alloc_concurrent_synthetic(ctx, "java/util/Optional", 1);
+        // Pin across the create_string below — a moving young GC there would
+        // relocate the fresh Optional (native stale-local family).
+        let optional_pin = ctx.pin_native_root(optional);
         let optional_value = value
             .map(|s| Value::Object(Some(ctx.create_string(&s))))
             .unwrap_or(Value::Object(None));
+        let optional = ctx.read_native_pin(optional_pin, optional);
         ctx.set_field(optional, 0, optional_value);
+        ctx.unpin_native_roots(optional_pin);
         Value::Object(Some(optional))
     }
 
@@ -7899,10 +9048,16 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
 
     fn picocli_new_regex_transformer(ctx: &mut dyn NativeContext) -> MethodCallResult {
         let obj = alloc_concurrent_synthetic(ctx, "picocli/CommandLine$RegexTransformer", 2);
+        // Pin across the emptyMap invoke below — a moving young GC there would
+        // relocate the fresh transformer (native stale-local family).
+        let obj_pin = ctx.pin_native_root(obj);
         if let Ok(Some(empty_map)) = ctx.invoke("java/util/Collections", "emptyMap", "()Ljava/util/Map;", &[]) {
+            let obj = ctx.read_native_pin(obj_pin, obj);
             ctx.set_field_by_name(obj, "replacements", empty_map);
             ctx.set_field_by_name(obj, "synopsis", empty_map);
         }
+        let obj = ctx.read_native_pin(obj_pin, obj);
+        ctx.unpin_native_roots(obj_pin);
         Ok(Some(Value::Object(Some(obj))))
     }
 
@@ -8248,14 +9403,23 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
                     .unwrap_or(1);
                 let n_fields = std::cmp::max(data_slot, size_slot) + 1;
                 let list = alloc_concurrent_synthetic(ctx, "java/util/ArrayList", n_fields);
+                // Pin across the array/string allocs below — a moving young GC
+                // there would relocate the fresh list/array (native
+                // stale-local family).
+                let list_pin = ctx.pin_native_root(list);
                 use cratonvm_types::ArrayElementType;
                 let arr = ctx.new_array(ArrayElementType::Reference, lines.len());
+                let arr_pin = ctx.pin_native_root(arr);
                 for (i, line) in lines.iter().enumerate() {
                     let s = ctx.create_string(line);
+                    let arr = ctx.read_native_pin(arr_pin, arr);
                     ctx.set_array_element(arr, i, Value::Object(Some(s)));
                 }
+                let list = ctx.read_native_pin(list_pin, list);
+                let arr = ctx.read_native_pin(arr_pin, arr);
                 ctx.set_field(list, data_slot, Value::Object(Some(arr)));
                 ctx.set_field(list, size_slot, Value::Int(lines.len() as i32));
+                ctx.unpin_native_roots(list_pin);
                 Ok(Some(Value::Object(Some(list))))
             }
             Err(e) => Err(p57_io_error(&e)),
@@ -8286,12 +9450,19 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
                     let lines: Vec<&str> = content.lines().collect();
                     use cratonvm_types::ArrayElementType;
                     let arr = ctx.new_array(ArrayElementType::Reference, lines.len());
+                    // Pin across the string/stream allocs below — a moving
+                    // young GC there would relocate the fresh array (native
+                    // stale-local family).
+                    let arr_pin = ctx.pin_native_root(arr);
                     for (i, line) in lines.iter().enumerate() {
                         let s = ctx.create_string(line);
+                        let arr = ctx.read_native_pin(arr_pin, arr);
                         ctx.set_array_element(arr, i, Value::Object(Some(s)));
                     }
                     let stream = alloc_concurrent_synthetic(ctx, "java/util/stream/Stream", 1);
+                    let arr = ctx.read_native_pin(arr_pin, arr);
                     ctx.set_field(stream, 0, Value::Object(Some(arr)));
+                    ctx.unpin_native_roots(arr_pin);
                     Ok(Some(Value::Object(Some(stream))))
                 }
                 Err(e) => Err(p57_io_error(&e)),
@@ -8453,8 +9624,14 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
                         "java/nio/file/FileAlreadyExistsException",
                         4,
                     );
+                    // Pin across the create_string below — a moving young GC
+                    // there would relocate the fresh exception (native
+                    // stale-local family).
+                    let exc_pin = ctx.pin_native_root(exc);
                     let file_str = ctx.create_string(&p);
+                    let exc = ctx.read_native_pin(exc_pin, exc);
                     ctx.set_field_by_name(exc, "file", Value::Object(Some(file_str)));
+                    ctx.unpin_native_roots(exc_pin);
                     Err(MethodCallFailed::ExceptionThrown(exc))
                 }
                 Err(e) => Err(p57_io_error(&e)),
@@ -8483,8 +9660,14 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
                         "java/nio/file/FileAlreadyExistsException",
                         4,
                     );
+                    // Pin across the create_string below — a moving young GC
+                    // there would relocate the fresh exception (native
+                    // stale-local family).
+                    let exc_pin = ctx.pin_native_root(exc);
                     let file_str = ctx.create_string(&p);
+                    let exc = ctx.read_native_pin(exc_pin, exc);
                     ctx.set_field_by_name(exc, "file", Value::Object(Some(file_str)));
+                    ctx.unpin_native_roots(exc_pin);
                     Err(MethodCallFailed::ExceptionThrown(exc))
                 }
                 Err(e) => Err(p57_io_error(&e)),
@@ -8584,8 +9767,14 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
                             "java/nio/channels/SeekableByteChannel",
                             3,
                         );
+                        // Pin across the array alloc below — a moving young GC
+                        // there would relocate the fresh channel (native
+                        // stale-local family).
+                        let channel_pin = ctx.pin_native_root(channel);
                         use cratonvm_types::ArrayElementType;
                         let arr = ctx.new_array(ArrayElementType::Byte, data.len());
+                        let channel = ctx.read_native_pin(channel_pin, channel);
+                        ctx.unpin_native_roots(channel_pin);
                         for (i, &b) in data.iter().enumerate() {
                             ctx.set_array_element(arr, i, Value::Int(b as i8 as i32));
                         }
@@ -8666,8 +9855,14 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
             match read {
                 Ok(data) => {
                     let stream = alloc_concurrent_synthetic(ctx, "java/io/ByteArrayInputStream", 4);
+                    // Pin across the array alloc below — a moving young GC
+                    // there would relocate the fresh stream (native
+                    // stale-local family).
+                    let stream_pin = ctx.pin_native_root(stream);
                     use cratonvm_types::ArrayElementType;
                     let arr = ctx.new_array(ArrayElementType::Byte, data.len());
+                    let stream = ctx.read_native_pin(stream_pin, stream);
+                    ctx.unpin_native_roots(stream_pin);
                     for (i, &b) in data.iter().enumerate() {
                         ctx.set_array_element(arr, i, Value::Int(b as i8 as i32));
                     }
@@ -8760,6 +9955,9 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
             let path_obj = obj_arg(args, 1)?;
             let p = p57_read_path(ctx, path_obj);
             let stream = alloc_concurrent_synthetic(ctx, "java/nio/file/DirectoryStream", 1);
+            // Pin across the array/Path allocs below — a moving young GC there
+            // would relocate the fresh stream/array (native stale-local family).
+            let stream_pin = ctx.pin_native_root(stream);
             // Build array of Path entries
             let entries: Vec<String> = if let Some((jar, dir)) = jarfs_decode(&p) {
                 jarfs_list_dir(&jar, &dir)
@@ -8782,11 +9980,16 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
             };
             use cratonvm_types::ArrayElementType;
             let arr = ctx.new_array(ArrayElementType::Reference, entries.len());
+            let arr_pin = ctx.pin_native_root(arr);
             for (i, entry) in entries.iter().enumerate() {
                 let ep = p57_alloc_path(ctx, entry);
+                let arr = ctx.read_native_pin(arr_pin, arr);
                 ctx.set_array_element(arr, i, Value::Object(Some(ep)));
             }
+            let stream = ctx.read_native_pin(stream_pin, stream);
+            let arr = ctx.read_native_pin(arr_pin, arr);
             ctx.set_field(stream, 0, Value::Object(Some(arr)));
+            ctx.unpin_native_roots(stream_pin);
             Ok(Some(Value::Object(Some(stream))))
         },
     );
@@ -9123,8 +10326,14 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
             match read {
                 Ok(data) => {
                     let stream = alloc_concurrent_synthetic(ctx, "java/io/ByteArrayInputStream", 4);
+                    // Pin across the array alloc below — a moving young GC
+                    // there would relocate the fresh stream (native
+                    // stale-local family).
+                    let stream_pin = ctx.pin_native_root(stream);
                     use cratonvm_types::ArrayElementType;
                     let arr = ctx.new_array(ArrayElementType::Byte, data.len());
+                    let stream = ctx.read_native_pin(stream_pin, stream);
+                    ctx.unpin_native_roots(stream_pin);
                     for (i, &b) in data.iter().enumerate() {
                         ctx.set_array_element(arr, i, Value::Int(b as i8 as i32));
                     }
@@ -9600,8 +10809,13 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
         let this = obj_arg(args, 0)?;
         let p = p57_read_path(ctx, this);
         let file = alloc_concurrent_synthetic(ctx, "java/io/File", 1);
+        // Pin across the create_string below — a moving young GC there would
+        // relocate the fresh File (native stale-local family).
+        let file_pin = ctx.pin_native_root(file);
         let s = ctx.create_string(&p);
+        let file = ctx.read_native_pin(file_pin, file);
         ctx.set_field(file, 0, Value::Object(Some(s)));
+        ctx.unpin_native_roots(file_pin);
         Ok(Some(Value::Object(Some(file))))
     });
 
@@ -9620,9 +10834,14 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
             let entry = entry.trim_start_matches('/');
             let uri_str = format!("jar:file:{jar_abs}!/{entry}");
             let uri = alloc_concurrent_synthetic(ctx, "java/net/URI", 5);
+            // Pin across the create_string below — a moving young GC there
+            // would relocate the fresh URI (native stale-local family).
+            let uri_pin = ctx.pin_native_root(uri);
             let s = ctx.create_string(&uri_str);
+            let uri = ctx.read_native_pin(uri_pin, uri);
             ctx.set_field(uri, 0, Value::Object(Some(s)));
             ctx.set_field(uri, 4, Value::Object(Some(s)));
+            ctx.unpin_native_roots(uri_pin);
             return Ok(Some(Value::Object(Some(uri))));
         }
         // jrt-FS Path → `jrt:/modules/<module>/<entry>` URI (matches the JDK
@@ -9631,9 +10850,14 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
             let entry = entry.trim_start_matches('/');
             let uri_str = format!("jrt:/{entry}");
             let uri = alloc_concurrent_synthetic(ctx, "java/net/URI", 5);
+            // Pin across the create_string below — a moving young GC there
+            // would relocate the fresh URI (native stale-local family).
+            let uri_pin = ctx.pin_native_root(uri);
             let s = ctx.create_string(&uri_str);
+            let uri = ctx.read_native_pin(uri_pin, uri);
             ctx.set_field(uri, 0, Value::Object(Some(s)));
             ctx.set_field(uri, 4, Value::Object(Some(s)));
+            ctx.unpin_native_roots(uri_pin);
             return Ok(Some(Value::Object(Some(uri))));
         }
         let prefixed;
@@ -9653,12 +10877,18 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
         let encoded = encode_file_uri_path(slash_p);
         let uri_str = format!("file://{}", encoded);
         let uri = alloc_concurrent_synthetic(ctx, "java/net/URI", 5);
+        // Pin across the create_strings below — a moving young GC there would
+        // relocate the fresh URI (native stale-local family).
+        let uri_pin = ctx.pin_native_root(uri);
         let s = ctx.create_string(&uri_str);
+        let uri = ctx.read_native_pin(uri_pin, uri);
         ctx.set_field(uri, 0, Value::Object(Some(s)));
         // field 4 = (decoded) path component, with the leading-slash form the JDK
         // exposes via `URI.getPath()` (e.g. `/C:/…/resource#test1.txt`).
         let path_s = ctx.create_string(slash_p);
+        let uri = ctx.read_native_pin(uri_pin, uri);
         ctx.set_field(uri, 4, Value::Object(Some(path_s)));
+        ctx.unpin_native_roots(uri_pin);
         Ok(Some(Value::Object(Some(uri))))
     });
 
@@ -9745,13 +10975,19 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
         let parts: Vec<String> = p57_parse_win_root(&p).1;
         use cratonvm_types::ArrayElementType;
         let arr = ctx.new_array(ArrayElementType::Reference, parts.len());
+        // Pin across the Path/iterator allocs below — a moving young GC there
+        // would relocate the fresh array (native stale-local family).
+        let arr_pin = ctx.pin_native_root(arr);
         for (i, part) in parts.iter().enumerate() {
             let ep = p57_alloc_path(ctx, part);
+            let arr = ctx.read_native_pin(arr_pin, arr);
             ctx.set_array_element(arr, i, Value::Object(Some(ep)));
         }
         let iter = alloc_concurrent_synthetic(ctx, "java/util/Iterator", 2);
+        let arr = ctx.read_native_pin(arr_pin, arr);
         ctx.set_field(iter, 0, Value::Object(Some(arr)));
         ctx.set_field(iter, 1, Value::Int(0)); // cursor
+        ctx.unpin_native_roots(arr_pin);
         Ok(Some(Value::Object(Some(iter))))
     });
 
@@ -10547,8 +11783,15 @@ fn p57_alloc_path_checked(ctx: &mut dyn NativeContext, path: &str) -> MethodCall
     if let Err(reason) = p57_validate_windows_path(path) {
         return match ctx.new_object("java/nio/file/InvalidPathException") {
             Ok(Some(Value::Object(Some(exc)))) => {
+                // Pin across the create_strings below — a moving young GC
+                // there would relocate the fresh exception (native
+                // stale-local family).
+                let exc_pin = ctx.pin_native_root(exc);
                 let input_str = ctx.create_string(path);
+                let input_pin = ctx.pin_native_root(input_str);
                 let reason_str = ctx.create_string(reason);
+                let exc = ctx.read_native_pin(exc_pin, exc);
+                let input_str = ctx.read_native_pin(input_pin, input_str);
                 let _ = ctx.invoke(
                     "java/nio/file/InvalidPathException",
                     "<init>",
@@ -10559,6 +11802,8 @@ fn p57_alloc_path_checked(ctx: &mut dyn NativeContext, path: &str) -> MethodCall
                         Value::Object(Some(reason_str)),
                     ],
                 );
+                let exc = ctx.read_native_pin(exc_pin, exc);
+                ctx.unpin_native_roots(exc_pin);
                 Err(MethodCallFailed::ExceptionThrown(exc))
             }
             _ => Err(RuntimeError::IllegalArgumentException {
@@ -10591,8 +11836,13 @@ fn p57_alloc_path(ctx: &mut dyn NativeContext, path: &str) -> ObjectRef {
     };
     #[cfg(not(windows))]
     let stored = path.to_string();
+    // Pin across the create_string below — a moving young GC there would
+    // relocate the fresh Path (native stale-local family).
+    let obj_pin = ctx.pin_native_root(obj);
     let s = ctx.create_string(&stored);
+    let obj = ctx.read_native_pin(obj_pin, obj);
     ctx.set_field(obj, P57_PATH_FIELD, Value::Object(Some(s)));
+    ctx.unpin_native_roots(obj_pin);
     obj
 }
 
@@ -10681,8 +11931,13 @@ fn fsp_new_output_stream(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
     if create_new && std::path::Path::new(&p).exists() {
         // CREATE_NEW + existing file ⇒ FileAlreadyExistsException
         let exc = alloc_concurrent_synthetic(ctx, "java/nio/file/FileAlreadyExistsException", 4);
+        // Pin across the create_string below — a moving young GC there would
+        // relocate the fresh exception (native stale-local family).
+        let exc_pin = ctx.pin_native_root(exc);
         let file_str = ctx.create_string(&p);
+        let exc = ctx.read_native_pin(exc_pin, exc);
         ctx.set_field_by_name(exc, "file", Value::Object(Some(file_str)));
+        ctx.unpin_native_roots(exc_pin);
         return Err(MethodCallFailed::ExceptionThrown(exc));
     }
     let fd = match ctx.fd_table().open_write(&p, append) {
@@ -10709,12 +11964,17 @@ fn fsp_new_output_stream(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
     // registered in native-io::lib.rs) recover the fd via the same
     // `fd`/`handle` fields on the FileDescriptor object.
     let fos = alloc_concurrent_synthetic(ctx, "java/io/FileOutputStream", 4);
+    // Pin across the FileDescriptor alloc below — a moving young GC there
+    // would relocate the fresh stream (native stale-local family).
+    let fos_pin = ctx.pin_native_root(fos);
     let fd_obj = alloc_concurrent_synthetic(ctx, "java/io/FileDescriptor", 4);
+    let fos = ctx.read_native_pin(fos_pin, fos);
     ctx.set_field_by_name(fd_obj, "fd", Value::Int(fd as i32));
     ctx.set_field_by_name(fd_obj, "handle", Value::Long(fd as i64));
     ctx.set_field_by_name(fos, "fd", Value::Object(Some(fd_obj)));
     // Belt-and-braces for legacy callers that read instance slot 0 directly.
     ctx.set_field(fos, 0, Value::Object(Some(fd_obj)));
+    ctx.unpin_native_roots(fos_pin);
     Ok(Some(Value::Object(Some(fos))))
 }
 
@@ -10731,9 +11991,14 @@ fn fsp_new_output_stream(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
 /// null to avoid a doubled `<path>: <path>` message.
 fn p57_no_such_file(ctx: &mut dyn NativeContext, path: &str) -> MethodCallFailed {
     let exc = alloc_concurrent_synthetic(ctx, "java/nio/file/NoSuchFileException", 4);
+    // Pin across the create_string below — a moving young GC there would
+    // relocate the fresh exception (native stale-local family).
+    let exc_pin = ctx.pin_native_root(exc);
     let file_str = ctx.create_string(path);
+    let exc = ctx.read_native_pin(exc_pin, exc);
     // FileSystemException stores the offending path in its `file` field.
     ctx.set_field_by_name(exc, "file", Value::Object(Some(file_str)));
+    ctx.unpin_native_roots(exc_pin);
     MethodCallFailed::ExceptionThrown(exc)
 }
 
@@ -10745,8 +12010,13 @@ fn p57_no_such_file(ctx: &mut dyn NativeContext, path: &str) -> MethodCallFailed
 /// output on Windows) so the thrown type matches HotSpot.
 fn p57_access_denied(ctx: &mut dyn NativeContext, path: &str) -> MethodCallFailed {
     let exc = alloc_concurrent_synthetic(ctx, "java/nio/file/AccessDeniedException", 4);
+    // Pin across the create_string below — a moving young GC there would
+    // relocate the fresh exception (native stale-local family).
+    let exc_pin = ctx.pin_native_root(exc);
     let file_str = ctx.create_string(path);
+    let exc = ctx.read_native_pin(exc_pin, exc);
     ctx.set_field_by_name(exc, "file", Value::Object(Some(file_str)));
+    ctx.unpin_native_roots(exc_pin);
     MethodCallFailed::ExceptionThrown(exc)
 }
 
@@ -11506,9 +12776,14 @@ fn p57_alloc_default_filesystem(ctx: &mut dyn NativeContext) -> ObjectRef {
     // null). The jrt field exists on every FS object so the jrt-aware
     // FileSystem.getPath/getRootDirectories natives can read it unconditionally.
     let fs = alloc_concurrent_synthetic(ctx, "java/nio/file/FileSystem", 3);
+    // Pin across the create_string below — a moving young GC there would
+    // relocate the fresh FileSystem (native stale-local family).
+    let fs_pin = ctx.pin_native_root(fs);
     let sep = if cfg!(windows) { "\\" } else { "/" };
     let s = ctx.create_string(sep);
+    let fs = ctx.read_native_pin(fs_pin, fs);
     ctx.set_field(fs, 0, Value::Object(Some(s)));
+    ctx.unpin_native_roots(fs_pin);
     fs
 }
 
@@ -11517,10 +12792,16 @@ fn p57_alloc_default_filesystem(ctx: &mut dyn NativeContext) -> ObjectRef {
 /// when they see the P57_FS_JRT_FIELD / a `JRTFS`-encoded path.
 fn p57_alloc_jrt_filesystem(ctx: &mut dyn NativeContext, java_home: &str) -> ObjectRef {
     let fs = alloc_concurrent_synthetic(ctx, "java/nio/file/FileSystem", 3);
+    // Pin across the create_strings below — a moving young GC there would
+    // relocate the fresh FileSystem (native stale-local family).
+    let fs_pin = ctx.pin_native_root(fs);
     let sep = ctx.create_string("/");
+    let fs = ctx.read_native_pin(fs_pin, fs);
     ctx.set_field(fs, 0, Value::Object(Some(sep)));
     let jh = ctx.create_string(java_home);
+    let fs = ctx.read_native_pin(fs_pin, fs);
     ctx.set_field(fs, P57_FS_JRT_FIELD, Value::Object(Some(jh)));
+    ctx.unpin_native_roots(fs_pin);
     fs
 }
 
@@ -11539,8 +12820,13 @@ fn p57_alloc_file_store(ctx: &mut dyn NativeContext, path: &str) -> ObjectRef {
     } else {
         "/".to_string()
     };
+    // Pin across the create_string below — a moving young GC there would
+    // relocate the fresh FileStore (native stale-local family).
+    let store_pin = ctx.pin_native_root(store);
     let s = ctx.create_string(&name);
+    let store = ctx.read_native_pin(store_pin, store);
     ctx.set_field(store, 0, Value::Object(Some(s)));
+    ctx.unpin_native_roots(store_pin);
     store
 }
 
@@ -11585,9 +12871,14 @@ fn p57_alloc_enum(
     ordinal: i32,
 ) -> MethodCallResult {
     let obj = alloc_concurrent_synthetic(ctx, class, 2);
+    // Pin across the create_string below — a moving young GC there would
+    // relocate the fresh enum (native stale-local family).
+    let obj_pin = ctx.pin_native_root(obj);
     let n = ctx.create_string(name);
+    let obj = ctx.read_native_pin(obj_pin, obj);
     ctx.set_field(obj, 0, Value::Object(Some(n)));
     ctx.set_field(obj, 1, Value::Int(ordinal));
+    ctx.unpin_native_roots(obj_pin);
     Ok(Some(Value::Object(Some(obj))))
 }
 
@@ -11810,14 +13101,21 @@ pub(crate) fn register_phase57_process(r: &mut NativeMethodRegistry) {
         match command.output() {
             Ok(output) => {
                 let process = alloc_concurrent_synthetic(ctx, "java/lang/Process", 3);
+                // Pin across the create_strings below — a moving young GC there
+                // would relocate the fresh Process (native stale-local family).
+                let process_pin = ctx.pin_native_root(process);
                 let exit_code = output.status.code().unwrap_or(-1);
                 ctx.set_field(process, PROC_FIELD_EXIT, Value::Int(exit_code));
                 let stdout_str = String::from_utf8_lossy(&output.stdout).into_owned();
                 let stderr_str = String::from_utf8_lossy(&output.stderr).into_owned();
                 let stdout_ref = ctx.create_string(&stdout_str);
+                let stdout_pin = ctx.pin_native_root(stdout_ref);
                 let stderr_ref = ctx.create_string(&stderr_str);
+                let process = ctx.read_native_pin(process_pin, process);
+                let stdout_ref = ctx.read_native_pin(stdout_pin, stdout_ref);
                 ctx.set_field(process, PROC_FIELD_STDOUT, Value::Object(Some(stdout_ref)));
                 ctx.set_field(process, PROC_FIELD_STDERR, Value::Object(Some(stderr_ref)));
+                ctx.unpin_native_roots(process_pin);
                 Ok(Some(Value::Object(Some(process))))
             }
             Err(e) => {
@@ -11859,10 +13157,15 @@ pub(crate) fn register_phase57_process(r: &mut NativeMethodRegistry) {
             return Ok(Some(Value::Object(Some(map))));
         }
         // Create a new HashMap with current process environment
+        // Pin across the map alloc below — a moving young GC there would
+        // relocate `this` (native stale-local family).
+        let this_pin = ctx.pin_native_root(this);
         let map = alloc_concurrent_synthetic(ctx, "java/util/HashMap", 4);
+        let this = ctx.read_native_pin(this_pin, this);
         ctx.set_field(map, 1, Value::Int(0)); // size = 0
                                               // Store for future access
         ctx.set_field(this, 2, Value::Object(Some(map)));
+        ctx.unpin_native_roots(this_pin);
         Ok(Some(Value::Object(Some(map))))
     });
 
@@ -11957,7 +13260,12 @@ pub(crate) fn register_phase57_process(r: &mut NativeMethodRegistry) {
             };
             // Create ByteArrayInputStream: buf(0), pos(1), mark(2), count(3)
             let bais = alloc_concurrent_synthetic(ctx, "java/io/ByteArrayInputStream", 4);
+            // Pin across the array alloc below — a moving young GC there would
+            // relocate the fresh stream (native stale-local family).
+            let bais_pin = ctx.pin_native_root(bais);
             let arr = ctx.new_array(cratonvm_types::ArrayElementType::Byte, stdout_bytes.len());
+            let bais = ctx.read_native_pin(bais_pin, bais);
+            ctx.unpin_native_roots(bais_pin);
             for (i, &b) in stdout_bytes.iter().enumerate() {
                 ctx.set_array_element(arr, i, Value::Int(b as i8 as i32));
             }
@@ -11984,7 +13292,12 @@ pub(crate) fn register_phase57_process(r: &mut NativeMethodRegistry) {
                 _ => Vec::new(),
             };
             let bais = alloc_concurrent_synthetic(ctx, "java/io/ByteArrayInputStream", 4);
+            // Pin across the array alloc below — a moving young GC there would
+            // relocate the fresh stream (native stale-local family).
+            let bais_pin = ctx.pin_native_root(bais);
             let arr = ctx.new_array(cratonvm_types::ArrayElementType::Byte, stderr_bytes.len());
+            let bais = ctx.read_native_pin(bais_pin, bais);
+            ctx.unpin_native_roots(bais_pin);
             for (i, &b) in stderr_bytes.iter().enumerate() {
                 ctx.set_array_element(arr, i, Value::Int(b as i8 as i32));
             }
@@ -12061,7 +13374,12 @@ pub(crate) fn register_phase57_process(r: &mut NativeMethodRegistry) {
                 _ => Vec::new(),
             };
             let bais = alloc_concurrent_synthetic(ctx, "java/io/ByteArrayInputStream", 4);
+            // Pin across the array alloc below — a moving young GC there would
+            // relocate the fresh stream (native stale-local family).
+            let bais_pin = ctx.pin_native_root(bais);
             let arr = ctx.new_array(cratonvm_types::ArrayElementType::Byte, stdout_bytes.len());
+            let bais = ctx.read_native_pin(bais_pin, bais);
+            ctx.unpin_native_roots(bais_pin);
             for (i, &b) in stdout_bytes.iter().enumerate() {
                 ctx.set_array_element(arr, i, Value::Int(b as i8 as i32));
             }
@@ -12083,7 +13401,12 @@ pub(crate) fn register_phase57_process(r: &mut NativeMethodRegistry) {
                 _ => Vec::new(),
             };
             let bais = alloc_concurrent_synthetic(ctx, "java/io/ByteArrayInputStream", 4);
+            // Pin across the array alloc below — a moving young GC there would
+            // relocate the fresh stream (native stale-local family).
+            let bais_pin = ctx.pin_native_root(bais);
             let arr = ctx.new_array(cratonvm_types::ArrayElementType::Byte, stderr_bytes.len());
+            let bais = ctx.read_native_pin(bais_pin, bais);
+            ctx.unpin_native_roots(bais_pin);
             for (i, &b) in stderr_bytes.iter().enumerate() {
                 ctx.set_array_element(arr, i, Value::Int(b as i8 as i32));
             }
@@ -12247,8 +13570,13 @@ fn raf_set_fd(ctx: &mut dyn NativeContext, this: ObjectRef, fd: u32) {
                 // `new RandomAccessFile(...).getFD().sync()`. Without this,
                 // sync() is dispatched on a null receiver and the Lucene
                 // commit path fails with InvocationTargetException.
+                // Pin across the alloc below — a moving young GC there would
+                // relocate `this` (native stale-local family).
+                let this_pin = ctx.pin_native_root(this);
                 let new_fd = alloc_concurrent_synthetic(ctx, "java/io/FileDescriptor", 1);
+                let this = ctx.read_native_pin(this_pin, this);
                 ctx.set_field_by_name(this, "fd", Value::Object(Some(new_fd)));
+                ctx.unpin_native_roots(this_pin);
                 new_fd
             }
         };
@@ -13460,8 +14788,13 @@ fn file_canonicalize_path_uncached(path: &str) -> String {
 /// Allocate a new File synthetic with the given path.
 fn file_alloc(ctx: &mut dyn NativeContext, path: &str) -> ObjectRef {
     let obj = alloc_concurrent_synthetic(ctx, "java/io/File", 1);
+    // Pin across the create_string below — a moving young GC there would
+    // relocate the fresh File (native stale-local family).
+    let obj_pin = ctx.pin_native_root(obj);
     let s = ctx.create_string(path);
+    let obj = ctx.read_native_pin(obj_pin, obj);
     ctx.set_field(obj, 0, Value::Object(Some(s)));
+    ctx.unpin_native_roots(obj_pin);
     obj
 }
 
@@ -13485,8 +14818,13 @@ pub fn register_phase57_file(r: &mut NativeMethodRegistry) {
             _ => String::new(),
         };
         let normalised = file_normalise_path(&path);
+        // Pin across the create_string below — a moving young GC there would
+        // relocate `this` (native stale-local family).
+        let this_pin = ctx.pin_native_root(this);
         let s = ctx.create_string(&normalised);
+        let this = ctx.read_native_pin(this_pin, this);
         ctx.set_field(this, 0, Value::Object(Some(s)));
+        ctx.unpin_native_roots(this_pin);
         Ok(None)
     });
 
@@ -13514,8 +14852,13 @@ pub fn register_phase57_file(r: &mut NativeMethodRegistry) {
             // from the parent, join with a separator, then normalise (slash
             // conversion + collapse). Empty child → just the normalised parent.
             let path = file_join_parent_child(&parent, &child);
+            // Pin across the create_string below — a moving young GC there
+            // would relocate `this` (native stale-local family).
+            let this_pin = ctx.pin_native_root(this);
             let s = ctx.create_string(&path);
+            let this = ctx.read_native_pin(this_pin, this);
             ctx.set_field(this, 0, Value::Object(Some(s)));
+            ctx.unpin_native_roots(this_pin);
             Ok(None)
         },
     );
@@ -13536,8 +14879,13 @@ pub fn register_phase57_file(r: &mut NativeMethodRegistry) {
                 _ => String::new(),
             };
             let path = file_join_parent_child(&parent_path, &child);
+            // Pin across the create_string below — a moving young GC there
+            // would relocate `this` (native stale-local family).
+            let this_pin = ctx.pin_native_root(this);
             let s = ctx.create_string(&path);
+            let this = ctx.read_native_pin(this_pin, this);
             ctx.set_field(this, 0, Value::Object(Some(s)));
+            ctx.unpin_native_roots(this_pin);
             Ok(None)
         },
     );
@@ -13559,8 +14907,13 @@ pub fn register_phase57_file(r: &mut NativeMethodRegistry) {
         let uri = match args.get(1) {
             Some(Value::Object(Some(u))) => *u,
             _ => {
+                // Pin across the create_string below — a moving young GC there
+                // would relocate `this` (native stale-local family).
+                let this_pin = ctx.pin_native_root(this);
                 let s = ctx.create_string("");
+                let this = ctx.read_native_pin(this_pin, this);
                 ctx.set_field(this, 0, Value::Object(Some(s)));
+                ctx.unpin_native_roots(this_pin);
                 return Ok(None);
             }
         };
@@ -14008,10 +15361,17 @@ pub fn register_phase57_file(r: &mut NativeMethodRegistry) {
                     .map(|e| e.file_name().to_string_lossy().into_owned())
                     .collect();
                 let arr = ctx.new_array(cratonvm_types::ArrayElementType::Reference, names.len());
+                // Pin across the create_strings below — a moving young GC
+                // there would relocate the fresh array (native stale-local
+                // family).
+                let arr_pin = ctx.pin_native_root(arr);
                 for (i, name) in names.iter().enumerate() {
                     let s = ctx.create_string(name);
+                    let arr = ctx.read_native_pin(arr_pin, arr);
                     ctx.set_array_element(arr, i, Value::Object(Some(s)));
                 }
+                let arr = ctx.read_native_pin(arr_pin, arr);
+                ctx.unpin_native_roots(arr_pin);
                 Ok(Some(Value::Object(Some(arr))))
             }
             Err(_) => Ok(Some(Value::Object(None))),
@@ -14027,10 +15387,16 @@ pub fn register_phase57_file(r: &mut NativeMethodRegistry) {
                     .map(|e| e.path().to_string_lossy().into_owned())
                     .collect();
                 let arr = ctx.new_array(cratonvm_types::ArrayElementType::Reference, paths.len());
+                // Pin across the File allocs below — a moving young GC there
+                // would relocate the fresh array (native stale-local family).
+                let arr_pin = ctx.pin_native_root(arr);
                 for (i, p) in paths.iter().enumerate() {
                     let f = file_alloc(ctx, p);
+                    let arr = ctx.read_native_pin(arr_pin, arr);
                     ctx.set_array_element(arr, i, Value::Object(Some(f)));
                 }
+                let arr = ctx.read_native_pin(arr_pin, arr);
+                ctx.unpin_native_roots(arr_pin);
                 Ok(Some(Value::Object(Some(arr))))
             }
             Err(_) => Ok(Some(Value::Object(None))),
@@ -14052,10 +15418,19 @@ pub fn register_phase57_file(r: &mut NativeMethodRegistry) {
                     .collect(),
                 Err(_) => return Ok(Some(Value::Object(None))),
             };
-            let mut accepted: Vec<ObjectRef> = Vec::new();
+            // Pin across the File allocs / filter callbacks below — a moving
+            // young GC there would relocate them (native stale-local family);
+            // each fresh File is pinned as it materialises.
+            let filter_pin = pinned_object_value(ctx, filter);
+            let mut first_pin = filter_pin.map(|(h, _)| h);
+            let mut accepted: Vec<(usize, ObjectRef)> = Vec::new();
             for entry_path in &entries {
                 let file_obj = file_alloc(ctx, entry_path);
-                let accept = match filter {
+                let file_pin = ctx.pin_native_root(file_obj);
+                if first_pin.is_none() {
+                    first_pin = Some(file_pin);
+                }
+                let accept = match read_pinned_object_value(ctx, filter_pin, filter) {
                     Value::Object(Some(f)) => {
                         match ctx.invoke_virtual(
                             f,
@@ -14070,12 +15445,16 @@ pub fn register_phase57_file(r: &mut NativeMethodRegistry) {
                     _ => true, // null filter accepts everything
                 };
                 if accept {
-                    accepted.push(file_obj);
+                    accepted.push((file_pin, file_obj));
                 }
             }
             let arr = ctx.new_array(cratonvm_types::ArrayElementType::Reference, accepted.len());
-            for (i, f) in accepted.iter().enumerate() {
-                ctx.set_array_element(arr, i, Value::Object(Some(*f)));
+            for (i, (pin, orig)) in accepted.iter().enumerate() {
+                let f = ctx.read_native_pin(*pin, *orig);
+                ctx.set_array_element(arr, i, Value::Object(Some(f)));
+            }
+            if let Some(h) = first_pin {
+                ctx.unpin_native_roots(h);
             }
             Ok(Some(Value::Object(Some(arr))))
         },
@@ -14100,11 +15479,17 @@ pub fn register_phase57_file(r: &mut NativeMethodRegistry) {
                     .collect(),
                 Err(_) => return Ok(Some(Value::Object(None))),
             };
-            let mut accepted: Vec<ObjectRef> = Vec::new();
+            // Pin across the File allocs / filter callbacks below — a moving
+            // young GC there would relocate them (native stale-local family);
+            // each fresh File is pinned as it materialises.
+            let this_pin = ctx.pin_native_root(this);
+            let filter_pin = pinned_object_value(ctx, filter);
+            let mut accepted: Vec<(usize, ObjectRef)> = Vec::new();
             for (full, name) in &entries {
-                let accept = match filter {
+                let accept = match read_pinned_object_value(ctx, filter_pin, filter) {
                     Value::Object(Some(f)) => {
                         let name_str = ctx.create_string(name);
+                        let this = ctx.read_native_pin(this_pin, this);
                         match ctx.invoke_virtual(
                             f,
                             "accept",
@@ -14118,13 +15503,16 @@ pub fn register_phase57_file(r: &mut NativeMethodRegistry) {
                     _ => true,
                 };
                 if accept {
-                    accepted.push(file_alloc(ctx, full));
+                    let f_obj = file_alloc(ctx, full);
+                    accepted.push((ctx.pin_native_root(f_obj), f_obj));
                 }
             }
             let arr = ctx.new_array(cratonvm_types::ArrayElementType::Reference, accepted.len());
-            for (i, f) in accepted.iter().enumerate() {
-                ctx.set_array_element(arr, i, Value::Object(Some(*f)));
+            for (i, (pin, orig)) in accepted.iter().enumerate() {
+                let f = ctx.read_native_pin(*pin, *orig);
+                ctx.set_array_element(arr, i, Value::Object(Some(f)));
             }
+            ctx.unpin_native_roots(this_pin);
             Ok(Some(Value::Object(Some(arr))))
         },
     );
@@ -14144,11 +15532,16 @@ pub fn register_phase57_file(r: &mut NativeMethodRegistry) {
                     .collect(),
                 Err(_) => return Ok(Some(Value::Object(None))),
             };
+            // Pin across the filter callbacks below — a moving young GC there
+            // would relocate `this`/`filter` (native stale-local family).
+            let this_pin = ctx.pin_native_root(this);
+            let filter_pin = pinned_object_value(ctx, filter);
             let mut accepted: Vec<String> = Vec::new();
             for name in &entries {
-                let accept = match filter {
+                let accept = match read_pinned_object_value(ctx, filter_pin, filter) {
                     Value::Object(Some(f)) => {
                         let name_str = ctx.create_string(name);
+                        let this = ctx.read_native_pin(this_pin, this);
                         match ctx.invoke_virtual(
                             f,
                             "accept",
@@ -14165,11 +15558,16 @@ pub fn register_phase57_file(r: &mut NativeMethodRegistry) {
                     accepted.push(name.clone());
                 }
             }
+            ctx.unpin_native_roots(this_pin);
             let arr = ctx.new_array(cratonvm_types::ArrayElementType::Reference, accepted.len());
+            let arr_pin = ctx.pin_native_root(arr);
             for (i, name) in accepted.iter().enumerate() {
                 let s = ctx.create_string(name);
+                let arr = ctx.read_native_pin(arr_pin, arr);
                 ctx.set_array_element(arr, i, Value::Object(Some(s)));
             }
+            let arr = ctx.read_native_pin(arr_pin, arr);
+            ctx.unpin_native_roots(arr_pin);
             Ok(Some(Value::Object(Some(arr))))
         },
     );
@@ -14301,8 +15699,15 @@ pub fn register_phase57_file(r: &mut NativeMethodRegistry) {
         // Allocate a real URI and populate named + positional fields so both
         // `URI` natives and any real-JDK bytecode see consistent state.
         let uri = alloc_concurrent_synthetic(ctx, "java/net/URI", 7);
+        // Pin across the parse/store helpers below (they create strings) — a
+        // moving young GC there would relocate the fresh URI (native
+        // stale-local family).
+        let uri_pin = ctx.pin_native_root(uri);
         crate::url_parse(ctx, uri, &full);
+        let uri = ctx.read_native_pin(uri_pin, uri);
         crate::uri_store_named(ctx, uri, &full);
+        let uri = ctx.read_native_pin(uri_pin, uri);
+        ctx.unpin_native_roots(uri_pin);
         Ok(Some(Value::Object(Some(uri))))
     });
 
@@ -14325,10 +15730,16 @@ pub fn register_phase57_file(r: &mut NativeMethodRegistry) {
         #[cfg(not(windows))]
         let roots: Vec<String> = vec!["/".to_string()];
         let arr = ctx.new_array(cratonvm_types::ArrayElementType::Reference, roots.len());
+        // Pin across the File allocs below — a moving young GC there would
+        // relocate the fresh array (native stale-local family).
+        let arr_pin = ctx.pin_native_root(arr);
         for (i, r) in roots.iter().enumerate() {
             let f = file_alloc(ctx, r);
+            let arr = ctx.read_native_pin(arr_pin, arr);
             ctx.set_array_element(arr, i, Value::Object(Some(f)));
         }
+        let arr = ctx.read_native_pin(arr_pin, arr);
+        ctx.unpin_native_roots(arr_pin);
         Ok(Some(Value::Object(Some(arr))))
     });
     r.register(
@@ -14714,6 +16125,10 @@ pub(crate) fn register_phase57_file_channel(r: &mut NativeMethodRegistry) {
             // Bounded streaming buffer (8 MiB) — matches the JDK's chunked fallback
             // when a true zero-copy sendfile is unavailable.
             const FC_XFER_CHUNK: i64 = 8 * 1024 * 1024;
+            // Pin across the per-chunk allocs / write callbacks below — a
+            // moving young GC there would relocate `target` (native
+            // stale-local family).
+            let target_pin = ctx.pin_native_root(target);
             let mut total_written: i64 = 0;
             let mut cur_pos = position;
             while to_transfer > 0 {
@@ -14731,12 +16146,15 @@ pub(crate) fn register_phase57_file_channel(r: &mut NativeMethodRegistry) {
                 for i in 0..n {
                     ctx.set_array_element(byte_arr, i, Value::Int(buf[i] as i8 as i32));
                 }
+                let byte_arr_pin = ctx.pin_native_root(byte_arr);
                 let bb = alloc_concurrent_synthetic(ctx, "java/nio/ByteBuffer", 3);
+                let byte_arr = ctx.read_native_pin(byte_arr_pin, byte_arr);
                 ctx.set_field(bb, 0, Value::Object(Some(byte_arr)));
                 ctx.set_field(bb, 1, Value::Int(0));
                 ctx.set_field(bb, 2, Value::Int(n as i32));
+                let target_cur = ctx.read_native_pin(target_pin, target);
                 let written = match ctx.invoke_virtual(
-                    target,
+                    target_cur,
                     "write",
                     "(Ljava/nio/ByteBuffer;)I",
                     &[Value::Object(Some(bb))],
@@ -14744,6 +16162,7 @@ pub(crate) fn register_phase57_file_channel(r: &mut NativeMethodRegistry) {
                     Ok(Some(Value::Int(w))) if w >= 0 => w as i64,
                     _ => n as i64,
                 };
+                ctx.unpin_native_roots(byte_arr_pin);
                 total_written += written;
                 cur_pos += n as i64;
                 to_transfer -= n as i64;
@@ -14753,6 +16172,7 @@ pub(crate) fn register_phase57_file_channel(r: &mut NativeMethodRegistry) {
                     break;
                 }
             }
+            ctx.unpin_native_roots(target_pin);
             Ok(Some(Value::Long(total_written)))
         },
     );
@@ -14788,6 +16208,10 @@ pub(crate) fn register_phase57_file_channel(r: &mut NativeMethodRegistry) {
             // sane ceiling and loop until `count` is satisfied or the source is
             // exhausted, so the allocation is bounded and the limit never truncates.
             const FC_XFER_CHUNK: i64 = 8 * 1024 * 1024;
+            // Pin across the per-chunk allocs / read callbacks below — a
+            // moving young GC there would relocate `src` (native stale-local
+            // family).
+            let src_pin = ctx.pin_native_root(src);
             let mut remaining = count;
             let mut cur_pos = position.max(0);
             let mut total_written: i64 = 0;
@@ -14795,13 +16219,17 @@ pub(crate) fn register_phase57_file_channel(r: &mut NativeMethodRegistry) {
                 let chunk = remaining.min(FC_XFER_CHUNK) as usize;
                 // Allocate a bounded ByteBuffer and call src.read(ByteBuffer)
                 let byte_arr = ctx.new_array(cratonvm_types::ArrayElementType::Byte, chunk);
+                let byte_arr_pin = ctx.pin_native_root(byte_arr);
                 let bb = alloc_concurrent_synthetic(ctx, "java/nio/ByteBuffer", 3);
+                let bb_pin = ctx.pin_native_root(bb);
+                let byte_arr = ctx.read_native_pin(byte_arr_pin, byte_arr);
                 ctx.set_field(bb, 0, Value::Object(Some(byte_arr)));
                 ctx.set_field(bb, 1, Value::Int(0));
                 // `chunk` <= FC_XFER_CHUNK so this Int cast never truncates.
                 ctx.set_field(bb, 2, Value::Int(chunk as i32));
+                let src_cur = ctx.read_native_pin(src_pin, src);
                 let read_n = match ctx.invoke_virtual(
-                    src,
+                    src_cur,
                     "read",
                     "(Ljava/nio/ByteBuffer;)I",
                     &[Value::Object(Some(bb))],
@@ -14809,6 +16237,8 @@ pub(crate) fn register_phase57_file_channel(r: &mut NativeMethodRegistry) {
                     Ok(Some(Value::Int(n))) if n > 0 => n as usize,
                     _ => 0,
                 };
+                let bb = ctx.read_native_pin(bb_pin, bb);
+                ctx.unpin_native_roots(byte_arr_pin);
                 if read_n == 0 {
                     break;
                 }
@@ -14831,6 +16261,7 @@ pub(crate) fn register_phase57_file_channel(r: &mut NativeMethodRegistry) {
                     break;
                 }
             }
+            ctx.unpin_native_roots(src_pin);
             Ok(Some(Value::Long(total_written)))
         },
     );
@@ -14896,11 +16327,16 @@ pub(crate) fn register_phase57_text(r: &mut NativeMethodRegistry) {
     // --- DecimalFormat ---
     r.register(df, "<init>", "()V", |ctx, args| {
         let this = obj_arg(args, 0)?;
+        // Pin across the create_string below — a moving young GC there would
+        // relocate `this` (native stale-local family).
+        let this_pin = ctx.pin_native_root(this);
         let pat = ctx.create_string("#,##0.###");
+        let this = ctx.read_native_pin(this_pin, this);
         ctx.set_field(this, DF_FIELD_PATTERN, Value::Object(Some(pat)));
         ctx.set_field(this, DF_FIELD_GROUPING, Value::Int(1));
         ctx.set_field(this, DF_FIELD_MAX_FRAC, Value::Int(3));
         ctx.set_field(this, DF_FIELD_MIN_FRAC, Value::Int(0));
+        ctx.unpin_native_roots(this_pin);
         Ok(None)
     });
 
@@ -15075,10 +16511,15 @@ pub(crate) fn register_phase57_text(r: &mut NativeMethodRegistry) {
         "()Ljava/text/NumberFormat;",
         |ctx, _args| {
             let obj = alloc_concurrent_synthetic(ctx, "java/text/DecimalFormat", 3);
+            // Pin across the create_string below — a moving young GC there
+            // would relocate the fresh format (native stale-local family).
+            let obj_pin = ctx.pin_native_root(obj);
             let pat = ctx.create_string("#,##0.###");
+            let obj = ctx.read_native_pin(obj_pin, obj);
             ctx.set_field(obj, DF_FIELD_PATTERN, Value::Object(Some(pat)));
             ctx.set_field(obj, DF_FIELD_GROUPING, Value::Int(1));
             ctx.set_field(obj, DF_FIELD_MAX_FRAC, Value::Int(3));
+            ctx.unpin_native_roots(obj_pin);
             Ok(Some(Value::Object(Some(obj))))
         },
     );
@@ -15089,10 +16530,15 @@ pub(crate) fn register_phase57_text(r: &mut NativeMethodRegistry) {
         "()Ljava/text/NumberFormat;",
         |ctx, _args| {
             let obj = alloc_concurrent_synthetic(ctx, "java/text/DecimalFormat", 3);
+            // Pin across the create_string below — a moving young GC there
+            // would relocate the fresh format (native stale-local family).
+            let obj_pin = ctx.pin_native_root(obj);
             let pat = ctx.create_string("#,##0");
+            let obj = ctx.read_native_pin(obj_pin, obj);
             ctx.set_field(obj, DF_FIELD_PATTERN, Value::Object(Some(pat)));
             ctx.set_field(obj, DF_FIELD_GROUPING, Value::Int(1));
             ctx.set_field(obj, DF_FIELD_MAX_FRAC, Value::Int(0));
+            ctx.unpin_native_roots(obj_pin);
             Ok(Some(Value::Object(Some(obj))))
         },
     );
@@ -15103,10 +16549,15 @@ pub(crate) fn register_phase57_text(r: &mut NativeMethodRegistry) {
         "()Ljava/text/NumberFormat;",
         |ctx, _args| {
             let obj = alloc_concurrent_synthetic(ctx, "java/text/DecimalFormat", 3);
+            // Pin across the create_string below — a moving young GC there
+            // would relocate the fresh format (native stale-local family).
+            let obj_pin = ctx.pin_native_root(obj);
             let pat = ctx.create_string("$#,##0.00");
+            let obj = ctx.read_native_pin(obj_pin, obj);
             ctx.set_field(obj, DF_FIELD_PATTERN, Value::Object(Some(pat)));
             ctx.set_field(obj, DF_FIELD_GROUPING, Value::Int(1));
             ctx.set_field(obj, DF_FIELD_MAX_FRAC, Value::Int(2));
+            ctx.unpin_native_roots(obj_pin);
             Ok(Some(Value::Object(Some(obj))))
         },
     );
@@ -15117,10 +16568,15 @@ pub(crate) fn register_phase57_text(r: &mut NativeMethodRegistry) {
         "()Ljava/text/NumberFormat;",
         |ctx, _args| {
             let obj = alloc_concurrent_synthetic(ctx, "java/text/DecimalFormat", 3);
+            // Pin across the create_string below — a moving young GC there
+            // would relocate the fresh format (native stale-local family).
+            let obj_pin = ctx.pin_native_root(obj);
             let pat = ctx.create_string("#,##0%");
+            let obj = ctx.read_native_pin(obj_pin, obj);
             ctx.set_field(obj, DF_FIELD_PATTERN, Value::Object(Some(pat)));
             ctx.set_field(obj, DF_FIELD_GROUPING, Value::Int(1));
             ctx.set_field(obj, DF_FIELD_MAX_FRAC, Value::Int(0));
+            ctx.unpin_native_roots(obj_pin);
             Ok(Some(Value::Object(Some(obj))))
         },
     );
@@ -15487,9 +16943,19 @@ pub(crate) fn register_p58_completable_future(r: &mut NativeMethodRegistry) {
 }
 
 pub(crate) fn p58_new_cf(ctx: &mut dyn NativeContext, result: Value, done: bool) -> ObjectRef {
+    // Pin across the CF alloc below — a moving young GC there would relocate
+    // the result value (native stale-local family).
+    let result_pin = pinned_object_value(ctx, result);
     let cf = alloc_concurrent_synthetic(ctx, "java/util/concurrent/CompletableFuture", 2);
-    ctx.set_field(cf, FUT_FIELD_RESULT, result);
+    ctx.set_field(
+        cf,
+        FUT_FIELD_RESULT,
+        read_pinned_object_value(ctx, result_pin, result),
+    );
     ctx.set_field(cf, FUT_FIELD_DONE, Value::Int(if done { 1 } else { 0 }));
+    if let Some((h, _)) = result_pin {
+        ctx.unpin_native_roots(h);
+    }
     cf
 }
 
@@ -15638,6 +17104,9 @@ fn p58_cf_when_complete(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCa
         );
     }
     let result = ctx.get_field(this, FUT_FIELD_RESULT);
+    // Pin across the accept() below — a moving young GC there would relocate
+    // the result value (native stale-local family).
+    let result_pin = pinned_object_value(ctx, result);
     // BiConsumer.accept(result, null_exception)
     let _ = ctx.invoke_virtual(
         action,
@@ -15645,6 +17114,10 @@ fn p58_cf_when_complete(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCa
         "(Ljava/lang/Object;Ljava/lang/Object;)V",
         &[result, Value::Object(None)],
     );
+    let result = read_pinned_object_value(ctx, result_pin, result);
+    if let Some((h, _)) = result_pin {
+        ctx.unpin_native_roots(h);
+    }
     // Return new CF with same result
     let cf = p58_new_cf(ctx, result, true);
     Ok(Some(Value::Object(Some(cf))))
@@ -15863,14 +17336,20 @@ pub(crate) fn register_p58_nio_channels(r: &mut NativeMethodRegistry) {
         |ctx, args| {
             let addr_obj = args.first().copied().unwrap_or(Value::Object(None));
             let addr_str = p98_extract_socket_addr(ctx, addr_obj);
-            let sc_obj = alloc_concurrent_synthetic(ctx, "java/nio/channels/SocketChannel", 4);
+            let mut sc_obj = alloc_concurrent_synthetic(ctx, "java/nio/channels/SocketChannel", 4);
             match ctx.fd_table().open_tcp_connect(&addr_str) {
                 Ok(fd) => {
                     ctx.set_field(sc_obj, 0, Value::Int(1));
                     ctx.set_field(sc_obj, 1, Value::Int(1));
+                    // Pin across the create_string below — a moving young GC
+                    // there would relocate the fresh channel (native
+                    // stale-local family).
+                    let sc_pin = ctx.pin_native_root(sc_obj);
                     let s = ctx.create_string(&addr_str);
+                    sc_obj = ctx.read_native_pin(sc_pin, sc_obj);
                     ctx.set_field(sc_obj, 2, Value::Object(Some(s)));
                     ctx.set_field(sc_obj, 3, Value::Int(fd as i32));
+                    ctx.unpin_native_roots(sc_pin);
                 }
                 Err(_) => {
                     ctx.set_field(sc_obj, 0, Value::Int(0));
@@ -15895,9 +17374,14 @@ pub(crate) fn register_p58_nio_channels(r: &mut NativeMethodRegistry) {
         match ctx.fd_table().open_tcp_connect(&addr_str) {
             Ok(fd) => {
                 ctx.set_field(this, 0, Value::Int(1));
+                // Pin across the create_string below — a moving young GC there
+                // would relocate `this` (native stale-local family).
+                let this_pin = ctx.pin_native_root(this);
                 let s = ctx.create_string(&addr_str);
+                let this = ctx.read_native_pin(this_pin, this);
                 ctx.set_field(this, 2, Value::Object(Some(s)));
                 ctx.set_field(this, 3, Value::Int(fd as i32));
+                ctx.unpin_native_roots(this_pin);
                 Ok(Some(Value::Int(1)))
             }
             Err(_) => Ok(Some(Value::Int(0))),
@@ -16132,7 +17616,12 @@ pub(crate) fn register_p58_nio_channels(r: &mut NativeMethodRegistry) {
             return Ok(Some(Value::Object(Some(cached))));
         }
         // 5-field ServerSocket: SS_PORT=0, SS_BACKLOG=1, SS_CLOSED=2, SS_LISTENER_ID=3, channel_ref=4
+        // Pin across the ServerSocket alloc below — a moving young GC there
+        // would relocate `this` (native stale-local family).
+        let this_pin = ctx.pin_native_root(this);
         let ss = alloc_concurrent_synthetic(ctx, "java/net/ServerSocket", 5);
+        let this = ctx.read_native_pin(this_pin, this);
+        ctx.unpin_native_roots(this_pin);
         ctx.set_field(ss, 0, Value::Int(0));
         ctx.set_field(ss, 1, Value::Int(50));
         ctx.set_field(ss, 2, Value::Int(0));
@@ -16174,9 +17663,14 @@ pub(crate) fn register_p58_nio_channels(r: &mut NativeMethodRegistry) {
             };
             let port = port_s.parse::<i32>().unwrap_or(0);
             let isa = alloc_concurrent_synthetic(ctx, "java/net/InetSocketAddress", 2);
+            // Pin across the create_string below — a moving young GC there
+            // would relocate the fresh address (native stale-local family).
+            let isa_pin = ctx.pin_native_root(isa);
             let host_str = ctx.create_string(host);
+            let isa = ctx.read_native_pin(isa_pin, isa);
             ctx.set_field(isa, 0, Value::Object(Some(host_str)));
             ctx.set_field(isa, 1, Value::Int(port));
+            ctx.unpin_native_roots(isa_pin);
             Ok(Some(Value::Object(Some(isa))))
         },
     );
@@ -16193,11 +17687,17 @@ pub(crate) fn register_p58_nio_channels(r: &mut NativeMethodRegistry) {
             match ctx.fd_table().tcp_accept(fd as u32) {
                 Ok((stream_fd, addr)) => {
                     let sc = alloc_concurrent_synthetic(ctx, "java/nio/channels/SocketChannel", 4);
+                    // Pin across the create_string below — a moving young GC
+                    // there would relocate the fresh channel (native
+                    // stale-local family).
+                    let sc_pin = ctx.pin_native_root(sc);
                     ctx.set_field(sc, 0, Value::Int(1));
                     ctx.set_field(sc, 1, Value::Int(1));
                     let s = ctx.create_string(&addr);
+                    let sc = ctx.read_native_pin(sc_pin, sc);
                     ctx.set_field(sc, 2, Value::Object(Some(s)));
                     ctx.set_field(sc, 3, Value::Int(stream_fd as i32));
+                    ctx.unpin_native_roots(sc_pin);
                     Ok(Some(Value::Object(Some(sc))))
                 }
                 Err(_) => Ok(Some(Value::Object(None))),
@@ -16244,11 +17744,16 @@ pub(crate) fn register_p58_nio_channels(r: &mut NativeMethodRegistry) {
                 eprintln!("[SEL/p98] Selector.open()");
             }
             let sel = alloc_concurrent_synthetic(ctx, "java/nio/channels/Selector", 4);
+            // Pin across the keys-array alloc below — a moving young GC there
+            // would relocate the fresh Selector (native stale-local family).
+            let sel_pin = ctx.pin_native_root(sel);
             ctx.set_field(sel, 0, Value::Int(1));
             let keys = ctx.new_array(cratonvm_types::ArrayElementType::Reference, 64);
+            let sel = ctx.read_native_pin(sel_pin, sel);
             ctx.set_field(sel, 1, Value::Object(Some(keys)));
             ctx.set_field(sel, 2, Value::Int(0));
             ctx.set_field(sel, 3, Value::Int(0)); // wakeup_flag
+            ctx.unpin_native_roots(sel_pin);
             Ok(Some(Value::Object(Some(sel))))
         },
     );
@@ -16286,20 +17791,33 @@ pub(crate) fn register_p58_nio_channels(r: &mut NativeMethodRegistry) {
                 }
             }
         }
+        // Pin across the set/array allocs below — a moving young GC there
+        // would relocate the collected keys (native stale-local family).
+        let ready_pins: Vec<usize> = ready.iter().map(|k| ctx.pin_native_root(*k)).collect();
         let set = alloc_concurrent_synthetic(ctx, "java/util/HashSet", 2);
+        let set_pin = ctx.pin_native_root(set);
         let arr = ctx.new_array(cratonvm_types::ArrayElementType::Reference, ready.len());
+        let set = ctx.read_native_pin(set_pin, set);
         for (i, k) in ready.iter().enumerate() {
-            ctx.set_array_element(arr, i, Value::Object(Some(*k)));
+            let k = ctx.read_native_pin(ready_pins[i], *k);
+            ctx.set_array_element(arr, i, Value::Object(Some(k)));
         }
         ctx.set_field(set, 0, Value::Object(Some(arr)));
         ctx.set_field(set, 1, Value::Int(ready.len() as i32));
+        ctx.unpin_native_roots(ready_pins.first().copied().unwrap_or(set_pin));
         Ok(Some(Value::Object(Some(set))))
     });
     r.register(sel, "keys", "()Ljava/util/Set;", |ctx, args| {
         let this = obj_arg(args, 0)?;
         let kc = ctx.get_field(this, 2).as_int().unwrap_or(0) as usize;
+        // Pin across the set/array allocs below — a moving young GC there
+        // would relocate `this` (native stale-local family).
+        let this_pin = ctx.pin_native_root(this);
         let set = alloc_concurrent_synthetic(ctx, "java/util/HashSet", 2);
+        let set_pin = ctx.pin_native_root(set);
         let arr = ctx.new_array(cratonvm_types::ArrayElementType::Reference, kc);
+        let this = ctx.read_native_pin(this_pin, this);
+        let set = ctx.read_native_pin(set_pin, set);
         if let Value::Object(Some(ka)) = ctx.get_field(this, 1) {
             for i in 0..kc {
                 ctx.set_array_element(arr, i, ctx.get_array_element(ka, i));
@@ -16307,6 +17825,7 @@ pub(crate) fn register_p58_nio_channels(r: &mut NativeMethodRegistry) {
         }
         ctx.set_field(set, 0, Value::Object(Some(arr)));
         ctx.set_field(set, 1, Value::Int(kc as i32));
+        ctx.unpin_native_roots(this_pin);
         Ok(Some(Value::Object(Some(set))))
     });
     r.register(
@@ -16385,7 +17904,14 @@ pub(crate) fn register_p58_nio_channels(r: &mut NativeMethodRegistry) {
             let channel = obj_arg(args, 0)?;
             let selector = obj_arg(args, 1)?;
             let ops = args.get(2).and_then(|v| v.as_int()).unwrap_or(0);
+            // Pin across the key alloc below — a moving young GC there would
+            // relocate them (native stale-local family).
+            let channel_pin = ctx.pin_native_root(channel);
+            let selector_pin = ctx.pin_native_root(selector);
             let key = alloc_concurrent_synthetic(ctx, "java/nio/channels/SelectionKey", 4);
+            let channel = ctx.read_native_pin(channel_pin, channel);
+            let selector = ctx.read_native_pin(selector_pin, selector);
+            ctx.unpin_native_roots(channel_pin);
             ctx.set_field(key, 0, Value::Object(Some(channel)));
             ctx.set_field(key, 1, Value::Object(Some(selector)));
             ctx.set_field(key, 2, Value::Int(ops));
@@ -16637,17 +18163,23 @@ fn inflate_bounded<R: std::io::Read>(
 fn drain_input_stream_bulk(ctx: &mut dyn NativeContext, is_ref: ObjectRef) -> Vec<u8> {
     const CHUNK: usize = 64 * 1024;
     let mut out: Vec<u8> = Vec::new();
+    // Pin across the read callbacks below — a moving young GC there would
+    // relocate the stream/buffer (native stale-local family).
+    let is_pin = ctx.pin_native_root(is_ref);
     let buf = ctx.new_array(cratonvm_types::ArrayElementType::Byte, CHUNK);
+    let buf_pin = ctx.pin_native_root(buf);
     // Heap-allocated scratch (not a 64 KiB stack array) to keep native-call
     // frames shallow; reused across every chunk.
     let mut scratch = vec![0u8; CHUNK];
     loop {
+        let is_cur = ctx.read_native_pin(is_pin, is_ref);
+        let buf_cur = ctx.read_native_pin(buf_pin, buf);
         let res = ctx.invoke_virtual(
-            is_ref,
+            is_cur,
             "read",
             "([BII)I",
             &[
-                Value::Object(Some(buf)),
+                Value::Object(Some(buf_cur)),
                 Value::Int(0),
                 Value::Int(CHUNK as i32),
             ],
@@ -16655,7 +18187,8 @@ fn drain_input_stream_bulk(ctx: &mut dyn NativeContext, is_ref: ObjectRef) -> Ve
         match res {
             Ok(Some(Value::Int(n))) if n > 0 => {
                 let n = n as usize;
-                let copied = ctx.read_byte_array_into(buf, 0, &mut scratch[..n]);
+                let buf_cur = ctx.read_native_pin(buf_pin, buf);
+                let copied = ctx.read_byte_array_into(buf_cur, 0, &mut scratch[..n]);
                 out.extend_from_slice(&scratch[..copied]);
                 if copied < n {
                     // Defensive: array shorter than reported — stop to avoid a
@@ -16667,22 +18200,29 @@ fn drain_input_stream_bulk(ctx: &mut dyn NativeContext, is_ref: ObjectRef) -> Ve
             // n == 0 (shouldn't happen for len>0) or bulk read unsupported:
             // finish the drain via the per-byte path so nothing is dropped.
             _ => {
-                drain_input_stream_per_byte(ctx, is_ref, &mut out);
+                let is_cur = ctx.read_native_pin(is_pin, is_ref);
+                drain_input_stream_per_byte(ctx, is_cur, &mut out);
                 break;
             }
         }
     }
+    ctx.unpin_native_roots(is_pin);
     out
 }
 
 /// Per-byte drain fallback (the original `read()I` loop). Appends to `out`.
 fn drain_input_stream_per_byte(ctx: &mut dyn NativeContext, is_ref: ObjectRef, out: &mut Vec<u8>) {
+    // Pin across the read callbacks below — a moving young GC there would
+    // relocate the stream (native stale-local family).
+    let is_pin = ctx.pin_native_root(is_ref);
     loop {
-        match ctx.invoke_virtual(is_ref, "read", "()I", &[]) {
+        let is_cur = ctx.read_native_pin(is_pin, is_ref);
+        match ctx.invoke_virtual(is_cur, "read", "()I", &[]) {
             Ok(Some(Value::Int(b))) if b >= 0 => out.push(b as u8),
             _ => break,
         }
     }
+    ctx.unpin_native_roots(is_pin);
 }
 
 pub(crate) fn register_p58_gzip_streams(r: &mut NativeMethodRegistry) {
@@ -16754,8 +18294,14 @@ pub(crate) fn register_p58_gzip_streams(r: &mut NativeMethodRegistry) {
             let cursor = std::io::Cursor::new(&all_bytes);
             if let Ok(mut archive) = zip::ZipArchive::new(cursor) {
                 let count = archive.len();
+                // Pin across the per-entry string/array allocs below — a
+                // moving young GC there would relocate `this` and the fresh
+                // arrays (native stale-local family).
+                let this_pin = ctx.pin_native_root(this);
                 let names_arr = ctx.new_array(cratonvm_types::ArrayElementType::Reference, count);
+                let names_pin = ctx.pin_native_root(names_arr);
                 let data_arr = ctx.new_array(cratonvm_types::ArrayElementType::Reference, count);
+                let data_pin = ctx.pin_native_root(data_arr);
                 // Bound the CUMULATIVE inflated size across all entries so a zip
                 // bomb (many/large entries) throws instead of exhausting the heap
                 // (finding 3). `remaining` tracks the budget left for this archive.
@@ -16764,10 +18310,12 @@ pub(crate) fn register_p58_gzip_streams(r: &mut NativeMethodRegistry) {
                 for i in 0..count {
                     if let Ok(entry) = archive.by_index(i) {
                         let name = ctx.create_string(entry.name());
+                        let names_arr = ctx.read_native_pin(names_pin, names_arr);
                         ctx.set_array_element(names_arr, i, Value::Object(Some(name)));
                         let entry_bytes = match inflate_bounded(entry, remaining) {
                             Ok(b) => b,
                             Err(_) => {
+                                ctx.unpin_native_roots(this_pin);
                                 // Cap exceeded mid-archive → fail loud.
                                 return Err(RuntimeError::IOException {
                                     message: format!(
@@ -16788,11 +18336,16 @@ pub(crate) fn register_p58_gzip_streams(r: &mut NativeMethodRegistry) {
                         // PERF: bulk memcpy the inflated entry instead of a
                         // per-element set_array_element loop.
                         ctx.write_byte_array_from(byte_arr, 0, &entry_bytes);
+                        let data_arr = ctx.read_native_pin(data_pin, data_arr);
                         ctx.set_array_element(data_arr, i, Value::Object(Some(byte_arr)));
                     }
                 }
+                let this = ctx.read_native_pin(this_pin, this);
+                let names_arr = ctx.read_native_pin(names_pin, names_arr);
+                let data_arr = ctx.read_native_pin(data_pin, data_arr);
                 ctx.set_field(this, 1, Value::Object(Some(names_arr)));
                 ctx.set_field(this, 2, Value::Object(Some(data_arr)));
+                ctx.unpin_native_roots(this_pin);
             } else {
                 ctx.set_field(this, 1, Value::Object(None));
                 ctx.set_field(this, 2, Value::Object(None));
@@ -16824,7 +18377,18 @@ pub(crate) fn register_p58_gzip_streams(r: &mut NativeMethodRegistry) {
             }
             // Create ZipEntry with name
             let name_val = ctx.get_array_element(names_arr, idx as usize);
+            // Pin across the ZipEntry alloc below — a moving young GC there
+            // would relocate them (native stale-local family).
+            let name_pin = pinned_object_value(ctx, name_val);
+            let this_pin = ctx.pin_native_root(this);
             let ze = alloc_concurrent_synthetic(ctx, "java/util/zip/ZipEntry", 2);
+            let name_val = read_pinned_object_value(ctx, name_pin, name_val);
+            let this = ctx.read_native_pin(this_pin, this);
+            if let Some((h, _)) = name_pin {
+                ctx.unpin_native_roots(h);
+            } else {
+                ctx.unpin_native_roots(this_pin);
+            }
             ctx.set_field(ze, 0, name_val); // name
                                             // Set size from data array
             if let Value::Object(Some(data_arr)) = ctx.get_field(this, 2) {
@@ -17558,9 +19122,14 @@ pub(crate) fn register_p58_pushback(r: &mut NativeMethodRegistry) {
 fn p58_pushback_in_init(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = obj_arg(args, 0)?;
     ctx.set_field(this, 0, args.get(1).copied().unwrap_or(Value::Object(None)));
+    // Pin across the buffer alloc below — a moving young GC there would
+    // relocate `this` (native stale-local family).
+    let this_pin = ctx.pin_native_root(this);
     let buf = ctx.new_array(cratonvm_types::ArrayElementType::Byte, 1);
+    let this = ctx.read_native_pin(this_pin, this);
     ctx.set_field(this, 1, Value::Object(Some(buf)));
     ctx.set_field(this, 2, Value::Int(1)); // pos = buf.length means buffer empty
+    ctx.unpin_native_roots(this_pin);
     Ok(None)
 }
 
@@ -17571,9 +19140,14 @@ fn p58_pushback_in_init_size(ctx: &mut dyn NativeContext, args: &[Value]) -> Met
         Some(Value::Int(v)) => *v as usize,
         _ => 1,
     };
+    // Pin across the buffer alloc below — a moving young GC there would
+    // relocate `this` (native stale-local family).
+    let this_pin = ctx.pin_native_root(this);
     let buf = ctx.new_array(cratonvm_types::ArrayElementType::Byte, size);
+    let this = ctx.read_native_pin(this_pin, this);
     ctx.set_field(this, 1, Value::Object(Some(buf)));
     ctx.set_field(this, 2, Value::Int(size as i32)); // pos = size means buffer empty
+    ctx.unpin_native_roots(this_pin);
     Ok(None)
 }
 
@@ -17643,9 +19217,14 @@ fn p58_pushback_in_available(ctx: &mut dyn NativeContext, args: &[Value]) -> Met
 fn p58_pushback_reader_init(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = obj_arg(args, 0)?;
     ctx.set_field(this, 0, args.get(1).copied().unwrap_or(Value::Object(None)));
+    // Pin across the buffer alloc below — a moving young GC there would
+    // relocate `this` (native stale-local family).
+    let this_pin = ctx.pin_native_root(this);
     let buf = ctx.new_array(cratonvm_types::ArrayElementType::Reference, 1);
+    let this = ctx.read_native_pin(this_pin, this);
     ctx.set_field(this, 1, Value::Object(Some(buf)));
     ctx.set_field(this, 2, Value::Int(1));
+    ctx.unpin_native_roots(this_pin);
     Ok(None)
 }
 
@@ -17656,9 +19235,14 @@ fn p58_pushback_reader_init_size(ctx: &mut dyn NativeContext, args: &[Value]) ->
         Some(Value::Int(v)) => *v as usize,
         _ => 1,
     };
+    // Pin across the buffer alloc below — a moving young GC there would
+    // relocate `this` (native stale-local family).
+    let this_pin = ctx.pin_native_root(this);
     let buf = ctx.new_array(cratonvm_types::ArrayElementType::Reference, size);
+    let this = ctx.read_native_pin(this_pin, this);
     ctx.set_field(this, 1, Value::Object(Some(buf)));
     ctx.set_field(this, 2, Value::Int(size as i32));
+    ctx.unpin_native_roots(this_pin);
     Ok(None)
 }
 
@@ -18979,7 +20563,13 @@ pub fn register_p59_jar(r: &mut NativeMethodRegistry) {
                     let method = rec.method;
                     let crc = rec.crc;
                     let ze = alloc_concurrent_synthetic(ctx, "java/util/jar/JarEntry", 4);
+                    // Pin across the create_string below — a moving young GC
+                    // there would relocate the fresh entry (native stale-local
+                    // family).
+                    let ze_pin = ctx.pin_native_root(ze);
                     let name_s = ctx.create_string(&entry_name);
+                    let ze = ctx.read_native_pin(ze_pin, ze);
+                    ctx.unpin_native_roots(ze_pin);
                     ctx.set_field(ze, 0, Value::Object(Some(name_s)));
                     ctx.set_field(ze, 1, Value::Long(size));
                     ctx.set_field(ze, 2, Value::Long(csize));
@@ -19034,7 +20624,12 @@ pub fn register_p59_jar(r: &mut NativeMethodRegistry) {
             };
             // ByteArrayInputStream: buf(0), pos(1), mark(2), count(3)
             let bais = alloc_concurrent_synthetic(ctx, "java/io/ByteArrayInputStream", 4);
+            // Pin across the array alloc below — a moving young GC there would
+            // relocate the fresh stream (native stale-local family).
+            let bais_pin = ctx.pin_native_root(bais);
             let arr = ctx.new_array(cratonvm_types::ArrayElementType::Byte, bytes.len());
+            let bais = ctx.read_native_pin(bais_pin, bais);
+            ctx.unpin_native_roots(bais_pin);
             for (i, &b) in bytes.iter().enumerate() {
                 ctx.set_array_element(arr, i, Value::Int(b as i8 as i32));
             }
@@ -19271,8 +20866,13 @@ pub fn register_p59_jar(r: &mut NativeMethodRegistry) {
         "Ljava/util/jar/Attributes$Name;",
         |ctx, _args| {
             let obj = alloc_concurrent_synthetic(ctx, "java/util/jar/Attributes$Name", 1);
+            // Pin across the create_string below — a moving young GC there
+            // would relocate the fresh Name (native stale-local family).
+            let obj_pin = ctx.pin_native_root(obj);
             let s = ctx.create_string("Manifest-Version");
+            let obj = ctx.read_native_pin(obj_pin, obj);
             ctx.set_field(obj, 0, Value::Object(Some(s)));
+            ctx.unpin_native_roots(obj_pin);
             Ok(Some(Value::Object(Some(obj))))
         },
     );
@@ -19282,8 +20882,13 @@ pub fn register_p59_jar(r: &mut NativeMethodRegistry) {
         "Ljava/util/jar/Attributes$Name;",
         |ctx, _args| {
             let obj = alloc_concurrent_synthetic(ctx, "java/util/jar/Attributes$Name", 1);
+            // Pin across the create_string below — a moving young GC there
+            // would relocate the fresh Name (native stale-local family).
+            let obj_pin = ctx.pin_native_root(obj);
             let s = ctx.create_string("Main-Class");
+            let obj = ctx.read_native_pin(obj_pin, obj);
             ctx.set_field(obj, 0, Value::Object(Some(s)));
+            ctx.unpin_native_roots(obj_pin);
             Ok(Some(Value::Object(Some(obj))))
         },
     );
@@ -19370,14 +20975,19 @@ pub fn register_p59_jar(r: &mut NativeMethodRegistry) {
             // Build a minimal 2-field synthetic archive so downstream
             // getClassPathIndex / getUrl / isNestedArchive calls that are NOT
             // already overridden get a non-null receiver instead of NPE-ing.
+            // Pin across the archive alloc below — a moving young GC there
+            // would relocate `this` (native stale-local family).
+            let this_pin = ctx.pin_native_root(this);
             let archive = alloc_concurrent_synthetic(
                 ctx,
                 "org/springframework/boot/loader/archive/JarFileArchive",
                 4,
             );
+            let this = ctx.read_native_pin(this_pin, this);
             // Write back into the launcher's `archive` field so bytecode
             // that does GETFIELD archive still gets a non-null value.
             ctx.set_field_by_name(this, "archive", Value::Object(Some(archive)));
+            ctx.unpin_native_roots(this_pin);
             Ok(Some(Value::Object(Some(archive))))
         },
     );
@@ -19404,12 +21014,17 @@ pub fn register_p59_jar(r: &mut NativeMethodRegistry) {
             "()Lorg/springframework/boot/loader/archive/Archive;",
             |ctx, args| {
                 let this = obj_arg(args, 0)?;
+                // Pin across the archive alloc below — a moving young GC there
+                // would relocate `this` (native stale-local family).
+                let this_pin = ctx.pin_native_root(this);
                 let archive = alloc_concurrent_synthetic(
                     ctx,
                     "org/springframework/boot/loader/archive/JarFileArchive",
                     4,
                 );
+                let this = ctx.read_native_pin(this_pin, this);
                 ctx.set_field_by_name(this, "archive", Value::Object(Some(archive)));
+                ctx.unpin_native_roots(this_pin);
                 Ok(Some(Value::Object(Some(archive))))
             },
         );
@@ -20015,6 +21630,13 @@ fn p59_jar_collect_entries(ctx: &mut dyn NativeContext, path: &str) -> Vec<Value
         None => return Vec::new(),
     };
     let mut out = Vec::with_capacity(contents.order.len());
+    // Pin each fresh entry across the subsequent per-entry allocs — a moving
+    // young GC there would relocate the earlier entries (native stale-local
+    // family). The pins stay live past this helper (the VM truncates the pin
+    // vec when the enclosing native returns); the refs are re-read to their
+    // current addresses right before returning, so callers receive values
+    // that are valid until their own next allocating call.
+    let mut pins: Vec<usize> = Vec::with_capacity(contents.order.len());
     for name in &contents.order {
         let rec = match contents.by_name.get(name) {
             Some(r) => r,
@@ -20022,7 +21644,10 @@ fn p59_jar_collect_entries(ctx: &mut dyn NativeContext, path: &str) -> Vec<Value
         };
         let (size, csize, method, crc) = (rec.size, rec.csize, rec.method, rec.crc);
         let je = alloc_concurrent_synthetic(ctx, "java/util/jar/JarEntry", 4);
+        let je_pin = ctx.pin_native_root(je);
         let name_s = ctx.create_string(name);
+        let je = ctx.read_native_pin(je_pin, je);
+        pins.push(je_pin);
         ctx.set_field(je, 0, Value::Object(Some(name_s)));
         ctx.set_field(je, 1, Value::Long(size));
         ctx.set_field(je, 2, Value::Long(csize));
@@ -20040,6 +21665,12 @@ fn p59_jar_collect_entries(ctx: &mut dyn NativeContext, path: &str) -> Vec<Value
         ctx.set_field_by_name(je, "method", Value::Int(method));
         ctx.set_field_by_name(je, "crc", Value::Long(crc));
         out.push(Value::Object(Some(je)));
+    }
+    // Re-read every entry to its current (post-GC) address before returning.
+    for (v, h) in out.iter_mut().zip(&pins) {
+        if let Value::Object(Some(o)) = v {
+            *v = Value::Object(Some(ctx.read_native_pin(*h, *o)));
+        }
     }
     out
 }
@@ -20066,7 +21697,12 @@ fn p59_jar_lookup_entry(ctx: &mut dyn NativeContext, path: &str, entry_name: &st
         None => return Value::Object(None),
     };
     let je = alloc_concurrent_synthetic(ctx, "java/util/jar/JarEntry", 4);
+    // Pin across the create_string below — a moving young GC there would
+    // relocate the fresh entry (native stale-local family).
+    let je_pin = ctx.pin_native_root(je);
     let name_s = ctx.create_string(&name);
+    let je = ctx.read_native_pin(je_pin, je);
+    ctx.unpin_native_roots(je_pin);
     ctx.set_field(je, 0, Value::Object(Some(name_s)));
     ctx.set_field(je, 1, Value::Long(size));
     ctx.set_field(je, 2, Value::Long(csize));
@@ -20112,9 +21748,16 @@ fn p59_fat_jar_boot_inf_nested_url_values(
     jar_path: &str,
 ) -> Vec<Value> {
     let mut urls: Vec<Value> = Vec::new();
+    // Pin each fresh URL across the subsequent per-entry allocs — a moving
+    // young GC there would relocate the earlier URLs (native stale-local
+    // family). The pins stay live past this helper (the VM truncates the pin
+    // vec at native exit); the refs are re-read right before returning.
+    let mut pins: Vec<usize> = Vec::new();
     let jar_uri_path = jar_path.replace('\\', "/").replace('!', "%21");
     let classes_url_str = format!("jar:nested:/{jar_uri_path}/!BOOT-INF/classes/!/");
-    urls.push(Value::Object(Some(p59_alloc_url(ctx, &classes_url_str))));
+    let classes_url = p59_alloc_url(ctx, &classes_url_str);
+    pins.push(ctx.pin_native_root(classes_url));
+    urls.push(Value::Object(Some(classes_url)));
     if !jar_path.is_empty() {
         if let Ok(file) = std::fs::File::open(jar_path) {
             if let Ok(mut archive) = zip::ZipArchive::new(file) {
@@ -20123,11 +21766,19 @@ fn p59_fat_jar_boot_inf_nested_url_values(
                         let name = entry.name().to_string();
                         if name.starts_with("BOOT-INF/lib/") && name.ends_with(".jar") {
                             let url_str = format!("jar:nested:/{jar_uri_path}/!{name}!/");
-                            urls.push(Value::Object(Some(p59_alloc_url(ctx, &url_str))));
+                            let url = p59_alloc_url(ctx, &url_str);
+                            pins.push(ctx.pin_native_root(url));
+                            urls.push(Value::Object(Some(url)));
                         }
                     }
                 }
             }
+        }
+    }
+    // Re-read every URL to its current (post-GC) address before returning.
+    for (v, h) in urls.iter_mut().zip(&pins) {
+        if let Value::Object(Some(o)) = v {
+            *v = Value::Object(Some(ctx.read_native_pin(*h, *o)));
         }
     }
     urls
@@ -20216,14 +21867,21 @@ fn sb3_executable_archive_launcher_create_class_loader_collection(
             cn, jar_path
         );
     }
+    // Pin across the URL scan / array alloc below — a moving young GC there
+    // would relocate `this` and the collected URLs (native stale-local family).
+    let this_pin = ctx.pin_native_root(this);
     let url_values = p59_fat_jar_boot_inf_nested_url_values(ctx, &jar_path);
+    let pins = pin_object_values(ctx, &url_values);
     let url_arr = ctx.new_array(
         cratonvm_types::ArrayElementType::Reference,
         url_values.len(),
     );
-    for (i, v) in url_values.iter().enumerate() {
-        ctx.set_array_element(url_arr, i, *v);
+    for (i, (v, p)) in url_values.iter().zip(&pins).enumerate() {
+        let v = read_pinned_object_value(ctx, *p, *v);
+        ctx.set_array_element(url_arr, i, v);
     }
+    let this = ctx.read_native_pin(this_pin, this);
+    ctx.unpin_native_roots(this_pin);
     ctx.invoke_special(
         "org/springframework/boot/loader/launch/Launcher",
         "createClassLoader",
@@ -20318,10 +21976,19 @@ fn sb2_launcher_build_archive_list(ctx: &mut dyn NativeContext, this: ObjectRef)
     // SB2 JarLauncher.isNestedArchive's BOOT-INF/classes/ branch).
     let archive_class = "org/springframework/boot/loader/archive/JarFileArchive";
     let classes_url_str = format!("jar:file:/{jar_uri_path}!/BOOT-INF/classes!/");
+    // Pin each fresh URL/archive across the subsequent per-entry allocs — a
+    // moving young GC there would relocate the earlier ones (native
+    // stale-local family). The pins stay live past this helper (the VM
+    // truncates the pin vec at native exit); the refs are re-read right
+    // before returning.
+    let mut pins: Vec<usize> = Vec::new();
     let classes_url = p59_alloc_url(ctx, &classes_url_str);
+    let classes_url_pin = ctx.pin_native_root(classes_url);
     let classes_archive = alloc_concurrent_synthetic(ctx, archive_class, 3);
+    let classes_url = ctx.read_native_pin(classes_url_pin, classes_url);
     // SB2 JarFileArchive layout: 0=jarFile, 1=url, 2=tempUnpackDirectory
     ctx.set_field(classes_archive, 1, Value::Object(Some(classes_url)));
+    pins.push(ctx.pin_native_root(classes_archive));
     archives.push(Value::Object(Some(classes_archive)));
 
     if let Ok(file) = std::fs::File::open(&jar_path) {
@@ -20332,12 +21999,21 @@ fn sb2_launcher_build_archive_list(ctx: &mut dyn NativeContext, this: ObjectRef)
                     if name.starts_with("BOOT-INF/lib/") && name.ends_with(".jar") {
                         let url_str = format!("jar:file:/{jar_uri_path}!/{name}!/");
                         let url = p59_alloc_url(ctx, &url_str);
+                        let url_pin = ctx.pin_native_root(url);
                         let nested = alloc_concurrent_synthetic(ctx, archive_class, 3);
+                        let url = ctx.read_native_pin(url_pin, url);
                         ctx.set_field(nested, 1, Value::Object(Some(url)));
+                        pins.push(ctx.pin_native_root(nested));
                         archives.push(Value::Object(Some(nested)));
                     }
                 }
             }
+        }
+    }
+    // Re-read every archive to its current (post-GC) address before returning.
+    for (v, h) in archives.iter_mut().zip(&pins) {
+        if let Value::Object(Some(o)) = v {
+            *v = Value::Object(Some(ctx.read_native_pin(*h, *o)));
         }
     }
     if std::env::var_os("CRATONVM_DBG_SBLOAD").is_some() {
@@ -20356,13 +22032,21 @@ fn sb2_launcher_get_class_path_archives_list(
 ) -> MethodCallResult {
     let this = obj_arg(args, 0)?;
     let archives = sb2_launcher_build_archive_list(ctx, this);
+    // Pin the archives across the list/array allocs below — a moving young GC
+    // there would relocate them (native stale-local family).
+    let pins = pin_object_values(ctx, &archives);
     let list = alloc_concurrent_synthetic(ctx, "java/util/ArrayList", 2);
+    let list_pin = ctx.pin_native_root(list);
     let arr = ctx.new_array(cratonvm_types::ArrayElementType::Reference, archives.len());
-    for (i, v) in archives.iter().enumerate() {
-        ctx.set_array_element(arr, i, *v);
+    let list = ctx.read_native_pin(list_pin, list);
+    for (i, (v, p)) in archives.iter().zip(&pins).enumerate() {
+        let v = read_pinned_object_value(ctx, *p, *v);
+        ctx.set_array_element(arr, i, v);
     }
     ctx.set_field(list, 0, Value::Object(Some(arr)));
     ctx.set_field(list, 1, Value::Int(archives.len() as i32));
+    let first_pin = pins.iter().flatten().next().map(|(h, _)| *h);
+    ctx.unpin_native_roots(first_pin.unwrap_or(list_pin));
     Ok(Some(Value::Object(Some(list))))
 }
 
@@ -20388,13 +22072,21 @@ fn sb2_launcher_get_class_path_archives_iterator(
     // our `try_stackless_invoke` resolves against the receiver's class:
     // `Enumeration$Impl` has the native registered, so the JDK bytecode
     // never runs.
+    // Pin the archives across the array/iterator allocs below — a moving
+    // young GC there would relocate them (native stale-local family).
+    let pins = pin_object_values(ctx, &archives);
     let arr = ctx.new_array(cratonvm_types::ArrayElementType::Reference, archives.len());
-    for (i, v) in archives.iter().enumerate() {
-        ctx.set_array_element(arr, i, *v);
+    let arr_pin = ctx.pin_native_root(arr);
+    for (i, (v, p)) in archives.iter().zip(&pins).enumerate() {
+        let v = read_pinned_object_value(ctx, *p, *v);
+        ctx.set_array_element(arr, i, v);
     }
     let itr = alloc_concurrent_synthetic(ctx, "java/util/Enumeration$Impl", 2);
+    let arr = ctx.read_native_pin(arr_pin, arr);
     ctx.set_field(itr, 0, Value::Object(Some(arr)));
     ctx.set_field(itr, 1, Value::Int(0));
+    let first_pin = pins.iter().flatten().next().map(|(h, _)| *h);
+    ctx.unpin_native_roots(first_pin.unwrap_or(arr_pin));
     if std::env::var_os("CRATONVM_DBG_SBLOAD").is_some() {
         eprintln!(
             "[DBG_SBLOAD] SB2 ExecutableArchiveLauncher.getClassPathArchivesIterator -> {} entries",
@@ -20419,20 +22111,28 @@ fn sb2_launcher_create_class_loader_bypass_archive_walk(
 ) -> MethodCallResult {
     let this = obj_arg(args, 0)?;
     let _ = args.get(1); // ignored — rebuilt from the launcher mirror
+    // Pin across the archive scan / URL[] alloc below — a moving young GC
+    // there would relocate them (native stale-local family).
+    let this_pin = ctx.pin_native_root(this);
     let archives = sb2_launcher_build_archive_list(ctx, this);
     let mut urls: Vec<ObjectRef> = Vec::with_capacity(archives.len());
+    let mut url_pins: Vec<usize> = Vec::with_capacity(archives.len());
     for arch_val in archives {
         let Value::Object(Some(arch_obj)) = arch_val else {
             continue;
         };
         if let Value::Object(Some(url)) = ctx.get_field(arch_obj, 1) {
+            url_pins.push(ctx.pin_native_root(url));
             urls.push(url);
         }
     }
     let url_arr = ctx.new_array(cratonvm_types::ArrayElementType::Reference, urls.len());
     for (i, u) in urls.iter().enumerate() {
-        ctx.set_array_element(url_arr, i, Value::Object(Some(*u)));
+        let u = ctx.read_native_pin(url_pins[i], *u);
+        ctx.set_array_element(url_arr, i, Value::Object(Some(u)));
     }
+    let this = ctx.read_native_pin(this_pin, this);
+    ctx.unpin_native_roots(this_pin);
     ctx.invoke(
         "org/springframework/boot/loader/Launcher",
         "createClassLoader",
@@ -20456,10 +22156,21 @@ fn p59_alloc_url(ctx: &mut dyn NativeContext, full: &str) -> ObjectRef {
     } else {
         &full[proto.len() + 1..]
     };
+    // Pin across the create_strings below — a moving young GC there would
+    // relocate the fresh URL and the earlier strings (native stale-local
+    // family).
+    let url_pin = ctx.pin_native_root(url);
     let proto_s = ctx.create_string(proto);
+    let proto_pin = ctx.pin_native_root(proto_s);
     let file_s = ctx.create_string(rest);
+    let file_pin = ctx.pin_native_root(file_s);
     let full_s = ctx.create_string(full);
+    let full_pin = ctx.pin_native_root(full_s);
     let host_s = ctx.create_string("");
+    let url = ctx.read_native_pin(url_pin, url);
+    let proto_s = ctx.read_native_pin(proto_pin, proto_s);
+    let file_s = ctx.read_native_pin(file_pin, file_s);
+    let full_s = ctx.read_native_pin(full_pin, full_s);
     ctx.set_field(url, 0, Value::Object(Some(proto_s))); // protocol
     ctx.set_field(url, 1, Value::Object(Some(host_s))); // host
     ctx.set_field(url, 2, Value::Int(-1)); // port
@@ -20468,6 +22179,7 @@ fn p59_alloc_url(ctx: &mut dyn NativeContext, full: &str) -> ObjectRef {
                                                 // Slot 5 = authority — leave null to satisfy our URL.toString fallback.
     ctx.set_field(url, 5, Value::Object(Some(full_s))); // authority/full
     ctx.set_field(url, 6, Value::Object(Some(file_s))); // path
+    ctx.unpin_native_roots(url_pin);
     url
 }
 
@@ -20482,13 +22194,21 @@ fn p59_jar_file_entries(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCa
     // cursor=1). Allocating the bare `java/util/Enumeration` interface
     // produced an object with no instantiable concrete class — it degraded
     // to `java/lang/Object` and `invokeinterface hasMoreElements` failed.
+    // Pin the entries across the array/Enumeration allocs below — a moving
+    // young GC there would relocate them (native stale-local family).
+    let pins = pin_object_values(ctx, &elems);
+    let first_pin = pins.iter().flatten().next().map(|(h, _)| *h);
     let arr = ctx.new_array(cratonvm_types::ArrayElementType::Reference, elems.len());
-    for (i, v) in elems.into_iter().enumerate() {
+    let arr_pin = ctx.pin_native_root(arr);
+    for (i, (v, p)) in elems.iter().zip(&pins).enumerate() {
+        let v = read_pinned_object_value(ctx, *p, *v);
         ctx.set_array_element(arr, i, v);
     }
     let enumeration = alloc_concurrent_synthetic(ctx, "java/util/Enumeration$Impl", 2);
+    let arr = ctx.read_native_pin(arr_pin, arr);
     ctx.set_field(enumeration, 0, Value::Object(Some(arr)));
     ctx.set_field(enumeration, 1, Value::Int(0));
+    ctx.unpin_native_roots(first_pin.unwrap_or(arr_pin));
     Ok(Some(Value::Object(Some(enumeration))))
 }
 
@@ -20507,6 +22227,9 @@ fn p59_jar_file_init(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallR
     // unaffected because `java.io.File` already normalizes the drive path.
     // Storing the normalized form also makes `getName()` match HotSpot's
     // `file.getPath()`. `p57_to_os_path` is a no-op for already-normal paths.
+    // Pin across the create_string / manifest parse below — a moving young GC
+    // there would relocate `this` (native stale-local family).
+    let this_pin = ctx.pin_native_root(this);
     let (slot0_val, path) = match name_val {
         Value::Object(Some(s)) => {
             let raw = ctx.read_string(s).unwrap_or_default();
@@ -20520,10 +22243,13 @@ fn p59_jar_file_init(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallR
         }
         _ => (name_val, String::new()),
     };
+    let this = ctx.read_native_pin(this_pin, this);
     ctx.set_field(this, 0, slot0_val);
     // Try to read the real MANIFEST.MF
     let manifest = p98_read_jar_manifest(ctx, &path);
+    let this = ctx.read_native_pin(this_pin, this);
     ctx.set_field(this, 1, manifest);
+    ctx.unpin_native_roots(this_pin);
     Ok(None)
 }
 
@@ -20543,8 +22269,13 @@ fn p59_jar_file_init_file(ctx: &mut dyn NativeContext, args: &[Value]) -> Method
     if std::env::var_os("CRATONVM_DBG_SBLOAD").is_some() {
         eprintln!("[DBG_SBLOAD] JarFile.<init>(File) path={:?}", path);
     }
+    // Pin across the manifest parse below — a moving young GC there would
+    // relocate `this` (native stale-local family).
+    let this_pin = ctx.pin_native_root(this);
     let manifest = p98_read_jar_manifest(ctx, &path);
+    let this = ctx.read_native_pin(this_pin, this);
     ctx.set_field(this, 1, manifest);
+    ctx.unpin_native_roots(this_pin);
     Ok(None)
 }
 
@@ -20709,14 +22440,25 @@ fn p59_read_input_stream_fully(
         return Ok(Vec::new());
     }
     // Slow path: loop on invoke_virtual("read()I") until -1.
+    // Pin across the read callbacks below — a moving young GC there would
+    // relocate the stream (native stale-local family).
+    let stream_pin = ctx.pin_native_root(stream);
     let mut out = Vec::new();
     loop {
-        let r = ctx.invoke_virtual(stream, "read", "()I", &[])?;
+        let stream = ctx.read_native_pin(stream_pin, stream);
+        let r = match ctx.invoke_virtual(stream, "read", "()I", &[]) {
+            Ok(r) => r,
+            Err(e) => {
+                ctx.unpin_native_roots(stream_pin);
+                return Err(e);
+            }
+        };
         match r {
             Some(Value::Int(-1)) => break,
             Some(Value::Int(v)) => out.push((v & 0xff) as u8),
             None | Some(Value::Object(None)) => break,
             Some(other) => {
+                ctx.unpin_native_roots(stream_pin);
                 return Err(MethodCallFailed::InternalError(
                     cratonvm_types::error::VmError::Runtime(RuntimeError::IOException {
                         message: format!(
@@ -20730,6 +22472,7 @@ fn p59_read_input_stream_fully(
         // Guard against runaway streams (e.g., buggy read() that never
         // returns -1). Manifest files are tiny — 1 MB is plenty of headroom.
         if out.len() > 1024 * 1024 {
+            ctx.unpin_native_roots(stream_pin);
             return Err(MethodCallFailed::InternalError(
                 cratonvm_types::error::VmError::Runtime(RuntimeError::IOException {
                     message: "Manifest(InputStream): stream exceeds 1 MB limit".to_string(),
@@ -20737,6 +22480,7 @@ fn p59_read_input_stream_fully(
             ));
         }
     }
+    ctx.unpin_native_roots(stream_pin);
     Ok(out)
 }
 
@@ -21179,13 +22923,23 @@ fn p59_stream_from_spliterator(ctx: &mut dyn NativeContext, args: &[Value]) -> M
         Value::Object(Some(a)) => a,
         _ => {
             let empty = ctx.new_array(cratonvm_types::ArrayElementType::Reference, 0);
+            // Pin across the stream alloc below — a moving young GC there
+            // would relocate the fresh array (native stale-local family).
+            let empty_pin = ctx.pin_native_root(empty);
             let stream = alloc_concurrent_synthetic(ctx, "java/util/stream/Stream", 1);
+            let empty = ctx.read_native_pin(empty_pin, empty);
             ctx.set_field(stream, 0, Value::Object(Some(empty)));
+            ctx.unpin_native_roots(empty_pin);
             return Ok(Some(Value::Object(Some(stream))));
         }
     };
+    // Pin across the stream alloc below — a moving young GC there would
+    // relocate the element array (native stale-local family).
+    let arr_pin = ctx.pin_native_root(arr);
     let stream = alloc_concurrent_synthetic(ctx, "java/util/stream/Stream", 1);
+    let arr = ctx.read_native_pin(arr_pin, arr);
     ctx.set_field(stream, 0, Value::Object(Some(arr)));
+    ctx.unpin_native_roots(arr_pin);
     Ok(Some(Value::Object(Some(stream))))
 }
 
@@ -21210,14 +22964,21 @@ pub(crate) fn p_int_stream_spliterator(
     let this = obj_arg(args, 0)?;
     let elems = p56_read_stream_elems(ctx, this);
     let n = elems.len();
+    // Pin any boxed elements across the array alloc below — a moving young GC
+    // there would relocate them (native stale-local family).
+    let pins = pin_object_values(ctx, &elems);
+    let first_pin = pins.iter().flatten().next().map(|(h, _)| *h);
     let arr = ctx.new_array(cratonvm_types::ArrayElementType::Int, n);
-    for (i, v) in elems.into_iter().enumerate() {
-        let iv = match v {
+    for (i, (v, p)) in elems.iter().zip(&pins).enumerate() {
+        let iv = match read_pinned_object_value(ctx, *p, *v) {
             Value::Int(x) => Value::Int(x),
             Value::Object(Some(o)) => ctx.get_field(o, 0),
             _ => Value::Int(0),
         };
         ctx.set_array_element(arr, i, iv);
+    }
+    if let Some(h) = first_pin {
+        ctx.unpin_native_roots(h);
     }
     ctx.invoke(
         "java/util/Spliterators",
@@ -21239,14 +23000,21 @@ pub(crate) fn p_long_stream_spliterator(
     let this = obj_arg(args, 0)?;
     let elems = p56_read_stream_elems(ctx, this);
     let n = elems.len();
+    // Pin any boxed elements across the array alloc below — a moving young GC
+    // there would relocate them (native stale-local family).
+    let pins = pin_object_values(ctx, &elems);
+    let first_pin = pins.iter().flatten().next().map(|(h, _)| *h);
     let arr = ctx.new_array(cratonvm_types::ArrayElementType::Long, n);
-    for (i, v) in elems.into_iter().enumerate() {
-        let lv = match v {
+    for (i, (v, p)) in elems.iter().zip(&pins).enumerate() {
+        let lv = match read_pinned_object_value(ctx, *p, *v) {
             Value::Long(x) => Value::Long(x),
             Value::Object(Some(o)) => ctx.get_field(o, 0),
             _ => Value::Long(0),
         };
         ctx.set_array_element(arr, i, lv);
+    }
+    if let Some(h) = first_pin {
+        ctx.unpin_native_roots(h);
     }
     ctx.invoke(
         "java/util/Spliterators",
@@ -21268,14 +23036,21 @@ pub(crate) fn p_double_stream_spliterator(
     let this = obj_arg(args, 0)?;
     let elems = p56_read_stream_elems(ctx, this);
     let n = elems.len();
+    // Pin any boxed elements across the array alloc below — a moving young GC
+    // there would relocate them (native stale-local family).
+    let pins = pin_object_values(ctx, &elems);
+    let first_pin = pins.iter().flatten().next().map(|(h, _)| *h);
     let arr = ctx.new_array(cratonvm_types::ArrayElementType::Double, n);
-    for (i, v) in elems.into_iter().enumerate() {
-        let dv = match v {
+    for (i, (v, p)) in elems.iter().zip(&pins).enumerate() {
+        let dv = match read_pinned_object_value(ctx, *p, *v) {
             Value::Double(x) => Value::Double(x),
             Value::Object(Some(o)) => ctx.get_field(o, 0),
             _ => Value::Double(0.0),
         };
         ctx.set_array_element(arr, i, dv);
+    }
+    if let Some(h) = first_pin {
+        ctx.unpin_native_roots(h);
     }
     ctx.invoke(
         "java/util/Spliterators",
@@ -21297,9 +23072,17 @@ pub(crate) fn p_obj_stream_spliterator(
     let this = obj_arg(args, 0)?;
     let elems = p56_read_stream_elems(ctx, this);
     let n = elems.len();
+    // Pin the object elements across the array alloc below — a moving young
+    // GC there would relocate them (native stale-local family).
+    let pins = pin_object_values(ctx, &elems);
+    let first_pin = pins.iter().flatten().next().map(|(h, _)| *h);
     let arr = ctx.new_array(cratonvm_types::ArrayElementType::Reference, n);
-    for (i, v) in elems.into_iter().enumerate() {
+    for (i, (v, p)) in elems.iter().zip(&pins).enumerate() {
+        let v = read_pinned_object_value(ctx, *p, *v);
         ctx.set_array_element(arr, i, v);
+    }
+    if let Some(h) = first_pin {
+        ctx.unpin_native_roots(h);
     }
     ctx.invoke(
         "java/util/Spliterators",
@@ -21331,14 +23114,21 @@ pub(crate) fn p_int_stream_iterator(
     let this = obj_arg(args, 0)?;
     let elems = p56_read_stream_elems(ctx, this);
     let n = elems.len();
+    // Pin any boxed elements across the array alloc below — a moving young GC
+    // there would relocate them (native stale-local family).
+    let pins = pin_object_values(ctx, &elems);
+    let first_pin = pins.iter().flatten().next().map(|(h, _)| *h);
     let arr = ctx.new_array(cratonvm_types::ArrayElementType::Int, n);
-    for (i, v) in elems.into_iter().enumerate() {
-        let iv = match v {
+    for (i, (v, p)) in elems.iter().zip(&pins).enumerate() {
+        let iv = match read_pinned_object_value(ctx, *p, *v) {
             Value::Int(x) => Value::Int(x),
             Value::Object(Some(o)) => ctx.get_field(o, 0),
             _ => Value::Int(0),
         };
         ctx.set_array_element(arr, i, iv);
+    }
+    if let Some(h) = first_pin {
+        ctx.unpin_native_roots(h);
     }
     let real_stream = ctx.invoke(
         "java/util/Arrays",
@@ -21364,14 +23154,21 @@ pub(crate) fn p_long_stream_iterator(
     let this = obj_arg(args, 0)?;
     let elems = p56_read_stream_elems(ctx, this);
     let n = elems.len();
+    // Pin any boxed elements across the array alloc below — a moving young GC
+    // there would relocate them (native stale-local family).
+    let pins = pin_object_values(ctx, &elems);
+    let first_pin = pins.iter().flatten().next().map(|(h, _)| *h);
     let arr = ctx.new_array(cratonvm_types::ArrayElementType::Long, n);
-    for (i, v) in elems.into_iter().enumerate() {
-        let lv = match v {
+    for (i, (v, p)) in elems.iter().zip(&pins).enumerate() {
+        let lv = match read_pinned_object_value(ctx, *p, *v) {
             Value::Long(x) => Value::Long(x),
             Value::Object(Some(o)) => ctx.get_field(o, 0),
             _ => Value::Long(0),
         };
         ctx.set_array_element(arr, i, lv);
+    }
+    if let Some(h) = first_pin {
+        ctx.unpin_native_roots(h);
     }
     let real_stream = ctx.invoke(
         "java/util/Arrays",
@@ -21397,14 +23194,21 @@ pub(crate) fn p_double_stream_iterator(
     let this = obj_arg(args, 0)?;
     let elems = p56_read_stream_elems(ctx, this);
     let n = elems.len();
+    // Pin any boxed elements across the array alloc below — a moving young GC
+    // there would relocate them (native stale-local family).
+    let pins = pin_object_values(ctx, &elems);
+    let first_pin = pins.iter().flatten().next().map(|(h, _)| *h);
     let arr = ctx.new_array(cratonvm_types::ArrayElementType::Double, n);
-    for (i, v) in elems.into_iter().enumerate() {
-        let dv = match v {
+    for (i, (v, p)) in elems.iter().zip(&pins).enumerate() {
+        let dv = match read_pinned_object_value(ctx, *p, *v) {
             Value::Double(x) => Value::Double(x),
             Value::Object(Some(o)) => ctx.get_field(o, 0),
             _ => Value::Double(0.0),
         };
         ctx.set_array_element(arr, i, dv);
+    }
+    if let Some(h) = first_pin {
+        ctx.unpin_native_roots(h);
     }
     let real_stream = ctx.invoke(
         "java/util/Arrays",
@@ -21432,8 +23236,13 @@ fn p59_int_stream_from_spliterator(
         Value::Object(Some(a)) => a,
         _ => ctx.new_array(cratonvm_types::ArrayElementType::Reference, 0),
     };
+    // Pin across the stream alloc below — a moving young GC there would
+    // relocate the element array (native stale-local family).
+    let arr_pin = ctx.pin_native_root(arr);
     let stream = alloc_concurrent_synthetic(ctx, "java/util/stream/IntStream", 1);
+    let arr = ctx.read_native_pin(arr_pin, arr);
     ctx.set_field(stream, 0, Value::Object(Some(arr)));
+    ctx.unpin_native_roots(arr_pin);
     Ok(Some(Value::Object(Some(stream))))
 }
 
@@ -21446,8 +23255,13 @@ fn p59_long_stream_from_spliterator(
         Value::Object(Some(a)) => a,
         _ => ctx.new_array(cratonvm_types::ArrayElementType::Reference, 0),
     };
+    // Pin across the stream alloc below — a moving young GC there would
+    // relocate the element array (native stale-local family).
+    let arr_pin = ctx.pin_native_root(arr);
     let stream = alloc_concurrent_synthetic(ctx, "java/util/stream/LongStream", 1);
+    let arr = ctx.read_native_pin(arr_pin, arr);
     ctx.set_field(stream, 0, Value::Object(Some(arr)));
+    ctx.unpin_native_roots(arr_pin);
     Ok(Some(Value::Object(Some(stream))))
 }
 
@@ -21460,8 +23274,13 @@ fn p59_double_stream_from_spliterator(
         Value::Object(Some(a)) => a,
         _ => ctx.new_array(cratonvm_types::ArrayElementType::Reference, 0),
     };
+    // Pin across the stream alloc below — a moving young GC there would
+    // relocate the element array (native stale-local family).
+    let arr_pin = ctx.pin_native_root(arr);
     let stream = alloc_concurrent_synthetic(ctx, "java/util/stream/DoubleStream", 1);
+    let arr = ctx.read_native_pin(arr_pin, arr);
     ctx.set_field(stream, 0, Value::Object(Some(arr)));
+    ctx.unpin_native_roots(arr_pin);
     Ok(Some(Value::Object(Some(stream))))
 }
 
@@ -21472,9 +23291,14 @@ fn p59_collection_spliterator(ctx: &mut dyn NativeContext, args: &[Value]) -> Me
         Value::Object(Some(arr)) => arr,
         _ => ctx.new_array(cratonvm_types::ArrayElementType::Reference, 0),
     };
+    // Pin across the Spliterator alloc below — a moving young GC there would
+    // relocate the backing array (native stale-local family).
+    let data_pin = ctx.pin_native_root(data);
     let spl = alloc_concurrent_synthetic(ctx, "java/util/Spliterator", 2);
+    let data = ctx.read_native_pin(data_pin, data);
     ctx.set_field(spl, 0, Value::Object(Some(data)));
     ctx.set_field(spl, 1, Value::Int(0)); // cursor at start
+    ctx.unpin_native_roots(data_pin);
     Ok(Some(Value::Object(Some(spl))))
 }
 
@@ -21517,13 +23341,21 @@ fn p59_hashset_spliterator(ctx: &mut dyn NativeContext, args: &[Value]) -> Metho
             }
         }
     }
+    // Pin the collected keys across the array/Spliterator allocs below — a
+    // moving young GC there would relocate them (native stale-local family).
+    let pins = pin_object_values(ctx, &keys);
+    let first_pin = pins.iter().flatten().next().map(|(h, _)| *h);
     let arr = ctx.new_array(cratonvm_types::ArrayElementType::Reference, keys.len());
-    for (i, k) in keys.iter().enumerate() {
-        ctx.set_array_element(arr, i, *k);
+    let arr_pin = ctx.pin_native_root(arr);
+    for (i, (k, p)) in keys.iter().zip(&pins).enumerate() {
+        let k = read_pinned_object_value(ctx, *p, *k);
+        ctx.set_array_element(arr, i, k);
     }
     let spl = alloc_concurrent_synthetic(ctx, "java/util/Spliterator", 2);
+    let arr = ctx.read_native_pin(arr_pin, arr);
     ctx.set_field(spl, 0, Value::Object(Some(arr)));
     ctx.set_field(spl, 1, Value::Int(0));
+    ctx.unpin_native_roots(first_pin.unwrap_or(arr_pin));
     Ok(Some(Value::Object(Some(spl))))
 }
 
@@ -25386,12 +27218,20 @@ pub(crate) fn register_p61_logging(r: &mut NativeMethodRegistry) {
                 Value::Object(Some(s)) => s,
                 _ => return Ok(None), // no stream
             };
+            // Pin across the LogRecord/write invokes below — a moving young GC
+            // there would relocate `stream`/`record` (native stale-local family).
+            let stream_pin = ctx.pin_native_root(stream);
+            let record_pin = match args.get(1) {
+                Some(Value::Object(Some(r))) => Some((ctx.pin_native_root(*r), *r)),
+                _ => None,
+            };
 
             // Extract level name and message from LogRecord via invoke_virtual
-            let level_str = if let Some(Value::Object(Some(record))) = args.get(1) {
+            let level_str = if let Some((h, orig)) = record_pin {
+                let record = ctx.read_native_pin(h, orig);
                 // getLevel() -> Level, then Level.getName() -> String
                 let level = match ctx.invoke_virtual(
-                    *record,
+                    record,
                     "getLevel",
                     "()Ljava/util/logging/Level;",
                     &[],
@@ -25411,8 +27251,9 @@ pub(crate) fn register_p61_logging(r: &mut NativeMethodRegistry) {
                 "INFO".to_string()
             };
 
-            let message = if let Some(Value::Object(Some(record))) = args.get(1) {
-                match ctx.invoke_virtual(*record, "getMessage", "()Ljava/lang/String;", &[]) {
+            let message = if let Some((h, orig)) = record_pin {
+                let record = ctx.read_native_pin(h, orig);
+                match ctx.invoke_virtual(record, "getMessage", "()Ljava/lang/String;", &[]) {
                     Ok(Some(Value::Object(Some(s)))) => ctx.read_string(s).unwrap_or_default(),
                     _ => String::new(),
                 }
@@ -25423,8 +27264,10 @@ pub(crate) fn register_p61_logging(r: &mut NativeMethodRegistry) {
             // Format and write to stream
             let formatted = format!("[{}] {}\n", level_str, message);
             for &b in formatted.as_bytes() {
+                let stream = ctx.read_native_pin(stream_pin, stream);
                 let _ = ctx.invoke_virtual(stream, "write", "(I)V", &[Value::Int(b as i32)]);
             }
+            ctx.unpin_native_roots(stream_pin);
             Ok(None)
         },
     );
@@ -25473,8 +27316,12 @@ pub(crate) fn register_p61_logging(r: &mut NativeMethodRegistry) {
 
             // Extract level and message
             let (level_str, message) = if let Some(Value::Object(Some(record))) = args.get(1) {
+                let record = *record;
+                // Pin across the LogRecord invokes below — a moving young GC
+                // there would relocate it (native stale-local family).
+                let record_pin = ctx.pin_native_root(record);
                 let level = match ctx.invoke_virtual(
-                    *record,
+                    record,
                     "getLevel",
                     "()Ljava/util/logging/Level;",
                     &[],
@@ -25489,11 +27336,13 @@ pub(crate) fn register_p61_logging(r: &mut NativeMethodRegistry) {
                     }
                     _ => "INFO".to_string(),
                 };
+                let record = ctx.read_native_pin(record_pin, record);
                 let msg =
-                    match ctx.invoke_virtual(*record, "getMessage", "()Ljava/lang/String;", &[]) {
+                    match ctx.invoke_virtual(record, "getMessage", "()Ljava/lang/String;", &[]) {
                         Ok(Some(Value::Object(Some(s)))) => ctx.read_string(s).unwrap_or_default(),
                         _ => String::new(),
                     };
+                ctx.unpin_native_roots(record_pin);
                 (level, msg)
             } else {
                 ("INFO".to_string(), String::new())
@@ -26670,7 +28519,12 @@ pub(crate) fn register_p62_char_buffer(r: &mut NativeMethodRegistry) {
             _ => return Ok(Some(Value::Object(None))),
         };
         let len = ctx.array_length(arr);
+        // Pin across the buffer alloc below — a moving young GC there would
+        // relocate the backing array (native stale-local family).
+        let arr_pin = ctx.pin_native_root(arr);
         let buf = alloc_concurrent_synthetic(ctx, "java/nio/CharBuffer", 5);
+        let arr = ctx.read_native_pin(arr_pin, arr);
+        ctx.unpin_native_roots(arr_pin);
         cb_write_hb(ctx, buf, arr, len as i32);
         Ok(Some(Value::Object(Some(buf))))
     });
@@ -26708,7 +28562,12 @@ pub(crate) fn register_p62_char_buffer(r: &mut NativeMethodRegistry) {
             for (i, &ch) in chars.iter().enumerate() {
                 ctx.set_array_element(arr, i, Value::Int(ch as i32));
             }
+            // Pin across the buffer alloc below — a moving young GC there
+            // would relocate the backing array (native stale-local family).
+            let arr_pin = ctx.pin_native_root(arr);
             let buf = alloc_concurrent_synthetic(ctx, "java/nio/CharBuffer", 5);
+            let arr = ctx.read_native_pin(arr_pin, arr);
+            ctx.unpin_native_roots(arr_pin);
             cb_write_hb(ctx, buf, arr, chars.len() as i32);
             Ok(Some(Value::Object(Some(buf))))
         },
@@ -26891,7 +28750,12 @@ pub(crate) fn register_p62_char_buffer(r: &mut NativeMethodRegistry) {
             let new_lim = cur_pos + end;
             // Allocate a fresh HeapCharBuffer pointing at the same char[]
             // — JDK's HeapCharBuffer.subSequence does the same.
+            // Pin across the buffer alloc below — a moving young GC there
+            // would relocate the backing array (native stale-local family).
+            let arr_pin = ctx.pin_native_root(arr);
             let buf = alloc_concurrent_synthetic(ctx, "java/nio/HeapCharBuffer", 5);
+            let arr = ctx.read_native_pin(arr_pin, arr);
+            ctx.unpin_native_roots(arr_pin);
             ctx.set_field_by_name(buf, "hb", Value::Object(Some(arr)));
             ctx.set_field_by_name(buf, "offset", Value::Int(cur_off));
             ctx.set_field_by_name(buf, "isReadOnly", Value::Int(0));
@@ -27138,7 +29002,12 @@ fn p62_alloc_char_buffer(ctx: &mut dyn NativeContext, cap: usize) -> ObjectRef {
     let arr = ctx.new_array(cratonvm_types::ArrayElementType::Char, cap);
     // Use HeapCharBuffer (concrete) not CharBuffer (abstract) so real-JDK
     // bytecode methods like compact() dispatch correctly.
+    // Pin across the buffer alloc below — a moving young GC there would
+    // relocate the backing array (native stale-local family).
+    let arr_pin = ctx.pin_native_root(arr);
     let buf = alloc_concurrent_synthetic(ctx, "java/nio/HeapCharBuffer", 5);
+    let arr = ctx.read_native_pin(arr_pin, arr);
+    ctx.unpin_native_roots(arr_pin);
     cb_write_hb(ctx, buf, arr, cap as i32);
     buf
 }
@@ -27428,7 +29297,12 @@ pub(crate) fn register_p62_format_factories(r: &mut NativeMethodRegistry) {
         "()Ljava/text/NumberFormat;",
         |ctx, _args| {
             let obj = alloc_concurrent_synthetic(ctx, "java/text/NumberFormat", 3);
+            // Pin across the create_string below — a moving young GC there
+            // would relocate the fresh format (native stale-local family).
+            let obj_pin = ctx.pin_native_root(obj);
             let pat = ctx.create_string("#,##0");
+            let obj = ctx.read_native_pin(obj_pin, obj);
+            ctx.unpin_native_roots(obj_pin);
             ctx.set_field(obj, 0, Value::Object(Some(pat)));
             ctx.set_field(obj, 1, Value::Int(1)); // grouping used
             ctx.set_field(obj, 2, Value::Int(0)); // 0 fraction digits
@@ -27441,7 +29315,12 @@ pub(crate) fn register_p62_format_factories(r: &mut NativeMethodRegistry) {
         "()Ljava/text/NumberFormat;",
         |ctx, _args| {
             let obj = alloc_concurrent_synthetic(ctx, "java/text/NumberFormat", 3);
+            // Pin across the create_string below — a moving young GC there
+            // would relocate the fresh format (native stale-local family).
+            let obj_pin = ctx.pin_native_root(obj);
             let pat = ctx.create_string("$#,##0.00");
+            let obj = ctx.read_native_pin(obj_pin, obj);
+            ctx.unpin_native_roots(obj_pin);
             ctx.set_field(obj, 0, Value::Object(Some(pat)));
             ctx.set_field(obj, 1, Value::Int(1));
             ctx.set_field(obj, 2, Value::Int(2));
@@ -27454,7 +29333,12 @@ pub(crate) fn register_p62_format_factories(r: &mut NativeMethodRegistry) {
         "()Ljava/text/NumberFormat;",
         |ctx, _args| {
             let obj = alloc_concurrent_synthetic(ctx, "java/text/NumberFormat", 3);
+            // Pin across the create_string below — a moving young GC there
+            // would relocate the fresh format (native stale-local family).
+            let obj_pin = ctx.pin_native_root(obj);
             let pat = ctx.create_string("#,##0%");
+            let obj = ctx.read_native_pin(obj_pin, obj);
+            ctx.unpin_native_roots(obj_pin);
             ctx.set_field(obj, 0, Value::Object(Some(pat)));
             ctx.set_field(obj, 1, Value::Int(1));
             ctx.set_field(obj, 2, Value::Int(0));
@@ -27482,7 +29366,12 @@ pub(crate) fn register_p62_format_factories(r: &mut NativeMethodRegistry) {
         "()Ljava/text/DateFormat;",
         |ctx, _args| {
             let obj = alloc_concurrent_synthetic(ctx, "java/text/DateFormat", 3);
+            // Pin across the create_string below — a moving young GC there
+            // would relocate the fresh format (native stale-local family).
+            let obj_pin = ctx.pin_native_root(obj);
             let pat = ctx.create_string("MMM d, yyyy");
+            let obj = ctx.read_native_pin(obj_pin, obj);
+            ctx.unpin_native_roots(obj_pin);
             ctx.set_field(obj, 0, Value::Object(Some(pat)));
             Ok(Some(Value::Object(Some(obj))))
         },
@@ -27493,7 +29382,12 @@ pub(crate) fn register_p62_format_factories(r: &mut NativeMethodRegistry) {
         "()Ljava/text/DateFormat;",
         |ctx, _args| {
             let obj = alloc_concurrent_synthetic(ctx, "java/text/DateFormat", 3);
+            // Pin across the create_string below — a moving young GC there
+            // would relocate the fresh format (native stale-local family).
+            let obj_pin = ctx.pin_native_root(obj);
             let pat = ctx.create_string("h:mm:ss a");
+            let obj = ctx.read_native_pin(obj_pin, obj);
+            ctx.unpin_native_roots(obj_pin);
             ctx.set_field(obj, 0, Value::Object(Some(pat)));
             Ok(Some(Value::Object(Some(obj))))
         },
@@ -27504,7 +29398,12 @@ pub(crate) fn register_p62_format_factories(r: &mut NativeMethodRegistry) {
         "()Ljava/text/DateFormat;",
         |ctx, _args| {
             let obj = alloc_concurrent_synthetic(ctx, "java/text/DateFormat", 3);
+            // Pin across the create_string below — a moving young GC there
+            // would relocate the fresh format (native stale-local family).
+            let obj_pin = ctx.pin_native_root(obj);
             let pat = ctx.create_string("MMM d, yyyy h:mm:ss a");
+            let obj = ctx.read_native_pin(obj_pin, obj);
+            ctx.unpin_native_roots(obj_pin);
             ctx.set_field(obj, 0, Value::Object(Some(pat)));
             Ok(Some(Value::Object(Some(obj))))
         },
@@ -27515,7 +29414,12 @@ pub(crate) fn register_p62_format_factories(r: &mut NativeMethodRegistry) {
         "(I)Ljava/text/DateFormat;",
         |ctx, _args| {
             let obj = alloc_concurrent_synthetic(ctx, "java/text/DateFormat", 3);
+            // Pin across the create_string below — a moving young GC there
+            // would relocate the fresh format (native stale-local family).
+            let obj_pin = ctx.pin_native_root(obj);
             let pat = ctx.create_string("MMM d, yyyy");
+            let obj = ctx.read_native_pin(obj_pin, obj);
+            ctx.unpin_native_roots(obj_pin);
             ctx.set_field(obj, 0, Value::Object(Some(pat)));
             Ok(Some(Value::Object(Some(obj))))
         },
@@ -27526,7 +29430,12 @@ pub(crate) fn register_p62_format_factories(r: &mut NativeMethodRegistry) {
         "(I)Ljava/text/DateFormat;",
         |ctx, _args| {
             let obj = alloc_concurrent_synthetic(ctx, "java/text/DateFormat", 3);
+            // Pin across the create_string below — a moving young GC there
+            // would relocate the fresh format (native stale-local family).
+            let obj_pin = ctx.pin_native_root(obj);
             let pat = ctx.create_string("h:mm:ss a");
+            let obj = ctx.read_native_pin(obj_pin, obj);
+            ctx.unpin_native_roots(obj_pin);
             ctx.set_field(obj, 0, Value::Object(Some(pat)));
             Ok(Some(Value::Object(Some(obj))))
         },
@@ -27537,7 +29446,12 @@ pub(crate) fn register_p62_format_factories(r: &mut NativeMethodRegistry) {
         "(II)Ljava/text/DateFormat;",
         |ctx, _args| {
             let obj = alloc_concurrent_synthetic(ctx, "java/text/DateFormat", 3);
+            // Pin across the create_string below — a moving young GC there
+            // would relocate the fresh format (native stale-local family).
+            let obj_pin = ctx.pin_native_root(obj);
             let pat = ctx.create_string("MMM d, yyyy h:mm:ss a");
+            let obj = ctx.read_native_pin(obj_pin, obj);
+            ctx.unpin_native_roots(obj_pin);
             ctx.set_field(obj, 0, Value::Object(Some(pat)));
             Ok(Some(Value::Object(Some(obj))))
         },
@@ -27565,7 +29479,12 @@ pub(crate) fn register_p62_format_factories(r: &mut NativeMethodRegistry) {
 
 fn p62_new_number_format(ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
     let obj = alloc_concurrent_synthetic(ctx, "java/text/NumberFormat", 3);
+    // Pin across the create_string below — a moving young GC there would
+    // relocate the fresh format (native stale-local family).
+    let obj_pin = ctx.pin_native_root(obj);
     let pat = ctx.create_string("#,##0.###");
+    let obj = ctx.read_native_pin(obj_pin, obj);
+    ctx.unpin_native_roots(obj_pin);
     ctx.set_field(obj, 0, Value::Object(Some(pat)));
     ctx.set_field(obj, 1, Value::Int(1));
     ctx.set_field(obj, 2, Value::Int(3));
@@ -28659,17 +30578,36 @@ pub(crate) fn register_p63_resource_bundle(r: &mut NativeMethodRegistry) {
 /// Build a Java String[] from a Rust slice of &str.
 fn make_string_array(ctx: &mut dyn NativeContext, items: &[&str]) -> ObjectRef {
     let arr = ctx.new_array(cratonvm_types::ArrayElementType::Reference, items.len());
+    // Pin across the create_strings below — a moving young GC there would
+    // relocate the fresh array (native stale-local family).
+    let arr_pin = ctx.pin_native_root(arr);
     for (i, s) in items.iter().enumerate() {
         let js = ctx.create_string(s);
+        let arr = ctx.read_native_pin(arr_pin, arr);
         ctx.set_array_element(arr, i, Value::Object(Some(js)));
     }
+    let arr = ctx.read_native_pin(arr_pin, arr);
+    ctx.unpin_native_roots(arr_pin);
     arr
 }
 
-/// Put a String[] under a key into a HashMap.
-fn put_arr(ctx: &mut dyn NativeContext, map: ObjectRef, key: &str, items: &[&str]) {
+/// Put a String[] under a key into a HashMap. `map_pin` is the caller's pin
+/// handle for `map` — the string/array allocations below can trigger a moving
+/// young GC, so the current map ref is re-read from the pin before the put
+/// (native stale-local family).
+fn put_arr(
+    ctx: &mut dyn NativeContext,
+    map_pin: usize,
+    map: ObjectRef,
+    key: &str,
+    items: &[&str],
+) {
     let k = ctx.create_string(key);
+    let k_pin = ctx.pin_native_root(k);
     let arr = make_string_array(ctx, items);
+    let map = ctx.read_native_pin(map_pin, map);
+    let k = ctx.read_native_pin(k_pin, k);
+    ctx.unpin_native_roots(k_pin);
     cratonvm_native_collections::native_map_put_pub(
         ctx,
         &[
@@ -28681,10 +30619,14 @@ fn put_arr(ctx: &mut dyn NativeContext, map: ObjectRef, key: &str, items: &[&str
     .ok();
 }
 
-/// Put a String value under a key into a HashMap.
-fn put_str(ctx: &mut dyn NativeContext, map: ObjectRef, key: &str, value: &str) {
+/// Put a String value under a key into a HashMap. `map_pin` as in [`put_arr`].
+fn put_str(ctx: &mut dyn NativeContext, map_pin: usize, map: ObjectRef, key: &str, value: &str) {
     let k = ctx.create_string(key);
+    let k_pin = ctx.pin_native_root(k);
     let v = ctx.create_string(value);
+    let map = ctx.read_native_pin(map_pin, map);
+    let k = ctx.read_native_pin(k_pin, k);
+    ctx.unpin_native_roots(k_pin);
     cratonvm_native_collections::native_map_put_pub(
         ctx,
         &[
@@ -28698,9 +30640,14 @@ fn put_str(ctx: &mut dyn NativeContext, map: ObjectRef, key: &str, value: &str) 
 
 /// Populate a synthetic English-US `sun.text.resources.FormatData` bundle map.
 fn populate_format_data_en(ctx: &mut dyn NativeContext, map: ObjectRef) {
+    // Pin across the per-entry allocations below — a moving young GC there
+    // would relocate `map` (native stale-local family); `put_arr`/`put_str`
+    // re-read the current ref from this pin before each put.
+    let map_pin = ctx.pin_native_root(map);
     // 13 entries (12 months + empty 13th for lunar calendar slot, JDK convention).
     put_arr(
         ctx,
+        map_pin,
         map,
         "MonthNames",
         &[
@@ -28721,6 +30668,7 @@ fn populate_format_data_en(ctx: &mut dyn NativeContext, map: ObjectRef) {
     );
     put_arr(
         ctx,
+        map_pin,
         map,
         "MonthAbbreviations",
         &[
@@ -28729,6 +30677,7 @@ fn populate_format_data_en(ctx: &mut dyn NativeContext, map: ObjectRef) {
     );
     put_arr(
         ctx,
+        map_pin,
         map,
         "MonthNarrows",
         &[
@@ -28737,6 +30686,7 @@ fn populate_format_data_en(ctx: &mut dyn NativeContext, map: ObjectRef) {
     );
     put_arr(
         ctx,
+        map_pin,
         map,
         "standalone.MonthNames",
         &[
@@ -28757,6 +30707,7 @@ fn populate_format_data_en(ctx: &mut dyn NativeContext, map: ObjectRef) {
     );
     put_arr(
         ctx,
+        map_pin,
         map,
         "standalone.MonthAbbreviations",
         &[
@@ -28765,6 +30716,7 @@ fn populate_format_data_en(ctx: &mut dyn NativeContext, map: ObjectRef) {
     );
     put_arr(
         ctx,
+        map_pin,
         map,
         "standalone.MonthNarrows",
         &[
@@ -28774,6 +30726,7 @@ fn populate_format_data_en(ctx: &mut dyn NativeContext, map: ObjectRef) {
     // 8 slots: index 0 unused, 1=Sunday..7=Saturday.
     put_arr(
         ctx,
+        map_pin,
         map,
         "DayNames",
         &[
@@ -28789,18 +30742,21 @@ fn populate_format_data_en(ctx: &mut dyn NativeContext, map: ObjectRef) {
     );
     put_arr(
         ctx,
+        map_pin,
         map,
         "DayAbbreviations",
         &["", "Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"],
     );
     put_arr(
         ctx,
+        map_pin,
         map,
         "DayNarrows",
         &["", "S", "M", "T", "W", "T", "F", "S"],
     );
     put_arr(
         ctx,
+        map_pin,
         map,
         "standalone.DayNames",
         &[
@@ -28816,46 +30772,52 @@ fn populate_format_data_en(ctx: &mut dyn NativeContext, map: ObjectRef) {
     );
     put_arr(
         ctx,
+        map_pin,
         map,
         "standalone.DayAbbreviations",
         &["", "Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"],
     );
     put_arr(
         ctx,
+        map_pin,
         map,
         "standalone.DayNarrows",
         &["", "S", "M", "T", "W", "T", "F", "S"],
     );
-    put_arr(ctx, map, "AmPmMarkers", &["AM", "PM"]);
-    put_arr(ctx, map, "narrow.AmPmMarkers", &["a", "p"]);
-    put_arr(ctx, map, "Eras", &["BC", "AD"]);
-    put_arr(ctx, map, "short.Eras", &["BC", "AD"]);
-    put_arr(ctx, map, "narrow.Eras", &["B", "A"]);
+    put_arr(ctx, map_pin, map, "AmPmMarkers", &["AM", "PM"]);
+    put_arr(ctx, map_pin, map, "narrow.AmPmMarkers", &["a", "p"]);
+    put_arr(ctx, map_pin, map, "Eras", &["BC", "AD"]);
+    put_arr(ctx, map_pin, map, "short.Eras", &["BC", "AD"]);
+    put_arr(ctx, map_pin, map, "narrow.Eras", &["B", "A"]);
     put_arr(
         ctx,
+        map_pin,
         map,
         "QuarterNames",
         &["1st quarter", "2nd quarter", "3rd quarter", "4th quarter"],
     );
-    put_arr(ctx, map, "QuarterAbbreviations", &["Q1", "Q2", "Q3", "Q4"]);
-    put_arr(ctx, map, "QuarterNarrows", &["1", "2", "3", "4"]);
+    put_arr(ctx, map_pin, map, "QuarterAbbreviations", &["Q1", "Q2", "Q3", "Q4"]);
+    put_arr(ctx, map_pin, map, "QuarterNarrows", &["1", "2", "3", "4"]);
     put_arr(
         ctx,
+        map_pin,
         map,
         "standalone.QuarterNames",
         &["1st quarter", "2nd quarter", "3rd quarter", "4th quarter"],
     );
     put_arr(
         ctx,
+        map_pin,
         map,
         "standalone.QuarterAbbreviations",
         &["Q1", "Q2", "Q3", "Q4"],
     );
-    put_arr(ctx, map, "standalone.QuarterNarrows", &["1", "2", "3", "4"]);
+    put_arr(ctx, map_pin, map, "standalone.QuarterNarrows", &["1", "2", "3", "4"]);
     // Standard 9-element layout used by SimpleDateFormat:
     // 4 time patterns (FULL/LONG/MEDIUM/SHORT), 4 date patterns, 1 date-time combiner.
     put_arr(
         ctx,
+        map_pin,
         map,
         "DateTimePatterns",
         &[
@@ -28873,6 +30835,7 @@ fn populate_format_data_en(ctx: &mut dyn NativeContext, map: ObjectRef) {
     // Calendar-keyed variant of DateTimePatterns used by some JDK paths.
     put_arr(
         ctx,
+        map_pin,
         map,
         "gregorian.DateTimePatterns",
         &[
@@ -28889,6 +30852,7 @@ fn populate_format_data_en(ctx: &mut dyn NativeContext, map: ObjectRef) {
     );
     put_arr(
         ctx,
+        map_pin,
         map,
         "DateTimePatternChars",
         &["GyMdkHmsSEDFwWahKzZYuXL"],
@@ -28896,6 +30860,7 @@ fn populate_format_data_en(ctx: &mut dyn NativeContext, map: ObjectRef) {
     // Number format patterns: number / currency / percent / scientific.
     put_arr(
         ctx,
+        map_pin,
         map,
         "NumberPatterns",
         &[
@@ -28907,13 +30872,15 @@ fn populate_format_data_en(ctx: &mut dyn NativeContext, map: ObjectRef) {
     );
     put_arr(
         ctx,
+        map_pin,
         map,
         "NumberElements",
         &[
             ".", ",", ";", "%", "0", "#", "-", "E", "\u{2030}", "\u{221E}", "NaN",
         ],
     );
-    put_str(ctx, map, "TimePatternChars", "hHmsSaEcLkKzZ");
+    put_str(ctx, map_pin, map, "TimePatternChars", "hHmsSaEcLkKzZ");
+    ctx.unpin_native_roots(map_pin);
 }
 
 /// Populate a synthetic `sun.util.resources.LocaleNames` (English) bundle map.
@@ -28921,6 +30888,9 @@ fn populate_locale_names_en(ctx: &mut dyn NativeContext, map: ObjectRef) {
     // Minimal language/country names that cover the common queries; for any
     // missing key callers fall back to the locale code via getDisplayName
     // overrides we register elsewhere.
+    // Pin across the per-entry allocations below — a moving young GC there
+    // would relocate `map` (native stale-local family).
+    let map_pin = ctx.pin_native_root(map);
     let langs: &[(&str, &str)] = &[
         ("en", "English"),
         ("fr", "French"),
@@ -28959,30 +30929,39 @@ fn populate_locale_names_en(ctx: &mut dyn NativeContext, map: ObjectRef) {
         ("ZA", "South Africa"),
     ];
     for (k, v) in langs {
-        put_str(ctx, map, k, v);
+        put_str(ctx, map_pin, map, k, v);
     }
     for (k, v) in countries {
-        put_str(ctx, map, k, v);
+        put_str(ctx, map_pin, map, k, v);
     }
+    ctx.unpin_native_roots(map_pin);
 }
 
 /// Populate a synthetic `sun.util.resources.CalendarData` (English) bundle map.
 fn populate_calendar_data_en(ctx: &mut dyn NativeContext, map: ObjectRef) {
-    put_str(ctx, map, "firstDayOfWeek", "1"); // Sunday
-    put_str(ctx, map, "minimalDaysInFirstWeek", "1");
+    // Pin across the per-entry allocations below — a moving young GC there
+    // would relocate `map` (native stale-local family).
+    let map_pin = ctx.pin_native_root(map);
+    put_str(ctx, map_pin, map, "firstDayOfWeek", "1"); // Sunday
+    put_str(ctx, map_pin, map, "minimalDaysInFirstWeek", "1");
+    ctx.unpin_native_roots(map_pin);
 }
 
 /// Populate a synthetic `sun.util.resources.CurrencyNames` bundle map.
 fn populate_currency_names_en(ctx: &mut dyn NativeContext, map: ObjectRef) {
-    put_str(ctx, map, "USD", "US Dollar");
-    put_str(ctx, map, "EUR", "Euro");
-    put_str(ctx, map, "GBP", "British Pound");
-    put_str(ctx, map, "JPY", "Japanese Yen");
-    put_str(ctx, map, "CNY", "Chinese Yuan");
-    put_str(ctx, map, "usd", "$");
-    put_str(ctx, map, "eur", "\u{20AC}");
-    put_str(ctx, map, "gbp", "\u{00A3}");
-    put_str(ctx, map, "jpy", "\u{00A5}");
+    // Pin across the per-entry allocations below — a moving young GC there
+    // would relocate `map` (native stale-local family).
+    let map_pin = ctx.pin_native_root(map);
+    put_str(ctx, map_pin, map, "USD", "US Dollar");
+    put_str(ctx, map_pin, map, "EUR", "Euro");
+    put_str(ctx, map_pin, map, "GBP", "British Pound");
+    put_str(ctx, map_pin, map, "JPY", "Japanese Yen");
+    put_str(ctx, map_pin, map, "CNY", "Chinese Yuan");
+    put_str(ctx, map_pin, map, "usd", "$");
+    put_str(ctx, map_pin, map, "eur", "\u{20AC}");
+    put_str(ctx, map_pin, map, "gbp", "\u{00A3}");
+    put_str(ctx, map_pin, map, "jpy", "\u{00A5}");
+    ctx.unpin_native_roots(map_pin);
 }
 
 /// Load a ResourceBundle from a .properties file on the classpath, with a
@@ -28995,8 +30974,15 @@ fn resource_bundle_get_bundle(ctx: &mut dyn NativeContext, args: &[Value]) -> Me
         _ => String::new(),
     };
     let obj = alloc_concurrent_synthetic(ctx, "java/util/ResourceBundle", 2);
+    // Pin across the map alloc / per-entry puts below — a moving young GC
+    // there would relocate the fresh bundle and map (native stale-local
+    // family).
+    let obj_pin = ctx.pin_native_root(obj);
     let map = alloc_concurrent_synthetic(ctx, "java/util/HashMap", 3);
+    let map_pin = ctx.pin_native_root(map);
     cratonvm_native_collections::native_map_init(ctx, &[Value::Object(Some(map))]).ok();
+    let obj = ctx.read_native_pin(obj_pin, obj);
+    let map = ctx.read_native_pin(map_pin, map);
     ctx.set_field(obj, 0, Value::Object(Some(map)));
     ctx.set_field(obj, 1, Value::Object(None));
 
@@ -29016,7 +31002,11 @@ fn resource_bundle_get_bundle(ctx: &mut dyn NativeContext, args: &[Value]) -> Me
                     let key = line[..pos].trim();
                     let value = line[pos + 1..].trim();
                     let k = ctx.create_string(key);
+                    let k_pin = ctx.pin_native_root(k);
                     let v = ctx.create_string(value);
+                    let map = ctx.read_native_pin(map_pin, map);
+                    let k = ctx.read_native_pin(k_pin, k);
+                    ctx.unpin_native_roots(k_pin);
                     cratonvm_native_collections::native_map_put_pub(
                         ctx,
                         &[
@@ -29040,6 +31030,7 @@ fn resource_bundle_get_bundle(ctx: &mut dyn NativeContext, args: &[Value]) -> Me
     // minimum.
     if !populated_from_props {
         let bn = bundle_name.as_str();
+        let map = ctx.read_native_pin(map_pin, map);
         if bn.starts_with("sun.text.resources.FormatData")
             || bn.starts_with("sun.text.resources.cldr.FormatData")
             || bn.starts_with("sun.text.resources.ext.FormatData")
@@ -29061,6 +31052,8 @@ fn resource_bundle_get_bundle(ctx: &mut dyn NativeContext, args: &[Value]) -> Me
         }
     }
 
+    let obj = ctx.read_native_pin(obj_pin, obj);
+    ctx.unpin_native_roots(obj_pin);
     Ok(Some(Value::Object(Some(obj))))
 }
 
@@ -30114,9 +32107,18 @@ fn native_p64_ll_get_last(ctx: &mut dyn NativeContext, args: &[Value]) -> Method
 
 // Helper: create Map$Entry from key + value
 fn p64_make_entry(ctx: &mut dyn NativeContext, key: Value, value: Value) -> ObjectRef {
+    // Pin across the entry alloc below — a moving young GC there would
+    // relocate the key/value (native stale-local family).
+    let key_pin = pinned_object_value(ctx, key);
+    let value_pin = pinned_object_value(ctx, value);
     let entry = alloc_concurrent_synthetic(ctx, "java/util/HashMap$Entry", 2);
+    let key = read_pinned_object_value(ctx, key_pin, key);
+    let value = read_pinned_object_value(ctx, value_pin, value);
     ctx.set_field(entry, 0, key);
     ctx.set_field(entry, 1, value);
+    if let Some((h, _)) = key_pin.or(value_pin) {
+        ctx.unpin_native_roots(h);
+    }
     entry
 }
 
@@ -42715,48 +44717,77 @@ fn xml_build_dom(ctx: &mut dyn NativeContext, node: &XmlNode) -> ObjectRef {
             children,
         } => {
             let elem = alloc_concurrent_synthetic(ctx, "org/w3c/dom/Element", 5);
+            // Pin across the string/attr/child allocs below — a moving young
+            // GC there would relocate the fresh element/arrays (native
+            // stale-local family).
+            let elem_pin = ctx.pin_native_root(elem);
             let tag_s = ctx.create_string(tag);
-            ctx.set_field(elem, 0, Value::Object(Some(tag_s))); // tag_name
+            let elem_cur = ctx.read_native_pin(elem_pin, elem);
+            ctx.set_field(elem_cur, 0, Value::Object(Some(tag_s))); // tag_name
 
             // Build attributes array
             let attrs_arr = ctx.new_array(
                 cratonvm_types::ArrayElementType::Reference,
                 attributes.len(),
             );
+            let attrs_pin = ctx.pin_native_root(attrs_arr);
             for (i, (name, value)) in attributes.iter().enumerate() {
                 let attr = alloc_concurrent_synthetic(ctx, "org/w3c/dom/Attr", 2);
+                let attr_pin = ctx.pin_native_root(attr);
                 let n = ctx.create_string(name);
+                let n_pin = ctx.pin_native_root(n);
                 let v = ctx.create_string(value);
+                let attr = ctx.read_native_pin(attr_pin, attr);
+                let n = ctx.read_native_pin(n_pin, n);
                 ctx.set_field(attr, 0, Value::Object(Some(n)));
                 ctx.set_field(attr, 1, Value::Object(Some(v)));
+                let attrs_arr = ctx.read_native_pin(attrs_pin, attrs_arr);
                 ctx.set_array_element(attrs_arr, i, Value::Object(Some(attr)));
+                ctx.unpin_native_roots(attr_pin);
             }
-            ctx.set_field(elem, 1, Value::Object(Some(attrs_arr))); // attributes
+            let elem_cur = ctx.read_native_pin(elem_pin, elem);
+            let attrs_arr = ctx.read_native_pin(attrs_pin, attrs_arr);
+            ctx.set_field(elem_cur, 1, Value::Object(Some(attrs_arr))); // attributes
 
             // Build children array
             let children_arr =
                 ctx.new_array(cratonvm_types::ArrayElementType::Reference, children.len());
+            let children_pin = ctx.pin_native_root(children_arr);
             for (i, child) in children.iter().enumerate() {
                 let child_obj = xml_build_dom(ctx, child);
+                let children_arr = ctx.read_native_pin(children_pin, children_arr);
                 ctx.set_array_element(children_arr, i, Value::Object(Some(child_obj)));
             }
-            ctx.set_field(elem, 2, Value::Object(Some(children_arr))); // children
-            ctx.set_field(elem, 3, Value::Int(children.len() as i32)); // child_count
-            ctx.set_field(elem, 4, Value::Object(None)); // parent (set later if needed)
-            elem
+            let elem_cur = ctx.read_native_pin(elem_pin, elem);
+            let children_arr = ctx.read_native_pin(children_pin, children_arr);
+            ctx.set_field(elem_cur, 2, Value::Object(Some(children_arr))); // children
+            ctx.set_field(elem_cur, 3, Value::Int(children.len() as i32)); // child_count
+            ctx.set_field(elem_cur, 4, Value::Object(None)); // parent (set later if needed)
+            ctx.unpin_native_roots(elem_pin);
+            elem_cur
         }
         XmlNode::Text(text) | XmlNode::CData(text) => {
             let t = alloc_concurrent_synthetic(ctx, "org/w3c/dom/Text", 2);
+            // Pin across the create_string below — a moving young GC there
+            // would relocate the fresh node (native stale-local family).
+            let t_pin = ctx.pin_native_root(t);
             let s = ctx.create_string(text);
+            let t = ctx.read_native_pin(t_pin, t);
             ctx.set_field(t, 0, Value::Object(Some(s)));
             ctx.set_field(t, 1, Value::Object(None)); // parent
+            ctx.unpin_native_roots(t_pin);
             t
         }
         XmlNode::Comment(text) => {
             let c = alloc_concurrent_synthetic(ctx, "org/w3c/dom/Comment", 2);
+            // Pin across the create_string below — a moving young GC there
+            // would relocate the fresh node (native stale-local family).
+            let c_pin = ctx.pin_native_root(c);
             let s = ctx.create_string(text);
+            let c = ctx.read_native_pin(c_pin, c);
             ctx.set_field(c, 0, Value::Object(Some(s)));
             ctx.set_field(c, 1, Value::Object(None));
+            ctx.unpin_native_roots(c_pin);
             c
         }
     }
@@ -42764,31 +44795,44 @@ fn xml_build_dom(ctx: &mut dyn NativeContext, node: &XmlNode) -> ObjectRef {
 
 /// Read all bytes from an InputStream and return as a String
 fn xml_read_input_stream(ctx: &mut dyn NativeContext, is: ObjectRef) -> String {
+    // Pin across the read callbacks below — a moving young GC there would
+    // relocate the stream (native stale-local family).
+    let is_pin = ctx.pin_native_root(is);
     let mut bytes = Vec::new();
     loop {
+        let is = ctx.read_native_pin(is_pin, is);
         match ctx.invoke_virtual(is, "read", "()I", &[]) {
             Ok(Some(Value::Int(b))) if b >= 0 => bytes.push(b as u8),
             _ => break,
         }
     }
+    ctx.unpin_native_roots(is_pin);
     String::from_utf8_lossy(&bytes).to_string()
 }
 
 /// Parse XML string and build DOM document
 fn xml_parse_to_document(ctx: &mut dyn NativeContext, xml_text: &str) -> ObjectRef {
-    let doc = alloc_concurrent_synthetic(ctx, "org/w3c/dom/Document", 2);
+    let mut doc = alloc_concurrent_synthetic(ctx, "org/w3c/dom/Document", 2);
+    // Pin across the DOM build below — a moving young GC there would relocate
+    // the fresh Document (native stale-local family).
+    let doc_pin = ctx.pin_native_root(doc);
     if let Some(root_node) = xml_parse(xml_text) {
         let root_obj = xml_build_dom(ctx, &root_node);
+        doc = ctx.read_native_pin(doc_pin, doc);
         ctx.set_field(doc, 0, Value::Object(Some(root_obj)));
     } else {
         ctx.set_field(doc, 0, Value::Object(None));
     }
     ctx.set_field(doc, 1, Value::Object(None)); // doc_type
+    ctx.unpin_native_roots(doc_pin);
     doc
 }
 
 /// Walk a DOM tree for SAX callbacks
 fn sax_walk(ctx: &mut dyn NativeContext, handler: ObjectRef, node: &XmlNode) {
+    // Pin across the string/attr allocs and SAX callbacks below — a moving
+    // young GC there would relocate `handler` (native stale-local family).
+    let handler_pin = ctx.pin_native_root(handler);
     match node {
         XmlNode::Element {
             tag,
@@ -42797,25 +44841,40 @@ fn sax_walk(ctx: &mut dyn NativeContext, handler: ObjectRef, node: &XmlNode) {
         } => {
             // Build Attributes object for startElement
             let uri = ctx.create_string("");
+            let uri_pin = ctx.pin_native_root(uri);
             let tag_s = ctx.create_string(tag);
+            let tag_pin = ctx.pin_native_root(tag_s);
             let qname = ctx.create_string(tag);
+            let qname_pin = ctx.pin_native_root(qname);
             // SAX Attributes = synthetic with attr data
             let sax_attrs =
                 alloc_concurrent_synthetic(ctx, "org/xml/sax/helpers/AttributesImpl", 1);
+            let sax_attrs_pin = ctx.pin_native_root(sax_attrs);
             let attrs_arr = ctx.new_array(
                 cratonvm_types::ArrayElementType::Reference,
                 attributes.len() * 2,
             );
+            let attrs_arr_pin = ctx.pin_native_root(attrs_arr);
             for (i, (name, value)) in attributes.iter().enumerate() {
                 let n = ctx.create_string(name);
+                let n_pin = ctx.pin_native_root(n);
                 let v = ctx.create_string(value);
+                let n = ctx.read_native_pin(n_pin, n);
+                let attrs_arr = ctx.read_native_pin(attrs_arr_pin, attrs_arr);
                 ctx.set_array_element(attrs_arr, i * 2, Value::Object(Some(n)));
                 ctx.set_array_element(attrs_arr, i * 2 + 1, Value::Object(Some(v)));
+                ctx.unpin_native_roots(n_pin);
             }
+            let sax_attrs = ctx.read_native_pin(sax_attrs_pin, sax_attrs);
+            let attrs_arr = ctx.read_native_pin(attrs_arr_pin, attrs_arr);
             ctx.set_field(sax_attrs, 0, Value::Object(Some(attrs_arr)));
 
+            let handler_cur = ctx.read_native_pin(handler_pin, handler);
+            let uri = ctx.read_native_pin(uri_pin, uri);
+            let tag_s = ctx.read_native_pin(tag_pin, tag_s);
+            let qname = ctx.read_native_pin(qname_pin, qname);
             let _ = ctx.invoke_virtual(
-                handler,
+                handler_cur,
                 "startElement",
                 "(Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;Lorg/xml/sax/Attributes;)V",
                 &[
@@ -42825,16 +44884,23 @@ fn sax_walk(ctx: &mut dyn NativeContext, handler: ObjectRef, node: &XmlNode) {
                     Value::Object(Some(sax_attrs)),
                 ],
             );
+            ctx.unpin_native_roots(uri_pin);
 
             for child in children {
-                sax_walk(ctx, handler, child);
+                let handler_cur = ctx.read_native_pin(handler_pin, handler);
+                sax_walk(ctx, handler_cur, child);
             }
 
             let uri2 = ctx.create_string("");
+            let uri2_pin = ctx.pin_native_root(uri2);
             let tag_s2 = ctx.create_string(tag);
+            let tag2_pin = ctx.pin_native_root(tag_s2);
             let qname2 = ctx.create_string(tag);
+            let handler_cur = ctx.read_native_pin(handler_pin, handler);
+            let uri2 = ctx.read_native_pin(uri2_pin, uri2);
+            let tag_s2 = ctx.read_native_pin(tag2_pin, tag_s2);
             let _ = ctx.invoke_virtual(
-                handler,
+                handler_cur,
                 "endElement",
                 "(Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;)V",
                 &[
@@ -42852,8 +44918,9 @@ fn sax_walk(ctx: &mut dyn NativeContext, handler: ObjectRef, node: &XmlNode) {
                     ctx.set_array_element(char_arr, i, Value::Int(ch as i32));
                 }
             }
+            let handler_cur = ctx.read_native_pin(handler_pin, handler);
             let _ = ctx.invoke_virtual(
-                handler,
+                handler_cur,
                 "characters",
                 "([CII)V",
                 &[
@@ -42865,6 +44932,7 @@ fn sax_walk(ctx: &mut dyn NativeContext, handler: ObjectRef, node: &XmlNode) {
         }
         XmlNode::Comment(_) => {} // SAX doesn't have a default comment handler
     }
+    ctx.unpin_native_roots(handler_pin);
 }
 
 /// Recursively collect elements matching a tag name
@@ -42875,13 +44943,20 @@ fn dom_get_elements_by_tag(
 ) -> MethodCallResult {
     let mut results = Vec::new();
     dom_collect_by_tag(ctx, elem, tag_name, &mut results);
+    // Pin across the NodeList/array allocs below — a moving young GC there
+    // would relocate the collected nodes (native stale-local family).
+    let result_pins: Vec<usize> = results.iter().map(|o| ctx.pin_native_root(*o)).collect();
     let nl = alloc_concurrent_synthetic(ctx, "org/w3c/dom/NodeList", 2);
+    let nl_pin = ctx.pin_native_root(nl);
     let arr = ctx.new_array(cratonvm_types::ArrayElementType::Reference, results.len());
+    let nl = ctx.read_native_pin(nl_pin, nl);
     for (i, obj) in results.iter().enumerate() {
-        ctx.set_array_element(arr, i, Value::Object(Some(*obj)));
+        let obj = ctx.read_native_pin(result_pins[i], *obj);
+        ctx.set_array_element(arr, i, Value::Object(Some(obj)));
     }
     ctx.set_field(nl, 0, Value::Object(Some(arr)));
     ctx.set_field(nl, 1, Value::Int(results.len() as i32));
+    ctx.unpin_native_roots(result_pins.first().copied().unwrap_or(nl_pin));
     Ok(Some(Value::Object(Some(nl))))
 }
 
@@ -43926,7 +46001,14 @@ pub(crate) fn register_p69_spliterator(r: &mut NativeMethodRegistry) {
                 Some(Value::Object(Some(c))) => *c,
                 _ => return Ok(None),
             };
+            // Pin across the consumer callbacks below — a moving young GC
+            // there would relocate them (native stale-local family).
+            let this_pin = ctx.pin_native_root(this);
+            let arr_pin = ctx.pin_native_root(arr);
+            let consumer_pin = ctx.pin_native_root(consumer);
             while pos < fence {
+                let arr = ctx.read_native_pin(arr_pin, arr);
+                let consumer = ctx.read_native_pin(consumer_pin, consumer);
                 let elem = ctx.get_array_element(arr, pos);
                 let _ = ctx.invoke_virtual(
                     consumer,
@@ -43936,7 +46018,9 @@ pub(crate) fn register_p69_spliterator(r: &mut NativeMethodRegistry) {
                 );
                 pos += 1;
             }
+            let this = ctx.read_native_pin(this_pin, this);
             ctx.set_field(this, 1, Value::Int(fence as i32));
+            ctx.unpin_native_roots(this_pin);
             Ok(None)
         },
     );
@@ -45759,6 +47843,9 @@ pub(crate) fn register_p70_file_attributes(r: &mut NativeMethodRegistry) {
             );
             let chars: Vec<char> = perms.chars().collect();
             let pfp = "java/nio/file/attribute/PosixFilePermission";
+            // Pin across the clinit / add() invokes below — a moving young GC
+            // there would relocate the fresh set (native stale-local family).
+            let set_pin = ctx.pin_native_root(set);
             let _ = ctx.ensure_class_initialized(pfp);
             let cid = ctx.class_id_by_name(pfp);
             for i in 0..9 {
@@ -45767,6 +47854,7 @@ pub(crate) fn register_p70_file_attributes(r: &mut NativeMethodRegistry) {
                         if let Some(slot) = ctx.static_field_index_by_name(c, PFP_NAMES[i]) {
                             let constant = ctx.get_static_field(c, slot);
                             if matches!(constant, Value::Object(Some(_))) {
+                                let set = ctx.read_native_pin(set_pin, set);
                                 let _ = ctx.invoke_virtual(
                                     set,
                                     "add",
@@ -45778,6 +47866,8 @@ pub(crate) fn register_p70_file_attributes(r: &mut NativeMethodRegistry) {
                     }
                 }
             }
+            let set = ctx.read_native_pin(set_pin, set);
+            ctx.unpin_native_roots(set_pin);
             Ok(Some(Value::Object(Some(set))))
         },
     );
@@ -45808,9 +47898,14 @@ pub(crate) fn register_p70_file_attributes(r: &mut NativeMethodRegistry) {
 
 /// Write bytes to an OutputStream via invoke_virtual
 fn oos_write_bytes(ctx: &mut dyn NativeContext, stream: ObjectRef, bytes: &[u8]) {
+    // Pin across the write callbacks below — a moving young GC there would
+    // relocate the stream (native stale-local family).
+    let stream_pin = ctx.pin_native_root(stream);
     for &b in bytes {
+        let stream = ctx.read_native_pin(stream_pin, stream);
         let _ = ctx.invoke_virtual(stream, "write", "(I)V", &[Value::Int(b as i32)]);
     }
+    ctx.unpin_native_roots(stream_pin);
 }
 
 /// Read a single byte from an InputStream. Returns -1 on EOF.
@@ -45823,14 +47918,19 @@ fn ois_read_byte(ctx: &mut dyn NativeContext, stream: ObjectRef) -> i32 {
 
 /// Read exactly n bytes from an InputStream. Returns empty vec on EOF.
 fn ois_read_n(ctx: &mut dyn NativeContext, stream: ObjectRef, n: usize) -> Vec<u8> {
+    // Pin across the read callbacks below — a moving young GC there would
+    // relocate the stream (native stale-local family).
+    let stream_pin = ctx.pin_native_root(stream);
     let mut result = Vec::with_capacity(n);
     for _ in 0..n {
+        let stream = ctx.read_native_pin(stream_pin, stream);
         let b = ois_read_byte(ctx, stream);
         if b < 0 {
             break;
         }
         result.push(b as u8);
     }
+    ctx.unpin_native_roots(stream_pin);
     result
 }
 
@@ -46588,12 +48688,19 @@ pub(crate) fn register_p70_misc(r: &mut NativeMethodRegistry) {
         |ctx, _args| {
             // Use same layout as existing EnumSet: field 0 = ArrayList backing, field 1 = type
             let set = alloc_concurrent_synthetic(ctx, "java/util/EnumSet", 2);
+            // Pin across the array/backing allocs below — a moving young GC
+            // there would relocate them (native stale-local family).
+            let set_pin = ctx.pin_native_root(set);
             let arr = ctx.new_array(cratonvm_types::ArrayElementType::Reference, 0);
+            let arr_pin = ctx.pin_native_root(arr);
             let backing = alloc_concurrent_synthetic(ctx, "java/util/ArrayList", 2);
+            let set = ctx.read_native_pin(set_pin, set);
+            let arr = ctx.read_native_pin(arr_pin, arr);
             ctx.set_field(backing, 0, Value::Object(Some(arr)));
             ctx.set_field(backing, 1, Value::Int(0));
             ctx.set_field(set, 0, Value::Object(Some(backing)));
             ctx.set_field(set, 1, Value::Object(None));
+            ctx.unpin_native_roots(set_pin);
             Ok(Some(Value::Object(Some(set))))
         },
     );
@@ -46603,12 +48710,19 @@ pub(crate) fn register_p70_misc(r: &mut NativeMethodRegistry) {
         "(Ljava/lang/Enum;Ljava/lang/Enum;)Ljava/util/EnumSet;",
         |ctx, _args| {
             let set = alloc_concurrent_synthetic(ctx, "java/util/EnumSet", 2);
+            // Pin across the array/backing allocs below — a moving young GC
+            // there would relocate them (native stale-local family).
+            let set_pin = ctx.pin_native_root(set);
             let arr = ctx.new_array(cratonvm_types::ArrayElementType::Reference, 0);
+            let arr_pin = ctx.pin_native_root(arr);
             let backing = alloc_concurrent_synthetic(ctx, "java/util/ArrayList", 2);
+            let set = ctx.read_native_pin(set_pin, set);
+            let arr = ctx.read_native_pin(arr_pin, arr);
             ctx.set_field(backing, 0, Value::Object(Some(arr)));
             ctx.set_field(backing, 1, Value::Int(0));
             ctx.set_field(set, 0, Value::Object(Some(backing)));
             ctx.set_field(set, 1, Value::Object(None));
+            ctx.unpin_native_roots(set_pin);
             Ok(Some(Value::Object(Some(set))))
         },
     );
@@ -48282,7 +50396,13 @@ pub(crate) fn register_p71_files_bridge(r: &mut NativeMethodRegistry) {
             match std::fs::read(&p) {
                 Ok(data) => {
                     let stream = alloc_concurrent_synthetic(ctx, "java/io/ByteArrayInputStream", 4);
+                    // Pin across the array alloc below — a moving young GC
+                    // there would relocate the fresh stream (native
+                    // stale-local family).
+                    let stream_pin = ctx.pin_native_root(stream);
                     let arr = ctx.new_array(cratonvm_types::ArrayElementType::Byte, data.len());
+                    let stream = ctx.read_native_pin(stream_pin, stream);
+                    ctx.unpin_native_roots(stream_pin);
                     for (i, &b) in data.iter().enumerate() {
                         ctx.set_array_element(arr, i, Value::Int(b as i8 as i32));
                     }
@@ -48368,10 +50488,15 @@ pub(crate) fn register_p71_files_bridge(r: &mut NativeMethodRegistry) {
         "(Ljava/nio/file/Path;Ljava/lang/String;[Ljava/nio/file/LinkOption;)Ljava/util/Map;",
         |ctx, _args| {
             let map = alloc_concurrent_synthetic(ctx, "java/util/HashMap", 3);
+            // Pin across the buckets alloc below — a moving young GC there
+            // would relocate the fresh map (native stale-local family).
+            let map_pin = ctx.pin_native_root(map);
             let buckets = ctx.new_array(cratonvm_types::ArrayElementType::Reference, 16);
+            let map = ctx.read_native_pin(map_pin, map);
             ctx.set_field(map, 0, Value::Object(Some(buckets)));
             ctx.set_field(map, 1, Value::Int(0));
             ctx.set_field(map, 2, Value::Int(16));
+            ctx.unpin_native_roots(map_pin);
             Ok(Some(Value::Object(Some(map))))
         },
     );
@@ -48446,37 +50571,33 @@ pub(crate) fn register_p71_thread_extras(r: &mut NativeMethodRegistry) {
     );
     r.register(ts, "values", "()[Ljava/lang/Thread$State;", |ctx, _args| {
         let arr = ctx.new_array(cratonvm_types::ArrayElementType::Reference, 6);
+        // Pin across the per-state allocs below — a moving young GC there
+        // would relocate the fresh array/states (native stale-local family).
+        let arr_pin = ctx.pin_native_root(arr);
         // Inline each state (no captures allowed)
-        let e0 = alloc_concurrent_synthetic(ctx, "java/lang/Thread$State", 2);
-        let n0 = ctx.create_string("NEW");
-        ctx.set_field(e0, 0, Value::Object(Some(n0)));
-        ctx.set_field(e0, 1, Value::Int(0));
-        ctx.set_array_element(arr, 0, Value::Object(Some(e0)));
-        let e1 = alloc_concurrent_synthetic(ctx, "java/lang/Thread$State", 2);
-        let n1 = ctx.create_string("RUNNABLE");
-        ctx.set_field(e1, 0, Value::Object(Some(n1)));
-        ctx.set_field(e1, 1, Value::Int(1));
-        ctx.set_array_element(arr, 1, Value::Object(Some(e1)));
-        let e2 = alloc_concurrent_synthetic(ctx, "java/lang/Thread$State", 2);
-        let n2 = ctx.create_string("BLOCKED");
-        ctx.set_field(e2, 0, Value::Object(Some(n2)));
-        ctx.set_field(e2, 1, Value::Int(2));
-        ctx.set_array_element(arr, 2, Value::Object(Some(e2)));
-        let e3 = alloc_concurrent_synthetic(ctx, "java/lang/Thread$State", 2);
-        let n3 = ctx.create_string("WAITING");
-        ctx.set_field(e3, 0, Value::Object(Some(n3)));
-        ctx.set_field(e3, 1, Value::Int(3));
-        ctx.set_array_element(arr, 3, Value::Object(Some(e3)));
-        let e4 = alloc_concurrent_synthetic(ctx, "java/lang/Thread$State", 2);
-        let n4 = ctx.create_string("TIMED_WAITING");
-        ctx.set_field(e4, 0, Value::Object(Some(n4)));
-        ctx.set_field(e4, 1, Value::Int(4));
-        ctx.set_array_element(arr, 4, Value::Object(Some(e4)));
-        let e5 = alloc_concurrent_synthetic(ctx, "java/lang/Thread$State", 2);
-        let n5 = ctx.create_string("TERMINATED");
-        ctx.set_field(e5, 0, Value::Object(Some(n5)));
-        ctx.set_field(e5, 1, Value::Int(5));
-        ctx.set_array_element(arr, 5, Value::Object(Some(e5)));
+        for (i, name) in [
+            "NEW",
+            "RUNNABLE",
+            "BLOCKED",
+            "WAITING",
+            "TIMED_WAITING",
+            "TERMINATED",
+        ]
+        .iter()
+        .enumerate()
+        {
+            let e = alloc_concurrent_synthetic(ctx, "java/lang/Thread$State", 2);
+            let e_pin = ctx.pin_native_root(e);
+            let n = ctx.create_string(name);
+            let e = ctx.read_native_pin(e_pin, e);
+            ctx.set_field(e, 0, Value::Object(Some(n)));
+            ctx.set_field(e, 1, Value::Int(i as i32));
+            let arr = ctx.read_native_pin(arr_pin, arr);
+            ctx.set_array_element(arr, i, Value::Object(Some(e)));
+            ctx.unpin_native_roots(e_pin);
+        }
+        let arr = ctx.read_native_pin(arr_pin, arr);
+        ctx.unpin_native_roots(arr_pin);
         Ok(Some(Value::Object(Some(arr))))
     });
 
@@ -49272,11 +51393,19 @@ pub(crate) fn register_phase72_natives(registry: &mut NativeMethodRegistry) {
 
 fn p72_alloc_prefs(ctx: &mut dyn NativeContext) -> ObjectRef {
     let prefs = alloc_concurrent_synthetic(ctx, "java/util/prefs/Preferences", 2);
+    // Pin across the map/string allocs below — a moving young GC there would
+    // relocate them (native stale-local family).
+    let prefs_pin = ctx.pin_native_root(prefs);
     let map = alloc_concurrent_synthetic(ctx, "java/util/HashMap", 3);
+    let map_pin = ctx.pin_native_root(map);
     cratonvm_native_collections::native_map_init(ctx, &[Value::Object(Some(map))]).ok();
+    let prefs = ctx.read_native_pin(prefs_pin, prefs);
+    let map = ctx.read_native_pin(map_pin, map);
     ctx.set_field(prefs, 0, Value::Object(Some(map)));
     let name_str = ctx.create_string("");
+    let prefs = ctx.read_native_pin(prefs_pin, prefs);
     ctx.set_field(prefs, 1, Value::Object(Some(name_str)));
+    ctx.unpin_native_roots(prefs_pin);
     prefs
 }
 
@@ -49284,9 +51413,16 @@ fn p72_prefs_map(ctx: &mut dyn NativeContext, this: ObjectRef) -> ObjectRef {
     match ctx.get_field(this, 0) {
         Value::Object(Some(m)) => m,
         _ => {
+            // Pin across the map alloc/init below — a moving young GC there
+            // would relocate `this` (native stale-local family).
+            let this_pin = ctx.pin_native_root(this);
             let map = alloc_concurrent_synthetic(ctx, "java/util/HashMap", 3);
+            let map_pin = ctx.pin_native_root(map);
             cratonvm_native_collections::native_map_init(ctx, &[Value::Object(Some(map))]).ok();
+            let this = ctx.read_native_pin(this_pin, this);
+            let map = ctx.read_native_pin(map_pin, map);
             ctx.set_field(this, 0, Value::Object(Some(map)));
+            ctx.unpin_native_roots(this_pin);
             map
         }
     }
@@ -49338,11 +51474,19 @@ pub(crate) fn register_p72_preferences(r: &mut NativeMethodRegistry) {
         );
         r.register(cls, "<init>", "()V", |ctx, args| {
             let this = obj_arg(args, 0)?;
+            // Pin across the map/string allocs below — a moving young GC there
+            // would relocate them (native stale-local family).
+            let this_pin = ctx.pin_native_root(this);
             let map = alloc_concurrent_synthetic(ctx, "java/util/HashMap", 3);
+            let map_pin = ctx.pin_native_root(map);
             cratonvm_native_collections::native_map_init(ctx, &[Value::Object(Some(map))]).ok();
+            let this = ctx.read_native_pin(this_pin, this);
+            let map = ctx.read_native_pin(map_pin, map);
             ctx.set_field(this, 0, Value::Object(Some(map)));
             let name_str = ctx.create_string("");
+            let this = ctx.read_native_pin(this_pin, this);
             ctx.set_field(this, 1, Value::Object(Some(name_str)));
+            ctx.unpin_native_roots(this_pin);
             Ok(None)
         });
         r.register(
@@ -49351,8 +51495,15 @@ pub(crate) fn register_p72_preferences(r: &mut NativeMethodRegistry) {
             "(Ljava/lang/String;)Ljava/util/prefs/Preferences;",
             |ctx, args| {
                 let name_val = args.get(1).copied().unwrap_or(Value::Object(None));
+                // Pin across the prefs alloc below — a moving young GC there
+                // would relocate it (native stale-local family).
+                let name_pin = pinned_object_value(ctx, name_val);
                 let p = p72_alloc_prefs(ctx);
+                let name_val = read_pinned_object_value(ctx, name_pin, name_val);
                 ctx.set_field(p, 1, name_val);
+                if let Some((h, _)) = name_pin {
+                    ctx.unpin_native_roots(h);
+                }
                 Ok(Some(Value::Object(Some(p))))
             },
         );
@@ -49664,6 +51815,10 @@ fn pcs_dispatch(ctx: &mut dyn NativeContext, pcs_this: ObjectRef, event: ObjectR
         Value::Object(Some(l)) => l,
         _ => return,
     };
+    // Pin across the listener callbacks below — a moving young GC there would
+    // relocate `listeners`/`event` (native stale-local family).
+    let listeners_pin = ctx.pin_native_root(listeners);
+    let event_pin = ctx.pin_native_root(event);
     // Get listener count
     let size =
         match cratonvm_native_collections::native_al_size(ctx, &[Value::Object(Some(listeners))]) {
@@ -49671,6 +51826,7 @@ fn pcs_dispatch(ctx: &mut dyn NativeContext, pcs_this: ObjectRef, event: ObjectR
             _ => 0,
         };
     for i in 0..size {
+        let listeners = ctx.read_native_pin(listeners_pin, listeners);
         let listener_val = match cratonvm_native_collections::native_al_get(
             ctx,
             &[Value::Object(Some(listeners)), Value::Int(i)],
@@ -49679,6 +51835,7 @@ fn pcs_dispatch(ctx: &mut dyn NativeContext, pcs_this: ObjectRef, event: ObjectR
             _ => continue,
         };
         if let Value::Object(Some(listener)) = listener_val {
+            let event = ctx.read_native_pin(event_pin, event);
             // Best-effort dispatch — ignore individual listener errors so all listeners get notified.
             let _ = ctx.invoke_virtual(
                 listener,
@@ -49688,6 +51845,7 @@ fn pcs_dispatch(ctx: &mut dyn NativeContext, pcs_this: ObjectRef, event: ObjectR
             );
         }
     }
+    ctx.unpin_native_roots(listeners_pin);
 }
 
 pub(crate) fn register_p72_beans(r: &mut NativeMethodRegistry) {
@@ -49739,9 +51897,16 @@ pub(crate) fn register_p72_beans(r: &mut NativeMethodRegistry) {
     r.register(pcs, "<init>", "(Ljava/lang/Object;)V", |ctx, args| {
         let this = obj_arg(args, 0)?;
         ctx.set_field(this, 0, args.get(1).copied().unwrap_or(Value::Object(None)));
+        // Pin across the list alloc/init below — a moving young GC there would
+        // relocate `this` (native stale-local family).
+        let this_pin = ctx.pin_native_root(this);
         let lst = alloc_concurrent_synthetic(ctx, "java/util/ArrayList", 2);
+        let lst_pin = ctx.pin_native_root(lst);
         cratonvm_native_collections::native_al_init(ctx, &[Value::Object(Some(lst))]).ok();
+        let this = ctx.read_native_pin(this_pin, this);
+        let lst = ctx.read_native_pin(lst_pin, lst);
         ctx.set_field(this, 1, Value::Object(Some(lst)));
+        ctx.unpin_native_roots(this_pin);
         Ok(None)
     });
     r.register(
@@ -49850,12 +52015,21 @@ pub(crate) fn register_p72_beans(r: &mut NativeMethodRegistry) {
                 return Ok(None);
             }
             // Build a PropertyChangeEvent (4-field: source, propertyName, oldValue, newValue)
+            // Pin across the event alloc below — a moving young GC there would
+            // relocate them (native stale-local family).
+            let this_pin = ctx.pin_native_root(this);
+            let prop_pin = pinned_object_value(ctx, prop_name);
+            let old_pin = pinned_object_value(ctx, old_val);
+            let new_pin = pinned_object_value(ctx, new_val);
             let source = ctx.get_field(this, 0);
+            let source_pin = pinned_object_value(ctx, source);
             let event = alloc_concurrent_synthetic(ctx, "java/beans/PropertyChangeEvent", 4);
-            ctx.set_field(event, 0, source);
-            ctx.set_field(event, 1, prop_name);
-            ctx.set_field(event, 2, old_val);
-            ctx.set_field(event, 3, new_val);
+            ctx.set_field(event, 0, read_pinned_object_value(ctx, source_pin, source));
+            ctx.set_field(event, 1, read_pinned_object_value(ctx, prop_pin, prop_name));
+            ctx.set_field(event, 2, read_pinned_object_value(ctx, old_pin, old_val));
+            ctx.set_field(event, 3, read_pinned_object_value(ctx, new_pin, new_val));
+            let this = ctx.read_native_pin(this_pin, this);
+            ctx.unpin_native_roots(this_pin);
             pcs_dispatch(ctx, this, event);
             Ok(None)
         },
@@ -49868,17 +52042,30 @@ pub(crate) fn register_p72_beans(r: &mut NativeMethodRegistry) {
             let this = obj_arg(args, 0)?;
             let prop_name = args.get(1).copied().unwrap_or(Value::Object(None));
             let old_int = args.get(2).and_then(|v| v.as_int()).unwrap_or(0);
-            let old_box = pcs_box_int(ctx, old_int);
             let new_val = args.get(3).copied().unwrap_or(Value::Object(None));
+            // Pin across the box/event allocs below — a moving young GC there
+            // would relocate them (native stale-local family).
+            let this_pin = ctx.pin_native_root(this);
+            let prop_pin = pinned_object_value(ctx, prop_name);
+            let new_pin = pinned_object_value(ctx, new_val);
+            let old_box = pcs_box_int(ctx, old_int);
+            let old_box_pin = ctx.pin_native_root(old_box);
+            let new_val = read_pinned_object_value(ctx, new_pin, new_val);
             if pcs_values_equal(&Value::Object(Some(old_box)), &new_val) {
+                ctx.unpin_native_roots(this_pin);
                 return Ok(None);
             }
-            let source = ctx.get_field(this, 0);
+            let this_cur = ctx.read_native_pin(this_pin, this);
+            let source = ctx.get_field(this_cur, 0);
+            let source_pin = pinned_object_value(ctx, source);
             let event = alloc_concurrent_synthetic(ctx, "java/beans/PropertyChangeEvent", 4);
-            ctx.set_field(event, 0, source);
-            ctx.set_field(event, 1, prop_name);
+            ctx.set_field(event, 0, read_pinned_object_value(ctx, source_pin, source));
+            ctx.set_field(event, 1, read_pinned_object_value(ctx, prop_pin, prop_name));
+            let old_box = ctx.read_native_pin(old_box_pin, old_box);
             ctx.set_field(event, 2, Value::Object(Some(old_box)));
-            ctx.set_field(event, 3, new_val);
+            ctx.set_field(event, 3, read_pinned_object_value(ctx, new_pin, new_val));
+            let this = ctx.read_native_pin(this_pin, this);
+            ctx.unpin_native_roots(this_pin);
             pcs_dispatch(ctx, this, event);
             Ok(None)
         },
@@ -49895,14 +52082,26 @@ pub(crate) fn register_p72_beans(r: &mut NativeMethodRegistry) {
             if old_b == new_b {
                 return Ok(None);
             }
+            // Pin across the box/event allocs below — a moving young GC there
+            // would relocate them (native stale-local family).
+            let this_pin = ctx.pin_native_root(this);
+            let prop_pin = pinned_object_value(ctx, prop_name);
             let old_box = pcs_box_bool(ctx, old_b);
+            let old_box_pin = ctx.pin_native_root(old_box);
             let new_box = pcs_box_bool(ctx, new_b);
-            let source = ctx.get_field(this, 0);
+            let new_box_pin = ctx.pin_native_root(new_box);
+            let this_cur = ctx.read_native_pin(this_pin, this);
+            let source = ctx.get_field(this_cur, 0);
+            let source_pin = pinned_object_value(ctx, source);
             let event = alloc_concurrent_synthetic(ctx, "java/beans/PropertyChangeEvent", 4);
-            ctx.set_field(event, 0, source);
-            ctx.set_field(event, 1, prop_name);
+            ctx.set_field(event, 0, read_pinned_object_value(ctx, source_pin, source));
+            ctx.set_field(event, 1, read_pinned_object_value(ctx, prop_pin, prop_name));
+            let old_box = ctx.read_native_pin(old_box_pin, old_box);
+            let new_box = ctx.read_native_pin(new_box_pin, new_box);
             ctx.set_field(event, 2, Value::Object(Some(old_box)));
             ctx.set_field(event, 3, Value::Object(Some(new_box)));
+            let this = ctx.read_native_pin(this_pin, this);
+            ctx.unpin_native_roots(this_pin);
             pcs_dispatch(ctx, this, event);
             Ok(None)
         },
@@ -49919,14 +52118,26 @@ pub(crate) fn register_p72_beans(r: &mut NativeMethodRegistry) {
             if old_i == new_i {
                 return Ok(None);
             }
+            // Pin across the box/event allocs below — a moving young GC there
+            // would relocate them (native stale-local family).
+            let this_pin = ctx.pin_native_root(this);
+            let prop_pin = pinned_object_value(ctx, prop_name);
             let old_box = pcs_box_int(ctx, old_i);
+            let old_box_pin = ctx.pin_native_root(old_box);
             let new_box = pcs_box_int(ctx, new_i);
-            let source = ctx.get_field(this, 0);
+            let new_box_pin = ctx.pin_native_root(new_box);
+            let this_cur = ctx.read_native_pin(this_pin, this);
+            let source = ctx.get_field(this_cur, 0);
+            let source_pin = pinned_object_value(ctx, source);
             let event = alloc_concurrent_synthetic(ctx, "java/beans/PropertyChangeEvent", 4);
-            ctx.set_field(event, 0, source);
-            ctx.set_field(event, 1, prop_name);
+            ctx.set_field(event, 0, read_pinned_object_value(ctx, source_pin, source));
+            ctx.set_field(event, 1, read_pinned_object_value(ctx, prop_pin, prop_name));
+            let old_box = ctx.read_native_pin(old_box_pin, old_box);
+            let new_box = ctx.read_native_pin(new_box_pin, new_box);
             ctx.set_field(event, 2, Value::Object(Some(old_box)));
             ctx.set_field(event, 3, Value::Object(Some(new_box)));
+            let this = ctx.read_native_pin(this_pin, this);
+            ctx.unpin_native_roots(this_pin);
             pcs_dispatch(ctx, this, event);
             Ok(None)
         },
@@ -49985,9 +52196,16 @@ pub(crate) fn register_p72_beans(r: &mut NativeMethodRegistry) {
     r.register(vcs, "<init>", "(Ljava/lang/Object;)V", |ctx, args| {
         let this = obj_arg(args, 0)?;
         ctx.set_field(this, 0, args.get(1).copied().unwrap_or(Value::Object(None)));
+        // Pin across the list alloc/init below — a moving young GC there would
+        // relocate `this` (native stale-local family).
+        let this_pin = ctx.pin_native_root(this);
         let lst = alloc_concurrent_synthetic(ctx, "java/util/ArrayList", 2);
+        let lst_pin = ctx.pin_native_root(lst);
         cratonvm_native_collections::native_al_init(ctx, &[Value::Object(Some(lst))]).ok();
+        let this = ctx.read_native_pin(this_pin, this);
+        let lst = ctx.read_native_pin(lst_pin, lst);
         ctx.set_field(this, 1, Value::Object(Some(lst)));
+        ctx.unpin_native_roots(this_pin);
         Ok(None)
     });
     r.register(
@@ -50316,6 +52534,11 @@ fn introspector_get_bean_info(ctx: &mut dyn NativeContext, args: &[Value]) -> Me
             return Ok(Some(Value::Object(None)));
         }
     };
+    // Pin across the mirror/descriptor construction below — a moving young GC
+    // there would relocate `class_mirror` (native stale-local family). The pin
+    // stays live until the enclosing native returns (the VM truncates the pin
+    // vec at native exit), so the `?`-free early returns below need no unpin.
+    let class_mirror_pin = ctx.pin_native_root(class_mirror);
 
     // The argument is a `Class` *mirror*, so `class_id_of_object` returns
     // `java/lang/Class` itself. We need the represented class — use
@@ -50331,10 +52554,17 @@ fn introspector_get_bean_info(ctx: &mut dyn NativeContext, args: &[Value]) -> Me
             // getMethodDescriptors (slot 1) / getBeanDescriptor (slot 2) natives
             // read in-bounds.
             let pd_arr = ctx.new_ref_array(cratonvm_types::ClassId::new(0), 0);
+            // Pin across the sibling allocs below — a moving young GC there
+            // would relocate the fresh arrays (native stale-local family).
+            let pd_pin = ctx.pin_native_root(pd_arr);
             let md_arr = ctx.new_ref_array(cratonvm_types::ClassId::new(0), 0);
+            let md_pin = ctx.pin_native_root(md_arr);
             let bean_info = alloc_concurrent_synthetic(ctx, "java/beans/BeanInfo", 3);
+            let pd_arr = ctx.read_native_pin(pd_pin, pd_arr);
+            let md_arr = ctx.read_native_pin(md_pin, md_arr);
             ctx.set_field(bean_info, 0, Value::Object(Some(pd_arr)));
             ctx.set_field(bean_info, 1, Value::Object(Some(md_arr)));
+            ctx.unpin_native_roots(class_mirror_pin);
             return Ok(Some(Value::Object(Some(bean_info))));
         }
     };
@@ -50698,10 +52928,14 @@ fn introspector_get_bean_info(ctx: &mut dyn NativeContext, args: &[Value]) -> Me
     // the overlay getters read out-of-range slots on those and returned null,
     // breaking ExtendedBeanInfoTests.
     let pd_arr = ctx.new_ref_array(cratonvm_types::ClassId::new(0), properties.len());
+    // Pin across the per-property ctor invokes below — a moving young GC there
+    // would relocate the fresh array (native stale-local family).
+    let pd_arr_pin = ctx.pin_native_root(pd_arr);
     for (i, (prop_name, getter, setter, _type_mirror, idx_read, idx_write)) in
         properties.iter().enumerate()
     {
         let name_str = ctx.create_string(prop_name);
+        let name_pin = ctx.pin_native_root(name_str);
         // A property with any indexed accessor becomes a java.beans
         // IndexedPropertyDescriptor (so `pd instanceof IndexedPropertyDescriptor`
         // holds and getIndexedReadMethod/getIndexedWriteMethod work). The JDK
@@ -50722,29 +52956,37 @@ fn introspector_get_bean_info(ctx: &mut dyn NativeContext, args: &[Value]) -> Me
                 // The ctor can throw IntrospectionException on an inconsistent
                 // indexed/array type pairing; retry with just the indexed read
                 // (java.beans favours the read method) before giving up.
-                _ => match ctx.new_object_initialized(
-                    "java/beans/IndexedPropertyDescriptor",
-                    "(Ljava/lang/String;Ljava/lang/reflect/Method;Ljava/lang/reflect/Method;Ljava/lang/reflect/Method;Ljava/lang/reflect/Method;)V",
-                    &[
-                        Value::Object(Some(name_str)),
-                        Value::Object(None),
-                        Value::Object(None),
-                        Value::Object(*idx_read),
-                        Value::Object(None),
-                    ],
-                ) {
-                    Ok(Some(Value::Object(Some(p)))) => Some(p),
-                    _ => None,
-                },
+                _ => {
+                    let name_str = ctx.read_native_pin(name_pin, name_str);
+                    match ctx.new_object_initialized(
+                        "java/beans/IndexedPropertyDescriptor",
+                        "(Ljava/lang/String;Ljava/lang/reflect/Method;Ljava/lang/reflect/Method;Ljava/lang/reflect/Method;Ljava/lang/reflect/Method;)V",
+                        &[
+                            Value::Object(Some(name_str)),
+                            Value::Object(None),
+                            Value::Object(None),
+                            Value::Object(*idx_read),
+                            Value::Object(None),
+                        ],
+                    ) {
+                        Ok(Some(Value::Object(Some(p)))) => Some(p),
+                        _ => None,
+                    }
+                }
             }
         } else {
             None
         };
         let pd = match pd {
             Some(p) => p,
-            None => build_property_descriptor(ctx, name_str, *getter, *setter),
+            None => {
+                let name_str = ctx.read_native_pin(name_pin, name_str);
+                build_property_descriptor(ctx, name_str, *getter, *setter)
+            }
         };
+        let pd_arr = ctx.read_native_pin(pd_arr_pin, pd_arr);
         ctx.set_array_element(pd_arr, i, Value::Object(Some(pd)));
+        ctx.unpin_native_roots(name_pin);
     }
 
     // Build MethodDescriptor[] as genuine java.beans.MethodDescriptor objects
@@ -50754,6 +52996,9 @@ fn introspector_get_bean_info(ctx: &mut dyn NativeContext, args: &[Value]) -> Me
     // non-void-returning setters, 2-arg indexed setters) that
     // java.beans.Introspector itself ignores.
     let md_arr = ctx.new_ref_array(cratonvm_types::ClassId::new(0), all_method_mirrors.len());
+    // Pin across the per-method ctor invokes below — a moving young GC there
+    // would relocate the fresh array (native stale-local family).
+    let md_arr_pin = ctx.pin_native_root(md_arr);
     for (i, m) in all_method_mirrors.iter().enumerate() {
         let md = match ctx.new_object_initialized(
             "java/beans/MethodDescriptor",
@@ -50768,12 +53013,14 @@ fn introspector_get_bean_info(ctx: &mut dyn NativeContext, args: &[Value]) -> Me
                 md
             }
         };
+        let md_arr = ctx.read_native_pin(md_arr_pin, md_arr);
         ctx.set_array_element(md_arr, i, Value::Object(Some(md)));
     }
 
     // Build a real java.beans.BeanDescriptor so BeanInfo.getBeanDescriptor() is
     // non-null (Spring's CachedIntrospectionResults calls
     // `beanInfo.getBeanDescriptor().getBeanClass()`).
+    let class_mirror = ctx.read_native_pin(class_mirror_pin, class_mirror);
     let bean_descriptor = match ctx.new_object_initialized(
         "java/beans/BeanDescriptor",
         "(Ljava/lang/Class;)V",
@@ -50782,14 +53029,19 @@ fn introspector_get_bean_info(ctx: &mut dyn NativeContext, args: &[Value]) -> Me
         Ok(Some(v @ Value::Object(Some(_)))) => v,
         _ => Value::Object(None),
     };
+    let bd_pin = pinned_object_value(ctx, bean_descriptor);
 
     // Build BeanInfo: slot 0 = PD[], slot 1 = MethodDescriptor[],
     // slot 2 = BeanDescriptor.
     let bean_info = alloc_concurrent_synthetic(ctx, "java/beans/BeanInfo", 3);
+    let pd_arr = ctx.read_native_pin(pd_arr_pin, pd_arr);
+    let md_arr = ctx.read_native_pin(md_arr_pin, md_arr);
+    let bean_descriptor = read_pinned_object_value(ctx, bd_pin, bean_descriptor);
     ctx.set_field(bean_info, 0, Value::Object(Some(pd_arr)));
     ctx.set_field(bean_info, 1, Value::Object(Some(md_arr)));
     ctx.set_field(bean_info, 2, bean_descriptor);
 
+    ctx.unpin_native_roots(class_mirror_pin);
     Ok(Some(Value::Object(Some(bean_info))))
 }
 
@@ -50891,21 +53143,40 @@ pub(crate) fn register_p72_naming(r: &mut NativeMethodRegistry) {
     let ic = "javax/naming/InitialContext";
     r.register(ic, "<init>", "()V", |ctx, args| {
         let this = obj_arg(args, 0)?;
+        // Pin across the map allocs/inits below — a moving young GC there
+        // would relocate them (native stale-local family).
+        let this_pin = ctx.pin_native_root(this);
         let bindings = alloc_concurrent_synthetic(ctx, "java/util/HashMap", 3);
+        let bindings_pin = ctx.pin_native_root(bindings);
         cratonvm_native_collections::native_map_init(ctx, &[Value::Object(Some(bindings))]).ok();
+        let this = ctx.read_native_pin(this_pin, this);
+        let bindings = ctx.read_native_pin(bindings_pin, bindings);
         ctx.set_field(this, 0, Value::Object(Some(bindings)));
         let env = alloc_concurrent_synthetic(ctx, "java/util/HashMap", 3);
+        let env_pin = ctx.pin_native_root(env);
         cratonvm_native_collections::native_map_init(ctx, &[Value::Object(Some(env))]).ok();
+        let this = ctx.read_native_pin(this_pin, this);
+        let env = ctx.read_native_pin(env_pin, env);
         ctx.set_field(this, 1, Value::Object(Some(env)));
+        ctx.unpin_native_roots(this_pin);
         Ok(None)
     });
     r.register(ic, "<init>", "(Ljava/util/Hashtable;)V", |ctx, args| {
         let this = obj_arg(args, 0)?;
-        let bindings = alloc_concurrent_synthetic(ctx, "java/util/HashMap", 3);
-        cratonvm_native_collections::native_map_init(ctx, &[Value::Object(Some(bindings))]).ok();
-        ctx.set_field(this, 0, Value::Object(Some(bindings)));
         let env_arg = args.get(1).copied().unwrap_or(Value::Object(None));
+        // Pin across the map alloc/init below — a moving young GC there would
+        // relocate them (native stale-local family).
+        let this_pin = ctx.pin_native_root(this);
+        let env_pin = pinned_object_value(ctx, env_arg);
+        let bindings = alloc_concurrent_synthetic(ctx, "java/util/HashMap", 3);
+        let bindings_pin = ctx.pin_native_root(bindings);
+        cratonvm_native_collections::native_map_init(ctx, &[Value::Object(Some(bindings))]).ok();
+        let this = ctx.read_native_pin(this_pin, this);
+        let bindings = ctx.read_native_pin(bindings_pin, bindings);
+        ctx.set_field(this, 0, Value::Object(Some(bindings)));
+        let env_arg = read_pinned_object_value(ctx, env_pin, env_arg);
         ctx.set_field(this, 1, env_arg);
+        ctx.unpin_native_roots(this_pin);
         Ok(None)
     });
     r.register(
@@ -50984,9 +53255,16 @@ pub(crate) fn register_p72_naming(r: &mut NativeMethodRegistry) {
     r.register(ic, "close", "()V", |ctx, args| {
         let this = obj_arg(args, 0)?;
         // Clear bindings on close
+        // Pin across the map alloc/init below — a moving young GC there would
+        // relocate them (native stale-local family).
+        let this_pin = ctx.pin_native_root(this);
         let empty = alloc_concurrent_synthetic(ctx, "java/util/HashMap", 3);
+        let empty_pin = ctx.pin_native_root(empty);
         cratonvm_native_collections::native_map_init(ctx, &[Value::Object(Some(empty))]).ok();
+        let this = ctx.read_native_pin(this_pin, this);
+        let empty = ctx.read_native_pin(empty_pin, empty);
         ctx.set_field(this, 0, Value::Object(Some(empty)));
+        ctx.unpin_native_roots(this_pin);
         Ok(None)
     });
     r.register(
@@ -51007,21 +53285,34 @@ pub(crate) fn register_p72_naming(r: &mut NativeMethodRegistry) {
             let old_name = args.get(1).copied().unwrap_or(Value::Object(None));
             let new_name = args.get(2).copied().unwrap_or(Value::Object(None));
             if let Value::Object(Some(bindings)) = ctx.get_field(this, 0) {
+                // Pin across the chained map ops below (their hashCode/equals
+                // callbacks can allocate) — a moving young GC there would
+                // relocate them (native stale-local family).
+                let bindings_pin = ctx.pin_native_root(bindings);
+                let old_pin = pinned_object_value(ctx, old_name);
+                let new_pin = pinned_object_value(ctx, new_name);
                 // Get the value under old name
                 let val = cratonvm_native_collections::native_map_get_pub(
                     ctx,
                     &[Value::Object(Some(bindings)), old_name],
                 )?
                 .unwrap_or(Value::Object(None));
+                let val_pin = pinned_object_value(ctx, val);
                 // Remove old, put new
+                let bindings = ctx.read_native_pin(bindings_pin, bindings);
+                let old_name = read_pinned_object_value(ctx, old_pin, old_name);
                 cratonvm_native_collections::native_map_remove_pub(
                     ctx,
                     &[Value::Object(Some(bindings)), old_name],
                 )?;
+                let bindings = ctx.read_native_pin(bindings_pin, bindings);
+                let new_name = read_pinned_object_value(ctx, new_pin, new_name);
+                let val = read_pinned_object_value(ctx, val_pin, val);
                 cratonvm_native_collections::native_map_put_pub(
                     ctx,
                     &[Value::Object(Some(bindings)), new_name, val],
                 )?;
+                ctx.unpin_native_roots(bindings_pin);
             }
             Ok(None)
         },
@@ -51032,9 +53323,16 @@ pub(crate) fn register_p72_naming(r: &mut NativeMethodRegistry) {
         "(Ljava/lang/String;)Ljavax/naming/Context;",
         |ctx, _args| {
             let sub = alloc_concurrent_synthetic(ctx, "javax/naming/InitialContext", 2);
+            // Pin across the map alloc/init below — a moving young GC there
+            // would relocate them (native stale-local family).
+            let sub_pin = ctx.pin_native_root(sub);
             let b2 = alloc_concurrent_synthetic(ctx, "java/util/HashMap", 3);
+            let b2_pin = ctx.pin_native_root(b2);
             cratonvm_native_collections::native_map_init(ctx, &[Value::Object(Some(b2))]).ok();
+            let sub = ctx.read_native_pin(sub_pin, sub);
+            let b2 = ctx.read_native_pin(b2_pin, b2);
             ctx.set_field(sub, 0, Value::Object(Some(b2)));
+            ctx.unpin_native_roots(sub_pin);
             Ok(Some(Value::Object(Some(sub))))
         },
     );
@@ -52149,7 +54447,13 @@ pub(crate) fn register_datagram_channel(r: &mut NativeMethodRegistry) {
                     ctx.set_field(bb, 1, Value::Int((pos + copy_len) as i32));
 
                     let sa = alloc_concurrent_synthetic(ctx, "java/net/InetSocketAddress", 2);
+                    // Pin across the create_string below — a moving young GC
+                    // there would relocate the fresh address (native
+                    // stale-local family).
+                    let sa_pin = ctx.pin_native_root(sa);
                     let host_str = ctx.create_string(&src_addr.ip().to_string());
+                    let sa = ctx.read_native_pin(sa_pin, sa);
+                    ctx.unpin_native_roots(sa_pin);
                     ctx.set_field(sa, 0, Value::Object(Some(host_str)));
                     ctx.set_field(sa, 1, Value::Int(src_addr.port() as i32));
                     Ok(Some(Value::Object(Some(sa))))
@@ -52316,7 +54620,12 @@ pub(crate) fn register_datagram_channel(r: &mut NativeMethodRegistry) {
                 _ => 0,
             };
             let sa = alloc_concurrent_synthetic(ctx, "java/net/InetSocketAddress", 2);
+            // Pin across the create_string below — a moving young GC there
+            // would relocate the fresh address (native stale-local family).
+            let sa_pin = ctx.pin_native_root(sa);
             let host = ctx.create_string("0.0.0.0");
+            let sa = ctx.read_native_pin(sa_pin, sa);
+            ctx.unpin_native_roots(sa_pin);
             ctx.set_field(sa, 0, Value::Object(Some(host)));
             ctx.set_field(sa, 1, Value::Int(port));
             Ok(Some(Value::Object(Some(sa))))
@@ -52386,10 +54695,17 @@ pub(crate) fn register_p72_http_server(r: &mut NativeMethodRegistry) {
         "(Ljava/net/InetSocketAddress;I)Lcom/sun/net/httpserver/HttpServer;",
         |ctx, _args| {
             let srv = alloc_concurrent_synthetic(ctx, "com/sun/net/httpserver/HttpServer", 3);
+            // Pin across the context-list alloc/init below — a moving young GC
+            // there would relocate them (native stale-local family).
+            let srv_pin = ctx.pin_native_root(srv);
             ctx.set_field(srv, 1, Value::Int(0));
             let ctxs = alloc_concurrent_synthetic(ctx, "java/util/ArrayList", 2);
+            let ctxs_pin = ctx.pin_native_root(ctxs);
             cratonvm_native_collections::native_al_init(ctx, &[Value::Object(Some(ctxs))]).ok();
+            let srv = ctx.read_native_pin(srv_pin, srv);
+            let ctxs = ctx.read_native_pin(ctxs_pin, ctxs);
             ctx.set_field(srv, 2, Value::Object(Some(ctxs)));
+            ctx.unpin_native_roots(srv_pin);
             Ok(Some(Value::Object(Some(srv))))
         },
     );
@@ -52415,9 +54731,16 @@ pub(crate) fn register_p72_http_server(r: &mut NativeMethodRegistry) {
             "(Ljava/lang/String;)Lcom/sun/net/httpserver/HttpContext;",
             |ctx, args| {
                 let path = args.get(1).copied().unwrap_or(Value::Object(None));
+                // Pin across the context alloc below — a moving young GC there
+                // would relocate it (native stale-local family).
+                let path_pin = pinned_object_value(ctx, path);
                 let hctx = alloc_concurrent_synthetic(ctx, "com/sun/net/httpserver/HttpContext", 2);
+                let path = read_pinned_object_value(ctx, path_pin, path);
                 ctx.set_field(hctx, 0, path);
                 ctx.set_field(hctx, 1, Value::Object(None));
+                if let Some((h, _)) = path_pin {
+                    ctx.unpin_native_roots(h);
+                }
                 Ok(Some(Value::Object(Some(hctx))))
             },
         );
@@ -52486,7 +54809,13 @@ pub(crate) fn register_p72_http_server(r: &mut NativeMethodRegistry) {
     );
     r.register(hctx, "getAttributes", "()Ljava/util/Map;", |ctx, _args| {
         let m = alloc_concurrent_synthetic(ctx, "java/util/HashMap", 3);
+        // Pin across the map init below (it allocates the bucket array) — a
+        // moving young GC there would relocate the fresh map (native
+        // stale-local family).
+        let m_pin = ctx.pin_native_root(m);
         cratonvm_native_collections::native_map_init(ctx, &[Value::Object(Some(m))]).ok();
+        let m = ctx.read_native_pin(m_pin, m);
+        ctx.unpin_native_roots(m_pin);
         Ok(Some(Value::Object(Some(m))))
     });
 

@@ -954,19 +954,26 @@ fn essential_quarkus_locale_convert(
             Ok(Some(Value::Object(Some(o)))) => o,
             _ => return Ok(Some(Value::Object(None))),
         };
+        // Pin across the create_string + <init> below — a moving young GC
+        // there would relocate loc_obj out from under this raw Rust local
+        // (native stale-local family).
+        let loc_pin = ctx.pin_native_root(loc_obj);
         let empty = ctx.create_string("");
+        let loc_cur = ctx.read_native_pin(loc_pin, loc_obj);
         let _ = ctx.invoke(
             cls,
             "<init>",
             "(Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;)V",
             &[
-                Value::Object(Some(loc_obj)),
+                Value::Object(Some(loc_cur)),
                 Value::Object(Some(empty)),
                 Value::Object(Some(empty)),
                 Value::Object(Some(empty)),
             ],
         );
-        return Ok(Some(Value::Object(Some(loc_obj))));
+        let loc_cur = ctx.read_native_pin(loc_pin, loc_obj);
+        ctx.unpin_native_roots(loc_pin);
+        return Ok(Some(Value::Object(Some(loc_cur))));
     }
     // Normalise: replace '_' with '-' then split.
     let normalised: String = trimmed.replace('_', "-");
@@ -981,21 +988,33 @@ fn essential_quarkus_locale_convert(
         Ok(Some(Value::Object(Some(o)))) => o,
         _ => return Ok(Some(Value::Object(None))),
     };
+    // Pin every ref held across the later create_string/<init> allocations —
+    // a moving young GC there would relocate them out from under these raw
+    // Rust locals (native stale-local family). `v` is used immediately with
+    // no intervening allocation, so it needs no pin.
+    let loc_pin = ctx.pin_native_root(loc_obj);
     let l = ctx.create_string(&lang);
+    let l_pin = ctx.pin_native_root(l);
     let c = ctx.create_string(&country);
+    let c_pin = ctx.pin_native_root(c);
     let v = ctx.create_string(&variant);
+    let loc_cur = ctx.read_native_pin(loc_pin, loc_obj);
+    let l_cur = ctx.read_native_pin(l_pin, l);
+    let c_cur = ctx.read_native_pin(c_pin, c);
     let _ = ctx.invoke(
         cls,
         "<init>",
         "(Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;)V",
         &[
-            Value::Object(Some(loc_obj)),
-            Value::Object(Some(l)),
-            Value::Object(Some(c)),
+            Value::Object(Some(loc_cur)),
+            Value::Object(Some(l_cur)),
+            Value::Object(Some(c_cur)),
             Value::Object(Some(v)),
         ],
     );
-    Ok(Some(Value::Object(Some(loc_obj))))
+    let loc_cur = ctx.read_native_pin(loc_pin, loc_obj);
+    ctx.unpin_native_roots(loc_pin);
+    Ok(Some(Value::Object(Some(loc_cur))))
 }
 
 /// Decode `java.lang.String` used as a system/property key when
@@ -24020,6 +24039,15 @@ fn native_lazy_launcher_discover(ctx: &mut dyn NativeContext, args: &[Value]) ->
         }
     };
 
+    // Pin the request across the launcher() / LauncherFactory.create() calls
+    // below — a moving young GC there would relocate it out from under this
+    // raw Rust local (native stale-local family). The dispatcher truncates
+    // the pin stack when this native returns.
+    let req_pin = match req {
+        Value::Object(Some(o)) => Some((ctx.pin_native_root(o), o)),
+        _ => None,
+    };
+
     let delegate =
         match ctx.invoke_special(LAZY, "launcher", DESC_GET, &[Value::Object(Some(this))]) {
             Ok(Some(Value::Object(Some(d)))) => d,
@@ -24028,7 +24056,11 @@ fn native_lazy_launcher_discover(ctx: &mut dyn NativeContext, args: &[Value]) ->
             Err(_) => materialize_from_factory(ctx)?,
         };
 
-    ctx.invoke_virtual(delegate, "discover", DESC_DISCOVER, &[req])
+    let req_cur = match req_pin {
+        Some((h, o)) => Value::Object(Some(ctx.read_native_pin(h, o))),
+        None => req,
+    };
+    ctx.invoke_virtual(delegate, "discover", DESC_DISCOVER, &[req_cur])
 }
 
 /// Surefire `TestPlanScannerFilter.accept(Class)` builds a one-class discovery
@@ -24079,6 +24111,14 @@ fn native_test_plan_scanner_filter_accept(
         }
     };
 
+    // Pin `this` across the long chain of allocating calls below (getName /
+    // selectClass / load_class / new_ref_array / builder invokes) — a moving
+    // young GC in any of them would relocate it out from under this raw Rust
+    // local (native stale-local family); re-read before each later use. The
+    // dispatcher truncates the pin stack when this native returns, so the
+    // early error returns need no explicit unpin.
+    let this_pin = ctx.pin_native_root(this);
+
     let name_val = ctx.invoke_virtual(class_obj, "getName", DESC_GET_NAME, &[])?;
     let name_obj = match name_val {
         Some(Value::Object(Some(s))) => s,
@@ -24106,6 +24146,8 @@ fn native_test_plan_scanner_filter_accept(
             .into());
         }
     };
+    // Pinned across load_class + new_ref_array (both can allocate/GC).
+    let selector_pin = ctx.pin_native_root(selector);
 
     let ds_mirror = match ctx.load_class("org/junit/platform/engine/DiscoverySelector")? {
         Some(Value::Object(Some(m))) => m,
@@ -24118,7 +24160,10 @@ fn native_test_plan_scanner_filter_accept(
     };
     let ds_cid = ctx.class_id_of_object(ds_mirror);
     let sel_arr = ctx.new_ref_array(ds_cid, 1);
-    ctx.set_array_element(sel_arr, 0, Value::Object(Some(selector)));
+    let selector_cur = ctx.read_native_pin(selector_pin, selector);
+    ctx.set_array_element(sel_arr, 0, Value::Object(Some(selector_cur)));
+    // Pinned across the builder `request()` invoke below.
+    let sel_arr_pin = ctx.pin_native_root(sel_arr);
 
     let builder_val = ctx.invoke(BUILDER, "request", DESC_BUILDER, &[])?;
     let builder = match builder_val {
@@ -24133,11 +24178,12 @@ fn native_test_plan_scanner_filter_accept(
         }
     };
 
+    let sel_arr_cur = ctx.read_native_pin(sel_arr_pin, sel_arr);
     let builder_val = ctx.invoke_virtual(
         builder,
         "selectors",
         DESC_SELECTORS,
-        &[Value::Object(Some(sel_arr))],
+        &[Value::Object(Some(sel_arr_cur))],
     )?;
     let builder = match builder_val {
         Some(Value::Object(Some(b))) => b,
@@ -24148,8 +24194,12 @@ fn native_test_plan_scanner_filter_accept(
             .into());
         }
     };
+    // Pinned across the possible load_class/new_ref_array in the filters
+    // fallback branch below.
+    let builder_pin = ctx.pin_native_root(builder);
 
-    let filters_val = ctx.get_field_by_name(this, "includeAndExcludeFilters");
+    let this_cur = ctx.read_native_pin(this_pin, this);
+    let filters_val = ctx.get_field_by_name(this_cur, "includeAndExcludeFilters");
     let filters_arg = match filters_val {
         Value::Object(Some(f)) => Value::Object(Some(f)),
         _ => {
@@ -24167,7 +24217,8 @@ fn native_test_plan_scanner_filter_accept(
         }
     };
 
-    let builder_val = ctx.invoke_virtual(builder, "filters", DESC_FILTERS, &[filters_arg])?;
+    let builder_cur = ctx.read_native_pin(builder_pin, builder);
+    let builder_val = ctx.invoke_virtual(builder_cur, "filters", DESC_FILTERS, &[filters_arg])?;
     let builder = match builder_val {
         Some(Value::Object(Some(b))) => b,
         _ => {
@@ -24180,7 +24231,7 @@ fn native_test_plan_scanner_filter_accept(
 
     let req_val = ctx.invoke_virtual(builder, "build", DESC_BUILD, &[])?;
     let request = match req_val {
-        Some(Value::Object(Some(r))) => Value::Object(Some(r)),
+        Some(Value::Object(Some(r))) => r,
         _ => {
             return Err(RuntimeError::IllegalStateException {
                 message: "TestPlanScannerFilter.accept: build() failed".into(),
@@ -24188,8 +24239,11 @@ fn native_test_plan_scanner_filter_accept(
             .into());
         }
     };
+    // Pinned across the possible LauncherFactory.create() below.
+    let request_pin = ctx.pin_native_root(request);
 
-    let launcher_field = ctx.get_field_by_name(this, "launcher");
+    let this_cur = ctx.read_native_pin(this_pin, this);
+    let launcher_field = ctx.get_field_by_name(this_cur, "launcher");
     let delegate = match launcher_field {
         Value::Object(Some(l)) => l,
         _ => {
@@ -24208,7 +24262,8 @@ fn native_test_plan_scanner_filter_accept(
         }
     };
 
-    let plan_val = ctx.invoke_virtual(delegate, "discover", DESC_DISCOVER, &[request])?;
+    let request_cur = Value::Object(Some(ctx.read_native_pin(request_pin, request)));
+    let plan_val = ctx.invoke_virtual(delegate, "discover", DESC_DISCOVER, &[request_cur])?;
     let plan = match plan_val {
         Some(Value::Object(Some(p))) => p,
         _ => {
@@ -45541,12 +45596,15 @@ fn native_es_execute(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallR
     Ok(None)
 }
 
-/// Process-wide singleton async worker pool (Bug D). Stored as a raw `ObjectRef`
-/// and kept alive across calls + GC via `register_var_handle_root` — the same
-/// long-lived-native-singleton pattern used for `SYSTEM_CL` / `SECURITY_MANAGER`
-/// (a `pin_native_root` handle is NOT usable here: that is a transient per-thread
-/// pin stack cleared after each native call, not a persistent root).
-static ASYNC_POOL: std::sync::Mutex<Option<ObjectRef>> = std::sync::Mutex::new(None);
+/// Process-wide singleton async worker pool (Bug D). Kept alive across calls +
+/// GC via `register_var_handle_root` (a `pin_native_root` handle is NOT usable
+/// here: that is a transient per-thread pin stack cleared after each native
+/// call, not a persistent root). Stored as `(identity_key, ObjectRef)`: the GC
+/// remaps the var-handle-root REGISTRY entry after a move, but it cannot
+/// rewrite this raw static copy — so every use must re-read the current
+/// address via `read_var_handle_root(identity_key)` (use-after-move
+/// otherwise once the pool is relocated by a moving young GC or promotion).
+static ASYNC_POOL: std::sync::Mutex<Option<(i32, ObjectRef)>> = std::sync::Mutex::new(None);
 static LAST_ASYNC_SUBMIT_MS: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
 
@@ -45644,6 +45702,11 @@ pub(crate) fn spawn_runnable_on_real_thread(
     ctx: &mut dyn NativeContext,
     runnable: ObjectRef,
 ) -> MethodCallResult {
+    // Pin across the pool get-or-create below — the first call runs
+    // <clinit>/<init> bytecode and allocates, and a moving young GC there
+    // would relocate the runnable out from under this raw Rust local
+    // (native stale-local family). Re-read via the pin before every use.
+    let pin = ctx.pin_native_root(runnable);
     if let Some(pool) = async_worker_pool(ctx) {
         // Record before handing the task to the executor: a fast worker can
         // enter user code (and its short scheduling sleeps) before execute()
@@ -45651,12 +45714,15 @@ pub(crate) fn spawn_runnable_on_real_thread(
         note_async_runnable_submitted();
         // execute() is the ForkJoinPool.execute contract we are emulating here;
         // avoid wrapping every CompletableFuture async task in a FutureTask.
-        ctx.invoke_virtual(
+        let runnable_cur = ctx.read_native_pin(pin, runnable);
+        let submitted = ctx.invoke_virtual(
             pool,
             "execute",
             "(Ljava/lang/Runnable;)V",
-            &[Value::Object(Some(runnable))],
-        )?;
+            &[Value::Object(Some(runnable_cur))],
+        );
+        ctx.unpin_native_roots(pin);
+        submitted?;
         let grace = async_submit_handoff_grace();
         if grace.is_zero() {
             std::thread::yield_now();
@@ -45666,15 +45732,20 @@ pub(crate) fn spawn_runnable_on_real_thread(
         return Ok(None);
     }
     // Fallback: pool creation failed — preserve the completion contract inline.
-    ctx.invoke_virtual(runnable, "run", "()V", &[])?;
+    let runnable_cur = ctx.read_native_pin(pin, runnable);
+    ctx.unpin_native_roots(pin);
+    ctx.invoke_virtual(runnable_cur, "run", "()V", &[])?;
     Ok(None)
 }
 
 /// Get-or-create the singleton bounded async worker pool. Returns `None` if the
 /// pool could not be constructed (caller then falls back to inline execution).
 fn async_worker_pool(ctx: &mut dyn NativeContext) -> Option<ObjectRef> {
-    if let Some(p) = *ASYNC_POOL.lock().unwrap_or_else(|e| e.into_inner()) {
-        return Some(p);
+    if let Some((key, cached)) = *ASYNC_POOL.lock().unwrap_or_else(|e| e.into_inner()) {
+        // Re-read the CURRENT address: the GC remaps the var-handle-root
+        // registry entry after a move, not this raw static copy. Contexts
+        // without a registry (mocks) fall back to the cached ref.
+        return Some(ctx.read_var_handle_root(key).unwrap_or(cached));
     }
     // Construct OUTSIDE the lock (the re-entrant <init> calls must not hold it):
     //   new ThreadPoolExecutor(0, 256, 10, SECONDS, new SynchronousQueue())
@@ -45709,15 +45780,17 @@ fn async_worker_pool(ctx: &mut dyn NativeContext) -> Option<ObjectRef> {
         Some(Value::Object(Some(p))) => p,
         _ => return None,
     };
-    // Keep alive + remap across GC moves (same as SYSTEM_CL / VarHandle roots).
+    // Keep alive + registry-remapped across GC moves (VarHandle-root pattern);
+    // the identity key lets every later use re-read the current address.
     ctx.register_var_handle_root(pool);
+    let key = ctx.identity_hash_code(pool);
     let mut guard = ASYNC_POOL.lock().unwrap_or_else(|e| e.into_inner());
-    if let Some(existing) = *guard {
+    if let Some((ekey, existing)) = *guard {
         // A racing creator already installed one; use it (ours is orphaned but
         // harmless — core=0 means it has no live worker threads yet).
-        return Some(existing);
+        return Some(ctx.read_var_handle_root(ekey).unwrap_or(existing));
     }
-    *guard = Some(pool);
+    *guard = Some((key, pool));
     Some(pool)
 }
 
