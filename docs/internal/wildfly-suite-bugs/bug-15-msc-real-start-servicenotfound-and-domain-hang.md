@@ -1,6 +1,9 @@
 # Bug 15 - `CRATONVM_MSC_REAL_START` gate blocks any WildFly boot from reaching real service execution
 
-Status: OPEN
+Status: PARTIALLY FIXED (2026-07-06) — Symptom 2's `ServiceNotFoundException` and a
+masking worker-pool race are fixed; two new, deeper blockers found immediately behind
+them (`addListener`/`removeListener` `AbstractMethodError`, and an as-yet-unidentified
+real exception from `ApplicationServerService.start()`). See the Fix section below.
 Severity: High
 First confirmed: 2026-07-06, Azure host `20.83.144.174`, worktree `fix/wildfly-domain-corrupt-value-20260706`
 
@@ -143,6 +146,116 @@ JAVA_HOME=<path-to>/fakejdk CRATONVM_JAVA_HOME=<real-jdk25> \
 # CRATONVM_DEFAULT_WATCHDOG_SEC=60 to get a thread-stack dump proving it's a genuine
 # parked wait, not slow interpretation.
 ```
+
+## 2026-07-06 Fix — ServiceNotFoundException + masking worker-pool race
+
+Worktree `fix/wildfly-msc-getservice-registry-gap-20260706` off `dev`, same Azure host,
+re-driving the identical repro below (WildFly 32.0.1.Final binary distribution,
+`bin/standalone.sh`, real JDK 25 boot, `CRATONVM_MSC_REAL_START=1 CRATONVM_DISABLE_JIT=1`).
+
+**Root cause 1 (this doc's headline `ServiceNotFoundException`):** `native_service_builder_install`
+(the P2 hook on `ServiceBuilderImpl.install()`) registers every installed service *only* in
+CratonVM's Rust-side shadow container (`global_container()` / `service_roots()`). It never
+touches `ServiceContainerImpl`'s own real `registry` field — a genuine
+`ConcurrentMap<ServiceName, ServiceRegistrationImpl>` in the real jboss-msc object, confirmed via
+`javap -c` on the extracted `jboss-msc-1.5.4.Final.jar` class:
+
+```
+public ServiceController<?> getService(ServiceName);
+  aload_0
+  getfield #4      // Field registry:Ljava/util/concurrent/ConcurrentMap;
+  aload_1
+  invokeinterface  // ConcurrentMap.get(Object)
+  checkcast        // ServiceRegistrationImpl
+  ...
+```
+
+`getService`/`getRequiredService` were never intercepted (no native was registered for either),
+so this real bytecode always read the real, always-empty `registry` map — even for a service
+`install()` had just registered a moment earlier — and `getRequiredService` threw
+`ServiceNotFoundException` (confirmed via `CRATONVM_DBG_MSC=1`: `install id=1 name=jboss.as ...`
+immediately followed by the exception, with no further installs in between).
+`LeakDetectorServiceContainer.getService`/`getRequiredService` (what `BootstrapImpl` actually
+calls on `container`) just `invokeinterface` straight through to the real delegate's own method,
+confirmed via `javap -c` — so hooking only the concrete `ServiceContainerImpl` class is
+sufficient; no separate hook is needed on the wrapper.
+
+**Fix:** added `native_service_container_get_service` / `native_service_container_get_required_service`
+in `native-builtins/src/jboss_msc.rs`, registered on `org/jboss/msc/service/ServiceContainerImpl`
+(gated behind `CRATONVM_MSC_REAL_START`, same as the rest of the P2 natives), answering from the
+Rust container's `get_id(&name)` + `service_roots()[id].controller_mirror` instead of the
+always-empty real map. On miss, throws a real `org.jboss.msc.service.ServiceNotFoundException`
+(via `new_object_initialized`) with a legible message — real MSC's own message for this case
+renders **blank** under CratonVM (`"service  not found"`, confirmed in the original repro output),
+because it's built via an `invokedynamic` string-concat over the `ServiceName` argument, whose
+`toString()` apparently resolves empty through that specific call shape. Not chased further here:
+it's moot on the fixed success path, and only mattered for the exact wording of a genuine
+not-found case.
+
+**Verified:** repro no longer throws `ServiceNotFoundException`; `CRATONVM_DBG_MSC=1` shows
+`[msc] getService jboss.as: found`.
+
+**Root cause 2 (found investigating why `ApplicationServerService.start()` never appeared to run
+any real logic even after fix 1):** `ServiceContainer::add_service` unconditionally pushes every
+newly-installed `Active`/`Passive` service onto `task_queue` and notifies the background worker
+pool — a queue/pool that predates P2 (T19.1-era) and whose `run_start_local` has, by its own doc
+comment, "no real Java callback to run locally" — it just flips bookkeeping straight to `Up`. P2's
+own driver, `drive_starts`, does **not** consume this queue — it independently scans
+`state.services` via `take_ready_start`. Both mechanisms were live simultaneously, so a woken
+worker thread could — and, confirmed via `CRATONVM_DBG_MSC=1`, reproducibly did — race
+`drive_starts` for the exact same newly-installed service and fake-complete it first: a
+`run_start_local (bookkeeping-only, NO real start() invoked) id=1` trace fired *before*
+`install()`'s own `install id=1 ...` trace even printed. This meant `CRATONVM_MSC_REAL_START=1`
+was not actually driving the real `start()` callback for any service that lost this race — the
+opposite of what the flag promises — while still reporting `Up` and letting boot appear to
+progress.
+
+**Fix:** `add_service` now skips the `task_queue` push (and worker-pool notify) entirely when
+`msc_real_start_enabled()` is true, so only `drive_starts`'s synchronous, real-callback-invoking
+loop ever starts a service in that mode.
+
+**Verified:** re-running the repro after this fix shows `[msc] -> start id=1` (real `drive_starts`
+invocation) where the race previously suppressed it, and the real `ApplicationServerService.start()`
+callback now actually runs — and throws a real exception, which the container correctly records as
+`Failed` (visible directly in the log now: `MSC service start() threw — marked FAILED, boot
+continues: ExceptionThrown(...) service=jboss.as`) rather than silently faking `Up`.
+
+**Not fixed / flagged for follow-up:** `ServiceContainer::demand()` (reached via
+`native_service_controller_set_mode`'s `Active`/`Passive` branch, registered unconditionally, not
+gated behind the real-start flag) schedules onto the exact same background-worker queue and is
+structurally the identical hazard. Not touched this session — `setMode` was never exercised by
+this repro, so there was nothing to verify a fix against — but a future session hitting it should
+apply the same `!msc_real_start_enabled()` guard.
+
+## 2026-07-06 New blockers found (immediately behind the two fixes above)
+
+1. **`ServiceController.addListener`/`removeListener` → `AbstractMethodError`.** Confirmed via
+   `javap`: `ServiceController` is a real interface with both methods `abstract`, no default body.
+   No native hook backs either, so `BootstrapImpl.internalBootstrap`'s
+   `controller.addListener(new BootstrapImpl$1(...))` (registering a `LifecycleListener` that
+   resolves a `FutureServiceContainer`) aborts immediately with `AbstractMethodError` at
+   `BootstrapImpl.java:113`. **Not a trivial no-op fix**: real MSC's `addListener` fires past
+   events immediately if the controller already reached a terminal state (`UP`/`FAILED`/`REMOVED`)
+   — tractable, since our container already knows the current state — but `BootstrapImpl$1`'s own
+   `handleEvent` (confirmed via `javap -c` on the anonymous class) chains into
+   `controller.removeListener(this)` → `controller.getServiceContainer()` →
+   `container.getRequiredService(Services.JBOSS_SERVER_CONTROLLER)` → registers yet another nested
+   listener (`BootstrapImpl$1$1`) on *that* controller — i.e. a real, multi-hop async workflow, not
+   a single synchronous callback. Worse, real MSC services commonly call
+   `StartContext.asynchronous()` and finish on a background thread, so by the time `addListener` is
+   called the state may genuinely still be `Starting` — which our shadow container has no
+   mechanism to notify later (no stored listener list per controller). A shallow no-op
+   implementation would trade this clean, immediate `AbstractMethodError` for a silent, harder-to
+   -diagnose hang (the exact worse failure mode this doc's own Symptom 1 already illustrates) —
+   deliberately left unimplemented rather than risk that regression under time pressure.
+2. **`ApplicationServerService.start()` now genuinely runs (fix 2 above) and throws.** The
+   exception's class/message aren't visible in current logging —
+   `jboss_msc`'s error trace only prints `ExceptionThrown(ObjectRef { ptr: ... })`, not the
+   exception's `getClass()`/`getMessage()`. This is now the actual gating defect on the path to
+   real sustained WildFly execution (previously hidden entirely by the worker-pool race). Next
+   session: decode the exception (extend the `tracing::error!` call in `drive_starts` to read
+   `getClass().getName()` + `getMessage()` off the `ObjectRef`, or attach `gdb`) before further
+   diagnosis.
 
 ## Why this matters beyond this one doc
 

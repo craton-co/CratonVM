@@ -398,7 +398,21 @@ impl ServiceContainer {
         state.by_id.insert(id, name.clone());
 
         // Schedule Active / Passive services whose deps are already Up.
-        if matches!(mode, Mode::Active | Mode::Passive) {
+        //
+        // Bug 15 follow-on: under CRATONVM_MSC_REAL_START, `drive_starts` is the
+        // sole intended driver of real `start()` — it does its own independent
+        // scan via `take_ready_start` (not this queue). Background worker
+        // threads (`worker_loop`) ALSO watch this same queue and, on waking,
+        // run `run_start_local` — which has NO real Java callback to invoke and
+        // just flips bookkeeping straight to `Up`. Pushing here let a worker
+        // thread race `drive_starts` for the very item it just registered and
+        // silently "fake-complete" it (confirmed via `CRATONVM_DBG_MSC`: a
+        // `run_start_local` bookkeeping-only trace fired for a service BEFORE
+        // `install()`'s own trace even printed), so the real `service.start()`
+        // callback was never invoked at all — the exact opposite of what the
+        // flag promises. Skip the push in that mode so only the real,
+        // synchronous `drive_starts` loop ever starts a service.
+        if !msc_real_start_enabled() && matches!(mode, Mode::Active | Mode::Passive) {
             if can_start(&state.services, &name) {
                 state.task_queue.push_back(Task::Start(id));
                 self.pool_cv.notify_one();
@@ -517,6 +531,11 @@ impl ServiceContainer {
     /// shutdown path call it directly to avoid cross-thread Java
     /// invocations.
     fn run_start_local(&self, id: u64) {
+        if msc_dbg() {
+            eprintln!(
+                "[msc] run_start_local (bookkeeping-only, NO real start() invoked) id={id}"
+            );
+        }
         let name = {
             let state = self.inner.lock().unwrap_or_else(|e| e.into_inner());
             match state.by_id.get(&id) {
@@ -2257,6 +2276,97 @@ fn native_start_context_failed(ctx: &mut dyn NativeContext, args: &[Value]) -> M
     Ok(None)
 }
 
+/// Bug 15 fix: `ServiceContainerImpl.getService(ServiceName)`.
+///
+/// `native_service_builder_install` (P2, above) intercepts
+/// `ServiceBuilderImpl.install()` wholesale and registers the service ONLY in
+/// our Rust-side shadow container (`global_container()` / `service_roots()`) —
+/// it never touches `ServiceContainerImpl`'s own real `registry` field (a real
+/// `ConcurrentMap<ServiceName, ServiceRegistrationImpl>`). `getService` is not
+/// otherwise intercepted, so its real bytecode
+/// (`this.registry.get(name)` → `ServiceRegistrationImpl.getDependencyController()`)
+/// always reads that untouched, empty real map — even for a service `install()`
+/// just registered a moment earlier. `getRequiredService` (below) built on top
+/// of this always sees `null` and throws `ServiceNotFoundException`, aborting
+/// boot ~3s in under `CRATONVM_MSC_REAL_START=1` (`docs/internal/wildfly-suite-bugs/
+/// bug-15-msc-real-start-servicenotfound-and-domain-hang.md`, Symptom 2). Fix:
+/// answer from the SAME shadow container `install()` populates instead of the
+/// always-empty real registry. `LeakDetectorServiceContainer.getService` (the
+/// caller WildFly's `BootstrapImpl` actually sees) just forwards to this method
+/// on its real `ServiceContainerImpl` delegate via `invokeinterface`, so hooking
+/// only the concrete class here is sufficient — no separate hook needed on the
+/// wrapper.
+fn native_service_container_get_service(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    let sn_obj = match args.get(1).copied() {
+        Some(Value::Object(Some(o))) => o,
+        _ => return Ok(Some(Value::Object(None))),
+    };
+    let name = match read_service_name_robust(ctx, sn_obj) {
+        Some(n) => n,
+        None => return Ok(Some(Value::Object(None))),
+    };
+    let container = global_container();
+    let mirror = container.get_id(&name).and_then(|id| {
+        service_roots()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&id)
+            .and_then(|r| r.controller_mirror)
+    });
+    if msc_dbg() {
+        eprintln!(
+            "[msc] getService {}: {}",
+            name.canonical(),
+            if mirror.is_some() { "found" } else { "MISS" }
+        );
+    }
+    Ok(Some(Value::Object(mirror)))
+}
+
+/// Bug 15 fix: `ServiceContainerImpl.getRequiredService(ServiceName)`. Real
+/// bytecode is `getService(name)` + throw `ServiceNotFoundException` on `null`
+/// (built via an `invokedynamic` string-concat of the `ServiceName`, which
+/// separately renders blank under CratonVM — a pre-existing, lower-priority
+/// diagnostic gap noted in bug-15 and not needed for this fix, since the
+/// success path below never reaches that concat). We reimplement the same
+/// shape against our shadow container so a real miss still throws the correct
+/// exception type with a legible message.
+fn native_service_container_get_required_service(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    let sn_obj = match args.get(1).copied() {
+        Some(Value::Object(Some(o))) => Some(o),
+        _ => None,
+    };
+    let canonical = sn_obj
+        .and_then(|o| read_service_name_robust(ctx, o))
+        .map(|n| n.canonical().to_string());
+    match native_service_container_get_service(ctx, args)? {
+        Some(Value::Object(Some(o))) => Ok(Some(Value::Object(Some(o)))),
+        _ => {
+            let message = format!(
+                "Service {} not found",
+                canonical.as_deref().unwrap_or("<unknown>")
+            );
+            let msg_obj = ctx.create_string(&message);
+            match ctx.new_object_initialized(
+                "org/jboss/msc/service/ServiceNotFoundException",
+                "(Ljava/lang/String;)V",
+                &[Value::Object(Some(msg_obj))],
+            ) {
+                Ok(Some(Value::Object(Some(exc)))) => Err(MethodCallFailed::ExceptionThrown(exc)),
+                _ => Err(MethodCallFailed::InternalError(VmError::Internal {
+                    message,
+                })),
+            }
+        }
+    }
+}
+
 /// `ServiceController.getServiceContainer()` → a synthetic ServiceContainer
 /// (forces the global container to exist; the mirror is a thin handle).
 fn native_service_controller_get_service_container(
@@ -2659,6 +2769,26 @@ pub fn register_jboss_msc_natives(r: &mut NativeMethodRegistry) {
             "getServiceContainer",
             "()Lorg/jboss/msc/service/ServiceContainer;",
             native_service_controller_get_service_container,
+        );
+        // Bug 15: getService/getRequiredService must read the SAME shadow
+        // container install() populates — see native_service_container_get_service.
+        // Registered on the concrete ServiceContainerImpl (not the ServiceContainer
+        // interface): LeakDetectorServiceContainer.getService/getRequiredService
+        // (what WildFly's BootstrapImpl actually calls) just forward via
+        // invokeinterface to their real ServiceContainerImpl delegate, so hooking
+        // the concrete class here is what dispatch lands on.
+        let sci = "org/jboss/msc/service/ServiceContainerImpl";
+        r.register(
+            sci,
+            "getService",
+            "(Lorg/jboss/msc/service/ServiceName;)Lorg/jboss/msc/service/ServiceController;",
+            native_service_container_get_service,
+        );
+        r.register(
+            sci,
+            "getRequiredService",
+            "(Lorg/jboss/msc/service/ServiceName;)Lorg/jboss/msc/service/ServiceController;",
+            native_service_container_get_required_service,
         );
     }
 
