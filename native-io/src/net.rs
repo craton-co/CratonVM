@@ -1642,6 +1642,35 @@ pub fn register_sun_nio_ch_net(r: &mut NativeMethodRegistry) {
             Ok(None)
         },
     );
+    // `sun/nio/ch/UnixDispatcher.close0`/`preClose0(FileDescriptor)` — real
+    // JDK 25's actual native surface for tearing down a NIO socket fd
+    // (confirmed via javap: `UnixDispatcher` declares both as private
+    // static natives; `SocketDispatcher extends UnixDispatcher` and does
+    // NOT redeclare them, so the `invokestatic` target lexically inside
+    // `UnixDispatcher.close()`/`implPreClose()` is `UnixDispatcher` itself,
+    // not `SocketDispatcher`). These were entirely unregistered — unlike
+    // the `(I)V`-descriptor stub above (a different, synthetic-bytecode
+    // shape), so real bytecode never resolved either — which threw
+    // `UnsatisfiedLinkError: sun/nio/ch/UnixDispatcher.preClose0` from
+    // `ServerSocket.close()` (via `NioSocketImpl.close()` ->
+    // `NativeDispatcher.preClose`). Companion gap to the `FileKey.init`
+    // fix, see docs/known-issues/tls-ocsp-clientcert-validation-not-enforced.md.
+    r.register(
+        "sun/nio/ch/UnixDispatcher",
+        "close0",
+        "(Ljava/io/FileDescriptor;)V",
+        net_close,
+    );
+    // `preClose0` marks the fd closed without actually closing it (used to
+    // unblock a concurrent blocking reader/writer before the real close()
+    // runs) — our socket I/O is already synchronous/blocking, so no-op,
+    // mirroring `nio_native.rs`'s analogous `FileDispatcherImpl` handling.
+    r.register(
+        "sun/nio/ch/UnixDispatcher",
+        "preClose0",
+        "(Ljava/io/FileDescriptor;)V",
+        |_ctx, _args| Ok(None),
+    );
 
     // Options
     r.register(
