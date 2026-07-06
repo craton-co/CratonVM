@@ -2893,6 +2893,56 @@ pub(crate) fn native_module_load_service_from_caller_module_loader(
     )
 }
 
+/// `Module.loadService(Class)` — the public instance method (distinct from
+/// the static `loadServiceFromCallerModuleLoader` above).
+///
+/// Real jboss-modules bytecode is:
+///   getClass().getModule().addUses(serviceType);
+///   return ServiceLoader.load(serviceType, moduleClassLoader);
+/// The `addUses` call walks the JDK's own `java.lang.Module` machinery
+/// (`this` here is an `org.jboss.modules.Module`, so `getClass()` resolves
+/// to the `org.jboss.modules.Module` class itself, and `.getModule()` asks
+/// what JPMS module *that* class belongs to) purely to register a
+/// `uses`-clause bookkeeping side effect that CratonVM's permissive module
+/// model doesn't enforce. Skip it and reimplement the observable contract
+/// directly via the module's own `moduleClassLoader` (read through
+/// `native_module_get_class_loader`, which lazily builds one instead of
+/// reading a possibly-unset field directly).
+pub(crate) fn native_module_load_service(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(o))) => *o,
+        _ => {
+            return Err(RuntimeError::NullPointerException {
+                message: Some("Module.loadService: receiver must not be null".to_string()),
+            }
+            .into());
+        }
+    };
+    let service_type = match args.get(1) {
+        Some(Value::Object(Some(c))) => *c,
+        _ => {
+            return Err(RuntimeError::NullPointerException {
+                message: Some("Module.loadService: serviceType is null".to_string()),
+            }
+            .into());
+        }
+    };
+    let class_loader_val = native_module_get_class_loader(ctx, &[Value::Object(Some(this))])?;
+    let class_loader = match class_loader_val {
+        Some(Value::Object(Some(cl))) => Value::Object(Some(cl)),
+        _ => Value::Object(None),
+    };
+    ctx.invoke(
+        "java/util/ServiceLoader",
+        "load",
+        "(Ljava/lang/Class;Ljava/lang/ClassLoader;)Ljava/util/ServiceLoader;",
+        &[Value::Object(Some(service_type)), class_loader],
+    )
+}
+
 /// Install every `LocalModuleLoader` / `Module` / `ModuleClassLoader`
 /// native this module owns.
 pub fn register_jboss_module_loader(registry: &mut NativeMethodRegistry) {
@@ -2962,6 +3012,13 @@ pub fn register_jboss_module_loader(registry: &mut NativeMethodRegistry) {
         "findServices",
         "(Ljava/lang/Class;Ljava/util/function/Predicate;Ljava/lang/ClassLoader;)Ljava/lang/Iterable;",
         native_module_find_services,
+    );
+
+    registry.register(
+        CN_MODULE,
+        "loadService",
+        "(Ljava/lang/Class;)Ljava/util/ServiceLoader;",
+        native_module_load_service,
     );
 
     registry.register(
