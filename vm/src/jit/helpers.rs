@@ -1741,7 +1741,7 @@ pub unsafe extern "C" fn jit_new_object(vm_ptr: i64, class_id_raw: i64, num_fiel
     // following allocations.
     if total_size <= cratonvm_gc::tlab::tlab_max_alloc() {
         if let Some((thread, _guard)) = jit_thread_mut() {
-            if let Some(obj_ref) = crate::runtime::interpreter::tlab_alloc_object(
+            if let Some(obj_ref) = crate::runtime::interpreter::tlab_alloc_object_guarded_refill(
                 thread,
                 vm,
                 class_id,
