@@ -20578,6 +20578,14 @@ fn native_lhm_put(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResu
     // `ExplicitQueryStatsMaxSizeTest` (query-plan stats trimmed at 100 entries).
     let this_cid = ctx.class_id_of_object(this);
     let is_plain_lhm = ctx.class_name_of_id(this_cid).as_deref() == Some("java/util/LinkedHashMap");
+    if std::env::var_os("CRATONVM_DBG_LHM_EVICT").is_some() {
+        eprintln!(
+            "[dbg-lhm-evict] this_cid={:?} class_name={:?} is_plain_lhm={}",
+            this_cid,
+            ctx.class_name_of_id(this_cid),
+            is_plain_lhm
+        );
+    }
     if !is_plain_lhm {
         if let Value::Object(Some(head)) = lhm_get(ctx, this, "head", LHM_FIELD_HEAD) {
             // The overlay node is a synthetic `java/util/LinkedHashMap$Node`
