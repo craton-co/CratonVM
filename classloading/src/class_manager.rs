@@ -113,20 +113,25 @@ fn loaded_classes_probe(
         .map(|(_, &id)| id)
 }
 
-/// `CRATONVM_LOADER_AWARE_RESOLUTION` gate (default OFF). Mirrors
+/// `CRATONVM_LOADER_AWARE_RESOLUTION` gate (default ON). Mirrors
 /// `cratonvm_vm::runtime::env_cache::loader_aware_resolution` and the
 /// native-builtins twin so the classloading half of loader-faithful class
 /// resolution (loader-faithful supertype linking in `define_class_with_options`)
-/// stays in lock-step. Default OFF keeps every define byte-identical; flip on to
-/// link an enhanced subclass to its same-loader (enhanced) supertype copy rather
-/// than the un-enhanced global one returned by `get_loaded_class_id`. Empty /
-/// `"0"` ⇒ off; any other value ⇒ on.
+/// stays in lock-step. This copy had drifted out of lock-step (still default
+/// OFF) after `env_cache::loader_aware_resolution` flipped to default ON for
+/// the `context.groovy` bug-cluster fix, which silently disabled this crate's
+/// share of the loader-faithful fixes (superclass/interface linking, verifier
+/// hierarchy lookup) by default — see
+/// `docs/known-issues/hib-bytecode-enhancement-loader-faithful-linking.md`.
+/// Flip on links an enhanced subclass to its same-loader (enhanced) supertype
+/// copy rather than the un-enhanced global one returned by
+/// `get_loaded_class_id`. Empty / `"0"` ⇒ off; any other value ⇒ on.
 fn loader_aware_resolution() -> bool {
     use std::sync::OnceLock;
     static GATE: OnceLock<bool> = OnceLock::new();
     *GATE.get_or_init(|| match std::env::var("CRATONVM_LOADER_AWARE_RESOLUTION") {
         Ok(v) => !v.is_empty() && v != "0",
-        Err(_) => false,
+        Err(_) => true,
     })
 }
 
