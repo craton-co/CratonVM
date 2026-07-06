@@ -557,6 +557,12 @@ pub fn collect_roots(shared: &SharedVm, thread: &JvmThread) -> Vec<ObjectRef> {
     //     trampoline dispatches to, reachable only through the leaked upcall
     //     userdata (Step 5 GAP C; remap companion in `gc.rs`).
     cratonvm_native_builtins::panama::gc_scan_upcall_target_roots(&mut roots);
+    //     TLS SSLContext TrustManager[] objects (t27_tls::ctx_trust_managers_table),
+    //     held so the post-handshake trust check (OCSP/CRL revocation checkers,
+    //     custom X509TrustManagers) can still call them long after
+    //     SSLContext.init returned (remap companion
+    //     `t27_tls::gc_update_tls_ctx_trust_manager_refs` in `gc.rs`).
+    cratonvm_native_builtins::t27_tls::gc_scan_tls_ctx_trust_manager_roots(&mut roots);
 
     // 21. Uniform native-root registry. Any native subsystem holding ObjectRefs
     //     in a process-global side-table can register a scan callback here

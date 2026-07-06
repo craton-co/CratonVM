@@ -6873,6 +6873,19 @@ fn register_re6_ssl_context(r: &mut NativeMethodRegistry) {
             // then use THIS context's cert+key rather than the process-global
             // slot, so an in-process server and client don't clobber each other.
             crate::t27_tls::attach_pending_identity_to_ctx(ctx, this);
+            // Stash the actual TrustManager objects passed here (may include a
+            // revocation-aware PKIXRevocationChecker attached by
+            // Tomcat's SSLUtilBase.getTrustManagers, or a fully custom
+            // X509TrustManager). rustls's own verifier only checks the
+            // certificate chain against a trust anchor — it never consults
+            // these — so without this, custom/OCSP/CRL trust managers are
+            // silently never invoked. Consulted post-handshake by
+            // `t27_tls::engine_run_trust_check`.
+            let tms_arr = match args.get(2) {
+                Some(Value::Object(Some(a))) => Some(*a),
+                _ => None,
+            };
+            crate::t27_tls::attach_trust_managers_to_ctx(ctx, this, tms_arr);
             Ok(None)
         },
     );
@@ -7020,6 +7033,10 @@ fn register_re6_ssl_context(r: &mut NativeMethodRegistry) {
                 if let Some((cert, key)) = crate::t27_tls::ctx_identity(ctx, sslctx) {
                     crate::t27_tls::set_engine_identity_override(eng, cert, key);
                 }
+                // Remember which SSLContext created this engine so the
+                // post-handshake trust check can find its TrustManager[]
+                // (independent of whether a KMF identity was also present).
+                crate::t27_tls::set_engine_trust_ctx_key(ctx, eng, sslctx);
             }
             Ok(Some(Value::Object(Some(eng))))
         });
