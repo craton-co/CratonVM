@@ -125,16 +125,55 @@ Root-caused to **two independent bugs** stacked in the same test run:
    1000 identical searches (only the first is a miss going through the write
    lock), so this points squarely at read-lock hold-count tracking under
    heavy read contention — a substantially more tractable lead than "silent
-   hang, cause unknown". Leading theory: `firstReader`/`firstReaderHoldCount`
-   are plain (non-volatile) fields in real JDK source, whose correctness
-   relies on a subtle happens-before relationship established by the
-   surrounding CAS on `state` — if CratonVM's interpreter/JIT does not
-   preserve that exact plain-write-then-CAS ordering relationship for
-   cross-thread visibility, this specific fast-path optimization could
-   observe stale/wrong counts under contention even though `ThreadLocal`
-   and CAS each work correctly in isolation. Not yet fixed — the temporary
-   diagnostic tracing was reverted (not committed) after confirming the
-   finding; needs a fix targeting that ordering guarantee, then
+   hang, cause unknown".
+
+   **Root mechanism, confirmed by code inspection (not just a theory):**
+   `firstReader`, `firstReaderHoldCount`, `cachedHoldCounter`, and `readHolds`
+   are all plain `transient` (non-`volatile`) fields in real JDK
+   (`java.util.concurrent.locks.ReentrantReadWriteLock$Sync`, confirmed via
+   `javap`). Real JDK's design deliberately relies on a well-known, legal JMM
+   pattern: a plain field write on one thread, followed by a `volatile`/CAS
+   write to `state` (declared `volatile long state` in
+   `AbstractQueuedLongSynchronizer`), "publishes" that plain write to any
+   other thread that later does a synchronizing read of `state` — this works
+   in real JVMs because a plain `int`/reference field fits in one
+   machine word, which is naturally atomic on real hardware even without a
+   fence. **CratonVM breaks this assumption**: every heap field slot is a
+   16-byte tagged `Value` (`gc/src/heap.rs`), and the plain-field accessors
+   `get_field`/`set_field` (used for ordinary, non-`volatile` `getfield`/
+   `putfield`) read/write that 16-byte slot via bare `std::ptr::read`/
+   `std::ptr::write` — **no lock, no fence, not even basic tear-freedom**.
+   By contrast, the `volatile`-field accessors `get_field_volatile`/
+   `set_field_volatile` (and `compare_and_swap_field`, used for `state`)
+   correctly protect against exactly this by acquiring a per-slot stripe
+   lock (`cratonvm_gc::collector::volatile_stripe_lock`) plus `SeqCst`
+   fences — a comment on `get_field_volatile` already explains why: "the
+   on-heap Value slot is 16 bytes, wider than any stable Rust atomic on
+   x86-64... a concurrent writer mid-store would expose a torn (tag,
+   payload) pair". That exact tearing risk applies equally to `firstReader`/
+   `firstReaderHoldCount`, which get NONE of that protection because they're
+   plain fields, not volatile ones. Under heavy contention (many threads
+   racing to become/stop being "the first reader", exactly `testAllEqual`'s
+   999-read-lock-hit shape), a torn 16-byte read/write of `firstReader` can
+   yield a `Value` with a mismatched tag/payload pair — corrupting the
+   reference-equality check `firstReader == currentThread` or the hold count
+   in ways that can either silently swallow a signal (the observed hang) or
+   surface as the exact thrown exception observed here, depending on timing.
+
+   This is very likely a **broader-than-this-bug architectural gap**: any
+   JDK-internal (or user) code relying on "plain field write is atomic
+   because it's word-sized" — a legal, common pattern in real JVMs — is
+   potentially exposed wherever CratonVM's 16-byte boxed `Value`
+   representation makes that assumption false. Fixing it properly means
+   giving plain field slot access at least tear-freedom (not necessarily
+   full ordering) uniformly, which touches one of the hottest code paths in
+   the whole VM and needs real performance evaluation — this is a
+   substantially bigger, riskier change than anything else in this
+   investigation and deserves its own dedicated, carefully-scoped effort
+   rather than a quick patch. Not yet fixed — the temporary diagnostic
+   tracing used to surface this (`vm/src/vm/vm_exec.rs` park/unpark trace
+   logging) was reverted (not committed) after confirming the finding; a
+   real fix needs to close the plain-slot tearing gap, then
    reconfirmation that the hang (not just the exception under perturbed
    timing) is resolved.
 
