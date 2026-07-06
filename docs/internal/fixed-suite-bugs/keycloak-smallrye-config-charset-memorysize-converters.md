@@ -9,7 +9,7 @@ CratonVM now routes Quarkus `LoggingSetupRecorder.handleFailedStart()` through a
 ## Validation
 
 - Direct repro: `ProbeLogHandler` under CratonVM now exits `rc=0` and prints `loghandler-ok`; before the fix it failed with `SRCFG00013` for `java.nio.charset.Charset` and `io.quarkus.runtime.configuration.MemorySize`.
-- Suite probe: `tests/base :: org.keycloak.tests.admin.identityprovider.IdentityProviderMapperTest` no longer fails in `beforeAll` with `ConfigValidationException`; it starts all 5 test methods and now fails later with `Failed to resolve next requested instance to deploy`, tracked separately in `docs/known-issues/keycloak-07-04/keycloak-testframework-deploy-requested-instances-resolution.md`.
+- Suite probe: `tests/base :: org.keycloak.tests.admin.identityprovider.IdentityProviderMapperTest` no longer fails in `beforeAll` with `ConfigValidationException`; it starts all 5 test methods and now fails later with `Failed to resolve next requested instance to deploy`. That bug is now fixed too (root cause: `LinkedList.addAll(LinkedList)`, see `docs/internal/fixed-suite-bugs/keycloak-testframework-linkedlist-addall-deployrequestedinstances-FIXED.md`); the residual is `docs/known-issues/keycloak-07-04/keycloak-testframework-phaser-forkjoinpool-sisu-hang.md`.
 
 ---
 
