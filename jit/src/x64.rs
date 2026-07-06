@@ -25021,7 +25021,17 @@ pub fn compile_with_param_slots(
         || compiler.emitted_athrow
         // A fallible `newarray` OOM bail needs the per-thread TLS set so the
         // helper can GC + construct the OOME (same rationale as direct_calls).
-        || compiler.emitted_alloc_oom_check;
+        || compiler.emitted_alloc_oom_check
+        // BUG-1 companion — a direct (non-dispatch) self-recursive CALL site:
+        // its stack guard stashes a catchable StackOverflowError near native
+        // exhaustion and returns the i64::MIN sentinel, so the method MUST be
+        // entered through the dispatch-aware path that sets `JIT_THREAD` (the
+        // guard constructs the SOE through it) and drains
+        // `JIT_PENDING_EXCEPTION` on return. Without this, the register-only
+        // fast entry mis-read the sentinel as a return value (int-truncated
+        // to 0) and leaked the pending SOE (observed: DeepRec printed
+        // "no-overflow r=0" instead of catching the error).
+        || !compiler.self_call_patches.is_empty();
     let mut cm = if needs_heap {
         CompiledMethod::new_with_context(compiler.buf)
     } else {
