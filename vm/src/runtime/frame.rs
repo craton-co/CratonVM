@@ -1047,7 +1047,20 @@ impl Frame {
     #[inline(always)]
     fn invalidate_cat2_upper_half(&mut self, i: usize, kind: u8) {
         if (kind == LKIND_LONG || kind == LKIND_DOUBLE) && i + 1 < self.locals.len() {
-            self.locals[i + 1] = CompactValue::int(0);
+            // Marking `local_kinds[i + 1]` as LKIND_LONG/_DOUBLE tells every
+            // other reader (the GC scan gate at `scan_local_objects`,
+            // `update_local_refs`, and `get_local_raw`) to treat this slot's
+            // `CompactValue` as raw untagged bits, not NaN-boxed — that's
+            // exactly how a real Long/Double `CompactValue` is stored (see
+            // `CompactValue::long`/`double`). The filler must honor that same
+            // contract: `CompactValue::int(0)` is NaN-boxed (`raw_bits()` ==
+            // `0xFFFC_0000_0000_0000`, not `0`), so a kind-consistent reader
+            // like `get_local_raw` would report a bogus non-zero "upper half"
+            // instead of the clean `0` this comment promises. `long(0)` is
+            // stored bit-exact as `0` and is still provably a non-object
+            // (untagged bit patterns never satisfy `is_nan_tagged`), so it's
+            // just as safe a filler while being raw-bits-correct too.
+            self.locals[i + 1] = CompactValue::long(0);
             self.local_kinds[i + 1] = kind;
         }
     }
