@@ -1478,18 +1478,38 @@ unsafe fn slot_ptr(obj_ref: ObjectRef, index: usize) -> *mut u8 {
 /// `Value::Object(None)` so the discriminant byte is 4 and this read yields
 /// `null`, not `Int(0)`.
 ///
+/// PLAIN-SLOT TEARING FIX (2026-07-06): this used to be a bare
+/// `std::ptr::read::<Value>(ptr)` — a non-atomic 16-byte copy that can race
+/// a concurrent plain `set_field` from another mutator thread. Commit
+/// `4e6b560f` ("atomic-per-word object-slot access for concurrent marking")
+/// already closed this gap for the GC-marker-vs-JIT-store race using
+/// `cratonvm_types::read_value_atomic`/`write_value_atomic`, but left the
+/// interpreter's own plain `get_field`/`set_field` (this function) using the
+/// raw, non-atomic path — so two ordinary mutator threads doing plain
+/// `getfield`/`putfield` on the SAME field slot could still tear each
+/// other's writes. Real JDK library code legally relies on this being
+/// tear-free (e.g. `ReentrantReadWriteLock$Sync`'s plain `firstReader`/
+/// `firstReaderHoldCount`, published via a nearby `volatile`/CAS write to
+/// `state` — see
+/// docs/known-issues/elasticsearch-lucene-binary-docvalues-range-hangs.md
+/// #3). Delegates to the same already-proven `read_value_atomic` helper.
+///
 /// # Safety
 /// The pointer must be valid and 8-byte aligned.
 unsafe fn read_slot(ptr: *mut u8) -> Value {
-    std::ptr::read(ptr as *const Value)
+    cratonvm_types::read_value_atomic(ptr as *const Value)
 }
 
 /// Write a `Value` into a slot.
 ///
+/// See [`read_slot`]'s PLAIN-SLOT TEARING FIX note — delegates to the same
+/// already-proven `write_value_atomic` helper so a concurrent plain reader
+/// on another mutator thread can never observe a torn (tag, payload) pair.
+///
 /// # Safety
 /// The pointer must be valid and 8-byte aligned.
 unsafe fn write_slot(ptr: *mut u8, value: Value) {
-    std::ptr::write(ptr as *mut Value, value);
+    cratonvm_types::write_value_atomic(ptr as *mut Value, value);
 }
 
 // ---------------------------------------------------------------------------
