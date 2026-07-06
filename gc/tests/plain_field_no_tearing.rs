@@ -43,6 +43,12 @@ fn plain_field_int_slot_never_tears_under_concurrent_access() {
     const A: i32 = 0x1111_1111;
     const B: i32 = 0x2222_2222_u32 as i32;
 
+    // Establish A as the slot'''s initial value BEFORE spawning the reader: a
+    // freshly-allocated slot is zero-initialized (decodes as Value::Int(0)),
+    // and 0 is neither A nor B, so a reader started before the writer'''s first
+    // store would see a legitimate-but-unaccounted-for transient value -- a
+    // test-harness race, not a torn read.
+    heap.set_field(obj, 0, Value::Int(A));
     let stop = Arc::new(AtomicBool::new(false));
 
     let h_writer = {
@@ -99,6 +105,10 @@ fn plain_field_object_slot_never_tears_under_concurrent_access() {
     let ref_a = heap.alloc_object(class_id, 0);
     let ref_b = heap.alloc_object(class_id, 0);
 
+    // Establish ref_a as the slot'''s initial value before spawning the reader
+    // -- see the matching note in the Int test above (a fresh slot decodes as
+    // Value::Int(0), i.e. Value::Object(None) here, neither ref_a nor ref_b).
+    heap.set_field(obj, 0, Value::Object(Some(ref_a)));
     let stop = Arc::new(AtomicBool::new(false));
 
     let h_writer = {

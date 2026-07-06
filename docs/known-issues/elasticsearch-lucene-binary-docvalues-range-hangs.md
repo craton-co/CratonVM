@@ -268,6 +268,41 @@ testAllEqual` end-to-end run still needs to happen on a host with the ES
 checkout (the Windows box, not this Linux build host) to fully close out
 root cause #3.
 
+**Follow-up on the separate JIT-specific reader-vs-writer bug (2026-07-06):**
+investigated with `CRATONVM_DBG_JITC=1` compile tracing and direct
+rebuild-and-retest bisection (forcing suspect methods onto the JIT skip-list
+one batch at a time). Ruled out: 7 small AQS/RRWL helper methods that get
+JIT-compiled during the repro (`readLock`, `getState`, `compareAndSetState`,
+`sharedCount`, `exclusiveCount`, `readerShouldBlock`,
+`apparentlyFirstQueuedIsExclusive`) and the entire `java.lang.ThreadLocal`/
+`ThreadLocalMap` family (12 methods) -- forcing all of these to interpret
+does NOT fix the hang. Also ruled out as a red herring: the reader loop
+(`lambda$main$0`-shaped methods with a `try/finally` around `unlock()`) never
+successfully OSR-compiles at all (0 successes across 105 attempts in one
+run) because such a method's bytecode contains `athrow` (the standard
+javac try-finally lowering), and CratonVM deliberately never OSR-compiles an
+`athrow`-containing method -- by design, not a bug.
+
+Along the way, found and fixed a genuinely separate, real bug: `jit_getfield`
+(`vm/src/jit/helpers.rs`) -- the native helper JIT-compiled code calls to
+execute a `getfield` -- read the 16-byte `Value` slot via a bare, non-atomic
+`std::ptr::read`, asymmetric with `jit_putfield_int/long/float/double/object`
+(which already use `write_value_atomic`, per commit `4e6b560f`). This is the
+exact same tearing gap as root cause #3's mechanism, just in the JIT's own
+field-read helper rather than the interpreter's `get_field` -- a real,
+independently-valuable fix (own regression test added), but empirically
+confirmed via rebuild-and-retest that it does NOT fix this specific
+reader-vs-continuously-cycling-writer hang either.
+
+Net result: the actual mechanism behind this second, JIT-specific hang
+remains unidentified after 22 candidate methods ruled out plus one real (but
+insufficient) bug fixed and merged. Flagged for a future session with a
+narrower, more targeted approach (e.g. binary-search bisection of the
+FULL compiled-method set rather than trace-informed guessing, or JIT-compiled
+code disassembly via `CRATONVM_DBG_JIT_DISASM`) -- see the project tracking
+for this investigation for the full list of what's been ruled out, so a
+future session doesn't repeat the same 22-method sweep.
+
 ## Current full-suite result
 
 Run `es-current-full-jiton-20260702`, `all[1..2701]`, CratonVM JIT-on,
