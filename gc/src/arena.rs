@@ -44,6 +44,12 @@ pub struct FreeBlock {
 /// below the minimum TLAB refill (16 KiB+).
 const LARGE_BLOCK_MIN: usize = 4096;
 
+/// Per-allocation scan budget for the small-hole tier — see
+/// [`Arena::first_fit`]. 16 keeps the uniform-hole case (hit at ~index 0)
+/// untouched while capping the dust-prefix walk at a handful of compares;
+/// a miss falls through to the bump tail / caller's old-gen spill.
+const SMALL_TIER_SCAN_BUDGET: usize = 16;
+
 pub struct Arena {
     /// Backing storage. Pre-allocated to `capacity` bytes.
     data: Vec<u8>,
@@ -110,18 +116,30 @@ impl Arena {
         }
     }
 
-    /// First-fit scan of ONE tier. On a fit: removes the block (O(1)
-    /// `swap_remove`), returns the aligned allocation offset plus up to two
-    /// remainder blocks (head alignment padding, tail leftover) for the
-    /// caller to re-route by size. `None` = nothing in this tier fits.
+    /// First-fit scan of ONE tier, visiting at most `max_scan` blocks. On a
+    /// fit: removes the block (O(1) `swap_remove`), returns the aligned
+    /// allocation offset plus up to two remainder blocks (head alignment
+    /// padding, tail leftover) for the caller to re-route by size. `None` =
+    /// nothing within the scan budget fits.
+    ///
+    /// The budget exists for the SMALL tier: `swap_remove` back-fills with
+    /// the most recently pushed block, so tiny split remainders ("dust")
+    /// drift toward the scan prefix, and an unbounded first-fit paid an
+    /// ever-growing dust walk on every object-sized allocation
+    /// (binarytrees-18: `Arena::alloc` was 47% of wall). A bounded scan
+    /// keeps the uniform-hole hit at ~index 0 while a dusty prefix gives up
+    /// quickly — the caller falls through to the bump tail / old-gen spill,
+    /// both valid homes for the object. Skipped blocks stay on the list, so
+    /// the sweep walker's hole map (`free_blocks_sorted`) is unaffected.
     #[inline]
     fn first_fit(
         list: &mut Vec<FreeBlock>,
         base: usize,
         size: usize,
         align: usize,
+        max_scan: usize,
     ) -> Option<(usize, [Option<FreeBlock>; 2])> {
-        for i in 0..list.len() {
+        for i in 0..list.len().min(max_scan) {
             let block = list[i];
             let block_addr = base + block.offset;
             let aligned_addr = (block_addr + align - 1) & !(align - 1);
@@ -180,10 +198,18 @@ impl Arena {
             // first-fits at ~index 0.
             let worst_need = size.saturating_add(align - 1);
             let hit = if worst_need < LARGE_BLOCK_MIN {
-                Self::first_fit(&mut self.free_small, base, size, align)
-                    .or_else(|| Self::first_fit(&mut self.free_large, base, size, align))
+                Self::first_fit(
+                    &mut self.free_small,
+                    base,
+                    size,
+                    align,
+                    SMALL_TIER_SCAN_BUDGET,
+                )
+                .or_else(|| {
+                    Self::first_fit(&mut self.free_large, base, size, align, usize::MAX)
+                })
             } else {
-                Self::first_fit(&mut self.free_large, base, size, align)
+                Self::first_fit(&mut self.free_large, base, size, align, usize::MAX)
             };
             if let Some((alloc_offset, remainders)) = hit {
                 for r in remainders.into_iter().flatten() {
@@ -193,19 +219,20 @@ impl Arena {
                 // block, which came from a region inside the buffer.
                 return Some(unsafe { self.data.as_mut_ptr().add(alloc_offset) });
             }
-            // Both tiers scanned with no fit: the exact maximum is now
-            // known — tighten the upper bound (sound: alloc only shrinks/
-            // splits blocks; only add_free_block can raise it again). For a
-            // large request that skipped the small tier the small blocks
-            // are all < LARGE_BLOCK_MIN <= worst_need, so bounding by the
-            // large-tier max plus the tier ceiling stays conservative.
-            let large_max = self.free_large.iter().map(|b| b.size).max().unwrap_or(0);
-            self.max_free_upper = if worst_need < LARGE_BLOCK_MIN {
-                let small_max = self.free_small.iter().map(|b| b.size).max().unwrap_or(0);
-                large_max.max(small_max)
-            } else {
-                large_max.max(LARGE_BLOCK_MIN.saturating_sub(1).min(self.max_free_upper))
-            };
+            // No fit. Tighten the upper bound only when the failure was a
+            // FULL view of the relevant tiers (a bounded small-tier scan
+            // may have skipped bigger blocks, so its miss proves nothing).
+            if worst_need >= LARGE_BLOCK_MIN {
+                // The whole span tier was scanned; the small tier caps below
+                // LARGE_BLOCK_MIN <= worst_need by construction.
+                let large_max = self.free_large.iter().map(|b| b.size).max().unwrap_or(0);
+                let small_cap = if self.free_small.is_empty() {
+                    0
+                } else {
+                    LARGE_BLOCK_MIN - 1
+                };
+                self.max_free_upper = self.max_free_upper.min(large_max.max(small_cap));
+            }
         }
 
         // Bump-allocation path: align the cursor up (checked to prevent
