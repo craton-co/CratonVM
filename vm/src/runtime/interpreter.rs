@@ -1692,43 +1692,6 @@ fn tlab_alloc_object(
     num_fields: usize,
     total_size: usize,
 ) -> Option<ObjectRef> {
-    tlab_alloc_object_inner(thread, shared, class_id, num_fields, total_size, false)
-}
-
-/// [`tlab_alloc_object`] for the JIT allocation slow path
-/// (`jit_new_object`): identical bump-allocation, but the REFILL arm first
-/// probes young-gen headroom for the requested chunk and bails to the
-/// caller's non-TLAB fallback when young is tight.
-///
-/// Rationale: the JIT slow path historically never refilled TLABs — once
-/// young filled with live data it spilled every allocation to old gen.
-/// Unconditionally adopting the interpreter's refill here made
-/// binarytrees-18 (a large LIVE young set under the non-moving sweep)
-/// pathological: each refill window ended in another young probe failure →
-/// forced GC → O(live) sweep that freed almost nothing, turning a 10.6s run
-/// into 460s. Guarding the refill keeps the (large) TLAB win for workloads
-/// with young headroom (binarytrees-16: 10x faster) while preserving the
-/// old-gen spill behaviour under pressure.
-#[inline(always)]
-pub(crate) fn tlab_alloc_object_guarded_refill(
-    thread: &mut JvmThread,
-    shared: &SharedVm,
-    class_id: ClassId,
-    num_fields: usize,
-    total_size: usize,
-) -> Option<ObjectRef> {
-    tlab_alloc_object_inner(thread, shared, class_id, num_fields, total_size, true)
-}
-
-#[inline(always)]
-fn tlab_alloc_object_inner(
-    thread: &mut JvmThread,
-    shared: &SharedVm,
-    class_id: ClassId,
-    num_fields: usize,
-    total_size: usize,
-    refill_needs_young_headroom: bool,
-) -> Option<ObjectRef> {
     use std::sync::atomic::Ordering;
 
     // Fast path: bump-allocate from the current TLAB without taking
@@ -1771,17 +1734,6 @@ fn tlab_alloc_object_inner(
         // somehow returns zero (pathological input).
         n.max(cratonvm_gc::tlab::min_tlab_size())
     };
-
-    // JIT slow path (`tlab_alloc_object_guarded_refill`): carve a fresh TLAB
-    // only when the young BUMP TAIL can spare the chunk — an O(1) check.
-    // Otherwise let the caller take its non-TLAB fallback (old-gen spill),
-    // preserving the pre-refill behaviour under young pressure. Probing the
-    // young FREE LIST here instead (try_alloc_young_probe →
-    // largest_free_block) re-scanned a fragmented free list on every slow
-    // allocation — 55% of a binarytrees-18 run. See the wrapper doc.
-    if refill_needs_young_headroom && !shared.heap.young_bump_headroom(requested) {
-        return None;
-    }
 
     // Bug-D fix (TLAB tail-filler on refill, 2026-06-12): retire the OUTGOING
     // TLAB *before* replacing it. The fast path above returned `None` because

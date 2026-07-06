@@ -1729,46 +1729,17 @@ pub unsafe extern "C" fn jit_new_object(vm_ptr: i64, class_id_raw: i64, num_fiel
             &format!("Java heap space (new_object class_id {class_id_raw} fields {num_fields})"),
         );
     }
-    // TLAB refill-aware allocation — mirrors the interpreter's
-    // `gc_alloc_object` medium path. The inline JIT bump only consumes an
-    // EXISTING TLAB: once it filled, this helper previously routed EVERY
-    // subsequent allocation through the global `try_alloc_object_full`
-    // (lock + arena scan) without ever installing a fresh TLAB, so
-    // allocation-heavy compiled code paid the full slow chain per object
-    // (~25% of binarytrees-18 wall time in the slow-alloc call graph).
-    // `tlab_alloc_object` bump-allocates and adaptively refills the thread's
-    // TLAB, which also restores the JIT's INLINE bump fast path for the
-    // following allocations.
-    if total_size <= cratonvm_gc::tlab::tlab_max_alloc() {
-        if let Some((thread, _guard)) = jit_thread_mut() {
-            if let Some(obj_ref) = crate::runtime::interpreter::tlab_alloc_object_guarded_refill(
-                thread,
-                vm,
-                class_id,
-                num_fields as usize,
-                total_size,
-            ) {
-                jit_init_primitive_fields(vm, obj_ref, class_id);
-                let has_fin = vm
-                    .class_manager
-                    .read()
-                    .class_store
-                    .get(class_id)
-                    .map_or(false, |c| c.has_finalizer);
-                if has_fin {
-                    vm.register_finalizable(obj_ref.as_ptr() as usize);
-                }
-                if dbg_jit_alloc_filter() == Some(class_id_raw as u32) {
-                    eprintln!(
-                        "[JIT_ALLOC] new_object(tlab) class_id={} obj=0x{:x}",
-                        class_id_raw,
-                        obj_ref.as_ptr() as usize
-                    );
-                }
-                return obj_ref.as_ptr() as i64;
-            }
-        }
-    }
+    // NOTE (JIT TLAB refill — attempted 2026-07-06, REVERTED): routing this
+    // slow path through the interpreter's TLAB refill (`tlab_alloc_object`)
+    // made small binarytrees runs ~10x faster (bt16 3s → 0.33s) but was
+    // pathological at bt18 scale: young-gen churn against a large live set
+    // under the non-moving sweep (and O(free-list) probes once young
+    // fragmented) turned 10.6s into 40-460s depending on the refill gate
+    // (even an O(1) bump-tail-only gate — `VmHeap::young_bump_headroom`,
+    // kept in the gc crate — still ended at ~119s). Restoring the historical
+    // behaviour (no refill here; old-gen spill under pressure) until TLAB
+    // refill is co-designed with young promotion/cursor semantics.
+    //
     // Fallible young → old-gen alloc (preserves alloc_object's old-gen spill);
     // on exhaustion surface a catchable OutOfMemoryError instead of the hard
     // abort in alloc_young. The `new` codegen's emit_post_alloc_oom_check bails
