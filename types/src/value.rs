@@ -831,6 +831,37 @@ pub unsafe fn read_value_checked(ptr: *const Value) -> Option<Value> {
     Some(std::ptr::read(ptr))
 }
 
+/// Atomic counterpart of [`read_value_checked`] — validates the discriminant
+/// **and** reads the slot tear-free, for a field slot that can be
+/// concurrently written by another mutator thread doing a plain (non-JIT)
+/// `putfield`.
+///
+/// `read_value_checked` reads via plain `ptr::read`, which is fine for a
+/// slot no other thread can be concurrently mutating (e.g. a one-shot
+/// forensic scan after the fact). But the interpreter's plain `get_field` —
+/// used for ordinary, non-`volatile` Java fields — can race a concurrent
+/// plain `set_field` on the SAME slot from another mutator thread. Real JDK
+/// library code legally relies on exactly this being tear-free (e.g.
+/// `ReentrantReadWriteLock$Sync`'s plain `firstReader`/`firstReaderHoldCount`
+/// fields, published via a nearby `volatile`/CAS write to `state` — see
+/// docs/known-issues/elasticsearch-lucene-binary-docvalues-range-hangs.md
+/// #3). This combines [`read_value_atomic`]'s tear-free two-word read with
+/// `read_value_checked`'s discriminant validation, so a corrupted slot still
+/// safely returns `None` instead of risking a wild jump-table match.
+///
+/// # Safety
+/// `ptr` must be a readable, 8-byte-aligned pointer to a 16-byte `Value` slot.
+#[inline]
+pub unsafe fn read_value_checked_atomic(ptr: *const Value) -> Option<Value> {
+    let w0 = (*(ptr as *const AtomicU64)).load(Ordering::Relaxed);
+    let disc = w0 as u32;
+    if disc > VALUE_MAX_DISCRIMINANT {
+        return None;
+    }
+    let w1 = (*((ptr as *const u8).add(8) as *const AtomicU64)).load(Ordering::Relaxed);
+    Some(std::mem::transmute::<[u64; 2], Value>([w0, w1]))
+}
+
 impl fmt::Display for Value {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
