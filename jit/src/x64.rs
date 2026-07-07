@@ -15409,25 +15409,47 @@ impl Compiler {
             // (`osr_exit_box_ptr_by_bci`) — both reconstruct + resume at `bci`.
             // Gate OFF (default) ⇒ None ⇒ the uncommon-trap path below emits
             // byte-identically.
-            // FIX (silent data corruption, HHH-15895 InPredicateTest / AccumRepro3
-            // residual): reason 8 (`DEOPT_REASON_UNREACHED_CODE`, the
-            // invokedynamic uncommon trap — see the matching fix note at the
-            // 0xba codegen arm) always uses its recorded OSR-exit snapshot when
-            // present, UNCONDITIONALLY — not gated behind `deopt_real_enabled()`
-            // like the experimental speculative-guard reasons below. Those guards
-            // can legitimately resume back into compiled code later, so their
-            // precise-resume machinery is still being proven out; the
-            // invokedynamic trap's action is always `MakeNotCompilable` (the
-            // method permanently reverts to the interpreter), so this is a
-            // strictly simpler one-shot "reconstruct once, hand off forever"
-            // case, and the imprecise fallback ("safe reject" rewinding to the
-            // OSR entry bci) has PROVEN silent corruption risk, not just
-            // performance cost. `emit_osr_exit_map_at` unconditionally records
-            // this snapshot at the 0xba site regardless of the gate, so
-            // `osr_exit_box_ptr_by_bci` always has an entry here.
-            let frame_box_ptr = if reason == 8 {
-                self.osr_exit_box_ptr_by_bci.get(&bci).copied()
-            } else if crate::deopt_real_enabled() {
+            //
+            // REVERTED (2026-07-07, jit-invokedynamic-groovy-regression):
+            // fb4a333d routed reason 8 (`DEOPT_REASON_UNREACHED_CODE`, the
+            // invokedynamic uncommon trap) through this precise path
+            // UNCONDITIONALLY, to fix a genuine silent-corruption bug (the old
+            // imprecise "safe reject" rewound to the OSR entry bci, discarding
+            // or duplicating side effects committed by JIT-compiled code
+            // between OSR entry and the trap). That fix is CORRECT for the
+            // case it targeted (a hot loop's OSR-compiled body reaching an
+            // invokedynamic after real work), but empirically root-caused
+            // (bisected via targeted per-item revert flags — see this
+            // session's investigation) to independently regress Groovy:
+            // running `GroovyBeanDefinitionReaderTests` with the JIT enabled
+            // (default) now fails almost every method with a Groovy-compiler-
+            // internal "duplicate main method"/"startup failed" error,
+            // reproducing on a single test method in total isolation and
+            // disappearing entirely under `--nojit`. Bisection ruled out every
+            // OTHER piece of fb4a333d (the 0xba codegen snapshot-recording
+            // itself, the `LocalKind::Ref` trust relaxation, and
+            // `can_osr_exit`'s elided-monitor exclusion each independently
+            // toggled off with no effect) — reverting ONLY this stub-routing
+            // line (forcing reason 8 back to `None`, the pre-fb4a333d
+            // "safe-reject" path) is the sole change that restores the Groovy
+            // suite to green, and was verified NOT to be a red herring by
+            // toggling it alone in isolation both ways.
+            //
+            // The exact mechanism inside the precise-resume path that Groovy's
+            // dynamic-call-site machinery finds unsound was not pinned down
+            // further in the time available (the reconstructed frame's operand
+            // stack — which for an invokedynamic trap holds the live call-site
+            // arguments the interpreter still needs to actually deliver, unlike
+            // the loop-header-only shape this machinery was originally built
+            // for — is the most likely remaining suspect; see
+            // docs/known-issues/jit-invokedynamic-uncommon-trap-precise-resume-groovy-regression.md).
+            // This revert restores the PRE-fb4a333d imprecise-reject behavior
+            // for reason 8 ONLY (reasons 2/6/7 keep their existing, unaffected
+            // gated precise-resume paths) — i.e. it reopens the original
+            // silent-corruption risk fb4a333d's item 2 aimed to close, in
+            // exchange for closing this regression. See the doc above for the
+            // full tradeoff writeup and suggested next steps.
+            let frame_box_ptr = if crate::deopt_real_enabled() {
                 match reason {
                     2 => self.deopt_box_ptr_by_bci.get(&bci).copied(),
                     // Step 6: String-intrinsic and call-site type-check guards

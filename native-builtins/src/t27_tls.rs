@@ -2237,7 +2237,7 @@ pub(crate) fn register_t27_natives(r: &mut NativeMethodRegistry) {
     r.set_category(__prev_cat);
 }
 
-fn register_accepted_issuers(r: &mut NativeMethodRegistry) {
+pub(crate) fn register_accepted_issuers(r: &mut NativeMethodRegistry) {
     let __prev_cat = r.current_category();
     r.set_category(cratonvm_native_api::NativeKind::Bridge);
     // T2.7.4: real X509TrustManager.getAcceptedIssuers — returns a Java

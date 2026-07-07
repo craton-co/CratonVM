@@ -266,3 +266,19 @@ can re-verify *any* fix in this area by hand-driving `standalone.sh`/`domain.sh`
 only the original Maven/Surefire/Arquillian harness (not available on the probe host used
 here) reaches far enough, which is presumably how the 2026-07-05 evidence in those docs was
 originally captured.
+
+## 2026-07-07 Follow-up — the remaining next-steps from this doc are DONE
+
+Branch `fix/wildfly-msc-realstart-boot-20260707`: the unidentified
+`ApplicationServerService.start()` exception was identified (a
+`StabilityMonitor.addController` ClassCastException on the synthetic mirror)
+and fixed, `ServiceController.addListener`/`removeListener` are implemented
+(with rest-state replay + transition events), the `demand()`/dependents/
+`setMode` queue-race hazards are guarded, and eight further blockers behind
+them were fixed (value plumbing, alias resolution, anonymous installs,
+legacy getValue/Injector wiring, getState enum constants, getElapsedTime/
+getStartException/getValue natives). Standalone boot now reaches subsystem
+initialization with zero MSC service failures. Full list + the new proximate
+blocker (a GC/STW cooperative-mutator stall, different bug class) in
+`docs/known-issues/wildfly-domain-managed-servers-timeout.md` (2026-07-07
+update).

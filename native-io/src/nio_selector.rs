@@ -1942,7 +1942,24 @@ fn selector_select_native(ctx: &mut dyn NativeContext, args: &[Value]) -> Method
         return Ok(Some(Value::Int(0)));
     }
     refresh_selector_handles(ctx, id);
-    let n = selector_select(id, timeout)?;
+    // GC-blocking audit (gc-blocked-thread-frame-stale-thread-mirror, proper-
+    // fix item 2): every call reaching this native is a BLOCKING select (the
+    // non-blocking probe rides the dedicated selectNow0 path), parking the
+    // thread in the kernel wait for up to `timeout` — indefinitely for the
+    // translated select(0). Without the blocking-region bracket every
+    // cross-thread STW GC must wait for each selector loop to tick out of
+    // epoll_wait (Tribes/Tomcat NIO threads stalled every collection), and an
+    // indefinite select wedges `wait_for_all` outright. `obj` is dispatched
+    // on after the wait, so re-sync it through `end_blocking_region_refs`.
+    let mut held = vec![Value::Object(Some(obj))];
+    ctx.begin_blocking_region();
+    let select_res = selector_select(id, timeout);
+    ctx.end_blocking_region_refs(&mut held);
+    let obj = match held[0] {
+        Value::Object(Some(o)) => o,
+        _ => return Ok(Some(Value::Int(0))),
+    };
+    let n = select_res?;
     apply_ready_ops(ctx, id);
     populate_selected_keys_field(ctx, obj, id);
     Ok(Some(Value::Int(n)))
@@ -2004,14 +2021,31 @@ fn populate_selected_keys_field(ctx: &mut dyn NativeContext, selector: ObjectRef
             .filter_map(|k| k.key_obj)
             .collect()
     };
-    for key in ready {
+    if ready.is_empty() {
+        return;
+    }
+    // Each Set.add below runs Java bytecode and may trigger a moving GC, so
+    // the raw `set` receiver and the still-pending key refs go stale after
+    // the first add (observed as an all-zero-header java/util/Set receiver +
+    // `NoSuchMethodError Object.add` under Tribes' ParallelNioSender.doLoop).
+    // Pin them all and re-read through the pins before every dispatch. The
+    // single unpin pops the whole watermark (set pin + key pins).
+    let set_pin = ctx.pin_native_root(set);
+    let key_pins: Vec<_> = ready
+        .iter()
+        .map(|k| (ctx.pin_native_root(*k), *k))
+        .collect();
+    for (pin, orig) in key_pins {
+        let set_cur = ctx.read_native_pin(set_pin, set);
+        let key_cur = ctx.read_native_pin(pin, orig);
         let _ = ctx.invoke_virtual(
-            set,
+            set_cur,
             "add",
             "(Ljava/lang/Object;)Z",
-            &[Value::Object(Some(key))],
+            &[Value::Object(Some(key_cur))],
         );
     }
+    ctx.unpin_native_roots(set_pin);
 }
 
 /// `SelectorImpl.selectNow0()` → int

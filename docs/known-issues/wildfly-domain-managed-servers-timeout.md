@@ -196,3 +196,101 @@ already `Up`/`Failed` — which our shadow container has no mechanism to notify 
 4. Once boot reaches real sustained concurrent execution, resolve whichever corrupt-cell
    hypothesis is live in `wildfly-domain-heap-corrupt-value-timeout.md`, and confirm this
    doc's original `awaitServers` timeout is gone.
+
+## 2026-07-07 Update — MSC real-start boot infrastructure cleared; standalone boot reaches subsystem initialization; new proximate blocker is a GC/STW cooperation stall
+
+Branch `fix/wildfly-msc-realstart-boot-20260707` (Azure host, same WildFly
+32.0.1.Final binary-distribution repro as above, `CRATONVM_MSC_REAL_START=1
+CRATONVM_DISABLE_JIT=1`, real JDK 25). All three "recommended next steps"
+from the update above are DONE, plus eight more blockers found and fixed
+behind them (all in `native-builtins/src/jboss_msc.rs`; every behavioral
+change is gated behind `CRATONVM_MSC_REAL_START` except the diagnostics):
+
+1. **start()-failure logging decoded** (exception class + `detailMessage`,
+   plus full `printStackTrace` under `CRATONVM_DBG_MSC`). The previously
+   "unidentified exception" from `ApplicationServerService.start()` was
+   `ClassCastException: ServiceController cannot be cast to
+   ServiceControllerImpl` — real `StabilityMonitor.addController`
+   (StabilityMonitor.java:115) downcasting our synthetic controller mirror.
+2. **`StabilityMonitor.addController`/`removeController` → no-op natives.**
+   Per-monitor membership is redundant: the `awaitStability` natives already
+   answer from the global shadow container.
+3. **`ServiceController.addListener`/`removeListener` implemented** with real
+   MSC semantics: listeners stored + GC-rooted per service
+   (`service_roots`), fired on Up/Failed transitions from the drive loop,
+   and the rest-state event REPLAYED on `addListener`
+   (`BootstrapImpl.internalBootstrap`'s completion chain requires the
+   replay). Was `AbstractMethodError` on any call.
+4. **`ServiceController.getStartException`/`getValue`,
+   `LifecycleContext.getElapsedTime` natives** — same
+   code-less-interface-method `AbstractMethodError` family, hit by
+   `BootstrapImpl$1`'s FAILED branch and `BootstrapListener` boot timing.
+5. **`getState` now returns the real `ServiceController$State` enum
+   constant** (via `valueOf`; ordinal-Int fallback for mock contexts). The
+   old Int return silently failed `WritableValueImpl.accept`'s
+   `state == State.STARTING` reference compare — killing ALL modern value
+   injection.
+6. **P3 value plumbing wired** (`wire_provides_injectors`): `install()` now
+   sets each provides-`WritableValueImpl.controller` to the mirror AND the
+   per-name real `ServiceRegistrationImpl.injector` (via the target's real
+   `getOrCreateRegistration`), exactly what real `install()`'s
+   `registration.set(...)` does. Fixes both
+   `IllegalStateException("Outside of Service lifecycle method")` (all
+   `jboss.server.path.*` services) and `"Service is not installed"` on the
+   requires side.
+7. **Alias index for dependency resolution**: `requires(X)` is now satisfied
+   by a service providing `X` under a different primary name (WildFly
+   capability names — `org.wildfly.management.executor` etc.), matching real
+   MSC's per-registration model. `can_start`/`get_id`/`getService` resolve
+   through it.
+8. **Anonymous installs no longer dropped**: `ServiceTarget.addService()`
+   with no name (addressable only via `provides()`) previously bailed with
+   "unreadable serviceId", silently losing whole services —
+   `ControlledProcessStateService` (provides
+   `org.wildfly.management.process-state-notifier`) was lost this way,
+   permanently dep-blocking `console-availability` → `server-controller`.
+   The first provided name is promoted to primary; the rest become aliases.
+9. **`ServiceRegistrationImpl.getValue` intercepted** with full semantics:
+   injector-wired (modern) providers delegate to the real
+   `WritableValueImpl`; LEGACY 2-arg `addService(name, Service)` providers
+   (the management executor, `ServerService$ServerExecutorService`) resolve
+   through the shadow container to the legacy `Service.getValue()`. Real
+   bytecode previously required `registration.instance` (never populated
+   under interception) and threw `"Service is not installed"`.
+10. **Legacy `addDependency(name, type, Injector)` injection wired**:
+    `(dependency registration, Injector)` pairs captured at install
+    (GC-rooted), values resolved and `Injector.inject(value)`d BEFORE
+    `start()` runs (real MSC StartTask order) — `ServerService`'s
+    `InjectedValue` fields (ServerService.java:272) read them during start.
+11. **Task-queue fake-start race guards extended** to `demand()`,
+    `schedule_dependents_of()` and `setMode`'s drain (same hazard class as
+    the already-fixed `add_service` race: background `run_start_local` marks
+    services Up without running the real `start()`). Demanded
+    OnDemand/Lazy services start via the drive loop's scan (`demanded`
+    flag) instead.
+
+**Result:** `standalone.sh` boot goes from "`jboss.as` start() aborts within
+~3s" to **31 services installed / 29 Up with zero service failures**, the
+`ServerService Thread Pool` spinning up real worker threads, standalone.xml
+parsed, and subsystem extensions initializing (Datasources, Transactions,
+Weld, JSF, JAX-RS, Deployment Scanner, ...). This is exactly the "real
+sustained concurrent execution" environment the 2026-07-06 update identified
+as the prerequisite this whole doc family depends on.
+
+**New proximate blocker (OPEN, different bug class):** ~75s into boot a
+stop-the-world phase wedges — repeated
+`STW cross-thread JIT takeover is still waiting for cooperative mutators
+rounds=64 pending=1 taken=0` (vm/src/runtime/interpreter.rs) — one mutator
+of the ~18 now-live threads never reaches a safepoint / GC-blocked state, so
+the STW never completes and boot hangs until timeout (log:
+`/tmp/wf-check9.log`, Azure host). Next session: catch it live, dump the
+pending thread's stack (gdb + the lock-state-word technique from
+`docs/internal/fixed-suite-bugs/class-manager-rwlock-recursive-read-deadlock-FIXED.md`),
+and audit GC-blocked marking on JBoss Threads' `EnhancedQueueExecutor` park
+paths.
+
+Also still open: the corrupt-`Value`-cell diagnostic
+([wildfly-domain-heap-corrupt-value-timeout.md](wildfly-domain-heap-corrupt-value-timeout.md)),
+domain-mode-specific behavior under the flag, and the original
+`DefaultConfigSmokeTestCase` verification (still needs Maven + a
+`wildfly-core` testsuite checkout on a probe host).

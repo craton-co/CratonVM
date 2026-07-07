@@ -18568,6 +18568,30 @@ pub fn register_essential_natives(registry: &mut NativeMethodRegistry) {
     // WP5.3 — X509KeyManager + X509TrustManager with EKU-aware alias selection
     //         and RFC 5280 chain validation backed by rustls-native-certs.
     x509_manager::register_x509_manager_real(registry);
+    // FIX (x509-trustmanager-abstractmethod-20260707): X509TrustManager.
+    // getAcceptedIssuers() itself -- not just getEncoded() on its results,
+    // fixed above by pulling in register_p68_security_cert -- was ALSO only
+    // ever registered by t27_tls::register_accepted_issuers, which (per its
+    // own doc comment) is reachable ONLY via register_t27_natives ->
+    // register_phase68_natives -> register_synthetic_overrides, the same
+    // #[cfg(feature = "synthetic-jdk")]-gated path documented above as
+    // compiled OUT of the default real-JDK CLI. The synthetic
+    // javax/net/ssl/TrustManagerFactory.getTrustManagers() native (tls.rs /
+    // phases_late.rs, registered unconditionally in every build) stamps its
+    // returned TrustManager objects with runtime class
+    // "javax/net/ssl/X509TrustManager" (the bare interface) -- not the real
+    // "sun/security/ssl/X509TrustManagerImpl" that register_x509_manager_real
+    // just registered getAcceptedIssuers on above -- so calling
+    // getAcceptedIssuers() on one resolved to the interface's own abstract
+    // declaration (no Code, no native anywhere) and threw AbstractMethodError.
+    // Repro: TrustManagerFactory.getInstance(...).init((KeyStore) null) then
+    // ((X509TrustManager) tmf.getTrustManagers()[0]).getAcceptedIssuers() --
+    // exactly what OkHttp's Platform.buildTrustRootIndex does on every
+    // OkHttpClient construction (spring-webflux
+    // InvalidHttpMethodIntegrationTests, all 4 server-backend variants).
+    // Call the narrow accepted-issuers registration here too, same pattern as
+    // register_p68_security_cert a few lines below.
+    t27_tls::register_accepted_issuers(registry);
     // Cert-code fix (real-JDK AbstractMethodError): java.security.cert.
     // Certificate / X509Certificate generic accessors (getEncoded, getType,
     // checkValidity, getNotBefore/getNotAfter, ...) and CertificateFactory.

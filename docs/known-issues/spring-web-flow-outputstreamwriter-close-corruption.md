@@ -1,6 +1,6 @@
 # spring-web http.client Flow/Reactive hangs: OutputStreamWriter internal-state corruption + 2 unrelated hangs
 
-## Status: OPEN (root cause narrowed, not fully resolved)
+## Status: Root cause #1 FIXED (commit `6744812d`, merged `963d59b3`); root causes #2/#3 still OPEN
 
 Branch `fix/httpclient-jdkclient-hangs-0706b` (off `dev` @ `9f1db39d`), Azure
 host worktree `/data/data/wt-hc-hangs-0706b`. This continues the
@@ -9,21 +9,23 @@ host worktree `/data/data/wt-hc-hangs-0706b`. This continues the
 for `JdkClientHttpRequestFactoryTests`, `OutputStreamPublisherTests`,
 `SubscriberInputStreamTests`, `reactive.ClientHttpConnectorTests`.
 
-**All 4 classes still hang** on current `dev`. This session found that they
-are **at least 2, likely 3, distinct root causes** — the original doc's
-"maybe one shared MockWebServer-related cause" hypothesis is refuted for 2
-of the 4 classes, which use no MockWebServer/sockets at all.
+**Update 2026-07-07:** Root cause #1 (below) is FIXED — see the "FIXED"
+section right after it. `JdkClientHttpRequestFactoryTests` and
+`reactive.ClientHttpConnectorTests` were NOT investigated in the fix session
+either (both use real `MockWebServer`/sockets, unrelated to
+`OutputStreamWriter`) and remain OPEN; this doc stays in `known-issues/`
+until those are triaged too.
 
 ## Summary table
 
-| Class | Uses MockWebServer? | Root cause this session | Status |
+| Class | Uses MockWebServer? | Root cause | Status |
 |---|---|---|---|
-| `OutputStreamPublisherTests` | No (pure `Flow`+Reactor `StepVerifier`) | `closed()` test hangs due to `OutputStreamWriter`/`StreamEncoder` internal-state corruption (see below) | Root cause narrowed, NOT fixed |
-| `SubscriberInputStreamTests` | No (pure `Flow`, no Reactor) | Same `OutputStreamWriter` bug reached via `SubscriberInputStreamTests.closed()`'s identical pattern (not independently confirmed but near-certain given identical code shape) | Root cause narrowed, NOT fixed |
-| `JdkClientHttpRequestFactoryTests` | Yes (`AbstractMockWebServerTests`) | NOT investigated this session — does not use `OutputStreamWriter`; uses `SimpleAsyncTaskExecutor` (real `new Thread()` per task, unaffected by the executor bug found below) | OPEN, separate investigation needed |
-| `reactive.ClientHttpConnectorTests` | Yes (`MockWebServer` field) | NOT investigated this session | OPEN, separate investigation needed |
+| `OutputStreamPublisherTests` | No (pure `Flow`+Reactor `StepVerifier`) | `closed()` test hung due to `OutputStreamWriter`/`StreamEncoder` real-field corruption (see below) | ✅ **FIXED** — 5/6 pass (`chunkSize()`'s pre-existing, unrelated `"bar"`-vs-`"b"` failure remains, not in scope) |
+| `SubscriberInputStreamTests` | No (pure `Flow`, no Reactor) | Same bug, reached via `SubscriberInputStreamTests.closed()`'s identical pattern | ✅ **FIXED** — 5/5 pass |
+| `JdkClientHttpRequestFactoryTests` | Yes (`AbstractMockWebServerTests`) | NOT investigated — does not use `OutputStreamWriter`; uses `SimpleAsyncTaskExecutor` (real `new Thread()` per task) | OPEN, separate investigation needed |
+| `reactive.ClientHttpConnectorTests` | Yes (`MockWebServer` field) | NOT investigated | OPEN, separate investigation needed |
 
-## Root cause #1 (found + explained, NOT fixed): `OutputStreamWriter` internal state corrupted from construction
+## Root cause #1 (FIXED 2026-07-07): `StreamEncoder` native shim hardcoded inherited `Writer` field slots
 
 ### The bug, precisely
 
@@ -32,183 +34,107 @@ OutputStream out = new ByteArrayOutputStream();
 OutputStreamWriter writer = new OutputStreamWriter(out, "UTF-8"); // any overload reproduces
 writer.write("foo");
 writer.close();
-writer.write("bar"); // should throw IOException("Stream closed") -- does NOT
+writer.write("bar"); // should throw IOException("Stream closed") -- did NOT, pre-fix
 ```
 
-Confirmed via reflection on a live CratonVM process (`--java-home` real-JDK
-mode, JDK 25, `docs/.../wt-hc-hangs-0706b`):
+### Actual root cause (this was NOT a general interpreter/GC bug)
 
-- `sun.nio.cs.StreamEncoder.closed` (a plain `private volatile boolean`,
-  should default `false`) already reads **`true` immediately after
-  construction**, before `close()` is ever called.
-- `java.io.Writer.lock` (inherited `protected Object lock`, which
-  `OutputStreamWriter`'s constructor chain should set to the `OutputStream`
-  argument via `super(out)`) instead holds **the charset-name `String`**
-  (e.g. `"UTF-8"`, or `"ISO-8859-1"` when that name is used instead — the
-  value tracks whatever charset name/`Charset.defaultCharset()` resolution
-  happened, not the real lock object). This holds across ALL constructor
-  overloads (`(OutputStream)`, `(OutputStream,String)`,
-  `(OutputStream,Charset)`), even ones whose bytecode never mentions the
-  charset-name string that ends up there.
+`native-io/src/stream_encoder.rs`'s `sun.nio.cs.StreamEncoder` shim allocates
+the encoder object with the REAL `StreamEncoder` class id (so real
+`OutputStreamWriter` bytecode dispatches `se.write(...)` to the native), but
+the pre-fix version addressed its own bookkeeping (the underlying
+`OutputStream`, the canonical charset name, a monotonic side-table id) via
+hardcoded field indices `0`/`1`/`2`, on the mistaken assumption those were
+`StreamEncoder`'s own first three declared fields.
 
-Because `closed` reads `true` from the start, `StreamEncoder.close()`'s
-real bytecode (`getfield lock; monitorenter; getfield closed; ifeq
-<call implClose+set closed>; <else> monitorexit; return`) takes the
-already-closed fast-return path on the very FIRST call — it never calls
-`implClose()` and never re-executes the `putfield closed`. This is why a
-targeted `putfield`-diagnostic trace (below) never observed a `closed`
-write: the write path is dead code given the (already-wrong) starting
-state.
-
-### Downstream consequence: the actual hang
-
-`OutputStreamPublisherTests.closed()` / `SubscriberInputStreamTests.closed()`:
-
-```java
-Flow.Publisher<byte[]> publisher = new OutputStreamPublisher<>(outputStream -> {
-    OutputStreamWriter writer = new OutputStreamWriter(outputStream, UTF_8);
-    writer.write("foo");
-    writer.close();
-    assertThatIOException().isThrownBy(() -> writer.write("bar")).withMessage("Stream closed");
-    latch.countDown();
-}, this.byteMapper, this.executor, null);
-```
-
-Since `writer.write("bar")` after close does NOT throw, AssertJ's
-`assertThatIOException().isThrownBy(...)` itself throws an
-**`AssertionError`** (an `Error`, not an `Exception`) to report the missing
-exception. `OutputStreamPublisher$OutputStreamSubscription.invokeHandler()`
-(`org/springframework/http/client/OutputStreamPublisher.java`) only catches
-`catch (Exception ex)` around the handler body — an `AssertionError`
-propagates straight through, uncaught, and **silently kills the executor
-worker thread** before `this.actual.onComplete()` / `onError()` is ever
-called. The `Flow.Subscriber` (and thus `StepVerifier`/`SubscriberInputStream.read()`)
-never receives a terminal signal and blocks forever. This is confirmed via
-isolated per-method JUnit Platform runs
-(`org.junit.platform.launcher... selectMethod`) against
-`OutputStreamPublisherTests`:
+`javap` on the real JDK25 `sun.nio.cs.StreamEncoder`/`java.io.Writer` classes
+confirms the REAL layout is:
 
 ```
-basic            -> succ=1 fail=0
-flush            -> succ=1 fail=0
-chunkSize        -> succ=0 fail=1  (expected: "bar" but was: "b" -- separate, unrelated bug, not investigated)
-cancel           -> succ=1 fail=0
-closed           -> HANGS (15s+ timeout, 100% CPU one thread, no RESULT line)
-negativeRequestN -> succ=1 fail=0
+0: Writer.writeBuffer   (char[], inherited)
+1: Writer.lock          (Object, inherited)
+2: StreamEncoder.closed (boolean, StreamEncoder's own first field)
+3: StreamEncoder.cs
+4: StreamEncoder.encoder
+...
+7: StreamEncoder.out
 ```
 
-Running the WHOLE class via `KRun` therefore also hangs, since JUnit
-Platform runs all `@Test` methods in one process/one JVM invocation.
+So the shim's writes to indices 0/1/2 actually landed on `Writer.writeBuffer`,
+`Writer.lock`, and `StreamEncoder.closed` — **not** scratch slots of its own.
+This exactly explains both symptoms originally reported:
+- `Writer.lock` held the charset-name string (written to index 1) instead of
+  the lock object.
+- `StreamEncoder.closed` read `true` immediately after construction (written
+  to index 2 was the shim's monotonic id counter, which starts at 1 — a
+  nonzero value in a `boolean` slot reads as `true`).
 
-`SubscriberInputStreamTests` was not isolated per-method this session but
-has an identically-shaped `closed()` test using the same
-`OutputStreamWriter` pattern, so this is very likely the same bug there too
-(not independently confirmed with a live capture — flagged as "near
-certain, not proven" per the task's evidence-based-reporting requirement).
+This is the same bug class already tracked in
+`docs/internal/audits/native-hardcoded-inherited-field-slots.md` ("native
+hardcodes an inherited field's slot"), just not yet swept for this file.
 
-### What's ruled out (checked and refuted this session)
+**Why the earlier session's bisection didn't find it:** all of that
+session's checks (JIT on/off, `CRATONVM_DBG_STRAYSTACK`, GC/stale-pointer,
+`alloc_concurrent_synthetic` sizing, synthetic Java repros matching the same
+bytecode shape) were sound and correctly ruled out — the bug genuinely
+wasn't any of those. It also wasn't reachable by disassembling
+`Charset`/`StreamEncoder`'s own bytecode, because that bytecode never runs:
+`forOutputStreamWriter`/`write`/`close`/etc. are fully native-intercepted in
+real-JDK mode. The corruption was in the **Rust native's own hardcoded slot
+constants**, a layer none of those checks inspected.
 
-- **Not a JIT bug**: identical corruption with `CRATONVM_DISABLE_JIT=1`.
-- **Not an out-of-bounds heap write**: `CRATONVM_DBG_STRAYSTACK=1` (existing
-  diagnostic at `vm/src/runtime/interpreter.rs:12138`, checks
-  `field.field_index >= object.num_slots`) shows zero hits — the putfield
-  target slot is within the object's allocated bounds.
-- **Not a `alloc_concurrent_synthetic`-undersized-object bug**: verified
-  (via a temporary `CRATONVM_DBG_ACS` trace, reverted before commit) that
-  `Charset.forName`/`Charset.newEncoder()`'s native overrides (which DO
-  return synthetic objects, `native-builtins/src/lib.rs:41331` /
-  `native-builtins/src/phases_late.rs` `register_p58_charset_coder`, both
-  active in real-JDK mode via `vm_init.rs`) correctly auto-upsize to the
-  real class's field count (`alloc_concurrent_synthetic`'s existing
-  `num_fields.max(real)` logic, `native-builtins/src/lib.rs:34852`) — AND,
-  more importantly, **these natives are never even invoked** on the actual
-  `new OutputStreamWriter(out, "UTF-8")` path (confirmed: the trace fires
-  for a direct top-level `Charset.forName(...)` call from application code,
-  but NOT when `Charset.forName`/`newEncoder` are called from *within*
-  `sun.nio.cs.StreamEncoder`'s own bytecode — even when
-  `StreamEncoder.forOutputStreamWriter` is invoked directly via reflection).
-  This means `Charset.forName`/`newEncoder` run as **100% real JDK bytecode**
-  in the failing path, hitting real `Charset`'s static provider-lookup/cache
-  machinery (`cache1`/`cache2` static fields, SPI `CharsetProvider`
-  lookups) — untested territory this session, and a plausible next-step
-  target.
-- **Not a generic field-layout/putfield bug for this exact class shape**:
-  multiple synthetic Java repros matching the EXACT bytecode shape
-  (`Writer`-like 2-field superclass + subclass fields; `new/dup/args/
-  invokestatic/invokespecial` construction shape; 2-level constructor
-  delegation with an intervening 3-call virtual chain; a static-factory
-  wrapper around the whole thing) were built and run correctly on
-  CratonVM — see
-  `/tmp/dl/repro/{MinimalCtorTest,StackShapeTest2,StackShapeTest3,NewDupTest,NewDupTryCatch,FieldOrderTest,FullShapeTest}.java`
-  in this session's scratch dir (not committed; recreate from this doc if
-  needed). Only the REAL `java.io.Writer`/`OutputStreamWriter`/
-  `sun.nio.cs.StreamEncoder`/`java.nio.charset.Charset` classes trigger the
-  bug — something specific to these actual boot classes (or their
-  specific interaction with `Charset.forName`'s real bytecode), not a
-  general interpreter defect reproducible with equivalent user classes.
-- **Class metadata/field-index computation is correct**: a temporary
-  `CRATONVM_DBG_LAYOUT` trace (reverted before commit) confirmed
-  `compute_field_layout` (`classloading/src/class_manager.rs:9229`)
-  correctly computes `Writer` = 2 total fields (`writeBuffer`, `lock`),
-  `StreamEncoder`'s own fields correctly starting at index 2 (`closed` is
-  index 2, not 0), `OutputStreamWriter`'s own field `se` correctly at index
-  2. The metadata is right; something at RUNTIME still corrupts the
-  slots 1-2 boundary only for this real-class combination.
-- **Not a GC/stale-pointer issue**: a targeted interpreter-level putfield
-  trace showed the CORRECT object reference (`out`, not the charset name)
-  being written to `Writer.lock` at construction time — the corruption is
-  not "wrote wrong value" at the observed putfield. (A companion
-  "immediate readback via `shared.heap.get_field`" check in the same trace
-  showed a mismatch too, but this was determined to be a FALSE LEAD: the
-  identical readback-mismatch pattern also appeared for the
-  `FieldOrderTest`/`FullShapeTest` control repros that behave CORRECTLY
-  end-to-end, meaning `shared.heap.get_field`'s indexing convention does
-  not directly correspond to `field.field_index` as used by regular
-  bytecode dispatch, and is not a valid way to cross-check the real
-  getfield/putfield path from that call site. Do not reuse that exact
-  diagnostic without first establishing the correct index-conversion
-  between the two.)
+**Separate, and the actual proximate cause of the reported hang:** even
+independent of the field corruption, the write natives never checked a
+closed flag and threw — they silently no-op'd once the underlying-stream
+reference was gone, so `writer.write("bar")` after `close()` did not throw
+`IOException("Stream closed")` as real `StreamEncoder.ensureOpen()` does.
+AssertJ's `assertThatIOException().isThrownBy(...)` found no exception and
+threw an uncaught `AssertionError`; `OutputStreamPublisher$OutputStreamSubscription.invokeHandler()`
+only catches `catch (Exception ex)`, so the `AssertionError` propagated
+straight through and silently killed the executor worker thread before
+`this.actual.onComplete()`/`onError()` was ever called — the
+`Flow.Subscriber` (and thus `StepVerifier`/`SubscriberInputStream.read()`)
+never received a terminal signal and blocked forever.
 
-### Next steps (not attempted this session)
+### The fix
 
-1. Instrument (or attach `gdb`/manual single-step) specifically inside
-   REAL `Charset.forName`'s bytecode execution (not our natives) when
-   called transitively from `StreamEncoder.forOutputStreamWriter` — confirm
-   whether it returns a well-formed `Charset` instance (e.g. check its
-   *actual* runtime class — should be `sun.nio.cs.UTF_8` or similar
-   concrete subclass, not the abstract `Charset` — a previous quick check
-   in this session on a DIRECT `Charset.forName` call from application code
-   showed `Charset class: class java.nio.charset.Charset`, i.e. the
-   ABSTRACT class itself, which is already wrong/suspicious for a
-   native-intercepted call — but that specific call path was confirmed NOT
-   to be what `StreamEncoder` hits internally, so this needs to be
-   re-checked specifically for the internal-call path).
-2. Try reproducing with `CRATONVM_REAL_AQS=1` / other env toggles seen used
-   elsewhere in this session's `ps aux` output on the shared host (other
-   concurrent sessions use `CRATONVM_REAL_NET_SOCKETS`,
-   `CRATONVM_REAL_AQS`) in case an existing "more real bytecode" toggle
-   happens to route around whatever `Charset`/`StreamEncoder`-adjacent
-   native or fast-path is responsible.
-3. Consider whether `java.nio.charset.Charset`'s STATIC fields
-   (`cache1`/`cache2`, `defaultCharset`) — which are populated once and
-   shared across every `Charset.forName` call process-wide — could be
-   corrupted by an EARLIER, unrelated call in the same process (bootstrap
-   `System.out`/JDK-internal `Charset.defaultCharset()` calls happen very
-   early); a minimal repro that does *nothing* before
-   `new OutputStreamWriter(...)` still reproduces, but the JDK itself may
-   already have called `Charset.forName`/`defaultCharset()` many times
-   during its own bootstrap before `main()` even starts, so "minimal user
-   code" does not mean "minimal actual `Charset` call history in this
-   process."
-4. Because the bug reproduces with a bare `ByteArrayOutputStream` and zero
-   Spring/executor/Reactor code
-   (`/tmp/dl/repro/WriterCloseTest.java`,
-   `/tmp/dl/repro/MinimalCtorTest.java` in this session's scratch dir),
-   this is the cheapest possible repro to hand to a fresh investigation —
-   no suite harness, classpath, or MockWebServer needed, just
-   `--java-home <jdk> -cp <dir> WriterCloseTest`.
+Commit `6744812d` (branch `fix/streamencoder-inherited-field-slots-0707`,
+merged to `dev` at `963d59b3`):
 
-## Root cause #2/#3 (NOT investigated this session)
+- Resolve the two real fields this shim legitimately owns semantically
+  (`out`, `closed`) **by name** (`get_field_by_name`/`set_field_by_name`,
+  which walk the real class's field metadata) instead of hardcoded indices —
+  the fix recipe from `native-hardcoded-inherited-field-slots.md`.
+- Keep the canonical charset name and the pending-bytes buffer (already
+  side-tabled pre-fix) in the same Rust-side table, now keyed by
+  `ctx.identity_hash_code(obj)` instead of a monotonic id stashed in a
+  scratch field slot — this touches zero real fields for that bookkeeping.
+- Added the missing `ensureOpen()`-equivalent check: `write`/`flush` now read
+  the real `closed` field and throw `IOException("Stream closed")` when
+  already closed, matching real `StreamEncoder`. `close()`/`implClose()` is
+  now also idempotent (`if (closed) return;`), matching real
+  `StreamEncoder.close()` — the pre-fix version would re-flush/re-close the
+  underlying stream on a second `close()` call.
+
+No change to the buffering/commit-threshold logic
+(`docs/internal/fixed-suite-bugs/dohead-streamencoder-eager-flush-commit-threshold-FIXED.md`,
+a separate, already-fixed concern) — `buffer_and_maybe_flush`/`write_through`
+are untouched.
+
+### Verification
+
+- The zero-dependency repro above now prints `Got expected IOException:
+  Stream closed` (was `NO EXCEPTION THROWN - BUG`).
+- `OutputStreamPublisherTests`: was HANG (15s+ timeout), now `found=6 succ=5
+  fail=1 ms=580 status=FAIL` — the one failure is `chunkSize()`
+  (`expected: "bar" but was: "b"`), a separate, pre-existing, unrelated bug
+  the original investigation already flagged as out of scope (not
+  investigated further here either).
+- `SubscriberInputStreamTests`: was HANG, now `found=5 succ=5 fail=0 ms=495
+  status=OK`.
+- `native-io` crate unit tests: unaffected, all pass.
+
+## Root cause #2/#3 (still NOT investigated): `JdkClientHttpRequestFactoryTests` / `reactive.ClientHttpConnectorTests`
 
 `JdkClientHttpRequestFactoryTests` and `reactive.ClientHttpConnectorTests`
 both use real `MockWebServer` (`AbstractMockWebServerTests` /
@@ -221,22 +147,20 @@ via `SimpleAsyncTaskExecutor` (Spring's own executor, which spawns a
 genuine real `new Thread()` per task — confirmed via
 `spring-core/.../SimpleAsyncTaskExecutor.java` source, "fires up a new
 Thread for each task") rather than `Executors.newSingleThreadExecutor()`,
-so the `ExecutorService.execute()` inline-execution bug fixed this session
-(see below) does not apply, and neither does the `OutputStreamWriter`
-corruption unless `JdkClientHttpRequestFactoryTests` itself calls a code
-path using `OutputStreamWriter` (not checked). Live `gdb` process captures
-for BOTH classes were taken this session (see raw output in session
-transcript) but not analyzed frame-by-frame in the same depth as
-`OutputStreamPublisherTests` — this is the concrete next step for these 2
-classes: attach `gdb -p <pid> -batch -ex 'thread apply all bt'` to a live
+so the `ExecutorService.execute()` inline-execution bug fixed in the
+original session (see below) does not apply, and neither does the
+`OutputStreamWriter` field-corruption bug fixed above unless
+`JdkClientHttpRequestFactoryTests` itself calls a code path using
+`OutputStreamWriter` (not checked). **Next concrete step for these 2
+classes**: attach `gdb -p <pid> -batch -ex 'thread apply all bt'` to a live
 hung instance (`timeout 60 ./target/release/cratonvm --java-home
 /data/data/jdk25-real -cp "<spring-suite-runner-shared>:<testcp>" KRun
 org.springframework.http.client.JdkClientHttpRequestFactoryTests` /
 `...reactive.ClientHttpConnectorTests`, then `gdb` a still-running process)
 and read the resulting backtrace against MockWebServer/okio/real-socket
-code paths specifically — genuinely not done this session.
+code paths specifically — genuinely not done yet.
 
-## A separate, real, low-risk fix landed this session (does NOT fix the above)
+## A separate, real, low-risk fix landed in the original session (does NOT fix root cause #1 or #2/#3)
 
 `native_es_execute` (`ExecutorService.execute(Runnable)`/
 `ThreadPoolExecutor.execute(Runnable)`, `native-builtins/src/lib.rs`) ran
@@ -269,12 +193,13 @@ doesn't, in real-JDK mode).
 ## Reproduction
 
 ```bash
-# Azure host, branch fix/httpclient-jdkclient-hangs-0706b off dev @ 9f1db39d
+# Azure host, dev @ 963d59b3 or later (fix already merged)
 ssh -i ~/.ssh/azure.pem victor@<current-IP>
-cd /data/data/wt-hc-hangs-0706b   # or a fresh worktree off this branch
+cd /data/data/cratonvm   # or a fresh worktree off dev
+
 CP="$(cat /data/data/spring-framework-shared/spring-web/build/cratonvm-testcp.txt)"
 
-# Cheapest possible repro (no suite harness at all):
+# Cheapest possible repro (no suite harness at all) — now passes:
 cat > /tmp/WriterCloseTest.java <<'EOF'
 import java.io.*;
 public class WriterCloseTest {
@@ -294,12 +219,19 @@ public class WriterCloseTest {
 EOF
 /data/data/jdk25-real/bin/javac -d /tmp /tmp/WriterCloseTest.java
 ./target/release/cratonvm --java-home /data/data/jdk25-real -cp /tmp WriterCloseTest
-# Expected (HotSpot): "Got expected IOException: Stream closed"
-# Actual (CratonVM):  "NO EXCEPTION THROWN - BUG"
+# Expected (HotSpot) AND now CratonVM: "Got expected IOException: Stream closed"
 
-# Full-class repro (hangs):
+# Full-class repro (used to hang, now completes):
 timeout 60 ./target/release/cratonvm --java-home /data/data/jdk25-real \
   -cp "/data/data/spring-suite-runner-shared:$CP" \
   KRun org.springframework.http.client.OutputStreamPublisherTests
-# Never prints a RESULT line; 100% CPU on the main-vm thread.
+# RESULT found=6 succ=5 fail=1 (chunkSize, unrelated) ms=580 status=FAIL
+
+# Still OPEN — root causes #2/#3, unrelated to the above:
+timeout 60 ./target/release/cratonvm --java-home /data/data/jdk25-real \
+  -cp "/data/data/spring-suite-runner-shared:$CP" \
+  KRun org.springframework.http.client.JdkClientHttpRequestFactoryTests
+timeout 60 ./target/release/cratonvm --java-home /data/data/jdk25-real \
+  -cp "/data/data/spring-suite-runner-shared:$CP" \
+  KRun org.springframework.http.client.reactive.ClientHttpConnectorTests
 ```
