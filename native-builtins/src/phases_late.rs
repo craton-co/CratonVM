@@ -40659,6 +40659,13 @@ pub(crate) fn register_p68_ssl(r: &mut NativeMethodRegistry) {
         // rustls-backed native) scopes trust to them.
         if let Some(Value::Object(Some(ks))) = args.get(1) {
             let ks_id = crate::tls::read_keystore_registry_id(ctx, *ks);
+            if std::env::var("CRATONVM_DBG_TLS_AUTH").is_ok() {
+                eprintln!(
+                    "[dbg-tls-auth] tmf(phases_late).init(KeyStore) this_ih={} ks_id={}",
+                    ctx.identity_hash_code(this),
+                    ks_id
+                );
+            }
             if ks_id != 0 {
                 let state = crate::x509_manager::build_trust_manager_state(ks_id);
                 if !state.anchor_ders.is_empty() {
@@ -40744,6 +40751,12 @@ pub(crate) fn register_p68_ssl(r: &mut NativeMethodRegistry) {
             } else {
                 0
             };
+            if std::env::var("CRATONVM_DBG_TLS_AUTH").is_ok() {
+                eprintln!(
+                    "[dbg-tls-auth] tmf(phases_late).getTrustManagers this_ih={} looked_up_ks_id={}",
+                    ih, ks_id
+                );
+            }
             let tm = if ks_id != 0 {
                 let state = crate::x509_manager::build_trust_manager_state(ks_id);
                 let tm_id = crate::x509_manager::register_trust_manager_state(state);
