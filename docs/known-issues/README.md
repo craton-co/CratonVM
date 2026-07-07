@@ -4,6 +4,12 @@ This folder collects CratonVM-only defects found while running upstream Java
 suites. The docs had grown to describe the **same underlying bug from several
 angles**; this index is the consolidated map. Read it first.
 
+## 2026-07-07 crypto/fips1402 ProvEC `ClassNotFoundException`/process-crash + SD-JWT hang FIXED (BC-FIPS `EngineCreator`/`creatorMap` bridge); new residual found
+
+- ✅ FIXED: [ProvEC `AlgorithmParametersSpi$EC` class-not-found, crashing whole process](../internal/fixed-suite-bugs/keycloak-crypto-fips1402-provec-algorithmparametersspi-classnotfound-FIXED.md) — BouncyCastle-FIPS registers algorithms through a private `creatorMap` (`EngineCreator` factories), never a directly-loadable `className`; CratonVM's real-JCA bridge didn't know about this and tried (and, worse, non-catchably crashed on) reflectively loading BC-FIPS's cosmetic label string. Fixed by reaching `creatorMap` directly (`try_engine_creator_instantiate`) plus retaining the real `Provider` object across `Security.addProvider` (`real_provider_table`), and hardening the reflective fallback to raise a catchable exception instead of aborting the process.
+- ✅ FIXED (same root cause/fix): [FIPS1402JwtVcMetadataTrustedSdJwtIssuerTest hang after provider init](../internal/fixed-suite-bugs/keycloak-crypto-fips1402-sdjwt-hang-after-provider-init-FIXED.md) — was a 1200s HANG, now 16/16 PASS in ~117s.
+- 🔴 NEW OPEN: [`KeyPairGenerator.getInstance("ECDSA","BCFIPS")` resolves to SunEC, not BC-FIPS; SunEC's curve table lacks 384-bit](crypto-fips1402-sunec-keypairgenerator-384bit-gap.md) — exposed now that EC crypto runs for real instead of crashing earlier. Affects the P-384/ES384 case in `BCFIPSECDSACryptoProviderTest`, `BCFIPSEcdhEsAlgorithmProviderTest`, `FIPS1402SdJwtCreationAndSigningTest` (1 of 2-3 parameterized cases in each); 256/512-bit and non-EC-keysize cases pass.
+
 ## 2026-07-07 Three Keycloak nonpassed-rerun bugs FIXED (DependencyGraphResolver spin loop, Phaser/ForkJoinPool hang, Liquibase Scope corruption)
 
 - ✅ FIXED: [`tests/base` `DependencyGraphResolver.scan()` spin loop](../internal/fixed-suite-bugs/tests-base-dependencygraphresolver-spin-loop-hang-FIXED.md) — missing early `return` after the "already scanned" check caused combinatorial re-traversal of shared DI dependencies, blowing a few-second HotSpot operation up into a 1200s CratonVM timeout. Fix lives in the vendored `apps/keycloak` Java source (test-framework/core), not CratonVM itself — needs re-applying to any other Keycloak checkout used as a suite fixture, or reporting upstream.
