@@ -36353,6 +36353,53 @@ fn register_t19_h2_lookup_clinit_deps(registry: &mut NativeMethodRegistry) {
         |_ctx, _args| Ok(None),
     );
 
+    // --- Reflection.areNestMates(Class, Class) ---
+    //
+    // JEP 181 nestmate access check, exposed to library code (e.g. JDK
+    // serialization's `ObjectStreamClass` privileged-lookup path, which
+    // Spring's `beanProviderSerialization` test exercises via
+    // `ObjectInputStream`). Real semantics
+    // (`Reflection.areNestMates` -> `Class.isNestmateOf`): identical
+    // classes are always nestmates; otherwise two classes are nestmates
+    // iff they resolve to the same nest host. Delegate to
+    // `native_class_get_nest_host` (already used by `Class.getNestHost()`)
+    // for host resolution so both entry points agree on a class's host,
+    // including the lambda-proxy special case it already handles.
+    registry.register(
+        refl,
+        "areNestMates",
+        "(Ljava/lang/Class;Ljava/lang/Class;)Z",
+        |ctx, args| {
+            let a = obj_arg(args, 0)?;
+            let b = obj_arg(args, 1)?;
+            if a == b {
+                return Ok(Some(Value::Int(1)));
+            }
+            let host_a = match crate::lang_class::native_class_get_nest_host(
+                ctx,
+                &[Value::Object(Some(a))],
+            )? {
+                Some(Value::Object(Some(h))) => h,
+                _ => a,
+            };
+            let host_b = match crate::lang_class::native_class_get_nest_host(
+                ctx,
+                &[Value::Object(Some(b))],
+            )? {
+                Some(Value::Object(Some(h))) => h,
+                _ => b,
+            };
+            let same = match (
+                crate::lang_class::mirror_class_id(ctx, host_a),
+                crate::lang_class::mirror_class_id(ctx, host_b),
+            ) {
+                (Some(x), Some(y)) => x == y,
+                _ => host_a == host_b,
+            };
+            Ok(Some(Value::Int(if same { 1 } else { 0 })))
+        },
+    );
+
     // --- ClassFileDumper.getInstance(String, String) ---
     //
     // Real HotSpot uses this to dump generated classfiles to disk when
