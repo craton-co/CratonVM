@@ -2991,6 +2991,142 @@ mod tests {
         unsafe { ObjectRef::from_raw(ptr) }
     }
 
+    // -------------------------------------------------------------------
+    // bb_view buffer-shape resolution (Reactor-Netty SSLEngine
+    // BUFFER_UNDERFLOW fix, 2026-07-07). The mock maps real-JDK
+    // java.nio.Buffer field names for "java/nio/*ByteBuffer" classes:
+    // mark@0, position@1, limit@2, capacity@3, address@4, hb@5, offset@6.
+    // -------------------------------------------------------------------
+
+    /// Real-JDK HeapByteBuffer shape with a nonzero arrayOffset (a sliced
+    /// or duplicated view, e.g. a Netty pooled heap buffer): logical index
+    /// 0 lives at `hb[offset]`, so reads must add the offset.
+    #[test]
+    fn bb_view_heap_named_respects_array_offset() {
+        let mut ctx = crate::test_utils::mock_ctx();
+        let arr = ctx.new_array(cratonvm_types::ArrayElementType::Byte, 16);
+        for i in 0..16 {
+            ctx.set_array_element(arr, i, Value::Int(i as i32));
+        }
+        let bb = alloc_concurrent_synthetic(&mut ctx, "java/nio/HeapByteBuffer", 8);
+        ctx.set_field_by_name(bb, "hb", Value::Object(Some(arr)));
+        ctx.set_field_by_name(bb, "position", Value::Int(1));
+        ctx.set_field_by_name(bb, "limit", Value::Int(4));
+        ctx.set_field_by_name(bb, "capacity", Value::Int(6));
+        ctx.set_field_by_name(bb, "offset", Value::Int(10));
+
+        let mut out = Vec::new();
+        let n = bb_read_into(&mut ctx, bb, &mut out, 64);
+        assert_eq!(n, 3);
+        assert_eq!(out, vec![11, 12, 13], "must read hb[offset+pos..offset+lim]");
+        assert_eq!(
+            ctx.get_field_by_name(bb, "position").as_int(),
+            Some(4),
+            "position must advance to limit"
+        );
+
+        // Write path honors the offset too.
+        ctx.set_field_by_name(bb, "position", Value::Int(0));
+        let put = bb_write_from(&mut ctx, bb, &[0x7f, 0x7e]);
+        assert_eq!(put, 2);
+        assert_eq!(ctx.get_array_element(arr, 10).as_int(), Some(0x7f));
+        assert_eq!(ctx.get_array_element(arr, 11).as_int(), Some(0x7e));
+    }
+
+    /// Real-JDK DirectByteBuffer shape (Reactor-Netty's default): `hb` is
+    /// null and the bytes live in native memory at the `address` field.
+    /// Reads and writes must go through native memory.
+    #[test]
+    fn bb_view_direct_named_reads_and_writes_native_memory() {
+        let mut ctx = crate::test_utils::mock_ctx();
+        let mut native: Vec<u8> = (0u8..32).collect();
+        let bb = alloc_concurrent_synthetic(&mut ctx, "java/nio/DirectByteBuffer", 8);
+        ctx.set_field_by_name(bb, "address", Value::Long(native.as_mut_ptr() as usize as i64));
+        ctx.set_field_by_name(bb, "position", Value::Int(2));
+        ctx.set_field_by_name(bb, "limit", Value::Int(7));
+        ctx.set_field_by_name(bb, "capacity", Value::Int(32));
+
+        let mut out = Vec::new();
+        let n = bb_read_into(&mut ctx, bb, &mut out, 64);
+        assert_eq!(n, 5);
+        assert_eq!(out, vec![2, 3, 4, 5, 6]);
+        assert_eq!(
+            ctx.get_field_by_name(bb, "position").as_int(),
+            Some(7),
+            "position must advance to limit"
+        );
+
+        // Write path: fill [7, 9) through the buffer.
+        ctx.set_field_by_name(bb, "limit", Value::Int(32));
+        let put = bb_write_from(&mut ctx, bb, &[0xAA, 0xBB]);
+        assert_eq!(put, 2);
+        assert_eq!(native[7], 0xAA);
+        assert_eq!(native[8], 0xBB);
+        assert_eq!(ctx.get_field_by_name(bb, "position").as_int(), Some(9));
+    }
+
+    /// Direct-backing accesses are clamped to capacity: a limit (or record
+    /// end) past the allocation is truncated, never read out of bounds.
+    #[test]
+    fn bb_view_direct_clamps_to_capacity() {
+        let mut ctx = crate::test_utils::mock_ctx();
+        let mut native: Vec<u8> = (10u8..18).collect(); // 8 bytes
+        let bb = alloc_concurrent_synthetic(&mut ctx, "java/nio/DirectByteBuffer", 8);
+        ctx.set_field_by_name(bb, "address", Value::Long(native.as_mut_ptr() as usize as i64));
+        ctx.set_field_by_name(bb, "position", Value::Int(0));
+        ctx.set_field_by_name(bb, "limit", Value::Int(64)); // lies past cap
+        ctx.set_field_by_name(bb, "capacity", Value::Int(8));
+
+        let v = bb_view(&mut ctx, bb);
+        assert_eq!(v.lim, 8, "limit must clamp to capacity");
+        let bytes = bb_bytes_range(&mut ctx, &v, 0, 100);
+        assert_eq!(bytes.len(), 8, "range reads clamp to capacity");
+        assert_eq!(bytes[0], 10);
+        assert_eq!(bytes[7], 17);
+        assert!(bb_get_byte(&mut ctx, &v, 8).is_none());
+        // Writes clamp as well.
+        assert_eq!(bb_put_bytes(&mut ctx, &v, 6, &[1, 2, 3, 4]), 2);
+        assert_eq!(native[6], 1);
+        assert_eq!(native[7], 2);
+    }
+
+    /// The pre-fix synthetic heap layout `[0]=array,[1]=pos,[2]=limit,
+    /// [3]=cap` must keep resolving (synthetic-jdk mode engines).
+    #[test]
+    fn bb_view_synthetic_heap_slot_fallback_still_resolves() {
+        let mut ctx = crate::test_utils::mock_ctx();
+        let arr = ctx.new_array(cratonvm_types::ArrayElementType::Byte, 8);
+        for i in 0..8 {
+            ctx.set_array_element(arr, i, Value::Int((40 + i) as i32));
+        }
+        // A class OUTSIDE the mock's java/nio/*ByteBuffer named-field map,
+        // so only slot-indexed reads can resolve it.
+        let bb = alloc_concurrent_synthetic(&mut ctx, "javax/net/ssl/SyntheticBuf", 4);
+        ctx.set_field(bb, 0, Value::Object(Some(arr)));
+        ctx.set_field(bb, 1, Value::Int(1)); // pos
+        ctx.set_field(bb, 2, Value::Int(3)); // limit
+        ctx.set_field(bb, 3, Value::Int(8)); // cap
+
+        let mut out = Vec::new();
+        let n = bb_read_into(&mut ctx, bb, &mut out, 64);
+        assert_eq!(n, 2);
+        assert_eq!(out, vec![41, 42]);
+        assert_eq!(ctx.get_field(bb, 1).as_int(), Some(3), "slot-1 pos advanced");
+    }
+
+    /// A shape we cannot resolve must move zero bytes (and not panic).
+    #[test]
+    fn bb_view_unresolved_moves_zero_bytes() {
+        let mut ctx = crate::test_utils::mock_ctx();
+        let bb = alloc_concurrent_synthetic(&mut ctx, "java/lang/Object", 3);
+        let mut out = Vec::new();
+        assert_eq!(bb_read_into(&mut ctx, bb, &mut out, 64), 0);
+        assert!(out.is_empty());
+        assert_eq!(bb_write_from(&mut ctx, bb, &[1, 2, 3]), 0);
+        let v = bb_view(&mut ctx, bb);
+        assert!(matches!(v.backing, BbBacking::Unresolved));
+    }
+
     #[test]
     fn scoped_trust_roots_attach_to_one_ssl_context() {
         let ca_der = parse_cert_chain_pem(CA_CRT_PEM).unwrap()[0]
@@ -4224,23 +4360,65 @@ fn handshake_status_of(s: &EngineState) -> i32 {
     }
 }
 
-/// Read a Java ByteBuffer's slice as `(backing_array_ref, position, limit, capacity)`.
+/// How a ByteBuffer's metadata fields were resolved — determines which
+/// slot(s) `bb_set_pos` must write back.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum BbLayout {
+    /// Real-JDK named fields (`position`/`limit`/`capacity`).
+    Named,
+    /// VM synthetic heap layout `[0]=array,[1]=pos,[2]=limit,[3]=cap`.
+    SyntheticHeap,
+    /// VM synthetic direct layout `[0]=pos,[1]=lim,[2]=cap,[3]=mark,[4]=addr`
+    /// (see `direct_buffer.rs::dbb_allocate_direct0`'s non-named fallback).
+    SyntheticDirect,
+}
+
+/// Where a ByteBuffer's bytes actually live.
+#[derive(Clone, Copy)]
+enum BbBacking {
+    /// Heap buffer: Java `byte[]` plus array offset. `off` is the real-JDK
+    /// `ByteBuffer.offset` (arrayOffset) — nonzero for sliced/duplicated
+    /// views (e.g. Netty pooled heap buffers), whose logical index 0 lives
+    /// at `hb[off]`, NOT `hb[0]`.
+    Heap { arr: ObjectRef, off: usize },
+    /// Direct buffer: bytes live in native memory at `addr` — a real
+    /// allocation minted by `direct_buffer.rs::dbb_allocate` (slices and
+    /// duplicates carry `parent.address + offset`, computed by real-JDK
+    /// bytecode). Reactor-Netty's default pooled-direct path hands these
+    /// to `SSLEngine.unwrap`/`wrap`.
+    Direct { addr: u64 },
+    /// Shape we could not resolve — reads/writes move zero bytes.
+    Unresolved,
+}
+
+/// Resolved view of a Java ByteBuffer: backing store + position/limit/
+/// capacity.
 ///
-/// Tomcat's NIO endpoint hands the engine **real-JDK `java.nio.HeapByteBuffer`**
-/// objects, whose layout is `Buffer{mark, position, limit, capacity, address}`
-/// then `ByteBuffer{hb, offset, …}` — i.e. the backing array `hb` is NOT at
-/// slot 0 (that's `mark`, an int). Resolve `hb`/`position`/`limit`/`capacity`
-/// by NAME first (mirroring `charset.rs::buf_state`), falling back to the
-/// VM's synthetic 5-field layout (`[0]=array,[1]=pos,[2]=limit,[3]=cap`).
+/// Tomcat's NIO endpoint hands the engine real-JDK `java.nio.HeapByteBuffer`
+/// objects, whose layout is `Buffer{mark, position, limit, capacity,
+/// address}` then `ByteBuffer{hb, offset, …}` — i.e. the backing array `hb`
+/// is NOT at slot 0 (that's `mark`, an int). Resolve fields by NAME first
+/// (mirroring `charset.rs::buf_state`), falling back to the VM's synthetic
+/// layouts.
 ///
-/// Previously this only read the synthetic slots, so on a real `HeapByteBuffer`
-/// it read slot 0 (`mark`) as the array → `None` → `bb_read_into`/`bb_write_from`
-/// moved ZERO bytes. The server engine therefore consumed the ClientHello at the
-/// socket level but produced no ServerHello, hanging every NIO HTTPS handshake.
-fn bb_view(
-    ctx: &mut dyn cratonvm_native_api::NativeContext,
-    bb: ObjectRef,
-) -> (Option<ObjectRef>, usize, usize, usize) {
+/// Reactor-Netty's `SslHandler` instead hands **`java.nio.DirectByteBuffer`**
+/// views (`hb == null`, bytes in native memory at the `address` field).
+/// Before 2026-07-07 those fell through to the synthetic-slot fallback,
+/// resolved no backing array, and `unwrap`/`wrap` moved ZERO bytes — the
+/// server engine never saw the ClientHello Netty delivered and its first
+/// `unwrap` returned `BUFFER_UNDERFLOW consumed=0`, upon which Netty closed
+/// the connection (client saw "TLS handshake failed: unexpected EOF"). See
+/// `docs/known-issues/reactive-netty-https-sslengine-handshake-underflow.md`.
+struct BbView {
+    backing: BbBacking,
+    layout: BbLayout,
+    pos: usize,
+    lim: usize,
+    cap: usize,
+}
+
+fn bb_view(ctx: &mut dyn cratonvm_native_api::NativeContext, bb: ObjectRef) -> BbView {
+    // 1) Real-JDK heap buffer: backing array in the named `hb` field.
     if let Value::Object(Some(a)) = ctx.get_field_by_name(bb, "hb") {
         let pos = ctx
             .get_field_by_name(bb, "position")
@@ -4257,56 +4435,251 @@ fn bb_view(
             .as_int()
             .unwrap_or(lim as i32)
             .max(0) as usize;
-        return (Some(a), pos, lim, cap);
+        let off = ctx
+            .get_field_by_name(bb, "offset")
+            .as_int()
+            .unwrap_or(0)
+            .max(0) as usize;
+        return BbView {
+            backing: BbBacking::Heap { arr: a, off },
+            layout: BbLayout::Named,
+            pos,
+            lim,
+            cap,
+        };
     }
-    let arr = match ctx.get_field(bb, 0) {
-        Value::Object(Some(a)) => Some(a),
-        _ => None,
-    };
+    // 2) Real-JDK direct buffer: no `hb`, bytes at the native `address`.
+    //    Require `position`/`limit` to also resolve by name so we never
+    //    treat some unrelated object's stale long as a pointer.
+    if let Value::Long(addr) = ctx.get_field_by_name(bb, "address") {
+        let pos_v = ctx.get_field_by_name(bb, "position").as_int();
+        let lim_v = ctx.get_field_by_name(bb, "limit").as_int();
+        if let (Some(p), Some(l)) = (pos_v, lim_v) {
+            let cap = ctx
+                .get_field_by_name(bb, "capacity")
+                .as_int()
+                .unwrap_or(l)
+                .max(0) as usize;
+            if addr > 0 && cap > 0 {
+                // Clamp pos/lim to capacity: every native access through
+                // this view is bounded by `cap`, the size the underlying
+                // allocation (or the parent buffer a slice was cut from)
+                // actually has.
+                return BbView {
+                    backing: BbBacking::Direct { addr: addr as u64 },
+                    layout: BbLayout::Named,
+                    pos: (p.max(0) as usize).min(cap),
+                    lim: (l.max(0) as usize).min(cap),
+                    cap,
+                };
+            }
+        }
+    }
+    // 3) Synthetic heap layout `[0]=array,[1]=pos,[2]=limit,[3]=cap`.
+    if let Value::Object(Some(a)) = ctx.get_field(bb, 0) {
+        let pos = ctx.get_field(bb, 1).as_int().unwrap_or(0).max(0) as usize;
+        let lim = ctx.get_field(bb, 2).as_int().unwrap_or(0).max(0) as usize;
+        let cap = if ctx.object_num_fields(bb) > 3 {
+            ctx.get_field(bb, 3).as_int().unwrap_or(lim as i32).max(0) as usize
+        } else {
+            lim
+        };
+        return BbView {
+            backing: BbBacking::Heap { arr: a, off: 0 },
+            layout: BbLayout::SyntheticHeap,
+            pos,
+            lim,
+            cap,
+        };
+    }
+    // 4) Synthetic direct layout `[0]=pos,[1]=lim,[2]=cap,[3]=mark,[4]=addr`
+    //    (see `direct_buffer.rs::dbb_allocate_direct0`).
+    if ctx.object_num_fields(bb) >= 5 {
+        if let Value::Long(addr) = ctx.get_field(bb, 4) {
+            let pos_v = ctx.get_field(bb, 0).as_int();
+            let lim_v = ctx.get_field(bb, 1).as_int();
+            let cap_v = ctx.get_field(bb, 2).as_int();
+            if let (Some(p), Some(l), Some(c)) = (pos_v, lim_v, cap_v) {
+                let cap = c.max(0) as usize;
+                if addr > 0 && cap > 0 {
+                    return BbView {
+                        backing: BbBacking::Direct { addr: addr as u64 },
+                        layout: BbLayout::SyntheticDirect,
+                        pos: (p.max(0) as usize).min(cap),
+                        lim: (l.max(0) as usize).min(cap),
+                        cap,
+                    };
+                }
+            }
+        }
+    }
+    // 5) Unresolvable — keep the synthetic-slot pos/lim so pure size probes
+    //    (e.g. dst_cap sums) behave exactly as before; data moves are no-ops.
     let pos = ctx.get_field(bb, 1).as_int().unwrap_or(0).max(0) as usize;
     let lim = ctx.get_field(bb, 2).as_int().unwrap_or(0).max(0) as usize;
-    let cap = if ctx.object_num_fields(bb) > 3 {
-        ctx.get_field(bb, 3).as_int().unwrap_or(lim as i32).max(0) as usize
-    } else {
-        lim
-    };
-    (arr, pos, lim, cap)
+    BbView {
+        backing: BbBacking::Unresolved,
+        layout: BbLayout::SyntheticHeap,
+        pos,
+        lim,
+        cap: lim,
+    }
 }
 
-/// Advance a ByteBuffer's `position` to `new_pos`, writing both the real-JDK
-/// named `position` field and the synthetic slot-1 so the change is visible
-/// whichever layout the buffer uses (mirrors `charset.rs::set_pos`).
-fn bb_set_pos(ctx: &mut dyn cratonvm_native_api::NativeContext, bb: ObjectRef, new_pos: usize) {
-    ctx.set_field_by_name(bb, "position", Value::Int(new_pos as i32));
-    ctx.set_field(bb, 1, Value::Int(new_pos as i32));
+/// One-line description of a resolved buffer view for `CRATONVM_DBG_TLS_HS`
+/// diagnostics: Java class + backing shape + cursor fields.
+fn bb_describe(
+    ctx: &mut dyn cratonvm_native_api::NativeContext,
+    bb: ObjectRef,
+    v: &BbView,
+) -> String {
+    let cls = ctx
+        .class_name_of_id(ctx.class_id_of_object(bb))
+        .unwrap_or_else(|| "<unknown-class>".to_string());
+    let backing = match v.backing {
+        BbBacking::Heap { off, .. } => format!("heap(arrayOffset={})", off),
+        BbBacking::Direct { addr } => format!("direct(addr={:#x})", addr),
+        BbBacking::Unresolved => "UNRESOLVED".to_string(),
+    };
+    format!(
+        "class={} backing={} layout={:?} pos={} lim={} cap={}",
+        cls, backing, v.layout, v.pos, v.lim, v.cap
+    )
+}
+
+/// Read the byte at buffer index `i` (the position/limit coordinate space).
+/// Returns `None` for unresolved backings or out-of-capacity direct access.
+fn bb_get_byte(
+    ctx: &mut dyn cratonvm_native_api::NativeContext,
+    v: &BbView,
+    i: usize,
+) -> Option<u8> {
+    match v.backing {
+        BbBacking::Heap { arr, off } => {
+            Some(ctx.get_array_element(arr, off + i).as_int().unwrap_or(0) as u8)
+        }
+        BbBacking::Direct { addr } => {
+            if i >= v.cap {
+                return None;
+            }
+            // SAFETY: `addr` is the buffer's live native allocation (minted
+            // by `dbb_allocate`, or `parent.address + offset` for slices)
+            // and `i < cap` keeps the access inside it.
+            Some(unsafe { std::ptr::read((addr as usize + i) as *const u8) })
+        }
+        BbBacking::Unresolved => None,
+    }
+}
+
+/// Copy buffer bytes `[from, to)` (buffer coordinates) into a Vec. Direct
+/// backings are clamped to capacity; unresolved backings yield an empty Vec.
+fn bb_bytes_range(
+    ctx: &mut dyn cratonvm_native_api::NativeContext,
+    v: &BbView,
+    from: usize,
+    to: usize,
+) -> Vec<u8> {
+    if to <= from {
+        return Vec::new();
+    }
+    match v.backing {
+        BbBacking::Heap { arr, off } => (from..to)
+            .map(|i| ctx.get_array_element(arr, off + i).as_int().unwrap_or(0) as u8)
+            .collect(),
+        BbBacking::Direct { addr } => {
+            let end = to.min(v.cap);
+            if end <= from {
+                return Vec::new();
+            }
+            // SAFETY: bounded by `cap` — see `bb_get_byte`.
+            unsafe {
+                std::slice::from_raw_parts((addr as usize + from) as *const u8, end - from)
+                    .to_vec()
+            }
+        }
+        BbBacking::Unresolved => Vec::new(),
+    }
+}
+
+/// Write `data` starting at buffer index `at`. Returns bytes written
+/// (direct backings clamp to capacity; unresolved backings write nothing).
+fn bb_put_bytes(
+    ctx: &mut dyn cratonvm_native_api::NativeContext,
+    v: &BbView,
+    at: usize,
+    data: &[u8],
+) -> usize {
+    match v.backing {
+        BbBacking::Heap { arr, off } => {
+            for (k, b) in data.iter().enumerate() {
+                ctx.set_array_element(arr, off + at + k, Value::Int(*b as i8 as i32));
+            }
+            data.len()
+        }
+        BbBacking::Direct { addr } => {
+            let end = (at + data.len()).min(v.cap);
+            if end <= at {
+                return 0;
+            }
+            let n = end - at;
+            // SAFETY: bounded by `cap` — see `bb_get_byte`.
+            unsafe {
+                std::ptr::copy_nonoverlapping(data.as_ptr(), (addr as usize + at) as *mut u8, n);
+            }
+            n
+        }
+        BbBacking::Unresolved => 0,
+    }
+}
+
+/// Advance a ByteBuffer's `position` to `new_pos`, writing back through the
+/// slot(s) the resolved layout actually reads (mirrors `charset.rs::set_pos`).
+fn bb_set_pos(
+    ctx: &mut dyn cratonvm_native_api::NativeContext,
+    bb: ObjectRef,
+    layout: BbLayout,
+    new_pos: usize,
+) {
+    match layout {
+        // Real-JDK named `position`; ALSO write slot 1 (== `position` in the
+        // real `Buffer` layout, == `pos` in the synthetic heap layout) to
+        // preserve the historical dual-write.
+        BbLayout::Named | BbLayout::SyntheticHeap => {
+            ctx.set_field_by_name(bb, "position", Value::Int(new_pos as i32));
+            ctx.set_field(bb, 1, Value::Int(new_pos as i32));
+        }
+        // Synthetic direct layout keeps `position` at slot 0 — writing
+        // slot 1 would clobber `limit`.
+        BbLayout::SyntheticDirect => {
+            ctx.set_field_by_name(bb, "position", Value::Int(new_pos as i32));
+            ctx.set_field(bb, 0, Value::Int(new_pos as i32));
+        }
+    }
 }
 
 /// Read up to `(limit - position)` bytes out of a ByteBuffer, leaving its
-/// position advanced by `consumed`. Returns the bytes copied. Honors a
-/// `max` cap so callers can chunk large buffers.
+/// position advanced by the bytes consumed. Honors a `max` cap so callers
+/// can chunk large buffers.
 fn bb_read_into(
     ctx: &mut dyn cratonvm_native_api::NativeContext,
     bb: ObjectRef,
     out: &mut Vec<u8>,
     max: usize,
 ) -> usize {
-    let (arr, pos, lim, _cap) = bb_view(ctx, bb);
-    let arr = match arr {
-        Some(a) => a,
-        None => return 0,
-    };
-    let avail = lim.saturating_sub(pos);
+    let v = bb_view(ctx, bb);
+    let avail = v.lim.saturating_sub(v.pos);
     let take = avail.min(max);
     if take == 0 {
         return 0;
     }
-    out.reserve(take);
-    for i in 0..take {
-        let b = ctx.get_array_element(arr, pos + i).as_int().unwrap_or(0) as u8;
-        out.push(b);
+    let got = bb_bytes_range(ctx, &v, v.pos, v.pos + take);
+    if got.is_empty() {
+        return 0;
     }
-    bb_set_pos(ctx, bb, pos + take);
-    take
+    let n = got.len();
+    out.extend_from_slice(&got);
+    bb_set_pos(ctx, bb, v.layout, v.pos + n);
+    n
 }
 
 /// Write up to `(limit - position)` bytes from `src` into a ByteBuffer,
@@ -4316,18 +4689,18 @@ fn bb_write_from(
     bb: ObjectRef,
     src: &[u8],
 ) -> usize {
-    let (arr, pos, lim, _cap) = bb_view(ctx, bb);
-    let arr = match arr {
-        Some(a) => a,
-        None => return 0,
-    };
-    let space = lim.saturating_sub(pos);
+    let v = bb_view(ctx, bb);
+    let space = v.lim.saturating_sub(v.pos);
     let put = space.min(src.len());
-    for i in 0..put {
-        ctx.set_array_element(arr, pos + i, Value::Int(src[i] as i8 as i32));
+    if put == 0 {
+        return 0;
     }
-    bb_set_pos(ctx, bb, pos + put);
-    put
+    let n = bb_put_bytes(ctx, &v, v.pos, &src[..put]);
+    if n == 0 {
+        return 0;
+    }
+    bb_set_pos(ctx, bb, v.layout, v.pos + n);
+    n
 }
 
 /// Build a default rustls ClientConfig for engine paths that didn't have an
@@ -5434,8 +5807,16 @@ fn do_wrap(
     }
 
     // Step 2: pump rustls + drain into dst.
-    let (_dst_arr, dst_pos, dst_lim, _dst_cap) = bb_view(ctx, dst);
-    let dst_remaining = dst_lim.saturating_sub(dst_pos);
+    let dst_view = bb_view(ctx, dst);
+    if __dbg_hs {
+        eprintln!(
+            "[dbg-tls-hs] thread={:?} do_wrap id={} DST {}",
+            std::thread::current().id(),
+            id,
+            bb_describe(ctx, dst, &dst_view)
+        );
+    }
+    let dst_remaining = dst_view.lim.saturating_sub(dst_view.pos);
 
     let (consumed_inner, status, hs, drained, pending_trust_check) = {
         let mut g = engine_registry().write();
@@ -5647,8 +6028,8 @@ fn do_unwrap(
     let dst_cap: usize = dsts
         .iter()
         .map(|d| {
-            let (_, p, l, _) = bb_view(ctx, *d);
-            l.saturating_sub(p)
+            let v = bb_view(ctx, *d);
+            v.lim.saturating_sub(v.pos)
         })
         .sum();
 
@@ -5717,7 +6098,16 @@ fn do_unwrap(
         return Ok(Some(Value::Object(Some(result))));
     }
 
-    let (src_arr, src_pos, src_lim, _) = bb_view(ctx, src);
+    let src_view = bb_view(ctx, src);
+    if __dbg_hs {
+        eprintln!(
+            "[dbg-tls-hs] thread={:?} do_unwrap id={} SRC {}",
+            std::thread::current().id(),
+            id,
+            bb_describe(ctx, src, &src_view)
+        );
+    }
+    let (src_pos, src_lim) = (src_view.pos, src_view.lim);
     let mut offset = src_pos;
 
     let (status, hs, plaintext, pending_trust_check) = {
@@ -5740,7 +6130,8 @@ fn do_unwrap(
         };
         let mut plaintext: Vec<u8> = Vec::new();
         let mut underflow = false;
-        if let (Some(arr), Some(conn)) = (src_arr, s.conn.as_mut()) {
+        let src_resolved = !matches!(src_view.backing, BbBacking::Unresolved);
+        if let (true, Some(conn)) = (src_resolved, s.conn.as_mut()) {
             loop {
                 if offset >= src_lim {
                     break;
@@ -5749,10 +6140,8 @@ fn do_unwrap(
                     underflow = true; // incomplete record header
                     break;
                 }
-                let b3 =
-                    ctx.get_array_element(arr, offset + 3).as_int().unwrap_or(0) as u8 as usize;
-                let b4 =
-                    ctx.get_array_element(arr, offset + 4).as_int().unwrap_or(0) as u8 as usize;
+                let b3 = bb_get_byte(ctx, &src_view, offset + 3).unwrap_or(0) as usize;
+                let b4 = bb_get_byte(ctx, &src_view, offset + 4).unwrap_or(0) as usize;
                 let rec_len = (b3 << 8) | b4;
                 let rec_end = offset + 5 + rec_len;
                 if rec_end > src_lim {
@@ -5766,9 +6155,12 @@ fn do_unwrap(
                     break;
                 }
                 let rec_total = 5 + rec_len;
-                let mut rec = Vec::with_capacity(rec_total);
-                for i in offset..rec_end {
-                    rec.push(ctx.get_array_element(arr, i).as_int().unwrap_or(0) as u8);
+                let rec = bb_bytes_range(ctx, &src_view, offset, rec_end);
+                if rec.len() != rec_total {
+                    // Backing couldn't produce the full record (clamped
+                    // direct access) — treat like an incomplete record.
+                    underflow = true;
+                    break;
                 }
                 // Feed the ENTIRE record into rustls. `read_tls` reads only as
                 // much as its deframer buffer takes per call (often less than a
@@ -5872,7 +6264,7 @@ fn do_unwrap(
         engine_run_trust_check(ctx, pending)?;
     }
     let consumed = offset - src_pos;
-    bb_set_pos(ctx, src, offset);
+    bb_set_pos(ctx, src, src_view.layout, offset);
 
     // Step 3: write plaintext into dsts (may span multiple buffers).
     let mut produced_total = 0usize;
