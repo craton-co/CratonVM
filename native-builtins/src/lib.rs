@@ -1438,6 +1438,12 @@ use util_time::*;
 use std::sync::Mutex;
 use std::sync::OnceLock;
 
+// GC note (gc-followups-20260706): VESTIGIAL — `set_context_class_loader` has
+// no callers, so this slot is never populated and `get_context_class_loader`
+// always returns `None` (the natives below read the Thread's
+// `contextClassLoader` FIELD, which the GC traces/remaps normally). GC-safe
+// only because it is never written; if a writer is ever added, convert to the
+// `(identity_key, ObjectRef)` var-handle-root pattern (see ASYNC_POOL) first.
 fn context_class_loader_store() -> &'static Mutex<Option<ObjectRef>> {
     static INSTANCE: OnceLock<Mutex<Option<ObjectRef>>> = OnceLock::new();
     INSTANCE.get_or_init(|| Mutex::new(None))
@@ -35197,8 +35203,11 @@ pub(crate) fn build_real_layout_string_hashset(
 //      `isTerminated`, and the `SharedSecrets.getJavaLangInvokeAccess`
 //      companion used by MethodHandles lookup.
 //
-// Cached via a process-wide `OnceLock<ObjectRef>` so repeat calls always
-// return the same instance — matches the real-JDK singleton semantics.
+// NOT cached (gc-followups-20260706 audit): an earlier revision cached the
+// shim in a process-wide `OnceLock<ObjectRef>`; the current implementation
+// deliberately allocates a fresh `System$1` per call (see the per-thread-heap
+// rationale in `get_or_build_jla_shim`), so there is no raw static ref to go
+// stale across a moving GC. Object identity is irrelevant for these natives.
 
 /// Build or return the cached System$1 JLA shim object.
 ///

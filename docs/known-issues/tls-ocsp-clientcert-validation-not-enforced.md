@@ -1,5 +1,27 @@
 # TLS/mTLS/OCSP validation doesn't reject invalid handshakes (security-relevant)
 
+**Windows platform gap found 2026-07-07 (new, separate task `task_c068bce2`):**
+all the verification below was done on Linux (Azure host). Rebuilding fresh on
+**Windows** from dev `d14d2ff3` (confirmed via `git merge-base` to include
+both `aafdaec8` and `b7390ffd`) and re-running all 8 classes in this cluster
+shows **all 8 still fail** — but not with the original fail-open symptom.
+Root cause (identical across all 8, confirmed via `.log.err`):
+```
+INFO [...] Starting test case [test[OpenSSL-FFM with OpenSSL trust ...]]
+WARN cratonvm_vm::vm::vm_util: <clinit> failed — wrapping in ExceptionInInitializerError
+  class=org/apache/tomcat/util/openssl/openssl_h$OpenSSL_version_num
+  cause=java/lang/NullPointerException Cannot invoke "java.util.Optional.or(java.util.function.Supplier)"
+```
+This fires when test parameterization reaches the "OpenSSL-FFM" connector
+variant. This doc's own "Verified test outcomes" table below already notes
+"OpenSSL/OpenSSL-FFM variants still skip — native ssl.dll/tomcat-native not
+installed, environmental, unrelated" — i.e. on Linux this variant is detected
+as unavailable and cleanly skipped. On Windows it isn't skipped: the
+`<clinit>` NPEs instead, and the resulting `ExceptionInInitializerError` kills
+the whole connector/test class rather than just that one parameterized case.
+**Not yet re-verified against this doc's claimed Linux pass counts on
+Windows** — do not assume they transfer. See `task_c068bce2`.
+
 **Status:** OCSP revocation checking now IMPLEMENTED and verified (branch
 `feat/ocsp-revocation-checking-20260706`, follow-up to
 `fix/tls-residuals-followup-20260706` / the original
@@ -19,8 +41,26 @@ documented simplification (CRL support).
 Separately (branch `fix/tls-client-cipher-restriction-20260706`), residual
 #3 (client-side cipher-suite restriction) is now **CLOSED for the TLS 1.3
 case** and confirmed **permanently unfixable for the TLS 1.2 DHE case** — see
-"Residual #3 closeout" below. Residual #2 (`chooseClientAlias`) remains
-untouched, confirmed still open.
+"Residual #3 closeout" below.
+
+Residual #2 (`chooseClientAlias` never consulted) is now **IMPLEMENTED and
+verified via a direct standalone repro** (branch
+`fix/tls-clientcert-resolver-v2-20260706`) — a real `rustls::client::
+ResolvesClientCert` calls back into the actual Java `KeyManager.
+chooseClientAlias`/`getPrivateKey` synchronously mid-handshake, matching the
+server's requested issuer exactly. **However**, `TestClientCert`/
+`TestCustomSslTrustManager` could not be re-verified at 18/18 and 9/9: both
+are blocked by (1) the classloading/vtable-install deadlock the cipher-
+restriction session above already found and documented (reproduces under
+this fix too, with the identical signature, at a higher frequency — this
+fix's extra first-time class loads make the pre-existing race easier to
+hit, not a new bug), and (2) a newly-discovered, separate, more fundamental
+gap: Tomcat's connector never actually sets `need`/`want` client auth to
+`true` for any connection either target test class makes in this
+environment, so the server never sends a `CertificateRequest` at all,
+regardless of the client-side fix. See "Residual #2 implementation" below for
+the full picture, including the direct-repro evidence that the fix itself is
+correct.
 
 **Related:** [BUG-DF06](../internal/CRATONVM_BUGS/BUG-DF06-certpath-pkix-not-implemented.md)
 (FIXED) and
@@ -209,17 +249,43 @@ produced exactly 27 tests / 7 failures — matching the pre-existing baseline
 (18+9 tests, 5+2 failures) exactly, confirming the OCSP work introduced no
 regression in the unrelated `chooseClientAlias` gap.
 
-## Residuals still open
+## Residual #2 — client-side `KeyManager.chooseClientAlias` consultation IMPLEMENTED (branch `fix/tls-clientcert-resolver-v2-20260706`), verified via direct repro; `TestClientCert`/`TestCustomSslTrustManager` end-to-end verification blocked by two separate, pre-existing issues
 
-**Residual #2 — client-side `KeyManager.chooseClientAlias` never
-consulted.** `TestClientCert`'s 5/18 and `TestCustomSslTrustManager`'s
-`testCustomTrustManagerCA`/`All` (2/9). CratonVM's client TLS path presents a
-fixed, pre-configured certificate instead of calling back into Java
-mid-handshake to match the server's `CertificateRequest` acceptable-issuer
-list. Needs a custom `rustls::client::ResolvesClientCert` calling back into
-Java *synchronously during the handshake* — a materially riskier change
-(GC/re-entrancy safety mid-handshake) than anything in this session; still
-recommended as its own dedicated session.
+**What was built:** a real `rustls::client::ResolvesClientCert` (`t27_tls::JavaKeyManagerResolver`) replaces the fixed, pre-configured client identity `build_client_config`/`build_engine_client_config_with_identity` previously always presented. When the server's `CertificateRequest` arrives mid-handshake, `resolve()` now:
+
+1. Renders the server's DER-encoded acceptable-issuer hints (`root_hint_subjects`) to RFC 4514 DN strings via a new `security_manager::x509::parse_name_dn` (reusing the existing hand-rolled ASN.1 DN renderer, previously only used for JAR-signer policy matching) and wraps each in a synthetic `X500Principal` (same 1-field/string convention `X509Certificate.getSubjectX500Principal()` already used).
+2. Maps the server's offered `SignatureScheme`s to JSSE `keyType` strings (`"RSA"`/`"EC"`/`"Ed25519"`/`"Ed448"`).
+3. Calls the *real* Java `KeyManager.chooseClientAlias(keyType[], issuers[], socket)` via `ctx.invoke_virtual` on the actual `KeyManager` object(s) captured from `SSLContext.init()` (new `ctx_key_managers_table`, mirroring the existing `ctx_trust_managers_table` pattern exactly, including its GC-root-scan/remap companions) — this is what makes a test-installed wrapper like Tomcat's `TrackingKeyManager` actually observe the call and record the requested issuers, and what would let a genuinely custom `KeyManager` have real say.
+4. Calls `getPrivateKey(alias)` on the same (possibly-wrapped) `KeyManager`, decodes the `km_id` this VM already packs into the returned key's identity composite (`x509_manager::km_id_from_private_key_mirror`, a new accessor), and reads the cert chain + PKCS#8 key DER directly out of the existing `km_registry` (`km_alias_material`, new) — avoiding a second Java round-trip for `getCertificateChain`, since it's the same registry `choose_client_alias`'s own native implementation already consults.
+5. Builds a `rustls::sign::CertifiedKey` from that DER directly (no PEM round-trip) and hands it to rustls.
+
+**Fixed alongside (both real, both hit immediately once `chooseClientAlias`/`getPrivateKey` were actually invoked for the first time):**
+- **`x509_manager::get_km_id`/`set_km_id`** had the identical identity-hash-side-table gap this doc's own "Recommendation for follow-up sessions" #4 predicted for `get_tm_id`/`set_tm_id`'s twin: a real bytecode `KeyManagerFactoryImpl$SunX509`/`SunX509KeyManagerImpl` instance has no room for the `cratonvm$x509km$id` pseudo-field, so `kmf_engine_init`'s stamp and `kmf_engine_get_key_managers`'s very next read (on the same pointer) silently round-tripped to 0 — every `KeyManager` returned by `getKeyManagers()` would have resolved to km_id 0, and `choose_client_alias`/`get_private_key` would have missed `km_registry` entirely the moment they were actually called. Fixed identically to `get_tm_id`/`set_tm_id` (an identity-hash-keyed `km_id_by_identity` side table, mirrored exactly).
+- **GC safety of the new `ctx_key_managers_table`** (holds live `ObjectRef`s across calls, same as its `ctx_trust_managers_table` sibling): scan/remap companions wired into `vm/src/memory/roots.rs`/`gc.rs` next to the existing trust-manager entries.
+- **Re-entrancy**: `resolve()` is called by rustls synchronously, mid-handshake, from deep inside `process_new_packets()` — with no way for rustls's fixed trait signature to pass a `NativeContext` through. Solved with a thread-local raw pointer (`t27_tls::set_active_native_context`/`with_active_native_context`), published by an RAII guard immediately before the handshake-driving code that might call `resolve()` and cleared (even on early return) before the underlying `&mut dyn NativeContext` borrow could dangle — the same "erase the lifetime, rely on an RAII guard to bound its true validity" pattern this codebase already uses for other native side-tables, just applied to a borrow instead of a heap object.
+- **Renegotiation-shaped resolve() calls**: initially the fix only wrapped the explicit handshake loop, but `has_certs()`/`resolve()` can also fire from *inside* `read_response`'s `stream.read()` calls (rustls handles a server-triggered mid-connection re-handshake transparently inside `StreamOwned`'s `Read`/`Write` impls) — widened the active-context window (and removed all `begin_blocking_region()`/`end_blocking_region()` wrapping) to cover the *entire* https exchange in `http_url_connection::perform`, not just the initial loop, for exactly this reason.
+- **GC-blocked-region hazard**: `resolve()` allocates and runs bytecode, which cannot safely happen while this thread is marked GC-parked (`begin_blocking_region()`) — `perform()`'s https branch no longer opens one at all (a loopback exchange is fast enough that never GC-parking here is an acceptable trade-off); the TCP connect and the plain (non-TLS) branch still do, since those are pure byte I/O with no Java interaction.
+
+**Verified independently, via a fast (~1s/iteration) standalone repro** (`/tmp/tlsrepro/ClientCertRepro.java` on the Azure host — a `com.sun.net.httpserver.HttpsServer` with `SSLParameters.setNeedClientAuth(true)` set upfront, a client wrapping `KeyManagerFactory.getKeyManagers()` in a `TrackingKeyManager`-shaped class, both using the same Tomcat test keystores) that the fix works end-to-end:
+
+```
+chooseClientAlias called! keyTypes=[EC, Ed25519, RSA] issuers=1
+  requested issuer: CN=Apache Tomcat Test CA, OU=Apache Tomcat PMC, O=The Apache Software Foundation, L=Wilmington, ST=DE, C=US
+  -> chosen alias: user1
+getPrivateKey(user1) -> present, algo=RSA
+```
+— matching the server's actual CA subject exactly — followed by the server-side trace confirming a real, complete, *trusted* mTLS handshake: `do_unwrap ... is_handshaking=false peer_certs_present=2`, `engine_run_trust_check: 1 trust manager(s), method=checkClientTrusted, chain_len=2`, `do_check_trusted ... registry_hit=true`, `invoke_virtual[0] -> Ok`. This is direct, unambiguous evidence that `chooseClientAlias` consultation, issuer-DN rendering, alias selection, private-key retrieval, and the resulting certificate are all correct and accepted by a real peer.
+
+**Why `TestClientCert`/`TestCustomSslTrustManager` could not be re-verified at 18/18 and 9/9 despite the above:** two separate, pre-existing issues block the *Tomcat* integration harness specifically (neither is a regression from this fix, and neither is specific to `chooseClientAlias`):
+
+1. **The classloading/vtable-install lock-ordering deadlock this doc's `fix/tls-client-cipher-restriction-20260706` session already found and documented** (see "Residual #3 closeout" above and follow-up item #7) reproduces under this fix too, with the identical `gdb` signature (`parking_lot::raw_rwlock::RawRwLock::lock_exclusive_slow` inside `vtable_install_adapter`/`define_class_with_options`, no other thread visibly holding the lock) — triggered via several different call shapes across repeated runs (`resolve_field_ref`, `Class.forName`, exception-handler lookup, plain `invokestatic`-driven class loading during Tomcat's own server startup, i.e. *not* specific to this fix's new class usage). A baseline (unmodified) binary run 4/4 times clean in the same window; this fix's binary hung roughly half the `TestClientCert` attempts and all 3 `TestCustomSslTrustManager` attempts — consistent with "this fix's extra first-time class loads (`X500Principal`/`Principal`/array types) raise the probability of hitting a pre-existing race," not with introducing a new one. Pre-warming those specific classes (and their array types) in the safe, top-level `perform()` call context reduced but did not eliminate the hang. Left as-is rather than chased further: this is VM-core locking code, already flagged by a sibling session as needing its own dedicated concurrency-debugging session, and duplicating that investigation here would not be a good use of either session's time.
+2. **A separate, newly-discovered gap: Tomcat's connector never actually sets `need`/`want` client auth to `true` for *any* connection in either target test class**, in this environment. Exhaustive tracing (`CRATONVM_DBG_TLS_AUTH=1`) across an entire `TestClientCert` run (11 engines, covering both the "preemptive" and "renegotiation-on-protected-resource" code paths) showed `setSSLParameters id=N need=false want=false` and `engine_begin request=false client_ca_none=true` for *every single one*, including the `testClientCertGetWithPreemptive` case that should request a cert upfront. Since the server-side `SSLEngine` is never told to request a certificate, it never sends a `CertificateRequest`, `JavaKeyManagerResolver::resolve` is (correctly) never invoked for these specific connections, and the client presents nothing — the `SSLHandshakeException: connection closed ... likely rejected (missing client cert)` failure for all 5 `TestClientCert` JSSE tests and 2 `TestCustomSslTrustManager` JSSE tests is the direct result, and is **identical in a from-scratch unmodified build** (confirmed via a concurrent OCSP-session log, `client_cert.log`, showing the exact same 5/18 failure signature on code that has never touched `chooseClientAlias`). This is *not* the issuer-check-assertion-failure shape this doc previously described for residual #2 (which implied a successful handshake with a merely-untracked issuer) — that description appears to have been based on code inspection rather than an observed run, and does not match current behavior. The true root cause is upstream of the client entirely: something in how Tomcat's `SSLHostConfig`/`preemptiveAuthentication`/`SSLAuthenticator` machinery is supposed to toggle `SSLEngine.setNeedClientAuth`/`setWantClientAuth` (directly, or via `SSLParameters`) per-connection or via mid-stream renegotiation is not reaching the native engine in this environment. Confirmed **not** a client-cert-resolver-specific gap: a minimal repro using `SSLParameters.setNeedClientAuth(true)` set upfront on a plain `HttpsServer` (bullet above) works perfectly, proving the underlying `need_client_auth` → `CertificateRequest` → `resolve()` pipeline is sound when actually configured. Needs its own dedicated session, focused on Tomcat's `AbstractEndpoint`/`SSLHostConfig`/`SSLAuthenticator` → CratonVM SSLEngine configuration path (`net_phase_e.rs`/`t27_tls.rs`'s `setSSLParameters`/`setNeedClientAuth`/`engine_begin` handlers), *not* on `chooseClientAlias` itself.
+
+**Regression check:** `TestClientCertTls13` (JSSE variant, both `testClientCertGet`/`testClientCertPost`) and `TestSslHandshakeFailure.testMissingClientCertificate` — the closest adjacent suites that also exercise the native `HttpsURLConnection`/`http_url_connection.rs` client path — pass cleanly (7/7) against this fix, matching pre-existing behavior; `JavaKeyManagerResolver::resolve` was not invoked in that run either (these specific tests don't appear to depend on it), consistent with no regression. A full-suite regression sweep beyond these adjacent classes was not completed given the shared-host instability described above (concurrent sessions actively rewriting the same files, a `/data` volume remount mid-session that broke every absolute path in every worktree simultaneously, and the pre-existing vtable-install race making repeated runs unreliable) — recommend re-running the broader Tomcat suite once the shared host is quiet and residual VM-core locking bug is fixed.
+
+**Environment note:** the Azure host's `/data` volume was remounted mid-session (an extra `/data/data/data/...` nesting level appeared under everything that used to be `/data/data/...`, including `jdk25-real`, `cratonvm`, and every `wt-*` worktree) — every absolute path baked into `.suite/cp.txt`, git worktree admin links, and this doc's own prior reproduction commands broke simultaneously. `.suite/cp.txt` needs regenerating (or path-substituting) after a remount like this; a worktree's `.git` administrative link can also get pruned if the directory was briefly "missing" during the remount, requiring a fresh `git worktree add` + copying working-tree changes across rather than a simple `git worktree repair`.
+
+## Residuals still open
 
 **Residual #3 — client-side cipher-suite restriction: CLOSED for TLS 1.3,
 permanently open for TLS 1.2 DHE (branch
@@ -395,18 +461,26 @@ Both fixed this session (`native-io/src/file_channel.rs`).
    fetch/parse remains a documented gap (`PREFER_CRLS`/`NO_FALLBACK` currently
    collapse to "OCSP only") — worth its own follow-up if a workload actually
    exercises CRL-preferring configurations, but no test in this suite does.
-2. `TestClientCert`/`TestCustomSslTrustManager`'s issuer-check gap
-   (client-side `KeyManager.chooseClientAlias` never consulted) — substantial,
-   separate feature, needs its own dedicated session (mid-handshake
-   re-entrancy/GC-safety).
+2. ~~`TestClientCert`/`TestCustomSslTrustManager`'s issuer-check gap
+   (client-side `KeyManager.chooseClientAlias` never consulted)~~ —
+   **IMPLEMENTED and verified via direct repro** (see "Residual #2
+   implementation" above). What's left: (a) confirm end-to-end on the actual
+   Tomcat suite once the classloading/vtable-install deadlock (item #7,
+   shared with the cipher-restriction session) is fixed, and (b) — the
+   actual current blocker — root-cause why Tomcat's connector never sets
+   `need`/`want` client auth to `true` in this environment (a separate,
+   Tomcat-configuration-path bug, not a `chooseClientAlias` issue; see
+   "Residual #2 implementation" point 2 for exactly what to check:
+   `SSLHostConfig`/`preemptiveAuthentication`/`SSLAuthenticator` →
+   `SSLEngine.setNeedClientAuth`/`setWantClientAuth`/`setSSLParameters`).
 3. ~~Client-side cipher-suite restriction~~ — CLOSED for TLS 1.3 (see
    "Residual #3 closeout"); the TLS 1.2 DHE case is permanently unfixable
    without adding a direct OpenSSL dependency (substantial, separate
    undertaking, not recommended unless a real caller needs DHE specifically).
-4. If `get_km_id`/`set_km_id` (KeyManager id, `x509_manager.rs`) is ever
+4. ~~If `get_km_id`/`set_km_id` (KeyManager id, `x509_manager.rs`) is ever
    implicated in a bug report, apply the same identity-hash-side-table fix as
-   `get_tm_id`/`set_tm_id` preemptively — it's presumably the same gap, just
-   not yet hit by a failing test.
+   `get_tm_id`/`set_tm_id` preemptively~~ — **DONE**, as part of the
+   `chooseClientAlias` work above (it was implicated immediately).
 5. A companion Linux native-registration gap was found (and is being fixed in
    a separate, parallel session) while iterating on this feature's test
    suite: `sun/nio/ch/UnixDispatcher.close0`/`preClose0` are missing native
@@ -436,3 +510,11 @@ Both fixed this session (`native-io/src/file_channel.rs`).
    dedicated session with proper concurrency debugging tools, since any
    other code path that triggers class initialization re-entrantly during
    another class's `<clinit>` could hit the same deadlock.
+
+## Post-merge finding: severe, separate, pre-existing regression affecting ALL native HttpsURLConnection connections (2026-07-07, discovered while re-verifying this merge against current dev)
+
+After merging this session's `chooseClientAlias` fix into `dev` (bringing in ~15 unrelated commits merged by other concurrent sessions since this branch was forked, including `60e2b20d`/`48b3c2d2` "Fix class_manager/vtable_manager AB-BA lock-order deadlock" — likely fixing the classloading/vtable-install deadlock this doc and the cipher-restriction session both hit, worth re-testing), re-running the standalone repro this session used to verify the `chooseClientAlias` fix started failing with `SSLHandshakeException: handshake read: Resource temporarily unavailable (os error 11)` — deterministically (10/10 repeated attempts), and **on a plain, non-mTLS HTTPS connection with no client certificate involved at all** (confirmed via `/tmp/tlsrepro/TlsRepro3.java`, a minimal `HttpsServer` + `HttpsURLConnection` repro with no `KeyManager`/`chooseClientAlias` in play whatsoever).
+
+This is confirmed **NOT caused by this session's fix**: an isolated build of this fix on its original base commit (`40df7946`, before any of the ~15 intervening commits) passes the same repro cleanly and repeatably; the EAGAIN failure was already present on an intermediate base (`a24035f2` plus one cherry-picked unrelated fix) built *before* this fix was merged onto it. The regression was introduced by one of the commits between `40df7946` and current `dev` HEAD — not yet root-caused (a quick look at `native-io/src/net.rs` and the JIT-signal/TLAB-refill commits in that range didn't turn up an obvious cause; the failure is immediate, not a real multi-second timeout expiry, which argues against a signal-interruption theory and for a more direct socket-configuration or read-loop logic change instead).
+
+**This is significantly more severe than anything else in this doc**: it appears to break every native `HttpURLConnection`/`HttpsURLConnection` HTTPS request in the current `dev` tip, not just mTLS-related ones — likely affecting a large number of currently-passing test suites across the whole codebase that make any real HTTPS call through this path. Given the severity and that it's unrelated to this doc's own scope, this needs an **immediate, dedicated, high-priority follow-up session** to bisect the exact commit and fix it — recommend starting with `git bisect` between `40df7946` and current `dev` HEAD using `/tmp/tlsrepro/TlsRepro3.java` (compile with the real JDK, run with `CRATONVM_REAL_NET_SOCKETS=1 CRATONVM_REAL_AQS=1 CRATONVM_DISABLE_DEFAULT_WATCHDOG=1`, expect `RC=200` on success) as the bisection probe — it reproduces in ~1s per attempt and has already been confirmed deterministic.

@@ -2174,6 +2174,13 @@ fn register_body_publisher(r: &mut NativeMethodRegistry) {
 /// Process-wide map from BodySubscriber identity → downstream Flow.Subscriber.
 /// Populated by `BodySubscriber.subscribe(Flow$Subscriber)` and queried by code
 /// that wants to forward data into the reactive pipeline.
+///
+/// GC note (gc-followups-20260706): KNOWN-UNSOUND across GCs — the key is the
+/// BodySubscriber's raw address (stale after a move) and the subscriber value
+/// is neither a GC root nor remapped, so a later `onNext`/`onComplete`
+/// forward can dispatch on a stale/reclaimed ref. Follow-up: key by
+/// `ctx.identity_hash_code(this)` and store `(identity_key, ObjectRef)`
+/// var-handle-root pairs (ASYNC_POOL pattern), removing on unsubscribe.
 fn body_subscriber_subscribers(
 ) -> &'static parking_lot::Mutex<std::collections::HashMap<u64, ObjectRef>> {
     use std::sync::OnceLock;

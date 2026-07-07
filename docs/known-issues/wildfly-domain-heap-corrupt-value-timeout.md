@@ -1,6 +1,6 @@
 # WildFly domain startup timeout with repeated corrupt `Value` cell guard
 
-Status: LIKELY FIXED for the timeout/hang (2026-07-06, branch `fix/wildfly-cv-corrupt-value-20260706`) — a real, confirmed, reliably-reproducing deadlock was found and fixed; needs a full WildFly domain-mode E2E rerun to close out fully (still blocked on Maven/wildfly-core availability, same as prior sessions). The `HIB-CV-32` "corrupt Value cell" log line's own exact trigger remains not independently re-confirmed post-fix (see below).
+Status: OPEN — three independent, confirmed, merged bug fixes along this path (deadlock, XNIO AbstractMethodError, jit_instanceof UAF; see 2026-07-06/07 fifth-session update below), but a full clean end-to-end pass has NOT yet been observed due to shared-host environment instability this session ran out of budget to work around. Do not move to internal until a clean E2E pass (or a definitive root-cause closure) is actually observed.
 Severity: High
 First confirmed: 2026-07-05 on Azure worktree `codex/wildfly-nonpassed-probes-20260705-035722`
 
@@ -273,3 +273,180 @@ against `dev` + this fix once Maven/`wildfly-core` availability (or bug-15) is r
 referencing the lock-order fix; if the `HIB-CV-32` guard still fires, Hypothesis 2's
 residual mystery (a not-yet-identified consumer that skips the safe `Value`-matching
 CratonVM otherwise uses everywhere) remains open and worth another pass.
+
+## 2026-07-06/07 update (fifth session) — two more real bugs found+fixed along the same path; full clean E2E still not achieved (host contention, not code)
+
+Picked up directly from the fourth session's fix
+(`fix/wildfly-cv-corrupt-value-20260706`, merged `48b3c2d2`) with the explicit
+goal of actually reaching a full Maven/Arquillian `EEConcurrencyExecutorShutdownTestCase`
+run against it, per that session's own "recommended next step". Built the
+missing infrastructure from scratch on the Azure host: cloned
+`github.com/wildfly/wildfly` at tag `32.0.1.Final` into `apps/wildfly`
+(previously absent — the original 2026-07-05 evidence run's WildFly build was
+lost to disk-pressure cleanup, per the doc's own history), installed
+`openjdk-17-jdk` (WildFly's `maven-compiler-plugin:3.8.1` cannot compile
+under JDK 21+ for its `--release 11` target — a from-scratch build needs
+JDK 17 specifically), built the full reactor (`install -DskipTests`, ~4
+minutes with `-T 8` and a warm `~/.m2` cache), and adapted a Linux copy of
+`apps/wildfly-suite-runner/run-suite.sh`.
+
+**Key operational finding: the domain's own nested processes
+(process-controller/host-controller/servers) do NOT automatically inherit
+`-Djvm=<cratonvm>`** — that Surefire property only selects the executable
+for the *outer* JUnit-runner fork. The nested WildFly processes are
+launched via `-default-jvm <path>`, itself derived from a *different* system
+property pair: `-Djboss.test.host.primary.jvmhome=<dir>` /
+`-Djboss.test.host.primary.controller.jvmhome=<dir>` (`<dir>` must contain
+`bin/java`), read directly by `DomainTestSupport$Configuration`'s static
+initializer (`org.wildfly.core:wildfly-core-testsuite-shared`). Without
+setting these explicitly, the nested processes silently ran on whatever JDK
+happened to be `JAVA_HOME` for the outer `mvn` invocation (real HotSpot),
+never exercising CratonVM at all. **Anyone re-running this test under
+CratonVM must set both properties to a directory whose `bin/java` is the
+CratonVM binary**, or the domain-mode boot never touches CratonVM and any
+result is meaningless.
+
+### Bug A: `class_manager`/`vtable_manager` AB-BA deadlock — same as session four, independently reconfirmed
+
+Reproduced the exact deadlock the fourth session fixed (`48b3c2d2`) via a
+from-scratch repro (`FieldSpawn.java`, real `ExecutorService` + shared heap
+fields + GC pressure) — 3/3 hangs on a `dev` checkout predating that fix,
+5/5 clean with it. No new information here beyond confirming the fix is
+real and already merged; see that session's own write-up above.
+
+### Bug B (NEW): `Xnio.build(XnioWorker$Builder)` → `AbstractMethodError`, blocking the native/http management interfaces from ever starting
+
+**Fixed, merged dev `952f0093`.** Manually drove `process-controller` →
+`host-controller` directly under CratonVM (bypassing the JUnit layer for a
+faster edit/rebuild/observe loop) and found the *actual* mechanism behind
+the domain never opening its management port: `NativeManagementAddHandler`
+(the `native-interface`, port 9999) and `HttpManagementAddHandler` both fail
+during boot with
+
+```text
+Caused by: java.lang.AbstractMethodError: method org/xnio/Xnio.build(Lorg/xnio/XnioWorker$Builder;)Lorg/xnio/XnioWorker; has no Code attribute
+```
+
+Root cause: `native-builtins/src/xnio_worker.rs`'s `native_xnio_get_instance`
+hands Java code a singleton stamped with the abstract `org/xnio/Xnio` class
+itself (`alloc_xnio_mirror`) rather than a concrete subclass. Only the
+*legacy* `Xnio.createWorker(OptionMap)` factory had a matching native
+registration; the *modern* XNIO 3.8.x builder-style factory
+(`XnioWorker.Builder.build()` → `xnio.build(this)`, what WildFly 32.x
+actually calls) had none, so `invokevirtual` correctly found only the
+abstract declaration — genuinely no Code attribute exists to dispatch to,
+not a CHA/vtable staleness bug. This cascaded into a full
+`WFLYCTL0459`/`WFLYHC0034` config rollback and unrecoverable host-controller
+abort every time, which is exactly what starves the client's connection
+retries against port 9999 into the `TimeoutException` this doc opened with.
+
+Fix: registered `native_xnio_build_worker` on `CLS_XNIO` for
+`build(Lorg/xnio/XnioWorker$Builder;)Lorg/xnio/XnioWorker;`, mirroring
+`createWorker`'s existing simplification (default `OptionMap`, ignore the
+`Builder`'s configured pool sizes/name). Verified: the exact same manual
+host-controller boot no longer hits `AbstractMethodError`/`WFLYHC0034` at
+all, and progresses much further (2289 vs ~919 captured output lines) into
+real management-subsystem/Elytron/audit-log startup.
+
+### Bug C (NEW): `jit_instanceof` SIGSEGV on a stale-but-bit-plausible `ObjectRef`
+
+**Fixed, merged dev — branch `fix/jit-instanceof-uaf-20260706`.** With bug B
+fixed, the domain boot progressed far enough to hit a *different* crash: a
+live `gdb` capture on the outer JUnit-runner JVM (a client-side `xnio-task-N`
+executor thread, this VM's own management-connection retry loop) showed
+
+```text
+Thread 27 "Thread-4" received signal SIGSEGV, Segmentation fault.
+#0  cratonvm_vm::jit::helpers::jit_instanceof ()
+```
+
+`jit_instanceof` (`vm/src/jit/helpers.rs`) validated its receiver with only
+`plausible_heap_pointer` — a pure bit-pattern check (non-null, 8-aligned,
+≤47-bit address) documented as having "zero false positives" but no view of
+the heap's actual mapped extent. A stale `ObjectRef` into memory the heap
+has since reclaimed/reused (the exact same class of GC root-coverage gap
+behind the BUG-03 family, see
+[[bug03-cross-thread-jit-root-scan-insufficient]] /
+[[bug03-concurrent-spawn-frame-remap-gap]] in memory) can satisfy that bit
+check while still being dangling, and the unchecked
+`ObjectRef::from_raw` + `class_id_of` this function did next then read
+through it.
+
+Fix: swapped the unchecked construction for `vm.heap.is_object_address(addr)`
+— the same heap-region-validating check `roots.rs`'s conservative scan
+already uses — degrading a dangling reference to "not an instance" instead
+of dereferencing it, consistent with every other stale-reference guard in
+this codebase (`gen_heap::read_slot`'s `HIB-CV-32` guard,
+`mark_young`'s implausible-extent rejection, etc.). Kept the cheap
+`plausible_heap_pointer` pre-filter ahead of the `vm_ptr` dereference so the
+existing unit tests (which pass `vm_ptr = 0`) are unaffected — all 3 pass
+unchanged. This is a narrow, targeted fix for the one call site that
+actually crashed live; it does **not** audit or fix the other `jit_*`
+helpers `plausible_heap_pointer`'s own doc comment says share the identical
+pattern (`jit_getfield`, `jit_aaload`) — that audit is a reasonable
+follow-up but out of scope here (no evidence they've crashed in practice,
+and this session's budget went to the one confirmed live crash).
+
+### Why a full clean E2E pass still hasn't been observed this session
+
+With all three fixes deployed, later attempts to re-run the full
+Maven/Arquillian test hit **environment instability, not a fourth code
+bug**, on this shared Azure host (confirmed **40 concurrent user sessions**
+at the time, `load average` ~6/16 cores, one prior run leaving an orphaned
+competing `cratonvm` process bound to the same ports after a `timeout`
+kill):
+
+- The Maven **wrapper's own bootstrap JVM** (`MavenWrapperMain`) hung for
+  200+ seconds with completely flat CPU time (`futex_do_wait`) before ever
+  reaching the project build — most likely contention on the shared
+  `~/.m2` repository/wrapper-dist cache across many concurrent Maven
+  invocations on this host. Worked around by invoking the already-extracted
+  Maven distribution directly
+  (`~/.m2/wrapper/dists/apache-maven-3.6.3-bin/*/apache-maven-3.6.3/bin/mvn`),
+  which reliably reached the actual test phase in seconds.
+- A subsequent run stalled with the outer test JVM legitimately parked in
+  `CountDownLatch.await()` (confirmed via live `gdb`, not a crash) for the
+  full timeout window, **before `target/domains` was ever created** — i.e.
+  before `DomainLifecycleUtil.start()` even ran. Not yet root-caused
+  whether this is further host-load-induced slowness in early JUnit/class-
+  loading setup, or a genuine (fourth) bug; ran out of session budget before
+  isolating it.
+- Separately, a **parallel session working the adjacent
+  `HttpComponentsClientHttpRequestFactoryTests` hang** (memory:
+  `httpclient-hangs-are-classmanager-rwlock-deadlock-and-methodhandle-dispatch`)
+  found and merged the *same* `class_manager`/`vtable_manager` AB-BA fix
+  independently (commits `caa4ee65`/`fc77a2f3`), and — after that fix — found
+  a **separate, still-OPEN residual**: `class_manager` RwLock writer
+  starvation under heavy concurrent reader pressure (non-fair
+  `parking_lot::RwLock`, a queued writer can starve behind a steady stream
+  of short reader acquisitions), now its own doc,
+  `docs/known-issues/class-manager-rwlock-writer-starvation.md`. This is
+  architecturally very plausible for `EEConcurrencyExecutorShutdownTestCase`
+  too (heavy concurrent class-loading/dispatch during domain boot) and is
+  worth checking first if a future session hits a `class_manager`-shaped
+  hang here specifically (distinguish via live `gdb`: reader-starvation
+  shows a queued writer + actively-cycling readers, never a 2-thread AB-BA
+  cycle).
+
+**Status of the three fixes themselves: all independently verified,
+merged, and pushed to `dev`** (`48b3c2d2`, `952f0093`, and the
+`jit-instanceof-uaf` merge). They are real, narrow, low-risk correctness
+fixes on their own merits regardless of this doc's outcome. What remains
+unconfirmed is only the **compound, full end-to-end claim** — that these
+three together (plus whatever the reader-starvation doc's fix eventually
+is) are *sufficient* to make `EEConcurrencyExecutorShutdownTestCase` pass
+cleanly end-to-end, and whether the original `HIB-CV-32` corrupt-Value-cell
+log line specifically was ever caused by any of them (it did not reproduce
+in any of this session's targeted repros, matching the fourth session's
+same non-finding).
+
+**Recommended next step:** retry the full Maven/Arquillian run on a
+quieter window of this shared host (or a dedicated one), using the direct
+Maven-distribution invocation (not the wrapper) and the
+`jboss.test.host.primary.jvmhome`/`controller.jvmhome` properties documented
+above. If it hangs again in `CountDownLatch.await()` before
+`target/domains` exists, get a live `gdb` capture immediately (before any
+timeout kills it) to identify what that latch actually is and who's
+supposed to count it down — this session did not reach that. If it instead
+reaches domain boot and hits a `class_manager`-shaped stall, check
+`class-manager-rwlock-writer-starvation.md` first.

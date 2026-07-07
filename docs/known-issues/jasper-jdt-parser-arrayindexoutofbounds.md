@@ -1,7 +1,39 @@
 # JSP compilation fails: Eclipse JDT parser `ArrayIndexOutOfBoundsException`
 
-**Status:** ✅ FIXED on branch `fix/jasper-jdt-parser-aioobe-20260706` (2026-07-06).
-**Severity:** was medium (broke JSP compilation for specific source shapes).
+**Status:** ✅ FIXED on branch `fix/jasper-jdt-parser-aioobe-20260706` (2026-07-06)
+for the targeted repro. **Residual observed on Windows (2026-07-06/07):**
+running the full `TestCompiler` class through the standard suite runner
+(`org.junit.runner.JUnitCore`, no method exclusions — unlike this doc's own
+verification, which explicitly excludes `testBug51584`) still shows problems,
+in two different forms across two separate runs on a binary confirmed to
+include this fix (`git merge-base --is-ancestor e60b7a5c` true):
+- One run: `testBug53257g` still failed with
+  `ArrayIndexOutOfBoundsException: Index -1 out of bounds for length 100`
+  (note: length 100, not the original 50 — a different call site/data size
+  hitting a similarly-shaped defect).
+- A second, independent run: the whole class never printed a single test-case
+  line and hung for the full 300s timeout, with `WARN
+  cratonvm_classloading::jar_signer: JDK cacerts=...cacerts PKCS#12 parse
+  failed: PKCS#12: bag decode failed` / `jar signer: rejecting signer block:
+  SignerInfo is missing authenticatedAttributes` in the log immediately
+  before the hang — possibly an unrelated jar-signature-verification issue
+  (Eclipse JDT's `ecj` jar is signed) rather than a recurrence of the AIOOBE,
+  not yet distinguished from the original bug.
+
+Not yet re-tasked pending closer isolation — this doc's own verification
+methodology (excluding `testBug51584`, Linux-only for some of this session's
+other work) may not fully cover the natural/default test-class execution
+order that the standard runner and HotSpot both use. Whoever picks this up
+next should first determine, with the class run start-to-finish with no
+method exclusions on a fresh binary, whether: (a) the length-100 AIOOBE and
+the hang are the same underlying defect surfacing differently run-to-run
+(non-deterministic, like the "double execution" root cause described below),
+(b) the hang is really the unrelated cacerts/jar-signer issue, and (c) if (a),
+whether the fix's fourth sub-fix (arraycopy args-buffer aliasing) has a
+similar unaddressed case for a different array shape/size than the one
+originally isolated.
+**Severity:** was medium (broke JSP compilation for specific source shapes);
+possible residual severity TBD pending the above.
 
 ## Summary
 

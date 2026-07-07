@@ -1557,6 +1557,17 @@ fn oos_write_array(
 /// Recover the `ObjectOutputStream` "this" reference for the stream keyed by
 /// `addr`. We register it in `oos_stream_refs` from `<init>` so cross-cutting
 /// helpers (Externalizable dispatch) can drive its primitive writers.
+///
+/// GC note (gc-followups-20260706): this table (and its OIS counterpart,
+/// `ois_handles`, and the per-stream filter tables) is keyed by the stream's
+/// RAW ADDRESS and holds raw refs; neither is remapped after a moving GC, so
+/// a collection in the middle of a (de)serialization both invalidates the
+/// key (later lookups from the relocated stream miss) and leaves stale value
+/// addresses. The caller's Java stack keeps the streams ALIVE, but not
+/// unmoved. A proper fix needs the whole addr-keyed family re-keyed by
+/// identity hash + values in the `(identity_key, ObjectRef)` var-handle-root
+/// pattern (ASYNC_POOL) or a dedicated gc_scan/gc_update hook pair — tracked
+/// as an open follow-up, too invasive to piggyback here.
 fn oos_stream_refs() -> &'static Mutex<HashMap<usize, ObjectRef>> {
     static INSTANCE: std::sync::OnceLock<Mutex<HashMap<usize, ObjectRef>>> =
         std::sync::OnceLock::new();
@@ -3947,8 +3958,16 @@ fn ois_stream_filter_objs() -> &'static Mutex<HashMap<usize, ObjectRef>> {
 /// Process-wide filter Java object reference (the one passed to
 /// `Config.setSerialFilter`). Used by `Config.getSerialFilter` to round-trip
 /// the exact instance back to Java code.
-fn process_serial_filter_obj() -> &'static Mutex<Option<ObjectRef>> {
-    static INSTANCE: std::sync::OnceLock<Mutex<Option<ObjectRef>>> = std::sync::OnceLock::new();
+///
+/// GC: stored as `(identity_key, ObjectRef)` — kept alive + registry-remapped
+/// via `register_var_handle_root` at store time; every read re-fetches the
+/// CURRENT address via `read_var_handle_root(identity_key)` because the GC
+/// cannot rewrite this raw static copy (ASYNC_POOL pattern, lib.rs). Before
+/// this fix the slot held a bare `ObjectRef` that was neither rooted nor
+/// remapped — the installed filter was ALSO collectable.
+fn process_serial_filter_obj() -> &'static Mutex<Option<(i32, ObjectRef)>> {
+    static INSTANCE: std::sync::OnceLock<Mutex<Option<(i32, ObjectRef)>>> =
+        std::sync::OnceLock::new();
     INSTANCE.get_or_init(|| Mutex::new(None))
 }
 
@@ -4062,11 +4081,16 @@ fn register_object_input_filter(r: &mut NativeMethodRegistry) {
         "java/io/ObjectInputFilter$Config",
         "getSerialFilter",
         "()Ljava/io/ObjectInputFilter;",
-        |_ctx, _args| {
-            let obj = process_serial_filter_obj()
+        |ctx, _args| {
+            let obj = (*process_serial_filter_obj()
                 .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .clone();
+                .unwrap_or_else(|e| e.into_inner()))
+            .map(|(key, cached)| {
+                // Re-read the CURRENT (post-GC) address — the var-handle-root
+                // registry entry is remapped after a move, this raw copy is
+                // not. Mock contexts fall back to the cached ref.
+                ctx.read_var_handle_root(key).unwrap_or(cached)
+            });
             Ok(Some(Value::Object(obj)))
         },
     );
@@ -4125,7 +4149,12 @@ fn register_object_input_filter(r: &mut NativeMethodRegistry) {
                     },
                 };
                 *existing = Some(parsed);
-                *existing_obj = Some(filter_obj);
+                // Keep alive + registry-remapped across GC moves
+                // (VarHandle-root pattern); key computed on the
+                // just-registered address, no allocation in between.
+                ctx.register_var_handle_root(filter_obj);
+                let key = ctx.identity_hash_code(filter_obj);
+                *existing_obj = Some((key, filter_obj));
             }
             Ok(None)
         },

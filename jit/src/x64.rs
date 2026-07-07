@@ -7268,9 +7268,43 @@ fn typed_local_frame_value(
         // Dead cat-2 upper half (collapse skips it) or a never-accessed dead
         // slot: a harmless zero the resume never reads.
         LocalKind::HighHalf | LocalKind::Unknown => FrameValue::Undefined,
-        // Scan says ref but the precise oop mask said non-oop here (handled by the
-        // caller before reaching this helper), or a reused slot — re-run.
-        LocalKind::Ref | LocalKind::Ambiguous => FrameValue::Unsupported,
+        // A reused slot (genuinely different kinds at different points) is
+        // unknowable from a whole-method scan — re-run, never a guess.
+        LocalKind::Ambiguous => FrameValue::Unsupported,
+        // FIX (silent data corruption residual): scan says this slot is
+        // UNAMBIGUOUSLY `Ref` everywhere it's ever accessed in the method, but
+        // we only reach this arm when the flow-sensitive precise oop-mask
+        // dataflow couldn't PROVE it's live-as-oop on every path reaching this
+        // bci (the caller already routes the provably-live case through
+        // `RegisterRef`/`StackSlotRef` before calling this helper). The
+        // canonical reason a single-kind `Ref` slot fails that proof is a
+        // narrower-scoped local (e.g. an enhanced-for loop variable) that's
+        // dead on a path bypassing its only `astore` (a loop that could run
+        // zero iterations) — the oop-mask dataflow is deliberately
+        // conservative there because a GC root scan must never mistake a
+        // genuinely-dead, possibly-garbage slot for a live oop. But the JVM
+        // verifier's definite-assignment rule means that same not-provably-
+        // live slot can NEVER be legally read by any bytecode reachable from
+        // here (reading an unassigned local is a verification error), so for
+        // THIS resume-snapshot purpose specifically — unlike the GC root
+        // scan — trusting the single unambiguous scan classification is
+        // sound: the resumed interpreter will never actually consume this
+        // slot's value if it truly isn't live. Previously this fell to
+        // `Unsupported` (safe re-run) for the exact code shape this fix
+        // targets — a loop `Iterator`/boxed-element local live right after
+        // the loop, at the print statement's invokedynamic trap — which
+        // silently defeated the OSR-exit transfer for that common pattern.
+        // Mirrors the already-trusted `RegisterRef`/`StackSlotRef` provenance
+        // split the oop-mask-true branch uses (see the caller).
+        LocalKind::Ref => {
+            if let Some(r) = reg {
+                FrameValue::RegisterRef(r)
+            } else if xmm.is_some() {
+                FrameValue::Unsupported
+            } else {
+                FrameValue::StackSlotRef(-spill_off)
+            }
+        }
     }
 }
 
@@ -15375,7 +15409,25 @@ impl Compiler {
             // (`osr_exit_box_ptr_by_bci`) — both reconstruct + resume at `bci`.
             // Gate OFF (default) ⇒ None ⇒ the uncommon-trap path below emits
             // byte-identically.
-            let frame_box_ptr = if crate::deopt_real_enabled() {
+            // FIX (silent data corruption, HHH-15895 InPredicateTest / AccumRepro3
+            // residual): reason 8 (`DEOPT_REASON_UNREACHED_CODE`, the
+            // invokedynamic uncommon trap — see the matching fix note at the
+            // 0xba codegen arm) always uses its recorded OSR-exit snapshot when
+            // present, UNCONDITIONALLY — not gated behind `deopt_real_enabled()`
+            // like the experimental speculative-guard reasons below. Those guards
+            // can legitimately resume back into compiled code later, so their
+            // precise-resume machinery is still being proven out; the
+            // invokedynamic trap's action is always `MakeNotCompilable` (the
+            // method permanently reverts to the interpreter), so this is a
+            // strictly simpler one-shot "reconstruct once, hand off forever"
+            // case, and the imprecise fallback ("safe reject" rewinding to the
+            // OSR entry bci) has PROVEN silent corruption risk, not just
+            // performance cost. `emit_osr_exit_map_at` unconditionally records
+            // this snapshot at the 0xba site regardless of the gate, so
+            // `osr_exit_box_ptr_by_bci` always has an entry here.
+            let frame_box_ptr = if reason == 8 {
+                self.osr_exit_box_ptr_by_bci.get(&bci).copied()
+            } else if crate::deopt_real_enabled() {
                 match reason {
                     2 => self.deopt_box_ptr_by_bci.get(&bci).copied(),
                     // Step 6: String-intrinsic and call-site type-check guards
@@ -23586,6 +23638,27 @@ impl Compiler {
                     // this file (`emit_jcc_rel32_patch` + `deopt_stubs.push`),
                     // but unconditional (`emit_jmp_rel32_patch`) since this
                     // instruction is NEVER taken on the JIT-compiled path.
+                    // FIX (silent data corruption, HHH-15895 InPredicateTest /
+                    // AccumRepro3 residual): the fallback for this trap when no
+                    // precise snapshot exists ("safe reject" in the VM's
+                    // `try_osr()`) can only rewind execution to the method's OSR
+                    // entry bci, discarding every side effect committed by
+                    // JIT-compiled code between OSR entry and this trap — this
+                    // instruction can be reached arbitrarily late in a method
+                    // (e.g. inside a `println` well after earlier loops/mutations
+                    // already ran to completion), so "rewind to entry" silently
+                    // re-executes or drops already-committed work. Unlike the
+                    // experimental speculative-guard snapshots elsewhere in this
+                    // file (gated behind `deopt_real_enabled()`), this one is
+                    // unconditional: `emit_deopt_stubs` always uses it for reason
+                    // 8 (see the matching fix note there), because the imprecise
+                    // fallback here has PROVEN silent corruption risk, not just
+                    // performance cost. Reuses the existing OSR-exit snapshot
+                    // machinery (frame reconstruction from live registers/spill
+                    // slots) so the VM can resume precisely at THIS bci instead of
+                    // rewinding.
+                    self.emit_osr_exit_map_at(pc);
+
                     let patch = self.emit_jmp_rel32_patch();
                     self.deopt_stubs.push((patch, pc, 8)); // 8 = DEOPT_REASON_UNREACHED_CODE
 
@@ -25221,7 +25294,11 @@ pub fn compile_with_param_slots(
     // consults `can_osr_exit` + `osr_exit_points` (under `CRATONVM_DEOPT_REAL`)
     // to route a mid-loop bail through the deopt trampoline.
     cm.osr_exit_points = compiler.osr_exit_points;
-    cm.can_osr_exit = !cm.osr_exit_points.is_empty();
+    // FIX: mirror `can_deopt_resume`'s elided-monitor exclusion above — an
+    // OSR-exit transfer materializes the same kind of reconstructed frame, so
+    // a scalar-replaced object held under an elided `synchronized` block is
+    // the same unsound-resume hazard here as it is for `can_deopt_resume`.
+    cm.can_osr_exit = !cm.osr_exit_points.is_empty() && !compiler.has_elided_monitor;
     // Stage 3 — the frame offset where this method stores the active
     // safepoint's bytecode PC (0 when the precise gate was off at compile).
     cm.sp_id_slot_off = compiler.sp_id_slot_off;

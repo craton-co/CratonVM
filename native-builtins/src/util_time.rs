@@ -4240,6 +4240,12 @@ fn native_period_zero_const(ctx: &mut dyn NativeContext, _args: &[Value]) -> Met
 /// the hot path is read-heavy — FIFO is the cheap, correct-enough bound).
 const DTF_PATTERN_CACHE_CAP: usize = 1024;
 
+// GC note (gc-followups-20260706): KNOWN-UNSOUND across GCs — the cached
+// DateTimeFormatter refs are neither GC roots nor remapped, so a cache hit
+// after a moving GC returns a stale (or reclaimed) address. Follow-up: store
+// `(identity_key, ObjectRef)` var-handle-root pairs (ASYNC_POOL pattern);
+// note the FIFO eviction below means registration-for-life would pin at most
+// DTF_PATTERN_CACHE_CAP formatters plus evicted ones.
 struct DtfPatternCache {
     map: rustc_hash::FxHashMap<String, ObjectRef>,
     order: std::collections::VecDeque<String>,

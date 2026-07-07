@@ -3388,10 +3388,21 @@ std::thread_local! {
 
 /// `withInitial` suppliers, keyed by the ThreadLocal's JLS identity hash.
 /// Populated by `withInitial`; read by `get` on map miss.
+///
+/// GC (gc-followups-20260706): values are `(identity_key, ObjectRef)` pairs
+/// registered via `register_var_handle_root` at store time and re-read via
+/// `read_var_handle_root` at every use (ASYNC_POOL pattern, lib.rs) — the GC
+/// remaps the registry entry after a move, never this raw static copy.
+/// Before this fix suppliers were bare `ObjectRef`s that were neither rooted
+/// nor remapped: a supplier only reachable from this table was collectable,
+/// and any supplier went stale after a moving young GC (the `get`-miss path
+/// then invoked `Supplier.get()` on a dangling address). Bounded by the live
+/// set of `withInitial` ThreadLocals (see the leak note above TL_MAP).
 pub(crate) fn tl_with_initial_suppliers(
-) -> &'static parking_lot::Mutex<rustc_hash::FxHashMap<i32, ObjectRef>> {
-    static S: std::sync::OnceLock<parking_lot::Mutex<rustc_hash::FxHashMap<i32, ObjectRef>>> =
-        std::sync::OnceLock::new();
+) -> &'static parking_lot::Mutex<rustc_hash::FxHashMap<i32, (i32, ObjectRef)>> {
+    static S: std::sync::OnceLock<
+        parking_lot::Mutex<rustc_hash::FxHashMap<i32, (i32, ObjectRef)>>,
+    > = std::sync::OnceLock::new();
     S.get_or_init(|| parking_lot::Mutex::new(rustc_hash::FxHashMap::default()))
 }
 
@@ -3492,7 +3503,14 @@ fn native_tl_get(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResul
     }
     // Miss path: if a supplier was registered via `withInitial`, invoke it
     // on the current thread, cache the result, and return.
-    let supplier = tl_with_initial_suppliers().lock().get(&key).copied();
+    let supplier = tl_with_initial_suppliers()
+        .lock()
+        .get(&key)
+        .map(|&(skey, cached)| {
+            // Re-read the CURRENT (post-GC) address — the var-handle-root
+            // registry entry is remapped after a move, this raw copy is not.
+            ctx.read_var_handle_root(skey).unwrap_or(cached)
+        });
     if let Some(s) = supplier {
         let initial = ctx
             .invoke_virtual(s, "get", "()Ljava/lang/Object;", &[])?
@@ -3537,7 +3555,17 @@ fn native_tl_with_initial(ctx: &mut dyn NativeContext, args: &[Value]) -> Method
     };
     let tl = alloc_concurrent_synthetic(ctx, "java/lang/ThreadLocal", 1);
     let key = ctx.identity_hash_code(tl);
-    tl_with_initial_suppliers().lock().insert(key, supplier);
+    // Keep the supplier alive + registry-remapped across GC moves
+    // (VarHandle-root pattern); key computed on the just-registered address,
+    // no allocation in between. NOTE: `supplier` was read from args BEFORE
+    // the `alloc_concurrent_synthetic` above; registration keys off the
+    // address as currently seen, matching the pre-existing exposure of raw
+    // arg refs across allocations in this native.
+    ctx.register_var_handle_root(supplier);
+    let skey = ctx.identity_hash_code(supplier);
+    tl_with_initial_suppliers()
+        .lock()
+        .insert(key, (skey, supplier));
     let initial = ctx
         .invoke_virtual(supplier, "get", "()Ljava/lang/Object;", &[])?
         .unwrap_or(Value::Object(None));

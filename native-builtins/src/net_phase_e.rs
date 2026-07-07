@@ -167,6 +167,15 @@ pub(crate) struct SsSide {
     pub listener_id: i32,
 }
 
+// GC note (gc-followups-20260706) — applies to sock/ss/ds/inet_addr side
+// tables in this file: values are plain data (no heap refs, no
+// use-after-free), but the KEY is the object's raw address, which goes stale
+// when a moving GC relocates the Socket/ServerSocket/etc. — subsequent
+// lookups from the relocated object miss and silently fall back to the
+// `unwrap_or(default)` state (e.g. a bound socket reads back port 0), and a
+// recycled address can alias another object's entry. Follow-up: re-key by
+// `ctx.identity_hash_code(obj)` (stable across moves), as the `(identity_key,
+// ObjectRef)` conversions elsewhere in this audit do.
 fn sock_side_table() -> &'static Mutex<HashMap<ObjectRef, SockSide>> {
     static T: OnceLock<Mutex<HashMap<ObjectRef, SockSide>>> = OnceLock::new();
     T.get_or_init(|| Mutex::new(HashMap::new()))
@@ -282,6 +291,17 @@ fn ds_set<F: FnOnce(&mut DsSide)>(this: ObjectRef, f: F) {
 // Map Socket$SocketInputStream / Socket$SocketOutputStream synthetic
 // instance -> owner Socket. The real-JDK inner classes have their own
 // fields (`parent`, `in`/`out`); we cannot use raw slot indices safely.
+//
+// GC note (gc-followups-20260706): KNOWN-UNSOUND across GCs — both the
+// stream KEY and the owner-Socket VALUE are raw addresses that are neither
+// rooted nor remapped. After a moving GC the relocated stream's lookup
+// misses (I/O on that stream then fails to find its owner) and a hit on an
+// unmoved key can return a stale owner address. Tolerable only while the
+// create→I/O window contains no moving GC. Follow-up: key by
+// `ctx.identity_hash_code(stream)` and store the owner as a
+// `(identity_key, ObjectRef)` var-handle-root pair (ASYNC_POOL pattern) —
+// or fold this table into the re10-handler gc_scan/gc_update hook pair
+// that already exists in this file.
 fn stream_owner_table() -> &'static Mutex<HashMap<ObjectRef, ObjectRef>> {
     static T: OnceLock<Mutex<HashMap<ObjectRef, ObjectRef>>> = OnceLock::new();
     T.get_or_init(|| Mutex::new(HashMap::new()))
@@ -6898,6 +6918,20 @@ fn register_re6_ssl_context(r: &mut NativeMethodRegistry) {
                 _ => None,
             };
             crate::t27_tls::attach_trust_managers_to_ctx(ctx, this, tms_arr);
+            // Stash the actual KeyManager objects too (may include a test
+            // wrapper like Tomcat's `TrackingKeyManager`). rustls's own
+            // client-cert path otherwise only ever presents one fixed
+            // (cert_pem, key_pem) pair — it never consults a KeyManager's
+            // `chooseClientAlias`, so a server-requested-issuer-specific
+            // selection (or a wrapper that must observe the call) was
+            // silently skipped. Consulted synchronously mid-handshake by
+            // `t27_tls::JavaKeyManagerResolver` (`getSocketFactory()` reads
+            // this back out via `ctx_key_managers_table`'s key).
+            let kms_arr = match args.get(1) {
+                Some(Value::Object(Some(a))) => Some(*a),
+                _ => None,
+            };
+            crate::t27_tls::attach_key_managers_to_ctx(ctx, this, kms_arr);
             Ok(None)
         },
     );
@@ -6920,6 +6954,12 @@ fn register_re6_ssl_context(r: &mut NativeMethodRegistry) {
             if let Some((cert, key)) = crate::t27_tls::ctx_identity(ctx, this) {
                 crate::t27_tls::set_huc_default_client_identity(Some((cert, key)));
             }
+            // Likewise remember this context's captured KeyManager objects
+            // (if any — see `SSLContext.init` above) so the native
+            // HttpsURLConnection client can consult a real
+            // `KeyManager.chooseClientAlias` mid-handshake instead of only
+            // ever presenting one fixed identity.
+            crate::t27_tls::capture_huc_key_managers_ctx_key(ctx, this);
             Ok(Some(Value::Object(Some(f))))
         },
     );
@@ -7119,9 +7159,18 @@ fn register_re6_ssl_context(r: &mut NativeMethodRegistry) {
             // native-tls default trusts only the OS root store, so it cannot
             // validate a test CA — which broke every loopback HTTPS client),
             // and (2) present the client certificate for mTLS when present.
+            // `km_ctx_key: None` here — this `SSLSocketFactory.createSocket`
+            // path (`rustls_client_connect`'s own handshake loop) doesn't yet
+            // publish an active native context around its handshake, so it
+            // keeps presenting the fixed pre-captured identity rather than
+            // consulting a live KeyManager. Only `http_url_connection::
+            // perform` (the path `HttpsURLConnection`/`TestClientCert` uses)
+            // does the latter today — see
+            // docs/known-issues/tls-ocsp-clientcert-validation-not-enforced.md.
             let cfg = crate::t27_tls::build_engine_client_config_with_identity(
                 &["http/1.1"],
                 client_ident.as_ref().map(|(c, k)| (c.as_str(), k.as_str())),
+                None,
             )
             .map_err(|e| ioex(format!("client TLS config: {e}")))?;
             // T19.H1: TCP connect + full TLS handshake blocks for real, and this

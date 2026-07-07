@@ -3352,6 +3352,27 @@ fn read_chain_arg(ctx: &mut dyn NativeContext, v: &Value) -> Vec<Vec<u8>> {
     out
 }
 
+/// Identity-hash-keyed fallback table for `get_km_id`/`set_km_id` — mirrors
+/// `tm_id_by_identity` (below) exactly.
+///
+/// FIX (client-cert-resolver): this is the "presumably the same gap" the
+/// `tm_id_by_identity` doc comment predicted. `kmf_engine_init` stamps a
+/// `km_id` on the `KeyManagerFactoryImpl$SunX509` instance, and
+/// `kmf_engine_get_key_managers` reads it back off the SAME pointer one line
+/// later — a real bytecode factory instance has no room for the
+/// `cratonvm$x509km$id` pseudo-field and no `Int` at slot 0, so without this
+/// fallback the round-trip silently returns 0 every time. That was invisible
+/// until `chooseClientAlias`/`getPrivateKey` were actually wired into the TLS
+/// handshake (see `t27_tls::JavaKeyManagerResolver`): `getPrivateKey` decodes
+/// `km_id` from the returned key's packed composite, `choose_client_alias`/
+/// `get_private_key` resolve `km_registry` by `get_km_id(ctx, this)` — with
+/// id always 0, every lookup missed and no client certificate was ever
+/// found, even though a `KeyManager` was genuinely configured.
+fn km_id_by_identity() -> &'static std::sync::Mutex<std::collections::HashMap<i32, i32>> {
+    static T: OnceLock<std::sync::Mutex<std::collections::HashMap<i32, i32>>> = OnceLock::new();
+    T.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+}
+
 fn get_km_id(ctx: &mut dyn NativeContext, this: ObjectRef) -> i32 {
     let by_name = ctx.get_field_by_name(this, "cratonvm$x509km$id");
     if let Value::Int(i) = by_name {
@@ -3367,6 +3388,16 @@ fn get_km_id(ctx: &mut dyn NativeContext, this: ObjectRef) -> i32 {
             }
         }
     }
+    let ih = ctx.identity_hash_code(this);
+    if ih != 0 {
+        if let Some(&id) = km_id_by_identity()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&ih)
+        {
+            return id;
+        }
+    }
     0
 }
 
@@ -3375,6 +3406,13 @@ fn set_km_id(ctx: &mut dyn NativeContext, this: ObjectRef, id: i32) {
     let n = ctx.object_num_fields(this);
     if n > 0 {
         ctx.set_field(this, 0, Value::Int(id));
+    }
+    let ih = ctx.identity_hash_code(this);
+    if ih != 0 {
+        km_id_by_identity()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(ih, id);
     }
 }
 
@@ -3500,6 +3538,39 @@ fn make_private_key_mirror(
     ctx.set_field(pk, 2, Value::Int(key_der.len() as i32));
     ctx.set_field(pk, 3, Value::Long(composite));
     pk
+}
+
+/// Decode the `km_id` half of the `(km_id, alias_hash)` composite
+/// `make_private_key_mirror` packs into field 3 of a synthetic `PrivateKey`
+/// mirror. Used by `t27_tls::JavaKeyManagerResolver::resolve` after calling
+/// the real (possibly test-wrapped) `KeyManager.getPrivateKey(alias)` via
+/// `ctx.invoke_virtual`: the caller already knows `alias` (it chose it), so
+/// only `km_id` needs recovering from the returned mirror before looking the
+/// actual DER material up via [`km_alias_material`]. Returns `None` if `pk`
+/// isn't a field-3-Long-composite mirror (e.g. `getPrivateKey` returned
+/// `null` or a differently-shaped object).
+pub(crate) fn km_id_from_private_key_mirror(ctx: &dyn NativeContext, pk: ObjectRef) -> Option<i32> {
+    match ctx.get_field(pk, 3) {
+        Value::Long(composite) => Some((composite >> 32) as i32),
+        _ => None,
+    }
+}
+
+/// Look up the DER cert chain (leaf first) and PKCS#8 private-key DER
+/// registered for `alias` under `km_id` in `km_registry`. Used by
+/// `t27_tls::JavaKeyManagerResolver::resolve` once it has an alias (from
+/// `chooseClientAlias`) and a `km_id` (decoded from `getPrivateKey`'s
+/// returned mirror via [`km_id_from_private_key_mirror`]) — this reads the
+/// same registry `choose_client_alias`/`get_certificate_chain`/
+/// `get_private_key` already consult, so it stays consistent with whatever
+/// `chooseClientAlias` actually picked, without a second round of native
+/// method calls into Java to fetch the chain/key material.
+pub(crate) fn km_alias_material(km_id: i32, alias: &str) -> Option<(Vec<Vec<u8>>, Vec<u8>)> {
+    let registry = km_registry().read();
+    let state = registry.get(&km_id)?;
+    let chain = state.aliases_to_chain.get(alias)?.clone();
+    let key = state.aliases_to_key.get(alias)?.clone();
+    Some((chain, key))
 }
 
 fn classify_key_type_from_pkcs8(key_der: &[u8]) -> &'static str {
