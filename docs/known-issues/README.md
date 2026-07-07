@@ -4,6 +4,10 @@ This folder collects CratonVM-only defects found while running upstream Java
 suites. The docs had grown to describe the **same underlying bug from several
 angles**; this index is the consolidated map. Read it first.
 
+## 2026-07-07 GC_STRESS residual corruption re-assessed (still OPEN, two hypotheses refuted)
+
+- 🟡 Re-ran the Fork6Hard `GC_STRESS` lane on current dev (commit `3a1a95b5`): **0 crashes in 56 runs** — the severe SIGSEGV/`CompactValue`-panic faces the doc opened for are gone (contained by the 2026-07-06 `2dfdfddc` slot-tearing + map-node + guard/recovery wave). Residual is now a *contained* stale-reference young-mark rejection that still surfaces as a rep-level `ClassCastException`/`NoSuchMethodError`/`nullchild` (32/56) or a rare wedge (5/56). **Refuted both leading producers**: disabling JIT inline-`new` (4→3/12) and compact-ref-fields (→3/12) change nothing, and it reproduces under `--nojit` too, so it is a shared-core missed-root/missed-remap bug, not JIT allocation codegen. The cheap `ZonedDateTimeTest` livelock repro is CLOSED (completes clean now). Kept in known-issues (unfixed). Full write-up in [gcstress-residual-corruption-faces.md](gcstress-residual-corruption-faces.md).
+
 ## 2026-07-06 Infinispan Cache.config null after real DefaultCacheManager.start() — FIXED; two new residuals found one/two layers deeper
 
 - ✅ FIXED: `native_dcm_get_cache` (and all Cache-instance natives —
