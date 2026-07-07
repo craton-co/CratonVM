@@ -41150,7 +41150,37 @@ pub(crate) fn register_p68_ssl(r: &mut NativeMethodRegistry) {
         },
     );
 
-    // SSLEngineResult accessors
+    // SSLEngineResult accessors.
+    //
+    // FIX (sslengineresult-stub-shadow): these are the ACTIVE accessor
+    // overrides for `javax/net/ssl/SSLEngineResult` — `register_p68_ssl`
+    // runs on the real-JDK path too since the httpserver-pkcs12 fix
+    // (lib.rs), and registration is last-wins, so this copy shadows BOTH
+    // the real `SSLEngineResult` bytecode AND the older duplicate in
+    // `tls.rs::register_ssl_engine_result`. The pre-fix bodies assumed
+    // every receiver was this file's synthetic int-code result and rebuilt
+    // a FRESH 2-slot fake enum (name@0, ordinal@1) on every call — a real
+    // result object's enum-reference field read through `.as_int()`
+    // defaulted to 0, so `getStatus()`/`getHandshakeStatus()` returned
+    // "OK"/"NOT_HANDSHAKING"-named fakes that `==`-match no real singleton.
+    // Real JSSE drivers gate their handshake state machines on exactly
+    // those identity comparisons (e.g. `sun.net.httpserver.SSLStreams
+    // .recvData`'s `hs == FINISHED / hs == NOT_HANDSHAKING` checks before
+    // `doHandshake`), so a real-JDK `HttpsServer` never learned it had to
+    // WRAP after consuming the ClientHello: it busy-spun re-reading a
+    // socket that would never deliver more bytes while the client timed
+    // out with `SSLHandshakeException: handshake read: Resource
+    // temporarily unavailable (os error 11)` — deterministically, for
+    // every `com.sun.net.httpserver.HttpsServer` exchange.
+    //
+    // Now: a real enum reference stored on the receiver (results built via
+    // the real 4-arg ctor in `t27_tls::alloc_engine_result`) passes
+    // through untouched — by-name first (layout-proof), then the raw slot.
+    // Int-code receivers (this file's fake-engine producers above, which
+    // use the name tables below) resolve the REAL enum singleton via
+    // `valueOf` so identity comparisons hold even for synthetic results;
+    // only when the real enum class is unresolvable (pure synthetic-JDK
+    // mode) do they fall back to the legacy fresh 2-slot holder.
     let ssleng_result = "javax/net/ssl/SSLEngineResult";
     r.register(
         ssleng_result,
@@ -41158,7 +41188,14 @@ pub(crate) fn register_p68_ssl(r: &mut NativeMethodRegistry) {
         "()Ljavax/net/ssl/SSLEngineResult$Status;",
         |ctx, args| {
             let this = obj_arg(args, 0)?;
-            let status = ctx.get_field(this, 0).as_int().unwrap_or(0);
+            if let Value::Object(Some(o)) = ctx.get_field_by_name(this, "status") {
+                return Ok(Some(Value::Object(Some(o))));
+            }
+            let raw = ctx.get_field(this, 0);
+            if let Value::Object(Some(_)) = raw {
+                return Ok(Some(raw));
+            }
+            let status = raw.as_int().unwrap_or(0);
             let name = match status {
                 0 => "OK",
                 1 => "BUFFER_UNDERFLOW",
@@ -41166,6 +41203,17 @@ pub(crate) fn register_p68_ssl(r: &mut NativeMethodRegistry) {
                 3 => "CLOSED",
                 _ => "OK",
             };
+            let arg = ctx.create_string(name);
+            if let Ok(Some(v)) = ctx.invoke(
+                "javax/net/ssl/SSLEngineResult$Status",
+                "valueOf",
+                "(Ljava/lang/String;)Ljavax/net/ssl/SSLEngineResult$Status;",
+                &[Value::Object(Some(arg))],
+            ) {
+                if matches!(v, Value::Object(Some(_))) {
+                    return Ok(Some(v));
+                }
+            }
             let e = alloc_concurrent_synthetic(ctx, "javax/net/ssl/SSLEngineResult$Status", 2);
             let n = ctx.create_string(name);
             ctx.set_field(e, 0, Value::Object(Some(n)));
@@ -41179,7 +41227,14 @@ pub(crate) fn register_p68_ssl(r: &mut NativeMethodRegistry) {
         "()Ljavax/net/ssl/SSLEngineResult$HandshakeStatus;",
         |ctx, args| {
             let this = obj_arg(args, 0)?;
-            let status = ctx.get_field(this, 1).as_int().unwrap_or(0);
+            if let Value::Object(Some(o)) = ctx.get_field_by_name(this, "handshakeStatus") {
+                return Ok(Some(Value::Object(Some(o))));
+            }
+            let raw = ctx.get_field(this, 1);
+            if let Value::Object(Some(_)) = raw {
+                return Ok(Some(raw));
+            }
+            let status = raw.as_int().unwrap_or(0);
             let name = match status {
                 0 => "NOT_HANDSHAKING",
                 1 => "NEED_WRAP",
@@ -41188,6 +41243,17 @@ pub(crate) fn register_p68_ssl(r: &mut NativeMethodRegistry) {
                 4 => "FINISHED",
                 _ => "NOT_HANDSHAKING",
             };
+            let arg = ctx.create_string(name);
+            if let Ok(Some(v)) = ctx.invoke(
+                "javax/net/ssl/SSLEngineResult$HandshakeStatus",
+                "valueOf",
+                "(Ljava/lang/String;)Ljavax/net/ssl/SSLEngineResult$HandshakeStatus;",
+                &[Value::Object(Some(arg))],
+            ) {
+                if matches!(v, Value::Object(Some(_))) {
+                    return Ok(Some(v));
+                }
+            }
             let e =
                 alloc_concurrent_synthetic(ctx, "javax/net/ssl/SSLEngineResult$HandshakeStatus", 2);
             let n = ctx.create_string(name);
@@ -41196,12 +41262,21 @@ pub(crate) fn register_p68_ssl(r: &mut NativeMethodRegistry) {
             Ok(Some(Value::Object(Some(e))))
         },
     );
+    // bytesConsumed/bytesProduced: real field by name first (layout-proof
+    // for real-ctor results regardless of declaration order), then the raw
+    // synthetic slot convention (consumed@2, produced@3).
     r.register(ssleng_result, "bytesConsumed", "()I", |ctx, args| {
         let this = obj_arg(args, 0)?;
+        if let Value::Int(n) = ctx.get_field_by_name(this, "bytesConsumed") {
+            return Ok(Some(Value::Int(n)));
+        }
         Ok(Some(ctx.get_field(this, 2)))
     });
     r.register(ssleng_result, "bytesProduced", "()I", |ctx, args| {
         let this = obj_arg(args, 0)?;
+        if let Value::Int(n) = ctx.get_field_by_name(this, "bytesProduced") {
+            return Ok(Some(Value::Int(n)));
+        }
         Ok(Some(ctx.get_field(this, 3)))
     });
 

@@ -2172,6 +2172,14 @@ fn engine_result_enum_accessor(
 }
 
 fn register_ssl_engine_result(r: &mut NativeMethodRegistry) {
+    // Shadowed by phases_late.rs::register_p68_ssl (Phase L), which registers
+    // the same four accessors LATER (registration is last-wins) and runs on
+    // the real-JDK path too since the httpserver-pkcs12 fix — if you are
+    // debugging SSLEngineResult accessor behavior, the copy that actually
+    // fires is the one in phases_late.rs. This copy is kept value-aware too
+    // (same fix recipe) so it stays correct if the registration order ever
+    // changes.
+    //
     // SyntheticStub: accessors over the synthetic SSLEngineResult produced by
     // the fake SSLEngine state machine. NOTE: these are ACTIVE in real-JDK
     // mode too (stub-dropping is opt-in via CRATONVM_NO_STUBS), so every body
