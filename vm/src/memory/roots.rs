@@ -563,6 +563,12 @@ pub fn collect_roots(shared: &SharedVm, thread: &JvmThread) -> Vec<ObjectRef> {
     //     SSLContext.init returned (remap companion
     //     `t27_tls::gc_update_tls_ctx_trust_manager_refs` in `gc.rs`).
     cratonvm_native_builtins::t27_tls::gc_scan_tls_ctx_trust_manager_roots(&mut roots);
+    //     TLS SSLContext KeyManager[] objects (t27_tls::ctx_key_managers_table),
+    //     held so `JavaKeyManagerResolver::resolve` can synchronously consult
+    //     the real `KeyManager.chooseClientAlias` mid-handshake, long after
+    //     SSLContext.init returned (remap companion
+    //     `t27_tls::gc_update_tls_ctx_key_manager_refs` in `gc.rs`).
+    cratonvm_native_builtins::t27_tls::gc_scan_tls_ctx_key_manager_roots(&mut roots);
 
     // 21. Uniform native-root registry. Any native subsystem holding ObjectRefs
     //     in a process-global side-table can register a scan callback here

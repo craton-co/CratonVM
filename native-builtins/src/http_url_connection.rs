@@ -293,16 +293,18 @@ fn huc_real_perform(
     };
     let body = real_body_bytes(ctx, this);
     // FIX (client-cipher-restriction): resolve any real caller-installed
-    // SSLSocketFactory BEFORE the blocking region — the up-call needs `ctx`,
+    // SSLSocketFactory BEFORE calling perform — the up-call needs `ctx`,
     // which isn't available (and TLS handshakes/up-calls aren't the kind of
-    // bounded, ctx-free work the blocking region exists for) once entered.
+    // bounded, ctx-free work a blocking region exists for) once inside one.
     let established_https_stream = if parsed.scheme == "https" {
         huc_upcall_create_socket_if_custom_factory(ctx, &parsed.host, parsed.port)?
     } else {
         None
     };
-    ctx.begin_blocking_region();
+    // `perform` manages its own (fine-grained) blocking regions internally —
+    // see its doc — so this caller must not wrap the whole call in one.
     let resp = perform(
+        ctx,
         &parsed,
         &method,
         &req.headers,
@@ -311,7 +313,6 @@ fn huc_real_perform(
         read_to,
         established_https_stream,
     );
-    ctx.end_blocking_region();
     match resp {
         Ok((status, headers, body)) => {
             if let Ok(mut t) = real_results().lock() {
@@ -988,6 +989,7 @@ fn huc_upcall_create_socket_if_custom_factory(
 }
 
 fn perform(
+    ctx: &mut dyn NativeContext,
     parsed: &Url1,
     method: &str,
     headers: &[(String, String)],
@@ -1029,6 +1031,9 @@ fn perform(
     // literal IP resolves to a single candidate, so the sort is a no-op. Mirrors
     // native-api fd_table::connect_prefer_ipv4 and the merged WS-connect fix.
     addrs.sort_by_key(|sa| u8::from(sa.is_ipv6()));
+    // Blocking region: pure OS-level TCP connect, no Java interaction at all —
+    // safe to mark this thread GC-parked for however long it takes.
+    ctx.begin_blocking_region();
     for sa in addrs {
         match TcpStream::connect_timeout(&sa, connect_timeout) {
             Ok(s) => {
@@ -1038,6 +1043,7 @@ fn perform(
             Err(e) => last_err = Some(format!("connect {sa}: {e}")),
         }
     }
+    ctx.end_blocking_region();
     let tcp = tcp.ok_or_else(|| {
         last_err.unwrap_or_else(|| format!("could not resolve any address for {addr}"))
     })?;
@@ -1046,15 +1052,49 @@ fn perform(
     let _ = tcp.set_nodelay(true);
 
     if parsed.scheme == "https" {
+        // Prewarm the classes `JavaKeyManagerResolver` allocates
+        // (`X500Principal`/`Principal`/`String`) here, in this normal
+        // top-level native-call context. If any of these is genuinely
+        // loaded/linked for the first time from deep inside the nested
+        // reflective-invocation + rustls callback context the resolver
+        // actually runs in (JUnit's `Method.invoke` -> ... -> `resolve()` ->
+        // `ensure_class_initialized`), defining it there can self-deadlock:
+        // reproduced via gdb — the interpreter's class-manager vtable-install
+        // write lock blocks in `lock_exclusive_slow` with no other thread
+        // holding it, i.e. this same thread re-entering class definition
+        // (to link a not-yet-loaded supertype/interface while installing the
+        // outer class's vtable) before releasing that lock. Touching these
+        // classes here — an ordinary, already-exercised call shape elsewhere
+        // in this codebase — sidesteps the hazard entirely regardless of its
+        // exact internal mechanism: by the time the resolver runs, they're
+        // already defined, so `ensure_class_initialized`/`alloc_concurrent_
+        // synthetic` are cache hits, no fresh class definition needed. Also
+        // force each array TYPE (`[Ljava/security/Principal;` etc.) to be
+        // defined here — a Java array type is its own `Class` object,
+        // defined separately from its component type, and `new_ref_array`
+        // (which the resolver also calls, for the `Principal[]`/`String[]`
+        // arguments to `chooseClientAlias`) would otherwise trigger that
+        // definition for the first time from the same risky nested context.
+        for cls in [
+            "javax/security/auth/x500/X500Principal",
+            "java/security/Principal",
+            "java/lang/String",
+        ] {
+            if let Ok(cid) = ctx.ensure_class_initialized(cls) {
+                let _ = ctx.new_ref_array(cid, 0);
+            }
+        }
         // Build a client config that trusts the gathered test/truststore roots
         // (not just the OS root store — a loopback test server's cert is signed
         // by a test CA) and presents the client certificate installed via
         // HttpsURLConnection.setDefaultSSLSocketFactory (mTLS). Falls back to the
         // cached system-roots config when no test roots / client identity exist.
         let huc_ident = crate::t27_tls::huc_default_client_identity();
+        let huc_km_ctx_key = crate::t27_tls::huc_default_key_managers_ctx_key();
         let cfg = crate::t27_tls::build_engine_client_config_with_identity(
             &["http/1.1"],
             huc_ident.as_ref().map(|(c, k)| (c.as_str(), k.as_str())),
+            huc_km_ctx_key,
         )
         .unwrap_or_else(|_| shared_legacy_config());
         let server_name = ServerName::try_from(parsed.host.clone())
@@ -1063,71 +1103,109 @@ fn perform(
             .map_err(|e| format!("rustls ClientConnection::new: {e}"))?;
         let mut stream: StreamOwned<ClientConnection, TcpStream> = StreamOwned::new(conn, tcp);
         let deadline = std::time::Instant::now() + HANDSHAKE_TIMEOUT;
-        while stream.conn.is_handshaking() {
-            if std::time::Instant::now() > deadline {
-                return Err(format!("{TLS_HANDSHAKE_FAILURE_SENTINEL}TLS handshake timed out"));
-            }
-            if stream.conn.wants_write() {
-                stream.conn.write_tls(&mut stream.sock).map_err(|e| {
-                    format!("{TLS_HANDSHAKE_FAILURE_SENTINEL}handshake write: {e}")
-                })?;
-            }
-            if stream.conn.wants_read() {
-                // FIX (client-cipher-restriction): `read_tls` returns `Ok(0)`
-                // (not an `Err`) once the peer closes the connection — rustls's
-                // documented contract. Left unchecked, a server that rejects the
-                // handshake and closes makes every subsequent `read_tls` return
-                // `Ok(0)` instantly, busy-spinning until `HANDSHAKE_TIMEOUT`
-                // instead of failing immediately. The deadline check above still
-                // bounds this loop, so this was never an outright hang here —
-                // just a wasted spin — but the sibling `rustls_client_connect`
-                // (t27_tls.rs), which has no such deadline, live-locked forever
-                // on exactly this gap once a real cipher restriction could
-                // actually cause a server to reject and close.
-                let n = stream.conn.read_tls(&mut stream.sock).map_err(|e| {
-                    format!("{TLS_HANDSHAKE_FAILURE_SENTINEL}handshake read: {e}")
-                })?;
-                if n == 0 {
+        // The ENTIRE https exchange below — initial handshake, request write,
+        // and response read — runs with an active native-context published
+        // and WITHOUT any begin_blocking_region()/end_blocking_region()
+        // wrapping. Both are deliberate, for the same reason:
+        // `JavaKeyManagerResolver::resolve` (-> `KeyManager.
+        // chooseClientAlias`/`getPrivateKey`) can fire not just during the
+        // initial handshake but ALSO from a server-triggered mid-connection
+        // TLS renegotiation — e.g. Tomcat's `SSLAuthenticator` only learns a
+        // request needs `CLIENT-CERT` auth after parsing the HTTP request
+        // line, which happens well after the initial handshake completed, so
+        // it renegotiates on the same connection instead of requesting a
+        // cert upfront (unless `preemptiveAuthentication` is set). rustls
+        // handles that renegotiation transparently inside `StreamOwned`'s
+        // `Read`/`Write` impls — i.e. inside `read_response`'s `stream.
+        // read()` calls below, NOT inside the explicit handshake loop — so
+        // the active-context window and the "don't GC-park" rule both have
+        // to cover that too, not just the loop. A loopback exchange is fast,
+        // so never GC-parking for this whole branch (a GC during these few
+        // milliseconds simply waits for this thread, like any other ordinary
+        // native call) is the safe, low-risk trade-off — see
+        // `set_active_native_context`'s doc for the deadlock this replaces
+        // (an earlier version toggled the blocking region on/off around just
+        // the initial loop's `process_new_packets` calls; that repeated
+        // toggling deadlocked the interpreter's class-loading/vtable-install
+        // locking the first time it exercised a fresh class load from inside
+        // the loop).
+        let active_ctx_guard = crate::t27_tls::set_active_native_context(ctx);
+        let outcome = (|| -> Result<(i32, Vec<(String, String)>, Vec<u8>), String> {
+            while stream.conn.is_handshaking() {
+                if std::time::Instant::now() > deadline {
                     return Err(format!(
-                        "{TLS_HANDSHAKE_FAILURE_SENTINEL}connection closed by peer during \
-                         handshake"
+                        "{TLS_HANDSHAKE_FAILURE_SENTINEL}TLS handshake timed out"
                     ));
                 }
-                stream.conn.process_new_packets().map_err(|e| {
-                    format!("{TLS_HANDSHAKE_FAILURE_SENTINEL}handshake process: {e}")
-                })?;
+                if stream.conn.wants_write() {
+                    stream.conn.write_tls(&mut stream.sock).map_err(|e| {
+                        format!("{TLS_HANDSHAKE_FAILURE_SENTINEL}handshake write: {e}")
+                    })?;
+                }
+                if stream.conn.wants_read() {
+                    // FIX (client-cipher-restriction): `read_tls` returns `Ok(0)`
+                    // (not an `Err`) once the peer closes the connection — rustls's
+                    // documented contract. Left unchecked, a server that rejects the
+                    // handshake and closes makes every subsequent `read_tls` return
+                    // `Ok(0)` instantly, busy-spinning until `HANDSHAKE_TIMEOUT`
+                    // instead of failing immediately. The deadline check above still
+                    // bounds this loop, so this was never an outright hang here —
+                    // just a wasted spin — but the sibling `rustls_client_connect`
+                    // (t27_tls.rs), which has no such deadline, live-locked forever
+                    // on exactly this gap once a real cipher restriction could
+                    // actually cause a server to reject and close.
+                    let n = stream.conn.read_tls(&mut stream.sock).map_err(|e| {
+                        format!("{TLS_HANDSHAKE_FAILURE_SENTINEL}handshake read: {e}")
+                    })?;
+                    if n == 0 {
+                        return Err(format!(
+                            "{TLS_HANDSHAKE_FAILURE_SENTINEL}connection closed by peer during \
+                             handshake"
+                        ));
+                    }
+                    stream.conn.process_new_packets().map_err(|e| {
+                        format!("{TLS_HANDSHAKE_FAILURE_SENTINEL}handshake process: {e}")
+                    })?;
+                }
             }
-        }
-        stream.write_all(&req).map_err(|e| format!("write: {e}"))?;
-        stream.flush().map_err(|e| format!("flush: {e}"))?;
-        // A TLS 1.3 client considers ITS side of the handshake finished (and so
-        // `is_handshaking()` above already flipped false) as soon as it has sent
-        // its own Finished — the server can still reject afterwards (e.g. a
-        // required-but-missing client certificate: `NoCertificatesPresented`)
-        // and close the connection without ever sending an HTTP response. Real
-        // JSSE surfaces that as `SSLHandshakeException`/`SSLException`, not a
-        // silent empty/malformed response, so a connection that closes before
-        // a single response byte arrives — immediately after our own optimistic
-        // handshake completion — is classified the same way here rather than
-        // falling through to `huc_real_perform`'s generic "-1" contract (which
-        // is correct for a genuinely malformed-but-present HTTP response, not
-        // for zero bytes at all).
-        read_response(&mut stream, head).map_err(|e| {
-            if e == "connection closed before response head" {
-                format!(
-                    "{TLS_HANDSHAKE_FAILURE_SENTINEL}connection closed immediately after the \
-                     TLS handshake with no response — the peer likely rejected the handshake \
-                     (e.g. a required client certificate was not presented): {e}"
-                )
-            } else {
-                e
-            }
-        })
+            stream.write_all(&req).map_err(|e| format!("write: {e}"))?;
+            stream.flush().map_err(|e| format!("flush: {e}"))?;
+            // A TLS 1.3 client considers ITS side of the handshake finished (and so
+            // `is_handshaking()` above already flipped false) as soon as it has sent
+            // its own Finished — the server can still reject afterwards (e.g. a
+            // required-but-missing client certificate: `NoCertificatesPresented`)
+            // and close the connection without ever sending an HTTP response. Real
+            // JSSE surfaces that as `SSLHandshakeException`/`SSLException`, not a
+            // silent empty/malformed response, so a connection that closes before
+            // a single response byte arrives — immediately after our own optimistic
+            // handshake completion — is classified the same way here rather than
+            // falling through to `huc_real_perform`'s generic "-1" contract (which
+            // is correct for a genuinely malformed-but-present HTTP response, not
+            // for zero bytes at all).
+            read_response(&mut stream, head).map_err(|e| {
+                if e == "connection closed before response head" {
+                    format!(
+                        "{TLS_HANDSHAKE_FAILURE_SENTINEL}connection closed immediately after the \
+                         TLS handshake with no response — the peer likely rejected the handshake \
+                         (e.g. a required client certificate was not presented): {e}"
+                    )
+                } else {
+                    e
+                }
+            })
+        })();
+        drop(active_ctx_guard);
+        outcome
     } else {
+        ctx.begin_blocking_region();
         let mut s = tcp;
-        s.write_all(&req).map_err(|e| format!("write: {e}"))?;
-        s.flush().map_err(|e| format!("flush: {e}"))?;
-        read_response(&mut s, head)
+        let result = (|| -> Result<(i32, Vec<(String, String)>, Vec<u8>), String> {
+            s.write_all(&req).map_err(|e| format!("write: {e}"))?;
+            s.flush().map_err(|e| format!("flush: {e}"))?;
+            read_response(&mut s, head)
+        })();
+        ctx.end_blocking_region();
+        result
     }
 }
 
@@ -1194,12 +1272,17 @@ fn ensure_connected(ctx: &mut dyn NativeContext, this: ObjectRef) -> MethodCallR
         _ => Duration::from_secs(60),
     };
 
+    // FIX (client-cipher-restriction): resolve any real caller-installed
+    // SSLSocketFactory BEFORE calling perform — the up-call needs `ctx`.
     let established_https_stream = if parsed.scheme == "https" {
         huc_upcall_create_socket_if_custom_factory(ctx, &parsed.host, parsed.port)?
     } else {
         None
     };
+    // `perform` manages its own (fine-grained) blocking regions internally —
+    // see its doc — so this caller must not wrap the whole call in one.
     let (status, headers, body_bytes) = match perform(
+        ctx,
         &parsed,
         &method,
         &headers,
