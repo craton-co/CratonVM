@@ -12885,7 +12885,7 @@ fn p57_alloc_enum(
 // ---------------------------------------------------------------------------
 // ProcessBuilder / Process — actual process execution via std::process
 // ProcessBuilder = 4-field synthetic (command=0, directory=1, env=2, redirect=3)
-// Process = 3-field synthetic (exit_code=0, stdout=1, stderr=2)
+// Process = 4-field synthetic (exit_code=0, stdout=1, stderr=2, pid=3)
 // ---------------------------------------------------------------------------
 const PB_FIELD_COMMAND: usize = 0;
 const PB_FIELD_DIRECTORY: usize = 1;
@@ -12893,6 +12893,7 @@ const PB_FIELD_DIRECTORY: usize = 1;
 const PROC_FIELD_EXIT: usize = 0;
 const PROC_FIELD_STDOUT: usize = 1;
 const PROC_FIELD_STDERR: usize = 2;
+const PROC_FIELD_PID: usize = 3;
 
 pub(crate) fn register_phase57_process(r: &mut NativeMethodRegistry) {
     let __prev_cat = r.current_category();
@@ -13098,25 +13099,40 @@ pub(crate) fn register_phase57_process(r: &mut NativeMethodRegistry) {
         command.stdout(std::process::Stdio::piped());
         command.stderr(std::process::Stdio::piped());
 
-        match command.output() {
-            Ok(output) => {
-                let process = alloc_concurrent_synthetic(ctx, "java/lang/Process", 3);
-                // Pin across the create_strings below — a moving young GC there
-                // would relocate the fresh Process (native stale-local family).
-                let process_pin = ctx.pin_native_root(process);
-                let exit_code = output.status.code().unwrap_or(-1);
-                ctx.set_field(process, PROC_FIELD_EXIT, Value::Int(exit_code));
-                let stdout_str = String::from_utf8_lossy(&output.stdout).into_owned();
-                let stderr_str = String::from_utf8_lossy(&output.stderr).into_owned();
-                let stdout_ref = ctx.create_string(&stdout_str);
-                let stdout_pin = ctx.pin_native_root(stdout_ref);
-                let stderr_ref = ctx.create_string(&stderr_str);
-                let process = ctx.read_native_pin(process_pin, process);
-                let stdout_ref = ctx.read_native_pin(stdout_pin, stdout_ref);
-                ctx.set_field(process, PROC_FIELD_STDOUT, Value::Object(Some(stdout_ref)));
-                ctx.set_field(process, PROC_FIELD_STDERR, Value::Object(Some(stderr_ref)));
-                ctx.unpin_native_roots(process_pin);
-                Ok(Some(Value::Object(Some(process))))
+        // Use spawn() (not the output() convenience wrapper) so the real OS
+        // pid of the launched child is available via Child::id() — output()
+        // only returns an Output{status, stdout, stderr}, with no pid, which
+        // is why pid()/toHandle() used to fall back to the VM's OWN pid.
+        match command.spawn() {
+            Ok(child) => {
+                let child_pid = child.id();
+                match child.wait_with_output() {
+                    Ok(output) => {
+                        let process = alloc_concurrent_synthetic(ctx, "java/lang/Process", 4);
+                        // Pin across the create_strings below — a moving young GC there
+                        // would relocate the fresh Process (native stale-local family).
+                        let process_pin = ctx.pin_native_root(process);
+                        let exit_code = output.status.code().unwrap_or(-1);
+                        ctx.set_field(process, PROC_FIELD_EXIT, Value::Int(exit_code));
+                        ctx.set_field(process, PROC_FIELD_PID, Value::Long(child_pid as i64));
+                        let stdout_str = String::from_utf8_lossy(&output.stdout).into_owned();
+                        let stderr_str = String::from_utf8_lossy(&output.stderr).into_owned();
+                        let stdout_ref = ctx.create_string(&stdout_str);
+                        let stdout_pin = ctx.pin_native_root(stdout_ref);
+                        let stderr_ref = ctx.create_string(&stderr_str);
+                        let process = ctx.read_native_pin(process_pin, process);
+                        let stdout_ref = ctx.read_native_pin(stdout_pin, stdout_ref);
+                        ctx.set_field(process, PROC_FIELD_STDOUT, Value::Object(Some(stdout_ref)));
+                        ctx.set_field(process, PROC_FIELD_STDERR, Value::Object(Some(stderr_ref)));
+                        ctx.unpin_native_roots(process_pin);
+                        Ok(Some(Value::Object(Some(process))))
+                    }
+                    Err(e) => {
+                        Err(RuntimeError::IllegalStateException {
+                            message: format!("ProcessBuilder.start() failed: {e}"),
+                        }.into())
+                    }
+                }
             }
             Err(e) => {
                 Err(RuntimeError::IllegalStateException {
@@ -13239,8 +13255,19 @@ pub(crate) fn register_phase57_process(r: &mut NativeMethodRegistry) {
         |_ctx, args| Ok(Some(args[0])),
     );
 
-    r.register(proc, "pid", "()J", |_ctx, _args| {
-        Ok(Some(Value::Long(std::process::id() as i64)))
+    r.register(proc, "pid", "()J", |ctx, args| {
+        let this = obj_arg(args, 0)?;
+        Ok(Some(ctx.get_field(this, PROC_FIELD_PID)))
+    });
+
+    // Process.toHandle() (JDK 9+) — build a ProcessHandle from the real
+    // child pid captured at spawn time (see PROC_FIELD_PID above).
+    r.register(proc, "toHandle", "()Ljava/lang/ProcessHandle;", |ctx, args| {
+        let this = obj_arg(args, 0)?;
+        let pid = ctx.get_field(this, PROC_FIELD_PID);
+        let handle = alloc_concurrent_synthetic(ctx, "java/lang/ProcessHandle", 1);
+        ctx.set_field(handle, 0, pid);
+        Ok(Some(Value::Object(Some(handle))))
     });
 
     // Process.getInputStream() — returns ByteArrayInputStream wrapping stdout bytes
@@ -13354,9 +13381,26 @@ pub(crate) fn register_phase57_process(r: &mut NativeMethodRegistry) {
         "()Ljava/lang/Process;",
         |_ctx, args| Ok(Some(args[0])),
     );
-    r.register(synthetic_proc, "pid", "()J", |_ctx, _args| {
-        Ok(Some(Value::Long(std::process::id() as i64)))
+    r.register(synthetic_proc, "pid", "()J", |ctx, args| {
+        let this = obj_arg(args, 0)?;
+        Ok(Some(ctx.get_field(this, PROC_FIELD_PID)))
     });
+
+    // Process.toHandle() (JDK 9+) — was entirely unregistered on this
+    // synthetic receiver class, causing NoSuchMethodError on any
+    // CratonVM-backed Process (docs/known-issues/wildfly-process-tohandle-missing.md).
+    r.register(
+        synthetic_proc,
+        "toHandle",
+        "()Ljava/lang/ProcessHandle;",
+        |ctx, args| {
+            let this = obj_arg(args, 0)?;
+            let pid = ctx.get_field(this, PROC_FIELD_PID);
+            let handle = alloc_concurrent_synthetic(ctx, "java/lang/ProcessHandle", 1);
+            ctx.set_field(handle, 0, pid);
+            Ok(Some(Value::Object(Some(handle))))
+        },
+    );
     r.register(
         synthetic_proc,
         "waitFor",
