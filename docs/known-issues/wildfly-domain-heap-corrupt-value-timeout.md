@@ -606,3 +606,92 @@ extension, the domain servers/host-controller, which are standalone-shaped
 JIT-on boots). It is distinct from — and now more clearly separated than — the
 no-JIT `awaitServers` propagation gap and the JIT-on domain interface-
 resolution miscompile documented above.
+
+## 2026-07-07 update (eighth session) — a THIRD, distinct WFLYSRV0082 defect found in `bin/domain.sh`'s stock config; corrects scope of the earlier JIT-miscompile note; JIT bisect attempted, did not converge
+
+Follow-up on the sixth-session finding ("JIT-on: HC interface resolution
+fails with WFLYSRV0082 ... does NOT reproduce under no-JIT"). That
+observation was made entirely through the **Arquillian testsuite harness**,
+whose `DomainTestSupport`-generated `host.xml`/`domain.xml` use **literal**
+`<inet-address value="127.0.0.2"/>` addresses (no `${...}` expression
+syntax). This session tested the **stock** `bin/domain.sh`/`bin/standalone.sh`
+config instead (`<inet-address value="${jboss.bind.address.management:127.0.0.1}"/>`)
+and found a **third, separate** interface-resolution defect that reproduces
+identically regardless of JIT state or bind address:
+
+```text
+[Host Controller] DEBUG [org.jboss.as.server.net] Starting NetworkInterfaceService
+[Host Controller] ERROR [org.jboss.as.controller.management-operation] WFLYCTL0013: Operation ("add") failed - address: (["host"=>"primary","core-service"=>"management","management-interface"=>"http-interface"])
+  - failure description: {"WFLYCTL0412: Required services that are not installed:" => [""], "WFLYCTL0180: ... => ["service  is missing []"]}
+[Host Controller] ERROR ... address: (["host"=>"primary","interface"=>"management"])
+  - failure description: {"WFLYCTL0080: Failed services" => {"" => "WFLYSRV0082: failed to resolve interface management"}}
+```
+
+Reproduced with `bin/domain.sh` (both default `127.0.0.1` binding and
+explicit `-bmanagement=127.0.0.2`) under **both** JIT-on and
+`CRATONVM_DISABLE_JIT=1` — same failure every time, ruling out JIT and the
+specific bind address as factors for THIS variant.
+
+**What was ruled out this session, with direct probes:**
+- `ModelNode` expression resolution (`${jboss.bind.address.management:127.0.0.1}`)
+  resolves correctly to `"127.0.0.1"` on both HotSpot and CratonVM — confirmed
+  via a standalone `org.jboss.dmr.ModelNode.resolve()` probe.
+- `ServiceName.toString()`/`.equals()`/`.hashCode()` all work correctly
+  against CratonVM's synthetic `ServiceName` mirror (which unconditionally
+  intercepts `of`/`append`/`getCanonicalName`/`getParent` — NOT gated behind
+  `CRATONVM_MSC_REAL_START`, so this runs on every boot). A direct probe
+  (`ServiceName.of("jboss","network","interface","management")`) round-trips
+  `toString()`/`equals()` identically on both VMs.
+- `NetworkInterfaceService.resolveInterface(OverallInterfaceCriteria)`
+  invoked directly via reflection with the exact same JVM flags as the
+  Host Controller resolves fine on both VMs (confirmed in the sixth-session
+  update above).
+
+**Not yet found:** the `"service  is missing []"` (two spaces = an empty
+`ServiceName`, `[]` = an empty dependency list) means some REAL MSC service
+registration during boot is keyed by a genuinely empty-segment `ServiceName`
+— i.e. a real value that should have carried a service reference (most
+likely the `http-interface` management-interface's dependency on the
+"management" `NetworkInterfaceService`, wired via the model's
+`<socket interface="management" .../>` attribute) collapsed to zero segments
+somewhere in the real `org.jboss.as.controller`/model-processing bytecode
+between reading that attribute and constructing the dependency's
+`ServiceName`. This is NOT a `ServiceName`-machinery bug (ruled out above);
+it must be upstream, in whatever code builds a composite `ServiceName` from
+a model attribute value during capability/socket-binding resolution. Not
+pinned to a specific class/method this session.
+
+**JIT bisect on the testsuite's own WFLYSRV0082 (literal-address config,
+the ORIGINAL sixth-session finding) — attempted, did not converge.** Ran
+`CRATONVM_JIT_DENY=org/jboss/as/controller/interfaces/,org/jboss/dmr/,java/net/`
+against `DefaultConfigSmokeTestCase#testStandardHost` under the full E2E
+harness. The run silently died with zero output past the JUnit test-class
+header — no `BUILD SUCCESS`/`FAILURE`, no crash dump, no nested JVM left
+alive — most likely because denying JIT wholesale for `org/jboss/dmr/`
+(an extremely hot-path package touched by nearly every model operation) is
+not a safe bisection axis by itself, or coincided with host instability
+(this session's Azure host had frequent SSH connection resets and at least
+one instance of a detached background launch dying without `disown -a`).
+Not re-attempted after two consecutive silent deaths — this needs a
+narrower, single-class `CRATONVM_JIT_BISECT_SKIP=Class.method` bisect
+(rather than whole-package `CRATONVM_JIT_DENY`) on a quieter host, or a
+live `gdb`/deopt-trace capture of the actual HC process at the moment of
+its `WFLYSRV0082` failure under the testsuite's literal-address config,
+which was never attempted directly (only the domain.sh variant was
+deep-probed this session).
+
+**Status:** three distinct, real, reproducible `WFLYSRV0082`-shaped
+defects are now known across this doc pair:
+1. Testsuite literal-address config, JIT-on only (sixth session) — cause
+   still unknown, JIT-implicated but not yet isolated to a method.
+2. `bin/domain.sh`/`bin/standalone.sh` stock expression-config, BOTH JIT
+   states, BOTH default and explicit bind addresses (this session) — cause
+   narrowed to an empty-`ServiceName` dependency, not yet pinned to the
+   exact model-attribute-read/ServiceName-construction site.
+3. (Unconfirmed whether #1 and #2 share a root cause — the testsuite's
+   no-JIT PASS on its own literal-address config is the strongest evidence
+   they're different, since #2 fails under no-JIT too.)
+
+Both docs remain OPEN. No fix landed this session; this is a documentation
+and scoping pass only, to prevent a future session from re-treading the
+same ground or conflating these three distinct failure modes.
