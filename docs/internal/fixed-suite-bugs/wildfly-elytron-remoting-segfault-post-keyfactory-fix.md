@@ -1,6 +1,6 @@
 # ElytronRemoteOutboundConnectionTestCase: native SIGSEGV during elytron subsystem / remoting-client test execution
 
-Status: OPEN — root-caused 2026-07-07 to the known A4 "register-only oop" JIT/GC gap; not fixed here (see [Root cause](#root-cause-confirmed-2026-07-07-a4-register-only-oop-family) below)
+Status: FIXED 2026-07-07 (for the SIGSEGV specifically — see correction below; the A4 register-only-oop attribution was revised, not confirmed) via dev 60079fc4
 Severity: High (hard native crash, not a catchable Java exception; blocks the whole test class)
 First confirmed: 2026-07-07, Azure worktree `wt-keyfactory-translatekey` (branch `fix/keyfactory-translatekey-20260707`)
 Root-caused: 2026-07-07, Azure worktree `wt-elytron-segv-20260707` (branch `fix/elytron-remoting-segv-20260707`)
@@ -21,6 +21,68 @@ terminated without properly saying goodbye. VM crash or System.exit called?
 
 Exit code 139 = SIGSEGV. Confirmed **still reproducing on current dev** (`4e6dc36d`, 2026-07-07) — same
 crash point, twice in a row.
+
+## ✅ CORRECTED 2026-07-07 ~16:35 — fixed via `jit_invoke_virtual_mic` arg-decode validation (NOT the general A4 register-oop-bitmap gap)
+
+The crash this doc documents is now fixed on `dev` (`60079fc4`,
+"fix(jit): validate heap membership for L/[ arg slots in jit_invoke_virtual_mic").
+Root cause, re-derived from a live gdb repro of this exact class's crash and
+cross-checked against two other same-day docs that share the byte-identical
+`read_string <- native_builder_set <- safe_native_call <- invoke_or_native <-
+jit_invoke_virtual_mic` backtrace and the same small-round-number fault
+addresses ([[wildfly-infinispan-remove-listener-segfault]],
+[[wildfly-xnio-mockselector-mutex-segfault]]):
+
+`jit_invoke_virtual_mic`'s inline `decode_values` closure
+(`vm/src/jit/helpers.rs`) decoded a raw `i64` call-argument slot into an
+`ObjectRef` whenever the callee's descriptor said `L`/`[` and the bits merely
+LOOKED like a plausible pointer (8-byte aligned, under the 48-bit canonical
+ceiling) -- it never checked the bits were an actual live heap address, unlike
+its own sibling `decode_dispatch_values` a few hundred lines above, which
+already calls `vm.heap.is_object_address()` for the identical decode.
+`org.xnio.OptionMap$Builder.set(Option, Object)` is called throughout XNIO
+worker/channel setup with numeric options (read/write timeouts, keepalive
+intervals, etc.) as boxed `Long`s; whenever one of those primitive longs
+reached this decode path unboxed, a round millisecond value like 60000 or
+120000 is ALSO 8-byte-aligned and well under 2^48, so it passed the old
+"plausible pointer" check trivially -- `ObjectRef::from_raw` fabricated a bogus
+reference into unmapped memory, and `native_builder_set`'s `ctx.read_string(s)`
+a few instructions later dereferenced its header. SIGSEGV.
+
+**This revises the "A4 register-only-oop family" attribution below.** That
+theory required a REAL, previously-valid `String` `ObjectRef` to go stale
+because GC relocated/reclaimed it while it sat only in a register, untracked,
+across a non-call safepoint. The actual fault addresses tell a simpler story:
+`0xea60` (60000) and `0x1d4c0` (120000) are not "small-looking-because-
+relocated" addresses -- they are exactly the millisecond timeout CONSTANTS
+XNIO passes to `Builder.set`. The value was never a real pointer at any point;
+it was a primitive that never went through boxing and got type-confused for a
+reference by one weak validation gap. The bisection evidence below
+(`--nojit` eliminates the crash; `--no-precise-maps` makes no difference) is
+equally consistent with this simpler mechanism -- the fix lives entirely in
+JIT-only code that the interpreter's own correctly-tagged argument path never
+goes through, and precise vs. conservative stack maps have nothing to do with
+a decode-time type-confusion bug. That bisection does not, on its own,
+distinguish between the two theories.
+
+**The general A4 register-oop-bitmap gap (`OopMapEntry` has no register-oop
+bitmap, `jit/src/lib.rs:52-73`) is very likely still real and still open** --
+this fix does not touch `OopMapEntry` or any safepoint/root-scanning code, only
+`jit_invoke_virtual_mic`'s own argument decode. [[fork6-fjp-multithread-jit-root-reclamation]]
+remains the correct tracker for that broader, still-unimplemented concern; this
+doc's specific crash turned out to be a narrower, independently-fixed decode
+bug that happened to produce a symptom shape (SIGSEGV in `read_string`,
+JIT-only, small fault address) easy to mistake for the bigger gap.
+
+**Verification**: this exact class no longer SIGSEGVs on the fixed binary --
+re-run via `run-suite-linux.sh` with `--class-to 300` hit the 300s ceiling as a
+`TIMEOUT`, not a `CRASH`/exit-139 (the timeout is consistent with the separate,
+already-documented GC-barrier blocked-region-transition boot hang in
+[[wildfly-xnio-mockselector-mutex-segfault]]'s "Reproduction attempt" section,
+not a new problem from this fix). No kernel segfault was recorded for this run.
+A full pass/fail (not just crash-free) confirmation of this specific class is
+still worth doing once the GC-barrier hang is separately fixed, but the SIGSEGV
+this doc exists to document is gone.
 
 ## Root cause (CONFIRMED 2026-07-07): A4 register-only-oop family
 

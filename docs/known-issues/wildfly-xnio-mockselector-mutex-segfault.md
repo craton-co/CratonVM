@@ -1,11 +1,56 @@
 # SIGSEGV in Mutex&lt;bool&gt;/Condvar::wait_timeout drop path — dominant crash once WildFly actually runs under CratonVM
 
-Status: OPEN — new, found 2026-07-07 during round-2 rerun of the full WildFly suite (after fixing the
-test harness so the managed WildFly server actually runs under CratonVM instead of falling back to real JDK)
+Status: PARTIALLY FIXED 2026-07-07 — the SIGSEGV this doc documents is fixed on `dev` (`60079fc4`,
+see the correction below); a SEPARATE, still-OPEN GC-barrier boot-hang was also found during this doc's
+own investigation (see "Reproduction attempt" section below) and remains unresolved, so this doc stays
+in `known-issues` rather than moving to `internal`.
 Severity: **Critical for this suite's signal** — the single dominant failure mode once the harness bug
 (container.java.home falling back to real JDK) was fixed; hit ~64% of all classes attempted in a ~200-class
 sample of round 2 (128/200 classes CRASH, all exit code 139, all at the identical code offset).
 First confirmed: 2026-07-07, Azure worktree `test/wildfly-full-suite-20260707`, dev@37efdc4a (round-2 binary)
+
+## ✅ FIXED 2026-07-07 ~16:40 — the SIGSEGV is fixed; it was a JIT arg-decode bug, not confirmation of the A4 register-oop-bitmap gap
+
+The section immediately below ("CONFIRMED ... SAME BUG as the Elytron A4 register-only-oop crash")
+correctly identified that this doc's crash, the Elytron doc's crash, and the (also same-day)
+`wildfly-infinispan-remove-listener-segfault.md` crash are all the byte-for-byte identical backtrace
+(`read_string <- native_builder_set <- safe_native_call <- invoke_or_native <- jit_invoke_virtual_mic`).
+It did NOT yet have a fix, and its "A4 register-only-oop" attribution has since been revised (not
+confirmed): the true mechanism was a much narrower, already-fixed decode-time validation gap, not the
+general register-oop-bitmap gap `fork6-fjp-multithread-jit-root-reclamation.md` tracks.
+
+`jit_invoke_virtual_mic`'s inline `decode_values` closure (`vm/src/jit/helpers.rs`) decoded a raw `i64`
+call-argument slot into an `ObjectRef` whenever the callee's descriptor said `L`/`[` and the bits merely
+LOOKED like a plausible pointer (8-byte aligned, under the 48-bit canonical ceiling) -- it never checked
+the bits were an actual live heap address, unlike its own sibling `decode_dispatch_values` a few hundred
+lines above, which already calls `vm.heap.is_object_address()` for the identical decode.
+`org.xnio.OptionMap$Builder.set(Option, Object)` -- which fires on essentially every managed-container
+boot via XNIO worker/channel setup, explaining this doc's 64% suite-wide crash rate -- passes numeric
+options (read/write timeouts, keepalive intervals) as boxed `Long`s. Whenever one of those primitive
+longs reached this decode path unboxed, a round millisecond value like 60000 or 120000 is ALSO
+8-byte-aligned and well under 2^48, so it passed the old "plausible pointer" check trivially --
+`ObjectRef::from_raw` fabricated a bogus reference into unmapped memory, and `native_builder_set`'s
+`ctx.read_string(s)` a few instructions later dereferenced its header. SIGSEGV.
+
+The fault addresses this doc itself recorded (`0xea60`=60000, `0x1d4c0`=120000) are the tell: they are
+exactly XNIO's millisecond timeout constants, not addresses that used to be valid and got relocated by a
+concurrent GC. Fixed on `dev` (`60079fc4`) by requiring actual heap membership
+(`vm.heap.is_object_address`) instead of bit-pattern plausibility, matching the already-correct sibling
+decode path. **This does NOT touch `OopMapEntry` or any register/safepoint tracking machinery** -- the
+general A4 register-oop-bitmap gap this doc's "CONFIRMED" section below points to is very likely still a
+real, separate, open concern; this fix only closes the `native_builder_set`/`OptionMap.Builder.set`
+manifestation of a SIGSEGV that turned out to have a simpler cause.
+
+**Verification**: 18+ consecutive clean repro attempts across two independently-built binaries (zero
+SIGSEGV, versus the doc's own documented near-100% pre-fix crash rate on the same repro shapes); a
+30-class `testsuite/integration/basic` regression slice on the fixed binary showed 0 CRASH / 0 ABEND
+(empty `crashes.log`, no kernel segfaults). Full details and the corrected root-cause writeup:
+`docs/internal/fixed-suite-bugs/wildfly-infinispan-remove-listener-segfault.md` and
+`docs/internal/fixed-suite-bugs/wildfly-elytron-remoting-segfault-post-keyfactory-fix.md`.
+
+**This doc stays in `known-issues`, not `internal`, because of the SEPARATE finding below** ("Reproduction
+attempt 2026-07-07 -- current dev HANGS at boot") -- a GC-barrier blocked-region-transition deadlock that
+is NOT fixed by this change and remains a real, open blocker for exercising WildFly-under-CratonVM at all.
 
 ## ✅ CONFIRMED 2026-07-07 ~16:15 — SAME BUG as the Elytron A4 register-only-oop crash; the "Coordination note" below (marked resolved ~15:26) is WRONG and is retracted
 
