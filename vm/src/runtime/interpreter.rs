@@ -9300,20 +9300,6 @@ fn resume_real_ir_deopt(
     }
 }
 
-/// deopt-osr Step 8 follow-up (P4): `CRATONVM_OSR_EXIT_TRANSFER` (default-OFF,
-/// read-once). When ON, a frame-deopt taken inside OSR-entered code transfers the
-/// JIT-advanced loop state into the LIVE interpreter frame and resumes the loop
-/// body there (a *true* OSR-exit), instead of the safe reject that discards the
-/// JIT-advanced state and re-runs those iterations in the interpreter. OFF ⇒ the
-/// validated Step-8 reject ⇒ byte-identical to today. Consulted together with the
-/// per-method `can_osr_exit` flag and `cratonvm_jit::deopt_real_enabled()` at the
-/// OSR sink, so OSR-exit can never run half-on.
-fn osr_exit_transfer_enabled() -> bool {
-    use std::sync::OnceLock;
-    static FLAG: OnceLock<bool> = OnceLock::new();
-    *FLAG.get_or_init(|| std::env::var_os("CRATONVM_OSR_EXIT_TRANSFER").is_some())
-}
-
 /// deopt-osr Step 8 follow-up (P4) — TRUE OSR-exit: transfer the JIT-advanced loop
 /// state from a reconstructed frame into the LIVE interpreter frame at `frame_idx`
 /// (overwrite locals + operand stack in place, set pc), so the interpreter resumes
@@ -23163,8 +23149,18 @@ fn try_osr(
     //     (the unconditional-at-header trigger). The validated Step-8 default.
     if result_i64 == i64::MIN {
         if let Some(rframe) = cratonvm_jit::deopt::take_last_deopt() {
-            if osr_exit_transfer_enabled()
-                && compiled.can_osr_exit
+            // FIX (silent data corruption, HHH-15895 InPredicateTest / AccumRepro3
+            // residual): `compiled.can_osr_exit` is already a precise gate — it's
+            // false unless this compile genuinely recorded an OSR-exit snapshot
+            // (either the experimental `deopt_real_enabled()`-gated loop-header
+            // guards, or the now-unconditional invokedynamic uncommon-trap
+            // snapshot — see the fix notes in `jit/src/x64.rs`). The separate
+            // `osr_exit_transfer_enabled()` opt-in gate was redundant on top of
+            // that and, left in place, would silently keep the invokedynamic
+            // trap on the corruption-prone "safe reject" path in default builds
+            // (`CRATONVM_OSR_EXIT_TRANSFER` unset). Dropped in favor of
+            // `can_osr_exit` alone.
+            if compiled.can_osr_exit
                 && transfer_osr_exit_into_live_frame(shared, thread, frame_idx, &rframe).is_some()
             {
                 if std::env::var_os("CRATONVM_DBG_DEOPT").is_some() {
