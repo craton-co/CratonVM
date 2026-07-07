@@ -7,6 +7,78 @@ Severity: **Critical for this suite's signal** — the single dominant failure m
 sample of round 2 (128/200 classes CRASH, all exit code 139, all at the identical code offset).
 First confirmed: 2026-07-07, Azure worktree `test/wildfly-full-suite-20260707`, dev@37efdc4a (round-2 binary)
 
+## ✅ CONFIRMED 2026-07-07 ~16:15 — SAME BUG as the Elytron A4 register-only-oop crash; the "Coordination note" below (marked resolved ~15:26) is WRONG and is retracted
+
+Built an independent repro of THIS doc's own crash (not borrowed from the Elytron investigation) using
+the round-2 binary (`frozen-cratonvm-wildfly-bugbash-v2-20260707`) against `testsuite/integration/basic`
+classes already known to crash (e.g. `org.jboss.as.test.integration.ejb.security.EJBSecurityTestCase`).
+
+**Methodology note — this crash is a heisenbug under a live gdb wrapper.** Wrapping the whole process in
+`gdb -batch -ex run ...` (the technique [[wildfly-elytron-remoting-segfault-post-keyfactory-fix]] used
+successfully for its own crash, including the `handle SIGUSR1/SIGUSR2 nostop noprint pass` fix for
+CratonVM's internal use of those signals) reproduced **zero crashes across 9 attempts** (2 batches, all
+previously-confirmed-crashing classes from `crashes.log`) — gdb's overhead changes thread scheduling just
+enough to close the race window. Switching to **raw execution + kernel core dumps** reproduced on the
+**first attempt**: `sudo sysctl kernel.core_pattern=/abs/path/core.%e.%p.%t`, `ulimit -c unlimited` in the
+same shell invoking `mvnw`, `-Djvm=<dir>/bin/java.exe` pointing at a plain passthrough wrapper
+(`exec <cratonvm-binary> "$@"`, no gdb), then `gdb <binary> <corefile>` post-mortem. **Prefer this over a
+live gdb wrapper for any future JIT-timing-sensitive race on this host.**
+
+**The core-dump backtrace:**
+
+```text
+Program terminated with signal SIGSEGV, Segmentation fault.
+#0  <cratonvm_vm::vm::vm_exec::NativeContextImpl as cratonvm_native_api::registry::NativeContext>::read_string ()
+#1  cratonvm_native_builtins::xnio_async::native_builder_set ()
+#2  cratonvm_vm::vm::vm_exec::safe_native_call ()
+#3  cratonvm_vm::vm::vm_exec::invoke_or_native ()
+#4  cratonvm_vm::jit::helpers::jit_invoke_virtual_mic ()
+#5+ (unwinder garbage through JIT-generated code -- no debug/unwind info emitted for JIT'd code)
+```
+
+This is **byte-for-byte identical** (same functions, same call order) to the backtrace in
+[[wildfly-elytron-remoting-segfault-post-keyfactory-fix]], which was root-caused there to the **A4
+register-only-oop family**, tracked centrally in [[fork6-fjp-multithread-jit-root-reclamation]]: a live
+oop (a `String` `ObjectRef`) held only in a register — not covered by frame-slot maps or conservative
+stack scanning — goes stale when GC relocates/reclaims it across a safepoint that isn't a JIT
+call-safepoint; any later use of that register value is a dangling-pointer read. `native_builder_set`
+(`native-builtins/src/xnio_async.rs:859`, the native override for `org.xnio.OptionMap$Builder.set(Option,
+Object)`) calls `ctx.read_string(s)` on the stale `ObjectRef` with no allocation in between — exactly the
+shape the CORRECTION section below predicted from addr2line alone, before either doc had a real backtrace.
+
+**Bisection confirms it independently**: `CRATONVM_DISABLE_JIT=1` (interpreter-only) eliminates the crash
+on all 3 classes retried (`EJBSecurityTestCase`, `MDBRoleTestCase`, `BasicGZIPTestCase`) — each ran to a
+normal (non-crash) test failure instead of SIGSEGV. Matches the Elytron doc's own bisection result
+exactly (same flag, same outcome).
+
+**This retracts the "Coordination note, resolved 2026-07-07 ~15:26" section below.** That note concluded
+the two crashes were different mechanisms by comparing the Elytron investigation's confirmed backtrace
+against THIS doc's still-unconfirmed addr2line/nm-only theory. With a real backtrace from this doc's own
+repro now in hand, they are conclusively the **same bug**. The CORRECTION section's "native-handle UAF /
+garbage `self` pointer" read was directionally useful (correctly ruling out `MockSelector` and a literal
+`Mutex`-lifetime bug) but had not yet identified the actual mechanism — only a live/core backtrace could.
+
+**Why this raises the stakes:** this is not a niche path hit by one Elytron/remoting test — it is the
+*same* gap causing **64% of the entire WildFly `integration/basic` suite to crash outright**, because
+`OptionMap.Builder.set()` fires pervasively during XNIO worker/channel setup on every managed-container
+boot, not just Elytron-specific code paths. The A4 register-oop-bitmap gap (`jit/src/lib.rs:52-73`,
+`OopMapEntry`) is very likely the single highest-leverage fix available for this suite's signal right now.
+
+**Not fixed here** — per the Elytron doc's own assessment this needs a real JIT codegen feature (tracking
+register-resident live oops at every safepoint, not just frame-slot-resident ones), too large/risky to
+implement blind in a triage session. Whoever picks up the A4 register-oop-bitmap project now has **two**
+independent, real-world (non-synthetic), highly-reproducible verification lanes — this doc's `basic`-module
+repro and the Elytron `manualmode` repro — in addition to the existing synthetic `Fork6Hard` lane.
+
+**⚠️ Caveat, do not skip:** [[fork6-fjp-multithread-jit-root-reclamation]] records that a separate, much
+deeper investigation empirically **refuted** "register-invisible oop, fixed by precise JIT maps" as A4's
+actual mechanism on `Fork6Hard`'s own canonical repro (precise maps, fullstack scan, register harvest, and
+a conservative operand-stack scan all failed to fix it; more root coverage made it *worse*). Also, neither
+this crash nor the Elytron one goes through ForkJoinPool/GC_STRESS at all — both are a single JIT-compiled
+virtual-dispatch-to-native call. Same crash **site**, but the **mechanism** may not be the same as
+`Fork6Hard`'s FJP-worker-publish-gap finding. Verify which mechanism actually applies here before building
+a register-oop-bitmap fix.
+
 ## ⛔ CORRECTION 2026-07-07 — MockSelector is REFUTED as the crash site (it is `#[cfg(test)]`)
 
 Investigated on current dev (`4e6dc36d`). The doc's "best source-level match",
@@ -64,6 +136,58 @@ native-handle-UAF root cause -- they are separate bugs that happen to both be
 WildFly-under-CratonVM SIGSEGVs found the same day. Still worth checking
 [[wildfly-infinispan-remove-listener-segfault]] against whichever mechanism gets
 confirmed here.
+
+## Reproduction attempt 2026-07-07 — current dev HANGS at boot (does NOT crash); precise-maps cleared
+
+Reproduced with a symbolicated current-dev binary (`4e6dc36d`+, i.e. after the
+precise-maps-default-ON flip `65d7cfba`) booting WildFly 32 **standalone**
+directly under CratonVM (`JAVA_HOME`→cratonvm, `CRATONVM_JAVA_HOME=jdk25`),
+bypassing Maven/Arquillian.
+
+**The documented SIGSEGV did NOT reproduce as a crash.** Instead the server
+**hangs during boot** at the `ServerService Thread Pool` startup, every time,
+at a **GC-barrier / blocked-region-transition deadlock** — NOT the native-handle
+crash. gdb-attach to the hung process (all threads):
+
+- 1 thread in `stw_take_over_and_wait` (`interpreter.rs:535`) →
+  `wait_for_all_timeout` (`gc_barrier.rs:312`): the STW initiator, spinning with
+  `pending=1 taken=0` ("still waiting for cooperative mutators rounds=64").
+- ~10 threads parked in `wait_out_pause_locked` (`gc_barrier.rs:278`) — arrived,
+  waiting for the pause to end.
+- ~8 threads in `arrive_and_wait`/`safepoint_check` (`gc_barrier.rs:363`,
+  `interpreter.rs:2409`).
+- **2 threads stuck mid-`mark_blocked_region_leave`** (`gc_barrier.rs:220`) via
+  `native_rq_remove_timeout` (`reference.rs:505`) →
+  `end_blocking_region_refs` (`vm_exec.rs:5151`): a `ReferenceQueue.remove`
+  worker trying to LEAVE its blocked region while a STW is active. This is the
+  `pending=1` holdout — a thread in the blocked→running transition window that
+  the takeover neither excuses (it left the blocked set) nor takes over
+  (`taken=0`). Classic blocked-region-transition barrier deadlock (cf.
+  [[reference_blocked_thread_gc_gap]] "leave WAITS OUT active STW while still
+  counted").
+
+**Precise-maps is NOT the cause.** The identical hang reproduces with
+`CRATONVM_NO_PRECISE_JIT_MAPS=1` (precise OFF) — so the precise-maps-default-ON
+flip (`65d7cfba`) does **not** regress WildFly boot; both modes deadlock at the
+same point. (This clears the flip; the hang is orthogonal.)
+
+**Open interpretation:** either (a) the documented SIGSEGV was on the OLD frozen
+binary (`37efdc4a`, precise-off) and intervening commits turned the
+race's outcome from crash→hang, or (b) standalone boot differs from the
+Arquillian-managed container config enough that standalone hits the barrier
+deadlock while the managed container hit the native-handle crash. The
+native-handle-UAF analysis above (garbage `self` at a Mutex unlock) still stands
+for the documented *crash*; this boot **hang** is a distinct GC-barrier
+coordination bug that blocks WildFly boot on current dev regardless of precise
+maps and likely deserves its own doc + a targeted fix in the
+`gc_barrier`/`stw_take_over_and_wait` blocked-region-leave transition. NOT fixed
+(a speculative change to the STW/blocked-region protocol is high blast-radius —
+it governs every multi-threaded workload).
+
+Repro (fast, no Maven, collision-free): `JAVA_HOME=<cratonvm-javahome>
+CRATONVM_JAVA_HOME=/home/victor/jdk25 wildfly-dist/wildfly-32.0.1.Final/bin/standalone.sh`
+— hangs at `ServerService Thread Pool -- N` within ~5s; gdb-attach for the
+barrier state. See [[reference_wildfly_native_segfault_family_20260707]].
 
 ## Symptom
 
@@ -208,8 +332,18 @@ nm -C frozen-cratonvm-wildfly-bugbash-v2-20260707 | grep -B1 -A1 e5bdb0
 
 ## Related
 
-Distinct from [[wildfly-infinispan-remove-listener-segfault]] (different symbol, different subsystem,
-much lower frequency/more intermittent) and [[wildfly-elytron-remoting-segfault-post-keyfactory-fix]]
-(different symptom shape — that one has no symbolization attempt yet). All three are native SIGSEGVs
-found in the same 2026-07-07 WildFly bug-bash session's harness-debugging phase, once the harness
-was fixed to actually exercise CratonVM as the WildFly host rather than falling back to real JDK.
+**CONFIRMED SAME BUG as [[wildfly-elytron-remoting-segfault-post-keyfactory-fix]]** (see the top section)
+— both are the A4 register-only-oop family, tracked centrally in
+[[fork6-fjp-multithread-jit-root-reclamation]]. Still distinct from
+[[wildfly-infinispan-remove-listener-segfault]] (different symbol, different subsystem, much lower
+frequency/more intermittent) and from the separate GC-barrier boot-**hang** found in the "Reproduction
+attempt 2026-07-07" section above (that one blocks standalone boot outright and doesn't crash — an
+orthogonal bug, not yet root-caused, not addressed by this confirmation).
+
+## Evidence (2026-07-07 ~16:15 confirmation)
+
+```text
+/data/data/scratch-xnio-mutex-segv/core.main-vm.371916.1783440822   (core dump, EJBSecurityTestCase, first attempt)
+/data/data/scratch-xnio-mutex-segv/gdb-core-analysis.log            (full post-mortem backtrace, all threads)
+/data/data/scratch-xnio-mutex-segv/mvn-nojit.log                    (CRATONVM_DISABLE_JIT=1 bisection: 3/3 no-crash)
+```
