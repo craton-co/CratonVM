@@ -21,7 +21,7 @@ young mark), tracked in
 [`docs/known-issues/gcstress-residual-corruption-faces.md`](../known-issues/gcstress-residual-corruption-faces.md)
 (see its 2026-07-07 repro note), NOT this doc's (fixed) dispatch-crash family. The classes also surface
 a **functional, non-GC bug** — duplicated JDBC `?` placeholders in generated SQL — tracked as
-[`docs/known-issues/hib-temporal-sql-parameter-placeholder-duplication.md`](../known-issues/hib-temporal-sql-parameter-placeholder-duplication.md).
+[`docs/internal/hib-temporal-sql-parameter-placeholder-duplication-FIXED.md`](hib-temporal-sql-parameter-placeholder-duplication-FIXED.md) (FIXED 2026-07-07 — it was the reopened JIT reason-8 imprecise-resume corruption, not a string bug).
 **Mode:** Interpreter (default and `--nojit`). **HotSpot (JDK 25):** PASS.
 **Affected classes (5):** `org.hibernate.orm.test.type.temporal.{InstantTests, LocalDateTimeTest,
 OffsetDateTimeTest, OffsetTimeTest, ZonedDateTimeTest}`.
