@@ -3795,8 +3795,9 @@ fn http_perform_request(
             {
                 let b64 = String::from_utf8(crate::b64_encode(ui.as_bytes(), 0, false))
                     .unwrap_or_default();
-                hdrs_with_auth = headers.to_vec();
-                hdrs_with_auth.push(("Authorization".to_string(), format!("Basic {b64}")));
+                let mut v = headers.to_vec();
+                v.push(("Authorization".to_string(), format!("Basic {b64}")));
+                hdrs_with_auth = v;
                 &hdrs_with_auth
             }
             _ => headers,
