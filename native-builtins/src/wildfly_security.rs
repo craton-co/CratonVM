@@ -916,9 +916,20 @@ fn native_subject_do_as(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCa
 }
 
 fn native_login_context_init(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    // <init>(String, Subject, CallbackHandler)V  — we only need the
-    // string-name here; the module chain comes from the security
-    // domain registry.
+    // Shared by both registered overloads:
+    //   <init>(String, Subject, CallbackHandler)V
+    //   <init>(String, Subject, CallbackHandler, Configuration)V
+    // We only need the string-name (args[1]) and Subject (args[2]) here;
+    // the module chain comes from the security domain registry, and any
+    // trailing CallbackHandler/Configuration arg is ignored — Tomcat's
+    // real `JAASRealm.authenticate()` unconditionally uses the 4-arg
+    // overload (`new LoginContext(appName, null, callbackHandler,
+    // getConfig())`, `JAASRealm.java` — `getConfig()` is frequently null
+    // when no `configFile` is set). Before this overload was registered,
+    // `<init>` ran as unintercepted real bytecode and never populated
+    // `login_context_handles()`, so the native `login()` override always
+    // hit `login_context_missing_err()` ("never initialized") — this
+    // reproduced on *every* authenticate() call, not just after a GC.
     let this = obj_arg(args, 0)?;
     let name = match args.get(1) {
         Some(Value::Object(Some(s))) => ctx.read_string(*s).unwrap_or_default(),
@@ -1152,6 +1163,15 @@ pub fn register_wildfly_security_natives(r: &mut NativeMethodRegistry) {
         lc,
         "<init>",
         "(Ljava/lang/String;Ljavax/security/auth/Subject;Ljavax/security/auth/callback/CallbackHandler;)V",
+        native_login_context_init,
+    );
+    // Tomcat's `JAASRealm.authenticate()` always calls this 4-arg
+    // overload (see the comment on `native_login_context_init`), so it
+    // must be registered too or `login()` always finds no state to load.
+    r.register(
+        lc,
+        "<init>",
+        "(Ljava/lang/String;Ljavax/security/auth/Subject;Ljavax/security/auth/callback/CallbackHandler;Ljavax/security/auth/login/Configuration;)V",
         native_login_context_init,
     );
     r.register(lc, "login", "()V", native_login_context_login);
