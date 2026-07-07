@@ -4,6 +4,54 @@ This folder collects CratonVM-only defects found while running upstream Java
 suites. The docs had grown to describe the **same underlying bug from several
 angles**; this index is the consolidated map. Read it first.
 
+## 2026-07-07 ES binary-docvalues range doc retired; residual re-diagnosed as young-GC live-object reclamation (NEW open doc)
+
+- [gen-heap-young-gc-live-object-reclaim-rrwl-holdcount.md](gen-heap-young-gc-live-object-reclaim-rrwl-holdcount.md) —
+  🔴 OPEN, VM-core GC. The `elasticsearch-lucene-binary-docvalues-range-hangs` residual (and the
+  "separate JIT-specific RRWL reader-vs-writer hang" from the 2026-07-06 Azure session) is NOT a JIT
+  miscompile: with every published-compiled method force-skipped (audited via `CRATONVM_DBG_JITC`),
+  the standalone probe still hangs. Direct evidence (`CRATONVM_DBG_SWEEP_ZERO`): the JIT-active
+  non-moving young sweep RECLAIMS a live `ThreadLocalMap$Entry` (RRWL `readHolds` hold-counter
+  storage) → IMSE at unlock / leaked read count → all-parked hang at AQLS.acquire bci 368.
+  `--nojit`+GC-stress completes; JIT-active+GC-stress hangs with nothing meaningful compiled.
+  Fixed `CRATONVM_DBG_SWEEP_EDGES` (was blind to Family-A side-marks) now classifies the loss as
+  case (a): register/native-stack root gap or sweep-walk defect. Hang rate regressed 0/3 →
+  ~6/6 across dev f6aa11c9..007e620a (prime suspect commits listed in the doc). Probe sources:
+  `repros/rwl-holdcount/`. New gated diagnostics on dev: `CRATONVM_DBG_REFERSTO`,
+  `CRATONVM_DBG_UNPARK_MISS`.
+- `elasticsearch-lucene-binary-docvalues-range-hangs.md` retired to
+  [`docs/internal/`](../internal/elasticsearch-lucene-binary-docvalues-range-hangs.md): its three
+  root causes (invokedynamic JIT blacklist, AQS skip-list gaps ×2 rounds, plain-field 16-byte slot
+  tearing) are all FIXED+merged, end-to-end verified on the Windows box (deterministic silent stall
+  → bimodal fast-IMSE/stall, both faces now attributed to the new GC doc above).
+## 2026-07-07 JIT invokedynamic uncommon-trap Groovy regression — FIXED (no tradeoff)
+
+- ✅ FIXED: `fb4a333d`'s precise-resume routing for the invokedynamic
+  uncommon trap (reason 8 / `UnreachedCode`) regressed
+  `GroovyBeanDefinitionReaderTests` under JIT-on. An earlier pass shipped a
+  blanket revert (reopening the exact silent-corruption risk `fb4a333d` had
+  fixed) as a stopgap — rejected as a final answer. Follow-up investigation
+  recovered `fb4a333d`'s own uncommitted standalone repros and found the REAL
+  root causes: (1) `getstatic` codegen never marked a reference-typed static
+  field as a GC/deopt oop (unlike `getfield`'s already-fixed inline arms),
+  corrupting `LicmRepro`/`LicmRepro2`/`ArrRepro`; (2) the invokedynamic-trap
+  snapshot mis-stamped its `DeoptReason` as `OsrExit` instead of
+  `UnreachedCode`, so the trap was never blacklisted after firing; (3) three
+  separate VM-side call sites consumed a stashed deopt frame without ever
+  driving de-speculation, so a blacklisted method kept getting re-entered
+  anyway. All four fixed; reason 8 keeps `fb4a333d`'s original unconditional
+  precise-resume routing. Verified: the corruption-repro suite is now
+  provably correct against HotSpot ground truth where it previously
+  crashed; Groovy matches the pre-existing (already-merged) baseline exactly
+  (30/36 isolated, 5/36 batch — both pre-existing numbers, unaffected either
+  way); `cargo test -p cratonvm-jit --lib` unchanged (878 passed, 4
+  pre-existing aarch64 failures). Doc moved to
+  [`docs/internal/jit-invokedynamic-uncommon-trap-precise-resume-groovy-regression-FIXED.md`](../internal/jit-invokedynamic-uncommon-trap-precise-resume-groovy-regression-FIXED.md).
+
+## 2026-07-07 GC_STRESS residual corruption re-assessed (still OPEN, two hypotheses refuted)
+
+- 🟡 Re-ran the Fork6Hard `GC_STRESS` lane on current dev (commit `3a1a95b5`): **0 crashes in 56 runs** — the severe SIGSEGV/`CompactValue`-panic faces the doc opened for are gone (contained by the 2026-07-06 `2dfdfddc` slot-tearing + map-node + guard/recovery wave). Residual is now a *contained* stale-reference young-mark rejection that still surfaces as a rep-level `ClassCastException`/`NoSuchMethodError`/`nullchild` (32/56) or a rare wedge (5/56). **Refuted both leading producers**: disabling JIT inline-`new` (4→3/12) and compact-ref-fields (→3/12) change nothing, and it reproduces under `--nojit` too, so it is a shared-core missed-root/missed-remap bug, not JIT allocation codegen. The cheap `ZonedDateTimeTest` livelock repro is CLOSED (completes clean now). Kept in known-issues (unfixed). Full write-up in [gcstress-residual-corruption-faces.md](gcstress-residual-corruption-faces.md).
+
 ## 2026-07-06 Infinispan Cache.config null after real DefaultCacheManager.start() — FIXED; two new residuals found one/two layers deeper
 
 - ✅ FIXED: `native_dcm_get_cache` (and all Cache-instance natives —
@@ -66,15 +114,18 @@ angles**; this index is the consolidated map. Read it first.
   corruption AND the Groovy regression that had forced the revert. Doc retired to
   [`docs/internal/hib-temporal-sql-parameter-placeholder-duplication-FIXED.md`](../internal/hib-temporal-sql-parameter-placeholder-duplication-FIXED.md);
   the reason-8 saga's remaining follow-ups stay tracked in
-  [jit-invokedynamic-uncommon-trap-precise-resume-groovy-regression.md](jit-invokedynamic-uncommon-trap-precise-resume-groovy-regression.md).
+  [jit-invokedynamic-uncommon-trap-precise-resume-groovy-regression-FIXED.md](../internal/jit-invokedynamic-uncommon-trap-precise-resume-groovy-regression-FIXED.md);
+  two unmasked PRE-EXISTING temporal residuals (37× `DdlTypeImpl.getRawTypeName` NPE in
+  InstantTests, 2× empty `IllegalThreadStateException`) are tracked in
+  [hib-temporal-residuals-typename-npe-illegalthreadstate.md](hib-temporal-residuals-typename-npe-illegalthreadstate.md).
 
 ## 2026-07-06/07 http.client class_manager RwLock recursive-read deadlock — FIXED (branch fix/class-manager-writer-starvation-20260706)
 
 - FIXED and retired: the "writer starvation" residual (~25-50% `HttpComponentsClientHttpRequestFactoryTests` teardown hang surviving the `caa4ee65`/`60e2b20d` AB-BA fixes) was actually a same-thread RECURSIVE READ deadlock on `class_manager`: `try_stackless_invoke`'s native-override hierarchy walk held a read guard while `native_shadow_suppressed_by_redefine` re-acquired the same lock, and parking_lot's task-fair policy parks the nested read behind any queued writer (`load_class_concurrent`). Proved via debug-info gdb (lock state word `0x1b` = 1 held reader + parked writer; the nested acquisition was inlined and invisible in the original symbols-only captures). Fix: guard-reusing `native_shadow_suppressed_by_redefine_in(&cm, ..)`. 0/40 + 0/20 hangs post-fix (was 2 hangs in 3 attempts). Full writeup: `docs/internal/fixed-suite-bugs/class-manager-rwlock-recursive-read-deadlock-FIXED.md`.
 
-## 2026-07-07 http.client Flow/Reactive hangs: root cause #1 FIXED, #2/#3 still open
+## 2026-07-07 http.client Flow/Reactive hangs: root causes #1 and #2 FIXED, #3 partially fixed (TCP connect now succeeds, deeper hang remains)
 
-- [spring-web-flow-outputstreamwriter-close-corruption.md](spring-web-flow-outputstreamwriter-close-corruption.md) -- ✅ root cause #1 FIXED (commit `6744812d`, merged `963d59b3`): `OutputStreamPublisherTests`/`SubscriberInputStreamTests` hung in their `closed()` test because `native-io/src/stream_encoder.rs`'s `StreamEncoder` shim addressed its own bookkeeping via hardcoded field indices 0/1/2, which are actually `Writer.writeBuffer`/`Writer.lock`/`StreamEncoder.closed` (confirmed via `javap` on real JDK25) -- the same "native hardcodes an inherited field's slot" bug class as `docs/internal/audits/native-hardcoded-inherited-field-slots.md`, not yet swept for this file. This corrupted `Writer.lock` (held the charset name instead of the lock object) and `StreamEncoder.closed` (read `true` from construction). Separately, and the actual proximate hang cause: the write natives never checked a closed flag and threw, so `write()` after `close()` silently no-op'd instead of throwing `IOException("Stream closed")` -- AssertJ's `assertThatIOException()` then threw an uncaught `AssertionError`, silently killing the executor worker thread before any terminal `Flow.Subscriber` signal fired. Fixed by resolving `out`/`closed` by name instead of hardcoded index, keying the charset-name/pending-buffer side-table by `identity_hash_code` instead of a scratch field slot, and adding the missing closed-check-and-throw (`close()` also now idempotent). Verified: `OutputStreamPublisherTests` 5/6 (was HANG; the 1 residual, `chunkSize()`, is a separate pre-existing bug out of scope), `SubscriberInputStreamTests` 5/5 (was HANG). `JdkClientHttpRequestFactoryTests`/`reactive.ClientHttpConnectorTests` (both real-MockWebServer-based, no `OutputStreamWriter` in their path) remain **OPEN, not investigated** -- separate root cause(s), doc stays in known-issues until those are triaged.
+- [spring-web-flow-outputstreamwriter-close-corruption.md](spring-web-flow-outputstreamwriter-close-corruption.md) -- ✅ root cause #1 FIXED (commit `6744812d`, merged `963d59b3`) and ✅ root cause #2 FIXED (commit `60bf9de0`, merged `86f37f84`): see prior entries, unchanged. 🟡 Root cause #3 (`reactive.ClientHttpConnectorTests`, isolated to specifically `HttpComponentsClientHttpConnector` of the 4 parameterized connectors -- Reactor Netty/Jetty both work, Jdk fails fast with an unrelated `ClassCastException`) is **PARTIALLY FIXED**: commit `cf78cbb8` (merged `e84859d7`) fixed `SocketChannel`/`ServerSocketChannel.supportedOptions()` throwing `AbstractMethodError` (neither class had a native registration, so dispatch fell through to the abstract `NetworkChannel` declaration) -- this `Error` (not `Exception`) wasn't caught by HttpClient5's `catch (IOException | RuntimeException)` around connection setup, and `IOReactorWorker.run()`'s own `catch (Error e) { ...; throw e; }` re-throws it, silently killing the reactor worker thread before it ever attempted a TCP connect (confirmed via `strace`: zero `connect()` syscalls before the fix). Fixed by registering `supportedOptions()` on both classes, returning a real `Set` of the options this shim's `apply_option`/`read_option` already recognize (`TCP_NODELAY` genuinely wired, `SO_KEEPALIVE`/`SO_REUSEADDR`/`SO_RCVBUF`/`SO_SNDBUF`/`SO_LINGER` accepted no-ops). Verified real progress: `strace` after the fix shows a genuine `connect()`+`getsockopt(SO_ERROR)=0` (TCP connect now succeeds) where before it never even attempted one; Reactor Netty/Jetty unaffected, `native-io`'s 330 unit tests pass. **Still open**: even after this fix, the request never reaches `MockWebServer` (`requestCount=0`) and the callback never fires -- exhaustively ruled out an uncaught exception on any of 16 `IOReactorWorker` threads (reflectively polled `getThrowable()` on all of them: null, all alive), `BasicFuture`/lock-based callback delivery (bytecode looks sound), and a false-positive connect timeout (`Timeout`/clock arithmetic all correct, 3-minute default). SLF4J TRACE logging (newly enabled via `slf4j-simple` + a `simplelogger.properties`, previously "no providers found") shows HttpClient5's own logging stops cleanly after "connecting ... (3 MINUTES)" with no further lines or errors. The break is somewhere in the connect-completion handoff (`InternalConnectChannel.onIOEvent` → `checkTimeout` → `eventHandlerFactory.createHandler` → `InternalDataChannel.upgrade`/`handleIOEvent`) producing no observable exception, log line, or thread death via any technique tried. Doc has detailed next-step guidance (instrument httpclient5 bytecode directly via ASM, the only remaining lever after reflection/logging/uncaught-handler techniques were exhausted) and lists all 16 reproduction probe files used (not committed, recreate from the doc).
 
 ## 2026-07-06 Hibernate `others.txt` non-passed rerun (OSR allocation-region gate branch)
 

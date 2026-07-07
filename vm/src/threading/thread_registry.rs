@@ -612,6 +612,25 @@ impl ThreadRegistry {
         None
     }
 
+    /// DBG (`CRATONVM_DBG_UNPARK_MISS`): snapshot of every registered
+    /// thread's `(tid, java_thread_obj address, alive)` so an unpark whose
+    /// mirror lookup missed can print what the registry believes the live
+    /// mirror addresses are (a stale `Node.waiter` shows up as a caller
+    /// address absent from this list).
+    pub fn debug_thread_obj_addrs(&self) -> Vec<(u64, usize, bool)> {
+        let threads = self.threads.lock();
+        threads
+            .iter()
+            .map(|(id, e)| {
+                (
+                    id.0,
+                    e.java_thread_obj.map_or(0, |o| o.as_ptr() as usize),
+                    e.alive.load(std::sync::atomic::Ordering::Relaxed),
+                )
+            })
+            .collect()
+    }
+
     /// WP4.1 — Find the `ThreadId` for a registered thread by its Java
     /// `Thread` mirror object.  Real-JDK-mode `Thread` objects do not have
     /// a single fixed slot we can write a `ThreadId` into (the class layout

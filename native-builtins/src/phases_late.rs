@@ -693,6 +693,27 @@ pub(crate) fn register_phase55_executors(r: &mut NativeMethodRegistry) {
         |ctx, args| {
             let runnable = obj_arg(args, 0)?;
             let result = ctx.invoke_virtual(runnable, "run", "()V", &[]);
+            // Phaser/ForkJoinPool hang fix (2026-07-07): a `MethodCallFailed::
+            // InternalError` means the Runnable's call stack was torn down by
+            // the VM WITHOUT ever routing through the callee's own bytecode
+            // exception table — any `try/finally` inside `run()` (e.g. a
+            // Phaser `arriveAndDeregister()` guarding a rendezvous, as in
+            // SmallRye Sisu's `BeanLoadingTaskRunner`) is skipped entirely,
+            // not just the catch. Previously this was stringified into the
+            // CF's error field and swallowed, so `runAsync` always reported
+            // eventual success to the caller even though the Runnable body
+            // silently never finished running — desyncing any external
+            // bookkeeping (like Phaser party counts) that assumed `run()`'s
+            // own cleanup always executes. Propagate InternalError out of
+            // this native method instead so the failure is visible (VM abort
+            // / caller sees the failure) rather than hidden. A genuine Java
+            // exception (`ExceptionThrown`) DID pass through the callee's
+            // exception table already (finally blocks ran), so that case is
+            // unaffected and keeps the existing eager-completion modeling.
+            if matches!(result, Err(MethodCallFailed::InternalError(_))) {
+                // Safe to unwrap: just matched Err(InternalError(_)) above.
+                return Err(result.unwrap_err());
+            }
             let mut future =
                 alloc_concurrent_synthetic(ctx, "java/util/concurrent/CompletableFuture", 3);
             // Pin across the create_string in the Err branch below — a moving
@@ -724,6 +745,14 @@ pub(crate) fn register_phase55_executors(r: &mut NativeMethodRegistry) {
             // completes with the correct (void) outcome — see the supplyAsync
             // overload above for why we do not route through executor.execute().
             let result = ctx.invoke_virtual(runnable, "run", "()V", &[]);
+            // Phaser/ForkJoinPool hang fix (2026-07-07): see the no-Executor
+            // overload above for the full rationale — an InternalError means
+            // the callee's own try/finally never ran, so we must not report
+            // success back to the caller.
+            if matches!(result, Err(MethodCallFailed::InternalError(_))) {
+                // Safe to unwrap: just matched Err(InternalError(_)) above.
+                return Err(result.unwrap_err());
+            }
             let mut future =
                 alloc_concurrent_synthetic(ctx, "java/util/concurrent/CompletableFuture", 3);
             // Pin across the create_string in the Err branch below — a moving
@@ -12885,7 +12914,7 @@ fn p57_alloc_enum(
 // ---------------------------------------------------------------------------
 // ProcessBuilder / Process — actual process execution via std::process
 // ProcessBuilder = 4-field synthetic (command=0, directory=1, env=2, redirect=3)
-// Process = 3-field synthetic (exit_code=0, stdout=1, stderr=2)
+// Process = 4-field synthetic (exit_code=0, stdout=1, stderr=2, pid=3)
 // ---------------------------------------------------------------------------
 const PB_FIELD_COMMAND: usize = 0;
 const PB_FIELD_DIRECTORY: usize = 1;
@@ -12893,6 +12922,7 @@ const PB_FIELD_DIRECTORY: usize = 1;
 const PROC_FIELD_EXIT: usize = 0;
 const PROC_FIELD_STDOUT: usize = 1;
 const PROC_FIELD_STDERR: usize = 2;
+const PROC_FIELD_PID: usize = 3;
 
 pub(crate) fn register_phase57_process(r: &mut NativeMethodRegistry) {
     let __prev_cat = r.current_category();
@@ -13098,25 +13128,40 @@ pub(crate) fn register_phase57_process(r: &mut NativeMethodRegistry) {
         command.stdout(std::process::Stdio::piped());
         command.stderr(std::process::Stdio::piped());
 
-        match command.output() {
-            Ok(output) => {
-                let process = alloc_concurrent_synthetic(ctx, "java/lang/Process", 3);
-                // Pin across the create_strings below — a moving young GC there
-                // would relocate the fresh Process (native stale-local family).
-                let process_pin = ctx.pin_native_root(process);
-                let exit_code = output.status.code().unwrap_or(-1);
-                ctx.set_field(process, PROC_FIELD_EXIT, Value::Int(exit_code));
-                let stdout_str = String::from_utf8_lossy(&output.stdout).into_owned();
-                let stderr_str = String::from_utf8_lossy(&output.stderr).into_owned();
-                let stdout_ref = ctx.create_string(&stdout_str);
-                let stdout_pin = ctx.pin_native_root(stdout_ref);
-                let stderr_ref = ctx.create_string(&stderr_str);
-                let process = ctx.read_native_pin(process_pin, process);
-                let stdout_ref = ctx.read_native_pin(stdout_pin, stdout_ref);
-                ctx.set_field(process, PROC_FIELD_STDOUT, Value::Object(Some(stdout_ref)));
-                ctx.set_field(process, PROC_FIELD_STDERR, Value::Object(Some(stderr_ref)));
-                ctx.unpin_native_roots(process_pin);
-                Ok(Some(Value::Object(Some(process))))
+        // Use spawn() (not the output() convenience wrapper) so the real OS
+        // pid of the launched child is available via Child::id() — output()
+        // only returns an Output{status, stdout, stderr}, with no pid, which
+        // is why pid()/toHandle() used to fall back to the VM's OWN pid.
+        match command.spawn() {
+            Ok(child) => {
+                let child_pid = child.id();
+                match child.wait_with_output() {
+                    Ok(output) => {
+                        let process = alloc_concurrent_synthetic(ctx, "java/lang/Process", 4);
+                        // Pin across the create_strings below — a moving young GC there
+                        // would relocate the fresh Process (native stale-local family).
+                        let process_pin = ctx.pin_native_root(process);
+                        let exit_code = output.status.code().unwrap_or(-1);
+                        ctx.set_field(process, PROC_FIELD_EXIT, Value::Int(exit_code));
+                        ctx.set_field(process, PROC_FIELD_PID, Value::Long(child_pid as i64));
+                        let stdout_str = String::from_utf8_lossy(&output.stdout).into_owned();
+                        let stderr_str = String::from_utf8_lossy(&output.stderr).into_owned();
+                        let stdout_ref = ctx.create_string(&stdout_str);
+                        let stdout_pin = ctx.pin_native_root(stdout_ref);
+                        let stderr_ref = ctx.create_string(&stderr_str);
+                        let process = ctx.read_native_pin(process_pin, process);
+                        let stdout_ref = ctx.read_native_pin(stdout_pin, stdout_ref);
+                        ctx.set_field(process, PROC_FIELD_STDOUT, Value::Object(Some(stdout_ref)));
+                        ctx.set_field(process, PROC_FIELD_STDERR, Value::Object(Some(stderr_ref)));
+                        ctx.unpin_native_roots(process_pin);
+                        Ok(Some(Value::Object(Some(process))))
+                    }
+                    Err(e) => {
+                        Err(RuntimeError::IllegalStateException {
+                            message: format!("ProcessBuilder.start() failed: {e}"),
+                        }.into())
+                    }
+                }
             }
             Err(e) => {
                 Err(RuntimeError::IllegalStateException {
@@ -13239,8 +13284,19 @@ pub(crate) fn register_phase57_process(r: &mut NativeMethodRegistry) {
         |_ctx, args| Ok(Some(args[0])),
     );
 
-    r.register(proc, "pid", "()J", |_ctx, _args| {
-        Ok(Some(Value::Long(std::process::id() as i64)))
+    r.register(proc, "pid", "()J", |ctx, args| {
+        let this = obj_arg(args, 0)?;
+        Ok(Some(ctx.get_field(this, PROC_FIELD_PID)))
+    });
+
+    // Process.toHandle() (JDK 9+) — build a ProcessHandle from the real
+    // child pid captured at spawn time (see PROC_FIELD_PID above).
+    r.register(proc, "toHandle", "()Ljava/lang/ProcessHandle;", |ctx, args| {
+        let this = obj_arg(args, 0)?;
+        let pid = ctx.get_field(this, PROC_FIELD_PID);
+        let handle = alloc_concurrent_synthetic(ctx, "java/lang/ProcessHandle", 1);
+        ctx.set_field(handle, 0, pid);
+        Ok(Some(Value::Object(Some(handle))))
     });
 
     // Process.getInputStream() — returns ByteArrayInputStream wrapping stdout bytes
@@ -13354,9 +13410,26 @@ pub(crate) fn register_phase57_process(r: &mut NativeMethodRegistry) {
         "()Ljava/lang/Process;",
         |_ctx, args| Ok(Some(args[0])),
     );
-    r.register(synthetic_proc, "pid", "()J", |_ctx, _args| {
-        Ok(Some(Value::Long(std::process::id() as i64)))
+    r.register(synthetic_proc, "pid", "()J", |ctx, args| {
+        let this = obj_arg(args, 0)?;
+        Ok(Some(ctx.get_field(this, PROC_FIELD_PID)))
     });
+
+    // Process.toHandle() (JDK 9+) — was entirely unregistered on this
+    // synthetic receiver class, causing NoSuchMethodError on any
+    // CratonVM-backed Process (docs/known-issues/wildfly-process-tohandle-missing.md).
+    r.register(
+        synthetic_proc,
+        "toHandle",
+        "()Ljava/lang/ProcessHandle;",
+        |ctx, args| {
+            let this = obj_arg(args, 0)?;
+            let pid = ctx.get_field(this, PROC_FIELD_PID);
+            let handle = alloc_concurrent_synthetic(ctx, "java/lang/ProcessHandle", 1);
+            ctx.set_field(handle, 0, pid);
+            Ok(Some(Value::Object(Some(handle))))
+        },
+    );
     r.register(
         synthetic_proc,
         "waitFor",
@@ -40602,7 +40675,18 @@ pub(crate) fn register_p68_ssl(r: &mut NativeMethodRegistry) {
         },
     );
 
-    // KeyManagerFactory = 3-field (algorithm=0, keystore=1, password=2)
+    // KeyManagerFactory = 3-field, matching the REAL javax.net.ssl.KeyManagerFactory
+    // field declaration order exactly (`javap -p javax.net.ssl.KeyManagerFactory`:
+    // `provider`, `factorySpi`, `algorithm`, in that order — NOT the order fields
+    // are first referenced in the constant pool, which is a different, easy-to-
+    // misread ordering). `getProvider()`/`getAlgorithm()` have no native override
+    // here, so they fall through to real bytecode reading these exact slots
+    // (`getProvider()` returns field 0, `getAlgorithm()` returns field 2 — see
+    // `javap -c`). The previous field numbering here (algorithm=0, keystore=1,
+    // password=2) put the algorithm *String* at slot 0, so real bytecode's
+    // `getProvider()` returned that String in place of a `Provider` — callers
+    // invoking `.getInfo()` on it (e.g. `SSLUtilBase.getKeyManagers`) got
+    // `NoSuchMethodError: java/lang/String.getInfo()`.
     let kmf = "javax/net/ssl/KeyManagerFactory";
     r.register(
         kmf,
@@ -40610,9 +40694,27 @@ pub(crate) fn register_p68_ssl(r: &mut NativeMethodRegistry) {
         "(Ljava/lang/String;)Ljavax/net/ssl/KeyManagerFactory;",
         |ctx, args| {
             let obj = alloc_concurrent_synthetic(ctx, "javax/net/ssl/KeyManagerFactory", 3);
-            ctx.set_field(obj, 0, args.get(0).copied().unwrap_or(Value::Object(None)));
-            ctx.set_field(obj, 1, Value::Object(None));
-            ctx.set_field(obj, 2, Value::Object(None));
+            // field 0: provider — a real `Provider` object, not the SPI's
+            // factorySpi/algorithm, so `getProvider().getInfo()` et al. work.
+            // Built via `provider_chain`'s own `make_provider` (not a raw
+            // `alloc_concurrent_synthetic` + indexed `set_field`): in
+            // real-JDK mode `alloc_concurrent_synthetic` upsizes the object
+            // to `java/security/Provider`'s full real field count —
+            // inherited Hashtable/Properties fields included — so a plain
+            // slot-0/1 write lands on whatever field happens to occupy that
+            // slot in the real inheritance layout, not `name`/`version`.
+            // `make_provider` writes by field NAME (`set_field_by_name`)
+            // specifically to survive that, and its registered `getInfo()`
+            // native reads the same "info" field back by name — see
+            // `jca/provider_chain.rs`'s module doc for the full story. Using
+            // the same "SunJSSE" entry already seeded in the provider chain
+            // keeps this consistent with `Security.getProvider("SunJSSE")`.
+            let (version, coverage) = crate::jca::provider_chain::find("SunJSSE")
+                .unwrap_or((25.0, "coverage: KeyManagerFactory{SunX509,NewSunX509,PKIX}"));
+            let provider = crate::jca::provider_chain::make_provider(ctx, "SunJSSE", version, coverage);
+            ctx.set_field(obj, 0, Value::Object(Some(provider)));
+            ctx.set_field(obj, 1, Value::Object(None)); // factorySpi — unused by this stub
+            ctx.set_field(obj, 2, args.get(0).copied().unwrap_or(Value::Object(None))); // algorithm
             Ok(Some(Value::Object(Some(obj))))
         },
     );
@@ -40627,21 +40729,19 @@ pub(crate) fn register_p68_ssl(r: &mut NativeMethodRegistry) {
     );
     r.register(kmf, "getAlgorithm", "()Ljava/lang/String;", |ctx, args| {
         let this = obj_arg(args, 0)?;
-        if ctx.object_num_fields(this) > 0 {
-            Ok(Some(ctx.get_field(this, 0)))
+        if ctx.object_num_fields(this) > 2 {
+            Ok(Some(ctx.get_field(this, 2)))
         } else {
             let s = ctx.create_string("SunX509");
             Ok(Some(Value::Object(Some(s))))
         }
     });
     r.register(kmf, "init", "(Ljava/security/KeyStore;[C)V", |ctx, args| {
-        let this = obj_arg(args, 0)?;
-        if ctx.object_num_fields(this) > 2 {
-            ctx.set_field(this, 1, args.get(1).copied().unwrap_or(Value::Object(None)));
-            ctx.set_field(this, 2, args.get(2).copied().unwrap_or(Value::Object(None)));
-        }
-        // Stage this keystore's identity for the next SSLContext.init on this
-        // thread (per-SSLContext mTLS identity flow).
+        // Fields 0-2 (provider/factorySpi/algorithm) are fixed at construction
+        // to match the real class layout — init() doesn't touch them. The only
+        // state this stub's callers actually rely on is the thread-local
+        // identity staging below (per-SSLContext mTLS identity flow); nothing
+        // reads the keystore/password back off this object.
         if let Some(Value::Object(Some(ks))) = args.get(1) {
             crate::keystore::keystore_set_pending_km_identity(ctx, *ks);
         }
@@ -40651,13 +40751,7 @@ pub(crate) fn register_p68_ssl(r: &mut NativeMethodRegistry) {
         kmf,
         "init",
         "(Ljavax/net/ssl/ManagerFactoryParameters;)V",
-        |ctx, args| {
-            let this = obj_arg(args, 0)?;
-            if ctx.object_num_fields(this) > 1 {
-                ctx.set_field(this, 1, args.get(1).copied().unwrap_or(Value::Object(None)));
-            }
-            Ok(None)
-        },
+        |_ctx, _args| Ok(None),
     );
     r.register(
         kmf,

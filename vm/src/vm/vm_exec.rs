@@ -5624,6 +5624,19 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
         // by looking up in the thread registry.
         if let Some(park_state) = self.shared.find_park_state_for_thread_obj(thread_obj) {
             park_state.unpark();
+        } else if crate::runtime::env_cache::dbg_unpark_miss() {
+            // DBG: a miss here is a SILENTLY LOST WAKEUP — the caller's
+            // Thread-mirror address matched no registered thread. Print the
+            // stale address, what its header currently claims to be, and the
+            // registry's live mirror addresses so the delta (e.g. a young
+            // address whose thread was promoted to old gen) is visible.
+            let class_id = self.shared.heap.class_id_of(thread_obj);
+            eprintln!(
+                "[unpark] MISS obj={:p} header_class_id={:?} registry={:x?}",
+                thread_obj.as_ptr(),
+                class_id,
+                self.shared.thread_registry.debug_thread_obj_addrs(),
+            );
         }
     }
 

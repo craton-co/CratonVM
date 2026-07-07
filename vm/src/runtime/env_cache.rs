@@ -574,6 +574,7 @@ cached_is_set!(dbg_ccsprobe, "CRATONVM_DBG_CCSPROBE");
 cached_is_set!(dbg_pbstart, "CRATONVM_DBG_PBSTART");
 cached_is_set!(dbg_bblp, "CRATONVM_DBG_BBLP");
 cached_is_set!(dbg_jitc, "CRATONVM_DBG_JITC");
+cached_is_set!(dbg_unpark_miss, "CRATONVM_DBG_UNPARK_MISS");
 cached_is_set!(dbg_jit_ldc, "CRATONVM_DBG_JIT_LDC");
 cached_is_set!(trace_unimplemented, "CRATONVM_TRACE_UNIMPLEMENTED");
 

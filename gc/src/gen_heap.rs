@@ -5034,6 +5034,17 @@ impl GenerationalHeap {
                 if !is_young(a) {
                     return false;
                 }
+                // Family-A (2026-07-03) made EVERY mark go through the SIDE
+                // set (`side_marks`) — the header `GC_FLAG_MARKED` bit is no
+                // longer written by this sweep's mark phase at all. Checking
+                // only the header bit made every live object look "unmarked"
+                // to this diagnostic (SUMMARY always reported marked=0 and
+                // every root registered as a bogus (1)/(2)/(3) edge hit),
+                // drowning the real signal. A side-marked object is live and
+                // will NOT be swept; only side-UNmarked objects matter here.
+                if side_marks.contains(&a) {
+                    return false;
+                }
                 // SAFETY: `is_young` confirmed an 8-aligned addr inside live
                 // from-space; reading its header is valid.
                 let h = unsafe { &*(a as *const ObjectHeader) };
@@ -5119,7 +5130,10 @@ impl GenerationalHeap {
                         );
                         break;
                     }
-                    if h.gc_flags & GC_FLAG_MARKED != 0 {
+                    // Family-A: side-marked objects are live survivors even
+                    // though their header GC_FLAG_MARKED bit is never written
+                    // (see `is_unmarked_young` above).
+                    if h.gc_flags & GC_FLAG_MARKED != 0 || side_marks.contains(&(optr as usize)) {
                         marked_total += 1;
                         let cid = h.class_id.as_u32();
                         let oaddr = optr as usize;

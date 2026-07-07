@@ -4968,6 +4968,58 @@ pub fn execute(
                                         _ => Ok(None),
                                     };
                                 }
+                                // FIX (2026-07-07, jit-invokedynamic-groovy-regression,
+                                // FOURTH-pass root cause): this is the OLDEST JIT call-dispatch
+                                // site in the interpreter (the first-call tier-up path in
+                                // `execute()` itself), predating the real-frame-deopt resume
+                                // machinery. It never consumed `take_last_deopt()`, so a
+                                // reconstructed frame stashed by `x64_deopt_entry` here (which,
+                                // since the invokedynamic-trap snapshot became unconditional,
+                                // happens on every reason-8 trap reached through THIS path) was
+                                // silently left behind instead of cleared -- a LATER, UNRELATED
+                                // deopt check on the same thread could then pick up this STALE
+                                // frame and resume with the wrong locals/stack.
+                                //
+                                // That alone would not be sufficient: unlike the safe-reject
+                                // helper (`jit_uncommon_trap`, the `frame_box_ptr == None` arm of
+                                // `emit_deopt_stubs`), which synchronously calls
+                                // `DeoptimizationController::deoptimize` and so blacklists
+                                // (`MakeNotCompilable`) an `UnreachedCode` trap on FIRST
+                                // occurrence regardless of which VM call site is running, the
+                                // precise-resume path (`x64_deopt_entry`) relies on the CALLER to
+                                // drive de-speculation via `real_frame_deopt_resume_and_
+                                // despeculate` -- which only the three newer call sites do. This
+                                // legacy site fell through to "re-run the whole method
+                                // interpreted" WITHOUT EVER BLACKLISTING the method, so the next
+                                // call re-entered the JIT-compiled artifact and re-hit the SAME
+                                // trap again -- for Groovy's `IndyInterface`-heavy dispatch
+                                // (essentially every call), that meant re-running a script's own
+                                // class/method-generation bytecode from entry ~2000 times in a
+                                // single test, each re-run re-registering a `doCall` method
+                                // Groovy's own compiler had already registered -- exactly the
+                                // "doCall duplicates another method" symptom. Fixed by driving the
+                                // same de-speculation call here that `jit_uncommon_trap` does,
+                                // using this method's own identity (`class_name_str`/
+                                // `method_name`/`method_descriptor` are already in scope, since
+                                // this whole block IS that method's own first-call JIT tier-up)
+                                // and the reason/bci recovered from the stashed frame itself
+                                // before discarding it.
+                                if let Some(rframe_for_despec) = cratonvm_jit::deopt::take_last_deopt() {
+                                    let deopt_reason = compiled
+                                        .deopt_points
+                                        .iter()
+                                        .find(|dp| dp.bci == rframe_for_despec.bci)
+                                        .map(|dp| dp.reason)
+                                        .unwrap_or(cratonvm_jit::deopt::DeoptReason::UnreachedCode);
+                                    let _ = crate::jit::helpers::DeoptimizationController::deoptimize(
+                                        shared,
+                                        &class_name_str,
+                                        method_name,
+                                        method_descriptor,
+                                        deopt_reason,
+                                        rframe_for_despec.bci,
+                                    );
+                                }
                                 // Deoptimized — pending-NPE drain was hoisted above the
                                 // i64::MIN branch (round-8 CRIT fix); fall through to
                                 // interpreter execution.
@@ -23606,6 +23658,30 @@ fn try_osr(
                     &*class_name_arc, &*method_name_arc, &*descriptor_arc, entry_pc
                 );
             }
+            // FIX (2026-07-07, jit-invokedynamic-groovy-regression, FOURTH-pass
+            // root cause): same missing-despeculation gap as the other two
+            // fixed call sites (see the fix note at the first-call tier-up
+            // site in `execute()`). A rejected bail here previously just
+            // continued interpreting THIS frame with no blacklist, so an
+            // `UnreachedCode` (reason 8) trap reached through the OSR-exit
+            // path also kept re-triggering on every subsequent call. Recover
+            // the reason from the matching deopt point (falling back to
+            // `UnreachedCode`) and drive the same de-speculation call the
+            // other two fixed sites do.
+            let despec_reason = compiled
+                .deopt_points
+                .iter()
+                .find(|dp| dp.bci == rframe.bci)
+                .map(|dp| dp.reason)
+                .unwrap_or(cratonvm_jit::deopt::DeoptReason::UnreachedCode);
+            let _ = crate::jit::helpers::DeoptimizationController::deoptimize(
+                shared,
+                &class_name_arc,
+                &method_name_arc,
+                &descriptor_arc,
+                despec_reason,
+                rframe.bci,
+            );
             return None;
         }
         // No stashed deopt frame. If the uncommon-trap path signaled a deopt
@@ -27018,19 +27094,58 @@ fn execute_jit_call_decoded(
             }
             // jit-invokedynamic-groovy-regression fix — mirror
             // `execute_jit_call`'s precise-resume arm on THIS sink too (the
-            // instance-method tier-up path): a frame-stashing deopt (e.g. the
-            // unconditional invokedynamic reason-8 trap) in the compiled
-            // target resumes at the trapping bci instead of re-running the
-            // whole method from entry (which double-executes every side
-            // effect committed before the trap). Identity/epoch checks and
-            // de-speculation live inside `real_frame_deopt_resume_and_
-            // despeculate`; any refusal falls through to the safe re-run.
+            // instance-method tier-up path, the dominant path for Groovy's
+            // `IndyInterface`-dispatched `doCall` methods): a frame-stashing
+            // deopt (e.g. the unconditional invokedynamic reason-8 trap) in
+            // the compiled target resumes at the trapping bci instead of
+            // re-running the whole method from entry (which double-executes
+            // every side effect committed before the trap). Identity/epoch
+            // checks and de-speculation live inside
+            // `real_frame_deopt_resume_and_despeculate`; any refusal falls
+            // through to the safe re-run below.
             if cratonvm_jit::deopt_real_enabled() && compiled.can_deopt_resume {
                 if let Some(r) =
                     real_frame_deopt_resume_and_despeculate(shared, thread, compiled, cached, &rframe)
                 {
                     return Ok(Some(r));
                 }
+            } else if !rframe.method_key.is_empty()
+                && !deopt_frame_matches_method(
+                    &rframe,
+                    &cached.class_name,
+                    &cached.method_name,
+                    &cached.method_descriptor,
+                )
+            {
+                // Resume unavailable and the stash belongs to a DIFFERENT
+                // (nested-callee) method: de-speculate the frame's real owner
+                // so it stops re-trapping; `cached` is innocent.
+                despeculate_stashed_frame_method(shared, &rframe);
+            } else {
+                // Resume unavailable (`can_deopt_resume` false / gate off) —
+                // still drive de-speculation so an `UnreachedCode` (reason 8)
+                // trap reached through THIS call site gets blacklisted
+                // (`MakeNotCompilable`) instead of re-triggering on every
+                // subsequent call (the FOURTH-pass Groovy finding: this sink
+                // consumed the stash but never de-speculated, leaving the
+                // trapping method compiled forever). Recover the reason from
+                // the deopt point matching this bci (falling back to
+                // `UnreachedCode`, the only reason this snapshot machinery
+                // unconditionally records).
+                let despec_reason = compiled
+                    .deopt_points
+                    .iter()
+                    .find(|dp| dp.bci == rframe.bci)
+                    .map(|dp| dp.reason)
+                    .unwrap_or(cratonvm_jit::deopt::DeoptReason::UnreachedCode);
+                let _ = crate::jit::helpers::DeoptimizationController::deoptimize(
+                    shared,
+                    &cached.class_name,
+                    &cached.method_name,
+                    &cached.method_descriptor,
+                    despec_reason,
+                    rframe.bci,
+                );
             }
             return Ok(None);
         }

@@ -352,6 +352,16 @@ fn native_ref_refers_to(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCa
         (Value::Object(a), Value::Object(b)) => a == b,
         _ => false,
     };
+    if !same && crate::dbg_refers_to() {
+        if let (Value::Object(Some(a)), Value::Object(Some(b))) = (&referent, &other) {
+            eprintln!(
+                "[refersto] FALSE(shadow) this={:#x} referent={:#x} other={:#x}",
+                this.as_ptr() as usize,
+                a.as_ptr() as usize,
+                b.as_ptr() as usize,
+            );
+        }
+    }
     Ok(Some(Value::Int(if same { 1 } else { 0 })))
 }
 

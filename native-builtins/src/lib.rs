@@ -1280,6 +1280,18 @@ pub fn route_rsa_to_real() -> bool {
     *CACHE.get_or_init(|| std::env::var_os("CRATONVM_SYNTHETIC_RSA").is_none())
 }
 
+/// DBG: trace every `Reference.refersTo`/`refersTo0` call that answers
+/// `false` while both the stored referent and the queried object are
+/// non-null (`CRATONVM_DBG_REFERSTO=1`). A weak-keyed table (ThreadLocalMap,
+/// WeakHashMap) treats such a mismatch as a stale entry and expunges it, so
+/// a spurious `false` here silently destroys live per-thread state — this
+/// trace is the cheap way to catch that class of bug in the act.
+pub(crate) fn dbg_refers_to() -> bool {
+    use std::sync::OnceLock;
+    static CACHE: OnceLock<bool> = OnceLock::new();
+    *CACHE.get_or_init(|| std::env::var_os("CRATONVM_DBG_REFERSTO").is_some())
+}
+
 pub mod apps_h2;
 pub mod deprecated_internal;
 pub mod deprecated_io_util;
@@ -25133,6 +25145,82 @@ fn native_surefire_forkedbooter_acknowledged_exit(
             "eventChannel.onJvmExit",
             ctx.invoke_virtual(event_channel, "onJvmExit", "()V", &[]),
         );
+    } else {
+        // Older Surefire booters (2.x line -- e.g. 2.22.2, still pinned by
+        // WildFly's testsuite poms) have no `eventChannel`/`closeForkChannel`
+        // at all: the parent's `ForkClient` only marks `saidGoodBye = true`
+        // once it reads a literal "Z,0,BYE!\n" line on the forked process's
+        // stdout, written by the real `acknowledgedExit()` via
+        // `encodeAndWriteToOutput(String)` before the process exits. Without
+        // this, `std::process::exit(0)` below leaves that flag unset and
+        // Maven reports "The forked VM terminated without properly saying
+        // goodbye" even though zero matching tests is the correct outcome.
+        let bye = ctx.create_string("Z,0,BYE!\n");
+        surefire_ignore(
+            "encodeAndWriteToOutput(BYE)",
+            ctx.invoke_special(
+                "org/apache/maven/surefire/booter/ForkedBooter",
+                "encodeAndWriteToOutput",
+                "(Ljava/lang/String;)V",
+                &[Value::Object(Some(this)), Value::Object(Some(bye))],
+            ),
+        );
+        // The write above reaches the OS pipe correctly, but CratonVM can
+        // then call process::exit() before Maven's own asynchronous
+        // stdout-pumping thread has even been scheduled to read it -- for
+        // trivial/fast test classes there is enough real wall-clock work
+        // (class loading, JIT warmup, GC) in a real HotSpot fork that this
+        // race never shows up there, but CratonVM's much faster teardown
+        // exposes it. Real Surefire's own acknowledgedExit() handles this by
+        // registering a bye-ack listener and blocking (bounded) until the
+        // parent's ForkClient explicitly acknowledges receipt
+        // (TestLessInputStream.acknowledgeByeEventReceived() queues
+        // Command.BYE_ACK and releases a semaphore) -- do the same here
+        // instead of exiting blind. Bounded well under the real 30s default
+        // exit-timeout: this is only ever meant to absorb an OS scheduling
+        // gap of a few milliseconds, not to wait out a genuinely wedged
+        // parent.
+        if let Value::Object(Some(command_reader)) = cr {
+            let wait_result: MethodCallResult = (|| {
+                let sem = match ctx.new_object("java/util/concurrent/Semaphore")? {
+                    Some(Value::Object(Some(o))) => o,
+                    _ => return Ok(None),
+                };
+                ctx.invoke_special(
+                    "java/util/concurrent/Semaphore",
+                    "<init>",
+                    "(I)V",
+                    &[Value::Object(Some(sem)), Value::Int(0)],
+                )?;
+                let listener = match ctx.new_object("org/apache/maven/surefire/booter/ForkedBooter$6")? {
+                    Some(Value::Object(Some(o))) => o,
+                    _ => return Ok(None),
+                };
+                ctx.invoke_special(
+                    "org/apache/maven/surefire/booter/ForkedBooter$6",
+                    "<init>",
+                    "(Lorg/apache/maven/surefire/booter/ForkedBooter;Ljava/util/concurrent/Semaphore;)V",
+                    &[
+                        Value::Object(Some(listener)),
+                        Value::Object(Some(this)),
+                        Value::Object(Some(sem)),
+                    ],
+                )?;
+                ctx.invoke_virtual(
+                    command_reader,
+                    "addByeAckListener",
+                    "(Lorg/apache/maven/surefire/booter/CommandListener;)V",
+                    &[Value::Object(Some(listener))],
+                )?;
+                ctx.invoke_virtual(
+                    sem,
+                    "tryAcquire",
+                    "(JLjava/util/concurrent/TimeUnit;)Z",
+                    &[Value::Long(2000), Value::Object(None)],
+                )
+            })();
+            surefire_ignore("bye-ack-wait", wait_result);
+        }
     }
     surefire_ignore(
         "cancelPingScheduler",
@@ -25149,15 +25237,17 @@ fn native_surefire_forkedbooter_acknowledged_exit(
             ctx.invoke_virtual(command_reader, "stop", "()V", &[]),
         );
     }
-    surefire_ignore(
-        "closeForkChannel",
-        ctx.invoke_special(
-            "org/apache/maven/surefire/booter/ForkedBooter",
+    if let Value::Object(Some(_)) = ev {
+        surefire_ignore(
             "closeForkChannel",
-            "()V",
-            &[Value::Object(Some(this))],
-        ),
-    );
+            ctx.invoke_special(
+                "org/apache/maven/surefire/booter/ForkedBooter",
+                "closeForkChannel",
+                "()V",
+                &[Value::Object(Some(this))],
+            ),
+        );
+    }
 
     if std::env::var("CRATONVM_SOFT_EXIT").as_deref() == Ok("1") {
         eprintln!("[SUREFIRE-ACK-EXIT] soft-returning due to CRATONVM_SOFT_EXIT=1");
@@ -32087,6 +32177,16 @@ fn native_reference_refers_to(ctx: &mut dyn NativeContext, args: &[Value]) -> Me
         (Value::Object(None), Value::Object(None)) => true,
         _ => false,
     };
+    if !result && dbg_refers_to() {
+        if let (Value::Object(Some(a)), Value::Object(Some(b))) = (&referent, &target) {
+            eprintln!(
+                "[refersto] FALSE(refersTo0) this={:#x} referent={:#x} other={:#x}",
+                this.as_ptr() as usize,
+                a.as_ptr() as usize,
+                b.as_ptr() as usize,
+            );
+        }
+    }
     Ok(Some(Value::Int(result as i32)))
 }
 
@@ -36403,6 +36503,53 @@ fn register_t19_h2_lookup_clinit_deps(registry: &mut NativeMethodRegistry) {
         "registerMethodsToFilter",
         "(Ljava/lang/Class;[Ljava/lang/String;)V",
         |_ctx, _args| Ok(None),
+    );
+
+    // --- Reflection.areNestMates(Class, Class) ---
+    //
+    // JEP 181 nestmate access check, exposed to library code (e.g. JDK
+    // serialization's `ObjectStreamClass` privileged-lookup path, which
+    // Spring's `beanProviderSerialization` test exercises via
+    // `ObjectInputStream`). Real semantics
+    // (`Reflection.areNestMates` -> `Class.isNestmateOf`): identical
+    // classes are always nestmates; otherwise two classes are nestmates
+    // iff they resolve to the same nest host. Delegate to
+    // `native_class_get_nest_host` (already used by `Class.getNestHost()`)
+    // for host resolution so both entry points agree on a class's host,
+    // including the lambda-proxy special case it already handles.
+    registry.register(
+        refl,
+        "areNestMates",
+        "(Ljava/lang/Class;Ljava/lang/Class;)Z",
+        |ctx, args| {
+            let a = obj_arg(args, 0)?;
+            let b = obj_arg(args, 1)?;
+            if a == b {
+                return Ok(Some(Value::Int(1)));
+            }
+            let host_a = match crate::lang_class::native_class_get_nest_host(
+                ctx,
+                &[Value::Object(Some(a))],
+            )? {
+                Some(Value::Object(Some(h))) => h,
+                _ => a,
+            };
+            let host_b = match crate::lang_class::native_class_get_nest_host(
+                ctx,
+                &[Value::Object(Some(b))],
+            )? {
+                Some(Value::Object(Some(h))) => h,
+                _ => b,
+            };
+            let same = match (
+                crate::lang_class::mirror_class_id(ctx, host_a),
+                crate::lang_class::mirror_class_id(ctx, host_b),
+            ) {
+                (Some(x), Some(y)) => x == y,
+                _ => host_a == host_b,
+            };
+            Ok(Some(Value::Int(if same { 1 } else { 0 })))
+        },
     );
 
     // --- ClassFileDumper.getInstance(String, String) ---

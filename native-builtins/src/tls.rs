@@ -1019,6 +1019,16 @@ fn register_trust_manager_factory(r: &mut NativeMethodRegistry) {
 fn register_key_manager_factory(r: &mut NativeMethodRegistry) {
     // SyntheticStub: 3-field synthetic factory; getKeyManagers() returns a
     // placeholder X509KeyManager with no real key material loaded.
+    //
+    // NOTE: this registration is currently shadowed — `phases_late.rs`'s
+    // `register_p68_ssl` registers the same (class, method, descriptor)
+    // triples under the `Bridge` category, runs later in the boot sequence,
+    // and wins via last-registration-wins (`NativeMethodRegistry::register`).
+    // Confirmed by direct tracing: this function's `getInstance` never fires
+    // in a real-JDK run. If you're debugging `KeyManagerFactory` behavior and
+    // changes here don't seem to take effect, check `phases_late.rs` first —
+    // see its own field-layout comment for why that copy must match the real
+    // `javax.net.ssl.KeyManagerFactory` field order.
     let __prev_cat = r.current_category();
     r.set_category(cratonvm_native_api::NativeKind::SyntheticStub);
     let cls = "javax/net/ssl/KeyManagerFactory";
@@ -2542,13 +2552,23 @@ mod tls_tests {
     }
 
     // FIX (nb-tls-tmf): getTrustManagers() must propagate the keystore registry
-    // id bound by init() (factory slot 2) onto the returned X509TrustManager's
-    // slot 0, so validate_cert_chain's read_trust_manager_id_from_obj resolves
-    // the bound trust anchors rather than returning a no-validation placeholder.
-    // The named-field stamp (`cratonvm$x509tm$id`) is not observable in the test
-    // mock (it only models known JDK field names), so we assert the slot-0
-    // fallback the mock fully supports — that is the channel validate_cert_chain
-    // also consults.
+    // id bound by init() (factory slot 2) onto the returned X509TrustManager,
+    // so validate_cert_chain's read_trust_manager_id_from_obj resolves the
+    // bound trust anchors rather than returning a no-validation placeholder.
+    //
+    // UPDATED (tls-residuals, see x509_manager::register_trust_manager_state's
+    // doc comment): the id stamped on slot 0 is no longer the raw keystore
+    // registry id itself. `getTrustManagers()` now builds a `TrustManagerState`
+    // from the bound keystore id and registers *that state* through
+    // `register_trust_manager_state`, getting back a fresh id in the separate
+    // `tm_registry` id space — deliberately, because stamping the raw keystore
+    // id directly caused `validate_cert_chain` to misresolve it against a
+    // numerically-coincident but unrelated `tm_registry` entry from other
+    // TrustManagerFactory SPI paths (both counters start at 1 and increment
+    // independently). So slot 0 is now an *indirection*: resolving it via
+    // `trust_manager_state_by_id` must yield a `TrustManagerState` whose own
+    // `keystore_id` field is the one init() bound — that's the invariant this
+    // test checks, not raw numeric equality with the bound id.
     #[test]
     fn nb_tls_tmf_get_trust_managers_propagates_keystore_id() {
         use crate::test_utils::MockNativeContext;
@@ -2574,7 +2594,7 @@ mod tls_tests {
         ctx.set_field(factory, 2, Value::Int(BOUND_ID));
 
         // getTrustManagers() should return a 1-element array whose X509TrustManager
-        // carries the bound id in slot 0 (validate_cert_chain's fallback channel).
+        // carries a `tm_registry` id resolving back to the bound keystore id.
         let get_tms = r
             .find(cls, "getTrustManagers", "()[Ljavax/net/ssl/TrustManager;")
             .unwrap();
@@ -2591,11 +2611,18 @@ mod tls_tests {
             Value::Object(Some(t)) => t,
             other => panic!("trust manager element should be an object, got {other:?}"),
         };
+        let tm_id = match ctx.get_field(tm, 0) {
+            Value::Int(i) => i,
+            other => panic!("trust manager id (slot 0) should be an Int, got {other:?}"),
+        };
+        let resolved_state = crate::x509_manager::trust_manager_state_by_id(tm_id);
         assert_eq!(
-            ctx.get_field(tm, 0),
-            Value::Int(BOUND_ID),
-            "returned X509TrustManager must carry the keystore id init() bound, \
-             so checkServerTrusted validates against those anchors (not a no-op placeholder)"
+            resolved_state.keystore_id, BOUND_ID,
+            "the X509TrustManager's stamped id must resolve (via \
+             trust_manager_state_by_id) to the TrustManagerState built from \
+             the keystore id init() bound, so checkServerTrusted validates \
+             against those anchors (not a no-op placeholder or an unrelated \
+             tm_registry entry)"
         );
     }
 

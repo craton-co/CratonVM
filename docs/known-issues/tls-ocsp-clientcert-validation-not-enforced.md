@@ -48,31 +48,106 @@ semantics) instead of the `Optional.or` NPE, across `TestClientCert`,
 `TestSecurity2017Ocsp`, and `TestSSLHostConfigCipher`. All 61
 `native-builtins` panama:: unit tests still pass.
 
-**Separate, still-open bug blocking full Windows re-verification:**
-`KeyManagerFactory.getProvider()` throws `NoSuchMethodError:
-java/lang/String.getInfo()Ljava/lang/String;` from
-`SSLUtilBase.getKeyManagers` (`SSLUtilBase.java:351`,
-`kmf.getProvider().getInfo().contains("FIPS")`) on every **JSSE**-variant
-sub-test across every class in this cluster (100% of JSSE sub-tests fail;
-OpenSSL/OpenSSL-FFM variants are unaffected). Root cause is a field-slot
-layout collision: `tls.rs::register_key_manager_factory`'s
-`KeyManagerFactory.getInstance`/`init` are a 3-field `SyntheticStub`
-allocating the object with its own private numbering (0=algorithm index,
-1=init flag, 2=keystore-present flag), but `getProvider()` itself is not
-overridden, so it falls through to real bytecode, which reads the REAL
-class's field layout (0=factorySpi, 1=provider, 2=algorithm) — field 1
-("provider" in real layout) holds the stub's `Value::Int` init-flag instead
-of a real `Provider` object. This is cross-platform (no Windows-specific
-code path involved) and was not hit by this doc's prior Linux verification
-runs — it's either a very recent regression or was never exercised by the
-JSSE variant's specific code path before. **Not yet fixed** (tracked
-separately, task `task_0ec4b356`) — needs its own investigation (likely:
-either drop `KeyManagerFactory`'s synthetic stub entirely in favor of real
-bytecode + real Provider/SPI lookup, matching how `register_pe_symbol_lookup`
-should have worked, or give `getProvider()` its own native override
-consistent with the stub's field numbering). Until fixed, do not expect
-this doc's claimed Linux pass counts to transfer to Windows for the JSSE
-variant.
+**`KeyManagerFactory.getProvider()` NoSuchMethodError/NPE — root-caused and
+FIXED 2026-07-07 (`task_0ec4b356`).** Was blocking every JSSE-variant
+sub-test across this cluster (100% failure rate; OpenSSL/OpenSSL-FFM
+variants unaffected) with:
+```
+Caused by: java.lang.NoSuchMethodError: java/lang/String.getInfo()Ljava/lang/String;
+  at org.apache.tomcat.util.net.SSLUtilBase.getKeyManagers(SSLUtilBase.java:351)
+```
+(`kmf.getProvider().getInfo().contains("FIPS")`.)
+
+**Root cause, part 1 (wrong receiver type):** the ACTIVE `KeyManagerFactory`
+registration — `phases_late.rs::register_p68_ssl`'s `getInstance`/`init`
+(NOT `tls.rs::register_key_manager_factory`, which is a fully-shadowed dead
+duplicate registered under `SyntheticStub` that never fires; confirmed via
+direct tracing that only the `phases_late.rs` copy ever runs) — stored the
+raw `algorithm` *String* argument at field slot 0. `getProvider()` has no
+native override, so it falls through to real bytecode, which reads the REAL
+`javax.net.ssl.KeyManagerFactory` field layout. `javap -p` on the actual
+class shows the true declaration order is `provider` (slot 0),
+`factorySpi` (slot 1), `algorithm` (slot 2) — easy to get backwards from a
+naive constant-pool read, which surfaces `factorySpi` first purely because
+another method happens to reference it first. So `getProvider()` returned
+the algorithm String sitting at slot 0, and `.getInfo()` on a `String`
+receiver is exactly the observed `NoSuchMethodError`.
+
+**Root cause, part 2 (wrong Provider construction), found after fixing part
+1:** once `getProvider()` correctly returned a `Provider`-tagged object, its
+`.getInfo()` call returned `null` instead of a string, NPEing on
+`.contains(...)`. `alloc_concurrent_synthetic("java/security/Provider", N)`
+upsizes to the *real* class's full field count in real-JDK mode — which
+includes every inherited `Hashtable`/`Properties` field ahead of
+`Provider`'s own `name`/`info`/`version`/... — so a naive indexed
+`ctx.set_field(provider, 0/1, ...)` (mirroring the simpler, legacy
+`phases_early.rs::make_provider` 2-field convention) lands on whatever
+field occupies that slot in the *real* inheritance layout, not `name`/
+`info`. `native-builtins/src/jca/provider_chain.rs` already solves this
+correctly (its own module doc explains the exact same trap, WP6.1) by
+writing every field through `set_field_by_name` and registering its own
+`getInfo()` native that reads `info` back the same way — confirmed via an
+isolated repro that `Security.getProvider("SunJSSE").getInfo()` already
+worked correctly through that path.
+
+**Fix:** in `phases_late.rs`, `KeyManagerFactory.getInstance` now builds its
+`provider` field via `jca::provider_chain::find("SunJSSE")` +
+`jca::provider_chain::make_provider(...)` (both promoted from private to
+`pub(crate)`) instead of an ad-hoc allocation, and stores `algorithm` at
+slot 2 / leaves `factorySpi` unset at slot 1, matching the real class
+layout; `getAlgorithm()`'s native override was updated to read slot 2
+accordingly; `init(KeyStore, char[])` no longer clobbers slots 1/2 (nothing
+ever read the keystore/password it used to stash there — the actual mTLS
+identity flow runs through `keystore_set_pending_km_identity`, untouched).
+Added a doc comment to `tls.rs::register_key_manager_factory` flagging it
+as dead/shadowed so a future reader debugging `KeyManagerFactory` doesn't
+lose time editing the copy that never runs.
+
+Verified: the isolated repro
+(`KeyManagerFactory.getInstance("SunX509").getProvider().getInfo()`) now
+returns a real info string and `.contains("FIPS")` evaluates `false` as
+expected. Through the full suite: `TestSecurity2017Ocsp` is back to **5/5
+PASS** on Windows. `TestClientCert`'s JSSE sub-tests no longer hit the
+`getProvider` error at all — they now fail later, during the actual TLS
+handshake (`SSLHandshakeException: connection closed by peer`), which lines
+up with this doc's already-documented, separate residual #2
+(`chooseClientAlias`/client-cert plumbing, still open) rather than a new
+issue. `TestSSLHostConfigCipher` improved from 4/12 to 3/12 failing (residual
+#2-shaped JSSE failures, not the DHE case this doc already tracks as
+permanently unfixable). **Do not expect Windows counts to match this doc's
+Linux baseline** — residual #2 and the DHE case are real, independent,
+already-tracked gaps, not artifacts of either fix on this page.
+
+**`nb_tls_tmf_get_trust_managers_propagates_keystore_id` — root-caused and
+FIXED 2026-07-07 (`task_2b28e7bc`): stale test, not a production bug.**
+Confirmed via `git stash` that this test failed identically before either
+fix on this page, so it wasn't a regression from this session — but it also
+wasn't a real correctness bug in `TrustManagerFactory`. The test (added by
+an earlier `nb-tls-tmf` commit) asserted that `getTrustManagers()`'s
+returned `X509TrustManager` carries the *raw keystore registry id* `init()`
+bound (slot 0 == 7, the test's simulated bound id). A **later**, deliberate
+fix (`FIX (tls-residuals)`, see `tls.rs::register_trust_manager_factory`'s
+`getTrustManagers()` and `x509_manager.rs`'s `register_trust_manager_state`/
+`trust_manager_state_by_id` doc comments) intentionally changed that
+contract: stamping the raw keystore id directly caused
+`validate_cert_chain` to misresolve it against a numerically-coincident but
+unrelated `tm_registry` entry from a different `TrustManagerFactory` SPI
+path (both id counters start at 1 and increment independently). The fix
+instead builds a `TrustManagerState` from the bound keystore id and
+registers *that state* through `register_trust_manager_state`, stamping the
+resulting `tm_registry`-scoped id (which starts at 1 in a fresh process —
+exactly the `Int(1)` the test was seeing instead of `Int(7)`). The test was
+simply never updated to match this intentional, well-documented behavior
+change.
+
+**Fix:** rewrote the test's final assertion to check the *actual* invariant
+that matters — that resolving the stamped id via
+`x509_manager::trust_manager_state_by_id` yields a `TrustManagerState` whose
+own `keystore_id` field equals the bound id (7), i.e. the indirection
+resolves correctly — rather than asserting raw numeric equality with the
+bound id. No production code changed. Verified: the test now passes; the
+full `tls::` suite (80 tests) and `x509_manager::` suite (48 tests) both
+pass with no regressions.
 
 **Status:** OCSP revocation checking now IMPLEMENTED and verified (branch
 `feat/ocsp-revocation-checking-20260706`, follow-up to
