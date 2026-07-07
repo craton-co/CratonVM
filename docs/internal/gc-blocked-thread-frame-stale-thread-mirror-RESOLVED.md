@@ -272,4 +272,7 @@ its frame still holds the recovery-replaced (heap-unreachable) socket.
   `fork6-fjp-multithread-jit-root-reclamation.md` (the
   precise-jit-stack-maps family).
 - **Cross-call raw-ObjectRef caching in native-io side tables** (found during
-  this closure, pre-existing): `nio-native-side-table-stale-objectref.md`.
+  this closure, pre-existing): FIXED 2026-07-07 — see
+  `nio-native-side-table-stale-objectref-FIXED.md` (this directory). The named
+  `sk_table`/`key_obj` hazard was already covered by 2026-06-21 hooks; the
+  audit found and fixed a real sibling bug in `build_set` (same file).

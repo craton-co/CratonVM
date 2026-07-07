@@ -1088,6 +1088,33 @@ fn seed_sunec_services() {
 /// PBES2Parameters$HmacSHA*AndAES_*`).
 fn seed_sunjce_pbe_services() {
     const P: &str = "SunJCE";
+    // `AlgorithmParameters.getInstance("OAEP")` -- needed by RSA-OAEP-256 JWE
+    // (e.g. WildFly Elytron's `ElytronRsaKeyEncryption256JWEAlgorithmProvider`
+    // builds an `OAEPParameterSpec` and inits an `AlgorithmParameters` from it
+    // directly). Verified via `javap -c com.sun.crypto.provider.SunJCE` on JDK
+    // 25.0.1 (`ps("AlgorithmParameters", "OAEP", "com.sun.crypto.provider.
+    // OAEPParameters")`); `OAEPParameters` has the required public no-arg ctor
+    // and is pure ASN.1 (no native methods), same as the PBES2 classes below.
+    put_service(
+        P,
+        "AlgorithmParameters",
+        "OAEP",
+        "com.sun.crypto.provider.OAEPParameters",
+    );
+    // `KeyGenerator.getInstance("HmacSHA256")` -- keycloak's
+    // `ElytronHmacTest::testHmacSignaturesUsingKeyGen` generates an HMAC key
+    // via `KeyGenerator` (as opposed to raw `SecretKeySpec`/`Mac`, which
+    // already work without this entry). Verified via `javap -c
+    // com.sun.crypto.provider.SunJCE` on JDK 25.0.1 (`ps("KeyGenerator",
+    // "HmacSHA256", "com.sun.crypto.provider.KeyGeneratorCore$HmacKG$
+    // SHA256")`); the nested class has the required public no-arg ctor and is
+    // pure Java (no native methods).
+    put_service(
+        P,
+        "KeyGenerator",
+        "HmacSHA256",
+        "com.sun.crypto.provider.KeyGeneratorCore$HmacKG$SHA256",
+    );
     const HASHES: &[&str] = &[
         "SHA1",
         "SHA224",
@@ -1849,6 +1876,21 @@ fn getinstance_get_service_search(ctx: &mut dyn NativeContext, args: &[Value]) -
 /// className here is read straight from the Rust-side `ServiceEntry` and the
 /// resulting objects are constructed by their real `<init>` (proper, traced
 /// fields). Returns `None` if no implementation is registered.
+fn throw_no_such_algorithm(ctx: &mut dyn NativeContext, msg: &str) -> MethodCallFailed {
+    let detail = ctx.create_string(msg);
+    if let Ok(Some(Value::Object(Some(exc)))) = ctx.new_object_initialized(
+        "java/security/NoSuchAlgorithmException",
+        "(Ljava/lang/String;)V",
+        &[Value::Object(Some(detail))],
+    ) {
+        return MethodCallFailed::ExceptionThrown(exc);
+    }
+    cratonvm_types::error::RuntimeError::SecurityException {
+        message: msg.to_string(),
+    }
+    .into()
+}
+
 fn build_jca_instance(
     ctx: &mut dyn NativeContext,
     provider: &str,
@@ -1927,10 +1969,10 @@ fn getinstance_instance_provider(ctx: &mut dyn NativeContext, args: &[Value]) ->
     let provider = read_arg_string(ctx, args, 3);
     match build_jca_instance(ctx, &provider, &type_str, &algo) {
         Some(r) => r,
-        None => Err(cratonvm_types::error::RuntimeError::NotImplemented {
-            feature: format!("no {type_str} {algo} implementation for provider {provider}"),
-        }
-        .into()),
+        None => Err(throw_no_such_algorithm(
+            ctx,
+            &format!("no {type_str} {algo} implementation for provider {provider}"),
+        )),
     }
 }
 
@@ -1949,10 +1991,10 @@ fn getinstance_instance_provider_obj(
     };
     match build_jca_instance(ctx, &provider, &type_str, &algo) {
         Some(r) => r,
-        None => Err(cratonvm_types::error::RuntimeError::NotImplemented {
-            feature: format!("no {type_str} {algo} implementation for provider {provider}"),
-        }
-        .into()),
+        None => Err(throw_no_such_algorithm(
+            ctx,
+            &format!("no {type_str} {algo} implementation for provider {provider}"),
+        )),
     }
 }
 
@@ -2006,10 +2048,24 @@ fn getinstance_instance_search(ctx: &mut dyn NativeContext, args: &[Value]) -> M
             return r;
         }
     }
-    Err(cratonvm_types::error::RuntimeError::NotImplemented {
-        feature: format!("no {type_str} {algo} implementation in any provider"),
-    }
-    .into())
+    // Every real `getInstance(type, algorithm)` overload declares (and
+    // catches, for callers like `KeyStore.getInstance(String)` which wraps it
+    // into `KeyStoreException`) `NoSuchAlgorithmException` for exactly this
+    // case. Previously this was a Rust-level `RuntimeError::NotImplemented`,
+    // which surfaces as `MethodCallFailed::InternalError` -- NOT catchable by
+    // Java `try`/`catch` -- and is only caught at `main-vm`'s top-level `Err`
+    // handler, which prints `"[cratonvm] main-vm run() returned Err: ..."`
+    // and exits the whole process. That turned a per-algorithm
+    // NoSuchAlgorithmException (e.g. `AlgorithmParameters.getInstance("OAEP")`
+    // before it was registered, or `KeyStore.getInstance("BCFKS")`, which
+    // WildFly Elytron deliberately does NOT support and probes for via a
+    // `catch (KeyStoreException e)` in `CryptoProvider.getSupportedKeyStoreTypes()`)
+    // into a crash of the entire test process instead of one clean, catchable
+    // exception.
+    Err(throw_no_such_algorithm(
+        ctx,
+        &format!("no {type_str} {algo} implementation in any provider"),
+    ))
 }
 
 /// Bridge for providers whose real `getService()`/`Service.newInstance()`

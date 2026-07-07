@@ -226,6 +226,26 @@ fn mock_classloader_field_slot(class_name: Option<&str>, name: &str) -> Option<u
     }
 }
 
+/// Real-JDK `java.nio.Buffer`/`ByteBuffer` field layout mirror for
+/// `t27_tls.rs::bb_view` tests: mark@0, position@1, limit@2, capacity@3,
+/// address@4, hb@5, offset@6. Gated on `java/nio/*ByteBuffer` class names so
+/// no other mock heap entries are shadowed.
+fn mock_buffer_field_slot(class_name: Option<&str>, name: &str) -> Option<usize> {
+    match class_name {
+        Some(c) if c.starts_with("java/nio/") && c.ends_with("ByteBuffer") => match name {
+            "mark" => Some(0),
+            "position" => Some(1),
+            "limit" => Some(2),
+            "capacity" => Some(3),
+            "address" => Some(4),
+            "hb" => Some(5),
+            "offset" => Some(6),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
 pub(crate) type InvokeVirtualHook =
     fn(&mut MockNativeContext, ObjectRef, &str, &str, &[Value]) -> Option<MethodCallResult>;
 
@@ -835,6 +855,7 @@ impl NativeContext for MockNativeContext {
             mock_parameter_field_slot(field_name).or_else(|| mock_jdk_field_slot(field_name))
         } else {
             mock_classloader_field_slot(class_name.as_deref(), field_name)
+                .or_else(|| mock_buffer_field_slot(class_name.as_deref(), field_name))
                 .or_else(|| mock_jdk_field_slot(field_name))
         };
         match slot {
@@ -849,6 +870,7 @@ impl NativeContext for MockNativeContext {
             mock_parameter_field_slot(field_name).or_else(|| mock_jdk_field_slot(field_name))
         } else {
             mock_classloader_field_slot(class_name.as_deref(), field_name)
+                .or_else(|| mock_buffer_field_slot(class_name.as_deref(), field_name))
                 .or_else(|| mock_jdk_field_slot(field_name))
         };
         if let Some(slot) = slot {

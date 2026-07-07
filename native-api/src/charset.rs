@@ -87,6 +87,58 @@ pub const REPLACEMENT_BYTE: u8 = b'?';
 /// Replacement code point used by the lossy variants for decoding.
 pub const REPLACEMENT_CHAR: u16 = 0xFFFD;
 
+/// Canonicalize a charset *alias* (case-insensitive, `-`/`_`-insensitive) to
+/// the canonical name this engine uses, or `None` when the alias has no
+/// canonical mapping at all.
+///
+/// This is the single shared alias table: `normalize_charset_name` in
+/// `cratonvm-native-builtins` and the `StreamEncoder`/`StreamDecoder` shims
+/// in `cratonvm-native-io` all resolve through it. The stream shims used to
+/// carry a stale private copy that was missing `IBM850` and every multibyte
+/// family this engine has since gained, so an
+/// `OutputStreamWriter(os, ibm850Charset)` silently encoded UTF-8 — Tomcat's
+/// `TestDefaultServletEncoding*` DefaultServlet include conversion put
+/// `C2 BD` on an ibm850 wire instead of `AB`
+/// (docs/known-issues/tomcat-defaultservlet-encoding-content-failures.md).
+///
+/// NOTE: `Some` here does **not** guarantee the engine can transcode the
+/// charset (e.g. `KOI8-U` canonicalizes but has no codec); callers that need
+/// a hard guarantee must probe `encode_chars` / `decode_bytes`.
+pub fn canonical_charset_name(name: &str) -> Option<&'static str> {
+    Some(match name.to_uppercase().replace(['-', '_'], "").as_str() {
+        "UTF8" => "UTF-8",
+        // "unicode" is the JDK's own alias for UTF-16 (`sun.nio.cs.UTF_16`'s
+        // alias list is `{"UTF16", "utf16", "unicode", "UnicodeBig"}`), and
+        // "UnicodeBigUnmarked"/"UnicodeLittleUnmarked" alias the no-BOM
+        // BE/LE variants.
+        "UTF16" | "UNICODE" | "UNICODEBIG" => "UTF-16",
+        "UTF16BE" | "UNICODEBIGUNMARKED" => "UTF-16BE",
+        "UTF16LE" | "UNICODELITTLEUNMARKED" => "UTF-16LE",
+        "UTF32" => "UTF-32",
+        "UTF32BE" => "UTF-32BE",
+        "UTF32LE" => "UTF-32LE",
+        "USASCII" | "ASCII" => "US-ASCII",
+        "ISO88591" | "LATIN1" | "ISO88591:1987" => "ISO-8859-1",
+        "ISO88592" => "ISO-8859-2",
+        "ISO885915" => "ISO-8859-15",
+        "SHIFTJIS" | "SJIS" | "CSSHIFTJIS" | "MSKANJI" | "WINDOWS31J" => "Shift_JIS",
+        "EUCJP" | "XEUCJP" => "EUC-JP",
+        "ISO2022JP" => "ISO-2022-JP",
+        "BIG5" | "CSBIG5" | "BIG5HKSCS" => "Big5",
+        "EUCKR" | "CSEUCKR" => "EUC-KR",
+        "GB2312" | "CSGB2312" => "GB2312",
+        "GBK" | "CP936" => "GBK",
+        "GB18030" => "GB18030",
+        "WINDOWS1252" | "CP1252" => "windows-1252",
+        "WINDOWS1251" | "CP1251" => "windows-1251",
+        "WINDOWS1250" | "CP1250" => "windows-1250",
+        "KOI8R" => "KOI8-R",
+        "KOI8U" => "KOI8-U",
+        "IBM850" | "CP850" | "850" | "CSPC850MULTILINGUAL" => "IBM850",
+        _ => return None,
+    })
+}
+
 /// Map a CratonVM canonical charset name (as produced by
 /// `normalize_charset_name`) to its `encoding_rs` implementation, for the
 /// legacy / CJK multi-byte families the hand-written codecs above don't cover.
