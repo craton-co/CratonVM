@@ -3290,7 +3290,9 @@ pub unsafe extern "C" fn jit_instanceof(
     // identically: take the existing null path instead of dereferencing it (the
     // field/class/header read below would SIGSEGV). `plausible_heap_pointer(0)`
     // is already false, so this also covers the original null check. Valid
-    // objects always pass (8-aligned, ≤47-bit); zero false positives.
+    // objects always pass (8-aligned, ≤47-bit); zero false positives. This is a
+    // cheap, vm-independent pre-filter — kept ahead of the `vm_ptr` dereference
+    // below so it alone guards the existing unit tests, which pass `vm_ptr = 0`.
     if !cratonvm_types::plausible_heap_pointer(obj_ptr as u64) {
         return 0;
     }
@@ -3299,6 +3301,25 @@ pub unsafe extern "C" fn jit_instanceof(
     }
     // SAFETY: vm_ptr originates from JIT code that received it from the interpreter's SharedVm reference.
     let vm = &*(vm_ptr as *const SharedVm);
+    // Defense-in-depth beyond the bit-pattern-only `plausible_heap_pointer`
+    // check above: that check has no view of the heap's actual mapped
+    // extent, only whether the bits LOOK like a pointer (aligned,
+    // in-range). A stale `ObjectRef` into memory the heap has since
+    // reclaimed/reused past a GC root-coverage gap still passes it, and
+    // the unchecked `ObjectRef::from_raw` + `class_id_of` this used to do
+    // next would then read through a dangling pointer — observed live as
+    // a SIGSEGV inside this function under concurrent executor load
+    // (WildFly `EEConcurrencyExecutorShutdownTestCase`, see
+    // docs/known-issues/wildfly-domain-heap-corrupt-value-timeout.md).
+    // `is_object_address` additionally validates the address falls inside
+    // a live heap region (and looks like a real header) before ever
+    // dereferencing it, degrading a dangling reference to "not an
+    // instance" instead of crashing — the same fallback every other stale-
+    // reference guard in this codebase uses.
+    let obj_ref = match vm.heap.is_object_address(obj_ptr as usize) {
+        Some(r) => r,
+        None => return 0,
+    };
     // SAFETY: class_name_ptr is non-null (checked above) and class_name_len > 0.
     // The pointer comes from the JIT string table which outlives this call.
     let class_name = match std::str::from_utf8(std::slice::from_raw_parts(
@@ -3308,8 +3329,6 @@ pub unsafe extern "C" fn jit_instanceof(
         Ok(s) => s,
         Err(_) => return 0,
     };
-    // SAFETY: obj_ptr is non-null (checked above) and points to a live heap object.
-    let obj_ref = ObjectRef::from_raw(obj_ptr as usize as *mut u8);
     let obj_class_id = vm.heap.class_id_of(obj_ref);
     // instanceof: strict (SBR-03).
     if jit_typecheck_resolve(vm, obj_class_id, obj_ref, class_name, false) {

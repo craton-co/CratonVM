@@ -19,7 +19,7 @@ angles**; this index is the consolidated map. Read it first.
 
 ## 2026-07-06 WildFly Host Controller org.jboss.as.jmx module-load NPE
 
-- [wildfly-module-descriptor-null-host-controller.md](wildfly-module-descriptor-null-host-controller.md) — root-cause mechanism fixed: `Module.canUse`/`addUses` read `this.descriptor` directly in real bytecode and were missing from `force_native_over_real_jdk_bytecode`, so a registered-but-shadowed native never protected real-JDK mode against a named Module with an unset `descriptor` field. Verified with a standalone repro; live re-confirmation via `HostExcludesTestCase` blocked by the same MSC real-start gap referenced below.
+- ✅ FIXED 2026-07-06 (`fix/wildfly-module-descriptor-null-20260706`, commit `657ee914`): `Module.canUse`/`addUses` read `this.descriptor` directly in real bytecode and were missing from `force_native_over_real_jdk_bytecode`, so a registered-but-shadowed native never protected real-JDK mode against a named Module with an unset `descriptor` field. Verified with a standalone repro that fails pre-fix and passes post-fix, plus existing module test suites all passing. Full analysis moved to [`docs/internal/fixed-suite-bugs/wildfly-module-descriptor-null-host-controller.md`](../internal/fixed-suite-bugs/wildfly-module-descriptor-null-host-controller.md); live re-confirmation via `HostExcludesTestCase` end to end remains blocked by the domain-mode MSC real-start gap noted below (orthogonal to this fix, doesn't block closing it).
 
 ## 2026-07-06 WildFly domain-mode corrupt-Value-cell root cause + MSC real-start gate
 

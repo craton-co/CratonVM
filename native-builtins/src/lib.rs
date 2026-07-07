@@ -15587,18 +15587,42 @@ pub fn register_essential_natives(registry: &mut NativeMethodRegistry) {
         target: Value,
         name: Value,
     ) {
+        // GC-safety: `this` (the Thread under construction) and `holder`
+        // (freshly allocated below) are both bare Rust locals held across
+        // `ctx.invoke("...FieldHolder", "<init>", ...)`, which runs real Java
+        // bytecode and can trigger a moving/promoting GC. `safe_native_call`
+        // pins/remaps this function's *incoming* args (`this` included) only
+        // once, at native-call entry — it does not protect a GC that happens
+        // *during* this callback's own re-entrant `invoke`. `holder` in
+        // particular has no Java-side reference anywhere until the final
+        // `set_field_by_name(this, "holder", ...)` below, so it is protected
+        // ONLY by an explicit native pin. Without this, a GC inside the
+        // FieldHolder ctor invoke relocates `holder` (and/or `this`), and the
+        // stale address then gets written into `this.holder` (or used to
+        // read/write fields on a dead object) — reads of `Thread.holder`
+        // downstream (`setPriority`/`getState`/`isDaemon`) then NPE or read
+        // garbage. Mirrors the identical BUG-03 pin pattern already used by
+        // `NativeContextImpl::build_thread_field_holder` (vm/src/vm/vm_exec.rs)
+        // for the bootstrap main-thread holder construction. See
+        // docs/known-issues/gc-blocked-thread-frame-stale-thread-mirror.md.
+        let pin_base = ctx.pin_native_root(this);
         ctx.set_field_by_name(this, "name", name);
         // Don't clobber an already-populated holder (e.g. if the real
         // Java constructor somehow ran first, or a re-entrant call).
         if let Value::Object(Some(_)) = ctx.get_field_by_name(this, "holder") {
+            ctx.unpin_native_roots(pin_base);
             return;
         }
         let holder_class = match ctx.ensure_class_initialized("java/lang/Thread$FieldHolder") {
             Ok(cid) => cid,
-            Err(_) => return,
+            Err(_) => {
+                ctx.unpin_native_roots(pin_base);
+                return;
+            }
         };
         let nfields = ctx.class_num_total_fields(holder_class).max(1);
         let holder = ctx.alloc_object(holder_class, nfields);
+        let holder_handle = ctx.pin_native_root(holder);
         // A real ThreadGroup is required: the FieldHolder ctor stores it,
         // and `Thread.getThreadGroup()` returns `holder.group`.  Fall back
         // to the current thread's group when the caller passed null.
@@ -15629,6 +15653,10 @@ pub fn register_essential_natives(registry: &mut NativeMethodRegistry) {
                 &args,
             )
             .is_ok();
+        // Re-read both pinned objects: the invoke above may have GC'd and
+        // relocated either (or both) of them.
+        let holder = ctx.read_native_pin(holder_handle, holder);
+        let this = ctx.read_native_pin(pin_base, this);
         if !ctor_ok {
             // Constructor unavailable — populate the known fields directly
             // so the holder is still usable by getPriority/isDaemon/getState.
@@ -15640,6 +15668,7 @@ pub fn register_essential_natives(registry: &mut NativeMethodRegistry) {
             ctx.set_field_by_name(holder, "threadStatus", Value::Int(0));
         }
         ctx.set_field_by_name(this, "holder", Value::Object(Some(holder)));
+        ctx.unpin_native_roots(pin_base);
     }
     registry.register(
         "java/lang/Thread",

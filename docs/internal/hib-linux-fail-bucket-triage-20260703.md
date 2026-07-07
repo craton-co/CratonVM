@@ -1,5 +1,17 @@
 # Hibernate FAIL-bucket triage on Linux (Azure host, dev `0d142fad`+, 2026-07-03)
 
+**Status (2026-07-06): all classes tracked by this doc are now FIXED or ruled
+out.** See "Fixed 2026-07-06" below — the 8 classes in "Genuinely new" (10
+counting the 3-class timezone bullet) were re-verified against current dev
+(Windows box, `9f1db39d`+) and all pass. Several turned out to already be
+fixed by unrelated earlier work this week (softdelete CHM-order fix, NoDepth
+ServiceLoader fix, HIB-CV-34 timezone fix); one (`CacheKeyEmbeddedIdEnanchedTest`)
+had a genuine, previously-undiagnosed bug, root-caused and fixed this
+session; one (`MetadataAccessTests`) was never actually broken — the earlier
+"HANG" observation was a batch-position timeout artifact, not a real hang.
+This doc is being archived to `docs/internal/` per the known-issues triage
+rule (no open defect remains).
+
 Source: the 387-class non-passed set from a full-suite Linux run (real-JDK,
 JIT on, TIMEOUT=600), OSR-off baseline (239 FAIL). After excluding the
 already-tracked clusters (bytecode.enhancement/lazytoone ~187, jar-scanning 3,
@@ -114,19 +126,88 @@ Both fixes are platform-neutral by construction (verified by code inspection,
 not by an actual Windows build+run in this session — `LinuxSocketOptions` is
 inert on Windows since the class doesn't exist there, and the `File` fixup
 uses the same `cfg!(windows)` ternary as every other platform-conditional
-constant in this codebase). Not yet merged to `dev` — awaiting sign-off.
+constant in this codebase). **Merged to `dev`** via commit `81a31c08`
+("Merge fix/linux-jdbc-serviceloader-and-javac-cp into dev") — confirmed
+present in both `native-io/src/net.rs` and `vm/src/vm/vm_util.rs` on current
+dev (2026-07-06 verification).
 
-## Genuinely new — still open, not yet root-caused
+## Fixed 2026-07-06 — re-triage of section C (all 10 classes)
 
-### C. Genuine new correctness/serialization bugs (one-offs, not yet root-caused)
-- `mapping.type.java.JdbcTimestampJavaTypeTest` — `AssertionFailedError: expected <true> but was <false>` (needs the specific assertion to know what boolean predicate is wrong).
-- `mapping.mutability.attribute.BasicAttributeMutabilityTests` — bare `AssertionFailedError`.
-- `serialization.CacheKeyEmbeddedIdEnanchedTest` — `InvalidClassException: local class incompatible: stream classdesc serialVersionUID mismatch` — a real serialization/serialVersionUID computation bug (CratonVM likely computes a different implicit serialVersionUID than HotSpot for this embeddable-id cache-key class).
-- `softdelete.SoftDeleteFetchModeTests` — `Expecting UnsupportedMappingException...` (expected exception not thrown — a validation gap).
-- `mapping.fetch.depth.NoDepthTests` — `PersistenceException: No Persistence provider for ...` — looks like a JPA bootstrap/provider-discovery gap, possibly `META-INF/services/jakarta.persistence.spi.PersistenceProvider` ServiceLoader (same family as finding A?).
-- `boot.database.metadata.MetadataAccessTests` — `ServiceException: Unable to create requested service [...]`.
-- `engine.spi.EntityEntryTest` — `MockitoException` (Mockito/CratonVM interop gap, distinct from the earlier-tracked Mockito issue in `UUidV6V7GeneratorTest`, which is a known timeout not a Mockito error).
-- `timezones.JDBCTimeZoneZonedTest`, `timezones.PassThruZonedTest`, `timezones.UTCNormalizedInstantTest` — all three fail with `expected: <2026-07-03T19:XX:XX...> but was: <...>` (wall-clock timestamp mismatches). Worth checking whether these are flaky (test compares against `Instant.now()`-ish values with a tolerance CratonVM's timing exceeds) vs a genuine timezone-storage correctness bug — distinct from the already-tracked `type.temporal.*` GC-crash cluster (these are FAIL/assertion, not CRASH).
+Re-ran all 10 classes below against current dev (Windows box, `9f1db39d`+,
+real-JDK, JIT on) to re-verify before investing more root-causing effort.
+**All 10 now pass.** Breakdown:
+
+- **8 already fixed by unrelated earlier work this week** (the triage doc
+  simply hadn't been re-checked against a fresh binary):
+  - `mapping.type.java.JdbcTimestampJavaTypeTest` — passes (4/4).
+  - `mapping.mutability.attribute.BasicAttributeMutabilityTests` — passes (7/7).
+  - `softdelete.SoftDeleteFetchModeTests` — fixed by the `ConcurrentHashMap`
+    default-capacity/iteration-order fix; see
+    `docs/internal/fixed-suite-bugs/hib-softdeletefetchmodetests-chm-order-RESOLVED.md`.
+  - `mapping.fetch.depth.NoDepthTests` — the JPA-variant `PersistenceProvider`
+    ServiceLoader residual is gone (no dedicated fix needed — closed by
+    unrelated classloader-resource-resolution hardening); see
+    `docs/internal/hibernate-bugs/hib-nodepthtests-persistenceprovider-serviceloader-residual.md`.
+  - `engine.spi.EntityEntryTest` — passes (5/5); the previously-reported
+    `MockitoException` no longer reproduces.
+  - `timezones.JDBCTimeZoneZonedTest`, `timezones.PassThruZonedTest`,
+    `timezones.UTCNormalizedInstantTest` — fixed by the `TimeZone`
+    standard-offset fix (HIB-CV-34); see
+    `docs/internal/hibernate-bugs/run-20260622/HIB-CV-34-jdbc-timezone-timestamp-offset.md`.
+- **1 genuinely new bug, root-caused and fixed this session:**
+  `serialization.CacheKeyEmbeddedIdEnanchedTest` —
+  `InvalidClassException: local class incompatible: stream classdesc
+  serialVersionUID mismatch`. The original hypothesis ("CratonVM computes a
+  different implicit serialVersionUID than HotSpot") was **wrong** — both
+  sides compute the SAME algorithm; the actual bug is that deserialization
+  resolved the stream's class name through the **wrong classloader**,
+  silently loading a *different*, structurally-different same-named class
+  (missing Hibernate's bytecode-enhancement transform). Three separate bugs
+  contributed, all in the same family (class-name resolution that ignores
+  which classloader the deserializing caller actually expects):
+  1. `jdk/internal/misc/VM.latestUserDefinedLoader0()` was a hardcoded stub
+     always returning `null`, breaking `ObjectInputStream.resolveClass()`'s
+     default `Class.forName(name, false, latestUserDefinedLoader())` — fixed
+     by implementing a real stack walk (mirroring HotSpot's
+     `JVM_LatestUserDefinedLoader`).
+  2. The synthetic deserialization fast path (`ois_read_object` in
+     `native-builtins/src/serialization.rs`) resolved class names via the
+     loader-oblivious `ensure_class_initialized`, bypassing `resolveClass`
+     entirely — fixed to consult the same stack-walk-derived loader first.
+  3. `Constructor.newInstance`'s "serialization constructor" special case
+     (`ReflectionFactory.newConstructorForSerialization` /
+     `DirectConstructorHandleAccessor`, used for any Serializable class
+     whose nearest non-Serializable ancestor is `Object`) allocated the new
+     instance by class **name** instead of by the already-resolved
+     `ClassId` — silently collapsing to whichever same-named class the
+     process registered first. Fixed to allocate via the resolved `ClassId`
+     directly.
+
+  A subtlety caught during verification: the stack-walk fix for (1)/(2)
+  initially only worked when this test ran *first* in a batch. Re-resolving
+  each stack frame's class by **name** (the only thing `capture_stack_trace`
+  exposes) collapses to the first-ever-registered class of that name once a
+  *second* `@BytecodeEnhanced` test class (each gets its own fresh
+  `EnhancingClassLoader`) has run earlier in the same process. Fixed
+  properly by adding `NativeContext::frame_class_ids()`, which exposes each
+  live frame's precise, already-resolved `ClassId` (no name round-trip).
+  Verified with all 10 classes above running together in one process, in
+  original order, all passing.
+
+  See `native-builtins/src/serialization.rs` (`latest_user_defined_loader_class`,
+  `ois_read_object`), `native-builtins/src/lib.rs`
+  (`VM.latestUserDefinedLoader0`), `native-builtins/src/lang_class.rs`
+  (`native_constructor_new_instance`), and `native-api/src/registry.rs` /
+  `vm/src/vm/vm_exec.rs` (`NativeContext::frame_class_ids`).
+- **1 was never actually broken:** `boot.database.metadata.MetadataAccessTests`
+  — the original `ServiceException` symptom no longer reproduces at all; a
+  later re-run instead showed it not completing within a tight batch
+  timeout, which looked like a hang but was purely a **cumulative slowdown
+  artifact** of running many classes (each opening/closing real H2
+  connections) in one process — the class reliably passes (32/32) both
+  alone and as part of the full 10-class batch given a timeout sized for the
+  batch's actual (slower-than-any-single-class) cumulative runtime. Not a
+  CratonVM bug.
 
 ## Ruled out / already tracked (no new action)
 - **7 classes shuffling between two already-broken statuses** (FAIL↔HANG↔CRASH in OSR on/off) — see `../internal/fixed-suite-bugs/jit-osr-linux-regression-triad.md`.
