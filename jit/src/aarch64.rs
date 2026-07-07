@@ -2225,30 +2225,45 @@ mod tests {
         assert!(!e.overflowed());
     }
 
-    // The encoders trip a `debug_assert!` on overflow (loud failure in
-    // debug/test builds) AND set the sticky `overflowed` flag so release
-    // builds bail to the interpreter. Here we confirm the debug-assert fires
-    // for each out-of-range field by catching the unwind.
-
-    fn assert_branch_panics<F>(f: F)
+    // `mark_branch_overflow` does two things on an out-of-range branch: it
+    // trips a `debug_assert!` (loud panic in debug/test builds) AND sets the
+    // sticky `overflowed` flag (always) so release builds discard the buffer
+    // and bail to the interpreter. `debug_assert!` is compiled OUT under
+    // `--release`, so a release test run sees no panic — these tests must
+    // check the mechanism that is actually active for the build: the panic in
+    // debug, the sticky flag in release. (Previously they only asserted the
+    // panic and so spuriously FAILED under `cargo test --release`.)
+    fn assert_branch_overflow_detected<F>(emit: F)
     where
-        F: FnOnce() + std::panic::UnwindSafe,
+        F: Fn(&mut Aarch64Emitter),
     {
-        let prev = std::panic::take_hook();
-        std::panic::set_hook(Box::new(|_| {})); // silence the panic message
-        let result = std::panic::catch_unwind(f);
-        std::panic::set_hook(prev);
-        assert!(
-            result.is_err(),
-            "expected an out-of-range branch offset to trip debug_assert!"
-        );
+        if cfg!(debug_assertions) {
+            let prev = std::panic::take_hook();
+            std::panic::set_hook(Box::new(|_| {})); // silence the panic message
+            let emit_ref = &emit;
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                let mut e = Aarch64Emitter::new();
+                emit_ref(&mut e);
+            }));
+            std::panic::set_hook(prev);
+            assert!(
+                result.is_err(),
+                "expected an out-of-range branch offset to trip debug_assert!"
+            );
+        } else {
+            let mut e = Aarch64Emitter::new();
+            emit(&mut e);
+            assert!(
+                e.overflowed(),
+                "expected an out-of-range branch offset to set the sticky overflowed flag"
+            );
+        }
     }
 
     #[test]
     fn test_b_cond_beyond_1mb_overflows() {
         // > ±1 MB conditional branch must not silently truncate.
-        assert_branch_panics(|| {
-            let mut e = Aarch64Emitter::new();
+        assert_branch_overflow_detected(|e| {
             e.b_cond(Cond::NE, 1 << 20);
         });
     }
@@ -2256,24 +2271,21 @@ mod tests {
     #[test]
     fn test_tbz_beyond_32kb_overflows() {
         // > ±32 KB test-bit branch must not silently truncate.
-        assert_branch_panics(|| {
-            let mut e = Aarch64Emitter::new();
+        assert_branch_overflow_detected(|e| {
             e.tbz(Reg::X0, 3, 1 << 15);
         });
     }
 
     #[test]
     fn test_b_beyond_128mb_overflows() {
-        assert_branch_panics(|| {
-            let mut e = Aarch64Emitter::new();
+        assert_branch_overflow_detected(|e| {
             e.b(1 << 27);
         });
     }
 
     #[test]
     fn test_patch_branch_out_of_range_overflows() {
-        assert_branch_panics(|| {
-            let mut e = Aarch64Emitter::new();
+        assert_branch_overflow_detected(|e| {
             let p = e.b(0);
             e.patch_branch(p, p + (1 << 27));
         });
