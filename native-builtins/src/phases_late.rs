@@ -39796,12 +39796,19 @@ fn kmf_keystore_id_by_identity() -> &'static parking_lot::Mutex<rustc_hash::FxHa
 /// FIX (tomcat-clientauth-engine-config): same pattern as
 /// `kmf_keystore_id_by_identity` immediately above, for
 /// `javax/net/ssl/TrustManagerFactory` — maps the TMF object to the
-/// keystore registry id its `init(KeyStore)` was called with, so
-/// `getTrustManagers()` (below) can build a real, functional
-/// `X509TrustManagerImpl`-shaped `TrustManager` instead of a bare-
-/// interface-stamped stub whose `checkClientTrusted`/`checkServerTrusted`
-/// have no Code.
-fn tmf_keystore_id_by_identity() -> &'static parking_lot::Mutex<rustc_hash::FxHashMap<i32, i32>> {
+/// `x509_manager::tm_registry` id its `init(KeyStore)` /
+/// `init(ManagerFactoryParameters)` was called with, so `getTrustManagers()`
+/// (below) can build a real, functional `X509TrustManagerImpl`-shaped
+/// `TrustManager` instead of a bare-interface-stamped stub whose
+/// `checkClientTrusted`/`checkServerTrusted` have no Code. Stores the
+/// FINAL registered `tm_registry` id directly (not a keystore id) so both
+/// `init` overloads — one backed by a real `KeyStore`, the other by a
+/// `CertPathTrustManagerParameters` with no keystore back-reference at all
+/// (Tomcat's own `SSLUtilBase.getTrustManagers()` uses this overload
+/// whenever `sslHostConfig.getTruststoreAlgorithm()` is `"PKIX"`, the
+/// default — confirmed via tracing this is the overload the SERVER side of
+/// this suite's mTLS tests actually exercises) — can populate it uniformly.
+fn tmf_tm_id_by_identity() -> &'static parking_lot::Mutex<rustc_hash::FxHashMap<i32, i32>> {
     static T: std::sync::OnceLock<parking_lot::Mutex<rustc_hash::FxHashMap<i32, i32>>> =
         std::sync::OnceLock::new();
     T.get_or_init(|| parking_lot::Mutex::new(rustc_hash::FxHashMap::default()))
@@ -40669,23 +40676,26 @@ pub(crate) fn register_p68_ssl(r: &mut NativeMethodRegistry) {
             if ks_id != 0 {
                 let state = crate::x509_manager::build_trust_manager_state(ks_id);
                 if !state.anchor_ders.is_empty() {
-                    crate::t27_tls::set_pending_tm_trust_roots(state.anchor_ders);
+                    crate::t27_tls::set_pending_tm_trust_roots(state.anchor_ders.clone());
                 }
-                // FIX (tomcat-clientauth-engine-config): also stash the
-                // keystore id via identity hash so getTrustManagers() below
-                // can build a REAL, functional TrustManager (same trap/fix
-                // as the sibling KeyManagerFactory.getKeyManagers() — see
-                // that handler's doc comment for the full story: a bare
-                // alloc_concurrent_synthetic(ctx, "javax/net/ssl/
-                // X509TrustManager", ...) stamps the INTERFACE's own class
-                // id, so checkClientTrusted/checkServerTrusted/
-                // getAcceptedIssuers have no Code and throw
-                // AbstractMethodError the moment real bytecode calls one
+                // FIX (tomcat-clientauth-engine-config): also register this
+                // state into `x509_manager::tm_registry` and stash the
+                // resulting id via identity hash, so `getTrustManagers()`
+                // below can build a REAL, functional TrustManager (same
+                // trap/fix as the sibling
+                // `KeyManagerFactory.getKeyManagers()` — see that handler's
+                // doc comment for the full story: a bare
+                // `alloc_concurrent_synthetic(ctx, "javax/net/ssl/
+                // X509TrustManager", ...)` stamps the INTERFACE's own class
+                // id, so `checkClientTrusted`/`checkServerTrusted`/
+                // `getAcceptedIssuers` have no Code and throw
+                // `AbstractMethodError` the moment real bytecode calls one
                 // directly instead of going through this crate's own
                 // post-handshake `engine_run_trust_check` native path).
+                let tm_id = crate::x509_manager::register_trust_manager_state(state);
                 let ih = ctx.identity_hash_code(this);
                 if ih != 0 {
-                    tmf_keystore_id_by_identity().lock().insert(ih, ks_id);
+                    tmf_tm_id_by_identity().lock().insert(ih, tm_id);
                 }
             }
         }
@@ -40699,6 +40709,37 @@ pub(crate) fn register_p68_ssl(r: &mut NativeMethodRegistry) {
             let this = obj_arg(args, 0)?;
             if ctx.object_num_fields(this) > 1 {
                 ctx.set_field(this, 1, args.get(1).copied().unwrap_or(Value::Object(None)));
+            }
+            // FIX (tomcat-clientauth-engine-config): this overload — used
+            // whenever `sslHostConfig.getTruststoreAlgorithm()` is `"PKIX"`
+            // (Tomcat's default; see `SSLUtilBase.getTrustManagers()`,
+            // which is what the SERVER side of every mTLS test in this
+            // suite actually calls) — used to leave `getTrustManagers()`
+            // below with no keystore id to work with at all, since
+            // `CertPathTrustManagerParameters` carries no back-reference to
+            // a `KeyStore`. Reuses `x509_manager`'s own
+            // `build_and_register_tm_state_from_mfp` (extracted from that
+            // module's `tmf_engine_init_params`, which does the identical
+            // walk for its own SPI-delegation registration) to recover the
+            // trust anchors directly from `getParameters().
+            // getTrustAnchors()` and register a real `TrustManagerState`,
+            // then stash the resulting id the same way the `init(KeyStore)`
+            // overload above does.
+            let mfp = match args.get(1) {
+                Some(Value::Object(Some(mfp))) => Some(*mfp),
+                _ => None,
+            };
+            let tm_id = crate::x509_manager::build_and_register_tm_state_from_mfp(ctx, mfp);
+            if std::env::var("CRATONVM_DBG_TLS_AUTH").is_ok() {
+                eprintln!(
+                    "[dbg-tls-auth] tmf(phases_late).init(ManagerFactoryParameters) this_ih={} tm_id={}",
+                    ctx.identity_hash_code(this),
+                    tm_id
+                );
+            }
+            let ih = ctx.identity_hash_code(this);
+            if ih != 0 {
+                tmf_tm_id_by_identity().lock().insert(ih, tm_id);
             }
             Ok(None)
         },
@@ -40734,16 +40775,16 @@ pub(crate) fn register_p68_ssl(r: &mut NativeMethodRegistry) {
             // the real, functional `FQN_X509_TM`-shaped object
             // `x509_manager.rs`'s `tmf_engine_get_trust_managers` already
             // produces for the SPI-delegation path, keyed off the SAME
-            // keystore id `init(KeyStore)` (above) stashed via
-            // `tmf_keystore_id_by_identity`. Falls back to the old (non-
-            // functional but allocation-safe) stub when no keystore id was
-            // captured (matches original behavior for `init((KeyStore)
-            // null)` / a `getTrustManagers()` call with no preceding
-            // `init`).
+            // `tm_registry` id either `init` overload above (`KeyStore` or
+            // `ManagerFactoryParameters`) already registered and stashed
+            // via `tmf_tm_id_by_identity`. Falls back to the old (non-
+            // functional but allocation-safe) stub when no id was captured
+            // (matches original behavior for `init((KeyStore) null)` / a
+            // `getTrustManagers()` call with no preceding `init`).
             let this = obj_arg(args, 0)?;
             let ih = ctx.identity_hash_code(this);
-            let ks_id = if ih != 0 {
-                tmf_keystore_id_by_identity()
+            let tm_id = if ih != 0 {
+                tmf_tm_id_by_identity()
                     .lock()
                     .get(&ih)
                     .copied()
@@ -40753,13 +40794,11 @@ pub(crate) fn register_p68_ssl(r: &mut NativeMethodRegistry) {
             };
             if std::env::var("CRATONVM_DBG_TLS_AUTH").is_ok() {
                 eprintln!(
-                    "[dbg-tls-auth] tmf(phases_late).getTrustManagers this_ih={} looked_up_ks_id={}",
-                    ih, ks_id
+                    "[dbg-tls-auth] tmf(phases_late).getTrustManagers this_ih={} looked_up_tm_id={}",
+                    ih, tm_id
                 );
             }
-            let tm = if ks_id != 0 {
-                let state = crate::x509_manager::build_trust_manager_state(ks_id);
-                let tm_id = crate::x509_manager::register_trust_manager_state(state);
+            let tm = if tm_id != 0 {
                 let tm = alloc_concurrent_synthetic(ctx, crate::x509_manager::FQN_X509_TM, 2);
                 crate::x509_manager::set_tm_id(ctx, tm, tm_id);
                 tm

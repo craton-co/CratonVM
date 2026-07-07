@@ -3039,32 +3039,55 @@ fn register_tmf(r: &mut NativeMethodRegistry) {
     );
 }
 
-/// `engineInit(ManagerFactoryParameters)` — see `register_tmf`'s doc for why
-/// this overload needs its own handler. Walks
+/// Shared by `tmf_engine_init_params` and, cross-module,
+/// `phases_late.rs`'s competing `TrustManagerFactory.init
+/// (ManagerFactoryParameters)` registration (see that handler's doc
+/// comment — FIX tomcat-clientauth-engine-config). Walks
 /// `CertPathTrustManagerParameters.getParameters()` (real runtime type
 /// `PKIXParameters`/`PKIXBuilderParameters`) -> `.getTrustAnchors()` -> each
 /// `TrustAnchor.getTrustedCert()` -> `.getEncoded()` to recover the same
 /// trust-anchor DER set `tmf_engine_init` gets from a plain `KeyStore` —
 /// `PKIXParameters` retains no back-reference to the original `KeyStore`
-/// object, so this is the only way to recover the anchors from this overload.
-fn tmf_engine_init_params(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    let this = this_arg(args)?;
+/// object, so this is the only way to recover the anchors from this
+/// overload. Builds and registers a `TrustManagerState` into `tm_registry`,
+/// stages the pending-trust-roots/revocation thread-locals the same way
+/// `tmf_engine_init` does, and returns the new `tm_registry` id — but does
+/// NOT call `set_tm_id` itself, since not every caller's `this` object has
+/// a safe place to land it (a `phases_late.rs`-allocated
+/// `javax/net/ssl/TrustManagerFactory` has its own field-0 in active use
+/// for something else entirely — writing the tm id there would corrupt
+/// it). Callers own where/whether to persist the returned id.
+pub(crate) fn build_and_register_tm_state_from_mfp(
+    ctx: &mut dyn NativeContext,
+    mfp: Option<ObjectRef>,
+) -> i32 {
     let mut state = TrustManagerState::default();
-    if let Some(Value::Object(Some(mfp))) = args.get(1) {
-        for der in extract_pkix_trust_anchor_ders(ctx, *mfp) {
+    if let Some(mfp) = mfp {
+        for der in extract_pkix_trust_anchor_ders(ctx, mfp) {
             insert_anchor(&mut state, der);
         }
-        state.revocation = extract_revocation_config(ctx, *mfp);
+        state.revocation = extract_revocation_config(ctx, mfp);
         if std::env::var("CRATONVM_DBG_TLS_AUTH").is_ok() {
             eprintln!(
-                "[dbg-tls-auth] tmf_engine_init_params revocation_config={:?}",
+                "[dbg-tls-auth] build_and_register_tm_state_from_mfp revocation_config={:?}",
                 state.revocation
             );
         }
     }
     crate::t27_tls::set_pending_tm_revocation(state.revocation.clone());
     crate::t27_tls::set_pending_tm_trust_roots(state.anchor_ders.clone());
-    let id = register_trust_manager_state(state);
+    register_trust_manager_state(state)
+}
+
+/// `engineInit(ManagerFactoryParameters)` — see `register_tmf`'s doc for why
+/// this overload needs its own handler.
+fn tmf_engine_init_params(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = this_arg(args)?;
+    let mfp = match args.get(1) {
+        Some(Value::Object(Some(mfp))) => Some(*mfp),
+        _ => None,
+    };
+    let id = build_and_register_tm_state_from_mfp(ctx, mfp);
     set_tm_id(ctx, this, id);
     Ok(None)
 }
