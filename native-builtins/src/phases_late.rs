@@ -38533,32 +38533,32 @@ pub(crate) fn register_p67_foreign_memory(r: &mut NativeMethodRegistry) {
         },
     );
 
-    // SymbolLookup
-    let sl = "java/lang/foreign/SymbolLookup";
-    r.register(
-        sl,
-        "loaderLookup",
-        "()Ljava/lang/foreign/SymbolLookup;",
-        |ctx, _args| {
-            let obj = alloc_concurrent_synthetic(ctx, "java/lang/foreign/SymbolLookup", 0);
-            Ok(Some(Value::Object(Some(obj))))
-        },
-    );
-    r.register(
-        sl,
-        "libraryLookup",
-        "(Ljava/lang/String;Ljava/lang/foreign/Arena;)Ljava/lang/foreign/SymbolLookup;",
-        |ctx, _args| {
-            let obj = alloc_concurrent_synthetic(ctx, "java/lang/foreign/SymbolLookup", 0);
-            Ok(Some(Value::Object(Some(obj))))
-        },
-    );
-    r.register(
-        sl,
-        "find",
-        "(Ljava/lang/String;)Ljava/util/Optional;",
-        |_ctx, _args| Ok(Some(Value::Object(None))),
-    );
+    // SymbolLookup — `loaderLookup`/`libraryLookup`/`find` are registered by
+    // `panama::register_pe_symbol_lookup` (promoted to `Bridge` category
+    // there specifically so it survives strict-no-stubs dropping). That
+    // implementation actually attempts a real library load via
+    // `ctx.load_native_library` and wraps results in a genuine
+    // `Optional`/`Optional.empty()` rather than a bare Java `null`.
+    //
+    // A duplicate, unconditionally-"successful" stub trio used to live here
+    // too (`libraryLookup` always allocating a fake lookup regardless of
+    // whether any library was found, `find` always returning raw `null`).
+    // Because this function runs under the always-on `Bridge` category while
+    // `register_pe_symbol_lookup` ran under the default `SyntheticStub`
+    // category (silently dropped under strict-no-stubs), THIS stub trio was
+    // the one actually winning the `(class, method, descriptor)` registry
+    // key — see `native_method_hash`/`self.methods.insert` last-registration-
+    // wins semantics. Real JDK bytecode composes lookups via
+    // `SymbolLookup.or()`, whose generated lambda does
+    // `this.find(name).or(() -> other.find(name))` — a bare `null` receiver
+    // there throws `NullPointerException: Cannot invoke
+    // "java.util.Optional.or(java.util.function.Supplier)"` instead of
+    // letting the composed lookup gracefully report "symbol not found".
+    // Tomcat's `openssl_h` (jextract FFM bindings) hits exactly this in its
+    // `<clinit>` when OpenSSL isn't installed, on a path Linux exercises
+    // identically but this stub trio's placement made real bytecode's own
+    // `.or()` compose over a lie ("yes, a library IS loaded") instead of a
+    // clean unavailable signal.
     r.set_category(__prev_cat);
 }
 
@@ -41356,9 +41356,6 @@ pub(crate) fn register_p68_security_cert(r: &mut NativeMethodRegistry) {
                 }
             }
 
-            // X509Certificate: 3 fields (subject_str=0, issuer_str=1, cert_id=2)
-            let cert = alloc_concurrent_synthetic(ctx, "java/security/cert/X509Certificate", 3);
-
             // Try to read DER data from InputStream's internal buffer
             let der_data = if let Some(Value::Object(Some(is_ref))) = args.get(1) {
                 if let Value::Object(Some(buf_ref)) = ctx.get_field(*is_ref, 0) {
@@ -41383,34 +41380,38 @@ pub(crate) fn register_p68_security_cert(r: &mut NativeMethodRegistry) {
                 None
             };
 
-            // Try legacy-synthetic-crypto parser first (full featured)
-            #[cfg(feature = "legacy-synthetic-crypto")]
+            // BUGFIX (keycloak-07-04 x509-authoritykeyidentifier-npe): this is the
+            // no-explicit-provider `getInstance("X.509")` path — the form virtually
+            // all callers use, including BC's own `JcaX509CertificateConverter`
+            // (`CertificateFactory.getInstance("X.509")`, no `.setProvider(...)`).
+            // The old code here never stored the raw DER anywhere reachable by
+            // `getEncoded()` unless the (default-off) `legacy-synthetic-crypto`
+            // parser happened to be enabled AND succeed; otherwise `getEncoded()`
+            // returned a 0-length byte[]. Re-parsing that empty array with BC's own
+            // ASN.1 decoder (e.g. `new JcaX509CertificateHolder(cert)`, which
+            // `createAuthorityKeyIdentifier` calls internally) hits
+            // `ASN1InputStream.readObject()` returning `null` at immediate EOF, then
+            // `ASN1UniversalType.checkedCast(null)` NPEs on `null.getClass()`.
+            //
+            // Build a REAL `sun.security.x509.X509CertImpl` from the DER instead —
+            // same "prefer real over synthetic" pattern `keystore::make_x509_mirror`
+            // already uses for KeyStore/TLS-peer certs. Real bytecode gives a
+            // correct `getEncoded()` (and `checkValidity`/`verify`/
+            // `getSubjectX500Principal`/etc. for free); if the real ctor itself
+            // throws (malformed input), `make_x509_mirror` falls back to a
+            // synthetic mirror that still stashes the DER in field 3, so
+            // `getEncoded()` is never empty for a non-empty input stream.
             if let Some(ref data) = der_data {
-                if let Ok(parsed) = crypto_impl::X509Cert::parse_der(data) {
-                    let sub_str = ctx.create_string(&parsed.subject_cn);
-                    let iss_str = ctx.create_string(&parsed.issuer_cn);
-                    let cert_id = crypto_impl::cert_next_id();
-                    crypto_impl::cert_store(cert_id, parsed);
-                    ctx.set_field(cert, 0, Value::Object(Some(sub_str)));
-                    ctx.set_field(cert, 1, Value::Object(Some(iss_str)));
-                    ctx.set_field(cert, 2, Value::Long(cert_id as i64));
-                    return Ok(Some(Value::Object(Some(cert))));
-                }
+                let alias = basic_der_extract_names(data)
+                    .map(|(subject, _)| subject)
+                    .unwrap_or_else(|| "CN=Unknown".into());
+                return Ok(Some(Value::Object(Some(crate::keystore::make_x509_mirror(
+                    ctx, &alias, data,
+                )))));
             }
 
-            // Non-feature-gated basic DER/ASN.1 TLV parser for subject/issuer extraction
-            if let Some(ref data) = der_data {
-                if let Some((subject, issuer)) = basic_der_extract_names(data) {
-                    let sub_str = ctx.create_string(&subject);
-                    let iss_str = ctx.create_string(&issuer);
-                    ctx.set_field(cert, 0, Value::Object(Some(sub_str)));
-                    ctx.set_field(cert, 1, Value::Object(Some(iss_str)));
-                    ctx.set_field(cert, 2, Value::Long(0));
-                    return Ok(Some(Value::Object(Some(cert))));
-                }
-            }
-
-            // Fallback
+            // Fallback: the input stream had no readable bytes at all.
+            let cert = alloc_concurrent_synthetic(ctx, "java/security/cert/X509Certificate", 3);
             let sub = ctx.create_string("CN=Unknown");
             let iss = ctx.create_string("CN=Unknown");
             ctx.set_field(cert, 0, Value::Object(Some(sub)));
@@ -41442,16 +41443,14 @@ pub(crate) fn register_p68_security_cert(r: &mut NativeMethodRegistry) {
             let arr = ctx.new_array(cratonvm_types::ArrayElementType::Reference, 10);
             ctx.set_field(al, 0, Value::Object(Some(arr)));
 
-            // Try reading a cert from the input stream
+            // Try reading a cert from the input stream. Same DER-preservation fix
+            // as `generateCertificate` above: build a real `X509CertImpl` (falls
+            // back internally to a DER-stashing synthetic mirror) instead of a
+            // bare 3-field stub whose `getEncoded()` would come back empty.
             if let Some(Value::Object(Some(is_ref))) = args.get(1) {
                 if let Value::Object(Some(buf_ref)) = ctx.get_field(*is_ref, 0) {
                     let len = ctx.array_length(buf_ref);
                     if len > 0 {
-                        let cert = alloc_concurrent_synthetic(
-                            ctx,
-                            "java/security/cert/X509Certificate",
-                            3,
-                        );
                         let mut data = Vec::with_capacity(len);
                         for i in 0..len {
                             let b = match ctx.get_array_element(buf_ref, i) {
@@ -41460,13 +41459,10 @@ pub(crate) fn register_p68_security_cert(r: &mut NativeMethodRegistry) {
                             };
                             data.push(b);
                         }
-                        let (subject, issuer) = basic_der_extract_names(&data)
-                            .unwrap_or(("CN=Unknown".into(), "CN=Unknown".into()));
-                        let sub_str = ctx.create_string(&subject);
-                        let iss_str = ctx.create_string(&issuer);
-                        ctx.set_field(cert, 0, Value::Object(Some(sub_str)));
-                        ctx.set_field(cert, 1, Value::Object(Some(iss_str)));
-                        ctx.set_field(cert, 2, Value::Long(0));
+                        let alias = basic_der_extract_names(&data)
+                            .map(|(subject, _)| subject)
+                            .unwrap_or_else(|| "CN=Unknown".into());
+                        let cert = crate::keystore::make_x509_mirror(ctx, &alias, &data);
                         ctx.set_array_element(arr, 0, Value::Object(Some(cert)));
                         ctx.set_field(al, 1, Value::Int(1));
                         return Ok(Some(Value::Object(Some(al))));

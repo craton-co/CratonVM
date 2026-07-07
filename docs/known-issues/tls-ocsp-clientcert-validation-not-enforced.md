@@ -1,26 +1,78 @@
 # TLS/mTLS/OCSP validation doesn't reject invalid handshakes (security-relevant)
 
-**Windows platform gap found 2026-07-07 (new, separate task `task_c068bce2`):**
-all the verification below was done on Linux (Azure host). Rebuilding fresh on
-**Windows** from dev `d14d2ff3` (confirmed via `git merge-base` to include
-both `aafdaec8` and `b7390ffd`) and re-running all 8 classes in this cluster
-shows **all 8 still fail** — but not with the original fail-open symptom.
-Root cause (identical across all 8, confirmed via `.log.err`):
+**Windows `openssl_h` `Optional.or` NPE (`task_c068bce2`) — root-caused and
+FIXED 2026-07-07.** The symptom reported when this task was opened:
 ```
 INFO [...] Starting test case [test[OpenSSL-FFM with OpenSSL trust ...]]
 WARN cratonvm_vm::vm::vm_util: <clinit> failed — wrapping in ExceptionInInitializerError
   class=org/apache/tomcat/util/openssl/openssl_h$OpenSSL_version_num
   cause=java/lang/NullPointerException Cannot invoke "java.util.Optional.or(java.util.function.Supplier)"
 ```
-This fires when test parameterization reaches the "OpenSSL-FFM" connector
-variant. This doc's own "Verified test outcomes" table below already notes
-"OpenSSL/OpenSSL-FFM variants still skip — native ssl.dll/tomcat-native not
-installed, environmental, unrelated" — i.e. on Linux this variant is detected
-as unavailable and cleanly skipped. On Windows it isn't skipped: the
-`<clinit>` NPEs instead, and the resulting `ExceptionInInitializerError` kills
-the whole connector/test class rather than just that one parameterized case.
-**Not yet re-verified against this doc's claimed Linux pass counts on
-Windows** — do not assume they transfer. See `task_c068bce2`.
+**Root cause:** two competing native registrations existed for
+`java/lang/foreign/SymbolLookup`. `panama.rs::register_pe_symbol_lookup` is
+the correct implementation — it actually attempts a real library load via
+`ctx.load_native_library` and wraps results in a genuine `Optional`/
+`Optional.empty()`. But that function ran under the registry's default
+`SyntheticStub` category, which is dropped entirely under strict-no-stubs
+(the default for real-JDK mode) — so it silently never registered at all.
+The only surviving registration was a duplicate stub in
+`phases_late.rs::register_p67_foreign_memory` (category `Bridge`, never
+dropped) that unconditionally faked success (`libraryLookup` always
+allocated a "loaded" object regardless of whether any library existed) and
+`find` always returned a bare Java `null` instead of `Optional.empty()`.
+Real JDK bytecode composes lookups via `SymbolLookup.or()`, whose generated
+lambda does `this.find(name).or(() -> other.find(name))` — a `null`
+receiver there is exactly the observed NPE. Confirmed via direct tracing
+(temporary `eprintln!` instrumentation) that the `phases_late.rs` stub, not
+`panama.rs`'s real implementation, was firing.
+
+Empirically (repro via `run-tomcat-suite.ps1`, `TestClientCert`/
+`TestSecurity2017Ocsp`/`TestSSLHostConfigCipher`/`TestOcspEnabled`), this NPE
+was already being caught gracefully by
+`OpenSSLLifecycleListener.isAvailable()`'s `catch (Throwable t)` — it did
+**not** actually kill the whole test class as originally suspected; all
+parameterized sub-tests (18/116/etc.) ran to completion both before and
+after the fix. The original "all 8 classes fail/hang" framing traces to a
+stale build predating several since-merged dev commits, not to this NPE
+itself. It was still a real, worth-fixing bug: HotSpot's actual behavior for
+a missing OpenSSL library is a clean `IllegalArgumentException("Cannot open
+library: ...")` thrown directly from `SymbolLookup.libraryLookup`, not an
+NPE from a downstream `.or()` composition.
+
+**Fix:** promoted `register_pe_symbol_lookup` to the `Bridge` category (so
+it survives strict-no-stubs) and deleted the redundant/broken duplicate
+trio (`loaderLookup`/`libraryLookup`/`find`) from `phases_late.rs`. Verified
+post-fix: `openssl_h`'s `<clinit>` now fails with
+`IllegalArgumentException Cannot open library: ssl.dll` (matching real JDK
+semantics) instead of the `Optional.or` NPE, across `TestClientCert`,
+`TestSecurity2017Ocsp`, and `TestSSLHostConfigCipher`. All 61
+`native-builtins` panama:: unit tests still pass.
+
+**Separate, still-open bug blocking full Windows re-verification:**
+`KeyManagerFactory.getProvider()` throws `NoSuchMethodError:
+java/lang/String.getInfo()Ljava/lang/String;` from
+`SSLUtilBase.getKeyManagers` (`SSLUtilBase.java:351`,
+`kmf.getProvider().getInfo().contains("FIPS")`) on every **JSSE**-variant
+sub-test across every class in this cluster (100% of JSSE sub-tests fail;
+OpenSSL/OpenSSL-FFM variants are unaffected). Root cause is a field-slot
+layout collision: `tls.rs::register_key_manager_factory`'s
+`KeyManagerFactory.getInstance`/`init` are a 3-field `SyntheticStub`
+allocating the object with its own private numbering (0=algorithm index,
+1=init flag, 2=keystore-present flag), but `getProvider()` itself is not
+overridden, so it falls through to real bytecode, which reads the REAL
+class's field layout (0=factorySpi, 1=provider, 2=algorithm) — field 1
+("provider" in real layout) holds the stub's `Value::Int` init-flag instead
+of a real `Provider` object. This is cross-platform (no Windows-specific
+code path involved) and was not hit by this doc's prior Linux verification
+runs — it's either a very recent regression or was never exercised by the
+JSSE variant's specific code path before. **Not yet fixed** (tracked
+separately, task `task_0ec4b356`) — needs its own investigation (likely:
+either drop `KeyManagerFactory`'s synthetic stub entirely in favor of real
+bytecode + real Provider/SPI lookup, matching how `register_pe_symbol_lookup`
+should have worked, or give `getProvider()` its own native override
+consistent with the stub's field numbering). Until fixed, do not expect
+this doc's claimed Linux pass counts to transfer to Windows for the JSSE
+variant.
 
 **Status:** OCSP revocation checking now IMPLEMENTED and verified (branch
 `feat/ocsp-revocation-checking-20260706`, follow-up to
