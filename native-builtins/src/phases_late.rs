@@ -693,6 +693,27 @@ pub(crate) fn register_phase55_executors(r: &mut NativeMethodRegistry) {
         |ctx, args| {
             let runnable = obj_arg(args, 0)?;
             let result = ctx.invoke_virtual(runnable, "run", "()V", &[]);
+            // Phaser/ForkJoinPool hang fix (2026-07-07): a `MethodCallFailed::
+            // InternalError` means the Runnable's call stack was torn down by
+            // the VM WITHOUT ever routing through the callee's own bytecode
+            // exception table — any `try/finally` inside `run()` (e.g. a
+            // Phaser `arriveAndDeregister()` guarding a rendezvous, as in
+            // SmallRye Sisu's `BeanLoadingTaskRunner`) is skipped entirely,
+            // not just the catch. Previously this was stringified into the
+            // CF's error field and swallowed, so `runAsync` always reported
+            // eventual success to the caller even though the Runnable body
+            // silently never finished running — desyncing any external
+            // bookkeeping (like Phaser party counts) that assumed `run()`'s
+            // own cleanup always executes. Propagate InternalError out of
+            // this native method instead so the failure is visible (VM abort
+            // / caller sees the failure) rather than hidden. A genuine Java
+            // exception (`ExceptionThrown`) DID pass through the callee's
+            // exception table already (finally blocks ran), so that case is
+            // unaffected and keeps the existing eager-completion modeling.
+            if matches!(result, Err(MethodCallFailed::InternalError(_))) {
+                // Safe to unwrap: just matched Err(InternalError(_)) above.
+                return Err(result.unwrap_err());
+            }
             let mut future =
                 alloc_concurrent_synthetic(ctx, "java/util/concurrent/CompletableFuture", 3);
             // Pin across the create_string in the Err branch below — a moving
@@ -724,6 +745,14 @@ pub(crate) fn register_phase55_executors(r: &mut NativeMethodRegistry) {
             // completes with the correct (void) outcome — see the supplyAsync
             // overload above for why we do not route through executor.execute().
             let result = ctx.invoke_virtual(runnable, "run", "()V", &[]);
+            // Phaser/ForkJoinPool hang fix (2026-07-07): see the no-Executor
+            // overload above for the full rationale — an InternalError means
+            // the callee's own try/finally never ran, so we must not report
+            // success back to the caller.
+            if matches!(result, Err(MethodCallFailed::InternalError(_))) {
+                // Safe to unwrap: just matched Err(InternalError(_)) above.
+                return Err(result.unwrap_err());
+            }
             let mut future =
                 alloc_concurrent_synthetic(ctx, "java/util/concurrent/CompletableFuture", 3);
             // Pin across the create_string in the Err branch below — a moving

@@ -1625,6 +1625,224 @@ fn kf_get_algorithm(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRe
     Ok(Some(Value::Object(Some(s))))
 }
 
+/// `KeyFactory.translateKey(Key)` -- the real JDK-25 bytecode is simply
+/// `return spi.engineTranslateKey(key);` (`KeyFactory.java:475`), but our
+/// synthetic `KeyFactory` never populates the real `spi` field (see the
+/// module doc comment), so ANY caller reaching this method NPEs on
+/// `this.spi` even though every other `KeyFactory` method here already has
+/// a native override. Real providers' `engineTranslateKey` (SunRsaSign
+/// `RSAKeyFactory`, SunEC `ECKeyFactory`) special-case "key already belongs
+/// to this algorithm's own impl classes" as a pass-through, and otherwise
+/// re-derive the key from its public accessor interface
+/// (`RSAPublicKey`/`ECPrivateKey` etc.) for a foreign implementation of the
+/// SAME algorithm, or throw `InvalidKeyException` for a mismatched one.
+/// Mirror that: our `generateKeyPair`/`generatePublic`/`generatePrivate`
+/// already hand back real, provider-native key objects (`RSAPrivate/
+/// PublicKeyImpl`, `EC*Impl`, BouncyCastle's own classes, or -- for
+/// unimplemented algorithms -- our own synthetic `PublicKey`/`PrivateKey`
+/// proxies), so there is never a foreign representation left to re-derive:
+/// a same-algorithm key passes through unchanged; a mismatched one throws.
+fn kf_translate_key(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = this_arg(args)?;
+    let key = match args.get(1) {
+        Some(Value::Object(Some(o))) => *o,
+        _ => {
+            return Err(throw_jca(
+                ctx,
+                "java/security/InvalidKeyException",
+                "Key must not be null",
+            ))
+        }
+    };
+    let base = synthetic_base_offset(ctx, "java/security/KeyFactory");
+    let algo = match ctx.get_field(this, base + KF_OFF_ALGO) {
+        Value::Int(i) => i,
+        _ => -1,
+    };
+    let expected = algo_name(algo);
+    // Unindexed KeyFactory algorithm (idx == -1, e.g. DSA/DH) -- we have no
+    // basis to validate a mismatch, so pass the key through rather than
+    // risk a false InvalidKeyException.
+    if expected == "Unknown" {
+        return Ok(Some(Value::Object(Some(key))));
+    }
+    let key_algo = match ctx.invoke_virtual(key, "getAlgorithm", "()Ljava/lang/String;", &[])? {
+        Some(Value::Object(Some(s))) => ctx.read_string(s).unwrap_or_default(),
+        _ => String::new(),
+    };
+    let matches = key_algo.eq_ignore_ascii_case(expected)
+        || (algo == ALGO_EC && key_algo.eq_ignore_ascii_case("ECDSA"));
+    if !matches {
+        return Err(throw_jca(
+            ctx,
+            "java/security/InvalidKeyException",
+            &format!("Key algorithm {key_algo} does not match KeyFactory algorithm {expected}"),
+        ));
+    }
+    Ok(Some(Value::Object(Some(key))))
+}
+
+/// `KeyFactory.getKeySpec(Key, Class)` -- the same shim gap as
+/// `translateKey` above, surfacing on a sibling method: the real bytecode is
+/// `return spi.engineGetKeySpec(key, keySpec);` (`KeyFactory.java:438`), and
+/// our synthetic `KeyFactory` never populates `spi`, so this NPEs too.
+/// Confirmed via the real Elytron
+/// `SelfSignedX509CertificateAndSigningKey.Builder.build()` path (WildFly's
+/// `X509CertificateBuilder.getTBSBytes()` calls
+/// `keyFactory.getKeySpec(publicKey, X509EncodedKeySpec.class)` to grab the
+/// encoded `SubjectPublicKeyInfo`) -- still NPEs here even after
+/// `translateKey` alone is fixed. Support the KeySpec classes real
+/// SunRsaSign/SunEC `engineGetKeySpec` implementations produce:
+/// `X509EncodedKeySpec` / `PKCS8EncodedKeySpec` (from the key's own
+/// encoding -- always available, our keys are real provider-native
+/// objects), `RSAPublicKeySpec` / `RSAPrivateKeySpec` (from the key's own
+/// BigInteger accessors), and `ECPublicKeySpec` / `ECPrivateKeySpec` (from
+/// the key's own `getW()`/`getS()` + `getParams()`). Anything else throws
+/// `InvalidKeySpecException`, exactly as a real provider would for an
+/// unsupported spec class.
+fn kf_get_key_spec(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let key = match args.get(1) {
+        Some(Value::Object(Some(o))) => *o,
+        _ => return Err(throw_invalid_key_spec(ctx, "Key must not be null")),
+    };
+    let spec_class = match args.get(2) {
+        Some(Value::Object(Some(o))) => *o,
+        _ => return Err(throw_invalid_key_spec(ctx, "keySpec class must not be null")),
+    };
+    let spec_class_name = match ctx.invoke_virtual(spec_class, "getName", "()Ljava/lang/String;", &[])? {
+        Some(Value::Object(Some(s))) => ctx.read_string(s).unwrap_or_default(),
+        _ => String::new(),
+    };
+    match spec_class_name.as_str() {
+        "java.security.spec.X509EncodedKeySpec" => {
+            let der = match ctx.invoke_virtual(key, "getEncoded", "()[B", &[])? {
+                Some(Value::Object(Some(arr))) => read_byte_array(ctx, arr),
+                _ => return Err(throw_invalid_key_spec(ctx, "Key has no X.509 encoding")),
+            };
+            let arr = alloc_byte_array(ctx, &der);
+            ctx.new_object_initialized(
+                "java/security/spec/X509EncodedKeySpec",
+                "([B)V",
+                &[Value::Object(Some(arr))],
+            )
+        }
+        "java.security.spec.PKCS8EncodedKeySpec" => {
+            let der = match ctx.invoke_virtual(key, "getEncoded", "()[B", &[])? {
+                Some(Value::Object(Some(arr))) => read_byte_array(ctx, arr),
+                _ => return Err(throw_invalid_key_spec(ctx, "Key has no PKCS#8 encoding")),
+            };
+            let arr = alloc_byte_array(ctx, &der);
+            ctx.new_object_initialized(
+                "java/security/spec/PKCS8EncodedKeySpec",
+                "([B)V",
+                &[Value::Object(Some(arr))],
+            )
+        }
+        "java.security.spec.RSAPublicKeySpec" => {
+            let n = read_biginteger_magnitude(ctx, key, "getModulus");
+            let e = read_biginteger_magnitude(ctx, key, "getPublicExponent");
+            if n.is_empty() || e.is_empty() {
+                return Err(throw_invalid_key_spec(ctx, "Key is not an RSA public key"));
+            }
+            let n_bi = build_positive_biginteger(ctx, &n)?;
+            let pin = ctx.pin_native_root(n_bi);
+            let result = (|| {
+                let e_bi = build_positive_biginteger(ctx, &e)?;
+                let n_bi = ctx.read_native_pin(pin, n_bi);
+                ctx.new_object_initialized(
+                    "java/security/spec/RSAPublicKeySpec",
+                    "(Ljava/math/BigInteger;Ljava/math/BigInteger;)V",
+                    &[Value::Object(Some(n_bi)), Value::Object(Some(e_bi))],
+                )
+            })();
+            ctx.unpin_native_roots(pin);
+            result
+        }
+        "java.security.spec.RSAPrivateKeySpec" => {
+            let n = read_biginteger_magnitude(ctx, key, "getModulus");
+            let d = read_biginteger_magnitude(ctx, key, "getPrivateExponent");
+            if n.is_empty() || d.is_empty() {
+                return Err(throw_invalid_key_spec(ctx, "Key is not an RSA private key"));
+            }
+            let n_bi = build_positive_biginteger(ctx, &n)?;
+            let pin = ctx.pin_native_root(n_bi);
+            let result = (|| {
+                let d_bi = build_positive_biginteger(ctx, &d)?;
+                let n_bi = ctx.read_native_pin(pin, n_bi);
+                ctx.new_object_initialized(
+                    "java/security/spec/RSAPrivateKeySpec",
+                    "(Ljava/math/BigInteger;Ljava/math/BigInteger;)V",
+                    &[Value::Object(Some(n_bi)), Value::Object(Some(d_bi))],
+                )
+            })();
+            ctx.unpin_native_roots(pin);
+            result
+        }
+        "java.security.spec.ECPublicKeySpec" => {
+            let pin_key = ctx.pin_native_root(key);
+            let result = (|| {
+                let key_r = ctx.read_native_pin(pin_key, key);
+                let w = match ctx.invoke_virtual(key_r, "getW", "()Ljava/security/spec/ECPoint;", &[])? {
+                    Some(Value::Object(Some(o))) => o,
+                    _ => return Err(throw_invalid_key_spec(ctx, "Key is not an EC public key")),
+                };
+                let pin_w = ctx.pin_native_root(w);
+                let key_r = ctx.read_native_pin(pin_key, key);
+                let params = match ctx.invoke_virtual(
+                    key_r,
+                    "getParams",
+                    "()Ljava/security/spec/ECParameterSpec;",
+                    &[],
+                )? {
+                    Some(Value::Object(Some(o))) => o,
+                    _ => return Err(throw_invalid_key_spec(ctx, "Key is not an EC key")),
+                };
+                let w = ctx.read_native_pin(pin_w, w);
+                ctx.new_object_initialized(
+                    "java/security/spec/ECPublicKeySpec",
+                    "(Ljava/security/spec/ECPoint;Ljava/security/spec/ECParameterSpec;)V",
+                    &[Value::Object(Some(w)), Value::Object(Some(params))],
+                )
+            })();
+            ctx.unpin_native_roots(pin_key);
+            result
+        }
+        "java.security.spec.ECPrivateKeySpec" => {
+            let pin_key = ctx.pin_native_root(key);
+            let result = (|| {
+                let key_r = ctx.read_native_pin(pin_key, key);
+                let s = match ctx.invoke_virtual(key_r, "getS", "()Ljava/math/BigInteger;", &[])? {
+                    Some(Value::Object(Some(o))) => o,
+                    _ => return Err(throw_invalid_key_spec(ctx, "Key is not an EC private key")),
+                };
+                let pin_s = ctx.pin_native_root(s);
+                let key_r = ctx.read_native_pin(pin_key, key);
+                let params = match ctx.invoke_virtual(
+                    key_r,
+                    "getParams",
+                    "()Ljava/security/spec/ECParameterSpec;",
+                    &[],
+                )? {
+                    Some(Value::Object(Some(o))) => o,
+                    _ => return Err(throw_invalid_key_spec(ctx, "Key is not an EC key")),
+                };
+                let s = ctx.read_native_pin(pin_s, s);
+                ctx.new_object_initialized(
+                    "java/security/spec/ECPrivateKeySpec",
+                    "(Ljava/math/BigInteger;Ljava/security/spec/ECParameterSpec;)V",
+                    &[Value::Object(Some(s)), Value::Object(Some(params))],
+                )
+            })();
+            ctx.unpin_native_roots(pin_key);
+            result
+        }
+        _ => Err(throw_invalid_key_spec(
+            ctx,
+            &format!("Unsupported key spec: {spec_class_name}"),
+        )),
+    }
+}
+
 // ---------------------------------------------------------------------------
 // KeyPair / Key accessors
 // ---------------------------------------------------------------------------
@@ -1801,6 +2019,18 @@ pub fn register(r: &mut NativeMethodRegistry) {
         kf_generate_private,
     );
     r.register(kf, "getAlgorithm", "()Ljava/lang/String;", kf_get_algorithm);
+    r.register(
+        kf,
+        "translateKey",
+        "(Ljava/security/Key;)Ljava/security/Key;",
+        kf_translate_key,
+    );
+    r.register(
+        kf,
+        "getKeySpec",
+        "(Ljava/security/Key;Ljava/lang/Class;)Ljava/security/spec/KeySpec;",
+        kf_get_key_spec,
+    );
     r.register(kf, "<clinit>", "()V", clinit_noop);
 
     let kp = "java/security/KeyPair";

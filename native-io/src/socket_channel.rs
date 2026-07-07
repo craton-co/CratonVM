@@ -1685,6 +1685,75 @@ fn box_socket_option(ctx: &mut dyn NativeContext, opt_name: &str, raw: i32) -> M
     }
 }
 
+/// Resolve `java.net.StandardSocketOptions.<FIELD>`'s static value (a real
+/// `SocketOption<?>` singleton instance), or `None` if the field can't be
+/// resolved (defensive — should not happen for a real boot class).
+fn standard_socket_option(ctx: &mut dyn NativeContext, field_name: &str) -> Option<Value> {
+    let cid = ctx
+        .ensure_class_initialized("java/net/StandardSocketOptions")
+        .ok()?;
+    let idx = ctx.static_field_index_by_name(cid, field_name)?;
+    Some(ctx.get_static_field(cid, idx))
+}
+
+/// `{Socket,ServerSocket}Channel.supportedOptions()` — must return a real,
+/// non-null `Set<SocketOption<?>>`. Without a native override, dispatch falls
+/// through to the abstract `NetworkChannel.supportedOptions()` declaration
+/// (no Code attribute), throwing `AbstractMethodError`. That's an `Error`,
+/// not an `Exception`, so a caller that only `catch (IOException |
+/// RuntimeException)` around it — e.g. Apache HttpClient5's
+/// `SingleCoreIOReactor.prepareSocket`, which checks
+/// `channel.supportedOptions().contains(TCP_NODELAY)` before setting it —
+/// does NOT catch it: the `AbstractMethodError` propagates uncaught out of
+/// the calling thread, silently killing it. See
+/// docs/known-issues/spring-web-flow-outputstreamwriter-close-corruption.md
+/// root cause #3 — this silently killed HttpClient5's I/O reactor worker
+/// thread mid-connection-setup, before it ever reached `SocketChannel
+/// .connect()`, hanging every request through
+/// `HttpComponentsClientHttpConnector` forever with no visible exception
+/// anywhere (an uncaught `Error` on a bare `Thread` with no
+/// `UncaughtExceptionHandler` just terminates that thread silently).
+///
+/// Advertise the options this shim actually recognizes in `apply_option`/
+/// `read_option` above: `TCP_NODELAY` (genuinely wired to
+/// `TcpStream::set_nodelay`), plus `SO_KEEPALIVE`/`SO_REUSEADDR`/
+/// `SO_RCVBUF`/`SO_SNDBUF`/`SO_LINGER` (accepted no-ops — `std::net
+/// ::TcpStream` exposes no setter for the latter three without the
+/// `socket2` crate). Listing a no-op option here changes nothing behaviorally
+/// (callers that skip a `setOption` call when it's unlisted would otherwise
+/// just silently skip it instead of silently no-op-ing it) — the real fix
+/// is simply that this method must never throw.
+fn supported_socket_options(ctx: &mut dyn NativeContext) -> MethodCallResult {
+    let names = [
+        "SO_RCVBUF",
+        "SO_SNDBUF",
+        "SO_KEEPALIVE",
+        "SO_REUSEADDR",
+        "SO_LINGER",
+        "TCP_NODELAY",
+    ];
+    let mut values = Vec::with_capacity(names.len());
+    for name in names {
+        if let Some(v) = standard_socket_option(ctx, name) {
+            values.push(v);
+        }
+    }
+    let arr = ctx.new_ref_array(cratonvm_types::ClassId::new(0), values.len());
+    for (i, v) in values.into_iter().enumerate() {
+        ctx.set_array_element(arr, i, v);
+    }
+    ctx.invoke(
+        "java/util/Set",
+        "of",
+        "([Ljava/lang/Object;)Ljava/util/Set;",
+        &[Value::Object(Some(arr))],
+    )
+}
+
+fn sc_supported_options(ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
+    supported_socket_options(ctx)
+}
+
 // ---------------------------------------------------------------------------
 // ServerSocketChannel — open / bind / accept / close
 // ---------------------------------------------------------------------------
@@ -2000,6 +2069,7 @@ pub fn register_socket_channel_real(r: &mut NativeMethodRegistry) {
             "(Ljava/net/SocketOption;)Ljava/lang/Object;",
             sc_get_option,
         );
+        r.register(c, "supportedOptions", "()Ljava/util/Set;", sc_supported_options);
     }
 
     // -- ServerSocketChannel factory + lifecycle --
@@ -2078,6 +2148,7 @@ pub fn register_socket_channel_real(r: &mut NativeMethodRegistry) {
             "(Ljava/net/SocketOption;)Ljava/lang/Object;",
             sc_get_option,
         );
+        r.register(c, "supportedOptions", "()Ljava/util/Set;", sc_supported_options);
         r.register(
             c,
             "getLocalAddress",
