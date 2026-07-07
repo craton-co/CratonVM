@@ -118,16 +118,36 @@ permanently unfixable). **Do not expect Windows counts to match this doc's
 Linux baseline** — residual #2 and the DHE case are real, independent,
 already-tracked gaps, not artifacts of either fix on this page.
 
-**Also found while investigating (pre-existing, unrelated, flagged
-separately as `task_2b28e7bc`, NOT fixed here):**
-`tls::tls_tests::nb_tls_tmf_get_trust_managers_propagates_keystore_id`
-(`native-builtins/src/tls.rs`) fails on dev's current tip — confirmed via
-`git stash` that it fails identically before either fix on this page, so
-it's not a regression from this session. `TrustManagerFactory.
-getTrustManagers()` returns a trust manager carrying keystore id `1`
-instead of the id `7` the test's simulated `init(KeyStore)` bound —
-possibly a real correctness bug in trust-manager id propagation, not just a
-stale test expectation; needs its own investigation.
+**`nb_tls_tmf_get_trust_managers_propagates_keystore_id` — root-caused and
+FIXED 2026-07-07 (`task_2b28e7bc`): stale test, not a production bug.**
+Confirmed via `git stash` that this test failed identically before either
+fix on this page, so it wasn't a regression from this session — but it also
+wasn't a real correctness bug in `TrustManagerFactory`. The test (added by
+an earlier `nb-tls-tmf` commit) asserted that `getTrustManagers()`'s
+returned `X509TrustManager` carries the *raw keystore registry id* `init()`
+bound (slot 0 == 7, the test's simulated bound id). A **later**, deliberate
+fix (`FIX (tls-residuals)`, see `tls.rs::register_trust_manager_factory`'s
+`getTrustManagers()` and `x509_manager.rs`'s `register_trust_manager_state`/
+`trust_manager_state_by_id` doc comments) intentionally changed that
+contract: stamping the raw keystore id directly caused
+`validate_cert_chain` to misresolve it against a numerically-coincident but
+unrelated `tm_registry` entry from a different `TrustManagerFactory` SPI
+path (both id counters start at 1 and increment independently). The fix
+instead builds a `TrustManagerState` from the bound keystore id and
+registers *that state* through `register_trust_manager_state`, stamping the
+resulting `tm_registry`-scoped id (which starts at 1 in a fresh process —
+exactly the `Int(1)` the test was seeing instead of `Int(7)`). The test was
+simply never updated to match this intentional, well-documented behavior
+change.
+
+**Fix:** rewrote the test's final assertion to check the *actual* invariant
+that matters — that resolving the stamped id via
+`x509_manager::trust_manager_state_by_id` yields a `TrustManagerState` whose
+own `keystore_id` field equals the bound id (7), i.e. the indirection
+resolves correctly — rather than asserting raw numeric equality with the
+bound id. No production code changed. Verified: the test now passes; the
+full `tls::` suite (80 tests) and `x509_manager::` suite (48 tests) both
+pass with no regressions.
 
 **Status:** OCSP revocation checking now IMPLEMENTED and verified (branch
 `feat/ocsp-revocation-checking-20260706`, follow-up to
