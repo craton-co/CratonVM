@@ -4599,7 +4599,18 @@ fn engine_begin(state: &mut EngineState) -> Result<(), String> {
                     // `SSLParameters.setNeedClientAuth(true)`-upfront repro
                     // this doc's residual #2 verified directly — still wins and
                     // still enforces REQUIRED semantics exactly as before).
-                    let speculative_optional_auth = !state.need_client_auth
+                    // TEMP-DISABLED for A/B testing (tomcat-clientauth-engine-config):
+                    // this speculative request broke TestClientCert's explicit
+                    // `assertEquals(0, count)` check for the unprotected-resource
+                    // request (the suite deliberately verifies NO cert is requested
+                    // until a protected resource needs one) — testClientCertPostLarger
+                    // regressed from pass to fail. Disabled here to verify whether
+                    // TestCustomSslTrustManager's 2/9->1/9 improvement survives
+                    // without it (expected: yes, since that improvement traces to the
+                    // separate KeyManagerFactory/TrustManagerFactory AbstractMethodError
+                    // fixes, not this speculative-auth mechanism).
+                    let speculative_optional_auth = false
+                        && !state.need_client_auth
                         && !state.want_client_auth
                         && state
                             .trust_roots_override
