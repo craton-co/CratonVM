@@ -164,7 +164,30 @@ pub fn weakref_null_referents_pre_gc(shared: &SharedVm) {
     // gc_quiescence::is_watched_referent). Unconditional — even an empty
     // list must be published so a previous cycle's entries can never leak
     // into this one.
-    let watch_addrs: Vec<usize> = pairs.iter().map(|&(_, referent)| referent).collect();
+    //
+    // Young-GC live-reclaim ROOT FIX (2026-07-07, RRWL/ThreadLocalMap$Entry
+    // IMSE/hang family): watch the REFERENCE OBJECTS' own addresses too, not
+    // just their referents. The post-GC restore pass and `remove_collected`
+    // judge survival by `pointer_map.contains_key(addr) || is_addr_live(addr)`,
+    // and for the Generational heap `is_addr_live` is old-gen-only — so after
+    // a NON-MOVING young sweep (which produces NO pointer_map entries for
+    // kept-in-place survivors) a live YOUNG Reference object was judged dead:
+    // its pre-GC-nulled referent slot was never restored and its processor
+    // entry was pruned. A live young `ThreadLocalMap$Entry` (a WeakReference)
+    // then answered `refersTo(null) == true`, so the mutator itself expunged
+    // the live entry — losing the RRWL `readHolds` hold counter (the
+    // `IllegalMonitorStateException: attempt to unlock read lock` /
+    // permanent all-parked hang in `RwlReadTearingProbe` and Elasticsearch
+    // `LongRandomBinaryDocValuesRangeQueryTests.testAllEqual`), and losing
+    // WeakHashMap entries generally (the RandomizedContext residual). The
+    // watched set already flows into identity `pointer_map` entries for every
+    // kept-in-place survivor the sweep retains (side-marked or header-marked),
+    // which is exactly the survival proof the restore pass needs — the
+    // referent half of this fix simply never covered the reference objects.
+    let watch_addrs: Vec<usize> = pairs
+        .iter()
+        .flat_map(|&(ref_obj, referent)| [ref_obj, referent])
+        .collect();
     if std::env::var_os("CRATONVM_DBG_WATCHREF").is_some() {
         eprintln!(
             "[watchref] publishing {} watched referent(s): {:x?}",
@@ -29391,6 +29414,47 @@ fn double_to_long(v: f64) -> i64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Young-GC live-reclaim ROOT FIX regression (RRWL/ThreadLocalMap$Entry
+    /// IMSE/hang family, 2026-07-07): the pre-GC watch publication must
+    /// include the REFERENCE OBJECTS' own addresses, not just their
+    /// referents. The non-moving young sweep only records identity
+    /// `pointer_map` entries for WATCHED kept-in-place survivors, and the
+    /// post-GC restore pass judges a Reference object's survival by
+    /// `pointer_map ∪ is_addr_live` — so an unwatched live YOUNG Reference
+    /// object was judged dead: its nulled referent was never restored and
+    /// the mutator then expunged the live entry (`refersTo(null) == true`),
+    /// losing RRWL read-lock hold counters and WeakHashMap entries.
+    #[test]
+    fn weakref_pre_gc_watch_includes_reference_objects() {
+        let shared = std::sync::Arc::new(crate::vm::SharedVm::new(
+            crate::config::VmConfig::default(),
+        ));
+        let referent = shared.heap.alloc_object(ClassId::new(0), 1);
+        let weak_ref = shared.heap.alloc_object(ClassId::new(0), 2);
+        shared.ref_processor.lock().discover_reference(
+            cratonvm_gc::reference::ReferenceType::Weak,
+            weak_ref.as_ptr() as usize,
+            referent.as_ptr() as usize,
+            None,
+        );
+
+        weakref_null_referents_pre_gc(&shared);
+
+        assert!(
+            cratonvm_gc::gc_quiescence::is_watched_referent(referent.as_ptr() as usize),
+            "referent address must be watched (pre-existing behaviour)"
+        );
+        assert!(
+            cratonvm_gc::gc_quiescence::is_watched_referent(weak_ref.as_ptr() as usize),
+            "the Reference OBJECT's own address must be watched, so a \
+             kept-in-place young Reference survivor gets an identity \
+             pointer_map entry and its nulled referent is restored post-GC"
+        );
+
+        // Clean up the process-global watch list for other tests.
+        cratonvm_gc::gc_quiescence::set_watched_referents(&[]);
+    }
 
     #[test]
     fn jit_native_shadow_invoke_index_covers_all_method_invokes() {

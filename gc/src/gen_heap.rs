@@ -2533,6 +2533,48 @@ impl GenerationalHeap {
         self.old_gen.lock().contains(addr as *const u8)
     }
 
+    /// True when `addr` is the start of a young from-space object that
+    /// SURVIVED the collection that just ran (young-GC live-reclaim ROOT FIX,
+    /// 2026-07-07 — RRWL/ThreadLocalMap$Entry IMSE/hang family).
+    ///
+    /// The NON-MOVING young sweep keeps survivors in place with NO
+    /// `pointer_map` entry, so post-GC reference processing's survivor
+    /// predicate (`pointer_map.contains_key(addr) || is_addr_live(addr)`)
+    /// judged every live young Reference object and referent dead: nulled
+    /// referents were never restored and live processor entries were pruned.
+    /// The watched-referent identity-map mechanism covers survivors the
+    /// sweep's disposition walk actually visits, but a desync-retained
+    /// stretch (walk re-anchor) leaves its survivors without entries — this
+    /// predicate closes that gap at the consumer side.
+    ///
+    /// Discriminator: the sweep ZEROES every span it reclaims before
+    /// publishing it to the free list, so inside the current from-space
+    /// "first header word non-zero" == "not reclaimed by the sweep that just
+    /// ran". This is only sound where it is used — between `collect_garbage`
+    /// returning and mutators resuming (the same STW window in which
+    /// `process_references_after_gc` runs), when no allocation can have
+    /// reused a reclaimed hole yet. After a MOVING collection, pre-GC
+    /// addresses lie in the *other* semispace (survivors were evacuated and
+    /// the arenas swapped), so this returns false for them and the
+    /// pointer-map half of the predicate remains authoritative, exactly as
+    /// before. A dead-but-retained object in a desync-skipped stretch reads
+    /// as "live" for one cycle — pure over-retention, the sweep's documented
+    /// safe direction.
+    pub fn is_live_young_survivor(&self, addr: usize) -> bool {
+        if addr & 0x7 != 0 {
+            return false;
+        }
+        let from = self.young_from.lock();
+        let base = from.base_ptr() as usize;
+        if addr < base || addr >= base + from.used() {
+            return false;
+        }
+        // SAFETY: bounds-checked 8-aligned address inside the mapped
+        // from-space region; reading one u64 is valid.
+        let word0 = unsafe { std::ptr::read(addr as *const u64) };
+        word0 != 0
+    }
+
     /// Access the old generation directly (for concurrent sweep).
     /// Returns a lock guard.
     pub fn old_gen_lock(&self) -> parking_lot::MutexGuard<'_, OldGen> {
