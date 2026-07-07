@@ -40,9 +40,24 @@ angles**; this index is the consolidated map. Read it first.
 - [Constructor-parameter-annotation offset fix + 3 residuals](test-context-constructor-param-annotation-offset.md) — core fix: `Constructor.getParameterAnnotations()`'s native override didn't account for a synthetic leading parameter (non-static inner-class constructors' implicit outer-instance arg), causing an AIOOBE that crashed 13 of 25 CV-unique classes across the six packages (7 directly + cascading ABEND in 6 more sharing a batch). 3 residuals open: Groovy TestContext script loading (isPresent stub blocks it; removing the stub exposes a separate ANTLR/jarjar class-layout bug — not fixed), `InheritableThreadLocal` not propagated through `Thread(ThreadGroup, Runnable, String[, long])` constructors (breaks `Executors`-backed pools generally, not just these tests), and one JUnit5-parallel-execution TIMEOUT not yet triaged.
 
 
-## 2026-07-04 http.server bug cluster (branch fix/http-server-cluster)
+## 2026-07-04 -> 2026-07-06 http.server bug cluster (RETIRED, split up)
 
-- [http.server cluster: fixes + residuals](http-server-cluster-residuals.md) - core fix: `Collections.emptyListIterator()` mis-stamped as `EmptyIterator` crashed Jetty's `ContextHandler.notifyExitScope` on the main thread (fatal, not per-test) — fixed 8 of 9 ABEND classes. Plus `newSetFromMap(LinkedCaseInsensitiveMap)` losing case-insensitivity (+ a `SetFromMap.size()` follow-on regression), `java.net.URI` malformed-`%`-escape validation + multi-arg query quoting, and `URLDecoder`/`URLEncoder` ignoring non-UTF-8 charsets. 2 residuals open: `ServerHttpsRequestIntegrationTests` self-signed-cert `CertificateEncodingException`, `ZeroCopyIntegrationTests` Jetty-Core zero-copy write-0-bytes.
+Iterated across several sessions (branches `fix/http-server-cluster`,
+`fix/httpserver-pkcs12-20260706`, `fix/httpserver-certfactory-20260706`,
+`fix/httpserver-zerocopy-bytebuddy-race-0706b`). 10 of 12 target classes
+fully fixed (`Collections.emptyListIterator()` mis-stamp crashing Jetty's
+main thread; `newSetFromMap(LinkedCaseInsensitiveMap)` losing
+case-insensitivity; `java.net.URI`/`URLDecoder`/`URLEncoder` gaps;
+`Provider.putService` + per-instance `containsKey`; `CertificateFactory`
+real-SPI delegation; PKCS12/PBE empty-password guard; real-JDK-mode TLS
+native reachability). `ZeroCopyIntegrationTests`'s flakiness is now
+**FIXED** (an ABBA `class_manager`/`vtable_manager` lock-order deadlock,
+the same bug independently found in the http.client cluster below). Full
+fix writeup moved to
+[`docs/internal/fixed-suite-bugs/http-server-cluster-residuals-fixes-FIXED.md`](../internal/fixed-suite-bugs/http-server-cluster-residuals-fixes-FIXED.md).
+One residual remains genuinely open:
+
+- [http-server-sslengine-identity-singleton-clobber.md](http-server-sslengine-identity-singleton-clobber.md) — `ServerHttpsRequestIntegrationTests`'s "TLS handshake failed: unexpected EOF". A prior `do_wrap`/`do_unwrap` SSLEngineResult-semantics hypothesis is REFUTED; the real cause is `engine_begin()` failing to parse a private key because a process-wide `RUNTIME_TLS_IDENTITY` singleton gets clobbered by a second, malformed `setKeyEntry` call before the handshake starts.
 
 ## 2026-07-04 Keycloak full-suite sweep (branch test/keycloak-fullsuite-20260704)
 
@@ -96,9 +111,31 @@ the same way). 25 additional CRASHes (`scim/core`, `ssf/*`,
 classpath gap (missing `junit:junit`, fixed alongside the JUnit Platform
 launcher fix above), not a VM bug.
 
-## 2026-07-03 http.client bug cluster (branch fix/http-client-cluster-azure)
+## 2026-07-03 -> 2026-07-06 http.client bug cluster (RETIRED, split up)
 
-- [http.client cluster: redefine-dispatch fix + JDK 21 gaps](http-client-cluster-redefine-dispatch-and-jdk21-gaps.md) - core fix: two of three "native shadow" dispatch paths never checked whether an ANCESTOR class (not just the receiver) was JVMTI-redefined, so Mockito-mocked concrete classes (e.g. `HttpURLConnection`) silently bypassed their own advice. Plus several JDK 21 real-mode native gaps (`JavaLangAccess.defineClass`/`getConstantPool`/`start`, `StackWalker.callStackWalk` overload). 4 residuals documented (Linux-only NIO gaps, a 4-class hang, one order-dependent Mockito state leak, pre-existing `SimpleClientHttpRequestFactoryTests` gaps).
+Iterated across several sessions (branches `fix/http-client-cluster-azure`,
+`fix/httpclient-residuals-20260706`,
+`fix/httpclient-vtable-classmanager-abba-deadlock-0706c`,
+`fix/httpclient-bytebuddy-mh-dispatch-0706b`,
+`fix/httpclient-jdkclient-hangs-0706b`). Core fix: two of three "native
+shadow" dispatch paths never checked whether an ANCESTOR class (not just
+the receiver) was JVMTI-redefined, so Mockito-mocked concrete classes
+(e.g. `HttpURLConnection`) silently bypassed their own advice. Plus
+several JDK 21 real-mode native gaps, a `HashMap`/`HashSet` chain-walk
+guard gap, and an ABBA `class_manager`/`vtable_manager` lock-order
+deadlock (cut `HttpComponentsClientHttpRequestFactoryTests`'s teardown
+hang rate from 65% to 25%). Full fix writeup moved to
+[`docs/internal/fixed-suite-bugs/http-client-cluster-redefine-dispatch-fixes-FIXED.md`](../internal/fixed-suite-bugs/http-client-cluster-redefine-dispatch-fixes-FIXED.md).
+Residuals split into their own focused docs:
+
+- [class-manager-rwlock-writer-starvation.md](class-manager-rwlock-writer-starvation.md) — the residual 25% hang rate above; `parking_lot::RwLock`'s non-fair mode lets readers starve a queued writer.
+- [http-client-simpleclienthttpresponsetests-mockito-dispatch-bugs.md](http-client-simpleclienthttpresponsetests-mockito-dispatch-bugs.md) — `SimpleClientHttpResponseTests`'s `UnfinishedVerificationException` (order-dependent) + an intermittent `(class, method, descriptor)`-substituting `NoSuchMethodError`; several hypotheses refuted, root cause still open.
+- [spring-web-flow-outputstreamwriter-close-corruption.md](spring-web-flow-outputstreamwriter-close-corruption.md) — 2 of 4 "genuine hang" classes root-caused to `StreamEncoder.closed` being `true` immediately from `OutputStreamWriter` construction (mechanism itself still unexplained); other 2 need separate investigation.
+- [http-client-reactor-windows-timeout-linux-epoll-gap.md](http-client-reactor-windows-timeout-linux-epoll-gap.md) — `ReactorClientHttpRequestFactoryTests`: a documented Linux-only `EPollSelectorImpl` gap (not a bug) plus an uninvestigated Windows-side TIMEOUT.
+
+`SimpleClientHttpRequestFactoryTests`'s residual failures are pre-existing,
+out-of-scope synthetic-`HttpURLConnection` gaps unrelated to this cluster
+(memory `huc-setdooutput-wrong-slot-drops-post-body`) — not re-documented.
 
 ## 2026-07-04 jmx cluster (branch fix/jmx-rmi-cluster)
 
