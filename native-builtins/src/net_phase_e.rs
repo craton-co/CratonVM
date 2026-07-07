@@ -3876,7 +3876,16 @@ fn http_build_request(
 /// complete 38-byte `Content-Length`-framed response and went straight back
 /// to `recv()` waiting for the next keep-alive request, while this client
 /// kept `recv()`-ing for a close that was never coming.
-fn http_read_response<R: Read>(mut r: R) -> std::io::Result<HttpResponse> {
+///
+/// `head_response` must be `true` when the request that elicited this
+/// response was a HEAD: RFC 9110 §9.3.2 entitles a HEAD response to carry
+/// the same framing headers (`Content-Length`/`Transfer-Encoding`) the
+/// corresponding GET would have, while sending NO body bytes at all --
+/// waiting for the declared `Content-Length` blocks on data the server will
+/// never send until the socket's `SO_RCVTIMEO` fires (`IOException:
+/// Resource temporarily unavailable (os error 11)`,
+/// `JdkClientHttpRequestFactoryTests.gzipCompressionWithHeadRequest`).
+fn http_read_response<R: Read>(mut r: R, head_response: bool) -> std::io::Result<HttpResponse> {
     let mut all = Vec::with_capacity(8192);
     let mut buf = [0u8; 4096];
 
@@ -3933,8 +3942,9 @@ fn http_read_response<R: Read>(mut r: R) -> std::io::Result<HttpResponse> {
     // Phase 2: read the body per the declared framing, stopping as soon as
     // it's complete.
     let body_start = sep + 4;
-    // 1xx/204/304 never carry a body regardless of the framing headers.
-    let no_body = matches!(status, 100..=199 | 204 | 304);
+    // 1xx/204/304 never carry a body regardless of the framing headers, and
+    // neither does any response to a HEAD request.
+    let no_body = head_response || matches!(status, 100..=199 | 204 | 304);
 
     let body = if no_body {
         Vec::new()
@@ -4058,7 +4068,7 @@ fn http_exchange_plain(
     let req = http_build_request(method, host, port, path, headers, body, 80);
     stream.write_all(&req)?;
     stream.flush()?;
-    http_read_response(stream)
+    http_read_response(stream, method.eq_ignore_ascii_case("HEAD"))
 }
 
 fn http_exchange_tls(
@@ -4081,7 +4091,7 @@ fn http_exchange_tls(
     let req = http_build_request(method, host, port, path, headers, body, 443);
     tls.write_all(&req)?;
     tls.flush()?;
-    http_read_response(tls)
+    http_read_response(tls, method.eq_ignore_ascii_case("HEAD"))
 }
 
 fn huc_extract_req_headers(ctx: &dyn NativeContext, hdrs: Value) -> Vec<(String, String)> {
@@ -5913,7 +5923,32 @@ const RE5_RESP_STATUS: usize = 0; // Int
 const RE5_RESP_BODY_BYTES: usize = 1; // byte[]
 const RE5_RESP_HEADERS: usize = 2; // String[] of "key: value"
 const RE5_RESP_HANDLER_TAG: usize = 3; // String: how body() materialises
-const RE5_RESP_NUM_FIELDS: usize = 4;
+const RE5_RESP_BODY_OBJ: usize = 4; // Object: the RE5_TAG_HANDLED body value
+const RE5_RESP_NUM_FIELDS: usize = 5;
+
+/// `RE5_RESP_HANDLER_TAG` value meaning "the body was produced by driving a
+/// real user-supplied BodyHandler; `body()` returns `RE5_RESP_BODY_OBJ`".
+const RE5_TAG_HANDLED: &str = "handled";
+
+// Synthetic `java/net/http/HttpResponse$ResponseInfo` handed to a real
+// BodyHandler's `apply` (see `re5_drive_body_handler`).
+const RE5_RESPONSE_INFO: &str = "java/net/http/HttpResponse$ResponseInfo";
+const RE5_RI_STATUS: usize = 0; // Int
+const RE5_RI_HEADERS: usize = 1; // String[] of "key: value"
+const RE5_RI_NUM_FIELDS: usize = 2;
+
+// One-shot replay `Flow.Subscription` handed to a real BodySubscriber (see
+// `re5_drive_body_handler`). Registered on its own wrapper class name -- NOT
+// on `java/util/concurrent/Flow$Subscription` itself, whose `request`/
+// `cancel` natives are already owned by the synthetic-Flow demand counters
+// in `streams.rs`/`phases_late.rs` with an incompatible field layout.
+// Abstract interface dispatch finds receiver-class natives (the
+// `Enumeration$Impl` wrapper pattern, vm_exec C25).
+const RE5_REPLAY_SUBSCRIPTION: &str = "cratonvm/net/HttpBodyReplaySubscription";
+const RE5_SUB_SUBSCRIBER: usize = 0; // Flow.Subscriber the body is delivered to
+const RE5_SUB_BODY: usize = 1; // byte[] wire body (null = empty body)
+const RE5_SUB_STATE: usize = 2; // Int: 0 = pending, 1 = delivered, 2 = cancelled
+const RE5_SUB_NUM_FIELDS: usize = 3;
 
 /// Read a `byte[]` heap object into a `Vec<u8>` (high byte ignored).
 fn re5_read_byte_array(ctx: &dyn NativeContext, arr: ObjectRef) -> Vec<u8> {
@@ -5939,24 +5974,39 @@ fn re5_read_byte_array_range(
     out
 }
 
-/// Determine how `HttpResponse.body()` should materialise from the BodyHandler
-/// passed to `send`/`sendAsync`. Our synthetic `BodyHandlers` factories stash a
-/// tag string in slot 0 ("string" / "inputstream" / "bytearray" /
-/// "discarding"); any other handler (e.g. Spring's `DecompressingBodyHandler`,
-/// which wraps `ofInputStream`) defaults to an InputStream body — the shape the
-/// JDK-`HttpClient` `ClientHttpRequest` path consumes.
-fn re5_handler_tag(ctx: &dyn NativeContext, handler: Option<Value>) -> String {
+/// Classify the BodyHandler passed to `send`/`sendAsync`.
+///
+/// Our synthetic `BodyHandlers` factories stash a tag string in slot 0
+/// ("string" / "inputstream" / "bytearray" / "discarding") — those (and a
+/// missing/null handler, which degrades to an InputStream body) return
+/// `Some(tag)`, and `HttpResponse.body()` materialises the raw wire bytes
+/// per the tag.
+///
+/// Any OTHER object is a real user-supplied `BodyHandler` implementation —
+/// e.g. Spring's `JdkClientHttpRequest$DecompressingBodyHandler` (wraps
+/// `ofInputStream` in a GZIP/Inflater stream) or the `BodyHandlers
+/// .ofPublisher()` lambda (reactive `JdkClientHttpConnector`) — and returns
+/// `None`: the caller must drive the real BodyHandler protocol via
+/// [`re5_drive_body_handler`]. The pre-fix version silently defaulted these
+/// to a raw InputStream, skipping the user's body transformation entirely
+/// (gzip/deflate response bodies reached Spring still compressed —
+/// `JdkClientHttpRequestFactoryTests.compressionGzip/compressionDeflate`).
+fn re5_handler_tag(ctx: &dyn NativeContext, handler: Option<Value>) -> Option<String> {
     if let Some(Value::Object(Some(h))) = handler {
         let cid = ctx.class_id_of_object(h);
         if ctx.class_name_of_id(cid).as_deref() == Some("java/net/http/HttpResponse$BodyHandler") {
             if let Value::Object(Some(s)) = ctx.get_field(h, 0) {
                 if let Some(tag) = ctx.read_string(s) {
-                    return tag;
+                    return Some(tag);
                 }
             }
+            // Synthetic-but-tagless: keep the legacy InputStream default
+            // (a bare synthetic handler has no real apply() to drive).
+            return Some("inputstream".to_string());
         }
+        return None;
     }
-    "inputstream".to_string()
+    Some("inputstream".to_string())
 }
 
 /// Build the synthetic `java/net/http/HttpResponse` carrying the wire result.
@@ -5983,6 +6033,263 @@ fn re5_build_response(
     let tag = ctx.create_string(handler_tag);
     ctx.set_field(out, RE5_RESP_HANDLER_TAG, Value::Object(Some(tag)));
     out
+}
+
+/// Build the synthetic `java.net.http.HttpHeaders` view over a `String[]` of
+/// `"key: value"` lines (the shape both the synthetic `HttpResponse` and the
+/// synthetic `ResponseInfo` carry). The array is pinned across the
+/// allocation so a moving collector can't leave the stored reference stale.
+fn re5_make_http_headers(ctx: &mut dyn NativeContext, hdr_arr: Value) -> ObjectRef {
+    let pinned = match hdr_arr {
+        Value::Object(Some(a)) => Some((ctx.pin_native_root(a), a)),
+        _ => None,
+    };
+    let headers = alloc_concurrent_synthetic(ctx, "java/net/http/HttpHeaders", 1);
+    let arr_now = match pinned {
+        Some((pin, a)) => Value::Object(Some(ctx.read_native_pin(pin, a))),
+        None => Value::Object(None),
+    };
+    ctx.set_field(headers, 0, arr_now);
+    if let Some((pin, _)) = pinned {
+        ctx.unpin_native_roots(pin);
+    }
+    headers
+}
+
+/// `Flow.Subscription.request(long)` for the one-shot replay subscription
+/// handed to real BodySubscribers by [`re5_drive_body_handler`]: on the
+/// first positive demand, deliver the parked wire body as a single
+/// `List.of(ByteBuffer)` `onNext` followed by `onComplete`, then drop the
+/// parked references. Zero/negative or repeat demand is a no-op (the
+/// reactive-streams spec says negative demand should `onError`; every JDK
+/// `BodySubscriber` requests positive demand, so stay lenient).
+///
+/// Delivery is demand-driven rather than pushed eagerly from the driver
+/// because not every `BodySubscriber` buffers: `BodySubscribers
+/// .ofPublisher()`'s pass-through forwards items straight to a downstream
+/// subscriber that only attaches (and signals demand) later, on a different
+/// thread (Reactor, for Spring's reactive `JdkClientHttpConnector`) —
+/// pushing before that demand would drop the body on the floor. All state
+/// lives in the subscription's own Java fields (GC-traced), never in
+/// cross-call native `ObjectRef`s.
+fn re5_replay_subscription_request(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    let this = obj_arg(args, 0)?;
+    let n = match args.get(1).copied() {
+        Some(Value::Long(v)) => v,
+        Some(Value::Int(v)) => v as i64,
+        _ => 0,
+    };
+    if n <= 0 || !matches!(ctx.get_field(this, RE5_SUB_STATE), Value::Int(0)) {
+        return Ok(None);
+    }
+    // Claim delivery BEFORE invoking the subscriber: `onNext` commonly
+    // re-enters `request` (e.g. `HttpResponseInputStream` requests the next
+    // list while consuming the current one).
+    ctx.set_field(this, RE5_SUB_STATE, Value::Int(1));
+    let subscriber = match ctx.get_field(this, RE5_SUB_SUBSCRIBER) {
+        Value::Object(Some(s)) => s,
+        _ => return Ok(None),
+    };
+    let body = ctx.get_field(this, RE5_SUB_BODY);
+    let this_pin = ctx.pin_native_root(this);
+    let subscriber_pin = ctx.pin_native_root(subscriber);
+    let deliver = |ctx: &mut dyn NativeContext| -> MethodCallResult {
+        if let Value::Object(Some(arr)) = body {
+            if ctx.array_length(arr) > 0 {
+                let arr_pin = ctx.pin_native_root(arr);
+                let arr_now = ctx.read_native_pin(arr_pin, arr);
+                let bb = match ctx.invoke(
+                    "java/nio/ByteBuffer",
+                    "wrap",
+                    "([B)Ljava/nio/ByteBuffer;",
+                    &[Value::Object(Some(arr_now))],
+                )? {
+                    Some(Value::Object(Some(b))) => b,
+                    _ => return Err(ioex("ByteBuffer.wrap returned null")),
+                };
+                let bb_pin = ctx.pin_native_root(bb);
+                let bb_now = ctx.read_native_pin(bb_pin, bb);
+                let list = match ctx.invoke(
+                    "java/util/Collections",
+                    "singletonList",
+                    "(Ljava/lang/Object;)Ljava/util/List;",
+                    &[Value::Object(Some(bb_now))],
+                )? {
+                    Some(v @ Value::Object(Some(_))) => v,
+                    _ => return Err(ioex("Collections.singletonList returned null")),
+                };
+                let subscriber_now = ctx.read_native_pin(subscriber_pin, subscriber);
+                // BodySubscriber<T> extends Flow.Subscriber<List<ByteBuffer>>;
+                // the erased/bridge signature takes Object.
+                ctx.invoke_virtual(subscriber_now, "onNext", "(Ljava/lang/Object;)V", &[list])?;
+            }
+        }
+        let subscriber_now = ctx.read_native_pin(subscriber_pin, subscriber);
+        ctx.invoke_virtual(subscriber_now, "onComplete", "()V", &[])?;
+        Ok(None)
+    };
+    let result = deliver(ctx);
+    // Drop the parked references so the delivered body can be collected.
+    let this_now = ctx.read_native_pin(this_pin, this);
+    ctx.set_field(this_now, RE5_SUB_SUBSCRIBER, Value::Object(None));
+    ctx.set_field(this_now, RE5_SUB_BODY, Value::Object(None));
+    ctx.unpin_native_roots(this_pin);
+    result
+}
+
+/// `Flow.Subscription.cancel()` for the one-shot replay subscription: mark
+/// cancelled and drop the parked references. Idempotent; a cancel after
+/// delivery is a no-op (the fields are already cleared).
+fn re5_replay_subscription_cancel(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    let this = obj_arg(args, 0)?;
+    if matches!(ctx.get_field(this, RE5_SUB_STATE), Value::Int(0)) {
+        ctx.set_field(this, RE5_SUB_STATE, Value::Int(2));
+        ctx.set_field(this, RE5_SUB_SUBSCRIBER, Value::Object(None));
+        ctx.set_field(this, RE5_SUB_BODY, Value::Object(None));
+    }
+    Ok(None)
+}
+
+/// Drive the real `java.net.http` BodyHandler protocol against a
+/// user-supplied handler, exactly as the real client would:
+///
+/// ```text
+/// subscriber = handler.apply(responseInfo)
+/// subscriber.onSubscribe(replaySubscription)   // request(n) pulls the body
+/// body = subscriber.getBody().toCompletableFuture().join()
+/// ```
+///
+/// Returns the handler-produced body value `T` (e.g. a `GZIPInputStream`
+/// for Spring's `DecompressingBodyHandler`, a `Flow.Publisher` for
+/// `BodyHandlers.ofPublisher()`), which `HttpResponse.body()` then hands
+/// back verbatim (tag [`RE5_TAG_HANDLED`]).
+///
+/// `join()` cannot deadlock for the JDK's own subscriber shapes:
+/// `ofInputStream`/`ofPublisher` complete their `getBody()` stage
+/// immediately/at `onSubscribe`, and eagerly-buffering shapes (`ofString`,
+/// `ofByteArray`) signal demand during `onSubscribe`, which makes the
+/// replay subscription deliver the whole body + `onComplete` before
+/// `getBody()` is even called.
+fn re5_drive_body_handler(
+    ctx: &mut dyn NativeContext,
+    handler: ObjectRef,
+    status: i32,
+    headers: &[(String, String)],
+    body: &[u8],
+) -> Result<Value, MethodCallFailed> {
+    let handler_pin = ctx.pin_native_root(handler);
+
+    // ResponseInfo synthetic: statusCode + the same "key: value" String[]
+    // shape the synthetic HttpResponse carries.
+    let ri = alloc_concurrent_synthetic(ctx, RE5_RESPONSE_INFO, RE5_RI_NUM_FIELDS);
+    ctx.set_field(ri, RE5_RI_STATUS, Value::Int(status));
+    let ri_pin = ctx.pin_native_root(ri);
+    let hdr_arr = ctx.new_ref_array(ClassId::new(0), headers.len());
+    let hdr_pin = ctx.pin_native_root(hdr_arr);
+    for (i, (k, v)) in headers.iter().enumerate() {
+        let s = ctx.create_string(&format!("{k}: {v}"));
+        let hdr_now = ctx.read_native_pin(hdr_pin, hdr_arr);
+        ctx.set_array_element(hdr_now, i, Value::Object(Some(s)));
+    }
+    {
+        let ri_now = ctx.read_native_pin(ri_pin, ri);
+        let hdr_now = ctx.read_native_pin(hdr_pin, hdr_arr);
+        ctx.set_field(ri_now, RE5_RI_HEADERS, Value::Object(Some(hdr_now)));
+    }
+
+    // subscriber = handler.apply(responseInfo)
+    let subscriber = {
+        let handler_now = ctx.read_native_pin(handler_pin, handler);
+        let ri_now = ctx.read_native_pin(ri_pin, ri);
+        match ctx.invoke_virtual(
+            handler_now,
+            "apply",
+            "(Ljava/net/http/HttpResponse$ResponseInfo;)Ljava/net/http/HttpResponse$BodySubscriber;",
+            &[Value::Object(Some(ri_now))],
+        )? {
+            Some(Value::Object(Some(s))) => s,
+            _ => return Err(ioex("HttpResponse.BodyHandler.apply returned null")),
+        }
+    };
+    let subscriber_pin = ctx.pin_native_root(subscriber);
+
+    // Park subscriber + body bytes in the replay subscription's own Java
+    // fields (GC-traced; delivery may happen later, on another thread).
+    let body_arr = if body.is_empty() {
+        None
+    } else {
+        let arr = ctx.new_array(ArrayElementType::Byte, body.len());
+        for (i, b) in body.iter().enumerate() {
+            ctx.set_array_element(arr, i, Value::Int(*b as i32));
+        }
+        Some((ctx.pin_native_root(arr), arr))
+    };
+    let subscription =
+        alloc_concurrent_synthetic(ctx, RE5_REPLAY_SUBSCRIPTION, RE5_SUB_NUM_FIELDS);
+    {
+        let subscriber_now = ctx.read_native_pin(subscriber_pin, subscriber);
+        ctx.set_field(
+            subscription,
+            RE5_SUB_SUBSCRIBER,
+            Value::Object(Some(subscriber_now)),
+        );
+        let body_val = match body_arr {
+            Some((pin, a)) => Value::Object(Some(ctx.read_native_pin(pin, a))),
+            None => Value::Object(None),
+        };
+        ctx.set_field(subscription, RE5_SUB_BODY, body_val);
+        ctx.set_field(subscription, RE5_SUB_STATE, Value::Int(0));
+    }
+    let subscription_pin = ctx.pin_native_root(subscription);
+    {
+        let subscriber_now = ctx.read_native_pin(subscriber_pin, subscriber);
+        let subscription_now = ctx.read_native_pin(subscription_pin, subscription);
+        ctx.invoke_virtual(
+            subscriber_now,
+            "onSubscribe",
+            "(Ljava/util/concurrent/Flow$Subscription;)V",
+            &[Value::Object(Some(subscription_now))],
+        )?;
+    }
+
+    // body = subscriber.getBody().toCompletableFuture().join()
+    let stage = {
+        let subscriber_now = ctx.read_native_pin(subscriber_pin, subscriber);
+        match ctx.invoke_virtual(
+            subscriber_now,
+            "getBody",
+            "()Ljava/util/concurrent/CompletionStage;",
+            &[],
+        )? {
+            Some(Value::Object(Some(s))) => s,
+            _ => return Err(ioex("BodySubscriber.getBody returned null")),
+        }
+    };
+    // `getBody()` may return a CompletableFuture.MinimalStage, whose
+    // `join()` throws UnsupportedOperationException -- always convert via
+    // `toCompletableFuture()` first.
+    let stage_pin = ctx.pin_native_root(stage);
+    let cf = {
+        let stage_now = ctx.read_native_pin(stage_pin, stage);
+        match ctx.invoke_virtual(
+            stage_now,
+            "toCompletableFuture",
+            "()Ljava/util/concurrent/CompletableFuture;",
+            &[],
+        )? {
+            Some(Value::Object(Some(c))) => c,
+            _ => return Err(ioex("CompletionStage.toCompletableFuture returned null")),
+        }
+    };
+    let result = ctx.invoke_virtual(cf, "join", "()Ljava/lang/Object;", &[])?;
+    ctx.unpin_native_roots(handler_pin);
+    Ok(result.unwrap_or(Value::Object(None)))
 }
 
 const RE5_BODY_COLLECTOR_SUBSCRIBER: &str = "java/util/concurrent/Flow$Subscriber";
@@ -6263,7 +6570,8 @@ fn re5_request_body_bytes(
 /// `HttpClient`, `args[1]` the `HttpRequest`, `args[2]` the `BodyHandler`.
 fn re5_do_request(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let req = obj_arg(args, 1)?;
-    let handler_tag = re5_handler_tag(ctx, args.get(2).copied());
+    let handler_val = args.get(2).copied();
+    let handler_tag = re5_handler_tag(ctx, handler_val);
     let method = read_field_string_or(ctx, req, 0, "GET");
     let uri = read_field_string_or(ctx, req, 1, "");
     let body_val = ctx.get_field(req, 2);
@@ -6273,9 +6581,41 @@ fn re5_do_request(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResu
     if uri.is_empty() {
         return Err(ioex("HttpRequest.uri is empty"));
     }
+    // A real (non-synthetic) BodyHandler must survive the blocking exchange:
+    // the moving collector can run from other threads while this thread is
+    // off in socket I/O, so pin it for the duration.
+    let real_handler = match (handler_tag.as_deref(), handler_val) {
+        (None, Some(Value::Object(Some(h)))) => Some((ctx.pin_native_root(h), h)),
+        _ => None,
+    };
     let resp = http_perform_request(&method, &uri, &headers, &body, 10)
         .map_err(|e| ioex(format!("HttpClient request failed: {e}")))?;
-    let out = re5_build_response(ctx, resp.status, &resp.headers, &resp.body, &handler_tag);
+    let out = match real_handler {
+        None => {
+            let tag = handler_tag.unwrap_or_else(|| "inputstream".to_string());
+            re5_build_response(ctx, resp.status, &resp.headers, &resp.body, &tag)
+        }
+        Some((handler_pin, handler)) => {
+            // Drive the user's BodyHandler protocol against the wire bytes;
+            // body() then returns whatever value the handler produced.
+            let handler_now = ctx.read_native_pin(handler_pin, handler);
+            let body_obj =
+                re5_drive_body_handler(ctx, handler_now, resp.status, &resp.headers, &resp.body)?;
+            let body_obj_pin = match body_obj {
+                Value::Object(Some(o)) => Some((ctx.pin_native_root(o), o)),
+                _ => None,
+            };
+            let out =
+                re5_build_response(ctx, resp.status, &resp.headers, &resp.body, RE5_TAG_HANDLED);
+            let body_obj_now = match body_obj_pin {
+                Some((pin, o)) => Value::Object(Some(ctx.read_native_pin(pin, o))),
+                None => Value::Object(None),
+            };
+            ctx.set_field(out, RE5_RESP_BODY_OBJ, body_obj_now);
+            ctx.unpin_native_roots(handler_pin);
+            out
+        }
+    };
     Ok(Some(Value::Object(Some(out))))
 }
 
@@ -6812,12 +7152,16 @@ fn register_re5_http_client(r: &mut NativeMethodRegistry) {
     });
     // body() materialises the stored byte[] per the BodyHandler tag captured at
     // send time: an InputStream (default / ofInputStream), a String (ofString),
-    // the raw byte[] (ofByteArray), or null (discarding).
+    // the raw byte[] (ofByteArray), null (discarding), or -- for a real
+    // user-supplied BodyHandler -- the exact value the driven handler's
+    // BodySubscriber produced (RE5_TAG_HANDLED; same instance every call,
+    // matching the real client).
     r.register(resp, "body", "()Ljava/lang/Object;", |ctx, args| {
         let this = obj_arg(args, 0)?;
         let tag = read_field_string_or(ctx, this, RE5_RESP_HANDLER_TAG, "inputstream");
         let body_val = ctx.get_field(this, RE5_RESP_BODY_BYTES);
         match tag.as_str() {
+            RE5_TAG_HANDLED => Ok(Some(ctx.get_field(this, RE5_RESP_BODY_OBJ))),
             "discarding" => Ok(Some(Value::Object(None))),
             "bytearray" => Ok(Some(body_val)),
             "string" => {
@@ -6846,10 +7190,59 @@ fn register_re5_http_client(r: &mut NativeMethodRegistry) {
         |ctx, args| {
             let this = obj_arg(args, 0)?;
             let arr = ctx.get_field(this, RE5_RESP_HEADERS);
-            let headers = alloc_concurrent_synthetic(ctx, "java/net/http/HttpHeaders", 1);
-            ctx.set_field(headers, 0, arr);
+            let headers = re5_make_http_headers(ctx, arr);
             Ok(Some(Value::Object(Some(headers))))
         },
+    );
+
+    // HttpResponse.ResponseInfo -- the argument re5_drive_body_handler hands
+    // to a real BodyHandler's apply(). Same synthetic-receiver pattern as the
+    // HttpResponse natives above.
+    r.register(RE5_RESPONSE_INFO, "statusCode", "()I", |ctx, args| {
+        let this = obj_arg(args, 0)?;
+        Ok(Some(ctx.get_field(this, RE5_RI_STATUS)))
+    });
+    r.register(
+        RE5_RESPONSE_INFO,
+        "headers",
+        "()Ljava/net/http/HttpHeaders;",
+        |ctx, args| {
+            let this = obj_arg(args, 0)?;
+            let arr = ctx.get_field(this, RE5_RI_HEADERS);
+            let headers = re5_make_http_headers(ctx, arr);
+            Ok(Some(Value::Object(Some(headers))))
+        },
+    );
+    r.register(
+        RE5_RESPONSE_INFO,
+        "version",
+        "()Ljava/net/http/HttpClient$Version;",
+        |ctx, _args| {
+            // The bare client speaks HTTP/1.1.
+            let name = ctx.create_string("HTTP_1_1");
+            ctx.invoke(
+                "java/net/http/HttpClient$Version",
+                "valueOf",
+                "(Ljava/lang/String;)Ljava/net/http/HttpClient$Version;",
+                &[Value::Object(Some(name))],
+            )
+        },
+    );
+
+    // One-shot replay Flow.Subscription (see re5_drive_body_handler /
+    // re5_replay_subscription_request). Registered on its own wrapper class
+    // name; abstract Flow$Subscription dispatch finds receiver-class natives.
+    r.register(
+        RE5_REPLAY_SUBSCRIPTION,
+        "request",
+        "(J)V",
+        re5_replay_subscription_request,
+    );
+    r.register(
+        RE5_REPLAY_SUBSCRIPTION,
+        "cancel",
+        "()V",
+        re5_replay_subscription_cancel,
     );
 
     // HttpHeaders.map() -> Map<String, List<String>>. Spring's
@@ -9401,10 +9794,172 @@ mod tests {
     #[test]
     fn re4_http_read_response_parses_status_and_body() {
         let raw = b"HTTP/1.1 204 No Content\r\nServer: t\r\nContent-Length: 0\r\n\r\n";
-        let resp = http_read_response(&raw[..]).unwrap();
+        let resp = http_read_response(&raw[..], false).unwrap();
         assert_eq!(resp.status, 204);
         assert_eq!(resp.body, Vec::<u8>::new());
         assert!(resp.headers.iter().any(|(k, _)| k == "Server"));
+    }
+
+    /// Serves exactly the given header block, then fails every further read
+    /// with `WouldBlock` -- the shape of a keep-alive HEAD response: the
+    /// headers legitimately declare the Content-Length the corresponding GET
+    /// would have, but no body bytes ever arrive, and a blocking socket's
+    /// `SO_RCVTIMEO` eventually surfaces EAGAIN ("Resource temporarily
+    /// unavailable (os error 11)").
+    struct HeadersThenEagain<'a>(&'a [u8]);
+
+    impl Read for HeadersThenEagain<'_> {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            if self.0.is_empty() {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::WouldBlock,
+                    "Resource temporarily unavailable (os error 11)",
+                ));
+            }
+            let n = self.0.len().min(buf.len());
+            buf[..n].copy_from_slice(&self.0[..n]);
+            self.0 = &self.0[n..];
+            Ok(n)
+        }
+    }
+
+    #[test]
+    fn re5_http_read_response_head_skips_declared_body() {
+        let raw = b"HTTP/1.1 200 OK\r\nContent-Length: 500\r\nContent-Encoding: gzip\r\n\r\n";
+        // HEAD: must return immediately with an empty body, never touching
+        // the socket again.
+        let resp = http_read_response(HeadersThenEagain(&raw[..]), true).unwrap();
+        assert_eq!(resp.status, 200);
+        assert!(resp.body.is_empty());
+        assert!(resp
+            .headers
+            .iter()
+            .any(|(k, v)| k == "Content-Length" && v == "500"));
+        // Non-HEAD control: the same wire bytes make the reader wait for the
+        // declared 500 body bytes and hit the read timeout (the pre-fix
+        // failure mode for HEAD).
+        match http_read_response(HeadersThenEagain(&raw[..]), false) {
+            Err(err) => assert_eq!(err.kind(), std::io::ErrorKind::WouldBlock),
+            Ok(_) => panic!("non-HEAD read must wait for the declared body"),
+        }
+    }
+
+    #[test]
+    fn re5_handler_tag_classifies_synthetic_vs_real_handlers() {
+        let mut ctx = MockNativeContext::new();
+        // Synthetic tagged handler -> its tag.
+        let bh = alloc_concurrent_synthetic(&mut ctx, "java/net/http/HttpResponse$BodyHandler", 1);
+        let tag = ctx.create_string("string");
+        ctx.set_field(bh, 0, Value::Object(Some(tag)));
+        assert_eq!(
+            re5_handler_tag(&ctx, Some(Value::Object(Some(bh)))).as_deref(),
+            Some("string")
+        );
+        // Null / absent handler degrades to the InputStream default.
+        assert_eq!(re5_handler_tag(&ctx, None).as_deref(), Some("inputstream"));
+        assert_eq!(
+            re5_handler_tag(&ctx, Some(Value::Object(None))).as_deref(),
+            Some("inputstream")
+        );
+        // A real user handler class -> None: drive the real protocol.
+        let real = alloc_concurrent_synthetic(
+            &mut ctx,
+            "org/springframework/http/client/JdkClientHttpRequest$DecompressingBodyHandler",
+            1,
+        );
+        assert_eq!(re5_handler_tag(&ctx, Some(Value::Object(Some(real)))), None);
+    }
+
+    /// Virtual-call hook that records `onNext`/`onComplete` deliveries by
+    /// bumping counters in the receiver's own fields (slot 0 / slot 1).
+    fn re5_recording_subscriber_hook(
+        ctx: &mut MockNativeContext,
+        receiver: ObjectRef,
+        method_name: &str,
+        _descriptor: &str,
+        _args: &[Value],
+    ) -> Option<MethodCallResult> {
+        let slot = match method_name {
+            "onNext" => 0,
+            "onComplete" => 1,
+            _ => return None,
+        };
+        let cur = ctx.get_field(receiver, slot).as_int().unwrap_or(0);
+        ctx.set_field(receiver, slot, Value::Int(cur + 1));
+        Some(Ok(None))
+    }
+
+    fn re5_test_replay_subscription(
+        ctx: &mut MockNativeContext,
+        subscriber: ObjectRef,
+    ) -> ObjectRef {
+        let subscription =
+            alloc_concurrent_synthetic(ctx, RE5_REPLAY_SUBSCRIPTION, RE5_SUB_NUM_FIELDS);
+        ctx.set_field(subscription, RE5_SUB_SUBSCRIBER, Value::Object(Some(subscriber)));
+        ctx.set_field(subscription, RE5_SUB_BODY, Value::Object(None));
+        ctx.set_field(subscription, RE5_SUB_STATE, Value::Int(0));
+        subscription
+    }
+
+    #[test]
+    fn re5_replay_subscription_delivers_completion_exactly_once() {
+        let mut ctx = MockNativeContext::new();
+        ctx.set_invoke_virtual_hook(re5_recording_subscriber_hook);
+        let subscriber = alloc_concurrent_synthetic(&mut ctx, "test/RecordingSubscriber", 2);
+        let subscription = re5_test_replay_subscription(&mut ctx, subscriber);
+
+        // Zero / negative demand: nothing delivered.
+        for n in [0i64, -3] {
+            re5_replay_subscription_request(
+                &mut ctx,
+                &[Value::Object(Some(subscription)), Value::Long(n)],
+            )
+            .unwrap();
+        }
+        assert_eq!(ctx.get_field(subscriber, 1), Value::Int(0));
+
+        // First positive demand: exactly one onComplete (empty body -> no
+        // onNext), and the parked references are dropped.
+        re5_replay_subscription_request(
+            &mut ctx,
+            &[Value::Object(Some(subscription)), Value::Long(1)],
+        )
+        .unwrap();
+        assert_eq!(ctx.get_field(subscriber, 0), Value::Int(0));
+        assert_eq!(ctx.get_field(subscriber, 1), Value::Int(1));
+        assert!(matches!(
+            ctx.get_field(subscription, RE5_SUB_SUBSCRIBER),
+            Value::Object(None)
+        ));
+
+        // One-shot: repeat demand delivers nothing further.
+        re5_replay_subscription_request(
+            &mut ctx,
+            &[Value::Object(Some(subscription)), Value::Long(9)],
+        )
+        .unwrap();
+        assert_eq!(ctx.get_field(subscriber, 1), Value::Int(1));
+    }
+
+    #[test]
+    fn re5_replay_subscription_cancel_before_demand_suppresses_delivery() {
+        let mut ctx = MockNativeContext::new();
+        ctx.set_invoke_virtual_hook(re5_recording_subscriber_hook);
+        let subscriber = alloc_concurrent_synthetic(&mut ctx, "test/RecordingSubscriber", 2);
+        let subscription = re5_test_replay_subscription(&mut ctx, subscriber);
+
+        re5_replay_subscription_cancel(&mut ctx, &[Value::Object(Some(subscription))]).unwrap();
+        re5_replay_subscription_request(
+            &mut ctx,
+            &[Value::Object(Some(subscription)), Value::Long(1)],
+        )
+        .unwrap();
+        assert_eq!(ctx.get_field(subscriber, 0), Value::Int(0));
+        assert_eq!(ctx.get_field(subscriber, 1), Value::Int(0));
+        assert!(matches!(
+            ctx.get_field(subscription, RE5_SUB_SUBSCRIBER),
+            Value::Object(None)
+        ));
     }
 
     #[test]
