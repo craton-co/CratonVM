@@ -1615,6 +1615,23 @@ fn materialize_java_string_array(ctx: &mut dyn NativeContext, items: &[String]) 
     arr
 }
 
+/// True if `result` is an `Err(ExceptionThrown)` wrapping a real
+/// `java.lang.AbstractMethodError`. See `resolve_via_java`'s retry-on-first-
+/// hit call site for why this specific exception gets a bounded retry
+/// instead of being treated as a genuine dispatch failure.
+fn is_abstract_method_error(
+    ctx: &mut dyn NativeContext,
+    result: &Result<Option<Value>, cratonvm_types::error::MethodCallFailed>,
+) -> bool {
+    match result {
+        Err(cratonvm_types::error::MethodCallFailed::ExceptionThrown(exc)) => ctx
+            .class_name_of_id(ctx.class_id_of_object(*exc))
+            .as_deref()
+            == Some("java/lang/AbstractMethodError"),
+        _ => false,
+    }
+}
+
 /// Consults the real Java `KeyManager.chooseClientAlias` (and
 /// `getPrivateKey`) to pick a client certificate matching the server's
 /// `CertificateRequest`, instead of always presenting one fixed identity.
@@ -1672,25 +1689,84 @@ impl JavaKeyManagerResolver {
             for (i, &pin) in pins.iter().enumerate() {
                 km_list[i] = ctx.read_native_pin(pin, km_list[i]);
                 let km_obj = km_list[i];
+                if dbg {
+                    let cls_name = ctx.class_name_of_id(ctx.class_id_of_object(km_obj));
+                    eprintln!(
+                        "[dbg-tls-auth] JavaKeyManagerResolver km_obj[{}] class={:?}",
+                        i, cls_name
+                    );
+                }
+                // FIX (tomcat-clientauth-engine-config): a caller-installed
+                // `KeyManager` wrapper (e.g. Tomcat's `TrackingKeyManager`,
+                // `test/org/apache/tomcat/util/net/TesterSupport.java`)
+                // delegates to whatever `KeyManagerFactory.getKeyManagers()`
+                // returned. That was ROOT-CAUSED (not just worked around) —
+                // see `phases_late.rs`'s `KeyManagerFactory.getKeyManagers()`
+                // handler's own doc comment for the full story: it used to
+                // return an object stamped with the bare
+                // `javax/net/ssl/X509KeyManager` INTERFACE's own class id,
+                // whose 6 methods are all abstract with no Code, so any
+                // caller invoking one directly hit `AbstractMethodError`
+                // unconditionally and deterministically (confirmed via
+                // `CRATONVM_DBG_NOCODE=1` tracing — NOT a timing/vtable-
+                // visibility race, an earlier hypothesis this session
+                // initially chased and disproved: `ensure_class_initialized`
+                // immediately before the call never helped, and a bounded
+                // retry-with-backoff (below) failed identically on every
+                // attempt, every time — the real receiver class was wrong,
+                // not "not yet ready"). Fixed at the source in
+                // `getKeyManagers()`. The retry loop below is kept as a
+                // narrowly-scoped defensive fallback (harmless: it only
+                // fires on this exact exception class, and costs nothing
+                // when it never fires) in case some OTHER, genuinely
+                // transient cause of the same symptom is hit by a future
+                // caller shape this session didn't exercise.
                 let args = [
                     Value::Object(Some(key_type_arr)),
                     Value::Object(Some(issuers_arr)),
                     Value::Object(None),
                 ];
-                let choose_result = ctx.invoke_virtual(
+                let mut choose_result = ctx.invoke_virtual(
                     km_obj,
                     "chooseClientAlias",
                     "([Ljava/lang/String;[Ljava/security/Principal;Ljava/net/Socket;)Ljava/lang/String;",
                     &args,
                 );
+                let mut retry_attempt = 0;
+                while is_abstract_method_error(ctx, &choose_result) && retry_attempt < 3 {
+                    retry_attempt += 1;
+                    std::thread::yield_now();
+                    std::thread::sleep(std::time::Duration::from_millis(5 * retry_attempt));
+                    km_list[i] = ctx.read_native_pin(pin, km_list[i]);
+                    let km_obj = km_list[i];
+                    choose_result = ctx.invoke_virtual(
+                        km_obj,
+                        "chooseClientAlias",
+                        "([Ljava/lang/String;[Ljava/security/Principal;Ljava/net/Socket;)Ljava/lang/String;",
+                        &args,
+                    );
+                    if dbg {
+                        eprintln!(
+                            "[dbg-tls-auth] JavaKeyManagerResolver chooseClientAlias[{}] RETRY#{} after AbstractMethodError -> {:?}",
+                            i, retry_attempt, choose_result
+                        );
+                    }
+                }
+                let choose_result = choose_result;
                 let alias = match &choose_result {
                     Ok(Some(Value::Object(Some(s)))) => ctx.read_string(*s),
                     _ => None,
                 };
                 if dbg {
+                    let exc_cls = match &choose_result {
+                        Err(cratonvm_types::error::MethodCallFailed::ExceptionThrown(exc)) => {
+                            Some(ctx.class_name_of_id(ctx.class_id_of_object(*exc)))
+                        }
+                        _ => None,
+                    };
                     eprintln!(
-                        "[dbg-tls-auth] JavaKeyManagerResolver chooseClientAlias[{}] -> {:?} (raw={:?})",
-                        i, alias, choose_result
+                        "[dbg-tls-auth] JavaKeyManagerResolver chooseClientAlias[{}] -> {:?} (raw={:?}, exc_class={:?})",
+                        i, alias, choose_result, exc_cls
                     );
                 }
                 km_list[i] = ctx.read_native_pin(pin, km_list[i]);
@@ -4826,6 +4902,12 @@ fn default_engine_server_config(
 /// configs (or defaults) and stash it on the engine.
 fn engine_begin(state: &mut EngineState) -> Result<(), String> {
     if state.conn.is_some() {
+        if std::env::var("CRATONVM_DBG_TLS_AUTH").is_ok() {
+            eprintln!(
+                "[dbg-tls-auth] engine_begin SHORT-CIRCUIT (conn already realized) need={} want={}",
+                state.need_client_auth, state.want_client_auth
+            );
+        }
         return Ok(());
     }
     let alpn_strs: Vec<&str> = state
@@ -4875,7 +4957,95 @@ fn engine_begin(state: &mut EngineState) -> Result<(), String> {
                     // Request the client cert for either NEED (required) or WANT
                     // (optional) client auth — otherwise an "optional" server
                     // never asks and `peer_certificates()` stays empty.
-                    let request = state.need_client_auth || state.want_client_auth;
+                    //
+                    // INVESTIGATED, NOT APPLIED (tomcat-clientauth-engine-config):
+                    // Tomcat's SSLHostConfig/SSLAuthenticator machinery
+                    // deliberately does NOT toggle need/want client auth up
+                    // front for the common "certificateVerification=optional,
+                    // auth decided per-request" configuration this suite
+                    // exercises (`TestClientCert`/`TestCustomSslTrustManager`)
+                    // — instead it always requests the cert (if at all) via a
+                    // mid-connection TLS renegotiation
+                    // (`SSLEngine.setNeedClientAuth(true)` + `beginHandshake()`
+                    // called AGAIN on an already-handshaked engine, from
+                    // `NioEndpoint$NioSocketWrapper.doClientAuth`). rustls
+                    // categorically does not support renegotiation in TLS 1.2
+                    // (nor TLS 1.3 — see rustls's own `manual::tlsvulns` docs);
+                    // it unconditionally rejects any post-handshake ClientHello/
+                    // HelloRequest with a `no_renegotiation` alert
+                    // (`common_state.rs::process_msg`, gated on
+                    // `may_receive_application_data`, which flips true the
+                    // instant the FIRST handshake finishes — there is no window
+                    // in which a real renegotiation attempt would be accepted).
+                    // `engine_begin`'s own `state.conn.is_some()` early return
+                    // (below the closing brace of this match) means that second
+                    // `beginHandshake()` call was ALSO silently discarded on the
+                    // CratonVM side even before hitting that rustls wall — see
+                    // this crate's `docs/known-issues/tls-ocsp-clientcert-
+                    // validation-not-enforced.md`, "Residual #2 implementation"
+                    // point 2, for the full trace evidence.
+                    //
+                    // True wire-level renegotiation is therefore not
+                    // implementable without swapping TLS backends (the same
+                    // class of permanently-unfixable gap as this doc's TLS 1.2
+                    // DHE cipher case).
+                    //
+                    // A workaround WAS tried and measured: when this engine's
+                    // SSLContext carried trust roots (a real `TrustManager[]`
+                    // was configured), speculatively send an OPTIONAL
+                    // CertificateRequest on the very FIRST handshake instead of
+                    // waiting for Tomcat's rehandshake — proven to work
+                    // end-to-end (a client with a KeyManager installed
+                    // volunteers its cert immediately; `WebPkiClientVerifier::
+                    // allow_unauthenticated()` accepts an empty Certificate
+                    // message from a client with none, identically to no
+                    // CertificateRequest ever being sent). Measured effect:
+                    // `TestCustomSslTrustManager` improved 2/9->1/9 failing
+                    // (the remaining failure is the doc's already-known
+                    // `testCustomTrustManagerNone` order-dependent flake), but
+                    // `TestClientCert` stayed at 5/18 failing with a *different*
+                    // failure set — `testClientCertGetWithPreemptive` newly
+                    // PASSED, but `testClientCertPostLarger` newly FAILED,
+                    // because the suite has an explicit,
+                    // deliberately-asserted invariant this workaround violates:
+                    // `doTestClientCertGet`/`doTestClientCertPost` both assert
+                    // `assertEquals(0, TesterSupport.
+                    // getLastClientAuthRequestedIssuerCount())` after the FIRST
+                    // (unprotected-resource) request — i.e. the suite is
+                    // explicitly verifying NO CertificateRequest is sent until
+                    // a protected resource actually needs one. A speculative
+                    // upfront request can therefore only ever satisfy the
+                    // small "preemptive" subset of this suite while breaking
+                    // the (larger) "non-preemptive" subset's own explicit
+                    // assertions — it cannot net-improve `TestClientCert`
+                    // without also implementing the deferred/mid-connection
+                    // request the suite actually wants, which circles back to
+                    // requiring real renegotiation. Reverted (kept as `false`
+                    // below, not deleted, since the wiring — `client_ca`
+                    // resolution, `has_custom_trust_managers`, the
+                    // `optional_client_cert` passthrough a few lines down —
+                    // is correct and reusable if a future session finds a
+                    // renegotiation-shaped answer, e.g. a custom rustls fork
+                    // or an OpenSSL-backed engine variant that does support
+                    // it). Deliberately does NOT downgrade or override an
+                    // already explicit `need`/`want` (a real
+                    // `setNeedClientAuth(true)` called before the first
+                    // handshake — e.g. a `certificateVerification=required`
+                    // host, or the plain `SSLParameters.setNeedClientAuth
+                    // (true)`-upfront repro this doc's residual #2 verified
+                    // directly — still wins and still enforces REQUIRED
+                    // semantics exactly as before; this is unaffected by the
+                    // revert below).
+                    let speculative_optional_auth = false
+                        && !state.need_client_auth
+                        && !state.want_client_auth
+                        && state
+                            .trust_roots_override
+                            .as_ref()
+                            .map(|r| !r.root_ders.is_empty())
+                            .unwrap_or(false);
+                    let request =
+                        state.need_client_auth || state.want_client_auth || speculative_optional_auth;
                     let client_ca = if request {
                         let trust_roots = state
                             .trust_roots_override
@@ -4931,7 +5101,8 @@ fn engine_begin(state: &mut EngineState) -> Result<(), String> {
                             key,
                             &alpn_strs,
                             state.need_client_auth,
-                            state.want_client_auth && !state.need_client_auth,
+                            (state.want_client_auth || speculative_optional_auth)
+                                && !state.need_client_auth,
                             client_ca.as_deref(),
                             &state.enabled_ciphers,
                         )
@@ -5308,6 +5479,13 @@ fn register_engine_impl_natives(r: &mut NativeMethodRegistry) {
         let this = obj_arg(args, 0)?;
         let v = args.get(1).and_then(|x| x.as_int()).unwrap_or(0) != 0;
         let id = engine_id_or_alloc(this);
+        if std::env::var("CRATONVM_DBG_TLS_AUTH").is_ok() {
+            let conn_is_some = with_engine(id, |s| s.conn.is_some()).unwrap_or(false);
+            eprintln!(
+                "[dbg-tls-auth] DIRECT setNeedClientAuth id={} v={} conn_already_realized={}",
+                id, v, conn_is_some
+            );
+        }
         with_engine(id, |s| {
             s.need_client_auth = v;
             if v {
