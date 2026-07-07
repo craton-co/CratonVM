@@ -5585,7 +5585,16 @@ fn register_re4_url_http(r: &mut NativeMethodRegistry) {
     // S111r27 — Keep optional integrations truly optional. Spring computes
     // several static "xxxPresent" flags via ClassUtils.isPresent(...); when
     // these flip true under partial emulation, later probes may dive into
-    // missing subsystems (JSF/Groovy) and destabilize bootstrap.
+    // missing subsystems (JSF) and destabilize bootstrap.
+    //
+    // Groovy note (2026-07-07): this stub used to also force `groovy.*` to
+    // absent, because letting Spring's `DelegatingSmartContextLoader` pick the
+    // Groovy context loader used to trip a since-fixed ATNConfig class-layout
+    // bug in Groovy's shaded ANTLR4 compiler (250k+ gc::guard warnings, near
+    // hang — see docs/known-issues/test-context-constructor-param-annotation-offset.md
+    // Residual 1). With that fixed, `groovy.*` presence is decided honestly by
+    // the classpath probe below, so `.groovy` bean scripts load through the
+    // real `GenericGroovyXmlContextLoader` when Groovy is actually present.
     r.register(
         "org/springframework/util/ClassUtils",
         "isPresent",
@@ -5595,7 +5604,7 @@ fn register_re4_url_http(r: &mut NativeMethodRegistry) {
                 Some(Value::Object(Some(s))) => ctx.read_string(*s).unwrap_or_default(),
                 _ => String::new(),
             };
-            if name == "jakarta.faces.context.FacesContext" || name.starts_with("groovy.") {
+            if name == "jakarta.faces.context.FacesContext" {
                 return Ok(Some(Value::Int(0)));
             }
             let internal = name.replace('.', "/");
