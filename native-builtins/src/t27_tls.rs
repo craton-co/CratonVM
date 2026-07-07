@@ -5770,6 +5770,10 @@ fn do_unwrap(
                 for i in offset..rec_end {
                     rec.push(ctx.get_array_element(arr, i).as_int().unwrap_or(0) as u8);
                 }
+                // Whether the handshake is still in progress BEFORE this record
+                // is fed — used below to stop at the handshake-completion
+                // boundary exactly like real `SSLEngineImpl.unwrap` does.
+                let was_handshaking = conn.is_handshaking();
                 // Feed the ENTIRE record into rustls. `read_tls` reads only as
                 // much as its deframer buffer takes per call (often less than a
                 // full 16 KiB record), so loop until the cursor is drained —
@@ -5845,6 +5849,22 @@ fn do_unwrap(
                     }
                 }
                 offset = rec_end;
+                // FIX (handshake-boundary): stop consuming records the moment
+                // the handshake COMPLETES, leaving any already-arrived
+                // application-data records in `src` for the caller's next
+                // unwrap. Real `SSLEngineImpl.unwrap` never crosses this
+                // boundary in one call, and drivers depend on that:
+                // `sun.net.httpserver.SSLStreams.doHandshake`'s NEED_UNWRAP
+                // branch unwraps into a THROWAWAY scratch buffer, so when the
+                // client's Finished and its first request bytes arrive in one
+                // TCP read (a pure timing race — reproduced ~50% on TlsRepro3),
+                // a greedy unwrap that consumed both returned hs=FINISHED with
+                // the decrypted HTTP request in a buffer the driver discards.
+                // The server then blocked reading a request the client had
+                // already sent, and the client timed out ("Read timed out").
+                if was_handshaking && !conn.is_handshaking() {
+                    break;
+                }
                 if plaintext.len() >= dst_cap {
                     break;
                 }
