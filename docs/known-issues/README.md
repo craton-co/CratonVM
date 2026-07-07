@@ -4,6 +4,41 @@ This folder collects CratonVM-only defects found while running upstream Java
 suites. The docs had grown to describe the **same underlying bug from several
 angles**; this index is the consolidated map. Read it first.
 
+## 2026-07-06 Infinispan Cache.config null after real DefaultCacheManager.start() — FIXED; two new residuals found one/two layers deeper
+
+- ✅ FIXED: `native_dcm_get_cache` (and all Cache-instance natives —
+  `put`/`get`/`remove`/`containsKey`/`size`/`clear`/`evict`/`addListener`/
+  `removeListener`/`getName`/`putIfAbsent`/`replace`) were registered
+  unconditionally on `DefaultCacheManager`/`Cache`/`CacheImpl`/`AdvancedCache`,
+  so they also intercepted a REAL manager's calls, fabricating a synthetic
+  `Cache` with a null `config` — Infinispan's own internal bootstrap
+  (`GlobalConfigurationManagerImpl.postStart()`) NPE'd on
+  `cache.config.clustering()`. Fixed by guarding each with `is_real_dcm()`/a
+  new `is_real_cache()` and delegating real objects to the real underlying
+  bytecode (`internalGetCache`, `put(K,V,Metadata)`, `get(K,long,InvocationContext)`,
+  etc. — found via `javap` decompilation of the real jar). `is_real_cache()`
+  took three attempts to get right (two field-by-name discriminators both
+  had value round-trip bugs on this class); see the FIXED doc for the full
+  trail. Also fixed a latent GC-safety bug (bare `ObjectRef`/`Value` locals
+  held across a re-entrant real-bytecode call in `get`/`containsKey`/`remove`)
+  and a prerequisite Windows-only build regression (`native-io`'s
+  `NativeSocketAddress` natives referenced `libc::sockaddr_in6`/`AF_INET`
+  unconditionally, but `libc` doesn't define those for Windows — gated with
+  `#[cfg(unix)]`). Verified: regression probe for the OLD synthetic path
+  passes cleanly, all 21 pre-existing unit tests pass, and `RealmModelTest`'s
+  originally-reported NPE is gone (gets through the entire cache-manager
+  bootstrap/use/teardown lifecycle under `--nojit`). Doc:
+  [`docs/internal/fixed-suite-bugs/keycloak-model-infinispan-cache-config-null-after-real-start-FIXED.md`](../internal/fixed-suite-bugs/keycloak-model-infinispan-cache-config-null-after-real-start-FIXED.md).
+- Two new, **distinct and unrelated** (JIT/VM-core, not Infinispan-specific)
+  residuals surfaced once the fix let `RealmModelTest` run much further:
+  [keycloak-model-infinispan-jit-adjacent-decode-error-fullname.md](keycloak-model-infinispan-jit-adjacent-decode-error-fullname.md)
+  (JIT-only bytecode-decode error, reachable only with JIT on — a
+  JIT-compiled caller appears to corrupt an interpreted callee's frame) and
+  [keycloak-model-stw-takeover-hang-eventloopgroup-shutdown.md](keycloak-model-stw-takeover-hang-eventloopgroup-shutdown.md)
+  (an STW cross-thread-takeover safepoint hang during Netty `EventLoopGroup`
+  shutdown, reachable only with `--nojit`, once the JIT bug above is worked
+  around).
+
 ## 2026-07-07 GC blocked-thread / stale-Thread-mirror doc RETIRED; real-net GC-blocking audit completed
 
 - ✅ RETIRED to [`docs/internal/gc-blocked-thread-frame-stale-thread-mirror-RESOLVED.md`](../internal/gc-blocked-thread-frame-stale-thread-mirror-RESOLVED.md): the 2026-06-29 six-class Tomcat hard-crash family (blocked thread's live young object reclaimed → SIGSEGV/`CompactValue` panic) is closed — 4297 encoding-suite Tomcat boot/serve/stop cases + all three tribes classes ran with ZERO stale-pointer warnings, ZERO panics, jit and nojit. Executing the doc's remaining audit TODO also landed six real-net GC-blocking fixes on this branch: `MulticastSocket.receive/send` and `DatagramChannel.receive0/send0` bracketted (+ held-ref re-sync), the `Selector.select` epoll wait bracketted (was the dominant STW-stall source — every NIO event loop held up every GC by its select timeout; `TestDataIntegrity --nojit` went from 420s-timeout/44 STW-stall warnings to completing with 0), `net_accept`'s post-wake writes re-synced, `net_connect0` bracketted, and `populate_selected_keys_field`'s `Set.add` loop pinned. The register-resident JIT oop remainder stays tracked in [dohead-jit-heap-corruption-register-invisibility.md](dohead-jit-heap-corruption-register-invisibility.md) + [fork6-fjp-multithread-jit-root-reclamation.md](fork6-fjp-multithread-jit-root-reclamation.md).
@@ -13,7 +48,7 @@ angles**; this index is the consolidated map. Read it first.
 ## 2026-07-07 Keycloak X.509 `AuthorityKeyIdentifier` NPE — FIXED, doc retired; new `tests/base` blocker found
 
 - ✅ FIXED: `CertificateFactory.getInstance("X.509")`'s no-provider path (used by BC's default `JcaX509CertificateConverter`) returned certs whose `getEncoded()` was always a 0-length byte array, so any later BC ASN.1 re-parse (e.g. `createAuthorityKeyIdentifier`) NPE'd deep in `ASN1UniversalType.checkedCast`. This blocked ~80/101 `tests/base` classes plus 2 crypto-module tests. Fixed in `native-builtins/src/phases_late.rs`'s `CertificateFactory.generateCertificate`/`.generateCertificates` by building a real `sun.security.x509.X509CertImpl` from the DER (reusing `keystore::make_x509_mirror`) instead of a byte-discarding synthetic stub. Verified via isolated before/after repro (byte-identical to real HotSpot post-fix) and real Keycloak tests (`PemUtilsBCTest` 6/6 pass). Doc retired to [`docs/internal/fixed-suite-bugs/keycloak-x509-authoritykeyidentifier-npe-FIXED.md`](../internal/fixed-suite-bugs/keycloak-x509-authoritykeyidentifier-npe-FIXED.md).
-- Fixing it far enough to verify surfaced the *next* `tests/base` blocker (every class hits this once the X.509 NPE is out of the way): [keycloak-tests-base-remote-providers-artifact-resolution.md](keycloak-tests-base-remote-providers-artifact-resolution.md) — `ProviderDeployer`/`org.keycloak.it.utils.Maven` fails to resolve the (locally-present) `keycloak-test-framework-remote-providers` artifact via its own reactor dependency-graph resolution. Not yet triaged as CratonVM bug vs. environment gap.
+- Fixing it far enough to verify surfaced the *next* `tests/base` blocker (every class hits this once the X.509 NPE is out of the way): `ProviderDeployer`/`org.keycloak.it.utils.Maven` fails to resolve the (locally-present) `keycloak-test-framework-remote-providers` artifact via its own reactor dependency-graph resolution. ✅ NOT A CRATONVM BUG — confirmed 2026-07-07 via direct HotSpot repro (identical failure, same stack trace, both VMs). Doc retired to [`docs/internal/keycloak-tests-base-remote-providers-artifact-resolution-NOT-A-BUG.md`](../internal/keycloak-tests-base-remote-providers-artifact-resolution-NOT-A-BUG.md).
 
 ## 2026-07-07 WP1.8 ServiceLoader iterator hang — FIXED, doc retired
 
@@ -121,9 +156,12 @@ testing against real JDK 25); the actual cause,
 [Infinispan JGroupsTransport.start() never invoked](../internal/fixed-suite-bugs/keycloak-model-jgroupstransport-start-never-invoked-FIXED.md)
 (a `DefaultCacheManager.start()`/`stop()` native shim intercepting real
 objects unconditionally), is now **also FIXED** (2026-07-06). `RealmModelTest`
-now reaches a distinct residual one layer deeper, in the same "synthetic
-native shim intercepts a real object" family:
-[Infinispan Cache.config null after real DefaultCacheManager.start()](keycloak-model-infinispan-cache-config-null-after-real-start.md).
+then reached a distinct residual one layer deeper, in the same "synthetic
+native shim intercepts a real object" family,
+[Infinispan Cache.config null after real DefaultCacheManager.start()](../internal/fixed-suite-bugs/keycloak-model-infinispan-cache-config-null-after-real-start-FIXED.md),
+now **also FIXED** (2026-07-06) — see the top of this file for the two new
+residuals (JIT-only decode error, `--nojit`-only STW shutdown hang) it
+uncovered one/two layers deeper still.
 Not CratonVM bugs: 543 FAILs (`testsuite/integration-arquillian/tests/base`
 + `tests/other/sssd`, exhaustively confirmed - 543/544 exact match, the 544th
 is the System Rules finding above) are "Not found frontend container:
@@ -766,8 +804,10 @@ PreviewFeatures native crash. The remaining non-passed rows are tracked here:
   `RealmModelTest` then reached a residual initially misdiagnosed as a Netty
   setAccessible bug; the actual cause was
   [Infinispan JGroupsTransport.start() never invoked](../internal/fixed-suite-bugs/keycloak-model-jgroupstransport-start-never-invoked-FIXED.md),
-  now FIXED. `RealmModelTest` now reaches a distinct residual tracked in
-  [keycloak-model-infinispan-cache-config-null-after-real-start.md](keycloak-model-infinispan-cache-config-null-after-real-start.md).
+  now FIXED. `RealmModelTest` then reached a distinct residual,
+  [Infinispan Cache.config null after real DefaultCacheManager.start()](../internal/fixed-suite-bugs/keycloak-model-infinispan-cache-config-null-after-real-start-FIXED.md),
+  now ALSO FIXED (2026-07-06) — see the top of this file for the two new
+  residuals it uncovered one/two layers deeper still.
 - [keycloak-sssd-system1-findbootstrapclassornull-nosuchmethod.md](keycloak-sssd-system1-findbootstrapclassornull-nosuchmethod.md) -
   2 `FAIL` rows in the SSSD module, missing
   `java/lang/System$1.findBootstrapClassOrNull(String)Class`.
