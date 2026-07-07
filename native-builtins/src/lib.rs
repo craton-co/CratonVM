@@ -40568,6 +40568,48 @@ fn b64_decode_char(c: u8, variant: i32) -> Option<u32> {
     }
 }
 
+/// If `bytes` is a PEM-armored block (`-----BEGIN … -----` … `-----END … -----`),
+/// base64-decode its body to DER; otherwise return `bytes` unchanged.
+///
+/// `CertificateFactory.generateCertificate` accepts BOTH DER and PEM streams on
+/// real JDK (`sun.security.provider.X509Factory` sniffs the `-----BEGIN` armor).
+/// CratonVM's native read the raw stream bytes as if always-DER, so a PEM stream
+/// (e.g. Netty's `SelfSignedCertificate` cert file, handed to
+/// `generateCertificate` unparsed) built a cert whose `getEncoded()` was empty →
+/// rustls `invalid peer certificate: BadEncoding` on the server handshake. See
+/// docs/known-issues/http-server-sslengine-identity-singleton-clobber.md.
+pub(crate) fn pem_block_to_der(bytes: &[u8]) -> Vec<u8> {
+    const BEGIN: &[u8] = b"-----BEGIN";
+    // Locate the first `-----BEGIN` line; bail (return input) if absent.
+    let Some(begin) = bytes
+        .windows(BEGIN.len())
+        .position(|w| w == BEGIN)
+    else {
+        return bytes.to_vec();
+    };
+    // Body starts after the end of the BEGIN line.
+    let after_begin = &bytes[begin..];
+    let Some(nl) = after_begin.iter().position(|&c| c == b'\n') else {
+        return bytes.to_vec();
+    };
+    let body_start = begin + nl + 1;
+    // Body ends at the `-----END` line.
+    const END: &[u8] = b"-----END";
+    let end_rel = bytes[body_start..]
+        .windows(END.len())
+        .position(|w| w == END);
+    let body = match end_rel {
+        Some(e) => &bytes[body_start..body_start + e],
+        None => &bytes[body_start..],
+    };
+    match b64_decode(body, B64_VARIANT_BASIC) {
+        Ok(der) if !der.is_empty() => der,
+        // Not valid base64 (or empty) — hand the original bytes back so the
+        // caller's existing DER path / mirror fallback runs exactly as before.
+        _ => bytes.to_vec(),
+    }
+}
+
 fn b64_decode(input: &[u8], variant: i32) -> Result<Vec<u8>, String> {
     // Filter out whitespace and line breaks
     let filtered: Vec<u8> = input
@@ -60696,5 +60738,25 @@ mod regex_lookbehind_tests {
         // "abc123x" -> the `x` is preceded by digits, so it matches.
         assert!(re.is_match("abc123x"));
         assert!(!re.is_match("abcx"));
+    }
+
+    /// `pem_block_to_der`: a PEM CERTIFICATE block decodes to its DER body;
+    /// raw DER (no armor) and non-base64 garbage pass through unchanged.
+    /// Regression guard for http-server-sslengine-identity-singleton-clobber
+    /// (Netty `SelfSignedCertificate` PEM → empty `getEncoded()`).
+    #[test]
+    fn pem_block_to_der_roundtrip() {
+        let der = vec![0x30u8, 0x03, 0x02, 0x01, 0x2a]; // trivial DER SEQUENCE
+        let b64 = String::from_utf8(b64_encode(&der, B64_VARIANT_BASIC, false)).unwrap();
+        let pem = format!("-----BEGIN CERTIFICATE-----\n{b64}\n-----END CERTIFICATE-----\n");
+        assert_eq!(pem_block_to_der(pem.as_bytes()), der, "PEM decodes to DER");
+        // Raw DER (no armor) passes through untouched.
+        assert_eq!(pem_block_to_der(&der), der, "raw DER unchanged");
+        // A leading-garbage-then-armor PEM still finds the block.
+        let noisy = format!("Bag Attributes\n{pem}");
+        assert_eq!(pem_block_to_der(noisy.as_bytes()), der, "armor found past a preamble");
+        // Non-base64 body → hand original bytes back (caller's mirror fallback).
+        let bad = b"-----BEGIN CERTIFICATE-----\n@@@@\n-----END CERTIFICATE-----\n";
+        assert_eq!(pem_block_to_der(bad), bad.to_vec(), "invalid base64 falls back to input");
     }
 }

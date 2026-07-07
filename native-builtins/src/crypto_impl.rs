@@ -2004,6 +2004,22 @@ pub struct RsaPrivateKey {
     pub n: BigUint,
     pub d: BigUint,
     pub e: BigUint,
+    // CRT parameters (Chinese Remainder Theorem). `Some` for a freshly
+    // generated key (see `generate_keypair`); `None` for a key reconstructed
+    // from a non-CRT source (a placeholder, or a bare `(n, d)` import). When
+    // all five are present, `private_key_to_der` emits the complete PKCS#1
+    // `RSAPrivateKey` (9 elements) that real JDK / rustls need — a bare
+    // `(n, e, d)` DER parses back (via `RSAKeyFactory$Legacy`, the default
+    // `route_rsa_to_real` path) as `sun.security.rsa.RSAPrivateKeyImpl`
+    // (non-CRT), whose `getEncoded()` is an incomplete 572-byte PKCS#8 that
+    // rustls rejects (`failed to parse private key as RSA`). See
+    // docs/known-issues/http-server-sslengine-identity-singleton-clobber.md.
+    // Convention: `p > q`, matching JDK's `RSAKeyPairGenerator`.
+    pub p: Option<BigUint>,
+    pub q: Option<BigUint>,
+    pub dp: Option<BigUint>,   // d mod (p-1)
+    pub dq: Option<BigUint>,   // d mod (q-1)
+    pub qinv: Option<BigUint>, // q^{-1} mod p
 }
 
 impl Drop for RsaPrivateKey {
@@ -2014,6 +2030,19 @@ impl Drop for RsaPrivateKey {
         }
         for limb in &mut self.n.limbs {
             *limb = 0;
+        }
+        for crt in [
+            &mut self.p,
+            &mut self.q,
+            &mut self.dp,
+            &mut self.dq,
+            &mut self.qinv,
+        ] {
+            if let Some(v) = crt {
+                for limb in &mut v.limbs {
+                    *limb = 0;
+                }
+            }
         }
     }
 }
@@ -2115,10 +2144,17 @@ impl Rsa {
         let half = bits / 2;
         let e = BigUint::from_u64(65537);
         loop {
-            let p = Self::gen_prime(half, &mut rng);
-            let q = Self::gen_prime(half, &mut rng);
+            let mut p = Self::gen_prime(half, &mut rng);
+            let mut q = Self::gen_prime(half, &mut rng);
             if p.cmp(&q) == std::cmp::Ordering::Equal {
                 continue;
+            }
+            // JDK's `RSAKeyPairGenerator` orders `p > q` (the CRT coefficient
+            // is `q^{-1} mod p`, which requires the prime it is reduced modulo
+            // to be the larger one). Swap so the emitted key matches that
+            // convention exactly.
+            if p.cmp(&q) == std::cmp::Ordering::Less {
+                std::mem::swap(&mut p, &mut q);
             }
             let n = p.mul(&q);
             if n.bit_length() != bits {
@@ -2133,11 +2169,31 @@ impl Rsa {
                 continue;
             }
             if let Some(d) = e.modinv(&phi) {
+                // CRT parameters, computed once here so the full PKCS#1
+                // `RSAPrivateKey` can be emitted (see `private_key_to_der`).
+                // `qinv = q^{-1} mod p` exists because p and q are distinct
+                // primes (gcd(q, p) == 1); the `Option`-guarded fallback keeps
+                // keygen infallible if `modinv` ever returns `None`.
+                let dp = d.modulo(&p1);
+                let dq = d.modulo(&q1);
+                let qinv = match q.modinv(&p) {
+                    Some(v) => v,
+                    None => continue,
+                };
                 let pub_key = RsaPublicKey {
                     n: n.clone(),
                     e: e.clone(),
                 };
-                let priv_key = RsaPrivateKey { n, d, e: e.clone() };
+                let priv_key = RsaPrivateKey {
+                    n,
+                    d,
+                    e: e.clone(),
+                    p: Some(p),
+                    q: Some(q),
+                    dp: Some(dp),
+                    dq: Some(dq),
+                    qinv: Some(qinv),
+                };
                 return (pub_key, priv_key);
             }
         }
@@ -2246,16 +2302,39 @@ impl Rsa {
     }
 
     /// Serialize private key to PKCS#8 DER.
+    /// Encode a private key as the PKCS#1 `RSAPrivateKey` ASN.1 SEQUENCE.
+    ///
+    /// When the CRT parameters are present (every freshly generated key — see
+    /// `generate_keypair`), emits the COMPLETE 9-element form
+    /// `{version, n, e, d, p, q, dP, dQ, qInv}` that RFC 8017 / real JDK /
+    /// rustls require. A key without CRT params (an imported bare `(n, d)`)
+    /// falls back to the legacy 4-element `{version, n, e, d}` — accepted by
+    /// JDK as a non-CRT key, but not usable by rustls as a server identity.
+    ///
+    /// The prior implementation ALWAYS emitted only the 4-element form, so a
+    /// generated key round-tripped through `RSAKeyFactory$Legacy`
+    /// (`route_rsa_to_real`) came back as `sun.security.rsa.RSAPrivateKeyImpl`
+    /// (non-CRT), whose `getEncoded()` is the incomplete 572-byte PKCS#8 that
+    /// broke TLS server identities built from generated keys. See
+    /// docs/known-issues/http-server-sslengine-identity-singleton-clobber.md.
     pub fn private_key_to_der(key: &RsaPrivateKey) -> Vec<u8> {
         let n_bytes = key.n.to_bytes_be();
         let d_bytes = key.d.to_bytes_be();
         let e_bytes = key.e.to_bytes_be();
-        // Simplified: version + n + e + d (we omit p, q, dp, dq, qinv)
         let mut inner = Vec::new();
-        inner.extend_from_slice(&der_encode_integer(&[0])); // version
+        inner.extend_from_slice(&der_encode_integer(&[0])); // version = 0 (two-prime)
         inner.extend_from_slice(&der_encode_integer(&n_bytes));
         inner.extend_from_slice(&der_encode_integer(&e_bytes));
         inner.extend_from_slice(&der_encode_integer(&d_bytes));
+        if let (Some(p), Some(q), Some(dp), Some(dq), Some(qinv)) =
+            (&key.p, &key.q, &key.dp, &key.dq, &key.qinv)
+        {
+            inner.extend_from_slice(&der_encode_integer(&p.to_bytes_be()));
+            inner.extend_from_slice(&der_encode_integer(&q.to_bytes_be()));
+            inner.extend_from_slice(&der_encode_integer(&dp.to_bytes_be()));
+            inner.extend_from_slice(&der_encode_integer(&dq.to_bytes_be()));
+            inner.extend_from_slice(&der_encode_integer(&qinv.to_bytes_be()));
+        }
         der_encode_sequence(&inner)
     }
 }
@@ -5743,6 +5822,64 @@ mod tests {
         assert!(!priv_der.is_empty());
     }
 
+    /// A generated key MUST carry its CRT parameters and emit the complete
+    /// 9-element PKCS#1 `RSAPrivateKey`, not the legacy 4-element non-CRT form.
+    /// Regression guard for http-server-sslengine-identity-singleton-clobber:
+    /// a non-CRT DER round-tripped through `RSAKeyFactory$Legacy` becomes a
+    /// `sun.security.rsa.RSAPrivateKeyImpl` whose `getEncoded()` is the
+    /// incomplete 572-byte PKCS#8 that rustls rejects.
+    #[test]
+    fn rsa_generated_key_is_crt() {
+        let (_pub_key, priv_key) = Rsa::generate_keypair(1024);
+        let p = priv_key.p.as_ref().expect("p present");
+        let q = priv_key.q.as_ref().expect("q present");
+        let dp = priv_key.dp.as_ref().expect("dp present");
+        let dq = priv_key.dq.as_ref().expect("dq present");
+        let qinv = priv_key.qinv.as_ref().expect("qinv present");
+        // p > q (JDK convention).
+        assert_eq!(p.cmp(q), std::cmp::Ordering::Greater, "p must exceed q");
+        // n == p*q.
+        assert_eq!(p.mul(q).to_bytes_be(), priv_key.n.to_bytes_be(), "n == p*q");
+        // dp == d mod (p-1), dq == d mod (q-1).
+        let p1 = p.sub(&BigUint::one());
+        let q1 = q.sub(&BigUint::one());
+        assert_eq!(priv_key.d.modulo(&p1).to_bytes_be(), dp.to_bytes_be(), "dP");
+        assert_eq!(priv_key.d.modulo(&q1).to_bytes_be(), dq.to_bytes_be(), "dQ");
+        // qinv*q ≡ 1 (mod p).
+        assert_eq!(
+            qinv.mul(q).modulo(p).to_bytes_be(),
+            BigUint::one().to_bytes_be(),
+            "qInv*q ≡ 1 mod p"
+        );
+        // The DER carries the CRT tail: a 1024-bit CRT RSAPrivateKey is ~600+
+        // bytes; the non-CRT (n,e,d)-only form is ~350. Assert we're on the
+        // CRT side of that gap.
+        let der = Rsa::private_key_to_der(&priv_key);
+        assert!(
+            der.len() > 500,
+            "generated RSA-1024 key DER must be the full CRT form (got {} bytes)",
+            der.len()
+        );
+    }
+
+    /// A key with no CRT params (an imported bare `(n, d)`) still round-trips
+    /// through the legacy 4-element form — no panic, no CRT tail.
+    #[test]
+    fn rsa_noncrt_key_emits_legacy_form() {
+        let key = RsaPrivateKey {
+            n: BigUint::from_bytes_be(&[0x00, 0xC1, 0x00, 0x01]),
+            d: BigUint::from_bytes_be(&[0x03]),
+            e: BigUint::from_bytes_be(&[0x01, 0x00, 0x01]),
+            p: None,
+            q: None,
+            dp: None,
+            dq: None,
+            qinv: None,
+        };
+        let der = Rsa::private_key_to_der(&key);
+        assert!(!der.is_empty());
+    }
+
     // =======================================================================
     // ECDSA P-256 tests
     // =======================================================================
@@ -6318,7 +6455,16 @@ mod tests {
         let n = BigUint::from_bytes_be(&[0xFFu8; 32]);
         let d = BigUint::from_bytes_be(&[0x03]);
         let e = BigUint::from_bytes_be(&[0x01, 0x00, 0x01]);
-        let key = RsaPrivateKey { n, d, e };
+        let key = RsaPrivateKey {
+            n,
+            d,
+            e,
+            p: None,
+            q: None,
+            dp: None,
+            dq: None,
+            qinv: None,
+        };
         assert!(
             Rsa::sign_sha256(&key, b"anything").is_empty(),
             "sign with a sub-minimum modulus must yield an empty signature"
