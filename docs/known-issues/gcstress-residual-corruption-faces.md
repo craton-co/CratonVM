@@ -128,15 +128,54 @@ face) did **not** appear in any of the 56 runs. Either it is rarer than the
 sampled window or was also closed by the intervening wave; it stays listed
 below but is now unconfirmed on current dev.
 
+### Precise-JIT-oop-maps do NOT fix this residual (tested)
+
+Correcting an earlier characterization of this bug as "the deferred
+precise-jit-stack-maps work": that machinery is **built, not deferred**, and
+turning it on does **not** close this residual.
+
+- Provenance: built by `d6bf8104` (Stage 3 exact-RBP frame reg + safepoint-id
+  + precise relocation); flipped **default-ON** by `5b8864a0` ("fixes
+  SB-CRASH-04 A3 / ReflRepro A2 / Fork6 A4"); flipped **default-OFF** by
+  `d53c0e96` because the per-call/per-safepoint codegen is a ~6× throughput
+  tax (BUG-01,
+  `docs/internal/app-jvm-bugs/bug-01-junit-reflection-heavy-jit-frame-scan-throughput.md`).
+  As of 2026-07-07 `precise_jit_maps_enabled()` was **re-flipped default-ON**
+  (opt out `CRATONVM_NO_PRECISE_JIT_MAPS=1`) because the BUG-01 ~6× tax is gone on
+  current dev; `precise_maps = precise_jit_maps_enabled() || moving_young_enabled()`.
+  Turning precise on does NOT fix this residual either way (below), and an
+  interleaved load-controlled Fork6 A/B is 23/25 ALL-OK on vs 22/25 off (neutral).
+- Even when precise maps map every frame *slot*, `OopMapEntry` still has **no
+  register-oop bitmap** (`jit/src/lib.rs:52-73`): a register-only oop is
+  covered not by the map but by `emit_pre_safepoint_spill` (spills locals to
+  slots, only at *call* safepoints) + the xt-takeover's conservative 16-GPR
+  scan of *running* in-JIT peers. The leak is a caller-saved/RAX/
+  operand-scratch oop live at a *non-call* (loop back-edge) safepoint or in a
+  skipped caller frame.
+- **Empirical test on this lane** (`CRATONVM_PRECISE_JIT_MAPS=1`, 12 runs):
+  corruption did **not** drop — **10/12 runs corrupt vs baseline 4/12**, with
+  per-run marker counts jumping to 8-215 (still 1 wedge + 2 rep-fails).
+  Precise-on roots more frames, so the young mark follows *more* of the same
+  stale references (over-retention), surfacing more guard rejections rather
+  than fewer. The lane is load-nondeterministic (grade the ratio loosely) but
+  the direction is unambiguous: `CRATONVM_PRECISE_JIT_MAPS=1` is **not** the
+  fix here. (It IS the fix for bt18/A3 — golden checksums — so this Fork6
+  multi-threaded residual is either a partly-different bug or a gap the maps
+  don't cover.)
+
 ### Net
 
 The residual is a stale-reference / missed-remap bug in the multi-threaded
-`REAL_FORKJOINPOOL` GC path — **not** the JIT allocation codegen (refuted).
+`REAL_FORKJOINPOOL` GC path — **not** the JIT allocation codegen (refuted),
+and **not** closed by turning precise JIT oop maps back on (refuted, above).
 It presents mostly as contained guard warnings, sometimes as a rep-level
-Java exception, rarely as a wedge; it never crashes on current dev. This is
-the deferred precise-jit-stack-maps / register-resident-root work (JIT side)
-plus a residual missed-root under `--nojit`; kept OPEN here rather than
-retired because the underlying corruption is unfixed.
+Java exception, rarely as a wedge; it never crashes on current dev. Two
+distinct sub-problems remain: (JIT) a register-only oop escaping the
+spill+takeover coverage at a non-call safepoint — needs the register-oop
+bitmap `OopMapEntry` still lacks, not just the existing frame-slot maps; and
+(`--nojit`, zero JIT frames) a separate interpreter-side missed-root / A1
+stale-local, sparse after the map-node + `2dfdfddc` slot-tearing wave. Kept
+OPEN here rather than retired because the underlying corruption is unfixed.
 
 ## Residual faces
 
