@@ -16052,6 +16052,37 @@ fn execute_invoke_kind(
                                     thread.kind,
                                     stk,
                                 );
+                                // A2 forensic breadcrumb (CRATONVM_DBG_A2): was this
+                                // address EVER header-written by an allocator, with
+                                // what class/size? Distinguishes never-allocated /
+                                // allocated-then-clobbered / mid-object (double-
+                                // allocation or free-list overlap) for the reclaimed
+                                // victim — the observed victims had ALREADY all-zero
+                                // headers at sweep time, which the sweep record alone
+                                // cannot explain.
+                                let victim_addr = obj_ref.as_ptr() as usize;
+                                let hist = cratonvm_gc::a2dbg::history_at(victim_addr, 12);
+                                if hist.is_empty() {
+                                    eprintln!(
+                                        "[sweep-zero]   [A2] NO event touches {victim_addr:#x} (never header-written here, ring wrapped, or CRATONVM_DBG_A2 off)",
+                                    );
+                                } else {
+                                    for r in hist {
+                                        if r.kind == 0xFF {
+                                            eprintln!(
+                                                "[sweep-zero]   [A2] seq={} FREE @{:#x}",
+                                                r.seq, r.addr,
+                                            );
+                                        } else {
+                                            eprintln!(
+                                                "[sweep-zero]   [A2] seq={} ALLOC @{:#x} class_id={} kind={} et={} alen={} ns={} size={}{}",
+                                                r.seq, r.addr, r.class_id, r.kind, r.element_type,
+                                                r.array_length, r.num_slots, r.size,
+                                                if r.addr != victim_addr { " (covering)" } else { "" },
+                                            );
+                                        }
+                                    }
+                                }
                             }
                             // WildFly / JBoss Modules often hits this path on
                             // `ClassLoader`-typed invokevirtual sites when a
