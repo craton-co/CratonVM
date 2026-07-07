@@ -2950,7 +2950,7 @@ fn register_re1_socket(r: &mut NativeMethodRegistry) {
 fn re2_accept_into(
     ctx: &mut dyn NativeContext,
     listener_id: i32,
-    target: ObjectRef,
+    mut target: ObjectRef,
     timeout_ms: i32,
 ) -> MethodCallResult {
     if listener_id < 0 {
@@ -3019,9 +3019,19 @@ fn re2_accept_into(
         // (`stw-census` showed `pending=1 taken=0` unable to move). Mark each
         // poll-sleep slice as a blocked region, exactly like `Thread.sleep`'s
         // pump loop.
+        //
+        // `target` is a raw `ObjectRef` local held across the whole loop (it
+        // is written to after a connection is accepted) — use the `_refs`
+        // end-region variant so a moving GC that runs while we're blocked
+        // rewrites it, same as `re1_socket_read_stream`'s `buf`.
+        let mut blocked_refs = [Value::Object(Some(target))];
         ctx.begin_blocking_region();
         std::thread::sleep(Duration::from_millis(10));
-        ctx.end_blocking_region();
+        ctx.end_blocking_region_refs(&mut blocked_refs);
+        target = match blocked_refs[0] {
+            Value::Object(Some(o)) => o,
+            _ => target,
+        };
     };
 
     // Restore blocking mode on the shared listener if it survived, so later
