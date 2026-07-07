@@ -1,6 +1,18 @@
 # Keycloak `tests/base` — `keycloak-test-framework-remote-providers` artifact resolution failure
 
-## Status: 🔴 OPEN, untriaged (newly surfaced 2026-07-07)
+## Status: ✅ NOT A CRATONVM BUG — confirmed environment/Maven-setup gap (triaged 2026-07-07)
+
+**Reproduces identically under real HotSpot** (same class, same harness, `--java-home`
+swapped for a plain JDK 25 `java`): `org.keycloak.tests.model.SimpleModelTest` fails
+with the exact same `Failed to resolve artifact:
+org.keycloak.testframework:keycloak-test-framework-remote-providers` error and stack
+trace under both VMs. Since this is a pure Maven-reactor dependency-resolution failure
+inside Keycloak's own `org.keycloak.it.utils.Maven` helper — nothing CratonVM-specific
+is involved — this is an environment/checkout prerequisite gap (likely needs a full
+reactor `mvn install` of the whole `keycloak-parent` tree, network access to check for
+snapshot updates, or a `settings.xml` this checkout lacks), not a CratonVM defect. Moved
+out of `known-issues` per this project's triage convention; kept for context in case the
+underlying environment gap is worth fixing to unblock further `tests/base` measurement.
 
 ## Context
 
@@ -41,21 +53,14 @@ appears to do its own in-process dependency-graph resolution (reading the
 `keycloak-parent` reactor POM) rather than a flat local-repo lookup — that
 resolution is what's failing, not the artifact's physical presence.
 
-Not yet determined whether this is:
-- a genuine CratonVM bug (some native/real-bytecode gap in whatever
-  Maven-model-resolution machinery `org.keycloak.it.utils.Maven` depends on
-  — e.g. an incomplete `javax.xml`/DOM parse, a `ServiceLoader` gap in the
-  Maven resolver library, or similar), or
-- an environment/setup gap specific to this local checkout (e.g. needs a full
-  reactor `mvn install`, network access to check for updates, or a
-  `settings.xml` this session doesn't have) that would also fail under real
-  HotSpot and isn't a CratonVM defect at all.
-
-**Next step**: reproduce the identical `KcRunner` invocation under real
-HotSpot (`--java-home` swapped for a plain `java` run, same classpath) to
-determine whether this is CratonVM-specific or an environment prerequisite
-that both VMs would hit equally. If it reproduces under HotSpot too, this
-doc should be reclassified as an environment-setup task, not a CratonVM bug.
+**Resolved**: confirmed via a direct HotSpot repro (`-Vm hotspot`, same
+`SimpleModelTest`, same harness) that this fails identically under real
+HotSpot — same exception, same stack trace, same message. This rules out a
+CratonVM-side native/real-bytecode gap; the failure is entirely inside
+Keycloak's own `org.keycloak.it.utils.Maven` reactor-resolution helper and
+would need to be fixed at the environment/checkout level (full reactor `mvn
+install`, network access, or a missing `settings.xml`) regardless of which
+JVM runs the tests.
 
 ## Impact
 
