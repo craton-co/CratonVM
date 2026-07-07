@@ -10710,7 +10710,7 @@ fn native_bos_write_locked(ctx: &mut dyn NativeContext, args: &[Value]) -> Metho
         Some(Value::Int(v)) => *v,
         _ => 0,
     };
-    let (out_slot, buf_slot, count_slot) = bos_slots(ctx);
+    let (_out_slot, buf_slot, count_slot) = bos_slots(ctx);
     let count = match ctx.get_field(this, count_slot) {
         Value::Int(v) => v,
         _ => 0,
@@ -10721,13 +10721,24 @@ fn native_bos_write_locked(ctx: &mut dyn NativeContext, args: &[Value]) -> Metho
     };
     let buf_len = ctx.array_length(buf) as i32;
     if count >= buf_len {
-        // Flush buffer to output stream then write
+        // Real BufferedOutputStream.implWrite(int): flush the full buffer,
+        // then store the byte INTO the now-empty buffer. The byte must NOT
+        // be passed straight through to the inner stream as a 1-byte
+        // `write(int)` — that changes the chunk boundaries the inner stream
+        // observes. Seen as OutputStreamPublisherTests.chunkSize() (buffer
+        // size 3) receiving chunks "foo","b","arb","a","z" instead of
+        // "foo","bar","baz": the byte that triggered the flush skipped the
+        // buffer entirely and arrived as its own 1-byte write.
         native_bos_flush(ctx, args)?;
-        let inner = match ctx.get_field(this, out_slot) {
-            Value::Object(Some(o)) => o,
+        // Re-read `buf` after the flush's invoke_virtual rather than holding
+        // the array oop across it (same stale-native-local discipline as
+        // native_bos_flush_locked); flush reset `count` to 0.
+        let buf = match ctx.get_field(this, buf_slot) {
+            Value::Object(Some(b)) => b,
             _ => return Ok(None),
         };
-        ctx.invoke_virtual(inner, "write", "(I)V", &[Value::Int(byte_val)])?;
+        ctx.set_array_element(buf, 0, Value::Int(byte_val & 0xFF));
+        ctx.set_field(this, count_slot, Value::Int(1));
     } else {
         ctx.set_array_element(buf, count as usize, Value::Int(byte_val & 0xFF));
         ctx.set_field(this, count_slot, Value::Int(count + 1));
@@ -10756,10 +10767,61 @@ fn native_bos_write_bulk_locked(ctx: &mut dyn NativeContext, args: &[Value]) -> 
         Some(Value::Int(v)) => *v as usize,
         _ => 0,
     };
+    // Mirror the real BufferedOutputStream.implWrite(byte[], off, len)
+    // (JDK: `if (len >= maxBufSize) { flushBuffer(); out.write(b, off, len); }`)
+    // instead of looping per byte through write(int). The per-byte loop broke
+    // the chunk boundaries the inner stream observes: with buffer size N, a
+    // bulk write of exactly N bytes should arrive at the inner stream as ONE
+    // N-byte write (after flushing any pending bytes), but the loop delivered
+    // the flush-triggering byte as its own 1-byte `write(int)` (see
+    // native_bos_write_locked). OutputStreamPublisherTests.chunkSize() (chunk
+    // size 3, writes of "foo"/"bar"/"baz") got "foo","b","arb","a","z".
+    let (out_slot, buf_slot, count_slot) = bos_slots(ctx);
+    let buf_len = match ctx.get_field(this, buf_slot) {
+        Value::Object(Some(b)) => ctx.array_length(b),
+        _ => return Ok(None),
+    };
+    if len >= buf_len {
+        // At least as large as the buffer: flush pending bytes, then hand the
+        // caller's array to the inner stream as a single bulk write.
+        native_bos_flush(ctx, args)?;
+        let inner = match ctx.get_field(this, out_slot) {
+            Value::Object(Some(o)) => o,
+            _ => return Ok(None),
+        };
+        ctx.invoke_virtual(
+            inner,
+            "write",
+            "([BII)V",
+            &[
+                Value::Object(Some(src)),
+                Value::Int(off as i32),
+                Value::Int(len as i32),
+            ],
+        )?;
+        return Ok(None);
+    }
+    let mut count = match ctx.get_field(this, count_slot) {
+        Value::Int(v) => v.max(0) as usize,
+        _ => 0,
+    };
+    if len > buf_len.saturating_sub(count) {
+        // Not enough room: flush first (resets count to 0), then buffer.
+        native_bos_flush(ctx, args)?;
+        count = 0;
+    }
+    // Re-read `buf` after any flush rather than holding the array oop across
+    // its invoke_virtual (same stale-native-local discipline as
+    // native_bos_flush_locked).
+    let buf = match ctx.get_field(this, buf_slot) {
+        Value::Object(Some(b)) => b,
+        _ => return Ok(None),
+    };
     for i in 0..len {
         let b = ctx.get_array_element(src, off + i);
-        native_bos_write(ctx, &[Value::Object(Some(this)), b])?;
+        ctx.set_array_element(buf, count + i, b);
     }
+    ctx.set_field(this, count_slot, Value::Int((count + len) as i32));
     Ok(None)
 }
 
