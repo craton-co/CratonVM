@@ -136,27 +136,18 @@ fn normalize(n: &str) -> String {
 /// a name that maps to a charset the engine does not implement — the JDK
 /// reports both as `UnsupportedEncodingException`.
 ///
-/// Small copy — see `stream_decoder::normalize_supported`.
+/// Alias resolution goes through the shared table in
+/// `cratonvm_native_api::charset::canonical_charset_name`. The private copy
+/// this function used to carry went stale — it lacked `IBM850` and the
+/// multibyte families the engine has since gained, so
+/// `OutputStreamWriter(os, ibm850Charset)` silently fell back to encoding
+/// UTF-8 (Tomcat `TestDefaultServletEncoding*`: the DefaultServlet include
+/// conversion put `C2 BD` on an ibm850 wire instead of `AB`).
 fn normalize_supported(name: &str) -> Option<String> {
-    let canon = match name.to_uppercase().replace(['-', '_'], "").as_str() {
-        "UTF8" => "UTF-8",
-        "UTF16" => "UTF-16",
-        "UTF16BE" => "UTF-16BE",
-        "UTF16LE" => "UTF-16LE",
-        "UTF32BE" => "UTF-32BE",
-        "UTF32LE" => "UTF-32LE",
-        "UTF32" => "UTF-32",
-        "USASCII" | "ASCII" => "US-ASCII",
-        "ISO88591" | "LATIN1" => "ISO-8859-1",
-        "ISO88592" => "ISO-8859-2",
-        "ISO885915" => "ISO-8859-15",
-        "WINDOWS1252" | "CP1252" => "windows-1252",
-        "WINDOWS1251" | "CP1251" => "windows-1251",
-        "KOI8R" => "KOI8-R",
-        _ => return None,
-    };
+    let canon = engine::canonical_charset_name(name)?;
     // Probe with an empty slice: the engine's name `match` returns
-    // `UnsupportedCharset` before encoding anything, so this is free.
+    // `UnsupportedCharset` before encoding anything, so this is free —
+    // and it keeps canonical-but-codecless names (e.g. KOI8-U) rejected.
     if matches!(
         engine::encode_chars(canon, &[]),
         Err(engine::CodingError {
@@ -869,11 +860,24 @@ mod tests {
     }
 
     #[test]
-    fn normalize_supported_rejects_real_but_unimplemented_charsets() {
-        // Real charset names the encoder engine does not implement must be
-        // rejected, not silently encoded as UTF-8.
-        assert_eq!(normalize_supported("Shift_JIS"), None);
-        assert_eq!(normalize_supported("GBK"), None);
+    fn normalize_supported_accepts_engine_supported_charsets() {
+        // These were rejected by the old stale private alias table even
+        // though the engine encodes them (IBM850 hand-written, the CJK
+        // families via encoding_rs) — the shared table accepts them.
+        assert_eq!(
+            normalize_supported("Shift_JIS").as_deref(),
+            Some("Shift_JIS")
+        );
+        assert_eq!(normalize_supported("GBK").as_deref(), Some("GBK"));
+        assert_eq!(normalize_supported("ibm850").as_deref(), Some("IBM850"));
+        assert_eq!(normalize_supported("Cp850").as_deref(), Some("IBM850"));
+    }
+
+    #[test]
+    fn normalize_supported_rejects_canonical_but_codecless_charsets() {
+        // KOI8-U canonicalizes in the shared table but the engine has no
+        // codec for it — the engine probe must still reject the name.
+        assert_eq!(normalize_supported("KOI8-U"), None);
     }
 
     #[test]
