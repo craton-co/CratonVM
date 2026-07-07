@@ -195,3 +195,26 @@ The pre-existing residual families are tracked in
 (typeNamePattern NPE + ITSE) and
 [`gcstress-residual-corruption-faces.md`](../known-issues/gcstress-residual-corruption-faces.md)
 (the ZonedDateTimeTest GC livelock face).
+
+## Concurrent finding merged 2026-07-07 — two more affected classes (independent Windows rerun)
+
+While this fix was in flight, a concurrent session's 4-shard Windows rerun of the 121-class
+non-passed list (dev `d0a779f6`) independently reproduced the identical growing-duplicate-`?`
+signature on two classes OUTSIDE `type.temporal.*`:
+
+- `org.hibernate.orm.test.bytecode.enhancement.basic.ExtendedEnhancementNonStandardAccessTest`
+  (`insert into abstract (...9 columns...) values (????,????,????,…)`)
+- `org.hibernate.orm.test.query.hql.FunctionTests`
+  (`insert into EntityOfLists_basic (…) values (????,????,????)` during fixture setup)
+
+That observation matches this doc's root cause exactly (the corruption is a general
+JIT-deopt side-effect replay on ANY hot SQL-string-building path, nothing temporal-specific)
+and predicted the "widen the search scope" conclusion this fix already embodies. Both classes
+are expected fixed by this branch (same mechanism, same paths); re-verify them in the next
+non-passed-list rerun rather than as a blocking gate here.
+
+**Harness gotcha recorded by that session (still open, worth fixing separately):**
+`rerun.sh`/`rerun-linux.sh` categorize `PASS` as `failed==0 && aborted==0 && found>0` without
+requiring `ok == found` — a class that dies in fixture setup before any @Test runs
+(`found=123 started=0 ok=0`) is mis-reported as PASS. Any "PASS" row with `ok != found` is a
+false positive.

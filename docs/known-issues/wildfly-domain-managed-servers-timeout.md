@@ -1,6 +1,6 @@
 # WildFly domain managed servers do not reach started state
 
-Status: OPEN (proximate cause updated 2026-07-06 — see below)
+Status: OPEN (2026-07-07: the real Arquillian test now RUNS end-to-end under CratonVM nested processes — see the 2026-07-07 update at the bottom. Two distinct residuals isolated: no-JIT boots both servers to WFLYSRV0025 started but awaitServers never sees them (management-model propagation gap); JIT-on fails HC interface resolution WFLYSRV0082 (a JIT miscompile). Both new, both OPEN.)
 Date found: 2026-07-05
 Area: WildFly domain mode startup under CratonVM
 
@@ -294,3 +294,97 @@ Also still open: the corrupt-`Value`-cell diagnostic
 domain-mode-specific behavior under the flag, and the original
 `DefaultConfigSmokeTestCase` verification (still needs Maven + a
 `wildfly-core` testsuite checkout on a probe host).
+
+## 2026-07-07 update — working end-to-end Arquillian harness established; DefaultConfigSmokeTestCase now RUNS under CratonVM nested processes; two new distinct residual blockers isolated
+
+This is the first session to actually run the real Arquillian domain test with the
+domain's own nested process-controller / host-controller / servers executing on
+CratonVM (every prior session was blocked on infrastructure or on the MSC real-start
+gate). Built on the 11 MSC real-start boot fixes landed earlier the same day
+(`4b2508cf`, see `wildfly-domain-managed-servers-timeout`'s sibling work) plus the
+three merged fixes from the corrupt-Value doc (`48b3c2d2` / `952f0093` /
+`jit-instanceof-uaf`).
+
+### Harness recipe (reusable — prior sessions could not get this far)
+
+The critical detail is that the domain's nested processes do NOT inherit the outer
+Surefire `-Djvm`; they are launched from `-Djboss.test.host.primary.jvmhome` /
+`-Djboss.test.host.primary.controller.jvmhome` (read by
+`DomainTestSupport`'s static init). Both must point at a directory whose `bin/java`
+runs CratonVM, or the nested domain silently runs on the outer HotSpot and the result
+is meaningless.
+
+```bash
+# Fork shim: a bin/java that re-execs a real JDK17 but sets CratonVM env, so the
+# testsuite's own `-Djvm`/jvmhome selection lands on CratonVM for nested processes.
+#   /data/data/forkjdk-msvt/bin/java :
+#     #!/bin/bash
+#     export JAVA_HOME=/data/data/fakejdk-msvt          # bin/java -> cratonvm binary
+#     export CRATONVM_JAVA_HOME=/data/data/jdk25-real
+#     # (add `export CRATONVM_DISABLE_JIT=1` for the no-JIT variant)
+#     exec /usr/lib/jvm/java-17-openjdk-amd64/bin/java "$@"
+
+# Invoke the already-extracted Maven distribution directly (the wrapper's bootstrap
+# JVM hangs on the shared ~/.m2 cache under host load — see fifth-session note):
+cd apps/wildfly/testsuite/domain
+JAVA_HOME=/usr/lib/jvm/java-17-openjdk-amd64 \
+~/.m2/wrapper/dists/apache-maven-3.6.3-bin/*/apache-maven-3.6.3/bin/mvn -B -ntp \
+  -Dsurefire.default-test.phase=test \
+  -Dtest=DefaultConfigSmokeTestCase \
+  -DfailIfNoTests=false -Dsurefire.failIfNoSpecifiedTests=false \
+  "-Djvm=/data/data/forkjdk-msvt/bin/java" \
+  "-Djboss.test.host.primary.jvmhome=/data/data/fakejdk-msvt" \
+  "-Djboss.test.host.primary.controller.jvmhome=/data/data/fakejdk-msvt" \
+  "-Djboss.test.host.primary.address=127.0.0.2" \
+  "-Dtimeout.factor=800" \
+  test
+```
+
+Notes: `-Djvm` must end in an actual `java` executable (Surefire validates the path);
+bind the test to `127.0.0.2` to dodge the shared host's occupied `127.0.0.1:9990`;
+`timeout.factor=800` scales the Arquillian `awaitServers` window (default 120s) so an
+interpreted boot is not falsely timed out. A stray earlier run can leave orphaned
+`[Host Controller]`/`[Server:...]` HotSpot processes squatting `:9990`/`:9999` — kill
+any `etimes > 3600` ones first (`ps -eo pid,etimes,args | grep '\[Host Controller\]'`).
+
+### Result: the test executes end-to-end. Both boot modes now reach real domain
+### execution — and each surfaces a different, newly-isolated residual.
+
+**No-JIT (`CRATONVM_DISABLE_JIT=1` nested):** the host-controller boots fully and BOTH
+managed servers reach `WFLYSRV0025 ... started in ~3.9s - Started 307 of 584 services`
+(confirmed in `target/domains/.../servers/server-{one,two}/log/server.log`). The test
+nonetheless fails with the original `TimeoutException: Managed servers were not started
+within [N] seconds` — i.e. the servers ARE started, but the piece the Arquillian
+`DomainLifecycleUtil.awaitServers` polls (the host-controller's view of managed-server
+"started" state, via its management model / server-registration handshake) never
+reports them as started to the domain client. This is a NEW, distinct residual: it is
+NOT interface resolution (that passes here), NOT the `HIB-CV-32` corrupt-`Value` guard
+(which did not fire at all — see the sibling doc's 2026-07-07 update), and NOT the MSC
+real-start gate (fixed). Next step: instrument/trace the HC-side
+`ServerRegistrationService` / domain-controller server-status propagation, or capture
+the domain client's `read-attribute(server-state)` responses, to see why `started`
+never propagates even though the server process logged it.
+
+**JIT-on (default):** boot fails EARLIER, at ~311s, with `WFLYSRV0082: failed to
+resolve interface management` (management + public), rolling the HC back to
+`WFLYHC0034` abort. This does NOT reproduce under no-JIT (which resolves the same
+`127.0.0.x` interface config fine), so it is a JIT miscompile on the interface-
+resolution path. Ruled out this session: it is NOT `NetworkInterfaceService.
+resolveInterface` itself — a standalone reflective probe calling that exact method in
+an 8000-iteration hot loop (enough to trigger JIT) resolved 8000/8000 on the JIT
+binary; and the `getAll()` NetworkInterface native correctly returns one loopback
+interface (confirmed via a `CRATONVM_DBG_NETIF` trace: `[netif] getAll: ctor ok=true ->
+returning 1 interface`). The miscompile is therefore somewhere in the XML-model →
+`InterfaceCriteria` construction / expression-resolution path
+(`${jboss.bind.address.management:127.0.0.1}` → `ModelNode` → criteria), not the
+resolution loop the probe exercised — not yet pinned to a method. A
+`CRATONVM_JIT_DENY` / `CRATONVM_JIT_BISECT_SKIP` bisect over the interface-model
+handlers is the next step.
+
+### Status
+
+Both blockers are real and newly isolated, but neither is fixed, so this doc stays
+OPEN. The concrete, durable gain this session is the harness above plus the narrowing:
+the domain now boots far enough under CratonVM that the failure is a specific
+management-model/JIT issue rather than the "never reaches sustained execution" wall
+every prior session hit.
