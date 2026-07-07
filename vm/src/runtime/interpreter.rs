@@ -20039,6 +20039,28 @@ fn native_shadow_suppressed_by_redefine(shared: &SharedVm, class_name: &str) -> 
         return false;
     }
     let cm = shared.class_manager.read();
+    native_shadow_suppressed_by_redefine_in(&cm, class_name)
+}
+
+/// Guard-reusing variant of [`native_shadow_suppressed_by_redefine`] for call
+/// sites that already hold a `class_manager` read guard. `parking_lot`
+/// `RwLock::read()` is task-fair and NOT reentrant: when a writer queues
+/// between a thread’s first and second read acquisition of the same lock,
+/// the second read parks behind the writer while the first guard blocks that
+/// writer forever — a same-thread self-deadlock. `try_stackless_invoke`’s
+/// native-override hierarchy walk hit exactly this once Mockito’s inline
+/// mock maker armed `any_class_redefined` (the nested acquisition is only
+/// reached after that flag is set), wedging ~25-50% of
+/// `HttpComponentsClientHttpRequestFactoryTests` runs in teardown while
+/// `load_class_concurrent`’s write was pending on another thread.
+#[inline]
+fn native_shadow_suppressed_by_redefine_in(
+    cm: &crate::classloading::ClassManager,
+    class_name: &str,
+) -> bool {
+    if !crate::classloading::any_class_redefined() {
+        return false;
+    }
     match cm.get_loaded_class_id(class_name) {
         Some(cid) => cm.class_redefine_generation(cid) > 0,
         None => false,
@@ -20564,7 +20586,7 @@ fn try_stackless_invoke(
             // calls) silently bypassed the mock's advice and ran the real
             // native instead. Skip an ancestor's native the same way the
             // receiver-class check does.
-            let parent_redefined = native_shadow_suppressed_by_redefine(shared, &parent.name)
+            let parent_redefined = native_shadow_suppressed_by_redefine_in(&cm, &parent.name)
                 && !redefine_immune_reflection_native(&parent.name, method_name)
                 && !redefine_immune_string_builder_native(&parent.name, method_name, descriptor)
                 && !redefine_immune_path_native(&parent.name, method_name, descriptor);

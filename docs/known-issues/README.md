@@ -4,9 +4,9 @@ This folder collects CratonVM-only defects found while running upstream Java
 suites. The docs had grown to describe the **same underlying bug from several
 angles**; this index is the consolidated map. Read it first.
 
-## 2026-07-06 http.client class_manager RwLock writer starvation (branch fix/httpclient-vtable-classmanager-abba-deadlock-0706c)
+## 2026-07-06/07 http.client class_manager RwLock recursive-read deadlock — FIXED (branch fix/class-manager-writer-starvation-20260706)
 
-- [class-manager-rwlock-writer-starvation.md](class-manager-rwlock-writer-starvation.md) -- follow-up to the AB-BA `vtable_manager`/`class_manager` lock-order deadlock FIXED this session (commit `caa4ee65`, cut `HttpComponentsClientHttpRequestFactoryTests` hang rate from 65% to 25%): the residual hangs are a separate, still-open bug -- `execute_invokestatic`'s `class_manager` read guard, held across a superclass-chain walk, can starve a queued writer (`load_class_concurrent`) under heavy concurrent read pressure, since `parking_lot::RwLock`'s default (non-`_fair`) mode is not strictly writer-preferring. Confirmed via two live gdb captures 2 seconds apart showing identical thread state (rules out a snapshot artifact). Next step: cache the native-override lookup per call site the same way the vtable fast path already does, rather than re-acquiring the read lock on every `invokestatic`.
+- FIXED and retired: the "writer starvation" residual (~25-50% `HttpComponentsClientHttpRequestFactoryTests` teardown hang surviving the `caa4ee65`/`60e2b20d` AB-BA fixes) was actually a same-thread RECURSIVE READ deadlock on `class_manager`: `try_stackless_invoke`'s native-override hierarchy walk held a read guard while `native_shadow_suppressed_by_redefine` re-acquired the same lock, and parking_lot's task-fair policy parks the nested read behind any queued writer (`load_class_concurrent`). Proved via debug-info gdb (lock state word `0x1b` = 1 held reader + parked writer; the nested acquisition was inlined and invisible in the original symbols-only captures). Fix: guard-reusing `native_shadow_suppressed_by_redefine_in(&cm, ..)`. 0/40 + 0/20 hangs post-fix (was 2 hangs in 3 attempts). Full writeup: `docs/internal/fixed-suite-bugs/class-manager-rwlock-recursive-read-deadlock-FIXED.md`.
 
 ## 2026-07-06 http.client Flow/Reactive hangs (branch fix/httpclient-jdkclient-hangs-0706b)
 
@@ -128,7 +128,7 @@ hang rate from 65% to 25%). Full fix writeup moved to
 [`docs/internal/fixed-suite-bugs/http-client-cluster-redefine-dispatch-fixes-FIXED.md`](../internal/fixed-suite-bugs/http-client-cluster-redefine-dispatch-fixes-FIXED.md).
 Residuals split into their own focused docs:
 
-- [class-manager-rwlock-writer-starvation.md](class-manager-rwlock-writer-starvation.md) — the residual 25% hang rate above; `parking_lot::RwLock`'s non-fair mode lets readers starve a queued writer.
+- ~~class-manager-rwlock-writer-starvation.md~~ — the residual 25% hang rate above: FIXED 2026-07-07 (was a same-thread recursive-read deadlock, not writer starvation — see `docs/internal/fixed-suite-bugs/class-manager-rwlock-recursive-read-deadlock-FIXED.md`).
 - [http-client-simpleclienthttpresponsetests-mockito-dispatch-bugs.md](http-client-simpleclienthttpresponsetests-mockito-dispatch-bugs.md) — `SimpleClientHttpResponseTests`'s `UnfinishedVerificationException` (order-dependent) + an intermittent `(class, method, descriptor)`-substituting `NoSuchMethodError`; several hypotheses refuted, root cause still open.
 - [spring-web-flow-outputstreamwriter-close-corruption.md](spring-web-flow-outputstreamwriter-close-corruption.md) — 2 of 4 "genuine hang" classes root-caused to `StreamEncoder.closed` being `true` immediately from `OutputStreamWriter` construction (mechanism itself still unexplained); other 2 need separate investigation.
 - [http-client-reactor-windows-timeout-linux-epoll-gap.md](http-client-reactor-windows-timeout-linux-epoll-gap.md) — `ReactorClientHttpRequestFactoryTests`: a documented Linux-only `EPollSelectorImpl` gap (not a bug) plus an uninvestigated Windows-side TIMEOUT.
