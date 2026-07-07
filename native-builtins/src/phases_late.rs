@@ -39793,6 +39793,20 @@ fn kmf_keystore_id_by_identity() -> &'static parking_lot::Mutex<rustc_hash::FxHa
     T.get_or_init(|| parking_lot::Mutex::new(rustc_hash::FxHashMap::default()))
 }
 
+/// FIX (tomcat-clientauth-engine-config): same pattern as
+/// `kmf_keystore_id_by_identity` immediately above, for
+/// `javax/net/ssl/TrustManagerFactory` — maps the TMF object to the
+/// keystore registry id its `init(KeyStore)` was called with, so
+/// `getTrustManagers()` (below) can build a real, functional
+/// `X509TrustManagerImpl`-shaped `TrustManager` instead of a bare-
+/// interface-stamped stub whose `checkClientTrusted`/`checkServerTrusted`
+/// have no Code.
+fn tmf_keystore_id_by_identity() -> &'static parking_lot::Mutex<rustc_hash::FxHashMap<i32, i32>> {
+    static T: std::sync::OnceLock<parking_lot::Mutex<rustc_hash::FxHashMap<i32, i32>>> =
+        std::sync::OnceLock::new();
+    T.get_or_init(|| parking_lot::Mutex::new(rustc_hash::FxHashMap::default()))
+}
+
 pub(crate) fn register_p68_ssl(r: &mut NativeMethodRegistry) {
     let __prev_cat = r.current_category();
     r.set_category(cratonvm_native_api::NativeKind::Bridge);
@@ -40650,6 +40664,22 @@ pub(crate) fn register_p68_ssl(r: &mut NativeMethodRegistry) {
                 if !state.anchor_ders.is_empty() {
                     crate::t27_tls::set_pending_tm_trust_roots(state.anchor_ders);
                 }
+                // FIX (tomcat-clientauth-engine-config): also stash the
+                // keystore id via identity hash so getTrustManagers() below
+                // can build a REAL, functional TrustManager (same trap/fix
+                // as the sibling KeyManagerFactory.getKeyManagers() — see
+                // that handler's doc comment for the full story: a bare
+                // alloc_concurrent_synthetic(ctx, "javax/net/ssl/
+                // X509TrustManager", ...) stamps the INTERFACE's own class
+                // id, so checkClientTrusted/checkServerTrusted/
+                // getAcceptedIssuers have no Code and throw
+                // AbstractMethodError the moment real bytecode calls one
+                // directly instead of going through this crate's own
+                // post-handshake `engine_run_trust_check` native path).
+                let ih = ctx.identity_hash_code(this);
+                if ih != 0 {
+                    tmf_keystore_id_by_identity().lock().insert(ih, ks_id);
+                }
             }
         }
         Ok(None)
@@ -40671,22 +40701,72 @@ pub(crate) fn register_p68_ssl(r: &mut NativeMethodRegistry) {
         "getTrustManagers",
         "()[Ljavax/net/ssl/TrustManager;",
         |ctx, args| {
-            // Forward the configured KeyStore into the TrustManager so
-            // chain verification sees the anchors we were told about.
-            let keystore_ref = if let Some(Value::Object(Some(this))) = args.first() {
-                if ctx.object_num_fields(*this) > 1 {
-                    ctx.get_field(*this, 1)
+            // FIX (tomcat-clientauth-engine-config): this used to always
+            // return a bare `alloc_concurrent_synthetic(ctx,
+            // "javax/net/ssl/X509TrustManager", 2)` — an object stamped
+            // with the INTERFACE's own class id. `getAcceptedIssuers()` on
+            // such an object was already known to throw
+            // `AbstractMethodError` (see the `FIX
+            // (x509-trustmanager-abstractmethod-20260707)` narrow rescue
+            // wired in `lib.rs` via `t27_tls::register_accepted_issuers`,
+            // registered directly on the bare interface since accepted-
+            // issuers enumeration is instance-independent — platform trust
+            // roots). `checkClientTrusted`/`checkServerTrusted` need real
+            // PER-INSTANCE state (which keystore's anchors to validate
+            // against), which a single interface-wide native cannot
+            // provide, so they were never given the same rescue and kept
+            // throwing `AbstractMethodError` for any caller invoking one
+            // directly (confirmed via this session's `CRATONVM_DBG_NOCODE`
+            // tracing against Tomcat's `TestClientCert`/
+            // `engine_run_trust_check`'s post-handshake
+            // `checkClientTrusted` call — see
+            // `docs/known-issues/tls-ocsp-clientcert-validation-not-
+            // enforced.md`, "Residual #2 implementation" for the full
+            // trace). Fixed the same way as the sibling
+            // `KeyManagerFactory.getKeyManagers()` fix just above: build
+            // the real, functional `FQN_X509_TM`-shaped object
+            // `x509_manager.rs`'s `tmf_engine_get_trust_managers` already
+            // produces for the SPI-delegation path, keyed off the SAME
+            // keystore id `init(KeyStore)` (above) stashed via
+            // `tmf_keystore_id_by_identity`. Falls back to the old (non-
+            // functional but allocation-safe) stub when no keystore id was
+            // captured (matches original behavior for `init((KeyStore)
+            // null)` / a `getTrustManagers()` call with no preceding
+            // `init`).
+            let this = obj_arg(args, 0)?;
+            let ih = ctx.identity_hash_code(this);
+            let ks_id = if ih != 0 {
+                tmf_keystore_id_by_identity()
+                    .lock()
+                    .get(&ih)
+                    .copied()
+                    .unwrap_or(0)
+            } else {
+                0
+            };
+            let tm = if ks_id != 0 {
+                let state = crate::x509_manager::build_trust_manager_state(ks_id);
+                let tm_id = crate::x509_manager::register_trust_manager_state(state);
+                let tm = alloc_concurrent_synthetic(ctx, crate::x509_manager::FQN_X509_TM, 2);
+                crate::x509_manager::set_tm_id(ctx, tm, tm_id);
+                tm
+            } else {
+                // Forward the configured KeyStore into the fallback
+                // TrustManager so chain verification (if anything still
+                // reads this legacy layout) sees the anchors we were told
+                // about. X509TrustManager layout: field 0 = KeyStore
+                // reference (may be null → platform default), field 1 =
+                // provider cookie.
+                let keystore_ref = if ctx.object_num_fields(this) > 1 {
+                    ctx.get_field(this, 1)
                 } else {
                     Value::Object(None)
-                }
-            } else {
-                Value::Object(None)
+                };
+                let tm = alloc_concurrent_synthetic(ctx, "javax/net/ssl/X509TrustManager", 2);
+                ctx.set_field(tm, 0, keystore_ref);
+                ctx.set_field(tm, 1, Value::Int(0));
+                tm
             };
-            // X509TrustManager layout: field 0 = KeyStore reference (may be
-            // null → platform default), field 1 = provider cookie.
-            let tm = alloc_concurrent_synthetic(ctx, "javax/net/ssl/X509TrustManager", 2);
-            ctx.set_field(tm, 0, keystore_ref);
-            ctx.set_field(tm, 1, Value::Int(0));
             let arr = ctx.new_array(cratonvm_types::ArrayElementType::Reference, 1);
             ctx.set_array_element(arr, 0, Value::Object(Some(tm)));
             Ok(Some(Value::Object(Some(arr))))

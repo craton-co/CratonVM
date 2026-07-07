@@ -2875,7 +2875,7 @@ pub fn check_endpoint_identity(
 
 pub(crate) const FQN_SUN_X509_KM: &str = "sun/security/ssl/SunX509KeyManagerImpl";
 const FQN_X509_KM: &str = "sun/security/ssl/X509KeyManagerImpl";
-const FQN_X509_TM: &str = "sun/security/ssl/X509TrustManagerImpl";
+pub(crate) const FQN_X509_TM: &str = "sun/security/ssl/X509TrustManagerImpl";
 const FQN_PKIX_VALIDATOR: &str = "sun/security/validator/PKIXValidator";
 const FQN_KMF_SUN_X509: &str = "sun/security/ssl/KeyManagerFactoryImpl$SunX509";
 const FQN_TMF_SIMPLE: &str = "sun/security/ssl/TrustManagerFactoryImpl$SimpleFactory";
@@ -3489,7 +3489,7 @@ fn get_tm_id(ctx: &mut dyn NativeContext, this: ObjectRef) -> i32 {
     0
 }
 
-fn set_tm_id(ctx: &mut dyn NativeContext, this: ObjectRef, id: i32) {
+pub(crate) fn set_tm_id(ctx: &mut dyn NativeContext, this: ObjectRef, id: i32) {
     ctx.set_field_by_name(this, "cratonvm$x509tm$id", Value::Int(id));
     let n = ctx.object_num_fields(this);
     if n > 0 {
