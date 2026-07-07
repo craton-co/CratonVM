@@ -9300,20 +9300,6 @@ fn resume_real_ir_deopt(
     }
 }
 
-/// deopt-osr Step 8 follow-up (P4): `CRATONVM_OSR_EXIT_TRANSFER` (default-OFF,
-/// read-once). When ON, a frame-deopt taken inside OSR-entered code transfers the
-/// JIT-advanced loop state into the LIVE interpreter frame and resumes the loop
-/// body there (a *true* OSR-exit), instead of the safe reject that discards the
-/// JIT-advanced state and re-runs those iterations in the interpreter. OFF ⇒ the
-/// validated Step-8 reject ⇒ byte-identical to today. Consulted together with the
-/// per-method `can_osr_exit` flag and `cratonvm_jit::deopt_real_enabled()` at the
-/// OSR sink, so OSR-exit can never run half-on.
-fn osr_exit_transfer_enabled() -> bool {
-    use std::sync::OnceLock;
-    static FLAG: OnceLock<bool> = OnceLock::new();
-    *FLAG.get_or_init(|| std::env::var_os("CRATONVM_OSR_EXIT_TRANSFER").is_some())
-}
-
 /// deopt-osr Step 8 follow-up (P4) — TRUE OSR-exit: transfer the JIT-advanced loop
 /// state from a reconstructed frame into the LIVE interpreter frame at `frame_idx`
 /// (overwrite locals + operand stack in place, set pc), so the interpreter resumes
@@ -21059,33 +21045,78 @@ fn execute_invokestatic(
             method_class_name, method_name, method_descriptor, is_native, direct_native
         );
     }
+    // Self-call identity fix (2026-07-06 — see hib-proxyclassreuse-loader-
+    // blind-class-resolution.md Residual B): when the invokestatic's
+    // constant-pool owner class NAME textually equals the CURRENTLY
+    // EXECUTING class's own name, that class is by definition already
+    // loaded/linked/initialized — it is literally running this bytecode
+    // right now. Record its `ClassId` directly (`current_class_id`) instead
+    // of letting the dispatch below re-resolve the name through the global,
+    // loader-blind `get_loaded_class_id` (which answers "whichever loader's
+    // copy of this name exists" and is silently wrong whenever 2+ DIFFERENT
+    // loaders each define their own class under the same simple name — the
+    // common case for Groovy, which names closure literals positionally
+    // per-script: `<Script>$_run_closure1`, `$_run_closure2`, ... — so two
+    // unrelated scripts compiled by two different `GroovyClassLoader`s
+    // routinely produce two DISTINCT classes sharing the identical name).
+    //
+    // Concretely: a Groovy closure's `doCall` calling its OWN private
+    // synthetic class-literal-cache accessor (`$get$$class$Foo()`, a
+    // compiler-generated `invokestatic` self-call) re-resolved the owner by
+    // name and landed on a DIFFERENT script's same-named closure class
+    // instead of the class that is actually executing — `NoSuchMethodError`
+    // on the synthetic accessor, since the wrong script's copy never
+    // declared that particular helper. Spring `GroovyBeanDefinitionReaderTests`
+    // (two sequential test methods, each a fresh `GroovyShell`/
+    // `GroovyClassLoader`, each producing a `beans$_run_closure1`)
+    // reproduces this deterministically (confirmed with a minimal
+    // `KRunMethod` 2-test repro before this fix; not reproducible with a
+    // simple 2-`GroovyShell` top-level-closure repro, which already worked
+    // — the bug needs a SELF-call inside the closure body, not merely
+    // distinct closure identity).
+    //
+    // `self_class_id` feeds BOTH the class-init step below and the
+    // `try_stackless_invoke` dispatch override further down, so the method
+    // lookup itself (not just class initialization) uses the correct,
+    // already-known identity for a self-call.
+    let self_class_id = shared
+        .class_manager
+        .read()
+        .get_class(current_class_id)
+        .filter(|c| c.name.as_ref() == method_class_name.as_ref())
+        .map(|_| current_class_id);
+
     if !is_native {
-        // Load and initialize the target class.
-        // Always go through load_class_concurrent so synthetic stubs
-        // get upgraded to real classes when the .class file is available.
-        let target_class_id = match shared.load_class_concurrent(&method_class_name) {
-            Ok(id) => id,
-            Err(e) => {
-                // Loader-aware rescue: the `invokestatic` owner may live ONLY
-                // behind the referencing class's defining loader (e.g. a webapp
-                // class calling a static method on a sibling in its own
-                // `/WEB-INF/lib` jar — JSTL `JstlBaseTLV` →
-                // `XmlUtil.newXMLReader`). Drive that loader before failing.
-                // Strictly additive — only on a global miss.
-                match drive_defining_loader_load(
-                    shared,
-                    thread,
-                    current_class_id,
-                    &method_class_name,
-                ) {
-                    Some(id) => id,
-                    None => {
-                        return Err(convert_class_not_found(
-                            shared,
-                            thread,
-                            &method_class_name,
-                            e.into(),
-                        ))
+        let target_class_id = if let Some(id) = self_class_id {
+            id
+        } else {
+            // Load and initialize the target class.
+            // Always go through load_class_concurrent so synthetic stubs
+            // get upgraded to real classes when the .class file is available.
+            match shared.load_class_concurrent(&method_class_name) {
+                Ok(id) => id,
+                Err(e) => {
+                    // Loader-aware rescue: the `invokestatic` owner may live ONLY
+                    // behind the referencing class's defining loader (e.g. a webapp
+                    // class calling a static method on a sibling in its own
+                    // `/WEB-INF/lib` jar — JSTL `JstlBaseTLV` →
+                    // `XmlUtil.newXMLReader`). Drive that loader before failing.
+                    // Strictly additive — only on a global miss.
+                    match drive_defining_loader_load(
+                        shared,
+                        thread,
+                        current_class_id,
+                        &method_class_name,
+                    ) {
+                        Some(id) => id,
+                        None => {
+                            return Err(convert_class_not_found(
+                                shared,
+                                thread,
+                                &method_class_name,
+                                e.into(),
+                            ))
+                        }
                     }
                 }
             }
@@ -21179,7 +21210,7 @@ fn execute_invokestatic(
         &method_descriptor,
         &args,
         true,
-        None,
+        self_class_id,
     )? {
         CachedCallResult::FramePushed => {
             populate_invoke_cache(thread, shared, current_class_id, cp_index, false);
@@ -21192,15 +21223,32 @@ fn execute_invokestatic(
         CachedCallResult::CacheMiss => {}
     }
 
-    // Fallback: recursive dispatch
-    let result = invoke_or_native(
-        shared,
-        thread,
-        &method_class_name,
-        &method_name,
-        &method_descriptor,
-        &args,
-    )?;
+    // Fallback: recursive dispatch. `invoke_or_native` re-resolves the
+    // owner by NAME (no ClassId-override parameter exists on it), so a
+    // self-call whose class-literal method wasn't found by the stackless
+    // path above (e.g. its bytecode requires the full recursive/native
+    // path) still needs the identity fix: dispatch straight through
+    // `invoke_on_class_shared` on `self_class_id` instead of falling into
+    // the loader-blind name lookup `invoke_or_native` performs internally.
+    let result = if let Some(cid) = self_class_id {
+        crate::vm::invoke_on_class_shared(
+            shared,
+            thread,
+            cid,
+            &method_name,
+            &method_descriptor,
+            &args,
+        )?
+    } else {
+        invoke_or_native(
+            shared,
+            thread,
+            &method_class_name,
+            &method_name,
+            &method_descriptor,
+            &args,
+        )?
+    };
     if let Some(value) = result {
         let ret = crate::jit::return_type(&method_descriptor);
         let value = if ret != b'V' {
@@ -23101,8 +23149,18 @@ fn try_osr(
     //     (the unconditional-at-header trigger). The validated Step-8 default.
     if result_i64 == i64::MIN {
         if let Some(rframe) = cratonvm_jit::deopt::take_last_deopt() {
-            if osr_exit_transfer_enabled()
-                && compiled.can_osr_exit
+            // FIX (silent data corruption, HHH-15895 InPredicateTest / AccumRepro3
+            // residual): `compiled.can_osr_exit` is already a precise gate — it's
+            // false unless this compile genuinely recorded an OSR-exit snapshot
+            // (either the experimental `deopt_real_enabled()`-gated loop-header
+            // guards, or the now-unconditional invokedynamic uncommon-trap
+            // snapshot — see the fix notes in `jit/src/x64.rs`). The separate
+            // `osr_exit_transfer_enabled()` opt-in gate was redundant on top of
+            // that and, left in place, would silently keep the invokedynamic
+            // trap on the corruption-prone "safe reject" path in default builds
+            // (`CRATONVM_OSR_EXIT_TRANSFER` unset). Dropped in favor of
+            // `can_osr_exit` alone.
+            if compiled.can_osr_exit
                 && transfer_osr_exit_into_live_frame(shared, thread, frame_idx, &rframe).is_some()
             {
                 if std::env::var_os("CRATONVM_DBG_DEOPT").is_some() {

@@ -153,6 +153,25 @@ pub fn parse_cert_subject_dn(cert_der: &[u8]) -> Result<String, X509Error> {
     render_dn(subject)
 }
 
+/// Parse a standalone DER-encoded X.501 `Name` (`SEQUENCE OF
+/// RelativeDistinguishedName`, RFC 5280 Appendix A.1) into a canonical
+/// RFC 4514 DN string. Unlike [`parse_cert_subject_dn`], the input is the
+/// `Name` TLV directly — not a Subject field nested inside a wrapping X.509
+/// `Certificate`. This is the shape a TLS `CertificateRequest`'s
+/// `certificate_authorities` list carries (rustls's `ResolvesClientCert::
+/// resolve` exposes it as `root_hint_subjects: &[&[u8]]`), so the TLS client-
+/// cert-selection path (`t27_tls::JavaKeyManagerResolver`) uses this to
+/// render the server's acceptable-issuer hints into `Principal.getName()`-
+/// compatible strings before handing them to a Java `KeyManager.
+/// chooseClientAlias`.
+pub fn parse_name_dn(name_der: &[u8]) -> Result<String, X509Error> {
+    if name_der.len() > MAX_INPUT_SIZE {
+        return Err(X509Error::TooLarge);
+    }
+    let name = read_tlv_tagged(name_der, TAG_SEQUENCE).map_err(|_| X509Error::MalformedAsn1)?;
+    render_dn(name.content)
+}
+
 // ---------------------------------------------------------------------------
 // ASN.1 DER helpers
 // ---------------------------------------------------------------------------
