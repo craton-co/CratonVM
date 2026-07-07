@@ -1968,12 +1968,26 @@ fn instruction_start_map(code: &[u8], code_len: usize) -> Vec<bool> {
 /// precise-stack-map machinery (exact RBP frame registration, safepoint-id
 /// slot, precise relocation).
 ///
-/// **DEFAULT OFF** (opt in with `CRATONVM_PRECISE_JIT_MAPS`; `CRATONVM_NO_PRECISE_JIT_MAPS`
-/// also forces off and wins). Flipped to default-off for BUG-01: the per-invocation
-/// `frame_record` + per-safepoint sp-id/flush codegen is a ~6× throughput tax on
-/// call-heavy JIT'd code (JUnit execution: 105 s → 18 s with this off), and it
-/// dominates the reflection/lambda-heavy Spring suites. See
-/// `docs/known-issues/bug-01-junit-reflection-heavy-jit-frame-scan-throughput.md`.
+/// **DEFAULT ON** (re-flipped 2026-07-07). Opt out with `CRATONVM_NO_PRECISE_JIT_MAPS=1`.
+/// (`CRATONVM_PRECISE_JIT_MAPS` is now a no-op — the coverage is the default.)
+///
+/// The BUG-01 ~6× throughput tax that had motivated the d53c0e96 default-OFF flip
+/// is **gone on current dev**: intervening JIT improvements (more inlining → far
+/// fewer real call safepoints in the hot reflection/framework methods) cut the
+/// precise per-safepoint cost to noise. Measured 2026-07-07 on the Linux
+/// spring-core suite: `ObjectUtilsTests`/`ClassUtilsTests` are byte-for-byte the
+/// same wall time precise-on vs -off even at `JIT_THRESHOLD=50`; a 40-class
+/// spring-util reflection batch is 73.5 s on vs 70.5 s off (~4%) with **identical
+/// pass counts (1059/1061)**. GC-root coverage verified on with it: `binarytrees
+/// 14 @GC_STRESS=4096` → `3222190` clean, and the Fork6 GC_STRESS outcome A/B is
+/// 14/15 ALL-OK on == off (the higher young-mark marker count under precise-on is
+/// benign guard-contained over-retention, not worse outcomes). See BUG-01 doc:
+/// `docs/internal/app-jvm-bugs/bug-01-junit-reflection-heavy-jit-frame-scan-throughput.md`.
+///
+/// History: default-OFF (d53c0e96) for BUG-01: the per-invocation
+/// `frame_record` + per-safepoint sp-id/flush codegen was a ~6× throughput tax on
+/// call-heavy JIT'd code (JUnit execution: 105 s → 18 s with this off) on that
+/// era's build.
 ///
 /// TRADE-OFF (accepted, residuals tracked): when off, the GC falls back to the
 /// conservative deepest-band-only JIT-frame scan, which can miss a live oop held
@@ -1989,8 +2003,10 @@ pub fn precise_jit_maps_enabled() -> bool {
     use std::sync::OnceLock;
     static G: OnceLock<bool> = OnceLock::new();
     *G.get_or_init(|| {
-        std::env::var_os("CRATONVM_PRECISE_JIT_MAPS").is_some()
-            && std::env::var_os("CRATONVM_NO_PRECISE_JIT_MAPS").is_none()
+        // Flipped back to DEFAULT-ON 2026-07-07 (see the doc comment above):
+        // the BUG-01 ~6× throughput tax that motivated the d53c0e96 default-off
+        // flip is gone on current dev. Opt out with CRATONVM_NO_PRECISE_JIT_MAPS=1.
+        std::env::var_os("CRATONVM_NO_PRECISE_JIT_MAPS").is_none()
     })
 }
 
@@ -8023,7 +8039,40 @@ impl Compiler {
     /// trampoline. Only called when `deopt_real_enabled()` (see the call site), so
     /// production builds zero OSR-exit metadata and stay byte-identical.
     fn emit_osr_exit_map_at(&mut self, bci: usize) {
-        let box_ptr = self.build_and_record_deopt_point(bci, crate::deopt::DeoptReason::OsrExit);
+        self.emit_osr_exit_map_at_reason(bci, crate::deopt::DeoptReason::OsrExit);
+    }
+
+    /// Same snapshot machinery as `emit_osr_exit_map_at`, but lets the caller
+    /// stamp the box's `DeoptReason` explicitly. FIX (2026-07-07,
+    /// jit-invokedynamic-groovy-regression, THIRD-pass root cause): this
+    /// snapshot machinery is shared by two call sites — the true loop-header
+    /// OSR-exit (Step 7/8) and the `invokedynamic` uncommon-trap snapshot
+    /// (opcode `0xba`, reason 8 = `UnreachedCode`) — but both used to hard-code
+    /// `DeoptReason::OsrExit` on the box regardless of which site created it.
+    /// `real_frame_deopt_resume_and_despeculate`'s de-speculation step recovers
+    /// the reason FROM THE BOX (`compiled.deopt_points.find(|dp| dp.bci ==
+    /// rframe.bci).map(|dp| dp.reason)`), not from the `8` baked into
+    /// `deopt_stubs` — so an invokedynamic trap that fires was mis-classified
+    /// as an ordinary `OsrExit` and got the count-based recompile-and-retry
+    /// policy instead of `UnreachedCode`'s "give up immediately"
+    /// (`MakeNotCompilable`). For Groovy's `IndyInterface`-based dynamic
+    /// dispatch — where this "unreachable" trap is actually reached on
+    /// essentially every call — that meant the method stayed compiled and kept
+    /// re-entering the trap on every subsequent invocation, each time pushing a
+    /// BRAND NEW interpreter frame via `resume_real_ir_deopt` to re-run the
+    /// call from scratch. Confirmed via `CRATONVM_DBG_DEOPT`: a single failing
+    /// `simpleBean()` run shows ~2000 `x64 frame-deopt entry` events (all
+    /// mis-labeled `reason=OsrExit`) for one Groovy script evaluation — each
+    /// one a fresh re-entry into Groovy's own script/closure class-generation
+    /// machinery, which is exactly what produces "doCall duplicates another
+    /// method" (Groovy's compiler observing its own generated method
+    /// registered more than once). Fixed by stamping the CORRECT reason at
+    /// each call site (see the two `emit_osr_exit_map_at`/
+    /// `emit_osr_exit_map_at_reason` calls) so `UnreachedCode` finally reaches
+    /// `recommend_action` and gets `MakeNotCompilable` on first occurrence, as
+    /// `fb4a333d` always intended.
+    fn emit_osr_exit_map_at_reason(&mut self, bci: usize, reason: crate::deopt::DeoptReason) {
+        let box_ptr = self.build_and_record_deopt_point(bci, reason);
         self.osr_exit_box_ptr_by_bci.insert(bci, box_ptr);
         self.osr_exit_points.push(bci);
         if std::env::var_os("CRATONVM_DBG_DEOPT").is_some() {
@@ -14091,7 +14140,7 @@ impl Compiler {
                     // `static_field_info` is keyed by callee bytecode PC,
                     // not CP index — match on `cpc` (see the `getfield`
                     // note above).
-                    if let Some((_, class_id_raw, field_index, _type_tag, is_volatile)) = site
+                    if let Some((_, class_id_raw, field_index, type_tag, is_volatile)) = site
                         .static_field_info
                         .iter()
                         .find(|(p, _, _, _, _)| *p == cpc)
@@ -14106,6 +14155,14 @@ impl Compiler {
                             self.buf.emit(&[0x0F, 0xAE, 0xF0]); // MFENCE
                         }
                         self.push_from_rax();
+                        // T1.1.a (fix, 2026-07-07) — see the matching fix at
+                        // the top-level 0xb2 arm: a reference-typed static
+                        // field must not keep push_from_rax's default
+                        // non-oop mark, or it decodes wrong in a precise
+                        // GC/deopt oop map while live.
+                        if type_tag == b'L' || type_tag == b'[' {
+                            self.mark_top_as_oop();
+                        }
                     } else {
                         self.next_spill_offset = callee_local_base;
                         return false;
@@ -15410,46 +15467,62 @@ impl Compiler {
             // Gate OFF (default) ⇒ None ⇒ the uncommon-trap path below emits
             // byte-identically.
             //
-            // REVERTED (2026-07-07, jit-invokedynamic-groovy-regression):
-            // fb4a333d routed reason 8 (`DEOPT_REASON_UNREACHED_CODE`, the
-            // invokedynamic uncommon trap) through this precise path
-            // UNCONDITIONALLY, to fix a genuine silent-corruption bug (the old
-            // imprecise "safe reject" rewound to the OSR entry bci, discarding
-            // or duplicating side effects committed by JIT-compiled code
-            // between OSR entry and the trap). That fix is CORRECT for the
-            // case it targeted (a hot loop's OSR-compiled body reaching an
-            // invokedynamic after real work), but empirically root-caused
-            // (bisected via targeted per-item revert flags — see this
-            // session's investigation) to independently regress Groovy:
-            // running `GroovyBeanDefinitionReaderTests` with the JIT enabled
-            // (default) now fails almost every method with a Groovy-compiler-
-            // internal "duplicate main method"/"startup failed" error,
-            // reproducing on a single test method in total isolation and
-            // disappearing entirely under `--nojit`. Bisection ruled out every
-            // OTHER piece of fb4a333d (the 0xba codegen snapshot-recording
-            // itself, the `LocalKind::Ref` trust relaxation, and
-            // `can_osr_exit`'s elided-monitor exclusion each independently
-            // toggled off with no effect) — reverting ONLY this stub-routing
-            // line (forcing reason 8 back to `None`, the pre-fb4a333d
-            // "safe-reject" path) is the sole change that restores the Groovy
-            // suite to green, and was verified NOT to be a red herring by
-            // toggling it alone in isolation both ways.
+            // RESTORED, with the REAL root cause fixed (2026-07-07,
+            // jit-invokedynamic-groovy-regression, FOURTH pass — see the
+            // known-issues doc for the full history). `fb4a333d` routed
+            // reason 8 (`DEOPT_REASON_UNREACHED_CODE`, the invokedynamic
+            // uncommon trap) through this precise path UNCONDITIONALLY, to
+            // fix a genuine, confirmed silent-corruption bug (the old
+            // imprecise "safe reject" rewound to the OSR entry bci,
+            // discarding or duplicating side effects committed by
+            // JIT-compiled code between OSR entry and the trap — confirmed via
+            // the `AccumRepro3`/`LicmRepro`/`LicmRepro2`/`ArrRepro` standalone
+            // repros run many times over: pre-`fb4a333d`, `AccumRepro3`
+            // silently and nondeterministically doubles a loop's iteration
+            // count roughly 90% of the time). That routing then appeared to
+            // independently regress Groovy (every
+            // `GroovyBeanDefinitionReaderTests` method failing with a
+            // Groovy-compiler-internal "duplicate main method" error under
+            // JIT-on) — an EARLIER pass here shipped a blanket revert of just
+            // this routing (reason 8 forced back to `None`, reopening the
+            // original corruption) as a stopgap, which was explicitly rejected
+            // as a final answer: it traded a loud, well-understood bug for a
+            // quieter, already-documented one instead of fixing both.
             //
-            // The exact mechanism inside the precise-resume path that Groovy's
-            // dynamic-call-site machinery finds unsound was not pinned down
-            // further in the time available (the reconstructed frame's operand
-            // stack — which for an invokedynamic trap holds the live call-site
-            // arguments the interpreter still needs to actually deliver, unlike
-            // the loop-header-only shape this machinery was originally built
-            // for — is the most likely remaining suspect; see
-            // docs/known-issues/jit-invokedynamic-uncommon-trap-precise-resume-groovy-regression.md).
-            // This revert restores the PRE-fb4a333d imprecise-reject behavior
-            // for reason 8 ONLY (reasons 2/6/7 keep their existing, unaffected
-            // gated precise-resume paths) — i.e. it reopens the original
-            // silent-corruption risk fb4a333d's item 2 aimed to close, in
-            // exchange for closing this regression. See the doc above for the
-            // full tradeoff writeup and suggested next steps.
-            let frame_box_ptr = if crate::deopt_real_enabled() {
+            // ACTUAL ROOT CAUSE (found on this pass, NOT a stack-soundness
+            // gap): `emit_osr_exit_map_at` is shared by two call sites — the
+            // true loop-header OSR-exit AND this invokedynamic trap snapshot —
+            // and BOTH used to hard-code the box's `DeoptReason` as `OsrExit`.
+            // `real_frame_deopt_resume_and_despeculate`'s de-speculation step
+            // recovers the reason FROM THE BOX, not from the `8` baked into
+            // `deopt_stubs`, so every time this "uncommon" trap actually fired
+            // it was de-speculated as an ordinary recoverable `OsrExit`
+            // (count-based recompile-and-retry) instead of `UnreachedCode`'s
+            // "give up immediately" (`MakeNotCompilable`) policy. For Groovy's
+            // `IndyInterface`-based dynamic dispatch, where this trap is
+            // reached on essentially EVERY call (never actually "unreached"),
+            // that meant the method stayed compiled and re-entered the trap
+            // on every subsequent invocation, each time pushing a BRAND NEW
+            // interpreter frame via `resume_real_ir_deopt` to redo the call
+            // from scratch — confirmed via `CRATONVM_DBG_DEOPT`: a single
+            // failing `simpleBean()` run showed ~2000 frame-deopt entries (all
+            // mis-labeled `reason=OsrExit`), each one a fresh re-entry into
+            // Groovy's own script/closure class-generation machinery, exactly
+            // matching the "doCall duplicates another method" symptom (Groovy
+            // observing its own generated method registered more than once).
+            // Fixed at the SOURCE: `emit_osr_exit_map_at_reason` now lets each
+            // call site stamp its own correct reason (`UnreachedCode` for the
+            // 0xba trap, `OsrExit` for the loop-header case), so
+            // `recommend_action` finally sees `UnreachedCode` and gives up on
+            // first occurrence, as `fb4a333d` always intended. This, together
+            // with a second, independent, unconditionally-correct fix
+            // (`getstatic`'s codegen never marked a reference-typed static
+            // field's pushed value as an oop, unlike `getfield`'s inline arms —
+            // see the `mark_top_as_oop()` calls added at both `0xb2` codegen
+            // sites — which was the actual cause of `LicmRepro`/`LicmRepro2`/
+            // `ArrRepro`'s `NullPointerException`), is what makes it safe to
+            // restore reason 8's unconditional precise-resume routing here.
+            let frame_box_ptr = if crate::deopt_real_enabled() || reason == 8 {
                 match reason {
                     2 => self.deopt_box_ptr_by_bci.get(&bci).copied(),
                     // Step 6: String-intrinsic and call-site type-check guards
@@ -15458,6 +15531,9 @@ impl Compiler {
                     // immediately after the pre-call flush (before any arg pops).
                     6 => self.deopt_box_ptr_by_bci.get(&bci).copied(),
                     7 => self.osr_exit_box_ptr_by_bci.get(&bci).copied(),
+                    // Reason 8 (UnreachedCode / invokedynamic trap): unconditional,
+                    // NOT gated behind `deopt_real_enabled()` — see the doc above.
+                    8 => self.osr_exit_box_ptr_by_bci.get(&bci).copied(),
                     _ => None,
                 }
             } else {
@@ -19024,7 +19100,7 @@ impl Compiler {
                 // RwLock and reads `Value` properly) but slow.
                 0xb2 => {
                     // MED-4 / Fix 3 — O(1) pc-indexed lookup.
-                    let (_, class_id_raw, field_index, _type_tag, is_volatile) = self
+                    let (_, class_id_raw, field_index, type_tag, is_volatile) = self
                         .static_field_info_idx
                         .get(&pc)
                         .map(|&i| self.static_field_info[i])
@@ -19040,6 +19116,26 @@ impl Compiler {
                         self.buf.emit(&[0x0F, 0xAE, 0xF0]); // MFENCE
                     }
                     self.push_from_rax();
+                    // T1.1.a (fix, 2026-07-07 — jit-invokedynamic-groovy
+                    // regression follow-up): a reference-typed static field's
+                    // loaded value is a live oop, but `push_from_rax`'s fast
+                    // path always pushes a hard-coded `false` oop-mark — the
+                    // same gap already fixed for `getfield`'s inline arms
+                    // (see the `c_is_ref`/`type_tag == b'L' || b'['` markers
+                    // above), just never applied here. Left unmarked, this
+                    // stack slot decodes as a plain non-oop value in any
+                    // precise GC/deopt oop map built while it's live (e.g. the
+                    // invokedynamic uncommon-trap snapshot machinery, which
+                    // records the operand stack directly beneath a live
+                    // `invokedynamic` call site — `getstatic
+                    // System.out` immediately followed by a
+                    // `makeConcatWithConstants` invokedynamic is exactly this
+                    // shape). A NullPointerException on the following
+                    // `println` was the concrete symptom (`LicmRepro`/
+                    // `LicmRepro2`/`ArrRepro`) traced to this exact gap.
+                    if type_tag == b'L' || type_tag == b'[' {
+                        self.mark_top_as_oop();
+                    }
                     pc += 3;
                 }
 
@@ -23679,7 +23775,7 @@ impl Compiler {
                     // machinery (frame reconstruction from live registers/spill
                     // slots) so the VM can resume precisely at THIS bci instead of
                     // rewinding.
-                    self.emit_osr_exit_map_at(pc);
+                    self.emit_osr_exit_map_at_reason(pc, crate::deopt::DeoptReason::UnreachedCode);
 
                     let patch = self.emit_jmp_rel32_patch();
                     self.deopt_stubs.push((patch, pc, 8)); // 8 = DEOPT_REASON_UNREACHED_CODE

@@ -1,6 +1,6 @@
 # WildFly domain startup timeout with repeated corrupt `Value` cell guard
 
-Status: OPEN — three independent, confirmed, merged bug fixes along this path (deadlock, XNIO AbstractMethodError, jit_instanceof UAF; see 2026-07-06/07 fifth-session update below), but a full clean end-to-end pass has NOT yet been observed due to shared-host environment instability this session ran out of budget to work around. Do not move to internal until a clean E2E pass (or a definitive root-cause closure) is actually observed.
+Status: OPEN — but the HIB-CV-32 corrupt-Value guard did NOT fire in ANY 2026-07-07 run (the sixth session finally ran the real Arquillian test end-to-end under CratonVM nested processes; see the 2026-07-07 sixth-session update at the bottom). Three merged fixes on this path (class_manager/vtable_manager AB-BA 48b3c2d2, XNIO AbstractMethodError 952f0093, jit_instanceof UAF) plus the 11 MSC real-start boot fixes (4b2508cf) appear to have cleared or now out-gate whatever produced the guard; two NEW blockers (sibling doc) currently stop the boot before the sustained-load phase that originally provoked it. Do not move to internal until a domain boot again runs a long sustained workload with the guard confirmed silent under CRATONVM_DIAG_HIB32=1.
 Severity: High
 First confirmed: 2026-07-05 on Azure worktree `codex/wildfly-nonpassed-probes-20260705-035722`
 
@@ -450,3 +450,55 @@ timeout kills it) to identify what that latch actually is and who's
 supposed to count it down — this session did not reach that. If it instead
 reaches domain boot and hits a `class_manager`-shaped stall, check
 `class-manager-rwlock-writer-starvation.md` first.
+
+## 2026-07-07 update (sixth session) — the actual Arquillian test ran end-to-end at last; HIB-CV-32 guard did NOT fire in any run
+
+The "recommended next step" every prior session ended on — get a live
+Maven/Arquillian `DefaultConfigSmokeTestCase` (and the domain suite) running with
+CratonVM as the *nested* domain JVM — was finally achieved this session, after the
+2026-07-07 MSC real-start boot fixes (`4b2508cf`, 11 blockers) made the host-controller
+boot reach real sustained execution. The full working harness recipe is in the sibling
+doc `wildfly-domain-managed-servers-timeout.md`'s 2026-07-07 update (the load-bearing
+detail: nested processes take their JVM from
+`-Djboss.test.host.primary.jvmhome`/`.controller.jvmhome`, NOT the outer Surefire
+`-Djvm`, so both must point at a CratonVM `bin/java` or the domain silently runs on
+HotSpot).
+
+**Key finding for THIS doc: across every 2026-07-07 run — testsuite E2E (both JIT and
+no-JIT) and multiple hand-driven `domain.sh` boots — the `gen_heap::read_slot: corrupt
+Value cell` (HIB-CV-32) guard did NOT fire once.** The failures observed instead were:
+
+- **no-JIT:** host-controller boots, both managed servers reach `WFLYSRV0025 ... started`,
+  but the Arquillian `awaitServers` poll never sees them as started (a management-model /
+  server-registration propagation gap — a NEW residual, tracked in the sibling doc).
+- **JIT-on:** a JIT miscompile fails HC *interface resolution* (`WFLYSRV0082`) at ~311s,
+  well before anything the corrupt-Value guard was about — also a NEW, separate blocker
+  (sibling doc), and clearly not this one.
+
+This is meaningful negative evidence. The corrupt-Value guard was a *symptom* of a heap
+reference-integrity defect somewhere upstream; with the three fixes this doc already
+tracks (`48b3c2d2` class_manager/vtable_manager AB-BA, `952f0093` XNIO
+`AbstractMethodError`, and the `jit-instanceof-uaf` heap-region guard) plus the 11 MSC
+real-start boot fixes all now on `dev`, the domain boot path that used to spin emitting
+that guard line no longer reaches (or no longer creates) whatever produced the
+out-of-range discriminant. Two readings remain open and this session cannot yet
+distinguish them:
+
+1. **Genuinely resolved** — one of the merged fixes (most plausibly the
+   `jit-instanceof-uaf` heap-region-validation guard, which directly addresses a
+   stale-`ObjectRef`-dereference of exactly the kind that lands garbage in a heap slot)
+   removed the upstream defect, and HIB-CV-32 is effectively closed.
+2. **Merely not-yet-reached** — the two new blockers above (awaitServers propagation
+   under no-JIT; interface-resolution JIT miscompile) now gate the boot *before* the
+   sustained concurrent-classloading-under-GC-pressure phase that originally provoked the
+   guard, so it simply hasn't had the chance to fire.
+
+**Recommended next step:** resolve the two new blockers in the sibling doc first (they
+now gate reaching sustained load). Once a domain boot again runs a long sustained
+concurrent workload — either a full `awaitServers`-passing `DefaultConfigSmokeTestCase`
+or `EEConcurrencyExecutorShutdownTestCase` proper — re-check for the HIB-CV-32 line under
+`CRATONVM_DIAG_HIB32=1`. If it stays silent through that phase, close this doc referencing
+the `jit-instanceof-uaf` fix; if it returns, the residual "some consumer skips the safe
+`Value`-matching" mystery from the third-session update is still live. Until then this doc
+stays OPEN, but note the guard has now gone unobserved across an entire session's worth of
+real domain runs for the first time since 2026-07-05.

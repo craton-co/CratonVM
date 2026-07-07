@@ -4,6 +4,11 @@ This folder collects CratonVM-only defects found while running upstream Java
 suites. The docs had grown to describe the **same underlying bug from several
 angles**; this index is the consolidated map. Read it first.
 
+## 2026-07-07 Hibernate local Windows rerun — progress check + new SQL-placeholder bug
+
+- [hib-local-windows-rerun-20260707.md](hib-local-windows-rerun-20260707.md) — 4-shard local rerun of the 121-class non-passed list confirms 15 real fixes (bytecode-enhancement/lazytoone progress, generic-timeout-wall classes now passing) landed on `dev` since the 2026-07-05 Azure baseline; documents 3 findings that evolved to different symptoms (`JpaLargeBlobTest`, `InPredicateTest`, the temporal 1-hour-skew doc now superseded); flags a harness status-computation false-positive.
+- [hib-temporal-sql-parameter-placeholder-duplication.md](hib-temporal-sql-parameter-placeholder-duplication.md) — 🔴 OPEN, updated: confirmed on Windows too (not Linux-specific), 2 more affected classes outside `type.temporal.*` found (`ExtendedEnhancementNonStandardAccessTest`, `FunctionTests`) — a general `PreparedStatement` SQL-generation defect, not temporal-specific.
+
 ## 2026-07-07 ES binary-docvalues range doc retired; residual re-diagnosed as young-GC live-object reclamation (NEW open doc)
 
 - [gen-heap-young-gc-live-object-reclaim-rrwl-holdcount.md](gen-heap-young-gc-live-object-reclaim-rrwl-holdcount.md) —
@@ -24,6 +29,29 @@ angles**; this index is the consolidated map. Read it first.
   root causes (invokedynamic JIT blacklist, AQS skip-list gaps ×2 rounds, plain-field 16-byte slot
   tearing) are all FIXED+merged, end-to-end verified on the Windows box (deterministic silent stall
   → bimodal fast-IMSE/stall, both faces now attributed to the new GC doc above).
+## 2026-07-07 JIT invokedynamic uncommon-trap Groovy regression — FIXED (no tradeoff)
+
+- ✅ FIXED: `fb4a333d`'s precise-resume routing for the invokedynamic
+  uncommon trap (reason 8 / `UnreachedCode`) regressed
+  `GroovyBeanDefinitionReaderTests` under JIT-on. An earlier pass shipped a
+  blanket revert (reopening the exact silent-corruption risk `fb4a333d` had
+  fixed) as a stopgap — rejected as a final answer. Follow-up investigation
+  recovered `fb4a333d`'s own uncommitted standalone repros and found the REAL
+  root causes: (1) `getstatic` codegen never marked a reference-typed static
+  field as a GC/deopt oop (unlike `getfield`'s already-fixed inline arms),
+  corrupting `LicmRepro`/`LicmRepro2`/`ArrRepro`; (2) the invokedynamic-trap
+  snapshot mis-stamped its `DeoptReason` as `OsrExit` instead of
+  `UnreachedCode`, so the trap was never blacklisted after firing; (3) three
+  separate VM-side call sites consumed a stashed deopt frame without ever
+  driving de-speculation, so a blacklisted method kept getting re-entered
+  anyway. All four fixed; reason 8 keeps `fb4a333d`'s original unconditional
+  precise-resume routing. Verified: the corruption-repro suite is now
+  provably correct against HotSpot ground truth where it previously
+  crashed; Groovy matches the pre-existing (already-merged) baseline exactly
+  (30/36 isolated, 5/36 batch — both pre-existing numbers, unaffected either
+  way); `cargo test -p cratonvm-jit --lib` unchanged (878 passed, 4
+  pre-existing aarch64 failures). Doc moved to
+  [`docs/internal/jit-invokedynamic-uncommon-trap-precise-resume-groovy-regression-FIXED.md`](../internal/jit-invokedynamic-uncommon-trap-precise-resume-groovy-regression-FIXED.md).
 
 ## 2026-07-07 GC_STRESS residual corruption re-assessed (still OPEN, two hypotheses refuted)
 

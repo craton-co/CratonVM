@@ -768,6 +768,41 @@ fn sc_is_connected(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRes
     }
 }
 
+/// `SocketChannel.isConnectionPending()` -- real HotSpot's `SocketChannelImpl`
+/// gives this a concrete body (`state == ST_PENDING`), so it is NOT declared
+/// `native` and CratonVM never registered it: dispatch on our synthetic
+/// `SocketChannel` object fell through to the abstract declaration on
+/// `java.nio.channels.SocketChannel` (no Code attribute) ->
+/// `AbstractMethodError`. That `Error` (not `Exception`) is invisible to
+/// HttpClient5's `InternalChannel.handleIOEvent`, whose `catch (Exception ex)`
+/// does not catch it, and to `IOReactorWorker.run()`'s own `catch (Exception
+/// e)` -- so it silently kills the reactor worker thread with no log, no
+/// stored throwable, and no callback ever firing. This is the same defect
+/// family as the `supportedOptions()` `AbstractMethodError` fixed earlier
+/// (native-io/src/socket_channel.rs), just one call further down the
+/// connect-completion handoff: `InternalConnectChannel.onIOEvent` calls
+/// `isConnectionPending()` as its very first step, before `finishConnect()`.
+///
+/// True iff the channel is registered in the `tcp_registry` as a
+/// `Connecting` entry (real non-blocking connect started, not yet completed
+/// via `finishConnect()`/promoted to a `Stream`) and not already marked
+/// connected.
+fn sc_is_connection_pending(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match obj_or_none(args, 0) {
+        Some(o) => o,
+        None => return Ok(Some(Value::Int(0))),
+    };
+    if matches!(cf_get(ctx, this, F_CONNECTED), Value::Int(1)) {
+        return Ok(Some(Value::Int(0)));
+    }
+    let id = match read_reg_id(ctx, this) {
+        Some(v) => v,
+        None => return Ok(Some(Value::Int(0))),
+    };
+    let pending = matches!(tcp_registry().read().get(&id), Some(TcpHandle::Connecting(_)));
+    Ok(Some(Value::Int(if pending { 1 } else { 0 })))
+}
+
 /// `SocketChannelImpl.isInputOpen()` / `isOutputOpen()` (package-private) —
 /// consulted by sun.nio.ch.SocketAdaptor's input/output streams (the streams
 /// returned by socket().getInputStream()/getOutputStream()). CratonVM does not
@@ -2023,6 +2058,7 @@ pub fn register_socket_channel_real(r: &mut NativeMethodRegistry) {
             sc_blocking_connect,
         );
         r.register(c, "finishConnect", "()Z", sc_finish_connect);
+        r.register(c, "isConnectionPending", "()Z", sc_is_connection_pending);
         r.register(c, "isInputOpen", "()Z", sc_io_open);
         r.register(c, "isOutputOpen", "()Z", sc_io_open);
         r.register(c, "read", "(Ljava/nio/ByteBuffer;)I", sc_read);
