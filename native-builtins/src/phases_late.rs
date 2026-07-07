@@ -41150,7 +41150,24 @@ pub(crate) fn register_p68_ssl(r: &mut NativeMethodRegistry) {
         },
     );
 
-    // SSLEngineResult accessors
+    // SSLEngineResult accessors.
+    //
+    // TWO result layouts reach these natives (they are NativeKind::Bridge, so
+    // they intercept in real-JDK CLI mode too):
+    //   * the REAL javax.net.ssl.SSLEngineResult built by
+    //     t27_tls::alloc_engine_result's primary path — fields 0/1 hold the
+    //     REAL Status/HandshakeStatus enum SINGLETON REFERENCES;
+    //   * 4-int-slot synthetic results (this file's synthetic engine, or
+    //     t27_tls's fallback) — fields 0/1 hold ints.
+    // For the real layout the singleton must be returned UNTOUCHED: callers
+    // compare with `==` / switch against Status.OK etc. Coercing the
+    // reference to int (as this did before 2026-07-07) yielded 0 and
+    // fabricated a fresh synthetic "OK"/"NOT_HANDSHAKING" object for EVERY
+    // real result — Reactor-Netty's SslHandler then never observed
+    // NEED_WRAP/BUFFER_UNDERFLOW from its unwrap() results, never wrapped
+    // the ServerHello, and every Netty HTTPS handshake died on
+    // "unexpected EOF" (docs/known-issues/
+    // reactive-netty-https-sslengine-handshake-underflow.md).
     let ssleng_result = "javax/net/ssl/SSLEngineResult";
     r.register(
         ssleng_result,
@@ -41158,6 +41175,10 @@ pub(crate) fn register_p68_ssl(r: &mut NativeMethodRegistry) {
         "()Ljavax/net/ssl/SSLEngineResult$Status;",
         |ctx, args| {
             let this = obj_arg(args, 0)?;
+            // REAL result: field 0 IS the Status singleton — pass it through.
+            if let v @ Value::Object(Some(_)) = ctx.get_field(this, 0) {
+                return Ok(Some(v));
+            }
             let status = ctx.get_field(this, 0).as_int().unwrap_or(0);
             let name = match status {
                 0 => "OK",
@@ -41179,6 +41200,11 @@ pub(crate) fn register_p68_ssl(r: &mut NativeMethodRegistry) {
         "()Ljavax/net/ssl/SSLEngineResult$HandshakeStatus;",
         |ctx, args| {
             let this = obj_arg(args, 0)?;
+            // REAL result: field 1 IS the HandshakeStatus singleton — pass it
+            // through (see getStatus above).
+            if let v @ Value::Object(Some(_)) = ctx.get_field(this, 1) {
+                return Ok(Some(v));
+            }
             let status = ctx.get_field(this, 1).as_int().unwrap_or(0);
             let name = match status {
                 0 => "NOT_HANDSHAKING",

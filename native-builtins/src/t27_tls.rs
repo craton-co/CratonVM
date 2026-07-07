@@ -4246,7 +4246,18 @@ fn enum_const(
     let n = ctx.create_string(name);
     match ctx.invoke(cls, "valueOf", valueof_desc, &[Value::Object(Some(n))]) {
         Ok(Some(v)) => v,
-        _ => Value::Object(None),
+        other => {
+            if std::env::var_os("CRATONVM_DBG_TLS_HS").is_some() {
+                eprintln!(
+                    "[dbg-tls-hs] thread={:?} enum_const FAILED cls={} name={} result={:?}",
+                    std::thread::current().id(),
+                    cls,
+                    name,
+                    other
+                );
+            }
+            Value::Object(None)
+        }
     }
 }
 
@@ -4318,14 +4329,45 @@ fn alloc_engine_result(
     // comparison fail → the NIO handshake state machine spun → native SO.)
     let st = real_status_enum(ctx, status);
     let hss = real_handshake_status_enum(ctx, hs);
+    let __dbg_hs = std::env::var_os("CRATONVM_DBG_TLS_HS").is_some();
     if matches!(st, Value::Object(Some(_))) && matches!(hss, Value::Object(Some(_))) {
-        if let Ok(Some(Value::Object(Some(o)))) = ctx.new_object_initialized(
+        match ctx.new_object_initialized(
             "javax/net/ssl/SSLEngineResult",
             "(Ljavax/net/ssl/SSLEngineResult$Status;Ljavax/net/ssl/SSLEngineResult$HandshakeStatus;II)V",
             &[st, hss, Value::Int(consumed), Value::Int(produced)],
         ) {
-            return o;
+            Ok(Some(Value::Object(Some(o)))) => {
+                if __dbg_hs {
+                    eprintln!(
+                        "[dbg-tls-hs] thread={:?} alloc_engine_result REAL status={} hs={}",
+                        std::thread::current().id(),
+                        status_name(status),
+                        hs_name(hs)
+                    );
+                }
+                return o;
+            }
+            other => {
+                if __dbg_hs {
+                    eprintln!(
+                        "[dbg-tls-hs] thread={:?} alloc_engine_result ctor FAILED status={} hs={} result={:?}",
+                        std::thread::current().id(),
+                        status_name(status),
+                        hs_name(hs),
+                        other
+                    );
+                }
+            }
         }
+    } else if __dbg_hs {
+        eprintln!(
+            "[dbg-tls-hs] thread={:?} alloc_engine_result enum resolve FAILED status={} hs={} st_ok={} hss_ok={}",
+            std::thread::current().id(),
+            status_name(status),
+            hs_name(hs),
+            matches!(st, Value::Object(Some(_))),
+            matches!(hss, Value::Object(Some(_)))
+        );
     }
     // Fallback: synthetic int-slot object (enum resolution failed).
     let obj = alloc_concurrent_synthetic(ctx, "javax/net/ssl/SSLEngineResult", 4);
