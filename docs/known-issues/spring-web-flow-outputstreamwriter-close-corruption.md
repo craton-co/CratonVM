@@ -1,6 +1,6 @@
 # spring-web http.client Flow/Reactive hangs: 3 distinct root causes
 
-## Status: Root causes #1 and #2 FIXED; root cause #3 OPEN (isolated to HttpComponentsClientHttpConnector; raw NIO layer proven fine; not yet fixed)
+## Status: Root causes #1 and #2 FIXED; root cause #3 PARTIALLY FIXED (supportedOptions() AbstractMethodError fixed -- TCP connect now succeeds -- but a deeper hang remains past that point)
 
 Branch history: `fix/httpclient-jdkclient-hangs-0706b` (original investigation,
 off `dev` @ `9f1db39d`) → `fix/streamencoder-inherited-field-slots-0707`
@@ -18,7 +18,7 @@ for `JdkClientHttpRequestFactoryTests`, `OutputStreamPublisherTests`,
 | `OutputStreamPublisherTests` | No (pure `Flow`+Reactor `StepVerifier`) | #1: `OutputStreamWriter`/`StreamEncoder` real-field corruption | ✅ **FIXED** — 5/6 pass (`chunkSize()`'s pre-existing, unrelated `"bar"`-vs-`"b"` failure remains, not in scope) |
 | `SubscriberInputStreamTests` | No (pure `Flow`, no Reactor) | #1: same bug, reached via `SubscriberInputStreamTests.closed()`'s identical pattern | ✅ **FIXED** — 5/5 pass |
 | `JdkClientHttpRequestFactoryTests` | Yes (`AbstractMockWebServerTests`) | #2: the native `java.net.http.HttpClient` shim's response reader read until EOF instead of stopping at declared framing, hanging on HTTP/1.1 keep-alive | ✅ **FIXED** — found=15 succ=11 fail=4 (4 residuals are a separate, newly-surfaced gzip/deflate bug, not in scope) |
-| `reactive.ClientHttpConnectorTests` | Yes (`MockWebServer` field) | #3: `HttpComponentsClientHttpConnector`/Apache HttpClient5 async reactor hangs; raw NIO SocketChannel/Selector layer confirmed NOT at fault | 🔴 **OPEN** — isolated to one of 4 parameterized connectors; not yet fixed |
+| `reactive.ClientHttpConnectorTests` | Yes (`MockWebServer` field) | #3: `HttpComponentsClientHttpConnector`/Apache HttpClient5 async reactor -- `supportedOptions()` AbstractMethodError blocked TCP connect entirely (FIXED); a deeper hang remains after the TCP connect succeeds | 🟡 **PARTIALLY FIXED** — TCP connect now succeeds; request still never reaches MockWebServer |
 
 ## Root cause #1 (FIXED): `StreamEncoder` native shim hardcoded inherited `Writer` field slots
 
@@ -197,23 +197,7 @@ tests throw `IOException: ... Resource temporarily unavailable (os error
 (`net_phase_e.rs`'s gzip/deflate request-body handling, or a
 non-blocking-socket EAGAIN not being retried somewhere in that path).
 
-## Root cause #3 (OPEN, NOT fixed): `reactive.ClientHttpConnectorTests` — isolated to `HttpComponentsClientHttpConnector`; raw NIO layer proven fine
-
-**Update 2026-07-07 (second pass): isolated to ONE specific connector and the
-earlier "46-thread, main-vm busy" characterization was likely a snapshot of
-normal (working) activity, not the hang itself.** This class's tests are
-`@ParameterizedTest`s over 4 connector implementations
-(`ClientHttpConnectorTests.connectors()`: Reactor Netty, Jetty,
-HttpComponents, Jdk) plus one plain `@Test`
-(`disableCookieWithHttpComponents`), so the earlier single-`gdb`-snapshot
-capture of the whole class run — 46 threads, `main-vm` busy 100+ frames deep
-in `try_lambda_dispatch`/`native_al_for_each` — most likely just caught the
-interpreter mid-flight on whichever connector was running *at that instant*
-(plausibly Reactor Netty or Jetty, which both complete), not evidence of a
-livelock. Per
-[[known-issue-doc-hypothesis-can-be-wrong-not-just-stale]], re-derive rather
-than trust a single-session snapshot's narrative — which is exactly what
-this pass did.
+## Root cause #3 (PARTIALLY FIXED): `reactive.ClientHttpConnectorTests` — `supportedOptions()` AbstractMethodError fixed; TCP connect now succeeds; a deeper, unresolved hang remains
 
 ### Per-connector isolation (standalone driver, since `KRun` only supports class-level selection)
 
@@ -224,10 +208,10 @@ fast per-connector verdict:
 
 | Connector | Real HotSpot | CratonVM | Verdict |
 |---|---|---|---|
-| Reactor Netty | 316ms, OK | 2246ms, OK | Works (just slower — interpreter overhead, not a bug) |
-| Jetty | 207ms, OK | 1082ms, OK | Works, BUT leaves 8 non-daemon threads alive after the process's `main()` returns (`[cratonvm] main() returned; VM held alive by 8 non-daemon thread(s)`) — a real, separate, minor resource-cleanup issue, not investigated further, does not itself hang a test *run* since threads leaking past the end of a whole-JVM process are harmless for a single `KRun` batch (though worth noting for whoever eventually chases it) |
-| HttpComponents | 37ms, OK | **HUNG** — never returns, hits the probe's own 15s `.block(Duration)` timeout | 🔴 **The actual hang** |
-| Jdk | 41ms, OK | FAILS FAST (208ms): `ClassCastException: java.io.ByteArrayInputStream cannot be cast to java.util.concurrent.Flow$Publisher` | A separate, real, unrelated bug (fails, doesn't hang) — not investigated further this session |
+| Reactor Netty | 316ms, OK | ~2s, OK | Works (just slower — interpreter overhead, not a bug) |
+| Jetty | 207ms, OK | ~1s, OK | Works, BUT leaves 8 non-daemon threads alive after the process's `main()` returns — a real, separate, minor resource-cleanup issue, not investigated further |
+| HttpComponents | 37ms, OK | **HUNG** — never returns | 🔴 **The actual hang**, partially fixed this session (see below) |
+| Jdk | 41ms, OK | FAILS FAST (~140ms): `ClassCastException: java.io.ByteArrayInputStream cannot be cast to java.util.concurrent.Flow$Publisher` | A separate, real, unrelated bug (fails, doesn't hang) — not investigated further |
 
 **So root cause #3 is specifically `HttpComponentsClientHttpConnector`**
 (backed by Apache HttpClient5's async reactor). Since 4 of this test class's
@@ -235,165 +219,177 @@ fast per-connector verdict:
 reaches the HttpComponents parameter blocks forever with no per-test
 timeout, which is what made the *whole class* look permanently hung.
 
-### Confirmed: this is a raw Apache HttpClient5 bug, not Spring's bridging code
+### Confirmed: raw Apache HttpClient5 bug (not Spring's bridging), and NOT the raw NIO layer
 
 A second standalone driver (`RawHc5Probe.java`) uses
 `org.apache.hc.client5.http.impl.async.HttpAsyncClients.createDefault()` +
 `CloseableHttpAsyncClient.execute(SimpleHttpRequest, FutureCallback)`
-directly against a `MockWebServer`, with **zero Spring code** in the path.
-Real HotSpot: completes in 128ms. CratonVM: `client.getStatus()` reports
-`ACTIVE` (so `start()` genuinely launched the reactor), but the
-`FutureCallback` is never invoked — confirmed via `latch.await(20,
-SECONDS)` timing out. This rules out `HttpComponentsClientHttpConnector`/
-`HttpComponentsClientHttpRequest`'s Spring-side bridging as the culprit;
-the bug is inside `httpclient5`/`httpcore5` itself running under CratonVM.
+directly against a `MockWebServer`, with **zero Spring code** in the path —
+reproduces the hang directly, ruling out Spring's bridging code.
 
-### Confirmed: the raw JDK NIO `SocketChannel`/`Selector` layer is NOT the bug
-
-This directly refutes the earlier hypothesis (per
+This also **refutes** the earlier hypothesis (per
 [[jdk-httpclient-realjdk-model-and-serversocket-bind-bug]]'s closing note)
-that this might be the same still-open "NIO SocketChannel/selector path" gap
-noted for `JettyClientHttpRequestFactoryTests`. Three standalone probes,
-each mirroring a progressively more precise slice of what HttpClient5's own
-`SingleCoreIOReactor` actually does, **all pass on CratonVM**:
+that this is the same still-open "NIO SocketChannel/selector path" gap noted
+for `JettyClientHttpRequestFactoryTests`. Three standalone probes, each
+mirroring a progressively more precise slice of what HttpClient5's own
+`SingleCoreIOReactor` actually does, **all pass** on CratonVM:
+`NioSelectorProbe.java` (single-threaded accept/connect/read/write/echo),
+`WakeupProbe.java` (cross-thread `Selector.wakeup()` on a channel registered
+from another thread), `ConnectWakeupProbe.java` (cross-thread non-blocking
+`OP_CONNECT` + `finishConnect()`) — the raw JDK NIO mechanics HttpClient5
+depends on are sound.
 
-1. `NioSelectorProbe.java` — single-threaded non-blocking
-   `ServerSocketChannel`/`SocketChannel` + `Selector`, full
-   accept/connect/read/write/echo round trip. **PASS** (3 select() rounds,
-   ~4ms).
-2. `WakeupProbe.java` — a dedicated "reactor" thread blocks in
-   `Selector.select(30000)` on an *empty* selector (nothing registered yet,
-   exactly how a real I/O reactor's dispatch thread starts); a second
-   "app" thread then registers a brand new `ServerSocketChannel` with that
-   *same* selector from outside and calls `wakeup()`. **PASS** — the
-   blocked `select()` returns immediately on `wakeup()` (not the 30s
-   timeout) and correctly picks up the new registration on the next round.
-3. `ConnectWakeupProbe.java` — the precise pattern HttpClient5 uses for
-   outbound connects: the "app" thread opens a **non-blocking**
-   `SocketChannel`, calls `connect()` (returns `false`/in-progress), then
-   registers *that* channel for `OP_CONNECT` on the reactor thread's
-   selector and calls `wakeup()`; the reactor thread is expected to notice
-   `OP_CONNECT`, call `finishConnect()`, then read/write. **PASS** — full
-   round trip completes in ~1ms after the reactor thread wakes.
+### ✅ FIXED this session: `SocketChannel`/`ServerSocketChannel.supportedOptions()` threw `AbstractMethodError`
 
-Since (3) is strictly harder than what `SingleCoreIOReactor.connect()`
-actually needs (per the disassembly below, it never registers a channel for
-`OP_CONNECT` from the app thread at all — only the reactor thread ever
-touches the selector), the underlying JDK NIO mechanics HttpClient5 depends
-on are verified sound.
-
-### `SingleCoreIOReactor.connect()`'s actual mechanism (via `javap -c`, no sources jar available on this host)
+Commit `cf78cbb8` (branch `fix/socketchannel-supportedoptions-abstractmethod-0707`,
+merged to `dev` at `e84859d7`). Root-caused via a Java-level stack dump
+(CratonVM's `--stack-dump-on-timeout <SECONDS>` flag — dumps every
+interpreter thread's Java frame chain to stderr, far more direct than
+Rust-level `gdb` backtraces for this) which caught an `IOReactorWorker`
+thread mid-`openSocketFor()` → traced forward via `javap -c` disassembly of
+`SingleCoreIOReactor`'s `prepareSocket(SocketChannel)`:
 
 ```
-public java.util.concurrent.Future<IOSession> connect(...) {
-    ...
-    IOSessionRequest req = new IOSessionRequest(...);
-    requestQueue.add(req);      // java.util.Queue<IOSessionRequest> field
-    selector.wakeup();
-    return req;
-}
+channel.supportedOptions().contains(StandardSocketOptions.TCP_NODELAY)
 ```
 
-A plain `queue.add()` + `wakeup()` — simpler than probe (3) above, which
-already passes. So the submission mechanism itself is very unlikely to be
-where this breaks; the stall is more likely somewhere later in the reactor's
-own processing of a dequeued request (`processPendingConnectionRequests` →
-`prepareSocket`/`openSocketFor`/`processConnectionRequest`, or the HTTP/1.1
-protocol handshake stage after the TCP connect completes) — not yet
-isolated further.
+Directly reproduced standalone (`SupportedOptionsProbe.java`):
+`SocketChannel.open().supportedOptions()` threw `AbstractMethodError: method
+java/nio/channels/NetworkChannel.supportedOptions()Ljava/util/Set; has no
+Code attribute` — neither `SocketChannel` nor `ServerSocketChannel` had a
+native registration for it in `native-io/src/socket_channel.rs`, so dispatch
+fell through to the abstract interface declaration. `AbstractMethodError` is
+an `Error`, not an `Exception`/`RuntimeException`, so
+`SingleCoreIOReactor.processPendingConnectionRequests`'s
+`catch (IOException | RuntimeException)` around the connection-setup call
+does not catch it — confirmed via disassembly of
+`IOReactorWorker.run()`: it `catch (Error e)`s, stores it in a field, and
+**re-throws** — an uncaught `Error` on a bare `Thread` (HttpClient5's own
+reactor worker threads) with no handler installed just terminates that
+thread silently, before the connect attempt was ever reached. A live
+`strace` before the fix showed **zero `connect()` syscalls** ever issued by
+the client.
 
-### Java-level stack dump (`--stack-dump-on-timeout`) of the raw-probe hang
+Fixed by registering `supportedOptions()` on both classes, returning a real
+`Set<SocketOption<?>>` built from `java.net.StandardSocketOptions`'s static
+fields, advertising exactly what this shim's `apply_option`/`read_option`
+already recognize (`TCP_NODELAY`, genuinely wired to `TcpStream
+::set_nodelay`; `SO_KEEPALIVE`/`SO_REUSEADDR`/`SO_RCVBUF`/`SO_SNDBUF`/
+`SO_LINGER`, accepted no-ops since `std::net::TcpStream` exposes no setter
+for the latter three without the `socket2` crate).
 
-CratonVM has a purpose-built flag for exactly this kind of investigation:
-`--stack-dump-on-timeout <SECONDS>` arms a watchdog that dumps every
-interpreter thread's **Java-level** frame chain (class/method/pc, not just
-Rust frames) to stderr after the deadline, then aborts — far more direct
-than reading Rust-level `gdb` backtraces for pinpointing which Java method
-is actually stuck. Running `RawHc5Probe` with `--stack-dump-on-timeout 20`:
+**Verified real, measurable progress**: after the fix, a live `strace` shows
+a genuine `connect(fd, {sa_family=AF_INET, ...}) = -1 EINPROGRESS` followed
+by `getsockopt(fd, SOL_SOCKET, SO_ERROR, [0], [4]) = 0` (i.e. `finishConnect
+()` succeeding) — the TCP connection now actually completes, where before
+this fix it never even attempted one. Regression-checked: Reactor Netty and
+Jetty connectors unaffected; `native-io`'s 330 unit tests all pass.
 
-- `main` (tid=0): parked at the `latch.await(...)` call site in
-  `RawHc5Probe.main`, as expected.
-- **14 separate `IOReactorWorker` threads** (tid 5–19, one dead), **all**
-  showing the identical 3-frame stack `IOReactorWorker.run()` →
-  `AbstractSingleCoreIOReactor.execute()` → `SingleCoreIOReactor.doExecute()`
-  — i.e. all blocked inside `doExecute()`'s own `select()` call, with
-  nothing deeper visible (the interpreter's frame-chain walk stops at the
-  native `Selector.select()` boundary, same as the Rust-level `gdb` view
-  showed `epoll_wait`). **This snapshot alone can't tell whether the ONE
-  worker actually assigned our connection (via `DefaultConnectingIOReactor
-  .selectWorker()`, presumably round-robin across the worker array) is
-  genuinely stuck vs. whether all 14 are simply idle/unused and only one was
-  ever supposed to do anything** — distinguishing these needs correlating
-  worker identity with the specific connect request, not done yet.
-- One `ThreadPoolExecutor$Worker` thread parked in
-  `LinkedBlockingQueue.take()` via `ForkJoinPool.managedBlock` — a generic
-  idle pool thread, unrelated.
-- No exception anywhere in the dump except a `SocketException` under
-  `MockWebServer.acceptConnections()`, which is just the *expected* teardown
-  side effect of the probe's own `server.close()` call racing the 20s
-  watchdog abort — not a clue about the hang itself.
+### 🔴 STILL OPEN: the hang persists past the TCP connect, with no observable cause found
 
-### A separate, genuine, confirmed (but almost certainly NOT hang-causing) bug found along the way
+Even after the fix, `MockWebServer.getRequestCount()` is `0` after the
+callback times out — the actual HTTP request never arrives, and neither
+`FutureCallback.completed()` nor `.failed()` ever fires. MockWebServer's own
+log shows `connection from 127.0.0.1/127.0.0.1 didn't make a request` — the
+TCP connection is accepted, then nothing.
 
-`SocketChannel.setOption()`/`getOption()` for `SO_SNDBUF`, `SO_RCVBUF`, and
-`SO_LINGER` are unconditional no-ops in `native-io/src/socket_channel.rs`'s
-`apply_option()`/`read_option()` (`"SO_RCVBUF" | "SO_SNDBUF" => Ok(())`, and
-`SO_LINGER` falls through the same catch-all `_ => Ok(())`) — `std::net
-::TcpStream` doesn't expose setters for these without the `socket2` crate,
-so the author left them as accepted no-ops. Confirmed via a standalone probe
-(`SetOptionAttachProbe.java`): `setOption(SO_SNDBUF, 32768)` followed by
-`getOption(SO_SNDBUF)` reads back `0`, not `32768` (same for `SO_RCVBUF`/
-`SO_LINGER`). `TCP_NODELAY` **is** actually wired to `TcpStream::set_nodelay`
-and *should* work once a real connection exists in `tcp_registry` — the
-probe's own `getOption(TCP_NODELAY)` read `false` after `setOption(...,
-true)` only because the probe called `setOption` *before* `connect()`, when
-there's no live `TcpStream` handle yet for `apply_option` to act on (not
-itself a bug, just a probe-ordering artifact — not re-tested post-connect).
-`SelectionKey.attach()`/`attachment()` were also checked and work correctly
-(same-object identity preserved across `select()`). `HttpClient5`'s
-`prepareSocket()` calls exactly these `setOption`s when preparing a fresh
-connect — since they're silent no-ops (not exceptions), they should not
-themselves cause a hang, but are flagged here as a genuine, real,
-independently-worth-fixing defect for whoever picks this up next (would need
-the `socket2` crate, or an equivalent raw-fd `setsockopt` call, added to
-`native-io` — a small, contained, low-risk fix, just out of scope for this
-pass since it doesn't explain the hang).
+Exhaustive further investigation this session, all inconclusive (each ruled
+out a hypothesis without finding the actual cause):
+
+- **Not an uncaught exception on any reactor thread.** Reflectively obtained
+  every `IOReactorWorker` instance backing the client's 16 dispatch threads
+  (`WorkerThrowableProbe.java`, navigating `Thread.holder.task` on JDK 25) and
+  called `getThrowable()` on each after the hang: all 16 threads are still
+  `alive=true`, and all report `null` — `IOReactorWorker.run()`'s own
+  `catch (Exception e) { this.throwable = e; }` (swallow, don't rethrow —
+  confirmed via disassembly) path was never hit either. Also confirmed
+  nothing reaches a global `Thread.setDefaultUncaughtExceptionHandler`.
+- **Not `BasicFuture`/lock-based callback delivery.** Disassembled
+  `IOSessionRequest.completed()`/`.failed()` (call into a
+  `BasicFuture<IOSession>`) and `BasicFuture.completed()` (a standard
+  `ReentrantLock`+`Condition` guarded state transition, then invokes the
+  stored `FutureCallback` if non-null) — structurally sound, no red flags.
+- **Not visible via HttpClient5's own logging.** Enabled `slf4j-simple`
+  (present in the Gradle cache) at `TRACE` level via a `simplelogger
+  .properties` on the classpath (SLF4J previously had zero providers, so
+  HttpClient5's internal logging went nowhere). Its own debug log runs
+  cleanly through connection-manager leasing, address resolution
+  (`MultihomeIOSessionRequester`), and `"localhost:PORT connecting
+  null->localhost/127.0.0.1:PORT (3 MINUTES)"` — then **nothing further, no
+  error**. The 3-minute figure confirms it isn't a false-positive connect
+  timeout either (the TCP connect completes in single-digit milliseconds
+  per the `strace` timestamps).
+- **Not `Timeout`/clock arithmetic.** `InternalConnectChannel.onIOEvent`
+  gates protocol setup behind `InternalChannel.checkTimeout(now)`, which
+  compares `now` against `getLastEventTime() + getTimeout().toMilliseconds()`
+  — directly tested `Timeout.ofSeconds(5)`/`Timeout.DISABLED`/
+  `System.currentTimeMillis()` deltas (`TimeoutCheckProbe.java`): all correct.
+  `ConnectionConfig.DEFAULT.getConnectTimeout()` is 3 minutes, nowhere close
+  to firing this fast.
+- **Reflectively invoking the exact same sequence in isolation works.**
+  `openSocketFor(address)` (`OpenSocketForProbe.java`), a full
+  `prepareSocket(channel)` call against a **real** `SingleCoreIOReactor`
+  worker instance pulled out of a live, started client via reflection
+  (`PrepareSocketProbe.java`), and the complete `processConnectionRequest
+  (channel, sessionRequest)` (`ProcessConnectionRequestProbe.java`, with a
+  real `IOSessionRequest` built via its package-private constructor) all
+  return normally, no exception, when driven directly — but this reflective
+  driving happens from a foreign thread rather than the reactor's own
+  worker thread noticing the event through its normal `select()` loop, so it
+  doesn't perfectly reproduce the real code path's threading; the callback
+  still didn't fire in that test either, but inconclusively (my test thread
+  registered onto the worker's selector without a `wakeup()`, so timing
+  wasn't controlled precisely enough to be a clean negative result).
+
+**Where this leaves it:** the break is somewhere in the connect-completion
+handoff — `InternalConnectChannel.onIOEvent` → `checkTimeout` →
+`eventHandlerFactory.createHandler(...)` → `InternalDataChannel.upgrade(...)`
+→ `SelectionKey.attach(...)` → `sessionRequest.completed(...)` →
+`dataChannel.handleIOEvent(8)` (disassembled in full via `javap -c
+InternalConnectChannel`, bytecode offsets 0–166) — that produces **no
+observable exception, log line, or thread death** through any technique
+tried this session (reflection, global uncaught-handler, SLF4J TRACE
+logging, `IOReactorWorker.getThrowable()` polling).
 
 ### Next concrete steps for a future session
 
-1. **Instrument `httpclient5`/`httpcore5` directly.** No `-sources.jar` is
-   available on this host for either artifact (`find
-   ~/.gradle/caches/modules-2/files-2.1/org.apache.httpcomponents.core5
-   -iname '*sources*'` finds nothing) and decompiling+recompiling with added
-   trace prints in `SingleCoreIOReactor.processPendingConnectionRequests`/
-   `processConnectionRequest`/`prepareSocket` (or wherever the dequeued
-   `IOSessionRequest` gets its socket opened and connected) would show
-   exactly which step is reached and where the reactor stops making
-   progress — this is the most direct remaining lever.
-2. **Correlate which specific `IOReactorWorker` thread was assigned the
-   request.** `DefaultConnectingIOReactor.selectWorker()` picks one of the
-   `workers[]` array per connect — add temporary logging (or attach a
-   debugger at that call) to identify which thread index gets it, then
-   target `--stack-dump-on-timeout` / `gdb` snapshots specifically at THAT
-   thread rather than treating all 14 as equally suspect.
-3. Try a **much shorter `IOReactorConfig` `ioThreadCount`** (e.g. 1) to
-   collapse the 14-worker fan-out down to a single, unambiguous reactor
-   thread — makes the next stack dump trivially attributable.
-4. Consider whether HTTP/1.1 protocol negotiation (`Http1AsyncRequester`,
-   the `IOEventHandlerFactory` chain) rather than the raw TCP connect is
-   where it actually stalls — the connect+`prepareSocket` path was the focus
-   this pass since it's the earliest point where something HttpClient5-only
-   (not shared with Jetty/Reactor Netty/JDK) is involved, but it has not
-   been positively confirmed as the exact stall point, only judged the most
-   likely remaining candidate after the raw NIO layer was cleared.
+1. **Instrument HttpClient5 bytecode directly.** No `-sources.jar` is
+   available on this host for `httpclient5`/`httpcore5`, but ASM is (`find
+   ~/.gradle/caches/modules-2/files-2.1/org.ow2.asm -iname '*.jar'`) —
+   use it to inject `System.err.println` calls at the start of
+   `InternalConnectChannel.onIOEvent`, right after each `checkTimeout`/
+   `eventHandlerFactory.createHandler`/`upgrade`/`handleIOEvent` call, write
+   the patched `.class` to a directory placed **first** on the classpath
+   (Java classpath precedence lets it shadow the real jar's copy), and rerun
+   `RawHc5Probe`. This is the most direct remaining lever — reflection,
+   logging, and uncaught-handler techniques are now exhausted.
+2. Alternatively, get a `-sources.jar` for `httpclient5`/`httpcore5` from
+   Maven Central (this host has outbound internet access, confirmed
+   elsewhere in this doc's history) and decompile-free read the real source
+   for `InternalConnectChannel`/`InternalDataChannel`/`ClientHttp1
+   IOEventHandlerFactory` directly instead of reconstructing intent from
+   `javap -c` bytecode.
+3. Reduce `IOReactorConfig`'s `ioThreadCount` to 1 (via a custom
+   `HttpAsyncClientBuilder`/`PoolingAsyncClientConnectionManager` config,
+   not just `HttpAsyncClients.createDefault()`) to collapse the 16-worker
+   fan-out to a single, unambiguous thread for any further `gdb`/stack-dump
+   work.
+4. Reproduction probes used this session (all in `/tmp` and `/tmp/probe` on
+   the Azure host, **not committed to the repo** — recreate from this doc's
+   descriptions if the host's `/tmp` has been cleared):
+   `ConnectorProbe.java`, `RawHc5Probe.java`, `NioSelectorProbe.java`,
+   `WakeupProbe.java`, `ConnectWakeupProbe.java`, `EarlyWakeupProbe.java`,
+   `ColdStartProbe.java`, `SetOptionAttachProbe.java`,
+   `SupportedOptionsProbe.java`, `OpenSocketForProbe.java`,
+   `OpenSocketForConnectProbe.java`, `PrepareSocketProbe.java`,
+   `ProcessConnectionRequestProbe.java`, `WorkerThrowableProbe.java`,
+   `TimeoutCheckProbe.java`, `IsUnresolvedProbe.java`.
 5. `sudo -n gdb -p <pid> ...` is required on this host for any raw-frame
    attach (plain `gdb -p` fails with a `ptrace_scope`/`yama` permission
-   error even though the ssh user owns the process, since the launched test
-   process and the `gdb` invocation are siblings under the same shell, not
-   parent/child — this user has passwordless `sudo`). Prefer
-   `--stack-dump-on-timeout` over raw `gdb` where possible now that it's
-   known to exist — it gives Java-level frames directly, no Rust-frame
-   translation needed.
+   error — the launched test process and the `gdb` invocation are siblings
+   under the same shell, not parent/child; this user has passwordless
+   `sudo`). `--stack-dump-on-timeout <SECONDS>` (integer seconds only) gives
+   Java-level frames directly and is usually preferable.
 ## A separate, real, low-risk fix landed in the original session (does NOT fix root cause #1, #2, or #3)
 
 `native_es_execute` (`ExecutorService.execute(Runnable)`/
