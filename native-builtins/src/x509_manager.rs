@@ -210,7 +210,24 @@ static TM_REGISTRY: OnceLock<RwLock<HashMap<i32, TrustManagerState>>> = OnceLock
 static NEXT_KM_ID: OnceLock<RwLock<i32>> = OnceLock::new();
 static NEXT_TM_ID: OnceLock<RwLock<i32>> = OnceLock::new();
 
-fn km_registry() -> &'static RwLock<HashMap<i32, KeyManagerState>> {
+// FIX (tomcat-clientauth-engine-config): promoted from private to
+// `pub(crate)` so `phases_late.rs`'s `KeyManagerFactory.getKeyManagers()`
+// stub (a separate, competing registration on the PUBLIC
+// `javax/net/ssl/KeyManagerFactory` class itself, active whenever the KMF
+// object was allocated via that module's own `getInstance` rather than
+// going through the real SPI `factorySpi.engineGetKeyManagers()`
+// delegation chain this module's `kmf_engine_get_key_managers` backs) can
+// register a KeyManager in the SAME registry `chooseClientAlias`/
+// `getPrivateKey` (below) consult, instead of returning a non-functional,
+// bare-interface-stamped `javax/net/ssl/X509KeyManager` object whose
+// methods have no Code and throw `AbstractMethodError` the instant real
+// Java bytecode (e.g. a test's wrapper `KeyManager` delegating to the
+// array `getKeyManagers()` returned) calls one directly. Mirrors the
+// identical `pub(crate)`-promotion precedent already applied to
+// `jca::provider_chain::find`/`make_provider` for the sibling
+// `KeyManagerFactory.getProvider()` fix (see this crate's
+// `docs/known-issues/tls-ocsp-clientcert-validation-not-enforced.md`).
+pub(crate) fn km_registry() -> &'static RwLock<HashMap<i32, KeyManagerState>> {
     KM_REGISTRY.get_or_init(|| RwLock::new(HashMap::new()))
 }
 
@@ -218,7 +235,7 @@ fn tm_registry() -> &'static RwLock<HashMap<i32, TrustManagerState>> {
     TM_REGISTRY.get_or_init(|| RwLock::new(HashMap::new()))
 }
 
-fn next_km_id() -> i32 {
+pub(crate) fn next_km_id() -> i32 {
     let cell = NEXT_KM_ID.get_or_init(|| RwLock::new(1));
     let mut g = cell.write();
     let id = *g;
@@ -2856,9 +2873,9 @@ pub fn check_endpoint_identity(
 // KeyManagerFactoryImpl$SunX509: slot 0 = i32 km_id.
 // TrustManagerFactoryImpl$SimpleFactory: slot 0 = i32 tm_id.
 
-const FQN_SUN_X509_KM: &str = "sun/security/ssl/SunX509KeyManagerImpl";
+pub(crate) const FQN_SUN_X509_KM: &str = "sun/security/ssl/SunX509KeyManagerImpl";
 const FQN_X509_KM: &str = "sun/security/ssl/X509KeyManagerImpl";
-const FQN_X509_TM: &str = "sun/security/ssl/X509TrustManagerImpl";
+pub(crate) const FQN_X509_TM: &str = "sun/security/ssl/X509TrustManagerImpl";
 const FQN_PKIX_VALIDATOR: &str = "sun/security/validator/PKIXValidator";
 const FQN_KMF_SUN_X509: &str = "sun/security/ssl/KeyManagerFactoryImpl$SunX509";
 const FQN_TMF_SIMPLE: &str = "sun/security/ssl/TrustManagerFactoryImpl$SimpleFactory";
@@ -3022,32 +3039,55 @@ fn register_tmf(r: &mut NativeMethodRegistry) {
     );
 }
 
-/// `engineInit(ManagerFactoryParameters)` — see `register_tmf`'s doc for why
-/// this overload needs its own handler. Walks
+/// Shared by `tmf_engine_init_params` and, cross-module,
+/// `phases_late.rs`'s competing `TrustManagerFactory.init
+/// (ManagerFactoryParameters)` registration (see that handler's doc
+/// comment — FIX tomcat-clientauth-engine-config). Walks
 /// `CertPathTrustManagerParameters.getParameters()` (real runtime type
 /// `PKIXParameters`/`PKIXBuilderParameters`) -> `.getTrustAnchors()` -> each
 /// `TrustAnchor.getTrustedCert()` -> `.getEncoded()` to recover the same
 /// trust-anchor DER set `tmf_engine_init` gets from a plain `KeyStore` —
 /// `PKIXParameters` retains no back-reference to the original `KeyStore`
-/// object, so this is the only way to recover the anchors from this overload.
-fn tmf_engine_init_params(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    let this = this_arg(args)?;
+/// object, so this is the only way to recover the anchors from this
+/// overload. Builds and registers a `TrustManagerState` into `tm_registry`,
+/// stages the pending-trust-roots/revocation thread-locals the same way
+/// `tmf_engine_init` does, and returns the new `tm_registry` id — but does
+/// NOT call `set_tm_id` itself, since not every caller's `this` object has
+/// a safe place to land it (a `phases_late.rs`-allocated
+/// `javax/net/ssl/TrustManagerFactory` has its own field-0 in active use
+/// for something else entirely — writing the tm id there would corrupt
+/// it). Callers own where/whether to persist the returned id.
+pub(crate) fn build_and_register_tm_state_from_mfp(
+    ctx: &mut dyn NativeContext,
+    mfp: Option<ObjectRef>,
+) -> i32 {
     let mut state = TrustManagerState::default();
-    if let Some(Value::Object(Some(mfp))) = args.get(1) {
-        for der in extract_pkix_trust_anchor_ders(ctx, *mfp) {
+    if let Some(mfp) = mfp {
+        for der in extract_pkix_trust_anchor_ders(ctx, mfp) {
             insert_anchor(&mut state, der);
         }
-        state.revocation = extract_revocation_config(ctx, *mfp);
+        state.revocation = extract_revocation_config(ctx, mfp);
         if std::env::var("CRATONVM_DBG_TLS_AUTH").is_ok() {
             eprintln!(
-                "[dbg-tls-auth] tmf_engine_init_params revocation_config={:?}",
+                "[dbg-tls-auth] build_and_register_tm_state_from_mfp revocation_config={:?}",
                 state.revocation
             );
         }
     }
     crate::t27_tls::set_pending_tm_revocation(state.revocation.clone());
     crate::t27_tls::set_pending_tm_trust_roots(state.anchor_ders.clone());
-    let id = register_trust_manager_state(state);
+    register_trust_manager_state(state)
+}
+
+/// `engineInit(ManagerFactoryParameters)` — see `register_tmf`'s doc for why
+/// this overload needs its own handler.
+fn tmf_engine_init_params(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = this_arg(args)?;
+    let mfp = match args.get(1) {
+        Some(Value::Object(Some(mfp))) => Some(*mfp),
+        _ => None,
+    };
+    let id = build_and_register_tm_state_from_mfp(ctx, mfp);
     set_tm_id(ctx, this, id);
     Ok(None)
 }
@@ -3401,7 +3441,7 @@ fn get_km_id(ctx: &mut dyn NativeContext, this: ObjectRef) -> i32 {
     0
 }
 
-fn set_km_id(ctx: &mut dyn NativeContext, this: ObjectRef, id: i32) {
+pub(crate) fn set_km_id(ctx: &mut dyn NativeContext, this: ObjectRef, id: i32) {
     ctx.set_field_by_name(this, "cratonvm$x509km$id", Value::Int(id));
     let n = ctx.object_num_fields(this);
     if n > 0 {
@@ -3472,7 +3512,7 @@ fn get_tm_id(ctx: &mut dyn NativeContext, this: ObjectRef) -> i32 {
     0
 }
 
-fn set_tm_id(ctx: &mut dyn NativeContext, this: ObjectRef, id: i32) {
+pub(crate) fn set_tm_id(ctx: &mut dyn NativeContext, this: ObjectRef, id: i32) {
     ctx.set_field_by_name(this, "cratonvm$x509tm$id", Value::Int(id));
     let n = ctx.object_num_fields(this);
     if n > 0 {
