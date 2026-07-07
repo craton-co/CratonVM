@@ -1639,6 +1639,13 @@ fn register_object_output_stream(r: &mut NativeMethodRegistry) {
     r.register(cls, "writeObject", "(Ljava/lang/Object;)V", |ctx, args| {
         let this = obj_arg(args, 0)?;
         let addr = this.as_ptr() as usize;
+        // Cross-call GC-safety fix (2026-07-07, same shape as
+        // ois_read_object): `this` (the ObjectOutputStream instance) is a
+        // bare Rust local read again *after* the custom writeObject hook /
+        // default oos_write_value recursion below, both of which can run
+        // arbitrary Java bytecode and trigger a moving GC. Pin it so the
+        // post-dispatch depth-counter reset reads the live address.
+        let this_pin = ctx.pin_native_root(this);
         let depth = match ctx.get_field(this, 2) {
             Value::Int(d) => d,
             _ => 0,
@@ -1772,7 +1779,9 @@ fn register_object_output_stream(r: &mut NativeMethodRegistry) {
             hook.map(|_| None)
         })();
 
-        ctx.set_field(this, 2, Value::Int(depth));
+        let this_cur = ctx.read_native_pin(this_pin, this);
+        ctx.unpin_native_roots(this_pin);
+        ctx.set_field(this_cur, 2, Value::Int(depth));
         result
     });
 
@@ -2275,6 +2284,21 @@ fn ois_read_object(ctx: &mut dyn NativeContext, addr: usize) -> Value {
         alloc_concurrent_synthetic(ctx, &desc.class_name, serialized_count)
     };
 
+    // Cross-call GC-safety fix (2026-07-07, same shape + pattern as
+    // nio_selector.rs's build_set / populate_selected_keys_field): `obj` is a
+    // bare Rust local held across several `invoke_virtual`/`invoke_special`
+    // dispatches below (readExternal, a custom readObject hook) and across
+    // the default field-decode path (`ois_read_descriptor_fields`, whose own
+    // recursive nested-object reads can themselves trigger a moving GC via
+    // `ois_read_value`/`read_field_value`). Any of those can relocate `obj`,
+    // so every use of it below -- including the final return -- must go
+    // through the pin rather than the stale captured value. Reproduced under
+    // CRATONVM_GC_STRESS amplification as "Stale pointer detected in
+    // invokevirtual receiver (all-zero header)" attributed to
+    // ObjectInputStream/nested field classes during Tomcat Tribes'
+    // GroupChannel.messageReceived deserialization.
+    let obj_pin = ctx.pin_native_root(obj);
+
     ois_push_handle(addr, Some(obj));
 
     // Zero-initialize all instance fields to their type defaults.
@@ -2291,7 +2315,8 @@ fn ois_read_object(ctx: &mut dyn NativeContext, addr: usize) -> Value {
                 d if d.starts_with('L') || d.starts_with('[') => Value::Object(None),
                 _ => Value::Int(0),
             };
-            ctx.set_field(obj, f.slot_index, default);
+            let cur = ctx.read_native_pin(obj_pin, obj);
+            ctx.set_field(cur, f.slot_index, default);
         }
     }
 
@@ -2303,20 +2328,23 @@ fn ois_read_object(ctx: &mut dyn NativeContext, addr: usize) -> Value {
                 cur_push(
                     addr,
                     CurFrame {
-                        obj,
+                        obj: ctx.read_native_pin(obj_pin, obj),
                         class_id,
                         read_desc: None,
                     },
                 );
+                let cur = ctx.read_native_pin(obj_pin, obj);
                 let _ = ctx.invoke_virtual(
-                    obj,
+                    cur,
                     "readExternal",
                     "(Ljava/io/ObjectInput;)V",
                     &[Value::Object(Some(stream))],
                 );
                 cur_pop(addr);
             }
-            return Value::Object(Some(obj));
+            let result_obj = ctx.read_native_pin(obj_pin, obj);
+            ctx.unpin_native_roots(obj_pin);
+            return Value::Object(Some(result_obj));
         }
         // Custom readObject hook: push the curObj frame and dispatch so the
         // hook can call defaultReadObject() + the primitive readers.
@@ -2332,26 +2360,32 @@ fn ois_read_object(ctx: &mut dyn NativeContext, addr: usize) -> Value {
                 cur_push(
                     addr,
                     CurFrame {
-                        obj,
+                        obj: ctx.read_native_pin(obj_pin, obj),
                         class_id,
                         read_desc: Some(desc.clone()),
                     },
                 );
+                let cur = ctx.read_native_pin(obj_pin, obj);
                 let _ = ctx.invoke_special(
                     &desc.class_name,
                     "readObject",
                     "(Ljava/io/ObjectInputStream;)V",
-                    &[Value::Object(Some(obj)), Value::Object(Some(stream))],
+                    &[Value::Object(Some(cur)), Value::Object(Some(stream))],
                 );
                 cur_pop(addr);
-                return Value::Object(Some(obj));
+                let result_obj = ctx.read_native_pin(obj_pin, obj);
+                ctx.unpin_native_roots(obj_pin);
+                return Value::Object(Some(result_obj));
             }
         }
     }
 
     // Default path: decode the field block straight into the object.
-    ois_read_descriptor_fields(ctx, addr, obj, &desc, resolved.ok());
-    Value::Object(Some(obj))
+    let cur = ctx.read_native_pin(obj_pin, obj);
+    ois_read_descriptor_fields(ctx, addr, cur, &desc, resolved.ok());
+    let result_obj = ctx.read_native_pin(obj_pin, obj);
+    ctx.unpin_native_roots(obj_pin);
+    Value::Object(Some(result_obj))
 }
 
 /// Read the field-data block described by `desc` from the stream and store
@@ -2366,6 +2400,14 @@ fn ois_read_descriptor_fields(
     desc: &ClassDescriptor,
     resolved: Option<ClassId>,
 ) {
+    // Cross-call GC-safety fix (2026-07-07, see ois_read_object's matching
+    // comment): a reference-typed field (`tc` == 'L' or '[') recurses through
+    // `read_field_value` -> `ois_read_value` into the full nested-object
+    // reader -- allocations, constructors, and custom readObject/readExternal
+    // hooks, any of which can trigger a moving GC. `obj` must be re-read via
+    // the pin before every `set_field`, not used as the stale value captured
+    // at entry.
+    let obj_pin = ctx.pin_native_root(obj);
     if let Some(class_id) = resolved {
         let names_snapshot: Vec<(String, usize)> = ctx
             .declared_fields(class_id)
@@ -2375,21 +2417,24 @@ fn ois_read_descriptor_fields(
             .collect();
         for (i, tc) in desc.field_types.clone().iter().enumerate() {
             let val = read_field_value(ctx, addr, *tc);
+            let cur = ctx.read_native_pin(obj_pin, obj);
             if let Some((_, slot)) = names_snapshot
                 .iter()
                 .find(|(n, _)| n == &desc.field_names[i])
             {
-                ctx.set_field(obj, *slot, val);
+                ctx.set_field(cur, *slot, val);
             } else {
-                ctx.set_field(obj, i, val);
+                ctx.set_field(cur, i, val);
             }
         }
     } else {
         for (i, tc) in desc.field_types.iter().enumerate() {
             let val = read_field_value(ctx, addr, *tc);
-            ctx.set_field(obj, i, val);
+            let cur = ctx.read_native_pin(obj_pin, obj);
+            ctx.set_field(cur, i, val);
         }
     }
+    ctx.unpin_native_roots(obj_pin);
 }
 
 /// Materialize a `TC_ARRAY` whose opening tag has already been consumed.
