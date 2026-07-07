@@ -13,7 +13,7 @@
 //! The interpreter and all helper functions take `(shared: &SharedVm, thread: &mut JvmThread)`
 //! instead of `(vm: &mut Vm)`.
 
-mod vm_exec;
+pub(crate) mod vm_exec;
 mod vm_init;
 mod vm_object;
 mod vm_util;
