@@ -436,8 +436,24 @@ pub fn ensure_class_initialized_shared(
                     // poison handling, wait_for returns a WaitTimeoutResult
                     // (no Result wrapper) since it cannot fail.
                     let mut guard = lock.lock();
-                    // Wait with timeout to avoid deadlock on misconfigured init
-                    let _result = cvar.wait_for(&mut guard, std::time::Duration::from_secs(30));
+                    // MISSED-NOTIFY FIX (2026-07-07 — the ~30s class-init
+                    // stall behind the RRWL "crawl regime", the 21-28s
+                    // Thread.join tails, and Elasticsearch startup stalls):
+                    // the initializer sets `*done = true` under THIS mutex
+                    // and only then calls `notify_all` (see
+                    // `finalize_class_init`). If initialization completed
+                    // between our class-state check above and this lock
+                    // acquisition, that notify already fired — waiting
+                    // unconditionally ate the full 30-second timeout, one
+                    // straggler thread per incident (measured: recovery
+                    // always lands at process lifetime ≈ +30s; probe join
+                    // tails of 21.37s±15ms). Wait only while the done flag
+                    // is unset; any wake (notify, timeout, spurious) falls
+                    // through to the outer loop's state re-check.
+                    if !*guard {
+                        let _result =
+                            cvar.wait_for(&mut guard, std::time::Duration::from_secs(30));
+                    }
                     drop(guard);
                     drop(blk);
                     ctx.check_post_block_gc();

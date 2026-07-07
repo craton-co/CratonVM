@@ -13043,6 +13043,16 @@ fn execute_instruction(
             let exc_value = thread.frames[frame_idx].stack.pop()?;
             match exc_value {
                 Value::Object(Some(obj_ref)) => {
+                    // DBG (CRATONVM_DBG_IMSE): autopsy for the RRWL "attempt
+                    // to unlock read lock" hold-count loss (ES testAllEqual
+                    // face). At the throw site, dump the Sync's complete
+                    // read-hold bookkeeping so the broken invariant is named
+                    // directly: firstReader identity, the cached hold
+                    // counter, and the current thread's readHolds
+                    // ThreadLocalMap entry.
+                    if std::env::var_os("CRATONVM_DBG_IMSE").is_some() {
+                        dump_imse_holdcount_state(shared, thread, obj_ref);
+                    }
                     // S111r19+: trace IAE thrown from Java bytecode (ATHROW opcode)
                     // This catches IAEs that don't go through throw_runtime_error,
                     // e.g. Spring's Assert.notNull / validateBeanDefinition etc.
@@ -29912,6 +29922,123 @@ fn double_to_long(v: f64) -> i64 {
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
+
+/// DBG (`CRATONVM_DBG_IMSE`): dump the complete `ReentrantReadWriteLock$Sync`
+/// read-hold bookkeeping at the moment an `IllegalMonitorStateException` is
+/// thrown from `tryReleaseShared` — names WHICH invariant broke (firstReader
+/// identity, cachedHoldCounter tid/count, or the current thread's `readHolds`
+/// ThreadLocalMap entry) for the ES `testAllEqual` hold-count-loss face.
+fn dump_imse_holdcount_state(shared: &SharedVm, thread: &JvmThread, exc: ObjectRef) {
+    let exc_class = {
+        let cm = shared.class_manager.read();
+        cm.get_class(shared.heap.class_id_of(exc))
+            .map(|c| c.name.to_string())
+            .unwrap_or_default()
+    };
+    if !exc_class.contains("IllegalMonitorStateException") {
+        return;
+    }
+    // Find the tryReleaseShared frame; local 0 is the Sync receiver.
+    let sync = thread.frames.iter().rev().find_map(|f| {
+        if f.method_name() == "tryReleaseShared" && f.class_name().contains("ReadWriteLock") {
+            match f.get_local(0) {
+                Value::Object(Some(o)) => Some(o),
+                _ => None,
+            }
+        } else {
+            None
+        }
+    });
+    let Some(sync) = sync else {
+        eprintln!("[imse] IllegalMonitorStateException thrown but no tryReleaseShared frame");
+        return;
+    };
+    let cm = shared.class_manager.read();
+    let field = |obj: ObjectRef, name: &str| -> Value {
+        let cid = shared.heap.class_id_of(obj);
+        match crate::vm::vm_exec::resolve_field_index_in_hierarchy(cid, name, &cm.class_store) {
+            Some(idx) => shared.heap.get_field(obj, idx),
+            None => Value::Uninitialized,
+        }
+    };
+    let me = thread.java_thread_obj;
+    let first_reader = field(sync, "firstReader");
+    let first_count = field(sync, "firstReaderHoldCount");
+    let cached = field(sync, "cachedHoldCounter");
+    let read_holds = field(sync, "readHolds");
+    eprintln!(
+        "[imse] tid={} me={:?} sync={:p} firstReader={:?} firstReaderHoldCount={:?}",
+        thread.thread_id.0,
+        me.map(|o| o.as_ptr()),
+        sync.as_ptr(),
+        first_reader,
+        first_count,
+    );
+    if let Value::Object(Some(rh)) = cached {
+        eprintln!(
+            "[imse]   cachedHoldCounter={:p} count={:?} tid={:?}",
+            rh.as_ptr(),
+            field(rh, "count"),
+            field(rh, "tid"),
+        );
+    } else {
+        eprintln!("[imse]   cachedHoldCounter={cached:?}");
+    }
+    // Walk the CURRENT thread's ThreadLocalMap for the readHolds entry.
+    let Value::Object(Some(read_holds)) = read_holds else {
+        eprintln!("[imse]   readHolds={read_holds:?} (field missing?)");
+        return;
+    };
+    let Some(me) = me else {
+        eprintln!("[imse]   no java_thread_obj for current thread");
+        return;
+    };
+    let tl_map = field(me, "threadLocals");
+    let Value::Object(Some(tl_map)) = tl_map else {
+        eprintln!("[imse]   readHolds={:p} but thread has NO threadLocals map", read_holds.as_ptr());
+        return;
+    };
+    let table = field(tl_map, "table");
+    let Value::Object(Some(table)) = table else {
+        eprintln!("[imse]   threadLocals map {:p} has NO table", tl_map.as_ptr());
+        return;
+    };
+    let len = shared.heap.array_length(table);
+    let mut found = false;
+    for i in 0..len {
+        let Ok(Value::Object(Some(entry))) = shared.heap.get_array_element(table, i) else {
+            continue;
+        };
+        // Entry extends WeakReference<ThreadLocal>; referent is field 0.
+        let referent = shared.heap.get_field(entry, 0);
+        let is_ours = matches!(referent, Value::Object(Some(r)) if r.as_ptr() == read_holds.as_ptr());
+        if is_ours {
+            found = true;
+            let value = field(entry, "value");
+            let vdesc = if let Value::Object(Some(hc)) = value {
+                format!(
+                    "HoldCounter@{:p} count={:?} tid={:?}",
+                    hc.as_ptr(),
+                    field(hc, "count"),
+                    field(hc, "tid"),
+                )
+            } else {
+                format!("{value:?}")
+            };
+            eprintln!(
+                "[imse]   readHolds={:p}: table[{i}] entry={:p} value={vdesc}",
+                read_holds.as_ptr(),
+                entry.as_ptr(),
+            );
+        }
+    }
+    if !found {
+        eprintln!(
+            "[imse]   readHolds={:p}: NO ThreadLocalMap entry in current thread's table (len={len}) — the entry is GONE",
+            read_holds.as_ptr(),
+        );
+    }
+}
 
 #[cfg(test)]
 mod tests {

@@ -15,6 +15,7 @@ public class RwlReadTearingProbe {
     static volatile boolean stop = false;
 
     public static void main(String[] args) throws Exception {
+        System.out.println("MAIN_START " + System.currentTimeMillis());
         int numThreads = args.length > 0 ? Integer.parseInt(args[0]) : 8;
         long durationMs = args.length > 1 ? Long.parseLong(args[1]) : 10000;
 
@@ -33,6 +34,7 @@ public class RwlReadTearingProbe {
                     }
                 }
                 sums[idx] = sum;
+                System.out.println("READER_EXIT " + idx + " " + System.currentTimeMillis());
             }, "reader-" + i);
         }
         Thread writer = new Thread(() -> {
@@ -45,15 +47,19 @@ public class RwlReadTearingProbe {
                     rwl.writeLock().unlock();
                 }
             }
+            System.out.println("WRITER_EXIT " + System.currentTimeMillis());
         }, "writer");
 
         for (Thread t : readers) t.start();
         writer.start();
+        System.out.println("THREADS_STARTED " + System.currentTimeMillis());
         Thread.sleep(durationMs);
         stop = true;
+        System.out.println("STOP_SET " + System.currentTimeMillis());
         for (Thread t : readers) t.join();
         writer.join();
 
+        System.out.println("JOINED " + System.currentTimeMillis());
         long total = 0;
         for (long s : sums) total += s;
         System.out.println("DONE total=" + total + " sharedFinal=" + shared);

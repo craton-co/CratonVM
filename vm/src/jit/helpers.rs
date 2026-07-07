@@ -4513,16 +4513,32 @@ pub unsafe extern "C" fn jit_invoke_virtual_mic(
                     if raw == 0 {
                         Value::Object(None)
                     } else {
-                        // Same defensive guard as the receiver decode above.
-                        // Tagged-long bits in an L/[ slot are downgraded to
-                        // null instead of panicking in ObjectRef::from_raw.
+                        // Tagged-long bits leaked into an L/[ slot (e.g. a
+                        // primitive that should have been boxed before this
+                        // virtual call) are downgraded to null instead of
+                        // being treated as a heap pointer. The alignment +
+                        // 48-bit-ceiling check alone is NOT sufficient: a
+                        // round-number primitive long (e.g. a millisecond
+                        // timeout like 60000/120000) is also 8-byte-aligned
+                        // and well under 2^48, so it silently passed as a
+                        // "plausible" pointer here and `ObjectRef::from_raw`
+                        // fabricated a bogus reference into unmapped memory --
+                        // confirmed via a live gdb repro: `XnioWorker$Builder
+                        // .set(Option, Object)` receiving an unboxed 120000
+                        // (0x1d4c0) segfaulted inside `read_string` when the
+                        // bogus ObjectRef's header was dereferenced. Match
+                        // `decode_dispatch_values`'s sibling path (used by the
+                        // cache-miss/bailout decode) and require actual heap
+                        // membership, not just bit-pattern plausibility.
                         let bits = raw as u64;
-                        if (bits & 0x7) == 0 && bits < (1u64 << 48) {
-                            // SAFETY: bits is non-zero, 8-byte aligned, and
-                            // within the 48-bit canonical address space.
-                            Value::Object(Some(ObjectRef::from_raw(raw as usize as *mut u8)))
+                        let validated = if (bits & 0x7) == 0 && bits < (1u64 << 48) {
+                            vm.heap.is_object_address(bits as usize)
                         } else {
-                            Value::Object(None)
+                            None
+                        };
+                        match validated {
+                            Some(obj) => Value::Object(Some(obj)),
+                            None => Value::Object(None),
                         }
                     }
                 }

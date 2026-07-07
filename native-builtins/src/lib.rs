@@ -53890,8 +53890,22 @@ fn register_java_lang_extras_natives(registry: &mut NativeMethodRegistry) {
     // is_interrupted(true) implementation — do NOT re-register here.
     // Thread.yield already registered in register_essential_natives with real
     // std::thread::yield_now() impl — not re-registered here.
+    // Thread.onSpinWait is a CPU spin-loop HINT (HotSpot lowers it to the
+    // x86 PAUSE instruction — nanoseconds, never a scheduler transition).
+    // The previous `std::thread::yield_now()` implementation was
+    // semantically wrong and catastrophic on a loaded host: every AQS
+    // pre-park spin (`AbstractQueuedSynchronizer.acquire` spins up to ~255
+    // onSpinWait rounds between park attempts) surrendered a scheduler
+    // quantum, so one contended ReentrantReadWriteLock handoff could cost
+    // SECONDS whenever the box had competing load — the "crawl regime"
+    // (probe throughput collapsing to ~1 lock op/s, ~21s Thread.join
+    // cascades at shutdown, Elasticsearch startups stalling past suite
+    // timeouts). Interpreted call sites dispatch this native shadow, so the
+    // crawl also locked itself in: threads too slow to hit JIT thresholds
+    // never got the compiled (empty-bytecode, shadow-free) version that
+    // made warm runs fast.
     registry.register("java/lang/Thread", "onSpinWait", "()V", |_ctx, _args| {
-        std::thread::yield_now();
+        std::hint::spin_loop();
         Ok(None)
     });
 

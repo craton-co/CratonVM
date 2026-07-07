@@ -103,6 +103,29 @@ impl Default for GcBlockState {
 pub struct ParkState {
     mutex: PLMutex<bool>,
     condvar: PLCondvar,
+    /// DBG (`CRATONVM_DBG_PARKLAT`): monotonic nanos of the most recent
+    /// `unpark()` that SET the permit (0 = none). `park_interruptible`
+    /// reads it on wake-with-permit and reports the unpark→wake latency
+    /// when it exceeds a threshold, separating "the signal was generated
+    /// late" (Java-side / protocol) from "the signal was delivered late"
+    /// (VM park machinery) in the RRWL crawl/join-stall investigation.
+    last_unpark_nanos: std::sync::atomic::AtomicU64,
+}
+
+/// Cached `CRATONVM_DBG_PARKLAT` gate.
+#[inline]
+fn parklat_enabled() -> bool {
+    use std::sync::OnceLock;
+    static G: OnceLock<bool> = OnceLock::new();
+    *G.get_or_init(|| std::env::var_os("CRATONVM_DBG_PARKLAT").is_some())
+}
+
+/// Monotonic nanos for the PARKLAT diagnostic (process-relative).
+#[inline]
+fn parklat_now_nanos() -> u64 {
+    use std::sync::OnceLock;
+    static EPOCH: OnceLock<std::time::Instant> = OnceLock::new();
+    EPOCH.get_or_init(std::time::Instant::now).elapsed().as_nanos() as u64
 }
 
 impl ParkState {
@@ -111,6 +134,7 @@ impl ParkState {
         Self {
             mutex: PLMutex::new(false),
             condvar: PLCondvar::new(),
+            last_unpark_nanos: std::sync::atomic::AtomicU64::new(0),
         }
     }
 
@@ -182,6 +206,22 @@ impl ParkState {
             }
             _ => {} // zero timeout = no-op
         }
+        // DBG (CRATONVM_DBG_PARKLAT): report a tardy delivery — the wake
+        // observed the permit long after the unpark that set it.
+        if *permit && parklat_enabled() {
+            let set_at = self
+                .last_unpark_nanos
+                .load(std::sync::atomic::Ordering::Acquire);
+            if set_at != 0 {
+                let lat_ms = parklat_now_nanos().saturating_sub(set_at) / 1_000_000;
+                if lat_ms >= 50 {
+                    eprintln!(
+                        "[parklat] unpark->wake {lat_ms}ms (thread {:?})",
+                        std::thread::current().id(),
+                    );
+                }
+            }
+        }
         *permit = false;
     }
 
@@ -192,6 +232,10 @@ impl ParkState {
     pub fn unpark(&self) {
         let mut permit = self.mutex.lock();
         *permit = true;
+        if parklat_enabled() {
+            self.last_unpark_nanos
+                .store(parklat_now_nanos(), std::sync::atomic::Ordering::Release);
+        }
         self.condvar.notify_one();
     }
 }

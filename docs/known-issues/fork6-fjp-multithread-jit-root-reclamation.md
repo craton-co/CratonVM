@@ -14,6 +14,63 @@
 > Use this repro (single-threaded, no GC_STRESS orchestration needed) to verify the
 > eventual register-oop-bitmap fix alongside the existing Fork6Hard lane.
 
+> **SECOND real-world confirmation 2026-07-07 ~16:15, and this one is suite-wide**:
+> [`wildfly-xnio-mockselector-mutex-segfault.md`](wildfly-xnio-mockselector-mutex-segfault.md) — the
+> dominant SIGSEGV blocking the ENTIRE WildFly `testsuite/integration/basic` suite (64% CRASH rate,
+> 128/200 classes in one sample) — was confirmed via a live core-dump backtrace to be **byte-for-byte the
+> same crash** (`read_string` ← `xnio_async::native_builder_set` ← `safe_native_call` ←
+> `invoke_or_native` ← `jit_invoke_virtual_mic`), independently bisected the same way
+> (`CRATONVM_DISABLE_JIT=1` → crash gone). That doc's own earlier addr2line-only theory (a native
+> `Mutex`/handle lifetime bug in `xnio_io_thread.rs`) is retracted in favor of this A4 finding. Practical
+> upshot: A4's register-only-oop gap is not a niche issue — it is very likely **the single highest-leverage
+> fix available for the WildFly suite's signal right now**, since `OptionMap.Builder.set()` fires on every
+> managed-container boot via XNIO worker/channel setup, not just Elytron-specific paths. Methodology note
+> for whoever debugs this next: a live gdb wrapper around the whole process (`gdb -batch -ex run ...`)
+> reproducibly **suppressed** this race (0/9 attempts across known-crashing classes) — the timing
+> perturbation closes the window. Raw execution with `kernel.core_pattern` pointed at a plain path +
+> `ulimit -c unlimited` (no gdb attached) reproduced on the first attempt every time; post-mortem `gdb
+> <binary> <corefile>` gives the same backtrace without perturbing the race.
+
+> **⚠️ Reconcile before implementing a fix.** A separate, much deeper investigation the same day (10+
+> hypotheses tested with hard evidence — precise JIT maps, `CRATONVM_DBG_FULLSTACK_SCAN`, a cross-thread
+> register harvest, a conservative operand-stack scan, `SEED_ALL_OLD`) **empirically refuted** the
+> "register-invisible oop, fixed by precise JIT maps" narrative for `Fork6Hard`'s own canonical
+> `GC_STRESS` repro. That session concluded A4 is instead a **real-FJP-path dangling-reference /
+> worker-barrier-publish gap** (a live island goes unpublished at the reclaiming GC — not a missed
+> root-scan) and that **adding more root coverage makes it WORSE, not better**. That conclusion is not yet
+> reflected in this doc's Status line above (still says "register-only residual... gated on the deferred
+> precise-JIT-stack-maps project"). Also worth noting: neither the Elytron nor the mockselector-mutex
+> repro touches ForkJoinPool or `GC_STRESS` at all — both are a single JIT-compiled virtual-dispatch call
+> to a native method (`jit_invoke_virtual_mic` → `native_builder_set`). So while these two share a crash
+> **site** with the `Fork6Hard` `read_string` symptom, the underlying **mechanism may differ** (a simpler
+> JIT-argument/root-tracking gap specific to invoke-virtual-to-native call sites, vs. `Fork6Hard`'s
+> FJP-worker-publish gap). Whoever picks this up next should confirm which mechanism actually applies to
+> the WildFly repros — e.g. with the same allocation-provenance/publish-check forensics used on
+> `Fork6Hard` — before building a register-oop-bitmap fix that was already shown not to fix the other one.
+
+> **THIRD real-world confirmation + FIX 2026-07-07 ~16:30**: a third doc,
+> `wildfly-infinispan-remove-listener-segfault.md`, had independently misattributed this same crash to
+> `infinispan_local::CacheInner::remove_listener` (another `addr2line`-on-stripped-LTO-release-binary
+> symbol-merge artifact — same trap as the mockselector doc's original theory). A live gdb repro (full
+> DWARF symbols) confirmed the identical `read_string` <- `xnio_async::native_builder_set` <-
+> `jit_invoke_virtual_mic` stack, same fault-address family (`0xea60`=60000, `0x1d4c0`=120000 — XNIO
+> worker/option millisecond timeouts, not "near-null garbage pointers"). Unlike this doc's general
+> register-oop-bitmap framing, this specific manifestation was fixable at the JIT argument **decode**
+> boundary without touching oop-map/register-tracking machinery at all: `jit_invoke_virtual_mic`'s
+> deferred arg decoder (`vm/src/jit/helpers.rs`, `decode_values` closure) treated any 8-byte-aligned,
+> sub-2^48 raw word in an `L`/`[` descriptor slot as a "plausible" pointer and built an `ObjectRef` from
+> it unconditionally — but a primitive `long` that should have matched the `J` arm (e.g. a round
+> millisecond timeout) is trivially both aligned and small, so it falsely passed. Fixed (landed on dev as
+> `60079fc4`) by requiring actual heap membership (`vm.heap.is_object_address`) instead of just
+> bit-pattern plausibility, matching an already-correct sibling decode path a few hundred lines earlier
+> in the same file. Verified with 18 consecutive clean repro attempts (two independent sessions) plus a
+> 30-class regression slice, zero crashes, versus a 100% pre-fix crash rate on the same repro — see the
+> corrected doc at `docs/internal/fixed-suite-bugs/wildfly-infinispan-remove-listener-segfault.md`.
+> **This closes the `native_builder_set`/`OptionMap.Builder.set` manifestation specifically** — it does
+> NOT close the more general register-invisible-oop gap this doc tracks, and does NOT touch
+> `Fork6Hard`'s own `GC_STRESS` repro (see the "Reconcile before implementing a fix" note above — that
+> repro's mechanism is still believed to differ).
+
 **Status:** 🟡 OPEN. Non-stress `Fork6`/`Fork6Hard` remains non-reproducing on current `dev`. Two infrastructure bugs adjacent to A4 were found and fixed 2026-07-02 (see that section below) — a takeover gate-polarity bug that made the default-on cross-thread STW JIT scan silently inert, and a defense-in-depth helper-window pass — but neither closes A4 itself, whose register-only residual remains gated on the deferred precise-JIT-stack-maps project. The 2026-07-01 aggressive `GC_STRESS` failures were **NOT A4** (zero live JIT frames, zero compiled JIT code at every STW) — root-caused as three unrelated concurrent-old-gen GC races, now FIXED on dev (`57f545be`); a different residual on that same lane is tracked at [`docs/known-issues/gcstress-residual-corruption-faces.md`](gcstress-residual-corruption-faces.md).
 
 > ## Fix 2026-07-02 — the "default-on" takeover was silently inert; + an initiator-side blocked/helper-window scan; stress lane re-scoped as a separate JIT-free bug
