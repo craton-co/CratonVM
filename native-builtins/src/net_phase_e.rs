@@ -3007,7 +3007,21 @@ fn re2_accept_into(
                 break AcceptOutcome::TimedOut;
             }
         }
+        // GC-barrier safepoint gap: unlike every other blocking-native call in
+        // this codebase (`Thread.sleep`, socket read/write), this poll-sleep
+        // ran unmarked. A no-timeout `ServerSocket.accept()` (timeout_ms <= 0,
+        // `deadline` is `None`) loops here indefinitely once no new
+        // connections are pending, staying counted in the GC barrier's
+        // `expected` set forever — it never reaches an interpreter safepoint
+        // (it's native Rust code, not JIT either, so the cross-thread JIT
+        // takeover can't rescue it), so any STW GC/JIT-takeover initiated
+        // while this thread has no pending connection deadlocks permanently
+        // (`stw-census` showed `pending=1 taken=0` unable to move). Mark each
+        // poll-sleep slice as a blocked region, exactly like `Thread.sleep`'s
+        // pump loop.
+        ctx.begin_blocking_region();
         std::thread::sleep(Duration::from_millis(10));
+        ctx.end_blocking_region();
     };
 
     // Restore blocking mode on the shared listener if it survived, so later
