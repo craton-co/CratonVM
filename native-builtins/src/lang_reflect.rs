@@ -237,6 +237,60 @@ pub(crate) fn native_constructor_can_access(
 // non-static member classes. `getEnclosingClass` returns the enclosing
 // class for ALL nested classes.
 
+/// Loader-scoped resolve of an enclosing/outer class NAME to a `ClassId`,
+/// preferring the SAME defining loader as `class_id` before falling back to
+/// the global (loader-blind) store.
+///
+/// hib-proxyclassreuse-loader-blind-class-resolution.md follow-up
+/// (2026-07-06): `getEnclosingClass`'s two lookups (`EnclosingMethod` ->
+/// enclosing class, `InnerClasses` -> outer class) previously went straight
+/// to `ctx.class_id_by_name(name)` / `ctx.ensure_class_initialized(name)` --
+/// the same loader-blind global lookup this doc's "Known remaining
+/// limitation" section already names. That is silently wrong whenever 2+
+/// DIFFERENT user-defined loaders each have their OWN class under the
+/// referenced enclosing-class name -- the common case for Groovy, which
+/// compiles every script under the identical top-level class name (e.g.
+/// Spring's `GroovyBeanDefinitionReader` always evaluates its script as
+/// `"beans"`, so `beans$_run_closure1`'s `EnclosingMethod` attribute always
+/// names the enclosing class `"beans"`, and two sequential test methods
+/// each running their own fresh `GroovyShell`/`GroovyClassLoader` produce
+/// two DISTINCT `beans` classes sharing that name).
+///
+/// Once the stale-mirror `CRATONVM_LOADER_AWARE_RESOLUTION` gate fix
+/// (2026-07-06) made the global lookup correctly refuse to guess between
+/// 2+ same-named user-loader classes (returning `None`/ambiguous instead of
+/// picking one), `getEnclosingClass()` on a Groovy closure started
+/// returning `null` where it used to return SOME (possibly wrong) class --
+/// surfacing downstream as `Closure.getThisType()`'s `GeneratedClosure.class
+/// .isAssignableFrom(this.getClass().getEnclosingClass())` throwing a NullPointerException
+/// (`Class.isAssignableFrom: argument is null`) once the loop's `aload_1`
+/// went null. The global lookup finding "2+ different loaders, ambiguous" is
+/// the CORRECT answer in the general case -- but `class_id` here already
+/// carries the exact context needed to disambiguate faithfully: `this`
+/// class's own defining loader is by construction the SAME loader that
+/// compiled its enclosing/outer class, so probe that loader's exact
+/// namespace FIRST (`class_id_defined_by_loader_exact`, no delegation
+/// fallback -- same mechanism `findLoadedClass` already uses faithfully)
+/// before falling through to the pre-existing global-store attempt. Built-in
+/// loaders (`loader_id_of_class` 0/1/2) skip this probe entirely and keep
+/// the exact prior behavior -- this only changes the answer for a
+/// user-defined-loader class whose enclosing/outer class the SAME loader
+/// has ALSO defined, which is the only case that was ever ambiguous.
+fn loader_scoped_enclosing_lookup(
+    ctx: &mut dyn NativeContext,
+    class_id: ClassId,
+    name: &str,
+) -> Option<ClassId> {
+    let loader_id = ctx.loader_id_of_class(class_id);
+    if loader_id > 2 {
+        if let Some(id) = ctx.class_id_defined_by_loader_exact(name, loader_id as u32) {
+            return Some(id);
+        }
+    }
+    ctx.class_id_by_name(name)
+        .or_else(|| ctx.ensure_class_initialized(name).ok())
+}
+
 pub(crate) fn native_class_get_enclosing_class(
     ctx: &mut dyn NativeContext,
     args: &[Value],
@@ -252,10 +306,7 @@ pub(crate) fn native_class_get_enclosing_class(
     // a nested class without the enclosing one being explicitly referenced),
     // so fall back to `ensure_class_initialized` if the cached lookup misses.
     if let Some((enc_class, _name, _desc)) = ctx.enclosing_method(class_id) {
-        let enc_id = ctx
-            .class_id_by_name(&enc_class)
-            .or_else(|| ctx.ensure_class_initialized(&enc_class).ok());
-        if let Some(enc_id) = enc_id {
+        if let Some(enc_id) = loader_scoped_enclosing_lookup(ctx, class_id, &enc_class) {
             let mirror = ctx.get_class_mirror(enc_id);
             return Ok(Some(Value::Object(Some(mirror))));
         }
@@ -275,10 +326,7 @@ pub(crate) fn native_class_get_enclosing_class(
         let entries = ctx.inner_classes(class_id);
         for (inner, outer, _inner_name, _flags) in &entries {
             if inner == &this_name && !outer.is_empty() {
-                let outer_id = ctx
-                    .class_id_by_name(outer)
-                    .or_else(|| ctx.ensure_class_initialized(outer).ok());
-                if let Some(outer_id) = outer_id {
+                if let Some(outer_id) = loader_scoped_enclosing_lookup(ctx, class_id, outer) {
                     let mirror = ctx.get_class_mirror(outer_id);
                     return Ok(Some(Value::Object(Some(mirror))));
                 }
