@@ -855,11 +855,50 @@ fn native_dcm_init(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRes
 }
 
 /// `DefaultCacheManager.getCache(String)Lorg/infinispan/Cache;`
+///
+/// Registered unconditionally on `DefaultCacheManager`/`EmbeddedCacheManager`
+/// (native dispatch is keyed by class+method+descriptor, not by which
+/// constructor built the receiver — see `is_real_dcm`'s doc), so this also
+/// intercepts `.getCache()`/`.getCache(String)` on a REAL `DefaultCacheManager`.
+/// For a real manager, delegate to the real `internalGetCache(String)` (what
+/// `getCache()`/`getCache(String)`'s own real bytecode calls) so the returned
+/// `Cache` is genuinely real — real `config`, interceptor chain, component
+/// wiring — instead of a synthetic object with only `handle`/`name`/`manager`
+/// ever populated. The synthetic object was allocated with the REAL
+/// `CacheImpl` class's full field layout, so every other real field
+/// (`config` included) sat at its zero-initialized default; Infinispan's own
+/// internal bootstrap (`GlobalComponentRegistry.postStart()` →
+/// `GlobalConfigurationManagerImpl.postStart()`, reached via
+/// `SecurityActions.getCache(EmbeddedCacheManager, String)` →
+/// `EmbeddedCacheManager.getCache(String)` — this exact native) then NPEs on
+/// `cache.config.clustering()` in `AbstractCacheBackedSet.<init>`. See
+/// docs/internal/fixed-suite-bugs/keycloak-model-infinispan-cache-config-null-after-real-start-FIXED.md.
 fn native_dcm_get_cache(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = match obj_arg(args, 0) {
         Some(o) => o,
         None => return Ok(Some(Value::Object(None))),
     };
+    if is_real_dcm(ctx, this) {
+        let name_value = match args.get(1) {
+            Some(v @ Value::Object(Some(_))) => *v,
+            _ => match ctx.get_field_by_name(this, "defaultCacheName") {
+                v @ Value::Object(Some(_)) => v,
+                _ => {
+                    return Err(RuntimeError::IllegalStateException {
+                        message: "ISPN000289: No default cache configured for this cache manager"
+                            .to_string(),
+                    }
+                    .into());
+                }
+            },
+        };
+        return ctx.invoke_virtual(
+            this,
+            "internalGetCache",
+            "(Ljava/lang/String;)Lorg/infinispan/Cache;",
+            &[name_value],
+        );
+    }
     let name = match string_arg(ctx, args, 1) {
         Some(s) => s,
         // getCache() with no args = default cache.
@@ -1059,6 +1098,121 @@ fn native_dcm_stop(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRes
     Ok(None)
 }
 
+/// Distinguish a REAL `Cache`/`CacheImpl` (built by real `internalGetCache`/
+/// `createCache` bytecode) from one fabricated by `native_dcm_get_cache`'s
+/// synthetic branch — same rationale and same necessity as `is_real_dcm`
+/// above: the Cache-instance natives below (`put`/`get`/`remove`/etc.) are
+/// registered unconditionally on `CLS_CACHE`/`CLS_CACHE_IMPL`/
+/// `CLS_CACHE_ADVANCED`, so once `native_dcm_get_cache` starts handing back
+/// real `Cache` objects for a real `DefaultCacheManager`, these natives would
+/// otherwise read `CACHE_FIELD_HANDLE` (raw slot 0) off a real object —
+/// which is actually `invocationContextFactory`, not our synthetic handle —
+/// and misbehave.
+///
+/// **Three prior attempts, all empirically falsified** by a regression probe
+/// (`new DefaultCacheManager()` + `getCache()` + `put()`, the old synthetic
+/// path — must still route to the Rust-side `CacheInner`, not real bytecode):
+///
+/// 1. `get_field_by_name(this, "config")` — `CacheImpl`'s real field order is
+///    `invocationContextFactory`(0), `commandsFactory`(1), `invoker`(2),
+///    `config`(3), immediately adjacent to the synthetic 3-slot layout
+///    override.
+/// 2. `get_field_by_name(this, "componentRegistry")` — further into the real
+///    field list, still failed identically.
+/// 3. `get_field(this, CACHE_FIELD_HANDLE)` matching `Value::Long(bits) if
+///    bits != 0` (mirroring `cache_from_field`'s own handle check) — debug
+///    tracing proved this doesn't round-trip AT ALL for this class: even
+///    right after `native_dcm_get_cache`'s synthetic branch writes
+///    `Value::Long(handle)` into raw slot 0, reading it back gives
+///    `Object(None)`, not the `Long`. Slot 0's REAL declared type is a
+///    reference (`invocationContextFactory`), and storing a `Long` bit
+///    pattern into a heap slot the GC treats as reference-typed silently
+///    loses the value on readback — a type-mismatched write, not a
+///    low-index-only quirk. (This also means the ORIGINAL, pre-existing
+///    `cache_from_field`'s "fast path" via `CACHE_FIELD_HANDLE` has quietly
+///    never worked once real Infinispan jars are on the classpath — every
+///    call was already silently falling through to its `CACHE_FIELD_NAME`
+///    string-based fallback, which is why this was never noticed.)
+///
+/// What DOES reliably round-trip (proven by that same pre-existing
+/// fallback): storing and reading back an **object reference** via raw slot
+/// index — `cache_from_field` has relied on `CACHE_FIELD_NAME` (slot 1)
+/// round-tripping a `String` reference for as long as the synthetic Cache
+/// path has existed. `native_dcm_get_cache`'s synthetic branch ALSO stores
+/// the owning manager into `CACHE_FIELD_MANAGER` (slot 2) as a reference —
+/// the real cache never does this (slot 2 is really `invoker`, an
+/// `AsyncInterceptorChain`, never a `DefaultCacheManager`). So: read slot 2
+/// back and check whether its *runtime class* is the manager class — a
+/// reference-identity check, not a value-round-trip gamble.
+fn is_real_cache(ctx: &dyn NativeContext, this: ObjectRef) -> bool {
+    match ctx.get_field(this, CACHE_FIELD_MANAGER) {
+        Value::Object(Some(mgr)) => {
+            let cid = ctx.class_id_of_object(mgr);
+            ctx.class_name_of_id(cid).as_deref() != Some(CLS_MANAGER)
+        }
+        _ => true,
+    }
+}
+
+/// Build the `InvocationContext` a real `CacheImpl.get`/`containsKey`'s own
+/// bytecode builds for itself: `invocationContextFactory.createInvocationContext(false, 1)`.
+fn real_cache_invocation_context(ctx: &mut dyn NativeContext, this: ObjectRef) -> MethodCallResult {
+    let icf = match ctx.get_field_by_name(this, "invocationContextFactory") {
+        Value::Object(Some(o)) => o,
+        _ => {
+            return Err(RuntimeError::IllegalStateException {
+                message: "Cache.invocationContextFactory is null".to_string(),
+            }
+            .into());
+        }
+    };
+    ctx.invoke_virtual(
+        icf,
+        "createInvocationContext",
+        "(ZI)Lorg/infinispan/context/InvocationContext;",
+        &[Value::Int(0), Value::Int(1)],
+    )
+}
+
+/// Pin `this` (and `key`, if it holds a heap reference) before a re-entrant
+/// call that runs real bytecode and can trigger a moving GC. Bare Rust
+/// locals like `this`/`key` are NOT automatically kept up to date by the
+/// entry-level pinning `safe_native_call` does for a native's *incoming*
+/// args — that protects only the initial dispatch, not a GC triggered by
+/// this function's *own* subsequent `ctx.invoke_virtual`/`ctx.invoke` calls.
+/// Mirrors the identical hazard fixed in
+/// `NativeContextImpl::build_thread_field_holder` (vm/src/vm/vm_exec.rs) —
+/// see docs/known-issues/gc-blocked-thread-frame-stale-thread-mirror.md.
+/// Re-read both with `read_this_and_key` after the risky call, then
+/// `ctx.unpin_native_roots(this_handle)` once `this`/`key` are no longer
+/// needed (releases the whole batch, `key`'s slot included).
+fn pin_this_and_key(ctx: &mut dyn NativeContext, this: ObjectRef, key: Value) -> (usize, usize) {
+    let this_handle = ctx.pin_native_root(this);
+    let key_handle = if let Value::Object(Some(k)) = key {
+        ctx.pin_native_root(k)
+    } else {
+        this_handle
+    };
+    (this_handle, key_handle)
+}
+
+/// Re-read `this`/`key` after a risky call — see `pin_this_and_key`.
+fn read_this_and_key(
+    ctx: &dyn NativeContext,
+    this_handle: usize,
+    this: ObjectRef,
+    key_handle: usize,
+    key: Value,
+) -> (ObjectRef, Value) {
+    let this = ctx.read_native_pin(this_handle, this);
+    let key = if let Value::Object(Some(k)) = key {
+        Value::Object(Some(ctx.read_native_pin(key_handle, k)))
+    } else {
+        key
+    };
+    (this, key)
+}
+
 fn cache_from_field(ctx: &dyn NativeContext, this: ObjectRef) -> Option<Arc<CacheInner>> {
     match ctx.get_field(this, CACHE_FIELD_HANDLE) {
         Value::Long(bits) if bits != 0 => {
@@ -1093,6 +1247,17 @@ fn native_cache_put(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRe
         Some(o) => o,
         None => return Ok(Some(Value::Object(None))),
     };
+    if is_real_cache(ctx, this) {
+        let key = args.get(1).copied().unwrap_or(Value::Object(None));
+        let val = args.get(2).copied().unwrap_or(Value::Object(None));
+        let metadata = ctx.get_field_by_name(this, "defaultMetadata");
+        return ctx.invoke_virtual(
+            this,
+            "put",
+            "(Ljava/lang/Object;Ljava/lang/Object;Lorg/infinispan/metadata/Metadata;)Ljava/lang/Object;",
+            &[key, val, metadata],
+        );
+    }
     let cache = match cache_from_field(ctx, this) {
         Some(c) => c,
         None => {
@@ -1128,6 +1293,20 @@ fn native_cache_get(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRe
         Some(o) => o,
         None => return Ok(Some(Value::Object(None))),
     };
+    if is_real_cache(ctx, this) {
+        let key = args.get(1).copied().unwrap_or(Value::Object(None));
+        let (this_h, key_h) = pin_this_and_key(ctx, this, key);
+        let invocation_ctx = real_cache_invocation_context(ctx, this);
+        let (this, key) = read_this_and_key(ctx, this_h, this, key_h, key);
+        ctx.unpin_native_roots(this_h);
+        let invocation_ctx = invocation_ctx?.unwrap_or(Value::Object(None));
+        return ctx.invoke_virtual(
+            this,
+            "get",
+            "(Ljava/lang/Object;JLorg/infinispan/context/InvocationContext;)Ljava/lang/Object;",
+            &[key, Value::Long(0), invocation_ctx],
+        );
+    }
     let cache = match cache_from_field(ctx, this) {
         Some(c) => c,
         None => return Ok(Some(Value::Object(None))),
@@ -1151,6 +1330,25 @@ fn native_cache_remove(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCal
         Some(o) => o,
         None => return Ok(Some(Value::Object(None))),
     };
+    if is_real_cache(ctx, this) {
+        let key = args.get(1).copied().unwrap_or(Value::Object(None));
+        let (this_h, key_h) = pin_this_and_key(ctx, this, key);
+        let ctx_builder = ctx.invoke_virtual(
+            this,
+            "defaultContextBuilderForWrite",
+            "()Lorg/infinispan/cache/impl/ContextBuilder;",
+            &[],
+        );
+        let (this, key) = read_this_and_key(ctx, this_h, this, key_h, key);
+        ctx.unpin_native_roots(this_h);
+        let ctx_builder = ctx_builder?.unwrap_or(Value::Object(None));
+        return ctx.invoke_virtual(
+            this,
+            "remove",
+            "(Ljava/lang/Object;JLorg/infinispan/cache/impl/ContextBuilder;)Ljava/lang/Object;",
+            &[key, Value::Long(0), ctx_builder],
+        );
+    }
     let cache = match cache_from_field(ctx, this) {
         Some(c) => c,
         None => return Ok(Some(Value::Object(None))),
@@ -1174,6 +1372,20 @@ fn native_cache_contains_key(ctx: &mut dyn NativeContext, args: &[Value]) -> Met
         Some(o) => o,
         None => return Ok(Some(Value::Int(0))),
     };
+    if is_real_cache(ctx, this) {
+        let key = args.get(1).copied().unwrap_or(Value::Object(None));
+        let (this_h, key_h) = pin_this_and_key(ctx, this, key);
+        let invocation_ctx = real_cache_invocation_context(ctx, this);
+        let (this, key) = read_this_and_key(ctx, this_h, this, key_h, key);
+        ctx.unpin_native_roots(this_h);
+        let invocation_ctx = invocation_ctx?.unwrap_or(Value::Object(None));
+        return ctx.invoke_virtual(
+            this,
+            "containsKey",
+            "(Ljava/lang/Object;JLorg/infinispan/context/InvocationContext;)Z",
+            &[key, Value::Long(0), invocation_ctx],
+        );
+    }
     let cache = match cache_from_field(ctx, this) {
         Some(c) => c,
         None => return Ok(Some(Value::Int(0))),
@@ -1193,6 +1405,9 @@ fn native_cache_size(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallR
         Some(o) => o,
         None => return Ok(Some(Value::Int(0))),
     };
+    if is_real_cache(ctx, this) {
+        return ctx.invoke_virtual(this, "size", "(J)I", &[Value::Long(0)]);
+    }
     let cache = match cache_from_field(ctx, this) {
         Some(c) => c,
         None => return Ok(Some(Value::Int(0))),
@@ -1207,6 +1422,9 @@ fn native_cache_clear(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
         Some(o) => o,
         None => return Ok(None),
     };
+    if is_real_cache(ctx, this) {
+        return ctx.invoke_virtual(this, "clear", "(J)V", &[Value::Long(0)]);
+    }
     if let Some(cache) = cache_from_field(ctx, this) {
         cache.clear();
     }
@@ -1219,6 +1437,15 @@ fn native_cache_evict(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
         Some(o) => o,
         None => return Ok(None),
     };
+    if is_real_cache(ctx, this) {
+        let key = args.get(1).copied().unwrap_or(Value::Object(None));
+        return ctx.invoke_virtual(
+            this,
+            "evict",
+            "(Ljava/lang/Object;J)V",
+            &[key, Value::Long(0)],
+        );
+    }
     if let Some(cache) = cache_from_field(ctx, this) {
         let key_v = args.get(1).copied().unwrap_or(Value::Object(None));
         if let Some(key) = CacheKey::from_value(ctx, key_v) {
@@ -1243,6 +1470,23 @@ fn native_cache_add_listener(ctx: &mut dyn NativeContext, args: &[Value]) -> Met
             .into());
         }
     };
+    if is_real_cache(ctx, this) {
+        let stage = ctx
+            .invoke_virtual(
+                this,
+                "addListenerAsync",
+                "(Ljava/lang/Object;)Ljava/util/concurrent/CompletionStage;",
+                &[Value::Object(Some(listener))],
+            )?
+            .unwrap_or(Value::Object(None));
+        ctx.invoke(
+            "org/infinispan/commons/util/concurrent/CompletionStages",
+            "join",
+            "(Ljava/util/concurrent/CompletionStage;)Ljava/lang/Object;",
+            &[stage],
+        )?;
+        return Ok(None);
+    }
     if let Some(cache) = cache_from_field(ctx, this) {
         cache.add_listener(listener);
     }
@@ -1259,6 +1503,23 @@ fn native_cache_remove_listener(ctx: &mut dyn NativeContext, args: &[Value]) -> 
         Some(o) => o,
         None => return Ok(None),
     };
+    if is_real_cache(ctx, this) {
+        let stage = ctx
+            .invoke_virtual(
+                this,
+                "removeListenerAsync",
+                "(Ljava/lang/Object;)Ljava/util/concurrent/CompletionStage;",
+                &[Value::Object(Some(listener))],
+            )?
+            .unwrap_or(Value::Object(None));
+        ctx.invoke(
+            "org/infinispan/commons/util/concurrent/CompletionStages",
+            "join",
+            "(Ljava/util/concurrent/CompletionStage;)Ljava/lang/Object;",
+            &[stage],
+        )?;
+        return Ok(None);
+    }
     if let Some(cache) = cache_from_field(ctx, this) {
         cache.remove_listener(listener);
     }
@@ -1271,6 +1532,9 @@ fn native_cache_get_name(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
         Some(o) => o,
         None => return Ok(Some(Value::Object(None))),
     };
+    if is_real_cache(ctx, this) {
+        return Ok(Some(ctx.get_field_by_name(this, "name")));
+    }
     if let Value::Object(Some(s)) = ctx.get_field(this, CACHE_FIELD_NAME) {
         return Ok(Some(Value::Object(Some(s))));
     }
@@ -1283,6 +1547,17 @@ fn native_cache_put_if_absent(ctx: &mut dyn NativeContext, args: &[Value]) -> Me
         Some(o) => o,
         None => return Ok(Some(Value::Object(None))),
     };
+    if is_real_cache(ctx, this) {
+        let key = args.get(1).copied().unwrap_or(Value::Object(None));
+        let val = args.get(2).copied().unwrap_or(Value::Object(None));
+        let metadata = ctx.get_field_by_name(this, "defaultMetadata");
+        return ctx.invoke_virtual(
+            this,
+            "putIfAbsent",
+            "(Ljava/lang/Object;Ljava/lang/Object;Lorg/infinispan/metadata/Metadata;)Ljava/lang/Object;",
+            &[key, val, metadata],
+        );
+    }
     let cache = match cache_from_field(ctx, this) {
         Some(c) => c,
         None => return Ok(Some(Value::Object(None))),
@@ -1316,6 +1591,17 @@ fn native_cache_replace(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCa
         Some(o) => o,
         None => return Ok(Some(Value::Object(None))),
     };
+    if is_real_cache(ctx, this) {
+        let key = args.get(1).copied().unwrap_or(Value::Object(None));
+        let val = args.get(2).copied().unwrap_or(Value::Object(None));
+        let metadata = ctx.get_field_by_name(this, "defaultMetadata");
+        return ctx.invoke_virtual(
+            this,
+            "replace",
+            "(Ljava/lang/Object;Ljava/lang/Object;Lorg/infinispan/metadata/Metadata;)Ljava/lang/Object;",
+            &[key, val, metadata],
+        );
+    }
     let cache = match cache_from_field(ctx, this) {
         Some(c) => c,
         None => return Ok(Some(Value::Object(None))),
