@@ -99,8 +99,21 @@ kf.translateKey(kp.getPrivate());  // -> NPE: this.spi is null
 
 ## Related / not to be confused with
 
-Unrelated to [[wildfly-domain-heap-corrupt-value-timeout]], [[wildfly-domain-managed-servers-timeout]], and
-[[wildfly-surefire-empty-class-goodbye]] — no domain-mode, no zero-test-class handshake involved here, and
-unrelated to the much larger "no managed container started" `integration/*` cluster from the same run (this
-test class doesn't even need Arquillian's managed container to fail; the NPE happens in local `@Before`
-setup before any deployment is attempted).
+Unrelated to [[wildfly-domain-heap-corrupt-value-timeout]] and [[wildfly-domain-managed-servers-timeout]]
+— no domain-mode involved here — and unrelated to the much larger "no managed container started"
+`integration/*` cluster from the same run (this test class doesn't even need Arquillian's managed container
+to fail; the NPE happens in local `@Before` setup before any deployment is attempted). The zero-test-class
+Surefire handshake bug this doc originally cross-referenced is already FIXED (see
+`docs/internal/wildfly-suite-bugs/bug-16-*.md` / `bug-17-*.md`).
+
+**Duplicate finding, same underlying bug, found independently a day earlier via a different app:**
+`docs/known-issues/keycloak-07-04/crypto-elytron-keyfactory-spi-null-and-x509extension-abstractmethoderror.md`
+("Finding 1") hits the exact same `KeyFactory.translateKey` → `this.spi is null` →
+`X509CertificateBuilder.getTBSBytes` signature via Keycloak's `ElytronCertificateUtilsProvider`, dated
+2026-07-06 (before this doc). That doc frames the root cause as `KeyFactory.getInstance()`'s SPI-binding
+step silently succeeding without completing SPI selection; this doc instead pinpoints the specific gap as
+`KeyFactory.translateKey` not being among the natively-registered methods in
+`native-builtins/src/jca/key_factory.rs` (getInstance/generatePublic/etc. *are* registered against the
+3-field synthetic object, translateKey specifically is not) — these are two framings of the same mechanism,
+not two different bugs. Whoever fixes this should treat both docs as describing one defect and close/merge
+them together rather than fixing twice.
