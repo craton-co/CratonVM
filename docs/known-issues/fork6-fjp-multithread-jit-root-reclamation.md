@@ -31,6 +31,23 @@
 > `ulimit -c unlimited` (no gdb attached) reproduced on the first attempt every time; post-mortem `gdb
 > <binary> <corefile>` gives the same backtrace without perturbing the race.
 
+> **⚠️ Reconcile before implementing a fix.** A separate, much deeper investigation the same day (10+
+> hypotheses tested with hard evidence — precise JIT maps, `CRATONVM_DBG_FULLSTACK_SCAN`, a cross-thread
+> register harvest, a conservative operand-stack scan, `SEED_ALL_OLD`) **empirically refuted** the
+> "register-invisible oop, fixed by precise JIT maps" narrative for `Fork6Hard`'s own canonical
+> `GC_STRESS` repro. That session concluded A4 is instead a **real-FJP-path dangling-reference /
+> worker-barrier-publish gap** (a live island goes unpublished at the reclaiming GC — not a missed
+> root-scan) and that **adding more root coverage makes it WORSE, not better**. That conclusion is not yet
+> reflected in this doc's Status line above (still says "register-only residual... gated on the deferred
+> precise-JIT-stack-maps project"). Also worth noting: neither the Elytron nor the mockselector-mutex
+> repro touches ForkJoinPool or `GC_STRESS` at all — both are a single JIT-compiled virtual-dispatch call
+> to a native method (`jit_invoke_virtual_mic` → `native_builder_set`). So while these two share a crash
+> **site** with the `Fork6Hard` `read_string` symptom, the underlying **mechanism may differ** (a simpler
+> JIT-argument/root-tracking gap specific to invoke-virtual-to-native call sites, vs. `Fork6Hard`'s
+> FJP-worker-publish gap). Whoever picks this up next should confirm which mechanism actually applies to
+> the WildFly repros — e.g. with the same allocation-provenance/publish-check forensics used on
+> `Fork6Hard` — before building a register-oop-bitmap fix that was already shown not to fix the other one.
+
 **Status:** 🟡 OPEN. Non-stress `Fork6`/`Fork6Hard` remains non-reproducing on current `dev`. Two infrastructure bugs adjacent to A4 were found and fixed 2026-07-02 (see that section below) — a takeover gate-polarity bug that made the default-on cross-thread STW JIT scan silently inert, and a defense-in-depth helper-window pass — but neither closes A4 itself, whose register-only residual remains gated on the deferred precise-JIT-stack-maps project. The 2026-07-01 aggressive `GC_STRESS` failures were **NOT A4** (zero live JIT frames, zero compiled JIT code at every STW) — root-caused as three unrelated concurrent-old-gen GC races, now FIXED on dev (`57f545be`); a different residual on that same lane is tracked at [`docs/known-issues/gcstress-residual-corruption-faces.md`](gcstress-residual-corruption-faces.md).
 
 > ## Fix 2026-07-02 — the "default-on" takeover was silently inert; + an initiator-side blocked/helper-window scan; stress lane re-scoped as a separate JIT-free bug

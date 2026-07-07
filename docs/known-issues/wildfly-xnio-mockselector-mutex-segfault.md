@@ -70,6 +70,15 @@ implement blind in a triage session. Whoever picks up the A4 register-oop-bitmap
 independent, real-world (non-synthetic), highly-reproducible verification lanes — this doc's `basic`-module
 repro and the Elytron `manualmode` repro — in addition to the existing synthetic `Fork6Hard` lane.
 
+**⚠️ Caveat, do not skip:** [[fork6-fjp-multithread-jit-root-reclamation]] records that a separate, much
+deeper investigation empirically **refuted** "register-invisible oop, fixed by precise JIT maps" as A4's
+actual mechanism on `Fork6Hard`'s own canonical repro (precise maps, fullstack scan, register harvest, and
+a conservative operand-stack scan all failed to fix it; more root coverage made it *worse*). Also, neither
+this crash nor the Elytron one goes through ForkJoinPool/GC_STRESS at all — both are a single JIT-compiled
+virtual-dispatch-to-native call. Same crash **site**, but the **mechanism** may not be the same as
+`Fork6Hard`'s FJP-worker-publish-gap finding. Verify which mechanism actually applies here before building
+a register-oop-bitmap fix.
+
 ## ⛔ CORRECTION 2026-07-07 — MockSelector is REFUTED as the crash site (it is `#[cfg(test)]`)
 
 Investigated on current dev (`4e6dc36d`). The doc's "best source-level match",
