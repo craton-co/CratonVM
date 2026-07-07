@@ -39629,9 +39629,27 @@ const NEW13_SESS_TLSID: usize = 2;
 /// CA/self-signed leaf, which mirrors the reference JDK's restrictive
 /// custom-truststore semantics closely enough to make the common
 /// self-signed-test-cert pattern actually work.
-fn new13_build_connector(extra_root_ders: &[Vec<u8>]) -> Result<native_tls::TlsConnector, String> {
+fn new13_build_connector(
+    extra_root_ders: &[Vec<u8>],
+    danger_skip_native_verify: bool,
+) -> Result<native_tls::TlsConnector, String> {
     let mut builder = native_tls::TlsConnector::builder();
     builder.min_protocol_version(Some(native_tls::Protocol::Tlsv12));
+    if danger_skip_native_verify {
+        // FIX (netty-https-client-trust): the owning SSLContext was init'd
+        // with REAL Java TrustManager objects (e.g. HttpClient5's
+        // SSLContextBuilder + TrustSelfSignedStrategy delegate). JSSE
+        // semantics make that TrustManager THE verifier, so native-tls's own
+        // WebPKI check must stand down — the caller runs the Java
+        // `checkServerTrusted` against the captured peer chain immediately
+        // after connect and aborts the socket on rejection (fail-closed; see
+        // `new13_do_create_socket`). Hostname verification is likewise not an
+        // SSLSocket-level concern in JSSE (no endpoint identification
+        // algorithm is set on this path); HTTP clients apply their own
+        // HostnameVerifier on top (e.g. HttpClient5's verifySession).
+        builder.danger_accept_invalid_certs(true);
+        builder.danger_accept_invalid_hostnames(true);
+    }
     for der in extra_root_ders {
         match native_tls::Certificate::from_der(der) {
             Ok(cert) => {
@@ -39729,6 +39747,32 @@ fn p68_factory_trust_roots(args: &[Value]) -> Vec<Vec<u8>> {
     }
 }
 
+/// FIX (netty-https-client-trust): the SSLContext object stashed at factory
+/// field 0 (`net_phase_e`'s `getSocketFactory` — the live registration —
+/// stores it) may carry REAL Java TrustManager objects attached at
+/// `SSLContext.init` (`t27_tls::attach_trust_managers_to_ctx`). Returns the
+/// trust-table key when so, which switches `new13_do_create_socket` from
+/// native-tls WebPKI verification to post-handshake Java
+/// `checkServerTrusted` delegation — the only semantic that honors e.g.
+/// HttpClient5's `TrustSelfSignedStrategy` against an ephemeral self-signed
+/// server cert (Netty `SelfSignedCertificate`;
+/// `ServerHttpsRequestIntegrationTests::checkUri`). A wrong object at
+/// field 0 (user-defined factory subclass — see `net_phase_e`'s
+/// `createSocket` comment) simply misses the table → `None` → unchanged
+/// default verification.
+fn p68_factory_java_tm_key(ctx: &mut dyn NativeContext, args: &[Value]) -> Option<u64> {
+    let Some(Value::Object(Some(factory))) = args.first() else {
+        return None;
+    };
+    if ctx.object_num_fields(*factory) == 0 {
+        return None;
+    }
+    let Value::Object(Some(sslctx)) = ctx.get_field(*factory, 0) else {
+        return None;
+    };
+    crate::t27_tls::ctx_trust_managers_key_if_attached(ctx, sslctx)
+}
+
 /// NEW-13: allocate an `SSLSession` synthetic object populated from the
 /// session info captured by `s2_tls_connect`.
 fn new13_alloc_ssl_session(ctx: &mut dyn NativeContext, tls_id: i32) -> ObjectRef {
@@ -39746,6 +39790,13 @@ fn new13_alloc_ssl_session(ctx: &mut dyn NativeContext, tls_id: i32) -> ObjectRe
     ctx.set_field(session, NEW13_SESS_PROTO, Value::Object(Some(proto_str)));
     ctx.set_field(session, NEW13_SESS_CIPHER, Value::Object(Some(cipher_str)));
     ctx.set_field(session, NEW13_SESS_TLSID, Value::Int(tls_id));
+    // FIX (netty-https-client-trust residual): record the peer chain this
+    // client connection already captured so a later `getPeerCertificates()`
+    // on THIS session object doesn't spuriously see "no certificate" — see
+    // `t27_tls::record_client_peer_chain` doc comment.
+    if let Some(chain) = crate::servlet::s2_tls_peer_cert_chain_der(tls_id) {
+        crate::t27_tls::record_client_peer_chain(session, chain);
+    }
     session
 }
 
@@ -39755,14 +39806,37 @@ fn new13_do_create_socket(
     host: &str,
     port: u16,
     extra_root_ders: &[Vec<u8>],
+    java_tm_key: Option<u64>,
 ) -> MethodCallResult {
-    let connector = new13_build_connector(extra_root_ders)
+    let connector = new13_build_connector(extra_root_ders, java_tm_key.is_some())
         .map_err(|msg| RuntimeError::IOException { message: msg })?;
     let tls_id = crate::servlet::s2_tls_connect(&connector, host, port).map_err(|e| {
         RuntimeError::IOException {
             message: e.to_string(),
         }
     })?;
+
+    // FIX (netty-https-client-trust): native verification was disabled above
+    // when the context carries Java TrustManagers — they are the ONLY
+    // verifier now, so consult them immediately and fail CLOSED: no chain, or
+    // a checkServerTrusted throw, aborts the socket with
+    // SSLHandshakeException (matching JSSE, which aborts the handshake when
+    // a configured TrustManager rejects the chain).
+    if let Some(tm_key) = java_tm_key {
+        let chain = crate::servlet::s2_tls_peer_cert_chain_der(tls_id).unwrap_or_default();
+        if chain.is_empty() {
+            let _ = crate::servlet::s2_tls_close(tls_id);
+            return Err(crate::phases_early::throw_jca_exc(
+                ctx,
+                "javax/net/ssl/SSLHandshakeException",
+                "no peer certificate available for TrustManager verification",
+            ));
+        }
+        if let Err(e) = crate::t27_tls::run_client_trust_check_for_chain(ctx, tm_key, chain) {
+            let _ = crate::servlet::s2_tls_close(tls_id);
+            return Err(e);
+        }
+    }
 
     let sock = alloc_concurrent_synthetic(ctx, "javax/net/ssl/SSLSocket", NEW13_SSL_SOCK_FIELDS);
     let host_obj = ctx.create_string(host);
@@ -39884,7 +39958,7 @@ pub(crate) fn register_p68_ssl(r: &mut NativeMethodRegistry) {
             // currently-requested protocol. A failure here surfaces
             // immediately to the caller as a KeyManagementException-shaped
             // IOException.
-            if let Err(msg) = new13_build_connector(extra_roots.as_deref().unwrap_or(&[])) {
+            if let Err(msg) = new13_build_connector(extra_roots.as_deref().unwrap_or(&[]), false) {
                 return Err(RuntimeError::IOException {
                     message: format!("SSLContext.init: {}", msg),
                 }
@@ -40049,7 +40123,8 @@ pub(crate) fn register_p68_ssl(r: &mut NativeMethodRegistry) {
                 .into());
             }
             let extra_roots = p68_factory_trust_roots(args);
-            new13_do_create_socket(ctx, &host, port_i as u16, &extra_roots)
+            let java_tm_key = p68_factory_java_tm_key(ctx, args);
+            new13_do_create_socket(ctx, &host, port_i as u16, &extra_roots, java_tm_key)
         },
     );
     // createSocket(Socket s, String host, int port, boolean autoClose) — we
@@ -40084,7 +40159,8 @@ pub(crate) fn register_p68_ssl(r: &mut NativeMethodRegistry) {
                 .into());
             }
             let extra_roots = p68_factory_trust_roots(args);
-            new13_do_create_socket(ctx, &host, port_i as u16, &extra_roots)
+            let java_tm_key = p68_factory_java_tm_key(ctx, args);
+            new13_do_create_socket(ctx, &host, port_i as u16, &extra_roots, java_tm_key)
         },
     );
 
@@ -41150,7 +41226,37 @@ pub(crate) fn register_p68_ssl(r: &mut NativeMethodRegistry) {
         },
     );
 
-    // SSLEngineResult accessors
+    // SSLEngineResult accessors.
+    //
+    // FIX (sslengineresult-stub-shadow): these are the ACTIVE accessor
+    // overrides for `javax/net/ssl/SSLEngineResult` — `register_p68_ssl`
+    // runs on the real-JDK path too since the httpserver-pkcs12 fix
+    // (lib.rs), and registration is last-wins, so this copy shadows BOTH
+    // the real `SSLEngineResult` bytecode AND the older duplicate in
+    // `tls.rs::register_ssl_engine_result`. The pre-fix bodies assumed
+    // every receiver was this file's synthetic int-code result and rebuilt
+    // a FRESH 2-slot fake enum (name@0, ordinal@1) on every call — a real
+    // result object's enum-reference field read through `.as_int()`
+    // defaulted to 0, so `getStatus()`/`getHandshakeStatus()` returned
+    // "OK"/"NOT_HANDSHAKING"-named fakes that `==`-match no real singleton.
+    // Real JSSE drivers gate their handshake state machines on exactly
+    // those identity comparisons (e.g. `sun.net.httpserver.SSLStreams
+    // .recvData`'s `hs == FINISHED / hs == NOT_HANDSHAKING` checks before
+    // `doHandshake`), so a real-JDK `HttpsServer` never learned it had to
+    // WRAP after consuming the ClientHello: it busy-spun re-reading a
+    // socket that would never deliver more bytes while the client timed
+    // out with `SSLHandshakeException: handshake read: Resource
+    // temporarily unavailable (os error 11)` — deterministically, for
+    // every `com.sun.net.httpserver.HttpsServer` exchange.
+    //
+    // Now: a real enum reference stored on the receiver (results built via
+    // the real 4-arg ctor in `t27_tls::alloc_engine_result`) passes
+    // through untouched — by-name first (layout-proof), then the raw slot.
+    // Int-code receivers (this file's fake-engine producers above, which
+    // use the name tables below) resolve the REAL enum singleton via
+    // `valueOf` so identity comparisons hold even for synthetic results;
+    // only when the real enum class is unresolvable (pure synthetic-JDK
+    // mode) do they fall back to the legacy fresh 2-slot holder.
     let ssleng_result = "javax/net/ssl/SSLEngineResult";
     r.register(
         ssleng_result,
@@ -41158,7 +41264,14 @@ pub(crate) fn register_p68_ssl(r: &mut NativeMethodRegistry) {
         "()Ljavax/net/ssl/SSLEngineResult$Status;",
         |ctx, args| {
             let this = obj_arg(args, 0)?;
-            let status = ctx.get_field(this, 0).as_int().unwrap_or(0);
+            if let Value::Object(Some(o)) = ctx.get_field_by_name(this, "status") {
+                return Ok(Some(Value::Object(Some(o))));
+            }
+            let raw = ctx.get_field(this, 0);
+            if let Value::Object(Some(_)) = raw {
+                return Ok(Some(raw));
+            }
+            let status = raw.as_int().unwrap_or(0);
             let name = match status {
                 0 => "OK",
                 1 => "BUFFER_UNDERFLOW",
@@ -41166,6 +41279,17 @@ pub(crate) fn register_p68_ssl(r: &mut NativeMethodRegistry) {
                 3 => "CLOSED",
                 _ => "OK",
             };
+            let arg = ctx.create_string(name);
+            if let Ok(Some(v)) = ctx.invoke(
+                "javax/net/ssl/SSLEngineResult$Status",
+                "valueOf",
+                "(Ljava/lang/String;)Ljavax/net/ssl/SSLEngineResult$Status;",
+                &[Value::Object(Some(arg))],
+            ) {
+                if matches!(v, Value::Object(Some(_))) {
+                    return Ok(Some(v));
+                }
+            }
             let e = alloc_concurrent_synthetic(ctx, "javax/net/ssl/SSLEngineResult$Status", 2);
             let n = ctx.create_string(name);
             ctx.set_field(e, 0, Value::Object(Some(n)));
@@ -41179,7 +41303,14 @@ pub(crate) fn register_p68_ssl(r: &mut NativeMethodRegistry) {
         "()Ljavax/net/ssl/SSLEngineResult$HandshakeStatus;",
         |ctx, args| {
             let this = obj_arg(args, 0)?;
-            let status = ctx.get_field(this, 1).as_int().unwrap_or(0);
+            if let Value::Object(Some(o)) = ctx.get_field_by_name(this, "handshakeStatus") {
+                return Ok(Some(Value::Object(Some(o))));
+            }
+            let raw = ctx.get_field(this, 1);
+            if let Value::Object(Some(_)) = raw {
+                return Ok(Some(raw));
+            }
+            let status = raw.as_int().unwrap_or(0);
             let name = match status {
                 0 => "NOT_HANDSHAKING",
                 1 => "NEED_WRAP",
@@ -41188,6 +41319,17 @@ pub(crate) fn register_p68_ssl(r: &mut NativeMethodRegistry) {
                 4 => "FINISHED",
                 _ => "NOT_HANDSHAKING",
             };
+            let arg = ctx.create_string(name);
+            if let Ok(Some(v)) = ctx.invoke(
+                "javax/net/ssl/SSLEngineResult$HandshakeStatus",
+                "valueOf",
+                "(Ljava/lang/String;)Ljavax/net/ssl/SSLEngineResult$HandshakeStatus;",
+                &[Value::Object(Some(arg))],
+            ) {
+                if matches!(v, Value::Object(Some(_))) {
+                    return Ok(Some(v));
+                }
+            }
             let e =
                 alloc_concurrent_synthetic(ctx, "javax/net/ssl/SSLEngineResult$HandshakeStatus", 2);
             let n = ctx.create_string(name);
@@ -41196,12 +41338,21 @@ pub(crate) fn register_p68_ssl(r: &mut NativeMethodRegistry) {
             Ok(Some(Value::Object(Some(e))))
         },
     );
+    // bytesConsumed/bytesProduced: real field by name first (layout-proof
+    // for real-ctor results regardless of declaration order), then the raw
+    // synthetic slot convention (consumed@2, produced@3).
     r.register(ssleng_result, "bytesConsumed", "()I", |ctx, args| {
         let this = obj_arg(args, 0)?;
+        if let Value::Int(n) = ctx.get_field_by_name(this, "bytesConsumed") {
+            return Ok(Some(Value::Int(n)));
+        }
         Ok(Some(ctx.get_field(this, 2)))
     });
     r.register(ssleng_result, "bytesProduced", "()I", |ctx, args| {
         let this = obj_arg(args, 0)?;
+        if let Value::Int(n) = ctx.get_field_by_name(this, "bytesProduced") {
+            return Ok(Some(Value::Int(n)));
+        }
         Ok(Some(ctx.get_field(this, 3)))
     });
 
@@ -57441,7 +57592,7 @@ mod new13_tests {
         // NEW-13.2 DoD: the default connector build (no custom KM/TM) must
         // succeed on every platform supported by native-tls, otherwise
         // SSLContext.init would fail even for the trivial null-TM path.
-        let c = new13_build_connector(&[]);
+        let c = new13_build_connector(&[], false);
         assert!(c.is_ok(), "connector build failed: {:?}", c.err());
     }
 
@@ -57451,7 +57602,7 @@ mod new13_tests {
         // unexpected TrustManager) must be skipped rather than failing the
         // whole connector build — `new13_build_connector` logs and continues.
         let garbage = vec![0xFFu8, 0x00, 0x01, 0x02];
-        let c = new13_build_connector(&[garbage]);
+        let c = new13_build_connector(&[garbage], false);
         assert!(
             c.is_ok(),
             "connector build must tolerate an unparseable extra root: {:?}",

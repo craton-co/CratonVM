@@ -2670,21 +2670,40 @@ fn build_set(ctx: &mut dyn NativeContext, keys: &[ObjectRef]) -> ObjectRef {
             Err(_) => ctx.alloc_object(ClassId::new(0), 1),
         },
     };
+    // Cross-call GC-safety fix (2026-07-07, companion to
+    // `populate_selected_keys_field`'s identical fix, same file): `set` is a
+    // bare Rust local held across `invoke_special`/`invoke_virtual` calls
+    // below, each of which runs Java bytecode (HashSet.<init> / Set.add) that
+    // can trigger a moving GC. Reproduced under CRATONVM_GC_STRESS
+    // amplification as an all-zero-header `java/util/Set` receiver +
+    // `NoSuchMethodError Object.add` at `NioReceiver.listen()`'s
+    // `selectedKeys().iterator()` call — i.e. `Selector.selectedKeys()` /
+    // `.keys()` (the only callers of `build_set`) handed back a HashSet that
+    // had already gone stale while building itself, before the caller's
+    // bytecode ever got to dereference it. Pin `set` (and each pending key)
+    // and re-read through the pin before every dispatch — the same pattern
+    // `populate_selected_keys_field` already uses for its own Set.add loop.
+    let set_pin = ctx.pin_native_root(set);
     let _ = ctx.invoke_special(
         "java/util/HashSet",
         "<init>",
         "()V",
-        &[Value::Object(Some(set))],
+        &[Value::Object(Some(ctx.read_native_pin(set_pin, set)))],
     );
-    for key in keys {
+    let key_pins: Vec<_> = keys.iter().map(|k| (ctx.pin_native_root(*k), *k)).collect();
+    for (pin, orig) in key_pins {
+        let set_cur = ctx.read_native_pin(set_pin, set);
+        let key_cur = ctx.read_native_pin(pin, orig);
         let _ = ctx.invoke_virtual(
-            set,
+            set_cur,
             "add",
             "(Ljava/lang/Object;)Z",
-            &[Value::Object(Some(*key))],
+            &[Value::Object(Some(key_cur))],
         );
     }
-    set
+    let result = ctx.read_native_pin(set_pin, set);
+    ctx.unpin_native_roots(set_pin);
+    result
 }
 
 fn selector_select_blocking(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {

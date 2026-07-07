@@ -1995,6 +1995,23 @@ impl ClassManager {
         // itself keep `superclass = None`.
         let synthetic_superclass = if name == "java/lang/Object" || name.starts_with('[') {
             None
+        } else if name == "javax/net/ssl/SSLSocketOutputStream" {
+            // FIX (netty-https-client-trust residual): this synthetic class
+            // stands in for the NEW-13 client socket's OutputStream
+            // (phases_late.rs's alloc_concurrent_synthetic call), but with no
+            // special case here it got the blanket java/lang/Object
+            // superclass below — so any caller storing the result in an
+            // OutputStream-typed local/field (javac emits a checkcast when
+            // the compile-time and declared types differ) failed with
+            // ClassCastException: SSLSocketOutputStream cannot be cast to
+            // java.io.OutputStream. Give it its real ancestor, mirroring the
+            // Proxy$Instance special case above.
+            self.get_loaded_class_id("java/io/OutputStream")
+                .or_else(|| self.get_loaded_class_id("java/lang/Object"))
+        } else if name == "javax/net/ssl/SSLSocketInputStream" {
+            // Same reasoning as SSLSocketOutputStream above, InputStream side.
+            self.get_loaded_class_id("java/io/InputStream")
+                .or_else(|| self.get_loaded_class_id("java/lang/Object"))
         } else {
             self.get_loaded_class_id("java/lang/Object")
         };
