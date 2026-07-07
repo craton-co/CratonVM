@@ -4573,6 +4573,23 @@ fn ensure_hashtable_load_factor(ctx: &mut dyn NativeContext, this: ObjectRef, cn
 }
 
 fn native_map_put(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    native_map_put_evict(ctx, args, true)
+}
+
+/// Like `native_map_put`, but with an explicit eviction-hook toggle. Real
+/// HotSpot's `HashMap.readObject` restores entries via
+/// `putVal(hash, key, value, false, false)` -- the trailing `evict=false`
+/// suppresses `afterNodeInsertion`'s `removeEldestEntry` callback while the
+/// object graph is still being reconstructed (a `LinkedHashMap` subclass's
+/// own fields -- e.g. an anonymous inner class's synthetic `this$0` -- may
+/// not be restored yet). `native_hashmap_read_object` passes `evict=false`
+/// for exactly this reason; every other caller wants ordinary evict=true
+/// put semantics via `native_map_put`.
+fn native_map_put_evict(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+    evict: bool,
+) -> MethodCallResult {
     let this = match args.first() {
         Some(Value::Object(Some(obj))) => *obj,
         _ => return Ok(Some(Value::Object(None))),
@@ -4646,7 +4663,7 @@ fn native_map_put(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResu
                 }
             }
             if is_lhm {
-                return native_lhm_put(ctx, args);
+                return native_lhm_put_evict(ctx, args, evict);
             }
             if is_tm {
                 return native_tm_put(ctx, args);
@@ -16979,7 +16996,17 @@ fn native_hashmap_read_object(ctx: &mut dyn NativeContext, args: &[Value]) -> Me
                 &[Value::Object(Some(ois))],
             )?
             .unwrap_or(Value::Object(None));
-        native_map_put(ctx, &[Value::Object(Some(this)), key, value])?;
+        // evict=false mirrors HotSpot's `HashMap.readObject`, which calls
+        // `putVal(hash, key, value, false, false)`: the trailing `evict=false`
+        // suppresses `afterNodeInsertion`'s `removeEldestEntry` callback while
+        // entries are being replayed. A `LinkedHashMap` subclass overriding
+        // `removeEldestEntry` (e.g. Spring's `LinkedCaseInsensitiveMap`'s
+        // anonymous inner class) may reference its own not-yet-restored
+        // fields (a synthetic `this$0` outer reference) at this point in the
+        // deserialization sequence -- calling the hook here throws
+        // `NullPointerException: Cannot invoke
+        // "...removeEldestEntry(...)" because "this.this$0" is null`.
+        native_map_put_evict(ctx, &[Value::Object(Some(this)), key, value], false)?;
     }
     Ok(None)
 }
@@ -20492,6 +20519,17 @@ fn native_lhm_is_empty(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCal
 }
 
 fn native_lhm_put(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    native_lhm_put_evict(ctx, args, true)
+}
+
+/// Like `native_lhm_put`, but honoring an explicit eviction-hook toggle --
+/// see `native_map_put_evict` for why `native_hashmap_read_object` needs
+/// `evict=false`.
+fn native_lhm_put_evict(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+    evict: bool,
+) -> MethodCallResult {
     let this = match args.first() {
         Some(Value::Object(Some(r))) => *r,
         _ => return Ok(Some(Value::Object(None))),
@@ -20580,13 +20618,14 @@ fn native_lhm_put(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResu
     let is_plain_lhm = ctx.class_name_of_id(this_cid).as_deref() == Some("java/util/LinkedHashMap");
     if std::env::var_os("CRATONVM_DBG_LHM_EVICT").is_some() {
         eprintln!(
-            "[dbg-lhm-evict] this_cid={:?} class_name={:?} is_plain_lhm={}",
+            "[dbg-lhm-evict] this_cid={:?} class_name={:?} is_plain_lhm={} evict={}",
             this_cid,
             ctx.class_name_of_id(this_cid),
-            is_plain_lhm
+            is_plain_lhm,
+            evict
         );
     }
-    if !is_plain_lhm {
+    if evict && !is_plain_lhm {
         if let Value::Object(Some(head)) = lhm_get(ctx, this, "head", LHM_FIELD_HEAD) {
             // The overlay node is a synthetic `java/util/LinkedHashMap$Node`
             // with no real `getKey()`/`getValue()`; an override that inspects
