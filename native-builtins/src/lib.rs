@@ -40507,7 +40507,7 @@ const B64_CHARS: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvw
 const B64_URL_CHARS: &[u8; 64] =
     b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
 
-fn b64_encode(input: &[u8], variant: i32, no_padding: bool) -> Vec<u8> {
+pub(crate) fn b64_encode(input: &[u8], variant: i32, no_padding: bool) -> Vec<u8> {
     let table = if variant == B64_VARIANT_URL {
         B64_URL_CHARS
     } else {

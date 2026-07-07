@@ -3733,7 +3733,13 @@ struct HttpResponse {
     body: Vec<u8>,
 }
 
-fn http_parse_url(url: &str) -> Result<(bool, String, u16, String), String> {
+/// Parse an `http(s)://[userinfo@]host[:port][/path]` URL into
+/// `(https, host, port, path, userinfo)`. The user-info (if any) is stripped
+/// from the connect target / Host header and returned separately so callers
+/// can turn it into preemptive `Authorization: Basic` credentials (the
+/// real-JDK `HttpURLConnection` behaviour Spring's
+/// `ResourceTests.useUserInfoToSetBasicAuth` relies on).
+fn http_parse_url(url: &str) -> Result<(bool, String, u16, String, Option<String>), String> {
     let (scheme, rest) = if let Some(s) = url.strip_prefix("http://") {
         (false, s)
     } else if let Some(s) = url.strip_prefix("https://") {
@@ -3745,15 +3751,21 @@ fn http_parse_url(url: &str) -> Result<(bool, String, u16, String), String> {
         Some(i) => (&rest[..i], &rest[i..]),
         None => (rest, "/"),
     };
-    let (host, port) = match authority.rfind(':') {
+    // RFC 3986: authority = [ userinfo "@" ] host [ ":" port ]. Split at the
+    // LAST '@' (userinfo may itself contain an encoded/raw '@').
+    let (userinfo, hostport) = match authority.rfind('@') {
+        Some(i) => (Some(authority[..i].to_string()), &authority[i + 1..]),
+        None => (None, authority),
+    };
+    let (host, port) = match hostport.rfind(':') {
         Some(i) => {
-            let (h, p) = (&authority[..i], &authority[i + 1..]);
+            let (h, p) = (&hostport[..i], &hostport[i + 1..]);
             let pn: u16 = p.parse().map_err(|_| format!("bad port in {url}"))?;
             (h.to_string(), pn)
         }
-        None => (authority.to_string(), if scheme { 443 } else { 80 }),
+        None => (hostport.to_string(), if scheme { 443 } else { 80 }),
     };
-    Ok((scheme, host, port, path.to_string()))
+    Ok((scheme, host, port, path.to_string(), userinfo))
 }
 
 fn http_perform_request(
@@ -3767,12 +3779,33 @@ fn http_perform_request(
     let mut current_method = method.to_string();
     let mut current_body = body.to_vec();
     for _ in 0..=max_redirects {
-        let (https, host, port, path) = http_parse_url(&current_url)
+        let (https, host, port, path, userinfo) = http_parse_url(&current_url)
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
+        // JDK parity: a URL carrying user-info (`http://alice:secret@host/…`)
+        // sends preemptive `Authorization: Basic base64(userinfo)` unless the
+        // caller already staged an explicit Authorization header
+        // (sun.net.www.protocol.http.HttpURLConnection does this from
+        // url.getUserInfo(); asserted by ResourceTests.useUserInfoToSetBasicAuth).
+        let hdrs_with_auth: Vec<(String, String)>;
+        let eff_headers: &[(String, String)] = match userinfo {
+            Some(ui)
+                if !headers
+                    .iter()
+                    .any(|(k, _)| k.eq_ignore_ascii_case("authorization")) =>
+            {
+                let b64 = String::from_utf8(crate::b64_encode(ui.as_bytes(), 0, false))
+                    .unwrap_or_default();
+                let mut v = headers.to_vec();
+                v.push(("Authorization".to_string(), format!("Basic {b64}")));
+                hdrs_with_auth = v;
+                &hdrs_with_auth
+            }
+            _ => headers,
+        };
         let resp = if https {
-            http_exchange_tls(&host, port, &path, &current_method, headers, &current_body)?
+            http_exchange_tls(&host, port, &path, &current_method, eff_headers, &current_body)?
         } else {
-            http_exchange_plain(&host, port, &path, &current_method, headers, &current_body)?
+            http_exchange_plain(&host, port, &path, &current_method, eff_headers, &current_body)?
         };
         match resp.status {
             301 | 302 | 303 | 307 | 308 => {
@@ -3785,7 +3818,7 @@ fn http_perform_request(
                     let next = if loc.starts_with("http") {
                         loc
                     } else {
-                        let (scheme, h, p, _) = http_parse_url(&current_url).map_err(|e| {
+                        let (scheme, h, p, _, _) = http_parse_url(&current_url).map_err(|e| {
                             std::io::Error::new(std::io::ErrorKind::InvalidInput, e)
                         })?;
                         format!(
@@ -4215,7 +4248,21 @@ fn classpath_resource_via_context_loader(
 /// text after the FIRST ':' is `"//..."` or a path/opaque part; in an authority
 /// it is the numeric port. So reject when everything after the first ':' is
 /// ASCII digits (a port).
+///
+/// A real URL's authority may ALSO carry user-info (`alice:secret@localhost:8080`),
+/// where the text after the first ':' is NOT all digits — the digits-only test
+/// alone then misreads the authority as a full URL with scheme `alice`
+/// (`URL.openStream: unsupported scheme: alice:secret@localhost:<port>`,
+/// ResourceTests.useUserInfoToSetBasicAuth). Discriminator: an authority's
+/// user-info '@' appears before any '/', while a full URL's first '/' comes
+/// immediately after `scheme:` (e.g. `http://u:p@h/x` → `http:` precedes the
+/// first '/', no '@' in it). So additionally reject when the segment before
+/// the first '/' contains '@'.
 fn field5_is_full_url(s: &str) -> bool {
+    let before_slash = s.split('/').next().unwrap_or(s);
+    if before_slash.contains('@') {
+        return false;
+    }
     match s.split_once(':') {
         Some((scheme, rest)) => {
             !scheme.is_empty() && !rest.is_empty() && !rest.bytes().all(|b| b.is_ascii_digit())
@@ -4289,7 +4336,24 @@ fn register_re4_url_http(r: &mut NativeMethodRegistry) {
             out.push_str(&proto);
             out.push(':');
         }
-        if !host.is_empty() || port >= 0 {
+        // Real java.net.URL.toExternalForm emits `protocol://authority` where
+        // the authority (field 5) may carry user-info
+        // (`alice:secret@localhost:8080`). Prefer it over the bare host:port
+        // reconstruction so user-info survives (ResourceTests.
+        // useUserInfoToSetBasicAuth needs the native HTTP client to see it and
+        // send preemptive Basic auth). Guard: only when the parsed host is
+        // non-empty and embedded in the field-5 string, so a synthetic 6-field
+        // URL's unrelated slot never leaks in. Reaching here already implies
+        // `field5_is_full_url(field 5)` was false (the fast path above
+        // returned otherwise), i.e. field 5 is authority-shaped or empty.
+        let authority_from_field5 = match &synth_full {
+            Some(s) if !host.is_empty() && s.contains(&host) => Some(s.as_str()),
+            _ => None,
+        };
+        if let Some(auth) = authority_from_field5 {
+            out.push_str("//");
+            out.push_str(auth);
+        } else if !host.is_empty() || port >= 0 {
             out.push_str("//");
             out.push_str(&host);
             if port >= 0 {
@@ -4702,8 +4766,19 @@ fn register_re4_url_http(r: &mut NativeMethodRegistry) {
             ctx.find_resource(resource)
                 .ok_or_else(|| ioex(format!("URL.openStream: jrt resource not found: {url_str}")))?
         } else if url_str.starts_with("http://") || url_str.starts_with("https://") {
-            let resp = http_perform_request("GET", &url_str, &[], &[], 10)
-                .map_err(|e| ioex(format!("URL.openStream failed: {e}")))?;
+            // GC-safe blocking region: the exchange blocks in native socket
+            // reads, and the peer may be an in-process Java server (e.g.
+            // MockWebServer in Spring's ResourceTests). Without parking this
+            // thread, a concurrent STW request freezes the server's worker
+            // threads while we sit in recv() — the 30s SO_RCVTIMEO then fires
+            // as `Resource temporarily unavailable (os error 11)`
+            // (ResourceTests.canCustomizeHttpUrlConnectionForRead). Pure OS
+            // I/O, no ctx interaction inside → safe to park. Mirrors the
+            // blocking-region use in http_url_connection.rs::perform.
+            ctx.begin_blocking_region();
+            let resp = http_perform_request("GET", &url_str, &[], &[], 10);
+            ctx.end_blocking_region();
+            let resp = resp.map_err(|e| ioex(format!("URL.openStream failed: {e}")))?;
             resp.body
         } else {
             // Application-provided `URLStreamHandler` (e.g. ShrinkWrap's
@@ -5331,8 +5406,107 @@ fn register_re4_url_http(r: &mut NativeMethodRegistry) {
                 Some(Value::Object(Some(o))) => o,
                 _ => return Err(ioex("UrlResource.getInputStream: getURL() returned null")),
             };
-            // Delegate directly to URL.openStream() — our native handles
-            // jar:file: double-nested URLs correctly.
+            // http(s) URLs: mirror Spring's REAL bytecode
+            //   openConnection() → customizeConnection(con) → con.getInputStream()
+            // instead of short-circuiting to URL.openStream(). Two reasons
+            // (ResourceTests):
+            //   * `customizeConnection(HttpURLConnection)` subclass overrides
+            //     stage request headers (canCustomizeHttpUrlConnectionForRead
+            //     asserts its Framework-Name header reaches the server) — the
+            //     openStream shortcut never ran them;
+            //   * the connection path performs the exchange inside GC-safe
+            //     blocking regions (http_url_connection.rs::perform), so an
+            //     in-process MockWebServer keeps serving during the read
+            //     (openStream's exchange previously EAGAIN-timed-out under a
+            //     concurrent STW).
+            // `this`/`url_obj`/`con` are pinned across the up-calls below:
+            // toExternalForm/openConnection/customizeConnection run arbitrary
+            // Java (allocations can move objects).
+            let this_pin = ctx.pin_native_root(this);
+            let url_pin = ctx.pin_native_root(url_obj);
+            let ext_val = ctx.invoke(
+                "java/net/URL",
+                "toExternalForm",
+                "()Ljava/lang/String;",
+                &[Value::Object(Some(url_obj))],
+            );
+            let this = ctx.read_native_pin(this_pin, this);
+            let url_obj = ctx.read_native_pin(url_pin, url_obj);
+            let ext = match ext_val {
+                Ok(Some(Value::Object(Some(s)))) => ctx.read_string(s).unwrap_or_default(),
+                _ => String::new(),
+            };
+            if ext.starts_with("http://") || ext.starts_with("https://") {
+                let con_val = ctx.invoke_virtual(
+                    url_obj,
+                    "openConnection",
+                    "()Ljava/net/URLConnection;",
+                    &[],
+                );
+                let this = ctx.read_native_pin(this_pin, this);
+                let con = match con_val {
+                    Ok(Some(Value::Object(Some(c)))) => c,
+                    Err(e) => {
+                        ctx.unpin_native_roots(this_pin);
+                        return Err(e);
+                    }
+                    _ => {
+                        ctx.unpin_native_roots(this_pin);
+                        return Err(ioex(
+                            "UrlResource.getInputStream: openConnection returned null",
+                        ));
+                    }
+                };
+                let con_pin = ctx.pin_native_root(con);
+                // Protected on AbstractFileResolvingResource; virtual dispatch
+                // reaches subclass overrides (its real bytecode no-ops the
+                // useCaches hook and forwards to the HttpURLConnection overload).
+                let cc = ctx.invoke_virtual(
+                    this,
+                    "customizeConnection",
+                    "(Ljava/net/URLConnection;)V",
+                    &[Value::Object(Some(con))],
+                );
+                let con = ctx.read_native_pin(con_pin, con);
+                if let Err(e) = cc {
+                    ctx.unpin_native_roots(this_pin);
+                    return Err(e);
+                }
+                // Perform the request (headers now staged) and inspect the
+                // status BEFORE handing out the body stream. Two cases must
+                // keep the legacy openStream behaviour the connection path
+                // lacks:
+                //   * 3xx — the connection path does not follow redirects,
+                //     while URL.openStream (and the real JDK's default
+                //     followRedirects) does;
+                //   * -1 — huc_real_perform folds connect failures into -1
+                //     per the getResponseCode contract, which must not become
+                //     a silent EMPTY stream here; openStream re-attempts and
+                //     raises the real IOException.
+                // A SocketTimeoutException from getResponseCode propagates
+                // as-is (no fallback), matching the real JDK.
+                let code_val = ctx.invoke_virtual(con, "getResponseCode", "()I", &[]);
+                let con = ctx.read_native_pin(con_pin, con);
+                let url_obj = ctx.read_native_pin(url_pin, url_obj);
+                ctx.unpin_native_roots(this_pin);
+                let code = match code_val {
+                    Ok(Some(Value::Int(c))) => c,
+                    Err(e) => return Err(e),
+                    _ => -1,
+                };
+                if code == -1 || matches!(code, 301 | 302 | 303 | 307 | 308) {
+                    return ctx.invoke_virtual(
+                        url_obj,
+                        "openStream",
+                        "()Ljava/io/InputStream;",
+                        &[],
+                    );
+                }
+                return ctx.invoke_virtual(con, "getInputStream", "()Ljava/io/InputStream;", &[]);
+            }
+            ctx.unpin_native_roots(this_pin);
+            // Everything else: delegate directly to URL.openStream() — our
+            // native handles jar:file: double-nested URLs correctly.
             if spring_dbg_enabled() {
                 eprintln!("[URLRES-DBG] UrlResource.getInputStream -> openStream");
             }
@@ -9703,20 +9877,49 @@ mod tests {
 
     #[test]
     fn re1_http_parse_url_plain() {
-        let (https, host, port, path) = http_parse_url("http://example.com/foo").unwrap();
+        let (https, host, port, path, userinfo) = http_parse_url("http://example.com/foo").unwrap();
         assert!(!https);
         assert_eq!(host, "example.com");
         assert_eq!(port, 80);
         assert_eq!(path, "/foo");
+        assert_eq!(userinfo, None);
     }
 
     #[test]
     fn re1_http_parse_url_with_port() {
-        let (https, host, port, path) = http_parse_url("https://example.com:8443/api?x=1").unwrap();
+        let (https, host, port, path, userinfo) =
+            http_parse_url("https://example.com:8443/api?x=1").unwrap();
         assert!(https);
         assert_eq!(host, "example.com");
         assert_eq!(port, 8443);
         assert_eq!(path, "/api?x=1");
+        assert_eq!(userinfo, None);
+    }
+
+    #[test]
+    fn re1_http_parse_url_with_userinfo() {
+        // user-info must be stripped from the connect target / Host header and
+        // returned separately (ResourceTests.useUserInfoToSetBasicAuth).
+        let (https, host, port, path, userinfo) =
+            http_parse_url("http://alice:secret@localhost:8080/resource").unwrap();
+        assert!(!https);
+        assert_eq!(host, "localhost");
+        assert_eq!(port, 8080);
+        assert_eq!(path, "/resource");
+        assert_eq!(userinfo.as_deref(), Some("alice:secret"));
+    }
+
+    #[test]
+    fn re1_field5_full_url_discriminator() {
+        // Full URLs (scheme-carrying) are accepted…
+        assert!(field5_is_full_url("http://localhost:8080/x"));
+        assert!(field5_is_full_url("file:/tmp/x.txt"));
+        assert!(field5_is_full_url("jar:file:/a.jar!/e"));
+        // …while authorities are rejected: bare host:port (digits after ':')
+        // and user-info-carrying authorities ('@' before any '/').
+        assert!(!field5_is_full_url("localhost:8080"));
+        assert!(!field5_is_full_url("alice:secret@localhost:8080"));
+        assert!(!field5_is_full_url("alice@localhost:8080"));
     }
 
     #[test]
