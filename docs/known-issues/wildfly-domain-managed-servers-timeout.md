@@ -388,3 +388,107 @@ OPEN. The concrete, durable gain this session is the harness above plus the narr
 the domain now boots far enough under CratonVM that the failure is a specific
 management-model/JIT issue rather than the "never reaches sustained execution" wall
 every prior session hit.
+
+## 2026-07-07 update (seventh session) — the standalone-boot blocker is pinned to a specific STW accounting stall (BUG-03 family); precise census captured
+
+The 2026-07-07 sixth-session update above noted a "GC/STW cooperative-mutator
+stall ~75s into standalone boot". This session reproduced it under a clean
+JIT-on standalone boot (WildFly 32.0.1.Final binary dist, `bin/standalone.sh
+-b=127.0.0.2 -bmanagement=127.0.0.2`, real JDK 25, `CRATONVM_MSC_REAL_START`
+NOT needed — this is the plain standalone path) and pinned the exact
+accounting via `CRATONVM_DBG_STW_CENSUS=1` + two independent live `gdb`
+captures.
+
+**Precise signature (reproducible):**
+
+```text
+[stw-request] initiator=11 alive=20 blocked=14 expected=5
+[stw-census]  rounds=64 pending=1 taken=0 blocked=14 alive=20
+```
+
+- `expected = alive - 1(initiator) - blocked = 20 - 1 - 14 = 5`.
+- `arrived = expected - pending = 4`. So of the 5 counted (non-blocked,
+  non-initiator) mutators, 4 reach the JIT-takeover safepoint and **one never
+  does** — the STW `wait_for_all_timeout` loop in
+  `stw_take_over_and_wait` (`vm/src/runtime/interpreter.rs`) then spins
+  forever (rounds keep climbing past 64; the process sits at ~0-2% CPU for the
+  whole timeout window — confirmed genuinely stalled, not slow).
+- `taken=0`: the cross-thread takeover froze **zero** in-JIT peers, i.e.
+  `conservative_roots::any_thread_in_jit()` reported no thread currently
+  executing JIT machine code, so `take_over_pass` never excused anyone. The
+  pending mutator is therefore NOT caught by the in-JIT takeover path.
+
+**Every thread is parked at the stall.** Two full `gdb -p <pid> -batch -ex
+'thread apply all bt'` captures (one 22-thread early-boot, one 96-thread
+deep-boot) show **no thread spinning in JIT or interpreter code** — the top
+frame of every thread is either `__futex_abstimed_wait_common64` (parking_lot
+park, ~58/96 in the deep capture) or `epoll_wait` (XNIO NIO I/O threads,
+~38/96). So the one `pending` mutator is *parked in a native* (a
+`LockSupport.park`/`parkNanos`, a `Selector`/`epoll_wait`, or an executor idle
+park) yet is still counted in the barrier's `expected` set (`blocked=false` in
+`debug_thread_census`), i.e. it entered that native block WITHOUT going through
+the `gc_barrier` blocked-region protocol (`enter_blocked` /
+`mark_blocked_region_enter`). The census breadcrumbs for the non-blocked
+mutators point at `org/jboss/threads/EnhancedQueueExecutor$ThreadBody.run@442`
+(the JBoss Threads worker idle-park) and one `java/io/FileInputStream.read`
+(these frame_traces are last-seen breadcrumbs and can be stale, so treat as a
+lead, not proof).
+
+**This is the BUG-03 family** ("cross-thread STW JIT root scan INSUFFICIENT",
+see `docs/internal` / memory `bug03-cross-thread-jit-root-scan-insufficient`):
+a mutator that neither cooperatively reaches an interpreter safepoint nor is
+detected as in-JIT stalls the STW barrier. What is new and useful here is a
+**clean, deterministic repro** (WildFly standalone boot under JIT reliably
+wedges; far simpler than the app/ForkJoin workloads BUG-03 was originally
+chased with) plus the exact census numbers isolating it to **one** non-blocked
+mutator parked in a native, with `taken=0` proving the in-JIT takeover is not
+the mechanism that would rescue it.
+
+**Live `vm_state` narrows the mechanism (the harder half of BUG-03).** A second
+run with `CRATONVM_DBG_STW_CENSUS=1 CRATONVM_DBG_VM_STATE=1` printed the pending
+population (`expected=7 blocked=11 alive=19`, one pending) with live states: the
+non-blocked mutators are the JBoss-Threads `EnhancedQueueExecutor` workers, all
+showing `state="native:return"` (`vm/src/vm/vm_exec.rs:615` — the breadcrumb set
+immediately after a native callback returns, before the next native call). Yet
+in `gdb` these very threads are parked in `__futex_abstimed_wait_common64` /
+`epoll_wait`. The reconciliation: they parked *after* their last real native
+returned, via a path that updated neither the `gc_barrier` blocked accounting
+(`blocked=false` — so still counted in `expected`) nor the interpreter
+`vm_state` (stale `native:return`). That is a **park that skips
+`enter_blocked`** — i.e. NOT `NativeContextImpl::park`/`monitor_wait` (both of
+which set `blocked=true`), but a JIT-compiled executor idle-park (or an internal
+`parking_lot` wait) whose `Rip` lands in libc/futex, not in a registered JIT
+code range.
+
+This is precisely the scenario `vm/src/jit/xt_root_scan.rs` (lines ~105-118)
+calls out: *"A peer that is blocked (or parked) with its `Rip` in Rust/native
+code can still have live JIT frames on its native stack."* The helper-window
+scan there recovers such a thread's **roots** after the barrier, but nothing
+lets the **barrier itself complete**: the thread is counted in `expected`,
+`take_over_pass` cannot freeze it (its `Rip` is not inside a JIT range, so the
+forcible-takeover pass skips it → `taken=0`), and it never cooperatively
+arrives → infinite spin in `stw_take_over_and_wait`.
+
+**Recommended next step (deliberately NOT attempted this session — this is the
+harder, still-open half of BUG-03: deep GC-barrier/takeover work with high
+regression risk, and the host was too SSH-unstable to iterate a GC-internals
+change safely):** the fix must make a JIT-thread parked-in-native either (a)
+register as `gc_barrier`-blocked at the JIT→park boundary (so it is excluded
+from `expected`, the same way `NativeContextImpl::park` excludes an
+interpreter park), or (b) be *excused* from the barrier by the takeover the way
+a frozen in-JIT peer is (identity-matched against `counted_os_tids`), since it
+holds live JIT frames but cannot be frozen at its libc `Rip`. Option (a) is
+cleaner but requires the JIT's park/blocking-call lowering to go through the
+blocked-region hook; option (b) is a `stw_take_over_and_wait` change to treat
+"counted mutator, parked with JIT frames, un-freezable" as excused rather than
+awaited. First confirm which park the executor worker actually uses
+(`Unsafe.park` is intrinsified in the JIT vs. calling `native_unsafe_park` →
+`ctx.park` → `enter_blocked`; the observed `blocked=false` proves the executor
+is NOT reaching `ctx.park`, so the JIT is either intrinsifying the park or the
+wait is on an internal `parking_lot` primitive).
+
+This is the current gating blocker for a JIT-on WildFly standalone (and, by
+extension, the domain servers/host-controller, which are standalone-shaped
+JIT-on boots). It is distinct from — and now more clearly separated than — the
+no-JIT `awaitServers` propagation gap and the JIT-on domain interface-
+resolution miscompile documented above.
