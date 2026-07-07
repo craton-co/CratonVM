@@ -1280,6 +1280,18 @@ pub fn route_rsa_to_real() -> bool {
     *CACHE.get_or_init(|| std::env::var_os("CRATONVM_SYNTHETIC_RSA").is_none())
 }
 
+/// DBG: trace every `Reference.refersTo`/`refersTo0` call that answers
+/// `false` while both the stored referent and the queried object are
+/// non-null (`CRATONVM_DBG_REFERSTO=1`). A weak-keyed table (ThreadLocalMap,
+/// WeakHashMap) treats such a mismatch as a stale entry and expunges it, so
+/// a spurious `false` here silently destroys live per-thread state — this
+/// trace is the cheap way to catch that class of bug in the act.
+pub(crate) fn dbg_refers_to() -> bool {
+    use std::sync::OnceLock;
+    static CACHE: OnceLock<bool> = OnceLock::new();
+    *CACHE.get_or_init(|| std::env::var_os("CRATONVM_DBG_REFERSTO").is_some())
+}
+
 pub mod apps_h2;
 pub mod deprecated_internal;
 pub mod deprecated_io_util;
@@ -31963,6 +31975,16 @@ fn native_reference_refers_to(ctx: &mut dyn NativeContext, args: &[Value]) -> Me
         (Value::Object(None), Value::Object(None)) => true,
         _ => false,
     };
+    if !result && dbg_refers_to() {
+        if let (Value::Object(Some(a)), Value::Object(Some(b))) = (&referent, &target) {
+            eprintln!(
+                "[refersto] FALSE(refersTo0) this={:#x} referent={:#x} other={:#x}",
+                this.as_ptr() as usize,
+                a.as_ptr() as usize,
+                b.as_ptr() as usize,
+            );
+        }
+    }
     Ok(Some(Value::Int(result as i32)))
 }
 
