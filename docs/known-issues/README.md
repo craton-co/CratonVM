@@ -206,9 +206,13 @@ it under `docs/internal`.
   because its own current evidence says both bugs are fixed and soak-verified.
 - The XT takeover activation corruption note moved to
   [`docs/internal/fixed-suite-bugs/xt-takeover-activation-young-corruption.md`](../internal/fixed-suite-bugs/xt-takeover-activation-young-corruption.md).
-  Its remaining 1/18 DoHead crash face is not an XT activation residual and stays
-  tracked by
-  [`dohead-jit-heap-corruption-register-invisibility.md`](dohead-jit-heap-corruption-register-invisibility.md).
+  Its remaining 1/18 DoHead crash face was not an XT activation residual; that
+  DoHead crash family's FATAL layer is now itself fixed too (2026-07-06,
+  `fix/dohead-sweep-freelist`) — doc moved to
+  [`docs/internal/fixed-suite-bugs/dohead-jit-heap-corruption-register-invisibility-FIXED.md`](../internal/fixed-suite-bugs/dohead-jit-heap-corruption-register-invisibility-FIXED.md).
+  Its one real residual (Layer 1, register-invisible roots) remains tracked by
+  the still-open [`fork6-fjp-multithread-jit-root-reclamation.md`](fork6-fjp-multithread-jit-root-reclamation.md)
+  (gated on the deferred precise-JIT-stack-maps project).
 
 ## How many distinct bugs are here?
 
