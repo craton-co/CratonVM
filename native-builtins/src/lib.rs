@@ -21539,6 +21539,22 @@ fn register_annotation_overrides(registry: &mut NativeMethodRegistry) {
     // Real-JDK SLF4J replay: `LoggerFactory` drains then clears the event queue.
     // Synthetic-stub `LinkedBlockingQueue` hierarchies may not resolve
     // `AbstractCollection.clear()V` on the method walk — register explicitly.
+    //
+    // BUG (2026-07-07): this used to unconditionally `ctx.set_field(this, 1,
+    // Value::Int(0))`, assuming the synthetic 4-field layout (slot 1 = size
+    // int). On a REAL-JDK-constructed `LinkedBlockingQueue` (real bytecode
+    // `<init>` ran), slot 1 is the real `count: AtomicInteger` *reference*
+    // field, not an int. Stomping it with `Value::Int(0)` corrupted that
+    // reference to null, so any later real-bytecode `count.get()` (e.g.
+    // `offer()`/`size()`) NPE'd with "Cannot invoke AtomicInteger.get()
+    // because count is null" — reproduced by
+    // BufferingStompDecoderTests (org.springframework.messaging.simp.stomp),
+    // whose `assembleChunksAndReset()` calls `chunks.clear()` right after
+    // dequeuing the sole buffered chunk. Mirror the `size()` override just
+    // below: detect the real layout by field name first (same technique),
+    // and for that case drain via the real `poll()` (already correct for
+    // real-layout queues, proven by `count` staying valid across dequeues)
+    // instead of touching the raw slot.
     registry.register(
         "java/util/concurrent/LinkedBlockingQueue",
         "clear",
@@ -21549,7 +21565,17 @@ fn register_annotation_overrides(registry: &mut NativeMethodRegistry) {
                 _ => return Ok(None),
             };
             ctx.monitor_enter(this);
-            ctx.set_field(this, 1, Value::Int(0));
+            match ctx.get_field_by_name(this, "count") {
+                Value::Object(Some(_)) => {
+                    while matches!(
+                        ctx.invoke_virtual(this, "poll", "()Ljava/lang/Object;", &[])?,
+                        Some(Value::Object(Some(_)))
+                    ) {}
+                }
+                _ => {
+                    ctx.set_field(this, 1, Value::Int(0));
+                }
+            }
             ctx.monitor_notify_all(this)?;
             ctx.monitor_exit(this);
             Ok(None)
