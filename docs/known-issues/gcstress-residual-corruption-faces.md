@@ -1,11 +1,17 @@
 # GC_STRESS — residual corruption faces (post concurrent-old-gen fix)
 
-**Status:** 🟡 OPEN. Split off `gcstress-concurrent-oldgen-races-FIXED.md`
-(moved to `docs/internal/` — the three concurrent-old-gen defects it
-investigated are fixed on dev, commit `57f545be`). These are **different**
-corruption signatures that survive that fix under the aggressive
-`CRATONVM_DBG_GC_STRESS` lane. Not yet root-caused; not yet confirmed
-distinct from each other.
+**Status:** 🟡 OPEN (residual). **Severe manifestations RESOLVED** — the
+doc's original *critical* framing (SIGSEGV / `CompactValue` panic / hard
+crash, "5/6 soak runs crash") no longer reproduces: **0 crashes across 56
+Fork6Hard GC_STRESS runs on current dev** (2026-07-07, commit `3a1a95b5`).
+What remains is a **contained** young-mark stale-reference residual (guard
+rejects the corrupt header; the run usually completes) that still escalates
+to a Java-level `ClassCastException` / `NoSuchMethodError` / `nullchild`
+rep-failure in a minority of runs and to a rare STW wedge. Split off
+`gcstress-concurrent-oldgen-races-FIXED.md` (in `docs/internal/`, defects
+fixed on dev `57f545be`). Root cause of the residual not yet identified;
+see the 2026-07-07 re-assessment below, which **refutes** the two leading
+producer hypotheses.
 
 ## Repro
 
@@ -43,6 +49,94 @@ CRATONVM_DISABLE_DEFAULT_WATCHDOG=1 <cratonvm> --java-home <jdk25> \
 
 This gives face-1-style triage (implausible header / no allocation record) a
 single-class, default-heap, watchable repro instead of the ≳100-run stress lane.
+
+## 2026-07-07 re-assessment on current dev (commit `3a1a95b5`)
+
+Re-ran the lane on the Azure Linux probe host (real-JDK jdk25, shared host
+under load) after ~600 commits of dev movement since the 2026-07-03 rounds.
+Binary `cratonvm-gcs-20260707`, worktree `wt-gcstress-20260707`.
+
+### Current reproduction rate (56 Fork6Hard `128 20` GC_STRESS=65536 runs)
+
+- **0 crashes** (no SIGSEGV, no `CompactValue` panic, no `exceeds 47-bit`) —
+  the severe faces the doc opened for are gone. The intervening fixes that
+  matter: the map-node stale-local family + `2dfdfddc` plain-field 16-byte
+  slot-tearing (landed 2026-07-06, *after* this doc's last round) + the GC
+  guard/recovery band-aids now **contain** the corruption instead of
+  crashing.
+- 19/56 completed fully clean (`ALL-OK reps=20`); 32/56 completed but with
+  ≥1 rep failure (workload caught the stale receiver as
+  `ClassCastException`, `NoSuchMethodError` e.g. `String.fork()`, or
+  `IllegalStateException: nullchild[a,b)`); 5/56 wedged (STW takeover waits
+  forever after a worker died on a stale receiver → `rc=124`).
+- nojit is now *much* cleaner than the doc's era (1/10 corrupt + 1 wedge vs
+  "dozens of corrupt-cell reads"); JIT still shows the face at ~4/12.
+
+### Both leading producer hypotheses REFUTED
+
+Controlled 12-run lanes, identical config, only the lever changed:
+
+| lane | runs with corruption |
+|------|----------------------|
+| baseline | 4/12 |
+| `CRATONVM_JIT_DISABLE_INLINE_NEW=1` | 3/12 |
+| `CRATONVM_COMPACT_REF_FIELDS=0` | 3/12 |
+
+Disabling JIT inline-`new` does **not** reduce the corruption, so the
+JIT-inline-allocation header-ordering path — the prime suspect carried in
+`docs/known-issues/jit-inline-alloc-array-header-corruption-hibernate-batch.md`
+and its memory note — is **not** the producer of *this* Fork6 residual.
+Disabling compact-ref-fields likewise does nothing, ruling out the
+compact-object `GC_FLAG_COMPACT`/`array_length` write window. And the face
+reproduces under `--nojit` too, so it is not JIT codegen at all — it is in
+the shared core (interpreter write path / GC root-scan / remap).
+
+### Corrupt-header signature decoded
+
+The `mark_young: rejecting object … implausible extent 0 (kind=0,
+array_len=513, num_slots=0)` warnings all point at a young address whose
+`array_length` dword equals the **high 32 bits of the address itself**
+(e.g. addr `0x201_07000620` → `array_length=0x201=513`). Reading a Value
+cell `[disc|payload32|payload64]` as an `ObjectHeader` puts the payload's
+high dword at the header's `array_length` offset (12). So the walker is
+following a **stale/wild reference in a live object's slot** into young
+memory that holds another young pointer, and mis-decoding it — i.e. the
+doc's face-1 "stale pointer in a Value cell," confirmed, not a torn header
+write. `[A2] BREADCRUMB — NO allocation record covers …
+(freed+reused past the ring)` confirms the target was a real allocation
+that died and had its slot reused while a live holder still referenced it:
+a **missed root / missed remap**, the same class as the blocked-thread /
+`fork6-fjp` A4 register-resident-root family
+([fork6-fjp-multithread-jit-root-reclamation.md](fork6-fjp-multithread-jit-root-reclamation.md),
+[dohead-jit-heap-corruption-register-invisibility.md](dohead-jit-heap-corruption-register-invisibility.md)).
+
+### The cheap ZonedDateTimeTest repro face is now CLOSED
+
+The 2026-07-03 "much cheaper repro" (Hibernate `ZonedDateTimeTest`
+livelocking forever in an `implausible extent` / `BREADCRUMB` loop at a
+persistent address) **no longer reproduces**: the class now completes in
+~170 s with **0 corruption markers, 0 stale-pointer warnings**. Its
+remaining failures are an unrelated functional bug (441× `NullPointerException:
+… "typeNamePattern" is null` — a `DatabaseMetaData`-shaped null, no GC
+signal), not this corruption family. Drop ZonedDateTimeTest as a face-1
+repro; it was closed by the same 2026-07-06 slot-tearing / map-node wave.
+
+### Face 2 did not reproduce
+
+`expected object reference, got int(512)` (the JIT lost-tag int-in-ref-slot
+face) did **not** appear in any of the 56 runs. Either it is rarer than the
+sampled window or was also closed by the intervening wave; it stays listed
+below but is now unconfirmed on current dev.
+
+### Net
+
+The residual is a stale-reference / missed-remap bug in the multi-threaded
+`REAL_FORKJOINPOOL` GC path — **not** the JIT allocation codegen (refuted).
+It presents mostly as contained guard warnings, sometimes as a rep-level
+Java exception, rarely as a wedge; it never crashes on current dev. This is
+the deferred precise-jit-stack-maps / register-resident-root work (JIT side)
+plus a residual missed-root under `--nojit`; kept OPEN here rather than
+retired because the underlying corruption is unfixed.
 
 ## Residual faces
 
