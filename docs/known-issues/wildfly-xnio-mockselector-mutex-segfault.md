@@ -65,6 +65,58 @@ WildFly-under-CratonVM SIGSEGVs found the same day. Still worth checking
 [[wildfly-infinispan-remove-listener-segfault]] against whichever mechanism gets
 confirmed here.
 
+## Reproduction attempt 2026-07-07 — current dev HANGS at boot (does NOT crash); precise-maps cleared
+
+Reproduced with a symbolicated current-dev binary (`4e6dc36d`+, i.e. after the
+precise-maps-default-ON flip `65d7cfba`) booting WildFly 32 **standalone**
+directly under CratonVM (`JAVA_HOME`→cratonvm, `CRATONVM_JAVA_HOME=jdk25`),
+bypassing Maven/Arquillian.
+
+**The documented SIGSEGV did NOT reproduce as a crash.** Instead the server
+**hangs during boot** at the `ServerService Thread Pool` startup, every time,
+at a **GC-barrier / blocked-region-transition deadlock** — NOT the native-handle
+crash. gdb-attach to the hung process (all threads):
+
+- 1 thread in `stw_take_over_and_wait` (`interpreter.rs:535`) →
+  `wait_for_all_timeout` (`gc_barrier.rs:312`): the STW initiator, spinning with
+  `pending=1 taken=0` ("still waiting for cooperative mutators rounds=64").
+- ~10 threads parked in `wait_out_pause_locked` (`gc_barrier.rs:278`) — arrived,
+  waiting for the pause to end.
+- ~8 threads in `arrive_and_wait`/`safepoint_check` (`gc_barrier.rs:363`,
+  `interpreter.rs:2409`).
+- **2 threads stuck mid-`mark_blocked_region_leave`** (`gc_barrier.rs:220`) via
+  `native_rq_remove_timeout` (`reference.rs:505`) →
+  `end_blocking_region_refs` (`vm_exec.rs:5151`): a `ReferenceQueue.remove`
+  worker trying to LEAVE its blocked region while a STW is active. This is the
+  `pending=1` holdout — a thread in the blocked→running transition window that
+  the takeover neither excuses (it left the blocked set) nor takes over
+  (`taken=0`). Classic blocked-region-transition barrier deadlock (cf.
+  [[reference_blocked_thread_gc_gap]] "leave WAITS OUT active STW while still
+  counted").
+
+**Precise-maps is NOT the cause.** The identical hang reproduces with
+`CRATONVM_NO_PRECISE_JIT_MAPS=1` (precise OFF) — so the precise-maps-default-ON
+flip (`65d7cfba`) does **not** regress WildFly boot; both modes deadlock at the
+same point. (This clears the flip; the hang is orthogonal.)
+
+**Open interpretation:** either (a) the documented SIGSEGV was on the OLD frozen
+binary (`37efdc4a`, precise-off) and intervening commits turned the
+race's outcome from crash→hang, or (b) standalone boot differs from the
+Arquillian-managed container config enough that standalone hits the barrier
+deadlock while the managed container hit the native-handle crash. The
+native-handle-UAF analysis above (garbage `self` at a Mutex unlock) still stands
+for the documented *crash*; this boot **hang** is a distinct GC-barrier
+coordination bug that blocks WildFly boot on current dev regardless of precise
+maps and likely deserves its own doc + a targeted fix in the
+`gc_barrier`/`stw_take_over_and_wait` blocked-region-leave transition. NOT fixed
+(a speculative change to the STW/blocked-region protocol is high blast-radius —
+it governs every multi-threaded workload).
+
+Repro (fast, no Maven, collision-free): `JAVA_HOME=<cratonvm-javahome>
+CRATONVM_JAVA_HOME=/home/victor/jdk25 wildfly-dist/wildfly-32.0.1.Final/bin/standalone.sh`
+— hangs at `ServerService Thread Pool -- N` within ~5s; gdb-attach for the
+barrier state. See [[reference_wildfly_native_segfault_family_20260707]].
+
 ## Symptom
 
 Once the test harness actually launches a real Arquillian-managed WildFly server under CratonVM (see
