@@ -2,7 +2,7 @@
 
 | | |
 |---|---|
-| **Status** | 🟢 FIXED — both the original JIT dispatch bug (merged `b09fea46`) and the residual GC-staleness bug (merged, see "Residual fix" below) are resolved. |
+| **Status** | 🟢 FIXED (both crash bugs) / 🟡 test class itself still does not complete — see "2026-07-07: fast-fail became a multi-hour non-hang" below. Both the original JIT dispatch bug (merged `b09fea46`) and the residual GC-staleness bug (merged, see "Residual fix" below) are resolved; the class was then observed to run past its old crash points and grind for a very long time (not a deadlock — the interpreter is genuinely still executing the test's own pathological I/O pattern). Not re-opening this as a VM bug; tracked here for continuity since it is the same class/symptom lineage. |
 | **Area** | VM — virtual/interface method dispatch for `InputStream.read()` on a JDBC `Blob`'s binary stream |
 | **Symptom** | `java.lang.NoSuchMethodError: java/lang/Object.read()I` |
 | **Severity** | medium — single class, but the failure mode (dispatch landing on `Object`'s non-existent method) suggests a general vtable/interface-dispatch defect that could recur elsewhere. |
@@ -180,3 +180,178 @@ artifacts, confirmed identical on unmodified `dev`.
 
 Fixed in worktree `/data/data/wt-hib-jpalargeblob-residual-20260706`, branch
 `fix/hib-jpalargeblob-residual-20260706`, merged to `dev`.
+
+## 2026-07-07: fast-fail became a multi-hour non-hang (not a new VM bug)
+
+After the 2026-07-06 residual fix (`813bc19b`) landed, a full local Windows
+121-class rerun (`docs/known-issues/hib-local-windows-rerun-20260707.md`,
+dev `d0a779f6`) reported `JpaLargeBlobTest` flipping from `FAIL` (fast
+`NoSuchMethodError`) to `HANG` (`rc=124`, ran the full 1200s with zero
+apparent progress), and speculated this might be a new blocking-call
+regression. This section investigates that report against current `dev` tip
+(`fa1c505f`, which is `d0a779f6` plus ~12 more commits including the
+young-GC live-reclaim RRWL fix `2072699b`/`e94ebf60` and other JIT/GC work)
+and concludes it is **not a hang, not a deadlock, and not a new correctness
+regression** — it is the test's own extreme I/O pattern finally being
+allowed to run to (very slow) completion instead of crashing out early.
+
+### Reproduction
+
+Built `dev` tip (`fa1c505f`, merged into this investigation's worktree
+branch) with the standard MSVC/libffi-sys-seed recipe, unique binary
+`target/release/cratonvm-hib-jpalargeblob-hang-20260707.exe`. Ran the
+existing one-class repro file from the 2026-07-05 investigation:
+
+```
+cd apps/hib-suite-runner
+<cv-binary> --java-home "C:\Program Files\Java\jdk-25" --Xmx 1500m \
+  --stack-dump-on-timeout=60 @common.args -Dcraton.batch=1 \
+  CratonRunner codex-jpalargeblob-oneclass-20260705.txt 0
+```
+
+`--stack-dump-on-timeout=60` (not `CRATONVM_DISABLE_DEFAULT_WATCHDOG=1`) was
+used deliberately so CratonVM's own watchdog would dump every thread's Java
+frames before aborting, avoiding the need for an external debugger.
+
+### Stack-dump evidence: the main thread is not stuck, it is looping
+
+The watchdog fired once at the 60s deadline and requested a stack dump. Per
+the `stack_dump_emitted` design in `vm/src/runtime/interpreter.rs` (a guard
+local to each nested `execute()` call, reset fresh for every new interpreter
+frame), a request that's still pending gets serviced independently by *every
+subsequent nested `execute()` call* until the watchdog's abort actually
+lands — so a genuinely tight, fast-iterating call loop produces many dumps
+in the grace window, not one. That is exactly what happened: **2704** dumps
+of `tid=0` ("main") landed in the ~3s post-deadline grace period before
+`process::abort()`, and every single one has the identical leaf shape:
+
+```
+tid=0 depth=100 class=org/h2/jdbc/JdbcPreparedStatement method=setBinaryStream ...
+tid=0 depth=101 class=org/h2/jdbc/JdbcConnection method=createBlob ...
+tid=0 depth=102 class=org/h2/mvstore/db/LobStorageMap method=createBlob ...
+tid=0 depth=103 class=org/h2/util/IOUtils method=readFully(Ljava/io/InputStream;[BI)I pc=23 last_pc=20
+tid=0 depth=104 class=org/hibernate/orm/test/lob/JpaLargeBlobTest$LobInputStream method=read()I pc=0 last_pc=0
+```
+
+The thread summary line (`tid=0 name="main" alive=true daemon=false
+roots=200`) is also byte-for-byte identical across all 2704 dumps — no
+frame-depth growth, no root-count growth/shrinkage. This is the signature
+of a stable, bounded loop making real progress through many iterations, not
+a deadlock (no lock/condvar/park frame anywhere in the stack) and not a
+leak.
+
+### Root cause: this is H2 doing a byte-at-a-time BLOB read, by design of the test fixture
+
+`JpaLargeBlobTest.LobInputStream` (`apps/hibernate-orm/hibernate-core/src/test/java/org/hibernate/orm/test/lob/JpaLargeBlobTest.java`)
+is:
+
+```java
+private class LobInputStream extends InputStream {
+    private Long count = (long) 200 * 1024 * 1024;   // 200 MiB
+
+    @Override
+    public int read() throws IOException {
+        read = true;
+        if ( count > 0 ) {
+            count--;
+            return new Random().nextInt();
+        }
+        return -1;
+    }
+    // no read(byte[], int, int) override
+}
+```
+
+This class only overrides single-byte `read()I` — exactly the "shape" the
+2026-07-06 residual-fix section above already identified as triggering
+H2's/`java.io.InputStream`'s default bulk-read fallback, which calls
+`read()` once per byte in a loop. H2's `IOUtils.readFully` (visible at
+depth=103 in every dump) is doing precisely that: reading a **200 MiB**
+stream **one byte at a time**, where each byte costs a full nested virtual
+dispatch into Java bytecode that additionally allocates a `new Random()`
+and calls `.nextInt()`.
+
+Before both 2026-07-05/06 fixes, this loop always crashed within the first
+few hundred-to-few-thousand iterations (`NoSuchMethodError` from the JIT MIC
+bug, or the GC-staleness `ObjectKind::Array` assertion under GC pressure) —
+so nobody had previously observed this test actually being allowed to run
+its intended 200,000,000-iteration loop to completion. With both crash
+bugs fixed, the loop no longer aborts early; it just keeps going.
+
+Extrapolating from the observed dump rate during the watchdog's 3-second
+grace window (2704 dumps / ~3s ≈ 900 completed single-byte reads/sec at
+that point in the run — necessarily a rough, potentially-still-warming-up
+sample, not a steady-state benchmark), reading the full 200 MiB one byte
+at a time would take on the order of **tens of hours**, far beyond any
+harness timeout (the 2026-07-07 rerun used `TIMEOUT=1200`; this
+investigation's own diagnostic probe used a 60s watchdog). Whether
+CratonVM's JIT ever tiers up `LobInputStream.read()` / the bulk-read
+fallback loop to native code during a real run, and what steady-state
+throughput that reaches, was not separately measured here — it doesn't
+change the conclusion, since even a substantial JIT speedup would need to
+close a multiple-orders-of-magnitude gap to finish inside a normal harness
+timeout.
+
+**This is not attributable to any specific commit in the `813bc19b..d0a779f6`
+(or `..fa1c505f`) window.** No commit in that range touches
+`native_bais_read_bytes`/`native_dis_read_bytes`/`dis_read_fully_impl`
+(confirmed via `git log -p` on `native-io/src/lib.rs` — same 3 commits as
+originally noted, none touching the pinned read loops), and the stack shows
+pure interpreted/JIT'd Java bytecode execution, not a native fallback path
+at all for this particular call shape (H2's `IOUtils.readFully` loop is
+plain Java calling `InputStream.read()`, no native intrinsic involved). The
+`class_manager`/`vtable_manager` AB-BA lock-order fixes in this window
+(`04da0610`, `60e2b20d`, `caa4ee65`) touch `execute_invokevirtual_vtable_fast`,
+which IS on this call's hot path (every `read()` call is a virtual
+dispatch) — inspected their diffs and confirmed they only change *when* an
+already-present `class_manager.read()` lookup is taken relative to the
+`vtable_manager` guard (to fix real deadlocks elsewhere), not whether it's
+taken; they don't add new per-call cost relative to pre-window `dev`.
+No evidence was found that per-call dispatch cost regressed in this window;
+the more likely explanation is simply that this exact 200-million-iteration
+call shape was never exercised end-to-end before (it always crashed first),
+so its true cost was never previously visible.
+
+### Conclusion — not re-opening as a bug
+
+The 2026-07-06 "HANG" classification in
+`docs/known-issues/hib-local-windows-rerun-20260707.md` is more precisely:
+**the test now runs correctly but far too slowly to finish inside any
+practical harness timeout**, as a direct consequence of both crash fixes
+successfully removing the early aborts that used to mask this. This is a
+performance characteristic of interpreting/JIT-warming a 200-million-call
+byte-at-a-time loop, not a new correctness defect, lock-order regression, or
+missed-wakeup bug — no lock, condvar, or native-call frame appears anywhere
+in the stuck stack. No code fix is landed alongside this doc update.
+
+If this class's wall-clock time needs to come down (e.g. to stop it
+poisoning suite-timeout budgets), the tractable angles are harness-side
+(skip/xfail this specific fixture, since HotSpot's C2 JIT would also spend
+real time here but compiles this trivial hot loop essentially immediately)
+or VM-side JIT-warmup speed for tight single-byte-dispatch loops — neither
+is attempted here since the task's scope was root-causing the "hang," not
+optimizing interpreter throughput.
+
+### Repro (2026-07-07)
+
+```
+cd apps/hib-suite-runner
+<cv-binary> --java-home "C:\Program Files\Java\jdk-25" --Xmx 1500m \
+  --stack-dump-on-timeout=60 @common.args -Dcraton.batch=1 \
+  CratonRunner codex-jpalargeblob-oneclass-20260705.txt 0
+```
+
+Do not set `CRATONVM_DISABLE_DEFAULT_WATCHDOG=1` when probing this class —
+that disables the stack-dump watchdog entirely, so the only signal an
+external timeout gives you is "still running," identical-looking whether
+it's truly stuck or just slow. `--stack-dump-on-timeout=N` is the only way
+to tell the two apart without an external debugger.
+
+Expect: process runs for 60s, then the watchdog dumps thousands of
+near-identical `tid=0` stacks all showing
+`org/h2/util/IOUtils.readFully` → `JpaLargeBlobTest$LobInputStream.read()I`
+at the leaf, then aborts. This confirms "still running the byte-loop," not
+"stuck." To actually watch it complete, use a `--stack-dump-on-timeout`
+value on the order of hours, or reduce `LobEntity.BLOB_LENGTH`/the test
+fixture's 200 MiB constant locally (do not commit such a change upstream —
+it would diverge from real Hibernate's test suite).

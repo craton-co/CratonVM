@@ -1,18 +1,20 @@
 # Fork6 — multi-thread (ForkJoinPool worker) JIT-root reclamation
 
-> **NEW real-world SIGSEGV repro 2026-07-07 (much simpler than Fork6Hard GC_STRESS
-> races)**: `org.jboss.as.test.manualmode.ejb.client.outbound.connection.security.
-> ElytronRemoteOutboundConnectionTestCase` (real WildFly/Elytron/XNIO code, no synthetic
-> harness) reliably SIGSEGVs in `NativeContextImpl::read_string` called from
-> `xnio_async::native_builder_set`, reached via a JIT-compiled `jit_invoke_virtual_mic`
-> call site fed a stale `String` `ObjectRef` — a single-process, deterministic hit of
-> this SAME register-only-oop gap (bisected: crash persists with
-> `CRATONVM_NO_PRECISE_JIT_MAPS=1`, disappears with `CRATONVM_DISABLE_JIT=1` — JIT-general,
-> not tied to the 2026-07-07 precise-maps default-ON flip). Full gdb backtrace + a
-> reusable Surefire-gdb-wrapper repro technique in
-> [`wildfly-elytron-remoting-segfault-post-keyfactory-fix.md`](wildfly-elytron-remoting-segfault-post-keyfactory-fix.md).
-> Use this repro (single-threaded, no GC_STRESS orchestration needed) to verify the
-> eventual register-oop-bitmap fix alongside the existing Fork6Hard lane.
+> **RETRACTED 2026-07-07**: the `ElytronRemoteOutboundConnectionTestCase` SIGSEGV
+> initially reported here as a new real-world repro of this A4 gap was
+> **mis-attributed**. Further investigation (enabling `CRATONVM_DBG_JIT_MIC=1` and
+> inspecting the exact pre-crash call sequence) found the real cause: a missing
+> autoboxing step in `native_option_map_get` (`native-builtins/src/xnio_async.rs`) that
+> let a raw unboxed int (e.g. a `60000`ms timeout option) escape as a bogus pointer-
+> shaped `ObjectRef` from an `Object`-returning native method. Every existing GC-root-
+> visibility mitigation (`CRATONVM_NO_PRECISE_JIT_MAPS=1`, `CRATONVM_JIT_SAFEPOINT_REG_SPILL=all`,
+> `CRATONVM_MOVING_YOUNG=1`+`CRATONVM_SHADOW_STACK=1`) was bisection-tested against the
+> real repro and NONE changed the crash -- in hindsight the signal that this was never a
+> register-visibility problem. Fixed and merged; see
+> [`wildfly-elytron-remoting-segfault-post-keyfactory-fix.md`](wildfly-elytron-remoting-segfault-post-keyfactory-fix.md)
+> (now in `docs/internal/fixed-suite-bugs/`) for the full corrected writeup, including
+> the "why every mitigation failing is itself a diagnostic signal" lesson. This Fork6/A4
+> gap itself remains open and unaffected by that fix.
 
 > **SECOND real-world confirmation 2026-07-07 ~16:15, and this one is suite-wide**:
 > [`wildfly-xnio-mockselector-mutex-segfault.md`](wildfly-xnio-mockselector-mutex-segfault.md) — the
