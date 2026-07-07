@@ -1,31 +1,26 @@
-# spring-web http.client Flow/Reactive hangs: OutputStreamWriter internal-state corruption + 2 unrelated hangs
+# spring-web http.client Flow/Reactive hangs: 3 distinct root causes
 
-## Status: Root cause #1 FIXED (commit `6744812d`, merged `963d59b3`); root causes #2/#3 still OPEN
+## Status: Root causes #1 and #2 FIXED; root cause #3 OPEN (confirmed genuine hang, not merely slow)
 
-Branch `fix/httpclient-jdkclient-hangs-0706b` (off `dev` @ `9f1db39d`), Azure
-host worktree `/data/data/wt-hc-hangs-0706b`. This continues the
-"Residual C — Genuine hangs" investigation from
+Branch history: `fix/httpclient-jdkclient-hangs-0706b` (original investigation,
+off `dev` @ `9f1db39d`) → `fix/streamencoder-inherited-field-slots-0707`
+(root cause #1, merged `963d59b3`) → `fix/http-phase-e-read-until-close-hang-0707`
+(root cause #2, merged `86f37f84`). This continues the "Residual C — Genuine
+hangs" investigation from
 `docs/known-issues/http-client-cluster-redefine-dispatch-and-jdk21-gaps.md`
 for `JdkClientHttpRequestFactoryTests`, `OutputStreamPublisherTests`,
 `SubscriberInputStreamTests`, `reactive.ClientHttpConnectorTests`.
-
-**Update 2026-07-07:** Root cause #1 (below) is FIXED — see the "FIXED"
-section right after it. `JdkClientHttpRequestFactoryTests` and
-`reactive.ClientHttpConnectorTests` were NOT investigated in the fix session
-either (both use real `MockWebServer`/sockets, unrelated to
-`OutputStreamWriter`) and remain OPEN; this doc stays in `known-issues/`
-until those are triaged too.
 
 ## Summary table
 
 | Class | Uses MockWebServer? | Root cause | Status |
 |---|---|---|---|
-| `OutputStreamPublisherTests` | No (pure `Flow`+Reactor `StepVerifier`) | `closed()` test hung due to `OutputStreamWriter`/`StreamEncoder` real-field corruption (see below) | ✅ **FIXED** — 5/6 pass (`chunkSize()`'s pre-existing, unrelated `"bar"`-vs-`"b"` failure remains, not in scope) |
-| `SubscriberInputStreamTests` | No (pure `Flow`, no Reactor) | Same bug, reached via `SubscriberInputStreamTests.closed()`'s identical pattern | ✅ **FIXED** — 5/5 pass |
-| `JdkClientHttpRequestFactoryTests` | Yes (`AbstractMockWebServerTests`) | NOT investigated — does not use `OutputStreamWriter`; uses `SimpleAsyncTaskExecutor` (real `new Thread()` per task) | OPEN, separate investigation needed |
-| `reactive.ClientHttpConnectorTests` | Yes (`MockWebServer` field) | NOT investigated | OPEN, separate investigation needed |
+| `OutputStreamPublisherTests` | No (pure `Flow`+Reactor `StepVerifier`) | #1: `OutputStreamWriter`/`StreamEncoder` real-field corruption | ✅ **FIXED** — 5/6 pass (`chunkSize()`'s pre-existing, unrelated `"bar"`-vs-`"b"` failure remains, not in scope) |
+| `SubscriberInputStreamTests` | No (pure `Flow`, no Reactor) | #1: same bug, reached via `SubscriberInputStreamTests.closed()`'s identical pattern | ✅ **FIXED** — 5/5 pass |
+| `JdkClientHttpRequestFactoryTests` | Yes (`AbstractMockWebServerTests`) | #2: the native `java.net.http.HttpClient` shim's response reader read until EOF instead of stopping at declared framing, hanging on HTTP/1.1 keep-alive | ✅ **FIXED** — found=15 succ=11 fail=4 (4 residuals are a separate, newly-surfaced gzip/deflate bug, not in scope) |
+| `reactive.ClientHttpConnectorTests` | Yes (`MockWebServer` field) | #3: unknown — confirmed NOT the same as #1 or #2 (different code path entirely) | 🔴 **OPEN** — confirmed genuine hang (600s timeout, never produced a result), not merely slow |
 
-## Root cause #1 (FIXED 2026-07-07): `StreamEncoder` native shim hardcoded inherited `Writer` field slots
+## Root cause #1 (FIXED): `StreamEncoder` native shim hardcoded inherited `Writer` field slots
 
 ### The bug, precisely
 
@@ -134,33 +129,147 @@ are untouched.
   status=OK`.
 - `native-io` crate unit tests: unaffected, all pass.
 
-## Root cause #2/#3 (still NOT investigated): `JdkClientHttpRequestFactoryTests` / `reactive.ClientHttpConnectorTests`
+## Root cause #2 (FIXED 2026-07-07): `http_read_response` read until EOF instead of stopping at declared framing
 
-`JdkClientHttpRequestFactoryTests` and `reactive.ClientHttpConnectorTests`
-both use real `MockWebServer` (`AbstractMockWebServerTests` /
-`mockwebserver3.MockWebServer` field respectively) and do NOT use
-`OutputStreamWriter` anywhere in their exercised code paths (`grep` over
-`JdkClientHttpRequest.java` / `reactive/*.java` main sources found no
-matches). `JdkClientHttpRequestFactoryTests`'s underlying
-`JdkClientHttpRequest` DOES use the same `OutputStreamPublisher` class, but
-via `SimpleAsyncTaskExecutor` (Spring's own executor, which spawns a
-genuine real `new Thread()` per task — confirmed via
-`spring-core/.../SimpleAsyncTaskExecutor.java` source, "fires up a new
-Thread for each task") rather than `Executors.newSingleThreadExecutor()`,
-so the `ExecutorService.execute()` inline-execution bug fixed in the
-original session (see below) does not apply, and neither does the
-`OutputStreamWriter` field-corruption bug fixed above unless
-`JdkClientHttpRequestFactoryTests` itself calls a code path using
-`OutputStreamWriter` (not checked). **Next concrete step for these 2
-classes**: attach `gdb -p <pid> -batch -ex 'thread apply all bt'` to a live
-hung instance (`timeout 60 ./target/release/cratonvm --java-home
-/data/data/jdk25-real -cp "<spring-suite-runner-shared>:<testcp>" KRun
-org.springframework.http.client.JdkClientHttpRequestFactoryTests` /
-`...reactive.ClientHttpConnectorTests`, then `gdb` a still-running process)
-and read the resulting backtrace against MockWebServer/okio/real-socket
-code paths specifically — genuinely not done yet.
+### The bug, precisely
 
-## A separate, real, low-risk fix landed in the original session (does NOT fix root cause #1 or #2/#3)
+`JdkClientHttpRequestFactoryTests` never produced a result, even with a
+300-second timeout — every single request hung. `net_phase_e.rs` implements
+`java.net.http.HttpClient` as a fully-native synchronous HTTP client (the
+"re5" model, registered by `register_re5_http_client` — see
+[[jdk-httpclient-realjdk-model-and-serversocket-bind-bug]] for the earlier
+history of this same subsystem). Its `http_read_response` function read the
+response socket in a loop **until `read()` returned `Ok(0)` (EOF)**, and
+only *afterward* parsed the headers to find `Content-Length`/chunked framing
+and slice out the body.
+
+Confirmed via a live `strace -f -e trace=network,read` against a real hang:
+
+```
+sendto(4, "POST /status/ok HTTP/1.1\r\nHost: "..., 200, ...) = 200      # client sends request
+recvfrom(5, "POST /status/ok HTTP/1.1\r\nHost: "..., 8192, ...) = 200   # MockWebServer receives it (fd 5 = accepted conn)
+sendto(5, "HTTP/1.1 200 OK\r\nContent-Length:"..., 38, ...) = 38        # MockWebServer sends a COMPLETE response
+recvfrom(5, <unfinished ...>                                            # MockWebServer waits for the NEXT keep-alive request (correct)
+recvfrom(4, ...) = 38   # ...resumed: client received the exact 38-byte complete response
+recvfrom(4, <unfinished ...>                                            # client goes BACK to read() for more -- hangs
+```
+
+A real HTTP/1.1 peer is entitled to keep a connection open after sending a
+fully-framed response (keep-alive) — it does not send EOF just because it
+finished responding. The client already had the WHOLE response (a complete
+`Content-Length`-framed 38-byte message) after the first `recvfrom`, but
+`http_read_response` kept trying to read more anyway, blocking until (or
+past) the 30-second `SO_RCVTIMEO` set on the socket
+(`stream.set_read_timeout(Some(Duration::from_secs(30)))` in
+`http_exchange_plain`/`http_exchange_tls`) — which a 15-test class hits once
+per test, easily exceeding any reasonable overall timeout.
+
+### The fix
+
+Commit `60bf9de0` (branch `fix/http-phase-e-read-until-close-hang-0707`,
+merged to `dev` at `86f37f84`): rewrote `http_read_response` to read the
+header block first, then read the body only up to what the declared framing
+requires:
+- `Content-Length: N` → stop once `N` body bytes have arrived (or the peer
+  closes early — return whatever arrived, matching the old code's leniency
+  for a short response).
+- `Transfer-Encoding: chunked` → reuse the existing `http_decode_chunked`
+  (unchanged) in a retry-on-incomplete-error loop, mirroring the identical
+  pattern the server-side chunked-body reader already uses elsewhere in the
+  same file.
+- 1xx/204/304 → no body, full stop, regardless of framing headers (these are
+  common in HTTP client conformance tests and could otherwise hit the same
+  keep-alive hang).
+- Neither header present → still read until EOF (this is the one legitimate
+  case: RFC 7230 §3.3.3 requires the server to close the connection to
+  signal end-of-body when it declares no other framing).
+
+### Verification
+
+`JdkClientHttpRequestFactoryTests`: was an unconditional hang (0 results,
+ever — confirmed even at a 300s timeout), now `found=15 succ=11 fail=4
+ms=63080 status=FAIL`. The 4 residual failures are a **separate, newly
+surfaced** bug (only reachable now that the hang is gone): `compressionGzip`/
+`compressionDeflate` fail an assertion comparing the request body to the
+uncompressed original string, and the `[1]`/`[2]` compression-parameterized
+tests throw `IOException: ... Resource temporarily unavailable (os error
+11)` (EAGAIN). Not investigated — flag for a future session
+(`net_phase_e.rs`'s gzip/deflate request-body handling, or a
+non-blocking-socket EAGAIN not being retried somewhere in that path).
+
+## Root cause #3 (OPEN, NOT fixed): `reactive.ClientHttpConnectorTests` — confirmed genuine hang, distinct mechanism
+
+**Confirmed NOT the same as #1 or #2.** This class does not go through
+`net_phase_e`'s synchronous "re5" HTTP client at all — a live `gdb
+-batch -ex 'thread apply all bt'` capture during the hang shows a
+completely different shape:
+
+- **46 threads total**, most of them idle Netty-style NIO selector loops
+  (`cratonvm_native_io::nio_selector::selector_select` → `epoll_wait(...,
+  timeout=1000)`, over a dozen of them, each on its own epoll fd) — this is
+  a real Reactor Netty client+server running inside the same process, not
+  the raw-socket "re5" client.
+- The **`main-vm` thread is NOT blocked on any syscall** — it's actively
+  executing interpreted bytecode
+  (`execute_instruction`/`execute_frame`/`execute`), with an extremely deep
+  and repetitive call stack: `try_lambda_dispatch` →
+  `execute_invoke_kind` → `execute_frame` → `execute` →
+  `invoke_on_class_shared_inner` → `invoke_or_native`, nested well over 100
+  frames deep, interspersed with `native_al_for_each` / `native_stream_for_each`
+  / `native_opt_if_present` (`ArrayList.forEach`/`Stream.forEach`/
+  `Optional.ifPresent` natives) repeated many times.
+- Two successive `gdb` snapshots ~3s apart showed **new threads being
+  spawned** in between (LWP count grew), so the process is not fully frozen
+  — something is still happening — but a full run with a **600-second
+  timeout never produced a `RESULT` line** (confirmed twice: once at 300s
+  truncated by `timeout`, once at a full 600s with `nohup`/`disown` so it
+  wasn't killed by a parent shell exiting). This rules out "just needs a
+  longer timeout" — whatever's happening either never terminates or takes
+  dramatically longer than 10 minutes for what should be a fast in-process
+  loopback HTTP test class.
+
+**Working hypothesis (NOT verified — next session should confirm before
+acting on it):** the deep, repeated `try_lambda_dispatch`/`*_for_each` stack
+shape is consistent with either (a) a genuine livelock in how the
+interpreter dispatches a specific chained reactive combinator (e.g. a
+`Flux`/`Mono` operator chain that keeps re-entering itself instead of
+completing), or (b) severe interpreter overhead compounding across a
+deeply-chained reactive pipeline that is merely *very* slow, not stuck, and
+600s legitimately isn't enough for whatever this test class's full
+`@Test` set does end-to-end. The two are hard to distinguish from a stack
+snapshot alone.
+
+**Next concrete steps for a future session:**
+1. Isolate to a single `@Test` method (JUnit Platform's `selectMethod`, not
+   `selectClass` — `KRun` only supports class-level selection right now, so
+   this needs either a small `KRun` extension or a separate driver) to find
+   out whether ALL methods in this class hang, or just one/a few — the
+   original class-wide symptom conflates them.
+2. Take 3+ `gdb` snapshots of the `main-vm` thread specifically (find its
+   LWP via `ps -eLo pid,tid,comm | grep main-vm`, then
+   `sudo gdb -p <pid> -batch -ex 'thread apply all bt'` — attaching by raw
+   LWP number via `thread apply <tid> bt` does NOT work, gdb wants its own
+   internal thread numbering) a few seconds apart and diff the actual
+   instruction pointers/frame contents (not just frame count) to distinguish
+   "genuinely making progress, just slow" from "stuck re-executing the exact
+   same bytecode forever."
+3. `sudo -n gdb -p <pid> ...` was required on this host (plain `gdb -p`
+   without `sudo` fails with a `ptrace_scope`/`yama` permission error even
+   though the ssh user owns the process — the launched test process and the
+   `gdb` invocation are siblings under the same shell, not parent/child, so
+   Yama's restricted-ptrace mode blocks it; this user has passwordless
+   `sudo`).
+4. Since this is Reactor Netty (not the raw "re5" client), check whether
+   this is actually the SAME subsystem noted as still-open in
+   [[jdk-httpclient-realjdk-model-and-serversocket-bind-bug]]'s closing
+   note ("Next lever = the NIO SocketChannel/selector read/write path") —
+   that doc flagged `JettyClientHttpRequestFactoryTests`'s NIO
+   `SocketChannel`+selector path as a distinct, unfixed layer from the
+   blocking `java.net.Socket` path; `reactive.ClientHttpConnectorTests`
+   likely goes through the same NIO/selector machinery (Reactor Netty is
+   NIO-based), so that may be the same underlying gap, not a brand new one.
+
+## A separate, real, low-risk fix landed in the original session (does NOT fix root cause #1, #2, or #3)
 
 `native_es_execute` (`ExecutorService.execute(Runnable)`/
 `ThreadPoolExecutor.execute(Runnable)`, `native-builtins/src/lib.rs`) ran
@@ -179,10 +288,10 @@ completes).
 lives in `register_synthetic_overrides` (`native-builtins/src/lib.rs`,
 guarded by `#[cfg(feature = "synthetic-jdk")]` AND
 `config.use_synthetic_jdk`), which is never called in real-JDK mode
-(`--java-home`, the mode all 4 hangs are reported/reproduced in) — confirmed
+(`--java-home`, the mode all hangs are reported/reproduced in) — confirmed
 via `grep`-verified call-graph tracing AND empirically (a temporary debug
 eprintln in `native_es_execute`, reverted before commit, never fired during
-any of the 4 classes' hangs). It is kept as a genuine, real,
+any of the classes' hangs). It is kept as a genuine, real,
 independently-useful fix for synthetic-JDK-mode callers of
 `Executors.newSingleThreadExecutor()`/`newFixedThreadPool()`/
 `newCachedThreadPool()`, documented precisely as scoped-but-inert for this
@@ -193,13 +302,13 @@ doesn't, in real-JDK mode).
 ## Reproduction
 
 ```bash
-# Azure host, dev @ 963d59b3 or later (fix already merged)
+# Azure host, dev @ 86f37f84 or later (root causes #1 and #2 fixed)
 ssh -i ~/.ssh/azure.pem victor@<current-IP>
 cd /data/data/cratonvm   # or a fresh worktree off dev
 
 CP="$(cat /data/data/spring-framework-shared/spring-web/build/cratonvm-testcp.txt)"
 
-# Cheapest possible repro (no suite harness at all) — now passes:
+# Cheapest possible repro for root cause #1 (no suite harness at all) — now passes:
 cat > /tmp/WriterCloseTest.java <<'EOF'
 import java.io.*;
 public class WriterCloseTest {
@@ -221,17 +330,26 @@ EOF
 ./target/release/cratonvm --java-home /data/data/jdk25-real -cp /tmp WriterCloseTest
 # Expected (HotSpot) AND now CratonVM: "Got expected IOException: Stream closed"
 
-# Full-class repro (used to hang, now completes):
+# Root cause #1 class repros (used to hang, now complete):
 timeout 60 ./target/release/cratonvm --java-home /data/data/jdk25-real \
   -cp "/data/data/spring-suite-runner-shared:$CP" \
   KRun org.springframework.http.client.OutputStreamPublisherTests
 # RESULT found=6 succ=5 fail=1 (chunkSize, unrelated) ms=580 status=FAIL
 
-# Still OPEN — root causes #2/#3, unrelated to the above:
 timeout 60 ./target/release/cratonvm --java-home /data/data/jdk25-real \
+  -cp "/data/data/spring-suite-runner-shared:$CP" \
+  KRun org.springframework.http.client.SubscriberInputStreamTests
+# RESULT found=5 succ=5 fail=0 ms=495 status=OK
+
+# Root cause #2 class repro (used to hang unconditionally, now completes):
+timeout 120 ./target/release/cratonvm --java-home /data/data/jdk25-real \
   -cp "/data/data/spring-suite-runner-shared:$CP" \
   KRun org.springframework.http.client.JdkClientHttpRequestFactoryTests
-timeout 60 ./target/release/cratonvm --java-home /data/data/jdk25-real \
+# RESULT found=15 succ=11 fail=4 ms=63080 status=FAIL (4 residuals = separate gzip/deflate bug)
+
+# Root cause #3 — STILL a genuine hang, confirmed at 600s:
+timeout 600 ./target/release/cratonvm --java-home /data/data/jdk25-real \
   -cp "/data/data/spring-suite-runner-shared:$CP" \
   KRun org.springframework.http.client.reactive.ClientHttpConnectorTests
+# Never prints a RESULT line even at 600s. Attach gdb per "Next concrete steps" above.
 ```
