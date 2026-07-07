@@ -200,3 +200,76 @@ the unrelated minor IBM850/CP850 charset (`UnsupportedEncodingException: ibm850`
    never spilled). Needs precise oop maps / a shadow stack for parked JIT frames — conservative
    register pinning is counterproductive (see "REJECTED follow-up"). Tracked with the
    register-invisibility family (`SB-CRASH-04` / precise-jit-stack-maps).
+
+---
+
+## Closure — RESOLVED (2026-07-07, branch `fix/gc-blocked-thread-mirror-doc-20260707`)
+
+Re-verified on dev @ `c15cee62` (Azure Linux, real-JDK jdk25,
+`CRATONVM_REAL_NET_SOCKETS=1 CRATONVM_REAL_AQS=1`, shared host under load —
+wall-clock numbers are not comparable to a quiet box):
+
+- **The 6 originally hard-crashing classes are crash-free in BOTH jit and
+  nojit.** The three `TestDefaultServletEncoding*` parameterized suites ran
+  **4297 full Tomcat boot/serve/stop cases across 4 configs with ZERO
+  stale-pointer warnings and ZERO panics/SIGSEGVs** (both nojit suites
+  completed all 1360 cases; the jit runs hit the harness wall-clock cap
+  mid-suite on the loaded host, clean up to that point). The remaining
+  encoding-suite failures are functional, carry no GC signal, and are tracked
+  separately: `tomcat-defaultservlet-encoding-content-failures.md`.
+- `TestDataIntegrity` / `TestMulticastPackages` / `TestNonBlockingCoordinator`:
+  no crashes; `TestNonBlockingCoordinator`'s single failure reproduces
+  identically on HotSpot on this host (multicast-limited environment), and the
+  remaining tribes failures are message-throughput assertions (HotSpot passes
+  on raw speed; the interpreter doesn't hit the counts inside the tests'
+  3s/15s windows on a loaded shared box).
+- Thread-mirror machinery regression tests green (`thread_registry` 29/29
+  incl. `alive_thread_mirror_is_a_root`); `cratonvm-native-io` 330/330.
+
+### Additional fixes landed with this closure (proper-fix item 2 — the real-net blocking-native audit — executed)
+
+1. **`MulticastSocket.receive`/`send` overrides** (`native-io/src/net.rs`):
+   the blocking `udp_recv`/`udp_send` are now bracketted in the GC-blocking
+   protocol, with the packet pinned across the GC-capable `DatagramPacket`
+   accessor invokes and every held ref re-read after the region. Pre-fix,
+   every cross-thread STW GC stalled up to soTimeout per Tribes McastService
+   receiver — 44 `STW … still waiting for cooperative mutators` warnings per
+   `TestDataIntegrity` run, run timing out at 420s.
+2. **`Selector.select` native** (`native-io/src/nio_selector.rs`): the kernel
+   `epoll_wait` — indefinite for the translated `select(0)` — is now
+   bracketted, with the selector obj re-synced after the region. This was the
+   dominant STW-stall source: every NIO event loop (Tribes senders/receivers,
+   Tomcat Poller) held up every GC by up to its select timeout.
+3. **`populate_selected_keys_field`**: pins the selectedKeys `set` + pending
+   key objects across the GC-capable `Set.add` loop (observed residual: an
+   all-zero-header `java/util/Set` receiver + `Object.add` NSME under
+   `ParallelNioSender.doLoop`).
+4. **`DatagramChannel.receive0`/`send0`** (`native-io/src/datagram.rs`):
+   bracketted + held buffer/array refs re-synced via
+   `end_blocking_region_refs`.
+5. **`net_accept`**: the post-wake writes into the `newfd` FileDescriptor and
+   `isaa[0]` now use refs re-synced by `end_blocking_region_refs` — they were
+   written at their pre-GC addresses whenever a GC completed mid-accept.
+6. **`net_connect0`**: the up-to-30s dial is bracketted.
+
+**Measured effect** (`TestDataIntegrity --nojit`, same host, same commit):
+timeout at 420s with 20 stale-receiver warnings + 44 STW-stall warnings →
+**completes (~310s), 0 STW-stall warnings in every post-fix run** (jit and
+nojit). Stale-receiver warnings went 20 → 0-1 per nojit run: the single
+remaining event (≈1 per 2 runs) is a RECOVERED, non-fatal all-zero-header
+`MulticastSocket` receiver at `McastServiceImpl.receive:384` in a dying
+`Tribes-MembershipReceiver` thread during McastService recovery churn (this
+host has no working multicast, so recovery cycles constantly). It does not
+change any test outcome (the remaining failures are throughput assertions
+with or without it). If it ever escalates, start from the McastService
+recovery path: the old receiver thread dies with an uncaught exception while
+its frame still holds the recovery-replaced (heap-unreachable) socket.
+
+### Remaining OPEN relatives (tracked separately)
+
+- **Register-resident JIT oop remainder** (this doc's last open TODO):
+  `dohead-jit-heap-corruption-register-invisibility.md` +
+  `fork6-fjp-multithread-jit-root-reclamation.md` (the
+  precise-jit-stack-maps family).
+- **Cross-call raw-ObjectRef caching in native-io side tables** (found during
+  this closure, pre-existing): `nio-native-side-table-stale-objectref.md`.
