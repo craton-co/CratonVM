@@ -1248,6 +1248,19 @@ fn pe_segment_set_impl(
 // SymbolLookup synthetic: [0]=lib_index (Long — index into SharedVm.native_libraries), [1]=name
 
 fn register_pe_symbol_lookup(r: &mut NativeMethodRegistry) {
+    // Promote to `Bridge`: this function runs under whatever category was
+    // ambient at the `register_pe_panama` call site, which defaults to
+    // `SyntheticStub` (dropped entirely under strict-no-stubs / real-JDK
+    // mode). These natives are real supporting glue for the Panama FFI
+    // downcall path (real library loading via `ctx.load_native_library`,
+    // real `Optional`/`Optional.empty()` wrapping) — not a placeholder — and
+    // must survive that filtering so `phases_late.rs`'s `Linker.defaultLookup`
+    // et al. (which allocate 0-field `SymbolLookup` objects) still resolve
+    // `.find()` sanely via this implementation's `_ => -1` "unknown lookup"
+    // fallback instead of a former duplicate stub here always returning a
+    // bare Java `null`. See the `find`/`libraryLookup` doc comments below.
+    let __prev_cat = r.current_category();
+    r.set_category(cratonvm_native_api::NativeKind::Bridge);
     let sl = "java/lang/foreign/SymbolLookup";
 
     // libraryLookup(path, arena) → SymbolLookup
@@ -1319,6 +1332,7 @@ fn register_pe_symbol_lookup(r: &mut NativeMethodRegistry) {
             }
         },
     );
+    r.set_category(__prev_cat);
 }
 
 // --- RawNativeLibraries: the real-JDK FFM native-library load path ---

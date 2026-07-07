@@ -38533,32 +38533,32 @@ pub(crate) fn register_p67_foreign_memory(r: &mut NativeMethodRegistry) {
         },
     );
 
-    // SymbolLookup
-    let sl = "java/lang/foreign/SymbolLookup";
-    r.register(
-        sl,
-        "loaderLookup",
-        "()Ljava/lang/foreign/SymbolLookup;",
-        |ctx, _args| {
-            let obj = alloc_concurrent_synthetic(ctx, "java/lang/foreign/SymbolLookup", 0);
-            Ok(Some(Value::Object(Some(obj))))
-        },
-    );
-    r.register(
-        sl,
-        "libraryLookup",
-        "(Ljava/lang/String;Ljava/lang/foreign/Arena;)Ljava/lang/foreign/SymbolLookup;",
-        |ctx, _args| {
-            let obj = alloc_concurrent_synthetic(ctx, "java/lang/foreign/SymbolLookup", 0);
-            Ok(Some(Value::Object(Some(obj))))
-        },
-    );
-    r.register(
-        sl,
-        "find",
-        "(Ljava/lang/String;)Ljava/util/Optional;",
-        |_ctx, _args| Ok(Some(Value::Object(None))),
-    );
+    // SymbolLookup — `loaderLookup`/`libraryLookup`/`find` are registered by
+    // `panama::register_pe_symbol_lookup` (promoted to `Bridge` category
+    // there specifically so it survives strict-no-stubs dropping). That
+    // implementation actually attempts a real library load via
+    // `ctx.load_native_library` and wraps results in a genuine
+    // `Optional`/`Optional.empty()` rather than a bare Java `null`.
+    //
+    // A duplicate, unconditionally-"successful" stub trio used to live here
+    // too (`libraryLookup` always allocating a fake lookup regardless of
+    // whether any library was found, `find` always returning raw `null`).
+    // Because this function runs under the always-on `Bridge` category while
+    // `register_pe_symbol_lookup` ran under the default `SyntheticStub`
+    // category (silently dropped under strict-no-stubs), THIS stub trio was
+    // the one actually winning the `(class, method, descriptor)` registry
+    // key — see `native_method_hash`/`self.methods.insert` last-registration-
+    // wins semantics. Real JDK bytecode composes lookups via
+    // `SymbolLookup.or()`, whose generated lambda does
+    // `this.find(name).or(() -> other.find(name))` — a bare `null` receiver
+    // there throws `NullPointerException: Cannot invoke
+    // "java.util.Optional.or(java.util.function.Supplier)"` instead of
+    // letting the composed lookup gracefully report "symbol not found".
+    // Tomcat's `openssl_h` (jextract FFM bindings) hits exactly this in its
+    // `<clinit>` when OpenSSL isn't installed, on a path Linux exercises
+    // identically but this stub trio's placement made real bytecode's own
+    // `.or()` compose over a lie ("yes, a library IS loaded") instead of a
+    // clean unavailable signal.
     r.set_category(__prev_cat);
 }
 
