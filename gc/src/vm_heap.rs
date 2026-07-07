@@ -1361,7 +1361,19 @@ impl VmHeap {
             // cycle (see `GenerationalHeap::is_old_gen_addr`). Returning `false`
             // here unconditionally — the prior behavior — cleared every weak
             // reference to a promoted object on the next young GC.
-            VmHeap::Generational(h) => h.is_old_gen_addr(addr),
+            //
+            // Young-GC live-reclaim ROOT FIX (2026-07-07): also recognize
+            // kept-in-place young survivors of the NON-MOVING sweep (which
+            // produces no pointer_map entries), or reference processing
+            // judges every live young Reference object/referent dead —
+            // skipping the post-GC referent restore and pruning live
+            // processor entries (the RRWL hold-count IMSE/hang family). See
+            // `GenerationalHeap::is_live_young_survivor` for the soundness
+            // argument (STW-window-only, zeroed-span discriminator,
+            // moving-collection compatibility).
+            VmHeap::Generational(h) => {
+                h.is_old_gen_addr(addr) || h.is_live_young_survivor(addr)
+            }
             VmHeap::G1(h) => h.is_addr_in_live_region(addr),
         }
     }

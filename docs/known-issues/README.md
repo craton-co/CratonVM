@@ -18,6 +18,11 @@ angles**; this index is the consolidated map. Read it first.
 
 All three verified against their real Keycloak classes via the suite runner; no regressions in the touched crates' test suites.
 
+## 2026-07-07 Hibernate local Windows rerun — progress check + new SQL-placeholder bug
+
+- [hib-local-windows-rerun-20260707.md](hib-local-windows-rerun-20260707.md) — 4-shard local rerun of the 121-class non-passed list confirms 15 real fixes (bytecode-enhancement/lazytoone progress, generic-timeout-wall classes now passing) landed on `dev` since the 2026-07-05 Azure baseline; documents 3 findings that evolved to different symptoms (`JpaLargeBlobTest`, `InPredicateTest`, the temporal 1-hour-skew doc now superseded); flags a harness status-computation false-positive.
+- ✅ FIXED same day: the SQL-placeholder duplication that rerun re-confirmed (plus 2 more affected classes outside `type.temporal.*` — `ExtendedEnhancementNonStandardAccessTest`, `FunctionTests`, proving it a general SQL-generation-path defect) was the reopened JIT reason-8 imprecise-resume corruption; see [`docs/internal/hib-temporal-sql-parameter-placeholder-duplication-FIXED.md`](../internal/hib-temporal-sql-parameter-placeholder-duplication-FIXED.md) and the identity-sound precise-resume entry below.
+
 ## 2026-07-07 ES binary-docvalues range doc retired; residual re-diagnosed as young-GC live-object reclamation (NEW open doc)
 
 - [gen-heap-young-gc-live-object-reclaim-rrwl-holdcount.md](gen-heap-young-gc-live-object-reclaim-rrwl-holdcount.md) —
@@ -38,6 +43,29 @@ All three verified against their real Keycloak classes via the suite runner; no 
   root causes (invokedynamic JIT blacklist, AQS skip-list gaps ×2 rounds, plain-field 16-byte slot
   tearing) are all FIXED+merged, end-to-end verified on the Windows box (deterministic silent stall
   → bimodal fast-IMSE/stall, both faces now attributed to the new GC doc above).
+## 2026-07-07 JIT invokedynamic uncommon-trap Groovy regression — FIXED (no tradeoff)
+
+- ✅ FIXED: `fb4a333d`'s precise-resume routing for the invokedynamic
+  uncommon trap (reason 8 / `UnreachedCode`) regressed
+  `GroovyBeanDefinitionReaderTests` under JIT-on. An earlier pass shipped a
+  blanket revert (reopening the exact silent-corruption risk `fb4a333d` had
+  fixed) as a stopgap — rejected as a final answer. Follow-up investigation
+  recovered `fb4a333d`'s own uncommitted standalone repros and found the REAL
+  root causes: (1) `getstatic` codegen never marked a reference-typed static
+  field as a GC/deopt oop (unlike `getfield`'s already-fixed inline arms),
+  corrupting `LicmRepro`/`LicmRepro2`/`ArrRepro`; (2) the invokedynamic-trap
+  snapshot mis-stamped its `DeoptReason` as `OsrExit` instead of
+  `UnreachedCode`, so the trap was never blacklisted after firing; (3) three
+  separate VM-side call sites consumed a stashed deopt frame without ever
+  driving de-speculation, so a blacklisted method kept getting re-entered
+  anyway. All four fixed; reason 8 keeps `fb4a333d`'s original unconditional
+  precise-resume routing. Verified: the corruption-repro suite is now
+  provably correct against HotSpot ground truth where it previously
+  crashed; Groovy matches the pre-existing (already-merged) baseline exactly
+  (30/36 isolated, 5/36 batch — both pre-existing numbers, unaffected either
+  way); `cargo test -p cratonvm-jit --lib` unchanged (878 passed, 4
+  pre-existing aarch64 failures). Doc moved to
+  [`docs/internal/jit-invokedynamic-uncommon-trap-precise-resume-groovy-regression-FIXED.md`](../internal/jit-invokedynamic-uncommon-trap-precise-resume-groovy-regression-FIXED.md).
 
 ## 2026-07-07 GC_STRESS residual corruption re-assessed (still OPEN, two hypotheses refuted)
 
@@ -95,11 +123,20 @@ All three verified against their real Keycloak classes via the suite runner; no 
 
 ## 2026-07-07 Hibernate temporal: GC crash family extinct → new SQL-placeholder bug surfaced
 
-- [hib-temporal-sql-parameter-placeholder-duplication.md](hib-temporal-sql-parameter-placeholder-duplication.md) —
-  🔴 OPEN, untriaged. Validating the archived GC stale-local doc (item 19 below) showed the 5
-  `type.temporal.*` classes are now crash-free (0 corruption markers) but fail en masse on
-  DUPLICATED JDBC `?` placeholders in generated INSERTs (`values (??,???)`, growing per
-  statement) — a string-building defect, not GC.
+- ✅ FIXED (branch `fix/hib-temporal-placeholder-dup-20260707`, 2026-07-07): the 5
+  `type.temporal.*` classes' DUPLICATED JDBC `?` placeholders (`values (??,???)`) were NOT a
+  string-building defect — they were the reopened JIT invokedynamic uncommon-trap
+  imprecise-resume corruption (the `5ceb880f` revert of `fb4a333d`) re-executing
+  JIT-committed `sqlBuffer` appends. Fixed by identity-sound precise resume for the reason-8
+  trap (method-key-baked deopt snapshots + identity-checked consumers + dispatch-helper
+  in-place callee resolution + direct-call/MIC/PIC publication gates), which closes BOTH this
+  corruption AND the Groovy regression that had forced the revert. Doc retired to
+  [`docs/internal/hib-temporal-sql-parameter-placeholder-duplication-FIXED.md`](../internal/hib-temporal-sql-parameter-placeholder-duplication-FIXED.md);
+  the reason-8 saga's remaining follow-ups stay tracked in
+  [jit-invokedynamic-uncommon-trap-precise-resume-groovy-regression-FIXED.md](../internal/jit-invokedynamic-uncommon-trap-precise-resume-groovy-regression-FIXED.md);
+  two unmasked PRE-EXISTING temporal residuals (37× `DdlTypeImpl.getRawTypeName` NPE in
+  InstantTests, 2× empty `IllegalThreadStateException`) are tracked in
+  [hib-temporal-residuals-typename-npe-illegalthreadstate.md](hib-temporal-residuals-typename-npe-illegalthreadstate.md).
 
 ## 2026-07-06/07 http.client class_manager RwLock recursive-read deadlock — FIXED (branch fix/class-manager-writer-starvation-20260706)
 

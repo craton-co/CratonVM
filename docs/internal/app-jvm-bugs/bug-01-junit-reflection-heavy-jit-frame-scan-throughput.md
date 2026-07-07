@@ -8,6 +8,25 @@ metadata:
 
 # BUG-01 — "JUnit discovery hangs on reflection-heavy test classes" — REAL cause: precise-JIT-maps codegen overhead
 
+> **⏫ SUPERSEDED 2026-07-07 — precise JIT oop maps re-flipped to DEFAULT-ON; this
+> throughput regression is GONE.** The ~6× tax was measured on the doc's era build.
+> On current dev (~600 commits later) it no longer reproduces: intervening JIT
+> improvements (notably more inlining → far fewer real call safepoints in the hot
+> reflection/framework methods) cut the precise per-safepoint cost to noise.
+> Re-measured on the Linux spring-core suite with a default-on build:
+> `ObjectUtilsTests`/`ClassUtilsTests` are the same wall time precise-on vs -off even
+> at `JIT_THRESHOLD=50`; a 40-class spring-util reflection batch is **69.46 s
+> default-on vs 69.33 s with `CRATONVM_NO_PRECISE_JIT_MAPS=1`** (noise) with
+> **identical pass counts (1059/1061)**. GC-root coverage restored by default and
+> verified: all A-family repros (`binarytrees`/`VAAload`/`VArgLen`/`VStatic`
+> `14 @GC_STRESS=4096`) → `3222190` clean; the Fork6 GC_STRESS outcome A/B
+> (interleaved, load-controlled, 25 each) is **23/25 ALL-OK on vs 22/25 off** —
+> equivalent. So the "accepted trade-off" below (losing A2/A3/A4 register-root
+> coverage for throughput) is no longer necessary and has been reversed:
+> `precise_jit_maps_enabled()` is default-on, opt out with
+> `CRATONVM_NO_PRECISE_JIT_MAPS=1`. The original analysis below is retained as history.
+
+
 **Severity:** High (suite-wide; every reflection/call-heavy JUnit test class overshoots
 the 120 s default watchdog and is reported as a hang).
 

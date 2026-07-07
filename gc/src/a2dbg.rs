@@ -118,3 +118,29 @@ pub fn lookup_at(target: usize) -> Option<Rec> {
     let l = LOG.lock().ok()?;
     l.iter().rev().find(|r| r.addr == target).copied()
 }
+
+/// Full recorded event history touching `target` (exact-start allocs, the
+/// sweep's free sentinels at that address, and any allocation whose span
+/// covers it), oldest first, capped at the last `max` events. The lifecycle
+/// SEQUENCE is the discriminator the single most-recent record cannot give:
+/// `alloc(Entry) → free → alloc(other)` at one address proves the span was
+/// reclaimed and reissued while the Entry was still referenced, while
+/// `alloc(Entry)` alone followed by a zeroed header proves in-place
+/// clobbering, and an empty history means the address was never
+/// header-written (or the ring wrapped).
+pub fn history_at(target: usize, max: usize) -> Vec<Rec> {
+    let Ok(l) = LOG.lock() else {
+        return Vec::new();
+    };
+    let mut hits: Vec<Rec> = l
+        .iter()
+        .filter(|r| {
+            r.addr == target || (r.size > 0 && r.addr <= target && target < r.addr + r.size)
+        })
+        .copied()
+        .collect();
+    if hits.len() > max {
+        hits.drain(..hits.len() - max);
+    }
+    hits
+}

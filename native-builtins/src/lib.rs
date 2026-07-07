@@ -17915,6 +17915,14 @@ pub fn register_essential_natives(registry: &mut NativeMethodRegistry) {
     // which then disagrees with the stream's `serialVersionUID`
     // (`InvalidClassException: local class incompatible`) even though the
     // written and read objects are logically the same class.
+    //
+    // Gated on the SAME cfg as `pub mod serialization` (line ~1163) — without
+    // this, a bare `cargo test -p cratonvm-native-builtins --lib` (default
+    // features only; nothing activates `experimental-serialization`, which
+    // every real workspace build gets via the vm crate's defaults) failed to
+    // compile with E0433 on `crate::serialization::…`. All shipping feature
+    // combinations are unaffected (module present ⇔ registration present).
+    #[cfg(any(feature = "experimental-serialization", feature = "synthetic-jdk"))]
     registry.register(
         "jdk/internal/misc/VM",
         "latestUserDefinedLoader0",
@@ -19858,7 +19866,73 @@ pub fn register_essential_natives(registry: &mut NativeMethodRegistry) {
         Some(format!("GMT{}{:02}:{:02}", sign, hours, num))
     }
 
+    /// DST rule for a zone id, as the trailing 11 int args of
+    /// `java.util.SimpleTimeZone`'s full constructor:
+    /// `(startMonth, startDay, startDayOfWeek, startTime, startTimeMode,
+    ///   endMonth, endDay, endDayOfWeek, endTime, endTimeMode, dstSavings)`.
+    /// Month/day-of-week values are `java.util.Calendar` constants
+    /// (JANUARY=0..; SUNDAY=1); `day = -1` means "last <dayOfWeek> of month";
+    /// time-mode 0 = WALL_TIME, 2 = UTC_TIME. Only zones whose CURRENT
+    /// (2018+) recurring rule SimpleTimeZone can express exactly are listed —
+    /// the rest keep the standard-offset-year-round approximation (the
+    /// HIB-CV-34 known limitation). Historical rule changes are NOT modeled.
+    fn tz_dst_rule(zone_id: &str) -> Option<[i32; 11]> {
+        const SUNDAY: i32 = 1;
+        const MARCH: i32 = 2;
+        const APRIL: i32 = 3;
+        const SEPTEMBER: i32 = 8;
+        const OCTOBER: i32 = 9;
+        const WALL_TIME: i32 = 0;
+        const UTC_TIME: i32 = 2;
+        const HOUR: i32 = 3_600_000;
+        match zone_id {
+            // EU rule: DST from last Sunday of March 01:00 UTC to last Sunday
+            // of October 01:00 UTC, +1h. Applies to the whole CET family and
+            // (with a 0 standard offset) Europe/London.
+            "Europe/Paris" | "Europe/Berlin" | "Europe/Rome" | "Europe/Madrid"
+            | "Europe/Oslo" | "Europe/Amsterdam" | "Europe/Brussels" | "Europe/Vienna"
+            | "Europe/Copenhagen" | "Europe/Stockholm" | "Europe/Zurich" | "Europe/Warsaw"
+            | "Europe/Prague" | "Europe/Budapest" | "Europe/London" | "GB"
+            | "Europe/Athens" | "Europe/Bucharest" | "Europe/Helsinki" => Some([
+                MARCH, -1, SUNDAY, HOUR, UTC_TIME, OCTOBER, -1, SUNDAY, HOUR, UTC_TIME, HOUR,
+            ]),
+            // New Zealand rule: DST from last Sunday of September 02:00 wall
+            // to first Sunday of April 03:00 wall (02:00 standard), +1h.
+            "Pacific/Auckland" | "NZ" => Some([
+                SEPTEMBER, -1, SUNDAY, 2 * HOUR, WALL_TIME, APRIL, 1, SUNDAY, 3 * HOUR,
+                WALL_TIME, HOUR,
+            ]),
+            _ => None,
+        }
+    }
+
     fn alloc_synth_timezone(ctx: &mut dyn NativeContext, id_str: &str) -> cratonvm_types::Value {
+        // DST-aware path (hib-temporal DST-boundary skew): for a zone whose
+        // current recurring DST rule is known (`tz_dst_rule`), construct a
+        // real `java.util.SimpleTimeZone` through its full constructor — its
+        // real bytecode implements `getOffset(long)`/`inDaylightTime`
+        // correctly for both halves of the year, where the transitions-less
+        // synthetic ZoneInfo below returns the standard (winter) offset
+        // year-round (the HIB-CV-34 known limitation; visible as the
+        // `LocalDateTimeTest` "expected 2018-10-28T01:00 but was
+        // 2018-10-28T00:00" 1-hour skew on any DST-period date). Any failure
+        // falls through to the legacy ZoneInfo path — never worse.
+        if let (Some(std_secs), Some(rule)) =
+            (tz_standard_offset_seconds(id_str), tz_dst_rule(id_str))
+        {
+            let id_obj = ctx.create_string(id_str);
+            let mut args: Vec<Value> = Vec::with_capacity(13);
+            args.push(Value::Int(std_secs.saturating_mul(1000)));
+            args.push(Value::Object(Some(id_obj)));
+            args.extend(rule.iter().map(|&v| Value::Int(v)));
+            if let Ok(Some(Value::Object(Some(obj)))) = ctx.new_object_initialized(
+                "java/util/SimpleTimeZone",
+                "(ILjava/lang/String;IIIIIIIIIII)V",
+                &args,
+            ) {
+                return cratonvm_types::Value::Object(Some(obj));
+            }
+        }
         // Prefer sun/util/calendar/ZoneInfo (concrete subclass of TimeZone).
         // Fall back to allocating with class-id 0 if init fails — the
         // caller only needs an object whose `getID()` returns id_str.

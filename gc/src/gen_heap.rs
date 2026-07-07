@@ -1755,6 +1755,31 @@ impl GenerationalHeap {
                     std::backtrace::Backtrace::force_capture()
                 );
                 }
+                // A2 forensic breadcrumb (CRATONVM_DBG_A2): an OOB read on a
+                // ClassId(0)/num_slots=0 receiver is the "zeroed live object"
+                // face — dump the address's recorded alloc/free lifecycle so
+                // the zeroing event is attributable (in-place clobber vs
+                // reclaim-and-reuse vs never-allocated).
+                if crate::a2dbg::enabled() && header.class_id.as_u32() == 0 {
+                    let victim = obj_ref.as_ptr() as usize;
+                    let hist = crate::a2dbg::history_at(victim, 12);
+                    if hist.is_empty() {
+                        eprintln!("[oob-field]   [A2] NO event touches {victim:#x}");
+                    } else {
+                        for r in hist {
+                            if r.kind == 0xFF {
+                                eprintln!("[oob-field]   [A2] seq={} FREE @{:#x}", r.seq, r.addr);
+                            } else {
+                                eprintln!(
+                                    "[oob-field]   [A2] seq={} ALLOC @{:#x} class_id={} kind={} et={} alen={} ns={} size={}{}",
+                                    r.seq, r.addr, r.class_id, r.kind, r.element_type,
+                                    r.array_length, r.num_slots, r.size,
+                                    if r.addr != victim { " (covering)" } else { "" },
+                                );
+                            }
+                        }
+                    }
+                }
             } // end rate-limited OOB-read diagnostics
             return Value::Object(None);
         }
@@ -2506,6 +2531,48 @@ impl GenerationalHeap {
     /// so `ResourceBundle.getBundle(.., null, ..)` threw `MissingResourceException`.
     pub fn is_old_gen_addr(&self, addr: usize) -> bool {
         self.old_gen.lock().contains(addr as *const u8)
+    }
+
+    /// True when `addr` is the start of a young from-space object that
+    /// SURVIVED the collection that just ran (young-GC live-reclaim ROOT FIX,
+    /// 2026-07-07 — RRWL/ThreadLocalMap$Entry IMSE/hang family).
+    ///
+    /// The NON-MOVING young sweep keeps survivors in place with NO
+    /// `pointer_map` entry, so post-GC reference processing's survivor
+    /// predicate (`pointer_map.contains_key(addr) || is_addr_live(addr)`)
+    /// judged every live young Reference object and referent dead: nulled
+    /// referents were never restored and live processor entries were pruned.
+    /// The watched-referent identity-map mechanism covers survivors the
+    /// sweep's disposition walk actually visits, but a desync-retained
+    /// stretch (walk re-anchor) leaves its survivors without entries — this
+    /// predicate closes that gap at the consumer side.
+    ///
+    /// Discriminator: the sweep ZEROES every span it reclaims before
+    /// publishing it to the free list, so inside the current from-space
+    /// "first header word non-zero" == "not reclaimed by the sweep that just
+    /// ran". This is only sound where it is used — between `collect_garbage`
+    /// returning and mutators resuming (the same STW window in which
+    /// `process_references_after_gc` runs), when no allocation can have
+    /// reused a reclaimed hole yet. After a MOVING collection, pre-GC
+    /// addresses lie in the *other* semispace (survivors were evacuated and
+    /// the arenas swapped), so this returns false for them and the
+    /// pointer-map half of the predicate remains authoritative, exactly as
+    /// before. A dead-but-retained object in a desync-skipped stretch reads
+    /// as "live" for one cycle — pure over-retention, the sweep's documented
+    /// safe direction.
+    pub fn is_live_young_survivor(&self, addr: usize) -> bool {
+        if addr & 0x7 != 0 {
+            return false;
+        }
+        let from = self.young_from.lock();
+        let base = from.base_ptr() as usize;
+        if addr < base || addr >= base + from.used() {
+            return false;
+        }
+        // SAFETY: bounds-checked 8-aligned address inside the mapped
+        // from-space region; reading one u64 is valid.
+        let word0 = unsafe { std::ptr::read(addr as *const u64) };
+        word0 != 0
     }
 
     /// Access the old generation directly (for concurrent sweep).
@@ -4117,6 +4184,19 @@ impl GenerationalHeap {
                     || (!is_array && header.num_slots > (1 << 24))
                     || (is_array && header.array_length > i32::MAX as u32)
                 {
+                    // DBG (CRATONVM_DBG_SWEEP_CENSUS): a candidate whose header
+                    // is IMPLAUSIBLE gets dropped from marking entirely — if it
+                    // was actually a live object with a scarred header, the
+                    // sweep will reclaim it. Surface the drop (bounded).
+                    if std::env::var_os("CRATONVM_DBG_SWEEP_CENSUS").is_some() {
+                        let n = SWEEP_BAD_EXTENT_HITS.load(Ordering::Relaxed);
+                        if n < 12 {
+                            eprintln!(
+                                "[mark-reject] candidate {ptr:p} kind=0x{kind_byte:02x} ns={} alen={} cid={:#x} — dropped from marking (shape)",
+                                header.num_slots, header.array_length, header.class_id.as_u32(),
+                            );
+                        }
+                    }
                     return;
                 }
                 // DoHead comb-7 fix (2026-07-03): also validate the object's
@@ -4263,6 +4343,26 @@ impl GenerationalHeap {
         // Seed: finalizable objects — keep them alive so finalize() runs.
         for &addr in finalizer_addrs {
             mark_young(addr as *mut u8, &mut worklist, &mut side_marks);
+        }
+
+        // DIAG/EXPERIMENT (CRATONVM_SWEEP_FULL_OLD_SCAN): seed old→young edges
+        // by walking EVERY old-gen object's reference slots instead of trusting
+        // the dirty-card table. If a workload that corrupts under the card seed
+        // runs clean under the full scan, an old→young edge is provably being
+        // lost by the card path (barrier miss, drain loss, or scan consumption)
+        // — the young-GC live-object-reclaim investigation's discriminator.
+        let full_old_scan = std::env::var_os("CRATONVM_SWEEP_FULL_OLD_SCAN").is_some();
+        if full_old_scan {
+            for (optr, _sz) in old_gen.walk_objects() {
+                // SAFETY: `walk_objects` yields valid live old-gen object starts.
+                let oh = unsafe { &*(optr as *const ObjectHeader) };
+                // SAFETY: `optr`/`oh` form a valid live object.
+                unsafe {
+                    for_each_ref_slot(optr, oh, |raw, _slot| {
+                        mark_young(raw, &mut worklist, &mut side_marks);
+                    });
+                }
+            }
         }
 
         // Seed: old→young references from dirty cards. Reuse the existing
@@ -5849,6 +5949,112 @@ impl GenerationalHeap {
             bytes_swept += sz;
             objects_swept += 1;
             young_from.add_free_block(off, sz);
+        }
+
+        // DBG (CRATONVM_DBG_SWEEP_CENSUS): per-cycle census of what this sweep
+        // reclaimed, by class. A continuously-live workload class (e.g. the
+        // RRWL probe's ThreadLocalMap$Entry / HoldCounter chain) showing up
+        // here names the wrongly-swept set directly at reclamation time —
+        // no use-time face (zero-header receiver / OOB read) required.
+        if std::env::var_os("CRATONVM_DBG_SWEEP_CENSUS").is_some() && !dead_regions.is_empty() {
+            let mut counts: std::collections::HashMap<u32, (usize, usize)> =
+                std::collections::HashMap::new();
+            for &(off, sz, class_id, _kind) in &dead_regions {
+                let e = counts.entry(class_id).or_insert((0, from_base + off));
+                e.0 += 1;
+                let _ = sz;
+            }
+            let mut v: Vec<(u32, usize, usize)> =
+                counts.into_iter().map(|(c, (n, a))| (c, n, a)).collect();
+            v.sort_by(|a, b| b.1.cmp(&a.1));
+            let mut line = format!(
+                "[sweep-census] cycle={} swept={} classes={}:",
+                sweep_zero_cycle,
+                dead_regions.len(),
+                v.len()
+            );
+            for (cid, n, first_addr) in v.iter().take(14) {
+                let name = crate::gc::resolve_class_info(*cid)
+                    .map(|(n, _)| n)
+                    .unwrap_or_else(|| format!("cid{cid:#x}"));
+                line.push_str(&format!(" {name}x{n}@{first_addr:#x}"));
+            }
+            eprintln!("{line}");
+
+            // Holder scan: for each swept victim, brute-scan young from-space
+            // and old gen for any aligned 8-byte word holding the victim's
+            // address, plus any legacy 16-byte Value cell whose payload is the
+            // victim. The mark said "unreachable"; if a live holder still
+            // points at the victim, this names the EXACT edge the mark missed
+            // — the decisive datum for the live-reclaim investigation.
+            for &(doff, _dsz, dcid, _dk) in dead_regions.iter().take(6) {
+                let victim = from_base + doff;
+                let vname = crate::gc::resolve_class_info(dcid)
+                    .map(|(n, _)| n)
+                    .unwrap_or_else(|| format!("cid{dcid:#x}"));
+                let mut holders = 0usize;
+                // Young from-space scan (skip the victim's own span).
+                let mut w = from_base;
+                let from_hi = from_base + young_from.used();
+                while w + 8 <= from_hi {
+                    // SAFETY: `[from_base, from_hi)` is mapped arena memory, w is 8-aligned.
+                    let word = unsafe { *(w as *const u64) } as usize;
+                    if word == victim && !(w >= victim && w < victim + _dsz) {
+                        holders += 1;
+                        if holders <= 4 {
+                            eprintln!(
+                                "[sweep-census]   victim {vname}@{victim:#x}: young holder word @{w:#x} (holder_off={:#x})",
+                                w - from_base,
+                            );
+                        }
+                    }
+                    w += 8;
+                }
+                // Old-gen scan via object walk (bounded per object by its size).
+                for (optr, osz) in old_gen.walk_objects() {
+                    let lo = optr as usize;
+                    let mut w = lo + HEADER_SIZE;
+                    let hi = lo + osz;
+                    while w + 8 <= hi {
+                        // SAFETY: `[lo, hi)` is a live old-gen object's span.
+                        let word = unsafe { *(w as *const u64) } as usize;
+                        if word == victim {
+                            holders += 1;
+                            if holders <= 8 {
+                                // SAFETY: `optr` is a live old-gen object header.
+                                let ocid =
+                                    unsafe { (*(optr as *const ObjectHeader)).class_id.as_u32() };
+                                let oname = crate::gc::resolve_class_info(ocid)
+                                    .map(|(n, _)| n)
+                                    .unwrap_or_else(|| format!("cid{ocid:#x}"));
+                                eprintln!(
+                                    "[sweep-census]   victim {vname}@{victim:#x}: OLD holder {oname}@{lo:#x}+{:#x}",
+                                    w - lo,
+                                );
+                            }
+                        }
+                        w += 8;
+                    }
+                }
+                // Was the victim in the ROOT SET (incl. every thread's folded
+                // snapshot)? A root-listed victim that still got swept means
+                // `mark_young` dropped it (validator/walk bug); an unlisted
+                // one means the upstream root/snapshot coverage missed it.
+                let in_roots = roots.iter().any(|r| r.as_ptr() as usize == victim);
+                if holders == 0 && !in_roots {
+                    eprintln!(
+                        "[sweep-census]   victim {vname}@{victim:#x}: NO heap holder, NOT in roots — register/native-side ref only, or truly dead",
+                    );
+                } else if in_roots {
+                    eprintln!(
+                        "[sweep-census]   victim {vname}@{victim:#x}: WAS IN ROOTS ({holders} heap holder(s)) — mark_young dropped a live root!",
+                    );
+                } else {
+                    eprintln!(
+                        "[sweep-census]   victim {vname}@{victim:#x}: {holders} heap holder(s) — MARK MISSED A HEAP EDGE",
+                    );
+                }
+            }
         }
 
         // Coalesce adjacent free blocks into maximal spans. Selective promotion

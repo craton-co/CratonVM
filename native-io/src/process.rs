@@ -1302,6 +1302,89 @@ fn native_process_destroy_forcibly(
     Ok(Some(Value::Object(Some(this))))
 }
 
+/// `java.lang.Process.toHandle()Ljava/lang/ProcessHandle;` (JDK 9+).
+///
+/// Was entirely unregistered here, so any CratonVM-backed `Process` (real
+/// or synthetic-JDK mode alike, since `spawn_and_wrap` always allocates the
+/// object under `SYNTHETIC_PROCESS_CLASS`/`java/lang/Process` regardless of
+/// mode) threw `NoSuchMethodError` on `.toHandle()`
+/// (docs/known-issues/wildfly-process-tohandle-missing.md).
+///
+/// Builds a REAL `java.lang.ProcessHandleImpl(pid, startTime)` rather than
+/// a bare 1-field synthetic `java/lang/ProcessHandle` — an interface, whose
+/// abstract `pid()` has no Code attribute, so dispatching a virtual call on
+/// an object allocated directly under the interface's own (real, loadable)
+/// class id throws AbstractMethodError instead of falling back to the
+/// native registry (confirmed empirically: `ensure_class_initialized`
+/// succeeds for `java/lang/ProcessHandle` even without `--java-home`, so the
+/// `Err(_)` synthetic-fallback branch this VM uses elsewhere never triggers
+/// here). `ProcessHandleImpl` is a concrete class with real method bodies,
+/// so `.pid()` runs actual bytecode and returns the pid we pass in — which
+/// matches `Process.pid()` per the JDK's documented `pid() ==
+/// toHandle().pid()` contract.
+///
+/// Known gap (not fixed here): `isAlive()`/`destroy()`/`waitFor()` on the
+/// returned handle route through `ProcessHandleImpl`'s already-registered
+/// natives (`isAlive0`/`destroy0`/`waitForProcessExit0`), which key off the
+/// VM's *internal* subprocess-table handle, not the real OS pid we store
+/// here — so they'll take the same "not found in table" fallback path
+/// `ProcessHandle.current()` already exercises, rather than accurately
+/// tracking this specific child. Fixing that needs the table to also be
+/// queryable by real pid, which is out of scope for the missing-native fix.
+fn native_process_to_handle(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(o))) => *o,
+        _ => {
+            return Err(RuntimeError::NullPointerException {
+                message: Some("Process.toHandle: null this".to_string()),
+            }
+            .into())
+        }
+    };
+    let pid = match ctx.get_field(this, PROC_FIELD_PID) {
+        Value::Long(p) => p,
+        _ => -1,
+    };
+    match ctx.new_object_initialized(
+        "java/lang/ProcessHandleImpl",
+        "(JJ)V",
+        &[Value::Long(pid), Value::Long(0)],
+    ) {
+        Ok(Some(v)) => Ok(Some(v)),
+        _ => {
+            // Pure-synthetic fallback: no real ProcessHandleImpl class was
+            // loadable at all, so fall back to the 1-field synthetic
+            // `java/lang/ProcessHandle` layout `ProcessHandle.current()`
+            // already uses in phases_late.rs (field 0 = pid).
+            let handle = alloc_process_handle(ctx, Value::Long(pid));
+            Ok(Some(Value::Object(Some(handle))))
+        }
+    }
+}
+
+/// Build a 1-field `java/lang/ProcessHandle` (field 0 = pid) — the exact
+/// layout `ProcessHandle.current()` in `phases_late.rs` already
+/// establishes, so the `pid()`/`isAlive()` natives registered there
+/// dispatch correctly against it regardless of real-JDK vs synthetic mode.
+/// Mirrors `native-builtins`'s `alloc_concurrent_synthetic` (not reusable
+/// here directly: `native-io` sits below `native-builtins` in the crate
+/// dependency graph).
+fn alloc_process_handle(ctx: &mut dyn NativeContext, pid: Value) -> ObjectRef {
+    let obj = match ctx.ensure_class_initialized("java/lang/ProcessHandle") {
+        Ok(cid) => {
+            let real = ctx.class_num_total_fields(cid);
+            let n = 1usize.max(real);
+            ctx.alloc_object(cid, n)
+        }
+        Err(_) => {
+            let cid = ctx.ensure_synthetic_class("java/lang/ProcessHandle", 1);
+            ctx.alloc_object(cid, 1)
+        }
+    };
+    ctx.set_field(obj, 0, pid);
+    obj
+}
+
 /// `java.lang.Process.pid()J`
 fn native_process_pid(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = match args.first() {
@@ -1543,6 +1626,12 @@ pub fn register_process_natives(registry: &mut NativeMethodRegistry) {
             native_process_destroy_forcibly,
         );
         registry.register(proc_cls, "pid", "()J", native_process_pid);
+        registry.register(
+            proc_cls,
+            "toHandle",
+            "()Ljava/lang/ProcessHandle;",
+            native_process_to_handle,
+        );
 
         // Stream getters. The spawn path stores the child's pipe fd ids in
         // fields 1-3 precisely so streams can be served through the
