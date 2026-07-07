@@ -140,9 +140,11 @@ turning it on does **not** close this residual.
   `d53c0e96` because the per-call/per-safepoint codegen is a ~6× throughput
   tax (BUG-01,
   `docs/internal/app-jvm-bugs/bug-01-junit-reflection-heavy-jit-frame-scan-throughput.md`).
-  So on current dev `precise_jit_maps_enabled()` is **default-off**
-  (opt-in `CRATONVM_PRECISE_JIT_MAPS=1`); `precise_maps =
-  precise_jit_maps_enabled() || moving_young_enabled()`, both off by default.
+  As of 2026-07-07 `precise_jit_maps_enabled()` was **re-flipped default-ON**
+  (opt out `CRATONVM_NO_PRECISE_JIT_MAPS=1`) because the BUG-01 ~6× tax is gone on
+  current dev; `precise_maps = precise_jit_maps_enabled() || moving_young_enabled()`.
+  Turning precise on does NOT fix this residual either way (below), and an
+  interleaved load-controlled Fork6 A/B is 23/25 ALL-OK on vs 22/25 off (neutral).
 - Even when precise maps map every frame *slot*, `OopMapEntry` still has **no
   register-oop bitmap** (`jit/src/lib.rs:52-73`): a register-only oop is
   covered not by the map but by `emit_pre_safepoint_spill` (spills locals to

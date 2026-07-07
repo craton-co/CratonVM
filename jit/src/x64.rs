@@ -1968,12 +1968,26 @@ fn instruction_start_map(code: &[u8], code_len: usize) -> Vec<bool> {
 /// precise-stack-map machinery (exact RBP frame registration, safepoint-id
 /// slot, precise relocation).
 ///
-/// **DEFAULT OFF** (opt in with `CRATONVM_PRECISE_JIT_MAPS`; `CRATONVM_NO_PRECISE_JIT_MAPS`
-/// also forces off and wins). Flipped to default-off for BUG-01: the per-invocation
-/// `frame_record` + per-safepoint sp-id/flush codegen is a ~6× throughput tax on
-/// call-heavy JIT'd code (JUnit execution: 105 s → 18 s with this off), and it
-/// dominates the reflection/lambda-heavy Spring suites. See
-/// `docs/known-issues/bug-01-junit-reflection-heavy-jit-frame-scan-throughput.md`.
+/// **DEFAULT ON** (re-flipped 2026-07-07). Opt out with `CRATONVM_NO_PRECISE_JIT_MAPS=1`.
+/// (`CRATONVM_PRECISE_JIT_MAPS` is now a no-op — the coverage is the default.)
+///
+/// The BUG-01 ~6× throughput tax that had motivated the d53c0e96 default-OFF flip
+/// is **gone on current dev**: intervening JIT improvements (more inlining → far
+/// fewer real call safepoints in the hot reflection/framework methods) cut the
+/// precise per-safepoint cost to noise. Measured 2026-07-07 on the Linux
+/// spring-core suite: `ObjectUtilsTests`/`ClassUtilsTests` are byte-for-byte the
+/// same wall time precise-on vs -off even at `JIT_THRESHOLD=50`; a 40-class
+/// spring-util reflection batch is 73.5 s on vs 70.5 s off (~4%) with **identical
+/// pass counts (1059/1061)**. GC-root coverage verified on with it: `binarytrees
+/// 14 @GC_STRESS=4096` → `3222190` clean, and the Fork6 GC_STRESS outcome A/B is
+/// 14/15 ALL-OK on == off (the higher young-mark marker count under precise-on is
+/// benign guard-contained over-retention, not worse outcomes). See BUG-01 doc:
+/// `docs/internal/app-jvm-bugs/bug-01-junit-reflection-heavy-jit-frame-scan-throughput.md`.
+///
+/// History: default-OFF (d53c0e96) for BUG-01: the per-invocation
+/// `frame_record` + per-safepoint sp-id/flush codegen was a ~6× throughput tax on
+/// call-heavy JIT'd code (JUnit execution: 105 s → 18 s with this off) on that
+/// era's build.
 ///
 /// TRADE-OFF (accepted, residuals tracked): when off, the GC falls back to the
 /// conservative deepest-band-only JIT-frame scan, which can miss a live oop held
@@ -1989,8 +2003,10 @@ pub fn precise_jit_maps_enabled() -> bool {
     use std::sync::OnceLock;
     static G: OnceLock<bool> = OnceLock::new();
     *G.get_or_init(|| {
-        std::env::var_os("CRATONVM_PRECISE_JIT_MAPS").is_some()
-            && std::env::var_os("CRATONVM_NO_PRECISE_JIT_MAPS").is_none()
+        // Flipped back to DEFAULT-ON 2026-07-07 (see the doc comment above):
+        // the BUG-01 ~6× throughput tax that motivated the d53c0e96 default-off
+        // flip is gone on current dev. Opt out with CRATONVM_NO_PRECISE_JIT_MAPS=1.
+        std::env::var_os("CRATONVM_NO_PRECISE_JIT_MAPS").is_none()
     })
 }
 
