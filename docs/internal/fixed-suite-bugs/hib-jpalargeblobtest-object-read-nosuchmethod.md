@@ -47,7 +47,7 @@ BLOB-reading utility wraps it in). The shared symptom (`Object.<method>`
 NoSuchMethodError as a generic "dispatch gave up" fallback) recurs across
 several unrelated docs in this repo
 ([fork6-fjp-multithread-jit-root-reclamation.md](fork6-fjp-multithread-jit-root-reclamation.md),
-[hib-temporal-gc-lambda-native-stale-local.md](hib-temporal-gc-lambda-native-stale-local.md)) —
+[hib-temporal-gc-lambda-native-stale-local.md](../hib-temporal-gc-lambda-native-stale-local.md)) —
 worth keeping in mind if a common dispatch-fallback bug is ever found, but
 each occurrence so far has had a distinct, unrelated root cause on inspection.
 

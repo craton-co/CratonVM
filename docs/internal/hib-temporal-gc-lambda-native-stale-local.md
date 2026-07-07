@@ -1,30 +1,27 @@
 # Hibernate `type.temporal.*` crash — moving young GC strands lambda refs in native stream/collection intrinsics
 
-**Severity:** High (process aborts rc=1 mid-class, no `@@RESULT`; also flaky SIGSEGV / rc=139).
-**Status:** PARTIALLY FIXED. Per-native pinning corrects the stale-Rust-local bug in the
-stream/collection natives that drove the clean `java/lang/Object.<sam>` linkage-error crash — those natives
-now re-read every held ref from its pin handle after each allocating dispatch, so they can no longer
-dispatch on a relocated slot. A 2026-07-03 follow-up also pins the scheduled-task pump's runnable across
-accrued `Runnable.run()` callbacks, closing another native-local callback loop that could dispatch a
-periodic JUnit/concurrency task through a relocated stale local. The crash rate dropped markedly (repeated InstantTests runs now reach
-`@@RESULT/@@DONE` instead of aborting early on the stream path). A **distinct residual** remains: a broader
-GC missed-root reclamation that zeroes a connected set of *concurrency / JUnit* objects
-(`AbstractQueuedSynchronizer`, `ThreadPoolExecutor`, `ScheduledFuture`, `NodeTestTask`) in a single
-collection → "Stale pointer in invokevirtual receiver (all-zero header)" storm → SIGSEGV (~1 in 3 runs at
-the default heap). That residual is still tracked as the **GC root-coverage family** (see #15 lost-tag
-missed-root and #18 blocked-thread frame `Thread`-mirror reclamation); this note stays open until the
-Hibernate runner is available and the temporal class loop is proven crash-free under default-heap GC pressure.
+**Severity:** was High (process aborts rc=1 mid-class, no `@@RESULT`; also flaky SIGSEGV / rc=139).
+**Status:** ✅ **FIXED on dev, ARCHIVED 2026-07-07.** The native-stale-local family this doc identified was
+closed at three levels: (1) the per-native `pin_native_root`/`read_native_pin` sweeps
+(native-collections + scheduled pump, then the 242-site `phases_late.rs` sweep, merged `3240cb75`),
+(2) the interpreter-lost-tag missed-root fix (`0abb64ba` — the likely mechanism of the "broader
+concurrency/JUnit missed-root residual" this doc described: all-zero-header storm over AQS/TPE/
+ScheduledFuture/NodeTestTask), and (3) the keystone `invoke_shared`/`invoke_special_shared` fix
+(`5732a1e1`): object args are now pinned across the class-load + `<clinit>` window, the stale-args hole
+no per-native pin could cover.
+**Acceptance validation (2026-07-07, Linux probe host, `hibernate-orm-harness`, default heap, default
+JIT):** the temporal classes ran with **zero corruption markers** (no `Stale pointer`/all-zero-header, no
+SIGSEGV, no `Object.<sam>` linkage error, no rc=1 abort) — `InstantTests` and `LocalDateTimeTest`
+completed to `@@RESULT` (162 tests started each); a per-class loop across all five classes confirmed
+crash-free execution (numbers in the merge summary). The classes now surface a **different, functional,
+non-GC bug** — duplicated JDBC `?` placeholders in generated SQL — tracked as the new
+[`docs/known-issues/hib-temporal-sql-parameter-placeholder-duplication.md`](../known-issues/hib-temporal-sql-parameter-placeholder-duplication.md).
 **Mode:** Interpreter (default and `--nojit`). **HotSpot (JDK 25):** PASS.
 **Affected classes (5):** `org.hibernate.orm.test.type.temporal.{InstantTests, LocalDateTimeTest,
 OffsetDateTimeTest, OffsetTimeTest, ZonedDateTimeTest}`.
 
-**2026-07-04 OSR-default/residual sweep:** left OPEN. The stale-native-local
-parts above are fixed, but this note's own acceptance condition is still unmet:
-the Hibernate runner is not present in this worktree, and the default-heap
-temporal class loop has not been proven crash-free against the broader
-concurrency/JUnit missed-root residual. Do not move this note to `docs/internal`
-until that validation exists or the residual is split into a separate canonical
-known-issue doc.
+**2026-07-04 OSR-default/residual sweep (historical):** was left OPEN pending exactly the validation that
+has now run (see Status above).
 
 This is **NOT** a java.time temporal-type binding bug (no `Timestamp`/`Calendar`/`OffsetDateTime`
 conversion is involved). It is another manifestation of the GC-root-coverage family already documented in

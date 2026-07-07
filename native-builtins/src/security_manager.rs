@@ -65,7 +65,16 @@ fn require_policy_enabled() -> bool {
 // Global SecurityManager singleton
 // ---------------------------------------------------------------------------
 
-static SECURITY_MANAGER: Mutex<Option<ObjectRef>> = Mutex::new(None);
+/// Process-wide SecurityManager singleton. Kept alive across calls + GC via
+/// `register_var_handle_root`. Stored as `(identity_key, ObjectRef)`: the GC
+/// remaps the var-handle-root REGISTRY entry after a move, but it cannot
+/// rewrite this raw static copy — so every use must re-read the current
+/// address via `read_var_handle_root(identity_key)` (use-after-move otherwise
+/// once the SM object is relocated by a moving young GC or promotion). Before
+/// this fix the slot held a bare `ObjectRef` that was neither rooted nor
+/// remapped, so the installed SM was ALSO collectable. Same pattern as
+/// `ASYNC_POOL` in lib.rs.
+static SECURITY_MANAGER: Mutex<Option<(i32, ObjectRef)>> = Mutex::new(None);
 
 /// Return the currently-installed `java.lang.SecurityManager` reference,
 /// or `None` if `System.setSecurityManager(null)` is in effect (the default).
@@ -74,12 +83,24 @@ static SECURITY_MANAGER: Mutex<Option<ObjectRef>> = Mutex::new(None);
 /// singleton: `ProcessBuilder.start` / `Runtime.exec*` via
 /// `lang_system::check_exec_or_throw`, and the Panama host-call gate via
 /// `panama::check_native_access`.
-pub(crate) fn get_security_manager() -> Option<ObjectRef> {
-    *SECURITY_MANAGER.lock().unwrap_or_else(|e| e.into_inner())
+pub(crate) fn get_security_manager(ctx: &dyn NativeContext) -> Option<ObjectRef> {
+    let (key, cached) = (*SECURITY_MANAGER.lock().unwrap_or_else(|e| e.into_inner()))?;
+    // Re-read the CURRENT address: the GC remaps the var-handle-root registry
+    // entry after a move, not this raw static copy. Contexts without a
+    // registry (mocks) fall back to the cached ref.
+    Some(ctx.read_var_handle_root(key).unwrap_or(cached))
 }
 
-fn set_security_manager(sm: Option<ObjectRef>) {
-    *SECURITY_MANAGER.lock().unwrap_or_else(|e| e.into_inner()) = sm;
+fn set_security_manager(ctx: &mut dyn NativeContext, sm: Option<ObjectRef>) {
+    let entry = sm.map(|obj| {
+        // Keep alive + registry-remapped across GC moves (VarHandle-root
+        // pattern); the identity key lets every later read re-read the
+        // current address. The key MUST be computed on the same address that
+        // was registered, with no allocating call in between.
+        ctx.register_var_handle_root(obj);
+        (ctx.identity_hash_code(obj), obj)
+    });
+    *SECURITY_MANAGER.lock().unwrap_or_else(|e| e.into_inner()) = entry;
 }
 
 /// Override the SecurityManager singleton for tests. Lets unit tests
@@ -87,11 +108,14 @@ fn set_security_manager(sm: Option<ObjectRef>) {
 /// gating path without going through `System.setSecurityManager`.
 ///
 /// Returns the previous value so callers can restore it on tear-down.
+/// Tests run against `MockNativeContext`, whose `read_var_handle_root`
+/// returns `None` — readers fall back to the cached raw ref — so a dummy
+/// identity key is fine here (no moving GC in unit tests).
 #[cfg(test)]
 pub(crate) fn set_security_manager_for_test(sm: Option<ObjectRef>) -> Option<ObjectRef> {
     let mut guard = SECURITY_MANAGER.lock().unwrap_or_else(|e| e.into_inner());
-    let prev = *guard;
-    *guard = sm;
+    let prev = guard.map(|(_, obj)| obj);
+    *guard = sm.map(|obj| (0, obj));
     prev
 }
 
@@ -109,7 +133,7 @@ pub(crate) fn set_security_manager_for_test(sm: Option<ObjectRef>) -> Option<Obj
 // WildFly, and EJBCA — which call `Policy.setPolicy(new ModulesPolicy())`
 // during boot — can proceed.
 //
-// Storage is a plain `Mutex<Option<ObjectRef>>`, not `OnceLock`, because
+// Storage is a plain `Mutex<Option<...>>`, not `OnceLock`, because
 // the slot must be reassignable. `setPolicy(null)` clears the slot and the
 // next `getPolicy()` call lazily re-creates the synthetic default — no
 // null-deref window can occur because the lazy init runs under the same
@@ -117,7 +141,14 @@ pub(crate) fn set_security_manager_for_test(sm: Option<ObjectRef>) -> Option<Obj
 //
 // The singleton is process-wide. A hostile caller from inside the JVM can
 // read or overwrite it; that mirrors real JDK behaviour and is intentional.
-static ACTIVE_POLICY_OBJECT: Mutex<Option<ObjectRef>> = Mutex::new(None);
+//
+// GC: stored as `(identity_key, ObjectRef)` — kept alive + registry-remapped
+// via `register_var_handle_root`; every read re-fetches the CURRENT address
+// via `read_var_handle_root(identity_key)` because the GC cannot rewrite this
+// raw static copy (ASYNC_POOL pattern, lib.rs). Before this fix the slot held
+// a bare `ObjectRef` that was neither rooted nor remapped — the installed
+// Policy was ALSO collectable.
+static ACTIVE_POLICY_OBJECT: Mutex<Option<(i32, ObjectRef)>> = Mutex::new(None);
 
 /// Process-wide cache of the read-only permissive `Permissions` collection
 /// returned by `Policy.getPermissions(...)`. Decoupled from
@@ -125,22 +156,44 @@ static ACTIVE_POLICY_OBJECT: Mutex<Option<ObjectRef>> = Mutex::new(None);
 /// fire on any vanilla-Policy receiver (most commonly the lazy default),
 /// and we want a stable reference for callers that perform
 /// reference-equality checks across calls.
-static SHARED_PERMISSION_COLLECTION: Mutex<Option<ObjectRef>> = Mutex::new(None);
+///
+/// GC: same `(identity_key, ObjectRef)` var-handle-root pattern as
+/// [`ACTIVE_POLICY_OBJECT`] — previously neither rooted nor remapped.
+static SHARED_PERMISSION_COLLECTION: Mutex<Option<(i32, ObjectRef)>> = Mutex::new(None);
 
-/// Read the currently-installed Java `Policy` object, if any.
-fn get_policy_object() -> Option<ObjectRef> {
-    *ACTIVE_POLICY_OBJECT
+/// Read the currently-installed Java `Policy` object, if any. Re-reads the
+/// CURRENT (post-GC) address from the var-handle-root registry; contexts
+/// without a registry (mocks) fall back to the cached raw ref.
+fn get_policy_object(ctx: &dyn NativeContext) -> Option<ObjectRef> {
+    let (key, cached) = (*ACTIVE_POLICY_OBJECT
+        .lock()
+        .unwrap_or_else(|e| e.into_inner()))?;
+    Some(ctx.read_var_handle_root(key).unwrap_or(cached))
+}
+
+/// Cheap "is a Policy installed?" probe that does not touch object
+/// addresses (used by `Policy.isSet`, which only needs presence).
+fn policy_object_installed() -> bool {
+    ACTIVE_POLICY_OBJECT
         .lock()
         .unwrap_or_else(|e| e.into_inner())
+        .is_some()
 }
 
 /// Store a new Java `Policy` reference (or clear with `None`). This matches
 /// `Policy.setPolicy(Policy)` semantics: `null` is accepted and results in
 /// a future `getPolicy()` call lazily allocating the synthetic default.
-fn set_policy_object(p: Option<ObjectRef>) {
+fn set_policy_object(ctx: &mut dyn NativeContext, p: Option<ObjectRef>) {
+    let entry = p.map(|obj| {
+        // Keep alive + registry-remapped across GC moves (VarHandle-root
+        // pattern). The identity key MUST be computed on the same address
+        // that was registered, with no allocating call in between.
+        ctx.register_var_handle_root(obj);
+        (ctx.identity_hash_code(obj), obj)
+    });
     *ACTIVE_POLICY_OBJECT
         .lock()
-        .unwrap_or_else(|e| e.into_inner()) = p;
+        .unwrap_or_else(|e| e.into_inner()) = entry;
 }
 
 /// Lazily allocate the synthetic default Policy used when no caller has
@@ -156,11 +209,16 @@ fn ensure_default_policy_object(ctx: &mut dyn NativeContext) -> ObjectRef {
     let mut g = ACTIVE_POLICY_OBJECT
         .lock()
         .unwrap_or_else(|e| e.into_inner());
-    if let Some(p) = *g {
-        return p;
+    if let Some((key, cached)) = *g {
+        // Re-read the CURRENT address (see the static's GC note).
+        return ctx.read_var_handle_root(key).unwrap_or(cached);
     }
     let p = alloc_concurrent_synthetic(ctx, "java/security/Policy", 0);
-    *g = Some(p);
+    // Keep alive + registry-remapped across GC moves (VarHandle-root pattern);
+    // key computed on the just-registered address, no allocation in between.
+    ctx.register_var_handle_root(p);
+    let key = ctx.identity_hash_code(p);
+    *g = Some((key, p));
     p
 }
 
@@ -172,11 +230,18 @@ fn ensure_shared_permission_collection(ctx: &mut dyn NativeContext) -> ObjectRef
     let mut g = SHARED_PERMISSION_COLLECTION
         .lock()
         .unwrap_or_else(|e| e.into_inner());
-    if let Some(p) = *g {
-        return p;
+    if let Some((key, cached)) = *g {
+        // Re-read the CURRENT address (see the static's GC note).
+        return ctx.read_var_handle_root(key).unwrap_or(cached);
     }
     let perms = build_permissive_collection(ctx);
-    *g = Some(perms);
+    // Keep alive + registry-remapped across GC moves (VarHandle-root pattern);
+    // key computed on the just-registered address, no allocation in between.
+    // The AllPermission entry in slot 0 stays live via normal heap tracing
+    // from this root.
+    ctx.register_var_handle_root(perms);
+    let key = ctx.identity_hash_code(perms);
+    *g = Some((key, perms));
     perms
 }
 
@@ -705,8 +770,8 @@ fn register_system_security(r: &mut NativeMethodRegistry) {
         sys,
         "getSecurityManager",
         "()Ljava/lang/SecurityManager;",
-        |_ctx, _args| {
-            let sm = get_security_manager();
+        |ctx, _args| {
+            let sm = get_security_manager(&*ctx);
             Ok(Some(Value::Object(sm)))
         },
     );
@@ -716,12 +781,12 @@ fn register_system_security(r: &mut NativeMethodRegistry) {
         sys,
         "setSecurityManager",
         "(Ljava/lang/SecurityManager;)V",
-        |_ctx, args| {
+        |ctx, args| {
             let sm = match args.get(0) {
                 Some(Value::Object(Some(o))) => Some(*o),
                 _ => None,
             };
-            set_security_manager(sm);
+            set_security_manager(ctx, sm);
             Ok(None)
         },
     );
@@ -1115,7 +1180,7 @@ fn register_policy_natives(r: &mut NativeMethodRegistry) {
     // permits all (`AllPermission`-style). The lazy init runs under the
     // singleton mutex so the default is never observed half-initialised.
     r.register(p, "getPolicy", "()Ljava/security/Policy;", |ctx, _args| {
-        if let Some(existing) = get_policy_object() {
+        if let Some(existing) = get_policy_object(&*ctx) {
             return Ok(Some(Value::Object(Some(existing))));
         }
         let p = ensure_default_policy_object(ctx);
@@ -1130,7 +1195,7 @@ fn register_policy_natives(r: &mut NativeMethodRegistry) {
         "getPolicyNoCheck",
         "()Ljava/security/Policy;",
         |ctx, _args| {
-            if let Some(existing) = get_policy_object() {
+            if let Some(existing) = get_policy_object(&*ctx) {
                 return Ok(Some(Value::Object(Some(existing))));
             }
             let p = ensure_default_policy_object(ctx);
@@ -1143,19 +1208,21 @@ fn register_policy_natives(r: &mut NativeMethodRegistry) {
     // materialised, matching `Policy.policyInfo.initialized` semantics in
     // real JDK after the first `getPolicy()` returns.
     r.register(p, "isSet", "()Z", |_ctx, _args| {
-        let set = get_policy_object().is_some();
+        // Presence-only probe — no object address is dereferenced, so no
+        // var-handle-root re-read is needed here.
+        let set = policy_object_installed();
         Ok(Some(Value::Int(if set { 1 } else { 0 })))
     });
 
     // setPolicy(Policy)V — store `newPolicy` in the singleton slot. Must
     // NOT throw under any circumstance (T19.H9 contract). `null` clears
     // the slot; the next `getPolicy()` lazily falls back to the default.
-    r.register(p, "setPolicy", "(Ljava/security/Policy;)V", |_ctx, args| {
+    r.register(p, "setPolicy", "(Ljava/security/Policy;)V", |ctx, args| {
         let new_policy = match args.get(0) {
             Some(Value::Object(Some(o))) => Some(*o),
             _ => None, // null or missing arg
         };
-        set_policy_object(new_policy);
+        set_policy_object(ctx, new_policy);
         Ok(None)
     });
 
@@ -1258,22 +1325,22 @@ mod tests {
 
     #[test]
     fn test_set_and_get_security_manager() {
+        let mut ctx = MockNativeContext::new();
         // Reset global state
-        set_security_manager(None);
+        set_security_manager(&mut ctx, None);
 
         // Initially null
-        assert!(get_security_manager().is_none());
+        assert!(get_security_manager(&ctx).is_none());
 
-        let mut ctx = MockNativeContext::new();
         let sm_obj = alloc_concurrent_synthetic(&mut ctx, "java/lang/SecurityManager", 0);
 
         // Set the SM
-        set_security_manager(Some(sm_obj));
-        assert_eq!(get_security_manager(), Some(sm_obj));
+        set_security_manager(&mut ctx, Some(sm_obj));
+        assert_eq!(get_security_manager(&ctx), Some(sm_obj));
 
         // Clear it
-        set_security_manager(None);
-        assert!(get_security_manager().is_none());
+        set_security_manager(&mut ctx, None);
+        assert!(get_security_manager(&ctx).is_none());
     }
 
     #[test]
@@ -1420,7 +1487,7 @@ mod tests {
     #[test]
     fn test_system_get_set_security_manager() {
         // Reset global state
-        set_security_manager(None);
+        let _ = set_security_manager_for_test(None);
 
         let mut registry = NativeMethodRegistry::new();
         register_security_manager_natives(&mut registry);
@@ -1459,7 +1526,7 @@ mod tests {
         assert_eq!(result.unwrap(), Some(Value::Object(Some(sm_obj))));
 
         // Clean up
-        set_security_manager(None);
+        let _ = set_security_manager_for_test(None);
     }
 
     #[test]
@@ -1777,7 +1844,11 @@ mod tests {
     /// Reset global state between policy-sensitive tests.
     fn clear_policy_and_stack() {
         set_active_policy(None);
-        set_policy_object(None);
+        // Clear the singleton slots directly (no ctx needed for a clear —
+        // registration only happens on store of Some).
+        *ACTIVE_POLICY_OBJECT
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = None;
         // Also clear the shared permission collection so the stale
         // ObjectRef from a prior test's MockNativeContext heap doesn't
         // leak into the next test — calls to ensure_shared_permission_collection
@@ -2540,7 +2611,7 @@ mod tests {
     #[test]
     fn t19_n3_ac_get_stack_context_returns_null_when_no_security_manager() {
         // No SecurityManager is installed; the spec-matching answer is null.
-        set_security_manager(None);
+        let _ = set_security_manager_for_test(None);
 
         let mut registry = NativeMethodRegistry::new();
         register_security_manager_natives(&mut registry);
@@ -2748,14 +2819,14 @@ mod tests {
             )
             .unwrap();
         let _ = set_p(&mut ctx, &[Value::Object(Some(policy_obj))]);
-        assert_eq!(get_policy_object(), Some(policy_obj));
+        assert_eq!(get_policy_object(&ctx), Some(policy_obj));
 
         // Now setPolicy(null) — must not throw.
         let result = set_p(&mut ctx, &[Value::Object(None)]);
         assert!(result.is_ok(), "setPolicy(null) must not raise");
 
         // The slot is cleared; the next getPolicy() lazily allocates a default.
-        assert_eq!(get_policy_object(), None);
+        assert_eq!(get_policy_object(&ctx), None);
 
         let get_p = registry
             .find(
@@ -3013,7 +3084,7 @@ mod tests {
 
         // refresh must not touch the singleton state — install nothing
         // before the call and verify isSet stays false afterwards.
-        assert_eq!(get_policy_object(), None);
+        assert_eq!(get_policy_object(&ctx), None);
 
         clear_policy_and_stack();
     }
@@ -3176,6 +3247,6 @@ mod tests {
         assert!(set_sm(&mut ctx, &[Value::Object(None)]).is_ok());
 
         clear_policy_and_stack();
-        set_security_manager(None);
+        let _ = set_security_manager_for_test(None);
     }
 }

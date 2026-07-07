@@ -54,4 +54,4 @@ Passed:
 ## Related
 
 - The reactor-thread leak it co-occurred with remains separate:
-  [gc-rscache-reactor-shutdown-timing-race.md](../known-issues/gc-rscache-reactor-shutdown-timing-race.md).
+  [gc-rscache-reactor-shutdown-timing-race.md](gc-rscache-reactor-shutdown-timing-race.md).

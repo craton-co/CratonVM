@@ -33,6 +33,14 @@ pub(crate) static ALLOW_THREAD_STOP: AtomicBool = AtomicBool::new(false);
 
 /// Per-thread stop-request state.  Keyed by the ObjectRef pointer of the
 /// Thread object (used as a u64 identity key).
+///
+/// GC note (gc-followups-20260706): effectively WRITE-ONLY today — the only
+/// reader, `take_stop_throwable`, is `#[allow(dead_code)]` with no callers,
+/// and the writer is further gated behind `ALLOW_THREAD_STOP` (default off).
+/// The stored throwable refs are neither GC roots nor remapped, and the
+/// raw-address key goes stale when the Thread moves — before wiring a real
+/// consumer, re-key by identity hash and adopt the `(identity_key,
+/// ObjectRef)` var-handle-root pattern (ASYNC_POOL in lib.rs).
 static THREAD_STOP_REQUESTS: Mutex<Option<std::collections::HashMap<u64, ObjectRef>>> =
     Mutex::new(None);
 

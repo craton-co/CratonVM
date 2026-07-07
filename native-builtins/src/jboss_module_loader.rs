@@ -633,18 +633,27 @@ pub(crate) fn resolve_module_in_roots(
 // Module / Loader cache
 // ===========================================================================
 
-/// Per-process cache of `(module-name, ObjectRef)` so concurrent
-/// `loadModule(name)` from multiple threads always returns the same
-/// `Module` instance — JBoss's contract.
+/// Per-process cache of `module-name -> (identity_key, ObjectRef)` so
+/// concurrent `loadModule(name)` from multiple threads always returns the
+/// same `Module` instance — JBoss's contract.
 ///
 /// We don't track per-loader caches because cratonvm only has one
 /// `LocalModuleLoader` instance (the boot holder).  When/if a second
 /// loader appears, the cache keys can be promoted to
 /// `(loader_object_ref, name)`.
-static MODULE_CACHE: OnceLock<Mutex<std::collections::HashMap<String, ObjectRef>>> =
+///
+/// GC: each cached Module is kept alive + registry-remapped via
+/// `register_var_handle_root` at insert time; every cache hit re-reads the
+/// CURRENT address via `read_var_handle_root(identity_key)` because the GC
+/// cannot rewrite these raw static copies (ASYNC_POOL pattern, lib.rs).
+/// Before this fix entries were bare `ObjectRef`s that were neither rooted
+/// nor remapped — cached Modules were ALSO collectable once the Java caller
+/// dropped its reference. Bounded by the number of distinct modules, so the
+/// permanent registration does not grow unboundedly.
+static MODULE_CACHE: OnceLock<Mutex<std::collections::HashMap<String, (i32, ObjectRef)>>> =
     OnceLock::new();
 
-fn module_cache() -> &'static Mutex<std::collections::HashMap<String, ObjectRef>> {
+fn module_cache() -> &'static Mutex<std::collections::HashMap<String, (i32, ObjectRef)>> {
     MODULE_CACHE.get_or_init(|| Mutex::new(std::collections::HashMap::new()))
 }
 
@@ -690,9 +699,16 @@ fn registered_paths() -> &'static Mutex<std::collections::HashSet<String>> {
 /// Process-wide cache of the boot holder INSTANCE so the post-clinit
 /// fixup and the `loadModule` native always hand out the same
 /// `LocalModuleLoader`.
-static BOOT_LOADER: OnceLock<Mutex<Option<ObjectRef>>> = OnceLock::new();
+///
+/// GC: stored as `(identity_key, ObjectRef)` — kept alive + registry-remapped
+/// via `register_var_handle_root`; every read re-fetches the CURRENT address
+/// via `read_var_handle_root(identity_key)` because the GC cannot rewrite
+/// this raw static copy (ASYNC_POOL pattern, lib.rs). Before this fix the
+/// slot held a bare `ObjectRef` that was neither rooted nor remapped — the
+/// singleton was collectable/movable out from under the cache.
+static BOOT_LOADER: OnceLock<Mutex<Option<(i32, ObjectRef)>>> = OnceLock::new();
 
-fn boot_loader_slot() -> &'static Mutex<Option<ObjectRef>> {
+fn boot_loader_slot() -> &'static Mutex<Option<(i32, ObjectRef)>> {
     BOOT_LOADER.get_or_init(|| Mutex::new(None))
 }
 
@@ -715,8 +731,11 @@ pub(crate) fn clear_boot_loader_for_test() {
 pub fn build_local_module_loader(ctx: &mut dyn NativeContext) -> ObjectRef {
     {
         let slot = boot_loader_slot().lock();
-        if let Some(o) = *slot {
-            return o;
+        if let Some((key, cached)) = *slot {
+            // Re-read the CURRENT address: the GC remaps the var-handle-root
+            // registry entry after a move, not this raw static copy. Contexts
+            // without a registry (mocks) fall back to the cached ref.
+            return ctx.read_var_handle_root(key).unwrap_or(cached);
         }
     }
     let loader = alloc_concurrent_synthetic(ctx, CN_MODULE_LOADER, LOADER_FIELD_COUNT);
@@ -725,13 +744,18 @@ pub fn build_local_module_loader(ctx: &mut dyn NativeContext) -> ObjectRef {
         None => ctx.create_string(""),
     };
     ctx.set_field(loader, LOADER_SLOT_ROOT, Value::Object(Some(root_str)));
+    // Keep alive + registry-remapped across GC moves (VarHandle-root pattern);
+    // key computed on the just-registered address, no allocation in between.
+    ctx.register_var_handle_root(loader);
+    let key = ctx.identity_hash_code(loader);
     {
         let mut slot = boot_loader_slot().lock();
-        // Double-checked locking: another thread may have raced us.
-        if let Some(o) = *slot {
-            return o;
+        // Double-checked locking: another thread may have raced us. (Our
+        // orphaned registration is harmless — same trade-off as ASYNC_POOL.)
+        if let Some((ekey, existing)) = *slot {
+            return ctx.read_var_handle_root(ekey).unwrap_or(existing);
         }
-        *slot = Some(loader);
+        *slot = Some((key, loader));
     }
     loader
 }
@@ -943,8 +967,12 @@ pub(crate) fn native_loader_load_module(
     // Cache hit?
     {
         let cache = module_cache().lock();
-        if let Some(cached) = cache.get(&name) {
-            return Ok(Some(Value::Object(Some(*cached))));
+        if let Some(&(key, cached)) = cache.get(&name) {
+            // Re-read the CURRENT (post-GC) address — the var-handle-root
+            // registry entry is remapped after a move, this raw copy is not.
+            return Ok(Some(Value::Object(Some(
+                ctx.read_var_handle_root(key).unwrap_or(cached),
+            ))));
         }
     }
 
@@ -1254,12 +1282,20 @@ pub(crate) fn native_loader_load_module(
         } // close `for synth_name` and `if allow_synth_bytecode`
     }
 
-    // Insert into cache, but check for race-loser.
+    // Keep the Module alive + registry-remapped across GC moves
+    // (VarHandle-root pattern, per cache entry); key computed on the
+    // just-registered address, no allocation in between.
+    ctx.register_var_handle_root(module);
+    let mkey = ctx.identity_hash_code(module);
+    // Insert into cache, but check for race-loser. (A race-loser's orphaned
+    // registration is harmless — same trade-off as ASYNC_POOL.)
     let mut cache = module_cache().lock();
-    if let Some(existing) = cache.get(&name) {
-        return Ok(Some(Value::Object(Some(*existing))));
+    if let Some(&(ekey, existing)) = cache.get(&name) {
+        return Ok(Some(Value::Object(Some(
+            ctx.read_var_handle_root(ekey).unwrap_or(existing),
+        ))));
     }
-    cache.insert(name.clone(), module);
+    cache.insert(name.clone(), (mkey, module));
     Ok(Some(Value::Object(Some(module))))
 }
 
