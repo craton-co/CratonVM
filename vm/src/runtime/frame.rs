@@ -1578,6 +1578,17 @@ impl Frame {
                 // relocations and is exactly the criterion `verify_no_stale_refs`
                 // uses, so remap iff the slot's address is a key.
                 if let Some(&new_addr) = pointer_map.get(&(old_ptr as usize)) {
+                    // Record construction provenance for the relocated address
+                    // (mirrors `ValueStack::update_object_refs`): writing the
+                    // raw bits via `try_from_pointer` does not by itself mark
+                    // `new_addr` as a known live-object payload, so a later
+                    // context-free decode of this local (`to_value` /
+                    // `decode_value`) would find `object_ref_payload_is_known`
+                    // false and degrade a live, moved reference to Long/null.
+                    // The `from_raw` round-trip is the canonical recorder.
+                    // SAFETY: `new_addr` is a live moved object's address from
+                    // the GC pointer map; only its bits are used.
+                    let _ = unsafe { ObjectRef::from_raw(new_addr as *mut u8) };
                     self.locals[i] = CompactValue::try_from_pointer(new_addr as u64)
                         .unwrap_or_else(CompactValue::null);
                 }
@@ -1590,6 +1601,10 @@ impl Frame {
                         continue;
                     };
                     if heap.is_object_address(new_addr).is_some() {
+                        // Same provenance fix as above for the lost-tag path.
+                        // SAFETY: `new_addr` is a live moved object's address,
+                        // confirmed by `heap.is_object_address` just above.
+                        let _ = unsafe { ObjectRef::from_raw(new_addr as *mut u8) };
                         self.locals[i] = CompactValue::try_from_pointer(new_addr as u64)
                             .unwrap_or_else(CompactValue::null);
                     }
