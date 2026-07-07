@@ -1671,6 +1671,13 @@ impl JavaKeyManagerResolver {
             for (i, &pin) in pins.iter().enumerate() {
                 km_list[i] = ctx.read_native_pin(pin, km_list[i]);
                 let km_obj = km_list[i];
+                if dbg {
+                    let cls_name = ctx.class_name_of_id(ctx.class_id_of_object(km_obj));
+                    eprintln!(
+                        "[dbg-tls-auth] JavaKeyManagerResolver km_obj[{}] class={:?}",
+                        i, cls_name
+                    );
+                }
                 // FIX (tomcat-clientauth-engine-config): calling
                 // `chooseClientAlias` on the very FIRST handshake of a fresh
                 // process (as this crate's "speculative optional client
