@@ -17883,11 +17883,33 @@ pub fn register_essential_natives(registry: &mut NativeMethodRegistry) {
         "()[Ljava/lang/String;",
         lang_system::native_vm_get_runtime_arguments,
     );
+    // `VM.latestUserDefinedLoader0()` backs `ObjectInputStream.resolveClass()`'s
+    // default class resolution (`Class.forName(name, false,
+    // latestUserDefinedLoader())`): real HotSpot walks the Java call stack from
+    // the innermost frame outward and returns the defining loader of the first
+    // class NOT loaded by the bootstrap or platform/extension loader. Returning
+    // an unconditional `null` (the previous stub) makes `resolveClass` fall back
+    // to a null/bootstrap loader, so `Class.forName` resolves the stream's class
+    // name through the WRONG loader whenever the caller's actual context
+    // classloader is a custom one (e.g. Hibernate bytecode-enhancement's
+    // `EnhancingClassLoader`) — silently loading a *different*, differently-
+    // shaped Class object (e.g. missing the bytecode-enhancement transform),
+    // which then disagrees with the stream's `serialVersionUID`
+    // (`InvalidClassException: local class incompatible`) even though the
+    // written and read objects are logically the same class.
     registry.register(
         "jdk/internal/misc/VM",
         "latestUserDefinedLoader0",
         "()Ljava/lang/ClassLoader;",
-        |_ctx, _args| Ok(Some(Value::Object(None))),
+        |ctx, _args| {
+            let loader = crate::serialization::latest_user_defined_loader_class(ctx).map(
+                |class_id| {
+                    crate::classloader::defining_loader_for(class_id.as_u32())
+                        .unwrap_or_else(|| crate::classloader::get_or_create_app_loader(ctx))
+                },
+            );
+            Ok(Some(Value::Object(loader)))
+        },
     );
     registry.register("jdk/internal/misc/VM", "getuid", "()J", |_ctx, _args| {
         Ok(Some(Value::Long(0)))

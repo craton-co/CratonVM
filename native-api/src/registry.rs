@@ -579,6 +579,26 @@ pub trait NativeContext {
     /// Retrieve a previously captured stack trace.
     fn get_stack_trace(&self, throwable_hash: i32) -> Option<&[StackTraceEntry]>;
 
+    /// The exact `ClassId` each live frame is currently executing in,
+    /// innermost (most recent call) first.
+    ///
+    /// Unlike `capture_stack_trace`'s `StackTraceEntry`s (which carry only a
+    /// display `class_name: Arc<str>`, for `Throwable`/`StackWalker` output),
+    /// this exposes each frame's precise, already-resolved `ClassId` — no
+    /// re-resolution by name needed. That distinction matters whenever two
+    /// *different* classes share one name (a common shape for custom
+    /// classloaders, e.g. Hibernate bytecode-enhancement's per-test-class
+    /// `EnhancingClassLoader`, or a class reloaded under a fresh loader
+    /// between JUnit tests sharing one process): re-resolving a frame's name
+    /// via `class_id_by_name` collapses to whichever definition the global
+    /// class table associates with that name (typically the first one ever
+    /// registered), which is not necessarily the one actually executing on
+    /// that frame. Used by `latest_user_defined_loader_class` to correctly
+    /// mirror `jdk.internal.misc.VM.latestUserDefinedLoader()`.
+    fn frame_class_ids(&self) -> Vec<ClassId> {
+        Vec::new()
+    }
+
     // -- Heap access methods (for native method implementations) --
     //
     // # Security contract (M4a — unvalidated slot indices)

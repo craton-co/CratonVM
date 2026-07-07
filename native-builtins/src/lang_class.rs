@@ -7407,26 +7407,43 @@ pub(crate) fn native_constructor_new_instance(
                     ctx.get_field_by_name(target_mh, "instanceClass")
                 {
                     if let Some(inst_cid) = ctx.class_id_from_mirror(inst_mirror) {
-                        if let Some(inst_name) = ctx.class_name_of_id(inst_cid) {
-                            if let Some(obj) = ctx.allocate_instance(&inst_name) {
-                                // Run the ancestor's no-arg `<init>` (`clazz`);
-                                // `java.lang.Object.<init>` is a no-op.
-                                if let Value::Object(Some(anc_mirror)) =
-                                    ctx.get_field_by_name(this, "clazz")
-                                {
-                                    if let Some(anc_cid) = ctx.class_id_from_mirror(anc_mirror) {
-                                        if let Some(anc_name) = ctx.class_name_of_id(anc_cid) {
-                                            let _ = ctx.invoke_special(
-                                                &anc_name,
-                                                "<init>",
-                                                "()V",
-                                                &[Value::Object(Some(obj))],
-                                            );
-                                        }
+                        // Allocate by the EXACT `inst_cid` the mirror already
+                        // resolved to, not by re-resolving `instanceClass`'s
+                        // name (`ctx.allocate_instance(name)`, as this used to
+                        // do) — the same loader-identity hazard the general
+                        // `Constructor.newInstance` path below already guards
+                        // against (see its comment / `new_object_initialized_
+                        // with_class_id`): a name-only lookup collapses to
+                        // whichever same-named class the VM's global class
+                        // table associates with that name FIRST, which for a
+                        // class loaded by a non-default classloader (e.g.
+                        // Hibernate bytecode-enhancement's `EnhancingClassLoader`)
+                        // is very often a *different*, non-enhanced definition
+                        // than `inst_cid` — deserializing then returns an
+                        // instance of the wrong class (same name, different
+                        // shape), which silently fails `equals()`/`getClass()`
+                        // identity checks against the original object even
+                        // though every field value round-tripped correctly.
+                        let num_fields = ctx.class_num_total_fields(inst_cid);
+                        let obj = ctx.alloc_object(inst_cid, num_fields);
+                        {
+                            // Run the ancestor's no-arg `<init>` (`clazz`);
+                            // `java.lang.Object.<init>` is a no-op.
+                            if let Value::Object(Some(anc_mirror)) =
+                                ctx.get_field_by_name(this, "clazz")
+                            {
+                                if let Some(anc_cid) = ctx.class_id_from_mirror(anc_mirror) {
+                                    if let Some(anc_name) = ctx.class_name_of_id(anc_cid) {
+                                        let _ = ctx.invoke_special(
+                                            &anc_name,
+                                            "<init>",
+                                            "()V",
+                                            &[Value::Object(Some(obj))],
+                                        );
                                     }
                                 }
-                                return Ok(Some(Value::Object(Some(obj))));
                             }
+                            return Ok(Some(Value::Object(Some(obj))));
                         }
                     }
                 }
