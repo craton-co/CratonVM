@@ -2,7 +2,7 @@
 
 | | |
 |---|---|
-| **Status** | `ProxyClassReuseTest.testNoReuse` FIXED, gate **default ON** (flipped 2026-07-03, validated 2026-07-04). Residual B (`GroovyBeanDefinitionReaderTests`/`GroovyApplicationContextTests` MetaClass/dispatch bug) **substantially fixed 2026-07-06** — see below (real root cause found: `invokestatic` self-calls re-resolved their owner class by name instead of reusing the executing frame's own `ClassId`, silently landing on the WRONG same-named class from a sibling `GroovyClassLoader`). Residual A (`BshScriptFactoryTests` reverse-pollution) re-verified 2026-07-06, **still open** — re-investigated further; see updated section below. Doc stays in `known-issues` for Residual A and the newly-found Residual-B-adjacent Groovy-compiler-state bug + a separate pre-existing `component-scan` hang. |
+| **Status** | `ProxyClassReuseTest.testNoReuse` FIXED, gate **default ON**. Residual B (`GroovyBeanDefinitionReaderTests`/`GroovyApplicationContextTests` MetaClass/dispatch bug) **partially fixed 2026-07-06** — real root cause found and fixed (`invokestatic` self-calls re-resolved their owner class by name instead of reusing the executing frame's own `ClassId`); a SEPARATE, concurrently-merged gate-mirror fix (`30e82560`, see Residual A) introduced a NEW regression to this same suite that the invokestatic fix only partially compensates for on current `dev` tip — see Residual B section for exact before/after numbers on both the old and new baselines. Residual A (`BshScriptFactoryTests` reverse-pollution) re-verified 2026-07-06, **still open**. Doc stays in `known-issues` for: Residual A, the Groovy-suite regression from the concurrently-merged gate-mirror fix, a Residual-B-adjacent Groovy-compiler-state bug, and a separate pre-existing `component-scan` hang. |
 | **Area** | VM core — real-JDK-mode class-loader identity + `CONSTANT_Class` resolution (the flat global class store conflated loader namespaces). |
 | **Symptom** | `org.hibernate.orm.test.proxy.ProxyClassReuseTest.testNoReuse` fails: `MappingException: Could not instantiate persister … MyEntity`, caused by `IncompatibleClassChangeError: class …MyEntity$HibernateProxy already defined by application loader`. |
 | **Severity** | medium (CratonVM-only; pre-existing — fails identically at baseline `b0aab8f9`). Same class as SBR-14 / SC-custom-classloader isolation residuals. |
@@ -141,7 +141,8 @@ parameter, plus route the `invoke_or_native` recursive-fallback path through
 name-based lookup. No other invokestatic call site is touched — a real call
 to a genuinely different class keeps the exact existing behavior.
 
-**Verification:**
+**Verification (initial, against pre-existing `dev` tip `9f1db39d` before this
+session's other concurrent gate-default change described below landed):**
 - Two-method repro (`simpleBean` + `beanWithFactoryBean`, one JVM): FAIL → PASS.
 - All 30 `GroovyBeanDefinitionReaderTests` methods that don't hit the
   separate `component-scan` hang (see below), run together in ONE JVM
@@ -158,6 +159,46 @@ to a genuinely different class keeps the exact existing behavior.
   cross-script collision at all): baseline 29/36 pass excluding the 6 hangs,
   fix 30/36 — the fix also incidentally corrected `beanWithParentRef`, which
   hit the same self-call pattern within a single script.
+
+**IMPORTANT — re-verified against the ACTUAL current `dev` tip after rebasing
+(2026-07-06, later same session):** while this fix was in progress, a
+DIFFERENT concurrent session independently found and merged (`30e82560`/
+`7367ac9c`, "Fix CRATONVM_LOADER_AWARE_RESOLUTION gate lock-step drift
+disabling Hibernate enhancement fixes") the EXACT SAME stale-mirror-gate bug
+described in the "Residual A" section below — flipping both `native-builtins`
+and `classloading`'s copies of the gate to default-on, validated against the
+Hibernate bytecode-enhancement suite (PASS 40→86/131). That fix is now
+`dev`'s default behavior. Rebasing this doc's `invokestatic` fix onto that
+tip and re-running the SAME 30-method `GroovyBeanDefinitionReaderTests`
+batch shows a MATERIALLY WORSE starting point than the pre-gate-fix numbers
+above: **without** this doc's `invokestatic` fix, current `dev` tip
+(`d14d2ff3`, gate-mirrors-on) crashes outright partway through the batch
+(`class file error: class not found: beans$_run_closure1` — a HARD failure,
+not a soft per-test failure) — i.e. the OTHER session's gate fix, though
+correctly validated against Hibernate, introduces a live regression against
+this Groovy scenario that was not caught by that session's own (Hibernate-
+only) validation. **With** this doc's `invokestatic` fix layered on top of
+that same tip, the batch completes (no crash) at **15/30 PASS** — a real,
+measurable improvement over "crashes before printing a single result," but
+markedly worse than the 23/30 this fix achieved against the OLDER
+pre-gate-fix baseline. The 15 failures on the combined tip show THREE
+different symptoms: the `startup failed`/`Should never happen`/
+`beans$_run_closure1` "class not found" patterns already described above,
+PLUS a new one, `Class.isAssignableFrom: argument is null`, not previously
+seen and not investigated further (out of scope / time for this session,
+but worth flagging: it appeared only once the OTHER session's gate-mirror
+fix was combined with this one, so it is plausibly yet another facet of the
+same loader-identity-vs-Groovy-compiler-state interaction, not necessarily
+a new independent bug).
+
+**Net effect of shipping this fix on top of current `dev`:** turns a hard
+crash into a partial pass (0 useful results → 15/30), a genuine improvement,
+but `GroovyBeanDefinitionReaderTests` is NOT close to fully fixed on current
+`dev` tip and needs more work than originally estimated from the
+pre-gate-fix numbers above. Given the now-confirmed regression from the
+OTHER session's already-merged gate-mirror fix, whoever picks up the
+"Follow-up" items below should re-baseline against current `dev` tip first,
+not against the older numbers earlier in this section.
 
 ### Follow-up: Groovy compiler-state reuse across scripts (open, deeper than Residual B)
 
@@ -463,36 +504,48 @@ is never triggered at all (no exception, silently wrong, exactly as the
 "Known remaining limitation" section predicts). This is a genuine instance of
 that already-documented, deliberately-deferred gap, not a new bug.
 
-**Separately found (2026-07-06) and NOT shipped:** while investigating, found
-that `CRATONVM_LOADER_AWARE_RESOLUTION`'s default has THREE independent
-copies — `vm/src/runtime/env_cache.rs` (flipped to default-ON 2026-07-03, per
-this doc's Status line), and two "mirror" copies, `native-builtins/src/
+**Separately found (2026-07-06):** while investigating, found that
+`CRATONVM_LOADER_AWARE_RESOLUTION`'s default has THREE independent copies —
+`vm/src/runtime/env_cache.rs` (flipped to default-ON 2026-07-03, per this
+doc's Status line), and two "mirror" copies, `native-builtins/src/
 classloader.rs::loader_aware_resolution` and `classloading/src/
 class_manager.rs::loader_aware_resolution`, each with a doc comment claiming
 to "stay in lock-step" with the `vm` crate's copy. Neither mirror was ever
 updated when the `vm` crate's copy flipped default-on — both silently stayed
-default-OFF the whole time, so the `native-builtins`/`classloading` halves of
-loader-faithful resolution (per-loader `defineClass` namespace assignment,
-loader-faithful supertype linking) have been running the OLD gate-OFF
-behavior in every default-config `dev` run since 2026-07-03, invisibly
-out-of-lock-step with the interpreter half. Flipping both mirrors' defaults to
-match (a 2-line change per file) DOES fix this doc's `BshScriptFactoryTests`
-namespace-assignment symptom in isolation (confirmed via debug trace: the
-first `MyMessenger` define correctly gets its own namespace instead of landing
-in Application) — but does NOT fix the actual `BshScriptFactoryTests` failure
-(the `Class.forName` reverse-pollution above is a separate step in the same
-chain), and flipping it DOES regress the Groovy suite: a minimal 2-`GroovyShell`
-self-call repro that passes on the current (mirrors-off) `dev` tip started
-throwing a hard `ClassNotFoundException` with the mirrors flipped on. Given
-this doc's own prior finding ("Flipping this doc's `CRATONVM_LOADER_AWARE_
-RESOLUTION` global default was considered and explicitly rejected" for the
-Groovy cluster, precisely because the full app-gauntlet soak bar wasn't met)
-and this new evidence of a live regression, the mirror-default fix was
-**reverted, not committed** — it needs its own dedicated soak before shipping,
-same bar this doc has always required for gate-default changes. The stale-
-mirror bug itself is real and worth fixing eventually, just not as a
-side-effect of this session's Residual-B-focused work.
+default-OFF, so the `native-builtins`/`classloading` halves of loader-faithful
+resolution (per-loader `defineClass` namespace assignment, loader-faithful
+supertype linking) ran the OLD gate-OFF behavior in every default-config
+`dev` run since 2026-07-03, invisibly out-of-lock-step with the interpreter
+half. A local fix (flip both mirrors' defaults to match) was drafted and
+found to fix this doc's `BshScriptFactoryTests` namespace-assignment symptom
+in isolation but NOT the actual `BshScriptFactoryTests` failure (the
+`Class.forName` reverse-pollution above is a separate step in the same
+chain), and to regress a minimal Groovy self-call repro (`ClassNotFoundException`
+where none existed before) — so it was reverted rather than shipped from this
+branch, pending the full app-gauntlet soak this doc has always required for
+gate-default changes.
 
+**Superseded 2026-07-06 (same day, different concurrent session):** another
+session independently found and fixed the identical stale-mirror bug
+(`30e82560`/`7367ac9c`, "Fix CRATONVM_LOADER_AWARE_RESOLUTION gate lock-step
+drift disabling Hibernate enhancement fixes"), flipped both mirrors'
+defaults to match, validated against the Hibernate bytecode-enhancement
+suite (PASS 40→86/131 on a 131-class gated subset), and merged it into
+`dev` (now `dev` tip as of this doc's update, `d14d2ff3`+). That soak did
+NOT include a Groovy check. Re-verifying THIS doc's own repro against the
+now-current `dev` tip confirms the regression this branch's abandoned
+attempt already flagged: `d14d2ff3` alone (gate-mirrors-on, no other
+changes) crashes `GroovyBeanDefinitionReaderTests` outright partway through
+a 30-method batch (`class file error: class not found:
+beans$_run_closure1` — not a soft per-test failure, a hard VM error). This
+doc's `invokestatic` self-call fix (Residual B, above) mitigates but does
+not fully resolve this on the combined tip — see the "IMPORTANT — re-verified
+against the ACTUAL current `dev` tip" note in the Residual B section above
+for exact numbers (15/30 pass on combined tip vs. 23/30 against the
+older pre-gate-fix baseline). The stale-mirror bug itself is therefore
+FIXED on `dev` (Hibernate-validated), but its Groovy-suite side effect is a
+newly-confirmed, still-open regression, only partially compensated by this
+branch's `invokestatic` fix.
 ## Impact
 
 - `ProxyClassReuseTest.testNoReuse` (1 of 3 methods).
