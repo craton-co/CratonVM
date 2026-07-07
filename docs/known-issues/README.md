@@ -4,6 +4,30 @@ This folder collects CratonVM-only defects found while running upstream Java
 suites. The docs had grown to describe the **same underlying bug from several
 angles**; this index is the consolidated map. Read it first.
 
+## 2026-07-07 JIT invokedynamic uncommon-trap Groovy regression — FIXED (no tradeoff)
+
+- ✅ FIXED: `fb4a333d`'s precise-resume routing for the invokedynamic
+  uncommon trap (reason 8 / `UnreachedCode`) regressed
+  `GroovyBeanDefinitionReaderTests` under JIT-on. An earlier pass shipped a
+  blanket revert (reopening the exact silent-corruption risk `fb4a333d` had
+  fixed) as a stopgap — rejected as a final answer. Follow-up investigation
+  recovered `fb4a333d`'s own uncommitted standalone repros and found the REAL
+  root causes: (1) `getstatic` codegen never marked a reference-typed static
+  field as a GC/deopt oop (unlike `getfield`'s already-fixed inline arms),
+  corrupting `LicmRepro`/`LicmRepro2`/`ArrRepro`; (2) the invokedynamic-trap
+  snapshot mis-stamped its `DeoptReason` as `OsrExit` instead of
+  `UnreachedCode`, so the trap was never blacklisted after firing; (3) three
+  separate VM-side call sites consumed a stashed deopt frame without ever
+  driving de-speculation, so a blacklisted method kept getting re-entered
+  anyway. All four fixed; reason 8 keeps `fb4a333d`'s original unconditional
+  precise-resume routing. Verified: the corruption-repro suite is now
+  provably correct against HotSpot ground truth where it previously
+  crashed; Groovy matches the pre-existing (already-merged) baseline exactly
+  (30/36 isolated, 5/36 batch — both pre-existing numbers, unaffected either
+  way); `cargo test -p cratonvm-jit --lib` unchanged (878 passed, 4
+  pre-existing aarch64 failures). Doc moved to
+  [`docs/internal/jit-invokedynamic-uncommon-trap-precise-resume-groovy-regression-FIXED.md`](../internal/jit-invokedynamic-uncommon-trap-precise-resume-groovy-regression-FIXED.md).
+
 ## 2026-07-07 GC_STRESS residual corruption re-assessed (still OPEN, two hypotheses refuted)
 
 - 🟡 Re-ran the Fork6Hard `GC_STRESS` lane on current dev (commit `3a1a95b5`): **0 crashes in 56 runs** — the severe SIGSEGV/`CompactValue`-panic faces the doc opened for are gone (contained by the 2026-07-06 `2dfdfddc` slot-tearing + map-node + guard/recovery wave). Residual is now a *contained* stale-reference young-mark rejection that still surfaces as a rep-level `ClassCastException`/`NoSuchMethodError`/`nullchild` (32/56) or a rare wedge (5/56). **Refuted both leading producers**: disabling JIT inline-`new` (4→3/12) and compact-ref-fields (→3/12) change nothing, and it reproduces under `--nojit` too, so it is a shared-core missed-root/missed-remap bug, not JIT allocation codegen. The cheap `ZonedDateTimeTest` livelock repro is CLOSED (completes clean now). Kept in known-issues (unfixed). Full write-up in [gcstress-residual-corruption-faces.md](gcstress-residual-corruption-faces.md).
