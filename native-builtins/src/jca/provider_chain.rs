@@ -174,6 +174,51 @@ fn remove(name: &str) {
     }
 }
 
+/// Real `java.security.Provider` objects handed to `Security.addProvider` /
+/// `insertProviderAt`, keyed by provider name -> a permanent GC root handle
+/// (see `NativeContext::add_global_root`). Every OTHER read of a provider
+/// (`Security.getProvider`, `getProviders`, `getService`'s internal
+/// `make_provider` calls, …) hands out a *fresh synthetic* `Provider`
+/// (module-top doc: "we never hold a heap `ObjectRef` past the originating
+/// callback") — deliberately, since most callers only need `getName`/
+/// `getVersion`/`getProperty`, which our synthetics answer correctly without
+/// pinning the real object forever.
+///
+/// Some providers, though, carry private state no JCA-visible accessor
+/// exposes: BouncyCastle-FIPS's `BouncyCastleFipsProvider` resolves
+/// `getService()`/`Service.newInstance()` through its own private
+/// `creatorMap` (an `EngineCreator` factory keyed by the same `className`
+/// string it also `put()`s into the inherited legacy Hashtable — see
+/// `try_engine_creator_instantiate`), never through the reflectable
+/// `className` our `ServiceEntry`/synthetic-Service path assumes. Retaining
+/// the real object here is what lets `build_jca_instance` reach that map.
+fn real_provider_table() -> &'static parking_lot::Mutex<rustc_hash::FxHashMap<String, usize>> {
+    use std::sync::OnceLock;
+    static MAP: OnceLock<parking_lot::Mutex<rustc_hash::FxHashMap<String, usize>>> = OnceLock::new();
+    MAP.get_or_init(|| parking_lot::Mutex::new(rustc_hash::FxHashMap::default()))
+}
+
+/// Remember `prov` (a real `Provider` object, e.g. just passed to
+/// `Security.addProvider`) as the real-object entry for `name`, replacing
+/// (and releasing the global root of) any previous entry for the same name.
+fn remember_real_provider(ctx: &mut dyn NativeContext, name: &str, prov: ObjectRef) {
+    let handle = ctx.add_global_root(prov);
+    if handle == 0 {
+        return;
+    }
+    let old = real_provider_table().lock().insert(name.to_string(), handle);
+    if let Some(old_handle) = old {
+        ctx.remove_global_root(old_handle);
+    }
+}
+
+/// Resolve the real `Provider` object registered for `name`, if any — see
+/// `real_provider_table`.
+fn resolve_real_provider(ctx: &mut dyn NativeContext, name: &str) -> Option<ObjectRef> {
+    let handle = real_provider_table().lock().get(name).copied()?;
+    ctx.resolve_global_root(handle)
+}
+
 // ---------------------------------------------------------------------------
 // Provider synthetic — slot layout documented at module top.
 // ---------------------------------------------------------------------------
@@ -467,6 +512,7 @@ fn security_add_provider(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
         Some(pair) => pair,
         None => return Ok(Some(Value::Int(-1))),
     };
+    remember_real_provider(ctx, &name, prov);
     Ok(Some(Value::Int(add(name, ver))))
 }
 
@@ -489,6 +535,7 @@ fn security_insert_provider_at(ctx: &mut dyn NativeContext, args: &[Value]) -> M
         Some(pair) => pair,
         None => return Ok(Some(Value::Int(-1))),
     };
+    remember_real_provider(ctx, &name, prov);
     Ok(Some(Value::Int(insert_at(name, ver, pos))))
 }
 
@@ -498,6 +545,9 @@ fn security_remove_provider(ctx: &mut dyn NativeContext, args: &[Value]) -> Meth
         _ => return Ok(None),
     };
     remove(&name);
+    if let Some(handle) = real_provider_table().lock().remove(&name) {
+        ctx.remove_global_root(handle);
+    }
     Ok(None)
 }
 
@@ -1435,6 +1485,7 @@ fn provider_put_service_native(ctx: &mut dyn NativeContext, args: &[Value]) -> M
     }
     let provider_name = provider_name_of(ctx, this);
     put_service(&provider_name, &type_str, &algorithm, &class_name);
+
     // Mirror the legacy `put` path's raw-property bookkeeping so
     // `getProperty`/`containsKey` on the equivalent legacy key also see
     // this registration (some providers query back via either surface).
@@ -1808,18 +1859,49 @@ fn build_jca_instance(
     if entry.class_name.is_empty() {
         return None;
     }
-    let internal = entry.class_name.replace('.', "/");
+    // Try the provider's own `EngineCreator` factory first when the real
+    // provider object is on file (see `try_engine_creator_instantiate`) —
+    // required for BC-FIPS, whose `className` is a non-loadable label.
+    let engine_creator_result = resolve_real_provider(ctx, provider)
+        .and_then(|provider_obj| try_engine_creator_instantiate(ctx, provider_obj, &entry.class_name));
     Some((|| {
         // 1. Instantiate the real SPI (runs genuine provider bytecode), pinned.
-        let impl_ref = match ctx.new_object_initialized(&internal, "()V", &[])? {
-            Some(Value::Object(Some(o))) => o,
-            _ => {
-                return Err(
-                    cratonvm_types::error::RuntimeError::ClassNotFoundException {
-                        class_name: entry.class_name.clone(),
-                    }
-                    .into(),
-                )
+        let impl_ref = if let Some(result) = engine_creator_result {
+            match result? {
+                Some(Value::Object(Some(o))) => o,
+                _ => {
+                    return Err(
+                        cratonvm_types::error::RuntimeError::ClassNotFoundException {
+                            class_name: entry.class_name.clone(),
+                        }
+                        .into(),
+                    )
+                }
+            }
+        } else {
+            // Class-loading here can fail with a non-catchable internal
+            // `VmError` (`new_object_initialized` resolves classes through
+            // the low-level `load_class_concurrent` bootstrap path, which is
+            // NOT the same as `Class.forName` — a miss there is meant to be
+            // fatal for genuine VM-internal lookups). `className` is
+            // arbitrary data supplied by whatever provider registered this
+            // service, so a lookup miss here is an ordinary, expected
+            // outcome and must surface as a catchable Java exception
+            // instead of aborting the process.
+            let internal = entry.class_name.replace('.', "/");
+            match ctx.new_object_initialized(&internal, "()V", &[]) {
+                Ok(Some(Value::Object(Some(o)))) => o,
+                Err(MethodCallFailed::ExceptionThrown(t)) => {
+                    return Err(MethodCallFailed::ExceptionThrown(t))
+                }
+                _ => {
+                    return Err(
+                        cratonvm_types::error::RuntimeError::ClassNotFoundException {
+                            class_name: entry.class_name.clone(),
+                        }
+                        .into(),
+                    )
+                }
             }
         };
         // Pin the SPI across the Provider allocation below (which can GC).
@@ -1930,6 +2012,58 @@ fn getinstance_instance_search(ctx: &mut dyn NativeContext, args: &[Value]) -> M
     .into())
 }
 
+/// Bridge for providers whose real `getService()`/`Service.newInstance()`
+/// never builds the SPI via reflection at all. BouncyCastle-FIPS's
+/// `BouncyCastleFipsProvider` is the motivating (and, so far, only known)
+/// case: `addAlgorithmImplementation` registers each algorithm through the
+/// plain inherited `Provider.put(key, className)` — which we already
+/// capture into `ServiceEntry.class_name` — PLUS a private
+/// `Map<String, EngineCreator> creatorMap` keyed by that SAME `className`
+/// string. `className` itself was never meant to be `Class.forName`-loadable
+/// (BC-FIPS builds it as `<enclosing-class-dotted-name>.<memberName-with-
+/// $-nesting>` purely as a label — e.g.
+/// `"org.bouncycastle.jcajce.provider.ProvEC.AlgorithmParametersSpi$EC"`, a
+/// string with no corresponding class file); the REAL construction is
+/// `creatorMap.get(className).createInstance(param)`, which only BC-FIPS's
+/// own `Provider$Service` subclass (its private `BcService`, never
+/// constructed by our bridge) would ever call.
+///
+/// `creatorMap` has no JCA-visible accessor, so reach it directly: given the
+/// real provider object, read its `creatorMap` field, look up `className`,
+/// and — if a creator is on file — invoke `createInstance(Object)` on it,
+/// exactly the call BC-FIPS's own bytecode would have made.
+///
+/// Returns `None` when `provider_obj` has no `creatorMap` field (or no
+/// entry for `class_name`) — true for every ordinary
+/// `className`-is-a-real-class provider — so callers fall back to the
+/// existing reflective path unchanged.
+fn try_engine_creator_instantiate(
+    ctx: &mut dyn NativeContext,
+    provider_obj: ObjectRef,
+    class_name: &str,
+) -> Option<MethodCallResult> {
+    let creator_map = match ctx.get_field_by_name(provider_obj, "creatorMap") {
+        Value::Object(Some(m)) => m,
+        _ => return None,
+    };
+    let key = ctx.create_string(class_name);
+    let creator = match ctx.invoke_virtual(
+        creator_map,
+        "get",
+        "(Ljava/lang/Object;)Ljava/lang/Object;",
+        &[Value::Object(Some(key))],
+    ) {
+        Ok(Some(Value::Object(Some(c)))) => c,
+        _ => return None,
+    };
+    Some(ctx.invoke_virtual(
+        creator,
+        "createInstance",
+        "(Ljava/lang/Object;)Ljava/lang/Object;",
+        &[Value::Object(None)],
+    ))
+}
+
 /// `java.security.Provider$Service.newInstance(Object constructorParameter)` —
 /// reflectively instantiate the entry's implementation class (a real BC `*Spi`)
 /// and run its no-arg constructor, so the genuine provider bytecode produces the
@@ -1964,13 +2098,26 @@ fn provider_service_new_instance(ctx: &mut dyn NativeContext, args: &[Value]) ->
             }
         }
     };
+    if let Value::Object(Some(provider_obj)) = ctx.get_field_by_name(this, "provider") {
+        if let Some(result) = try_engine_creator_instantiate(ctx, provider_obj, &class_name) {
+            return result;
+        }
+    }
     let internal = class_name.replace('.', "/");
     // GC-safe allocate + run the no-arg constructor (real BC SPI bytecode). The
     // SPI constructor can allocate enough to trigger a moving GC, so we must not
     // hold the raw reference across `<init>` — `new_object_initialized` pins it
     // and returns the forwarded reference.
-    match ctx.new_object_initialized(&internal, "()V", &[])? {
-        Some(v @ Value::Object(Some(_))) => Ok(Some(v)),
+    //
+    // `className` is arbitrary data the provider registered (not code we
+    // control), so a lookup miss is an ordinary, expected outcome — it must
+    // surface as a catchable `ClassNotFoundException`, not the non-catchable
+    // internal `VmError` `new_object_initialized` raises for its normal
+    // (VM-bootstrap) callers. Match on the `Result` explicitly instead of `?`
+    // so a class-not-found here can't abort the process.
+    match ctx.new_object_initialized(&internal, "()V", &[]) {
+        Ok(Some(v @ Value::Object(Some(_)))) => Ok(Some(v)),
+        Err(MethodCallFailed::ExceptionThrown(t)) => Err(MethodCallFailed::ExceptionThrown(t)),
         _ => Err(
             cratonvm_types::error::RuntimeError::ClassNotFoundException {
                 class_name: class_name.clone(),
