@@ -1649,12 +1649,16 @@ pub(crate) fn huc_get_header_field_named(ctx: &mut dyn NativeContext, args: &[Va
         _ => return Ok(Some(Value::Object(None))),
     };
     // Real-JDK carrier: read from the cached perform result, not synthetic slots.
+    // LAST duplicate wins, mirroring `sun.net.www.MessageHeader.findValue`'s
+    // backwards iteration (see `content_length_of`'s doc for the MockWebServer
+    // duplicate-Content-Length case that exposed this).
     if let Some(url_str) = huc_real_object_url(ctx, this) {
         if url_str.starts_with("http://") || url_str.starts_with("https://") {
             huc_real_perform(ctx, this, &url_str)?;
             let v = huc_real_headers(ctx, this)
                 .into_iter()
-                .find(|(k, _)| k.eq_ignore_ascii_case(&name))
+                .filter(|(k, _)| k.eq_ignore_ascii_case(&name))
+                .last()
                 .map(|(_, v)| v);
             return Ok(Some(match v {
                 Some(s) => Value::Object(Some(ctx.create_string(&s))),
@@ -1668,7 +1672,8 @@ pub(crate) fn huc_get_header_field_named(ctx: &mut dyn NativeContext, args: &[Va
     let v = with_state(ctx, this, |s| {
         s.response_headers
             .iter()
-            .find(|(k, _)| k.eq_ignore_ascii_case(&name))
+            .filter(|(k, _)| k.eq_ignore_ascii_case(&name))
+            .last()
             .map(|(_, v)| v.clone())
     })
     .flatten();
@@ -1769,10 +1774,18 @@ fn huc_get_header_fields(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
 /// HEAD 200 and call the resource empty/unreadable
 /// (ResourceTests.remoteResourceExists: `exists()` true but `isReadable()`
 /// false, `contentLength()` 0 instead of 6).
+///
+/// LAST duplicate wins: `sun.net.www.MessageHeader.findValue` iterates
+/// BACKWARDS (`for (int i = nkeys; --i >= 0;)`), so on real JDK a later
+/// duplicate header overrides an earlier one. MockWebServer actually emits
+/// `Content-Length: 0` (its bodiless default) FOLLOWED BY the test's
+/// `addHeader("Content-Length", "6")` on both HotSpot and CratonVM — HotSpot
+/// reads 6, so must we.
 fn content_length_of(headers: &[(String, String)], body_len: usize) -> i64 {
     headers
         .iter()
-        .find(|(k, _)| k.eq_ignore_ascii_case("content-length"))
+        .filter(|(k, _)| k.eq_ignore_ascii_case("content-length"))
+        .last()
         .and_then(|(_, v)| v.trim().parse::<i64>().ok())
         .unwrap_or(body_len as i64)
 }
@@ -2460,6 +2473,15 @@ mod http_url_connection_tests {
         assert_eq!(content_length_of(&headers, 0), 6);
         // No header → fall back to the buffered body size.
         assert_eq!(content_length_of(&[], 5), 5);
+        // Duplicate headers: the LAST wins (MessageHeader.findValue iterates
+        // backwards). MockWebServer emits its bodiless "Content-Length: 0"
+        // default before the test's addHeader("Content-Length", "6").
+        let dup = vec![
+            ("Content-Length".to_string(), "0".to_string()),
+            ("Content-Type".to_string(), "text/plain".to_string()),
+            ("Content-Length".to_string(), "6".to_string()),
+        ];
+        assert_eq!(content_length_of(&dup, 0), 6);
     }
 
     #[test]
