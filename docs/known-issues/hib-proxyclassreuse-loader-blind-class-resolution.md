@@ -2,7 +2,7 @@
 
 | | |
 |---|---|
-| **Status** | `ProxyClassReuseTest.testNoReuse` FIXED, gate **default ON**. Residual B (`GroovyBeanDefinitionReaderTests`/`GroovyApplicationContextTests` MetaClass/dispatch bug) **partially fixed 2026-07-06** — real root cause found and fixed (`invokestatic` self-calls re-resolved their owner class by name instead of reusing the executing frame's own `ClassId`); a SEPARATE, concurrently-merged gate-mirror fix (`30e82560`, see Residual A) introduced a NEW regression to this same suite that the invokestatic fix only partially compensates for on current `dev` tip — see Residual B section for exact before/after numbers on both the old and new baselines. Residual A (`BshScriptFactoryTests` reverse-pollution) re-verified 2026-07-06, **still open**. Doc stays in `known-issues` for: Residual A, the Groovy-suite regression from the concurrently-merged gate-mirror fix, a Residual-B-adjacent Groovy-compiler-state bug, and a separate pre-existing `component-scan` hang. |
+| **Status** | `ProxyClassReuseTest.testNoReuse` FIXED, gate **default ON**. Residual B (`GroovyBeanDefinitionReaderTests`/`GroovyApplicationContextTests` MetaClass/dispatch bug) **FIXED 2026-07-06** — two companion root causes found and fixed: `invokestatic` self-calls re-resolving their owner class by name (`f3a45ca9`), and `Class.getEnclosingClass()` doing the same for a Groovy closure's enclosing-class name (`f6662334`) — the second one specifically needed once a concurrently-merged gate-mirror fix (`30e82560`) correctly tightened the global lookup's ambiguity handling. Verified against BOTH suites: Hibernate `gated_subset.txt` 100/131 (up from `30e82560`'s own 86/131, not a regression) and `GroovyBeanDefinitionReaderTests` 30/30 under `--nojit` (a separate, unrelated JIT invokedynamic regression, `fb4a333d`, currently masks this under default JIT-on settings — flagged, not fixed here). Residual A (`BshScriptFactoryTests` reverse-pollution) re-verified 2026-07-06, **still open** — unaffected by, and unrelated to, the Residual B fixes above. Doc stays in `known-issues` for: Residual A, the separate JIT/invokedynamic regression masking Residual B under JIT-on, and a separate pre-existing `component-scan` hang. |
 | **Area** | VM core — real-JDK-mode class-loader identity + `CONSTANT_Class` resolution (the flat global class store conflated loader namespaces). |
 | **Symptom** | `org.hibernate.orm.test.proxy.ProxyClassReuseTest.testNoReuse` fails: `MappingException: Could not instantiate persister … MyEntity`, caused by `IncompatibleClassChangeError: class …MyEntity$HibernateProxy already defined by application loader`. |
 | **Severity** | medium (CratonVM-only; pre-existing — fails identically at baseline `b0aab8f9`). Same class as SBR-14 / SC-custom-classloader isolation residuals. |
@@ -546,6 +546,72 @@ older pre-gate-fix baseline). The stale-mirror bug itself is therefore
 FIXED on `dev` (Hibernate-validated), but its Groovy-suite side effect is a
 newly-confirmed, still-open regression, only partially compensated by this
 branch's `invokestatic` fix.
+
+**RESOLVED 2026-07-06 (same session, follow-up):** root-caused and fixed the
+regression precisely. Traced the "class not found: beans$_run_closure1" crash
+(gate-mirror fix alone, no invokestatic fix) and the `Class.isAssignableFrom:
+argument is null` NPE (both fixes combined) to a SINGLE additional root
+cause: `Class.getEnclosingClass()` (`native_class_get_enclosing_class`,
+`native-builtins/src/lang_reflect.rs`) resolves a class's `EnclosingMethod`/
+`InnerClasses`-attribute enclosing/outer class NAME via the same global,
+loader-blind `class_id_by_name`/`ensure_class_initialized` this doc's "Known
+remaining limitation" section names. Every Groovy script compiles under the
+identical top-level name (`"beans"` for Spring's `GroovyBeanDefinitionReader`),
+so `beans$_run_closure1`'s `EnclosingMethod` attribute always names its
+enclosing class `"beans"` — and two sequential test methods produce two
+DISTINCT `"beans"` classes sharing that name. Before the gate-mirror fix, the
+global lookup silently guessed SOME `"beans"` class; after it, the lookup
+correctly refuses to guess (returns ambiguous/`None`) — so `getEnclosingClass()`
+started returning `null`, surfacing downstream in real Groovy bytecode
+(`Closure.getThisType()`'s `GeneratedClosure.class.isAssignableFrom(this
+.getClass().getEnclosingClass())` loop) as the NPE. **Fix** (`f6662334`):
+probe the SAME defining loader as the receiver class first (via
+`loader_id_of_class` + `class_id_defined_by_loader_exact`, the same
+mechanism `findLoadedClass` already uses faithfully) before falling through
+to the pre-existing global lookup; built-in-loader classes are unaffected.
+
+**Verification (both suites, per the standard this doc has always required
+for gate-adjacent changes):**
+- `GroovyBeanDefinitionReaderTests`, 30 non-hanging methods in one JVM
+  (`--nojit` — see the separate, unrelated JIT regression noted below):
+  **30/30 PASS** (up from 23/30 with only the invokestatic fix on the
+  pre-gate-fix baseline, and up from a hard crash on the actual current
+  `dev` tip without this fix).
+- `GroovyApplicationContextTests`: still 4/4.
+- `BshScriptFactoryTests` (Residual A): unchanged, 15/18, confirming this
+  fix is orthogonal to Residual A's remaining bug.
+- Hibernate bytecode-enhancement `gated_subset.txt` (131 classes, the exact
+  suite `30e82560` validated against, re-run with a Linux-adapted
+  `run_gated.sh` against the fixed binary): **PASS 100/131** — up from the
+  86/131 `30e82560` itself reported, not a regression. Residual 31 failures
+  match the already-documented, separately-tracked `lazy.*`/`detached.*`/
+  `mapping.lazytoone.*` cluster (see `hib-bytecode-enhancement-loader-
+  faithful-linking.md`) plus the two pre-existing gate-sensitive ABORTED
+  cases (`InheritedTest`, `MappedSuperclassTest`) `30e82560`'s own commit
+  message already flagged as not a regression.
+
+**Separate, unrelated finding surfaced during this verification**: a
+different, newly-landed commit on `dev` (`fb4a333d`, "Fix silent data
+corruption: precise resume for JIT invokedynamic uncommon trap") currently
+breaks ALL Groovy execution when the JIT is enabled — every
+`GroovyBeanDefinitionReaderTests` method fails with a Groovy-compiler-internal
+`"duplicate main method"` / `"startup failed"` error under default (JIT-on)
+settings, masking the fix above entirely unless `--nojit` is passed. This
+reproduces identically with or without every fix in this doc and is
+unrelated to loader-identity/gate work — flagged here for whoever picks up
+JIT/invokedynamic work next, not investigated further in this session (out
+of scope: this doc is about class-loader identity, not the JIT).
+
+With this fix, the two concurrently-discovered halves of the same underlying
+issue (the invokestatic self-call fix and this `getEnclosingClass` fix) are
+BOTH now landed, and the stale-mirror gate fix's Hibernate improvement is
+preserved (in fact further improved, 86→100/131) with no remaining Groovy
+regression under `--nojit`. Residual B (the Groovy MetaClass/dispatch bug
+this doc originally opened) is now considered FIXED, modulo the separate
+JIT regression noted above (which masks it under default settings until
+that unrelated bug is fixed) and the separate pre-existing `component-scan`
+hang (6/36 methods, still open, still unrelated).
+
 ## Impact
 
 - `ProxyClassReuseTest.testNoReuse` (1 of 3 methods).
