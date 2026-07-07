@@ -2070,9 +2070,115 @@ fn register_ssl_context_impl(r: &mut NativeMethodRegistry) {
 // 11. SSLEngineResult — accessor stubs
 // ---------------------------------------------------------------------------
 
+/// Map this file's OWN synthetic status int codes (the `alloc_ssl_engine_result`
+/// convention above: `STATUS_OK`=0/`CLOSED`=1/`BUFFER_UNDERFLOW`=2/
+/// `BUFFER_OVERFLOW`=3) to `t27_tls`'s real-JDK-ordinal codes (`SR_*`), so both
+/// conventions resolve through the same real-enum-singleton lookup.
+fn tls_status_code_to_real(code: i32) -> i32 {
+    match code {
+        STATUS_CLOSED => crate::t27_tls::SR_CLOSED,
+        STATUS_BUFFER_UNDERFLOW => crate::t27_tls::SR_BUFFER_UNDERFLOW,
+        STATUS_BUFFER_OVERFLOW => crate::t27_tls::SR_BUFFER_OVERFLOW,
+        _ => crate::t27_tls::SR_OK,
+    }
+}
+
+/// As [`tls_status_code_to_real`], for the handshake-status convention
+/// (`HS_NOT_HANDSHAKING`=0/`NEED_WRAP`=1/`NEED_UNWRAP`=2/`NEED_TASK`=3/
+/// `FINISHED`=4 here vs the real JDK enum ordinals in `t27_tls::HS_*_R`).
+fn tls_hs_code_to_real(code: i32) -> i32 {
+    match code {
+        HS_NEED_WRAP => crate::t27_tls::HS_NEED_WRAP_R,
+        HS_NEED_UNWRAP => crate::t27_tls::HS_NEED_UNWRAP_R,
+        HS_NEED_TASK => crate::t27_tls::HS_NEED_TASK_R,
+        HS_FINISHED => crate::t27_tls::HS_FINISHED_R,
+        _ => crate::t27_tls::HS_NOT_HANDSHAKING_R,
+    }
+}
+
+/// Shared body for `getStatus()`/`getHandshakeStatus()`.
+///
+/// FIX (sslengineresult-stub-shadow): these accessors are registered
+/// unconditionally — the `SyntheticStub` category is only dropped under
+/// `CRATONVM_NO_STUBS`, which nothing sets by default — so in real-JDK mode
+/// they SHADOW the real `SSLEngineResult` bytecode. The pre-fix versions
+/// assumed every receiver was this file's synthetic int-code object and
+/// returned a FRESH 1-slot synthetic enum holder, so every identity
+/// comparison in real JSSE driver code (`result.getStatus() == Status.OK`,
+/// `result.getHandshakeStatus() == HandshakeStatus.NEED_WRAP` — e.g.
+/// `sun.net.httpserver.SSLStreams.recvData`, which gates `doHandshake()` on
+/// exactly those `==` checks) silently failed. The server-side handshake
+/// driver therefore never saw NEED_WRAP, never wrapped, and its peer waited
+/// forever for a ServerHello — surfacing as the client-side
+/// `SSLHandshakeException: handshake read: Resource temporarily unavailable
+/// (os error 11)` stall on every real-JDK `HttpsServer` exchange. Same
+/// stub-shadows-real-bytecode family as the `SymbolLookup` and
+/// `KeyManagerFactory` fixes.
+///
+/// Resolution order:
+/// 1. A real enum reference already stored on the receiver (objects built
+///    via the real 4-arg ctor in `t27_tls::alloc_engine_result`) passes
+///    through untouched — by-name first (layout-proof), then the raw slot.
+/// 2. An int code is translated to the REAL enum singleton via
+///    `t27_tls::real_*_enum` (`valueOf` on the real class), distinguishing
+///    the two producer conventions by allocated width: a 2-slot object is
+///    this file's fake-engine convention; anything wider stores the
+///    real-JDK-ordinal codes (`t27_tls`/`phases_late` fallbacks).
+/// 3. Only when no real enum class is resolvable (pure synthetic-JDK mode,
+///    where the fake state machine is the only producer AND the only
+///    consumer) fall back to the legacy fresh 1-slot holder.
+fn engine_result_enum_accessor(
+    ctx: &mut dyn NativeContext,
+    this: ObjectRef,
+    real_field: &str,
+    slot: usize,
+    enum_cls: &str,
+    is_handshake: bool,
+) -> MethodCallResult {
+    if let Value::Object(Some(o)) = ctx.get_field_by_name(this, real_field) {
+        return Ok(Some(Value::Object(Some(o))));
+    }
+    let raw = ctx.get_field(this, slot);
+    match raw {
+        Value::Object(Some(_)) => Ok(Some(raw)),
+        Value::Int(code) => {
+            let real_code = if ctx.object_num_fields(this) <= 2 {
+                if is_handshake {
+                    tls_hs_code_to_real(code)
+                } else {
+                    tls_status_code_to_real(code)
+                }
+            } else {
+                // Wider objects (t27_tls / phases_late fallbacks) already
+                // store real-JDK-ordinal codes.
+                code
+            };
+            let v = if is_handshake {
+                crate::t27_tls::real_handshake_status_enum(ctx, real_code)
+            } else {
+                crate::t27_tls::real_status_enum(ctx, real_code)
+            };
+            if matches!(v, Value::Object(Some(_))) {
+                Ok(Some(v))
+            } else {
+                // Pure synthetic-JDK mode: legacy 1-slot int holder.
+                let holder = alloc_concurrent_synthetic(ctx, enum_cls, 1);
+                ctx.set_field(holder, 0, Value::Int(code));
+                Ok(Some(Value::Object(Some(holder))))
+            }
+        }
+        _ => Ok(Some(Value::Object(None))),
+    }
+}
+
 fn register_ssl_engine_result(r: &mut NativeMethodRegistry) {
     // SyntheticStub: accessors over the synthetic SSLEngineResult produced by
-    // the fake SSLEngine state machine — no real TLS result data.
+    // the fake SSLEngine state machine. NOTE: these are ACTIVE in real-JDK
+    // mode too (stub-dropping is opt-in via CRATONVM_NO_STUBS), so every body
+    // below must also behave correctly for a REAL SSLEngineResult built by
+    // real bytecode / `t27_tls::alloc_engine_result` — see
+    // `engine_result_enum_accessor`'s doc for the handshake stall this
+    // caused when they didn't.
     let __prev_cat = r.current_category();
     r.set_category(cratonvm_native_api::NativeKind::SyntheticStub);
     let cls = "javax/net/ssl/SSLEngineResult";
@@ -2085,11 +2191,14 @@ fn register_ssl_engine_result(r: &mut NativeMethodRegistry) {
         "()Ljavax/net/ssl/SSLEngineResult$Status;",
         |ctx, args| {
             let this = obj_arg(args, 0)?;
-            let status_obj =
-                alloc_concurrent_synthetic(ctx, "javax/net/ssl/SSLEngineResult$Status", 1);
-            let status_val = ctx.get_field(this, 0);
-            ctx.set_field(status_obj, 0, status_val);
-            Ok(Some(Value::Object(Some(status_obj))))
+            engine_result_enum_accessor(
+                ctx,
+                this,
+                "status",
+                0,
+                "javax/net/ssl/SSLEngineResult$Status",
+                false,
+            )
         },
     );
 
@@ -2100,21 +2209,46 @@ fn register_ssl_engine_result(r: &mut NativeMethodRegistry) {
         "()Ljavax/net/ssl/SSLEngineResult$HandshakeStatus;",
         |ctx, args| {
             let this = obj_arg(args, 0)?;
-            let hs_obj =
-                alloc_concurrent_synthetic(ctx, "javax/net/ssl/SSLEngineResult$HandshakeStatus", 1);
-            let hs_val = ctx.get_field(this, 1);
-            ctx.set_field(hs_obj, 0, hs_val);
-            Ok(Some(Value::Object(Some(hs_obj))))
+            engine_result_enum_accessor(
+                ctx,
+                this,
+                "handshakeStatus",
+                1,
+                "javax/net/ssl/SSLEngineResult$HandshakeStatus",
+                true,
+            )
         },
     );
 
-    // bytesConsumed() -> int
-    r.register(cls, "bytesConsumed", "()I", |_ctx, _args| {
+    // bytesConsumed() -> int. Real field first (real ctor path), then the
+    // 4-slot fallback convention (consumed@2); the 2-slot fake-engine object
+    // never stored a consumed count, so 0 is the only honest answer there
+    // (matching the pre-fix behavior for that producer only).
+    r.register(cls, "bytesConsumed", "()I", |ctx, args| {
+        let this = obj_arg(args, 0)?;
+        if let Value::Int(n) = ctx.get_field_by_name(this, "bytesConsumed") {
+            return Ok(Some(Value::Int(n)));
+        }
+        if ctx.object_num_fields(this) >= 3 {
+            if let Value::Int(n) = ctx.get_field(this, 2) {
+                return Ok(Some(Value::Int(n)));
+            }
+        }
         Ok(Some(Value::Int(0)))
     });
 
-    // bytesProduced() -> int
-    r.register(cls, "bytesProduced", "()I", |_ctx, _args| {
+    // bytesProduced() -> int (see bytesConsumed; produced@3 in the 4-slot
+    // fallback convention).
+    r.register(cls, "bytesProduced", "()I", |ctx, args| {
+        let this = obj_arg(args, 0)?;
+        if let Value::Int(n) = ctx.get_field_by_name(this, "bytesProduced") {
+            return Ok(Some(Value::Int(n)));
+        }
+        if ctx.object_num_fields(this) >= 4 {
+            if let Value::Int(n) = ctx.get_field(this, 3) {
+                return Ok(Some(Value::Int(n)));
+            }
+        }
         Ok(Some(Value::Int(0)))
     });
     r.set_category(__prev_cat);
@@ -2346,6 +2480,36 @@ pub(crate) fn register_tls_natives(r: &mut NativeMethodRegistry) {
 mod tls_tests {
     use super::*;
     use cratonvm_native_api::NativeMethodRegistry;
+
+    // --- SSLEngineResult int-code convention translation ---------------------
+
+    #[test]
+    fn engine_result_code_translation_maps_conventions_onto_real_ordinals() {
+        // This file's fake-engine convention → t27_tls real-JDK-ordinal codes.
+        assert_eq!(tls_status_code_to_real(STATUS_OK), crate::t27_tls::SR_OK);
+        assert_eq!(tls_status_code_to_real(STATUS_CLOSED), crate::t27_tls::SR_CLOSED);
+        assert_eq!(
+            tls_status_code_to_real(STATUS_BUFFER_UNDERFLOW),
+            crate::t27_tls::SR_BUFFER_UNDERFLOW
+        );
+        assert_eq!(
+            tls_status_code_to_real(STATUS_BUFFER_OVERFLOW),
+            crate::t27_tls::SR_BUFFER_OVERFLOW
+        );
+        assert_eq!(
+            tls_hs_code_to_real(HS_NOT_HANDSHAKING),
+            crate::t27_tls::HS_NOT_HANDSHAKING_R
+        );
+        assert_eq!(tls_hs_code_to_real(HS_NEED_WRAP), crate::t27_tls::HS_NEED_WRAP_R);
+        assert_eq!(tls_hs_code_to_real(HS_NEED_UNWRAP), crate::t27_tls::HS_NEED_UNWRAP_R);
+        assert_eq!(tls_hs_code_to_real(HS_NEED_TASK), crate::t27_tls::HS_NEED_TASK_R);
+        assert_eq!(tls_hs_code_to_real(HS_FINISHED), crate::t27_tls::HS_FINISHED_R);
+        // The two conventions genuinely disagree on these — the whole reason
+        // the translation exists (e.g. raw code 3 is NEED_TASK here but
+        // NEED_WRAP in real-JDK ordinals).
+        assert_ne!(HS_NEED_WRAP, crate::t27_tls::HS_NEED_WRAP_R);
+        assert_ne!(STATUS_CLOSED, crate::t27_tls::SR_CLOSED);
+    }
 
     // --- Registration tests -------------------------------------------------
 
