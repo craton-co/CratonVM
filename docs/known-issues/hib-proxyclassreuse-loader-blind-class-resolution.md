@@ -2,7 +2,7 @@
 
 | | |
 |---|---|
-| **Status** | `ProxyClassReuseTest.testNoReuse` FIXED, gate now **default ON** (flipped 2026-07-03 during the `context.groovy` fix, validated with the Hibernate app-gauntlet soak below on 2026-07-04). Genuinely open residuals remain elsewhere in this doc (Groovy `MetaClass`/dispatch-layer bug, `BshScriptFactoryTests` reverse-pollution) — kept in `known-issues` for those. |
+| **Status** | `ProxyClassReuseTest.testNoReuse` FIXED, gate **default ON** (flipped 2026-07-03, validated 2026-07-04). Residual B (`GroovyBeanDefinitionReaderTests`/`GroovyApplicationContextTests` MetaClass/dispatch bug) **substantially fixed 2026-07-06** — see below (real root cause found: `invokestatic` self-calls re-resolved their owner class by name instead of reusing the executing frame's own `ClassId`, silently landing on the WRONG same-named class from a sibling `GroovyClassLoader`). Residual A (`BshScriptFactoryTests` reverse-pollution) re-verified 2026-07-06, **still open** — re-investigated further; see updated section below. Doc stays in `known-issues` for Residual A and the newly-found Residual-B-adjacent Groovy-compiler-state bug + a separate pre-existing `component-scan` hang. |
 | **Area** | VM core — real-JDK-mode class-loader identity + `CONSTANT_Class` resolution (the flat global class store conflated loader namespaces). |
 | **Symptom** | `org.hibernate.orm.test.proxy.ProxyClassReuseTest.testNoReuse` fails: `MappingException: Could not instantiate persister … MyEntity`, caused by `IncompatibleClassChangeError: class …MyEntity$HibernateProxy already defined by application loader`. |
 | **Severity** | medium (CratonVM-only; pre-existing — fails identically at baseline `b0aab8f9`). Same class as SBR-14 / SC-custom-classloader isolation residuals. |
@@ -92,7 +92,115 @@ same cluster (both unconditional, not gated):
   exists; the common single-custom-loader case (Tomcat/Hibernate/WildFly) is
   unaffected.
 
-### Residual (not fixed) — cross-script/cross-method closure-identity collision
+### Residual B FIXED (2026-07-06) — `invokestatic` self-calls re-resolved their own class by name
+
+Re-verified on current `dev` tip (2026-07-06): `GroovyApplicationContextTests`
+was ALREADY fully green (4/4, matching HotSpot) before any new fix — better
+than this doc's 2026-07-03 snapshot ("3/4 methods fail even in isolation"),
+apparently improved by unrelated loader-identity work that landed since. That
+snapshot is now stale; `GroovyApplicationContextTests` is not part of the open
+residual anymore.
+
+`GroovyBeanDefinitionReaderTests` was still broken. Root-caused with a minimal
+reproducer (`KRunMethod` harness running exactly two real Spring test methods,
+`simpleBean` then `beanWithFactoryBean`, in one JVM — each a fresh
+`GroovyShell`/`GroovyClassLoader` producing its own `beans$_run_closure1`):
+the SECOND method's closure threw `NoSuchMethodError` naming a synthetic
+accessor (`$get$$class$...`) that only the FIRST method's closure class
+declares — order-independent, whichever script runs second fails, always
+referencing the earlier script's accessor name.
+
+**This is a different bug from the `CONSTANT_Class`/`defineClass`/
+`findLoadedClass` triage this doc otherwise covers.** The Groovy-generated
+synthetic class-literal-cache accessor (`$get$$class$Foo()`, a private
+static helper) is called via a plain `invokestatic` SELF-call — the
+closure's own `doCall` calling a method on its own class. `execute_invokestatic`
+(`vm/src/runtime/interpreter.rs`) resolved the call's owner class purely by
+the constant-pool NAME string, via the same loader-blind `get_loaded_class_id`
+this doc's "Known remaining limitation" section already flags — even though
+the executing frame's `ClassId` (`current_class_id`) is already known and IS
+the correct answer for a self-call. `try_stackless_invoke` already had a
+`dispatch_class_override: Option<ClassId>` parameter built for exactly this
+class of bug (used by the `invokevirtual`/`invokespecial` paths — receiver
+identity, and `lookup_loader_initiated`'s initiating-loader semantics,
+respectively) but `execute_invokestatic` was the one caller that always
+passed `None`, so a same-named self-call fell all the way through to the
+global, loader-blind name lookup — which silently returns whichever
+same-named class the flat store happens to hold when only ONE of the two
+colliding classes has been probed/registered so far (not an ambiguous-miss
+case, since both real classes are genuinely loaded — just the wrong one for
+this frame).
+
+**Fix** (`a7790a91`, `vm/src/runtime/interpreter.rs::execute_invokestatic`):
+when the invokestatic's constant-pool owner name textually matches the
+current frame's own class name, resolve straight to `current_class_id`
+(definitionally already loaded/linked/initialized) and thread that `ClassId`
+through as `try_stackless_invoke`'s existing `dispatch_class_override`
+parameter, plus route the `invoke_or_native` recursive-fallback path through
+`invoke_on_class_shared(current_class_id, ...)` instead of its internal
+name-based lookup. No other invokestatic call site is touched — a real call
+to a genuinely different class keeps the exact existing behavior.
+
+**Verification:**
+- Two-method repro (`simpleBean` + `beanWithFactoryBean`, one JVM): FAIL → PASS.
+- All 30 `GroovyBeanDefinitionReaderTests` methods that don't hit the
+  separate `component-scan` hang (see below), run together in ONE JVM
+  (matching real Spring/JUnit usage — the scenario this doc's numbers are
+  measured against): **23/30 PASS** (up from ~5-7/36 in prior snapshots of
+  this doc). The 7 that still fail show two DIFFERENT, deeper failure modes
+  not touched by this fix (Groovy-compiler-internal state reuse across
+  scripts — see "Follow-up: Groovy compiler-state reuse" below).
+- `GroovyApplicationContextTests`: still 4/4, no regression.
+- `cratonvm-vm` unit suite: 2129 passed (9 pre-existing `lock_order` failures
+  are a `--release`-vs-`--debug` test-harness expectation mismatch, unrelated,
+  reproduce identically on pre-fix code).
+- Per-method isolation (one JVM per test, the shape that can't reproduce the
+  cross-script collision at all): baseline 29/36 pass excluding the 6 hangs,
+  fix 30/36 — the fix also incidentally corrected `beanWithParentRef`, which
+  hit the same self-call pattern within a single script.
+
+### Follow-up: Groovy compiler-state reuse across scripts (open, deeper than Residual B)
+
+Running all 30 non-hanging `GroovyBeanDefinitionReaderTests` methods together
+still leaves 7 failing, with error text that is NOT a CratonVM
+`NoSuchMethodError`/`ClassCastException` pattern but Groovy's OWN compiler
+diagnostics, e.g.:
+
+```
+beans: 12: The current parameter list already contains a parameter of the name bean
+ @ line 12, column 28.
+```
+
+and a bare `Should never happen` (an internal Groovy AST/compiler assertion
+message) for other methods. This means some of Groovy's OWN compiler-internal
+state (AST parameter-list tracking, or similar) is being incorrectly shared
+or not fully reset **between separate `GroovyShell.parseClass` invocations**
+— a different bug from both this doc's classloader-identity mechanism and
+the `invokestatic` self-call fix above. Not investigated further in this
+session (would need tracing Groovy's own compiler pipeline, e.g.
+`org.codehaus.groovy.control.CompilationUnit`/`SourceUnit` state, and
+whatever CratonVM native shims or reflection paths those depend on — no
+CratonVM code was identified as the culprit before time ran out on this
+follow-up). Flagged here as the next concrete step for closing out
+`GroovyBeanDefinitionReaderTests` fully.
+
+### Separate pre-existing hang: `component-scan` / XML-namespace Groovy DSL (open, unrelated)
+
+6 of the 36 `GroovyBeanDefinitionReaderTests` methods —
+`contextComponentScanSpringTag`, `useSpringNamespaceAsMethod`,
+`useTwoSpringNamespaces`, `springAopSupport`, `springScopedProxyBean`,
+`springNamespaceBean` — hang indefinitely (confirmed via per-method
+`KRunMethod` isolation with a 15-30s timeout) **identically before and after**
+the `invokestatic` fix above, and identically on the un-fixed baseline. All
+six use the Groovy DSL's `xmlns context:"…"` / `context.'component-scan'(...)`
+namespace-tag mechanism (`GroovyDynamicElementReader`), which likely performs
+a real classpath/directory scan. Not triaged further — flagged as a separate,
+pre-existing bug outside this doc's scope (not loader-identity-related as far
+as this session went).
+
+### 2026-07-03 snapshot (historical — superseded by the above)
+
+Original text describing the pre-fix state, kept for history:
 
 Even with the fixes above, `GroovyApplicationContextDynamicBeanPropertyTests`
 is now fully green (2/2, byte-for-byte HotSpot match), but
@@ -324,6 +432,66 @@ defining loader. Focused verification:
 passes the new "hide user namespace" and "keep application namespace" cases (re-run
 2026-07-01). Full Spring BeanShell / Hibernate app repros were not rerun in this
 session, so this document remains in `docs/known-issues`.
+
+**2026-07-06 re-verification: still open, still fails identically.** Re-ran
+`BshScriptFactoryTests` on current `dev` tip (`9f1db39d`+): **15/18 pass**, the
+SAME 3 methods fail with the SAME `ClassCastException` the 2026-07-01 entry
+describes (`staticPrototypeScript`, `resourceScriptFromTag`,
+`nonStaticPrototypeScript`). The doc's own suspicion that current `dev`'s more
+general `find_loaded_class_for_loader` (rejecting ANY `loader_id_of_class(cid)
+> 2` hit for a built-in-loader query, not just generated-proxy names) might
+have already fixed this incidentally was checked directly via `--verbose`
+debug tracing and confirmed NOT the case — `findLoadedClass` itself now behaves
+correctly (every subsequent `BshClassLoader`'s `findLoadedClass("MyMessenger")`
+correctly misses, as it should), but the SECOND interpreter's `MyMessenger`
+still never gets generated.
+
+Traced the actual failure precisely this session: BeanShell's
+`ClassManagerImpl.plainClassForName` calls the STATIC 1-arg
+`Class.forName(name)` (not `Class.forName(name, false, loader)`), which
+CratonVM's `native_class_for_name` (`native-builtins/src/lang_class.rs`)
+routes to the bootstrap-style global `ctx.ensure_class_initialized`
+(→ `load_class_concurrent` → `ClassManager::get_loaded_class_id`) whenever no
+explicit loader argument is present — the SAME loader-blind global lookup this
+doc's "Known remaining limitation" section already names. At the moment the
+SECOND `BshClassLoader` calls this, only ONE `MyMessenger` (the first
+interpreter's) is registered yet, so `get_loaded_class_id`'s ambiguity check
+(which only fires when 2+ DIFFERENT loaders already have their OWN copy) sees
+a single, unambiguous match and returns it — `plainClassForName` "succeeds"
+with the wrong class, so the second interpreter's own `MyMessenger` generation
+is never triggered at all (no exception, silently wrong, exactly as the
+"Known remaining limitation" section predicts). This is a genuine instance of
+that already-documented, deliberately-deferred gap, not a new bug.
+
+**Separately found (2026-07-06) and NOT shipped:** while investigating, found
+that `CRATONVM_LOADER_AWARE_RESOLUTION`'s default has THREE independent
+copies — `vm/src/runtime/env_cache.rs` (flipped to default-ON 2026-07-03, per
+this doc's Status line), and two "mirror" copies, `native-builtins/src/
+classloader.rs::loader_aware_resolution` and `classloading/src/
+class_manager.rs::loader_aware_resolution`, each with a doc comment claiming
+to "stay in lock-step" with the `vm` crate's copy. Neither mirror was ever
+updated when the `vm` crate's copy flipped default-on — both silently stayed
+default-OFF the whole time, so the `native-builtins`/`classloading` halves of
+loader-faithful resolution (per-loader `defineClass` namespace assignment,
+loader-faithful supertype linking) have been running the OLD gate-OFF
+behavior in every default-config `dev` run since 2026-07-03, invisibly
+out-of-lock-step with the interpreter half. Flipping both mirrors' defaults to
+match (a 2-line change per file) DOES fix this doc's `BshScriptFactoryTests`
+namespace-assignment symptom in isolation (confirmed via debug trace: the
+first `MyMessenger` define correctly gets its own namespace instead of landing
+in Application) — but does NOT fix the actual `BshScriptFactoryTests` failure
+(the `Class.forName` reverse-pollution above is a separate step in the same
+chain), and flipping it DOES regress the Groovy suite: a minimal 2-`GroovyShell`
+self-call repro that passes on the current (mirrors-off) `dev` tip started
+throwing a hard `ClassNotFoundException` with the mirrors flipped on. Given
+this doc's own prior finding ("Flipping this doc's `CRATONVM_LOADER_AWARE_
+RESOLUTION` global default was considered and explicitly rejected" for the
+Groovy cluster, precisely because the full app-gauntlet soak bar wasn't met)
+and this new evidence of a live regression, the mirror-default fix was
+**reverted, not committed** — it needs its own dedicated soak before shipping,
+same bar this doc has always required for gate-default changes. The stale-
+mirror bug itself is real and worth fixing eventually, just not as a
+side-effect of this session's Residual-B-focused work.
 
 ## Impact
 
