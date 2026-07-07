@@ -9300,20 +9300,6 @@ fn resume_real_ir_deopt(
     }
 }
 
-/// deopt-osr Step 8 follow-up (P4): `CRATONVM_OSR_EXIT_TRANSFER` (default-OFF,
-/// read-once). When ON, a frame-deopt taken inside OSR-entered code transfers the
-/// JIT-advanced loop state into the LIVE interpreter frame and resumes the loop
-/// body there (a *true* OSR-exit), instead of the safe reject that discards the
-/// JIT-advanced state and re-runs those iterations in the interpreter. OFF ⇒ the
-/// validated Step-8 reject ⇒ byte-identical to today. Consulted together with the
-/// per-method `can_osr_exit` flag and `cratonvm_jit::deopt_real_enabled()` at the
-/// OSR sink, so OSR-exit can never run half-on.
-fn osr_exit_transfer_enabled() -> bool {
-    use std::sync::OnceLock;
-    static FLAG: OnceLock<bool> = OnceLock::new();
-    *FLAG.get_or_init(|| std::env::var_os("CRATONVM_OSR_EXIT_TRANSFER").is_some())
-}
-
 /// deopt-osr Step 8 follow-up (P4) — TRUE OSR-exit: transfer the JIT-advanced loop
 /// state from a reconstructed frame into the LIVE interpreter frame at `frame_idx`
 /// (overwrite locals + operand stack in place, set pc), so the interpreter resumes
@@ -17290,13 +17276,6 @@ pub fn coerce_lambda_args(
     receiver_present: bool,
     num_captures: usize,
 ) -> Result<(), MethodCallFailed> {
-    // LambdaMetafactory argument adaptation: replay the `checkcast` to each
-    // instantiated parameter type that the (bypassed) synthetic SAM bridge would
-    // have performed, so a narrowed type variable still raises
-    // `ClassCastException` for an incompatible argument. Runs before the
-    // box/unbox coercion below, mirroring the bridge's cast-then-adapt order.
-    checkcast_lambda_instantiated_args(shared, sam_desc, inst_desc, args, num_captures)?;
-
     let (sam_params, _sam_ret) = split_method_descriptor(sam_desc);
     let (impl_params, _impl_ret) = split_method_descriptor(impl_desc);
 
@@ -17309,13 +17288,48 @@ pub fn coerce_lambda_args(
         return Ok(());
     }
 
+    // GC-safety: the instantiated-type checkcast below can LOAD classes and
+    // `coerce_arg` BOXES primitives — both allocate and can trigger a moving
+    // young GC while `args` sits in this raw Rust Vec, invisible to the
+    // collector (native stale-local family). Pin every object entry into
+    // `native_pin_roots` (which the GC remaps), refresh the Vec from the pins
+    // after every potentially-allocating step, and keep each pin tracking the
+    // CURRENT object for its index as entries are coerced. Pins are truncated
+    // on every exit path.
+    let pin_base = thread.native_pin_roots.len();
+    let mut handles: Vec<Option<usize>> = Vec::with_capacity(args.len());
+    for a in args.iter() {
+        if let Value::Object(Some(o)) = a {
+            handles.push(Some(thread.native_pin_roots.len()));
+            thread.native_pin_roots.push(*o);
+        } else {
+            handles.push(None);
+        }
+    }
+
+    // LambdaMetafactory argument adaptation: replay the `checkcast` to each
+    // instantiated parameter type that the (bypassed) synthetic SAM bridge would
+    // have performed, so a narrowed type variable still raises
+    // `ClassCastException` for an incompatible argument. Runs before the
+    // box/unbox coercion below, mirroring the bridge's cast-then-adapt order.
+    if let Err(e) = checkcast_lambda_instantiated_args(shared, sam_desc, inst_desc, args, num_captures)
+    {
+        thread.native_pin_roots.truncate(pin_base);
+        return Err(e);
+    }
+    for (j, h) in handles.iter().enumerate() {
+        if let Some(h) = *h {
+            args[j] = Value::Object(Some(thread.native_pin_roots[h]));
+        }
+    }
+
     // The SAM-supplied args start at index num_captures in `args` (captures
     // come first). Captures themselves may also need boxing if bound as the
     // impl's receiver or first params, but for now we focus on the SAM args,
     // which is where the primitive/reference mismatch occurs.
     let impl_non_recv = &impl_params[..];
     // We want to coerce each arg[i] against the corresponding impl param.
-    for (i, arg) in args.iter_mut().enumerate() {
+    for i in 0..args.len() {
         if i < receiver_skip {
             continue;
         }
@@ -17338,9 +17352,34 @@ pub fn coerce_lambda_args(
             impl_non_recv[impl_idx].clone()
         };
         let impl_tok = &impl_non_recv[impl_idx];
-        let coerced = coerce_arg(shared, thread, &sam_tok, impl_tok, *arg)?;
-        *arg = coerced;
+        let coerced = match coerce_arg(shared, thread, &sam_tok, impl_tok, args[i]) {
+            Ok(v) => v,
+            Err(e) => {
+                thread.native_pin_roots.truncate(pin_base);
+                return Err(e);
+            }
+        };
+        // Keep this index's pin tracking the (possibly freshly boxed) object.
+        match coerced {
+            Value::Object(Some(o)) => {
+                if let Some(h) = handles[i] {
+                    thread.native_pin_roots[h] = o;
+                } else {
+                    handles[i] = Some(thread.native_pin_roots.len());
+                    thread.native_pin_roots.push(o);
+                }
+            }
+            _ => handles[i] = None,
+        }
+        args[i] = coerced;
+        // coerce_arg may have allocated (boxing) — refresh every pinned entry.
+        for (j, h) in handles.iter().enumerate() {
+            if let Some(h) = *h {
+                args[j] = Value::Object(Some(thread.native_pin_roots[h]));
+            }
+        }
     }
+    thread.native_pin_roots.truncate(pin_base);
     Ok(())
 }
 
@@ -23185,8 +23224,18 @@ fn try_osr(
     //     (the unconditional-at-header trigger). The validated Step-8 default.
     if result_i64 == i64::MIN {
         if let Some(rframe) = cratonvm_jit::deopt::take_last_deopt() {
-            if osr_exit_transfer_enabled()
-                && compiled.can_osr_exit
+            // FIX (silent data corruption, HHH-15895 InPredicateTest / AccumRepro3
+            // residual): `compiled.can_osr_exit` is already a precise gate — it's
+            // false unless this compile genuinely recorded an OSR-exit snapshot
+            // (either the experimental `deopt_real_enabled()`-gated loop-header
+            // guards, or the now-unconditional invokedynamic uncommon-trap
+            // snapshot — see the fix notes in `jit/src/x64.rs`). The separate
+            // `osr_exit_transfer_enabled()` opt-in gate was redundant on top of
+            // that and, left in place, would silently keep the invokedynamic
+            // trap on the corruption-prone "safe reject" path in default builds
+            // (`CRATONVM_OSR_EXIT_TRANSFER` unset). Dropped in favor of
+            // `can_osr_exit` alone.
+            if compiled.can_osr_exit
                 && transfer_osr_exit_into_live_frame(shared, thread, frame_idx, &rframe).is_some()
             {
                 if std::env::var_os("CRATONVM_DBG_DEOPT").is_some() {

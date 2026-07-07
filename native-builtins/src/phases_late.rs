@@ -52599,25 +52599,30 @@ fn introspector_get_bean_info(ctx: &mut dyn NativeContext, args: &[Value]) -> Me
             _ => desc.to_string(),
         }
     }
+    // Every mirror accumulated during discovery is produced by an allocating
+    // call and read again only after MANY later allocating calls (the rest of
+    // the discovery scan, then the descriptor-build tail), so each ref is
+    // stored together with its native-pin handle — `(pin_handle, ref)` — and
+    // re-read from the pin at the point of use (native stale-local family).
     #[derive(Default)]
     struct PropAcc {
         name: String,
-        read_method: Option<ObjectRef>,
-        read_ret_mirror: Option<ObjectRef>,
+        read_method: Option<(usize, ObjectRef)>,
+        read_ret_mirror: Option<(usize, ObjectRef)>,
         read_ret_desc: Option<String>,
         read_ret_cid: Option<cratonvm_types::ClassId>,
         uses_is: bool,
         // (method_mirror, param_desc, param_mirror, param_class_id)
         write_methods: Vec<(
-            ObjectRef,
+            (usize, ObjectRef),
             String,
-            ObjectRef,
+            (usize, ObjectRef),
             Option<cratonvm_types::ClassId>,
         )>,
         // indexed read method `getXxx(int) -> T` (first one wins).
-        indexed_read: Option<ObjectRef>,
+        indexed_read: Option<(usize, ObjectRef)>,
         // void-returning indexed setters `setXxx(int, E)` — (mirror, E desc).
-        indexed_write_candidates: Vec<(ObjectRef, String)>,
+        indexed_write_candidates: Vec<((usize, ObjectRef), String)>,
     }
     fn prop_idx(props: &mut Vec<PropAcc>, name: &str) -> usize {
         match props.iter().position(|p| p.name == name) {
@@ -52687,11 +52692,16 @@ fn introspector_get_bean_info(ctx: &mut dyn NativeContext, args: &[Value]) -> Me
     // build getMethodDescriptors() — java.beans BeanInfo exposes every
     // Class.getMethods() entry, and Spring's ExtendedBeanInfo scans them for
     // non-standard write methods.
-    let mut all_method_mirrors: Vec<ObjectRef> = Vec::new();
+    let mut all_method_mirrors: Vec<(usize, ObjectRef)> = Vec::new();
     for cid in scan_cids {
         // Resolve the mirror for this declaring class so the Method mirror
         // points at the class that actually declares the method.
         let declaring_mirror = ctx.get_class_mirror(cid);
+        // Pin across the per-method mirror construction below — every
+        // `build_method_mirror` / descriptor-mirror call allocates, and a
+        // moving young GC there would relocate `declaring_mirror` between
+        // methods (native stale-local family). Re-read before each use.
+        let declaring_mirror_pin = ctx.pin_native_root(declaring_mirror);
 
         let methods = ctx.declared_methods(cid);
         for method in &methods {
@@ -52705,6 +52715,7 @@ fn introspector_get_bean_info(ctx: &mut dyn NativeContext, args: &[Value]) -> Me
             // Collect every public, non-constructor method for the
             // MethodDescriptor[] (mirrors Class.getMethods()).
             if method.access_flags & 0x0001 != 0 && !name.starts_with('<') {
+                let declaring_mirror = ctx.read_native_pin(declaring_mirror_pin, declaring_mirror);
                 let mm_all = crate::jmx_openmbean::build_method_mirror(
                     ctx,
                     declaring_mirror,
@@ -52712,7 +52723,8 @@ fn introspector_get_bean_info(ctx: &mut dyn NativeContext, args: &[Value]) -> Me
                     desc,
                     method.access_flags,
                 );
-                all_method_mirrors.push(mm_all);
+                let mm_all_pin = ctx.pin_native_root(mm_all);
+                all_method_mirrors.push((mm_all_pin, mm_all));
             }
             // JavaBeans properties come from PUBLIC INSTANCE methods only
             // (java.beans uses Class.getMethods(), which is public-only — a
@@ -52737,7 +52749,9 @@ fn introspector_get_bean_info(ctx: &mut dyn NativeContext, args: &[Value]) -> Me
                     .to_string();
                 let ret_mirror =
                     crate::jmx_openmbean::type_descriptor_to_class_mirror_pub(ctx, &ret_desc);
+                let ret_mirror_pin = ctx.pin_native_root(ret_mirror);
                 let ret_cid = crate::lang_class::mirror_class_id(ctx, ret_mirror);
+                let declaring_mirror = ctx.read_native_pin(declaring_mirror_pin, declaring_mirror);
                 let mm = crate::jmx_openmbean::build_method_mirror(
                     ctx,
                     declaring_mirror,
@@ -52745,19 +52759,21 @@ fn introspector_get_bean_info(ctx: &mut dyn NativeContext, args: &[Value]) -> Me
                     desc,
                     method.access_flags,
                 );
+                let mm_pin = ctx.pin_native_root(mm);
+                let ret_mirror = ctx.read_native_pin(ret_mirror_pin, ret_mirror);
                 let idx = prop_idx(&mut props, &prop_name);
                 let p = &mut props[idx];
                 if is_is {
                     // A boolean isXxx() always wins and locks out plain getters.
-                    p.read_method = Some(mm);
-                    p.read_ret_mirror = Some(ret_mirror);
+                    p.read_method = Some((mm_pin, mm));
+                    p.read_ret_mirror = Some((ret_mirror_pin, ret_mirror));
                     p.read_ret_desc = Some(ret_desc);
                     p.read_ret_cid = ret_cid;
                     p.uses_is = true;
                 } else if !p.uses_is && p.read_method.is_none() {
                     // First plain getter (subclass is walked first) wins.
-                    p.read_method = Some(mm);
-                    p.read_ret_mirror = Some(ret_mirror);
+                    p.read_method = Some((mm_pin, mm));
+                    p.read_ret_mirror = Some((ret_mirror_pin, ret_mirror));
                     p.read_ret_desc = Some(ret_desc);
                     p.read_ret_cid = ret_cid;
                 }
@@ -52768,6 +52784,8 @@ fn introspector_get_bean_info(ctx: &mut dyn NativeContext, args: &[Value]) -> Me
                 let (params, ret) = crate::jmx_openmbean::parse_method_descriptor_pub(desc);
                 if params.len() == 1 && params[0] == "I" && ret != "V" {
                     let prop_name = decapitalize(&name[3..]);
+                    let declaring_mirror =
+                        ctx.read_native_pin(declaring_mirror_pin, declaring_mirror);
                     let mm = crate::jmx_openmbean::build_method_mirror(
                         ctx,
                         declaring_mirror,
@@ -52775,9 +52793,10 @@ fn introspector_get_bean_info(ctx: &mut dyn NativeContext, args: &[Value]) -> Me
                         desc,
                         method.access_flags,
                     );
+                    let mm_pin = ctx.pin_native_root(mm);
                     let idx = prop_idx(&mut props, &prop_name);
                     if props[idx].indexed_read.is_none() {
-                        props[idx].indexed_read = Some(mm);
+                        props[idx].indexed_read = Some((mm_pin, mm));
                     }
                 }
             }
@@ -52790,7 +52809,10 @@ fn introspector_get_bean_info(ctx: &mut dyn NativeContext, args: &[Value]) -> Me
                     let prop_name = decapitalize(&name[3..]);
                     let param_mirror =
                         crate::jmx_openmbean::type_descriptor_to_class_mirror_pub(ctx, &params[0]);
+                    let param_mirror_pin = ctx.pin_native_root(param_mirror);
                     let param_cid = crate::lang_class::mirror_class_id(ctx, param_mirror);
+                    let declaring_mirror =
+                        ctx.read_native_pin(declaring_mirror_pin, declaring_mirror);
                     let mm = crate::jmx_openmbean::build_method_mirror(
                         ctx,
                         declaring_mirror,
@@ -52798,13 +52820,20 @@ fn introspector_get_bean_info(ctx: &mut dyn NativeContext, args: &[Value]) -> Me
                         desc,
                         method.access_flags,
                     );
+                    let mm_pin = ctx.pin_native_root(mm);
+                    let param_mirror = ctx.read_native_pin(param_mirror_pin, param_mirror);
                     let idx = prop_idx(&mut props, &prop_name);
-                    props[idx]
-                        .write_methods
-                        .push((mm, params[0].clone(), param_mirror, param_cid));
+                    props[idx].write_methods.push((
+                        (mm_pin, mm),
+                        params[0].clone(),
+                        (param_mirror_pin, param_mirror),
+                        param_cid,
+                    ));
                 } else if params.len() == 2 && params[0] == "I" {
                     // Standard (void-returning) indexed setter.
                     let prop_name = decapitalize(&name[3..]);
+                    let declaring_mirror =
+                        ctx.read_native_pin(declaring_mirror_pin, declaring_mirror);
                     let mm = crate::jmx_openmbean::build_method_mirror(
                         ctx,
                         declaring_mirror,
@@ -52812,10 +52841,11 @@ fn introspector_get_bean_info(ctx: &mut dyn NativeContext, args: &[Value]) -> Me
                         desc,
                         method.access_flags,
                     );
+                    let mm_pin = ctx.pin_native_root(mm);
                     let idx = prop_idx(&mut props, &prop_name);
                     props[idx]
                         .indexed_write_candidates
-                        .push((mm, params[1].clone()));
+                        .push(((mm_pin, mm), params[1].clone()));
                 }
             }
         }
@@ -52824,17 +52854,22 @@ fn introspector_get_bean_info(ctx: &mut dyn NativeContext, args: &[Value]) -> Me
     // Resolve each accumulated property into the
     // (name, readMethod, writeMethod, propertyType, indexedReadMethod,
     // indexedWriteMethod) tuple the descriptor builder below expects.
+    // Each Option carries a `(pin_handle, ref)` pair — see `PropAcc` above.
+    // NOTE: this resolve loop performs no allocating ctx calls, so reading
+    // the raw refs stored in `props` here (they are only copied, never
+    // dereferenced) is safe; every heap read happens in the descriptor-build
+    // tail below via `read_native_pin`.
     let mut properties: Vec<(
         String,
-        Option<ObjectRef>,
-        Option<ObjectRef>,
-        Option<ObjectRef>,
-        Option<ObjectRef>,
-        Option<ObjectRef>,
+        Option<(usize, ObjectRef)>,
+        Option<(usize, ObjectRef)>,
+        Option<(usize, ObjectRef)>,
+        Option<(usize, ObjectRef)>,
+        Option<(usize, ObjectRef)>,
     )> = Vec::with_capacity(props.len());
     for p in &mut props {
-        let mut write_method: Option<ObjectRef> = None;
-        let mut write_param_mirror: Option<ObjectRef> = None;
+        let mut write_method: Option<(usize, ObjectRef)> = None;
+        let mut write_param_mirror: Option<(usize, ObjectRef)> = None;
         if !p.write_methods.is_empty() {
             // Seed type: getter return type, else smallest parameter type name.
             let (mut type_desc, mut type_cid) = if p.read_method.is_some() {
@@ -52889,8 +52924,13 @@ fn introspector_get_bean_info(ctx: &mut dyn NativeContext, args: &[Value]) -> Me
     if !ctx.is_interface_class(class_id) && !properties.iter().any(|(n, ..)| n == "class") {
         let class_class_mirror = match ctx.ensure_class_initialized("java/lang/Class") {
             Ok(cid) => ctx.get_class_mirror(cid),
-            Err(_) => class_mirror,
+            // Re-read from the pin: the discovery scan above (and the failed
+            // load here) allocated, so the raw `class_mirror` is stale
+            // (native stale-local family).
+            Err(_) => ctx.read_native_pin(class_mirror_pin, class_mirror),
         };
+        let class_class_mirror_pin = ctx.pin_native_root(class_class_mirror);
+        let class_mirror = ctx.read_native_pin(class_mirror_pin, class_mirror);
         let getter = crate::jmx_openmbean::build_method_mirror(
             ctx,
             class_mirror,
@@ -52898,11 +52938,13 @@ fn introspector_get_bean_info(ctx: &mut dyn NativeContext, args: &[Value]) -> Me
             "()Ljava/lang/Class;",
             0x0001, /* ACC_PUBLIC */
         );
+        let getter_pin = ctx.pin_native_root(getter);
+        let class_class_mirror = ctx.read_native_pin(class_class_mirror_pin, class_class_mirror);
         properties.push((
             "class".to_string(),
-            Some(getter),
+            Some((getter_pin, getter)),
             None,
-            Some(class_class_mirror),
+            Some((class_class_mirror_pin, class_class_mirror)),
             None,
             None,
         ));
@@ -52936,6 +52978,13 @@ fn introspector_get_bean_info(ctx: &mut dyn NativeContext, args: &[Value]) -> Me
     {
         let name_str = ctx.create_string(prop_name);
         let name_pin = ctx.pin_native_root(name_str);
+        // Re-read every pinned discovery-phase mirror to its current address —
+        // the `create_string` above and the previous iterations' ctor invokes
+        // may have moved them (native stale-local family).
+        let getter_cur = getter.map(|(h, o)| ctx.read_native_pin(h, o));
+        let setter_cur = setter.map(|(h, o)| ctx.read_native_pin(h, o));
+        let idx_read_cur = idx_read.map(|(h, o)| ctx.read_native_pin(h, o));
+        let idx_write_cur = idx_write.map(|(h, o)| ctx.read_native_pin(h, o));
         // A property with any indexed accessor becomes a java.beans
         // IndexedPropertyDescriptor (so `pd instanceof IndexedPropertyDescriptor`
         // holds and getIndexedReadMethod/getIndexedWriteMethod work). The JDK
@@ -52946,10 +52995,10 @@ fn introspector_get_bean_info(ctx: &mut dyn NativeContext, args: &[Value]) -> Me
                 "(Ljava/lang/String;Ljava/lang/reflect/Method;Ljava/lang/reflect/Method;Ljava/lang/reflect/Method;Ljava/lang/reflect/Method;)V",
                 &[
                     Value::Object(Some(name_str)),
-                    Value::Object(*getter),
-                    Value::Object(*setter),
-                    Value::Object(*idx_read),
-                    Value::Object(*idx_write),
+                    Value::Object(getter_cur),
+                    Value::Object(setter_cur),
+                    Value::Object(idx_read_cur),
+                    Value::Object(idx_write_cur),
                 ],
             ) {
                 Ok(Some(Value::Object(Some(p)))) => Some(p),
@@ -52958,6 +53007,7 @@ fn introspector_get_bean_info(ctx: &mut dyn NativeContext, args: &[Value]) -> Me
                 // (java.beans favours the read method) before giving up.
                 _ => {
                     let name_str = ctx.read_native_pin(name_pin, name_str);
+                    let idx_read_cur = idx_read.map(|(h, o)| ctx.read_native_pin(h, o));
                     match ctx.new_object_initialized(
                         "java/beans/IndexedPropertyDescriptor",
                         "(Ljava/lang/String;Ljava/lang/reflect/Method;Ljava/lang/reflect/Method;Ljava/lang/reflect/Method;Ljava/lang/reflect/Method;)V",
@@ -52965,7 +53015,7 @@ fn introspector_get_bean_info(ctx: &mut dyn NativeContext, args: &[Value]) -> Me
                             Value::Object(Some(name_str)),
                             Value::Object(None),
                             Value::Object(None),
-                            Value::Object(*idx_read),
+                            Value::Object(idx_read_cur),
                             Value::Object(None),
                         ],
                     ) {
@@ -52981,7 +53031,12 @@ fn introspector_get_bean_info(ctx: &mut dyn NativeContext, args: &[Value]) -> Me
             Some(p) => p,
             None => {
                 let name_str = ctx.read_native_pin(name_pin, name_str);
-                build_property_descriptor(ctx, name_str, *getter, *setter)
+                // Re-read again — the failed ctor invokes above (indexed
+                // case) may have moved the mirrors since the reads at the
+                // top of this iteration.
+                let getter_cur = getter.map(|(h, o)| ctx.read_native_pin(h, o));
+                let setter_cur = setter.map(|(h, o)| ctx.read_native_pin(h, o));
+                build_property_descriptor(ctx, name_str, getter_cur, setter_cur)
             }
         };
         let pd_arr = ctx.read_native_pin(pd_arr_pin, pd_arr);
@@ -52999,17 +53054,24 @@ fn introspector_get_bean_info(ctx: &mut dyn NativeContext, args: &[Value]) -> Me
     // Pin across the per-method ctor invokes below — a moving young GC there
     // would relocate the fresh array (native stale-local family).
     let md_arr_pin = ctx.pin_native_root(md_arr);
-    for (i, m) in all_method_mirrors.iter().enumerate() {
+    for (i, &(m_pin, m)) in all_method_mirrors.iter().enumerate() {
+        // Re-read the pinned mirror to its current address — the discovery
+        // scan and the previous iterations' ctor invokes may have moved it
+        // (native stale-local family).
+        let m = ctx.read_native_pin(m_pin, m);
         let md = match ctx.new_object_initialized(
             "java/beans/MethodDescriptor",
             "(Ljava/lang/reflect/Method;)V",
-            &[Value::Object(Some(*m))],
+            &[Value::Object(Some(m))],
         ) {
             Ok(Some(Value::Object(Some(d)))) => d,
             _ => {
                 let md = alloc_concurrent_synthetic(ctx, "java/beans/MethodDescriptor", 1);
-                ctx.set_field_by_name(md, "method", Value::Object(Some(*m)));
-                ctx.set_field(md, 0, Value::Object(Some(*m)));
+                // Re-read — the failed ctor invoke + the alloc above may have
+                // moved the mirror again.
+                let m = ctx.read_native_pin(m_pin, m);
+                ctx.set_field_by_name(md, "method", Value::Object(Some(m)));
+                ctx.set_field(md, 0, Value::Object(Some(m)));
                 md
             }
         };
@@ -53065,6 +53127,12 @@ fn build_property_descriptor(
     read: Option<ObjectRef>,
     write: Option<ObjectRef>,
 ) -> ObjectRef {
+    // Pin the inputs across the ctor/setter invokes below — each invoke can
+    // run a moving young GC that relocates them (native stale-local family).
+    // Entry contract: callers pass refs that are current at call time.
+    let name_pin = ctx.pin_native_root(name_str);
+    let read_pin = read.map(|o| ctx.pin_native_root(o));
+    let write_pin = write.map(|o| ctx.pin_native_root(o));
     // First try the strict 3-arg ctor; it succeeds for the common (matching or
     // read-only/write-only) cases and yields the correct propertyType.
     if let Ok(Some(Value::Object(Some(p)))) = ctx.new_object_initialized(
@@ -53076,10 +53144,18 @@ fn build_property_descriptor(
             Value::Object(write),
         ],
     ) {
+        ctx.unpin_native_roots(name_pin);
         return p;
     }
     // Strict ctor rejected the pair (type mismatch). Build a read-only PD, then
     // attach the write method leniently (ref stored before validation throws).
+    // Re-read the inputs first — the failed ctor invoke above may have moved
+    // them.
+    let name_str = ctx.read_native_pin(name_pin, name_str);
+    let read = match (read_pin, read) {
+        (Some(h), Some(o)) => Some(ctx.read_native_pin(h, o)),
+        _ => read,
+    };
     let pd = match ctx.new_object_initialized(
         "java/beans/PropertyDescriptor",
         "(Ljava/lang/String;Ljava/lang/reflect/Method;Ljava/lang/reflect/Method;)V",
@@ -53093,6 +53169,11 @@ fn build_property_descriptor(
         _ => None,
     };
     if let (Some(pd), Some(_)) = (pd, write) {
+        let pd_pin = ctx.pin_native_root(pd);
+        let write = match (write_pin, write) {
+            (Some(h), Some(o)) => Some(ctx.read_native_pin(h, o)),
+            _ => write,
+        };
         // Ignore the IntrospectionException: setWriteMethod stores the ref first.
         let _ = ctx.invoke(
             "java/beans/PropertyDescriptor",
@@ -53100,9 +53181,13 @@ fn build_property_descriptor(
             "(Ljava/lang/reflect/Method;)V",
             &[Value::Object(Some(pd)), Value::Object(write)],
         );
+        // Re-read — the invoke above may have moved the descriptor we return.
+        let pd = ctx.read_native_pin(pd_pin, pd);
+        ctx.unpin_native_roots(name_pin);
         return pd;
     }
     if let Some(pd) = pd {
+        ctx.unpin_native_roots(name_pin);
         return pd;
     }
     // Last resort (class load failure): a bare object with the name field set
@@ -53112,7 +53197,9 @@ fn build_property_descriptor(
         .unwrap_or(cratonvm_types::ClassId::new(0));
     let n = ctx.class_num_total_fields(cid);
     let o = ctx.alloc_object(cid, n);
+    let name_str = ctx.read_native_pin(name_pin, name_str);
     ctx.set_field_by_name(o, "name", Value::Object(Some(name_str)));
+    ctx.unpin_native_roots(name_pin);
     o
 }
 

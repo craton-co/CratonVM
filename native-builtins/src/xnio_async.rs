@@ -1437,8 +1437,15 @@ fn ensure_options_initialized(ctx: &mut dyn NativeContext) -> MethodCallResult {
         let ty_s = ctx.create_string(ty);
         ctx.set_field(opt, OPT_TYPE_CLASS, Value::Object(Some(ty_s)));
         // Store in a global map for retrieval (reflective getField + the
-        // synthetic getXXX accessors below read from here).
-        options_store().lock().insert(name.to_string(), opt);
+        // synthetic getXXX accessors below read from here). Keep each Option
+        // alive + registry-remapped across GC moves (VarHandle-root pattern);
+        // key computed on the just-registered address, no allocation between
+        // the two calls. (The static-field write below keeps the object alive
+        // too, but the FIELD is remapped by the statics scan — this raw map
+        // copy is not, hence the identity-key indirection for reads.)
+        ctx.register_var_handle_root(opt);
+        let okey = ctx.identity_hash_code(opt);
+        options_store().lock().insert(name.to_string(), (okey, opt));
         // Also write the REAL Java static field. We shim `Options.<clinit>`
         // (so the stock clinit's `Option.simple(...)` cascade never runs), which
         // means the `public static final Option` fields stay null unless we set
@@ -1453,8 +1460,17 @@ fn ensure_options_initialized(ctx: &mut dyn NativeContext) -> MethodCallResult {
     Ok(None)
 }
 
-fn options_store() -> &'static Mutex<HashMap<String, ObjectRef>> {
-    static INSTANCE: OnceLock<Mutex<HashMap<String, ObjectRef>>> = OnceLock::new();
+/// Option-name → `(identity_key, ObjectRef)`.
+///
+/// GC (gc-followups-20260706): values are registered via
+/// `register_var_handle_root` at insert and re-read via
+/// `read_var_handle_root` at every lookup (ASYNC_POOL pattern, lib.rs) —
+/// the GC remaps the registry entry after a move, never this raw static
+/// copy. Before this fix `lookup_options_field` handed Java a bare cached
+/// `ObjectRef` that went stale after any moving GC. Bounded by the
+/// well-known option set, so the permanent registration cannot grow.
+fn options_store() -> &'static Mutex<HashMap<String, (i32, ObjectRef)>> {
+    static INSTANCE: OnceLock<Mutex<HashMap<String, (i32, ObjectRef)>>> = OnceLock::new();
     INSTANCE.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
@@ -1477,7 +1493,13 @@ fn native_options_clinit(ctx: &mut dyn NativeContext, _args: &[Value]) -> Method
 fn lookup_options_field(ctx: &mut dyn NativeContext, name: &str) -> MethodCallResult {
     ensure_options_initialized(ctx)?;
     match options_store().lock().get(name) {
-        Some(o) => Ok(Some(Value::Object(Some(*o)))),
+        Some(&(key, cached)) => {
+            // Re-read the CURRENT (post-GC) address — the var-handle-root
+            // registry entry is remapped after a move, this raw copy is not.
+            Ok(Some(Value::Object(Some(
+                ctx.read_var_handle_root(key).unwrap_or(cached),
+            ))))
+        }
         None => Ok(Some(Value::Object(None))),
     }
 }
@@ -2497,7 +2519,8 @@ mod tests {
         // get with default=4, and confirm we get 4. The getter for the
         // default lives in xnio_worker.rs, but the OptionMap API surface
         // here is what makes 4 addressable.
-        let opt = wio.unwrap();
+        // (Store entries are `(identity_key, ObjectRef)` — take the ref.)
+        let opt = wio.unwrap().1;
         let m = empty_map(&mut ctx);
         let got = native_option_map_get(
             &mut ctx,

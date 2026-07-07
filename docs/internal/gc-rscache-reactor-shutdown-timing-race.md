@@ -1,10 +1,12 @@
 # GC: rs_cache-presence-triggered GC-STW-vs-reactor-shutdown timing race (reactor worker leak)
 
-**Status:** 🟢 **FIX LANDED on dev** (`323a3ba6`, 2026-07-01 — "fix(gc): serialize thread exit against stw";
-the "Fix candidate" section below is what landed, incl. the `blocked_dead_transition_*` /
-`inflated_handle_survives_object_remap_*` unit tests, verified present on dev 2026-07-06). Kept in
-`known-issues` ONLY pending this doc's own acceptance gate (the ES RestClient `-Xmx1g` default-cache soak,
-see "Next step"); **reliable workaround validated** (`CRATONVM_ROOTSNAP_CACHE=0`), expected unnecessary post-fix.
+**Status:** ✅ **FIXED on dev, ARCHIVED to `docs/internal` 2026-07-07** (`323a3ba6`, 2026-07-01 —
+"fix(gc): serialize thread exit against stw"; the "Fix candidate" section below is what landed, incl. the
+`blocked_dead_transition_*` / `inflated_handle_survives_object_remap_*` unit tests, verified present on dev
+2026-07-06). **Residual validation item (not a code gap):** this doc's own acceptance soak — ES
+`RestClientSingleHostIntegTests` at `-Xmx1g` with the default rootsnap cache — was not rerun before
+archiving (the ES test fixture is not present on the Linux probe host); rerun opportunistically next time an
+ES-capable environment exists. The `CRATONVM_ROOTSNAP_CACHE=0` workaround is expected unnecessary post-fix.
 Found/characterized 2026-06-20 (branch `fix/es-restclient-gc-safety`). Supersedes an earlier
 investigation pass (the former `reactor-worker-thread-leak-at-shutdown.md`, now removed — see git history).
 `--nojit` (moving young collector), GC-pressure-dependent.

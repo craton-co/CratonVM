@@ -199,6 +199,14 @@ pub fn gc_reconcile_defining_loaders(
 // is `Hash + Eq`, the table is touched only at class definition time
 // and at the rare `classData` native call so contention is minimal.
 // Cleared in `reset_loader_singletons` to avoid stale refs across VMs.
+//
+// GC note (gc-followups-20260706): NOT GC-safe for reads-after-GC — the
+// mirror KEY is a raw address that goes stale when the mirror moves (lookups
+// would miss), and Object-typed VALUES are neither rooted nor remapped. This
+// is tolerated ONLY because `get_class_data` currently has no production
+// callers (test-only) — the table is effectively write-only. Before adding a
+// real reader: re-key by `ctx.identity_hash_code(mirror)` and store values as
+// `(identity_key, ObjectRef)` var-handle-root pairs (ASYNC_POOL pattern).
 // ---------------------------------------------------------------------------
 fn class_data_store() -> &'static Mutex<std::collections::HashMap<ObjectRef, Value>> {
     static INSTANCE: OnceLock<Mutex<std::collections::HashMap<ObjectRef, Value>>> = OnceLock::new();

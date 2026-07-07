@@ -167,6 +167,15 @@ pub(crate) struct SsSide {
     pub listener_id: i32,
 }
 
+// GC note (gc-followups-20260706) — applies to sock/ss/ds/inet_addr side
+// tables in this file: values are plain data (no heap refs, no
+// use-after-free), but the KEY is the object's raw address, which goes stale
+// when a moving GC relocates the Socket/ServerSocket/etc. — subsequent
+// lookups from the relocated object miss and silently fall back to the
+// `unwrap_or(default)` state (e.g. a bound socket reads back port 0), and a
+// recycled address can alias another object's entry. Follow-up: re-key by
+// `ctx.identity_hash_code(obj)` (stable across moves), as the `(identity_key,
+// ObjectRef)` conversions elsewhere in this audit do.
 fn sock_side_table() -> &'static Mutex<HashMap<ObjectRef, SockSide>> {
     static T: OnceLock<Mutex<HashMap<ObjectRef, SockSide>>> = OnceLock::new();
     T.get_or_init(|| Mutex::new(HashMap::new()))
@@ -282,6 +291,17 @@ fn ds_set<F: FnOnce(&mut DsSide)>(this: ObjectRef, f: F) {
 // Map Socket$SocketInputStream / Socket$SocketOutputStream synthetic
 // instance -> owner Socket. The real-JDK inner classes have their own
 // fields (`parent`, `in`/`out`); we cannot use raw slot indices safely.
+//
+// GC note (gc-followups-20260706): KNOWN-UNSOUND across GCs — both the
+// stream KEY and the owner-Socket VALUE are raw addresses that are neither
+// rooted nor remapped. After a moving GC the relocated stream's lookup
+// misses (I/O on that stream then fails to find its owner) and a hit on an
+// unmoved key can return a stale owner address. Tolerable only while the
+// create→I/O window contains no moving GC. Follow-up: key by
+// `ctx.identity_hash_code(stream)` and store the owner as a
+// `(identity_key, ObjectRef)` var-handle-root pair (ASYNC_POOL pattern) —
+// or fold this table into the re10-handler gc_scan/gc_update hook pair
+// that already exists in this file.
 fn stream_owner_table() -> &'static Mutex<HashMap<ObjectRef, ObjectRef>> {
     static T: OnceLock<Mutex<HashMap<ObjectRef, ObjectRef>>> = OnceLock::new();
     T.get_or_init(|| Mutex::new(HashMap::new()))

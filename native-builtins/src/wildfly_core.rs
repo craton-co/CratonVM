@@ -1237,6 +1237,15 @@ use cratonvm_types::ObjectRef;
 /// Per-EQE pending-Runnable queue. Keyed by the EQE `this` ObjectRef.
 /// `CRATONVM_EQE_SYNC_EXECUTE=1` reverts to the Round-69 sync-on-caller
 /// behaviour (escape hatch for Keycloak in case the deferral regresses it).
+///
+/// GC note (gc-followups-20260706): KNOWN-UNSOUND across GCs — both the EQE
+/// key (raw address, stale after a move) and the queued Runnable refs
+/// (neither rooted nor remapped) survive across allocations between
+/// `execute` and the drain in `AsyncFutureTask.await()`. Tolerable only
+/// while the enqueue→drain window contains no moving GC. Follow-up: key by
+/// identity hash + store `(identity_key, ObjectRef)` var-handle-root pairs,
+/// or add a gc_scan/gc_update hook pair (entries here are transient, so a
+/// hook avoids permanently pinning drained Runnables).
 static EQE_PENDING: OnceLock<Mutex<HashMap<ObjectRef, VecDeque<ObjectRef>>>> = OnceLock::new();
 
 fn eqe_pending() -> &'static Mutex<HashMap<ObjectRef, VecDeque<ObjectRef>>> {

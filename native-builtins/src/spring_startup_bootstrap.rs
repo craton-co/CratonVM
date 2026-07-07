@@ -57,8 +57,16 @@ use std::sync::OnceLock;
 // on it so callers that read property sources or properties get safe defaults.
 // ──────────────────────────────────────────────────────────────────────────────
 
-fn noop_environment() -> &'static Mutex<Option<ObjectRef>> {
-    static S: OnceLock<Mutex<Option<ObjectRef>>> = OnceLock::new();
+/// Process-global fallback Environment singleton.
+///
+/// GC: stored as `(identity_key, ObjectRef)` — kept alive + registry-remapped
+/// via `register_var_handle_root`; every read re-fetches the CURRENT address
+/// via `read_var_handle_root(identity_key)` because the GC cannot rewrite this
+/// raw static copy (ASYNC_POOL pattern, lib.rs). Before this fix the slot held
+/// a bare `ObjectRef` that was neither rooted nor remapped — the cached
+/// environment was ALSO collectable.
+fn noop_environment() -> &'static Mutex<Option<(i32, ObjectRef)>> {
+    static S: OnceLock<Mutex<Option<(i32, ObjectRef)>>> = OnceLock::new();
     S.get_or_init(|| Mutex::new(None))
 }
 
@@ -78,8 +86,11 @@ fn construct_real_standard_environment(ctx: &mut dyn NativeContext) -> Option<Ob
 }
 
 fn get_noop_environment(ctx: &mut dyn NativeContext) -> ObjectRef {
-    if let Some(obj) = *noop_environment().lock() {
-        return obj;
+    if let Some((key, cached)) = *noop_environment().lock() {
+        // Re-read the CURRENT address: the GC remaps the var-handle-root
+        // registry entry after a move, not this raw static copy. Contexts
+        // without a registry (mocks) fall back to the cached ref.
+        return ctx.read_var_handle_root(key).unwrap_or(cached);
     }
 
     let env_class = "org/springframework/core/env/StandardEnvironment";
@@ -106,7 +117,17 @@ fn get_noop_environment(ctx: &mut dyn NativeContext) -> ObjectRef {
         env
     };
 
-    *noop_environment().lock() = Some(obj);
+    // Keep alive + registry-remapped across GC moves (VarHandle-root pattern);
+    // key computed on the just-registered address, no allocation in between.
+    ctx.register_var_handle_root(obj);
+    let key = ctx.identity_hash_code(obj);
+    let mut guard = noop_environment().lock();
+    if let Some((ekey, existing)) = *guard {
+        // A racing creator already installed one; converge on it (our
+        // orphaned registration is harmless — same trade-off as ASYNC_POOL).
+        return ctx.read_var_handle_root(ekey).unwrap_or(existing);
+    }
+    *guard = Some((key, obj));
     obj
 }
 

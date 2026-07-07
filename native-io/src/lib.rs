@@ -4581,11 +4581,6 @@ pub fn register_io_natives(registry: &mut NativeMethodRegistry) {
         pub const OFFSET_SIN6_FLOWINFO: i32 = 4;
     }
 
-    // sun.nio.ch.NativeSocketAddress's 12 native probes -- struct layout
-    // constants for the platform's `sockaddr_in`/`sockaddr_in6`, used by
-    // the newer native-memory-based socket address encoding that
-    // MulticastSocket/DatagramChannel routes through (reached e.g. by
-    // JGroups' UDP transport creating a multicast socket). These are fixed
     // platform ABI values, not runtime-computed state. On unix they are
     // read straight off Rust's own `libc` layout (compiled for the same
     // target CratonVM runs on); on Windows — where the `libc` crate is not

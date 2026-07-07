@@ -500,6 +500,14 @@ fn sts_get_int(ctx: &mut dyn NativeContext, this: ObjectRef, field: usize) -> i3
 /// scans its stack and the Thread mirror), and the Subtask is returned to the
 /// Java caller. Workers are short-lived — `join()` reaps them and the entry is
 /// cleared on close — so this side-table never accumulates.
+///
+/// GC note (gc-followups-20260706): reachability keeps these objects ALIVE
+/// but not UNMOVED — the fork→join window can span a moving GC, after which
+/// (a) the raw-address scope key goes stale (join/close miss the entry) and
+/// (b) the raw Subtask/Thread copies point at old addresses. Same follow-up
+/// as SCOPE_JOINERS below: key by `ctx.identity_hash_code(scope)` and
+/// re-read values via the `(identity_key, ObjectRef)` var-handle-root
+/// pattern (ASYNC_POOL in lib.rs), or add a gc_scan/gc_update hook pair.
 static SCOPE_FORKS: std::sync::LazyLock<
     std::sync::Mutex<std::collections::HashMap<usize, Vec<(ObjectRef, ObjectRef)>>>,
 > = std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashMap::new()));
@@ -1813,6 +1821,14 @@ fn native_sts_close_owned(ctx: &mut dyn NativeContext, args: &[Value]) -> Method
 // ---------------------------------------------------------------------------
 
 /// Global map: scope → joiner, for scopes opened with open(Joiner).
+///
+/// GC note (gc-followups-20260706): KNOWN-UNSOUND across GCs on two axes —
+/// the key is the scope's raw address (stale after the scope moves, so the
+/// lookup misses / can alias a reused address) and the joiner value is
+/// neither a GC root nor remapped. Tolerable only while a scope's open→join
+/// window contains no moving GC. Follow-up: key by
+/// `ctx.identity_hash_code(scope)` and store the joiner as a
+/// `(identity_key, ObjectRef)` var-handle-root pair (ASYNC_POOL pattern).
 static SCOPE_JOINERS: LazyLock<Mutex<HashMap<usize, ObjectRef>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
 

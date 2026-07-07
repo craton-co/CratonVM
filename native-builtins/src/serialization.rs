@@ -1557,6 +1557,17 @@ fn oos_write_array(
 /// Recover the `ObjectOutputStream` "this" reference for the stream keyed by
 /// `addr`. We register it in `oos_stream_refs` from `<init>` so cross-cutting
 /// helpers (Externalizable dispatch) can drive its primitive writers.
+///
+/// GC note (gc-followups-20260706): this table (and its OIS counterpart,
+/// `ois_handles`, and the per-stream filter tables) is keyed by the stream's
+/// RAW ADDRESS and holds raw refs; neither is remapped after a moving GC, so
+/// a collection in the middle of a (de)serialization both invalidates the
+/// key (later lookups from the relocated stream miss) and leaves stale value
+/// addresses. The caller's Java stack keeps the streams ALIVE, but not
+/// unmoved. A proper fix needs the whole addr-keyed family re-keyed by
+/// identity hash + values in the `(identity_key, ObjectRef)` var-handle-root
+/// pattern (ASYNC_POOL) or a dedicated gc_scan/gc_update hook pair — tracked
+/// as an open follow-up, too invasive to piggyback here.
 fn oos_stream_refs() -> &'static Mutex<HashMap<usize, ObjectRef>> {
     static INSTANCE: std::sync::OnceLock<Mutex<HashMap<usize, ObjectRef>>> =
         std::sync::OnceLock::new();
@@ -2170,6 +2181,42 @@ fn ois_read_value(ctx: &mut dyn NativeContext, addr: usize) -> Value {
     }
 }
 
+/// Mirror of real HotSpot's `JVM_LatestUserDefinedLoader` / `jdk.internal
+/// .misc.VM.latestUserDefinedLoader()`: walk the Java call stack innermost
+/// frame first and return the `ClassId` of the first frame whose class was
+/// NOT loaded by the bootstrap or platform/extension loader (i.e. loader id
+/// `>= 2`; see `NativeContext::loader_id_of_class`). Returns `None` if every
+/// frame on the stack is bootstrap/platform (e.g. `main` itself, or a stack
+/// walk with no user code visible).
+///
+/// Uses `NativeContext::frame_class_ids` (each frame's own already-resolved
+/// `ClassId`), NOT a name-based re-resolution of `capture_stack_trace`'s
+/// display `StackTraceEntry`s — re-resolving by name collapses to whichever
+/// definition the global class table associates with that name (typically
+/// the first one ever registered in the process), which silently picks the
+/// WRONG class whenever the same name has been loaded more than once by
+/// different loaders (exactly what happens running more than one
+/// `@BytecodeEnhanced` Hibernate test class in a single process: each test
+/// class execution gets its own fresh `EnhancingClassLoader`; once a second
+/// test has run, `class_id_by_name("...TheFirstTestClass")` would still
+/// resolve, but for a DIFFERENT class than the one actually executing on
+/// that frame right now).
+///
+/// Shared by the real `VM.latestUserDefinedLoader0()` native (`lib.rs`) and
+/// this module's synthetic deserialization read-path (`ois_read_object`
+/// below), which never goes through `ObjectInputStream.resolveClass()` and
+/// so has no other way to learn which classloader a deserializing caller
+/// actually expects — without this, `ois_read_object` resolved every stream
+/// class name via the loader-oblivious `ensure_class_initialized`, silently
+/// materializing the WRONG (e.g. non-bytecode-enhanced) class whenever a
+/// custom classloader (like Hibernate's `EnhancingClassLoader`) defined the
+/// class actually referenced by the code doing the deserializing.
+pub(crate) fn latest_user_defined_loader_class(ctx: &mut dyn NativeContext) -> Option<ClassId> {
+    ctx.frame_class_ids()
+        .into_iter()
+        .find(|&class_id| ctx.loader_id_of_class(class_id) >= 2)
+}
+
 /// Materialize a `TC_OBJECT` whose opening tag has already been consumed.
 /// Reserves the wire handle **before** reading field values so that a
 /// self-referential field decodes back to the same instance.
@@ -2194,7 +2241,27 @@ fn ois_read_object(ctx: &mut dyn NativeContext, addr: usize) -> Value {
     if desc.class_name == SERIALIZED_LAMBDA_CLASS {
         return reconstruct_serialized_lambda(ctx, addr);
     }
-    let resolved = ctx.ensure_class_initialized(&desc.class_name);
+    // Prefer resolving the stream's class name through whichever loader the
+    // deserializing caller's own call stack implies (mirrors
+    // `ObjectInputStream.resolveClass()`'s `latestUserDefinedLoader()`
+    // fallback — see `latest_user_defined_loader_class` above). Only a
+    // genuine user-defined loader (id >= 3; plain "Application", id 2, is
+    // the same global default `ensure_class_initialized` already resolves
+    // against) can pick out a *different* same-named class, so only bother
+    // with the loader-aware lookup in that case, falling back to the
+    // loader-oblivious path if the caller's loader never defined this class
+    // name (e.g. a JDK class read from a stream written elsewhere).
+    let mut loader_aware_class_id = None;
+    if let Some(caller_class_id) = latest_user_defined_loader_class(ctx) {
+        let loader_id = ctx.loader_id_of_class(caller_class_id);
+        if loader_id >= 3 {
+            loader_aware_class_id = ctx.class_id_by_name_and_loader(&desc.class_name, loader_id as u32);
+        }
+    }
+    let resolved = match loader_aware_class_id {
+        Some(cid) => Ok(cid),
+        None => ctx.ensure_class_initialized(&desc.class_name),
+    };
     let serialized_count = desc.field_types.len().max(2);
     let obj = if let Ok(class_id) = resolved {
         let class_field_count = ctx
@@ -3891,8 +3958,16 @@ fn ois_stream_filter_objs() -> &'static Mutex<HashMap<usize, ObjectRef>> {
 /// Process-wide filter Java object reference (the one passed to
 /// `Config.setSerialFilter`). Used by `Config.getSerialFilter` to round-trip
 /// the exact instance back to Java code.
-fn process_serial_filter_obj() -> &'static Mutex<Option<ObjectRef>> {
-    static INSTANCE: std::sync::OnceLock<Mutex<Option<ObjectRef>>> = std::sync::OnceLock::new();
+///
+/// GC: stored as `(identity_key, ObjectRef)` — kept alive + registry-remapped
+/// via `register_var_handle_root` at store time; every read re-fetches the
+/// CURRENT address via `read_var_handle_root(identity_key)` because the GC
+/// cannot rewrite this raw static copy (ASYNC_POOL pattern, lib.rs). Before
+/// this fix the slot held a bare `ObjectRef` that was neither rooted nor
+/// remapped — the installed filter was ALSO collectable.
+fn process_serial_filter_obj() -> &'static Mutex<Option<(i32, ObjectRef)>> {
+    static INSTANCE: std::sync::OnceLock<Mutex<Option<(i32, ObjectRef)>>> =
+        std::sync::OnceLock::new();
     INSTANCE.get_or_init(|| Mutex::new(None))
 }
 
@@ -4006,11 +4081,16 @@ fn register_object_input_filter(r: &mut NativeMethodRegistry) {
         "java/io/ObjectInputFilter$Config",
         "getSerialFilter",
         "()Ljava/io/ObjectInputFilter;",
-        |_ctx, _args| {
-            let obj = process_serial_filter_obj()
+        |ctx, _args| {
+            let obj = (*process_serial_filter_obj()
                 .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .clone();
+                .unwrap_or_else(|e| e.into_inner()))
+            .map(|(key, cached)| {
+                // Re-read the CURRENT (post-GC) address — the var-handle-root
+                // registry entry is remapped after a move, this raw copy is
+                // not. Mock contexts fall back to the cached ref.
+                ctx.read_var_handle_root(key).unwrap_or(cached)
+            });
             Ok(Some(Value::Object(obj)))
         },
     );
@@ -4069,7 +4149,12 @@ fn register_object_input_filter(r: &mut NativeMethodRegistry) {
                     },
                 };
                 *existing = Some(parsed);
-                *existing_obj = Some(filter_obj);
+                // Keep alive + registry-remapped across GC moves
+                // (VarHandle-root pattern); key computed on the
+                // just-registered address, no allocation in between.
+                ctx.register_var_handle_root(filter_obj);
+                let key = ctx.identity_hash_code(filter_obj);
+                *existing_obj = Some((key, filter_obj));
             }
             Ok(None)
         },

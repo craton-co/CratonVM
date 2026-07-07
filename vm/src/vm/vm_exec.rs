@@ -2675,6 +2675,14 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
         r
     }
 
+    fn frame_class_ids(&self) -> Vec<ClassId> {
+        // `self.thread.frames` is stored outermost-first (index 0 = the
+        // oldest call still on the stack); reverse so callers see
+        // innermost-first, matching `capture_stack_trace`'s `.iter().rev()`
+        // convention (see its own callers, e.g. `resolve_caller_class_id`).
+        self.thread.frames.iter().rev().map(|f| f.class_id).collect()
+    }
+
     // -- Heap access methods --
 
     fn get_field(&self, obj: ObjectRef, index: usize) -> Value {
