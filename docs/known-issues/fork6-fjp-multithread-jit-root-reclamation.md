@@ -14,6 +14,23 @@
 > Use this repro (single-threaded, no GC_STRESS orchestration needed) to verify the
 > eventual register-oop-bitmap fix alongside the existing Fork6Hard lane.
 
+> **SECOND real-world confirmation 2026-07-07 ~16:15, and this one is suite-wide**:
+> [`wildfly-xnio-mockselector-mutex-segfault.md`](wildfly-xnio-mockselector-mutex-segfault.md) — the
+> dominant SIGSEGV blocking the ENTIRE WildFly `testsuite/integration/basic` suite (64% CRASH rate,
+> 128/200 classes in one sample) — was confirmed via a live core-dump backtrace to be **byte-for-byte the
+> same crash** (`read_string` ← `xnio_async::native_builder_set` ← `safe_native_call` ←
+> `invoke_or_native` ← `jit_invoke_virtual_mic`), independently bisected the same way
+> (`CRATONVM_DISABLE_JIT=1` → crash gone). That doc's own earlier addr2line-only theory (a native
+> `Mutex`/handle lifetime bug in `xnio_io_thread.rs`) is retracted in favor of this A4 finding. Practical
+> upshot: A4's register-only-oop gap is not a niche issue — it is very likely **the single highest-leverage
+> fix available for the WildFly suite's signal right now**, since `OptionMap.Builder.set()` fires on every
+> managed-container boot via XNIO worker/channel setup, not just Elytron-specific paths. Methodology note
+> for whoever debugs this next: a live gdb wrapper around the whole process (`gdb -batch -ex run ...`)
+> reproducibly **suppressed** this race (0/9 attempts across known-crashing classes) — the timing
+> perturbation closes the window. Raw execution with `kernel.core_pattern` pointed at a plain path +
+> `ulimit -c unlimited` (no gdb attached) reproduced on the first attempt every time; post-mortem `gdb
+> <binary> <corefile>` gives the same backtrace without perturbing the race.
+
 **Status:** 🟡 OPEN. Non-stress `Fork6`/`Fork6Hard` remains non-reproducing on current `dev`. Two infrastructure bugs adjacent to A4 were found and fixed 2026-07-02 (see that section below) — a takeover gate-polarity bug that made the default-on cross-thread STW JIT scan silently inert, and a defense-in-depth helper-window pass — but neither closes A4 itself, whose register-only residual remains gated on the deferred precise-JIT-stack-maps project. The 2026-07-01 aggressive `GC_STRESS` failures were **NOT A4** (zero live JIT frames, zero compiled JIT code at every STW) — root-caused as three unrelated concurrent-old-gen GC races, now FIXED on dev (`57f545be`); a different residual on that same lane is tracked at [`docs/known-issues/gcstress-residual-corruption-faces.md`](gcstress-residual-corruption-faces.md).
 
 > ## Fix 2026-07-02 — the "default-on" takeover was silently inert; + an initiator-side blocked/helper-window scan; stress lane re-scoped as a separate JIT-free bug
