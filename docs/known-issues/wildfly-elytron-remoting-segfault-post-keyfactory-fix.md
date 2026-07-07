@@ -1,14 +1,15 @@
 # ElytronRemoteOutboundConnectionTestCase: native SIGSEGV during elytron subsystem / remoting-client test execution
 
-Status: OPEN — new, found 2026-07-07 while verifying the [[wildfly-keyfactory-translatekey-null-spi]] fix
-Severity: Unknown/High (hard native crash, not a catchable Java exception; blocks the whole test class)
+Status: OPEN — root-caused 2026-07-07 to the known A4 "register-only oop" JIT/GC gap; not fixed here (see [Root cause](#root-cause-confirmed-2026-07-07-a4-register-only-oop-family) below)
+Severity: High (hard native crash, not a catchable Java exception; blocks the whole test class)
 First confirmed: 2026-07-07, Azure worktree `wt-keyfactory-translatekey` (branch `fix/keyfactory-translatekey-20260707`)
+Root-caused: 2026-07-07, Azure worktree `wt-elytron-segv-20260707` (branch `fix/elytron-remoting-segv-20260707`)
 
 ## Symptom
 
 Running `org.jboss.as.test.manualmode.ejb.client.outbound.connection.security.ElytronRemoteOutboundConnectionTestCase`
-(module `testsuite/integration/manualmode`) under CratonVM (`jit-real` mode) via Maven/Surefire now
-crashes the forked JVM outright:
+(module `testsuite/integration/manualmode`) under CratonVM (`jit-real` mode) via Maven/Surefire crashes
+the forked JVM outright:
 
 ```text
 [ERROR] Process Exit Code: 139
@@ -18,69 +19,151 @@ crashes the forked JVM outright:
 terminated without properly saying goodbye. VM crash or System.exit called?
 ```
 
-Exit code 139 = SIGSEGV. The trace-level `.dumpstream` log for the forked VM shows it gets well into
-actual test execution before dying — past the `@Before` setup, past `Executing operation` (adding an
-`elytron` `properties-realm`), through opening a first `management-client` remoting endpoint and all its
-connection-provider registrations (`remote`, `remote+tls`, `remoting`, `remote+http`, `remote+https`,
-`http-remoting`, `https-remoting`), through a `getAuthenticationConfiguration` call, closing that
-endpoint, then opening a SECOND `management-client` endpoint for what looks like the actual per-test
-management operation — and segfaults partway through that second endpoint's connection-provider
-registration sequence (`remote+http`, tick 5 of the second endpoint), with no further output beyond
-`Segmentation fault (core dumped)`. No Rust panic message, no Java exception — a hard native fault.
-`ulimit -c` is 0 on this host and no core file was produced, so no backtrace is available yet.
+Exit code 139 = SIGSEGV. Confirmed **still reproducing on current dev** (`4e6dc36d`, 2026-07-07) — same
+crash point, twice in a row.
 
-**Reproducible**: confirmed twice in a row (both times crashed at the same point, same wall-clock
-~43-45s).
+## Root cause (CONFIRMED 2026-07-07): A4 register-only-oop family
 
-## Why this is newly visible, not a regression
+Got a real backtrace by driving Surefire's own `-Djvm=<path ending in bin/java.exe>` property at a
+**gdb wrapper script** (Surefire validates the jvm path's parent dir must literally be named `bin` and
+the executable `java`/`java.exe`, and the forked process's stdout is consumed by Surefire's own binary
+IPC protocol — so gdb's own textual output must be redirected via `set logging file ... redirect on`,
+NOT left on stdout, or Surefire never even starts the fork). This pattern (drop-in `-Djvm=` gdb wrapper
++ direct `mvnw -Dtest=... -Djvm=<wrapper>/bin/java.exe test`, bypassing `run-suite-linux.sh` for this one
+diagnostic run) is reusable for any future CratonVM-under-Surefire native crash — no core dump needed,
+no WildFly-specific setup beyond `CRATONVM_JAVA_HOME` env.
 
-This test class previously failed EARLIER, in its `@Before` setup, with the
-`KeyFactory.translateKey`/`getKeySpec` NPE documented in [[wildfly-keyfactory-translatekey-null-spi]]
-(now fixed). Nobody had ever exercised this class's actual test-method bodies (remoting connections,
-elytron subsystem operations) under CratonVM before, because the class never got that far. Fixing the
-KeyFactory NPE let the class progress into new territory, which immediately hit this segfault. This is
-very likely a **pre-existing, unrelated bug** in the remoting/xnio/socket or elytron-subsystem-management
-native path, now reachable for the first time — not something introduced by the KeyFactory fix (which
-only touches `native-builtins/src/jca/key_factory.rs`, nowhere near remoting/networking code).
+```text
+Thread 2 "main-vm" received signal SIGSEGV, Segmentation fault.
+0x0000555555adea57 in <cratonvm_vm::vm::vm_exec::NativeContextImpl as cratonvm_native_api::registry::NativeContext>::read_string ()
+#1  cratonvm_native_builtins::xnio_async::native_builder_set ()
+#2  cratonvm_vm::vm::vm_exec::safe_native_call ()
+#3  cratonvm_vm::vm::vm_exec::invoke_or_native ()
+#4  cratonvm_vm::jit::helpers::jit_invoke_virtual_mic ()
+#5..#16  (unwinder garbage through the JIT-generated call site — no debug/unwind info emitted for JIT'd code)
+#17 cratonvm_native_api::native_ring::record_exit ()
+#18 cratonvm_vm::vm::vm_exec::safe_native_call ()
+#19 cratonvm_vm::runtime::interpreter::invoke_cached_native_callback ()
+#20 cratonvm_vm::runtime::interpreter::execute_invokestatic_cached ()
+#21 cratonvm_vm::runtime::interpreter::execute_frame ()
+#22 cratonvm_vm::runtime::interpreter::execute ()
+#23 cratonvm_vm::vm::vm_exec::invoke_on_class_shared_inner ()
+#24 cratonvm_vm::vm::vm_exec::invoke_or_native ()
+#25 <NativeContextImpl as NativeContext>::invoke_virtual ()
+#26 cratonvm_native_builtins::lang_class::native_method_invoke ()
+#27 cratonvm_native_builtins::lang_reflect::native_method_invoke_boxed ()
+#28 cratonvm_vm::vm::vm_exec::safe_native_call ()
+... (frames #29-#115+ repeat the #18-#27 invokevirtual→interpreter→Method.invoke cycle
+     roughly a dozen times — a deep recursive reflective-dispatch chain, consistent
+     with WildFly's management-operation marshalling)
+```
+
+`native_builder_set` (`native-builtins/src/xnio_async.rs:859`, the native override for
+`org.xnio.OptionMap$Builder.set(Option, Object)`) does `ctx.read_string(s)` on `args[2]` (the `value`
+argument) with **no allocation in between** receiving `args` and the read — so the `ObjectRef` was
+*already* a dangling/stale pointer by the time it reached this native. The corruption happened earlier,
+somewhere up the deep reflective call chain (frames #29+), most likely while a live `String` reference
+was held **only in a register** (not a scanned stack slot) across a GC-triggering safepoint inside that
+recursion, then later copied — now stale — into the `jit_invoke_virtual_mic` call-argument buffer at
+frame #4.
+
+**Two bisection experiments, both via the same gdb-wrapper repro:**
+
+1. **`CRATONVM_DISABLE_JIT=1` (interpreter-only): crash GONE.** All 22 test methods ran to completion
+   (0 crashes; they then failed on an unrelated `java.io.IOException` — a different, non-fatal issue,
+   not investigated here). Confirms the bug is JIT-specific.
+2. **`CRATONVM_NO_PRECISE_JIT_MAPS=1` with JIT still ON: crash UNCHANGED** (identical `read_string`
+   crash site, identical call chain). This **refutes** the natural suspicion that today's
+   `f22a8d8c` ("flip precise JIT oop maps back to DEFAULT-ON") caused/exposed this — precise maps
+   being on or off makes no difference here. The bug is a **general JIT** gap, not specific to that
+   flip; it was simply never reachable under CratonVM before because this WildFly test class never got
+   past its `@Before` setup until [[wildfly-keyfactory-translatekey-null-spi]] was fixed today.
+
+**This matches an already-documented, deliberately-deferred gap exactly**: `docs/known-issues/
+gcstress-residual-corruption-faces.md` (§"Precise-JIT-oop-maps do NOT fix this residual") and
+`docs/known-issues/fork6-fjp-multithread-jit-root-reclamation.md` (the "A4" tracker) both describe —
+and this session's own bisection independently re-confirms — that even with precise JIT stack maps on,
+**`OopMapEntry` has no register-oop bitmap** (`jit/src/lib.rs:52-73`): a register-only oop is covered
+by neither the frame-slot maps nor conservative stack scanning, only by
+`emit_pre_safepoint_spill` (which only fires at *call* safepoints). A live oop held only in a register
+across some other safepoint (e.g. inside a deep interpreter/reflection recursion, not a JIT call
+safepoint) can go stale if GC relocates or reclaims it, and any later use of that register's value is a
+dangling-pointer read — exactly what happened here.
+
+**Why this finding matters beyond just this WildFly test**: the existing A4 tracker's repros are all
+synthetic, multi-threaded `Fork6Hard ... GC_STRESS=...` runs orchestrating `ForkJoinPool` worker races,
+and that doc explicitly says the ForkJoinPool residual "never crashes on current dev" (it usually
+surfaces as contained guard warnings or occasional NPEs). **This is a single-process, single-thread-at-
+the-crash-point, real production code path (WildFly Elytron + JBoss Remoting + XNIO) that reliably
+SIGSEGVs** — a much simpler, more direct, real-world repro of the same underlying gap than orchestrating
+GC-stress races. Whoever picks up the A4 register-oop-bitmap work should use this repro to verify the
+eventual fix, in addition to the existing Fork6Hard lane.
 
 ## Repro
 
+**Fastest (no gdb, just confirms the crash)**:
 ```bash
-# On the Azure host (uses the already-built WildFly checkout + Linux Maven driver):
 cd /data/data/wt-wildfly-bugbash-20260707-runner   # or any checkout of apps/wildfly-suite-runner's Linux driver
 export WILDFLY=/data/data/cratonvm/apps/wildfly
-export CRATONVM_BIN=<any cratonvm release binary with the keyfactory-translatekey fix, or later>
+export CRATONVM_BIN=<any cratonvm release binary with the keyfactory-translatekey fix merged (fdfeb8c8+), or later dev>
 export JDK25_WIN=/home/victor/jdk25
 ./run-suite-linux.sh run --category all --jit on --jdk real --class-to 300 \
   --only 'ElytronRemoteOutboundConnectionTestCase' --tag repro
-# -> classes: CRASH=1, Process Exit Code: 139 (SIGSEGV), test-methods found=0
+# -> classes: CRASH=1, Process Exit Code: 139 (SIGSEGV)
 ```
 
-Note this REQUIRES the `KeyFactory.translateKey`/`getKeySpec` fix to be present in the binary under
-test — against an unfixed binary the class fails earlier (in `@Before`) and never reaches this crash.
+**With a gdb backtrace** (bypasses `run-suite-linux.sh`'s `.exe`-suffix cp-binary wrapper, which can't
+host a script; drives Maven directly instead):
+```bash
+mkdir -p /tmp/gdbwrap/bin
+cat > /tmp/gdbwrap/bin/java.exe << 'EOF'
+#!/bin/bash
+rm -f /tmp/gdb-backtrace.log
+exec gdb -q -batch \
+  -ex 'set confirm off' -ex 'set pagination off' -ex 'set backtrace limit 300' \
+  -ex 'set logging file /tmp/gdb-backtrace.log' -ex 'set logging redirect on' -ex 'set logging enabled on' \
+  -ex 'handle SIGSEGV stop print nopass' -ex run \
+  -ex 'thread apply all bt full' -ex 'set logging enabled off' -ex quit \
+  --args <path-to-cratonvm-binary> "$@"
+EOF
+chmod +x /tmp/gdbwrap/bin/java.exe
+cd /data/data/cratonvm/apps/wildfly/testsuite/integration/manualmode
+export CRATONVM_JAVA_HOME=/home/victor/jdk25
+rm -rf target/surefire-reports
+/data/data/cratonvm/apps/wildfly/mvnw -B -ntp -Dsurefire.default-test.phase=test \
+  -Dtest=ElytronRemoteOutboundConnectionTestCase \
+  -DfailIfNoTests=false -Dsurefire.failIfNoSpecifiedTests=false \
+  -Djvm=/tmp/gdbwrap/bin/java.exe test
+# backtrace lands in /tmp/gdb-backtrace.log regardless of Maven's own exit status
+```
+
+Both require a binary with the `KeyFactory.translateKey`/`getKeySpec` fix (`fdfeb8c8`+) — against an
+unfixed binary the class fails earlier (in `@Before`) and never reaches this crash.
 
 ## Evidence
 
 ```text
-/data/data/wt-wildfly-bugbash-20260707-runner/out/verify-fix-jit-real-all-20260707-053719/logs/00001-org.jboss.as.test.manualmode.ejb.client.outbound.connection.security.ElytronRemoteOutboundConnectionTestCase.log
-/data/data/wt-wildfly-bugbash-20260707-runner/out/verify-fix-rerun-jit-real-all-20260707-053936/logs/00001-org.jboss.as.test.manualmode.ejb.client.outbound.connection.security.ElytronRemoteOutboundConnectionTestCase.log
-/data/data/cratonvm/apps/wildfly/testsuite/integration/manualmode/target/surefire-reports/2026-07-07T05-37-50_272.dumpstream   (trace log ending in "Segmentation fault (core dumped)")
+/data/data/wt-wildfly-bugbash-20260707-runner/out/verify-fix-jit-real-all-20260707-053719/logs/00001-*.log
+/data/data/wt-wildfly-bugbash-20260707-runner/out/precheck-jit-real-all-20260707-150946/logs/00001-*.log  (re-confirmed on dev@4e6dc36d)
+/data/data/cratonvm/apps/wildfly/testsuite/integration/manualmode/target/surefire-reports/*.dumpstream    (trace log ending in "Segmentation fault (core dumped)")
+/data/data/scratch-elytron-segv/gdb-backtrace.log   (full gdb backtrace, both JIT+precise-maps-on and JIT+precise-maps-off runs)
 ```
 
 ## Suggested next steps
 
-Not yet root-caused. To make progress: run the same repro directly under `gdb --args <cratonvm binary>
---java-home ... -jar surefirebooter....jar ...` (or attach to the forked PID) to get a real backtrace —
-Maven/Surefire's own fork doesn't preserve one, and this host's `core_pattern` routes to `apport`
-which isn't producing a usable core file (`ulimit -c` is 0). Given the crash point (deep in
-`org.jboss.remoting3`/xnio connection-provider setup, second `management-client` endpoint), likely
-candidates given prior related findings in this codebase: `class_manager`/vtable RwLock contention
-(see [[httpclient-hangs-are-classmanager-rwlock-deadlock-and-methodhandle-dispatch]]), xnio native
-gaps (see [[wildfly-suite-0618-heapcap-and-xnio-options-bug]]), or a JIT-compiled-frame issue in the
-remoting endpoint/connection-provider registration path — but none of these are confirmed; this needs
-its own investigation from scratch.
+Not a quick fix — this is the same class of gap `fork6-fjp-multithread-jit-root-reclamation.md`
+describes as needing a **register-oop bitmap on `OopMapEntry`** (`jit/src/lib.rs:52-73`), a real JIT
+codegen feature addition (tracking which live oops are register-resident, not just frame-slot-resident,
+at every safepoint), not attempted in this session — too large/risky to implement blind without the
+established JIT-team context on that project. When someone picks up the A4 register-oop-bitmap work,
+this doc's repro (single-threaded, deterministic, real production code) is a much cheaper verification
+lane than orchestrating `Fork6Hard ... GC_STRESS=...` races.
 
 ## Related
 
 Found via [[wildfly-keyfactory-translatekey-null-spi]]'s own fix-verification run — not caused by that
-fix, just newly reachable because of it.
+fix, just newly reachable because of it. Root cause is the same family as
+[[fork6-fjp-multithread-jit-root-reclamation]] (the canonical A4 register-only-oop tracker) and the
+"Precise-JIT-oop-maps do NOT fix this residual" section of `gcstress-residual-corruption-faces.md` —
+see those docs for the register-oop-bitmap fix design context. NOT caused by `f22a8d8c`'s precise-JIT-
+maps default-ON flip (bisected: identical crash with `CRATONVM_NO_PRECISE_JIT_MAPS=1`).

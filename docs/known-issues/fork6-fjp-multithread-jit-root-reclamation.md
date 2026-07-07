@@ -1,5 +1,19 @@
 # Fork6 — multi-thread (ForkJoinPool worker) JIT-root reclamation
 
+> **NEW real-world SIGSEGV repro 2026-07-07 (much simpler than Fork6Hard GC_STRESS
+> races)**: `org.jboss.as.test.manualmode.ejb.client.outbound.connection.security.
+> ElytronRemoteOutboundConnectionTestCase` (real WildFly/Elytron/XNIO code, no synthetic
+> harness) reliably SIGSEGVs in `NativeContextImpl::read_string` called from
+> `xnio_async::native_builder_set`, reached via a JIT-compiled `jit_invoke_virtual_mic`
+> call site fed a stale `String` `ObjectRef` — a single-process, deterministic hit of
+> this SAME register-only-oop gap (bisected: crash persists with
+> `CRATONVM_NO_PRECISE_JIT_MAPS=1`, disappears with `CRATONVM_DISABLE_JIT=1` — JIT-general,
+> not tied to the 2026-07-07 precise-maps default-ON flip). Full gdb backtrace + a
+> reusable Surefire-gdb-wrapper repro technique in
+> [`wildfly-elytron-remoting-segfault-post-keyfactory-fix.md`](wildfly-elytron-remoting-segfault-post-keyfactory-fix.md).
+> Use this repro (single-threaded, no GC_STRESS orchestration needed) to verify the
+> eventual register-oop-bitmap fix alongside the existing Fork6Hard lane.
+
 **Status:** 🟡 OPEN. Non-stress `Fork6`/`Fork6Hard` remains non-reproducing on current `dev`. Two infrastructure bugs adjacent to A4 were found and fixed 2026-07-02 (see that section below) — a takeover gate-polarity bug that made the default-on cross-thread STW JIT scan silently inert, and a defense-in-depth helper-window pass — but neither closes A4 itself, whose register-only residual remains gated on the deferred precise-JIT-stack-maps project. The 2026-07-01 aggressive `GC_STRESS` failures were **NOT A4** (zero live JIT frames, zero compiled JIT code at every STW) — root-caused as three unrelated concurrent-old-gen GC races, now FIXED on dev (`57f545be`); a different residual on that same lane is tracked at [`docs/known-issues/gcstress-residual-corruption-faces.md`](gcstress-residual-corruption-faces.md).
 
 > ## Fix 2026-07-02 — the "default-on" takeover was silently inert; + an initiator-side blocked/helper-window scan; stress lane re-scoped as a separate JIT-free bug
