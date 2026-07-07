@@ -5595,7 +5595,23 @@ fn register_re4_url_http(r: &mut NativeMethodRegistry) {
     // S111r27 — Keep optional integrations truly optional. Spring computes
     // several static "xxxPresent" flags via ClassUtils.isPresent(...); when
     // these flip true under partial emulation, later probes may dive into
-    // missing subsystems (JSF/Groovy) and destabilize bootstrap.
+    // missing subsystems (JSF) and destabilize bootstrap.
+    //
+    // Groovy note (2026-07-07): this stub used to also force `groovy.*` to
+    // absent, because letting Spring's `DelegatingSmartContextLoader` pick the
+    // Groovy context loader used to wedge the VM in Groovy's shaded ANTLR4
+    // compiler (millions of gc::guard OOB-field warnings, no completion). The
+    // real culprit was OUR force-registered ANTLR ATN fast-path shim
+    // (`native_antlr_atn_config_init` & friends in lib.rs, added e48e14cc)
+    // applying standard-ANTLR4 `ATNConfig` slot indices (reachesIntoOuterContext=3,
+    // semanticContext=4) to the `groovyjarjarantlr4` shaded copy — which is the
+    // tunnelvisionlabs fork whose base `ATNConfig` legitimately has only THREE
+    // fields (state / packed altAndOuterContextDepth / context) with subclass
+    // fields at slots 3..5. Fixed by 50119adb (fork-aware packed layout +
+    // `antlr_groovy_atn_special_slot`), so `groovy.*` presence is now decided
+    // honestly by the classpath probe below and `.groovy` bean scripts load
+    // through the real `GenericGroovyXmlContextLoader`. See
+    // docs/known-issues/test-context-constructor-param-annotation-offset.md.
     r.register(
         "org/springframework/util/ClassUtils",
         "isPresent",
@@ -5605,7 +5621,7 @@ fn register_re4_url_http(r: &mut NativeMethodRegistry) {
                 Some(Value::Object(Some(s))) => ctx.read_string(*s).unwrap_or_default(),
                 _ => String::new(),
             };
-            if name == "jakarta.faces.context.FacesContext" || name.starts_with("groovy.") {
+            if name == "jakarta.faces.context.FacesContext" {
                 return Ok(Some(Value::Int(0)));
             }
             let internal = name.replace('.', "/");

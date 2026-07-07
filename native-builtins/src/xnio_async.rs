@@ -1207,14 +1207,41 @@ fn option_value_as_bool(ctx: &dyn NativeContext, value: &OptionValue) -> Option<
     }
 }
 
-/// `OptionMap.get(Option)Ljava/lang/Object;` and `get(Option, Object)Object`.
+/// `OptionMap.get(Option)Ljava/lang/Object;` and `get(Option, Object)Object` --
+/// both overloads declare a return type of `Ljava/lang/Object;`, so a numeric
+/// entry (stored unboxed for cheap internal representation -- see
+/// `native_builder_set`, which stores `Value::Int`/`Value::Long` straight from
+/// the primitive `set(Option<Integer>, int)`-family setters) MUST be boxed
+/// into a real `Integer`/`Long`/`Boolean` object before returning, exactly as
+/// real XNIO's `Map<Option<?>, Object>`-backed `OptionMap` would already hold
+/// a boxed value. Returning the raw `Value::Int`/`Value::Long` here used to
+/// violate the declared `Object` return type: the interpreter's generic
+/// native-return handling tolerated it, but the JIT's fast MIC-miss return
+/// path (`vm/src/jit/helpers.rs`) takes a raw primitive result and passes it
+/// through as if it were already a pointer-shaped `ObjectRef` -- so a small
+/// int (e.g. a `60000`ms timeout option) becomes a bogus "object reference"
+/// that segfaults the next time anything dereferences it (confirmed root
+/// cause of the `ElytronRemoteOutboundConnectionTestCase` SIGSEGV, see
+/// `docs/known-issues/wildfly-elytron-remoting-segfault-post-keyfactory-fix.md`).
 fn native_option_map_get(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let (inner, key, default_val) = option_map_get_key(ctx, args)?;
 
     match inner.entries.get(&key) {
-        Some(OptionValue::Int(n)) => Ok(Some(Value::Int(*n))),
-        Some(OptionValue::Long(n)) => Ok(Some(Value::Long(*n))),
-        Some(OptionValue::Bool(b)) => Ok(Some(Value::Int(if *b { 1 } else { 0 }))),
+        Some(OptionValue::Int(n)) => Ok(Some(crate::lang_class::box_value(
+            ctx,
+            Value::Int(*n),
+            "I",
+        ))),
+        Some(OptionValue::Long(n)) => Ok(Some(crate::lang_class::box_value(
+            ctx,
+            Value::Long(*n),
+            "J",
+        ))),
+        Some(OptionValue::Bool(b)) => Ok(Some(crate::lang_class::box_value(
+            ctx,
+            Value::Int(if *b { 1 } else { 0 }),
+            "Z",
+        ))),
         Some(OptionValue::Str(s)) => {
             let js = ctx.create_string(s);
             Ok(Some(Value::Object(Some(js))))
@@ -2349,7 +2376,15 @@ mod tests {
         )
         .unwrap()
         .unwrap();
-        assert_eq!(got, Value::Int(8));
+        // `get(Option)Object` must box the stored int, not return it raw
+        // (the JIT's fast return path treats a raw int as a bogus ObjectRef --
+        // see native_option_map_get's doc comment).
+        match got {
+            Value::Object(Some(o)) => {
+                assert_eq!(ctx.get_field(o, 0), Value::Int(8));
+            }
+            other => panic!("expected boxed Integer, got {other:?}"),
+        }
         // Size should be 1.
         let size = native_option_map_size(&mut ctx, &[Value::Object(Some(map))])
             .unwrap()
@@ -2499,7 +2534,12 @@ mod tests {
         )
         .unwrap()
         .unwrap();
-        assert_eq!(got, Value::Int(4));
+        match got {
+            Value::Object(Some(o)) => {
+                assert_eq!(ctx.get_field(o, 0), Value::Int(4));
+            }
+            other => panic!("expected boxed Integer, got {other:?}"),
+        }
     }
 
     #[test]
@@ -2847,8 +2887,14 @@ mod tests {
         )
         .unwrap()
         .unwrap();
-        // Bool is encoded as Int(0/1).
-        assert_eq!(got, Value::Int(1));
+        // Bool is stored as Int(0/1) internally but `get(Option)Object` must
+        // box it into a real Boolean, matching the declared Object return type.
+        match got {
+            Value::Object(Some(o)) => {
+                assert_eq!(ctx.get_field(o, 0), Value::Int(1));
+            }
+            other => panic!("expected boxed Boolean, got {other:?}"),
+        }
     }
 
     #[test]
