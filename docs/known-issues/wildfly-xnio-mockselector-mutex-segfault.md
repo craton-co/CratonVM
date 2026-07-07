@@ -334,11 +334,25 @@ nm -C frozen-cratonvm-wildfly-bugbash-v2-20260707 | grep -B1 -A1 e5bdb0
 
 **CONFIRMED SAME BUG as [[wildfly-elytron-remoting-segfault-post-keyfactory-fix]]** (see the top section)
 — both are the A4 register-only-oop family, tracked centrally in
-[[fork6-fjp-multithread-jit-root-reclamation]]. Still distinct from
-[[wildfly-infinispan-remove-listener-segfault]] (different symbol, different subsystem, much lower
-frequency/more intermittent) and from the separate GC-barrier boot-**hang** found in the "Reproduction
-attempt 2026-07-07" section above (that one blocks standalone boot outright and doesn't crash — an
-orthogonal bug, not yet root-caused, not addressed by this confirmation).
+[[fork6-fjp-multithread-jit-root-reclamation]].
+
+**UPDATE 2026-07-07 ~16:30: also confirmed the SAME bug as the (formerly "distinct") infinispan
+finding.** `wildfly-infinispan-remove-listener-segfault.md`'s original `addr2line`-derived
+`infinispan_local::CacheInner::remove_listener` attribution was itself an LTO/drop-glue symbol-merge
+artifact, exactly like this doc's own original `MockSelector`/`std::sync::Mutex` misattribution — a live
+gdb repro (full DWARF symbols, `release-with-debug` profile) showed the identical
+`read_string` <- `xnio_async::native_builder_set` <- `jit_invoke_virtual_mic` stack, with the SAME
+fault addresses (`0xea60`=60000, `0x1d4c0`=120000 — XNIO worker/option millisecond timeouts misdecoded
+as heap pointers, not "near-null garbage"). Fixed as `60079fc4` (`fix(jit): validate heap membership for
+L/[ arg slots in jit_invoke_virtual_mic`, `vm/src/jit/helpers.rs`) — see the corrected doc, moved to
+`docs/internal/fixed-suite-bugs/wildfly-infinispan-remove-listener-segfault.md`. All three WildFly
+SIGSEGV docs opened on 2026-07-07 (this one, the elytron one, and the infinispan one) turned out to be
+the same underlying JIT `L`/`[` argument-decode gap, each initially misattributed to a different
+subsystem by `addr2line` on a stripped/LTO release binary.
+
+Still distinct from the separate GC-barrier boot-**hang** found in the "Reproduction attempt
+2026-07-07" section above (that one blocks standalone boot outright and doesn't crash — an orthogonal
+bug, not yet root-caused, not addressed by this confirmation).
 
 ## Evidence (2026-07-07 ~16:15 confirmation)
 

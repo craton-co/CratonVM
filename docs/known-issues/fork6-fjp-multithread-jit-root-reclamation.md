@@ -48,6 +48,29 @@
 > the WildFly repros — e.g. with the same allocation-provenance/publish-check forensics used on
 > `Fork6Hard` — before building a register-oop-bitmap fix that was already shown not to fix the other one.
 
+> **THIRD real-world confirmation + FIX 2026-07-07 ~16:30**: a third doc,
+> `wildfly-infinispan-remove-listener-segfault.md`, had independently misattributed this same crash to
+> `infinispan_local::CacheInner::remove_listener` (another `addr2line`-on-stripped-LTO-release-binary
+> symbol-merge artifact — same trap as the mockselector doc's original theory). A live gdb repro (full
+> DWARF symbols) confirmed the identical `read_string` <- `xnio_async::native_builder_set` <-
+> `jit_invoke_virtual_mic` stack, same fault-address family (`0xea60`=60000, `0x1d4c0`=120000 — XNIO
+> worker/option millisecond timeouts, not "near-null garbage pointers"). Unlike this doc's general
+> register-oop-bitmap framing, this specific manifestation was fixable at the JIT argument **decode**
+> boundary without touching oop-map/register-tracking machinery at all: `jit_invoke_virtual_mic`'s
+> deferred arg decoder (`vm/src/jit/helpers.rs`, `decode_values` closure) treated any 8-byte-aligned,
+> sub-2^48 raw word in an `L`/`[` descriptor slot as a "plausible" pointer and built an `ObjectRef` from
+> it unconditionally — but a primitive `long` that should have matched the `J` arm (e.g. a round
+> millisecond timeout) is trivially both aligned and small, so it falsely passed. Fixed (landed on dev as
+> `60079fc4`) by requiring actual heap membership (`vm.heap.is_object_address`) instead of just
+> bit-pattern plausibility, matching an already-correct sibling decode path a few hundred lines earlier
+> in the same file. Verified with 18 consecutive clean repro attempts (two independent sessions) plus a
+> 30-class regression slice, zero crashes, versus a 100% pre-fix crash rate on the same repro — see the
+> corrected doc at `docs/internal/fixed-suite-bugs/wildfly-infinispan-remove-listener-segfault.md`.
+> **This closes the `native_builder_set`/`OptionMap.Builder.set` manifestation specifically** — it does
+> NOT close the more general register-invisible-oop gap this doc tracks, and does NOT touch
+> `Fork6Hard`'s own `GC_STRESS` repro (see the "Reconcile before implementing a fix" note above — that
+> repro's mechanism is still believed to differ).
+
 **Status:** 🟡 OPEN. Non-stress `Fork6`/`Fork6Hard` remains non-reproducing on current `dev`. Two infrastructure bugs adjacent to A4 were found and fixed 2026-07-02 (see that section below) — a takeover gate-polarity bug that made the default-on cross-thread STW JIT scan silently inert, and a defense-in-depth helper-window pass — but neither closes A4 itself, whose register-only residual remains gated on the deferred precise-JIT-stack-maps project. The 2026-07-01 aggressive `GC_STRESS` failures were **NOT A4** (zero live JIT frames, zero compiled JIT code at every STW) — root-caused as three unrelated concurrent-old-gen GC races, now FIXED on dev (`57f545be`); a different residual on that same lane is tracked at [`docs/known-issues/gcstress-residual-corruption-faces.md`](gcstress-residual-corruption-faces.md).
 
 > ## Fix 2026-07-02 — the "default-on" takeover was silently inert; + an initiator-side blocked/helper-window scan; stress lane re-scoped as a separate JIT-free bug
