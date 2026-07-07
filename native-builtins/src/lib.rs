@@ -25079,6 +25079,62 @@ fn native_surefire_forkedbooter_acknowledged_exit(
                 &[Value::Object(Some(this)), Value::Object(Some(bye))],
             ),
         );
+        // The write above reaches the OS pipe correctly, but CratonVM can
+        // then call process::exit() before Maven's own asynchronous
+        // stdout-pumping thread has even been scheduled to read it -- for
+        // trivial/fast test classes there is enough real wall-clock work
+        // (class loading, JIT warmup, GC) in a real HotSpot fork that this
+        // race never shows up there, but CratonVM's much faster teardown
+        // exposes it. Real Surefire's own acknowledgedExit() handles this by
+        // registering a bye-ack listener and blocking (bounded) until the
+        // parent's ForkClient explicitly acknowledges receipt
+        // (TestLessInputStream.acknowledgeByeEventReceived() queues
+        // Command.BYE_ACK and releases a semaphore) -- do the same here
+        // instead of exiting blind. Bounded well under the real 30s default
+        // exit-timeout: this is only ever meant to absorb an OS scheduling
+        // gap of a few milliseconds, not to wait out a genuinely wedged
+        // parent.
+        if let Value::Object(Some(command_reader)) = cr {
+            let wait_result: MethodCallResult = (|| {
+                let sem = match ctx.new_object("java/util/concurrent/Semaphore")? {
+                    Some(Value::Object(Some(o))) => o,
+                    _ => return Ok(None),
+                };
+                ctx.invoke_special(
+                    "java/util/concurrent/Semaphore",
+                    "<init>",
+                    "(I)V",
+                    &[Value::Object(Some(sem)), Value::Int(0)],
+                )?;
+                let listener = match ctx.new_object("org/apache/maven/surefire/booter/ForkedBooter$6")? {
+                    Some(Value::Object(Some(o))) => o,
+                    _ => return Ok(None),
+                };
+                ctx.invoke_special(
+                    "org/apache/maven/surefire/booter/ForkedBooter$6",
+                    "<init>",
+                    "(Lorg/apache/maven/surefire/booter/ForkedBooter;Ljava/util/concurrent/Semaphore;)V",
+                    &[
+                        Value::Object(Some(listener)),
+                        Value::Object(Some(this)),
+                        Value::Object(Some(sem)),
+                    ],
+                )?;
+                ctx.invoke_virtual(
+                    command_reader,
+                    "addByeAckListener",
+                    "(Lorg/apache/maven/surefire/booter/CommandListener;)V",
+                    &[Value::Object(Some(listener))],
+                )?;
+                ctx.invoke_virtual(
+                    sem,
+                    "tryAcquire",
+                    "(JLjava/util/concurrent/TimeUnit;)Z",
+                    &[Value::Long(2000), Value::Object(None)],
+                )
+            })();
+            surefire_ignore("bye-ack-wait", wait_result);
+        }
     }
     surefire_ignore(
         "cancelPingScheduler",
