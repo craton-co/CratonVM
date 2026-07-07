@@ -20,6 +20,30 @@ Load-nondeterministic: per the fork6-fjp doc's own history, distinguishing a
 partial fix from noise on this lane needs ≳100 interleaved runs. A single
 run failing is not by itself evidence against a fix.
 
+### 2026-07-07 — MUCH cheaper repro: Hibernate `ZonedDateTimeTest` (no GC_STRESS lane needed)
+
+Found while validating the archived stale-local doc: on the Linux probe host
+(`hibernate-orm-harness`, default heap, default JIT, binary `cvgc0706-fix2` =
+dev `3240cb75`), `org.hibernate.orm.test.type.temporal.ZonedDateTimeTest`
+**livelocks before its first test result** in a continuous
+`mark_young: rejecting object at 0x… with implausible extent NNN (kind=0, …)` +
+`[A2] BREADCRUMB — NO allocation record covers 0x…` loop (one pair every ~1.5 s,
+same address for the whole run — a garbage-header object stays reachable by the
+young mark across every collection; the guard rejects it so there is no crash,
+just no progress; 0 of the stale-local family's signatures present).
+`OffsetDateTimeTest` intermittently logs 2 such rejections at CHANGING addresses
+and still completes (exit=0) — the face is intermittent there, persistent-address
+in Zoned. Sibling classes (`InstantTests`, `LocalDateTimeTest`, `OffsetTimeTest`)
+are clean. Command shape:
+
+```
+CRATONVM_DISABLE_DEFAULT_WATCHDOG=1 <cratonvm> --java-home <jdk25> \
+  "@<fixed common.args>" CratonRunner <listfile-with-ZonedDateTimeTest> 0
+```
+
+This gives face-1-style triage (implausible header / no allocation record) a
+single-class, default-heap, watchable repro instead of the ≳100-run stress lane.
+
 ## Residual faces
 
 > **2026-07-03 investigation round (branch `fix/gcstress-residual-diag-20260703`,

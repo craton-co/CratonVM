@@ -10,11 +10,17 @@ ScheduledFuture/NodeTestTask), and (3) the keystone `invoke_shared`/`invoke_spec
 (`5732a1e1`): object args are now pinned across the class-load + `<clinit>` window, the stale-args hole
 no per-native pin could cover.
 **Acceptance validation (2026-07-07, Linux probe host, `hibernate-orm-harness`, default heap, default
-JIT):** the temporal classes ran with **zero corruption markers** (no `Stale pointer`/all-zero-header, no
-SIGSEGV, no `Object.<sam>` linkage error, no rc=1 abort) — `InstantTests` and `LocalDateTimeTest`
-completed to `@@RESULT` (162 tests started each); a per-class loop across all five classes confirmed
-crash-free execution (numbers in the merge summary). The classes now surface a **different, functional,
-non-GC bug** — duplicated JDBC `?` placeholders in generated SQL — tracked as the new
+JIT):** ZERO instances of THIS doc's crash signatures anywhere (`Object.<sam>` linkage error,
+all-zero-header stale-receiver storm, SIGSEGV, rc=1 mid-class abort). Per-class:
+`InstantTests`/`LocalDateTimeTest`/`OffsetTimeTest` completed to `@@RESULT` fully clean;
+`OffsetDateTimeTest` completed (exit=0) with 2 gracefully-degraded `mark_young … implausible extent`
+guard rejections; `ZonedDateTimeTest` never crashes but LIVELOCKS in a continuous
+`mark_young: rejecting object … implausible extent` + `[A2] BREADCRUMB — NO allocation record` loop —
+that is a **DISTINCT, still-open** corruption face (garbage-header object repeatedly reachable by the
+young mark), tracked in
+[`docs/known-issues/gcstress-residual-corruption-faces.md`](../known-issues/gcstress-residual-corruption-faces.md)
+(see its 2026-07-07 repro note), NOT this doc's (fixed) dispatch-crash family. The classes also surface
+a **functional, non-GC bug** — duplicated JDBC `?` placeholders in generated SQL — tracked as
 [`docs/known-issues/hib-temporal-sql-parameter-placeholder-duplication.md`](../known-issues/hib-temporal-sql-parameter-placeholder-duplication.md).
 **Mode:** Interpreter (default and `--nojit`). **HotSpot (JDK 25):** PASS.
 **Affected classes (5):** `org.hibernate.orm.test.type.temporal.{InstantTests, LocalDateTimeTest,
