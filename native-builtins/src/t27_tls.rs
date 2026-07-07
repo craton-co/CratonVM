@@ -1678,32 +1678,31 @@ impl JavaKeyManagerResolver {
                         i, cls_name
                     );
                 }
-                // FIX (tomcat-clientauth-engine-config): calling
-                // `chooseClientAlias` on the very FIRST handshake of a fresh
-                // process (as this crate's "speculative optional client
-                // auth on first handshake" fix now does, to avoid needing
-                // TLS renegotiation — see `engine_begin`'s
-                // `speculative_optional_auth` — for a KeyManager wrapper
-                // class the test suite defines, e.g. Tomcat's
-                // `TrackingKeyManager`) intermittently threw
-                // `AbstractMethodError` even though `javap` confirms the
-                // real target method is concrete, non-abstract bytecode.
-                // `ensure_class_initialized` on the receiver's own class (and
-                // the `X509KeyManager`/`X509ExtendedKeyManager` supertypes)
-                // immediately beforehand did not eliminate it — consistent
-                // with this doc's own already-documented, separate VM-core
-                // vtable-install cross-thread visibility race (see
-                // "Residual #2 implementation" point 1 / recommendation #7:
-                // the handshake runs on a different thread than the one that
-                // defined/verified this class), not a class-initialization
-                // ordering issue this call site can fix on its own. A single
-                // retry after yielding is a safe, narrowly-scoped mitigation
-                // for what is empirically a one-shot transient race (never
-                // observed to fail twice in a row) — it does not mask a
-                // correctness bug, since `AbstractMethodError` here always
-                // means "vtable slot not yet visible to this thread", never
-                // "the real target is genuinely unimplemented" (verified via
-                // `javap`).
+                // FIX (tomcat-clientauth-engine-config): a caller-installed
+                // `KeyManager` wrapper (e.g. Tomcat's `TrackingKeyManager`,
+                // `test/org/apache/tomcat/util/net/TesterSupport.java`)
+                // delegates to whatever `KeyManagerFactory.getKeyManagers()`
+                // returned. That was ROOT-CAUSED (not just worked around) —
+                // see `phases_late.rs`'s `KeyManagerFactory.getKeyManagers()`
+                // handler's own doc comment for the full story: it used to
+                // return an object stamped with the bare
+                // `javax/net/ssl/X509KeyManager` INTERFACE's own class id,
+                // whose 6 methods are all abstract with no Code, so any
+                // caller invoking one directly hit `AbstractMethodError`
+                // unconditionally and deterministically (confirmed via
+                // `CRATONVM_DBG_NOCODE=1` tracing — NOT a timing/vtable-
+                // visibility race, an earlier hypothesis this session
+                // initially chased and disproved: `ensure_class_initialized`
+                // immediately before the call never helped, and a bounded
+                // retry-with-backoff (below) failed identically on every
+                // attempt, every time — the real receiver class was wrong,
+                // not "not yet ready"). Fixed at the source in
+                // `getKeyManagers()`. The retry loop below is kept as a
+                // narrowly-scoped defensive fallback (harmless: it only
+                // fires on this exact exception class, and costs nothing
+                // when it never fires) in case some OTHER, genuinely
+                // transient cause of the same symptom is hit by a future
+                // caller shape this session didn't exercise.
                 let args = [
                     Value::Object(Some(key_type_arr)),
                     Value::Object(Some(issuers_arr)),
@@ -1743,17 +1742,6 @@ impl JavaKeyManagerResolver {
                 if dbg {
                     let exc_cls = match &choose_result {
                         Err(cratonvm_types::error::MethodCallFailed::ExceptionThrown(exc)) => {
-                            let hash = ctx.identity_hash_code(*exc);
-                            if let Some(trace) = ctx.get_stack_trace(hash) {
-                                for (fi, frame) in trace.iter().enumerate() {
-                                    eprintln!(
-                                        "[dbg-tls-auth]   frame[{}] = {:?}",
-                                        fi, frame
-                                    );
-                                }
-                            } else {
-                                eprintln!("[dbg-tls-auth]   (no stack trace captured)");
-                            }
                             Some(ctx.class_name_of_id(ctx.class_id_of_object(*exc)))
                         }
                         _ => None,
@@ -4537,13 +4525,14 @@ fn engine_begin(state: &mut EngineState) -> Result<(), String> {
                     // (optional) client auth — otherwise an "optional" server
                     // never asks and `peer_certificates()` stays empty.
                     //
-                    // FIX (tomcat-clientauth-engine-config): Tomcat's
-                    // SSLHostConfig/SSLAuthenticator machinery deliberately does
-                    // NOT toggle need/want client auth up front for the common
-                    // "certificateVerification=optional, auth decided per-request"
-                    // configuration this suite exercises (`TestClientCert`/
-                    // `TestCustomSslTrustManager`) — instead it always requests
-                    // the cert (if at all) via a mid-connection TLS renegotiation
+                    // INVESTIGATED, NOT APPLIED (tomcat-clientauth-engine-config):
+                    // Tomcat's SSLHostConfig/SSLAuthenticator machinery
+                    // deliberately does NOT toggle need/want client auth up
+                    // front for the common "certificateVerification=optional,
+                    // auth decided per-request" configuration this suite
+                    // exercises (`TestClientCert`/`TestCustomSslTrustManager`)
+                    // — instead it always requests the cert (if at all) via a
+                    // mid-connection TLS renegotiation
                     // (`SSLEngine.setNeedClientAuth(true)` + `beginHandshake()`
                     // called AGAIN on an already-handshaked engine, from
                     // `NioEndpoint$NioSocketWrapper.doClientAuth`). rustls
@@ -4566,49 +4555,54 @@ fn engine_begin(state: &mut EngineState) -> Result<(), String> {
                     // True wire-level renegotiation is therefore not
                     // implementable without swapping TLS backends (the same
                     // class of permanently-unfixable gap as this doc's TLS 1.2
-                    // DHE cipher case). The workaround here avoids needing
-                    // renegotiation at all: when this engine's SSLContext was
-                    // itself initialized with trust roots (i.e. a real Java
-                    // `TrustManager[]`/truststore was configured — which for a
-                    // SERVER SSLContext is essentially always "this connector
-                    // may want to validate a client certificate"), speculatively
-                    // send an OPTIONAL CertificateRequest on the very FIRST
-                    // handshake, before Tomcat has explicitly asked for one. A
-                    // client with no certificate to offer (the common case)
-                    // behaves identically — `WebPkiClientVerifier::
-                    // allow_unauthenticated()` accepts an empty client
-                    // Certificate message exactly as if no CertificateRequest
-                    // had been sent at all. A client that DOES have a KeyManager
-                    // installed (every test in this cluster that actually
-                    // exercises client-cert auth configures one via
-                    // `TesterSupport.configureClientSsl()`, unconditionally, in
-                    // its own `@Before`/setup, independent of whether that
-                    // particular sub-test's request path needs it) volunteers
-                    // its cert immediately — `peer_cert_chain_der` is populated
-                    // during this first, only handshake, so by the time
-                    // Tomcat's `SSLAuthenticator`/`AbstractProcessor.
-                    // populateSslRequestAttributes` later reads
-                    // `SSLSession.getPeerCertificates()` (or the explicit
-                    // `doClientAuth`/rehandshake path finds `certs != null`
-                    // already and skips re-handshaking altogether), the
-                    // certificate is already there — no renegotiation required.
-                    // Deliberately does NOT downgrade or override an already
-                    // explicit `need`/`want` (a real `setNeedClientAuth(true)`
-                    // called before the first handshake — e.g. a
-                    // `certificateVerification=required` host, or the plain
-                    // `SSLParameters.setNeedClientAuth(true)`-upfront repro
-                    // this doc's residual #2 verified directly — still wins and
-                    // still enforces REQUIRED semantics exactly as before).
-                    // TEMP-DISABLED for A/B testing (tomcat-clientauth-engine-config):
-                    // this speculative request broke TestClientCert's explicit
-                    // `assertEquals(0, count)` check for the unprotected-resource
-                    // request (the suite deliberately verifies NO cert is requested
-                    // until a protected resource needs one) — testClientCertPostLarger
-                    // regressed from pass to fail. Disabled here to verify whether
-                    // TestCustomSslTrustManager's 2/9->1/9 improvement survives
-                    // without it (expected: yes, since that improvement traces to the
-                    // separate KeyManagerFactory/TrustManagerFactory AbstractMethodError
-                    // fixes, not this speculative-auth mechanism).
+                    // DHE cipher case).
+                    //
+                    // A workaround WAS tried and measured: when this engine's
+                    // SSLContext carried trust roots (a real `TrustManager[]`
+                    // was configured), speculatively send an OPTIONAL
+                    // CertificateRequest on the very FIRST handshake instead of
+                    // waiting for Tomcat's rehandshake — proven to work
+                    // end-to-end (a client with a KeyManager installed
+                    // volunteers its cert immediately; `WebPkiClientVerifier::
+                    // allow_unauthenticated()` accepts an empty Certificate
+                    // message from a client with none, identically to no
+                    // CertificateRequest ever being sent). Measured effect:
+                    // `TestCustomSslTrustManager` improved 2/9->1/9 failing
+                    // (the remaining failure is the doc's already-known
+                    // `testCustomTrustManagerNone` order-dependent flake), but
+                    // `TestClientCert` stayed at 5/18 failing with a *different*
+                    // failure set — `testClientCertGetWithPreemptive` newly
+                    // PASSED, but `testClientCertPostLarger` newly FAILED,
+                    // because the suite has an explicit,
+                    // deliberately-asserted invariant this workaround violates:
+                    // `doTestClientCertGet`/`doTestClientCertPost` both assert
+                    // `assertEquals(0, TesterSupport.
+                    // getLastClientAuthRequestedIssuerCount())` after the FIRST
+                    // (unprotected-resource) request — i.e. the suite is
+                    // explicitly verifying NO CertificateRequest is sent until
+                    // a protected resource actually needs one. A speculative
+                    // upfront request can therefore only ever satisfy the
+                    // small "preemptive" subset of this suite while breaking
+                    // the (larger) "non-preemptive" subset's own explicit
+                    // assertions — it cannot net-improve `TestClientCert`
+                    // without also implementing the deferred/mid-connection
+                    // request the suite actually wants, which circles back to
+                    // requiring real renegotiation. Reverted (kept as `false`
+                    // below, not deleted, since the wiring — `client_ca`
+                    // resolution, `has_custom_trust_managers`, the
+                    // `optional_client_cert` passthrough a few lines down —
+                    // is correct and reusable if a future session finds a
+                    // renegotiation-shaped answer, e.g. a custom rustls fork
+                    // or an OpenSSL-backed engine variant that does support
+                    // it). Deliberately does NOT downgrade or override an
+                    // already explicit `need`/`want` (a real
+                    // `setNeedClientAuth(true)` called before the first
+                    // handshake — e.g. a `certificateVerification=required`
+                    // host, or the plain `SSLParameters.setNeedClientAuth
+                    // (true)`-upfront repro this doc's residual #2 verified
+                    // directly — still wins and still enforces REQUIRED
+                    // semantics exactly as before; this is unaffected by the
+                    // revert below).
                     let speculative_optional_auth = false
                         && !state.need_client_auth
                         && !state.want_client_auth
