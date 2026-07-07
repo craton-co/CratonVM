@@ -366,9 +366,20 @@ fn dgram_send0(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult 
     let mut bytes = vec![0u8; n_to_send];
     let n_read = ctx.read_byte_array_into(arr, position as usize, &mut bytes);
     bytes.truncate(n_read);
-    let sent = dgram_with(id, |s| s.sock.send_to(&bytes, target))
+    // send_to can park on a full local socket buffer; keep it in the same
+    // GC-blocking protocol as the receive path and re-sync `buf` (used by
+    // buffer_advance below) across the region.
+    let mut held = vec![Value::Object(Some(buf))];
+    ctx.begin_blocking_region();
+    let sent_opt = dgram_with(id, |s| s.sock.send_to(&bytes, target));
+    ctx.end_blocking_region_refs(&mut held);
+    let sent = sent_opt
         .ok_or_else(|| io_error("send: socket missing"))?
         .map_err(|e| io_error(format!("send_to {target}: {e}")))?;
+    let buf = match held[0] {
+        Value::Object(Some(b)) => b,
+        _ => return Ok(Some(Value::Int(sent as i32))),
+    };
     if sent > 0 {
         buffer_advance(ctx, buf, position + sent as i32);
     }
@@ -391,8 +402,19 @@ fn dgram_receive0(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResu
         return Ok(Some(Value::Object(None)));
     }
     let mut bytes = vec![0u8; space];
-    let recv_result = dgram_with(id, |s| s.sock.recv_from(&mut bytes))
-        .ok_or_else(|| io_error("receive: socket missing"))?;
+    // A blocking-mode DatagramChannel parks in recv_from until a packet
+    // arrives. Bracket it in the GC-blocking protocol (see the matching
+    // MulticastSocket.receive comment in net.rs) and re-sync the heap refs
+    // used after the region through `end_blocking_region_refs`.
+    let mut held = vec![Value::Object(Some(buf)), Value::Object(Some(arr))];
+    ctx.begin_blocking_region();
+    let recv_opt = dgram_with(id, |s| s.sock.recv_from(&mut bytes));
+    ctx.end_blocking_region_refs(&mut held);
+    let recv_result = recv_opt.ok_or_else(|| io_error("receive: socket missing"))?;
+    let (buf, arr) = match (held[0], held[1]) {
+        (Value::Object(Some(b)), Value::Object(Some(a))) => (b, a),
+        _ => return Ok(Some(Value::Object(None))),
+    };
     let (n, peer) = match recv_result {
         Ok(x) => x,
         Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {

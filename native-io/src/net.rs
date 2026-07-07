@@ -385,25 +385,34 @@ pub fn register_multicast_socket_overrides(r: &mut NativeMethodRegistry) {
             Some(Value::Object(Some(p))) => *p,
             _ => return Ok(None),
         };
-        let arr = ms_iv_obj(ctx, pkt, "getData", "()[B");
+        // Every ms_iv_* accessor below runs Java bytecode (GC-capable), so
+        // pin pkt and re-read it before each dispatch; fetch the data array
+        // LAST so its address is post-GC-fresh for the bulk copy.
+        let pkt_pin = ctx.pin_native_root(pkt);
         let addr = ms_iv_obj(ctx, pkt, "getAddress", "()Ljava/net/InetAddress;");
+        let host = addr.and_then(|ia| ms_inet_host(ctx, ia));
+        let pkt = ctx.read_native_pin(pkt_pin, pkt);
         let off = ms_iv_i32(ctx, pkt, "getOffset", "()I").unwrap_or(0).max(0) as usize;
+        let pkt = ctx.read_native_pin(pkt_pin, pkt);
         let len = ms_iv_i32(ctx, pkt, "getLength", "()I").unwrap_or(0).max(0) as usize;
+        let pkt = ctx.read_native_pin(pkt_pin, pkt);
         let port = ms_iv_i32(ctx, pkt, "getPort", "()I").unwrap_or(0);
-        if let (Some(arr), Some(ia)) = (arr, addr) {
-            if let Some(host) = ms_inet_host(ctx, ia) {
-                let alen = ctx.array_length(arr);
-                let mut buf = vec![0u8; len];
-                for i in 0..len {
-                    if off + i < alen {
-                        buf[i] = ctx.get_array_element(arr, off + i).as_int().unwrap_or(0) as u8;
-                    }
-                }
-                let _ = ctx
-                    .fd_table()
-                    .udp_send(fd as u32, &buf, &format!("{host}:{port}"));
-            }
+        let pkt = ctx.read_native_pin(pkt_pin, pkt);
+        let arr = ms_iv_obj(ctx, pkt, "getData", "()[B");
+        if let (Some(arr), Some(host)) = (arr, host) {
+            let alen = ctx.array_length(arr);
+            let mut buf = vec![0u8; len];
+            let n = (off + len).min(alen).saturating_sub(off);
+            let _ = ctx.read_byte_array_into(arr, off, &mut buf[..n]);
+            // Bracket the sendto in the GC-blocking protocol (it can park on
+            // a full local socket buffer); no heap refs are used afterwards.
+            ctx.begin_blocking_region();
+            let _ = ctx
+                .fd_table()
+                .udp_send(fd as u32, &buf, &format!("{host}:{port}"));
+            ctx.end_blocking_region();
         }
+        ctx.unpin_native_roots(pkt_pin);
         Ok(None)
     });
 
@@ -438,36 +447,61 @@ pub fn register_multicast_socket_overrides(r: &mut NativeMethodRegistry) {
                 Some(Value::Object(Some(p))) => *p,
                 _ => return Ok(None),
             };
+            // getData runs Java bytecode (GC-capable): pin pkt so every use
+            // after a potential collection sees the post-GC address.
+            let pkt_pin = ctx.pin_native_root(pkt);
             let arr = match ms_iv_obj(ctx, pkt, "getData", "()[B") {
                 Some(a) => a,
                 None => {
+                    ctx.unpin_native_roots(pkt_pin);
                     return Err(RuntimeError::IOException {
                         message: "DatagramPacket has no buffer".into(),
                     }
-                    .into())
+                    .into());
                 }
             };
+            let pkt = ctx.read_native_pin(pkt_pin, pkt);
+            let arr_pin = ctx.pin_native_root(arr);
             let cap = ctx.array_length(arr);
             let mut buf = vec![0u8; cap.max(1)];
-            match ctx.fd_table().udp_recv(fd as u32, &mut buf) {
+            // GC-blocking audit (gc-blocked-thread-frame-stale-thread-mirror,
+            // proper-fix item 2): this recv parks in the OS for up to
+            // soTimeout — or indefinitely when no timeout is set. Without the
+            // blocking-region bracket every cross-thread STW GC must wait for
+            // the receiver to tick out of the syscall (Tribes' McastService
+            // receiver stalled every collection by ~soTimeout, and a
+            // timeout-less receive wedges `wait_for_all` outright). The pins
+            // above are part of the deposited snapshot, so the socket/packet
+            // graph stays rooted and remappable while the thread is parked.
+            ctx.begin_blocking_region();
+            let recv_result = ctx.fd_table().udp_recv(fd as u32, &mut buf);
+            ctx.end_blocking_region();
+            let pkt = ctx.read_native_pin(pkt_pin, pkt);
+            let arr = ctx.read_native_pin(arr_pin, arr);
+            match recv_result {
                 Ok((n, src)) => {
                     let copy = n.min(cap);
-                    for i in 0..copy {
-                        ctx.set_array_element(arr, i, Value::Int(buf[i] as i8 as i32));
-                    }
+                    ctx.write_byte_array_from(arr, 0, &buf[..copy]);
                     let _ =
                         ctx.invoke_virtual(pkt, "setLength", "(I)V", &[Value::Int(copy as i32)]);
+                    // setLength ran bytecode: re-read pkt before the next
+                    // dispatch on it.
+                    let pkt = ctx.read_native_pin(pkt_pin, pkt);
                     if let Some(c) = src.rfind(':') {
                         if let Ok(p) = src[c + 1..].parse::<i32>() {
                             let _ = ctx.invoke_virtual(pkt, "setPort", "(I)V", &[Value::Int(p)]);
                         }
                     }
+                    ctx.unpin_native_roots(pkt_pin);
                     Ok(None)
                 }
-                Err(e) => Err(RuntimeError::IOException {
-                    message: format!("SocketTimeoutException: Receive timed out: {e}"),
+                Err(e) => {
+                    ctx.unpin_native_roots(pkt_pin);
+                    Err(RuntimeError::IOException {
+                        message: format!("SocketTimeoutException: Receive timed out: {e}"),
+                    }
+                    .into())
                 }
-                .into()),
             }
         },
     );
@@ -880,8 +914,6 @@ fn net_accept(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     // slot, which silently broke `net_fd_from_descriptor`'s fallback
     // path; see the comment below the accept() call. The new fd id is
     // returned via the Int return value instead.
-    let isaa = args.get(2).copied();
-
     let fd = net_fd_from_descriptor(ctx, fd_obj)
         .ok_or_else(|| ioex("accept: FileDescriptor has no fd id"))?;
     dbgnet!("accept fd={fd:#x} (blocking)");
@@ -900,6 +932,11 @@ fn net_accept(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
         }
     };
 
+    // The newfd FileDescriptor (args[1]) and isaa array (args[2]) are written
+    // AFTER the blocking region below; re-sync them through
+    // `end_blocking_region_refs` so a GC completing while this thread was
+    // parked in accept() cannot leave them as vacated pre-move addresses.
+    let mut largs = args.to_vec();
     let (stream, peer) = {
         let listener = listener_handle.lock();
         // Bracket the unbounded blocking accept() in a GC-blocking region so a
@@ -911,7 +948,7 @@ fn net_accept(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
         // alive until accept returns.
         ctx.begin_blocking_region();
         let res = net_accept_close_aware(&listener, fd);
-        ctx.end_blocking_region();
+        ctx.end_blocking_region_refs(&mut largs);
         res.map_err(|e| net_err("accept", e))?
     };
     let _ = stream.set_nonblocking(false);
@@ -930,11 +967,11 @@ fn net_accept(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     //      (the old synthetic 2-field object made `getAddress()` return a
     //      String → `NoSuchMethodError: String.getAddress()`).
     //   3. Return 1 (IOStatus: one connection accepted), not the fd id.
-    if let Some(Value::Object(Some(newfd_obj))) = args.get(1).copied() {
+    if let Some(Value::Object(Some(newfd_obj))) = largs.get(1).copied() {
         ctx.set_field_by_name(newfd_obj, "fd", Value::Int(new_fd));
     }
 
-    if let Some(Value::Object(Some(arr))) = isaa {
+    if let Some(Value::Object(Some(arr))) = largs.get(2).copied() {
         if ctx.array_length(arr) >= 1 {
             let peer_ip = peer.ip().to_string();
             let peer_port = peer.port() as i32;
@@ -984,7 +1021,10 @@ fn net_connect0(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult
     // code calling `sun/nio/ch/Net.connect0` could reach cloud-metadata
     // endpoints (e.g. AWS IMDS at 169.254.169.254) or pin the VM thread
     // on a black-hole target for the OS-default TCP timeout (~2 min).
-    let stream = match crate::outbound_policy::policy_connect(&conn_addr) {
+    ctx.begin_blocking_region();
+    let policy_res = crate::outbound_policy::policy_connect(&conn_addr);
+    ctx.end_blocking_region();
+    let stream = match policy_res {
         Ok(s) => s,
         Err(crate::outbound_policy::PolicyConnectError::Denied(reason)) => {
             return Err(ioex(format!("connect denied by outbound policy: {reason}")));
