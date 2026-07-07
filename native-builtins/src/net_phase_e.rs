@@ -3860,25 +3860,45 @@ fn http_build_request(
     out
 }
 
+/// Real HTTP/1.1 response reader: reads the header block, then reads the
+/// body according to the framing the headers actually declare
+/// (`Content-Length`, chunked, or close-delimited), stopping as soon as the
+/// message is complete instead of unconditionally reading until the peer
+/// closes the connection.
+///
+/// A real HTTP/1.1 peer is entitled to keep a connection open after sending
+/// a fully-framed response (keep-alive) -- reading until EOF unconditionally
+/// hangs forever on such a connection even though the whole response
+/// already arrived. See
+/// docs/known-issues/spring-web-flow-outputstreamwriter-close-corruption.md
+/// root cause #2 (`JdkClientHttpRequestFactoryTests` hang): confirmed via a
+/// live `strace` against a real `MockWebServer` that the server sent a
+/// complete 38-byte `Content-Length`-framed response and went straight back
+/// to `recv()` waiting for the next keep-alive request, while this client
+/// kept `recv()`-ing for a close that was never coming.
 fn http_read_response<R: Read>(mut r: R) -> std::io::Result<HttpResponse> {
     let mut all = Vec::with_capacity(8192);
     let mut buf = [0u8; 4096];
-    loop {
+
+    // Phase 1: read until the response headers are fully present.
+    let sep = loop {
+        if let Some(pos) = all.windows(4).position(|w| w == b"\r\n\r\n") {
+            break pos;
+        }
         match r.read(&mut buf) {
-            Ok(0) => break,
+            Ok(0) => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::UnexpectedEof,
+                    "connection closed before response headers were complete",
+                ));
+            }
             Ok(n) => all.extend_from_slice(&buf[..n]),
             Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
             Err(e) => return Err(e),
         }
-    }
-    let sep = all
-        .windows(4)
-        .position(|w| w == b"\r\n\r\n")
-        .ok_or_else(|| {
-            std::io::Error::new(std::io::ErrorKind::InvalidData, "no header terminator")
-        })?;
+    };
+
     let header_block = &all[..sep];
-    let body_region = &all[sep + 4..];
     let head_str = std::str::from_utf8(header_block)
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
     let mut lines = head_str.split("\r\n");
@@ -3909,13 +3929,67 @@ fn http_read_response<R: Read>(mut r: R) -> std::io::Result<HttpResponse> {
             headers.push((k, v));
         }
     }
-    let body = if chunked {
-        http_decode_chunked(body_region)?
+
+    // Phase 2: read the body per the declared framing, stopping as soon as
+    // it's complete.
+    let body_start = sep + 4;
+    // 1xx/204/304 never carry a body regardless of the framing headers.
+    let no_body = matches!(status, 100..=199 | 204 | 304);
+
+    let body = if no_body {
+        Vec::new()
+    } else if chunked {
+        // Mirrors the server-side chunked-body read loop elsewhere in this
+        // file (`http_decode_chunked` returns `Ok` only once the terminating
+        // zero-size chunk is present): read more whenever it still errors,
+        // until it succeeds or the peer closes/errors.
+        loop {
+            match http_decode_chunked(&all[body_start..]) {
+                Ok(b) => break b,
+                Err(_) => match r.read(&mut buf) {
+                    Ok(0) => {
+                        return Err(std::io::Error::new(
+                            std::io::ErrorKind::UnexpectedEof,
+                            "connection closed before chunked body was complete",
+                        ));
+                    }
+                    Ok(n) => all.extend_from_slice(&buf[..n]),
+                    Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+                    Err(e) => return Err(e),
+                },
+            }
+        }
     } else if let Some(n) = content_length {
+        while all.len() - body_start < n {
+            match r.read(&mut buf) {
+                // Peer closed early: return whatever body arrived, matching
+                // the previous read-until-EOF behavior's leniency for a
+                // short response instead of erroring.
+                Ok(0) => break,
+                Ok(read) => all.extend_from_slice(&buf[..read]),
+                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+                Err(e) => return Err(e),
+            }
+        }
+        let body_region = &all[body_start..];
         body_region[..body_region.len().min(n)].to_vec()
     } else {
-        body_region.to_vec()
+        // Neither Content-Length nor chunked: the only remaining HTTP/1.1
+        // framing is "read until the connection closes" (legacy
+        // close-delimited body) -- a compliant server without either header
+        // MUST close the connection to signal the end of the body, so
+        // waiting for EOF here is still correct and necessary.
+        loop {
+            match r.read(&mut buf) {
+                Ok(0) => break,
+                Ok(n) => all.extend_from_slice(&buf[..n]),
+                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+                Err(e) => return Err(e),
+            }
+        }
+        all[body_start..].to_vec()
     };
+
     Ok(HttpResponse {
         status,
         headers,

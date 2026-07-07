@@ -25,6 +25,56 @@ angles**; this index is the consolidated map. Read it first.
   tearing) are all FIXED+merged, end-to-end verified on the Windows box (deterministic silent stall
   → bimodal fast-IMSE/stall, both faces now attributed to the new GC doc above).
 
+## 2026-07-07 GC_STRESS residual corruption re-assessed (still OPEN, two hypotheses refuted)
+
+- 🟡 Re-ran the Fork6Hard `GC_STRESS` lane on current dev (commit `3a1a95b5`): **0 crashes in 56 runs** — the severe SIGSEGV/`CompactValue`-panic faces the doc opened for are gone (contained by the 2026-07-06 `2dfdfddc` slot-tearing + map-node + guard/recovery wave). Residual is now a *contained* stale-reference young-mark rejection that still surfaces as a rep-level `ClassCastException`/`NoSuchMethodError`/`nullchild` (32/56) or a rare wedge (5/56). **Refuted both leading producers**: disabling JIT inline-`new` (4→3/12) and compact-ref-fields (→3/12) change nothing, and it reproduces under `--nojit` too, so it is a shared-core missed-root/missed-remap bug, not JIT allocation codegen. The cheap `ZonedDateTimeTest` livelock repro is CLOSED (completes clean now). Kept in known-issues (unfixed). Full write-up in [gcstress-residual-corruption-faces.md](gcstress-residual-corruption-faces.md).
+
+## 2026-07-06 Infinispan Cache.config null after real DefaultCacheManager.start() — FIXED; two new residuals found one/two layers deeper
+
+- ✅ FIXED: `native_dcm_get_cache` (and all Cache-instance natives —
+  `put`/`get`/`remove`/`containsKey`/`size`/`clear`/`evict`/`addListener`/
+  `removeListener`/`getName`/`putIfAbsent`/`replace`) were registered
+  unconditionally on `DefaultCacheManager`/`Cache`/`CacheImpl`/`AdvancedCache`,
+  so they also intercepted a REAL manager's calls, fabricating a synthetic
+  `Cache` with a null `config` — Infinispan's own internal bootstrap
+  (`GlobalConfigurationManagerImpl.postStart()`) NPE'd on
+  `cache.config.clustering()`. Fixed by guarding each with `is_real_dcm()`/a
+  new `is_real_cache()` and delegating real objects to the real underlying
+  bytecode (`internalGetCache`, `put(K,V,Metadata)`, `get(K,long,InvocationContext)`,
+  etc. — found via `javap` decompilation of the real jar). `is_real_cache()`
+  took three attempts to get right (two field-by-name discriminators both
+  had value round-trip bugs on this class); see the FIXED doc for the full
+  trail. Also fixed a latent GC-safety bug (bare `ObjectRef`/`Value` locals
+  held across a re-entrant real-bytecode call in `get`/`containsKey`/`remove`)
+  and a prerequisite Windows-only build regression (`native-io`'s
+  `NativeSocketAddress` natives referenced `libc::sockaddr_in6`/`AF_INET`
+  unconditionally, but `libc` doesn't define those for Windows — gated with
+  `#[cfg(unix)]`). Verified: regression probe for the OLD synthetic path
+  passes cleanly, all 21 pre-existing unit tests pass, and `RealmModelTest`'s
+  originally-reported NPE is gone (gets through the entire cache-manager
+  bootstrap/use/teardown lifecycle under `--nojit`). Doc:
+  [`docs/internal/fixed-suite-bugs/keycloak-model-infinispan-cache-config-null-after-real-start-FIXED.md`](../internal/fixed-suite-bugs/keycloak-model-infinispan-cache-config-null-after-real-start-FIXED.md).
+- Two new, **distinct and unrelated** (JIT/VM-core, not Infinispan-specific)
+  residuals surfaced once the fix let `RealmModelTest` run much further:
+  [keycloak-model-infinispan-jit-adjacent-decode-error-fullname.md](keycloak-model-infinispan-jit-adjacent-decode-error-fullname.md)
+  (JIT-only bytecode-decode error, reachable only with JIT on — a
+  JIT-compiled caller appears to corrupt an interpreted callee's frame) and
+  [keycloak-model-stw-takeover-hang-eventloopgroup-shutdown.md](keycloak-model-stw-takeover-hang-eventloopgroup-shutdown.md)
+  (an STW cross-thread-takeover safepoint hang during Netty `EventLoopGroup`
+  shutdown, reachable only with `--nojit`, once the JIT bug above is worked
+  around).
+
+## 2026-07-07 GC blocked-thread / stale-Thread-mirror doc RETIRED; real-net GC-blocking audit completed
+
+- ✅ RETIRED to [`docs/internal/gc-blocked-thread-frame-stale-thread-mirror-RESOLVED.md`](../internal/gc-blocked-thread-frame-stale-thread-mirror-RESOLVED.md): the 2026-06-29 six-class Tomcat hard-crash family (blocked thread's live young object reclaimed → SIGSEGV/`CompactValue` panic) is closed — 4297 encoding-suite Tomcat boot/serve/stop cases + all three tribes classes ran with ZERO stale-pointer warnings, ZERO panics, jit and nojit. Executing the doc's remaining audit TODO also landed six real-net GC-blocking fixes on this branch: `MulticastSocket.receive/send` and `DatagramChannel.receive0/send0` bracketted (+ held-ref re-sync), the `Selector.select` epoll wait bracketted (was the dominant STW-stall source — every NIO event loop held up every GC by its select timeout; `TestDataIntegrity --nojit` went from 420s-timeout/44 STW-stall warnings to completing with 0), `net_accept`'s post-wake writes re-synced, `net_connect0` bracketted, and `populate_selected_keys_field`'s `Set.add` loop pinned. The register-resident JIT oop remainder stays tracked in [dohead-jit-heap-corruption-register-invisibility.md](dohead-jit-heap-corruption-register-invisibility.md) + [fork6-fjp-multithread-jit-root-reclamation.md](fork6-fjp-multithread-jit-root-reclamation.md).
+- 🔴 NEW [tomcat-defaultservlet-encoding-content-failures.md](tomcat-defaultservlet-encoding-content-failures.md) — with the crash family gone, full 1360-case `TestDefaultServletEncoding{WithoutBom,WithBom}` nojit runs surface 264/228 functional failures (mostly `expected:<200> but was:<-1>`, exotic-output-encoding cases like ibm850 among the first failures; zero GC signal). Untriaged.
+- 🔴 NEW [nio-native-side-table-stale-objectref.md](nio-native-side-table-stale-objectref.md) — pre-existing: the NIO selector layer caches raw `ObjectRef`s (`key_obj`, `sk_table().channel`) in Rust side-tables across calls; a moving GC leaves them vacated (low-rate recovered stale receivers). In-call windows fixed with the audit above; cross-call window open.
+
+## 2026-07-07 Keycloak X.509 `AuthorityKeyIdentifier` NPE — FIXED, doc retired; new `tests/base` blocker found
+
+- ✅ FIXED: `CertificateFactory.getInstance("X.509")`'s no-provider path (used by BC's default `JcaX509CertificateConverter`) returned certs whose `getEncoded()` was always a 0-length byte array, so any later BC ASN.1 re-parse (e.g. `createAuthorityKeyIdentifier`) NPE'd deep in `ASN1UniversalType.checkedCast`. This blocked ~80/101 `tests/base` classes plus 2 crypto-module tests. Fixed in `native-builtins/src/phases_late.rs`'s `CertificateFactory.generateCertificate`/`.generateCertificates` by building a real `sun.security.x509.X509CertImpl` from the DER (reusing `keystore::make_x509_mirror`) instead of a byte-discarding synthetic stub. Verified via isolated before/after repro (byte-identical to real HotSpot post-fix) and real Keycloak tests (`PemUtilsBCTest` 6/6 pass). Doc retired to [`docs/internal/fixed-suite-bugs/keycloak-x509-authoritykeyidentifier-npe-FIXED.md`](../internal/fixed-suite-bugs/keycloak-x509-authoritykeyidentifier-npe-FIXED.md).
+- Fixing it far enough to verify surfaced the *next* `tests/base` blocker (every class hits this once the X.509 NPE is out of the way): `ProviderDeployer`/`org.keycloak.it.utils.Maven` fails to resolve the (locally-present) `keycloak-test-framework-remote-providers` artifact via its own reactor dependency-graph resolution. ✅ NOT A CRATONVM BUG — confirmed 2026-07-07 via direct HotSpot repro (identical failure, same stack trace, both VMs). Doc retired to [`docs/internal/keycloak-tests-base-remote-providers-artifact-resolution-NOT-A-BUG.md`](../internal/keycloak-tests-base-remote-providers-artifact-resolution-NOT-A-BUG.md).
+
 ## 2026-07-07 WP1.8 ServiceLoader iterator hang — FIXED, doc retired
 
 - ✅ FIXED (root cause `8a61e6f8`, merged `1b131502`, 2026-07-06): the WP1.8 `ServiceLoader.load(Driver.class).iterator()` acceptance tests (`vm/tests/wp1_8_real_jar_serviceloader.rs`, `vm/tests/wp1_8_serviceloader_e2e.rs`) hung in an infinite `while (it.hasNext())` loop — the `ArrayList$Itr` fallback layout's lastRet slot collided with cursor (both slot 1), so `native_al_itr_next` overwrote its own cursor increment and `hasNext()` never went false on the natively-assembled provider list. Causally verified: the doc-era tree (`d9cb7be8`) hangs; the same tree + only the `8a61e6f8` native-collections patch passes in 0.01s; current dev passes 5/5 on Linux (real-JDK jdk25 + synthetic fallback) and Windows (jdk-25, the original report platform). Both `#[ignore]`s removed so the acceptance bar is enforced by default again; doc retired to [`docs/internal/wp1-8-real-jar-serviceloader-hang-FIXED.md`](../internal/wp1-8-real-jar-serviceloader-hang-FIXED.md).
@@ -41,9 +91,9 @@ angles**; this index is the consolidated map. Read it first.
 
 - FIXED and retired: the "writer starvation" residual (~25-50% `HttpComponentsClientHttpRequestFactoryTests` teardown hang surviving the `caa4ee65`/`60e2b20d` AB-BA fixes) was actually a same-thread RECURSIVE READ deadlock on `class_manager`: `try_stackless_invoke`'s native-override hierarchy walk held a read guard while `native_shadow_suppressed_by_redefine` re-acquired the same lock, and parking_lot's task-fair policy parks the nested read behind any queued writer (`load_class_concurrent`). Proved via debug-info gdb (lock state word `0x1b` = 1 held reader + parked writer; the nested acquisition was inlined and invisible in the original symbols-only captures). Fix: guard-reusing `native_shadow_suppressed_by_redefine_in(&cm, ..)`. 0/40 + 0/20 hangs post-fix (was 2 hangs in 3 attempts). Full writeup: `docs/internal/fixed-suite-bugs/class-manager-rwlock-recursive-read-deadlock-FIXED.md`.
 
-## 2026-07-06 http.client Flow/Reactive hangs (branch fix/httpclient-jdkclient-hangs-0706b)
+## 2026-07-07 http.client Flow/Reactive hangs: root causes #1 and #2 FIXED, #3 isolated to HttpComponents/HttpClient5, still open
 
-- [spring-web-flow-outputstreamwriter-close-corruption.md](spring-web-flow-outputstreamwriter-close-corruption.md) -- continued the "Residual C" investigation for `JdkClientHttpRequestFactoryTests`/`OutputStreamPublisherTests`/`SubscriberInputStreamTests`/`reactive.ClientHttpConnectorTests` (all still hang). Found these are at least 2 distinct root causes, not one shared MockWebServer cause: `OutputStreamPublisherTests`/`SubscriberInputStreamTests` hang in their `closed()` test because `new OutputStreamWriter(out, ...)` leaves `StreamEncoder.closed` permanently `true` from construction (confirmed via a zero-dependency 15-line repro, `--java-home` real-JDK mode only) -- `write()` after `close()` then fails to throw, AssertJ's `assertThatIOException()` throws an uncaught `AssertionError` inside the executor-run handler (`invokeHandler`'s `catch (Exception ex)` doesn't catch `Error`), silently killing the worker thread before any terminal `Flow.Subscriber` signal fires. Root mechanism NOT found despite extensive bisection (ruled out: JIT, out-of-bounds heap write, undersized synthetic-object allocation, GC/stale-pointer, generic field-layout -- none of several matching-bytecode-shape Java repros reproduce it; only the REAL `java.io.Writer`/`OutputStreamWriter`/`sun.nio.cs.StreamEncoder`/`java.nio.charset.Charset` classes trigger it). `JdkClientHttpRequestFactoryTests`/`reactive.ClientHttpConnectorTests` (both real-MockWebServer-based, no `OutputStreamWriter` in their path) not investigated this session -- separate root cause(s). Also landed a genuine, low-risk, but ultimately inert-for-this-symptom fix: `ExecutorService.execute()`'s synthetic native ran tasks eager-inline instead of on a real worker thread (same bug class as the already-fixed ForkJoinPool "Bug D") -- real, but dead code in real-JDK mode, which is what these 4 hangs use.
+- [spring-web-flow-outputstreamwriter-close-corruption.md](spring-web-flow-outputstreamwriter-close-corruption.md) -- ✅ root cause #1 FIXED (commit `6744812d`, merged `963d59b3`): see prior entry for the `StreamEncoder` hardcoded-inherited-field-slot writeup, unchanged. ✅ root cause #2 FIXED (commit `60bf9de0`, merged `86f37f84`): `JdkClientHttpRequestFactoryTests` never produced a result even at a 300s timeout because `net_phase_e.rs`'s native `java.net.http.HttpClient` shim (`http_read_response`) read the response socket until EOF before ever parsing the headers, instead of stopping once `Content-Length`/chunked framing said the message was complete. A real HTTP/1.1 peer is entitled to keep a connection open after a fully-framed response (keep-alive) -- confirmed via live `strace` against a real `MockWebServer`: it sent a complete 38-byte `Content-Length`-framed response and went back to `recv()` for the next keep-alive request, while the client kept `recv()`-ing for a close that would never come, blocking every single request until (or past) its 30s socket timeout. Fixed by reading headers first, then reading only the declared body length (`Content-Length`, or the existing `http_decode_chunked` in a retry-on-incomplete loop for chunked, or EOF only for the one legitimate close-delimited case with neither header); also short-circuits 1xx/204/304 to no body. Verified: `JdkClientHttpRequestFactoryTests` found=15 succ=11 fail=4 ms=63080 (was unconditional hang) -- the 4 residuals are a separate, newly-surfaced gzip/deflate compression bug (request body assertion mismatch + `os error 11` EAGAIN), not investigated, flagged for a future session. 🔴 Root cause #3 (`reactive.ClientHttpConnectorTests`) is now **isolated to specifically `HttpComponentsClientHttpConnector`** (of the 4 parameterized connectors -- Reactor Netty and Jetty both work, just slower than HotSpot; Jdk fails fast with an unrelated `ClassCastException`), and confirmed via a raw `HttpAsyncClients`-only probe (zero Spring code) to be a genuine Apache HttpClient5 bug, not Spring's bridging. Critically, this **refutes** the earlier hypothesis that it's the same "NIO SocketChannel/selector path" gap as `JettyClientHttpRequestFactoryTests`: three standalone probes mirroring HttpClient5's exact reactor patterns (single-threaded accept/connect/read/write, cross-thread `Selector.wakeup()` on a channel registered from another thread, and cross-thread non-blocking `OP_CONNECT` + `finishConnect()`) **all pass** on CratonVM, and `javap`-disassembling `SingleCoreIOReactor.connect()` shows it uses an even simpler `queue.add()`+`wakeup()` pattern than what's already proven to work. A Java-level stack dump (via CratonVM's `--stack-dump-on-timeout <SECONDS>` flag -- far more direct than `gdb` for this) shows 14 `IOReactorWorker` threads all idle in `doExecute()`'s blocking `select()`, with nothing visibly processing the connect request; a separate, confirmed, but likely-unrelated bug was found along the way (`SocketChannel.setOption()` for `SO_SNDBUF`/`SO_RCVBUF`/`SO_LINGER` are silent no-ops in `native-io/src/socket_channel.rs`, limited by `std::net::TcpStream` lacking setters without the `socket2` crate -- doesn't throw, so unlikely to cause a hang, but worth fixing separately). Doc has detailed next-step guidance (instrument httpclient5/httpcore5 directly since no sources jar is available on this host; correlate which specific reactor worker was assigned the request; reduce `ioThreadCount` to 1 to remove ambiguity).
 
 ## 2026-07-06 Hibernate `others.txt` non-passed rerun (OSR allocation-region gate branch)
 
@@ -131,9 +181,12 @@ testing against real JDK 25); the actual cause,
 [Infinispan JGroupsTransport.start() never invoked](../internal/fixed-suite-bugs/keycloak-model-jgroupstransport-start-never-invoked-FIXED.md)
 (a `DefaultCacheManager.start()`/`stop()` native shim intercepting real
 objects unconditionally), is now **also FIXED** (2026-07-06). `RealmModelTest`
-now reaches a distinct residual one layer deeper, in the same "synthetic
-native shim intercepts a real object" family:
-[Infinispan Cache.config null after real DefaultCacheManager.start()](keycloak-model-infinispan-cache-config-null-after-real-start.md).
+then reached a distinct residual one layer deeper, in the same "synthetic
+native shim intercepts a real object" family,
+[Infinispan Cache.config null after real DefaultCacheManager.start()](../internal/fixed-suite-bugs/keycloak-model-infinispan-cache-config-null-after-real-start-FIXED.md),
+now **also FIXED** (2026-07-06) — see the top of this file for the two new
+residuals (JIT-only decode error, `--nojit`-only STW shutdown hang) it
+uncovered one/two layers deeper still.
 Not CratonVM bugs: 543 FAILs (`testsuite/integration-arquillian/tests/base`
 + `tests/other/sssd`, exhaustively confirmed - 543/544 exact match, the 544th
 is the System Rules finding above) are "Not found frontend container:
@@ -222,9 +275,13 @@ it under `docs/internal`.
   because its own current evidence says both bugs are fixed and soak-verified.
 - The XT takeover activation corruption note moved to
   [`docs/internal/fixed-suite-bugs/xt-takeover-activation-young-corruption.md`](../internal/fixed-suite-bugs/xt-takeover-activation-young-corruption.md).
-  Its remaining 1/18 DoHead crash face is not an XT activation residual and stays
-  tracked by
-  [`dohead-jit-heap-corruption-register-invisibility.md`](dohead-jit-heap-corruption-register-invisibility.md).
+  Its remaining 1/18 DoHead crash face was not an XT activation residual; that
+  DoHead crash family's FATAL layer is now itself fixed too (2026-07-06,
+  `fix/dohead-sweep-freelist`) — doc moved to
+  [`docs/internal/fixed-suite-bugs/dohead-jit-heap-corruption-register-invisibility-FIXED.md`](../internal/fixed-suite-bugs/dohead-jit-heap-corruption-register-invisibility-FIXED.md).
+  Its one real residual (Layer 1, register-invisible roots) remains tracked by
+  the still-open [`fork6-fjp-multithread-jit-root-reclamation.md`](fork6-fjp-multithread-jit-root-reclamation.md)
+  (gated on the deferred precise-JIT-stack-maps project).
 
 ## How many distinct bugs are here?
 
@@ -772,8 +829,10 @@ PreviewFeatures native crash. The remaining non-passed rows are tracked here:
   `RealmModelTest` then reached a residual initially misdiagnosed as a Netty
   setAccessible bug; the actual cause was
   [Infinispan JGroupsTransport.start() never invoked](../internal/fixed-suite-bugs/keycloak-model-jgroupstransport-start-never-invoked-FIXED.md),
-  now FIXED. `RealmModelTest` now reaches a distinct residual tracked in
-  [keycloak-model-infinispan-cache-config-null-after-real-start.md](keycloak-model-infinispan-cache-config-null-after-real-start.md).
+  now FIXED. `RealmModelTest` then reached a distinct residual,
+  [Infinispan Cache.config null after real DefaultCacheManager.start()](../internal/fixed-suite-bugs/keycloak-model-infinispan-cache-config-null-after-real-start-FIXED.md),
+  now ALSO FIXED (2026-07-06) — see the top of this file for the two new
+  residuals it uncovered one/two layers deeper still.
 - [keycloak-sssd-system1-findbootstrapclassornull-nosuchmethod.md](keycloak-sssd-system1-findbootstrapclassornull-nosuchmethod.md) -
   2 `FAIL` rows in the SSSD module, missing
   `java/lang/System$1.findBootstrapClassOrNull(String)Class`.

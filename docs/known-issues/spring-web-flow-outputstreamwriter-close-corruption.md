@@ -1,29 +1,26 @@
-# spring-web http.client Flow/Reactive hangs: OutputStreamWriter internal-state corruption + 2 unrelated hangs
+# spring-web http.client Flow/Reactive hangs: 3 distinct root causes
 
-## Status: OPEN (root cause narrowed, not fully resolved)
+## Status: Root causes #1 and #2 FIXED; root cause #3 OPEN (isolated to HttpComponentsClientHttpConnector; raw NIO layer proven fine; not yet fixed)
 
-Branch `fix/httpclient-jdkclient-hangs-0706b` (off `dev` @ `9f1db39d`), Azure
-host worktree `/data/data/wt-hc-hangs-0706b`. This continues the
-"Residual C — Genuine hangs" investigation from
+Branch history: `fix/httpclient-jdkclient-hangs-0706b` (original investigation,
+off `dev` @ `9f1db39d`) → `fix/streamencoder-inherited-field-slots-0707`
+(root cause #1, merged `963d59b3`) → `fix/http-phase-e-read-until-close-hang-0707`
+(root cause #2, merged `86f37f84`). This continues the "Residual C — Genuine
+hangs" investigation from
 `docs/known-issues/http-client-cluster-redefine-dispatch-and-jdk21-gaps.md`
 for `JdkClientHttpRequestFactoryTests`, `OutputStreamPublisherTests`,
 `SubscriberInputStreamTests`, `reactive.ClientHttpConnectorTests`.
 
-**All 4 classes still hang** on current `dev`. This session found that they
-are **at least 2, likely 3, distinct root causes** — the original doc's
-"maybe one shared MockWebServer-related cause" hypothesis is refuted for 2
-of the 4 classes, which use no MockWebServer/sockets at all.
-
 ## Summary table
 
-| Class | Uses MockWebServer? | Root cause this session | Status |
+| Class | Uses MockWebServer? | Root cause | Status |
 |---|---|---|---|
-| `OutputStreamPublisherTests` | No (pure `Flow`+Reactor `StepVerifier`) | `closed()` test hangs due to `OutputStreamWriter`/`StreamEncoder` internal-state corruption (see below) | Root cause narrowed, NOT fixed |
-| `SubscriberInputStreamTests` | No (pure `Flow`, no Reactor) | Same `OutputStreamWriter` bug reached via `SubscriberInputStreamTests.closed()`'s identical pattern (not independently confirmed but near-certain given identical code shape) | Root cause narrowed, NOT fixed |
-| `JdkClientHttpRequestFactoryTests` | Yes (`AbstractMockWebServerTests`) | NOT investigated this session — does not use `OutputStreamWriter`; uses `SimpleAsyncTaskExecutor` (real `new Thread()` per task, unaffected by the executor bug found below) | OPEN, separate investigation needed |
-| `reactive.ClientHttpConnectorTests` | Yes (`MockWebServer` field) | NOT investigated this session | OPEN, separate investigation needed |
+| `OutputStreamPublisherTests` | No (pure `Flow`+Reactor `StepVerifier`) | #1: `OutputStreamWriter`/`StreamEncoder` real-field corruption | ✅ **FIXED** — 5/6 pass (`chunkSize()`'s pre-existing, unrelated `"bar"`-vs-`"b"` failure remains, not in scope) |
+| `SubscriberInputStreamTests` | No (pure `Flow`, no Reactor) | #1: same bug, reached via `SubscriberInputStreamTests.closed()`'s identical pattern | ✅ **FIXED** — 5/5 pass |
+| `JdkClientHttpRequestFactoryTests` | Yes (`AbstractMockWebServerTests`) | #2: the native `java.net.http.HttpClient` shim's response reader read until EOF instead of stopping at declared framing, hanging on HTTP/1.1 keep-alive | ✅ **FIXED** — found=15 succ=11 fail=4 (4 residuals are a separate, newly-surfaced gzip/deflate bug, not in scope) |
+| `reactive.ClientHttpConnectorTests` | Yes (`MockWebServer` field) | #3: `HttpComponentsClientHttpConnector`/Apache HttpClient5 async reactor hangs; raw NIO SocketChannel/Selector layer confirmed NOT at fault | 🔴 **OPEN** — isolated to one of 4 parameterized connectors; not yet fixed |
 
-## Root cause #1 (found + explained, NOT fixed): `OutputStreamWriter` internal state corrupted from construction
+## Root cause #1 (FIXED): `StreamEncoder` native shim hardcoded inherited `Writer` field slots
 
 ### The bug, precisely
 
@@ -32,211 +29,372 @@ OutputStream out = new ByteArrayOutputStream();
 OutputStreamWriter writer = new OutputStreamWriter(out, "UTF-8"); // any overload reproduces
 writer.write("foo");
 writer.close();
-writer.write("bar"); // should throw IOException("Stream closed") -- does NOT
+writer.write("bar"); // should throw IOException("Stream closed") -- did NOT, pre-fix
 ```
 
-Confirmed via reflection on a live CratonVM process (`--java-home` real-JDK
-mode, JDK 25, `docs/.../wt-hc-hangs-0706b`):
+### Actual root cause (this was NOT a general interpreter/GC bug)
 
-- `sun.nio.cs.StreamEncoder.closed` (a plain `private volatile boolean`,
-  should default `false`) already reads **`true` immediately after
-  construction**, before `close()` is ever called.
-- `java.io.Writer.lock` (inherited `protected Object lock`, which
-  `OutputStreamWriter`'s constructor chain should set to the `OutputStream`
-  argument via `super(out)`) instead holds **the charset-name `String`**
-  (e.g. `"UTF-8"`, or `"ISO-8859-1"` when that name is used instead — the
-  value tracks whatever charset name/`Charset.defaultCharset()` resolution
-  happened, not the real lock object). This holds across ALL constructor
-  overloads (`(OutputStream)`, `(OutputStream,String)`,
-  `(OutputStream,Charset)`), even ones whose bytecode never mentions the
-  charset-name string that ends up there.
+`native-io/src/stream_encoder.rs`'s `sun.nio.cs.StreamEncoder` shim allocates
+the encoder object with the REAL `StreamEncoder` class id (so real
+`OutputStreamWriter` bytecode dispatches `se.write(...)` to the native), but
+the pre-fix version addressed its own bookkeeping (the underlying
+`OutputStream`, the canonical charset name, a monotonic side-table id) via
+hardcoded field indices `0`/`1`/`2`, on the mistaken assumption those were
+`StreamEncoder`'s own first three declared fields.
 
-Because `closed` reads `true` from the start, `StreamEncoder.close()`'s
-real bytecode (`getfield lock; monitorenter; getfield closed; ifeq
-<call implClose+set closed>; <else> monitorexit; return`) takes the
-already-closed fast-return path on the very FIRST call — it never calls
-`implClose()` and never re-executes the `putfield closed`. This is why a
-targeted `putfield`-diagnostic trace (below) never observed a `closed`
-write: the write path is dead code given the (already-wrong) starting
-state.
-
-### Downstream consequence: the actual hang
-
-`OutputStreamPublisherTests.closed()` / `SubscriberInputStreamTests.closed()`:
-
-```java
-Flow.Publisher<byte[]> publisher = new OutputStreamPublisher<>(outputStream -> {
-    OutputStreamWriter writer = new OutputStreamWriter(outputStream, UTF_8);
-    writer.write("foo");
-    writer.close();
-    assertThatIOException().isThrownBy(() -> writer.write("bar")).withMessage("Stream closed");
-    latch.countDown();
-}, this.byteMapper, this.executor, null);
-```
-
-Since `writer.write("bar")` after close does NOT throw, AssertJ's
-`assertThatIOException().isThrownBy(...)` itself throws an
-**`AssertionError`** (an `Error`, not an `Exception`) to report the missing
-exception. `OutputStreamPublisher$OutputStreamSubscription.invokeHandler()`
-(`org/springframework/http/client/OutputStreamPublisher.java`) only catches
-`catch (Exception ex)` around the handler body — an `AssertionError`
-propagates straight through, uncaught, and **silently kills the executor
-worker thread** before `this.actual.onComplete()` / `onError()` is ever
-called. The `Flow.Subscriber` (and thus `StepVerifier`/`SubscriberInputStream.read()`)
-never receives a terminal signal and blocks forever. This is confirmed via
-isolated per-method JUnit Platform runs
-(`org.junit.platform.launcher... selectMethod`) against
-`OutputStreamPublisherTests`:
+`javap` on the real JDK25 `sun.nio.cs.StreamEncoder`/`java.io.Writer` classes
+confirms the REAL layout is:
 
 ```
-basic            -> succ=1 fail=0
-flush            -> succ=1 fail=0
-chunkSize        -> succ=0 fail=1  (expected: "bar" but was: "b" -- separate, unrelated bug, not investigated)
-cancel           -> succ=1 fail=0
-closed           -> HANGS (15s+ timeout, 100% CPU one thread, no RESULT line)
-negativeRequestN -> succ=1 fail=0
+0: Writer.writeBuffer   (char[], inherited)
+1: Writer.lock          (Object, inherited)
+2: StreamEncoder.closed (boolean, StreamEncoder's own first field)
+3: StreamEncoder.cs
+4: StreamEncoder.encoder
+...
+7: StreamEncoder.out
 ```
 
-Running the WHOLE class via `KRun` therefore also hangs, since JUnit
-Platform runs all `@Test` methods in one process/one JVM invocation.
+So the shim's writes to indices 0/1/2 actually landed on `Writer.writeBuffer`,
+`Writer.lock`, and `StreamEncoder.closed` — **not** scratch slots of its own.
+This exactly explains both symptoms originally reported:
+- `Writer.lock` held the charset-name string (written to index 1) instead of
+  the lock object.
+- `StreamEncoder.closed` read `true` immediately after construction (written
+  to index 2 was the shim's monotonic id counter, which starts at 1 — a
+  nonzero value in a `boolean` slot reads as `true`).
 
-`SubscriberInputStreamTests` was not isolated per-method this session but
-has an identically-shaped `closed()` test using the same
-`OutputStreamWriter` pattern, so this is very likely the same bug there too
-(not independently confirmed with a live capture — flagged as "near
-certain, not proven" per the task's evidence-based-reporting requirement).
+This is the same bug class already tracked in
+`docs/internal/audits/native-hardcoded-inherited-field-slots.md` ("native
+hardcodes an inherited field's slot"), just not yet swept for this file.
 
-### What's ruled out (checked and refuted this session)
+**Why the earlier session's bisection didn't find it:** all of that
+session's checks (JIT on/off, `CRATONVM_DBG_STRAYSTACK`, GC/stale-pointer,
+`alloc_concurrent_synthetic` sizing, synthetic Java repros matching the same
+bytecode shape) were sound and correctly ruled out — the bug genuinely
+wasn't any of those. It also wasn't reachable by disassembling
+`Charset`/`StreamEncoder`'s own bytecode, because that bytecode never runs:
+`forOutputStreamWriter`/`write`/`close`/etc. are fully native-intercepted in
+real-JDK mode. The corruption was in the **Rust native's own hardcoded slot
+constants**, a layer none of those checks inspected.
 
-- **Not a JIT bug**: identical corruption with `CRATONVM_DISABLE_JIT=1`.
-- **Not an out-of-bounds heap write**: `CRATONVM_DBG_STRAYSTACK=1` (existing
-  diagnostic at `vm/src/runtime/interpreter.rs:12138`, checks
-  `field.field_index >= object.num_slots`) shows zero hits — the putfield
-  target slot is within the object's allocated bounds.
-- **Not a `alloc_concurrent_synthetic`-undersized-object bug**: verified
-  (via a temporary `CRATONVM_DBG_ACS` trace, reverted before commit) that
-  `Charset.forName`/`Charset.newEncoder()`'s native overrides (which DO
-  return synthetic objects, `native-builtins/src/lib.rs:41331` /
-  `native-builtins/src/phases_late.rs` `register_p58_charset_coder`, both
-  active in real-JDK mode via `vm_init.rs`) correctly auto-upsize to the
-  real class's field count (`alloc_concurrent_synthetic`'s existing
-  `num_fields.max(real)` logic, `native-builtins/src/lib.rs:34852`) — AND,
-  more importantly, **these natives are never even invoked** on the actual
-  `new OutputStreamWriter(out, "UTF-8")` path (confirmed: the trace fires
-  for a direct top-level `Charset.forName(...)` call from application code,
-  but NOT when `Charset.forName`/`newEncoder` are called from *within*
-  `sun.nio.cs.StreamEncoder`'s own bytecode — even when
-  `StreamEncoder.forOutputStreamWriter` is invoked directly via reflection).
-  This means `Charset.forName`/`newEncoder` run as **100% real JDK bytecode**
-  in the failing path, hitting real `Charset`'s static provider-lookup/cache
-  machinery (`cache1`/`cache2` static fields, SPI `CharsetProvider`
-  lookups) — untested territory this session, and a plausible next-step
-  target.
-- **Not a generic field-layout/putfield bug for this exact class shape**:
-  multiple synthetic Java repros matching the EXACT bytecode shape
-  (`Writer`-like 2-field superclass + subclass fields; `new/dup/args/
-  invokestatic/invokespecial` construction shape; 2-level constructor
-  delegation with an intervening 3-call virtual chain; a static-factory
-  wrapper around the whole thing) were built and run correctly on
-  CratonVM — see
-  `/tmp/dl/repro/{MinimalCtorTest,StackShapeTest2,StackShapeTest3,NewDupTest,NewDupTryCatch,FieldOrderTest,FullShapeTest}.java`
-  in this session's scratch dir (not committed; recreate from this doc if
-  needed). Only the REAL `java.io.Writer`/`OutputStreamWriter`/
-  `sun.nio.cs.StreamEncoder`/`java.nio.charset.Charset` classes trigger the
-  bug — something specific to these actual boot classes (or their
-  specific interaction with `Charset.forName`'s real bytecode), not a
-  general interpreter defect reproducible with equivalent user classes.
-- **Class metadata/field-index computation is correct**: a temporary
-  `CRATONVM_DBG_LAYOUT` trace (reverted before commit) confirmed
-  `compute_field_layout` (`classloading/src/class_manager.rs:9229`)
-  correctly computes `Writer` = 2 total fields (`writeBuffer`, `lock`),
-  `StreamEncoder`'s own fields correctly starting at index 2 (`closed` is
-  index 2, not 0), `OutputStreamWriter`'s own field `se` correctly at index
-  2. The metadata is right; something at RUNTIME still corrupts the
-  slots 1-2 boundary only for this real-class combination.
-- **Not a GC/stale-pointer issue**: a targeted interpreter-level putfield
-  trace showed the CORRECT object reference (`out`, not the charset name)
-  being written to `Writer.lock` at construction time — the corruption is
-  not "wrote wrong value" at the observed putfield. (A companion
-  "immediate readback via `shared.heap.get_field`" check in the same trace
-  showed a mismatch too, but this was determined to be a FALSE LEAD: the
-  identical readback-mismatch pattern also appeared for the
-  `FieldOrderTest`/`FullShapeTest` control repros that behave CORRECTLY
-  end-to-end, meaning `shared.heap.get_field`'s indexing convention does
-  not directly correspond to `field.field_index` as used by regular
-  bytecode dispatch, and is not a valid way to cross-check the real
-  getfield/putfield path from that call site. Do not reuse that exact
-  diagnostic without first establishing the correct index-conversion
-  between the two.)
+**Separate, and the actual proximate cause of the reported hang:** even
+independent of the field corruption, the write natives never checked a
+closed flag and threw — they silently no-op'd once the underlying-stream
+reference was gone, so `writer.write("bar")` after `close()` did not throw
+`IOException("Stream closed")` as real `StreamEncoder.ensureOpen()` does.
+AssertJ's `assertThatIOException().isThrownBy(...)` found no exception and
+threw an uncaught `AssertionError`; `OutputStreamPublisher$OutputStreamSubscription.invokeHandler()`
+only catches `catch (Exception ex)`, so the `AssertionError` propagated
+straight through and silently killed the executor worker thread before
+`this.actual.onComplete()`/`onError()` was ever called — the
+`Flow.Subscriber` (and thus `StepVerifier`/`SubscriberInputStream.read()`)
+never received a terminal signal and blocked forever.
 
-### Next steps (not attempted this session)
+### The fix
 
-1. Instrument (or attach `gdb`/manual single-step) specifically inside
-   REAL `Charset.forName`'s bytecode execution (not our natives) when
-   called transitively from `StreamEncoder.forOutputStreamWriter` — confirm
-   whether it returns a well-formed `Charset` instance (e.g. check its
-   *actual* runtime class — should be `sun.nio.cs.UTF_8` or similar
-   concrete subclass, not the abstract `Charset` — a previous quick check
-   in this session on a DIRECT `Charset.forName` call from application code
-   showed `Charset class: class java.nio.charset.Charset`, i.e. the
-   ABSTRACT class itself, which is already wrong/suspicious for a
-   native-intercepted call — but that specific call path was confirmed NOT
-   to be what `StreamEncoder` hits internally, so this needs to be
-   re-checked specifically for the internal-call path).
-2. Try reproducing with `CRATONVM_REAL_AQS=1` / other env toggles seen used
-   elsewhere in this session's `ps aux` output on the shared host (other
-   concurrent sessions use `CRATONVM_REAL_NET_SOCKETS`,
-   `CRATONVM_REAL_AQS`) in case an existing "more real bytecode" toggle
-   happens to route around whatever `Charset`/`StreamEncoder`-adjacent
-   native or fast-path is responsible.
-3. Consider whether `java.nio.charset.Charset`'s STATIC fields
-   (`cache1`/`cache2`, `defaultCharset`) — which are populated once and
-   shared across every `Charset.forName` call process-wide — could be
-   corrupted by an EARLIER, unrelated call in the same process (bootstrap
-   `System.out`/JDK-internal `Charset.defaultCharset()` calls happen very
-   early); a minimal repro that does *nothing* before
-   `new OutputStreamWriter(...)` still reproduces, but the JDK itself may
-   already have called `Charset.forName`/`defaultCharset()` many times
-   during its own bootstrap before `main()` even starts, so "minimal user
-   code" does not mean "minimal actual `Charset` call history in this
-   process."
-4. Because the bug reproduces with a bare `ByteArrayOutputStream` and zero
-   Spring/executor/Reactor code
-   (`/tmp/dl/repro/WriterCloseTest.java`,
-   `/tmp/dl/repro/MinimalCtorTest.java` in this session's scratch dir),
-   this is the cheapest possible repro to hand to a fresh investigation —
-   no suite harness, classpath, or MockWebServer needed, just
-   `--java-home <jdk> -cp <dir> WriterCloseTest`.
+Commit `6744812d` (branch `fix/streamencoder-inherited-field-slots-0707`,
+merged to `dev` at `963d59b3`):
 
-## Root cause #2/#3 (NOT investigated this session)
+- Resolve the two real fields this shim legitimately owns semantically
+  (`out`, `closed`) **by name** (`get_field_by_name`/`set_field_by_name`,
+  which walk the real class's field metadata) instead of hardcoded indices —
+  the fix recipe from `native-hardcoded-inherited-field-slots.md`.
+- Keep the canonical charset name and the pending-bytes buffer (already
+  side-tabled pre-fix) in the same Rust-side table, now keyed by
+  `ctx.identity_hash_code(obj)` instead of a monotonic id stashed in a
+  scratch field slot — this touches zero real fields for that bookkeeping.
+- Added the missing `ensureOpen()`-equivalent check: `write`/`flush` now read
+  the real `closed` field and throw `IOException("Stream closed")` when
+  already closed, matching real `StreamEncoder`. `close()`/`implClose()` is
+  now also idempotent (`if (closed) return;`), matching real
+  `StreamEncoder.close()` — the pre-fix version would re-flush/re-close the
+  underlying stream on a second `close()` call.
 
-`JdkClientHttpRequestFactoryTests` and `reactive.ClientHttpConnectorTests`
-both use real `MockWebServer` (`AbstractMockWebServerTests` /
-`mockwebserver3.MockWebServer` field respectively) and do NOT use
-`OutputStreamWriter` anywhere in their exercised code paths (`grep` over
-`JdkClientHttpRequest.java` / `reactive/*.java` main sources found no
-matches). `JdkClientHttpRequestFactoryTests`'s underlying
-`JdkClientHttpRequest` DOES use the same `OutputStreamPublisher` class, but
-via `SimpleAsyncTaskExecutor` (Spring's own executor, which spawns a
-genuine real `new Thread()` per task — confirmed via
-`spring-core/.../SimpleAsyncTaskExecutor.java` source, "fires up a new
-Thread for each task") rather than `Executors.newSingleThreadExecutor()`,
-so the `ExecutorService.execute()` inline-execution bug fixed this session
-(see below) does not apply, and neither does the `OutputStreamWriter`
-corruption unless `JdkClientHttpRequestFactoryTests` itself calls a code
-path using `OutputStreamWriter` (not checked). Live `gdb` process captures
-for BOTH classes were taken this session (see raw output in session
-transcript) but not analyzed frame-by-frame in the same depth as
-`OutputStreamPublisherTests` — this is the concrete next step for these 2
-classes: attach `gdb -p <pid> -batch -ex 'thread apply all bt'` to a live
-hung instance (`timeout 60 ./target/release/cratonvm --java-home
-/data/data/jdk25-real -cp "<spring-suite-runner-shared>:<testcp>" KRun
-org.springframework.http.client.JdkClientHttpRequestFactoryTests` /
-`...reactive.ClientHttpConnectorTests`, then `gdb` a still-running process)
-and read the resulting backtrace against MockWebServer/okio/real-socket
-code paths specifically — genuinely not done this session.
+No change to the buffering/commit-threshold logic
+(`docs/internal/fixed-suite-bugs/dohead-streamencoder-eager-flush-commit-threshold-FIXED.md`,
+a separate, already-fixed concern) — `buffer_and_maybe_flush`/`write_through`
+are untouched.
 
-## A separate, real, low-risk fix landed this session (does NOT fix the above)
+### Verification
+
+- The zero-dependency repro above now prints `Got expected IOException:
+  Stream closed` (was `NO EXCEPTION THROWN - BUG`).
+- `OutputStreamPublisherTests`: was HANG (15s+ timeout), now `found=6 succ=5
+  fail=1 ms=580 status=FAIL` — the one failure is `chunkSize()`
+  (`expected: "bar" but was: "b"`), a separate, pre-existing, unrelated bug
+  the original investigation already flagged as out of scope (not
+  investigated further here either).
+- `SubscriberInputStreamTests`: was HANG, now `found=5 succ=5 fail=0 ms=495
+  status=OK`.
+- `native-io` crate unit tests: unaffected, all pass.
+
+## Root cause #2 (FIXED 2026-07-07): `http_read_response` read until EOF instead of stopping at declared framing
+
+### The bug, precisely
+
+`JdkClientHttpRequestFactoryTests` never produced a result, even with a
+300-second timeout — every single request hung. `net_phase_e.rs` implements
+`java.net.http.HttpClient` as a fully-native synchronous HTTP client (the
+"re5" model, registered by `register_re5_http_client` — see
+[[jdk-httpclient-realjdk-model-and-serversocket-bind-bug]] for the earlier
+history of this same subsystem). Its `http_read_response` function read the
+response socket in a loop **until `read()` returned `Ok(0)` (EOF)**, and
+only *afterward* parsed the headers to find `Content-Length`/chunked framing
+and slice out the body.
+
+Confirmed via a live `strace -f -e trace=network,read` against a real hang:
+
+```
+sendto(4, "POST /status/ok HTTP/1.1\r\nHost: "..., 200, ...) = 200      # client sends request
+recvfrom(5, "POST /status/ok HTTP/1.1\r\nHost: "..., 8192, ...) = 200   # MockWebServer receives it (fd 5 = accepted conn)
+sendto(5, "HTTP/1.1 200 OK\r\nContent-Length:"..., 38, ...) = 38        # MockWebServer sends a COMPLETE response
+recvfrom(5, <unfinished ...>                                            # MockWebServer waits for the NEXT keep-alive request (correct)
+recvfrom(4, ...) = 38   # ...resumed: client received the exact 38-byte complete response
+recvfrom(4, <unfinished ...>                                            # client goes BACK to read() for more -- hangs
+```
+
+A real HTTP/1.1 peer is entitled to keep a connection open after sending a
+fully-framed response (keep-alive) — it does not send EOF just because it
+finished responding. The client already had the WHOLE response (a complete
+`Content-Length`-framed 38-byte message) after the first `recvfrom`, but
+`http_read_response` kept trying to read more anyway, blocking until (or
+past) the 30-second `SO_RCVTIMEO` set on the socket
+(`stream.set_read_timeout(Some(Duration::from_secs(30)))` in
+`http_exchange_plain`/`http_exchange_tls`) — which a 15-test class hits once
+per test, easily exceeding any reasonable overall timeout.
+
+### The fix
+
+Commit `60bf9de0` (branch `fix/http-phase-e-read-until-close-hang-0707`,
+merged to `dev` at `86f37f84`): rewrote `http_read_response` to read the
+header block first, then read the body only up to what the declared framing
+requires:
+- `Content-Length: N` → stop once `N` body bytes have arrived (or the peer
+  closes early — return whatever arrived, matching the old code's leniency
+  for a short response).
+- `Transfer-Encoding: chunked` → reuse the existing `http_decode_chunked`
+  (unchanged) in a retry-on-incomplete-error loop, mirroring the identical
+  pattern the server-side chunked-body reader already uses elsewhere in the
+  same file.
+- 1xx/204/304 → no body, full stop, regardless of framing headers (these are
+  common in HTTP client conformance tests and could otherwise hit the same
+  keep-alive hang).
+- Neither header present → still read until EOF (this is the one legitimate
+  case: RFC 7230 §3.3.3 requires the server to close the connection to
+  signal end-of-body when it declares no other framing).
+
+### Verification
+
+`JdkClientHttpRequestFactoryTests`: was an unconditional hang (0 results,
+ever — confirmed even at a 300s timeout), now `found=15 succ=11 fail=4
+ms=63080 status=FAIL`. The 4 residual failures are a **separate, newly
+surfaced** bug (only reachable now that the hang is gone): `compressionGzip`/
+`compressionDeflate` fail an assertion comparing the request body to the
+uncompressed original string, and the `[1]`/`[2]` compression-parameterized
+tests throw `IOException: ... Resource temporarily unavailable (os error
+11)` (EAGAIN). Not investigated — flag for a future session
+(`net_phase_e.rs`'s gzip/deflate request-body handling, or a
+non-blocking-socket EAGAIN not being retried somewhere in that path).
+
+## Root cause #3 (OPEN, NOT fixed): `reactive.ClientHttpConnectorTests` — isolated to `HttpComponentsClientHttpConnector`; raw NIO layer proven fine
+
+**Update 2026-07-07 (second pass): isolated to ONE specific connector and the
+earlier "46-thread, main-vm busy" characterization was likely a snapshot of
+normal (working) activity, not the hang itself.** This class's tests are
+`@ParameterizedTest`s over 4 connector implementations
+(`ClientHttpConnectorTests.connectors()`: Reactor Netty, Jetty,
+HttpComponents, Jdk) plus one plain `@Test`
+(`disableCookieWithHttpComponents`), so the earlier single-`gdb`-snapshot
+capture of the whole class run — 46 threads, `main-vm` busy 100+ frames deep
+in `try_lambda_dispatch`/`native_al_for_each` — most likely just caught the
+interpreter mid-flight on whichever connector was running *at that instant*
+(plausibly Reactor Netty or Jetty, which both complete), not evidence of a
+livelock. Per
+[[known-issue-doc-hypothesis-can-be-wrong-not-just-stale]], re-derive rather
+than trust a single-session snapshot's narrative — which is exactly what
+this pass did.
+
+### Per-connector isolation (standalone driver, since `KRun` only supports class-level selection)
+
+A minimal standalone driver (`ConnectorProbe.java` — constructs each of the
+4 connectors directly against a fresh `MockWebServer`, in its own thread with
+an explicit `join(20000)` bound, entirely bypassing JUnit) gives a clean,
+fast per-connector verdict:
+
+| Connector | Real HotSpot | CratonVM | Verdict |
+|---|---|---|---|
+| Reactor Netty | 316ms, OK | 2246ms, OK | Works (just slower — interpreter overhead, not a bug) |
+| Jetty | 207ms, OK | 1082ms, OK | Works, BUT leaves 8 non-daemon threads alive after the process's `main()` returns (`[cratonvm] main() returned; VM held alive by 8 non-daemon thread(s)`) — a real, separate, minor resource-cleanup issue, not investigated further, does not itself hang a test *run* since threads leaking past the end of a whole-JVM process are harmless for a single `KRun` batch (though worth noting for whoever eventually chases it) |
+| HttpComponents | 37ms, OK | **HUNG** — never returns, hits the probe's own 15s `.block(Duration)` timeout | 🔴 **The actual hang** |
+| Jdk | 41ms, OK | FAILS FAST (208ms): `ClassCastException: java.io.ByteArrayInputStream cannot be cast to java.util.concurrent.Flow$Publisher` | A separate, real, unrelated bug (fails, doesn't hang) — not investigated further this session |
+
+**So root cause #3 is specifically `HttpComponentsClientHttpConnector`**
+(backed by Apache HttpClient5's async reactor). Since 4 of this test class's
+5 methods are parameterized over all 4 connectors, any invocation that
+reaches the HttpComponents parameter blocks forever with no per-test
+timeout, which is what made the *whole class* look permanently hung.
+
+### Confirmed: this is a raw Apache HttpClient5 bug, not Spring's bridging code
+
+A second standalone driver (`RawHc5Probe.java`) uses
+`org.apache.hc.client5.http.impl.async.HttpAsyncClients.createDefault()` +
+`CloseableHttpAsyncClient.execute(SimpleHttpRequest, FutureCallback)`
+directly against a `MockWebServer`, with **zero Spring code** in the path.
+Real HotSpot: completes in 128ms. CratonVM: `client.getStatus()` reports
+`ACTIVE` (so `start()` genuinely launched the reactor), but the
+`FutureCallback` is never invoked — confirmed via `latch.await(20,
+SECONDS)` timing out. This rules out `HttpComponentsClientHttpConnector`/
+`HttpComponentsClientHttpRequest`'s Spring-side bridging as the culprit;
+the bug is inside `httpclient5`/`httpcore5` itself running under CratonVM.
+
+### Confirmed: the raw JDK NIO `SocketChannel`/`Selector` layer is NOT the bug
+
+This directly refutes the earlier hypothesis (per
+[[jdk-httpclient-realjdk-model-and-serversocket-bind-bug]]'s closing note)
+that this might be the same still-open "NIO SocketChannel/selector path" gap
+noted for `JettyClientHttpRequestFactoryTests`. Three standalone probes,
+each mirroring a progressively more precise slice of what HttpClient5's own
+`SingleCoreIOReactor` actually does, **all pass on CratonVM**:
+
+1. `NioSelectorProbe.java` — single-threaded non-blocking
+   `ServerSocketChannel`/`SocketChannel` + `Selector`, full
+   accept/connect/read/write/echo round trip. **PASS** (3 select() rounds,
+   ~4ms).
+2. `WakeupProbe.java` — a dedicated "reactor" thread blocks in
+   `Selector.select(30000)` on an *empty* selector (nothing registered yet,
+   exactly how a real I/O reactor's dispatch thread starts); a second
+   "app" thread then registers a brand new `ServerSocketChannel` with that
+   *same* selector from outside and calls `wakeup()`. **PASS** — the
+   blocked `select()` returns immediately on `wakeup()` (not the 30s
+   timeout) and correctly picks up the new registration on the next round.
+3. `ConnectWakeupProbe.java` — the precise pattern HttpClient5 uses for
+   outbound connects: the "app" thread opens a **non-blocking**
+   `SocketChannel`, calls `connect()` (returns `false`/in-progress), then
+   registers *that* channel for `OP_CONNECT` on the reactor thread's
+   selector and calls `wakeup()`; the reactor thread is expected to notice
+   `OP_CONNECT`, call `finishConnect()`, then read/write. **PASS** — full
+   round trip completes in ~1ms after the reactor thread wakes.
+
+Since (3) is strictly harder than what `SingleCoreIOReactor.connect()`
+actually needs (per the disassembly below, it never registers a channel for
+`OP_CONNECT` from the app thread at all — only the reactor thread ever
+touches the selector), the underlying JDK NIO mechanics HttpClient5 depends
+on are verified sound.
+
+### `SingleCoreIOReactor.connect()`'s actual mechanism (via `javap -c`, no sources jar available on this host)
+
+```
+public java.util.concurrent.Future<IOSession> connect(...) {
+    ...
+    IOSessionRequest req = new IOSessionRequest(...);
+    requestQueue.add(req);      // java.util.Queue<IOSessionRequest> field
+    selector.wakeup();
+    return req;
+}
+```
+
+A plain `queue.add()` + `wakeup()` — simpler than probe (3) above, which
+already passes. So the submission mechanism itself is very unlikely to be
+where this breaks; the stall is more likely somewhere later in the reactor's
+own processing of a dequeued request (`processPendingConnectionRequests` →
+`prepareSocket`/`openSocketFor`/`processConnectionRequest`, or the HTTP/1.1
+protocol handshake stage after the TCP connect completes) — not yet
+isolated further.
+
+### Java-level stack dump (`--stack-dump-on-timeout`) of the raw-probe hang
+
+CratonVM has a purpose-built flag for exactly this kind of investigation:
+`--stack-dump-on-timeout <SECONDS>` arms a watchdog that dumps every
+interpreter thread's **Java-level** frame chain (class/method/pc, not just
+Rust frames) to stderr after the deadline, then aborts — far more direct
+than reading Rust-level `gdb` backtraces for pinpointing which Java method
+is actually stuck. Running `RawHc5Probe` with `--stack-dump-on-timeout 20`:
+
+- `main` (tid=0): parked at the `latch.await(...)` call site in
+  `RawHc5Probe.main`, as expected.
+- **14 separate `IOReactorWorker` threads** (tid 5–19, one dead), **all**
+  showing the identical 3-frame stack `IOReactorWorker.run()` →
+  `AbstractSingleCoreIOReactor.execute()` → `SingleCoreIOReactor.doExecute()`
+  — i.e. all blocked inside `doExecute()`'s own `select()` call, with
+  nothing deeper visible (the interpreter's frame-chain walk stops at the
+  native `Selector.select()` boundary, same as the Rust-level `gdb` view
+  showed `epoll_wait`). **This snapshot alone can't tell whether the ONE
+  worker actually assigned our connection (via `DefaultConnectingIOReactor
+  .selectWorker()`, presumably round-robin across the worker array) is
+  genuinely stuck vs. whether all 14 are simply idle/unused and only one was
+  ever supposed to do anything** — distinguishing these needs correlating
+  worker identity with the specific connect request, not done yet.
+- One `ThreadPoolExecutor$Worker` thread parked in
+  `LinkedBlockingQueue.take()` via `ForkJoinPool.managedBlock` — a generic
+  idle pool thread, unrelated.
+- No exception anywhere in the dump except a `SocketException` under
+  `MockWebServer.acceptConnections()`, which is just the *expected* teardown
+  side effect of the probe's own `server.close()` call racing the 20s
+  watchdog abort — not a clue about the hang itself.
+
+### A separate, genuine, confirmed (but almost certainly NOT hang-causing) bug found along the way
+
+`SocketChannel.setOption()`/`getOption()` for `SO_SNDBUF`, `SO_RCVBUF`, and
+`SO_LINGER` are unconditional no-ops in `native-io/src/socket_channel.rs`'s
+`apply_option()`/`read_option()` (`"SO_RCVBUF" | "SO_SNDBUF" => Ok(())`, and
+`SO_LINGER` falls through the same catch-all `_ => Ok(())`) — `std::net
+::TcpStream` doesn't expose setters for these without the `socket2` crate,
+so the author left them as accepted no-ops. Confirmed via a standalone probe
+(`SetOptionAttachProbe.java`): `setOption(SO_SNDBUF, 32768)` followed by
+`getOption(SO_SNDBUF)` reads back `0`, not `32768` (same for `SO_RCVBUF`/
+`SO_LINGER`). `TCP_NODELAY` **is** actually wired to `TcpStream::set_nodelay`
+and *should* work once a real connection exists in `tcp_registry` — the
+probe's own `getOption(TCP_NODELAY)` read `false` after `setOption(...,
+true)` only because the probe called `setOption` *before* `connect()`, when
+there's no live `TcpStream` handle yet for `apply_option` to act on (not
+itself a bug, just a probe-ordering artifact — not re-tested post-connect).
+`SelectionKey.attach()`/`attachment()` were also checked and work correctly
+(same-object identity preserved across `select()`). `HttpClient5`'s
+`prepareSocket()` calls exactly these `setOption`s when preparing a fresh
+connect — since they're silent no-ops (not exceptions), they should not
+themselves cause a hang, but are flagged here as a genuine, real,
+independently-worth-fixing defect for whoever picks this up next (would need
+the `socket2` crate, or an equivalent raw-fd `setsockopt` call, added to
+`native-io` — a small, contained, low-risk fix, just out of scope for this
+pass since it doesn't explain the hang).
+
+### Next concrete steps for a future session
+
+1. **Instrument `httpclient5`/`httpcore5` directly.** No `-sources.jar` is
+   available on this host for either artifact (`find
+   ~/.gradle/caches/modules-2/files-2.1/org.apache.httpcomponents.core5
+   -iname '*sources*'` finds nothing) and decompiling+recompiling with added
+   trace prints in `SingleCoreIOReactor.processPendingConnectionRequests`/
+   `processConnectionRequest`/`prepareSocket` (or wherever the dequeued
+   `IOSessionRequest` gets its socket opened and connected) would show
+   exactly which step is reached and where the reactor stops making
+   progress — this is the most direct remaining lever.
+2. **Correlate which specific `IOReactorWorker` thread was assigned the
+   request.** `DefaultConnectingIOReactor.selectWorker()` picks one of the
+   `workers[]` array per connect — add temporary logging (or attach a
+   debugger at that call) to identify which thread index gets it, then
+   target `--stack-dump-on-timeout` / `gdb` snapshots specifically at THAT
+   thread rather than treating all 14 as equally suspect.
+3. Try a **much shorter `IOReactorConfig` `ioThreadCount`** (e.g. 1) to
+   collapse the 14-worker fan-out down to a single, unambiguous reactor
+   thread — makes the next stack dump trivially attributable.
+4. Consider whether HTTP/1.1 protocol negotiation (`Http1AsyncRequester`,
+   the `IOEventHandlerFactory` chain) rather than the raw TCP connect is
+   where it actually stalls — the connect+`prepareSocket` path was the focus
+   this pass since it's the earliest point where something HttpClient5-only
+   (not shared with Jetty/Reactor Netty/JDK) is involved, but it has not
+   been positively confirmed as the exact stall point, only judged the most
+   likely remaining candidate after the raw NIO layer was cleared.
+5. `sudo -n gdb -p <pid> ...` is required on this host for any raw-frame
+   attach (plain `gdb -p` fails with a `ptrace_scope`/`yama` permission
+   error even though the ssh user owns the process, since the launched test
+   process and the `gdb` invocation are siblings under the same shell, not
+   parent/child — this user has passwordless `sudo`). Prefer
+   `--stack-dump-on-timeout` over raw `gdb` where possible now that it's
+   known to exist — it gives Java-level frames directly, no Rust-frame
+   translation needed.
+## A separate, real, low-risk fix landed in the original session (does NOT fix root cause #1, #2, or #3)
 
 `native_es_execute` (`ExecutorService.execute(Runnable)`/
 `ThreadPoolExecutor.execute(Runnable)`, `native-builtins/src/lib.rs`) ran
@@ -255,10 +413,10 @@ completes).
 lives in `register_synthetic_overrides` (`native-builtins/src/lib.rs`,
 guarded by `#[cfg(feature = "synthetic-jdk")]` AND
 `config.use_synthetic_jdk`), which is never called in real-JDK mode
-(`--java-home`, the mode all 4 hangs are reported/reproduced in) — confirmed
+(`--java-home`, the mode all hangs are reported/reproduced in) — confirmed
 via `grep`-verified call-graph tracing AND empirically (a temporary debug
 eprintln in `native_es_execute`, reverted before commit, never fired during
-any of the 4 classes' hangs). It is kept as a genuine, real,
+any of the classes' hangs). It is kept as a genuine, real,
 independently-useful fix for synthetic-JDK-mode callers of
 `Executors.newSingleThreadExecutor()`/`newFixedThreadPool()`/
 `newCachedThreadPool()`, documented precisely as scoped-but-inert for this
@@ -269,12 +427,13 @@ doesn't, in real-JDK mode).
 ## Reproduction
 
 ```bash
-# Azure host, branch fix/httpclient-jdkclient-hangs-0706b off dev @ 9f1db39d
+# Azure host, dev @ 86f37f84 or later (root causes #1 and #2 fixed)
 ssh -i ~/.ssh/azure.pem victor@<current-IP>
-cd /data/data/wt-hc-hangs-0706b   # or a fresh worktree off this branch
+cd /data/data/cratonvm   # or a fresh worktree off dev
+
 CP="$(cat /data/data/spring-framework-shared/spring-web/build/cratonvm-testcp.txt)"
 
-# Cheapest possible repro (no suite harness at all):
+# Cheapest possible repro for root cause #1 (no suite harness at all) — now passes:
 cat > /tmp/WriterCloseTest.java <<'EOF'
 import java.io.*;
 public class WriterCloseTest {
@@ -294,12 +453,45 @@ public class WriterCloseTest {
 EOF
 /data/data/jdk25-real/bin/javac -d /tmp /tmp/WriterCloseTest.java
 ./target/release/cratonvm --java-home /data/data/jdk25-real -cp /tmp WriterCloseTest
-# Expected (HotSpot): "Got expected IOException: Stream closed"
-# Actual (CratonVM):  "NO EXCEPTION THROWN - BUG"
+# Expected (HotSpot) AND now CratonVM: "Got expected IOException: Stream closed"
 
-# Full-class repro (hangs):
+# Root cause #1 class repros (used to hang, now complete):
 timeout 60 ./target/release/cratonvm --java-home /data/data/jdk25-real \
   -cp "/data/data/spring-suite-runner-shared:$CP" \
   KRun org.springframework.http.client.OutputStreamPublisherTests
-# Never prints a RESULT line; 100% CPU on the main-vm thread.
+# RESULT found=6 succ=5 fail=1 (chunkSize, unrelated) ms=580 status=FAIL
+
+timeout 60 ./target/release/cratonvm --java-home /data/data/jdk25-real \
+  -cp "/data/data/spring-suite-runner-shared:$CP" \
+  KRun org.springframework.http.client.SubscriberInputStreamTests
+# RESULT found=5 succ=5 fail=0 ms=495 status=OK
+
+# Root cause #2 class repro (used to hang unconditionally, now completes):
+timeout 120 ./target/release/cratonvm --java-home /data/data/jdk25-real \
+  -cp "/data/data/spring-suite-runner-shared:$CP" \
+  KRun org.springframework.http.client.JdkClientHttpRequestFactoryTests
+# RESULT found=15 succ=11 fail=4 ms=63080 status=FAIL (4 residuals = separate gzip/deflate bug)
+
+# Root cause #3 — isolated to HttpComponentsClientHttpConnector specifically
+# (Reactor Netty/Jetty/Jdk all work or fail-fast; only HttpComponents hangs).
+# The whole-class run still never completes (any parameterized test hitting
+# the HttpComponents connector blocks forever):
+timeout 600 ./target/release/cratonvm --java-home /data/data/jdk25-real \
+  -cp "/data/data/spring-suite-runner-shared:$CP" \
+  KRun org.springframework.http.client.reactive.ClientHttpConnectorTests
+# Never prints a RESULT line even at 600s.
+
+# Cheapest per-connector isolation (bypasses JUnit + Spring entirely):
+# compile ConnectorProbe.java / RawHc5Probe.java / NioSelectorProbe.java /
+# WakeupProbe.java / ConnectWakeupProbe.java / SetOptionAttachProbe.java
+# (recreate from the "Root cause #3" section above -- not committed, they
+# were scratch diagnostics) against the same $CP, then:
+./target/release/cratonvm --java-home /data/data/jdk25-real -cp "<probe-dir>:$CP" ConnectorProbe httpcomponents
+# HttpComponents: FAILED java.lang.IllegalStateException: Timeout on blocking read for 15000000000 NANOSECONDS
+
+# Java-level stack dump of the hang (far more useful than raw gdb for this):
+timeout 45 ./target/release/cratonvm --stack-dump-on-timeout 20 --java-home /data/data/jdk25-real \
+  -cp "<probe-dir>:$CP" RawHc5Probe
+# Shows 14 IOReactorWorker threads all idle in doExecute()'s blocking select(),
+# nothing visibly processing the connect request.
 ```

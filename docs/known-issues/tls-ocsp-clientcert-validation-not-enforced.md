@@ -1,26 +1,133 @@
 # TLS/mTLS/OCSP validation doesn't reject invalid handshakes (security-relevant)
 
-**Windows platform gap found 2026-07-07 (new, separate task `task_c068bce2`):**
-all the verification below was done on Linux (Azure host). Rebuilding fresh on
-**Windows** from dev `d14d2ff3` (confirmed via `git merge-base` to include
-both `aafdaec8` and `b7390ffd`) and re-running all 8 classes in this cluster
-shows **all 8 still fail** — but not with the original fail-open symptom.
-Root cause (identical across all 8, confirmed via `.log.err`):
+**Windows `openssl_h` `Optional.or` NPE (`task_c068bce2`) — root-caused and
+FIXED 2026-07-07.** The symptom reported when this task was opened:
 ```
 INFO [...] Starting test case [test[OpenSSL-FFM with OpenSSL trust ...]]
 WARN cratonvm_vm::vm::vm_util: <clinit> failed — wrapping in ExceptionInInitializerError
   class=org/apache/tomcat/util/openssl/openssl_h$OpenSSL_version_num
   cause=java/lang/NullPointerException Cannot invoke "java.util.Optional.or(java.util.function.Supplier)"
 ```
-This fires when test parameterization reaches the "OpenSSL-FFM" connector
-variant. This doc's own "Verified test outcomes" table below already notes
-"OpenSSL/OpenSSL-FFM variants still skip — native ssl.dll/tomcat-native not
-installed, environmental, unrelated" — i.e. on Linux this variant is detected
-as unavailable and cleanly skipped. On Windows it isn't skipped: the
-`<clinit>` NPEs instead, and the resulting `ExceptionInInitializerError` kills
-the whole connector/test class rather than just that one parameterized case.
-**Not yet re-verified against this doc's claimed Linux pass counts on
-Windows** — do not assume they transfer. See `task_c068bce2`.
+**Root cause:** two competing native registrations existed for
+`java/lang/foreign/SymbolLookup`. `panama.rs::register_pe_symbol_lookup` is
+the correct implementation — it actually attempts a real library load via
+`ctx.load_native_library` and wraps results in a genuine `Optional`/
+`Optional.empty()`. But that function ran under the registry's default
+`SyntheticStub` category, which is dropped entirely under strict-no-stubs
+(the default for real-JDK mode) — so it silently never registered at all.
+The only surviving registration was a duplicate stub in
+`phases_late.rs::register_p67_foreign_memory` (category `Bridge`, never
+dropped) that unconditionally faked success (`libraryLookup` always
+allocated a "loaded" object regardless of whether any library existed) and
+`find` always returned a bare Java `null` instead of `Optional.empty()`.
+Real JDK bytecode composes lookups via `SymbolLookup.or()`, whose generated
+lambda does `this.find(name).or(() -> other.find(name))` — a `null`
+receiver there is exactly the observed NPE. Confirmed via direct tracing
+(temporary `eprintln!` instrumentation) that the `phases_late.rs` stub, not
+`panama.rs`'s real implementation, was firing.
+
+Empirically (repro via `run-tomcat-suite.ps1`, `TestClientCert`/
+`TestSecurity2017Ocsp`/`TestSSLHostConfigCipher`/`TestOcspEnabled`), this NPE
+was already being caught gracefully by
+`OpenSSLLifecycleListener.isAvailable()`'s `catch (Throwable t)` — it did
+**not** actually kill the whole test class as originally suspected; all
+parameterized sub-tests (18/116/etc.) ran to completion both before and
+after the fix. The original "all 8 classes fail/hang" framing traces to a
+stale build predating several since-merged dev commits, not to this NPE
+itself. It was still a real, worth-fixing bug: HotSpot's actual behavior for
+a missing OpenSSL library is a clean `IllegalArgumentException("Cannot open
+library: ...")` thrown directly from `SymbolLookup.libraryLookup`, not an
+NPE from a downstream `.or()` composition.
+
+**Fix:** promoted `register_pe_symbol_lookup` to the `Bridge` category (so
+it survives strict-no-stubs) and deleted the redundant/broken duplicate
+trio (`loaderLookup`/`libraryLookup`/`find`) from `phases_late.rs`. Verified
+post-fix: `openssl_h`'s `<clinit>` now fails with
+`IllegalArgumentException Cannot open library: ssl.dll` (matching real JDK
+semantics) instead of the `Optional.or` NPE, across `TestClientCert`,
+`TestSecurity2017Ocsp`, and `TestSSLHostConfigCipher`. All 61
+`native-builtins` panama:: unit tests still pass.
+
+**`KeyManagerFactory.getProvider()` NoSuchMethodError/NPE — root-caused and
+FIXED 2026-07-07 (`task_0ec4b356`).** Was blocking every JSSE-variant
+sub-test across this cluster (100% failure rate; OpenSSL/OpenSSL-FFM
+variants unaffected) with:
+```
+Caused by: java.lang.NoSuchMethodError: java/lang/String.getInfo()Ljava/lang/String;
+  at org.apache.tomcat.util.net.SSLUtilBase.getKeyManagers(SSLUtilBase.java:351)
+```
+(`kmf.getProvider().getInfo().contains("FIPS")`.)
+
+**Root cause, part 1 (wrong receiver type):** the ACTIVE `KeyManagerFactory`
+registration — `phases_late.rs::register_p68_ssl`'s `getInstance`/`init`
+(NOT `tls.rs::register_key_manager_factory`, which is a fully-shadowed dead
+duplicate registered under `SyntheticStub` that never fires; confirmed via
+direct tracing that only the `phases_late.rs` copy ever runs) — stored the
+raw `algorithm` *String* argument at field slot 0. `getProvider()` has no
+native override, so it falls through to real bytecode, which reads the REAL
+`javax.net.ssl.KeyManagerFactory` field layout. `javap -p` on the actual
+class shows the true declaration order is `provider` (slot 0),
+`factorySpi` (slot 1), `algorithm` (slot 2) — easy to get backwards from a
+naive constant-pool read, which surfaces `factorySpi` first purely because
+another method happens to reference it first. So `getProvider()` returned
+the algorithm String sitting at slot 0, and `.getInfo()` on a `String`
+receiver is exactly the observed `NoSuchMethodError`.
+
+**Root cause, part 2 (wrong Provider construction), found after fixing part
+1:** once `getProvider()` correctly returned a `Provider`-tagged object, its
+`.getInfo()` call returned `null` instead of a string, NPEing on
+`.contains(...)`. `alloc_concurrent_synthetic("java/security/Provider", N)`
+upsizes to the *real* class's full field count in real-JDK mode — which
+includes every inherited `Hashtable`/`Properties` field ahead of
+`Provider`'s own `name`/`info`/`version`/... — so a naive indexed
+`ctx.set_field(provider, 0/1, ...)` (mirroring the simpler, legacy
+`phases_early.rs::make_provider` 2-field convention) lands on whatever
+field occupies that slot in the *real* inheritance layout, not `name`/
+`info`. `native-builtins/src/jca/provider_chain.rs` already solves this
+correctly (its own module doc explains the exact same trap, WP6.1) by
+writing every field through `set_field_by_name` and registering its own
+`getInfo()` native that reads `info` back the same way — confirmed via an
+isolated repro that `Security.getProvider("SunJSSE").getInfo()` already
+worked correctly through that path.
+
+**Fix:** in `phases_late.rs`, `KeyManagerFactory.getInstance` now builds its
+`provider` field via `jca::provider_chain::find("SunJSSE")` +
+`jca::provider_chain::make_provider(...)` (both promoted from private to
+`pub(crate)`) instead of an ad-hoc allocation, and stores `algorithm` at
+slot 2 / leaves `factorySpi` unset at slot 1, matching the real class
+layout; `getAlgorithm()`'s native override was updated to read slot 2
+accordingly; `init(KeyStore, char[])` no longer clobbers slots 1/2 (nothing
+ever read the keystore/password it used to stash there — the actual mTLS
+identity flow runs through `keystore_set_pending_km_identity`, untouched).
+Added a doc comment to `tls.rs::register_key_manager_factory` flagging it
+as dead/shadowed so a future reader debugging `KeyManagerFactory` doesn't
+lose time editing the copy that never runs.
+
+Verified: the isolated repro
+(`KeyManagerFactory.getInstance("SunX509").getProvider().getInfo()`) now
+returns a real info string and `.contains("FIPS")` evaluates `false` as
+expected. Through the full suite: `TestSecurity2017Ocsp` is back to **5/5
+PASS** on Windows. `TestClientCert`'s JSSE sub-tests no longer hit the
+`getProvider` error at all — they now fail later, during the actual TLS
+handshake (`SSLHandshakeException: connection closed by peer`), which lines
+up with this doc's already-documented, separate residual #2
+(`chooseClientAlias`/client-cert plumbing, still open) rather than a new
+issue. `TestSSLHostConfigCipher` improved from 4/12 to 3/12 failing (residual
+#2-shaped JSSE failures, not the DHE case this doc already tracks as
+permanently unfixable). **Do not expect Windows counts to match this doc's
+Linux baseline** — residual #2 and the DHE case are real, independent,
+already-tracked gaps, not artifacts of either fix on this page.
+
+**Also found while investigating (pre-existing, unrelated, flagged
+separately as `task_2b28e7bc`, NOT fixed here):**
+`tls::tls_tests::nb_tls_tmf_get_trust_managers_propagates_keystore_id`
+(`native-builtins/src/tls.rs`) fails on dev's current tip — confirmed via
+`git stash` that it fails identically before either fix on this page, so
+it's not a regression from this session. `TrustManagerFactory.
+getTrustManagers()` returns a trust manager carrying keystore id `1`
+instead of the id `7` the test's simulated `init(KeyStore)` bound —
+possibly a real correctness bug in trust-manager id propagation, not just a
+stale test expectation; needs its own investigation.
 
 **Status:** OCSP revocation checking now IMPLEMENTED and verified (branch
 `feat/ocsp-revocation-checking-20260706`, follow-up to

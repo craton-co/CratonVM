@@ -9,7 +9,7 @@ Status: **FIXED** on branch `dev` (this fix). Root cause is entirely in
 `jakarta.servlet.http.TestHttpServletDoHeadInvalidWrite1024ValidWrite512`
 (suite index 50) previously HUNG/CRASHED at short timeouts (120s/600s), which
 is the tracked, separate GC non-moving-sweep corruption family documented in
-`dohead-jit-heap-corruption-register-invisibility.md`. At a 1200s timeout it
+`dohead-jit-heap-corruption-register-invisibility-FIXED.md`. At a 1200s timeout it
 actually COMPLETES in ~674s and produces 16 deterministic (non-flaky)
 failures — a different bug, confirmed unrelated to the GC-corruption family:
 in the baseline run
@@ -156,6 +156,6 @@ a custom `org.junit.runner.manipulation.Filter` matching a substring like
 in `apps/tomcat/output/testclasses` (no `ant test-compile` needed between
 runs unless the `.java` sources themselves change).
 
-Related: `dohead-jit-heap-corruption-register-invisibility.md` (the SEPARATE,
+Related: `dohead-jit-heap-corruption-register-invisibility-FIXED.md` (the SEPARATE,
 previously-tracked GC-corruption family this bug was initially confused with
 — see the log-line evidence above for why they're unrelated).

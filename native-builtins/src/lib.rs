@@ -18580,6 +18580,30 @@ pub fn register_essential_natives(registry: &mut NativeMethodRegistry) {
     // WP5.3 — X509KeyManager + X509TrustManager with EKU-aware alias selection
     //         and RFC 5280 chain validation backed by rustls-native-certs.
     x509_manager::register_x509_manager_real(registry);
+    // FIX (x509-trustmanager-abstractmethod-20260707): X509TrustManager.
+    // getAcceptedIssuers() itself -- not just getEncoded() on its results,
+    // fixed above by pulling in register_p68_security_cert -- was ALSO only
+    // ever registered by t27_tls::register_accepted_issuers, which (per its
+    // own doc comment) is reachable ONLY via register_t27_natives ->
+    // register_phase68_natives -> register_synthetic_overrides, the same
+    // #[cfg(feature = "synthetic-jdk")]-gated path documented above as
+    // compiled OUT of the default real-JDK CLI. The synthetic
+    // javax/net/ssl/TrustManagerFactory.getTrustManagers() native (tls.rs /
+    // phases_late.rs, registered unconditionally in every build) stamps its
+    // returned TrustManager objects with runtime class
+    // "javax/net/ssl/X509TrustManager" (the bare interface) -- not the real
+    // "sun/security/ssl/X509TrustManagerImpl" that register_x509_manager_real
+    // just registered getAcceptedIssuers on above -- so calling
+    // getAcceptedIssuers() on one resolved to the interface's own abstract
+    // declaration (no Code, no native anywhere) and threw AbstractMethodError.
+    // Repro: TrustManagerFactory.getInstance(...).init((KeyStore) null) then
+    // ((X509TrustManager) tmf.getTrustManagers()[0]).getAcceptedIssuers() --
+    // exactly what OkHttp's Platform.buildTrustRootIndex does on every
+    // OkHttpClient construction (spring-webflux
+    // InvalidHttpMethodIntegrationTests, all 4 server-backend variants).
+    // Call the narrow accepted-issuers registration here too, same pattern as
+    // register_p68_security_cert a few lines below.
+    t27_tls::register_accepted_issuers(registry);
     // Cert-code fix (real-JDK AbstractMethodError): java.security.cert.
     // Certificate / X509Certificate generic accessors (getEncoded, getType,
     // checkValidity, getNotBefore/getNotAfter, ...) and CertificateFactory.
@@ -21551,6 +21575,22 @@ fn register_annotation_overrides(registry: &mut NativeMethodRegistry) {
     // Real-JDK SLF4J replay: `LoggerFactory` drains then clears the event queue.
     // Synthetic-stub `LinkedBlockingQueue` hierarchies may not resolve
     // `AbstractCollection.clear()V` on the method walk — register explicitly.
+    //
+    // BUG (2026-07-07): this used to unconditionally `ctx.set_field(this, 1,
+    // Value::Int(0))`, assuming the synthetic 4-field layout (slot 1 = size
+    // int). On a REAL-JDK-constructed `LinkedBlockingQueue` (real bytecode
+    // `<init>` ran), slot 1 is the real `count: AtomicInteger` *reference*
+    // field, not an int. Stomping it with `Value::Int(0)` corrupted that
+    // reference to null, so any later real-bytecode `count.get()` (e.g.
+    // `offer()`/`size()`) NPE'd with "Cannot invoke AtomicInteger.get()
+    // because count is null" — reproduced by
+    // BufferingStompDecoderTests (org.springframework.messaging.simp.stomp),
+    // whose `assembleChunksAndReset()` calls `chunks.clear()` right after
+    // dequeuing the sole buffered chunk. Mirror the `size()` override just
+    // below: detect the real layout by field name first (same technique),
+    // and for that case drain via the real `poll()` (already correct for
+    // real-layout queues, proven by `count` staying valid across dequeues)
+    // instead of touching the raw slot.
     registry.register(
         "java/util/concurrent/LinkedBlockingQueue",
         "clear",
@@ -21561,7 +21601,17 @@ fn register_annotation_overrides(registry: &mut NativeMethodRegistry) {
                 _ => return Ok(None),
             };
             ctx.monitor_enter(this);
-            ctx.set_field(this, 1, Value::Int(0));
+            match ctx.get_field_by_name(this, "count") {
+                Value::Object(Some(_)) => {
+                    while matches!(
+                        ctx.invoke_virtual(this, "poll", "()Ljava/lang/Object;", &[])?,
+                        Some(Value::Object(Some(_)))
+                    ) {}
+                }
+                _ => {
+                    ctx.set_field(this, 1, Value::Int(0));
+                }
+            }
             ctx.monitor_notify_all(this)?;
             ctx.monitor_exit(this);
             Ok(None)
@@ -25021,6 +25071,26 @@ fn native_surefire_forkedbooter_acknowledged_exit(
             "eventChannel.onJvmExit",
             ctx.invoke_virtual(event_channel, "onJvmExit", "()V", &[]),
         );
+    } else {
+        // Older Surefire booters (2.x line -- e.g. 2.22.2, still pinned by
+        // WildFly's testsuite poms) have no `eventChannel`/`closeForkChannel`
+        // at all: the parent's `ForkClient` only marks `saidGoodBye = true`
+        // once it reads a literal "Z,0,BYE!\n" line on the forked process's
+        // stdout, written by the real `acknowledgedExit()` via
+        // `encodeAndWriteToOutput(String)` before the process exits. Without
+        // this, `std::process::exit(0)` below leaves that flag unset and
+        // Maven reports "The forked VM terminated without properly saying
+        // goodbye" even though zero matching tests is the correct outcome.
+        let bye = ctx.create_string("Z,0,BYE!\n");
+        surefire_ignore(
+            "encodeAndWriteToOutput(BYE)",
+            ctx.invoke_special(
+                "org/apache/maven/surefire/booter/ForkedBooter",
+                "encodeAndWriteToOutput",
+                "(Ljava/lang/String;)V",
+                &[Value::Object(Some(this)), Value::Object(Some(bye))],
+            ),
+        );
     }
     surefire_ignore(
         "cancelPingScheduler",
@@ -25037,15 +25107,17 @@ fn native_surefire_forkedbooter_acknowledged_exit(
             ctx.invoke_virtual(command_reader, "stop", "()V", &[]),
         );
     }
-    surefire_ignore(
-        "closeForkChannel",
-        ctx.invoke_special(
-            "org/apache/maven/surefire/booter/ForkedBooter",
+    if let Value::Object(Some(_)) = ev {
+        surefire_ignore(
             "closeForkChannel",
-            "()V",
-            &[Value::Object(Some(this))],
-        ),
-    );
+            ctx.invoke_special(
+                "org/apache/maven/surefire/booter/ForkedBooter",
+                "closeForkChannel",
+                "()V",
+                &[Value::Object(Some(this))],
+            ),
+        );
+    }
 
     if std::env::var("CRATONVM_SOFT_EXIT").as_deref() == Ok("1") {
         eprintln!("[SUREFIRE-ACK-EXIT] soft-returning due to CRATONVM_SOFT_EXIT=1");

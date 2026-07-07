@@ -289,6 +289,12 @@ pub struct ServiceController {
     /// true, the worker does NOT transition to `Up` on return from
     /// `start()`.  The service must call `complete()` to finish.
     pub async_pending: bool,
+    /// Set when a dependent (or `setMode(ACTIVE)`) demanded this
+    /// `OnDemand`/`Lazy` service. Under `CRATONVM_MSC_REAL_START` the
+    /// background-worker queue is bypassed, so `take_ready_start` uses this
+    /// flag to make demanded on-demand services start-eligible in the real
+    /// `drive_starts` loop instead.
+    pub demanded: bool,
 }
 
 impl ServiceController {
@@ -303,6 +309,7 @@ impl ServiceController {
             dependents: Vec::new(),
             failure_message: None,
             async_pending: false,
+            demanded: false,
         }
     }
 }
@@ -328,6 +335,15 @@ struct ContainerState {
     services: HashMap<Arc<ServiceName>, ServiceController>,
     /// Back-index: controller id → name (for fast lookup by ID).
     by_id: HashMap<u64, Arc<ServiceName>>,
+    /// Alias → primary-name index. Real MSC resolves a dependency against
+    /// the per-name `ServiceRegistrationImpl`, so a `requires(X)` is
+    /// satisfied by ANY service whose `provides(...)`/`addAliases(...)`
+    /// includes `X` — not just one whose primary serviceId equals `X`
+    /// (WildFly capability names like `org.wildfly.management.executor` are
+    /// provided this way). Without this index, `can_start` never saw such
+    /// dependencies as satisfiable and the dependent (e.g.
+    /// `jboss.as.server-controller`) stayed `Down` forever.
+    aliases: HashMap<Arc<ServiceName>, Arc<ServiceName>>,
     /// Pending work items the workers will pick up.
     task_queue: VecDeque<Task>,
     /// Set of service IDs currently being started/stopped; used to
@@ -335,6 +351,19 @@ struct ContainerState {
     in_flight: HashSet<u64>,
     /// Shutdown flag — stops workers from accepting new tasks.
     shutdown: bool,
+}
+
+impl ContainerState {
+    /// Resolve a (possibly aliased) service name to the primary name the
+    /// `services` map is keyed by. Names that are already primary — or
+    /// entirely unknown — come back unchanged.
+    fn resolve<'a>(&'a self, name: &'a Arc<ServiceName>) -> &'a Arc<ServiceName> {
+        if self.services.contains_key(name) {
+            name
+        } else {
+            self.aliases.get(name).unwrap_or(name)
+        }
+    }
 }
 
 /// A single unit of work the scheduler dispatches to a worker.
@@ -353,6 +382,7 @@ impl ServiceContainer {
             inner: Mutex::new(ContainerState {
                 services: HashMap::new(),
                 by_id: HashMap::new(),
+                aliases: HashMap::new(),
                 task_queue: VecDeque::new(),
                 in_flight: HashSet::new(),
                 shutdown: false,
@@ -390,7 +420,8 @@ impl ServiceContainer {
         ctrl.dependencies = dependencies.clone();
         ctrl.state = ServiceState::Down;
         for dep in &dependencies {
-            if let Some(d) = state.services.get_mut(dep) {
+            let dep_primary = state.resolve(dep).clone();
+            if let Some(d) = state.services.get_mut(&dep_primary) {
                 d.dependents.push(name.clone());
             }
         }
@@ -413,7 +444,7 @@ impl ServiceContainer {
         // flag promises. Skip the push in that mode so only the real,
         // synchronous `drive_starts` loop ever starts a service.
         if !msc_real_start_enabled() && matches!(mode, Mode::Active | Mode::Passive) {
-            if can_start(&state.services, &name) {
+            if can_start(&state, &name) {
                 state.task_queue.push_back(Task::Start(id));
                 self.pool_cv.notify_one();
             }
@@ -421,15 +452,22 @@ impl ServiceContainer {
         Ok(id)
     }
 
-    /// Return a snapshot of a controller's state by name.
+    /// Return a snapshot of a controller's state by name (alias-aware).
     pub fn get_state(&self, name: &Arc<ServiceName>) -> Option<ServiceState> {
         let state = self.inner.lock().unwrap_or_else(|e| e.into_inner());
-        state.services.get(name).map(|c| c.state)
+        state.services.get(state.resolve(name)).map(|c| c.state)
     }
 
     pub fn get_id(&self, name: &Arc<ServiceName>) -> Option<u64> {
         let state = self.inner.lock().unwrap_or_else(|e| e.into_inner());
-        state.services.get(name).map(|c| c.id)
+        state.services.get(state.resolve(name)).map(|c| c.id)
+    }
+
+    /// Register `alias` (a `provides(...)`/`addAliases(...)` name) as
+    /// resolving to the service installed under `primary`.
+    pub fn add_alias(&self, alias: Arc<ServiceName>, primary: Arc<ServiceName>) {
+        let mut state = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        state.aliases.insert(alias, primary);
     }
 
     /// Ask the scheduler to start a service whose mode is `OnDemand` or
@@ -437,17 +475,29 @@ impl ServiceContainer {
     /// `Never`-mode services ignore the request.
     pub fn demand(&self, name: &Arc<ServiceName>) {
         let mut state = self.inner.lock().unwrap_or_else(|e| e.into_inner());
-        if let Some(c) = state.services.get(name) {
-            if matches!(c.mode, Mode::Never) {
-                return;
+        let primary = state.resolve(name).clone();
+        let (id, cur_state) = match state.services.get_mut(&primary) {
+            Some(c) => {
+                if matches!(c.mode, Mode::Never) {
+                    return;
+                }
+                c.demanded = true;
+                (c.id, c.state)
             }
-            let id = c.id;
-            if matches!(c.state, ServiceState::Down | ServiceState::New)
-                && can_start(&state.services, name)
-            {
-                state.task_queue.push_back(Task::Start(id));
-                self.pool_cv.notify_one();
-            }
+            None => return,
+        };
+        // Bug 15 follow-on (same hazard as `add_service`): under
+        // CRATONVM_MSC_REAL_START never feed the background-worker queue —
+        // a worker's `run_start_local` would fake-complete the service
+        // without ever invoking its real `start()`. The `demanded` flag
+        // set above makes `take_ready_start` pick it up in the real
+        // drive loop instead (the caller drives).
+        if !msc_real_start_enabled()
+            && matches!(cur_state, ServiceState::Down | ServiceState::New)
+            && can_start(&state, name)
+        {
+            state.task_queue.push_back(Task::Start(id));
+            self.pool_cv.notify_one();
         }
     }
 
@@ -616,9 +666,14 @@ impl ServiceContainer {
         let mut state = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         let mut chosen: Option<(Arc<ServiceName>, u64)> = None;
         for (name, c) in state.services.iter() {
+            // Auto-start modes are always eligible; OnDemand/Lazy become
+            // eligible once something demanded them (see `demand()` — under
+            // CRATONVM_MSC_REAL_START this scan is their only start path).
+            let mode_eligible = matches!(c.mode, Mode::Active | Mode::Passive)
+                || (c.demanded && matches!(c.mode, Mode::OnDemand | Mode::Lazy));
             if matches!(c.state, ServiceState::Down | ServiceState::New)
-                && matches!(c.mode, Mode::Active | Mode::Passive)
-                && can_start(&state.services, name)
+                && mode_eligible
+                && can_start(&state, name)
             {
                 chosen = Some((name.clone(), c.id));
                 break;
@@ -691,16 +746,16 @@ fn would_cycle(
 }
 
 /// Check whether every dependency of `name` is currently `Up`.
-fn can_start(
-    services: &HashMap<Arc<ServiceName>, ServiceController>,
-    name: &Arc<ServiceName>,
-) -> bool {
-    let c = match services.get(name) {
+fn can_start(state: &ContainerState, name: &Arc<ServiceName>) -> bool {
+    let c = match state.services.get(state.resolve(name)) {
         Some(c) => c,
         None => return false,
     };
     for dep in &c.dependencies {
-        match services.get(dep) {
+        // Dependencies resolve through the alias index: a `requires(X)` is
+        // satisfied by a service that `provides(X)` under a different
+        // primary name (real MSC registration semantics).
+        match state.services.get(state.resolve(dep)) {
             Some(d) if matches!(d.state, ServiceState::Up) => {}
             _ => return false,
         }
@@ -726,7 +781,13 @@ fn schedule_dependents_of(state: &mut ContainerState, name: &Arc<ServiceName>, p
         if !matches!(mode, Mode::Active | Mode::Passive | Mode::Lazy) {
             continue;
         }
-        if can_start(&state.services, &dn) {
+        // Bug 15 follow-on: under CRATONVM_MSC_REAL_START the background
+        // workers must never pick up Start tasks (their `run_start_local` is
+        // bookkeeping-only and would fake the dependent straight to Up
+        // without running its real start()). The real drive loop rescans via
+        // `take_ready_start` after every completion, so eligible dependents
+        // are picked up there instead.
+        if !msc_real_start_enabled() && can_start(state, &dn) {
             state.task_queue.push_back(Task::Start(id));
             pool_cv.notify_one();
         }
@@ -854,6 +915,28 @@ fn worker_loop(container: Arc<ServiceContainer>) {
                 }
             }
         }
+    }
+}
+
+/// Render a `MethodCallFailed` as `Class: message` when it wraps a thrown
+/// Java exception — the raw `Debug` form is just an `ObjectRef` pointer,
+/// which made real service-start failures undiagnosable.
+fn describe_method_call_failure(ctx: &dyn NativeContext, e: &MethodCallFailed) -> String {
+    match e {
+        MethodCallFailed::ExceptionThrown(exc) => {
+            let cls = ctx
+                .class_name_of_id(ctx.class_id_of_object(*exc))
+                .unwrap_or_else(|| "<unknown class>".to_string());
+            let msg = match ctx.get_field_by_name(*exc, "detailMessage") {
+                Value::Object(Some(s)) => ctx.read_string(s),
+                _ => None,
+            };
+            match msg {
+                Some(m) => format!("{cls}: {m}"),
+                None => cls,
+            }
+        }
+        other => format!("{other:?}"),
     }
 }
 
@@ -1180,7 +1263,21 @@ fn native_service_controller_set_mode(
         };
         if let Some(n) = name_opt {
             container.demand(&n);
-            container.drain_tasks_locally();
+            if msc_real_start_enabled() {
+                // Bug 15 follow-on: `drain_tasks_locally` runs
+                // `run_start_local`, which fake-completes services without
+                // invoking their real `start()`. Route through the real
+                // drive loop instead (skip when a drive loop higher on this
+                // stack is already running — it rescans on its own).
+                let was_driving = DRIVING.with(|d| d.replace(true));
+                if !was_driving {
+                    let res = drive_starts(ctx, &container);
+                    DRIVING.with(|d| d.set(false));
+                    res?;
+                }
+            } else {
+                container.drain_tasks_locally();
+            }
         }
     }
     ctx.set_field(this, SC_FIELD_MODE, Value::Int(new_mode.ordinal()));
@@ -1198,16 +1295,271 @@ fn native_service_controller_get_state(
         _ => 0,
     };
     let container = global_container();
-    let state_ord = {
+    let state = {
         let state = container.inner.lock().unwrap_or_else(|e| e.into_inner());
         state
             .by_id
             .get(&id)
             .and_then(|n| state.services.get(n))
-            .map(|c| c.state.ordinal())
-            .unwrap_or_else(|| ServiceState::New.ordinal())
+            .map(|c| c.state)
+            .unwrap_or(ServiceState::New)
     };
-    Ok(Some(Value::Int(state_ord)))
+    // The declared descriptor returns the REAL `ServiceController$State` enum
+    // constant — bytecode callers compare it by reference against `getstatic`
+    // constants (`WritableValueImpl.accept` gates value injection on
+    // `state == State.STARTING` via `if_acmpne`), so returning an ordinal Int
+    // here silently failed every such comparison. Map our shadow states onto
+    // MSC's enum names (no NEW in MSC's State; FAILED is START_FAILED) and
+    // fetch the constant fresh via `valueOf` (no caching — a stored ObjectRef
+    // would go stale across a moving GC).
+    let msc_name = match state {
+        ServiceState::New | ServiceState::Down => "DOWN",
+        ServiceState::Starting => "STARTING",
+        ServiceState::Up => "UP",
+        ServiceState::Stopping => "STOPPING",
+        ServiceState::Failed => "START_FAILED",
+        ServiceState::Removed => "REMOVED",
+    };
+    let name_str = ctx.create_string(msc_name);
+    match ctx.invoke(
+        "org/jboss/msc/service/ServiceController$State",
+        "valueOf",
+        "(Ljava/lang/String;)Lorg/jboss/msc/service/ServiceController$State;",
+        &[Value::Object(Some(name_str))],
+    ) {
+        Ok(Some(v @ Value::Object(Some(_)))) => Ok(Some(v)),
+        // Enum class unavailable (mock/unit-test contexts): keep the legacy
+        // ordinal-Int answer rather than failing dispatch outright.
+        _ => Ok(Some(Value::Int(state.ordinal()))),
+    }
+}
+
+/// `ServiceController.getStartException()` — `BootstrapImpl$1`'s FAILED branch
+/// calls this to build the bootstrap-failure report; as a code-less interface
+/// method it previously died with `AbstractMethodError` (swallowed by the
+/// listener-exception guard, silently losing the real failure). Builds a real
+/// `StartException` from the shadow container's recorded failure message;
+/// null when the service has not failed.
+fn native_service_controller_get_start_exception(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    let this = obj_arg(args, 0)?;
+    let id = match ctx.get_field(this, SC_FIELD_ID) {
+        Value::Long(l) => l as u64,
+        _ => 0,
+    };
+    let container = global_container();
+    let failure = {
+        let state = container.inner.lock().unwrap_or_else(|e| e.into_inner());
+        state
+            .by_id
+            .get(&id)
+            .and_then(|n| state.services.get(n))
+            .and_then(|c| c.failure_message.clone())
+    };
+    let msg = match failure {
+        Some(m) => m,
+        None => return Ok(Some(Value::Object(None))),
+    };
+    let msg_obj = ctx.create_string(&msg);
+    match ctx.new_object_initialized(
+        "org/jboss/msc/service/StartException",
+        "(Ljava/lang/String;)V",
+        &[Value::Object(Some(msg_obj))],
+    ) {
+        Ok(Some(v @ Value::Object(Some(_)))) => Ok(Some(v)),
+        _ => Ok(Some(Value::Object(None))),
+    }
+}
+
+/// `LifecycleContext.getElapsedTime()J` — nanoseconds since the current
+/// lifecycle action began (BootstrapListener times boot with it). Another
+/// code-less interface method on our synthetic `StartContext`. Answered from
+/// the Rust-side `start_began` instant recorded when `drive_starts` invoked
+/// the service's `start()`.
+fn native_lifecycle_context_get_elapsed_time(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    let this = obj_arg(args, 0)?;
+    let id = match ctx.get_field(this, CTX_FIELD_CONTROLLER_ID) {
+        Value::Long(l) => l as u64,
+        _ => 0,
+    };
+    let began = {
+        let map = service_roots().lock().unwrap_or_else(|e| e.into_inner());
+        map.get(&id).and_then(|r| r.start_began)
+    };
+    let nanos = began
+        .map(|t| t.elapsed().as_nanos().min(i64::MAX as u128) as i64)
+        .unwrap_or(0);
+    Ok(Some(Value::Long(nanos)))
+}
+
+/// Map a shadow-container [`ServiceState`] to the `LifecycleEvent` enum
+/// constant name real MSC would replay for a listener added at that rest
+/// state (`ServiceControllerImpl.addListener` fires the current rest-state
+/// event immediately so late listeners never miss a completed transition).
+/// `None` for transient states (`New`/`Starting`/`Stopping`) — those notify
+/// later, when the transition completes.
+fn rest_state_event(state: ServiceState) -> Option<&'static str> {
+    match state {
+        ServiceState::Up => Some("UP"),
+        ServiceState::Failed => Some("FAILED"),
+        ServiceState::Down => Some("DOWN"),
+        ServiceState::Removed => Some("REMOVED"),
+        ServiceState::New | ServiceState::Starting | ServiceState::Stopping => None,
+    }
+}
+
+/// Fire `LifecycleListener.handleEvent(controller, event)` on the given
+/// listeners. Fetches the real `LifecycleEvent` enum constant fresh each time
+/// (no caching — enum constants live in the enum class's statics, and a
+/// cached copy here would go stale across a moving GC). Listener exceptions
+/// are logged and swallowed, matching real MSC (`invokeListener` catches
+/// `Throwable` so one broken listener cannot wedge the container).
+fn fire_lifecycle_event(
+    ctx: &mut dyn NativeContext,
+    id: u64,
+    event: &str,
+    listeners: &[ObjectRef],
+) {
+    if listeners.is_empty() {
+        return;
+    }
+    let mirror = {
+        let map = service_roots().lock().unwrap_or_else(|e| e.into_inner());
+        map.get(&id).and_then(|r| r.controller_mirror)
+    };
+    let mirror = match mirror {
+        Some(m) => m,
+        None => return,
+    };
+    // Sync the Java mirror's state field before listeners read it.
+    reflect_controller(ctx, mirror, global_container(), id);
+    let event_name = ctx.create_string(event);
+    let event_obj = match ctx.invoke(
+        "org/jboss/msc/service/LifecycleEvent",
+        "valueOf",
+        "(Ljava/lang/String;)Lorg/jboss/msc/service/LifecycleEvent;",
+        &[Value::Object(Some(event_name))],
+    ) {
+        Ok(Some(Value::Object(Some(e)))) => e,
+        other => {
+            tracing::warn!(
+                target: "jboss_msc",
+                "LifecycleEvent.valueOf({event}) unavailable — listeners not notified: {other:?}"
+            );
+            return;
+        }
+    };
+    for l in listeners {
+        if msc_dbg() {
+            eprintln!("[msc] fire {event} id={id} listener={:?}", l.as_ptr());
+        }
+        if let Err(e) = ctx.invoke_virtual(
+            *l,
+            "handleEvent",
+            "(Lorg/jboss/msc/service/ServiceController;Lorg/jboss/msc/service/LifecycleEvent;)V",
+            &[Value::Object(Some(mirror)), Value::Object(Some(event_obj))],
+        ) {
+            let detail = describe_method_call_failure(ctx, &e);
+            tracing::warn!(
+                target: "jboss_msc",
+                "LifecycleListener.handleEvent({event}) threw {detail} — ignored (MSC-faithful)"
+            );
+        }
+    }
+}
+
+/// Fire a lifecycle event to every listener currently registered for `id`.
+fn fire_lifecycle_event_all(ctx: &mut dyn NativeContext, id: u64, event: &str) {
+    let listeners: Vec<ObjectRef> = {
+        let map = service_roots().lock().unwrap_or_else(|e| e.into_inner());
+        map.get(&id).map(|r| r.listeners.clone()).unwrap_or_default()
+    };
+    fire_lifecycle_event(ctx, id, event, &listeners);
+}
+
+/// `ServiceController.addListener(LifecycleListener)` — register the listener
+/// on the shadow container and, when the controller is already at a rest
+/// state, replay that state's event immediately (real MSC semantics;
+/// `BootstrapImpl.internalBootstrap`'s bootstrap-completion chain hangs
+/// forever without the replay). Previously unimplemented: the interface
+/// method has no bytecode, so any call died with `AbstractMethodError`.
+fn native_service_controller_add_listener(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    let this = obj_arg(args, 0)?;
+    let listener = match args.get(1).copied() {
+        Some(Value::Object(Some(l))) => l,
+        _ => return Ok(None),
+    };
+    let id = match ctx.get_field(this, SC_FIELD_ID) {
+        Value::Long(l) => l as u64,
+        _ => 0,
+    };
+    {
+        let mut map = service_roots().lock().unwrap_or_else(|e| e.into_inner());
+        map.entry(id).or_default().listeners.push(listener);
+    }
+    let state = {
+        let container = global_container();
+        let state = container.inner.lock().unwrap_or_else(|e| e.into_inner());
+        state
+            .by_id
+            .get(&id)
+            .and_then(|n| state.services.get(n))
+            .map(|c| c.state)
+    };
+    if msc_dbg() {
+        eprintln!("[msc] addListener id={id} state={state:?}");
+    }
+    if let Some(event) = state.and_then(rest_state_event) {
+        // Replay only to the newly-added listener.
+        fire_lifecycle_event(ctx, id, event, &[listener]);
+    }
+    Ok(None)
+}
+
+/// `ServiceController.removeListener(LifecycleListener)` — drop by identity.
+/// The GC remap keeps stored refs current, so pointer equality with the
+/// (equally current) argument is the right identity test.
+fn native_service_controller_remove_listener(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    let this = obj_arg(args, 0)?;
+    let listener = match args.get(1).copied() {
+        Some(Value::Object(Some(l))) => l,
+        _ => return Ok(None),
+    };
+    let id = match ctx.get_field(this, SC_FIELD_ID) {
+        Value::Long(l) => l as u64,
+        _ => 0,
+    };
+    let mut map = service_roots().lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(r) = map.get_mut(&id) {
+        r.listeners.retain(|l| l.as_ptr() != listener.as_ptr());
+    }
+    Ok(None)
+}
+
+/// `StabilityMonitor.addController/removeController` — real MSC downcasts the
+/// argument to its concrete `ServiceControllerImpl` to hook per-controller
+/// bookkeeping (`StabilityMonitor.java:115`), which `ClassCastException`s on
+/// our synthetic `ServiceController` mirror (first thrown from
+/// `ApplicationServerService.start` → boot marked jboss.as FAILED). The
+/// shadow container already tracks every installed service globally and the
+/// `awaitStability` natives answer from it, so per-monitor membership is
+/// redundant here — accept and ignore.
+fn native_stability_monitor_controller_noop(
+    _ctx: &mut dyn NativeContext,
+    _args: &[Value],
+) -> MethodCallResult {
+    Ok(None)
 }
 
 fn native_start_context_asynchronous(
@@ -1230,6 +1582,20 @@ fn native_start_context_complete(ctx: &mut dyn NativeContext, args: &[Value]) ->
         _ => 0,
     };
     global_container().complete_async(id);
+    fire_lifecycle_event_all(ctx, id, "UP");
+    // An async completion makes dependents start-eligible. Under
+    // CRATONVM_MSC_REAL_START the background-worker queue is bypassed
+    // entirely (see add_service), so drive them here — unless a drive loop
+    // higher on this stack is already running and will rescan anyway.
+    if msc_real_start_enabled() {
+        let was_driving = DRIVING.with(|d| d.replace(true));
+        if !was_driving {
+            let container = global_container().clone();
+            let res = drive_starts(ctx, &container);
+            DRIVING.with(|d| d.set(false));
+            res?;
+        }
+    }
     Ok(None)
 }
 
@@ -1767,7 +2133,7 @@ pub fn bind_controller_id(ctx: &dyn NativeContext, obj: ObjectRef, id: u64) {
 
 /// GC-visible references held per controller id. Every `Some` field is a root
 /// and a post-move remap target.
-#[derive(Default, Clone, Copy)]
+#[derive(Default, Clone)]
 struct ServiceRoots {
     /// The Java `org.jboss.msc.Service` instance to drive `start`/`stop` on.
     service: Option<ObjectRef>,
@@ -1781,6 +2147,26 @@ struct ServiceRoots {
     /// The synthetic `StartContext` (kept live while the service is `Starting`
     /// / async-pending so a later `complete()` can still reach it).
     start_context: Option<ObjectRef>,
+    /// `LifecycleListener`s registered via `ServiceController.addListener`.
+    /// Real Java objects held only by this side-table — GC roots and post-move
+    /// remap targets like every other field here. Fired on Up/Failed
+    /// transitions from the drive loop, and replayed once on `addListener`
+    /// when the controller is already at a rest state (real MSC semantics —
+    /// `BootstrapImpl.internalBootstrap`'s listener chain depends on both).
+    listeners: Vec<ObjectRef>,
+    /// When the in-flight lifecycle action (`start()`) began — backs
+    /// `LifecycleContext.getElapsedTime()J` (BootstrapListener calls it while
+    /// timing boot). Kept Rust-side so the synthetic `StartContext` layout
+    /// (`CTX_NUM_SLOTS`, matched to `synthetic_stub_fields`) stays unchanged.
+    start_began: Option<std::time::Instant>,
+    /// Legacy `addDependency(name, type, Injector)` wiring captured from the
+    /// builder at install: `(dependency ServiceRegistrationImpl, Injector)`
+    /// pairs. Real MSC's StartTask resolves each dependency's value and
+    /// calls `Injector.inject(value)` BEFORE `start()` runs (WildFly's
+    /// `ServerService` reads `InjectedValue.getValue()` at start:272);
+    /// `drive_starts` mirrors that via [`inject_dependency_values`]. Both
+    /// elements are GC roots / remap targets.
+    dep_injections: Vec<(ObjectRef, ObjectRef)>,
 }
 
 /// Process-global side-table: controller id → held Java refs.
@@ -1805,6 +2191,11 @@ pub fn gc_scan_msc_service_roots(out: &mut Vec<ObjectRef>) {
         .flatten()
         {
             out.push(o);
+        }
+        out.extend(r.listeners.iter().copied());
+        for (reg, inj) in r.dep_injections.iter() {
+            out.push(*reg);
+            out.push(*inj);
         }
     }
 }
@@ -1831,6 +2222,22 @@ pub fn gc_update_msc_service_refs(pointer_map: &std::collections::HashMap<usize,
         remap(&mut r.controller_mirror);
         remap(&mut r.child_target);
         remap(&mut r.start_context);
+        for l in r.listeners.iter_mut() {
+            let old_addr = l.as_ptr() as usize;
+            if let Some(&new_addr) = pointer_map.get(&old_addr) {
+                debug_assert!(new_addr != 0, "GC pointer map contains null address");
+                *l = unsafe { ObjectRef::from_raw(new_addr as *mut u8) };
+            }
+        }
+        for (reg, inj) in r.dep_injections.iter_mut() {
+            for o in [reg, inj] {
+                let old_addr = o.as_ptr() as usize;
+                if let Some(&new_addr) = pointer_map.get(&old_addr) {
+                    debug_assert!(new_addr != 0, "GC pointer map contains null address");
+                    *o = unsafe { ObjectRef::from_raw(new_addr as *mut u8) };
+                }
+            }
+        }
     }
 }
 
@@ -1973,6 +2380,307 @@ fn read_dep_names(
     out
 }
 
+/// Bug 15 follow-up (handoff P3 "value injection not wired"): make real MSC
+/// value plumbing work under the intercepted `install()`.
+///
+/// Real `install()` calls `ServiceRegistrationImpl.set(controller, injector)`
+/// for every provided name, which our interception skips entirely — leaving
+/// (a) each `WritableValueImpl.controller` null, so the first
+/// `Consumer.accept(value)` a service makes inside `start()` throws
+/// `IllegalStateException("Outside of Service lifecycle method")` (this
+/// killed all the `jboss.server.path.*` services), and (b) each per-name
+/// `ServiceRegistrationImpl.injector` null, so `requires()`-side
+/// `ReadableValueImpl.get()` → `registration.getValue()` throws
+/// `"Service is not installed"` even after the provider ran.
+///
+/// `requires()` and `provides()` resolve names through the SAME real
+/// `ServiceTargetImpl.getOrCreateRegistration` map (real bytecode that still
+/// runs), so wiring `controller` + `injector` here reconnects both ends
+/// exactly the way real install() does. The mirror satisfies `accept()`'s
+/// `getState() == State.STARTING` reference-compare because our `getState`
+/// native returns the real enum constant.
+/// Bug 15 follow-up: `ServiceRegistrationImpl.getValue()` — the requires()-
+/// supplier read path (`ReadableValueImpl.get` → `Dependency.getValue`).
+/// Modern providers reach it through the injector wired in
+/// [`wire_provides_injectors`]; LEGACY services (2-arg
+/// `ServiceTarget.addService(name, Service)` — e.g. WildFly's management
+/// executor `ServerService$ServerExecutorService`) have no provides()
+/// consumer at all: their value is the legacy `Service.getValue()`. Real MSC
+/// resolves those through `registration.instance` (a real
+/// `ServiceControllerImpl`) which our install() interception never populates,
+/// so the real bytecode threw `IllegalStateException("Service is not
+/// installed")` even though the provider was Up (killed
+/// `ServerService.start` → `AbstractControllerService.getExecutorService`).
+fn native_service_registration_get_value(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    let this = obj_arg(args, 0)?;
+    // 1. Injector wired (modern provides-consumer path): defer to the real
+    //    WritableValueImpl bytecode (returns the value or throws the real
+    //    "Service unavailable" ISE).
+    if let Value::Object(Some(injector)) = ctx.get_field_by_name(this, "injector") {
+        return ctx.invoke_virtual(injector, "getValue", "()Ljava/lang/Object;", &[]);
+    }
+    // 2. Legacy path: resolve the registration's name against the shadow
+    //    container and return the provider's own legacy getValue().
+    let name = match ctx.get_field_by_name(this, "name") {
+        Value::Object(Some(sn)) => read_service_name_robust(ctx, sn),
+        _ => None,
+    };
+    let service = name.as_ref().and_then(|n| {
+        global_container().get_id(n).and_then(|id| {
+            service_roots()
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .get(&id)
+                .and_then(|r| r.service)
+        })
+    });
+    match service {
+        Some(svc) => ctx.invoke_virtual(svc, "getValue", "()Ljava/lang/Object;", &[]),
+        None => {
+            let msg_obj = ctx.create_string("Service is not installed");
+            match ctx.new_object_initialized(
+                "java/lang/IllegalStateException",
+                "(Ljava/lang/String;)V",
+                &[Value::Object(Some(msg_obj))],
+            ) {
+                Ok(Some(Value::Object(Some(exc)))) => Err(MethodCallFailed::ExceptionThrown(exc)),
+                _ => Ok(Some(Value::Object(None))),
+            }
+        }
+    }
+}
+
+/// `ServiceController.getValue()` on the synthetic mirror — legacy API used
+/// by code holding a controller (real impl reads its primary registration).
+/// Answer with the shadow service's legacy `getValue()`; null when the
+/// service instance is absent or modern (no legacy getValue).
+fn native_service_controller_get_value(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    let this = obj_arg(args, 0)?;
+    let id = match ctx.get_field(this, SC_FIELD_ID) {
+        Value::Long(l) => l as u64,
+        _ => 0,
+    };
+    let service = {
+        let map = service_roots().lock().unwrap_or_else(|e| e.into_inner());
+        map.get(&id).and_then(|r| r.service)
+    };
+    match service {
+        Some(svc) => match ctx.invoke_virtual(svc, "getValue", "()Ljava/lang/Object;", &[]) {
+            Ok(v) => Ok(v),
+            // Modern org.jboss.msc.Service has no getValue — treat as no value.
+            Err(_) => Ok(Some(Value::Object(None))),
+        },
+        None => Ok(Some(Value::Object(None))),
+    }
+}
+
+/// Capture the builder's legacy `addDependency(name, type, Injector)` wiring:
+/// for every `requires` entry with a non-empty `injectorList`, store
+/// `(dependency registration, injector)` pairs in the service's roots so
+/// [`inject_dependency_values`] can perform real MSC's inject-before-start.
+fn capture_dependency_injections(ctx: &mut dyn NativeContext, builder: ObjectRef, id: u64) {
+    let requires = match ctx.get_field_by_name(builder, "requires") {
+        Value::Object(Some(m)) => m,
+        _ => return,
+    };
+    let values = match ctx.invoke_virtual(requires, "values", "()Ljava/util/Collection;", &[]) {
+        Ok(Some(Value::Object(Some(v)))) => v,
+        _ => return,
+    };
+    let arr = match ctx.invoke_virtual(values, "toArray", "()[Ljava/lang/Object;", &[]) {
+        Ok(Some(Value::Object(Some(a)))) => a,
+        _ => return,
+    };
+    let n = ctx.array_length(arr);
+    for i in 0..n {
+        let dep = match ctx.get_array_element(arr, i) {
+            Value::Object(Some(d)) => d,
+            _ => continue,
+        };
+        let reg = match ctx.get_field_by_name(dep, "registration") {
+            Value::Object(Some(r)) => r,
+            _ => continue,
+        };
+        let inj_list = match ctx.get_field_by_name(dep, "injectorList") {
+            Value::Object(Some(l)) => l,
+            _ => continue,
+        };
+        let inj_arr = match ctx.invoke_virtual(inj_list, "toArray", "()[Ljava/lang/Object;", &[]) {
+            Ok(Some(Value::Object(Some(a)))) => a,
+            _ => continue,
+        };
+        let m = ctx.array_length(inj_arr);
+        for j in 0..m {
+            if let Value::Object(Some(inj)) = ctx.get_array_element(inj_arr, j) {
+                service_roots()
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .entry(id)
+                    .or_default()
+                    .dep_injections
+                    .push((reg, inj));
+            }
+        }
+    }
+}
+
+/// Real MSC's StartTask resolves every legacy-injected dependency's value
+/// and calls `Injector.inject(value)` BEFORE the service's `start()` runs.
+/// The registration's `getValue` dispatches to our
+/// [`native_service_registration_get_value`], which handles both modern
+/// (injector-wired) and legacy (`Service.getValue`) providers. An injection
+/// failure is a start failure (returned as `Err`, handled by the caller's
+/// existing failure arm).
+fn inject_dependency_values(ctx: &mut dyn NativeContext, id: u64) -> Result<(), MethodCallFailed> {
+    let pairs: Vec<(ObjectRef, ObjectRef)> = {
+        let map = service_roots().lock().unwrap_or_else(|e| e.into_inner());
+        map.get(&id).map(|r| r.dep_injections.clone()).unwrap_or_default()
+    };
+    for (idx, _) in pairs.iter().enumerate() {
+        // Re-read the (GC-remapped) pair on every iteration — each
+        // invoke_virtual below can move objects captured earlier.
+        let (reg, inj) = {
+            let map = service_roots().lock().unwrap_or_else(|e| e.into_inner());
+            match map.get(&id).and_then(|r| r.dep_injections.get(idx).copied()) {
+                Some(p) => p,
+                None => continue,
+            }
+        };
+        let value = ctx.invoke_virtual(reg, "getValue", "()Ljava/lang/Object;", &[])?;
+        let value = value.unwrap_or(Value::Object(None));
+        ctx.invoke_virtual(inj, "inject", "(Ljava/lang/Object;)V", &[value])?;
+    }
+    Ok(())
+}
+
+/// Read the builder's `provides` map keys as interned service names.
+fn read_provides_names(ctx: &mut dyn NativeContext, builder: ObjectRef) -> Vec<Arc<ServiceName>> {
+    let provides = match ctx.get_field_by_name(builder, "provides") {
+        Value::Object(Some(m)) => m,
+        _ => return Vec::new(),
+    };
+    let set = match ctx.invoke_virtual(provides, "keySet", "()Ljava/util/Set;", &[]) {
+        Ok(Some(Value::Object(Some(s)))) => s,
+        _ => return Vec::new(),
+    };
+    let arr = match ctx.invoke_virtual(set, "toArray", "()[Ljava/lang/Object;", &[]) {
+        Ok(Some(Value::Object(Some(a)))) => a,
+        _ => return Vec::new(),
+    };
+    let n = ctx.array_length(arr);
+    let mut out = Vec::with_capacity(n);
+    for i in 0..n {
+        if let Value::Object(Some(sn)) = ctx.get_array_element(arr, i) {
+            if let Some(name) = read_service_name_robust(ctx, sn) {
+                out.push(name);
+            }
+        }
+    }
+    out
+}
+
+fn wire_provides_injectors(
+    ctx: &mut dyn NativeContext,
+    builder: ObjectRef,
+    id: u64,
+    primary: &Arc<ServiceName>,
+) {
+    // `addAliases(...)` names resolve to this service too.
+    if let Value::Object(Some(alias_set)) = ctx.get_field_by_name(builder, "aliases") {
+        if let Ok(Some(Value::Object(Some(arr)))) =
+            ctx.invoke_virtual(alias_set, "toArray", "()[Ljava/lang/Object;", &[])
+        {
+            let n = ctx.array_length(arr);
+            for i in 0..n {
+                if let Value::Object(Some(sn)) = ctx.get_array_element(arr, i) {
+                    if let Some(alias) = read_service_name_robust(ctx, sn) {
+                        if alias != *primary {
+                            global_container().add_alias(alias, primary.clone());
+                        }
+                    }
+                }
+            }
+        }
+    }
+    let provides = match ctx.get_field_by_name(builder, "provides") {
+        Value::Object(Some(m)) => m,
+        _ => return,
+    };
+    let target = match ctx.get_field_by_name(builder, "serviceTarget") {
+        Value::Object(Some(t)) => Some(t),
+        _ => None,
+    };
+    let set = match ctx.invoke_virtual(provides, "entrySet", "()Ljava/util/Set;", &[]) {
+        Ok(Some(Value::Object(Some(s)))) => s,
+        _ => return,
+    };
+    let arr = match ctx.invoke_virtual(set, "toArray", "()[Ljava/lang/Object;", &[]) {
+        Ok(Some(Value::Object(Some(a)))) => a,
+        _ => return,
+    };
+    let n = ctx.array_length(arr);
+    for i in 0..n {
+        let entry = match ctx.get_array_element(arr, i) {
+            Value::Object(Some(e)) => e,
+            _ => continue,
+        };
+        let key = match ctx.invoke_virtual(entry, "getKey", "()Ljava/lang/Object;", &[]) {
+            Ok(Some(Value::Object(Some(k)))) => k,
+            _ => continue,
+        };
+        // Every provided name that differs from the primary serviceId is an
+        // alias — dependency resolution (`can_start`) and lookups
+        // (`getService`) must find this service under it, matching real
+        // MSC's per-registration semantics.
+        if let Some(provided) = read_service_name_robust(ctx, key) {
+            if provided != *primary {
+                global_container().add_alias(provided, primary.clone());
+            }
+        }
+        let writable = match ctx.invoke_virtual(entry, "getValue", "()Ljava/lang/Object;", &[]) {
+            Ok(Some(Value::Object(Some(w)))) => w,
+            _ => continue,
+        };
+        // Re-read the mirror from the GC-remapped side-table on every use —
+        // the invoke_virtual calls above can trigger a moving collection, and
+        // a stale local here is exactly the native stale-local root family.
+        let mirror = {
+            let map = service_roots().lock().unwrap_or_else(|e| e.into_inner());
+            match map.get(&id).and_then(|r| r.controller_mirror) {
+                Some(m) => m,
+                None => return,
+            }
+        };
+        ctx.set_field_by_name(writable, "controller", Value::Object(Some(mirror)));
+        if let Some(t) = target {
+            match ctx.invoke_virtual(
+                t,
+                "getOrCreateRegistration",
+                "(Lorg/jboss/msc/service/ServiceName;)Lorg/jboss/msc/service/ServiceRegistrationImpl;",
+                &[Value::Object(Some(key))],
+            ) {
+                Ok(Some(Value::Object(Some(reg)))) => {
+                    ctx.set_field_by_name(reg, "injector", Value::Object(Some(writable)));
+                }
+                other => {
+                    if msc_dbg() {
+                        eprintln!(
+                            "[msc] wire_provides: getOrCreateRegistration failed (entry {i}): ok={}",
+                            other.is_ok()
+                        );
+                    }
+                }
+            }
+        }
+    }
+}
+
 /// Allocate a synthetic `StartContext` carrying `controller_id`, and root it.
 fn build_start_context(ctx: &mut dyn NativeContext, id: u64) -> ObjectRef {
     let sctx = alloc_concurrent_synthetic(ctx, "org/jboss/msc/service/StartContext", CTX_NUM_SLOTS);
@@ -2036,26 +2744,51 @@ fn drive_starts(
                     eprintln!("[msc] start id={id}: no service instance, marking Up");
                 }
                 container.finish_start(id);
+                fire_lifecycle_event_all(ctx, id, "UP");
                 continue;
             }
         };
         let sctx = build_start_context(ctx, id);
+        {
+            let mut map = service_roots().lock().unwrap_or_else(|e| e.into_inner());
+            map.entry(id).or_default().start_began = Some(std::time::Instant::now());
+        }
         if msc_dbg() {
             eprintln!("[msc] -> start id={id}");
         }
+        // Real MSC injects legacy dependency values BEFORE start(); an
+        // injection failure is a start failure (same handling arm below).
         // invoke_virtual prepends the receiver; `args` is parameters ONLY.
-        let res = ctx.invoke_virtual(
-            svc,
-            "start",
-            "(Lorg/jboss/msc/service/StartContext;)V",
-            &[Value::Object(Some(sctx))],
-        );
+        let res = match inject_dependency_values(ctx, id) {
+            Ok(()) => ctx.invoke_virtual(
+                svc,
+                "start",
+                "(Lorg/jboss/msc/service/StartContext;)V",
+                &[Value::Object(Some(sctx))],
+            ),
+            Err(e) => Err(e),
+        };
         match res {
             Ok(_) => {
                 if msc_dbg() {
                     eprintln!("[msc] <- start id={id} OK");
                 }
                 container.finish_start(id);
+                // finish_start leaves an async-pending service at `Starting`
+                // (its later `StartContext.complete()` fires UP instead) —
+                // only notify listeners when the transition actually landed.
+                let now_up = {
+                    let state = container.inner.lock().unwrap_or_else(|e| e.into_inner());
+                    state
+                        .by_id
+                        .get(&id)
+                        .and_then(|n| state.services.get(n))
+                        .map(|c| matches!(c.state, ServiceState::Up))
+                        .unwrap_or(false)
+                };
+                if now_up {
+                    fire_lifecycle_event_all(ctx, id, "UP");
+                }
             }
             Err(e) => {
                 // Always surface the failure (not just under CRATONVM_MSC_DBG):
@@ -2069,16 +2802,26 @@ fn drive_starts(
                         .map(|n| n.canonical().to_string())
                         .unwrap_or_else(|| format!("<id {id}>"))
                 };
-                container.record_failure(id, format!("service start failed: {e:?}"));
+                // Decode a thrown Java exception to class + message — the raw
+                // Debug form is just an ObjectRef pointer, which made real
+                // start() failures undiagnosable (see
+                // wildfly-domain-managed-servers-timeout.md, 2026-07-06).
+                let detail = describe_method_call_failure(ctx, &e);
+                container.record_failure(id, format!("service start failed: {detail}"));
                 match e {
-                    MethodCallFailed::ExceptionThrown(_) => {
+                    MethodCallFailed::ExceptionThrown(exc) => {
                         // Catchable Java exception: MSC-faithful — mark Failed
                         // (done above) and keep draining other services.
                         tracing::error!(
                             target: "jboss_msc",
                             service = %name,
-                            "MSC service start() threw — marked FAILED, boot continues: {e:?}"
+                            "MSC service start() threw {detail} — marked FAILED, boot continues"
                         );
+                        if msc_dbg() {
+                            // Full Java stack trace (incl. cause chain) to stderr.
+                            let _ = ctx.invoke_virtual(exc, "printStackTrace", "()V", &[]);
+                        }
+                        fire_lifecycle_event_all(ctx, id, "FAILED");
                     }
                     MethodCallFailed::InternalError(_) => {
                         // Uncatchable VM-level error: do not swallow. Surface it
@@ -2119,20 +2862,33 @@ fn native_service_builder_install(ctx: &mut dyn NativeContext, args: &[Value]) -
         _ => None,
     };
     let name = sn_obj.and_then(|o| read_service_name_robust(ctx, o));
+    // Anonymous install (`ServiceTarget.addService()` with no name): the
+    // service is addressable only via its `provides(...)` names. Real MSC
+    // installs these normally; bailing here silently dropped whole services —
+    // WildFly's ControlledProcessStateService (which provides
+    // `org.wildfly.management.process-state-notifier`) was lost this way,
+    // permanently dep-blocking `console-availability` → `server-controller`.
+    // Promote the first provided name to primary (the rest become aliases in
+    // `wire_provides_injectors`); a service with neither name nor provides
+    // still gets a synthetic anonymous name so its start() side-effects run.
     let name = match name {
         Some(n) => n,
         None => {
-            if msc_dbg() {
-                let bcls = obj_class_name(ctx, builder);
-                let sid = match sn_obj {
-                    Some(o) => format!("ServiceName<{}>", obj_class_name(ctx, o)),
-                    None => "null".to_string(),
-                };
-                eprintln!(
-                    "[msc] install: unreadable serviceId (builder={bcls}, serviceId={sid}) — returning null controller"
-                );
+            let provided = read_provides_names(ctx, builder);
+            match provided.into_iter().next() {
+                Some(n) => n,
+                None => {
+                    static ANON: AtomicU64 = AtomicU64::new(1);
+                    let n = ANON.fetch_add(1, Ordering::Relaxed);
+                    if msc_dbg() {
+                        let bcls = obj_class_name(ctx, builder);
+                        eprintln!(
+                            "[msc] install: anonymous no-provides builder ({bcls}) — synthesizing cratonvm.anonymous.{n}"
+                        );
+                    }
+                    ServiceName::parse(&format!("cratonvm.anonymous.{n}"))
+                }
             }
-            return Ok(Some(Value::Object(None)));
         }
     };
     let service_ref = match ctx.get_field_by_name(builder, "service") {
@@ -2173,11 +2929,14 @@ fn native_service_builder_install(ctx: &mut dyn NativeContext, args: &[Value]) -
 
     // Build the synthetic ServiceController mirror (returned to the caller and
     // from StartContext.getController()).
+    // Anonymous installs have no serviceId object — mirror the resolved
+    // primary name instead so getName()/diagnostics stay meaningful.
+    // Allocated BEFORE the mirror: a GC triggered by this allocation would
+    // otherwise stale the raw `ctrl_obj` local (it is only rooted later).
+    let sn_for_mirror = sn_obj.unwrap_or_else(|| alloc_java_service_name(ctx, &name));
     let ctrl_obj =
         alloc_concurrent_synthetic(ctx, "org/jboss/msc/service/ServiceController", SC_NUM_SLOTS);
-    if let Some(sn) = sn_obj {
-        ctx.set_field(ctrl_obj, SC_FIELD_NAME, Value::Object(Some(sn)));
-    }
+    ctx.set_field(ctrl_obj, SC_FIELD_NAME, Value::Object(Some(sn_for_mirror)));
     ctx.set_field(ctrl_obj, SC_FIELD_MODE, Value::Int(mode.ordinal()));
     ctx.set_field(
         ctrl_obj,
@@ -2197,12 +2956,19 @@ fn native_service_builder_install(ctx: &mut dyn NativeContext, args: &[Value]) -
         r.child_target = child_target;
     }
 
+    // P3 value plumbing: connect this builder's provides-consumers and the
+    // per-name registrations real requires()-suppliers read from, and index
+    // provided/alias names for dependency resolution.
+    wire_provides_injectors(ctx, builder, id, &name);
+    // Legacy addDependency(…, Injector) wiring — injected before start().
+    capture_dependency_injections(ctx, builder, id);
+
     if msc_dbg() {
         eprintln!(
-            "[msc] install id={id} name={} mode={mode:?} has_service={} deps={}",
+            "[msc] install id={id} name={} mode={mode:?} has_service={} deps={:?}",
             name.canonical(),
             service_ref.is_some(),
-            deps.len()
+            deps.iter().map(|d| d.canonical()).collect::<Vec<_>>()
         );
     }
 
@@ -2273,6 +3039,7 @@ fn native_start_context_failed(ctx: &mut dyn NativeContext, args: &[Value]) -> M
         _ => 0,
     };
     global_container().record_failure(id, "service start failed (StartContext.failed)".to_string());
+    fire_lifecycle_event_all(ctx, id, "FAILED");
     Ok(None)
 }
 
@@ -2500,6 +3267,15 @@ pub fn register_jboss_msc_natives(r: &mut NativeMethodRegistry) {
         native_start_context_asynchronous,
     );
     r.register(start_ctx, "complete", "()V", native_start_context_complete);
+    // LifecycleContext.getElapsedTime()J — inherited (code-less) interface
+    // method; BootstrapListener times boot with it and died with
+    // AbstractMethodError on our synthetic StartContext.
+    r.register(
+        start_ctx,
+        "getElapsedTime",
+        "()J",
+        native_lifecycle_context_get_elapsed_time,
+    );
 
     // R63: silence the boot-banner NPE inside SCI<clinit>. The bytecode
     // calls `ServiceLogger_$logger.greeting(String)` via invokeinterface
@@ -2777,18 +3553,90 @@ pub fn register_jboss_msc_natives(r: &mut NativeMethodRegistry) {
         // (what WildFly's BootstrapImpl actually calls) just forward via
         // invokeinterface to their real ServiceContainerImpl delegate, so hooking
         // the concrete class here is what dispatch lands on.
-        let sci = "org/jboss/msc/service/ServiceContainerImpl";
+        // Registered on the concrete impl (real container objects), on the
+        // synthetic mirror's own class name (`getServiceContainer()` hands
+        // back a synthetic "ServiceContainer"), and on the ServiceRegistry
+        // super-interface (where dispatch on the synthetic mirror resolves
+        // the code-less method — BootstrapImpl$1's UP branch hit
+        // `AbstractMethodError: ServiceRegistry.getRequiredService`). The
+        // natives are receiver-agnostic (answer from the global shadow
+        // container), so all three registrations share one implementation.
+        for cls in [
+            "org/jboss/msc/service/ServiceContainerImpl",
+            "org/jboss/msc/service/ServiceContainer",
+            "org/jboss/msc/service/ServiceRegistry",
+        ] {
+            r.register(
+                cls,
+                "getService",
+                "(Lorg/jboss/msc/service/ServiceName;)Lorg/jboss/msc/service/ServiceController;",
+                native_service_container_get_service,
+            );
+            r.register(
+                cls,
+                "getRequiredService",
+                "(Lorg/jboss/msc/service/ServiceName;)Lorg/jboss/msc/service/ServiceController;",
+                native_service_container_get_required_service,
+            );
+        }
+        // Bug 15 follow-ups (wildfly-domain-managed-servers-timeout.md,
+        // 2026-07-07): lifecycle listeners on the synthetic controller mirror.
+        // `ServiceController.addListener/removeListener` are abstract interface
+        // methods with no native backing — any caller died with
+        // `AbstractMethodError` (BootstrapImpl.internalBootstrap:113 was the
+        // boot-path victim).
         r.register(
-            sci,
-            "getService",
-            "(Lorg/jboss/msc/service/ServiceName;)Lorg/jboss/msc/service/ServiceController;",
-            native_service_container_get_service,
+            ctrl,
+            "addListener",
+            "(Lorg/jboss/msc/service/LifecycleListener;)V",
+            native_service_controller_add_listener,
         );
         r.register(
-            sci,
-            "getRequiredService",
-            "(Lorg/jboss/msc/service/ServiceName;)Lorg/jboss/msc/service/ServiceController;",
-            native_service_container_get_required_service,
+            ctrl,
+            "removeListener",
+            "(Lorg/jboss/msc/service/LifecycleListener;)V",
+            native_service_controller_remove_listener,
+        );
+        // BootstrapImpl$1's FAILED branch reports the boot failure via
+        // controller.getStartException() — code-less interface method.
+        r.register(
+            ctrl,
+            "getStartException",
+            "()Lorg/jboss/msc/service/StartException;",
+            native_service_controller_get_start_exception,
+        );
+        r.register(
+            ctrl,
+            "getValue",
+            "()Ljava/lang/Object;",
+            native_service_controller_get_value,
+        );
+        // requires()-supplier read path — must resolve BOTH modern
+        // (injector-wired) and legacy (Service.getValue) providers against
+        // the shadow container.
+        r.register(
+            "org/jboss/msc/service/ServiceRegistrationImpl",
+            "getValue",
+            "()Ljava/lang/Object;",
+            native_service_registration_get_value,
+        );
+        // Real `StabilityMonitor.addController/removeController` downcast to
+        // the concrete `ServiceControllerImpl` — ClassCastException on our
+        // mirror (thrown from ApplicationServerService.start:140). Membership
+        // is redundant: the awaitStability natives (registered above,
+        // un-gated) already answer from the global shadow container.
+        let stability_monitor = "org/jboss/msc/service/StabilityMonitor";
+        r.register(
+            stability_monitor,
+            "addController",
+            "(Lorg/jboss/msc/service/ServiceController;)V",
+            native_stability_monitor_controller_noop,
+        );
+        r.register(
+            stability_monitor,
+            "removeController",
+            "(Lorg/jboss/msc/service/ServiceController;)V",
+            native_stability_monitor_controller_noop,
         );
     }
 
