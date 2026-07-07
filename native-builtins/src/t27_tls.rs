@@ -4448,7 +4448,78 @@ fn engine_begin(state: &mut EngineState) -> Result<(), String> {
                     // Request the client cert for either NEED (required) or WANT
                     // (optional) client auth — otherwise an "optional" server
                     // never asks and `peer_certificates()` stays empty.
-                    let request = state.need_client_auth || state.want_client_auth;
+                    //
+                    // FIX (tomcat-clientauth-engine-config): Tomcat's
+                    // SSLHostConfig/SSLAuthenticator machinery deliberately does
+                    // NOT toggle need/want client auth up front for the common
+                    // "certificateVerification=optional, auth decided per-request"
+                    // configuration this suite exercises (`TestClientCert`/
+                    // `TestCustomSslTrustManager`) — instead it always requests
+                    // the cert (if at all) via a mid-connection TLS renegotiation
+                    // (`SSLEngine.setNeedClientAuth(true)` + `beginHandshake()`
+                    // called AGAIN on an already-handshaked engine, from
+                    // `NioEndpoint$NioSocketWrapper.doClientAuth`). rustls
+                    // categorically does not support renegotiation in TLS 1.2
+                    // (nor TLS 1.3 — see rustls's own `manual::tlsvulns` docs);
+                    // it unconditionally rejects any post-handshake ClientHello/
+                    // HelloRequest with a `no_renegotiation` alert
+                    // (`common_state.rs::process_msg`, gated on
+                    // `may_receive_application_data`, which flips true the
+                    // instant the FIRST handshake finishes — there is no window
+                    // in which a real renegotiation attempt would be accepted).
+                    // `engine_begin`'s own `state.conn.is_some()` early return
+                    // (below the closing brace of this match) means that second
+                    // `beginHandshake()` call was ALSO silently discarded on the
+                    // CratonVM side even before hitting that rustls wall — see
+                    // this crate's `docs/known-issues/tls-ocsp-clientcert-
+                    // validation-not-enforced.md`, "Residual #2 implementation"
+                    // point 2, for the full trace evidence.
+                    //
+                    // True wire-level renegotiation is therefore not
+                    // implementable without swapping TLS backends (the same
+                    // class of permanently-unfixable gap as this doc's TLS 1.2
+                    // DHE cipher case). The workaround here avoids needing
+                    // renegotiation at all: when this engine's SSLContext was
+                    // itself initialized with trust roots (i.e. a real Java
+                    // `TrustManager[]`/truststore was configured — which for a
+                    // SERVER SSLContext is essentially always "this connector
+                    // may want to validate a client certificate"), speculatively
+                    // send an OPTIONAL CertificateRequest on the very FIRST
+                    // handshake, before Tomcat has explicitly asked for one. A
+                    // client with no certificate to offer (the common case)
+                    // behaves identically — `WebPkiClientVerifier::
+                    // allow_unauthenticated()` accepts an empty client
+                    // Certificate message exactly as if no CertificateRequest
+                    // had been sent at all. A client that DOES have a KeyManager
+                    // installed (every test in this cluster that actually
+                    // exercises client-cert auth configures one via
+                    // `TesterSupport.configureClientSsl()`, unconditionally, in
+                    // its own `@Before`/setup, independent of whether that
+                    // particular sub-test's request path needs it) volunteers
+                    // its cert immediately — `peer_cert_chain_der` is populated
+                    // during this first, only handshake, so by the time
+                    // Tomcat's `SSLAuthenticator`/`AbstractProcessor.
+                    // populateSslRequestAttributes` later reads
+                    // `SSLSession.getPeerCertificates()` (or the explicit
+                    // `doClientAuth`/rehandshake path finds `certs != null`
+                    // already and skips re-handshaking altogether), the
+                    // certificate is already there — no renegotiation required.
+                    // Deliberately does NOT downgrade or override an already
+                    // explicit `need`/`want` (a real `setNeedClientAuth(true)`
+                    // called before the first handshake — e.g. a
+                    // `certificateVerification=required` host, or the plain
+                    // `SSLParameters.setNeedClientAuth(true)`-upfront repro
+                    // this doc's residual #2 verified directly — still wins and
+                    // still enforces REQUIRED semantics exactly as before).
+                    let speculative_optional_auth = !state.need_client_auth
+                        && !state.want_client_auth
+                        && state
+                            .trust_roots_override
+                            .as_ref()
+                            .map(|r| !r.root_ders.is_empty())
+                            .unwrap_or(false);
+                    let request =
+                        state.need_client_auth || state.want_client_auth || speculative_optional_auth;
                     let client_ca = if request {
                         let trust_roots = state
                             .trust_roots_override
@@ -4504,7 +4575,8 @@ fn engine_begin(state: &mut EngineState) -> Result<(), String> {
                             key,
                             &alpn_strs,
                             state.need_client_auth,
-                            state.want_client_auth && !state.need_client_auth,
+                            (state.want_client_auth || speculative_optional_auth)
+                                && !state.need_client_auth,
                             client_ca.as_deref(),
                             &state.enabled_ciphers,
                         )
