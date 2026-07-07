@@ -89,7 +89,7 @@ CRATONVM_DISABLE_DEFAULT_WATCHDOG=1 CRATONVM_JIT_OSR=1 \
 
 ## Cross-reference
 
-[hib-temporal-gc-lambda-native-stale-local.md](../../known-issues/hib-temporal-gc-lambda-native-stale-local.md)
+[hib-temporal-gc-lambda-native-stale-local.md](../hib-temporal-gc-lambda-native-stale-local.md)
 — that doc's `type.temporal.*` cluster is a GC-corruption/CRASH family,
 unrelated to this FAIL/assertion-only bug (different root cause, both now
 independently tracked).

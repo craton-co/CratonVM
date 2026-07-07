@@ -4,6 +4,14 @@ This folder collects CratonVM-only defects found while running upstream Java
 suites. The docs had grown to describe the **same underlying bug from several
 angles**; this index is the consolidated map. Read it first.
 
+## 2026-07-07 Hibernate temporal: GC crash family extinct → new SQL-placeholder bug surfaced
+
+- [hib-temporal-sql-parameter-placeholder-duplication.md](hib-temporal-sql-parameter-placeholder-duplication.md) —
+  🔴 OPEN, untriaged. Validating the archived GC stale-local doc (item 19 below) showed the 5
+  `type.temporal.*` classes are now crash-free (0 corruption markers) but fail en masse on
+  DUPLICATED JDBC `?` placeholders in generated INSERTs (`values (??,???)`, growing per
+  statement) — a string-building defect, not GC.
+
 ## 2026-07-06 http.client class_manager RwLock writer starvation (branch fix/httpclient-vtable-classmanager-abba-deadlock-0706c)
 
 - [class-manager-rwlock-writer-starvation.md](class-manager-rwlock-writer-starvation.md) -- follow-up to the AB-BA `vtable_manager`/`class_manager` lock-order deadlock FIXED this session (commit `caa4ee65`, cut `HttpComponentsClientHttpRequestFactoryTests` hang rate from 65% to 25%): the residual hangs are a separate, still-open bug -- `execute_invokestatic`'s `class_manager` read guard, held across a superclass-chain walk, can starve a queued writer (`load_class_concurrent`) under heavy concurrent read pressure, since `parking_lot::RwLock`'s default (non-`_fair`) mode is not strictly writer-preferring. Confirmed via two live gdb captures 2 seconds apart showing identical thread state (rules out a snapshot artifact). Next step: cache the native-override lookup per call site the same way the vtable fast path already does, rather than re-acquiring the read lock on every `invokestatic`.
@@ -250,13 +258,13 @@ initialization gap was fixed 2026-07-02), grouped as:
     probed via `lost_tag_local_candidates` + the strict `is_object_address` header check, then rooted and
     remapped. Unit-tested (`scan_local_objects_roots_lost_tag_other_local`,
     `update_local_refs_remaps_lost_tag_other_local`); the `CRATONVM_GC_VERIFY_STALE` verifier is retained.
-16. **[GC: rs_cache-presence reactor-shutdown timing race](gc-rscache-reactor-shutdown-timing-race.md)** —
-    🟢 **FIX LANDED on dev** (`323a3ba6`, 2026-07-01: thread exit serialized against STW —
+16. **[GC: rs_cache-presence reactor-shutdown timing race](../internal/gc-rscache-reactor-shutdown-timing-race.md)** —
+    ✅ **FIXED on dev** (`323a3ba6`, 2026-07-01: thread exit serialized against STW —
     `request_stw_counted` computes `alive_count` under the barrier lock, blocked→dead transition is atomic,
-    thread teardown uses a stable inflated `Arc<Monitor>`; unit-tested). The doc stays here only because its
-    own acceptance gate — the ES `RestClientSingleHostIntegTests` soak at `-Xmx1g` with the default rootsnap
-    cache — has not been rerun; the `CRATONVM_ROOTSNAP_CACHE=0` workaround should no longer be needed once
-    that soak confirms. **NOT** a socket/OP_WRITE bug and **NOT** an rs_cache correctness bug.
+    thread teardown uses a stable inflated `Arc<Monitor>`; unit-tested; doc archived to `docs/internal/`
+    2026-07-07). Residual validation item recorded in the archived doc: the ES
+    `RestClientSingleHostIntegTests` `-Xmx1g` default-cache soak; the `CRATONVM_ROOTSNAP_CACHE=0`
+    workaround is expected unnecessary. **NOT** a socket/OP_WRITE bug and **NOT** an rs_cache correctness bug.
 17. **[CompletableFuture untimed `get()` never wakes on cross-thread completion](../internal/app-jvm-bugs/gc-gen-promotion-completablefuture-completion-loss.md)** —
     ✅ **FIXED on dev** (moved to `docs/internal/app-jvm-bugs/`). The original gen-GC "lost young `Signaller`"
     theory was **refuted** (the hang is deterministic + GC-independent); the real cause was the synthetic
@@ -273,17 +281,16 @@ initialization gap was fixed 2026-07-02), grouped as:
     open for the blocked-frame snapshot gap and register-resident remainder. The mitigation (`plausible_heap_pointer`
     gate at every ref-decode + JIT receiver-deref boundary) degrades a stale ref to a Java NPE — all 6 are now
     **crash-free jit+nojit** but still fail/time out (the residual reclamation itself is unfixed).
-19. **[Hibernate `type.temporal.*` — moving GC strands lambda refs in native stream/collection intrinsics](hib-temporal-gc-lambda-native-stale-local.md)** —
-    🟠 **OPEN** (native callback pinning hardened; full Hibernate rerun still pending). The 5 `org.hibernate.orm.test.type.temporal.*` classes
-    abort rc=1 / SIGSEGV with `linkage error: no such method java/lang/Object.<sam>` — **not** a java.time
-    binding bug. Same native-stale-Rust-local family as the StackWalker corruption
-    ([hibernate-bytearraymapping-stackwalk-gc-corruption.md](../internal/fixed-suite-bugs/hibernate-bytearraymapping-stackwalk-gc-corruption.md)):
-    `Stream.forEach`/`sorted`, `Spliterator.tryAdvance`/`forEachRemaining`, `ArrayList.forEach` hold the lambda
-    + materialized elements in Rust locals across `invoke_virtual`; the scheduled-task pump had the same issue
-    when firing multiple accrued `Runnable.run()` callbacks. Current focused fix = `pin_native_root` /
-    `read_native_pin` per callback/native (NOT force-non-moving — that hits the HIB-CV-33 precise-root gap).
-    This remains open until the Hibernate runner fixture is available and the temporal class loop is proven
-    crash-free at the default heap.
+19. **[Hibernate `type.temporal.*` — moving GC strands lambda refs in native stream/collection intrinsics](../internal/hib-temporal-gc-lambda-native-stale-local.md)** —
+    ✅ **FIXED on dev** (`3240cb75`, 2026-07-06; doc archived to `docs/internal/` 2026-07-07). The
+    native-stale-Rust-local family this doc identified was closed at three levels: the earlier
+    native-collections + scheduled-pump pin sweep, a 242-site `pin_native_root`/`read_native_pin` sweep of
+    `phases_late.rs`, and — the keystone — `invoke_shared`/`invoke_special_shared` now pin object args
+    across the class-load + `<clinit>` window (`5732a1e1`), which was the residual stale-args hole no
+    per-native pin could cover. Deterministic repro
+    (`IntStream.concat(s.chars(), s.chars())` at `CRATONVM_DBG_GC_STRESS=32768`, failed <1s) is green
+    ×5 + full-length, jit and nojit, checksums == HotSpot. Remaining validation noted in the archived
+    doc: the 5 `org.hibernate.orm.test.type.temporal.*` classes loop at default heap.
 
 FIXED bugs whose standalone docs were **removed** from this folder (resolved; full writeups in
 `git` history or [`docs/internal/fixed-suite-bugs/`](../internal/fixed-suite-bugs/)): A1 (reflection
