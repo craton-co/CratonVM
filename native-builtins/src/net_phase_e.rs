@@ -5458,8 +5458,40 @@ fn register_re4_url_http(r: &mut NativeMethodRegistry) {
                     &[Value::Object(Some(con))],
                 );
                 let con = ctx.read_native_pin(con_pin, con);
+                if let Err(e) = cc {
+                    ctx.unpin_native_roots(this_pin);
+                    return Err(e);
+                }
+                // Perform the request (headers now staged) and inspect the
+                // status BEFORE handing out the body stream. Two cases must
+                // keep the legacy openStream behaviour the connection path
+                // lacks:
+                //   * 3xx — the connection path does not follow redirects,
+                //     while URL.openStream (and the real JDK's default
+                //     followRedirects) does;
+                //   * -1 — huc_real_perform folds connect failures into -1
+                //     per the getResponseCode contract, which must not become
+                //     a silent EMPTY stream here; openStream re-attempts and
+                //     raises the real IOException.
+                // A SocketTimeoutException from getResponseCode propagates
+                // as-is (no fallback), matching the real JDK.
+                let code_val = ctx.invoke_virtual(con, "getResponseCode", "()I", &[]);
+                let con = ctx.read_native_pin(con_pin, con);
+                let url_obj = ctx.read_native_pin(url_pin, url_obj);
                 ctx.unpin_native_roots(this_pin);
-                cc?;
+                let code = match code_val {
+                    Ok(Some(Value::Int(c))) => c,
+                    Err(e) => return Err(e),
+                    _ => -1,
+                };
+                if code == -1 || matches!(code, 301 | 302 | 303 | 307 | 308) {
+                    return ctx.invoke_virtual(
+                        url_obj,
+                        "openStream",
+                        "()Ljava/io/InputStream;",
+                        &[],
+                    );
+                }
                 return ctx.invoke_virtual(con, "getInputStream", "()Ljava/io/InputStream;", &[]);
             }
             ctx.unpin_native_roots(this_pin);
