@@ -119,7 +119,7 @@ fn snapshot() -> Vec<(String, f64, &'static str)> {
     provider_chain().lock().clone()
 }
 
-fn find(name: &str) -> Option<(f64, &'static str)> {
+pub(crate) fn find(name: &str) -> Option<(f64, &'static str)> {
     provider_chain()
         .lock()
         .iter()
@@ -182,7 +182,7 @@ fn remove(name: &str) {
 /// numeric version. Used by every read-side path
 /// (`getProviders`, `getProvider`); we never cache `ObjectRef` values
 /// across callbacks so the heap is free to GC the previous instance.
-fn make_provider(
+pub(crate) fn make_provider(
     ctx: &mut dyn NativeContext,
     name: &str,
     version: f64,

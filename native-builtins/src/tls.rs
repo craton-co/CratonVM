@@ -1019,6 +1019,16 @@ fn register_trust_manager_factory(r: &mut NativeMethodRegistry) {
 fn register_key_manager_factory(r: &mut NativeMethodRegistry) {
     // SyntheticStub: 3-field synthetic factory; getKeyManagers() returns a
     // placeholder X509KeyManager with no real key material loaded.
+    //
+    // NOTE: this registration is currently shadowed — `phases_late.rs`'s
+    // `register_p68_ssl` registers the same (class, method, descriptor)
+    // triples under the `Bridge` category, runs later in the boot sequence,
+    // and wins via last-registration-wins (`NativeMethodRegistry::register`).
+    // Confirmed by direct tracing: this function's `getInstance` never fires
+    // in a real-JDK run. If you're debugging `KeyManagerFactory` behavior and
+    // changes here don't seem to take effect, check `phases_late.rs` first —
+    // see its own field-layout comment for why that copy must match the real
+    // `javax.net.ssl.KeyManagerFactory` field order.
     let __prev_cat = r.current_category();
     r.set_category(cratonvm_native_api::NativeKind::SyntheticStub);
     let cls = "javax/net/ssl/KeyManagerFactory";
