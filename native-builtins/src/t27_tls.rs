@@ -50,11 +50,11 @@ use std::net::{TcpListener, TcpStream};
 use std::sync::{Arc, OnceLock};
 
 use parking_lot::Mutex;
-use rustls::client::ClientConnection;
-use rustls::pki_types::{CertificateDer, PrivateKeyDer, ServerName};
+use rustls::client::{ClientConnection, ResolvesClientCert};
+use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer, ServerName};
 use rustls::server::{ClientHello, ResolvesServerCert, ServerConnection, WebPkiClientVerifier};
 use rustls::sign::CertifiedKey;
-use rustls::{ClientConfig, RootCertStore, ServerConfig, StreamOwned};
+use rustls::{ClientConfig, RootCertStore, ServerConfig, SignatureScheme, StreamOwned};
 
 use cratonvm_native_api::{NativeContext, NativeMethodRegistry};
 use cratonvm_types::error::RuntimeError;
@@ -302,6 +302,56 @@ pub(crate) fn attach_trust_managers_to_ctx(
     }
 }
 
+/// The `KeyManager[]` objects passed to `SSLContext.init(km, tms, random)`,
+/// keyed identically to `ctx_trust_managers_table` (same reasons apply: holds
+/// live `ObjectRef`s, so it MUST stay in the GC root set — see
+/// `gc_scan_tls_ctx_key_manager_roots`/`gc_update_tls_ctx_key_manager_refs`,
+/// wired into `vm/src/memory/roots.rs` and `gc.rs`). Consulted synchronously
+/// mid-handshake by `JavaKeyManagerResolver::resolve` (via a `km_ctx_key`
+/// looked up here, never the `ObjectRef`s copied out long-term — the same
+/// "keep only a key" discipline `EngineState::trust_managers_ctx_key` uses)
+/// so a real `KeyManager.chooseClientAlias` can be consulted for mTLS client
+/// certificate selection instead of presenting one fixed identity.
+fn ctx_key_managers_table() -> &'static Mutex<HashMap<u64, Vec<ObjectRef>>> {
+    static T: OnceLock<Mutex<HashMap<u64, Vec<ObjectRef>>>> = OnceLock::new();
+    T.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// `SSLContext.init(km, tms, random)` calls this with the raw `km` array
+/// argument (may be `None`/empty) to stash the actual `KeyManager` Java
+/// objects against this context, keyed the same way as
+/// `attach_trust_managers_to_ctx`.
+pub(crate) fn attach_key_managers_to_ctx(
+    ctx: &mut dyn NativeContext,
+    ctx_obj: ObjectRef,
+    kms_array: Option<ObjectRef>,
+) {
+    let key = ctx_obj_key(ctx, ctx_obj);
+    let mut list = Vec::new();
+    if let Some(arr) = kms_array {
+        let len = ctx.array_length(arr);
+        for i in 0..len {
+            if let Value::Object(Some(km)) = ctx.get_array_element(arr, i) {
+                list.push(km);
+            }
+        }
+    }
+    if std::env::var("CRATONVM_DBG_TLS_AUTH").is_ok() {
+        eprintln!(
+            "[dbg-tls-auth] attach_key_managers_to_ctx key={} kms_array_present={} count={}",
+            key,
+            kms_array.is_some(),
+            list.len()
+        );
+    }
+    let mut table = ctx_key_managers_table().lock();
+    if list.is_empty() {
+        table.remove(&key);
+    } else {
+        table.insert(key, list);
+    }
+}
+
 /// `SSLContext.init` calls this to move pending KMF identity and TMF trust
 /// roots onto the SSLContext object's per-context slots.
 pub(crate) fn attach_pending_identity_to_ctx(ctx: &mut dyn NativeContext, ctx_obj: ObjectRef) {
@@ -360,12 +410,50 @@ pub fn der_identity_to_pem(key_pkcs8_der: &[u8], chain_der: &[Vec<u8>]) -> (Stri
 /// SSLContext, or the platform roots when no context trust is configured, and
 /// optionally presents a client certificate.
 /// Used by the rustls-backed `SSLSocketFactory.createSocket` client path.
+///
+/// `km_ctx_key`, when present and `ctx_key_managers_table` has a non-empty
+/// entry for it, takes priority over `client_identity`: instead of always
+/// presenting one fixed (cert_pem, key_pem) pair, the returned config
+/// consults the real Java `KeyManager.chooseClientAlias` synchronously
+/// during the handshake (see `JavaKeyManagerResolver`), so a client with
+/// multiple available certificates presents the one matching the server's
+/// `CertificateRequest` acceptable-issuer list. Falls back to
+/// `client_identity` (or no client auth) when no KeyManager was captured —
+/// e.g. a plain `SSLContext.init(null, tms, null)` client with no KMF.
 pub(crate) fn build_engine_client_config_with_identity(
     alpn: &[&str],
     client_identity: Option<(&str, &str)>,
+    km_ctx_key: Option<u64>,
 ) -> Result<Arc<ClientConfig>, String> {
     let trust_roots = active_client_trust_roots();
     let roots = root_store_for_trust_roots(trust_roots.as_ref());
+    if std::env::var("CRATONVM_DBG_TLS_AUTH").is_ok() {
+        eprintln!(
+            "[dbg-tls-auth] build_engine_client_config_with_identity km_ctx_key={:?} client_identity_present={}",
+            km_ctx_key,
+            client_identity.is_some()
+        );
+    }
+    if let Some(key) = km_ctx_key {
+        let has_kms = ctx_key_managers_table()
+            .lock()
+            .get(&key)
+            .map(|v| !v.is_empty())
+            .unwrap_or(false);
+        if std::env::var("CRATONVM_DBG_TLS_AUTH").is_ok() {
+            eprintln!(
+                "[dbg-tls-auth] build_engine_client_config_with_identity key={} has_kms={}",
+                key, has_kms
+            );
+        }
+        if has_kms {
+            let resolver: Arc<dyn ResolvesClientCert> = Arc::new(JavaKeyManagerResolver {
+                km_ctx_key: key,
+                provider: Arc::new(rustls::crypto::ring::default_provider()),
+            });
+            return build_client_config_with_resolver(roots, alpn, resolver);
+        }
+    }
     build_client_config(roots, alpn, client_identity)
 }
 
@@ -404,6 +492,47 @@ pub fn huc_default_client_identity() -> Option<(String, String)> {
 
 fn huc_default_trust_roots() -> Option<TlsTrustRoots> {
     huc_default_trust_roots_slot().lock().clone()
+}
+
+/// The `ctx_key_managers_table` key of the `SSLContext` that most recently
+/// supplied `HUC_DEFAULT_CLIENT_IDENTITY`. Set alongside that identity (same
+/// `getSocketFactory()` capture point — see its call site) so
+/// `http_url_connection::perform`'s client config can consult the real
+/// `KeyManager.chooseClientAlias` (via `JavaKeyManagerResolver`) instead of
+/// only ever presenting the one fixed identity `ctx_identity` captured. A
+/// plain `u64` — never the `KeyManager` `ObjectRef`s themselves, which stay
+/// solely in the GC-rooted `ctx_key_managers_table` (see that table's doc).
+static HUC_DEFAULT_KM_CTX_KEY: OnceLock<Mutex<Option<u64>>> = OnceLock::new();
+
+fn huc_default_km_ctx_key_slot() -> &'static Mutex<Option<u64>> {
+    HUC_DEFAULT_KM_CTX_KEY.get_or_init(|| Mutex::new(None))
+}
+
+pub(crate) fn set_huc_default_key_managers_ctx_key(key: Option<u64>) {
+    *huc_default_km_ctx_key_slot().lock() = key;
+}
+
+pub(crate) fn huc_default_key_managers_ctx_key() -> Option<u64> {
+    *huc_default_km_ctx_key_slot().lock()
+}
+
+/// `SSLContext.getSocketFactory()` calls this alongside
+/// `set_huc_default_client_identity` (same reliable per-context capture
+/// point — see that call site's doc). Clears the slot when this context has
+/// no captured `KeyManager`s at all, so a plain non-mTLS client (or one
+/// whose `SSLContext.init` passed a null/empty `KeyManager[]`) keeps falling
+/// back to `client_identity`/no-client-auth instead of spuriously trying (and
+/// failing) to consult an empty resolver.
+pub(crate) fn capture_huc_key_managers_ctx_key(ctx: &mut dyn NativeContext, ctx_obj: ObjectRef) {
+    let key = ctx_obj_key(ctx, ctx_obj);
+    let has_kms = ctx_key_managers_table().lock().contains_key(&key);
+    if std::env::var("CRATONVM_DBG_TLS_AUTH").is_ok() {
+        eprintln!(
+            "[dbg-tls-auth] capture_huc_key_managers_ctx_key key={} has_kms={}",
+            key, has_kms
+        );
+    }
+    set_huc_default_key_managers_ctx_key(if has_kms { Some(key) } else { None });
 }
 
 // -----------------------------------------------------------------------------
@@ -897,6 +1026,391 @@ pub(crate) fn build_client_config(
         .map(|s| s.as_bytes().to_vec())
         .collect();
     Ok(Arc::new(config))
+}
+
+/// As `build_client_config`, but plugs in a custom `ResolvesClientCert`
+/// instead of a fixed (cert_pem, key_pem) pair — used when a real Java
+/// `KeyManager` is available to consult (see `JavaKeyManagerResolver`).
+fn build_client_config_with_resolver(
+    roots: RootCertStore,
+    alpn_protocols: &[&str],
+    resolver: Arc<dyn ResolvesClientCert>,
+) -> Result<Arc<ClientConfig>, String> {
+    let builder = ClientConfig::builder().with_root_certificates(roots);
+    let mut config = builder.with_client_cert_resolver(resolver);
+    config.alpn_protocols = alpn_protocols
+        .iter()
+        .map(|s| s.as_bytes().to_vec())
+        .collect();
+    Ok(Arc::new(config))
+}
+
+// -----------------------------------------------------------------------------
+// Synchronous mid-handshake client-certificate selection
+// -----------------------------------------------------------------------------
+//
+// `JavaKeyManagerResolver` is the fix for the "always presents one fixed
+// identity" gap: `rustls::client::ResolvesClientCert::resolve` is called BY
+// rustls, synchronously, while parsing the server's `CertificateRequest` —
+// there is no async/callback-later mechanism, so if the answer depends on
+// consulting the real Java `KeyManager.chooseClientAlias` (which it must,
+// for a test-installed wrapper like Tomcat's `TrackingKeyManager` to see the
+// call and record its side effects, and for a genuinely custom KeyManager to
+// have any say at all), that Java call has to happen INSIDE `resolve()`.
+//
+// Two safety properties this design relies on:
+//
+//  1. **GC-rootedness without holding `ObjectRef`s long-term.** The resolver
+//     itself only stores a plain `u64` key (`km_ctx_key`) — never the
+//     `KeyManager` `ObjectRef`s. It is built once per `ClientConfig` and may
+//     be cached/reused across many connections and — since rustls requires
+//     `Send + Sync` — potentially observed from a different thread than the
+//     one that built it. The live `ObjectRef`s are looked up fresh from
+//     `ctx_key_managers_table` (GC-rooted, see its doc) every time `resolve`
+//     actually runs, exactly mirroring why `EngineState` stores only
+//     `trust_managers_ctx_key`, never the `TrustManager`s themselves.
+//
+//  2. **A valid `&mut dyn NativeContext` at the exact moment `resolve` needs
+//     one, despite rustls's fixed trait signature having no room to pass
+//     one in.** The caller that drives the handshake (`http_url_connection::
+//     perform`) already holds `ctx` for its entire native-call frame; it
+//     stashes a raw pointer to it in a thread-local
+//     (`set_active_native_context`) for the duration of the
+//     `process_new_packets()` call that might invoke `resolve` — and ONLY
+//     that duration, cleared via an RAII guard even on an early return/error
+//     — then calls `with_active_native_context` to reborrow it. This is sound
+//     because rustls calls `resolve` synchronously, on the same thread, from
+//     within that exact call; it is never deferred, queued, or handed to
+//     another thread. Critically, the caller must NOT be inside a
+//     `begin_blocking_region()`/`end_blocking_region()` window when it does
+//     this: a blocking region tells the collector this thread is parked and
+//     safe to ignore, and `resolve()` here allocates Java objects and runs
+//     bytecode (`invoke_virtual`) — running that while "parked" would let a
+//     concurrent GC and this thread's own heap mutation race. `perform`
+//     ends its blocking region before entering the active-context window and
+//     re-enters it immediately after, for exactly this reason.
+thread_local! {
+    // `'static` here is a lie load-bearing on `ActiveNativeContextGuard`'s
+    // `Drop` clearing this before the real, shorter-lived borrow it was
+    // erased from could expire — see `set_active_native_context`.
+    static ACTIVE_TLS_NATIVE_CTX: std::cell::Cell<Option<*mut (dyn NativeContext + 'static)>> =
+        std::cell::Cell::new(None);
+}
+
+/// RAII guard returned by `set_active_native_context`; clears the
+/// thread-local on drop (including on an early return/`?` inside the
+/// handshake loop), so the raw pointer never outlives the native call frame
+/// that created it.
+pub(crate) struct ActiveNativeContextGuard {
+    _private: (),
+}
+
+impl Drop for ActiveNativeContextGuard {
+    fn drop(&mut self) {
+        ACTIVE_TLS_NATIVE_CTX.with(|c| c.set(None));
+    }
+}
+
+/// Publish `ctx` for `JavaKeyManagerResolver::resolve` (running on this same
+/// thread, synchronously, somewhere inside the caller's next
+/// `process_new_packets()`/handshake-loop call) to reborrow. Callers MUST
+/// NOT be inside a `begin_blocking_region()` window — see the module doc
+/// above. Drop the returned guard (or let it go out of scope) before this
+/// call's `ctx` reference itself would become invalid.
+pub(crate) fn set_active_native_context(ctx: &mut dyn NativeContext) -> ActiveNativeContextGuard {
+    let ptr: *mut dyn NativeContext = ctx;
+    // SAFETY: erasing the borrow's lifetime to `'static` here is sound only
+    // because `ActiveNativeContextGuard::drop` unconditionally clears this
+    // thread-local (even on an early `?` return / panic-driven unwind)
+    // before the real `ctx` borrow this pointer came from could expire —
+    // see the guard's doc and `with_active_native_context`'s SAFETY note.
+    let ptr: *mut (dyn NativeContext + 'static) = unsafe { std::mem::transmute(ptr) };
+    ACTIVE_TLS_NATIVE_CTX.with(|c| c.set(Some(ptr)));
+    ActiveNativeContextGuard { _private: () }
+}
+
+/// Reborrow the `ctx` published by `set_active_native_context`, if any is
+/// currently active on this thread. Returns `None` (rather than panicking)
+/// when called outside that window, so a resolver invoked in an unexpected
+/// context degrades to "no client certificate" instead of crashing.
+fn with_active_native_context<R>(f: impl FnOnce(&mut dyn NativeContext) -> R) -> Option<R> {
+    let ptr = ACTIVE_TLS_NATIVE_CTX.with(|c| c.get())?;
+    // SAFETY: `ptr` was published by `set_active_native_context` from a
+    // `&mut dyn NativeContext` that is still borrowed for the entire
+    // enclosing native call (`http_url_connection::perform`'s handshake
+    // loop). We are executing synchronously, on the same thread, inside a
+    // call reachable only from within that same call frame
+    // (`rustls`'s `process_new_packets` -> `resolve`), so the pointer is
+    // still valid. The `ActiveNativeContextGuard` clears the thread-local
+    // (via `Drop`, so even an early `?` return runs it) before that frame
+    // returns, so this pointer can never be read after it would dangle.
+    Some(f(unsafe { &mut *ptr }))
+}
+
+/// Map the `SignatureScheme`s a server's `CertificateRequest` advertises to
+/// the JSSE-style `keyType` strings (`"RSA"`, `"EC"`, …)
+/// `X509KeyManager.chooseClientAlias`/`getClientAliases` expect. Order is
+/// stable and deduplicated; falls back to `["RSA"]` when nothing recognized
+/// is offered (matches this module's other RSA-favoring defaults) so a
+/// server that (unusually) advertises no schemes still gets a `keyType` hint
+/// rather than an empty array.
+fn key_types_from_sigschemes(schemes: &[SignatureScheme]) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    let mut push = |s: &str, out: &mut Vec<String>| {
+        if !out.iter().any(|x| x == s) {
+            out.push(s.to_string());
+        }
+    };
+    for scheme in schemes {
+        match scheme {
+            SignatureScheme::RSA_PKCS1_SHA1
+            | SignatureScheme::RSA_PKCS1_SHA256
+            | SignatureScheme::RSA_PKCS1_SHA384
+            | SignatureScheme::RSA_PKCS1_SHA512
+            | SignatureScheme::RSA_PSS_SHA256
+            | SignatureScheme::RSA_PSS_SHA384
+            | SignatureScheme::RSA_PSS_SHA512 => push("RSA", &mut out),
+            SignatureScheme::ECDSA_SHA1_Legacy
+            | SignatureScheme::ECDSA_NISTP256_SHA256
+            | SignatureScheme::ECDSA_NISTP384_SHA384
+            | SignatureScheme::ECDSA_NISTP521_SHA512 => push("EC", &mut out),
+            SignatureScheme::ED25519 => push("Ed25519", &mut out),
+            SignatureScheme::ED448 => push("Ed448", &mut out),
+            _ => {}
+        }
+    }
+    if out.is_empty() {
+        out.push("RSA".to_string());
+    }
+    out
+}
+
+/// Build a Java `Principal[]` from the server's acceptable-issuer DER hints,
+/// for the `issuers` parameter of `chooseClientAlias`/`getClientAliases`.
+/// Each hint is rendered to an RFC 4514 DN string (via
+/// `security_manager::x509::parse_name_dn`) and wrapped in a synthetic
+/// `X500Principal`, mirroring exactly how `phases_late.rs`'s
+/// `X509Certificate.getSubjectX500Principal()` already builds one (same
+/// class, same 1-field/string convention) — so `Principal.getName()` on the
+/// result behaves the same way existing, already-exercised code produces.
+/// Hints that fail to parse (malformed DER) are skipped rather than aborting
+/// the whole call — a partial issuer list is still useful context for
+/// `chooseClientAlias`, and none at all is a valid "send whatever you have"
+/// signal per the trait's own contract.
+fn build_issuer_principals(ctx: &mut dyn NativeContext, root_hint_subjects: &[&[u8]]) -> ObjectRef {
+    let dn_strings: Vec<String> = root_hint_subjects
+        .iter()
+        .filter_map(|der| crate::security_manager::x509::parse_name_dn(der).ok())
+        .collect();
+    let cls_id = ctx
+        .ensure_class_initialized("java/security/Principal")
+        .unwrap_or(cratonvm_types::ClassId::new(0));
+    let arr = ctx.new_ref_array(cls_id, dn_strings.len());
+    for (i, dn) in dn_strings.iter().enumerate() {
+        let princ = alloc_concurrent_synthetic(ctx, "javax/security/auth/x500/X500Principal", 1);
+        let s = ctx.create_string(dn);
+        ctx.set_field(princ, 0, Value::Object(Some(s)));
+        ctx.set_array_element(arr, i, Value::Object(Some(princ)));
+    }
+    arr
+}
+
+fn materialize_java_string_array(ctx: &mut dyn NativeContext, items: &[String]) -> ObjectRef {
+    let cls_id = ctx
+        .ensure_class_initialized("java/lang/String")
+        .unwrap_or(cratonvm_types::ClassId::new(0));
+    let arr = ctx.new_ref_array(cls_id, items.len());
+    for (i, s) in items.iter().enumerate() {
+        let js = ctx.create_string(s);
+        ctx.set_array_element(arr, i, Value::Object(Some(js)));
+    }
+    arr
+}
+
+/// Consults the real Java `KeyManager.chooseClientAlias` (and
+/// `getPrivateKey`) to pick a client certificate matching the server's
+/// `CertificateRequest`, instead of always presenting one fixed identity.
+/// See the module doc above this struct for the GC-safety/re-entrancy design
+/// this relies on.
+#[derive(Debug)]
+struct JavaKeyManagerResolver {
+    /// Key into `ctx_key_managers_table` — never the `ObjectRef`s themselves.
+    km_ctx_key: u64,
+    provider: Arc<rustls::crypto::CryptoProvider>,
+}
+
+impl JavaKeyManagerResolver {
+    /// Try each configured `KeyManager` in turn (matching real JSSE's
+    /// `SSLContextImpl`, which does the same) until one's
+    /// `chooseClientAlias` returns a non-null alias with resolvable
+    /// cert/key material.
+    fn resolve_via_java(
+        &self,
+        ctx: &mut dyn NativeContext,
+        root_hint_subjects: &[&[u8]],
+        sigschemes: &[SignatureScheme],
+    ) -> Option<Arc<CertifiedKey>> {
+        let dbg = std::env::var("CRATONVM_DBG_TLS_AUTH").is_ok();
+        let mut km_list = ctx_key_managers_table().lock().get(&self.km_ctx_key)?.clone();
+        if dbg {
+            eprintln!(
+                "[dbg-tls-auth] JavaKeyManagerResolver::resolve km_ctx_key={} km_count={} root_hint_subjects={} sigschemes={:?}",
+                self.km_ctx_key,
+                km_list.len(),
+                root_hint_subjects.len(),
+                sigschemes
+            );
+        }
+        if km_list.is_empty() {
+            return None;
+        }
+        let key_types = key_types_from_sigschemes(sigschemes);
+        if dbg {
+            eprintln!("[dbg-tls-auth] JavaKeyManagerResolver key_types={:?}", key_types);
+        }
+        let key_type_arr = materialize_java_string_array(ctx, &key_types);
+        let issuers_arr = build_issuer_principals(ctx, root_hint_subjects);
+
+        // Pin every KeyManager ObjectRef before any call that can allocate
+        // (invoke_virtual below) — a moving GC triggered by that call could
+        // otherwise relocate an entry we haven't gotten to yet. Mirrors the
+        // `apps_h2.rs`/`atomic_updater.rs` batch-pin pattern: keep each
+        // individual handle (not assumed-sequential arithmetic), unpin the
+        // whole batch via the FIRST handle at the end.
+        let pins: Vec<usize> = km_list.iter().map(|&obj| ctx.pin_native_root(obj)).collect();
+        let first_pin = pins[0];
+
+        let result = (|| {
+            for (i, &pin) in pins.iter().enumerate() {
+                km_list[i] = ctx.read_native_pin(pin, km_list[i]);
+                let km_obj = km_list[i];
+                let args = [
+                    Value::Object(Some(key_type_arr)),
+                    Value::Object(Some(issuers_arr)),
+                    Value::Object(None),
+                ];
+                let choose_result = ctx.invoke_virtual(
+                    km_obj,
+                    "chooseClientAlias",
+                    "([Ljava/lang/String;[Ljava/security/Principal;Ljava/net/Socket;)Ljava/lang/String;",
+                    &args,
+                );
+                let alias = match &choose_result {
+                    Ok(Some(Value::Object(Some(s)))) => ctx.read_string(*s),
+                    _ => None,
+                };
+                if dbg {
+                    eprintln!(
+                        "[dbg-tls-auth] JavaKeyManagerResolver chooseClientAlias[{}] -> {:?} (raw={:?})",
+                        i, alias, choose_result
+                    );
+                }
+                km_list[i] = ctx.read_native_pin(pin, km_list[i]);
+                let Some(alias) = alias else { continue };
+
+                let pk_args = [Value::Object(Some(ctx.create_string(&alias)))];
+                let pk_result = ctx.invoke_virtual(
+                    km_list[i],
+                    "getPrivateKey",
+                    "(Ljava/lang/String;)Ljava/security/PrivateKey;",
+                    &pk_args,
+                );
+                let pk_obj = match &pk_result {
+                    Ok(Some(Value::Object(Some(pk)))) => Some(*pk),
+                    _ => None,
+                };
+                if dbg {
+                    eprintln!(
+                        "[dbg-tls-auth] JavaKeyManagerResolver getPrivateKey[{}] alias={} -> present={} (raw={:?})",
+                        i, alias, pk_obj.is_some(), pk_result
+                    );
+                }
+                km_list[i] = ctx.read_native_pin(pin, km_list[i]);
+                let Some(pk_obj) = pk_obj else { continue };
+
+                let km_id = crate::x509_manager::km_id_from_private_key_mirror(ctx, pk_obj);
+                if dbg {
+                    eprintln!("[dbg-tls-auth] JavaKeyManagerResolver km_id_from_private_key_mirror -> {:?}", km_id);
+                }
+                let Some(km_id) = km_id else {
+                    continue;
+                };
+                let material = crate::x509_manager::km_alias_material(km_id, &alias);
+                if dbg {
+                    eprintln!(
+                        "[dbg-tls-auth] JavaKeyManagerResolver km_alias_material(km_id={}, alias={}) -> chain_len={:?} key_len={:?}",
+                        km_id, alias,
+                        material.as_ref().map(|(c, _)| c.len()),
+                        material.as_ref().map(|(_, k)| k.len())
+                    );
+                }
+                let Some((chain_der, key_der)) = material else {
+                    continue;
+                };
+                let cert_chain: Vec<CertificateDer<'static>> =
+                    chain_der.into_iter().map(CertificateDer::from).collect();
+                if cert_chain.is_empty() {
+                    continue;
+                }
+                let key = PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(key_der));
+                match CertifiedKey::from_der(cert_chain, key, &self.provider) {
+                    Ok(ck) => return Some(Arc::new(ck)),
+                    Err(e) => {
+                        if dbg {
+                            eprintln!("[dbg-tls-auth] JavaKeyManagerResolver CertifiedKey::from_der failed: {e}");
+                        }
+                    }
+                }
+            }
+            None
+        })();
+
+        ctx.unpin_native_roots(first_pin);
+        result
+    }
+}
+
+impl ResolvesClientCert for JavaKeyManagerResolver {
+    fn resolve(
+        &self,
+        root_hint_subjects: &[&[u8]],
+        sigschemes: &[SignatureScheme],
+    ) -> Option<Arc<CertifiedKey>> {
+        let dbg = std::env::var("CRATONVM_DBG_TLS_AUTH").is_ok();
+        if dbg {
+            eprintln!(
+                "[dbg-tls-auth] JavaKeyManagerResolver::resolve CALLED km_ctx_key={} root_hint_subjects={}",
+                self.km_ctx_key,
+                root_hint_subjects.len()
+            );
+        }
+        let out = with_active_native_context(|ctx| {
+            self.resolve_via_java(ctx, root_hint_subjects, sigschemes)
+        });
+        if dbg && out.is_none() {
+            eprintln!("[dbg-tls-auth] JavaKeyManagerResolver::resolve NO active native context");
+        }
+        out.flatten()
+    }
+
+    fn has_certs(&self) -> bool {
+        // A pure data check (no Java call) — safe to call before the active
+        // native-context window opens (rustls calls this very early, at
+        // `ClientConnection::new`/`start_handshake`, before the handshake
+        // loop that establishes that window even begins).
+        let out = ctx_key_managers_table()
+            .lock()
+            .get(&self.km_ctx_key)
+            .map(|v| !v.is_empty())
+            .unwrap_or(false);
+        if std::env::var("CRATONVM_DBG_TLS_AUTH").is_ok() {
+            eprintln!(
+                "[dbg-tls-auth] JavaKeyManagerResolver::has_certs CALLED km_ctx_key={} -> {}",
+                self.km_ctx_key, out
+            );
+        }
+        out
+    }
 }
 
 /// Map a Java `SSLEngine.setEnabledCipherSuites` name to the matching rustls
@@ -5157,6 +5671,38 @@ pub fn gc_update_tls_ctx_trust_manager_refs(map: &std::collections::HashMap<usiz
                 // SAFETY: `new` is a live, 8-byte-aligned heap address produced
                 // by the moving collector for the object previously at `old`.
                 *tm = unsafe { ObjectRef::from_raw(new as *mut u8) };
+            }
+        }
+    }
+}
+
+/// GC root scan for `ctx_key_managers_table` — mirrors
+/// `gc_scan_tls_ctx_trust_manager_roots` exactly (see that table's doc).
+pub fn gc_scan_tls_ctx_key_manager_roots(roots: &mut Vec<ObjectRef>) {
+    let table = ctx_key_managers_table().lock();
+    for list in table.values() {
+        for km in list {
+            if !km.as_ptr().is_null() {
+                roots.push(*km);
+            }
+        }
+    }
+}
+
+/// Post-move remap companion to `gc_scan_tls_ctx_key_manager_roots`.
+pub fn gc_update_tls_ctx_key_manager_refs(map: &std::collections::HashMap<usize, usize>) {
+    if map.is_empty() {
+        return;
+    }
+    let mut table = ctx_key_managers_table().lock();
+    for list in table.values_mut() {
+        for km in list.iter_mut() {
+            let old = km.as_ptr() as usize;
+            if let Some(&new) = map.get(&old) {
+                debug_assert!(new != 0, "GC pointer map contains null address");
+                // SAFETY: `new` is a live, 8-byte-aligned heap address produced
+                // by the moving collector for the object previously at `old`.
+                *km = unsafe { ObjectRef::from_raw(new as *mut u8) };
             }
         }
     }

@@ -545,6 +545,9 @@ pub fn update_all_roots(
     // TLS SSLContext TrustManager[] objects; scan companion
     // `t27_tls::gc_scan_tls_ctx_trust_manager_roots` in `roots.rs`.
     cratonvm_native_builtins::t27_tls::gc_update_tls_ctx_trust_manager_refs(pointer_map);
+    // TLS SSLContext KeyManager[] objects (client-cert resolver); scan
+    // companion `t27_tls::gc_scan_tls_ctx_key_manager_roots` in `roots.rs`.
+    cratonvm_native_builtins::t27_tls::gc_update_tls_ctx_key_manager_refs(pointer_map);
 
     // 20. Blocked-thread root maintenance (the H2 TestScript stale-receiver
     //     SEGV fix). Threads parked in a blocking native (Object.wait /
