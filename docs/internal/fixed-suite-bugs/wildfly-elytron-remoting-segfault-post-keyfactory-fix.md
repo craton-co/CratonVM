@@ -84,6 +84,34 @@ A full pass/fail (not just crash-free) confirmation of this specific class is
 still worth doing once the GC-barrier hang is separately fixed, but the SIGSEGV
 this doc exists to document is gone.
 
+## ADDENDUM 2026-07-07 ~17:00 -- complementary source-level fix: `OptionMap.get(Option)Object` also now boxes correctly
+
+`60079fc4` (above) is a defense-in-depth fix at the JIT argument-decode layer: it stops a leaked raw
+primitive from being fabricated into a wild `ObjectRef` (converts it to `null` instead), which is what
+stops the SIGSEGV. But it does not fix the actual source of the leaked primitive. Independently (same
+day, worktree `wt-a4-register-oop-20260707`, branch `fix/a4-register-oop-bitmap-20260707`), traced the
+concrete data flow one level further back using `CRATONVM_DBG_JIT_MIC=1` against the live crash: the
+`60000`/`120000` values passed to `Builder.set(Option, Object)` originate from
+`org/xnio/OptionMap.get(Lorg/xnio/Option;)Ljava/lang/Object;` (a `get()` call feeding its own result
+directly into a `set()` call -- the common "copy an option from one map into another" idiom). Its native
+override, `native_option_map_get` (`native-builtins/src/xnio_async.rs`), stores numeric option values
+unboxed internally (`OptionValue::Int`/`Long`/`Bool`) and, for the generic `Object`-returning overloads,
+was returning that raw value directly as `Value::Int`/`Value::Long` instead of boxing it -- violating the
+method's declared `Ljava/lang/Object;` return type. This is architecturally the SAME missing-boxing bug
+`60079fc4` protects against at the decode layer, just caught at its origin instead of its landing site.
+
+**Why both fixes matter**: `60079fc4` alone means `Builder.set(option, workerMap.get(otherOption))`
+would no longer crash, but would silently store `null` where a real `60000` belonged -- a correctness
+bug, not a crash, and one that could resurface identically for any OTHER native method with the same
+"stores primitives unboxed, forgets to box on the generic `Object` accessor" shape. Fixing
+`native_option_map_get` at the source makes `OptionMap.get(Option)Object` return a real, correct
+`Integer`/`Long`/`Boolean` -- verified to match real HotSpot exactly (`getClass()`/`instanceof`/`equals()`/
+the typed-primitive-overload sibling/the default-`null`-when-missing fallback), not just "doesn't crash."
+Both changes are complementary and both landed on dev: `60079fc4` as a general JIT-layer safety net for
+this whole bug *class*, and the `native_option_map_get` boxing fix for this specific *instance*'s
+correctness. See `native-builtins/src/xnio_async.rs`'s `native_option_map_get` doc comment for the
+source-level writeup.
+
 ## Root cause (CONFIRMED 2026-07-07): A4 register-only-oop family
 
 **Disambiguation from the concurrent [[wildfly-xnio-mockselector-mutex-segfault]]
