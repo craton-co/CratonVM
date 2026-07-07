@@ -173,6 +173,13 @@ fn real_reqs() -> &'static Mutex<HashMap<i32, RealReq>> {
 /// by identity — same rationale and lifetime as `stream_owner_table`: the
 /// harness keeps the stream live on its Java stack across the
 /// write→`getResponseCode` window, so the bytes are read back at perform time.
+///
+/// GC note (gc-followups-20260706): the Java stack keeps the BAOS ALIVE, but
+/// this raw ref is never REMAPPED — a moving GC in the
+/// write→`getResponseCode` window leaves a stale address behind and the
+/// response-perform path then reads the body from the old location.
+/// Follow-up: store `(identity_key, ObjectRef)` var-handle-root pairs
+/// (ASYNC_POOL pattern) and re-read at perform time.
 fn real_body_streams() -> &'static Mutex<HashMap<i32, ObjectRef>> {
     static R: OnceLock<Mutex<HashMap<i32, ObjectRef>>> = OnceLock::new();
     R.get_or_init(|| Mutex::new(HashMap::new()))

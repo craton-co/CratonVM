@@ -152,6 +152,12 @@ fn tracked_read(addr: u64, offset: usize, count: usize) -> Option<Vec<u8>> {
 // ===========================================================================
 
 /// Map signal number -> handler ObjectRef (or None for SIG_DFL).
+///
+/// GC note (gc-followups-20260706): KNOWN-UNSOUND across GCs — the handler
+/// refs are neither GC roots nor remapped, so `Signal.raise` after a moving
+/// GC invokes a stale (or reclaimed) handler. Follow-up: convert to the
+/// `(identity_key, ObjectRef)` var-handle-root pattern (see ASYNC_POOL in
+/// lib.rs) or add a gc_scan/gc_update hook pair.
 fn signal_handler_store() -> &'static Mutex<HashMap<i32, Option<ObjectRef>>> {
     static INSTANCE: std::sync::OnceLock<Mutex<HashMap<i32, Option<ObjectRef>>>> =
         std::sync::OnceLock::new();

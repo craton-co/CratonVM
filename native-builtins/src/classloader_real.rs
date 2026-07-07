@@ -100,6 +100,14 @@ fn register_url_array(ctx: &mut dyn NativeContext, this: ObjectRef, urls: Value)
 }
 
 /// Cached system/platform classloader objects (created lazily).
+///
+/// GC note (gc-followups-20260706): BOTH statics are WRITE-ONLY — every read
+/// path goes through `classloader::get_or_create_{app,platform}_loader`, whose
+/// own stores are GC-scanned + remapped (`gc_scan_loader_singleton_roots` /
+/// `gc_update_loader_singleton_refs`). The raw refs cached here are neither
+/// rooted nor remapped, so they go stale after a moving GC — GC-safe ONLY
+/// because nothing ever reads them back. Do not add readers; read via the
+/// classloader.rs singletons instead.
 static SYSTEM_CL: Mutex<Option<ObjectRef>> = Mutex::new(None);
 static PLATFORM_CL: Mutex<Option<ObjectRef>> = Mutex::new(None);
 
@@ -987,8 +995,10 @@ pub fn get_or_create_system_cl(
     // on the mismatch it extracted an EMPTY classpath, the module registry
     // found no Gradle installation, and every ProjectBuilder bootstrap died
     // ("Cannot find resource 'gradle-plugins.properties'"). One object,
-    // one identity. (The old SYSTEM_CL static stays only as a GC-rooted
-    // alias to whatever we hand out.)
+    // one identity. (The old SYSTEM_CL static stays only as a write-only
+    // alias to whatever we hand out — it is NOT a GC root and is never
+    // remapped, which is safe solely because it is never read back; the
+    // canonical GC-tracked copy lives in classloader.rs's app-loader store.)
     let obj = crate::classloader::get_or_create_app_loader(ctx);
     *SYSTEM_CL.lock().unwrap_or_else(|e| e.into_inner()) = Some(obj);
     Some(obj)

@@ -1388,7 +1388,9 @@ pub(crate) fn check_exec_or_throw(
     ctx: &mut dyn NativeContext,
     command_first: &str,
 ) -> Result<(), cratonvm_types::error::MethodCallFailed> {
-    let sm = crate::security_manager::get_security_manager();
+    // Pass ctx so the singleton read re-fetches the CURRENT (post-GC) address
+    // via the var-handle-root registry (raw static copies are never remapped).
+    let sm = crate::security_manager::get_security_manager(&*ctx);
     let Some(sm_ref) = sm else { return Ok(()) };
 
     // Allocate a Java String for command[0] and call sm.checkExec(String).

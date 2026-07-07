@@ -192,6 +192,15 @@ pub(crate) struct ArcContainerInner {
     id: u64,
     /// Per-scope bean caches. Application + Singleton share the same
     /// process-wide map; Request + Dependent are handled separately.
+    ///
+    /// GC note (gc-followups-20260706): KNOWN-UNSOUND across GCs — cached
+    /// bean `ObjectRef`s are neither GC roots nor remapped, so a bean only
+    /// reachable from this cache is collectable and any cached ref goes
+    /// stale after a moving GC (a later `Arc.container().instance(...)`
+    /// then hands Java a dangling address). Tolerated so far because beans
+    /// resolved during boot are promptly stored into Java fields; convert
+    /// values to the `(identity_key, ObjectRef)` var-handle-root pattern
+    /// (ASYNC_POOL in lib.rs) before relying on cross-GC cache hits.
     app_scoped: RwLock<HashMap<ClassKey, ObjectRef>>,
     request_scoped: RwLock<HashMap<ClassKey, ObjectRef>>,
     /// Static bean index recorded at initialize()-time or lazily grown

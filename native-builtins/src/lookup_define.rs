@@ -586,6 +586,15 @@ fn lk_define_hidden_class_with_class_data(
 use parking_lot::Mutex;
 use std::collections::HashMap;
 
+// GC note (gc-followups-20260706): the stored `ObjectRef`s are neither GC
+// roots nor remapped after a move, so any read after a moving GC would be
+// unsound (stale address) and the object is collectable. This is currently
+// tolerated ONLY because the read helper below (`get_class_data`) has no
+// callers anywhere in the workspace — the table is effectively write-only.
+// Before wiring a real `MethodHandles.classData` retrieval native to it,
+// convert entries to the `(identity_key, ObjectRef)` var-handle-root pattern
+// (see `ASYNC_POOL` in lib.rs): `register_var_handle_root` at store,
+// `read_var_handle_root` at every read.
 fn class_data_store() -> &'static Mutex<HashMap<u32, ObjectRef>> {
     static STORE: std::sync::OnceLock<Mutex<HashMap<u32, ObjectRef>>> = std::sync::OnceLock::new();
     STORE.get_or_init(|| Mutex::new(HashMap::new()))
