@@ -4393,6 +4393,12 @@ fn default_engine_server_config(
 /// configs (or defaults) and stash it on the engine.
 fn engine_begin(state: &mut EngineState) -> Result<(), String> {
     if state.conn.is_some() {
+        if std::env::var("CRATONVM_DBG_TLS_AUTH").is_ok() {
+            eprintln!(
+                "[dbg-tls-auth] engine_begin SHORT-CIRCUIT (conn already realized) need={} want={}",
+                state.need_client_auth, state.want_client_auth
+            );
+        }
         return Ok(());
     }
     let alpn_strs: Vec<&str> = state
@@ -4854,6 +4860,13 @@ fn register_engine_impl_natives(r: &mut NativeMethodRegistry) {
         let this = obj_arg(args, 0)?;
         let v = args.get(1).and_then(|x| x.as_int()).unwrap_or(0) != 0;
         let id = engine_id_or_alloc(this);
+        if std::env::var("CRATONVM_DBG_TLS_AUTH").is_ok() {
+            let conn_is_some = with_engine(id, |s| s.conn.is_some()).unwrap_or(false);
+            eprintln!(
+                "[dbg-tls-auth] DIRECT setNeedClientAuth id={} v={} conn_already_realized={}",
+                id, v, conn_is_some
+            );
+        }
         with_engine(id, |s| {
             s.need_client_auth = v;
             if v {
