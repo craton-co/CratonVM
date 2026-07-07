@@ -346,6 +346,24 @@ pub(crate) fn attach_trust_managers_to_ctx(
     }
 }
 
+/// The `ctx_trust_managers_table` key for `ctx_obj`, if real Java
+/// `TrustManager` objects were attached at `SSLContext.init` time
+/// (`attach_trust_managers_to_ctx`) — `None` when the context carries no
+/// custom trust managers. Used by the native client-socket paths
+/// (`phases_late::new13_do_create_socket`) to decide whether certificate
+/// verification must be delegated to the Java TrustManagers.
+pub(crate) fn ctx_trust_managers_key_if_attached(
+    ctx: &mut dyn NativeContext,
+    ctx_obj: ObjectRef,
+) -> Option<u64> {
+    let key = ctx_obj_key(ctx, ctx_obj);
+    if ctx_trust_managers_table().lock().contains_key(&key) {
+        Some(key)
+    } else {
+        None
+    }
+}
+
 /// The `KeyManager[]` objects passed to `SSLContext.init(km, tms, random)`,
 /// keyed identically to `ctx_trust_managers_table` (same reasons apply: holds
 /// live `ObjectRef`s, so it MUST stay in the GC root set — see
@@ -5223,6 +5241,27 @@ fn engine_run_trust_check(
     Ok(())
 }
 
+/// Client-socket variant of the post-handshake TrustManager consultation:
+/// run the attached Java TrustManagers' `checkServerTrusted` against the
+/// peer chain captured by a native client connect
+/// (`servlet::s2_tls_connect`). Same rejection semantics as
+/// `engine_run_trust_check` (any thrown exception → `SSLHandshakeException`).
+pub(crate) fn run_client_trust_check_for_chain(
+    ctx: &mut dyn NativeContext,
+    trust_ctx_key: u64,
+    peer_chain_der: Vec<Vec<u8>>,
+) -> Result<(), cratonvm_types::error::MethodCallFailed> {
+    engine_run_trust_check(
+        ctx,
+        PendingTrustCheck {
+            is_client: true,
+            peer_chain_der,
+            trust_ctx_key,
+            negotiated_cipher_suite_name: None,
+        },
+    )
+}
+
 /// Public accessor for the negotiated ALPN of an engine — used by other
 /// modules (e.g. http2.rs) that drive the engine through wrap/unwrap and
 /// then need to know which protocol to speak.
@@ -6726,10 +6765,21 @@ fn register_ssl_session_real(r: &mut NativeMethodRegistry) {
                 .cloned()
                 .unwrap_or_default();
             if chain.is_empty() {
-                return Err(RuntimeError::IllegalStateException {
-                    message: "peer not authenticated (no certificate in session)".into(),
-                }
-                .into());
+                // Real-JDK contract (and this function's own doc): throw
+                // SSLPeerUnverifiedException — an SSLException — NOT
+                // IllegalStateException. Callers specifically catch the
+                // former to mean "peer presented no certificate": e.g.
+                // Spring's DefaultSslInfo.initCertificates() swallows
+                // SSLPeerUnverifiedException when building SslInfo for a
+                // server session without client auth; the previous
+                // IllegalStateException escaped instead and failed every
+                // reactive HTTPS request
+                // (ServerHttpsRequestIntegrationTests::checkUri).
+                return Err(crate::phases_early::throw_jca_exc(
+                    ctx,
+                    "javax/net/ssl/SSLPeerUnverifiedException",
+                    "peer not authenticated",
+                ));
             }
             let arr = ctx.new_ref_array(cratonvm_types::ClassId::new(0), chain.len());
             for (i, der) in chain.iter().enumerate() {
