@@ -189,9 +189,21 @@ native reachability). `ZeroCopyIntegrationTests`'s flakiness is now
 the same bug independently found in the http.client cluster below). Full
 fix writeup moved to
 [`docs/internal/fixed-suite-bugs/http-server-cluster-residuals-fixes-FIXED.md`](../internal/fixed-suite-bugs/http-server-cluster-residuals-fixes-FIXED.md).
-One residual remains genuinely open:
+Residual tracking:
 
-- [http-server-sslengine-identity-singleton-clobber.md](http-server-sslengine-identity-singleton-clobber.md) — `ServerHttpsRequestIntegrationTests`'s "TLS handshake failed: unexpected EOF". A prior `do_wrap`/`do_unwrap` SSLEngineResult-semantics hypothesis is REFUTED; the real cause is `engine_begin()` failing to parse a private key because a process-wide `RUNTIME_TLS_IDENTITY` singleton gets clobbered by a second, malformed `setKeyEntry` call before the handshake starts.
+- ✅ FIXED (branch `fix/tls-identity-singleton-clobber-20260707`, 2026-07-07):
+  `http-server-sslengine-identity-singleton-clobber` — the identity-singleton
+  clobber and its "malformed key" root cause. FOUR distinct CratonVM bugs found
+  and fixed: RSA `KeyPairGenerator` producing non-CRT keys with a 572-byte
+  `getEncoded()`, the `RUNTIME_TLS_IDENTITY` clobber (validate-before-overwrite),
+  `CertificateFactory.generateCertificate` empty `getEncoded()` on PEM streams,
+  and `generateCertificate` only reading a `ByteArrayInputStream`'s field-0
+  buffer. Doc retired to
+  [`../internal/http-server-sslengine-identity-singleton-clobber-FIXED.md`](../internal/http-server-sslengine-identity-singleton-clobber-FIXED.md).
+  `ServerHttpsRequestIntegrationTests` now reaches TLS record processing (server
+  config builds) and fails on a separate, newly-exposed SSLEngine handshake
+  data-flow bug tracked in
+  [reactive-netty-https-sslengine-handshake-underflow.md](reactive-netty-https-sslengine-handshake-underflow.md).
 
 ## 2026-07-04 Keycloak full-suite sweep (branch test/keycloak-fullsuite-20260704)
 

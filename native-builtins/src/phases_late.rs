@@ -41450,25 +41450,19 @@ pub(crate) fn register_p68_security_cert(r: &mut NativeMethodRegistry) {
                 }
             }
 
-            // Try to read DER data from InputStream's internal buffer
+            // Read the full stream. Previously this only read a
+            // `ByteArrayInputStream`'s field-0 `buf` array directly, so ANY
+            // other InputStream subtype (e.g. a Netty/`SslContext` file or
+            // buffer stream feeding `SelfSignedCertificate`'s cert) read zero
+            // bytes and fell through to the empty-cert stub → 0-byte
+            // `getEncoded()` → rustls `invalid peer certificate: BadEncoding`.
+            // `p59_read_input_stream_fully` keeps the fast BAIS path and adds a
+            // generic `read()`-loop fallback for every other stream type. See
+            // docs/known-issues/http-server-sslengine-identity-singleton-clobber.md.
             let der_data = if let Some(Value::Object(Some(is_ref))) = args.get(1) {
-                if let Value::Object(Some(buf_ref)) = ctx.get_field(*is_ref, 0) {
-                    let len = ctx.array_length(buf_ref);
-                    if len > 0 {
-                        let mut data = Vec::with_capacity(len);
-                        for i in 0..len {
-                            let b = match ctx.get_array_element(buf_ref, i) {
-                                Value::Int(v) => v as u8,
-                                _ => 0,
-                            };
-                            data.push(b);
-                        }
-                        Some(data)
-                    } else {
-                        None
-                    }
-                } else {
-                    None
+                match p59_read_input_stream_fully(ctx, *is_ref) {
+                    Ok(bytes) if !bytes.is_empty() => Some(bytes),
+                    _ => None,
                 }
             } else {
                 None
@@ -41495,12 +41489,20 @@ pub(crate) fn register_p68_security_cert(r: &mut NativeMethodRegistry) {
             // throws (malformed input), `make_x509_mirror` falls back to a
             // synthetic mirror that still stashes the DER in field 3, so
             // `getEncoded()` is never empty for a non-empty input stream.
-            if let Some(ref data) = der_data {
-                let alias = basic_der_extract_names(data)
+            if let Some(ref raw) = der_data {
+                // Accept PEM-armored streams too (real JDK's X509Factory sniffs
+                // `-----BEGIN`): decode to DER first so the mirror stores real
+                // cert bytes and `getEncoded()` is non-empty. A DER stream (no
+                // armor) passes through `pem_block_to_der` unchanged. Fixes
+                // Netty `SelfSignedCertificate` → empty `getEncoded()` → rustls
+                // `invalid peer certificate: BadEncoding`
+                // (http-server-sslengine-identity-singleton-clobber).
+                let data = crate::pem_block_to_der(raw);
+                let alias = basic_der_extract_names(&data)
                     .map(|(subject, _)| subject)
                     .unwrap_or_else(|| "CN=Unknown".into());
                 return Ok(Some(Value::Object(Some(crate::keystore::make_x509_mirror(
-                    ctx, &alias, data,
+                    ctx, &alias, &data,
                 )))));
             }
 
@@ -41542,25 +41544,20 @@ pub(crate) fn register_p68_security_cert(r: &mut NativeMethodRegistry) {
             // back internally to a DER-stashing synthetic mirror) instead of a
             // bare 3-field stub whose `getEncoded()` would come back empty.
             if let Some(Value::Object(Some(is_ref))) = args.get(1) {
-                if let Value::Object(Some(buf_ref)) = ctx.get_field(*is_ref, 0) {
-                    let len = ctx.array_length(buf_ref);
-                    if len > 0 {
-                        let mut data = Vec::with_capacity(len);
-                        for i in 0..len {
-                            let b = match ctx.get_array_element(buf_ref, i) {
-                                Value::Int(v) => v as u8,
-                                _ => 0,
-                            };
-                            data.push(b);
-                        }
-                        let alias = basic_der_extract_names(&data)
-                            .map(|(subject, _)| subject)
-                            .unwrap_or_else(|| "CN=Unknown".into());
-                        let cert = crate::keystore::make_x509_mirror(ctx, &alias, &data);
-                        ctx.set_array_element(arr, 0, Value::Object(Some(cert)));
-                        ctx.set_field(al, 1, Value::Int(1));
-                        return Ok(Some(Value::Object(Some(al))));
-                    }
+                let raw = match p59_read_input_stream_fully(ctx, *is_ref) {
+                    Ok(bytes) => bytes,
+                    Err(_) => Vec::new(),
+                };
+                if !raw.is_empty() {
+                    // PEM-or-DER, same as `generateCertificate`.
+                    let data = crate::pem_block_to_der(&raw);
+                    let alias = basic_der_extract_names(&data)
+                        .map(|(subject, _)| subject)
+                        .unwrap_or_else(|| "CN=Unknown".into());
+                    let cert = crate::keystore::make_x509_mirror(ctx, &alias, &data);
+                    ctx.set_array_element(arr, 0, Value::Object(Some(cert)));
+                    ctx.set_field(al, 1, Value::Int(1));
+                    return Ok(Some(Value::Object(Some(al))));
                 }
             }
             ctx.set_field(al, 1, Value::Int(0));

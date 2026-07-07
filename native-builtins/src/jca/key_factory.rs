@@ -513,6 +513,89 @@ fn real_rsa_key_from_components(
     Ok(key)
 }
 
+/// Build a GENUINE CRT `RSAPrivateCrtKeyImpl` from the full component set via
+/// `RSAPrivateCrtKeySpec` + the real `RSAKeyFactory$Legacy` SPI.
+///
+/// The 2-arg `real_rsa_key_from_components(.., is_public=false)` path builds an
+/// `RSAPrivateKeySpec(n, d)` → `sun.security.rsa.RSAPrivateKeyImpl` (non-CRT),
+/// whose `getEncoded()` is an incomplete 572-byte PKCS#8 (only n and d; e and
+/// all CRT params encoded as INTEGER 0) that rustls rejects
+/// (`failed to parse private key as RSA`) — the root cause behind
+/// docs/known-issues/http-server-sslengine-identity-singleton-clobber.md. A
+/// freshly generated key HAS its CRT parameters, so build the CRT spec and get
+/// a real `RSAPrivateCrtKeyImpl` with a complete `getEncoded()`.
+///
+/// `comps` is `[n, e, d, p, q, dp, dq, qinv]`, each an unsigned big-endian
+/// magnitude. Every intermediate `BigInteger` is pinned across the subsequent
+/// allocations (the moving collector can relocate them); `new_object_initialized`
+/// then GC-roots its own init args.
+#[allow(clippy::too_many_arguments)]
+fn real_rsa_crt_private_key(
+    ctx: &mut dyn NativeContext,
+    comps: [&[u8]; 8],
+    key_id: u64,
+) -> Result<ObjectRef, MethodCallFailed> {
+    // Build all eight BigIntegers, keeping every previously-built one pinned
+    // across each new allocation. `pin_native_root` returns the slot index;
+    // the first pin's index is the release watermark.
+    let mut objs: [Option<ObjectRef>; 8] = [None; 8];
+    let mut handles: [usize; 8] = [0; 8];
+    let mut base: Option<usize> = None;
+    for (i, bytes) in comps.iter().enumerate() {
+        let bi = build_positive_biginteger(ctx, bytes)?;
+        let h = ctx.pin_native_root(bi);
+        if base.is_none() {
+            base = Some(h);
+        }
+        handles[i] = h;
+        objs[i] = Some(bi);
+    }
+    // Re-read each forwarded ref (a later allocation may have relocated it).
+    let mut args: Vec<Value> = Vec::with_capacity(8);
+    for i in 0..8 {
+        let cur = objs[i].expect("bigint built above");
+        let fwd = ctx.read_native_pin(handles[i], cur);
+        args.push(Value::Object(Some(fwd)));
+    }
+    let built = (|| {
+        let spec = match ctx.new_object_initialized(
+            "java/security/spec/RSAPrivateCrtKeySpec",
+            "(Ljava/math/BigInteger;Ljava/math/BigInteger;Ljava/math/BigInteger;\
+             Ljava/math/BigInteger;Ljava/math/BigInteger;Ljava/math/BigInteger;\
+             Ljava/math/BigInteger;Ljava/math/BigInteger;)V",
+            &args,
+        )? {
+            Some(Value::Object(Some(o))) => o,
+            _ => {
+                return Err(RuntimeError::NotImplemented {
+                    feature: "java.security.spec.RSAPrivateCrtKeySpec".into(),
+                }
+                .into())
+            }
+        };
+        drive_real_rsa_keyfactory(
+            ctx,
+            spec,
+            "engineGeneratePrivate",
+            "Ljava/security/PrivateKey;",
+        )
+    })();
+    if let Some(b) = base {
+        ctx.unpin_native_roots(b);
+    }
+    let key = match built? {
+        Some(Value::Object(Some(o))) => o,
+        _ => {
+            return Err(RuntimeError::NotImplemented {
+                feature: "RSAKeyFactory$Legacy produced no CRT key".into(),
+            }
+            .into())
+        }
+    };
+    crypto_impl::rsa_realkey_map_set(ctx.identity_hash_code(key), key_id);
+    Ok(key)
+}
+
 /// Build both real RSA key objects from raw components and assemble them into a
 /// GENUINE `java.security.KeyPair` via its real constructor — so `getPublic()` /
 /// `getPrivate()` observe the correct `publicKey` / `privateKey` fields (the
@@ -520,17 +603,30 @@ fn real_rsa_key_from_components(
 /// accessors handle for real keys). Pins the public key across the private-key
 /// construction (which allocates and may relocate the heap). The crypto material
 /// is already stored under `key_id`, so sign/verify stay on the fast Rust path.
+///
+/// `crt_priv`, when `Some([p, q, dp, dq, qinv])`, builds the private key as a
+/// full CRT `RSAPrivateCrtKeyImpl` (complete `getEncoded()`); `None` falls back
+/// to the legacy 2-arg `(n, d)` non-CRT key.
+#[allow(clippy::too_many_arguments)]
 fn real_rsa_keypair(
     ctx: &mut dyn NativeContext,
     n_bytes: &[u8],
     e_bytes: &[u8],
     d_bytes: &[u8],
+    crt_priv: Option<[&[u8]; 5]>,
     key_id: u64,
 ) -> Result<ObjectRef, MethodCallFailed> {
     let pub_obj = real_rsa_key_from_components(ctx, n_bytes, e_bytes, key_id, true)?;
     let pin = ctx.pin_native_root(pub_obj);
     let assembled = (|| {
-        let priv_obj = real_rsa_key_from_components(ctx, n_bytes, d_bytes, key_id, false)?;
+        let priv_obj = match crt_priv {
+            Some([p, q, dp, dq, qinv]) => real_rsa_crt_private_key(
+                ctx,
+                [n_bytes, e_bytes, d_bytes, p, q, dp, dq, qinv],
+                key_id,
+            )?,
+            None => real_rsa_key_from_components(ctx, n_bytes, d_bytes, key_id, false)?,
+        };
         // `new_object_initialized` is GC-safe for its init args (VM override), so
         // `priv_obj` needs no separate pin; refresh `pub_obj` post-relocation.
         let pub_obj = ctx.read_native_pin(pin, pub_obj);
@@ -593,6 +689,11 @@ fn real_public_key_from_x509_der(ctx: &mut dyn NativeContext, der: &[u8]) -> Met
                         n: crypto_impl::BigUint::from_bytes_be(&[1]),
                         d: crypto_impl::BigUint::from_bytes_be(&[1]),
                         e: crypto_impl::BigUint::from_bytes_be(&[1]),
+                        p: None,
+                        q: None,
+                        dp: None,
+                        dq: None,
+                        qinv: None,
                     },
                 },
             );
@@ -653,6 +754,11 @@ fn register_rsa_pub_verify_material(ctx: &mut dyn NativeContext, key: ObjectRef)
                         n: crypto_impl::BigUint::from_bytes_be(&[1]),
                         d: crypto_impl::BigUint::from_bytes_be(&[1]),
                         e: crypto_impl::BigUint::from_bytes_be(&[1]),
+                        p: None,
+                        q: None,
+                        dp: None,
+                        dq: None,
+                        qinv: None,
                     },
                 },
             );
@@ -749,6 +855,11 @@ fn register_rsa_priv_sign_material(ctx: &mut dyn NativeContext, key: ObjectRef) 
                 n: crypto_impl::BigUint::from_bytes_be(&n),
                 d: crypto_impl::BigUint::from_bytes_be(&d),
                 e: crypto_impl::BigUint::from_bytes_be(&e),
+                p: None,
+                q: None,
+                dp: None,
+                dq: None,
+                qinv: None,
             },
         },
     );
@@ -1155,6 +1266,21 @@ fn kpg_generate_key_pair(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
         let n_bytes = pk.n.to_bytes_be();
         let e_bytes = pk.e.to_bytes_be();
         let d_bytes = sk.d.to_bytes_be();
+        // Extract the CRT parameter magnitudes BEFORE `sk` is moved into the
+        // key store, so the real private key can be built as a full CRT
+        // `RSAPrivateCrtKeyImpl` (complete `getEncoded()`). Every generated key
+        // carries these; `and_then` yields `None` only for the (never-hit here)
+        // non-CRT case, which falls back to the legacy 2-arg key.
+        let crt_bytes: Option<[Vec<u8>; 5]> = match (&sk.p, &sk.q, &sk.dp, &sk.dq, &sk.qinv) {
+            (Some(p), Some(q), Some(dp), Some(dq), Some(qinv)) => Some([
+                p.to_bytes_be(),
+                q.to_bytes_be(),
+                dp.to_bytes_be(),
+                dq.to_bytes_be(),
+                qinv.to_bytes_be(),
+            ]),
+            _ => None,
+        };
         let pk_der = crypto_impl::Rsa::public_key_to_der(&pk);
         let sk_der = crypto_impl::Rsa::private_key_to_der(&sk);
         let key_id = crypto_impl::rsa_key_next_id();
@@ -1172,7 +1298,16 @@ fn kpg_generate_key_pair(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
         // identity bridge. CRATONVM_SYNTHETIC_RSA=1 restores the bare-interface
         // synthetic keys (faster alloc, but the cast/cert paths fail).
         if crate::route_rsa_to_real() {
-            if let Ok(kp) = real_rsa_keypair(ctx, &n_bytes, &e_bytes, &d_bytes, key_id) {
+            let crt_ref: Option<[&[u8]; 5]> = crt_bytes.as_ref().map(|a| {
+                [
+                    a[0].as_slice(),
+                    a[1].as_slice(),
+                    a[2].as_slice(),
+                    a[3].as_slice(),
+                    a[4].as_slice(),
+                ]
+            });
+            if let Ok(kp) = real_rsa_keypair(ctx, &n_bytes, &e_bytes, &d_bytes, crt_ref, key_id) {
                 return Ok(Some(Value::Object(Some(kp))));
             }
             // Fall through to the synthetic keys if the real SPI is unavailable.
@@ -1371,6 +1506,11 @@ fn kf_generate_public(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
                         n: crypto_impl::BigUint::from_bytes_be(&[1]),
                         d: crypto_impl::BigUint::from_bytes_be(&[1]),
                         e: crypto_impl::BigUint::from_bytes_be(&[1]),
+                        p: None,
+                        q: None,
+                        dp: None,
+                        dq: None,
+                        qinv: None,
                     },
                 },
             );

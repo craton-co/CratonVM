@@ -2757,6 +2757,27 @@ impl GenerationalHeap {
         finalizer_addrs: &[usize],
         monitors: &dyn MonitorCleanup,
     ) -> (GcResult, Vec<usize>) {
+        // DBG (CRATONVM_DBG_GCPAUSE): time every collection and report slow
+        // ones — pairs with CRATONVM_DBG_PARKLAT to split the RRWL
+        // crawl/join-stall between "GC pauses dominate" and "wake latency".
+        struct PauseTimer(Option<std::time::Instant>);
+        impl Drop for PauseTimer {
+            fn drop(&mut self) {
+                if let Some(t0) = self.0 {
+                    let ms = t0.elapsed().as_millis();
+                    if ms >= 100 {
+                        eprintln!("[gcpause] collection took {ms}ms");
+                    }
+                }
+            }
+        }
+        let _pause_timer = {
+            use std::sync::OnceLock;
+            static G: OnceLock<bool> = OnceLock::new();
+            let on =
+                *G.get_or_init(|| std::env::var_os("CRATONVM_DBG_GCPAUSE").is_some());
+            PauseTimer(on.then(std::time::Instant::now))
+        };
         // Phase 6 #1: spin-yield until every live `SafepointToken` has
         // dropped. While a kernel is reading a JVM array on the GPU, we
         // must not move that array — a single token held anywhere on

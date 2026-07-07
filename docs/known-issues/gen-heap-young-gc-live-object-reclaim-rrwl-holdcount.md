@@ -244,3 +244,70 @@ additions on the branch: `CRATONVM_DBG_SWEEP_CENSUS` (per-cycle swept-class
 census + per-victim young/old holder scan + roots-membership check),
 `CRATONVM_SWEEP_FULL_OLD_SCAN` (card-bypass seed), A2 lifecycle dumps at the
 RECLAIMED-LIVE / OOB-guard consumers, and `a2dbg::history_at`.
+
+## 2026-07-07 (second pass): crawl regime FIXED; Thread.tid collision FIXED; ES face narrowed further
+
+**Crawl regime — ROOT-CAUSED AND FIXED (class-init missed-notify).** Phase
+timestamps in the probe decomposed the "crawl" into (a) a body that
+sometimes crawls from t=0 and (b) a constant ~21.4s `Thread.join` tail —
+and per-thread exit stamps showed the tail is ONE straggler thread. The
+recovery always landed at process lifetime ≈ +30.6s (2s-duration probes:
+tail 27.9s; 8s probes: tail 21.37s±15ms), naming a 30-second timeout. It is
+the class-INITIALIZATION waiter in `vm/src/vm/vm_util.rs`: it locked the
+waiter pair's mutex and called `wait_for(30s)` WITHOUT consulting the
+`done` flag that `finalize_class_init` sets under that same mutex before
+`notify_all` — a textbook missed-notify: any thread whose class-state check
+raced the initializer's completion ate the full 30s. One such stall inside
+the RRWL protocol serializes every handoff behind it (the crawl body); at
+shutdown it surfaces as the join tail; during Elasticsearch startup several
+in sequence blow the suite timeout. Fix: wait only while `!*done`.
+Verified: 24/24 probe runs fast (0 crawls, 0 hangs, 0 join tails; wall time
+10.1s→7.7s; throughput ~200M→~240M ops/8s); pre-fix baseline was 5/10
+tails + 2-4/10 crawls.
+
+**Thread.tid collision — REAL BUG, FIXED.** `TidProbe` (committed beside
+the RRWL probes) showed `Thread.threadId()`: main=1, spawned threads
+0,1,2… — tid 0 is invalid and tid 1 DUPLICATES main. Two numbering
+authorities: Java-constructed threads take `ThreadIdentifiers.next()`
+(whose static counter lives in the Unsafe static-long side store and starts
+at 0 — see lead below), while VM-fabricated mirrors (main, attached
+threads) took `vm_id.max(1)`. Colliding tids break every tid-keyed
+algorithm — most relevantly `ReentrantReadWriteLock$Sync`'s
+`cachedHoldCounter.tid == LockSupport.getThreadId(current)` check, which
+then lets DIFFERENT threads share one hold counter (cross-thread hold-count
+corruption ⇒ IMSE / leaked read counts). Fixed by assigning VM-fabricated
+tids from a disjoint high range (`(1<<40) + vm_id`). The probe never saw
+this because its main thread doesn't touch the lock; ES's test thread does.
+
+**Also fixed:** `Thread.onSpinWait`'s native shadow was
+`std::thread::yield_now()` — semantically wrong (HotSpot lowers onSpinWait
+to the PAUSE hint); on a loaded host every AQS pre-park spin surrendered a
+scheduler quantum. Now `std::hint::spin_loop()`. (Measured: not the crawl's
+cause — that was the missed-notify — but wrong and fixed.)
+
+**New autopsy tooling:** `CRATONVM_DBG_IMSE=1` dumps the complete
+`RRWL$Sync` hold-count state at the exact `IllegalMonitorStateException`
+throw site (firstReader identity, cachedHoldCounter addr/count/tid, and the
+current thread's `readHolds` ThreadLocalMap entry, walking the real table).
+Also `CRATONVM_DBG_PARKLAT` (unpark→wake latency ≥50ms) and
+`CRATONVM_DBG_GCPAUSE` (collections ≥100ms).
+
+**ES `testAllEqual` — STILL RED (the one remaining face).** Post-fixes it
+stalls (3/3 at 400s) in the RRWL contention phase; earlier IMSE-face
+autopsy captured `cachedHoldCounter{count=0, tid=0}` on a thread whose
+`readHolds` map entry was already removed (expected post-throw, since
+`tryReleaseShared` removes before throwing). With collisions fixed, the
+count=0 cached counter points at a LOST INCREMENT or torn/broken counter
+update under full JIT (compiled ThreadLocalMap/HoldCounter paths) — catch
+it again with `CRATONVM_DBG_IMSE=1` now that tids are unique; the dump
+prints whether the broken invariant is the identity, the cache, or the map.
+
+**Filed lead (separate defect worth its own fix):** the
+`ThreadIdentifiers` static counter starts at 0 instead of the
+class-initializer's seed because Unsafe STATIC accessors
+(`getAndAddLong`/`getLong` on `staticFieldOffset` offsets) read/write a
+SIDE STORE (`static_long_store`) that is never reconciled with the VM's
+real statics table (where putstatic wrote the seed). Any JDK code mixing
+putstatic-initialized statics with Unsafe static access sees this dual-store
+desync. Tid uniqueness no longer depends on it after the range split, but
+the desync will bite other code.

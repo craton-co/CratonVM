@@ -4738,10 +4738,28 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
                     .set_field(thread_obj, slot, Value::Object(Some(name_str)));
             }
             if let Some(slot) = tid_slot {
-                let tid = self.thread.thread_id.0.max(1);
+                // TID-COLLISION FIX (2026-07-07, ES testAllEqual
+                // IllegalMonitorStateException/stall): Java-constructed
+                // threads get `Thread.tid` from `ThreadIdentifiers.next()`
+                // (whose counter, living in the Unsafe static-long side
+                // store, currently starts at 0 → tids 0,1,2,…), while this
+                // lazy VM mirror path fabricated `vm_id.max(1)` — TWO
+                // numbering authorities whose ranges overlap. main (vm id 0
+                // → tid 1) collided with the second Java-created thread
+                // (tid 1), so tid-keyed algorithms confused the two:
+                // `ReentrantReadWriteLock$Sync`'s `cachedHoldCounter.tid ==
+                // LockSupport.getThreadId(current)` check let DIFFERENT
+                // threads share one hold counter, corrupting read-lock hold
+                // counts (the "attempt to unlock read lock" throw / leaked
+                // read counts stalling the lock). Reproduced standalone with
+                // `TidProbe` (threadId(): main=1, spawned=0,1,2 — duplicate
+                // 1). Assign VM-fabricated tids from a disjoint high range so
+                // the two authorities can never collide; JDK only requires
+                // per-process uniqueness and positivity of threadId().
+                let tid = (1i64 << 40) + self.thread.thread_id.0 as i64;
                 self.shared
                     .heap
-                    .set_field(thread_obj, slot, Value::Long(tid as i64));
+                    .set_field(thread_obj, slot, Value::Long(tid));
             }
             if let Some(slot) = priority_slot {
                 // In JDK 19+ priority lives on FieldHolder, but older

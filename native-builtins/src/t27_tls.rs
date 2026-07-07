@@ -815,6 +815,37 @@ pub fn install_identity_from_der(key_pkcs8_der: &[u8], chain_der: &[Vec<u8>]) {
         );
     }
     let key_pem = der_to_pem(__sniffed, key_pkcs8_der);
+
+    // Validate-before-overwrite (http-server-sslengine-identity-singleton-clobber):
+    // the process-global `RUNTIME_TLS_IDENTITY` is last-write-wins, so a
+    // `KeyStore.setKeyEntry` on an UNRELATED keystore (never wired to the
+    // server's `SSLContext`) used to clobber a working server identity with a
+    // malformed/mismatched one, breaking every subsequent handshake. If a
+    // usable identity is already installed, only overwrite it when the NEW
+    // (cert, key) pair actually builds a rustls `ServerConfig` — i.e. the key
+    // parses and matches its leaf cert. A new identity that fails to build is
+    // rejected (the working one is kept) with a warning; if no identity is
+    // installed yet, we install unconditionally (nothing to protect, and a
+    // first identity that later proves unusable surfaces its own error at
+    // handshake time exactly as before).
+    let candidate_builds =
+        build_server_config_single_cert(&cert_pem, &key_pem, &["http/1.1"], false, None).is_ok();
+    if !candidate_builds {
+        if runtime_tls_identity().is_some() {
+            eprintln!(
+                "[cratonvm-tls] rejecting setKeyEntry TLS identity that does not build a \
+                 valid ServerConfig (key parse/cert-mismatch); keeping the previously \
+                 installed identity (see http-server-sslengine-identity-singleton-clobber)"
+            );
+            return;
+        }
+        // No prior identity: fall through and install anyway — preserves the
+        // pre-fix behavior where the failure (if this identity is ever used)
+        // is reported at handshake time, and avoids regressing any path that
+        // stages an identity the native config-builder happens to reject but
+        // that some other code path repairs.
+    }
+
     set_runtime_tls_identity(Some(RuntimeTlsIdentity {
         cert_pem,
         key_pem,

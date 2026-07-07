@@ -1,9 +1,55 @@
-# ServerHttpsRequestIntegrationTests: RUNTIME_TLS_IDENTITY singleton clobbered by a malformed key [OPEN]
+# ServerHttpsRequestIntegrationTests: RUNTIME_TLS_IDENTITY singleton clobbered by a malformed key [FIXED]
 
-Status: OPEN. Split out of the retired `http-server-cluster-residuals.md`
-(full historical fix context there:
-`docs/internal/fixed-suite-bugs/http-server-cluster-fixes-FIXED.md`, which
-fixed 4 other real bugs in this same test's dependency chain).
+Status: ✅ **FIXED 2026-07-07** (branch `fix/tls-identity-singleton-clobber-20260707`).
+The doc's documented defect — a malformed private key clobbering the
+process-global `RUNTIME_TLS_IDENTITY` and breaking every subsequent handshake —
+is resolved, along with the deeper root cause of *why* the key was malformed and
+two further encoding bugs in the same cert/key setup chain. **FOUR distinct
+CratonVM bugs** were found and fixed here (each verified against HotSpot in
+isolation); the server rustls `ServerConfig` now builds successfully where it
+previously failed at `failed to parse private key`.
+
+The `ServerHttpsRequestIntegrationTests` test itself is still red, but now on a
+**fifth, separate** issue — the Reactor-Netty SSLEngine handshake stalls at
+`BUFFER_UNDERFLOW` in TLS record data-flow, a different subsystem this doc never
+covered — tracked in
+[`../known-issues/reactive-netty-https-sslengine-handshake-underflow.md`](../known-issues/reactive-netty-https-sslengine-handshake-underflow.md).
+
+## The four fixed bugs (in the order the handshake exposed them)
+
+1. **RSA `KeyPairGenerator` produced non-CRT keys with a malformed 572-byte
+   `getEncoded()`** — the doc's "malformed key" mystery (open question #2 below).
+   CratonVM's default fast RSA keygen dropped the primes `p`/`q` and rebuilt the
+   private key via a 2-arg `RSAPrivateKeySpec(n, d)` → a non-CRT
+   `sun.security.rsa.RSAPrivateKeyImpl` whose PKCS#8 has only modulus + private
+   exponent (`e` and all five CRT params encoded as INTEGER 0), where HotSpot
+   emits a complete 1216-byte `RSAPrivateCrtKeyImpl`. rustls rejects the former
+   (`failed to parse private key as RSA, ECDSA, or EdDSA`). Fixed by carrying the
+   CRT parameters on `crypto_impl::RsaPrivateKey` and building the real key via
+   `RSAPrivateCrtKeySpec` (`native-builtins/src/crypto_impl.rs`,
+   `jca/key_factory.rs`). Verified: `getEncoded()` 572 → 1217 bytes,
+   `RSAPrivateCrtKey`, sign/verify round-trip.
+2. **`RUNTIME_TLS_IDENTITY` clobber defense** (this doc's headline, fix candidate
+   (b)): `install_identity_from_der` now validates a candidate identity actually
+   builds a rustls `ServerConfig` before overwriting an already-installed working
+   one (`native-builtins/src/t27_tls.rs`), so an unrelated/malformed
+   `KeyStore.setKeyEntry` can no longer silently break a server that already has a
+   valid identity.
+3. **`CertificateFactory.generateCertificate` returned empty `getEncoded()` on
+   PEM streams** — the native read the raw stream bytes as if always-DER; a
+   PEM-armored stream produced a cert with empty DER. Fixed with PEM-armor
+   detection + base64-decode (`pem_block_to_der`, `native-builtins/src/lib.rs`).
+4. **`generateCertificate`/`generateCertificates` only read a
+   `ByteArrayInputStream`'s field-0 buffer** — any other `InputStream` subtype
+   (Netty's cert stream) read zero bytes → empty-cert stub → rustls
+   `invalid peer certificate: BadEncoding`. Fixed by reading via the generic
+   `p59_read_input_stream_fully` helper (`native-builtins/src/phases_late.rs`).
+   Verified: Netty `SelfSignedCertificate().cert().getEncoded()` 0 → 686 bytes,
+   real `X509CertImpl`.
+
+Historical context: split out of the retired `http-server-cluster-residuals.md`
+(full history: `docs/internal/fixed-suite-bugs/http-server-cluster-fixes-FIXED.md`,
+which fixed 4 other real bugs in this same test's dependency chain).
 
 ## Symptom
 
