@@ -4,6 +4,27 @@ This folder collects CratonVM-only defects found while running upstream Java
 suites. The docs had grown to describe the **same underlying bug from several
 angles**; this index is the consolidated map. Read it first.
 
+## 2026-07-07 ES binary-docvalues range doc retired; residual re-diagnosed as young-GC live-object reclamation (NEW open doc)
+
+- [gen-heap-young-gc-live-object-reclaim-rrwl-holdcount.md](gen-heap-young-gc-live-object-reclaim-rrwl-holdcount.md) —
+  🔴 OPEN, VM-core GC. The `elasticsearch-lucene-binary-docvalues-range-hangs` residual (and the
+  "separate JIT-specific RRWL reader-vs-writer hang" from the 2026-07-06 Azure session) is NOT a JIT
+  miscompile: with every published-compiled method force-skipped (audited via `CRATONVM_DBG_JITC`),
+  the standalone probe still hangs. Direct evidence (`CRATONVM_DBG_SWEEP_ZERO`): the JIT-active
+  non-moving young sweep RECLAIMS a live `ThreadLocalMap$Entry` (RRWL `readHolds` hold-counter
+  storage) → IMSE at unlock / leaked read count → all-parked hang at AQLS.acquire bci 368.
+  `--nojit`+GC-stress completes; JIT-active+GC-stress hangs with nothing meaningful compiled.
+  Fixed `CRATONVM_DBG_SWEEP_EDGES` (was blind to Family-A side-marks) now classifies the loss as
+  case (a): register/native-stack root gap or sweep-walk defect. Hang rate regressed 0/3 →
+  ~6/6 across dev f6aa11c9..007e620a (prime suspect commits listed in the doc). Probe sources:
+  `repros/rwl-holdcount/`. New gated diagnostics on dev: `CRATONVM_DBG_REFERSTO`,
+  `CRATONVM_DBG_UNPARK_MISS`.
+- `elasticsearch-lucene-binary-docvalues-range-hangs.md` retired to
+  [`docs/internal/`](../internal/elasticsearch-lucene-binary-docvalues-range-hangs.md): its three
+  root causes (invokedynamic JIT blacklist, AQS skip-list gaps ×2 rounds, plain-field 16-byte slot
+  tearing) are all FIXED+merged, end-to-end verified on the Windows box (deterministic silent stall
+  → bimodal fast-IMSE/stall, both faces now attributed to the new GC doc above).
+
 ## 2026-07-07 WP1.8 ServiceLoader iterator hang — FIXED, doc retired
 
 - ✅ FIXED (root cause `8a61e6f8`, merged `1b131502`, 2026-07-06): the WP1.8 `ServiceLoader.load(Driver.class).iterator()` acceptance tests (`vm/tests/wp1_8_real_jar_serviceloader.rs`, `vm/tests/wp1_8_serviceloader_e2e.rs`) hung in an infinite `while (it.hasNext())` loop — the `ArrayList$Itr` fallback layout's lastRet slot collided with cursor (both slot 1), so `native_al_itr_next` overwrote its own cursor increment and `hasNext()` never went false on the natively-assembled provider list. Causally verified: the doc-era tree (`d9cb7be8`) hangs; the same tree + only the `8a61e6f8` native-collections patch passes in 0.01s; current dev passes 5/5 on Linux (real-JDK jdk25 + synthetic fallback) and Windows (jdk-25, the original report platform). Both `#[ignore]`s removed so the acceptance bar is enforced by default again; doc retired to [`docs/internal/wp1-8-real-jar-serviceloader-hang-FIXED.md`](../internal/wp1-8-real-jar-serviceloader-hang-FIXED.md).

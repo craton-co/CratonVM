@@ -1,11 +1,22 @@
 # Elasticsearch Lucene binary doc-values range query hangs
 
-Status: open (root causes #1 and #2 FIXED; root cause #3's underlying
-mechanism -- plain-field 16-byte slot tearing -- FIXED and merged; full
-end-to-end confirmation against the real ES test still pending, see below)
+Status: RETIRED to docs/internal 2026-07-07 — all three root causes this doc
+tracked are FIXED. End-to-end `testAllEqual` runs on the Windows box confirm
+the failure mode changed accordingly: the historical DETERMINISTIC silent
+stall (identical every run, including `--nojit`) is replaced by run-dependent
+bimodal behaviour — the method now either FAILS fast (~70s) with the concrete
+`IllegalMonitorStateException` this doc predicted from hold-count corruption,
+or still stalls (observed once at a 400s cap under heavy box load). BOTH
+remaining faces are now attributed, with direct evidence, to a DIFFERENT,
+independently characterized defect — young-GC live-object reclamation
+corrupting RRWL read-lock hold counts — tracked by the new open doc
+`docs/known-issues/gen-heap-young-gc-live-object-reclaim-rrwl-holdcount.md`,
+which also retires this doc's "separate JIT-specific reader-vs-writer hang"
+residual (it was never a JIT miscompile at all — see the 2026-07-07 final
+update at the bottom).
 
 Date observed: 2026-07-02
-Date updated: 2026-07-06 (fifth update)
+Date updated: 2026-07-07 (final update — retirement)
 
 ## Summary
 
@@ -344,3 +355,65 @@ C:\craton\CratonVM-elasticsearch-current-suite-20260702\apps\elasticsearch-suite
 C:\craton\CratonVM-elasticsearch-current-suite-20260702\apps\elasticsearch-suite-runner\.suite\results\es-current-full-jiton-20260702\all-jit\logs\server.org.elasticsearch.lucene.queries.IntegerRandomBinaryDocValuesRangeQueryTests.out.log
 C:\craton\CratonVM-elasticsearch-full-suite-20260702\apps\elasticsearch-suite-runner\.suite\results\es-full-hotspot-20260702\hotspot-jit\results.tsv
 ```
+
+## 2026-07-07 final update: end-to-end confirmation done; residual re-diagnosed and split out; doc retired
+
+Work on branch `fix/es-binary-docvalues-range-close-20260706` (worktree
+`C:\craton\CratonVM-es-bdvr-close-20260706`, unique binary
+`cratonvm-es-bdvr-close-20260706.exe`), base `c15cee62`.
+
+**End-to-end confirmation of root causes #1–#3 (the pending item):** direct
+`JUnitCore -Dtests.method=testAllEqual` runs of
+`LongRandomBinaryDocValuesRangeQueryTests` on the Windows box with the real
+ES checkout (seed B17AC9D3E1F2A0C4). The historical behaviour — a
+DETERMINISTIC silent stall at `testAllEqual` reproducing identically on
+every run including `--nojit` (two TaskExecutor workers parked forever at
+`AbstractQueuedLongSynchronizer.acquire` bci 368) — is replaced by
+run-dependent bimodal behaviour: run 1 completed the search workload and
+failed in ~70s (JUnit `Time: 70.19`) with
+`java.lang.IllegalMonitorStateException: attempt to unlock read lock, not
+locked by current thread` — exactly the exception this doc's root-cause-#3
+analysis predicted surfaces when read-lock hold-count bookkeeping is
+corrupted and the silent-lost-wakeup path is closed; a later run under heavy
+box load reached the RRWL contention phase (~49s in) and stalled to a 400s
+cap. #1 (invokedynamic JIT blacklist), #2 (AQS skip-list gaps, both rounds)
+and #3's tearing mechanism (interpreter + jit_getfield atomic slot access)
+are confirmed effective; BOTH remaining faces (fast IMSE / stall) are the
+new GC defect's two documented regimes (its standalone probe shows the same
+IMSE-or-hang bimodality with identical stack signatures).
+
+**The surviving IMSE failure is a different defect, now properly
+characterized** (it also subsumes the "separate JIT-specific
+reader-vs-writer hang" residual this doc carried):
+
+- It is NOT a JIT miscompile. With `CRATONVM_JIT_BISECT_SKIP` covering every
+  method that publishes a compiled artifact in the repro (audited per-run via
+  `CRATONVM_DBG_JITC`), the probe still hangs. The prior session's 22-method
+  rule-out list was chasing a wrong premise — no compiled method is the
+  culprit, which is why skip-listing "never worked".
+- The true differential is the GC mode + frequency: any thread executing JIT
+  code routes young collections to the non-moving sweep
+  (`sweep_young_non_moving`); under GC pressure that path reclaims (zeroes)
+  live young objects. Directly observed via `CRATONVM_DBG_SWEEP_ZERO`:
+  `RECLAIMED-LIVE ... invoked as java/lang/ThreadLocal$ThreadLocalMap$Entry.
+  refersTo` under `Sync.tryAcquireShared` — the RRWL `readHolds` per-thread
+  hold-counter storage. Lost entry → fresh count-0 HoldCounter at unlock →
+  IMSE (the ES failure), or leaked read count → writer parks forever → total
+  hang (the probe failure). `--nojit` + `CRATONVM_DBG_GC_STRESS` completes;
+  JIT-active + same stress hangs even with nothing meaningful compiled.
+- Also ruled out with new gated diagnostics (merged on this branch): GC weak
+  ref clearing (0 CLEARs in 26k decisions), `refersTo` false-negatives
+  (`CRATONVM_DBG_REFERSTO`), unpark Thread-mirror lookup misses
+  (`CRATONVM_DBG_UNPARK_MISS`).
+- dev regression data: hang rate on the standalone probe went from 0/3
+  (f6aa11c9, 2026-07-05) through 1/8 (a1bf33fb) to ~6/6 at tip (c15cee62) —
+  the amplifying window is f6aa11c9..007e620a.
+
+Full evidence, repro recipe (probe sources committed under
+`docs/known-issues/repros/rwl-holdcount/`), ruled-out list, regression data
+and next steps live in the new open doc:
+`docs/known-issues/gen-heap-young-gc-live-object-reclaim-rrwl-holdcount.md`.
+
+Per the known-issues triage rule, this doc's primary defects (the three
+root causes) are fixed and the residual is tracked by a separate open doc,
+so this doc retires to `docs/internal/`.
