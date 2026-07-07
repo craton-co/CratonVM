@@ -56,11 +56,17 @@ bug (below) during fixture setup. `rerun.sh`'s status computation doesn't check
 
 - **`JpaLargeBlobTest`**: was `FAIL` (`NoSuchMethodError: java/lang/Object.read()I`,
   see the archived probe in `docs/internal` if still present) → now **`HANG`**
-  (`rc=124`, ran the full 1200s). The dispatch bug that used to fail fast now
-  blocks instead — worth checking whether an in-flight fix changed the
-  `read()` call to something that blocks (e.g. now correctly dispatches into
-  a real blocking stream read that never gets its expected data) rather than
-  raising immediately.
+  (`rc=124`, ran the full 1200s). **Investigated 2026-07-07, see the "2026-07-07:
+  fast-fail became a multi-hour non-hang" section of
+  [hib-jpalargeblobtest-object-read-nosuchmethod.md](../internal/fixed-suite-bugs/hib-jpalargeblobtest-object-read-nosuchmethod.md):**
+  not a blocking call — a `--stack-dump-on-timeout` probe against current
+  `dev` shows the main thread genuinely still executing, stuck in neither a
+  lock nor a native call, but grinding through the test fixture's own
+  200 MiB byte-at-a-time `InputStream.read()` loop (2704 near-identical
+  stack dumps in a 3s window, all at the same leaf frame, zero root-count
+  growth). Both 2026-07-05/06 crash fixes removed the early aborts that used
+  to mask this; the class was apparently never previously exercised to
+  completion. Not a VM correctness regression — no fix landed, doc-only.
 - **`InPredicateTest`**: was `FAIL` (`NullPointerException: ... "values" is null`)
   → now `FAIL` with a completely different symptom: `TimeoutException:
   testInPredicate(...) timed out after 120 seconds` (total `ms=608596` across

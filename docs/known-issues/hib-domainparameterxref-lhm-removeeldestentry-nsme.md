@@ -2,11 +2,30 @@
 
 | | |
 |---|---|
-| **Status** | 🔴 OPEN — root cause traced to the receiver's `ClassId` reading `0`, which matches this codebase's already-documented, unresolved "Layer 1 register-invisible roots" gap. Not independently fixable here; see analysis below. |
+| **Status** | 🔴 OPEN, but **UNVERIFIED as of 2026-07-07** — see the "2026-07-07 update" note below. Root cause traced to the receiver's `ClassId` reading `0`, which matches this codebase's already-documented, unresolved "Layer 1 register-invisible roots" gap. Not independently fixable here; see analysis below. |
 | **Area** | VM — JIT/GC precise-root-tracking ("Layer 1"), surfacing here via the native `LinkedHashMap` shim's `removeEldestEntry` guard (`native-collections/src/lib.rs`) |
 | **Symptom** | `java.lang.NoSuchMethodError: java/lang/Object.removeEldestEntry(Ljava/util/Map$Entry;)Z` |
 | **Severity** | blocks `org.hibernate.orm.test.jpa.criteria.InPredicateTest` (and likely any other criteria/HQL-parameter test that constructs `DomainParameterXref`) from completing, once the earlier `values`-null NPE is fixed — see [`docs/internal/hib-inpredicatetest-criteria-values-null-npe-FIXED.md`](../internal/hib-inpredicatetest-criteria-values-null-npe-FIXED.md). |
 | **Discovered** | 2026-07-06. Root cause traced same day. |
+
+## 2026-07-07 update — symptom no longer observed, but likely masked, not fixed
+
+`InPredicateTest` no longer throws this NSME as of `dev@fa1c505f` — it now times
+out earlier in the same test method instead (`TimeoutException` @ 120s), see
+[hib-inpredicate-dispatch-heavy-jit-timeout-20260707.md](hib-inpredicate-dispatch-heavy-jit-timeout-20260707.md).
+Stack-dump sampling of a clean, uncontended repro shows the test consistently
+timing out inside `SqmCriteriaNodeBuilder.in()` (criteria-predicate
+construction), which runs **before** `session.createQuery(cr)` — the call that
+triggers `DomainParameterXref`'s constructor and this doc's NSME. So
+`DomainParameterXref` is very likely never reached at all in the current
+timing profile, not fixed. Confirmed via `CRATONVM_DBG_LHM_EVICT=1` and
+`CRATONVM_DBG_OSR=1` on the current binary: no `removeEldestEntry`/NSME
+activity of any kind appears in the log, consistent with "unreached" rather
+than "fixed." **Do not retire this doc to `internal/` on the basis of
+`InPredicateTest` alone** — its Layer-1 root cause is a separate, still-open
+question that would need a repro that actually reaches `DomainParameterXref`
+(e.g. a synthetic direct repro, or re-checking once the dispatch-heavy JIT
+slowdown blocking `.in()` is addressed).
 
 ## Symptom
 
