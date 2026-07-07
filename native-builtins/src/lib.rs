@@ -25091,6 +25091,62 @@ fn native_surefire_forkedbooter_acknowledged_exit(
                 &[Value::Object(Some(this)), Value::Object(Some(bye))],
             ),
         );
+        // The write above reaches the OS pipe correctly, but CratonVM can
+        // then call process::exit() before Maven's own asynchronous
+        // stdout-pumping thread has even been scheduled to read it -- for
+        // trivial/fast test classes there is enough real wall-clock work
+        // (class loading, JIT warmup, GC) in a real HotSpot fork that this
+        // race never shows up there, but CratonVM's much faster teardown
+        // exposes it. Real Surefire's own acknowledgedExit() handles this by
+        // registering a bye-ack listener and blocking (bounded) until the
+        // parent's ForkClient explicitly acknowledges receipt
+        // (TestLessInputStream.acknowledgeByeEventReceived() queues
+        // Command.BYE_ACK and releases a semaphore) -- do the same here
+        // instead of exiting blind. Bounded well under the real 30s default
+        // exit-timeout: this is only ever meant to absorb an OS scheduling
+        // gap of a few milliseconds, not to wait out a genuinely wedged
+        // parent.
+        if let Value::Object(Some(command_reader)) = cr {
+            let wait_result: MethodCallResult = (|| {
+                let sem = match ctx.new_object("java/util/concurrent/Semaphore")? {
+                    Some(Value::Object(Some(o))) => o,
+                    _ => return Ok(None),
+                };
+                ctx.invoke_special(
+                    "java/util/concurrent/Semaphore",
+                    "<init>",
+                    "(I)V",
+                    &[Value::Object(Some(sem)), Value::Int(0)],
+                )?;
+                let listener = match ctx.new_object("org/apache/maven/surefire/booter/ForkedBooter$6")? {
+                    Some(Value::Object(Some(o))) => o,
+                    _ => return Ok(None),
+                };
+                ctx.invoke_special(
+                    "org/apache/maven/surefire/booter/ForkedBooter$6",
+                    "<init>",
+                    "(Lorg/apache/maven/surefire/booter/ForkedBooter;Ljava/util/concurrent/Semaphore;)V",
+                    &[
+                        Value::Object(Some(listener)),
+                        Value::Object(Some(this)),
+                        Value::Object(Some(sem)),
+                    ],
+                )?;
+                ctx.invoke_virtual(
+                    command_reader,
+                    "addByeAckListener",
+                    "(Lorg/apache/maven/surefire/booter/CommandListener;)V",
+                    &[Value::Object(Some(listener))],
+                )?;
+                ctx.invoke_virtual(
+                    sem,
+                    "tryAcquire",
+                    "(JLjava/util/concurrent/TimeUnit;)Z",
+                    &[Value::Long(2000), Value::Object(None)],
+                )
+            })();
+            surefire_ignore("bye-ack-wait", wait_result);
+        }
     }
     surefire_ignore(
         "cancelPingScheduler",
@@ -36373,6 +36429,53 @@ fn register_t19_h2_lookup_clinit_deps(registry: &mut NativeMethodRegistry) {
         "registerMethodsToFilter",
         "(Ljava/lang/Class;[Ljava/lang/String;)V",
         |_ctx, _args| Ok(None),
+    );
+
+    // --- Reflection.areNestMates(Class, Class) ---
+    //
+    // JEP 181 nestmate access check, exposed to library code (e.g. JDK
+    // serialization's `ObjectStreamClass` privileged-lookup path, which
+    // Spring's `beanProviderSerialization` test exercises via
+    // `ObjectInputStream`). Real semantics
+    // (`Reflection.areNestMates` -> `Class.isNestmateOf`): identical
+    // classes are always nestmates; otherwise two classes are nestmates
+    // iff they resolve to the same nest host. Delegate to
+    // `native_class_get_nest_host` (already used by `Class.getNestHost()`)
+    // for host resolution so both entry points agree on a class's host,
+    // including the lambda-proxy special case it already handles.
+    registry.register(
+        refl,
+        "areNestMates",
+        "(Ljava/lang/Class;Ljava/lang/Class;)Z",
+        |ctx, args| {
+            let a = obj_arg(args, 0)?;
+            let b = obj_arg(args, 1)?;
+            if a == b {
+                return Ok(Some(Value::Int(1)));
+            }
+            let host_a = match crate::lang_class::native_class_get_nest_host(
+                ctx,
+                &[Value::Object(Some(a))],
+            )? {
+                Some(Value::Object(Some(h))) => h,
+                _ => a,
+            };
+            let host_b = match crate::lang_class::native_class_get_nest_host(
+                ctx,
+                &[Value::Object(Some(b))],
+            )? {
+                Some(Value::Object(Some(h))) => h,
+                _ => b,
+            };
+            let same = match (
+                crate::lang_class::mirror_class_id(ctx, host_a),
+                crate::lang_class::mirror_class_id(ctx, host_b),
+            ) {
+                (Some(x), Some(y)) => x == y,
+                _ => host_a == host_b,
+            };
+            Ok(Some(Value::Int(if same { 1 } else { 0 })))
+        },
     );
 
     // --- ClassFileDumper.getInstance(String, String) ---
