@@ -210,7 +210,24 @@ static TM_REGISTRY: OnceLock<RwLock<HashMap<i32, TrustManagerState>>> = OnceLock
 static NEXT_KM_ID: OnceLock<RwLock<i32>> = OnceLock::new();
 static NEXT_TM_ID: OnceLock<RwLock<i32>> = OnceLock::new();
 
-fn km_registry() -> &'static RwLock<HashMap<i32, KeyManagerState>> {
+// FIX (tomcat-clientauth-engine-config): promoted from private to
+// `pub(crate)` so `phases_late.rs`'s `KeyManagerFactory.getKeyManagers()`
+// stub (a separate, competing registration on the PUBLIC
+// `javax/net/ssl/KeyManagerFactory` class itself, active whenever the KMF
+// object was allocated via that module's own `getInstance` rather than
+// going through the real SPI `factorySpi.engineGetKeyManagers()`
+// delegation chain this module's `kmf_engine_get_key_managers` backs) can
+// register a KeyManager in the SAME registry `chooseClientAlias`/
+// `getPrivateKey` (below) consult, instead of returning a non-functional,
+// bare-interface-stamped `javax/net/ssl/X509KeyManager` object whose
+// methods have no Code and throw `AbstractMethodError` the instant real
+// Java bytecode (e.g. a test's wrapper `KeyManager` delegating to the
+// array `getKeyManagers()` returned) calls one directly. Mirrors the
+// identical `pub(crate)`-promotion precedent already applied to
+// `jca::provider_chain::find`/`make_provider` for the sibling
+// `KeyManagerFactory.getProvider()` fix (see this crate's
+// `docs/known-issues/tls-ocsp-clientcert-validation-not-enforced.md`).
+pub(crate) fn km_registry() -> &'static RwLock<HashMap<i32, KeyManagerState>> {
     KM_REGISTRY.get_or_init(|| RwLock::new(HashMap::new()))
 }
 
@@ -218,7 +235,7 @@ fn tm_registry() -> &'static RwLock<HashMap<i32, TrustManagerState>> {
     TM_REGISTRY.get_or_init(|| RwLock::new(HashMap::new()))
 }
 
-fn next_km_id() -> i32 {
+pub(crate) fn next_km_id() -> i32 {
     let cell = NEXT_KM_ID.get_or_init(|| RwLock::new(1));
     let mut g = cell.write();
     let id = *g;
@@ -2856,7 +2873,7 @@ pub fn check_endpoint_identity(
 // KeyManagerFactoryImpl$SunX509: slot 0 = i32 km_id.
 // TrustManagerFactoryImpl$SimpleFactory: slot 0 = i32 tm_id.
 
-const FQN_SUN_X509_KM: &str = "sun/security/ssl/SunX509KeyManagerImpl";
+pub(crate) const FQN_SUN_X509_KM: &str = "sun/security/ssl/SunX509KeyManagerImpl";
 const FQN_X509_KM: &str = "sun/security/ssl/X509KeyManagerImpl";
 const FQN_X509_TM: &str = "sun/security/ssl/X509TrustManagerImpl";
 const FQN_PKIX_VALIDATOR: &str = "sun/security/validator/PKIXValidator";
@@ -3401,7 +3418,7 @@ fn get_km_id(ctx: &mut dyn NativeContext, this: ObjectRef) -> i32 {
     0
 }
 
-fn set_km_id(ctx: &mut dyn NativeContext, this: ObjectRef, id: i32) {
+pub(crate) fn set_km_id(ctx: &mut dyn NativeContext, this: ObjectRef, id: i32) {
     ctx.set_field_by_name(this, "cratonvm$x509km$id", Value::Int(id));
     let n = ctx.object_num_fields(this);
     if n > 0 {

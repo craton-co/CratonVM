@@ -39775,6 +39775,24 @@ fn new13_do_create_socket(
     Ok(Some(Value::Object(Some(sock))))
 }
 
+/// FIX (tomcat-clientauth-engine-config): identity-hash side table mapping a
+/// `javax/net/ssl/KeyManagerFactory` object (allocated with the REAL class
+/// shape — no room for a `cratonvm$...` pseudo-field) to the keystore
+/// registry id it was `init()`-ed with. Lets `getKeyManagers()` (below)
+/// build a real, functional `KeyManager` via `x509_manager`'s
+/// `km_registry`/`FQN_SUN_X509_KM` machinery instead of the previous
+/// non-functional bare-`javax/net/ssl/X509KeyManager`-interface stub, whose
+/// methods have no Code and threw `AbstractMethodError` for any caller that
+/// invoked one directly (e.g. a test wrapper `KeyManager` delegating to the
+/// array `getKeyManagers()` returned — see
+/// `docs/known-issues/tls-ocsp-clientcert-validation-not-enforced.md`,
+/// "Residual #2 implementation" for the full trace that found this).
+fn kmf_keystore_id_by_identity() -> &'static parking_lot::Mutex<rustc_hash::FxHashMap<i32, i32>> {
+    static T: std::sync::OnceLock<parking_lot::Mutex<rustc_hash::FxHashMap<i32, i32>>> =
+        std::sync::OnceLock::new();
+    T.get_or_init(|| parking_lot::Mutex::new(rustc_hash::FxHashMap::default()))
+}
+
 pub(crate) fn register_p68_ssl(r: &mut NativeMethodRegistry) {
     let __prev_cat = r.current_category();
     r.set_category(cratonvm_native_api::NativeKind::Bridge);
@@ -40738,12 +40756,39 @@ pub(crate) fn register_p68_ssl(r: &mut NativeMethodRegistry) {
     });
     r.register(kmf, "init", "(Ljava/security/KeyStore;[C)V", |ctx, args| {
         // Fields 0-2 (provider/factorySpi/algorithm) are fixed at construction
-        // to match the real class layout — init() doesn't touch them. The only
-        // state this stub's callers actually rely on is the thread-local
-        // identity staging below (per-SSLContext mTLS identity flow); nothing
-        // reads the keystore/password back off this object.
+        // to match the real class layout — init() doesn't touch them. The
+        // thread-local identity staging below (per-SSLContext mTLS identity
+        // flow) is one consumer of the keystore this KMF was init'd with.
+        //
+        // FIX (tomcat-clientauth-engine-config): ALSO stash the keystore's
+        // registry id directly on this KMF object (via `set_field_by_name`'s
+        // pseudo-field convention — a real `javax.net.ssl.KeyManagerFactory`
+        // has no room for it, same reasoning as `x509_manager.rs`'s
+        // `cratonvm$x509km$id`/`cratonvm$x509tm$id` side-fields), so
+        // `getKeyManagers()` below can build a REAL, functional KeyManager
+        // instead of the non-functional bare-interface stub it used to
+        // return (see that handler's doc comment for the full story).
         if let Some(Value::Object(Some(ks))) = args.get(1) {
             crate::keystore::keystore_set_pending_km_identity(ctx, *ks);
+            let ks_id = crate::keystore::keystore_id_from_object(ctx, *ks);
+            if ks_id != 0 {
+                let this = obj_arg(args, 0)?;
+                // `set_field_by_name` would silently no-op here: this KMF
+                // object is allocated with the REAL `javax/net/ssl/
+                // KeyManagerFactory` class shape (fields 0-2 already fixed to
+                // provider/factorySpi/algorithm above), which declares no
+                // `cratonvm$...` pseudo-field for a real class to land on —
+                // same trap this doc's helpers (`keystore.rs::
+                // store_id_by_identity`, `x509_manager.rs::km_id_by_identity`/
+                // `tm_id_by_identity`) were all built to route around. Use an
+                // identity-hash side table directly rather than
+                // `set_field_by_name`/`set_field`, neither of which has
+                // anywhere to durably land the value on this object shape.
+                let ih = ctx.identity_hash_code(this);
+                if ih != 0 {
+                    kmf_keystore_id_by_identity().lock().insert(ih, ks_id);
+                }
+            }
         }
         Ok(None)
     });
@@ -40757,8 +40802,67 @@ pub(crate) fn register_p68_ssl(r: &mut NativeMethodRegistry) {
         kmf,
         "getKeyManagers",
         "()[Ljavax/net/ssl/KeyManager;",
-        |ctx, _args| {
-            let km = alloc_concurrent_synthetic(ctx, "javax/net/ssl/X509KeyManager", 0);
+        |ctx, args| {
+            // FIX (tomcat-clientauth-engine-config): this handler used to
+            // return a bare `alloc_concurrent_synthetic(ctx,
+            // "javax/net/ssl/X509KeyManager", 0)` — an object stamped with
+            // the INTERFACE's own class id (it's a real, loadable JDK
+            // interface, so `ensure_class_initialized` happily "succeeds").
+            // Every one of `X509KeyManager`'s 6 methods is abstract with no
+            // Code, so real Java bytecode calling any of them directly
+            // (rather than going through this crate's own
+            // `t27_tls::JavaKeyManagerResolver`, which never calls
+            // `getKeyManagers()` at all — it captures the KeyManager array
+            // straight off `SSLContext.init()`'s arguments instead) hit an
+            // unconditional `AbstractMethodError`. Confirmed via direct
+            // `CRATONVM_DBG_NOCODE=1` tracing against Tomcat's
+            // `TesterSupport.TrackingKeyManager` (`test/org/apache/tomcat/
+            // util/net/TesterSupport.java`), whose `chooseClientAlias`
+            // override does exactly this
+            // (`manager.chooseClientAlias(keyType, issuers, socket)`,
+            // `manager` being whatever `getKeyManagers()` returned) — see
+            // `docs/known-issues/tls-ocsp-clientcert-validation-not-
+            // enforced.md`, "Residual #2 implementation" for the full trace.
+            //
+            // Fixed by building the SAME real, natively-backed
+            // `FQN_SUN_X509_KM`-shaped object `x509_manager.rs`'s
+            // `kmf_engine_get_key_managers` already produces for the SPI
+            // delegation path (`KeyManagerFactoryImpl$SunX509.
+            // engineGetKeyManagers`, reached when a caller goes through the
+            // real `factorySpi` chain) — `chooseClientAlias`/
+            // `chooseServerAlias`/`getCertificateChain`/`getClientAliases`/
+            // `getPrivateKey`/`getServerAliases` are all real, working
+            // natives on that class (`x509_manager::register_key_manager`),
+            // so a wrapper's direct delegate call now completes instead of
+            // throwing. Registered in the SAME `km_registry` +
+            // `next_km_id`/`set_km_id` id space so `choose_client_alias`/
+            // `get_private_key`'s registry lookups resolve correctly. Falls
+            // back to the old (non-functional but at least allocation-safe)
+            // stub only when no keystore id was ever captured — matches
+            // this handler's original behavior for a `getKeyManagers()`
+            // call with no preceding `init(KeyStore, char[])`, which is not
+            // a real/expected call shape for this API but shouldn't panic.
+            let this = obj_arg(args, 0)?;
+            let ih = ctx.identity_hash_code(this);
+            let ks_id = if ih != 0 {
+                kmf_keystore_id_by_identity()
+                    .lock()
+                    .get(&ih)
+                    .copied()
+                    .unwrap_or(0)
+            } else {
+                0
+            };
+            let km = if ks_id != 0 {
+                let state = crate::x509_manager::build_key_manager_state(ks_id);
+                let km_id = crate::x509_manager::next_km_id();
+                crate::x509_manager::km_registry().write().insert(km_id, state);
+                let km = alloc_concurrent_synthetic(ctx, crate::x509_manager::FQN_SUN_X509_KM, 2);
+                crate::x509_manager::set_km_id(ctx, km, km_id);
+                km
+            } else {
+                alloc_concurrent_synthetic(ctx, "javax/net/ssl/X509KeyManager", 0)
+            };
             let arr = ctx.new_array(cratonvm_types::ArrayElementType::Reference, 1);
             ctx.set_array_element(arr, 0, Value::Object(Some(km)));
             Ok(Some(Value::Object(Some(arr))))
