@@ -1,15 +1,14 @@
 # ElytronRemoteOutboundConnectionTestCase: native SIGSEGV during elytron subsystem / remoting-client test execution
 
-Status: RESOLVED — fixed 2026-07-07
-Severity: was High (hard native crash, not a catchable Java exception; blocked the whole test class)
+Status: FIXED 2026-07-07 (for the SIGSEGV specifically — see correction below; the A4 register-only-oop attribution was revised, not confirmed) via dev 60079fc4
+Severity: High (hard native crash, not a catchable Java exception; blocks the whole test class)
 First confirmed: 2026-07-07, Azure worktree `wt-keyfactory-translatekey` (branch `fix/keyfactory-translatekey-20260707`)
-Root-caused (initial, later corrected): 2026-07-07, Azure worktree `wt-elytron-segv-20260707` (branch `fix/elytron-remoting-segv-20260707`)
-Actually fixed: 2026-07-07, Azure worktree `wt-a4-register-oop-20260707` (branch `fix/a4-register-oop-bitmap-20260707`)
+Root-caused: 2026-07-07, Azure worktree `wt-elytron-segv-20260707` (branch `fix/elytron-remoting-segv-20260707`)
 
 ## Symptom
 
 Running `org.jboss.as.test.manualmode.ejb.client.outbound.connection.security.ElytronRemoteOutboundConnectionTestCase`
-(module `testsuite/integration/manualmode`) under CratonVM (`jit-real` mode) via Maven/Surefire crashed
+(module `testsuite/integration/manualmode`) under CratonVM (`jit-real` mode) via Maven/Surefire crashes
 the forked JVM outright:
 
 ```text
@@ -20,109 +19,255 @@ the forked JVM outright:
 terminated without properly saying goodbye. VM crash or System.exit called?
 ```
 
-## Root cause (CONFIRMED and FIXED 2026-07-07): missing autoboxing in `OptionMap.get(Option)Object`
+Exit code 139 = SIGSEGV. Confirmed **still reproducing on current dev** (`4e6dc36d`, 2026-07-07) — same
+crash point, twice in a row.
 
-The initial investigation (same day, see history below) got a real gdb backtrace and found the crash
-site — `NativeContextImpl::read_string` dereferencing a garbage `ObjectRef` inside
-`xnio_async::native_builder_set` — but mis-attributed the mechanism to the known-but-unrelated "A4
-register-only oop" JIT/GC gap. That attribution was wrong. The **actual** root cause, found by enabling
-`CRATONVM_DBG_JIT_MIC=1` and inspecting the exact call sequence immediately before the crash:
+## ✅ CORRECTED 2026-07-07 ~16:35 — fixed via `jit_invoke_virtual_mic` arg-decode validation (NOT the general A4 register-oop-bitmap gap)
+
+The crash this doc documents is now fixed on `dev` (`60079fc4`,
+"fix(jit): validate heap membership for L/[ arg slots in jit_invoke_virtual_mic").
+Root cause, re-derived from a live gdb repro of this exact class's crash and
+cross-checked against two other same-day docs that share the byte-identical
+`read_string <- native_builder_set <- safe_native_call <- invoke_or_native <-
+jit_invoke_virtual_mic` backtrace and the same small-round-number fault
+addresses ([[wildfly-infinispan-remove-listener-segfault]],
+[[wildfly-xnio-mockselector-mutex-segfault]]):
+
+`jit_invoke_virtual_mic`'s inline `decode_values` closure
+(`vm/src/jit/helpers.rs`) decoded a raw `i64` call-argument slot into an
+`ObjectRef` whenever the callee's descriptor said `L`/`[` and the bits merely
+LOOKED like a plausible pointer (8-byte aligned, under the 48-bit canonical
+ceiling) -- it never checked the bits were an actual live heap address, unlike
+its own sibling `decode_dispatch_values` a few hundred lines above, which
+already calls `vm.heap.is_object_address()` for the identical decode.
+`org.xnio.OptionMap$Builder.set(Option, Object)` is called throughout XNIO
+worker/channel setup with numeric options (read/write timeouts, keepalive
+intervals, etc.) as boxed `Long`s; whenever one of those primitive longs
+reached this decode path unboxed, a round millisecond value like 60000 or
+120000 is ALSO 8-byte-aligned and well under 2^48, so it passed the old
+"plausible pointer" check trivially -- `ObjectRef::from_raw` fabricated a bogus
+reference into unmapped memory, and `native_builder_set`'s `ctx.read_string(s)`
+a few instructions later dereferenced its header. SIGSEGV.
+
+**This revises the "A4 register-only-oop family" attribution below.** That
+theory required a REAL, previously-valid `String` `ObjectRef` to go stale
+because GC relocated/reclaimed it while it sat only in a register, untracked,
+across a non-call safepoint. The actual fault addresses tell a simpler story:
+`0xea60` (60000) and `0x1d4c0` (120000) are not "small-looking-because-
+relocated" addresses -- they are exactly the millisecond timeout CONSTANTS
+XNIO passes to `Builder.set`. The value was never a real pointer at any point;
+it was a primitive that never went through boxing and got type-confused for a
+reference by one weak validation gap. The bisection evidence below
+(`--nojit` eliminates the crash; `--no-precise-maps` makes no difference) is
+equally consistent with this simpler mechanism -- the fix lives entirely in
+JIT-only code that the interpreter's own correctly-tagged argument path never
+goes through, and precise vs. conservative stack maps have nothing to do with
+a decode-time type-confusion bug. That bisection does not, on its own,
+distinguish between the two theories.
+
+**The general A4 register-oop-bitmap gap (`OopMapEntry` has no register-oop
+bitmap, `jit/src/lib.rs:52-73`) is very likely still real and still open** --
+this fix does not touch `OopMapEntry` or any safepoint/root-scanning code, only
+`jit_invoke_virtual_mic`'s own argument decode. [[fork6-fjp-multithread-jit-root-reclamation]]
+remains the correct tracker for that broader, still-unimplemented concern; this
+doc's specific crash turned out to be a narrower, independently-fixed decode
+bug that happened to produce a symptom shape (SIGSEGV in `read_string`,
+JIT-only, small fault address) easy to mistake for the bigger gap.
+
+**Verification**: this exact class no longer SIGSEGVs on the fixed binary --
+re-run via `run-suite-linux.sh` with `--class-to 300` hit the 300s ceiling as a
+`TIMEOUT`, not a `CRASH`/exit-139 (the timeout is consistent with the separate,
+already-documented GC-barrier blocked-region-transition boot hang in
+[[wildfly-xnio-mockselector-mutex-segfault]]'s "Reproduction attempt" section,
+not a new problem from this fix). No kernel segfault was recorded for this run.
+A full pass/fail (not just crash-free) confirmation of this specific class is
+still worth doing once the GC-barrier hang is separately fixed, but the SIGSEGV
+this doc exists to document is gone.
+
+## ADDENDUM 2026-07-07 ~17:00 -- complementary source-level fix: `OptionMap.get(Option)Object` also now boxes correctly
+
+`60079fc4` (above) is a defense-in-depth fix at the JIT argument-decode layer: it stops a leaked raw
+primitive from being fabricated into a wild `ObjectRef` (converts it to `null` instead), which is what
+stops the SIGSEGV. But it does not fix the actual source of the leaked primitive. Independently (same
+day, worktree `wt-a4-register-oop-20260707`, branch `fix/a4-register-oop-bitmap-20260707`), traced the
+concrete data flow one level further back using `CRATONVM_DBG_JIT_MIC=1` against the live crash: the
+`60000`/`120000` values passed to `Builder.set(Option, Object)` originate from
+`org/xnio/OptionMap.get(Lorg/xnio/Option;)Ljava/lang/Object;` (a `get()` call feeding its own result
+directly into a `set()` call -- the common "copy an option from one map into another" idiom). Its native
+override, `native_option_map_get` (`native-builtins/src/xnio_async.rs`), stores numeric option values
+unboxed internally (`OptionValue::Int`/`Long`/`Bool`) and, for the generic `Object`-returning overloads,
+was returning that raw value directly as `Value::Int`/`Value::Long` instead of boxing it -- violating the
+method's declared `Ljava/lang/Object;` return type. This is architecturally the SAME missing-boxing bug
+`60079fc4` protects against at the decode layer, just caught at its origin instead of its landing site.
+
+**Why both fixes matter**: `60079fc4` alone means `Builder.set(option, workerMap.get(otherOption))`
+would no longer crash, but would silently store `null` where a real `60000` belonged -- a correctness
+bug, not a crash, and one that could resurface identically for any OTHER native method with the same
+"stores primitives unboxed, forgets to box on the generic `Object` accessor" shape. Fixing
+`native_option_map_get` at the source makes `OptionMap.get(Option)Object` return a real, correct
+`Integer`/`Long`/`Boolean` -- verified to match real HotSpot exactly (`getClass()`/`instanceof`/`equals()`/
+the typed-primitive-overload sibling/the default-`null`-when-missing fallback), not just "doesn't crash."
+Both changes are complementary and both landed on dev: `60079fc4` as a general JIT-layer safety net for
+this whole bug *class*, and the `native_option_map_get` boxing fix for this specific *instance*'s
+correctness. See `native-builtins/src/xnio_async.rs`'s `native_option_map_get` doc comment for the
+source-level writeup.
+
+## Root cause (CONFIRMED 2026-07-07): A4 register-only-oop family
+
+**Disambiguation from the concurrent [[wildfly-xnio-mockselector-mutex-segfault]]
+investigation**: that doc's crash (unlocking a `std::sync::Mutex<T>` on invalid
+memory, in `native-builtins/src/xnio_io_thread.rs`'s I/O-selector subsystem) is a
+**native Rust handle/lifetime bug** (an `Arc`/`Box`-owned native object freed while
+another thread still holds a raw pointer/handle to it). This doc's crash (below) is
+a **Java-heap GC-root bug**: `NativeContextImpl::read_string` dereferencing a stale
+`java/lang/String` `ObjectRef` in `vm/src/vm/vm_exec.rs`, whose staleness traces to
+the JIT not tracking a register-resident oop across a safepoint
+(`vm/src/jit/helpers.rs`, `jit/src/lib.rs`) — nowhere near `xnio_io_thread.rs` or
+`std::sync::Mutex`. Confirmed via live gdb backtrace (see below) that these are two
+distinct mechanisms in two different subsystems, not the same root cause wearing
+two symptoms, despite both being WildFly-under-CratonVM SIGSEGVs found the same day.
+
+
+Got a real backtrace by driving Surefire's own `-Djvm=<path ending in bin/java.exe>` property at a
+**gdb wrapper script** (Surefire validates the jvm path's parent dir must literally be named `bin` and
+the executable `java`/`java.exe`, and the forked process's stdout is consumed by Surefire's own binary
+IPC protocol — so gdb's own textual output must be redirected via `set logging file ... redirect on`,
+NOT left on stdout, or Surefire never even starts the fork). This pattern (drop-in `-Djvm=` gdb wrapper
++ direct `mvnw -Dtest=... -Djvm=<wrapper>/bin/java.exe test`, bypassing `run-suite-linux.sh` for this one
+diagnostic run) is reusable for any future CratonVM-under-Surefire native crash — no core dump needed,
+no WildFly-specific setup beyond `CRATONVM_JAVA_HOME` env.
 
 ```text
-[JIT_MIC] org/xnio/OptionMap.get(Lorg/xnio/Option;)Ljava/lang/Object; cached_cid=0 recv_cid=2426 entry=0
-[JIT_MIC] org/xnio/OptionMap$Builder.set(Lorg/xnio/Option;Ljava/lang/Object;)Lorg/xnio/OptionMap$Builder; cached_cid=0 recv_cid=2404 entry=0
-Segmentation fault (core dumped)
+Thread 2 "main-vm" received signal SIGSEGV, Segmentation fault.
+0x0000555555adea57 in <cratonvm_vm::vm::vm_exec::NativeContextImpl as cratonvm_native_api::registry::NativeContext>::read_string ()
+#1  cratonvm_native_builtins::xnio_async::native_builder_set ()
+#2  cratonvm_vm::vm::vm_exec::safe_native_call ()
+#3  cratonvm_vm::vm::vm_exec::invoke_or_native ()
+#4  cratonvm_vm::jit::helpers::jit_invoke_virtual_mic ()
+#5..#16  (unwinder garbage through the JIT-generated call site — no debug/unwind info emitted for JIT'd code)
+#17 cratonvm_native_api::native_ring::record_exit ()
+#18 cratonvm_vm::vm::vm_exec::safe_native_call ()
+#19 cratonvm_vm::runtime::interpreter::invoke_cached_native_callback ()
+#20 cratonvm_vm::runtime::interpreter::execute_invokestatic_cached ()
+#21 cratonvm_vm::runtime::interpreter::execute_frame ()
+#22 cratonvm_vm::runtime::interpreter::execute ()
+#23 cratonvm_vm::vm::vm_exec::invoke_on_class_shared_inner ()
+#24 cratonvm_vm::vm::vm_exec::invoke_or_native ()
+#25 <NativeContextImpl as NativeContext>::invoke_virtual ()
+#26 cratonvm_native_builtins::lang_class::native_method_invoke ()
+#27 cratonvm_native_builtins::lang_reflect::native_method_invoke_boxed ()
+#28 cratonvm_vm::vm::vm_exec::safe_native_call ()
+... (frames #29-#115+ repeat the #18-#27 invokevirtual→interpreter→Method.invoke cycle
+     roughly a dozen times — a deep recursive reflective-dispatch chain, consistent
+     with WildFly's management-operation marshalling)
 ```
 
-`OptionMap.get(Option)Object`'s result flows directly into `Builder.set(Option, Object)`'s second
-argument (copying an option from one map into another, a common XNIO idiom). `native_option_map_get`
-(`native-builtins/src/xnio_async.rs`) stores numeric option values unboxed internally
-(`OptionValue::Int`/`Long`/`Bool`, populated by the primitive `set(Option<Integer>, int)`-family
-overloads in `native_builder_set`), which is a fine internal representation — but when read back through
-the **generic, `Object`-returning** `get(Option)Object` / `get(Option, Object)Object` overloads, the old
-code returned the raw value directly:
+`native_builder_set` (`native-builtins/src/xnio_async.rs:859`, the native override for
+`org.xnio.OptionMap$Builder.set(Option, Object)`) does `ctx.read_string(s)` on `args[2]` (the `value`
+argument) with **no allocation in between** receiving `args` and the read — so the `ObjectRef` was
+*already* a dangling/stale pointer by the time it reached this native. The corruption happened earlier,
+somewhere up the deep reflective call chain (frames #29+), most likely while a live `String` reference
+was held **only in a register** (not a scanned stack slot) across a GC-triggering safepoint inside that
+recursion, then later copied — now stale — into the `jit_invoke_virtual_mic` call-argument buffer at
+frame #4.
 
-```rust
-Some(OptionValue::Int(n)) => Ok(Some(Value::Int(*n))),   // WRONG: declared return type is Object
-Some(OptionValue::Long(n)) => Ok(Some(Value::Long(*n))), // WRONG
-Some(OptionValue::Bool(b)) => Ok(Some(Value::Int(if *b { 1 } else { 0 }))), // WRONG
+**Two bisection experiments, both via the same gdb-wrapper repro:**
+
+1. **`CRATONVM_DISABLE_JIT=1` (interpreter-only): crash GONE.** All 22 test methods ran to completion
+   (0 crashes; they then failed on an unrelated `java.io.IOException` — a different, non-fatal issue,
+   not investigated here). Confirms the bug is JIT-specific.
+2. **`CRATONVM_NO_PRECISE_JIT_MAPS=1` with JIT still ON: crash UNCHANGED** (identical `read_string`
+   crash site, identical call chain). This **refutes** the natural suspicion that today's
+   `f22a8d8c` ("flip precise JIT oop maps back to DEFAULT-ON") caused/exposed this — precise maps
+   being on or off makes no difference here. The bug is a **general JIT** gap, not specific to that
+   flip; it was simply never reachable under CratonVM before because this WildFly test class never got
+   past its `@Before` setup until [[wildfly-keyfactory-translatekey-null-spi]] was fixed today.
+
+**This matches an already-documented, deliberately-deferred gap exactly**: `docs/known-issues/
+gcstress-residual-corruption-faces.md` (§"Precise-JIT-oop-maps do NOT fix this residual") and
+`docs/known-issues/fork6-fjp-multithread-jit-root-reclamation.md` (the "A4" tracker) both describe —
+and this session's own bisection independently re-confirms — that even with precise JIT stack maps on,
+**`OopMapEntry` has no register-oop bitmap** (`jit/src/lib.rs:52-73`): a register-only oop is covered
+by neither the frame-slot maps nor conservative stack scanning, only by
+`emit_pre_safepoint_spill` (which only fires at *call* safepoints). A live oop held only in a register
+across some other safepoint (e.g. inside a deep interpreter/reflection recursion, not a JIT call
+safepoint) can go stale if GC relocates or reclaims it, and any later use of that register's value is a
+dangling-pointer read — exactly what happened here.
+
+**Why this finding matters beyond just this WildFly test**: the existing A4 tracker's repros are all
+synthetic, multi-threaded `Fork6Hard ... GC_STRESS=...` runs orchestrating `ForkJoinPool` worker races,
+and that doc explicitly says the ForkJoinPool residual "never crashes on current dev" (it usually
+surfaces as contained guard warnings or occasional NPEs). **This is a single-process, single-thread-at-
+the-crash-point, real production code path (WildFly Elytron + JBoss Remoting + XNIO) that reliably
+SIGSEGVs** — a much simpler, more direct, real-world repro of the same underlying gap than orchestrating
+GC-stress races. Whoever picks up the A4 register-oop-bitmap work should use this repro to verify the
+eventual fix, in addition to the existing Fork6Hard lane.
+
+## Repro
+
+**Fastest (no gdb, just confirms the crash)**:
+```bash
+cd /data/data/wt-wildfly-bugbash-20260707-runner   # or any checkout of apps/wildfly-suite-runner's Linux driver
+export WILDFLY=/data/data/cratonvm/apps/wildfly
+export CRATONVM_BIN=<any cratonvm release binary with the keyfactory-translatekey fix merged (fdfeb8c8+), or later dev>
+export JDK25_WIN=/home/victor/jdk25
+./run-suite-linux.sh run --category all --jit on --jdk real --class-to 300 \
+  --only 'ElytronRemoteOutboundConnectionTestCase' --tag repro
+# -> classes: CRASH=1, Process Exit Code: 139 (SIGSEGV)
 ```
 
-This violates the Java method's contract (`Ljava/lang/Object;`) — a `60000` int option (e.g.
-`Options.READ_TIMEOUT`'s common default) came back as raw `Value::Int(60000)` instead of a boxed
-`Integer`. The **interpreter's** generic native-return handling tolerated this (manifesting more mildly,
-as a spurious `null` — confirmed separately, see Verification below), but the **JIT's** fast MIC cache-
-miss return path (`vm/src/jit/helpers.rs`, the `invoke_or_native` result conversion) takes the raw `i64`
-and treats it as an already-valid pointer-shaped `ObjectRef` when the call site's static return type says
-`Object`:
-
-```rust
-Some(Value::Int(v)) => v as i64,   // returned as the call's raw ABI result — the JIT
-                                    // caller reads it back as a pointer for an Object-typed call
+**With a gdb backtrace** (bypasses `run-suite-linux.sh`'s `.exe`-suffix cp-binary wrapper, which can't
+host a script; drives Maven directly instead):
+```bash
+mkdir -p /tmp/gdbwrap/bin
+cat > /tmp/gdbwrap/bin/java.exe << 'EOF'
+#!/bin/bash
+rm -f /tmp/gdb-backtrace.log
+exec gdb -q -batch \
+  -ex 'set confirm off' -ex 'set pagination off' -ex 'set backtrace limit 300' \
+  -ex 'set logging file /tmp/gdb-backtrace.log' -ex 'set logging redirect on' -ex 'set logging enabled on' \
+  -ex 'handle SIGSEGV stop print nopass' -ex run \
+  -ex 'thread apply all bt full' -ex 'set logging enabled off' -ex quit \
+  --args <path-to-cratonvm-binary> "$@"
+EOF
+chmod +x /tmp/gdbwrap/bin/java.exe
+cd /data/data/cratonvm/apps/wildfly/testsuite/integration/manualmode
+export CRATONVM_JAVA_HOME=/home/victor/jdk25
+rm -rf target/surefire-reports
+/data/data/cratonvm/apps/wildfly/mvnw -B -ntp -Dsurefire.default-test.phase=test \
+  -Dtest=ElytronRemoteOutboundConnectionTestCase \
+  -DfailIfNoTests=false -Dsurefire.failIfNoSpecifiedTests=false \
+  -Djvm=/tmp/gdbwrap/bin/java.exe test
+# backtrace lands in /tmp/gdb-backtrace.log regardless of Maven's own exit status
 ```
 
-`60000 as i64 = 0x00_00_00_00_00_00_EA_60` — the exact faulting address (`segfault at ea60`) confirmed by
-kernel logs and gdb across every reproduction. The very next native call to touch that bogus "reference"
-(`Builder.set`'s `ctx.read_string(s)` on the "value" argument) dereferences it and crashes.
+Both require a binary with the `KeyFactory.translateKey`/`getKeySpec` fix (`fdfeb8c8`+) — against an
+unfixed binary the class fails earlier (in `@Before`) and never reaches this crash.
 
-## Fix
+## Evidence
 
-`native_option_map_get`, in the three primitive branches, now boxes the value through the crate's
-existing `lang_class::box_value(ctx, value, type_desc)` helper (the same helper used elsewhere for
-reflection/`Method.invoke` boxing) before returning it as `Value::Object(Some(boxed))`, matching what a
-real `Map<Option<?>, Object>`-backed `OptionMap` would already hold. The specialized primitive overloads
-(`get(Option<Integer>, int)I`, `get(Option<Long>, long)J`, `get(Option<Boolean>, boolean)Z`) are
-untouched — they correctly return raw primitives because *their* declared return type is the primitive
-itself, not `Object`.
+```text
+/data/data/wt-wildfly-bugbash-20260707-runner/out/verify-fix-jit-real-all-20260707-053719/logs/00001-*.log
+/data/data/wt-wildfly-bugbash-20260707-runner/out/precheck-jit-real-all-20260707-150946/logs/00001-*.log  (re-confirmed on dev@4e6dc36d)
+/data/data/cratonvm/apps/wildfly/testsuite/integration/manualmode/target/surefire-reports/*.dumpstream    (trace log ending in "Segmentation fault (core dumped)")
+/data/data/scratch-elytron-segv/gdb-backtrace.log   (full gdb backtrace, both JIT+precise-maps-on and JIT+precise-maps-off runs)
+```
 
-## Verification
+## Suggested next steps
 
-1. **The real WildFly repro** — `ElytronRemoteOutboundConnectionTestCase` via the actual Maven/Surefire
-   harness — no longer crashes. Confirmed twice in a row (`Tests run: 22, Failures: 0, Errors: 22`, zero
-   `Process Exit Code: 139` / `Segmentation fault` anywhere in either run's log — the 22 errors are a
-   separate, pre-existing `java.io.IOException` issue unrelated to this fix, matching exactly what
-   `CRATONVM_DISABLE_JIT=1` already showed against the pre-fix binary).
-2. **Targeted correctness repro** (`BoxingRepro.java`, driving the real `xnio-api` jar directly, no
-   WildFly needed): sets an int/string/boolean option, reads them back via the generic `get(Option)Object`
-   accessor, and checks `getClass()`, `instanceof`, `equals()`, the typed-primitive-overload path, and the
-   default-`null` fallback for a missing key. Pre-fix CratonVM (interpreter-only, too short-lived to JIT)
-   threw `NullPointerException: Cannot invoke "Object.getClass()" because "<local3>" is null` — the
-   SAME missing-box bug, manifesting as null instead of a crash outside JIT. Fixed CratonVM matches real
-   HotSpot output exactly on every check.
-3. **Stress repros** (16-thread × 15s, 500K-iteration single-thread, both using the real `OptionMap.Builder`)
-   — clean on the fixed binary, no regressions.
-4. **`cargo test -p cratonvm-native-builtins xnio_async`** — 26/26 pass. Three pre-existing tests asserted
-   the *buggy* raw-`Value::Int` return and needed updating to assert the correctly-boxed value instead
-   (they were literally encoding the bug as expected behavior).
-
-## Investigation history (for context — the initial mis-attribution)
-
-The same-day investigation that found the crash site initially concluded this was the long-standing,
-deliberately-deferred "A4 register-only oop" JIT/GC gap (`OopMapEntry` has no register-oop bitmap —
-tracked in `fork6-fjp-multithread-jit-root-reclamation.md` / `gcstress-residual-corruption-faces.md`),
-based on: (a) `CRATONVM_DISABLE_JIT=1` made the crash disappear, and (b) the crash shape (small,
-non-heap-looking faulting address) superficially matched that family's known signature. Both were true
-but pointed at the wrong mechanism — every existing GC-root-visibility mitigation was bisection-tested
-(`CRATONVM_NO_PRECISE_JIT_MAPS=1`, `CRATONVM_JIT_SAFEPOINT_REG_SPILL=all`, `CRATONVM_MOVING_YOUNG=1` +
-`CRATONVM_SHADOW_STACK=1`) and **none** changed the crash, which in hindsight was the tell that this
-wasn't a root-visibility problem at all. Three independent minimal-repro attempts using real XNIO
-`OptionMap.Builder` (plain loop, 16-thread concurrent, reflective-recursion-mimicking) also failed to
-reproduce it — because none of them replicated the actual data flow (`get()`'s return value fed directly
-into `set()`'s argument). Enabling the existing `CRATONVM_DBG_JIT_MIC=1` diagnostic against the real
-WildFly repro was what actually cracked it: the exact call sequence immediately preceding the crash,
-including the *cache-miss* status (`entry=0`) showing this was a cold first-dispatch, not a warmed hot
-path — which reframed the investigation away from "stale reference across a GC safepoint" and toward
-"wrong value produced at this exact call," leading directly to the boxing bug above.
-
-**Lesson for next time**: when several independent GC-tracking mitigations *all* fail to change a
-crash, stop assuming it's a GC-root-visibility bug — it likely isn't. A faulting address that looks like
-a plausible *domain value* (a round number, a common config default) is a stronger signal of a
-type/boxing confusion than of pointer staleness.
+Not a quick fix — this is the same class of gap `fork6-fjp-multithread-jit-root-reclamation.md`
+describes as needing a **register-oop bitmap on `OopMapEntry`** (`jit/src/lib.rs:52-73`), a real JIT
+codegen feature addition (tracking which live oops are register-resident, not just frame-slot-resident,
+at every safepoint), not attempted in this session — too large/risky to implement blind without the
+established JIT-team context on that project. When someone picks up the A4 register-oop-bitmap work,
+this doc's repro (single-threaded, deterministic, real production code) is a much cheaper verification
+lane than orchestrating `Fork6Hard ... GC_STRESS=...` races.
 
 ## Related
 
 Found via [[wildfly-keyfactory-translatekey-null-spi]]'s own fix-verification run — not caused by that
-fix, just newly reachable because of it (this WildFly test class never got far enough to hit this code
-path before). NOT the A4 register-only-oop family after all, despite the initial same-day
-misattribution — see investigation history above. `docs/known-issues/fork6-fjp-multithread-jit-root-reclamation.md`
-and `gcstress-residual-corruption-faces.md` remain open, unrelated issues.
+fix, just newly reachable because of it. Root cause is the same family as
+[[fork6-fjp-multithread-jit-root-reclamation]] (the canonical A4 register-only-oop tracker) and the
+"Precise-JIT-oop-maps do NOT fix this residual" section of `gcstress-residual-corruption-faces.md` —
+see those docs for the register-oop-bitmap fix design context. NOT caused by `f22a8d8c`'s precise-JIT-
+maps default-ON flip (bisected: identical crash with `CRATONVM_NO_PRECISE_JIT_MAPS=1`).
