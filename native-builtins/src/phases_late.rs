@@ -40602,7 +40602,18 @@ pub(crate) fn register_p68_ssl(r: &mut NativeMethodRegistry) {
         },
     );
 
-    // KeyManagerFactory = 3-field (algorithm=0, keystore=1, password=2)
+    // KeyManagerFactory = 3-field, matching the REAL javax.net.ssl.KeyManagerFactory
+    // field declaration order exactly (`javap -p javax.net.ssl.KeyManagerFactory`:
+    // `provider`, `factorySpi`, `algorithm`, in that order — NOT the order fields
+    // are first referenced in the constant pool, which is a different, easy-to-
+    // misread ordering). `getProvider()`/`getAlgorithm()` have no native override
+    // here, so they fall through to real bytecode reading these exact slots
+    // (`getProvider()` returns field 0, `getAlgorithm()` returns field 2 — see
+    // `javap -c`). The previous field numbering here (algorithm=0, keystore=1,
+    // password=2) put the algorithm *String* at slot 0, so real bytecode's
+    // `getProvider()` returned that String in place of a `Provider` — callers
+    // invoking `.getInfo()` on it (e.g. `SSLUtilBase.getKeyManagers`) got
+    // `NoSuchMethodError: java/lang/String.getInfo()`.
     let kmf = "javax/net/ssl/KeyManagerFactory";
     r.register(
         kmf,
@@ -40610,9 +40621,27 @@ pub(crate) fn register_p68_ssl(r: &mut NativeMethodRegistry) {
         "(Ljava/lang/String;)Ljavax/net/ssl/KeyManagerFactory;",
         |ctx, args| {
             let obj = alloc_concurrent_synthetic(ctx, "javax/net/ssl/KeyManagerFactory", 3);
-            ctx.set_field(obj, 0, args.get(0).copied().unwrap_or(Value::Object(None)));
-            ctx.set_field(obj, 1, Value::Object(None));
-            ctx.set_field(obj, 2, Value::Object(None));
+            // field 0: provider — a real `Provider` object, not the SPI's
+            // factorySpi/algorithm, so `getProvider().getInfo()` et al. work.
+            // Built via `provider_chain`'s own `make_provider` (not a raw
+            // `alloc_concurrent_synthetic` + indexed `set_field`): in
+            // real-JDK mode `alloc_concurrent_synthetic` upsizes the object
+            // to `java/security/Provider`'s full real field count —
+            // inherited Hashtable/Properties fields included — so a plain
+            // slot-0/1 write lands on whatever field happens to occupy that
+            // slot in the real inheritance layout, not `name`/`version`.
+            // `make_provider` writes by field NAME (`set_field_by_name`)
+            // specifically to survive that, and its registered `getInfo()`
+            // native reads the same "info" field back by name — see
+            // `jca/provider_chain.rs`'s module doc for the full story. Using
+            // the same "SunJSSE" entry already seeded in the provider chain
+            // keeps this consistent with `Security.getProvider("SunJSSE")`.
+            let (version, coverage) = crate::jca::provider_chain::find("SunJSSE")
+                .unwrap_or((25.0, "coverage: KeyManagerFactory{SunX509,NewSunX509,PKIX}"));
+            let provider = crate::jca::provider_chain::make_provider(ctx, "SunJSSE", version, coverage);
+            ctx.set_field(obj, 0, Value::Object(Some(provider)));
+            ctx.set_field(obj, 1, Value::Object(None)); // factorySpi — unused by this stub
+            ctx.set_field(obj, 2, args.get(0).copied().unwrap_or(Value::Object(None))); // algorithm
             Ok(Some(Value::Object(Some(obj))))
         },
     );
@@ -40627,21 +40656,19 @@ pub(crate) fn register_p68_ssl(r: &mut NativeMethodRegistry) {
     );
     r.register(kmf, "getAlgorithm", "()Ljava/lang/String;", |ctx, args| {
         let this = obj_arg(args, 0)?;
-        if ctx.object_num_fields(this) > 0 {
-            Ok(Some(ctx.get_field(this, 0)))
+        if ctx.object_num_fields(this) > 2 {
+            Ok(Some(ctx.get_field(this, 2)))
         } else {
             let s = ctx.create_string("SunX509");
             Ok(Some(Value::Object(Some(s))))
         }
     });
     r.register(kmf, "init", "(Ljava/security/KeyStore;[C)V", |ctx, args| {
-        let this = obj_arg(args, 0)?;
-        if ctx.object_num_fields(this) > 2 {
-            ctx.set_field(this, 1, args.get(1).copied().unwrap_or(Value::Object(None)));
-            ctx.set_field(this, 2, args.get(2).copied().unwrap_or(Value::Object(None)));
-        }
-        // Stage this keystore's identity for the next SSLContext.init on this
-        // thread (per-SSLContext mTLS identity flow).
+        // Fields 0-2 (provider/factorySpi/algorithm) are fixed at construction
+        // to match the real class layout — init() doesn't touch them. The only
+        // state this stub's callers actually rely on is the thread-local
+        // identity staging below (per-SSLContext mTLS identity flow); nothing
+        // reads the keystore/password back off this object.
         if let Some(Value::Object(Some(ks))) = args.get(1) {
             crate::keystore::keystore_set_pending_km_identity(ctx, *ks);
         }
@@ -40651,13 +40678,7 @@ pub(crate) fn register_p68_ssl(r: &mut NativeMethodRegistry) {
         kmf,
         "init",
         "(Ljavax/net/ssl/ManagerFactoryParameters;)V",
-        |ctx, args| {
-            let this = obj_arg(args, 0)?;
-            if ctx.object_num_fields(this) > 1 {
-                ctx.set_field(this, 1, args.get(1).copied().unwrap_or(Value::Object(None)));
-            }
-            Ok(None)
-        },
+        |_ctx, _args| Ok(None),
     );
     r.register(
         kmf,
