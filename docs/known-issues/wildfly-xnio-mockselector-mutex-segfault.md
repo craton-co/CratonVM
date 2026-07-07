@@ -54,11 +54,16 @@ path. Then apply the identity-hash side-table handle pattern
 ([[reference_real_bytecode_pseudofield_identity_hash_pattern]]) or reference-count
 the handle registry so a GC/finalize can't free it mid-native-call.
 
-**Coordination note:** a concurrent session is (2026-07-07 ~15:10) actively
-gdb-debugging the sibling [[wildfly-elytron-remoting-segfault-post-keyfactory-fix]]
-in `/data/data/scratch-elytron-segv/` using the same wildfly checkout
-(`/data/data/cratonvm/apps/wildfly`). These three WildFly SIGSEGVs may share
-this native-handle-UAF root cause; whoever pins one should check the other two.
+**Coordination note, resolved 2026-07-07 ~15:26:** the concurrent
+[[wildfly-elytron-remoting-segfault-post-keyfactory-fix]] investigation got a live
+gdb backtrace of its crash and confirmed it is a **different** mechanism from this
+one -- a Java-heap GC-root bug (JIT-tracked `String` `ObjectRef` gone stale across a
+safepoint, in `vm/src/jit/helpers.rs` / `vm/src/vm/vm_exec.rs`), not a native
+`std::sync::Mutex`/handle UAF in `xnio_io_thread.rs`. So these two do NOT share this
+native-handle-UAF root cause -- they are separate bugs that happen to both be
+WildFly-under-CratonVM SIGSEGVs found the same day. Still worth checking
+[[wildfly-infinispan-remove-listener-segfault]] against whichever mechanism gets
+confirmed here.
 
 ## Symptom
 

@@ -24,6 +24,20 @@ crash point, twice in a row.
 
 ## Root cause (CONFIRMED 2026-07-07): A4 register-only-oop family
 
+**Disambiguation from the concurrent [[wildfly-xnio-mockselector-mutex-segfault]]
+investigation**: that doc's crash (unlocking a `std::sync::Mutex<T>` on invalid
+memory, in `native-builtins/src/xnio_io_thread.rs`'s I/O-selector subsystem) is a
+**native Rust handle/lifetime bug** (an `Arc`/`Box`-owned native object freed while
+another thread still holds a raw pointer/handle to it). This doc's crash (below) is
+a **Java-heap GC-root bug**: `NativeContextImpl::read_string` dereferencing a stale
+`java/lang/String` `ObjectRef` in `vm/src/vm/vm_exec.rs`, whose staleness traces to
+the JIT not tracking a register-resident oop across a safepoint
+(`vm/src/jit/helpers.rs`, `jit/src/lib.rs`) — nowhere near `xnio_io_thread.rs` or
+`std::sync::Mutex`. Confirmed via live gdb backtrace (see below) that these are two
+distinct mechanisms in two different subsystems, not the same root cause wearing
+two symptoms, despite both being WildFly-under-CratonVM SIGSEGVs found the same day.
+
+
 Got a real backtrace by driving Surefire's own `-Djvm=<path ending in bin/java.exe>` property at a
 **gdb wrapper script** (Surefire validates the jvm path's parent dir must literally be named `bin` and
 the executable `java`/`java.exe`, and the forked process's stdout is consumed by Surefire's own binary
