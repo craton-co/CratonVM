@@ -1209,6 +1209,16 @@ thread_local! {
         const { std::cell::RefCell::new(None) };
 }
 
+/// Read-once: is `CRATONVM_JIT_FREE_CODE` set (the A/B mode that actually
+/// frees evicted artifacts and their deopt-point boxes)? Mirrors the reads in
+/// `ExecutableBuffer::drop` / `CompiledMethod::drop` (jit/src/lib.rs); in the
+/// default retain-everything mode this is `false` and superseded artifacts'
+/// deopt boxes remain valid for the process lifetime.
+fn jit_free_code_enabled() -> bool {
+    static FLAG: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *FLAG.get_or_init(|| std::env::var_os("CRATONVM_JIT_FREE_CODE").is_some())
+}
+
 /// Take (and clear) the frame most recently reconstructed by a deopt.
 pub fn take_last_deopt() -> Option<ReconstructedFrame> {
     LAST_DEOPT.with(|c| c.borrow_mut().take())
@@ -1226,6 +1236,29 @@ pub fn take_last_deopt() -> Option<ReconstructedFrame> {
 /// so the interpreter's outer `take_last_deopt` still consumes it.
 pub fn has_last_deopt() -> bool {
     LAST_DEOPT.with(|c| c.borrow().is_some())
+}
+
+/// Peek the stashed frame's `(method_key, bci)` identity without clearing it.
+///
+/// Used by the dispatch-helper precise-resume arm
+/// (`try_resume_trapped_callee`, vm/src/jit/helpers.rs) to decide — BEFORE
+/// consuming the stash — whether the frame belongs to the compiled callee this
+/// helper just invoked. A non-matching frame must stay stashed so it
+/// propagates (with the sentinel) to the outer consumer that CAN attribute it.
+pub fn peek_last_deopt_identity() -> Option<(String, u32)> {
+    LAST_DEOPT.with(|c| {
+        c.borrow()
+            .as_ref()
+            .map(|f| (f.method_key.clone(), f.bci))
+    })
+}
+
+/// Put a taken frame back (the take-inspect-restash pattern for consumers that
+/// discover mid-flight they cannot handle it). Overwrites any newer stash —
+/// callers only restash what they just took, with no interleaving stash
+/// possible on the same thread.
+pub fn restash_last_deopt(frame: ReconstructedFrame) {
+    LAST_DEOPT.with(|c| *c.borrow_mut() = Some(frame));
 }
 
 /// Deopt trampoline entry — called from JIT code when a guard fails.
@@ -1291,10 +1324,19 @@ pub extern "C" fn x64_deopt_entry(
     regs: *const SavedRegisters,
     epoch_guard: *const DeoptEpochGuard,
 ) -> i64 {
-    // Before-deref staleness short-circuit, FIRST — it consults only the
-    // retained guard, never `point`/`regs`, so a superseded artifact is handled
-    // without touching the (possibly-freed) box even when those are null/garbage.
-    if !epoch_guard.is_null() {
+    // Before-deref staleness short-circuit — ONLY when `CRATONVM_JIT_FREE_CODE`
+    // is set (the A/B mode that actually frees artifacts and their deopt-point
+    // boxes on eviction). In the default retain-everything mode the box is
+    // leaked for the process lifetime (see `CompiledMethod`'s Drop), and a
+    // superseded artifact's snapshot is still SELF-CONSISTENT with the machine
+    // state of the (retained, still-executing) code that trapped — the epochs
+    // version the SPECULATION, not the frame layout. Short-circuiting here for
+    // retained code stashed an identity-less `bci == u32::MAX` sentinel that
+    // forced every post-supersession trap onto the imprecise whole-method
+    // re-run — re-introducing the side-effect duplication for exactly the
+    // methods that keep getting dispatched via stale cached entries after
+    // their first de-speculation (jit-invokedynamic-groovy-regression fix).
+    if !epoch_guard.is_null() && jit_free_code_enabled() {
         // SAFETY: a non-null `epoch_guard` is a retained `DeoptEpochGuard`
         // (process-lifetime, see `CompiledMethod`'s Drop) — valid to read.
         let guard = unsafe { &*epoch_guard };
@@ -1394,14 +1436,21 @@ mod x64_deopt_entry_tests {
         assert!(take_last_deopt().is_none());
     }
 
-    /// deopt-osr Step 9 follow-up (a): a SUPERSEDED guard (live epoch advanced
-    /// past the artifact's creation epoch) short-circuits BEFORE the box is
-    /// dereferenced — it stashes a sentinel re-run frame (out-of-range bci) and
-    /// never reads `point`. A null `point` here proves the box is untouched: a
-    /// non-superseded run with a null point would crash, but the superseded
-    /// path returns the sentinel cleanly.
+    /// deopt-osr Step 9 follow-up (a), REVISED by the
+    /// jit-invokedynamic-groovy-regression identity fix: in the default
+    /// retain-everything mode (`CRATONVM_JIT_FREE_CODE` unset — which unit
+    /// tests must assume, since mutating a process-global env var races
+    /// parallel tests) a SUPERSEDED guard NO LONGER short-circuits — the
+    /// artifact's code and deopt boxes are leaked for the process lifetime,
+    /// so the box is valid and its snapshot is self-consistent with the
+    /// (stale, still-executing) code that trapped. The entry must proceed to
+    /// a normal reconstruction; short-circuiting here stashed an
+    /// identity-less `bci == u32::MAX` sentinel that forced every
+    /// post-supersession trap onto the corrupting imprecise re-run. (The
+    /// before-deref short-circuit still exists under `CRATONVM_JIT_FREE_CODE`
+    /// — not unit-covered, by the env-race constraint above.)
     #[test]
-    fn superseded_guard_skips_box_deref_and_stashes_rerun_sentinel() {
+    fn superseded_guard_still_reconstructs_in_retain_mode() {
         use std::sync::atomic::{AtomicU64, Ordering};
         let live = Box::new(AtomicU64::new(3)); // live epoch = 3
         let guard = DeoptEpochGuard::new();
@@ -1410,15 +1459,31 @@ mod x64_deopt_entry_tests {
             live.as_ref() as *const AtomicU64 as *mut AtomicU64,
             Ordering::Release,
         );
+        assert!(guard.is_superseded());
 
+        let regs = SavedRegisters::default();
+        let point = DeoptimizationPoint {
+            native_offset: 0,
+            bci: 21,
+            reason: DeoptReason::UnreachedCode,
+            action: DeoptAction::Reinterpret,
+            speculation_id: 0,
+            frame_state: FrameState {
+                method_key: "T.m:()V".to_string(),
+                bci: 21,
+                locals: vec![FrameValue::Int(7)],
+                stack: Vec::new(),
+                monitors: Vec::new(),
+                caller: None,
+            },
+        };
         let _ = take_last_deopt();
-        // point is NULL on purpose: the superseded check must fire before any
-        // deref, so passing null must NOT crash and must yield the sentinel.
-        let r = x64_deopt_entry(std::ptr::null(), 0, std::ptr::null(), &guard);
+        let r = x64_deopt_entry(&point, 0, &regs as *const SavedRegisters, &guard);
         assert_eq!(r, i64::MIN);
-        let frame = take_last_deopt().expect("superseded path stashes a re-run sentinel");
-        assert_eq!(frame.bci, u32::MAX, "sentinel bci is out-of-range ⇒ re-run");
-        assert!(frame.locals.is_empty() && frame.stack.is_empty());
+        let frame = take_last_deopt().expect("retain-mode superseded path reconstructs normally");
+        assert_eq!(frame.bci, 21, "real bci, not the u32::MAX re-run sentinel");
+        assert_eq!(frame.method_key, "T.m:()V", "identity preserved for the resume sinks");
+        assert_eq!(frame.locals[0], FrameValue::Int(7));
     }
 
     /// A FRESH guard (creation epoch == live epoch) does NOT short-circuit: the

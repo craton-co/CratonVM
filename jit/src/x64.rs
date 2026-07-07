@@ -1100,6 +1100,47 @@ pub fn jit_scan(code: &[u8], code_len: usize, descriptor: &str) -> Option<JitSca
     let mut ldc2w_ops: Vec<(usize, u16)> = Vec::new(); // (pc, cp_index) for `ldc2_w` (0x14)
     let mut indy_ops: Vec<(usize, u16)> = Vec::new(); // (pc, cp_index) for `invokedynamic` (0xba)
     let mut has_athrow = false; // RBC.6 — method contains 0xbf
+    // BUG-LQB-SCOPE: earliest bytecode pc of any instruction with an
+    // observable, non-idempotent side effect (putfield/putstatic, an array
+    // store, or any invoke* — a callee can mutate arbitrary state). The
+    // `invokedynamic` (0xba) arm below lowers to an UNCONDITIONAL jump to the
+    // shared uncommon-trap deopt stub (reason 8, `UnreachedCode`) — control
+    // never returns from the trap into JIT-compiled code, and the VM's
+    // fallback for that trap (when no precise resume snapshot exists, which
+    // is unconditionally true for reason 8 as of the 2026-07-07 Groovy-
+    // regression revert — see
+    // docs/known-issues/jit-invokedynamic-uncommon-trap-precise-resume-groovy-regression.md)
+    // is to RE-EXECUTE THE WHOLE METHOD FROM ITS INTERPRETER ENTRY. Any
+    // side-effecting bytecode positioned BEFORE the indy in program order
+    // already ran for real once under the (aborted) JIT attempt, so the
+    // interpreter's from-scratch re-run executes it a SECOND time — a
+    // genuine double-execution, not just a performance cost. Confirmed via a
+    // minimal standalone repro (`enter()`-shaped method: `counter++;
+    // ...concat via invokedynamic...`) invoked from a JIT-compiled caller:
+    // the counter field was incremented twice per logical call. This is the
+    // root cause of the Liquibase `Scope` "Cannot end scope X when currently
+    // at scope root" corruption (docs/known-issues/keycloak-07-04/
+    // testsuite-model-liquibase-scope-corruption.md) — `Scope.enter()`-style
+    // methods perform a `putstatic`/field mutation before a string-concat
+    // `invokedynamic`, so the ThreadLocal-tracked scope stack gets pushed
+    // twice for one logical `Scope.enter()` call once such a helper method
+    // gets JIT-compiled and reached from a JIT-compiled (or otherwise
+    // JIT-dispatching) caller.
+    //
+    // Fix: track the earliest such pc; after the scan, if it precedes any
+    // `invokedynamic` site, refuse to compile the WHOLE method (return
+    // `None`, same fail-safe posture as the RBC.6 athrow+exception-table
+    // gate below) rather than emit unconditional-trap codegen that can
+    // double-execute already-committed work. This only affects methods that
+    // have both a live invokedynamic AND an earlier side effect in raw
+    // bytecode-pc order — the overwhelmingly common case (an
+    // `assert cond : "msg" + x;` message-concat sitting on a dead branch
+    // near the end of a method, unrelated to any earlier field/array
+    // mutation reachability) is unaffected and still compiles at full JIT
+    // speed; methods that fail this new gate simply stay fully interpreted
+    // (correct, just not JIT-accelerated), matching the scanner's existing
+    // "when in doubt, don't compile" philosophy.
+    let mut first_committing_side_effect_pc: Option<usize> = None;
     let mut pc = 0;
     while pc < code_len {
         let op = code[pc];
@@ -1204,6 +1245,11 @@ pub fn jit_scan(code: &[u8], code_len: usize, descriptor: &str) -> Option<JitSca
                 // heap-dependent helper).
                 if op == 0x53 {
                     needs_heap = true;
+                }
+                // BUG-LQB-SCOPE: array stores are observable side effects —
+                // see the tracker doc comment at its declaration above.
+                if first_committing_side_effect_pc.is_none() {
+                    first_committing_side_effect_pc = Some(pc);
                 }
                 pc += 1;
             }
@@ -1315,6 +1361,11 @@ pub fn jit_scan(code: &[u8], code_len: usize, descriptor: &str) -> Option<JitSca
                 let cp_idx = ((code[pc + 1] as u16) << 8) | (code[pc + 2] as u16); // Widening: always safe
                 invoke_ops.push((pc, cp_idx, op));
                 needs_heap = true;
+                // BUG-LQB-SCOPE: a callee can have arbitrary observable side
+                // effects — see tracker doc comment at its declaration above.
+                if first_committing_side_effect_pc.is_none() {
+                    first_committing_side_effect_pc = Some(pc);
+                }
                 pc += 3;
             }
             // areturn — return object reference
@@ -1339,6 +1390,11 @@ pub fn jit_scan(code: &[u8], code_len: usize, descriptor: &str) -> Option<JitSca
                 let cp_idx = ((code[pc + 1] as u16) << 8) | (code[pc + 2] as u16); // Widening: always safe
                 static_field_ops.push((pc, cp_idx));
                 needs_heap = true;
+                // BUG-LQB-SCOPE: observable side effect — see tracker doc
+                // comment at its declaration above.
+                if first_committing_side_effect_pc.is_none() {
+                    first_committing_side_effect_pc = Some(pc);
+                }
                 pc += 3;
             }
             // getfield — object field read
@@ -1368,6 +1424,11 @@ pub fn jit_scan(code: &[u8], code_len: usize, descriptor: &str) -> Option<JitSca
                 let cp_idx = ((code[pc + 1] as u16) << 8) | (code[pc + 2] as u16); // Widening: always safe
                 field_ops.push((pc, cp_idx));
                 needs_heap = true;
+                // BUG-LQB-SCOPE: observable side effect — see tracker doc
+                // comment at its declaration above.
+                if first_committing_side_effect_pc.is_none() {
+                    first_committing_side_effect_pc = Some(pc);
+                }
                 pc += 3;
             }
             // newarray — needs heap for allocation
@@ -1438,6 +1499,11 @@ pub fn jit_scan(code: &[u8], code_len: usize, descriptor: &str) -> Option<JitSca
                 let cp_idx = ((code[pc + 1] as u16) << 8) | (code[pc + 2] as u16); // Widening: always safe
                 invoke_ops.push((pc, cp_idx, op));
                 needs_heap = true;
+                // BUG-LQB-SCOPE: a callee can have arbitrary observable side
+                // effects — see tracker doc comment at its declaration above.
+                if first_committing_side_effect_pc.is_none() {
+                    first_committing_side_effect_pc = Some(pc);
+                }
                 pc += 3;
             }
             // invokeinterface — interface dispatch via helper (5 bytes: opcode, cp_hi, cp_lo, count, 0)
@@ -1448,6 +1514,11 @@ pub fn jit_scan(code: &[u8], code_len: usize, descriptor: &str) -> Option<JitSca
                 let cp_idx = ((code[pc + 1] as u16) << 8) | (code[pc + 2] as u16); // Widening: always safe
                 invoke_ops.push((pc, cp_idx, op));
                 needs_heap = true;
+                // BUG-LQB-SCOPE: a callee can have arbitrary observable side
+                // effects — see tracker doc comment at its declaration above.
+                if first_committing_side_effect_pc.is_none() {
+                    first_committing_side_effect_pc = Some(pc);
+                }
                 pc += 5;
             }
             // invokedynamic — no longer a permanent scan-time veto (5 bytes:
@@ -1494,6 +1565,26 @@ pub fn jit_scan(code: &[u8], code_len: usize, descriptor: &str) -> Option<JitSca
             0xba => {
                 if pc + 4 >= code_len {
                     return None;
+                }
+                // BUG-LQB-SCOPE: refuse to compile the WHOLE method if a
+                // committing side effect (putfield/putstatic/array-store/
+                // invoke*) already occurred earlier in raw bytecode-pc order.
+                // The unconditional-trap codegen below can only "safely
+                // reject" by re-running the entire method from its
+                // interpreter entry (see the tracker's declaration-site
+                // comment above for the full explanation and the Liquibase
+                // `Scope` corruption this caused) — that re-run would
+                // double-execute the earlier side effect. Bailing out of
+                // compilation here is conservative (pc-order, not true
+                // control-flow reachability) but always SAFE: the method
+                // simply stays fully interpreted instead of risking a
+                // duplicated side effect. This must be checked BEFORE
+                // `indy_ops.push` / `needs_heap = true` below, matching every
+                // other "unsound shape" bail in this scanner (e.g. RBC.6).
+                if let Some(effect_pc) = first_committing_side_effect_pc {
+                    if effect_pc < pc {
+                        return None;
+                    }
                 }
                 let cp_idx = ((code[pc + 1] as u16) << 8) | (code[pc + 2] as u16); // Widening: always safe
                 indy_ops.push((pc, cp_idx));
@@ -8343,7 +8434,20 @@ impl Compiler {
             action: DeoptAction::Reinterpret,
             speculation_id: 0,
             frame_state: FrameState {
-                method_key: String::new(),
+                // Deopt-frame identity (jit-invokedynamic-groovy-regression root
+                // cause): bake this method's `"<class>.<method>:<descriptor>"`
+                // key into every snapshot so the VM-side resume sinks can verify
+                // a stashed `ReconstructedFrame` actually belongs to the method
+                // they are about to resume. Without it, a trap in a NESTED
+                // compiled callee propagated the `i64::MIN` sentinel up through
+                // its compiled callers' epilogue bails, and the OUTERMOST
+                // interpreter sink consumed the (identity-less) inner frame as
+                // if it were the outer method's — materializing the outer
+                // method's frame with the inner method's locals/stack/bci, i.e.
+                // resuming arbitrary bytecode with a foreign frame. Empty only
+                // for legacy/test wrappers that pass no key (the consumers
+                // treat an empty key as "never matches" → safe re-run).
+                method_key: self.method_key.clone(),
                 // Cast: bytecode/native offset to u32 (non-negative, fits)
                 bci: bci as u32,
                 locals,
@@ -15522,6 +15626,24 @@ impl Compiler {
             // sites — which was the actual cause of `LicmRepro`/`LicmRepro2`/
             // `ArrRepro`'s `NullPointerException`), is what makes it safe to
             // restore reason 8's unconditional precise-resume routing here.
+            //
+            // ADDITIONALLY (same day, concurrent branch fix/hib-temporal-
+            // placeholder-dup-20260707): a SECOND, independent unsoundness in
+            // the same resume machinery — the stashed `ReconstructedFrame`
+            // carried NO method identity (`method_key` was empty), so a trap
+            // in a NESTED compiled callee (sentinel bubbling up through its
+            // compiled callers' epilogue bails) could be resumed by an outer
+            // consumer as if it were the OUTER method's frame: foreign
+            // locals/stack/bci, arbitrary misexecution. Closed by (a) baking
+            // `self.method_key` into every snapshot
+            // (`build_and_record_deopt_point`), (b) identity checks at every
+            // VM resume sink, (c) `try_resume_trapped_callee`
+            // (vm/src/jit/helpers.rs): dispatch helpers resolve a trapped
+            // callee precisely at the call site, and (d) `has_indy_trap`
+            // publication gates so machine code never direct-calls an
+            // indy-trap artifact (no helper there could resolve it). Repro:
+            // scratch-min/IndyReplay.java (nested shape: 30000/30000 calls
+            // corrupted side effects before these fixes, 0 after).
             let frame_box_ptr = if crate::deopt_real_enabled() || reason == 8 {
                 match reason {
                     2 => self.deopt_box_ptr_by_bci.get(&bci).copied(),
@@ -21472,6 +21594,27 @@ impl Compiler {
                         // Check for tail call: invokestatic self at PC, xreturn at PC+3
                         let is_tail_call = pc + 3 < code_len && matches!(code[pc + 3], 0xac..=0xb0); // ireturn..areturn
 
+                        // jit-invokedynamic-groovy-regression fix: a method
+                        // containing a live invokedynamic site (compiled as an
+                        // unconditional reason-8 trap) must NEVER machine-CALL
+                        // its own entry: a trap in the INNER recursive
+                        // invocation stashes a frame whose method identity
+                        // equals this method's, so the dispatch-helper resume
+                        // above this frame could not distinguish the inner
+                        // invocation's frame from the outer's and would resume
+                        // the wrong one (dropping the outer continuation). The
+                        // tail-JMP form below is exempt (it reuses the SAME
+                        // frame, so the stash genuinely describes the one live
+                        // invocation). For the non-tail raw CALL, bail the
+                        // whole compile — correctness first; a self-recursive
+                        // method that also contains an invokedynamic is rare
+                        // enough that staying interpreted is acceptable.
+                        if !self.indy_info.is_empty()
+                            && !(is_tail_call && self.body_entry_offset > 0)
+                        {
+                            return false;
+                        }
+
                         let mut arg_slots = Vec::with_capacity(n);
                         for _ in 0..n {
                             arg_slots.push(self.pop_stack());
@@ -23774,7 +23917,10 @@ impl Compiler {
                     // performance cost. Reuses the existing OSR-exit snapshot
                     // machinery (frame reconstruction from live registers/spill
                     // slots) so the VM can resume precisely at THIS bci instead of
-                    // rewinding.
+                    // rewinding. Tagged `UnreachedCode` (the trap's true
+                    // reason) so the resume sinks' de-speculation applies the
+                    // give-up-immediately policy — see
+                    // `emit_osr_exit_map_at_reason`.
                     self.emit_osr_exit_map_at_reason(pc, crate::deopt::DeoptReason::UnreachedCode);
 
                     let patch = self.emit_jmp_rel32_patch();
@@ -25417,6 +25563,19 @@ pub fn compile_with_param_slots(
     // a scalar-replaced object held under an elided `synchronized` block is
     // the same unsound-resume hazard here as it is for `can_deopt_resume`.
     cm.can_osr_exit = !cm.osr_exit_points.is_empty() && !compiler.has_elided_monitor;
+    // jit-invokedynamic-groovy-regression fix: a compiled 0xba site is an
+    // UNCONDITIONAL trap (the instruction is never JIT-executed), so any
+    // execution of this artifact that reaches it deopts. Publishing this
+    // artifact's entry where MACHINE CODE calls it directly (a baked
+    // JIT→JIT direct call, a MIC/PIC inline-cache entry) would let the
+    // sentinel + stashed frame bail through a compiled CALLER's epilogue,
+    // where no consumer can resume the callee precisely (the caller's
+    // continuation is already lost). The publication gates (see
+    // `callee_compiler` in vm/src/runtime/interpreter.rs and the MIC/PIC
+    // install sites in vm/src/jit/helpers.rs) consult this flag so every
+    // call to such a method stays on a dispatch helper, whose
+    // `try_resume_trapped_callee` resolves the trap precisely in place.
+    cm.has_indy_trap = !compiler.indy_info.is_empty();
     // Stage 3 — the frame offset where this method stores the active
     // safepoint's bytecode PC (0 when the precise gate was off at compile).
     cm.sp_id_slot_off = compiler.sp_id_slot_off;

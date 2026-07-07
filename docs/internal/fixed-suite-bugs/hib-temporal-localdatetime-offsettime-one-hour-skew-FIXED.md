@@ -93,3 +93,32 @@ CRATONVM_DISABLE_DEFAULT_WATCHDOG=1 CRATONVM_JIT_OSR=1 \
 — that doc's `type.temporal.*` cluster is a GC-corruption/CRASH family,
 unrelated to this FAIL/assertion-only bug (different root cause, both now
 independently tracked).
+
+## UPDATE 2026-07-07 — DST-transition half of the known limitation FIXED (branch `fix/hib-temporal-placeholder-dup-20260707`)
+
+The "Known limitation" above ("any date inside a covered zone's DST period gets
+the standard (winter) offset instead of the DST offset") became the dominant
+residual once the separate `values (??,??)` SQL-placeholder corruption was fixed
+(see `docs/internal/hib-temporal-sql-parameter-placeholder-duplication-FIXED.md`):
+`LocalDateTimeTest` failed 6/162 with the exact 1-hour skew on DST-period /
+DST-boundary dates (`expected: <2018-10-28T01:00> but was: <2018-10-28T00:00>`,
+plus the 2018-03-25 / 2018-04-01 / 2018-09-30 EU and New Zealand transitions).
+
+**Fix** (`native-builtins/src/lib.rs`): `alloc_synth_timezone` now constructs a
+real `java.util.SimpleTimeZone` (full 13-arg constructor, real-bytecode
+`getOffset(long)`/`inDaylightTime` semantics) for any zone whose CURRENT
+recurring DST rule is in the new `tz_dst_rule` table — the EU rule (last Sunday
+March 01:00 UTC → last Sunday October 01:00 UTC, +1h) for the whole CET family
+plus London/Athens/Bucharest/Helsinki, and the New Zealand rule (last Sunday
+September 02:00 wall → first Sunday April 03:00 wall, +1h) for
+`Pacific/Auckland`. Any constructor failure falls through to the legacy
+transitions-less ZoneInfo path — never worse. Zones without an entry (e.g.
+`America/Santiago`, whose historical rule changes SimpleTimeZone cannot model
+in one recurrence) keep the standard-offset approximation; historical (pre-rule-
+change) dates in covered zones are still approximated by the CURRENT rule.
+
+**Verification:** `scratch-min/TzDstProbe.java` (winter/summer offsets, exact
+before/after instants at the 2018 EU and NZ transitions, Calendar round-trip,
+untouched-zone regression guards) — expectations validated on HotSpot JDK 25,
+then `@@PASS` on the fixed CratonVM binary. `LocalDateTimeTest` DST-skew
+failures 6 → 0 (see the placeholder-duplication doc for the full class table).

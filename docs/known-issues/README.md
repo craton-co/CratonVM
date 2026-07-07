@@ -4,6 +4,25 @@ This folder collects CratonVM-only defects found while running upstream Java
 suites. The docs had grown to describe the **same underlying bug from several
 angles**; this index is the consolidated map. Read it first.
 
+## 2026-07-07 crypto/fips1402 ProvEC `ClassNotFoundException`/process-crash + SD-JWT hang FIXED (BC-FIPS `EngineCreator`/`creatorMap` bridge); new residual found
+
+- ✅ FIXED: [ProvEC `AlgorithmParametersSpi$EC` class-not-found, crashing whole process](../internal/fixed-suite-bugs/keycloak-crypto-fips1402-provec-algorithmparametersspi-classnotfound-FIXED.md) — BouncyCastle-FIPS registers algorithms through a private `creatorMap` (`EngineCreator` factories), never a directly-loadable `className`; CratonVM's real-JCA bridge didn't know about this and tried (and, worse, non-catchably crashed on) reflectively loading BC-FIPS's cosmetic label string. Fixed by reaching `creatorMap` directly (`try_engine_creator_instantiate`) plus retaining the real `Provider` object across `Security.addProvider` (`real_provider_table`), and hardening the reflective fallback to raise a catchable exception instead of aborting the process.
+- ✅ FIXED (same root cause/fix): [FIPS1402JwtVcMetadataTrustedSdJwtIssuerTest hang after provider init](../internal/fixed-suite-bugs/keycloak-crypto-fips1402-sdjwt-hang-after-provider-init-FIXED.md) — was a 1200s HANG, now 16/16 PASS in ~117s.
+- 🔴 NEW OPEN: [`KeyPairGenerator.getInstance("ECDSA","BCFIPS")` resolves to SunEC, not BC-FIPS; SunEC's curve table lacks 384-bit](crypto-fips1402-sunec-keypairgenerator-384bit-gap.md) — exposed now that EC crypto runs for real instead of crashing earlier. Affects the P-384/ES384 case in `BCFIPSECDSACryptoProviderTest`, `BCFIPSEcdhEsAlgorithmProviderTest`, `FIPS1402SdJwtCreationAndSigningTest` (1 of 2-3 parameterized cases in each); 256/512-bit and non-EC-keysize cases pass.
+
+## 2026-07-07 Three Keycloak nonpassed-rerun bugs FIXED (DependencyGraphResolver spin loop, Phaser/ForkJoinPool hang, Liquibase Scope corruption)
+
+- ✅ FIXED: [`tests/base` `DependencyGraphResolver.scan()` spin loop](../internal/fixed-suite-bugs/tests-base-dependencygraphresolver-spin-loop-hang-FIXED.md) — missing early `return` after the "already scanned" check caused combinatorial re-traversal of shared DI dependencies, blowing a few-second HotSpot operation up into a 1200s CratonVM timeout. Fix lives in the vendored `apps/keycloak` Java source (test-framework/core), not CratonVM itself — needs re-applying to any other Keycloak checkout used as a suite fixture, or reporting upstream.
+- ✅ FIXED (branch `fix/phaser-forkjoinpool-managedblock-hang-20260707`, commit `743da7b1`): [Phaser/ForkJoinPool hang in SmallRye Sisu bean loading](../internal/fixed-suite-bugs/keycloak-testframework-phaser-forkjoinpool-sisu-hang-FIXED.md) — `CompletableFuture.runAsync`'s native override swallowed `MethodCallFailed::InternalError` (VM-level, non-catchable-by-Java) without routing through the task's own exception table, so a VM-level gap deep in bean-loading skipped `finally { phaser.arriveAndDeregister(); }` and hung `arriveAndAwaitAdvance()` forever. `IdentityProviderMapperTest`: 12+ hour hang → ~71s.
+- ✅ FIXED (branch `fix/liquibase-scope-threadlocal-corruption-20260707`, commit `752796a0`): [Liquibase `Scope` "Cannot end scope ... at scope root"](../internal/fixed-suite-bugs/testsuite-model-liquibase-scope-corruption-FIXED.md) — a JIT `invokedynamic` uncommon-trap re-runs the whole method from the interpreter entry point instead of resuming from the throw point, double-executing any committing side effect (e.g. `Scope.enter()`'s field mutation) positioned before the indy call site. Fixed in `jit/src/x64.rs` (`jit_scan` now refuses to JIT-compile such methods). ThreadLocal/InheritableThreadLocal and try-with-resources-double-close theories were both investigated and ruled out first.
+
+All three verified against their real Keycloak classes via the suite runner; no regressions in the touched crates' test suites.
+
+## 2026-07-07 Hibernate local Windows rerun — progress check + new SQL-placeholder bug
+
+- [hib-local-windows-rerun-20260707.md](hib-local-windows-rerun-20260707.md) — 4-shard local rerun of the 121-class non-passed list confirms 15 real fixes (bytecode-enhancement/lazytoone progress, generic-timeout-wall classes now passing) landed on `dev` since the 2026-07-05 Azure baseline; documents 3 findings that evolved to different symptoms (`JpaLargeBlobTest`, `InPredicateTest`, the temporal 1-hour-skew doc now superseded); flags a harness status-computation false-positive.
+- ✅ FIXED same day: the SQL-placeholder duplication that rerun re-confirmed (plus 2 more affected classes outside `type.temporal.*` — `ExtendedEnhancementNonStandardAccessTest`, `FunctionTests`, proving it a general SQL-generation-path defect) was the reopened JIT reason-8 imprecise-resume corruption; see [`docs/internal/hib-temporal-sql-parameter-placeholder-duplication-FIXED.md`](../internal/hib-temporal-sql-parameter-placeholder-duplication-FIXED.md) and the identity-sound precise-resume entry below.
+
 ## 2026-07-07 ES binary-docvalues range doc retired; residual re-diagnosed as young-GC live-object reclamation (NEW open doc)
 
 - [gen-heap-young-gc-live-object-reclaim-rrwl-holdcount.md](gen-heap-young-gc-live-object-reclaim-rrwl-holdcount.md) —
@@ -104,11 +123,20 @@ angles**; this index is the consolidated map. Read it first.
 
 ## 2026-07-07 Hibernate temporal: GC crash family extinct → new SQL-placeholder bug surfaced
 
-- [hib-temporal-sql-parameter-placeholder-duplication.md](hib-temporal-sql-parameter-placeholder-duplication.md) —
-  🔴 OPEN, untriaged. Validating the archived GC stale-local doc (item 19 below) showed the 5
-  `type.temporal.*` classes are now crash-free (0 corruption markers) but fail en masse on
-  DUPLICATED JDBC `?` placeholders in generated INSERTs (`values (??,???)`, growing per
-  statement) — a string-building defect, not GC.
+- ✅ FIXED (branch `fix/hib-temporal-placeholder-dup-20260707`, 2026-07-07): the 5
+  `type.temporal.*` classes' DUPLICATED JDBC `?` placeholders (`values (??,???)`) were NOT a
+  string-building defect — they were the reopened JIT invokedynamic uncommon-trap
+  imprecise-resume corruption (the `5ceb880f` revert of `fb4a333d`) re-executing
+  JIT-committed `sqlBuffer` appends. Fixed by identity-sound precise resume for the reason-8
+  trap (method-key-baked deopt snapshots + identity-checked consumers + dispatch-helper
+  in-place callee resolution + direct-call/MIC/PIC publication gates), which closes BOTH this
+  corruption AND the Groovy regression that had forced the revert. Doc retired to
+  [`docs/internal/hib-temporal-sql-parameter-placeholder-duplication-FIXED.md`](../internal/hib-temporal-sql-parameter-placeholder-duplication-FIXED.md);
+  the reason-8 saga's remaining follow-ups stay tracked in
+  [jit-invokedynamic-uncommon-trap-precise-resume-groovy-regression-FIXED.md](../internal/jit-invokedynamic-uncommon-trap-precise-resume-groovy-regression-FIXED.md);
+  two unmasked PRE-EXISTING temporal residuals (37× `DdlTypeImpl.getRawTypeName` NPE in
+  InstantTests, 2× empty `IllegalThreadStateException`) are tracked in
+  [hib-temporal-residuals-typename-npe-illegalthreadstate.md](hib-temporal-residuals-typename-npe-illegalthreadstate.md).
 
 ## 2026-07-06/07 http.client class_manager RwLock recursive-read deadlock — FIXED (branch fix/class-manager-writer-starvation-20260706)
 
@@ -180,7 +208,7 @@ were exhaustively bucketed by exact terminal-error signature (not sampled); see
 Fixed from this sweep:
 - [crypto/fips1402 CryptoProvider ServiceLoader bootstrap](../internal/fixed-suite-bugs/keycloak-crypto-fips1402-cryptoprovider-serviceloader.md) - `ServiceLoader` now sees the FIPS `CryptoProvider`; representative classes no longer fail at `CryptoInitRule.before` with `containersFailed=1`. Residual: the module can still fail later after bootstrap (`CryptoIntegration.getProvider(): init first`).
 - [SmallRyeConfig.getConfigMapping(Class) 1-arg bare-interface AbstractMethodError](../internal/fixed-suite-bugs/smallrye-getconfigmapping-1arg-bare-interface-abstractmethoderror.md).
-- [SmallRye Config missing Charset/MemorySize converters](../internal/fixed-suite-bugs/keycloak-smallrye-config-charset-memorysize-converters.md) - `LoggingSetupRecorder.handleFailedStart()` now builds its transient logging config with discovered Quarkus converters. The local 2026-07-04 deep dive also showed this fix exposes a later test-framework/Maven-artifact resolution gap rather than unlocking all `tests/base` classes outright. That gap is also now fixed: [test-framework deployRequestedInstances resolution failure](../internal/fixed-suite-bugs/keycloak-testframework-linkedlist-addall-deployrequestedinstances-FIXED.md) (root cause: `LinkedList.addAll(LinkedList)` silently dropped elements). Residual: [Phaser/ForkJoinPool hang in SmallRye Sisu bean loading](keycloak-testframework-phaser-forkjoinpool-sisu-hang.md).
+- [SmallRye Config missing Charset/MemorySize converters](../internal/fixed-suite-bugs/keycloak-smallrye-config-charset-memorysize-converters.md) - `LoggingSetupRecorder.handleFailedStart()` now builds its transient logging config with discovered Quarkus converters. The local 2026-07-04 deep dive also showed this fix exposes a later test-framework/Maven-artifact resolution gap rather than unlocking all `tests/base` classes outright. That gap is also now fixed: [test-framework deployRequestedInstances resolution failure](../internal/fixed-suite-bugs/keycloak-testframework-linkedlist-addall-deployrequestedinstances-FIXED.md) (root cause: `LinkedList.addAll(LinkedList)` silently dropped elements). The Phaser/ForkJoinPool hang this exposed next is also now fixed: see the 2026-07-07 entry near the top of this file.
 - [quarkus/runtime CompactValue NaN-box collision SIGSEGV](../internal/fixed-suite-bugs/keycloak-quarkus-compactvalue-nanbox-sigsegv.md) - current `dev` no longer reproduces `rc=139`. The post-crash PicocliTest timeout residual is also fixed in [PicocliTest post-CompactValue-fix hang](../internal/fixed-suite-bugs/quarkus-runtime-picocli-post-compactvalue-hang.md).
 - [System Rules getenv() field 'm' reflection mismatch](../internal/fixed-suite-bugs/keycloak-system-rules-getenv-field-m-reflection.md) - `System.getenv()` now exposes an OpenJDK-shaped unmodifiable map wrapper whose private `m` field points at the backing map.
 - [KcAdmV2HelpTest --help text env-var mentions](../internal/keycloak-07-04/kcadmv2-helptext-env-var-mentions.md) - synthetic `BreakIterator.getLineInstance()` now returns Java UTF-16 text offsets after complete whitespace/hyphen runs, so Picocli no longer hard-wraps `KC_CLI_*` env-var names.
@@ -188,9 +216,6 @@ Fixed from this sweep:
 - [LoggingConfigurationTest getPropertyNames stale log-category key](../internal/fixed-suite-bugs/quarkus-runtime-logging-getpropertynames-garbage-key.md) - `System.setProperties(Properties)` now replaces the VM-wide properties state, so stale fixture keys do not leak into SmallRye property-name iteration.
 - [LoggingConfigurationTest wildcard DEBUG level resolves null](../internal/fixed-suite-bugs/quarkus-runtime-logging-wildcard-debug-level-null.md) - fixed by the same System-properties replacement semantics as the stale log-category key.
 - [TelemetryConfigurationTest telemetry-service-name wrong value](../internal/fixed-suite-bugs/quarkus-runtime-telemetry-service-name-wrong-value.md) - fixed by System-properties replacement/reset semantics.
-
-Open findings from this sweep, in `keycloak-07-04/`, roughly by priority:
-- [test-framework Phaser/ForkJoinPool hang in SmallRye Sisu bean loading](keycloak-testframework-phaser-forkjoinpool-sisu-hang.md) - surfaced after fixing the `LinkedList.addAll` bug that previously masked it.
 
 Already-tracked, not re-documented: the 37 `testsuite/model` CRASHes were the
 [Infinispan GlobalConfigurationBuilder.isClustered() NoSuchMethodError](../internal/fixed-suite-bugs/keycloak-model-infinispan-globalconfiguration-isclustered-nosuchmethod-FIXED.md),

@@ -1,8 +1,14 @@
 # Young-GC live-object reclamation corrupts RRWL read-lock hold counts (ES binary-docvalues IMSE / probe hang)
 
-Status: OPEN — root-caused to the GC family, exact reclamation hole not yet
-isolated; a fast (<60s), highly reliable standalone repro now exists, plus a
-regression window on dev.
+Status: PRIMARY HOLE FIXED 2026-07-07 (branch
+`fix/young-gc-live-reclaim-20260707`) — see "2026-07-07 root cause and fix"
+below. The probe's plain-mode permanent hang is gone (0/16 hangs vs ~6/6;
+healthy ~200M ops/8s), and the long-open RandomizedContext
+`WeakHashMap<Thread,…>` `getPerThread()` NPE is CONFIRMED GONE
+(`MappingStatsTests` now runs all 14 methods with zero
+`randomnesses`-NPE occurrences). Doc stays OPEN for the three remaining
+faces listed at the bottom (ES `testAllEqual` stall/IMSE, extreme-GC-stress
+hang, crawl regime).
 
 Date filed: 2026-07-07 (split out of
 `elasticsearch-lucene-binary-docvalues-range-hangs.md`, whose three original
@@ -148,3 +154,93 @@ plausibly a broad set of GC-pressure-sensitive suite flakiness.
    sweep-walk/sizing defect**. This narrows the hunt to the conservative
    root coverage of running/suspended threads (xt takeover, root snapshots,
    TLAB tails) and the sweep's linear-walk bookkeeping — NOT mark/seed logic.
+
+## 2026-07-07 root cause and fix (primary hole)
+
+**The bug was never object reclamation in the common face — it was
+reference-processing survivorship.** `ThreadLocalMap$Entry` IS a
+`WeakReference`. Before every collection,
+`weakref_null_referents_pre_gc` nulls every active weak/phantom referent
+slot (so the marker cannot keep referents alive through their References);
+after the collection the restore pass writes the referent back into every
+SURVIVING Reference object. Survival is judged by
+`pointer_map.contains_key(addr) || heap.is_addr_live(addr)` — and for the
+Generational heap `is_addr_live` was **old-gen-only**, while the NON-MOVING
+young sweep keeps survivors in place with **no pointer_map entries**. Net
+effect, every JIT-active young GC:
+
+- live young Reference objects were judged dead → their nulled referent was
+  never restored → `ThreadLocalMap` saw `refersTo(null) == true` → the
+  MUTATOR ITSELF expunged the live entry → RRWL `readHolds` hold count lost
+  → `IllegalMonitorStateException: attempt to unlock read lock` (reader dies
+  or, in the probe, exits silently) → leaked read count → writer parks
+  forever → the all-parked bci-368 hang;
+- live young entries were pruned from the reference processor
+  (`remove_collected`), compounding across cycles;
+- the same mechanism ate `WeakHashMap<Thread,…>` entries — the
+  RandomizedContext `getPerThread()` NPE residual, whose earlier fix
+  (watched REFERENTS → identity pointer_map entries) covered only half the
+  predicate: the Reference OBJECTS' side was still judged dead.
+
+Why every prior instrument stayed silent: nothing is wrongly swept in this
+face (the Entry stays alive, header intact — SWEEP_ZERO/holder scans find
+nothing), no weak ref is CLEARED (the referent side was already patched —
+WATCHREF shows KEEPs only), and `refersTo` computes honestly on a
+genuinely-nulled slot.
+
+**Fix (two complementary halves, both merged):**
+1. `weakref_null_referents_pre_gc` now watches the Reference OBJECTS' own
+   addresses alongside their referents, so the sweep's existing
+   watched-survivor machinery mints identity `pointer_map` entries for them
+   (`vm/src/runtime/interpreter.rs`; regression test
+   `vm/src/vm.rs::weakref_pre_gc_watch_includes_reference_objects`, note the
+   vm.rs tests module is `--features synthetic-jdk`-gated).
+2. `VmHeap::is_addr_live` (Generational arm) now also recognizes
+   kept-in-place young survivors via
+   `GenerationalHeap::is_live_young_survivor` — in current from-space +
+   non-zero first header word (the sweep zeroes everything it reclaims;
+   sound only in the post-collection STW window where reference processing
+   runs, which is exactly where the predicate is used). This half is robust
+   where the identity-entry half is not: desync-retained walk stretches
+   whose survivors the sweep never visits (common at ES heap sizes).
+
+**Verification:** probe plain mode 0/16 hangs (was ~6/6), ~200M ops/8s
+healthy; `cargo test -p cratonvm-gc` green (768+ tests);
+`MappingStatsTests` NPE-free (14/14 run, 1 pre-existing separate
+serialization-diff failure).
+
+**Bisect postscript:** the dev "regression window" (f6aa11c9→007e620a,
+hang 0/3 → ~6/6) bisected to `5117469c` ("Fix Spring messaging rsocket
+failures") — which contains nothing GC- or lock-related. Perturbing the
+GOOD-era binary (12 threads instead of 8) reproduced the corrupted regime
+directly, proving the window was **layout/timing amplification of the
+pre-existing hole**, not an introduced bug. Do not revert anything.
+
+## Remaining OPEN faces (this doc stays open for these)
+
+1. **ES `LongRandomBinaryDocValuesRangeQueryTests.testAllEqual` still red**,
+   bimodal: ~2/3 of runs stall in STARTUP (the crawl regime below; never
+   reach the test body), ~1/3 reach the body and fail with the same IMSE at
+   ~60s. The IMSE face therefore has at least one more mechanism beyond the
+   fixed refproc hole — full-JIT-compiled ThreadLocalMap/AQS paths and
+   conservative JIT-frame coverage are the standing suspects (the probe's
+   IMSE/hang went away; ES differs in real compiled frames + much bigger
+   young gen). All gated diagnostics stayed silent on a stall run except 19
+   benign hash-probe `refersTo` misses.
+2. **Extreme-GC-stress hang residual**: with `CRATONVM_DBG_GC_STRESS=200000`
+   (young GC every ~200KB — diagnostic sledgehammer, ~1000x production
+   cadence) the probe still hangs ~2/5. Plain mode is clean. Likely the
+   genuine register/native-window conservative-coverage gap (case (a)).
+3. **Crawl regime**: runs (probe AND ES startup) sometimes degenerate to
+   ~1 lock handoff/second from t=0 (probe total=4..11 in 8s; 31s wall for a
+   10s workload). Predates the window (reproduced on f6aa11c9 with 12
+   threads). Completes, so no correctness loss proven — but it gates ES
+   startup within timeouts and likely explains a broad class of
+   "HANG at N s" suite rows. Untriaged mechanism; suspect STW-pause
+   domination (GC-per-handoff feedback) rather than lock-protocol failure.
+
+Repro assets and diagnostic env vars are unchanged (see above). Forensic
+additions on the branch: `CRATONVM_DBG_SWEEP_CENSUS` (per-cycle swept-class
+census + per-victim young/old holder scan + roots-membership check),
+`CRATONVM_SWEEP_FULL_OLD_SCAN` (card-bypass seed), A2 lifecycle dumps at the
+RECLAIMED-LIVE / OOB-guard consumers, and `a2dbg::history_at`.

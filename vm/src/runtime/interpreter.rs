@@ -164,7 +164,30 @@ pub fn weakref_null_referents_pre_gc(shared: &SharedVm) {
     // gc_quiescence::is_watched_referent). Unconditional — even an empty
     // list must be published so a previous cycle's entries can never leak
     // into this one.
-    let watch_addrs: Vec<usize> = pairs.iter().map(|&(_, referent)| referent).collect();
+    //
+    // Young-GC live-reclaim ROOT FIX (2026-07-07, RRWL/ThreadLocalMap$Entry
+    // IMSE/hang family): watch the REFERENCE OBJECTS' own addresses too, not
+    // just their referents. The post-GC restore pass and `remove_collected`
+    // judge survival by `pointer_map.contains_key(addr) || is_addr_live(addr)`,
+    // and for the Generational heap `is_addr_live` is old-gen-only — so after
+    // a NON-MOVING young sweep (which produces NO pointer_map entries for
+    // kept-in-place survivors) a live YOUNG Reference object was judged dead:
+    // its pre-GC-nulled referent slot was never restored and its processor
+    // entry was pruned. A live young `ThreadLocalMap$Entry` (a WeakReference)
+    // then answered `refersTo(null) == true`, so the mutator itself expunged
+    // the live entry — losing the RRWL `readHolds` hold counter (the
+    // `IllegalMonitorStateException: attempt to unlock read lock` /
+    // permanent all-parked hang in `RwlReadTearingProbe` and Elasticsearch
+    // `LongRandomBinaryDocValuesRangeQueryTests.testAllEqual`), and losing
+    // WeakHashMap entries generally (the RandomizedContext residual). The
+    // watched set already flows into identity `pointer_map` entries for every
+    // kept-in-place survivor the sweep retains (side-marked or header-marked),
+    // which is exactly the survival proof the restore pass needs — the
+    // referent half of this fix simply never covered the reference objects.
+    let watch_addrs: Vec<usize> = pairs
+        .iter()
+        .flat_map(|&(ref_obj, referent)| [ref_obj, referent])
+        .collect();
     if std::env::var_os("CRATONVM_DBG_WATCHREF").is_some() {
         eprintln!(
             "[watchref] publishing {} watched referent(s): {:x?}",
@@ -4531,7 +4554,11 @@ pub fn execute(
                         0,    // param_slot_span — legacy layout
                         param_oop_mask,
                         compact_field_info,
-                        "", // method_key — eager path disables the per-bci de-spec consult
+                        // method_key — bakes this method's identity into its
+                        // deopt snapshots (resume sinks verify it before
+                        // resuming a stashed frame). Also enables the per-bci
+                        // de-spec consult (inert in production).
+                        &format!("{class_name_arc}.{method_name_arc}:{descriptor_arc}"),
                         indy_info,
                     )?;
                     // Attach owned metadata to compiled method
@@ -5202,6 +5229,86 @@ pub fn execute(
     }
 
     // Pop frame and recycle its Vec allocations
+    pop_and_recycle_frame(shared, thread);
+
+    result
+}
+
+/// jit-invokedynamic-groovy-regression fix — run an already-materialized
+/// interpreter frame (e.g. one reconstructed from a JIT deopt snapshot, with
+/// its `pc` mid-method and operand stack pre-populated) to completion on this
+/// thread, returning the method result exactly like [`execute`].
+///
+/// This is the dispatch-helper precise-resume primitive
+/// (`try_resume_trapped_callee`, vm/src/jit/helpers.rs): a compiled callee
+/// that hit its unconditional `invokedynamic` uncommon trap left a precise
+/// frame snapshot; resuming that frame HERE — at the helper call site, before
+/// any compiled caller's epilogue bail — completes the callee in the
+/// interpreter and hands the real result back to the compiled caller, so no
+/// side effect is re-run and no sentinel escapes.
+///
+/// Mirrors [`execute`]'s tail exactly: push + entry hooks, STW safepoint
+/// check, panic-protected `execute_frame`, orphaned-inner-frame truncation,
+/// pop + recycle. See `execute`'s own comments for why each step exists.
+pub(crate) fn execute_prebuilt_frame(
+    shared: &SharedVm,
+    thread: &mut JvmThread,
+    frame: Frame,
+) -> MethodCallResult {
+    let frames_depth_before_push = thread.frames.len();
+    if crate::runtime::env_cache::frame_trace() {
+        eprintln!(
+            "[FRAME_PUSH/execute_prebuilt_frame] depth={} {}.{}{} pc={}",
+            thread.frames.len(),
+            frame.class_name(),
+            frame.method_name(),
+            frame.method_descriptor(),
+            frame.pc
+        );
+    }
+    push_frame_and_fire_entry(thread, frame);
+    if shared
+        .gc_barrier
+        .stw_requested
+        .load(std::sync::atomic::Ordering::Acquire)
+    {
+        safepoint_check(shared, thread);
+    }
+
+    let result = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        execute_frame(shared, thread)
+    })) {
+        Ok(r) => r,
+        Err(panic_info) => {
+            let msg = if let Some(s) = panic_info.downcast_ref::<&str>() {
+                s.to_string()
+            } else if let Some(s) = panic_info.downcast_ref::<String>() {
+                s.clone()
+            } else {
+                "unknown panic in bytecode execution".to_string()
+            };
+            if let Some(f) = thread.frames.last() {
+                eprintln!(
+                    "[PANIC_IN/prebuilt] {}.{}{} pc={} max_stack={} :: {}",
+                    f.class_name(),
+                    f.method_name(),
+                    f.method_descriptor(),
+                    f.pc,
+                    f.max_stack,
+                    msg
+                );
+            }
+            Err(MethodCallFailed::InternalError(VmError::Runtime(
+                RuntimeError::NotImplemented { feature: msg },
+            )))
+        }
+    };
+
+    // Truncate any orphaned inner frames execute_frame may have left, then pop
+    // our own frame — same accounting as `execute`.
+    while thread.frames.len() > frames_depth_before_push + 1 {
+        pop_and_recycle_frame(shared, thread);
+    }
     pop_and_recycle_frame(shared, thread);
 
     result
@@ -9077,7 +9184,7 @@ fn verify_reconstructed_oops(
 /// Rust-side only), so no GC can stale the built frame. `stress` forces a GC
 /// immediately before refill — the ONLY sanctioned injection point — to
 /// exercise the forward-in-place path (tests / `CRATONVM_GC_STRESS`).
-fn build_deopt_frame_inner(
+pub(crate) fn build_deopt_frame_inner(
     shared: &SharedVm,
     thread: &mut JvmThread,
     cached: &Arc<CachedBytecodeMethod>,
@@ -9091,6 +9198,25 @@ fn build_deopt_frame_inner(
     // (a non-scalar elision sets `has_elided_monitor` → `can_deopt_resume=false`),
     // so every monitor here is materializable + relockable.
     if !rframe.caller_frames.is_empty() {
+        return None;
+    }
+
+    // Identity gate (jit-invokedynamic-groovy-regression), belt-and-suspenders
+    // for every caller: the frame's baked `method_key` must name the method
+    // whose bytecode/frame-shape (`cached`) we are about to materialize it
+    // into. A mismatched (nested-callee) or key-less (legacy producer /
+    // superseded-guard sentinel) frame bails to the safe re-run. Also bounds-
+    // check the resume bci against this method's code — the superseded-guard
+    // sentinel stashes `bci == u32::MAX` precisely so this fails.
+    if !deopt_frame_matches_method(
+        rframe,
+        &cached.class_name,
+        &cached.method_name,
+        &cached.method_descriptor,
+    ) {
+        return None;
+    }
+    if rframe.bci == u32::MAX {
         return None;
     }
 
@@ -9565,6 +9691,69 @@ fn stamp_compilation_epoch(
 ///
 /// Returns `Some` when the frame was resumed (caller returns it), `None` to
 /// fall through to the whole-method re-run.
+/// Read-once mirror of the jit crate's `CRATONVM_JIT_FREE_CODE` check (see
+/// `jit/src/deopt.rs::jit_free_code_enabled`): `true` only in the A/B mode
+/// that actually frees evicted artifacts and their deopt-point boxes.
+fn vm_jit_free_code_enabled() -> bool {
+    static FLAG: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *FLAG.get_or_init(|| std::env::var_os("CRATONVM_JIT_FREE_CODE").is_some())
+}
+
+/// jit-invokedynamic-groovy-regression fix — does the stashed reconstructed
+/// frame belong to `cached`? The producer bakes the compiling method's
+/// `"<class>.<method>:<descriptor>"` key into every snapshot
+/// (`build_and_record_deopt_point`); a frame stashed by a NESTED compiled
+/// callee (whose sentinel bubbled up through its compiled callers' epilogue
+/// bails) carries THAT callee's key and must never be resumed as if it were
+/// this method's. An empty key (legacy/test producer, or the superseded-guard
+/// `bci == u32::MAX` sentinel frame) never matches.
+pub(crate) fn deopt_frame_matches_method(
+    rframe: &cratonvm_jit::deopt::ReconstructedFrame,
+    class_name: &str,
+    method_name: &str,
+    descriptor: &str,
+) -> bool {
+    if rframe.method_key.is_empty() {
+        return false;
+    }
+    let Some((rest, key_desc)) = rframe.method_key.rsplit_once(':') else {
+        return false;
+    };
+    let Some((key_class, key_method)) = rest.rsplit_once('.') else {
+        return false;
+    };
+    key_class == class_name && key_method == method_name && key_desc == descriptor
+}
+
+/// jit-invokedynamic-groovy-regression fix — de-speculate the method a
+/// MISMATCHED stashed frame actually belongs to (parsed from its baked
+/// `method_key`), so the truly-trapping method gets evicted/blacklisted and
+/// stops re-trapping, instead of the consumer's own (innocent) method eating
+/// the deopt accounting. No-op for an unparseable/empty key.
+fn despeculate_stashed_frame_method(
+    shared: &SharedVm,
+    rframe: &cratonvm_jit::deopt::ReconstructedFrame,
+) {
+    let Some((rest, key_desc)) = rframe.method_key.rsplit_once(':') else {
+        return;
+    };
+    let Some((key_class, key_method)) = rest.rsplit_once('.') else {
+        return;
+    };
+    // `UnreachedCode` = give-up-immediately (`recommend_action`): the frame's
+    // owner is made not-compilable on the first mismatch so it stops
+    // re-trapping, instead of the count-based recompile churn `UncommonTrap`
+    // would drive.
+    crate::jit::helpers::DeoptimizationController::deoptimize(
+        shared,
+        key_class,
+        key_method,
+        key_desc,
+        cratonvm_jit::deopt::DeoptReason::UnreachedCode,
+        rframe.bci,
+    );
+}
+
 fn real_frame_deopt_resume_and_despeculate(
     shared: &SharedVm,
     thread: &mut JvmThread,
@@ -9572,12 +9761,52 @@ fn real_frame_deopt_resume_and_despeculate(
     cached: &Arc<CachedBytecodeMethod>,
     rframe: &cratonvm_jit::deopt::ReconstructedFrame,
 ) -> Option<CachedCallResult> {
+    // Identity gate (jit-invokedynamic-groovy-regression): never resume a
+    // frame that was stashed by a DIFFERENT method (a nested compiled callee's
+    // trap whose sentinel propagated up to this outer sink). Resuming it here
+    // would materialize THIS method's frame with the callee's locals/stack/bci
+    // — arbitrary misexecution (the root cause of the Groovy "duplicate main
+    // method" compiler-internal failures that forced the 5ceb880f revert).
+    // De-speculate the frame's real owner so it stops re-trapping, then fall
+    // back to the whole-method re-run (the pre-existing conservative path).
+    if !deopt_frame_matches_method(
+        rframe,
+        &cached.class_name,
+        &cached.method_name,
+        &cached.method_descriptor,
+    ) {
+        if std::env::var_os("CRATONVM_DBG_DEOPT").is_some() {
+            eprintln!(
+                "[cratonvm-deopt] stashed frame identity mismatch: frame={} bci={} \
+                 vs sink method {}.{}:{} — despeculating frame owner, safe re-run",
+                rframe.method_key,
+                rframe.bci,
+                cached.class_name,
+                cached.method_name,
+                cached.method_descriptor
+            );
+        }
+        despeculate_stashed_frame_method(shared, rframe);
+        return None;
+    }
     let method_key = format!(
         "{}.{}:{}",
         cached.class_name, cached.method_name, cached.method_descriptor
     );
     let live = shared.compilation_epoch_for(&method_key);
-    let fresh = compiled.compilation_epoch >= live;
+    // Epoch freshness matters only in the `CRATONVM_JIT_FREE_CODE` A/B mode,
+    // where a superseded artifact's code and deopt boxes are actually freed.
+    // In the default retain-everything mode they are leaked for the process
+    // lifetime, and the snapshot is SELF-CONSISTENT with the (stale, still
+    // executing) code that trapped — the epochs version the speculation, not
+    // the frame layout — so resuming is sound once the identity check above
+    // passed (jit-invokedynamic-groovy-regression fix: skipping here forced
+    // the imprecise whole-method re-run for every trap arriving through a
+    // stale cached entry right after the first de-speculation, re-duplicating
+    // side effects). Class redefinition invalidates the bytecode itself, so
+    // it keeps the conservative skip in either mode.
+    let fresh = compiled.compilation_epoch >= live
+        || (!vm_jit_free_code_enabled() && !crate::classloading::any_class_redefined());
     let resumed = if fresh {
         resume_real_ir_deopt(shared, thread, cached, rframe)
     } else {
@@ -9698,7 +9927,7 @@ mod deopt_step3_tests {
 
     fn rframe(locals: Vec<FrameValue>, stack: Vec<FrameValue>, bci: u32) -> ReconstructedFrame {
         ReconstructedFrame {
-            method_key: "T.m".to_string(),
+            method_key: "T.m:()V".to_string(),
             bci,
             locals,
             stack,
@@ -10009,7 +10238,7 @@ mod deopt_step3_tests {
         // local 0 = scalar object id 0 (class 5, one Int field); a held monitor on
         // it at recursion depth 2 (nested `synchronized` blocks).
         let rf = ReconstructedFrame {
-            method_key: "T.m".to_string(),
+            method_key: "T.m:()V".to_string(),
             bci: 4,
             locals: vec![vobj(0, 5, vec![FrameValue::Int(9)])],
             stack: vec![],
@@ -10125,11 +10354,17 @@ mod deopt_step3_tests {
         assert_eq!(shared.deopt_log.lock().deopt_count("T.m:()V"), 1);
     }
 
-    /// A *superseded* artifact (epoch < live, simulating an invalidation since it
-    /// was installed) does NOT resume — it falls back to the safe re-run — but the
-    /// deopt is still recorded.
+    /// A *superseded* artifact (epoch < live, simulating an invalidation since
+    /// it was installed) STILL resumes in the default retain-everything mode
+    /// (jit-invokedynamic-groovy-regression fix): the stale artifact's code
+    /// and deopt boxes are leaked, so its snapshot remains self-consistent
+    /// with the code that trapped, and refusing forced the corrupting
+    /// imprecise re-run for traps arriving through stale cached entries. The
+    /// conservative skip is retained only under `CRATONVM_JIT_FREE_CODE`
+    /// (which actually frees the boxes — not unit-testable here without a
+    /// racy global env mutation) and after class redefinition.
     #[test]
-    fn step9_stale_artifact_skips_resume() {
+    fn step9_stale_artifact_resumes_in_retain_mode() {
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
         let mut thread = JvmThread::new(ThreadId(0), "test");
         let cached = minimal_cached(); // T.m:()V
@@ -10139,10 +10374,11 @@ mod deopt_step3_tests {
         // Simulate a prior invalidation: live epoch advances past the artifact.
         assert_eq!(shared.bump_compilation_epoch("T.m:()V"), 1);
 
-        let r = real_frame_deopt_resume_and_despeculate(&shared, &mut thread, &cm, &cached, &rf);
-        assert!(r.is_none(), "superseded artifact must not resume");
-        assert_eq!(thread.frames.len(), 0);
-        // Still recorded for the deopt rate.
+        let r = real_frame_deopt_resume_and_despeculate(&shared, &mut thread, &cm, &cached, &rf)
+            .expect("superseded artifact must still resume in retain mode");
+        assert!(matches!(r, CachedCallResult::FramePushed));
+        assert_eq!(thread.frames.len(), 1);
+        // Recorded for the deopt rate as before.
         assert_eq!(shared.deopt_log.lock().deopt_count("T.m:()V"), 1);
     }
 
@@ -10180,7 +10416,17 @@ mod deopt_step3_tests {
         // per-bci de-spec fires exactly when the count reaches the limit (4).
         for n in 1..=4u32 {
             let cm = cm_with_deopt_point(0, 5);
-            let rf = rframe(vec![FrameValue::Int(1)], vec![], 5);
+            // The frame's baked identity must name `cached` — the identity gate
+            // (jit-invokedynamic-groovy-regression fix) refuses a mismatched
+            // frame before any of the de-spec accounting this test measures.
+            let rf = ReconstructedFrame {
+                method_key: key.to_string(),
+                bci: 5,
+                locals: vec![FrameValue::Int(1)],
+                stack: vec![],
+                monitors: Vec::new(),
+                caller_frames: Vec::new(),
+            };
             let _ =
                 real_frame_deopt_resume_and_despeculate(&shared, &mut thread, &cm, &cached, &rf);
             let despec_now = cratonvm_jit::deopt::despec_contains(key, 5);
@@ -10196,6 +10442,92 @@ mod deopt_step3_tests {
         // A different bci on the same method is unaffected — de-spec is per-site.
         assert!(!cratonvm_jit::deopt::despec_contains(key, 9));
         cratonvm_jit::deopt::despec_clear_for_test();
+    }
+
+    /// jit-invokedynamic-groovy-regression fix — the frame-identity parser:
+    /// exact `"<class>.<method>:<descriptor>"` matches; empty / unparseable /
+    /// differing keys never match (an empty key is the legacy-producer and
+    /// superseded-guard-sentinel shape, which must always take the safe
+    /// re-run).
+    #[test]
+    fn deopt_frame_identity_matching() {
+        let rf = |key: &str| ReconstructedFrame {
+            method_key: key.to_string(),
+            bci: 0,
+            locals: vec![],
+            stack: vec![],
+            monitors: Vec::new(),
+            caller_frames: Vec::new(),
+        };
+        // Slash-form class names contain '.': only the LAST '.' before the
+        // ':' separates class from method.
+        assert!(deopt_frame_matches_method(
+            &rf("org/x/Foo.bar:(I)V"),
+            "org/x/Foo",
+            "bar",
+            "(I)V"
+        ));
+        assert!(!deopt_frame_matches_method(
+            &rf("org/x/Foo.bar:(I)V"),
+            "org/x/Foo",
+            "baz",
+            "(I)V"
+        ));
+        assert!(!deopt_frame_matches_method(
+            &rf("org/x/Foo.bar:(I)V"),
+            "org/x/Other",
+            "bar",
+            "(I)V"
+        ));
+        assert!(!deopt_frame_matches_method(
+            &rf("org/x/Foo.bar:(I)V"),
+            "org/x/Foo",
+            "bar",
+            "(J)V"
+        ));
+        assert!(!deopt_frame_matches_method(&rf(""), "T", "m", "()V"));
+        assert!(!deopt_frame_matches_method(&rf("garbage"), "T", "m", "()V"));
+    }
+
+    /// jit-invokedynamic-groovy-regression fix — a MISMATCHED stashed frame
+    /// must not resume into the sink's method: `real_frame_deopt_resume_and_
+    /// despeculate` refuses (returns `None`, no frame pushed) and
+    /// de-speculates the frame's REAL owner (parsed from its key), not the
+    /// sink's method.
+    #[test]
+    fn mismatched_frame_refused_and_owner_despeculated() {
+        let cached = minimal_cached(); // "T"/"m"/"()V"
+        let shared = Arc::new(SharedVm::new(VmConfig::default()));
+        let mut thread = JvmThread::new(ThreadId(0), "test");
+        let cm = cm_with_deopt_point(0, 3);
+        let foreign = ReconstructedFrame {
+            method_key: "Inner/Callee.trap:(I)I".to_string(),
+            bci: 3,
+            locals: vec![FrameValue::Int(7)],
+            stack: vec![],
+            monitors: Vec::new(),
+            caller_frames: Vec::new(),
+        };
+        let frames_before = thread.frames.len();
+        let r =
+            real_frame_deopt_resume_and_despeculate(&shared, &mut thread, &cm, &cached, &foreign);
+        assert!(r.is_none(), "mismatched frame must refuse to resume");
+        assert_eq!(
+            thread.frames.len(),
+            frames_before,
+            "no frame may be pushed for a mismatched stash"
+        );
+        // The deopt was attributed to the FRAME's method, not the sink's.
+        let log = shared.deopt_log.lock();
+        assert!(
+            log.deopt_count_at_bci("Inner/Callee.trap:(I)I", 3) >= 1,
+            "frame owner must receive the deopt accounting"
+        );
+        assert_eq!(
+            log.deopt_count_at_bci("T.m:()V", 3),
+            0,
+            "sink method must NOT be charged for a foreign frame"
+        );
     }
 
     // ---------------------------------------------------------------------
@@ -16104,6 +16436,37 @@ fn execute_invoke_kind(
                                     thread.kind,
                                     stk,
                                 );
+                                // A2 forensic breadcrumb (CRATONVM_DBG_A2): was this
+                                // address EVER header-written by an allocator, with
+                                // what class/size? Distinguishes never-allocated /
+                                // allocated-then-clobbered / mid-object (double-
+                                // allocation or free-list overlap) for the reclaimed
+                                // victim — the observed victims had ALREADY all-zero
+                                // headers at sweep time, which the sweep record alone
+                                // cannot explain.
+                                let victim_addr = obj_ref.as_ptr() as usize;
+                                let hist = cratonvm_gc::a2dbg::history_at(victim_addr, 12);
+                                if hist.is_empty() {
+                                    eprintln!(
+                                        "[sweep-zero]   [A2] NO event touches {victim_addr:#x} (never header-written here, ring wrapped, or CRATONVM_DBG_A2 off)",
+                                    );
+                                } else {
+                                    for r in hist {
+                                        if r.kind == 0xFF {
+                                            eprintln!(
+                                                "[sweep-zero]   [A2] seq={} FREE @{:#x}",
+                                                r.seq, r.addr,
+                                            );
+                                        } else {
+                                            eprintln!(
+                                                "[sweep-zero]   [A2] seq={} ALLOC @{:#x} class_id={} kind={} et={} alen={} ns={} size={}{}",
+                                                r.seq, r.addr, r.class_id, r.kind, r.element_type,
+                                                r.array_length, r.num_slots, r.size,
+                                                if r.addr != victim_addr { " (covering)" } else { "" },
+                                            );
+                                        }
+                                    }
+                                }
                             }
                             // WildFly / JBoss Modules often hits this path on
                             // `ClassLoader`-typed invokevirtual sites when a
@@ -22657,6 +23020,15 @@ fn compile_osr_artifact(
                         &callee_class,
                         &callee_method,
                         &callee_desc,
+                    )
+                    // jit-invokedynamic-groovy-regression fix: never bake a
+                    // direct machine-code CALL to an indy-trap-bearing
+                    // artifact — see the matching gate in `callee_compiler`.
+                    && !crate::jit::helpers::compiled_entry_has_indy_trap(
+                        shared,
+                        &callee_class,
+                        &callee_method,
+                        &callee_desc,
                     ) {
                         direct_calls2.push((
                             ipc,
@@ -22930,7 +23302,13 @@ fn compile_osr_artifact(
                 param_slot_span,
                 param_oop_mask,
                 compact_field_info,
-                "", // method_key — OSR path disables the per-bci de-spec consult
+                // method_key — needed so OSR-artifact deopt snapshots carry
+                // this method's identity (the resume sinks verify a stashed
+                // frame's `method_key` before resuming it; an empty key would
+                // force every OSR-frame deopt onto the imprecise safe-reject
+                // path). Also enables the per-bci de-spec consult, which is
+                // inert in production (empty registry).
+                &format!("{class_name}.{method_name}:{method_descriptor}"),
                 indy_info,
             );
             let Some(mut cm) = cm else {
@@ -23276,6 +23654,34 @@ fn try_osr(
     //     (the unconditional-at-header trigger). The validated Step-8 default.
     if result_i64 == i64::MIN {
         if let Some(rframe) = cratonvm_jit::deopt::take_last_deopt() {
+            // Identity gate (jit-invokedynamic-groovy-regression): the stash
+            // could belong to a NESTED compiled callee of the OSR'd code whose
+            // sentinel bubbled up here; transferring THAT frame into this live
+            // frame would resume this method's bytecode at the callee's bci
+            // with the callee's locals/stack. Verify the frame's baked
+            // `method_key` names THIS method before transferring; on a
+            // mismatch, despeculate the frame's real owner and safe-reject.
+            let identity_ok = deopt_frame_matches_method(
+                &rframe,
+                &class_name,
+                &method_name,
+                &method_descriptor,
+            );
+            if !identity_ok {
+                despeculate_stashed_frame_method(shared, &rframe);
+                if std::env::var_os("CRATONVM_DBG_DEOPT").is_some() {
+                    eprintln!(
+                        "[cratonvm-deopt] OSR-exit stash identity mismatch (frame={} bci={}) \
+                         for {}.{}{} — safe reject",
+                        rframe.method_key,
+                        rframe.bci,
+                        &*class_name_arc,
+                        &*method_name_arc,
+                        &*descriptor_arc
+                    );
+                }
+                return None;
+            }
             // FIX (silent data corruption, HHH-15895 InPredicateTest / AccumRepro3
             // residual): `compiled.can_osr_exit` is already a precise gate — it's
             // false unless this compile genuinely recorded an OSR-exit snapshot
@@ -24059,6 +24465,17 @@ fn try_jit_upgrade_with_gate(
                 if let Some(compiled) =
                     jit_cache.get(&callee_class_arc, &callee_method_arc, &callee_desc_arc)
                 {
+                    // jit-invokedynamic-groovy-regression fix: never bake a
+                    // direct machine-code CALL to an artifact containing an
+                    // unconditional invokedynamic trap — its sentinel +
+                    // stashed frame would bail through the compiled CALLER's
+                    // epilogue, past the only point (a dispatch helper) that
+                    // can resume the callee precisely. Returning None keeps
+                    // the site on `jit_invoke_dispatch`, whose
+                    // `try_resume_trapped_callee` resolves the trap in place.
+                    if compiled.has_indy_trap {
+                        return None;
+                    }
                     // Cast: object/code pointer to integer address
                     return Some((compiled.entry_ptr() as usize, compiled.needs_context()));
                     // Cast: JIT entry point to address
@@ -24354,6 +24771,11 @@ fn try_jit_upgrade_with_gate(
             )?;
             let entry = compiled.entry_ptr() as usize; // Cast: JIT entry point to address
             let needs_ctx = compiled.needs_context();
+            // jit-invokedynamic-groovy-regression fix — see the matching gate
+            // at the JIT-cache-hit return above. The artifact is still cached
+            // (below) for helper/interpreter dispatch, but never handed back
+            // for a baked direct machine-code CALL.
+            let indy_trap = compiled.has_indy_trap;
             if crate::runtime::env_cache::dbg_jitc() {
                 eprintln!(
                     "[cratonvm-jitc] callee-compile {}.{}{} entry={:p} len={}",
@@ -24393,6 +24815,9 @@ fn try_jit_upgrade_with_gate(
                 );
             }
 
+            if indy_trap {
+                return None;
+            }
             Some((entry, needs_ctx))
         };
 
@@ -26721,38 +27146,61 @@ fn execute_jit_call_decoded(
                     return Ok(Some(r));
                 }
             }
-            // FIX (2026-07-07, jit-invokedynamic-groovy-regression, FOURTH-pass
-            // root cause): mirrors the fix at the first-call tier-up site in
-            // `execute()` (see the fix note there for the full explanation).
-            // This site consumed and cleared `take_last_deopt()` (so it never
-            // leaked a stale frame to a later unrelated check), but never drove
-            // de-speculation the way `jit_uncommon_trap`'s safe-reject path
-            // does — so an `UnreachedCode` (reason 8) trap reached through THIS
-            // call site never got blacklisted (`MakeNotCompilable`) and kept
-            // re-triggering on every subsequent call to the same compiled
-            // method. This is the actual dominant path for Groovy's
-            // `IndyInterface`-dispatched `doCall` methods (invoked via cached
-            // virtual/interface dispatch, not the first-call tier-up), so
-            // fixing only the tier-up site left the bulk of the ~2000
-            // re-entries in place. Recover the reason from the deopt point
-            // matching this bci (falling back to `UnreachedCode`, the only
-            // reason this snapshot machinery unconditionally records) and
-            // drive the same `DeoptimizationController::deoptimize` call
-            // `jit_uncommon_trap` makes, using `cached`'s own identity.
-            let despec_reason = compiled
-                .deopt_points
-                .iter()
-                .find(|dp| dp.bci == rframe.bci)
-                .map(|dp| dp.reason)
-                .unwrap_or(cratonvm_jit::deopt::DeoptReason::UnreachedCode);
-            let _ = crate::jit::helpers::DeoptimizationController::deoptimize(
-                shared,
-                &cached.class_name,
-                &cached.method_name,
-                &cached.method_descriptor,
-                despec_reason,
-                rframe.bci,
-            );
+            // jit-invokedynamic-groovy-regression fix — mirror
+            // `execute_jit_call`'s precise-resume arm on THIS sink too (the
+            // instance-method tier-up path, the dominant path for Groovy's
+            // `IndyInterface`-dispatched `doCall` methods): a frame-stashing
+            // deopt (e.g. the unconditional invokedynamic reason-8 trap) in
+            // the compiled target resumes at the trapping bci instead of
+            // re-running the whole method from entry (which double-executes
+            // every side effect committed before the trap). Identity/epoch
+            // checks and de-speculation live inside
+            // `real_frame_deopt_resume_and_despeculate`; any refusal falls
+            // through to the safe re-run below.
+            if cratonvm_jit::deopt_real_enabled() && compiled.can_deopt_resume {
+                if let Some(r) =
+                    real_frame_deopt_resume_and_despeculate(shared, thread, compiled, cached, &rframe)
+                {
+                    return Ok(Some(r));
+                }
+            } else if !rframe.method_key.is_empty()
+                && !deopt_frame_matches_method(
+                    &rframe,
+                    &cached.class_name,
+                    &cached.method_name,
+                    &cached.method_descriptor,
+                )
+            {
+                // Resume unavailable and the stash belongs to a DIFFERENT
+                // (nested-callee) method: de-speculate the frame's real owner
+                // so it stops re-trapping; `cached` is innocent.
+                despeculate_stashed_frame_method(shared, &rframe);
+            } else {
+                // Resume unavailable (`can_deopt_resume` false / gate off) —
+                // still drive de-speculation so an `UnreachedCode` (reason 8)
+                // trap reached through THIS call site gets blacklisted
+                // (`MakeNotCompilable`) instead of re-triggering on every
+                // subsequent call (the FOURTH-pass Groovy finding: this sink
+                // consumed the stash but never de-speculated, leaving the
+                // trapping method compiled forever). Recover the reason from
+                // the deopt point matching this bci (falling back to
+                // `UnreachedCode`, the only reason this snapshot machinery
+                // unconditionally records).
+                let despec_reason = compiled
+                    .deopt_points
+                    .iter()
+                    .find(|dp| dp.bci == rframe.bci)
+                    .map(|dp| dp.reason)
+                    .unwrap_or(cratonvm_jit::deopt::DeoptReason::UnreachedCode);
+                let _ = crate::jit::helpers::DeoptimizationController::deoptimize(
+                    shared,
+                    &cached.class_name,
+                    &cached.method_name,
+                    &cached.method_descriptor,
+                    despec_reason,
+                    rframe.bci,
+                );
+            }
             return Ok(None);
         }
     }
@@ -29238,7 +29686,7 @@ fn refs_equal(a: &Value, b: &Value) -> bool {
     }
 }
 
-fn count_method_params(descriptor: &str) -> usize {
+pub(crate) fn count_method_params(descriptor: &str) -> usize {
     let mut count = 0;
     let bytes = descriptor.as_bytes();
     let mut i = 1; // skip opening '('
@@ -29468,6 +29916,47 @@ fn double_to_long(v: f64) -> i64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Young-GC live-reclaim ROOT FIX regression (RRWL/ThreadLocalMap$Entry
+    /// IMSE/hang family, 2026-07-07): the pre-GC watch publication must
+    /// include the REFERENCE OBJECTS' own addresses, not just their
+    /// referents. The non-moving young sweep only records identity
+    /// `pointer_map` entries for WATCHED kept-in-place survivors, and the
+    /// post-GC restore pass judges a Reference object's survival by
+    /// `pointer_map ∪ is_addr_live` — so an unwatched live YOUNG Reference
+    /// object was judged dead: its nulled referent was never restored and
+    /// the mutator then expunged the live entry (`refersTo(null) == true`),
+    /// losing RRWL read-lock hold counters and WeakHashMap entries.
+    #[test]
+    fn weakref_pre_gc_watch_includes_reference_objects() {
+        let shared = std::sync::Arc::new(crate::vm::SharedVm::new(
+            crate::config::VmConfig::default(),
+        ));
+        let referent = shared.heap.alloc_object(ClassId::new(0), 1);
+        let weak_ref = shared.heap.alloc_object(ClassId::new(0), 2);
+        shared.ref_processor.lock().discover_reference(
+            cratonvm_gc::reference::ReferenceType::Weak,
+            weak_ref.as_ptr() as usize,
+            referent.as_ptr() as usize,
+            None,
+        );
+
+        weakref_null_referents_pre_gc(&shared);
+
+        assert!(
+            cratonvm_gc::gc_quiescence::is_watched_referent(referent.as_ptr() as usize),
+            "referent address must be watched (pre-existing behaviour)"
+        );
+        assert!(
+            cratonvm_gc::gc_quiescence::is_watched_referent(weak_ref.as_ptr() as usize),
+            "the Reference OBJECT's own address must be watched, so a \
+             kept-in-place young Reference survivor gets an identity \
+             pointer_map entry and its nulled referent is restored post-GC"
+        );
+
+        // Clean up the process-global watch list for other tests.
+        cratonvm_gc::gc_quiescence::set_watched_referents(&[]);
+    }
 
     #[test]
     fn jit_native_shadow_invoke_index_covers_all_method_invokes() {

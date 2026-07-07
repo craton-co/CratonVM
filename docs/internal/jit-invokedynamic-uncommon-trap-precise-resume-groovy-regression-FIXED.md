@@ -205,3 +205,61 @@ itself (i.e., what happens when a genuinely `Unsupported` slot forces a
 whole-method re-run), not something `fb4a333d`, the earlier blanket revert,
 or this fix's changes introduced, worsened, or are positioned to fix. Left
 for separate investigation.
+
+## UPDATE 2026-07-07 (concurrent branch `fix/hib-temporal-placeholder-dup-20260707`) — a FOURTH bug in the same machinery: stashed frames carried no method identity
+
+Merged the same day from the branch that root-caused the Hibernate
+`type.temporal.*` `values (??,??)` SQL-placeholder duplication (the visible
+Hibernate face of the corruption the earlier blanket revert had reopened —
+see `docs/internal/hib-temporal-sql-parameter-placeholder-duplication-FIXED.md`).
+That investigation independently found one more real unsoundness this doc's
+three fixes do not cover:
+
+**The stashed `ReconstructedFrame` carried NO method identity** (`method_key`
+was `String::new()` in the x64 producer). When a reason-8 trap fires in a
+NESTED compiled callee, its sentinel bubbles up through the compiled callers'
+epilogue bails, and the outermost interpreter sink consumed the stash as if it
+belonged to the OUTERMOST method — materializing that method's frame with the
+callee's locals/stack/bci: arbitrary misexecution. Deterministic repro:
+`scratch-min/IndyReplay.java`'s nested shape (compiled middle → compiled leaf
+with a side effect before a live indy) corrupted 30000/30000 calls before
+these fixes, 0 after. Closed by:
+
+1. Baking `"<class>.<method>:<descriptor>"` into every deopt snapshot
+   (`build_and_record_deopt_point`; the OSR and eager first-call compile paths
+   now pass real method keys — they passed `""`).
+2. Identity checks at every resume consumer (`real_frame_deopt_resume_and_
+   despeculate`, `build_deopt_frame_inner`, `try_osr`'s transfer arm); a
+   mismatched frame de-speculates its REAL owner (parsed from the key) and
+   takes the safe re-run. Unit-tested (`deopt_frame_identity_matching`,
+   `mismatched_frame_refused_and_owner_despeculated`).
+3. `try_resume_trapped_callee` (vm/src/jit/helpers.rs) + `execute_prebuilt_
+   frame`: dispatch helpers resolve a trapped compiled callee PRECISELY at the
+   call site (rebuild its frame from the stash, interpret to completion, hand
+   the real result to the compiled caller) — nested chains never propagate a
+   sentinel or replay side effects at all.
+4. `CompiledMethod.has_indy_trap` publication gates (JIT→JIT direct-call
+   baking, MIC/PIC inline-cache installs), so machine code never calls an
+   indy-trap artifact directly — every call stays on a dispatch helper that
+   can resolve its trap. Indy-bearing methods with a non-tail raw
+   self-recursive call bail compilation (stash identity cannot distinguish
+   recursive invocations).
+5. `x64_deopt_entry`'s superseded-epoch short-circuit and the sink's
+   `compilation_epoch` freshness check now apply only under
+   `CRATONVM_JIT_FREE_CODE` — in the default retain-everything mode the deopt
+   boxes are leaked and a stale artifact's snapshot stays self-consistent
+   with its own still-executing code, so refusing forced the imprecise re-run
+   for every post-despeculation trap arriving via stale cached entries.
+
+The reason-tagging fix in this doc (`emit_osr_exit_map_at_reason`) and that
+branch's identical independent fix were unified in the merge; ditto the
+sink-side de-speculation (kept as the fallback arm where precise resume is
+unavailable). See the placeholder-duplication doc for full verification
+numbers (Hibernate temporal: 36 corrupted SessionFactories → 0; nested repro
+30000/30000 → 0; 24-class passed-slice regression 24/24).
+
+**Residual flagged for the Azure host:** re-measure
+`GroovyBeanDefinitionReaderTests` batch/isolated numbers on the merged tree
+(structurally the identity checks can only remove wrong-frame resumes, never
+add them; no Spring checkout exists on the Windows box these fixes were
+verified on).
