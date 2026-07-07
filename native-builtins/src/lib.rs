@@ -25059,6 +25059,26 @@ fn native_surefire_forkedbooter_acknowledged_exit(
             "eventChannel.onJvmExit",
             ctx.invoke_virtual(event_channel, "onJvmExit", "()V", &[]),
         );
+    } else {
+        // Older Surefire booters (2.x line -- e.g. 2.22.2, still pinned by
+        // WildFly's testsuite poms) have no `eventChannel`/`closeForkChannel`
+        // at all: the parent's `ForkClient` only marks `saidGoodBye = true`
+        // once it reads a literal "Z,0,BYE!\n" line on the forked process's
+        // stdout, written by the real `acknowledgedExit()` via
+        // `encodeAndWriteToOutput(String)` before the process exits. Without
+        // this, `std::process::exit(0)` below leaves that flag unset and
+        // Maven reports "The forked VM terminated without properly saying
+        // goodbye" even though zero matching tests is the correct outcome.
+        let bye = ctx.create_string("Z,0,BYE!\n");
+        surefire_ignore(
+            "encodeAndWriteToOutput(BYE)",
+            ctx.invoke_special(
+                "org/apache/maven/surefire/booter/ForkedBooter",
+                "encodeAndWriteToOutput",
+                "(Ljava/lang/String;)V",
+                &[Value::Object(Some(this)), Value::Object(Some(bye))],
+            ),
+        );
     }
     surefire_ignore(
         "cancelPingScheduler",
@@ -25075,15 +25095,17 @@ fn native_surefire_forkedbooter_acknowledged_exit(
             ctx.invoke_virtual(command_reader, "stop", "()V", &[]),
         );
     }
-    surefire_ignore(
-        "closeForkChannel",
-        ctx.invoke_special(
-            "org/apache/maven/surefire/booter/ForkedBooter",
+    if let Value::Object(Some(_)) = ev {
+        surefire_ignore(
             "closeForkChannel",
-            "()V",
-            &[Value::Object(Some(this))],
-        ),
-    );
+            ctx.invoke_special(
+                "org/apache/maven/surefire/booter/ForkedBooter",
+                "closeForkChannel",
+                "()V",
+                &[Value::Object(Some(this))],
+            ),
+        );
+    }
 
     if std::env::var("CRATONVM_SOFT_EXIT").as_deref() == Ok("1") {
         eprintln!("[SUREFIRE-ACK-EXIT] soft-returning due to CRATONVM_SOFT_EXIT=1");
