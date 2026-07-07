@@ -1,5 +1,27 @@
 # TLS/mTLS/OCSP validation doesn't reject invalid handshakes (security-relevant)
 
+**Windows platform gap found 2026-07-07 (new, separate task `task_c068bce2`):**
+all the verification below was done on Linux (Azure host). Rebuilding fresh on
+**Windows** from dev `d14d2ff3` (confirmed via `git merge-base` to include
+both `aafdaec8` and `b7390ffd`) and re-running all 8 classes in this cluster
+shows **all 8 still fail** — but not with the original fail-open symptom.
+Root cause (identical across all 8, confirmed via `.log.err`):
+```
+INFO [...] Starting test case [test[OpenSSL-FFM with OpenSSL trust ...]]
+WARN cratonvm_vm::vm::vm_util: <clinit> failed — wrapping in ExceptionInInitializerError
+  class=org/apache/tomcat/util/openssl/openssl_h$OpenSSL_version_num
+  cause=java/lang/NullPointerException Cannot invoke "java.util.Optional.or(java.util.function.Supplier)"
+```
+This fires when test parameterization reaches the "OpenSSL-FFM" connector
+variant. This doc's own "Verified test outcomes" table below already notes
+"OpenSSL/OpenSSL-FFM variants still skip — native ssl.dll/tomcat-native not
+installed, environmental, unrelated" — i.e. on Linux this variant is detected
+as unavailable and cleanly skipped. On Windows it isn't skipped: the
+`<clinit>` NPEs instead, and the resulting `ExceptionInInitializerError` kills
+the whole connector/test class rather than just that one parameterized case.
+**Not yet re-verified against this doc's claimed Linux pass counts on
+Windows** — do not assume they transfer. See `task_c068bce2`.
+
 **Status:** OCSP revocation checking now IMPLEMENTED and verified (branch
 `feat/ocsp-revocation-checking-20260706`, follow-up to
 `fix/tls-residuals-followup-20260706` / the original
