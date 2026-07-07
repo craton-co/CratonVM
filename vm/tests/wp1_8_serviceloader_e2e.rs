@@ -185,7 +185,6 @@ fn fake_driver_instantiates_directly() {
 /// `ServiceLoader.load(java.sql.Driver.class).iterator()` end-to-end
 /// (no native helpers, no shortcut paths).
 #[test]
-#[ignore = "hangs in ServiceLoader iterator path; see docs/known-issues/wp1-8-real-jar-serviceloader-hang.md"]
 fn service_loader_iterator_discovers_driver() {
     if !fixture_compiled() {
         eprintln!("Skipping: Wp18ServiceLoaderE2E.class not available (javac not on PATH?)");
