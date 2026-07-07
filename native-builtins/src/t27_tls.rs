@@ -6743,6 +6743,28 @@ fn session_peer_certs_table() -> &'static Mutex<HashMap<u64, Vec<Vec<u8>>>> {
     T.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
+/// FIX (netty-https-client-trust residual): populate `session_peer_certs_table`
+/// for a CLIENT-side `SSLSession` (allocated by `phases_late::new13_alloc_ssl_session`
+/// for the native-tls `SSLSocketFactory.createSocket` path). Without this, the
+/// client's own session object never gets an entry — the table was only ever
+/// populated for SSLEngine-based (server / NIO) sessions — so any caller that
+/// later queries `session.getPeerCertificates()` on the CLIENT session (e.g.
+/// Spring's `DefaultSslInfo.initCertificates` when building `SslInfo` for a
+/// reactive HTTPS exchange) always sees an empty chain and gets
+/// `SSLPeerUnverifiedException("peer not authenticated")` even though the
+/// handshake succeeded and a real peer chain was captured (and already used
+/// once, to pass the TrustManager check in `new13_do_create_socket`). A no-op
+/// when the chain is empty (nothing to record; the accessor's existing
+/// empty-chain contract is unaffected).
+pub(crate) fn record_client_peer_chain(session: ObjectRef, chain_der: Vec<Vec<u8>>) {
+    if chain_der.is_empty() {
+        return;
+    }
+    session_peer_certs_table()
+        .lock()
+        .insert(objref_key(session), chain_der);
+}
+
 fn register_ssl_session_real(r: &mut NativeMethodRegistry) {
     let cls = "javax/net/ssl/SSLSession";
 

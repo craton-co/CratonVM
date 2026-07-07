@@ -39790,6 +39790,13 @@ fn new13_alloc_ssl_session(ctx: &mut dyn NativeContext, tls_id: i32) -> ObjectRe
     ctx.set_field(session, NEW13_SESS_PROTO, Value::Object(Some(proto_str)));
     ctx.set_field(session, NEW13_SESS_CIPHER, Value::Object(Some(cipher_str)));
     ctx.set_field(session, NEW13_SESS_TLSID, Value::Int(tls_id));
+    // FIX (netty-https-client-trust residual): record the peer chain this
+    // client connection already captured so a later `getPeerCertificates()`
+    // on THIS session object doesn't spuriously see "no certificate" — see
+    // `t27_tls::record_client_peer_chain` doc comment.
+    if let Some(chain) = crate::servlet::s2_tls_peer_cert_chain_der(tls_id) {
+        crate::t27_tls::record_client_peer_chain(session, chain);
+    }
     session
 }
 
