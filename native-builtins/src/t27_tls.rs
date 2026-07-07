@@ -1743,6 +1743,17 @@ impl JavaKeyManagerResolver {
                 if dbg {
                     let exc_cls = match &choose_result {
                         Err(cratonvm_types::error::MethodCallFailed::ExceptionThrown(exc)) => {
+                            let hash = ctx.identity_hash_code(*exc);
+                            if let Some(trace) = ctx.get_stack_trace(hash) {
+                                for (fi, frame) in trace.iter().enumerate() {
+                                    eprintln!(
+                                        "[dbg-tls-auth]   frame[{}] = {:?}",
+                                        fi, frame
+                                    );
+                                }
+                            } else {
+                                eprintln!("[dbg-tls-auth]   (no stack trace captured)");
+                            }
                             Some(ctx.class_name_of_id(ctx.class_id_of_object(*exc)))
                         }
                         _ => None,
