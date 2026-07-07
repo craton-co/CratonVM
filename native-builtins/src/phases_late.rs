@@ -41495,12 +41495,20 @@ pub(crate) fn register_p68_security_cert(r: &mut NativeMethodRegistry) {
             // throws (malformed input), `make_x509_mirror` falls back to a
             // synthetic mirror that still stashes the DER in field 3, so
             // `getEncoded()` is never empty for a non-empty input stream.
-            if let Some(ref data) = der_data {
-                let alias = basic_der_extract_names(data)
+            if let Some(ref raw) = der_data {
+                // Accept PEM-armored streams too (real JDK's X509Factory sniffs
+                // `-----BEGIN`): decode to DER first so the mirror stores real
+                // cert bytes and `getEncoded()` is non-empty. A DER stream (no
+                // armor) passes through `pem_block_to_der` unchanged. Fixes
+                // Netty `SelfSignedCertificate` → empty `getEncoded()` → rustls
+                // `invalid peer certificate: BadEncoding`
+                // (http-server-sslengine-identity-singleton-clobber).
+                let data = crate::pem_block_to_der(raw);
+                let alias = basic_der_extract_names(&data)
                     .map(|(subject, _)| subject)
                     .unwrap_or_else(|| "CN=Unknown".into());
                 return Ok(Some(Value::Object(Some(crate::keystore::make_x509_mirror(
-                    ctx, &alias, data,
+                    ctx, &alias, &data,
                 )))));
             }
 
@@ -41545,14 +41553,16 @@ pub(crate) fn register_p68_security_cert(r: &mut NativeMethodRegistry) {
                 if let Value::Object(Some(buf_ref)) = ctx.get_field(*is_ref, 0) {
                     let len = ctx.array_length(buf_ref);
                     if len > 0 {
-                        let mut data = Vec::with_capacity(len);
+                        let mut raw = Vec::with_capacity(len);
                         for i in 0..len {
                             let b = match ctx.get_array_element(buf_ref, i) {
                                 Value::Int(v) => v as u8,
                                 _ => 0,
                             };
-                            data.push(b);
+                            raw.push(b);
                         }
+                        // PEM-or-DER, same as `generateCertificate`.
+                        let data = crate::pem_block_to_der(&raw);
                         let alias = basic_der_extract_names(&data)
                             .map(|(subject, _)| subject)
                             .unwrap_or_else(|| "CN=Unknown".into());
