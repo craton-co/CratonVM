@@ -56,11 +56,17 @@ angles**; this index is the consolidated map. Read it first.
 
 ## 2026-07-07 Hibernate temporal: GC crash family extinct → new SQL-placeholder bug surfaced
 
-- [hib-temporal-sql-parameter-placeholder-duplication.md](hib-temporal-sql-parameter-placeholder-duplication.md) —
-  🔴 OPEN, untriaged. Validating the archived GC stale-local doc (item 19 below) showed the 5
-  `type.temporal.*` classes are now crash-free (0 corruption markers) but fail en masse on
-  DUPLICATED JDBC `?` placeholders in generated INSERTs (`values (??,???)`, growing per
-  statement) — a string-building defect, not GC.
+- ✅ FIXED (branch `fix/hib-temporal-placeholder-dup-20260707`, 2026-07-07): the 5
+  `type.temporal.*` classes' DUPLICATED JDBC `?` placeholders (`values (??,???)`) were NOT a
+  string-building defect — they were the reopened JIT invokedynamic uncommon-trap
+  imprecise-resume corruption (the `5ceb880f` revert of `fb4a333d`) re-executing
+  JIT-committed `sqlBuffer` appends. Fixed by identity-sound precise resume for the reason-8
+  trap (method-key-baked deopt snapshots + identity-checked consumers + dispatch-helper
+  in-place callee resolution + direct-call/MIC/PIC publication gates), which closes BOTH this
+  corruption AND the Groovy regression that had forced the revert. Doc retired to
+  [`docs/internal/hib-temporal-sql-parameter-placeholder-duplication-FIXED.md`](../internal/hib-temporal-sql-parameter-placeholder-duplication-FIXED.md);
+  the reason-8 saga's remaining follow-ups stay tracked in
+  [jit-invokedynamic-uncommon-trap-precise-resume-groovy-regression.md](jit-invokedynamic-uncommon-trap-precise-resume-groovy-regression.md).
 
 ## 2026-07-06/07 http.client class_manager RwLock recursive-read deadlock — FIXED (branch fix/class-manager-writer-starvation-20260706)
 

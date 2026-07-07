@@ -8023,7 +8023,20 @@ impl Compiler {
     /// trampoline. Only called when `deopt_real_enabled()` (see the call site), so
     /// production builds zero OSR-exit metadata and stay byte-identical.
     fn emit_osr_exit_map_at(&mut self, bci: usize) {
-        let box_ptr = self.build_and_record_deopt_point(bci, crate::deopt::DeoptReason::OsrExit);
+        self.emit_osr_exit_map_at_with_reason(bci, crate::deopt::DeoptReason::OsrExit)
+    }
+
+    /// As [`emit_osr_exit_map_at`], with the recorded point's `reason` chosen
+    /// by the caller. The 0xba (invokedynamic) arm records its unconditional
+    /// uncommon-trap snapshot as `UnreachedCode` — the reason the VM resume
+    /// sinks recover from the point (by bci) and feed to
+    /// `DeoptimizationController::deoptimize`, whose policy for
+    /// `UnreachedCode` is give-up-immediately (`MakeNotCompilable`). Tagging
+    /// it `OsrExit` (the loop-header map's reason) put indy-trap methods on
+    /// the count-based recompile policy instead — an endless
+    /// recompile→trap→resolve churn.
+    fn emit_osr_exit_map_at_with_reason(&mut self, bci: usize, reason: crate::deopt::DeoptReason) {
+        let box_ptr = self.build_and_record_deopt_point(bci, reason);
         self.osr_exit_box_ptr_by_bci.insert(bci, box_ptr);
         self.osr_exit_points.push(bci);
         if std::env::var_os("CRATONVM_DBG_DEOPT").is_some() {
@@ -8294,7 +8307,20 @@ impl Compiler {
             action: DeoptAction::Reinterpret,
             speculation_id: 0,
             frame_state: FrameState {
-                method_key: String::new(),
+                // Deopt-frame identity (jit-invokedynamic-groovy-regression root
+                // cause): bake this method's `"<class>.<method>:<descriptor>"`
+                // key into every snapshot so the VM-side resume sinks can verify
+                // a stashed `ReconstructedFrame` actually belongs to the method
+                // they are about to resume. Without it, a trap in a NESTED
+                // compiled callee propagated the `i64::MIN` sentinel up through
+                // its compiled callers' epilogue bails, and the OUTERMOST
+                // interpreter sink consumed the (identity-less) inner frame as
+                // if it were the outer method's — materializing the outer
+                // method's frame with the inner method's locals/stack/bci, i.e.
+                // resuming arbitrary bytecode with a foreign frame. Empty only
+                // for legacy/test wrappers that pass no key (the consumers
+                // treat an empty key as "never matches" → safe re-run).
+                method_key: self.method_key.clone(),
                 // Cast: bytecode/native offset to u32 (non-negative, fits)
                 bci: bci as u32,
                 locals,
@@ -15410,45 +15436,36 @@ impl Compiler {
             // Gate OFF (default) ⇒ None ⇒ the uncommon-trap path below emits
             // byte-identically.
             //
-            // REVERTED (2026-07-07, jit-invokedynamic-groovy-regression):
-            // fb4a333d routed reason 8 (`DEOPT_REASON_UNREACHED_CODE`, the
-            // invokedynamic uncommon trap) through this precise path
-            // UNCONDITIONALLY, to fix a genuine silent-corruption bug (the old
-            // imprecise "safe reject" rewound to the OSR entry bci, discarding
-            // or duplicating side effects committed by JIT-compiled code
-            // between OSR entry and the trap). That fix is CORRECT for the
-            // case it targeted (a hot loop's OSR-compiled body reaching an
-            // invokedynamic after real work), but empirically root-caused
-            // (bisected via targeted per-item revert flags — see this
-            // session's investigation) to independently regress Groovy:
-            // running `GroovyBeanDefinitionReaderTests` with the JIT enabled
-            // (default) now fails almost every method with a Groovy-compiler-
-            // internal "duplicate main method"/"startup failed" error,
-            // reproducing on a single test method in total isolation and
-            // disappearing entirely under `--nojit`. Bisection ruled out every
-            // OTHER piece of fb4a333d (the 0xba codegen snapshot-recording
-            // itself, the `LocalKind::Ref` trust relaxation, and
-            // `can_osr_exit`'s elided-monitor exclusion each independently
-            // toggled off with no effect) — reverting ONLY this stub-routing
-            // line (forcing reason 8 back to `None`, the pre-fb4a333d
-            // "safe-reject" path) is the sole change that restores the Groovy
-            // suite to green, and was verified NOT to be a red herring by
-            // toggling it alone in isolation both ways.
-            //
-            // The exact mechanism inside the precise-resume path that Groovy's
-            // dynamic-call-site machinery finds unsound was not pinned down
-            // further in the time available (the reconstructed frame's operand
-            // stack — which for an invokedynamic trap holds the live call-site
-            // arguments the interpreter still needs to actually deliver, unlike
-            // the loop-header-only shape this machinery was originally built
-            // for — is the most likely remaining suspect; see
-            // docs/known-issues/jit-invokedynamic-uncommon-trap-precise-resume-groovy-regression.md).
-            // This revert restores the PRE-fb4a333d imprecise-reject behavior
-            // for reason 8 ONLY (reasons 2/6/7 keep their existing, unaffected
-            // gated precise-resume paths) — i.e. it reopens the original
-            // silent-corruption risk fb4a333d's item 2 aimed to close, in
-            // exchange for closing this regression. See the doc above for the
-            // full tradeoff writeup and suggested next steps.
+            // Reason-8 history (jit-invokedynamic-groovy-regression): fb4a333d
+            // routed reason 8 (`DEOPT_REASON_UNREACHED_CODE`, the invokedynamic
+            // uncommon trap) through this precise path unconditionally, to fix
+            // a genuine silent-corruption bug — the old imprecise "safe reject"
+            // rewound to the OSR entry bci (or re-ran the whole method from
+            // entry, for a normal call), discarding or duplicating side effects
+            // committed by JIT-compiled code before the trap (the Hibernate
+            // `type.temporal.*` `values (??,??)` SQL-placeholder duplication).
+            // That routing was then REVERTED (5ceb880f) because it regressed
+            // Groovy dynamic dispatch. The ACTUAL root cause of that
+            // regression, found 2026-07-07: the stashed `ReconstructedFrame`
+            // carried NO method identity, so when the trap fired in a NESTED
+            // compiled callee (sentinel propagating up through compiled
+            // callers' epilogue bails), the outermost interpreter sink resumed
+            // the OUTER method's frame with the INNER method's locals/stack/
+            // bci — arbitrary misexecution. Fixed by (a) baking
+            // `self.method_key` into every snapshot (see
+            // `build_and_record_deopt_point`), (b) identity-checking at every
+            // VM resume sink, and (c) resolving a trapped compiled callee
+            // PRECISELY at its own dispatch-helper call site
+            // (`try_resume_trapped_callee`, vm/src/jit/helpers.rs) so the
+            // sentinel never reaches a foreign consumer for helper-dispatched
+            // calls, plus refusing to publish machine-code-callable entries
+            // (direct calls / MIC / PIC) for indy-trap-bearing methods so every
+            // call to one goes through a helper. With those in place, reason 8
+            // routes through the precise trampoline again (under the standard
+            // `deopt_real_enabled()` kill-switch, default ON — explicit
+            // `CRATONVM_DEOPT_REAL=0` restores the legacy imprecise path).
+            // `emit_osr_exit_map_at` unconditionally records the snapshot at
+            // the 0xba site, so `osr_exit_box_ptr_by_bci` always has an entry.
             let frame_box_ptr = if crate::deopt_real_enabled() {
                 match reason {
                     2 => self.deopt_box_ptr_by_bci.get(&bci).copied(),
@@ -15458,6 +15475,9 @@ impl Compiler {
                     // immediately after the pre-call flush (before any arg pops).
                     6 => self.deopt_box_ptr_by_bci.get(&bci).copied(),
                     7 => self.osr_exit_box_ptr_by_bci.get(&bci).copied(),
+                    // The invokedynamic uncommon trap — see the block comment
+                    // above for why this is safe again.
+                    8 => self.osr_exit_box_ptr_by_bci.get(&bci).copied(),
                     _ => None,
                 }
             } else {
@@ -21376,6 +21396,27 @@ impl Compiler {
                         // Check for tail call: invokestatic self at PC, xreturn at PC+3
                         let is_tail_call = pc + 3 < code_len && matches!(code[pc + 3], 0xac..=0xb0); // ireturn..areturn
 
+                        // jit-invokedynamic-groovy-regression fix: a method
+                        // containing a live invokedynamic site (compiled as an
+                        // unconditional reason-8 trap) must NEVER machine-CALL
+                        // its own entry: a trap in the INNER recursive
+                        // invocation stashes a frame whose method identity
+                        // equals this method's, so the dispatch-helper resume
+                        // above this frame could not distinguish the inner
+                        // invocation's frame from the outer's and would resume
+                        // the wrong one (dropping the outer continuation). The
+                        // tail-JMP form below is exempt (it reuses the SAME
+                        // frame, so the stash genuinely describes the one live
+                        // invocation). For the non-tail raw CALL, bail the
+                        // whole compile — correctness first; a self-recursive
+                        // method that also contains an invokedynamic is rare
+                        // enough that staying interpreted is acceptable.
+                        if !self.indy_info.is_empty()
+                            && !(is_tail_call && self.body_entry_offset > 0)
+                        {
+                            return false;
+                        }
+
                         let mut arg_slots = Vec::with_capacity(n);
                         for _ in 0..n {
                             arg_slots.push(self.pop_stack());
@@ -23678,8 +23719,14 @@ impl Compiler {
                     // performance cost. Reuses the existing OSR-exit snapshot
                     // machinery (frame reconstruction from live registers/spill
                     // slots) so the VM can resume precisely at THIS bci instead of
-                    // rewinding.
-                    self.emit_osr_exit_map_at(pc);
+                    // rewinding. Tagged `UnreachedCode` (the trap's true reason)
+                    // so the resume sinks' de-speculation applies the
+                    // give-up-immediately policy — see
+                    // `emit_osr_exit_map_at_with_reason`.
+                    self.emit_osr_exit_map_at_with_reason(
+                        pc,
+                        crate::deopt::DeoptReason::UnreachedCode,
+                    );
 
                     let patch = self.emit_jmp_rel32_patch();
                     self.deopt_stubs.push((patch, pc, 8)); // 8 = DEOPT_REASON_UNREACHED_CODE
@@ -25321,6 +25368,19 @@ pub fn compile_with_param_slots(
     // a scalar-replaced object held under an elided `synchronized` block is
     // the same unsound-resume hazard here as it is for `can_deopt_resume`.
     cm.can_osr_exit = !cm.osr_exit_points.is_empty() && !compiler.has_elided_monitor;
+    // jit-invokedynamic-groovy-regression fix: a compiled 0xba site is an
+    // UNCONDITIONAL trap (the instruction is never JIT-executed), so any
+    // execution of this artifact that reaches it deopts. Publishing this
+    // artifact's entry where MACHINE CODE calls it directly (a baked
+    // JIT→JIT direct call, a MIC/PIC inline-cache entry) would let the
+    // sentinel + stashed frame bail through a compiled CALLER's epilogue,
+    // where no consumer can resume the callee precisely (the caller's
+    // continuation is already lost). The publication gates (see
+    // `callee_compiler` in vm/src/runtime/interpreter.rs and the MIC/PIC
+    // install sites in vm/src/jit/helpers.rs) consult this flag so every
+    // call to such a method stays on a dispatch helper, whose
+    // `try_resume_trapped_callee` resolves the trap precisely in place.
+    cm.has_indy_trap = !compiler.indy_info.is_empty();
     // Stage 3 — the frame offset where this method stores the active
     // safepoint's bytecode PC (0 when the precise gate was off at compile).
     cm.sp_id_slot_off = compiler.sp_id_slot_off;

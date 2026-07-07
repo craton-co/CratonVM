@@ -1134,6 +1134,21 @@ unsafe fn route_implicit_exc_through_callee(
     if rc != i64::MIN {
         return rc;
     }
+    // jit-invokedynamic-groovy-regression fix — FIRST chance: a frame-stashing
+    // deopt (the unconditional invokedynamic reason-8 trap, or a precise guard
+    // bail) in the compiled callee THIS helper just invoked. Resume the callee
+    // precisely at its trapping bci and hand the real result back to the
+    // compiled caller — no side-effect re-run, no sentinel escape. Refusals
+    // (identity mismatch / unmappable / no stash) leave the stash + sentinel
+    // to propagate exactly as before. The cheap `has_last_deopt` pre-check
+    // keeps the common exception path free of the thread-guard acquire.
+    if cratonvm_jit::deopt::has_last_deopt() {
+        if let Some((thread, _guard)) = jit_thread_mut() {
+            if let Some(v) = try_resume_trapped_callee(vm, thread, info) {
+                return v;
+            }
+        }
+    }
     // Did the callee raise an *implicit* runtime exception?
     let aioobe = take_jit_pending_aioobe();
     let npe = if aioobe.is_none() {
@@ -1192,6 +1207,189 @@ unsafe fn route_implicit_exc_through_callee(
         return bail_to_interpreter(vm, thread, info, &bail_args);
     }
     restash_and_return()
+}
+
+/// jit-invokedynamic-groovy-regression fix — does the JIT cache hold a
+/// compiled artifact for `(class, method, descriptor)` whose body contains an
+/// unconditional `invokedynamic` uncommon trap (`has_indy_trap`)?
+///
+/// Entry-publication gates consult this: such an artifact must NEVER be
+/// published where MACHINE CODE calls it directly (a baked JIT→JIT direct
+/// call, a MIC/PIC inline-cache entry), because the trap's `i64::MIN`
+/// sentinel + stashed frame would bail through the compiled CALLER's
+/// epilogue, past the only point (the dispatch helper) that can resume the
+/// callee precisely. Keyed exactly like the compile probes at each gate site
+/// (the receiver class for MIC/PIC, the CP class for static direct calls) so
+/// the lookup hits the same cache row `try_jit_compile_callee` filled.
+pub(crate) fn compiled_entry_has_indy_trap(
+    vm: &SharedVm,
+    class_name: &str,
+    method_name: &str,
+    descriptor: &str,
+) -> bool {
+    let jit_cache = vm.jit_cache.read();
+    jit_cache
+        .get(class_name, method_name, descriptor)
+        .map_or(false, |c| c.has_indy_trap)
+}
+
+/// jit-invokedynamic-groovy-regression fix — precise, in-place resolution of a
+/// compiled callee that deopted with a stashed frame, at the dispatch-helper
+/// call site that invoked it.
+///
+/// When a compiled callee returns the `i64::MIN` sentinel because it hit a
+/// frame-stashing deopt (the unconditional `invokedynamic` reason-8 trap, or a
+/// precise guard bail), the stash describes the CALLEE's own frame at the
+/// trapping bci. THIS helper — sitting directly between the compiled caller
+/// and the callee — is the only place the callee can be resumed without
+/// losing any caller's continuation: rebuild the callee's interpreter frame
+/// from the stash, run it to completion, and hand the REAL result back to the
+/// compiled caller as if the callee had returned normally. No side effect is
+/// re-run, no sentinel escapes.
+///
+/// Refusal (returns `None`, stash left in place / restored) when:
+///   * no stash, or the superseded-artifact sentinel (`bci == u32::MAX`);
+///   * the stash's baked `method_key` does not name the SAME method this
+///     helper invoked (`info`'s name+descriptor; the declaring class may be a
+///     supertype of the call-site class for virtual dispatch, so the class is
+///     taken from the key and verified to declare the method) — e.g. a
+///     deeper machine-called method's guard deopt propagating through;
+///   * the method is `ACC_SYNCHRONIZED` (conservative — monitor accounting
+///     for the compiled prologue/epilogue vs the interpreter continuation is
+///     not audited for this path);
+///   * the frame is unmappable (`build_deopt_frame_inner` bails).
+/// On refusal the sentinel propagates exactly as before — the outer sinks'
+/// identity checks then despeculate + fall back to the safe re-run.
+///
+/// SAFETY: same contract as the surrounding dispatch helpers — `vm` live,
+/// `info` a live `JitInvokeInfo`, `thread` the current thread's exclusive
+/// borrow (passed in, NOT re-acquired via `jit_thread_mut`, because some call
+/// sites — `jit_invoke_virtual_mic` — hold the thread guard for their whole
+/// body and a nested acquire would alias the `&mut`).
+unsafe fn try_resume_trapped_callee(
+    vm: &SharedVm,
+    thread: &mut JvmThread,
+    info: &JitInvokeInfo,
+) -> Option<i64> {
+    let (key, bci) = cratonvm_jit::deopt::peek_last_deopt_identity()?;
+    if key.is_empty() || bci == u32::MAX {
+        return None;
+    }
+    // After a class redefinition the stash (from a pre-redefine artifact) may
+    // describe bytecode that no longer matches the class store — refuse and
+    // let the conservative re-run handle it (mirrors `try_osr`'s guard).
+    if crate::classloading::any_class_redefined() {
+        return None;
+    }
+    let (rest, key_desc) = key.rsplit_once(':')?;
+    let (key_class, key_method) = rest.rsplit_once('.')?;
+    if key_method != info.method_name || key_desc != info.descriptor {
+        return None;
+    }
+
+    // Resolve the trapping method from ITS OWN declaring class (baked in the
+    // key) — mirrors the `callee_compiler` resolution recipe.
+    let cached = {
+        let cm = vm.class_manager.read();
+        let class_id = cm.find_class_by_name(key_class)?;
+        let store = cm.class_store();
+        let (method, declaring_id) = crate::classloading::find_method_recursive(
+            class_id,
+            key_method,
+            key_desc,
+            store,
+        )?;
+        let code_attr = method.code()?;
+        let declaring_class_name = store.get(declaring_id).map(|c| &*c.name)?;
+        // The key must name the method's OWN declaring class — a mismatch
+        // means the name resolution drifted (e.g. class redefinition);
+        // refuse rather than resume against different bytecode.
+        if declaring_class_name != key_class {
+            return None;
+        }
+        if method.is_synchronized() {
+            return None;
+        }
+        let num_params = crate::runtime::interpreter::count_method_params(key_desc);
+        std::sync::Arc::new(crate::classloading::resolution::CachedBytecodeMethod {
+            declaring_class_id: declaring_id,
+            class_name: std::sync::Arc::from(declaring_class_name),
+            method_name: std::sync::Arc::from(key_method),
+            method_descriptor: std::sync::Arc::from(key_desc),
+            source_file: store
+                .get(declaring_id)
+                .and_then(|c| c.source_file.as_deref())
+                .map(std::sync::Arc::from),
+            code: crate::runtime::frame::padded_bytecode(&code_attr.code),
+            exception_table: std::sync::Arc::from(code_attr.exception_table.as_slice()),
+            max_stack: code_attr.max_stack,
+            max_locals: code_attr.max_locals,
+            num_params: num_params as u16,
+            is_synchronized: method.is_synchronized(),
+            is_static: method.is_static(),
+        })
+    };
+    if bci as usize >= cached.code.len() {
+        return None;
+    }
+
+    // Commit: take the stash. From here every path either resumes or restores
+    // it so nothing is silently dropped.
+    let rframe = cratonvm_jit::deopt::take_last_deopt()?;
+
+    let pin_base = thread.native_pin_roots.len();
+    let frame = match crate::runtime::interpreter::build_deopt_frame_inner(
+        vm, thread, &cached, &rframe, false,
+    ) {
+        Some(f) => f,
+        None => {
+            // Unmappable — release partial pins, restore the stash, and let
+            // the sentinel propagate to the outer (identity-checked) sinks.
+            thread.native_pin_roots.truncate(pin_base);
+            cratonvm_jit::deopt::restash_last_deopt(rframe);
+            return None;
+        }
+    };
+
+    if std::env::var_os("CRATONVM_DBG_DEOPT").is_some() {
+        eprintln!(
+            "[cratonvm-deopt] helper precise-resume of trapped callee {key} at bci={bci}"
+        );
+    }
+
+    // De-speculate the trapping method FIRST (record + evict + escalate), so
+    // repeated traps blacklist it and future calls interpret it outright.
+    // Reason: `UnreachedCode` — the one-shot "give up immediately" policy
+    // (`recommend_action`), so the trapping method is made not-compilable on
+    // the FIRST resolution and the tiered manager stops re-queuing recompiles
+    // that would just trap again. (A guard-bail stash reaching this arm is
+    // over-blacklisted by this — acceptable: it reverts to the interpreter,
+    // which is always correct.)
+    DeoptimizationController::deoptimize(
+        vm,
+        key_class,
+        key_method,
+        key_desc,
+        cratonvm_jit::deopt::DeoptReason::UnreachedCode,
+        bci,
+    );
+
+    // Run the reconstructed frame to completion. The pins stay installed for
+    // the duration (they root the reconstructed oops; the pushed frame roots
+    // them too — over-rooting is harmless), released after.
+    let res = crate::runtime::interpreter::execute_prebuilt_frame(vm, thread, frame);
+    thread.native_pin_roots.truncate(pin_base);
+
+    Some(match res {
+        Ok(Some(Value::Int(v))) => v as i64,
+        Ok(Some(Value::Long(v))) => v,
+        Ok(Some(Value::Float(f))) => f.to_bits() as i64,
+        Ok(Some(Value::Double(d))) => d.to_bits() as i64,
+        Ok(Some(Value::Object(Some(obj)))) => obj.as_ptr() as i64,
+        Ok(Some(Value::Object(None))) | Ok(None) => 0,
+        Ok(_) => 0,
+        Err(e) => handle_jit_dispatch_error(vm, thread, e, info),
+    })
 }
 
 /// Decode a JIT dispatch helper's raw `i64` argument slice into the
@@ -4472,6 +4670,14 @@ pub unsafe extern "C" fn jit_invoke_virtual_mic(
                 // callee's table (e.g. Tomcat `HttpParser.isNotRequestTarget
                 // Relaxed`: `IS_NOT_REQUEST_TARGET[c]` in `catch (AIOOBE)`).
                 if rc == i64::MIN {
+                    // jit-invokedynamic-groovy-regression fix — precise resume
+                    // of a frame-stashing deopt in the MIC-dispatched callee
+                    // (see `try_resume_trapped_callee`). Must run BEFORE the
+                    // implicit-exception drains below (a pure deopt sets no
+                    // exception flags).
+                    if let Some(v) = try_resume_trapped_callee(vm, thread, info) {
+                        return v;
+                    }
                     let aioobe = take_jit_pending_aioobe();
                     let npe = if aioobe.is_none() {
                         take_jit_pending_npe()
@@ -4559,7 +4765,14 @@ pub unsafe extern "C" fn jit_invoke_virtual_mic(
         // `invoke_or_native` path so the exception routes through the callee's
         // own table.
         if let Some((entry_ptr, needs_ctx)) = compile_res {
-            if !mic_callee_has_exception_table(vm, receiver_class_id, info) {
+            // jit-invokedynamic-groovy-regression fix: also never publish an
+            // artifact containing an unconditional invokedynamic trap — the
+            // inline MIC/PIC cascade would machine-CALL it, letting the trap's
+            // sentinel + stashed frame bail through the compiled caller's
+            // epilogue past the only point able to resume it precisely.
+            if !mic_callee_has_exception_table(vm, receiver_class_id, info)
+                && !compiled_entry_has_indy_trap(vm, &class_name, info.method_name, info.descriptor)
+            {
                 mic.cached_entry_ptr
                     .store(entry_ptr as u64, std::sync::atomic::Ordering::Release);
                 mic.cached_needs_context
@@ -4673,7 +4886,13 @@ pub unsafe extern "C" fn jit_invoke_virtual_mic(
     // helper's `invoke_or_native` path below, which routes the exception
     // through the callee's table correctly. (The statically-bound sibling is
     // gated in the `callee_compiler` closure in `interpreter.rs`.)
-    if cacheable_receiver && !mic_callee_has_exception_table(vm, receiver_class_id, info) {
+    if cacheable_receiver
+        && !mic_callee_has_exception_table(vm, receiver_class_id, info)
+        // jit-invokedynamic-groovy-regression fix — see the matching gate in
+        // the cache-hit branch above: an indy-trap-bearing artifact must stay
+        // on the dispatch helper, never in a machine-called MIC/PIC entry.
+        && !compiled_entry_has_indy_trap(vm, &class_name, info.method_name, info.descriptor)
+    {
         // Update all MIC fields atomically (needs_ctx must match compiled entry ABI)
         mic.update(receiver_cid, &class_name, entry_ptr, needs_ctx);
 

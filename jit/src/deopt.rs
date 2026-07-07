@@ -1209,6 +1209,16 @@ thread_local! {
         const { std::cell::RefCell::new(None) };
 }
 
+/// Read-once: is `CRATONVM_JIT_FREE_CODE` set (the A/B mode that actually
+/// frees evicted artifacts and their deopt-point boxes)? Mirrors the reads in
+/// `ExecutableBuffer::drop` / `CompiledMethod::drop` (jit/src/lib.rs); in the
+/// default retain-everything mode this is `false` and superseded artifacts'
+/// deopt boxes remain valid for the process lifetime.
+fn jit_free_code_enabled() -> bool {
+    static FLAG: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *FLAG.get_or_init(|| std::env::var_os("CRATONVM_JIT_FREE_CODE").is_some())
+}
+
 /// Take (and clear) the frame most recently reconstructed by a deopt.
 pub fn take_last_deopt() -> Option<ReconstructedFrame> {
     LAST_DEOPT.with(|c| c.borrow_mut().take())
@@ -1226,6 +1236,29 @@ pub fn take_last_deopt() -> Option<ReconstructedFrame> {
 /// so the interpreter's outer `take_last_deopt` still consumes it.
 pub fn has_last_deopt() -> bool {
     LAST_DEOPT.with(|c| c.borrow().is_some())
+}
+
+/// Peek the stashed frame's `(method_key, bci)` identity without clearing it.
+///
+/// Used by the dispatch-helper precise-resume arm
+/// (`try_resume_trapped_callee`, vm/src/jit/helpers.rs) to decide — BEFORE
+/// consuming the stash — whether the frame belongs to the compiled callee this
+/// helper just invoked. A non-matching frame must stay stashed so it
+/// propagates (with the sentinel) to the outer consumer that CAN attribute it.
+pub fn peek_last_deopt_identity() -> Option<(String, u32)> {
+    LAST_DEOPT.with(|c| {
+        c.borrow()
+            .as_ref()
+            .map(|f| (f.method_key.clone(), f.bci))
+    })
+}
+
+/// Put a taken frame back (the take-inspect-restash pattern for consumers that
+/// discover mid-flight they cannot handle it). Overwrites any newer stash —
+/// callers only restash what they just took, with no interleaving stash
+/// possible on the same thread.
+pub fn restash_last_deopt(frame: ReconstructedFrame) {
+    LAST_DEOPT.with(|c| *c.borrow_mut() = Some(frame));
 }
 
 /// Deopt trampoline entry — called from JIT code when a guard fails.
@@ -1291,10 +1324,19 @@ pub extern "C" fn x64_deopt_entry(
     regs: *const SavedRegisters,
     epoch_guard: *const DeoptEpochGuard,
 ) -> i64 {
-    // Before-deref staleness short-circuit, FIRST — it consults only the
-    // retained guard, never `point`/`regs`, so a superseded artifact is handled
-    // without touching the (possibly-freed) box even when those are null/garbage.
-    if !epoch_guard.is_null() {
+    // Before-deref staleness short-circuit — ONLY when `CRATONVM_JIT_FREE_CODE`
+    // is set (the A/B mode that actually frees artifacts and their deopt-point
+    // boxes on eviction). In the default retain-everything mode the box is
+    // leaked for the process lifetime (see `CompiledMethod`'s Drop), and a
+    // superseded artifact's snapshot is still SELF-CONSISTENT with the machine
+    // state of the (retained, still-executing) code that trapped — the epochs
+    // version the SPECULATION, not the frame layout. Short-circuiting here for
+    // retained code stashed an identity-less `bci == u32::MAX` sentinel that
+    // forced every post-supersession trap onto the imprecise whole-method
+    // re-run — re-introducing the side-effect duplication for exactly the
+    // methods that keep getting dispatched via stale cached entries after
+    // their first de-speculation (jit-invokedynamic-groovy-regression fix).
+    if !epoch_guard.is_null() && jit_free_code_enabled() {
         // SAFETY: a non-null `epoch_guard` is a retained `DeoptEpochGuard`
         // (process-lifetime, see `CompiledMethod`'s Drop) — valid to read.
         let guard = unsafe { &*epoch_guard };

@@ -1259,6 +1259,17 @@ pub struct CompiledMethod {
     /// was on at compile, so `false` in production. Step 8 consults it (with the
     /// `CRATONVM_DEOPT_REAL` gate) before routing a mid-loop bail.
     pub can_osr_exit: bool,
+    /// jit-invokedynamic-groovy-regression fix — `true` when this artifact
+    /// compiled at least one `invokedynamic` (0xba) site, i.e. it contains an
+    /// UNCONDITIONAL reason-8 uncommon trap that fires on every execution
+    /// reaching that site. Entry-publication gates (JIT→JIT direct-call
+    /// baking, MIC/PIC inline-cache installs) consult this so machine code
+    /// never calls such an artifact directly — every call stays on a dispatch
+    /// helper, which can resolve the trap precisely in place
+    /// (`try_resume_trapped_callee`). Set at x64 finalize from
+    /// `!compiler.indy_info.is_empty()`; `false` for IR-path artifacts (the
+    /// IR lowerer rejects invokedynamic methods).
+    pub has_indy_trap: bool,
     /// deopt-osr Step 7 — the loop-boundary bcis (OSR-vetted, outside every
     /// LICM-hoisted body) for which an OSR-exit map was emitted into
     /// `deopt_points` (tagged `DeoptReason::OsrExit`). Empty unless
@@ -1439,6 +1450,7 @@ impl CompiledMethod {
             // emitter sets these yet (see docs/feature-designs/deopt-osr.md).
             can_deopt_resume: false,
             can_osr_exit: false,
+            has_indy_trap: false,
             osr_exit_points: Vec::new(),
             compilation_epoch: 0,
             deopt_epoch_guard: std::ptr::null(),
@@ -1496,6 +1508,7 @@ impl CompiledMethod {
             // emitter sets these yet (see docs/feature-designs/deopt-osr.md).
             can_deopt_resume: false,
             can_osr_exit: false,
+            has_indy_trap: false,
             osr_exit_points: Vec::new(),
             compilation_epoch: 0,
             deopt_epoch_guard: std::ptr::null(),
