@@ -1670,9 +1670,15 @@ impl JavaKeyManagerResolver {
                     _ => None,
                 };
                 if dbg {
+                    let exc_cls = match &choose_result {
+                        Err(cratonvm_types::error::MethodCallFailed::ExceptionThrown(exc)) => {
+                            Some(ctx.class_name_of_id(ctx.class_id_of_object(*exc)))
+                        }
+                        _ => None,
+                    };
                     eprintln!(
-                        "[dbg-tls-auth] JavaKeyManagerResolver chooseClientAlias[{}] -> {:?} (raw={:?})",
-                        i, alias, choose_result
+                        "[dbg-tls-auth] JavaKeyManagerResolver chooseClientAlias[{}] -> {:?} (raw={:?}, exc_class={:?})",
+                        i, alias, choose_result, exc_cls
                     );
                 }
                 km_list[i] = ctx.read_native_pin(pin, km_list[i]);
