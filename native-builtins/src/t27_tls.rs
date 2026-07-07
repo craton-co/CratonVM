@@ -1654,6 +1654,17 @@ impl JavaKeyManagerResolver {
             for (i, &pin) in pins.iter().enumerate() {
                 km_list[i] = ctx.read_native_pin(pin, km_list[i]);
                 let km_obj = km_list[i];
+                // DEBUG (tomcat-clientauth-engine-config): the first-ever
+                // native invoke_virtual call to a test-defined KeyManager
+                // wrapper (e.g. Tomcat's TrackingKeyManager) is throwing
+                // AbstractMethodError, suggesting its vtable isn't fully
+                // installed yet at this point. Try forcing class init/vtable
+                // installation via its own dynamic class name right before
+                // the call, mirroring http_url_connection.rs's existing
+                // pre-warm pattern for X500Principal/Principal/String.
+                if let Some(cls_name) = ctx.class_name_of_id(ctx.class_id_of_object(km_obj)) {
+                    let _ = ctx.ensure_class_initialized(&cls_name);
+                }
                 let args = [
                     Value::Object(Some(key_type_arr)),
                     Value::Object(Some(issuers_arr)),
