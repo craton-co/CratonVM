@@ -557,6 +557,12 @@ struct Url1 {
     host: String,
     port: u16,
     path: String,
+    /// RFC 3986 user-info (`alice:secret` in `http://alice:secret@host/…`),
+    /// stripped from the connect target / Host header. `build_request` turns
+    /// it into preemptive `Authorization: Basic` credentials — the real-JDK
+    /// `HttpURLConnection` behaviour (from `url.getUserInfo()`) that Spring's
+    /// `ResourceTests.useUserInfoToSetBasicAuth` asserts on.
+    userinfo: Option<String>,
 }
 
 fn parse_url(url: &str) -> Result<Url1, String> {
@@ -570,6 +576,12 @@ fn parse_url(url: &str) -> Result<Url1, String> {
     let (authority, path) = match rest.find('/') {
         Some(i) => (&rest[..i], &rest[i..]),
         None => (rest, "/"),
+    };
+    // RFC 3986: authority = [ userinfo "@" ] host [ ":" port ]. Split at the
+    // LAST '@' (userinfo may itself contain an encoded/raw '@').
+    let (userinfo, authority) = match authority.rfind('@') {
+        Some(i) => (Some(authority[..i].to_string()), &authority[i + 1..]),
+        None => (None, authority),
     };
     let default_port: u16 = if scheme == "https" { 443 } else { 80 };
     let (host, port) = match authority.rfind(':') {
@@ -591,6 +603,7 @@ fn parse_url(url: &str) -> Result<Url1, String> {
         host,
         port,
         path: path.to_string(),
+        userinfo,
     })
 }
 
@@ -612,6 +625,7 @@ fn build_request(
     let mut has_content_length = false;
     let mut has_connection = false;
     let mut has_content_type = false;
+    let mut has_authorization = false;
     for (k, v) in headers {
         let lk = k.to_ascii_lowercase();
         if lk == "user-agent" {
@@ -626,7 +640,22 @@ fn build_request(
         if lk == "content-type" {
             has_content_type = true;
         }
+        if lk == "authorization" {
+            has_authorization = true;
+        }
         let _ = write!(&mut out, "{k}: {v}\r\n");
+    }
+    // JDK parity: a URL carrying user-info sends preemptive
+    // `Authorization: Basic base64(userinfo)` unless the caller staged an
+    // explicit Authorization header (sun.net.www.protocol.http
+    // .HttpURLConnection does this from `url.getUserInfo()`; asserted by
+    // Spring's ResourceTests.useUserInfoToSetBasicAuth).
+    if !has_authorization {
+        if let Some(ui) = &parsed.userinfo {
+            let b64 =
+                String::from_utf8(crate::b64_encode(ui.as_bytes(), 0, false)).unwrap_or_default();
+            let _ = write!(&mut out, "Authorization: Basic {b64}\r\n");
+        }
     }
     if !has_user_agent {
         out.extend_from_slice(b"User-Agent: Java/CratonVM\r\n");
@@ -1731,18 +1760,42 @@ fn huc_get_header_fields(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
     Ok(Some(Value::Object(Some(map))))
 }
 
+/// Content length per the real `URLConnection.getContentLengthLong()` contract:
+/// the `Content-Length` RESPONSE HEADER when present, else the buffered body
+/// size (legacy behaviour, kept for chunked/close-delimited responses). The
+/// distinction matters for HEAD responses, which advertise the entity size in
+/// the header but carry NO body — reporting the (empty) body made Spring's
+/// `AbstractFileResolvingResource.isReadable()/contentLength()` see 0 after a
+/// HEAD 200 and call the resource empty/unreadable
+/// (ResourceTests.remoteResourceExists: `exists()` true but `isReadable()`
+/// false, `contentLength()` 0 instead of 6).
+fn content_length_of(headers: &[(String, String)], body_len: usize) -> i64 {
+    headers
+        .iter()
+        .find(|(k, _)| k.eq_ignore_ascii_case("content-length"))
+        .and_then(|(_, v)| v.trim().parse::<i64>().ok())
+        .unwrap_or(body_len as i64)
+}
+
 pub(crate) fn huc_get_content_length(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = obj_arg(args, 0)?;
     if let Some(url_str) = huc_real_object_url(ctx, this) {
         if url_str.starts_with("http://") || url_str.starts_with("https://") {
             huc_real_perform(ctx, this, &url_str)?;
-            return Ok(Some(Value::Int(huc_real_body(ctx, this).len() as i32)));
+            let n = content_length_of(
+                &huc_real_headers(ctx, this),
+                huc_real_body(ctx, this).len(),
+            );
+            return Ok(Some(Value::Int(n as i32)));
         }
     }
     if !matches!(ctx.get_field(this, HUC_CONNECTED), Value::Int(1)) {
         ensure_connected(ctx, this)?;
     }
-    let n = with_state(ctx, this, |s| s.response_body.len() as i32).unwrap_or(-1);
+    let n = with_state(ctx, this, |s| {
+        content_length_of(&s.response_headers, s.response_body.len()) as i32
+    })
+    .unwrap_or(-1);
     Ok(Some(Value::Int(n)))
 }
 
@@ -1751,13 +1804,20 @@ pub(crate) fn huc_get_content_length_long(ctx: &mut dyn NativeContext, args: &[V
     if let Some(url_str) = huc_real_object_url(ctx, this) {
         if url_str.starts_with("http://") || url_str.starts_with("https://") {
             huc_real_perform(ctx, this, &url_str)?;
-            return Ok(Some(Value::Long(huc_real_body(ctx, this).len() as i64)));
+            let n = content_length_of(
+                &huc_real_headers(ctx, this),
+                huc_real_body(ctx, this).len(),
+            );
+            return Ok(Some(Value::Long(n)));
         }
     }
     if !matches!(ctx.get_field(this, HUC_CONNECTED), Value::Int(1)) {
         ensure_connected(ctx, this)?;
     }
-    let n = with_state(ctx, this, |s| s.response_body.len() as i64).unwrap_or(-1);
+    let n = with_state(ctx, this, |s| {
+        content_length_of(&s.response_headers, s.response_body.len())
+    })
+    .unwrap_or(-1);
     Ok(Some(Value::Long(n)))
 }
 
@@ -2353,6 +2413,53 @@ mod http_url_connection_tests {
         assert!(s.contains("Content-Length: 2\r\n"));
         assert!(s.contains("Content-Type: application/json\r\n"));
         assert!(s.ends_with("{}"));
+    }
+
+    #[test]
+    fn test_parse_url_userinfo_stripped() {
+        // `http://alice:secret@localhost:8080/resource` — the user-info must be
+        // stripped from host/port (connect target, Host header) and surfaced in
+        // `userinfo` (ResourceTests.useUserInfoToSetBasicAuth).
+        let p = parse_url("http://alice:secret@localhost:8080/resource").unwrap();
+        assert_eq!(p.scheme, "http");
+        assert_eq!(p.host, "localhost");
+        assert_eq!(p.port, 8080);
+        assert_eq!(p.path, "/resource");
+        assert_eq!(p.userinfo.as_deref(), Some("alice:secret"));
+        // No user-info → None.
+        assert_eq!(parse_url("http://example.com/x").unwrap().userinfo, None);
+    }
+
+    #[test]
+    fn test_build_request_preemptive_basic_auth_from_userinfo() {
+        let p = parse_url("http://alice:secret@localhost:8080/resource").unwrap();
+        let req = build_request("GET", &p, &[], b"");
+        let s = String::from_utf8(req).unwrap();
+        // Host header must NOT carry the user-info.
+        assert!(s.contains("Host: localhost:8080\r\n"));
+        // base64("alice:secret") == "YWxpY2U6c2VjcmV0" (preemptive Basic auth).
+        assert!(s.contains("Authorization: Basic YWxpY2U6c2VjcmV0\r\n"));
+
+        // An explicitly staged Authorization header wins over the user-info.
+        let req2 = build_request(
+            "GET",
+            &p,
+            &[("Authorization".to_string(), "Bearer tok".to_string())],
+            b"",
+        );
+        let s2 = String::from_utf8(req2).unwrap();
+        assert!(s2.contains("Authorization: Bearer tok\r\n"));
+        assert!(!s2.contains("Basic YWxpY2U6c2VjcmV0"));
+    }
+
+    #[test]
+    fn test_content_length_prefers_header_over_body() {
+        // HEAD responses advertise the entity size in Content-Length but carry
+        // no body — the header must win (ResourceTests.remoteResourceExists).
+        let headers = vec![("Content-Length".to_string(), "6".to_string())];
+        assert_eq!(content_length_of(&headers, 0), 6);
+        // No header → fall back to the buffered body size.
+        assert_eq!(content_length_of(&[], 5), 5);
     }
 
     #[test]
