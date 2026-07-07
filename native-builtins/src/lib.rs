@@ -41978,50 +41978,20 @@ fn native_std_charset_latin1(ctx: &mut dyn NativeContext, _args: &[Value]) -> Me
 
 /// Normalize a charset name to its canonical form, or return empty if unsupported.
 pub(crate) fn normalize_charset_name(name: &str) -> String {
-    match name.to_uppercase().replace(['-', '_'], "").as_str() {
-        "UTF8" => "UTF-8".to_string(),
-        // "unicode" is the JDK's own alias for UTF-16 (`sun.nio.cs.UTF_16`'s
-        // alias list is `{"UTF16", "utf16", "unicode", "UnicodeBig"}`), and
-        // "UnicodeBigUnmarked"/"UnicodeLittleUnmarked" alias the no-BOM
-        // BE/LE variants. Missing "unicode" made
-        // `Charset.forName("unicode")` — a legal charset name on real
-        // JDK — throw `UnsupportedCharsetException` here instead
-        // (`ResourceBundleMessageSourceTests.
-        // reloadableResourceBundleMessageSourceWithInappropriateDefaultCharsetName`).
-        "UTF16" | "UNICODE" | "UNICODEBIG" => "UTF-16".to_string(),
-        "UTF16BE" | "UNICODEBIGUNMARKED" => "UTF-16BE".to_string(),
-        "UTF16LE" | "UNICODELITTLEUNMARKED" => "UTF-16LE".to_string(),
-        "UTF32" => "UTF-32".to_string(),
-        "UTF32BE" => "UTF-32BE".to_string(),
-        "UTF32LE" => "UTF-32LE".to_string(),
-        "USASCII" | "ASCII" => "US-ASCII".to_string(),
-        "ISO88591" | "LATIN1" | "ISO88591:1987" => "ISO-8859-1".to_string(),
-        "ISO88592" => "ISO-8859-2".to_string(),
-        "ISO885915" => "ISO-8859-15".to_string(),
-        "SHIFTJIS" | "SHIFT_JIS" | "SJIS" | "CSSHIFTJIS" | "MSKANJI" | "WINDOWS31J" => {
-            "Shift_JIS".to_string()
-        }
-        "EUCJP" | "XEUCJP" => "EUC-JP".to_string(),
-        "ISO2022JP" => "ISO-2022-JP".to_string(),
-        "BIG5" | "CSBIG5" | "BIG5HKSCS" => "Big5".to_string(),
-        "EUCKR" | "CSEUCKR" => "EUC-KR".to_string(),
-        "GB2312" | "CSGB2312" => "GB2312".to_string(),
-        "GBK" | "CP936" => "GBK".to_string(),
-        "GB18030" => "GB18030".to_string(),
-        "WINDOWS1252" | "CP1252" => "windows-1252".to_string(),
-        "WINDOWS1251" | "CP1251" => "windows-1251".to_string(),
-        "WINDOWS1250" | "CP1250" => "windows-1250".to_string(),
-        "KOI8R" => "KOI8-R".to_string(),
-        "KOI8U" => "KOI8-U".to_string(),
-        "IBM850" | "CP850" | "850" | "CSPC850MULTILINGUAL" => "IBM850".to_string(),
-        _ => {
-            let upper = name.to_uppercase();
-            if upper.contains("UTF") && upper.contains("8") {
-                "UTF-8".to_string()
-            } else {
-                String::new()
-            }
-        }
+    // Alias resolution is delegated to the shared table next to the
+    // transcoding engine (`cratonvm_native_api::charset::
+    // canonical_charset_name`), which the StreamEncoder/StreamDecoder shims
+    // in cratonvm-native-io also use — their former private copy went stale
+    // (no IBM850, no multibyte families) and silently UTF-8-encoded ibm850
+    // OutputStreamWriters in Tomcat's DefaultServlet include conversion.
+    if let Some(canon) = cratonvm_native_api::charset::canonical_charset_name(name) {
+        return canon.to_string();
+    }
+    let upper = name.to_uppercase();
+    if upper.contains("UTF") && upper.contains("8") {
+        "UTF-8".to_string()
+    } else {
+        String::new()
     }
 }
 
