@@ -1436,14 +1436,21 @@ mod x64_deopt_entry_tests {
         assert!(take_last_deopt().is_none());
     }
 
-    /// deopt-osr Step 9 follow-up (a): a SUPERSEDED guard (live epoch advanced
-    /// past the artifact's creation epoch) short-circuits BEFORE the box is
-    /// dereferenced — it stashes a sentinel re-run frame (out-of-range bci) and
-    /// never reads `point`. A null `point` here proves the box is untouched: a
-    /// non-superseded run with a null point would crash, but the superseded
-    /// path returns the sentinel cleanly.
+    /// deopt-osr Step 9 follow-up (a), REVISED by the
+    /// jit-invokedynamic-groovy-regression identity fix: in the default
+    /// retain-everything mode (`CRATONVM_JIT_FREE_CODE` unset — which unit
+    /// tests must assume, since mutating a process-global env var races
+    /// parallel tests) a SUPERSEDED guard NO LONGER short-circuits — the
+    /// artifact's code and deopt boxes are leaked for the process lifetime,
+    /// so the box is valid and its snapshot is self-consistent with the
+    /// (stale, still-executing) code that trapped. The entry must proceed to
+    /// a normal reconstruction; short-circuiting here stashed an
+    /// identity-less `bci == u32::MAX` sentinel that forced every
+    /// post-supersession trap onto the corrupting imprecise re-run. (The
+    /// before-deref short-circuit still exists under `CRATONVM_JIT_FREE_CODE`
+    /// — not unit-covered, by the env-race constraint above.)
     #[test]
-    fn superseded_guard_skips_box_deref_and_stashes_rerun_sentinel() {
+    fn superseded_guard_still_reconstructs_in_retain_mode() {
         use std::sync::atomic::{AtomicU64, Ordering};
         let live = Box::new(AtomicU64::new(3)); // live epoch = 3
         let guard = DeoptEpochGuard::new();
@@ -1452,15 +1459,31 @@ mod x64_deopt_entry_tests {
             live.as_ref() as *const AtomicU64 as *mut AtomicU64,
             Ordering::Release,
         );
+        assert!(guard.is_superseded());
 
+        let regs = SavedRegisters::default();
+        let point = DeoptimizationPoint {
+            native_offset: 0,
+            bci: 21,
+            reason: DeoptReason::UnreachedCode,
+            action: DeoptAction::Reinterpret,
+            speculation_id: 0,
+            frame_state: FrameState {
+                method_key: "T.m:()V".to_string(),
+                bci: 21,
+                locals: vec![FrameValue::Int(7)],
+                stack: Vec::new(),
+                monitors: Vec::new(),
+                caller: None,
+            },
+        };
         let _ = take_last_deopt();
-        // point is NULL on purpose: the superseded check must fire before any
-        // deref, so passing null must NOT crash and must yield the sentinel.
-        let r = x64_deopt_entry(std::ptr::null(), 0, std::ptr::null(), &guard);
+        let r = x64_deopt_entry(&point, 0, &regs as *const SavedRegisters, &guard);
         assert_eq!(r, i64::MIN);
-        let frame = take_last_deopt().expect("superseded path stashes a re-run sentinel");
-        assert_eq!(frame.bci, u32::MAX, "sentinel bci is out-of-range ⇒ re-run");
-        assert!(frame.locals.is_empty() && frame.stack.is_empty());
+        let frame = take_last_deopt().expect("retain-mode superseded path reconstructs normally");
+        assert_eq!(frame.bci, 21, "real bci, not the u32::MAX re-run sentinel");
+        assert_eq!(frame.method_key, "T.m:()V", "identity preserved for the resume sinks");
+        assert_eq!(frame.locals[0], FrameValue::Int(7));
     }
 
     /// A FRESH guard (creation epoch == live epoch) does NOT short-circuit: the
