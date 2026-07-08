@@ -1,6 +1,6 @@
 # WildFly domain managed servers do not reach started state
 
-Status: OPEN (2026-07-08: stock-config empty-ServiceName collapse, loopback-interface criterion failure, Undertow HttpString parser-clinit, JBoss Modules caller/context ModuleLoader accessors, capability ServiceName null fallback, XNIO TCP accept-server binding, and module-alias service-provider lookup are fixed/reduced. Remaining open residuals: no-JIT Arquillian awaitServers propagation gap; JIT-on literal-address WFLYSRV0082; stock domain now gets past the management HTTP ModuleLoader/XNIO/module-alias signatures and hangs in the process-controller VM's STW/native watchdog path.)
+Status: OPEN (2026-07-08: stock-config empty-ServiceName collapse, loopback-interface criterion failure, Undertow HttpString parser-clinit, JBoss Modules caller/context ModuleLoader accessors, capability ServiceName null fallback, XNIO TCP accept-server binding, module-alias service-provider lookup, and the process-controller Process.waitFor STW/native watchdog gap are fixed/reduced. Remaining open residuals: no-JIT Arquillian awaitServers propagation gap; JIT-on literal-address WFLYSRV0082; stock domain now reaches Host Controller start-servers and fails the process-controller inventory path with Socket.getOutputStream: not connected, followed by watchdog stack dumps.)
 Date found: 2026-07-05
 Area: WildFly domain mode startup under CratonVM
 
@@ -771,3 +771,83 @@ STW cross-thread JIT takeover is still waiting for cooperative mutators rounds=6
 The native-call/dispatch ring for that watchdog run is dominated by the process controller's `org.jboss.as.process.ManagedProcess$ReadTask.run()` loop reading child output via `sun/nio/cs/StreamDecoder.read`, `java/io/FileInputStream.readBytes`, and `FileInputStream.available0`, then writing it through `OutputStreamWriter`/`PrintStream`. This run also prints the existing `ReentrantReadWriteLock$NonfairSync` CAS retry diagnostics, but the durable reduced boundary is the process-controller STW/native watchdog hang after the management-interface and extension-initialization layers.
 
 Status remains OPEN: this pass closed the newly exposed stock management-HTTP XNIO/module-alias layers, but did not close the no-JIT Arquillian `awaitServers` propagation gap, the JIT-on literal-address WFLYSRV0082, or the broader STW/native watchdog residual now exposed by stock `domain.sh`.
+
+## 2026-07-08 update - Process.waitFor STW/native gap fixed; new stock-domain boundary is start-servers socket inventory
+
+Branch `codex/wildfly-stw-managedprocess-20260708-194254` on the Azure probe host, using a separate worktree from `/data/data/cratonvm`:
+
+```text
+/data/data/codex-wildfly-stw-managedprocess-20260708-194254
+```
+
+Unique rebuilt binaries:
+
+```text
+/data/data/bin/java-wildfly-stw-managedprocess-20260708-194254
+/data/data/bin/cratonvm-wildfly-stw-managedprocess-20260708-194254
+```
+
+The previous reduced boundary was confirmed in a stock WildFly 32.0.1.Final no-JIT
+`bin/domain.sh` run with STW census/native-ring diagnostics enabled. The Process
+Controller hit:
+
+```text
+[stw-request] initiator=3 alive=8 blocked=6 expected=1
+STW cross-thread JIT takeover is still waiting for cooperative mutators rounds=64 pending=1 taken=0
+[stw-census] rounds=64 pending=1 taken=0 blocked=6 alive=8
+t5 ... state="native:java/lang/Process.waitFor()I" top=org/jboss/as/process/ManagedProcess$JoinTask.run@9
+```
+
+The waiting peer was in `java.lang.Process.waitFor()I` but was not published as
+GC-blocked, while the native ring was still dominated by
+`org.jboss.as.process.ManagedProcess$ReadTask.run()` reading child process output. The
+watchdog then reported zero Java stack dumps because no Java threads responded.
+
+Fix in `native-io/src/process.rs`: bracket all blocking process waits with
+`NativeContext::begin_blocking_region()` / `end_blocking_region()` and resync moved
+object references where needed. This covers `java.lang.Process.waitFor()I`,
+`java.lang.Process.waitFor(long, TimeUnit)` (both the overflow fallback and poll sleep),
+and `java.lang.ProcessHandleImpl.waitForProcessExit0(JZ)I`.
+
+Focused validation:
+
+```text
+cargo test -p cratonvm-native-io process_wait_for_enters_gc_blocked_region -- --nocapture
+cargo test -p cratonvm-native-io process_handle_wait_for_exit_enters_gc_blocked_region -- --nocapture
+cargo test -p cratonvm-native-io process_wait_for_timeout_enters_gc_blocked_region_between_polls -- --nocapture
+cargo check -p cratonvm-native-io -p cratonvm-vm -p cratonvm-native-builtins
+cargo build --release -p cratonvm-cli --features java-bin-alias --bins
+```
+
+The follow-up stock-domain probe with the rebuilt `java` shim shows the original
+Process.waitFor STW accounting bug is gone. The Process Controller now reports the
+process wait as blocked and has no expected peer to wait for:
+
+```text
+[stw-request] initiator=3 alive=8 blocked=7 expected=0
+```
+
+The Host Controller also gets further than the previous boundary, including the earlier
+network-interface/modcluster milestones and a real host-controller started message:
+
+```text
+NetworkInterfaceService matched interface binding
+Final response for step handler ... [("extension" => "org.jboss.as.modcluster")] is {"outcome" => "success"}
+WFLYSRV0025: WildFly Full 32.0.1.Final ... (Host Controller) started
+```
+
+The newly exposed stock-domain boundary is now the Host Controller's `start-servers`
+request into the Process Controller inventory path:
+
+```text
+WFLYCTL0013: Operation ("start-servers") failed - address: ([("host" => "primary")])
+Caused by: java.io.IOException: Socket.getOutputStream: not connected
+    at org.jboss.as.process.ProcessControllerClient.requestProcessInventory(ProcessControllerClient.java:247)
+    at org.jboss.as.process.protocol.ConnectionImpl.writeMessage(ConnectionImpl.java:85)
+```
+
+After that failure, the watchdog can dump Java stacks again rather than reporting that no
+Java threads responded. Status remains OPEN: this pass fixes the process wait/native STW
+cooperation defect, but does not close the no-JIT Arquillian `awaitServers` propagation
+gap, the JIT-on literal-address `WFLYSRV0082`, or the newly exposed
+`Socket.getOutputStream: not connected` process-controller inventory residual.
