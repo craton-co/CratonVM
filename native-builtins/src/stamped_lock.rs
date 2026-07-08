@@ -70,6 +70,7 @@ use parking_lot::{Condvar, Mutex};
 /// brand-new lock immediately handed back via `tryOptimisticRead` returns
 /// 256, which validates true; a write-locked one returns 0.
 pub const STAMPED_ORIGIN: i64 = 256;
+const JDK_WBIT: i64 = 128;
 
 // ---------------------------------------------------------------------------
 // StampedLock backend
@@ -234,6 +235,19 @@ pub fn stamped_unlock_write(addr: usize) {
 
 /// `unlockRead(stamp)` — decrement reader count; if it hits 0 wake any
 /// queued writer.
+pub fn stamped_try_unstamped_unlock_write(addr: usize) -> bool {
+    let slot = stamped_slot(addr);
+    {
+        let mut state = slot.state.lock();
+        if !state.write_held() {
+            return false;
+        }
+        state.stamp = (state.stamp | 1).wrapping_add(1);
+    }
+    slot.cv.notify_all();
+    true
+}
+
 pub fn stamped_unlock_read(addr: usize) {
     let slot = stamped_slot(addr);
     let drained_to_zero;
@@ -251,6 +265,34 @@ pub fn stamped_unlock_read(addr: usize) {
 
 /// `tryConvertToWriteLock(stamp)` — if we hold the only read lock and
 /// `stamp` is still valid, atomically promote to write lock.
+pub fn stamped_try_unstamped_unlock_read(addr: usize) -> bool {
+    let slot = stamped_slot(addr);
+    let drained_to_zero;
+    {
+        let mut state = slot.state.lock();
+        if state.readers <= 0 {
+            return false;
+        }
+        state.readers -= 1;
+        drained_to_zero = state.readers == 0;
+    }
+    if drained_to_zero {
+        slot.cv.notify_all();
+    }
+    true
+}
+
+pub fn stamped_visible_state(addr: usize) -> i64 {
+    let slot = stamped_slot(addr);
+    let state = slot.state.lock();
+    let base = state.stamp & !1i64;
+    if state.write_held() {
+        base | JDK_WBIT
+    } else {
+        base.saturating_add(i64::from(state.readers.clamp(0, 126)))
+    }
+}
+
 pub fn stamped_try_convert_to_write(addr: usize, stamp: i64) -> i64 {
     let slot = stamped_slot(addr);
     let mut state = slot.state.lock();

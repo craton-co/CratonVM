@@ -254,6 +254,24 @@ fn mock_lucene_field_slot(class_name: Option<&str>, name: &str) -> Option<usize>
     }
 }
 
+fn mock_infinispan_dcm_field_slot(class_name: Option<&str>, name: &str) -> Option<usize> {
+    match (class_name, name) {
+        (Some("org/infinispan/manager/DefaultCacheManager"), "globalComponentRegistry") => Some(3),
+        (Some("org/infinispan/manager/DefaultCacheManager"), "configurationManager") => Some(4),
+        (Some("org/infinispan/manager/DefaultCacheManager"), "defaultCacheName") => Some(5),
+        _ => None,
+    }
+}
+
+fn mock_stamped_lock_field_slot(class_name: Option<&str>, name: &str) -> Option<usize> {
+    match (class_name, name) {
+        (Some("java/util/concurrent/locks/StampedLock"), "state") => Some(5),
+        (Some("java/util/concurrent/locks/StampedLock$ReadLockView"), "this$0") => Some(0),
+        (Some("java/util/concurrent/locks/StampedLock$WriteLockView"), "this$0") => Some(0),
+        _ => None,
+    }
+}
+
 pub(crate) type InvokeVirtualHook =
     fn(&mut MockNativeContext, ObjectRef, &str, &str, &[Value]) -> Option<MethodCallResult>;
 
@@ -865,6 +883,8 @@ impl NativeContext for MockNativeContext {
             mock_classloader_field_slot(class_name.as_deref(), field_name)
                 .or_else(|| mock_buffer_field_slot(class_name.as_deref(), field_name))
                 .or_else(|| mock_lucene_field_slot(class_name.as_deref(), field_name))
+                .or_else(|| mock_infinispan_dcm_field_slot(class_name.as_deref(), field_name))
+                .or_else(|| mock_stamped_lock_field_slot(class_name.as_deref(), field_name))
                 .or_else(|| mock_jdk_field_slot(field_name))
         };
         match slot {
@@ -881,6 +901,8 @@ impl NativeContext for MockNativeContext {
             mock_classloader_field_slot(class_name.as_deref(), field_name)
                 .or_else(|| mock_buffer_field_slot(class_name.as_deref(), field_name))
                 .or_else(|| mock_lucene_field_slot(class_name.as_deref(), field_name))
+                .or_else(|| mock_infinispan_dcm_field_slot(class_name.as_deref(), field_name))
+                .or_else(|| mock_stamped_lock_field_slot(class_name.as_deref(), field_name))
                 .or_else(|| mock_jdk_field_slot(field_name))
         };
         if let Some(slot) = slot {

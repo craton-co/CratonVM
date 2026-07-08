@@ -541,6 +541,25 @@ fn should_skip_jit_internal(
             return Some(SkipReason::RustJvmTestFixture);
         }
 
+        // KC26-RX.1 (2026-07-08) -- Keycloak `RealmModelTest` post-Infinispan
+        // bootstrap residual: default JIT gets past the old `FileDescriptor.
+        // fullName` decode error and the `DefaultCacheManager` configuration
+        // native gaps, then stalls while Infinispan drains a RxJava-backed
+        // distributed stream (`BlockingFlowableIterable$BlockingFlowableIterator.
+        // hasNext` waiting on an AQS condition; last default-JIT progress was
+        // `PublisherHandler` request `node-1#2`). Direct controls on the real
+        // Keycloak/Infinispan classpath showed `CRATONVM_JIT_DENY=io/reactivex/`
+        // advances through the publisher requests (`node-1#6` complete) and
+        // into Liquibase parsing, while narrower Infinispan-only denies do not.
+        // Keep RxJava3 interpreted under Conservative until the exact producer
+        // or consumer miscompile is isolated. Liftable with
+        // `CRATONVM_JIT_ALLOW_PACKAGES=io/reactivex/`.
+        if class_name.starts_with("io/reactivex/rxjava3/")
+            && !package_allowed(class_name, allow_packages)
+        {
+            return Some(SkipReason::RustJvmTestFixture);
+        }
+
         // RBC.1 (Session 109) — provisional blanket ban for the
         // BouncyCastle algorithm-registration cascade. BC's
         // `BouncyCastleProvider.<init>` registers ~thousand algorithm
@@ -2773,6 +2792,39 @@ mod tests {
                 "allow-package entry must lift {class_name}"
             );
         }
+    }
+
+    #[test]
+    fn rxjava3_package_skips_under_conservative_for_keycloak_reactive_wait() {
+        let class_name = "io/reactivex/rxjava3/internal/operators/flowable/BlockingFlowableIterable";
+        assert_eq!(
+            check(
+                class_name,
+                "hasNext",
+                false,
+                true,
+                SkipPolicy::Conservative,
+            ),
+            Some(SkipReason::RustJvmTestFixture),
+            "RxJava3 must stay interpreted under the conservative policy"
+        );
+        assert_eq!(
+            check(class_name, "hasNext", false, true, SkipPolicy::Aggressive),
+            None,
+            "aggressive policy must lift the RxJava3 package ban"
+        );
+        assert_eq!(
+            check_with(
+                class_name,
+                "hasNext",
+                false,
+                true,
+                SkipPolicy::Conservative,
+                &["io/reactivex/"],
+            ),
+            None,
+            "CRATONVM_JIT_ALLOW_PACKAGES=io/reactivex/ must lift RxJava3"
+        );
     }
 
     #[test]

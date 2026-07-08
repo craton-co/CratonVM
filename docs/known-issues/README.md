@@ -4,6 +4,11 @@ This folder collects CratonVM-only defects found while running upstream Java
 suites. The docs had grown to describe the **same underlying bug from several
 angles**; this index is the consolidated map. Read it first.
 
+## 2026-07-08 Keycloak RealmModelTest `fullName` note retired; Liquibase timeout remains open
+
+- FIXED/RETIRED: [Infinispan ProtoStream `FileDescriptor.fullName` decode error](../internal/fixed-suite-bugs/keycloak-model-infinispan-jit-adjacent-decode-error-fullname-FIXED.md) - the exact default-JIT `decode error at pc=51 in fullName...` no longer reproduces on current `dev`. The residual pass fixed the later real-`DefaultCacheManager.defineConfiguration` delegation gap, real-JDK `StampedLock` lock-view/native coherence, Windows C-runtime symbol lookup for Panama symbol lookup, and added a conservative RxJava3 JIT skip after `CRATONVM_JIT_DENY=io/reactivex/` proved it clears the Infinispan publisher wait.
+- OPEN: [Keycloak `RealmModelTest` timeout after Infinispan bootstrap reaches Liquibase](keycloak-model-realmmodeltest-post-infinispan-liquibase-timeout.md) - with those layers fixed, CratonVM reaches Liquibase changelog parsing but still times out well after HotSpot's ~36s pass. The active residual is now a Liquibase/XML/startup throughput or blocking investigation, not the old ProtoStream `fullName` decode failure.
+
 ## 2026-07-08 `InPredicateTest` LHM NSME and stale timeout notes retired
 
 - ✅ FIXED: [`DomainParameterXref` `LinkedHashMap.removeEldestEntry` NSME](../internal/fixed-suite-bugs/hib-domainparameterxref-lhm-removeeldestentry-nsme-FIXED.md) — fresh Azure `dev@47bbdc3b` reproduced the slot-0/`java.lang.Object` class-id read and `Object.removeEldestEntry` NSME (`ok=0`, 33.697s). The LHM native now skips that impossible virtual call while preserving real subclass eviction hooks; the fixed probe still sees the slot-0 read but passes (`ok=1`, 55.971s).
@@ -91,14 +96,13 @@ All three verified against their real Keycloak classes via the suite runner; no 
   bootstrap/use/teardown lifecycle under `--nojit`). Doc:
   [`docs/internal/fixed-suite-bugs/keycloak-model-infinispan-cache-config-null-after-real-start-FIXED.md`](../internal/fixed-suite-bugs/keycloak-model-infinispan-cache-config-null-after-real-start-FIXED.md).
 - Two new, **distinct and unrelated** (JIT/VM-core, not Infinispan-specific)
-  residuals surfaced once the fix let `RealmModelTest` run much further:
-  [keycloak-model-infinispan-jit-adjacent-decode-error-fullname.md](keycloak-model-infinispan-jit-adjacent-decode-error-fullname.md)
-  (JIT-only bytecode-decode error, reachable only with JIT on — a
-  JIT-compiled caller appears to corrupt an interpreted callee's frame) and
-  [keycloak-model-stw-takeover-hang-eventloopgroup-shutdown.md](keycloak-model-stw-takeover-hang-eventloopgroup-shutdown.md)
-  (an STW cross-thread-takeover safepoint hang during Netty `EventLoopGroup`
-  shutdown, reachable only with `--nojit`, once the JIT bug above is worked
-  around).
+  residuals surfaced once the fix let `RealmModelTest` run much further. The
+  original [ProtoStream `fullName` decode note](../internal/fixed-suite-bugs/keycloak-model-infinispan-jit-adjacent-decode-error-fullname-FIXED.md)
+  is now retired; the current open follow-up is
+  [keycloak-model-realmmodeltest-post-infinispan-liquibase-timeout.md](keycloak-model-realmmodeltest-post-infinispan-liquibase-timeout.md).
+  The separate [keycloak-model-stw-takeover-hang-eventloopgroup-shutdown.md](keycloak-model-stw-takeover-hang-eventloopgroup-shutdown.md)
+  still tracks the STW cross-thread-takeover safepoint hang during Netty
+  `EventLoopGroup` shutdown.
 
 ## 2026-07-07 GC blocked-thread / stale-Thread-mirror doc RETIRED; real-net GC-blocking audit completed
 
@@ -257,8 +261,9 @@ then reached a distinct residual one layer deeper, in the same "synthetic
 native shim intercepts a real object" family,
 [Infinispan Cache.config null after real DefaultCacheManager.start()](../internal/fixed-suite-bugs/keycloak-model-infinispan-cache-config-null-after-real-start-FIXED.md),
 now **also FIXED** (2026-07-06) — see the top of this file for the two new
-residuals (JIT-only decode error, `--nojit`-only STW shutdown hang) it
-uncovered one/two layers deeper still.
+residuals it uncovered one/two layers deeper still. The JIT-only decode-error
+note has since been retired; the current open follow-up is the
+`RealmModelTest` Liquibase-phase timeout.
 Not CratonVM bugs: 543 FAILs (`testsuite/integration-arquillian/tests/base`
 + `tests/other/sssd`, exhaustively confirmed - 543/544 exact match, the 544th
 is the System Rules finding above) are "Not found frontend container:
@@ -904,7 +909,9 @@ PreviewFeatures native crash. The remaining non-passed rows are tracked here:
   now FIXED. `RealmModelTest` then reached a distinct residual,
   [Infinispan Cache.config null after real DefaultCacheManager.start()](../internal/fixed-suite-bugs/keycloak-model-infinispan-cache-config-null-after-real-start-FIXED.md),
   now ALSO FIXED (2026-07-06) — see the top of this file for the two new
-  residuals it uncovered one/two layers deeper still.
+  residuals it uncovered one/two layers deeper still. The original JIT-only
+  decode-error note is retired; the current open follow-up is the
+  `RealmModelTest` Liquibase-phase timeout.
 - [keycloak-sssd-system1-findbootstrapclassornull-nosuchmethod.md](keycloak-sssd-system1-findbootstrapclassornull-nosuchmethod.md) -
   2 `FAIL` rows in the SSSD module, missing
   `java/lang/System$1.findBootstrapClassOrNull(String)Class`.

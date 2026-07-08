@@ -1278,6 +1278,7 @@ impl SharedVm {
                 // Register concurrent natives (ReentrantLock, etc.) needed by real JDK classes
                 // like LinkedBlockingQueue which use ReentrantLock for synchronization
                 cratonvm_native_builtins::register_concurrent_natives(&mut native_methods);
+                cratonvm_native_builtins::register_stamped_lock_natives(&mut native_methods);
                 // LinkedBlockingQueue.drainTo(Collection, int) - needed by SLF4J/Spring
                 // Override with native implementation to avoid ReentrantLock field layout mismatch
                 // between synthetic natives and real JDK classes
@@ -1677,6 +1678,7 @@ impl SharedVm {
             // above. Real-JDK apps still need ReentrantLock / Condition / LBQ
             // drainTo natives (SLF4J replayEvents, Spring thread pools).
             cratonvm_native_builtins::register_concurrent_natives(&mut native_methods);
+            cratonvm_native_builtins::register_stamped_lock_natives(&mut native_methods);
             fn real_jdk_lbq_drain_to_bounded(
                 ctx: &mut dyn cratonvm_native_api::NativeContext,
                 args: &[cratonvm_types::Value],

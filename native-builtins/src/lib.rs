@@ -12525,6 +12525,11 @@ pub fn register_essential_natives(registry: &mut NativeMethodRegistry) {
     // libssl/libcrypto. Registered here (the always-compiled essential path)
     // rather than in the synthetic-only `register_pe_panama`. See the fn doc.
     crate::panama::register_pe_raw_native_libraries(registry);
+    // FFM SymbolLookup bridge: real-JDK mode can still dispatch through the
+    // abstract `SymbolLookup.find(String)` interface declaration on composed
+    // lookup objects. Keep the focused bridge in the essential path so callers
+    // get Optional<MemorySegment>/Optional.empty() instead of AbstractMethodError.
+    crate::panama::register_pe_symbol_lookup(registry);
     // FFM real-JDK layout/runtime shims. JDK 25's vector/foreign bootstrap
     // reaches `java.lang.foreign.ValueLayout$Of*` interface methods whose real
     // declarations are abstract/covariant. Register the phase-67 foreign-memory
@@ -52567,6 +52572,10 @@ fn register_rwlock_natives(registry: &mut NativeMethodRegistry) {
 
     // StampedLock — real optimistic read / exclusive write lock with stamp validation.
     // Uses a global state map keyed by object address for per-lock state.
+    register_stamped_lock_natives(registry);
+}
+
+pub fn register_stamped_lock_natives(registry: &mut NativeMethodRegistry) {
     let sl = "java/util/concurrent/locks/StampedLock";
     registry.register(sl, "<init>", "()V", native_stamped_init);
     registry.register(sl, "readLock", "()J", native_stamped_read_lock);
@@ -52574,6 +52583,20 @@ fn register_rwlock_natives(registry: &mut NativeMethodRegistry) {
     registry.register(sl, "tryOptimisticRead", "()J", native_stamped_optimistic);
     registry.register(sl, "unlockRead", "(J)V", native_stamped_unlock_read);
     registry.register(sl, "unlockWrite", "(J)V", native_stamped_unlock_write);
+    registry.register(
+        sl,
+        "unstampedUnlockRead",
+        "()V",
+        native_stamped_unstamped_unlock_read,
+    );
+    registry.register(
+        sl,
+        "unstampedUnlockWrite",
+        "()V",
+        native_stamped_unstamped_unlock_write,
+    );
+    registry.register(sl, "tryUnlockRead", "()Z", native_stamped_try_unlock_read);
+    registry.register(sl, "tryUnlockWrite", "()Z", native_stamped_try_unlock_write);
     registry.register(sl, "validate", "(J)Z", native_stamped_validate);
     registry.register(sl, "tryReadLock", "()J", native_stamped_try_read_lock);
     registry.register(sl, "tryWriteLock", "()J", native_stamped_try_write_lock);
@@ -52597,6 +52620,16 @@ fn register_rwlock_natives(registry: &mut NativeMethodRegistry) {
         "()I",
         native_stamped_get_read_lock_count,
     );
+
+    let sl_wv = "java/util/concurrent/locks/StampedLock$WriteLockView";
+    registry.register(sl_wv, "lock", "()V", native_stamped_write_view_lock);
+    registry.register(sl_wv, "tryLock", "()Z", native_stamped_write_view_try_lock);
+    registry.register(sl_wv, "unlock", "()V", native_stamped_write_view_unlock);
+
+    let sl_rv = "java/util/concurrent/locks/StampedLock$ReadLockView";
+    registry.register(sl_rv, "lock", "()V", native_stamped_read_view_lock);
+    registry.register(sl_rv, "tryLock", "()Z", native_stamped_read_view_try_lock);
+    registry.register(sl_rv, "unlock", "()V", native_stamped_read_view_unlock);
 }
 
 fn native_rwl_init(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
@@ -52749,51 +52782,166 @@ fn stamped_addr(ctx: &mut dyn NativeContext, args: &[Value]) -> Option<usize> {
     }
 }
 
+fn stamped_obj(args: &[Value]) -> Option<ObjectRef> {
+    match args.first() {
+        Some(Value::Object(Some(o))) => Some(*o),
+        _ => None,
+    }
+}
+
+fn stamped_addr_for_obj(ctx: &mut dyn NativeContext, obj: ObjectRef) -> usize {
+    gc_stable_lock_key(ctx, obj)
+}
+
+fn mirror_stamped_state(ctx: &mut dyn NativeContext, obj: ObjectRef, addr: usize) {
+    ctx.set_field_by_name(
+        obj,
+        "state",
+        Value::Long(crate::stamped_lock::stamped_visible_state(addr)),
+    );
+}
+
+fn stamped_view_parent(ctx: &mut dyn NativeContext, args: &[Value]) -> Option<ObjectRef> {
+    let view = stamped_obj(args)?;
+    match ctx.get_field_by_name(view, "this$0") {
+        Value::Object(Some(parent)) => Some(parent),
+        _ => None,
+    }
+}
+
 fn native_stamped_init(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    if let Some(addr) = stamped_addr(ctx, args) {
+    if let Some(obj) = stamped_obj(args) {
+        let addr = stamped_addr_for_obj(ctx, obj);
         crate::stamped_lock::stamped_init(addr);
+        mirror_stamped_state(ctx, obj, addr);
     }
     Ok(None)
 }
 
 fn native_stamped_write_lock(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    let addr = match stamped_addr(ctx, args) {
-        Some(a) => a,
+    let obj = match stamped_obj(args) {
+        Some(o) => o,
         None => return Ok(Some(Value::Long(0))),
     };
-    Ok(Some(Value::Long(crate::stamped_lock::stamped_write_lock(
-        addr,
-    ))))
+    let addr = stamped_addr_for_obj(ctx, obj);
+    let stamp = crate::stamped_lock::stamped_write_lock(addr);
+    mirror_stamped_state(ctx, obj, addr);
+    Ok(Some(Value::Long(stamp)))
 }
 
 fn native_stamped_read_lock(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    let addr = match stamped_addr(ctx, args) {
-        Some(a) => a,
+    let obj = match stamped_obj(args) {
+        Some(o) => o,
         None => return Ok(Some(Value::Long(0))),
     };
-    Ok(Some(Value::Long(crate::stamped_lock::stamped_read_lock(
-        addr,
-    ))))
+    let addr = stamped_addr_for_obj(ctx, obj);
+    let stamp = crate::stamped_lock::stamped_read_lock(addr);
+    mirror_stamped_state(ctx, obj, addr);
+    Ok(Some(Value::Long(stamp)))
 }
 
 fn native_stamped_try_read_lock(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    let addr = match stamped_addr(ctx, args) {
-        Some(a) => a,
+    let obj = match stamped_obj(args) {
+        Some(o) => o,
         None => return Ok(Some(Value::Long(0))),
     };
-    Ok(Some(Value::Long(
-        crate::stamped_lock::stamped_try_read_lock(addr),
-    )))
+    let addr = stamped_addr_for_obj(ctx, obj);
+    let stamp = crate::stamped_lock::stamped_try_read_lock(addr);
+    mirror_stamped_state(ctx, obj, addr);
+    Ok(Some(Value::Long(stamp)))
 }
 
 fn native_stamped_try_write_lock(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    let addr = match stamped_addr(ctx, args) {
-        Some(a) => a,
+    let obj = match stamped_obj(args) {
+        Some(o) => o,
         None => return Ok(Some(Value::Long(0))),
     };
-    Ok(Some(Value::Long(
-        crate::stamped_lock::stamped_try_write_lock(addr),
-    )))
+    let addr = stamped_addr_for_obj(ctx, obj);
+    let stamp = crate::stamped_lock::stamped_try_write_lock(addr);
+    mirror_stamped_state(ctx, obj, addr);
+    Ok(Some(Value::Long(stamp)))
+}
+
+fn native_stamped_write_view_lock(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let Some(parent) = stamped_view_parent(ctx, args) else {
+        return Ok(None);
+    };
+    let addr = stamped_addr_for_obj(ctx, parent);
+    crate::stamped_lock::stamped_write_lock(addr);
+    mirror_stamped_state(ctx, parent, addr);
+    Ok(None)
+}
+
+fn native_stamped_write_view_try_lock(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    let Some(parent) = stamped_view_parent(ctx, args) else {
+        return Ok(Some(Value::Int(0)));
+    };
+    let addr = stamped_addr_for_obj(ctx, parent);
+    let stamp = crate::stamped_lock::stamped_try_write_lock(addr);
+    mirror_stamped_state(ctx, parent, addr);
+    Ok(Some(Value::Int(i32::from(stamp != 0))))
+}
+
+fn native_stamped_write_view_unlock(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    let Some(parent) = stamped_view_parent(ctx, args) else {
+        return Ok(None);
+    };
+    let addr = stamped_addr_for_obj(ctx, parent);
+    if !crate::stamped_lock::stamped_try_unstamped_unlock_write(addr) {
+        return Err(RuntimeError::IllegalMonitorStateException {
+            message: "StampedLock write lock not held".to_string(),
+        }
+        .into());
+    }
+    mirror_stamped_state(ctx, parent, addr);
+    Ok(None)
+}
+
+fn native_stamped_read_view_lock(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let Some(parent) = stamped_view_parent(ctx, args) else {
+        return Ok(None);
+    };
+    let addr = stamped_addr_for_obj(ctx, parent);
+    crate::stamped_lock::stamped_read_lock(addr);
+    mirror_stamped_state(ctx, parent, addr);
+    Ok(None)
+}
+
+fn native_stamped_read_view_try_lock(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    let Some(parent) = stamped_view_parent(ctx, args) else {
+        return Ok(Some(Value::Int(0)));
+    };
+    let addr = stamped_addr_for_obj(ctx, parent);
+    let stamp = crate::stamped_lock::stamped_try_read_lock(addr);
+    mirror_stamped_state(ctx, parent, addr);
+    Ok(Some(Value::Int(i32::from(stamp != 0))))
+}
+
+fn native_stamped_read_view_unlock(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    let Some(parent) = stamped_view_parent(ctx, args) else {
+        return Ok(None);
+    };
+    let addr = stamped_addr_for_obj(ctx, parent);
+    if !crate::stamped_lock::stamped_try_unstamped_unlock_read(addr) {
+        return Err(RuntimeError::IllegalMonitorStateException {
+            message: "StampedLock read lock not held".to_string(),
+        }
+        .into());
+    }
+    mirror_stamped_state(ctx, parent, addr);
+    Ok(None)
 }
 
 fn native_stamped_optimistic(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
@@ -52820,17 +52968,81 @@ fn native_stamped_validate(ctx: &mut dyn NativeContext, args: &[Value]) -> Metho
 }
 
 fn native_stamped_unlock_read(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    if let Some(addr) = stamped_addr(ctx, args) {
+    if let Some(obj) = stamped_obj(args) {
+        let addr = stamped_addr_for_obj(ctx, obj);
         crate::stamped_lock::stamped_unlock_read(addr);
+        mirror_stamped_state(ctx, obj, addr);
     }
     Ok(None)
 }
 
 fn native_stamped_unlock_write(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    if let Some(addr) = stamped_addr(ctx, args) {
+    if let Some(obj) = stamped_obj(args) {
+        let addr = stamped_addr_for_obj(ctx, obj);
         crate::stamped_lock::stamped_unlock_write(addr);
+        mirror_stamped_state(ctx, obj, addr);
     }
     Ok(None)
+}
+
+fn native_stamped_unstamped_unlock_read(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    if let Some(obj) = stamped_obj(args) {
+        let addr = stamped_addr_for_obj(ctx, obj);
+        if !crate::stamped_lock::stamped_try_unstamped_unlock_read(addr) {
+            return Err(RuntimeError::IllegalMonitorStateException {
+                message: "StampedLock read lock not held".to_string(),
+            }
+            .into());
+        }
+        mirror_stamped_state(ctx, obj, addr);
+    }
+    Ok(None)
+}
+
+fn native_stamped_unstamped_unlock_write(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    if let Some(obj) = stamped_obj(args) {
+        let addr = stamped_addr_for_obj(ctx, obj);
+        if !crate::stamped_lock::stamped_try_unstamped_unlock_write(addr) {
+            return Err(RuntimeError::IllegalMonitorStateException {
+                message: "StampedLock write lock not held".to_string(),
+            }
+            .into());
+        }
+        mirror_stamped_state(ctx, obj, addr);
+    }
+    Ok(None)
+}
+
+fn native_stamped_try_unlock_read(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    let Some(obj) = stamped_obj(args) else {
+        return Ok(Some(Value::Int(0)));
+    };
+    let addr = stamped_addr_for_obj(ctx, obj);
+    let unlocked = crate::stamped_lock::stamped_try_unstamped_unlock_read(addr);
+    mirror_stamped_state(ctx, obj, addr);
+    Ok(Some(Value::Int(i32::from(unlocked))))
+}
+
+fn native_stamped_try_unlock_write(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    let Some(obj) = stamped_obj(args) else {
+        return Ok(Some(Value::Int(0)));
+    };
+    let addr = stamped_addr_for_obj(ctx, obj);
+    let unlocked = crate::stamped_lock::stamped_try_unstamped_unlock_write(addr);
+    mirror_stamped_state(ctx, obj, addr);
+    Ok(Some(Value::Int(i32::from(unlocked))))
 }
 
 fn native_stamped_try_convert_to_write(
@@ -52841,26 +53053,28 @@ fn native_stamped_try_convert_to_write(
         Some(Value::Long(v)) => *v,
         _ => return Ok(Some(Value::Long(0))),
     };
-    let addr = match stamped_addr(ctx, args) {
-        Some(a) => a,
+    let obj = match stamped_obj(args) {
+        Some(o) => o,
         None => return Ok(Some(Value::Long(0))),
     };
-    Ok(Some(Value::Long(
-        crate::stamped_lock::stamped_try_convert_to_write(addr, stamp),
-    )))
+    let addr = stamped_addr_for_obj(ctx, obj);
+    let converted = crate::stamped_lock::stamped_try_convert_to_write(addr, stamp);
+    mirror_stamped_state(ctx, obj, addr);
+    Ok(Some(Value::Long(converted)))
 }
 
 fn native_stamped_try_convert_to_read(
     ctx: &mut dyn NativeContext,
     args: &[Value],
 ) -> MethodCallResult {
-    let addr = match stamped_addr(ctx, args) {
-        Some(a) => a,
+    let obj = match stamped_obj(args) {
+        Some(o) => o,
         None => return Ok(Some(Value::Long(0))),
     };
-    Ok(Some(Value::Long(
-        crate::stamped_lock::stamped_try_convert_to_read(addr),
-    )))
+    let addr = stamped_addr_for_obj(ctx, obj);
+    let converted = crate::stamped_lock::stamped_try_convert_to_read(addr);
+    mirror_stamped_state(ctx, obj, addr);
+    Ok(Some(Value::Long(converted)))
 }
 
 fn native_stamped_is_write_locked(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
@@ -58919,6 +59133,40 @@ mod module_can_read_essential_tests {
 }
 
 #[cfg(test)]
+mod panama_essential_tests {
+    use super::*;
+
+    #[test]
+    fn register_essential_includes_symbol_lookup_bridge() {
+        let mut registry = NativeMethodRegistry::new();
+        register_essential_natives(&mut registry);
+        let symbol_lookup = "java/lang/foreign/SymbolLookup";
+
+        assert!(registry
+            .find(
+                symbol_lookup,
+                "libraryLookup",
+                "(Ljava/lang/String;Ljava/lang/foreign/Arena;)Ljava/lang/foreign/SymbolLookup;"
+            )
+            .is_some());
+        assert!(registry
+            .find(
+                symbol_lookup,
+                "loaderLookup",
+                "()Ljava/lang/foreign/SymbolLookup;"
+            )
+            .is_some());
+        assert!(registry
+            .find(
+                symbol_lookup,
+                "find",
+                "(Ljava/lang/String;)Ljava/util/Optional;"
+            )
+            .is_some());
+    }
+}
+
+#[cfg(test)]
 mod unsafe_static_field_offset_tests {
     use super::*;
     use crate::test_utils::MockNativeContext;
@@ -59419,6 +59667,13 @@ mod concurrency_tests {
 
     // ------- StampedLock -------
 
+    fn stamped_lock_obj(ctx: &mut MockNativeContext) -> ObjectRef {
+        let cid = ctx
+            .ensure_class_initialized("java/util/concurrent/locks/StampedLock")
+            .expect("mock StampedLock class id");
+        ctx.alloc_object(cid, 8)
+    }
+
     #[test]
     fn m18_stamped_init_creates_state() {
         let _guard = stamped_test_lock();
@@ -59486,6 +59741,151 @@ mod concurrency_tests {
             .unwrap()
             .unwrap();
         assert_eq!(locked, Value::Int(0), "lock/unlock must agree on the slot");
+    }
+
+    #[test]
+    fn m18_stamped_real_jdk_registry_keeps_write_and_unstamped_unlock_coherent() {
+        let _guard = stamped_test_lock();
+        let mut registry = NativeMethodRegistry::new();
+        register_essential_natives(&mut registry);
+        register_concurrent_natives(&mut registry);
+        register_stamped_lock_natives(&mut registry);
+        let sl_class = "java/util/concurrent/locks/StampedLock";
+        let init = registry
+            .find(sl_class, "<init>", "()V")
+            .expect("StampedLock.<init> should be registered");
+        let write_lock = registry
+            .find(sl_class, "writeLock", "()J")
+            .expect("StampedLock.writeLock should be registered");
+        let unstamped_unlock_write = registry
+            .find(sl_class, "unstampedUnlockWrite", "()V")
+            .expect("StampedLock.unstampedUnlockWrite should be registered");
+        let is_write_locked = registry
+            .find(sl_class, "isWriteLocked", "()Z")
+            .expect("StampedLock.isWriteLocked should be registered");
+
+        let mut ctx = make_ctx();
+        let sl = stamped_lock_obj(&mut ctx);
+        init(&mut ctx, &[Value::Object(Some(sl))]).unwrap();
+        write_lock(&mut ctx, &[Value::Object(Some(sl))]).unwrap();
+        unstamped_unlock_write(&mut ctx, &[Value::Object(Some(sl))])
+            .expect("writeLock and unstampedUnlockWrite must use the same state backend");
+
+        let locked = is_write_locked(&mut ctx, &[Value::Object(Some(sl))])
+            .unwrap()
+            .unwrap();
+        assert_eq!(locked, Value::Int(0));
+    }
+
+    #[test]
+    fn m18_stamped_write_view_lock_unlock_updates_parent_state() {
+        let _guard = stamped_test_lock();
+        let mut ctx = make_ctx();
+        let sl = stamped_lock_obj(&mut ctx);
+        native_stamped_init(&mut ctx, &[Value::Object(Some(sl))]).unwrap();
+        let view_cid = ctx
+            .ensure_class_initialized("java/util/concurrent/locks/StampedLock$WriteLockView")
+            .expect("mock StampedLock WriteLockView class id");
+        let view = ctx.alloc_object(view_cid, 1);
+        ctx.set_field_by_name(view, "this$0", Value::Object(Some(sl)));
+
+        native_stamped_write_view_lock(&mut ctx, &[Value::Object(Some(view))]).unwrap();
+        let write_state = match ctx.get_field_by_name(sl, "state") {
+            Value::Long(v) => v,
+            other => panic!("expected mirrored StampedLock.state Long, got {other:?}"),
+        };
+        assert_ne!(write_state & 128, 0);
+
+        native_stamped_write_view_unlock(&mut ctx, &[Value::Object(Some(view))]).unwrap();
+        let post_state = match ctx.get_field_by_name(sl, "state") {
+            Value::Long(v) => v,
+            other => panic!("expected mirrored StampedLock.state Long, got {other:?}"),
+        };
+        assert_eq!(post_state & 128, 0);
+    }
+
+    #[test]
+    fn m18_stamped_read_view_lock_unlock_updates_parent_state() {
+        let _guard = stamped_test_lock();
+        let mut ctx = make_ctx();
+        let sl = stamped_lock_obj(&mut ctx);
+        native_stamped_init(&mut ctx, &[Value::Object(Some(sl))]).unwrap();
+        let view_cid = ctx
+            .ensure_class_initialized("java/util/concurrent/locks/StampedLock$ReadLockView")
+            .expect("mock StampedLock ReadLockView class id");
+        let view = ctx.alloc_object(view_cid, 1);
+        ctx.set_field_by_name(view, "this$0", Value::Object(Some(sl)));
+
+        native_stamped_read_view_lock(&mut ctx, &[Value::Object(Some(view))]).unwrap();
+        let read_state = match ctx.get_field_by_name(sl, "state") {
+            Value::Long(v) => v,
+            other => panic!("expected mirrored StampedLock.state Long, got {other:?}"),
+        };
+        assert_eq!(read_state & 127, 1);
+
+        native_stamped_read_view_unlock(&mut ctx, &[Value::Object(Some(view))]).unwrap();
+        let post_state = match ctx.get_field_by_name(sl, "state") {
+            Value::Long(v) => v,
+            other => panic!("expected mirrored StampedLock.state Long, got {other:?}"),
+        };
+        assert_eq!(post_state & 127, 0);
+    }
+
+    #[test]
+    fn m18_stamped_unstamped_write_unlock_updates_side_table_and_state() {
+        let _guard = stamped_test_lock();
+        let mut ctx = make_ctx();
+        let sl = stamped_lock_obj(&mut ctx);
+        native_stamped_init(&mut ctx, &[Value::Object(Some(sl))]).unwrap();
+        assert_eq!(ctx.get_field_by_name(sl, "state"), Value::Long(STAMPED_ORIGIN));
+
+        native_stamped_write_lock(&mut ctx, &[Value::Object(Some(sl))]).unwrap();
+        let write_state = match ctx.get_field_by_name(sl, "state") {
+            Value::Long(v) => v,
+            other => panic!("expected mirrored StampedLock.state Long, got {other:?}"),
+        };
+        assert_ne!(write_state & 128, 0, "JDK WBIT must be visible");
+
+        native_stamped_unstamped_unlock_write(&mut ctx, &[Value::Object(Some(sl))]).unwrap();
+        let locked = native_stamped_is_write_locked(&mut ctx, &[Value::Object(Some(sl))])
+            .unwrap()
+            .unwrap();
+        assert_eq!(locked, Value::Int(0));
+        let post_state = match ctx.get_field_by_name(sl, "state") {
+            Value::Long(v) => v,
+            other => panic!("expected mirrored StampedLock.state Long, got {other:?}"),
+        };
+        assert_eq!(post_state & 128, 0, "JDK WBIT must clear after unlock");
+    }
+
+    #[test]
+    fn m18_stamped_unstamped_read_unlock_updates_side_table_and_state() {
+        let _guard = stamped_test_lock();
+        let mut ctx = make_ctx();
+        let sl = stamped_lock_obj(&mut ctx);
+        native_stamped_init(&mut ctx, &[Value::Object(Some(sl))]).unwrap();
+
+        native_stamped_read_lock(&mut ctx, &[Value::Object(Some(sl))]).unwrap();
+        let count = native_stamped_get_read_lock_count(&mut ctx, &[Value::Object(Some(sl))])
+            .unwrap()
+            .unwrap();
+        assert_eq!(count, Value::Int(1));
+        let read_state = match ctx.get_field_by_name(sl, "state") {
+            Value::Long(v) => v,
+            other => panic!("expected mirrored StampedLock.state Long, got {other:?}"),
+        };
+        assert_ne!(read_state & 127, 0, "read count must be visible");
+
+        native_stamped_unstamped_unlock_read(&mut ctx, &[Value::Object(Some(sl))]).unwrap();
+        let count = native_stamped_get_read_lock_count(&mut ctx, &[Value::Object(Some(sl))])
+            .unwrap()
+            .unwrap();
+        assert_eq!(count, Value::Int(0));
+        let post_state = match ctx.get_field_by_name(sl, "state") {
+            Value::Long(v) => v,
+            other => panic!("expected mirrored StampedLock.state Long, got {other:?}"),
+        };
+        assert_eq!(post_state & 127, 0, "read count must clear after unlock");
     }
 
     #[test]

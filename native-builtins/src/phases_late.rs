@@ -28513,7 +28513,11 @@ pub(crate) fn register_phase62_natives(registry: &mut NativeMethodRegistry) {
     register_p62_format_factories(registry);
     register_p62_navigable_expansion(registry);
     register_p62_abstract_map_entries(registry);
-    register_p62_stamped_lock(registry);
+    // StampedLock is registered separately with the side-table implementation
+    // used by real JDK lock-view bytecode. The older p62 2-field shim is
+    // intentionally not installed in the essential path, because mixing its
+    // `writeLock()` with the side-table `unstampedUnlock*` methods makes
+    // `StampedLock$WriteLockView.unlock()` throw spuriously.
     register_p62_zip_entry(registry);
     registry.set_category(__prev_cat);
 }

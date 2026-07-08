@@ -4,7 +4,7 @@ Status: open
 
 Date observed: 2026-07-07 — surfaced while running `RealmModelTest` with
 `--nojit` to work around
-[keycloak-model-infinispan-jit-adjacent-decode-error-fullname](keycloak-model-infinispan-jit-adjacent-decode-error-fullname.md).
+[keycloak-model-infinispan-jit-adjacent-decode-error-fullname](../internal/fixed-suite-bugs/keycloak-model-infinispan-jit-adjacent-decode-error-fullname-FIXED.md).
 
 ## Summary
 

@@ -27,6 +27,42 @@ use super::SharedVm;
 use crate::classloading::ClassStore;
 use crate::native::registry::NativeCallback;
 
+#[cfg(target_os = "windows")]
+extern "system" {
+    fn GetModuleHandleA(lpModuleName: *const i8) -> *mut std::ffi::c_void;
+    fn GetProcAddress(
+        hModule: *mut std::ffi::c_void,
+        lpProcName: *const i8,
+    ) -> *mut std::ffi::c_void;
+}
+
+fn lookup_process_native_symbol(name: &str) -> Option<usize> {
+    let c_name = std::ffi::CString::new(name).ok()?;
+    #[cfg(target_os = "windows")]
+    {
+        for lib in ["ucrtbase.dll\0", "msvcrt.dll\0", "vcruntime140.dll\0"] {
+            let handle = unsafe { GetModuleHandleA(lib.as_ptr() as *const i8) };
+            if handle.is_null() {
+                continue;
+            }
+            let addr = unsafe { GetProcAddress(handle, c_name.as_ptr()) };
+            if !addr.is_null() {
+                return Some(addr as usize);
+            }
+        }
+        None
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        let addr = unsafe { libc::dlsym(libc::RTLD_DEFAULT, c_name.as_ptr()) };
+        if addr.is_null() {
+            None
+        } else {
+            Some(addr as usize)
+        }
+    }
+}
+
 /// DBG (CRATONVM_DBG_WATCHREF, extended): RandomizedContext WeakHashMap
 /// residual investigation — logs a `[watchref]` line ONLY when a given
 /// thread's OWN `Thread.currentThread()` mirror address or identity hash
@@ -7236,7 +7272,7 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
                     return Some(*sym as usize);
                 }
             }
-            None
+            lookup_process_native_symbol(name)
         }
     }
 }
@@ -11932,6 +11968,11 @@ fn invoke_on_class_shared_inner(
                             method_name,
                             descriptor,
                         )
+                        || crate::runtime::interpreter::is_stamped_lock_native_override(
+                            class_name,
+                            method_name,
+                            descriptor,
+                        )
                         // Logback / Spring: `new SimpleDateFormat(pattern)` on real-JDK
                         // `java.text` classes can hit NSME during early bootstrap.
                         || (class_name == "java/text/SimpleDateFormat"
@@ -13738,6 +13779,12 @@ mod tests {
 
     fn test_shared() -> Arc<SharedVm> {
         Arc::new(SharedVm::new(VmConfig::default()))
+    }
+
+    #[test]
+    fn default_process_lookup_finds_c_runtime_allocator_symbols() {
+        assert!(lookup_process_native_symbol("malloc").is_some());
+        assert!(lookup_process_native_symbol("free").is_some());
     }
 
     // -----------------------------------------------------------------------
