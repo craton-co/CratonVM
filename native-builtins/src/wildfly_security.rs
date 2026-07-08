@@ -1043,18 +1043,12 @@ fn native_login_context_init(ctx: &mut dyn NativeContext, args: &[Value]) -> Met
     let key = obj_key(ctx, this);
     login_context_handles().write().insert(key, lc);
 
-    let name_value = object_value(name_pin.map(|pin| pin.current(ctx)));
     let subject_value = Value::Object(Some(subject_obj));
     let handler_value = object_value(handler_pin.map(|pin| pin.current(ctx)));
     let config_value = object_value(config_pin.map(|pin| pin.current(ctx)));
 
-    ctx.set_field(this, LOGIN_CONTEXT_SLOT_NAME, name_value);
-    ctx.set_field_by_name(this, "name", name_value);
-    ctx.set_field(this, LOGIN_CONTEXT_SLOT_SUBJECT, subject_value);
     ctx.set_field_by_name(this, "subject", subject_value);
-    ctx.set_field(this, LOGIN_CONTEXT_SLOT_HANDLER, handler_value);
     ctx.set_field_by_name(this, "callbackHandler", handler_value);
-    ctx.set_field(this, LOGIN_CONTEXT_SLOT_CONFIG, config_value);
     ctx.set_field_by_name(this, "config", config_value);
 
     ctx.unpin_native_roots(pin_base);
@@ -1084,6 +1078,12 @@ fn login_context_object_field(
 ) -> Option<ObjectRef> {
     match ctx.get_field_by_name(this, field_name) {
         Value::Object(Some(obj)) => Some(obj),
+        _ if ctx
+            .resolve_field_index("javax/security/auth/login/LoginContext", "state")
+            .is_some() =>
+        {
+            None
+        }
         _ => match ctx.get_field(this, slot) {
             Value::Object(Some(obj)) => Some(obj),
             _ => None,
@@ -1320,11 +1320,7 @@ fn run_java_configuration_login(
         let handler =
             login_context_object_field(ctx, this, "callbackHandler", LOGIN_CONTEXT_SLOT_HANDLER)
                 .map(|obj| PinnedObject::new(ctx, obj));
-        let name_obj = match login_context_object_field(ctx, this, "name", LOGIN_CONTEXT_SLOT_NAME)
-        {
-            Some(obj) => obj,
-            None => ctx.create_string(name),
-        };
+        let name_obj = ctx.create_string(name);
         let name_pin = PinnedObject::new(ctx, name_obj);
         let specs = read_java_login_modules(ctx, config, name_pin)?;
         if specs.is_empty() {
@@ -1779,7 +1775,13 @@ mod tests {
         clear_domain_registry();
 
         let mut ctx = MockNativeContext::new();
-        let this = ctx.fresh_object_ref();
+        let this = match ctx
+            .new_object("javax/security/auth/login/LoginContext")
+            .unwrap()
+        {
+            Some(Value::Object(Some(login_context))) => login_context,
+            other => panic!("expected LoginContext object, got {other:?}"),
+        };
         let name = ctx.create_string("CustomLogin");
         let subject = match ctx.new_object("javax/security/auth/Subject").unwrap() {
             Some(Value::Object(Some(subject))) => subject,
@@ -1805,7 +1807,7 @@ mod tests {
         .expect("LoginContext init should retain config-backed state");
 
         assert_eq!(
-            ctx.get_field(this, LOGIN_CONTEXT_SLOT_CONFIG),
+            ctx.get_field_by_name(this, "config"),
             Value::Object(Some(config))
         );
         native_login_context_login(&mut ctx, &[Value::Object(Some(this))])

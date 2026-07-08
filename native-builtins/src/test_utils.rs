@@ -222,6 +222,16 @@ fn mock_classloader_field_slot(class_name: Option<&str>, name: &str) -> Option<u
         ) => Some(0),
         (Some("jdk/internal/loader/URLClassPath" | "sun/misc/URLClassPath"), "path") => Some(0),
         (Some("java/net/URL"), "path") => Some(0),
+        (
+            Some("javax/security/auth/login/LoginContext"),
+            "name" | "subject" | "callbackHandler" | "config",
+        ) => match name {
+            "name" => Some(0),
+            "subject" => Some(1),
+            "callbackHandler" => Some(2),
+            "config" => Some(3),
+            _ => None,
+        },
         _ => None,
     }
 }
