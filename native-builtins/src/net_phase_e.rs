@@ -8527,12 +8527,17 @@ fn register_re8_network_interface(r: &mut NativeMethodRegistry) {
     r.register(ni, "isUp0", "(Ljava/lang/String;I)Z", |_ctx, _args| {
         Ok(Some(Value::Int(1)))
     });
-    r.register(
-        ni,
-        "isLoopback0",
-        "(Ljava/lang/String;I)Z",
-        |_ctx, _args| Ok(Some(Value::Int(0))),
-    );
+    r.register(ni, "isLoopback0", "(Ljava/lang/String;I)Z", |ctx, args| {
+        let name = match args.first().copied() {
+            Some(Value::Object(Some(s))) => ctx.read_string(s).unwrap_or_default(),
+            _ => String::new(),
+        };
+        let index = match args.get(1).copied() {
+            Some(Value::Int(i)) => i,
+            _ => 0,
+        };
+        Ok(Some(Value::Int(if name == "lo" || index == 1 { 1 } else { 0 })))
+    });
     r.register(ni, "isP2P0", "(Ljava/lang/String;I)Z", |_ctx, _args| {
         Ok(Some(Value::Int(0)))
     });

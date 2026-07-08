@@ -1,6 +1,6 @@
 # WildFly domain managed servers do not reach started state
 
-Status: OPEN (2026-07-07: the real Arquillian test now RUNS end-to-end under CratonVM nested processes — see the 2026-07-07 update at the bottom. Two distinct residuals isolated: no-JIT boots both servers to WFLYSRV0025 started but awaitServers never sees them (management-model propagation gap); JIT-on fails HC interface resolution WFLYSRV0082 (a JIT miscompile). Both new, both OPEN.)
+Status: OPEN (2026-07-08: stock-config empty-ServiceName collapse, loopback-interface criterion failure, and Undertow HttpString parser-clinit blocker are fixed/reduced. Remaining open residuals: no-JIT Arquillian awaitServers propagation gap; JIT-on literal-address WFLYSRV0082; stock domain now fails later with moduleLoader null in management HTTP service.)
 Date found: 2026-07-05
 Area: WildFly domain mode startup under CratonVM
 
@@ -582,7 +582,6 @@ Both docs remain OPEN. No fix landed this session; this is a documentation
 and scoping pass only, to prevent a future session from re-treading the
 same ground or conflating these three distinct failure modes.
 
-
 ## 2026-07-08 update — logging follow-up residual fixed; XNIO native blocking hardened; broader STW stall remains OPEN
 
 Branch `codex/fix-wildfly-stw-park-20260708-165032` on the Azure probe host, using a separate worktree from `dev` and uniquely named binaries:
@@ -623,3 +622,66 @@ The STW residual is **not fixed**. The rebuilt JIT-on standalone probe still tim
 The pending thread in that run was a non-blocked `ParallelBootOperationStepHandler$ParallelBootTransactionControl.operationPrepared` worker (`t53`), while a follow-up probe with `CRATONVM_JIT_BISECT_SKIP='org/jboss/threads/EnhancedQueueExecutor$ThreadBody.run'` made idle `ThreadBody.run@442` workers consistently blocked but still wedged later with a non-blocked `operationPrepared` worker (`t38`). That rules out a single `EnhancedQueueExecutor$ThreadBody.run` JIT skip as a complete fix. The next pass should focus on the Java/AQS/Future wait path used by `operationPrepared` and the two new functional boot NPEs above.
 
 Status remains OPEN: the fixed `BindInfo` bug is closed under `docs/internal`; this doc continues to track the broader WildFly domain/standalone boot residuals.
+## 2026-07-08 update - stock-config ServiceName, loopback, and Undertow parser blockers fixed
+
+Branch `codex/wildfly-residuals-20260708-164820` targeted the concrete stock-config
+`bin/domain.sh` residual from the eighth-session update where the management-interface
+failure was keyed by an empty MSC service name (`service  is missing []`). Three separate
+CratonVM gaps were found behind that symptom:
+
+1. **JBoss MSC `ServiceName` mirrors were incomplete - FIXED.** The native surface covered
+   `ServiceName.of(String...)` but missed the real overloads
+   `ServiceName.of(ServiceName,String...)`, `append(String...)`, and `append(ServiceName)`
+   while also registering a non-real `append(String)` descriptor. Native-created mirrors
+   also left the real `parent` field null and cached a canonical-string hash instead of
+   JBoss MSC's segment hash. Real WildFly bytecode reads `name`, `parent`, and `hashCode`
+   directly when composing/looking up services, so mixed native/bytecode composition could
+   collapse or compare incorrectly. The fix populates the parent chain recursively, uses the
+   Java/JBoss segment hash, registers the real overloads, and makes `getCanonicalName` /
+   `getParent` robust for real `ServiceName.JBOSS` objects with lazy canonical fields.
+
+2. **`NetworkInterface.isLoopback0("lo", 1)` always returned false - FIXED.** A focused
+   HotSpot/CratonVM probe using the stock expression model
+   `${jboss.bind.address.management:127.0.0.1}` showed both VMs parse the criterion as
+   `LoopbackAddressInterfaceCriteria(address=127.0.0.3)`, but CratonVM returned
+   `acceptableSize=0` because its low-level `java.net.NetworkInterface.isLoopback0`
+   native answered false for the synthetic loopback interface. HotSpot accepts `lo` and
+   returns `/127.0.0.3`. The fix reports loopback for `name == "lo"` or index `1`.
+
+3. **Undertow parser constants were native-nooped - FIXED.** `HttpRequestParser` reflects
+   over `Headers`, `Methods`, and `Protocols` and calls `HttpString.toString()` on each
+   static `HttpString`. CratonVM's Undertow shim no-oped `Headers.<clinit>`, leaving those
+   reflected values null. The fix lets real `Headers.<clinit>` populate the constants and
+   teaches `HttpString.toString()` to handle both CratonVM's old synthetic one-slot layout
+   and Undertow's real `bytes`/`string` layout.
+
+Validation before the loopback fix showed the ServiceName change removed the previous empty
+name failure: the stock no-JIT `domain.sh` repro with
+`java-wildfly-residuals-20260708-164820-svcname` no longer printed
+`service  is missing []`; the remaining failure was keyed by the real service name
+`jboss.network.management`. The interface-criteria probe then isolated and fixed the
+next layer.
+
+A rebuild with `java-wildfly-residuals-20260708-164820-svcname-netif` confirmed
+`NetworkInterfaceService matched interface binding` and no longer reported
+`WFLYSRV0082`. That exposed a later Undertow parser blocker:
+`HttpRequestParser$$generated.<clinit>` failed because `Headers.<clinit>` had been
+native-nooped, leaving reflected static `HttpString` constants null. The fix lets real
+`Headers.<clinit>` run and makes `HttpString.toString()` understand both CratonVM's old
+synthetic one-slot layout and Undertow's real `bytes`/`string` layout. A focused
+`HttpRequestParser.httpStrings()` probe now matches HotSpot (`size=144`, including
+`Host`, `GET`, and `HTTP/1.1`).
+
+A final stock no-JIT `domain.sh` rerun with
+`java-wildfly-residuals-20260708-164820-svcname-netif-undertow` advanced past both fixed
+layers. Current stock-domain boundary is now:
+
+```text
+NetworkInterfaceService matched interface binding
+WFLYSRV0083: Failed to start the http-interface service
+Caused by: java.lang.NullPointerException: Cannot invoke "org.jboss.modules.ModuleLoader.loadModule(org.jboss.modules.ModuleIdentifier)" because "moduleLoader" is null
+```
+
+This document remains OPEN until the Arquillian no-JIT `awaitServers` propagation gap,
+the JIT-on literal-address WFLYSRV0082, and this newly exposed stock management-HTTP
+module-loader wiring failure are closed.
