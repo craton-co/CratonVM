@@ -26,8 +26,8 @@
 //! out-of-bounds test, whose deopt stub does call `uncommon_trap`; a counting
 //! stub there confirms the trap fired and that no copy was performed.
 
-use cratonvm_jit::x64::compile;
-use cratonvm_jit::JitDirectCall;
+use cratonvm_jit::x64::{compile, compile_with_param_slots};
+use cratonvm_jit::{CompiledMethod, JitDirectCall, JitInvokeInfo};
 use cratonvm_jit_api::JitRuntimeHelpers;
 use cratonvm_types::{ArrayElementType, ObjectKind, HEADER_SIZE};
 use std::collections::{HashMap, HashSet};
@@ -45,6 +45,18 @@ static TRAP_COUNT: AtomicU64 = AtomicU64::new(0);
 /// without this lock two of them running in parallel would each observe the
 /// other's increment and the `before + 1` assertion would spuriously fail.
 static DEOPT_LOCK: Mutex<()> = Mutex::new(());
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct DispatchRecord {
+    vm_ptr: i64,
+    info_ptr: usize,
+    num_args: usize,
+    args: [i64; 5],
+    return_type: u8,
+    invoke_kind: u8,
+}
+
+static DISPATCH_RECORD: Mutex<Option<DispatchRecord>> = Mutex::new(None);
 
 fn deopt_lock() -> MutexGuard<'static, ()> {
     DEOPT_LOCK
@@ -148,6 +160,46 @@ fn helpers() -> JitRuntimeHelpers {
         jit_drem: s,
         self_call_stack_guard: 0,
     }
+}
+
+fn helpers_with_dispatch(dispatch: usize) -> JitRuntimeHelpers {
+    let mut h = helpers();
+    h.invoke_dispatch = dispatch;
+    h
+}
+
+unsafe extern "C" fn recording_invoke_dispatch(
+    vm_ptr: i64,
+    info: *const JitInvokeInfo,
+    args_ptr: *const i64,
+    num_args: usize,
+) -> i64 {
+    let mut args = [0i64; 5];
+    if !args_ptr.is_null() {
+        let n = num_args.min(args.len());
+        unsafe {
+            std::ptr::copy_nonoverlapping(args_ptr, args.as_mut_ptr(), n);
+        }
+    }
+
+    let (return_type, invoke_kind) = if info.is_null() {
+        (0, 0)
+    } else {
+        unsafe { ((*info).return_type, (*info).invoke_kind) }
+    };
+
+    let mut record = DISPATCH_RECORD
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    *record = Some(DispatchRecord {
+        vm_ptr,
+        info_ptr: info as usize,
+        num_args,
+        args,
+        return_type,
+        invoke_kind,
+    });
+    0
 }
 
 /// A heap array object laid out byte-for-byte like the VM's compact array:
@@ -291,6 +343,65 @@ fn compile_arraycopy() -> impl Fn(i64, i32, i64, i32, i32) {
     }
 }
 
+fn compile_despec_arraycopy_with_dispatch(
+    method_key: &str,
+    info: &JitInvokeInfo,
+    helpers: &JitRuntimeHelpers,
+) -> CompiledMethod {
+    let entry = cratonvm_jit::try_resolve_intrinsic(
+        "java/lang/System",
+        "arraycopy",
+        "(Ljava/lang/Object;ILjava/lang/Object;II)V",
+    )
+    .expect("System.arraycopy must register as an intrinsic")
+    .0;
+
+    let code: Vec<u8> = vec![
+        0x2a, 0x1b, 0x2c, 0x1d, 0x15, 0x04, 0xb8, 0x00, 0x01, 0xb1, 0, 0,
+    ];
+    compile_with_param_slots(
+        &code,
+        code.len(),
+        5, // num_params: src, srcPos, dst, dstPos, len
+        5, // max_locals
+        true,
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+        vec![(6, info as *const JitInvokeInfo)],
+        vec![(
+            6,
+            JitDirectCall {
+                entry,
+                needs_context: false,
+                num_params: 5,
+                return_type: b'V',
+                guard_class_id: 0,
+            },
+        )],
+        Vec::new(), // mic_slots
+        Vec::new(), // pic_slots
+        Vec::new(), // ldc_info
+        Vec::new(), // ldc2w_info
+        HashMap::new(),
+        HashMap::new(),
+        helpers,
+        HashSet::new(),
+        HashMap::new(),
+        None, // string_layout
+        &[],
+        0,
+        0,
+        Vec::new(),
+        method_key,
+        Vec::new(),
+    )
+    .expect("JIT compilation of the despecialized arraycopy wrapper failed")
+}
+
 #[test]
 fn arraycopy_matcher_registers_only_the_erased_descriptor() {
     // The single type-erased descriptor is registered.
@@ -309,6 +420,53 @@ fn arraycopy_matcher_registers_only_the_erased_descriptor() {
             .is_none()
     );
     assert!(cratonvm_jit::try_resolve_intrinsic("java/lang/Object", "arraycopy", "()V").is_none());
+}
+
+#[test]
+fn arraycopy_despec_uses_dispatch_not_intrinsic_sentinel() {
+    let _g = deopt_lock();
+    cratonvm_jit::deopt::despec_clear_for_test();
+    let method_key = "ArraycopyDespec.wrapper:(Ljava/lang/Object;ILjava/lang/Object;II)V";
+    cratonvm_jit::deopt::despec_insert(method_key, 6);
+    {
+        let mut record = DISPATCH_RECORD
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        *record = None;
+    }
+
+    let info = JitInvokeInfo {
+        class_name: "java/lang/System",
+        method_name: "arraycopy",
+        descriptor: "(Ljava/lang/Object;ILjava/lang/Object;II)V",
+        num_jit_args: 5,
+        return_type: b'V',
+        invoke_kind: 3,
+    };
+    let helpers = helpers_with_dispatch(recording_invoke_dispatch as *const () as usize);
+    let compiled = compile_despec_arraycopy_with_dispatch(method_key, &info, &helpers);
+
+    let before = clear_deopt_signals();
+    let vm_ptr = 0x1234_5678_i64;
+    unsafe {
+        compiled
+            .try_call_with_context(vm_ptr, &[11, 22, 33, 44, 55])
+            .expect("test JIT call");
+    }
+    assert_no_deopt_after(before, "de-specialized arraycopy dispatch");
+
+    let record = *DISPATCH_RECORD
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let record = record.expect("despecialized arraycopy must call invoke_dispatch");
+    assert_eq!(record.vm_ptr, vm_ptr);
+    assert_eq!(record.info_ptr, &info as *const JitInvokeInfo as usize);
+    assert_eq!(record.num_args, 5);
+    assert_eq!(record.args, [11, 22, 33, 44, 55]);
+    assert_eq!(record.return_type, b'V');
+    assert_eq!(record.invoke_kind, 3);
+
+    cratonvm_jit::deopt::despec_clear_for_test();
 }
 
 #[test]
