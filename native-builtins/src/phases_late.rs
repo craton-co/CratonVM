@@ -40781,6 +40781,64 @@ pub(crate) fn register_p68_ssl(r: &mut NativeMethodRegistry) {
             Ok(Some(Value::Object(Some(arr))))
         },
     );
+    // FIX (netty-client-socket-write-after-close residual): getLocalPrincipal/
+    // getPeerPrincipal/getLocalCertificates were never registered anywhere in
+    // the crate at all — `javax.net.ssl.SSLSession` is a real JDK interface,
+    // so a synthetic object impersonating it has no bytecode to fall back to
+    // for an unregistered method, and calling one throws AbstractMethodError
+    // (observed via Spring's own session-info-building code:
+    // `getLocalPrincipal()Ljava/security/Principal; has no Code attribute`).
+    r.register(
+        ssl_session,
+        "getLocalPrincipal",
+        "()Ljava/security/Principal;",
+        |_ctx, _args| {
+            // This client session never presents a certificate (no mTLS in
+            // this path) — null is the documented return for "no principal
+            // was sent", not an exception.
+            Ok(Some(Value::Object(None)))
+        },
+    );
+    r.register(
+        ssl_session,
+        "getLocalCertificates",
+        "()[Ljava/security/cert/Certificate;",
+        |_ctx, _args| {
+            // Same rationale as getLocalPrincipal: null is the documented
+            // return when no local certificate chain was used.
+            Ok(Some(Value::Object(None)))
+        },
+    );
+    r.register(
+        ssl_session,
+        "getPeerPrincipal",
+        "()Ljava/security/Principal;",
+        |ctx, args| {
+            let this = obj_arg(args, 0)?;
+            let tls_id = if ctx.object_num_fields(this) > NEW13_SESS_TLSID {
+                ctx.get_field(this, NEW13_SESS_TLSID).as_int().unwrap_or(-1)
+            } else {
+                -1
+            };
+            let chain = if tls_id >= 0 {
+                crate::servlet::s2_tls_peer_cert_chain_der(tls_id).unwrap_or_default()
+            } else {
+                Vec::new()
+            };
+            let Some(leaf) = chain.first() else {
+                return Err(RuntimeError::IllegalStateException {
+                    message: "peer not authenticated (no certificate in session)".into(),
+                }
+                .into());
+            };
+            let (subject, _issuer) =
+                basic_der_extract_names(leaf).unwrap_or_else(|| ("CN=Unknown".into(), String::new()));
+            let princ = alloc_concurrent_synthetic(ctx, "javax/security/auth/x500/X500Principal", 1);
+            let s = ctx.create_string(&subject);
+            ctx.set_field(princ, 0, Value::Object(Some(s)));
+            Ok(Some(Value::Object(Some(princ))))
+        },
+    );
     r.register(ssl_session, "getCreationTime", "()J", |_ctx, _args| {
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
