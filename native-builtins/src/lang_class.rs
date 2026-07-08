@@ -3925,13 +3925,12 @@ fn ensure_static_field_declaring_class_initialized(
     ctx: &mut dyn NativeContext,
     class_id: cratonvm_types::ClassId,
 ) -> Result<(), cratonvm_types::error::MethodCallFailed> {
-    if let Some(name) = ctx.class_name_of_id(class_id) {
-        // Reflective access to a static field is an active use of the declaring
-        // class. HotSpot runs <clinit> before Field.get/set returns the value;
-        // XMLBeans depends on this for generated enum `table` fields.
-        ctx.ensure_class_initialized(&name)?;
-    }
-    Ok(())
+    // Reflective access to a static field is an active use of the declaring
+    // class. Initialize by exact `ClassId`: BeanShell can define several
+    // same-named script classes (`MyMessenger`) through distinct loaders, and a
+    // name-based initialization collapses or fails before the exact static slot
+    // is read or written.
+    ctx.ensure_class_id_initialized(class_id)
 }
 
 // --- Field.get(Object) / Field.set(Object, Object) ---
@@ -3968,12 +3967,6 @@ pub(crate) fn native_field_get(ctx: &mut dyn NativeContext, args: &[Value]) -> M
     // internally via `Unsafe.getReferenceVolatile`/`getIntVolatile`. No-op
     // for non-volatile fields so the plain-read path stays cheap.
     volatile_load_fence(modifiers);
-
-    if is_static {
-        if let Some(class_name) = ctx.class_name_of_id(class_id) {
-            ctx.ensure_class_initialized(&class_name)?;
-        }
-    }
 
     let raw_value = if is_static {
         ensure_static_field_declaring_class_initialized(ctx, class_id)?;

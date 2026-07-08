@@ -3623,6 +3623,10 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
         Ok(class_id)
     }
 
+    fn ensure_class_id_initialized(&mut self, class_id: ClassId) -> Result<(), MethodCallFailed> {
+        super::ensure_class_initialized_shared(self.shared, self.thread, class_id)
+    }
+
     fn ensure_synthetic_class(&mut self, name: &str, num_fields: usize) -> ClassId {
         // Prefer the real class if it can be loaded — `ensure_synthetic_class`
         // returns the existing id when the name is already registered, so a

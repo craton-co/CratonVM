@@ -1040,6 +1040,23 @@ pub trait NativeContext {
         name: &str,
     ) -> Result<ClassId, cratonvm_types::error::MethodCallFailed>;
 
+    /// Ensure an already-resolved class is initialized by exact `ClassId`.
+    ///
+    /// Name-based initialization is not enough for classes defined by
+    /// isolating user loaders: multiple classes can share the same binary
+    /// name, and resolving that name globally can select the wrong class or
+    /// fail as ambiguous. Real VM contexts override this with direct class-id
+    /// initialization; the default is sufficient for single-namespace mocks.
+    fn ensure_class_id_initialized(
+        &mut self,
+        class_id: ClassId,
+    ) -> Result<(), cratonvm_types::error::MethodCallFailed> {
+        if let Some(name) = self.class_name_of_id(class_id) {
+            self.ensure_class_initialized(&name)?;
+        }
+        Ok(())
+    }
+
     /// Register (or look up) a minimal synthetic class with the given name
     /// and instance-field count, returning its `ClassId`.
     ///

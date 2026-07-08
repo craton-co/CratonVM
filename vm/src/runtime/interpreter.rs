@@ -18920,6 +18920,74 @@ pub(crate) fn is_reflection_access_native_override(
             "java/lang/reflect/Field",
             "get",
             "(Ljava/lang/Object;)Ljava/lang/Object;"
+        ) | (
+            "java/lang/reflect/Field",
+            "set",
+            "(Ljava/lang/Object;Ljava/lang/Object;)V"
+        ) | (
+            "java/lang/reflect/Field",
+            "getInt",
+            "(Ljava/lang/Object;)I"
+        ) | (
+            "java/lang/reflect/Field",
+            "getLong",
+            "(Ljava/lang/Object;)J"
+        ) | (
+            "java/lang/reflect/Field",
+            "getFloat",
+            "(Ljava/lang/Object;)F"
+        ) | (
+            "java/lang/reflect/Field",
+            "getDouble",
+            "(Ljava/lang/Object;)D"
+        ) | (
+            "java/lang/reflect/Field",
+            "getBoolean",
+            "(Ljava/lang/Object;)Z"
+        ) | (
+            "java/lang/reflect/Field",
+            "getByte",
+            "(Ljava/lang/Object;)B"
+        ) | (
+            "java/lang/reflect/Field",
+            "getShort",
+            "(Ljava/lang/Object;)S"
+        ) | (
+            "java/lang/reflect/Field",
+            "getChar",
+            "(Ljava/lang/Object;)C"
+        ) | (
+            "java/lang/reflect/Field",
+            "setInt",
+            "(Ljava/lang/Object;I)V"
+        ) | (
+            "java/lang/reflect/Field",
+            "setLong",
+            "(Ljava/lang/Object;J)V"
+        ) | (
+            "java/lang/reflect/Field",
+            "setFloat",
+            "(Ljava/lang/Object;F)V"
+        ) | (
+            "java/lang/reflect/Field",
+            "setDouble",
+            "(Ljava/lang/Object;D)V"
+        ) | (
+            "java/lang/reflect/Field",
+            "setBoolean",
+            "(Ljava/lang/Object;Z)V"
+        ) | (
+            "java/lang/reflect/Field",
+            "setByte",
+            "(Ljava/lang/Object;B)V"
+        ) | (
+            "java/lang/reflect/Field",
+            "setShort",
+            "(Ljava/lang/Object;S)V"
+        ) | (
+            "java/lang/reflect/Field",
+            "setChar",
+            "(Ljava/lang/Object;C)V"
         ) | ("java/lang/reflect/Field", "setAccessible", "(Z)V")
             | (
                 "java/lang/reflect/AccessibleObject",
