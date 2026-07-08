@@ -32,13 +32,18 @@
        (e.g. commons-io 2.18.0 vs 2.21.0) — pulling in an unrelated module's
        full dependency set risks introducing a version conflict that was
        never there before.
-  So: use -Modules to name the SPECIFIC module(s) whose cratonvm-full-cp.txt
-  you actually want considered (e.g. the module that declares the dependency
-  your NoClassDefFoundError/NoSuchMethodError is missing), review the printed
-  diff, then re-run with -Apply once you're happy with it. Only module
+  So: use -Modules to name the SPECIFIC module(s) whose dependency classpath
+  should be considered (e.g. the module that declares the dependency your
+  NoClassDefFoundError/NoSuchMethodError is missing), review the printed diff,
+  then re-run with -Apply once you're happy with it. Only module
   target/classes and target/test-classes output DIRECTORIES (never jars) are
   auto-included unconditionally — those aren't versioned artifacts, so they
   carry none of the version-conflict/bloat risk jars do.
+
+  A small default module list is also considered even when -Modules is omitted.
+  It is reserved for universal-classpath service providers that the generator
+  itself adds via target/classes and that therefore need their dependency
+  closure available whenever ServiceLoader discovers them.
 
   A short list of runtime-only jars discovered by hand (needed transitively
   via reflection/ServiceLoader/codegen, without being a *declared* dependency
@@ -55,9 +60,16 @@
 
 .PARAMETER Modules
   One or more module directories (relative to KeycloakRoot, e.g.
-  "quarkus/config-api") whose cratonvm-full-cp.txt jar entries should be
-  considered for merging. Omit to consider only module output directories +
-  the hardcoded supplemental jar list (no full-repo jar scan).
+  "quarkus/config-api") whose Maven dependency classpath should be considered
+  for merging. Omit to consider only the default universal provider modules,
+  module output directories, and the hardcoded supplemental jar list.
+
+.PARAMETER WorkDir
+  Scratch/cache directory for Maven classpath files generated when a selected
+  module has no precomputed cratonvm-full-cp.txt.
+
+.PARAMETER RefreshModuleClasspaths
+  Rebuild generated Maven classpath cache files even when a cached file exists.
 
 .PARAMETER Full
   Consider EVERY module's cratonvm-full-cp.txt (not just -Modules). Prints a
@@ -84,8 +96,10 @@
 param(
   [string]$KeycloakRoot = (Join-Path (Split-Path -Parent (Split-Path -Parent $PSScriptRoot)) "apps/keycloak"),
   [string]$OutFile = "",
+  [string]$WorkDir = "",
   [string[]]$Modules = @(),
   [switch]$Full,
+  [switch]$RefreshModuleClasspaths,
   [switch]$Apply
 )
 
@@ -104,36 +118,330 @@ $KeycloakRoot = (Resolve-Path $KeycloakRoot).Path
 if ([string]::IsNullOrEmpty($OutFile)) {
   $OutFile = Join-Path $KeycloakRoot "kc-universal-cp.txt"
 }
+if ([string]::IsNullOrEmpty($WorkDir)) {
+  $WorkDir = Join-Path $PSScriptRoot ".suite"
+}
+$WorkDir = [System.IO.Path]::GetFullPath($WorkDir)
 
 function Normalize-Path([string]$p) {
   return $p.Trim().Replace('\', '/')
 }
 
-# ---- 1. Candidate jars from cratonvm-full-cp.txt dumps --------------------
-# Scope: -Full considers every module; otherwise only the named -Modules
-# (each matched by its cratonvm-full-cp.txt living directly under
-# KeycloakRoot/<module>). No jars are considered at all if neither is given.
+function Test-HasClassFile([string]$Directory) {
+  if (-not (Test-Path $Directory)) { return $false }
+  $classFile = Get-ChildItem -Path $Directory -Recurse -Filter "*.class" -File -ErrorAction SilentlyContinue |
+    Select-Object -First 1
+  return $null -ne $classFile
+}
+
+function Test-HasServiceDescriptor([string]$Directory) {
+  if (-not (Test-Path $Directory)) { return $false }
+  $serviceDir = Join-Path $Directory "META-INF\services"
+  if (-not (Test-Path $serviceDir -PathType Container)) { return $false }
+  $descriptor = Get-ChildItem -Path $serviceDir -File -ErrorAction SilentlyContinue |
+    Select-Object -First 1
+  return $null -ne $descriptor
+}
+
+function Test-StaleClassOutputEntry([string]$Entry) {
+  if (-not $Entry) { return $false }
+  $path = $Entry.Trim()
+  if ($path -notmatch '[\\/]target[\\/](test-)?classes[\\/]?$') { return $false }
+  if (-not (Test-Path $path -PathType Container)) { return $false }
+  return (Test-HasServiceDescriptor $path) -and -not (Test-HasClassFile $path)
+}
+
+function ConvertTo-SafeFileStem([string]$Value) {
+  $safe = ($Value -replace '[^A-Za-z0-9_.-]', '_')
+  $maxLength = 96
+  if ($safe.Length -le $maxLength) { return $safe }
+
+  $sha = [System.Security.Cryptography.SHA256]::Create()
+  try {
+    $bytes = [System.Text.Encoding]::UTF8.GetBytes($safe)
+    $hash = ([System.BitConverter]::ToString($sha.ComputeHash($bytes)) -replace '-', '').Substring(0, 12).ToLowerInvariant()
+  } finally {
+    $sha.Dispose()
+  }
+  $prefixLength = $maxLength - $hash.Length - 1
+  return "$($safe.Substring(0, $prefixLength))-$hash"
+}
+
+function Resolve-MavenExe {
+  $sh = Join-Path $KeycloakRoot 'mvnw'
+  $cmd = Join-Path $KeycloakRoot 'mvnw.cmd'
+  $candidates = if ([System.Environment]::OSVersion.Platform -eq [System.PlatformID]::Win32NT) {
+    @($cmd, $sh)
+  } else {
+    @($sh, $cmd)
+  }
+  foreach ($candidate in $candidates) {
+    if (Test-Path $candidate) { return [System.IO.Path]::GetFullPath($candidate) }
+  }
+  return 'mvn'
+}
+
+function Quote-WindowsArgument([string]$Argument) {
+  if ($null -eq $Argument) { return '""' }
+  if ($Argument.Length -eq 0) { return '""' }
+  if ($Argument -notmatch '[\s"]') { return $Argument }
+
+  $result = New-Object System.Text.StringBuilder
+  [void]$result.Append('"')
+  $backslashes = 0
+  foreach ($ch in $Argument.ToCharArray()) {
+    if ($ch -eq '\') {
+      $backslashes++
+    } elseif ($ch -eq '"') {
+      if ($backslashes -gt 0) { [void]$result.Append('\' * ($backslashes * 2)) }
+      $backslashes = 0
+      [void]$result.Append('\"')
+    } else {
+      if ($backslashes -gt 0) { [void]$result.Append('\' * $backslashes) }
+      $backslashes = 0
+      [void]$result.Append($ch)
+    }
+  }
+  if ($backslashes -gt 0) { [void]$result.Append('\' * ($backslashes * 2)) }
+  [void]$result.Append('"')
+  return $result.ToString()
+}
+
+function Set-ProcessArguments([System.Diagnostics.ProcessStartInfo]$StartInfo, [string[]]$Arguments) {
+  $argListProp = $StartInfo.GetType().GetProperty('ArgumentList')
+  if ($argListProp -and $null -ne $StartInfo.ArgumentList) {
+    foreach ($arg in $Arguments) { [void]$StartInfo.ArgumentList.Add($arg) }
+  } else {
+    $StartInfo.Arguments = (($Arguments | ForEach-Object { Quote-WindowsArgument $_ }) -join ' ')
+  }
+}
+
+function Invoke-ProcessChecked {
+  param(
+    [string]$FilePath,
+    [string[]]$Arguments,
+    [string]$WorkingDirectory,
+    [string]$Description
+  )
+
+  $psi = [System.Diagnostics.ProcessStartInfo]::new()
+  $psi.FileName = $FilePath
+  $psi.WorkingDirectory = $WorkingDirectory
+  $psi.UseShellExecute = $false
+  $psi.CreateNoWindow = $true
+  $psi.RedirectStandardOutput = $true
+  $psi.RedirectStandardError = $true
+  Set-ProcessArguments -StartInfo $psi -Arguments $Arguments
+
+  $proc = [System.Diagnostics.Process]::new()
+  $proc.StartInfo = $psi
+  [void]$proc.Start()
+  $stdoutTask = $proc.StandardOutput.ReadToEndAsync()
+  $stderrTask = $proc.StandardError.ReadToEndAsync()
+  $proc.WaitForExit()
+  try { $stdoutTask.Wait(5000) | Out-Null } catch {}
+  try { $stderrTask.Wait(5000) | Out-Null } catch {}
+  $stdout = ''
+  $stderr = ''
+  try { $stdout = $stdoutTask.Result } catch {}
+  try { $stderr = $stderrTask.Result } catch {}
+  $exitCode = $proc.ExitCode
+  $proc.Dispose()
+
+  if ($exitCode -ne 0) {
+    return [pscustomobject]@{
+      ok = $false
+      stdout = $stdout
+      stderr = $stderr
+      message = "$Description failed with exit $exitCode"
+    }
+  }
+  return [pscustomobject]@{ ok = $true; stdout = $stdout; stderr = $stderr; message = "" }
+}
+
+function Get-ModuleClasspathFile {
+  param(
+    [string]$Module,
+    [string]$IncludeScope = "test",
+    [string[]]$IncludeGroupIds = @(),
+    [string[]]$IncludeArtifactIds = @()
+  )
+
+  $moduleRoot = Join-Path $KeycloakRoot $Module
+  $precomputed = Join-Path $moduleRoot "cratonvm-full-cp.txt"
+  $hasFilters = $IncludeGroupIds.Count -gt 0 -or $IncludeArtifactIds.Count -gt 0 -or $IncludeScope -ne "test"
+  if ((-not $hasFilters) -and (Test-Path $precomputed) -and -not $RefreshModuleClasspaths) {
+    return (Get-Item $precomputed)
+  }
+
+  $pom = Join-Path $moduleRoot "pom.xml"
+  if (-not (Test-Path $pom)) {
+    Write-Warning "Module '$Module' has no pom.xml at $pom"
+    return $null
+  }
+
+  $cacheDir = Join-Path $WorkDir "classpaths"
+  New-Item -ItemType Directory -Force -Path $cacheDir | Out-Null
+  $scopeSuffix = $IncludeScope
+  if ($IncludeGroupIds.Count -gt 0) {
+    $scopeSuffix += "." + ($IncludeGroupIds -join "_")
+  }
+  if ($IncludeArtifactIds.Count -gt 0) {
+    $scopeSuffix += "." + ($IncludeArtifactIds -join "_")
+  }
+  $safe = ConvertTo-SafeFileStem "$Module.$scopeSuffix"
+  $generated = Join-Path $cacheDir "$safe.full.cp.txt"
+  if ((Test-Path $generated) -and -not $RefreshModuleClasspaths -and ((Get-Content -Path $generated -Raw -ErrorAction SilentlyContinue).Trim())) {
+    return (Get-Item $generated)
+  }
+
+  $mvn = Resolve-MavenExe
+  Write-Host "Building Maven classpath for module '$Module' into $generated"
+  $mavenArgs = @(
+    '-pl', $Module,
+    "-DincludeScope=$IncludeScope",
+    "-Dmdep.outputFile=$generated",
+    '-DskipTests',
+    'dependency:build-classpath'
+  )
+  if ($IncludeGroupIds.Count -gt 0) {
+    $mavenArgs = @($mavenArgs[0..2]) + @("-DincludeGroupIds=$($IncludeGroupIds -join ',')") + @($mavenArgs[3..($mavenArgs.Count - 1)])
+  }
+  if ($IncludeArtifactIds.Count -gt 0) {
+    $mavenArgs = @($mavenArgs[0..2]) + @("-DincludeArtifactIds=$($IncludeArtifactIds -join ',')") + @($mavenArgs[3..($mavenArgs.Count - 1)])
+  }
+  $result = Invoke-ProcessChecked -FilePath $mvn -WorkingDirectory $KeycloakRoot -Description "Maven dependency:build-classpath for $Module from root" -Arguments $mavenArgs
+  if (-not $result.ok) {
+    if (($result.stdout + $result.stderr) -notmatch 'Could not find the selected project in the reactor') {
+      Die "$($result.message)`n$($result.stdout)`n$($result.stderr)"
+    }
+    Write-Host "Module '$Module' is not selectable from root reactor; retrying from module directory."
+    $moduleArgs = @(
+      "-DincludeScope=$IncludeScope",
+      "-Dmdep.outputFile=$generated",
+      '-DskipTests',
+      'dependency:build-classpath'
+    )
+    if ($IncludeGroupIds.Count -gt 0) {
+      $moduleArgs = @($moduleArgs[0]) + @("-DincludeGroupIds=$($IncludeGroupIds -join ',')") + @($moduleArgs[1..($moduleArgs.Count - 1)])
+    }
+    if ($IncludeArtifactIds.Count -gt 0) {
+      $moduleArgs = @($moduleArgs[0]) + @("-DincludeArtifactIds=$($IncludeArtifactIds -join ',')") + @($moduleArgs[1..($moduleArgs.Count - 1)])
+    }
+    $result = Invoke-ProcessChecked -FilePath $mvn -WorkingDirectory $moduleRoot -Description "Maven dependency:build-classpath for $Module from module directory" -Arguments $moduleArgs
+    if (-not $result.ok) {
+      Die "$($result.message)`n$($result.stdout)`n$($result.stderr)"
+    }
+  }
+
+  if (-not (Test-Path $generated)) {
+    Die "Maven completed but did not write classpath file: $generated"
+  }
+  return (Get-Item $generated)
+}
+
+# ---- 1. Candidate jars from Maven classpath dumps -------------------------
+# Scope: -Full considers every precomputed module dump; otherwise only selected
+# modules are considered. Explicit -Modules keeps the broad test-scope behavior.
+# The default module set may use filters to avoid dragging the whole Keycloak
+# reactor into the universal classpath for one ServiceLoader provider.
 $candidateJars = New-Object System.Collections.Generic.List[string]
 $seenCandidateJars = New-Object 'System.Collections.Generic.HashSet[string]' ([System.StringComparer]::OrdinalIgnoreCase)
+
+$script:DefaultModuleDependencyClosures = @(
+  # Universal classpath includes db-edb/target/classes and its ServiceLoader
+  # provider. Loading that provider requires test-framework/test-containers and
+  # org.testcontainers:testcontainers-jdbc even for tests that do not request
+  # EnterpriseDB explicitly.
+  [pscustomobject]@{
+    Module = "test-framework/db-edb"
+    IncludeScope = "runtime"
+    IncludeGroupIds = @(
+      "org.testcontainers",
+      "com.github.docker-java",
+      "org.rnorth",
+      "org.apache.commons",
+      "org.jetbrains"
+    )
+    IncludeArtifactIds = @()
+  },
+  [pscustomobject]@{
+    Module = "test-framework/junit5-config"
+    IncludeScope = "runtime"
+    IncludeGroupIds = @("org.infinispan")
+    IncludeArtifactIds = @()
+  },
+  # Universal classpath includes ui/target/classes and its ServiceLoader
+  # provider. Loading that provider links Selenium WebDriver suppliers before a
+  # test class asks for a browser explicitly, so keep the default closure
+  # limited to Selenium and its direct driver/runtime support libraries.
+  [pscustomobject]@{
+    Module = "test-framework/ui"
+    IncludeScope = "runtime"
+    IncludeGroupIds = @(
+      "org.seleniumhq.selenium",
+      "org.htmlunit",
+      "io.opentelemetry",
+      "org.apache.commons",
+      "commons-logging",
+      "commons-codec",
+      "commons-exec",
+      "com.google.auto.service",
+      "org.jspecify"
+    )
+    IncludeArtifactIds = @()
+  },
+  [pscustomobject]@{
+    Module = "test-framework/core"
+    IncludeScope = "runtime"
+    IncludeGroupIds = @()
+    IncludeArtifactIds = @("quarkus-bootstrap-app-model", "quarkus-bootstrap-core", "quarkus-bootstrap-maven-resolver")
+  },
+  # quarkus-bootstrap-maven-resolver links Maven Resolver, Sisu, Plexus, and
+  # Maven model APIs when Keycloak resolves its Quarkus module path during
+  # server startup. Keep this separate from the exact Quarkus artifact filter:
+  # Maven dependency plugin group and artifact filters are intersected.
+  [pscustomobject]@{
+    Module = "test-framework/core"
+    IncludeScope = "runtime"
+    IncludeGroupIds = @(
+      "org.apache.maven",
+      "org.apache.maven.resolver",
+      "org.apache.maven.wagon",
+      "org.codehaus.plexus",
+      "org.eclipse.sisu",
+      "io.smallrye.beanbag",
+      "com.google.inject",
+      "aopalliance",
+      "javax.inject",
+      "commons-cli",
+      "commons-io",
+      "org.slf4j"
+    )
+    IncludeArtifactIds = @()
+  }
+)
 
 $cpFiles = @()
 if ($Full) {
   $cpFiles = Get-ChildItem -Path $KeycloakRoot -Recurse -Filter "cratonvm-full-cp.txt" -File -ErrorAction SilentlyContinue
   Write-Host "[-Full] scanning ALL $($cpFiles.Count) module classpath dumps under $KeycloakRoot"
 }
-elseif ($Modules.Count -gt 0) {
-  foreach ($m in $Modules) {
-    $f = Join-Path (Join-Path $KeycloakRoot $m) "cratonvm-full-cp.txt"
-    if (Test-Path $f) {
-      $cpFiles += Get-Item $f
-    }
-    else {
-      Write-Warning "No cratonvm-full-cp.txt found for module '$m' at $f (module not built yet?)"
-    }
-  }
-}
 else {
-  Write-Host "No -Modules and no -Full given: not scanning any module's jar dependencies (only output dirs + supplemental jars below)."
+  $moduleScopes = @()
+  if ($Modules.Count -gt 0) {
+    $moduleScopes = @($Modules | ForEach-Object {
+      [pscustomobject]@{ Module = $_; IncludeScope = "test"; IncludeGroupIds = @(); IncludeArtifactIds = @() }
+    })
+  } else {
+    $moduleScopes = @($script:DefaultModuleDependencyClosures)
+    Write-Host "Using default universal dependency module(s): $((@($moduleScopes) | ForEach-Object { $_.Module }) -join ', ')"
+  }
+
+  foreach ($scope in $moduleScopes) {
+    $f = Get-ModuleClasspathFile -Module $scope.Module -IncludeScope $scope.IncludeScope -IncludeGroupIds @($scope.IncludeGroupIds) -IncludeArtifactIds @($scope.IncludeArtifactIds)
+    if ($f) { $cpFiles += $f }
+  }
 }
 
 foreach ($f in $cpFiles) {
@@ -159,7 +467,7 @@ foreach ($pom in $poms) {
   $moduleDir = $pom.DirectoryName
   foreach ($sub in @("target/classes", "target/test-classes")) {
     $candidate = Join-Path $moduleDir $sub
-    if (Test-Path $candidate) {
+    if ((Test-Path $candidate) -and -not (Test-StaleClassOutputEntry $candidate)) {
       $norm = Normalize-Path $candidate
       if ($seenDirs.Add($norm)) {
         $dirEntries.Add($norm) | Out-Null
@@ -198,11 +506,16 @@ foreach ($j in $script:SupplementalRuntimeJars) {
 # ---- 4. Read existing OutFile, compute the diff ---------------------------
 $existing = New-Object System.Collections.Generic.List[string]
 $seenExisting = New-Object 'System.Collections.Generic.HashSet[string]' ([System.StringComparer]::OrdinalIgnoreCase)
+$removedExisting = New-Object System.Collections.Generic.List[string]
 if (Test-Path $OutFile) {
   $raw = (Get-Content -Path $OutFile -Raw)
   if (-not [string]::IsNullOrWhiteSpace($raw)) {
     foreach ($part in ($raw -split '[;\r\n]+' | Where-Object { $_.Trim().Length -gt 0 })) {
       $norm = Normalize-Path $part
+      if (Test-StaleClassOutputEntry $norm) {
+        $removedExisting.Add($norm) | Out-Null
+        continue
+      }
       if ($seenExisting.Add($norm)) { $existing.Add($norm) | Out-Null }
     }
   }
@@ -221,17 +534,24 @@ foreach ($j in $candidateJars) {
   if (-not $seenExisting.Contains($j)) { $toAdd.Add($j) | Out-Null }
 }
 
-if ($toAdd.Count -eq 0) {
+if ($toAdd.Count -eq 0 -and $removedExisting.Count -eq 0) {
   Write-Host "No new classpath entries found; $OutFile already covers everything in scope ($($existing.Count) existing entries)."
   exit 0
 }
 
-Write-Host "Found $($toAdd.Count) candidate entries not currently in $OutFile ($($existing.Count) existing entries):"
-foreach ($a in $toAdd) { Write-Host "  + $a" }
+if ($removedExisting.Count -gt 0) {
+  Write-Host "Found $($removedExisting.Count) stale existing class output entries to remove from ${OutFile}:"
+  foreach ($r in $removedExisting) { Write-Host "  - $r" }
+}
+
+if ($toAdd.Count -gt 0) {
+  Write-Host "Found $($toAdd.Count) candidate entries not currently in $OutFile ($($existing.Count) existing entries after pruning):"
+  foreach ($a in $toAdd) { Write-Host "  + $a" }
+}
 
 if (-not $Apply) {
   Write-Host ""
-  Write-Host "Dry run only (no changes written). Re-run with -Apply to write these $($toAdd.Count) entries to $OutFile."
+  Write-Host "Dry run only (no changes written). Re-run with -Apply to apply these classpath changes to $OutFile."
   exit 0
 }
 

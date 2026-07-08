@@ -3691,7 +3691,8 @@ pub(crate) fn register_phase56_summary_stats(r: &mut NativeMethodRegistry) {
 // ---------------------------------------------------------------------------
 // Collectors expansion: maxBy, minBy, mapping, filtering, flatMapping,
 // summarizingInt/Long/Double, toUnmodifiableList/Set/Map, collectingAndThen
-// Collector tags (extending existing):
+// Collector tags. Values 1/2 intentionally match native-collections' core
+// collector engine, which owns Stream.collect(Collector) and Collector.supplier().
 //   9 = MAX_BY (comparator in ARG1)
 //  10 = MIN_BY (comparator in ARG1)
 //  11 = MAPPING (Function in ARG1, downstream Collector in ARG2)
@@ -3699,8 +3700,7 @@ pub(crate) fn register_phase56_summary_stats(r: &mut NativeMethodRegistry) {
 //  13 = SUMMARIZING_INT (ToIntFunction in ARG1)
 //  14 = SUMMARIZING_LONG (ToLongFunction in ARG1)
 //  15 = SUMMARIZING_DOUBLE (ToDoubleFunction in ARG1)
-//  16 = TO_UNMODIFIABLE_LIST
-//  17 = TO_UNMODIFIABLE_SET
+//   1 = TO_UNMODIFIABLE_LIST, 2 = TO_UNMODIFIABLE_SET
 //  18 = COLLECTING_AND_THEN (downstream Collector in ARG1, Function finisher in ARG2)
 // ---------------------------------------------------------------------------
 const P56_COLLECTOR_MAX_BY: i32 = 9;
@@ -3710,8 +3710,8 @@ const P56_COLLECTOR_FILTERING: i32 = 12;
 const P56_COLLECTOR_SUMMARIZING_INT: i32 = 13;
 const P56_COLLECTOR_SUMMARIZING_LONG: i32 = 14;
 const P56_COLLECTOR_SUMMARIZING_DOUBLE: i32 = 15;
-const P56_COLLECTOR_TO_UNMODIFIABLE_LIST: i32 = 16;
-const P56_COLLECTOR_TO_UNMODIFIABLE_SET: i32 = 17;
+const P56_COLLECTOR_TO_UNMODIFIABLE_LIST: i32 = 1;
+const P56_COLLECTOR_TO_UNMODIFIABLE_SET: i32 = 2;
 const P56_COLLECTOR_COLLECTING_AND_THEN: i32 = 18;
 
 pub(crate) fn register_phase56_collectors_extras(r: &mut NativeMethodRegistry) {
@@ -3881,7 +3881,7 @@ pub(crate) fn register_phase56_collectors_extras(r: &mut NativeMethodRegistry) {
         "toUnmodifiableList",
         "()Ljava/util/stream/Collector;",
         |ctx, _args| {
-            let c = alloc_concurrent_synthetic(ctx, "java/util/stream/Collector", 3);
+            let c = alloc_concurrent_synthetic(ctx, "java/util/stream/Collector", 4);
             ctx.set_field(c, 0, Value::Int(P56_COLLECTOR_TO_UNMODIFIABLE_LIST));
             Ok(Some(Value::Object(Some(c))))
         },
@@ -3893,7 +3893,7 @@ pub(crate) fn register_phase56_collectors_extras(r: &mut NativeMethodRegistry) {
         "toUnmodifiableSet",
         "()Ljava/util/stream/Collector;",
         |ctx, _args| {
-            let c = alloc_concurrent_synthetic(ctx, "java/util/stream/Collector", 3);
+            let c = alloc_concurrent_synthetic(ctx, "java/util/stream/Collector", 4);
             ctx.set_field(c, 0, Value::Int(P56_COLLECTOR_TO_UNMODIFIABLE_SET));
             Ok(Some(Value::Object(Some(c))))
         },
@@ -39592,6 +39592,32 @@ const NEW13_SOCK_TLSID: usize = 2;
 const NEW13_SOCK_CLOSED: usize = 3;
 const NEW13_SOCK_SESSION: usize = 4;
 
+/// FIX (netty-client-socket-write-after-close): resolve a `javax/net/ssl/
+/// SSLSocket` object's `s2_registry` stream id whether it was built by
+/// `new13_do_create_socket` below (raw field `NEW13_SOCK_TLSID`) or by
+/// `net_phase_e`'s OWN `SSLSocketFactory.createSocket(String,int)` — that
+/// exact (class,name,descriptor) is registered in BOTH modules, and
+/// `net_phase_e::register_phase_e_networking` runs after `register_p68_ssl`
+/// (see lib.rs's `register_essential_natives`), so its side-table-based
+/// implementation wins and never populates this raw field, leaving it at
+/// its allocation default. The stream/lifecycle natives below are
+/// registered on the concrete `SSLSocket` class though (a more specific
+/// match than `net_phase_e`'s registrations on the `java/net/Socket`
+/// superclass), so they run regardless of which factory built the object —
+/// falling back to `net_phase_e`'s side table here is what makes
+/// `getOutputStream`/`write` work on a socket obtained via the plain
+/// 2-arg `createSocket(host, port)` (the overload Apache HttpClient5's
+/// classic connection pool actually calls, per
+/// docs/known-issues/netty-client-socket-write-after-close-nsme.md).
+fn new13_resolve_tls_id(ctx: &dyn NativeContext, this: ObjectRef) -> i32 {
+    if let Some(id) = ctx.get_field(this, NEW13_SOCK_TLSID).as_int() {
+        if id >= 0 {
+            return id;
+        }
+    }
+    crate::net_phase_e::sock_stream_id_for_upcall(this)
+}
+
 // SSLSession field layout: 3 fields.
 //   0 = protocol String
 //   1 = cipher String
@@ -39810,10 +39836,26 @@ fn new13_do_create_socket(
 ) -> MethodCallResult {
     let connector = new13_build_connector(extra_root_ders, java_tm_key.is_some())
         .map_err(|msg| RuntimeError::IOException { message: msg })?;
-    let tls_id = crate::servlet::s2_tls_connect(&connector, host, port).map_err(|e| {
-        RuntimeError::IOException {
-            message: e.to_string(),
-        }
+    // FIX (netty-client-socket-write-after-close): this is a real, blocking
+    // TCP connect + full TLS handshake (same shape as net_phase_e.rs's own
+    // client createSocket, which already announces this — see its "T19.H1"
+    // comment). Without announcing it, a concurrent stop-the-world GC has no
+    // way to know this thread is safely parked in native code rather than
+    // stuck mid-bytecode, and (per that comment) can mishandle this thread's
+    // pending return value across the pause — observed as the freshly built
+    // socket's own fields reading back as their zero/None default the
+    // moment Java calls a method on it afterward (`getOutputStream`/
+    // `getInputStream` seeing the just-set NEW13_SOCK_TLSID field as
+    // `Object(None)` instead of the `Int` written a few lines below), a
+    // symptom whose true trigger (a concurrent GC racing this unmarked
+    // blocking call) is not IO-timing-reproducible on demand, but a bigger
+    // heap alone does not suppress it either since young-gen collections
+    // still fire from ordinary allocation churn on OTHER threads.
+    ctx.begin_blocking_region();
+    let connect_result = crate::servlet::s2_tls_connect(&connector, host, port);
+    ctx.end_blocking_region();
+    let tls_id = connect_result.map_err(|e| RuntimeError::IOException {
+        message: e.to_string(),
     })?;
 
     // FIX (netty-https-client-trust): native verification was disabled above
@@ -39842,10 +39884,33 @@ fn new13_do_create_socket(
     let host_obj = ctx.create_string(host);
     ctx.set_field(sock, NEW13_SOCK_HOST, Value::Object(Some(host_obj)));
     ctx.set_field(sock, NEW13_SOCK_PORT, Value::Int(port as i32));
+    // FIX (netty-client-socket-write-after-close): do NOT rely on the raw
+    // NEW13_SOCK_TLSID/NEW13_SOCK_CLOSED field writes below being visible —
+    // `alloc_concurrent_synthetic` sizes this object using the REAL loaded
+    // `javax/net/ssl/SSLSocket` class's own field layout, and its actual
+    // field #2 is reference-typed; the GC/field-layout guard silently drops
+    // our mismatched-type Int write (confirmed via an immediate same-call
+    // readback: a debug trace showed `Object(None)` moments after setting
+    // Int(tls_id), with no Java code and no GC in between). Record the
+    // authoritative state in net_phase_e's side table instead — the same
+    // mechanism its own createSocket(String,int) uses for the identical
+    // class — so new13_resolve_tls_id's fallback (used by getInputStream/
+    // getOutputStream/close/isClosed/isConnected below) finds it. The raw
+    // writes are kept too: harmless if dropped, and a free win if some
+    // future JDK's field layout happens not to collide.
+    crate::net_phase_e::sock_set_for_create(sock, port as i32, tls_id);
     ctx.set_field(sock, NEW13_SOCK_TLSID, Value::Int(tls_id));
     ctx.set_field(sock, NEW13_SOCK_CLOSED, Value::Int(0));
     let session = new13_alloc_ssl_session(ctx, tls_id);
     ctx.set_field(sock, NEW13_SOCK_SESSION, Value::Object(Some(session)));
+    if std::env::var_os("CRATONVM_DBG_TLS_SOCK").is_some() {
+        eprintln!(
+            "[dbg-tls-sock] thread={:?} new13_do_create_socket built sock={:?} tls_id={}",
+            std::thread::current().id(),
+            sock,
+            tls_id
+        );
+    }
     Ok(Some(Value::Object(Some(sock))))
 }
 
@@ -40211,7 +40276,16 @@ pub(crate) fn register_p68_ssl(r: &mut NativeMethodRegistry) {
         "()Ljavax/net/ssl/SSLSession;",
         |ctx, args| {
             let this = obj_arg(args, 0)?;
-            Ok(Some(ctx.get_field(this, 4)))
+            let session = ctx.get_field(this, 4);
+            if std::env::var_os("CRATONVM_DBG_TLS_SOCK").is_some() {
+                eprintln!(
+                    "[dbg-tls-sock] thread={:?} getSession sock={:?} -> {:?}",
+                    std::thread::current().id(),
+                    this,
+                    session
+                );
+            }
+            Ok(Some(session))
         },
     );
     r.register(ssl_sock, "startHandshake", "()V", |_ctx, _args| {
@@ -40325,10 +40399,18 @@ pub(crate) fn register_p68_ssl(r: &mut NativeMethodRegistry) {
         "()Ljava/io/InputStream;",
         |ctx, args| {
             let this = obj_arg(args, 0)?;
-            let fd_id = ctx.get_field(this, 2);
+            let fd_id = new13_resolve_tls_id(ctx, this);
+            if std::env::var_os("CRATONVM_DBG_TLS_SOCK").is_some() {
+                eprintln!(
+                    "[dbg-tls-sock] thread={:?} getInputStream sock={:?} tls_id={}",
+                    std::thread::current().id(),
+                    this,
+                    fd_id
+                );
+            }
             // Return an InputStream that reads from the TLS fd
             let is = alloc_concurrent_synthetic(ctx, "javax/net/ssl/SSLSocketInputStream", 1);
-            ctx.set_field(is, 0, fd_id); // fd_id
+            ctx.set_field(is, 0, Value::Int(fd_id));
             Ok(Some(Value::Object(Some(is))))
         },
     );
@@ -40338,15 +40420,30 @@ pub(crate) fn register_p68_ssl(r: &mut NativeMethodRegistry) {
         "()Ljava/io/OutputStream;",
         |ctx, args| {
             let this = obj_arg(args, 0)?;
-            let fd_id = ctx.get_field(this, 2);
+            let fd_id = new13_resolve_tls_id(ctx, this);
+            if std::env::var_os("CRATONVM_DBG_TLS_SOCK").is_some() {
+                eprintln!(
+                    "[dbg-tls-sock] thread={:?} getOutputStream sock={:?} tls_id={}",
+                    std::thread::current().id(),
+                    this,
+                    fd_id
+                );
+            }
             let os = alloc_concurrent_synthetic(ctx, "javax/net/ssl/SSLSocketOutputStream", 1);
-            ctx.set_field(os, 0, fd_id);
+            ctx.set_field(os, 0, Value::Int(fd_id));
             Ok(Some(Value::Object(Some(os))))
         },
     );
     r.register(ssl_sock, "close", "()V", |ctx, args| {
         let this = obj_arg(args, 0)?;
-        let tls_id = ctx.get_field(this, NEW13_SOCK_TLSID).as_int().unwrap_or(-1);
+        let tls_id = new13_resolve_tls_id(ctx, this);
+        if std::env::var_os("CRATONVM_DBG_TLS_SOCK").is_some() {
+            eprintln!(
+                "[dbg-tls-sock] thread={:?} JAVA_CALLED Socket.close() tls_id={}",
+                std::thread::current().id(),
+                tls_id
+            );
+        }
         if tls_id >= 0 {
             // Idempotent — s2_tls_close tolerates an unknown id. The TCP
             // half-close inside shutdown() also flushes any pending TLS
@@ -40361,17 +40458,44 @@ pub(crate) fn register_p68_ssl(r: &mut NativeMethodRegistry) {
                 }
             }
         }
+        // Keep net_phase_e's side table (if this socket was built through
+        // its createSocket(String,int) — see new13_resolve_tls_id) in sync,
+        // so any other code path that consults it also observes closed.
+        crate::net_phase_e::sock_mark_closed_for_upcall(this);
         ctx.set_field(this, NEW13_SOCK_CLOSED, Value::Int(1));
         Ok(None)
     });
     r.register(ssl_sock, "isClosed", "()Z", |ctx, args| {
         let this = obj_arg(args, 0)?;
-        Ok(Some(ctx.get_field(this, 3)))
+        let closed = match ctx.get_field(this, NEW13_SOCK_CLOSED) {
+            Value::Int(c) => c != 0,
+            _ => crate::net_phase_e::sock_is_closed_for_upcall(this),
+        };
+        if std::env::var_os("CRATONVM_DBG_TLS_SOCK").is_some() {
+            eprintln!(
+                "[dbg-tls-sock] thread={:?} isClosed sock={:?} -> {}",
+                std::thread::current().id(),
+                this,
+                closed
+            );
+        }
+        Ok(Some(Value::Int(if closed { 1 } else { 0 })))
     });
     r.register(ssl_sock, "isConnected", "()Z", |ctx, args| {
         let this = obj_arg(args, 0)?;
-        let closed = ctx.get_field(this, 3).as_int().unwrap_or(0);
-        Ok(Some(Value::Int(if closed == 0 { 1 } else { 0 })))
+        let closed = match ctx.get_field(this, NEW13_SOCK_CLOSED) {
+            Value::Int(c) => c != 0,
+            _ => crate::net_phase_e::sock_is_closed_for_upcall(this),
+        };
+        if std::env::var_os("CRATONVM_DBG_TLS_SOCK").is_some() {
+            eprintln!(
+                "[dbg-tls-sock] thread={:?} isConnected sock={:?} -> {}",
+                std::thread::current().id(),
+                this,
+                !closed
+            );
+        }
+        Ok(Some(Value::Int(if closed { 0 } else { 1 })))
     });
     r.register(ssl_sock, "getPort", "()I", |ctx, args| {
         let this = obj_arg(args, 0)?;
@@ -40456,6 +40580,13 @@ pub(crate) fn register_p68_ssl(r: &mut NativeMethodRegistry) {
     r.register(ssl_os, "write", "(I)V", |ctx, args| {
         let this = obj_arg(args, 0)?;
         let tls_id = ctx.get_field(this, 0).as_int().unwrap_or(-1);
+        if std::env::var_os("CRATONVM_DBG_TLS_SOCK").is_some() {
+            eprintln!(
+                "[dbg-tls-sock] thread={:?} SSLSocketOutputStream.write(int) tls_id={}",
+                std::thread::current().id(),
+                tls_id
+            );
+        }
         if tls_id < 0 {
             return Err(RuntimeError::IOException {
                 message: "SSLSocketOutputStream.write: stream is closed".into(),
@@ -40471,6 +40602,15 @@ pub(crate) fn register_p68_ssl(r: &mut NativeMethodRegistry) {
     r.register(ssl_os, "write", "([BII)V", |ctx, args| {
         let this = obj_arg(args, 0)?;
         let tls_id = ctx.get_field(this, 0).as_int().unwrap_or(-1);
+        let len_arg = args.get(3).and_then(|v| v.as_int()).unwrap_or(-1);
+        if std::env::var_os("CRATONVM_DBG_TLS_SOCK").is_some() {
+            eprintln!(
+                "[dbg-tls-sock] thread={:?} SSLSocketOutputStream.write([BII) tls_id={} len={}",
+                std::thread::current().id(),
+                tls_id,
+                len_arg
+            );
+        }
         if tls_id < 0 {
             return Err(RuntimeError::IOException {
                 message: "SSLSocketOutputStream.write: stream is closed".into(),
@@ -40664,6 +40804,64 @@ pub(crate) fn register_p68_ssl(r: &mut NativeMethodRegistry) {
                 ctx.set_array_element(arr, i, Value::Object(Some(cert)));
             }
             Ok(Some(Value::Object(Some(arr))))
+        },
+    );
+    // FIX (netty-client-socket-write-after-close residual): getLocalPrincipal/
+    // getPeerPrincipal/getLocalCertificates were never registered anywhere in
+    // the crate at all — `javax.net.ssl.SSLSession` is a real JDK interface,
+    // so a synthetic object impersonating it has no bytecode to fall back to
+    // for an unregistered method, and calling one throws AbstractMethodError
+    // (observed via Spring's own session-info-building code:
+    // `getLocalPrincipal()Ljava/security/Principal; has no Code attribute`).
+    r.register(
+        ssl_session,
+        "getLocalPrincipal",
+        "()Ljava/security/Principal;",
+        |_ctx, _args| {
+            // This client session never presents a certificate (no mTLS in
+            // this path) — null is the documented return for "no principal
+            // was sent", not an exception.
+            Ok(Some(Value::Object(None)))
+        },
+    );
+    r.register(
+        ssl_session,
+        "getLocalCertificates",
+        "()[Ljava/security/cert/Certificate;",
+        |_ctx, _args| {
+            // Same rationale as getLocalPrincipal: null is the documented
+            // return when no local certificate chain was used.
+            Ok(Some(Value::Object(None)))
+        },
+    );
+    r.register(
+        ssl_session,
+        "getPeerPrincipal",
+        "()Ljava/security/Principal;",
+        |ctx, args| {
+            let this = obj_arg(args, 0)?;
+            let tls_id = if ctx.object_num_fields(this) > NEW13_SESS_TLSID {
+                ctx.get_field(this, NEW13_SESS_TLSID).as_int().unwrap_or(-1)
+            } else {
+                -1
+            };
+            let chain = if tls_id >= 0 {
+                crate::servlet::s2_tls_peer_cert_chain_der(tls_id).unwrap_or_default()
+            } else {
+                Vec::new()
+            };
+            let Some(leaf) = chain.first() else {
+                return Err(RuntimeError::IllegalStateException {
+                    message: "peer not authenticated (no certificate in session)".into(),
+                }
+                .into());
+            };
+            let (subject, _issuer) =
+                basic_der_extract_names(leaf).unwrap_or_else(|| ("CN=Unknown".into(), String::new()));
+            let princ = alloc_concurrent_synthetic(ctx, "javax/security/auth/x500/X500Principal", 1);
+            let s = ctx.create_string(&subject);
+            ctx.set_field(princ, 0, Value::Object(Some(s)));
+            Ok(Some(Value::Object(Some(princ))))
         },
     );
     r.register(ssl_session, "getCreationTime", "()J", |_ctx, _args| {

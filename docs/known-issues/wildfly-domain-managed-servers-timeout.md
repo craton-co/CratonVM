@@ -1,6 +1,6 @@
 # WildFly domain managed servers do not reach started state
 
-Status: OPEN (2026-07-07: the real Arquillian test now RUNS end-to-end under CratonVM nested processes — see the 2026-07-07 update at the bottom. Two distinct residuals isolated: no-JIT boots both servers to WFLYSRV0025 started but awaitServers never sees them (management-model propagation gap); JIT-on fails HC interface resolution WFLYSRV0082 (a JIT miscompile). Both new, both OPEN.)
+Status: OPEN (2026-07-08: stock-config empty-ServiceName collapse, loopback-interface criterion failure, and Undertow HttpString parser-clinit blocker are fixed/reduced. Remaining open residuals: no-JIT Arquillian awaitServers propagation gap; JIT-on literal-address WFLYSRV0082; stock domain now fails later with moduleLoader null in management HTTP service.)
 Date found: 2026-07-05
 Area: WildFly domain mode startup under CratonVM
 
@@ -581,3 +581,139 @@ defects are now known across this doc pair:
 Both docs remain OPEN. No fix landed this session; this is a documentation
 and scoping pass only, to prevent a future session from re-treading the
 same ground or conflating these three distinct failure modes.
+
+## 2026-07-08 update — logging follow-up residual fixed; XNIO native blocking hardened; broader STW stall remains OPEN
+
+Branch `codex/fix-wildfly-stw-park-20260708-165032` on the Azure probe host, using a separate worktree from `dev` and uniquely named binaries:
+
+```text
+/data/data/cratonvm-builtins/cratonvm-wildfly-residuals-20260708-171950
+/data/data/cratonvm-builtins/java-wildfly-residuals-20260708-171950
+/data/data/fakejdk-wildfly-residuals-20260708-171950/bin/java
+```
+
+Two concrete fixes landed in this pass:
+
+1. **`String.getCanonicalName()` residual fixed.** The immediate post-LogManager WildFly boot failure was not a missing JDK API. `ContextNames$BindInfo.getBinderServiceName()` was returning a synthetic field populated with a `String`, while real WildFly expects `org.jboss.msc.service.ServiceName`. The naming bridge now allocates the real four-field `BindInfo` shape and stores `ServiceName` mirrors for both parent and binder service names. See the fixed note in `docs/internal/fixed-suite-bugs/wildfly-bindinfo-binder-servicename.md`.
+2. **XNIO registered native selector threads now publish GC-blocked state.** A new `NativeThreadBlocker` hook lets native-spawned carrier threads publish their OS tid and bracket host-native waits. `xnio_io_thread::run_io_loop_with_blocker` wraps `selector.select(timeout)` so XNIO `epoll`/selector waits are excluded from STW expected-count accounting and visible as blocked in the thread registry.
+
+Validation performed:
+
+```text
+cargo test -p cratonvm-native-builtins t19_2_b_context_names_bind_info_parses_absolute_name -- --nocapture
+cargo test -p cratonvm-native-builtins t19_2_b_service_based_naming_store_registers_msc_service -- --nocapture
+cargo check -p cratonvm-native-api -p cratonvm-native-builtins -p cratonvm-vm
+cargo build --release -p cratonvm-cli --features java-bin-alias --bin cratonvm --bin java
+```
+
+The direct WildFly `standalone.sh` probe with the rebuilt fake JDK confirms the `String.getCanonicalName` error is gone and boot progresses further. New visible failures before the remaining STW stall are:
+
+```text
+WFLYCTL0158: Operation handler failed: java.lang.NullPointerException: Cannot invoke "org.jboss.modules.ModuleLoader.loadModule(org.jboss.modules.ModuleIdentifier)"
+WFLYCTL0158: Operation handler failed: java.lang.NullPointerException: Method parameter cannot be null
+```
+
+The STW residual is **not fixed**. The rebuilt JIT-on standalone probe still times out with:
+
+```text
+[stw-census] rounds=64 pending=1 taken=0 blocked=67 alive=76
+```
+
+The pending thread in that run was a non-blocked `ParallelBootOperationStepHandler$ParallelBootTransactionControl.operationPrepared` worker (`t53`), while a follow-up probe with `CRATONVM_JIT_BISECT_SKIP='org/jboss/threads/EnhancedQueueExecutor$ThreadBody.run'` made idle `ThreadBody.run@442` workers consistently blocked but still wedged later with a non-blocked `operationPrepared` worker (`t38`). That rules out a single `EnhancedQueueExecutor$ThreadBody.run` JIT skip as a complete fix. The next pass should focus on the Java/AQS/Future wait path used by `operationPrepared` and the two new functional boot NPEs above.
+
+Status remains OPEN: the fixed `BindInfo` bug is closed under `docs/internal`; this doc continues to track the broader WildFly domain/standalone boot residuals.
+## 2026-07-08 update - stock-config ServiceName, loopback, and Undertow parser blockers fixed
+
+Branch `codex/wildfly-residuals-20260708-164820` targeted the concrete stock-config
+`bin/domain.sh` residual from the eighth-session update where the management-interface
+failure was keyed by an empty MSC service name (`service  is missing []`). Three separate
+CratonVM gaps were found behind that symptom:
+
+1. **JBoss MSC `ServiceName` mirrors were incomplete - FIXED.** The native surface covered
+   `ServiceName.of(String...)` but missed the real overloads
+   `ServiceName.of(ServiceName,String...)`, `append(String...)`, and `append(ServiceName)`
+   while also registering a non-real `append(String)` descriptor. Native-created mirrors
+   also left the real `parent` field null and cached a canonical-string hash instead of
+   JBoss MSC's segment hash. Real WildFly bytecode reads `name`, `parent`, and `hashCode`
+   directly when composing/looking up services, so mixed native/bytecode composition could
+   collapse or compare incorrectly. The fix populates the parent chain recursively, uses the
+   Java/JBoss segment hash, registers the real overloads, and makes `getCanonicalName` /
+   `getParent` robust for real `ServiceName.JBOSS` objects with lazy canonical fields.
+
+2. **`NetworkInterface.isLoopback0("lo", 1)` always returned false - FIXED.** A focused
+   HotSpot/CratonVM probe using the stock expression model
+   `${jboss.bind.address.management:127.0.0.1}` showed both VMs parse the criterion as
+   `LoopbackAddressInterfaceCriteria(address=127.0.0.3)`, but CratonVM returned
+   `acceptableSize=0` because its low-level `java.net.NetworkInterface.isLoopback0`
+   native answered false for the synthetic loopback interface. HotSpot accepts `lo` and
+   returns `/127.0.0.3`. The fix reports loopback for `name == "lo"` or index `1`.
+
+3. **Undertow parser constants were native-nooped - FIXED.** `HttpRequestParser` reflects
+   over `Headers`, `Methods`, and `Protocols` and calls `HttpString.toString()` on each
+   static `HttpString`. CratonVM's Undertow shim no-oped `Headers.<clinit>`, leaving those
+   reflected values null. The fix lets real `Headers.<clinit>` populate the constants and
+   teaches `HttpString.toString()` to handle both CratonVM's old synthetic one-slot layout
+   and Undertow's real `bytes`/`string` layout.
+
+Validation before the loopback fix showed the ServiceName change removed the previous empty
+name failure: the stock no-JIT `domain.sh` repro with
+`java-wildfly-residuals-20260708-164820-svcname` no longer printed
+`service  is missing []`; the remaining failure was keyed by the real service name
+`jboss.network.management`. The interface-criteria probe then isolated and fixed the
+next layer.
+
+A rebuild with `java-wildfly-residuals-20260708-164820-svcname-netif` confirmed
+`NetworkInterfaceService matched interface binding` and no longer reported
+`WFLYSRV0082`. That exposed a later Undertow parser blocker:
+`HttpRequestParser$$generated.<clinit>` failed because `Headers.<clinit>` had been
+native-nooped, leaving reflected static `HttpString` constants null. The fix lets real
+`Headers.<clinit>` run and makes `HttpString.toString()` understand both CratonVM's old
+synthetic one-slot layout and Undertow's real `bytes`/`string` layout. A focused
+`HttpRequestParser.httpStrings()` probe now matches HotSpot (`size=144`, including
+`Host`, `GET`, and `HTTP/1.1`).
+
+A final stock no-JIT `domain.sh` rerun with
+`java-wildfly-residuals-20260708-164820-svcname-netif-undertow` advanced past both fixed
+layers. Current stock-domain boundary is now:
+
+```text
+NetworkInterfaceService matched interface binding
+WFLYSRV0083: Failed to start the http-interface service
+Caused by: java.lang.NullPointerException: Cannot invoke "org.jboss.modules.ModuleLoader.loadModule(org.jboss.modules.ModuleIdentifier)" because "moduleLoader" is null
+```
+
+This document remains OPEN until the Arquillian no-JIT `awaitServers` propagation gap,
+the JIT-on literal-address WFLYSRV0082, and this newly exposed stock management-HTTP
+module-loader wiring failure are closed.
+
+## 2026-07-08 update -- ModuleLoader/capability ServiceName null residuals fixed; STW stall remains OPEN
+
+Branch `codex/fix-wildfly-null-residuals-20260708-175605` on the Azure probe host, using a separate worktree from `dev` and uniquely named binaries:
+
+```text
+/data/data/cratonvm-builtins/cratonvm-wildfly-20260708-175605-nullres
+/data/data/cratonvm-builtins/java-wildfly-20260708-175605-nullres
+/data/data/fakejdk-wildfly-20260708-175605-nullres/bin/java
+```
+
+Two functional residuals from the previous 2026-07-08 pass are now fixed:
+
+1. **Datasource `ModuleLoader.loadModule(ModuleIdentifier)` null receiver -- FIXED.** `JdbcDriverAdd.performRuntime` calls `Module.getCallerModuleLoader().loadModule(identifier)`. CratonVM already handled the `loadModule(...)` side, but did not provide `Module.getCallerModuleLoader()` / `Module.getBootModuleLoader()`. The module bridge now returns the existing boot `LocalModuleLoader` for both methods.
+2. **Infinispan `ServiceBuilderImpl.requires(null)` / "Method parameter cannot be null" -- FIXED.** `XAResourceRecoveryServiceConfigurator.configure()` obtains `org.wildfly.transactions.xa-resource-recovery-registry` via `OperationContext.getCapabilityServiceName(name, type)`. WildFly's real `OperationContextImpl` falls back to parsing the capability name as an MSC `ServiceName` when registry lookup is unavailable; under CratonVM the under-modeled registry path could return null instead. The WildFly core bridge now mirrors that fallback for the `getCapabilityServiceName(...)` overloads and appends dynamic parts where applicable.
+
+Focused validation:
+
+```text
+cargo test -p cratonvm-native-builtins t19_h4_get_caller_module_loader_returns_boot_loader -- --nocapture
+cargo test -p cratonvm-native-builtins t19_2_a_operation_context_capability_name -- --nocapture
+cargo check -p cratonvm-native-api -p cratonvm-native-builtins -p cratonvm-vm
+cargo build --release -p cratonvm-cli --features java-bin-alias --bin cratonvm --bin java
+```
+
+The follow-up direct WildFly standalone probe no longer reports either null residual. The process still times out with the pre-existing STW cooperation stall:
+
+```text
+[stw-census] rounds=64 pending=1 taken=0 blocked=48 alive=53
+```
+
+The pending/nonblocked threads remain in the `EnhancedQueueExecutor$ThreadBody.run` / `ParallelBootOperationStepHandler` cooperation family. Status remains OPEN for the broader WildFly boot timeout; the two null residuals from this section are closed under `docs/internal/fixed-suite-bugs/wildfly-moduleloader-capability-servicename-nulls.md`.

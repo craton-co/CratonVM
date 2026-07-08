@@ -131,6 +131,24 @@ const IA_ADDR: usize = 1;
 const ISA_HOST: usize = 0;
 const ISA_PORT: usize = 1;
 
+/// The list `SSLSocket.getSupportedCipherSuites()` returns for our synthetic
+/// client socket (`ssl_sock_supported_cipher_suites` in phases_late.rs — kept
+/// in sync manually since the two functions live in different files serving
+/// different halves of the same `javax/net/ssl/SSLSocket` class). Used by
+/// `setEnabledCipherSuites` below to distinguish a real cipher restriction
+/// from a caller just re-asserting "use everything you support".
+const CLIENT_SUPPORTED_CIPHER_SUITES: &[&str] = &[
+    "TLS_AES_128_GCM_SHA256",
+    "TLS_AES_256_GCM_SHA384",
+    "TLS_CHACHA20_POLY1305_SHA256",
+    "TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256",
+    "TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256",
+    "TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384",
+    "TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384",
+    "TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305_SHA256",
+    "TLS_ECDHE_RSA_WITH_CHACHA20_POLY1305_SHA256",
+];
+
 const SOCK_HOST: usize = 0;
 const SOCK_PORT: usize = 1;
 const SOCK_LOCAL_PORT: usize = 2;
@@ -157,6 +175,8 @@ pub(crate) struct SockSide {
     pub local_port: i32,
     pub closed: i32,
     pub stream_id: i32,
+    pub input_shutdown: i32,
+    pub output_shutdown: i32,
 }
 
 #[derive(Default, Debug, Clone, Copy)]
@@ -194,6 +214,8 @@ fn sock_get(this: ObjectRef) -> SockSide {
         local_port: 0,
         closed: 0,
         stream_id: -1,
+        input_shutdown: 0,
+        output_shutdown: 0,
     })
 }
 
@@ -205,6 +227,8 @@ fn sock_set<F: FnOnce(&mut SockSide)>(this: ObjectRef, f: F) {
         local_port: 0,
         closed: 0,
         stream_id: -1,
+        input_shutdown: 0,
+        output_shutdown: 0,
     });
     f(entry);
 }
@@ -219,6 +243,61 @@ fn sock_set<F: FnOnce(&mut SockSide)>(this: ObjectRef, f: F) {
 /// effect through the real Java call chain.
 pub(crate) fn sock_stream_id_for_upcall(this: ObjectRef) -> i32 {
     sock_get(this).stream_id
+}
+
+/// FIX (netty-client-socket-write-after-close): companion to
+/// [`sock_stream_id_for_upcall`] for `phases_late.rs`'s NEW-13
+/// `javax/net/ssl/SSLSocket` stream/lifecycle natives (`getInputStream`,
+/// `getOutputStream`, `close`, `isClosed`, `isConnected`). Those read/write
+/// raw object fields (`NEW13_SOCK_TLSID`/`NEW13_SOCK_CLOSED`), which is fine
+/// for a socket `new13_do_create_socket` built itself — but
+/// `SSLSocketFactory.createSocket(String,int)` is ALSO registered here (this
+/// module registers `register_phase_e_networking` after `register_p68_ssl`,
+/// so this implementation wins for that exact (class,name,descriptor) key)
+/// and builds the socket through the side table above, leaving those raw
+/// fields at their default `Object(None)`. Real bytecode method resolution
+/// then finds phases_late.rs's `getOutputStream`/`close`/etc — they're
+/// registered on the concrete `javax/net/ssl/SSLSocket` class, a more
+/// specific match than anything this module registers on the `java/net/
+/// Socket` superclass — so those raw-field readers ran regardless of which
+/// factory built the object, read the never-populated field, and treated
+/// every write on a `createSocket(host,port)`-obtained socket as though the
+/// stream had already been closed. These accessors let phases_late.rs fall
+/// back to the side table when the raw field isn't a valid entry.
+pub(crate) fn sock_mark_closed_for_upcall(this: ObjectRef) {
+    sock_set(this, |s| {
+        s.closed = 1;
+        s.stream_id = -1;
+    });
+}
+
+pub(crate) fn sock_is_closed_for_upcall(this: ObjectRef) -> bool {
+    sock_get(this).closed != 0
+}
+
+/// FIX (netty-client-socket-write-after-close): let `phases_late.rs`'s
+/// `new13_do_create_socket` record its connect result HERE instead of (only)
+/// in a raw object field. `alloc_concurrent_synthetic` sizes a "synthetic"
+/// object using the REAL loaded class's actual field count/layout when the
+/// class is loadable (`ctx.class_num_total_fields`) — see its own doc
+/// comment — so field index 2 on a `javax/net/ssl/SSLSocket` lands wherever
+/// the real class hierarchy's own 3rd field actually is, not a slot we
+/// control. Traced with a same-native-call immediate readback
+/// (CRATONVM_DBG_TLS_SOCK): `ctx.set_field(sock, 2, Value::Int(tls_id))`
+/// followed instantly by `ctx.get_field(sock, 2)` — no Java code, no GC,
+/// same call — already read back `Object(None)`, proving the object's real
+/// field #2 is reference-typed and the GC/field-layout guard silently drops
+/// a mismatched-type write rather than erroring. This is exactly the
+/// collision this file's own `SockSide` table was introduced to avoid for
+/// plain `java.net.Socket`/`ServerSocket`/`DatagramSocket`; `SSLSocket`
+/// needs the same treatment.
+pub(crate) fn sock_set_for_create(this: ObjectRef, port: i32, stream_id: i32) {
+    sock_set(this, |s| {
+        s.port = port;
+        s.local_port = 0;
+        s.closed = 0;
+        s.stream_id = stream_id;
+    });
 }
 
 fn ss_get(this: ObjectRef) -> SsSide {
@@ -292,25 +371,34 @@ fn ds_set<F: FnOnce(&mut DsSide)>(this: ObjectRef, f: F) {
 // instance -> owner Socket. The real-JDK inner classes have their own
 // fields (`parent`, `in`/`out`); we cannot use raw slot indices safely.
 //
-// GC note (gc-followups-20260706): KNOWN-UNSOUND across GCs — both the
-// stream KEY and the owner-Socket VALUE are raw addresses that are neither
-// rooted nor remapped. After a moving GC the relocated stream's lookup
-// misses (I/O on that stream then fails to find its owner) and a hit on an
-// unmoved key can return a stale owner address. Tolerable only while the
-// create→I/O window contains no moving GC. Follow-up: key by
-// `ctx.identity_hash_code(stream)` and store the owner as a
-// `(identity_key, ObjectRef)` var-handle-root pair (ASYNC_POOL pattern) —
-// or fold this table into the re10-handler gc_scan/gc_update hook pair
-// that already exists in this file.
-fn stream_owner_table() -> &'static Mutex<HashMap<ObjectRef, ObjectRef>> {
-    static T: OnceLock<Mutex<HashMap<ObjectRef, ObjectRef>>> = OnceLock::new();
+// GC-safety fix: both `stream` and `owner` are raw `ObjectRef`s that a moving
+// GC can relocate at any point between `getInputStream()`/`getOutputStream()`
+// (which populate this table) and a much-later `read`/`write` call (which
+// looks it up) — `is`/`os` are freshly-allocated, short-lived objects, prime
+// young-gen relocation candidates. Keying by the raw `stream` pointer went
+// stale the moment `is`/`os` moved (lookup miss -> spurious "has no owner"),
+// and returning the raw `owner` pointer went stale the moment the Socket
+// moved (a dispatch against the relocated, now-reclaimed address -> "Stale
+// pointer detected ... falling back to CP class java/net/Socket"). Both
+// reproduced via org.apache.catalina.realm.TestJNDIRealmIntegration once the
+// GC-barrier accept-loop fix let the test run long enough to trigger a GC
+// mid-stream. Fix: key by `identity_hash_code` (GC-stable) and hold the value
+// as a global GC root (remapped by the collector on every move), resolved
+// fresh at each read — the same pattern `register_var_handle_root`/
+// `read_var_handle_root` use for the identical hazard on VarHandle statics.
+fn stream_owner_table() -> &'static Mutex<HashMap<i32, usize>> {
+    static T: OnceLock<Mutex<HashMap<i32, usize>>> = OnceLock::new();
     T.get_or_init(|| Mutex::new(HashMap::new()))
 }
-fn stream_owner_set(stream: ObjectRef, owner: ObjectRef) {
-    stream_owner_table().lock().insert(stream, owner);
+fn stream_owner_set(ctx: &mut dyn NativeContext, stream: ObjectRef, owner: ObjectRef) {
+    let key = ctx.identity_hash_code(stream);
+    let handle = ctx.add_global_root(owner);
+    stream_owner_table().lock().insert(key, handle);
 }
-fn stream_owner_get(stream: ObjectRef) -> Option<ObjectRef> {
-    stream_owner_table().lock().get(&stream).copied()
+fn stream_owner_get(ctx: &mut dyn NativeContext, stream: ObjectRef) -> Option<ObjectRef> {
+    let key = ctx.identity_hash_code(stream);
+    let handle = *stream_owner_table().lock().get(&key)?;
+    ctx.resolve_global_root(handle)
 }
 
 // InetAddress side-table — same rationale as the Socket / ServerSocket
@@ -2749,8 +2837,15 @@ fn register_re1_socket(r: &mut NativeMethodRegistry) {
                 stream
                     .shutdown(std::net::Shutdown::Read)
                     .map_err(|e| ioex(format!("shutdown read failed: {e}")))?;
+            } else if let Some(entry) = reg.tls_streams.get(&sid) {
+                entry
+                    .stream
+                    .get_ref()
+                    .shutdown(std::net::Shutdown::Read)
+                    .map_err(|e| ioex(format!("shutdown read failed: {e}")))?;
             }
         }
+        sock_set(this, |s| s.input_shutdown = 1);
         Ok(None)
     });
     r.register(sock, "shutdownOutput", "()V", |_ctx, args| {
@@ -2762,9 +2857,41 @@ fn register_re1_socket(r: &mut NativeMethodRegistry) {
                 stream
                     .shutdown(std::net::Shutdown::Write)
                     .map_err(|e| ioex(format!("shutdown write failed: {e}")))?;
+            } else if let Some(entry) = reg.tls_streams.get(&sid) {
+                entry
+                    .stream
+                    .get_ref()
+                    .shutdown(std::net::Shutdown::Write)
+                    .map_err(|e| ioex(format!("shutdown write failed: {e}")))?;
             }
         }
+        sock_set(this, |s| s.output_shutdown = 1);
         Ok(None)
+    });
+    // FIX (netty-client-socket-write-after-close residual): isInputShutdown/
+    // isOutputShutdown had no reachable native registration in real-JDK mode
+    // (the only registration lived in register_p72_server_socket, which is
+    // only reachable via the synthetic-jdk-gated register_synthetic_overrides
+    // umbrella — see the identical dead-code pattern already documented
+    // elsewhere in this codebase, e.g. lib.rs's "FIX (httpserver-pkcs12
+    // -20260706)" comment). Real bytecode ran instead, reading our synthetic
+    // object's fields as if they were real Socket internals (`impl`/`shutIn`)
+    // — undefined, and in practice non-deterministically truthy roughly one
+    // run in three. Apache HttpClient5's DefaultBHttpClientConnection$1
+    // .checkTLS() calls sslSocket.isInputShutdown() before every write and
+    // throws ConnectionClosedException ("Connection is closed") if it
+    // returns true, matching this bug's exact flaky signature (traced via
+    // KRUN_STACK=1: ConnectionClosedException at
+    // DefaultBHttpClientConnection$1.checkTLS, no CratonVM native or
+    // exception involved at all up to that point — the socket was never
+    // actually shut down).
+    r.register(sock, "isInputShutdown", "()Z", |_ctx, args| {
+        let this = obj_arg(args, 0)?;
+        Ok(Some(Value::Int(sock_get(this).input_shutdown)))
+    });
+    r.register(sock, "isOutputShutdown", "()Z", |_ctx, args| {
+        let this = obj_arg(args, 0)?;
+        Ok(Some(Value::Int(sock_get(this).output_shutdown)))
     });
 
     r.register(sock, "setSoTimeout", "(I)V", |_ctx, args| {
@@ -2775,14 +2902,30 @@ fn register_re1_socket(r: &mut NativeMethodRegistry) {
         }
         let sid = sock_get(this).stream_id;
         if sid >= 0 {
+            let d = if ms == 0 {
+                None
+            } else {
+                Some(Duration::from_millis(ms as u64))
+            };
             let reg = s2_registry().lock();
             if let Some(stream) = reg.streams.get(&sid) {
-                let d = if ms == 0 {
-                    None
-                } else {
-                    Some(Duration::from_millis(ms as u64))
-                };
                 stream
+                    .set_read_timeout(d)
+                    .map_err(|e| ioex(format!("setSoTimeout failed: {e}")))?;
+            } else if let Some(entry) = reg.tls_streams.get(&sid) {
+                // FIX (netty-client-socket-write-after-close residual): a
+                // socket connected via new13_do_create_socket's TLS path
+                // (phases_late.rs) registers its stream id in `tls_streams`,
+                // not `streams` — the table this native originally only
+                // checked. Apache HttpClient5's `DefaultManagedHttpClient
+                // Connection.bind()` calls `setSoTimeout`/`getSoTimeout`
+                // unconditionally on every connection (see `getSoTimeout`'s
+                // own doc comment below); missing `tls_streams` here made
+                // both silently no-op for every TLS socket instead of
+                // configuring the real underlying TcpStream's read timeout.
+                entry
+                    .stream
+                    .get_ref()
                     .set_read_timeout(d)
                     .map_err(|e| ioex(format!("setSoTimeout failed: {e}")))?;
             }
@@ -2810,6 +2953,18 @@ fn register_re1_socket(r: &mut NativeMethodRegistry) {
             let reg = s2_registry().lock();
             if let Some(stream) = reg.streams.get(&sid) {
                 let ms = stream
+                    .read_timeout()
+                    .map_err(|e| ioex(format!("getSoTimeout failed: {e}")))?
+                    .map(|d| d.as_millis() as i32)
+                    .unwrap_or(0);
+                return Ok(Some(Value::Int(ms)));
+            }
+            // See the matching comment in setSoTimeout above: a TLS socket's
+            // stream id lives in `tls_streams`, not `streams`.
+            if let Some(entry) = reg.tls_streams.get(&sid) {
+                let ms = entry
+                    .stream
+                    .get_ref()
                     .read_timeout()
                     .map_err(|e| ioex(format!("getSoTimeout failed: {e}")))?
                     .map(|d| d.as_millis() as i32)
@@ -2845,6 +3000,33 @@ fn register_re1_socket(r: &mut NativeMethodRegistry) {
             Ok(Some(Value::Object(Some(ia))))
         },
     );
+    // FIX (netty-client-socket-write-after-close): `getLocalAddress()` — the
+    // LOCAL bind address — had no native registration at all (unlike its
+    // sibling `getInetAddress()`, the REMOTE address, just above), so real
+    // `java.net.Socket.getLocalAddress()` bytecode ran against this
+    // synthetic object. That bytecode reads a real `SocketImpl`/holder
+    // structure that doesn't exist here — this file's own `SOCK_HOST` slot
+    // holds a plain `java.lang.String` instead (see the side-table
+    // rationale above), so the real accessor it calls next resolves onto
+    // `String` and throws a bogus `NoSuchMethodError:
+    // java/lang/String.getOption(I)Ljava/lang/Object;` (observed via Apache
+    // HttpClient5's connection setup calling this — see
+    // docs/known-issues/netty-client-socket-write-after-close-nsme.md).
+    // We don't track the real local bind IP for this client-side socket
+    // (the TLS connect never does an explicit local bind), so return
+    // loopback — a real client socket connecting to a loopback server
+    // reports 127.0.0.1 as its local address too, and callers here only
+    // need a non-crashing, non-null address (route/pool bookkeeping),
+    // not byte-perfect network topology.
+    r.register(
+        sock,
+        "getLocalAddress",
+        "()Ljava/net/InetAddress;",
+        |ctx, _args| {
+            let ia = alloc_inet_address(ctx, "localhost", "127.0.0.1");
+            Ok(Some(Value::Object(Some(ia))))
+        },
+    );
 
     r.register(
         sock,
@@ -2860,7 +3042,7 @@ fn register_re1_socket(r: &mut NativeMethodRegistry) {
             // Side-table the stream's owner+sid so we don't depend on field
             // layout (real `Socket$SocketInputStream` has different fields
             // than the synthetic shape: `parent:Socket`, `in:InputStream`).
-            stream_owner_set(is, this);
+            stream_owner_set(ctx, is, this);
             Ok(Some(Value::Object(Some(is))))
         },
     );
@@ -2875,7 +3057,7 @@ fn register_re1_socket(r: &mut NativeMethodRegistry) {
                 return Err(ioex("Socket.getOutputStream: not connected"));
             }
             let os = alloc_concurrent_synthetic(ctx, "java/net/Socket$SocketOutputStream", 3);
-            stream_owner_set(os, this);
+            stream_owner_set(ctx, os, this);
             Ok(Some(Value::Object(Some(os))))
         },
     );
@@ -2883,7 +3065,8 @@ fn register_re1_socket(r: &mut NativeMethodRegistry) {
     let sis = "java/net/Socket$SocketInputStream";
     r.register(sis, "read", "([BII)I", |ctx, args| {
         let this = obj_arg(args, 0)?;
-        let owner = stream_owner_get(this).ok_or_else(|| ioex("SocketInputStream has no owner"))?;
+        let owner =
+            stream_owner_get(ctx, this).ok_or_else(|| ioex("SocketInputStream has no owner"))?;
         let buf = obj_arg(args, 1)?;
         let off = args.get(2).and_then(|v| v.as_int()).unwrap_or(0);
         let len = args.get(3).and_then(|v| v.as_int()).unwrap_or(0);
@@ -2899,14 +3082,16 @@ fn register_re1_socket(r: &mut NativeMethodRegistry) {
     // server-side request read (okhttp MockWebServer, loopback HTTP). BUG-04.
     r.register(sis, "read", "([B)I", |ctx, args| {
         let this = obj_arg(args, 0)?;
-        let owner = stream_owner_get(this).ok_or_else(|| ioex("SocketInputStream has no owner"))?;
+        let owner =
+            stream_owner_get(ctx, this).ok_or_else(|| ioex("SocketInputStream has no owner"))?;
         let buf = obj_arg(args, 1)?;
         let len = ctx.array_length(buf) as i32;
         re1_socket_read_stream(ctx, owner, buf, 0, len)
     });
     r.register(sis, "read", "()I", |ctx, args| {
         let this = obj_arg(args, 0)?;
-        let owner = stream_owner_get(this).ok_or_else(|| ioex("SocketInputStream has no owner"))?;
+        let owner =
+            stream_owner_get(ctx, this).ok_or_else(|| ioex("SocketInputStream has no owner"))?;
         let one = ctx.new_array(ArrayElementType::Byte, 1);
         let r = re1_socket_read_stream(ctx, owner, one, 0, 1)?;
         match r {
@@ -2930,7 +3115,7 @@ fn register_re1_socket(r: &mut NativeMethodRegistry) {
     r.register(sos, "write", "([BII)V", |ctx, args| {
         let this = obj_arg(args, 0)?;
         let owner =
-            stream_owner_get(this).ok_or_else(|| ioex("SocketOutputStream has no owner"))?;
+            stream_owner_get(ctx, this).ok_or_else(|| ioex("SocketOutputStream has no owner"))?;
         let buf = obj_arg(args, 1)?;
         let off = args.get(2).and_then(|v| v.as_int()).unwrap_or(0);
         let len = args.get(3).and_then(|v| v.as_int()).unwrap_or(0);
@@ -2939,15 +3124,15 @@ fn register_re1_socket(r: &mut NativeMethodRegistry) {
     r.register(sos, "write", "(I)V", |ctx, args| {
         let this = obj_arg(args, 0)?;
         let owner =
-            stream_owner_get(this).ok_or_else(|| ioex("SocketOutputStream has no owner"))?;
+            stream_owner_get(ctx, this).ok_or_else(|| ioex("SocketOutputStream has no owner"))?;
         let b = args.get(1).and_then(|v| v.as_int()).unwrap_or(0) & 0xff;
         let one = ctx.new_array(ArrayElementType::Byte, 1);
         ctx.set_array_element(one, 0, Value::Int(b as i8 as i32));
         re1_socket_write_stream(ctx, owner, one, 0, 1)
     });
-    r.register(sos, "flush", "()V", |_ctx, args| {
+    r.register(sos, "flush", "()V", |ctx, args| {
         let this = obj_arg(args, 0)?;
-        if let Some(owner) = stream_owner_get(this) {
+        if let Some(owner) = stream_owner_get(ctx, this) {
             let sid = sock_get(owner).stream_id;
             if sid >= 0 {
                 let mut reg = s2_registry().lock();
@@ -2970,7 +3155,7 @@ fn register_re1_socket(r: &mut NativeMethodRegistry) {
 fn re2_accept_into(
     ctx: &mut dyn NativeContext,
     listener_id: i32,
-    target: ObjectRef,
+    mut target: ObjectRef,
     timeout_ms: i32,
 ) -> MethodCallResult {
     if listener_id < 0 {
@@ -3027,7 +3212,31 @@ fn re2_accept_into(
                 break AcceptOutcome::TimedOut;
             }
         }
+        // GC-barrier safepoint gap: unlike every other blocking-native call in
+        // this codebase (`Thread.sleep`, socket read/write), this poll-sleep
+        // ran unmarked. A no-timeout `ServerSocket.accept()` (timeout_ms <= 0,
+        // `deadline` is `None`) loops here indefinitely once no new
+        // connections are pending, staying counted in the GC barrier's
+        // `expected` set forever — it never reaches an interpreter safepoint
+        // (it's native Rust code, not JIT either, so the cross-thread JIT
+        // takeover can't rescue it), so any STW GC/JIT-takeover initiated
+        // while this thread has no pending connection deadlocks permanently
+        // (`stw-census` showed `pending=1 taken=0` unable to move). Mark each
+        // poll-sleep slice as a blocked region, exactly like `Thread.sleep`'s
+        // pump loop.
+        //
+        // `target` is a raw `ObjectRef` local held across the whole loop (it
+        // is written to after a connection is accepted) — use the `_refs`
+        // end-region variant so a moving GC that runs while we're blocked
+        // rewrites it, same as `re1_socket_read_stream`'s `buf`.
+        let mut blocked_refs = [Value::Object(Some(target))];
+        ctx.begin_blocking_region();
         std::thread::sleep(Duration::from_millis(10));
+        ctx.end_blocking_region_refs(&mut blocked_refs);
+        target = match blocked_refs[0] {
+            Value::Object(Some(o)) => o,
+            _ => target,
+        };
     };
 
     // Restore blocking mode on the shared listener if it survived, so later
@@ -7852,6 +8061,14 @@ fn register_re6_ssl_context(r: &mut NativeMethodRegistry) {
                 s.closed = 0;
                 s.stream_id = id;
             });
+            if std::env::var_os("CRATONVM_DBG_TLS_SOCK").is_some() {
+                eprintln!(
+                    "[dbg-tls-sock] thread={:?} net_phase_e createSocket(String,int) built sock={:?} stream_id={}",
+                    std::thread::current().id(),
+                    sock,
+                    id
+                );
+            }
             Ok(Some(Value::Object(Some(sock))))
         },
     );
@@ -7892,6 +8109,34 @@ fn register_re6_ssl_context(r: &mut NativeMethodRegistry) {
                 }
             }
             if ciphers.is_empty() || !crate::t27_tls::any_cipher_mappable(&ciphers) {
+                return Ok(None);
+            }
+            // FIX (netty-client-socket-write-after-close residual): don't
+            // reconnect when `ciphers` covers this socket's ENTIRE supported
+            // set (`ssl_sock_supported_cipher_suites` in phases_late.rs, the
+            // list `SSLSocket.getSupportedCipherSuites()` returns) — that's
+            // not a real restriction, just a caller re-asserting "use
+            // everything you support" (the common case: e.g. Apache
+            // HttpClient5's `SSLConnectionSocketFactory` calls
+            // `setEnabledCipherSuites(getSupportedCipherSuites())` as part of
+            // its normal connection setup, unconditionally, for every socket
+            // it creates — not only ones under an actual cipher policy).
+            // Reconnecting anyway tears down a connection that may have been
+            // established under semantics THIS rustls-only path cannot
+            // reproduce (a Java TrustManager accepting a self-signed/test
+            // certificate — see `new13_do_create_socket`'s post-connect
+            // `checkServerTrusted` delegation, which this reconnect has no
+            // way to redo), turning a harmless no-op call into a hard
+            // failure. Only reconnect for a GENUINE restriction: a proper
+            // subset of the supported suites (e.g. Tomcat's
+            // `TesterSupport.ClientSSLSocketFactory`, which this reconnect
+            // exists for in the first place — see the FIX comment above).
+            let requested: std::collections::HashSet<&str> =
+                ciphers.iter().map(String::as_str).collect();
+            let is_full_supported_set = CLIENT_SUPPORTED_CIPHER_SUITES
+                .iter()
+                .all(|c| requested.contains(c));
+            if is_full_supported_set {
                 return Ok(None);
             }
             let host = read_field_string_or(ctx, this, SOCK_HOST, "");
@@ -8282,12 +8527,17 @@ fn register_re8_network_interface(r: &mut NativeMethodRegistry) {
     r.register(ni, "isUp0", "(Ljava/lang/String;I)Z", |_ctx, _args| {
         Ok(Some(Value::Int(1)))
     });
-    r.register(
-        ni,
-        "isLoopback0",
-        "(Ljava/lang/String;I)Z",
-        |_ctx, _args| Ok(Some(Value::Int(0))),
-    );
+    r.register(ni, "isLoopback0", "(Ljava/lang/String;I)Z", |ctx, args| {
+        let name = match args.first().copied() {
+            Some(Value::Object(Some(s))) => ctx.read_string(s).unwrap_or_default(),
+            _ => String::new(),
+        };
+        let index = match args.get(1).copied() {
+            Some(Value::Int(i)) => i,
+            _ => 0,
+        };
+        Ok(Some(Value::Int(if name == "lo" || index == 1 { 1 } else { 0 })))
+    });
     r.register(ni, "isP2P0", "(Ljava/lang/String;I)Z", |_ctx, _args| {
         Ok(Some(Value::Int(0)))
     });

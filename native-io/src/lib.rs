@@ -2815,7 +2815,13 @@ fn native_bais_read_bytes(ctx: &mut dyn NativeContext, args: &[Value]) -> Method
         let mut buf = buf;
         let mut i: usize = 0;
         while i < len {
-            let read_result = ctx.invoke_virtual(this, "read", "()I", &[])?;
+            let read_result = match ctx.invoke_virtual(this, "read", "()I", &[]) {
+                Ok(v) => v,
+                Err(e) => {
+                    ctx.unpin_native_roots(this_pin);
+                    return Err(e);
+                }
+            };
             this = ctx.read_native_pin(this_pin, this);
             buf = ctx.read_native_pin(buf_pin, buf);
             match read_result {
@@ -7574,12 +7580,18 @@ fn native_dis_read_bytes(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
     // docs/known-issues/hib-jpalargeblobtest-object-read-nosuchmethod.md).
     let this_pin = ctx.pin_native_root(this);
     let buf_pin = ctx.pin_native_root(buf);
-    let result = ctx.invoke_virtual(
+    let result = match ctx.invoke_virtual(
         inner,
         "read",
         "([BII)I",
         &[Value::Object(Some(buf)), Value::Int(off), Value::Int(len)],
-    )?;
+    ) {
+        Ok(v) => v,
+        Err(e) => {
+            ctx.unpin_native_roots(this_pin);
+            return Err(e);
+        }
+    };
     let this = ctx.read_native_pin(this_pin, this);
     let buf = ctx.read_native_pin(buf_pin, buf);
     let out = match result {
@@ -7973,10 +7985,23 @@ fn dis_read_fully_impl(
         Value::Object(Some(s)) => s,
         _ => return Err(eof_exception()),
     };
+    // Same stale-local hazard as native_bais_read_bytes/native_dis_read_bytes:
+    // every invoke_virtual below can run bytecode and trigger a moving GC.
+    // Keep all object refs reused after those calls as native roots and reload
+    // them before any further dispatch or array store.
+    let this_pin = ctx.pin_native_root(this);
+    let buf_pin = ctx.pin_native_root(buf);
+    let inner_pin = ctx.pin_native_root(inner);
+    let mut this = this;
+    let mut buf = buf;
+    let mut inner = inner;
     let mut filled = 0usize;
-    while filled < len {
+    let out = loop {
+        if filled >= len {
+            break Ok(None);
+        }
         let remaining = (len - filled) as i32;
-        let n = ctx.invoke_virtual(
+        let n = match ctx.invoke_virtual(
             inner,
             "read",
             "([BII)I",
@@ -7985,7 +8010,16 @@ fn dis_read_fully_impl(
                 Value::Int((off + filled) as i32),
                 Value::Int(remaining),
             ],
-        )?;
+        ) {
+            Ok(v) => v,
+            Err(e) => {
+                ctx.unpin_native_roots(this_pin);
+                return Err(e);
+            }
+        };
+        this = ctx.read_native_pin(this_pin, this);
+        buf = ctx.read_native_pin(buf_pin, buf);
+        inner = ctx.read_native_pin(inner_pin, inner);
         match n {
             Some(Value::Int(v)) if v > 0 => {
                 filled += v as usize;
@@ -7994,17 +8028,27 @@ fn dis_read_fully_impl(
                 // EOF (0 or -1) before all bytes were delivered → byte-by-byte fallback.
                 // dis_read_one returns -1 on EOF; we throw EOFException if that happens.
                 for i in filled..len {
-                    let b = dis_read_one(ctx, this)?;
+                    let b = match dis_read_one(ctx, this) {
+                        Ok(v) => v,
+                        Err(e) => {
+                            ctx.unpin_native_roots(this_pin);
+                            return Err(e);
+                        }
+                    };
+                    this = ctx.read_native_pin(this_pin, this);
+                    buf = ctx.read_native_pin(buf_pin, buf);
                     if b < 0 {
+                        ctx.unpin_native_roots(this_pin);
                         return Err(eof_exception());
                     }
                     ctx.set_array_element(buf, off + i, Value::Int(b));
                 }
-                return Ok(None);
+                break Ok(None);
             }
         }
-    }
-    Ok(None)
+    };
+    ctx.unpin_native_roots(this_pin);
+    out
 }
 
 fn native_dis_skip_bytes(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
