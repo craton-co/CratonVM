@@ -19,7 +19,9 @@ use crate::classloading::ClassId;
 use crate::error::{LinkageError, MethodCallFailed, MethodCallResult, RuntimeError, VmError};
 use crate::memory::heap::{ArrayElementType, ObjectKind};
 use crate::native::io::FileDescriptorTable;
-use crate::native::registry::{FieldMetadata, MethodMetadata, NativeContext, StackTraceEntry};
+use crate::native::registry::{
+    FieldMetadata, MethodMetadata, NativeContext, NativeThreadBlocker, StackTraceEntry,
+};
 use crate::threading::jvm_thread::{JvmThread, ThreadId};
 use crate::types::{jlong_bits_as_aligned_object_ptr, ObjectRef, Value};
 
@@ -2082,6 +2084,36 @@ fn reread_native_object_values(
             _ => *value,
         })
         .collect()
+}
+
+struct VmNativeThreadBlocker {
+    shared: std::sync::Arc<SharedVm>,
+    thread_id: ThreadId,
+}
+
+impl NativeThreadBlocker for VmNativeThreadBlocker {
+    fn publish_os_tid(&self) {
+        self.shared
+            .thread_registry
+            .set_os_tid_current(self.thread_id);
+    }
+
+    fn enter_blocked(&self) {
+        self.shared
+            .thread_registry
+            .mark_native_thread_blocked(self.thread_id);
+        let pre_stw = self.shared.gc_barrier.mark_blocked_region_enter();
+        if pre_stw {
+            let _ = self.shared.gc_barrier.arrive_and_wait(self.thread_id);
+        }
+    }
+
+    fn leave_blocked(&self) {
+        self.shared.gc_barrier.mark_blocked_region_leave();
+        self.shared
+            .thread_registry
+            .mark_native_thread_unblocked(self.thread_id);
+    }
 }
 
 impl<'a> NativeContext for NativeContextImpl<'a> {
@@ -5014,6 +5046,19 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
             self.shared.thread_registry.set_join_handle(tid, *boxed);
         }
         tid.0
+    }
+
+    fn native_thread_blocker(
+        &self,
+        thread_id: u64,
+    ) -> Option<std::sync::Arc<dyn NativeThreadBlocker>> {
+        if thread_id == 0 {
+            return None;
+        }
+        Some(std::sync::Arc::new(VmNativeThreadBlocker {
+            shared: self.shared.get_arc(),
+            thread_id: ThreadId(thread_id),
+        }))
     }
 
     /// T19_K2 вЂ” Mark a previously-registered native thread dead. Called

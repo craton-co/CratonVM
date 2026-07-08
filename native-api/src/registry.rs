@@ -248,6 +248,25 @@ fn fmix64(mut h: u64) -> u64 {
     h
 }
 
+/// GC/STW hooks for VM-registered native carrier threads.
+///
+/// Some native subsystems spawn host OS threads that are registered in the VM
+/// thread list, but do not own a full [`NativeContext`] while they sit in an
+/// OS wait primitive. Those threads still need to publish their OS tid for
+/// cross-thread diagnostics/takeover and must enter the GC-blocked population
+/// before parking so a stop-the-world pause does not wait for a thread that
+/// cannot reach an interpreter safepoint.
+pub trait NativeThreadBlocker: Send + Sync {
+    /// Publish the current OS thread id for this VM thread.
+    fn publish_os_tid(&self);
+
+    /// Enter a GC-blocked native wait region.
+    fn enter_blocked(&self);
+
+    /// Leave a GC-blocked native wait region.
+    fn leave_blocked(&self);
+}
+
 /// Trait providing VM capabilities needed by native method implementations.
 ///
 /// The `Vm` struct implements this trait. Using a trait here avoids circular
@@ -1240,6 +1259,16 @@ pub trait NativeContext {
         _join_handle_ptr: usize,
     ) -> u64 {
         0
+    }
+
+    /// Return GC/STW hooks for a thread registered via
+    /// [`Self::register_native_thread`].
+    ///
+    /// The returned object is intentionally independent of `&mut self` so a
+    /// spawned host thread can carry it into its event loop and bracket native
+    /// waits without a full `NativeContext`.
+    fn native_thread_blocker(&self, _thread_id: u64) -> Option<Arc<dyn NativeThreadBlocker>> {
+        None
     }
 
     /// T19_K2 — Mark a previously-registered native thread dead.
