@@ -16924,6 +16924,108 @@ pub fn register_essential_natives(registry: &mut NativeMethodRegistry) {
         lang_class::native_field_get,
     );
     registry.register(
+        "java/lang/reflect/Field",
+        "set",
+        "(Ljava/lang/Object;Ljava/lang/Object;)V",
+        lang_class::native_field_set,
+    );
+    registry.register(
+        "java/lang/reflect/Field",
+        "getInt",
+        "(Ljava/lang/Object;)I",
+        lang_class::native_field_get_int,
+    );
+    registry.register(
+        "java/lang/reflect/Field",
+        "getLong",
+        "(Ljava/lang/Object;)J",
+        lang_class::native_field_get_long,
+    );
+    registry.register(
+        "java/lang/reflect/Field",
+        "getFloat",
+        "(Ljava/lang/Object;)F",
+        lang_class::native_field_get_float,
+    );
+    registry.register(
+        "java/lang/reflect/Field",
+        "getDouble",
+        "(Ljava/lang/Object;)D",
+        lang_class::native_field_get_double,
+    );
+    registry.register(
+        "java/lang/reflect/Field",
+        "getBoolean",
+        "(Ljava/lang/Object;)Z",
+        lang_class::native_field_get_boolean,
+    );
+    registry.register(
+        "java/lang/reflect/Field",
+        "getByte",
+        "(Ljava/lang/Object;)B",
+        lang_class::native_field_get_byte,
+    );
+    registry.register(
+        "java/lang/reflect/Field",
+        "getShort",
+        "(Ljava/lang/Object;)S",
+        lang_class::native_field_get_short,
+    );
+    registry.register(
+        "java/lang/reflect/Field",
+        "getChar",
+        "(Ljava/lang/Object;)C",
+        lang_class::native_field_get_char,
+    );
+    registry.register(
+        "java/lang/reflect/Field",
+        "setInt",
+        "(Ljava/lang/Object;I)V",
+        lang_class::native_field_set_int,
+    );
+    registry.register(
+        "java/lang/reflect/Field",
+        "setLong",
+        "(Ljava/lang/Object;J)V",
+        lang_class::native_field_set_long,
+    );
+    registry.register(
+        "java/lang/reflect/Field",
+        "setFloat",
+        "(Ljava/lang/Object;F)V",
+        lang_class::native_field_set_float,
+    );
+    registry.register(
+        "java/lang/reflect/Field",
+        "setDouble",
+        "(Ljava/lang/Object;D)V",
+        lang_class::native_field_set_double,
+    );
+    registry.register(
+        "java/lang/reflect/Field",
+        "setBoolean",
+        "(Ljava/lang/Object;Z)V",
+        lang_class::native_field_set_boolean,
+    );
+    registry.register(
+        "java/lang/reflect/Field",
+        "setByte",
+        "(Ljava/lang/Object;B)V",
+        lang_class::native_field_set_byte,
+    );
+    registry.register(
+        "java/lang/reflect/Field",
+        "setShort",
+        "(Ljava/lang/Object;S)V",
+        lang_class::native_field_set_short,
+    );
+    registry.register(
+        "java/lang/reflect/Field",
+        "setChar",
+        "(Ljava/lang/Object;C)V",
+        lang_class::native_field_set_char,
+    );
+    registry.register(
         "java/lang/reflect/AccessibleObject",
         "setAccessible",
         "(Z)V",
@@ -59013,6 +59115,43 @@ mod vector_support_essential_tests {
                     .find("java/lang/Class", name, "()Ljava/lang/Class;")
                     .is_some(),
                 "Class.{name}() must also be registered in the final native set"
+            );
+        }
+    }
+}
+
+#[cfg(test)]
+mod reflection_field_essential_tests {
+    use super::*;
+
+    #[test]
+    fn register_essential_includes_reflective_field_accessors() {
+        let mut registry = NativeMethodRegistry::new();
+        register_essential_natives(&mut registry);
+        let field = "java/lang/reflect/Field";
+        for (name, desc) in [
+            ("get", "(Ljava/lang/Object;)Ljava/lang/Object;"),
+            ("set", "(Ljava/lang/Object;Ljava/lang/Object;)V"),
+            ("getInt", "(Ljava/lang/Object;)I"),
+            ("getLong", "(Ljava/lang/Object;)J"),
+            ("getFloat", "(Ljava/lang/Object;)F"),
+            ("getDouble", "(Ljava/lang/Object;)D"),
+            ("getBoolean", "(Ljava/lang/Object;)Z"),
+            ("getByte", "(Ljava/lang/Object;)B"),
+            ("getShort", "(Ljava/lang/Object;)S"),
+            ("getChar", "(Ljava/lang/Object;)C"),
+            ("setInt", "(Ljava/lang/Object;I)V"),
+            ("setLong", "(Ljava/lang/Object;J)V"),
+            ("setFloat", "(Ljava/lang/Object;F)V"),
+            ("setDouble", "(Ljava/lang/Object;D)V"),
+            ("setBoolean", "(Ljava/lang/Object;Z)V"),
+            ("setByte", "(Ljava/lang/Object;B)V"),
+            ("setShort", "(Ljava/lang/Object;S)V"),
+            ("setChar", "(Ljava/lang/Object;C)V"),
+        ] {
+            assert!(
+                registry.find(field, name, desc).is_some(),
+                "Field.{name}{desc} must be registered in the real-JDK essential native path"
             );
         }
     }
