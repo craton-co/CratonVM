@@ -786,13 +786,14 @@ impl OopMapEntry {
 // Stage 5 (precise oop maps) — JIT code-range registry
 // ---------------------------------------------------------------------------
 //
-// Maps each compiled method's native code range `[entry, entry+len)` to its
-// (Arc-stable) `CompiledMethod` pointer. The GC root walker uses it to resolve
+// Maps each compiled method's native code range `[entry, entry+len)` to an
+// Arc-stable `CompiledMethod` pointer. The GC root walker uses it to resolve
 // which method a return address belongs to while walking the JIT RBP chain, so
 // it can remap EVERY active JIT frame (not just the innermost). Populated at
-// `JitCache::put`, evicted at `JitCache::remove`. The stored pointer is the
-// `Arc<CompiledMethod>` inner address, which is stable for the cm's cache
-// lifetime; a live JIT frame keeps its cm in the cache (hence alive).
+// `JitCache::put`; normal eviction retires the `Arc<CompiledMethod>` instead of
+// dropping/unregistering it because stale direct calls and active return
+// addresses can still reach retained code. The explicit `CRATONVM_JIT_FREE_CODE`
+// diagnostic mode restores unregister+drop behavior for A/B testing only.
 
 /// One registered code range: `(entry, end, cm_ptr)`.
 static JIT_CODE_RANGES: std::sync::OnceLock<std::sync::Mutex<Vec<(usize, usize, usize)>>> =
@@ -813,8 +814,9 @@ pub fn register_jit_code_range(entry: usize, len: usize, cm_ptr: usize) {
     }
 }
 
-/// Remove every range with the given `entry` start (called on cache eviction
-/// so the GC walker never resolves a return address to a freed method). Stage 5.
+/// Remove every range with the given `entry` start. Normal cache eviction keeps
+/// ranges registered; this is used by explicit free-code diagnostics and tests.
+/// Stage 5.
 pub fn unregister_jit_code_range(entry: usize) {
     if entry == 0 {
         return;
@@ -861,9 +863,10 @@ pub fn xt_jit_root_scan_enabled() -> bool {
 /// deadlock the collector. The collector instead takes this snapshot ONCE
 /// (no thread suspended yet), then classifies every frozen peer against the
 /// returned copy with a lock-free range check. The set of ranges only grows
-/// during compilation / shrinks on eviction; a momentarily-stale snapshot can
-/// only mis-classify a brand-new range as "not JIT" (handled conservatively
-/// by the snapshot-based mitigation), never the reverse.
+/// during compilation and normally remains registered after eviction because
+/// retained code may still be reached by stale direct calls. A momentarily-stale
+/// snapshot can only mis-classify a brand-new range as "not JIT" (handled
+/// conservatively by the snapshot-based mitigation), never the reverse.
 pub fn jit_code_ranges_snapshot() -> Vec<(usize, usize)> {
     jit_code_ranges()
         .lock()
@@ -4003,6 +4006,14 @@ fn compute_jit_key_hash(class: &str, method: &str, desc: &str) -> u64 {
 /// concurrency invariants that need their own test battery.
 pub struct JitCache {
     methods: FxHashMap<u64, (JitKey, Arc<CompiledMethod>)>,
+    /// Evicted compiled methods whose code ranges remain executable and
+    /// registered for precise GC frame walks.
+    ///
+    /// Code is normally retained for process lifetime (see
+    /// `ExecutableBuffer::drop`), and direct-call sites / MIC slots are not yet
+    /// patched at invalidation time. Keeping the `Arc` alive preserves the
+    /// `CompiledMethod` pointer stored in `JIT_CODE_RANGES`.
+    retired_methods: Vec<Arc<CompiledMethod>>,
     string_arena: Vec<Pin<Box<str>>>,
     invoke_info_arena: Vec<Pin<Box<JitInvokeInfo>>>,
 }
@@ -4011,6 +4022,7 @@ impl JitCache {
     pub fn new() -> Self {
         Self {
             methods: FxHashMap::default(),
+            retired_methods: Vec::new(),
             string_arena: Vec::new(),
             invoke_info_arena: Vec::new(),
         }
@@ -4064,6 +4076,19 @@ impl JitCache {
         }
     }
 
+    fn retire_evicted_method(&mut self, cm: Arc<CompiledMethod>) {
+        if std::env::var_os("CRATONVM_JIT_FREE_CODE").is_some() {
+            unregister_jit_code_range(cm.entry_ptr() as usize);
+            return;
+        }
+
+        // Keep the method object alive for the same lifetime as its retained
+        // executable buffer. The code-range registry stores this Arc's inner
+        // pointer and GC may dereference it while walking stale direct-call or
+        // still-active JIT frames after the cache entry becomes non-entrant.
+        self.retired_methods.push(cm);
+    }
+
     pub fn put(
         &mut self,
         class_name: Arc<str>,
@@ -4077,8 +4102,8 @@ impl JitCache {
             method_name,
             descriptor,
         };
-        if let Some((_old_key, old_cm)) = self.methods.get(&h) {
-            unregister_jit_code_range(old_cm.entry_ptr() as usize);
+        if let Some((_old_key, old_cm)) = self.methods.remove(&h) {
+            self.retire_evicted_method(old_cm);
         }
         let arc = Arc::new(compiled);
         // Stage 5 — register this method's code range for the GC RBP-chain
@@ -4127,11 +4152,12 @@ impl JitCache {
                 && &*key.method_name == method_name
                 && &*key.descriptor == descriptor
             {
-                // Stage 5 — drop this method's GC code-range registration
-                // before evicting, so the RBP-chain walker can never resolve a
-                // return address to a freed CompiledMethod.
-                unregister_jit_code_range(cm.entry_ptr() as usize);
+                // Keep this method's GC code-range registration live after
+                // eviction; retained code may still appear in active frames or
+                // stale direct-call targets.
+                let cm = cm.clone();
                 self.methods.remove(&h);
+                self.retire_evicted_method(cm);
             }
         }
     }
@@ -4146,20 +4172,23 @@ impl JitCache {
     ///
     /// Returns the number of evicted entries.
     pub fn invalidate_for_class_change(&mut self, changed_class: &str) -> usize {
-        let before = self.methods.len();
-        self.methods.retain(|_h, (_key, cm)| {
-            // Keep the entry iff it does NOT inline from the changed class.
-            let keep = !cm
-                .inlined_methods
-                .iter()
-                .any(|(cls, _, _)| cls == changed_class);
-            // Stage 5 — drop the GC code-range registration for evicted methods.
-            if !keep {
-                unregister_jit_code_range(cm.entry_ptr() as usize);
+        let hashes_to_remove: Vec<u64> = self
+            .methods
+            .iter()
+            .filter(|(_, (_key, cm))| {
+                cm.inlined_methods
+                    .iter()
+                    .any(|(cls, _, _)| cls == changed_class)
+            })
+            .map(|(h, _)| *h)
+            .collect();
+        let count = hashes_to_remove.len();
+        for h in hashes_to_remove {
+            if let Some((_key, cm)) = self.methods.remove(&h) {
+                self.retire_evicted_method(cm);
             }
-            keep
-        });
-        before - self.methods.len()
+        }
+        count
     }
 
     /// Invalidate all compiled methods that inlined code from `class_name`.
@@ -4178,11 +4207,9 @@ impl JitCache {
             .collect();
         let count = hashes_to_remove.len();
         for h in hashes_to_remove {
-            // Stage 5 — drop the GC code-range registration before evicting.
-            if let Some((_key, cm)) = self.methods.get(&h) {
-                unregister_jit_code_range(cm.entry_ptr() as usize);
+            if let Some((_key, cm)) = self.methods.remove(&h) {
+                self.retire_evicted_method(cm);
             }
-            self.methods.remove(&h);
         }
         count
     }
@@ -4191,13 +4218,14 @@ impl JitCache {
     ///
     /// JVMTI redefine can invalidate caller-side direct calls and inline caches,
     /// not just methods declared by the redefined class. A full flush is rare
-    /// but conservative and keeps the code-range registry in sync.
+    /// but conservative; normal mode retires evicted methods so retained code
+    /// ranges still have valid GC metadata.
     pub fn clear_all(&mut self) -> usize {
         let count = self.methods.len();
-        for (_key, cm) in self.methods.values() {
-            unregister_jit_code_range(cm.entry_ptr() as usize);
+        let methods = std::mem::take(&mut self.methods);
+        for (_h, (_key, cm)) in methods {
+            self.retire_evicted_method(cm);
         }
-        self.methods.clear();
         count
     }
 }
@@ -4698,6 +4726,17 @@ fn hibernate_temporal_jit_deny_prefix(class_name: &str) -> Option<&'static str> 
     }
 }
 
+fn snakeyaml_emitter_emit_jit_deny_prefix(
+    class_name: &str,
+    method_name: &str,
+) -> Option<&'static str> {
+    if class_name == "org/yaml/snakeyaml/emitter/Emitter" && method_name == "emit" {
+        Some("org/yaml/snakeyaml/emitter/")
+    } else {
+        None
+    }
+}
+
 /// Diagnostic: number of `try_compile` calls short-circuited because
 /// the method was already bail-listed.  Each short-circuit saves the
 /// ~50µs we'd otherwise have spent re-running scan/IR/lowering only to
@@ -4963,6 +5002,18 @@ pub fn try_compile(
     // `CRATONVM_JIT_DENY=org/hibernate/`, so keep Hibernate bytecode interpreted
     // here too unless the package is explicitly allowed for bisection.
     if let Some(prefix) = hibernate_temporal_jit_deny_prefix(&cached.class_name) {
+        if !jit_allow_package(prefix) {
+            return None;
+        }
+    }
+
+    // ES-JIT-DEOPT-GC.1: final fail-closed companion to the VM skip-list guard
+    // for `org/yaml/snakeyaml/emitter/Emitter.emit`. Tiered/background compile
+    // can reach this crate after the VM-side enqueue path has logged work; keep
+    // the exact proven corruptor interpreted unless explicitly lifted.
+    if let Some(prefix) =
+        snakeyaml_emitter_emit_jit_deny_prefix(&cached.class_name, &cached.method_name)
+    {
         if !jit_allow_package(prefix) {
             return None;
         }
@@ -7316,6 +7367,31 @@ mod tests {
         ));
     }
 
+    #[test]
+    fn snakeyaml_emitter_emit_final_guard_is_exact() {
+        assert_eq!(
+            snakeyaml_emitter_emit_jit_deny_prefix(
+                "org/yaml/snakeyaml/emitter/Emitter",
+                "emit",
+            ),
+            Some("org/yaml/snakeyaml/emitter/")
+        );
+        assert_eq!(
+            snakeyaml_emitter_emit_jit_deny_prefix(
+                "org/yaml/snakeyaml/emitter/Emitter",
+                "writeWhitespace",
+            ),
+            None
+        );
+        assert_eq!(
+            snakeyaml_emitter_emit_jit_deny_prefix(
+                "org/yaml/snakeyaml/emitter/ScalarAnalysis",
+                "isEmpty",
+            ),
+            None
+        );
+    }
+
     /// BUG-1 companion — routing of NON-tail static self-recursive call sites.
     ///
     /// With `helpers.self_call_stack_guard` wired, the site must stay on the
@@ -9363,7 +9439,7 @@ mod tests {
     }
 
     #[test]
-    fn test_jit_cache_put_replacement_unregisters_old_code_range() {
+    fn test_jit_cache_put_replacement_retires_old_code_range() {
         let mut cache = JitCache::new();
         let class: Arc<str> = Arc::from("ReplaceClass");
         let method: Arc<str> = Arc::from("replaceMethod");
@@ -9393,11 +9469,52 @@ mod tests {
             CompiledMethod::new(new_buf),
         );
 
-        assert!(lookup_jit_code_range(old_entry).is_none());
+        if std::env::var_os("CRATONVM_JIT_FREE_CODE").is_none() {
+            assert_eq!(cache.retired_methods.len(), 1);
+            assert!(
+                lookup_jit_code_range(old_entry).is_some(),
+                "retained code must keep its GC metadata range after replacement"
+            );
+        }
         unregister_jit_code_range(old_entry);
         if let Some(new_cm) = cache.get(&class, &method, &desc) {
             unregister_jit_code_range(new_cm.entry_ptr() as usize);
         }
+    }
+
+    #[test]
+    fn test_jit_cache_remove_retires_code_range() {
+        let mut cache = JitCache::new();
+        let class: Arc<str> = Arc::from("RemoveClass");
+        let method: Arc<str> = Arc::from("removeMethod");
+        let desc: Arc<str> = Arc::from("()V");
+
+        let mut buf = ExecutableBuffer::new(64).expect("alloc failed");
+        buf.emit(&[0xC3]); // RET
+        cache.put(
+            class.clone(),
+            method.clone(),
+            desc.clone(),
+            CompiledMethod::new(buf),
+        );
+        let cm = cache
+            .get(&class, &method, &desc)
+            .expect("compiled method");
+        let entry = cm.entry_ptr() as usize;
+        register_jit_code_range(entry, cm.code_len(), Arc::as_ptr(&cm) as usize);
+        drop(cm);
+
+        cache.remove(&class, &method, &desc);
+
+        assert!(cache.get(&class, &method, &desc).is_none());
+        if std::env::var_os("CRATONVM_JIT_FREE_CODE").is_none() {
+            assert_eq!(cache.retired_methods.len(), 1);
+            assert!(
+                lookup_jit_code_range(entry).is_some(),
+                "retained code must keep a valid CompiledMethod mapping"
+            );
+        }
+        unregister_jit_code_range(entry);
     }
 
     #[test]
@@ -9428,11 +9545,25 @@ mod tests {
             CompiledMethod::new(buf_b),
         );
 
+        let entry_a = cache
+            .get(&class_a, &method_a, &desc_a)
+            .expect("compiled A")
+            .entry_ptr() as usize;
+        let entry_b = cache
+            .get(&class_b, &method_b, &desc_b)
+            .expect("compiled B")
+            .entry_ptr() as usize;
+
         assert_eq!(cache.len(), 2);
         assert_eq!(cache.clear_all(), 2);
         assert!(cache.is_empty());
         assert!(cache.get(&class_a, &method_a, &desc_a).is_none());
         assert!(cache.get(&class_b, &method_b, &desc_b).is_none());
+        if std::env::var_os("CRATONVM_JIT_FREE_CODE").is_none() {
+            assert_eq!(cache.retired_methods.len(), 2);
+        }
+        unregister_jit_code_range(entry_a);
+        unregister_jit_code_range(entry_b);
     }
 
     #[test]

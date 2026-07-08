@@ -528,6 +528,21 @@ fn should_skip_jit_internal(
                 return Some(SkipReason::RustJvmTestFixture);
             }
         }
+
+        // ES-JIT-DEOPT-GC.1 (2026-07-08) - Elasticsearch interval-provider
+        // tests crash under JIT while serializing through Jackson YAML. Package
+        // bisection narrowed the producer from org/yaml/snakeyaml/emitter/ to
+        // Emitter.emit(Event): interpreting only this dispatcher changes the
+        // three interval classes from rc=139 SIGSEGV to ordinary JUnit failures,
+        // while a high JIT threshold and --nojit show the same non-crash shape.
+        // Keep the tiny dispatcher interpreted under Conservative until the
+        // emitter-state codegen defect is root-caused. Liftable with
+        // CRATONVM_JIT_ALLOW_PACKAGES=org/yaml/snakeyaml/emitter/.
+        if is_snakeyaml_emitter_emit_jit_corruption(class_name, method_name)
+            && !package_allowed("org/yaml/snakeyaml/emitter/", allow_packages)
+        {
+            return Some(SkipReason::RustJvmTestFixture);
+        }
         if callee_saved_gpr_local_homes_enabled()
             && is_known_miscompile(class_name, method_name)
             && !package_allowed(class_name, allow_packages)
@@ -1369,6 +1384,10 @@ fn hibernate_temporal_residual_skip_prefix(class_name: &str) -> Option<&'static 
     } else {
         class_name.starts_with(DOT_PREFIX).then_some(DOT_PREFIX)
     }
+}
+
+fn is_snakeyaml_emitter_emit_jit_corruption(class_name: &str, method_name: &str) -> bool {
+    class_name == "org/yaml/snakeyaml/emitter/Emitter" && method_name == "emit"
 }
 
 fn is_known_miscompile(class_name: &str, method_name: &str) -> bool {
@@ -2612,6 +2631,56 @@ mod tests {
                 false,
                 true,
                 SkipPolicy::Aggressive
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn snakeyaml_emitter_emit_skipped_conservatively() {
+        assert_eq!(
+            check(
+                "org/yaml/snakeyaml/emitter/Emitter",
+                "emit",
+                false,
+                true,
+                SkipPolicy::Conservative,
+            ),
+            Some(SkipReason::RustJvmTestFixture)
+        );
+        assert_eq!(
+            check(
+                "org/yaml/snakeyaml/emitter/Emitter",
+                "writeWhitespace",
+                false,
+                true,
+                SkipPolicy::Conservative,
+            ),
+            None,
+            "the ES interval crash guard must stay exact to Emitter.emit"
+        );
+    }
+
+    #[test]
+    fn snakeyaml_emitter_emit_lifts_with_allow_packages() {
+        assert_eq!(
+            check_with(
+                "org/yaml/snakeyaml/emitter/Emitter",
+                "emit",
+                false,
+                true,
+                SkipPolicy::Conservative,
+                &["org/yaml/snakeyaml/emitter/"],
+            ),
+            None
+        );
+        assert_eq!(
+            check(
+                "org/yaml/snakeyaml/emitter/Emitter",
+                "emit",
+                false,
+                true,
+                SkipPolicy::Aggressive,
             ),
             None
         );

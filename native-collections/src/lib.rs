@@ -23078,6 +23078,31 @@ fn collect_collection_elements(ctx: &mut dyn NativeContext, coll: ObjectRef) -> 
             }
             return out;
         }
+        // Jetty's BlockingArrayQueue (used by HttpDestination.exchanges) is a
+        // real AbstractList/BlockingQueue with inherited AbstractList fields
+        // followed by `_indexes:int[]`, `_size:AtomicInteger`, locks, and the
+        // real `_elements:Object[]`. The broad Arrays$ArrayList heuristic below
+        // used to read the resolved `a` slot from this unrelated class, found
+        // `_indexes:int[]`, copied its primitive ints into an Object[] snapshot
+        // as nulls, and `new ArrayList<>(exchanges)` later surfaced a null
+        // HttpExchange during `HttpClient.stop()`. Snapshot through the queue's
+        // own indexed List contract instead.
+        if cls_name == "org/eclipse/jetty/util/BlockingArrayQueue"
+            || obj_is_instance_of(ctx, coll, "org/eclipse/jetty/util/BlockingArrayQueue")
+        {
+            let size = match ctx.invoke_virtual(coll, "size", "()I", &[]) {
+                Ok(Some(Value::Int(n))) if n > 0 => n.min(16_777_216),
+                _ => 0,
+            };
+            let mut out = Vec::with_capacity(size as usize);
+            for i in 0..size {
+                match ctx.invoke_virtual(coll, "get", "(I)Ljava/lang/Object;", &[Value::Int(i)]) {
+                    Ok(Some(v)) => out.push(v),
+                    _ => break,
+                }
+            }
+            return out;
+        }
     }
     // org.apache.kafka.common.utils.ImplicitLinkedHashCollection (and its
     // subclasses — ImplicitLinkedHashMultiCollection, the generated message
@@ -23204,17 +23229,16 @@ fn collect_collection_elements(ctx: &mut dyn NativeContext, coll: ObjectRef) -> 
     } else {
         Value::Object(None)
     };
-    if let Value::Object(Some(arr)) = f_aal_a {
-        if ctx.heap_kind_of(arr) == ObjectKind::Array {
-            let len = ctx.array_length(arr);
-            // Heuristic: if this object has at most a couple of fields and
-            // the resolved slot is a ref-array, treat it as an array-backed
-            // wrapper.
-            let mut elems = Vec::with_capacity(len);
-            for i in 0..len {
-                elems.push(ctx.get_array_element(arr, i));
+    if obj_is_instance_of(ctx, coll, "java/util/Arrays$ArrayList") {
+        if let Value::Object(Some(arr)) = f_aal_a {
+            if ctx.heap_kind_of(arr) == ObjectKind::Array {
+                let len = ctx.array_length(arr);
+                let mut elems = Vec::with_capacity(len);
+                for i in 0..len {
+                    elems.push(ctx.get_array_element(arr, i));
+                }
+                return elems;
             }
-            return elems;
         }
     }
     // LinkedList: its real head/tail/size live in the identity-hash-keyed
