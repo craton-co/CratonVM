@@ -4404,6 +4404,22 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
                     let pin_base = jvm_thread.native_pin_roots.len();
                     jvm_thread.native_pin_roots.push(*exc);
                     let exc_ref = jvm_thread.native_pin_roots[pin_base];
+                    if std::env::var_os("CRATONVM_DBG_UNCAUGHT").is_some() {
+                        let cid = shared_arc.heap.class_id_of(exc_ref);
+                        let cname = shared_arc
+                            .class_manager
+                            .read()
+                            .get_class(cid)
+                            .map(|c| c.name.to_string())
+                            .unwrap_or_else(|| format!("<unknown class_id={}>", cid.as_u32()));
+                        eprintln!(
+                            "[dbg-uncaught] tid={} thread_name={:?} exc_class={} ptr={:p}",
+                            tid.0,
+                            name,
+                            cname,
+                            exc_ref.as_ptr(),
+                        );
+                    }
                     let dispatch_result = invoke_on_class_shared(
                         &shared_arc,
                         &mut jvm_thread,
