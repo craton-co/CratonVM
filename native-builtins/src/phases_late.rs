@@ -39924,7 +39924,7 @@ fn new13_do_create_socket(
 /// methods have no Code and threw `AbstractMethodError` for any caller that
 /// invoked one directly (e.g. a test wrapper `KeyManager` delegating to the
 /// array `getKeyManagers()` returned — see
-/// `docs/known-issues/tls-ocsp-clientcert-validation-not-enforced.md`,
+/// `docs/internal/fixed-suite-bugs/tls-ocsp-clientcert-validation-not-enforced-FIXED.md`,
 /// "Residual #2 implementation" for the full trace that found this).
 fn kmf_keystore_id_by_identity() -> &'static parking_lot::Mutex<rustc_hash::FxHashMap<i32, i32>> {
     static T: std::sync::OnceLock<parking_lot::Mutex<rustc_hash::FxHashMap<i32, i32>>> =
@@ -41042,8 +41042,8 @@ pub(crate) fn register_p68_ssl(r: &mut NativeMethodRegistry) {
             // tracing against Tomcat's `TestClientCert`/
             // `engine_run_trust_check`'s post-handshake
             // `checkClientTrusted` call — see
-            // `docs/known-issues/tls-ocsp-clientcert-validation-not-
-            // enforced.md`, "Residual #2 implementation" for the full
+            // `docs/internal/fixed-suite-bugs/tls-ocsp-clientcert-validation-not-
+            // enforced-FIXED.md`, "Residual #2 implementation" for the full
             // trace). Fixed the same way as the sibling
             // `KeyManagerFactory.getKeyManagers()` fix just above: build
             // the real, functional `FQN_X509_TM`-shaped object
@@ -41227,8 +41227,8 @@ pub(crate) fn register_p68_ssl(r: &mut NativeMethodRegistry) {
             // override does exactly this
             // (`manager.chooseClientAlias(keyType, issuers, socket)`,
             // `manager` being whatever `getKeyManagers()` returned) — see
-            // `docs/known-issues/tls-ocsp-clientcert-validation-not-
-            // enforced.md`, "Residual #2 implementation" for the full trace.
+            // `docs/internal/fixed-suite-bugs/tls-ocsp-clientcert-validation-not-
+            // enforced-FIXED.md`, "Residual #2 implementation" for the full trace.
             //
             // Fixed by building the SAME real, natively-backed
             // `FQN_SUN_X509_KM`-shaped object `x509_manager.rs`'s
