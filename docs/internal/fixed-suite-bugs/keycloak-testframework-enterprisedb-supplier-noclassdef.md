@@ -100,4 +100,4 @@ The full `AccountConsoleDisabledTest` repro no longer reports
 `EnterpriseDbDatabaseSupplier`, `AbstractContainerDatabaseSupplier`,
 `SerializableComparator`, `DependencyBuilder`, or `BuildToolHelper` as missing.
 It now reaches later, separate residuals documented in
-[keycloak-universal-classpath-post-enterprisedb-residuals.md](../../known-issues/keycloak-universal-classpath-post-enterprisedb-residuals.md).
+[keycloak-universal-classpath-post-enterprisedb-residuals.md](keycloak-universal-classpath-post-enterprisedb-residuals.md).

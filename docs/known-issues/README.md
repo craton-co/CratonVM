@@ -863,12 +863,12 @@ JIT divide-by-zero re-run) has since been fixed; the other two remain open:
   builds a filtered default runtime closure for the provider and prunes stale
   service-descriptor-only output dirs. Historical record moved to
   [../internal/fixed-suite-bugs/keycloak-testframework-enterprisedb-supplier-noclassdef.md](../internal/fixed-suite-bugs/keycloak-testframework-enterprisedb-supplier-noclassdef.md).
-- [keycloak-universal-classpath-post-enterprisedb-residuals.md](keycloak-universal-classpath-post-enterprisedb-residuals.md) -
-  OPEN. Later residuals after the EnterpriseDB supplier fix:
-  HotSpot now reaches `UITestFrameworkExtension` and misses Selenium
-  `org/openqa/selenium/WebDriver`; CratonVM reaches Keycloak server startup
-  and misses the Quarkus Maven resolver path behind
-  `BootstrapMavenContext.config()`.
+- **Keycloak universal classpath post-EnterpriseDB residuals** -
+  FIXED (2026-07-08). The generator now adds filtered Selenium/UI and
+  Quarkus Maven resolver closures, and the suite runner orders selected module
+  output dirs before `kc-runner` for pathing jars so Keycloak resolves Maven
+  artifacts from the correct module. Historical record moved to
+  [../internal/fixed-suite-bugs/keycloak-universal-classpath-post-enterprisedb-residuals.md](../internal/fixed-suite-bugs/keycloak-universal-classpath-post-enterprisedb-residuals.md).
 
 ## Keycloak post-PreviewFeatures rerun (2026-07-03)
 
