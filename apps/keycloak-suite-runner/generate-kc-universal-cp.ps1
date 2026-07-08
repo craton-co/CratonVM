@@ -371,11 +371,54 @@ $script:DefaultModuleDependencyClosures = @(
     IncludeGroupIds = @("org.infinispan")
     IncludeArtifactIds = @()
   },
+  # Universal classpath includes ui/target/classes and its ServiceLoader
+  # provider. Loading that provider links Selenium WebDriver suppliers before a
+  # test class asks for a browser explicitly, so keep the default closure
+  # limited to Selenium and its direct driver/runtime support libraries.
+  [pscustomobject]@{
+    Module = "test-framework/ui"
+    IncludeScope = "runtime"
+    IncludeGroupIds = @(
+      "org.seleniumhq.selenium",
+      "org.htmlunit",
+      "io.opentelemetry",
+      "org.apache.commons",
+      "commons-logging",
+      "commons-codec",
+      "commons-exec",
+      "com.google.auto.service",
+      "org.jspecify"
+    )
+    IncludeArtifactIds = @()
+  },
   [pscustomobject]@{
     Module = "test-framework/core"
     IncludeScope = "runtime"
     IncludeGroupIds = @()
-    IncludeArtifactIds = @("quarkus-bootstrap-app-model", "quarkus-bootstrap-core")
+    IncludeArtifactIds = @("quarkus-bootstrap-app-model", "quarkus-bootstrap-core", "quarkus-bootstrap-maven-resolver")
+  },
+  # quarkus-bootstrap-maven-resolver links Maven Resolver, Sisu, Plexus, and
+  # Maven model APIs when Keycloak resolves its Quarkus module path during
+  # server startup. Keep this separate from the exact Quarkus artifact filter:
+  # Maven dependency plugin group and artifact filters are intersected.
+  [pscustomobject]@{
+    Module = "test-framework/core"
+    IncludeScope = "runtime"
+    IncludeGroupIds = @(
+      "org.apache.maven",
+      "org.apache.maven.resolver",
+      "org.apache.maven.wagon",
+      "org.codehaus.plexus",
+      "org.eclipse.sisu",
+      "io.smallrye.beanbag",
+      "com.google.inject",
+      "aopalliance",
+      "javax.inject",
+      "commons-cli",
+      "commons-io",
+      "org.slf4j"
+    )
+    IncludeArtifactIds = @()
   }
 )
 
