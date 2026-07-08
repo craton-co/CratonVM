@@ -4,6 +4,30 @@ This folder collects CratonVM-only defects found while running upstream Java
 suites. The docs had grown to describe the **same underlying bug from several
 angles**; this index is the consolidated map. Read it first.
 
+## 2026-07-07 Five new Spring non-passed-rerun bugs (Azure host, dev, real-JDK/JIT-on)
+
+Found triaging FAIL results from a 516-class Spring non-passed rerun (filtered
+out ~250 environmental classpath-dump gaps first — missing cross-module
+Spring test-fixture jars, not CratonVM bugs). All 5 below are genuine,
+distinct CratonVM defects, still OPEN, no fix attempted yet:
+
+- OPEN: [`web-x509trustmanager-getacceptedissuers-abstractmethoderror.md`](web-x509trustmanager-getacceptedissuers-abstractmethoderror.md) — `X509TrustManager.getAcceptedIssuers()` AbstractMethodError, identical across all 4 HTTP server backends in one WebFlux test.
+- OPEN: [`groovy-compilationunit-phaseoperation-abstractmethoderror.md`](groovy-compilationunit-phaseoperation-abstractmethoderror.md) — Groovy `CompilationUnit$PhaseOperation.doPhaseOperation` AbstractMethodError, 4 `GroovyScriptFactoryTests` methods.
+- OPEN: [`stomp-bufferingdecoder-atomicinteger-count-npe.md`](stomp-bufferingdecoder-atomicinteger-count-npe.md) — `BufferingStompDecoder`'s `count` `AtomicInteger` field null, 5 STOMP decoder test methods.
+- OPEN: [`linkedcaseinsensitivemap-deserialize-this0-npe.md`](linkedcaseinsensitivemap-deserialize-this0-npe.md) — `LinkedCaseInsensitiveMap` inner-class `this$0` null after deserialize; related but distinct from the FIXED `removeEldestEntry`-dispatch-to-`Object` NSME below.
+- OPEN: [`reflection-arenestmates-missing-native.md`](reflection-arenestmates-missing-native.md) — `jdk.internal.reflect.Reflection.areNestMates` has no native registered at all.
+
+Also confirmed (not new, corroborating evidence only, no new doc needed):
+`expression.spel.*` SpEL `EL1040E` double-literal-suffix parse failures (33
+occurrences, matches an already-known SpEL bug); `NoSuchMethodError:
+Object.accept/Object.test` in `SpelCompilerTests`/`BeanOverrideHandlerTests`
+matches the general JIT wrong-receiver-type/virtual-dispatch bug called out
+in `docs/internal/fixed-suite-bugs/jit-osr-linux-regression-triad.md` (that
+doc's top-level FIXED status covers only one narrow OSR-entry sub-case; this
+broader dispatch signature is explicitly noted there as still needing a
+general-path fix) — new evidence it also hits Spring, not just Hibernate.
+
+## 2026-07-08 Hibernate bytecode-enhancement loader/lazytoone family retired; residual basic/merge/version bugs split out
 ## 2026-07-08 Hibernate bytecode-enhancement loader/lazytoone and residual basic/merge/version bugs retired
 
 - FIXED/RETIRED: [`hib-bytecode-enhancement-loader-faithful-linking-FIXED.md`](../internal/fixed-suite-bugs/hib-bytecode-enhancement-loader-faithful-linking-FIXED.md) - the remaining loader-faithful lazy/lazytoone failures are closed: 18/18 representative sample and 69/69 lazy/lazytoone subset pass, and the graph same-name checkcast residual now passes.

@@ -18825,6 +18825,12 @@ fn register_linked_list_natives(registry: &mut NativeMethodRegistry) {
     registry.register(c, "size", "()I", native_ll_size);
     registry.register(c, "isEmpty", "()Z", native_ll_is_empty);
     registry.register(c, "contains", "(Ljava/lang/Object;)Z", native_ll_contains);
+    registry.register(
+        c,
+        "removeIf",
+        "(Ljava/util/function/Predicate;)Z",
+        native_ll_remove_if,
+    );
     registry.register(c, "clear", "()V", native_ll_clear);
     registry.register(c, "peek", "()Ljava/lang/Object;", native_ll_peek);
     registry.register(c, "poll", "()Ljava/lang/Object;", native_ll_poll);
@@ -19698,6 +19704,67 @@ fn native_ll_remove_object(ctx: &mut dyn NativeContext, args: &[Value]) -> Metho
         };
     }
     Ok(Some(Value::Int(0)))
+}
+
+/// `LinkedList.removeIf(Predicate)` — remove all nodes whose element satisfies
+/// the predicate. Groovy's SAM detection uses `LinkedList.removeIf` while
+/// pruning inherited abstract methods; if this falls through to a path whose
+/// iterator does not support `remove`, the failure surfaces as an unrelated
+/// reflection `UnsupportedOperationException`.
+fn native_ll_remove_if(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(r))) => *r,
+        _ => return Ok(Some(Value::Int(0))),
+    };
+    let predicate = match args.get(1) {
+        Some(Value::Object(Some(p))) => *p,
+        _ => return Ok(Some(Value::Int(0))),
+    };
+
+    let this_pin = ctx.pin_native_root(this);
+    let pred_pin = ctx.pin_native_root(predicate);
+    let mut removed = false;
+    let mut cur_opt = match ll_get(ctx, this, "head") {
+        Value::Object(Some(r)) => Some(r),
+        _ => None,
+    };
+
+    while let Some(cur) = cur_opt {
+        let next_orig = match ctx.get_field(cur, LL_NODE_NEXT) {
+            Value::Object(Some(n)) => Some(n),
+            _ => None,
+        };
+        let elem_orig = ctx.get_field(cur, LL_NODE_ELEM);
+
+        let cur_pin = ctx.pin_native_root(cur);
+        let next_pin = next_orig.map(|n| ctx.pin_native_root(n));
+        let elem_pin = pin_value(ctx, elem_orig);
+
+        let predicate = ctx.read_native_pin(pred_pin, predicate);
+        let elem = read_pinned_elem(ctx, elem_pin, elem_orig);
+        let verdict = match ctx.invoke_virtual(predicate, "test", "(Ljava/lang/Object;)Z", &[elem])
+        {
+            Ok(v) => v,
+            Err(e) => {
+                ctx.unpin_native_roots(cur_pin);
+                ctx.unpin_native_roots(this_pin);
+                return Err(e);
+            }
+        };
+
+        let next_after = next_orig.map(|n| ctx.read_native_pin(next_pin.unwrap(), n));
+        if matches!(verdict, Some(Value::Int(v)) if v != 0) {
+            let this = ctx.read_native_pin(this_pin, this);
+            let cur = ctx.read_native_pin(cur_pin, cur);
+            ll_unlink_node(ctx, this, cur);
+            removed = true;
+        }
+        cur_opt = next_after;
+        ctx.unpin_native_roots(cur_pin);
+    }
+
+    ctx.unpin_native_roots(this_pin);
+    Ok(Some(Value::Int(if removed { 1 } else { 0 })))
 }
 
 /// `LinkedList.removeLastOccurrence(Object)` — as above but walks from the tail
