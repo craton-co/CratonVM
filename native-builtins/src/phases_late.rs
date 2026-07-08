@@ -41051,7 +41051,10 @@ pub(crate) fn register_p68_ssl(r: &mut NativeMethodRegistry) {
             // produces for the SPI-delegation path, keyed off the SAME
             // `tm_registry` id either `init` overload above (`KeyStore` or
             // `ManagerFactoryParameters`) already registered and stashed
-            // via `tmf_tm_id_by_identity`. Falls back to the old (non-
+            // via `tmf_tm_id_by_identity`. The default/null-initialized path
+            // uses id 0 on the same real-impl-shaped object, which the
+            // `x509_manager` handlers intentionally resolve as platform
+            // default trust roots. This avoids falling back to the old (non-
             // functional but allocation-safe) stub when no id was captured
             // (matches original behavior for `init((KeyStore) null)` / a
             // `getTrustManagers()` call with no preceding `init`).
@@ -41072,27 +41075,8 @@ pub(crate) fn register_p68_ssl(r: &mut NativeMethodRegistry) {
                     ih, tm_id
                 );
             }
-            let tm = if tm_id != 0 {
-                let tm = alloc_concurrent_synthetic(ctx, crate::x509_manager::FQN_X509_TM, 2);
-                crate::x509_manager::set_tm_id(ctx, tm, tm_id);
-                tm
-            } else {
-                // Forward the configured KeyStore into the fallback
-                // TrustManager so chain verification (if anything still
-                // reads this legacy layout) sees the anchors we were told
-                // about. X509TrustManager layout: field 0 = KeyStore
-                // reference (may be null → platform default), field 1 =
-                // provider cookie.
-                let keystore_ref = if ctx.object_num_fields(this) > 1 {
-                    ctx.get_field(this, 1)
-                } else {
-                    Value::Object(None)
-                };
-                let tm = alloc_concurrent_synthetic(ctx, "javax/net/ssl/X509TrustManager", 2);
-                ctx.set_field(tm, 0, keystore_ref);
-                ctx.set_field(tm, 1, Value::Int(0));
-                tm
-            };
+            let tm = alloc_concurrent_synthetic(ctx, crate::x509_manager::FQN_X509_TM, 2);
+            crate::x509_manager::set_tm_id(ctx, tm, tm_id);
             let arr = ctx.new_array(cratonvm_types::ArrayElementType::Reference, 1);
             ctx.set_array_element(arr, 0, Value::Object(Some(tm)));
             Ok(Some(Value::Object(Some(arr))))
@@ -57980,6 +57964,48 @@ mod new13_tests {
                 "()[Ljava/security/cert/Certificate;",
             )
             .is_some());
+    }
+
+    #[test]
+    fn trust_manager_factory_default_returns_concrete_x509_impl() {
+        use crate::test_utils::MockNativeContext;
+
+        let r = build_registry();
+        let mut ctx = MockNativeContext::new();
+        let get_instance = r
+            .find(
+                "javax/net/ssl/TrustManagerFactory",
+                "getInstance",
+                "(Ljava/lang/String;)Ljavax/net/ssl/TrustManagerFactory;",
+            )
+            .unwrap();
+        let factory = match get_instance(&mut ctx, &[Value::Object(None)]) {
+            Ok(Some(Value::Object(Some(o)))) => o,
+            other => panic!("getInstance should return a factory, got {other:?}"),
+        };
+        let get_tms = r
+            .find(
+                "javax/net/ssl/TrustManagerFactory",
+                "getTrustManagers",
+                "()[Ljavax/net/ssl/TrustManager;",
+            )
+            .unwrap();
+        let arr = match get_tms(&mut ctx, &[Value::Object(Some(factory))]) {
+            Ok(Some(Value::Object(Some(a)))) => a,
+            other => panic!("getTrustManagers should return an array, got {other:?}"),
+        };
+        let tm = match ctx.get_array_element(arr, 0) {
+            Value::Object(Some(t)) => t,
+            other => panic!("trust manager element should be an object, got {other:?}"),
+        };
+        let tm_class = ctx
+            .class_name_of_id(ctx.class_id_of_object(tm))
+            .unwrap_or_default();
+        assert_eq!(
+            tm_class,
+            crate::x509_manager::FQN_X509_TM,
+            "default TrustManagerFactory must not vend the abstract X509TrustManager interface"
+        );
     }
 
     #[test]
