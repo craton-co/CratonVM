@@ -86,6 +86,13 @@ Direct repro via `KcRunner` on the real `crypto/fips1402` classpath
   still failed on the separate P-384 keygen issue fixed in the follow-up note.
 - `FIPS1402SdJwtCreationAndSigningTest` - same: crash gone; at this point, 1/2 tests
   still failed on the separate P-384 keygen issue fixed in the follow-up note.
+  `ProvEC$ECAlgParams` built via BC-FIPS's own `EngineCreator`. 1/3 parameterized cases
+  now fail on an unrelated, pre-existing issue — see
+  [crypto-fips1402-sunec-keypairgenerator-384bit-gap.md](../../known-issues/crypto-fips1402-sunec-keypairgenerator-384bit-gap.md).
+- `BCFIPSEcdhEsAlgorithmProviderTest` — same: crash gone, 1/2 tests pass, the
+  remaining failure is the same unrelated 384-bit gap.
+- `FIPS1402SdJwtCreationAndSigningTest` — same: crash gone, 1/2 tests pass, remaining
+  failure is the same unrelated 384-bit gap.
 - `FIPS1402JwtVcMetadataTrustedSdJwtIssuerTest` (the OTHER known-issues doc,
   `crypto-fips1402-sdjwt-hang-after-provider-init.md`) — **16/16 PASS**, no hang. See
   that doc's own FIXED writeup for detail; it shares this exact root cause (the hang
@@ -99,6 +106,14 @@ Direct repro via `KcRunner` on the real `crypto/fips1402` classpath
 
 The separate P-384/ES384 keygen residual described at the time of this fix is now fixed
 and archived in [keycloak-crypto-fips1402-sunec-keypairgenerator-384bit-gap-FIXED.md](keycloak-crypto-fips1402-sunec-keypairgenerator-384bit-gap-FIXED.md). The follow-up routes explicit BC-FIPS EC/ECDSA keygen through the provider-created BC-FIPS generator and avoids SunEC's no-arg constructor default-size initialize for no-provider `ECGenParameterSpec` keygen.
+`sun.security.ec.ECKeyPairGenerator.initialize` throws
+`InvalidParameterException: No EC parameters available for key size 384 bits` for the
+P-384/ES384 case across all three tests above. This is unrelated to the
+`className`/`EngineCreator` bug fixed here — `KeyPairGenerator.getInstance("ECDSA",
+"BCFIPS")` resolves to **SunEC's own** `ECKeyPairGenerator` (not a BC-FIPS SPI) via a
+pre-existing, separate CratonVM EC-routing shortcut, and that path's curve-size table
+doesn't cover 384 bits. Tracked in
+[crypto-fips1402-sunec-keypairgenerator-384bit-gap.md](../../known-issues/crypto-fips1402-sunec-keypairgenerator-384bit-gap.md).
 
 ---
 
