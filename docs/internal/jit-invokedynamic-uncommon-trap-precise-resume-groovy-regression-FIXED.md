@@ -46,7 +46,7 @@ always defaults `stack_oop_marks.push(false)`) without ever calling
 `mark_top_as_oop()` for a reference-typed (`L`/`[`) static field — unlike
 `getfield`'s inline arms, which already carry this exact fix (see their
 `c_is_ref`/`type_tag == b'L' || b'['` markers, added for a prior bug,
-`docs/known-issues/jasper-jdt-parser-arrayindexoutofbounds.md`).
+`docs/internal/jasper-jdt-parser-arrayindexoutofbounds.md`).
 
 `LicmRepro`'s trap shape is `getstatic System.out` (a reference) immediately
 followed by a `makeConcatWithConstants` invokedynamic. With the unmarked

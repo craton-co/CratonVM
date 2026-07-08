@@ -3178,6 +3178,13 @@ fn re2_accept_into(
     if listener_id < 0 {
         return Err(ioex("ServerSocket not bound"));
     }
+    // `target` is a Socket allocated by the enclosing ServerSocket.accept
+    // native, not a Java-frame local or a safe_native_call argument. This method
+    // can park in the poll loop below, where GC will scan only the deposited
+    // blocked-thread snapshot. Keep the Socket in native_pin_roots for the whole
+    // native so that snapshot includes it and any moving-GC fixup can be read
+    // back before field writes and before returning it to Java.
+    let target_pin = ctx.pin_native_root(target);
     // Poll-based accept. We deliberately do NOT block directly on a
     // `try_clone()`'d listener handle for the no-timeout case: on Windows,
     // closing one duplicated socket handle does not unblock a thread blocked in
@@ -3246,7 +3253,7 @@ fn re2_accept_into(
         // is written to after a connection is accepted) — use the `_refs`
         // end-region variant so a moving GC that runs while we're blocked
         // rewrites it, same as `re1_socket_read_stream`'s `buf`.
-        let mut blocked_refs = [Value::Object(Some(target))];
+        let mut blocked_refs = [Value::Object(Some(ctx.read_native_pin(target_pin, target)))];
         ctx.begin_blocking_region();
         std::thread::sleep(Duration::from_millis(10));
         ctx.end_blocking_region_refs(&mut blocked_refs);
@@ -3254,6 +3261,7 @@ fn re2_accept_into(
             Value::Object(Some(o)) => o,
             _ => target,
         };
+        target = ctx.read_native_pin(target_pin, target);
     };
 
     // Restore blocking mode on the shared listener if it survived, so later
@@ -3315,9 +3323,9 @@ fn re2_accept_into(
     // `Socket.getInetAddress()` then read a zeroed field and returned null).
     // Pin it exactly like every other raw-ObjectRef-across-a-reentrant-call
     // site in this codebase.
-    let pin_base = ctx.pin_native_root(target);
+    target = ctx.read_native_pin(target_pin, target);
     let host_str = ctx.create_string(&peer_ip);
-    let target = ctx.read_native_pin(pin_base, target);
+    let target = ctx.read_native_pin(target_pin, target);
     ctx.set_field(target, SOCK_HOST, Value::Object(Some(host_str)));
     sock_set(target, |s| {
         s.port = peer_port;
@@ -3325,7 +3333,9 @@ fn re2_accept_into(
         s.closed = 0;
         s.stream_id = stream_id;
     });
-    ctx.unpin_native_roots(pin_base);
+    // Leave `target_pin` live until `safe_native_call` installs
+    // `native_pending_return` and truncates the native pin stack. Unpinning here
+    // would recreate the native-return handoff window this path is protecting.
     Ok(Some(Value::Object(Some(target))))
 }
 

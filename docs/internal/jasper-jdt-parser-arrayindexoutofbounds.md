@@ -1,5 +1,38 @@
 # JSP compilation fails: Eclipse JDT parser `ArrayIndexOutOfBoundsException`
 
+**Current status:** FIXED and retired to `docs/internal` (2026-07-08).
+
+The original targeted repro was fixed on branch
+`fix/jasper-jdt-parser-aioobe-20260706` (2026-07-06). Later Windows residuals
+in the default full-class order were closed on 2026-07-08 by keeping the Eclipse
+JDT parser package (`org/eclipse/jdt/internal/compiler/parser/`) interpreted
+under the conservative JIT policy. The first residual was JIT-only and
+order-dependent: `testBug55262` passed in a fresh JVM, `testBug51584` followed
+by `testBug55262` failed with `ArrayIndexOutOfBoundsException: Index -1 out of
+bounds for length 100`, and the same two-method sequence passed with `--nojit`.
+
+JIT bisection narrowed the residual to the Eclipse JDT parser package:
+`CRATONVM_JIT_BISECT_ONLY=org/eclipse/jdt/internal/compiler/parser/` still
+failed, while adding
+`CRATONVM_JIT_BISECT_SKIP=org/eclipse/jdt/internal/compiler/parser/Parser.consumeRule`
+made the two-method repro pass. After rebasing onto newer `dev`, the full class
+could still surface parser-adjacent heap corruption/OOM around the
+`testBug53257*` sequence unless the parser package was interpreted. The current
+fix is therefore a correctness-first parser-package skip until the backend issue
+in that generated parser switch/stack-update shape is root-caused.
+
+Closure evidence:
+- Two-method release repro with the fixed binary
+  `cratonvm-jasper-jdt-residual-20260708-003.exe`:
+  `RunOne org.apache.jasper.compiler.TestCompiler testBug51584 testBug55262`
+  -> `tests=2 failures=0 ignored=0`.
+- Full standard Tomcat suite-runner class, no method exclusions:
+  `jasper-residual-20260708-010-final-current-dev-parser-guard`, real JDK, JIT on, no
+  `CRATONVM_JIT_DENY` override, `org.apache.jasper.compiler.TestCompiler` ->
+  `PASS` in 500.4s.
+
+## Historical Status Notes
+
 **Status:** ✅ FIXED on branch `fix/jasper-jdt-parser-aioobe-20260706` (2026-07-06)
 for the targeted repro. **Residual observed on Windows (2026-07-06/07):**
 running the full `TestCompiler` class through the standard suite runner

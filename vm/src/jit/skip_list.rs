@@ -475,6 +475,29 @@ fn should_skip_jit_internal(
         {
             return Some(SkipReason::JavaUtilCollection);
         }
+
+        // JASPER-JDT.2 (2026-07-08) - default Tomcat
+        // `org.apache.jasper.compiler.TestCompiler` order corrupts Eclipse JDT
+        // parser state under JIT and then fails JSP compilation. The first
+        // stable face was `ArrayIndexOutOfBoundsException: Index -1 out of
+        // bounds for length 100` in `Parser.parse`: `--nojit` passed, running
+        // `testBug55262` alone passed, and package bisection showed
+        // `CRATONVM_JIT_BISECT_ONLY=org/eclipse/jdt/internal/compiler/parser/`
+        // still failed while `CRATONVM_JIT_BISECT_SKIP=.../Parser.consumeRule`
+        // made the two-method repro pass. After rebasing onto newer `dev`, the
+        // full class still produced nondeterministic parser-adjacent heap
+        // corruption/OOM around the `testBug53257*` sequence unless the parser
+        // package was interpreted. The affected generated parser methods
+        // (`consumeRule`, `consumeBlock`, `consumeTypeImportOnDemandDeclarationName`,
+        // and siblings) share the same huge switch/stack update shape, so keep
+        // the parser package interpreted under Conservative until the backend
+        // producer is root-caused. Liftable for diagnosis with
+        // `CRATONVM_JIT_ALLOW_PACKAGES=org/eclipse/jdt/internal/compiler/parser/`.
+        if class_name.starts_with("org/eclipse/jdt/internal/compiler/parser/")
+            && !package_allowed("org/eclipse/jdt/internal/compiler/parser/", allow_packages)
+        {
+            return Some(SkipReason::RustJvmTestFixture);
+        }
         if is_elasticsearch_suite_jit_fragile_cluster(class_name, method_name)
             && !package_allowed(class_name, allow_packages)
         {
@@ -2839,6 +2862,43 @@ mod tests {
                 &["java/util/"],
             ),
             None
+        );
+    }
+
+    #[test]
+    fn jdt_parser_package_skips_under_conservative() {
+        assert_eq!(
+            check(
+                "org/eclipse/jdt/internal/compiler/parser/Parser",
+                "consumeRule",
+                false,
+                true,
+                SkipPolicy::Conservative,
+            ),
+            Some(SkipReason::RustJvmTestFixture),
+            "JDT Parser.consumeRule must stay interpreted for the Jasper parser residual"
+        );
+        assert_eq!(
+            check(
+                "org/eclipse/jdt/internal/compiler/parser/Parser",
+                "consumeTypeImportOnDemandDeclarationName",
+                false,
+                true,
+                SkipPolicy::Conservative,
+            ),
+            Some(SkipReason::RustJvmTestFixture),
+            "the Jasper residual guard covers the JDT parser package, not only consumeRule"
+        );
+        assert_eq!(
+            check(
+                "org/eclipse/jdt/internal/compiler/lookup/Scope",
+                "getType",
+                false,
+                true,
+                SkipPolicy::Conservative,
+            ),
+            None,
+            "the Jasper residual guard is intentionally limited to the parser package"
         );
     }
 
