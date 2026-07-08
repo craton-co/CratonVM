@@ -783,13 +783,18 @@ pub fn safe_native_call(
         }
     };
 
-    thread.native_pin_roots.truncate(pin_base);
     thread.native_pending_return = None;
     if let Ok(Some(v)) = &out {
         if let Some(o) = value_as_validated_object_ref(shared, *v) {
             thread.native_pending_return = Some(o);
         }
     }
+    // Install the object-return root before unwinding native pins. Some natives
+    // intentionally leave a freshly-created return object pinned until this
+    // point, covering blocked-region snapshots and cross-thread GC while the
+    // object still exists only in Rust locals. Dropping pins first opens a
+    // reclaim window before the pending-return slot can take over.
+    thread.native_pin_roots.truncate(pin_base);
     if thread.native_pending_return.is_some() {
         crate::runtime::interpreter::update_root_snapshot(shared, thread);
     }
