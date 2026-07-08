@@ -3104,7 +3104,21 @@ fn re2_accept_into(
         );
     }
     let stream_id = s2_alloc_stream(stream);
+    // GC-safety: `target` is a raw ObjectRef local that survived the poll
+    // loop above (already fixed via blocked_refs there), but this is a
+    // SEPARATE, later hazard -- `create_string` is a re-entrant, allocating
+    // call (it can allocate the String object and trigger a GC), and nothing
+    // protected `target` across it. A moving GC here relocates/reclaims
+    // `target` before the very next line's `set_field` uses it, corrupting
+    // the just-accepted Socket (observed: TestJNDIRealmIntegration's "LDAP
+    // Listener Thread" — a plain `Socket s = accept()` local, stored and
+    // read back across nothing but an unconditional `goto`, going stale;
+    // `Socket.getInetAddress()` then read a zeroed field and returned null).
+    // Pin it exactly like every other raw-ObjectRef-across-a-reentrant-call
+    // site in this codebase.
+    let pin_base = ctx.pin_native_root(target);
     let host_str = ctx.create_string(&peer_ip);
+    let target = ctx.read_native_pin(pin_base, target);
     ctx.set_field(target, SOCK_HOST, Value::Object(Some(host_str)));
     sock_set(target, |s| {
         s.port = peer_port;
@@ -3112,6 +3126,7 @@ fn re2_accept_into(
         s.closed = 0;
         s.stream_id = stream_id;
     });
+    ctx.unpin_native_roots(pin_base);
     Ok(Some(Value::Object(Some(target))))
 }
 
