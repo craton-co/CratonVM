@@ -39592,6 +39592,32 @@ const NEW13_SOCK_TLSID: usize = 2;
 const NEW13_SOCK_CLOSED: usize = 3;
 const NEW13_SOCK_SESSION: usize = 4;
 
+/// FIX (netty-client-socket-write-after-close): resolve a `javax/net/ssl/
+/// SSLSocket` object's `s2_registry` stream id whether it was built by
+/// `new13_do_create_socket` below (raw field `NEW13_SOCK_TLSID`) or by
+/// `net_phase_e`'s OWN `SSLSocketFactory.createSocket(String,int)` — that
+/// exact (class,name,descriptor) is registered in BOTH modules, and
+/// `net_phase_e::register_phase_e_networking` runs after `register_p68_ssl`
+/// (see lib.rs's `register_essential_natives`), so its side-table-based
+/// implementation wins and never populates this raw field, leaving it at
+/// its allocation default. The stream/lifecycle natives below are
+/// registered on the concrete `SSLSocket` class though (a more specific
+/// match than `net_phase_e`'s registrations on the `java/net/Socket`
+/// superclass), so they run regardless of which factory built the object —
+/// falling back to `net_phase_e`'s side table here is what makes
+/// `getOutputStream`/`write` work on a socket obtained via the plain
+/// 2-arg `createSocket(host, port)` (the overload Apache HttpClient5's
+/// classic connection pool actually calls, per
+/// docs/known-issues/netty-client-socket-write-after-close-nsme.md).
+fn new13_resolve_tls_id(ctx: &dyn NativeContext, this: ObjectRef) -> i32 {
+    if let Some(id) = ctx.get_field(this, NEW13_SOCK_TLSID).as_int() {
+        if id >= 0 {
+            return id;
+        }
+    }
+    crate::net_phase_e::sock_stream_id_for_upcall(this)
+}
+
 // SSLSession field layout: 3 fields.
 //   0 = protocol String
 //   1 = cipher String
@@ -40325,17 +40351,17 @@ pub(crate) fn register_p68_ssl(r: &mut NativeMethodRegistry) {
         "()Ljava/io/InputStream;",
         |ctx, args| {
             let this = obj_arg(args, 0)?;
-            let fd_id = ctx.get_field(this, 2);
+            let fd_id = new13_resolve_tls_id(ctx, this);
             if std::env::var_os("CRATONVM_DBG_TLS_SOCK").is_some() {
                 eprintln!(
-                    "[dbg-tls-sock] thread={:?} getInputStream tls_id={:?}",
+                    "[dbg-tls-sock] thread={:?} getInputStream tls_id={}",
                     std::thread::current().id(),
                     fd_id
                 );
             }
             // Return an InputStream that reads from the TLS fd
             let is = alloc_concurrent_synthetic(ctx, "javax/net/ssl/SSLSocketInputStream", 1);
-            ctx.set_field(is, 0, fd_id); // fd_id
+            ctx.set_field(is, 0, Value::Int(fd_id));
             Ok(Some(Value::Object(Some(is))))
         },
     );
@@ -40345,22 +40371,22 @@ pub(crate) fn register_p68_ssl(r: &mut NativeMethodRegistry) {
         "()Ljava/io/OutputStream;",
         |ctx, args| {
             let this = obj_arg(args, 0)?;
-            let fd_id = ctx.get_field(this, 2);
+            let fd_id = new13_resolve_tls_id(ctx, this);
             if std::env::var_os("CRATONVM_DBG_TLS_SOCK").is_some() {
                 eprintln!(
-                    "[dbg-tls-sock] thread={:?} getOutputStream tls_id={:?}",
+                    "[dbg-tls-sock] thread={:?} getOutputStream tls_id={}",
                     std::thread::current().id(),
                     fd_id
                 );
             }
             let os = alloc_concurrent_synthetic(ctx, "javax/net/ssl/SSLSocketOutputStream", 1);
-            ctx.set_field(os, 0, fd_id);
+            ctx.set_field(os, 0, Value::Int(fd_id));
             Ok(Some(Value::Object(Some(os))))
         },
     );
     r.register(ssl_sock, "close", "()V", |ctx, args| {
         let this = obj_arg(args, 0)?;
-        let tls_id = ctx.get_field(this, NEW13_SOCK_TLSID).as_int().unwrap_or(-1);
+        let tls_id = new13_resolve_tls_id(ctx, this);
         if std::env::var_os("CRATONVM_DBG_TLS_SOCK").is_some() {
             eprintln!(
                 "[dbg-tls-sock] thread={:?} JAVA_CALLED Socket.close() tls_id={}",
@@ -40382,17 +40408,28 @@ pub(crate) fn register_p68_ssl(r: &mut NativeMethodRegistry) {
                 }
             }
         }
+        // Keep net_phase_e's side table (if this socket was built through
+        // its createSocket(String,int) — see new13_resolve_tls_id) in sync,
+        // so any other code path that consults it also observes closed.
+        crate::net_phase_e::sock_mark_closed_for_upcall(this);
         ctx.set_field(this, NEW13_SOCK_CLOSED, Value::Int(1));
         Ok(None)
     });
     r.register(ssl_sock, "isClosed", "()Z", |ctx, args| {
         let this = obj_arg(args, 0)?;
-        Ok(Some(ctx.get_field(this, 3)))
+        let closed = match ctx.get_field(this, NEW13_SOCK_CLOSED) {
+            Value::Int(c) => c != 0,
+            _ => crate::net_phase_e::sock_is_closed_for_upcall(this),
+        };
+        Ok(Some(Value::Int(if closed { 1 } else { 0 })))
     });
     r.register(ssl_sock, "isConnected", "()Z", |ctx, args| {
         let this = obj_arg(args, 0)?;
-        let closed = ctx.get_field(this, 3).as_int().unwrap_or(0);
-        Ok(Some(Value::Int(if closed == 0 { 1 } else { 0 })))
+        let closed = match ctx.get_field(this, NEW13_SOCK_CLOSED) {
+            Value::Int(c) => c != 0,
+            _ => crate::net_phase_e::sock_is_closed_for_upcall(this),
+        };
+        Ok(Some(Value::Int(if closed { 0 } else { 1 })))
     });
     r.register(ssl_sock, "getPort", "()I", |ctx, args| {
         let this = obj_arg(args, 0)?;

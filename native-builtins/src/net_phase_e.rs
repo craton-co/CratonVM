@@ -221,6 +221,36 @@ pub(crate) fn sock_stream_id_for_upcall(this: ObjectRef) -> i32 {
     sock_get(this).stream_id
 }
 
+/// FIX (netty-client-socket-write-after-close): companion to
+/// [`sock_stream_id_for_upcall`] for `phases_late.rs`'s NEW-13
+/// `javax/net/ssl/SSLSocket` stream/lifecycle natives (`getInputStream`,
+/// `getOutputStream`, `close`, `isClosed`, `isConnected`). Those read/write
+/// raw object fields (`NEW13_SOCK_TLSID`/`NEW13_SOCK_CLOSED`), which is fine
+/// for a socket `new13_do_create_socket` built itself — but
+/// `SSLSocketFactory.createSocket(String,int)` is ALSO registered here (this
+/// module registers `register_phase_e_networking` after `register_p68_ssl`,
+/// so this implementation wins for that exact (class,name,descriptor) key)
+/// and builds the socket through the side table above, leaving those raw
+/// fields at their default `Object(None)`. Real bytecode method resolution
+/// then finds phases_late.rs's `getOutputStream`/`close`/etc — they're
+/// registered on the concrete `javax/net/ssl/SSLSocket` class, a more
+/// specific match than anything this module registers on the `java/net/
+/// Socket` superclass — so those raw-field readers ran regardless of which
+/// factory built the object, read the never-populated field, and treated
+/// every write on a `createSocket(host,port)`-obtained socket as though the
+/// stream had already been closed. These accessors let phases_late.rs fall
+/// back to the side table when the raw field isn't a valid entry.
+pub(crate) fn sock_mark_closed_for_upcall(this: ObjectRef) {
+    sock_set(this, |s| {
+        s.closed = 1;
+        s.stream_id = -1;
+    });
+}
+
+pub(crate) fn sock_is_closed_for_upcall(this: ObjectRef) -> bool {
+    sock_get(this).closed != 0
+}
+
 fn ss_get(this: ObjectRef) -> SsSide {
     let t = ss_side_table().lock();
     t.get(&this).copied().unwrap_or(SsSide {
