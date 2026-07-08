@@ -38,6 +38,7 @@ that `docs/known-issues/` holds only **open** items. Kept for traceability (repr
 | `http-client-reactor-windows-timeout-linux-epoll-gap-FIXED.md` | Retired 2026-07-08 on current `dev@d49ce503`: unique Azure binary `cratonvm-reactor-http-timeout-20260708-170805.bin` passes `ReactorClientHttpRequestFactoryTests` 10/10 in real-JDK Spring `KRun`; old Linux EPoll gap is obsolete after NIO selector routing/fixes. |
 | `groovy-compilationunit-phaseoperation-abstractmethoderror-FIXED.md` | `36e0cef1` / merge `a3d771c2` - lambda proxy no-code fallback now invokes concrete default methods on the proxy's functional interface; Spring Groovy `PhaseOperation.doPhaseOperation` AME gone. |
 | `tls-ocsp-clientcert-validation-not-enforced-FIXED.md` | Retired 2026-07-08: OCSP, client-cert identity plumbing, SSLEngineResult/HttpsServer, Linux native teardown, and TLS socket/session residuals are fixed on `dev`; remaining Tomcat deferred client-auth and TLS 1.2 DHE failures are dependency limitations requiring a TLS-backend change, not open CratonVM bugs. |
+| `linkedcaseinsensitivemap-this0-deserialization-FIXED.md` | `2c008f78` - `HashMap.readObject` replay uses `evict=false`, so anonymous `LinkedHashMap` subclasses do not invoke `removeEldestEntry` before their synthetic `this$0` outer reference is restored; `RSerial`, `MimeTypeTests`, and `MediaTypeTests` pass. |
 
 **Not moved — partial fixes with open residuals** (left in their suite folders / `docs/known-issues/`):
 - `spring-suite/crash-reports-2026-06-16/bug-05-generics-fieldtypesignature-cce.md`

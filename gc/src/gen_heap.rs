@@ -39,9 +39,10 @@ use crate::collector::{GarbageCollector, MonitorCleanup};
 use crate::concurrent_mark::ConcurrentGcState;
 use crate::gc::GcResult;
 use crate::heap::{
-    array_data_size, read_prim_element, write_prim_element, ArrayElementType, ObjectHeader,
-    ObjectKind, AUTOBOX_CLASS_ID, GC_FLAG_MARKED, GC_FLAG_OLD_GEN, HEADER_SIZE, REF_ELEMENT_SIZE,
-    SLOT_SIZE,
+    array_data_size, array_element_type_from_tag, object_kind_from_tag, read_prim_element,
+    write_prim_element, ArrayElementType, ObjectHeader, ObjectKind, ARRAY_ELEMENT_TYPE_OFFSET,
+    AUTOBOX_CLASS_ID, GC_FLAG_MARKED, GC_FLAG_OLD_GEN, HEADER_SIZE, OBJECT_KIND_OFFSET,
+    REF_ELEMENT_SIZE, SLOT_SIZE,
 };
 use crate::old_gen::OldGen;
 // Compact reference-field layout (CRATONVM_COMPACT_REF_FIELDS). Reference
@@ -1477,20 +1478,26 @@ impl GenerationalHeap {
             return None;
         }
 
-        // SAFETY: The region check above confirmed `raw` is inside one of the
-        // three arenas, so reading `HEADER_SIZE` bytes from it is valid memory.
-        // The reference is short-lived and the arena locks are held.
-        let header = unsafe { &*(raw as *const ObjectHeader) };
+        // Validate raw enum tags before constructing an `ObjectHeader`
+        // reference. Conservative root scans can land on arbitrary arena words;
+        // invalid `#[repr(u8)]` discriminants must be rejected as bytes, not
+        // reached through a typed enum match.
+        let kind = unsafe { object_kind_from_tag(*raw.add(OBJECT_KIND_OFFSET)) }?;
+        let _element_type =
+            unsafe { array_element_type_from_tag(*raw.add(ARRAY_ELEMENT_TYPE_OFFSET)) }?;
 
-        // Validate the discriminated-union tag. Object/Array are the only
+        // Object/Array are the only
         // valid kinds; anything else means we landed in the middle of a
         // field or in stale memory. HumongousFiller is a synthetic
         // walker-sentinel (round-9 gc CRIT-1) and never represents a
         // real object reachable from a root.
-        match header.kind {
-            ObjectKind::Object | ObjectKind::Array => {}
-            ObjectKind::HumongousFiller => return None,
+        if kind == ObjectKind::HumongousFiller {
+            return None;
         }
+
+        // SAFETY: The region check above confirmed `raw` is inside one of the
+        // three arenas, and the enum tag bytes have been validated.
+        let header = unsafe { &*(raw as *const ObjectHeader) };
         // Cheap structural sanity before trusting a conservative root
         // candidate as an object header. These invariants are written by every
         // allocator before publication; payload/interior words often satisfy
@@ -1506,7 +1513,7 @@ impl GenerationalHeap {
         // so a legitimate 256 MB int[] has num_slots = 2^26 > 1<<24 and
         // would be falsely rejected here. Bound num_slots only for non-arrays.
         const MAX_PLAUSIBLE_SLOTS: u32 = 1 << 24; // 16M slots -> 256 MB obj
-        let is_array = matches!(header.kind, ObjectKind::Array);
+        let is_array = kind == ObjectKind::Array;
         let is_compact = !is_array && is_compact_object(header);
         if is_array && header.gc_flags & GC_FLAG_COMPACT != 0 {
             return None;
@@ -8715,6 +8722,31 @@ mod tests {
     struct NoOpMonitors;
     impl crate::collector::MonitorCleanup for NoOpMonitors {
         fn remap_after_gc(&self, _pointer_map: &std::collections::HashMap<usize, usize>) {}
+    }
+
+    unsafe fn corrupt_header_byte(obj: ObjectRef, offset: usize, value: u8) {
+        unsafe {
+            (obj.as_ptr() as *mut u8).add(offset).write(value);
+        }
+    }
+
+    #[test]
+    fn is_object_address_rejects_invalid_raw_header_tags() {
+        let heap = GenerationalHeap::new();
+        let invalid_kind = heap.alloc_object(ClassId::new(1), 0);
+        unsafe {
+            corrupt_header_byte(invalid_kind, OBJECT_KIND_OFFSET, 0x7f);
+        }
+        assert!(heap.is_object_address(invalid_kind.as_ptr() as usize).is_none());
+
+        let invalid_element = heap.alloc_array(ClassId::new(2), ArrayElementType::Int, 1);
+        unsafe {
+            corrupt_header_byte(invalid_element, ARRAY_ELEMENT_TYPE_OFFSET, 0x7f);
+        }
+        assert!(
+            heap.is_object_address(invalid_element.as_ptr() as usize)
+                .is_none()
+        );
     }
 
     /// Test-only `StopTheWorldToken`. The single-threaded test harness

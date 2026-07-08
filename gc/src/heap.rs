@@ -27,9 +27,10 @@ use cratonvm_types::{ClassId, ObjectRef, Value};
 
 // Re-export heap types from the shared types crate.
 pub use cratonvm_types::{
-    array_data_size, array_data_size_checked, element_byte_size, ArrayElementType, ObjectHeader,
-    ObjectKind, ARRAY_LENGTH_OFFSET, AUTOBOX_CLASS_ID, GC_FLAG_COMPACT, GC_FLAG_MARKED,
-    GC_FLAG_OLD_GEN, HEADER_SIZE, REF_ELEMENT_SIZE, REF_FIELD_SIZE, SLOT_SIZE,
+    array_data_size, array_data_size_checked, array_element_type_from_tag, element_byte_size,
+    object_kind_from_tag, ArrayElementType, ObjectHeader, ObjectKind, ARRAY_ELEMENT_TYPE_OFFSET,
+    ARRAY_LENGTH_OFFSET, AUTOBOX_CLASS_ID, GC_FLAG_COMPACT, GC_FLAG_MARKED, GC_FLAG_OLD_GEN,
+    HEADER_SIZE, OBJECT_KIND_OFFSET, REF_ELEMENT_SIZE, REF_FIELD_SIZE, SLOT_SIZE,
 };
 use cratonvm_types::{class_layout, is_compact_object, CompactLayout};
 use std::sync::Arc;
