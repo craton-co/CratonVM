@@ -688,15 +688,39 @@ fn native_header_map_get(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
 
 fn native_http_string_init(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = obj_arg(args, 0)?;
-    let bytes = args.get(1).copied().unwrap_or(Value::Object(None));
-    ctx.set_field(this, HS_FIELD_BYTES, bytes);
+    let text = args.get(1).copied().unwrap_or(Value::Object(None));
+    ctx.set_field(this, HS_FIELD_BYTES, text);
+    ctx.set_field_by_name(this, "string", text);
     Ok(None)
+}
+
+fn http_string_text(ctx: &mut dyn NativeContext, this: ObjectRef) -> Option<ObjectRef> {
+    if let Value::Object(Some(s)) = ctx.get_field_by_name(this, "string") {
+        if ctx.read_string(s).is_some() {
+            return Some(s);
+        }
+    }
+
+    match ctx.get_field(this, HS_FIELD_BYTES) {
+        Value::Object(Some(s)) if ctx.read_string(s).is_some() => Some(s),
+        Value::Object(Some(bytes)) => {
+            let len = ctx.array_length(bytes);
+            let mut out = String::with_capacity(len);
+            for i in 0..len {
+                let b = ctx.get_array_element(bytes, i).as_int().unwrap_or(0) as u8;
+                out.push(char::from(b));
+            }
+            let s = ctx.create_string(&out);
+            ctx.set_field_by_name(this, "string", Value::Object(Some(s)));
+            Some(s)
+        }
+        _ => None,
+    }
 }
 
 fn native_http_string_to_string(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = obj_arg(args, 0)?;
-    let bytes = ctx.get_field(this, HS_FIELD_BYTES);
-    Ok(Some(bytes))
+    Ok(Some(Value::Object(http_string_text(ctx, this))))
 }
 
 /// Read a `HttpString` (or plain String) back into a Rust `String`.
@@ -712,6 +736,11 @@ fn read_http_string(ctx: &dyn NativeContext, v: Option<Value>) -> Option<String>
                     if let Some(s) = ctx.read_string(inner) {
                         return Some(s);
                     }
+                }
+            }
+            if let Value::Object(Some(inner)) = ctx.get_field_by_name(o, "string") {
+                if let Some(s) = ctx.read_string(inner) {
+                    return Some(s);
                 }
             }
             ctx.read_string(o)
@@ -953,11 +982,9 @@ pub fn register_undertow_natives(r: &mut NativeMethodRegistry) {
         "()Ljava/lang/String;",
         native_http_string_to_string,
     );
-    // --- Static `Headers.CONTENT_TYPE` et al. are populated lazily via
-    // a no-op <clinit> that Java's constant-folded field resolution
-    // tolerates (the synthetic layout reserves no slots — usage goes
-    // through string-named APIs above).
-    r.register(CLS_HEADERS, "<clinit>", "()V", |_ctx, _args| Ok(None));
+    // Let Undertow's real Headers.<clinit> populate HttpString constants.
+    // HttpRequestParser reflects over Headers/Methods/Protocols and expects
+    // every static HttpString field to hold a real value.
 
     // --- HttpServerExchange ---
     r.register(
