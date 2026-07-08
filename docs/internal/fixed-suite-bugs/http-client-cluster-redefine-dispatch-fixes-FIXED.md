@@ -13,8 +13,8 @@ Investigated across several 2026-07 sessions on the Azure Linux host,
 iterating against both a fast Linux+OpenJDK21 loop and the official
 Windows+JDK25 harness (`apps/spring-suite-runner`). Of the original 12
 target classes: 6 fully fixed outright, 1 (`ReactorClientHttpRequestFactoryTests`)
-mostly fixed on Windows with a residual TIMEOUT (see
-`http-client-reactor-windows-timeout-linux-epoll-gap.md`), 1
+later retired after current-dev real-JDK probes passed 10/10 (see
+`http-client-reactor-windows-timeout-linux-epoll-gap-FIXED.md`), 1
 (`reactive.ReactorClientHttpConnectorTests`) fully fixed on Windows, and 4
 remaining classes have open residuals now tracked in their own docs (see
 below). A separately-discovered AB-BA lock-order deadlock that caused an
@@ -141,7 +141,7 @@ Verified with 20-iteration repro loops: 13/20 (65%) hangs before → 5/20
 - [`docs/known-issues/class-manager-rwlock-writer-starvation.md`](../../known-issues/class-manager-rwlock-writer-starvation.md) — the residual 25% hang rate above; `parking_lot::RwLock`'s non-fair mode lets readers starve a queued writer.
 - [`docs/known-issues/http-client-simpleclienthttpresponsetests-mockito-dispatch-bugs.md`](../../known-issues/http-client-simpleclienthttpresponsetests-mockito-dispatch-bugs.md) — `SimpleClientHttpResponseTests`'s `UnfinishedVerificationException` + intermittent `(class, method, descriptor)`-substituting `NoSuchMethodError`.
 - [`docs/known-issues/spring-web-flow-outputstreamwriter-close-corruption.md`](../../known-issues/spring-web-flow-outputstreamwriter-close-corruption.md) — 2 of the 4 "genuine hang" classes (`OutputStreamPublisherTests`, `SubscriberInputStreamTests`); the other 2 (`JdkClientHttpRequestFactoryTests`, `reactive.ClientHttpConnectorTests`) are flagged there as needing separate investigation.
-- [`docs/known-issues/http-client-reactor-windows-timeout-linux-epoll-gap.md`](../../known-issues/http-client-reactor-windows-timeout-linux-epoll-gap.md) — `ReactorClientHttpRequestFactoryTests`'s residual (Linux: known EPollSelectorImpl gap; Windows: a different, uninvestigated TIMEOUT).
+- [`http-client-reactor-windows-timeout-linux-epoll-gap-FIXED.md`](http-client-reactor-windows-timeout-linux-epoll-gap-FIXED.md) — `ReactorClientHttpRequestFactoryTests`'s residual was later retired; current `dev` passes the class 10/10 under the Azure real-JDK Spring probe.
 
 `SimpleClientHttpRequestFactoryTests`'s residual 4 failures
 (`prepareConnectionWithRequestBody`, `deleteWithoutBodyDoesNotRaiseException`,
