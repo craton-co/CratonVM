@@ -25,6 +25,7 @@ use cratonvm_types::Value;
 pub struct ModuleXml {
     pub name: String,
     pub slot: Option<String>,
+    pub alias_target: Option<String>,
     pub main_class: Option<String>,
     pub properties: Vec<(String, String)>,
     pub resource_roots: Vec<ResourceRoot>,
@@ -146,6 +147,7 @@ pub fn parse_module_xml_bytes(bytes: &[u8]) -> Result<ModuleXml, ParseError> {
                                 match a.key.as_ref() {
                                     b"name" => mx.name = attr_str(&a)?,
                                     b"slot" => mx.slot = Some(attr_str(&a)?),
+                                    b"target-name" => mx.alias_target = Some(attr_str(&a)?),
                                     _ => {}
                                 }
                             }
@@ -516,6 +518,18 @@ mod tests {
         assert_eq!(mx.dependencies[2].services, ServicesDisposition::Import);
         assert!(mx.dependencies[4].export);
         assert!(mx.resource_roots.is_empty());
+    }
+
+    #[test]
+    fn parses_module_alias_target_name() {
+        let src = r#"<?xml version="1.0"?>
+<module-alias name="org.jboss.as.modcluster" target-name="org.wildfly.extension.mod_cluster" xmlns="urn:jboss:module:1.9"/>"#;
+        let mx = parse_module_xml_bytes(src.as_bytes()).unwrap();
+        assert_eq!(mx.name, "org.jboss.as.modcluster");
+        assert_eq!(
+            mx.alias_target.as_deref(),
+            Some("org.wildfly.extension.mod_cluster")
+        );
     }
 
     #[test]

@@ -77,8 +77,9 @@
 
 #![allow(clippy::needless_pass_by_value)]
 
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::panic::{catch_unwind, AssertUnwindSafe};
+use std::net::TcpListener;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex, OnceLock};
 use std::thread::{self, JoinHandle};
@@ -88,6 +89,9 @@ use cratonvm_native_api::{NativeContext, NativeMethodRegistry};
 use cratonvm_types::error::{MethodCallFailed, MethodCallResult, RuntimeError, VmError};
 use cratonvm_types::{ObjectRef, Value};
 
+use crate::xnio_conduits::{
+    SETTER_FIELD_CHANNEL_HANDLE, SETTER_FIELD_LISTENER_SLOT_INDEX, SETTER_NUM_SLOTS,
+};
 use crate::{alloc_concurrent_synthetic, obj_arg};
 
 // ---------------------------------------------------------------------------
@@ -99,6 +103,13 @@ pub(crate) const CLS_XNIO_WORKER: &str = "org/xnio/XnioWorker";
 pub(crate) const CLS_NIO_XNIO: &str = "org/xnio/nio/NioXnio";
 pub(crate) const CLS_NIO_XNIO_WORKER: &str = "org/xnio/nio/NioXnioWorker";
 pub(crate) const CLS_OPTION_MAP: &str = "org/xnio/OptionMap";
+const CLS_ACCEPTING_CHANNEL: &str = "org/xnio/channels/AcceptingChannel";
+const CLS_SIMPLE_ACCEPTING_CHANNEL: &str = "org/xnio/channels/SimpleAcceptingChannel";
+const CLS_SUSPENDABLE_ACCEPT_CHANNEL: &str = "org/xnio/channels/SuspendableAcceptChannel";
+const CLS_BOUND_CHANNEL: &str = "org/xnio/channels/BoundChannel";
+const CLS_CLOSEABLE_CHANNEL: &str = "org/xnio/channels/CloseableChannel";
+const CLS_CONFIGURABLE_CHANNEL: &str = "org/xnio/channels/Configurable";
+const CLS_QUEUED_NIO_TCP_SERVER2: &str = "org/xnio/nio/QueuedNioTcpServer2";
 
 // Xnio (2 slots): 0=name (String), 1=provider_handle (Long id into registry)
 pub(crate) const XNIO_FIELD_NAME: usize = 0;
@@ -117,6 +128,23 @@ pub(crate) const WORKER_FIELD_TASK_THREADS_COUNT: usize = 2;
 pub(crate) const WORKER_FIELD_STATE: usize = 3;
 pub(crate) const WORKER_FIELD_OPTIONS_HANDLE: usize = 4;
 pub(crate) const WORKER_NUM_SLOTS: usize = 5;
+
+// AcceptingChannel mirror (management HTTP listener):
+//   0 = localAddress (InetSocketAddress)
+//   1 = acceptListener (ChannelListener)
+//   2 = closeListener (ChannelListener)
+//   3 = open flag (boolean as int)
+//   4 = accepts-resumed flag (boolean as int)
+//   5 = worker mirror (XnioWorker)
+//   6 = listener id (Rust TcpListener registry key; 0 when unbound)
+const ACCEPT_FIELD_LOCAL_ADDRESS: usize = 0;
+const ACCEPT_FIELD_ACCEPT_LISTENER: usize = 1;
+const ACCEPT_FIELD_CLOSE_LISTENER: usize = 2;
+const ACCEPT_FIELD_OPEN: usize = 3;
+const ACCEPT_FIELD_RESUMED: usize = 4;
+const ACCEPT_FIELD_WORKER: usize = 5;
+const ACCEPT_FIELD_LISTENER_ID: usize = 6;
+const ACCEPT_NUM_SLOTS: usize = 7;
 
 // State ordinals (mirrors the bits Java side inspects).
 pub(crate) const WORKER_STATE_RUNNING: i32 = 0;
@@ -643,6 +671,32 @@ fn remove_worker(id: u64) {
 // Java ↔ Rust glue — natives registered with the method registry.
 // ---------------------------------------------------------------------------
 
+static NEXT_ACCEPTING_CHANNEL_ID: AtomicU64 = AtomicU64::new(1);
+
+fn accepting_listener_registry() -> &'static Mutex<HashMap<u64, TcpListener>> {
+    static REG: OnceLock<Mutex<HashMap<u64, TcpListener>>> = OnceLock::new();
+    REG.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn register_accepting_listener(listener: TcpListener) -> u64 {
+    let id = NEXT_ACCEPTING_CHANNEL_ID.fetch_add(1, Ordering::SeqCst);
+    accepting_listener_registry()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .insert(id, listener);
+    id
+}
+
+fn remove_accepting_listener(id: u64) {
+    if id == 0 {
+        return;
+    }
+    accepting_listener_registry()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .remove(&id);
+}
+
 /// Allocate the Java `Xnio` mirror (singleton) — lazily created.
 fn alloc_xnio_mirror(ctx: &mut dyn NativeContext) -> ObjectRef {
     let obj = alloc_concurrent_synthetic(ctx, CLS_XNIO, XNIO_NUM_SLOTS);
@@ -750,6 +804,239 @@ fn native_xnio_build_worker(ctx: &mut dyn NativeContext, _args: &[Value]) -> Met
     register_worker(worker_arc);
     let obj = alloc_worker_mirror(ctx, CLS_XNIO_WORKER, &worker);
     Ok(Some(Value::Object(Some(obj))))
+}
+
+fn decode_xnio_bind_address(
+    ctx: &mut dyn NativeContext,
+    addr: ObjectRef,
+) -> Result<(String, u16), MethodCallFailed> {
+    let port_via_method = match ctx.invoke_virtual(addr, "getPort", "()I", &[]) {
+        Ok(Some(Value::Int(v))) if (0..=u16::MAX as i32).contains(&v) => Some(v as u16),
+        _ => None,
+    };
+    let host_via_method = match ctx.invoke_virtual(
+        addr,
+        "getHostString",
+        "()Ljava/lang/String;",
+        &[],
+    ) {
+        Ok(Some(Value::Object(Some(s)))) => ctx.read_string(s),
+        _ => None,
+    };
+    if let Some(port) = port_via_method {
+        let host = host_via_method.unwrap_or_else(|| "0.0.0.0".to_string());
+        return Ok((if host.is_empty() { "0.0.0.0".to_string() } else { host }, port));
+    }
+
+    let holder = match ctx.get_field_by_name(addr, "holder") {
+        Value::Object(Some(h)) => h,
+        _ => addr,
+    };
+    let port = match ctx.get_field_by_name(holder, "port") {
+        Value::Int(v) if (0..=u16::MAX as i32).contains(&v) => Some(v as u16),
+        _ => match ctx.get_field(addr, 1) {
+            Value::Int(v) if (0..=u16::MAX as i32).contains(&v) => Some(v as u16),
+            _ => None,
+        },
+    };
+    let host = match ctx.get_field_by_name(holder, "hostname") {
+        Value::Object(Some(s)) => ctx.read_string(s),
+        _ => match ctx.get_field(addr, 0) {
+            Value::Object(Some(s)) => ctx.read_string(s),
+            _ => None,
+        },
+    }
+    .unwrap_or_else(|| "0.0.0.0".to_string());
+    let Some(port) = port else {
+        return Err(mcf_io("XnioWorker.createTcpConnectionServer: invalid bind address"));
+    };
+    Ok((if host.is_empty() { "0.0.0.0".to_string() } else { host }, port))
+}
+
+fn alloc_accepting_channel_mirror(
+    ctx: &mut dyn NativeContext,
+    worker: ObjectRef,
+    local_address: ObjectRef,
+    accept_listener: Value,
+    listener_id: u64,
+) -> ObjectRef {
+    let obj = alloc_concurrent_synthetic(ctx, CLS_ACCEPTING_CHANNEL, ACCEPT_NUM_SLOTS);
+    ctx.set_field(obj, ACCEPT_FIELD_LOCAL_ADDRESS, Value::Object(Some(local_address)));
+    ctx.set_field(obj, ACCEPT_FIELD_ACCEPT_LISTENER, accept_listener);
+    ctx.set_field(obj, ACCEPT_FIELD_CLOSE_LISTENER, Value::Object(None));
+    ctx.set_field(obj, ACCEPT_FIELD_OPEN, Value::Int(1));
+    ctx.set_field(obj, ACCEPT_FIELD_RESUMED, Value::Int(0));
+    ctx.set_field(obj, ACCEPT_FIELD_WORKER, Value::Object(Some(worker)));
+    ctx.set_field(obj, ACCEPT_FIELD_LISTENER_ID, Value::Long(listener_id as i64));
+    obj
+}
+
+// --- XnioWorker.createTcpConnectionServer(InetSocketAddress, ChannelListener, OptionMap) ---
+//
+// The abstract XnioWorker base implementation throws XNIO000900. CratonVM's
+// synthetic worker mirrors are stamped as that base class, so WildFly domain
+// management hit the unsupported method while starting the HTTP interface.
+// Bind a real TcpListener to keep the management port occupied and return a
+// lightweight AcceptingChannel mirror. Full accept/StreamConnection plumbing is
+// intentionally left to the existing XNIO event-loop work; this bridge supplies
+// the startup contract Undertow needs to install and resume the listener.
+fn native_xnio_create_tcp_connection_server(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    let worker = obj_arg(args, 0)?;
+    let bind_addr = obj_arg(args, 1)?;
+    let accept_listener = args.get(2).copied().unwrap_or(Value::Object(None));
+    let (host, port) = decode_xnio_bind_address(ctx, bind_addr)?;
+    let listener = TcpListener::bind((host.as_str(), port)).map_err(|e| {
+        mcf_io(format!(
+            "XnioWorker.createTcpConnectionServer bind {host}:{port}: {e}"
+        ))
+    })?;
+    let _ = listener.set_nonblocking(true);
+    let listener_id = register_accepting_listener(listener);
+    let channel = alloc_accepting_channel_mirror(
+        ctx,
+        worker,
+        bind_addr,
+        accept_listener,
+        listener_id,
+    );
+    Ok(Some(Value::Object(Some(channel))))
+}
+
+fn make_accepting_listener_setter(
+    ctx: &mut dyn NativeContext,
+    channel: ObjectRef,
+    listener_slot: usize,
+) -> ObjectRef {
+    let setter = alloc_concurrent_synthetic(ctx, "org/xnio/ChannelListener$Setter", SETTER_NUM_SLOTS);
+    ctx.set_field(
+        setter,
+        SETTER_FIELD_CHANNEL_HANDLE,
+        Value::Object(Some(channel)),
+    );
+    ctx.set_field(
+        setter,
+        SETTER_FIELD_LISTENER_SLOT_INDEX,
+        Value::Int(listener_slot as i32),
+    );
+    setter
+}
+
+fn native_accepting_get_accept_setter(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    let this = obj_arg(args, 0)?;
+    let setter = make_accepting_listener_setter(ctx, this, ACCEPT_FIELD_ACCEPT_LISTENER);
+    Ok(Some(Value::Object(Some(setter))))
+}
+
+fn native_accepting_get_close_setter(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    let this = obj_arg(args, 0)?;
+    let setter = make_accepting_listener_setter(ctx, this, ACCEPT_FIELD_CLOSE_LISTENER);
+    Ok(Some(Value::Object(Some(setter))))
+}
+
+fn native_accepting_accept(_ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
+    Ok(Some(Value::Object(None)))
+}
+
+fn native_accepting_get_local_address(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    let this = obj_arg(args, 0)?;
+    Ok(Some(ctx.get_field(this, ACCEPT_FIELD_LOCAL_ADDRESS)))
+}
+
+fn native_accepting_suspend_accepts(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    let this = obj_arg(args, 0)?;
+    ctx.set_field(this, ACCEPT_FIELD_RESUMED, Value::Int(0));
+    Ok(None)
+}
+
+fn native_accepting_resume_accepts(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    let this = obj_arg(args, 0)?;
+    ctx.set_field(this, ACCEPT_FIELD_RESUMED, Value::Int(1));
+    Ok(None)
+}
+
+fn native_accepting_is_accept_resumed(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    let this = obj_arg(args, 0)?;
+    let resumed = matches!(ctx.get_field(this, ACCEPT_FIELD_RESUMED), Value::Int(v) if v != 0);
+    Ok(Some(Value::Int(if resumed { 1 } else { 0 })))
+}
+
+fn native_accepting_wakeup_accepts(_ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
+    Ok(None)
+}
+
+fn native_accepting_await_acceptable(
+    _ctx: &mut dyn NativeContext,
+    _args: &[Value],
+) -> MethodCallResult {
+    Ok(None)
+}
+
+fn native_accepting_get_worker(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = obj_arg(args, 0)?;
+    Ok(Some(ctx.get_field(this, ACCEPT_FIELD_WORKER)))
+}
+
+fn native_accepting_get_io_thread(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = obj_arg(args, 0)?;
+    match ctx.get_field(this, ACCEPT_FIELD_WORKER) {
+        Value::Object(Some(worker)) => native_worker_get_io_thread(ctx, &[Value::Object(Some(worker))]),
+        _ => Ok(Some(Value::Object(None))),
+    }
+}
+
+fn native_accepting_close(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = obj_arg(args, 0)?;
+    if let Value::Long(id) = ctx.get_field(this, ACCEPT_FIELD_LISTENER_ID) {
+        if id > 0 {
+            remove_accepting_listener(id as u64);
+        }
+    }
+    ctx.set_field(this, ACCEPT_FIELD_LISTENER_ID, Value::Long(0));
+    ctx.set_field(this, ACCEPT_FIELD_OPEN, Value::Int(0));
+    ctx.set_field(this, ACCEPT_FIELD_RESUMED, Value::Int(0));
+    Ok(None)
+}
+
+fn native_accepting_is_open(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = obj_arg(args, 0)?;
+    let open = matches!(ctx.get_field(this, ACCEPT_FIELD_OPEN), Value::Int(v) if v != 0);
+    Ok(Some(Value::Int(if open { 1 } else { 0 })))
+}
+
+fn native_accepting_supports_option(
+    _ctx: &mut dyn NativeContext,
+    _args: &[Value],
+) -> MethodCallResult {
+    Ok(Some(Value::Int(0)))
+}
+
+fn native_accepting_get_option(_ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
+    Ok(Some(Value::Object(None)))
+}
+
+fn native_accepting_set_option(_ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
+    Ok(Some(Value::Object(None)))
 }
 
 // --- XnioWorker.getIoThread / getIoThreads ---
@@ -875,10 +1162,111 @@ fn mcf_runtime(msg: &str) -> MethodCallFailed {
     }))
 }
 
+fn mcf_io<S: Into<String>>(message: S) -> MethodCallFailed {
+    RuntimeError::IOException {
+        message: message.into(),
+    }
+    .into()
+}
+
 // ---------------------------------------------------------------------------
 // Registration — called from `lib.rs` after the WildFly Undertow natives so
 // T19.7 subsystems see the Xnio / XnioWorker surface.
 // ---------------------------------------------------------------------------
+
+fn register_accepting_channel_surface(r: &mut NativeMethodRegistry, cls: &str) {
+    r.register(
+        cls,
+        "accept",
+        "()Lorg/xnio/channels/ConnectedChannel;",
+        native_accepting_accept,
+    );
+    r.register(
+        cls,
+        "accept",
+        "()Lorg/xnio/channels/CloseableChannel;",
+        native_accepting_accept,
+    );
+    r.register(
+        cls,
+        "accept",
+        "()Lorg/xnio/StreamConnection;",
+        native_accepting_accept,
+    );
+    r.register(
+        cls,
+        "getAcceptSetter",
+        "()Lorg/xnio/ChannelListener$Setter;",
+        native_accepting_get_accept_setter,
+    );
+    r.register(
+        cls,
+        "getCloseSetter",
+        "()Lorg/xnio/ChannelListener$Setter;",
+        native_accepting_get_close_setter,
+    );
+    r.register(
+        cls,
+        "getLocalAddress",
+        "()Ljava/net/SocketAddress;",
+        native_accepting_get_local_address,
+    );
+    r.register(
+        cls,
+        "getLocalAddress",
+        "(Ljava/lang/Class;)Ljava/net/SocketAddress;",
+        native_accepting_get_local_address,
+    );
+    r.register(cls, "suspendAccepts", "()V", native_accepting_suspend_accepts);
+    r.register(cls, "resumeAccepts", "()V", native_accepting_resume_accepts);
+    r.register(cls, "isAcceptResumed", "()Z", native_accepting_is_accept_resumed);
+    r.register(cls, "wakeupAccepts", "()V", native_accepting_wakeup_accepts);
+    r.register(cls, "awaitAcceptable", "()V", native_accepting_await_acceptable);
+    r.register(
+        cls,
+        "awaitAcceptable",
+        "(JLjava/util/concurrent/TimeUnit;)V",
+        native_accepting_await_acceptable,
+    );
+    r.register(
+        cls,
+        "getAcceptThread",
+        "()Lorg/xnio/XnioExecutor;",
+        native_accepting_get_io_thread,
+    );
+    r.register(
+        cls,
+        "getIoThread",
+        "()Lorg/xnio/XnioIoThread;",
+        native_accepting_get_io_thread,
+    );
+    r.register(
+        cls,
+        "getWorker",
+        "()Lorg/xnio/XnioWorker;",
+        native_accepting_get_worker,
+    );
+    r.register(cls, "close", "()V", native_accepting_close);
+    r.register(cls, "isOpen", "()Z", native_accepting_is_open);
+    r.register(
+        cls,
+        "supportsOption",
+        "(Lorg/xnio/Option;)Z",
+        native_accepting_supports_option,
+    );
+    r.register(
+        cls,
+        "getOption",
+        "(Lorg/xnio/Option;)Ljava/lang/Object;",
+        native_accepting_get_option,
+    );
+    r.register(
+        cls,
+        "setOption",
+        "(Lorg/xnio/Option;Ljava/lang/Object;)Ljava/lang/Object;",
+        native_accepting_set_option,
+    );
+}
 
 pub fn register_xnio_worker_natives(r: &mut NativeMethodRegistry) {
     r.register(
@@ -905,6 +1293,14 @@ pub fn register_xnio_worker_natives(r: &mut NativeMethodRegistry) {
         "(Lorg/xnio/XnioWorker$Builder;)Lorg/xnio/XnioWorker;",
         native_xnio_build_worker,
     );
+    for cls in [CLS_XNIO_WORKER, CLS_NIO_XNIO_WORKER] {
+        r.register(
+            cls,
+            "createTcpConnectionServer",
+            "(Ljava/net/InetSocketAddress;Lorg/xnio/ChannelListener;Lorg/xnio/OptionMap;)Lorg/xnio/channels/AcceptingChannel;",
+            native_xnio_create_tcp_connection_server,
+        );
+    }
 
     r.register(
         CLS_XNIO_WORKER,
@@ -958,6 +1354,18 @@ pub fn register_xnio_worker_natives(r: &mut NativeMethodRegistry) {
 
     // NioXnioWorker inherits the surface of XnioWorker — register the
     // subset that real WildFly code calls through the concrete class.
+    for cls in [
+        CLS_ACCEPTING_CHANNEL,
+        CLS_SIMPLE_ACCEPTING_CHANNEL,
+        CLS_SUSPENDABLE_ACCEPT_CHANNEL,
+        CLS_BOUND_CHANNEL,
+        CLS_CLOSEABLE_CHANNEL,
+        CLS_CONFIGURABLE_CHANNEL,
+        CLS_QUEUED_NIO_TCP_SERVER2,
+    ] {
+        register_accepting_channel_surface(r, cls);
+    }
+
     r.register(
         CLS_NIO_XNIO_WORKER,
         "getIoThread",
@@ -1285,6 +1693,87 @@ mod tests {
                 "()Lorg/xnio/XnioIoThread;"
             )
             .is_some());
+        assert!(r
+            .find(
+                CLS_XNIO_WORKER,
+                "createTcpConnectionServer",
+                "(Ljava/net/InetSocketAddress;Lorg/xnio/ChannelListener;Lorg/xnio/OptionMap;)Lorg/xnio/channels/AcceptingChannel;"
+            )
+            .is_some());
+        assert!(r
+            .find(
+                CLS_ACCEPTING_CHANNEL,
+                "getAcceptSetter",
+                "()Lorg/xnio/ChannelListener$Setter;"
+            )
+            .is_some());
+    }
+
+    #[test]
+    fn wf_domain_create_tcp_connection_server_returns_accepting_channel() {
+        let mut ctx = mock_ctx();
+        let worker = XnioWorker::new("wf_domain_tcp_server", OptionMap::default());
+        register_worker(worker.clone());
+        let worker_mirror = alloc_worker_mirror(&mut ctx, CLS_XNIO_WORKER, &worker);
+        let bind_addr = alloc_concurrent_synthetic(&mut ctx, "java/net/InetSocketAddress", 2);
+        let host = ctx.create_string("127.0.0.1");
+        ctx.set_field(bind_addr, 0, Value::Object(Some(host)));
+        ctx.set_field(bind_addr, 1, Value::Int(0));
+        let listener = alloc_concurrent_synthetic(&mut ctx, "org/xnio/ChannelListener", 0);
+
+        let channel = match native_xnio_create_tcp_connection_server(
+            &mut ctx,
+            &[
+                Value::Object(Some(worker_mirror)),
+                Value::Object(Some(bind_addr)),
+                Value::Object(Some(listener)),
+                Value::Object(None),
+            ],
+        )
+        .unwrap()
+        .unwrap()
+        {
+            Value::Object(Some(o)) => o,
+            other => panic!("expected accepting channel, got {:?}", other),
+        };
+        assert_eq!(
+            ctx.get_field(channel, ACCEPT_FIELD_LOCAL_ADDRESS),
+            Value::Object(Some(bind_addr))
+        );
+        assert_eq!(
+            ctx.get_field(channel, ACCEPT_FIELD_ACCEPT_LISTENER),
+            Value::Object(Some(listener))
+        );
+        assert_eq!(
+            native_accepting_is_open(&mut ctx, &[Value::Object(Some(channel))])
+                .unwrap()
+                .unwrap(),
+            Value::Int(1)
+        );
+
+        let setter = match native_accepting_get_accept_setter(
+            &mut ctx,
+            &[Value::Object(Some(channel))],
+        )
+        .unwrap()
+        .unwrap()
+        {
+            Value::Object(Some(o)) => o,
+            other => panic!("expected setter, got {:?}", other),
+        };
+        assert_eq!(
+            ctx.get_field(setter, SETTER_FIELD_CHANNEL_HANDLE),
+            Value::Object(Some(channel))
+        );
+        assert_eq!(
+            ctx.get_field(setter, SETTER_FIELD_LISTENER_SLOT_INDEX),
+            Value::Int(ACCEPT_FIELD_ACCEPT_LISTENER as i32)
+        );
+
+        native_accepting_close(&mut ctx, &[Value::Object(Some(channel))]).unwrap();
+        assert_eq!(ctx.get_field(channel, ACCEPT_FIELD_OPEN), Value::Int(0));
+        worker.shutdown_now();
+        assert!(worker.await_termination(Duration::from_secs(2)));
     }
 
     #[test]

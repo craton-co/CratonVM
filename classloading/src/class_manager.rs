@@ -8588,6 +8588,52 @@ fn synthetic_stub_fields(name: &str) -> Vec<cratonvm_reader::field::ClassFileFie
                 attributes: vec![],
             },
         ],
+        // AcceptingChannel = 7 (localAddress, acceptListener, closeListener,
+        //                       open, resumed, worker, listenerId).
+        "org/xnio/channels/AcceptingChannel" => vec![
+            ClassFileField {
+                access_flags: FieldAccessFlags::empty(),
+                name: cratonvm_types::intern_arc("localAddress"),
+                descriptor: cratonvm_types::intern_arc("Ljava/net/SocketAddress;"),
+                attributes: vec![],
+            },
+            ClassFileField {
+                access_flags: FieldAccessFlags::empty(),
+                name: cratonvm_types::intern_arc("acceptListener"),
+                descriptor: cratonvm_types::intern_arc("Lorg/xnio/ChannelListener;"),
+                attributes: vec![],
+            },
+            ClassFileField {
+                access_flags: FieldAccessFlags::empty(),
+                name: cratonvm_types::intern_arc("closeListener"),
+                descriptor: cratonvm_types::intern_arc("Lorg/xnio/ChannelListener;"),
+                attributes: vec![],
+            },
+            ClassFileField {
+                access_flags: FieldAccessFlags::empty(),
+                name: cratonvm_types::intern_arc("open"),
+                descriptor: cratonvm_types::intern_arc("I"),
+                attributes: vec![],
+            },
+            ClassFileField {
+                access_flags: FieldAccessFlags::empty(),
+                name: cratonvm_types::intern_arc("resumed"),
+                descriptor: cratonvm_types::intern_arc("I"),
+                attributes: vec![],
+            },
+            ClassFileField {
+                access_flags: FieldAccessFlags::empty(),
+                name: cratonvm_types::intern_arc("worker"),
+                descriptor: cratonvm_types::intern_arc("Lorg/xnio/XnioWorker;"),
+                attributes: vec![],
+            },
+            ClassFileField {
+                access_flags: FieldAccessFlags::empty(),
+                name: cratonvm_types::intern_arc("listenerId"),
+                descriptor: cratonvm_types::intern_arc("J"),
+                attributes: vec![],
+            },
+        ],
 
         // ---- T19.7.c: XNIO I/O-thread + executor-key field layouts ----
         //
