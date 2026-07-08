@@ -3416,6 +3416,16 @@ pub fn execute(
                         )? {
                             return Ok(inner);
                         }
+                        if let Some(inner) = try_lambda_default_method_dispatch(
+                            shared,
+                            thread,
+                            recv_cid,
+                            method_name,
+                            method_descriptor,
+                            args,
+                        )? {
+                            return Ok(inner);
+                        }
                     }
                     // Receiver-is-annotation-proxy rescue. An annotation
                     // member call (e.g. JUnit5's `ExtendWith.value()`)
@@ -18116,6 +18126,65 @@ pub(crate) fn lambda_impl_dispatch_override(
         *cid != ClassId::new(0)
             && shared.class_manager.read().get_loaded_class_id(name) != Some(*cid)
     })
+}
+
+/// Try to run a concrete default method declared by a lambda proxy's
+/// functional interface.
+///
+/// Lambda proxy ids are synthetic and do not live in the class store. Calls to
+/// non-SAM interface defaults normally reach the real functional interface via
+/// direct dispatch, but an invoke through a superinterface can resolve to that
+/// superinterface's abstract declaration first. Groovy's
+/// `CompilationUnit$PhaseOperation.doPhaseOperation(CompilationUnit)` is one
+/// such shape: the receiver is an `ISourceUnitOperation`/
+/// `IPrimaryClassNodeOperation` lambda, while the resolved declaration is the
+/// abstract parent interface.
+fn try_lambda_default_method_dispatch(
+    shared: &SharedVm,
+    thread: &mut JvmThread,
+    obj_class_id: ClassId,
+    method_name: &str,
+    method_descriptor: &str,
+    full_args: &[Value],
+) -> Result<Option<Option<Value>>, MethodCallFailed> {
+    let interface_name = {
+        let proxies = shared.lambda_proxies.read();
+        match proxies.get(&obj_class_id) {
+            Some(call_site) => call_site.functional_interface.clone(),
+            None => return Ok(None),
+        }
+    };
+
+    let declaring_id = {
+        let cm = shared.class_manager.read();
+        let Some(interface_id) = cm.get_loaded_class_id(&interface_name) else {
+            return Ok(None);
+        };
+        match crate::classloading::find_method_recursive(
+            interface_id,
+            method_name,
+            method_descriptor,
+            &cm.class_store,
+        ) {
+            Some((method, declaring_id)) if method.code().is_some() && !method.is_abstract() => {
+                Some(declaring_id)
+            }
+            _ => None,
+        }
+    };
+
+    let Some(declaring_id) = declaring_id else {
+        return Ok(None);
+    };
+    crate::vm::invoke_on_class_shared_no_retarget(
+        shared,
+        thread,
+        declaring_id,
+        method_name,
+        method_descriptor,
+        full_args,
+    )
+    .map(Some)
 }
 
 /// Try to dispatch a method call on a lambda proxy object.
