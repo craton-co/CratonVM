@@ -826,6 +826,43 @@ fn register_spring_codec_intrinsics(registry: &mut NativeMethodRegistry) {
         "(Ljava/lang/CharSequence;Ljava/nio/charset/Charset;)I",
         native_spring_char_sequence_encoder_calculate_capacity,
     );
+
+    registry.register(
+        "org/springframework/core/annotation/PackagesAnnotationFilter",
+        "matches",
+        "(Ljava/lang/String;)Z",
+        native_spring_packages_annotation_filter_matches,
+    );
+    registry.register(
+        "org/springframework/core/annotation/AnnotationFilter",
+        "matches",
+        "(Ljava/lang/Class;)Z",
+        native_spring_annotation_filter_matches_class,
+    );
+    registry.register(
+        "org/springframework/core/annotation/AnnotationsScanner",
+        "hasPlainJavaAnnotationsOnly",
+        "(Ljava/lang/Class;)Z",
+        native_spring_has_plain_java_annotations_only_class,
+    );
+    registry.register(
+        "org/springframework/core/annotation/AnnotationsScanner",
+        "hasPlainJavaAnnotationsOnly",
+        "(Ljava/lang/Object;)Z",
+        native_spring_has_plain_java_annotations_only_object,
+    );
+    registry.register(
+        "org/junit/platform/commons/util/AnnotationUtils",
+        "isInJavaLangAnnotationPackage",
+        "(Ljava/lang/Class;)Z",
+        native_junit_is_in_java_lang_annotation_package,
+    );
+    registry.register(
+        "org/springframework/test/context/junit/jupiter/SpringExtension",
+        "resolveParameter",
+        "(Lorg/junit/jupiter/api/extension/ParameterContext;Lorg/junit/jupiter/api/extension/ExtensionContext;)Ljava/lang/Object;",
+        native_spring_extension_resolve_parameter,
+    );
 }
 
 fn native_spring_char_sequence_encoder_calculate_capacity(
@@ -848,6 +885,282 @@ fn native_spring_char_sequence_encoder_calculate_capacity(
 
     let capacity = len.saturating_mul(8).min(i32::MAX as i64) as i32;
     Ok(Some(Value::Int(capacity)))
+}
+
+fn spring_java_class_name(ctx: &mut dyn NativeContext, class_obj: ObjectRef) -> Option<String> {
+    match native_class_get_name(ctx, &[Value::Object(Some(class_obj))]) {
+        Ok(Some(Value::Object(Some(name)))) => ctx.read_string(name),
+        _ => None,
+    }
+}
+
+fn spring_packages_filter_matches_text(
+    ctx: &mut dyn NativeContext,
+    filter: ObjectRef,
+    annotation_type: &str,
+) -> bool {
+    let prefixes = match ctx.get_field_by_name(filter, "prefixes") {
+        Value::Object(Some(prefixes)) => prefixes,
+        _ => return false,
+    };
+    for i in 0..ctx.array_length(prefixes) {
+        if let Value::Object(Some(prefix)) = ctx.get_array_element(prefixes, i) {
+            if let Some(prefix) = ctx.read_string(prefix) {
+                if annotation_type.starts_with(&prefix) {
+                    return true;
+                }
+            }
+        }
+    }
+    false
+}
+
+fn native_spring_packages_annotation_filter_matches(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    let this = obj_arg(args, 0)?;
+    let annotation_type = match args.get(1) {
+        Some(Value::Object(Some(s))) => ctx.read_string(*s).unwrap_or_default(),
+        _ => return Ok(Some(Value::Int(0))),
+    };
+    Ok(Some(Value::Int(
+        spring_packages_filter_matches_text(ctx, this, &annotation_type) as i32,
+    )))
+}
+
+fn native_spring_annotation_filter_matches_class(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    let this = obj_arg(args, 0)?;
+    let class_obj = obj_arg(args, 1)?;
+    let Some(type_name) = spring_java_class_name(ctx, class_obj) else {
+        return Ok(Some(Value::Int(0)));
+    };
+
+    if ctx
+        .class_name_of_id(ctx.class_id_of_object(this))
+        .as_deref()
+        == Some("org/springframework/core/annotation/PackagesAnnotationFilter")
+    {
+        return Ok(Some(Value::Int(
+            spring_packages_filter_matches_text(ctx, this, &type_name) as i32,
+        )));
+    }
+
+    let type_name_obj = ctx.create_string(&type_name);
+    ctx.invoke_virtual(
+        this,
+        "matches",
+        "(Ljava/lang/String;)Z",
+        &[Value::Object(Some(type_name_obj))],
+    )
+}
+
+fn native_junit_is_in_java_lang_annotation_package(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    let class_obj = match args.first() {
+        Some(Value::Object(Some(o))) => *o,
+        _ => return Ok(Some(Value::Int(0))),
+    };
+    let matched = spring_java_class_name(ctx, class_obj)
+        .map(|name| name.starts_with("java.lang.annotation"))
+        .unwrap_or(false);
+    Ok(Some(Value::Int(matched as i32)))
+}
+
+fn spring_has_plain_java_annotations_only_name(name: &str) -> bool {
+    name.starts_with("java.") || name == "org.springframework.core.Ordered"
+}
+
+fn native_spring_has_plain_java_annotations_only_class(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    let class_obj = match args.first() {
+        Some(Value::Object(Some(o))) => *o,
+        _ => return Ok(Some(Value::Int(0))),
+    };
+    let matched = spring_java_class_name(ctx, class_obj)
+        .map(|name| spring_has_plain_java_annotations_only_name(&name))
+        .unwrap_or(false);
+    Ok(Some(Value::Int(matched as i32)))
+}
+
+fn native_spring_has_plain_java_annotations_only_object(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    let annotated = match args.first() {
+        Some(Value::Object(Some(o))) => *o,
+        _ => return Ok(Some(Value::Int(0))),
+    };
+    let class_name = ctx.class_name_of_id(ctx.class_id_of_object(annotated));
+    if class_name.as_deref() == Some("java/lang/Class") {
+        return native_spring_has_plain_java_annotations_only_class(ctx, args);
+    }
+    if matches!(
+        class_name.as_deref(),
+        Some("java/lang/reflect/Method")
+            | Some("java/lang/reflect/Constructor")
+            | Some("java/lang/reflect/Field")
+    ) {
+        if let Ok(Some(Value::Object(Some(declaring)))) =
+            ctx.invoke_virtual(annotated, "getDeclaringClass", "()Ljava/lang/Class;", &[])
+        {
+            return native_spring_has_plain_java_annotations_only_class(
+                ctx,
+                &[Value::Object(Some(declaring))],
+            );
+        }
+    }
+    Ok(Some(Value::Int(0)))
+}
+
+fn spring_extension_get_application_context(
+    ctx: &mut dyn NativeContext,
+    extension_context: ObjectRef,
+) -> MethodCallResult {
+    ctx.invoke_special(
+        "org/springframework/test/context/junit/jupiter/SpringExtension",
+        "getApplicationContext",
+        "(Lorg/junit/jupiter/api/extension/ExtensionContext;)Lorg/springframework/context/ApplicationContext;",
+        &[Value::Object(Some(extension_context))],
+    )
+}
+
+fn native_spring_extension_resolve_parameter(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    let parameter_context = obj_arg(args, 1)?;
+    let mut extension_context = obj_arg(args, 2)?;
+
+    let parameter = match ctx.invoke_virtual(
+        parameter_context,
+        "getParameter",
+        "()Ljava/lang/reflect/Parameter;",
+        &[],
+    )? {
+        Some(Value::Object(Some(parameter))) => parameter,
+        _ => return Ok(Some(Value::Object(None))),
+    };
+    let index = ctx
+        .invoke_virtual(parameter_context, "getIndex", "()I", &[])?
+        .and_then(|v| v.as_int())
+        .unwrap_or(0);
+    let executable = match ctx.invoke_virtual(
+        parameter_context,
+        "getDeclaringExecutable",
+        "()Ljava/lang/reflect/Executable;",
+        &[],
+    )? {
+        Some(Value::Object(Some(executable))) => executable,
+        _ => return Ok(Some(Value::Object(None))),
+    };
+    let mut test_class = match ctx.invoke_virtual(
+        extension_context,
+        "getRequiredTestClass",
+        "()Ljava/lang/Class;",
+        &[],
+    )? {
+        Some(Value::Object(Some(test_class))) => test_class,
+        _ => return Ok(Some(Value::Object(None))),
+    };
+
+    if ctx
+        .class_name_of_id(ctx.class_id_of_object(executable))
+        .as_deref()
+        == Some("java/lang/reflect/Constructor")
+    {
+        if let Ok(Some(Value::Object(Some(declaring)))) =
+            ctx.invoke_virtual(executable, "getDeclaringClass", "()Ljava/lang/Class;", &[])
+        {
+            test_class = declaring;
+            if let Ok(Some(Value::Object(Some(scoped)))) = ctx.invoke_special(
+                "org/springframework/test/context/junit/jupiter/SpringExtension",
+                "findProperlyScopedExtensionContext",
+                "(Ljava/lang/Class;Lorg/junit/jupiter/api/extension/ExtensionContext;)Lorg/junit/jupiter/api/extension/ExtensionContext;",
+                &[
+                    Value::Object(Some(test_class)),
+                    Value::Object(Some(extension_context)),
+                ],
+            ) {
+                extension_context = scoped;
+            }
+        }
+    }
+
+    let application_context =
+        match spring_extension_get_application_context(ctx, extension_context)? {
+            Some(Value::Object(Some(application_context))) => application_context,
+            other => return Ok(other),
+        };
+
+    let parameter_type =
+        match ctx.invoke_virtual(parameter, "getType", "()Ljava/lang/Class;", &[])? {
+            Some(Value::Object(Some(parameter_type))) => parameter_type,
+            _ => return Ok(Some(Value::Object(Some(application_context)))),
+        };
+    if spring_java_class_name(ctx, parameter_type).as_deref()
+        == Some("org.springframework.context.ApplicationContext")
+    {
+        return Ok(Some(Value::Object(Some(application_context))));
+    }
+
+    let is_bean_override = ctx
+        .invoke_special(
+            "org/springframework/test/context/junit/jupiter/SpringExtension",
+            "isBeanOverride",
+            "(Ljava/lang/reflect/Parameter;)Z",
+            &[Value::Object(Some(parameter))],
+        )?
+        .and_then(|v| v.as_int())
+        .unwrap_or(0)
+        != 0;
+    if is_bean_override {
+        if let Ok(Some(Value::Object(Some(handler)))) = ctx.invoke_special(
+            "org/springframework/test/context/bean/override/BeanOverrideUtils",
+            "resolveHandlerForParameter",
+            "(Ljava/lang/reflect/Parameter;Ljava/lang/Class;)Lorg/springframework/test/context/bean/override/BeanOverrideHandler;",
+            &[Value::Object(Some(parameter)), Value::Object(Some(test_class))],
+        ) {
+            if let Ok(Some(Value::Object(Some(bean_name)))) =
+                ctx.invoke_virtual(handler, "getBeanName", "()Ljava/lang/String;", &[])
+            {
+                return ctx.invoke_virtual(
+                    application_context,
+                    "getBean",
+                    "(Ljava/lang/String;)Ljava/lang/Object;",
+                    &[Value::Object(Some(bean_name))],
+                );
+            }
+        }
+    }
+
+    let bean_factory = match ctx.invoke_virtual(
+        application_context,
+        "getAutowireCapableBeanFactory",
+        "()Lorg/springframework/beans/factory/config/AutowireCapableBeanFactory;",
+        &[],
+    )? {
+        Some(Value::Object(Some(bean_factory))) => bean_factory,
+        _ => return Ok(Some(Value::Object(None))),
+    };
+    ctx.invoke_special(
+        "org/springframework/beans/factory/annotation/ParameterResolutionDelegate",
+        "resolveDependency",
+        "(Ljava/lang/reflect/Parameter;ILjava/lang/Class;Lorg/springframework/beans/factory/config/AutowireCapableBeanFactory;)Ljava/lang/Object;",
+        &[
+            Value::Object(Some(parameter)),
+            Value::Int(index),
+            Value::Object(Some(test_class)),
+            Value::Object(Some(bean_factory)),
+        ],
+    )
 }
 
 /// Native `Duration.parse(CharSequence)` for real-JDK mode.
