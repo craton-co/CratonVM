@@ -2,7 +2,7 @@
 
 | | |
 |---|---|
-| **Status** | ✅ FIXED / RETIRED from `docs/known-issues` on 2026-07-08. A fresh Azure single-class rerun on current `dev` no longer reproduces the 330–510s JIT timeout; it reaches the later, separately tracked `DomainParameterXref` `removeEldestEntry` NSME in ~33s. |
+| **Status** | ✅ FIXED / RETIRED from `docs/known-issues` on 2026-07-08. A fresh Azure single-class rerun on current `dev` no longer reproduces the 330–510s JIT timeout; it reaches the later, separately tracked `DomainParameterXref` `removeEldestEntry` NSME in ~31s. |
 | **Area** | JIT tiered-compilation dispatch overhead, surfaced via `org.hibernate.orm.test.jpa.criteria.InPredicateTest` |
 | **Symptom** | `java.util.concurrent.TimeoutException: testInPredicate(...) timed out after 120 seconds`, class wall time ~330–510s |
 | **Discovered** | Symptom first observed 2026-07-07 in a contended 4-shard local rerun ([hib-local-windows-rerun-20260707.md](../../known-issues/hib-local-windows-rerun-20260707.md)); root-caused same day with a clean, uncontended single-class rerun (this doc). |
@@ -21,8 +21,8 @@ Result:
 
 ```text
 @@FAIL org.hibernate.orm.test.jpa.criteria.InPredicateTest :: java.lang.NoSuchMethodError: java/lang/Object.removeEldestEntry(Ljava/util/Map$Entry;)Z
-@@RESULT 0 org.hibernate.orm.test.jpa.criteria.InPredicateTest found=1 started=1 ok=0 failed=1 aborted=0 skipped=0 ms=33049
-@@HOST_RC=0 @@WALL=33s
+@@RESULT 0 org.hibernate.orm.test.jpa.criteria.InPredicateTest found=1 started=1 ok=0 failed=1 aborted=0 skipped=0 ms=30985
+@@HOST_RC=0 @@WALL=31s
 ```
 
 This proves the dispatch-heavy `.in()` phase no longer consumes the JUnit 120s

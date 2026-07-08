@@ -18,7 +18,7 @@ longer times out in `SqmCriteriaNodeBuilder.in()`. It reaches
 
 ```text
 @@FAIL org.hibernate.orm.test.jpa.criteria.InPredicateTest :: java.lang.NoSuchMethodError: java/lang/Object.removeEldestEntry(Ljava/util/Map$Entry;)Z
-@@RESULT 0 org.hibernate.orm.test.jpa.criteria.InPredicateTest found=1 started=1 ok=0 failed=1 aborted=0 skipped=0 ms=33049
+@@RESULT 0 org.hibernate.orm.test.jpa.criteria.InPredicateTest found=1 started=1 ok=0 failed=1 aborted=0 skipped=0 ms=30985
 ```
 
 The timeout note is therefore retired to

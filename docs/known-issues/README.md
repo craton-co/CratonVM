@@ -6,7 +6,7 @@ angles**; this index is the consolidated map. Read it first.
 
 ## 2026-07-08 `InPredicateTest` timeout retired; `DomainParameterXref` NSME remains open
 
-- ✅ RETIRED: [`InPredicateTest` 100k-element criteria `IN` predicate JIT timeout](../internal/fixed-suite-bugs/hib-inpredicate-dispatch-heavy-jit-timeout-20260707-FIXED.md) — a 2026-07-08 Azure rerun on current `dev` no longer reproduces the 330–510s JIT timeout. The class reaches the later `DomainParameterXref` phase and fails in ~33s with `java/lang/Object.removeEldestEntry(Ljava/util/Map$Entry;)Z`, so the dispatch-heavy `.in()` timeout family is closed but this is not a full `InPredicateTest` pass.
+- ✅ RETIRED: [`InPredicateTest` 100k-element criteria `IN` predicate JIT timeout](../internal/fixed-suite-bugs/hib-inpredicate-dispatch-heavy-jit-timeout-20260707-FIXED.md) — a 2026-07-08 Azure rerun on current `dev` no longer reproduces the 330–510s JIT timeout. The class reaches the later `DomainParameterXref` phase and fails in ~31s with `java/lang/Object.removeEldestEntry(Ljava/util/Map$Entry;)Z`, so the dispatch-heavy `.in()` timeout family is closed but this is not a full `InPredicateTest` pass.
 - 🔴 OPEN: [`DomainParameterXref` `LinkedHashMap.removeEldestEntry` dispatch resolves to `Object`](hib-domainparameterxref-lhm-removeeldestentry-nsme.md) — re-confirmed 2026-07-08 once the timeout stopped masking it. Keep this separate Layer-1/register-invisible-root issue in `docs/known-issues`.
 
 ## 2026-07-07/08 crypto/fips1402 ProvEC `ClassNotFoundException`, SD-JWT hang, and P-384 KeyPairGenerator gaps FIXED
