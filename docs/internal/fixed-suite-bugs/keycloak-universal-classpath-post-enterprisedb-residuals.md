@@ -133,3 +133,13 @@ The validation no longer contains the fixed signatures:
 
 Both HotSpot and CratonVM now reach the same local environmental boundary:
 Testcontainers cannot find a valid Docker environment on this host.
+
+## Follow-up Recheck: origin/dev Reconciliation
+
+On 2026-07-08, `origin/dev` still carried the old open
+`docs/known-issues/keycloak-universal-classpath-post-enterprisedb-residuals.md`
+record while local `dev` already had the fix and this archived note. Merging
+`origin/dev` into
+`codex/fix-keycloak-post-enterprisedb-followup-20260708-002` kept the fixed
+state: the known-issues path remains absent, this archive remains present, and
+the generator/runner fixes listed above are still in the merged tree.
