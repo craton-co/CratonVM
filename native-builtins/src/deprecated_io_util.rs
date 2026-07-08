@@ -1027,25 +1027,19 @@ fn register_class_new_instance(r: &mut NativeMethodRegistry) {
                 }
             }
 
-            // Check if the no-arg constructor exists
-            if !ctx.method_exists(&class_name, "<init>", "()V") {
+            // Class.newInstance() is invoked on a Class mirror, so keep the
+            // mirror's exact loader namespace. ByteBuddy/Hibernate routinely
+            // define same-named helper classes in per-test loaders; resolving
+            // by name here can miss the loader-private no-arg constructor or
+            // allocate the global copy instead of the mirror's class.
+            if !ctx.class_declares_method(class_id, "<init>", "()V") {
                 return Err(RuntimeError::UnsupportedOperationException {
                     message: format!("InstantiationException: no no-arg constructor in {}", class_name),
                 }.into());
             }
 
-            // Create a new instance and invoke the constructor
-            let result = ctx.new_object(&class_name)?;
-            match result {
-                Some(Value::Object(Some(obj))) => {
-                    ctx.invoke(
-                        &class_name,
-                        "<init>",
-                        "()V",
-                        &[Value::Object(Some(obj))],
-                    )?;
-                    Ok(Some(Value::Object(Some(obj))))
-                }
+            match ctx.new_object_initialized_with_class_id(class_id, "()V", &[])? {
+                Some(Value::Object(Some(obj))) => Ok(Some(Value::Object(Some(obj)))),
                 _ => Err(RuntimeError::UnsupportedOperationException {
                     message: format!("InstantiationException: failed to instantiate {}", class_name),
                 }.into()),

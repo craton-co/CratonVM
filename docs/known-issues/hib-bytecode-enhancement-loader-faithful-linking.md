@@ -2,7 +2,7 @@
 
 | | |
 |---|---|
-| **Status** | 🟡 **PARTIALLY FIXED 2026-07-06** — root cause of the 2026-07-04 REOPENED regression found and fixed: `CRATONVM_LOADER_AWARE_RESOLUTION` is implemented as **three independent copies** of the same gate function (`classloading/src/class_manager.rs`, `native-builtins/src/classloader.rs`, `vm/src/runtime/env_cache.rs`), each with a doc comment asserting it "stays in lock-step" with the others. Only the `vm` crate's copy was ever flipped from default-OFF to default-ON (the `context.groovy` fix, `docs/known-issues/hib-proxyclassreuse-loader-blind-class-resolution.md`); the other two silently stayed default-OFF, so most of the actual loader-faithful fixes for THIS bug — which live in `classloading` (superclass/interface linking, verifier hierarchy lookup) and `native-builtins` (`preload_supertypes_via_loader`, `inherit_lookup_loader`, annotation Class-value resolution, `descriptor_to_class_mirror_via_loader` for reflective Field/Method/Constructor types) — were disabled by default despite being genuinely landed and correct. This fully explains the 2026-07-04 "REOPENED" finding: nobody had actually exercised the gate as globally on. Fix (branch `fix/hib-enhancement-annotation-classvalue-loader-20260706`): flipped the two stale copies' `Err(_) => false` to `Err(_) => true`, restoring the lock-step invariant. Verified on a fresh worktree (Azure host, dev `9f1db39d`+): `gated_subset.txt` (131 classes) went from **PASS 40 / HANG 13 / FAIL 78** (baseline) to **PASS 86 / HANG 7 / ABORTED 2 / FAIL 36** (fixed), with the dominant `targetEntity=X, but the attribute is declared as X` class-identity-mismatch signature **eliminated from the FAIL set entirely**. Status is "partially fixed" (not fully closed) because ~36 FAILs + 7 HANGs remain — see "UPDATE 2026-07-06" below for the residual breakdown; these are distinct, separate bugs one layer downstream of the one just fixed, matching this doc's established pattern of layered fixes. |
+| **Status** | 🟡 **PARTIALLY FIXED 2026-07-08** — current `dev` no longer reproduces the two residual buckets fixed in this pass: loader-private `$HibernateInstantiator` helpers now instantiate via the exact `Class` mirror `ClassId`, and JIT invokeinterface dispatch now retries the CP-resolved interface when a receiver-class dispatch raises the exact catchable `NoSuchMethodError`. The doc is **not retired** because the same residual sample still has interpreter-reproducing failures: `FetchGraphTest` now fails 16/17 with `SpecializedKey.$$_hibernate_read_specializedEntities()` returning null, and `BasicAttributesLazyGroupTest` still fails at container/Nested Jupiter setup. See "UPDATE 2026-07-08" below. |
 | **Area** | VM core — real-JDK-mode loader-faithful resolution: superclass/interface *linking* (not just `new`/checkcast/ldc), `invokespecial` owner dispatch, and link-time verification of trusted runtime-generated classes. |
 | **Builds on** | [hib-proxyclassreuse-loader-blind-class-resolution.md](hib-proxyclassreuse-loader-blind-class-resolution.md) — the three-layer `CONSTANT_Class` / `defineClass`-namespace / `findLoadedClass` fix and the `resolve_class_loader_aware` mechanism. That doc's gate is now **default-on** (flipped 2026-07-03) and validated via a Hibernate app-gauntlet soak; this doc describes the *linking/dispatch* layer built on top of it. Both docs describe the same loader-identity mechanism at different depths — read the other doc first for the gate's base three-layer fix, this one for the enhancement-specific linking/dispatch/SessionFactory-build work. |
 
@@ -182,6 +182,61 @@ own repro classes) both now build their `SessionFactory` successfully.
    mismatches in `enhancement.detached.*` tests — not investigated, may be a
    related but distinct class-identity gap in detached-entity merge/contains
    checks.
+
+## UPDATE 2026-07-08 — `Class.newInstance` mirror fidelity + JIT invokeinterface-default rescue
+
+Rechecked this note on Azure from branch
+`codex/retire-hib-bytecode-enhancement-loader-20260708-170637`, worktree
+`/data/data/cratonvm-worktrees/20260708-170637-hib-bytecode-enhancement-loader`,
+off `dev` `d49ce5033f70`. The note is **still open**; this pass fixed two
+real sub-buckets but did not close the full issue family.
+
+**Fixes landed in this pass:**
+
+1. `native-builtins/src/deprecated_io_util.rs` had a second
+   `Class.newInstance()` native registered after the loader-faithful
+   `lang_class.rs` implementation. The later registration still checked
+   `method_exists(&class_name, "<init>", "()V")` and allocated by class name,
+   which is wrong for ByteBuddy/Hibernate helpers defined in per-test loaders.
+   It now checks `class_declares_method(class_id, "<init>", "()V")` and calls
+   `new_object_initialized_with_class_id(class_id, "()V", &[])`, preserving the
+   exact mirror loader namespace.
+2. `vm/src/jit/helpers.rs` only retried CP-interface fallback on the old
+   internal `LinkageError::NoSuchMethodError` form. `invoke_or_native` now
+   materializes ordinary linkage misses as catchable Java `NoSuchMethodError`s,
+   so JIT MIC/dispatch helpers were skipping the retry and surfacing
+   concrete-entity `asManagedEntity()` misses. The helper now recognizes both
+   forms, but only when the thrown `NoSuchMethodError.detailMessage` matches
+   this dispatch's own `{dispatch_class}.{method}{descriptor}`, avoiding the
+   older double-invoke hazard for nested callee failures.
+
+**Verification:**
+
+- `rustfmt --check vm/src/jit/helpers.rs native-builtins/src/deprecated_io_util.rs`
+- `CARGO_TARGET_DIR=/data/data/cratonvm-targets/hibenhloader-20260708-170637-test2 cargo test -p cratonvm-vm --test t8_deprecated_conformance t8_2_6_class_new_instance -- --nocapture` — 2/2 passed.
+- Release probe binary: `/data/data/cratonvm-binaries/cvhibenhloader-20260708-170637-fix2`.
+- Hibernate residual sample log: `/data/data/hibenhloader-20260708-170637-probes/fix2-residual-sample.log`.
+
+**Post-fix sample results (JIT on, real JDK 25):**
+
+| Class | Result |
+|---|---|
+| `LazyGroupTest` | 2/2 pass |
+| `OnlyLazyBasicUpdateTest` | 20/20 pass |
+| `EagerAndLazyBasicUpdateTest` | 40/40 pass |
+| `SimpleLazyGroupUpdateTest` | 2/2 pass |
+| `BatchFetchProxyTest` | 5/5 pass |
+| `LazyCollectionLoadingTest` | 3/3 pass |
+| `ManyToOneAllowProxyTests` | 2/2 pass |
+| `OneToOneAllowProxyTests` | 2/2 pass |
+| `InverseToOneAllowProxyTests` | 2/2 pass |
+| `FetchGraphTest` | 1/17 pass; 16 fail with `NullPointerException: ... SpecializedKey.$$_hibernate_read_specializedEntities() is null` |
+| `BasicAttributesLazyGroupTest` | harness found 5 tests but started 0; `Nested Jupiter execution failed: 1 failure(s)` |
+
+`FetchGraphTest` and `BasicAttributesLazyGroupTest` reproduce with `--nojit` on
+the same `fix2` binary, so the remaining failures are not the JIT
+`asManagedEntity()` gap fixed above. Keep this document in `docs/known-issues`
+until those interpreter/native residuals are closed.
 
 ## Context
 
