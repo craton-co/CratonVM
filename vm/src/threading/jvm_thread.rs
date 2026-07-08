@@ -333,7 +333,7 @@ pub struct JvmThread {
     /// invalidating the cached addresses). The key is `(seq, exec_epoch)` — NOT
     /// `seq` alone: `seq` proves the frame was never popped, but a still-present
     /// frame can RE-EXECUTE and reassign its locals; `exec_epoch` (bumped on
-    /// every callee-return into the frame) detects that so stale roots are never
+    /// callee-return and local-slot writes) detects that so stale roots are never
     /// reused (see `Frame::seq` / `Frame::exec_epoch`). Empty/unused when the
     /// gate is off.
     pub rs_cache: Vec<((u64, u64), Vec<ObjectRef>)>,
