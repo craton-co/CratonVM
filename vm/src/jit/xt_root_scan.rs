@@ -676,7 +676,6 @@ mod imp {
 #[cfg(windows)]
 pub use imp::{helper_window_pass, resume, take_over_pass};
 
-
 // ---------------------------------------------------------------------------
 // Linux x86-64 implementation (signal rendezvous)
 // ---------------------------------------------------------------------------
@@ -758,6 +757,7 @@ mod imp {
 
     static INSTALL: Once = Once::new();
     static ACTIVE: AtomicBool = AtomicBool::new(false);
+    static HELPER_MODE: AtomicBool = AtomicBool::new(false);
     static SLOTS: [LinuxSlot; MAX_SLOTS] = [const { LinuxSlot::new() }; MAX_SLOTS];
     static RANGES: [AtomicRange; MAX_RANGES] = [const { AtomicRange::new() }; MAX_RANGES];
     static RANGES_LEN: AtomicUsize = AtomicUsize::new(0);
@@ -836,7 +836,7 @@ mod imp {
             }
             i += 1;
         }
-        if !in_jit {
+        if !in_jit && !HELPER_MODE.load(Ordering::Acquire) {
             slot.state.store(STATE_NOT_JIT, Ordering::Release);
             return;
         }
@@ -933,18 +933,34 @@ mod imp {
         }
     }
 
-    fn readable_region_end(addr: usize) -> Option<usize> {
-        let maps = std::fs::read_to_string("/proc/self/maps").ok()?;
+    fn readable_regions() -> Vec<(usize, usize)> {
+        let mut regions = Vec::new();
+        let Ok(maps) = std::fs::read_to_string("/proc/self/maps") else {
+            return regions;
+        };
         for line in maps.lines() {
             let mut parts = line.split_whitespace();
-            let range = parts.next()?;
-            let perms = parts.next()?;
+            let Some(range) = parts.next() else { continue };
+            let Some(perms) = parts.next() else { continue };
             if !perms.starts_with('r') {
                 continue;
             }
-            let (lo, hi) = range.split_once('-')?;
-            let lo = usize::from_str_radix(lo, 16).ok()?;
-            let hi = usize::from_str_radix(hi, 16).ok()?;
+            let Some((lo, hi)) = range.split_once('-') else {
+                continue;
+            };
+            let Ok(lo) = usize::from_str_radix(lo, 16) else {
+                continue;
+            };
+            let Ok(hi) = usize::from_str_radix(hi, 16) else {
+                continue;
+            };
+            regions.push((lo, hi));
+        }
+        regions
+    }
+
+    fn readable_region_end_from_regions(addr: usize, regions: &[(usize, usize)]) -> Option<usize> {
+        for &(lo, hi) in regions {
             if addr >= lo && addr < hi {
                 return Some(hi.min(addr.saturating_add(MAX_STACK_SCAN)));
             }
@@ -953,6 +969,19 @@ mod imp {
     }
 
     fn scan_slot<F>(slot: &LinuxSlot, is_obj: &F, roots: &mut Vec<ObjectRef>) -> usize
+    where
+        F: Fn(usize) -> Option<ObjectRef>,
+    {
+        let regions = readable_regions();
+        scan_slot_with_regions(slot, &regions, is_obj, roots)
+    }
+
+    fn scan_slot_with_regions<F>(
+        slot: &LinuxSlot,
+        regions: &[(usize, usize)],
+        is_obj: &F,
+        roots: &mut Vec<ObjectRef>,
+    ) -> usize
     where
         F: Fn(usize) -> Option<ObjectRef>,
     {
@@ -969,7 +998,7 @@ mod imp {
         if rsp == 0 || rsp & 0x7 != 0 {
             return found;
         }
-        let Some(end) = readable_region_end(rsp) else {
+        let Some(end) = readable_region_end_from_regions(rsp, regions) else {
             return found;
         };
         let mut p = rsp;
@@ -982,6 +1011,59 @@ mod imp {
             p += 8;
         }
         found
+    }
+
+    fn release_slot(slot: &LinuxSlot) {
+        slot.resume.store(1, Ordering::Release);
+        let start = Instant::now();
+        while slot.state.load(Ordering::Acquire) == STATE_PARKED
+            && start.elapsed() < Duration::from_millis(100)
+        {
+            std::thread::yield_now();
+        }
+        slot.clear();
+    }
+
+    fn classify_slot_helper_window<F>(
+        slot: &LinuxSlot,
+        regions: &[(usize, usize)],
+        ranges: &[(usize, usize)],
+        is_obj: &F,
+        candidates: &mut Vec<ObjectRef>,
+    ) -> bool
+    where
+        F: Fn(usize) -> Option<ObjectRef>,
+    {
+        let mut has_jit = false;
+        for reg in &slot.regs {
+            let v = reg.load(Ordering::Acquire);
+            if !has_jit && ranges.iter().any(|&(lo, hi)| v >= lo && v < hi) {
+                has_jit = true;
+            }
+            if let Some(o) = is_obj(v) {
+                candidates.push(o);
+            }
+        }
+
+        let rsp = slot.rsp.load(Ordering::Acquire);
+        if rsp == 0 || rsp & 0x7 != 0 {
+            return has_jit;
+        }
+        let Some(end) = readable_region_end_from_regions(rsp, regions) else {
+            return has_jit;
+        };
+        let mut p = rsp;
+        while p + 8 <= end {
+            let w = unsafe { (p as *const usize).read_unaligned() };
+            if !has_jit && ranges.iter().any(|&(lo, hi)| w >= lo && w < hi) {
+                has_jit = true;
+            }
+            if let Some(o) = is_obj(w) {
+                candidates.push(o);
+            }
+            p += 8;
+        }
+        has_jit
     }
 
     /// Linux implementation of the cross-thread JIT root scan. We cannot use
@@ -1052,30 +1134,91 @@ mod imp {
     pub fn resume(taken: TakenOver) {
         for tid in taken.tids {
             if let Some(slot) = find_slot(tid) {
-                slot.resume.store(1, Ordering::Release);
-                let start = Instant::now();
-                while slot.state.load(Ordering::Acquire) == STATE_PARKED
-                    && start.elapsed() < Duration::from_millis(100)
-                {
-                    std::thread::yield_now();
-                }
-                slot.clear();
+                release_slot(slot);
             }
         }
         ACTIVE.store(false, Ordering::Release);
+        HELPER_MODE.store(false, Ordering::Release);
         RANGES_LEN.store(0, Ordering::Release);
     }
 
     pub fn helper_window_pass<F>(
-        _taken: &TakenOver,
-        _is_obj: &F,
-        _roots: &mut Vec<ObjectRef>,
-        _blocked_os_tids: &[u32],
+        taken: &TakenOver,
+        is_obj: &F,
+        roots: &mut Vec<ObjectRef>,
+        blocked_os_tids: &[u32],
     ) -> (usize, usize)
     where
         F: Fn(usize) -> Option<ObjectRef>,
     {
-        (0, 0)
+        let ranges = crate::jit::jit_code_ranges_snapshot();
+        if ranges.is_empty() || blocked_os_tids.is_empty() {
+            return (0, 0);
+        }
+        install_handler();
+        publish_ranges(&ranges);
+        let regions = readable_regions();
+        let had_taken = taken.count() > 0;
+        ACTIVE.store(true, Ordering::Release);
+        HELPER_MODE.store(true, Ordering::Release);
+
+        let self_tid = gettid();
+        let mut candidates: Vec<ObjectRef> = Vec::new();
+        let mut windows = 0usize;
+        let mut found_total = 0usize;
+        let mut examined = 0usize;
+        for &tid in blocked_os_tids {
+            if tid == self_tid || taken.contains(tid) {
+                continue;
+            }
+            let Some(slot) = arm_slot(tid) else {
+                break;
+            };
+            examined += 1;
+            if !send_takeover_signal(tid) {
+                slot.clear();
+                continue;
+            }
+            match wait_for_response(slot, Duration::from_millis(20)) {
+                STATE_PARKED => {
+                    candidates.clear();
+                    let has_jit = classify_slot_helper_window(
+                        slot,
+                        &regions,
+                        &ranges,
+                        is_obj,
+                        &mut candidates,
+                    );
+                    if has_jit {
+                        windows += 1;
+                        found_total += candidates.len();
+                        let roots_this_window = candidates.len();
+                        roots.append(&mut candidates);
+                        if dbg() {
+                            eprintln!(
+                                "[xt-jit-roots] linux helper-window tid={tid}: JIT frames on native stack (Rip outside JIT), {roots_this_window} conservative roots"
+                            );
+                        }
+                    }
+                    release_slot(slot);
+                }
+                _ => slot.clear(),
+            }
+        }
+
+        HELPER_MODE.store(false, Ordering::Release);
+        if !had_taken {
+            ACTIVE.store(false, Ordering::Release);
+            RANGES_LEN.store(0, Ordering::Release);
+        }
+        XT_HELPER_WINDOWS_SCANNED.fetch_add(windows as u64, Ordering::Relaxed);
+        XT_HELPER_WINDOW_ROOTS.fetch_add(found_total as u64, Ordering::Relaxed);
+        if dbg() {
+            eprintln!(
+                "[xt-jit-roots] linux helper-window pass: examined {examined} blocked peer(s), {windows} window(s), {found_total} conservative root(s)"
+            );
+        }
+        (windows, found_total)
     }
 }
 

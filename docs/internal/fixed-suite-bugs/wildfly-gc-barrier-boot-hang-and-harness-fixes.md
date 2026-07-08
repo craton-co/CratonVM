@@ -143,7 +143,7 @@ comment before relying on a copy for a long unattended run.
 
 - `docs/internal/fixed-suite-bugs/wildfly-infinispan-remove-listener-segfault.md` — the SIGSEGV whose
   doc first flagged these three harness findings as follow-up work.
-- `docs/known-issues/wildfly-logging-subsystem-requires-real-logmanager.md` — the next blocker in the
+- `docs/internal/fixed-suite-bugs/wildfly-logging-subsystem-requires-real-logmanager.md` — the next blocker in the
   chain, newly reachable now that these three are resolved.
 - `docs/known-issues/wildfly-xnio-mockselector-mutex-segfault.md` — its "Reproduction attempt 2026-07-07"
   section documented the same GC-barrier hang from an earlier, less-precise investigation (`CRATONVM_DBG_STW_CENSUS`

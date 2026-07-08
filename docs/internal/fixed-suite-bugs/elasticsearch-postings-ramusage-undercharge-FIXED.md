@@ -1,42 +1,73 @@
-# Elasticsearch postings-format hangs (general interpreter throughput)
+# Elasticsearch postings-format timeout from RamUsageTester undercharge
 
-Status: open
+Status: fixed 2026-07-08.
 
-Date observed: 2026-07-02. Re-verified still open: 2026-07-05.
+The surviving postings-format residual was not a deadlock and not a new Lucene
+postings corruption. The actionable root cause was the CratonVM native bridge
+for `org.apache.lucene.tests.util.RamUsageTester.ramUsed(Object)`: it returned a
+flat 1024 bytes for every `org.apache.lucene.document.Document`.
 
-2026-07-05 update: the focused postings correctness failures uncovered during
-this retry were fixed separately from the class-level timeout. The retry added
-the missing FFM/Lucene checksum bridges and a conservative Lucene/JUnit test
-stack JIT skip, then validated:
+`BasePostingsFormatTestCase.testDocIDRunEnd` uses `LineFileDocs.nextDoc()`, keeps
+only the `body` field, indexes documents until `bytesIndexed >= atLeast(100) *
+1024`, and increments `bytesIndexed` with `RamUsageTester.ramUsed(justBodyDoc)`.
+HotSpot/Lucene 10.4 reports roughly `align8(376 + 2 * body.length())` for these
+body-only documents, averaging about 2.2 KiB for seed `B17AC9D3E1F2A0C4`.
+CratonVM therefore indexed roughly twice as many documents as the test intended,
+which turned an already interpreter-heavy postings path into a class-level
+suite timeout.
 
-```text
-ES812PostingsFormatTests.testDocsAndFreqsAndPositionsAndPayloads: OK (76.8s)
-ES85BloomFilterPostingsFormatTests.testInvertedWrite: OK (46.3s)
-ES87BloomFilterPostingsFormatTests.testInvertedWrite: OK (46.5s)
-MMap endian/random-access and BufferedChecksumIndexInput side-effect/footer probes: OK
-```
+## Fix
 
-The broader issue remains open. A full
-`ES85BloomFilterPostingsFormatTests` class run still hits the timeout.
+`native-builtins/src/lib.rs` now inspects Lucene `Document.fields`, reads each
+Lucene `Field.fieldsData` string payload, and estimates the document charge from
+actual string length. Unknown shapes fall back to the old 1024-byte conservative
+charge. The helper pins the field list across re-entrant `List.size()` / `get()`
+upcalls so it remains correct under moving GC.
 
-2026-07-05 follow-up: the separate no-JIT
-`ES85BloomFilterPostingsFormatTests.testRandom`
-`java.nio.file.FileAlreadyExistsException` was fixed by correcting
-`Files.walkFileTree` visitor dispatch to prefer concrete `Path` overrides
-before falling back to erased `Object` visitor methods. Validation against
-`/data/cratonvm/cratonvm-es85-fileexists-20260705-walktree`:
+The test mock gained Lucene field-name mappings solely for focused native unit
+tests; production uses normal class metadata field lookup.
 
-```text
-CRATONVM_DISABLE_JIT=1 ES85BloomFilterPostingsFormatTests.testRandom: OK (83.677s)
-log: /data/tmp/es85-testRandom-nojit-walktree-20260705.log
-```
+## Validation
 
-The full class remains unresolved after the requested longer retry:
+Focused Rust test:
 
 ```text
-ES85BloomFilterPostingsFormatTests full class: TIMEOUT (timeout 600s, RC=124)
-log: /data/tmp/es85-full-600-walktree-20260705.log
+cargo test -p cratonvm-native-builtins lucene_ram_usage_tests --lib
+result: 3 passed
 ```
+
+Fresh unique binaries on the Azure host:
+
+```text
+baseline: /data/data/bin/cratonvm-espostings-residuals-142548-baseline
+fixed:    /data/data/bin/cratonvm-espostings-residuals-142548-fixed
+```
+
+Synthetic one-field document probe, `DocumentRamUsageProbe 160 1`:
+
+```text
+HotSpot:          1912..1920 bytes
+CratonVM before: 1024 bytes for every document
+CratonVM after:  1896..1904 bytes
+```
+
+Exact `LineFileDocs` body-only loop used by `BasePostingsFormatTestCase`, target
+102400 bytes, seed `B17AC9D3E1F2A0C4`:
+
+```text
+HotSpot:          count=44 bytes=102664 max=3488
+CratonVM before: count=100 bytes=102400 max=1024
+CratonVM after:  count=43 bytes=107848 max=6000
+```
+
+The Azure host did not have a compiled Elasticsearch fixture, so the full
+`ES85BloomFilterPostingsFormatTests` class was not rerun there. The validation
+above exercises the exact byte-budget gate that controlled the residual
+class-level timeout. If a future full-suite run still times out, it should be
+tracked as a new residual after this RamUsageTester undercharge fix.
+
+
+## Historical Notes
 
 ## Summary
 

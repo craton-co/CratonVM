@@ -308,6 +308,11 @@ fn native_randomized_context_get_per_thread(
     Ok(Some(Value::Object(Some(resources))))
 }
 
+const LUCENE_RAM_USAGE_FALLBACK_DOCUMENT_BYTES: i64 = 1024;
+const LUCENE_RAM_USAGE_MIN_DOCUMENT_BYTES: i64 = 1024;
+const LUCENE_RAM_USAGE_DOCUMENT_BASE_BYTES: i64 = 376;
+const LUCENE_RAM_USAGE_EXTRA_FIELD_BYTES: i64 = 256;
+
 fn native_lucene_ram_usage_tester_ram_used(
     ctx: &mut dyn NativeContext,
     args: &[Value],
@@ -322,10 +327,18 @@ fn native_lucene_ram_usage_tester_ram_used(
     let bytes = if class_name == "org/apache/lucene/document/Document" {
         // Lucene postings-format tests use RamUsageTester.ramUsed(Document) only
         // to cap how many generated documents are indexed. The real helper walks
-        // the full object graph reflectively; under CratonVM that dominates the
-        // test without increasing coverage. Keep the loop scale close to the
-        // intended 100 KiB target by charging each generated Document 1 KiB.
-        1024
+        // the full object graph reflectively; under CratonVM that reflective
+        // walk dominates the test without increasing postings coverage.
+        //
+        // Keep the loop scale close to HotSpot by charging the actual string
+        // payloads inside the Document. For the body-only LineFileDocs shape in
+        // BasePostingsFormatTestCase, HotSpot 25 / Lucene 10.4 reports almost
+        // exactly `align8(376 + 2 * body.length())` bytes (seed B17AC9D3E1F2A0C4:
+        // avg ~2281 bytes, range 1256..3424 for the first 32 docs). The old flat
+        // 1 KiB estimate undercharged this loop by ~2.2x and made CratonVM index
+        // far more documents than the test's intended ~100 KiB cap.
+        estimate_lucene_document_ram_used(ctx, obj)
+            .unwrap_or(LUCENE_RAM_USAGE_FALLBACK_DOCUMENT_BYTES)
     } else if class_name == "java/lang/String" {
         ctx.read_string(obj)
             .map(|s| 40 + (s.len() as i64 * 2))
@@ -334,6 +347,182 @@ fn native_lucene_ram_usage_tester_ram_used(
         128
     };
     Ok(Some(Value::Long(bytes)))
+}
+
+fn estimate_lucene_document_ram_used(ctx: &mut dyn NativeContext, doc: ObjectRef) -> Option<i64> {
+    let fields = match ctx.get_field_by_name(doc, "fields") {
+        Value::Object(Some(fields)) => fields,
+        _ => return None,
+    };
+    let fields_pin = ctx.pin_native_root(fields);
+    let field_count = match invoke_list_size(ctx, fields) {
+        Some(field_count) => field_count,
+        None => {
+            ctx.unpin_native_roots(fields_pin);
+            return None;
+        }
+    };
+    if field_count <= 0 {
+        ctx.unpin_native_roots(fields_pin);
+        return Some(LUCENE_RAM_USAGE_MIN_DOCUMENT_BYTES);
+    }
+
+    let mut fields = ctx.read_native_pin(fields_pin, fields);
+    let mut string_chars = 0_i64;
+    let mut string_fields = 0_i64;
+    let max_fields = field_count.min(16);
+    for index in 0..max_fields {
+        let field = invoke_list_get(ctx, fields, index);
+        fields = ctx.read_native_pin(fields_pin, fields);
+        let Some(field) = field else {
+            continue;
+        };
+        let Some(chars) = lucene_field_string_chars(ctx, field) else {
+            continue;
+        };
+        string_fields += 1;
+        string_chars = string_chars.saturating_add(chars as i64);
+    }
+    ctx.unpin_native_roots(fields_pin);
+
+    if string_fields == 0 {
+        return None;
+    }
+
+    let uncounted_fields = (field_count as i64).saturating_sub(string_fields);
+    let bytes = LUCENE_RAM_USAGE_DOCUMENT_BASE_BYTES
+        .saturating_add(string_chars.saturating_mul(2))
+        .saturating_add(string_fields.saturating_sub(1) * LUCENE_RAM_USAGE_EXTRA_FIELD_BYTES)
+        .saturating_add(uncounted_fields * 128);
+    Some(align_lucene_ram_usage(bytes).max(LUCENE_RAM_USAGE_MIN_DOCUMENT_BYTES))
+}
+
+fn align_lucene_ram_usage(bytes: i64) -> i64 {
+    bytes.saturating_add(7) & !7
+}
+
+fn invoke_list_size(ctx: &mut dyn NativeContext, list: ObjectRef) -> Option<i32> {
+    let pin = ctx.pin_native_root(list);
+    let result = ctx.invoke_virtual(list, "size", "()I", &[]);
+    ctx.unpin_native_roots(pin);
+    match result {
+        Ok(Some(Value::Int(size))) if size >= 0 => Some(size),
+        _ => None,
+    }
+}
+
+fn invoke_list_get(ctx: &mut dyn NativeContext, list: ObjectRef, index: i32) -> Option<ObjectRef> {
+    let pin = ctx.pin_native_root(list);
+    let result = ctx.invoke_virtual(list, "get", "(I)Ljava/lang/Object;", &[Value::Int(index)]);
+    ctx.unpin_native_roots(pin);
+    match result {
+        Ok(Some(Value::Object(Some(field)))) => Some(field),
+        _ => None,
+    }
+}
+
+fn lucene_field_string_chars(ctx: &dyn NativeContext, field: ObjectRef) -> Option<usize> {
+    match ctx.get_field_by_name(field, "fieldsData") {
+        Value::Object(Some(data)) => ctx.read_string(data).map(|s| s.len()),
+        _ => None,
+    }
+}
+
+#[cfg(test)]
+mod lucene_ram_usage_tests {
+    use super::*;
+    use crate::test_utils::{mock_ctx, MockNativeContext};
+    use cratonvm_types::ArrayElementType;
+
+    fn lucene_list_hook(
+        ctx: &mut MockNativeContext,
+        receiver: ObjectRef,
+        method: &str,
+        desc: &str,
+        args: &[Value],
+    ) -> Option<MethodCallResult> {
+        let class_name = ctx.class_name_of_id(ctx.class_id_of_object(receiver));
+        if class_name.as_deref() != Some("java/util/ArrayList") {
+            return None;
+        }
+        match (method, desc) {
+            ("size", "()I") => Some(Ok(Some(ctx.get_field(receiver, 1)))),
+            ("get", "(I)Ljava/lang/Object;") => {
+                let index = match args.first() {
+                    Some(Value::Int(index)) if *index >= 0 => *index as usize,
+                    _ => return Some(Ok(Some(Value::Object(None)))),
+                };
+                let array = match ctx.get_field(receiver, 0) {
+                    Value::Object(Some(array)) => array,
+                    _ => return Some(Ok(Some(Value::Object(None)))),
+                };
+                Some(Ok(Some(ctx.get_array_element(array, index))))
+            }
+            _ => None,
+        }
+    }
+
+    fn new_obj(ctx: &mut MockNativeContext, class_name: &str) -> ObjectRef {
+        match ctx
+            .new_object(class_name)
+            .expect("mock allocation should not throw")
+        {
+            Some(Value::Object(Some(obj))) => obj,
+            other => panic!("unexpected allocation result: {other:?}"),
+        }
+    }
+
+    fn lucene_doc_with_body_len(ctx: &mut MockNativeContext, body_len: usize) -> ObjectRef {
+        ctx.set_invoke_virtual_hook(lucene_list_hook);
+        let doc = new_obj(ctx, "org/apache/lucene/document/Document");
+        let list = new_obj(ctx, "java/util/ArrayList");
+        let field = new_obj(ctx, "org/apache/lucene/document/TextField");
+        let body = ctx.create_string(&"x".repeat(body_len));
+        let array = ctx.new_array(ArrayElementType::Reference, 1);
+
+        ctx.set_field(field, 0, Value::Object(Some(body)));
+        ctx.set_array_element(array, 0, Value::Object(Some(field)));
+        ctx.set_field(list, 0, Value::Object(Some(array)));
+        ctx.set_field(list, 1, Value::Int(1));
+        ctx.set_field(doc, 0, Value::Object(Some(list)));
+        doc
+    }
+
+    #[test]
+    fn lucene_document_ram_usage_tracks_line_file_docs_body_length() {
+        let mut ctx = mock_ctx();
+        let doc = lucene_doc_with_body_len(&mut ctx, 1023);
+
+        let bytes = estimate_lucene_document_ram_used(&mut ctx, doc)
+            .expect("Lucene Document shape should be inspectable");
+
+        assert_eq!(bytes, 2424);
+    }
+
+    #[test]
+    fn lucene_document_ram_usage_has_hotspot_minimum_floor() {
+        let mut ctx = mock_ctx();
+        let doc = lucene_doc_with_body_len(&mut ctx, 40);
+
+        let bytes = estimate_lucene_document_ram_used(&mut ctx, doc)
+            .expect("Lucene Document shape should be inspectable");
+
+        assert_eq!(bytes, LUCENE_RAM_USAGE_MIN_DOCUMENT_BYTES);
+    }
+
+    #[test]
+    fn lucene_document_ram_usage_falls_back_for_unknown_shape() {
+        let mut ctx = mock_ctx();
+        let doc = new_obj(&mut ctx, "org/apache/lucene/document/Document");
+
+        let got = native_lucene_ram_usage_tester_ram_used(&mut ctx, &[Value::Object(Some(doc))])
+            .expect("native call should not throw");
+
+        assert_eq!(
+            got,
+            Some(Value::Long(LUCENE_RAM_USAGE_FALLBACK_DOCUMENT_BYTES))
+        );
+    }
 }
 
 fn lucene_eof() -> MethodCallFailed {
@@ -15982,9 +16171,13 @@ pub fn register_essential_natives(registry: &mut NativeMethodRegistry) {
         "getNextThreadIdOffset",
         "()J",
         |_ctx, _args| {
-            // Return offset of Thread.tid field — used by Thread.nextThreadId().
-            // HotSpot returns the physical offset; we return 0 and let Unsafe handle it.
-            Ok(Some(Value::Long(0)))
+            // JDK ThreadIdentifiers.next() uses Unsafe.getAndAddLong(null,
+            // NEXT_TID_OFFSET, 1). Offset 0 routed that RMW into the generic
+            // null-base side store with a zero seed, producing illegal tid 0.
+            // Use a dedicated, seeded synthetic offset for Java-created
+            // threads; VM-fabricated thread mirrors already use a disjoint
+            // high range.
+            Ok(Some(Value::Long(thread_next_tid_offset() as i64)))
         },
     );
     // C11: `NativeLibraries.findBuiltinLib(name)` — HotSpot returns the
@@ -28878,6 +29071,13 @@ fn static_obj_store() -> &'static UnsafeShardedMap<usize, Option<cratonvm_types:
     T.get_or_init(new_unsafe_sharded_map)
 }
 
+fn thread_next_tid_offset() -> usize {
+    let offset = synthetic_offset_for("java/lang/Thread$ThreadIdentifiers", "native:nextTid");
+    let mut map = lock_unsafe_shard_usize(static_long_store(), offset);
+    map.entry(offset).or_insert(1);
+    offset
+}
+
 /// Lock the shard that owns `key` in a `usize`-keyed sharded map.
 #[inline]
 fn lock_unsafe_shard_usize<V>(
@@ -28987,6 +29187,46 @@ fn unsafe_static_field_target(offset: usize) -> Option<(ClassId, usize)> {
         .get(&offset)
         .copied()?;
     Some((ClassId::new(target.class_id), target.field_index))
+}
+
+fn unsafe_static_get(ctx: &dyn NativeContext, offset: usize) -> Option<Value> {
+    let (class_id, field_index) = unsafe_static_field_target(offset)?;
+    Some(ctx.get_static_field(class_id, field_index))
+}
+
+fn unsafe_static_put(ctx: &mut dyn NativeContext, offset: usize, value: Value) -> bool {
+    let Some((class_id, field_index)) = unsafe_static_field_target(offset) else {
+        return false;
+    };
+    ctx.set_static_field(class_id, field_index, value);
+    true
+}
+
+fn unsafe_static_get_and_add_long(
+    ctx: &mut dyn NativeContext,
+    offset: usize,
+    delta: i64,
+) -> Option<i64> {
+    let (class_id, field_index) = unsafe_static_field_target(offset)?;
+    let Value::Long(old) = ctx.get_static_field(class_id, field_index) else {
+        return Some(0);
+    };
+    ctx.set_static_field(class_id, field_index, Value::Long(old.wrapping_add(delta)));
+    Some(old)
+}
+
+fn unsafe_static_get_and_set_long(
+    ctx: &mut dyn NativeContext,
+    offset: usize,
+    value: i64,
+) -> Option<i64> {
+    let (class_id, field_index) = unsafe_static_field_target(offset)?;
+    let old = match ctx.get_static_field(class_id, field_index) {
+        Value::Long(old) => old,
+        _ => 0,
+    };
+    ctx.set_static_field(class_id, field_index, Value::Long(value));
+    Some(old)
 }
 
 fn unsafe_static_field_target_for_base(
@@ -29691,6 +29931,14 @@ pub(crate) fn native_unsafe_cas_long(
     let obj = match unsafe_obj(args, 1) {
         Some(o) => o,
         None => {
+            if let Some((class_id, field_index)) = unsafe_static_field_target(offset) {
+                let cur = ctx.get_static_field(class_id, field_index);
+                let ok = unsafe_cas_values_equal(cur, expected);
+                if ok {
+                    ctx.set_static_field(class_id, field_index, new_val);
+                }
+                return Ok(Some(Value::Int(if ok { 1 } else { 0 })));
+            }
             let mut map = lock_unsafe_shard_usize(static_long_store(), offset);
             let cur = *map.entry(offset).or_insert(0);
             let ex = if let Value::Long(e) = expected { e } else { 0 };
@@ -29931,6 +30179,13 @@ fn native_unsafe_get_long_volatile(
     let obj = match unsafe_obj(args, 1) {
         Some(o) => o,
         None => {
+            if let Some(value) = unsafe_static_get(ctx, offset) {
+                return Ok(Some(match value {
+                    Value::Long(v) => Value::Long(v),
+                    Value::Int(v) => Value::Long(v as i64),
+                    _ => Value::Long(0),
+                }));
+            }
             let map = lock_unsafe_shard_usize(static_long_store(), offset);
             return Ok(Some(Value::Long(map.get(&offset).copied().unwrap_or(0))));
         }
@@ -29962,6 +30217,9 @@ fn native_unsafe_put_long_volatile(
         Some(o) => o,
         None => {
             let v = if let Value::Long(i) = val { i } else { 0 };
+            if unsafe_static_put(ctx, offset, Value::Long(v)) {
+                return Ok(None);
+            }
             lock_unsafe_shard_usize(static_long_store(), offset).insert(offset, v);
             return Ok(None);
         }
@@ -30642,6 +30900,13 @@ pub(crate) fn native_unsafe_get_long(
     let obj = match unsafe_obj(args, 1) {
         Some(o) => o,
         None => {
+            if let Some(value) = unsafe_static_get(ctx, offset) {
+                return Ok(Some(match value {
+                    Value::Long(v) => Value::Long(v),
+                    Value::Int(v) => Value::Long(v as i64),
+                    _ => Value::Long(0),
+                }));
+            }
             let map = lock_unsafe_shard_usize(static_long_store(), offset);
             return Ok(Some(Value::Long(map.get(&offset).copied().unwrap_or(0))));
         }
@@ -30680,6 +30945,9 @@ pub(crate) fn native_unsafe_put_long(
         Some(o) => o,
         None => {
             let v = if let Value::Long(i) = val { i } else { 0 };
+            if unsafe_static_put(ctx, offset, Value::Long(v)) {
+                return Ok(None);
+            }
             lock_unsafe_shard_usize(static_long_store(), offset).insert(offset, v);
             return Ok(None);
         }
@@ -30979,6 +31247,9 @@ fn native_unsafe_get_and_add_long(ctx: &mut dyn NativeContext, args: &[Value]) -
     let obj = match unsafe_obj(args, 1) {
         Some(o) => o,
         None => {
+            if let Some(old) = unsafe_static_get_and_add_long(ctx, offset, delta) {
+                return Ok(Some(Value::Long(old)));
+            }
             // Static-field semantics (null receiver). Maintain a per-offset
             // counter so callers like Thread$ThreadIdentifiers.next() get
             // monotonically-increasing values rather than a VM panic.
@@ -31043,6 +31314,9 @@ fn native_unsafe_get_and_set_long(ctx: &mut dyn NativeContext, args: &[Value]) -
         Some(o) => o,
         None => {
             let nv = if let Value::Long(n) = new_val { n } else { 0 };
+            if let Some(prev) = unsafe_static_get_and_set_long(ctx, offset, nv) {
+                return Ok(Some(Value::Long(prev)));
+            }
             let mut map = lock_unsafe_shard_usize(static_long_store(), offset);
             let prev = map.insert(offset, nv).unwrap_or(0);
             return Ok(Some(Value::Long(prev)));
@@ -32049,6 +32323,18 @@ fn native_unsafe_compare_and_exchange_long(
         Some(Value::Long(v)) => *v,
         _ => 0,
     };
+    if obj.is_none() {
+        if let Some((class_id, field_index)) = unsafe_static_field_target(offset) {
+            let old = ctx.get_static_field(class_id, field_index);
+            if let Value::Long(old_val) = old {
+                if old_val == expected {
+                    ctx.set_static_field(class_id, field_index, Value::Long(update));
+                }
+                return Ok(Some(Value::Long(old_val)));
+            }
+            return Ok(Some(Value::Long(expected)));
+        }
+    }
     if let Some(obj_ref) = obj {
         let old = if is_synthetic_offset(offset) {
             synthetic_get(ctx, obj_ref, offset)
@@ -58699,6 +58985,96 @@ mod unsafe_static_field_offset_tests {
         assert_eq!(cas, Value::Int(1));
         assert_eq!(ctx.get_static_field(class_id, 24), Value::Int(1));
         assert_eq!(ctx.get_field(base, 24), Value::Int(77));
+    }
+
+    #[test]
+    fn static_long_null_base_unsafe_uses_real_static_storage() {
+        let mut ctx = MockNativeContext::new();
+        let class_id = ctx
+            .ensure_class_initialized("java/lang/Thread$ThreadIdentifiers")
+            .expect("mock class id");
+        let meta = FieldMetadata {
+            name: "next".to_string(),
+            descriptor: "J".to_string(),
+            access_flags: 0x0008,
+            slot_index: 7,
+            declaring_class_id: class_id,
+            is_static: true,
+        };
+        ctx.set_static_field(class_id, 7, Value::Long(42));
+
+        let field = crate::lang_class::create_field_object(&mut ctx, &meta);
+        let offset = match native_unsafe_static_field_offset(
+            &mut ctx,
+            &[Value::Object(None), Value::Object(Some(field))],
+        )
+        .expect("staticFieldOffset")
+        .expect("offset value")
+        {
+            Value::Long(offset) => offset as usize,
+            other => panic!("unexpected offset value: {other:?}"),
+        };
+
+        let before = native_unsafe_get_long_volatile(
+            &mut ctx,
+            &[
+                Value::Object(None),
+                Value::Object(None),
+                Value::Long(offset as i64),
+            ],
+        )
+        .expect("getLongVolatile")
+        .expect("read value");
+        assert_eq!(before, Value::Long(42));
+
+        let old = native_unsafe_get_and_add_long(
+            &mut ctx,
+            &[
+                Value::Object(None),
+                Value::Object(None),
+                Value::Long(offset as i64),
+                Value::Long(1),
+            ],
+        )
+        .expect("getAndAddLong")
+        .expect("old value");
+
+        assert_eq!(old, Value::Long(42));
+        assert_eq!(ctx.get_static_field(class_id, 7), Value::Long(43));
+    }
+
+    #[test]
+    fn thread_next_tid_offset_seeds_positive_null_base_counter() {
+        let mut ctx = MockNativeContext::new();
+        let offset = thread_next_tid_offset();
+        lock_unsafe_shard_usize(static_long_store(), offset).insert(offset, 1);
+
+        let first = native_unsafe_get_and_add_long(
+            &mut ctx,
+            &[
+                Value::Object(None),
+                Value::Object(None),
+                Value::Long(offset as i64),
+                Value::Long(1),
+            ],
+        )
+        .expect("first getAndAddLong")
+        .expect("first old value");
+        let second = native_unsafe_get_and_add_long(
+            &mut ctx,
+            &[
+                Value::Object(None),
+                Value::Object(None),
+                Value::Long(offset as i64),
+                Value::Long(1),
+            ],
+        )
+        .expect("second getAndAddLong")
+        .expect("second old value");
+
+        assert_ne!(offset, 0);
+        assert_eq!(first, Value::Long(1));
+        assert_eq!(second, Value::Long(2));
     }
 }
 

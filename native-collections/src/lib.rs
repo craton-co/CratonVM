@@ -20522,6 +20522,28 @@ fn native_lhm_put(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResu
     native_lhm_put_evict(ctx, args, true)
 }
 
+fn lhm_remove_eldest_hook_decision(
+    ctx: &dyn NativeContext,
+    this: ObjectRef,
+) -> (ClassId, Option<String>, bool, bool) {
+    let this_cid = ctx.class_id_of_object(this);
+    let class_name = ctx.class_name_of_id(this_cid);
+    let is_plain_lhm = class_name.as_deref() == Some("java/util/LinkedHashMap");
+    let is_untrusted_slot0_object =
+        this_cid.as_u32() == 0 && matches!(class_name.as_deref(), Some("java/lang/Object") | None);
+
+    // A slot-0/Object read from a receiver that already reached the
+    // LinkedHashMap native is not a real LHM subclass. Dispatching
+    // Object.removeEldestEntry only turns the stale class-word read into a
+    // NoSuchMethodError. Keep real subclass hooks, but fail closed here.
+    (
+        this_cid,
+        class_name,
+        is_plain_lhm,
+        !is_plain_lhm && !is_untrusted_slot0_object,
+    )
+}
+
 /// Like `native_lhm_put`, but honoring an explicit eviction-hook toggle --
 /// see `native_map_put_evict` for why `native_hashmap_read_object` needs
 /// `evict=false`.
@@ -20614,18 +20636,19 @@ fn native_lhm_put_evict(
     // `BoundedConcurrentHashMap.LRU`) override it. Without this, bounded LHM
     // subclasses never evict and grow without bound — e.g.
     // `ExplicitQueryStatsMaxSizeTest` (query-plan stats trimmed at 100 entries).
-    let this_cid = ctx.class_id_of_object(this);
-    let is_plain_lhm = ctx.class_name_of_id(this_cid).as_deref() == Some("java/util/LinkedHashMap");
+    let (this_cid, this_class_name, is_plain_lhm, invoke_remove_eldest) =
+        lhm_remove_eldest_hook_decision(ctx, this);
     if std::env::var_os("CRATONVM_DBG_LHM_EVICT").is_some() {
         eprintln!(
-            "[dbg-lhm-evict] this_cid={:?} class_name={:?} is_plain_lhm={} evict={}",
+            "[dbg-lhm-evict] this_cid={:?} class_name={:?} is_plain_lhm={} invoke_remove_eldest={} evict={}",
             this_cid,
-            ctx.class_name_of_id(this_cid),
+            this_class_name,
             is_plain_lhm,
+            invoke_remove_eldest,
             evict
         );
     }
-    if evict && !is_plain_lhm {
+    if evict && invoke_remove_eldest {
         if let Value::Object(Some(head)) = lhm_get(ctx, this, "head", LHM_FIELD_HEAD) {
             // The overlay node is a synthetic `java/util/LinkedHashMap$Node`
             // with no real `getKey()`/`getValue()`; an override that inspects

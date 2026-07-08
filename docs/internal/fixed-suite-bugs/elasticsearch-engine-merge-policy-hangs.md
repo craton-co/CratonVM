@@ -1,6 +1,19 @@
 # Elasticsearch engine merge-policy hangs
 
-Status: open (partially mitigated)
+Status: RETIRED 2026-07-08 (fixed on current dev; residual folded into the young-GC weak-reference survivorship fix)
+
+## 2026-07-08 retirement
+
+This tracker is retired out of `docs/known-issues` because both pieces it carried are now closed or superseded by fixed root-cause trackers:
+
+- the original deterministic A5/root-snapshot throughput bug was fixed by `cbae5cd0` (`scan_active_jit_frames` no longer rescans the already-verified native-stack suffix on every object-returning helper);
+- the later 2026-07-05 corrupt-header/RRWL residual matched the young-GC weak-reference survivorship bug fixed by `0c6cbd58`, with the follow-up crawl-regime fix in `2072699b`. The concrete runtime changes are that `weakref_null_referents_pre_gc` now watches Reference object addresses as well as referents, and `GenerationalHeap::is_live_young_survivor` lets reference processing recognize kept-in-place young survivors after the non-moving sweep.
+
+Fresh Azure validation from isolated branch `codex/fix-es-engine-merge-policy-residuals-20260708` used the unique binary `/data/data/target-es-engine-residuals-20260708/release/cratonvm-es-engine-residuals-baseline-20260708`:
+
+- `RwlReadTearingProbe 8 8000` completed 4/4 with every reader and the writer joined; this is the focused RRWL/weak-reference probe for the residual mechanism that made this note stay open after the A5 scan fix.
+- A direct `ShuffleForcedMergePolicyTests` rerun was not possible on that host: no compiled Elasticsearch checkout/classpath was present (`craton-testcp.txt` and the test class were absent under `/data/data`). If that class is rebuilt and again exceeds the 300s suite timeout on current `dev`, file a new known-issue note with fresh logs rather than reopening this stale combined tracker.
+
 
 Date observed: 2026-07-02
 Date investigated: 2026-07-03/04
