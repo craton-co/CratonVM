@@ -23,9 +23,9 @@ angles**; this index is the consolidated map. Read it first.
 
 All three verified against their real Keycloak classes via the suite runner; no regressions in the touched crates' test suites.
 
-## 2026-07-07 Hibernate local Windows rerun — progress check + new SQL-placeholder bug
+## 2026-07-07 Hibernate local Windows rerun — retired aggregate note
 
-- [hib-local-windows-rerun-20260707.md](hib-local-windows-rerun-20260707.md) — 4-shard local rerun of the 121-class non-passed list confirms 15 real fixes (bytecode-enhancement/lazytoone progress, generic-timeout-wall classes now passing) landed on `dev` since the 2026-07-05 Azure baseline; documents 3 findings that evolved to different symptoms (`JpaLargeBlobTest`, `InPredicateTest`, the temporal 1-hour-skew doc now superseded); flags a harness status-computation false-positive.
+- ✅ RETIRED: [hib-local-windows-rerun-20260707.md](../internal/hib-local-windows-rerun-20260707.md) — the 4-shard local rerun remains historical evidence for 15 confirmed fixes, `JpaLargeBlobTest`'s non-hang slow path, the superseded temporal-skew observation, and the harness status-computation false-positive. A 2026-07-08 Azure `dev@22d79b10` recheck with unique binary `/data/data/cratonvm-binaries/cvhiblocalcurrentdev-20260708-160310-rebased` passed `InPredicateTest` (`ok=1`, 60.643s) plus the fixed-bucket sample (`LocalXmlResourceResolverTest` 23/23, `ConfigurationTest` 1/1, `OrmXmlEnumTypeTest` 1/1), so this aggregate note no longer owns an open task.
 - ✅ FIXED same day: the SQL-placeholder duplication that rerun re-confirmed (plus 2 more affected classes outside `type.temporal.*` — `ExtendedEnhancementNonStandardAccessTest`, `FunctionTests`, proving it a general SQL-generation-path defect) was the reopened JIT reason-8 imprecise-resume corruption; see [`docs/internal/hib-temporal-sql-parameter-placeholder-duplication-FIXED.md`](../internal/hib-temporal-sql-parameter-placeholder-duplication-FIXED.md) and the identity-sound precise-resume entry below.
 
 ## 2026-07-07 ES binary-docvalues range doc retired; young-GC RRWL residual fixed 2026-07-08

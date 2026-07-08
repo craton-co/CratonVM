@@ -5,7 +5,7 @@
 | **Status** | ✅ RETIRED 2026-07-08 — current Azure recheck no longer reproduces the timeout. Fresh `dev@47bbdc3b` reached the later `DomainParameterXref` NSME in 33.697s, and after the LHM guard fix the same class passed under default JIT in 55.971s. Historical 2026-07-07 evidence retained below. |
 | **Area** | JIT tiered-compilation dispatch overhead, surfaced via `org.hibernate.orm.test.jpa.criteria.InPredicateTest` |
 | **Symptom** | historical: `java.util.concurrent.TimeoutException: testInPredicate(...) timed out after 120 seconds`, class wall time ~330–510s. Current fixed probe: `ok=1`, 55.971s. |
-| **Discovered** | Symptom first observed 2026-07-07 in a contended 4-shard local rerun ([hib-local-windows-rerun-20260707.md](../../known-issues/hib-local-windows-rerun-20260707.md)); root-caused same day with a clean, uncontended single-class rerun (this doc). |
+| **Discovered** | Symptom first observed 2026-07-07 in a contended 4-shard local rerun ([hib-local-windows-rerun-20260707.md](../hib-local-windows-rerun-20260707.md)); root-caused same day with a clean, uncontended single-class rerun (this doc). |
 
 ## 2026-07-08 retirement — current `InPredicateTest` no longer times out
 
@@ -33,7 +33,7 @@ context, but this class no longer has an open timeout blocker in current dev.
 
 ## Confirmed: real, deterministic regression — not host-load noise
 
-The 2026-07-07 4-shard local rerun ([hib-local-windows-rerun-20260707.md](../../known-issues/hib-local-windows-rerun-20260707.md)) ran ~20-30 concurrent worktrees/builds on the same box, so its own text flagged this finding as unconfirmed pending "a clean, uncontended rerun." That rerun was done here: fresh worktree off `dev@fa1c505f` (branch `investigate/hib-inpredicate-timeout-20260707`), binary `cvinpredtimeout0707.exe`, **no other builds/tests running concurrently**, single-class invocation:
+The 2026-07-07 4-shard local rerun ([hib-local-windows-rerun-20260707.md](../hib-local-windows-rerun-20260707.md)) ran ~20-30 concurrent worktrees/builds on the same box, so its own text flagged this finding as unconfirmed pending "a clean, uncontended rerun." That rerun was done here: fresh worktree off `dev@fa1c505f` (branch `investigate/hib-inpredicate-timeout-20260707`), binary `cvinpredtimeout0707.exe`, **no other builds/tests running concurrently**, single-class invocation:
 
 ```
 CRATONVM_DISABLE_DEFAULT_WATCHDOG=1 <cv-binary> --java-home "C:/Program Files/Java/jdk-25" \
@@ -91,15 +91,13 @@ This is precisely the shape already root-caused as a systemic CratonVM defect: [
 
 Disabling JIT entirely is **3–4.6× faster** and drops the class comfortably under the 120s per-test timeout. This is decisive: the slowdown is JIT-tier-up overhead, not GC, not I/O, not an algorithmic bug in the test or in Hibernate's criteria code.
 
-## Why the `removeEldestEntry` NSME doc's symptom no longer appears
+## Historical note: why the NSME was masked during the 2026-07-07 timeout runs
 
-[hib-domainparameterxref-lhm-removeeldestentry-nsme-FIXED.md](hib-domainparameterxref-lhm-removeeldestentry-nsme-FIXED.md) traced its `NoSuchMethodError` to `DomainParameterXref`'s constructor loop, which runs during `session.createQuery(cr)` — **after** `cr.select(root).where(root.get("name").in(names))` (i.e. after `SqmCriteriaNodeBuilder.in()`) completes in the test source. Since `.in()` alone now consumes the entire 120s+ budget (confirmed by the stack-dump sampling above, which never shows the thread past that call), **`createQuery()` — and therefore `DomainParameterXref`'s constructor — is never reached** in the current timing profile. The NSME's absence here is *not* evidence it's fixed; it simply isn't reached before the earlier-in-the-method `.in()` phase times out. Do not close that doc on this basis — its underlying Layer-1 register-invisible-roots root cause is a separate, unverified question. That doc has been annotated accordingly rather than moved to `internal/`.
+Before the 2026-07-08 LHM guard fix, the timeout-focused reruns often failed before reaching `DomainParameterXref`'s constructor: `.in()` consumed the 120s+ budget first, so the later `removeEldestEntry` NSME was not always observable in that timing profile. That masking explanation is retained as historical context only. The 2026-07-08 Azure recheck reproduced the NSME on current `dev`, fixed it in the `LinkedHashMap` native guard, and then passed `InPredicateTest` under default JIT; see [hib-domainparameterxref-lhm-removeeldestentry-nsme-FIXED.md](hib-domainparameterxref-lhm-removeeldestentry-nsme-FIXED.md).
 
 ## Recommendation
 
-- Track this doc's finding as a second, cleanly-reproduced data point for the dispatch-heavy JIT tier-up overhead issue, alongside `FunctionTests`/`StandardFunctionTests` (`docs/internal/HIB-misc16-correctness-sweep.md` §15–16) and `project_wire_tiered_manager`'s outstanding lock-free-tier-up-path work. Not independently fixable here without that larger effort.
-- `--nojit` is a practical per-run workaround for this specific class (109.5s, passes) but is a blanket JIT disable, not a scoped fix — a harness-level decision, not made here.
-- If/when the tier-up lock-free work lands, re-verify `InPredicateTest` (and re-check whether the `removeEldestEntry` NSME reappears once `.in()` is fast enough to reach `createQuery()` again).
+No active follow-up remains for this note. Keep the dispatch-heavy tier-up analysis as historical context, but current `dev` passes `InPredicateTest` under default JIT after the LHM guard fix.
 
 ## Repro
 

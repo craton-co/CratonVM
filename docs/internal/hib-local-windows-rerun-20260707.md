@@ -7,6 +7,30 @@
 | **Config** | real-JDK (`--java-home`, JDK 25.0.1), JIT on, `SHARDS=4`, `TIMEOUT=1200`. Wall time: 156m23s. |
 | **Result** | `PASS=16 FAIL=75 CRASH=17 HANG=10 ABORTED=3` (of 121). |
 
+## Retirement (2026-07-08 Azure `dev` recheck)
+
+Retired from `docs/known-issues` after a fresh Azure-host recheck against
+current `dev@18a8b736` in worktree
+`/data/data/cratonvm-worktrees/20260708-160310-hib-local-rerun-currentdev`
+(branch `codex/retire-hib-local-rerun-currentdev-20260708-160310`). The
+unique binary used for the proof run was
+`/data/data/cratonvm-binaries/cvhiblocalcurrentdev-20260708-160310-rebased`.
+
+Focused Hibernate harness results:
+
+```text
+@@RESULT 0 org.hibernate.orm.test.jpa.criteria.InPredicateTest found=1 started=1 ok=1 failed=0 aborted=0 skipped=0 ms=60643
+@@RESULT 0 org.hibernate.boot.jaxb.internal.stax.LocalXmlResourceResolverTest found=23 started=23 ok=23 failed=0 aborted=0 skipped=0 ms=45611
+@@RESULT 1 org.hibernate.orm.test.annotations.configuration.ConfigurationTest found=1 started=1 ok=1 failed=0 aborted=0 skipped=0 ms=39153
+@@RESULT 2 org.hibernate.orm.test.annotations.enumerated.ormXml.OrmXmlEnumTypeTest found=1 started=1 ok=1 failed=0 aborted=0 skipped=0 ms=37899
+```
+
+The `InPredicateTest` timeout note and the later
+`DomainParameterXref`/`LinkedHashMap.removeEldestEntry` NSME note are now fixed
+and archived under `docs/internal/fixed-suite-bugs`. The original rerun evidence
+remains useful historical context, but this aggregate note no longer owns an
+open task.
+
 ## Why rerun the same list on a different host
 
 The 2026-07-05 findings (bytecode-enhancement cluster, temporal-skew,
@@ -37,7 +61,7 @@ annotations.configuration.ConfigurationTest
 service.ClassLoaderServiceImplTest
 ```
 This confirms real progress on the bytecode-enhancement/lazytoone cluster
-([hib-bytecode-enhancement-loader-faithful-linking.md](hib-bytecode-enhancement-loader-faithful-linking.md)),
+([hib-bytecode-enhancement-loader-faithful-linking.md](../known-issues/hib-bytecode-enhancement-loader-faithful-linking.md)),
 and confirms the "generic 120s-timeout wall" cluster
 ([hib-linux-fail-bucket-triage-20260703.md](hib-linux-fail-bucket-triage-20260703.md))
 was indeed slowness/load-related rather than deterministic — several of
@@ -50,7 +74,7 @@ now pass outright.
 any test method; it's now blocked earlier by the new SQL-placeholder-duplication
 bug (below) during fixture setup. `rerun.sh`'s status computation doesn't check
 `ok == found`, so this reads as a false PASS. See the harness-gotcha note in
-[hib-temporal-sql-parameter-placeholder-duplication.md](hib-temporal-sql-parameter-placeholder-duplication.md).
+[hib-temporal-sql-parameter-placeholder-duplication-FIXED.md](hib-temporal-sql-parameter-placeholder-duplication-FIXED.md).
 
 ## Findings that evolved (same class, different/deeper symptom now)
 
@@ -58,7 +82,7 @@ bug (below) during fixture setup. `rerun.sh`'s status computation doesn't check
   see the archived probe in `docs/internal` if still present) → now **`HANG`**
   (`rc=124`, ran the full 1200s). **Investigated 2026-07-07, see the "2026-07-07:
   fast-fail became a multi-hour non-hang" section of
-  [hib-jpalargeblobtest-object-read-nosuchmethod.md](../internal/fixed-suite-bugs/hib-jpalargeblobtest-object-read-nosuchmethod.md):**
+  [hib-jpalargeblobtest-object-read-nosuchmethod.md](fixed-suite-bugs/hib-jpalargeblobtest-object-read-nosuchmethod.md):**
   not a blocking call — a `--stack-dump-on-timeout` probe against current
   `dev` shows the main thread genuinely still executing, stuck in neither a
   lock nor a native call, but grinding through the test fixture's own
@@ -68,24 +92,23 @@ bug (below) during fixture setup. `rerun.sh`'s status computation doesn't check
   to mask this; the class was apparently never previously exercised to
   completion. Not a VM correctness regression — no fix landed, doc-only.
 - **`InPredicateTest`**: was `FAIL` (`NullPointerException: ... "values" is null`)
-  → now `FAIL` with a completely different symptom: `TimeoutException:
-  testInPredicate(...) timed out after 120 seconds` (total `ms=608596` across
-  the class). The null-values NPE appears fixed; a new slowness/hang-adjacent
-  issue replaced it.
+  → later evolved through a dispatch-heavy timeout and a
+  `DomainParameterXref`/`LinkedHashMap.removeEldestEntry` NSME. Both follow-up
+  notes are now retired after the 2026-07-08 Azure `dev` recheck: see
+  [hib-inpredicate-dispatch-heavy-jit-timeout-20260707-FIXED.md](fixed-suite-bugs/hib-inpredicate-dispatch-heavy-jit-timeout-20260707-FIXED.md)
+  and
+  [hib-domainparameterxref-lhm-removeeldestentry-nsme-FIXED.md](fixed-suite-bugs/hib-domainparameterxref-lhm-removeeldestentry-nsme-FIXED.md).
 - **`type.temporal.LocalDateTimeTest` / `OffsetTimeTest`**: the 2026-07-05
   "every value off by exactly 1 hour" symptom
-  ([hib-temporal-localdatetime-offsettime-one-hour-skew.md](hib-temporal-localdatetime-offsettime-one-hour-skew.md),
-  if that doc still exists — it was lost from the main worktree by an
-  unrelated concurrent `git` operation between sessions and needs
-  re-creating) **no longer reproduces**. `LocalDateTimeTest` now fails on
-  the SQL-placeholder-duplication bug before any round-trip completes
+  ([hib-temporal-localdatetime-offsettime-one-hour-skew-FIXED.md](fixed-suite-bugs/hib-temporal-localdatetime-offsettime-one-hour-skew-FIXED.md))
+  **no longer reproduces**. `LocalDateTimeTest` later failed on the
+  SQL-placeholder-duplication bug before any round-trip completed
   (`ok=54 failed=36 aborted=72` — see
-  [hib-temporal-sql-parameter-placeholder-duplication.md](hib-temporal-sql-parameter-placeholder-duplication.md));
-  `OffsetTimeTest` now `HANG`s outright. The 1-hour-skew doc's data predates
-  the 2026-07-06 temporal GC fix (`3240cb75`) that changed this code path —
-  treat that doc as **superseded/stale** if recreated; the current blocker
-  for both classes is the placeholder-duplication bug or a hang, not a
-  skew.
+  [hib-temporal-sql-parameter-placeholder-duplication-FIXED.md](hib-temporal-sql-parameter-placeholder-duplication-FIXED.md));
+  `OffsetTimeTest` then `HANG`ed outright in this contended run. The
+  1-hour-skew doc's data predates the 2026-07-06 temporal GC fix
+  (`3240cb75`) that changed this code path; the active blockers became the
+  placeholder-duplication bug and the hang, not the skew.
 
 ## HANG cluster grew 3 → 10 — likely host load, not confirmed as new bugs
 
