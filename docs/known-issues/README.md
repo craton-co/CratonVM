@@ -4,6 +4,10 @@ This folder collects CratonVM-only defects found while running upstream Java
 suites. The docs had grown to describe the **same underlying bug from several
 angles**; this index is the consolidated map. Read it first.
 
+## 2026-07-08 NIO selected-key `ClassCastException` retired
+
+- FIXED/RETIRED: [Tribes `ParallelNioSender` selected-key `ClassCastException`](../internal/fixed-suite-bugs/nio-selectionkey-classcastexception-tribes-sender-FIXED.md) - the remaining two-key `Selector.selectedKeys().iterator().next()/remove()` GC-stress crash was in native collection map/set helpers, not the selector side table. `HashMap.put`/`remove` now pin their inner receiver/key/value windows, `HashSet.iterator()` pins its receiver/snapshot backing before allocation, and the focused two-`SelectionKey` fixture passes under `CRATONVM_GC_STRESS`.
+
 ## 2026-07-08 Hibernate bytecode-enhancement loader/lazytoone and residual basic/merge/version bugs retired
 
 - FIXED/RETIRED: [`hib-bytecode-enhancement-loader-faithful-linking-FIXED.md`](../internal/fixed-suite-bugs/hib-bytecode-enhancement-loader-faithful-linking-FIXED.md) - the remaining loader-faithful lazy/lazytoone failures are closed: 18/18 representative sample and 69/69 lazy/lazytoone subset pass, and the graph same-name checkcast residual now passes.

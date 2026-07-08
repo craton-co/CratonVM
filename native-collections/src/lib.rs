@@ -3449,9 +3449,7 @@ fn element_hash_code(ctx: &mut dyn NativeContext, v: &Value) -> i32 {
 }
 
 fn class_name_is(ctx: &dyn NativeContext, obj: ObjectRef, expected: &str) -> bool {
-    ctx.class_name_of_id(ctx.class_id_of_object(obj))
-        .as_deref()
-        == Some(expected)
+    ctx.class_name_of_id(ctx.class_id_of_object(obj)).as_deref() == Some(expected)
 }
 
 /// Check if two keys are equal.
@@ -4693,11 +4691,53 @@ fn native_map_put_evict(
     let key_val = args.get(1).copied().unwrap_or(Value::Object(None));
     let value = args.get(2).copied().unwrap_or(Value::Object(None));
 
+    // `map_hash_key` / `map_keys_equal` dispatch arbitrary Java code. When
+    // this path is reached by a direct native-to-native call (for example
+    // HashSet.add -> HashMap.put while Selector.selectedKeys() builds a set),
+    // `safe_native_call` has not pinned this inner map receiver or the
+    // key/value locals. Pin the whole put window so a stress-GC during
+    // hashCode()/equals() cannot leave the later bucket/node writes using stale
+    // ObjectRefs.
+    let put_pin_base = ctx.pin_native_root(this);
+    let key_pin = pin_value(ctx, key_val);
+    let value_pin = pin_value(ctx, value);
+    let result = native_map_put_evict_pinned(
+        ctx,
+        this,
+        key_val,
+        value,
+        evict,
+        put_pin_base,
+        key_pin,
+        value_pin,
+    );
+    ctx.unpin_native_roots(put_pin_base);
+    result
+}
+
+fn native_map_put_evict_pinned(
+    ctx: &mut dyn NativeContext,
+    this: ObjectRef,
+    key_val: Value,
+    value: Value,
+    evict: bool,
+    put_pin_base: usize,
+    key_pin: usize,
+    value_pin: usize,
+) -> MethodCallResult {
     // Handle null key: hash=0, bucket=0, key field stores null
-    let (key_ref, hash, is_null_key) = match key_val {
-        Value::Object(Some(k)) => (Some(k), map_hash_key(ctx, k)?, false),
-        Value::Object(None) => (None, 0, true),
+    let (hash, is_null_key) = match key_val {
+        Value::Object(Some(k)) => (map_hash_key(ctx, k)?, false),
+        Value::Object(None) => (0, true),
         _ => return Ok(Some(Value::Object(None))), // non-object keys not supported
+    };
+    let mut this = ctx.read_native_pin(put_pin_base, this);
+    let key_val = read_pinned_elem(ctx, key_pin, key_val);
+    let value = read_pinned_elem(ctx, value_pin, value);
+    let key_ref = match key_val {
+        Value::Object(Some(k)) => Some(k),
+        Value::Object(None) if is_null_key => None,
+        _ => return Ok(Some(Value::Object(None))),
     };
 
     // Check for resize first. Also initialize table when buckets is None
@@ -4710,6 +4750,7 @@ fn native_map_put_evict(
     let (initial_buckets, size, cap) = map_state(ctx, this);
     if initial_buckets.is_none() || size + 1 > (cap * 3) / 4 {
         map_resize(ctx, this);
+        this = ctx.read_native_pin(put_pin_base, this);
     }
 
     let (buckets, size, cap) = map_state(ctx, this);
@@ -4971,9 +5012,30 @@ fn native_map_remove(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallR
     }
     let key_val = args.get(1).copied().unwrap_or(Value::Object(None));
 
-    let (key_ref, hash, is_null_key) = match key_val {
-        Value::Object(Some(k)) => (Some(k), map_hash_key(ctx, k)?, false),
-        Value::Object(None) => (None, 0, true),
+    let remove_pin_base = ctx.pin_native_root(this);
+    let key_pin = pin_value(ctx, key_val);
+    let result = native_map_remove_pinned(ctx, this, key_val, remove_pin_base, key_pin);
+    ctx.unpin_native_roots(remove_pin_base);
+    result
+}
+
+fn native_map_remove_pinned(
+    ctx: &mut dyn NativeContext,
+    this: ObjectRef,
+    key_val: Value,
+    remove_pin_base: usize,
+    key_pin: usize,
+) -> MethodCallResult {
+    let (hash, is_null_key) = match key_val {
+        Value::Object(Some(k)) => (map_hash_key(ctx, k)?, false),
+        Value::Object(None) => (0, true),
+        _ => return Ok(Some(Value::Object(None))),
+    };
+    let this = ctx.read_native_pin(remove_pin_base, this);
+    let key_val = read_pinned_elem(ctx, key_pin, key_val);
+    let key_ref = match key_val {
+        Value::Object(Some(k)) => Some(k),
+        Value::Object(None) if is_null_key => None,
         _ => return Ok(Some(Value::Object(None))),
     };
 
@@ -7093,24 +7155,23 @@ fn native_hs_iterator(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
     // go stale and surface as null/stale iterator elements during WildFly MSC
     // state reporting.
     let len = collect_view_snapshot_ordered(ctx, backing).len();
+    let this_pin = ctx.pin_native_root(this);
     let backing_pin = ctx.pin_native_root(backing);
     let keys_arr = alloc_ref_array(ctx, len);
+    let keys_arr_pin = ctx.pin_native_root(keys_arr);
     let backing = ctx.read_native_pin(backing_pin, backing);
     let keys = collect_view_snapshot_ordered(ctx, backing);
-    ctx.unpin_native_roots(backing_pin);
+    let keys_arr = ctx.read_native_pin(keys_arr_pin, keys_arr);
     let total = std::cmp::min(len, keys.len());
     if dbg_hs_itr() {
         eprintln!(
             "[HS-ITR-DBG] native_hs_iterator: collected {} keys from backing map {:?}",
-            total,
-            backing
+            total, backing
         );
     }
     for (i, k) in keys.iter().enumerate().take(total) {
         ctx.set_array_element(keys_arr, i, *k);
     }
-    let keys_arr_pin = ctx.pin_native_root(keys_arr);
-    let this_pin = ctx.pin_native_root(this);
     let itr = alloc_synthetic(ctx, "java/util/HashMap$KeyItr", MAP_KEY_ITR_NUM_FIELDS);
     let keys_arr = ctx.read_native_pin(keys_arr_pin, keys_arr);
     let this = ctx.read_native_pin(this_pin, this);
@@ -7123,7 +7184,7 @@ fn native_hs_iterator(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
     // because dispatch falls through to the default Iterator.remove().
     ctx.set_field(itr, MAP_KEY_ITR_FIELD_BACKING, Value::Object(Some(this)));
     ctx.set_field(itr, MAP_KEY_ITR_FIELD_LAST_RET, Value::Int(-1));
-    ctx.unpin_native_roots(keys_arr_pin);
+    ctx.unpin_native_roots(this_pin);
     Ok(Some(Value::Object(Some(itr))))
 }
 

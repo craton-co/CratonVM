@@ -1,11 +1,50 @@
 # Tribes `ParallelNioSender`: `ClassCastException: Object cannot be cast to SelectionKey` under GC stress
 
-Status: open (untriaged; corrects an earlier, invalid hypothesis — see below)
+Status: FIXED / retired 2026-07-08
 
 Date observed: 2026-07-07 (Azure Linux, dev @ `8b35a995` — i.e. **with** the
 `nio_selector.rs` `build_set`/`populate_selected_keys_field` cross-call
 GC-safety fix already landed; real-JDK jdk25, `--nojit`,
 `CRATONVM_GC_STRESS=4194304`)
+
+Date fixed: 2026-07-08 (`codex/fix-nio-selectionkey-tribes-20260708-001`)
+
+## Resolution
+
+The selector side table was not the remaining culprit. The selected-key set
+construction and mutation path crossed into `native-collections`:
+
+- `Selector.selectedKeys()` builds a `java.util.HashSet` and populates it through
+  `HashSet.add`, which directly enters `HashMap.put`.
+- `HashMap.put` computed `key.hashCode()` before pinning the inner map receiver,
+  key, or value. Under `CRATONVM_GC_STRESS`, even `Object.hashCode()` can enter a
+  safepoint with a pending moving GC, leaving later bucket/node writes using
+  stale locals.
+- `HashSet.iterator()` allocated the snapshot array before pinning the `HashSet`
+  receiver used as the iterator's `remove()` backing. A GC during snapshot
+  allocation could install a stale backing reference in the iterator.
+- `Iterator.remove()` on the selected-key set routes through `HashMap.remove`,
+  which had the same unpinned receiver/key window before `hashCode()`.
+
+The fix pins the `HashMap.put` receiver/key/value across the whole hash/insert
+window, pins the `HashMap.remove` receiver/key across the hash/remove window, and
+pins the `HashSet.iterator()` receiver/backing/snapshot array before any
+allocation that can move them. The focused fixture now uses two ready
+`SelectionKey`s per selector cycle and asserts that `Iterator.remove()` drains the
+selected-key set.
+
+Validation:
+
+```powershell
+$env:CARGO_TARGET_DIR='C:\craton\cargo-targets\nio-selectionkey-tribes-20260708-001'
+javac -d 'C:\craton\cargo-targets\nio-selectionkey-tribes-20260708-001-javac' vm\tests\resources\cratonvm\NioSelectorBuildSetGc.java
+$env:CRATONVM_BIN='C:\craton\cargo-targets\nio-selectionkey-tribes-20260708-001\debug\cratonvm-nio-selectionkey-tribes-20260708-001-debug.exe'
+$env:CRATONVM_TEST_CLASSES_DIR='C:\craton\cargo-targets\nio-selectionkey-tribes-20260708-001-javac'
+cargo test -p cratonvm-vm --test nio_selector_build_set_gc -- --nocapture
+cargo test -p cratonvm-native-collections --test mock_hashmap -- --nocapture
+```
+
+Both passed on Windows in the fix worktree.
 
 ## Correction to the original report
 
@@ -110,22 +149,14 @@ fix in place, on a fresh `dev`-based build, means either:
   behavioral difference under this GC-stress regime) — cannot be ruled out
   without further isolation.
 
-## Next steps for whoever picks this up
+## Closure notes
 
-1. Isolate further: does the same `ClassCastException` reproduce with a
-   **minimal** two-`SelectionKey`, single-selector Java fixture driven
-   directly (not through the full Tribes stack), under
-   `CRATONVM_GC_STRESS`? This would confirm/deny the VM-vs-Tribes-timing
-   question decisively and is a much cheaper repro loop than the full
-   1360-boot-cycle-style Tribes suite.
-2. Audit `Iterator.remove()`'s real bytecode path against a CratonVM-built
-   `HashSet` specifically — `build_set`'s fix only covers construction
-   (`<init>`/`add`), not subsequent mutation.
-3. Audit `sk_cancel_public` (`nio_selector.rs:2562`) and
-   `channel_register_native` for a key-object-identity race against an
-   in-flight `selectedKeys()` snapshot still being iterated by a caller.
-4. If a fix lands, add a regression test following the pattern of
-   `vm/tests/nio_selector_build_set_gc.rs` (a Java fixture driving many
-   `Selector.selectedKeys()` + `Iterator.remove()` cycles under
-   `CRATONVM_GC_STRESS`), since the full Tribes suite is too slow/noisy for
-   fast iteration.
+The original next-step list is now covered by the updated fixture:
+
+1. The minimal repro is a two-`SelectionKey`, single-selector Java fixture
+   (`NioSelectorBuildSetGc`) driven under `CRATONVM_GC_STRESS`.
+2. `Iterator.remove()` is exercised against the selected-key `HashSet` and
+   checked with `ready.isEmpty()` after the loop.
+3. `sk_cancel_public` and `channel_register_native` were not the failing layer
+   for this specific crash; the corruption window was in native collection
+   map/set helpers used by the selected-key set.

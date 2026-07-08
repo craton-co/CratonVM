@@ -41,19 +41,27 @@ public class NioSelectorBuildSetGc {
                 churn[c] = new byte[512];
             }
 
-            SocketChannel client = SocketChannel.open();
-            client.configureBlocking(false);
-            client.connect(new InetSocketAddress("127.0.0.1", port));
-            // Finish the handshake (accept + finishConnect) so the key is
-            // actually READ/WRITE-ready on the next select.
-            Socket accepted = server.accept();
-            long deadline = System.nanoTime() + 2_000_000_000L;
-            while (!client.finishConnect()) {
-                if (System.nanoTime() > deadline) {
-                    throw new AssertionError("finishConnect timed out at iter " + i);
+            SocketChannel[] clients = new SocketChannel[2];
+            Socket[] accepted = new Socket[2];
+            for (int c = 0; c < clients.length; c++) {
+                SocketChannel client = SocketChannel.open();
+                client.configureBlocking(false);
+                client.connect(new InetSocketAddress("127.0.0.1", port));
+                // Finish the handshake (accept + finishConnect) so the key is
+                // actually READ/WRITE-ready on the next select. Using two keys
+                // exercises the selectedKeys().iterator().next()/remove() path
+                // that Tomcat Tribes' ParallelNioSender drives.
+                accepted[c] = server.accept();
+                long deadline = System.nanoTime() + 2_000_000_000L;
+                while (!client.finishConnect()) {
+                    if (System.nanoTime() > deadline) {
+                        throw new AssertionError(
+                            "finishConnect timed out at iter " + i + " client " + c);
+                    }
                 }
+                client.register(selector, SelectionKey.OP_WRITE);
+                clients[c] = client;
             }
-            client.register(selector, SelectionKey.OP_WRITE);
 
             int n = selector.select(1000);
             if (n > 0) {
@@ -70,6 +78,10 @@ public class NioSelectorBuildSetGc {
                     it.remove();
                     key.cancel();
                 }
+                if (!ready.isEmpty()) {
+                    throw new AssertionError(
+                        "Iterator.remove left selectedKeys non-empty at iter " + i);
+                }
             }
 
             // Also exercise keys() (the other build_set caller) every few
@@ -82,8 +94,10 @@ public class NioSelectorBuildSetGc {
                 }
             }
 
-            client.close();
-            accepted.close();
+            for (int c = 0; c < clients.length; c++) {
+                clients[c].close();
+                accepted[c].close();
+            }
         }
 
         selector.close();
