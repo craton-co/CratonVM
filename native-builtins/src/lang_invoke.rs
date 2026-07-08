@@ -811,7 +811,6 @@ pub fn register_phase54_method_handle(r: &mut NativeMethodRegistry) {
         },
     );
 
-
     // byteBufferViewVarHandle(<T>[].class, ByteOrder) -- view a ByteBuffer as
     // wider primitives at a BYTE index. Netty 4.2 uses these VarHandles for
     // direct ByteBuf multi-byte headers when USE_VAR_HANDLE is true.
@@ -1302,7 +1301,6 @@ fn byte_view_kind(meta: Option<&VarHandleMeta>) -> Option<(u8, bool)> {
     };
     Some((*m.field_desc.as_bytes().first().unwrap_or(&b'J'), le))
 }
-
 
 /// If `meta` is a byte-buffer-view VarHandle, return `(element_desc, little_endian)`.
 fn byte_buffer_view_kind(meta: Option<&VarHandleMeta>) -> Option<(u8, bool)> {
@@ -3968,12 +3966,14 @@ fn make_drop_arguments_adapter(ctx: &mut dyn NativeContext, args: &[Value]) -> M
     if extra_n == 0 {
         return Ok(Some(Value::Object(Some(orig_mh))));
     }
-    // Read the original MH's desc; construct the widened desc by inserting
-    // `extra_n` erased object descriptors at position `pos`.
-    let inner_desc = match ctx.get_field(orig_mh, MH_DESC) {
-        Value::Object(Some(s)) => ctx.read_string(s).unwrap_or_default(),
-        _ => String::new(),
-    };
+    // Construct the widened descriptor from the original MH's effective
+    // type(), not its raw leaf descriptor. Groovy stacks dropArguments on top
+    // of asType/insert/collect adapters whose MH_DESC can still describe a
+    // lower-level leaf; widening that raw shape overstates arity and makes the
+    // guard test receive the wrong arguments forever.
+    let inner_desc = mh_type_descriptor(ctx, orig_mh)
+        .or_else(|| mh_read_desc(ctx, orig_mh))
+        .unwrap_or_default();
     let widened_desc = widen_descriptor(ctx, &inner_desc, extra_classes, pos);
     // Encode `pos` into MH_CLASS so dispatch can recover it.
     let pos_str = pos.to_string();
@@ -5327,7 +5327,6 @@ fn mh_dispatch_fold(
     mh_dispatch(ctx, target, &full)
 }
 
-
 fn mh_exception_matches(
     ctx: &dyn NativeContext,
     thrown: cratonvm_types::ObjectRef,
@@ -5339,6 +5338,45 @@ fn mh_exception_matches(
     };
     let thrown_id = ctx.class_id_of_object(thrown);
     thrown_id == catch_id || ctx.is_subclass(thrown_id, catch_id)
+}
+
+fn box_direct_primitive_return(
+    ctx: &mut dyn NativeContext,
+    mh: ObjectRef,
+    result: MethodCallResult,
+    desc: &str,
+) -> MethodCallResult {
+    let ret_desc = return_type_desc(desc);
+    if !matches!(ret_desc, "I" | "J" | "F" | "D" | "Z" | "B" | "S" | "C") {
+        return result;
+    }
+    let effective_desc = mh_type_descriptor(ctx, mh).unwrap_or_default();
+    if !matches!(
+        return_type_desc(&effective_desc).as_bytes().first(),
+        Some(b'L') | Some(b'[')
+    ) {
+        return result;
+    }
+    match result {
+        Ok(Some(v @ Value::Object(Some(_)))) => Ok(Some(v)),
+        Ok(Some(v)) => Ok(Some(box_value(ctx, v, ret_desc))),
+        other => other,
+    }
+}
+
+fn mh_guard_truthy(ctx: &dyn NativeContext, result: Option<Value>) -> bool {
+    match result {
+        Some(Value::Int(v)) => v != 0,
+        Some(Value::Object(Some(obj))) => match crate::lang_class::unbox_value(ctx, obj) {
+            Value::Int(v) => v != 0,
+            Value::Long(v) => v != 0,
+            Value::Float(v) => v != 0.0,
+            Value::Double(v) => v != 0.0,
+            Value::Object(Some(_)) => true,
+            _ => false,
+        },
+        _ => false,
+    }
 }
 
 /// `MethodHandles.catchException` dispatch (`MH_KIND_CATCH`).
@@ -5431,7 +5469,8 @@ pub(crate) fn mh_dispatch(
             // the args were supplied flat — see `collect_trailing_varargs`).
             let full = collect_trailing_varargs(ctx, &class, &name, &desc, &full);
             let adapted = adapt_invoke_args(ctx, &full, &desc);
-            ctx.invoke(&class, &name, &desc, &adapted)
+            let result = ctx.invoke(&class, &name, &desc, &adapted);
+            box_direct_primitive_return(ctx, mh, result, &desc)
         }
         MH_KIND_CONSTRUCTOR => {
             // Constructor: allocate new object then call <init>
@@ -5467,7 +5506,8 @@ pub(crate) fn mh_dispatch(
                     Err(_) => return Ok(Some(Value::Object(None))),
                 };
                 let slot = ctx.static_field_index_by_name(class_id, &name).unwrap_or(0);
-                Ok(Some(ctx.get_static_field(class_id, slot)))
+                let result = Ok(Some(ctx.get_static_field(class_id, slot)));
+                box_direct_primitive_return(ctx, mh, result, &desc)
             } else {
                 let receiver = match bound {
                     Value::Object(Some(r)) => r,
@@ -5476,10 +5516,11 @@ pub(crate) fn mh_dispatch(
                         _ => return Ok(Some(Value::Object(None))),
                     },
                 };
-                match ctx.resolve_field_index(&class, &name) {
+                let result = match ctx.resolve_field_index(&class, &name) {
                     Some(idx) => Ok(Some(ctx.get_field(receiver, idx))),
                     None => Ok(Some(ctx.get_field_by_name(receiver, &name))),
-                }
+                };
+                box_direct_primitive_return(ctx, mh, result, &desc)
             }
         }
         MH_KIND_SETTER => {
@@ -5570,14 +5611,16 @@ pub(crate) fn mh_dispatch(
         MH_KIND_DROP => {
             // C26: dropArgumentsTrusted wrapper. Unwrap to inner MH (in
             // MH_BOUND) and forward only the inner MH's expected args.
-            // Inner arity is derived from the inner MH's MH_DESC. The drop
-            // position is encoded in MH_CLASS as "<pos>" decimal; if parse
+            // Inner arity is derived from the inner MH's effective type. The
+            // drop position is encoded in MH_CLASS as "<pos>" decimal; if parse
             // fails, drop from the head.
             let inner = match bound {
                 Value::Object(Some(r)) => r,
                 _ => return Ok(Some(Value::Object(None))),
             };
-            let inner_desc = mh_read_desc(ctx, inner).unwrap_or_default();
+            let inner_desc = mh_type_descriptor(ctx, inner)
+                .or_else(|| mh_read_desc(ctx, inner))
+                .unwrap_or_default();
             let inner_params = count_descriptor_params(&inner_desc);
             let inner_kind = match ctx.get_field(inner, MH_KIND) {
                 Value::Int(k) => k,
@@ -5623,13 +5666,16 @@ pub(crate) fn mh_dispatch(
                 Value::Object(Some(f)) => f,
                 _ => return Ok(Some(Value::Object(None))),
             };
-            // Invoke the test MH with the same arguments
-            let test_result = mh_dispatch(ctx, test_mh, extra_args)?;
-            let is_true = match test_result {
-                Some(Value::Int(v)) => v != 0,
-                Some(Value::Object(Some(_))) => true,
-                _ => false,
-            };
+            // guardWithTest calls the test with the prefix of the target
+            // arguments matching the test handle's own parameter list. Passing
+            // all target args makes shorter Groovy guard predicates
+            // (sameClasses/isSameMetaClass after dropArguments) miss forever.
+            let test_desc = mh_type_descriptor(ctx, test_mh)
+                .or_else(|| mh_read_desc(ctx, test_mh))
+                .unwrap_or_default();
+            let test_argc = count_descriptor_params(&test_desc).min(extra_args.len());
+            let test_result = mh_dispatch(ctx, test_mh, &extra_args[..test_argc])?;
+            let is_true = mh_guard_truthy(ctx, test_result);
             if is_true {
                 mh_dispatch(ctx, target_mh, extra_args)
             } else {
@@ -5740,7 +5786,8 @@ pub(crate) fn mh_dispatch(
                     full_args = extra_args.to_vec();
                 }
             }
-            ctx.invoke_special(&class_for_dispatch, &name, &desc, &full_args)
+            let result = ctx.invoke_special(&class_for_dispatch, &name, &desc, &full_args);
+            box_direct_primitive_return(ctx, mh, result, &desc)
         }
         MH_KIND_RECORD_DESER => {
             // Record deserialization constructor. extra_args =
@@ -5940,7 +5987,8 @@ pub(crate) fn mh_dispatch(
                     // Bound method handle — receiver was pre-captured
                     let collected = collect_trailing_varargs(ctx, &class, &name, &desc, extra_args);
                     let adapted = adapt_invoke_args(ctx, &collected, &desc);
-                    ctx.invoke_virtual(r, &name, &desc, &adapted)
+                    let result = ctx.invoke_virtual(r, &name, &desc, &adapted);
+                    box_direct_primitive_return(ctx, mh, result, &desc)
                 }
                 _ => match extra_args.first() {
                     Some(Value::Object(Some(receiver))) => {
@@ -5948,7 +5996,8 @@ pub(crate) fn mh_dispatch(
                         let collected =
                             collect_trailing_varargs(ctx, &class, &name, &desc, &extra_args[1..]);
                         let adapted = adapt_invoke_args(ctx, &collected, &desc);
-                        ctx.invoke_virtual(receiver, &name, &desc, &adapted)
+                        let result = ctx.invoke_virtual(receiver, &name, &desc, &adapted);
+                        box_direct_primitive_return(ctx, mh, result, &desc)
                     }
                     _ => Ok(Some(Value::Object(None))),
                 },
@@ -6551,6 +6600,7 @@ fn auto_box_return(
     let ret_desc = return_type_desc(desc);
     match ret_desc {
         "I" | "J" | "F" | "D" | "Z" | "B" | "S" | "C" => match result {
+            Ok(Some(v @ Value::Object(Some(_)))) => Ok(Some(v)),
             Ok(Some(val)) => Ok(Some(box_value(ctx, val, ret_desc))),
             other => other,
         },
@@ -8238,6 +8288,93 @@ mod tests {
         let mut ctx = MockNativeContext::new();
         assert!(build_method_type_from_descriptor(&mut ctx, "").is_none());
         assert!(build_method_type_from_descriptor(&mut ctx, "not-a-descriptor").is_none());
+    }
+
+    #[test]
+    fn direct_primitive_return_boxes_boolean_for_adapter_chains() {
+        let mut ctx = MockNativeContext::new();
+        let mh = alloc_method_handle(
+            &mut ctx,
+            "java/util/Map",
+            "containsKey",
+            "(Ljava/lang/Object;)Z",
+            MH_KIND_VIRTUAL,
+        );
+        let effective_desc =
+            ctx.create_string("(Ljava/lang/Object;Ljava/lang/Object;)Ljava/lang/Object;");
+        ctx.set_field(mh, MH_DESC, Value::Object(Some(effective_desc)));
+        let result = box_direct_primitive_return(
+            &mut ctx,
+            mh,
+            Ok(Some(Value::Int(1))),
+            "(Ljava/lang/Object;)Z",
+        )
+        .expect("direct return should not throw")
+        .expect("direct return should produce a value");
+        match result {
+            Value::Object(Some(obj)) => {
+                // The wrapper class-id cache is process-global while each
+                // MockNativeContext has a private class table, so class-name
+                // lookup can be stale here. The payload proves boxing happened.
+                assert_eq!(ctx.get_field(obj, 0), Value::Int(1));
+            }
+            other => panic!("expected boxed Boolean, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn direct_primitive_return_keeps_raw_for_primitive_effective_type() {
+        let mut ctx = MockNativeContext::new();
+        let mh = alloc_method_handle(
+            &mut ctx,
+            "java/util/Map",
+            "containsKey",
+            "(Ljava/lang/Object;)Z",
+            MH_KIND_VIRTUAL,
+        );
+        let result = box_direct_primitive_return(
+            &mut ctx,
+            mh,
+            Ok(Some(Value::Int(1))),
+            "(Ljava/lang/Object;)Z",
+        )
+        .expect("direct return should not throw")
+        .expect("direct return should produce a value");
+        assert_eq!(result, Value::Int(1));
+    }
+
+    #[test]
+    fn auto_box_return_preserves_already_boxed_primitive_result() {
+        let mut ctx = MockNativeContext::new();
+        let boxed = match box_value(&mut ctx, Value::Int(0), "Z") {
+            Value::Object(Some(obj)) => obj,
+            other => panic!("expected boxed Boolean fixture, got {:?}", other),
+        };
+        let result = auto_box_return(&mut ctx, Ok(Some(Value::Object(Some(boxed)))), "()Z")
+            .expect("auto box should not throw")
+            .expect("auto box should produce a value");
+        assert_eq!(result, Value::Object(Some(boxed)));
+        assert_eq!(ctx.get_field(boxed, 0), Value::Int(0));
+    }
+
+    #[test]
+    fn guard_truthiness_unboxes_boxed_boolean_false() {
+        let mut ctx = MockNativeContext::new();
+        let boxed_false = match ctx.new_object("java/lang/Boolean").unwrap() {
+            Some(Value::Object(Some(obj))) => obj,
+            other => panic!("expected boxed Boolean fixture, got {:?}", other),
+        };
+        ctx.set_field(boxed_false, 0, Value::Int(0));
+        let boxed_true = match ctx.new_object("java/lang/Boolean").unwrap() {
+            Some(Value::Object(Some(obj))) => obj,
+            other => panic!("expected boxed Boolean fixture, got {:?}", other),
+        };
+        ctx.set_field(boxed_true, 0, Value::Int(1));
+        assert!(!mh_guard_truthy(
+            &ctx,
+            Some(Value::Object(Some(boxed_false)))
+        ));
+        assert!(mh_guard_truthy(&ctx, Some(Value::Object(Some(boxed_true)))));
     }
 
     // C33: alloc_resolved_member_name must produce a MemberName that reads
