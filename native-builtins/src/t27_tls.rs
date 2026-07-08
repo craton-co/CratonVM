@@ -1235,7 +1235,8 @@ pub(crate) fn build_client_config(
 /// `PKIXRevocationChecker`-configured `TrustManagerFactory` used only for
 /// `HttpsURLConnection.setDefaultSSLSocketFactory` would silently accept a
 /// revoked server certificate — exactly the fail-open gap this feature
-/// fixes. See `docs/known-issues/tls-ocsp-clientcert-validation-not-enforced.md`.
+/// fixes. See
+/// `docs/internal/fixed-suite-bugs/tls-ocsp-clientcert-validation-not-enforced-FIXED.md`.
 #[derive(Debug)]
 struct OcspAwareServerCertVerifier {
     inner: Arc<dyn rustls::client::danger::ServerCertVerifier>,
@@ -4981,8 +4982,9 @@ fn engine_begin(state: &mut EngineState) -> Result<(), String> {
                     // (below the closing brace of this match) means that second
                     // `beginHandshake()` call was ALSO silently discarded on the
                     // CratonVM side even before hitting that rustls wall — see
-                    // this crate's `docs/known-issues/tls-ocsp-clientcert-
-                    // validation-not-enforced.md`, "Residual #2 implementation"
+                    // this crate's
+                    // `docs/internal/fixed-suite-bugs/tls-ocsp-clientcert-
+                    // validation-not-enforced-FIXED.md`, "Residual #2 implementation"
                     // point 2, for the full trace evidence.
                     //
                     // True wire-level renegotiation is therefore not
