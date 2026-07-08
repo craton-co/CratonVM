@@ -27,26 +27,15 @@ All three verified against their real Keycloak classes via the suite runner; no 
 - [hib-local-windows-rerun-20260707.md](hib-local-windows-rerun-20260707.md) — 4-shard local rerun of the 121-class non-passed list confirms 15 real fixes (bytecode-enhancement/lazytoone progress, generic-timeout-wall classes now passing) landed on `dev` since the 2026-07-05 Azure baseline; documents 3 findings that evolved to different symptoms (`JpaLargeBlobTest`, `InPredicateTest`, the temporal 1-hour-skew doc now superseded); flags a harness status-computation false-positive.
 - ✅ FIXED same day: the SQL-placeholder duplication that rerun re-confirmed (plus 2 more affected classes outside `type.temporal.*` — `ExtendedEnhancementNonStandardAccessTest`, `FunctionTests`, proving it a general SQL-generation-path defect) was the reopened JIT reason-8 imprecise-resume corruption; see [`docs/internal/hib-temporal-sql-parameter-placeholder-duplication-FIXED.md`](../internal/hib-temporal-sql-parameter-placeholder-duplication-FIXED.md) and the identity-sound precise-resume entry below.
 
-## 2026-07-07 ES binary-docvalues range doc retired; residual re-diagnosed as young-GC live-object reclamation (NEW open doc)
+## 2026-07-07 ES binary-docvalues range doc retired; young-GC RRWL residual fixed 2026-07-08
 
-- [gen-heap-young-gc-live-object-reclaim-rrwl-holdcount.md](gen-heap-young-gc-live-object-reclaim-rrwl-holdcount.md) —
-  🔴 OPEN, VM-core GC. The `elasticsearch-lucene-binary-docvalues-range-hangs` residual (and the
-  "separate JIT-specific RRWL reader-vs-writer hang" from the 2026-07-06 Azure session) is NOT a JIT
-  miscompile: with every published-compiled method force-skipped (audited via `CRATONVM_DBG_JITC`),
-  the standalone probe still hangs. Direct evidence (`CRATONVM_DBG_SWEEP_ZERO`): the JIT-active
-  non-moving young sweep RECLAIMS a live `ThreadLocalMap$Entry` (RRWL `readHolds` hold-counter
-  storage) → IMSE at unlock / leaked read count → all-parked hang at AQLS.acquire bci 368.
-  `--nojit`+GC-stress completes; JIT-active+GC-stress hangs with nothing meaningful compiled.
-  Fixed `CRATONVM_DBG_SWEEP_EDGES` (was blind to Family-A side-marks) now classifies the loss as
-  case (a): register/native-stack root gap or sweep-walk defect. Hang rate regressed 0/3 →
-  ~6/6 across dev f6aa11c9..007e620a (prime suspect commits listed in the doc). Probe sources:
-  `repros/rwl-holdcount/`. New gated diagnostics on dev: `CRATONVM_DBG_REFERSTO`,
-  `CRATONVM_DBG_UNPARK_MISS`.
+- [FIXED] [Young-GC live-object reclamation corrupting RRWL read-lock hold counts](../internal/fixed-suite-bugs/gen-heap-young-gc-live-object-reclaim-rrwl-holdcount-FIXED.md) - the `elasticsearch-lucene-binary-docvalues-range-hangs` residual and the standalone RRWL reader-vs-writer hang were traced through three layers: reference-processing survivorship, class-init missed-notify crawl, ThreadIdentifiers tid collisions, then the final Linux helper-window/native ClassLoader pinning gaps. The standalone `RwlReadTearingProbe` now completes 10/10 under `CRATONVM_DBG_GC_STRESS=200000` on the Azure validation host. Direct ES rerun remains unavailable there because the ES checkout/classpath is absent, so any future ES confirmation should be tracked as suite validation rather than keeping this fixed mechanism in `known-issues`.
 - `elasticsearch-lucene-binary-docvalues-range-hangs.md` retired to
   [`docs/internal/`](../internal/elasticsearch-lucene-binary-docvalues-range-hangs.md): its three
-  root causes (invokedynamic JIT blacklist, AQS skip-list gaps ×2 rounds, plain-field 16-byte slot
-  tearing) are all FIXED+merged, end-to-end verified on the Windows box (deterministic silent stall
-  → bimodal fast-IMSE/stall, both faces now attributed to the new GC doc above).
+  root causes (invokedynamic JIT blacklist, AQS skip-list gaps x2 rounds, plain-field 16-byte slot
+  tearing) are all FIXED+merged, end-to-end verified on the Windows box. Its residual now points at
+  the fixed RRWL document above.
+
 ## 2026-07-07 JIT invokedynamic uncommon-trap Groovy regression — FIXED (no tradeoff)
 
 - ✅ FIXED: `fb4a333d`'s precise-resume routing for the invokedynamic
