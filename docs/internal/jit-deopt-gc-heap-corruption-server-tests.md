@@ -1,8 +1,53 @@
 # JIT/deopt/GC heap-corruption crashes in ES `:server` unit tests
 
-Status: open
+Status: fixed
 
 Date observed: 2026-07-04
+
+## Fix summary
+
+Fixed on 2026-07-08 by making two fail-closed changes in the JIT path:
+
+- `JitCache` now retires evicted compiled methods instead of immediately unregistering and dropping executable buffers. This keeps compiled code-range metadata available after deoptimization/cache eviction unless the explicit diagnostic `CRATONVM_JIT_FREE_CODE` mode is enabled, avoiding stale compiled-call targets into freed code memory.
+- The Elasticsearch interval-provider crash signature was narrowed to JIT compilation of `org/yaml/snakeyaml/emitter/Emitter.emit`. Conservative JIT eligibility now keeps that exact dispatcher interpreted in both the VM skip-list and the final `cratonvm-jit` `try_compile` gate, with `CRATONVM_JIT_ALLOW_PACKAGES=org/yaml/snakeyaml/emitter/` left as the explicit bisection escape hatch.
+
+Validation used a remote Linux worktree at `/data/data/cratonvm-worktrees/20260708-214648-jit-deopt-gc-heap-corruption`, branch `codex/fix-jit-deopt-gc-heap-corruption-20260708-214648`, with a uniquely named release-with-debug binary:
+
+```text
+/data/data/target-jit-deopt-gc-heap-corruption-20260708-214648-rwd/release-with-debug/cratonvm-jit-deopt-gc-heap-corruption-20260708-214648
+```
+
+Focused Rust validation:
+
+```text
+CARGO_TARGET_DIR=/data/data/target-jit-deopt-gc-heap-corruption-20260708-214648-focused2 \
+  cargo test -p cratonvm-vm snakeyaml_emitter_emit --lib -- --nocapture
+# 2 passed
+
+CARGO_TARGET_DIR=/data/data/target-jit-deopt-gc-heap-corruption-20260708-214648-focused2 \
+  cargo test -p cratonvm-jit snakeyaml_emitter_emit_final_guard_is_exact --lib -- --nocapture
+# 1 passed
+
+CARGO_TARGET_DIR=/data/data/target-jit-deopt-gc-heap-corruption-20260708-214648-focused2 \
+  cargo test -p cratonvm-jit test_jit_cache_ --lib -- --nocapture
+# 7 passed
+```
+
+Elasticsearch crash regression validation used a compact five-class bundle and the same rows listed below. Before the guard, the three interval-provider classes exited as `CRASH`/rc=139 under default JIT while the same rows did not crash with `--nojit`, `CRATONVM_JIT_THRESHOLD=2000000000`, or `CRATONVM_JIT_DENY=org/yaml/snakeyaml/emitter/Emitter.emit`. After the fix, the default-JIT run completed all five rows without crashes:
+
+```text
+run: jit-deopt-gc-five-fixed-guard2-20260708-214648
+mode: all-jit
+results: FAIL=5, CRASH=0
+
+org.elasticsearch.index.mapper.TsidExtractingIdFieldMapperTests             FAIL
+org.elasticsearch.index.mapper.UpdateMappingTests                          FAIL
+org.elasticsearch.index.query.CombineIntervalsSourceProviderTests          FAIL
+org.elasticsearch.index.query.DisjunctionIntervalsSourceProviderTests      FAIL
+org.elasticsearch.index.query.FilterIntervalsSourceProviderTests           FAIL
+```
+
+The remaining `FAIL` statuses are ordinary suite/runtime failures in this compact bundle, including the known native-access `NoSuchMethodError` shape, not the documented JIT/deopt/GC heap-corruption crash.
 
 ## Summary
 
