@@ -19800,6 +19800,13 @@ impl Compiler {
                         .get(&pc)
                         .map(|&i| self.invoke_info[i].1);
 
+                    let direct = direct.filter(|(entry, _, _, _)| {
+                        if *entry != super::JitIntrinsic::ArraycopyPrimitive.as_entry() {
+                            return true;
+                        }
+                        !crate::deopt::despec_contains(&self.method_key, pc as u32)
+                    });
+
                     if let Some((callee_entry, callee_needs_ctx, callee_params, ret_type)) = direct
                     {
                         if callee_entry == super::MATH_SQRT_INTRINSIC {
