@@ -4,9 +4,10 @@ This folder collects CratonVM-only defects found while running upstream Java
 suites. The docs had grown to describe the **same underlying bug from several
 angles**; this index is the consolidated map. Read it first.
 
-## 2026-07-07 `InPredicateTest` timeout root-caused to dispatch-heavy JIT tier-up overhead (not the OSR alloc-gate, not precise-JIT-maps)
+## 2026-07-08 `InPredicateTest` timeout retired; `DomainParameterXref` NSME remains open
 
-- 🔴 OPEN: [`InPredicateTest` 100k-element criteria `IN` predicate times out under JIT](hib-inpredicate-dispatch-heavy-jit-timeout-20260707.md) — a clean, uncontended single-class rerun confirms the 2026-07-07 local-rerun timeout finding is a real, deterministic regression (3/3 clean runs, 330–510s, always timing out), not host-load noise. Two same-day-landed candidates (the precise-JIT-maps default-ON re-flip, the OSR allocation-region gate) were directly A/B-tested and ruled out. Root cause: `SqmCriteriaNodeBuilder.in()`'s 100k-call dispatch-heavy loop hits the already-tracked "JIT is a net slowdown for dispatch-heavy Hibernate workloads" issue ([[reference_jit_invoke_cache_thrash_dispatch_heavy]], `docs/internal/HIB-misc16-correctness-sweep.md` §15–16) — confirmed decisively via `--nojit` A/B (330-510s FAIL vs 109.5s PASS, 3–4.6× faster with JIT off). Also explains why the previously-tracked `removeEldestEntry` NSME ([hib-domainparameterxref-lhm-removeeldestentry-nsme.md](hib-domainparameterxref-lhm-removeeldestentry-nsme.md)) no longer reproduces: the code path that threw it is never reached anymore, not fixed — that doc has been annotated, not retired.
+- ✅ RETIRED: [`InPredicateTest` 100k-element criteria `IN` predicate JIT timeout](../internal/fixed-suite-bugs/hib-inpredicate-dispatch-heavy-jit-timeout-20260707-FIXED.md) — a 2026-07-08 Azure rerun on current `dev` no longer reproduces the 330–510s JIT timeout. The class reaches the later `DomainParameterXref` phase and fails in ~33s with `java/lang/Object.removeEldestEntry(Ljava/util/Map$Entry;)Z`, so the dispatch-heavy `.in()` timeout family is closed but this is not a full `InPredicateTest` pass.
+- 🔴 OPEN: [`DomainParameterXref` `LinkedHashMap.removeEldestEntry` dispatch resolves to `Object`](hib-domainparameterxref-lhm-removeeldestentry-nsme.md) — re-confirmed 2026-07-08 once the timeout stopped masking it. Keep this separate Layer-1/register-invisible-root issue in `docs/known-issues`.
 
 ## 2026-07-07/08 crypto/fips1402 ProvEC `ClassNotFoundException`, SD-JWT hang, and P-384 KeyPairGenerator gaps FIXED
 
