@@ -35687,7 +35687,18 @@ pub(crate) fn alloc_concurrent_synthetic(
     num_fields: usize,
 ) -> ObjectRef {
     match ctx.ensure_class_initialized(class_name) {
-        Ok(cid) => {
+        Ok(class_id) => {
+            let resolved_name = ctx.class_name_of_id(class_id).unwrap_or_default();
+            let cid = if resolved_name == class_name || class_name == "java/lang/Object" {
+                class_id
+            } else {
+                // Some class-loading fallbacks report success with Object's
+                // ClassId for helper/interface-like synthetic classes. Keep
+                // the requested identity so field writes and native dispatch
+                // use the helper layout instead of Object's zero-slot layout.
+                ctx.class_id_by_name(class_name)
+                    .unwrap_or_else(|| ctx.ensure_synthetic_class(class_name, num_fields))
+            };
             // In real-JDK mode the loaded class's actual instance-field
             // count often exceeds the synthetic-mode hard-coded number.
             // Allocating with too few slots causes out-of-bounds field
