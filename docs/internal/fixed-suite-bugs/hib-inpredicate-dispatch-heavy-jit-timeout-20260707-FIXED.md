@@ -1,41 +1,34 @@
-# `InPredicateTest` — 100k-element criteria `IN` predicate JIT timeout — FIXED
+# `InPredicateTest` — 100k-element criteria `IN` predicate times out under JIT (RETIRED 2026-07-08)
 
 | | |
 |---|---|
-| **Status** | ✅ FIXED / RETIRED from `docs/known-issues` on 2026-07-08. A fresh Azure single-class rerun on current `dev` no longer reproduces the 330–510s JIT timeout; it reaches the later, separately tracked `DomainParameterXref` `removeEldestEntry` NSME in ~31s. |
+| **Status** | ✅ RETIRED 2026-07-08 — current Azure recheck no longer reproduces the timeout. Fresh `dev@47bbdc3b` reached the later `DomainParameterXref` NSME in 33.697s, and after the LHM guard fix the same class passed under default JIT in 55.971s. Historical 2026-07-07 evidence retained below. |
 | **Area** | JIT tiered-compilation dispatch overhead, surfaced via `org.hibernate.orm.test.jpa.criteria.InPredicateTest` |
-| **Symptom** | `java.util.concurrent.TimeoutException: testInPredicate(...) timed out after 120 seconds`, class wall time ~330–510s |
+| **Symptom** | historical: `java.util.concurrent.TimeoutException: testInPredicate(...) timed out after 120 seconds`, class wall time ~330–510s. Current fixed probe: `ok=1`, 55.971s. |
 | **Discovered** | Symptom first observed 2026-07-07 in a contended 4-shard local rerun ([hib-local-windows-rerun-20260707.md](../../known-issues/hib-local-windows-rerun-20260707.md)); root-caused same day with a clean, uncontended single-class rerun (this doc). |
 
-## 2026-07-08 resolution on current `dev`
+## 2026-07-08 retirement — current `InPredicateTest` no longer times out
 
-The timeout tracked by this note is no longer reproducible on current `dev`.
-Fresh Azure worktree and binary:
-
-- worktree: `/data/data/cratonvm-worktrees/20260708-121221-hib-inpredicate-tierup`
-- branch: `codex/fix-hib-inpredicate-tierup-20260708-121221`, initially from `dev@47bbdc3b`
-- binary: `/data/data/cratonvm-probe-bins/cvinpredtierup-20260708-121221-baseline`
-- harness: `/data/data/apps/hibernate-orm-harness/hib-suite-runner`
-
-Result:
+This note was rechecked while retiring the later `DomainParameterXref` /
+`LinkedHashMap.removeEldestEntry` NSME. The old timeout symptom is no longer
+current on the Azure host:
 
 ```text
-@@FAIL org.hibernate.orm.test.jpa.criteria.InPredicateTest :: java.lang.NoSuchMethodError: java/lang/Object.removeEldestEntry(Ljava/util/Map$Entry;)Z
-@@RESULT 0 org.hibernate.orm.test.jpa.criteria.InPredicateTest found=1 started=1 ok=0 failed=1 aborted=0 skipped=0 ms=30985
-@@HOST_RC=0 @@WALL=31s
+# current dev before the LHM guard, unique binary cratonvm-hib-domainparameterxref-lhm-20260708-151223-dev
+@@RESULT 0 org.hibernate.orm.test.jpa.criteria.InPredicateTest found=1 started=1 ok=0 failed=1 aborted=0 skipped=0 ms=33697
+# failure was the later LHM NSME, not a timeout
+
+# after the LHM guard, unique binary cratonvm-hib-domainparameterxref-lhm-20260708-151223-fixed
+@@RESULT 0 org.hibernate.orm.test.jpa.criteria.InPredicateTest found=1 started=1 ok=1 failed=0 aborted=0 skipped=0 ms=55971
 ```
 
-This proves the dispatch-heavy `.in()` phase no longer consumes the JUnit 120s
-timeout budget. `InPredicateTest` still does **not** pass, but the remaining
-failure is the older, separate
-[`DomainParameterXref` `removeEldestEntry` dispatch bug](../../known-issues/hib-domainparameterxref-lhm-removeeldestentry-nsme.md),
-which is kept open in `docs/known-issues`. Retiring this note is therefore a
-timeout-family closure, not a full-class pass claim.
+The 2026-07-07 dispatch-heavy tier-up analysis remains useful historical
+context, but this class no longer has an open timeout blocker in current dev.
 
 ## Background — this test's failure mode has changed twice in two days
 
 1. **2026-07-05 (Azure host, `dev@49aaf713`)**: `NullPointerException: Cannot invoke "java.util.Collection.size()" because "values" is null` — fixed 2026-07-06 (`084c8ffb`, see [`docs/internal/hib-inpredicatetest-criteria-values-null-npe-FIXED.md`](../hib-inpredicatetest-criteria-values-null-npe-FIXED.md)).
-2. **2026-07-06**: a distinct `NoSuchMethodError` in `LinkedHashMap.removeEldestEntry` dispatch, tracked in [hib-domainparameterxref-lhm-removeeldestentry-nsme.md](../../known-issues/hib-domainparameterxref-lhm-removeeldestentry-nsme.md) and root-caused to the "Layer 1 register-invisible-roots" JIT/GC gap.
+2. **2026-07-06**: a distinct `NoSuchMethodError` in `LinkedHashMap.removeEldestEntry` dispatch, tracked in [hib-domainparameterxref-lhm-removeeldestentry-nsme-FIXED.md](hib-domainparameterxref-lhm-removeeldestentry-nsme-FIXED.md) and root-caused to the "Layer 1 register-invisible-roots" JIT/GC gap.
 3. **2026-07-07 (this doc)**: neither the NPE nor the NSME reproduce any more. The class now fails with a `TimeoutException` instead, and — see "Why the NSME doc's symptom no longer appears" below — this is very likely because the test now times out **before ever reaching** the code path that used to throw the NSME, not because that bug is fixed.
 
 ## Confirmed: real, deterministic regression — not host-load noise
@@ -100,7 +93,7 @@ Disabling JIT entirely is **3–4.6× faster** and drops the class comfortably u
 
 ## Why the `removeEldestEntry` NSME doc's symptom no longer appears
 
-[hib-domainparameterxref-lhm-removeeldestentry-nsme.md](../../known-issues/hib-domainparameterxref-lhm-removeeldestentry-nsme.md) traced its `NoSuchMethodError` to `DomainParameterXref`'s constructor loop, which runs during `session.createQuery(cr)` — **after** `cr.select(root).where(root.get("name").in(names))` (i.e. after `SqmCriteriaNodeBuilder.in()`) completes in the test source. Since `.in()` alone consumed the entire 120s+ budget at the time (confirmed by the stack-dump sampling above, which never showed the thread past that call), **`createQuery()` — and therefore `DomainParameterXref`'s constructor — was not reached** in the 2026-07-07 timing profile. The 2026-07-08 recheck above confirms that once the timeout is gone, the NSME is reachable again; keep that separate doc open.
+[hib-domainparameterxref-lhm-removeeldestentry-nsme-FIXED.md](hib-domainparameterxref-lhm-removeeldestentry-nsme-FIXED.md) traced its `NoSuchMethodError` to `DomainParameterXref`'s constructor loop, which runs during `session.createQuery(cr)` — **after** `cr.select(root).where(root.get("name").in(names))` (i.e. after `SqmCriteriaNodeBuilder.in()`) completes in the test source. Since `.in()` alone now consumes the entire 120s+ budget (confirmed by the stack-dump sampling above, which never shows the thread past that call), **`createQuery()` — and therefore `DomainParameterXref`'s constructor — is never reached** in the current timing profile. The NSME's absence here is *not* evidence it's fixed; it simply isn't reached before the earlier-in-the-method `.in()` phase times out. Do not close that doc on this basis — its underlying Layer-1 register-invisible-roots root cause is a separate, unverified question. That doc has been annotated accordingly rather than moved to `internal/`.
 
 ## Recommendation
 
