@@ -28022,6 +28022,12 @@ fn register_concurrent_hashmap_natives(r: &mut NativeMethodRegistry) {
     );
     r.register(
         c,
+        "computeIfPresent",
+        "(Ljava/lang/Object;Ljava/util/function/BiFunction;)Ljava/lang/Object;",
+        native_chm_compute_if_present,
+    );
+    r.register(
+        c,
         "merge",
         "(Ljava/lang/Object;Ljava/lang/Object;Ljava/util/function/BiFunction;)Ljava/lang/Object;",
         native_chm_merge,
@@ -28679,6 +28685,33 @@ fn native_chm_compute(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
             let _resize_flag = ChmResizeLockGuard::enter();
             let _guard = ChmMonitorGuard::acquire(ctx, seg);
             native_map_compute(ctx, &[Value::Object(Some(seg)), key, func])
+        }
+        None => Ok(Some(Value::Object(None))),
+    }
+}
+
+fn native_chm_compute_if_present(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(o))) => *o,
+        _ => return Ok(Some(Value::Object(None))),
+    };
+    let key = args.get(1).copied().unwrap_or(Value::Object(None));
+    let func = args.get(2).copied().unwrap_or(Value::Object(None));
+    // JDK ConcurrentHashMap rejects null key and null remappingFunction.
+    if matches!(key, Value::Object(None)) || matches!(func, Value::Object(None)) {
+        return Err(RuntimeError::NullPointerException {
+            message: Some(
+                "ConcurrentHashMap.computeIfPresent: null key or remappingFunction".to_string(),
+            ),
+        }
+        .into());
+    }
+    let hash = chm_key_hash(ctx, &key)?;
+    match chm_segment_for(ctx, this, hash) {
+        Some(seg) => {
+            let _resize_flag = ChmResizeLockGuard::enter();
+            let _guard = ChmMonitorGuard::acquire(ctx, seg);
+            native_map_compute_if_present(ctx, &[Value::Object(Some(seg)), key, func])
         }
         None => Ok(Some(Value::Object(None))),
     }
@@ -32102,11 +32135,17 @@ fn native_collections_extreme(
         _ => return Ok(Some(Value::Object(None))),
     };
     let (data, size) = al_state(ctx, coll);
-    let data = match data {
-        Some(d) => d,
-        None => return Ok(Some(Value::Object(None))),
+    let elems = if let Some(data) = data {
+        let len = size.max(0) as usize;
+        let mut out = Vec::with_capacity(len);
+        for i in 0..len {
+            out.push(ctx.get_array_element(data, i));
+        }
+        out
+    } else {
+        collect_collection_elements_or_real(ctx, coll)
     };
-    if size == 0 {
+    if elems.is_empty() {
         return Err(
             cratonvm_types::error::RuntimeError::NoSuchElementException {
                 message: String::new(),
@@ -32114,9 +32153,8 @@ fn native_collections_extreme(
             .into(),
         );
     }
-    let mut best = ctx.get_array_element(data, 0);
-    for i in 1..size as usize {
-        let elem = ctx.get_array_element(data, i);
+    let mut best = elems[0].clone();
+    for elem in elems.into_iter().skip(1) {
         let cmp = compare_via_compare_to(ctx, &elem, &best)?;
         if (want_max && cmp > 0) || (!want_max && cmp < 0) {
             best = elem;
