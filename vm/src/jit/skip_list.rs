@@ -681,8 +681,7 @@ fn should_skip_jit_internal(
             return Some(SkipReason::RustJvmTestFixture);
         }
 
-        if class_name.starts_with("org/junit/") && !package_allowed("org/junit/", allow_packages)
-        {
+        if class_name.starts_with("org/junit/") && !package_allowed("org/junit/", allow_packages) {
             return Some(SkipReason::RustJvmTestFixture);
         }
 
@@ -1285,6 +1284,12 @@ fn is_unconditional_hash_miscompile_cluster(class_name: &str, method_name: &str)
     )
 }
 
+// Elasticsearch suite classes are kept interpreted under the conservative
+// policy until the package can be safely re-bisected. The July 2026 vector and
+// DiskBBQ hang residuals are covered by this same containment: the affected
+// test classes and their Elasticsearch vector-codec bodies sit under
+// `org/elasticsearch/`, while Lucene bytecode has its own fail-closed package
+// skip below.
 fn is_elasticsearch_suite_jit_fragile_cluster(class_name: &str, _method_name: &str) -> bool {
     class_name.starts_with("org/elasticsearch/")
 }
@@ -2741,10 +2746,7 @@ mod tests {
     #[test]
     fn keycloak_picocli_smallrye_packages_skip_under_conservative() {
         for (class_name, allow) in [
-            (
-                "org/keycloak/quarkus/runtime/cli/Picocli",
-                "org/keycloak/",
-            ),
+            ("org/keycloak/quarkus/runtime/cli/Picocli", "org/keycloak/"),
             ("picocli/CommandLine", "picocli/"),
             ("io/smallrye/config/SmallRyeConfig", "io/smallrye/"),
         ] {
@@ -2771,6 +2773,60 @@ mod tests {
                 "allow-package entry must lift {class_name}"
             );
         }
+    }
+
+    #[test]
+    fn elasticsearch_vector_diskbbq_hang_cluster_stays_interpreted_by_default() {
+        for class_name in [
+            "org/elasticsearch/index/codec/vectors/diskbbq/DocIdsWriterTests",
+            "org/elasticsearch/index/codec/vectors/diskbbq/ES920DiskBBQVectorsFormatTests",
+            "org/elasticsearch/index/codec/vectors/diskbbq/es94/ES940DiskBBQVectorsFormatTests",
+            "org/elasticsearch/index/codec/vectors/diskbbq/next/ESNextDiskBBQVectorsFormatTests",
+            "org/elasticsearch/index/codec/vectors/es93/ES93FlatVectorFormatTests",
+            "org/elasticsearch/index/codec/vectors/es93/ES93HnswBitVectorsFormatTests",
+            "org/elasticsearch/search/vectors/IVFKnnFloatSlicedVectorQueryTests",
+        ] {
+            assert_eq!(
+                check(
+                    class_name,
+                    "testBody",
+                    false,
+                    true,
+                    SkipPolicy::Conservative,
+                ),
+                Some(SkipReason::RustJvmTestFixture),
+                "{class_name} must stay interpreted under the conservative policy"
+            );
+            assert_eq!(
+                check(class_name, "testBody", false, true, SkipPolicy::Aggressive),
+                None,
+                "aggressive policy must still lift {class_name} for bisection"
+            );
+            assert_eq!(
+                check_with(
+                    class_name,
+                    "testBody",
+                    false,
+                    true,
+                    SkipPolicy::Conservative,
+                    &["org/elasticsearch/"],
+                ),
+                None,
+                "CRATONVM_JIT_ALLOW_PACKAGES=org/elasticsearch/ must lift {class_name}"
+            );
+        }
+
+        assert_eq!(
+            check(
+                "org/apache/lucene/codecs/hnsw/DefaultFlatVectorScorer",
+                "score",
+                false,
+                true,
+                SkipPolicy::Conservative,
+            ),
+            Some(SkipReason::RustJvmTestFixture),
+            "Lucene vector leaves must stay interpreted by the separate Lucene package ban"
+        );
     }
 
     #[test]
