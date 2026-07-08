@@ -65,3 +65,9 @@ found=162 started=162 ok=90 failed=0 aborted=72 skipped=0
 ```
 
 Across those runs: 0 DST assertions, 0 H2 `<local4>`, 0 `typeNamePattern`, 0 `IllegalThreadStateException`, 0 `NoSuchMethodError`, and 0 stale-receiver warnings.
+
+## 2026-07-08 Follow-up: direct `CET` alias DST rule
+
+The original `LocalDateTimeTest` residual above was already fixed in `dev` by the default-zone/Timestamp and `Properties.keySet().toArray()` repairs. A later direct check found a narrower `TimeZone.getTimeZone("CET")` mismatch: CratonVM returned only the standard +01:00 offset for `2018-10-28T00:30Z`, while HotSpot still returns +02:00 until the EU DST transition at `2018-10-28T01:00Z`.
+
+Follow-up fix: add `CET` to the EU recurring DST rule arm in `native-builtins/src/lib.rs` and extend `scratch-min/TzDstProbe.java` to cover the alias.
