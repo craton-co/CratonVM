@@ -93,6 +93,28 @@ class,rc,seconds,status
 "org.apache.catalina.realm.TestJAASRealm",0,26.1,PASS
 ```
 
+After merging the residual fix and concurrent `dev` changes, the same slice was
+rerun with a release binary built from merged `dev`:
+
+```powershell
+$env:CARGO_TARGET_DIR='C:\craton\target-jaasrealm-runner-20260708-003'
+cargo test -p cratonvm-native-builtins t19_2_c_login_context_runs_configuration_backed_login_module -- --nocapture
+cargo build --release --bin cratonvm
+
+cd C:\craton\CratonVM\apps\tomcat-suite-runner
+.\run-tomcat-suite.ps1 -Vm craton -Jit on -Jdk real -Category all `
+  -RunName jaasrealm-config-fix-20260708-004 -Start 198 -Count 1 `
+  -TimeoutSec 180 -Parallel 1 `
+  -Exe C:\craton\CratonVM\apps\tomcat\.suite\bin\cratonvm-jaasrealm-mergeddev-release-20260708-003.exe
+```
+
+Merged-dev runner result:
+
+```text
+class,rc,seconds,status
+"org.apache.catalina.realm.TestJAASRealm",0,15.6,PASS
+```
+
 The focused regression covers the residual mechanism directly: a 4-arg
 `LoginContext` receives a real configuration object, obtains a
 `LoginModuleControlFlag: sufficient` entry, invokes the Java login module
