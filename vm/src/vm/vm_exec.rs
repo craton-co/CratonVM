@@ -6149,6 +6149,38 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
         }
     }
 
+    fn invoke_virtual_declared(
+        &mut self,
+        declared_class: &str,
+        receiver: ObjectRef,
+        method_name: &str,
+        descriptor: &str,
+        args: &[Value],
+    ) -> MethodCallResult {
+        let result = self.invoke_virtual(receiver, method_name, descriptor, args);
+        match &result {
+            Err(MethodCallFailed::InternalError(VmError::Linkage(
+                LinkageError::NoSuchMethodError {
+                    class_name,
+                    method_name: nsme_method,
+                    method_descriptor,
+                    ..
+                },
+            ))) if class_name == "java/lang/Object"
+                && declared_class != "java/lang/Object"
+                && nsme_method == method_name
+                && method_descriptor == descriptor
+                && !is_object_member(method_name, descriptor) =>
+            {
+                let mut full_args = Vec::with_capacity(1 + args.len());
+                full_args.push(Value::Object(Some(receiver)));
+                full_args.extend_from_slice(args);
+                self.invoke_or_native(declared_class, method_name, descriptor, &full_args)
+            }
+            _ => result,
+        }
+    }
+
     fn class_annotations(&self, class_id: ClassId) -> Vec<crate::native::registry::AnnotationData> {
         let cm = self.shared.class_manager.read();
         let class = match cm.get_class(class_id) {

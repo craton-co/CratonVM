@@ -1,8 +1,35 @@
-# SimpleClientHttpResponseTests: two intermittent Mockito/ByteBuddy dispatch bugs [OPEN]
+# SimpleClientHttpResponseTests: Mockito/ByteBuddy dispatch residuals [FIXED]
 
-Status: OPEN. Split out of the retired `http-client-cluster-redefine-
+Status: FIXED on 2026-07-08. Split out of the retired `http-client-cluster-redefine-
 dispatch-and-jdk21-gaps.md` (full historical fix context there:
 `docs/internal/fixed-suite-bugs/http-client-cluster-redefine-dispatch-fixes-FIXED.md`).
+
+Fix summary:
+
+- `ThreadLocal.get()` now honors overridden `initialValue()` for anonymous
+  subclasses such as Mockito's `ThreadSafeMockingProgress$1`, preventing stale
+  per-thread mocking progress from leaking into the next JUnit method.
+- Method-handle virtual dispatch now keeps adapted object arguments pinned
+  through the final target invocation and can recover a known declared owner
+  when receiver dispatch collapses to `java/lang/Object`.
+- Synthetic/lazy stream pipelines now pin source streams, source elements, and
+  deferred lambdas across materialization and terminal pulls, preventing
+  StackWalker/Mockito lambdas from degrading to `Object.apply/test`.
+- InputStream/OutputStream native fallbacks now refresh receivers across
+  transfer/drain loops and avoid applying inherited `InputStream` read helpers
+  to Mockito mock streams where Mockito's default-answer machinery should own
+  the inherited concrete methods.
+
+Validation:
+
+- Built release binary
+  `/data/data/bin/cratonvm-http-simpleclient-residuals-20260708-170843-fix16`.
+- Probe `TLInitialValueProbe20260708170843`: PASS.
+- Probe `LazyStreamLambdaProbe20260708170843`: PASS.
+- `org.springframework.http.client.SimpleClientHttpResponseTests`: PASS 17/17
+  after final fixes (`fix14` batch 10/10, `fix15` batch 3/3, `fix16`
+  batch 3/3, and one standalone `fix14` run), with no `NoSuchMethodError` and no
+  `UnfinishedVerificationException`.
 
 Two distinct, both intermittent bugs in `org.springframework.http.client
 .SimpleClientHttpResponseTests`, confirmed across multiple sessions on the

@@ -3520,7 +3520,17 @@ fn native_tl_get(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResul
         });
         return Ok(Some(initial));
     }
-    Ok(Some(Value::Object(None)))
+    // JDK ThreadLocal.get() calls initialValue() on first access and caches
+    // even a null result. Mockito's ThreadSafeMockingProgress uses an
+    // anonymous ThreadLocal subclass rather than ThreadLocal.withInitial(), so
+    // skipping this virtual call leaves its per-thread state uninitialized.
+    let initial = ctx
+        .invoke_virtual(this, "initialValue", "()Ljava/lang/Object;", &[])?
+        .unwrap_or(Value::Object(None));
+    TL_MAP.with(|m| {
+        m.borrow_mut().insert(key, initial);
+    });
+    Ok(Some(initial))
 }
 
 fn native_tl_set(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
@@ -15482,7 +15492,9 @@ pub(crate) fn register_phase54_net_extras(r: &mut NativeMethodRegistry) {
     });
     r.register(uri, "hashCode", "()I", |ctx, args| {
         let this = obj_arg(args, 0)?;
-        Ok(Some(Value::Int(crate::net_phase_e::uri_hash_code(ctx, this))))
+        Ok(Some(Value::Int(crate::net_phase_e::uri_hash_code(
+            ctx, this,
+        ))))
     });
 
     // --- HttpURLConnection (10-field) ---

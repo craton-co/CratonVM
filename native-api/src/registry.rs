@@ -1990,6 +1990,24 @@ pub trait NativeContext {
         args: &[Value],
     ) -> MethodCallResult;
 
+    /// Invoke a virtual method whose declaring class is known by the caller.
+    ///
+    /// Most callers should use [`Self::invoke_virtual`]. Method-handle dispatch
+    /// has one extra piece of information, though: the owner class stored in the
+    /// handle. VM contexts can use that as a recovery target when receiver-based
+    /// dispatch collapses to bare `java/lang/Object` for a non-Object member.
+    /// Mock/test contexts keep the simple virtual behavior by default.
+    fn invoke_virtual_declared(
+        &mut self,
+        _declared_class: &str,
+        receiver: ObjectRef,
+        method_name: &str,
+        descriptor: &str,
+        args: &[Value],
+    ) -> MethodCallResult {
+        self.invoke_virtual(receiver, method_name, descriptor, args)
+    }
+
     /// Invoke a method with invokespecial semantics — *exactly* the resolved
     /// method on `class_name`, with no virtual dispatch and no interface
     /// retarget to the receiver's concrete class.
