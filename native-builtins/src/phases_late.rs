@@ -39610,7 +39610,17 @@ const NEW13_SOCK_SESSION: usize = 4;
 /// classic connection pool actually calls, per
 /// docs/known-issues/netty-client-socket-write-after-close-nsme.md).
 fn new13_resolve_tls_id(ctx: &dyn NativeContext, this: ObjectRef) -> i32 {
-    if let Some(id) = ctx.get_field(this, NEW13_SOCK_TLSID).as_int() {
+    let raw = ctx.get_field(this, NEW13_SOCK_TLSID);
+    if std::env::var_os("CRATONVM_DBG_TLS_SOCK").is_some() {
+        eprintln!(
+            "[dbg-tls-sock] thread={:?} new13_resolve_tls_id sock={:?} raw_field2={:?} num_fields={}",
+            std::thread::current().id(),
+            this,
+            raw,
+            ctx.object_num_fields(this)
+        );
+    }
+    if let Some(id) = raw.as_int() {
         if id >= 0 {
             return id;
         }
