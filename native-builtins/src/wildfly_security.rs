@@ -283,7 +283,12 @@ impl ControlFlag {
     /// Parse a JAAS-config control-flag token.  Matches the case-
     /// insensitive JDK parser.
     pub fn parse(s: &str) -> Option<ControlFlag> {
-        match s.trim().to_ascii_lowercase().as_str() {
+        let lower = s.trim().to_ascii_lowercase();
+        let token = lower
+            .strip_prefix("loginmodulecontrolflag:")
+            .unwrap_or(&lower)
+            .trim();
+        match token {
             "required" => Some(ControlFlag::Required),
             "requisite" => Some(ControlFlag::Requisite),
             "sufficient" => Some(ControlFlag::Sufficient),
@@ -766,6 +771,54 @@ const SUBJECT_SLOT_PRINCIPALS: usize = 0;
 const SUBJECT_SLOT_PUBLIC_CREDS: usize = 1;
 const SUBJECT_SLOT_PRIVATE_CREDS: usize = 2;
 
+const LOGIN_CONTEXT_SLOT_NAME: usize = 0;
+const LOGIN_CONTEXT_SLOT_SUBJECT: usize = 1;
+const LOGIN_CONTEXT_SLOT_HANDLER: usize = 2;
+const LOGIN_CONTEXT_SLOT_CONFIG: usize = 3;
+
+#[derive(Clone, Copy, Debug)]
+struct PinnedObject {
+    handle: usize,
+    fallback: ObjectRef,
+}
+
+impl PinnedObject {
+    fn new(ctx: &mut dyn NativeContext, obj: ObjectRef) -> PinnedObject {
+        PinnedObject {
+            handle: ctx.pin_native_root(obj),
+            fallback: obj,
+        }
+    }
+
+    fn current(self, ctx: &dyn NativeContext) -> ObjectRef {
+        ctx.read_native_pin(self.handle, self.fallback)
+    }
+}
+
+#[derive(Clone, Debug)]
+struct JavaLoginModuleSpec {
+    class_name: String,
+    flag: ControlFlag,
+    options: Option<PinnedObject>,
+}
+
+#[derive(Clone, Debug)]
+struct JavaLoginModuleRuntime {
+    module: PinnedObject,
+    flag: ControlFlag,
+}
+
+fn optional_obj_arg(args: &[Value], idx: usize) -> Option<ObjectRef> {
+    match args.get(idx) {
+        Some(Value::Object(Some(obj))) => Some(*obj),
+        _ => None,
+    }
+}
+
+fn object_value(obj: Option<ObjectRef>) -> Value {
+    Value::Object(obj)
+}
+
 /// Read the real, mutable `java.util.HashSet` backing one of `Subject`'s
 /// three sets, lazily building and storing it when the slot is still null.
 ///
@@ -859,6 +912,26 @@ fn native_subject_get_principals(ctx: &mut dyn NativeContext, args: &[Value]) ->
     let Some(subject) = get_subject_from_this(ctx, this) else {
         return Err(subject_missing_err());
     };
+    let real_set = match get_or_init_subject_set(ctx, this, SUBJECT_SLOT_PRINCIPALS)? {
+        Some(Value::Object(Some(set))) => set,
+        other => return Ok(other),
+    };
+
+    // Java-backed LoginModule.commit() implementations mutate the real
+    // Subject.principals set. Prefer that set once it has contents; keep the
+    // old Rust-side synthetic count only for WildFly bootstrap modules that
+    // still record principals solely in the Rust side table.
+    let set_pin = ctx.pin_native_root(real_set);
+    let real_size = match ctx.invoke_virtual(real_set, "size", "()I", &[]) {
+        Ok(Some(Value::Int(size))) => size,
+        _ => 0,
+    };
+    let real_set = ctx.read_native_pin(set_pin, real_set);
+    ctx.unpin_native_roots(set_pin);
+    if real_size > 0 || subject.principal_count() == 0 {
+        return Ok(Some(Value::Object(Some(real_set))));
+    }
+
     let principals = subject.get_principals();
     let set = alloc_concurrent_synthetic(ctx, "java/util/HashSet", 3);
     // Field 1 = size; track how many we synthesize so downstream code
@@ -919,48 +992,72 @@ fn native_login_context_init(ctx: &mut dyn NativeContext, args: &[Value]) -> Met
     // Shared by both registered overloads:
     //   <init>(String, Subject, CallbackHandler)V
     //   <init>(String, Subject, CallbackHandler, Configuration)V
-    // We only need the string-name (args[1]) and Subject (args[2]) here;
-    // the module chain comes from the security domain registry, and any
-    // trailing CallbackHandler/Configuration arg is ignored — Tomcat's
-    // real `JAASRealm.authenticate()` unconditionally uses the 4-arg
-    // overload (`new LoginContext(appName, null, callbackHandler,
-    // getConfig())`, `JAASRealm.java` — `getConfig()` is frequently null
-    // when no `configFile` is set). Before this overload was registered,
-    // `<init>` ran as unintercepted real bytecode and never populated
-    // `login_context_handles()`, so the native `login()` override always
-    // hit `login_context_missing_err()` ("never initialized") — this
-    // reproduced on *every* authenticate() call, not just after a GC.
+    //
+    // WildFly/Keycloak's bootstrap path still resolves modules from the
+    // Rust-side security-domain registry. Generic JAAS callers (notably
+    // Tomcat's `JAASRealm`) pass a real `Configuration` object to the 4-arg
+    // overload; record those Java objects on the LoginContext too so
+    // `login()` can execute real `LoginModule` bytecode from the config.
     let this = obj_arg(args, 0)?;
-    let name = match args.get(1) {
-        Some(Value::Object(Some(s))) => ctx.read_string(*s).unwrap_or_default(),
-        _ => String::new(),
-    };
-    let subject_obj = match args.get(2) {
-        Some(Value::Object(Some(s))) => Some(*s),
-        _ => None,
-    };
+    let name_obj = optional_obj_arg(args, 1);
+    let subject_arg = optional_obj_arg(args, 2);
+    let handler_obj = optional_obj_arg(args, 3);
+    let config_obj = optional_obj_arg(args, 4);
 
-    // Try to resolve a registered domain by name; fall back to an
-    // empty chain so LoginContext.<init> never fails just because a
-    // domain wasn't registered (real JAAS defers until login()).
-    // A non-null Subject ref whose handle isn't recognised is a
-    // caller bug (post-GC-key fix it can't be a relocation artefact)
-    // — surface loudly.
-    let subject = if let Some(s_obj) = subject_obj {
-        get_subject_from_this(ctx, s_obj).ok_or_else(subject_missing_err)?
-    } else {
-        Subject::new()
+    let pin_base = ctx.pin_native_root(this);
+    let name_pin = name_obj.map(|obj| PinnedObject::new(ctx, obj));
+    let subject_pin = subject_arg.map(|obj| PinnedObject::new(ctx, obj));
+    let handler_pin = handler_obj.map(|obj| PinnedObject::new(ctx, obj));
+    let config_pin = config_obj.map(|obj| PinnedObject::new(ctx, obj));
+
+    let name_obj = name_pin.map(|pin| pin.current(ctx));
+    let name = name_obj
+        .and_then(|s| ctx.read_string(s))
+        .unwrap_or_default();
+
+    // A null Subject is JDK-conformant: LoginContext creates one. Create the
+    // real Java Subject now so arbitrary Java LoginModule implementations can
+    // mutate its backing sets during commit(), and so getSubject() can return
+    // the same object.
+    let subject_obj = match subject_pin {
+        Some(pin) => pin.current(ctx),
+        None => match ctx.new_object_initialized("javax/security/auth/Subject", "()V", &[])? {
+            Some(Value::Object(Some(obj))) => obj,
+            _ => {
+                ctx.unpin_native_roots(pin_base);
+                return Err(RuntimeError::IllegalStateException {
+                    message: "LoginContext could not allocate Subject".into(),
+                }
+                .into());
+            }
+        },
     };
+    let subject = get_subject_from_this(ctx, subject_obj).ok_or_else(subject_missing_err)?;
+
     let modules = lookup_security_domain(&name)
         .map(|d| d.policy.modules.clone())
         .unwrap_or_default();
     let lc = LoginContext::new(name, subject, modules);
+
+    let this = ctx.read_native_pin(pin_base, this);
     let key = obj_key(ctx, this);
     login_context_handles().write().insert(key, lc);
 
-    // Field 0 = name — we write a placeholder Long so real-JDK mode
-    // doesn't trip on a null while reflectively dumping the context.
-    ctx.set_field(this, 0, Value::Long(next_oid() as i64));
+    let name_value = object_value(name_pin.map(|pin| pin.current(ctx)));
+    let subject_value = Value::Object(Some(subject_obj));
+    let handler_value = object_value(handler_pin.map(|pin| pin.current(ctx)));
+    let config_value = object_value(config_pin.map(|pin| pin.current(ctx)));
+
+    ctx.set_field(this, LOGIN_CONTEXT_SLOT_NAME, name_value);
+    ctx.set_field_by_name(this, "name", name_value);
+    ctx.set_field(this, LOGIN_CONTEXT_SLOT_SUBJECT, subject_value);
+    ctx.set_field_by_name(this, "subject", subject_value);
+    ctx.set_field(this, LOGIN_CONTEXT_SLOT_HANDLER, handler_value);
+    ctx.set_field_by_name(this, "callbackHandler", handler_value);
+    ctx.set_field(this, LOGIN_CONTEXT_SLOT_CONFIG, config_value);
+    ctx.set_field_by_name(this, "config", config_value);
+
+    ctx.unpin_native_roots(pin_base);
     Ok(None)
 }
 
@@ -979,11 +1076,327 @@ fn login_context_missing_err() -> MethodCallFailed {
     .into()
 }
 
+fn login_context_object_field(
+    ctx: &dyn NativeContext,
+    this: ObjectRef,
+    field_name: &str,
+    slot: usize,
+) -> Option<ObjectRef> {
+    match ctx.get_field_by_name(this, field_name) {
+        Value::Object(Some(obj)) => Some(obj),
+        _ => match ctx.get_field(this, slot) {
+            Value::Object(Some(obj)) => Some(obj),
+            _ => None,
+        },
+    }
+}
+
+fn java_string_result(ctx: &dyn NativeContext, value: Option<Value>) -> Option<String> {
+    match value {
+        Some(Value::Object(Some(s))) => ctx.read_string(s),
+        _ => None,
+    }
+}
+
+fn invoke_java_boolean(
+    ctx: &mut dyn NativeContext,
+    receiver: ObjectRef,
+    method_name: &str,
+) -> Result<bool, MethodCallFailed> {
+    match ctx.invoke_virtual(receiver, method_name, "()Z", &[])? {
+        Some(Value::Int(v)) => Ok(v != 0),
+        _ => Ok(false),
+    }
+}
+
+fn read_entry_string(
+    ctx: &mut dyn NativeContext,
+    entry: ObjectRef,
+    method_name: &str,
+) -> Result<String, MethodCallFailed> {
+    let value = ctx.invoke_virtual(entry, method_name, "()Ljava/lang/String;", &[])?;
+    Ok(java_string_result(ctx, value).unwrap_or_default())
+}
+
+fn parse_entry_flag(
+    ctx: &mut dyn NativeContext,
+    entry: ObjectRef,
+) -> Result<ControlFlag, MethodCallFailed> {
+    let flag_obj = match ctx.invoke_virtual(
+        entry,
+        "getControlFlag",
+        "()Ljavax/security/auth/login/AppConfigurationEntry$LoginModuleControlFlag;",
+        &[],
+    )? {
+        Some(Value::Object(Some(obj))) => obj,
+        _ => {
+            return Err(RuntimeError::SecurityException {
+                message: "LoginException: missing JAAS control flag".into(),
+            }
+            .into())
+        }
+    };
+    let flag_pin = PinnedObject::new(ctx, flag_obj);
+    let flag_obj = flag_pin.current(ctx);
+    let text = ctx.invoke_virtual(flag_obj, "toString", "()Ljava/lang/String;", &[])?;
+    let parsed = java_string_result(ctx, text)
+        .and_then(|s| ControlFlag::parse(&s))
+        .ok_or_else(|| -> MethodCallFailed {
+            RuntimeError::SecurityException {
+                message: "LoginException: unknown JAAS control flag".into(),
+            }
+            .into()
+        })?;
+    Ok(parsed)
+}
+
+fn read_entry_options(
+    ctx: &mut dyn NativeContext,
+    entry: ObjectRef,
+) -> Result<Option<PinnedObject>, MethodCallFailed> {
+    match ctx.invoke_virtual(entry, "getOptions", "()Ljava/util/Map;", &[])? {
+        Some(Value::Object(Some(options))) => Ok(Some(PinnedObject::new(ctx, options))),
+        _ => Ok(None),
+    }
+}
+
+fn read_java_login_modules(
+    ctx: &mut dyn NativeContext,
+    config: PinnedObject,
+    name: PinnedObject,
+) -> Result<Vec<JavaLoginModuleSpec>, MethodCallFailed> {
+    let config_obj = config.current(ctx);
+    let name_obj = name.current(ctx);
+    let entries = match ctx.invoke_virtual(
+        config_obj,
+        "getAppConfigurationEntry",
+        "(Ljava/lang/String;)[Ljavax/security/auth/login/AppConfigurationEntry;",
+        &[Value::Object(Some(name_obj))],
+    )? {
+        Some(Value::Object(Some(entries))) => entries,
+        _ => return Ok(Vec::new()),
+    };
+    let entries_pin = PinnedObject::new(ctx, entries);
+    let entries = entries_pin.current(ctx);
+    let len = ctx.array_length(entries);
+    let mut specs = Vec::with_capacity(len);
+    for index in 0..len {
+        let entries = entries_pin.current(ctx);
+        let entry = match ctx.get_array_element(entries, index) {
+            Value::Object(Some(entry)) => entry,
+            _ => continue,
+        };
+        let entry_pin = PinnedObject::new(ctx, entry);
+        let entry = entry_pin.current(ctx);
+        let class_name = read_entry_string(ctx, entry, "getLoginModuleName")?;
+        if class_name.is_empty() {
+            return Err(RuntimeError::SecurityException {
+                message: "LoginException: missing LoginModule class name".into(),
+            }
+            .into());
+        }
+        let entry = entry_pin.current(ctx);
+        let flag = parse_entry_flag(ctx, entry)?;
+        let entry = entry_pin.current(ctx);
+        let options = read_entry_options(ctx, entry)?;
+        specs.push(JavaLoginModuleSpec {
+            class_name,
+            flag,
+            options,
+        });
+    }
+    Ok(specs)
+}
+
+fn new_hash_map_pinned(ctx: &mut dyn NativeContext) -> Result<PinnedObject, MethodCallFailed> {
+    match ctx.new_object_initialized("java/util/HashMap", "()V", &[])? {
+        Some(Value::Object(Some(map))) => Ok(PinnedObject::new(ctx, map)),
+        _ => Err(RuntimeError::IllegalStateException {
+            message: "LoginContext could not allocate JAAS shared state".into(),
+        }
+        .into()),
+    }
+}
+
+fn instantiate_login_module(
+    ctx: &mut dyn NativeContext,
+    spec: &JavaLoginModuleSpec,
+    subject: PinnedObject,
+    handler: Option<PinnedObject>,
+    shared_state: PinnedObject,
+) -> Result<JavaLoginModuleRuntime, MethodCallFailed> {
+    let internal_name = spec.class_name.replace('.', "/");
+    let module = match ctx.new_object_initialized(&internal_name, "()V", &[])? {
+        Some(Value::Object(Some(module))) => PinnedObject::new(ctx, module),
+        _ => {
+            return Err(RuntimeError::SecurityException {
+                message: format!("LoginException: could not instantiate {}", spec.class_name),
+            }
+            .into())
+        }
+    };
+
+    let options = match spec.options {
+        Some(pin) => Value::Object(Some(pin.current(ctx))),
+        None => Value::Object(Some(new_hash_map_pinned(ctx)?.current(ctx))),
+    };
+    let args = [
+        Value::Object(Some(subject.current(ctx))),
+        object_value(handler.map(|pin| pin.current(ctx))),
+        Value::Object(Some(shared_state.current(ctx))),
+        options,
+    ];
+    ctx.invoke_virtual(
+        module.current(ctx),
+        "initialize",
+        "(Ljavax/security/auth/Subject;Ljavax/security/auth/callback/CallbackHandler;Ljava/util/Map;Ljava/util/Map;)V",
+        &args,
+    )?;
+
+    Ok(JavaLoginModuleRuntime {
+        module,
+        flag: spec.flag,
+    })
+}
+
+fn abort_java_modules(ctx: &mut dyn NativeContext, modules: &[JavaLoginModuleRuntime]) {
+    for module in modules {
+        let _ = ctx.invoke_virtual(module.module.current(ctx), "abort", "()Z", &[]);
+    }
+}
+
+fn commit_java_modules(
+    ctx: &mut dyn NativeContext,
+    modules: &[JavaLoginModuleRuntime],
+) -> Result<bool, MethodCallFailed> {
+    let mut any_non_optional_success = false;
+    let mut any_required_failure = false;
+
+    for module in modules {
+        let module_obj = module.module.current(ctx);
+        let ok = invoke_java_boolean(ctx, module_obj, "commit")?;
+        match (module.flag, ok) {
+            (ControlFlag::Required | ControlFlag::Requisite, true) => {
+                any_non_optional_success = true;
+            }
+            (ControlFlag::Required | ControlFlag::Requisite, false) => {
+                any_required_failure = true;
+            }
+            (ControlFlag::Sufficient, true) => {
+                any_non_optional_success = true;
+            }
+            (ControlFlag::Sufficient | ControlFlag::Optional, false)
+            | (ControlFlag::Optional, true) => {}
+        }
+    }
+
+    Ok(any_non_optional_success && !any_required_failure)
+}
+
+fn run_java_configuration_login(
+    ctx: &mut dyn NativeContext,
+    this: ObjectRef,
+    name: &str,
+) -> Result<Option<bool>, MethodCallFailed> {
+    let pin_base = ctx.pin_native_root(this);
+    let result = (|| {
+        let this = ctx.read_native_pin(pin_base, this);
+        let Some(config_obj) =
+            login_context_object_field(ctx, this, "config", LOGIN_CONTEXT_SLOT_CONFIG)
+        else {
+            return Ok(None);
+        };
+        let Some(subject_obj) =
+            login_context_object_field(ctx, this, "subject", LOGIN_CONTEXT_SLOT_SUBJECT)
+        else {
+            return Err(RuntimeError::IllegalStateException {
+                message: "LoginContext subject missing".into(),
+            }
+            .into());
+        };
+
+        let config = PinnedObject::new(ctx, config_obj);
+        let subject = PinnedObject::new(ctx, subject_obj);
+        let handler =
+            login_context_object_field(ctx, this, "callbackHandler", LOGIN_CONTEXT_SLOT_HANDLER)
+                .map(|obj| PinnedObject::new(ctx, obj));
+        let name_obj = match login_context_object_field(ctx, this, "name", LOGIN_CONTEXT_SLOT_NAME)
+        {
+            Some(obj) => obj,
+            None => ctx.create_string(name),
+        };
+        let name_pin = PinnedObject::new(ctx, name_obj);
+        let specs = read_java_login_modules(ctx, config, name_pin)?;
+        if specs.is_empty() {
+            return Ok(Some(false));
+        }
+
+        let shared_state = new_hash_map_pinned(ctx)?;
+        let mut invoked = Vec::new();
+        let mut any_non_optional_success = false;
+        let mut any_required_failure = false;
+        let mut sufficient_success = false;
+
+        for spec in &specs {
+            if sufficient_success {
+                continue;
+            }
+            let runtime = instantiate_login_module(ctx, spec, subject, handler, shared_state)?;
+            let module_obj = runtime.module.current(ctx);
+            let login_ok = invoke_java_boolean(ctx, module_obj, "login")?;
+
+            match (spec.flag, login_ok) {
+                (ControlFlag::Required, true) | (ControlFlag::Requisite, true) => {
+                    any_non_optional_success = true;
+                }
+                (ControlFlag::Required, false) => {
+                    any_required_failure = true;
+                }
+                (ControlFlag::Requisite, false) => {
+                    any_required_failure = true;
+                    invoked.push(runtime);
+                    break;
+                }
+                (ControlFlag::Sufficient, true) => {
+                    any_non_optional_success = true;
+                    sufficient_success = true;
+                }
+                (ControlFlag::Sufficient, false) | (ControlFlag::Optional, _) => {}
+            }
+            invoked.push(runtime);
+        }
+
+        let login_success = any_non_optional_success && !any_required_failure;
+        if !login_success {
+            abort_java_modules(ctx, &invoked);
+            return Ok(Some(false));
+        }
+
+        let commit_success = commit_java_modules(ctx, &invoked)?;
+        if !commit_success {
+            abort_java_modules(ctx, &invoked);
+        }
+        Ok(Some(commit_success))
+    })();
+    ctx.unpin_native_roots(pin_base);
+    result
+}
+
 fn native_login_context_login(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = obj_arg(args, 0)?;
     let Some(lc) = get_login_context_from_this(ctx, this) else {
         return Err(login_context_missing_err());
     };
+    if let Some(success) = run_java_configuration_login(ctx, this, &lc.name)? {
+        if !success {
+            return Err(RuntimeError::SecurityException {
+                message: "LoginException: authentication failed".into(),
+            }
+            .into());
+        }
+        return Ok(None);
+    }
+
     let result = lc.login();
     if !result.success {
         return Err(RuntimeError::SecurityException {
@@ -1011,16 +1424,26 @@ fn native_login_context_get_subject(
     args: &[Value],
 ) -> MethodCallResult {
     let this = obj_arg(args, 0)?;
+    if let Some(subject_obj) =
+        login_context_object_field(ctx, this, "subject", LOGIN_CONTEXT_SLOT_SUBJECT)
+    {
+        return Ok(Some(Value::Object(Some(subject_obj))));
+    }
+
     let Some(lc) = get_login_context_from_this(ctx, this) else {
         // Post-GC-key fix: missing state is a caller bug, not a
         // relocation artefact.  Surface loudly instead of returning
         // a silent null (which earlier code did).
         return Err(login_context_missing_err());
     };
-    let subject_obj = alloc_concurrent_synthetic(ctx, "javax/security/auth/Subject", 3);
-    let key = obj_key(ctx, subject_obj);
-    subject_handles().write().insert(key, lc.get_subject());
-    Ok(Some(Value::Object(Some(subject_obj))))
+    match ctx.new_object_initialized("javax/security/auth/Subject", "()V", &[])? {
+        Some(Value::Object(Some(subject_obj))) => {
+            let key = obj_key(ctx, subject_obj);
+            subject_handles().write().insert(key, lc.get_subject());
+            Ok(Some(Value::Object(Some(subject_obj))))
+        }
+        other => Ok(other),
+    }
 }
 
 fn native_security_domain_service_get_auth_manager(
@@ -1226,6 +1649,8 @@ pub fn register_wildfly_security_natives(r: &mut NativeMethodRegistry) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_utils::MockNativeContext;
+    use cratonvm_types::ArrayElementType;
     use std::sync::Mutex;
 
     // Serialize tests that mutate the global domain registry so
@@ -1280,9 +1705,129 @@ mod tests {
         })
     }
 
+    fn jaas_config_hook(
+        ctx: &mut MockNativeContext,
+        receiver: ObjectRef,
+        method_name: &str,
+        descriptor: &str,
+        args: &[Value],
+    ) -> Option<MethodCallResult> {
+        match (method_name, descriptor) {
+            (
+                "getAppConfigurationEntry",
+                "(Ljava/lang/String;)[Ljavax/security/auth/login/AppConfigurationEntry;",
+            ) => {
+                let entry = ctx.fresh_object_ref();
+                let class_name =
+                    ctx.create_string("org.apache.catalina.realm.TesterLoginModule");
+                let flag = ctx.fresh_object_ref();
+                let flag_text = ctx.create_string("LoginModuleControlFlag: sufficient");
+                let options = ctx.fresh_object_ref();
+                ctx.set_field(entry, 0, Value::Object(Some(class_name)));
+                ctx.set_field(entry, 1, Value::Object(Some(flag)));
+                ctx.set_field(entry, 2, Value::Object(Some(options)));
+                ctx.set_field(flag, 0, Value::Object(Some(flag_text)));
+
+                let arr = ctx.new_array(ArrayElementType::Reference, 1);
+                ctx.set_array_element(arr, 0, Value::Object(Some(entry)));
+                Some(Ok(Some(Value::Object(Some(arr)))))
+            }
+            ("getLoginModuleName", "()Ljava/lang/String;") => Some(Ok(Some(ctx.get_field(receiver, 0)))),
+            (
+                "getControlFlag",
+                "()Ljavax/security/auth/login/AppConfigurationEntry$LoginModuleControlFlag;",
+            ) => Some(Ok(Some(ctx.get_field(receiver, 1)))),
+            ("getOptions", "()Ljava/util/Map;") => Some(Ok(Some(ctx.get_field(receiver, 2)))),
+            ("toString", "()Ljava/lang/String;") => Some(Ok(Some(ctx.get_field(receiver, 0)))),
+            (
+                "initialize",
+                "(Ljavax/security/auth/Subject;Ljavax/security/auth/callback/CallbackHandler;Ljava/util/Map;Ljava/util/Map;)V",
+            ) => {
+                ctx.set_field(receiver, 0, args[0]);
+                ctx.set_field(receiver, 1, args[1]);
+                ctx.set_field(receiver, 2, args[2]);
+                ctx.set_field(receiver, 3, args[3]);
+                Some(Ok(None))
+            }
+            ("login", "()Z") => Some(Ok(Some(Value::Int(1)))),
+            ("commit", "()Z") => {
+                if let Value::Object(Some(subject)) = ctx.get_field(receiver, 0) {
+                    if let Value::Object(Some(principals)) =
+                        ctx.get_field(subject, SUBJECT_SLOT_PRINCIPALS)
+                    {
+                        ctx.set_field(principals, 1, Value::Int(1));
+                    }
+                }
+                Some(Ok(Some(Value::Int(1))))
+            }
+            ("abort", "()Z") => Some(Ok(Some(Value::Int(1)))),
+            ("size", "()I") => Some(Ok(Some(match ctx.get_field(receiver, 1) {
+                Value::Int(size) => Value::Int(size),
+                _ => Value::Int(0),
+            }))),
+            _ => None,
+        }
+    }
+
     // -----------------------------------------------------------------------
     // The 10 required tests.
     // -----------------------------------------------------------------------
+
+    #[test]
+    fn t19_2_c_login_context_runs_configuration_backed_login_module() {
+        let _guard = domain_test_lock();
+        clear_domain_registry();
+
+        let mut ctx = MockNativeContext::new();
+        let this = ctx.fresh_object_ref();
+        let name = ctx.create_string("CustomLogin");
+        let subject = match ctx.new_object("javax/security/auth/Subject").unwrap() {
+            Some(Value::Object(Some(subject))) => subject,
+            other => panic!("expected Subject object, got {other:?}"),
+        };
+        native_subject_init(&mut ctx, &[Value::Object(Some(subject))])
+            .expect("Subject init should register side-table handle");
+
+        let callback = ctx.fresh_object_ref();
+        let config = ctx.fresh_object_ref();
+        ctx.set_invoke_virtual_hook(jaas_config_hook);
+
+        native_login_context_init(
+            &mut ctx,
+            &[
+                Value::Object(Some(this)),
+                Value::Object(Some(name)),
+                Value::Object(Some(subject)),
+                Value::Object(Some(callback)),
+                Value::Object(Some(config)),
+            ],
+        )
+        .expect("LoginContext init should retain config-backed state");
+
+        assert_eq!(
+            ctx.get_field(this, LOGIN_CONTEXT_SLOT_CONFIG),
+            Value::Object(Some(config))
+        );
+        native_login_context_login(&mut ctx, &[Value::Object(Some(this))])
+            .expect("sufficient Java LoginModule should authenticate");
+
+        let returned_subject =
+            native_login_context_get_subject(&mut ctx, &[Value::Object(Some(this))])
+                .expect("getSubject should succeed")
+                .expect("getSubject should return a value");
+        assert_eq!(returned_subject, Value::Object(Some(subject)));
+
+        let principals = native_subject_get_principals(&mut ctx, &[Value::Object(Some(subject))])
+            .expect("getPrincipals should return the Java backing set")
+            .expect("getPrincipals should return a value");
+        let expected_set = ctx.get_field(subject, SUBJECT_SLOT_PRINCIPALS);
+        assert_eq!(principals, expected_set);
+        if let Value::Object(Some(set)) = principals {
+            assert_eq!(ctx.get_field(set, 1), Value::Int(1));
+        } else {
+            panic!("expected principals set object, got {principals:?}");
+        }
+    }
 
     #[test]
     #[allow(non_snake_case)]
