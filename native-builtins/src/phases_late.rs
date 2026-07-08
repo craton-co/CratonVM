@@ -40276,7 +40276,16 @@ pub(crate) fn register_p68_ssl(r: &mut NativeMethodRegistry) {
         "()Ljavax/net/ssl/SSLSession;",
         |ctx, args| {
             let this = obj_arg(args, 0)?;
-            Ok(Some(ctx.get_field(this, 4)))
+            let session = ctx.get_field(this, 4);
+            if std::env::var_os("CRATONVM_DBG_TLS_SOCK").is_some() {
+                eprintln!(
+                    "[dbg-tls-sock] thread={:?} getSession sock={:?} -> {:?}",
+                    std::thread::current().id(),
+                    this,
+                    session
+                );
+            }
+            Ok(Some(session))
         },
     );
     r.register(ssl_sock, "startHandshake", "()V", |_ctx, _args| {
@@ -40462,6 +40471,14 @@ pub(crate) fn register_p68_ssl(r: &mut NativeMethodRegistry) {
             Value::Int(c) => c != 0,
             _ => crate::net_phase_e::sock_is_closed_for_upcall(this),
         };
+        if std::env::var_os("CRATONVM_DBG_TLS_SOCK").is_some() {
+            eprintln!(
+                "[dbg-tls-sock] thread={:?} isClosed sock={:?} -> {}",
+                std::thread::current().id(),
+                this,
+                closed
+            );
+        }
         Ok(Some(Value::Int(if closed { 1 } else { 0 })))
     });
     r.register(ssl_sock, "isConnected", "()Z", |ctx, args| {
@@ -40470,6 +40487,14 @@ pub(crate) fn register_p68_ssl(r: &mut NativeMethodRegistry) {
             Value::Int(c) => c != 0,
             _ => crate::net_phase_e::sock_is_closed_for_upcall(this),
         };
+        if std::env::var_os("CRATONVM_DBG_TLS_SOCK").is_some() {
+            eprintln!(
+                "[dbg-tls-sock] thread={:?} isConnected sock={:?} -> {}",
+                std::thread::current().id(),
+                this,
+                !closed
+            );
+        }
         Ok(Some(Value::Int(if closed { 0 } else { 1 })))
     });
     r.register(ssl_sock, "getPort", "()I", |ctx, args| {
