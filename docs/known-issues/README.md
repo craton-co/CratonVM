@@ -128,9 +128,12 @@ All three verified against their real Keycloak classes via the suite runner; no 
   [`docs/internal/hib-temporal-sql-parameter-placeholder-duplication-FIXED.md`](../internal/hib-temporal-sql-parameter-placeholder-duplication-FIXED.md);
   the reason-8 saga's remaining follow-ups stay tracked in
   [jit-invokedynamic-uncommon-trap-precise-resume-groovy-regression-FIXED.md](../internal/jit-invokedynamic-uncommon-trap-precise-resume-groovy-regression-FIXED.md);
-  two unmasked PRE-EXISTING temporal residuals (37× `DdlTypeImpl.getRawTypeName` NPE in
-  InstantTests, 2× empty `IllegalThreadStateException`) are tracked in
-  [hib-temporal-residuals-typename-npe-illegalthreadstate.md](hib-temporal-residuals-typename-npe-illegalthreadstate.md).
+  the two unmasked PRE-EXISTING temporal residuals (37× `DdlTypeImpl.getRawTypeName` NPE in
+  InstantTests, 2× empty `IllegalThreadStateException`) are now fixed by the conservative
+  Hibernate JIT guard and retired to
+  [hib-temporal-residuals-typename-npe-illegalthreadstate-FIXED.md](../internal/fixed-suite-bugs/hib-temporal-residuals-typename-npe-illegalthreadstate-FIXED.md).
+  Separate current `LocalDateTimeTest` DST/H2 residuals are tracked in
+  [hib-temporal-localdatetime-dst-h2-local4-residuals.md](hib-temporal-localdatetime-dst-h2-local4-residuals.md).
 
 ## 2026-07-06/07 http.client class_manager RwLock recursive-read deadlock — FIXED (branch fix/class-manager-writer-starvation-20260706)
 
