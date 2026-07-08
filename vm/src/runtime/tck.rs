@@ -321,6 +321,12 @@ impl TckRegistry {
             vec!["linkedlist", "iterator"],
         ));
         self.register(TckTest::passing(
+            "util.LinkedList.removeIfIteratorRemove",
+            TckCategory::Util,
+            "cratonvm/TckUtil.java#linkedlist_remove_if_iterator_remove",
+            vec!["linkedlist", "iterator", "removeif"],
+        ));
+        self.register(TckTest::passing(
             "util.Collections.sortStability",
             TckCategory::Util,
             "java/util/Collections/SortStabilityTest.java",
@@ -4109,7 +4115,7 @@ impl CoreLanguageTck {
             ],
         );
 
-        // Session 47: java.util — TckUtil (28 tests)
+        // Session 47: java.util — TckUtil (29 tests)
         self.run_class_tests(
             "cratonvm/TckUtil",
             &[
@@ -4141,6 +4147,7 @@ impl CoreLanguageTck {
                 ("testHashMapCapacity", 1),
                 ("testArrayListToArray", 1),
                 ("testHashMapNullKey", 1),
+                ("linkedlist_remove_if_iterator_remove", 1),
             ],
         );
 

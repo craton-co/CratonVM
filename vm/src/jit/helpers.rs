@@ -1293,12 +1293,8 @@ unsafe fn try_resume_trapped_callee(
         let cm = vm.class_manager.read();
         let class_id = cm.find_class_by_name(key_class)?;
         let store = cm.class_store();
-        let (method, declaring_id) = crate::classloading::find_method_recursive(
-            class_id,
-            key_method,
-            key_desc,
-            store,
-        )?;
+        let (method, declaring_id) =
+            crate::classloading::find_method_recursive(class_id, key_method, key_desc, store)?;
         let code_attr = method.code()?;
         let declaring_class_name = store.get(declaring_id).map(|c| &*c.name)?;
         // The key must name the method's OWN declaring class — a mismatch
@@ -1352,9 +1348,7 @@ unsafe fn try_resume_trapped_callee(
     };
 
     if std::env::var_os("CRATONVM_DBG_DEOPT").is_some() {
-        eprintln!(
-            "[cratonvm-deopt] helper precise-resume of trapped callee {key} at bci={bci}"
-        );
+        eprintln!("[cratonvm-deopt] helper precise-resume of trapped callee {key} at bci={bci}");
     }
 
     // De-speculate the trapping method FIRST (record + evict + escalate), so
@@ -3729,6 +3723,63 @@ fn raise_jit_stack_overflow(vm: &SharedVm) -> i64 {
     i64::MIN
 }
 
+#[cold]
+fn throwable_class_name(vm: &SharedVm, obj: ObjectRef) -> Option<String> {
+    let cid = vm.heap.class_id_of(obj);
+    vm.class_manager
+        .read()
+        .get_class(cid)
+        .map(|c| c.name.to_string())
+}
+
+#[cold]
+fn throwable_detail_message(vm: &SharedVm, obj: ObjectRef) -> Option<String> {
+    let cid = vm.heap.class_id_of(obj);
+    let msg_ref = {
+        let cm = vm.class_manager.read();
+        let idx =
+            crate::vm::resolve_field_index_in_hierarchy(cid, "detailMessage", &cm.class_store)?;
+        match vm.heap.get_field(obj, idx) {
+            Value::Object(Some(s)) => s,
+            _ => return None,
+        }
+    };
+    if throwable_class_name(vm, msg_ref).as_deref() != Some("java/lang/String") {
+        return None;
+    }
+    crate::vm::read_java_string(&vm.heap, msg_ref)
+}
+
+#[cold]
+fn is_dispatch_no_such_method_miss(
+    vm: &SharedVm,
+    err: &crate::error::MethodCallFailed,
+    dispatch_class: &str,
+    method_name: &str,
+    descriptor: &str,
+) -> bool {
+    use crate::error::{LinkageError, MethodCallFailed, VmError};
+
+    match err {
+        MethodCallFailed::InternalError(VmError::Linkage(LinkageError::NoSuchMethodError {
+            class_name,
+            method_name: err_method,
+            method_descriptor,
+        })) => {
+            class_name == dispatch_class
+                && err_method == method_name
+                && method_descriptor == descriptor
+        }
+        MethodCallFailed::ExceptionThrown(exc)
+            if throwable_class_name(vm, *exc).as_deref() == Some("java/lang/NoSuchMethodError") =>
+        {
+            let expected = format!("{dispatch_class}.{method_name}{descriptor}");
+            throwable_detail_message(vm, *exc).as_deref() == Some(expected.as_str())
+        }
+        _ => false,
+    }
+}
+
 /// S112r9 — JIT dispatch error handler. When a JIT-dispatched callee returns
 /// an error, route it through `JIT_PENDING_EXCEPTION` so the interpreter's
 /// post-JIT exception-routing path can find a handler (or propagate to the
@@ -4279,15 +4330,7 @@ pub unsafe extern "C" fn jit_invoke_dispatch(
                     // it. Mirrors the S111r10 receiver-walk fallback
                     // for invokeinterface and the S111r8 cid=0 →
                     // CP-class fallback in `execute_invoke`.
-                    let is_nsme = matches!(
-                        &e,
-                        crate::error::MethodCallFailed::InternalError(
-                            crate::error::VmError::Linkage(
-                                crate::error::LinkageError::NoSuchMethodError { .. },
-                            ),
-                        ),
-                    );
-                    if is_nsme && !info.class_name.is_empty() {
+                    if !info.class_name.is_empty() {
                         let recv_cid = vm.heap.class_id_of(receiver_ref);
                         let recv_name_opt = {
                             let cm = vm.class_manager.read();
@@ -4297,7 +4340,17 @@ pub unsafe extern "C" fn jit_invoke_dispatch(
                             .as_deref()
                             .map(|n| n != info.class_name)
                             .unwrap_or(true);
-                        if cp_differs {
+                        if cp_differs
+                            && recv_name_opt.as_deref().is_some_and(|recv_name| {
+                                is_dispatch_no_such_method_miss(
+                                    vm,
+                                    &e,
+                                    recv_name,
+                                    info.method_name,
+                                    info.descriptor,
+                                )
+                            })
+                        {
                             let r = crate::vm::invoke_or_native(
                                 vm,
                                 thread,
@@ -4829,9 +4882,17 @@ pub unsafe extern "C" fn jit_invoke_virtual_mic(
         // caller run on with a bogus value.
         let result = match invoke_res {
             Ok(v) => v,
-            Err(crate::error::MethodCallFailed::InternalError(crate::error::VmError::Linkage(
-                crate::error::LinkageError::NoSuchMethodError { .. },
-            ))) if !info.class_name.is_empty() && &*class_name != info.class_name => {
+            Err(e)
+                if !info.class_name.is_empty()
+                    && &*class_name != info.class_name
+                    && is_dispatch_no_such_method_miss(
+                        vm,
+                        &e,
+                        &class_name,
+                        info.method_name,
+                        info.descriptor,
+                    ) =>
+            {
                 match crate::vm::invoke_or_native(
                     vm,
                     thread,
@@ -4952,9 +5013,17 @@ pub unsafe extern "C" fn jit_invoke_virtual_mic(
     // and the S111r8 cid=0 → CP-class fallback in `execute_invoke`.
     let result = match invoke_res {
         Ok(v) => v,
-        Err(crate::error::MethodCallFailed::InternalError(crate::error::VmError::Linkage(
-            crate::error::LinkageError::NoSuchMethodError { .. },
-        ))) if !info.class_name.is_empty() && &*class_name != info.class_name => {
+        Err(e)
+            if !info.class_name.is_empty()
+                && &*class_name != info.class_name
+                && is_dispatch_no_such_method_miss(
+                    vm,
+                    &e,
+                    &class_name,
+                    info.method_name,
+                    info.descriptor,
+                ) =>
+        {
             match crate::vm::invoke_or_native(
                 vm,
                 thread,

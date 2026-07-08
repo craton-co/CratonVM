@@ -1,10 +1,10 @@
 # Hibernate `type.temporal.*` residuals — `DdlTypeImpl.getRawTypeName` NPE cluster + empty `IllegalThreadStateException` pair
 
-**Status:** 🔴 OPEN — two SEPARATE pre-existing bugs, unmasked (not caused) by the 2026-07-07
-placeholder-duplication fix ([`hib-temporal-sql-parameter-placeholder-duplication-FIXED.md`](../internal/hib-temporal-sql-parameter-placeholder-duplication-FIXED.md)).
-Untriaged beyond the A/B evidence below.
-**Severity:** Medium (37 + 2 tests in `InstantTests`; 2 in `LocalDateTimeTest`; other temporal
-classes unmeasured for these signatures).
+**Status:** FIXED on 2026-07-08 by the conservative Hibernate JIT guard in `vm/src/jit/skip_list.rs` plus the final `cratonvm-jit::try_compile` gate. The guard keeps `org/hibernate/` bytecode interpreted under the default conservative policy, with `CRATONVM_JIT_ALLOW_PACKAGES=org/hibernate/` (or `org.hibernate.` for dotted names) available for bisection.
+
+**Original severity:** Medium (37 + 2 tests in `InstantTests`; 2 in `LocalDateTimeTest`; other temporal classes unmeasured for these signatures).
+
+**Fix summary:** cold `H2Dialect.columnType(3003)` matched HotSpot, while `CRATONVM_TIER_ENABLED=0` removed the `typeNamePattern` signature, proving this was JIT-induced. Narrow package bisection removed the DDL NPE but exposed intermittent adjacent temporal failures; the stable control was `CRATONVM_JIT_DENY=org/hibernate/`, so the production fix makes that fail-closed guard the default conservative behavior.
 
 ## 1. `NullPointerException: Cannot invoke "String.indexOf(int)" because "typeNamePattern" is null` (37× in `InstantTests`)
 
@@ -40,3 +40,15 @@ different, unidentified thread-lifecycle interaction. Next step for whoever pick
 rerun one class with a patched `CratonRunner` that prints the full stack trace of failures
 (the JUnit listener currently truncates to the message line), then chase the `Thread.start`
 call site.
+
+
+## 2026-07-08 fix verification
+
+Built `/data/data/bin/cratonvm-hib-temporal-residuals-20260708-170734-fixed` from branch `codex/hib-temporal-residuals-20260708-170734`.
+
+- `cargo test -p cratonvm-jit --lib hibernate_temporal_jit -- --nocapture`: 2/2 passed.
+- `cargo test -p cratonvm-vm --lib hibernate_temporal_residual -- --nocapture`: 3/3 passed.
+- `rustfmt --edition 2021 --check vm/src/jit/skip_list.rs`: passed.
+- `InstantTests` final run 0: `found=204 started=204 ok=112 failed=0 aborted=92`, with 0 `typeNamePattern`, 0 `IllegalThreadStateException`, 0 H2 `<local4>`, 0 `NoSuchMethodError`.
+- `InstantTests` final run 1: `found=204 started=204 ok=112 failed=0 aborted=92`, with the same zero-signature counts.
+- `LocalDateTimeTest`: 0 `IllegalThreadStateException`; the separate DST/H2 residuals are now fixed and retired to `docs/internal/fixed-suite-bugs/hib-temporal-localdatetime-dst-h2-local4-residuals-FIXED.md`.

@@ -559,6 +559,14 @@ pub(crate) fn resolve_module(root: &Path, name: &str) -> Result<ResolvedModule, 
     let mx = parse_module_xml(&module_xml_path).map_err(|e| RuntimeError::IOException {
         message: format!("failed to parse {}: {}", module_xml_path.display(), e),
     })?;
+    if let Some(target) = mx.alias_target.as_deref().filter(|target| !target.is_empty()) {
+        if target == name {
+            return Err(RuntimeError::IllegalArgumentException {
+                message: format!("module alias {name} points to itself"),
+            });
+        }
+        return resolve_module(root, target);
+    }
     // Resource roots are relative to module_dir.  Materialize each as
     // an absolute path and confirm it stays under the canonical root.
     let mut resource_roots = Vec::with_capacity(mx.resource_roots.len() + mx.artifacts.len());
@@ -2802,6 +2810,22 @@ pub(crate) fn native_module_get_module_loader(
     Ok(Some(Value::Object(Some(l))))
 }
 
+/// `Module.getBootModuleLoader()` / `Module.getCallerModuleLoader()` /
+/// `Module.getContextModuleLoader()`.
+///
+/// WildFly subsystem code commonly asks JBoss Modules for the caller loader
+/// before loading optional subsystem/provider modules. CratonVM does not model
+/// the per-frame JBoss module association, but all WildFly modules are resolved
+/// through the same boot `LocalModuleLoader` rooted in the module path, so this
+/// returns that loader instead of letting the real bytecode produce null.
+pub(crate) fn native_module_get_boot_or_caller_module_loader(
+    ctx: &mut dyn NativeContext,
+    _args: &[Value],
+) -> MethodCallResult {
+    let loader = build_local_module_loader(ctx);
+    Ok(Some(Value::Object(Some(loader))))
+}
+
 // ===========================================================================
 // Registration
 // ===========================================================================
@@ -3093,6 +3117,18 @@ pub fn register_jboss_module_loader(registry: &mut NativeMethodRegistry) {
         "()Lorg/jboss/modules/ModuleLoader;",
         native_module_get_module_loader,
     );
+    for name in [
+        "getBootModuleLoader",
+        "getCallerModuleLoader",
+        "getContextModuleLoader",
+    ] {
+        registry.register(
+            CN_MODULE,
+            name,
+            "()Lorg/jboss/modules/ModuleLoader;",
+            native_module_get_boot_or_caller_module_loader,
+        );
+    }
     registry.register(
         CN_MODULE,
         "loadClass",
@@ -3561,6 +3597,33 @@ mod tests {
     }
 
     #[test]
+    fn wf_domain_resolve_module_alias_follows_target_name() {
+        let _g = TEST_LOCK.lock();
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        write(
+            &root.join("org/jboss/as/modcluster/main/module.xml"),
+            r#"<?xml version="1.0" encoding="UTF-8"?>
+<module-alias name="org.jboss.as.modcluster" target-name="org.wildfly.extension.mod_cluster" xmlns="urn:jboss:module:1.9"/>
+"#,
+        );
+        let target_dir = root.join("org/wildfly/extension/mod_cluster/main");
+        write(
+            &target_dir.join("module.xml"),
+            &make_module_xml_with_jars(
+                "org.wildfly.extension.mod_cluster",
+                &["wildfly-mod_cluster-extension.jar"],
+            ),
+        );
+        write(&target_dir.join("wildfly-mod_cluster-extension.jar"), "PK");
+
+        let r = resolve_module(root, "org.jboss.as.modcluster").unwrap();
+        assert_eq!(r.mx.name, "org.wildfly.extension.mod_cluster");
+        assert_eq!(r.resource_roots.len(), 1);
+        assert!(r.resource_roots[0].ends_with("wildfly-mod_cluster-extension.jar"));
+    }
+
+    #[test]
     fn t19_h4_resolve_module_layered_base_path() {
         let _g = TEST_LOCK.lock();
         let tmp = tempfile::tempdir().unwrap();
@@ -3945,6 +4008,34 @@ mod tests {
         }
     }
 
+    #[test]
+    fn wf_domain_static_module_loader_accessors_return_boot_loader() {
+        let _g = TEST_LOCK.lock();
+        let tmp = tempfile::tempdir().unwrap();
+        setup_test_env(tmp.path());
+        let mut ctx = MockNativeContext::new();
+        let boot = build_local_module_loader(&mut ctx);
+
+        for accessor in [
+            "getBootModuleLoader",
+            "getCallerModuleLoader",
+            "getContextModuleLoader",
+        ] {
+            let result = native_module_get_boot_or_caller_module_loader(&mut ctx, &[])
+                .unwrap()
+                .unwrap();
+            match result {
+                Value::Object(Some(loader)) => assert_eq!(
+                    loader.as_ptr(),
+                    boot.as_ptr(),
+                    "{} did not return the cached boot loader",
+                    accessor
+                ),
+                other => panic!("{} returned {:?}", accessor, other),
+            }
+        }
+    }
+
     // -----------------------------------------------------------------
     // Concurrency: 4 threads racing loadModule for the same module
     // must end up with one cached instance.
@@ -4079,13 +4170,11 @@ mod tests {
         let after = r.len();
         // We register at least: 2 DefaultBootModuleLoaderHolder$1.run
         // overloads, loadModule/String + loadModule/Identifier on both
-        // LocalModuleLoader and ModuleLoader (4), plus 11 methods on
-        // Module / ModuleClassLoader (incl. property accessors and
-        // getClassLoaderPrivate).  Assert at least 15 net new
-        // registrations.
+        // LocalModuleLoader and ModuleLoader (4), plus the Module /
+        // ModuleClassLoader surface including the static loader accessors.
         assert!(
-            after >= before + 15,
-            "expected >= 15 new registrations, got {}",
+            after >= before + 18,
+            "expected >= 18 new registrations, got {}",
             after - before
         );
     }
@@ -4115,6 +4204,26 @@ mod tests {
                 assert_eq!(a.as_ptr(), b.as_ptr());
             }
             other => panic!("expected pair of non-null loaders, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn t19_h4_get_caller_module_loader_returns_boot_loader() {
+        let _g = TEST_LOCK.lock();
+        let tmp = tempfile::tempdir().unwrap();
+        setup_test_env(tmp.path());
+        let mut ctx = MockNativeContext::new();
+        let caller = native_module_get_boot_or_caller_module_loader(&mut ctx, &[])
+            .unwrap()
+            .unwrap();
+        let boot = native_module_get_boot_or_caller_module_loader(&mut ctx, &[])
+            .unwrap()
+            .unwrap();
+        match (caller, boot) {
+            (Value::Object(Some(a)), Value::Object(Some(b))) => {
+                assert_eq!(a.as_ptr(), b.as_ptr());
+            }
+            other => panic!("expected stable boot loader refs, got {:?}", other),
         }
     }
 
@@ -4683,6 +4792,10 @@ mod tests {
             "org.wildfly.extension.core-management",
             "org.jboss.as.controller.Extension",
         );
+        let modcluster = module_service_provider_names(
+            "org.jboss.as.modcluster",
+            "org.jboss.as.controller.Extension",
+        );
         assert_eq!(
             jmx,
             vec!["org.jboss.as.jmx.JMXExtension".to_string()],
@@ -4700,6 +4813,13 @@ mod tests {
              org.jboss.as.jmx reproduces the cross-module \
              service-provider leak.",
             cm
+        );
+        assert_eq!(
+            modcluster,
+            vec!["org.wildfly.extension.mod_cluster.ModClusterExtension".to_string()],
+            "org.jboss.as.modcluster is a module-alias for \
+             org.wildfly.extension.mod_cluster; got {:?}",
+            modcluster
         );
     }
 

@@ -553,6 +553,31 @@ public class TckUtil {
         return 1;
     }
 
+    /** LinkedList.removeIf must route through a remove-capable iterator. */
+    public static int linkedlist_remove_if_iterator_remove() {
+        LinkedList list = new LinkedList();
+        list.add("implemented");
+        list.add("remaining");
+        list.add("implemented");
+
+        boolean changed = list.removeIf(new java.util.function.Predicate() {
+            public boolean test(Object value) {
+                return "implemented".equals(value);
+            }
+        });
+        if (!changed) return 0;
+        if (list.size() != 1) return 0;
+        if (!"remaining".equals(list.getFirst())) return 0;
+
+        Iterator it = list.iterator();
+        if (!it.hasNext()) return 0;
+        if (!"remaining".equals(it.next())) return 0;
+        it.remove();
+        if (list.size() != 0) return 0;
+
+        return 1;
+    }
+
     // -----------------------------------------------------------------------
     // TreeMap
     // -----------------------------------------------------------------------

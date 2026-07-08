@@ -1040,14 +1040,9 @@ pub trait NativeContext {
         name: &str,
     ) -> Result<ClassId, cratonvm_types::error::MethodCallFailed>;
 
-    /// Ensure an already-resolved class is initialized by exact `ClassId`.
-    ///
-    /// Name-based initialization is not enough for classes defined by
-    /// isolating user loaders: multiple classes can share the same binary
-    /// name, and resolving that name globally can select the wrong class or
-    /// fail as ambiguous. Real VM contexts override this with direct class-id
-    /// initialization; the default is sufficient for single-namespace mocks.
-    fn ensure_class_id_initialized(
+    /// Ensure the exact already-resolved class id is initialized without
+    /// re-resolving its binary name through the global loader map.
+    fn ensure_class_initialized_with_class_id(
         &mut self,
         class_id: ClassId,
     ) -> Result<(), cratonvm_types::error::MethodCallFailed> {
@@ -2035,6 +2030,24 @@ pub trait NativeContext {
         descriptor: &str,
         args: &[Value],
     ) -> MethodCallResult;
+
+    /// Invoke a virtual method whose declaring class is known by the caller.
+    ///
+    /// Most callers should use [`Self::invoke_virtual`]. Method-handle dispatch
+    /// has one extra piece of information, though: the owner class stored in the
+    /// handle. VM contexts can use that as a recovery target when receiver-based
+    /// dispatch collapses to bare `java/lang/Object` for a non-Object member.
+    /// Mock/test contexts keep the simple virtual behavior by default.
+    fn invoke_virtual_declared(
+        &mut self,
+        _declared_class: &str,
+        receiver: ObjectRef,
+        method_name: &str,
+        descriptor: &str,
+        args: &[Value],
+    ) -> MethodCallResult {
+        self.invoke_virtual(receiver, method_name, descriptor, args)
+    }
 
     /// Invoke a method with invokespecial semantics — *exactly* the resolved
     /// method on `class_name`, with no virtual dispatch and no interface

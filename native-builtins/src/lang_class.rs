@@ -1,4 +1,4 @@
-﻿// SPDX-License-Identifier: Apache-2.0
+// SPDX-License-Identifier: Apache-2.0
 // Copyright 2024-2026 Craton Software Company
 
 //! Class, reflect.Method, reflect.Field, reflect.Constructor native method implementations.
@@ -2056,7 +2056,18 @@ pub(crate) fn native_class_is_instance(
         }
     }
 
-    if target_class_id == this_class_id || ctx.is_subclass(target_class_id, this_class_id) {
+    let this_name_for_assignability = mirror_class_name(ctx, this)
+        .or_else(|| ctx.class_name_of_id(this_class_id))
+        .unwrap_or_default();
+    if target_class_id == this_class_id
+        || ctx.is_subclass(target_class_id, this_class_id)
+        || loader_aware_reflect_assignable(
+            ctx,
+            target_class_id,
+            this_class_id,
+            &this_name_for_assignability,
+        )
+    {
         return Ok(Some(Value::Int(1)));
     }
     if std::env::var_os("CRATONVM_DBG_ISINSTANCE").is_some() {
@@ -2103,6 +2114,66 @@ pub(crate) fn native_class_is_instance(
 /// pub(crate): also used by the Object.toString native (lib.rs) so the
 /// default `Name@hash` rendering of arrays matches HotSpot
 /// (`[Ljava.lang.Class;@вЂ¦`, not the component class name).
+#[inline]
+fn is_global_resolution_namespace(name: &str) -> bool {
+    name.starts_with("java/")
+        || name.starts_with("javax/")
+        || name.starts_with("jdk/")
+        || name.starts_with("sun/")
+        || name.starts_with("com/sun/")
+}
+
+fn loader_aware_reflect_assignable(
+    ctx: &dyn NativeContext,
+    source_class_id: ClassId,
+    target_class_id: ClassId,
+    target_class_name: &str,
+) -> bool {
+    if !crate::classloader::loader_aware_resolution()
+        || target_class_name.is_empty()
+        || target_class_name.starts_with('[')
+        || is_global_resolution_namespace(target_class_name)
+    {
+        return false;
+    }
+
+    let Some(target_actual_name) = ctx.class_name_of_id(target_class_id) else {
+        return false;
+    };
+    if target_actual_name != target_class_name {
+        return false;
+    }
+
+    if ctx.class_name_of_id(source_class_id).as_deref() == Some(target_class_name) {
+        return true;
+    }
+
+    if !ctx.is_interface_class(target_class_id) {
+        return false;
+    }
+
+    let mut queue = Vec::new();
+    let mut current = Some(source_class_id);
+    while let Some(class_id) = current {
+        queue.extend(ctx.class_interfaces(class_id));
+        current = ctx.superclass_of(class_id);
+    }
+
+    let mut seen = Vec::new();
+    while let Some(iface_id) = queue.pop() {
+        if seen.contains(&iface_id) {
+            continue;
+        }
+        seen.push(iface_id);
+        if ctx.class_name_of_id(iface_id).as_deref() == Some(target_class_name) {
+            return true;
+        }
+        queue.extend(ctx.class_interfaces(iface_id));
+    }
+
+    false
+}
+
 pub(crate) fn array_descriptor_for(
     ctx: &dyn NativeContext,
     obj: cratonvm_types::ObjectRef,
@@ -2356,8 +2427,9 @@ pub(crate) fn native_class_is_assignable_from(
                 return Ok(Some(Value::Int(0)));
             }
         };
-        let result =
-            other_class_id == this_class_id || ctx.is_subclass(other_class_id, this_class_id);
+        let result = other_class_id == this_class_id
+            || ctx.is_subclass(other_class_id, this_class_id)
+            || loader_aware_reflect_assignable(ctx, other_class_id, this_class_id, &this_name);
         Ok(Some(Value::Int(if result { 1 } else { 0 })))
     })();
     // Restore depth on every exit path (success or error).
@@ -3926,11 +3998,10 @@ fn ensure_static_field_declaring_class_initialized(
     class_id: cratonvm_types::ClassId,
 ) -> Result<(), cratonvm_types::error::MethodCallFailed> {
     // Reflective access to a static field is an active use of the declaring
-    // class. Initialize by exact `ClassId`: BeanShell can define several
-    // same-named script classes (`MyMessenger`) through distinct loaders, and a
-    // name-based initialization collapses or fails before the exact static slot
-    // is read or written.
-    ctx.ensure_class_id_initialized(class_id)
+    // class. HotSpot runs <clinit> before Field.get/set returns the value.
+    // Use the exact Field mirror ClassId so loader-private classes are
+    // initialized as themselves, not as a same-named global class.
+    ctx.ensure_class_initialized_with_class_id(class_id)
 }
 
 // --- Field.get(Object) / Field.set(Object, Object) ---
@@ -12462,7 +12533,9 @@ fn native_package_equals(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
     }
     let this_name = package_name_from_package_obj(ctx, this);
     let other_name = package_name_from_package_obj(ctx, other);
-    Ok(Some(Value::Int((this_name.is_some() && this_name == other_name) as i32)))
+    Ok(Some(Value::Int(
+        (this_name.is_some() && this_name == other_name) as i32,
+    )))
 }
 
 fn native_package_hash_code(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
@@ -12757,7 +12830,7 @@ pub(crate) fn native_class_get_enum_constants(
         Some(n) => n,
         None => return Ok(Some(Value::Object(None))),
     };
-    if let Err(_e) = ctx.ensure_class_initialized(&class_name) {
+    if let Err(_e) = ctx.ensure_class_initialized_with_class_id(class_id) {
         // Fall through вЂ” we can still try to read $VALUES if it was
         // populated before the failure (common after silent-swallow).
     }

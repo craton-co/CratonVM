@@ -1,6 +1,6 @@
 # WildFly domain managed servers do not reach started state
 
-Status: OPEN (2026-07-08: stock-config empty-ServiceName collapse, loopback-interface criterion failure, and Undertow HttpString parser-clinit blocker are fixed/reduced. Remaining open residuals: no-JIT Arquillian awaitServers propagation gap; JIT-on literal-address WFLYSRV0082; stock domain now fails later with moduleLoader null in management HTTP service.)
+Status: OPEN (2026-07-08: stock-config empty-ServiceName collapse, loopback-interface criterion failure, Undertow HttpString parser-clinit, JBoss Modules caller/context ModuleLoader accessors, capability ServiceName null fallback, XNIO TCP accept-server binding, module-alias service-provider lookup, and the process-controller Process.waitFor STW/native watchdog gap are fixed/reduced. Remaining open residuals: no-JIT Arquillian awaitServers propagation gap; JIT-on literal-address WFLYSRV0082; stock domain now reaches Host Controller start-servers and fails the process-controller inventory path with Socket.getOutputStream: not connected, followed by watchdog stack dumps.)
 Date found: 2026-07-05
 Area: WildFly domain mode startup under CratonVM
 
@@ -685,3 +685,169 @@ Caused by: java.lang.NullPointerException: Cannot invoke "org.jboss.modules.Modu
 This document remains OPEN until the Arquillian no-JIT `awaitServers` propagation gap,
 the JIT-on literal-address WFLYSRV0082, and this newly exposed stock management-HTTP
 module-loader wiring failure are closed.
+
+## 2026-07-08 update -- ModuleLoader/capability ServiceName null residuals fixed; STW stall remains OPEN
+
+Branch `codex/fix-wildfly-null-residuals-20260708-175605` on the Azure probe host, using a separate worktree from `dev` and uniquely named binaries:
+
+```text
+/data/data/cratonvm-builtins/cratonvm-wildfly-20260708-175605-nullres
+/data/data/cratonvm-builtins/java-wildfly-20260708-175605-nullres
+/data/data/fakejdk-wildfly-20260708-175605-nullres/bin/java
+```
+
+Two functional residuals from the previous 2026-07-08 pass are now fixed:
+
+1. **Datasource `ModuleLoader.loadModule(ModuleIdentifier)` null receiver -- FIXED.** `JdbcDriverAdd.performRuntime` calls `Module.getCallerModuleLoader().loadModule(identifier)`. CratonVM already handled the `loadModule(...)` side, but did not provide `Module.getCallerModuleLoader()` / `Module.getBootModuleLoader()`. The module bridge now returns the existing boot `LocalModuleLoader` for both methods.
+2. **Infinispan `ServiceBuilderImpl.requires(null)` / "Method parameter cannot be null" -- FIXED.** `XAResourceRecoveryServiceConfigurator.configure()` obtains `org.wildfly.transactions.xa-resource-recovery-registry` via `OperationContext.getCapabilityServiceName(name, type)`. WildFly's real `OperationContextImpl` falls back to parsing the capability name as an MSC `ServiceName` when registry lookup is unavailable; under CratonVM the under-modeled registry path could return null instead. The WildFly core bridge now mirrors that fallback for the `getCapabilityServiceName(...)` overloads and appends dynamic parts where applicable.
+
+Focused validation:
+
+```text
+cargo test -p cratonvm-native-builtins t19_h4_get_caller_module_loader_returns_boot_loader -- --nocapture
+cargo test -p cratonvm-native-builtins t19_2_a_operation_context_capability_name -- --nocapture
+cargo check -p cratonvm-native-api -p cratonvm-native-builtins -p cratonvm-vm
+cargo build --release -p cratonvm-cli --features java-bin-alias --bin cratonvm --bin java
+```
+
+The follow-up direct WildFly standalone probe no longer reports either null residual. The process still times out with the pre-existing STW cooperation stall:
+
+```text
+[stw-census] rounds=64 pending=1 taken=0 blocked=48 alive=53
+```
+
+The pending/nonblocked threads remain in the `EnhancedQueueExecutor$ThreadBody.run` / `ParallelBootOperationStepHandler` cooperation family. Status remains OPEN for the broader WildFly boot timeout; the two null residuals from this section are closed under `docs/internal/fixed-suite-bugs/wildfly-moduleloader-capability-servicename-nulls.md`.
+
+## 2026-07-08 update - XNIO accept server and module aliases fixed; stock-domain boundary reduced to process-controller STW/native watchdog
+
+Branch `codex/wildfly-moduleloader-20260708-150444` on the Azure probe host, using a separate worktree from `/data/data/cratonvm`:
+
+```text
+/data/data/codex-wildfly-moduleloader-20260708-150444
+```
+
+Unique rebuilt binaries:
+
+```text
+/data/data/bin/java-wildfly-moduleloader-20260708-150444-callerloader
+/data/data/bin/cratonvm-wildfly-moduleloader-20260708-150444-callerloader
+```
+
+Two additional stock-domain blockers exposed after the caller-loader fix were closed in this pass, and the accessor coverage was extended to `Module.getContextModuleLoader()`:
+
+1. **JBoss Modules caller/context loader accessors - FIXED/EXTENDED.** The rebased `dev` branch already fixes `Module.getBootModuleLoader()` / `getCallerModuleLoader()` for the datasource null receiver. This branch keeps that helper and registers the same boot `LocalModuleLoader` for `Module.getContextModuleLoader()` as well, matching the rest of the synthetic JBoss Modules bridge.
+2. **XNIO `createTcpConnectionServer` - FIXED for the management HTTP boot path.** Once the caller-loader NPE was gone, stock `domain.sh` reached `XNIO000900: Method 'createTcpConnectionServer' is not supported on this implementation`. CratonVM now provides focused natives for `XnioWorker.createTcpConnectionServer` and `NioXnioWorker.createTcpConnectionServer`, binds a real Rust `TcpListener` for the requested `InetSocketAddress`, stores it in a registry, and returns a synthetic `AcceptingChannel` mirror with the channel methods WildFly/XNIO expects during boot (`getAcceptSetter`, `resumeAccepts`, `getLocalAddress`, `close`, option probes, worker/thread accessors, and related no-op await/wakeup paths).
+3. **JBoss Modules `module-alias` resolution - FIXED.** After the XNIO bridge, host boot failed parsing the stock domain because `org.jboss.as.modcluster` has no direct service descriptor: it is a `module-alias` to `org.wildfly.extension.mod_cluster`. The `module.xml` parser now captures `target-name`, and module resolution follows aliases before collecting resources/service providers. A real WildFly distribution regression test now asserts that `org.jboss.as.modcluster` exposes `org.wildfly.extension.mod_cluster.ModClusterExtension` for `META-INF/services/org.jboss.as.controller.Extension`.
+
+Validation:
+
+```text
+cargo test -p cratonvm-native-builtins wf_domain_static_module_loader_accessors_return_boot_loader -- --nocapture
+cargo test -p cratonvm-native-builtins t19_h4_register_jboss_module_loader_adds_surface -- --nocapture
+cargo test -p cratonvm-native-builtins xnio_worker::tests -- --nocapture
+cargo test -p cratonvm-native-builtins parses_module_alias_target_name -- --nocapture
+cargo test -p cratonvm-native-builtins wf_domain_resolve_module_alias_follows_target_name -- --nocapture
+cargo test -p cratonvm-native-builtins wildfly_jboss_modules_service_provider_leak_real_dist_scoping -- --nocapture
+cargo check -p cratonvm-classloading -p cratonvm-native-builtins
+cargo build --release -p cratonvm-cli --features java-bin-alias --bins
+```
+
+Stock WildFly 32.0.1.Final `bin/domain.sh` was rerun no-JIT against fresh domain bases using the rebuilt `java` shim. The old signatures are gone: no `moduleLoader` NPE, no `XNIO000900`, no `WFLYCTL0153`, and no missing `META-INF/services` for modcluster. A pre-rebase run reached both the earlier network-interface success and the alias-dependent extension success:
+
+```text
+NetworkInterfaceService matched interface binding
+Final response for step handler ... handling add in address [("extension" => "org.jboss.as.modcluster")] is {"outcome" => "success"}
+```
+
+After rebasing onto current `origin/dev` and rebuilding the same unique binaries, the final integrated probe (`/tmp/wildfly-domain-moduleloader-final-20260708-150444-nojit-ring/domain-run.log`) still avoids the old signatures and reaches host-controller extension initialization (`Initializing Connector Extension`, `Activating Weld Extension`, `Initializing ResourceAdapters Extension`) before the process-controller CratonVM process hangs silently and its watchdog aborts. With `CRATONVM_ENABLE_NATIVE_RING=1 CRATONVM_DEFAULT_WATCHDOG_SEC=90`:
+
+```text
+STW cross-thread JIT takeover is still waiting for cooperative mutators rounds=64 pending=1 taken=0
+=== T19.H1 watchdog: deadline of 90s elapsed; requesting thread stack dumps ===
+=== T19.H1 watchdog: 0 thread(s) dumped; aborting process ===
+=== T19.H1 watchdog: no Java threads responded -- main thread is in native (Rust) code. pid=3972727. ===
+```
+
+The native-call/dispatch ring for that watchdog run is dominated by the process controller's `org.jboss.as.process.ManagedProcess$ReadTask.run()` loop reading child output via `sun/nio/cs/StreamDecoder.read`, `java/io/FileInputStream.readBytes`, and `FileInputStream.available0`, then writing it through `OutputStreamWriter`/`PrintStream`. This run also prints the existing `ReentrantReadWriteLock$NonfairSync` CAS retry diagnostics, but the durable reduced boundary is the process-controller STW/native watchdog hang after the management-interface and extension-initialization layers.
+
+Status remains OPEN: this pass closed the newly exposed stock management-HTTP XNIO/module-alias layers, but did not close the no-JIT Arquillian `awaitServers` propagation gap, the JIT-on literal-address WFLYSRV0082, or the broader STW/native watchdog residual now exposed by stock `domain.sh`.
+
+## 2026-07-08 update - Process.waitFor STW/native gap fixed; new stock-domain boundary is start-servers socket inventory
+
+Branch `codex/wildfly-stw-managedprocess-20260708-194254` on the Azure probe host, using a separate worktree from `/data/data/cratonvm`:
+
+```text
+/data/data/codex-wildfly-stw-managedprocess-20260708-194254
+```
+
+Unique rebuilt binaries:
+
+```text
+/data/data/bin/java-wildfly-stw-managedprocess-20260708-194254
+/data/data/bin/cratonvm-wildfly-stw-managedprocess-20260708-194254
+```
+
+The previous reduced boundary was confirmed in a stock WildFly 32.0.1.Final no-JIT
+`bin/domain.sh` run with STW census/native-ring diagnostics enabled. The Process
+Controller hit:
+
+```text
+[stw-request] initiator=3 alive=8 blocked=6 expected=1
+STW cross-thread JIT takeover is still waiting for cooperative mutators rounds=64 pending=1 taken=0
+[stw-census] rounds=64 pending=1 taken=0 blocked=6 alive=8
+t5 ... state="native:java/lang/Process.waitFor()I" top=org/jboss/as/process/ManagedProcess$JoinTask.run@9
+```
+
+The waiting peer was in `java.lang.Process.waitFor()I` but was not published as
+GC-blocked, while the native ring was still dominated by
+`org.jboss.as.process.ManagedProcess$ReadTask.run()` reading child process output. The
+watchdog then reported zero Java stack dumps because no Java threads responded.
+
+Fix in `native-io/src/process.rs`: bracket all blocking process waits with
+`NativeContext::begin_blocking_region()` / `end_blocking_region()` and resync moved
+object references where needed. This covers `java.lang.Process.waitFor()I`,
+`java.lang.Process.waitFor(long, TimeUnit)` (both the overflow fallback and poll sleep),
+and `java.lang.ProcessHandleImpl.waitForProcessExit0(JZ)I`.
+
+Focused validation:
+
+```text
+cargo test -p cratonvm-native-io process_wait_for_enters_gc_blocked_region -- --nocapture
+cargo test -p cratonvm-native-io process_handle_wait_for_exit_enters_gc_blocked_region -- --nocapture
+cargo test -p cratonvm-native-io process_wait_for_timeout_enters_gc_blocked_region_between_polls -- --nocapture
+cargo check -p cratonvm-native-io -p cratonvm-vm -p cratonvm-native-builtins
+cargo build --release -p cratonvm-cli --features java-bin-alias --bins
+```
+
+The follow-up stock-domain probe with the rebuilt `java` shim shows the original
+Process.waitFor STW accounting bug is gone. The Process Controller now reports the
+process wait as blocked and has no expected peer to wait for:
+
+```text
+[stw-request] initiator=3 alive=8 blocked=7 expected=0
+```
+
+The Host Controller also gets further than the previous boundary, including the earlier
+network-interface/modcluster milestones and a real host-controller started message:
+
+```text
+NetworkInterfaceService matched interface binding
+Final response for step handler ... [("extension" => "org.jboss.as.modcluster")] is {"outcome" => "success"}
+WFLYSRV0025: WildFly Full 32.0.1.Final ... (Host Controller) started
+```
+
+The newly exposed stock-domain boundary is now the Host Controller's `start-servers`
+request into the Process Controller inventory path:
+
+```text
+WFLYCTL0013: Operation ("start-servers") failed - address: ([("host" => "primary")])
+Caused by: java.io.IOException: Socket.getOutputStream: not connected
+    at org.jboss.as.process.ProcessControllerClient.requestProcessInventory(ProcessControllerClient.java:247)
+    at org.jboss.as.process.protocol.ConnectionImpl.writeMessage(ConnectionImpl.java:85)
+```
+
+After that failure, the watchdog can dump Java stacks again rather than reporting that no
+Java threads responded. Status remains OPEN: this pass fixes the process wait/native STW
+cooperation defect, but does not close the no-JIT Arquillian `awaitServers` propagation
+gap, the JIT-on literal-address `WFLYSRV0082`, or the newly exposed
+`Socket.getOutputStream: not connected` process-controller inventory residual.

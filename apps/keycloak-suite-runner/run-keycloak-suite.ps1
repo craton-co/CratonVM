@@ -572,6 +572,8 @@ function Get-SelectedClasses {
 }
 
 function Get-UniversalClasspathEntries {
+  param([string]$Module = '')
+
   $runnerDir = Join-Path $script:KeycloakDir 'kc-runner'
   $cpFile = Join-Path $script:KeycloakDir 'kc-universal-cp.txt'
   if (-not (Test-Path $runnerDir)) { Die "missing KcRunner directory: $runnerDir" }
@@ -583,6 +585,14 @@ function Get-UniversalClasspathEntries {
 
   $entries = New-Object System.Collections.Generic.List[string]
   $seen = @{}
+  if ($Module) {
+    $modulePath = $Module -replace '/', '\'
+    $moduleRoot = Join-Path $script:KeycloakDir $modulePath
+    if (Test-Path $moduleRoot) {
+      Add-UniqueClasspathEntry -Entries $entries -Seen $seen -Entry (Join-Path $moduleRoot 'target\classes')
+      Add-UniqueClasspathEntry -Entries $entries -Seen $seen -Entry (Join-Path $moduleRoot 'target\test-classes')
+    }
+  }
   foreach ($entry in (@($runnerDir) + (Split-ClasspathEntries $cp))) {
     Add-UniqueClasspathEntry -Entries $entries -Seen $seen -Entry $entry
   }
@@ -595,7 +605,7 @@ function Get-ModuleClasspathEntries {
   param([string]$Module)
 
   if (-not $Module -or $UniversalClasspath) {
-    return Get-UniversalClasspathEntries
+    return Get-UniversalClasspathEntries -Module $Module
   }
 
   if (-not $script:ModuleClasspathCache) { $script:ModuleClasspathCache = @{} }
@@ -659,9 +669,9 @@ function Get-ModuleClasspathEntries {
 
   $entries = New-Object System.Collections.Generic.List[string]
   $seen = @{}
-  Add-UniqueClasspathEntry -Entries $entries -Seen $seen -Entry $runnerDir
   Add-UniqueClasspathEntry -Entries $entries -Seen $seen -Entry (Join-Path $moduleRoot 'target\classes')
   Add-UniqueClasspathEntry -Entries $entries -Seen $seen -Entry (Join-Path $moduleRoot 'target\test-classes')
+  Add-UniqueClasspathEntry -Entries $entries -Seen $seen -Entry $runnerDir
   foreach ($entry in (Split-ClasspathEntries ((Get-Content -Path $cpFile -Raw).Trim()))) {
     Add-UniqueClasspathEntry -Entries $entries -Seen $seen -Entry $entry
   }

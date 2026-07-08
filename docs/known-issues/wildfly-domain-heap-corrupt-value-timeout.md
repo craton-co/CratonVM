@@ -695,3 +695,61 @@ defects are now known across this doc pair:
 Both docs remain OPEN. No fix landed this session; this is a documentation
 and scoping pass only, to prevent a future session from re-treading the
 same ground or conflating these three distinct failure modes.
+
+## 2026-07-08 update (ninth session) - two standalone residuals fixed; HIB-CV-32 still silent; boot remains gated by STW/rollback blockers
+
+This session picked up the open residuals from the standalone WildFly 32.0.1.Final
+binary-distribution probes and fixed two concrete linkage/layout failures that were
+masking the already-known STW blocker:
+
+1. `ContextNames.bindInfoFor("java:jboss/datasources/KeycloakDS")` now returns a
+   `ContextNames$BindInfo` mirror with the real WildFly field layout:
+   parent `ServiceName`, binder `ServiceName`, stripped bind name, absolute JNDI
+   name. The previous two-slot/string layout wrote the JNDI string where WildFly
+   expected a `ServiceName`, causing `AbstractDataSourceService.getServiceName` to
+   dispatch `ServiceName.getCanonicalName()` on a `String` and fail with
+   `NoSuchMethodError: java/lang/String.getCanonicalName()Ljava/lang/String;`.
+2. Phase-56 `Collectors.toUnmodifiableList()` / `toUnmodifiableSet()` now use the
+   same synthetic collector shape as `native-collections`' stream collector engine:
+   tags `1`/`2` and a four-field `java/util/stream/Collector` object. The previous
+   phase-local tags/three-slot allocation could replace the core collector shape
+   and later fail as `NoSuchMethodError: java/lang/Object.supplier()...` after the
+   synthetic helper resolved through an `Object` identity.
+
+Verification used the unique probe binary
+`/data/data/probes/wildfly-hib-residuals-20260708-164823/bin/cratonvm-wildfly-hib-residuals-20260708-164823`
+and the matching `JAVA_HOME` shim at
+`/data/data/probes/wildfly-hib-residuals-20260708-164823/javahome/bin/java`.
+
+Focused checks:
+
+```text
+cargo test -p cratonvm-native-builtins t19_2_b_context_names_bind_info_parses_absolute_name -- --nocapture
+=> pass
+
+cargo test -p cratonvm-vm --features synthetic-jdk collectors_to_unmodifiable_list_p56 -- --nocapture
+=> not usable: pre-existing synthetic-jdk inline test compile drift (Arc<str>/LazyAttribute errors) prevents this target from building
+```
+
+Standalone probes after the fix:
+
+```text
+no-JIT: /data/data/probes/wildfly-hib-residuals-20260708-164823/runs/standalone-nojit-after-collector-20260708-180904.log
+rc=124 (timeout)
+getCanonicalName=0 Object.supplier=0 HIB-CV-32=0 NoClassDefFoundError=0 NoSuchMethodError=0 STW cross-thread=1
+
+JIT-on: /data/data/probes/wildfly-hib-residuals-20260708-164823/runs/standalone-jit-after-collector-20260708-181811.log
+rc=124 (timeout)
+getCanonicalName=0 Object.supplier=0 HIB-CV-32=0 NoClassDefFoundError=0 NoSuchMethodError=0 STW cross-thread=1
+```
+
+So the two method-linkage residuals are fixed, and the original HIB-CV-32 corrupt
+`Value` guard remains silent under `CRATONVM_DIAG_HIB32=1`. This document stays OPEN:
+the same probes now roll into subsystem boot failures/rollback and the existing
+BUG-03-family STW accounting stall. The no-JIT run reported early datasource and
+Infinispan boot errors (`ModuleLoader.loadModule(ModuleIdentifier)` null receiver;
+`ServiceBuilderImpl.assertNotNull` "Method parameter cannot be null") before rollback,
+then wedged at `pending=1 taken=0`. The JIT-on comparison wedged at
+`pending=2 taken=0`. The STW fix should be handled as a separate barrier/blocked-region
+change with an identity-aware reproducer; do not conflate it with the fixed BindInfo or
+collector layout issues.

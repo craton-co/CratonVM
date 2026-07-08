@@ -328,10 +328,12 @@ pub fn real_proxy_super() -> bool {
 }
 
 // Cache the per-native-call GC root snapshot's *frozen* lower frames and
-// re-scan only the churning top, keyed by per-frame `seq` + GC generation.
+// re-scan only the churning top, keyed by per-frame `(seq, exec_epoch)` + GC
+// generation.
 // Correctness rests on the LIFO stack discipline (a frame still present at
 // index k with unchanged seq proves [0..k) stayed continuously frozen). See
-// `update_root_snapshot`.
+// `update_root_snapshot`. Local writes bump `exec_epoch`, so a frozen-frame
+// cache entry is reused only while that frame's root shape is unchanged.
 //
 // DEFAULT-ON as of 2026-06-16 (SpringRepositoriesExtension hang). Previously
 // default-OFF: `update_root_snapshot` rescans EVERY interpreter frame on every

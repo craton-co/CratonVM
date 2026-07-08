@@ -199,10 +199,11 @@ and via `RealmModelTest` (the original `cache.config` NPE is gone).
   cluster topology recovery, and cache-manager teardown
   (`EmbeddedCacheManager` reaches `STOPPED`) — with no further Infinispan/
   Cache-native crash. Two **new, distinct, unrelated** residuals surfaced
-  one/two layers deeper (both JIT/VM-core, not Infinispan-specific — see
-  their own docs): a JIT-adjacent bytecode-decode error reachable only with
-  JIT on, and an STW cross-thread-takeover hang during Netty
-  `EventLoopGroup` shutdown reachable only with `--nojit`.
+  one/two layers deeper (both JIT/VM-core, not Infinispan-specific): a
+  JIT-adjacent bytecode-decode error reachable only with JIT on, and a now
+  fixed STW cross-thread-takeover hang during Netty `EventLoopGroup` shutdown
+  reachable only with `--nojit`; see
+  [keycloak-model-stw-takeover-hang-eventloopgroup-shutdown-FIXED.md](keycloak-model-stw-takeover-hang-eventloopgroup-shutdown-FIXED.md).
 
 ## Prerequisite fix bundled in the same commit
 

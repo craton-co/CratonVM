@@ -3691,7 +3691,8 @@ pub(crate) fn register_phase56_summary_stats(r: &mut NativeMethodRegistry) {
 // ---------------------------------------------------------------------------
 // Collectors expansion: maxBy, minBy, mapping, filtering, flatMapping,
 // summarizingInt/Long/Double, toUnmodifiableList/Set/Map, collectingAndThen
-// Collector tags (extending existing):
+// Collector tags. Values 1/2 intentionally match native-collections' core
+// collector engine, which owns Stream.collect(Collector) and Collector.supplier().
 //   9 = MAX_BY (comparator in ARG1)
 //  10 = MIN_BY (comparator in ARG1)
 //  11 = MAPPING (Function in ARG1, downstream Collector in ARG2)
@@ -3699,8 +3700,7 @@ pub(crate) fn register_phase56_summary_stats(r: &mut NativeMethodRegistry) {
 //  13 = SUMMARIZING_INT (ToIntFunction in ARG1)
 //  14 = SUMMARIZING_LONG (ToLongFunction in ARG1)
 //  15 = SUMMARIZING_DOUBLE (ToDoubleFunction in ARG1)
-//  16 = TO_UNMODIFIABLE_LIST
-//  17 = TO_UNMODIFIABLE_SET
+//   1 = TO_UNMODIFIABLE_LIST, 2 = TO_UNMODIFIABLE_SET
 //  18 = COLLECTING_AND_THEN (downstream Collector in ARG1, Function finisher in ARG2)
 // ---------------------------------------------------------------------------
 const P56_COLLECTOR_MAX_BY: i32 = 9;
@@ -3710,8 +3710,8 @@ const P56_COLLECTOR_FILTERING: i32 = 12;
 const P56_COLLECTOR_SUMMARIZING_INT: i32 = 13;
 const P56_COLLECTOR_SUMMARIZING_LONG: i32 = 14;
 const P56_COLLECTOR_SUMMARIZING_DOUBLE: i32 = 15;
-const P56_COLLECTOR_TO_UNMODIFIABLE_LIST: i32 = 16;
-const P56_COLLECTOR_TO_UNMODIFIABLE_SET: i32 = 17;
+const P56_COLLECTOR_TO_UNMODIFIABLE_LIST: i32 = 1;
+const P56_COLLECTOR_TO_UNMODIFIABLE_SET: i32 = 2;
 const P56_COLLECTOR_COLLECTING_AND_THEN: i32 = 18;
 
 pub(crate) fn register_phase56_collectors_extras(r: &mut NativeMethodRegistry) {
@@ -3881,7 +3881,7 @@ pub(crate) fn register_phase56_collectors_extras(r: &mut NativeMethodRegistry) {
         "toUnmodifiableList",
         "()Ljava/util/stream/Collector;",
         |ctx, _args| {
-            let c = alloc_concurrent_synthetic(ctx, "java/util/stream/Collector", 3);
+            let c = alloc_concurrent_synthetic(ctx, "java/util/stream/Collector", 4);
             ctx.set_field(c, 0, Value::Int(P56_COLLECTOR_TO_UNMODIFIABLE_LIST));
             Ok(Some(Value::Object(Some(c))))
         },
@@ -3893,7 +3893,7 @@ pub(crate) fn register_phase56_collectors_extras(r: &mut NativeMethodRegistry) {
         "toUnmodifiableSet",
         "()Ljava/util/stream/Collector;",
         |ctx, _args| {
-            let c = alloc_concurrent_synthetic(ctx, "java/util/stream/Collector", 3);
+            let c = alloc_concurrent_synthetic(ctx, "java/util/stream/Collector", 4);
             ctx.set_field(c, 0, Value::Int(P56_COLLECTOR_TO_UNMODIFIABLE_SET));
             Ok(Some(Value::Object(Some(c))))
         },
@@ -39924,7 +39924,7 @@ fn new13_do_create_socket(
 /// methods have no Code and threw `AbstractMethodError` for any caller that
 /// invoked one directly (e.g. a test wrapper `KeyManager` delegating to the
 /// array `getKeyManagers()` returned — see
-/// `docs/known-issues/tls-ocsp-clientcert-validation-not-enforced.md`,
+/// `docs/internal/fixed-suite-bugs/tls-ocsp-clientcert-validation-not-enforced-FIXED.md`,
 /// "Residual #2 implementation" for the full trace that found this).
 fn kmf_keystore_id_by_identity() -> &'static parking_lot::Mutex<rustc_hash::FxHashMap<i32, i32>> {
     static T: std::sync::OnceLock<parking_lot::Mutex<rustc_hash::FxHashMap<i32, i32>>> =
@@ -41042,8 +41042,8 @@ pub(crate) fn register_p68_ssl(r: &mut NativeMethodRegistry) {
             // tracing against Tomcat's `TestClientCert`/
             // `engine_run_trust_check`'s post-handshake
             // `checkClientTrusted` call — see
-            // `docs/known-issues/tls-ocsp-clientcert-validation-not-
-            // enforced.md`, "Residual #2 implementation" for the full
+            // `docs/internal/fixed-suite-bugs/tls-ocsp-clientcert-validation-not-
+            // enforced-FIXED.md`, "Residual #2 implementation" for the full
             // trace). Fixed the same way as the sibling
             // `KeyManagerFactory.getKeyManagers()` fix just above: build
             // the real, functional `FQN_X509_TM`-shaped object
@@ -41051,7 +41051,10 @@ pub(crate) fn register_p68_ssl(r: &mut NativeMethodRegistry) {
             // produces for the SPI-delegation path, keyed off the SAME
             // `tm_registry` id either `init` overload above (`KeyStore` or
             // `ManagerFactoryParameters`) already registered and stashed
-            // via `tmf_tm_id_by_identity`. Falls back to the old (non-
+            // via `tmf_tm_id_by_identity`. The default/null-initialized path
+            // uses id 0 on the same real-impl-shaped object, which the
+            // `x509_manager` handlers intentionally resolve as platform
+            // default trust roots. This avoids falling back to the old (non-
             // functional but allocation-safe) stub when no id was captured
             // (matches original behavior for `init((KeyStore) null)` / a
             // `getTrustManagers()` call with no preceding `init`).
@@ -41072,27 +41075,8 @@ pub(crate) fn register_p68_ssl(r: &mut NativeMethodRegistry) {
                     ih, tm_id
                 );
             }
-            let tm = if tm_id != 0 {
-                let tm = alloc_concurrent_synthetic(ctx, crate::x509_manager::FQN_X509_TM, 2);
-                crate::x509_manager::set_tm_id(ctx, tm, tm_id);
-                tm
-            } else {
-                // Forward the configured KeyStore into the fallback
-                // TrustManager so chain verification (if anything still
-                // reads this legacy layout) sees the anchors we were told
-                // about. X509TrustManager layout: field 0 = KeyStore
-                // reference (may be null → platform default), field 1 =
-                // provider cookie.
-                let keystore_ref = if ctx.object_num_fields(this) > 1 {
-                    ctx.get_field(this, 1)
-                } else {
-                    Value::Object(None)
-                };
-                let tm = alloc_concurrent_synthetic(ctx, "javax/net/ssl/X509TrustManager", 2);
-                ctx.set_field(tm, 0, keystore_ref);
-                ctx.set_field(tm, 1, Value::Int(0));
-                tm
-            };
+            let tm = alloc_concurrent_synthetic(ctx, crate::x509_manager::FQN_X509_TM, 2);
+            crate::x509_manager::set_tm_id(ctx, tm, tm_id);
             let arr = ctx.new_array(cratonvm_types::ArrayElementType::Reference, 1);
             ctx.set_array_element(arr, 0, Value::Object(Some(tm)));
             Ok(Some(Value::Object(Some(arr))))
@@ -41227,8 +41211,8 @@ pub(crate) fn register_p68_ssl(r: &mut NativeMethodRegistry) {
             // override does exactly this
             // (`manager.chooseClientAlias(keyType, issuers, socket)`,
             // `manager` being whatever `getKeyManagers()` returned) — see
-            // `docs/known-issues/tls-ocsp-clientcert-validation-not-
-            // enforced.md`, "Residual #2 implementation" for the full trace.
+            // `docs/internal/fixed-suite-bugs/tls-ocsp-clientcert-validation-not-
+            // enforced-FIXED.md`, "Residual #2 implementation" for the full trace.
             //
             // Fixed by building the SAME real, natively-backed
             // `FQN_SUN_X509_KM`-shaped object `x509_manager.rs`'s
@@ -57980,6 +57964,48 @@ mod new13_tests {
                 "()[Ljava/security/cert/Certificate;",
             )
             .is_some());
+    }
+
+    #[test]
+    fn trust_manager_factory_default_returns_concrete_x509_impl() {
+        use crate::test_utils::MockNativeContext;
+
+        let r = build_registry();
+        let mut ctx = MockNativeContext::new();
+        let get_instance = r
+            .find(
+                "javax/net/ssl/TrustManagerFactory",
+                "getInstance",
+                "(Ljava/lang/String;)Ljavax/net/ssl/TrustManagerFactory;",
+            )
+            .unwrap();
+        let factory = match get_instance(&mut ctx, &[Value::Object(None)]) {
+            Ok(Some(Value::Object(Some(o)))) => o,
+            other => panic!("getInstance should return a factory, got {other:?}"),
+        };
+        let get_tms = r
+            .find(
+                "javax/net/ssl/TrustManagerFactory",
+                "getTrustManagers",
+                "()[Ljavax/net/ssl/TrustManager;",
+            )
+            .unwrap();
+        let arr = match get_tms(&mut ctx, &[Value::Object(Some(factory))]) {
+            Ok(Some(Value::Object(Some(a)))) => a,
+            other => panic!("getTrustManagers should return an array, got {other:?}"),
+        };
+        let tm = match ctx.get_array_element(arr, 0) {
+            Value::Object(Some(t)) => t,
+            other => panic!("trust manager element should be an object, got {other:?}"),
+        };
+        let tm_class = ctx
+            .class_name_of_id(ctx.class_id_of_object(tm))
+            .unwrap_or_default();
+        assert_eq!(
+            tm_class,
+            crate::x509_manager::FQN_X509_TM,
+            "default TrustManagerFactory must not vend the abstract X509TrustManager interface"
+        );
     }
 
     #[test]

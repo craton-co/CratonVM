@@ -1674,6 +1674,23 @@ fn register_java_nio_access(registry: &mut NativeMethodRegistry) {
         "(Ljava/nio/Buffer;)Z",
         jnio_has_session,
     );
+    // JDK NIO buffer views consult JavaNioAccess.scaleShifts(Buffer) to compute
+    // element-size shifts. Heap/direct buffers used by the Spring STOMP/Netty
+    // path are byte-addressed in CratonVM, so zero is the safe default.
+    registry.register(
+        owner,
+        "scaleShifts",
+        "(Ljava/nio/Buffer;)I",
+        |_ctx, _args| Ok(Some(Value::Int(0))),
+    );
+    // Some real-JDK builds expose the JavaNioAccess anonymous implementation as
+    // Buffer$1 rather than Buffer$2; register both owners to avoid linkage drift.
+    registry.register(
+        "java/nio/Buffer$1",
+        "scaleShifts",
+        "(Ljava/nio/Buffer;)I",
+        |_ctx, _args| Ok(Some(Value::Int(0))),
+    );
     registry.register(
         owner,
         "isThreadConfined",

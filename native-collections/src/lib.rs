@@ -1017,17 +1017,31 @@ fn display_array_class_name(ctx: &dyn NativeContext, obj: ObjectRef) -> String {
 }
 
 /// Unbox a wrapper object (Integer, Long, Boolean, etc.) to its primitive Value.
-/// Returns None if the object is not a recognized 1-field wrapper type.
+/// Returns None if the object is not a recognized JDK wrapper type.
 fn unbox_wrapper(ctx: &dyn NativeContext, obj: ObjectRef) -> Option<Value> {
-    let nf = ctx.object_num_fields(obj);
-    if nf == 1 {
-        let inner = ctx.get_field(obj, 0);
-        match inner {
-            Value::Int(_) | Value::Long(_) | Value::Float(_) | Value::Double(_) => Some(inner),
-            _ => None,
+    let class_name = ctx.class_name_of_id(ctx.class_id_of_object(obj))?;
+    if !matches!(
+        class_name.as_str(),
+        "java/lang/Integer"
+            | "java/lang/Long"
+            | "java/lang/Boolean"
+            | "java/lang/Character"
+            | "java/lang/Byte"
+            | "java/lang/Short"
+            | "java/lang/Float"
+            | "java/lang/Double"
+    ) {
+        return None;
+    }
+
+    if ctx.object_num_fields(obj) != 1 {
+        return None;
+    }
+    match ctx.get_field(obj, 0) {
+        inner @ (Value::Int(_) | Value::Long(_) | Value::Float(_) | Value::Double(_)) => {
+            Some(inner)
         }
-    } else {
-        None
+        _ => None,
     }
 }
 
@@ -10402,14 +10416,19 @@ fn stream_read_chain(ctx: &dyn NativeContext, this: ObjectRef) -> Vec<LazyOp> {
 /// Raw SOURCE elements of a (lazy) synthetic stream — slot 0, BEFORE the op-chain
 /// is applied. Drains a lazy spliterator source first.
 fn stream_source_elems(ctx: &mut dyn NativeContext, this: ObjectRef) -> Vec<Value> {
-    materialize_lazy_stream(ctx, this);
-    match ctx.get_field(this, STREAM_FIELD_ELEMENTS) {
+    let this_pin = ctx.pin_native_root(this);
+    let this_cur = ctx.read_native_pin(this_pin, this);
+    materialize_lazy_stream(ctx, this_cur);
+    let this_cur = ctx.read_native_pin(this_pin, this);
+    let elems = match ctx.get_field(this_cur, STREAM_FIELD_ELEMENTS) {
         Value::Object(Some(arr)) => {
             let len = ctx.array_length(arr);
             (0..len).map(|i| ctx.get_array_element(arr, i)).collect()
         }
         _ => Vec::new(),
-    }
+    };
+    ctx.unpin_native_roots(this_pin);
+    elems
 }
 
 /// Build a lazy derived stream that appends op `(kind, lambda, aux)` to `src`'s
@@ -10423,41 +10442,60 @@ fn stream_make_lazy_derived(
     lambda: Option<ObjectRef>,
     aux: i64,
 ) -> MethodCallResult {
-    materialize_lazy_stream(ctx, src);
-    let source = ctx.get_field(src, STREAM_FIELD_ELEMENTS);
-    let src_chain = if ctx.object_num_fields(src) > STREAM_FIELD_OP_CHAIN {
-        match ctx.get_field(src, STREAM_FIELD_OP_CHAIN) {
+    let src_pin = ctx.pin_native_root(src);
+    let lambda_pin = lambda.map(|l| ctx.pin_native_root(l)).unwrap_or(usize::MAX);
+    let src_cur = ctx.read_native_pin(src_pin, src);
+    materialize_lazy_stream(ctx, src_cur);
+    let src_cur = ctx.read_native_pin(src_pin, src);
+    let source = ctx.get_field(src_cur, STREAM_FIELD_ELEMENTS);
+    let source_pin = pin_value(ctx, source);
+    let src_chain = if ctx.object_num_fields(src_cur) > STREAM_FIELD_OP_CHAIN {
+        match ctx.get_field(src_cur, STREAM_FIELD_OP_CHAIN) {
             Value::Object(Some(a)) => Some(a),
             _ => None,
         }
     } else {
         None
     };
+    let src_chain_pin = src_chain
+        .map(|a| ctx.pin_native_root(a))
+        .unwrap_or(usize::MAX);
     let src_len = match src_chain {
-        Some(a) => ctx.array_length(a),
+        Some(a) => ctx.array_length(ctx.read_native_pin(src_chain_pin, a)),
         None => 0,
     };
     let new_chain = alloc_ref_array(ctx, src_len + 1);
+    let new_chain_pin = ctx.pin_native_root(new_chain);
     if let Some(a) = src_chain {
+        let a = ctx.read_native_pin(src_chain_pin, a);
+        let new_chain = ctx.read_native_pin(new_chain_pin, new_chain);
         for i in 0..src_len {
             let v = ctx.get_array_element(a, i);
             ctx.set_array_element(new_chain, i, v);
         }
     }
     let rec = alloc_synthetic(ctx, "cratonvm/stream/LazyOp", 3);
+    let rec_pin = ctx.pin_native_root(rec);
+    let lambda_cur = lambda.map(|l| ctx.read_native_pin(lambda_pin, l));
+    let rec = ctx.read_native_pin(rec_pin, rec);
     ctx.set_field(rec, 0, Value::Int(kind));
-    ctx.set_field(rec, 1, Value::Object(lambda));
+    ctx.set_field(rec, 1, Value::Object(lambda_cur));
     ctx.set_field(rec, 2, Value::Long(aux));
+    let new_chain = ctx.read_native_pin(new_chain_pin, new_chain);
     ctx.set_array_element(new_chain, src_len, Value::Object(Some(rec)));
     let stream = alloc_synthetic(ctx, "java/util/stream/Stream", STREAM_NUM_FIELDS_LAZY);
-    ctx.set_field(stream, STREAM_FIELD_ELEMENTS, source);
+    let source_cur = read_pinned_elem(ctx, source_pin, source);
+    let new_chain = ctx.read_native_pin(new_chain_pin, new_chain);
+    ctx.set_field(stream, STREAM_FIELD_ELEMENTS, source_cur);
     ctx.set_field(stream, STREAM_FIELD_CLOSE_HANDLERS, Value::Object(None));
     ctx.set_field(
         stream,
         STREAM_FIELD_OP_CHAIN,
         Value::Object(Some(new_chain)),
     );
-    stream_inherit_close_handlers(ctx, src, stream);
+    let src_cur = ctx.read_native_pin(src_pin, src);
+    stream_inherit_close_handlers(ctx, src_cur, stream);
+    ctx.unpin_native_roots(src_pin);
     Ok(Some(Value::Object(Some(stream))))
 }
 
@@ -10477,6 +10515,39 @@ enum PullStep {
 
 type StreamEmit<'a> =
     dyn FnMut(&mut dyn NativeContext, Value) -> Result<PullStep, MethodCallFailed> + 'a;
+
+fn invoke_deferred_stream_lambda(
+    ctx: &mut dyn NativeContext,
+    lambda: ObjectRef,
+    method_name: &str,
+    descriptor: &str,
+    args: &[Value],
+) -> MethodCallResult {
+    let lambda_pin = ctx.pin_native_root(lambda);
+    let (_, arg_handles) = pin_value_slice(ctx, args);
+    let lambda = ctx.read_native_pin(lambda_pin, lambda);
+    let args = read_value_slice(ctx, &arg_handles, args);
+    let result = ctx.invoke_virtual(lambda, method_name, descriptor, &args);
+    ctx.unpin_native_roots(lambda_pin);
+    result
+}
+
+fn pin_lazy_chain_lambdas(ctx: &mut dyn NativeContext, chain: &[LazyOp]) -> Vec<usize> {
+    chain
+        .iter()
+        .map(|op| match op.lambda {
+            Some(lambda) => ctx.pin_native_root(lambda),
+            None => usize::MAX,
+        })
+        .collect()
+}
+
+fn read_lazy_chain_lambda(ctx: &dyn NativeContext, op: &LazyOp, pin: usize) -> Option<ObjectRef> {
+    op.lambda.map(|lambda| match pin {
+        usize::MAX => lambda,
+        _ => ctx.read_native_pin(pin, lambda),
+    })
+}
 
 struct StreamPullState {
     limit_passed: Vec<i64>,
@@ -10504,6 +10575,7 @@ fn stream_process_chain(
     ctx: &mut dyn NativeContext,
     mut cur: Value,
     chain: &[LazyOp],
+    chain_pins: &[usize],
     start: usize,
     state: &mut StreamPullState,
     emit: &mut StreamEmit<'_>,
@@ -10515,27 +10587,41 @@ fn stream_process_chain(
     let mut i = start;
     while i < chain.len() {
         let op = &chain[i];
+        let lambda =
+            read_lazy_chain_lambda(ctx, op, chain_pins.get(i).copied().unwrap_or(usize::MAX));
         match op.kind {
             LAZY_OP_PEEK => {
-                if let Some(l) = op.lambda {
-                    ctx.invoke_virtual(l, "accept", "(Ljava/lang/Object;)V", &[cur])?;
+                if let Some(l) = lambda {
+                    invoke_deferred_stream_lambda(
+                        ctx,
+                        l,
+                        "accept",
+                        "(Ljava/lang/Object;)V",
+                        &[cur],
+                    )?;
                 }
             }
             LAZY_OP_MAP => {
-                if let Some(l) = op.lambda {
-                    cur = ctx
-                        .invoke_virtual(
-                            l,
-                            "apply",
-                            "(Ljava/lang/Object;)Ljava/lang/Object;",
-                            &[cur],
-                        )?
-                        .unwrap_or(Value::Object(None));
+                if let Some(l) = lambda {
+                    cur = invoke_deferred_stream_lambda(
+                        ctx,
+                        l,
+                        "apply",
+                        "(Ljava/lang/Object;)Ljava/lang/Object;",
+                        &[cur],
+                    )?
+                    .unwrap_or(Value::Object(None));
                 }
             }
             LAZY_OP_FILTER => {
-                if let Some(l) = op.lambda {
-                    let t = ctx.invoke_virtual(l, "test", "(Ljava/lang/Object;)Z", &[cur])?;
+                if let Some(l) = lambda {
+                    let t = invoke_deferred_stream_lambda(
+                        ctx,
+                        l,
+                        "test",
+                        "(Ljava/lang/Object;)Z",
+                        &[cur],
+                    )?;
                     if !matches!(t, Some(Value::Int(x)) if x != 0) {
                         return Ok(PullStep::Continue);
                     }
@@ -10551,8 +10637,9 @@ fn stream_process_chain(
                 }
             }
             LAZY_OP_FLAT_MAP => {
-                let mapped = if let Some(l) = op.lambda {
-                    ctx.invoke_virtual(
+                let mapped = if let Some(l) = lambda {
+                    invoke_deferred_stream_lambda(
+                        ctx,
                         l,
                         "apply",
                         "(Ljava/lang/Object;)Ljava/lang/Object;",
@@ -10564,8 +10651,15 @@ fn stream_process_chain(
                 };
                 if let Value::Object(Some(inner_stream)) = mapped {
                     let inner_pin = ctx.pin_native_root(inner_stream);
-                    let pull =
-                        stream_pull_any_downstream(ctx, inner_stream, chain, i + 1, state, emit);
+                    let pull = stream_pull_any_downstream(
+                        ctx,
+                        inner_stream,
+                        chain,
+                        chain_pins,
+                        i + 1,
+                        state,
+                        emit,
+                    );
                     let inner_stream = ctx.read_native_pin(inner_pin, inner_stream);
                     let close = ctx
                         .invoke_virtual(inner_stream, "close", "()V", &[])
@@ -10589,40 +10683,61 @@ fn stream_pull_internal(
     this: ObjectRef,
     emit: &mut StreamEmit<'_>,
 ) -> Result<PullStep, MethodCallFailed> {
-    let base = stream_source_elems(ctx, this);
-    let chain = stream_read_chain(ctx, this);
-    let mut state = stream_new_pull_state(chain.len());
-    for v in base {
-        if stream_limit_saturated(&chain, &state, 0) {
-            return Ok(PullStep::Continue);
+    let stream_pin = ctx.pin_native_root(this);
+    let stream = ctx.read_native_pin(stream_pin, this);
+    let base = stream_source_elems(ctx, stream);
+    let (_, base_pins) = pin_value_slice(ctx, &base);
+    let stream = ctx.read_native_pin(stream_pin, this);
+    let chain = stream_read_chain(ctx, stream);
+    let chain_pins = pin_lazy_chain_lambdas(ctx, &chain);
+
+    let result: Result<PullStep, MethodCallFailed> = (|| {
+        let mut state = stream_new_pull_state(chain.len());
+        for (idx, v) in base.iter().copied().enumerate() {
+            if stream_limit_saturated(&chain, &state, 0) {
+                return Ok(PullStep::Continue);
+            }
+            let v = read_pinned_elem(ctx, base_pins[idx], v);
+            let mut emit_stopped = false;
+            let step = {
+                let mut wrapped_emit =
+                    |c: &mut dyn NativeContext, v: Value| -> Result<PullStep, MethodCallFailed> {
+                        let step = emit(c, v)?;
+                        if step == PullStep::Stop {
+                            emit_stopped = true;
+                        }
+                        Ok(step)
+                    };
+                stream_process_chain(
+                    ctx,
+                    v,
+                    &chain,
+                    &chain_pins,
+                    0,
+                    &mut state,
+                    &mut wrapped_emit,
+                )?
+            };
+            if step == PullStep::Stop {
+                return Ok(if emit_stopped {
+                    PullStep::Stop
+                } else {
+                    PullStep::Continue
+                });
+            }
         }
-        let mut emit_stopped = false;
-        let step = {
-            let mut wrapped_emit =
-                |c: &mut dyn NativeContext, v: Value| -> Result<PullStep, MethodCallFailed> {
-                    let step = emit(c, v)?;
-                    if step == PullStep::Stop {
-                        emit_stopped = true;
-                    }
-                    Ok(step)
-                };
-            stream_process_chain(ctx, v, &chain, 0, &mut state, &mut wrapped_emit)?
-        };
-        if step == PullStep::Stop {
-            return Ok(if emit_stopped {
-                PullStep::Stop
-            } else {
-                PullStep::Continue
-            });
-        }
-    }
-    Ok(PullStep::Continue)
+        Ok(PullStep::Continue)
+    })();
+
+    ctx.unpin_native_roots(stream_pin);
+    result
 }
 
 fn stream_pull_iterator_downstream(
     ctx: &mut dyn NativeContext,
     stream: ObjectRef,
     downstream_chain: &[LazyOp],
+    downstream_chain_pins: &[usize],
     downstream_start: usize,
     downstream_state: &mut StreamPullState,
     emit: &mut StreamEmit<'_>,
@@ -10651,6 +10766,7 @@ fn stream_pull_iterator_downstream(
             ctx,
             next,
             downstream_chain,
+            downstream_chain_pins,
             downstream_start,
             downstream_state,
             emit,
@@ -10666,54 +10782,77 @@ fn stream_pull_synthetic_downstream(
     ctx: &mut dyn NativeContext,
     stream: ObjectRef,
     downstream_chain: &[LazyOp],
+    downstream_chain_pins: &[usize],
     downstream_start: usize,
     downstream_state: &mut StreamPullState,
     emit: &mut StreamEmit<'_>,
 ) -> Result<PullStep, MethodCallFailed> {
+    let stream_pin = ctx.pin_native_root(stream);
+    let stream = ctx.read_native_pin(stream_pin, stream);
     let base = stream_source_elems(ctx, stream);
+    let (_, base_pins) = pin_value_slice(ctx, &base);
+    let stream = ctx.read_native_pin(stream_pin, stream);
     let chain = stream_read_chain(ctx, stream);
-    let mut state = stream_new_pull_state(chain.len());
-    for v in base {
-        if stream_limit_saturated(downstream_chain, downstream_state, downstream_start) {
-            return Ok(PullStep::Stop);
+    let chain_pins = pin_lazy_chain_lambdas(ctx, &chain);
+
+    let result: Result<PullStep, MethodCallFailed> = (|| {
+        let mut state = stream_new_pull_state(chain.len());
+        for (idx, v) in base.iter().copied().enumerate() {
+            if stream_limit_saturated(downstream_chain, downstream_state, downstream_start) {
+                return Ok(PullStep::Stop);
+            }
+            if stream_limit_saturated(&chain, &state, 0) {
+                return Ok(PullStep::Continue);
+            }
+            let v = read_pinned_elem(ctx, base_pins[idx], v);
+            let mut downstream_stopped = false;
+            let step = {
+                let mut downstream_emit =
+                    |c: &mut dyn NativeContext, v: Value| -> Result<PullStep, MethodCallFailed> {
+                        let step = stream_process_chain(
+                            c,
+                            v,
+                            downstream_chain,
+                            downstream_chain_pins,
+                            downstream_start,
+                            downstream_state,
+                            emit,
+                        )?;
+                        if step == PullStep::Stop {
+                            downstream_stopped = true;
+                        }
+                        Ok(step)
+                    };
+                stream_process_chain(
+                    ctx,
+                    v,
+                    &chain,
+                    &chain_pins,
+                    0,
+                    &mut state,
+                    &mut downstream_emit,
+                )?
+            };
+            if step == PullStep::Stop {
+                return Ok(if downstream_stopped {
+                    PullStep::Stop
+                } else {
+                    PullStep::Continue
+                });
+            }
         }
-        if stream_limit_saturated(&chain, &state, 0) {
-            return Ok(PullStep::Continue);
-        }
-        let mut downstream_stopped = false;
-        let step = {
-            let mut downstream_emit =
-                |c: &mut dyn NativeContext, v: Value| -> Result<PullStep, MethodCallFailed> {
-                    let step = stream_process_chain(
-                        c,
-                        v,
-                        downstream_chain,
-                        downstream_start,
-                        downstream_state,
-                        emit,
-                    )?;
-                    if step == PullStep::Stop {
-                        downstream_stopped = true;
-                    }
-                    Ok(step)
-                };
-            stream_process_chain(ctx, v, &chain, 0, &mut state, &mut downstream_emit)?
-        };
-        if step == PullStep::Stop {
-            return Ok(if downstream_stopped {
-                PullStep::Stop
-            } else {
-                PullStep::Continue
-            });
-        }
-    }
-    Ok(PullStep::Continue)
+        Ok(PullStep::Continue)
+    })();
+
+    ctx.unpin_native_roots(stream_pin);
+    result
 }
 
 fn stream_pull_any_downstream(
     ctx: &mut dyn NativeContext,
     stream: ObjectRef,
     downstream_chain: &[LazyOp],
+    downstream_chain_pins: &[usize],
     downstream_start: usize,
     downstream_state: &mut StreamPullState,
     emit: &mut StreamEmit<'_>,
@@ -10728,6 +10867,7 @@ fn stream_pull_any_downstream(
                     ctx,
                     delegate,
                     downstream_chain,
+                    downstream_chain_pins,
                     downstream_start,
                     downstream_state,
                     emit,
@@ -10740,6 +10880,7 @@ fn stream_pull_any_downstream(
             ctx,
             stream,
             downstream_chain,
+            downstream_chain_pins,
             downstream_start,
             downstream_state,
             emit,
@@ -10749,6 +10890,7 @@ fn stream_pull_any_downstream(
             ctx,
             stream,
             downstream_chain,
+            downstream_chain_pins,
             downstream_start,
             downstream_state,
             emit,
@@ -14200,17 +14342,21 @@ fn primitive_iterator_next_value(
     let arr = match ctx.get_field(this, PRIMITIVE_ITERATOR_FIELD_ELEMENTS) {
         Value::Object(Some(arr)) => arr,
         _ => {
-            return Err(cratonvm_types::error::RuntimeError::NoSuchElementException {
-                message: "no more elements".to_string(),
-            }
-            .into())
+            return Err(
+                cratonvm_types::error::RuntimeError::NoSuchElementException {
+                    message: "no more elements".to_string(),
+                }
+                .into(),
+            )
         }
     };
     if cursor >= ctx.array_length(arr) {
-        return Err(cratonvm_types::error::RuntimeError::NoSuchElementException {
-            message: "no more elements".to_string(),
-        }
-        .into());
+        return Err(
+            cratonvm_types::error::RuntimeError::NoSuchElementException {
+                message: "no more elements".to_string(),
+            }
+            .into(),
+        );
     }
     let val = ctx.get_array_element(arr, cursor);
     ctx.set_field(
@@ -18679,6 +18825,12 @@ fn register_linked_list_natives(registry: &mut NativeMethodRegistry) {
     registry.register(c, "size", "()I", native_ll_size);
     registry.register(c, "isEmpty", "()Z", native_ll_is_empty);
     registry.register(c, "contains", "(Ljava/lang/Object;)Z", native_ll_contains);
+    registry.register(
+        c,
+        "removeIf",
+        "(Ljava/util/function/Predicate;)Z",
+        native_ll_remove_if,
+    );
     registry.register(c, "clear", "()V", native_ll_clear);
     registry.register(c, "peek", "()Ljava/lang/Object;", native_ll_peek);
     registry.register(c, "poll", "()Ljava/lang/Object;", native_ll_poll);
@@ -19552,6 +19704,67 @@ fn native_ll_remove_object(ctx: &mut dyn NativeContext, args: &[Value]) -> Metho
         };
     }
     Ok(Some(Value::Int(0)))
+}
+
+/// `LinkedList.removeIf(Predicate)` — remove all nodes whose element satisfies
+/// the predicate. Groovy's SAM detection uses `LinkedList.removeIf` while
+/// pruning inherited abstract methods; if this falls through to a path whose
+/// iterator does not support `remove`, the failure surfaces as an unrelated
+/// reflection `UnsupportedOperationException`.
+fn native_ll_remove_if(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(r))) => *r,
+        _ => return Ok(Some(Value::Int(0))),
+    };
+    let predicate = match args.get(1) {
+        Some(Value::Object(Some(p))) => *p,
+        _ => return Ok(Some(Value::Int(0))),
+    };
+
+    let this_pin = ctx.pin_native_root(this);
+    let pred_pin = ctx.pin_native_root(predicate);
+    let mut removed = false;
+    let mut cur_opt = match ll_get(ctx, this, "head") {
+        Value::Object(Some(r)) => Some(r),
+        _ => None,
+    };
+
+    while let Some(cur) = cur_opt {
+        let next_orig = match ctx.get_field(cur, LL_NODE_NEXT) {
+            Value::Object(Some(n)) => Some(n),
+            _ => None,
+        };
+        let elem_orig = ctx.get_field(cur, LL_NODE_ELEM);
+
+        let cur_pin = ctx.pin_native_root(cur);
+        let next_pin = next_orig.map(|n| ctx.pin_native_root(n));
+        let elem_pin = pin_value(ctx, elem_orig);
+
+        let predicate = ctx.read_native_pin(pred_pin, predicate);
+        let elem = read_pinned_elem(ctx, elem_pin, elem_orig);
+        let verdict = match ctx.invoke_virtual(predicate, "test", "(Ljava/lang/Object;)Z", &[elem])
+        {
+            Ok(v) => v,
+            Err(e) => {
+                ctx.unpin_native_roots(cur_pin);
+                ctx.unpin_native_roots(this_pin);
+                return Err(e);
+            }
+        };
+
+        let next_after = next_orig.map(|n| ctx.read_native_pin(next_pin.unwrap(), n));
+        if matches!(verdict, Some(Value::Int(v)) if v != 0) {
+            let this = ctx.read_native_pin(this_pin, this);
+            let cur = ctx.read_native_pin(cur_pin, cur);
+            ll_unlink_node(ctx, this, cur);
+            removed = true;
+        }
+        cur_opt = next_after;
+        ctx.unpin_native_roots(cur_pin);
+    }
+
+    ctx.unpin_native_roots(this_pin);
+    Ok(Some(Value::Int(if removed { 1 } else { 0 })))
 }
 
 /// `LinkedList.removeLastOccurrence(Object)` — as above but walks from the tail
@@ -28022,6 +28235,12 @@ fn register_concurrent_hashmap_natives(r: &mut NativeMethodRegistry) {
     );
     r.register(
         c,
+        "computeIfPresent",
+        "(Ljava/lang/Object;Ljava/util/function/BiFunction;)Ljava/lang/Object;",
+        native_chm_compute_if_present,
+    );
+    r.register(
+        c,
         "merge",
         "(Ljava/lang/Object;Ljava/lang/Object;Ljava/util/function/BiFunction;)Ljava/lang/Object;",
         native_chm_merge,
@@ -28280,7 +28499,12 @@ fn native_chm_init_default(ctx: &mut dyn NativeContext, args: &[Value]) -> Metho
         Some(Value::Object(Some(o))) => *o,
         _ => return Ok(None),
     };
-    chm_init_segments(ctx, this, CHM_DEFAULT_INIT_SEGMENTS, CHM_DEFAULT_SEGMENT_CAP);
+    chm_init_segments(
+        ctx,
+        this,
+        CHM_DEFAULT_INIT_SEGMENTS,
+        CHM_DEFAULT_SEGMENT_CAP,
+    );
     Ok(None)
 }
 
@@ -28679,6 +28903,33 @@ fn native_chm_compute(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
             let _resize_flag = ChmResizeLockGuard::enter();
             let _guard = ChmMonitorGuard::acquire(ctx, seg);
             native_map_compute(ctx, &[Value::Object(Some(seg)), key, func])
+        }
+        None => Ok(Some(Value::Object(None))),
+    }
+}
+
+fn native_chm_compute_if_present(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(o))) => *o,
+        _ => return Ok(Some(Value::Object(None))),
+    };
+    let key = args.get(1).copied().unwrap_or(Value::Object(None));
+    let func = args.get(2).copied().unwrap_or(Value::Object(None));
+    // JDK ConcurrentHashMap rejects null key and null remappingFunction.
+    if matches!(key, Value::Object(None)) || matches!(func, Value::Object(None)) {
+        return Err(RuntimeError::NullPointerException {
+            message: Some(
+                "ConcurrentHashMap.computeIfPresent: null key or remappingFunction".to_string(),
+            ),
+        }
+        .into());
+    }
+    let hash = chm_key_hash(ctx, &key)?;
+    match chm_segment_for(ctx, this, hash) {
+        Some(seg) => {
+            let _resize_flag = ChmResizeLockGuard::enter();
+            let _guard = ChmMonitorGuard::acquire(ctx, seg);
+            native_map_compute_if_present(ctx, &[Value::Object(Some(seg)), key, func])
         }
         None => Ok(Some(Value::Object(None))),
     }
@@ -30562,13 +30813,23 @@ fn register_unmodifiable_natives(r: &mut NativeMethodRegistry) {
             let desc = "(Ljava/lang/Object;)Ljava/lang/Object;";
             let cb: cratonvm_native_api::NativeCallback = match m {
                 "ceiling" => |ctx, args| {
-                    unmod_delegate(ctx, args, "ceiling", "(Ljava/lang/Object;)Ljava/lang/Object;")
+                    unmod_delegate(
+                        ctx,
+                        args,
+                        "ceiling",
+                        "(Ljava/lang/Object;)Ljava/lang/Object;",
+                    )
                 },
                 "floor" => |ctx, args| {
                     unmod_delegate(ctx, args, "floor", "(Ljava/lang/Object;)Ljava/lang/Object;")
                 },
                 "higher" => |ctx, args| {
-                    unmod_delegate(ctx, args, "higher", "(Ljava/lang/Object;)Ljava/lang/Object;")
+                    unmod_delegate(
+                        ctx,
+                        args,
+                        "higher",
+                        "(Ljava/lang/Object;)Ljava/lang/Object;",
+                    )
                 },
                 _ => |ctx, args| {
                     unmod_delegate(ctx, args, "lower", "(Ljava/lang/Object;)Ljava/lang/Object;")
@@ -32102,11 +32363,17 @@ fn native_collections_extreme(
         _ => return Ok(Some(Value::Object(None))),
     };
     let (data, size) = al_state(ctx, coll);
-    let data = match data {
-        Some(d) => d,
-        None => return Ok(Some(Value::Object(None))),
+    let elems = if let Some(data) = data {
+        let len = size.max(0) as usize;
+        let mut out = Vec::with_capacity(len);
+        for i in 0..len {
+            out.push(ctx.get_array_element(data, i));
+        }
+        out
+    } else {
+        collect_collection_elements_or_real(ctx, coll)
     };
-    if size == 0 {
+    if elems.is_empty() {
         return Err(
             cratonvm_types::error::RuntimeError::NoSuchElementException {
                 message: String::new(),
@@ -32114,9 +32381,8 @@ fn native_collections_extreme(
             .into(),
         );
     }
-    let mut best = ctx.get_array_element(data, 0);
-    for i in 1..size as usize {
-        let elem = ctx.get_array_element(data, i);
+    let mut best = elems[0].clone();
+    for elem in elems.into_iter().skip(1) {
         let cmp = compare_via_compare_to(ctx, &elem, &best)?;
         if (want_max && cmp > 0) || (!want_max && cmp < 0) {
             best = elem;
@@ -38547,6 +38813,8 @@ mod tests {
         struct Shared {
             heap: Vec<HeapEntry>,
             ptr_to_index: HashMap<usize, usize>,
+            object_classes: HashMap<usize, ClassId>,
+            class_names: HashMap<ClassId, String>,
             next_ptr: usize,
             monitors: HashMap<usize, Arc<ObjMonitor>>,
         }
@@ -38556,6 +38824,8 @@ mod tests {
                 Shared {
                     heap: Vec::new(),
                     ptr_to_index: HashMap::new(),
+                    object_classes: HashMap::new(),
+                    class_names: HashMap::new(),
                     next_ptr: 8,
                     monitors: HashMap::new(),
                 }
@@ -38617,6 +38887,14 @@ mod tests {
                 s.alloc_entry(HeapEntry::Object {
                     fields: vec![Value::Int(0); 4],
                 })
+            }
+
+            pub(super) fn define_class(&self, class_id: ClassId, name: &str) {
+                self.shared
+                    .lock()
+                    .unwrap()
+                    .class_names
+                    .insert(class_id, name.to_string());
             }
         }
 
@@ -38680,11 +38958,13 @@ mod tests {
                     fields[index] = value;
                 }
             }
-            fn alloc_object(&mut self, _c: ClassId, num_fields: usize) -> ObjectRef {
+            fn alloc_object(&mut self, c: ClassId, num_fields: usize) -> ObjectRef {
                 let mut s = self.shared.lock().unwrap();
-                s.alloc_entry(HeapEntry::Object {
+                let obj = s.alloc_entry(HeapEntry::Object {
                     fields: vec![Value::Int(0); num_fields],
-                })
+                });
+                s.object_classes.insert(obj.as_ptr() as usize, c);
+                obj
             }
             fn object_num_fields(&self, obj: ObjectRef) -> usize {
                 let s = self.shared.lock().unwrap();
@@ -38776,11 +39056,17 @@ mod tests {
                 o.as_ptr() as i32
             }
             fn record_printed_value(&mut self, _v: Value) {}
-            fn class_name_of_id(&self, _c: ClassId) -> Option<String> {
-                None
+            fn class_name_of_id(&self, c: ClassId) -> Option<String> {
+                self.shared.lock().unwrap().class_names.get(&c).cloned()
             }
-            fn class_id_of_object(&self, _o: ObjectRef) -> ClassId {
-                ClassId::new(0)
+            fn class_id_of_object(&self, o: ObjectRef) -> ClassId {
+                self.shared
+                    .lock()
+                    .unwrap()
+                    .object_classes
+                    .get(&(o.as_ptr() as usize))
+                    .copied()
+                    .unwrap_or_else(|| ClassId::new(0))
             }
             fn capture_stack_trace(&mut self, _h: i32) -> Vec<StackTraceEntry> {
                 Vec::new()
@@ -39036,6 +39322,30 @@ mod tests {
             fn check_deep_reflection_access(&self, _a: ClassId, _t: ClassId) -> Result<(), String> {
                 Ok(())
             }
+        }
+
+        #[test]
+        fn unbox_wrapper_requires_jdk_wrapper_class() {
+            let mut ctx = MockCtx::new(1);
+            let entity_class = ClassId::new(1000);
+            ctx.define_class(entity_class, "example/EntityWithLongId");
+            let entity = ctx.alloc_object(entity_class, 1);
+            ctx.set_field(entity, 0, Value::Long(42));
+
+            assert_eq!(unbox_wrapper(&ctx, entity), None);
+            let expected_identity = ctx.identity_hash_code(entity);
+            assert_eq!(
+                element_hash_code(&mut ctx, &Value::Object(Some(entity))),
+                expected_identity
+            );
+
+            let long_class = ClassId::new(1001);
+            ctx.define_class(long_class, "java/lang/Long");
+            let boxed = ctx.alloc_object(long_class, 1);
+            ctx.set_field(boxed, 0, Value::Long(42));
+
+            assert_eq!(unbox_wrapper(&ctx, boxed), Some(Value::Long(42)));
+            assert_eq!(element_hash_code(&mut ctx, &Value::Object(Some(boxed))), 42);
         }
 
         /// Helper: initialise a fresh LBQ instance with the given capacity.

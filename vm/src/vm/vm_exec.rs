@@ -2708,7 +2708,12 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
         // oldest call still on the stack); reverse so callers see
         // innermost-first, matching `capture_stack_trace`'s `.iter().rev()`
         // convention (see its own callers, e.g. `resolve_caller_class_id`).
-        self.thread.frames.iter().rev().map(|f| f.class_id).collect()
+        self.thread
+            .frames
+            .iter()
+            .rev()
+            .map(|f| f.class_id)
+            .collect()
     }
 
     // -- Heap access methods --
@@ -3619,7 +3624,10 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
         Ok(class_id)
     }
 
-    fn ensure_class_id_initialized(&mut self, class_id: ClassId) -> Result<(), MethodCallFailed> {
+    fn ensure_class_initialized_with_class_id(
+        &mut self,
+        class_id: ClassId,
+    ) -> Result<(), MethodCallFailed> {
         super::ensure_class_initialized_shared(self.shared, self.thread, class_id)
     }
 
@@ -6225,6 +6233,38 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
             } else {
                 self.invoke_or_native(&class_name, method_name, descriptor, &full_args)
             }
+        }
+    }
+
+    fn invoke_virtual_declared(
+        &mut self,
+        declared_class: &str,
+        receiver: ObjectRef,
+        method_name: &str,
+        descriptor: &str,
+        args: &[Value],
+    ) -> MethodCallResult {
+        let result = self.invoke_virtual(receiver, method_name, descriptor, args);
+        match &result {
+            Err(MethodCallFailed::InternalError(VmError::Linkage(
+                LinkageError::NoSuchMethodError {
+                    class_name,
+                    method_name: nsme_method,
+                    method_descriptor,
+                    ..
+                },
+            ))) if class_name == "java/lang/Object"
+                && declared_class != "java/lang/Object"
+                && nsme_method == method_name
+                && method_descriptor == descriptor
+                && !is_object_member(method_name, descriptor) =>
+            {
+                let mut full_args = Vec::with_capacity(1 + args.len());
+                full_args.push(Value::Object(Some(receiver)));
+                full_args.extend_from_slice(args);
+                self.invoke_or_native(declared_class, method_name, descriptor, &full_args)
+            }
+            _ => result,
         }
     }
 
@@ -12609,11 +12649,14 @@ fn invoke_on_class_shared_inner(
                         if let Some(Value::Object(Some(recv))) = args.first().copied() {
                             let recv_cid = shared.heap.class_id_of(recv);
                             let recv_name = store.get(recv_cid).map(|c| &*c.name).unwrap_or("");
-                            if matches!(recv_name, "org/python/core/PyNullImporter" | "org/python/modules/zipimport/zipimporter")
-                                && shared
-                                    .native_methods
-                                    .find(recv_name, method_name, descriptor)
-                                    .is_some()
+                            if matches!(
+                                recv_name,
+                                "org/python/core/PyNullImporter"
+                                    | "org/python/modules/zipimport/zipimporter"
+                            ) && shared
+                                .native_methods
+                                .find(recv_name, method_name, descriptor)
+                                .is_some()
                             {
                                 native = true;
                                 declaring_id_out = recv_cid;
@@ -13090,6 +13133,37 @@ fn invoke_on_class_shared_inner(
                 {
                     return Ok(Some(Value::Object(None)));
                 }
+                // Loader-aware receiver retry: this recursive slow path can be
+                // entered after name-based dispatch picked the global copy of a
+                // class while the heap receiver is a loader-specific copy with
+                // extra bytecode-enhancement interfaces/default methods. Retry
+                // against the receiver's real class before falling through to
+                // CP-interface or native-only rescues.
+                if let Some(Value::Object(Some(recv))) = args.first().copied() {
+                    let recv_cid = shared.heap.class_id_of(recv);
+                    if recv_cid != class_id && recv_cid != ClassId::new(0) {
+                        let cm_recv = shared.class_manager.read();
+                        if let Some((m, declaring_id)) = crate::classloading::find_method_recursive(
+                            recv_cid,
+                            method_name,
+                            descriptor,
+                            &cm_recv.class_store,
+                        ) {
+                            if !m.is_abstract() && !m.is_static() {
+                                drop(cm_recv);
+                                return invoke_on_class_shared(
+                                    shared,
+                                    thread,
+                                    declaring_id,
+                                    method_name,
+                                    descriptor,
+                                    args,
+                                );
+                            }
+                        }
+                    }
+                }
+
                 // KAFKA-DEFAULT-RESCUE: invokeinterface on a receiver whose
                 // runtime class is bare `java/lang/Object` (a synthetic
                 // ServiceLoader provider stub) can land here when the target

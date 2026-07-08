@@ -4662,6 +4662,42 @@ fn jit_deny_filter() -> Option<&'static Vec<String>> {
         .as_ref()
 }
 
+fn jit_allow_packages_filter() -> &'static Vec<String> {
+    use std::sync::OnceLock;
+    static CACHE: OnceLock<Vec<String>> = OnceLock::new();
+    CACHE.get_or_init(|| {
+        std::env::var("CRATONVM_JIT_ALLOW_PACKAGES")
+            .ok()
+            .map(|s| {
+                s.split(',')
+                    .map(|entry| entry.trim().to_string())
+                    .filter(|entry| !entry.is_empty())
+                    .collect()
+            })
+            .unwrap_or_default()
+    })
+}
+
+fn jit_allow_entry_allows_prefix(entry: &str, prefix: &str) -> bool {
+    !entry.is_empty() && prefix.starts_with(entry)
+}
+
+fn jit_allow_package(prefix: &str) -> bool {
+    jit_allow_packages_filter()
+        .iter()
+        .any(|entry| jit_allow_entry_allows_prefix(entry, prefix))
+}
+
+fn hibernate_temporal_jit_deny_prefix(class_name: &str) -> Option<&'static str> {
+    const SLASH_PREFIX: &str = "org/hibernate/";
+    const DOT_PREFIX: &str = "org.hibernate.";
+    if class_name.starts_with(SLASH_PREFIX) {
+        Some(SLASH_PREFIX)
+    } else {
+        class_name.starts_with(DOT_PREFIX).then_some(DOT_PREFIX)
+    }
+}
+
 /// Diagnostic: number of `try_compile` calls short-circuited because
 /// the method was already bail-listed.  Each short-circuit saves the
 /// ~50µs we'd otherwise have spent re-running scan/IR/lowering only to
@@ -4918,6 +4954,18 @@ pub fn try_compile(
     ) {
         JIT_BAIL_SHORTCIRCUITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         return None;
+    }
+
+    // HIB-TEMPORAL.1 (2026-07-08): final fail-closed Hibernate guard. The VM
+    // skip-list catches most eligibility paths, but tiered/background compile
+    // can still reach this crate's final `try_compile` gate. The proven stable
+    // control for the temporal residuals is exactly the same shape as
+    // `CRATONVM_JIT_DENY=org/hibernate/`, so keep Hibernate bytecode interpreted
+    // here too unless the package is explicitly allowed for bisection.
+    if let Some(prefix) = hibernate_temporal_jit_deny_prefix(&cached.class_name) {
+        if !jit_allow_package(prefix) {
+            return None;
+        }
     }
 
     // DBG (RandomizedContext WeakHashMap JIT investigation, 2026-07-02):
@@ -7238,6 +7286,35 @@ pub fn invokestatic_self_call_uses_tail_jump(code: &[u8], code_len: usize, pc: u
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn hibernate_temporal_jit_deny_matches_slash_and_dot_names() {
+        assert_eq!(
+            hibernate_temporal_jit_deny_prefix("org/hibernate/dialect/H2Dialect"),
+            Some("org/hibernate/")
+        );
+        assert_eq!(
+            hibernate_temporal_jit_deny_prefix("org.hibernate.dialect.H2Dialect"),
+            Some("org.hibernate.")
+        );
+        assert_eq!(hibernate_temporal_jit_deny_prefix("org/example/Foo"), None);
+    }
+
+    #[test]
+    fn hibernate_temporal_jit_allow_entries_are_prefix_based() {
+        assert!(jit_allow_entry_allows_prefix(
+            "org/hibernate/",
+            "org/hibernate/"
+        ));
+        assert!(jit_allow_entry_allows_prefix(
+            "org.hibernate.",
+            "org.hibernate."
+        ));
+        assert!(!jit_allow_entry_allows_prefix(
+            "org/hibernate/",
+            "org.hibernate."
+        ));
+    }
 
     /// BUG-1 companion — routing of NON-tail static self-recursive call sites.
     ///

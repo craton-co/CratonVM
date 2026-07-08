@@ -4,6 +4,35 @@ This folder collects CratonVM-only defects found while running upstream Java
 suites. The docs had grown to describe the **same underlying bug from several
 angles**; this index is the consolidated map. Read it first.
 
+## 2026-07-07 Five new Spring non-passed-rerun bugs (Azure host, dev, real-JDK/JIT-on)
+
+Found triaging FAIL results from a 516-class Spring non-passed rerun (filtered
+out ~250 environmental classpath-dump gaps first — missing cross-module
+Spring test-fixture jars, not CratonVM bugs). All 5 below are genuine,
+distinct CratonVM defects, still OPEN, no fix attempted yet:
+
+- OPEN: [`web-x509trustmanager-getacceptedissuers-abstractmethoderror.md`](web-x509trustmanager-getacceptedissuers-abstractmethoderror.md) — `X509TrustManager.getAcceptedIssuers()` AbstractMethodError, identical across all 4 HTTP server backends in one WebFlux test.
+- OPEN: [`groovy-compilationunit-phaseoperation-abstractmethoderror.md`](groovy-compilationunit-phaseoperation-abstractmethoderror.md) — Groovy `CompilationUnit$PhaseOperation.doPhaseOperation` AbstractMethodError, 4 `GroovyScriptFactoryTests` methods.
+- OPEN: [`stomp-bufferingdecoder-atomicinteger-count-npe.md`](stomp-bufferingdecoder-atomicinteger-count-npe.md) — `BufferingStompDecoder`'s `count` `AtomicInteger` field null, 5 STOMP decoder test methods.
+- OPEN: [`linkedcaseinsensitivemap-deserialize-this0-npe.md`](linkedcaseinsensitivemap-deserialize-this0-npe.md) — `LinkedCaseInsensitiveMap` inner-class `this$0` null after deserialize; related but distinct from the FIXED `removeEldestEntry`-dispatch-to-`Object` NSME below.
+- OPEN: [`reflection-arenestmates-missing-native.md`](reflection-arenestmates-missing-native.md) — `jdk.internal.reflect.Reflection.areNestMates` has no native registered at all.
+
+Also confirmed (not new, corroborating evidence only, no new doc needed):
+`expression.spel.*` SpEL `EL1040E` double-literal-suffix parse failures (33
+occurrences, matches an already-known SpEL bug); `NoSuchMethodError:
+Object.accept/Object.test` in `SpelCompilerTests`/`BeanOverrideHandlerTests`
+matches the general JIT wrong-receiver-type/virtual-dispatch bug called out
+in `docs/internal/fixed-suite-bugs/jit-osr-linux-regression-triad.md` (that
+doc's top-level FIXED status covers only one narrow OSR-entry sub-case; this
+broader dispatch signature is explicitly noted there as still needing a
+general-path fix) — new evidence it also hits Spring, not just Hibernate.
+
+## 2026-07-08 Hibernate bytecode-enhancement loader/lazytoone family retired; residual basic/merge/version bugs split out
+## 2026-07-08 Hibernate bytecode-enhancement loader/lazytoone and residual basic/merge/version bugs retired
+
+- FIXED/RETIRED: [`hib-bytecode-enhancement-loader-faithful-linking-FIXED.md`](../internal/fixed-suite-bugs/hib-bytecode-enhancement-loader-faithful-linking-FIXED.md) - the remaining loader-faithful lazy/lazytoone failures are closed: 18/18 representative sample and 69/69 lazy/lazytoone subset pass, and the graph same-name checkcast residual now passes.
+- FIXED/RETIRED: [`hib-bytecode-enhancement-basic-merge-version-residuals-FIXED.md`](../internal/fixed-suite-bugs/hib-bytecode-enhancement-basic-merge-version-residuals-FIXED.md) - the six non-lazy basic dirty tracking, final-field embedded-id, composite merge/null, and versioned-entity residuals now pass.
+
 ## 2026-07-08 `InPredicateTest` LHM NSME and stale timeout notes retired
 
 - ✅ FIXED: [`DomainParameterXref` `LinkedHashMap.removeEldestEntry` NSME](../internal/fixed-suite-bugs/hib-domainparameterxref-lhm-removeeldestentry-nsme-FIXED.md) — fresh Azure `dev@47bbdc3b` reproduced the slot-0/`java.lang.Object` class-id read and `Object.removeEldestEntry` NSME (`ok=0`, 33.697s). The LHM native now skips that impossible virtual call while preserving real subclass eviction hooks; the fixed probe still sees the slot-0 read but passes (`ok=1`, 55.971s).
@@ -90,15 +119,14 @@ All three verified against their real Keycloak classes via the suite runner; no 
   originally-reported NPE is gone (gets through the entire cache-manager
   bootstrap/use/teardown lifecycle under `--nojit`). Doc:
   [`docs/internal/fixed-suite-bugs/keycloak-model-infinispan-cache-config-null-after-real-start-FIXED.md`](../internal/fixed-suite-bugs/keycloak-model-infinispan-cache-config-null-after-real-start-FIXED.md).
-- Two new, **distinct and unrelated** (JIT/VM-core, not Infinispan-specific)
-  residuals surfaced once the fix let `RealmModelTest` run much further:
+- One new, **distinct and unrelated** (JIT/VM-core, not Infinispan-specific)
+  residual remains open from the deeper `RealmModelTest` path:
   [keycloak-model-infinispan-jit-adjacent-decode-error-fullname.md](keycloak-model-infinispan-jit-adjacent-decode-error-fullname.md)
   (JIT-only bytecode-decode error, reachable only with JIT on — a
-  JIT-compiled caller appears to corrupt an interpreted callee's frame) and
-  [keycloak-model-stw-takeover-hang-eventloopgroup-shutdown.md](keycloak-model-stw-takeover-hang-eventloopgroup-shutdown.md)
-  (an STW cross-thread-takeover safepoint hang during Netty `EventLoopGroup`
-  shutdown, reachable only with `--nojit`, once the JIT bug above is worked
-  around).
+  JIT-compiled caller appears to corrupt an interpreted callee's frame). The
+  `--nojit` STW shutdown hang that surfaced alongside it is now fixed and
+  retired to
+  [`docs/internal/fixed-suite-bugs/keycloak-model-stw-takeover-hang-eventloopgroup-shutdown-FIXED.md`](../internal/fixed-suite-bugs/keycloak-model-stw-takeover-hang-eventloopgroup-shutdown-FIXED.md).
 
 ## 2026-07-07 GC blocked-thread / stale-Thread-mirror doc RETIRED; real-net GC-blocking audit completed
 
@@ -128,9 +156,12 @@ All three verified against their real Keycloak classes via the suite runner; no 
   [`docs/internal/hib-temporal-sql-parameter-placeholder-duplication-FIXED.md`](../internal/hib-temporal-sql-parameter-placeholder-duplication-FIXED.md);
   the reason-8 saga's remaining follow-ups stay tracked in
   [jit-invokedynamic-uncommon-trap-precise-resume-groovy-regression-FIXED.md](../internal/jit-invokedynamic-uncommon-trap-precise-resume-groovy-regression-FIXED.md);
-  two unmasked PRE-EXISTING temporal residuals (37× `DdlTypeImpl.getRawTypeName` NPE in
-  InstantTests, 2× empty `IllegalThreadStateException`) are tracked in
-  [hib-temporal-residuals-typename-npe-illegalthreadstate.md](hib-temporal-residuals-typename-npe-illegalthreadstate.md).
+  the two unmasked PRE-EXISTING temporal residuals (37× `DdlTypeImpl.getRawTypeName` NPE in
+  InstantTests, 2× empty `IllegalThreadStateException`) are now fixed by the conservative
+  Hibernate JIT guard and retired to
+  [hib-temporal-residuals-typename-npe-illegalthreadstate-FIXED.md](../internal/fixed-suite-bugs/hib-temporal-residuals-typename-npe-illegalthreadstate-FIXED.md).
+  The later `LocalDateTimeTest` DST/H2 residuals are also fixed and retired to
+  [hib-temporal-localdatetime-dst-h2-local4-residuals-FIXED.md](../internal/fixed-suite-bugs/hib-temporal-localdatetime-dst-h2-local4-residuals-FIXED.md).
 
 ## 2026-07-06/07 http.client class_manager RwLock recursive-read deadlock — FIXED (branch fix/class-manager-writer-starvation-20260706)
 
@@ -256,9 +287,10 @@ objects unconditionally), is now **also FIXED** (2026-07-06). `RealmModelTest`
 then reached a distinct residual one layer deeper, in the same "synthetic
 native shim intercepts a real object" family,
 [Infinispan Cache.config null after real DefaultCacheManager.start()](../internal/fixed-suite-bugs/keycloak-model-infinispan-cache-config-null-after-real-start-FIXED.md),
-now **also FIXED** (2026-07-06) — see the top of this file for the two new
-residuals (JIT-only decode error, `--nojit`-only STW shutdown hang) it
-uncovered one/two layers deeper still.
+now **also FIXED** (2026-07-06); see the top of this file for the remaining
+JIT-only decode residual it uncovered. The sibling `--nojit` STW shutdown hang
+is now fixed and retired to
+[`docs/internal/fixed-suite-bugs/keycloak-model-stw-takeover-hang-eventloopgroup-shutdown-FIXED.md`](../internal/fixed-suite-bugs/keycloak-model-stw-takeover-hang-eventloopgroup-shutdown-FIXED.md).
 Not CratonVM bugs: 543 FAILs (`testsuite/integration-arquillian/tests/base`
 + `tests/other/sssd`, exhaustively confirmed - 543/544 exact match, the 544th
 is the System Rules finding above) are "Not found frontend container:
@@ -863,12 +895,12 @@ JIT divide-by-zero re-run) has since been fixed; the other two remain open:
   builds a filtered default runtime closure for the provider and prunes stale
   service-descriptor-only output dirs. Historical record moved to
   [../internal/fixed-suite-bugs/keycloak-testframework-enterprisedb-supplier-noclassdef.md](../internal/fixed-suite-bugs/keycloak-testframework-enterprisedb-supplier-noclassdef.md).
-- [keycloak-universal-classpath-post-enterprisedb-residuals.md](keycloak-universal-classpath-post-enterprisedb-residuals.md) -
-  OPEN. Later residuals after the EnterpriseDB supplier fix:
-  HotSpot now reaches `UITestFrameworkExtension` and misses Selenium
-  `org/openqa/selenium/WebDriver`; CratonVM reaches Keycloak server startup
-  and misses the Quarkus Maven resolver path behind
-  `BootstrapMavenContext.config()`.
+- **Keycloak universal classpath post-EnterpriseDB residuals** -
+  FIXED (2026-07-08). The generator now adds filtered Selenium/UI and
+  Quarkus Maven resolver closures, and the suite runner orders selected module
+  output dirs before `kc-runner` for pathing jars so Keycloak resolves Maven
+  artifacts from the correct module. Historical record moved to
+  [../internal/fixed-suite-bugs/keycloak-universal-classpath-post-enterprisedb-residuals.md](../internal/fixed-suite-bugs/keycloak-universal-classpath-post-enterprisedb-residuals.md).
 
 ## Keycloak post-PreviewFeatures rerun (2026-07-03)
 
@@ -911,8 +943,10 @@ PreviewFeatures native crash. The remaining non-passed rows are tracked here:
   [Infinispan JGroupsTransport.start() never invoked](../internal/fixed-suite-bugs/keycloak-model-jgroupstransport-start-never-invoked-FIXED.md),
   now FIXED. `RealmModelTest` then reached a distinct residual,
   [Infinispan Cache.config null after real DefaultCacheManager.start()](../internal/fixed-suite-bugs/keycloak-model-infinispan-cache-config-null-after-real-start-FIXED.md),
-  now ALSO FIXED (2026-07-06) — see the top of this file for the two new
-  residuals it uncovered one/two layers deeper still.
+  now ALSO FIXED (2026-07-06); see the top of this file for the remaining
+  JIT-only decode residual it uncovered. The sibling `--nojit` STW shutdown
+  hang is now retired to
+  [keycloak-model-stw-takeover-hang-eventloopgroup-shutdown-FIXED.md](../internal/fixed-suite-bugs/keycloak-model-stw-takeover-hang-eventloopgroup-shutdown-FIXED.md).
 - [keycloak-sssd-system1-findbootstrapclassornull-nosuchmethod.md](keycloak-sssd-system1-findbootstrapclassornull-nosuchmethod.md) -
   2 `FAIL` rows in the SSSD module, missing
   `java/lang/System$1.findBootstrapClassOrNull(String)Class`.

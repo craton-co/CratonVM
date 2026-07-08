@@ -2307,6 +2307,68 @@ pub(crate) fn update_root_snapshot(shared: &SharedVm, thread: &mut JvmThread) {
     }
 }
 
+#[cfg(test)]
+mod root_snapshot_cache_tests {
+    use super::*;
+    use crate::config::VmConfig;
+    use crate::threading::jvm_thread::ThreadId;
+
+    fn frame(code: Vec<u8>, method_name: &str) -> Frame {
+        Frame::new(
+            ClassId::new(0),
+            "T".to_string(),
+            method_name.to_string(),
+            "()V".to_string(),
+            None,
+            code,
+            vec![],
+            8,
+            4,
+            &[],
+        )
+    }
+
+    #[test]
+    fn local_write_invalidates_cached_deep_frame_roots() {
+        if !crate::runtime::env_cache::rootsnap_cache() {
+            return;
+        }
+
+        let shared = SharedVm::new(VmConfig::default());
+        let mut thread = JvmThread::new(ThreadId(0), "root-snapshot-cache-test");
+
+        // Frame 0 reads LOCAL[2] at pc 0, so the normal local-liveness filter
+        // must keep that slot live. Frames 1 and 2 make frame 0 reusable by the
+        // frozen-frame cache; the current top is never cached.
+        thread
+            .frames
+            .push(frame(vec![0x2c, 0x57, 0xb1], "deep")); // aload_2; pop; return
+        thread.frames.push(frame(vec![0xb1], "middle"));
+        thread.frames.push(frame(vec![0xb1], "top"));
+
+        update_root_snapshot(&shared, &mut thread);
+        assert_eq!(thread.rs_cache.len(), 2);
+        assert!(thread.rs_cache[0].1.is_empty());
+
+        let obj = shared.heap.alloc_object(ClassId::new(7), 0);
+        let obj_addr = obj.as_ptr();
+        let cached_key = thread.rs_cache[0].0;
+        thread.frames[0].set_local_unchecked(2, Value::Object(Some(obj)));
+        assert_ne!(
+            (thread.frames[0].seq, thread.frames[0].exec_epoch),
+            cached_key,
+            "a local write must invalidate this frame's cached root set"
+        );
+
+        update_root_snapshot(&shared, &mut thread);
+        let snapshot = thread.root_snapshot.lock();
+        assert!(
+            snapshot.iter().any(|root| root.as_ptr() == obj_addr),
+            "updated root snapshot must include the object stored into deep LOCAL[2]"
+        );
+    }
+}
+
 /// Check if a stop-the-world pause is requested and participate if so.
 ///
 /// Called at safepoints: allocation sites and backward branches (loop iterations).
@@ -12171,7 +12233,16 @@ fn execute_instruction(
                         )
                     }
                 })?;
-            let field = resolve_field_ref(shared, current_class_id, *index)?;
+            let mut field = resolve_field_ref(shared, current_class_id, *index)?;
+            if let Some(retargeted) = retarget_instance_field_to_receiver(
+                shared,
+                current_class_id,
+                *index,
+                shared.heap.class_id_of(obj_ref),
+                &field,
+            ) {
+                field = retargeted;
+            }
             // Perf: ALL of the per-getfield diagnostic blocks below are gated
             // behind a SINGLE cached "any field diagnostic enabled" branch, so
             // the common no-diagnostics case (the overwhelmingly hot path) does
@@ -12415,7 +12486,7 @@ fn execute_instruction(
             // for the tag-exact value pop below. resolve_field_ref is
             // stack-neutral, and surfacing a resolution error here (before the
             // value/objectref pop) is spec-compliant for putfield.
-            let field = resolve_field_ref(shared, current_class_id, *index)?;
+            let mut field = resolve_field_ref(shared, current_class_id, *index)?;
             // K2 (T10.9.E) — tag-exact pop for category-2 primitives.
             //
             // The stack top before putfield is [..., objectref, value] (with
@@ -12566,6 +12637,15 @@ fn execute_instruction(
                 }
             }
             let obj_ref = obj_ref?;
+            if let Some(retargeted) = retarget_instance_field_to_receiver(
+                shared,
+                current_class_id,
+                *index,
+                shared.heap.class_id_of(obj_ref),
+                &field,
+            ) {
+                field = retargeted;
+            }
             // Perf: ALL of the per-putfield diagnostic blocks below are gated
             // behind a SINGLE cached "any field diagnostic enabled" branch, so
             // the common no-diagnostics case (the overwhelmingly hot path) does
@@ -13394,6 +13474,12 @@ fn execute_instruction(
                             .class_manager
                             .read()
                             .is_subclass_of(obj_class_id, target_class_id)
+                            || loader_aware_name_assignable(
+                                shared,
+                                obj_class_id,
+                                target_class_id,
+                                &target_class_name,
+                            )
                             || lambda_proxy_satisfies(shared, obj_class_id, target_class_id)
                             || synthetic_implements(shared, obj_class_id, &target_class_name)
                             || proxy_instance_satisfies_target(shared, obj_ref, &target_class_name)
@@ -13557,6 +13643,12 @@ fn execute_instruction(
                             .class_manager
                             .read()
                             .is_subclass_of(obj_class_id, target_class_id)
+                            || loader_aware_name_assignable(
+                                shared,
+                                obj_class_id,
+                                target_class_id,
+                                &target_class_name,
+                            )
                             || lambda_proxy_satisfies(shared, obj_class_id, target_class_id)
                             || synthetic_implements(shared, obj_class_id, &target_class_name)
                             || proxy_instance_satisfies_target(shared, obj_ref, &target_class_name)
@@ -14035,6 +14127,61 @@ fn lambda_proxy_satisfies(
     false
 }
 
+fn loader_aware_name_assignable(
+    shared: &SharedVm,
+    obj_class_id: ClassId,
+    target_class_id: ClassId,
+    target_class_name: &str,
+) -> bool {
+    if !crate::runtime::env_cache::loader_aware_resolution()
+        || is_global_resolution_namespace(target_class_name)
+    {
+        return false;
+    }
+
+    let cm = shared.class_manager.read();
+    let Some(obj_class) = cm.get_class(obj_class_id) else {
+        return false;
+    };
+    let Some(target_class) = cm.get_class(target_class_id) else {
+        return false;
+    };
+
+    if &*obj_class.name == target_class_name && &*target_class.name == target_class_name {
+        return true;
+    }
+    if !target_class.is_interface() {
+        return false;
+    }
+
+    let mut queue: Vec<ClassId> = Vec::new();
+    let mut current = Some(obj_class_id);
+    while let Some(cid) = current {
+        let Some(class) = cm.class_store.get(cid) else {
+            break;
+        };
+        queue.extend_from_slice(&class.interfaces);
+        current = class.superclass;
+    }
+
+    let mut seen: Vec<ClassId> = Vec::new();
+    while let Some(iface_id) = queue.pop() {
+        if seen.contains(&iface_id) {
+            continue;
+        }
+        seen.push(iface_id);
+        let Some(iface) = cm.class_store.get(iface_id) else {
+            continue;
+        };
+        if &*iface.name == target_class_name {
+            return true;
+        }
+        queue.extend_from_slice(&iface.interfaces);
+    }
+
+    false
+}
+
 // ---------------------------------------------------------------------------
 // Helper: array type compatibility for checkcast/instanceof
 // ---------------------------------------------------------------------------
@@ -14265,15 +14412,25 @@ pub(crate) fn aastore_element_assignable(
     if value_class_id == ClassId::new(0) {
         return true;
     }
-    let comp_id = match shared.class_manager.read().find_class_by_name(comp_name) {
-        Some(id) => id,
-        // Component class not loaded yet — load it; failure to load means we
-        // cannot prove incompatibility, so allow the store.
-        None => match shared.class_manager.write().load_class(comp_name) {
-            Ok(id) => id,
-            Err(_) => return true,
-        },
-    };
+    let array_component_class_id = shared.heap.class_id_of(array_ref);
+    let comp_id = {
+        let cm = shared.class_manager.read();
+        if array_component_class_id != ClassId::new(0) {
+            cm.get_class(array_component_class_id)
+                .filter(|c| &*c.name == comp_name)
+                .map(|_| array_component_class_id)
+        } else {
+            None
+        }
+    }
+    .or_else(|| shared.class_manager.read().find_class_by_name(comp_name))
+    .unwrap_or_else(|| match shared.class_manager.write().load_class(comp_name) {
+        Ok(id) => id,
+        Err(_) => ClassId::new(0),
+    });
+    if comp_id == ClassId::new(0) {
+        return true;
+    }
     // The element class must exist in the hierarchy; if not, fail open.
     {
         let cm = shared.class_manager.read();
@@ -15451,6 +15608,63 @@ fn resolve_field_ref(
     Ok(resolved)
 }
 
+fn retarget_instance_field_to_receiver(
+    shared: &SharedVm,
+    current_class_id: ClassId,
+    cp_index: u16,
+    receiver_class_id: ClassId,
+    field: &ResolvedField,
+) -> Option<ResolvedField> {
+    if field.is_static
+        || receiver_class_id == ClassId::new(0)
+        || receiver_class_id == field.declaring_class_id
+        || !should_use_loader_initiated_resolution(shared, current_class_id)
+    {
+        return None;
+    }
+
+    let cm = shared.class_manager.read();
+    let current_class = cm.get_class(current_class_id)?;
+    let name_and_type_index = match current_class.constant_pool.get(cp_index)? {
+        ConstantPoolEntry::FieldReference {
+            name_and_type_index,
+            ..
+        } => *name_and_type_index,
+        _ => return None,
+    };
+    let (field_name, descriptor) = current_class.constant_pool.get_name_and_type(name_and_type_index)?;
+    let resolved_decl = cm.get_class(field.declaring_class_id)?;
+    let receiver_class = cm.get_class(receiver_class_id)?;
+    if &*receiver_class.name != &*resolved_decl.name {
+        return None;
+    }
+
+    let mut cursor = Some(receiver_class_id);
+    while let Some(cid) = cursor {
+        let class = cm.class_store.get(cid)?;
+        let mut instance_idx = 0usize;
+        for f in &class.fields {
+            if f.is_static() {
+                continue;
+            }
+            if &*f.name == field_name && &*f.descriptor == descriptor {
+                return Some(ResolvedField {
+                    declaring_class_id: cid,
+                    field_index: class.first_field_index + instance_idx,
+                    is_static: false,
+                    is_volatile: f.is_volatile(),
+                    is_reference: f.descriptor.starts_with('L') || f.descriptor.starts_with('['),
+                    desc_byte: f.descriptor.as_bytes().first().copied().unwrap_or(0),
+                });
+            }
+            instance_idx += 1;
+        }
+        cursor = class.superclass;
+    }
+
+    None
+}
+
 /// Extract the declaring class name from a constant pool FieldReference.
 ///
 /// Used at the getstatic/putstatic opcode boundary to build a
@@ -16126,9 +16340,11 @@ fn execute_invoke_kind(
     // hierarchy. The slot is also left unset when the resolved class isn't
     // an interface so a malformed CP entry can't poison nested dispatch.
     let cp_resolved_class_id: Option<ClassId> = if is_interface {
-        let cm = shared.class_manager.read();
-        cm.get_loaded_class_id(&method_class_name)
-            .and_then(|cid| cm.get_class(cid).filter(|c| c.is_interface()).map(|_| cid))
+        let loaded = shared.class_manager.write().load_class(&method_class_name).ok();
+        loaded.and_then(|cid| {
+            let cm = shared.class_manager.read();
+            cm.get_class(cid).filter(|c| c.is_interface()).map(|_| cid)
+        })
     } else {
         None
     };
@@ -17195,24 +17411,50 @@ fn execute_invoke_kind(
             })
         } else if is_special && crate::runtime::env_cache::loader_aware_resolution() {
             // invokespecial owner is the CP-resolved class NAME (`method_class_name`),
-            // which `get_loaded_class_id` collapses to ONE copy per name — the
-            // un-enhanced global one. A `super.<method>()` / `super.<init>()` /
-            // private call from inside a per-loader ENHANCED class must reach the
-            // SAME loader's copy of the owner: e.g. enhanced
-            // `Employee.$$_hibernate_read_oca` calls `super.$$_hibernate_read_oca()`
-            // on the enhanced (mapped-superclass) `Person`, whose accessor exists
-            // ONLY on that loader's copy — name resolution picks the un-enhanced
-            // `Person` (no such method → hard NoSuchMethodError → process abort).
-            // Resolve the owner through the CALLER's loader (JVMS §5.4.3 initiating
-            // loader) and override dispatch when it diverges from the name-resolved
-            // copy. Gated + divergence-only → byte-identical gate-off / single-copy.
-            lookup_loader_initiated(shared, current_class_id, &invoke_class).filter(|owner_cid| {
-                *owner_cid != ClassId::new(0)
-                    && shared
-                        .class_manager
-                        .read()
-                        .get_loaded_class_id(&invoke_class)
-                        != Some(*owner_cid)
+            // which `get_loaded_class_id` collapses to ONE copy per name. Super and
+            // private calls from inside a loader-private enhanced class must reach
+            // that same loader's owner copy. For self-constructors, the receiver is
+            // more precise than the caller: a global harness class can execute
+            // `new C; invokespecial C.<init>` where `new` correctly allocated a
+            // loader-private enhanced C. Running the global C constructor against
+            // that receiver writes the wrong layout slots and leaves enhanced fields
+            // null.
+            let receiver_self_ctor = if &*method_name == "<init>" {
+                match args.first() {
+                    Some(Value::Object(Some(recv))) => {
+                        let recv_cid = shared.heap.class_id_of(*recv);
+                        if recv_cid != ClassId::new(0) {
+                            let cm = shared.class_manager.read();
+                            let recv_matches_owner = cm
+                                .get_class(recv_cid)
+                                .map(|c| {
+                                    &*c.name == &*invoke_class
+                                        && c.find_method(&method_name, &method_descriptor).is_some()
+                                })
+                                .unwrap_or(false);
+                            if recv_matches_owner {
+                                Some(recv_cid)
+                            } else {
+                                None
+                            }
+                        } else {
+                            None
+                        }
+                    }
+                    _ => None,
+                }
+            } else {
+                None
+            };
+            receiver_self_ctor.or_else(|| {
+                lookup_loader_initiated(shared, current_class_id, &invoke_class).filter(|owner_cid| {
+                    *owner_cid != ClassId::new(0)
+                        && shared
+                            .class_manager
+                            .read()
+                            .get_loaded_class_id(&invoke_class)
+                            != Some(*owner_cid)
+                })
             })
         } else {
             None
@@ -21684,8 +21926,8 @@ fn execute_invokestatic(
     // — the bug needs a SELF-call inside the closure body, not merely
     // distinct closure identity).
     //
-    // `self_class_id` feeds BOTH the class-init step below and the
-    // `try_stackless_invoke` dispatch override further down, so the method
+    // The dispatch identity selected below feeds BOTH the class-init step and
+    // the `try_stackless_invoke` dispatch override, so the method
     // lookup itself (not just class initialization) uses the correct,
     // already-known identity for a self-call.
     let self_class_id = shared
@@ -21695,8 +21937,18 @@ fn execute_invokestatic(
         .filter(|c| c.name.as_ref() == method_class_name.as_ref())
         .map(|_| current_class_id);
 
+    // Sibling static owners in a user-defined loader need the same identity
+    // preservation as self-calls; resolving by flat name can pick the app copy.
+    let static_dispatch_class_id = self_class_id.or_else(|| {
+        if crate::runtime::env_cache::loader_aware_resolution() {
+            lookup_loader_initiated(shared, current_class_id, &method_class_name)
+        } else {
+            None
+        }
+    });
+
     if !is_native {
-        let target_class_id = if let Some(id) = self_class_id {
+        let target_class_id = if let Some(id) = static_dispatch_class_id {
             id
         } else {
             // Load and initialize the target class.
@@ -21819,7 +22071,7 @@ fn execute_invokestatic(
         &method_descriptor,
         &args,
         true,
-        self_class_id,
+        static_dispatch_class_id,
     )? {
         CachedCallResult::FramePushed => {
             populate_invoke_cache(thread, shared, current_class_id, cp_index, false);
@@ -21835,11 +22087,11 @@ fn execute_invokestatic(
     // Fallback: recursive dispatch. `invoke_or_native` re-resolves the
     // owner by NAME (no ClassId-override parameter exists on it), so a
     // self-call whose class-literal method wasn't found by the stackless
-    // path above (e.g. its bytecode requires the full recursive/native
-    // path) still needs the identity fix: dispatch straight through
-    // `invoke_on_class_shared` on `self_class_id` instead of falling into
-    // the loader-blind name lookup `invoke_or_native` performs internally.
-    let result = if let Some(cid) = self_class_id {
+    // path above, or a loader-local sibling static owner, still needs the
+    // identity fix: dispatch straight through `invoke_on_class_shared` instead
+    // of falling into the loader-blind name lookup `invoke_or_native` performs
+    // internally.
+    let result = if let Some(cid) = static_dispatch_class_id {
         crate::vm::invoke_on_class_shared(
             shared,
             thread,
@@ -22012,25 +22264,35 @@ fn populate_invoke_cache(
         return;
     }
 
-    // T10.4 fast path — if a sibling thread already resolved this call site
-    // we reuse its fully-built `CachedInvokeTarget` from the shared
-    // lock-free cache, avoiding both `class_manager.read()` and the native
-    // registry lookup below.
-    let promoted_key: crate::runtime::lockfree_resolve::PromotedInvokeKey =
-        (caller_class_id, cp_index, is_special, None);
-    if let Some(target) = shared.shared_resolution.get_promoted_invoke(&promoted_key) {
-        thread
-            .invoke_cache
-            .put(caller_class_id, cp_index, is_special, target);
-        return;
-    }
-
-    // Resolve the method reference from the constant pool
+    // Resolve the method reference from the constant pool. We need the symbolic
+    // owner before consulting the shared promoted cache because loader-aware
+    // invokestatic/invokespecial sites may have a per-loader owner that differs
+    // from the flat global owner.
     let (class_name, method_name, descriptor, num_params) =
         match resolve_method_ref(shared, caller_class_id, cp_index) {
             Ok(r) => r,
             Err(_) => return,
         };
+
+    let loader_owner_override = if crate::runtime::env_cache::loader_aware_resolution() {
+        lookup_loader_initiated(shared, caller_class_id, &class_name)
+    } else {
+        None
+    };
+
+    // T10.4 fast path: reuse a sibling thread's fully-built target unless this
+    // static/special site has a loader-local owner. Reusing a flat-global owner
+    // here would bypass loader-faithful constructor/super/static dispatch.
+    let promoted_key: crate::runtime::lockfree_resolve::PromotedInvokeKey =
+        (caller_class_id, cp_index, is_special, None);
+    if loader_owner_override.is_none() {
+        if let Some(target) = shared.shared_resolution.get_promoted_invoke(&promoted_key) {
+            thread
+                .invoke_cache
+                .put(caller_class_id, cp_index, is_special, target);
+            return;
+        }
+    }
 
     // Check if it's a native method.  WP2.4-F1: the staleness gate binds
     // to the *referenced* class — if that class is later redefined to a
@@ -22099,8 +22361,12 @@ fn populate_invoke_cache(
         return;
     }
 
-    // Find the bytecode method
-    let target_class_id = match shared.class_manager.read().get_loaded_class_id(&class_name) {
+    // Find the bytecode method. For static/special refs from a loader-private class,
+    // the symbolic owner must stay in that loader's namespace; resolving through
+    // the flat global store would cache the app-loader method body.
+    let target_class_id = match loader_owner_override
+        .or_else(|| shared.class_manager.read().get_loaded_class_id(&class_name))
+    {
         Some(id) => id,
         None => return,
     };
@@ -22230,6 +22496,19 @@ fn populate_invoke_cache(
         .put(caller_class_id, cp_index, is_special, target);
 }
 
+#[inline]
+fn cached_static_owner_stale(
+    shared: &SharedVm,
+    caller_class_id: ClassId,
+    cached: &CachedBytecodeMethod,
+) -> bool {
+    if !crate::runtime::env_cache::loader_aware_resolution() {
+        return false;
+    }
+    lookup_loader_initiated(shared, caller_class_id, cached.class_name.as_ref())
+        .is_some_and(|owner_cid| owner_cid != cached.declaring_class_id)
+}
+
 /// Fast invokestatic using the invoke cache (stackless dispatch).
 /// Returns FramePushed for bytecode (caller updates frame_idx),
 /// Handled for native, CacheMiss for fall-through to slow path.
@@ -22338,20 +22617,31 @@ fn execute_invokestatic_cached(
             cached,
             gate: _,
             supersede_epoch: _,
-        } => execute_jit_call(
-            shared,
-            thread,
-            frame_idx,
-            &compiled,
-            num_params,
-            return_type,
-            needs_heap,
-            &cached,
-        ),
+        } => {
+            if cached_static_owner_stale(shared, caller_class_id, &cached) {
+                thread.invoke_cache.evict(caller_class_id, cp_index, false);
+                return Ok(CachedCallResult::CacheMiss);
+            }
+            execute_jit_call(
+                shared,
+                thread,
+                frame_idx,
+                &compiled,
+                num_params,
+                return_type,
+                needs_heap,
+                &cached,
+            )
+        }
         CachedInvokeTarget::Bytecode {
             ref cached,
             gate: ref entry_gate,
         } => {
+            if cached_static_owner_stale(shared, caller_class_id, cached) {
+                thread.invoke_cache.evict(caller_class_id, cp_index, false);
+                return Ok(CachedCallResult::CacheMiss);
+            }
+
             // Fast path: check if the method was already JIT-compiled (e.g. by OSR)
             // before going through the invocation counter.
             if !redefine_jit_quiesced {
@@ -28631,6 +28921,20 @@ fn execute_invokevirtual_cached(
         }
         // Static cache entries: invokespecial uses Bytecode/Native
         CachedInvokeTarget::Bytecode { cached, gate: _ } => {
+            if is_special && crate::runtime::env_cache::loader_aware_resolution() {
+                if let Some(owner_cid) = lookup_loader_initiated(
+                    shared,
+                    caller_class_id,
+                    cached.class_name.as_ref(),
+                ) {
+                    if owner_cid != cached.declaring_class_id {
+                        thread
+                            .invoke_cache
+                            .evict(caller_class_id, cp_index, is_special);
+                        return Ok(CachedCallResult::CacheMiss);
+                    }
+                }
+            }
             if thread.frames.len() >= shared.config.max_stack_depth {
                 dump_stack_on_soe(thread);
                 return Err(MethodCallFailed::InternalError(VmError::Runtime(

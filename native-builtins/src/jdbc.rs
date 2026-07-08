@@ -42,7 +42,7 @@
 //! the listed driver class.
 
 use cratonvm_native_api::{NativeContext, NativeMethodRegistry};
-use cratonvm_types::error::{MethodCallFailed, MethodCallResult, VmError};
+use cratonvm_types::error::{MethodCallFailed, MethodCallResult, RuntimeError, VmError};
 use cratonvm_types::{ObjectRef, Value};
 
 /// Public entry: register every native that WP7.1 owns. Idempotent —
@@ -80,6 +80,18 @@ fn register_sql_datetime_natives(registry: &mut NativeMethodRegistry) {
             native_sql_datetime_to_string,
         );
     }
+    registry.register(
+        "java/sql/Timestamp",
+        "<init>",
+        "(IIIIIII)V",
+        native_sql_timestamp_fields_init,
+    );
+    registry.register(
+        "java/sql/Timestamp",
+        "toLocalDateTime",
+        "()Ljava/time/LocalDateTime;",
+        native_sql_timestamp_to_local_date_time,
+    );
 }
 
 fn native_sql_datetime_init(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
@@ -113,10 +125,77 @@ fn native_sql_datetime_get_time(ctx: &mut dyn NativeContext, args: &[Value]) -> 
     Ok(Some(Value::Long(millis + nanos_millis)))
 }
 
+fn native_sql_timestamp_fields_init(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    let this = crate::obj_arg(args, 0)?;
+    let int_arg = |idx: usize, default: i32| match args.get(idx) {
+        Some(Value::Int(v)) => *v,
+        _ => default,
+    };
+    let year = int_arg(1, 70) + 1900;
+    let month = int_arg(2, 0);
+    let date = int_arg(3, 1);
+    let hour = int_arg(4, 0);
+    let minute = int_arg(5, 0);
+    let second = int_arg(6, 0);
+    let nanos = int_arg(7, 0);
+    if !(0..=999_999_999).contains(&nanos) {
+        return Err(RuntimeError::IllegalArgumentException {
+            message: "nanos > 999999999 or < 0".to_string(),
+        }
+        .into());
+    }
+    let millis = crate::deprecated_util::date_fields_to_default_millis(
+        ctx, year, month, date, hour, minute, second,
+    );
+    ctx.set_field(this, 0, Value::Long(millis));
+    if ctx.object_num_fields(this) > 1 {
+        ctx.set_field(this, 1, Value::Object(None));
+    }
+    if let Some(idx) = timestamp_nanos_index(ctx, this) {
+        ctx.set_field(this, idx, Value::Int(nanos));
+    }
+    Ok(None)
+}
+
+fn native_sql_timestamp_to_local_date_time(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    let this = crate::obj_arg(args, 0)?;
+    let millis = sql_datetime_millis(ctx, this);
+    let parts = crate::deprecated_util::millis_to_default_date_parts(ctx, millis);
+    let date = crate::alloc_concurrent_synthetic(ctx, "java/time/LocalDate", 3);
+    ctx.set_field(date, 0, Value::Int(parts.year));
+    ctx.set_field(date, 1, Value::Int(parts.month + 1));
+    ctx.set_field(date, 2, Value::Int(parts.date));
+
+    let time = crate::alloc_concurrent_synthetic(ctx, "java/time/LocalTime", 4);
+    ctx.set_field(time, 0, Value::Int(parts.hrs));
+    ctx.set_field(time, 1, Value::Int(parts.min));
+    ctx.set_field(time, 2, Value::Int(parts.sec));
+    ctx.set_field(time, 3, Value::Int(timestamp_nanos(ctx, this)));
+
+    let ldt = crate::alloc_concurrent_synthetic(ctx, "java/time/LocalDateTime", 2);
+    ctx.set_field(ldt, 0, Value::Object(Some(date)));
+    ctx.set_field(ldt, 1, Value::Object(Some(time)));
+    Ok(Some(Value::Object(Some(ldt))))
+}
+
 fn native_sql_datetime_to_string(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = crate::obj_arg(args, 0)?;
     let millis = sql_datetime_millis(ctx, this);
-    let (year, month, day, hour, minute, second) = sql_datetime_parts(millis);
+    let parts = crate::deprecated_util::millis_to_default_date_parts(ctx, millis);
+    let (year, month, day, hour, minute, second) = (
+        parts.year,
+        parts.month + 1,
+        parts.date,
+        parts.hrs,
+        parts.min,
+        parts.sec,
+    );
     let class_name = ctx
         .class_name_of_id(ctx.class_id_of_object(this))
         .unwrap_or_default();

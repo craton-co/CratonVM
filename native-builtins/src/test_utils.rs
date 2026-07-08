@@ -222,6 +222,16 @@ fn mock_classloader_field_slot(class_name: Option<&str>, name: &str) -> Option<u
         ) => Some(0),
         (Some("jdk/internal/loader/URLClassPath" | "sun/misc/URLClassPath"), "path") => Some(0),
         (Some("java/net/URL"), "path") => Some(0),
+        (
+            Some("javax/security/auth/login/LoginContext"),
+            "name" | "subject" | "callbackHandler" | "config",
+        ) => match name {
+            "name" => Some(0),
+            "subject" => Some(1),
+            "callbackHandler" => Some(2),
+            "config" => Some(3),
+            _ => None,
+        },
         _ => None,
     }
 }
@@ -250,6 +260,13 @@ fn mock_lucene_field_slot(class_name: Option<&str>, name: &str) -> Option<usize>
     match (class_name, name) {
         (Some("org/apache/lucene/document/Document"), "fields") => Some(0),
         (Some(c), "fieldsData") if c.starts_with("org/apache/lucene/document/") => Some(0),
+        _ => None,
+    }
+}
+
+fn mock_concurrent_field_slot(class_name: Option<&str>, name: &str) -> Option<usize> {
+    match (class_name, name) {
+        (Some("java/util/concurrent/LinkedBlockingQueue"), "count") => Some(1),
         _ => None,
     }
 }
@@ -309,6 +326,8 @@ pub(crate) struct MockNativeContext {
     /// T19.N1: per-class signer certificate blocks (raw PKCS#7 bytes).
     /// Returned by `class_code_source_certs`; empty by default.
     pub(crate) code_source_certs_override: UnsafeCell<HashMap<u32, Vec<Vec<u8>>>>,
+    blocking_begin_count: usize,
+    blocking_end_count: usize,
     /// WP0.2: per-class overrides for `declared_fields`. Empty vec by
     /// default (mock has no class metadata); tests can populate this
     /// to simulate a class with a specific declared field list for
@@ -447,6 +466,8 @@ impl MockNativeContext {
             interrupted_flag: UnsafeCell::new(false),
             code_base_override: UnsafeCell::new(HashMap::new()),
             code_source_certs_override: UnsafeCell::new(HashMap::new()),
+            blocking_begin_count: 0,
+            blocking_end_count: 0,
             declared_fields_override: UnsafeCell::new(HashMap::new()),
             declared_methods_override: UnsafeCell::new(HashMap::new()),
             superclass_override: UnsafeCell::new(HashMap::new()),
@@ -756,6 +777,10 @@ impl MockNativeContext {
         unsafe { (&*self.native_pin_roots.get()).len() }
     }
 
+    pub(crate) fn blocking_region_counts(&self) -> (usize, usize) {
+        (self.blocking_begin_count, self.blocking_end_count)
+    }
+
     /// FIX(test-isolation): map a `thread_id` handed out by
     /// `register_native_thread` back to its 0-based slot in
     /// `registered_native_threads`. The k-th registration returns
@@ -883,6 +908,7 @@ impl NativeContext for MockNativeContext {
             mock_classloader_field_slot(class_name.as_deref(), field_name)
                 .or_else(|| mock_buffer_field_slot(class_name.as_deref(), field_name))
                 .or_else(|| mock_lucene_field_slot(class_name.as_deref(), field_name))
+                .or_else(|| mock_concurrent_field_slot(class_name.as_deref(), field_name))
                 .or_else(|| mock_jdk_field_slot(field_name))
         };
         match slot {
@@ -899,6 +925,7 @@ impl NativeContext for MockNativeContext {
             mock_classloader_field_slot(class_name.as_deref(), field_name)
                 .or_else(|| mock_buffer_field_slot(class_name.as_deref(), field_name))
                 .or_else(|| mock_lucene_field_slot(class_name.as_deref(), field_name))
+                .or_else(|| mock_concurrent_field_slot(class_name.as_deref(), field_name))
                 .or_else(|| mock_jdk_field_slot(field_name))
         };
         if let Some(slot) = slot {
@@ -1786,6 +1813,14 @@ impl NativeContext for MockNativeContext {
     }
 
     fn force_gc(&mut self) {}
+
+    fn begin_blocking_region(&mut self) {
+        self.blocking_begin_count += 1;
+    }
+
+    fn end_blocking_region(&mut self) {
+        self.blocking_end_count += 1;
+    }
 
     fn method_parameter_annotations(
         &self,

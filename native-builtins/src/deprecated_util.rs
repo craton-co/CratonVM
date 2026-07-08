@@ -159,6 +159,55 @@ pub(crate) fn millis_to_date_parts(millis: i64) -> DateParts {
     }
 }
 
+fn default_time_zone_ref(ctx: &mut dyn NativeContext) -> Option<ObjectRef> {
+    let class_id = ctx.class_id_by_name("java/util/TimeZone")?;
+    let field_index = ctx.static_field_index_by_name(class_id, "defaultTimeZone")?;
+    match ctx.get_static_field(class_id, field_index) {
+        Value::Object(Some(tz)) => Some(tz),
+        _ => None,
+    }
+}
+
+fn timezone_offset_at_millis(ctx: &mut dyn NativeContext, tz: ObjectRef, millis: i64) -> i32 {
+    match ctx.invoke_virtual(tz, "getOffset", "(J)I", &[Value::Long(millis)]) {
+        Ok(Some(Value::Int(offset))) => offset,
+        _ => 0,
+    }
+}
+
+pub(crate) fn millis_to_default_date_parts(ctx: &mut dyn NativeContext, millis: i64) -> DateParts {
+    let offset = default_time_zone_ref(ctx)
+        .map(|tz| timezone_offset_at_millis(ctx, tz, millis) as i64)
+        .unwrap_or(0);
+    millis_to_date_parts(millis.saturating_add(offset))
+}
+
+pub(crate) fn date_fields_to_default_millis(
+    ctx: &mut dyn NativeContext,
+    year: i32,
+    month: i32,
+    date: i32,
+    hrs: i32,
+    min: i32,
+    sec: i32,
+) -> i64 {
+    let local_millis = date_fields_to_millis(year, month, date, hrs, min, sec);
+    let Some(tz) = default_time_zone_ref(ctx) else {
+        return local_millis;
+    };
+    let mut candidate =
+        local_millis.saturating_sub(timezone_offset_at_millis(ctx, tz, local_millis) as i64);
+    for _ in 0..4 {
+        let next =
+            local_millis.saturating_sub(timezone_offset_at_millis(ctx, tz, candidate) as i64);
+        if next == candidate {
+            break;
+        }
+        candidate = next;
+    }
+    candidate
+}
+
 // ---------------------------------------------------------------------------
 // Field accessors for java.util.Date (field 0 = epoch millis as Long)
 // ---------------------------------------------------------------------------
@@ -193,7 +242,7 @@ fn native_date_init_iii(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCa
         Some(Value::Int(v)) => *v,
         _ => 1,
     };
-    let millis = date_fields_to_millis(year + 1900, month, date, 0, 0, 0);
+    let millis = date_fields_to_default_millis(ctx, year + 1900, month, date, 0, 0, 0);
     set_date_millis(ctx, this, millis);
     Ok(None)
 }
@@ -220,7 +269,7 @@ fn native_date_init_iiiii(ctx: &mut dyn NativeContext, args: &[Value]) -> Method
         Some(Value::Int(v)) => *v,
         _ => 0,
     };
-    let millis = date_fields_to_millis(year + 1900, month, date, hrs, min, 0);
+    let millis = date_fields_to_default_millis(ctx, year + 1900, month, date, hrs, min, 0);
     set_date_millis(ctx, this, millis);
     Ok(None)
 }
@@ -251,7 +300,7 @@ fn native_date_init_iiiiii(ctx: &mut dyn NativeContext, args: &[Value]) -> Metho
         Some(Value::Int(v)) => *v,
         _ => 0,
     };
-    let millis = date_fields_to_millis(year + 1900, month, date, hrs, min, sec);
+    let millis = date_fields_to_default_millis(ctx, year + 1900, month, date, hrs, min, sec);
     set_date_millis(ctx, this, millis);
     Ok(None)
 }
@@ -270,52 +319,63 @@ fn native_date_init_string(_ctx: &mut dyn NativeContext, _args: &[Value]) -> Met
 
 fn native_date_get_year(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = obj_arg(args, 0)?;
-    let p = millis_to_date_parts(get_date_millis(ctx, this));
+    let current_millis = get_date_millis(ctx, this);
+    let p = millis_to_default_date_parts(ctx, current_millis);
     Ok(Some(Value::Int(p.year - 1900)))
 }
 
 fn native_date_get_month(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = obj_arg(args, 0)?;
-    let p = millis_to_date_parts(get_date_millis(ctx, this));
+    let current_millis = get_date_millis(ctx, this);
+    let p = millis_to_default_date_parts(ctx, current_millis);
     Ok(Some(Value::Int(p.month)))
 }
 
 fn native_date_get_date(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = obj_arg(args, 0)?;
-    let p = millis_to_date_parts(get_date_millis(ctx, this));
+    let current_millis = get_date_millis(ctx, this);
+    let p = millis_to_default_date_parts(ctx, current_millis);
     Ok(Some(Value::Int(p.date)))
 }
 
 fn native_date_get_day(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = obj_arg(args, 0)?;
-    let p = millis_to_date_parts(get_date_millis(ctx, this));
+    let current_millis = get_date_millis(ctx, this);
+    let p = millis_to_default_date_parts(ctx, current_millis);
     Ok(Some(Value::Int(p.day_of_week)))
 }
 
 fn native_date_get_hours(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = obj_arg(args, 0)?;
-    let p = millis_to_date_parts(get_date_millis(ctx, this));
+    let current_millis = get_date_millis(ctx, this);
+    let p = millis_to_default_date_parts(ctx, current_millis);
     Ok(Some(Value::Int(p.hrs)))
 }
 
 fn native_date_get_minutes(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = obj_arg(args, 0)?;
-    let p = millis_to_date_parts(get_date_millis(ctx, this));
+    let current_millis = get_date_millis(ctx, this);
+    let p = millis_to_default_date_parts(ctx, current_millis);
     Ok(Some(Value::Int(p.min)))
 }
 
 fn native_date_get_seconds(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = obj_arg(args, 0)?;
-    let p = millis_to_date_parts(get_date_millis(ctx, this));
+    let current_millis = get_date_millis(ctx, this);
+    let p = millis_to_default_date_parts(ctx, current_millis);
     Ok(Some(Value::Int(p.sec)))
 }
 
-/// getTimezoneOffset()I — always returns 0 (UTC assumption for deprecated API).
 fn native_date_get_timezone_offset(
-    _ctx: &mut dyn NativeContext,
-    _args: &[Value],
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
 ) -> MethodCallResult {
-    Ok(Some(Value::Int(0)))
+    let this = obj_arg(args, 0)?;
+    let millis = get_date_millis(ctx, this);
+    let offset = default_time_zone_ref(ctx)
+        .map(|tz| timezone_offset_at_millis(ctx, tz, millis))
+        .unwrap_or(0);
+    Ok(Some(Value::Int(-offset / 60_000)))
 }
 
 fn native_date_set_year(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
@@ -324,8 +384,10 @@ fn native_date_set_year(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCa
         Some(Value::Int(v)) => *v,
         _ => 70,
     };
-    let p = millis_to_date_parts(get_date_millis(ctx, this));
-    let millis = date_fields_to_millis(new_year + 1900, p.month, p.date, p.hrs, p.min, p.sec);
+    let current_millis = get_date_millis(ctx, this);
+    let p = millis_to_default_date_parts(ctx, current_millis);
+    let millis =
+        date_fields_to_default_millis(ctx, new_year + 1900, p.month, p.date, p.hrs, p.min, p.sec);
     set_date_millis(ctx, this, millis);
     Ok(None)
 }
@@ -336,8 +398,9 @@ fn native_date_set_month(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
         Some(Value::Int(v)) => *v,
         _ => 0,
     };
-    let p = millis_to_date_parts(get_date_millis(ctx, this));
-    let millis = date_fields_to_millis(p.year, new_month, p.date, p.hrs, p.min, p.sec);
+    let current_millis = get_date_millis(ctx, this);
+    let p = millis_to_default_date_parts(ctx, current_millis);
+    let millis = date_fields_to_default_millis(ctx, p.year, new_month, p.date, p.hrs, p.min, p.sec);
     set_date_millis(ctx, this, millis);
     Ok(None)
 }
@@ -348,8 +411,9 @@ fn native_date_set_date(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCa
         Some(Value::Int(v)) => *v,
         _ => 1,
     };
-    let p = millis_to_date_parts(get_date_millis(ctx, this));
-    let millis = date_fields_to_millis(p.year, p.month, new_date, p.hrs, p.min, p.sec);
+    let current_millis = get_date_millis(ctx, this);
+    let p = millis_to_default_date_parts(ctx, current_millis);
+    let millis = date_fields_to_default_millis(ctx, p.year, p.month, new_date, p.hrs, p.min, p.sec);
     set_date_millis(ctx, this, millis);
     Ok(None)
 }
@@ -360,8 +424,10 @@ fn native_date_set_hours(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
         Some(Value::Int(v)) => *v,
         _ => 0,
     };
-    let p = millis_to_date_parts(get_date_millis(ctx, this));
-    let millis = date_fields_to_millis(p.year, p.month, p.date, new_hours, p.min, p.sec);
+    let current_millis = get_date_millis(ctx, this);
+    let p = millis_to_default_date_parts(ctx, current_millis);
+    let millis =
+        date_fields_to_default_millis(ctx, p.year, p.month, p.date, new_hours, p.min, p.sec);
     set_date_millis(ctx, this, millis);
     Ok(None)
 }
@@ -372,8 +438,9 @@ fn native_date_set_minutes(ctx: &mut dyn NativeContext, args: &[Value]) -> Metho
         Some(Value::Int(v)) => *v,
         _ => 0,
     };
-    let p = millis_to_date_parts(get_date_millis(ctx, this));
-    let millis = date_fields_to_millis(p.year, p.month, p.date, p.hrs, new_min, p.sec);
+    let current_millis = get_date_millis(ctx, this);
+    let p = millis_to_default_date_parts(ctx, current_millis);
+    let millis = date_fields_to_default_millis(ctx, p.year, p.month, p.date, p.hrs, new_min, p.sec);
     set_date_millis(ctx, this, millis);
     Ok(None)
 }
@@ -384,8 +451,9 @@ fn native_date_set_seconds(ctx: &mut dyn NativeContext, args: &[Value]) -> Metho
         Some(Value::Int(v)) => *v,
         _ => 0,
     };
-    let p = millis_to_date_parts(get_date_millis(ctx, this));
-    let millis = date_fields_to_millis(p.year, p.month, p.date, p.hrs, p.min, new_sec);
+    let current_millis = get_date_millis(ctx, this);
+    let p = millis_to_default_date_parts(ctx, current_millis);
+    let millis = date_fields_to_default_millis(ctx, p.year, p.month, p.date, p.hrs, p.min, new_sec);
     set_date_millis(ctx, this, millis);
     Ok(None)
 }

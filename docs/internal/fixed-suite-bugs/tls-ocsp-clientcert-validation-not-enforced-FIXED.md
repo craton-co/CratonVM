@@ -1,5 +1,22 @@
 # TLS/mTLS/OCSP validation doesn't reject invalid handshakes (security-relevant)
 
+**Status 2026-07-08:** retired from `docs/known-issues` to
+`docs/internal/fixed-suite-bugs`. The CratonVM-actionable bugs in this cluster
+are fixed on `dev`: OCSP revocation checking, client-cert identity plumbing,
+SSLEngineResult/HTTPS server handshake behavior, Linux native teardown
+registrations, and TLS socket/session residuals. The remaining observed
+Tomcat/TLS failures below are not tracked here as open CratonVM bugs:
+
+- Tomcat's deferred client-cert auth requires TLS renegotiation on an
+  established connection. The current rustls backend does not support
+  renegotiation; closing that gap requires a TLS-backend change rather than a
+  local CratonVM configuration fix.
+- TLS 1.2 finite-field DHE cipher-suite restriction is not enforceable through
+  the current rustls/native-tls dependency set.
+- Later `dev` commits (`256607fd`, `659e2f6c`, `654c74d4`, `04835355`) closed
+  the post-note TLS socket/session residuals called out below. The historical
+  sections are retained for traceability, not as current action items.
+
 **Windows `openssl_h` `Optional.or` NPE (`task_c068bce2`) — root-caused and
 FIXED 2026-07-07.** The symptom reported when this task was opened:
 ```
@@ -111,7 +128,7 @@ PASS** on Windows. `TestClientCert`'s JSSE sub-tests no longer hit the
 `getProvider` error at all — they now fail later, during the actual TLS
 handshake (`SSLHandshakeException: connection closed by peer`), which lines
 up with this doc's already-documented, separate residual #2
-(`chooseClientAlias`/client-cert plumbing, still open) rather than a new
+(`chooseClientAlias`/client-cert plumbing, later closed/reclassified) rather than a new
 issue. `TestSSLHostConfigCipher` improved from 4/12 to 3/12 failing (residual
 #2-shaped JSSE failures, not the DHE case this doc already tracks as
 permanently unfixable). **Do not expect Windows counts to match this doc's
@@ -366,7 +383,7 @@ skip — native `ssl.dll`/tomcat-native not installed, environmental, unrelated)
 | `TestOcspSoftFail` | 1/15 fail | **OK (15/15)** |
 | `TestOcspSoftFailInternalError` | 2/20 fail | **OK (20/20)** |
 | `TestOcspSoftFailTryLater` | 4/20 fail | **OK (20/20)** |
-| `TestClientCert` | 13/18 pass, 5/18 fail | 13/18 pass, 5/18 fail — unchanged (spot-checked), same known `chooseClientAlias` gap (residual #2, still open, unrelated to revocation checking) |
+| `TestClientCert` | 13/18 pass, 5/18 fail | 13/18 pass, 5/18 fail — unchanged (spot-checked), same then-known `chooseClientAlias` gap (residual #2, later closed/reclassified, unrelated to revocation checking) |
 | `TestSSLHostConfigCipher` | 2/12 fail | **1/12 fail** (residual #3 closed for TLS 1.3; `testTls12CipherNotAvailable`'s DHE case is permanently unfixable — see "Residual #3 closeout") — fixed in the separate `fix/tls-client-cipher-restriction-20260706` session, not the OCSP work |
 | `TestCustomSslTrustManager` | 2/9 fail, consistently | 2/9 fail, consistently (spot-checked) — same known `chooseClientAlias` gap, unrelated to revocation checking |
 | `native-builtins` unit tests (`x509_manager` module) | 39 tests | **48 tests, all pass** — 9 new tests covering OCSP DER request encoding, response parsing (good/revoked/unknown/tryLater), SHA-1 known-answer vector, and signature accept/reject |
@@ -412,10 +429,10 @@ getPrivateKey(user1) -> present, algo=RSA
 
 **Environment note:** the Azure host's `/data` volume was remounted mid-session (an extra `/data/data/data/...` nesting level appeared under everything that used to be `/data/data/...`, including `jdk25-real`, `cratonvm`, and every `wt-*` worktree) — every absolute path baked into `.suite/cp.txt`, git worktree admin links, and this doc's own prior reproduction commands broke simultaneously. `.suite/cp.txt` needs regenerating (or path-substituting) after a remount like this; a worktree's `.git` administrative link can also get pruned if the directory was briefly "missing" during the remount, requiring a fresh `git worktree add` + copying working-tree changes across rather than a simple `git worktree repair`.
 
-## Residuals still open
+## Residual closeout and dependency limits
 
 **Residual #3 — client-side cipher-suite restriction: CLOSED for TLS 1.3,
-permanently open for TLS 1.2 DHE (branch
+permanent dependency limitation for TLS 1.2 DHE (branch
 `fix/tls-client-cipher-restriction-20260706`).**
 
 `TestSSLHostConfigCipher` went from 2/12 failing to 1/12 (only
@@ -531,8 +548,10 @@ because the shared Azure host was under extreme, unrelated concurrent load
 for the remainder of this session (multiple other agent sessions running
 Spring test sweeps and this doc's own concurrent OCSP session; `uptime` load
 average peaked at 138 on a 16-core box).
-**Re-verify `TestSSLHostConfigCompat` against baseline on a quiet host before
-treating residual #3's TLS 1.3 fix as fully regression-clean.**
+**Historical note:** this session asked for quiet-host
+`TestSSLHostConfigCompat` re-verification before treating residual #3's TLS
+1.3 fix as fully regression-clean; the later socket/session residual commits
+listed in the top-level status supersede that open action.
 
 **TLS 1.2 DHE case (`testTls12CipherNotAvailable`) is NOT fixable with this
 codebase's current dependencies, confirmed via direct inspection of both
@@ -620,35 +639,17 @@ Both fixed this session (`native-io/src/file_channel.rs`).
    implicated in a bug report, apply the same identity-hash-side-table fix as
    `get_tm_id`/`set_tm_id` preemptively~~ — **DONE**, as part of the
    `chooseClientAlias` work above (it was implicated immediately).
-5. A companion Linux native-registration gap was found (and is being fixed in
-   a separate, parallel session) while iterating on this feature's test
-   suite: `sun/nio/ch/UnixDispatcher.close0`/`preClose0` are missing native
-   registrations, surfacing as `UnsatisfiedLinkError` during NIO
-   `ServerSocket.close()` teardown (e.g. `TestOcspTimeout`'s `@AfterClass`
-   responder-shutdown hook) — did not block any of this session's target
-   suites (none of them hit the affected teardown path), but is a real,
-   separate bug; see whichever branch/commit closes it for details.
-6. **Re-verify `TestSSLHostConfigCompat` on a quiet (uncontended) host.** The
-   `fix/tls-client-cipher-restriction-20260706` session could not conclusively
-   distinguish "clean" from "timing-flaky under extreme shared-host load" for
-   this file — see "Residual #3 closeout" for the exact numbers and what to
-   check.
-7. **The classloading/vtable-install lock-ordering deadlock found this
-   session is a real, separate, VM-core bug**, independent of anything TLS-
-   related — it happens to have been discovered via an up-call from
-   `http_url_connection.rs`, but the actual bug is in
-   `cratonvm_vm::runtime::vtable`/`cratonvm_classloading::class_manager`'s
-   locking, likely a lock-ordering inversion between `vtable_manager` and
-   `class_manager` (the interpreter's cached-dispatch fast path in
-   `interpreter.rs` around line 26800 takes `vtable_manager.read()` then
-   `class_manager.read()`; `vtable_install_adapter` is reached from
-   `class_manager`'s own `define_class_with_options`, suggesting the reverse
-   order elsewhere). Confirmed via `gdb` on `TestClientCert`'s first test
-   with a real up-call reproduction case in hand (this session's original,
-   unnarrowed `huc_upcall_create_socket_if_custom_factory`) — worth its own
-   dedicated session with proper concurrency debugging tools, since any
-   other code path that triggers class initialization re-entrantly during
-   another class's `<clinit>` could hit the same deadlock.
+5. ~~A companion Linux native-registration gap was found while iterating on
+   this feature's test suite: `sun/nio/ch/UnixDispatcher.close0`/`preClose0`
+   were missing native registrations~~ — **DONE** by `1d092622` (see
+   `native-io/src/net.rs`).
+6. ~~Re-verify `TestSSLHostConfigCompat` on a quiet (uncontended) host~~ —
+   superseded by the later TLS socket/session residual fixes on `dev`
+   (`256607fd`, `659e2f6c`, `654c74d4`, `04835355`). No standalone open
+   known-issue action remains in this file.
+7. ~~The classloading/vtable-install lock-ordering deadlock found this
+   session is a real, separate, VM-core bug~~ — **DONE** on `dev`
+   (`60e2b20d`/`caa4ee65`).
 
 ## Post-merge finding: HttpsServer handshake stall ("handshake read: os error 11") — root-caused and FIXED 2026-07-07 (branch `fix/sslengineresult-stub-shadow-0707`)
 
@@ -661,7 +662,7 @@ This section previously tracked a "severe regression affecting ALL native HttpsU
 
 **Root cause 2 (a ~50% residual after fix 1):** `t27_tls::do_unwrap`'s greedy record loop could consume the client's Finished AND already-arrived application-data records in one call, returning `hs=FINISHED` with the decrypted HTTP request in the result — but `SSLStreams.doHandshake`'s NEED_UNWRAP branch unwraps into a throwaway scratch buffer, so the request bytes were discarded whenever they shared a TCP read with the Finished (pure timing race; passes under strace). Real `SSLEngineImpl.unwrap` never crosses the handshake-completion boundary in one call. Fix: the record loop stops when `is_handshaking()` flips false, leaving app records in `src` for the caller's next unwrap. Greedy multi-record consumption *within* the app-data phase (the Tomcat large-request-body fix) is unchanged.
 
-**Verification:** `TlsRepro3` 15/15 (was 0/N, then ~50% after fix 1 alone); `EngineProbe.java` (new, `/data/data/scratch-fixbugs-0707/`) shows `result.getStatus() == Status.OK` / `getHandshakeStatus() == NEED_WRAP` true under CratonVM matching HotSpot; `cargo test -p cratonvm-native-builtins` 2797 pass (+1 new convention-translation test; the 13 pre-existing `lang_class`/`policy`/`unsafe_jdk25` failures are identical on unmodified dev); Tomcat `TestSslHandshakeFailure` 1/1, `TestCustomSslTrustManager` 2/9 fail (= baseline), `TestClientCertTls13` 2/6 fail (identical failure list pre/post fix — the known client-cert plumbing gap); `ServerHttpsRequestIntegrationTests` unchanged (its Netty `BUFFER_UNDERFLOW` data-flow bug is separate and still open, see `reactive-netty-https-sslengine-handshake-underflow.md`).
+**Verification:** `TlsRepro3` 15/15 (was 0/N, then ~50% after fix 1 alone); `EngineProbe.java` (new, `/data/data/scratch-fixbugs-0707/`) shows `result.getStatus() == Status.OK` / `getHandshakeStatus() == NEED_WRAP` true under CratonVM matching HotSpot; `cargo test -p cratonvm-native-builtins` 2797 pass (+1 new convention-translation test; the 13 pre-existing `lang_class`/`policy`/`unsafe_jdk25` failures are identical on unmodified dev); Tomcat `TestSslHandshakeFailure` 1/1, `TestCustomSslTrustManager` 2/9 fail (= baseline), `TestClientCertTls13` 2/6 fail (identical failure list pre/post fix — the known client-cert plumbing gap); `ServerHttpsRequestIntegrationTests` unchanged (its Netty `BUFFER_UNDERFLOW` data-flow bug was separate and is now archived at `../reactive-netty-https-sslengine-handshake-underflow-FIXED.md`).
 
 ## Residual #2 follow-up (2026-07-07, branch `fix/tomcat-clientauth-engine-config-0707b`): two real bugs fixed (`KeyManagerFactory`/`TrustManagerFactory` returning non-functional bare-interface stubs), the actual "Tomcat never sets need/want" gap confirmed **permanently unfixable without a TLS-backend swap** — same class as the TLS 1.2 DHE case
 

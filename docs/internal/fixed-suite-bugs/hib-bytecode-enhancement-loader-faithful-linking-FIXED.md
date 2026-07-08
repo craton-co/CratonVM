@@ -1,3 +1,19 @@
+# 2026-07-08 closure
+
+Status: FIXED / RETIRED. The loader-faithful enhancement/lazy/lazytoone family tracked here is closed on dev by `codex/hib-enhancement-loader-retire-20260708-121047`. The fix plugs the remaining runtime layers that still collapsed loader-private enhanced classes back to same-named global classes: exact mirror `Class.newInstance`, receiver-exact method retry, CP-interface default-method rescue, receiver-exact instance field retargeting, exact enum/static initialization, exact reference-array component checks, and loader-aware type-test fallback for same-named copies.
+
+Verification on Azure host `/data/data/cratonvm` worktree `/data/data/wt-hib-enhancement-loader-retire-20260708-121047`, binary `/data/data/bin/cratonvm-hib-enhancement-loader-retire-20260708-121047-fix8` unless otherwise noted:
+
+- Baseline dev sample before this fix: `lazy_lazytoone_sample.txt` was `total=18 pass=10 fail=8`, with `asManagedEntity`/`asPersistentAttributeInterceptable` default-method `NoSuchMethodError`, `$HibernateInstantiator` no-arg-constructor failures, enum `$VALUES`/container failure in `BasicAttributesLazyGroupTest`, and `FetchGraphTest` lazy field-slot failure.
+- Post-fix focused residuals: `BasicAttributesLazyGroupTest` is `found=5 started=5 ok=5 failed=0`; `FetchGraphTest` is `found=17 started=17 ok=17 failed=0`.
+- Post-fix representative sample: `lazy_lazytoone_sample.txt` is `SUMMARY total=18 pass=18 fail=0 hang=0`.
+- Post-fix broader lazy/lazytoone subset: `lazy_lazytoone_subset.txt` is `SUMMARY total=69 pass=69 fail=0 hang=0` with the final fix8 binary.
+- Additional 131-subset same-name checkcast regression: `LoadAndFetchGraphAssociationNotExplicitlySpecifiedTest` is fixed by the final type-test fallback (`found=14 started=14 ok=14 failed=0`).
+
+The remaining non-green `gated_subset.txt` cases were not this loader-linking/lazytoone family. They were tracked separately and later retired in [`hib-bytecode-enhancement-basic-merge-version-residuals-FIXED.md`](hib-bytecode-enhancement-basic-merge-version-residuals-FIXED.md).
+
+---
+
 # Hibernate `bytecode.enhancement.*` — loader-faithful supertype linking + dispatch (gate `CRATONVM_LOADER_AWARE_RESOLUTION`)
 
 | | |
