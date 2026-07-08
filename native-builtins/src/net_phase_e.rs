@@ -7981,13 +7981,30 @@ fn register_re6_ssl_context(r: &mut NativeMethodRegistry) {
                     }
                 }
             }
+            if std::env::var_os("CRATONVM_DBG_TLS_SOCK").is_some() {
+                eprintln!(
+                    "[dbg-tls-sock] setEnabledCipherSuites called this={:?} ciphers={:?} any_mappable={}",
+                    this,
+                    ciphers,
+                    crate::t27_tls::any_cipher_mappable(&ciphers)
+                );
+            }
             if ciphers.is_empty() || !crate::t27_tls::any_cipher_mappable(&ciphers) {
                 return Ok(None);
             }
             let host = read_field_string_or(ctx, this, SOCK_HOST, "");
             let side = sock_get(this);
+            if std::env::var_os("CRATONVM_DBG_TLS_SOCK").is_some() {
+                eprintln!(
+                    "[dbg-tls-sock] setEnabledCipherSuites reconnect check host={:?} side_port={}",
+                    host, side.port
+                );
+            }
             if host.is_empty() || side.port <= 0 {
                 return Ok(None);
+            }
+            if std::env::var_os("CRATONVM_DBG_TLS_SOCK").is_some() {
+                eprintln!("[dbg-tls-sock] setEnabledCipherSuites RECONNECTING (tearing down existing connection)");
             }
             let client_ident = crate::t27_tls::huc_default_client_identity();
             let cfg = match crate::t27_tls::build_engine_client_config_with_identity_ciphers(
