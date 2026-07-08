@@ -472,9 +472,15 @@ mod tests {
         // the scale — the critical path that unblocks
         // jctools.UnsafeRefArrayAccess.<clinit>.
         let mut ctx = MockNativeContext::new();
+        // FIX(class_id-0 name shadow): mirror_class_name checks the
+        // class-id reverse-map before slot 1's stored name; a mirror
+        // whose field 0 is the never-registered placeholder `0` reads
+        // back empty. Register a real class id via ensure_class_initialized
+        // so the reverse-map agrees with the name in slot 1.
+        let cid = ctx.ensure_class_initialized("[Ljava/lang/Object;").unwrap();
         let name_obj = ctx.create_string("[Ljava/lang/Object;");
         let mirror = ctx.alloc_object(ClassId::new(0), 2);
-        ctx.set_field(mirror, 0, Value::Int(0));
+        ctx.set_field(mirror, 0, Value::Int(cid.as_u32() as i32));
         ctx.set_field(mirror, 1, Value::Object(Some(name_obj)));
         let scale =
             native_unsafe_array_index_scale(&mut ctx, &[dummy_this(), Value::Object(Some(mirror))])
@@ -482,9 +488,10 @@ mod tests {
         assert_eq!(scale, Some(Value::Int(8)));
 
         // And for int[] → 4.
+        let int_cid = ctx.ensure_class_initialized("[I").unwrap();
         let int_name = ctx.create_string("[I");
         let int_mirror = ctx.alloc_object(ClassId::new(0), 2);
-        ctx.set_field(int_mirror, 0, Value::Int(0));
+        ctx.set_field(int_mirror, 0, Value::Int(int_cid.as_u32() as i32));
         ctx.set_field(int_mirror, 1, Value::Object(Some(int_name)));
         let int_scale = native_unsafe_array_index_scale(
             &mut ctx,

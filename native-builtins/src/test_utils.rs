@@ -1344,10 +1344,17 @@ impl NativeContext for MockNativeContext {
     }
 
     fn primitive_class_mirror(&mut self, name: &str) -> ObjectRef {
+        // FIX(class_id-0 name shadow): give the mirror a real, distinct
+        // class id via `ensure_class_initialized` (idempotent per name)
+        // instead of the shared placeholder `0` — this mock never
+        // populates `class_names[0]`, so `mirror_class_name`'s
+        // class-id-first lookup returned None/empty for every primitive
+        // mirror, shadowing the correct name already stored in slot 1.
+        let class_id = self.ensure_class_initialized(name).unwrap().as_u32();
         let name_obj = self.create_string(name);
         self.alloc_entry(HeapEntry::Object {
             class_id: ClassId::new(0),
-            fields: vec![Value::Int(0), Value::Object(Some(name_obj))],
+            fields: vec![Value::Int(class_id as i32), Value::Object(Some(name_obj))],
         })
     }
 
