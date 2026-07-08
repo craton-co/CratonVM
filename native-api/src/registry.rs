@@ -1021,6 +1021,18 @@ pub trait NativeContext {
         name: &str,
     ) -> Result<ClassId, cratonvm_types::error::MethodCallFailed>;
 
+    /// Ensure the exact already-resolved class id is initialized without
+    /// re-resolving its binary name through the global loader map.
+    fn ensure_class_initialized_with_class_id(
+        &mut self,
+        class_id: ClassId,
+    ) -> Result<(), cratonvm_types::error::MethodCallFailed> {
+        if let Some(name) = self.class_name_of_id(class_id) {
+            self.ensure_class_initialized(&name)?;
+        }
+        Ok(())
+    }
+
     /// Register (or look up) a minimal synthetic class with the given name
     /// and instance-field count, returning its `ClassId`.
     ///

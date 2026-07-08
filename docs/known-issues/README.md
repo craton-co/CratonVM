@@ -4,6 +4,11 @@ This folder collects CratonVM-only defects found while running upstream Java
 suites. The docs had grown to describe the **same underlying bug from several
 angles**; this index is the consolidated map. Read it first.
 
+## 2026-07-08 Hibernate bytecode-enhancement loader/lazytoone family retired; residual basic/merge/version bugs split out
+
+- FIXED/RETIRED: [`hib-bytecode-enhancement-loader-faithful-linking-FIXED.md`](../internal/fixed-suite-bugs/hib-bytecode-enhancement-loader-faithful-linking-FIXED.md) - the remaining loader-faithful lazy/lazytoone failures are closed: 18/18 representative sample and 69/69 lazy/lazytoone subset pass, and the graph same-name checkcast residual now passes.
+- OPEN: [`hib-bytecode-enhancement-basic-merge-version-residuals.md`](hib-bytecode-enhancement-basic-merge-version-residuals.md) - separate non-lazy residuals left in basic dirty tracking, final-field embedded id, composite merge/null, and versioned entity type checks.
+
 ## 2026-07-07 `InPredicateTest` timeout root-caused to dispatch-heavy JIT tier-up overhead (not the OSR alloc-gate, not precise-JIT-maps)
 
 - 🔴 OPEN: [`InPredicateTest` 100k-element criteria `IN` predicate times out under JIT](hib-inpredicate-dispatch-heavy-jit-timeout-20260707.md) — a clean, uncontended single-class rerun confirms the 2026-07-07 local-rerun timeout finding is a real, deterministic regression (3/3 clean runs, 330–510s, always timing out), not host-load noise. Two same-day-landed candidates (the precise-JIT-maps default-ON re-flip, the OSR allocation-region gate) were directly A/B-tested and ruled out. Root cause: `SqmCriteriaNodeBuilder.in()`'s 100k-call dispatch-heavy loop hits the already-tracked "JIT is a net slowdown for dispatch-heavy Hibernate workloads" issue ([[reference_jit_invoke_cache_thrash_dispatch_heavy]], `docs/internal/HIB-misc16-correctness-sweep.md` §15–16) — confirmed decisively via `--nojit` A/B (330-510s FAIL vs 109.5s PASS, 3–4.6× faster with JIT off). Also explains why the previously-tracked `removeEldestEntry` NSME ([hib-domainparameterxref-lhm-removeeldestentry-nsme.md](hib-domainparameterxref-lhm-removeeldestentry-nsme.md)) no longer reproduces: the code path that threw it is never reached anymore, not fixed — that doc has been annotated, not retired.
