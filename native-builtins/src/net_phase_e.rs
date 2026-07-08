@@ -251,6 +251,31 @@ pub(crate) fn sock_is_closed_for_upcall(this: ObjectRef) -> bool {
     sock_get(this).closed != 0
 }
 
+/// FIX (netty-client-socket-write-after-close): let `phases_late.rs`'s
+/// `new13_do_create_socket` record its connect result HERE instead of (only)
+/// in a raw object field. `alloc_concurrent_synthetic` sizes a "synthetic"
+/// object using the REAL loaded class's actual field count/layout when the
+/// class is loadable (`ctx.class_num_total_fields`) — see its own doc
+/// comment — so field index 2 on a `javax/net/ssl/SSLSocket` lands wherever
+/// the real class hierarchy's own 3rd field actually is, not a slot we
+/// control. Traced with a same-native-call immediate readback
+/// (CRATONVM_DBG_TLS_SOCK): `ctx.set_field(sock, 2, Value::Int(tls_id))`
+/// followed instantly by `ctx.get_field(sock, 2)` — no Java code, no GC,
+/// same call — already read back `Object(None)`, proving the object's real
+/// field #2 is reference-typed and the GC/field-layout guard silently drops
+/// a mismatched-type write rather than erroring. This is exactly the
+/// collision this file's own `SockSide` table was introduced to avoid for
+/// plain `java.net.Socket`/`ServerSocket`/`DatagramSocket`; `SSLSocket`
+/// needs the same treatment.
+pub(crate) fn sock_set_for_create(this: ObjectRef, port: i32, stream_id: i32) {
+    sock_set(this, |s| {
+        s.port = port;
+        s.local_port = 0;
+        s.closed = 0;
+        s.stream_id = stream_id;
+    });
+}
+
 fn ss_get(this: ObjectRef) -> SsSide {
     let t = ss_side_table().lock();
     t.get(&this).copied().unwrap_or(SsSide {

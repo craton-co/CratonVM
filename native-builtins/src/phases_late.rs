@@ -39610,17 +39610,7 @@ const NEW13_SOCK_SESSION: usize = 4;
 /// classic connection pool actually calls, per
 /// docs/known-issues/netty-client-socket-write-after-close-nsme.md).
 fn new13_resolve_tls_id(ctx: &dyn NativeContext, this: ObjectRef) -> i32 {
-    let raw = ctx.get_field(this, NEW13_SOCK_TLSID);
-    if std::env::var_os("CRATONVM_DBG_TLS_SOCK").is_some() {
-        eprintln!(
-            "[dbg-tls-sock] thread={:?} new13_resolve_tls_id sock={:?} raw_field2={:?} num_fields={}",
-            std::thread::current().id(),
-            this,
-            raw,
-            ctx.object_num_fields(this)
-        );
-    }
-    if let Some(id) = raw.as_int() {
+    if let Some(id) = ctx.get_field(this, NEW13_SOCK_TLSID).as_int() {
         if id >= 0 {
             return id;
         }
@@ -39894,23 +39884,24 @@ fn new13_do_create_socket(
     let host_obj = ctx.create_string(host);
     ctx.set_field(sock, NEW13_SOCK_HOST, Value::Object(Some(host_obj)));
     ctx.set_field(sock, NEW13_SOCK_PORT, Value::Int(port as i32));
+    // FIX (netty-client-socket-write-after-close): do NOT rely on the raw
+    // NEW13_SOCK_TLSID/NEW13_SOCK_CLOSED field writes below being visible —
+    // `alloc_concurrent_synthetic` sizes this object using the REAL loaded
+    // `javax/net/ssl/SSLSocket` class's own field layout, and its actual
+    // field #2 is reference-typed; the GC/field-layout guard silently drops
+    // our mismatched-type Int write (confirmed via an immediate same-call
+    // readback: a debug trace showed `Object(None)` moments after setting
+    // Int(tls_id), with no Java code and no GC in between). Record the
+    // authoritative state in net_phase_e's side table instead — the same
+    // mechanism its own createSocket(String,int) uses for the identical
+    // class — so new13_resolve_tls_id's fallback (used by getInputStream/
+    // getOutputStream/close/isClosed/isConnected below) finds it. The raw
+    // writes are kept too: harmless if dropped, and a free win if some
+    // future JDK's field layout happens not to collide.
+    crate::net_phase_e::sock_set_for_create(sock, port as i32, tls_id);
     ctx.set_field(sock, NEW13_SOCK_TLSID, Value::Int(tls_id));
-    if std::env::var_os("CRATONVM_DBG_TLS_SOCK").is_some() {
-        eprintln!(
-            "[dbg-tls-sock] thread={:?} IMMEDIATE readback after set field2={:?}",
-            std::thread::current().id(),
-            ctx.get_field(sock, NEW13_SOCK_TLSID)
-        );
-    }
     ctx.set_field(sock, NEW13_SOCK_CLOSED, Value::Int(0));
     let session = new13_alloc_ssl_session(ctx, tls_id);
-    if std::env::var_os("CRATONVM_DBG_TLS_SOCK").is_some() {
-        eprintln!(
-            "[dbg-tls-sock] thread={:?} POST-session-alloc readback field2={:?}",
-            std::thread::current().id(),
-            ctx.get_field(sock, NEW13_SOCK_TLSID)
-        );
-    }
     ctx.set_field(sock, NEW13_SOCK_SESSION, Value::Object(Some(session)));
     if std::env::var_os("CRATONVM_DBG_TLS_SOCK").is_some() {
         eprintln!(
