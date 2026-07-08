@@ -1017,17 +1017,31 @@ fn display_array_class_name(ctx: &dyn NativeContext, obj: ObjectRef) -> String {
 }
 
 /// Unbox a wrapper object (Integer, Long, Boolean, etc.) to its primitive Value.
-/// Returns None if the object is not a recognized 1-field wrapper type.
+/// Returns None if the object is not a recognized JDK wrapper type.
 fn unbox_wrapper(ctx: &dyn NativeContext, obj: ObjectRef) -> Option<Value> {
-    let nf = ctx.object_num_fields(obj);
-    if nf == 1 {
-        let inner = ctx.get_field(obj, 0);
-        match inner {
-            Value::Int(_) | Value::Long(_) | Value::Float(_) | Value::Double(_) => Some(inner),
-            _ => None,
+    let class_name = ctx.class_name_of_id(ctx.class_id_of_object(obj))?;
+    if !matches!(
+        class_name.as_str(),
+        "java/lang/Integer"
+            | "java/lang/Long"
+            | "java/lang/Boolean"
+            | "java/lang/Character"
+            | "java/lang/Byte"
+            | "java/lang/Short"
+            | "java/lang/Float"
+            | "java/lang/Double"
+    ) {
+        return None;
+    }
+
+    if ctx.object_num_fields(obj) != 1 {
+        return None;
+    }
+    match ctx.get_field(obj, 0) {
+        inner @ (Value::Int(_) | Value::Long(_) | Value::Float(_) | Value::Double(_)) => {
+            Some(inner)
         }
-    } else {
-        None
+        _ => None,
     }
 }
 
@@ -38732,6 +38746,8 @@ mod tests {
         struct Shared {
             heap: Vec<HeapEntry>,
             ptr_to_index: HashMap<usize, usize>,
+            object_classes: HashMap<usize, ClassId>,
+            class_names: HashMap<ClassId, String>,
             next_ptr: usize,
             monitors: HashMap<usize, Arc<ObjMonitor>>,
         }
@@ -38741,6 +38757,8 @@ mod tests {
                 Shared {
                     heap: Vec::new(),
                     ptr_to_index: HashMap::new(),
+                    object_classes: HashMap::new(),
+                    class_names: HashMap::new(),
                     next_ptr: 8,
                     monitors: HashMap::new(),
                 }
@@ -38802,6 +38820,14 @@ mod tests {
                 s.alloc_entry(HeapEntry::Object {
                     fields: vec![Value::Int(0); 4],
                 })
+            }
+
+            pub(super) fn define_class(&self, class_id: ClassId, name: &str) {
+                self.shared
+                    .lock()
+                    .unwrap()
+                    .class_names
+                    .insert(class_id, name.to_string());
             }
         }
 
@@ -38865,11 +38891,13 @@ mod tests {
                     fields[index] = value;
                 }
             }
-            fn alloc_object(&mut self, _c: ClassId, num_fields: usize) -> ObjectRef {
+            fn alloc_object(&mut self, c: ClassId, num_fields: usize) -> ObjectRef {
                 let mut s = self.shared.lock().unwrap();
-                s.alloc_entry(HeapEntry::Object {
+                let obj = s.alloc_entry(HeapEntry::Object {
                     fields: vec![Value::Int(0); num_fields],
-                })
+                });
+                s.object_classes.insert(obj.as_ptr() as usize, c);
+                obj
             }
             fn object_num_fields(&self, obj: ObjectRef) -> usize {
                 let s = self.shared.lock().unwrap();
@@ -38961,11 +38989,17 @@ mod tests {
                 o.as_ptr() as i32
             }
             fn record_printed_value(&mut self, _v: Value) {}
-            fn class_name_of_id(&self, _c: ClassId) -> Option<String> {
-                None
+            fn class_name_of_id(&self, c: ClassId) -> Option<String> {
+                self.shared.lock().unwrap().class_names.get(&c).cloned()
             }
-            fn class_id_of_object(&self, _o: ObjectRef) -> ClassId {
-                ClassId::new(0)
+            fn class_id_of_object(&self, o: ObjectRef) -> ClassId {
+                self.shared
+                    .lock()
+                    .unwrap()
+                    .object_classes
+                    .get(&(o.as_ptr() as usize))
+                    .copied()
+                    .unwrap_or_else(|| ClassId::new(0))
             }
             fn capture_stack_trace(&mut self, _h: i32) -> Vec<StackTraceEntry> {
                 Vec::new()
@@ -39221,6 +39255,30 @@ mod tests {
             fn check_deep_reflection_access(&self, _a: ClassId, _t: ClassId) -> Result<(), String> {
                 Ok(())
             }
+        }
+
+        #[test]
+        fn unbox_wrapper_requires_jdk_wrapper_class() {
+            let mut ctx = MockCtx::new(1);
+            let entity_class = ClassId::new(1000);
+            ctx.define_class(entity_class, "example/EntityWithLongId");
+            let entity = ctx.alloc_object(entity_class, 1);
+            ctx.set_field(entity, 0, Value::Long(42));
+
+            assert_eq!(unbox_wrapper(&ctx, entity), None);
+            let expected_identity = ctx.identity_hash_code(entity);
+            assert_eq!(
+                element_hash_code(&mut ctx, &Value::Object(Some(entity))),
+                expected_identity
+            );
+
+            let long_class = ClassId::new(1001);
+            ctx.define_class(long_class, "java/lang/Long");
+            let boxed = ctx.alloc_object(long_class, 1);
+            ctx.set_field(boxed, 0, Value::Long(42));
+
+            assert_eq!(unbox_wrapper(&ctx, boxed), Some(Value::Long(42)));
+            assert_eq!(element_hash_code(&mut ctx, &Value::Object(Some(boxed))), 42);
         }
 
         /// Helper: initialise a fresh LBQ instance with the given capacity.

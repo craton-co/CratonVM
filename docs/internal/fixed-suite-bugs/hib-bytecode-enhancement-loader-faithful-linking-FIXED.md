@@ -10,7 +10,7 @@ Verification on Azure host `/data/data/cratonvm` worktree `/data/data/wt-hib-enh
 - Post-fix broader lazy/lazytoone subset: `lazy_lazytoone_subset.txt` is `SUMMARY total=69 pass=69 fail=0 hang=0` with the final fix8 binary.
 - Additional 131-subset same-name checkcast regression: `LoadAndFetchGraphAssociationNotExplicitlySpecifiedTest` is fixed by the final type-test fallback (`found=14 started=14 ok=14 failed=0`).
 
-The remaining non-green `gated_subset.txt` cases are not this loader-linking/lazytoone family anymore. They are tracked separately in [`docs/known-issues/hib-bytecode-enhancement-basic-merge-version-residuals.md`](../../known-issues/hib-bytecode-enhancement-basic-merge-version-residuals.md).
+The remaining non-green `gated_subset.txt` cases were not this loader-linking/lazytoone family. They were tracked separately and later retired in [`hib-bytecode-enhancement-basic-merge-version-residuals-FIXED.md`](hib-bytecode-enhancement-basic-merge-version-residuals-FIXED.md).
 
 ---
 

@@ -21796,8 +21796,8 @@ fn execute_invokestatic(
     // — the bug needs a SELF-call inside the closure body, not merely
     // distinct closure identity).
     //
-    // `self_class_id` feeds BOTH the class-init step below and the
-    // `try_stackless_invoke` dispatch override further down, so the method
+    // The dispatch identity selected below feeds BOTH the class-init step and
+    // the `try_stackless_invoke` dispatch override, so the method
     // lookup itself (not just class initialization) uses the correct,
     // already-known identity for a self-call.
     let self_class_id = shared
@@ -21807,8 +21807,18 @@ fn execute_invokestatic(
         .filter(|c| c.name.as_ref() == method_class_name.as_ref())
         .map(|_| current_class_id);
 
+    // Sibling static owners in a user-defined loader need the same identity
+    // preservation as self-calls; resolving by flat name can pick the app copy.
+    let static_dispatch_class_id = self_class_id.or_else(|| {
+        if crate::runtime::env_cache::loader_aware_resolution() {
+            lookup_loader_initiated(shared, current_class_id, &method_class_name)
+        } else {
+            None
+        }
+    });
+
     if !is_native {
-        let target_class_id = if let Some(id) = self_class_id {
+        let target_class_id = if let Some(id) = static_dispatch_class_id {
             id
         } else {
             // Load and initialize the target class.
@@ -21931,7 +21941,7 @@ fn execute_invokestatic(
         &method_descriptor,
         &args,
         true,
-        self_class_id,
+        static_dispatch_class_id,
     )? {
         CachedCallResult::FramePushed => {
             populate_invoke_cache(thread, shared, current_class_id, cp_index, false);
@@ -21947,11 +21957,11 @@ fn execute_invokestatic(
     // Fallback: recursive dispatch. `invoke_or_native` re-resolves the
     // owner by NAME (no ClassId-override parameter exists on it), so a
     // self-call whose class-literal method wasn't found by the stackless
-    // path above (e.g. its bytecode requires the full recursive/native
-    // path) still needs the identity fix: dispatch straight through
-    // `invoke_on_class_shared` on `self_class_id` instead of falling into
-    // the loader-blind name lookup `invoke_or_native` performs internally.
-    let result = if let Some(cid) = self_class_id {
+    // path above, or a loader-local sibling static owner, still needs the
+    // identity fix: dispatch straight through `invoke_on_class_shared` instead
+    // of falling into the loader-blind name lookup `invoke_or_native` performs
+    // internally.
+    let result = if let Some(cid) = static_dispatch_class_id {
         crate::vm::invoke_on_class_shared(
             shared,
             thread,
@@ -22124,25 +22134,35 @@ fn populate_invoke_cache(
         return;
     }
 
-    // T10.4 fast path — if a sibling thread already resolved this call site
-    // we reuse its fully-built `CachedInvokeTarget` from the shared
-    // lock-free cache, avoiding both `class_manager.read()` and the native
-    // registry lookup below.
-    let promoted_key: crate::runtime::lockfree_resolve::PromotedInvokeKey =
-        (caller_class_id, cp_index, is_special, None);
-    if let Some(target) = shared.shared_resolution.get_promoted_invoke(&promoted_key) {
-        thread
-            .invoke_cache
-            .put(caller_class_id, cp_index, is_special, target);
-        return;
-    }
-
-    // Resolve the method reference from the constant pool
+    // Resolve the method reference from the constant pool. We need the symbolic
+    // owner before consulting the shared promoted cache because loader-aware
+    // invokestatic/invokespecial sites may have a per-loader owner that differs
+    // from the flat global owner.
     let (class_name, method_name, descriptor, num_params) =
         match resolve_method_ref(shared, caller_class_id, cp_index) {
             Ok(r) => r,
             Err(_) => return,
         };
+
+    let loader_owner_override = if crate::runtime::env_cache::loader_aware_resolution() {
+        lookup_loader_initiated(shared, caller_class_id, &class_name)
+    } else {
+        None
+    };
+
+    // T10.4 fast path: reuse a sibling thread's fully-built target unless this
+    // static/special site has a loader-local owner. Reusing a flat-global owner
+    // here would bypass loader-faithful constructor/super/static dispatch.
+    let promoted_key: crate::runtime::lockfree_resolve::PromotedInvokeKey =
+        (caller_class_id, cp_index, is_special, None);
+    if loader_owner_override.is_none() {
+        if let Some(target) = shared.shared_resolution.get_promoted_invoke(&promoted_key) {
+            thread
+                .invoke_cache
+                .put(caller_class_id, cp_index, is_special, target);
+            return;
+        }
+    }
 
     // Check if it's a native method.  WP2.4-F1: the staleness gate binds
     // to the *referenced* class — if that class is later redefined to a
@@ -22211,8 +22231,12 @@ fn populate_invoke_cache(
         return;
     }
 
-    // Find the bytecode method
-    let target_class_id = match shared.class_manager.read().get_loaded_class_id(&class_name) {
+    // Find the bytecode method. For static/special refs from a loader-private class,
+    // the symbolic owner must stay in that loader's namespace; resolving through
+    // the flat global store would cache the app-loader method body.
+    let target_class_id = match loader_owner_override
+        .or_else(|| shared.class_manager.read().get_loaded_class_id(&class_name))
+    {
         Some(id) => id,
         None => return,
     };
@@ -22342,6 +22366,19 @@ fn populate_invoke_cache(
         .put(caller_class_id, cp_index, is_special, target);
 }
 
+#[inline]
+fn cached_static_owner_stale(
+    shared: &SharedVm,
+    caller_class_id: ClassId,
+    cached: &CachedBytecodeMethod,
+) -> bool {
+    if !crate::runtime::env_cache::loader_aware_resolution() {
+        return false;
+    }
+    lookup_loader_initiated(shared, caller_class_id, cached.class_name.as_ref())
+        .is_some_and(|owner_cid| owner_cid != cached.declaring_class_id)
+}
+
 /// Fast invokestatic using the invoke cache (stackless dispatch).
 /// Returns FramePushed for bytecode (caller updates frame_idx),
 /// Handled for native, CacheMiss for fall-through to slow path.
@@ -22450,20 +22487,31 @@ fn execute_invokestatic_cached(
             cached,
             gate: _,
             supersede_epoch: _,
-        } => execute_jit_call(
-            shared,
-            thread,
-            frame_idx,
-            &compiled,
-            num_params,
-            return_type,
-            needs_heap,
-            &cached,
-        ),
+        } => {
+            if cached_static_owner_stale(shared, caller_class_id, &cached) {
+                thread.invoke_cache.evict(caller_class_id, cp_index, false);
+                return Ok(CachedCallResult::CacheMiss);
+            }
+            execute_jit_call(
+                shared,
+                thread,
+                frame_idx,
+                &compiled,
+                num_params,
+                return_type,
+                needs_heap,
+                &cached,
+            )
+        }
         CachedInvokeTarget::Bytecode {
             ref cached,
             gate: ref entry_gate,
         } => {
+            if cached_static_owner_stale(shared, caller_class_id, cached) {
+                thread.invoke_cache.evict(caller_class_id, cp_index, false);
+                return Ok(CachedCallResult::CacheMiss);
+            }
+
             // Fast path: check if the method was already JIT-compiled (e.g. by OSR)
             // before going through the invocation counter.
             if !redefine_jit_quiesced {
@@ -28743,6 +28791,20 @@ fn execute_invokevirtual_cached(
         }
         // Static cache entries: invokespecial uses Bytecode/Native
         CachedInvokeTarget::Bytecode { cached, gate: _ } => {
+            if is_special && crate::runtime::env_cache::loader_aware_resolution() {
+                if let Some(owner_cid) = lookup_loader_initiated(
+                    shared,
+                    caller_class_id,
+                    cached.class_name.as_ref(),
+                ) {
+                    if owner_cid != cached.declaring_class_id {
+                        thread
+                            .invoke_cache
+                            .evict(caller_class_id, cp_index, is_special);
+                        return Ok(CachedCallResult::CacheMiss);
+                    }
+                }
+            }
             if thread.frames.len() >= shared.config.max_stack_depth {
                 dump_stack_on_soe(thread);
                 return Err(MethodCallFailed::InternalError(VmError::Runtime(
