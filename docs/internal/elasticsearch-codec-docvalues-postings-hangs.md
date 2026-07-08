@@ -3,10 +3,10 @@
 Status: ARCHIVED 2026-07-03 (this file is the historical investigation
 record). Live status: cause 1 (doc-values `java.math` hot path) is FIXED —
 see `docs/known-issues/elasticsearch-randomizedcontext-per-thread-null.md`
-for its residual, which is tracked there, not here. Cause 2 (postings
-classes) is STILL OPEN — see the slimmed current doc at
-`docs/known-issues/elasticsearch-codec-docvalues-postings-hangs.md`, which
-now covers only the open postings gap plus a 2026-07-03 addendum below.
+for its unrelated residual. Cause 2 (postings classes) was fixed on
+2026-07-08 by correcting the CratonVM `RamUsageTester.ramUsed(Document)`
+shortcut; see
+`docs/internal/fixed-suite-bugs/elasticsearch-postings-ramusage-undercharge-FIXED.md`.
 
 Date observed: 2026-07-02
 
