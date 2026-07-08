@@ -3691,7 +3691,8 @@ pub(crate) fn register_phase56_summary_stats(r: &mut NativeMethodRegistry) {
 // ---------------------------------------------------------------------------
 // Collectors expansion: maxBy, minBy, mapping, filtering, flatMapping,
 // summarizingInt/Long/Double, toUnmodifiableList/Set/Map, collectingAndThen
-// Collector tags (extending existing):
+// Collector tags. Values 1/2 intentionally match native-collections' core
+// collector engine, which owns Stream.collect(Collector) and Collector.supplier().
 //   9 = MAX_BY (comparator in ARG1)
 //  10 = MIN_BY (comparator in ARG1)
 //  11 = MAPPING (Function in ARG1, downstream Collector in ARG2)
@@ -3699,8 +3700,7 @@ pub(crate) fn register_phase56_summary_stats(r: &mut NativeMethodRegistry) {
 //  13 = SUMMARIZING_INT (ToIntFunction in ARG1)
 //  14 = SUMMARIZING_LONG (ToLongFunction in ARG1)
 //  15 = SUMMARIZING_DOUBLE (ToDoubleFunction in ARG1)
-//  16 = TO_UNMODIFIABLE_LIST
-//  17 = TO_UNMODIFIABLE_SET
+//   1 = TO_UNMODIFIABLE_LIST, 2 = TO_UNMODIFIABLE_SET
 //  18 = COLLECTING_AND_THEN (downstream Collector in ARG1, Function finisher in ARG2)
 // ---------------------------------------------------------------------------
 const P56_COLLECTOR_MAX_BY: i32 = 9;
@@ -3710,8 +3710,8 @@ const P56_COLLECTOR_FILTERING: i32 = 12;
 const P56_COLLECTOR_SUMMARIZING_INT: i32 = 13;
 const P56_COLLECTOR_SUMMARIZING_LONG: i32 = 14;
 const P56_COLLECTOR_SUMMARIZING_DOUBLE: i32 = 15;
-const P56_COLLECTOR_TO_UNMODIFIABLE_LIST: i32 = 16;
-const P56_COLLECTOR_TO_UNMODIFIABLE_SET: i32 = 17;
+const P56_COLLECTOR_TO_UNMODIFIABLE_LIST: i32 = 1;
+const P56_COLLECTOR_TO_UNMODIFIABLE_SET: i32 = 2;
 const P56_COLLECTOR_COLLECTING_AND_THEN: i32 = 18;
 
 pub(crate) fn register_phase56_collectors_extras(r: &mut NativeMethodRegistry) {
@@ -3881,7 +3881,7 @@ pub(crate) fn register_phase56_collectors_extras(r: &mut NativeMethodRegistry) {
         "toUnmodifiableList",
         "()Ljava/util/stream/Collector;",
         |ctx, _args| {
-            let c = alloc_concurrent_synthetic(ctx, "java/util/stream/Collector", 3);
+            let c = alloc_concurrent_synthetic(ctx, "java/util/stream/Collector", 4);
             ctx.set_field(c, 0, Value::Int(P56_COLLECTOR_TO_UNMODIFIABLE_LIST));
             Ok(Some(Value::Object(Some(c))))
         },
@@ -3893,7 +3893,7 @@ pub(crate) fn register_phase56_collectors_extras(r: &mut NativeMethodRegistry) {
         "toUnmodifiableSet",
         "()Ljava/util/stream/Collector;",
         |ctx, _args| {
-            let c = alloc_concurrent_synthetic(ctx, "java/util/stream/Collector", 3);
+            let c = alloc_concurrent_synthetic(ctx, "java/util/stream/Collector", 4);
             ctx.set_field(c, 0, Value::Int(P56_COLLECTOR_TO_UNMODIFIABLE_SET));
             Ok(Some(Value::Object(Some(c))))
         },
