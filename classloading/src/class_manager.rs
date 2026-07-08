@@ -8094,7 +8094,7 @@ fn synthetic_stub_fields(name: &str) -> Vec<cratonvm_reader::field::ClassFileFie
                 attributes: vec![],
             },
         ],
-        // LoginContext = 4 (name, subject, handler, modules).
+        // LoginContext = 4 (name, subject, handler, config).
         "javax/security/auth/login/LoginContext" => vec![
             ClassFileField {
                 access_flags: FieldAccessFlags::empty(),
@@ -8118,8 +8118,8 @@ fn synthetic_stub_fields(name: &str) -> Vec<cratonvm_reader::field::ClassFileFie
             },
             ClassFileField {
                 access_flags: FieldAccessFlags::empty(),
-                name: cratonvm_types::intern_arc("modules"),
-                descriptor: cratonvm_types::intern_arc("Ljava/util/List;"),
+                name: cratonvm_types::intern_arc("config"),
+                descriptor: cratonvm_types::intern_arc("Ljavax/security/auth/login/Configuration;"),
                 attributes: vec![],
             },
         ],
