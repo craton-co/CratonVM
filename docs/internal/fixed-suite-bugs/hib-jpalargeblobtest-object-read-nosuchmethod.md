@@ -2,7 +2,7 @@
 
 | | |
 |---|---|
-| **Status** | 🟢 FIXED (both crash bugs) / 🟡 test class itself still does not complete — see "2026-07-07: fast-fail became a multi-hour non-hang" below. Both the original JIT dispatch bug (merged `b09fea46`) and the residual GC-staleness bug (merged, see "Residual fix" below) are resolved; the class was then observed to run past its old crash points and grind for a very long time (not a deadlock — the interpreter is genuinely still executing the test's own pathological I/O pattern). Not re-opening this as a VM bug; tracked here for continuity since it is the same class/symptom lineage. |
+| **Status** | FIXED crash family / test class itself still does not complete quickly - see "2026-07-07: fast-fail became a multi-hour non-hang" below. The original JIT dispatch bug (`b09fea46`), the first native stale-local residual (`813bc19b`), and the 2026-07-08 missed `DataInputStream.readFully` helper variant are resolved; the class was then observed to run past its old crash points and grind for a very long time (not a deadlock - the interpreter is genuinely still executing the test's own pathological I/O pattern). Not re-opening this as a VM bug; tracked here for continuity since it is the same class/symptom lineage. |
 | **Area** | VM — virtual/interface method dispatch for `InputStream.read()` on a JDBC `Blob`'s binary stream |
 | **Symptom** | `java.lang.NoSuchMethodError: java/lang/Object.read()I` |
 | **Severity** | medium — single class, but the failure mode (dispatch landing on `Object`'s non-existent method) suggests a general vtable/interface-dispatch defect that could recur elsewhere. |
@@ -180,6 +180,42 @@ artifacts, confirmed identical on unmodified `dev`.
 
 Fixed in worktree `/data/data/wt-hib-jpalargeblob-residual-20260706`, branch
 `fix/hib-jpalargeblob-residual-20260706`, merged to `dev`.
+
+## Residual follow-up (2026-07-08)
+
+The 2026-07-06 residual fix correctly pinned
+`native_bais_read_bytes` and `native_dis_read_bytes`, but its commit message
+and the section above overstated coverage: the shared native
+`DataInputStream.readFully` helper, `dis_read_fully_impl`, still kept
+`this`, `buf`, and `inner` as raw `ObjectRef` locals across
+`ctx.invoke_virtual(inner, "read", "([BII)I", ...)`, then reused `buf` in the
+byte-by-byte fallback. If a moving GC fired inside the wrapped stream's read,
+the subsequent `set_array_element(buf, ...)` could see the stale `buf` address
+as a non-array object and trip:
+
+```
+assertion `left == right` failed
+  left: Object
+ right: Array
+native invoked from org/h2/util/IOUtils.readFully(Ljava/io/InputStream;[BI)I
+```
+
+Fix: `dis_read_fully_impl` now pins and reloads `this`, `buf`, and `inner`
+around every bulk virtual read, reloads `this`/`buf` after each
+`dis_read_one` fallback call before `set_array_element`, and the adjacent
+already-pinned read helpers now unpin before propagating `invoke_virtual`
+errors.
+
+**Validation:** `cargo test -p cratonvm-native-io --lib -- --nocapture`
+passed (332/332). The new focused regression
+`cargo test -p cratonvm-vm --test native_io_dis_read_fully_pin -- --nocapture`
+passed with a stream whose bulk `read(byte[],int,int)` returns `0`, forcing
+`DataInputStream.readFully` into the byte-by-byte fallback while each
+single-byte `read()` allocates and calls `System.gc()`. A unique debug binary
+was also built for the Hibernate one-class probe; a 45s watchdog run did not
+reproduce the `ObjectKind::Array` assertion or `Object.read()I` before the
+diagnostic abort, but that debug run was still in pre-test Log4j/Hibernate
+loading rather than the H2 Blob loop.
 
 ## 2026-07-07: fast-fail became a multi-hour non-hang (not a new VM bug)
 
