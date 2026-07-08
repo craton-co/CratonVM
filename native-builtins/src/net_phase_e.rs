@@ -2875,6 +2875,33 @@ fn register_re1_socket(r: &mut NativeMethodRegistry) {
             Ok(Some(Value::Object(Some(ia))))
         },
     );
+    // FIX (netty-client-socket-write-after-close): `getLocalAddress()` — the
+    // LOCAL bind address — had no native registration at all (unlike its
+    // sibling `getInetAddress()`, the REMOTE address, just above), so real
+    // `java.net.Socket.getLocalAddress()` bytecode ran against this
+    // synthetic object. That bytecode reads a real `SocketImpl`/holder
+    // structure that doesn't exist here — this file's own `SOCK_HOST` slot
+    // holds a plain `java.lang.String` instead (see the side-table
+    // rationale above), so the real accessor it calls next resolves onto
+    // `String` and throws a bogus `NoSuchMethodError:
+    // java/lang/String.getOption(I)Ljava/lang/Object;` (observed via Apache
+    // HttpClient5's connection setup calling this — see
+    // docs/known-issues/netty-client-socket-write-after-close-nsme.md).
+    // We don't track the real local bind IP for this client-side socket
+    // (the TLS connect never does an explicit local bind), so return
+    // loopback — a real client socket connecting to a loopback server
+    // reports 127.0.0.1 as its local address too, and callers here only
+    // need a non-crashing, non-null address (route/pool bookkeeping),
+    // not byte-perfect network topology.
+    r.register(
+        sock,
+        "getLocalAddress",
+        "()Ljava/net/InetAddress;",
+        |ctx, _args| {
+            let ia = alloc_inet_address(ctx, "localhost", "127.0.0.1");
+            Ok(Some(Value::Object(Some(ia))))
+        },
+    );
 
     r.register(
         sock,
