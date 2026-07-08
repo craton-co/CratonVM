@@ -40326,6 +40326,13 @@ pub(crate) fn register_p68_ssl(r: &mut NativeMethodRegistry) {
         |ctx, args| {
             let this = obj_arg(args, 0)?;
             let fd_id = ctx.get_field(this, 2);
+            if std::env::var_os("CRATONVM_DBG_TLS_SOCK").is_some() {
+                eprintln!(
+                    "[dbg-tls-sock] thread={:?} getInputStream tls_id={:?}",
+                    std::thread::current().id(),
+                    fd_id
+                );
+            }
             // Return an InputStream that reads from the TLS fd
             let is = alloc_concurrent_synthetic(ctx, "javax/net/ssl/SSLSocketInputStream", 1);
             ctx.set_field(is, 0, fd_id); // fd_id
@@ -40339,6 +40346,13 @@ pub(crate) fn register_p68_ssl(r: &mut NativeMethodRegistry) {
         |ctx, args| {
             let this = obj_arg(args, 0)?;
             let fd_id = ctx.get_field(this, 2);
+            if std::env::var_os("CRATONVM_DBG_TLS_SOCK").is_some() {
+                eprintln!(
+                    "[dbg-tls-sock] thread={:?} getOutputStream tls_id={:?}",
+                    std::thread::current().id(),
+                    fd_id
+                );
+            }
             let os = alloc_concurrent_synthetic(ctx, "javax/net/ssl/SSLSocketOutputStream", 1);
             ctx.set_field(os, 0, fd_id);
             Ok(Some(Value::Object(Some(os))))
@@ -40347,6 +40361,13 @@ pub(crate) fn register_p68_ssl(r: &mut NativeMethodRegistry) {
     r.register(ssl_sock, "close", "()V", |ctx, args| {
         let this = obj_arg(args, 0)?;
         let tls_id = ctx.get_field(this, NEW13_SOCK_TLSID).as_int().unwrap_or(-1);
+        if std::env::var_os("CRATONVM_DBG_TLS_SOCK").is_some() {
+            eprintln!(
+                "[dbg-tls-sock] thread={:?} JAVA_CALLED Socket.close() tls_id={}",
+                std::thread::current().id(),
+                tls_id
+            );
+        }
         if tls_id >= 0 {
             // Idempotent — s2_tls_close tolerates an unknown id. The TCP
             // half-close inside shutdown() also flushes any pending TLS
@@ -40456,6 +40477,13 @@ pub(crate) fn register_p68_ssl(r: &mut NativeMethodRegistry) {
     r.register(ssl_os, "write", "(I)V", |ctx, args| {
         let this = obj_arg(args, 0)?;
         let tls_id = ctx.get_field(this, 0).as_int().unwrap_or(-1);
+        if std::env::var_os("CRATONVM_DBG_TLS_SOCK").is_some() {
+            eprintln!(
+                "[dbg-tls-sock] thread={:?} SSLSocketOutputStream.write(int) tls_id={}",
+                std::thread::current().id(),
+                tls_id
+            );
+        }
         if tls_id < 0 {
             return Err(RuntimeError::IOException {
                 message: "SSLSocketOutputStream.write: stream is closed".into(),
@@ -40471,6 +40499,15 @@ pub(crate) fn register_p68_ssl(r: &mut NativeMethodRegistry) {
     r.register(ssl_os, "write", "([BII)V", |ctx, args| {
         let this = obj_arg(args, 0)?;
         let tls_id = ctx.get_field(this, 0).as_int().unwrap_or(-1);
+        let len_arg = args.get(3).and_then(|v| v.as_int()).unwrap_or(-1);
+        if std::env::var_os("CRATONVM_DBG_TLS_SOCK").is_some() {
+            eprintln!(
+                "[dbg-tls-sock] thread={:?} SSLSocketOutputStream.write([BII) tls_id={} len={}",
+                std::thread::current().id(),
+                tls_id,
+                len_arg
+            );
+        }
         if tls_id < 0 {
             return Err(RuntimeError::IOException {
                 message: "SSLSocketOutputStream.write: stream is closed".into(),
