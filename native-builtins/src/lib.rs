@@ -22611,7 +22611,7 @@ pub fn register_essential_natives(registry: &mut NativeMethodRegistry) {
             // EU rule: DST from last Sunday of March 01:00 UTC to last Sunday
             // of October 01:00 UTC, +1h. Applies to the whole CET family and
             // (with a 0 standard offset) Europe/London.
-            "Europe/Paris" | "Europe/Berlin" | "Europe/Rome" | "Europe/Madrid"
+            "CET" | "Europe/Paris" | "Europe/Berlin" | "Europe/Rome" | "Europe/Madrid"
             | "Europe/Oslo" | "Europe/Amsterdam" | "Europe/Brussels" | "Europe/Vienna"
             | "Europe/Copenhagen" | "Europe/Stockholm" | "Europe/Zurich" | "Europe/Warsaw"
             | "Europe/Prague" | "Europe/Budapest" | "Europe/London" | "GB"

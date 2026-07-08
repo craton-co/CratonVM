@@ -28,6 +28,13 @@ public class TzDstProbe {
         check("paris.oct28-before", paris.getOffset(oct28_0030utc), 7200000L);
         check("paris.oct28-after", paris.getOffset(oct28_0130utc), 3600000L);
 
+        // Legacy CET is a distinct HotSpot zone id, not just a display name.
+        // Hibernate-adjacent temporal code can still surface the alias.
+        TimeZone cet = TimeZone.getTimeZone("CET");
+        check("cet.raw", cet.getRawOffset(), 3600000L);
+        check("cet.oct28-before", cet.getOffset(oct28_0030utc), 7200000L);
+        check("cet.oct28-after", cet.getOffset(oct28_0130utc), 3600000L);
+
         TimeZone akl = TimeZone.getTimeZone("Pacific/Auckland");
         check("akl.raw", akl.getRawOffset(), 12 * 3600000L);
         check("akl.jan", akl.getOffset(jan15_2018), 13 * 3600000L); // NZDT
