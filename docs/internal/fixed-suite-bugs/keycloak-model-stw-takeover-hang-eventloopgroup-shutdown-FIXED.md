@@ -62,10 +62,54 @@ blocked thread was polling.
 
 ## Verification
 
-The local checkout does not contain `apps/keycloak`, so the original
-`RealmModelTest` suite-runner repro was not runnable here. The replacement
-validation is the narrow native selector regression group covering the root
-mechanism:
+Real suite-runner repro, after the fix:
+
+```powershell
+$suite = 'C:\craton\CratonVM\apps\keycloak-suite-runner\.suite'
+$list = Join-Path $suite 'keycloak-model-realm-stw-20260708-001.tsv'
+"module`tclass" | Set-Content -Path $list -Encoding ascii
+"testsuite/model`torg.keycloak.testsuite.model.RealmModelTest" | Add-Content -Path $list -Encoding ascii
+
+& 'C:\craton\CratonVM\apps\keycloak-suite-runner\run-keycloak-suite.ps1' `
+  -ClassList $list -Category others -Vm craton -Jit off -Parallel 1 `
+  -TimeoutSec 900 -RunName 'keycloak-stw-eventloopgroup-verify-20260708-001' `
+  -KeycloakRoot 'C:\craton\CratonVM\apps\keycloak' -WorkDir $suite `
+  -Exe 'C:\craton\cargo-targets\keycloak-stw-eventloopgroup-20260708-001\release\cratonvm-keycloak-stw-eventloopgroup-20260708-001.exe'
+```
+
+Result: no hang. The runner returned in 108.644s with status `FAIL`, not
+`HANG`/timeout. The log reaches:
+
+```text
+Changed status of io.netty.channel.EventLoopGroup to STOPPING
+Changed status of io.netty.channel.EventLoopGroup to STOPPED
+```
+
+and contains no `STW cross-thread JIT takeover is still waiting` signature.
+This confirms the original EventLoopGroup shutdown hang is closed.
+
+The class now fails later and cleanly with a separate CratonVM-specific
+residual:
+
+```text
+java.lang.ExceptionInInitializerError
+Caused by: org.infinispan.commons.CacheConfigurationException:
+ISPN000436: Cache '___protobuf_metadata' has been requested, but no matching cache configuration exists
+```
+
+HotSpot `-Xint` control for the same class/list passes in 142.6s:
+
+```powershell
+& 'C:\craton\CratonVM\apps\keycloak-suite-runner\run-keycloak-suite.ps1' `
+  -ClassList $list -Category others -Vm hotspot -Jit off -Parallel 1 `
+  -TimeoutSec 900 -RunName 'keycloak-stw-eventloopgroup-hotspot-control-20260708-001' `
+  -KeycloakRoot 'C:\craton\CratonVM\apps\keycloak' -WorkDir $suite
+```
+
+The new residual is tracked separately in
+[`docs/known-issues/keycloak-model-protobuf-metadata-cache-config-missing.md`](../../known-issues/keycloak-model-protobuf-metadata-cache-config-missing.md).
+
+Narrow native selector regression group covering the root mechanism:
 
 ```powershell
 $env:CARGO_TARGET_DIR='C:\craton\cargo-targets\keycloak-stw-eventloopgroup-20260708-001'
@@ -85,8 +129,7 @@ to:
 C:\craton\cargo-targets\keycloak-stw-eventloopgroup-20260708-001\release\cratonvm-keycloak-stw-eventloopgroup-20260708-001.exe
 ```
 
-That binary is available for a later real `RealmModelTest --nojit` rerun in a
-checkout that has the Keycloak fixture.
+That binary was used for the real CratonVM suite-runner verification above.
 
 ## Cross-reference
 
