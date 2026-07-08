@@ -2847,15 +2847,37 @@ fn register_re1_socket(r: &mut NativeMethodRegistry) {
             return Err(iae(format!("negative SO_TIMEOUT: {ms}")));
         }
         let sid = sock_get(this).stream_id;
+        if std::env::var_os("CRATONVM_DBG_TLS_SOCK").is_some() {
+            eprintln!(
+                "[dbg-tls-sock] setSoTimeout called this={:?} ms={} sid={}",
+                this, ms, sid
+            );
+        }
         if sid >= 0 {
+            let d = if ms == 0 {
+                None
+            } else {
+                Some(Duration::from_millis(ms as u64))
+            };
             let reg = s2_registry().lock();
             if let Some(stream) = reg.streams.get(&sid) {
-                let d = if ms == 0 {
-                    None
-                } else {
-                    Some(Duration::from_millis(ms as u64))
-                };
                 stream
+                    .set_read_timeout(d)
+                    .map_err(|e| ioex(format!("setSoTimeout failed: {e}")))?;
+            } else if let Some(entry) = reg.tls_streams.get(&sid) {
+                // FIX (netty-client-socket-write-after-close residual): a
+                // socket connected via new13_do_create_socket's TLS path
+                // (phases_late.rs) registers its stream id in `tls_streams`,
+                // not `streams` — the table this native originally only
+                // checked. Apache HttpClient5's `DefaultManagedHttpClient
+                // Connection.bind()` calls `setSoTimeout`/`getSoTimeout`
+                // unconditionally on every connection (see `getSoTimeout`'s
+                // own doc comment below); missing `tls_streams` here made
+                // both silently no-op for every TLS socket instead of
+                // configuring the real underlying TcpStream's read timeout.
+                entry
+                    .stream
+                    .get_ref()
                     .set_read_timeout(d)
                     .map_err(|e| ioex(format!("setSoTimeout failed: {e}")))?;
             }
@@ -2883,6 +2905,18 @@ fn register_re1_socket(r: &mut NativeMethodRegistry) {
             let reg = s2_registry().lock();
             if let Some(stream) = reg.streams.get(&sid) {
                 let ms = stream
+                    .read_timeout()
+                    .map_err(|e| ioex(format!("getSoTimeout failed: {e}")))?
+                    .map(|d| d.as_millis() as i32)
+                    .unwrap_or(0);
+                return Ok(Some(Value::Int(ms)));
+            }
+            // See the matching comment in setSoTimeout above: a TLS socket's
+            // stream id lives in `tls_streams`, not `streams`.
+            if let Some(entry) = reg.tls_streams.get(&sid) {
+                let ms = entry
+                    .stream
+                    .get_ref()
                     .read_timeout()
                     .map_err(|e| ioex(format!("getSoTimeout failed: {e}")))?
                     .map(|d| d.as_millis() as i32)
