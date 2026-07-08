@@ -9,6 +9,21 @@
 | **Discovered** | 2026-06-24, triaging the Hibernate suite residuals after the collection-delegation stack-overflow fix (`7b224d8a`). |
 | **See also** | [hib-bytecode-enhancement-loader-faithful-linking.md](hib-bytecode-enhancement-loader-faithful-linking.md) — describes the *linking/dispatch* layer built on top of this doc's three-layer `CONSTANT_Class`/`defineClass`-namespace/`findLoadedClass` fix (superclass linking, `invokespecial` dispatch, SessionFactory-build identity). Both docs describe the same loader-identity mechanism; that doc's `enhancement.lazy.*`/`mapping.lazytoone.*` cluster is the largest remaining gap in this whole family, re-verified still open 2026-07-04. |
 
+> **CURRENT DEV RECHECK 2026-07-08:** Do **not** archive this document yet.
+> The original Hibernate bug is still fixed on `dev` (`d49ce503`, unique probe
+> binary `/data/data/cratonvm-probe-bins/cvhibproxy-20260708-170000`):
+> `ProxyClassReuseTest` reports `found=3 started=3 ok=3 failed=0`.
+> However, the residual Spring/Groovy namespace cluster remains VM-only:
+> HotSpot passes `GroovyBeanDefinitionReaderTests` 36/36 with the same translated
+> Linux fixture, while CratonVM `--nojit` completes without hanging but fails
+> 6/36 (`succ=30 fail=6`) in the XML-namespace/component-scan methods. The
+> stack signature is now `StreamingMarkupBuilder$_bind_closure7` ->
+> `Selector$InitSelector.getMetaClass(Selector.java:406)` AIOOBE, alongside
+> `gen_heap::get_field` out-of-bounds and HIB-CV-32 corrupt-`Value` guard lines.
+> The BeanShell fixture available for this recheck is not HotSpot-clean
+> (`BshScriptFactoryTests` 5/18 on HotSpot), so today's BeanShell run is not
+> used as closure evidence for Residual A; keep the 2026-07-06 Residual A status.
+
 > **RETRY 2026-07-01:** Re-ran the focused builtin-loader reverse-pollution coverage on
 > current `dev`: `cargo test -p cratonvm-native-builtins test_builtin_find_loaded_class -- --nocapture`
 > passed both cases (`hides_user_namespace_hit`, `keeps_application_namespace_hit`). A broader
@@ -238,6 +253,38 @@ namespace-tag mechanism (`GroovyDynamicElementReader`), which likely performs
 a real classpath/directory scan. Not triaged further — flagged as a separate,
 pre-existing bug outside this doc's scope (not loader-identity-related as far
 as this session went).
+
+**2026-07-08 recheck:** the same cluster no longer presents as a hard hang in
+the shared Linux Spring fixture, but it is still open. HotSpot passes the full
+`GroovyBeanDefinitionReaderTests` class (`found=36 succ=36 fail=0`). CratonVM
+with `--nojit` and the same classpath completes in about 112s but reports
+`found=36 succ=30 fail=6`, with the namespace-tag methods still failing:
+`useSpringNamespaceAsMethod`, `useTwoSpringNamespaces`, `springAopSupport`,
+`contextComponentScanSpringTag`, `springScopedProxyBean`, and
+`springNamespaceBean`. The logged signatures
+are `Namespace prefix: aop is not bound to a URI` for the AOP namespace cases
+and `ArrayIndexOutOfBoundsException` in Groovy's indy selector path for the
+component-scan/scoped-proxy path:
+
+```
+org.codehaus.groovy.vmplugin.v8.Selector$InitSelector.getMetaClass(Selector.java:406)
+org.codehaus.groovy.vmplugin.v8.Selector$MethodSelector.setCallSiteTarget(Selector.java:1055)
+org.codehaus.groovy.vmplugin.v8.IndyInterface.fallback(IndyInterface.java:401)
+groovy.xml.StreamingMarkupBuilder$_bind_closure7.doCall(StreamingMarkupBuilder.groovy:249)
+org.springframework.beans.factory.groovy.GroovyDynamicElementReader.invokeMethod(GroovyDynamicElementReader.java:111)
+```
+
+The same CratonVM run emitted guarded heap-integrity diagnostics before the
+per-test failures:
+
+```
+gen_heap::get_field: out-of-bounds field read dropped ... class_name=java/lang/Object
+gen_heap::read_slot: corrupt Value cell (out-of-range discriminant) ... Heap reference-integrity defect (see HIB-CV-32).
+```
+
+So this is no longer best described as only a timeout, but it is not fixed.
+The issue remains VM-only under a HotSpot-clean Groovy fixture and should stay
+in `docs/known-issues`.
 
 ### 2026-07-03 snapshot (historical — superseded by the above)
 
@@ -486,6 +533,14 @@ debug tracing and confirmed NOT the case — `findLoadedClass` itself now behave
 correctly (every subsequent `BshClassLoader`'s `findLoadedClass("MyMessenger")`
 correctly misses, as it should), but the SECOND interpreter's `MyMessenger`
 still never gets generated.
+
+**2026-07-08 fixture caveat:** the shared Spring fixture available on the
+Azure host for this recheck is not HotSpot-clean for this class
+(`BshScriptFactoryTests` reports `found=18 succ=5 fail=13` on HotSpot, with
+BeanCreationException failures in the same general context). Do not use that
+run to update Residual A's pass/fail count or to archive this document. The
+last HotSpot-clean CratonVM-specific Residual A evidence remains the 2026-07-06
+15/18 CratonVM run above.
 
 Traced the actual failure precisely this session: BeanShell's
 `ClassManagerImpl.plainClassForName` calls the STATIC 1-arg
