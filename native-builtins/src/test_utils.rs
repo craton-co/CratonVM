@@ -264,6 +264,13 @@ fn mock_lucene_field_slot(class_name: Option<&str>, name: &str) -> Option<usize>
     }
 }
 
+fn mock_concurrent_field_slot(class_name: Option<&str>, name: &str) -> Option<usize> {
+    match (class_name, name) {
+        (Some("java/util/concurrent/LinkedBlockingQueue"), "count") => Some(1),
+        _ => None,
+    }
+}
+
 pub(crate) type InvokeVirtualHook =
     fn(&mut MockNativeContext, ObjectRef, &str, &str, &[Value]) -> Option<MethodCallResult>;
 
@@ -883,6 +890,7 @@ impl NativeContext for MockNativeContext {
             mock_classloader_field_slot(class_name.as_deref(), field_name)
                 .or_else(|| mock_buffer_field_slot(class_name.as_deref(), field_name))
                 .or_else(|| mock_lucene_field_slot(class_name.as_deref(), field_name))
+                .or_else(|| mock_concurrent_field_slot(class_name.as_deref(), field_name))
                 .or_else(|| mock_jdk_field_slot(field_name))
         };
         match slot {
@@ -899,6 +907,7 @@ impl NativeContext for MockNativeContext {
             mock_classloader_field_slot(class_name.as_deref(), field_name)
                 .or_else(|| mock_buffer_field_slot(class_name.as_deref(), field_name))
                 .or_else(|| mock_lucene_field_slot(class_name.as_deref(), field_name))
+                .or_else(|| mock_concurrent_field_slot(class_name.as_deref(), field_name))
                 .or_else(|| mock_jdk_field_slot(field_name))
         };
         if let Some(slot) = slot {

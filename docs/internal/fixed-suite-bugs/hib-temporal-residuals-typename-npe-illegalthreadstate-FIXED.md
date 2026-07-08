@@ -51,4 +51,4 @@ Built `/data/data/bin/cratonvm-hib-temporal-residuals-20260708-170734-fixed` fro
 - `rustfmt --edition 2021 --check vm/src/jit/skip_list.rs`: passed.
 - `InstantTests` final run 0: `found=204 started=204 ok=112 failed=0 aborted=92`, with 0 `typeNamePattern`, 0 `IllegalThreadStateException`, 0 H2 `<local4>`, 0 `NoSuchMethodError`.
 - `InstantTests` final run 1: `found=204 started=204 ok=112 failed=0 aborted=92`, with the same zero-signature counts.
-- `LocalDateTimeTest`: 0 `IllegalThreadStateException`; separate DST/H2 residuals remain tracked in `docs/known-issues/hib-temporal-localdatetime-dst-h2-local4-residuals.md`.
+- `LocalDateTimeTest`: 0 `IllegalThreadStateException`; the separate DST/H2 residuals are now fixed and retired to `docs/internal/fixed-suite-bugs/hib-temporal-localdatetime-dst-h2-local4-residuals-FIXED.md`.
