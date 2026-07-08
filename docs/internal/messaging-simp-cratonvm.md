@@ -30,8 +30,8 @@ HotSpot baseline:
 
 CratonVM JIT-real final:
 
-- Binary: `/data/data/cratonvm-worktrees/20260708-messaging-simp/cvm-messaging-simp-20260708-final`
-- Output: `out/jit-real-all-20260708-190444`
+- Binary: `/data/data/cratonvm-worktrees/20260708-messaging-simp/cvm-messaging-simp-20260708-merged`
+- Output: `out/jit-real-all-20260708-191453`
 - Result: `classes: EMPTY=1 OK=33`, `test-methods: found=338 passed=338 failed=0`
 
 Focused probes also confirmed:
