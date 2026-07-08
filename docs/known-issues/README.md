@@ -38,6 +38,10 @@ general-path fix) — new evidence it also hits Spring, not just Hibernate.
 
 - FIXED/RETIRED: [`hib-bytecode-enhancement-loader-faithful-linking-FIXED.md`](../internal/fixed-suite-bugs/hib-bytecode-enhancement-loader-faithful-linking-FIXED.md) - the remaining loader-faithful lazy/lazytoone failures are closed: 18/18 representative sample and 69/69 lazy/lazytoone subset pass, and the graph same-name checkcast residual now passes.
 - FIXED/RETIRED: [`hib-bytecode-enhancement-basic-merge-version-residuals-FIXED.md`](../internal/fixed-suite-bugs/hib-bytecode-enhancement-basic-merge-version-residuals-FIXED.md) - the six non-lazy basic dirty tracking, final-field embedded-id, composite merge/null, and versioned-entity residuals now pass.
+## 2026-07-08 Keycloak RealmModelTest `fullName` note retired; Liquibase timeout remains open
+
+- FIXED/RETIRED: [Infinispan ProtoStream `FileDescriptor.fullName` decode error](../internal/fixed-suite-bugs/keycloak-model-infinispan-jit-adjacent-decode-error-fullname-FIXED.md) - the exact default-JIT `decode error at pc=51 in fullName...` no longer reproduces on current `dev`. The residual pass fixed the later real-`DefaultCacheManager.defineConfiguration` delegation gap, real-JDK `StampedLock` lock-view/native coherence, Windows C-runtime symbol lookup for Panama symbol lookup, and added a conservative RxJava3 JIT skip after `CRATONVM_JIT_DENY=io/reactivex/` proved it clears the Infinispan publisher wait.
+- OPEN: [Keycloak `RealmModelTest` timeout after Infinispan bootstrap reaches Liquibase](keycloak-model-realmmodeltest-post-infinispan-liquibase-timeout.md) - with those layers fixed, CratonVM reaches Liquibase changelog parsing but still times out well after HotSpot's ~36s pass. The active residual is now a Liquibase/XML/startup throughput or blocking investigation, not the old ProtoStream `fullName` decode failure.
 
 ## 2026-07-08 `InPredicateTest` LHM NSME and stale timeout notes retired
 
@@ -126,13 +130,13 @@ All three verified against their real Keycloak classes via the suite runner; no 
   originally-reported NPE is gone (gets through the entire cache-manager
   bootstrap/use/teardown lifecycle under `--nojit`). Doc:
   [`docs/internal/fixed-suite-bugs/keycloak-model-infinispan-cache-config-null-after-real-start-FIXED.md`](../internal/fixed-suite-bugs/keycloak-model-infinispan-cache-config-null-after-real-start-FIXED.md).
-- One new, **distinct and unrelated** (JIT/VM-core, not Infinispan-specific)
-  residual remains open from the deeper `RealmModelTest` path:
-  [keycloak-model-infinispan-jit-adjacent-decode-error-fullname.md](keycloak-model-infinispan-jit-adjacent-decode-error-fullname.md)
-  (JIT-only bytecode-decode error, reachable only with JIT on — a
-  JIT-compiled caller appears to corrupt an interpreted callee's frame). The
-  `--nojit` STW shutdown hang that surfaced alongside it is now fixed and
+- The historical JIT-only ProtoStream `fullName` decode residual is now
   retired to
+  [`docs/internal/fixed-suite-bugs/keycloak-model-infinispan-jit-adjacent-decode-error-fullname-FIXED.md`](../internal/fixed-suite-bugs/keycloak-model-infinispan-jit-adjacent-decode-error-fullname-FIXED.md).
+  The current open follow-up from the deeper `RealmModelTest` path is
+  [keycloak-model-realmmodeltest-post-infinispan-liquibase-timeout.md](keycloak-model-realmmodeltest-post-infinispan-liquibase-timeout.md).
+  The sibling `--nojit` STW shutdown hang that surfaced alongside the old
+  decode note is fixed and retired to
   [`docs/internal/fixed-suite-bugs/keycloak-model-stw-takeover-hang-eventloopgroup-shutdown-FIXED.md`](../internal/fixed-suite-bugs/keycloak-model-stw-takeover-hang-eventloopgroup-shutdown-FIXED.md).
 
 ## 2026-07-07 GC blocked-thread / stale-Thread-mirror doc RETIRED; real-net GC-blocking audit completed
@@ -294,9 +298,9 @@ objects unconditionally), is now **also FIXED** (2026-07-06). `RealmModelTest`
 then reached a distinct residual one layer deeper, in the same "synthetic
 native shim intercepts a real object" family,
 [Infinispan Cache.config null after real DefaultCacheManager.start()](../internal/fixed-suite-bugs/keycloak-model-infinispan-cache-config-null-after-real-start-FIXED.md),
-now **also FIXED** (2026-07-06); see the top of this file for the remaining
-JIT-only decode residual it uncovered. The sibling `--nojit` STW shutdown hang
-is now fixed and retired to
+now **also FIXED** (2026-07-06); the historical JIT-only decode-error note is
+retired, the current open follow-up is the `RealmModelTest` Liquibase-phase
+timeout, and the sibling `--nojit` STW shutdown hang is fixed and retired to
 [`docs/internal/fixed-suite-bugs/keycloak-model-stw-takeover-hang-eventloopgroup-shutdown-FIXED.md`](../internal/fixed-suite-bugs/keycloak-model-stw-takeover-hang-eventloopgroup-shutdown-FIXED.md).
 Not CratonVM bugs: 543 FAILs (`testsuite/integration-arquillian/tests/base`
 + `tests/other/sssd`, exhaustively confirmed - 543/544 exact match, the 544th
@@ -950,9 +954,9 @@ PreviewFeatures native crash. The remaining non-passed rows are tracked here:
   [Infinispan JGroupsTransport.start() never invoked](../internal/fixed-suite-bugs/keycloak-model-jgroupstransport-start-never-invoked-FIXED.md),
   now FIXED. `RealmModelTest` then reached a distinct residual,
   [Infinispan Cache.config null after real DefaultCacheManager.start()](../internal/fixed-suite-bugs/keycloak-model-infinispan-cache-config-null-after-real-start-FIXED.md),
-  now ALSO FIXED (2026-07-06); see the top of this file for the remaining
-  JIT-only decode residual it uncovered. The sibling `--nojit` STW shutdown
-  hang is now retired to
+  now ALSO FIXED (2026-07-06); the historical JIT-only decode-error note is
+  retired, the current open follow-up is the `RealmModelTest` Liquibase-phase
+  timeout, and the sibling `--nojit` STW shutdown hang is retired to
   [keycloak-model-stw-takeover-hang-eventloopgroup-shutdown-FIXED.md](../internal/fixed-suite-bugs/keycloak-model-stw-takeover-hang-eventloopgroup-shutdown-FIXED.md).
 - [keycloak-sssd-system1-findbootstrapclassornull-nosuchmethod.md](keycloak-sssd-system1-findbootstrapclassornull-nosuchmethod.md) -
   2 `FAIL` rows in the SSSD module, missing

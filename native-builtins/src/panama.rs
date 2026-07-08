@@ -1247,7 +1247,7 @@ fn pe_segment_set_impl(
 // --- SymbolLookup: load shared libraries and find symbols ---
 // SymbolLookup synthetic: [0]=lib_index (Long — index into SharedVm.native_libraries), [1]=name
 
-fn register_pe_symbol_lookup(r: &mut NativeMethodRegistry) {
+pub(crate) fn register_pe_symbol_lookup(r: &mut NativeMethodRegistry) {
     // Promote to `Bridge`: this function runs under whatever category was
     // ambient at the `register_pe_panama` call site, which defaults to
     // `SyntheticStub` (dropped entirely under strict-no-stubs / real-JDK

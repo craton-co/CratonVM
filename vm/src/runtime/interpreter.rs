@@ -20079,6 +20079,43 @@ pub(crate) fn is_count_down_latch_native_override(
         )
 }
 
+pub(crate) fn is_stamped_lock_native_override(
+    class_name: &str,
+    method_name: &str,
+    descriptor: &str,
+) -> bool {
+    class_name == "java/util/concurrent/locks/StampedLock"
+        && matches!(
+            (method_name, descriptor),
+            ("<init>", "()V")
+                | ("readLock", "()J")
+                | ("writeLock", "()J")
+                | ("tryOptimisticRead", "()J")
+                | ("unlockRead", "(J)V")
+                | ("unlockWrite", "(J)V")
+                | ("unstampedUnlockRead", "()V")
+                | ("unstampedUnlockWrite", "()V")
+                | ("tryUnlockRead", "()Z")
+                | ("tryUnlockWrite", "()Z")
+                | ("validate", "(J)Z")
+                | ("tryReadLock", "()J")
+                | ("tryWriteLock", "()J")
+                | ("tryConvertToWriteLock", "(J)J")
+                | ("tryConvertToReadLock", "(J)J")
+                | ("isWriteLocked", "()Z")
+                | ("isReadLocked", "()Z")
+                | ("getReadLockCount", "()I")
+        )
+        || matches!(
+            class_name,
+            "java/util/concurrent/locks/StampedLock$ReadLockView"
+                | "java/util/concurrent/locks/StampedLock$WriteLockView"
+        ) && matches!(
+            (method_name, descriptor),
+            ("lock", "()V") | ("tryLock", "()Z") | ("unlock", "()V")
+        )
+}
+
 fn force_native_over_real_jdk_bytecode(
     class_name: &str,
     method_name: &str,
@@ -20642,7 +20679,9 @@ fn force_native_over_real_jdk_bytecode(
     // LockSupport machinery CratonVM does not model completely. Force the full
     // public surface, including <init>, so the synthetic int[] holder is
     // installed before await/countDown read it.
-    if is_count_down_latch_native_override(class_name, method_name, method_descriptor) {
+    if is_count_down_latch_native_override(class_name, method_name, method_descriptor)
+        || is_stamped_lock_native_override(class_name, method_name, method_descriptor)
+    {
         return true;
     }
     // Surefire fork bootstrap/teardown: bypass ServiceLoader decoder discovery
@@ -21022,6 +21061,17 @@ fn redefine_immune_path_native(
         && method_descriptor == "()Ljava/lang/String;"
 }
 
+fn redefine_immune_forced_native(
+    class_name: &str,
+    method_name: &str,
+    method_descriptor: &str,
+) -> bool {
+    redefine_immune_reflection_native(class_name, method_name)
+        || redefine_immune_string_builder_native(class_name, method_name, method_descriptor)
+        || redefine_immune_path_native(class_name, method_name, method_descriptor)
+        || is_stamped_lock_native_override(class_name, method_name, method_descriptor)
+}
+
 /// Dispatch a force-native override via `safe_native_call`, pushing any return
 /// value onto the caller operand stack.
 #[inline]
@@ -21053,9 +21103,7 @@ fn intercept_force_registered_native(
     // natives are exempt (see `redefine_immune_reflection_native`): the real
     // bytecode cannot reproduce them under CratonVM.
     if native_shadow_suppressed_by_redefine(shared, class_name)
-        && !redefine_immune_reflection_native(class_name, method_name)
-        && !redefine_immune_string_builder_native(class_name, method_name, method_descriptor)
-        && !redefine_immune_path_native(class_name, method_name, method_descriptor)
+        && !redefine_immune_forced_native(class_name, method_name, method_descriptor)
     {
         return None;
     }
@@ -21471,9 +21519,7 @@ fn try_stackless_invoke(
             // native instead. Skip an ancestor's native the same way the
             // receiver-class check does.
             let parent_redefined = native_shadow_suppressed_by_redefine_in(&cm, &parent.name)
-                && !redefine_immune_reflection_native(&parent.name, method_name)
-                && !redefine_immune_string_builder_native(&parent.name, method_name, descriptor)
-                && !redefine_immune_path_native(&parent.name, method_name, descriptor);
+                && !redefine_immune_forced_native(&parent.name, method_name, descriptor);
             if !parent_redefined {
                 if let Some(cb) = shared
                     .native_methods
@@ -21498,9 +21544,7 @@ fn try_stackless_invoke(
     // Reflection-metadata natives stay authoritative (see
     // `redefine_immune_reflection_native`).
     let native_cb = if native_shadow_suppressed_by_redefine(shared, class_name)
-        && !redefine_immune_reflection_native(class_name, method_name)
-        && !redefine_immune_string_builder_native(class_name, method_name, descriptor)
-        && !redefine_immune_path_native(class_name, method_name, descriptor)
+        && !redefine_immune_forced_native(class_name, method_name, descriptor)
     {
         None
     } else {
@@ -21679,9 +21723,7 @@ fn try_stackless_invoke(
     // `java.lang.reflect.Method` must not disable annotation reflection.
     if !(declaring_is_interface && !is_static)
         && (!native_shadow_suppressed_by_redefine(shared, &class_name_arc)
-            || redefine_immune_reflection_native(&class_name_arc, method_name)
-            || redefine_immune_string_builder_native(&class_name_arc, method_name, descriptor)
-            || redefine_immune_path_native(&class_name_arc, method_name, descriptor))
+            || redefine_immune_forced_native(&class_name_arc, method_name, descriptor))
     {
         if let Some(callback) = shared
             .native_methods
@@ -22967,6 +23009,18 @@ fn execute_invokestatic_cached(
                 }
                 &mut args_vec
             };
+
+            if let Some(res) = intercept_force_registered_native(
+                shared,
+                thread,
+                frame_idx,
+                cached.class_name.as_ref(),
+                cached.method_name.as_ref(),
+                cached.method_descriptor.as_ref(),
+                args_slice,
+            ) {
+                return res;
+            }
 
             // Acquire monitor for synchronized methods
             let monitor_obj: Option<ObjectRef> = if cached.is_synchronized {
@@ -28210,15 +28264,13 @@ fn execute_invokevirtual_vtable_fast(
                                 .is_some();
                             // Suppress an inherited native shadow when the declaring
                             // parent has been redefined by an agent (woven bytecode wins).
-            let parent_redefined = crate::classloading::any_class_redefined()
-                && cm.class_redefine_generation(parent_id) > 0
-                && !redefine_immune_reflection_native(&parent.name, &method_name)
-                && !redefine_immune_string_builder_native(
-                    &parent.name,
-                    &method_name,
-                    &method_descriptor,
-                )
-                && !redefine_immune_path_native(&parent.name, &method_name, &method_descriptor);
+                            let parent_redefined = crate::classloading::any_class_redefined()
+                                && cm.class_redefine_generation(parent_id) > 0
+                                && !redefine_immune_forced_native(
+                                    &parent.name,
+                                    &method_name,
+                                    &method_descriptor,
+                                );
                             let has_native = !parent_redefined
                                 && shared
                                     .native_methods
@@ -28369,6 +28421,18 @@ fn execute_invokevirtual_vtable_fast(
     if let Some(res) = intercept_classloader_set_default_assertion_status(
         shared,
         thread,
+        entry_cached.method_name.as_ref(),
+        entry_cached.method_descriptor.as_ref(),
+        args_slice,
+    ) {
+        return res;
+    }
+
+    if let Some(res) = intercept_force_registered_native(
+        shared,
+        thread,
+        frame_idx,
+        entry_cached.class_name.as_ref(),
         entry_cached.method_name.as_ref(),
         entry_cached.method_descriptor.as_ref(),
         args_slice,
@@ -28687,6 +28751,18 @@ fn execute_invokevirtual_cached(
                             cached.method_descriptor.as_ref(),
                         )?;
                         return Ok(CachedCallResult::Handled);
+                    }
+
+                    if let Some(res) = intercept_force_registered_native(
+                        shared,
+                        thread,
+                        frame_idx,
+                        cached.class_name.as_ref(),
+                        cached.method_name.as_ref(),
+                        cached.method_descriptor.as_ref(),
+                        args_slice,
+                    ) {
+                        return res;
                     }
 
                     // (bug-03 layer B, default-ON; off-switch CRATONVM_JIT_VIRTUAL_TIERUP=0)
@@ -29045,6 +29121,18 @@ fn execute_invokevirtual_cached(
             if let Some(res) = intercept_classloader_set_default_assertion_status(
                 shared,
                 thread,
+                cached.method_name.as_ref(),
+                cached.method_descriptor.as_ref(),
+                args_slice,
+            ) {
+                return res;
+            }
+
+            if let Some(res) = intercept_force_registered_native(
+                shared,
+                thread,
+                frame_idx,
+                cached.class_name.as_ref(),
                 cached.method_name.as_ref(),
                 cached.method_descriptor.as_ref(),
                 args_slice,
@@ -30619,6 +30707,76 @@ mod tests {
             "java/util/concurrent/Semaphore",
             "await",
             "()V"
+        ));
+    }
+
+    #[test]
+    fn stamped_lock_force_native_covers_registered_surface() {
+        let sl = "java/util/concurrent/locks/StampedLock";
+        for (name, descriptor) in [
+            ("<init>", "()V"),
+            ("readLock", "()J"),
+            ("writeLock", "()J"),
+            ("tryOptimisticRead", "()J"),
+            ("unlockRead", "(J)V"),
+            ("unlockWrite", "(J)V"),
+            ("unstampedUnlockRead", "()V"),
+            ("unstampedUnlockWrite", "()V"),
+            ("tryUnlockRead", "()Z"),
+            ("tryUnlockWrite", "()Z"),
+            ("validate", "(J)Z"),
+            ("tryReadLock", "()J"),
+            ("tryWriteLock", "()J"),
+            ("tryConvertToWriteLock", "(J)J"),
+            ("tryConvertToReadLock", "(J)J"),
+            ("isWriteLocked", "()Z"),
+            ("isReadLocked", "()Z"),
+            ("getReadLockCount", "()I"),
+        ] {
+            assert!(
+                is_stamped_lock_native_override(sl, name, descriptor),
+                "{name}{descriptor} must route to the registered native"
+            );
+        }
+        assert!(!is_stamped_lock_native_override(
+            sl,
+            "asWriteLock",
+            "()Ljava/util/concurrent/locks/Lock;"
+        ));
+        assert!(!is_stamped_lock_native_override(
+            "java/util/concurrent/locks/ReentrantReadWriteLock",
+            "writeLock",
+            "()Ljava/util/concurrent/locks/ReentrantReadWriteLock$WriteLock;"
+        ));
+        for view in [
+            "java/util/concurrent/locks/StampedLock$ReadLockView",
+            "java/util/concurrent/locks/StampedLock$WriteLockView",
+        ] {
+            for (name, descriptor) in [("lock", "()V"), ("tryLock", "()Z"), ("unlock", "()V")] {
+                assert!(
+                    is_stamped_lock_native_override(view, name, descriptor),
+                    "{view}.{name}{descriptor} must route to the registered native"
+                );
+                assert!(
+                    redefine_immune_forced_native(view, name, descriptor),
+                    "{view}.{name}{descriptor} must stay native even after unrelated redefinition"
+                );
+            }
+        }
+        assert!(redefine_immune_forced_native(
+            sl,
+            "unstampedUnlockWrite",
+            "()V"
+        ));
+        assert!(!is_stamped_lock_native_override(
+            "java/util/concurrent/locks/StampedLock$WriteLockView",
+            "newCondition",
+            "()Ljava/util/concurrent/locks/Condition;"
+        ));
+        assert!(!redefine_immune_forced_native(
+            "java/util/concurrent/locks/StampedLock$WriteLockView",
+            "newCondition",
+            "()Ljava/util/concurrent/locks/Condition;"
         ));
     }
 

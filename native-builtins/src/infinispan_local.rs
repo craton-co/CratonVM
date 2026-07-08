@@ -959,6 +959,7 @@ fn native_dcm_define_configuration(
     ctx: &mut dyn NativeContext,
     args: &[Value],
 ) -> MethodCallResult {
+    let this = obj_arg(args, 0);
     let name = match string_arg(ctx, args, 1) {
         Some(s) => s,
         None => {
@@ -968,7 +969,30 @@ fn native_dcm_define_configuration(
             .into());
         }
     };
+    let name_value = args.get(1).copied().unwrap_or(Value::Object(None));
     let config = obj_arg(args, 2);
+    if let Some(this) = this {
+        if is_real_dcm(ctx, this) {
+            let configuration_manager = match ctx.get_field_by_name(this, "configurationManager") {
+                Value::Object(Some(obj)) => obj,
+                _ => {
+                    return Err(RuntimeError::IllegalStateException {
+                        message: "DefaultCacheManager.configurationManager is null".to_string(),
+                    }
+                    .into());
+                }
+            };
+            let config_value = config
+                .map(|o| Value::Object(Some(o)))
+                .unwrap_or(Value::Object(None));
+            return ctx.invoke_virtual(
+                configuration_manager,
+                "putConfiguration",
+                "(Ljava/lang/String;Lorg/infinispan/configuration/cache/Configuration;)Lorg/infinispan/configuration/cache/Configuration;",
+                &[name_value, config_value],
+            );
+        }
+    }
     let (size, ttl_ms) = match config {
         Some(obj) => {
             let s = match ctx
@@ -982,7 +1006,11 @@ fn native_dcm_define_configuration(
                 .flatten()
             {
                 Some(Value::Object(Some(mem))) => {
-                    match ctx.invoke_virtual(mem, "maxCount", "()J", &[]).ok().flatten() {
+                    match ctx
+                        .invoke_virtual(mem, "maxCount", "()J", &[])
+                        .ok()
+                        .flatten()
+                    {
                         Some(Value::Long(v)) if v > 0 => v as usize,
                         _ => DEFAULT_SIZE_LIMIT,
                     }
@@ -1000,7 +1028,11 @@ fn native_dcm_define_configuration(
                 .flatten()
             {
                 Some(Value::Object(Some(exp))) => {
-                    match ctx.invoke_virtual(exp, "lifespan", "()J", &[]).ok().flatten() {
+                    match ctx
+                        .invoke_virtual(exp, "lifespan", "()J", &[])
+                        .ok()
+                        .flatten()
+                    {
                         Some(Value::Long(v)) if v > 0 => Some(Duration::from_millis(v as u64)),
                         _ => None,
                     }
@@ -1800,6 +1832,9 @@ pub fn register_infinispan_natives(registry: &mut NativeMethodRegistry) {
 mod tests {
     use super::*;
     use crate::test_utils::mock_ctx;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    static REAL_DCM_DEFINE_PUT_CONFIGURATION_CALLS: AtomicUsize = AtomicUsize::new(0);
 
     fn fresh_cache(name: &str, limit: usize) -> Arc<CacheInner> {
         reset_manager_for_tests();
@@ -2215,7 +2250,10 @@ mod tests {
                 Value::Object(Some(config_obj)),
             ],
         );
-        assert!(result.is_ok(), "defineConfiguration must succeed: {result:?}");
+        assert!(
+            result.is_ok(),
+            "defineConfiguration must succeed: {result:?}"
+        );
 
         let cache = global_manager().get_cache("real-cfg-cache").unwrap();
         assert_eq!(
@@ -2228,6 +2266,83 @@ mod tests {
             "default_ttl must come from expiration().lifespan(), not a default/garbage slot read"
         );
         assert_ne!(cache.size_limit, DEFAULT_SIZE_LIMIT);
+    }
+
+    fn real_dcm_define_configuration_hook(
+        ctx: &mut crate::test_utils::MockNativeContext,
+        receiver: ObjectRef,
+        method_name: &str,
+        descriptor: &str,
+        args: &[Value],
+    ) -> Option<MethodCallResult> {
+        if method_name != "putConfiguration" {
+            return Some(Err(RuntimeError::IllegalStateException {
+                message: format!("unexpected virtual call: {method_name}{descriptor}"),
+            }
+            .into()));
+        }
+        REAL_DCM_DEFINE_PUT_CONFIGURATION_CALLS.fetch_add(1, Ordering::SeqCst);
+        assert_eq!(
+            descriptor,
+            "(Ljava/lang/String;Lorg/infinispan/configuration/cache/Configuration;)Lorg/infinispan/configuration/cache/Configuration;"
+        );
+        assert_eq!(ctx.get_field(receiver, 0), Value::Int(0x4350));
+        let name = match args.first() {
+            Some(Value::Object(Some(obj))) => ctx.read_string(*obj),
+            other => panic!("expected cache name string argument, got {other:?}"),
+        };
+        assert_eq!(name.as_deref(), Some("___protobuf_metadata"));
+        let config = match args.get(1) {
+            Some(Value::Object(Some(obj))) => *obj,
+            other => panic!("expected Configuration argument, got {other:?}"),
+        };
+        assert_eq!(ctx.get_field(config, 0), Value::Int(0xC0F1));
+        Some(Ok(args.get(1).copied()))
+    }
+
+    #[test]
+    fn t19_10_define_configuration_real_manager_delegates_to_configuration_manager() {
+        let _g = test_lock();
+        reset_manager_for_tests();
+        REAL_DCM_DEFINE_PUT_CONFIGURATION_CALLS.store(0, Ordering::SeqCst);
+
+        let mut ctx = mock_ctx();
+        ctx.set_invoke_virtual_hook(real_dcm_define_configuration_hook);
+
+        let dcm_cid = ctx.ensure_class_initialized(CLS_MANAGER).unwrap();
+        let dcm = ctx.alloc_object(dcm_cid, 6);
+        let gcr = ctx.fresh_object_ref();
+        let configuration_manager = ctx.fresh_object_ref();
+        ctx.set_field(configuration_manager, 0, Value::Int(0x4350));
+        ctx.set_field_by_name(dcm, "globalComponentRegistry", Value::Object(Some(gcr)));
+        ctx.set_field_by_name(
+            dcm,
+            "configurationManager",
+            Value::Object(Some(configuration_manager)),
+        );
+
+        let name_obj = ctx.create_string("___protobuf_metadata");
+        let config_obj = ctx.fresh_object_ref();
+        ctx.set_field(config_obj, 0, Value::Int(0xC0F1));
+
+        let result = native_dcm_define_configuration(
+            &mut ctx,
+            &[
+                Value::Object(Some(dcm)),
+                Value::Object(Some(name_obj)),
+                Value::Object(Some(config_obj)),
+            ],
+        )
+        .expect("real DefaultCacheManager defineConfiguration should delegate");
+
+        assert_eq!(
+            REAL_DCM_DEFINE_PUT_CONFIGURATION_CALLS.load(Ordering::SeqCst),
+            1
+        );
+        assert!(
+            matches!(result, Some(Value::Object(Some(obj))) if obj == config_obj),
+            "real ConfigurationManager.putConfiguration should return the input config: {result:?}"
+        );
     }
 
     #[test]
