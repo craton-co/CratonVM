@@ -1,15 +1,15 @@
 # Young-GC live-object reclamation corrupts RRWL read-lock hold counts (ES binary-docvalues IMSE / probe hang)
 
-Status: PRIMARY HOLE FIXED 2026-07-07 (branch
-`fix/young-gc-live-reclaim-20260707`) - see "2026-07-07 root cause and fix"
-below. The probe's plain-mode permanent hang is gone (0/16 hangs vs ~6/6;
-healthy ~200M ops/8s), and the long-open RandomizedContext
-`WeakHashMap<Thread,...>` `getPerThread()` NPE is CONFIRMED GONE
-(`MappingStatsTests` now runs all 14 methods with zero
-`randomnesses`-NPE occurrences). The 2026-07-08 pass also fixed the
-`ThreadIdentifiers.NEXT_TID_OFFSET == 0` / Java-created tid 0 lead. Doc stays
-OPEN for the ES `testAllEqual` face and the remaining extreme-GC-stress /
-stale-pointer residuals.
+Status: RETIRED to `docs/internal/fixed-suite-bugs` 2026-07-08. The
+primary reference-processing hole was fixed on 2026-07-07; the crawl and
+ThreadIdentifiers subcases were fixed on 2026-07-07/08; the final tracked
+extreme-GC-stress RRWL residual is fixed by the 2026-07-08 Linux helper-window
+JIT-root scan plus GC-safe native ClassLoader allocation pinning described in
+the final section below. Direct ES `testAllEqual` rerun was not possible on the
+Azure host because neither `/data/data/cratonvm/apps/elasticsearch` nor
+`server/build/craton-testcp.txt` exists there; the standalone RRWL mechanism
+and its stress residual now pass focused validation, so this canonical issue
+note is retired.
 
 Date filed: 2026-07-07 (split out of
 `elasticsearch-lucene-binary-docvalues-range-hangs.md`, whose three original
@@ -358,5 +358,49 @@ unique binary
 No direct ES `LongRandomBinaryDocValuesRangeQueryTests.testAllEqual` rerun was
 possible on this Azure host: neither `/data/data/cratonvm/apps/elasticsearch`
 nor a `server/build/craton-testcp.txt` classpath exists in the available
-checkouts. Keep this note in `docs/known-issues` until the ES face and stress
-residual are rechecked/fixed.
+checkouts. This historical note was superseded by the final 2026-07-08 pass below.
+
+## 2026-07-08 final pass: Linux helper-window roots and native ClassLoader pins
+
+Two remaining gaps explained the extreme `CRATONVM_DBG_GC_STRESS=200000`
+RRWL residual after the earlier reference-processing, crawl, and tid fixes.
+
+1. Linux had no implementation for the STW helper-window scan. Blocked threads
+   excluded from the cooperative barrier could still have JIT return addresses
+   and live object words on their native stacks, but `helper_window_pass` was a
+   stub returning `(0, 0)`. The Linux signal rendezvous now has a helper mode:
+   it samples blocked peer registers and stack words, classifies a window as
+   relevant only when a JIT return address is present, contributes conservative
+   object candidates as roots, resumes the peer, and marks the cycle as moving
+   young coverage-incomplete when such helper roots are used.
+2. The built-in ClassLoader construction path held raw `ObjectRef`s across
+   re-entrant native allocations and the `Object.<init>` call used for
+   `assertionLock`. Under forced young GC those locals could become stale before
+   later field writes, showing up as `java/lang/Object` slot-0/5/6 OOB writes.
+   `get_or_create_platform_loader`, `get_or_create_app_loader`,
+   `alloc_default_protection_domain`, `alloc_classloader`, and
+   `alloc_url_classloader` now pin objects held across those calls and reread
+   them through `read_native_pin` before use.
+
+Focused validation on Azure host `20.83.144.174`, worktree
+`/data/data/cratonvm-worktrees/20260708-151146-young-gc-rrwl-holdcount-retire`,
+unique binary
+`/data/data/cratonvm-worktrees/bin/cratonvm-young-gc-rrwl-holdcount-retire-20260708-151146`:
+
+- `cargo check -p cratonvm-vm` passed.
+- `cargo test -p cratonvm-vm helper_window_classifier -- --nocapture` passed:
+  3/3 tests.
+- Release build of the unique binary passed.
+- `RwlReadTearingProbe 8 8000` with `CRATONVM_DBG_GC_STRESS=200000`: 10/10
+  runs completed with `DONE` at a 45s cap (previous pass: 2/5 completed,
+  3/5 timed out; immediately prior ThreadIdentifiers pass: 2/3 completed,
+  1/3 timed out).
+- Diagnostic census run with `CRATONVM_DBG_STW_CENSUS=1`,
+  `CRATONVM_DBG_XT_JIT_ROOT_SCAN=1`, and `CRATONVM_DBG_MTROOTS=1` completed
+  with `DONE`.
+
+Direct ES `LongRandomBinaryDocValuesRangeQueryTests.testAllEqual` validation
+was still unavailable on this Azure host because the Elasticsearch checkout and
+Craton test classpath were absent. Any future ES-suite confirmation should be a
+fresh suite-validation note, not a reason to keep this RRWL mechanism document
+open.
