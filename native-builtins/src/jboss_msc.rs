@@ -139,6 +139,63 @@ impl ServiceName {
     }
 }
 
+fn java_string_hash(s: &str) -> i32 {
+    s.encode_utf16()
+        .fold(0i32, |acc, ch| acc.wrapping_mul(31).wrapping_add(ch as i32))
+}
+
+fn service_name_hash(name: &ServiceName) -> i32 {
+    name.segments.iter().fold(1i32, |acc, segment| {
+        acc.wrapping_mul(31)
+            .wrapping_add(java_string_hash(segment.as_ref()))
+    })
+}
+
+fn illegal_service_name_arg(message: impl Into<String>) -> MethodCallFailed {
+    MethodCallFailed::InternalError(VmError::Runtime(RuntimeError::IllegalArgumentException {
+        message: message.into(),
+    }))
+}
+
+fn read_service_name_segments_array(
+    ctx: &mut dyn NativeContext,
+    arr: ObjectRef,
+) -> Result<Vec<String>, MethodCallFailed> {
+    let len = ctx.array_length(arr);
+    if len == 0 {
+        return Err(illegal_service_name_arg(
+            "Must provide at least one name segment",
+        ));
+    }
+    let mut segs = Vec::with_capacity(len);
+    for i in 0..len {
+        let text = match ctx.get_array_element(arr, i) {
+            Value::Object(Some(s)) => ctx.read_string(s).unwrap_or_default(),
+            _ => String::new(),
+        };
+        if text.is_empty() {
+            return Err(illegal_service_name_arg(format!(
+                "Invalid empty ServiceName segment at index {i}"
+            )));
+        }
+        segs.push(text);
+    }
+    Ok(segs)
+}
+
+fn append_service_name_segments(
+    base: Option<Arc<ServiceName>>,
+    mut suffix: Vec<String>,
+) -> Arc<ServiceName> {
+    if let Some(base) = base {
+        let mut segs: Vec<String> = base.segments.iter().map(|s| s.to_string()).collect();
+        segs.append(&mut suffix);
+        ServiceName::of(segs)
+    } else {
+        ServiceName::of(suffix)
+    }
+}
+
 impl PartialEq for ServiceName {
     fn eq(&self, other: &Self) -> bool {
         self.canonical == other.canonical
@@ -1015,24 +1072,24 @@ pub(crate) fn alloc_java_service_name(
     let canonical_text = name.canonical();
     let canonical = ctx.create_string(canonical_text);
     // canonicalName is updated via an AtomicReferenceFieldUpdater in the
-    // JDK ctor; using `set_field_by_name` is safe — it writes the same
+    // JDK ctor; using `set_field_by_name` is safe: it writes the same
     // slot the updater would CAS into.
     ctx.set_field_by_name(obj, "canonicalName", Value::Object(Some(canonical)));
-    // Leaf segment for the `name` field. Use the whole canonical text if
-    // there are no dots (matches the JDK ctor for a top-level
-    // ServiceName.of(String)).
-    let leaf = canonical_text.rsplit('.').next().unwrap_or(canonical_text);
+
+    // Real ServiceName bytecode reads the leaf `name`, `parent`, and cached
+    // `hashCode` fields directly. Populate all three so native-created names
+    // compose correctly when real overloads (append(ServiceName), equals,
+    // toArray, getParent) execute bytecode around our mirrors.
+    let leaf = name
+        .segments
+        .last()
+        .map(|s| s.as_ref())
+        .unwrap_or(canonical_text);
     let leaf_str = ctx.create_string(leaf);
     ctx.set_field_by_name(obj, "name", Value::Object(Some(leaf_str)));
-    // Stable, deterministic hash that matches our equals contract on
-    // synthetic mirrors. The exact value does not need to mirror the
-    // JDK's `calculateHashCode` — `ServiceName.equals` compares both
-    // sides' `hashCode` fields, so as long as two mirrors of the same
-    // canonical name produce the same value we're good.
-    let h: i32 = canonical_text
-        .bytes()
-        .fold(0i32, |acc, b| acc.wrapping_mul(31).wrapping_add(b as i32));
-    ctx.set_field_by_name(obj, "hashCode", Value::Int(h));
+    let parent = name.parent().map(|p| alloc_java_service_name(ctx, &p));
+    ctx.set_field_by_name(obj, "parent", Value::Object(parent));
+    ctx.set_field_by_name(obj, "hashCode", Value::Int(service_name_hash(name)));
     obj
 }
 
@@ -1095,34 +1152,67 @@ fn native_service_name_of_varargs(ctx: &mut dyn NativeContext, args: &[Value]) -
             )));
         }
     };
-    let len = ctx.array_length(arr);
-    let mut segs: Vec<String> = Vec::with_capacity(len);
-    for i in 0..len {
-        let el = ctx.get_array_element(arr, i);
-        if let Value::Object(Some(s)) = el {
-            if let Some(text) = ctx.read_string(s) {
-                segs.push(text);
-            }
-        }
-    }
-    let sn = ServiceName::of(segs);
+    let sn = ServiceName::of(read_service_name_segments_array(ctx, arr)?);
     Ok(Some(Value::Object(Some(alloc_java_service_name(ctx, &sn)))))
 }
 
-fn native_service_name_append(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+fn native_service_name_of_parent_varargs(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    // Signature: static ServiceName.of(ServiceName parent, String[] segments)
+    let base = match args.first().copied() {
+        Some(Value::Object(Some(o))) => read_service_name_robust(ctx, o),
+        _ => None,
+    };
+    let arr = match args.get(1).copied() {
+        Some(Value::Object(Some(o))) => o,
+        _ => {
+            return Err(MethodCallFailed::InternalError(VmError::Runtime(
+                RuntimeError::NullPointerException {
+                    message: Some("ServiceName.of: null segments array".into()),
+                },
+            )));
+        }
+    };
+    let sn = append_service_name_segments(base, read_service_name_segments_array(ctx, arr)?);
+    Ok(Some(Value::Object(Some(alloc_java_service_name(ctx, &sn)))))
+}
+
+fn native_service_name_append_varargs(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    // Signature: ServiceName.append(String[] segments)
     let this = obj_arg(args, 0)?;
-    let seg = match args.get(1).copied() {
-        Some(Value::Object(Some(s))) => ctx.read_string(s).unwrap_or_default(),
-        _ => String::new(),
+    let base = read_service_name_robust(ctx, this);
+    let arr = match args.get(1).copied() {
+        Some(Value::Object(Some(o))) => o,
+        _ => {
+            return Err(MethodCallFailed::InternalError(VmError::Runtime(
+                RuntimeError::NullPointerException {
+                    message: Some("ServiceName.append: null segments array".into()),
+                },
+            )));
+        }
     };
-    let parent = match read_java_service_name(ctx, this) {
-        Some(p) => p,
-        None => ServiceName::of(std::iter::empty::<&str>()),
-    };
-    let child = parent.append(&seg);
-    Ok(Some(Value::Object(Some(alloc_java_service_name(
-        ctx, &child,
-    )))))
+    let sn = append_service_name_segments(base, read_service_name_segments_array(ctx, arr)?);
+    Ok(Some(Value::Object(Some(alloc_java_service_name(ctx, &sn)))))
+}
+
+fn native_service_name_append_service_name(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    // Signature: ServiceName.append(ServiceName other)
+    let this = obj_arg(args, 0)?;
+    let other = obj_arg(args, 1)?;
+    let base = read_service_name_robust(ctx, this);
+    let suffix = read_service_name_robust(ctx, other)
+        .ok_or_else(|| illegal_service_name_arg("ServiceName.append: unreadable suffix"))?;
+    let suffix_segments: Vec<String> = suffix.segments.iter().map(|s| s.to_string()).collect();
+    let sn = append_service_name_segments(base, suffix_segments);
+    Ok(Some(Value::Object(Some(alloc_java_service_name(ctx, &sn)))))
 }
 
 fn native_service_name_get_canonical(
@@ -1130,7 +1220,7 @@ fn native_service_name_get_canonical(
     args: &[Value],
 ) -> MethodCallResult {
     let this = obj_arg(args, 0)?;
-    let canonical = read_java_service_name(ctx, this)
+    let canonical = read_service_name_robust(ctx, this)
         .map(|n| n.canonical().to_string())
         .unwrap_or_default();
     let s = ctx.create_string(&canonical);
@@ -1139,7 +1229,7 @@ fn native_service_name_get_canonical(
 
 fn native_service_name_get_parent(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = obj_arg(args, 0)?;
-    let sn = read_java_service_name(ctx, this);
+    let sn = read_service_name_robust(ctx, this);
     let parent_obj = match sn.and_then(|s| s.parent()) {
         Some(p) => Value::Object(Some(alloc_java_service_name(ctx, &p))),
         None => Value::Object(None),
@@ -3168,9 +3258,21 @@ pub fn register_jboss_msc_natives(r: &mut NativeMethodRegistry) {
     );
     r.register(
         sn,
+        "of",
+        "(Lorg/jboss/msc/service/ServiceName;[Ljava/lang/String;)Lorg/jboss/msc/service/ServiceName;",
+        native_service_name_of_parent_varargs,
+    );
+    r.register(
+        sn,
         "append",
-        "(Ljava/lang/String;)Lorg/jboss/msc/service/ServiceName;",
-        native_service_name_append,
+        "([Ljava/lang/String;)Lorg/jboss/msc/service/ServiceName;",
+        native_service_name_append_varargs,
+    );
+    r.register(
+        sn,
+        "append",
+        "(Lorg/jboss/msc/service/ServiceName;)Lorg/jboss/msc/service/ServiceName;",
+        native_service_name_append_service_name,
     );
     r.register(
         sn,
@@ -3809,6 +3911,36 @@ mod tests {
         assert_eq!(pa.canonical(), "jboss.as");
         // Interning => pointer equality for same canonical string.
         assert!(Arc::ptr_eq(&p, &pa));
+    }
+
+    #[test]
+    fn t19_1_service_name_hash_matches_jboss_msc_formula() {
+        let suffix = ServiceName::of(["network", "interface", "management"]);
+        assert_eq!(service_name_hash(&suffix), -1_335_710_409);
+
+        let full = ServiceName::of(["jboss", "network", "interface", "management"]);
+        assert_eq!(service_name_hash(&full), -1_212_000_734);
+    }
+
+    #[test]
+    fn t19_1_service_name_append_segments_preserves_parent_chain() {
+        let base = ServiceName::of(["jboss"]);
+        let full = append_service_name_segments(
+            Some(base.clone()),
+            vec![
+                "network".to_string(),
+                "interface".to_string(),
+                "management".to_string(),
+            ],
+        );
+
+        assert_eq!(full.canonical(), "jboss.network.interface.management");
+        let parent = full.parent().expect("parent should exist");
+        assert_eq!(parent.canonical(), "jboss.network.interface");
+        let grandparent = parent.parent().expect("grandparent should exist");
+        assert_eq!(grandparent.canonical(), "jboss.network");
+        let root = grandparent.parent().expect("root should exist");
+        assert!(Arc::ptr_eq(&base, &root));
     }
 
     #[test]
