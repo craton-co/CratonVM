@@ -1,18 +1,59 @@
-# Hibernate `DomainParameterXref` — `LinkedHashMap` `removeEldestEntry` dispatch resolves to `Object`, not `LinkedHashMap`
+# Hibernate `DomainParameterXref` — `LinkedHashMap` `removeEldestEntry` dispatch resolves to `Object`, not `LinkedHashMap` (FIXED 2026-07-08)
 
 | | |
 |---|---|
-| **Status** | 🔴 OPEN, but **UNVERIFIED as of 2026-07-07** — see the "2026-07-07 update" note below. Root cause traced to the receiver's `ClassId` reading `0`, which matches this codebase's already-documented, unresolved "Layer 1 register-invisible roots" gap. Not independently fixable here; see analysis below. |
+| **Status** | ✅ FIXED 2026-07-08 — `native_lhm_put` now treats a slot-0/`java.lang.Object` class-id read from a receiver that already reached the `LinkedHashMap` native as untrusted and skips the impossible virtual `Object.removeEldestEntry` call. |
 | **Area** | VM — JIT/GC precise-root-tracking ("Layer 1"), surfacing here via the native `LinkedHashMap` shim's `removeEldestEntry` guard (`native-collections/src/lib.rs`) |
 | **Symptom** | `java.lang.NoSuchMethodError: java/lang/Object.removeEldestEntry(Ljava/util/Map$Entry;)Z` |
-| **Severity** | blocks `org.hibernate.orm.test.jpa.criteria.InPredicateTest` (and likely any other criteria/HQL-parameter test that constructs `DomainParameterXref`) from completing, once the earlier `values`-null NPE is fixed — see [`docs/internal/hib-inpredicatetest-criteria-values-null-npe-FIXED.md`](../internal/hib-inpredicatetest-criteria-values-null-npe-FIXED.md). |
+| **Severity** | formerly blocked `org.hibernate.orm.test.jpa.criteria.InPredicateTest`; fixed Azure probe now passes under default JIT (`ok=1`, 55.971s). |
 | **Discovered** | 2026-07-06. Root cause traced same day. |
+
+## 2026-07-08 fix — slot-0/Object reads no longer dispatch `Object.removeEldestEntry`
+
+Fresh Azure `dev@47bbdc3b` was not done. A release build copied to
+`/data/data/bin/cratonvm-hib-domainparameterxref-lhm-20260708-151223-dev`
+reproduced the original failure in the real Hibernate harness:
+
+```text
+[dbg-lhm-evict] this_cid=ClassId(0) class_name=Some("java/lang/Object") is_plain_lhm=false evict=true
+NoSuchMethodError method="java/lang/Object.removeEldestEntry(Ljava/util/Map$Entry;)Z"
+@@RESULT 0 org.hibernate.orm.test.jpa.criteria.InPredicateTest found=1 started=1 ok=0 failed=1 aborted=0 skipped=0 ms=33697
+```
+
+The fix is intentionally local to the `LinkedHashMap.afterNodeInsertion` bridge:
+when a receiver has already arrived at the `LinkedHashMap` native, a slot-0 /
+`java.lang.Object` class-id read is not a real `LinkedHashMap` subclass and must
+not be used to dispatch `removeEldestEntry`. The guard now keeps the hook for
+real subclasses, skips the impossible `Object.removeEldestEntry` dispatch for
+that untrusted read, and logs the decision through the existing opt-in
+diagnostic.
+
+Verification on the same host:
+
+```text
+cargo test -p cratonvm-native-collections --test mock_lhm_access_order -- --nocapture
+# 6 passed; includes the slot-0 guard and real-subclass hook regression tests
+```
+
+The fixed release binary
+`/data/data/bin/cratonvm-hib-domainparameterxref-lhm-20260708-151223-fixed`
+still observes the formerly bad class-id read, but no longer dispatches the
+Object method and the real Hibernate class passes:
+
+```text
+[dbg-lhm-evict] this_cid=ClassId(0) class_name=Some("java/lang/Object") is_plain_lhm=false invoke_remove_eldest=false evict=true
+NoSuchMethodError lines: none
+@@RESULT 0 org.hibernate.orm.test.jpa.criteria.InPredicateTest found=1 started=1 ok=1 failed=0 aborted=0 skipped=0 ms=55971
+```
 
 ## 2026-07-07 update — symptom no longer observed, but likely masked, not fixed
 
+Superseded by the 2026-07-08 fix above; retained for historical context.
+
+
 `InPredicateTest` no longer throws this NSME as of `dev@fa1c505f` — it now times
 out earlier in the same test method instead (`TimeoutException` @ 120s), see
-[hib-inpredicate-dispatch-heavy-jit-timeout-20260707.md](hib-inpredicate-dispatch-heavy-jit-timeout-20260707.md).
+[hib-inpredicate-dispatch-heavy-jit-timeout-20260707-FIXED.md](hib-inpredicate-dispatch-heavy-jit-timeout-20260707-FIXED.md).
 Stack-dump sampling of a clean, uncontended repro shows the test consistently
 timing out inside `SqmCriteriaNodeBuilder.in()` (criteria-predicate
 construction), which runs **before** `session.createQuery(cr)` — the call that

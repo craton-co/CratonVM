@@ -102,11 +102,15 @@ impl MockCtx {
         // allocate hundreds of objects cannot wrap into another ctx's
         // range (an i32 has ~127 million such windows before exhausting).
         let hash_base = NEXT_HASH_BASE.fetch_add(1 << 24, Ordering::Relaxed);
+        let mut class_names = HashMap::new();
+        class_names.insert(0, "java/lang/Object".to_string());
+        let mut name_to_id = HashMap::new();
+        name_to_id.insert("java/lang/Object".to_string(), 0);
         Self {
             heap: UnsafeCell::new(Vec::new()),
             ptr_to_index: UnsafeCell::new(HashMap::new()),
-            class_names: HashMap::new(),
-            name_to_id: HashMap::new(),
+            class_names,
+            name_to_id,
             next_class_id: 1,
             next_ptr: ptr_base,
             identity_hashes: UnsafeCell::new(HashMap::new()),
@@ -206,6 +210,16 @@ impl MockCtx {
     /// `ObjectRef`s on which to exercise identity-hash stability.
     pub fn alloc_object_simple(&mut self, class_id: u32) -> ObjectRef {
         <Self as NativeContext>::alloc_object(self, ClassId::new(class_id), 0)
+    }
+
+    pub fn set_object_class_id_for_test(&mut self, obj: ObjectRef, new_class_id: ClassId) {
+        let idx = self
+            .entry_index(obj)
+            .expect("set_object_class_id_for_test on invalid ObjectRef");
+        match &mut self.heap_mut()[idx] {
+            HeapEntry::Object { class_id, .. } => *class_id = new_class_id,
+            HeapEntry::Array { .. } => panic!("set_object_class_id_for_test on array"),
+        }
     }
 
     /// Move `old` to a fresh address while preserving its identity-hash

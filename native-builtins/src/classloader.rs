@@ -284,16 +284,24 @@ pub(crate) fn get_or_create_platform_loader(ctx: &mut dyn NativeContext) -> Obje
     if let Some(obj) = existing {
         return obj;
     }
-    let obj = alloc_classloader(ctx, LOADER_PLATFORM);
+    let mut obj = alloc_classloader(ctx, LOADER_PLATFORM);
+    let obj_pin = ctx.pin_native_root(obj);
     let name = ctx.create_string("platform");
+    let name_pin = ctx.pin_native_root(name);
+    obj = ctx.read_native_pin(obj_pin, obj);
+    let name = ctx.read_native_pin(name_pin, name);
     ctx.set_field(obj, CL_NAME_REF, Value::Object(Some(name)));
     // Also populate the REAL `name` field by name: the active getName native
     // (classloader_real) reads the real field slot, not CL_NAME_REF.
+    obj = ctx.read_native_pin(obj_pin, obj);
+    let name = ctx.read_native_pin(name_pin, name);
     ctx.set_field_by_name(obj, "name", Value::Object(Some(name)));
-    // Platform's parent is bootstrap (null) — already set by alloc_classloader
+    // Platform's parent is bootstrap (null); already set by alloc_classloader
+    obj = ctx.read_native_pin(obj_pin, obj);
     *platform_loader_store()
         .lock()
         .unwrap_or_else(|e| e.into_inner()) = Some(obj);
+    ctx.unpin_native_roots(obj_pin);
     obj
 }
 
@@ -304,9 +312,17 @@ pub fn get_or_create_app_loader(ctx: &mut dyn NativeContext) -> ObjectRef {
         return obj;
     }
     let platform = get_or_create_platform_loader(ctx);
-    let obj = alloc_classloader(ctx, LOADER_APP);
+    let platform_pin = ctx.pin_native_root(platform);
+    let mut obj = alloc_classloader(ctx, LOADER_APP);
+    let obj_pin = ctx.pin_native_root(obj);
     let name = ctx.create_string("app");
+    let name_pin = ctx.pin_native_root(name);
+    let mut platform = ctx.read_native_pin(platform_pin, platform);
+    obj = ctx.read_native_pin(obj_pin, obj);
+    let mut name = ctx.read_native_pin(name_pin, name);
     ctx.set_field(obj, CL_NAME_REF, Value::Object(Some(name)));
+    obj = ctx.read_native_pin(obj_pin, obj);
+    platform = ctx.read_native_pin(platform_pin, platform);
     ctx.set_field(obj, CL_PARENT_REF, Value::Object(Some(platform)));
     // Also populate the REAL `name`/`parent` fields by name: the active
     // getName/getParent natives (classloader_real) read the real field slots,
@@ -314,16 +330,23 @@ pub fn get_or_create_app_loader(ctx: &mut dyn NativeContext) -> ObjectRef {
     // loader's getParent() returned null and Tomcat's
     // WebappClassLoaderBase.<init> javase-loader walk
     // (`while (j.getParent() != null) j = j.getParent()`) misbehaved.
+    obj = ctx.read_native_pin(obj_pin, obj);
+    name = ctx.read_native_pin(name_pin, name);
     ctx.set_field_by_name(obj, "name", Value::Object(Some(name)));
+    obj = ctx.read_native_pin(obj_pin, obj);
+    platform = ctx.read_native_pin(platform_pin, platform);
     ctx.set_field_by_name(obj, "parent", Value::Object(Some(platform)));
     // Populate the REAL static `java.lang.ClassLoader.scl` so the real-JDK
     // `ClassLoader.getSystemClassLoader()` bytecode (reached when a call site
-    // does not resolve to our native — observed in
+    // does not resolve to our native; observed in
     // WebappClassLoaderBase.<init> at pc=174) returns this loader instead of
     // null. A null there made the subsequent `j.getParent()` NPE and aborted
     // every embedded-server webapp deploy ("Error starting the loader").
+    obj = ctx.read_native_pin(obj_pin, obj);
     ctx.set_static_field_by_name("java/lang/ClassLoader", "scl", Value::Object(Some(obj)));
+    obj = ctx.read_native_pin(obj_pin, obj);
     *app_loader_store().lock().unwrap_or_else(|e| e.into_inner()) = Some(obj);
+    ctx.unpin_native_roots(platform_pin);
     obj
 }
 
@@ -433,23 +456,35 @@ const CS_CLASS: &str = "java/security/CodeSource";
 /// a real object that `getCertificates()` / `getLocation()` can be called on
 /// without NPE.
 fn alloc_default_protection_domain(ctx: &mut dyn NativeContext) -> ObjectRef {
-    let cs = alloc_concurrent_synthetic(ctx, CS_CLASS, CS_FIELD_COUNT);
+    let mut cs = alloc_concurrent_synthetic(ctx, CS_CLASS, CS_FIELD_COUNT);
+    let cs_pin = ctx.pin_native_root(cs);
     ctx.set_field(cs, CS_LOCATION_REF, Value::Object(None));
     ctx.set_field(cs, CS_CERTIFICATES_REF, Value::Object(None));
     // Belt-and-suspenders: also set by name in case the real JDK CodeSource
     // layout reads through a different field index than our synthetic.
+    cs = ctx.read_native_pin(cs_pin, cs);
     ctx.set_field_by_name(cs, "location", Value::Object(None));
+    cs = ctx.read_native_pin(cs_pin, cs);
     ctx.set_field_by_name(cs, "certs", Value::Object(None));
 
-    let pd = alloc_concurrent_synthetic(ctx, PD_CLASS, PD_FIELD_COUNT);
+    let mut pd = alloc_concurrent_synthetic(ctx, PD_CLASS, PD_FIELD_COUNT);
+    let pd_pin = ctx.pin_native_root(pd);
+    cs = ctx.read_native_pin(cs_pin, cs);
+    pd = ctx.read_native_pin(pd_pin, pd);
     ctx.set_field(pd, PD_CODE_SOURCE_REF, Value::Object(Some(cs)));
     ctx.set_field(pd, PD_PERMISSIONS_REF, Value::Object(None));
     ctx.set_field(pd, PD_CLASS_LOADER_REF, Value::Object(None));
     // Real JDK PD reads `codesource` by name in `getCodeSource`; cover both
     // field-index orderings.
+    cs = ctx.read_native_pin(cs_pin, cs);
+    pd = ctx.read_native_pin(pd_pin, pd);
     ctx.set_field_by_name(pd, "codesource", Value::Object(Some(cs)));
+    pd = ctx.read_native_pin(pd_pin, pd);
     ctx.set_field_by_name(pd, "permissions", Value::Object(None));
+    pd = ctx.read_native_pin(pd_pin, pd);
     ctx.set_field_by_name(pd, "classloader", Value::Object(None));
+    let pd = ctx.read_native_pin(pd_pin, pd);
+    ctx.unpin_native_roots(cs_pin);
     pd
 }
 
@@ -463,14 +498,20 @@ pub(crate) fn alloc_classloader(ctx: &mut dyn NativeContext, loader_type: i32) -
         LOADER_APP => "jdk/internal/loader/ClassLoaders$AppClassLoader",
         _ => CL_CLASS,
     };
-    let obj = alloc_concurrent_synthetic(ctx, class_name, CL_FIELD_COUNT);
+    let mut obj = alloc_concurrent_synthetic(ctx, class_name, CL_FIELD_COUNT);
+    let obj_pin = ctx.pin_native_root(obj);
     ctx.set_field(obj, CL_LOADER_TYPE, Value::Int(loader_type));
     ctx.set_field(obj, CL_PARENT_REF, Value::Object(None));
     ctx.set_field(obj, CL_NAME_REF, Value::Object(None));
     ctx.set_field(obj, CL_CLASSES_LOADED, Value::Int(0));
     ctx.set_field(obj, CL_IS_PARALLEL_CAPABLE, Value::Int(0));
     let pd = alloc_default_protection_domain(ctx);
+    let pd_pin = ctx.pin_native_root(pd);
+    obj = ctx.read_native_pin(obj_pin, obj);
+    let pd = ctx.read_native_pin(pd_pin, pd);
     ctx.set_field(obj, CL_DEFAULT_DOMAIN, Value::Object(Some(pd)));
+    obj = ctx.read_native_pin(obj_pin, obj);
+    let pd = ctx.read_native_pin(pd_pin, pd);
     ctx.set_field_by_name(obj, "defaultDomain", Value::Object(Some(pd)));
     // Assign a unique loader ID for custom classloaders
     let lid = if loader_type == LOADER_CUSTOM {
@@ -478,6 +519,7 @@ pub(crate) fn alloc_classloader(ctx: &mut dyn NativeContext, loader_type: i32) -
     } else {
         0 // built-in loaders don't use this field
     };
+    obj = ctx.read_native_pin(obj_pin, obj);
     ctx.set_field(obj, CL_LOADER_ID, Value::Int(lid));
     // Built-in loaders (platform & app) extend `jdk.internal.loader.BuiltinClassLoader`,
     // whose constructor (`BuiltinClassLoader(String, BuiltinClassLoader, URLClassPath)`)
@@ -491,9 +533,15 @@ pub(crate) fn alloc_classloader(ctx: &mut dyn NativeContext, loader_type: i32) -
     if loader_type == LOADER_PLATFORM || loader_type == LOADER_APP {
         let name_to_module =
             alloc_concurrent_synthetic(ctx, "java/util/concurrent/ConcurrentHashMap", 16);
+        let name_to_module_pin = ctx.pin_native_root(name_to_module);
+        obj = ctx.read_native_pin(obj_pin, obj);
+        let name_to_module = ctx.read_native_pin(name_to_module_pin, name_to_module);
         ctx.set_field_by_name(obj, "nameToModule", Value::Object(Some(name_to_module)));
         let module_to_reader =
             alloc_concurrent_synthetic(ctx, "java/util/concurrent/ConcurrentHashMap", 16);
+        let module_to_reader_pin = ctx.pin_native_root(module_to_reader);
+        obj = ctx.read_native_pin(obj_pin, obj);
+        let module_to_reader = ctx.read_native_pin(module_to_reader_pin, module_to_reader);
         ctx.set_field_by_name(obj, "moduleToReader", Value::Object(Some(module_to_reader)));
     }
     // S111r17: `java/lang/ClassLoader` declares `packages:ConcurrentHashMap`
@@ -501,27 +549,36 @@ pub(crate) fn alloc_classloader(ctx: &mut dyn NativeContext, loader_type: i32) -
     // `new ConcurrentHashMap()`.  We bypass the ctor through
     // `alloc_concurrent_synthetic`, so `packages` defaults to null. The JDK's
     // `ClassLoader.packages()` instance method does
-    // `getfield packages → ConcurrentHashMap.values()`, NPE'ing with
-    // "Cannot invoke values on null" — observed during
+    // `getfield packages` then `ConcurrentHashMap.values()`, NPE'ing with
+    // "Cannot invoke values on null"; observed during
     // `org/jboss/modules/ConcurrentClassLoader.<clinit>` (JBoss Modules /
     // WildFly 39 boot), whose static initializer calls
-    // `Package.getPackages()` → `ClassLoader.getClassLoader(...).getPackages()`
-    // → `packages()`. Pre-populate an empty CHM so the bytecode path runs
+    // `Package.getPackages()` then `ClassLoader.getClassLoader(...).getPackages()`
+    // then `packages()`. Pre-populate an empty CHM so the bytecode path runs
     // without additional intercepts.
     let packages_map =
         alloc_concurrent_synthetic(ctx, "java/util/concurrent/ConcurrentHashMap", 16);
+    let packages_map_pin = ctx.pin_native_root(packages_map);
+    obj = ctx.read_native_pin(obj_pin, obj);
+    let packages_map = ctx.read_native_pin(packages_map_pin, packages_map);
     ctx.set_field_by_name(obj, "packages", Value::Object(Some(packages_map)));
     // `ClassLoader.setDefaultAssertionStatus` uses `synchronized (assertionLock)`.
     // Real JDK ctors assign `this.assertionLock = new Object()`; synthetic
     // allocation skips that, so Surefire's forked booter NPEs on monitorenter.
     let lock = alloc_concurrent_synthetic(ctx, "java/lang/Object", 0);
+    let lock_pin = ctx.pin_native_root(lock);
+    let lock = ctx.read_native_pin(lock_pin, lock);
     let _ = ctx.invoke_special(
         "java/lang/Object",
         "<init>",
         "()V",
         &[Value::Object(Some(lock))],
     );
+    obj = ctx.read_native_pin(obj_pin, obj);
+    let lock = ctx.read_native_pin(lock_pin, lock);
     ctx.set_field_by_name(obj, "assertionLock", Value::Object(Some(lock)));
+    let obj = ctx.read_native_pin(obj_pin, obj);
+    ctx.unpin_native_roots(obj_pin);
     obj
 }
 
@@ -551,17 +608,24 @@ fn get_or_assign_loader_id(ctx: &mut dyn NativeContext, cl: ObjectRef) -> u32 {
 }
 
 fn alloc_url_classloader(ctx: &mut dyn NativeContext) -> ObjectRef {
-    let obj = alloc_concurrent_synthetic(ctx, UCL_CLASS, UCL_FIELD_COUNT);
+    let mut obj = alloc_concurrent_synthetic(ctx, UCL_CLASS, UCL_FIELD_COUNT);
+    let obj_pin = ctx.pin_native_root(obj);
     ctx.set_field(obj, UCL_LOADER_TYPE, Value::Int(LOADER_CUSTOM));
     ctx.set_field(obj, UCL_PARENT_REF, Value::Object(None));
     ctx.set_field(obj, UCL_URL_COUNT, Value::Int(0));
     ctx.set_field(obj, UCL_CLOSED, Value::Int(0));
     // Allocate initial URLs array (capacity 16)
     let urls_arr = ctx.new_array(cratonvm_types::ArrayElementType::Reference, 16);
+    let urls_pin = ctx.pin_native_root(urls_arr);
+    obj = ctx.read_native_pin(obj_pin, obj);
+    let urls_arr = ctx.read_native_pin(urls_pin, urls_arr);
     ctx.set_field(obj, UCL_URLS_ARRAY, Value::Object(Some(urls_arr)));
     // Assign unique loader ID
     let lid = ctx.allocate_loader_id();
+    obj = ctx.read_native_pin(obj_pin, obj);
     ctx.set_field(obj, UCL_LOADER_ID, Value::Int(lid as i32));
+    let obj = ctx.read_native_pin(obj_pin, obj);
+    ctx.unpin_native_roots(obj_pin);
     obj
 }
 

@@ -4,15 +4,16 @@ This folder collects CratonVM-only defects found while running upstream Java
 suites. The docs had grown to describe the **same underlying bug from several
 angles**; this index is the consolidated map. Read it first.
 
-## 2026-07-07 `InPredicateTest` timeout root-caused to dispatch-heavy JIT tier-up overhead (not the OSR alloc-gate, not precise-JIT-maps)
+## 2026-07-08 `InPredicateTest` LHM NSME and stale timeout notes retired
 
-- 🔴 OPEN: [`InPredicateTest` 100k-element criteria `IN` predicate times out under JIT](hib-inpredicate-dispatch-heavy-jit-timeout-20260707.md) — a clean, uncontended single-class rerun confirms the 2026-07-07 local-rerun timeout finding is a real, deterministic regression (3/3 clean runs, 330–510s, always timing out), not host-load noise. Two same-day-landed candidates (the precise-JIT-maps default-ON re-flip, the OSR allocation-region gate) were directly A/B-tested and ruled out. Root cause: `SqmCriteriaNodeBuilder.in()`'s 100k-call dispatch-heavy loop hits the already-tracked "JIT is a net slowdown for dispatch-heavy Hibernate workloads" issue ([[reference_jit_invoke_cache_thrash_dispatch_heavy]], `docs/internal/HIB-misc16-correctness-sweep.md` §15–16) — confirmed decisively via `--nojit` A/B (330-510s FAIL vs 109.5s PASS, 3–4.6× faster with JIT off). Also explains why the previously-tracked `removeEldestEntry` NSME ([hib-domainparameterxref-lhm-removeeldestentry-nsme.md](hib-domainparameterxref-lhm-removeeldestentry-nsme.md)) no longer reproduces: the code path that threw it is never reached anymore, not fixed — that doc has been annotated, not retired.
+- ✅ FIXED: [`DomainParameterXref` `LinkedHashMap.removeEldestEntry` NSME](../internal/fixed-suite-bugs/hib-domainparameterxref-lhm-removeeldestentry-nsme-FIXED.md) — fresh Azure `dev@47bbdc3b` reproduced the slot-0/`java.lang.Object` class-id read and `Object.removeEldestEntry` NSME (`ok=0`, 33.697s). The LHM native now skips that impossible virtual call while preserving real subclass eviction hooks; the fixed probe still sees the slot-0 read but passes (`ok=1`, 55.971s).
+- ✅ RETIRED: [`InPredicateTest` dispatch-heavy JIT timeout note](../internal/fixed-suite-bugs/hib-inpredicate-dispatch-heavy-jit-timeout-20260707-FIXED.md) — current recheck no longer times out. Before the LHM guard, current dev reached the later NSME in 33.697s; after the guard, the class passed under default JIT in 55.971s.
 
-## 2026-07-07 crypto/fips1402 ProvEC `ClassNotFoundException`/process-crash + SD-JWT hang FIXED (BC-FIPS `EngineCreator`/`creatorMap` bridge); new residual found
+## 2026-07-07/08 crypto/fips1402 ProvEC `ClassNotFoundException`, SD-JWT hang, and P-384 KeyPairGenerator gaps FIXED
 
-- ✅ FIXED: [ProvEC `AlgorithmParametersSpi$EC` class-not-found, crashing whole process](../internal/fixed-suite-bugs/keycloak-crypto-fips1402-provec-algorithmparametersspi-classnotfound-FIXED.md) — BouncyCastle-FIPS registers algorithms through a private `creatorMap` (`EngineCreator` factories), never a directly-loadable `className`; CratonVM's real-JCA bridge didn't know about this and tried (and, worse, non-catchably crashed on) reflectively loading BC-FIPS's cosmetic label string. Fixed by reaching `creatorMap` directly (`try_engine_creator_instantiate`) plus retaining the real `Provider` object across `Security.addProvider` (`real_provider_table`), and hardening the reflective fallback to raise a catchable exception instead of aborting the process.
-- ✅ FIXED (same root cause/fix): [FIPS1402JwtVcMetadataTrustedSdJwtIssuerTest hang after provider init](../internal/fixed-suite-bugs/keycloak-crypto-fips1402-sdjwt-hang-after-provider-init-FIXED.md) — was a 1200s HANG, now 16/16 PASS in ~117s.
-- 🔴 NEW OPEN: [`KeyPairGenerator.getInstance("ECDSA","BCFIPS")` resolves to SunEC, not BC-FIPS; SunEC's curve table lacks 384-bit](crypto-fips1402-sunec-keypairgenerator-384bit-gap.md) — exposed now that EC crypto runs for real instead of crashing earlier. Affects the P-384/ES384 case in `BCFIPSECDSACryptoProviderTest`, `BCFIPSEcdhEsAlgorithmProviderTest`, `FIPS1402SdJwtCreationAndSigningTest` (1 of 2-3 parameterized cases in each); 256/512-bit and non-EC-keysize cases pass.
+- FIXED: [ProvEC `AlgorithmParametersSpi$EC` class-not-found, crashing whole process](../internal/fixed-suite-bugs/keycloak-crypto-fips1402-provec-algorithmparametersspi-classnotfound-FIXED.md) - BouncyCastle-FIPS registers algorithms through a private `creatorMap` (`EngineCreator` factories), never a directly-loadable `className`; CratonVM's real-JCA bridge didn't know about this and tried (and, worse, non-catchably crashed on) reflectively loading BC-FIPS's cosmetic label string. Fixed by reaching `creatorMap` directly (`try_engine_creator_instantiate`) plus retaining the real `Provider` object across `Security.addProvider` (`real_provider_table`), and hardening the reflective fallback to raise a catchable exception instead of aborting the process.
+- FIXED (same root cause/fix): [FIPS1402JwtVcMetadataTrustedSdJwtIssuerTest hang after provider init](../internal/fixed-suite-bugs/keycloak-crypto-fips1402-sdjwt-hang-after-provider-init-FIXED.md) - was a 1200s HANG, now 16/16 PASS in ~117s.
+- FIXED: [`KeyPairGenerator.getInstance("ECDSA","BCFIPS")` and no-provider SunEC P-384 keygen failures](../internal/fixed-suite-bugs/keycloak-crypto-fips1402-sunec-keypairgenerator-384bit-gap-FIXED.md) - explicit BC-FIPS EC/ECDSA keygen now returns the provider-created BC-FIPS generator through the existing `EngineCreator` bridge, and default SunEC keygen now bypasses the no-arg constructor's failing default-384 initialize before applying the caller's `ECGenParameterSpec`. Verified `BCFIPSECDSACryptoProviderTest` 3/3, `BCFIPSEcdhEsAlgorithmProviderTest` 2/2, and `FIPS1402SdJwtCreationAndSigningTest` 2/2.
 
 ## 2026-07-07 Three Keycloak nonpassed-rerun bugs FIXED (DependencyGraphResolver spin loop, Phaser/ForkJoinPool hang, Liquibase Scope corruption)
 
@@ -22,31 +23,20 @@ angles**; this index is the consolidated map. Read it first.
 
 All three verified against their real Keycloak classes via the suite runner; no regressions in the touched crates' test suites.
 
-## 2026-07-07 Hibernate local Windows rerun — progress check + new SQL-placeholder bug
+## 2026-07-07 Hibernate local Windows rerun — retired aggregate note
 
-- [hib-local-windows-rerun-20260707.md](hib-local-windows-rerun-20260707.md) — 4-shard local rerun of the 121-class non-passed list confirms 15 real fixes (bytecode-enhancement/lazytoone progress, generic-timeout-wall classes now passing) landed on `dev` since the 2026-07-05 Azure baseline; documents 3 findings that evolved to different symptoms (`JpaLargeBlobTest`, `InPredicateTest`, the temporal 1-hour-skew doc now superseded); flags a harness status-computation false-positive.
+- ✅ RETIRED: [hib-local-windows-rerun-20260707.md](../internal/hib-local-windows-rerun-20260707.md) — the 4-shard local rerun remains historical evidence for 15 confirmed fixes, `JpaLargeBlobTest`'s non-hang slow path, the superseded temporal-skew observation, and the harness status-computation false-positive. A 2026-07-08 Azure `dev@22d79b10` recheck with unique binary `/data/data/cratonvm-binaries/cvhiblocalcurrentdev-20260708-160310-rebased` passed `InPredicateTest` (`ok=1`, 60.643s) plus the fixed-bucket sample (`LocalXmlResourceResolverTest` 23/23, `ConfigurationTest` 1/1, `OrmXmlEnumTypeTest` 1/1), so this aggregate note no longer owns an open task.
 - ✅ FIXED same day: the SQL-placeholder duplication that rerun re-confirmed (plus 2 more affected classes outside `type.temporal.*` — `ExtendedEnhancementNonStandardAccessTest`, `FunctionTests`, proving it a general SQL-generation-path defect) was the reopened JIT reason-8 imprecise-resume corruption; see [`docs/internal/hib-temporal-sql-parameter-placeholder-duplication-FIXED.md`](../internal/hib-temporal-sql-parameter-placeholder-duplication-FIXED.md) and the identity-sound precise-resume entry below.
 
-## 2026-07-07 ES binary-docvalues range doc retired; residual re-diagnosed as young-GC live-object reclamation (NEW open doc)
+## 2026-07-07 ES binary-docvalues range doc retired; young-GC RRWL residual fixed 2026-07-08
 
-- [gen-heap-young-gc-live-object-reclaim-rrwl-holdcount.md](gen-heap-young-gc-live-object-reclaim-rrwl-holdcount.md) —
-  🔴 OPEN, VM-core GC. The `elasticsearch-lucene-binary-docvalues-range-hangs` residual (and the
-  "separate JIT-specific RRWL reader-vs-writer hang" from the 2026-07-06 Azure session) is NOT a JIT
-  miscompile: with every published-compiled method force-skipped (audited via `CRATONVM_DBG_JITC`),
-  the standalone probe still hangs. Direct evidence (`CRATONVM_DBG_SWEEP_ZERO`): the JIT-active
-  non-moving young sweep RECLAIMS a live `ThreadLocalMap$Entry` (RRWL `readHolds` hold-counter
-  storage) → IMSE at unlock / leaked read count → all-parked hang at AQLS.acquire bci 368.
-  `--nojit`+GC-stress completes; JIT-active+GC-stress hangs with nothing meaningful compiled.
-  Fixed `CRATONVM_DBG_SWEEP_EDGES` (was blind to Family-A side-marks) now classifies the loss as
-  case (a): register/native-stack root gap or sweep-walk defect. Hang rate regressed 0/3 →
-  ~6/6 across dev f6aa11c9..007e620a (prime suspect commits listed in the doc). Probe sources:
-  `repros/rwl-holdcount/`. New gated diagnostics on dev: `CRATONVM_DBG_REFERSTO`,
-  `CRATONVM_DBG_UNPARK_MISS`.
+- [FIXED] [Young-GC live-object reclamation corrupting RRWL read-lock hold counts](../internal/fixed-suite-bugs/gen-heap-young-gc-live-object-reclaim-rrwl-holdcount-FIXED.md) - the `elasticsearch-lucene-binary-docvalues-range-hangs` residual and the standalone RRWL reader-vs-writer hang were traced through three layers: reference-processing survivorship, class-init missed-notify crawl, ThreadIdentifiers tid collisions, then the final Linux helper-window/native ClassLoader pinning gaps. The standalone `RwlReadTearingProbe` now completes 10/10 under `CRATONVM_DBG_GC_STRESS=200000` on the Azure validation host. Direct ES rerun remains unavailable there because the ES checkout/classpath is absent, so any future ES confirmation should be tracked as suite validation rather than keeping this fixed mechanism in `known-issues`.
 - `elasticsearch-lucene-binary-docvalues-range-hangs.md` retired to
   [`docs/internal/`](../internal/elasticsearch-lucene-binary-docvalues-range-hangs.md): its three
-  root causes (invokedynamic JIT blacklist, AQS skip-list gaps ×2 rounds, plain-field 16-byte slot
-  tearing) are all FIXED+merged, end-to-end verified on the Windows box (deterministic silent stall
-  → bimodal fast-IMSE/stall, both faces now attributed to the new GC doc above).
+  root causes (invokedynamic JIT blacklist, AQS skip-list gaps x2 rounds, plain-field 16-byte slot
+  tearing) are all FIXED+merged, end-to-end verified on the Windows box. Its residual now points at
+  the fixed RRWL document above.
+
 ## 2026-07-07 JIT invokedynamic uncommon-trap Groovy regression — FIXED (no tradeoff)
 
 - ✅ FIXED: `fb4a333d`'s precise-resume routing for the invokedynamic
@@ -152,7 +142,7 @@ All three verified against their real Keycloak classes via the suite runner; no 
 
 ## 2026-07-06 Hibernate `others.txt` non-passed rerun (OSR allocation-region gate branch)
 
-- ✅ FIXED 2026-07-06 (`fix/hib-inpredicate-criteria-values-null-20260706`, commit `084c8ffb`): the `values`-null NPE was `try_osr()` in `vm/src/runtime/interpreter.rs` misreading the invokedynamic uncommon-trap's `i64::MIN` deopt sentinel as a genuine reference return value (no CompactValue/register-staleness involved — reproduced standalone, no Hibernate needed). Full analysis moved to [`docs/internal/hib-inpredicatetest-criteria-values-null-npe-FIXED.md`](../internal/hib-inpredicatetest-criteria-values-null-npe-FIXED.md); the previously-noted candidate cherry-pick (`4c3cf821` / `fix/hib-inpredicate-criteria-values-null-20260705`) is superseded and unneeded. `InPredicateTest` still doesn't fully pass — it now hits a distinct, unrelated `NoSuchMethodError` in `LinkedHashMap.removeEldestEntry` dispatch, tracked separately: [hib-domainparameterxref-lhm-removeeldestentry-nsme.md](hib-domainparameterxref-lhm-removeeldestentry-nsme.md).
+- ✅ FIXED 2026-07-06 (`fix/hib-inpredicate-criteria-values-null-20260706`, commit `084c8ffb`): the `values`-null NPE was `try_osr()` in `vm/src/runtime/interpreter.rs` misreading the invokedynamic uncommon-trap's `i64::MIN` deopt sentinel as a genuine reference return value (no CompactValue/register-staleness involved — reproduced standalone, no Hibernate needed). Full analysis moved to [`docs/internal/hib-inpredicatetest-criteria-values-null-npe-FIXED.md`](../internal/hib-inpredicatetest-criteria-values-null-npe-FIXED.md); the previously-noted candidate cherry-pick (`4c3cf821` / `fix/hib-inpredicate-criteria-values-null-20260705`) is superseded and unneeded. `InPredicateTest` later exposed the separate `LinkedHashMap.removeEldestEntry` NSME and a stale timeout note; both are now retired after the 2026-07-08 Azure recheck/fix: [LHM NSME](../internal/fixed-suite-bugs/hib-domainparameterxref-lhm-removeeldestentry-nsme-FIXED.md) and [timeout note](../internal/fixed-suite-bugs/hib-inpredicate-dispatch-heavy-jit-timeout-20260707-FIXED.md).
 - A 50-class rerun of `others.txt` (4 shards, 1200s per-class timeout) otherwise reconfirmed several already-tracked bugs with no new symptoms: HIB-CV-30 (`MultiLevelCascadeCollectionEmbeddableTest`/`IdClassTest`), the H2/javac `File.pathSeparator` cluster (`SessionDelegatorBaseImplTest` + 4 stored-procedure classes, fix exists on an unmerged branch), `ProxyClassReuseTest`, and `JpaLargeBlobTest`. `SortNaturalTest` showed `HANG` in the parallel sweep but passed cleanly (`ok=1`, 10.5s) in an isolated rerun — a shared-host contention artifact, not a regression of its 2026-06-22 fix. `DelayedCdiSupportTest` (originally reported alongside this rerun as a genuine hang, see `docs/internal/hib-delayedcdisupporttest-weld-bootstrap-hang-NOT-A-BUG.md`) was later REFUTED as the same contention artifact -- it and all sibling CDI-strategy tests pass cleanly in 2-8s when the host is not under load.
 
 ## 2026-07-06 WildFly Host Controller org.jboss.as.jmx module-load NPE

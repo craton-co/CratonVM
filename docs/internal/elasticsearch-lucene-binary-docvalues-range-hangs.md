@@ -9,8 +9,8 @@ bimodal behaviour — the method now either FAILS fast (~70s) with the concrete
 or still stalls (observed once at a 400s cap under heavy box load). BOTH
 remaining faces are now attributed, with direct evidence, to a DIFFERENT,
 independently characterized defect — young-GC live-object reclamation
-corrupting RRWL read-lock hold counts — tracked by the new open doc
-`docs/known-issues/gen-heap-young-gc-live-object-reclaim-rrwl-holdcount.md`,
+corrupting RRWL read-lock hold counts — tracked by the now-fixed retired doc
+`docs/internal/fixed-suite-bugs/gen-heap-young-gc-live-object-reclaim-rrwl-holdcount-FIXED.md`,
 which also retires this doc's "separate JIT-specific reader-vs-writer hang"
 residual (it was never a JIT miscompile at all — see the 2026-07-07 final
 update at the bottom).
@@ -411,9 +411,9 @@ reader-vs-writer hang" residual this doc carried):
 
 Full evidence, repro recipe (probe sources committed under
 `docs/known-issues/repros/rwl-holdcount/`), ruled-out list, regression data
-and next steps live in the new open doc:
-`docs/known-issues/gen-heap-young-gc-live-object-reclaim-rrwl-holdcount.md`.
+and final validation live in the now-fixed retired doc:
+`docs/internal/fixed-suite-bugs/gen-heap-young-gc-live-object-reclaim-rrwl-holdcount-FIXED.md`.
 
 Per the known-issues triage rule, this doc's primary defects (the three
-root causes) are fixed and the residual is tracked by a separate open doc,
-so this doc retires to `docs/internal/`.
+root causes) are fixed and the residual is tracked by the now-fixed RRWL doc,
+so this doc stays retired in `docs/internal/`.

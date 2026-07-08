@@ -243,24 +243,27 @@ fn allocate_log_manager(ctx: &mut dyn NativeContext, class_name: &str) -> Object
 /// default `java/util/logging/LogManager` singleton (preserving the
 /// no-`-Djava.util.logging.manager` baseline).
 ///
-/// Built-in aliases (`java.util.logging.LogManager`,
-/// `org.jboss.logmanager.LogManager`) short-circuit to `None` so the
-/// existing pre-allocated singletons remain the source of truth — those
-/// singletons already have the synthetic field layout my native helpers
-/// expect, and routing them through `<init>` would re-enter
-/// `getLogManager()` recursively.
+/// The JDK alias (`java.util.logging.LogManager`) short-circuits to
+/// `None` so the existing default singleton remains the source of truth.
+/// The JBoss alias (`org.jboss.logmanager.LogManager`) is special: WildFly's
+/// logging extension checks that the active singleton's concrete class is the
+/// JBoss manager, so allocate our synthetic JBoss-classed singleton directly
+/// instead of invoking the real constructor.
 fn try_allocate_property_log_manager(ctx: &mut dyn NativeContext) -> Option<ObjectRef> {
     let prop = ctx.get_system_property("java.util.logging.manager")?;
     let dotted = prop.trim();
     if dotted.is_empty() {
         return None;
     }
-    // Built-in aliases use the pre-existing singletons; calling
+    // Built-in aliases use our synthetic singleton layout; calling
     // `<init>` on them through the bytecode path would either re-enter
     // this function or trip the `native_jboss_init` no-op contract.
     let internal = dotted.replace('.', "/");
-    if internal == CLS_JUL_LOG_MANAGER || internal == CLS_JBOSS_LOG_MANAGER {
+    if internal == CLS_JUL_LOG_MANAGER {
         return None;
+    }
+    if internal == CLS_JBOSS_LOG_MANAGER {
+        return Some(allocate_log_manager(ctx, CLS_JBOSS_LOG_MANAGER));
     }
 
     // SECURITY FIX: validate the *class name* with a dedicated
@@ -747,8 +750,18 @@ fn ensure_jboss_log_context(ctx: &mut dyn NativeContext) -> ObjectRef {
             }
         }
     }
-    // Synthetic with zero fields — none are read by our overrides.
     let obj = alloc_concurrent_synthetic(ctx, "org/jboss/logmanager/LogContext", 1);
+    // Real LogContext.addCloseHandler synchronizes on treeLock. Most LogContext
+    // methods are native-overridden below, but initializing the monitor keeps
+    // any remaining real bytecode null-safe.
+    let tree_lock = alloc_concurrent_synthetic(ctx, "java/lang/Object", 0);
+    ctx.set_field_by_name(obj, "treeLock", Value::Object(Some(tree_lock)));
+    if ctx
+        .resolve_field_index("org/jboss/logmanager/LogContext", "treeLock")
+        .is_none()
+    {
+        ctx.set_field(obj, 0, Value::Object(Some(tree_lock)));
+    }
     let mut g = jboss_log_context_singleton()
         .lock()
         .unwrap_or_else(|e| e.into_inner());
@@ -934,6 +947,31 @@ fn native_jboss_log_context_check_access(
     _args: &[Value],
 ) -> MethodCallResult {
     Ok(None)
+}
+
+fn native_jboss_log_context_add_close_handler(
+    _ctx: &mut dyn NativeContext,
+    _args: &[Value],
+) -> MethodCallResult {
+    // Close handlers are lifecycle cleanup hooks for the real JBoss logging
+    // graph. Our synthetic LogContext has no owned resources to close.
+    Ok(None)
+}
+
+fn native_jboss_log_context_get_close_handlers(
+    ctx: &mut dyn NativeContext,
+    _args: &[Value],
+) -> MethodCallResult {
+    if let Ok(Some(set)) = ctx.invoke(
+        "java/util/Collections",
+        "emptySet",
+        "()Ljava/util/Set;",
+        &[],
+    ) {
+        return Ok(Some(set));
+    }
+    let set = alloc_concurrent_synthetic(ctx, "java/util/Collections$EmptySet", 0);
+    Ok(Some(Value::Object(Some(set))))
 }
 
 fn native_jboss_logger_get_level(
@@ -2917,6 +2955,30 @@ pub fn register_logmanager_natives(registry: &mut NativeMethodRegistry) {
         "()V",
         native_jboss_log_context_check_access,
     );
+    registry.register(
+        "org/jboss/logmanager/LogContext",
+        "addCloseHandler",
+        "(Ljava/lang/AutoCloseable;)V",
+        native_jboss_log_context_add_close_handler,
+    );
+    registry.register(
+        "org/jboss/logmanager/LogContext",
+        "getCloseHandlers",
+        "()Ljava/util/Set;",
+        native_jboss_log_context_get_close_handlers,
+    );
+    registry.register(
+        "org/jboss/logmanager/LogContext",
+        "setCloseHandlers",
+        "(Ljava/util/Collection;)V",
+        native_jboss_log_context_add_close_handler,
+    );
+    registry.register(
+        "org/jboss/logmanager/LogContext",
+        "close",
+        "()V",
+        native_jboss_log_context_add_close_handler,
+    );
 
     // ---------------- KC16-JUL: java/util/logging/Logger null-safe accessors ----------------
     // Real-JDK `Logger.getResourceBundleName()` reads
@@ -3017,6 +3079,20 @@ mod tests {
             )
             .is_some());
         assert!(r.find(CLS_JBOSS_LOG_MANAGER, "<init>", "()V").is_some());
+        assert!(r
+            .find(
+                "org/jboss/logmanager/LogContext",
+                "addCloseHandler",
+                "(Ljava/lang/AutoCloseable;)V"
+            )
+            .is_some());
+        assert!(r
+            .find(
+                "org/jboss/logmanager/LogContext",
+                "getCloseHandlers",
+                "()Ljava/util/Set;"
+            )
+            .is_some());
         // Enumeration wrapper.
         assert!(r
             .find(CLS_LOGGER_ENUMERATION, "hasMoreElements", "()Z")
@@ -3067,6 +3143,18 @@ mod tests {
         assert_eq!(
             jul, jboss,
             "JUL and JBoss getLogManager() must share singleton"
+        );
+    }
+
+    #[test]
+    fn jboss_log_context_singleton_has_tree_lock_for_real_bytecode() {
+        let _g = test_lock().lock().unwrap_or_else(|e| e.into_inner());
+        reset_state_for_tests();
+        let mut ctx = mock_ctx();
+        let log_context = ensure_jboss_log_context(&mut ctx);
+        assert!(
+            matches!(ctx.get_field(log_context, 0), Value::Object(Some(_))),
+            "real LogContext.addCloseHandler synchronizes on treeLock"
         );
     }
 
@@ -3457,10 +3545,10 @@ mod tests {
 
     #[test]
     fn block_2b_property_built_in_alias_falls_through_to_singleton() {
-        // Built-in JDK / JBoss class names short-circuit through the
-        // pre-allocated singleton path. This pins the contract that
-        // `try_allocate_property_log_manager` returns `None` for them
-        // (so the existing synthetic field layout is preserved).
+        // The JDK class name short-circuits through the pre-allocated default
+        // singleton path. This pins the contract that
+        // `try_allocate_property_log_manager` returns `None` for the JDK alias
+        // so the existing synthetic field layout is preserved.
         let _g = test_lock().lock().unwrap_or_else(|e| e.into_inner());
         reset_state_for_tests();
         let mut ctx = mock_ctx();
@@ -3478,6 +3566,36 @@ mod tests {
             _ => panic!(),
         };
         assert_eq!(obj, obj2);
+    }
+
+    #[test]
+    fn block_2b_property_jboss_alias_returns_jboss_class_singleton() {
+        let _g = test_lock().lock().unwrap_or_else(|e| e.into_inner());
+        reset_state_for_tests();
+        let mut ctx = mock_ctx();
+        ctx.set_system_property(
+            "java.util.logging.manager",
+            "org.jboss.logmanager.LogManager",
+        );
+        let obj = match native_get_log_manager(&mut ctx, &[]).unwrap().unwrap() {
+            Value::Object(Some(o)) => o,
+            other => panic!("expected manager ObjectRef, got {:?}", other),
+        };
+        let cid = ctx.class_id_of_object(obj);
+        let name = ctx.class_name_of_id(cid).unwrap_or_default();
+        assert_eq!(
+            name, CLS_JBOSS_LOG_MANAGER,
+            "WildFly's logging extension requires the active manager class to be JBoss LogManager"
+        );
+
+        let jboss = match native_get_jboss_log_manager(&mut ctx, &[])
+            .unwrap()
+            .unwrap()
+        {
+            Value::Object(Some(o)) => o,
+            other => panic!("expected JBoss manager ObjectRef, got {:?}", other),
+        };
+        assert_eq!(obj, jboss, "JUL and JBoss entry points share singleton");
     }
 
     #[test]

@@ -308,6 +308,11 @@ fn native_randomized_context_get_per_thread(
     Ok(Some(Value::Object(Some(resources))))
 }
 
+const LUCENE_RAM_USAGE_FALLBACK_DOCUMENT_BYTES: i64 = 1024;
+const LUCENE_RAM_USAGE_MIN_DOCUMENT_BYTES: i64 = 1024;
+const LUCENE_RAM_USAGE_DOCUMENT_BASE_BYTES: i64 = 376;
+const LUCENE_RAM_USAGE_EXTRA_FIELD_BYTES: i64 = 256;
+
 fn native_lucene_ram_usage_tester_ram_used(
     ctx: &mut dyn NativeContext,
     args: &[Value],
@@ -322,10 +327,18 @@ fn native_lucene_ram_usage_tester_ram_used(
     let bytes = if class_name == "org/apache/lucene/document/Document" {
         // Lucene postings-format tests use RamUsageTester.ramUsed(Document) only
         // to cap how many generated documents are indexed. The real helper walks
-        // the full object graph reflectively; under CratonVM that dominates the
-        // test without increasing coverage. Keep the loop scale close to the
-        // intended 100 KiB target by charging each generated Document 1 KiB.
-        1024
+        // the full object graph reflectively; under CratonVM that reflective
+        // walk dominates the test without increasing postings coverage.
+        //
+        // Keep the loop scale close to HotSpot by charging the actual string
+        // payloads inside the Document. For the body-only LineFileDocs shape in
+        // BasePostingsFormatTestCase, HotSpot 25 / Lucene 10.4 reports almost
+        // exactly `align8(376 + 2 * body.length())` bytes (seed B17AC9D3E1F2A0C4:
+        // avg ~2281 bytes, range 1256..3424 for the first 32 docs). The old flat
+        // 1 KiB estimate undercharged this loop by ~2.2x and made CratonVM index
+        // far more documents than the test's intended ~100 KiB cap.
+        estimate_lucene_document_ram_used(ctx, obj)
+            .unwrap_or(LUCENE_RAM_USAGE_FALLBACK_DOCUMENT_BYTES)
     } else if class_name == "java/lang/String" {
         ctx.read_string(obj)
             .map(|s| 40 + (s.len() as i64 * 2))
@@ -334,6 +347,182 @@ fn native_lucene_ram_usage_tester_ram_used(
         128
     };
     Ok(Some(Value::Long(bytes)))
+}
+
+fn estimate_lucene_document_ram_used(ctx: &mut dyn NativeContext, doc: ObjectRef) -> Option<i64> {
+    let fields = match ctx.get_field_by_name(doc, "fields") {
+        Value::Object(Some(fields)) => fields,
+        _ => return None,
+    };
+    let fields_pin = ctx.pin_native_root(fields);
+    let field_count = match invoke_list_size(ctx, fields) {
+        Some(field_count) => field_count,
+        None => {
+            ctx.unpin_native_roots(fields_pin);
+            return None;
+        }
+    };
+    if field_count <= 0 {
+        ctx.unpin_native_roots(fields_pin);
+        return Some(LUCENE_RAM_USAGE_MIN_DOCUMENT_BYTES);
+    }
+
+    let mut fields = ctx.read_native_pin(fields_pin, fields);
+    let mut string_chars = 0_i64;
+    let mut string_fields = 0_i64;
+    let max_fields = field_count.min(16);
+    for index in 0..max_fields {
+        let field = invoke_list_get(ctx, fields, index);
+        fields = ctx.read_native_pin(fields_pin, fields);
+        let Some(field) = field else {
+            continue;
+        };
+        let Some(chars) = lucene_field_string_chars(ctx, field) else {
+            continue;
+        };
+        string_fields += 1;
+        string_chars = string_chars.saturating_add(chars as i64);
+    }
+    ctx.unpin_native_roots(fields_pin);
+
+    if string_fields == 0 {
+        return None;
+    }
+
+    let uncounted_fields = (field_count as i64).saturating_sub(string_fields);
+    let bytes = LUCENE_RAM_USAGE_DOCUMENT_BASE_BYTES
+        .saturating_add(string_chars.saturating_mul(2))
+        .saturating_add(string_fields.saturating_sub(1) * LUCENE_RAM_USAGE_EXTRA_FIELD_BYTES)
+        .saturating_add(uncounted_fields * 128);
+    Some(align_lucene_ram_usage(bytes).max(LUCENE_RAM_USAGE_MIN_DOCUMENT_BYTES))
+}
+
+fn align_lucene_ram_usage(bytes: i64) -> i64 {
+    bytes.saturating_add(7) & !7
+}
+
+fn invoke_list_size(ctx: &mut dyn NativeContext, list: ObjectRef) -> Option<i32> {
+    let pin = ctx.pin_native_root(list);
+    let result = ctx.invoke_virtual(list, "size", "()I", &[]);
+    ctx.unpin_native_roots(pin);
+    match result {
+        Ok(Some(Value::Int(size))) if size >= 0 => Some(size),
+        _ => None,
+    }
+}
+
+fn invoke_list_get(ctx: &mut dyn NativeContext, list: ObjectRef, index: i32) -> Option<ObjectRef> {
+    let pin = ctx.pin_native_root(list);
+    let result = ctx.invoke_virtual(list, "get", "(I)Ljava/lang/Object;", &[Value::Int(index)]);
+    ctx.unpin_native_roots(pin);
+    match result {
+        Ok(Some(Value::Object(Some(field)))) => Some(field),
+        _ => None,
+    }
+}
+
+fn lucene_field_string_chars(ctx: &dyn NativeContext, field: ObjectRef) -> Option<usize> {
+    match ctx.get_field_by_name(field, "fieldsData") {
+        Value::Object(Some(data)) => ctx.read_string(data).map(|s| s.len()),
+        _ => None,
+    }
+}
+
+#[cfg(test)]
+mod lucene_ram_usage_tests {
+    use super::*;
+    use crate::test_utils::{mock_ctx, MockNativeContext};
+    use cratonvm_types::ArrayElementType;
+
+    fn lucene_list_hook(
+        ctx: &mut MockNativeContext,
+        receiver: ObjectRef,
+        method: &str,
+        desc: &str,
+        args: &[Value],
+    ) -> Option<MethodCallResult> {
+        let class_name = ctx.class_name_of_id(ctx.class_id_of_object(receiver));
+        if class_name.as_deref() != Some("java/util/ArrayList") {
+            return None;
+        }
+        match (method, desc) {
+            ("size", "()I") => Some(Ok(Some(ctx.get_field(receiver, 1)))),
+            ("get", "(I)Ljava/lang/Object;") => {
+                let index = match args.first() {
+                    Some(Value::Int(index)) if *index >= 0 => *index as usize,
+                    _ => return Some(Ok(Some(Value::Object(None)))),
+                };
+                let array = match ctx.get_field(receiver, 0) {
+                    Value::Object(Some(array)) => array,
+                    _ => return Some(Ok(Some(Value::Object(None)))),
+                };
+                Some(Ok(Some(ctx.get_array_element(array, index))))
+            }
+            _ => None,
+        }
+    }
+
+    fn new_obj(ctx: &mut MockNativeContext, class_name: &str) -> ObjectRef {
+        match ctx
+            .new_object(class_name)
+            .expect("mock allocation should not throw")
+        {
+            Some(Value::Object(Some(obj))) => obj,
+            other => panic!("unexpected allocation result: {other:?}"),
+        }
+    }
+
+    fn lucene_doc_with_body_len(ctx: &mut MockNativeContext, body_len: usize) -> ObjectRef {
+        ctx.set_invoke_virtual_hook(lucene_list_hook);
+        let doc = new_obj(ctx, "org/apache/lucene/document/Document");
+        let list = new_obj(ctx, "java/util/ArrayList");
+        let field = new_obj(ctx, "org/apache/lucene/document/TextField");
+        let body = ctx.create_string(&"x".repeat(body_len));
+        let array = ctx.new_array(ArrayElementType::Reference, 1);
+
+        ctx.set_field(field, 0, Value::Object(Some(body)));
+        ctx.set_array_element(array, 0, Value::Object(Some(field)));
+        ctx.set_field(list, 0, Value::Object(Some(array)));
+        ctx.set_field(list, 1, Value::Int(1));
+        ctx.set_field(doc, 0, Value::Object(Some(list)));
+        doc
+    }
+
+    #[test]
+    fn lucene_document_ram_usage_tracks_line_file_docs_body_length() {
+        let mut ctx = mock_ctx();
+        let doc = lucene_doc_with_body_len(&mut ctx, 1023);
+
+        let bytes = estimate_lucene_document_ram_used(&mut ctx, doc)
+            .expect("Lucene Document shape should be inspectable");
+
+        assert_eq!(bytes, 2424);
+    }
+
+    #[test]
+    fn lucene_document_ram_usage_has_hotspot_minimum_floor() {
+        let mut ctx = mock_ctx();
+        let doc = lucene_doc_with_body_len(&mut ctx, 40);
+
+        let bytes = estimate_lucene_document_ram_used(&mut ctx, doc)
+            .expect("Lucene Document shape should be inspectable");
+
+        assert_eq!(bytes, LUCENE_RAM_USAGE_MIN_DOCUMENT_BYTES);
+    }
+
+    #[test]
+    fn lucene_document_ram_usage_falls_back_for_unknown_shape() {
+        let mut ctx = mock_ctx();
+        let doc = new_obj(&mut ctx, "org/apache/lucene/document/Document");
+
+        let got = native_lucene_ram_usage_tester_ram_used(&mut ctx, &[Value::Object(Some(doc))])
+            .expect("native call should not throw");
+
+        assert_eq!(
+            got,
+            Some(Value::Long(LUCENE_RAM_USAGE_FALLBACK_DOCUMENT_BYTES))
+        );
+    }
 }
 
 fn lucene_eof() -> MethodCallFailed {

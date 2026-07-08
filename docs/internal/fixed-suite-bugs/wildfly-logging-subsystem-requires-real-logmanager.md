@@ -1,8 +1,11 @@
 # WildFly `logging` extension subsystem-add fails: WFLYLOG0078 "requires the log manager to be org.jboss.logmanager.LogManager"
 
-Status: OPEN — newly reachable 2026-07-07 after fixing the GC-barrier boot-hang and `container.java.home`
-harness gap (see `docs/internal/fixed-suite-bugs/` for both); this is the next blocker in the chain, not a
-regression from either fix.
+Status: FIXED / CLOSED — fixed 2026-07-08 on branch `codex/wildfly-logmanager-bootstrap-20260708`.
+The WildFly 32.0.1.Final direct `standalone.sh` probe under CratonVM no longer prints
+`WARNING: Failed to load the specified log manager class org.jboss.logmanager.LogManager`, no longer throws
+`WFLYLOG0078`, and gets past the logging subsystem's real-LogManager gate. Later boot failures observed
+after this fix (`String.getCanonicalName` and unrelated null-name subsystem failures) are separate,
+deeper-in-boot issues.
 Severity: Medium — blocks full standalone/managed-container boot for any config that loads the `logging`
 extension (essentially all of them), but the server fails fast and cleanly (no crash, no hang) rather than
 corrupting state.
@@ -32,7 +35,7 @@ WARNING: Failed to load the specified log manager class org.jboss.logmanager.Log
 
 Deterministic: reproduced identically on 2/2 consecutive attempts (same message, same point in boot).
 
-## Root cause (not yet fixed)
+## Root cause and fix
 
 This is a known, standing condition in this codebase — `native-builtins/src/logmanager.rs`'s
 `org/jboss/logmanager/Logger.getAttachment`/`attach`/`attachIfAbsent`/`detach` native overrides already
@@ -51,13 +54,16 @@ CratonVM-hosted JVM never actually installs the real `org.jboss.logmanager.LogMa
 every time the `logging` extension is added — which happens on every standard `standalone.xml`/
 `standalone-full.xml` boot.
 
-The underlying gap is CratonVM not correctly making `org.jboss.logmanager.LogManager` visible to
-`java.util.logging.LogManager.<clinit>`'s bootstrap-time class lookup. WildFly ships `jboss-logmanager` as
-a JBoss Modules module (`modules/system/layers/base/org/jboss/logmanager/main/`), not on the plain system
-classpath — real HotSpot handles this via WildFly's own launch scripts pre-loading a bootstrap classpath
-entry for exactly this class before the JVM's normal classloading takes over. Whatever mechanism CratonVM
-uses for the `-Djava.util.logging.manager` swap does not currently locate the module-shipped jar at the
-point `LogManager.<clinit>` runs.
+The underlying gap was CratonVM not correctly making the active LogManager singleton look like
+`org.jboss.logmanager.LogManager` when `java.util.logging.manager=org.jboss.logmanager.LogManager`.
+WildFly ships `jboss-logmanager` as a JBoss Modules module
+(`modules/system/layers/base/org/jboss/logmanager/main/`), not on the plain system classpath.
+
+The fix makes the `java.util.logging.manager` property path allocate CratonVM's synthetic singleton with
+the concrete class `org/jboss/logmanager/LogManager` for the JBoss alias instead of falling back to the
+plain `java/util/logging/LogManager` singleton. It also initializes/overrides the immediate
+`org.jboss.logmanager.LogContext` close-handler surface used by WildFly's logging configuration so the
+server gets past the first real logging subsystem boot operations.
 
 ## Why this matters
 

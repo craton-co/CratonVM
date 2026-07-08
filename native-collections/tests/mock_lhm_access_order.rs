@@ -12,7 +12,7 @@ mod common;
 
 use common::{boxed_int, build_registry, call, new_linked_hashmap, MockCtx};
 use cratonvm_native_api::NativeContext;
-use cratonvm_types::Value;
+use cratonvm_types::{ClassId, Value};
 
 const LHM: &str = "java/util/LinkedHashMap";
 const PUT: &str = "(Ljava/lang/Object;Ljava/lang/Object;)Ljava/lang/Object;";
@@ -275,5 +275,90 @@ fn access_order_put_of_existing_key_moves_to_tail() {
         vec![k2, k3, k1],
         "access-order LHM put-of-existing-key must move k to tail; \
                 expected [k2, k3, k1], got {order:?}"
+    );
+}
+
+#[test]
+fn plain_lhm_with_slot0_class_read_does_not_call_remove_eldest_entry() {
+    let reg = build_registry();
+    let mut ctx = MockCtx::new();
+    let lhm = new_linked_hashmap(&reg, &mut ctx, /*access_order=*/ false);
+
+    let k1 = boxed_int(&mut ctx, 1);
+    let v1 = boxed_int(&mut ctx, 10);
+    call(
+        &reg,
+        &mut ctx,
+        LHM,
+        "put",
+        PUT,
+        &[Value::Object(Some(lhm)), k1, v1],
+    )
+    .unwrap();
+
+    ctx.set_object_class_id_for_test(lhm, ClassId::new(0));
+    ctx.clear_invoke_virtual_log();
+
+    let k2 = boxed_int(&mut ctx, 2);
+    let v2 = boxed_int(&mut ctx, 20);
+    call(
+        &reg,
+        &mut ctx,
+        LHM,
+        "put",
+        PUT,
+        &[Value::Object(Some(lhm)), k2, v2],
+    )
+    .unwrap();
+
+    assert!(
+        ctx.invoke_virtual_log()
+            .iter()
+            .all(|(_, method, _, _)| method != "removeEldestEntry"),
+        "slot-0/Object class-id reads from an LHM-native receiver must not dispatch Object.removeEldestEntry"
+    );
+
+    let order = iter_keys_via_for_each(&reg, &mut ctx, lhm);
+    assert_eq!(order, vec![k1, k2]);
+}
+
+#[test]
+fn lhm_subclass_still_calls_remove_eldest_entry() {
+    let reg = build_registry();
+    let mut ctx = MockCtx::new();
+    let subclass_cid = ctx
+        .ensure_class_initialized("test/LruLinkedHashMap")
+        .unwrap();
+    let lhm = ctx.alloc_object(subclass_cid, 8);
+
+    call(
+        &reg,
+        &mut ctx,
+        LHM,
+        "<init>",
+        "()V",
+        &[Value::Object(Some(lhm))],
+    )
+    .unwrap();
+    ctx.clear_invoke_virtual_log();
+
+    let key = boxed_int(&mut ctx, 1);
+    let value = boxed_int(&mut ctx, 10);
+    call(
+        &reg,
+        &mut ctx,
+        LHM,
+        "put",
+        PUT,
+        &[Value::Object(Some(lhm)), key, value],
+    )
+    .unwrap();
+
+    assert!(
+        ctx.invoke_virtual_log()
+            .iter()
+            .any(|(_, method, desc, _)| method == "removeEldestEntry"
+                && desc == "(Ljava/util/Map$Entry;)Z"),
+        "real LinkedHashMap subclasses must keep their removeEldestEntry hook"
     );
 }

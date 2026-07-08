@@ -220,7 +220,7 @@ loading rather than the H2 Blob loop.
 ## 2026-07-07: fast-fail became a multi-hour non-hang (not a new VM bug)
 
 After the 2026-07-06 residual fix (`813bc19b`) landed, a full local Windows
-121-class rerun (`docs/known-issues/hib-local-windows-rerun-20260707.md`,
+121-class rerun (`docs/internal/hib-local-windows-rerun-20260707.md`,
 dev `d0a779f6`) reported `JpaLargeBlobTest` flipping from `FAIL` (fast
 `NoSuchMethodError`) to `HANG` (`rc=124`, ran the full 1200s with zero
 apparent progress), and speculated this might be a new blocking-call
@@ -351,7 +351,7 @@ so its true cost was never previously visible.
 ### Conclusion — not re-opening as a bug
 
 The 2026-07-06 "HANG" classification in
-`docs/known-issues/hib-local-windows-rerun-20260707.md` is more precisely:
+`docs/internal/hib-local-windows-rerun-20260707.md` is more precisely:
 **the test now runs correctly but far too slowly to finish inside any
 practical harness timeout**, as a direct consequence of both crash fixes
 successfully removing the early aborts that used to mask this. This is a
