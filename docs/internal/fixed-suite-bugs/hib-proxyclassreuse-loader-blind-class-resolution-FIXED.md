@@ -1,28 +1,65 @@
-# Hibernate `ProxyClassReuseTest.testNoReuse` — constant-pool class resolution is loader-blind
+# Hibernate `ProxyClassReuseTest.testNoReuse` / Spring Groovy residual cluster - FIXED 2026-07-08
 
 | | |
 |---|---|
-| **Status** | `ProxyClassReuseTest.testNoReuse` FIXED, gate **default ON**. Residual B (`GroovyBeanDefinitionReaderTests`/`GroovyApplicationContextTests` MetaClass/dispatch bug) **FIXED 2026-07-06** — two companion root causes found and fixed: `invokestatic` self-calls re-resolving their owner class by name (`f3a45ca9`), and `Class.getEnclosingClass()` doing the same for a Groovy closure's enclosing-class name (`f6662334`) — the second one specifically needed once a concurrently-merged gate-mirror fix (`30e82560`) correctly tightened the global lookup's ambiguity handling. Verified against BOTH suites: Hibernate `gated_subset.txt` 100/131 (up from `30e82560`'s own 86/131, not a regression) and `GroovyBeanDefinitionReaderTests` 30/30 under `--nojit`. A separate, unrelated JIT invokedynamic regression (`fb4a333d`) masked this under default JIT-on settings — fully root-caused and fixed 2026-07-07 (three distinct de-speculation gaps plus a `getstatic` oop-marking bug, not the operand-stack soundness gap originally suspected), see [jit-invokedynamic-uncommon-trap-precise-resume-groovy-regression-FIXED.md](../internal/jit-invokedynamic-uncommon-trap-precise-resume-groovy-regression-FIXED.md) (JIT-on now matches `--nojit`'s isolated-run pass rate exactly, no tradeoff). Residual A (`BshScriptFactoryTests` reverse-pollution) re-verified 2026-07-06, **still open** — unaffected by, and unrelated to, the Residual B fixes above. Doc stays in `known-issues` for: Residual A and a separate pre-existing `component-scan` hang. |
+| **Status** | FIXED / RETIRED 2026-07-08. The original Hibernate `ProxyClassReuseTest` loader-identity bug still passes, and the remaining Spring/Groovy and BeanShell residuals that kept this note active are now closed by the 2026-07-08 residual fixes (`MethodHandle` direct primitive boxing, `guardWithTest` truthiness/arity, `dropArguments` effective-type widening, and synthetic system-module-reader `list()` returning an empty stream instead of throwing). |
 | **Area** | VM core — real-JDK-mode class-loader identity + `CONSTANT_Class` resolution (the flat global class store conflated loader namespaces). |
 | **Symptom** | `org.hibernate.orm.test.proxy.ProxyClassReuseTest.testNoReuse` fails: `MappingException: Could not instantiate persister … MyEntity`, caused by `IncompatibleClassChangeError: class …MyEntity$HibernateProxy already defined by application loader`. |
 | **Severity** | medium (CratonVM-only; pre-existing — fails identically at baseline `b0aab8f9`). Same class as SBR-14 / SC-custom-classloader isolation residuals. |
 | **Discovered** | 2026-06-24, triaging the Hibernate suite residuals after the collection-delegation stack-overflow fix (`7b224d8a`). |
-| **See also** | [hib-bytecode-enhancement-loader-faithful-linking.md](hib-bytecode-enhancement-loader-faithful-linking.md) — describes the *linking/dispatch* layer built on top of this doc's three-layer `CONSTANT_Class`/`defineClass`-namespace/`findLoadedClass` fix (superclass linking, `invokespecial` dispatch, SessionFactory-build identity). Both docs describe the same loader-identity mechanism; that doc's `enhancement.lazy.*`/`mapping.lazytoone.*` cluster is the largest remaining gap in this whole family, re-verified still open 2026-07-04. |
+| **See also** | [hib-bytecode-enhancement-loader-faithful-linking-FIXED.md](hib-bytecode-enhancement-loader-faithful-linking-FIXED.md) - describes the linking/dispatch layer built on top of this doc's three-layer `CONSTANT_Class`/`defineClass`-namespace/`findLoadedClass` fix. [jit-invokedynamic-uncommon-trap-precise-resume-groovy-regression-FIXED.md](../jit-invokedynamic-uncommon-trap-precise-resume-groovy-regression-FIXED.md) tracks the separate JIT invokedynamic regression that previously masked this area. |
 
-> **CURRENT DEV RECHECK 2026-07-08:** Do **not** archive this document yet.
-> The original Hibernate bug is still fixed on `dev` (`d49ce503`, unique probe
-> binary `/data/data/cratonvm-probe-bins/cvhibproxy-20260708-170000`):
+> **RETIRED 2026-07-08:** current `dev` plus this residual-fix branch closes the
+> active tails. Final Azure binary:
+> `/data/data/cratonvm-probe-bins/cvproxresid-20260708-143410-final-9983ff83`.
 > `ProxyClassReuseTest` reports `found=3 started=3 ok=3 failed=0`.
-> However, the residual Spring/Groovy namespace cluster remains VM-only:
-> HotSpot passes `GroovyBeanDefinitionReaderTests` 36/36 with the same translated
-> Linux fixture, while CratonVM `--nojit` completes without hanging but fails
-> 6/36 (`succ=30 fail=6`) in the XML-namespace/component-scan methods. The
-> stack signature is now `StreamingMarkupBuilder$_bind_closure7` ->
-> `Selector$InitSelector.getMetaClass(Selector.java:406)` AIOOBE, alongside
-> `gen_heap::get_field` out-of-bounds and HIB-CV-32 corrupt-`Value` guard lines.
-> The BeanShell fixture available for this recheck is not HotSpot-clean
-> (`BshScriptFactoryTests` 5/18 on HotSpot), so today's BeanShell run is not
-> used as closure evidence for Residual A; keep the 2026-07-06 Residual A status.
+> `GroovyBeanDefinitionReaderTests` reports `found=36 succ=36 fail=0 skip=0`.
+> `BshScriptFactoryTests` reports `found=18 succ=18 fail=0 skip=0`.
+> The formerly failing `contextComponentScanSpringTag` method passes in
+> isolation, `classpath*:org/springframework/context/groovy/**/*.class`
+> resource scanning returns 21 resources, and the synthetic system module
+> reader no longer throws while Spring scans module-path resources. The related
+> Hibernate `InPredicateTest` run also passes under default JIT
+> (`ok=1`, 34.760s) with no `DomainParameterXref.removeEldestEntry` NSME.
+
+## 2026-07-08 retirement - residuals closed
+
+Validation used the unique Azure binary
+`/data/data/cratonvm-probe-bins/cvproxresid-20260708-143410-final-9983ff83`
+built from the final residual branch head (`9983ff83`) in a separate detached
+build worktree.
+
+- Hibernate `ProxyClassReuseTest`: 3/3 passed
+  (`/tmp/proxresid-20260708-143410-final-9983ff83/proxy.log`).
+- Spring `GroovyBeanDefinitionReaderTests`: 36/36 passed in the shared Linux
+  fixture
+  (`/tmp/proxresid-20260708-143410-final-9983ff83/groovy-full.log`).
+- Spring `BshScriptFactoryTests`: 18/18 passed
+  (`/tmp/proxresid-20260708-143410-final-9983ff83/bsh-full.log`).
+- Focused Spring namespace/component-scan probe:
+  `contextComponentScanSpringTag` passed, and direct resource scanning for
+  `classpath*:org/springframework/context/groovy/**/*.class` returned 21
+  resources
+  (`spring-method-contextComponentScanSpringTag.log`,
+  `resourcescan-cv.log`).
+- Reduced Groovy/MethodHandle probes passed: `Map.containsKey` indy returns
+  boxed `Boolean` values (`true`/`false`), and namespace markup emits the
+  expected `<context:component-scan .../>` tag (`mapcontains.log`,
+  `groovyns.log`).
+- Related Hibernate `InPredicateTest` pass: default-JIT run completed
+  `found=1 started=1 ok=1 failed=0` in 34.760s with no
+  `DomainParameterXref.removeEldestEntry` NSME
+  (`/tmp/proxresid-20260708-143410-final-9983ff83/inpred.log`).
+
+The live root causes were not new loader-blind class resolution defects:
+`MethodHandle` adapters were leaking raw primitive direct-call results into
+object-return chains, `guardWithTest` treated boxed `Boolean.FALSE` as truthy
+and forwarded too many arguments to prefix guard handles, `dropArguments`
+computed widening from the raw target descriptor instead of the effective
+handle type, and Spring's resource scan hit CratonVM's synthetic
+`SystemModuleReader.list()` implementation, which threw before classpath
+resources could be consulted. Those fixes retire the residuals that kept this
+document in `docs/known-issues`.
 
 > **RETRY 2026-07-01:** Re-ran the focused builtin-loader reverse-pollution coverage on
 > current `dev`: `cargo test -p cratonvm-native-builtins test_builtin_find_loaded_class -- --nocapture`
@@ -254,8 +291,8 @@ a real classpath/directory scan. Not triaged further — flagged as a separate,
 pre-existing bug outside this doc's scope (not loader-identity-related as far
 as this session went).
 
-**2026-07-08 recheck:** the same cluster no longer presents as a hard hang in
-the shared Linux Spring fixture, but it is still open. HotSpot passes the full
+**2026-07-08 interim recheck, superseded later the same day:** the same cluster no longer presents as a hard hang in
+the shared Linux Spring fixture, but it was not yet fixed. HotSpot passes the full
 `GroovyBeanDefinitionReaderTests` class (`found=36 succ=36 fail=0`). CratonVM
 with `--nojit` and the same classpath completes in about 112s but reports
 `found=36 succ=30 fail=6`, with the namespace-tag methods still failing:
@@ -282,9 +319,11 @@ gen_heap::get_field: out-of-bounds field read dropped ... class_name=java/lang/O
 gen_heap::read_slot: corrupt Value cell (out-of-range discriminant) ... Heap reference-integrity defect (see HIB-CV-32).
 ```
 
-So this is no longer best described as only a timeout, but it is not fixed.
-The issue remains VM-only under a HotSpot-clean Groovy fixture and should stay
-in `docs/known-issues`.
+So this was no longer best described as only a timeout, but this interim run
+was not yet fixed. The later 2026-07-08 retirement run at the top of this
+archive supersedes this snapshot: the full class passed 36/36, the focused
+component-scan method passed, and the document moved out of
+`docs/known-issues`.
 
 ### 2026-07-03 snapshot (historical — superseded by the above)
 
@@ -521,7 +560,7 @@ passes the new "hide user namespace" and "keep application namespace" cases (re-
 2026-07-01). Full Spring BeanShell / Hibernate app repros were not rerun in this
 session, so this document remains in `docs/known-issues`.
 
-**2026-07-06 re-verification: still open, still fails identically.** Re-ran
+**2026-07-06 re-verification, historical: then still failed identically.** Re-ran
 `BshScriptFactoryTests` on current `dev` tip (`9f1db39d`+): **15/18 pass**, the
 SAME 3 methods fail with the SAME `ClassCastException` the 2026-07-01 entry
 describes (`staticPrototypeScript`, `resourceScriptFromTag`,
@@ -534,13 +573,17 @@ correctly (every subsequent `BshClassLoader`'s `findLoadedClass("MyMessenger")`
 correctly misses, as it should), but the SECOND interpreter's `MyMessenger`
 still never gets generated.
 
-**2026-07-08 fixture caveat:** the shared Spring fixture available on the
+**2026-07-08 fixture caveat, superseded later the same day:** the shared Spring fixture available on the
 Azure host for this recheck is not HotSpot-clean for this class
 (`BshScriptFactoryTests` reports `found=18 succ=5 fail=13` on HotSpot, with
 BeanCreationException failures in the same general context). Do not use that
 run to update Residual A's pass/fail count or to archive this document. The
 last HotSpot-clean CratonVM-specific Residual A evidence remains the 2026-07-06
 15/18 CratonVM run above.
+
+The final 2026-07-08 retirement run used the corrected fixture and the unique
+residual binary named at the top of this file; `BshScriptFactoryTests` then
+reported `found=18 succ=18 fail=0 skip=0`, closing Residual A.
 
 Traced the actual failure precisely this session: BeanShell's
 `ClassManagerImpl.plainClassForName` calls the STATIC 1-arg
@@ -649,7 +692,7 @@ for gate-adjacent changes):**
 doc**: a different, newly-landed commit on `dev` (`fb4a333d`, "Fix silent
 data corruption: precise resume for JIT invokedynamic uncommon trap") broke
 ALL Groovy execution when the JIT is enabled — see
-[jit-invokedynamic-uncommon-trap-precise-resume-groovy-regression-FIXED.md](../internal/jit-invokedynamic-uncommon-trap-precise-resume-groovy-regression-FIXED.md)
+[jit-invokedynamic-uncommon-trap-precise-resume-groovy-regression-FIXED.md](../jit-invokedynamic-uncommon-trap-precise-resume-groovy-regression-FIXED.md)
 for the full root-cause/fix/tradeoff writeup (root-caused and a targeted fix
 landed 2026-07-07, though with a documented tradeoff — that doc's own status
 line has the details). Unrelated to loader-identity/gate work; this doc's
@@ -663,7 +706,12 @@ regression under `--nojit`. Residual B (the Groovy MetaClass/dispatch bug
 this doc originally opened) is now considered FIXED, modulo the separate
 JIT regression noted above (which masks it under default settings until
 that unrelated bug is fixed) and the separate pre-existing `component-scan`
-hang (6/36 methods, still open, still unrelated).
+hang (6/36 methods, then still unresolved and unrelated).
+
+This closing sentence was superseded by the final 2026-07-08 retirement run:
+the separate JIT regression is fixed, the component-scan path is fixed, and
+the full Spring Groovy and BeanShell classes now pass on the final residual
+binary.
 
 ## Impact
 

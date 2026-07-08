@@ -275,6 +275,13 @@ pub fn coerce_value_against_ret_char(value: Value, ret_char: u8, shared: &Shared
     if ret_char == b'V' {
         return value;
     }
+    let is_primitive_ret = matches!(
+        ret_char,
+        b'J' | b'I' | b'B' | b'S' | b'C' | b'Z' | b'F' | b'D'
+    );
+    if !is_primitive_ret {
+        return value;
+    }
     // Already a primitive-typed Value вЂ” keep as-is.
     if !matches!(value, Value::Object(Some(_))) {
         return value;
@@ -293,7 +300,6 @@ pub fn coerce_value_against_ret_char(value: Value, ret_char: u8, shared: &Shared
         .map(|c| c.name.to_string())
         .unwrap_or_default();
     drop(cm);
-    let inner = shared.heap.get_field(obj, 0);
     // Expected wrapper class for each primitive ret_char.
     let expected_wrapper: &str = match ret_char {
         b'J' => "java/lang/Long",
@@ -306,38 +312,7 @@ pub fn coerce_value_against_ret_char(value: Value, ret_char: u8, shared: &Shared
         b'D' => "java/lang/Double",
         _ => "",
     };
-    // C15: When the caller's bytecode expects a primitive (signature-polymorphic
-    // invoke call-site), NEVER leave a reference on the stack. If the wrapper
-    // class matches, unbox field 0 вЂ” coercing any variant (including malformed
-    // Object(None) from an incomplete MethodHandle) to the target primitive's
-    // default so the subsequent load opcode can read it correctly.
-    let is_primitive_ret = matches!(
-        ret_char,
-        b'J' | b'I' | b'B' | b'S' | b'C' | b'Z' | b'F' | b'D'
-    );
-    if is_primitive_ret && cls_name == expected_wrapper {
-        return match (ret_char, inner) {
-            (b'J', Value::Long(v)) => Value::Long(v),
-            (b'J', Value::Int(v)) => Value::Long(v as i64),
-            (b'I' | b'B' | b'S' | b'C' | b'Z', Value::Int(v)) => Value::Int(v),
-            (b'F', Value::Float(v)) => Value::Float(v),
-            (b'F', Value::Int(v)) => Value::Float(f32::from_bits(v as u32)),
-            (b'D', Value::Double(v)) => Value::Double(v),
-            (b'D', Value::Long(v)) => Value::Double(f64::from_bits(v as u64)),
-            // Wrapper present but field 0 is null or otherwise malformed
-            // (e.g. from a MethodHandle that returned Object(None)) вЂ” yield
-            // the primitive zero so the caller's bytecode doesn't see a ref.
-            (b'J', _) => Value::Long(0),
-            (b'F', _) => Value::Float(0.0),
-            (b'D', _) => Value::Double(0.0),
-            (_, _) => Value::Int(0),
-        };
-    }
-    // C15: Primitive return but wrapper class unrecognized (e.g. the value
-    // is some other Object such as a String or null-wrapped result) вЂ” we still
-    // MUST NOT leave a ref on the caller's stack when the bytecode expects a
-    // primitive. Fall back to zero so the next load opcode succeeds.
-    if is_primitive_ret {
+    if cls_name != expected_wrapper {
         return match ret_char {
             b'J' => Value::Long(0),
             b'F' => Value::Float(0.0),
@@ -345,7 +320,28 @@ pub fn coerce_value_against_ret_char(value: Value, ret_char: u8, shared: &Shared
             _ => Value::Int(0),
         };
     }
-    Value::Object(Some(obj))
+    let inner = shared.heap.get_field(obj, 0);
+    // C15: When the caller's bytecode expects a primitive (signature-polymorphic
+    // invoke call-site), NEVER leave a reference on the stack. If the wrapper
+    // class matches, unbox field 0 вЂ” coercing any variant (including malformed
+    // Object(None) from an incomplete MethodHandle) to the target primitive's
+    // default so the subsequent load opcode can read it correctly.
+    match (ret_char, inner) {
+        (b'J', Value::Long(v)) => Value::Long(v),
+        (b'J', Value::Int(v)) => Value::Long(v as i64),
+        (b'I' | b'B' | b'S' | b'C' | b'Z', Value::Int(v)) => Value::Int(v),
+        (b'F', Value::Float(v)) => Value::Float(v),
+        (b'F', Value::Int(v)) => Value::Float(f32::from_bits(v as u32)),
+        (b'D', Value::Double(v)) => Value::Double(v),
+        (b'D', Value::Long(v)) => Value::Double(f64::from_bits(v as u64)),
+        // Wrapper present but field 0 is null or otherwise malformed
+        // (e.g. from a MethodHandle that returned Object(None)) вЂ” yield
+        // the primitive zero so the caller's bytecode doesn't see a ref.
+        (b'J', _) => Value::Long(0),
+        (b'F', _) => Value::Float(0.0),
+        (b'D', _) => Value::Double(0.0),
+        (_, _) => Value::Int(0),
+    }
 }
 
 /// Unbox a polymorphic-invoke native return using the call-site descriptor.
@@ -2712,7 +2708,12 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
         // oldest call still on the stack); reverse so callers see
         // innermost-first, matching `capture_stack_trace`'s `.iter().rev()`
         // convention (see its own callers, e.g. `resolve_caller_class_id`).
-        self.thread.frames.iter().rev().map(|f| f.class_id).collect()
+        self.thread
+            .frames
+            .iter()
+            .rev()
+            .map(|f| f.class_id)
+            .collect()
     }
 
     // -- Heap access methods --
@@ -12648,11 +12649,14 @@ fn invoke_on_class_shared_inner(
                         if let Some(Value::Object(Some(recv))) = args.first().copied() {
                             let recv_cid = shared.heap.class_id_of(recv);
                             let recv_name = store.get(recv_cid).map(|c| &*c.name).unwrap_or("");
-                            if matches!(recv_name, "org/python/core/PyNullImporter" | "org/python/modules/zipimport/zipimporter")
-                                && shared
-                                    .native_methods
-                                    .find(recv_name, method_name, descriptor)
-                                    .is_some()
+                            if matches!(
+                                recv_name,
+                                "org/python/core/PyNullImporter"
+                                    | "org/python/modules/zipimport/zipimporter"
+                            ) && shared
+                                .native_methods
+                                .find(recv_name, method_name, descriptor)
+                                .is_some()
                             {
                                 native = true;
                                 declaring_id_out = recv_cid;

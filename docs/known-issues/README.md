@@ -42,6 +42,7 @@ general-path fix) — new evidence it also hits Spring, not just Hibernate.
 
 - ✅ FIXED: [`DomainParameterXref` `LinkedHashMap.removeEldestEntry` NSME](../internal/fixed-suite-bugs/hib-domainparameterxref-lhm-removeeldestentry-nsme-FIXED.md) — fresh Azure `dev@47bbdc3b` reproduced the slot-0/`java.lang.Object` class-id read and `Object.removeEldestEntry` NSME (`ok=0`, 33.697s). The LHM native now skips that impossible virtual call while preserving real subclass eviction hooks; the fixed probe still sees the slot-0 read but passes (`ok=1`, 55.971s).
 - ✅ RETIRED: [`InPredicateTest` dispatch-heavy JIT timeout note](../internal/fixed-suite-bugs/hib-inpredicate-dispatch-heavy-jit-timeout-20260707-FIXED.md) — current recheck no longer times out. Before the LHM guard, current dev reached the later NSME in 33.697s; after the guard, the class passed under default JIT in 55.971s.
+- ✅ RETIRED: [`ProxyClassReuseTest` / Spring Groovy residual cluster](../internal/fixed-suite-bugs/hib-proxyclassreuse-loader-blind-class-resolution-FIXED.md) - the original Hibernate proxy case remains 3/3 green, and the residual Spring `GroovyBeanDefinitionReaderTests` (36/36), Spring `BshScriptFactoryTests` (18/18), namespace/component-scan probe, and related `InPredicateTest` default-JIT run all pass on the final 2026-07-08 Azure binary.
 
 ## 2026-07-07/08 crypto/fips1402 ProvEC `ClassNotFoundException`, SD-JWT hang, and P-384 KeyPairGenerator gaps FIXED
 
@@ -813,15 +814,15 @@ Triaged while fixing the collection-delegation native stack overflow (`7b224d8a`
 residuals surfaced (all fail identically at baseline `b0aab8f9`, so none is from the
 regression):
 
-- [hib-proxyclassreuse-loader-blind-class-resolution.md](hib-proxyclassreuse-loader-blind-class-resolution.md) —
-  🔴 **OPEN.** The original `ProxyClassReuseTest.testNoReuse` loader-blind
-  `CONSTANT_Class` bug is fixed on current `dev` (2026-07-08: 3/3 pass), but
-  the document stays open for live residuals in the same loader/Groovy-runtime
-  area: `BshScriptFactoryTests` reverse-pollution (`Class.forName(name)` with
-  no explicit loader) and the `GroovyBeanDefinitionReaderTests`
-  XML-namespace/component-scan cluster (2026-07-08: HotSpot 36/36, CratonVM
-  `--nojit` 30/36 with namespace/StreamingMarkupBuilder failures plus heap
-  guard diagnostics). Same family as **SBR-14** / `SC-custom-classloader`.
+- [hib-proxyclassreuse-loader-blind-class-resolution-FIXED.md](../internal/fixed-suite-bugs/hib-proxyclassreuse-loader-blind-class-resolution-FIXED.md) -
+  ✅ **FIXED/RETIRED 2026-07-08.** The original `ProxyClassReuseTest.testNoReuse`
+  loader-blind `CONSTANT_Class` bug remains fixed (3/3 pass), and the residual
+  Spring/Groovy and BeanShell tails that kept the note active now pass:
+  `GroovyBeanDefinitionReaderTests` 36/36, `BshScriptFactoryTests` 18/18,
+  namespace/component-scan probe green, and related `InPredicateTest` default-JIT
+  run green with no `DomainParameterXref.removeEldestEntry` NSME. Same family as
+  **SBR-14** / `SC-custom-classloader`; historical details are archived under
+  `docs/internal/fixed-suite-bugs`.
 - [hib-bytecode-enhancement-loader-faithful-linking.md](hib-bytecode-enhancement-loader-faithful-linking.md) —
   🔴 **REOPENED 2026-07-04** (moved back from `docs/internal`, where it was mis-archived as
   "FIXED / ARCHIVED"). Builds on the proxyclassreuse fix above with superclass/interface linking,

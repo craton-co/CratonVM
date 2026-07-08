@@ -417,6 +417,10 @@ pub(crate) struct MockNativeContext {
     /// `raw` follows the `loader_id_of_class` encoding (0=Bootstrap,
     /// 1=Extension, 2=Application, N>=3=UserDefined(N)).
     pub(crate) loader_id_override: UnsafeCell<HashMap<u32, i32>>,
+    /// Test override for the current Java frame class ids, innermost first.
+    /// Production uses the live interpreter stack; native unit tests can set a
+    /// precise caller chain without standing up the VM.
+    pub(crate) frame_class_ids_override: UnsafeCell<Vec<ClassId>>,
     /// Per-method return TYPE_USE annotation overrides for tests.
     pub(crate) method_return_type_annotations_override:
         UnsafeCell<HashMap<(u32, String, String), Vec<AnnotationData>>>,
@@ -481,6 +485,7 @@ impl MockNativeContext {
             last_define_full_opts: UnsafeCell::new(None),
             last_define_full_loader: UnsafeCell::new(None),
             loader_id_override: UnsafeCell::new(HashMap::new()),
+            frame_class_ids_override: UnsafeCell::new(Vec::new()),
             method_return_type_annotations_override: UnsafeCell::new(HashMap::new()),
             method_parameter_type_annotations_override: UnsafeCell::new(HashMap::new()),
             field_type_annotations_override: UnsafeCell::new(HashMap::new()),
@@ -495,6 +500,14 @@ impl MockNativeContext {
         // SAFETY: single-threaded test code.
         unsafe {
             (*self.loader_id_override.get()).insert(class_id.as_u32(), raw_loader);
+        }
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn set_frame_class_ids(&self, frame_class_ids: Vec<ClassId>) {
+        // SAFETY: single-threaded test code.
+        unsafe {
+            *self.frame_class_ids_override.get() = frame_class_ids;
         }
     }
 
@@ -852,6 +865,11 @@ impl NativeContext for MockNativeContext {
 
     fn get_stack_trace(&self, _throwable_hash: i32) -> Option<&[StackTraceEntry]> {
         None
+    }
+
+    fn frame_class_ids(&self) -> Vec<ClassId> {
+        // SAFETY: single-threaded test code.
+        unsafe { (*self.frame_class_ids_override.get()).clone() }
     }
 
     fn get_field(&self, obj: ObjectRef, index: usize) -> Value {

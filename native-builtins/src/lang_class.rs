@@ -1,4 +1,4 @@
-﻿// SPDX-License-Identifier: Apache-2.0
+// SPDX-License-Identifier: Apache-2.0
 // Copyright 2024-2026 Craton Software Company
 
 //! Class, reflect.Method, reflect.Field, reflect.Constructor native method implementations.
@@ -1480,6 +1480,23 @@ fn dbg_is_entity_name(n: &str) -> bool {
     n.contains("orm/test/cache/") || n.contains("orm.test.cache.")
 }
 
+fn class_for_name_one_arg_caller_loader(ctx: &mut dyn NativeContext) -> Option<ObjectRef> {
+    for caller_cid in ctx.frame_class_ids() {
+        if matches!(
+            ctx.class_name_of_id(caller_cid).as_deref(),
+            Some("java/lang/Class")
+        ) {
+            continue;
+        }
+        let caller_mirror = ctx.get_class_mirror(caller_cid);
+        return match native_class_get_class_loader(ctx, &[Value::Object(Some(caller_mirror))]) {
+            Ok(Some(Value::Object(Some(loader)))) => Some(loader),
+            _ => None,
+        };
+    }
+    None
+}
+
 pub(crate) fn native_class_for_name(
     ctx: &mut dyn NativeContext,
     args: &[Value],
@@ -1544,6 +1561,19 @@ pub(crate) fn native_class_for_name(
         );
     }
 
+    let effective_loader = match args.get(2) {
+        Some(Value::Object(Some(loader))) => {
+            let initialize = matches!(args.get(1), Some(v) if v.as_int().unwrap_or(0) != 0);
+            Some((*loader, initialize))
+        }
+        None if args.len() == 1 => class_for_name_one_arg_caller_loader(ctx).map(|loader| {
+            // Class.forName(String) is caller-sensitive and initializes the
+            // resolved class.
+            (loader, true)
+        }),
+        _ => None,
+    };
+
     // RKC16N.12 вЂ” when `Class.forName` is invoked with an explicit non-null
     // classloader, route through `loader.loadClass(name)` so module-scoped
     // loaders (notably `org.jboss.modules.ModuleClassLoader`) get their
@@ -1559,9 +1589,16 @@ pub(crate) fn native_class_for_name(
     //   args[1] = initialize (boolean)
     //   args[2] = loader (ClassLoader, may be null = bootstrap)
     //   args[3] = caller (Class, ignored by us)
-    if let Some(Value::Object(Some(loader))) = args.get(2) {
+    // HIB-CV-40: the public one-arg overload is caller-sensitive too. When
+    // native dispatch reaches us directly with only the name argument, derive
+    // the caller's loader from the current Java frames and route through the
+    // same loader.loadClass path. A global fallback can otherwise see classes
+    // defined only by sibling/child loaders; BeanShell's second interpreter
+    // then reuses the first interpreter's generated MyMessenger class and
+    // Spring's prototype script casts fail.
+    if let Some((loader, initialize)) = effective_loader {
         let loader_class_name_debug = {
-            let cid = ctx.class_id_of_object(*loader);
+            let cid = ctx.class_id_of_object(loader);
             ctx.class_name_of_id(cid).unwrap_or_default()
         };
         s111_dbg!(
@@ -1569,9 +1606,9 @@ pub(crate) fn native_class_for_name(
             dotted_name,
             loader_class_name_debug
         );
-        let invoke_args = [Value::Object(Some(*loader)), Value::Object(Some(name_obj))];
+        let invoke_args = [Value::Object(Some(loader)), Value::Object(Some(name_obj))];
         match ctx.invoke_virtual(
-            *loader,
+            loader,
             "loadClass",
             "(Ljava/lang/String;)Ljava/lang/Class;",
             &invoke_args[1..],
@@ -1591,7 +1628,6 @@ pub(crate) fn native_class_for_name(
                 // self-registering static block fires). Without this, drivers
                 // loaded via the 3-arg overload never register and
                 // `DriverManager.getDriver` throws "No suitable driver".
-                let initialize = matches!(args.get(1), Some(v) if v.as_int().unwrap_or(0) != 0);
                 if initialize {
                     if let Value::Object(Some(mirror_ref)) = mirror {
                         if let Some(cid) = ctx.class_id_from_mirror(mirror_ref) {
@@ -3962,12 +3998,10 @@ fn ensure_static_field_declaring_class_initialized(
     class_id: cratonvm_types::ClassId,
 ) -> Result<(), cratonvm_types::error::MethodCallFailed> {
     // Reflective access to a static field is an active use of the declaring
-    // class. HotSpot runs <clinit> before Field.get/set returns the value;
-    // XMLBeans depends on this for generated enum `table` fields. Use the exact
-    // ClassId from the Field mirror so loader-private classes are initialized as
-    // themselves, not as a same-named global class.
-    ctx.ensure_class_initialized_with_class_id(class_id)?;
-    Ok(())
+    // class. HotSpot runs <clinit> before Field.get/set returns the value.
+    // Use the exact Field mirror ClassId so loader-private classes are
+    // initialized as themselves, not as a same-named global class.
+    ctx.ensure_class_initialized_with_class_id(class_id)
 }
 
 // --- Field.get(Object) / Field.set(Object, Object) ---
@@ -4004,12 +4038,6 @@ pub(crate) fn native_field_get(ctx: &mut dyn NativeContext, args: &[Value]) -> M
     // internally via `Unsafe.getReferenceVolatile`/`getIntVolatile`. No-op
     // for non-volatile fields so the plain-read path stays cheap.
     volatile_load_fence(modifiers);
-
-    if is_static {
-        if let Some(class_name) = ctx.class_name_of_id(class_id) {
-            ctx.ensure_class_initialized(&class_name)?;
-        }
-    }
 
     let raw_value = if is_static {
         ensure_static_field_declaring_class_initialized(ctx, class_id)?;
@@ -7598,7 +7626,7 @@ pub(crate) fn native_constructor_new_instance(
     // Reject abstract classes / interfaces before allocating вЂ” matches
     // `java.lang.reflect.Constructor.newInstance` which throws
     // InstantiationException on abstract targets.
-    if let Some(cid) = ctx.class_id_by_name(&class_name) {
+    if let Some(cid) = declaring_cid {
         let flags = ctx.class_access_flags(cid);
         let abstract_bit = cratonvm_types::access_flags::ACC_ABSTRACT;
         let iface_bit = cratonvm_types::access_flags::ACC_INTERFACE;
@@ -7630,6 +7658,21 @@ pub(crate) fn native_constructor_new_instance(
             }
             .into());
         }
+    }
+
+    // `Constructor.newInstance` must trigger class initialization before it
+    // allocates and invokes `<init>`. This is observable for BeanShell/ASM
+    // generated classes: their constructor reads static state populated by
+    // `<clinit>`, and reflective construction otherwise throws
+    // `InterpreterError: Unititialized class: no static`.
+    if let Some(cid) = declaring_cid {
+        ctx.initialize_class(cid).map_err(|message| {
+            cratonvm_types::error::MethodCallFailed::InternalError(
+                cratonvm_types::error::VmError::Internal {
+                    message: format!("Constructor.newInstance: class init failed: {message}"),
+                },
+            )
+        })?;
     }
 
     // Parse parameter types
@@ -12490,7 +12533,9 @@ fn native_package_equals(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
     }
     let this_name = package_name_from_package_obj(ctx, this);
     let other_name = package_name_from_package_obj(ctx, other);
-    Ok(Some(Value::Int((this_name.is_some() && this_name == other_name) as i32)))
+    Ok(Some(Value::Int(
+        (this_name.is_some() && this_name == other_name) as i32,
+    )))
 }
 
 fn native_package_hash_code(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
@@ -17346,6 +17391,40 @@ mod tests {
     // -----------------------------------------------------------------------
     // T19_H12_ вЂ” Class.forName(Module, String) native
     // -----------------------------------------------------------------------
+
+    #[test]
+    fn hib_cv40_class_for_name_one_arg_uses_caller_loader() {
+        crate::classloader::reset_loader_singletons();
+        let mut ctx = mock_ctx();
+        let class_frame = ctx
+            .ensure_class_initialized("java/lang/Class")
+            .expect("ensure Class");
+        let caller_cid = ctx
+            .ensure_class_initialized("bsh/classpath/ClassManagerImpl")
+            .expect("ensure BeanShell caller");
+        ctx.set_frame_class_ids(vec![class_frame, caller_cid]);
+
+        let sentinel_cid = ctx
+            .ensure_class_initialized("org/springframework/scripting/bsh/LoaderVisible")
+            .expect("ensure sentinel");
+        let sentinel_mirror = ctx.get_class_mirror(sentinel_cid);
+        ctx.set_invoke_virtual_result(Ok(Some(Value::Object(Some(sentinel_mirror)))));
+
+        let name = ctx.create_string("MyMessenger");
+        let resolved = native_class_for_name(&mut ctx, &[Value::Object(Some(name))])
+            .expect("Class.forName should route through caller loader")
+            .expect("Class.forName should return a mirror");
+        let resolved_mirror = match resolved {
+            Value::Object(Some(mirror)) => mirror,
+            other => panic!("expected Class mirror, got {other:?}"),
+        };
+
+        assert_eq!(
+            ctx.class_id_from_mirror(resolved_mirror),
+            Some(sentinel_cid),
+            "Class.forName(String) must use caller loader before global lookup"
+        );
+    }
 
     #[test]
     fn t19_h12_class_for_name_module_loads_existing_class() {

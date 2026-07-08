@@ -893,7 +893,13 @@ pub(crate) fn receiver_overrides_load_class_resolve(
         // are handled by the existing `Class.forName` / base-delegation rescues.
         // Leave them on the base path: do NOT route them through their override.
         if name == "java/net/URLClassLoader" {
-            return false;
+            // Plain URLClassLoader-family receivers stay on CratonVM's base
+            // path, but a subclass override found below the URLClassLoader
+            // superclass must still win. BeanShell's BshClassLoader extends
+            // URLClassLoader and overrides loadClass(String, boolean); masking
+            // that override makes ClassManagerImpl.classForName reuse a stale
+            // globally-loaded MyMessenger instead of reaching findClass.
+            return found_override;
         }
         if is_builtin_loader_class(&name) {
             // Reached the builtin base.
@@ -1077,6 +1083,11 @@ pub(crate) fn find_loaded_class_for_loader(
             if ctx.loader_id_of_class(cid) > 2 {
                 return None;
             }
+            if let Some(def) = defining_loader_for(cid.as_u32()) {
+                if !loader_can_see_defining(ctx, this, def) {
+                    return None;
+                }
+            }
             Some(ctx.get_class_mirror(cid))
         });
     }
@@ -1186,24 +1197,18 @@ fn loader_can_see_defining(
 /// is unchanged and still resolves permissively.
 /// The class mirror for `cid`, unless loader isolation hides it from `this`.
 ///
-/// Only enforces isolation when the *requesting* loader is itself user-defined
-/// (`this_is_custom`): a class whose registered defining loader is a user-defined
-/// loader `this` cannot see ([`loader_can_see_defining`]) is treated as not
-/// found (`None`). This targets the sibling/unrelated custom-loader case while
-/// leaving the dominant built-in (app/platform/bootstrap) resolution path — which
-/// has no JVMS-faithful per-loader namespace in CratonVM's flat store — exactly
-/// as before (no regression).
+/// Enforces isolation for both custom and built-in requesters. The app loader
+/// must not report a child loader's class as already globally available; that
+/// reverse leak lets sibling BeanShell interpreters reuse the first generated
+/// `MyMessenger` instead of defining their own.
 fn cid_visible_mirror(
     ctx: &mut dyn NativeContext,
     this: ObjectRef,
-    this_is_custom: bool,
     cid: cratonvm_types::ClassId,
 ) -> Option<ObjectRef> {
-    if this_is_custom {
-        if let Some(def) = defining_loader_for(cid.as_u32()) {
-            if !loader_can_see_defining(ctx, this, def) {
-                return None;
-            }
+    if let Some(def) = defining_loader_for(cid.as_u32()) {
+        if !loader_can_see_defining(ctx, this, def) {
+            return None;
         }
     }
     Some(ctx.get_class_mirror(cid))
@@ -1215,11 +1220,7 @@ fn resolve_global_if_visible(
     internal: &str,
 ) -> Option<ObjectRef> {
     let cid = ctx.ensure_class_initialized(internal).ok()?;
-    let this_is_custom = matches!(
-        ctx.get_field(this, CL_LOADER_TYPE),
-        Value::Int(LOADER_CUSTOM)
-    );
-    cid_visible_mirror(ctx, this, this_is_custom, cid)
+    cid_visible_mirror(ctx, this, cid)
 }
 
 /// Base-class `ClassLoader.loadClass` parent-first delegation, reimplemented in
@@ -1270,8 +1271,6 @@ fn cl_load_class_base_delegation(
         _ => LOADER_APP,
     };
 
-    let this_is_custom = loader_type == LOADER_CUSTOM;
-
     // For custom loaders, check own namespace first
     if loader_type == LOADER_CUSTOM {
         let loader_id = match ctx.get_field(this, CL_LOADER_ID) {
@@ -1280,7 +1279,7 @@ fn cl_load_class_base_delegation(
         };
         if let Some(lid) = loader_id {
             if let Some(cid) = ctx.class_id_by_name_and_loader(&internal, lid) {
-                if let Some(mirror) = cid_visible_mirror(ctx, this, this_is_custom, cid) {
+                if let Some(mirror) = cid_visible_mirror(ctx, this, cid) {
                     return Ok(Some(Value::Object(Some(mirror))));
                 }
             }
@@ -1305,7 +1304,7 @@ fn cl_load_class_base_delegation(
         // .isCacheSafe via `isLoadable`.
         if let Some(pid) = parent_lid {
             if let Some(cid) = ctx.class_id_by_name_and_loader(&internal, pid) {
-                if let Some(mirror) = cid_visible_mirror(ctx, this, this_is_custom, cid) {
+                if let Some(mirror) = cid_visible_mirror(ctx, this, cid) {
                     return Ok(Some(Value::Object(Some(mirror))));
                 }
             }
@@ -6375,6 +6374,38 @@ mod classloader_tests {
     }
 
     #[test]
+    fn test_loadclass_resolve_override_survives_urlclassloader_superclass() {
+        let mut ctx = MockNativeContext::new();
+        let url_cid = ctx
+            .ensure_class_initialized("java/net/URLClassLoader")
+            .expect("URLClassLoader class");
+        let bsh_cid = ctx
+            .ensure_class_initialized("bsh/classpath/BshClassLoader")
+            .expect("BshClassLoader class");
+        let discrete_cid = ctx
+            .ensure_class_initialized("bsh/classpath/DiscreteFilesClassLoader")
+            .expect("DiscreteFilesClassLoader class");
+        ctx.set_superclass(discrete_cid, bsh_cid);
+        ctx.set_superclass(bsh_cid, url_cid);
+        ctx.set_declared_methods(
+            bsh_cid,
+            vec![cratonvm_native_api::MethodMetadata {
+                name: "loadClass".to_string(),
+                descriptor: "(Ljava/lang/String;Z)Ljava/lang/Class;".to_string(),
+                access_flags: 0,
+                declaring_class_id: bsh_cid,
+                exceptions: Vec::new(),
+            }],
+        );
+        let loader = new_object_ref(&mut ctx, "bsh/classpath/DiscreteFilesClassLoader");
+
+        assert!(
+            receiver_overrides_load_class_resolve(&mut ctx, loader),
+            "BeanShell-shaped URLClassLoader subclasses must dispatch their loadClass override"
+        );
+    }
+
+    #[test]
     fn test_cl_init_default_registered() {
         let r = make_registry();
         assert!(r.find(CL_CLASS, "<init>", "()V").is_some());
@@ -6484,6 +6515,31 @@ mod classloader_tests {
         ctx.set_loader_id_override(cid, 2);
 
         assert!(find_loaded_class_for_loader(&mut ctx, loader, "framework/Generated").is_some());
+    }
+
+    #[test]
+    fn test_builtin_find_loaded_class_hides_user_defined_app_namespace_hit() {
+        let mut ctx = MockNativeContext::new();
+        let app_loader = match ctx.new_object("java/lang/ClassLoader").unwrap() {
+            Some(Value::Object(Some(obj))) => obj,
+            other => panic!("expected classloader object, got {other:?}"),
+        };
+        let child_loader = match ctx.new_object("bsh/classpath/BshClassLoader").unwrap() {
+            Some(Value::Object(Some(obj))) => obj,
+            other => panic!("expected child loader object, got {other:?}"),
+        };
+        let cid = ctx.ensure_class_initialized("MyMessenger").unwrap();
+        ctx.set_loader_id_override(cid, 2);
+        register_defining_loader(cid.as_u32(), child_loader);
+
+        assert!(
+            find_loaded_class_for_loader(&mut ctx, app_loader, "MyMessenger").is_none(),
+            "built-in loaders must not see app-namespace classes defined by a child loader"
+        );
+        assert!(
+            resolve_global_if_visible(&mut ctx, app_loader, "MyMessenger").is_none(),
+            "base loadClass global fallback must apply the same child-loader visibility rule"
+        );
     }
 
     #[test]
