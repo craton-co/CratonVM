@@ -9,13 +9,14 @@ angles**; this index is the consolidated map. Read it first.
 Found triaging FAIL results from a 516-class Spring non-passed rerun (filtered
 out ~250 environmental classpath-dump gaps first — missing cross-module
 Spring test-fixture jars, not CratonVM bugs). All 5 below are genuine,
-distinct CratonVM defects. Four remain OPEN here; the Groovy PhaseOperation
-AME was fixed 2026-07-08 and moved to `docs/internal/fixed-suite-bugs`.
+distinct CratonVM defects. Three remain OPEN here; the Groovy PhaseOperation
+AME and LCIM deserialization NPE were fixed 2026-07-08 and moved to
+`docs/internal/fixed-suite-bugs`.
 
 - OPEN: [`web-x509trustmanager-getacceptedissuers-abstractmethoderror.md`](web-x509trustmanager-getacceptedissuers-abstractmethoderror.md) — `X509TrustManager.getAcceptedIssuers()` AbstractMethodError, identical across all 4 HTTP server backends in one WebFlux test.
 - FIXED/RETIRED: [`groovy-compilationunit-phaseoperation-abstractmethoderror-FIXED.md`](../internal/fixed-suite-bugs/groovy-compilationunit-phaseoperation-abstractmethoderror-FIXED.md) - Groovy `CompilationUnit$PhaseOperation.doPhaseOperation` AbstractMethodError, 4 `GroovyScriptFactoryTests` methods.
 - OPEN: [`stomp-bufferingdecoder-atomicinteger-count-npe.md`](stomp-bufferingdecoder-atomicinteger-count-npe.md) — `BufferingStompDecoder`'s `count` `AtomicInteger` field null, 5 STOMP decoder test methods.
-- OPEN: [`linkedcaseinsensitivemap-deserialize-this0-npe.md`](linkedcaseinsensitivemap-deserialize-this0-npe.md) — `LinkedCaseInsensitiveMap` inner-class `this$0` null after deserialize; related but distinct from the FIXED `removeEldestEntry`-dispatch-to-`Object` NSME below.
+- FIXED/RETIRED: [`linkedcaseinsensitivemap-this0-deserialization-FIXED.md`](../internal/fixed-suite-bugs/linkedcaseinsensitivemap-this0-deserialization-FIXED.md) - `LinkedCaseInsensitiveMap` inner-class `this$0` null after deserialize; fixed by suppressing `removeEldestEntry` during `HashMap.readObject` replay.
 - OPEN: [`reflection-arenestmates-missing-native.md`](reflection-arenestmates-missing-native.md) — `jdk.internal.reflect.Reflection.areNestMates` has no native registered at all.
 
 Also confirmed (not new, corroborating evidence only, no new doc needed):
