@@ -195,9 +195,27 @@ Residual tracking:
   buffer. Doc retired to
   [`../internal/http-server-sslengine-identity-singleton-clobber-FIXED.md`](../internal/http-server-sslengine-identity-singleton-clobber-FIXED.md).
   `ServerHttpsRequestIntegrationTests` now reaches TLS record processing (server
-  config builds) and fails on a separate, newly-exposed SSLEngine handshake
-  data-flow bug tracked in
-  [reactive-netty-https-sslengine-handshake-underflow.md](reactive-netty-https-sslengine-handshake-underflow.md).
+  config builds) and initially failed on a separate SSLEngine handshake
+  data-flow bug — ✅ FIXED (branch `fix/netty-sslengine-underflow-20260707`,
+  2026-07-07): a `bb_view` gap for `DirectByteBuffer`-backed engines, plus
+  four further chained bugs (`SSLEngineResult` accessor natives clobbering
+  the REAL enum singletons, client `TrustManager` delegation, client
+  `SSLSession` peer-chain population, and synthetic `SSLSocketOutputStream`/
+  `InputStream` missing their real superclass). Doc retired to
+  [`../internal/reactive-netty-https-sslengine-handshake-underflow-FIXED.md`](../internal/reactive-netty-https-sslengine-handshake-underflow-FIXED.md).
+  That fix chain exposed one more residual — the client's actual POST write
+  failing with `SSLSocketOutputStream.write: stream is closed` — which is
+  itself now ✅ FIXED (branch `fix/netty-socket-write-after-close-20260708`,
+  2026-07-08): EIGHT further chained bugs, the core one being
+  `alloc_concurrent_synthetic` sizing a synthetic `SSLSocket` using the
+  REAL loaded class's field layout, so a raw `Int` field write to the
+  connection-id slot was silently dropped by the GC/field-layout guard
+  (fixed by migrating that state into `net_phase_e`'s existing `SockSide`
+  side table); the final flaky residual was `isInputShutdown`/
+  `isOutputShutdown` never having a reachable native registration, so real
+  bytecode read garbage from the synthetic object and non-deterministically
+  told Apache HttpClient5 the connection was already closed. Doc retired to
+  [`../internal/netty-client-socket-write-after-close-nsme-FIXED.md`](../internal/netty-client-socket-write-after-close-nsme-FIXED.md).
 
 ## 2026-07-04 Keycloak full-suite sweep (branch test/keycloak-fullsuite-20260704)
 
