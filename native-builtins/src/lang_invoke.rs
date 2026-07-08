@@ -3952,6 +3952,65 @@ pub(crate) fn register_callsite_dynamic_invoker_bridge(r: &mut NativeMethodRegis
     r.set_category(__prev_cat);
 }
 
+fn make_drop_arguments_adapter(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let orig_mh = match args.first() {
+        Some(Value::Object(Some(r))) => *r,
+        _ => return Ok(Some(Value::Object(None))),
+    };
+    let pos = args.get(1).and_then(|v| v.as_int()).unwrap_or(0) as usize;
+    let extra_classes = match args.get(2) {
+        Some(Value::Object(Some(a))) => *a,
+        _ => {
+            return Ok(Some(Value::Object(Some(orig_mh))));
+        }
+    };
+    let extra_n = ctx.array_length(extra_classes);
+    if extra_n == 0 {
+        return Ok(Some(Value::Object(Some(orig_mh))));
+    }
+    // Read the original MH's desc; construct the widened desc by inserting
+    // `extra_n` erased object descriptors at position `pos`.
+    let inner_desc = match ctx.get_field(orig_mh, MH_DESC) {
+        Value::Object(Some(s)) => ctx.read_string(s).unwrap_or_default(),
+        _ => String::new(),
+    };
+    let widened_desc = widen_descriptor(ctx, &inner_desc, extra_classes, pos);
+    // Encode `pos` into MH_CLASS so dispatch can recover it.
+    let pos_str = pos.to_string();
+    let wrapper = alloc_method_handle(ctx, &pos_str, "drop", &widened_desc, MH_KIND_DROP);
+    ctx.set_field(wrapper, MH_BOUND, Value::Object(Some(orig_mh)));
+    // Also widen the `type:MethodType` field so JDK-internal code
+    // that reads mh.type().parameterCount() sees the widened arity.
+    let orig_type = ctx.get_field(orig_mh, 0);
+    if let Value::Object(Some(mt)) = orig_type {
+        let ret = ctx.get_field(mt, 0);
+        if let Value::Object(Some(orig_ptypes)) = ctx.get_field(mt, 1) {
+            let orig_n = ctx.array_length(orig_ptypes);
+            let new_n = orig_n + extra_n;
+            let new_ptypes = ctx.new_array(cratonvm_types::ArrayElementType::Reference, new_n);
+            let pos_c = pos.min(orig_n);
+            for i in 0..pos_c {
+                let v = ctx.get_array_element(orig_ptypes, i);
+                ctx.set_array_element(new_ptypes, i, v);
+            }
+            for i in 0..extra_n {
+                let v = ctx.get_array_element(extra_classes, i);
+                ctx.set_array_element(new_ptypes, pos_c + i, v);
+            }
+            for i in pos_c..orig_n {
+                let v = ctx.get_array_element(orig_ptypes, i);
+                ctx.set_array_element(new_ptypes, extra_n + i, v);
+            }
+            let new_mt = alloc_concurrent_synthetic(ctx, "java/lang/invoke/MethodType", 6);
+            ctx.set_field(new_mt, 0, ret);
+            ctx.set_field(new_mt, 1, Value::Object(Some(new_ptypes)));
+            populate_method_type_form(ctx, new_mt);
+            ctx.set_field_by_name(wrapper, "type", Value::Object(Some(new_mt)));
+        }
+    }
+    Ok(Some(Value::Object(Some(wrapper))))
+}
+
 /// Functional `MethodHandles.insertArguments` / `MethodHandle.asCollector`
 /// plus the `CallSite`-construction natives Apache Groovy's `IndyInterface`
 /// fallback relies on (`CallSite.makeUninitializedCallSite`,
@@ -4190,10 +4249,7 @@ pub(crate) fn register_p65_method_handles_extra(r: &mut NativeMethodRegistry) {
         mh,
         "dropArguments",
         "(Ljava/lang/invoke/MethodHandle;I[Ljava/lang/Class;)Ljava/lang/invoke/MethodHandle;",
-        |_ctx, args| {
-            // Return the original method handle (simplified)
-            Ok(Some(args.first().copied().unwrap_or(Value::Object(None))))
-        },
+        make_drop_arguments_adapter,
     );
     r.register(
         mh,
@@ -7126,65 +7182,7 @@ pub fn register_t28_method_handle_completeness(r: &mut NativeMethodRegistry) {
         mhs,
         "dropArgumentsTrusted",
         "(Ljava/lang/invoke/MethodHandle;I[Ljava/lang/Class;)Ljava/lang/invoke/MethodHandle;",
-        |ctx, args| {
-            let orig_mh = match args.first() {
-                Some(Value::Object(Some(r))) => *r,
-                _ => return Ok(Some(Value::Object(None))),
-            };
-            let pos = args.get(1).and_then(|v| v.as_int()).unwrap_or(0) as usize;
-            let extra_classes = match args.get(2) {
-                Some(Value::Object(Some(a))) => *a,
-                _ => {
-                    return Ok(Some(Value::Object(Some(orig_mh))));
-                }
-            };
-            let extra_n = ctx.array_length(extra_classes);
-            if extra_n == 0 {
-                return Ok(Some(Value::Object(Some(orig_mh))));
-            }
-            // Read the original MH's desc; construct the widened desc by
-            // inserting `extra_n` erased object descriptors at position `pos`.
-            let inner_desc = match ctx.get_field(orig_mh, MH_DESC) {
-                Value::Object(Some(s)) => ctx.read_string(s).unwrap_or_default(),
-                _ => String::new(),
-            };
-            let widened_desc = widen_descriptor(ctx, &inner_desc, extra_classes, pos);
-            // Encode `pos` into MH_CLASS so dispatch can recover it.
-            let pos_str = pos.to_string();
-            let wrapper = alloc_method_handle(ctx, &pos_str, "drop", &widened_desc, MH_KIND_DROP);
-            ctx.set_field(wrapper, MH_BOUND, Value::Object(Some(orig_mh)));
-            // Also widen the `type:MethodType` field so JDK-internal code
-            // that reads mh.type().parameterCount() sees the widened arity.
-            let orig_type = ctx.get_field(orig_mh, 0);
-            if let Value::Object(Some(mt)) = orig_type {
-                let ret = ctx.get_field(mt, 0);
-                if let Value::Object(Some(orig_ptypes)) = ctx.get_field(mt, 1) {
-                    let orig_n = ctx.array_length(orig_ptypes);
-                    let new_n = orig_n + extra_n;
-                    let new_ptypes =
-                        ctx.new_array(cratonvm_types::ArrayElementType::Reference, new_n);
-                    let pos_c = pos.min(orig_n);
-                    for i in 0..pos_c {
-                        let v = ctx.get_array_element(orig_ptypes, i);
-                        ctx.set_array_element(new_ptypes, i, v);
-                    }
-                    for i in 0..extra_n {
-                        let v = ctx.get_array_element(extra_classes, i);
-                        ctx.set_array_element(new_ptypes, pos_c + i, v);
-                    }
-                    for i in pos_c..orig_n {
-                        let v = ctx.get_array_element(orig_ptypes, i);
-                        ctx.set_array_element(new_ptypes, extra_n + i, v);
-                    }
-                    let new_mt = alloc_concurrent_synthetic(ctx, "java/lang/invoke/MethodType", 6);
-                    ctx.set_field(new_mt, 0, ret);
-                    ctx.set_field(new_mt, 1, Value::Object(Some(new_ptypes)));
-                    populate_method_type_form(ctx, new_mt);
-                    ctx.set_field_by_name(wrapper, "type", Value::Object(Some(new_mt)));
-                }
-            }
-            Ok(Some(Value::Object(Some(wrapper))))
-        },
+        make_drop_arguments_adapter,
     );
 
     // --- Additional MethodHandles combinators ---
