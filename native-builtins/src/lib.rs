@@ -29229,6 +29229,72 @@ fn unsafe_static_get_and_set_long(
     Some(old)
 }
 
+// The above cover Long null-base statics only — Unsafe.{get,put,CAS,
+// getAndAdd,getAndSet}Int/Reference/Float/Double with a null receiver still
+// fell through to the never-reconciled `static_int_store`/`static_obj_store`
+// side maps below, unable to see a `putstatic`-initialized seed or be seen
+// by `getstatic`. Same shape as the Long fix above, extended to the other
+// four value types.
+
+fn unsafe_static_get_and_add_int(
+    ctx: &mut dyn NativeContext,
+    offset: usize,
+    delta: i32,
+) -> Option<i32> {
+    let (class_id, field_index) = unsafe_static_field_target(offset)?;
+    let Value::Int(old) = ctx.get_static_field(class_id, field_index) else {
+        return Some(0);
+    };
+    ctx.set_static_field(class_id, field_index, Value::Int(old.wrapping_add(delta)));
+    Some(old)
+}
+
+fn unsafe_static_get_and_set_int(
+    ctx: &mut dyn NativeContext,
+    offset: usize,
+    value: i32,
+) -> Option<i32> {
+    let (class_id, field_index) = unsafe_static_field_target(offset)?;
+    let old = match ctx.get_static_field(class_id, field_index) {
+        Value::Int(old) => old,
+        _ => 0,
+    };
+    ctx.set_static_field(class_id, field_index, Value::Int(value));
+    Some(old)
+}
+
+fn unsafe_static_get_and_set_object(
+    ctx: &mut dyn NativeContext,
+    offset: usize,
+    value: Option<ObjectRef>,
+) -> Option<Option<ObjectRef>> {
+    let (class_id, field_index) = unsafe_static_field_target(offset)?;
+    let old = match ctx.get_static_field(class_id, field_index) {
+        Value::Object(old) => old,
+        _ => None,
+    };
+    ctx.set_static_field(class_id, field_index, Value::Object(value));
+    Some(old)
+}
+
+/// CAS a registered static using `unsafe_cas_values_equal` for the
+/// comparison — the same semantics `native_unsafe_cas_int`/`_object`'s
+/// side-store fallback already used.
+fn unsafe_static_cas(
+    ctx: &mut dyn NativeContext,
+    offset: usize,
+    expected: Value,
+    new_val: Value,
+) -> Option<bool> {
+    let (class_id, field_index) = unsafe_static_field_target(offset)?;
+    let cur = ctx.get_static_field(class_id, field_index);
+    let ok = unsafe_cas_values_equal(cur, expected);
+    if ok {
+        ctx.set_static_field(class_id, field_index, new_val);
+    }
+    Some(ok)
+}
+
 fn unsafe_static_field_target_for_base(
     ctx: &dyn NativeContext,
     obj: ObjectRef,
@@ -29886,6 +29952,9 @@ pub(crate) fn native_unsafe_cas_int(
     let obj = match unsafe_obj(args, 1) {
         Some(o) => o,
         None => {
+            if let Some(ok) = unsafe_static_cas(ctx, offset, expected, new_val) {
+                return Ok(Some(Value::Int(if ok { 1 } else { 0 })));
+            }
             let mut map = lock_unsafe_shard_usize(static_int_store(), offset);
             let cur = *map.entry(offset).or_insert(0);
             let ex = if let Value::Int(e) = expected { e } else { 0 };
@@ -30063,6 +30132,9 @@ pub(crate) fn native_unsafe_cas_object(
     let obj = match unsafe_obj(args, 1) {
         Some(o) => o,
         None => {
+            if let Some(ok) = unsafe_static_cas(ctx, offset, expected, new_val) {
+                return Ok(Some(Value::Int(if ok { 1 } else { 0 })));
+            }
             let mut map = lock_unsafe_shard_usize(static_obj_store(), offset);
             let cur = *map.entry(offset).or_insert(None);
             let ex = if let Value::Object(e) = expected {
@@ -30122,6 +30194,13 @@ pub(crate) fn native_unsafe_get_int_volatile(
     let obj = match unsafe_obj(args, 1) {
         Some(o) => o,
         None => {
+            if let Some(v) = unsafe_static_get(ctx, offset) {
+                return Ok(Some(match v {
+                    Value::Int(i) => Value::Int(i),
+                    Value::Long(l) => Value::Int(l as i32),
+                    _ => Value::Int(0),
+                }));
+            }
             let map = lock_unsafe_shard_usize(static_int_store(), offset);
             return Ok(Some(Value::Int(map.get(&offset).copied().unwrap_or(0))));
         }
@@ -30152,6 +30231,9 @@ pub(crate) fn native_unsafe_put_int_volatile(
         Some(o) => o,
         None => {
             let v = if let Value::Int(i) = val { i } else { 0 };
+            if unsafe_static_put(ctx, offset, Value::Int(v)) {
+                return Ok(None);
+            }
             lock_unsafe_shard_usize(static_int_store(), offset).insert(offset, v);
             return Ok(None);
         }
@@ -30247,6 +30329,9 @@ fn native_unsafe_get_object_volatile(
     let obj = match unsafe_obj(args, 1) {
         Some(o) => o,
         None => {
+            if let Some(v) = unsafe_static_get(ctx, offset) {
+                return Ok(Some(recover_object_arg(v)));
+            }
             let map = lock_unsafe_shard_usize(static_obj_store(), offset);
             return Ok(Some(Value::Object(
                 map.get(&offset).copied().unwrap_or(None),
@@ -30280,6 +30365,9 @@ fn native_unsafe_put_object_volatile(
         Some(o) => o,
         None => {
             let v = if let Value::Object(o) = val { o } else { None };
+            if unsafe_static_put(ctx, offset, Value::Object(v)) {
+                return Ok(None);
+            }
             lock_unsafe_shard_usize(static_obj_store(), offset).insert(offset, v);
             return Ok(None);
         }
@@ -30307,6 +30395,9 @@ pub(crate) fn native_unsafe_get_object(
     let obj = match unsafe_obj(args, 1) {
         Some(o) => o,
         None => {
+            if let Some(v) = unsafe_static_get(ctx, offset) {
+                return Ok(Some(recover_object_arg(v)));
+            }
             let map = lock_unsafe_shard_usize(static_obj_store(), offset);
             return Ok(Some(Value::Object(
                 map.get(&offset).copied().unwrap_or(None),
@@ -30338,6 +30429,9 @@ pub(crate) fn native_unsafe_put_object(
         Some(o) => o,
         None => {
             let v = if let Value::Object(o) = val { o } else { None };
+            if unsafe_static_put(ctx, offset, Value::Object(v)) {
+                return Ok(None);
+            }
             lock_unsafe_shard_usize(static_obj_store(), offset).insert(offset, v);
             return Ok(None);
         }
@@ -30735,6 +30829,13 @@ pub(crate) fn native_unsafe_get_int(
     let obj = match unsafe_obj(args, 1) {
         Some(o) => o,
         None => {
+            if let Some(v) = unsafe_static_get(ctx, offset) {
+                return Ok(Some(match v {
+                    Value::Int(i) => Value::Int(i),
+                    Value::Long(l) => Value::Int(l as i32),
+                    _ => Value::Int(0),
+                }));
+            }
             let map = lock_unsafe_shard_usize(static_int_store(), offset);
             return Ok(Some(Value::Int(map.get(&offset).copied().unwrap_or(0))));
         }
@@ -30765,6 +30866,9 @@ pub(crate) fn native_unsafe_put_int(
         Some(o) => o,
         None => {
             let v = if let Value::Int(i) = val { i } else { 0 };
+            if unsafe_static_put(ctx, offset, Value::Int(v)) {
+                return Ok(None);
+            }
             lock_unsafe_shard_usize(static_int_store(), offset).insert(offset, v);
             return Ok(None);
         }
@@ -31069,6 +31173,9 @@ pub(crate) fn native_unsafe_get_and_add_int(
     let obj = match unsafe_obj(args, 1) {
         Some(o) => o,
         None => {
+            if let Some(old) = unsafe_static_get_and_add_int(ctx, offset, delta) {
+                return Ok(Some(Value::Int(old)));
+            }
             let mut map = lock_unsafe_shard_usize(static_int_store(), offset);
             let slot = map.entry(offset).or_insert(0);
             let old = *slot;
@@ -31132,6 +31239,9 @@ fn native_unsafe_get_and_set_int(ctx: &mut dyn NativeContext, args: &[Value]) ->
         Some(o) => o,
         None => {
             let nv = if let Value::Int(n) = new_val { n } else { 0 };
+            if let Some(prev) = unsafe_static_get_and_set_int(ctx, offset, nv) {
+                return Ok(Some(Value::Int(prev)));
+            }
             let mut map = lock_unsafe_shard_usize(static_int_store(), offset);
             let prev = map.insert(offset, nv).unwrap_or(0);
             return Ok(Some(Value::Int(prev)));
@@ -31168,7 +31278,13 @@ fn native_unsafe_get_float(ctx: &mut dyn NativeContext, args: &[Value]) -> Metho
     let offset = unsafe_offset(args, 2);
     let obj = match unsafe_obj(args, 1) {
         Some(o) => o,
-        None => return Ok(Some(Value::Float(0.0))),
+        None => {
+            return Ok(Some(match unsafe_static_get(ctx, offset) {
+                Some(Value::Float(f)) => Value::Float(f),
+                Some(Value::Int(bits)) => Value::Float(f32::from_bits(bits as u32)),
+                _ => Value::Float(0.0),
+            }));
+        }
     };
     if is_synthetic_offset(offset) {
         let val = synthetic_get(ctx, obj, offset);
@@ -31191,7 +31307,10 @@ fn native_unsafe_put_float(ctx: &mut dyn NativeContext, args: &[Value]) -> Metho
     let val = args.get(3).copied().unwrap_or(Value::Float(0.0));
     let obj = match unsafe_obj(args, 1) {
         Some(o) => o,
-        None => return Ok(None),
+        None => {
+            let _ = unsafe_static_put(ctx, offset, val);
+            return Ok(None);
+        }
     };
     if is_synthetic_offset(offset) {
         synthetic_put(ctx, obj, offset, val);
@@ -31205,7 +31324,13 @@ fn native_unsafe_get_double(ctx: &mut dyn NativeContext, args: &[Value]) -> Meth
     let offset = unsafe_offset(args, 2);
     let obj = match unsafe_obj(args, 1) {
         Some(o) => o,
-        None => return Ok(Some(Value::Double(0.0))),
+        None => {
+            return Ok(Some(match unsafe_static_get(ctx, offset) {
+                Some(Value::Double(d)) => Value::Double(d),
+                Some(Value::Long(bits)) => Value::Double(f64::from_bits(bits as u64)),
+                _ => Value::Double(0.0),
+            }));
+        }
     };
     if is_synthetic_offset(offset) {
         let val = synthetic_get(ctx, obj, offset);
@@ -31228,7 +31353,10 @@ fn native_unsafe_put_double(ctx: &mut dyn NativeContext, args: &[Value]) -> Meth
     let val = args.get(3).copied().unwrap_or(Value::Double(0.0));
     let obj = match unsafe_obj(args, 1) {
         Some(o) => o,
-        None => return Ok(None),
+        None => {
+            let _ = unsafe_static_put(ctx, offset, val);
+            return Ok(None);
+        }
     };
     if is_synthetic_offset(offset) {
         synthetic_put(ctx, obj, offset, val);
@@ -31363,6 +31491,9 @@ fn native_unsafe_get_and_set_object(
             } else {
                 None
             };
+            if let Some(prev) = unsafe_static_get_and_set_object(ctx, offset, nv) {
+                return Ok(Some(Value::Object(prev)));
+            }
             let mut map = lock_unsafe_shard_usize(static_obj_store(), offset);
             let prev = map.insert(offset, nv).unwrap_or(None);
             return Ok(Some(Value::Object(prev)));
@@ -32288,6 +32419,18 @@ fn native_unsafe_compare_and_exchange_int(
         Some(Value::Int(v)) => *v,
         _ => 0,
     };
+    if obj.is_none() {
+        if let Some((class_id, field_index)) = unsafe_static_field_target(offset) {
+            let old = ctx.get_static_field(class_id, field_index);
+            if let Value::Int(old_val) = old {
+                if old_val == expected {
+                    ctx.set_static_field(class_id, field_index, Value::Int(update));
+                }
+                return Ok(Some(Value::Int(old_val)));
+            }
+            return Ok(Some(Value::Int(expected)));
+        }
+    }
     if let Some(obj_ref) = obj {
         let old = if is_synthetic_offset(offset) {
             synthetic_get(ctx, obj_ref, offset)
@@ -32362,6 +32505,28 @@ fn native_unsafe_compare_and_exchange_reference(
 ) -> MethodCallResult {
     let obj = unsafe_obj(args, 1);
     let offset = unsafe_offset(args, 2);
+    if obj.is_none() {
+        if let Some((class_id, field_index)) = unsafe_static_field_target(offset) {
+            let old = ctx.get_static_field(class_id, field_index);
+            let expected_ref = match args.get(3) {
+                Some(Value::Object(r)) => *r,
+                _ => None,
+            };
+            let matches = match &old {
+                Value::Object(Some(a)) => expected_ref.is_some_and(|b| a.as_ptr() == b.as_ptr()),
+                Value::Object(None) => expected_ref.is_none(),
+                _ => false,
+            };
+            if matches {
+                let update = match args.get(4) {
+                    Some(v) => v.clone(),
+                    None => Value::Object(None),
+                };
+                ctx.set_static_field(class_id, field_index, update);
+            }
+            return Ok(Some(old));
+        }
+    }
     if let Some(obj_ref) = obj {
         let old = if is_synthetic_offset(offset) {
             synthetic_get(ctx, obj_ref, offset)
@@ -59075,6 +59240,140 @@ mod unsafe_static_field_offset_tests {
         assert_ne!(offset, 0);
         assert_eq!(first, Value::Long(1));
         assert_eq!(second, Value::Long(2));
+    }
+
+    /// Same shape as `static_long_null_base_unsafe_uses_real_static_storage`
+    /// above, for an int static — the null-base int accessors previously
+    /// serviced `static_int_store` unconditionally, invisible to putstatic.
+    #[test]
+    fn static_int_null_base_unsafe_uses_real_static_storage() {
+        let mut ctx = MockNativeContext::new();
+        let class_id = ctx
+            .ensure_class_initialized("com/example/IntStaticHolder")
+            .expect("mock class id");
+        let meta = FieldMetadata {
+            name: "counter".to_string(),
+            descriptor: "I".to_string(),
+            access_flags: 0x0008,
+            slot_index: 0,
+            declaring_class_id: class_id,
+            is_static: true,
+        };
+        ctx.set_static_field(class_id, 0, Value::Int(10));
+
+        let field = crate::lang_class::create_field_object(&mut ctx, &meta);
+        let offset = match native_unsafe_static_field_offset(
+            &mut ctx,
+            &[Value::Object(None), Value::Object(Some(field))],
+        )
+        .expect("staticFieldOffset")
+        .expect("offset value")
+        {
+            Value::Long(offset) => offset as usize,
+            other => panic!("unexpected offset value: {other:?}"),
+        };
+
+        let before = native_unsafe_get_int_volatile(
+            &mut ctx,
+            &[
+                Value::Object(None),
+                Value::Object(None),
+                Value::Long(offset as i64),
+            ],
+        )
+        .expect("getIntVolatile")
+        .expect("read value");
+        assert_eq!(before, Value::Int(10));
+
+        let old = native_unsafe_get_and_add_int(
+            &mut ctx,
+            &[
+                Value::Object(None),
+                Value::Object(None),
+                Value::Long(offset as i64),
+                Value::Int(1),
+            ],
+        )
+        .expect("getAndAddInt")
+        .expect("old value");
+        assert_eq!(old, Value::Int(10));
+        assert_eq!(ctx.get_static_field(class_id, 0), Value::Int(11));
+
+        let cas_ok = native_unsafe_cas_int(
+            &mut ctx,
+            &[
+                Value::Object(None),
+                Value::Object(None),
+                Value::Long(offset as i64),
+                Value::Int(11),
+                Value::Int(99),
+            ],
+        )
+        .expect("compareAndSetInt")
+        .expect("cas result");
+        assert_eq!(cas_ok, Value::Int(1));
+        assert_eq!(ctx.get_static_field(class_id, 0), Value::Int(99));
+    }
+
+    /// Same shape, for a static Object field.
+    #[test]
+    fn static_object_null_base_unsafe_uses_real_static_storage() {
+        let mut ctx = MockNativeContext::new();
+        let class_id = ctx
+            .ensure_class_initialized("com/example/ObjectStaticHolder")
+            .expect("mock class id");
+        let meta = FieldMetadata {
+            name: "value".to_string(),
+            descriptor: "Ljava/lang/Object;".to_string(),
+            access_flags: 0x0008,
+            slot_index: 0,
+            declaring_class_id: class_id,
+            is_static: true,
+        };
+        let seeded = ctx.create_string("seed");
+        ctx.set_static_field(class_id, 0, Value::Object(Some(seeded)));
+
+        let field = crate::lang_class::create_field_object(&mut ctx, &meta);
+        let offset = match native_unsafe_static_field_offset(
+            &mut ctx,
+            &[Value::Object(None), Value::Object(Some(field))],
+        )
+        .expect("staticFieldOffset")
+        .expect("offset value")
+        {
+            Value::Long(offset) => offset as usize,
+            other => panic!("unexpected offset value: {other:?}"),
+        };
+
+        let before = native_unsafe_get_object_volatile(
+            &mut ctx,
+            &[
+                Value::Object(None),
+                Value::Object(None),
+                Value::Long(offset as i64),
+            ],
+        )
+        .expect("getObjectVolatile")
+        .expect("read value");
+        assert_eq!(before, Value::Object(Some(seeded)));
+
+        let replacement = ctx.create_string("replacement");
+        let prev = native_unsafe_get_and_set_object(
+            &mut ctx,
+            &[
+                Value::Object(None),
+                Value::Object(None),
+                Value::Long(offset as i64),
+                Value::Object(Some(replacement)),
+            ],
+        )
+        .expect("getAndSetObject")
+        .expect("previous value");
+        assert_eq!(prev, Value::Object(Some(seeded)));
+        assert_eq!(
+            ctx.get_static_field(class_id, 0),
+            Value::Object(Some(replacement))
+        );
     }
 }
 
