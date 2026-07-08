@@ -7882,6 +7882,14 @@ fn register_re6_ssl_context(r: &mut NativeMethodRegistry) {
                 s.closed = 0;
                 s.stream_id = id;
             });
+            if std::env::var_os("CRATONVM_DBG_TLS_SOCK").is_some() {
+                eprintln!(
+                    "[dbg-tls-sock] thread={:?} net_phase_e createSocket(String,int) built sock={:?} stream_id={}",
+                    std::thread::current().id(),
+                    sock,
+                    id
+                );
+            }
             Ok(Some(Value::Object(Some(sock))))
         },
     );

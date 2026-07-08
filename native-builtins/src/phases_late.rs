@@ -39872,6 +39872,14 @@ fn new13_do_create_socket(
     ctx.set_field(sock, NEW13_SOCK_CLOSED, Value::Int(0));
     let session = new13_alloc_ssl_session(ctx, tls_id);
     ctx.set_field(sock, NEW13_SOCK_SESSION, Value::Object(Some(session)));
+    if std::env::var_os("CRATONVM_DBG_TLS_SOCK").is_some() {
+        eprintln!(
+            "[dbg-tls-sock] thread={:?} new13_do_create_socket built sock={:?} tls_id={}",
+            std::thread::current().id(),
+            sock,
+            tls_id
+        );
+    }
     Ok(Some(Value::Object(Some(sock))))
 }
 
@@ -40354,8 +40362,9 @@ pub(crate) fn register_p68_ssl(r: &mut NativeMethodRegistry) {
             let fd_id = new13_resolve_tls_id(ctx, this);
             if std::env::var_os("CRATONVM_DBG_TLS_SOCK").is_some() {
                 eprintln!(
-                    "[dbg-tls-sock] thread={:?} getInputStream tls_id={}",
+                    "[dbg-tls-sock] thread={:?} getInputStream sock={:?} tls_id={}",
                     std::thread::current().id(),
+                    this,
                     fd_id
                 );
             }
@@ -40374,8 +40383,9 @@ pub(crate) fn register_p68_ssl(r: &mut NativeMethodRegistry) {
             let fd_id = new13_resolve_tls_id(ctx, this);
             if std::env::var_os("CRATONVM_DBG_TLS_SOCK").is_some() {
                 eprintln!(
-                    "[dbg-tls-sock] thread={:?} getOutputStream tls_id={}",
+                    "[dbg-tls-sock] thread={:?} getOutputStream sock={:?} tls_id={}",
                     std::thread::current().id(),
+                    this,
                     fd_id
                 );
             }
