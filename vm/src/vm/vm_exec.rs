@@ -3623,6 +3623,13 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
         Ok(class_id)
     }
 
+    fn ensure_class_initialized_with_class_id(
+        &mut self,
+        class_id: ClassId,
+    ) -> Result<(), MethodCallFailed> {
+        super::ensure_class_initialized_shared(self.shared, self.thread, class_id)
+    }
+
     fn ensure_synthetic_class(&mut self, name: &str, num_fields: usize) -> ClassId {
         // Prefer the real class if it can be loaded — `ensure_synthetic_class`
         // returns the existing id when the name is already registered, so a
@@ -13090,6 +13097,37 @@ fn invoke_on_class_shared_inner(
                 {
                     return Ok(Some(Value::Object(None)));
                 }
+                // Loader-aware receiver retry: this recursive slow path can be
+                // entered after name-based dispatch picked the global copy of a
+                // class while the heap receiver is a loader-specific copy with
+                // extra bytecode-enhancement interfaces/default methods. Retry
+                // against the receiver's real class before falling through to
+                // CP-interface or native-only rescues.
+                if let Some(Value::Object(Some(recv))) = args.first().copied() {
+                    let recv_cid = shared.heap.class_id_of(recv);
+                    if recv_cid != class_id && recv_cid != ClassId::new(0) {
+                        let cm_recv = shared.class_manager.read();
+                        if let Some((m, declaring_id)) = crate::classloading::find_method_recursive(
+                            recv_cid,
+                            method_name,
+                            descriptor,
+                            &cm_recv.class_store,
+                        ) {
+                            if !m.is_abstract() && !m.is_static() {
+                                drop(cm_recv);
+                                return invoke_on_class_shared(
+                                    shared,
+                                    thread,
+                                    declaring_id,
+                                    method_name,
+                                    descriptor,
+                                    args,
+                                );
+                            }
+                        }
+                    }
+                }
+
                 // KAFKA-DEFAULT-RESCUE: invokeinterface on a receiver whose
                 // runtime class is bare `java/lang/Object` (a synthetic
                 // ServiceLoader provider stub) can land here when the target

@@ -3889,12 +3889,12 @@ fn ensure_static_field_declaring_class_initialized(
     ctx: &mut dyn NativeContext,
     class_id: cratonvm_types::ClassId,
 ) -> Result<(), cratonvm_types::error::MethodCallFailed> {
-    if let Some(name) = ctx.class_name_of_id(class_id) {
-        // Reflective access to a static field is an active use of the declaring
-        // class. HotSpot runs <clinit> before Field.get/set returns the value;
-        // XMLBeans depends on this for generated enum `table` fields.
-        ctx.ensure_class_initialized(&name)?;
-    }
+    // Reflective access to a static field is an active use of the declaring
+    // class. HotSpot runs <clinit> before Field.get/set returns the value;
+    // XMLBeans depends on this for generated enum `table` fields. Use the exact
+    // ClassId from the Field mirror so loader-private classes are initialized as
+    // themselves, not as a same-named global class.
+    ctx.ensure_class_initialized_with_class_id(class_id)?;
     Ok(())
 }
 
@@ -12713,7 +12713,7 @@ pub(crate) fn native_class_get_enum_constants(
         Some(n) => n,
         None => return Ok(Some(Value::Object(None))),
     };
-    if let Err(_e) = ctx.ensure_class_initialized(&class_name) {
+    if let Err(_e) = ctx.ensure_class_initialized_with_class_id(class_id) {
         // Fall through вЂ” we can still try to read $VALUES if it was
         // populated before the failure (common after silent-swallow).
     }

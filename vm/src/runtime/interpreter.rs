@@ -12171,7 +12171,16 @@ fn execute_instruction(
                         )
                     }
                 })?;
-            let field = resolve_field_ref(shared, current_class_id, *index)?;
+            let mut field = resolve_field_ref(shared, current_class_id, *index)?;
+            if let Some(retargeted) = retarget_instance_field_to_receiver(
+                shared,
+                current_class_id,
+                *index,
+                shared.heap.class_id_of(obj_ref),
+                &field,
+            ) {
+                field = retargeted;
+            }
             // Perf: ALL of the per-getfield diagnostic blocks below are gated
             // behind a SINGLE cached "any field diagnostic enabled" branch, so
             // the common no-diagnostics case (the overwhelmingly hot path) does
@@ -12415,7 +12424,7 @@ fn execute_instruction(
             // for the tag-exact value pop below. resolve_field_ref is
             // stack-neutral, and surfacing a resolution error here (before the
             // value/objectref pop) is spec-compliant for putfield.
-            let field = resolve_field_ref(shared, current_class_id, *index)?;
+            let mut field = resolve_field_ref(shared, current_class_id, *index)?;
             // K2 (T10.9.E) — tag-exact pop for category-2 primitives.
             //
             // The stack top before putfield is [..., objectref, value] (with
@@ -12566,6 +12575,15 @@ fn execute_instruction(
                 }
             }
             let obj_ref = obj_ref?;
+            if let Some(retargeted) = retarget_instance_field_to_receiver(
+                shared,
+                current_class_id,
+                *index,
+                shared.heap.class_id_of(obj_ref),
+                &field,
+            ) {
+                field = retargeted;
+            }
             // Perf: ALL of the per-putfield diagnostic blocks below are gated
             // behind a SINGLE cached "any field diagnostic enabled" branch, so
             // the common no-diagnostics case (the overwhelmingly hot path) does
@@ -13394,6 +13412,12 @@ fn execute_instruction(
                             .class_manager
                             .read()
                             .is_subclass_of(obj_class_id, target_class_id)
+                            || loader_aware_name_assignable(
+                                shared,
+                                obj_class_id,
+                                target_class_id,
+                                &target_class_name,
+                            )
                             || lambda_proxy_satisfies(shared, obj_class_id, target_class_id)
                             || synthetic_implements(shared, obj_class_id, &target_class_name)
                             || proxy_instance_satisfies_target(shared, obj_ref, &target_class_name)
@@ -13557,6 +13581,12 @@ fn execute_instruction(
                             .class_manager
                             .read()
                             .is_subclass_of(obj_class_id, target_class_id)
+                            || loader_aware_name_assignable(
+                                shared,
+                                obj_class_id,
+                                target_class_id,
+                                &target_class_name,
+                            )
                             || lambda_proxy_satisfies(shared, obj_class_id, target_class_id)
                             || synthetic_implements(shared, obj_class_id, &target_class_name)
                             || proxy_instance_satisfies_target(shared, obj_ref, &target_class_name)
@@ -14035,6 +14065,61 @@ fn lambda_proxy_satisfies(
     false
 }
 
+fn loader_aware_name_assignable(
+    shared: &SharedVm,
+    obj_class_id: ClassId,
+    target_class_id: ClassId,
+    target_class_name: &str,
+) -> bool {
+    if !crate::runtime::env_cache::loader_aware_resolution()
+        || is_global_resolution_namespace(target_class_name)
+    {
+        return false;
+    }
+
+    let cm = shared.class_manager.read();
+    let Some(obj_class) = cm.get_class(obj_class_id) else {
+        return false;
+    };
+    let Some(target_class) = cm.get_class(target_class_id) else {
+        return false;
+    };
+
+    if &*obj_class.name == target_class_name && &*target_class.name == target_class_name {
+        return true;
+    }
+    if !target_class.is_interface() {
+        return false;
+    }
+
+    let mut queue: Vec<ClassId> = Vec::new();
+    let mut current = Some(obj_class_id);
+    while let Some(cid) = current {
+        let Some(class) = cm.class_store.get(cid) else {
+            break;
+        };
+        queue.extend_from_slice(&class.interfaces);
+        current = class.superclass;
+    }
+
+    let mut seen: Vec<ClassId> = Vec::new();
+    while let Some(iface_id) = queue.pop() {
+        if seen.contains(&iface_id) {
+            continue;
+        }
+        seen.push(iface_id);
+        let Some(iface) = cm.class_store.get(iface_id) else {
+            continue;
+        };
+        if &*iface.name == target_class_name {
+            return true;
+        }
+        queue.extend_from_slice(&iface.interfaces);
+    }
+
+    false
+}
+
 // ---------------------------------------------------------------------------
 // Helper: array type compatibility for checkcast/instanceof
 // ---------------------------------------------------------------------------
@@ -14265,15 +14350,25 @@ pub(crate) fn aastore_element_assignable(
     if value_class_id == ClassId::new(0) {
         return true;
     }
-    let comp_id = match shared.class_manager.read().find_class_by_name(comp_name) {
-        Some(id) => id,
-        // Component class not loaded yet — load it; failure to load means we
-        // cannot prove incompatibility, so allow the store.
-        None => match shared.class_manager.write().load_class(comp_name) {
-            Ok(id) => id,
-            Err(_) => return true,
-        },
-    };
+    let array_component_class_id = shared.heap.class_id_of(array_ref);
+    let comp_id = {
+        let cm = shared.class_manager.read();
+        if array_component_class_id != ClassId::new(0) {
+            cm.get_class(array_component_class_id)
+                .filter(|c| &*c.name == comp_name)
+                .map(|_| array_component_class_id)
+        } else {
+            None
+        }
+    }
+    .or_else(|| shared.class_manager.read().find_class_by_name(comp_name))
+    .unwrap_or_else(|| match shared.class_manager.write().load_class(comp_name) {
+        Ok(id) => id,
+        Err(_) => ClassId::new(0),
+    });
+    if comp_id == ClassId::new(0) {
+        return true;
+    }
     // The element class must exist in the hierarchy; if not, fail open.
     {
         let cm = shared.class_manager.read();
@@ -15451,6 +15546,63 @@ fn resolve_field_ref(
     Ok(resolved)
 }
 
+fn retarget_instance_field_to_receiver(
+    shared: &SharedVm,
+    current_class_id: ClassId,
+    cp_index: u16,
+    receiver_class_id: ClassId,
+    field: &ResolvedField,
+) -> Option<ResolvedField> {
+    if field.is_static
+        || receiver_class_id == ClassId::new(0)
+        || receiver_class_id == field.declaring_class_id
+        || !should_use_loader_initiated_resolution(shared, current_class_id)
+    {
+        return None;
+    }
+
+    let cm = shared.class_manager.read();
+    let current_class = cm.get_class(current_class_id)?;
+    let name_and_type_index = match current_class.constant_pool.get(cp_index)? {
+        ConstantPoolEntry::FieldReference {
+            name_and_type_index,
+            ..
+        } => *name_and_type_index,
+        _ => return None,
+    };
+    let (field_name, descriptor) = current_class.constant_pool.get_name_and_type(name_and_type_index)?;
+    let resolved_decl = cm.get_class(field.declaring_class_id)?;
+    let receiver_class = cm.get_class(receiver_class_id)?;
+    if &*receiver_class.name != &*resolved_decl.name {
+        return None;
+    }
+
+    let mut cursor = Some(receiver_class_id);
+    while let Some(cid) = cursor {
+        let class = cm.class_store.get(cid)?;
+        let mut instance_idx = 0usize;
+        for f in &class.fields {
+            if f.is_static() {
+                continue;
+            }
+            if &*f.name == field_name && &*f.descriptor == descriptor {
+                return Some(ResolvedField {
+                    declaring_class_id: cid,
+                    field_index: class.first_field_index + instance_idx,
+                    is_static: false,
+                    is_volatile: f.is_volatile(),
+                    is_reference: f.descriptor.starts_with('L') || f.descriptor.starts_with('['),
+                    desc_byte: f.descriptor.as_bytes().first().copied().unwrap_or(0),
+                });
+            }
+            instance_idx += 1;
+        }
+        cursor = class.superclass;
+    }
+
+    None
+}
+
 /// Extract the declaring class name from a constant pool FieldReference.
 ///
 /// Used at the getstatic/putstatic opcode boundary to build a
@@ -16126,9 +16278,11 @@ fn execute_invoke_kind(
     // hierarchy. The slot is also left unset when the resolved class isn't
     // an interface so a malformed CP entry can't poison nested dispatch.
     let cp_resolved_class_id: Option<ClassId> = if is_interface {
-        let cm = shared.class_manager.read();
-        cm.get_loaded_class_id(&method_class_name)
-            .and_then(|cid| cm.get_class(cid).filter(|c| c.is_interface()).map(|_| cid))
+        let loaded = shared.class_manager.write().load_class(&method_class_name).ok();
+        loaded.and_then(|cid| {
+            let cm = shared.class_manager.read();
+            cm.get_class(cid).filter(|c| c.is_interface()).map(|_| cid)
+        })
     } else {
         None
     };
@@ -17195,24 +17349,50 @@ fn execute_invoke_kind(
             })
         } else if is_special && crate::runtime::env_cache::loader_aware_resolution() {
             // invokespecial owner is the CP-resolved class NAME (`method_class_name`),
-            // which `get_loaded_class_id` collapses to ONE copy per name — the
-            // un-enhanced global one. A `super.<method>()` / `super.<init>()` /
-            // private call from inside a per-loader ENHANCED class must reach the
-            // SAME loader's copy of the owner: e.g. enhanced
-            // `Employee.$$_hibernate_read_oca` calls `super.$$_hibernate_read_oca()`
-            // on the enhanced (mapped-superclass) `Person`, whose accessor exists
-            // ONLY on that loader's copy — name resolution picks the un-enhanced
-            // `Person` (no such method → hard NoSuchMethodError → process abort).
-            // Resolve the owner through the CALLER's loader (JVMS §5.4.3 initiating
-            // loader) and override dispatch when it diverges from the name-resolved
-            // copy. Gated + divergence-only → byte-identical gate-off / single-copy.
-            lookup_loader_initiated(shared, current_class_id, &invoke_class).filter(|owner_cid| {
-                *owner_cid != ClassId::new(0)
-                    && shared
-                        .class_manager
-                        .read()
-                        .get_loaded_class_id(&invoke_class)
-                        != Some(*owner_cid)
+            // which `get_loaded_class_id` collapses to ONE copy per name. Super and
+            // private calls from inside a loader-private enhanced class must reach
+            // that same loader's owner copy. For self-constructors, the receiver is
+            // more precise than the caller: a global harness class can execute
+            // `new C; invokespecial C.<init>` where `new` correctly allocated a
+            // loader-private enhanced C. Running the global C constructor against
+            // that receiver writes the wrong layout slots and leaves enhanced fields
+            // null.
+            let receiver_self_ctor = if &*method_name == "<init>" {
+                match args.first() {
+                    Some(Value::Object(Some(recv))) => {
+                        let recv_cid = shared.heap.class_id_of(*recv);
+                        if recv_cid != ClassId::new(0) {
+                            let cm = shared.class_manager.read();
+                            let recv_matches_owner = cm
+                                .get_class(recv_cid)
+                                .map(|c| {
+                                    &*c.name == &*invoke_class
+                                        && c.find_method(&method_name, &method_descriptor).is_some()
+                                })
+                                .unwrap_or(false);
+                            if recv_matches_owner {
+                                Some(recv_cid)
+                            } else {
+                                None
+                            }
+                        } else {
+                            None
+                        }
+                    }
+                    _ => None,
+                }
+            } else {
+                None
+            };
+            receiver_self_ctor.or_else(|| {
+                lookup_loader_initiated(shared, current_class_id, &invoke_class).filter(|owner_cid| {
+                    *owner_cid != ClassId::new(0)
+                        && shared
+                            .class_manager
+                            .read()
+                            .get_loaded_class_id(&invoke_class)
+                            != Some(*owner_cid)
+                })
             })
         } else {
             None
