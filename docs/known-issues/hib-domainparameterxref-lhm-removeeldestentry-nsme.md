@@ -2,17 +2,35 @@
 
 | | |
 |---|---|
-| **Status** | 🔴 OPEN, but **UNVERIFIED as of 2026-07-07** — see the "2026-07-07 update" note below. Root cause traced to the receiver's `ClassId` reading `0`, which matches this codebase's already-documented, unresolved "Layer 1 register-invisible roots" gap. Not independently fixable here; see analysis below. |
+| **Status** | 🔴 OPEN, re-confirmed 2026-07-08 after the `InPredicateTest` dispatch-heavy timeout stopped masking this later phase. Root cause traced to the receiver's `ClassId` reading `0`, which matches this codebase's already-documented, unresolved "Layer 1 register-invisible roots" gap. Not independently fixable here; see analysis below. |
 | **Area** | VM — JIT/GC precise-root-tracking ("Layer 1"), surfacing here via the native `LinkedHashMap` shim's `removeEldestEntry` guard (`native-collections/src/lib.rs`) |
 | **Symptom** | `java.lang.NoSuchMethodError: java/lang/Object.removeEldestEntry(Ljava/util/Map$Entry;)Z` |
 | **Severity** | blocks `org.hibernate.orm.test.jpa.criteria.InPredicateTest` (and likely any other criteria/HQL-parameter test that constructs `DomainParameterXref`) from completing, once the earlier `values`-null NPE is fixed — see [`docs/internal/hib-inpredicatetest-criteria-values-null-npe-FIXED.md`](../internal/hib-inpredicatetest-criteria-values-null-npe-FIXED.md). |
 | **Discovered** | 2026-07-06. Root cause traced same day. |
 
+## 2026-07-08 update — symptom re-confirmed after timeout retirement
+
+Fresh Azure rerun from a separate worktree/branch rooted at current `dev`
+(`codex/fix-hib-inpredicate-tierup-20260708-121221`, unique binary
+`/data/data/cratonvm-probe-bins/cvinpredtierup-20260708-121221-baseline`) no
+longer times out in `SqmCriteriaNodeBuilder.in()`. It reaches
+`DomainParameterXref` and fails with this doc's original symptom:
+
+```text
+@@FAIL org.hibernate.orm.test.jpa.criteria.InPredicateTest :: java.lang.NoSuchMethodError: java/lang/Object.removeEldestEntry(Ljava/util/Map$Entry;)Z
+@@RESULT 0 org.hibernate.orm.test.jpa.criteria.InPredicateTest found=1 started=1 ok=0 failed=1 aborted=0 skipped=0 ms=30985
+```
+
+The timeout note is therefore retired to
+[`docs/internal/fixed-suite-bugs/hib-inpredicate-dispatch-heavy-jit-timeout-20260707-FIXED.md`](../internal/fixed-suite-bugs/hib-inpredicate-dispatch-heavy-jit-timeout-20260707-FIXED.md),
+but this Layer-1 `removeEldestEntry` issue remains the current blocker for
+`InPredicateTest`.
+
 ## 2026-07-07 update — symptom no longer observed, but likely masked, not fixed
 
 `InPredicateTest` no longer throws this NSME as of `dev@fa1c505f` — it now times
 out earlier in the same test method instead (`TimeoutException` @ 120s), see
-[hib-inpredicate-dispatch-heavy-jit-timeout-20260707.md](hib-inpredicate-dispatch-heavy-jit-timeout-20260707.md).
+[`docs/internal/fixed-suite-bugs/hib-inpredicate-dispatch-heavy-jit-timeout-20260707-FIXED.md`](../internal/fixed-suite-bugs/hib-inpredicate-dispatch-heavy-jit-timeout-20260707-FIXED.md).
 Stack-dump sampling of a clean, uncontended repro shows the test consistently
 timing out inside `SqmCriteriaNodeBuilder.in()` (criteria-predicate
 construction), which runs **before** `session.createQuery(cr)` — the call that
