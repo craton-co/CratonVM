@@ -371,25 +371,34 @@ fn ds_set<F: FnOnce(&mut DsSide)>(this: ObjectRef, f: F) {
 // instance -> owner Socket. The real-JDK inner classes have their own
 // fields (`parent`, `in`/`out`); we cannot use raw slot indices safely.
 //
-// GC note (gc-followups-20260706): KNOWN-UNSOUND across GCs — both the
-// stream KEY and the owner-Socket VALUE are raw addresses that are neither
-// rooted nor remapped. After a moving GC the relocated stream's lookup
-// misses (I/O on that stream then fails to find its owner) and a hit on an
-// unmoved key can return a stale owner address. Tolerable only while the
-// create→I/O window contains no moving GC. Follow-up: key by
-// `ctx.identity_hash_code(stream)` and store the owner as a
-// `(identity_key, ObjectRef)` var-handle-root pair (ASYNC_POOL pattern) —
-// or fold this table into the re10-handler gc_scan/gc_update hook pair
-// that already exists in this file.
-fn stream_owner_table() -> &'static Mutex<HashMap<ObjectRef, ObjectRef>> {
-    static T: OnceLock<Mutex<HashMap<ObjectRef, ObjectRef>>> = OnceLock::new();
+// GC-safety fix: both `stream` and `owner` are raw `ObjectRef`s that a moving
+// GC can relocate at any point between `getInputStream()`/`getOutputStream()`
+// (which populate this table) and a much-later `read`/`write` call (which
+// looks it up) — `is`/`os` are freshly-allocated, short-lived objects, prime
+// young-gen relocation candidates. Keying by the raw `stream` pointer went
+// stale the moment `is`/`os` moved (lookup miss -> spurious "has no owner"),
+// and returning the raw `owner` pointer went stale the moment the Socket
+// moved (a dispatch against the relocated, now-reclaimed address -> "Stale
+// pointer detected ... falling back to CP class java/net/Socket"). Both
+// reproduced via org.apache.catalina.realm.TestJNDIRealmIntegration once the
+// GC-barrier accept-loop fix let the test run long enough to trigger a GC
+// mid-stream. Fix: key by `identity_hash_code` (GC-stable) and hold the value
+// as a global GC root (remapped by the collector on every move), resolved
+// fresh at each read — the same pattern `register_var_handle_root`/
+// `read_var_handle_root` use for the identical hazard on VarHandle statics.
+fn stream_owner_table() -> &'static Mutex<HashMap<i32, usize>> {
+    static T: OnceLock<Mutex<HashMap<i32, usize>>> = OnceLock::new();
     T.get_or_init(|| Mutex::new(HashMap::new()))
 }
-fn stream_owner_set(stream: ObjectRef, owner: ObjectRef) {
-    stream_owner_table().lock().insert(stream, owner);
+fn stream_owner_set(ctx: &mut dyn NativeContext, stream: ObjectRef, owner: ObjectRef) {
+    let key = ctx.identity_hash_code(stream);
+    let handle = ctx.add_global_root(owner);
+    stream_owner_table().lock().insert(key, handle);
 }
-fn stream_owner_get(stream: ObjectRef) -> Option<ObjectRef> {
-    stream_owner_table().lock().get(&stream).copied()
+fn stream_owner_get(ctx: &mut dyn NativeContext, stream: ObjectRef) -> Option<ObjectRef> {
+    let key = ctx.identity_hash_code(stream);
+    let handle = *stream_owner_table().lock().get(&key)?;
+    ctx.resolve_global_root(handle)
 }
 
 // InetAddress side-table — same rationale as the Socket / ServerSocket
@@ -3033,7 +3042,7 @@ fn register_re1_socket(r: &mut NativeMethodRegistry) {
             // Side-table the stream's owner+sid so we don't depend on field
             // layout (real `Socket$SocketInputStream` has different fields
             // than the synthetic shape: `parent:Socket`, `in:InputStream`).
-            stream_owner_set(is, this);
+            stream_owner_set(ctx, is, this);
             Ok(Some(Value::Object(Some(is))))
         },
     );
@@ -3048,7 +3057,7 @@ fn register_re1_socket(r: &mut NativeMethodRegistry) {
                 return Err(ioex("Socket.getOutputStream: not connected"));
             }
             let os = alloc_concurrent_synthetic(ctx, "java/net/Socket$SocketOutputStream", 3);
-            stream_owner_set(os, this);
+            stream_owner_set(ctx, os, this);
             Ok(Some(Value::Object(Some(os))))
         },
     );
@@ -3056,7 +3065,8 @@ fn register_re1_socket(r: &mut NativeMethodRegistry) {
     let sis = "java/net/Socket$SocketInputStream";
     r.register(sis, "read", "([BII)I", |ctx, args| {
         let this = obj_arg(args, 0)?;
-        let owner = stream_owner_get(this).ok_or_else(|| ioex("SocketInputStream has no owner"))?;
+        let owner =
+            stream_owner_get(ctx, this).ok_or_else(|| ioex("SocketInputStream has no owner"))?;
         let buf = obj_arg(args, 1)?;
         let off = args.get(2).and_then(|v| v.as_int()).unwrap_or(0);
         let len = args.get(3).and_then(|v| v.as_int()).unwrap_or(0);
@@ -3072,14 +3082,16 @@ fn register_re1_socket(r: &mut NativeMethodRegistry) {
     // server-side request read (okhttp MockWebServer, loopback HTTP). BUG-04.
     r.register(sis, "read", "([B)I", |ctx, args| {
         let this = obj_arg(args, 0)?;
-        let owner = stream_owner_get(this).ok_or_else(|| ioex("SocketInputStream has no owner"))?;
+        let owner =
+            stream_owner_get(ctx, this).ok_or_else(|| ioex("SocketInputStream has no owner"))?;
         let buf = obj_arg(args, 1)?;
         let len = ctx.array_length(buf) as i32;
         re1_socket_read_stream(ctx, owner, buf, 0, len)
     });
     r.register(sis, "read", "()I", |ctx, args| {
         let this = obj_arg(args, 0)?;
-        let owner = stream_owner_get(this).ok_or_else(|| ioex("SocketInputStream has no owner"))?;
+        let owner =
+            stream_owner_get(ctx, this).ok_or_else(|| ioex("SocketInputStream has no owner"))?;
         let one = ctx.new_array(ArrayElementType::Byte, 1);
         let r = re1_socket_read_stream(ctx, owner, one, 0, 1)?;
         match r {
@@ -3103,7 +3115,7 @@ fn register_re1_socket(r: &mut NativeMethodRegistry) {
     r.register(sos, "write", "([BII)V", |ctx, args| {
         let this = obj_arg(args, 0)?;
         let owner =
-            stream_owner_get(this).ok_or_else(|| ioex("SocketOutputStream has no owner"))?;
+            stream_owner_get(ctx, this).ok_or_else(|| ioex("SocketOutputStream has no owner"))?;
         let buf = obj_arg(args, 1)?;
         let off = args.get(2).and_then(|v| v.as_int()).unwrap_or(0);
         let len = args.get(3).and_then(|v| v.as_int()).unwrap_or(0);
@@ -3112,15 +3124,15 @@ fn register_re1_socket(r: &mut NativeMethodRegistry) {
     r.register(sos, "write", "(I)V", |ctx, args| {
         let this = obj_arg(args, 0)?;
         let owner =
-            stream_owner_get(this).ok_or_else(|| ioex("SocketOutputStream has no owner"))?;
+            stream_owner_get(ctx, this).ok_or_else(|| ioex("SocketOutputStream has no owner"))?;
         let b = args.get(1).and_then(|v| v.as_int()).unwrap_or(0) & 0xff;
         let one = ctx.new_array(ArrayElementType::Byte, 1);
         ctx.set_array_element(one, 0, Value::Int(b as i8 as i32));
         re1_socket_write_stream(ctx, owner, one, 0, 1)
     });
-    r.register(sos, "flush", "()V", |_ctx, args| {
+    r.register(sos, "flush", "()V", |ctx, args| {
         let this = obj_arg(args, 0)?;
-        if let Some(owner) = stream_owner_get(this) {
+        if let Some(owner) = stream_owner_get(ctx, this) {
             let sid = sock_get(owner).stream_id;
             if sid >= 0 {
                 let mut reg = s2_registry().lock();
@@ -3143,7 +3155,7 @@ fn register_re1_socket(r: &mut NativeMethodRegistry) {
 fn re2_accept_into(
     ctx: &mut dyn NativeContext,
     listener_id: i32,
-    target: ObjectRef,
+    mut target: ObjectRef,
     timeout_ms: i32,
 ) -> MethodCallResult {
     if listener_id < 0 {
@@ -3200,7 +3212,31 @@ fn re2_accept_into(
                 break AcceptOutcome::TimedOut;
             }
         }
+        // GC-barrier safepoint gap: unlike every other blocking-native call in
+        // this codebase (`Thread.sleep`, socket read/write), this poll-sleep
+        // ran unmarked. A no-timeout `ServerSocket.accept()` (timeout_ms <= 0,
+        // `deadline` is `None`) loops here indefinitely once no new
+        // connections are pending, staying counted in the GC barrier's
+        // `expected` set forever — it never reaches an interpreter safepoint
+        // (it's native Rust code, not JIT either, so the cross-thread JIT
+        // takeover can't rescue it), so any STW GC/JIT-takeover initiated
+        // while this thread has no pending connection deadlocks permanently
+        // (`stw-census` showed `pending=1 taken=0` unable to move). Mark each
+        // poll-sleep slice as a blocked region, exactly like `Thread.sleep`'s
+        // pump loop.
+        //
+        // `target` is a raw `ObjectRef` local held across the whole loop (it
+        // is written to after a connection is accepted) — use the `_refs`
+        // end-region variant so a moving GC that runs while we're blocked
+        // rewrites it, same as `re1_socket_read_stream`'s `buf`.
+        let mut blocked_refs = [Value::Object(Some(target))];
+        ctx.begin_blocking_region();
         std::thread::sleep(Duration::from_millis(10));
+        ctx.end_blocking_region_refs(&mut blocked_refs);
+        target = match blocked_refs[0] {
+            Value::Object(Some(o)) => o,
+            _ => target,
+        };
     };
 
     // Restore blocking mode on the shared listener if it survived, so later
