@@ -4,10 +4,10 @@ This folder collects CratonVM-only defects found while running upstream Java
 suites. The docs had grown to describe the **same underlying bug from several
 angles**; this index is the consolidated map. Read it first.
 
-## 2026-07-08 Hibernate bytecode-enhancement loader/lazytoone family retired; residual basic/merge/version bugs split out
+## 2026-07-08 Hibernate bytecode-enhancement loader/lazytoone and residual basic/merge/version bugs retired
 
 - FIXED/RETIRED: [`hib-bytecode-enhancement-loader-faithful-linking-FIXED.md`](../internal/fixed-suite-bugs/hib-bytecode-enhancement-loader-faithful-linking-FIXED.md) - the remaining loader-faithful lazy/lazytoone failures are closed: 18/18 representative sample and 69/69 lazy/lazytoone subset pass, and the graph same-name checkcast residual now passes.
-- OPEN: [`hib-bytecode-enhancement-basic-merge-version-residuals.md`](hib-bytecode-enhancement-basic-merge-version-residuals.md) - separate non-lazy residuals left in basic dirty tracking, final-field embedded id, composite merge/null, and versioned entity type checks.
+- FIXED/RETIRED: [`hib-bytecode-enhancement-basic-merge-version-residuals-FIXED.md`](../internal/fixed-suite-bugs/hib-bytecode-enhancement-basic-merge-version-residuals-FIXED.md) - the six non-lazy basic dirty tracking, final-field embedded-id, composite merge/null, and versioned-entity residuals now pass.
 
 ## 2026-07-08 `InPredicateTest` LHM NSME and stale timeout notes retired
 
