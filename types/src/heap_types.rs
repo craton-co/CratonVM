@@ -268,6 +268,32 @@ pub enum ArrayElementType {
     Reference = 0,
 }
 
+#[inline]
+pub fn object_kind_from_tag(tag: u8) -> Option<ObjectKind> {
+    match tag {
+        tag if tag == ObjectKind::Object as u8 => Some(ObjectKind::Object),
+        tag if tag == ObjectKind::Array as u8 => Some(ObjectKind::Array),
+        tag if tag == ObjectKind::HumongousFiller as u8 => Some(ObjectKind::HumongousFiller),
+        _ => None,
+    }
+}
+
+#[inline]
+pub fn array_element_type_from_tag(tag: u8) -> Option<ArrayElementType> {
+    match tag {
+        tag if tag == ArrayElementType::Reference as u8 => Some(ArrayElementType::Reference),
+        tag if tag == ArrayElementType::Boolean as u8 => Some(ArrayElementType::Boolean),
+        tag if tag == ArrayElementType::Char as u8 => Some(ArrayElementType::Char),
+        tag if tag == ArrayElementType::Float as u8 => Some(ArrayElementType::Float),
+        tag if tag == ArrayElementType::Double as u8 => Some(ArrayElementType::Double),
+        tag if tag == ArrayElementType::Byte as u8 => Some(ArrayElementType::Byte),
+        tag if tag == ArrayElementType::Short as u8 => Some(ArrayElementType::Short),
+        tag if tag == ArrayElementType::Int as u8 => Some(ArrayElementType::Int),
+        tag if tag == ArrayElementType::Long as u8 => Some(ArrayElementType::Long),
+        _ => None,
+    }
+}
+
 /// The header stored at the beginning of every heap-allocated object/array.
 ///
 /// Layout (40 bytes total, 8-byte aligned):
@@ -314,6 +340,22 @@ pub struct ObjectHeader {
     /// Initialized to `MARK_NEUTRAL` by `ObjectHeader::new`.
     pub mark_word: AtomicU64,
 }
+
+/// Byte offset of the `kind` field within `ObjectHeader`.
+pub const OBJECT_KIND_OFFSET: usize = 4;
+
+/// Byte offset of the `element_type` field within `ObjectHeader`.
+pub const ARRAY_ELEMENT_TYPE_OFFSET: usize = 5;
+
+const _: () = assert!(
+    std::mem::offset_of!(ObjectHeader, kind) == OBJECT_KIND_OFFSET,
+    "OBJECT_KIND_OFFSET must match ObjectHeader layout"
+);
+
+const _: () = assert!(
+    std::mem::offset_of!(ObjectHeader, element_type) == ARRAY_ELEMENT_TYPE_OFFSET,
+    "ARRAY_ELEMENT_TYPE_OFFSET must match ObjectHeader layout"
+);
 
 /// GC flag: object resides in the old generation.
 pub const GC_FLAG_OLD_GEN: u8 = 0x01;

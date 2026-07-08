@@ -29,7 +29,9 @@ use crate::collector::{GarbageCollector, MonitorCleanup};
 use crate::concurrent_mark::{ConcurrentGcPhase, ConcurrentGcState};
 use crate::gc::{GcResult, GcStats};
 use crate::heap::{
-    array_data_size, ArrayElementType, ObjectHeader, ObjectKind, HEADER_SIZE, SLOT_SIZE,
+    array_data_size, array_element_type_from_tag, object_kind_from_tag, ArrayElementType,
+    ObjectHeader, ObjectKind, ARRAY_ELEMENT_TYPE_OFFSET, HEADER_SIZE, OBJECT_KIND_OFFSET,
+    SLOT_SIZE,
 };
 use crate::mark_bitmap::MarkBitmap;
 use crate::region::{RegionType, RememberedSet};
@@ -5813,23 +5815,27 @@ impl G1Collector {
             return None;
         }
         let raw = addr as *const u8;
-        // SAFETY: address is inside a live region, so reading HEADER_SIZE
-        // bytes from it is well-defined.
-        let header = unsafe { &*(raw as *const ObjectHeader) };
-        match header.kind {
-            ObjectKind::Object | ObjectKind::Array => {}
-            // Round-9 gc CRIT-1: humongous-continuation filler is a
-            // walker sentinel, not a heap object. Reject so root scans
-            // can't accidentally "validate" the address of a filler.
-            ObjectKind::HumongousFiller => return None,
+        // Validate raw enum tags before borrowing as `ObjectHeader`; this path
+        // is fed by conservative JIT-frame words and must reject garbage
+        // without letting invalid `#[repr(u8)]` values reach a debug enum
+        // match.
+        let kind = unsafe { object_kind_from_tag(*raw.add(OBJECT_KIND_OFFSET)) }?;
+        let _element_type =
+            unsafe { array_element_type_from_tag(*raw.add(ARRAY_ELEMENT_TYPE_OFFSET)) }?;
+        if kind == ObjectKind::HumongousFiller {
+            return None;
         }
+
+        // SAFETY: address is inside a live region and both enum tag bytes have
+        // been validated.
+        let header = unsafe { &*(raw as *const ObjectHeader) };
         // Multi-array reloc fix (2026-05-22): `alloc_array` mirrors the
         // array length into `num_slots`, so a legitimate 256 MB int[] has
         // num_slots = 2^26 > 1<<24 and would be falsely rejected here.
         // Gate num_slots only for non-arrays, and bound array_length at
         // the JVM `Integer.MAX_VALUE` ceiling (matches `array_length()`).
         const MAX_PLAUSIBLE_SLOTS: u32 = 1 << 24;
-        let is_array = matches!(header.kind, ObjectKind::Array);
+        let is_array = kind == ObjectKind::Array;
         if !is_array && header.num_slots > MAX_PLAUSIBLE_SLOTS {
             return None;
         }
@@ -6774,6 +6780,32 @@ mod tests {
             }
         }
         unreachable!("buffer base cannot be aligned to every offset")
+    }
+
+    unsafe fn corrupt_header_byte(obj: ObjectRef, offset: usize, value: u8) {
+        unsafe {
+            (obj.as_ptr() as *mut u8).add(offset).write(value);
+        }
+    }
+
+    #[test]
+    fn is_object_address_rejects_invalid_raw_header_tags() {
+        let gc = make_collector();
+        let invalid_kind = gc.alloc_object(ClassId::new(1), 0);
+        unsafe {
+            corrupt_header_byte(invalid_kind, OBJECT_KIND_OFFSET, 0x7f);
+        }
+        assert!(gc
+            .is_object_address(invalid_kind.as_ptr() as usize)
+            .is_none());
+
+        let invalid_element = gc.alloc_array(ClassId::new(2), ArrayElementType::Int, 1);
+        unsafe {
+            corrupt_header_byte(invalid_element, ARRAY_ELEMENT_TYPE_OFFSET, 0x7f);
+        }
+        assert!(gc
+            .is_object_address(invalid_element.as_ptr() as usize)
+            .is_none());
     }
 
     #[test]

@@ -28,12 +28,13 @@ pub use field_layout::{
 };
 pub use float_format::{java_double_to_string, java_float_to_string};
 pub use heap_types::{
-    array_data_size, array_data_size_checked, element_byte_size, ArrayElementType, ObjectHeader,
-    ObjectKind, ARRAY_LENGTH_OFFSET, AUTOBOX_CLASS_ID, FIELD_CELL_PAYLOAD32_OFFSET,
+    array_data_size, array_data_size_checked, array_element_type_from_tag, element_byte_size,
+    object_kind_from_tag, ArrayElementType, ObjectHeader, ObjectKind, ARRAY_ELEMENT_TYPE_OFFSET,
+    ARRAY_LENGTH_OFFSET, AUTOBOX_CLASS_ID, FIELD_CELL_PAYLOAD32_OFFSET,
     FIELD_CELL_PAYLOAD64_OFFSET, FIELD_CELL_TAG_OFFSET, GC_FLAG_COMPACT, GC_FLAG_MARKED,
     GC_FLAG_OLD_GEN, HEADER_SIZE, INFLATED_PTR_MASK, MARK_INFLATED, MARK_NEUTRAL, MARK_STATE_MASK,
-    MARK_THIN_LOCKED, MARK_WORD_OFFSET, REF_ELEMENT_SIZE, REF_FIELD_SIZE, SLOT_SIZE,
-    THIN_LOCK_OWNER_MASK, THIN_LOCK_OWNER_SHIFT, THIN_LOCK_RECURSION_MASK,
+    MARK_THIN_LOCKED, MARK_WORD_OFFSET, OBJECT_KIND_OFFSET, REF_ELEMENT_SIZE, REF_FIELD_SIZE,
+    SLOT_SIZE, THIN_LOCK_OWNER_MASK, THIN_LOCK_OWNER_SHIFT, THIN_LOCK_RECURSION_MASK,
     THIN_LOCK_RECURSION_SHIFT,
 };
 pub use intern::{intern, intern_arc, StringPool};
@@ -97,6 +98,8 @@ mod tests {
         assert_eq!(SLOT_SIZE, 16);
         assert_eq!(REF_ELEMENT_SIZE, 8);
         assert!(ARRAY_LENGTH_OFFSET > 0);
+        assert_eq!(OBJECT_KIND_OFFSET, 4);
+        assert_eq!(ARRAY_ELEMENT_TYPE_OFFSET, 5);
         assert_eq!(AUTOBOX_CLASS_ID.as_u32(), u32::MAX);
     }
 
@@ -109,6 +112,10 @@ mod tests {
         assert_eq!(element_byte_size(ArrayElementType::Int), 4);
         assert_eq!(array_data_size(10, ArrayElementType::Int).unwrap(), 40);
         assert_eq!(array_data_size_checked(10, ArrayElementType::Int), Some(40));
+        assert_eq!(object_kind_from_tag(1), Some(ObjectKind::Array));
+        assert_eq!(object_kind_from_tag(0x7f), None);
+        assert_eq!(array_element_type_from_tag(10), Some(ArrayElementType::Int));
+        assert_eq!(array_element_type_from_tag(0x7f), None);
     }
 
     #[test]
