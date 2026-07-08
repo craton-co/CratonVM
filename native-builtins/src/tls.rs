@@ -997,13 +997,12 @@ fn register_trust_manager_factory(r: &mut NativeMethodRegistry) {
             // a keystore id (or vice versa) whenever this path is live.
             let state = crate::x509_manager::build_trust_manager_state(ks_id);
             let tm_id = crate::x509_manager::register_trust_manager_state(state);
-            // Allocate a 1-field X509TrustManager and stamp the unified id so
-            // its validation picks up those anchors. Both the named field
-            // (preferred by read_trust_manager_id_from_obj) and slot 0 (its
-            // fallback) carry the id.
-            let tm = alloc_concurrent_synthetic(ctx, "javax/net/ssl/X509TrustManager", 1);
-            ctx.set_field_by_name(tm, "cratonvm$x509tm$id", Value::Int(tm_id));
-            ctx.set_field(tm, 0, Value::Int(tm_id));
+            // Allocate the same real-impl-shaped mirror used by the WP5.3
+            // TrustManagerFactory SPI path. Returning the bare interface here
+            // lets invokevirtual resolve to abstract interface slots such as
+            // getAcceptedIssuers(), which have no Code attribute.
+            let tm = alloc_concurrent_synthetic(ctx, crate::x509_manager::FQN_X509_TM, 2);
+            crate::x509_manager::set_tm_id(ctx, tm, tm_id);
             let arr = ctx.new_ref_array(ClassId::new(0), 1);
             ctx.set_array_element(arr, 0, Value::Object(Some(tm)));
             Ok(Some(Value::Object(Some(arr))))
@@ -2783,6 +2782,14 @@ mod tls_tests {
             Value::Object(Some(t)) => t,
             other => panic!("trust manager element should be an object, got {other:?}"),
         };
+        let tm_class = ctx
+            .class_name_of_id(ctx.class_id_of_object(tm))
+            .unwrap_or_default();
+        assert_eq!(
+            tm_class,
+            crate::x509_manager::FQN_X509_TM,
+            "TrustManagerFactory must return a concrete X509TrustManagerImpl mirror, not the abstract javax.net.ssl.X509TrustManager interface"
+        );
         let tm_id = match ctx.get_field(tm, 0) {
             Value::Int(i) => i,
             other => panic!("trust manager id (slot 0) should be an Int, got {other:?}"),
