@@ -59,7 +59,7 @@ use cratonvm_native_api::{NativeContext, NativeMethodRegistry};
 use cratonvm_types::error::{MethodCallFailed, MethodCallResult, RuntimeError, VmError};
 use cratonvm_types::Value;
 
-use crate::jboss_msc::ServiceName;
+use crate::jboss_msc::{alloc_java_service_name, ServiceName};
 use crate::{alloc_concurrent_synthetic, obj_arg};
 
 // ===========================================================================
@@ -208,6 +208,92 @@ pub fn wildfly_deployment_unit_name(archive: &str) -> Arc<ServiceName> {
 /// prefix constant (`Services.JBOSS_DEPLOYMENT_UNIT`).
 pub fn jboss_deployment_unit_base() -> Arc<ServiceName> {
     ServiceName::of(["jboss", "deployment", "unit"])
+}
+
+fn read_string_arg(ctx: &mut dyn NativeContext, value: Option<&Value>) -> Option<String> {
+    match value {
+        Some(Value::Object(Some(s))) => ctx.read_string(*s),
+        _ => None,
+    }
+}
+
+fn capability_service_name(base_name: &str, dynamic_parts: &[String]) -> Arc<ServiceName> {
+    let mut name = ServiceName::parse(base_name);
+    for part in dynamic_parts {
+        if !part.is_empty() {
+            name = name.append(part);
+        }
+    }
+    name
+}
+
+fn capability_service_name_value(
+    ctx: &mut dyn NativeContext,
+    base_name: &str,
+    dynamic_parts: &[String],
+) -> Value {
+    let name = capability_service_name(base_name, dynamic_parts);
+    Value::Object(Some(alloc_java_service_name(ctx, &name)))
+}
+
+/// `OperationContext.getCapabilityServiceName(String, Class)` fallback.
+///
+/// Real WildFly first consults the runtime capability registry and, when that
+/// cannot parse a capability as a registry-backed capability, falls back to
+/// `ServiceNameFactory.parseServiceName(capabilityName)`. Under CratonVM the
+/// under-modeled registry path can produce null instead of throwing the
+/// `IllegalStateException` that triggers that fallback, which later becomes
+/// `ServiceBuilderImpl.requires(null)`. Mirror the fallback at the boundary.
+fn native_operation_context_get_capability_service_name(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    let base = read_string_arg(ctx, args.get(1)).ok_or_else(|| {
+        MethodCallFailed::from(RuntimeError::NullPointerException {
+            message: Some("capabilityName must not be null".to_string()),
+        })
+    })?;
+    Ok(Some(capability_service_name_value(ctx, &base, &[])))
+}
+
+/// `OperationContext.getCapabilityServiceName(String, String, Class)`.
+fn native_operation_context_get_capability_service_name_dynamic(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    let base = read_string_arg(ctx, args.get(1)).ok_or_else(|| {
+        MethodCallFailed::from(RuntimeError::NullPointerException {
+            message: Some("capabilityBaseName must not be null".to_string()),
+        })
+    })?;
+    let mut parts = Vec::new();
+    if let Some(part) = read_string_arg(ctx, args.get(2)) {
+        parts.push(part);
+    }
+    Ok(Some(capability_service_name_value(ctx, &base, &parts)))
+}
+
+/// `OperationContext.getCapabilityServiceName(String, Class, String...)`.
+fn native_operation_context_get_capability_service_name_varargs(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    let base = read_string_arg(ctx, args.get(1)).ok_or_else(|| {
+        MethodCallFailed::from(RuntimeError::NullPointerException {
+            message: Some("capabilityBaseName must not be null".to_string()),
+        })
+    })?;
+    let mut parts = Vec::new();
+    if let Some(Value::Object(Some(arr))) = args.get(3) {
+        for i in 0..ctx.array_length(*arr) {
+            if let Value::Object(Some(s)) = ctx.get_array_element(*arr, i) {
+                if let Some(part) = ctx.read_string(s) {
+                    parts.push(part);
+                }
+            }
+        }
+    }
+    Ok(Some(capability_service_name_value(ctx, &base, &parts)))
 }
 
 // ===========================================================================
@@ -1544,6 +1630,31 @@ pub fn register_wildfly_core_natives(r: &mut NativeMethodRegistry) {
         native_services_deployment_unit_name,
     );
 
+    for operation_context in [
+        "org/jboss/as/controller/OperationContext",
+        "org/jboss/as/controller/OperationContextImpl",
+        "org/jboss/as/controller/AbstractOperationContext",
+    ] {
+        r.register(
+            operation_context,
+            "getCapabilityServiceName",
+            "(Ljava/lang/String;Ljava/lang/Class;)Lorg/jboss/msc/service/ServiceName;",
+            native_operation_context_get_capability_service_name,
+        );
+        r.register(
+            operation_context,
+            "getCapabilityServiceName",
+            "(Ljava/lang/String;Ljava/lang/String;Ljava/lang/Class;)Lorg/jboss/msc/service/ServiceName;",
+            native_operation_context_get_capability_service_name_dynamic,
+        );
+        r.register(
+            operation_context,
+            "getCapabilityServiceName",
+            "(Ljava/lang/String;Ljava/lang/Class;[Ljava/lang/String;)Lorg/jboss/msc/service/ServiceName;",
+            native_operation_context_get_capability_service_name_varargs,
+        );
+    }
+
     // --- DeploymentUnit ---
     let du = "org/jboss/as/server/deployment/DeploymentUnit";
     r.register(
@@ -2067,6 +2178,13 @@ mod tests {
             .is_some());
         assert!(r
             .find(
+                "org/jboss/as/controller/OperationContextImpl",
+                "getCapabilityServiceName",
+                "(Ljava/lang/String;Ljava/lang/Class;)Lorg/jboss/msc/service/ServiceName;",
+            )
+            .is_some());
+        assert!(r
+            .find(
                 "org/jboss/logmanager/LogManager",
                 "getLogger",
                 "(Ljava/lang/String;)Lorg/jboss/logmanager/Logger;",
@@ -2147,6 +2265,68 @@ mod tests {
             _ => String::new(),
         };
         assert_eq!(canonical, "jboss.deployment.unit.my-archive.war");
+    }
+
+    #[test]
+    fn t19_2_a_operation_context_capability_name_falls_back_to_service_name() {
+        let mut ctx = mock_ctx();
+        let this = ctx.alloc_object(cratonvm_types::ClassId::new(0), 1);
+        let cap = ctx.create_string("org.wildfly.transactions.xa-resource-recovery-registry");
+        let res = native_operation_context_get_capability_service_name(
+            &mut ctx,
+            &[
+                Value::Object(Some(this)),
+                Value::Object(Some(cap)),
+                Value::Object(None),
+            ],
+        )
+        .expect("capability fallback should succeed");
+        match res {
+            Some(Value::Object(Some(_))) => {}
+            other => panic!("expected ServiceName object, got {:?}", other),
+        }
+        let name = capability_service_name(
+            "org.wildfly.transactions.xa-resource-recovery-registry",
+            &[],
+        );
+        assert_eq!(
+            name.canonical(),
+            "org.wildfly.transactions.xa-resource-recovery-registry"
+        );
+    }
+
+    #[test]
+    fn t19_2_a_operation_context_capability_name_appends_dynamic_parts() {
+        let mut ctx = mock_ctx();
+        let this = ctx.alloc_object(cratonvm_types::ClassId::new(0), 1);
+        let cap = ctx.create_string("org.wildfly.clustering.infinispan.cache");
+        let p0 = ctx.create_string("hibernate");
+        let p1 = ctx.create_string("entity");
+        let parts = ctx.new_array(cratonvm_types::ArrayElementType::Reference, 2);
+        ctx.set_array_element(parts, 0, Value::Object(Some(p0)));
+        ctx.set_array_element(parts, 1, Value::Object(Some(p1)));
+        let res = native_operation_context_get_capability_service_name_varargs(
+            &mut ctx,
+            &[
+                Value::Object(Some(this)),
+                Value::Object(Some(cap)),
+                Value::Object(None),
+                Value::Object(Some(parts)),
+            ],
+        )
+        .expect("capability varargs fallback should succeed");
+        match res {
+            Some(Value::Object(Some(_))) => {}
+            other => panic!("expected ServiceName object, got {:?}", other),
+        }
+        let name = capability_service_name(
+            "org.wildfly.clustering.infinispan.cache",
+            &["hibernate".to_string(), "entity".to_string()],
+        );
+        assert_eq!(
+            name.canonical(),
+            "org.wildfly.clustering.infinispan.cache.hibernate.entity"
+        );
     }
 
     #[test]

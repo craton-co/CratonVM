@@ -623,3 +623,35 @@ The STW residual is **not fixed**. The rebuilt JIT-on standalone probe still tim
 The pending thread in that run was a non-blocked `ParallelBootOperationStepHandler$ParallelBootTransactionControl.operationPrepared` worker (`t53`), while a follow-up probe with `CRATONVM_JIT_BISECT_SKIP='org/jboss/threads/EnhancedQueueExecutor$ThreadBody.run'` made idle `ThreadBody.run@442` workers consistently blocked but still wedged later with a non-blocked `operationPrepared` worker (`t38`). That rules out a single `EnhancedQueueExecutor$ThreadBody.run` JIT skip as a complete fix. The next pass should focus on the Java/AQS/Future wait path used by `operationPrepared` and the two new functional boot NPEs above.
 
 Status remains OPEN: the fixed `BindInfo` bug is closed under `docs/internal`; this doc continues to track the broader WildFly domain/standalone boot residuals.
+
+## 2026-07-08 update -- ModuleLoader/capability ServiceName null residuals fixed; STW stall remains OPEN
+
+Branch `codex/fix-wildfly-null-residuals-20260708-175605` on the Azure probe host, using a separate worktree from `dev` and uniquely named binaries:
+
+```text
+/data/data/cratonvm-builtins/cratonvm-wildfly-20260708-175605-nullres
+/data/data/cratonvm-builtins/java-wildfly-20260708-175605-nullres
+/data/data/fakejdk-wildfly-20260708-175605-nullres/bin/java
+```
+
+Two functional residuals from the previous 2026-07-08 pass are now fixed:
+
+1. **Datasource `ModuleLoader.loadModule(ModuleIdentifier)` null receiver -- FIXED.** `JdbcDriverAdd.performRuntime` calls `Module.getCallerModuleLoader().loadModule(identifier)`. CratonVM already handled the `loadModule(...)` side, but did not provide `Module.getCallerModuleLoader()` / `Module.getBootModuleLoader()`. The module bridge now returns the existing boot `LocalModuleLoader` for both methods.
+2. **Infinispan `ServiceBuilderImpl.requires(null)` / "Method parameter cannot be null" -- FIXED.** `XAResourceRecoveryServiceConfigurator.configure()` obtains `org.wildfly.transactions.xa-resource-recovery-registry` via `OperationContext.getCapabilityServiceName(name, type)`. WildFly's real `OperationContextImpl` falls back to parsing the capability name as an MSC `ServiceName` when registry lookup is unavailable; under CratonVM the under-modeled registry path could return null instead. The WildFly core bridge now mirrors that fallback for the `getCapabilityServiceName(...)` overloads and appends dynamic parts where applicable.
+
+Focused validation:
+
+```text
+cargo test -p cratonvm-native-builtins t19_h4_get_caller_module_loader_returns_boot_loader -- --nocapture
+cargo test -p cratonvm-native-builtins t19_2_a_operation_context_capability_name -- --nocapture
+cargo check -p cratonvm-native-api -p cratonvm-native-builtins -p cratonvm-vm
+cargo build --release -p cratonvm-cli --features java-bin-alias --bin cratonvm --bin java
+```
+
+The follow-up direct WildFly standalone probe no longer reports either null residual. The process still times out with the pre-existing STW cooperation stall:
+
+```text
+[stw-census] rounds=64 pending=1 taken=0 blocked=48 alive=53
+```
+
+The pending/nonblocked threads remain in the `EnhancedQueueExecutor$ThreadBody.run` / `ParallelBootOperationStepHandler` cooperation family. Status remains OPEN for the broader WildFly boot timeout; the two null residuals from this section are closed under `docs/internal/fixed-suite-bugs/wildfly-moduleloader-capability-servicename-nulls.md`.

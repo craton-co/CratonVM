@@ -2802,6 +2802,21 @@ pub(crate) fn native_module_get_module_loader(
     Ok(Some(Value::Object(Some(l))))
 }
 
+/// `Module.getBootModuleLoader()` / `Module.getCallerModuleLoader()`.
+///
+/// WildFly subsystem code commonly asks JBoss Modules for the caller loader
+/// before loading optional subsystem/provider modules. CratonVM does not model
+/// the per-frame JBoss module association, but all WildFly modules are resolved
+/// through the same boot `LocalModuleLoader` rooted in the module path, so this
+/// returns that loader instead of letting the real bytecode produce null.
+pub(crate) fn native_module_get_boot_or_caller_module_loader(
+    ctx: &mut dyn NativeContext,
+    _args: &[Value],
+) -> MethodCallResult {
+    let loader = build_local_module_loader(ctx);
+    Ok(Some(Value::Object(Some(loader))))
+}
+
 // ===========================================================================
 // Registration
 // ===========================================================================
@@ -3092,6 +3107,18 @@ pub fn register_jboss_module_loader(registry: &mut NativeMethodRegistry) {
         "getModuleLoader",
         "()Lorg/jboss/modules/ModuleLoader;",
         native_module_get_module_loader,
+    );
+    registry.register(
+        CN_MODULE,
+        "getBootModuleLoader",
+        "()Lorg/jboss/modules/ModuleLoader;",
+        native_module_get_boot_or_caller_module_loader,
+    );
+    registry.register(
+        CN_MODULE,
+        "getCallerModuleLoader",
+        "()Lorg/jboss/modules/ModuleLoader;",
+        native_module_get_boot_or_caller_module_loader,
     );
     registry.register(
         CN_MODULE,
@@ -4115,6 +4142,26 @@ mod tests {
                 assert_eq!(a.as_ptr(), b.as_ptr());
             }
             other => panic!("expected pair of non-null loaders, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn t19_h4_get_caller_module_loader_returns_boot_loader() {
+        let _g = TEST_LOCK.lock();
+        let tmp = tempfile::tempdir().unwrap();
+        setup_test_env(tmp.path());
+        let mut ctx = MockNativeContext::new();
+        let caller = native_module_get_boot_or_caller_module_loader(&mut ctx, &[])
+            .unwrap()
+            .unwrap();
+        let boot = native_module_get_boot_or_caller_module_loader(&mut ctx, &[])
+            .unwrap()
+            .unwrap();
+        match (caller, boot) {
+            (Value::Object(Some(a)), Value::Object(Some(b))) => {
+                assert_eq!(a.as_ptr(), b.as_ptr());
+            }
+            other => panic!("expected stable boot loader refs, got {:?}", other),
         }
     }
 
