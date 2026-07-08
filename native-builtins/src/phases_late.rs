@@ -39895,8 +39895,22 @@ fn new13_do_create_socket(
     ctx.set_field(sock, NEW13_SOCK_HOST, Value::Object(Some(host_obj)));
     ctx.set_field(sock, NEW13_SOCK_PORT, Value::Int(port as i32));
     ctx.set_field(sock, NEW13_SOCK_TLSID, Value::Int(tls_id));
+    if std::env::var_os("CRATONVM_DBG_TLS_SOCK").is_some() {
+        eprintln!(
+            "[dbg-tls-sock] thread={:?} IMMEDIATE readback after set field2={:?}",
+            std::thread::current().id(),
+            ctx.get_field(sock, NEW13_SOCK_TLSID)
+        );
+    }
     ctx.set_field(sock, NEW13_SOCK_CLOSED, Value::Int(0));
     let session = new13_alloc_ssl_session(ctx, tls_id);
+    if std::env::var_os("CRATONVM_DBG_TLS_SOCK").is_some() {
+        eprintln!(
+            "[dbg-tls-sock] thread={:?} POST-session-alloc readback field2={:?}",
+            std::thread::current().id(),
+            ctx.get_field(sock, NEW13_SOCK_TLSID)
+        );
+    }
     ctx.set_field(sock, NEW13_SOCK_SESSION, Value::Object(Some(session)));
     if std::env::var_os("CRATONVM_DBG_TLS_SOCK").is_some() {
         eprintln!(
