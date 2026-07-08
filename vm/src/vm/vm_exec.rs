@@ -19,7 +19,9 @@ use crate::classloading::ClassId;
 use crate::error::{LinkageError, MethodCallFailed, MethodCallResult, RuntimeError, VmError};
 use crate::memory::heap::{ArrayElementType, ObjectKind};
 use crate::native::io::FileDescriptorTable;
-use crate::native::registry::{FieldMetadata, MethodMetadata, NativeContext, StackTraceEntry};
+use crate::native::registry::{
+    FieldMetadata, MethodMetadata, NativeContext, NativeThreadBlocker, StackTraceEntry,
+};
 use crate::threading::jvm_thread::{JvmThread, ThreadId};
 use crate::types::{jlong_bits_as_aligned_object_ptr, ObjectRef, Value};
 
@@ -2082,6 +2084,36 @@ fn reread_native_object_values(
             _ => *value,
         })
         .collect()
+}
+
+struct VmNativeThreadBlocker {
+    shared: std::sync::Arc<SharedVm>,
+    thread_id: ThreadId,
+}
+
+impl NativeThreadBlocker for VmNativeThreadBlocker {
+    fn publish_os_tid(&self) {
+        self.shared
+            .thread_registry
+            .set_os_tid_current(self.thread_id);
+    }
+
+    fn enter_blocked(&self) {
+        self.shared
+            .thread_registry
+            .mark_native_thread_blocked(self.thread_id);
+        let pre_stw = self.shared.gc_barrier.mark_blocked_region_enter();
+        if pre_stw {
+            let _ = self.shared.gc_barrier.arrive_and_wait(self.thread_id);
+        }
+    }
+
+    fn leave_blocked(&self) {
+        self.shared.gc_barrier.mark_blocked_region_leave();
+        self.shared
+            .thread_registry
+            .mark_native_thread_unblocked(self.thread_id);
+    }
 }
 
 impl<'a> NativeContext for NativeContextImpl<'a> {
@@ -4401,7 +4433,40 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
                 // a buggy handler can't take down the VM further than the
                 // original exception already did).
                 if let MethodCallFailed::ExceptionThrown(exc) = &e {
-                    let exc_ref = *exc;
+                    // GC-root gap: `exc_ref` is a bare Rust local at this
+                    // point — `run()`'s frame has already popped (the
+                    // exception unwound past it) and
+                    // `dispatchUncaughtException`'s frame doesn't exist yet,
+                    // so no interpreter frame covers it. `invoke_on_class_shared`
+                    // below is re-entrant (it can lazily init classes / allocate
+                    // on the way to `ThreadGroup.uncaughtException`'s default
+                    // handler chain), so a GC in that window relocates the
+                    // Throwable while nothing roots it, corrupting it before
+                    // `dispatchUncaughtException`/`printStackTrace` ever see it
+                    // (observed as a stale invokevirtual receiver on
+                    // `Throwable.printStackTrace`, e.g. an LDAP listener's
+                    // "Exception in thread" logging). Pin it in
+                    // `native_pin_roots` for the call, matching every other
+                    // raw-ObjectRef-across-a-reentrant-call site.
+                    let pin_base = jvm_thread.native_pin_roots.len();
+                    jvm_thread.native_pin_roots.push(*exc);
+                    let exc_ref = jvm_thread.native_pin_roots[pin_base];
+                    if std::env::var_os("CRATONVM_DBG_UNCAUGHT").is_some() {
+                        let cid = shared_arc.heap.class_id_of(exc_ref);
+                        let cname = shared_arc
+                            .class_manager
+                            .read()
+                            .get_class(cid)
+                            .map(|c| c.name.to_string())
+                            .unwrap_or_else(|| format!("<unknown class_id={}>", cid.as_u32()));
+                        eprintln!(
+                            "[dbg-uncaught] tid={} thread_name={:?} exc_class={} ptr={:p}",
+                            tid.0,
+                            name,
+                            cname,
+                            exc_ref.as_ptr(),
+                        );
+                    }
                     let dispatch_result = invoke_on_class_shared(
                         &shared_arc,
                         &mut jvm_thread,
@@ -4418,6 +4483,7 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
                             Value::Object(Some(exc_ref)),
                         ],
                     );
+                    jvm_thread.native_pin_roots.truncate(pin_base);
                     if let Err(de) = dispatch_result {
                         eprintln!(
                             "Thread {} terminated with error: {:?} (dispatchUncaughtException also failed: {:?})",
@@ -5021,6 +5087,19 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
             self.shared.thread_registry.set_join_handle(tid, *boxed);
         }
         tid.0
+    }
+
+    fn native_thread_blocker(
+        &self,
+        thread_id: u64,
+    ) -> Option<std::sync::Arc<dyn NativeThreadBlocker>> {
+        if thread_id == 0 {
+            return None;
+        }
+        Some(std::sync::Arc::new(VmNativeThreadBlocker {
+            shared: self.shared.get_arc(),
+            thread_id: ThreadId(thread_id),
+        }))
     }
 
     /// T19_K2 вЂ” Mark a previously-registered native thread dead. Called

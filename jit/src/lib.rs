@@ -5272,6 +5272,16 @@ fn try_compile_inner(
     // keeps the historical IR-first behaviour.
     if optimize
         && ir::ir_compatible(&scan)
+        // STUB-S8: the IR builder has no exception-table-aware codegen — a
+        // handler entry isn't a registered merge target, so the builder walks
+        // over handler bytecode with stale `self.ctrl`/`self.locals`/`self.stack`
+        // state left over from wherever the linear PC walk last was. An
+        // implicit-throw-only method (try/catch with no `athrow` of its own)
+        // slips past the `scan.has_athrow` bail above and produces orphaned
+        // nodes referencing `NO_NODE` (a popped-empty-stack or
+        // never-assigned-local sentinel) that the scheduler/lowerer still
+        // visit, panicking in `ir_lower::slot_of` on a `u32::MAX` index.
+        && cached.exception_table.is_empty()
         && ((!method_uses_category2(code, code_len, &cached.method_descriptor)
                 // inc 30: the pure int/long/ref IR path stays FP-free, so a
                 // float-using (cat-1) method is no longer admitted here — it

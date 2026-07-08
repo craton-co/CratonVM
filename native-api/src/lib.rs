@@ -30,5 +30,5 @@ pub use intrinsic::InterpIntrinsic;
 pub use registry::{
     AnnotationData, AnnotationElementValue, DefineClassFull, FieldMetadata, LambdaSerialMetadata,
     MethodMetadata, NativeCallback, NativeContext, NativeKind, NativeMethodRegistry,
-    StackTraceEntry,
+    NativeThreadBlocker, StackTraceEntry,
 };

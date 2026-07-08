@@ -5674,8 +5674,22 @@ fn execute_frame(shared: &SharedVm, thread: &mut JvmThread) -> MethodCallResult 
         // Handle any pending Java exception from a previous invoke (e.g. JIT dispatch).
         if let Some((exc, invoke_pc)) = pending_java_exception.take() {
             let mut exc_pc = invoke_pc;
-            let current_exc = exc;
+            // GC-root gap: this loop can pop MANY frames while searching for a
+            // handler (unwinding all the way out of the method if none is
+            // found), and `find_exception_handler` -> `find_exception_handler_impl`
+            // lazily loads an unresolved catch-type class on a cache miss
+            // (`load_class_concurrent`, which runs <clinit> and can allocate/
+            // trigger a GC). Once a frame is popped it no longer roots the
+            // propagating exception, and nothing else does until a handler is
+            // found (pushed onto a frame's stack) or the method returns it as
+            // an Err — pin it in `native_pin_roots` for the whole walk so a GC
+            // mid-unwind can't reclaim it (observed: an uncaught exception
+            // propagating out of a thread's run() corrupted before
+            // dispatchUncaughtException/printStackTrace ever saw it).
+            let pin_base = thread.native_pin_roots.len();
+            thread.native_pin_roots.push(exc);
             loop {
+                let current_exc = thread.native_pin_roots[pin_base];
                 match find_exception_handler(shared, &thread.frames[frame_idx], exc_pc, current_exc)
                 {
                     Some((handler_pc, exc_ref)) => {
@@ -5686,6 +5700,7 @@ fn execute_frame(shared: &SharedVm, thread: &mut JvmThread) -> MethodCallResult 
                             .map_err(|e| MethodCallFailed::InternalError(VmError::Runtime(e)))?;
                         thread.frames[frame_idx].pc = handler_pc;
                         fire_jvmti_exception_catch(&thread.frames[frame_idx], handler_pc);
+                        thread.native_pin_roots.truncate(pin_base);
                         break;
                     }
                     None => {
@@ -5695,6 +5710,8 @@ fn execute_frame(shared: &SharedVm, thread: &mut JvmThread) -> MethodCallResult 
                             frame_idx -= 1;
                             exc_pc = thread.frames[frame_idx].last_instr_pc;
                         } else {
+                            let current_exc = thread.native_pin_roots[pin_base];
+                            thread.native_pin_roots.truncate(pin_base);
                             return Err(MethodCallFailed::ExceptionThrown(current_exc));
                         }
                     }
@@ -5722,8 +5739,13 @@ fn execute_frame(shared: &SharedVm, thread: &mut JvmThread) -> MethodCallResult 
             match exc_result {
                 MethodCallFailed::ExceptionThrown(exc) => {
                     let mut exc_pc = invoke_pc;
-                    let current_exc = exc;
+                    // GC-root gap: see the identical pin in the
+                    // `pending_java_exception` arm above — this loop has the
+                    // same unpinned-across-frame-pops-and-lazy-class-load hazard.
+                    let pin_base = thread.native_pin_roots.len();
+                    thread.native_pin_roots.push(exc);
                     loop {
+                        let current_exc = thread.native_pin_roots[pin_base];
                         match find_exception_handler(
                             shared,
                             &thread.frames[frame_idx],
@@ -5740,6 +5762,7 @@ fn execute_frame(shared: &SharedVm, thread: &mut JvmThread) -> MethodCallResult 
                                     })?;
                                 thread.frames[frame_idx].pc = handler_pc;
                                 fire_jvmti_exception_catch(&thread.frames[frame_idx], handler_pc);
+                                thread.native_pin_roots.truncate(pin_base);
                                 break;
                             }
                             None => {
@@ -5757,6 +5780,8 @@ fn execute_frame(shared: &SharedVm, thread: &mut JvmThread) -> MethodCallResult 
                                     // (no trace site consumed them). Dropped —
                                     // behaviour is identical (pure, discarded
                                     // computations).
+                                    let current_exc = thread.native_pin_roots[pin_base];
+                                    thread.native_pin_roots.truncate(pin_base);
                                     return Err(MethodCallFailed::ExceptionThrown(current_exc));
                                 }
                             }
@@ -8137,9 +8162,14 @@ fn execute_frame(shared: &SharedVm, thread: &mut JvmThread) -> MethodCallResult 
                 match exc_result {
                     MethodCallFailed::ExceptionThrown(exc) => {
                         // Route through the ExceptionThrown handler below
-                        let current_exc = exc;
+                        // GC-root gap: see the pin in the `pending_java_exception`
+                        // arm earlier in this function — same
+                        // unpinned-across-frame-pops-and-lazy-class-load hazard.
                         let mut exc_pc = saved_pc;
+                        let pin_base = thread.native_pin_roots.len();
+                        thread.native_pin_roots.push(exc);
                         loop {
+                            let current_exc = thread.native_pin_roots[pin_base];
                             match find_exception_handler(
                                 shared,
                                 &thread.frames[frame_idx],
@@ -8159,6 +8189,7 @@ fn execute_frame(shared: &SharedVm, thread: &mut JvmThread) -> MethodCallResult 
                                         &thread.frames[frame_idx],
                                         handler_pc,
                                     );
+                                    thread.native_pin_roots.truncate(pin_base);
                                     break;
                                 }
                                 None => {
@@ -8169,6 +8200,8 @@ fn execute_frame(shared: &SharedVm, thread: &mut JvmThread) -> MethodCallResult 
                                         frame_idx -= 1;
                                         exc_pc = thread.frames[frame_idx].last_instr_pc;
                                     } else {
+                                        let current_exc = thread.native_pin_roots[pin_base];
+                                        thread.native_pin_roots.truncate(pin_base);
                                         return Err(MethodCallFailed::ExceptionThrown(current_exc));
                                     }
                                 }
@@ -8200,9 +8233,14 @@ fn execute_frame(shared: &SharedVm, thread: &mut JvmThread) -> MethodCallResult 
             }
             Err(MethodCallFailed::ExceptionThrown(exc)) => {
                 // Try to find handler, unwinding through stackless frames
-                let current_exc = exc;
+                // GC-root gap: see the pin in the `pending_java_exception` arm
+                // earlier in this function — same
+                // unpinned-across-frame-pops-and-lazy-class-load hazard.
                 let mut exc_pc = saved_pc;
+                let pin_base = thread.native_pin_roots.len();
+                thread.native_pin_roots.push(exc);
                 loop {
+                    let current_exc = thread.native_pin_roots[pin_base];
                     match find_exception_handler(
                         shared,
                         &thread.frames[frame_idx],
@@ -8225,6 +8263,7 @@ fn execute_frame(shared: &SharedVm, thread: &mut JvmThread) -> MethodCallResult 
                                 })?;
                             thread.frames[frame_idx].pc = handler_pc;
                             fire_jvmti_exception_catch(&thread.frames[frame_idx], handler_pc);
+                            thread.native_pin_roots.truncate(pin_base);
                             break;
                         }
                         None => {
@@ -8250,6 +8289,8 @@ fn execute_frame(shared: &SharedVm, thread: &mut JvmThread) -> MethodCallResult 
                                 // (no trace site consumed them). Dropped —
                                 // behaviour is identical (pure, discarded
                                 // computations).
+                                let current_exc = thread.native_pin_roots[pin_base];
+                                thread.native_pin_roots.truncate(pin_base);
                                 return Err(MethodCallFailed::ExceptionThrown(current_exc));
                             }
                         }

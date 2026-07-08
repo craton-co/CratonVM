@@ -861,13 +861,19 @@ JIT divide-by-zero re-run) has since been fixed; the other two remain open:
   ask) — see it for why a blind full-repo union isn't used by default.
   Historical record moved to
   [../internal/fixed-suite-bugs/keycloak-testframework-quarkus-config-classpath-gap.md](../internal/fixed-suite-bugs/keycloak-testframework-quarkus-config-classpath-gap.md).
-- [keycloak-testframework-enterprisedb-supplier-noclassdef.md](keycloak-testframework-enterprisedb-supplier-noclassdef.md) —
-  🔴 open. Residual uncovered by the fix above: `Registry`'s extension-supplier
-  discovery now runs (it couldn't before) and immediately fails with
-  `NoClassDefFoundError: org/keycloak/testframework/database/EnterpriseDbDatabaseSupplier`
-  — puzzling because the class/jar/classpath-dir all genuinely exist; possibly
-  the same misleading-diagnostic pattern as the Infinispan `isClustered()` bug
-  below, or a missing Testcontainers jar. Not yet root-caused.
+- **`EnterpriseDbDatabaseSupplier` supplier discovery classpath gap** -
+  FIXED (2026-07-08). The named `db-edb` class was present, but its
+  `test-framework/test-containers` superclass and Testcontainers/Docker
+  runtime jars were missing from the universal classpath. The generator now
+  builds a filtered default runtime closure for the provider and prunes stale
+  service-descriptor-only output dirs. Historical record moved to
+  [../internal/fixed-suite-bugs/keycloak-testframework-enterprisedb-supplier-noclassdef.md](../internal/fixed-suite-bugs/keycloak-testframework-enterprisedb-supplier-noclassdef.md).
+- [keycloak-universal-classpath-post-enterprisedb-residuals.md](keycloak-universal-classpath-post-enterprisedb-residuals.md) -
+  OPEN. Later residuals after the EnterpriseDB supplier fix:
+  HotSpot now reaches `UITestFrameworkExtension` and misses Selenium
+  `org/openqa/selenium/WebDriver`; CratonVM reaches Keycloak server startup
+  and misses the Quarkus Maven resolver path behind
+  `BootstrapMavenContext.config()`.
 
 ## Keycloak post-PreviewFeatures rerun (2026-07-03)
 
