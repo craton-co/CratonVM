@@ -15982,9 +15982,13 @@ pub fn register_essential_natives(registry: &mut NativeMethodRegistry) {
         "getNextThreadIdOffset",
         "()J",
         |_ctx, _args| {
-            // Return offset of Thread.tid field — used by Thread.nextThreadId().
-            // HotSpot returns the physical offset; we return 0 and let Unsafe handle it.
-            Ok(Some(Value::Long(0)))
+            // JDK ThreadIdentifiers.next() uses Unsafe.getAndAddLong(null,
+            // NEXT_TID_OFFSET, 1). Offset 0 routed that RMW into the generic
+            // null-base side store with a zero seed, producing illegal tid 0.
+            // Use a dedicated, seeded synthetic offset for Java-created
+            // threads; VM-fabricated thread mirrors already use a disjoint
+            // high range.
+            Ok(Some(Value::Long(thread_next_tid_offset() as i64)))
         },
     );
     // C11: `NativeLibraries.findBuiltinLib(name)` — HotSpot returns the
@@ -28878,6 +28882,13 @@ fn static_obj_store() -> &'static UnsafeShardedMap<usize, Option<cratonvm_types:
     T.get_or_init(new_unsafe_sharded_map)
 }
 
+fn thread_next_tid_offset() -> usize {
+    let offset = synthetic_offset_for("java/lang/Thread$ThreadIdentifiers", "native:nextTid");
+    let mut map = lock_unsafe_shard_usize(static_long_store(), offset);
+    map.entry(offset).or_insert(1);
+    offset
+}
+
 /// Lock the shard that owns `key` in a `usize`-keyed sharded map.
 #[inline]
 fn lock_unsafe_shard_usize<V>(
@@ -28987,6 +28998,46 @@ fn unsafe_static_field_target(offset: usize) -> Option<(ClassId, usize)> {
         .get(&offset)
         .copied()?;
     Some((ClassId::new(target.class_id), target.field_index))
+}
+
+fn unsafe_static_get(ctx: &dyn NativeContext, offset: usize) -> Option<Value> {
+    let (class_id, field_index) = unsafe_static_field_target(offset)?;
+    Some(ctx.get_static_field(class_id, field_index))
+}
+
+fn unsafe_static_put(ctx: &mut dyn NativeContext, offset: usize, value: Value) -> bool {
+    let Some((class_id, field_index)) = unsafe_static_field_target(offset) else {
+        return false;
+    };
+    ctx.set_static_field(class_id, field_index, value);
+    true
+}
+
+fn unsafe_static_get_and_add_long(
+    ctx: &mut dyn NativeContext,
+    offset: usize,
+    delta: i64,
+) -> Option<i64> {
+    let (class_id, field_index) = unsafe_static_field_target(offset)?;
+    let Value::Long(old) = ctx.get_static_field(class_id, field_index) else {
+        return Some(0);
+    };
+    ctx.set_static_field(class_id, field_index, Value::Long(old.wrapping_add(delta)));
+    Some(old)
+}
+
+fn unsafe_static_get_and_set_long(
+    ctx: &mut dyn NativeContext,
+    offset: usize,
+    value: i64,
+) -> Option<i64> {
+    let (class_id, field_index) = unsafe_static_field_target(offset)?;
+    let old = match ctx.get_static_field(class_id, field_index) {
+        Value::Long(old) => old,
+        _ => 0,
+    };
+    ctx.set_static_field(class_id, field_index, Value::Long(value));
+    Some(old)
 }
 
 fn unsafe_static_field_target_for_base(
@@ -29691,6 +29742,14 @@ pub(crate) fn native_unsafe_cas_long(
     let obj = match unsafe_obj(args, 1) {
         Some(o) => o,
         None => {
+            if let Some((class_id, field_index)) = unsafe_static_field_target(offset) {
+                let cur = ctx.get_static_field(class_id, field_index);
+                let ok = unsafe_cas_values_equal(cur, expected);
+                if ok {
+                    ctx.set_static_field(class_id, field_index, new_val);
+                }
+                return Ok(Some(Value::Int(if ok { 1 } else { 0 })));
+            }
             let mut map = lock_unsafe_shard_usize(static_long_store(), offset);
             let cur = *map.entry(offset).or_insert(0);
             let ex = if let Value::Long(e) = expected { e } else { 0 };
@@ -29931,6 +29990,13 @@ fn native_unsafe_get_long_volatile(
     let obj = match unsafe_obj(args, 1) {
         Some(o) => o,
         None => {
+            if let Some(value) = unsafe_static_get(ctx, offset) {
+                return Ok(Some(match value {
+                    Value::Long(v) => Value::Long(v),
+                    Value::Int(v) => Value::Long(v as i64),
+                    _ => Value::Long(0),
+                }));
+            }
             let map = lock_unsafe_shard_usize(static_long_store(), offset);
             return Ok(Some(Value::Long(map.get(&offset).copied().unwrap_or(0))));
         }
@@ -29962,6 +30028,9 @@ fn native_unsafe_put_long_volatile(
         Some(o) => o,
         None => {
             let v = if let Value::Long(i) = val { i } else { 0 };
+            if unsafe_static_put(ctx, offset, Value::Long(v)) {
+                return Ok(None);
+            }
             lock_unsafe_shard_usize(static_long_store(), offset).insert(offset, v);
             return Ok(None);
         }
@@ -30642,6 +30711,13 @@ pub(crate) fn native_unsafe_get_long(
     let obj = match unsafe_obj(args, 1) {
         Some(o) => o,
         None => {
+            if let Some(value) = unsafe_static_get(ctx, offset) {
+                return Ok(Some(match value {
+                    Value::Long(v) => Value::Long(v),
+                    Value::Int(v) => Value::Long(v as i64),
+                    _ => Value::Long(0),
+                }));
+            }
             let map = lock_unsafe_shard_usize(static_long_store(), offset);
             return Ok(Some(Value::Long(map.get(&offset).copied().unwrap_or(0))));
         }
@@ -30680,6 +30756,9 @@ pub(crate) fn native_unsafe_put_long(
         Some(o) => o,
         None => {
             let v = if let Value::Long(i) = val { i } else { 0 };
+            if unsafe_static_put(ctx, offset, Value::Long(v)) {
+                return Ok(None);
+            }
             lock_unsafe_shard_usize(static_long_store(), offset).insert(offset, v);
             return Ok(None);
         }
@@ -30979,6 +31058,9 @@ fn native_unsafe_get_and_add_long(ctx: &mut dyn NativeContext, args: &[Value]) -
     let obj = match unsafe_obj(args, 1) {
         Some(o) => o,
         None => {
+            if let Some(old) = unsafe_static_get_and_add_long(ctx, offset, delta) {
+                return Ok(Some(Value::Long(old)));
+            }
             // Static-field semantics (null receiver). Maintain a per-offset
             // counter so callers like Thread$ThreadIdentifiers.next() get
             // monotonically-increasing values rather than a VM panic.
@@ -31043,6 +31125,9 @@ fn native_unsafe_get_and_set_long(ctx: &mut dyn NativeContext, args: &[Value]) -
         Some(o) => o,
         None => {
             let nv = if let Value::Long(n) = new_val { n } else { 0 };
+            if let Some(prev) = unsafe_static_get_and_set_long(ctx, offset, nv) {
+                return Ok(Some(Value::Long(prev)));
+            }
             let mut map = lock_unsafe_shard_usize(static_long_store(), offset);
             let prev = map.insert(offset, nv).unwrap_or(0);
             return Ok(Some(Value::Long(prev)));
@@ -32049,6 +32134,18 @@ fn native_unsafe_compare_and_exchange_long(
         Some(Value::Long(v)) => *v,
         _ => 0,
     };
+    if obj.is_none() {
+        if let Some((class_id, field_index)) = unsafe_static_field_target(offset) {
+            let old = ctx.get_static_field(class_id, field_index);
+            if let Value::Long(old_val) = old {
+                if old_val == expected {
+                    ctx.set_static_field(class_id, field_index, Value::Long(update));
+                }
+                return Ok(Some(Value::Long(old_val)));
+            }
+            return Ok(Some(Value::Long(expected)));
+        }
+    }
     if let Some(obj_ref) = obj {
         let old = if is_synthetic_offset(offset) {
             synthetic_get(ctx, obj_ref, offset)
@@ -58699,6 +58796,96 @@ mod unsafe_static_field_offset_tests {
         assert_eq!(cas, Value::Int(1));
         assert_eq!(ctx.get_static_field(class_id, 24), Value::Int(1));
         assert_eq!(ctx.get_field(base, 24), Value::Int(77));
+    }
+
+    #[test]
+    fn static_long_null_base_unsafe_uses_real_static_storage() {
+        let mut ctx = MockNativeContext::new();
+        let class_id = ctx
+            .ensure_class_initialized("java/lang/Thread$ThreadIdentifiers")
+            .expect("mock class id");
+        let meta = FieldMetadata {
+            name: "next".to_string(),
+            descriptor: "J".to_string(),
+            access_flags: 0x0008,
+            slot_index: 7,
+            declaring_class_id: class_id,
+            is_static: true,
+        };
+        ctx.set_static_field(class_id, 7, Value::Long(42));
+
+        let field = crate::lang_class::create_field_object(&mut ctx, &meta);
+        let offset = match native_unsafe_static_field_offset(
+            &mut ctx,
+            &[Value::Object(None), Value::Object(Some(field))],
+        )
+        .expect("staticFieldOffset")
+        .expect("offset value")
+        {
+            Value::Long(offset) => offset as usize,
+            other => panic!("unexpected offset value: {other:?}"),
+        };
+
+        let before = native_unsafe_get_long_volatile(
+            &mut ctx,
+            &[
+                Value::Object(None),
+                Value::Object(None),
+                Value::Long(offset as i64),
+            ],
+        )
+        .expect("getLongVolatile")
+        .expect("read value");
+        assert_eq!(before, Value::Long(42));
+
+        let old = native_unsafe_get_and_add_long(
+            &mut ctx,
+            &[
+                Value::Object(None),
+                Value::Object(None),
+                Value::Long(offset as i64),
+                Value::Long(1),
+            ],
+        )
+        .expect("getAndAddLong")
+        .expect("old value");
+
+        assert_eq!(old, Value::Long(42));
+        assert_eq!(ctx.get_static_field(class_id, 7), Value::Long(43));
+    }
+
+    #[test]
+    fn thread_next_tid_offset_seeds_positive_null_base_counter() {
+        let mut ctx = MockNativeContext::new();
+        let offset = thread_next_tid_offset();
+        lock_unsafe_shard_usize(static_long_store(), offset).insert(offset, 1);
+
+        let first = native_unsafe_get_and_add_long(
+            &mut ctx,
+            &[
+                Value::Object(None),
+                Value::Object(None),
+                Value::Long(offset as i64),
+                Value::Long(1),
+            ],
+        )
+        .expect("first getAndAddLong")
+        .expect("first old value");
+        let second = native_unsafe_get_and_add_long(
+            &mut ctx,
+            &[
+                Value::Object(None),
+                Value::Object(None),
+                Value::Long(offset as i64),
+                Value::Long(1),
+            ],
+        )
+        .expect("second getAndAddLong")
+        .expect("second old value");
+
+        assert_ne!(offset, 0);
+        assert_eq!(first, Value::Long(1));
+        assert_eq!(second, Value::Long(2));
     }
 }
 
