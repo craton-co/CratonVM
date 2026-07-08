@@ -1027,25 +1027,20 @@ fn register_class_new_instance(r: &mut NativeMethodRegistry) {
                 }
             }
 
-            // Check if the no-arg constructor exists
-            if !ctx.method_exists(&class_name, "<init>", "()V") {
+            // Check the receiver mirror's exact class id. Name-only lookup can
+            // collapse a Lookup.defineClass helper back to an application-loader
+            // class with the same binary name.
+            if !ctx.class_declares_method(class_id, "<init>", "()V") {
                 return Err(RuntimeError::UnsupportedOperationException {
                     message: format!("InstantiationException: no no-arg constructor in {}", class_name),
                 }.into());
             }
 
-            // Create a new instance and invoke the constructor
-            let result = ctx.new_object(&class_name)?;
+            // Create a new instance of the exact mirror class and invoke its
+            // constructor without re-resolving the name through the global map.
+            let result = ctx.new_object_initialized_with_class_id(class_id, "()V", &[])?;
             match result {
-                Some(Value::Object(Some(obj))) => {
-                    ctx.invoke(
-                        &class_name,
-                        "<init>",
-                        "()V",
-                        &[Value::Object(Some(obj))],
-                    )?;
-                    Ok(Some(Value::Object(Some(obj))))
-                }
+                Some(Value::Object(Some(obj))) => Ok(Some(Value::Object(Some(obj)))),
                 _ => Err(RuntimeError::UnsupportedOperationException {
                     message: format!("InstantiationException: failed to instantiate {}", class_name),
                 }.into()),
