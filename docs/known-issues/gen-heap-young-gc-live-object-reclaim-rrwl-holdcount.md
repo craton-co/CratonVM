@@ -1,14 +1,15 @@
 # Young-GC live-object reclamation corrupts RRWL read-lock hold counts (ES binary-docvalues IMSE / probe hang)
 
 Status: PRIMARY HOLE FIXED 2026-07-07 (branch
-`fix/young-gc-live-reclaim-20260707`) — see "2026-07-07 root cause and fix"
+`fix/young-gc-live-reclaim-20260707`) - see "2026-07-07 root cause and fix"
 below. The probe's plain-mode permanent hang is gone (0/16 hangs vs ~6/6;
 healthy ~200M ops/8s), and the long-open RandomizedContext
-`WeakHashMap<Thread,…>` `getPerThread()` NPE is CONFIRMED GONE
+`WeakHashMap<Thread,...>` `getPerThread()` NPE is CONFIRMED GONE
 (`MappingStatsTests` now runs all 14 methods with zero
-`randomnesses`-NPE occurrences). Doc stays OPEN for the three remaining
-faces listed at the bottom (ES `testAllEqual` stall/IMSE, extreme-GC-stress
-hang, crawl regime).
+`randomnesses`-NPE occurrences). The 2026-07-08 pass also fixed the
+`ThreadIdentifiers.NEXT_TID_OFFSET == 0` / Java-created tid 0 lead. Doc stays
+OPEN for the ES `testAllEqual` face and the remaining extreme-GC-stress /
+stale-pointer residuals.
 
 Date filed: 2026-07-07 (split out of
 `elasticsearch-lucene-binary-docvalues-range-hangs.md`, whose three original
@@ -302,12 +303,60 @@ update under full JIT (compiled ThreadLocalMap/HoldCounter paths) — catch
 it again with `CRATONVM_DBG_IMSE=1` now that tids are unique; the dump
 prints whether the broken invariant is the identity, the cache, or the map.
 
-**Filed lead (separate defect worth its own fix):** the
-`ThreadIdentifiers` static counter starts at 0 instead of the
-class-initializer's seed because Unsafe STATIC accessors
-(`getAndAddLong`/`getLong` on `staticFieldOffset` offsets) read/write a
-SIDE STORE (`static_long_store`) that is never reconciled with the VM's
-real statics table (where putstatic wrote the seed). Any JDK code mixing
-putstatic-initialized statics with Unsafe static access sees this dual-store
-desync. Tid uniqueness no longer depends on it after the range split, but
-the desync will bite other code.
+**Filed lead (FIXED 2026-07-08):** the
+`ThreadIdentifiers` counter lead had two parts. First,
+`Thread.getNextThreadIdOffset()` returned `0`, so
+`ThreadIdentifiers.next()` called `Unsafe.getAndAddLong(null, 0, 1)` and
+allocated Java-created tids from a zero-seeded side store (`0,1,2,...`).
+Second, null-base Unsafe long operations on registered static offsets used
+that side store instead of the VM's real class statics. Current fix returns
+a dedicated synthetic `NEXT_TID_OFFSET` seeded to `1` and routes registered
+static long offsets (`getLong`, `putLong`, CAS, get-and-add/set,
+compare-and-exchange; volatile and plain forms where applicable) through
+real static storage.
+
+## 2026-07-08 third pass: ThreadIdentifiers offset fixed; family still open
+
+Root cause for this subcase: the real JDK's
+`java/lang/Thread$ThreadIdentifiers.NEXT_TID_OFFSET` is initialized from the
+native `Thread.getNextThreadIdOffset()`. CratonVM's stub returned `0`, so the
+subsequent `Unsafe.getAndAddLong(null, NEXT_TID_OFFSET, 1)` path used the
+generic null-base `static_long_store` at offset 0 and allocated illegal
+Java-created tids `0,1,2,...`. That no longer collided with VM-fabricated
+main-thread mirrors after the 2026-07-07 high-range split, but tid 0 is still
+invalid and leaves RRWL/AQS bookkeeping in a non-HotSpot state.
+
+Fix on branch `codex/fix-young-gc-rrwl-holdcount-20260708-142835`:
+
+- `Thread.getNextThreadIdOffset()` now returns a dedicated synthetic offset
+  (`0x20000000` in the validation run) backed by a null-base Unsafe long
+  counter seeded to `1`.
+- Null-base Unsafe long operations for registered `staticFieldOffset` values
+  now hit real VM static storage instead of an independent side store
+  (`getLong`, `putLong`, CAS, get-and-add/set, compare-and-exchange; volatile
+  and plain forms where applicable).
+
+Focused validation on Azure host `20.83.144.174`, worktree
+`/data/data/cratonvm-worktrees/20260708-142835-young-gc-rrwl-holdcount`,
+unique binary
+`/data/data/cratonvm-worktrees/bin/cratonvm-young-gc-rrwl-holdcount-20260708-142835`:
+
+- `cargo test -p cratonvm-native-builtins unsafe_static_field_offset_tests -- --nocapture`
+  passed: 3/3 tests, including the new real-static-storage and seeded tid
+  offset regressions.
+- Reflective `ThreadIdentifiersFields20260708` now prints
+  `NEXT_TID_OFFSET=536870912` instead of `0`.
+- Reflective `TidProbeCompat20260708` now prints
+  `main=1099511627776`, spawned tids `1,2,3`, and
+  `LockSupport.getThreadId` matches each `Thread.threadId()` value.
+- Plain `RwlReadTearingProbe 8 8000`: 3/3 completed with `DONE` and no hang.
+- Extreme stress `CRATONVM_DBG_GC_STRESS=200000 RwlReadTearingProbe 8 8000`:
+  2/3 completed with `DONE`, 1/3 timed out at 45s; logs still show
+  `STW cross-thread JIT takeover is still waiting`, stale receiver fallback,
+  and implausible/corrupt young headers. This residual remains open.
+
+No direct ES `LongRandomBinaryDocValuesRangeQueryTests.testAllEqual` rerun was
+possible on this Azure host: neither `/data/data/cratonvm/apps/elasticsearch`
+nor a `server/build/craton-testcp.txt` classpath exists in the available
+checkouts. Keep this note in `docs/known-issues` until the ES face and stress
+residual are rechecked/fixed.
