@@ -102,7 +102,7 @@ use std::sync::{Arc, Mutex, OnceLock, Weak};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use cratonvm_native_api::{NativeContext, NativeMethodRegistry};
+use cratonvm_native_api::{NativeContext, NativeMethodRegistry, NativeThreadBlocker};
 use cratonvm_types::error::{MethodCallFailed, MethodCallResult, RuntimeError, VmError};
 use cratonvm_types::{ObjectRef, Value};
 
@@ -593,6 +593,27 @@ pub fn dispatch_channel_event(key: SelectedKey) {
 // The event loop.
 // ---------------------------------------------------------------------------
 
+struct NativeSelectBlock<'a> {
+    blocker: Option<&'a dyn NativeThreadBlocker>,
+}
+
+impl<'a> NativeSelectBlock<'a> {
+    fn enter(blocker: Option<&'a dyn NativeThreadBlocker>) -> Self {
+        if let Some(blocker) = blocker {
+            blocker.enter_blocked();
+        }
+        Self { blocker }
+    }
+}
+
+impl Drop for NativeSelectBlock<'_> {
+    fn drop(&mut self) {
+        if let Some(blocker) = self.blocker {
+            blocker.leave_blocked();
+        }
+    }
+}
+
 /// Run the event loop for a single I/O thread. Called by T19.7.b's
 /// worker-thread entry point after the handle has been constructed.
 /// Returns only when `handle.shutdown_requested` is set.
@@ -600,9 +621,19 @@ pub fn dispatch_channel_event(key: SelectedKey) {
 /// Panic-safe per task — individual Runnables cannot crash the loop.
 /// The five phases per iteration are documented in the module header.
 pub fn run_io_loop(handle: Arc<IoThreadHandle>) {
+    run_io_loop_with_blocker(handle, None);
+}
+
+fn run_io_loop_with_blocker(
+    handle: Arc<IoThreadHandle>,
+    blocker: Option<Arc<dyn NativeThreadBlocker>>,
+) {
     // Record OS-level thread id so `execute` can tell same-thread vs
     // cross-thread.
     handle.loop_thread_id.store(os_tid(), Ordering::Release);
+    if let Some(blocker) = blocker.as_deref() {
+        blocker.publish_os_tid();
+    }
     let _registered = CURRENT_IO_THREAD.with(|slot| {
         let mut g = slot.borrow_mut();
         let prev = g.clone();
@@ -648,7 +679,10 @@ pub fn run_io_loop(handle: Arc<IoThreadHandle>) {
         handle.pending_wakeup.store(false, Ordering::Release);
 
         // ---- phase 3 — block in selector.select ----
-        let select_res = handle.selector.select(timeout);
+        let select_res = {
+            let _blocked = NativeSelectBlock::enter(blocker.as_deref());
+            handle.selector.select(timeout)
+        };
         match select_res {
             Ok(_n) => {}
             Err(e) => {
@@ -921,10 +955,11 @@ pub fn spawn_io_thread_with_ctx(
 
     let h_for_thread = handle.clone();
     let captured_vm_tid = vm_tid;
+    let blocker_for_thread = ctx.native_thread_blocker(vm_tid);
     let jh = thread::Builder::new()
         .name(name.clone())
         .spawn(move || {
-            run_io_loop(h_for_thread.clone());
+            run_io_loop_with_blocker(h_for_thread.clone(), blocker_for_thread);
             // After the loop exits, push the captured VM ThreadId
             // onto the dead-queue. Captured-by-value avoids the
             // race that a `lookup_vm_thread_id` on a global map

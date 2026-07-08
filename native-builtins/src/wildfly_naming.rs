@@ -58,7 +58,7 @@ use cratonvm_types::error::{MethodCallFailed, MethodCallResult};
 use cratonvm_types::{ObjectRef, Value};
 use parking_lot::RwLock;
 
-use crate::jboss_msc::{global_container, Mode, ServiceName};
+use crate::jboss_msc::{alloc_java_service_name, global_container, Mode, ServiceName};
 use crate::{alloc_concurrent_synthetic, obj_arg};
 
 // ===========================================================================
@@ -170,6 +170,7 @@ pub fn canonical_jndi_name(raw: &str) -> JndiName {
 #[derive(Debug, Clone)]
 pub struct BindInfo {
     pub binder_service_name: Arc<ServiceName>,
+    pub parent_context_service_name: Arc<ServiceName>,
     pub binding_name: JndiName,
     pub absolute_name: JndiName,
 }
@@ -181,26 +182,60 @@ pub fn java_context_service_name() -> Arc<ServiceName> {
     ServiceName::of(["java"])
 }
 
+fn split_context_parent(after_java_prefix: &str) -> (&'static [&'static str], &str) {
+    let contexts: [(&str, &[&str]); 7] = [
+        ("jboss/exported", &["java", "jboss", "exported"]),
+        ("jboss", &["java", "jboss"]),
+        ("app", &["java", "app"]),
+        ("module", &["java", "module"]),
+        ("comp", &["java", "comp"]),
+        ("global", &["java", "global"]),
+        ("", &["java"]),
+    ];
+
+    for (prefix, parent) in contexts {
+        if prefix.is_empty() {
+            return (parent, after_java_prefix);
+        }
+        if after_java_prefix == prefix {
+            return (parent, "");
+        }
+        if let Some(rest) = after_java_prefix.strip_prefix(prefix) {
+            if let Some(rest) = rest.strip_prefix('/') {
+                return (parent, rest);
+            }
+        }
+    }
+
+    unreachable!("empty prefix fallback must match");
+}
+
 /// Parse `java:jboss/datasources/KeycloakDS` →
 ///
 /// * binder service name `java.jboss.datasources.KeycloakDS`,
-/// * stripped binding name `jboss/datasources/KeycloakDS`.
+/// * parent context service name `java.jboss`,
+/// * stripped binding name `datasources/KeycloakDS`.
 pub fn context_names_bind_info_for(absolute: &str) -> Result<BindInfo, String> {
     validate_jndi_name(absolute)?;
     let trimmed = absolute.trim();
     // Strip leading `java:` (if present) before turning the path into
     // MSC segments.
     let after = trimmed.strip_prefix("java:").unwrap_or(trimmed);
-    // MSC ServiceName segments — "java" root + each `/`-delimited piece.
-    let mut segs: Vec<String> = vec!["java".to_string()];
-    for seg in after.split('/') {
+
+    let (parent_segments, bind_name) = split_context_parent(after);
+    let parent_context_service_name = ServiceName::of(parent_segments.iter().copied());
+
+    // MSC ServiceName segments — parent context + each `/`-delimited bind-name piece.
+    let mut segs: Vec<String> = parent_segments.iter().map(|s| (*s).to_string()).collect();
+    for seg in bind_name.split('/') {
         if !seg.is_empty() {
             segs.push(seg.to_string());
         }
     }
     Ok(BindInfo {
         binder_service_name: ServiceName::of(segs),
-        binding_name: canonical_jndi_name(after),
+        parent_context_service_name,
+        binding_name: canonical_jndi_name(bind_name),
         absolute_name: canonical_jndi_name(trimmed),
     })
 }
@@ -445,9 +480,11 @@ const NAMING_STORE_FIELD_BINDINGS: usize = 0;
 const NAMING_STORE_FIELD_SERVICE_BASE: usize = 1;
 const NAMING_STORE_NUM_SLOTS: usize = 2;
 
-const BIND_INFO_FIELD_BINDER: usize = 0;
-const BIND_INFO_FIELD_BINDING_NAME: usize = 1;
-const BIND_INFO_NUM_SLOTS: usize = 2;
+const BIND_INFO_FIELD_PARENT: &str = "parentContextServiceName";
+const BIND_INFO_FIELD_BINDER: &str = "binderServiceName";
+const BIND_INFO_FIELD_BIND_NAME: &str = "bindName";
+const BIND_INFO_FIELD_ABSOLUTE: &str = "absoluteJndiName";
+const BIND_INFO_NUM_SLOTS: usize = 4;
 
 /// Build a *real, catchable* `javax.naming.*` exception object and wrap it in
 /// `MethodCallFailed::ExceptionThrown`.
@@ -1265,13 +1302,21 @@ fn native_context_names_bind_info_for(
         "org/jboss/as/naming/deployment/ContextNames$BindInfo",
         BIND_INFO_NUM_SLOTS,
     );
-    let binder_s = ctx.create_string(info.binder_service_name.canonical());
-    let binding_s = ctx.create_string(info.binding_name.as_ref());
-    ctx.set_field(obj, BIND_INFO_FIELD_BINDER, Value::Object(Some(binder_s)));
-    ctx.set_field(
+    let parent_obj = alloc_java_service_name(ctx, &info.parent_context_service_name);
+    let binder_obj = alloc_java_service_name(ctx, &info.binder_service_name);
+    let bind_name_s = ctx.create_string(info.binding_name.as_ref());
+    let absolute_s = ctx.create_string(info.absolute_name.as_ref());
+    ctx.set_field_by_name(obj, BIND_INFO_FIELD_PARENT, Value::Object(Some(parent_obj)));
+    ctx.set_field_by_name(obj, BIND_INFO_FIELD_BINDER, Value::Object(Some(binder_obj)));
+    ctx.set_field_by_name(
         obj,
-        BIND_INFO_FIELD_BINDING_NAME,
-        Value::Object(Some(binding_s)),
+        BIND_INFO_FIELD_BIND_NAME,
+        Value::Object(Some(bind_name_s)),
+    );
+    ctx.set_field_by_name(
+        obj,
+        BIND_INFO_FIELD_ABSOLUTE,
+        Value::Object(Some(absolute_s)),
     );
     Ok(Some(Value::Object(Some(obj))))
 }
@@ -1546,8 +1591,16 @@ mod tests {
             info.binder_service_name.canonical(),
             "java.jboss.datasources.KeycloakDS"
         );
-        assert_eq!(&*info.binding_name, "jboss/datasources/KeycloakDS");
+        assert_eq!(info.parent_context_service_name.canonical(), "java.jboss");
+        assert_eq!(&*info.binding_name, "datasources/KeycloakDS");
         assert_eq!(&*info.absolute_name, "java:jboss/datasources/KeycloakDS");
+
+        let exported = context_names_bind_info_for("java:jboss/exported/Foo").unwrap();
+        assert_eq!(
+            exported.parent_context_service_name.canonical(),
+            "java.jboss.exported"
+        );
+        assert_eq!(&*exported.binding_name, "Foo");
 
         // And ensure the injection-guard rejects hostile URL schemes.
         assert!(context_names_bind_info_for("ldap://evil.example/a").is_err());

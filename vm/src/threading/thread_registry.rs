@@ -733,6 +733,36 @@ impl ThreadRegistry {
             .collect()
     }
 
+    /// Mark a VM-registered native carrier thread as parked in host-native code.
+    ///
+    /// These threads do not own interpreter frames while parked, so their
+    /// authoritative root snapshot is empty. The flag still matters: moving-GC
+    /// fixups and STW diagnostics use it to classify the thread as blocked.
+    pub fn mark_native_thread_blocked(&self, thread_id: ThreadId) {
+        let threads = self.threads.lock();
+        if let Some(entry) = threads.get(&thread_id) {
+            entry.root_snapshot.lock().clear();
+            entry.frame_trace.lock().clear();
+            entry
+                .gc_block_state
+                .in_blocked_region
+                .store(true, Ordering::Release);
+        }
+    }
+
+    /// Clear the GC-blocked mark for a VM-registered native carrier thread.
+    pub fn mark_native_thread_unblocked(&self, thread_id: ThreadId) {
+        let threads = self.threads.lock();
+        if let Some(entry) = threads.get(&thread_id) {
+            entry.gc_block_state.fixup.lock().clear();
+            entry.root_snapshot.lock().clear();
+            entry
+                .gc_block_state
+                .in_blocked_region
+                .store(false, Ordering::Release);
+        }
+    }
+
     /// DBG (CRATONVM_DBG_MTROOTS): per-thread (tid, in_blocked_region,
     /// snapshot_len) for every alive thread. Used at an STW to see whether a
     /// thread that holds a reclaimed live oop was counted BLOCKED (excluded from
