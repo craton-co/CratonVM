@@ -42,14 +42,14 @@ standard library, so it can run with **no JDK installation, no `JAVA_HOME`, no `
 
 | Benchmark               | JDK 25 C2    | CratonVM default | Default ratio | CratonVM OSR, threshold=1 | OSR ratio |
 |-------------------------|--------------|------------------|---------------|---------------------------|-----------|
-| Arithmetic 300M         | 991 ms       | 73,820 ms        | 74.5x         | 1,534 ms                  | 1.55x     |
-| Fibonacci(42)           | 2,071 ms     | 28,969 ms        | 14.0x         | 28,525 ms                 | 13.8x     |
-| Sieve 100Kx500          | 358 ms       | 31,665 ms        | 88.4x         | 466 ms                    | 1.30x     |
-| Matrix 500x500          | 336 ms       | 39,078 ms        | 116.3x        | 452 ms                    | 1.35x     |
-| **QuickBench TOTAL**    | **3,756 ms** | **173,532 ms**   | **46.2x**     | **30,977 ms**             | **8.25x** |
-| Binary Trees (depth=18) | 681 ms       | 36,525 ms        | 53.6x         | 36,983 ms                 | 54.3x     |
+| Arithmetic 300M         | 343 ms       | 692 ms           | 2.0x          | 740 ms                    | 2.2x      |
+| Fibonacci(42)           | 603 ms       | 2,944 ms         | 4.9x          | 2,975 ms                  | 4.9x      |
+| Sieve 100Kx500          | 70 ms        | 349 ms           | 5.0x          | 354 ms                    | 5.1x      |
+| Matrix 500x500          | 161 ms       | 370 ms           | 2.3x          | 380 ms                    | 2.4x      |
+| **QuickBench TOTAL**    | **1,177 ms** | **4,355 ms**     | **3.7x**      | **4,449 ms**              | **3.8x**  |
+| Binary Trees (depth=18) | 347 ms       | 8,214 ms         | 23.7x         | 8,554 ms                  | 24.7x     |
 
-*Single-run historical snapshot measured on Microsoft Windows 11 Home, JDK 25.0.1 LTS, release builds, before the 2026-07-04 OSR default flip. QuickBench rows are from CratonVM code `b80c50b5` on 2026-07-02. The Binary Trees CratonVM columns were rechecked on 2026-07-03 at `8292ec9c`, using the same 681 ms HotSpot baseline from the 2026-07-02 JDK run. The benchmark sources are the historical `bench/QuickBench.java` and `bench/binarytrees.java` from commit `2cea208`; `bench/` is currently untracked. The old default column used a launcher default where OSR was disabled. The OSR column sets `CRATONVM_JIT_OSR=1 CRATONVM_JIT_THRESHOLD=1`; for QuickBench it recovers Arithmetic, Sieve, and Matrix, while Fibonacci and Binary Trees remain current regressions. Current `dev` enables OSR by default; set `CRATONVM_JIT_OSR=0` to reproduce the old OSR-off lane.*
+*Best-of-N snapshot measured 2026-07-08 on a shared Azure Linux build host (16 cores; sustained `uptime` load average 10-16 from concurrent sessions) against JDK 25.0.3 Temurin C2 and a CratonVM release build off `dev` at `bfc26c2d`. N=10 samples for JDK 25, N=7 per CratonVM column (one CratonVM-default run of 50,516 ms excluded as a host-contention outlier); reported as best-of-N rather than a single run because run-to-run variance on this shared, multi-tenant host was 2-4x. The benchmark sources are the historical `bench/QuickBench.java` and `bench/binarytrees.java` from commit `2cea208`; `bench/` remains untracked — restore via `git show 2cea208:bench/<file>`. `CRATONVM_JIT_OSR` back-edge OSR is now default-on (flipped 2026-07-04), so the "CratonVM default" column already includes OSR; the "OSR, threshold=1" column additionally forces `CRATONVM_JIT_THRESHOLD=1`. That extra tuning no longer shows a distinct benefit now that OSR itself defaults on — both columns agree within run-to-run noise, unlike the pre-flip snapshot where forcing OSR+low-threshold was the only way to see it at all. Absolute times are not comparable to the pre-2026-07-04 Windows-box snapshot this replaces (different host, different JDK patch, different dev commit) — only the CratonVM/HotSpot ratios, measured on the same host, carry over. Fibonacci and Binary Trees remain the largest gaps, matching the JIT call-dispatch and GC-throughput work still tracked on the roadmap.*
 
 See [docs/JIT_OPTIMIZATION.md](docs/JIT_OPTIMIZATION.md) for the full 26-round JIT optimization journey.
 

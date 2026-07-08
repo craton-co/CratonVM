@@ -7,32 +7,36 @@ with hardware, OS load, JDK version, and VM configuration.
 
 ## QuickBench vs. HotSpot JDK 25 C2
 
-*Historical pre-2026-07-04-OSR-default-flip snapshot measured on Windows 11
-against JDK 25.0.1 C2 and CratonVM release builds.
-QuickBench rows are from CratonVM code `b80c50b5` on 2026-07-02. The Binary
-Trees CratonVM columns were rechecked on 2026-07-03 at `8292ec9c`, using the
-same 681 ms HotSpot baseline from the 2026-07-02 JDK run. Ratio = CratonVM time
-/ HotSpot time (lower is better; 1.00x is parity). The old default column used
-a launcher default where OSR was disabled. Current `dev` enables OSR by default;
-set `CRATONVM_JIT_OSR=0` to reproduce the old OSR-off lane. The OSR column sets
-`CRATONVM_JIT_OSR=1` and `CRATONVM_JIT_THRESHOLD=1`.*
+*Best-of-N snapshot measured 2026-07-08 on a shared Azure Linux build host (16
+cores, sustained load average 10-16 from concurrent sessions) against JDK
+25.0.3 Temurin C2 and a CratonVM release build off `dev` at `bfc26c2d`. N=10
+samples for JDK 25, N=7 per CratonVM column (one CratonVM-default run of
+50,516 ms excluded as a host-contention outlier) — best-of-N rather than a
+single run because run-to-run variance on this shared host was 2-4x. Ratio =
+CratonVM time / HotSpot time (lower is better; 1.00x is parity). `dev` enables
+back-edge OSR by default (flipped 2026-07-04), so the default column already
+includes OSR; the OSR column additionally sets `CRATONVM_JIT_THRESHOLD=1`.
+Set `CRATONVM_JIT_OSR=0` to reproduce the old OSR-off lane.*
 
 | Benchmark                 | JDK 25 C2    | CratonVM default | Default ratio | CratonVM OSR, threshold=1 | OSR ratio |
 |---------------------------|--------------|------------------|---------------|---------------------------|-----------|
-| Arithmetic (300M ops)     | 991 ms       | 73,820 ms        | 74.5x         | 1,534 ms                  | 1.55x     |
-| Fibonacci(42), recursive  | 2,071 ms     | 28,969 ms        | 14.0x         | 28,525 ms                 | 13.8x     |
-| Sieve (100K x 500 reps)   | 358 ms       | 31,665 ms        | 88.4x         | 466 ms                    | 1.30x     |
-| Matrix 500x500 multiply   | 336 ms       | 39,078 ms        | 116.3x        | 452 ms                    | 1.35x     |
-| **QuickBench TOTAL**      | **3,756 ms** | **173,532 ms**   | **46.2x**     | **30,977 ms**             | **8.25x** |
-| Binary Trees (depth = 18) | 681 ms       | 36,525 ms        | 53.6x         | 36,983 ms                 | 54.3x     |
+| Arithmetic (300M ops)     | 343 ms       | 692 ms           | 2.0x          | 740 ms                    | 2.2x      |
+| Fibonacci(42), recursive  | 603 ms       | 2,944 ms         | 4.9x          | 2,975 ms                  | 4.9x      |
+| Sieve (100K x 500 reps)   | 70 ms        | 349 ms           | 5.0x          | 354 ms                    | 5.1x      |
+| Matrix 500x500 multiply   | 161 ms       | 370 ms           | 2.3x          | 380 ms                    | 2.4x      |
+| **QuickBench TOTAL**      | **1,177 ms** | **4,355 ms**     | **3.7x**      | **4,449 ms**              | **3.8x**  |
+| Binary Trees (depth = 18) | 347 ms       | 8,214 ms         | 23.7x         | 8,554 ms                  | 24.7x     |
 
 **Reading the results:**
 
-- In this historical snapshot, default launcher settings left these one-shot hot
-  loops mostly interpreted, so the default QuickBench total was not competitive.
-- With OSR enabled and the invocation threshold lowered, Arithmetic, Sieve, and
-  Matrix were close to HotSpot C2. Recursive Fibonacci remains a call-heavy JIT
-  gap, and Binary Trees remains dominated by allocation/GC throughput.
+- Now that back-edge OSR defaults on, the default column is already close to
+  the tuned OSR/low-threshold column — forcing `CRATONVM_JIT_THRESHOLD=1` no
+  longer buys a distinct advantage; both columns agree within run-to-run
+  noise. That tuning only mattered previously, when OSR itself was opt-in.
+- Arithmetic, Sieve, and Matrix now run within ~2-5x of HotSpot C2. Recursive
+  Fibonacci and Binary Trees remain the largest gaps — Fibonacci from
+  call-heavy JIT dispatch overhead, Binary Trees from allocation/GC
+  throughput.
 - Closing the Fibonacci and Binary Trees gaps is a tracked roadmap item; see
   [Roadmap](../contributing/roadmap.md).
 
