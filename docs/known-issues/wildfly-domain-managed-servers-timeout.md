@@ -581,3 +581,45 @@ defects are now known across this doc pair:
 Both docs remain OPEN. No fix landed this session; this is a documentation
 and scoping pass only, to prevent a future session from re-treading the
 same ground or conflating these three distinct failure modes.
+
+
+## 2026-07-08 update — logging follow-up residual fixed; XNIO native blocking hardened; broader STW stall remains OPEN
+
+Branch `codex/fix-wildfly-stw-park-20260708-165032` on the Azure probe host, using a separate worktree from `dev` and uniquely named binaries:
+
+```text
+/data/data/cratonvm-builtins/cratonvm-wildfly-residuals-20260708-171950
+/data/data/cratonvm-builtins/java-wildfly-residuals-20260708-171950
+/data/data/fakejdk-wildfly-residuals-20260708-171950/bin/java
+```
+
+Two concrete fixes landed in this pass:
+
+1. **`String.getCanonicalName()` residual fixed.** The immediate post-LogManager WildFly boot failure was not a missing JDK API. `ContextNames$BindInfo.getBinderServiceName()` was returning a synthetic field populated with a `String`, while real WildFly expects `org.jboss.msc.service.ServiceName`. The naming bridge now allocates the real four-field `BindInfo` shape and stores `ServiceName` mirrors for both parent and binder service names. See the fixed note in `docs/internal/fixed-suite-bugs/wildfly-bindinfo-binder-servicename.md`.
+2. **XNIO registered native selector threads now publish GC-blocked state.** A new `NativeThreadBlocker` hook lets native-spawned carrier threads publish their OS tid and bracket host-native waits. `xnio_io_thread::run_io_loop_with_blocker` wraps `selector.select(timeout)` so XNIO `epoll`/selector waits are excluded from STW expected-count accounting and visible as blocked in the thread registry.
+
+Validation performed:
+
+```text
+cargo test -p cratonvm-native-builtins t19_2_b_context_names_bind_info_parses_absolute_name -- --nocapture
+cargo test -p cratonvm-native-builtins t19_2_b_service_based_naming_store_registers_msc_service -- --nocapture
+cargo check -p cratonvm-native-api -p cratonvm-native-builtins -p cratonvm-vm
+cargo build --release -p cratonvm-cli --features java-bin-alias --bin cratonvm --bin java
+```
+
+The direct WildFly `standalone.sh` probe with the rebuilt fake JDK confirms the `String.getCanonicalName` error is gone and boot progresses further. New visible failures before the remaining STW stall are:
+
+```text
+WFLYCTL0158: Operation handler failed: java.lang.NullPointerException: Cannot invoke "org.jboss.modules.ModuleLoader.loadModule(org.jboss.modules.ModuleIdentifier)"
+WFLYCTL0158: Operation handler failed: java.lang.NullPointerException: Method parameter cannot be null
+```
+
+The STW residual is **not fixed**. The rebuilt JIT-on standalone probe still times out with:
+
+```text
+[stw-census] rounds=64 pending=1 taken=0 blocked=67 alive=76
+```
+
+The pending thread in that run was a non-blocked `ParallelBootOperationStepHandler$ParallelBootTransactionControl.operationPrepared` worker (`t53`), while a follow-up probe with `CRATONVM_JIT_BISECT_SKIP='org/jboss/threads/EnhancedQueueExecutor$ThreadBody.run'` made idle `ThreadBody.run@442` workers consistently blocked but still wedged later with a non-blocked `operationPrepared` worker (`t38`). That rules out a single `EnhancedQueueExecutor$ThreadBody.run` JIT skip as a complete fix. The next pass should focus on the Java/AQS/Future wait path used by `operationPrepared` and the two new functional boot NPEs above.
+
+Status remains OPEN: the fixed `BindInfo` bug is closed under `docs/internal`; this doc continues to track the broader WildFly domain/standalone boot residuals.
