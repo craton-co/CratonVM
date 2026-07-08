@@ -793,38 +793,102 @@ fn chm_extra_entries(
         Ok(Some(Value::Object(Some(s)))) => s,
         _ => return Vec::new(),
     };
-    let it = match ctx.invoke_virtual(set, "iterator", "()Ljava/util/Iterator;", &[]) {
+    let set_pin = ctx.pin_native_root(set);
+    let set_cur = ctx.read_native_pin(set_pin, set);
+    let it = match ctx.invoke_virtual(set_cur, "iterator", "()Ljava/util/Iterator;", &[]) {
         Ok(Some(Value::Object(Some(i)))) => i,
-        _ => return Vec::new(),
+        _ => {
+            ctx.unpin_native_roots(set_pin);
+            return Vec::new();
+        }
     };
-    let mut out = Vec::new();
+    ctx.unpin_native_roots(set_pin);
+
+    struct PinnedExtraEntry {
+        key_pin: usize,
+        key_fallback: ObjectRef,
+        value: Value,
+        value_pin: Option<(usize, ObjectRef)>,
+        key_string: Option<String>,
+    }
+
+    let it_pin = ctx.pin_native_root(it);
+    let mut pinned = Vec::new();
     loop {
-        match ctx.invoke_virtual(it, "hasNext", "()Z", &[]) {
+        let it_cur = ctx.read_native_pin(it_pin, it);
+        match ctx.invoke_virtual(it_cur, "hasNext", "()Z", &[]) {
             Ok(Some(Value::Int(n))) if n != 0 => {}
             _ => break,
         }
-        let entry = match ctx.invoke_virtual(it, "next", "()Ljava/lang/Object;", &[]) {
+        let it_cur = ctx.read_native_pin(it_pin, it);
+        let entry = match ctx.invoke_virtual(it_cur, "next", "()Ljava/lang/Object;", &[]) {
             Ok(Some(Value::Object(Some(o)))) => o,
             _ => break,
         };
-        let key_obj = match ctx.invoke_virtual(entry, "getKey", "()Ljava/lang/Object;", &[]) {
+        let entry_pin = ctx.pin_native_root(entry);
+        let entry_cur = ctx.read_native_pin(entry_pin, entry);
+        let key_obj = match ctx.invoke_virtual(entry_cur, "getKey", "()Ljava/lang/Object;", &[]) {
             Ok(Some(Value::Object(Some(o)))) => o,
-            _ => continue,
+            _ => {
+                ctx.unpin_native_roots(entry_pin);
+                continue;
+            }
         };
-        let value = match ctx.invoke_virtual(entry, "getValue", "()Ljava/lang/Object;", &[]) {
+        let key_pin = ctx.pin_native_root(key_obj);
+        let entry_cur = ctx.read_native_pin(entry_pin, entry);
+        let value = match ctx.invoke_virtual(entry_cur, "getValue", "()Ljava/lang/Object;", &[]) {
             Ok(Some(v)) => v,
-            _ => continue,
+            _ => {
+                ctx.unpin_native_roots(key_pin);
+                ctx.unpin_native_roots(entry_pin);
+                continue;
+            }
         };
-        let kstr = ctx.read_string(key_obj);
+        let value_pin = match value {
+            Value::Object(Some(o)) => Some((ctx.pin_native_root(o), o)),
+            _ => None,
+        };
+        let key_cur = ctx.read_native_pin(key_pin, key_obj);
+        let kstr = ctx.read_string(key_cur);
+        ctx.unpin_native_roots(entry_pin);
         if let Some(ref s) = kstr {
             if skip.contains(s) {
+                if let Some((pin, _)) = value_pin {
+                    ctx.unpin_native_roots(pin);
+                }
+                ctx.unpin_native_roots(key_pin);
                 continue; // String entry already represented by the side-table
             }
         }
-        out.push((key_obj, value, kstr));
-        if out.len() >= MAX_PROPS_PER_OBJECT {
+        pinned.push(PinnedExtraEntry {
+            key_pin,
+            key_fallback: key_obj,
+            value,
+            value_pin,
+            key_string: kstr,
+        });
+        if pinned.len() >= MAX_PROPS_PER_OBJECT {
             break;
         }
+    }
+    ctx.unpin_native_roots(it_pin);
+
+    let mut out = Vec::with_capacity(pinned.len());
+    for entry in &pinned {
+        let key_obj = ctx.read_native_pin(entry.key_pin, entry.key_fallback);
+        let value = match (entry.value, entry.value_pin) {
+            (Value::Object(Some(_)), Some((pin, fallback))) => {
+                Value::Object(Some(ctx.read_native_pin(pin, fallback)))
+            }
+            _ => entry.value,
+        };
+        out.push((key_obj, value, entry.key_string.clone()));
+    }
+    for entry in pinned {
+        if let Some((pin, _)) = entry.value_pin {
+            ctx.unpin_native_roots(pin);
+        }
+        ctx.unpin_native_roots(entry.key_pin);
     }
     out
 }
@@ -1721,19 +1785,44 @@ fn native_properties_key_set(ctx: &mut dyn NativeContext, args: &[Value]) -> Met
             return Ok(Some(Value::Object(Some(empty))));
         }
     };
-    let set = build_key_set(ctx, this);
+    let mut set = build_key_set(ctx, this);
+    let set_pin = ctx.pin_native_root(set);
     // Add keys for CHM-exclusive (non-String-valued) entries so the key view
     // matches the real map; `stringPropertyNames()` deliberately does NOT do
     // this (it is specified to return only String-keyed/String-valued names).
     let side = side_key_set(ctx, this);
-    for (key_obj, _value, _kstr) in chm_extra_entries(ctx, this, &side) {
-        let _ = ctx.invoke_virtual(
-            set,
-            "add",
-            "(Ljava/lang/Object;)Z",
-            &[Value::Object(Some(key_obj))],
-        );
+    let extra = chm_extra_entries(ctx, this, &side);
+    let extra_key_pins: Vec<(usize, ObjectRef)> = extra
+        .iter()
+        .map(|(key_obj, _value, _kstr)| (ctx.pin_native_root(*key_obj), *key_obj))
+        .collect();
+    for ((key_obj, _value, kstr), (key_pin, key_fallback)) in
+        extra.iter().zip(extra_key_pins.iter())
+    {
+        let key_value = if let Some(s) = kstr {
+            // String keys are common for Properties; rebuild a fresh Java
+            // String after the CHM walk so the key cannot be a stale raw ref
+            // from a previous iterator call.
+            let fresh = ctx.create_string(s);
+            let fresh_pin = ctx.pin_native_root(fresh);
+            let fresh = ctx.read_native_pin(fresh_pin, fresh);
+            let value = Value::Object(Some(fresh));
+            set = ctx.read_native_pin(set_pin, set);
+            let _ = ctx.invoke_virtual(set, "add", "(Ljava/lang/Object;)Z", &[value]);
+            ctx.unpin_native_roots(fresh_pin);
+            continue;
+        } else {
+            let _ = key_obj;
+            Value::Object(Some(ctx.read_native_pin(*key_pin, *key_fallback)))
+        };
+        set = ctx.read_native_pin(set_pin, set);
+        let _ = ctx.invoke_virtual(set, "add", "(Ljava/lang/Object;)Z", &[key_value]);
     }
+    for (pin, _fallback) in extra_key_pins {
+        ctx.unpin_native_roots(pin);
+    }
+    set = ctx.read_native_pin(set_pin, set);
+    ctx.unpin_native_roots(set_pin);
     Ok(Some(Value::Object(Some(set))))
 }
 

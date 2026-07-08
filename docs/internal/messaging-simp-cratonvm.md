@@ -15,6 +15,7 @@ Status: fixed on 2026-07-08 in branch `codex/messaging-simp-20260708`.
 ## Root causes fixed
 
 - `ConcurrentHashMap.computeIfPresent` was missing from the native CHM bridge, so Spring subscription-registry updates did not match HotSpot.
+- `LinkedBlockingQueue.clear()` in the real-JDK essential native path treated slot 1 as the synthetic `size` int and overwrote the real `count: AtomicInteger` reference; `BufferingStompDecoderTests` exposed this when chunk assembly cleared its queue and later called real queue bytecode that dereferenced `count`.
 - `Collections.max(Collection)` returned `null` for non-ArrayList collections. ActiveMQ STOMP version negotiation uses `HashSet` plus `Collections.max`, which produced `CONNECTED version:null` and broke receipt handling.
 - Reactor Netty was forced to too small a worker pool. One or two workers could strand simultaneous STOMP connects; a deterministic default of four workers keeps the Spring concurrent-connect path live while preserving explicit user `-Dreactor.netty.ioWorkerCount` values.
 - The Spring/Netty/ActiveMQ bridge layer needed explicit real-JDK-mode coverage for Netty JCTools queues, Reactor `Mono.just`, STOMP frame sends, ActiveMQ topic/cursor helpers, and `ByteBuffer.wrap`/shared-secret access used in this cluster.

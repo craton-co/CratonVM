@@ -8,6 +8,30 @@ angles**; this index is the consolidated map. Read it first.
 
 - FIXED/RETIRED: [Tribes `ParallelNioSender` selected-key `ClassCastException`](../internal/fixed-suite-bugs/nio-selectionkey-classcastexception-tribes-sender-FIXED.md) - the remaining two-key `Selector.selectedKeys().iterator().next()/remove()` GC-stress crash was in native collection map/set helpers, not the selector side table. `HashMap.put`/`remove` now pin their inner receiver/key/value windows, `HashSet.iterator()` pins its receiver/snapshot backing before allocation, and the focused two-`SelectionKey` fixture passes under `CRATONVM_GC_STRESS`.
 
+## 2026-07-07 Five new Spring non-passed-rerun bugs (Azure host, dev, real-JDK/JIT-on)
+
+Found triaging FAIL results from a 516-class Spring non-passed rerun (filtered
+out ~250 environmental classpath-dump gaps first — missing cross-module
+Spring test-fixture jars, not CratonVM bugs). All 5 below are genuine,
+distinct CratonVM defects, still OPEN, no fix attempted yet:
+
+- OPEN: [`web-x509trustmanager-getacceptedissuers-abstractmethoderror.md`](web-x509trustmanager-getacceptedissuers-abstractmethoderror.md) — `X509TrustManager.getAcceptedIssuers()` AbstractMethodError, identical across all 4 HTTP server backends in one WebFlux test.
+- OPEN: [`groovy-compilationunit-phaseoperation-abstractmethoderror.md`](groovy-compilationunit-phaseoperation-abstractmethoderror.md) — Groovy `CompilationUnit$PhaseOperation.doPhaseOperation` AbstractMethodError, 4 `GroovyScriptFactoryTests` methods.
+- OPEN: [`stomp-bufferingdecoder-atomicinteger-count-npe.md`](stomp-bufferingdecoder-atomicinteger-count-npe.md) — `BufferingStompDecoder`'s `count` `AtomicInteger` field null, 5 STOMP decoder test methods.
+- OPEN: [`linkedcaseinsensitivemap-deserialize-this0-npe.md`](linkedcaseinsensitivemap-deserialize-this0-npe.md) — `LinkedCaseInsensitiveMap` inner-class `this$0` null after deserialize; related but distinct from the FIXED `removeEldestEntry`-dispatch-to-`Object` NSME below.
+- OPEN: [`reflection-arenestmates-missing-native.md`](reflection-arenestmates-missing-native.md) — `jdk.internal.reflect.Reflection.areNestMates` has no native registered at all.
+
+Also confirmed (not new, corroborating evidence only, no new doc needed):
+`expression.spel.*` SpEL `EL1040E` double-literal-suffix parse failures (33
+occurrences, matches an already-known SpEL bug); `NoSuchMethodError:
+Object.accept/Object.test` in `SpelCompilerTests`/`BeanOverrideHandlerTests`
+matches the general JIT wrong-receiver-type/virtual-dispatch bug called out
+in `docs/internal/fixed-suite-bugs/jit-osr-linux-regression-triad.md` (that
+doc's top-level FIXED status covers only one narrow OSR-entry sub-case; this
+broader dispatch signature is explicitly noted there as still needing a
+general-path fix) — new evidence it also hits Spring, not just Hibernate.
+
+## 2026-07-08 Hibernate bytecode-enhancement loader/lazytoone family retired; residual basic/merge/version bugs split out
 ## 2026-07-08 Hibernate bytecode-enhancement loader/lazytoone and residual basic/merge/version bugs retired
 
 - FIXED/RETIRED: [`hib-bytecode-enhancement-loader-faithful-linking-FIXED.md`](../internal/fixed-suite-bugs/hib-bytecode-enhancement-loader-faithful-linking-FIXED.md) - the remaining loader-faithful lazy/lazytoone failures are closed: 18/18 representative sample and 69/69 lazy/lazytoone subset pass, and the graph same-name checkcast residual now passes.
@@ -140,8 +164,8 @@ All three verified against their real Keycloak classes via the suite runner; no 
   InstantTests, 2× empty `IllegalThreadStateException`) are now fixed by the conservative
   Hibernate JIT guard and retired to
   [hib-temporal-residuals-typename-npe-illegalthreadstate-FIXED.md](../internal/fixed-suite-bugs/hib-temporal-residuals-typename-npe-illegalthreadstate-FIXED.md).
-  Separate current `LocalDateTimeTest` DST/H2 residuals are tracked in
-  [hib-temporal-localdatetime-dst-h2-local4-residuals.md](hib-temporal-localdatetime-dst-h2-local4-residuals.md).
+  The later `LocalDateTimeTest` DST/H2 residuals are also fixed and retired to
+  [hib-temporal-localdatetime-dst-h2-local4-residuals-FIXED.md](../internal/fixed-suite-bugs/hib-temporal-localdatetime-dst-h2-local4-residuals-FIXED.md).
 
 ## 2026-07-06/07 http.client class_manager RwLock recursive-read deadlock — FIXED (branch fix/class-manager-writer-starvation-20260706)
 

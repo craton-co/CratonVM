@@ -273,6 +273,11 @@ const CORPUS: &[TckTest] = &[
     tck(UTIL, "cratonvm/TckUtil", "testArrayListToArray"),
     tck(UTIL, "cratonvm/TckUtil", "testHashMapNullKey"),
     tck(UTIL, "cratonvm/TckUtil", "linkedlist_basic"),
+    tck(
+        UTIL,
+        "cratonvm/TckUtil",
+        "linkedlist_remove_if_iterator_remove",
+    ),
     tck(UTIL, "cratonvm/TckUtil", "treemap_basic"),
     tck(UTIL, "cratonvm/TckUtil", "arrays_sort"),
     tck(UTIL, "cratonvm/TckUtil", "optional_basic"),

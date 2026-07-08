@@ -4498,6 +4498,10 @@ s47_test!(test_s47_optional_or_else, "testOptionalOrElse");
 // Integration / combined
 s47_test!(test_s47_frequency_map, "testFrequencyMap");
 s47_test!(test_s47_deduplication, "testDeduplication");
+s47_test!(
+    test_s47_linkedlist_remove_if_iterator_remove,
+    "linkedlist_remove_if_iterator_remove"
+);
 
 // ===========================================================================
 // Session 49 — TCK: java.util.concurrent

@@ -8064,7 +8064,7 @@ fn register_re6_ssl_context(r: &mut NativeMethodRegistry) {
             // consulting a live KeyManager. Only `http_url_connection::
             // perform` (the path `HttpsURLConnection`/`TestClientCert` uses)
             // does the latter today — see
-            // docs/known-issues/tls-ocsp-clientcert-validation-not-enforced.md.
+            // docs/internal/fixed-suite-bugs/tls-ocsp-clientcert-validation-not-enforced-FIXED.md.
             let cfg = crate::t27_tls::build_engine_client_config_with_identity(
                 &["http/1.1"],
                 client_ident.as_ref().map(|(c, k)| (c.as_str(), k.as_str())),
@@ -8122,7 +8122,7 @@ fn register_re6_ssl_context(r: &mut NativeMethodRegistry) {
     // own empty-`wanted` fallback) — that would tear down a working
     // connection for no enforcement benefit. Known, currently unclosable gap
     // for TLS 1.2 DHE-suite restriction specifically; see
-    // docs/known-issues/tls-ocsp-clientcert-validation-not-enforced.md.
+    // docs/internal/fixed-suite-bugs/tls-ocsp-clientcert-validation-not-enforced-FIXED.md.
     r.register(
         "javax/net/ssl/SSLSocket",
         "setEnabledCipherSuites",

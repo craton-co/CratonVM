@@ -22689,6 +22689,23 @@ pub fn register_essential_natives(registry: &mut NativeMethodRegistry) {
         cratonvm_types::Value::Object(Some(obj))
     }
 
+    fn timezone_default_ref(ctx: &mut dyn NativeContext) -> cratonvm_types::Value {
+        if let Some(class_id) = ctx.class_id_by_name("java/util/TimeZone") {
+            if let Some(field_index) = ctx.static_field_index_by_name(class_id, "defaultTimeZone") {
+                let current = ctx.get_static_field(class_id, field_index);
+                if matches!(current, Value::Object(Some(_))) {
+                    return current;
+                }
+                let fallback = alloc_synth_timezone(ctx, "UTC");
+                if matches!(fallback, Value::Object(Some(_))) {
+                    ctx.set_static_field(class_id, field_index, fallback);
+                }
+                return fallback;
+            }
+        }
+        alloc_synth_timezone(ctx, "UTC")
+    }
+
     /// Localized display name for a synthetic TimeZone, honouring its `ID` and
     /// the requested style. The previous natives hard-coded "UTC" for every
     /// zone and style, so `TimeZone.getTimeZone("GMT").getDisplayName(false,
@@ -22782,19 +22799,19 @@ pub fn register_essential_natives(registry: &mut NativeMethodRegistry) {
         "java/util/TimeZone",
         "getDefault",
         "()Ljava/util/TimeZone;",
-        |ctx, _args| Ok(Some(alloc_synth_timezone(ctx, "UTC"))),
+        |ctx, _args| Ok(Some(timezone_default_ref(ctx))),
     );
     registry.register(
         "java/util/TimeZone",
         "getDefaultRef",
         "()Ljava/util/TimeZone;",
-        |ctx, _args| Ok(Some(alloc_synth_timezone(ctx, "UTC"))),
+        |ctx, _args| Ok(Some(timezone_default_ref(ctx))),
     );
     registry.register(
         "java/util/TimeZone",
         "setDefaultZone",
-        "()V",
-        |_ctx, _args| Ok(None),
+        "()Ljava/util/TimeZone;",
+        |ctx, _args| Ok(Some(timezone_default_ref(ctx))),
     );
     // getDisplayName() and getDisplayName(Locale) default to the LONG style.
     registry.register(
@@ -61516,6 +61533,7 @@ fn register_pd_structured_concurrency(r: &mut NativeMethodRegistry) {
 #[cfg(test)]
 mod vector_support_essential_tests {
     use super::*;
+    use crate::test_utils::MockNativeContext;
 
     #[test]
     fn register_essential_includes_jdk25_vector_support_natives() {
@@ -61555,6 +61573,35 @@ mod vector_support_essential_tests {
                 "Class.{name}() must also be registered in the final native set"
             );
         }
+    }
+
+    #[test]
+    fn linked_blocking_queue_clear_preserves_real_jdk_count_field() {
+        let mut registry = NativeMethodRegistry::new();
+        register_essential_natives(&mut registry);
+        let clear = registry
+            .find("java/util/concurrent/LinkedBlockingQueue", "clear", "()V")
+            .expect("essential LinkedBlockingQueue.clear native");
+
+        let mut ctx = MockNativeContext::new();
+        let queue_class = ctx
+            .ensure_class_initialized("java/util/concurrent/LinkedBlockingQueue")
+            .expect("mock queue class");
+        let queue = ctx.alloc_object(queue_class, 3);
+        let count_class = ctx
+            .ensure_class_initialized("java/util/concurrent/atomic/AtomicInteger")
+            .expect("mock AtomicInteger class");
+        let count = ctx.alloc_object(count_class, 1);
+        ctx.set_field(queue, 1, Value::Object(Some(count)));
+
+        clear(&mut ctx, &[Value::Object(Some(queue))]).expect("clear succeeds");
+
+        assert_eq!(
+            ctx.get_field(queue, 1),
+            Value::Object(Some(count)),
+            "real-JDK LinkedBlockingQueue.count must not be stomped as synthetic size"
+        );
+        assert_eq!(ctx.get_field_by_name(queue, "count"), Value::Object(Some(count)));
     }
 }
 
