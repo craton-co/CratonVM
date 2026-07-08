@@ -1891,7 +1891,7 @@ fn throw_no_such_algorithm(ctx: &mut dyn NativeContext, msg: &str) -> MethodCall
     .into()
 }
 
-fn build_jca_instance(
+pub(crate) fn build_jca_impl(
     ctx: &mut dyn NativeContext,
     provider: &str,
     type_str: &str,
@@ -1904,10 +1904,11 @@ fn build_jca_instance(
     // Try the provider's own `EngineCreator` factory first when the real
     // provider object is on file (see `try_engine_creator_instantiate`) —
     // required for BC-FIPS, whose `className` is a non-loadable label.
-    let engine_creator_result = resolve_real_provider(ctx, provider)
-        .and_then(|provider_obj| try_engine_creator_instantiate(ctx, provider_obj, &entry.class_name));
+    let engine_creator_result = resolve_real_provider(ctx, provider).and_then(|provider_obj| {
+        try_engine_creator_instantiate(ctx, provider_obj, &entry.class_name)
+    });
     Some((|| {
-        // 1. Instantiate the real SPI (runs genuine provider bytecode), pinned.
+        // Instantiate the real SPI/engine object (runs genuine provider bytecode).
         let impl_ref = if let Some(result) = engine_creator_result {
             match result? {
                 Some(Value::Object(Some(o))) => o,
@@ -1944,6 +1945,29 @@ fn build_jca_instance(
                         .into(),
                     )
                 }
+            }
+        };
+        Ok(Some(Value::Object(Some(impl_ref))))
+    })())
+}
+
+fn build_jca_instance(
+    ctx: &mut dyn NativeContext,
+    provider: &str,
+    type_str: &str,
+    algo: &str,
+) -> Option<MethodCallResult> {
+    let impl_result = build_jca_impl(ctx, provider, type_str, algo)?;
+    Some((|| {
+        let impl_ref = match impl_result? {
+            Some(Value::Object(Some(o))) => o,
+            _ => {
+                return Err(cratonvm_types::error::RuntimeError::NotImplemented {
+                    feature: format!(
+                        "{type_str} {algo} implementation for provider {provider} returned no object"
+                    ),
+                }
+                .into())
             }
         };
         // Pin the SPI across the Provider allocation below (which can GC).

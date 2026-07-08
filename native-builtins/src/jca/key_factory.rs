@@ -177,8 +177,12 @@ fn requested_provider_name(ctx: &mut dyn NativeContext, args: &[Value]) -> Strin
     }
 }
 
+fn is_bc_fips_provider(name: &str) -> bool {
+    name.eq_ignore_ascii_case("BCFIPS") || name.contains("BouncyCastleFips")
+}
+
 fn is_bc_provider(name: &str) -> bool {
-    name.eq_ignore_ascii_case("BC") || name.contains("BouncyCastle")
+    name.eq_ignore_ascii_case("BC") || is_bc_fips_provider(name) || name.contains("BouncyCastle")
 }
 
 // ---------------------------------------------------------------------------
@@ -250,17 +254,37 @@ fn drive_ec_keypair_spi(
     };
     // Pin the spec (if any) FIRST so it survives the SPI allocation below.
     let spec_pin = spec0.map(|s| ctx.pin_native_root(s));
-    let spi = match ctx.new_object_initialized(spi_class, "()V", &[]) {
-        Ok(Some(Value::Object(Some(o)))) => o,
-        other => {
-            if let Some(p) = spec_pin {
-                ctx.unpin_native_roots(p);
+    let spi = if spi_class == "sun/security/ec/ECKeyPairGenerator" {
+        // SunEC's no-arg constructor initializes the provider default key size
+        // before callers can pass ECGenParameterSpec. JDK 25's default is 384,
+        // which fails under CratonVM's partial SunEC provider map; allocate the
+        // SPI directly and invoke the requested initialize(...) below.
+        ctx.ensure_class_initialized(spi_class)?;
+        match ctx.allocate_instance(spi_class) {
+            Some(o) => o,
+            None => {
+                if let Some(p) = spec_pin {
+                    ctx.unpin_native_roots(p);
+                }
+                return Err(RuntimeError::NotImplemented {
+                    feature: spi_class.into(),
+                }
+                .into());
             }
-            other?;
-            return Err(RuntimeError::NotImplemented {
-                feature: spi_class.into(),
+        }
+    } else {
+        match ctx.new_object_initialized(spi_class, "()V", &[]) {
+            Ok(Some(Value::Object(Some(o)))) => o,
+            other => {
+                if let Some(p) = spec_pin {
+                    ctx.unpin_native_roots(p);
+                }
+                other?;
+                return Err(RuntimeError::NotImplemented {
+                    feature: spi_class.into(),
+                }
+                .into());
             }
-            .into());
         }
     };
     let spi_pin = ctx.pin_native_root(spi);
@@ -1141,7 +1165,25 @@ fn kpg_get_instance(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRe
     // Resolve the requested provider BEFORE allocating the synthetic (the
     // Provider.getName() invoke can trigger GC, which would relocate the KPG and
     // desync its raw-ObjectRef side-table entries).
-    let is_bc = is_bc_provider(&requested_provider_name(ctx, args));
+    let provider_name = requested_provider_name(ctx, args);
+
+    // BC-FIPS registers EC keypair generators through its Provider-owned
+    // EngineCreator map. Return that real KeyPairGenerator object directly so
+    // initialize()/generateKeyPair() run BC-FIPS bytecode instead of falling
+    // through to the SunEC shortcut used for default EC.
+    if idx == ALGO_EC && is_bc_fips_provider(&provider_name) {
+        if let Some(result) =
+            super::provider_chain::build_jca_impl(ctx, &provider_name, "KeyPairGenerator", &alg)
+        {
+            return result;
+        }
+        return Err(throw_no_such_algorithm(
+            ctx,
+            &format!("no KeyPairGenerator {alg} implementation for provider {provider_name}"),
+        ));
+    }
+
+    let is_bc = is_bc_provider(&provider_name);
     let base = synthetic_base_offset(ctx, "java/security/KeyPairGenerator");
     let kpg = alloc_concurrent_synthetic(
         ctx,
@@ -2313,6 +2355,16 @@ mod tests {
         assert_eq!(algo_name(ALGO_EC), "EC");
         assert_eq!(algo_name(ALGO_ED25519), "Ed25519");
         assert_eq!(algo_name(-1), "Unknown");
+    }
+
+    #[test]
+    fn bc_provider_detection_includes_bcfips() {
+        assert!(is_bc_provider("BC"));
+        assert!(is_bc_provider("BCFIPS"));
+        assert!(is_bc_provider("BouncyCastle Security Provider"));
+        assert!(is_bc_fips_provider("BCFIPS"));
+        assert!(!is_bc_fips_provider("BC"));
+        assert!(!is_bc_provider("SunEC"));
     }
 
     /// No-synthetic-stubs policy: a `KeyPairGenerator` for an algorithm we
