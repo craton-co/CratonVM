@@ -186,16 +186,17 @@ pub struct Frame {
     /// unrooted → reclaimed by the next GC → the all-zero-header
     /// (`AbstractMethodError: ... has no Code attribute`) corruption cascade.
     /// `exec_epoch` (below) closes this: it is bumped every time a callee returns
-    /// into this frame (i.e. the frame is about to re-execute), so the cache key
-    /// `(seq, exec_epoch)` invalidates on re-execution while still reusing the
-    /// roots of a genuinely-frozen deep frame (whose callees never return into
-    /// it until the very end — the perf case the cache exists for).
+    /// into this frame (i.e. the frame is about to re-execute) and every time
+    /// bytecode mutates a local slot. The cache key `(seq, exec_epoch)`
+    /// invalidates on root-shape changes while still reusing the roots of a
+    /// genuinely-frozen deep frame (whose locals do not change until the very end
+    /// — the perf case the cache exists for).
     pub seq: u64,
 
-    /// Re-execution counter for the root-snapshot cache key (paired with `seq`).
+    /// Mutation counter for the root-snapshot cache key (paired with `seq`).
     /// Bumped in `pop_and_recycle_frame_with_reason` when a callee frame is
-    /// popped and THIS frame becomes the top again — the precise moment it may
-    /// resume executing and mutate its locals. See the `seq` doc above.
+    /// popped and THIS frame becomes the top again, and also by local stores
+    /// themselves. See the `seq` doc above.
     pub exec_epoch: u64,
 
     // ── Cold fields (metadata, rarely-mutated state) ────────────────────
@@ -270,9 +271,9 @@ thread_local! {
     static FRAME_SEQ_CTR: std::cell::Cell<u64> = const { std::cell::Cell::new(1) };
 }
 
-/// Next unique frame-instance id, or 0 when the opt-in root-snapshot cache is
-/// disabled (the default) — so the default build pays only a cached-bool read
-/// per frame creation, not the thread-local bump.
+/// Next unique frame-instance id, or 0 when the root-snapshot cache is
+/// disabled — so opt-out builds pay only a cached-bool read per frame creation,
+/// not the thread-local bump.
 #[inline]
 fn next_frame_seq() -> u64 {
     if !crate::runtime::env_cache::rootsnap_cache() {
@@ -1024,6 +1025,7 @@ impl Frame {
     pub fn set_local(&mut self, index: u16, value: Value) {
         let i = index as usize;
         if i < self.locals.len() {
+            self.note_local_write();
             self.locals[i] = CompactValue::from_value(value);
             let k = lkind_of_value(&value);
             self.local_kinds[i] = k;
@@ -1072,6 +1074,7 @@ impl Frame {
     /// Panics if `index` is out of bounds.
     #[inline(always)]
     pub fn set_local_unchecked(&mut self, index: usize, value: Value) {
+        self.note_local_write();
         self.locals[index] = CompactValue::from_value(value);
         let k = lkind_of_value(&value);
         self.local_kinds[index] = k;
@@ -1089,6 +1092,7 @@ impl Frame {
     /// Panics if `index` is out of bounds.
     #[inline(always)]
     pub fn set_local_int_unchecked(&mut self, index: usize, v: i32) {
+        self.note_local_write();
         self.locals[index] = CompactValue::int(v);
         // An int never aliases the SUB_OBJECT pattern, but clearing any prior
         // cat-2 mark keeps `local_kinds` an exact reflection of the slot.
@@ -1174,6 +1178,7 @@ impl Frame {
     pub fn set_local_compact(&mut self, index: u16, cv: CompactValue) {
         let i = index as usize;
         if i < self.locals.len() {
+            self.note_local_write();
             self.locals[i] = cv;
             // Keep legacy behavior for the hot-path int/float/reference
             // setters, but preserve the explicit long-tagged compact path for
@@ -1191,6 +1196,7 @@ impl Frame {
     /// Panics if `index` is out of bounds.
     #[inline(always)]
     pub fn set_local_compact_unchecked(&mut self, index: usize, cv: CompactValue) {
+        self.note_local_write();
         self.locals[index] = cv;
         // Preserve the compact-tagged category-2 path for NaN-box collisions
         // while keeping the existing int/float/reference fast path.
@@ -1206,6 +1212,13 @@ impl Frame {
     #[inline(always)]
     pub fn get_local_compact_unchecked(&self, index: usize) -> CompactValue {
         self.locals[index]
+    }
+
+    #[inline(always)]
+    fn note_local_write(&mut self) {
+        if self.seq != 0 {
+            self.exec_epoch = self.exec_epoch.wrapping_add(1);
+        }
     }
 
     // ── Continuation freeze/thaw ─────────────────��───────────────────

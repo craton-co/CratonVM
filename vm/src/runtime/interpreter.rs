@@ -2307,6 +2307,68 @@ pub(crate) fn update_root_snapshot(shared: &SharedVm, thread: &mut JvmThread) {
     }
 }
 
+#[cfg(test)]
+mod root_snapshot_cache_tests {
+    use super::*;
+    use crate::config::VmConfig;
+    use crate::threading::jvm_thread::ThreadId;
+
+    fn frame(code: Vec<u8>, method_name: &str) -> Frame {
+        Frame::new(
+            ClassId::new(0),
+            "T".to_string(),
+            method_name.to_string(),
+            "()V".to_string(),
+            None,
+            code,
+            vec![],
+            8,
+            4,
+            &[],
+        )
+    }
+
+    #[test]
+    fn local_write_invalidates_cached_deep_frame_roots() {
+        if !crate::runtime::env_cache::rootsnap_cache() {
+            return;
+        }
+
+        let shared = SharedVm::new(VmConfig::default());
+        let mut thread = JvmThread::new(ThreadId(0), "root-snapshot-cache-test");
+
+        // Frame 0 reads LOCAL[2] at pc 0, so the normal local-liveness filter
+        // must keep that slot live. Frames 1 and 2 make frame 0 reusable by the
+        // frozen-frame cache; the current top is never cached.
+        thread
+            .frames
+            .push(frame(vec![0x2c, 0x57, 0xb1], "deep")); // aload_2; pop; return
+        thread.frames.push(frame(vec![0xb1], "middle"));
+        thread.frames.push(frame(vec![0xb1], "top"));
+
+        update_root_snapshot(&shared, &mut thread);
+        assert_eq!(thread.rs_cache.len(), 2);
+        assert!(thread.rs_cache[0].1.is_empty());
+
+        let obj = shared.heap.alloc_object(ClassId::new(7), 0);
+        let obj_addr = obj.as_ptr();
+        let cached_key = thread.rs_cache[0].0;
+        thread.frames[0].set_local_unchecked(2, Value::Object(Some(obj)));
+        assert_ne!(
+            (thread.frames[0].seq, thread.frames[0].exec_epoch),
+            cached_key,
+            "a local write must invalidate this frame's cached root set"
+        );
+
+        update_root_snapshot(&shared, &mut thread);
+        let snapshot = thread.root_snapshot.lock();
+        assert!(
+            snapshot.iter().any(|root| root.as_ptr() == obj_addr),
+            "updated root snapshot must include the object stored into deep LOCAL[2]"
+        );
+    }
+}
+
 /// Check if a stop-the-world pause is requested and participate if so.
 ///
 /// Called at safepoints: allocation sites and backward branches (loop iterations).
