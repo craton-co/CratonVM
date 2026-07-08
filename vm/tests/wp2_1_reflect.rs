@@ -22,6 +22,21 @@ fn wp2_1_natives_register_without_panic() {
 }
 
 #[test]
+fn jdk_internal_reflection_are_nest_mates_registered() {
+    let mut r = NativeMethodRegistry::new();
+    cratonvm_native_builtins::register_essential_natives(&mut r);
+    assert!(
+        r.find(
+            "jdk/internal/reflect/Reflection",
+            "areNestMates",
+            "(Ljava/lang/Class;Ljava/lang/Class;)Z",
+        )
+        .is_some(),
+        "Reflection.areNestMates(Class, Class) must be registered in the real-JDK essential registry"
+    );
+}
+
+#[test]
 fn try_set_accessible_registered_on_method_field_constructor_and_accessibleobject() {
     let mut r = NativeMethodRegistry::new();
     cratonvm_native_builtins::register_essential_natives(&mut r);
