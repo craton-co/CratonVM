@@ -2669,14 +2669,31 @@ fn re1_socket_write_stream(
 /// java/net/Socket.getImpl pc=16`. Initialize the lock object(s) so that path
 /// works. `set_field_by_name` is a no-op if the field is absent (synthetic-stub
 /// mode), so this is safe on either layout.
-fn re1_init_socket_locks(ctx: &mut dyn NativeContext, this: ObjectRef) {
+/// Returns the (possibly GC-relocated) `this` — callers that keep using the
+/// Socket afterward MUST use the returned value, not their original local.
+#[must_use]
+fn re1_init_socket_locks(ctx: &mut dyn NativeContext, this: ObjectRef) -> ObjectRef {
+    // GC-safety: `this` is a raw ObjectRef parameter, and `new_object` below
+    // is a re-entrant, allocating call (it can trigger a GC). This is called
+    // right after a fresh Socket allocation -- for a freshly-accepted Socket
+    // (see the `ss, "accept"` wrapper), the caller passes this same `this`
+    // straight into `re2_accept_into` afterward, so a relocation/reclaim here
+    // corrupts the Socket before it is ever returned to Java bytecode.
+    // Pin across both allocating iterations, re-reading the current
+    // (possibly-forwarded) value before every use.
+    let pin_base = ctx.pin_native_root(this);
     for f in ["socketLock", "closeLock"] {
-        if !matches!(ctx.get_field_by_name(this, f), Value::Object(Some(_))) {
+        let cur = ctx.read_native_pin(pin_base, this);
+        if !matches!(ctx.get_field_by_name(cur, f), Value::Object(Some(_))) {
             if let Ok(Some(Value::Object(Some(lock)))) = ctx.new_object("java/lang/Object") {
-                ctx.set_field_by_name(this, f, Value::Object(Some(lock)));
+                let cur = ctx.read_native_pin(pin_base, this);
+                ctx.set_field_by_name(cur, f, Value::Object(Some(lock)));
             }
         }
     }
+    let result = ctx.read_native_pin(pin_base, this);
+    ctx.unpin_native_roots(pin_base);
+    result
 }
 
 fn re1_connect_socket(
@@ -2707,7 +2724,7 @@ fn re1_connect_socket(
         s.closed = 0;
         s.stream_id = stream_id;
     });
-    re1_init_socket_locks(ctx, this);
+    let _ = re1_init_socket_locks(ctx, this);
     Ok(None)
 }
 
@@ -2728,7 +2745,7 @@ fn register_re1_socket(r: &mut NativeMethodRegistry) {
             s.closed = 0;
             s.stream_id = -1;
         });
-        re1_init_socket_locks(ctx, this);
+        let _ = re1_init_socket_locks(ctx, this);
         Ok(None)
     });
 
@@ -3286,7 +3303,21 @@ fn re2_accept_into(
         );
     }
     let stream_id = s2_alloc_stream(stream);
+    // GC-safety: `target` is a raw ObjectRef local that survived the poll
+    // loop above (already fixed via blocked_refs there), but this is a
+    // SEPARATE, later hazard -- `create_string` is a re-entrant, allocating
+    // call (it can allocate the String object and trigger a GC), and nothing
+    // protected `target` across it. A moving GC here relocates/reclaims
+    // `target` before the very next line's `set_field` uses it, corrupting
+    // the just-accepted Socket (observed: TestJNDIRealmIntegration's "LDAP
+    // Listener Thread" — a plain `Socket s = accept()` local, stored and
+    // read back across nothing but an unconditional `goto`, going stale;
+    // `Socket.getInetAddress()` then read a zeroed field and returned null).
+    // Pin it exactly like every other raw-ObjectRef-across-a-reentrant-call
+    // site in this codebase.
+    let pin_base = ctx.pin_native_root(target);
     let host_str = ctx.create_string(&peer_ip);
+    let target = ctx.read_native_pin(pin_base, target);
     ctx.set_field(target, SOCK_HOST, Value::Object(Some(host_str)));
     sock_set(target, |s| {
         s.port = peer_port;
@@ -3294,6 +3325,7 @@ fn re2_accept_into(
         s.closed = 0;
         s.stream_id = stream_id;
     });
+    ctx.unpin_native_roots(pin_base);
     Ok(Some(Value::Object(Some(target))))
 }
 
@@ -3472,7 +3504,7 @@ fn register_re2_server_socket(r: &mut NativeMethodRegistry) {
             x.closed = 0;
             x.stream_id = -1;
         });
-        re1_init_socket_locks(ctx, sock);
+        let sock = re1_init_socket_locks(ctx, sock);
         re2_accept_into(ctx, lid, sock, timeout_ms)
     });
 
