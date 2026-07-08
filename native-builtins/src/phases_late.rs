@@ -39846,10 +39846,26 @@ fn new13_do_create_socket(
 ) -> MethodCallResult {
     let connector = new13_build_connector(extra_root_ders, java_tm_key.is_some())
         .map_err(|msg| RuntimeError::IOException { message: msg })?;
-    let tls_id = crate::servlet::s2_tls_connect(&connector, host, port).map_err(|e| {
-        RuntimeError::IOException {
-            message: e.to_string(),
-        }
+    // FIX (netty-client-socket-write-after-close): this is a real, blocking
+    // TCP connect + full TLS handshake (same shape as net_phase_e.rs's own
+    // client createSocket, which already announces this — see its "T19.H1"
+    // comment). Without announcing it, a concurrent stop-the-world GC has no
+    // way to know this thread is safely parked in native code rather than
+    // stuck mid-bytecode, and (per that comment) can mishandle this thread's
+    // pending return value across the pause — observed as the freshly built
+    // socket's own fields reading back as their zero/None default the
+    // moment Java calls a method on it afterward (`getOutputStream`/
+    // `getInputStream` seeing the just-set NEW13_SOCK_TLSID field as
+    // `Object(None)` instead of the `Int` written a few lines below), a
+    // symptom whose true trigger (a concurrent GC racing this unmarked
+    // blocking call) is not IO-timing-reproducible on demand, but a bigger
+    // heap alone does not suppress it either since young-gen collections
+    // still fire from ordinary allocation churn on OTHER threads.
+    ctx.begin_blocking_region();
+    let connect_result = crate::servlet::s2_tls_connect(&connector, host, port);
+    ctx.end_blocking_region();
+    let tls_id = connect_result.map_err(|e| RuntimeError::IOException {
+        message: e.to_string(),
     })?;
 
     // FIX (netty-https-client-trust): native verification was disabled above
