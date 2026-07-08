@@ -175,6 +175,8 @@ pub(crate) struct SockSide {
     pub local_port: i32,
     pub closed: i32,
     pub stream_id: i32,
+    pub input_shutdown: i32,
+    pub output_shutdown: i32,
 }
 
 #[derive(Default, Debug, Clone, Copy)]
@@ -212,6 +214,8 @@ fn sock_get(this: ObjectRef) -> SockSide {
         local_port: 0,
         closed: 0,
         stream_id: -1,
+        input_shutdown: 0,
+        output_shutdown: 0,
     })
 }
 
@@ -223,6 +227,8 @@ fn sock_set<F: FnOnce(&mut SockSide)>(this: ObjectRef, f: F) {
         local_port: 0,
         closed: 0,
         stream_id: -1,
+        input_shutdown: 0,
+        output_shutdown: 0,
     });
     f(entry);
 }
@@ -2822,8 +2828,15 @@ fn register_re1_socket(r: &mut NativeMethodRegistry) {
                 stream
                     .shutdown(std::net::Shutdown::Read)
                     .map_err(|e| ioex(format!("shutdown read failed: {e}")))?;
+            } else if let Some(entry) = reg.tls_streams.get(&sid) {
+                entry
+                    .stream
+                    .get_ref()
+                    .shutdown(std::net::Shutdown::Read)
+                    .map_err(|e| ioex(format!("shutdown read failed: {e}")))?;
             }
         }
+        sock_set(this, |s| s.input_shutdown = 1);
         Ok(None)
     });
     r.register(sock, "shutdownOutput", "()V", |_ctx, args| {
@@ -2835,9 +2848,41 @@ fn register_re1_socket(r: &mut NativeMethodRegistry) {
                 stream
                     .shutdown(std::net::Shutdown::Write)
                     .map_err(|e| ioex(format!("shutdown write failed: {e}")))?;
+            } else if let Some(entry) = reg.tls_streams.get(&sid) {
+                entry
+                    .stream
+                    .get_ref()
+                    .shutdown(std::net::Shutdown::Write)
+                    .map_err(|e| ioex(format!("shutdown write failed: {e}")))?;
             }
         }
+        sock_set(this, |s| s.output_shutdown = 1);
         Ok(None)
+    });
+    // FIX (netty-client-socket-write-after-close residual): isInputShutdown/
+    // isOutputShutdown had no reachable native registration in real-JDK mode
+    // (the only registration lived in register_p72_server_socket, which is
+    // only reachable via the synthetic-jdk-gated register_synthetic_overrides
+    // umbrella — see the identical dead-code pattern already documented
+    // elsewhere in this codebase, e.g. lib.rs's "FIX (httpserver-pkcs12
+    // -20260706)" comment). Real bytecode ran instead, reading our synthetic
+    // object's fields as if they were real Socket internals (`impl`/`shutIn`)
+    // — undefined, and in practice non-deterministically truthy roughly one
+    // run in three. Apache HttpClient5's DefaultBHttpClientConnection$1
+    // .checkTLS() calls sslSocket.isInputShutdown() before every write and
+    // throws ConnectionClosedException ("Connection is closed") if it
+    // returns true, matching this bug's exact flaky signature (traced via
+    // KRUN_STACK=1: ConnectionClosedException at
+    // DefaultBHttpClientConnection$1.checkTLS, no CratonVM native or
+    // exception involved at all up to that point — the socket was never
+    // actually shut down).
+    r.register(sock, "isInputShutdown", "()Z", |_ctx, args| {
+        let this = obj_arg(args, 0)?;
+        Ok(Some(Value::Int(sock_get(this).input_shutdown)))
+    });
+    r.register(sock, "isOutputShutdown", "()Z", |_ctx, args| {
+        let this = obj_arg(args, 0)?;
+        Ok(Some(Value::Int(sock_get(this).output_shutdown)))
     });
 
     r.register(sock, "setSoTimeout", "(I)V", |_ctx, args| {
@@ -2847,12 +2892,6 @@ fn register_re1_socket(r: &mut NativeMethodRegistry) {
             return Err(iae(format!("negative SO_TIMEOUT: {ms}")));
         }
         let sid = sock_get(this).stream_id;
-        if std::env::var_os("CRATONVM_DBG_TLS_SOCK").is_some() {
-            eprintln!(
-                "[dbg-tls-sock] setSoTimeout called this={:?} ms={} sid={}",
-                this, ms, sid
-            );
-        }
         if sid >= 0 {
             let d = if ms == 0 {
                 None

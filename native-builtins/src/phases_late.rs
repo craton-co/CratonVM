@@ -40719,29 +40719,14 @@ pub(crate) fn register_p68_ssl(r: &mut NativeMethodRegistry) {
     );
     r.register(ssl_session, "isValid", "()Z", |ctx, args| {
         let this = obj_arg(args, 0)?;
-        let num_fields = ctx.object_num_fields(this);
-        let raw_field = ctx.get_field(this, NEW13_SESS_TLSID);
-        let tls_id = if num_fields > NEW13_SESS_TLSID {
-            raw_field.as_int().unwrap_or(-1)
+        let tls_id = if ctx.object_num_fields(this) > NEW13_SESS_TLSID {
+            ctx.get_field(this, NEW13_SESS_TLSID).as_int().unwrap_or(-1)
         } else {
             -1
         };
         // A session is "valid" while the backing TLS stream is still alive
         // in the registry. Closed sockets invalidate their own session.
-        let info = crate::servlet::s2_tls_session_info(tls_id);
-        let alive = tls_id >= 0 && info.is_some();
-        if std::env::var_os("CRATONVM_DBG_TLS_SOCK").is_some() {
-            eprintln!(
-                "[dbg-tls-sock] thread={:?} isValid sock={:?} num_fields={} raw_field={:?} tls_id={} info_some={} -> {}",
-                std::thread::current().id(),
-                this,
-                num_fields,
-                raw_field,
-                tls_id,
-                info.is_some(),
-                alive
-            );
-        }
+        let alive = tls_id >= 0 && crate::servlet::s2_tls_session_info(tls_id).is_some();
         Ok(Some(Value::Int(if alive { 1 } else { 0 })))
     });
     r.register(ssl_session, "getId", "()[B", |ctx, args| {
