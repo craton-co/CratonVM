@@ -2750,10 +2750,10 @@ fn dgram_pollreq_fd(sock: &UdpSocket) -> i64 {
 // is added to the `pollfds` array on every `select()` call. `Selector.wakeup`
 // writes one byte to this socket; the poll wakes up, the byte is drained
 // from the receive queue, and the function returns promptly. The selector's
-// identity (used as the map key) is its `ObjectRef` pointer value: since we
-// treat ObjectRefs as opaque u64 tags, two distinct selectors always get
-// distinct wakeup channels, and a selector's channel persists for its
-// lifetime. Entries are removed when the Java `Selector.close()` runs.
+// identity (used as the map key) is its stable Java identity hash plus VM
+// identity. Raw ObjectRef pointer bits are not safe here because a moving GC
+// can relocate a selector while another thread is blocked in select(). Entries
+// are removed when the Java `Selector.close()` runs.
 //
 // The UDP socket is bound to 127.0.0.1:0, which the OS fills in with an
 // ephemeral port. We then call `connect()` on the same socket back to its
@@ -2766,17 +2766,18 @@ struct WakeupChannel {
     socket: UdpSocket,
 }
 
-static SELECTOR_WAKEUPS: OnceLock<parking_lot::Mutex<HashMap<u64, WakeupChannel>>> =
+type SelectorWakeupKey = (usize, i32);
+
+static SELECTOR_WAKEUPS: OnceLock<parking_lot::Mutex<HashMap<SelectorWakeupKey, WakeupChannel>>> =
     OnceLock::new();
 
-fn selector_wakeups() -> &'static parking_lot::Mutex<HashMap<u64, WakeupChannel>> {
+fn selector_wakeups() -> &'static parking_lot::Mutex<HashMap<SelectorWakeupKey, WakeupChannel>> {
     SELECTOR_WAKEUPS.get_or_init(|| parking_lot::Mutex::new(HashMap::new()))
 }
 
-/// Produce a stable identity key for the selector. We use the `ObjectRef`
-/// pointer bits so that identical `ObjectRef` values share a channel.
-fn selector_key(sel: ObjectRef) -> u64 {
-    sel.as_ptr() as usize as u64
+/// Produce a stable identity key for the selector.
+fn selector_key(ctx: &dyn NativeContext, sel: ObjectRef) -> SelectorWakeupKey {
+    (ctx.vm_identity(), ctx.identity_hash_code(sel))
 }
 
 /// Construct a new self-connected UDP socket for wakeup signaling. Returns
@@ -2794,11 +2795,11 @@ fn build_wakeup_channel() -> Option<WakeupChannel> {
 
 /// Get the wakeup channel for this selector, creating one lazily if needed.
 /// Returns `None` if construction failed (e.g. loopback unavailable).
-fn ensure_wakeup_channel<F, T>(sel: ObjectRef, f: F) -> Option<T>
+fn ensure_wakeup_channel<F, T>(ctx: &dyn NativeContext, sel: ObjectRef, f: F) -> Option<T>
 where
     F: FnOnce(&WakeupChannel) -> T,
 {
-    let key = selector_key(sel);
+    let key = selector_key(ctx, sel);
     let mut map = selector_wakeups().lock();
     if !map.contains_key(&key) {
         let ch = build_wakeup_channel()?;
@@ -2808,16 +2809,16 @@ where
 }
 
 /// Drop the wakeup channel (called by `Selector.close()`).
-fn release_wakeup_channel(sel: ObjectRef) {
-    let key = selector_key(sel);
+fn release_wakeup_channel(ctx: &dyn NativeContext, sel: ObjectRef) {
+    let key = selector_key(ctx, sel);
     selector_wakeups().lock().remove(&key);
 }
 
 /// Signal the wakeup channel. Called by `Selector.wakeup()`.
 /// Writes a single byte; the blocked `poll()` observes POLLIN on the
 /// wakeup fd, returns, and drains the byte.
-fn signal_wakeup(sel: ObjectRef) {
-    ensure_wakeup_channel(sel, |ch| {
+fn signal_wakeup(ctx: &dyn NativeContext, sel: ObjectRef) {
+    ensure_wakeup_channel(ctx, sel, |ch| {
         // Best-effort: if the socket buffer is full (caller wake'd N times
         // without any poll clearing it), the send fails and we silently
         // proceed — the byte that is already pending is enough to wake
@@ -2829,8 +2830,8 @@ fn signal_wakeup(sel: ObjectRef) {
 /// Drain any queued wakeup bytes on the wakeup socket. Called after every
 /// `poll()` return so the next `select()` does not spuriously wake on a
 /// leftover byte.
-fn drain_wakeup(sel: ObjectRef) {
-    ensure_wakeup_channel(sel, |ch| {
+fn drain_wakeup(ctx: &dyn NativeContext, sel: ObjectRef) {
+    ensure_wakeup_channel(ctx, sel, |ch| {
         let mut buf = [0u8; 64];
         loop {
             match ch.socket.recv(&mut buf) {
@@ -2859,6 +2860,7 @@ fn s2_selector_do_poll_with_timeout(
     sel: ObjectRef,
     timeout_ms: i32,
 ) -> i32 {
+    let mut sel = sel;
     let n = ctx.get_field(sel, S2SEL_NKEYS).as_int().unwrap_or(0) as usize;
     let keys_arr = match ctx.get_field(sel, S2SEL_KEYS) {
         Value::Object(Some(arr)) => arr,
@@ -2866,11 +2868,11 @@ fn s2_selector_do_poll_with_timeout(
             // No registered keys yet; honor the wakeup + timeout contract
             // anyway so that `select(timeout)` on an empty selector sleeps
             // correctly instead of spinning.
-            return poll_empty_selector(sel, timeout_ms);
+            return poll_empty_selector(ctx, sel, timeout_ms);
         }
     };
     if n == 0 {
-        return poll_empty_selector(sel, timeout_ms);
+        return poll_empty_selector(ctx, sel, timeout_ms);
     }
 
     // Gather channel info for each registered key.
@@ -2972,7 +2974,7 @@ fn s2_selector_do_poll_with_timeout(
     // Append the wakeup fd. If the wakeup channel can't be built, we
     // proceed without it; the caller can still return via timeout.
     drop(reg); // drop registry lock before touching wakeup map
-    let wakeup_req = ensure_wakeup_channel(sel, |ch| PollReq {
+    let wakeup_req = ensure_wakeup_channel(ctx, sel, |ch| PollReq {
         fd: dgram_pollreq_fd(&ch.socket),
         events: POLL_IN,
     });
@@ -2982,8 +2984,37 @@ fn s2_selector_do_poll_with_timeout(
     }
 
     // Call the OS poll. On Unix this hits `poll(2)`; on Windows it hits
-    // `WSAPoll` via direct FFI. Both honor the same timeout contract.
-    let revents = selector_poll(&reqs, timeout_ms);
+    // `WSAPoll` via direct FFI. Both honor the same timeout contract. Blocking
+    // waits must enter the VM's GC-blocked protocol so a stop-the-world GC does
+    // not wait for an event-loop thread parked in the kernel. Pin selector-local
+    // ObjectRefs before the deposit so a moving GC can remap them on wake.
+    let revents = if timeout_ms == 0 {
+        selector_poll(&reqs, timeout_ms)
+    } else {
+        let pin_base = ctx.pin_native_root(sel);
+        let sel_pin = pin_base;
+        let keys_pin = ctx.pin_native_root(keys_arr);
+        let entry_pins: Vec<(usize, usize)> = entries
+            .iter()
+            .map(|entry| {
+                (
+                    ctx.pin_native_root(entry.key_ref),
+                    ctx.pin_native_root(entry.channel_ref),
+                )
+            })
+            .collect();
+        ctx.begin_blocking_region();
+        let revents = selector_poll(&reqs, timeout_ms);
+        ctx.end_blocking_region();
+        sel = ctx.read_native_pin(sel_pin, sel);
+        let _keys_arr = ctx.read_native_pin(keys_pin, keys_arr);
+        for (entry, (key_pin, channel_pin)) in entries.iter_mut().zip(entry_pins) {
+            entry.key_ref = ctx.read_native_pin(key_pin, entry.key_ref);
+            entry.channel_ref = ctx.read_native_pin(channel_pin, entry.channel_ref);
+        }
+        ctx.unpin_native_roots(pin_base);
+        revents
+    };
     if !revents.is_empty() {
         for (pi, rev) in revents.iter().enumerate() {
             let ei = match req_to_entry[pi] {
@@ -3024,7 +3055,7 @@ fn s2_selector_do_poll_with_timeout(
     // Drain the wakeup channel (no-op if no wakeup was pending). We do
     // this unconditionally so a spurious leftover byte from a previous
     // cycle is also cleared.
-    drain_wakeup(sel);
+    drain_wakeup(ctx, sel);
 
     // Post-processing: OP_ACCEPT eagerly pulls the next connection into
     // the SSC's `pending` slot so the Java caller can hand it out via
@@ -3070,28 +3101,37 @@ fn s2_selector_do_poll_with_timeout(
 /// has zero registered keys. We still honor the wakeup + timeout contract
 /// so that idiomatic code like `selector.select(1000)` on a not-yet-bound
 /// selector sleeps for the timeout instead of spinning.
-fn poll_empty_selector(sel: ObjectRef, timeout_ms: i32) -> i32 {
+fn poll_empty_selector(ctx: &mut dyn NativeContext, sel: ObjectRef, timeout_ms: i32) -> i32 {
     if timeout_ms == 0 {
-        drain_wakeup(sel);
+        drain_wakeup(ctx, sel);
         return 0;
     }
     // Construct a single-entry PollReq for the wakeup channel and block
     // on it for the specified timeout. If the wakeup channel could not
     // be built, fall back to `std::thread::sleep` so the caller is still
     // rate-limited rather than busy-looping.
-    let req = ensure_wakeup_channel(sel, |ch| PollReq {
+    let req = ensure_wakeup_channel(ctx, sel, |ch| PollReq {
         fd: dgram_pollreq_fd(&ch.socket),
         events: POLL_IN,
     });
     match req {
         Some(r) => {
+            let pin_base = ctx.pin_native_root(sel);
+            ctx.begin_blocking_region();
             let _ = selector_poll(&[r], timeout_ms);
-            drain_wakeup(sel);
+            ctx.end_blocking_region();
+            let sel = ctx.read_native_pin(pin_base, sel);
+            ctx.unpin_native_roots(pin_base);
+            drain_wakeup(ctx, sel);
             0
         }
         None => {
             if timeout_ms > 0 {
+                let pin_base = ctx.pin_native_root(sel);
+                ctx.begin_blocking_region();
                 std::thread::sleep(std::time::Duration::from_millis(timeout_ms as u64));
+                ctx.end_blocking_region();
+                ctx.unpin_native_roots(pin_base);
             }
             0
         }
@@ -4742,9 +4782,9 @@ fn register_s2_selector(r: &mut NativeMethodRegistry) {
         sel,
         "wakeup",
         "()Ljava/nio/channels/Selector;",
-        |_ctx, args| {
+        |ctx, args| {
             let this = obj_arg(args, 0)?;
-            signal_wakeup(this);
+            signal_wakeup(ctx, this);
             Ok(Some(Value::Object(Some(this))))
         },
     );
@@ -4762,7 +4802,7 @@ fn register_s2_selector(r: &mut NativeMethodRegistry) {
         // NEW-3: release the per-selector wakeup channel so its socket
         // fd is returned to the OS promptly rather than lingering in
         // the global map until process exit.
-        release_wakeup_channel(this);
+        release_wakeup_channel(ctx, this);
         Ok(None)
     });
     r.register(sel, "keys", "()Ljava/util/Set;", |ctx, args| {
@@ -5144,6 +5184,8 @@ fn s3_stub_response(ctx: &mut dyn NativeContext, status: i32, msg: &str) -> Meth
 #[cfg(test)]
 mod tests {
     use super::*;
+    use cratonvm_native_api::NativeContext as _;
+    use cratonvm_types::ClassId;
 
     #[test]
     fn test_socket_registry_alloc_stream_wrapping_ids() {
@@ -5383,30 +5425,33 @@ mod tests {
         use std::sync::atomic::{AtomicBool, Ordering};
         use std::sync::Arc;
         use std::time::{Duration, Instant};
+        let mut ctx = crate::test_utils::MockNativeContext::new();
 
         // Synthesize a fake selector identity. The map is keyed by the
-        // ObjectRef pointer bits, so any stable value works as long as
+        // selector's stable identity, so any stable value works as long as
         // this test releases it at the end.
         let fake_sel = unsafe { ObjectRef::from_raw(0xdead_beef_0000_0100u64 as usize as *mut u8) };
 
         // Ensure a wakeup channel exists (would normally be allocated by
         // the first `select()` call).
-        let existed = ensure_wakeup_channel(fake_sel, |ch| dgram_pollreq_fd(&ch.socket)).is_some();
+        let existed =
+            ensure_wakeup_channel(&ctx, fake_sel, |ch| dgram_pollreq_fd(&ch.socket)).is_some();
         assert!(existed, "wakeup channel should be constructible");
 
         let woke = Arc::new(AtomicBool::new(false));
         let woke_clone = Arc::clone(&woke);
         // Spawn a waker thread that triggers signal_wakeup after 50ms.
         let waker = std::thread::spawn(move || {
+            let waker_ctx = crate::test_utils::MockNativeContext::new();
             std::thread::sleep(Duration::from_millis(50));
-            signal_wakeup(fake_sel);
+            signal_wakeup(&waker_ctx, fake_sel);
             woke_clone.store(true, Ordering::Release);
         });
 
         // Block for up to 2 seconds. If wakeup works, the poll returns
         // in roughly 50ms; if it doesn't, we wait the full 2 seconds.
         let t0 = Instant::now();
-        let _ = poll_empty_selector(fake_sel, 2_000);
+        let _ = poll_empty_selector(&mut ctx, fake_sel, 2_000);
         let elapsed = t0.elapsed();
         waker.join().expect("waker thread");
 
@@ -5417,7 +5462,51 @@ mod tests {
         );
 
         // Clean up so other tests don't see a stale entry.
-        release_wakeup_channel(fake_sel);
+        release_wakeup_channel(&ctx, fake_sel);
+    }
+
+    #[test]
+    fn s2_empty_selector_wait_enters_gc_blocked_region() {
+        let mut ctx = crate::test_utils::MockNativeContext::new();
+        let fake_sel = unsafe { ObjectRef::from_raw(0xdead_beef_0000_0200u64 as usize as *mut u8) };
+
+        let _ = poll_empty_selector(&mut ctx, fake_sel, 5);
+
+        assert_eq!(
+            ctx.blocking_region_counts(),
+            (1, 1),
+            "blocking select on an empty selector must be GC-blocked"
+        );
+        release_wakeup_channel(&ctx, fake_sel);
+    }
+
+    #[test]
+    fn s2_registered_selector_wait_enters_gc_blocked_region() {
+        let mut ctx = crate::test_utils::MockNativeContext::new();
+        let sel = ctx.alloc_object(ClassId::new(0), 3);
+        let keys = ctx.new_ref_array(ClassId::new(0), 1);
+        let key = ctx.alloc_object(ClassId::new(0), 4);
+        let channel = ctx.alloc_object(ClassId::new(0), 5);
+
+        ctx.set_field(sel, S2SEL_OPEN, Value::Int(1));
+        ctx.set_field(sel, S2SEL_KEYS, Value::Object(Some(keys)));
+        ctx.set_field(sel, S2SEL_NKEYS, Value::Int(1));
+        ctx.set_array_element(keys, 0, Value::Object(Some(key)));
+        ctx.set_field(key, 0, Value::Object(Some(channel)));
+        ctx.set_field(key, 2, Value::Int(1));
+        ctx.set_field(channel, S2SSC_LISTENER_ID, Value::Int(-1));
+        ctx.set_field(channel, S2SC_SOCK_ID, Value::Int(-1));
+        ctx.set_field(channel, S2DC_SOCK_ID, Value::Int(-1));
+
+        let n = s2_selector_do_poll_with_timeout(&mut ctx, sel, 5);
+
+        assert_eq!(n, 0);
+        assert_eq!(
+            ctx.blocking_region_counts(),
+            (1, 1),
+            "blocking select with registered keys must be GC-blocked"
+        );
+        release_wakeup_channel(&ctx, sel);
     }
 
     /// Verify that `release_wakeup_channel` removes the entry from the
@@ -5425,16 +5514,17 @@ mod tests {
     /// long-running processes that repeatedly open and close selectors).
     #[test]
     fn new3_release_wakeup_channel_removes_entry() {
-        let fake_sel = unsafe { ObjectRef::from_raw(0xdead_beef_0000_0200u64 as usize as *mut u8) };
-        let _ = ensure_wakeup_channel(fake_sel, |_| ());
+        let ctx = crate::test_utils::MockNativeContext::new();
+        let fake_sel = unsafe { ObjectRef::from_raw(0xdead_beef_0000_0400u64 as usize as *mut u8) };
+        let _ = ensure_wakeup_channel(&ctx, fake_sel, |_| ());
         assert!(selector_wakeups()
             .lock()
-            .contains_key(&selector_key(fake_sel)));
-        release_wakeup_channel(fake_sel);
+            .contains_key(&selector_key(&ctx, fake_sel)));
+        release_wakeup_channel(&ctx, fake_sel);
         assert!(
             !selector_wakeups()
                 .lock()
-                .contains_key(&selector_key(fake_sel)),
+                .contains_key(&selector_key(&ctx, fake_sel)),
             "release_wakeup_channel must remove the entry"
         );
     }
@@ -5443,18 +5533,21 @@ mod tests {
     /// return the same backing socket (same local port) as the first.
     #[test]
     fn new3_ensure_wakeup_channel_is_idempotent() {
+        let ctx = crate::test_utils::MockNativeContext::new();
         let fake_sel = unsafe { ObjectRef::from_raw(0xdead_beef_0000_0300u64 as usize as *mut u8) };
-        let first =
-            ensure_wakeup_channel(fake_sel, |ch| ch.socket.local_addr().expect("local_addr"))
-                .expect("first ensure");
-        let second =
-            ensure_wakeup_channel(fake_sel, |ch| ch.socket.local_addr().expect("local_addr"))
-                .expect("second ensure");
+        let first = ensure_wakeup_channel(&ctx, fake_sel, |ch| {
+            ch.socket.local_addr().expect("local_addr")
+        })
+        .expect("first ensure");
+        let second = ensure_wakeup_channel(&ctx, fake_sel, |ch| {
+            ch.socket.local_addr().expect("local_addr")
+        })
+        .expect("second ensure");
         assert_eq!(
             first, second,
             "repeated ensure_wakeup_channel must yield the same socket"
         );
-        release_wakeup_channel(fake_sel);
+        release_wakeup_channel(&ctx, fake_sel);
     }
 
     /// Allocating a UDP socket via `s2_alloc_dgram` must not collide

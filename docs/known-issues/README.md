@@ -90,15 +90,14 @@ All three verified against their real Keycloak classes via the suite runner; no 
   originally-reported NPE is gone (gets through the entire cache-manager
   bootstrap/use/teardown lifecycle under `--nojit`). Doc:
   [`docs/internal/fixed-suite-bugs/keycloak-model-infinispan-cache-config-null-after-real-start-FIXED.md`](../internal/fixed-suite-bugs/keycloak-model-infinispan-cache-config-null-after-real-start-FIXED.md).
-- Two new, **distinct and unrelated** (JIT/VM-core, not Infinispan-specific)
-  residuals surfaced once the fix let `RealmModelTest` run much further:
+- One new, **distinct and unrelated** (JIT/VM-core, not Infinispan-specific)
+  residual remains open from the deeper `RealmModelTest` path:
   [keycloak-model-infinispan-jit-adjacent-decode-error-fullname.md](keycloak-model-infinispan-jit-adjacent-decode-error-fullname.md)
   (JIT-only bytecode-decode error, reachable only with JIT on — a
-  JIT-compiled caller appears to corrupt an interpreted callee's frame) and
-  [keycloak-model-stw-takeover-hang-eventloopgroup-shutdown.md](keycloak-model-stw-takeover-hang-eventloopgroup-shutdown.md)
-  (an STW cross-thread-takeover safepoint hang during Netty `EventLoopGroup`
-  shutdown, reachable only with `--nojit`, once the JIT bug above is worked
-  around).
+  JIT-compiled caller appears to corrupt an interpreted callee's frame). The
+  `--nojit` STW shutdown hang that surfaced alongside it is now fixed and
+  retired to
+  [`docs/internal/fixed-suite-bugs/keycloak-model-stw-takeover-hang-eventloopgroup-shutdown-FIXED.md`](../internal/fixed-suite-bugs/keycloak-model-stw-takeover-hang-eventloopgroup-shutdown-FIXED.md).
 
 ## 2026-07-07 GC blocked-thread / stale-Thread-mirror doc RETIRED; real-net GC-blocking audit completed
 
@@ -256,9 +255,10 @@ objects unconditionally), is now **also FIXED** (2026-07-06). `RealmModelTest`
 then reached a distinct residual one layer deeper, in the same "synthetic
 native shim intercepts a real object" family,
 [Infinispan Cache.config null after real DefaultCacheManager.start()](../internal/fixed-suite-bugs/keycloak-model-infinispan-cache-config-null-after-real-start-FIXED.md),
-now **also FIXED** (2026-07-06) — see the top of this file for the two new
-residuals (JIT-only decode error, `--nojit`-only STW shutdown hang) it
-uncovered one/two layers deeper still.
+now **also FIXED** (2026-07-06); see the top of this file for the remaining
+JIT-only decode residual it uncovered. The sibling `--nojit` STW shutdown hang
+is now fixed and retired to
+[`docs/internal/fixed-suite-bugs/keycloak-model-stw-takeover-hang-eventloopgroup-shutdown-FIXED.md`](../internal/fixed-suite-bugs/keycloak-model-stw-takeover-hang-eventloopgroup-shutdown-FIXED.md).
 Not CratonVM bugs: 543 FAILs (`testsuite/integration-arquillian/tests/base`
 + `tests/other/sssd`, exhaustively confirmed - 543/544 exact match, the 544th
 is the System Rules finding above) are "Not found frontend container:
@@ -903,8 +903,10 @@ PreviewFeatures native crash. The remaining non-passed rows are tracked here:
   [Infinispan JGroupsTransport.start() never invoked](../internal/fixed-suite-bugs/keycloak-model-jgroupstransport-start-never-invoked-FIXED.md),
   now FIXED. `RealmModelTest` then reached a distinct residual,
   [Infinispan Cache.config null after real DefaultCacheManager.start()](../internal/fixed-suite-bugs/keycloak-model-infinispan-cache-config-null-after-real-start-FIXED.md),
-  now ALSO FIXED (2026-07-06) — see the top of this file for the two new
-  residuals it uncovered one/two layers deeper still.
+  now ALSO FIXED (2026-07-06); see the top of this file for the remaining
+  JIT-only decode residual it uncovered. The sibling `--nojit` STW shutdown
+  hang is now retired to
+  [keycloak-model-stw-takeover-hang-eventloopgroup-shutdown-FIXED.md](../internal/fixed-suite-bugs/keycloak-model-stw-takeover-hang-eventloopgroup-shutdown-FIXED.md).
 - [keycloak-sssd-system1-findbootstrapclassornull-nosuchmethod.md](keycloak-sssd-system1-findbootstrapclassornull-nosuchmethod.md) -
   2 `FAIL` rows in the SSSD module, missing
   `java/lang/System$1.findBootstrapClassOrNull(String)Class`.
