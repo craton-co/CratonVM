@@ -289,7 +289,7 @@ Residuals split into their own focused docs:
 - ~~class-manager-rwlock-writer-starvation.md~~ — the residual 25% hang rate above: FIXED 2026-07-07 (was a same-thread recursive-read deadlock, not writer starvation — see `docs/internal/fixed-suite-bugs/class-manager-rwlock-recursive-read-deadlock-FIXED.md`).
 - [http-client-simpleclienthttpresponsetests-mockito-dispatch-bugs.md](http-client-simpleclienthttpresponsetests-mockito-dispatch-bugs.md) — `SimpleClientHttpResponseTests`'s `UnfinishedVerificationException` (order-dependent) + an intermittent `(class, method, descriptor)`-substituting `NoSuchMethodError`; several hypotheses refuted, root cause still open.
 - [spring-web-flow-outputstreamwriter-close-corruption.md](spring-web-flow-outputstreamwriter-close-corruption.md) — 2 of 4 "genuine hang" classes root-caused to `StreamEncoder.closed` being `true` immediately from `OutputStreamWriter` construction (mechanism itself still unexplained); other 2 need separate investigation.
-- [http-client-reactor-windows-timeout-linux-epoll-gap.md](http-client-reactor-windows-timeout-linux-epoll-gap.md) — `ReactorClientHttpRequestFactoryTests`: a documented Linux-only `EPollSelectorImpl` gap (not a bug) plus an uninvestigated Windows-side TIMEOUT.
+- ~~http-client-reactor-windows-timeout-linux-epoll-gap.md~~ — RETIRED 2026-07-08: current `dev` passes `ReactorClientHttpRequestFactoryTests` 10/10 on the Azure real-JDK Spring probe; archived at [`docs/internal/fixed-suite-bugs/http-client-reactor-windows-timeout-linux-epoll-gap-FIXED.md`](../internal/fixed-suite-bugs/http-client-reactor-windows-timeout-linux-epoll-gap-FIXED.md).
 
 `SimpleClientHttpRequestFactoryTests`'s residual failures are pre-existing,
 out-of-scope synthetic-`HttpURLConnection` gaps unrelated to this cluster
@@ -777,12 +777,14 @@ residuals surfaced (all fail identically at baseline `b0aab8f9`, so none is from
 regression):
 
 - [hib-proxyclassreuse-loader-blind-class-resolution.md](hib-proxyclassreuse-loader-blind-class-resolution.md) —
-  🔴 **OPEN.** `ProxyClassReuseTest.testNoReuse`: `CONSTANT_Class` resolution is loader-blind
-  (a class constant inside custom-loader bytecode resolves through the flat global/app store, not
-  the holder's defining loader), so an isolated loader's `MyEntity` collapses to the app namespace
-  and its ByteBuddy proxy collides. loadClass-override isolation itself works; this is deeper
-  (core class-store change, broad blast radius). Min repro `.scratch-hhsf/IsoProbe3.java`. Same
-  family as **SBR-14** / `SC-custom-classloader`.
+  🔴 **OPEN.** The original `ProxyClassReuseTest.testNoReuse` loader-blind
+  `CONSTANT_Class` bug is fixed on current `dev` (2026-07-08: 3/3 pass), but
+  the document stays open for live residuals in the same loader/Groovy-runtime
+  area: `BshScriptFactoryTests` reverse-pollution (`Class.forName(name)` with
+  no explicit loader) and the `GroovyBeanDefinitionReaderTests`
+  XML-namespace/component-scan cluster (2026-07-08: HotSpot 36/36, CratonVM
+  `--nojit` 30/36 with namespace/StreamingMarkupBuilder failures plus heap
+  guard diagnostics). Same family as **SBR-14** / `SC-custom-classloader`.
 - [hib-bytecode-enhancement-loader-faithful-linking.md](hib-bytecode-enhancement-loader-faithful-linking.md) —
   🔴 **REOPENED 2026-07-04** (moved back from `docs/internal`, where it was mis-archived as
   "FIXED / ARCHIVED"). Builds on the proxyclassreuse fix above with superclass/interface linking,

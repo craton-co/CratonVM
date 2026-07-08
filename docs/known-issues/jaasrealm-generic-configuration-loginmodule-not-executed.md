@@ -1,4 +1,4 @@
-# TestJAASRealm — generic file-based JAAS `Configuration`/`LoginModule` chain not executed
+``# TestJAASRealm — generic file-based JAAS `Configuration`/`LoginModule` chain not executed
 
 > **STATUS: PARTIAL FIX.** The originally-reported bug — `LoginContext.<init>`'s 4-arg overload
 > (`String, Subject, CallbackHandler, Configuration`) wasn't registered as a CratonVM native, so it
