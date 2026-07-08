@@ -131,6 +131,24 @@ const IA_ADDR: usize = 1;
 const ISA_HOST: usize = 0;
 const ISA_PORT: usize = 1;
 
+/// The list `SSLSocket.getSupportedCipherSuites()` returns for our synthetic
+/// client socket (`ssl_sock_supported_cipher_suites` in phases_late.rs — kept
+/// in sync manually since the two functions live in different files serving
+/// different halves of the same `javax/net/ssl/SSLSocket` class). Used by
+/// `setEnabledCipherSuites` below to distinguish a real cipher restriction
+/// from a caller just re-asserting "use everything you support".
+const CLIENT_SUPPORTED_CIPHER_SUITES: &[&str] = &[
+    "TLS_AES_128_GCM_SHA256",
+    "TLS_AES_256_GCM_SHA384",
+    "TLS_CHACHA20_POLY1305_SHA256",
+    "TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256",
+    "TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256",
+    "TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384",
+    "TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384",
+    "TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305_SHA256",
+    "TLS_ECDHE_RSA_WITH_CHACHA20_POLY1305_SHA256",
+];
+
 const SOCK_HOST: usize = 0;
 const SOCK_PORT: usize = 1;
 const SOCK_LOCAL_PORT: usize = 2;
@@ -7981,30 +7999,41 @@ fn register_re6_ssl_context(r: &mut NativeMethodRegistry) {
                     }
                 }
             }
-            if std::env::var_os("CRATONVM_DBG_TLS_SOCK").is_some() {
-                eprintln!(
-                    "[dbg-tls-sock] setEnabledCipherSuites called this={:?} ciphers={:?} any_mappable={}",
-                    this,
-                    ciphers,
-                    crate::t27_tls::any_cipher_mappable(&ciphers)
-                );
-            }
             if ciphers.is_empty() || !crate::t27_tls::any_cipher_mappable(&ciphers) {
+                return Ok(None);
+            }
+            // FIX (netty-client-socket-write-after-close residual): don't
+            // reconnect when `ciphers` covers this socket's ENTIRE supported
+            // set (`ssl_sock_supported_cipher_suites` in phases_late.rs, the
+            // list `SSLSocket.getSupportedCipherSuites()` returns) — that's
+            // not a real restriction, just a caller re-asserting "use
+            // everything you support" (the common case: e.g. Apache
+            // HttpClient5's `SSLConnectionSocketFactory` calls
+            // `setEnabledCipherSuites(getSupportedCipherSuites())` as part of
+            // its normal connection setup, unconditionally, for every socket
+            // it creates — not only ones under an actual cipher policy).
+            // Reconnecting anyway tears down a connection that may have been
+            // established under semantics THIS rustls-only path cannot
+            // reproduce (a Java TrustManager accepting a self-signed/test
+            // certificate — see `new13_do_create_socket`'s post-connect
+            // `checkServerTrusted` delegation, which this reconnect has no
+            // way to redo), turning a harmless no-op call into a hard
+            // failure. Only reconnect for a GENUINE restriction: a proper
+            // subset of the supported suites (e.g. Tomcat's
+            // `TesterSupport.ClientSSLSocketFactory`, which this reconnect
+            // exists for in the first place — see the FIX comment above).
+            let requested: std::collections::HashSet<&str> =
+                ciphers.iter().map(String::as_str).collect();
+            let is_full_supported_set = CLIENT_SUPPORTED_CIPHER_SUITES
+                .iter()
+                .all(|c| requested.contains(c));
+            if is_full_supported_set {
                 return Ok(None);
             }
             let host = read_field_string_or(ctx, this, SOCK_HOST, "");
             let side = sock_get(this);
-            if std::env::var_os("CRATONVM_DBG_TLS_SOCK").is_some() {
-                eprintln!(
-                    "[dbg-tls-sock] setEnabledCipherSuites reconnect check host={:?} side_port={}",
-                    host, side.port
-                );
-            }
             if host.is_empty() || side.port <= 0 {
                 return Ok(None);
-            }
-            if std::env::var_os("CRATONVM_DBG_TLS_SOCK").is_some() {
-                eprintln!("[dbg-tls-sock] setEnabledCipherSuites RECONNECTING (tearing down existing connection)");
             }
             let client_ident = crate::t27_tls::huc_default_client_identity();
             let cfg = match crate::t27_tls::build_engine_client_config_with_identity_ciphers(

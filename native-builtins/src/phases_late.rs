@@ -39788,33 +39788,15 @@ fn p68_factory_trust_roots(args: &[Value]) -> Vec<Vec<u8>> {
 /// default verification.
 fn p68_factory_java_tm_key(ctx: &mut dyn NativeContext, args: &[Value]) -> Option<u64> {
     let Some(Value::Object(Some(factory))) = args.first() else {
-        if std::env::var_os("CRATONVM_DBG_TLS_SOCK").is_some() {
-            eprintln!("[dbg-tls-sock] p68_factory_java_tm_key: args[0] not an object");
-        }
         return None;
     };
-    let num_fields = ctx.object_num_fields(*factory);
-    let field0 = ctx.get_field(*factory, 0);
-    if std::env::var_os("CRATONVM_DBG_TLS_SOCK").is_some() {
-        eprintln!(
-            "[dbg-tls-sock] p68_factory_java_tm_key: factory={:?} num_fields={} field0={:?}",
-            factory, num_fields, field0
-        );
-    }
-    if num_fields == 0 {
+    if ctx.object_num_fields(*factory) == 0 {
         return None;
     }
-    let Value::Object(Some(sslctx)) = field0 else {
+    let Value::Object(Some(sslctx)) = ctx.get_field(*factory, 0) else {
         return None;
     };
-    let key = crate::t27_tls::ctx_trust_managers_key_if_attached(ctx, sslctx);
-    if std::env::var_os("CRATONVM_DBG_TLS_SOCK").is_some() {
-        eprintln!(
-            "[dbg-tls-sock] p68_factory_java_tm_key: ctx_trust_managers_key_if_attached={:?}",
-            key
-        );
-    }
-    key
+    crate::t27_tls::ctx_trust_managers_key_if_attached(ctx, sslctx)
 }
 
 /// NEW-13: allocate an `SSLSession` synthetic object populated from the
