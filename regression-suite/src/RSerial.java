@@ -16,6 +16,26 @@ public class RSerial {
         Node(int id) { this.id = id; }
     }
 
+    static final class LhmOuter implements Serializable {
+        private static final long serialVersionUID = 1L;
+        final int limit;
+        final LinkedHashMap<String, String> map;
+
+        LhmOuter(int limit) {
+            this.limit = limit;
+            this.map = new LinkedHashMap<String, String>() {
+                private static final long serialVersionUID = 1L;
+                @Override
+                protected boolean removeEldestEntry(Map.Entry<String, String> eldest) {
+                    if (LhmOuter.this.limit < 0) {
+                        throw new AssertionError("outer reference lost");
+                    }
+                    return size() > LhmOuter.this.limit;
+                }
+            };
+        }
+    }
+
     @SuppressWarnings("unchecked")
     static <T> T roundtrip(T o) throws Exception {
         ByteArrayOutputStream bos = new ByteArrayOutputStream();
@@ -47,6 +67,16 @@ public class RSerial {
         HashMap<String, Integer> map = new HashMap<>();
         map.put("a", 1); map.put("b", 2);
         check(roundtrip(map).equals(map), "HashMap round-trip");
+        LhmOuter lhm = new LhmOuter(100);
+        lhm.map.put("a", "1");
+        lhm.map.put("b", "2");
+        LhmOuter lhmRoundTrip = roundtrip(lhm);
+        // HashMap.readObject must not invoke removeEldestEntry before this
+        // anonymous subclass's synthetic this$0 field is restored; the live
+        // put after deserialize proves the outer reference is usable again.
+        lhmRoundTrip.map.put("c", "3");
+        check(lhmRoundTrip.limit == 100 && lhmRoundTrip.map.size() == 3
+            && "1".equals(lhmRoundTrip.map.get("a")), "anonymous LinkedHashMap this$0 restored");
         check(roundtrip("a plain string").equals("a plain string"), "String round-trip");
         check(roundtrip(Integer.valueOf(123)).equals(123), "boxed Integer round-trip");
         check(Arrays.equals(roundtrip(new long[] { 1L, 2L, 3L }), new long[] { 1L, 2L, 3L }), "long[] round-trip");
