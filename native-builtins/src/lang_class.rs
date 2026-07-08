@@ -14920,7 +14920,8 @@ mod tests {
     #[test]
     fn class_is_array_true() {
         let mut ctx = mock_ctx();
-        let mirror = make_class_mirror(&mut ctx, 0, "[Ljava/lang/String;");
+        let cid = ctx.ensure_class_initialized("[Ljava/lang/String;").unwrap();
+        let mirror = make_class_mirror(&mut ctx, cid.as_u32(), "[Ljava/lang/String;");
         let r = native_class_is_array(&mut ctx, &[Value::Object(Some(mirror))]);
         assert_eq!(r.unwrap(), Some(Value::Int(1)));
     }
@@ -14940,7 +14941,8 @@ mod tests {
     #[test]
     fn class_is_primitive_int() {
         let mut ctx = mock_ctx();
-        let mirror = make_class_mirror(&mut ctx, 0, "int");
+        let cid = ctx.ensure_class_initialized("int").unwrap();
+        let mirror = make_class_mirror(&mut ctx, cid.as_u32(), "int");
         let r = native_class_is_primitive(&mut ctx, &[Value::Object(Some(mirror))]);
         assert_eq!(r.unwrap(), Some(Value::Int(1)));
     }
@@ -14956,7 +14958,8 @@ mod tests {
     #[test]
     fn class_is_primitive_boolean() {
         let mut ctx = mock_ctx();
-        let mirror = make_class_mirror(&mut ctx, 0, "boolean");
+        let cid = ctx.ensure_class_initialized("boolean").unwrap();
+        let mirror = make_class_mirror(&mut ctx, cid.as_u32(), "boolean");
         let r = native_class_is_primitive(&mut ctx, &[Value::Object(Some(mirror))]);
         assert_eq!(r.unwrap(), Some(Value::Int(1)));
     }
@@ -14968,7 +14971,8 @@ mod tests {
     #[test]
     fn class_get_simple_name_basic() {
         let mut ctx = mock_ctx();
-        let mirror = make_class_mirror(&mut ctx, 0, "java/lang/String");
+        let cid = ctx.ensure_class_initialized("java/lang/String").unwrap();
+        let mirror = make_class_mirror(&mut ctx, cid.as_u32(), "java/lang/String");
         let r = native_class_get_simple_name(&mut ctx, &[Value::Object(Some(mirror))]);
         let obj = match r.unwrap() {
             Some(Value::Object(Some(o))) => o,
@@ -14980,7 +14984,8 @@ mod tests {
     #[test]
     fn class_get_simple_name_inner_class() {
         let mut ctx = mock_ctx();
-        let mirror = make_class_mirror(&mut ctx, 0, "java/util/Map$Entry");
+        let cid = ctx.ensure_class_initialized("java/util/Map$Entry").unwrap();
+        let mirror = make_class_mirror(&mut ctx, cid.as_u32(), "java/util/Map$Entry");
         let r = native_class_get_simple_name(&mut ctx, &[Value::Object(Some(mirror))]);
         let obj = match r.unwrap() {
             Some(Value::Object(Some(o))) => o,
@@ -14996,7 +15001,8 @@ mod tests {
     #[test]
     fn class_descriptor_string_int() {
         let mut ctx = mock_ctx();
-        let mirror = make_class_mirror(&mut ctx, 0, "int");
+        let cid = ctx.ensure_class_initialized("int").unwrap();
+        let mirror = make_class_mirror(&mut ctx, cid.as_u32(), "int");
         let r = native_class_descriptor_string(&mut ctx, &[Value::Object(Some(mirror))]);
         let obj = match r.unwrap() {
             Some(Value::Object(Some(o))) => o,
@@ -15008,7 +15014,8 @@ mod tests {
     #[test]
     fn class_descriptor_string_object() {
         let mut ctx = mock_ctx();
-        let mirror = make_class_mirror(&mut ctx, 0, "java/lang/Object");
+        let cid = ctx.ensure_class_initialized("java/lang/Object").unwrap();
+        let mirror = make_class_mirror(&mut ctx, cid.as_u32(), "java/lang/Object");
         let r = native_class_descriptor_string(&mut ctx, &[Value::Object(Some(mirror))]);
         let obj = match r.unwrap() {
             Some(Value::Object(Some(o))) => o,
@@ -15020,7 +15027,8 @@ mod tests {
     #[test]
     fn class_descriptor_string_array() {
         let mut ctx = mock_ctx();
-        let mirror = make_class_mirror(&mut ctx, 0, "[I");
+        let cid = ctx.ensure_class_initialized("[I").unwrap();
+        let mirror = make_class_mirror(&mut ctx, cid.as_u32(), "[I");
         let r = native_class_descriptor_string(&mut ctx, &[Value::Object(Some(mirror))]);
         let obj = match r.unwrap() {
             Some(Value::Object(Some(o))) => o,
