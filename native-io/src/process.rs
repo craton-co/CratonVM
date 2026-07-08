@@ -1123,14 +1123,16 @@ fn native_proc_handle_is_alive0(_ctx: &mut dyn NativeContext, args: &[Value]) ->
 
 /// `java.lang.ProcessHandleImpl.waitForProcessExit0(long, boolean) -> int`
 fn native_proc_handle_wait_for_process_exit0(
-    _ctx: &mut dyn NativeContext,
+    ctx: &mut dyn NativeContext,
     args: &[Value],
 ) -> MethodCallResult {
     let handle = match args.first() {
         Some(Value::Long(h)) => *h,
         _ => return Ok(Some(Value::Int(-1))),
     };
+    ctx.begin_blocking_region();
     let code = wait_for_handle(handle);
+    ctx.end_blocking_region();
     Ok(Some(Value::Int(code)))
 }
 
@@ -1150,17 +1152,23 @@ fn native_proc_handle_destroy_process0(
 
 /// `java.lang.Process.waitFor()I` on our synthetic Process object.
 fn native_process_wait_for(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    let this = match args.first() {
+    let mut this = match args.first() {
         Some(Value::Object(Some(o))) => *o,
         _ => return Ok(Some(Value::Int(-1))),
     };
     let handle = handle_of(ctx, this);
     if handle == 0 {
-        // Legacy / stub Process (from phases_late ProcessBuilder.start) —
+        // Legacy / stub Process (from phases_late ProcessBuilder.start) -
         // fall back to reading the cached exit code in field 0.
         return Ok(Some(ctx.get_field(this, PROC_FIELD_EXIT)));
     }
+    let mut held = [Value::Object(Some(this))];
+    ctx.begin_blocking_region();
     let code = wait_for_handle(handle);
+    ctx.end_blocking_region_refs(&mut held);
+    if let Value::Object(Some(updated)) = held[0] {
+        this = updated;
+    }
     ctx.set_field(this, PROC_FIELD_EXIT, Value::Int(code));
     Ok(Some(Value::Int(code)))
 }
@@ -1176,7 +1184,7 @@ fn native_process_wait_for_timeout(
     ctx: &mut dyn NativeContext,
     args: &[Value],
 ) -> MethodCallResult {
-    let this = match args.first() {
+    let mut this = match args.first() {
         Some(Value::Object(Some(o))) => *o,
         _ => return Ok(Some(Value::Int(0))),
     };
@@ -1213,7 +1221,13 @@ fn native_process_wait_for_timeout(
     }
     let timeout_ms = timeout_ms as u64;
     let Some(deadline) = Instant::now().checked_add(Duration::from_millis(timeout_ms)) else {
+        let mut held = [Value::Object(Some(this))];
+        ctx.begin_blocking_region();
         let code = wait_for_handle(handle);
+        ctx.end_blocking_region_refs(&mut held);
+        if let Value::Object(Some(updated)) = held[0] {
+            this = updated;
+        }
         ctx.set_field(this, PROC_FIELD_EXIT, Value::Int(code));
         return Ok(Some(Value::Int(1)));
     };
@@ -1230,7 +1244,13 @@ fn native_process_wait_for_timeout(
         }
 
         let remaining = deadline.saturating_duration_since(now);
+        let mut held = [Value::Object(Some(this))];
+        ctx.begin_blocking_region();
         std::thread::sleep(remaining.min(Duration::from_millis(10)));
+        ctx.end_blocking_region_refs(&mut held);
+        if let Value::Object(Some(updated)) = held[0] {
+            this = updated;
+        }
     }
 }
 
@@ -1804,6 +1824,29 @@ fn native_process_builder_start(ctx: &mut dyn NativeContext, args: &[Value]) -> 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::MockNativeContext;
+
+    fn install_child_for_test(child: Child) -> (i64, i64) {
+        let handle = NEXT_HANDLE.fetch_add(1, Ordering::Relaxed);
+        let pid = child.id() as i64;
+        process_table().lock().insert(handle, child);
+        exit_cache().lock().insert(
+            handle,
+            ExitCache {
+                pid,
+                exit_code: None,
+            },
+        );
+        (handle, pid)
+    }
+
+    fn mock_process(ctx: &mut MockNativeContext, handle: i64, pid: i64) -> ObjectRef {
+        let proc_ref = ctx.alloc_object(PROC_FIELD_COUNT);
+        ctx.set_field(proc_ref, PROC_FIELD_EXIT, Value::Int(EXIT_NOT_YET));
+        ctx.set_field(proc_ref, PROC_FIELD_PID, Value::Long(pid));
+        ctx.set_field(proc_ref, PROC_FIELD_HANDLE, Value::Long(handle));
+        proc_ref
+    }
 
     /// End-to-end spawn + waitFor round-trip — no NativeContext needed.
     #[test]
@@ -1886,6 +1929,98 @@ mod tests {
         // After kill, waitFor returns some exit code (non-zero on
         // Unix; Windows returns 1).
         let _code = wait_for_handle(handle);
+    }
+
+    #[test]
+    fn process_wait_for_enters_gc_blocked_region() {
+        #[cfg(target_os = "windows")]
+        let child = Command::new("cmd")
+            .args(["/c", "echo", "x"])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn");
+        #[cfg(not(target_os = "windows"))]
+        let child = Command::new("/bin/echo")
+            .arg("x")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn");
+
+        let (handle, pid) = install_child_for_test(child);
+        let mut ctx = MockNativeContext::new();
+        let proc_ref = mock_process(&mut ctx, handle, pid);
+
+        let result = native_process_wait_for(&mut ctx, &[Value::Object(Some(proc_ref))])
+            .unwrap()
+            .unwrap();
+        assert_eq!(result, Value::Int(0));
+        assert_eq!(ctx.get_field(proc_ref, PROC_FIELD_EXIT), Value::Int(0));
+        assert_eq!(ctx.blocking_region_counts(), (1, 1));
+    }
+
+    #[test]
+    fn process_handle_wait_for_exit_enters_gc_blocked_region() {
+        #[cfg(target_os = "windows")]
+        let child = Command::new("cmd")
+            .args(["/c", "echo", "x"])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn");
+        #[cfg(not(target_os = "windows"))]
+        let child = Command::new("/bin/echo")
+            .arg("x")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn");
+
+        let (handle, _pid) = install_child_for_test(child);
+        let mut ctx = MockNativeContext::new();
+        let result = native_proc_handle_wait_for_process_exit0(
+            &mut ctx,
+            &[Value::Long(handle), Value::Int(0)],
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(result, Value::Int(0));
+        assert_eq!(ctx.blocking_region_counts(), (1, 1));
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    #[test]
+    fn process_wait_for_timeout_enters_gc_blocked_region_between_polls() {
+        let child = Command::new("/bin/sleep")
+            .arg("1")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn sleep");
+
+        let (handle, pid) = install_child_for_test(child);
+        let mut ctx = MockNativeContext::new();
+        let proc_ref = mock_process(&mut ctx, handle, pid);
+
+        let result = native_process_wait_for_timeout(
+            &mut ctx,
+            &[Value::Object(Some(proc_ref)), Value::Long(20), Value::Object(None)],
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(result, Value::Int(0));
+        let (begin, end) = ctx.blocking_region_counts();
+        assert!(begin >= 1, "timed wait should enter a blocked region");
+        assert_eq!(begin, end, "blocked-region enter/leave must balance");
+
+        let _ = destroy_handle(handle, true);
+        let _ = wait_for_handle(handle);
     }
 
     /// `pid_for_handle` returns the captured pid even after reap.

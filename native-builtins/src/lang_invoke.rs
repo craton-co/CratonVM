@@ -5882,17 +5882,44 @@ pub(crate) fn mh_dispatch(
             match bound {
                 Value::Object(Some(r)) => {
                     // Bound method handle — receiver was pre-captured
+                    let recv_pin = ctx.pin_native_root(r);
                     let collected = collect_trailing_varargs(ctx, &class, &name, &desc, extra_args);
                     let adapted = adapt_invoke_args(ctx, &collected, &desc);
-                    ctx.invoke_virtual(r, &name, &desc, &adapted)
+                    let (adapted_pin_base, adapted_handles) = pin_mh_args(ctx, &adapted);
+                    let adapted: Vec<Value> = adapted
+                        .iter()
+                        .enumerate()
+                        .map(|(i, arg)| read_pinned_mh_arg(ctx, adapted_handles[i], *arg))
+                        .collect();
+                    let r = ctx.read_native_pin(recv_pin, r);
+                    let result = ctx.invoke_virtual_declared(&class, r, &name, &desc, &adapted);
+                    if adapted_pin_base != usize::MAX {
+                        ctx.unpin_native_roots(adapted_pin_base);
+                    }
+                    ctx.unpin_native_roots(recv_pin);
+                    result
                 }
                 _ => match extra_args.first() {
                     Some(Value::Object(Some(receiver))) => {
                         let receiver = *receiver;
+                        let recv_pin = ctx.pin_native_root(receiver);
                         let collected =
                             collect_trailing_varargs(ctx, &class, &name, &desc, &extra_args[1..]);
                         let adapted = adapt_invoke_args(ctx, &collected, &desc);
-                        ctx.invoke_virtual(receiver, &name, &desc, &adapted)
+                        let (adapted_pin_base, adapted_handles) = pin_mh_args(ctx, &adapted);
+                        let adapted: Vec<Value> = adapted
+                            .iter()
+                            .enumerate()
+                            .map(|(i, arg)| read_pinned_mh_arg(ctx, adapted_handles[i], *arg))
+                            .collect();
+                        let receiver = ctx.read_native_pin(recv_pin, receiver);
+                        let result =
+                            ctx.invoke_virtual_declared(&class, receiver, &name, &desc, &adapted);
+                        if adapted_pin_base != usize::MAX {
+                            ctx.unpin_native_roots(adapted_pin_base);
+                        }
+                        ctx.unpin_native_roots(recv_pin);
+                        result
                     }
                     _ => Ok(Some(Value::Object(None))),
                 },
@@ -6203,6 +6230,34 @@ fn count_descriptor_params(desc: &str) -> usize {
 
 /// Type adaptation for invoke(): coerce args to match the expected descriptor.
 /// Handles boxing (int→Integer), unboxing (Integer→int), and widening (int→long).
+fn pin_mh_args(ctx: &mut dyn NativeContext, args: &[Value]) -> (usize, Vec<usize>) {
+    let mut base = usize::MAX;
+    let handles = args
+        .iter()
+        .map(|arg| match arg {
+            Value::Object(Some(obj)) => {
+                let h = ctx.pin_native_root(*obj);
+                if base == usize::MAX {
+                    base = h;
+                }
+                h
+            }
+            _ => usize::MAX,
+        })
+        .collect();
+    (base, handles)
+}
+
+#[inline]
+fn read_pinned_mh_arg(ctx: &dyn NativeContext, handle: usize, arg: Value) -> Value {
+    match arg {
+        Value::Object(Some(obj)) if handle != usize::MAX => {
+            Value::Object(Some(ctx.read_native_pin(handle, obj)))
+        }
+        _ => arg,
+    }
+}
+
 fn adapt_invoke_args(ctx: &mut dyn NativeContext, args: &[Value], desc: &str) -> Vec<Value> {
     if desc.is_empty() || !desc.starts_with('(') {
         return args.to_vec();
@@ -6214,13 +6269,18 @@ fn adapt_invoke_args(ctx: &mut dyn NativeContext, args: &[Value], desc: &str) ->
     let params_str = &desc[1..close];
     let param_types = parse_descriptor_types(params_str);
 
+    let (pin_base, handles) = pin_mh_args(ctx, args);
     let mut result = Vec::with_capacity(args.len());
     for (i, arg) in args.iter().enumerate() {
+        let arg = read_pinned_mh_arg(ctx, handles[i], *arg);
         if i < param_types.len() {
-            result.push(adapt_single_arg(ctx, *arg, &param_types[i]));
+            result.push(adapt_single_arg(ctx, arg, &param_types[i]));
         } else {
-            result.push(*arg);
+            result.push(arg);
         }
+    }
+    if pin_base != usize::MAX {
+        ctx.unpin_native_roots(pin_base);
     }
     result
 }

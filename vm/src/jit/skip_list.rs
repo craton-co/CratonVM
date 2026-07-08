@@ -480,6 +480,31 @@ fn should_skip_jit_internal(
         {
             return Some(SkipReason::RustJvmTestFixture);
         }
+        // HIB-TEMPORAL.1 (2026-07-08) - Hibernate temporal suite residuals.
+        // The `InstantTests` failure cluster was not a Hibernate data bug: with
+        // default JIT, `DdlTypeImpl.getRawTypeName` saw a null `typeNamePattern`
+        // during `TIMESTAMP_UTC` DDL descriptor registration (37 failures). A cold
+        // standalone `H2Dialect.columnType(3003)` probe matched HotSpot, but
+        // `CRATONVM_TIER_ENABLED=0` removed the type-name-pattern signature, so
+        // this is a JIT-only corruption in the Hibernate DDL/type hot path.
+        //
+        // Narrow bisection found `org/hibernate/type/descriptor/sql/internal/`
+        // as the DDL NPE face, but that exposed intermittent empty-message
+        // `IllegalThreadStateException`, H2 connection `<local4>` NPE, and
+        // `Object.{test,apply}` NoSuchMethodError failures in adjacent temporal
+        // runs. The stable control is interpreting Hibernate bytecode as a
+        // package (repeat `CRATONVM_JIT_DENY=org/hibernate/` runs: 0 failures in
+        // `InstantTests`), matching the existing conservative third-party
+        // fail-closed guards in this file. The helper accepts both slash and
+        // dotted class-name spellings because the JIT eligibility path can see
+        // either shape depending on the caller. Liftable for bisection with
+        // `CRATONVM_JIT_ALLOW_PACKAGES=org/hibernate/` or `org.hibernate.` once
+        // the underlying JIT producer is narrowed.
+        if let Some(prefix) = hibernate_temporal_residual_skip_prefix(class_name) {
+            if !package_allowed(prefix, allow_packages) {
+                return Some(SkipReason::RustJvmTestFixture);
+            }
+        }
         if callee_saved_gpr_local_homes_enabled()
             && is_known_miscompile(class_name, method_name)
             && !package_allowed(class_name, allow_packages)
@@ -1292,6 +1317,16 @@ fn is_unconditional_hash_miscompile_cluster(class_name: &str, method_name: &str)
 // skip below.
 fn is_elasticsearch_suite_jit_fragile_cluster(class_name: &str, _method_name: &str) -> bool {
     class_name.starts_with("org/elasticsearch/")
+}
+
+fn hibernate_temporal_residual_skip_prefix(class_name: &str) -> Option<&'static str> {
+    const SLASH_PREFIX: &str = "org/hibernate/";
+    const DOT_PREFIX: &str = "org.hibernate.";
+    if class_name.starts_with(SLASH_PREFIX) {
+        Some(SLASH_PREFIX)
+    } else {
+        class_name.starts_with(DOT_PREFIX).then_some(DOT_PREFIX)
+    }
 }
 
 fn is_known_miscompile(class_name: &str, method_name: &str) -> bool {
@@ -2535,6 +2570,70 @@ mod tests {
                 false,
                 true,
                 SkipPolicy::Aggressive
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn hibernate_temporal_residual_package_skipped_conservatively() {
+        for cls in [
+            "org/hibernate/dialect/H2Dialect",
+            "org/hibernate/type/descriptor/sql/internal/DdlTypeImpl",
+            "org/hibernate/testing/jdbc/SharedDriverManagerConnectionProvider",
+            "org/hibernate/orm/test/type/temporal/InstantTests",
+            "org.hibernate.dialect.H2Dialect",
+        ] {
+            assert_eq!(
+                check(
+                    cls,
+                    "getRawTypeNames",
+                    false,
+                    true,
+                    SkipPolicy::Conservative
+                ),
+                Some(SkipReason::RustJvmTestFixture),
+                "{cls} should stay interpreted under the conservative Hibernate temporal guard"
+            );
+        }
+    }
+
+    #[test]
+    fn hibernate_temporal_residual_package_lifts_under_aggressive_policy() {
+        assert_eq!(
+            check(
+                "org/hibernate/type/descriptor/sql/internal/DdlTypeImpl",
+                "getRawTypeNames",
+                false,
+                true,
+                SkipPolicy::Aggressive,
+            ),
+            None,
+            "aggressive policy should lift the Hibernate temporal guard"
+        );
+    }
+
+    #[test]
+    fn hibernate_temporal_residual_package_lifts_with_allow_packages() {
+        assert_eq!(
+            check_with(
+                "org/hibernate/testing/jdbc/SharedDriverManagerConnectionProvider",
+                "onDefaultTimeZoneChange",
+                false,
+                true,
+                SkipPolicy::Conservative,
+                &["org/hibernate/"],
+            ),
+            None
+        );
+        assert_eq!(
+            check_with(
+                "org.hibernate.testing.jdbc.SharedDriverManagerConnectionProvider",
+                "onDefaultTimeZoneChange",
+                false,
+                true,
+                SkipPolicy::Conservative,
+                &["org.hibernate."],
             ),
             None
         );

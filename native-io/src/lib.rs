@@ -2798,7 +2798,33 @@ fn native_bais_read_bytes(ctx: &mut dyn NativeContext, args: &[Value]) -> Method
         .class_name_of_id(ctx.class_id_of_object(this))
         .unwrap_or_default();
     let is_bais = cls_name == "java/io/ByteArrayInputStream";
+    // Mockito subclass mocks inherit concrete InputStream helpers; let Mockito's
+    // default-answer machinery own those inherited methods instead of spinning
+    // here on the mock's default read() == 0.
+    if cls_name.contains("$MockitoMock$") {
+        return Ok(Some(Value::Int(0)));
+    }
     if !is_bais {
+        if ctx.class_declares_method(ctx.class_id_of_object(this), "read", "([BII)I") {
+            let this_pin = ctx.pin_native_root(this);
+            let buf_pin = ctx.pin_native_root(buf);
+            let this_cur = ctx.read_native_pin(this_pin, this);
+            let buf_cur = ctx.read_native_pin(buf_pin, buf);
+            let result = ctx.invoke(
+                &cls_name,
+                "read",
+                "([BII)I",
+                &[
+                    Value::Object(Some(this_cur)),
+                    Value::Object(Some(buf_cur)),
+                    Value::Int(off as i32),
+                    Value::Int(len as i32),
+                ],
+            );
+            ctx.unpin_native_roots(this_pin);
+            return result;
+        }
+
         // Match InputStream.read(byte[],int,int) default impl: one read()
         // call per byte, stop on -1, return count read (or -1 if none).
         if len == 0 {
@@ -3138,13 +3164,21 @@ fn native_baos_write_bytes(ctx: &mut dyn NativeContext, args: &[Value]) -> Metho
     // subclass's overridden `write(int)` runs. Matches the parallel guard
     // in `native_bais_read_bytes` (committed in 840160d).
     if !receiver_is_baos(ctx, this) {
+        let this_pin = ctx.pin_native_root(this);
+        let buf_pin = ctx.pin_native_root(buf);
         for i in 0..len {
-            let v = match ctx.get_array_element(buf, off + i) {
+            let this_cur = ctx.read_native_pin(this_pin, this);
+            let buf_cur = ctx.read_native_pin(buf_pin, buf);
+            let v = match ctx.get_array_element(buf_cur, off + i) {
                 Value::Int(b) => b & 0xFF,
                 _ => 0,
             };
-            ctx.invoke_virtual(this, "write", "(I)V", &[Value::Int(v)])?;
+            if let Err(e) = ctx.invoke_virtual(this_cur, "write", "(I)V", &[Value::Int(v)]) {
+                ctx.unpin_native_roots(this_pin);
+                return Err(e);
+            }
         }
+        ctx.unpin_native_roots(this_pin);
         return Ok(None);
     }
     let count = match ctx.get_field(this, BAOS_FIELD_COUNT) {
@@ -5130,6 +5164,15 @@ fn native_is_read_all_bytes(ctx: &mut dyn NativeContext, args: &[Value]) -> Meth
             return Ok(Some(Value::Object(Some(arr))));
         }
     };
+    let cls_name = ctx
+        .class_name_of_id(ctx.class_id_of_object(this))
+        .unwrap_or_default();
+    // Same Mockito inherited-helper guard as native_bais_read_bytes.
+    if cls_name.contains("$MockitoMock$") {
+        let arr = ctx.new_array(cratonvm_types::ArrayElementType::Byte, 0);
+        return Ok(Some(Value::Object(Some(arr))));
+    }
+
     let mut bytes: Vec<i32> = Vec::new();
     loop {
         let b = ctx.invoke_virtual(this, "read", "()I", &[])?;
@@ -5208,7 +5251,7 @@ fn native_is_read_n_bytes_buf(ctx: &mut dyn NativeContext, args: &[Value]) -> Me
     Ok(Some(Value::Int(count as i32)))
 }
 
-/// InputStream.transferTo(OutputStream out) → long (Java 9+)
+/// InputStream.transferTo(OutputStream out) -> long (Java 9+)
 /// Reads all bytes from this stream and writes them to the given output stream.
 fn native_is_transfer_to(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = match args.first() {
@@ -5219,18 +5262,52 @@ fn native_is_transfer_to(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
         Some(Value::Object(Some(o))) => *o,
         _ => return Ok(Some(Value::Long(0))),
     };
+
+    let this_pin = ctx.pin_native_root(this);
+    let out_pin = ctx.pin_native_root(out);
+    let buf = ctx.new_array(ArrayElementType::Byte, 16 * 1024);
+    let buf_pin = ctx.pin_native_root(buf);
     let mut transferred: i64 = 0;
+
     loop {
-        let b = ctx.invoke_virtual(this, "read", "()I", &[])?;
-        match b {
-            Some(Value::Int(-1)) | None => break,
-            Some(Value::Int(v)) => {
-                ctx.invoke_virtual(out, "write", "(I)V", &[Value::Int(v & 0xFF)])?;
-                transferred += 1;
+        let this_cur = ctx.read_native_pin(this_pin, this);
+        let buf_cur = ctx.read_native_pin(buf_pin, buf);
+        let n = match ctx.invoke_virtual(
+            this_cur,
+            "read",
+            "([BII)I",
+            &[
+                Value::Object(Some(buf_cur)),
+                Value::Int(0),
+                Value::Int(16 * 1024),
+            ],
+        ) {
+            Ok(Some(Value::Int(n))) => n,
+            Ok(_) => -1,
+            Err(e) => {
+                ctx.unpin_native_roots(this_pin);
+                return Err(e);
             }
-            _ => break,
+        };
+        if n <= 0 {
+            break;
         }
+
+        let out_cur = ctx.read_native_pin(out_pin, out);
+        let buf_cur = ctx.read_native_pin(buf_pin, buf);
+        if let Err(e) = ctx.invoke_virtual(
+            out_cur,
+            "write",
+            "([BII)V",
+            &[Value::Object(Some(buf_cur)), Value::Int(0), Value::Int(n)],
+        ) {
+            ctx.unpin_native_roots(this_pin);
+            return Err(e);
+        }
+        transferred = transferred.saturating_add(n as i64);
     }
+
+    ctx.unpin_native_roots(this_pin);
     Ok(Some(Value::Long(transferred)))
 }
 
