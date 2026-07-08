@@ -22689,6 +22689,23 @@ pub fn register_essential_natives(registry: &mut NativeMethodRegistry) {
         cratonvm_types::Value::Object(Some(obj))
     }
 
+    fn timezone_default_ref(ctx: &mut dyn NativeContext) -> cratonvm_types::Value {
+        if let Some(class_id) = ctx.class_id_by_name("java/util/TimeZone") {
+            if let Some(field_index) = ctx.static_field_index_by_name(class_id, "defaultTimeZone") {
+                let current = ctx.get_static_field(class_id, field_index);
+                if matches!(current, Value::Object(Some(_))) {
+                    return current;
+                }
+                let fallback = alloc_synth_timezone(ctx, "UTC");
+                if matches!(fallback, Value::Object(Some(_))) {
+                    ctx.set_static_field(class_id, field_index, fallback);
+                }
+                return fallback;
+            }
+        }
+        alloc_synth_timezone(ctx, "UTC")
+    }
+
     /// Localized display name for a synthetic TimeZone, honouring its `ID` and
     /// the requested style. The previous natives hard-coded "UTC" for every
     /// zone and style, so `TimeZone.getTimeZone("GMT").getDisplayName(false,
@@ -22782,19 +22799,19 @@ pub fn register_essential_natives(registry: &mut NativeMethodRegistry) {
         "java/util/TimeZone",
         "getDefault",
         "()Ljava/util/TimeZone;",
-        |ctx, _args| Ok(Some(alloc_synth_timezone(ctx, "UTC"))),
+        |ctx, _args| Ok(Some(timezone_default_ref(ctx))),
     );
     registry.register(
         "java/util/TimeZone",
         "getDefaultRef",
         "()Ljava/util/TimeZone;",
-        |ctx, _args| Ok(Some(alloc_synth_timezone(ctx, "UTC"))),
+        |ctx, _args| Ok(Some(timezone_default_ref(ctx))),
     );
     registry.register(
         "java/util/TimeZone",
         "setDefaultZone",
-        "()V",
-        |_ctx, _args| Ok(None),
+        "()Ljava/util/TimeZone;",
+        |ctx, _args| Ok(Some(timezone_default_ref(ctx))),
     );
     // getDisplayName() and getDisplayName(Locale) default to the LONG style.
     registry.register(

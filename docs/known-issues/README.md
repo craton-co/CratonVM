@@ -136,8 +136,8 @@ All three verified against their real Keycloak classes via the suite runner; no 
   InstantTests, 2× empty `IllegalThreadStateException`) are now fixed by the conservative
   Hibernate JIT guard and retired to
   [hib-temporal-residuals-typename-npe-illegalthreadstate-FIXED.md](../internal/fixed-suite-bugs/hib-temporal-residuals-typename-npe-illegalthreadstate-FIXED.md).
-  Separate current `LocalDateTimeTest` DST/H2 residuals are tracked in
-  [hib-temporal-localdatetime-dst-h2-local4-residuals.md](hib-temporal-localdatetime-dst-h2-local4-residuals.md).
+  The later `LocalDateTimeTest` DST/H2 residuals are also fixed and retired to
+  [hib-temporal-localdatetime-dst-h2-local4-residuals-FIXED.md](../internal/fixed-suite-bugs/hib-temporal-localdatetime-dst-h2-local4-residuals-FIXED.md).
 
 ## 2026-07-06/07 http.client class_manager RwLock recursive-read deadlock — FIXED (branch fix/class-manager-writer-starvation-20260706)
 
