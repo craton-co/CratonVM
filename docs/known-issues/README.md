@@ -17,11 +17,11 @@ distinct CratonVM defects. Three remain OPEN here; the Groovy PhaseOperation
 AME and LCIM deserialization NPE were fixed 2026-07-08 and moved to
 `docs/internal/fixed-suite-bugs`.
 
-- OPEN: [`web-x509trustmanager-getacceptedissuers-abstractmethoderror.md`](web-x509trustmanager-getacceptedissuers-abstractmethoderror.md) — `X509TrustManager.getAcceptedIssuers()` AbstractMethodError, identical across all 4 HTTP server backends in one WebFlux test.
+- OPEN: [`web-x509trustmanager-getacceptedissuers-abstractmethoderror.md`](../internal/web-x509trustmanager-getacceptedissuers-abstractmethoderror.md) — `X509TrustManager.getAcceptedIssuers()` AbstractMethodError, identical across all 4 HTTP server backends in one WebFlux test.
 - FIXED/RETIRED: [`groovy-compilationunit-phaseoperation-abstractmethoderror-FIXED.md`](../internal/fixed-suite-bugs/groovy-compilationunit-phaseoperation-abstractmethoderror-FIXED.md) - Groovy `CompilationUnit$PhaseOperation.doPhaseOperation` AbstractMethodError, 4 `GroovyScriptFactoryTests` methods.
-- OPEN: [`stomp-bufferingdecoder-atomicinteger-count-npe.md`](stomp-bufferingdecoder-atomicinteger-count-npe.md) — `BufferingStompDecoder`'s `count` `AtomicInteger` field null, 5 STOMP decoder test methods.
+- OPEN: [`stomp-bufferingdecoder-atomicinteger-count-npe.md`](../internal/stomp-bufferingdecoder-atomicinteger-count-npe.md) — `BufferingStompDecoder`'s `count` `AtomicInteger` field null, 5 STOMP decoder test methods.
 - FIXED/RETIRED: [`linkedcaseinsensitivemap-this0-deserialization-FIXED.md`](../internal/fixed-suite-bugs/linkedcaseinsensitivemap-this0-deserialization-FIXED.md) - `LinkedCaseInsensitiveMap` inner-class `this$0` null after deserialize; fixed by suppressing `removeEldestEntry` during `HashMap.readObject` replay.
-- OPEN: [`reflection-arenestmates-missing-native.md`](reflection-arenestmates-missing-native.md) — `jdk.internal.reflect.Reflection.areNestMates` has no native registered at all.
+- OPEN: [`reflection-arenestmates-missing-native.md`](../internal/reflection-arenestmates-missing-native.md) — `jdk.internal.reflect.Reflection.areNestMates` has no native registered at all.
 
 Also confirmed (not new, corroborating evidence only, no new doc needed):
 `expression.spel.*` SpEL `EL1040E` double-literal-suffix parse failures (33
