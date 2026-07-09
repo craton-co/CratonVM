@@ -12181,7 +12181,8 @@ fn execute_instruction(
                 }
             } else {
                 ensure_class_initialized_shared(shared, thread, field.declaring_class_id)?;
-                let mut value = get_static_shared(shared, field.declaring_class_id, field.field_index);
+                let mut value =
+                    get_static_shared(shared, field.declaring_class_id, field.field_index);
                 if matches!(value, Value::Object(None)) {
                     let boolean_const = {
                         let cm = shared.class_manager.read();
@@ -12208,7 +12209,12 @@ fn execute_instruction(
                         let obj = gc_alloc_object(shared, thread, field.declaring_class_id, 1)?;
                         shared.heap.set_field(obj, 0, Value::Int(i32::from(b)));
                         value = Value::Object(Some(obj));
-                        set_static_shared(shared, field.declaring_class_id, field.field_index, value);
+                        set_static_shared(
+                            shared,
+                            field.declaring_class_id,
+                            field.field_index,
+                            value,
+                        );
                     }
                 }
                 if field.is_volatile {
@@ -12628,9 +12634,7 @@ fn execute_instruction(
                     // Same jobject-as-Long contract as `astore` / `coerce_value_for_return`
                     // in vm_exec: invoke returns can sit on the stack as compact long bits.
                     match desc_byte {
-                        Some(d @ (b'L' | b'[')) => {
-                            coerce_value_for_return_validated(shared, v, d)
-                        }
+                        Some(d @ (b'L' | b'[')) => coerce_value_for_return_validated(shared, v, d),
                         // JVMS putfield: narrow the popped int to the field's
                         // declared sub-int width (byte/boolean/char/short) before
                         // storing, so a wide int producer can't leave out-of-range
@@ -20928,6 +20932,8 @@ fn force_native_over_real_jdk_bytecode(
                 | "putLongInternal"
                 | "putLongUnaligned"
                 | "putLongUnalignedInternal"
+                | "copyMemory"
+                | "copyMemoryInternal"
         )
     {
         return true;
@@ -20940,6 +20946,23 @@ fn force_native_over_real_jdk_bytecode(
         && matches!(
             method_name,
             "write" | "toByteArray" | "size" | "reset" | "toString"
+        )
+    {
+        return true;
+    }
+    // The lightweight resource-reader bridge stores the backing InputStream in
+    // the reader slot used by the native read shim. Real JDK close() expects a
+    // fully initialized sun.nio.cs.StreamDecoder in `sd` and can NPE while
+    // closing META-INF/services readers during Elasticsearch provider loading.
+    if class_name == "java/io/InputStreamReader"
+        && matches!((method_name, method_descriptor), ("close", "()V"))
+    {
+        return true;
+    }
+    if class_name == "java/lang/Runtime$Version"
+        && matches!(
+            (method_name, method_descriptor),
+            ("feature", "()I") | ("build", "()Ljava/util/Optional;")
         )
     {
         return true;

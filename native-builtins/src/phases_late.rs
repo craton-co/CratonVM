@@ -6219,6 +6219,45 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
             Ok(Some(Value::Object(Some(fs))))
         },
     );
+    r.register(
+        file_systems,
+        "newFileSystem",
+        "(Ljava/nio/file/Path;Ljava/util/Map;Ljava/lang/ClassLoader;)Ljava/nio/file/FileSystem;",
+        |ctx, args| {
+            let jar_path = obj_arg(args, 0)
+                .ok()
+                .map(|p| p57_read_path(ctx, p))
+                .unwrap_or_default();
+            let fs = p57_alloc_jar_filesystem(ctx, &jar_path);
+            Ok(Some(Value::Object(Some(fs))))
+        },
+    );
+    r.register(
+        file_systems,
+        "newFileSystem",
+        "(Ljava/nio/file/Path;Ljava/util/Map;)Ljava/nio/file/FileSystem;",
+        |ctx, args| {
+            let jar_path = obj_arg(args, 0)
+                .ok()
+                .map(|p| p57_read_path(ctx, p))
+                .unwrap_or_default();
+            let fs = p57_alloc_jar_filesystem(ctx, &jar_path);
+            Ok(Some(Value::Object(Some(fs))))
+        },
+    );
+    r.register(
+        file_systems,
+        "newFileSystem",
+        "(Ljava/nio/file/Path;Ljava/lang/ClassLoader;)Ljava/nio/file/FileSystem;",
+        |ctx, args| {
+            let jar_path = obj_arg(args, 0)
+                .ok()
+                .map(|p| p57_read_path(ctx, p))
+                .unwrap_or_default();
+            let fs = p57_alloc_jar_filesystem(ctx, &jar_path);
+            Ok(Some(Value::Object(Some(fs))))
+        },
+    );
 
     // --- FileSystem methods ---
     let fs_class = "java/nio/file/FileSystem";
@@ -6537,16 +6576,7 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
                 .ok()
                 .map(|p| p57_read_path(ctx, p))
                 .unwrap_or_default();
-            let mut fs = p57_alloc_default_filesystem(ctx);
-            if !jar_path.is_empty() {
-                // Pin across the create_string below — a moving young GC there
-                // would relocate the fresh FileSystem (native stale-local family).
-                let fs_pin = ctx.pin_native_root(fs);
-                let jp = ctx.create_string(&jar_path);
-                fs = ctx.read_native_pin(fs_pin, fs);
-                ctx.set_field(fs, P57_FS_JAR_FIELD, Value::Object(Some(jp)));
-                ctx.unpin_native_roots(fs_pin);
-            }
+            let fs = p57_alloc_jar_filesystem(ctx, &jar_path);
             Ok(Some(Value::Object(Some(fs))))
         },
     );
@@ -6573,18 +6603,15 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
                 let fs = p57_alloc_jrt_filesystem(ctx, &jh);
                 return Ok(Some(Value::Object(Some(fs))));
             }
-            let mut fs = p57_alloc_default_filesystem(ctx);
             if let Some(jar) = p57_jar_uri_to_os_path(&text) {
                 // Mount file-backed jar/zip URIs even when the archive does not
                 // exist yet. HotSpot's zipfs supports Map.of("create", "true");
                 // callers then populate it through Files.createDirectories/copy.
                 // CratonVM's jarfs writer below creates the archive lazily.
-                let fs_pin = ctx.pin_native_root(fs);
-                let jp = ctx.create_string(&jar);
-                fs = ctx.read_native_pin(fs_pin, fs);
-                ctx.set_field(fs, P57_FS_JAR_FIELD, Value::Object(Some(jp)));
-                ctx.unpin_native_roots(fs_pin);
+                let fs = p57_alloc_jar_filesystem(ctx, &jar);
+                return Ok(Some(Value::Object(Some(fs))));
             }
+            let fs = p57_alloc_default_filesystem(ctx);
             Ok(Some(Value::Object(Some(fs))))
         },
     );
@@ -12364,7 +12391,8 @@ fn jarfs_rewrite_entry(jar: &str, entry: &str, data: Option<&[u8]>) -> std::io::
         }
         if !std::path::Path::new(jar).exists() {
             let f = std::fs::File::create(jar)?;
-            zip::ZipWriter::new(f).finish()
+            zip::ZipWriter::new(f)
+                .finish()
                 .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))?;
         }
         return Ok(());
@@ -12403,27 +12431,32 @@ fn jarfs_rewrite_entry(jar: &str, entry: &str, data: Option<&[u8]>) -> std::io::
     let tmp = format!("{jar}.cratonvm-tmp-{}", std::process::id());
     let file = std::fs::File::create(&tmp)?;
     let mut writer = zip::ZipWriter::new(file);
-    let opts = zip::write::SimpleFileOptions::default()
-        .compression_method(zip::CompressionMethod::Stored);
+    let opts =
+        zip::write::SimpleFileOptions::default().compression_method(zip::CompressionMethod::Stored);
     for (name, bytes) in existing {
         if let Some(bytes) = bytes {
-            writer.start_file(name, opts)
+            writer
+                .start_file(name, opts)
                 .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))?;
             writer.write_all(&bytes)?;
         } else {
-            writer.add_directory(name, opts)
+            writer
+                .add_directory(name, opts)
                 .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))?;
         }
     }
     if let Some(bytes) = data {
-        writer.start_file(target, opts)
+        writer
+            .start_file(target, opts)
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))?;
         writer.write_all(bytes)?;
     } else {
-        writer.add_directory(target, opts)
+        writer
+            .add_directory(target, opts)
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))?;
     }
-    writer.finish()
+    writer
+        .finish()
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))?;
     std::fs::rename(tmp, jar)?;
     Ok(())
@@ -13031,6 +13064,21 @@ fn p57_alloc_default_filesystem(ctx: &mut dyn NativeContext) -> ObjectRef {
     let s = ctx.create_string(sep);
     let fs = ctx.read_native_pin(fs_pin, fs);
     ctx.set_field(fs, 0, Value::Object(Some(s)));
+    ctx.unpin_native_roots(fs_pin);
+    fs
+}
+
+fn p57_alloc_jar_filesystem(ctx: &mut dyn NativeContext, jar_path: &str) -> ObjectRef {
+    let fs = p57_alloc_default_filesystem(ctx);
+    if jar_path.is_empty() {
+        return fs;
+    }
+    // Pin across the create_string below: a moving young GC there would
+    // relocate the fresh FileSystem before we store the mounted jar path.
+    let fs_pin = ctx.pin_native_root(fs);
+    let jp = ctx.create_string(jar_path);
+    let fs = ctx.read_native_pin(fs_pin, fs);
+    ctx.set_field(fs, P57_FS_JAR_FIELD, Value::Object(Some(jp)));
     ctx.unpin_native_roots(fs_pin);
     fs
 }
@@ -25397,16 +25445,19 @@ fn populate_stack_frame(
 }
 
 fn p59_sw_walk(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    // Capture the current call stack and build a Stream<StackFrame>
+    // Capture the current call stack and build a Stream<StackFrame>. HotSpot's
+    // StackWalker stream is innermost-first and begins at the method that
+    // called StackWalker.walk(), not at the process entry point.
     let trace = ctx.capture_stack_trace(0); // key 0 = temporary
-    let frame_count = trace.len();
+    let frames = crate::lang_stackwalker::ordered_stack_walk_frames(&trace);
+    let frame_count = frames.len();
     let arr = ctx.new_ref_array(ClassId::new(0), frame_count);
     // GC-SAFETY: `populate_stack_frame` allocates, so pin `arr` (which also
     // keeps its already-stored StackFrame elements reachable) and re-read the
     // forwarded reference before each `set_array_element`.
     let arr_pin = ctx.pin_native_root(arr);
     let mut arr = arr;
-    for (i, entry) in trace.iter().enumerate() {
+    for (i, entry) in frames.iter().enumerate() {
         let sf = populate_stack_frame(ctx, entry);
         arr = ctx.read_native_pin(arr_pin, arr);
         ctx.set_array_element(arr, i, Value::Object(Some(sf)));
@@ -25435,7 +25486,8 @@ fn p59_sw_for_each(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRes
         _ => return Ok(None),
     };
     let trace = ctx.capture_stack_trace(0);
-    for entry in &trace {
+    let frames = crate::lang_stackwalker::ordered_stack_walk_frames(&trace);
+    for entry in &frames {
         let sf = populate_stack_frame(ctx, entry);
         ctx.invoke_virtual(
             consumer,
@@ -29271,22 +29323,27 @@ pub(crate) fn register_p62_char_buffer(r: &mut NativeMethodRegistry) {
         ];
         cb_to_string_range(ctx, &args2)
     });
-    r.register("java/nio/StringCharBuffer", "toString", "()Ljava/lang/String;", |ctx, args| {
-        let this = match args.first() {
-            Some(Value::Object(Some(o))) => *o,
-            _ => return Ok(Some(Value::Object(None))),
-        };
-        let pos = match ctx.get_field_by_name(this, "position") {
-            Value::Int(v) => v,
-            _ => 0,
-        };
-        let lim = match ctx.get_field_by_name(this, "limit") {
-            Value::Int(v) => v,
-            _ => pos,
-        };
-        let args2 = [Value::Object(Some(this)), Value::Int(pos), Value::Int(lim)];
-        cb_to_string_range(ctx, &args2)
-    });
+    r.register(
+        "java/nio/StringCharBuffer",
+        "toString",
+        "()Ljava/lang/String;",
+        |ctx, args| {
+            let this = match args.first() {
+                Some(Value::Object(Some(o))) => *o,
+                _ => return Ok(Some(Value::Object(None))),
+            };
+            let pos = match ctx.get_field_by_name(this, "position") {
+                Value::Int(v) => v,
+                _ => 0,
+            };
+            let lim = match ctx.get_field_by_name(this, "limit") {
+                Value::Int(v) => v,
+                _ => pos,
+            };
+            let args2 = [Value::Object(Some(this)), Value::Int(pos), Value::Int(lim)];
+            cb_to_string_range(ctx, &args2)
+        },
+    );
     // subSequence(II)Ljava/nio/CharBuffer; — abstract on CharBuffer, so
     // an unbacked synthetic instance would AbstractMethodError. Allocate
     // a fresh CharBuffer with the same backing array and adjusted
@@ -47563,9 +47620,12 @@ pub(crate) fn register_p69_cleaner(r: &mut NativeMethodRegistry) {
             Ok(Some(Value::Object(Some(cleanable))))
         },
     );
-    r.register("java/lang/ref/Cleaner$Cleanable", "clean", "()V", |_ctx, _args| {
-        Ok(None)
-    });
+    r.register(
+        "java/lang/ref/Cleaner$Cleanable",
+        "clean",
+        "()V",
+        |_ctx, _args| Ok(None),
+    );
     r.set_category(__prev_cat);
 }
 
@@ -50436,6 +50496,7 @@ pub(crate) fn register_phase71_natives(registry: &mut NativeMethodRegistry) {
     register_p71_biginteger_extras(registry);
     register_p71_files_bridge(registry);
     register_p71_thread_extras(registry);
+    crate::uncaught_handlers::register_uncaught_handler_natives(registry);
     register_p71_zip_extras(registry);
     register_p71_logging_extras(registry);
     registry.set_category(__prev_cat);
@@ -52208,8 +52269,45 @@ pub(crate) fn register_p71_files_bridge(r: &mut NativeMethodRegistry) {
 
 // =============================================================================
 // Thread extras: Thread$State enum, ThreadGroup, UncaughtExceptionHandler
-// ThreadGroup = 3-field synthetic (name=0, parent=1, daemon=2)
+// Legacy synthetic ThreadGroup = name=0, parent=1, daemon=2, maxPriority=3.
 // =============================================================================
+
+fn tg_slot(
+    ctx: &dyn NativeContext,
+    this: ObjectRef,
+    field: &str,
+    legacy_fallback: usize,
+) -> Option<usize> {
+    let class_name = ctx
+        .class_name_of_id(ctx.class_id_of_object(this))
+        .unwrap_or_default();
+    ctx.resolve_field_index(&class_name, field)
+        .filter(|idx| *idx < ctx.object_num_fields(this))
+        .or_else(|| (legacy_fallback < ctx.object_num_fields(this)).then_some(legacy_fallback))
+}
+
+fn tg_get_field(
+    ctx: &dyn NativeContext,
+    this: ObjectRef,
+    field: &str,
+    legacy_fallback: usize,
+) -> Value {
+    tg_slot(ctx, this, field, legacy_fallback)
+        .map(|idx| ctx.get_field(this, idx))
+        .unwrap_or(Value::Object(None))
+}
+
+fn tg_set_field(
+    ctx: &mut dyn NativeContext,
+    this: ObjectRef,
+    field: &str,
+    legacy_fallback: usize,
+    value: Value,
+) {
+    if let Some(idx) = tg_slot(ctx, this, field, legacy_fallback) {
+        ctx.set_field(this, idx, value);
+    }
+}
 
 pub(crate) fn register_p71_thread_extras(r: &mut NativeMethodRegistry) {
     let __prev_cat = r.current_category();
@@ -52271,16 +52369,23 @@ pub(crate) fn register_p71_thread_extras(r: &mut NativeMethodRegistry) {
         Ok(Some(Value::Object(Some(arr))))
     });
 
-    // ThreadGroup = 4-field (name=0, parent=1, daemon=2, maxPriority=3)
+    // ThreadGroup bridge. Real JDK 21+ layout is parent=0, name=1,
+    // maxPriority=2, daemon=3; the legacy synthetic layout was name=0,
+    // parent=1, daemon=2, maxPriority=3. Resolve slots by name first so
+    // reflection/Unsafe and these natives agree on the same object contents.
     let tg = "java/lang/ThreadGroup";
     r.register(tg, "<init>", "(Ljava/lang/String;)V", |ctx, args| {
         let this = obj_arg(args, 0)?;
-        ctx.set_field(this, 0, args.get(1).copied().unwrap_or(Value::Object(None)));
-        ctx.set_field(this, 1, Value::Object(None));
-        ctx.set_field(this, 2, Value::Int(0));
-        if ctx.object_num_fields(this) > 3 {
-            ctx.set_field(this, 3, Value::Int(10)); // Thread.MAX_PRIORITY
-        }
+        tg_set_field(
+            ctx,
+            this,
+            "name",
+            0,
+            args.get(1).copied().unwrap_or(Value::Object(None)),
+        );
+        tg_set_field(ctx, this, "parent", 1, Value::Object(None));
+        tg_set_field(ctx, this, "daemon", 2, Value::Int(0));
+        tg_set_field(ctx, this, "maxPriority", 3, Value::Int(10));
         Ok(None)
     });
     r.register(
@@ -52289,43 +52394,54 @@ pub(crate) fn register_p71_thread_extras(r: &mut NativeMethodRegistry) {
         "(Ljava/lang/ThreadGroup;Ljava/lang/String;)V",
         |ctx, args| {
             let this = obj_arg(args, 0)?;
-            ctx.set_field(this, 1, args.get(1).copied().unwrap_or(Value::Object(None)));
-            ctx.set_field(this, 0, args.get(2).copied().unwrap_or(Value::Object(None)));
-            ctx.set_field(this, 2, Value::Int(0));
-            if ctx.object_num_fields(this) > 3 {
-                // Inherit parent's max priority if possible
-                let parent_max = match args.get(1) {
-                    Some(Value::Object(Some(p))) => {
-                        if ctx.object_num_fields(*p) > 3 {
-                            ctx.get_field(*p, 3).as_int().unwrap_or(10)
-                        } else {
-                            10
-                        }
-                    }
-                    _ => 10,
-                };
-                ctx.set_field(this, 3, Value::Int(parent_max));
-            }
+            tg_set_field(
+                ctx,
+                this,
+                "parent",
+                1,
+                args.get(1).copied().unwrap_or(Value::Object(None)),
+            );
+            tg_set_field(
+                ctx,
+                this,
+                "name",
+                0,
+                args.get(2).copied().unwrap_or(Value::Object(None)),
+            );
+            tg_set_field(ctx, this, "daemon", 2, Value::Int(0));
+            let parent_max = match args.get(1) {
+                Some(Value::Object(Some(p))) => tg_get_field(ctx, *p, "maxPriority", 3)
+                    .as_int()
+                    .unwrap_or(10),
+                _ => 10,
+            };
+            tg_set_field(ctx, this, "maxPriority", 3, Value::Int(parent_max));
             Ok(None)
         },
     );
     r.register(tg, "getName", "()Ljava/lang/String;", |ctx, args| {
-        Ok(Some(ctx.get_field(obj_arg(args, 0)?, 0)))
+        Ok(Some(tg_get_field(ctx, obj_arg(args, 0)?, "name", 0)))
     });
     r.register(tg, "getParent", "()Ljava/lang/ThreadGroup;", |ctx, args| {
-        Ok(Some(ctx.get_field(obj_arg(args, 0)?, 1)))
+        Ok(Some(tg_get_field(ctx, obj_arg(args, 0)?, "parent", 1)))
     });
     r.register(tg, "isDaemon", "()Z", |ctx, args| {
-        Ok(Some(ctx.get_field(obj_arg(args, 0)?, 2)))
+        Ok(Some(tg_get_field(ctx, obj_arg(args, 0)?, "daemon", 2)))
     });
     r.register(tg, "setDaemon", "(Z)V", |ctx, args| {
         let this = obj_arg(args, 0)?;
-        ctx.set_field(this, 2, args.get(1).copied().unwrap_or(Value::Int(0)));
+        tg_set_field(
+            ctx,
+            this,
+            "daemon",
+            2,
+            args.get(1).copied().unwrap_or(Value::Int(0)),
+        );
         Ok(None)
     });
     r.register(tg, "toString", "()Ljava/lang/String;", |ctx, args| {
         let this = obj_arg(args, 0)?;
-        let name = match ctx.get_field(this, 0) {
+        let name = match tg_get_field(ctx, this, "name", 0) {
             Value::Object(Some(s)) => ctx.read_string(s).unwrap_or_else(|| "main".into()),
             _ => "main".into(),
         };
@@ -52351,20 +52467,17 @@ pub(crate) fn register_p71_thread_extras(r: &mut NativeMethodRegistry) {
     });
     r.register(tg, "getMaxPriority", "()I", |ctx, args| {
         let this = obj_arg(args, 0)?;
-        if ctx.object_num_fields(this) > 3 {
-            Ok(Some(ctx.get_field(this, 3)))
-        } else {
-            Ok(Some(Value::Int(10)))
-        }
+        let max = tg_get_field(ctx, this, "maxPriority", 3)
+            .as_int()
+            .unwrap_or(10);
+        Ok(Some(Value::Int(max)))
     });
     r.register(tg, "setMaxPriority", "(I)V", |ctx, args| {
         let this = obj_arg(args, 0)?;
         let prio = args.get(1).and_then(|v| v.as_int()).unwrap_or(10);
         // Clamp to Thread.MIN_PRIORITY..MAX_PRIORITY
         let clamped = prio.max(1).min(10);
-        if ctx.object_num_fields(this) > 3 {
-            ctx.set_field(this, 3, Value::Int(clamped));
-        }
+        tg_set_field(ctx, this, "maxPriority", 3, Value::Int(clamped));
         Ok(None)
     });
     r.register(tg, "interrupt", "()V", |ctx, _args| {
@@ -52381,15 +52494,13 @@ pub(crate) fn register_p71_thread_extras(r: &mut NativeMethodRegistry) {
     });
     r.register(tg, "list", "()V", |ctx, args| {
         let this = obj_arg(args, 0)?;
-        let name = match ctx.get_field(this, 0) {
+        let name = match tg_get_field(ctx, this, "name", 0) {
             Value::Object(Some(s)) => ctx.read_string(s).unwrap_or_else(|| "main".into()),
             _ => "main".into(),
         };
-        let max_prio = if ctx.object_num_fields(this) > 3 {
-            ctx.get_field(this, 3).as_int().unwrap_or(10)
-        } else {
-            10
-        };
+        let max_prio = tg_get_field(ctx, this, "maxPriority", 3)
+            .as_int()
+            .unwrap_or(10);
         // Print the group info and each contained thread
         let header = format!("java.lang.ThreadGroup[name={},maxpri={}]\n", name, max_prio);
         let header_s = ctx.create_string(&header);
@@ -52446,7 +52557,7 @@ pub(crate) fn register_p71_thread_extras(r: &mut NativeMethodRegistry) {
             if c == this {
                 return Ok(Some(Value::Int(1)));
             }
-            current = match ctx.get_field(c, 1) {
+            current = match tg_get_field(ctx, c, "parent", 1) {
                 Value::Object(Some(p)) => Some(p),
                 _ => None,
             };

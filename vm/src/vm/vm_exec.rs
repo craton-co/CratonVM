@@ -4974,13 +4974,14 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
         thread_obj = self.thread.java_thread_obj.unwrap_or(thread_obj);
 
         if is_real_jdk {
-            let (name_slot, tid_slot, holder_slot, priority_slot) = {
+            let (name_slot, tid_slot, holder_slot, priority_slot, group_slot) = {
                 let cm = self.shared.class_manager.read();
                 (
                     resolve_field_index_in_hierarchy(class_id, "name", &cm.class_store),
                     resolve_field_index_in_hierarchy(class_id, "tid", &cm.class_store),
                     resolve_field_index_in_hierarchy(class_id, "holder", &cm.class_store),
                     resolve_field_index_in_hierarchy(class_id, "priority", &cm.class_store),
+                    resolve_field_index_in_hierarchy(class_id, "group", &cm.class_store),
                 )
             };
             if let Some(slot) = name_slot {
@@ -5028,6 +5029,16 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
                     self.shared
                         .heap
                         .set_field(thread_obj, slot, Value::Object(Some(holder)));
+                }
+            }
+            if let Some(slot) = group_slot {
+                if let Some(group) = self.get_or_create_main_thread_group() {
+                    // InnocuousThread.<clinit> reads Thread.group via Unsafe,
+                    // bypassing Thread.getThreadGroup()/holder.group.
+                    thread_obj = self.thread.java_thread_obj.unwrap_or(thread_obj);
+                    self.shared
+                        .heap
+                        .set_field(thread_obj, slot, Value::Object(Some(group)));
                 }
             }
             // C9: initialize contextClassLoader so SLF4J and other users
@@ -6654,7 +6665,10 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
         };
         for m in &class.methods {
             if &*m.name == method_name && &*m.descriptor == method_desc {
-                return extract_return_type_argument_annotations(&m.attributes, &class.constant_pool);
+                return extract_return_type_argument_annotations(
+                    &m.attributes,
+                    &class.constant_pool,
+                );
             }
         }
         Vec::new()
@@ -6709,7 +6723,10 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
         };
         for f in &class.fields {
             if &*f.name == field_name {
-                return extract_field_type_argument_annotations(&f.attributes, &class.constant_pool);
+                return extract_field_type_argument_annotations(
+                    &f.attributes,
+                    &class.constant_pool,
+                );
             }
         }
         Vec::new()
@@ -8167,10 +8184,11 @@ pub fn invoke_or_native(
         // end of this function — provided real bytecode actually exists. The
         // ReentrantLock fallback is also protected this way: it exists only for
         // fake-JDK synthetic lock stubs and must not steal real AQS bytecode.
-        let synthetic_stub_native = shared
-            .native_methods
-            .kind_of(effective_class, method_name, descriptor)
-            == Some(cratonvm_native_api::NativeKind::SyntheticStub);
+        let synthetic_stub_native =
+            shared
+                .native_methods
+                .kind_of(effective_class, method_name, descriptor)
+                == Some(cratonvm_native_api::NativeKind::SyntheticStub);
         let real_protected_stub = synthetic_stub_native
             && (crate::runtime::env_cache::real_bytecode_selector().prefers_real(effective_class)
                 || matches!(
@@ -12731,6 +12749,17 @@ fn invoke_on_class_shared_inner(
                                 method_name,
                                 "write" | "toByteArray" | "size" | "reset" | "toString"
                             ))
+                        // ES provider loading closes InputStreamReader wrappers
+                        // created by the lightweight resource-reader bridge. The
+                        // real close() body dereferences StreamDecoder state we do
+                        // not initialize; force the registered no-op native.
+                        || (class_name == "java/io/InputStreamReader"
+                            && method_name == "close"
+                            && descriptor == "()V")
+                        || (class_name == "java/lang/Runtime$Version"
+                            && ((method_name == "feature" && descriptor == "()I")
+                                || (method_name == "build"
+                                    && descriptor == "()Ljava/util/Optional;")))
                         // SigProbe WP6.6: `javax.security.auth.x500.X500Principal`
                         // string / DER round-trip. JDK 25 routes through
                         // `sun.security.x509.X500Name` whose parser depends
@@ -12769,6 +12798,40 @@ fn invoke_on_class_shared_inner(
                         || (class_name == "java/io/PrintStream"
                             && method_name == "charset"
                             && descriptor == "()Ljava/nio/charset/Charset;")
+                        || (class_name == "jdk/internal/misc/ScopedMemoryAccess"
+                            && matches!(
+                                method_name,
+                                "getByte"
+                                    | "getByteInternal"
+                                    | "putByte"
+                                    | "putByteInternal"
+                                    | "getShort"
+                                    | "getShortInternal"
+                                    | "getShortUnaligned"
+                                    | "getShortUnalignedInternal"
+                                    | "putShort"
+                                    | "putShortInternal"
+                                    | "putShortUnaligned"
+                                    | "putShortUnalignedInternal"
+                                    | "getInt"
+                                    | "getIntInternal"
+                                    | "getIntUnaligned"
+                                    | "getIntUnalignedInternal"
+                                    | "putInt"
+                                    | "putIntInternal"
+                                    | "putIntUnaligned"
+                                    | "putIntUnalignedInternal"
+                                    | "getLong"
+                                    | "getLongInternal"
+                                    | "getLongUnaligned"
+                                    | "getLongUnalignedInternal"
+                                    | "putLong"
+                                    | "putLongInternal"
+                                    | "putLongUnaligned"
+                                    | "putLongUnalignedInternal"
+                                    | "copyMemory"
+                                    | "copyMemoryInternal"
+                            ))
                         // BREAKITER: `java.text.BreakIterator.getWordInstance` /
                         // `getLineInstance` / `getSentenceInstance` / `getCharacterInstance`
                         // are concrete static factories whose JDK 25 bytecode walks

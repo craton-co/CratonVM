@@ -242,7 +242,7 @@ fn stack_walk_skip_internals(class_name: &str, method_name: &str) -> bool {
 /// inner→outer with VM-internal walker frames stripped from the inner end.
 /// `fetchStackFrames` reuses the same ordering with `anchor` as an index into
 /// this vector (not into the raw reversed physical trace).
-fn ordered_stack_walk_frames(trace: &[StackTraceEntry]) -> Vec<StackTraceEntry> {
+pub(crate) fn ordered_stack_walk_frames(trace: &[StackTraceEntry]) -> Vec<StackTraceEntry> {
     let mut iter = trace.iter().rev().peekable();
     while let Some(e) = iter.peek() {
         if stack_walk_skip_internals(&e.class_name, &e.method_name) {

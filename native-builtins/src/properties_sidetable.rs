@@ -372,7 +372,10 @@ fn parse_properties_text_strict(raw: &str) -> Result<Vec<(String, String)>, ()> 
     parse_properties_text_inner(raw, true)
 }
 
-fn parse_properties_text_inner(raw: &str, strict_unicode: bool) -> Result<Vec<(String, String)>, ()> {
+fn parse_properties_text_inner(
+    raw: &str,
+    strict_unicode: bool,
+) -> Result<Vec<(String, String)>, ()> {
     let mut out = Vec::new();
     let mut iter = raw.split('\n').peekable();
     let mut continued = String::new();

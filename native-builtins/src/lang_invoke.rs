@@ -1825,7 +1825,11 @@ fn segment_vh_get(
             })?,
         };
         let raw = if be { seg_swap_bytes(raw, width) } else { raw };
-        Ok(Some(box_value(ctx, seg_decode_value(shape, raw), seg_shape_desc(shape))))
+        Ok(Some(box_value(
+            ctx,
+            seg_decode_value(shape, raw),
+            seg_shape_desc(shape),
+        )))
     })())
 }
 

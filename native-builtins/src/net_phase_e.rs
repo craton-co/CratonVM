@@ -1687,10 +1687,7 @@ fn uri_split(
                     .chars()
                     .all(|c| c.is_ascii_alphanumeric() || matches!(c, '+' | '-' | '.')) =>
         {
-            (
-                Some(without_frag[..i].to_string()),
-                &without_frag[i + 1..],
-            )
+            (Some(without_frag[..i].to_string()), &without_frag[i + 1..])
         }
         _ => (None, without_frag),
     };
@@ -5489,17 +5486,22 @@ fn register_re4_url_http(r: &mut NativeMethodRegistry) {
     r.register("java/net/URLConnection", "connect", "()V", |_ctx, _args| {
         Ok(None)
     });
-    r.register("java/net/URLConnection", "getContentLength", "()I", |ctx, args| {
-        let this = obj_arg(args, 0)?;
-        let url = huc_url_string(ctx, this);
-        let len = synthetic_resource_url_content_len(ctx, &url);
-        let v = if len < 0 || len > i32::MAX as i64 {
-            -1
-        } else {
-            len as i32
-        };
-        Ok(Some(Value::Int(v)))
-    });
+    r.register(
+        "java/net/URLConnection",
+        "getContentLength",
+        "()I",
+        |ctx, args| {
+            let this = obj_arg(args, 0)?;
+            let url = huc_url_string(ctx, this);
+            let len = synthetic_resource_url_content_len(ctx, &url);
+            let v = if len < 0 || len > i32::MAX as i64 {
+                -1
+            } else {
+                len as i32
+            };
+            Ok(Some(Value::Int(v)))
+        },
+    );
     r.register(
         "java/net/URLConnection",
         "getContentLengthLong",
@@ -5507,7 +5509,9 @@ fn register_re4_url_http(r: &mut NativeMethodRegistry) {
         |ctx, args| {
             let this = obj_arg(args, 0)?;
             let url = huc_url_string(ctx, this);
-            Ok(Some(Value::Long(synthetic_resource_url_content_len(ctx, &url))))
+            Ok(Some(Value::Long(synthetic_resource_url_content_len(
+                ctx, &url,
+            ))))
         },
     );
     // URLConnection.getInputStream — defer to URL.openStream by reading
