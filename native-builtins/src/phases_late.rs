@@ -28705,10 +28705,6 @@ pub(crate) fn register_p62_char_buffer(r: &mut NativeMethodRegistry) {
         };
         let start = args.get(1).and_then(|v| v.as_int()).unwrap_or(0);
         let end = args.get(2).and_then(|v| v.as_int()).unwrap_or(0);
-        let arr = match cb_read_hb(ctx, this) {
-            Some(a) => a,
-            None => return Ok(Some(Value::Object(Some(ctx.create_string(""))))),
-        };
         let cur_pos = match ctx.get_field_by_name(this, "position") {
             Value::Int(v) => v,
             _ => match ctx.get_field(this, CB_FIELD_POS) {
@@ -28719,6 +28715,35 @@ pub(crate) fn register_p62_char_buffer(r: &mut NativeMethodRegistry) {
         let cur_off = match ctx.get_field_by_name(this, "offset") {
             Value::Int(v) => v,
             _ => 0,
+        };
+        // StringCharBuffer has no `hb`; it stores the wrapped CharSequence in
+        // `str` and uses the same position/limit/offset coordinates as the
+        // JDK bytecode. This is reached by Netty's
+        // `CharBuffer.wrap(String,start,end).toString()` cookie path.
+        let cid = ctx.class_id_of_object(this);
+        let cname = ctx.class_name_of_id(cid).unwrap_or_default();
+        if cname == "java/nio/StringCharBuffer" {
+            let str_obj = match ctx.get_field_by_name(this, "str") {
+                Value::Object(Some(o)) => o,
+                _ => return Ok(Some(Value::Object(Some(ctx.create_string(""))))),
+            };
+            let text = ctx.read_string(str_obj).unwrap_or_default();
+            let units: Vec<u16> = text.encode_utf16().collect();
+            // StringCharBuffer.toString(int,int) receives absolute buffer
+            // indexes (CharBuffer.toString() calls it with position..limit),
+            // and StringCharBuffer then adds only `offset` before slicing
+            // the wrapped CharSequence. Do not add current position again.
+            let abs_start = cur_off + start;
+            let abs_end = cur_off + end;
+            let len = units.len() as i32;
+            let s_lo = abs_start.max(0).min(len);
+            let s_hi = abs_end.max(s_lo).min(len);
+            let out = String::from_utf16_lossy(&units[s_lo as usize..s_hi as usize]);
+            return Ok(Some(Value::Object(Some(ctx.create_string(&out)))));
+        }
+        let arr = match cb_read_hb(ctx, this) {
+            Some(a) => a,
+            None => return Ok(Some(Value::Object(Some(ctx.create_string(""))))),
         };
         // CharBuffer.toString(int start, int end) reads start..end (exclusive)
         // RELATIVE to the current position — see HeapCharBuffer.toString.
@@ -28778,13 +28803,30 @@ pub(crate) fn register_p62_char_buffer(r: &mut NativeMethodRegistry) {
                 _ => pos,
             },
         };
-        // toString() is documented as toString(position(), limit())
-        // where start/end are RELATIVE — pass 0 and (lim-pos).
+        // toString() is documented as toString(position(), limit()). For
+        // synthetic/heap buffers our `cb_to_string_range` historically treats
+        // the range as relative, so keep the old 0..remaining call here.
         let args2 = [
             Value::Object(Some(this)),
             Value::Int(0),
             Value::Int(lim - pos),
         ];
+        cb_to_string_range(ctx, &args2)
+    });
+    r.register("java/nio/StringCharBuffer", "toString", "()Ljava/lang/String;", |ctx, args| {
+        let this = match args.first() {
+            Some(Value::Object(Some(o))) => *o,
+            _ => return Ok(Some(Value::Object(None))),
+        };
+        let pos = match ctx.get_field_by_name(this, "position") {
+            Value::Int(v) => v,
+            _ => 0,
+        };
+        let lim = match ctx.get_field_by_name(this, "limit") {
+            Value::Int(v) => v,
+            _ => pos,
+        };
+        let args2 = [Value::Object(Some(this)), Value::Int(pos), Value::Int(lim)];
         cb_to_string_range(ctx, &args2)
     });
     // subSequence(II)Ljava/nio/CharBuffer; — abstract on CharBuffer, so

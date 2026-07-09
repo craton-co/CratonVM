@@ -446,6 +446,49 @@ fn should_skip_jit_internal(
         return Some(SkipReason::RustJvmTestFixture);
     }
 
+    // SPR-AOT-TESTNG-MAPS.1 (2026-07-08) — TestNG's Maps helper is a set
+    // of tiny allocation factories. JIT-compiling Maps.newConcurrentMap()
+    // can hand ClassMethodMap a malformed/empty map path that later makes
+    // computeIfAbsent appear to return null. Keep this tiny helper interpreted.
+    if class_name == "org/testng/collections/Maps" {
+        return Some(SkipReason::RustJvmTestFixture);
+    }
+
+    // REACTOR-ADDCAP.1 (2026-07-09) — Reactor's demand accounting helper
+    // `Operators.addCap(...)` is tiny but correctness-critical. Under Craton's
+    // optimized JIT it can corrupt requested-count bookkeeping in WebSocket
+    // send chains: after several Reactor publisher pipelines, Jetty client
+    // sends stall reproducibly at 84/100 messages while the interpreter and
+    // HotSpot complete. Keep both overloads interpreted until the JIT long/CAS
+    // lowering bug is fixed.
+    if class_name == "reactor/core/publisher/Operators" && method_name == "addCap" {
+        return Some(SkipReason::RustJvmTestFixture);
+    }
+    // REACTOR-FLUXCREATE.1 (2026-07-09) — the WebFlux websocket integration
+    // sequence still lost demand after `Operators.addCap` was pinned. Runtime
+    // bisection narrowed the remaining Reactor-side poison to the FluxCreate
+    // sink accounting/drain pair below. Leaving them interpreted fixes the
+    // ReactorNetty/JettyCore echo stall without disabling broader Reactor JIT.
+    if class_name == "reactor/core/publisher/FluxCreate$BaseSink" && method_name == "addCap" {
+        return Some(SkipReason::RustJvmTestFixture);
+    }
+    if class_name == "reactor/core/publisher/FluxCreate$BufferAsyncSink" && method_name == "drain" {
+        return Some(SkipReason::RustJvmTestFixture);
+    }
+    // JETTY-WSIO.1 (2026-07-09) — Jetty websocket large-payload receives need
+    // the websocket core and IO packages to be compiled together to reproduce:
+    // each subpackage alone is clean, but `CRATONVM_JIT_BISECT_ONLY=org/eclipse/jetty/`
+    // times out all Jetty-client large-payload combinations after the normal
+    // websocket method warmup. Exact env skipping of every compiled
+    // `org/eclipse/jetty/{websocket,io}/...` method (113 entries in the probe)
+    // clears the timeout, so keep this interaction interpreted until the shared
+    // IO/websocket lowering bug is fixed.
+    if class_name.starts_with("org/eclipse/jetty/websocket/")
+        || class_name.starts_with("org/eclipse/jetty/io/")
+    {
+        return Some(SkipReason::RustJvmTestFixture);
+    }
+
     // T1.1.g — the historical blanket bans for `java/util/*` and
     // `cratonvm/*` were narrowed to targeted per-method exclusions.
     // Those targeted exclusions guarded the callee-saved-GPR local-home

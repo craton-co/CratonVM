@@ -12628,7 +12628,21 @@ pub fn register_essential_natives(registry: &mut NativeMethodRegistry) {
                 Some(Value::Object(Some(r))) => r,
                 _ => return Ok(Some(Value::Int(0))),
             };
-            let val = args.get(1).copied().unwrap_or(Value::Object(None));
+            let raw_val = args.get(1).copied().unwrap_or(Value::Object(None));
+            let val = if matches!(raw_val, Value::Object(None)) {
+                // Real-JDK CompletableFuture uses a null result slot to mean
+                // "not completed yet".  A normally completed null value must be
+                // represented by the private CompletableFuture.NIL AltResult
+                // sentinel; otherwise waitingGet()/join() will spin/park
+                // forever after completeValue(null).
+                let cf_id = ctx.ensure_class_initialized("java/util/concurrent/CompletableFuture")?;
+                ctx.static_field_index_by_name(cf_id, "NIL")
+                    .map(|idx| ctx.get_static_field(cf_id, idx))
+                    .filter(|v| matches!(v, Value::Object(Some(_))))
+                    .unwrap_or(raw_val)
+            } else {
+                raw_val
+            };
             let before = ctx.get_field(this, 0);
             // Manually do the CAS
             if matches!(before, Value::Object(None)) {
@@ -20075,6 +20089,7 @@ pub fn register_essential_natives(registry: &mut NativeMethodRegistry) {
         const APRIL: i32 = 3;
         const SEPTEMBER: i32 = 8;
         const OCTOBER: i32 = 9;
+        const NOVEMBER: i32 = 10;
         const WALL_TIME: i32 = 0;
         const UTC_TIME: i32 = 2;
         const HOUR: i32 = 3_600_000;
@@ -20082,12 +20097,18 @@ pub fn register_essential_natives(registry: &mut NativeMethodRegistry) {
             // EU rule: DST from last Sunday of March 01:00 UTC to last Sunday
             // of October 01:00 UTC, +1h. Applies to the whole CET family and
             // (with a 0 standard offset) Europe/London.
-            "Europe/Paris" | "Europe/Berlin" | "Europe/Rome" | "Europe/Madrid"
+            "Europe/Paris" | "Europe/Berlin" | "Europe/Rome" | "Europe/Madrid" | "CET"
             | "Europe/Oslo" | "Europe/Amsterdam" | "Europe/Brussels" | "Europe/Vienna"
             | "Europe/Copenhagen" | "Europe/Stockholm" | "Europe/Zurich" | "Europe/Warsaw"
             | "Europe/Prague" | "Europe/Budapest" | "Europe/London" | "GB"
             | "Europe/Athens" | "Europe/Bucharest" | "Europe/Helsinki" => Some([
                 MARCH, -1, SUNDAY, HOUR, UTC_TIME, OCTOBER, -1, SUNDAY, HOUR, UTC_TIME, HOUR,
+            ]),
+            // US rule (2007+): DST from second Sunday of March 02:00
+            // wall time to first Sunday of November 02:00 wall time, +1h.
+            "US/Pacific" | "America/Los_Angeles" | "PST" => Some([
+                MARCH, 8, -SUNDAY, 2 * HOUR, WALL_TIME, NOVEMBER, 1, -SUNDAY, 2 * HOUR,
+                WALL_TIME, HOUR,
             ]),
             // New Zealand rule: DST from last Sunday of September 02:00 wall
             // to first Sunday of April 03:00 wall (02:00 standard), +1h.
@@ -21769,7 +21790,7 @@ fn register_annotation_overrides(registry: &mut NativeMethodRegistry) {
         Ok(None)
     });
     registry.register(acl_log, "isDebugEnabled", "()Z", |_, _| {
-        Ok(Some(Value::Int(1)))
+        Ok(Some(Value::Int(0)))
     });
     registry.register(acl_log, "isInfoEnabled", "()Z", |_, _| {
         Ok(Some(Value::Int(1)))
@@ -33380,6 +33401,7 @@ fn native_objects_hash(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCal
     Ok(Some(Value::Int(result)))
 }
 
+
 fn native_objects_to_string(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let s = match args.first() {
         Some(Value::Object(None)) | None => "null".to_string(),
@@ -36388,9 +36410,10 @@ fn register_module_builder_overrides(registry: &mut NativeMethodRegistry) {
     //     every `ofSystem()` caller (Spring's PMRPR.<clinit> calls
     //     `ofSystem().findAll()` at boot) and it would OOM the default heap.
     //
-    // So we provide a *lazy* finder: `findAll()` stays empty (Spring's only
-    // use is to seed a `Set<String>`; empty is a semantic no-op, matching the
-    // long-standing behaviour) and `find(name)` returns a `ModuleReference`
+    // So we provide a *lazy* finder: `findAll()` returns synthetic references
+    // for the boot-layer system modules Craton exposes, enough for callers
+    // such as Spring to classify those modules as system modules and skip
+    // scanning them. `find(name)` returns a `ModuleReference`
     // whose `open()` builds a *real* `SystemModuleReader` on demand. The
     // image is therefore read only when code actually traverses module
     // contents (`reader.list()/read()`), via the genuine JDK
@@ -36414,8 +36437,34 @@ fn register_module_builder_overrides(registry: &mut NativeMethodRegistry) {
         "jdk/internal/module/SystemModuleFinders$SystemModuleFinder",
     ] {
         registry.register(cls, "findAll", "()Ljava/util/Set;", |ctx, _args| {
-            let empty = cratonvm_native_collections::make_hashset_with_elements(ctx, &[]);
-            Ok(Some(Value::Object(Some(empty))))
+            let mut module_refs = Vec::new();
+            let mut first_pin = None;
+            for module_name in ["java.base", "java.xml"] {
+                let name = ctx.create_string(module_name);
+                let name_pin = ctx.pin_native_root(name);
+                first_pin = Some(first_pin.map_or(name_pin, |pin: usize| pin.min(name_pin)));
+
+                let mref =
+                    alloc_concurrent_synthetic(ctx, "jdk/internal/module/ModuleReferenceImpl", 8);
+                let mref_pin = ctx.pin_native_root(mref);
+                first_pin = Some(first_pin.map_or(mref_pin, |pin: usize| pin.min(mref_pin)));
+
+                let md = alloc_concurrent_synthetic(ctx, "java/lang/module/ModuleDescriptor", 16);
+                let name = ctx.read_native_pin(name_pin, name);
+                ctx.set_field_by_name(md, "name", Value::Object(Some(name)));
+                let mref = ctx.read_native_pin(mref_pin, mref);
+                ctx.set_field_by_name(mref, "descriptor", Value::Object(Some(md)));
+                module_refs.push((mref_pin, mref));
+            }
+            let elements: Vec<Value> = module_refs
+                .iter()
+                .map(|(pin, mref)| Value::Object(Some(ctx.read_native_pin(*pin, *mref))))
+                .collect();
+            let set = cratonvm_native_collections::make_hashset_with_elements(ctx, &elements);
+            if let Some(pin) = first_pin {
+                ctx.unpin_native_roots(pin);
+            }
+            Ok(Some(Value::Object(Some(set))))
         });
     }
     // find(name) -> Optional<ModuleReference> backed by a lazy reader.
@@ -41341,6 +41390,62 @@ fn register_charset_natives(registry: &mut NativeMethodRegistry) {
             ctx.set_field(this, 1, Value::Int(new_pos));
         }
 
+        // Real-JDK `StringCharBuffer` has no `hb` char[] backing array. It
+        // stores the wrapped CharSequence in `str` and uses Buffer
+        // position/limit plus `offset` for indexing. The generic CharBuffer
+        // natives below exist for synthetic char[]-backed buffers, but they
+        // are also reached by inherited `CharBuffer.charAt(int)` on
+        // StringCharBuffer. Honor the JDK layout instead of treating the null
+        // hb as an error (Netty cookie decoding uses
+        // `CharBuffer.wrap(String,start,end).charAt(0)`).
+        fn string_cb_state(
+            ctx: &dyn cratonvm_native_api::NativeContext,
+            this: ObjectRef,
+        ) -> Option<(Vec<u16>, i32, i32, i32)> {
+            let cid = ctx.class_id_of_object(this);
+            let cname = ctx.class_name_of_id(cid).unwrap_or_default();
+            if cname != "java/nio/StringCharBuffer" {
+                return None;
+            }
+            let str_obj = match ctx.get_field_by_name(this, "str") {
+                Value::Object(Some(o)) => o,
+                _ => return None,
+            };
+            let text = ctx.read_string(str_obj)?;
+            let pos = match ctx.get_field_by_name(this, "position") {
+                Value::Int(v) => v,
+                _ => match ctx.get_field(this, 1) {
+                    Value::Int(v) => v,
+                    _ => 0,
+                },
+            };
+            let lim = match ctx.get_field_by_name(this, "limit") {
+                Value::Int(v) => v,
+                _ => match ctx.get_field(this, 2) {
+                    Value::Int(v) => v,
+                    _ => 0,
+                },
+            };
+            let off = match ctx.get_field_by_name(this, "offset") {
+                Value::Int(v) => v,
+                _ => 0,
+            };
+            Some((text.encode_utf16().collect(), pos, lim, off))
+        }
+
+        fn string_cb_char_at(
+            ctx: &dyn cratonvm_native_api::NativeContext,
+            this: ObjectRef,
+            absolute_index: i32,
+        ) -> Option<Value> {
+            let (chars, _pos, _lim, off) = string_cb_state(ctx, this)?;
+            let real = absolute_index + off;
+            if real < 0 || real as usize >= chars.len() {
+                return None;
+            }
+            Some(Value::Int(chars[real as usize] as i32))
+        }
+
         // get()C — advance pos, return char at pos.
         registry.register(cb, "get", "()C", |ctx, args| {
             let this = match args.first() {
@@ -41352,6 +41457,20 @@ fn register_charset_natives(registry: &mut NativeMethodRegistry) {
                     .into())
                 }
             };
+            if let Some((chars, pos, lim, off)) = string_cb_state(ctx, this) {
+                if pos >= lim {
+                    return Err(RuntimeError::BufferUnderflowException.into());
+                }
+                let real = pos + off;
+                if real < 0 || real as usize >= chars.len() {
+                    return Err(RuntimeError::IllegalArgumentException {
+                        message: format!("index: {pos}"),
+                    }
+                    .into());
+                }
+                cb_set_pos(ctx, this, pos + 1);
+                return Ok(Some(Value::Int(chars[real as usize] as i32)));
+            }
             let (arr, pos, lim, off) = match cb_state(ctx, this) {
                 Some(s) => s,
                 None => {
@@ -41391,6 +41510,22 @@ fn register_charset_natives(registry: &mut NativeMethodRegistry) {
             {
                 let ch = bbacb_char_at(ctx, this, idx)?;
                 return Ok(Some(Value::Int(ch as i32)));
+            }
+            if let Some((chars, _pos, lim, off)) = string_cb_state(ctx, this) {
+                if idx < 0 || idx >= lim {
+                    return Err(RuntimeError::IllegalArgumentException {
+                        message: format!("index: {idx}"),
+                    }
+                    .into());
+                }
+                let real = idx + off;
+                if real < 0 || real as usize >= chars.len() {
+                    return Err(RuntimeError::IllegalArgumentException {
+                        message: format!("index: {idx}"),
+                    }
+                    .into());
+                }
+                return Ok(Some(Value::Int(chars[real as usize] as i32)));
             }
             let (arr, _pos, lim, off) = match cb_state(ctx, this) {
                 Some(s) => s,
@@ -41710,6 +41845,23 @@ fn register_charset_natives(registry: &mut NativeMethodRegistry) {
             {
                 let ch = bbacb_char_at(ctx, this, idx)?;
                 return Ok(Some(Value::Int(ch as i32)));
+            }
+            if let Some((chars, pos, lim, off)) = string_cb_state(ctx, this) {
+                let real = pos + idx;
+                if idx < 0 || real >= lim {
+                    return Err(RuntimeError::IllegalArgumentException {
+                        message: format!("charAt index: {idx}"),
+                    }
+                    .into());
+                }
+                let str_idx = real + off;
+                if str_idx < 0 || str_idx as usize >= chars.len() {
+                    return Err(RuntimeError::IllegalArgumentException {
+                        message: format!("charAt index: {idx}"),
+                    }
+                    .into());
+                }
+                return Ok(Some(Value::Int(chars[str_idx as usize] as i32)));
             }
             let (arr, pos, lim, off) = match cb_state(ctx, this) {
                 Some(s) => s,
@@ -50511,7 +50663,7 @@ fn register_slf4j_natives(registry: &mut NativeMethodRegistry) {
         Ok(None)
     });
     registry.register(acl_log, "isDebugEnabled", "()Z", |_, _| {
-        Ok(Some(Value::Int(1)))
+        Ok(Some(Value::Int(0)))
     });
     registry.register(acl_log, "isInfoEnabled", "()Z", |_, _| {
         Ok(Some(Value::Int(1)))
