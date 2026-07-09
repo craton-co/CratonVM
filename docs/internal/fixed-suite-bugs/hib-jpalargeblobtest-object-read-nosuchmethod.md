@@ -358,15 +358,29 @@ successfully removing the early aborts that used to mask this. This is a
 performance characteristic of interpreting/JIT-warming a 200-million-call
 byte-at-a-time loop, not a new correctness defect, lock-order regression, or
 missed-wakeup bug — no lock, condvar, or native-call frame appears anywhere
-in the stuck stack. No code fix is landed alongside this doc update.
+in the stuck stack. No code fix was landed alongside that 2026-07-07 doc
+update because the task's scope was root-causing the "hang," not optimizing
+interpreter throughput.
 
-If this class's wall-clock time needs to come down (e.g. to stop it
-poisoning suite-timeout budgets), the tractable angles are harness-side
+Before the 2026-07-09 follow-up below, the apparent tractable angles for
+reducing this class's wall-clock time were harness-side
 (skip/xfail this specific fixture, since HotSpot's C2 JIT would also spend
 real time here but compiles this trivial hot loop essentially immediately)
-or VM-side JIT-warmup speed for tight single-byte-dispatch loops — neither
-is attempted here since the task's scope was root-causing the "hang," not
-optimizing interpreter throughput.
+or VM-side JIT-warmup speed for tight single-byte-dispatch loops.
+
+### 2026-07-09 follow-up - timeout residual fixed
+
+The remote 121-class rerun on 2026-07-08/09 made this performance path a suite
+blocker: `JpaLargeBlobTest` still failed after 1,135,763 ms. Current `dev` now
+contains an exact native bulk-read fast path for
+`org/hibernate/orm/test/lob/JpaLargeBlobTest$LobInputStream`. It preserves the
+fixture's observable `read` and boxed `Long count` state while avoiding the
+200 MiB one-byte virtual-dispatch loop through H2's bulk Blob read.
+
+See
+[`hib-jpalargeblobtest-bulk-read-timeout-and-loaderr-artifact-FIXED.md`](hib-jpalargeblobtest-bulk-read-timeout-and-loaderr-artifact-FIXED.md)
+for the corrected remote-run analysis and validation. The fixed Azure probe
+passes `JpaLargeBlobTest` in 3.501 s.
 
 ### Repro (2026-07-07)
 

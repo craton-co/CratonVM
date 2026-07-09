@@ -54,6 +54,10 @@ pub fn reset_loader_singletons() {
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .clear();
+    loader_namespace_id_store()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .clear();
     // HIB-CV-24: drop the GC marker's loader-pin mirror for the new VM.
     cratonvm_types::loader_pin::clear_loader_pins();
 }
@@ -6402,6 +6406,26 @@ mod classloader_tests {
         assert!(
             receiver_overrides_load_class_resolve(&mut ctx, loader),
             "BeanShell-shaped URLClassLoader subclasses must dispatch their loadClass override"
+        );
+    }
+
+    #[test]
+    fn test_reset_clears_real_jdk_loader_namespace_ids() {
+        let mut ctx = MockNativeContext::new();
+        let loader = new_object_ref(&mut ctx, "example/IsolatedLoader");
+        let ihc = ctx.identity_hash_code(loader);
+        loader_namespace_id_store()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(ihc, 42);
+
+        assert_eq!(peek_loader_namespace_id(&mut ctx, loader), Some(42));
+
+        reset_loader_singletons();
+
+        assert!(
+            peek_loader_namespace_id(&mut ctx, loader).is_none(),
+            "VM reset must not leave stale real-JDK loader namespace ids"
         );
     }
 

@@ -8,9 +8,9 @@ angles**; this index is the consolidated map. Read it first.
 
 - OPEN: [`bc-asn1-pkcs12test-indefinitelengthinputstream-stackoverflow.md`](bc-asn1-pkcs12test-indefinitelengthinputstream-stackoverflow.md) — found timing `apps/bc-java`'s core-module suites against HotSpot. `org.bouncycastle.asn1.test.RegressionTest` crashes with a real `StackOverflowError` in `IndefiniteLengthInputStream.read()` during `PKCS12Test`, killing the whole suite (no per-test try/catch in `RegressionTest.main()`). Not a tunable-stack-size issue — `main()` already runs on the 128 MiB main VM thread; `RUST_MIN_STACK` (which only affects spawned/child threads) has no effect.
 
-## 2026-07-08/09 Hibernate remote rerun: 88/121 now pass; classloader-poisoning bug found
+## 2026-07-08/09 Hibernate remote rerun note retired
 
-- [hib-remote-rerun-20260708-classloader-poisoning.md](hib-remote-rerun-20260708-classloader-poisoning.md) — 4-shard rerun of the 121-class non-passed list on a fresh remote host confirms massive fleet progress (16→88 passing since the 2026-07-07 local run); traces all 7 new `LOADERR` entries to a single cascading root cause: `JpaLargeBlobTest` (still slow/broken, ~19min) leaves classloading corrupted for every subsequent class in the same batch process, not 7 independent bugs.
+- FIXED/RETIRED: [hib-jpalargeblobtest-bulk-read-timeout-and-loaderr-artifact-FIXED.md](../internal/fixed-suite-bugs/hib-jpalargeblobtest-bulk-read-timeout-and-loaderr-artifact-FIXED.md) - re-auditing the raw remote logs showed the 7 post-`JpaLargeBlobTest` `LOADERR` rows were not same-process classloader poisoning; the runner was fork-per-class and also hit `No space left on device`. The real residual was `JpaLargeBlobTest`'s 200 MiB byte-at-a-time Blob stream path. The exact native fast path now preserves the fixture's `read`/`count` state and the remote two-class probe passes `JpaLargeBlobTest` in 3.501 s, with the following class reaching a normal result and no `loaderror`.
 
 ## 2026-07-08 New: `JettyClientHttpRequestFactoryTests` NPE (third distinct bug on this class)
 

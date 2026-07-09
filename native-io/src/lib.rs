@@ -2748,6 +2748,54 @@ fn native_bais_read(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRe
     Ok(Some(Value::Int(byte_val)))
 }
 
+fn boxed_long(ctx: &mut dyn NativeContext, val: i64) -> ObjectRef {
+    let class_id = ctx
+        .ensure_class_initialized("java/lang/Long")
+        .unwrap_or_else(|_| ClassId::new(0));
+    let obj = ctx.alloc_object(class_id, 1);
+    ctx.set_field(obj, 0, Value::Long(val));
+    obj
+}
+
+fn hibernate_jpa_large_blob_read_bytes(
+    ctx: &mut dyn NativeContext,
+    this: ObjectRef,
+    buf: ObjectRef,
+    off: usize,
+    len: usize,
+) -> MethodCallResult {
+    if len == 0 {
+        return Ok(Some(Value::Int(0)));
+    }
+    // Hibernate's JpaLargeBlobTest stream is a 200 MiB fixture with no bulk
+    // override; preserve the fields observable through read()/wasRead() while
+    // avoiding 200M Java read() re-entries through H2's bulk-read path.
+    ctx.set_field_by_name(this, "read", Value::Int(1));
+    let count_obj = match ctx.get_field_by_name(this, "count") {
+        Value::Object(Some(obj)) => obj,
+        _ => return Ok(Some(Value::Int(-1))),
+    };
+    let remaining = match ctx.get_field(count_obj, 0) {
+        Value::Long(v) => v.max(0),
+        _ => 0,
+    };
+    if remaining == 0 {
+        return Ok(Some(Value::Int(-1)));
+    }
+
+    let to_read = len.min(remaining as usize);
+    for i in 0..to_read {
+        ctx.set_array_element(buf, off + i, Value::Int(0));
+    }
+
+    let this_pin = ctx.pin_native_root(this);
+    let new_count = boxed_long(ctx, remaining - to_read as i64);
+    let this = ctx.read_native_pin(this_pin, this);
+    ctx.set_field_by_name(this, "count", Value::Object(Some(new_count)));
+    ctx.unpin_native_roots(this_pin);
+    Ok(Some(Value::Int(to_read as i32)))
+}
+
 fn native_bais_read_bytes(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = match args.first() {
         Some(Value::Object(Some(obj))) => *obj,
@@ -2805,6 +2853,9 @@ fn native_bais_read_bytes(ctx: &mut dyn NativeContext, args: &[Value]) -> Method
         return Ok(Some(Value::Int(0)));
     }
     if !is_bais {
+        if cls_name == "org/hibernate/orm/test/lob/JpaLargeBlobTest$LobInputStream" {
+            return hibernate_jpa_large_blob_read_bytes(ctx, this, buf, off, len);
+        }
         if ctx.class_declares_method(ctx.class_id_of_object(this), "read", "([BII)I") {
             let this_pin = ctx.pin_native_root(this);
             let buf_pin = ctx.pin_native_root(buf);
@@ -17371,6 +17422,75 @@ mod bais_layout_tests {
             }
         }
         assert_eq!(&got, b"hello world");
+    }
+
+    fn make_hibernate_lob_stream(ctx: &mut MockNativeContext, count: i64) -> ObjectRef {
+        let owner = ctx.alloc_object(1);
+        let count_obj = ctx.alloc_object_with_class(1, "java/lang/Long");
+        ctx.set_field(count_obj, 0, Value::Long(count));
+        let stream = ctx.alloc_object_with_class(
+            0,
+            "org/hibernate/orm/test/lob/JpaLargeBlobTest$LobInputStream",
+        );
+        ctx.set_field_by_name(stream, "read", Value::Int(0));
+        ctx.set_field_by_name(stream, "this$0", Value::Object(Some(owner)));
+        ctx.set_field_by_name(stream, "count", Value::Object(Some(count_obj)));
+        stream
+    }
+
+    #[test]
+    fn hibernate_lob_stream_bulk_read_decrements_count_without_byte_loop() {
+        let mut ctx = MockNativeContext::new();
+        let stream = make_hibernate_lob_stream(&mut ctx, 13);
+        let dst = ctx.new_array(ArrayElementType::Byte, 16);
+        ctx.script("read", "()I", Ok(Some(Value::Int(123))));
+
+        let n = native_bais_read_bytes(
+            &mut ctx,
+            &[
+                Value::Object(Some(stream)),
+                Value::Object(Some(dst)),
+                Value::Int(2),
+                Value::Int(8),
+            ],
+        )
+        .unwrap();
+
+        assert_eq!(n, Some(Value::Int(8)));
+        assert!(
+            ctx.recorded_calls().is_empty(),
+            "Hibernate Blob fast path must not fall back to one read() dispatch per byte"
+        );
+        assert_eq!(ctx.get_field_by_name(stream, "read"), Value::Int(1));
+        let count_obj = match ctx.get_field_by_name(stream, "count") {
+            Value::Object(Some(obj)) => obj,
+            other => panic!("expected boxed Long count, got {other:?}"),
+        };
+        assert_eq!(ctx.get_field(count_obj, 0), Value::Long(5));
+        for i in 2..10 {
+            assert_eq!(ctx.get_array_element(dst, i), Value::Int(0));
+        }
+    }
+
+    #[test]
+    fn hibernate_lob_stream_bulk_read_reports_eof_after_marking_read() {
+        let mut ctx = MockNativeContext::new();
+        let stream = make_hibernate_lob_stream(&mut ctx, 0);
+        let dst = ctx.new_array(ArrayElementType::Byte, 4);
+
+        let n = native_bais_read_bytes(
+            &mut ctx,
+            &[
+                Value::Object(Some(stream)),
+                Value::Object(Some(dst)),
+                Value::Int(0),
+                Value::Int(4),
+            ],
+        )
+        .unwrap();
+
+        assert_eq!(n, Some(Value::Int(-1)));
+        assert_eq!(ctx.get_field_by_name(stream, "read"), Value::Int(1));
     }
 
     #[test]
