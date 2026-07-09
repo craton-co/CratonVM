@@ -12934,6 +12934,60 @@ fn native_byte_buffer_wrap_bytes_offset_len(
     )
 }
 
+fn native_heap_byte_buffer_init_array_offset_len(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    let this = match args.first().copied() {
+        Some(Value::Object(Some(o))) => o,
+        _ => return Ok(None),
+    };
+    let bytes = match args.get(1).copied() {
+        Some(Value::Object(Some(o))) => o,
+        _ => {
+            return Err(RuntimeError::NullPointerException {
+                message: Some("HeapByteBuffer backing array is null".to_string()),
+            }
+            .into())
+        }
+    };
+    let array_len = ctx.array_length(bytes) as i32;
+    let offset = args.get(2).and_then(|v| v.as_int()).unwrap_or(0);
+    let len = args.get(3).and_then(|v| v.as_int()).unwrap_or(array_len);
+    let limit64 = offset as i64 + len as i64;
+    if offset < 0 || len < 0 || limit64 < 0 || limit64 > array_len as i64 {
+        let index = if offset < 0 {
+            offset
+        } else if len < 0 {
+            len
+        } else {
+            limit64.min(i32::MAX as i64) as i32
+        };
+        return Err(RuntimeError::ArrayIndexOutOfBoundsException { index }.into());
+    }
+    let limit = limit64 as i32;
+    let segment = args.get(4).copied().unwrap_or(Value::Object(None));
+
+    ctx.set_field_by_name(this, "mark", Value::Int(-1));
+    ctx.set_field_by_name(this, "position", Value::Int(offset));
+    ctx.set_field_by_name(this, "limit", Value::Int(limit));
+    ctx.set_field_by_name(this, "capacity", Value::Int(array_len));
+    ctx.set_field_by_name(this, "segment", segment);
+    ctx.set_field_by_name(this, "hb", Value::Object(Some(bytes)));
+    ctx.set_field_by_name(this, "offset", Value::Int(0));
+    ctx.set_field_by_name(this, "isReadOnly", Value::Int(0));
+    ctx.set_field_by_name(this, "bigEndian", Value::Int(1));
+    ctx.set_field_by_name(
+        this,
+        "nativeByteOrder",
+        Value::Int(if cfg!(target_endian = "big") { 1 } else { 0 }),
+    );
+    // Unsafe.arrayBaseOffset(byte[]) is 16 on the JDKs this VM targets. The
+    // inherited bulk get/put paths add position to this address.
+    ctx.set_field_by_name(this, "address", Value::Long(16));
+    Ok(None)
+}
+
 fn native_byte_buffer_wrap_bytes(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let bytes = match args.first().copied() {
         Some(Value::Object(Some(o))) => o,
@@ -14023,6 +14077,17 @@ fn native_activemq_topic_region_create_subscription(
 }
 
 fn register_spring_messaging_bridges(registry: &mut NativeMethodRegistry) {
+    for descriptor in [
+        "([BIILjava/lang/foreign/MemorySegment;)V",
+        "([BIILjdk/internal/access/foreign/MemorySegmentProxy;)V",
+    ] {
+        registry.register(
+            "java/nio/HeapByteBuffer",
+            "<init>",
+            descriptor,
+            native_heap_byte_buffer_init_array_offset_len,
+        );
+    }
     registry.register(
         "java/nio/ByteBuffer",
         "wrap",
@@ -62377,6 +62442,68 @@ mod vector_support_essential_tests {
             ctx.get_field_by_name(queue, "count"),
             Value::Object(Some(count))
         );
+    }
+}
+
+#[cfg(test)]
+mod nio_heap_byte_buffer_tests {
+    use super::*;
+    use crate::test_utils::MockNativeContext;
+    use cratonvm_types::ArrayElementType;
+
+    #[test]
+    fn heap_byte_buffer_memorysegment_constructors_initialize_real_fields() {
+        let mut registry = NativeMethodRegistry::new();
+        register_essential_natives(&mut registry);
+        for descriptor in [
+            "([BIILjava/lang/foreign/MemorySegment;)V",
+            "([BIILjdk/internal/access/foreign/MemorySegmentProxy;)V",
+        ] {
+            assert!(
+                registry
+                    .find("java/nio/HeapByteBuffer", "<init>", descriptor)
+                    .is_some(),
+                "HeapByteBuffer constructor {descriptor} must be native in real-JDK mode"
+            );
+        }
+
+        let init = registry
+            .find(
+                "java/nio/HeapByteBuffer",
+                "<init>",
+                "([BIILjdk/internal/access/foreign/MemorySegmentProxy;)V",
+            )
+            .expect("JDK17 HeapByteBuffer(byte[],int,int,segment) native");
+
+        let mut ctx = MockNativeContext::new();
+        let buffer_class = ctx
+            .ensure_class_initialized("java/nio/HeapByteBuffer")
+            .expect("mock HeapByteBuffer class");
+        let buffer = ctx.alloc_object(buffer_class, 8);
+        let bytes = ctx.new_array(ArrayElementType::Byte, 6);
+
+        init(
+            &mut ctx,
+            &[
+                Value::Object(Some(buffer)),
+                Value::Object(Some(bytes)),
+                Value::Int(2),
+                Value::Int(3),
+                Value::Object(None),
+            ],
+        )
+        .expect("constructor native succeeds");
+
+        assert_eq!(ctx.get_field_by_name(buffer, "mark"), Value::Int(-1));
+        assert_eq!(ctx.get_field_by_name(buffer, "position"), Value::Int(2));
+        assert_eq!(ctx.get_field_by_name(buffer, "limit"), Value::Int(5));
+        assert_eq!(ctx.get_field_by_name(buffer, "capacity"), Value::Int(6));
+        assert_eq!(
+            ctx.get_field_by_name(buffer, "hb"),
+            Value::Object(Some(bytes))
+        );
+        assert_eq!(ctx.get_field_by_name(buffer, "offset"), Value::Int(0));
+        assert_eq!(ctx.get_field_by_name(buffer, "address"), Value::Long(16));
     }
 }
 
