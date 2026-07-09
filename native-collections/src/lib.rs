@@ -10547,44 +10547,6 @@ struct LazyOp {
 }
 
 
-fn pin_lazy_chain_lambdas(
-    ctx: &mut dyn NativeContext,
-    chain: &[LazyOp],
-) -> (Vec<Option<usize>>, usize) {
-    let mut base = usize::MAX;
-    let mut pins = Vec::with_capacity(chain.len());
-    for op in chain {
-        if let Some(lambda) = op.lambda {
-            let h = ctx.pin_native_root(lambda);
-            if base == usize::MAX {
-                base = h;
-            }
-            pins.push(Some(h));
-        } else {
-            pins.push(None);
-        }
-    }
-    (pins, base)
-}
-
-fn read_lazy_lambda(
-    ctx: &mut dyn NativeContext,
-    op: &LazyOp,
-    pin: Option<usize>,
-) -> Option<ObjectRef> {
-    match (op.lambda, pin) {
-        (Some(lambda), Some(handle)) => Some(ctx.read_native_pin(handle, lambda)),
-        (Some(lambda), None) => Some(lambda),
-        _ => None,
-    }
-}
-
-fn unpin_lazy_chain_lambdas(ctx: &mut dyn NativeContext, base: usize) {
-    if base != usize::MAX {
-        ctx.unpin_native_roots(base);
-    }
-}
-
 /// `true` if `this` is a synthetic stream that currently carries a non-empty
 /// deferred op-chain (slot 3). Cheap guard used by terminals to pick the lazy path.
 fn stream_has_chain(ctx: &dyn NativeContext, this: ObjectRef) -> bool {
