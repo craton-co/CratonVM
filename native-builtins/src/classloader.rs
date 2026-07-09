@@ -54,6 +54,10 @@ pub fn reset_loader_singletons() {
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .clear();
+    loader_namespace_id_store()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .clear();
     // HIB-CV-24: drop the GC marker's loader-pin mirror for the new VM.
     cratonvm_types::loader_pin::clear_loader_pins();
 }
@@ -3537,6 +3541,52 @@ pub fn module_get_resource_as_stream(
     cl_get_resource_as_stream(ctx, args)
 }
 
+fn resource_stream_for_last_string_arg(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    let name = args
+        .iter()
+        .rev()
+        .find_map(|v| match v {
+            Value::Object(Some(o)) => ctx.read_string(*o),
+            _ => None,
+        })
+        .unwrap_or_default();
+    let resource_name = name.trim_start_matches('/');
+    if crate::lang_class::t19_h10_validate_resource_name_pub(resource_name).is_none() {
+        return Ok(Some(Value::Object(None)));
+    }
+    match ctx.find_resource(resource_name) {
+        Some(bytes) => {
+            let stream = crate::lang_class::t19_h10_alloc_byte_array_input_stream(ctx, &bytes);
+            Ok(Some(Value::Object(Some(stream))))
+        }
+        None => Ok(Some(Value::Object(None))),
+    }
+}
+
+/// `jdk.internal.loader.BootLoader.findResourceAsStream(String,String)`.
+///
+/// `java.lang.Module.getResourceAsStream` delegates here for named boot modules
+/// such as `java.desktop`. CratonVM does not populate the JDK's internal module
+/// resource maps, but its classpath manager already indexes JMOD/JImage
+/// resources by module, so serve the requested resource bytes from that path.
+pub fn bootloader_find_resource_as_stream(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    resource_stream_for_last_string_arg(ctx, args)
+}
+
+/// `jdk.internal.loader.BuiltinClassLoader.findResourceAsStream(String,String)`.
+pub fn builtin_classloader_find_resource_as_stream(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    resource_stream_for_last_string_arg(ctx, args)
+}
+
 fn cl_get_defined_package(_ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
     Ok(Some(Value::Object(None)))
 }
@@ -6402,6 +6452,26 @@ mod classloader_tests {
         assert!(
             receiver_overrides_load_class_resolve(&mut ctx, loader),
             "BeanShell-shaped URLClassLoader subclasses must dispatch their loadClass override"
+        );
+    }
+
+    #[test]
+    fn test_reset_clears_real_jdk_loader_namespace_ids() {
+        let mut ctx = MockNativeContext::new();
+        let loader = new_object_ref(&mut ctx, "example/IsolatedLoader");
+        let ihc = ctx.identity_hash_code(loader);
+        loader_namespace_id_store()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(ihc, 42);
+
+        assert_eq!(peek_loader_namespace_id(&mut ctx, loader), Some(42));
+
+        reset_loader_singletons();
+
+        assert!(
+            peek_loader_namespace_id(&mut ctx, loader).is_none(),
+            "VM reset must not leave stale real-JDK loader namespace ids"
         );
     }
 

@@ -126,12 +126,6 @@ pub(crate) fn register_collections_extras_natives(r: &mut NativeMethodRegistry) 
     );
     r.register(
         cu,
-        "enumeration",
-        "(Ljava/util/Collection;)Ljava/util/Enumeration;",
-        native_collections_enumeration,
-    );
-    r.register(
-        cu,
         "list",
         "(Ljava/util/Enumeration;)Ljava/util/ArrayList;",
         native_return_first_arg,
@@ -333,18 +327,6 @@ fn native_collections_singleton_map(
     ctx.set_array_element(buckets, idx, Value::Object(Some(node)));
     ctx.set_field(map, 1, Value::Int(1));
     Ok(Some(Value::Object(Some(map))))
-}
-
-fn native_collections_enumeration(
-    ctx: &mut dyn NativeContext,
-    _args: &[Value],
-) -> MethodCallResult {
-    // Return empty iterator as enumeration stub
-    let itr = alloc_concurrent_synthetic(ctx, "java/util/Collections$EmptyEnumeration", 2);
-    let arr = ctx.new_array(cratonvm_types::ArrayElementType::Reference, 0);
-    ctx.set_field(itr, 0, Value::Object(Some(arr)));
-    ctx.set_field(itr, 1, Value::Int(0));
-    Ok(Some(Value::Object(Some(itr))))
 }
 
 fn native_collections_frequency(ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
@@ -15412,9 +15394,10 @@ pub(crate) fn register_phase54_net_extras(r: &mut NativeMethodRegistry) {
         if let Some(scheme) = scheme_text {
             let named_scheme = ctx.create_string(scheme);
             ctx.set_field_by_name(this, "scheme", Value::Object(Some(named_scheme)));
-            let named_ssp = ctx.create_string(rest);
+            let raw_ssp = rest.split('#').next().unwrap_or(rest);
+            let named_ssp = ctx.create_string(raw_ssp);
             ctx.set_field_by_name(this, "schemeSpecificPart", Value::Object(Some(named_ssp)));
-            let named_dssp = ctx.create_string(rest);
+            let named_dssp = ctx.create_string(raw_ssp);
             ctx.set_field_by_name(
                 this,
                 "decodedSchemeSpecificPart",
@@ -15538,9 +15521,9 @@ pub(crate) fn register_phase54_net_extras(r: &mut NativeMethodRegistry) {
         // on that exception to fall back from URI.toURL() to new URL(...), and
         // then to classpath resource resolution for unresolved placeholders.
         let raw = crate::net_phase_e::uri_raw_string(ctx, this);
-        if raw.find(':').is_none() {
+        if !raw.contains(':') {
             return Err(RuntimeError::IllegalArgumentException {
-                message: "URI is not absolute".into(),
+                message: "URI is not absolute".to_string(),
             }
             .into());
         }

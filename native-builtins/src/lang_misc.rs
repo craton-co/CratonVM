@@ -725,6 +725,25 @@ pub(crate) fn native_throwable_get_message(
     }
 }
 
+pub(crate) fn native_throwable_get_localized_message(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(obj))) => *obj,
+        _ => return Ok(Some(Value::Object(None))),
+    };
+    let pin = ctx.pin_native_root(this);
+    let receiver = ctx.read_native_pin(pin, this);
+    let result = ctx.invoke_virtual(receiver, "getMessage", "()Ljava/lang/String;", &[]);
+    ctx.unpin_native_roots(pin);
+
+    match result {
+        Ok(Some(Value::Object(obj))) => Ok(Some(Value::Object(obj))),
+        Ok(Some(_)) | Ok(None) | Err(_) => native_throwable_get_message(ctx, args),
+    }
+}
+
 // --- Throwable additional methods ---
 
 /// True iff `this`'s runtime class is `java.lang.reflect.InvocationTargetException`
@@ -831,56 +850,65 @@ pub(crate) fn native_throwable_to_string(
         _ => return Ok(Some(Value::Object(None))),
     };
 
-    // Get the class name
-    let class_id = ctx.class_id_of_object(this);
-    let class_name = ctx
-        .class_name_of_id(class_id)
-        .unwrap_or_else(|| "java/lang/Throwable".to_string())
-        .replace('/', ".");
-
-    // Read detailMessage by name first (real-JDK Throwable layout has it
-    // at slot 1), with slot-0 fallback for synthetic stubs.
-    let by_name = ctx.get_field_by_name(this, "detailMessage");
-    let detail = match by_name {
-        Value::Object(Some(_)) => by_name,
-        _ => ctx.get_field(this, 0),
-    };
-    let result = match detail {
-        Value::Object(Some(str_ref)) => {
-            if let Some(msg) = ctx.read_string(str_ref) {
-                format!("{class_name}: {msg}")
-            } else {
-                class_name
-            }
-        }
-        _ => class_name,
-    };
-
+    let (_, result) = throwable_to_string_text(ctx, this);
     let str_obj = ctx.create_string(&result);
     Ok(Some(Value::Object(Some(str_obj))))
 }
 
-/// Build "ClassName: message" or just "ClassName" for a throwable, reading
-/// the real-JDK `detailMessage` field by name with a slot-0 fallback for
-/// synthetic stubs.
-fn throwable_header_line(ctx: &mut dyn NativeContext, t: ObjectRef) -> String {
-    let class_id = ctx.class_id_of_object(t);
-    let class_name = ctx
-        .class_name_of_id(class_id)
+fn throwable_class_name(ctx: &mut dyn NativeContext, t: ObjectRef) -> String {
+    ctx.class_name_of_id(ctx.class_id_of_object(t))
         .unwrap_or_else(|| "java/lang/Throwable".to_string())
-        .replace('/', ".");
-    let by_name = ctx.get_field_by_name(t, "detailMessage");
-    let detail = match by_name {
-        Value::Object(Some(_)) => by_name,
-        _ => ctx.get_field(t, 0),
+        .replace('/', ".")
+}
+
+fn throwable_detail_message_text(ctx: &mut dyn NativeContext, t: ObjectRef) -> Option<String> {
+    let has_named_detail_message = ctx
+        .class_name_of_id(ctx.class_id_of_object(t))
+        .and_then(|cn| ctx.resolve_field_index(&cn, "detailMessage"))
+        .is_some();
+    let detail = match ctx.get_field_by_name(t, "detailMessage") {
+        v @ Value::Object(Some(_)) => v,
+        _ if has_named_detail_message => Value::Object(None),
+        _ => match ctx.get_field(t, 0) {
+            v @ Value::Object(Some(o))
+                if ctx.class_name_of_id(ctx.class_id_of_object(o)).as_deref()
+                    == Some("java/lang/String") =>
+            {
+                v
+            }
+            _ => Value::Object(None),
+        },
     };
     match detail {
-        Value::Object(Some(sr)) => match ctx.read_string(sr) {
-            Some(m) => format!("{class_name}: {m}"),
-            None => class_name,
-        },
-        _ => class_name,
+        Value::Object(Some(sr)) => ctx.read_string(sr),
+        _ => None,
     }
+}
+
+/// Return a Throwable.toString()-compatible text line plus the post-GC receiver
+/// reference. HotSpot's `Throwable.toString()` calls virtual
+/// `getLocalizedMessage()`, not a raw `detailMessage` field read; custom
+/// subclasses such as Spring's `JmsException` depend on that virtual message to
+/// include linked exception details.
+fn throwable_to_string_text(ctx: &mut dyn NativeContext, t: ObjectRef) -> (ObjectRef, String) {
+    let pin = ctx.pin_native_root(t);
+    let receiver = ctx.read_native_pin(pin, t);
+    let localized =
+        ctx.invoke_virtual(receiver, "getLocalizedMessage", "()Ljava/lang/String;", &[]);
+    let current = ctx.read_native_pin(pin, receiver);
+    let message = match localized {
+        Ok(Some(Value::Object(Some(msg)))) => ctx.read_string(msg),
+        Ok(Some(Value::Object(None))) | Ok(None) => None,
+        _ => throwable_detail_message_text(ctx, current),
+    };
+    ctx.unpin_native_roots(pin);
+
+    let class_name = throwable_class_name(ctx, current);
+    let text = match message {
+        Some(m) => format!("{class_name}: {m}"),
+        None => class_name,
+    };
+    (current, text)
 }
 
 /// Read the cause field, returning None if missing or self-referential
@@ -1016,11 +1044,12 @@ pub(crate) fn native_throwable_print_stack_trace(
 /// Collect the full printStackTrace text (header + captured frames for the
 /// throwable and its cause chain) as a list of lines, WITHOUT emitting them.
 /// Shared by the fd sink and the stream-object sink so both produce identical
-/// text. Reading the trace store here does no user-visible allocation, so it is
-/// safe to run before any `invoke_virtual` that could trigger GC.
+/// text. The header path pins each throwable while it asks the receiver for its
+/// virtual localized message, matching `Throwable.toString()` semantics.
 fn collect_throwable_chain_lines(ctx: &mut dyn NativeContext, this: ObjectRef) -> Vec<String> {
     let mut lines = Vec::new();
-    lines.push(throwable_header_line(ctx, this));
+    let (this, header) = throwable_to_string_text(ctx, this);
+    lines.push(header);
     lines.extend(throwable_frame_lines(ctx, this));
 
     // Walk the cause chain with a cycle guard. Limit depth defensively
@@ -1031,11 +1060,12 @@ fn collect_throwable_chain_lines(ctx: &mut dyn NativeContext, this: ObjectRef) -
     let mut depth = 0;
     while let Some(c) = current {
         depth += 1;
+        let (c, header) = throwable_to_string_text(ctx, c);
         if depth > 32 || seen.iter().any(|s| *s == c) {
             break;
         }
         seen.push(c);
-        lines.push(format!("Caused by: {}", throwable_header_line(ctx, c)));
+        lines.push(format!("Caused by: {header}"));
         lines.extend(throwable_frame_lines(ctx, c));
         current = throwable_cause(ctx, c);
     }
@@ -1822,13 +1852,13 @@ pub fn register_throwable_subclass_natives(r: &mut NativeMethodRegistry) {
             "()Ljava/lang/String;",
             native_throwable_get_message,
         );
-        // getLocalizedMessage()Ljava/lang/String; — JDK delegates to
+        // getLocalizedMessage()Ljava/lang/String; — JDK delegates to virtual
         // getMessage by default.
         r.register(
             cls,
             "getLocalizedMessage",
             "()Ljava/lang/String;",
-            native_throwable_get_message,
+            native_throwable_get_localized_message,
         );
         // printStackTrace()V — no-arg overload, prints to System.err equivalent.
         r.register(

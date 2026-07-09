@@ -34,6 +34,12 @@ fn t7_1_2_awt_toolkit_shim() {
     cratonvm_native_awt::register_awt_natives(&mut registry);
     let count = registry.len();
     eprintln!("[t7] AWT natives registered: {count}");
+    assert!(registry
+        .find("java/awt/Toolkit", "initIDs", "()V")
+        .is_some());
+    assert!(registry
+        .find("sun/java2d/Disposer", "initIDs", "()V")
+        .is_some());
     assert!(count >= 50, "Expected >= 50 AWT natives, got {count}");
 }
 
@@ -98,7 +104,50 @@ fn t7_1_6_imageio_png_jpeg_natives_registered() {
         .find(
             "javax/imageio/ImageIO",
             "write",
+            "(Ljava/awt/image/RenderedImage;Ljava/lang/String;Ljavax/imageio/stream/ImageOutputStream;)Z",
+        )
+        .is_some());
+    assert!(registry
+        .find(
+            "javax/imageio/ImageIO",
+            "write",
             "(Ljava/awt/image/RenderedImage;Ljava/lang/String;Ljava/io/File;)Z",
+        )
+        .is_some());
+
+    assert!(registry
+        .find(
+            "com/sun/imageio/plugins/jpeg/JPEGImageReader",
+            "initReaderIDs",
+            "(Ljava/lang/Class;Ljava/lang/Class;Ljava/lang/Class;)V",
+        )
+        .is_some());
+    assert!(registry
+        .find(
+            "com/sun/imageio/plugins/jpeg/JPEGImageWriter",
+            "initWriterIDs",
+            "(Ljava/lang/Class;Ljava/lang/Class;)V",
+        )
+        .is_some());
+    assert!(registry
+        .find(
+            "com/sun/imageio/plugins/jpeg/JPEGImageReader",
+            "initJPEGImageReader",
+            "()J",
+        )
+        .is_some());
+    assert!(registry
+        .find(
+            "com/sun/imageio/plugins/jpeg/JPEGImageReader",
+            "read",
+            "(ILjavax/imageio/ImageReadParam;)Ljava/awt/image/BufferedImage;",
+        )
+        .is_some());
+    assert!(registry
+        .find(
+            "com/sun/imageio/plugins/png/PNGImageWriter",
+            "write",
+            "(Ljavax/imageio/metadata/IIOMetadata;Ljavax/imageio/IIOImage;Ljavax/imageio/ImageWriteParam;)V",
         )
         .is_some());
 
