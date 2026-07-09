@@ -533,6 +533,7 @@ pub fn _anchor_getaddrinfo() {
 const INET4_IMPL: &str = "java/net/Inet4AddressImpl";
 const INET6_IMPL: &str = "java/net/Inet6AddressImpl";
 const INET_ADDRESS: &str = "java/net/InetAddress";
+const INET_IMPL_FACTORY: &str = "java/net/InetAddressImplFactory";
 
 pub fn register_inet_address_real(r: &mut NativeMethodRegistry) {
     let __prev_cat = r.current_category();
@@ -622,6 +623,21 @@ pub fn register_inet_address_real(r: &mut NativeMethodRegistry) {
     );
     r.register(
         INET_ADDRESS,
+        "isIPv4Available",
+        "()Z",
+        native_inet_address_is_ipv4_available,
+    );
+    // JDK 17 declares the host-family probes on InetAddressImplFactory instead
+    // of InetAddress. Register both owners so real-JDK boot code can choose the
+    // address implementation without tripping UnsatisfiedLinkError.
+    r.register(
+        INET_IMPL_FACTORY,
+        "isIPv6Supported",
+        "()Z",
+        native_inet_address_is_ipv6_supported,
+    );
+    r.register(
+        INET_IMPL_FACTORY,
         "isIPv4Available",
         "()Z",
         native_inet_address_is_ipv4_available,
@@ -754,5 +770,22 @@ mod tests {
         let a = ipv4_available_cached();
         let b = ipv4_available_cached();
         assert_eq!(a, b, "ipv4_available cache must memoize");
+    }
+
+    #[test]
+    fn ipv4_ipv6_probe_natives_cover_jdk17_and_jdk25_owners() {
+        let mut r = NativeMethodRegistry::new();
+        register_inet_address_real(&mut r);
+
+        for owner in [INET_ADDRESS, INET_IMPL_FACTORY] {
+            assert!(
+                r.find(owner, "isIPv6Supported", "()Z").is_some(),
+                "{owner}.isIPv6Supported must be registered"
+            );
+            assert!(
+                r.find(owner, "isIPv4Available", "()Z").is_some(),
+                "{owner}.isIPv4Available must be registered"
+            );
+        }
     }
 }
