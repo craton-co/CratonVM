@@ -11097,6 +11097,11 @@ fn invoke_on_class_shared_inner(
                             method_name,
                             descriptor,
                         )
+                        || crate::runtime::interpreter::is_xerces_xml_parser_native_override(
+                            class_name,
+                            method_name,
+                            descriptor,
+                        )
                         || (matches!(
                                 class_name,
                                 "java/util/concurrent/locks/ReentrantReadWriteLock$ReadLock"
@@ -12116,6 +12121,11 @@ fn invoke_on_class_shared_inner(
                             descriptor,
                         )
                         || crate::runtime::interpreter::is_xerces_cmstateset_native_override(
+                            class_name,
+                            method_name,
+                            descriptor,
+                        )
+                        || crate::runtime::interpreter::is_xerces_xml_parser_native_override(
                             class_name,
                             method_name,
                             descriptor,

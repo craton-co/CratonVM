@@ -23,6 +23,14 @@ The class still does not finish under CratonVM within the current watchdog.
 The current residual is later: Keycloak reaches Liquibase changelog parsing
 and remains much slower than HotSpot.
 
+Update 2026-07-09: the specific no-JIT Liquibase/Xerces XML parse hotspot has
+been fixed and retired to
+`docs/internal/fixed-suite-bugs/keycloak-model-liquibase-xerces-xml-parse-nojit-timeout-FIXED.md`.
+The active remaining layer is now
+`docs/known-issues/keycloak-model-liquibase-checksum-status-nojit-timeout.md`,
+where the main thread is in Liquibase checksum/status serialization rather than
+Xerces schema parsing.
+
 ## Evidence
 
 HotSpot control:
@@ -70,18 +78,16 @@ Liquibase. The skip is deliberately narrow:
 
 ## Not yet root-caused / fixed
 
-The remaining timeout needs a fresh Liquibase-phase investigation. Useful next
-steps:
+The remaining timeout needs a fresh Liquibase checksum/status investigation.
+Useful next steps:
 
-1. Capture a `--stack-dump-on-timeout` run after the RxJava3 skip-list entry is
-   compiled in, so the current wait point is from committed behavior rather
-   than an environment deny experiment.
-2. Compare the JIT-on/RxJava3-skipped stack dump with the 900-second `--nojit`
-   dump to determine whether both are simply slow in XML/Liquibase parsing or
-   blocked in different paths.
-3. If both are in Liquibase XML parsing, narrow whether the gap is parser,
-   reflection, ZIP/resource I/O, logging, or JDBC/H2 migration work before
-   adding any broader JIT skip.
+1. Instrument `StringChangeLogSerializer.serializeObject` and
+   `AbstractChange.generateCheckSum` under `--nojit`.
+2. Compare the checksum/status path against HotSpot `-Xint` on the same
+   class/list.
+3. If JIT-on with the RxJava3 skip-list reaches the same layer, decide whether
+   the shared no-JIT/JIT-denied cost is reflection/property traversal, repeated
+   checksum work, string serialization, or another Liquibase visitor hot path.
 
 ## Repro
 
