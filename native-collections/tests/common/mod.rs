@@ -808,6 +808,25 @@ impl NativeContext for MockCtx {
                 a.to_vec(),
             ));
         }
+        if m == "compare"
+            && d == "(Ljava/lang/Object;Ljava/lang/Object;)I"
+            && self.class_name_of_id(self.class_id_of_object(r)).as_deref()
+                == Some("test/LiquibaseTieComparator")
+        {
+            let order_of = |ctx: &MockCtx, v: Value| -> i32 {
+                match v {
+                    Value::Object(Some(o)) => match ctx.get_field(o, 0) {
+                        Value::Int(order) => order,
+                        _ => 0,
+                    },
+                    _ => 0,
+                }
+            };
+            let left = a.first().copied().unwrap_or(Value::Object(None));
+            let right = a.get(1).copied().unwrap_or(Value::Object(None));
+            let cmp = order_of(self, left).cmp(&order_of(self, right)) as i32;
+            return Ok(Some(Value::Int(if cmp == 0 { 1 } else { cmp })));
+        }
         match (m, d) {
             ("complete", "(Ljava/lang/Object;)Z") => {
                 let val = a.first().copied().unwrap_or(Value::Object(None));

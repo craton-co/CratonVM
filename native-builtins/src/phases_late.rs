@@ -30208,6 +30208,21 @@ pub(crate) fn register_p62_stamped_lock(r: &mut NativeMethodRegistry) {
         ctx.set_field(this, 1, Value::Int(0));
         Ok(None)
     });
+    r.register(sl, "unstampedUnlockRead", "()V", |ctx, args| {
+        let this = obj_arg(args, 0)?;
+        let state = match ctx.get_field(this, 0) {
+            Value::Long(v) => v,
+            _ => 0,
+        };
+        ctx.set_field(this, 0, Value::Long((state - 1).max(0)));
+        Ok(None)
+    });
+    r.register(sl, "unstampedUnlockWrite", "()V", |ctx, args| {
+        let this = obj_arg(args, 0)?;
+        ctx.set_field(this, 0, Value::Long(0));
+        ctx.set_field(this, 1, Value::Int(0));
+        Ok(None)
+    });
     r.register(sl, "validate", "(J)Z", |ctx, args| {
         let this = obj_arg(args, 0)?;
         let stamp = match args.get(1) {
