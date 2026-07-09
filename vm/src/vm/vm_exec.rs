@@ -1438,7 +1438,15 @@ impl<'a> NativeContextImpl<'a> {
         // instead of evacuating it and zeroing the young slot under it.
         let conservative_locals = crate::memory::roots::conservative_locals_enabled();
         for frame in &self.thread.frames {
-            frame.scan_local_objects(&mut snapshot, &self.shared.heap);
+            if conservative_locals {
+                // Matches `update_root_snapshot`: while the non-moving FJP
+                // stress collector uses roots as pins, scoped-out references
+                // are cheaper than a live receiver reclaimed under a blocked
+                // native call.
+                frame.scan_local_objects_all_live(&mut snapshot, &self.shared.heap);
+            } else {
+                frame.scan_local_objects(&mut snapshot, &self.shared.heap);
+            }
             if conservative_locals {
                 frame.scan_locals_conservative(&mut snapshot, &self.shared.heap);
             }

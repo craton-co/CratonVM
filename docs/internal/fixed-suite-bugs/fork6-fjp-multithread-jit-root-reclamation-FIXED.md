@@ -1,4 +1,15 @@
-# Fork6 — multi-thread (ForkJoinPool worker) JIT-root reclamation
+# Fork6 - multi-thread (ForkJoinPool worker) JIT-root reclamation - FIXED
+
+> **FIXED 2026-07-09:** the canonical real-FJP repro is retired. The fix is
+> intentionally three-part: STW root requests now count only live blocked
+> threads from the registry snapshot, `Unsafe.compareAndExchange*` returns the
+> actual CAS witness instead of a stale pre-read value, and the real-FJP
+> non-moving snapshot path scans reference locals as all-live before the
+> conservative local pass. Final validation used the unique Linux binary
+> `cratonvm-fork6-alllive-caxwitness-20260709-012308`: plain `Fork6` and
+> `Fork6Hard 128 20` are `ALL-OK`, and aggressive real-FJP
+> `GC_STRESS=65536` passed 48/48 with `fail=0 timeout=0 signal_logs=0`.
+> Historical notes below describe earlier misattributions and partial fixes.
 
 > **RETRACTED 2026-07-07**: the `ElytronRemoteOutboundConnectionTestCase` SIGSEGV
 > initially reported here as a new real-world repro of this A4 gap was
@@ -39,9 +50,9 @@
 > "register-invisible oop, fixed by precise JIT maps" narrative for `Fork6Hard`'s own canonical
 > `GC_STRESS` repro. That session concluded A4 is instead a **real-FJP-path dangling-reference /
 > worker-barrier-publish gap** (a live island goes unpublished at the reclaiming GC — not a missed
-> root-scan) and that **adding more root coverage makes it WORSE, not better**. That conclusion is not yet
-> reflected in this doc's Status line above (still says "register-only residual... gated on the deferred
-> precise-JIT-stack-maps project"). Also worth noting: neither the Elytron nor the mockselector-mutex
+> root-scan) and that **adding more root coverage makes it WORSE, not better**. That conclusion was later superseded by the 2026-07-09 fix above, but the
+> warning remains useful history for separating FJP-worker publication failures from
+> unrelated native-call argument bugs. Also worth noting: neither the Elytron nor the mockselector-mutex
 > repro touches ForkJoinPool or `GC_STRESS` at all — both are a single JIT-compiled virtual-dispatch call
 > to a native method (`jit_invoke_virtual_mic` → `native_builder_set`). So while these two share a crash
 > **site** with the `Fork6Hard` `read_string` symptom, the underlying **mechanism may differ** (a simpler
@@ -73,7 +84,7 @@
 > `Fork6Hard`'s own `GC_STRESS` repro (see the "Reconcile before implementing a fix" note above — that
 > repro's mechanism is still believed to differ).
 
-**Status:** 🟡 OPEN. Non-stress `Fork6`/`Fork6Hard` remains non-reproducing on current `dev`. Two infrastructure bugs adjacent to A4 were found and fixed 2026-07-02 (see that section below) — a takeover gate-polarity bug that made the default-on cross-thread STW JIT scan silently inert, and a defense-in-depth helper-window pass — but neither closes A4 itself, whose register-only residual remains gated on the deferred precise-JIT-stack-maps project. The 2026-07-01 aggressive `GC_STRESS` failures were **NOT A4** (zero live JIT frames, zero compiled JIT code at every STW) — root-caused as three unrelated concurrent-old-gen GC races, now FIXED on dev (`57f545be`); a later residual on that same lane is now fixed and archived at [`docs/internal/gcstress-residual-corruption-faces-FIXED.md`](../internal/gcstress-residual-corruption-faces-FIXED.md).
+**Status:** FIXED 2026-07-09. The real-FJP `Fork6`/`Fork6Hard` A4 repro is retired on dev after fixing live-blocked STW accounting, `Unsafe.compareAndExchange*` witness semantics, and real-FJP non-moving reference-local snapshots. The older concurrent-old-gen and later residual `GC_STRESS` bugs are also fixed and archived at [`docs/internal/gcstress-concurrent-oldgen-races-FIXED.md`](../gcstress-concurrent-oldgen-races-FIXED.md) and [`docs/internal/gcstress-residual-corruption-faces-FIXED.md`](../gcstress-residual-corruption-faces-FIXED.md).
 
 > ## Fix 2026-07-02 — the "default-on" takeover was silently inert; + an initiator-side blocked/helper-window scan; stress lane re-scoped as a separate JIT-free bug
 >
@@ -164,7 +175,7 @@
 > later residual corruption survived that fix on the same aggressive
 > lane, but is now **FIXED** too; full history is in
 > `docs/internal/gcstress-concurrent-oldgen-races-FIXED.md` and
-> [`docs/internal/gcstress-residual-corruption-faces-FIXED.md`](../internal/gcstress-residual-corruption-faces-FIXED.md).
+> [`docs/internal/gcstress-residual-corruption-faces-FIXED.md`](../gcstress-residual-corruption-faces-FIXED.md).
 >
 > **Validation (both-fixes binary `cvmp-fork6-hw2-20260702.exe`, real-FJP gate):**
 > plain `Fork6` ALL-OK; `Fork6Hard 256 40` ALL-OK; 8-way concurrent `Fork6` 8/8

@@ -36024,7 +36024,81 @@ fn native_unsafe_object_field_offset1(
     Ok(Some(Value::Long(synthetic as i64)))
 }
 
-/// Unsafe.compareAndExchangeInt — atomically sets field to update if current == expected,
+pub(crate) fn unsafe_compare_exchange_static_field(
+    ctx: &mut dyn NativeContext,
+    offset: usize,
+    expected: Value,
+    update: Value,
+) -> Option<Value> {
+    let (class_id, field_index) = unsafe_static_field_target(offset)?;
+    let mut attempts = 0usize;
+    loop {
+        let old = ctx.get_static_field(class_id, field_index);
+        if !unsafe_cas_values_equal(old.clone(), expected.clone()) {
+            return Some(old);
+        }
+        if unsafe_static_cas(ctx, offset, expected.clone(), update.clone()).unwrap_or(false) {
+            return Some(old);
+        }
+        attempts = attempts.wrapping_add(1);
+        if attempts % CAS_MAX_RETRIES == 0 {
+            std::thread::yield_now();
+        }
+    }
+}
+
+pub(crate) fn unsafe_compare_exchange_synthetic_field(
+    ctx: &mut dyn NativeContext,
+    obj: cratonvm_types::ObjectRef,
+    offset: usize,
+    expected: Value,
+    update: Value,
+) -> Value {
+    let mut attempts = 0usize;
+    loop {
+        let old = synthetic_get(ctx, obj, offset);
+        if !unsafe_cas_values_equal(old.clone(), expected.clone()) {
+            return old;
+        }
+        if synthetic_cas(ctx, obj, offset, expected.clone(), update.clone()) {
+            return old;
+        }
+        attempts = attempts.wrapping_add(1);
+        if attempts % CAS_MAX_RETRIES == 0 {
+            std::thread::yield_now();
+        }
+    }
+}
+
+pub(crate) fn unsafe_compare_exchange_heap_slot(
+    ctx: &mut dyn NativeContext,
+    obj: cratonvm_types::ObjectRef,
+    index: usize,
+    expected: Value,
+    update: Value,
+) -> Value {
+    let is_array = ctx.heap_kind_of(obj) == cratonvm_types::ObjectKind::Array;
+    let mut attempts = 0usize;
+    loop {
+        let old = if is_array {
+            ctx.get_array_element(obj, index)
+        } else {
+            ctx.get_field_volatile(obj, index)
+        };
+        if !unsafe_cas_values_equal(old.clone(), expected.clone()) {
+            return old;
+        }
+        if ctx.compare_and_swap_field(obj, index, expected.clone(), update.clone()) {
+            return old;
+        }
+        attempts = attempts.wrapping_add(1);
+        if attempts % CAS_MAX_RETRIES == 0 {
+            std::thread::yield_now();
+        }
+    }
+}
+
+/// Unsafe.compareAndExchangeInt atomically sets field to update if current == expected,
 /// returns the witness value (old value).
 fn native_unsafe_compare_and_exchange_int(
     ctx: &mut dyn NativeContext,
@@ -36040,39 +36114,44 @@ fn native_unsafe_compare_and_exchange_int(
         Some(Value::Int(v)) => *v,
         _ => 0,
     };
+    let expected_value = Value::Int(expected);
+    let update_value = Value::Int(update);
     if obj.is_none() {
-        if let Some((class_id, field_index)) = unsafe_static_field_target(offset) {
-            let old = ctx.get_static_field(class_id, field_index);
-            if let Value::Int(old_val) = old {
-                if old_val == expected {
-                    ctx.set_static_field(class_id, field_index, Value::Int(update));
-                }
-                return Ok(Some(Value::Int(old_val)));
-            }
-            return Ok(Some(Value::Int(expected)));
+        if let Some(old) = unsafe_compare_exchange_static_field(
+            ctx,
+            offset,
+            expected_value.clone(),
+            update_value.clone(),
+        ) {
+            return Ok(Some(match old {
+                Value::Int(v) => Value::Int(v),
+                _ => Value::Int(expected),
+            }));
         }
     }
     if let Some(obj_ref) = obj {
         let old = if is_synthetic_offset(offset) {
-            synthetic_get(ctx, obj_ref, offset)
+            unsafe_compare_exchange_synthetic_field(ctx, obj_ref, offset, expected_value, update_value)
         } else {
-            ctx.get_field_volatile(obj_ref, offset)
-        };
-        if let Value::Int(old_val) = old {
-            if old_val == expected {
-                if is_synthetic_offset(offset) {
-                    synthetic_put(ctx, obj_ref, offset, Value::Int(update));
-                } else {
-                    ctx.set_field_volatile(obj_ref, offset, Value::Int(update));
+            let index = if ctx.heap_kind_of(obj_ref) == cratonvm_types::ObjectKind::Array {
+                match unsafe_checked_array_index(ctx, obj_ref, offset) {
+                    Some(i) => i,
+                    None => return Ok(Some(Value::Int(expected))),
                 }
-            }
-            return Ok(Some(Value::Int(old_val)));
-        }
+            } else {
+                offset
+            };
+            unsafe_compare_exchange_heap_slot(ctx, obj_ref, index, expected_value, update_value)
+        };
+        return Ok(Some(match old {
+            Value::Int(v) => Value::Int(v),
+            _ => Value::Int(expected),
+        }));
     }
     Ok(Some(Value::Int(expected)))
 }
 
-/// Unsafe.compareAndExchangeLong — atomically sets field to update if current == expected.
+/// Unsafe.compareAndExchangeLong atomically sets field to update if current == expected.
 fn native_unsafe_compare_and_exchange_long(
     ctx: &mut dyn NativeContext,
     args: &[Value],
@@ -36087,95 +36166,77 @@ fn native_unsafe_compare_and_exchange_long(
         Some(Value::Long(v)) => *v,
         _ => 0,
     };
+    let expected_value = Value::Long(expected);
+    let update_value = Value::Long(update);
     if obj.is_none() {
-        if let Some((class_id, field_index)) = unsafe_static_field_target(offset) {
-            let old = ctx.get_static_field(class_id, field_index);
-            if let Value::Long(old_val) = old {
-                if old_val == expected {
-                    ctx.set_static_field(class_id, field_index, Value::Long(update));
-                }
-                return Ok(Some(Value::Long(old_val)));
-            }
-            return Ok(Some(Value::Long(expected)));
+        if let Some(old) = unsafe_compare_exchange_static_field(
+            ctx,
+            offset,
+            expected_value.clone(),
+            update_value.clone(),
+        ) {
+            return Ok(Some(match old {
+                Value::Long(v) => Value::Long(v),
+                _ => Value::Long(expected),
+            }));
         }
     }
     if let Some(obj_ref) = obj {
         let old = if is_synthetic_offset(offset) {
-            synthetic_get(ctx, obj_ref, offset)
+            unsafe_compare_exchange_synthetic_field(ctx, obj_ref, offset, expected_value, update_value)
         } else {
-            ctx.get_field_volatile(obj_ref, offset)
-        };
-        if let Value::Long(old_val) = old {
-            if old_val == expected {
-                if is_synthetic_offset(offset) {
-                    synthetic_put(ctx, obj_ref, offset, Value::Long(update));
-                } else {
-                    ctx.set_field_volatile(obj_ref, offset, Value::Long(update));
+            let index = if ctx.heap_kind_of(obj_ref) == cratonvm_types::ObjectKind::Array {
+                match unsafe_checked_array_index(ctx, obj_ref, offset) {
+                    Some(i) => i,
+                    None => return Ok(Some(Value::Long(expected))),
                 }
-            }
-            return Ok(Some(Value::Long(old_val)));
-        }
+            } else {
+                offset
+            };
+            unsafe_compare_exchange_heap_slot(ctx, obj_ref, index, expected_value, update_value)
+        };
+        return Ok(Some(match old {
+            Value::Long(v) => Value::Long(v),
+            _ => Value::Long(expected),
+        }));
     }
     Ok(Some(Value::Long(expected)))
 }
 
-/// Unsafe.compareAndExchangeReference — atomically sets field to update if current == expected.
+/// Unsafe.compareAndExchangeReference atomically sets field to update if current == expected.
 fn native_unsafe_compare_and_exchange_reference(
     ctx: &mut dyn NativeContext,
     args: &[Value],
 ) -> MethodCallResult {
     let obj = unsafe_obj(args, 1);
     let offset = unsafe_offset(args, 2);
+    let expected = recover_object_arg(args.get(3).copied().unwrap_or(Value::Object(None)));
+    let update = recover_object_arg(args.get(4).copied().unwrap_or(Value::Object(None)));
     if obj.is_none() {
-        if let Some((class_id, field_index)) = unsafe_static_field_target(offset) {
-            let old = ctx.get_static_field(class_id, field_index);
-            let expected_ref = match args.get(3) {
-                Some(Value::Object(r)) => *r,
-                _ => None,
-            };
-            let matches = match &old {
-                Value::Object(Some(a)) => expected_ref.is_some_and(|b| a.as_ptr() == b.as_ptr()),
-                Value::Object(None) => expected_ref.is_none(),
-                _ => false,
-            };
-            if matches {
-                let update = match args.get(4) {
-                    Some(v) => v.clone(),
-                    None => Value::Object(None),
-                };
-                ctx.set_static_field(class_id, field_index, update);
-            }
-            return Ok(Some(old));
+        if let Some(old) = unsafe_compare_exchange_static_field(
+            ctx,
+            offset,
+            expected.clone(),
+            update.clone(),
+        ) {
+            return Ok(Some(recover_object_arg(old)));
         }
     }
     if let Some(obj_ref) = obj {
         let old = if is_synthetic_offset(offset) {
-            synthetic_get(ctx, obj_ref, offset)
+            unsafe_compare_exchange_synthetic_field(ctx, obj_ref, offset, expected, update)
         } else {
-            ctx.get_field_volatile(obj_ref, offset)
-        };
-        // Compare by reference identity
-        let expected_ref = match args.get(3) {
-            Some(Value::Object(r)) => *r,
-            _ => None,
-        };
-        let matches = match (&old, &expected_ref) {
-            (Value::Object(Some(a)), Some(b)) => a.as_ptr() == b.as_ptr(),
-            (Value::Object(None), None) => true,
-            _ => false,
-        };
-        if matches {
-            let update = match args.get(4) {
-                Some(v) => v.clone(),
-                None => Value::Object(None),
-            };
-            if is_synthetic_offset(offset) {
-                synthetic_put(ctx, obj_ref, offset, update);
+            let index = if ctx.heap_kind_of(obj_ref) == cratonvm_types::ObjectKind::Array {
+                match unsafe_checked_array_index(ctx, obj_ref, offset) {
+                    Some(i) => i,
+                    None => return Ok(Some(Value::Object(None))),
+                }
             } else {
-                ctx.set_field_volatile(obj_ref, offset, update);
-            }
-        }
-        return Ok(Some(old));
+                offset
+            };
+            unsafe_compare_exchange_heap_slot(ctx, obj_ref, index, expected, update)
+        };
+        return Ok(Some(recover_object_arg(old)));
     }
     Ok(Some(Value::Object(None)))
 }

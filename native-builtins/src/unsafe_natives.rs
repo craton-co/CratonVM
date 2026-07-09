@@ -1476,83 +1476,130 @@ fn native_unsafe_release_fence(_ctx: &mut dyn NativeContext, _args: &[Value]) ->
 // strong CAS — see the weak-CAS note above for the rationale.
 
 fn cae_int_impl(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    // args: [unsafe, obj, offset(long), expected(int), new(int)]
     let offset = crate::unsafe_offset(args, 2);
-    let expected = args.get(3).copied().unwrap_or(Value::Int(0));
-    let new_val = args.get(4).copied().unwrap_or(Value::Int(0));
-    let obj = match crate::unsafe_obj(args, 1) {
-        Some(o) => o,
+    let expected_i = match args.get(3) {
+        Some(Value::Int(v)) => *v,
+        _ => 0,
+    };
+    let update_i = match args.get(4) {
+        Some(Value::Int(v)) => *v,
+        _ => 0,
+    };
+    let expected = Value::Int(expected_i);
+    let update = Value::Int(update_i);
+    match crate::unsafe_obj(args, 1) {
         None => {
-            // Static base: read current, CAS attempt. We can't reach the
-            // static-int side-store from here (private to lib.rs), so route
-            // through the existing cas helper for the side-effect and
-            // synthesise the prior value via a volatile read on the dummy
-            // base. In practice the no-obj path is rare (synthetic
-            // statics) and the value returned is sufficient.
-            // Read-then-CAS is racy by design (see spec note above).
+            if let Some(old) =
+                crate::unsafe_compare_exchange_static_field(ctx, offset, expected, update)
+            {
+                return Ok(Some(match old {
+                    Value::Int(v) => Value::Int(v),
+                    _ => Value::Int(expected_i),
+                }));
+            }
             let _ = crate::native_unsafe_cas_int(ctx, args)?;
-            return Ok(Some(expected));
+            Ok(Some(Value::Int(expected_i)))
         }
-    };
-    let current = if crate::is_synthetic_offset(offset) {
-        crate::synthetic_get(ctx, obj, offset)
-    } else if ctx.heap_kind_of(obj) == cratonvm_types::ObjectKind::Array {
-        let idx = crate::unsafe_array_index_from_offset(ctx, obj, offset);
-        ctx.get_array_element(obj, idx)
-    } else {
-        ctx.get_field_volatile(obj, offset)
-    };
-    // Attempt the CAS using the existing strong-CAS helper so we inherit
-    // the synthetic-offset, array, and synchronisation handling.
-    let _ = crate::native_unsafe_cas_int(ctx, args)?;
-    // Return the value we observed BEFORE the CAS attempt — on success
-    // it equals `expected`, on failure the caller uses it as the next
-    // retry's `expected`.
-    Ok(Some(current))
+        Some(obj) => {
+            let old = if crate::is_synthetic_offset(offset) {
+                crate::unsafe_compare_exchange_synthetic_field(ctx, obj, offset, expected, update)
+            } else {
+                let index = if ctx.heap_kind_of(obj) == cratonvm_types::ObjectKind::Array {
+                    match crate::unsafe_checked_array_index(ctx, obj, offset) {
+                        Some(i) => i,
+                        None => return Ok(Some(Value::Int(expected_i))),
+                    }
+                } else {
+                    offset
+                };
+                crate::unsafe_compare_exchange_heap_slot(ctx, obj, index, expected, update)
+            };
+            Ok(Some(match old {
+                Value::Int(v) => Value::Int(v),
+                _ => Value::Int(expected_i),
+            }))
+        }
+    }
 }
 
 fn cae_long_impl(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let offset = crate::unsafe_offset(args, 2);
-    let expected = args.get(3).copied().unwrap_or(Value::Long(0));
-    let obj = match crate::unsafe_obj(args, 1) {
-        Some(o) => o,
+    let expected_l = match args.get(3) {
+        Some(Value::Long(v)) => *v,
+        _ => 0,
+    };
+    let update_l = match args.get(4) {
+        Some(Value::Long(v)) => *v,
+        _ => 0,
+    };
+    let expected = Value::Long(expected_l);
+    let update = Value::Long(update_l);
+    match crate::unsafe_obj(args, 1) {
         None => {
+            if let Some(old) =
+                crate::unsafe_compare_exchange_static_field(ctx, offset, expected, update)
+            {
+                return Ok(Some(match old {
+                    Value::Long(v) => Value::Long(v),
+                    _ => Value::Long(expected_l),
+                }));
+            }
             let _ = crate::native_unsafe_cas_long(ctx, args)?;
-            return Ok(Some(expected));
+            Ok(Some(Value::Long(expected_l)))
         }
-    };
-    let current = if crate::is_synthetic_offset(offset) {
-        crate::synthetic_get(ctx, obj, offset)
-    } else if ctx.heap_kind_of(obj) == cratonvm_types::ObjectKind::Array {
-        let idx = crate::unsafe_array_index_from_offset(ctx, obj, offset);
-        ctx.get_array_element(obj, idx)
-    } else {
-        ctx.get_field_volatile(obj, offset)
-    };
-    let _ = crate::native_unsafe_cas_long(ctx, args)?;
-    Ok(Some(current))
+        Some(obj) => {
+            let old = if crate::is_synthetic_offset(offset) {
+                crate::unsafe_compare_exchange_synthetic_field(ctx, obj, offset, expected, update)
+            } else {
+                let index = if ctx.heap_kind_of(obj) == cratonvm_types::ObjectKind::Array {
+                    match crate::unsafe_checked_array_index(ctx, obj, offset) {
+                        Some(i) => i,
+                        None => return Ok(Some(Value::Long(expected_l))),
+                    }
+                } else {
+                    offset
+                };
+                crate::unsafe_compare_exchange_heap_slot(ctx, obj, index, expected, update)
+            };
+            Ok(Some(match old {
+                Value::Long(v) => Value::Long(v),
+                _ => Value::Long(expected_l),
+            }))
+        }
+    }
 }
 
 fn cae_object_impl(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let offset = crate::unsafe_offset(args, 2);
     let expected = crate::recover_object_arg(args.get(3).copied().unwrap_or(Value::Object(None)));
-    let obj = match crate::unsafe_obj(args, 1) {
-        Some(o) => o,
+    let update = crate::recover_object_arg(args.get(4).copied().unwrap_or(Value::Object(None)));
+    match crate::unsafe_obj(args, 1) {
         None => {
+            if let Some(old) =
+                crate::unsafe_compare_exchange_static_field(ctx, offset, expected, update)
+            {
+                return Ok(Some(crate::recover_object_arg(old)));
+            }
             let _ = crate::native_unsafe_cas_object(ctx, args)?;
-            return Ok(Some(expected));
+            Ok(Some(crate::recover_object_arg(expected)))
         }
-    };
-    let current = if crate::is_synthetic_offset(offset) {
-        crate::synthetic_get(ctx, obj, offset)
-    } else if ctx.heap_kind_of(obj) == cratonvm_types::ObjectKind::Array {
-        let idx = crate::unsafe_array_index_from_offset(ctx, obj, offset);
-        ctx.get_array_element(obj, idx)
-    } else {
-        ctx.get_field_volatile(obj, offset)
-    };
-    let _ = crate::native_unsafe_cas_object(ctx, args)?;
-    Ok(Some(current))
+        Some(obj) => {
+            let old = if crate::is_synthetic_offset(offset) {
+                crate::unsafe_compare_exchange_synthetic_field(ctx, obj, offset, expected, update)
+            } else {
+                let index = if ctx.heap_kind_of(obj) == cratonvm_types::ObjectKind::Array {
+                    match crate::unsafe_checked_array_index(ctx, obj, offset) {
+                        Some(i) => i,
+                        None => return Ok(Some(Value::Object(None))),
+                    }
+                } else {
+                    offset
+                };
+                crate::unsafe_compare_exchange_heap_slot(ctx, obj, index, expected, update)
+            };
+            Ok(Some(crate::recover_object_arg(old)))
+        }
+    }
 }
 
 fn native_unsafe_cae_int(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
@@ -2024,6 +2071,46 @@ mod tests {
         .unwrap();
         assert_eq!(r, Some(Value::Int(0)));
         assert_eq!(ctx.get_field(obj, 0), Value::Long(100));
+    }
+
+    #[test]
+    fn compare_and_exchange_reference_returns_varhandle_witness() {
+        let mut ctx = MockNativeContext::new();
+        let obj = ctx.alloc_object(ClassId::new(1), 1);
+        let current = ctx.create_string("current");
+        let replacement = ctx.create_string("replacement");
+        let stale = ctx.create_string("stale");
+        ctx.set_field(obj, 0, Value::Object(Some(current)));
+
+        let failed = native_unsafe_cae_object(
+            &mut ctx,
+            &[
+                dummy_this(),
+                Value::Object(Some(obj)),
+                Value::Long(0),
+                Value::Object(None),
+                Value::Object(Some(stale)),
+            ],
+        )
+        .expect("compareAndExchangeReference")
+        .expect("witness");
+        assert_eq!(failed, Value::Object(Some(current)));
+        assert_eq!(ctx.get_field(obj, 0), Value::Object(Some(current)));
+
+        let witness = native_unsafe_cae_object(
+            &mut ctx,
+            &[
+                dummy_this(),
+                Value::Object(Some(obj)),
+                Value::Long(0),
+                Value::Object(Some(current)),
+                Value::Object(Some(replacement)),
+            ],
+        )
+        .expect("compareAndExchangeReference success")
+        .expect("success witness");
+        assert_eq!(witness, Value::Object(Some(current)));
+        assert_eq!(ctx.get_field(obj, 0), Value::Object(Some(replacement)));
     }
 
     #[test]

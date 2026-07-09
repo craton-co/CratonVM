@@ -4,7 +4,7 @@ Status: **FIXED** — landed on `dev` as `60079fc4` (`fix(jit): validate heap me
 jit_invoke_virtual_mic`). Moved here from `docs/known-issues/` once fixed and independently re-verified.
 Severity: was **High** (real native SIGSEGV, not a misclassification) — root cause turned out to be the
 same defect already tracked centrally as the "A4" family in
-[`fork6-fjp-multithread-jit-root-reclamation.md`](fork6-fjp-multithread-jit-root-reclamation.md).
+[`fork6-fjp-multithread-jit-root-reclamation-FIXED.md`](fork6-fjp-multithread-jit-root-reclamation-FIXED.md).
 First confirmed: 2026-07-07, Azure worktree `test/wildfly-full-suite-20260707`, dev@37efdc4a
 Root-caused + fixed: 2026-07-07, two independent sessions converged on the same diagnosis —
 `wt-infinispan-remlist-0707` (branch `fix/infinispan-remove-listener-segfault-0707`, landed the fix as
@@ -119,7 +119,7 @@ day in [`wildfly-elytron-remoting-segfault-post-keyfactory-fix.md`](wildfly-elyt
 (`ElytronRemoteOutboundConnectionTestCase`) and
 [`wildfly-xnio-mockselector-mutex-segfault.md`](wildfly-xnio-mockselector-mutex-segfault.md) (which
 found it dominating 64% of `testsuite/integration/basic` CRASH classifications) — see
-[`fork6-fjp-multithread-jit-root-reclamation.md`](fork6-fjp-multithread-jit-root-reclamation.md) for the
+[`fork6-fjp-multithread-jit-root-reclamation-FIXED.md`](fork6-fjp-multithread-jit-root-reclamation-FIXED.md) for the
 central tracker. All three docs' original hypotheses were wrong in different ways (this doc: wrong
 function entirely via addr2line merge; the mockselector doc: wrong subsystem, `std::sync::Mutex`
 native-handle-UAF theory refuted the same day); all three converged on the identical gdb-confirmed stack.
@@ -222,7 +222,7 @@ Combined: **18 consecutive clean targeted repro attempts + 30/30 clean broader-s
 - [`wildfly-xnio-mockselector-mutex-segfault.md`](wildfly-xnio-mockselector-mutex-segfault.md) — same
   crash chain, confirmed the same day as the dominant blocker (64% CRASH rate) for
   `testsuite/integration/basic`.
-- [`fork6-fjp-multithread-jit-root-reclamation.md`](fork6-fjp-multithread-jit-root-reclamation.md) — the
+- [`fork6-fjp-multithread-jit-root-reclamation-FIXED.md`](fork6-fjp-multithread-jit-root-reclamation-FIXED.md) — the
   central "A4" tracker; this fix closes one concrete, high-frequency manifestation (the `L`/`[`
   JIT-arg-decode plausibility gap) but does **not** close the more general register-invisible-oop gap
   described there (that doc's own `Fork6Hard`/`GC_STRESS` repro is a different code path and remains
