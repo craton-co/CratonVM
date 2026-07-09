@@ -1382,10 +1382,10 @@ impl HprofWriter {
         class_info: &HprofClassInfo,
         all_classes: &std::collections::HashMap<u32, HprofClassInfo>,
     ) {
-        use cratonvm_gc::{class_layout, is_compact_object, ObjectHeader};
-        use cratonvm_gc::heap::SLOT_SIZE;
-        use cratonvm_types::FIELD_CELL_PAYLOAD64_OFFSET;
         use cratonvm_gc::heap::HEADER_SIZE;
+        use cratonvm_gc::heap::SLOT_SIZE;
+        use cratonvm_gc::{class_layout, is_compact_object, ObjectHeader};
+        use cratonvm_types::FIELD_CELL_PAYLOAD64_OFFSET;
 
         buf.push(Self::GC_INSTANCE_DUMP);
         buf.extend_from_slice(&obj.object_id.to_be_bytes());
@@ -1464,7 +1464,7 @@ impl HprofWriter {
                         } else if slot_offset + FIELD_CELL_PAYLOAD64_OFFSET + 8 <= obj.total_size {
                             unsafe {
                                 std::ptr::read_unaligned(
-                                    slot_ptr.add(FIELD_CELL_PAYLOAD64_OFFSET) as *const u64,
+                                    slot_ptr.add(FIELD_CELL_PAYLOAD64_OFFSET) as *const u64
                                 )
                             }
                         } else {
@@ -3618,14 +3618,15 @@ mod tests {
 
     #[test]
     fn test_hprof_instance_dump_reads_compact_ref_field_value() {
-        use cratonvm_gc::heap::{ObjectHeader, ObjectKind, ArrayElementType, HEADER_SIZE};
-        use cratonvm_types::{clear_class_layouts, CompactLayout, GC_FLAG_COMPACT};
+        use cratonvm_gc::heap::{ArrayElementType, ObjectHeader, ObjectKind, HEADER_SIZE};
         use cratonvm_gc::register_class_layout;
+        use cratonvm_types::{CompactLayout, GC_FLAG_COMPACT};
         use std::sync::Arc;
 
-        clear_class_layouts();
+        const CLASS_ID: u32 = 61_001;
+
         register_class_layout(
-            1,
+            CLASS_ID,
             Arc::new(CompactLayout {
                 field_offsets: vec![0],
                 is_ref: vec![true],
@@ -3635,9 +3636,9 @@ mod tests {
         );
 
         let classes_map: std::collections::HashMap<u32, HprofClassInfo> = [(
-            1u32,
+            CLASS_ID,
             HprofClassInfo {
-                class_id: 1,
+                class_id: CLASS_ID,
                 name: "RefHolder".to_string(),
                 super_class_id: 0,
                 instance_fields: vec![("ref".to_string(), "Ljava/lang/Object;".to_string())],
@@ -3653,7 +3654,7 @@ mod tests {
         let mut mem = vec![0u8; total_size];
         let expected_ref = 0x1_2345_6789_abcd_u64;
         let mut header = ObjectHeader::new(
-            cratonvm_types::ClassId::new(1),
+            cratonvm_types::ClassId::new(CLASS_ID),
             ObjectKind::Object,
             ArrayElementType::Boolean,
             0,
@@ -3667,10 +3668,10 @@ mod tests {
             std::ptr::write_unaligned(mem.as_mut_ptr().add(HEADER_SIZE) as *mut u64, expected_ref);
         }
 
-        let ci = classes_map.get(&1).unwrap();
+        let ci = classes_map.get(&CLASS_ID).unwrap();
         let obj = HprofObjectInfo {
             object_id: 0xABCD,
-            class_id: 1,
+            class_id: CLASS_ID,
             is_array: false,
             element_type: 0,
             array_length: 0,
@@ -3683,7 +3684,6 @@ mod tests {
 
         let fval = u64::from_be_bytes(buf[25..33].try_into().unwrap());
         assert_eq!(fval, expected_ref);
-        clear_class_layouts();
     }
 
     // --- HSDB protocol tests ---
