@@ -187,28 +187,23 @@ pub(crate) struct SsSide {
     pub listener_id: i32,
 }
 
-// GC note (gc-followups-20260706) — applies to sock/ss/ds/inet_addr side
-// tables in this file: values are plain data (no heap refs, no
-// use-after-free), but the KEY is the object's raw address, which goes stale
-// when a moving GC relocates the Socket/ServerSocket/etc. — subsequent
-// lookups from the relocated object miss and silently fall back to the
-// `unwrap_or(default)` state (e.g. a bound socket reads back port 0), and a
-// recycled address can alias another object's entry. Follow-up: re-key by
-// `ctx.identity_hash_code(obj)` (stable across moves), as the `(identity_key,
-// ObjectRef)` conversions elsewhere in this audit do.
-fn sock_side_table() -> &'static Mutex<HashMap<ObjectRef, SockSide>> {
-    static T: OnceLock<Mutex<HashMap<ObjectRef, SockSide>>> = OnceLock::new();
+// Socket and ServerSocket side-table state must survive object relocation.
+// Key these maps by identity hash rather than ObjectRef so a moving GC cannot
+// make an established socket look unconnected after its object address changes.
+fn sock_side_table() -> &'static Mutex<HashMap<i32, SockSide>> {
+    static T: OnceLock<Mutex<HashMap<i32, SockSide>>> = OnceLock::new();
     T.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
-fn ss_side_table() -> &'static Mutex<HashMap<ObjectRef, SsSide>> {
-    static T: OnceLock<Mutex<HashMap<ObjectRef, SsSide>>> = OnceLock::new();
+fn ss_side_table() -> &'static Mutex<HashMap<i32, SsSide>> {
+    static T: OnceLock<Mutex<HashMap<i32, SsSide>>> = OnceLock::new();
     T.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
-fn sock_get(this: ObjectRef) -> SockSide {
+fn sock_get(ctx: &dyn NativeContext, this: ObjectRef) -> SockSide {
+    let key = ctx.identity_hash_code(this);
     let t = sock_side_table().lock();
-    t.get(&this).copied().unwrap_or(SockSide {
+    t.get(&key).copied().unwrap_or(SockSide {
         host_id: 0,
         port: 0,
         local_port: 0,
@@ -219,9 +214,10 @@ fn sock_get(this: ObjectRef) -> SockSide {
     })
 }
 
-fn sock_set<F: FnOnce(&mut SockSide)>(this: ObjectRef, f: F) {
+fn sock_set<F: FnOnce(&mut SockSide)>(ctx: &dyn NativeContext, this: ObjectRef, f: F) {
+    let key = ctx.identity_hash_code(this);
     let mut t = sock_side_table().lock();
-    let entry = t.entry(this).or_insert(SockSide {
+    let entry = t.entry(key).or_insert(SockSide {
         host_id: 0,
         port: 0,
         local_port: 0,
@@ -241,8 +237,8 @@ fn sock_set<F: FnOnce(&mut SockSide)>(this: ObjectRef, f: F) {
 /// connection) when that factory might apply configuration — like cipher
 /// restriction via `SSLSocket.setEnabledCipherSuites` — that only takes
 /// effect through the real Java call chain.
-pub(crate) fn sock_stream_id_for_upcall(this: ObjectRef) -> i32 {
-    sock_get(this).stream_id
+pub(crate) fn sock_stream_id_for_upcall(ctx: &dyn NativeContext, this: ObjectRef) -> i32 {
+    sock_get(ctx, this).stream_id
 }
 
 /// FIX (netty-client-socket-write-after-close): companion to
@@ -264,15 +260,15 @@ pub(crate) fn sock_stream_id_for_upcall(this: ObjectRef) -> i32 {
 /// every write on a `createSocket(host,port)`-obtained socket as though the
 /// stream had already been closed. These accessors let phases_late.rs fall
 /// back to the side table when the raw field isn't a valid entry.
-pub(crate) fn sock_mark_closed_for_upcall(this: ObjectRef) {
-    sock_set(this, |s| {
+pub(crate) fn sock_mark_closed_for_upcall(ctx: &dyn NativeContext, this: ObjectRef) {
+    sock_set(ctx, this, |s| {
         s.closed = 1;
         s.stream_id = -1;
     });
 }
 
-pub(crate) fn sock_is_closed_for_upcall(this: ObjectRef) -> bool {
-    sock_get(this).closed != 0
+pub(crate) fn sock_is_closed_for_upcall(ctx: &dyn NativeContext, this: ObjectRef) -> bool {
+    sock_get(ctx, this).closed != 0
 }
 
 /// FIX (netty-client-socket-write-after-close): let `phases_late.rs`'s
@@ -291,8 +287,13 @@ pub(crate) fn sock_is_closed_for_upcall(this: ObjectRef) -> bool {
 /// collision this file's own `SockSide` table was introduced to avoid for
 /// plain `java.net.Socket`/`ServerSocket`/`DatagramSocket`; `SSLSocket`
 /// needs the same treatment.
-pub(crate) fn sock_set_for_create(this: ObjectRef, port: i32, stream_id: i32) {
-    sock_set(this, |s| {
+pub(crate) fn sock_set_for_create(
+    ctx: &dyn NativeContext,
+    this: ObjectRef,
+    port: i32,
+    stream_id: i32,
+) {
+    sock_set(ctx, this, |s| {
         s.port = port;
         s.local_port = 0;
         s.closed = 0;
@@ -300,9 +301,10 @@ pub(crate) fn sock_set_for_create(this: ObjectRef, port: i32, stream_id: i32) {
     });
 }
 
-fn ss_get(this: ObjectRef) -> SsSide {
+fn ss_get(ctx: &dyn NativeContext, this: ObjectRef) -> SsSide {
+    let key = ctx.identity_hash_code(this);
     let t = ss_side_table().lock();
-    t.get(&this).copied().unwrap_or(SsSide {
+    t.get(&key).copied().unwrap_or(SsSide {
         port: -1,
         backlog: 50,
         closed: 0,
@@ -310,9 +312,10 @@ fn ss_get(this: ObjectRef) -> SsSide {
     })
 }
 
-fn ss_set<F: FnOnce(&mut SsSide)>(this: ObjectRef, f: F) {
+fn ss_set<F: FnOnce(&mut SsSide)>(ctx: &dyn NativeContext, this: ObjectRef, f: F) {
+    let key = ctx.identity_hash_code(this);
     let mut t = ss_side_table().lock();
-    let entry = t.entry(this).or_insert(SsSide {
+    let entry = t.entry(key).or_insert(SsSide {
         port: -1,
         backlog: 50,
         closed: 0,
@@ -2609,7 +2612,7 @@ fn re1_socket_read_stream(
             "read out of range: off={off} len={ln} cap={cap}"
         )));
     }
-    let stream_id = sock_get(this).stream_id;
+    let stream_id = sock_get(ctx, this).stream_id;
     if stream_id < 0 {
         return Err(ioex("Socket not connected"));
     }
@@ -2666,7 +2669,7 @@ fn re1_socket_write_stream(
         return Ok(None);
     }
     let data = java_byte_array_to_vec(ctx, buf, offset, length)?;
-    let stream_id = sock_get(this).stream_id;
+    let stream_id = sock_get(ctx, this).stream_id;
     if stream_id < 0 {
         return Err(ioex("Socket not connected"));
     }
@@ -2756,7 +2759,7 @@ fn re1_connect_socket(
     let stream_id = s2_alloc_stream(stream);
     let host_str = ctx.create_string(host);
     ctx.set_field(this, SOCK_HOST, Value::Object(Some(host_str)));
-    sock_set(this, |s| {
+    sock_set(ctx, this, |s| {
         s.port = port;
         s.local_port = local_port;
         s.closed = 0;
@@ -2777,7 +2780,7 @@ fn register_re1_socket(r: &mut NativeMethodRegistry) {
     r.register(sock, "<init>", "()V", |ctx, args| {
         let this = obj_arg(args, 0)?;
         ctx.set_field(this, SOCK_HOST, Value::Object(None));
-        sock_set(this, |s| {
+        sock_set(ctx, this, |s| {
             s.port = 0;
             s.local_port = 0;
             s.closed = 0;
@@ -2844,48 +2847,48 @@ fn register_re1_socket(r: &mut NativeMethodRegistry) {
         let this = obj_arg(args, 0)?;
         if let Some(Value::Object(Some(sa))) = args.get(1) {
             let (_, port) = read_inet_socket_address(ctx, *sa)?;
-            sock_set(this, |s| s.local_port = port);
+            sock_set(ctx, this, |s| s.local_port = port);
         }
         Ok(None)
     });
 
-    r.register(sock, "isConnected", "()Z", |_ctx, args| {
+    r.register(sock, "isConnected", "()Z", |ctx, args| {
         let this = obj_arg(args, 0)?;
-        let s = sock_get(this);
+        let s = sock_get(ctx, this);
         Ok(Some(Value::Int(if s.stream_id >= 0 && s.closed == 0 {
             1
         } else {
             0
         })))
     });
-    r.register(sock, "isClosed", "()Z", |_ctx, args| {
+    r.register(sock, "isClosed", "()Z", |ctx, args| {
         let this = obj_arg(args, 0)?;
-        Ok(Some(Value::Int(if sock_get(this).closed != 0 {
+        Ok(Some(Value::Int(if sock_get(ctx, this).closed != 0 {
             1
         } else {
             0
         })))
     });
 
-    r.register(sock, "close", "()V", |_ctx, args| {
+    r.register(sock, "close", "()V", |ctx, args| {
         let this = obj_arg(args, 0)?;
-        let sid = sock_get(this).stream_id;
+        let sid = sock_get(ctx, this).stream_id;
         if sid >= 0 {
             let mut reg = s2_registry().lock();
             if let Some(stream) = reg.streams.remove(&sid) {
                 let _ = stream.shutdown(std::net::Shutdown::Both);
             }
         }
-        sock_set(this, |s| {
+        sock_set(ctx, this, |s| {
             s.stream_id = -1;
             s.closed = 1;
         });
         Ok(None)
     });
 
-    r.register(sock, "shutdownInput", "()V", |_ctx, args| {
+    r.register(sock, "shutdownInput", "()V", |ctx, args| {
         let this = obj_arg(args, 0)?;
-        let sid = sock_get(this).stream_id;
+        let sid = sock_get(ctx, this).stream_id;
         if sid >= 0 {
             let reg = s2_registry().lock();
             if let Some(stream) = reg.streams.get(&sid) {
@@ -2900,12 +2903,12 @@ fn register_re1_socket(r: &mut NativeMethodRegistry) {
                     .map_err(|e| ioex(format!("shutdown read failed: {e}")))?;
             }
         }
-        sock_set(this, |s| s.input_shutdown = 1);
+        sock_set(ctx, this, |s| s.input_shutdown = 1);
         Ok(None)
     });
-    r.register(sock, "shutdownOutput", "()V", |_ctx, args| {
+    r.register(sock, "shutdownOutput", "()V", |ctx, args| {
         let this = obj_arg(args, 0)?;
-        let sid = sock_get(this).stream_id;
+        let sid = sock_get(ctx, this).stream_id;
         if sid >= 0 {
             let reg = s2_registry().lock();
             if let Some(stream) = reg.streams.get(&sid) {
@@ -2920,7 +2923,7 @@ fn register_re1_socket(r: &mut NativeMethodRegistry) {
                     .map_err(|e| ioex(format!("shutdown write failed: {e}")))?;
             }
         }
-        sock_set(this, |s| s.output_shutdown = 1);
+        sock_set(ctx, this, |s| s.output_shutdown = 1);
         Ok(None)
     });
     // FIX (netty-client-socket-write-after-close residual): isInputShutdown/
@@ -2940,22 +2943,22 @@ fn register_re1_socket(r: &mut NativeMethodRegistry) {
     // DefaultBHttpClientConnection$1.checkTLS, no CratonVM native or
     // exception involved at all up to that point — the socket was never
     // actually shut down).
-    r.register(sock, "isInputShutdown", "()Z", |_ctx, args| {
+    r.register(sock, "isInputShutdown", "()Z", |ctx, args| {
         let this = obj_arg(args, 0)?;
-        Ok(Some(Value::Int(sock_get(this).input_shutdown)))
+        Ok(Some(Value::Int(sock_get(ctx, this).input_shutdown)))
     });
-    r.register(sock, "isOutputShutdown", "()Z", |_ctx, args| {
+    r.register(sock, "isOutputShutdown", "()Z", |ctx, args| {
         let this = obj_arg(args, 0)?;
-        Ok(Some(Value::Int(sock_get(this).output_shutdown)))
+        Ok(Some(Value::Int(sock_get(ctx, this).output_shutdown)))
     });
 
-    r.register(sock, "setSoTimeout", "(I)V", |_ctx, args| {
+    r.register(sock, "setSoTimeout", "(I)V", |ctx, args| {
         let this = obj_arg(args, 0)?;
         let ms = args.get(1).and_then(|v| v.as_int()).unwrap_or(0);
         if ms < 0 {
             return Err(iae(format!("negative SO_TIMEOUT: {ms}")));
         }
-        let sid = sock_get(this).stream_id;
+        let sid = sock_get(ctx, this).stream_id;
         if sid >= 0 {
             let d = if ms == 0 {
                 None
@@ -3001,9 +3004,9 @@ fn register_re1_socket(r: &mut NativeMethodRegistry) {
     // (set by `setSoTimeout` above) directly instead of going through
     // `getImpl()` at all — same side-table-based approach `setSoTimeout`
     // already uses.
-    r.register(sock, "getSoTimeout", "()I", |_ctx, args| {
+    r.register(sock, "getSoTimeout", "()I", |ctx, args| {
         let this = obj_arg(args, 0)?;
-        let sid = sock_get(this).stream_id;
+        let sid = sock_get(ctx, this).stream_id;
         if sid >= 0 {
             let reg = s2_registry().lock();
             if let Some(stream) = reg.streams.get(&sid) {
@@ -3030,13 +3033,13 @@ fn register_re1_socket(r: &mut NativeMethodRegistry) {
         Ok(Some(Value::Int(0)))
     });
 
-    r.register(sock, "getPort", "()I", |_ctx, args| {
+    r.register(sock, "getPort", "()I", |ctx, args| {
         let this = obj_arg(args, 0)?;
-        Ok(Some(Value::Int(sock_get(this).port)))
+        Ok(Some(Value::Int(sock_get(ctx, this).port)))
     });
-    r.register(sock, "getLocalPort", "()I", |_ctx, args| {
+    r.register(sock, "getLocalPort", "()I", |ctx, args| {
         let this = obj_arg(args, 0)?;
-        Ok(Some(Value::Int(sock_get(this).local_port)))
+        Ok(Some(Value::Int(sock_get(ctx, this).local_port)))
     });
     r.register(
         sock,
@@ -3089,7 +3092,7 @@ fn register_re1_socket(r: &mut NativeMethodRegistry) {
         "()Ljava/io/InputStream;",
         |ctx, args| {
             let this = obj_arg(args, 0)?;
-            let sid = sock_get(this).stream_id;
+            let sid = sock_get(ctx, this).stream_id;
             if sid < 0 {
                 return Err(ioex("Socket.getInputStream: not connected"));
             }
@@ -3107,7 +3110,7 @@ fn register_re1_socket(r: &mut NativeMethodRegistry) {
         "()Ljava/io/OutputStream;",
         |ctx, args| {
             let this = obj_arg(args, 0)?;
-            let sid = sock_get(this).stream_id;
+            let sid = sock_get(ctx, this).stream_id;
             if sid < 0 {
                 return Err(ioex("Socket.getOutputStream: not connected"));
             }
@@ -3188,7 +3191,7 @@ fn register_re1_socket(r: &mut NativeMethodRegistry) {
     r.register(sos, "flush", "()V", |ctx, args| {
         let this = obj_arg(args, 0)?;
         if let Some(owner) = stream_owner_get(ctx, this) {
-            let sid = sock_get(owner).stream_id;
+            let sid = sock_get(ctx, owner).stream_id;
             if sid >= 0 {
                 let mut reg = s2_registry().lock();
                 if let Some(stream) = reg.streams.get_mut(&sid) {
@@ -3374,7 +3377,7 @@ fn re2_accept_into(
     let host_str = ctx.create_string(&peer_ip);
     let target = ctx.read_native_pin(target_pin, target);
     ctx.set_field(target, SOCK_HOST, Value::Object(Some(host_str)));
-    sock_set(target, |s| {
+    sock_set(ctx, target, |s| {
         s.port = peer_port;
         s.local_port = local_port;
         s.closed = 0;
@@ -3397,12 +3400,13 @@ fn re2_bind_listener(
     let addr = SocketAddr::new(ip, port.clamp(0, 65535) as u16);
     let listener =
         TcpListener::bind(addr).map_err(|e| ioex(format!("BindException: {addr}: {e}")))?;
-    let actual_port = listener
-        .local_addr()
-        .map(|a| a.port() as i32)
-        .unwrap_or(port);
+    let local_addr = listener.local_addr().ok();
+    let actual_port = local_addr.map(|a| a.port() as i32).unwrap_or(port);
+    let actual_host = local_addr
+        .map(|a| a.ip().to_string())
+        .unwrap_or_else(|| ip.to_string());
     let listener_id = s2_alloc_listener(listener);
-    ss_set(this, |s| {
+    ss_set(ctx, this, |s| {
         s.port = actual_port;
         s.backlog = backlog.max(0);
         s.closed = 0;
@@ -3418,7 +3422,11 @@ fn re2_bind_listener(
     // lets that winner return the real ephemeral port instead of 0 — without which
     // `new ServerSocket(0).getLocalPort()` is 0 and any connect-to-advertised-port
     // (Narayana's TransactionStatusManager recovery listener) fails / hangs.
-    cratonvm_native_api::server_socket_ports::record(ctx.identity_hash_code(this), actual_port);
+    cratonvm_native_api::server_socket_ports::record_addr(
+        ctx.identity_hash_code(this),
+        &actual_host,
+        actual_port,
+    );
     Ok(None)
 }
 
@@ -3437,7 +3445,7 @@ fn re2_server_socket_bind(ctx: &mut dyn NativeContext, args: &[Value]) -> Method
     let backlog = args
         .get(2)
         .and_then(|v| v.as_int())
-        .unwrap_or_else(|| ss_get(this).backlog);
+        .unwrap_or_else(|| ss_get(ctx, this).backlog);
     re2_bind_listener(ctx, this, &host, port, backlog)
 }
 
@@ -3456,14 +3464,14 @@ fn re2_server_socket_bind(ctx: &mut dyn NativeContext, args: &[Value]) -> Method
 /// drain on teardown, then throws
 /// `AssertionError: Gave up waiting for queue to shut down` (BUG: it polluted
 /// every Spring HTTP-client test teardown). Mirrors the BUG-04 plain-bind hook.
-fn re2_server_socket_close(_ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+fn re2_server_socket_close(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = obj_arg(args, 0)?;
-    let lid = ss_get(this).listener_id;
+    let lid = ss_get(ctx, this).listener_id;
     if lid >= 0 {
         s2_registry().lock().listeners.remove(&lid);
         re2_clear_accept_timeout(lid);
     }
-    ss_set(this, |s| {
+    ss_set(ctx, this, |s| {
         s.closed = 1;
         s.listener_id = -1;
     });
@@ -3488,9 +3496,9 @@ fn register_re2_server_socket(r: &mut NativeMethodRegistry) {
     cratonvm_native_api::plain_server_socket_close::set(re2_server_socket_close);
     let ss = "java/net/ServerSocket";
 
-    r.register(ss, "<init>", "()V", |_ctx, args| {
+    r.register(ss, "<init>", "()V", |ctx, args| {
         let this = obj_arg(args, 0)?;
-        ss_set(this, |s| {
+        ss_set(ctx, this, |s| {
             s.port = -1;
             s.backlog = 50;
             s.closed = 0;
@@ -3505,9 +3513,9 @@ fn register_re2_server_socket(r: &mut NativeMethodRegistry) {
         re2_bind_listener(ctx, this, "0.0.0.0", port, 50)
     });
 
-    r.register(ss, "getLocalPort", "()I", |_ctx, args| {
+    r.register(ss, "getLocalPort", "()I", |ctx, args| {
         let this = obj_arg(args, 0)?;
-        let p = ss_get(this).port;
+        let p = ss_get(ctx, this).port;
         Ok(Some(Value::Int(p)))
     });
 
@@ -3547,7 +3555,7 @@ fn register_re2_server_socket(r: &mut NativeMethodRegistry) {
 
     r.register(ss, "accept", "()Ljava/net/Socket;", |ctx, args| {
         let this = obj_arg(args, 0)?;
-        let s = ss_get(this);
+        let s = ss_get(ctx, this);
         if s.closed != 0 {
             return Err(ioex("Socket is closed"));
         }
@@ -3555,7 +3563,7 @@ fn register_re2_server_socket(r: &mut NativeMethodRegistry) {
         let timeout_ms = re2_accept_timeout_for(lid);
         let sock = alloc_concurrent_synthetic(ctx, "java/net/Socket", 5);
         ctx.set_field(sock, SOCK_HOST, Value::Object(None));
-        sock_set(sock, |x| {
+        sock_set(ctx, sock, |x| {
             x.port = 0;
             x.local_port = 0;
             x.closed = 0;
@@ -3565,19 +3573,19 @@ fn register_re2_server_socket(r: &mut NativeMethodRegistry) {
         re2_accept_into(ctx, lid, sock, timeout_ms)
     });
 
-    r.register(ss, "setSoTimeout", "(I)V", |_ctx, args| {
+    r.register(ss, "setSoTimeout", "(I)V", |ctx, args| {
         let this = obj_arg(args, 0)?;
         let ms = args.get(1).and_then(|v| v.as_int()).unwrap_or(0);
         if ms < 0 {
             return Err(iae(format!("negative SO_TIMEOUT: {ms}")));
         }
-        let lid = ss_get(this).listener_id;
+        let lid = ss_get(ctx, this).listener_id;
         re2_set_accept_timeout(lid, ms);
         Ok(None)
     });
-    r.register(ss, "getSoTimeout", "()I", |_ctx, args| {
+    r.register(ss, "getSoTimeout", "()I", |ctx, args| {
         let this = obj_arg(args, 0)?;
-        let lid = ss_get(this).listener_id;
+        let lid = ss_get(ctx, this).listener_id;
         Ok(Some(Value::Int(re2_accept_timeout_for(lid))))
     });
 
@@ -3597,14 +3605,14 @@ fn register_re2_server_socket(r: &mut NativeMethodRegistry) {
 
     r.register(ss, "close", "()V", re2_server_socket_close);
 
-    r.register(ss, "isBound", "()Z", |_ctx, args| {
+    r.register(ss, "isBound", "()Z", |ctx, args| {
         let this = obj_arg(args, 0)?;
-        let lid = ss_get(this).listener_id;
+        let lid = ss_get(ctx, this).listener_id;
         Ok(Some(Value::Int(if lid >= 0 { 1 } else { 0 })))
     });
-    r.register(ss, "isClosed", "()Z", |_ctx, args| {
+    r.register(ss, "isClosed", "()Z", |ctx, args| {
         let this = obj_arg(args, 0)?;
-        Ok(Some(Value::Int(ss_get(this).closed)))
+        Ok(Some(Value::Int(ss_get(ctx, this).closed)))
     });
 
     r.register(
@@ -3613,7 +3621,7 @@ fn register_re2_server_socket(r: &mut NativeMethodRegistry) {
         "()Ljava/net/SocketAddress;",
         |ctx, args| {
             let this = obj_arg(args, 0)?;
-            let lid = ss_get(this).listener_id;
+            let lid = ss_get(ctx, this).listener_id;
             if lid < 0 {
                 return Ok(Some(Value::Object(None)));
             }
@@ -3625,9 +3633,9 @@ fn register_re2_server_socket(r: &mut NativeMethodRegistry) {
                     .map(|a| (a.ip().to_string(), a.port() as i32))
             };
             match local {
-                Some((ip, port)) => Ok(Some(Value::Object(Some(alloc_inet_socket_address(
-                    ctx, &ip, port,
-                ))))),
+                Some((ip, port)) => Ok(Some(Value::Object(Some(
+                    alloc_inet_socket_address_resolved(ctx, &ip, &ip, port),
+                )))),
                 None => Ok(Some(Value::Object(None))),
             }
         },
@@ -3651,7 +3659,7 @@ fn register_re2_server_socket(r: &mut NativeMethodRegistry) {
         "()Ljava/net/InetAddress;",
         |ctx, args| {
             let this = obj_arg(args, 0)?;
-            let mut lid = ss_get(this).listener_id;
+            let mut lid = ss_get(ctx, this).listener_id;
             if lid < 0 {
                 lid = ctx.get_field(this, SS_LISTENER_ID).as_int().unwrap_or(-1);
             }
@@ -8174,7 +8182,7 @@ fn register_re6_ssl_context(r: &mut NativeMethodRegistry) {
             let sock = alloc_concurrent_synthetic(ctx, "javax/net/ssl/SSLSocket", 5);
             let host_s = ctx.create_string(&host);
             ctx.set_field(sock, SOCK_HOST, Value::Object(Some(host_s)));
-            sock_set(sock, |s| {
+            sock_set(ctx, sock, |s| {
                 s.port = port;
                 s.local_port = 0;
                 s.closed = 0;
@@ -8259,7 +8267,7 @@ fn register_re6_ssl_context(r: &mut NativeMethodRegistry) {
                 return Ok(None);
             }
             let host = read_field_string_or(ctx, this, SOCK_HOST, "");
-            let side = sock_get(this);
+            let side = sock_get(ctx, this);
             if host.is_empty() || side.port <= 0 {
                 return Ok(None);
             }
@@ -8289,7 +8297,7 @@ fn register_re6_ssl_context(r: &mut NativeMethodRegistry) {
                         let _ = crate::servlet::s2_tls_close(side.stream_id);
                     }
                     let new_id = crate::servlet::RUSTLS_SOCK_ID_BASE + rid;
-                    sock_set(this, |s| {
+                    sock_set(ctx, this, |s| {
                         s.stream_id = new_id;
                     });
                     Ok(None)

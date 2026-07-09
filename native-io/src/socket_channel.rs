@@ -176,6 +176,7 @@ fn tcp_remove(id: i32) {
 }
 
 const ACCEPT_CLOSE_POLL: Duration = Duration::from_millis(10);
+const LINGERING_CHANNEL_CLOSE_DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
 
 fn tcp_listener_still_registered(id: i32) -> bool {
     matches!(tcp_registry().read().get(&id), Some(TcpHandle::Listener(_)))
@@ -211,6 +212,35 @@ fn accept_close_aware(
             Err(e) => return Err(e),
         }
     }
+}
+
+fn lingering_channel_close(id: i32, stream: &TcpStream) {
+    let Ok(mut drain_stream) = stream.try_clone() else {
+        let _ = stream.shutdown(std::net::Shutdown::Write);
+        return;
+    };
+    let _ = stream.shutdown(std::net::Shutdown::Write);
+    let _ = std::thread::Builder::new()
+        .name(format!("cratonvm-tomcat0807-http-close-{id:x}"))
+        .spawn(move || {
+            let _ = drain_stream.set_nonblocking(false);
+            let _ = drain_stream.set_read_timeout(Some(LINGERING_CHANNEL_CLOSE_DRAIN_TIMEOUT));
+            let mut buf = [0u8; 1024];
+            loop {
+                match drain_stream.read(&mut buf) {
+                    Ok(0) => break,
+                    Ok(_) => continue,
+                    Err(e)
+                        if e.kind() == ErrorKind::WouldBlock
+                            || e.kind() == ErrorKind::TimedOut
+                            || e.kind() == ErrorKind::Interrupted =>
+                    {
+                        break;
+                    }
+                    Err(_) => break,
+                }
+            }
+        });
 }
 
 // ---------------------------------------------------------------------------
@@ -850,17 +880,20 @@ fn sc_configure_blocking(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
 fn sc_close(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     if let Some(this) = obj_or_none(args, 0) {
         if let Some(id) = read_reg_id(ctx, this) {
-            // Force a FIN now. A selector this channel was registered with holds
-            // a `try_clone()`d duplicate of the socket (see
-            // `nio_selector::selector_register`); on Windows, closing only the
-            // original handle (the `tcp_remove` below) does NOT shut the
+            // Force the write-side FIN now. A selector this channel was
+            // registered with holds a `try_clone()`d duplicate of the socket
+            // (see `nio_selector::selector_register`); on Windows, closing only
+            // the original handle (the `tcp_remove` below) does NOT shut the
             // connection while that duplicate is alive, so the peer's blocking
-            // read never sees EOF and hangs forever. Shutting the socket down
-            // explicitly emits FIN regardless of any outstanding duplicate.
+            // read never sees EOF and hangs forever. Do not use
+            // `Shutdown::Both`: if the peer is still sending request-body bytes,
+            // aborting the read side is RST-prone on Windows and surfaces to the
+            // client as WSAECONNABORTED instead of the graceful close Tomcat's
+            // swallow-input path expects.
             {
                 let map = tcp_registry().read();
                 if let Some(TcpHandle::Stream(s)) = map.get(&id) {
-                    let _ = s.shutdown(std::net::Shutdown::Both);
+                    lingering_channel_close(id, s);
                 }
             }
             // Drop the selector's cloned handle too, mirroring the JDK where
@@ -2434,7 +2467,28 @@ fn ssc_local_address(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallR
             .unwrap_or_else(|_| "0.0.0.0".to_string()),
         _ => "0.0.0.0".to_string(),
     };
-    let h = ctx.create_string(&host);
+    new_resolved_inet_socket_address(ctx, &host, port)
+}
+
+fn new_resolved_inet_socket_address(
+    ctx: &mut dyn NativeContext,
+    host: &str,
+    port: i32,
+) -> MethodCallResult {
+    let h = ctx.create_string(host);
+    if let Ok(Some(Value::Object(Some(addr)))) = ctx.invoke(
+        "java/net/InetAddress",
+        "getByName",
+        "(Ljava/lang/String;)Ljava/net/InetAddress;",
+        &[Value::Object(Some(h))],
+    ) {
+        return ctx.new_object_initialized(
+            "java/net/InetSocketAddress",
+            "(Ljava/net/InetAddress;I)V",
+            &[Value::Object(Some(addr)), Value::Int(port)],
+        );
+    }
+    let h = ctx.create_string(host);
     ctx.new_object_initialized(
         "java/net/InetSocketAddress",
         "(Ljava/lang/String;I)V",
@@ -2527,31 +2581,32 @@ fn ss_wrapper_local_address(ctx: &mut dyn NativeContext, args: &[Value]) -> Meth
         };
         (port, host)
     } else {
-        // Plain ServerSocket — read the port recorded by the binder (BUG-04),
-        // same channel ss_wrapper_local_port uses. No channel registry entry
-        // to resolve a real host from here, so keep the wildcard text.
-        let port = cratonvm_native_api::server_socket_ports::get(ctx.identity_hash_code(this))
-            .unwrap_or(0);
-        (port, "0.0.0.0".to_string())
+        // Plain ServerSocket — read the address recorded by the binder (BUG-04),
+        // same channel ss_wrapper_local_port uses. The binder lives in
+        // native-builtins, while this last-registered wrapper lives in native-io,
+        // so the native-api side table is the cross-crate handoff.
+        let identity = ctx.identity_hash_code(this);
+        match cratonvm_native_api::server_socket_ports::get_addr(identity) {
+            Some((host, port)) => (port, host),
+            None => (
+                cratonvm_native_api::server_socket_ports::get(identity).unwrap_or(0),
+                "0.0.0.0".to_string(),
+            ),
+        }
     };
     if port <= 0 {
         return Ok(Some(Value::Object(None)));
     }
-    // Build via the REAL `InetSocketAddress(String,int)` ctor (like
+    // Build via the REAL `InetSocketAddress(InetAddress,int)` ctor (like
     // `ssc_local_address` above), NOT a flat 2-slot synthetic: the real
     // `getPort()`/`getHostString()`/`toString()` bytecode reads
     // `this.holder.port` / `this.holder.hostname`, and a flat object has a null
     // `holder` → `getPort()` returns 0. okhttp's `MockWebServer.getPort()` reads
     // `(serverSocket.localSocketAddress as InetSocketAddress).port`, so the flat
     // object made it 0 → every Spring HTTP-client test connected to
-    // `http://localhost:0` and failed (BUG-04). The real ctor populates the
-    // holder so `getPort()` returns the bound ephemeral port.
-    let h = ctx.create_string(&host);
-    ctx.new_object_initialized(
-        "java/net/InetSocketAddress",
-        "(Ljava/lang/String;I)V",
-        &[Value::Object(Some(h)), Value::Int(port)],
-    )
+    // `http://localhost:0` and failed (BUG-04). The resolved real ctor also
+    // populates holder.addr, which WildFly's process controller dereferences.
+    new_resolved_inet_socket_address(ctx, &host, port)
 }
 
 fn ss_wrapper_is_bound(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
@@ -2736,5 +2791,27 @@ mod tests {
         // Block on the server side to confirm bytes arrived.
         let got = server.join().unwrap();
         assert_eq!(got.as_slice(), &b"hello"[..n as usize]);
+    }
+
+    #[test]
+    fn tomcat0807_http_lingering_channel_close_drains_peer_upload() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = std::thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            lingering_channel_close(0x0807, &stream);
+            drop(stream);
+        });
+
+        let mut client = TcpStream::connect(("127.0.0.1", port)).unwrap();
+        server.join().unwrap();
+
+        let chunk = [b'x'; 8192];
+        for _ in 0..64 {
+            client
+                .write_all(&chunk)
+                .expect("client upload write should not be reset by channel close");
+        }
+        let _ = client.shutdown(std::net::Shutdown::Write);
     }
 }

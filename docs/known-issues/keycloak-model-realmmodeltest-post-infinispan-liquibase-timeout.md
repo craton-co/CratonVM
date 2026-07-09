@@ -19,17 +19,22 @@ note was retired, `RealmModelTest` now gets substantially further:
   reactive publisher request advances through `node-1#6` instead of stalling
   at `node-1#2`.
 
-The class still does not finish under CratonVM within the current watchdog.
-The current residual is later: Keycloak reaches Liquibase changelog parsing
-and remains much slower than HotSpot.
+The class still does not pass under CratonVM. The current residual is later:
+Keycloak now reaches and completes Liquibase changelog execution, then fails in
+Hibernate/H2 connection bootstrap.
 
 Update 2026-07-09: the specific no-JIT Liquibase/Xerces XML parse hotspot has
 been fixed and retired to
 `docs/internal/fixed-suite-bugs/keycloak-model-liquibase-xerces-xml-parse-nojit-timeout-FIXED.md`.
-The active remaining layer is now
-`docs/known-issues/keycloak-model-liquibase-checksum-status-nojit-timeout.md`,
-where the main thread is in Liquibase checksum/status serialization rather than
-Xerces schema parsing.
+The 2026-07-09 `scanQName` follow-up also cleared the intermediate
+`XMLEntityScanner.skipString` empty-rawname failure and H2 `BitSet.clone`
+failure. The 2026-07-09 checksum/status follow-up then moved the class through
+all 195 Liquibase changesets and retired the Liquibase timeout to
+`docs/internal/fixed-suite-bugs/keycloak-model-liquibase-checksum-status-nojit-timeout-FIXED.md`.
+The current terminal residual is now
+`docs/known-issues/keycloak-model-realmmodeltest-h2-auth-after-liquibase-nojit.md`:
+Hibernate bootstrap of `JdbcEnvironment` fails through H2 with
+`Wrong user name or password [28000-240]`.
 
 ## Evidence
 
@@ -78,16 +83,18 @@ Liquibase. The skip is deliberately narrow:
 
 ## Not yet root-caused / fixed
 
-The remaining timeout needs a fresh Liquibase checksum/status investigation.
+The remaining failure needs a fresh Hibernate/H2 credential propagation
+investigation.
 Useful next steps:
 
-1. Instrument `StringChangeLogSerializer.serializeObject` and
-   `AbstractChange.generateCheckSum` under `--nojit`.
-2. Compare the checksum/status path against HotSpot `-Xint` on the same
-   class/list.
-3. If JIT-on with the RxJava3 skip-list reaches the same layer, decide whether
-   the shared no-JIT/JIT-denied cost is reflection/property traversal, repeated
-   checksum work, string serialization, or another Liquibase visitor hot path.
+1. Instrument H2 `Driver.connect` or Hibernate
+   `DriverConnectionCreator.makeConnection` to log the URL/user/password shape
+   for the successful Liquibase connection and the later failing Hibernate
+   bootstrap connection in the same VM.
+2. Compare with HotSpot `-Xint` using the same runner class list.
+3. Use `docs/internal/hibernate-bugs/HIB-CV-06-emf-bootstrap-db-connect.md` as
+   prior art for `Properties` credential propagation, but re-prove the
+   Keycloak path before assuming it is the same bug.
 
 ## Repro
 
@@ -96,13 +103,13 @@ Use the single-class Keycloak model list with the unique CratonVM binary:
 ```powershell
 powershell.exe -NoProfile -ExecutionPolicy Bypass -File apps\keycloak-suite-runner\run-keycloak-suite.ps1 `
   -Vm craton `
-  -Jit on `
+  -Jit off `
   -Parallel 1 `
   -TimeoutSec 900 `
-  -RunName verify-realmmodel-liquibase-timeout `
-  -ClassList apps\keycloak-suite-runner\.suite\realm-model-test.tsv `
+  -RunName verify-realmmodel-h2-auth-after-liquibase `
+  -ClassList apps\keycloak-suite-runner\.suite\keycloak-model-realm-stw-20260708-001.tsv `
   -KeycloakRoot C:\craton\CratonVM\apps\keycloak `
   -WorkDir apps\keycloak-suite-runner\.suite `
-  -Exe target\release\cratonvm-keycloak-infinispan-fullname-20260708-001.exe `
+  -Exe target\release\cratonvm-keycloak-liquibase-columnconfig-20260709-012.exe `
   -JdkHome "C:\Program Files\Java\jdk-25"
 ```

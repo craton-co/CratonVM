@@ -12181,7 +12181,36 @@ fn execute_instruction(
                 }
             } else {
                 ensure_class_initialized_shared(shared, thread, field.declaring_class_id)?;
-                let value = get_static_shared(shared, field.declaring_class_id, field.field_index);
+                let mut value = get_static_shared(shared, field.declaring_class_id, field.field_index);
+                if matches!(value, Value::Object(None)) {
+                    let boolean_const = {
+                        let cm = shared.class_manager.read();
+                        cm.get_class(field.declaring_class_id)
+                            .filter(|c| &*c.name == "java/lang/Boolean")
+                            .and_then(|c| {
+                                let mut static_idx = 0usize;
+                                for f in &c.fields {
+                                    if f.is_static() {
+                                        if static_idx == field.field_index {
+                                            return match &*f.name {
+                                                "TRUE" => Some(true),
+                                                "FALSE" => Some(false),
+                                                _ => None,
+                                            };
+                                        }
+                                        static_idx += 1;
+                                    }
+                                }
+                                None
+                            })
+                    };
+                    if let Some(b) = boolean_const {
+                        let obj = gc_alloc_object(shared, thread, field.declaring_class_id, 1)?;
+                        shared.heap.set_field(obj, 0, Value::Int(i32::from(b)));
+                        value = Value::Object(Some(obj));
+                        set_static_shared(shared, field.declaring_class_id, field.field_index, value);
+                    }
+                }
                 if field.is_volatile {
                     std::sync::atomic::fence(std::sync::atomic::Ordering::SeqCst);
                 }
@@ -12599,7 +12628,9 @@ fn execute_instruction(
                     // Same jobject-as-Long contract as `astore` / `coerce_value_for_return`
                     // in vm_exec: invoke returns can sit on the stack as compact long bits.
                     match desc_byte {
-                        Some(d @ (b'L' | b'[')) => coerce_value_for_return(v, d),
+                        Some(d @ (b'L' | b'[')) => {
+                            coerce_value_for_return_validated(shared, v, d)
+                        }
                         // JVMS putfield: narrow the popped int to the field's
                         // declared sub-int width (byte/boolean/char/short) before
                         // storing, so a wide int producer can't leave out-of-range
@@ -20000,6 +20031,24 @@ pub(crate) fn is_h2_parser_native_override(
                 "(Lorg/h2/mvstore/tx/TransactionStore;IJILjava/lang/String;JIILorg/h2/engine/IsolationLevel;Lorg/h2/mvstore/tx/TransactionStore$RollbackListener;)V",
             );
     }
+    if class_name == "org/h2/table/Column" {
+        return matches!(
+            (method_name, descriptor),
+            ("equals", "(Ljava/lang/Object;)Z") | ("hashCode", "()I")
+        );
+    }
+    if class_name == "org/h2/engine/DbObject" {
+        return matches!(
+            (method_name, descriptor),
+            ("equals", "(Ljava/lang/Object;)Z") | ("hashCode", "()I")
+        );
+    }
+    if matches!(
+        class_name,
+        "org/h2/engine/Session" | "org/h2/engine/SessionLocal"
+    ) {
+        return (method_name, descriptor) == ("hashCode", "()I");
+    }
     if class_name == "org/h2/command/ParserBase" {
         return matches!(
             (method_name, descriptor),
@@ -20280,6 +20329,20 @@ pub(crate) fn is_native_thread_set_native_override(
         )
 }
 
+/// JavaNioAccess methods that must dispatch through CratonVM natives even when
+/// the real JDK returns an anonymous/synthetic access singleton. JDK 17's
+/// `VM$BufferPoolsHolder.<clinit>` invokes this through the interface, and a
+/// receiver-class lookup alone can miss the bridge native.
+pub(crate) fn is_java_nio_access_native_override(
+    class_name: &str,
+    method_name: &str,
+    descriptor: &str,
+) -> bool {
+    class_name == "jdk/internal/access/JavaNioAccess"
+        && method_name == "getDirectBufferPool"
+        && descriptor == "()Ljdk/internal/misc/VM$BufferPool;"
+}
+
 pub(crate) fn is_stamped_lock_native_override(
     class_name: &str,
     method_name: &str,
@@ -20378,6 +20441,9 @@ pub(crate) fn is_xerces_xml_parser_native_override(
             (
                 "scanContent",
                 "(Lcom/sun/org/apache/xerces/internal/xni/XMLString;)I"
+            ) | (
+                "scanQName",
+                "(Lcom/sun/org/apache/xerces/internal/xni/QName;Lcom/sun/org/apache/xerces/internal/impl/XMLScanner$NameType;)Z"
             ) | ("skipSpaces", "()Z") | (
                 "normalizeNewlines",
                 "(SLcom/sun/org/apache/xerces/internal/xni/XMLString;ZZLcom/sun/org/apache/xerces/internal/impl/XMLScanner$NameType;)Z"
@@ -20484,11 +20550,37 @@ pub(crate) fn is_awt_imageio_native_override(
             == "(Ljavax/imageio/metadata/IIOMetadata;Ljavax/imageio/IIOImage;Ljavax/imageio/ImageWriteParam;)V"
 }
 
+pub(crate) fn is_liquibase_checksum_native_override(
+    class_name: &str,
+    method_name: &str,
+    descriptor: &str,
+) -> bool {
+    matches!(
+        (class_name, method_name, descriptor),
+        (
+            "liquibase/change/AbstractChange$1",
+            "include",
+            "(Ljava/lang/Object;Ljava/lang/String;Ljava/lang/Object;)Z",
+        ) | (
+            "liquibase/change/ColumnConfig",
+            "getSerializableFieldValue",
+            "(Ljava/lang/String;)Ljava/lang/Object;",
+        )
+    )
+}
+
 fn force_native_over_real_jdk_bytecode(
     class_name: &str,
     method_name: &str,
     method_descriptor: &str,
 ) -> bool {
+    if class_name == "java/lang/Object"
+        && method_name == "clone"
+        && method_descriptor == "()Ljava/lang/Object;"
+    {
+        return true;
+    }
+
     if is_forkjoin_native_override(class_name, method_name, method_descriptor) {
         return true;
     }
@@ -20560,6 +20652,22 @@ fn force_native_over_real_jdk_bytecode(
                 | "implAddExportsNoSync"
                 | "implAddOpens"
                 | "implAddOpensToAllUnnamed"
+        )
+    {
+        return true;
+    }
+    // `ServerSocket.getLocalSocketAddress()` is pure Java in the real JDK:
+    // it calls `getInetAddress()` and then constructs an InetSocketAddress.
+    // CratonVM's real ServerSocket instances carry their live listener state
+    // in native side-tables / synthetic slots, while some real SocketImpl
+    // fields remain unpopulated. Force the registered natives for these
+    // accessors so WildFly's process controller sees a resolved bound address
+    // instead of `/0.0.0.0:PORT` with a null InetAddress.
+    if class_name == "java/net/ServerSocket"
+        && matches!(
+            (method_name, method_descriptor),
+            ("getInetAddress", "()Ljava/net/InetAddress;")
+                | ("getLocalSocketAddress", "()Ljava/net/SocketAddress;")
         )
     {
         return true;
@@ -20726,6 +20834,13 @@ fn force_native_over_real_jdk_bytecode(
         || is_jython_pyobject_native_override(class_name, method_name, method_descriptor)
         || is_jython_imp_native_override(class_name, method_name, method_descriptor)
         || is_jython_pymodule_native_override(class_name, method_name, method_descriptor)
+    {
+        return true;
+    }
+
+    if class_name == "java/nio/charset/Charset"
+        && ((method_name == "availableCharsets" && method_descriptor == "()Ljava/util/SortedMap;")
+            || (method_name == "aliases" && method_descriptor == "()Ljava/util/Set;"))
     {
         return true;
     }
@@ -21031,6 +21146,9 @@ fn force_native_over_real_jdk_bytecode(
     if is_native_thread_set_native_override(class_name, method_name, method_descriptor) {
         return true;
     }
+    if is_java_nio_access_native_override(class_name, method_name, method_descriptor) {
+        return true;
+    }
     if is_stamped_lock_native_override(class_name, method_name, method_descriptor) {
         return true;
     }
@@ -21038,6 +21156,9 @@ fn force_native_over_real_jdk_bytecode(
         return true;
     }
     if is_xerces_xml_parser_native_override(class_name, method_name, method_descriptor) {
+        return true;
+    }
+    if is_liquibase_checksum_native_override(class_name, method_name, method_descriptor) {
         return true;
     }
     // Surefire fork bootstrap/teardown: bypass ServiceLoader decoder discovery
@@ -21633,7 +21754,7 @@ fn intercept_urlclassloader_subclass_find_class(
     let ret_type = crate::jit::return_type(method_descriptor);
     Some((|| {
         let result = crate::vm::safe_native_call(shared, thread, cb, args)?;
-        if let Some(value) = result {
+        if let Some(value) = result.filter(|_| ret_type != b'V') {
             push_invoke_return_value(
                 &mut thread.frames[frame_idx].stack,
                 coerce_value_for_return(value, ret_type),
@@ -21806,7 +21927,7 @@ fn try_stackless_invoke(
                 .find("java/lang/reflect/Constructor", method_name, descriptor)
         {
             let result = safe_native_call(shared, thread, callback, args)?;
-            if let Some(value) = result {
+            if let Some(value) = result.filter(|_| ret_type != b'V') {
                 push_invoke_return_value(
                     &mut thread.frames[frame_idx].stack,
                     coerce_value_for_return(value, ret_type),
@@ -21940,15 +22061,17 @@ fn try_stackless_invoke(
                     class_name, method_name, descriptor, value
                 );
             }
-            // T18.K4 — tag-exact push for J/D native-override return values.
-            // `coerce_value_for_return` may widen/narrow the type-erased
-            // native result; we then push via the category-2 aware path so
-            // J/D retain their bits across the operand-stack boundary.
-            push_invoke_return_value(
-                &mut thread.frames[frame_idx].stack,
-                coerce_value_for_return(value, ret_type),
-            )?;
-            native_return_pushed_to_stack(shared, thread);
+            if ret_type != b'V' {
+                // T18.K4 — tag-exact push for J/D native-override return values.
+                // `coerce_value_for_return` may widen/narrow the type-erased
+                // native result; we then push via the category-2 aware path so
+                // J/D retain their bits across the operand-stack boundary.
+                push_invoke_return_value(
+                    &mut thread.frames[frame_idx].stack,
+                    coerce_value_for_return(value, ret_type),
+                )?;
+                native_return_pushed_to_stack(shared, thread);
+            }
         }
         if crate::runtime::env_cache::resume_pc_dbg() && method_name == "enhance" {
             let f = &thread.frames[frame_idx];
@@ -22020,7 +22143,7 @@ fn try_stackless_invoke(
             .find(&declaring_name, method_name, descriptor)
         {
             let result = safe_native_call(shared, thread, callback, args)?;
-            if let Some(value) = result {
+            if let Some(value) = result.filter(|_| ret_type != b'V') {
                 // T18.K4 — tag-exact push for J/D native-bytecode method return values.
                 push_invoke_return_value(
                     &mut thread.frames[frame_idx].stack,
@@ -22088,7 +22211,7 @@ fn try_stackless_invoke(
             .find(&class_name_arc, method_name, descriptor)
         {
             let result = safe_native_call(shared, thread, callback, args)?;
-            if let Some(value) = result {
+            if let Some(value) = result.filter(|_| ret_type != b'V') {
                 // T18.K4 — tag-exact push for J/D native-override (on bytecode method) return values.
                 push_invoke_return_value(
                     &mut thread.frames[frame_idx].stack,
@@ -22581,19 +22704,17 @@ fn execute_invokestatic(
     };
     if let Some(value) = result {
         let ret = crate::jit::return_type(&method_descriptor);
-        let value = if ret != b'V' {
-            coerce_value_for_return(value, ret)
-        } else {
-            value
-        };
-        // T18.K4 — tag-exact push for J/D fallback invokestatic return values.
-        push_invoke_return_value(&mut thread.frames[frame_idx].stack, value)?;
-        // Hypothesis (b): symmetric clear-after-push for the slow invokestatic
-        // path. `invoke_or_native` may recursively run `safe_native_call` which
-        // pins the object return in `thread.native_pending_return`; without
-        // this clear, the field outlives the call site and `update_root_snapshot`
-        // re-roots a stale (already-popped) ObjectRef across GC.
-        crate::vm::native_return_pushed_to_stack(shared, thread);
+        if ret != b'V' {
+            let value = coerce_value_for_return(value, ret);
+            // T18.K4 — tag-exact push for J/D fallback invokestatic return values.
+            push_invoke_return_value(&mut thread.frames[frame_idx].stack, value)?;
+            // Hypothesis (b): symmetric clear-after-push for the slow invokestatic
+            // path. `invoke_or_native` may recursively run `safe_native_call` which
+            // pins the object return in `thread.native_pending_return`; without
+            // this clear, the field outlives the call site and `update_root_snapshot`
+            // re-roots a stale (already-popped) ObjectRef across GC.
+            crate::vm::native_return_pushed_to_stack(shared, thread);
+        }
     }
 
     // Populate invoke cache for future fast-path hits
@@ -22644,12 +22765,8 @@ fn invoke_cached_intrinsic(
 ) -> Result<(), MethodCallFailed> {
     INTRINSIC_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let result = crate::vm::safe_native_call(shared, thread, callback, args)?;
-    if let Some(value) = result {
-        let value = if return_type != b'V' {
-            coerce_value_for_return(value, return_type)
-        } else {
-            value
-        };
+    if let Some(value) = result.filter(|_| return_type != b'V') {
+        let value = coerce_value_for_return(value, return_type);
         push_invoke_return_value(&mut thread.frames[frame_idx].stack, value)?;
         crate::vm::native_return_pushed_to_stack(shared, thread);
     }
@@ -31098,6 +31215,30 @@ mod tests {
     }
 
     #[test]
+    fn java_nio_access_force_native_covers_jdk17_direct_buffer_pool() {
+        let access = "jdk/internal/access/JavaNioAccess";
+        let descriptor = "()Ljdk/internal/misc/VM$BufferPool;";
+        assert!(
+            is_java_nio_access_native_override(access, "getDirectBufferPool", descriptor),
+            "JDK 17 VM$BufferPoolsHolder must route JavaNioAccess.getDirectBufferPool to the native bridge"
+        );
+        assert!(
+            force_native_over_real_jdk_bytecode(access, "getDirectBufferPool", descriptor),
+            "invokeinterface JavaNioAccess.getDirectBufferPool must force the registered native"
+        );
+        assert!(!is_java_nio_access_native_override(
+            "java/nio/Buffer$1",
+            "getDirectBufferPool",
+            descriptor
+        ));
+        assert!(!is_java_nio_access_native_override(
+            access,
+            "getBufferPool",
+            "()Ljava/lang/management/BufferPoolMXBean;"
+        ));
+    }
+
+    #[test]
     fn file_channel_impl_open_force_native_covers_registered_factories() {
         let fci = "sun/nio/ch/FileChannelImpl";
         let descriptor =
@@ -31197,6 +31338,28 @@ mod tests {
         ));
         assert!(force_native_over_real_jdk_bytecode(
             png_writer, "write", write_desc
+        ));
+    }
+
+    #[test]
+    fn charset_force_native_covers_tomcat_cache_surface() {
+        let charset = "java/nio/charset/Charset";
+        assert!(
+            force_native_over_real_jdk_bytecode(
+                charset,
+                "availableCharsets",
+                "()Ljava/util/SortedMap;"
+            ),
+            "Tomcat B2CConverter must use native Charset.availableCharsets"
+        );
+        assert!(
+            force_native_over_real_jdk_bytecode(charset, "aliases", "()Ljava/util/Set;"),
+            "Tomcat CharsetCache must use native Charset.aliases on synthetic Charset objects"
+        );
+        assert!(!force_native_over_real_jdk_bytecode(
+            charset,
+            "aliases",
+            "()Ljava/util/List;"
         ));
     }
 
@@ -31301,6 +31464,18 @@ mod tests {
     }
 
     #[test]
+    fn object_clone_force_native_covers_super_clone() {
+        assert!(
+            force_native_over_real_jdk_bytecode(
+                "java/lang/Object",
+                "clone",
+                "()Ljava/lang/Object;"
+            ),
+            "Object.clone must route to the registered shallow-clone native"
+        );
+    }
+
+    #[test]
     fn xerces_xml_parser_force_native_covers_liquibase_parse_hotspots() {
         let xmlchar = "com/sun/org/apache/xerces/internal/util/XMLChar";
         for (name, descriptor) in [
@@ -31376,6 +31551,10 @@ mod tests {
         let entity_scanner = "com/sun/org/apache/xerces/internal/impl/XMLEntityScanner";
         for (name, descriptor) in [
             ("scanContent", "(Lcom/sun/org/apache/xerces/internal/xni/XMLString;)I"),
+            (
+                "scanQName",
+                "(Lcom/sun/org/apache/xerces/internal/xni/QName;Lcom/sun/org/apache/xerces/internal/impl/XMLScanner$NameType;)Z",
+            ),
             ("skipSpaces", "()Z"),
             (
                 "normalizeNewlines",
@@ -31487,6 +31666,63 @@ mod tests {
             analyzer,
             "debugPrint",
             "(Ljdk/xml/internal/XMLSecurityManager;)V"
+        ));
+    }
+
+    #[test]
+    fn liquibase_checksum_force_native_covers_status_hotpath_intrinsics() {
+        for (class_name, method_name, descriptor) in [
+            (
+                "liquibase/change/AbstractChange$1",
+                "include",
+                "(Ljava/lang/Object;Ljava/lang/String;Ljava/lang/Object;)Z",
+            ),
+            (
+                "liquibase/change/ColumnConfig",
+                "getSerializableFieldValue",
+                "(Ljava/lang/String;)Ljava/lang/Object;",
+            ),
+        ] {
+            assert!(
+                is_liquibase_checksum_native_override(class_name, method_name, descriptor),
+                "{class_name}.{method_name}{descriptor} must route to the registered native"
+            );
+            assert!(
+                force_native_over_real_jdk_bytecode(class_name, method_name, descriptor),
+                "{class_name}.{method_name}{descriptor} must not fall through to interpreted stream bytecode"
+            );
+        }
+        assert!(!is_liquibase_checksum_native_override(
+            "liquibase/serializer/core/string/StringChangeLogSerializer$FieldFilter",
+            "include",
+            "(Ljava/lang/Object;Ljava/lang/String;Ljava/lang/Object;)Z"
+        ));
+    }
+
+    #[test]
+    fn h2_liquibase_force_native_covers_ddl_hotpath_intrinsics() {
+        for (class_name, name, descriptor) in [
+            ("org/h2/table/Column", "equals", "(Ljava/lang/Object;)Z"),
+            ("org/h2/table/Column", "hashCode", "()I"),
+            ("org/h2/engine/DbObject", "equals", "(Ljava/lang/Object;)Z"),
+            ("org/h2/engine/DbObject", "hashCode", "()I"),
+            ("org/h2/engine/Session", "hashCode", "()I"),
+            ("org/h2/engine/SessionLocal", "hashCode", "()I"),
+        ] {
+            assert!(
+                is_h2_parser_native_override(class_name, name, descriptor),
+                "{class_name}.{name}{descriptor} must route to the registered H2 native"
+            );
+            assert!(
+                force_native_over_real_jdk_bytecode(class_name, name, descriptor),
+                "{class_name}.{name}{descriptor} must not fall through to interpreted H2 bytecode"
+            );
+        }
+
+        assert!(!is_h2_parser_native_override(
+            "org/h2/table/Column",
+            "getName",
+            "()Ljava/lang/String;"
         ));
     }
 

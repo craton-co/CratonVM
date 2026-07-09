@@ -17,13 +17,18 @@ hotspots that the interpreter could not execute quickly enough:
 - `XMLLimitAnalyzer` counter updates and reads;
 - `XSSimpleTypeDecl.normalize`;
 - `XSDHandler$XSDKey` hash/equality;
-- `XMLEntityScanner.scanContent`, newline normalization, entity-limit updates,
-  and whitespace skipping;
+- `XMLEntityScanner.scanQName`, `scanContent`, newline normalization,
+  entity-limit updates, and whitespace skipping;
 - Xerces opti DOM trivial getters used while building schema DOMs;
 - `RangeToken.sortRanges`.
 
 The VM override gate now forces those methods through the native path even when
 the interpreter is running with JIT disabled.
+
+The 2026-07-09 follow-up also pins the `scanQName` symbol-table results until
+they are installed into the target `QName`. Without that, a later symbol-table
+call could move the raw name before the element stack copied it, surfacing as a
+downstream `XMLEntityScanner.skipString` `StringIndexOutOfBoundsException`.
 
 ## Validation
 
@@ -37,11 +42,32 @@ $env:CARGO_TARGET_DIR='C:\craton\cargo-targets\keycloak-liquibase-xerces-tests-2
 cargo test -p cratonvm-vm xerces --lib
 ```
 
-Result:
+Original result:
 
 ```text
 cratonvm-native-builtins: 17 passed
 cratonvm-vm: 2 passed
+```
+
+Follow-up coverage for the resurfaced `scanQName` stack:
+
+```powershell
+$env:CARGO_TARGET_DIR='C:\craton\cargo-targets\keycloak-xerces-scanqname-tests-20260709-005-native'
+cargo test -p cratonvm-native-builtins xerces --lib
+
+$env:CARGO_TARGET_DIR='C:\craton\cargo-targets\keycloak-xerces-scanqname-tests-20260709-005-vm'
+cargo test -p cratonvm-vm object_clone_force_native --lib
+
+$env:CARGO_TARGET_DIR='C:\craton\cargo-targets\keycloak-xerces-scanqname-tests-20260709-006-vm-xerces'
+cargo test -p cratonvm-vm xerces --lib
+```
+
+Result:
+
+```text
+cratonvm-native-builtins: 18 passed
+cratonvm-vm object_clone_force_native: 1 passed
+cratonvm-vm xerces: 2 passed
 ```
 
 The unique release binary used for suite validation was:
@@ -77,10 +103,54 @@ the 900-second watchdog for `org.keycloak.testsuite.model.RealmModelTest`, but
 the residual is no longer the Liquibase/Xerces XML parse hotspot described by
 this note.
 
-## Follow-up
-
-The still-open follow-up is tracked separately as:
+The follow-up unique binary was:
 
 ```text
-docs/known-issues/keycloak-model-liquibase-checksum-status-nojit-timeout.md
+C:\craton\cargo-targets\keycloak-xerces-scanqname-20260709-002\release\cratonvm-keycloak-xerces-scanqname-20260709-004.exe
+```
+
+The suite-runner check:
+
+```powershell
+& 'C:\craton\CratonVM\apps\keycloak-suite-runner\run-keycloak-suite.ps1' `
+  -Vm craton -Category others -Jit off `
+  -ClassList 'C:\craton\CratonVM\apps\keycloak-suite-runner\.suite\keycloak-model-realm-stw-20260708-001.tsv' `
+  -RunName 'keycloak-xerces-scanqname-verify-20260709-004' `
+  -Parallel 1 -TimeoutSec 900 `
+  -KeycloakRoot 'C:\craton\CratonVM\apps\keycloak' `
+  -WorkDir 'C:\craton\CratonVM\apps\keycloak-suite-runner\.suite' `
+  -Exe 'C:\craton\cargo-targets\keycloak-xerces-scanqname-20260709-002\release\cratonvm-keycloak-xerces-scanqname-20260709-004.exe'
+```
+
+Result:
+
+```text
+HANG 900.073s org.keycloak.testsuite.model.RealmModelTest
+```
+
+This run no longer shows:
+
+```text
+XMLEntityScanner.scanQName -> checkLimit -> XMLLimitAnalyzer.addValue
+XMLEntityScanner.skipString -> StringIndexOutOfBoundsException
+BitSet.clone -> CloneNotSupportedException
+```
+
+It instead reaches Liquibase changelog execution and is still applying schema
+updates near `META-INF/jpa-changelog-authz-3.4.0.CR1` when the 900-second
+watchdog fires.
+
+## Follow-up
+
+The Liquibase checksum/status follow-up was later fixed and retired as:
+
+```text
+docs/internal/fixed-suite-bugs/keycloak-model-liquibase-checksum-status-nojit-timeout-FIXED.md
+```
+
+The still-open `RealmModelTest` residual after Liquibase completion is tracked
+separately as:
+
+```text
+docs/known-issues/keycloak-model-realmmodeltest-h2-auth-after-liquibase-nojit.md
 ```

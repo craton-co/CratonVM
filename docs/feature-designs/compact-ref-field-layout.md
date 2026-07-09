@@ -1,11 +1,12 @@
 # Compact reference-field layout (architectural lever #1)
 
-**Status:** implemented + validated (branch `feat/compact-ref-fields`, worktree
-`CratonVM-movingyoung`; NOT pushed). Gated **default-OFF** behind
-`CRATONVM_COMPACT_REF_FIELDS`; flag-off is byte-identical to dev. Correctness ==
+**Status:** implemented, validated, and default-ON. Set
+`CRATONVM_COMPACT_REF_FIELDS=0` (also accepts `false`/`off`/`no`) to force the
+legacy uniform 16-byte-cell layout for A/B runs. Correctness ==
 HotSpot (bt10–18, GC_STRESS, HashMap/ArrayList/inheritance mix). Footprint
 reduced (node 56 vs 72 B). Throughput **bt16 ~10 % faster, bt18 parity** with
-the compact-aware inline codegen. Default-on flip still needs the app gauntlet.
+the compact-aware inline codegen; current Binary Trees reruns keep this as the
+default allocation-footprint lever.
 
 **Goal:** shrink allocation-heavy object footprint by storing **reference
 instance fields as bare 8-byte pointers** instead of the 16-byte tagged `Value`
@@ -109,10 +110,9 @@ and layout indexing.
 
 `CRATONVM_COMPACT_REF_FIELDS` is read **once at startup** into an immutable
 global (`compact_ref_fields_enabled()`); the layout is fixed for the process so
-objects are never read under a different layout than they were written. Every
-migrated site is `if compact_ref_fields_enabled() { new } else { legacy }` with
-the legacy arm kept **verbatim**, so flag-off is byte-identical to dev. The
-registry is only populated when the flag is on.
+objects are never read under a different layout than they were written. The
+default is compact; `CRATONVM_COMPACT_REF_FIELDS=0` selects the legacy arm for
+A/B runs. The registry is populated only when the compact layout is enabled.
 
 ## Migration checklist (by subsystem)
 
@@ -358,21 +358,20 @@ declared layout would let these classes go compact too (more footprint win), but
 is a larger, riskier change; the per-object flag already makes both layouts
 correct, so this is left as a throughput lever, not a correctness fix.
 
-## Stage 5 — observability (deferred, non-critical)
+## Stage 5 — observability (implemented)
 
 HPROF instance dump (`serviceability.rs`) and the field-watch corruption
 detector (`ec_watch.rs`) still assume the uniform 16-byte cell layout under the
-compact flag. Both are **safe** (no crash / no heap corruption) — HPROF's
-`slot_offset + N <= total_size` bounds check fails closed (reads 0 for an
-out-of-range compact offset), and ec_watch reads within the always-mapped
-arena — they are merely **inaccurate** for compact objects (heap dumps show
-wrong field values; the debug `CRATONVM_DBG_BADREF` watcher checks the wrong
-offset). Both are debug/observability features (HPROF dumps, JVMTI/debug
-watch), off by default, with no effect on execution, GC, or bt checksums.
-Making them compact-aware is a follow-up (use `class_layout` for the packed
-offset + 8-byte ref read). NB: the HPROF field-value reads were already
-approximate before this work (they read the cell start, not the `Value`
-payload offsets).
+compact flag are now compact-layout-aware:
+
+- `serviceability.rs` resolves per-class packed offsets from `class_layout` and
+  reads compact object references as raw pointers at offset `0` in compact
+  reference fields.
+- `ec_watch.rs` resolves packed field offsets and compacts-flag-aware watched
+  slot kinds; compact reference watches read the watched 8-byte pointer payload.
+
+Both features remain debug-only/off by default and do not affect execution,
+GC, or benchmark checksums.
 
 ## Residuals / future
 

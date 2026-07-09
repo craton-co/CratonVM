@@ -34,6 +34,10 @@ use cratonvm_types::{ClassId, ObjectRef, Value};
 
 const H2_ROOT_REFERENCE: &str = "org/h2/mvstore/RootReference";
 const H2_TRANSACTION: &str = "org/h2/mvstore/tx/Transaction";
+const H2_COLUMN: &str = "org/h2/table/Column";
+const H2_DB_OBJECT: &str = "org/h2/engine/DbObject";
+const H2_SESSION: &str = "org/h2/engine/Session";
+const H2_SESSION_LOCAL: &str = "org/h2/engine/SessionLocal";
 
 /// Register Thread.threadState / Thread.getState overrides so the real-JDK
 /// bytecode path does not dereference the null `holder` FieldHolder.
@@ -170,6 +174,22 @@ pub fn register_h2_parser_fastpaths(registry: &mut NativeMethodRegistry) {
         "(Lorg/h2/mvstore/tx/TransactionStore;IJILjava/lang/String;JIILorg/h2/engine/IsolationLevel;Lorg/h2/mvstore/tx/TransactionStore$RollbackListener;)V",
         h2_transaction_init,
     );
+    registry.register(
+        H2_COLUMN,
+        "equals",
+        "(Ljava/lang/Object;)Z",
+        h2_column_equals,
+    );
+    registry.register(H2_COLUMN, "hashCode", "()I", h2_column_hash_code);
+    registry.register(
+        H2_DB_OBJECT,
+        "equals",
+        "(Ljava/lang/Object;)Z",
+        h2_db_object_equals,
+    );
+    registry.register(H2_DB_OBJECT, "hashCode", "()I", h2_db_object_hash_code);
+    registry.register(H2_SESSION, "hashCode", "()I", h2_session_hash_code);
+    registry.register(H2_SESSION_LOCAL, "hashCode", "()I", h2_session_hash_code);
 
     for class_name in [
         "org/h2/command/Token",
@@ -273,6 +293,108 @@ fn h2_object_field(ctx: &mut dyn NativeContext, obj: ObjectRef, field: &str) -> 
         Value::Object(obj) => obj,
         _ => None,
     }
+}
+
+fn h2_java_string_hash(text: &str) -> i32 {
+    text.encode_utf16().fold(0i32, |hash, unit| {
+        hash.wrapping_mul(31).wrapping_add(unit as i32)
+    })
+}
+
+fn h2_read_string_hash(
+    ctx: &mut dyn NativeContext,
+    obj: ObjectRef,
+) -> Result<i32, MethodCallFailed> {
+    if let Some(text) = ctx.read_string(obj) {
+        return Ok(h2_java_string_hash(&text));
+    }
+    match ctx.invoke_virtual(obj, "hashCode", "()I", &[])? {
+        Some(Value::Int(hash)) => Ok(hash),
+        _ => Ok(0),
+    }
+}
+
+fn h2_string_refs_equal(ctx: &dyn NativeContext, left: ObjectRef, right: ObjectRef) -> bool {
+    left == right
+        || ctx
+            .read_string(left)
+            .zip(ctx.read_string(right))
+            .is_some_and(|(a, b)| a == b)
+}
+
+fn h2_column_equals(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = h2_object_arg(args, 0, "Column.equals receiver is null")?;
+    let Some(other) = h2_optional_object_arg(args, 1) else {
+        return Ok(Some(Value::Int(0)));
+    };
+    if other == this {
+        return Ok(Some(Value::Int(1)));
+    }
+
+    let other_cid = ctx.class_id_of_object(other);
+    let is_column = ctx.class_id_by_name(H2_COLUMN).is_some_and(|column_cid| {
+        other_cid == column_cid || ctx.is_subclass(other_cid, column_cid)
+    });
+    if !is_column {
+        return Ok(Some(Value::Int(0)));
+    }
+
+    let this_table = h2_object_field(ctx, this, "table");
+    let other_table = h2_object_field(ctx, other, "table");
+    let this_name = h2_object_field(ctx, this, "name");
+    let other_name = h2_object_field(ctx, other, "name");
+    let equal = match (this_table, other_table, this_name, other_name) {
+        (Some(this_table), Some(other_table), Some(this_name), Some(other_name))
+            if this_table == other_table =>
+        {
+            h2_string_refs_equal(ctx, this_name, other_name)
+        }
+        _ => false,
+    };
+    Ok(Some(Value::Int(i32::from(equal))))
+}
+
+fn h2_column_hash_code(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = h2_object_arg(args, 0, "Column.hashCode receiver is null")?;
+    let Some(table) = h2_object_field(ctx, this, "table") else {
+        return Ok(Some(Value::Int(0)));
+    };
+    let Some(name) = h2_object_field(ctx, this, "name") else {
+        return Ok(Some(Value::Int(0)));
+    };
+
+    let table_id = h2_int_field(ctx, table, "id");
+    let name_hash = h2_read_string_hash(ctx, name)?;
+    Ok(Some(Value::Int(table_id ^ name_hash)))
+}
+
+fn h2_db_object_equals(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = h2_object_arg(args, 0, "DbObject.equals receiver is null")?;
+    let Some(other) = h2_optional_object_arg(args, 1) else {
+        return Ok(Some(Value::Int(0)));
+    };
+
+    let other_cid = ctx.class_id_of_object(other);
+    let is_db_object = ctx
+        .class_id_by_name(H2_DB_OBJECT)
+        .is_some_and(|db_cid| other_cid == db_cid || ctx.is_subclass(other_cid, db_cid));
+    if !is_db_object {
+        return Ok(Some(Value::Int(0)));
+    }
+
+    Ok(Some(Value::Int(i32::from(
+        h2_int_field(ctx, this, "id") == h2_int_field(ctx, other, "id"),
+    ))))
+}
+
+fn h2_db_object_hash_code(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = h2_object_arg(args, 0, "DbObject.hashCode receiver is null")?;
+    Ok(Some(Value::Int(h2_int_field(ctx, this, "id"))))
+}
+
+fn h2_session_hash_code(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = h2_object_arg(args, 0, "Session.hashCode receiver is null")?;
+    Ok(Some(Value::Int(h2_int_field(ctx, this, "serialId"))))
 }
 
 fn h2_transaction_init(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
@@ -1214,6 +1336,14 @@ fn table_filter_prepare_on(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_utils::MockNativeContext;
+
+    fn h2_test_object(ctx: &mut MockNativeContext, class_name: &str, fields: usize) -> ObjectRef {
+        let cid = ctx
+            .ensure_class_initialized(class_name)
+            .expect("H2 test class id");
+        ctx.alloc_object(cid, fields)
+    }
 
     #[test]
     fn h2_long_data_type_binary_search_is_registered() {
@@ -1247,5 +1377,171 @@ mod tests {
                 "(Lorg/h2/mvstore/tx/TransactionStore;IJILjava/lang/String;JIILorg/h2/engine/IsolationLevel;Lorg/h2/mvstore/tx/TransactionStore$RollbackListener;)V",
             )
             .is_some());
+        for (class_name, name, descriptor) in [
+            (H2_COLUMN, "equals", "(Ljava/lang/Object;)Z"),
+            (H2_COLUMN, "hashCode", "()I"),
+            (H2_DB_OBJECT, "equals", "(Ljava/lang/Object;)Z"),
+            (H2_DB_OBJECT, "hashCode", "()I"),
+            (H2_SESSION, "hashCode", "()I"),
+            (H2_SESSION_LOCAL, "hashCode", "()I"),
+        ] {
+            assert!(
+                registry.find(class_name, name, descriptor).is_some(),
+                "{class_name}.{name}{descriptor} must be registered"
+            );
+        }
+    }
+
+    #[test]
+    fn h2_column_equals_matches_h2_table_and_name_rules() {
+        let mut ctx = MockNativeContext::new();
+        let table_a = h2_test_object(&mut ctx, "org/h2/table/Table", 1);
+        let table_b = h2_test_object(&mut ctx, "org/h2/table/Table", 1);
+        let col_a = h2_test_object(&mut ctx, H2_COLUMN, 2);
+        let col_same = h2_test_object(&mut ctx, H2_COLUMN, 2);
+        let col_other_table = h2_test_object(&mut ctx, H2_COLUMN, 2);
+        let col_null_name = h2_test_object(&mut ctx, H2_COLUMN, 2);
+        let not_column = h2_test_object(&mut ctx, "java/lang/Object", 1);
+        let name_a = ctx.create_string("ID");
+        let name_b = ctx.create_string("ID");
+
+        ctx.set_field_by_name(col_a, "table", Value::Object(Some(table_a)));
+        ctx.set_field_by_name(col_a, "name", Value::Object(Some(name_a)));
+        ctx.set_field_by_name(col_same, "table", Value::Object(Some(table_a)));
+        ctx.set_field_by_name(col_same, "name", Value::Object(Some(name_b)));
+        ctx.set_field_by_name(col_other_table, "table", Value::Object(Some(table_b)));
+        ctx.set_field_by_name(col_other_table, "name", Value::Object(Some(name_a)));
+        ctx.set_field_by_name(col_null_name, "table", Value::Object(Some(table_a)));
+
+        assert_eq!(
+            h2_column_equals(
+                &mut ctx,
+                &[
+                    Value::Object(Some(col_null_name)),
+                    Value::Object(Some(col_null_name))
+                ]
+            )
+            .expect("same column")
+            .expect("return"),
+            Value::Int(1),
+            "Column.equals returns true for same object before null-field checks"
+        );
+        assert_eq!(
+            h2_column_equals(
+                &mut ctx,
+                &[Value::Object(Some(col_a)), Value::Object(Some(col_same))]
+            )
+            .expect("same name/table")
+            .expect("return"),
+            Value::Int(1)
+        );
+        assert_eq!(
+            h2_column_equals(
+                &mut ctx,
+                &[
+                    Value::Object(Some(col_a)),
+                    Value::Object(Some(col_other_table))
+                ]
+            )
+            .expect("different table")
+            .expect("return"),
+            Value::Int(0)
+        );
+        assert_eq!(
+            h2_column_equals(
+                &mut ctx,
+                &[
+                    Value::Object(Some(col_a)),
+                    Value::Object(Some(col_null_name))
+                ]
+            )
+            .expect("null name")
+            .expect("return"),
+            Value::Int(0)
+        );
+        assert_eq!(
+            h2_column_equals(
+                &mut ctx,
+                &[Value::Object(Some(col_a)), Value::Object(Some(not_column))]
+            )
+            .expect("wrong type")
+            .expect("return"),
+            Value::Int(0)
+        );
+    }
+
+    #[test]
+    fn h2_hash_intrinsics_match_stored_ids_and_string_hashes() {
+        let mut ctx = MockNativeContext::new();
+        let db_cid = ctx
+            .ensure_class_initialized(H2_DB_OBJECT)
+            .expect("DbObject class id");
+        let table_cid = ctx
+            .ensure_class_initialized("org/h2/table/Table")
+            .expect("Table class id");
+        let session_cid = ctx
+            .ensure_class_initialized(H2_SESSION)
+            .expect("Session class id");
+        let session_local_cid = ctx
+            .ensure_class_initialized(H2_SESSION_LOCAL)
+            .expect("SessionLocal class id");
+        ctx.set_superclass(table_cid, db_cid);
+        ctx.set_superclass(session_local_cid, session_cid);
+
+        let table = ctx.alloc_object(table_cid, 1);
+        let col = h2_test_object(&mut ctx, H2_COLUMN, 2);
+        let name = ctx.create_string("CLIENT_SCOPE");
+        ctx.set_field_by_name(table, "id", Value::Int(1234));
+        ctx.set_field_by_name(col, "table", Value::Object(Some(table)));
+        ctx.set_field_by_name(col, "name", Value::Object(Some(name)));
+        assert_eq!(
+            h2_column_hash_code(&mut ctx, &[Value::Object(Some(col))])
+                .expect("column hash")
+                .expect("return"),
+            Value::Int(1234 ^ h2_java_string_hash("CLIENT_SCOPE"))
+        );
+
+        let db_obj = ctx.alloc_object(db_cid, 1);
+        let table_alias = ctx.alloc_object(table_cid, 1);
+        let different = ctx.alloc_object(table_cid, 1);
+        ctx.set_field_by_name(db_obj, "id", Value::Int(7));
+        ctx.set_field_by_name(table_alias, "id", Value::Int(7));
+        ctx.set_field_by_name(different, "id", Value::Int(8));
+        assert_eq!(
+            h2_db_object_hash_code(&mut ctx, &[Value::Object(Some(db_obj))])
+                .expect("db object hash")
+                .expect("return"),
+            Value::Int(7)
+        );
+        assert_eq!(
+            h2_db_object_equals(
+                &mut ctx,
+                &[
+                    Value::Object(Some(db_obj)),
+                    Value::Object(Some(table_alias))
+                ]
+            )
+            .expect("subclass with same id")
+            .expect("return"),
+            Value::Int(1)
+        );
+        assert_eq!(
+            h2_db_object_equals(
+                &mut ctx,
+                &[Value::Object(Some(db_obj)), Value::Object(Some(different))]
+            )
+            .expect("subclass with different id")
+            .expect("return"),
+            Value::Int(0)
+        );
+
+        let session = ctx.alloc_object(session_local_cid, 1);
+        ctx.set_field_by_name(session, "serialId", Value::Int(42));
+        assert_eq!(
+            h2_session_hash_code(&mut ctx, &[Value::Object(Some(session))])
+                .expect("session hash")
+                .expect("return"),
+            Value::Int(42)
+        );
     }
 }

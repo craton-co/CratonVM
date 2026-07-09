@@ -1,6 +1,6 @@
 # WildFly domain managed servers do not reach started state
 
-Status: OPEN (2026-07-08: stock-config empty-ServiceName collapse, loopback-interface criterion failure, Undertow HttpString parser-clinit, JBoss Modules caller/context ModuleLoader accessors, capability ServiceName null fallback, XNIO TCP accept-server binding, module-alias service-provider lookup, and the process-controller Process.waitFor STW/native watchdog gap are fixed/reduced. Remaining open residuals: no-JIT Arquillian awaitServers propagation gap; JIT-on literal-address WFLYSRV0082; stock domain now reaches Host Controller start-servers and fails the process-controller inventory path with Socket.getOutputStream: not connected, followed by watchdog stack dumps.)
+Status: OPEN (2026-07-09: stock `domain.sh` now gets past the process-controller bootstrap linkage gaps exposed after the ModuleLoader/XNIO/module-alias fixes, including ServerSocket address resolution, Base64/Arrays/ProcessBuilder, FileDescriptor-backed process streams, `OutputStreamWriter(OutputStream, Charset)`, inherited `FilterOutputStream.out`, and `TimeUnit.sleep(long)`. Remaining open residuals: no-JIT Arquillian awaitServers propagation gap; JIT-on literal-address WFLYSRV0082; stock domain now repeatedly respawns the Host Controller and still ends at the process-controller VM's STW/native watchdog path.)
 Date found: 2026-07-05
 Area: WildFly domain mode startup under CratonVM
 
@@ -851,3 +851,74 @@ Java threads responded. Status remains OPEN: this pass fixes the process wait/na
 cooperation defect, but does not close the no-JIT Arquillian `awaitServers` propagation
 gap, the JIT-on literal-address `WFLYSRV0082`, or the newly exposed
 `Socket.getOutputStream: not connected` process-controller inventory residual.
+
+## 2026-07-09 update - process-controller bootstrap linkage gaps fixed; respawn/watchdog boundary remains
+
+Branch `codex/fix-wildfly-stw-rollback-20260708-194425` on the Azure probe host, using
+a separate worktree from `/data/data/cratonvm`:
+
+```text
+/data/data/cratonvm-worktrees/20260708-194425-wildfly-stw-rollback
+```
+
+Unique rebuilt probe binaries were installed under:
+
+```text
+/data/data/probes/wildfly-stw-rollback-20260708-194425/bin/
+```
+
+This pass continued from the reduced stock-domain boundary above and closed the
+process-controller bootstrap/linkage residuals that were masking the broader STW/native
+watchdog problem:
+
+1. **ServerSocket local-address propagation fixed.** Plain `ServerSocket.bind` now records
+   the actual bound host/port and `getInetAddress()` / `getLocalSocketAddress()` return
+   resolved `InetSocketAddress` mirrors instead of null-address holders.
+2. **Early process-controller JDK surface filled in.** `Base64.getEncoder()`,
+   `Arrays.hashCode(byte[])`, `ProcessBuilder(List)`, `Process` stream accessors, and
+   `FileDescriptor`-backed `FileInputStream` / `FileOutputStream` constructors are now
+   visible before the later phase tables are installed.
+3. **Process stream wrappers fixed.** `BufferedInputStream`, `FilterOutputStream`,
+   `OutputStream.write(byte[])`, and `OutputStreamWriter(OutputStream, Charset)` now have
+   the synthetic declarations and native delegates needed by
+   `ManagedProcess$ReadTask` and WildFly's `Base64OutputStream`. The synthetic `java.io`
+   hierarchy was corrected so real bytecode can inherit `FilterInputStream.in` and
+   `FilterOutputStream.out` by name.
+4. **Respawn policy sleep fixed.** `TimeUnit.sleep(long)` is declared and bridged through
+   the existing `Thread.sleep` implementation, so `RespawnPolicy$2.respawn` no longer
+   fails with `NoSuchMethodError`.
+
+Focused validation highlights:
+
+```text
+cargo check -p cratonvm-native-builtins -p cratonvm-vm
+cargo build -p cratonvm-cli --bin java --features java-bin-alias
+domain-nojit-io-fields-20260709-075858.log: RC=0, previous
+  OutputStreamWriter/Base64OutputStream/FilterOutputStream.out failures gone; exposed
+  TimeUnit.sleep(J)V as the next missing method.
+domain-nojit-timeunit-sleep-20260709-081840.log: RC=134 via the 90s watchdog, with
+  grep -c NoSuch == 0.
+domain-nojit-finaldev-20260709-083646.log: final binary rebased on current
+  origin/dev, RC=134, grep -c NoSuch == 0, six Host Controller starts;
+  native-ring tail ends at
+  RespawnPolicy$2.respawn(...) -> TimeUnit.sleep(J)V.
+```
+
+The latest stock `domain.sh` probe now repeatedly starts the Host Controller, observes it
+finish, sleeps through the respawn policy, and restarts it. After the configured
+`CRATONVM_DEFAULT_WATCHDOG_SEC=90`, the process-controller VM still aborts in the known
+native/STW watchdog shape:
+
+```text
+=== T19.H1 watchdog: deadline of 90s elapsed; requesting thread stack dumps ===
+--- T19.H1 thread summary: 20 registered thread(s) ---
+  tid=0 name="main" alive=true daemon=false roots=8
+  ...
+  tid=19 name="reaper for Host Controller" alive=true daemon=false roots=6
+=== T19.H1 watchdog: 0 thread(s) dumped; aborting process ===
+=== T19.H1 watchdog: no Java threads responded -- main thread is in native (Rust) code.
+```
+
+Status remains OPEN. This pass removed the process-controller stream/JDK linkage layers
+that prevented clean reproduction of the residual, but did not resolve the broader
+process-controller respawn/lifecycle and STW/native watchdog blocker.

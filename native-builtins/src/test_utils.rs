@@ -210,6 +210,15 @@ fn mock_parameter_field_slot(name: &str) -> Option<usize> {
     }
 }
 
+fn mock_charset_field_slot(class_name: Option<&str>, name: &str) -> Option<usize> {
+    match (class_name, name) {
+        (Some("java/nio/charset/Charset"), "name") => Some(0),
+        (Some("java/nio/charset/Charset"), "aliases") => Some(1),
+        (Some("java/nio/charset/Charset"), "aliasSet") => Some(2),
+        _ => None,
+    }
+}
+
 fn mock_classloader_field_slot(class_name: Option<&str>, name: &str) -> Option<usize> {
     match (class_name, name) {
         (
@@ -255,7 +264,8 @@ fn mock_classloader_field_slot(class_name: Option<&str>, name: &str) -> Option<u
         },
         (
             Some("com/sun/org/apache/xerces/internal/impl/XMLEntityScanner"),
-            "fCurrentEntity" | "isExternal" | "offset" | "newlines" | "counted" | "fLimitAnalyzer",
+            "fCurrentEntity" | "isExternal" | "offset" | "newlines" | "counted" | "fLimitAnalyzer"
+            | "fSymbolTable",
         ) => match name {
             "fCurrentEntity" => Some(0),
             "isExternal" => Some(1),
@@ -263,11 +273,13 @@ fn mock_classloader_field_slot(class_name: Option<&str>, name: &str) -> Option<u
             "newlines" => Some(3),
             "counted" => Some(4),
             "fLimitAnalyzer" => Some(5),
+            "fSymbolTable" => Some(6),
             _ => None,
         },
         (
             Some("com/sun/xml/internal/stream/Entity$ScannedEntity"),
-            "ch" | "position" | "count" | "columnNumber" | "lineNumber" | "isGE" | "name",
+            "ch" | "position" | "count" | "columnNumber" | "lineNumber" | "isGE" | "name"
+            | "fBufferSize",
         ) => match name {
             "ch" => Some(0),
             "position" => Some(1),
@@ -276,6 +288,17 @@ fn mock_classloader_field_slot(class_name: Option<&str>, name: &str) -> Option<u
             "lineNumber" => Some(4),
             "isGE" => Some(5),
             "name" => Some(6),
+            "fBufferSize" => Some(7),
+            _ => None,
+        },
+        (
+            Some("com/sun/org/apache/xerces/internal/xni/QName"),
+            "prefix" | "localpart" | "rawname" | "uri",
+        ) => match name {
+            "prefix" => Some(0),
+            "localpart" => Some(1),
+            "rawname" => Some(2),
+            "uri" => Some(3),
             _ => None,
         },
         (Some("com/sun/org/apache/xerces/internal/xni/XMLString"), "ch" | "offset" | "length") => {
@@ -312,6 +335,7 @@ fn mock_classloader_field_slot(class_name: Option<&str>, name: &str) -> Option<u
             "compacted" => Some(2),
             _ => None,
         },
+        (Some("liquibase/change/AbstractChange$1"), "this$0") => Some(0),
         (
             Some(
                 "java/lang/ClassLoader"
@@ -386,6 +410,96 @@ fn mock_infinispan_dcm_field_slot(class_name: Option<&str>, name: &str) -> Optio
         (Some("org/infinispan/manager/DefaultCacheManager"), "globalComponentRegistry") => Some(3),
         (Some("org/infinispan/manager/DefaultCacheManager"), "configurationManager") => Some(4),
         (Some("org/infinispan/manager/DefaultCacheManager"), "defaultCacheName") => Some(5),
+        _ => None,
+    }
+}
+
+fn mock_h2_field_slot(class_name: Option<&str>, name: &str) -> Option<usize> {
+    match (class_name, name) {
+        (Some("org/h2/table/Column"), "name") => Some(0),
+        (Some("org/h2/table/Column"), "table") => Some(1),
+        (
+            Some(
+                "org/h2/engine/DbObject"
+                | "org/h2/table/Table"
+                | "org/h2/table/TableBase"
+                | "org/h2/table/RegularTable",
+            ),
+            "id",
+        ) => Some(0),
+        (Some("org/h2/engine/Session" | "org/h2/engine/SessionLocal"), "serialId") => Some(0),
+        _ => None,
+    }
+}
+
+fn mock_liquibase_field_slot(class_name: Option<&str>, name: &str) -> Option<usize> {
+    match (class_name, name) {
+        (Some("liquibase/change/AbstractChange$1"), "this$0") => Some(0),
+        (
+            Some("liquibase/change/ColumnConfig"),
+            "name"
+            | "computed"
+            | "type"
+            | "value"
+            | "valueNumeric"
+            | "valueDate"
+            | "valueBoolean"
+            | "valueBlobFile"
+            | "valueClobFile"
+            | "encoding"
+            | "valueComputed"
+            | "valueSequenceNext"
+            | "valueSequenceCurrent"
+            | "defaultValue"
+            | "defaultValueNumeric"
+            | "defaultValueDate"
+            | "defaultValueBoolean"
+            | "defaultValueComputed"
+            | "defaultValueSequenceNext"
+            | "defaultValueConstraintName"
+            | "constraints"
+            | "autoIncrement"
+            | "generationType"
+            | "defaultOnNull"
+            | "startWith"
+            | "incrementBy"
+            | "remarks"
+            | "descending"
+            | "included"
+            | "rawDateValue",
+        ) => match name {
+            "name" => Some(0),
+            "computed" => Some(1),
+            "type" => Some(2),
+            "value" => Some(3),
+            "valueNumeric" => Some(4),
+            "valueDate" => Some(5),
+            "valueBoolean" => Some(6),
+            "valueBlobFile" => Some(7),
+            "valueClobFile" => Some(8),
+            "encoding" => Some(9),
+            "valueComputed" => Some(10),
+            "valueSequenceNext" => Some(11),
+            "valueSequenceCurrent" => Some(12),
+            "defaultValue" => Some(13),
+            "defaultValueNumeric" => Some(14),
+            "defaultValueDate" => Some(15),
+            "defaultValueBoolean" => Some(16),
+            "defaultValueComputed" => Some(17),
+            "defaultValueSequenceNext" => Some(18),
+            "defaultValueConstraintName" => Some(19),
+            "constraints" => Some(20),
+            "autoIncrement" => Some(21),
+            "generationType" => Some(22),
+            "defaultOnNull" => Some(23),
+            "startWith" => Some(24),
+            "incrementBy" => Some(25),
+            "remarks" => Some(26),
+            "descending" => Some(27),
+            "included" => Some(28),
+            "rawDateValue" => Some(29),
+            _ => None,
+        },
         _ => None,
     }
 }
@@ -1035,9 +1149,12 @@ impl NativeContext for MockNativeContext {
         } else {
             mock_classloader_field_slot(class_name.as_deref(), field_name)
                 .or_else(|| mock_buffer_field_slot(class_name.as_deref(), field_name))
+                .or_else(|| mock_charset_field_slot(class_name.as_deref(), field_name))
                 .or_else(|| mock_lucene_field_slot(class_name.as_deref(), field_name))
                 .or_else(|| mock_concurrent_field_slot(class_name.as_deref(), field_name))
                 .or_else(|| mock_infinispan_dcm_field_slot(class_name.as_deref(), field_name))
+                .or_else(|| mock_h2_field_slot(class_name.as_deref(), field_name))
+                .or_else(|| mock_liquibase_field_slot(class_name.as_deref(), field_name))
                 .or_else(|| mock_stamped_lock_field_slot(class_name.as_deref(), field_name))
                 .or_else(|| mock_jdk_field_slot(field_name))
         };
@@ -1054,9 +1171,12 @@ impl NativeContext for MockNativeContext {
         } else {
             mock_classloader_field_slot(class_name.as_deref(), field_name)
                 .or_else(|| mock_buffer_field_slot(class_name.as_deref(), field_name))
+                .or_else(|| mock_charset_field_slot(class_name.as_deref(), field_name))
                 .or_else(|| mock_lucene_field_slot(class_name.as_deref(), field_name))
                 .or_else(|| mock_concurrent_field_slot(class_name.as_deref(), field_name))
                 .or_else(|| mock_infinispan_dcm_field_slot(class_name.as_deref(), field_name))
+                .or_else(|| mock_h2_field_slot(class_name.as_deref(), field_name))
+                .or_else(|| mock_liquibase_field_slot(class_name.as_deref(), field_name))
                 .or_else(|| mock_stamped_lock_field_slot(class_name.as_deref(), field_name))
                 .or_else(|| mock_jdk_field_slot(field_name))
         };
