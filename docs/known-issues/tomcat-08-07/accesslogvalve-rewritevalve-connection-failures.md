@@ -55,3 +55,16 @@ Tomcat's `RewriteValve` flag vocabulary) — if genuine, check CratonVM's
 query-string UTF-8 decode path under that specific rewrite-flag combination,
 possibly related to the broader URI-decode gap family
 (`reference_par_classpath_extension_uri_decode`).
+
+## 2026-07-09 worker isolation
+
+No isolated `TestAccessLogValve` / `TestRewriteValve` rerun was possible in
+this worktree because `apps/tomcat-suite-runner` is absent. The native
+`SocketChannel.close()` change made for the sibling
+`TestSwallowAbortedUploads` note addresses an abortive Windows close path that
+can produce connection-level failures, but it does not prove these two `-1`
+responses are genuine.
+
+Current classification after this worker: still "needs re-verification".
+Treat as contention/noise-prone until each class reproduces under `-Parallel 1`
+with a generous timeout and server-side logs showing the close/reset source.

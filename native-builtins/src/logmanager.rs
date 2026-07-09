@@ -430,6 +430,30 @@ fn get_or_create_logger(ctx: &mut dyn NativeContext, name: &str) -> ObjectRef {
     obj
 }
 
+fn read_jul_logger_name(ctx: &dyn NativeContext, logger: ObjectRef) -> String {
+    // Real-JDK Logger instances keep their name in the `name` field; slot 0 is
+    // `Logger$ConfigurationData`. CratonVM synthetic Logger instances keep the
+    // name in slot 0. Prefer the real layout, then fall back only if slot 0 is
+    // actually a String.
+    if let Value::Object(Some(name_obj)) = ctx.get_field_by_name(logger, "name") {
+        if let Some(name) = ctx.read_string(name_obj) {
+            return name;
+        }
+    }
+    if let Value::Object(Some(name_obj)) = ctx.get_field(logger, LOGGER_FIELD_NAME) {
+        if ctx
+            .class_name_of_id(ctx.class_id_of_object(name_obj))
+            .as_deref()
+            == Some("java/lang/String")
+        {
+            if let Some(name) = ctx.read_string(name_obj) {
+                return name;
+            }
+        }
+    }
+    String::new()
+}
+
 fn jboss_log_manager_requested(ctx: &dyn NativeContext) -> bool {
     matches!(
         ctx.get_system_property("java.util.logging.manager")
@@ -528,11 +552,7 @@ fn native_add_logger(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallR
         // behaviour T19.H1 established elsewhere.
         return Ok(Some(Value::Int(0)));
     };
-    // Read the logger's name via slot 0; if it's not a String, reject.
-    let name = match ctx.get_field(logger, LOGGER_FIELD_NAME) {
-        Value::Object(Some(name_obj)) => ctx.read_string(name_obj).unwrap_or_default(),
-        _ => String::new(),
-    };
+    let name = read_jul_logger_name(ctx, logger);
     if !is_valid_logger_name(&name) {
         tracing::warn!(
             rejected_name = %name,
@@ -3285,6 +3305,56 @@ mod tests {
             second,
             Value::Int(0),
             "duplicate addLogger must return false"
+        );
+    }
+
+    #[test]
+    fn tomcat0807_juli_add_logger_indexes_real_jdk_logger_name_field() {
+        let _g = test_lock().lock().unwrap_or_else(|e| e.into_inner());
+        reset_state_for_tests();
+        let mut ctx = mock_ctx();
+        let mgr = match native_get_log_manager(&mut ctx, &[]).unwrap().unwrap() {
+            Value::Object(Some(o)) => o,
+            _ => panic!(),
+        };
+
+        // Tomcat JULI's ClassLoaderLogManager.addLogger receives real-JDK
+        // Logger instances. On that layout slot 0 is `config`; the logger name
+        // lives in the `name` field. A later LogManager.getLogger(name) must
+        // find this same logger instead of creating a separate entry.
+        let logger_cid = ctx.ensure_class_initialized(CLS_JUL_LOGGER).unwrap();
+        let logger = ctx.alloc_object(logger_cid, LOGGER_NUM_FIELDS);
+        let config_cid = ctx
+            .ensure_class_initialized("java/util/logging/Logger$ConfigurationData")
+            .unwrap();
+        let config = ctx.alloc_object(config_cid, 1);
+        let logger_name = "org.apache.catalina.core.AsyncContextImpl";
+        let name_obj = ctx.create_string(logger_name);
+        ctx.set_field(logger, LOGGER_FIELD_NAME, Value::Object(Some(config)));
+        ctx.set_field_by_name(logger, "name", Value::Object(Some(name_obj)));
+
+        let added = native_add_logger(
+            &mut ctx,
+            &[Value::Object(Some(mgr)), Value::Object(Some(logger))],
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(added, Value::Int(1));
+
+        let lookup_name = ctx.create_string(logger_name);
+        let looked_up = match native_get_logger(
+            &mut ctx,
+            &[Value::Object(Some(mgr)), Value::Object(Some(lookup_name))],
+        )
+        .unwrap()
+        .unwrap()
+        {
+            Value::Object(Some(o)) => o,
+            other => panic!("expected logger, got {:?}", other),
+        };
+        assert_eq!(
+            looked_up, logger,
+            "LogManager.getLogger(name) must see the real-JDK logger registered by addLogger"
         );
     }
 
