@@ -7180,6 +7180,39 @@ fn peek_constructor_mirror_side(obj: ObjectRef) -> Option<ConstructorMirrorSideM
     g.get(&key).cloned()
 }
 
+fn jdk_string_constructor_reflection_rank(descriptor: &str) -> Option<usize> {
+    Some(match descriptor {
+        "(Ljava/lang/StringBuilder;)V" => 0,
+        "([BIILjava/nio/charset/Charset;)V" => 1,
+        "([BLjava/lang/String;)V" => 2,
+        "([BLjava/nio/charset/Charset;)V" => 3,
+        "([BII)V" => 4,
+        "([B)V" => 5,
+        "(Ljava/lang/StringBuffer;)V" => 6,
+        "([CII)V" => 7,
+        "([C)V" => 8,
+        "(Ljava/lang/String;)V" => 9,
+        "()V" => 10,
+        "([BIILjava/lang/String;)V" => 11,
+        "([BI)V" => 12,
+        "([BIII)V" => 13,
+        "([III)V" => 14,
+        _ => return None,
+    })
+}
+
+fn order_constructors_for_reflection(class_name: &str, constructors: &mut Vec<&MethodMetadata>) {
+    if class_name == "java/lang/String" {
+        // HotSpot does not expose String constructors in class-file order.
+        // Spring SpEL keeps the last conversion-compatible one-arg constructor,
+        // so this order makes `new String(3.0d)` choose String(String), not
+        // String(byte[])/String(char[]).
+        constructors.sort_by_key(|m| {
+            jdk_string_constructor_reflection_rank(&m.descriptor).unwrap_or(usize::MAX)
+        });
+    }
+}
+
 /// Number of "extra" slots appended after the JDK Constructor layout to
 /// hold CratonVM-specific metadata (not present on real JDK Constructor):
 ///   +0 в†’ String (raw descriptor, e.g. "(I)V")
@@ -7833,10 +7866,13 @@ pub(crate) fn native_class_get_declared_constructors(
     };
 
     let methods = ctx.declared_methods(class_id);
-    let constructors: Vec<&MethodMetadata> = methods
+    let mut constructors: Vec<&MethodMetadata> = methods
         .iter()
         .filter(|m| m.name == "<init>" && (!public_only || (m.access_flags & 0x0001) != 0))
         .collect();
+    if let Some(class_name) = ctx.class_name_of_id(class_id) {
+        order_constructors_for_reflection(&class_name, &mut constructors);
+    }
 
     // GC-safe: `create_constructor_object` allocates (see `build_mirror_array`).
     let arr = build_mirror_array(ctx, constructors.len(), |ctx, i| {
@@ -8403,10 +8439,13 @@ pub(crate) fn native_class_get_constructors(
     };
 
     let methods = ctx.declared_methods(class_id);
-    let public_ctors: Vec<&MethodMetadata> = methods
+    let mut public_ctors: Vec<&MethodMetadata> = methods
         .iter()
         .filter(|m| m.name == "<init>" && (m.access_flags & 0x0001) != 0)
         .collect();
+    if let Some(class_name) = ctx.class_name_of_id(class_id) {
+        order_constructors_for_reflection(&class_name, &mut public_ctors);
+    }
 
     let arr = ctx.new_ref_array(cratonvm_types::ClassId::new(0), public_ctors.len());
     for (i, meta) in public_ctors.iter().enumerate() {
@@ -14724,6 +14763,21 @@ mod tests {
     use super::*;
     use crate::test_utils::mock_ctx;
     use cratonvm_native_api::NativeContext;
+
+    #[test]
+    fn string_constructor_reflection_order_matches_hotspot_for_spel_conversion() {
+        let byte_array = jdk_string_constructor_reflection_rank("([B)V").unwrap();
+        let char_array = jdk_string_constructor_reflection_rank("([C)V").unwrap();
+        let string = jdk_string_constructor_reflection_rank("(Ljava/lang/String;)V").unwrap();
+
+        assert!(byte_array < string);
+        assert!(char_array < string);
+        assert_eq!(
+            jdk_string_constructor_reflection_rank("(Ljava/lang/StringBuilder;)V"),
+            Some(0)
+        );
+        assert_eq!(jdk_string_constructor_reflection_rank("([III)V"), Some(14));
+    }
 
     /// Helper: create a Class mirror object with the given class_id and name.
     fn make_class_mirror(
