@@ -18,6 +18,12 @@ The failing methods were `headersAfterExecute()`, `status()`, `echo()`,
 `org.eclipse.jetty.client.transport.HttpDestination.abortExchanges()`, line 539,
 while iterating `new ArrayList<>(exchanges)`.
 
+This retired the stale open-bug note at
+`docs/known-issues/jetty-clienthttprequestfactory-httpexchange-getrequest-npe.md`.
+The symptom was related to, but distinct from, the earlier Jetty
+`InputStreamResponseListener$Input` fallback-dispatch stack overflow and the
+separate NIO SocketChannel/selector residual.
+
 ## Root Cause
 
 Jetty 12.1.10 stores destination exchanges in
