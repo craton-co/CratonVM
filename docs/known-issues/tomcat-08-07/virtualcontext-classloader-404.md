@@ -40,3 +40,36 @@ mapping the same way HotSpot's does. Compare against
 `reference_par_classpath_extension_uri_decode`-style prior findings in this
 codebase (URI/path decode edge cases have bitten webapp resource resolution
 before).
+
+## 2026-07-09 worker update
+
+Candidate VM-side root cause found and patched in
+`native-builtins/src/classloader.rs`: real-JDK mode force-routes
+`java.net.URLClassLoader.findResource/findResources` through CratonVM natives
+because the JDK `URLClassPath` object is shimmed. The old native consulted the
+flattened global dynamic classpath before consulting the receiver loader's own
+constructor URLs, so a webapp/virtual loader could miss or be shadowed by
+global resources instead of resolving through its own resource root.
+
+Patch summary:
+
+- `ucl_find_resource` now searches the receiver's stashed/constructor URLs with
+  a temporary `ClassPath` before falling back to the legacy global scan.
+- `ucl_find_resources` uses the same receiver-local scan and pins the temporary
+  enumeration across the existing custom-handler probing path.
+- Added a focused regression named
+  `test_urlclassloader_find_resource_prefers_receiver_urls`, using a temporary
+  resource named `tomcat0807_webapp.txt`.
+
+Validation available in this worktree:
+
+- `cargo test -p cratonvm-native-builtins classloader_tests::test_urlclassloader_find_resource_prefers_receiver_urls`
+  passes.
+- `cargo test -p cratonvm-native-builtins classloader_tests::` passes: 91/91.
+- `cargo test -p cratonvm-native-builtins` passes: 2876 passed, 6 ignored, plus
+  integration tests 5/5 and 2/2.
+
+The actual Tomcat runner (`apps/tomcat-suite-runner` / `apps/tomcat`) is not
+present in this worktree, so this note remains OPEN until
+`org.apache.catalina.loader.TestVirtualContext` is rerun against the suite
+fixture and confirmed green.

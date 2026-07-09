@@ -78,3 +78,17 @@ artifacts, (2) if `TestHttp11Processor`/`TestHttp2Limits` reproduce
 consistently in isolation, treat as genuine protocol-framing/limit-
 enforcement bugs and prioritize — request-smuggling-adjacent and HTTP/2
 limit-enforcement gaps are security-relevant even if not exploitable here.
+
+## 2026-07-09 worker isolation
+
+No assertion detail was extracted in this worker because the full
+`apps/tomcat-suite-runner` checkout and Tomcat JUnit classpath are not present
+in the available worktree. The only code change made for this track was the
+native `SocketChannel.close()` close/drain fix documented in
+`swallowabortedupploads-unexpected-socketexception.md`; that fix is plausibly
+relevant to connector-level resets, but it does not prove or disprove the
+bare assertions in `TestNonBlockingAPI`, `TestHttp11Processor`, or
+`TestHttp2Limits`.
+
+This note remains genuine/open pending isolated single-method reruns with
+actual expected/actual assertion details.

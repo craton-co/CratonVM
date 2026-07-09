@@ -176,6 +176,7 @@ fn tcp_remove(id: i32) {
 }
 
 const ACCEPT_CLOSE_POLL: Duration = Duration::from_millis(10);
+const LINGERING_CHANNEL_CLOSE_DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
 
 fn tcp_listener_still_registered(id: i32) -> bool {
     matches!(tcp_registry().read().get(&id), Some(TcpHandle::Listener(_)))
@@ -211,6 +212,35 @@ fn accept_close_aware(
             Err(e) => return Err(e),
         }
     }
+}
+
+fn lingering_channel_close(id: i32, stream: &TcpStream) {
+    let Ok(mut drain_stream) = stream.try_clone() else {
+        let _ = stream.shutdown(std::net::Shutdown::Write);
+        return;
+    };
+    let _ = stream.shutdown(std::net::Shutdown::Write);
+    let _ = std::thread::Builder::new()
+        .name(format!("cratonvm-tomcat0807-http-close-{id:x}"))
+        .spawn(move || {
+            let _ = drain_stream.set_nonblocking(false);
+            let _ = drain_stream.set_read_timeout(Some(LINGERING_CHANNEL_CLOSE_DRAIN_TIMEOUT));
+            let mut buf = [0u8; 1024];
+            loop {
+                match drain_stream.read(&mut buf) {
+                    Ok(0) => break,
+                    Ok(_) => continue,
+                    Err(e)
+                        if e.kind() == ErrorKind::WouldBlock
+                            || e.kind() == ErrorKind::TimedOut
+                            || e.kind() == ErrorKind::Interrupted =>
+                    {
+                        break;
+                    }
+                    Err(_) => break,
+                }
+            }
+        });
 }
 
 // ---------------------------------------------------------------------------
@@ -850,17 +880,20 @@ fn sc_configure_blocking(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
 fn sc_close(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     if let Some(this) = obj_or_none(args, 0) {
         if let Some(id) = read_reg_id(ctx, this) {
-            // Force a FIN now. A selector this channel was registered with holds
-            // a `try_clone()`d duplicate of the socket (see
-            // `nio_selector::selector_register`); on Windows, closing only the
-            // original handle (the `tcp_remove` below) does NOT shut the
+            // Force the write-side FIN now. A selector this channel was
+            // registered with holds a `try_clone()`d duplicate of the socket
+            // (see `nio_selector::selector_register`); on Windows, closing only
+            // the original handle (the `tcp_remove` below) does NOT shut the
             // connection while that duplicate is alive, so the peer's blocking
-            // read never sees EOF and hangs forever. Shutting the socket down
-            // explicitly emits FIN regardless of any outstanding duplicate.
+            // read never sees EOF and hangs forever. Do not use
+            // `Shutdown::Both`: if the peer is still sending request-body bytes,
+            // aborting the read side is RST-prone on Windows and surfaces to the
+            // client as WSAECONNABORTED instead of the graceful close Tomcat's
+            // swallow-input path expects.
             {
                 let map = tcp_registry().read();
                 if let Some(TcpHandle::Stream(s)) = map.get(&id) {
-                    let _ = s.shutdown(std::net::Shutdown::Both);
+                    lingering_channel_close(id, s);
                 }
             }
             // Drop the selector's cloned handle too, mirroring the JDK where
@@ -2736,5 +2769,27 @@ mod tests {
         // Block on the server side to confirm bytes arrived.
         let got = server.join().unwrap();
         assert_eq!(got.as_slice(), &b"hello"[..n as usize]);
+    }
+
+    #[test]
+    fn tomcat0807_http_lingering_channel_close_drains_peer_upload() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = std::thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            lingering_channel_close(0x0807, &stream);
+            drop(stream);
+        });
+
+        let mut client = TcpStream::connect(("127.0.0.1", port)).unwrap();
+        server.join().unwrap();
+
+        let chunk = [b'x'; 8192];
+        for _ in 0..64 {
+            client
+                .write_all(&chunk)
+                .expect("client upload write should not be reset by channel close");
+        }
+        let _ = client.shutdown(std::net::Shutdown::Write);
     }
 }

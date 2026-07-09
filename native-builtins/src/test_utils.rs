@@ -210,6 +210,15 @@ fn mock_parameter_field_slot(name: &str) -> Option<usize> {
     }
 }
 
+fn mock_charset_field_slot(class_name: Option<&str>, name: &str) -> Option<usize> {
+    match (class_name, name) {
+        (Some("java/nio/charset/Charset"), "name") => Some(0),
+        (Some("java/nio/charset/Charset"), "aliases") => Some(1),
+        (Some("java/nio/charset/Charset"), "aliasSet") => Some(2),
+        _ => None,
+    }
+}
+
 fn mock_classloader_field_slot(class_name: Option<&str>, name: &str) -> Option<usize> {
     match (class_name, name) {
         (
@@ -1049,6 +1058,7 @@ impl NativeContext for MockNativeContext {
         } else {
             mock_classloader_field_slot(class_name.as_deref(), field_name)
                 .or_else(|| mock_buffer_field_slot(class_name.as_deref(), field_name))
+                .or_else(|| mock_charset_field_slot(class_name.as_deref(), field_name))
                 .or_else(|| mock_lucene_field_slot(class_name.as_deref(), field_name))
                 .or_else(|| mock_concurrent_field_slot(class_name.as_deref(), field_name))
                 .or_else(|| mock_infinispan_dcm_field_slot(class_name.as_deref(), field_name))
@@ -1068,6 +1078,7 @@ impl NativeContext for MockNativeContext {
         } else {
             mock_classloader_field_slot(class_name.as_deref(), field_name)
                 .or_else(|| mock_buffer_field_slot(class_name.as_deref(), field_name))
+                .or_else(|| mock_charset_field_slot(class_name.as_deref(), field_name))
                 .or_else(|| mock_lucene_field_slot(class_name.as_deref(), field_name))
                 .or_else(|| mock_concurrent_field_slot(class_name.as_deref(), field_name))
                 .or_else(|| mock_infinispan_dcm_field_slot(class_name.as_deref(), field_name))

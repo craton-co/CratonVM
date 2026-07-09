@@ -20280,6 +20280,20 @@ pub(crate) fn is_native_thread_set_native_override(
         )
 }
 
+/// JavaNioAccess methods that must dispatch through CratonVM natives even when
+/// the real JDK returns an anonymous/synthetic access singleton. JDK 17's
+/// `VM$BufferPoolsHolder.<clinit>` invokes this through the interface, and a
+/// receiver-class lookup alone can miss the bridge native.
+pub(crate) fn is_java_nio_access_native_override(
+    class_name: &str,
+    method_name: &str,
+    descriptor: &str,
+) -> bool {
+    class_name == "jdk/internal/access/JavaNioAccess"
+        && method_name == "getDirectBufferPool"
+        && descriptor == "()Ljdk/internal/misc/VM$BufferPool;"
+}
+
 pub(crate) fn is_stamped_lock_native_override(
     class_name: &str,
     method_name: &str,
@@ -20740,6 +20754,13 @@ fn force_native_over_real_jdk_bytecode(
         return true;
     }
 
+    if class_name == "java/nio/charset/Charset"
+        && ((method_name == "availableCharsets" && method_descriptor == "()Ljava/util/SortedMap;")
+            || (method_name == "aliases" && method_descriptor == "()Ljava/util/Set;"))
+    {
+        return true;
+    }
+
     // JBoss LogManager fallback. CratonVM often creates synthetic
     // `org.jboss.logmanager.Logger` instances without a real `LoggerNode` graph.
     // The native-builtins logmanager shim already registers null-safe
@@ -21039,6 +21060,9 @@ fn force_native_over_real_jdk_bytecode(
         return true;
     }
     if is_native_thread_set_native_override(class_name, method_name, method_descriptor) {
+        return true;
+    }
+    if is_java_nio_access_native_override(class_name, method_name, method_descriptor) {
         return true;
     }
     if is_stamped_lock_native_override(class_name, method_name, method_descriptor) {
@@ -31108,6 +31132,30 @@ mod tests {
     }
 
     #[test]
+    fn java_nio_access_force_native_covers_jdk17_direct_buffer_pool() {
+        let access = "jdk/internal/access/JavaNioAccess";
+        let descriptor = "()Ljdk/internal/misc/VM$BufferPool;";
+        assert!(
+            is_java_nio_access_native_override(access, "getDirectBufferPool", descriptor),
+            "JDK 17 VM$BufferPoolsHolder must route JavaNioAccess.getDirectBufferPool to the native bridge"
+        );
+        assert!(
+            force_native_over_real_jdk_bytecode(access, "getDirectBufferPool", descriptor),
+            "invokeinterface JavaNioAccess.getDirectBufferPool must force the registered native"
+        );
+        assert!(!is_java_nio_access_native_override(
+            "java/nio/Buffer$1",
+            "getDirectBufferPool",
+            descriptor
+        ));
+        assert!(!is_java_nio_access_native_override(
+            access,
+            "getBufferPool",
+            "()Ljava/lang/management/BufferPoolMXBean;"
+        ));
+    }
+
+    #[test]
     fn file_channel_impl_open_force_native_covers_registered_factories() {
         let fci = "sun/nio/ch/FileChannelImpl";
         let descriptor =
@@ -31207,6 +31255,28 @@ mod tests {
         ));
         assert!(force_native_over_real_jdk_bytecode(
             png_writer, "write", write_desc
+        ));
+    }
+
+    #[test]
+    fn charset_force_native_covers_tomcat_cache_surface() {
+        let charset = "java/nio/charset/Charset";
+        assert!(
+            force_native_over_real_jdk_bytecode(
+                charset,
+                "availableCharsets",
+                "()Ljava/util/SortedMap;"
+            ),
+            "Tomcat B2CConverter must use native Charset.availableCharsets"
+        );
+        assert!(
+            force_native_over_real_jdk_bytecode(charset, "aliases", "()Ljava/util/Set;"),
+            "Tomcat CharsetCache must use native Charset.aliases on synthetic Charset objects"
+        );
+        assert!(!force_native_over_real_jdk_bytecode(
+            charset,
+            "aliases",
+            "()Ljava/util/List;"
         ));
     }
 

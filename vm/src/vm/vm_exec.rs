@@ -1859,6 +1859,13 @@ impl<'a> NativeContextImpl<'a> {
     pub(crate) fn read_thread_task_object(&self, thread_obj: ObjectRef) -> Option<ObjectRef> {
         let header = self.shared.heap.get_header(thread_obj);
         let cm = self.shared.class_manager.read();
+        if let Some(target_slot) =
+            resolve_field_index_in_hierarchy(header.class_id, "target", &cm.class_store)
+        {
+            if let Value::Object(Some(task)) = self.shared.heap.get_field(thread_obj, target_slot) {
+                return Some(task);
+            }
+        }
         if let Some(holder_slot) =
             resolve_field_index_in_hierarchy(header.class_id, "holder", &cm.class_store)
         {
@@ -11322,6 +11329,11 @@ fn invoke_on_class_shared_inner(
                             method_name,
                             descriptor,
                         )
+                        || crate::runtime::interpreter::is_java_nio_access_native_override(
+                            class_name,
+                            method_name,
+                            descriptor,
+                        )
                         || crate::runtime::interpreter::is_xerces_cmstateset_native_override(
                             class_name,
                             method_name,
@@ -12323,12 +12335,15 @@ fn invoke_on_class_shared_inner(
                         // SportMe / Tomcat startup: real-JDK `Charset.availableCharsets()`
                         // (Charset.java:610) enumerates `CharsetProvider` SPI and calls
                         // `Charset.put` which dereferences a null name, NPEing during
-                        // `B2CConverter.<clinit>` -> `Connector.setURIEncoding`. Force
-                        // our native (registered in `register_p61_charset`) that returns
-                        // a populated TreeMap with the standard charsets directly.
+                        // `B2CConverter.<clinit>` -> `Connector.setURIEncoding`. The same
+                        // Tomcat path calls `Charset.aliases()` on native-produced Charset
+                        // objects whose real-JDK `aliases` field may be empty/null. Force
+                        // our registered natives for both methods.
                         || (class_name == "java/nio/charset/Charset"
-                            && method_name == "availableCharsets"
-                            && descriptor == "()Ljava/util/SortedMap;")
+                            && ((method_name == "availableCharsets"
+                                && descriptor == "()Ljava/util/SortedMap;")
+                                || (method_name == "aliases"
+                                    && descriptor == "()Ljava/util/Set;")))
                         // SLF4J replay: force `LinkedBlockingQueue.clear` native over JDK
                         // bytecode so the synthetic field slots used by `drainTo` stay consistent.
                         || (class_name == "java/util/concurrent/LinkedBlockingQueue"
@@ -15422,6 +15437,36 @@ mod tests {
         });
         cm.register_class_name(ClassLoaderId::Application, class_name, id);
         (id, num_fields)
+    }
+
+    #[test]
+    fn read_thread_task_object_prefers_jdk17_direct_target_field() {
+        let shared = test_shared();
+        let (thread_cid, _n) = add_real_class_with_field_descriptors(
+            &shared,
+            "cratonvm/test/Jdk17ThreadLayout",
+            &["Ljava/lang/Runnable;"],
+        );
+        {
+            let mut cm = shared.class_manager.write();
+            let cls = cm
+                .get_class_mut(thread_cid)
+                .expect("test thread layout class registered");
+            cls.fields[0].name = Arc::from("target");
+        }
+
+        let thread_obj = shared.heap.alloc_object(thread_cid, 1);
+        let target = shared.heap.alloc_object(ClassId::new(0), 0);
+        shared
+            .heap
+            .set_field(thread_obj, 0, Value::Object(Some(target)));
+
+        let mut thread = JvmThread::new(ThreadId(0), "test");
+        let ctx = NativeContextImpl {
+            shared: &shared,
+            thread: &mut thread,
+        };
+        assert_eq!(ctx.read_thread_task_object(thread_obj), Some(target));
     }
 
     /// values_equal_for_cas: a `Long(5)` and `Double::from_bits(5)` share
