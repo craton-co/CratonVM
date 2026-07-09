@@ -1,17 +1,6 @@
 # GC_STRESS — residual corruption faces (post concurrent-old-gen fix)
 
-**Status:** 🟡 OPEN (residual). **Severe manifestations RESOLVED** — the
-doc's original *critical* framing (SIGSEGV / `CompactValue` panic / hard
-crash, "5/6 soak runs crash") no longer reproduces: **0 crashes across 56
-Fork6Hard GC_STRESS runs on current dev** (2026-07-07, commit `3a1a95b5`).
-What remains is a **contained** young-mark stale-reference residual (guard
-rejects the corrupt header; the run usually completes) that still escalates
-to a Java-level `ClassCastException` / `NoSuchMethodError` / `nullchild`
-rep-failure in a minority of runs and to a rare STW wedge. Split off
-`gcstress-concurrent-oldgen-races-FIXED.md` (in `docs/internal/`, defects
-fixed on dev `57f545be`). Root cause of the residual not yet identified;
-see the 2026-07-07 re-assessment below, which **refutes** the two leading
-producer hypotheses.
+**Status:** OPEN (residual warning lane). A4 stale-receiver manifestations RESOLVED 2026-07-09 - after the Fork6/FJP fix, the final aggressive real-FJP `GC_STRESS=65536` validation passed 48/48 (`fail=0 timeout=0 signal_logs=0`) with no `ClassCastException`, `NoSuchMethodError`, `nullchild`, underflow, crash, or timeout signatures. The run still emitted inconsistent-header warning noise, so this note stays in `docs/known-issues` for that residual. Split off `gcstress-concurrent-oldgen-races-FIXED.md` (in `docs/internal/`, defects fixed on dev `57f545be`). Earlier 2026-07-07 evidence below is retained for history.
 
 ## Repro
 
@@ -105,9 +94,9 @@ doc's face-1 "stale pointer in a Value cell," confirmed, not a torn header
 write. `[A2] BREADCRUMB — NO allocation record covers …
 (freed+reused past the ring)` confirms the target was a real allocation
 that died and had its slot reused while a live holder still referenced it:
-a **missed root / missed remap**, the same class as the blocked-thread /
+a **missed root / missed remap**, the same broad class as the now-retired blocked-thread /
 `fork6-fjp` A4 register-resident-root family
-([fork6-fjp-multithread-jit-root-reclamation.md](fork6-fjp-multithread-jit-root-reclamation.md),
+([fork6-fjp-multithread-jit-root-reclamation-FIXED.md](../internal/fixed-suite-bugs/fork6-fjp-multithread-jit-root-reclamation-FIXED.md),
 [dohead-jit-heap-corruption-register-invisibility.md](dohead-jit-heap-corruption-register-invisibility.md)).
 
 ### The cheap ZonedDateTimeTest repro face is now CLOSED
@@ -227,7 +216,7 @@ OPEN here rather than retired because the underlying corruption is unfixed.
    `kind=Object array_length=512 num_slots=4 class_id=6` — an A4-family
    tag/layout confusion under JIT, distinct from GC reclamation. May be
    related to the still-open fork6-fjp A4 register-only residual (see
-   [fork6-fjp-multithread-jit-root-reclamation.md](fork6-fjp-multithread-jit-root-reclamation.md)) —
+   [fork6-fjp-multithread-jit-root-reclamation-FIXED.md](../internal/fixed-suite-bugs/fork6-fjp-multithread-jit-root-reclamation-FIXED.md)) —
    unconfirmed. Untouched this round (all diagnosis ran `--nojit`).
 3. **Bootstrap `set_field` OOB write-drop — ROOT-CAUSED AND FIXED
    (2026-07-03).** The `CRATONVM_DBG_OOBFIELD=Object` backtrace named

@@ -91,7 +91,15 @@ pub fn collect_roots(shared: &SharedVm, thread: &JvmThread) -> Vec<ObjectRef> {
     // `CRATONVM_NO_CONSERVATIVE_LOCALS`.
     let conservative_locals = conservative_locals_enabled();
     for frame in thread.frames.iter() {
-        frame.scan_local_objects(&mut roots, &shared.heap);
+        if conservative_locals {
+            // In the non-moving stress collector, local-liveness precision can
+            // drop an active FJP receiver while it is also parked in a callee
+            // frame. Over-retaining a dead reference is harmless here; missing
+            // the receiver lets selective promotion zero it under `join()`.
+            frame.scan_local_objects_all_live(&mut roots, &shared.heap);
+        } else {
+            frame.scan_local_objects(&mut roots, &shared.heap);
+        }
         if conservative_locals {
             frame.scan_locals_conservative(&mut roots, &shared.heap);
         }

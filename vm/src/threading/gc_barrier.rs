@@ -97,6 +97,15 @@ impl GcBarrier {
     /// Request a stop-the-world pause, computing `alive_count` while the
     /// barrier transition lock is held.
     ///
+    /// Legacy callers provide only the total alive-thread count, so this keeps
+    /// the historical behaviour and subtracts the barrier's global blocked
+    /// count as-is. Production GC paths should prefer
+    /// [`Self::request_stw_counted_with_live_blocked`], which uses the registry
+    /// publication made when a thread deposits its blocked-region roots. That
+    /// prevents both stale global slots from lowering `expected` too far and
+    /// newly blocked, already-snapshotted threads from being waited on before
+    /// `enter_blocked` increments the anonymous global counter.
+    ///
     /// This is the production entry point for VM GC initiators. It serializes
     /// the alive-thread snapshot with blocked-region transitions such as thread
     /// termination, avoiding mixed observations like "thread already dead" plus
@@ -106,11 +115,46 @@ impl GcBarrier {
         F: FnOnce() -> u32,
     {
         let mut inner = self.inner.lock();
+        let alive_count = alive_count();
+        self.request_stw_counted_locked(&mut inner, initiator, alive_count, None)
+    }
+
+    /// Request a stop-the-world pause with both the alive-thread count and the
+    /// subset of those alive threads that are currently published as blocked.
+    ///
+    /// `live_blocked_count` is the authoritative exclusion count for these
+    /// callers: `in_blocked_region` is set only after the thread's root snapshot
+    /// has been deposited, and it can become visible before `enter_blocked`
+    /// increments the anonymous `threads_blocked` counter. The global counter is
+    /// still useful for legacy callers and diagnostics, but production GC must
+    /// key the expected mutator quota off the same registry state that owns the
+    /// blocked root/fixup publication.
+    pub fn request_stw_counted_with_live_blocked<F>(&self, initiator: ThreadId, counts: F) -> bool
+    where
+        F: FnOnce() -> (u32, u32),
+    {
+        let mut inner = self.inner.lock();
+        let (alive_count, live_blocked_count) = counts();
+        self.request_stw_counted_locked(
+            &mut inner,
+            initiator,
+            alive_count,
+            Some(live_blocked_count),
+        )
+    }
+
+    fn request_stw_counted_locked(
+        &self,
+        inner: &mut GcBarrierInner,
+        initiator: ThreadId,
+        alive_count: u32,
+        live_blocked_count: Option<u32>,
+    ) -> bool {
         if self.stw_requested.load(Ordering::Acquire) {
             return false;
         }
         inner.initiator = Some(initiator);
-        // T19.H1 — exclude threads currently parked in a blocking native
+        // T19.H1: exclude threads currently parked in a blocking native
         // from the set we wait for. They are GC-safe (roots already
         // deposited via `deposit_root_snapshot`) and execute no code, so
         // they will not reach an interpreter safepoint. Without this, a
@@ -118,28 +162,36 @@ impl GcBarrier {
         // in `ReferenceQueue.remove` deadlocks `wait_for_all` forever.
         //
         // Race analysis (the count may change after this read):
-        //  * blocked→running after the read: the waking thread runs
+        //  * blocked->running after the read: the waking thread runs
         //    `check_post_block_gc`, sees `stw_requested`, and waits the
-        //    pause out. B2 fix — it does so via `arrive_and_wait_excluded`
+        //    pause out. B2 fix: it does so via `arrive_and_wait_excluded`
         //    (or, once it has left the blocked region and become a counted
         //    mutator, via the participating `arrive_and_wait`). An excluded
         //    caller never bumps `arrived`, so it can no longer satisfy the
         //    `arrived >= expected` quota early and release `wait_for_all`
         //    while a counted mutator is still running.
-        //  * running→blocked after the read: handled by `enter_blocked`,
-        //    which — if a STW is already active — makes the thread
+        //  * running->blocked after the read: handled by `enter_blocked`,
+        //    which, if a STW is already active, makes the thread
         //    arrive at the barrier *before* it parks, so the initiator
         //    is not left waiting for a thread that counted in `expected`
         //    and then vanished into a block.
-        let alive_count = alive_count();
         let blocked = self.threads_blocked.load(Ordering::Acquire);
         let blocked_u32 = u32::try_from(blocked).unwrap_or(u32::MAX);
-        inner.expected = alive_count.saturating_sub(1).saturating_sub(blocked_u32);
+        let live_blocked_for_log = live_blocked_count.unwrap_or(blocked_u32);
+        let effective_blocked = live_blocked_count.unwrap_or(blocked_u32);
+        inner.expected = alive_count
+            .saturating_sub(1)
+            .saturating_sub(effective_blocked);
         inner.arrived = 0;
         if std::env::var_os("CRATONVM_DBG_STW_CENSUS").is_some() {
             eprintln!(
-                "[stw-request] initiator={} alive={} blocked={} expected={}",
-                initiator.0, alive_count, blocked_u32, inner.expected
+                "[stw-request] initiator={} alive={} blocked={} live_blocked={} effective_blocked={} expected={}",
+                initiator.0,
+                alive_count,
+                blocked_u32,
+                live_blocked_for_log,
+                effective_blocked,
+                inner.expected
             );
         }
         // NOTE: do NOT clear `pointer_map` here. With generation-keyed waiting
@@ -467,6 +519,28 @@ impl GcBarrier {
         self.complete_gc(HashMap::new());
         true
     }
+
+    /// [`brief_stw_counted`] variant that uses the registry's published live
+    /// blocked-thread count. See
+    /// [`Self::request_stw_counted_with_live_blocked`].
+    pub fn brief_stw_counted_with_live_blocked<C, F>(
+        &self,
+        initiator: ThreadId,
+        counts: C,
+        work: F,
+    ) -> bool
+    where
+        C: FnOnce() -> (u32, u32),
+        F: FnOnce(),
+    {
+        if !self.request_stw_counted_with_live_blocked(initiator, counts) {
+            return false;
+        }
+        self.wait_for_all();
+        work();
+        self.complete_gc(HashMap::new());
+        true
+    }
 }
 
 impl Default for GcBarrier {
@@ -745,6 +819,39 @@ mod tests {
                 inner.expected, 1,
                 "manual dead blocked thread must not be subtracted from the live mutator quota",
             );
+        }
+        barrier.complete_gc(HashMap::new());
+    }
+    #[test]
+    fn counted_request_ignores_stale_global_blocked_slots() {
+        let barrier = GcBarrier::new();
+        // Simulate a leaked/stale blocked slot not represented by any live
+        // blocked registry entry. A plain global subtraction would set
+        // expected=0 for two alive threads and let GC proceed without waiting
+        // for the one live peer.
+        barrier.threads_blocked.store(1, Ordering::Release);
+
+        assert!(barrier.request_stw_counted_with_live_blocked(ThreadId(0), || (2, 0)));
+        {
+            let inner = barrier.inner.lock();
+            assert_eq!(inner.expected, 1);
+        }
+        barrier.complete_gc(HashMap::new());
+    }
+
+    #[test]
+    fn counted_request_uses_live_blocked_before_global_counter_increment() {
+        let barrier = GcBarrier::new();
+        // A blocking thread deposits roots and sets its registry blocked flag
+        // before `enter_blocked` increments the anonymous global count. Once the
+        // root snapshot is published, STW must exclude it even if the global
+        // counter still reads zero.
+        barrier.threads_blocked.store(0, Ordering::Release);
+
+        assert!(barrier.request_stw_counted_with_live_blocked(ThreadId(0), || (4, 2)));
+        {
+            let inner = barrier.inner.lock();
+            assert_eq!(inner.expected, 1);
         }
         barrier.complete_gc(HashMap::new());
     }

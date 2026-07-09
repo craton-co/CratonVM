@@ -1379,6 +1379,31 @@ impl Frame {
     /// filter unchanged; long-bit-patterns whose lower 47 bits don't point
     /// at a live heap object are correctly excluded.
     pub fn scan_local_objects(&self, roots: &mut Vec<ObjectRef>, heap: &crate::memory::VmHeap) {
+        self.scan_local_objects_inner(roots, heap, true);
+    }
+
+    /// Variant used by the non-moving ForkJoin stress snapshot path.
+    ///
+    /// It keeps the exact same kind/tag filtering as [`Self::scan_local_objects`]
+    /// but treats every non-primitive local as live. This is only sound for the
+    /// non-moving selective-promotion collector, where an extra dead reference
+    /// can only over-retain/pin; the moving collector must continue using the
+    /// liveness-filtered scan to avoid retaining scoped-out references for whole
+    /// frame lifetimes.
+    pub fn scan_local_objects_all_live(
+        &self,
+        roots: &mut Vec<ObjectRef>,
+        heap: &crate::memory::VmHeap,
+    ) {
+        self.scan_local_objects_inner(roots, heap, false);
+    }
+
+    fn scan_local_objects_inner(
+        &self,
+        roots: &mut Vec<ObjectRef>,
+        heap: &crate::memory::VmHeap,
+        honor_liveness: bool,
+    ) {
         // Per-bci local liveness (HotSpot interpreter-oop-map equivalent): a
         // slot whose value can never be read again under bytecode semantics
         // is NOT a root. Without this, a scoped-out local (e.g. a loop
@@ -1390,7 +1415,7 @@ impl Frame {
         // unioned, and slot 0 is always kept. Opt out with
         // `CRATONVM_NO_LOCAL_LIVENESS=1`. The NON-MOVING conservative scan
         // (`scan_locals_conservative`) is intentionally unfiltered.
-        let live_mask = if crate::runtime::env_cache::no_local_liveness() {
+        let live_mask = if !honor_liveness || crate::runtime::env_cache::no_local_liveness() {
             crate::runtime::local_liveness::ALL_LIVE
         } else {
             crate::runtime::local_liveness::live_locals_mask(
@@ -2102,6 +2127,14 @@ mod tests {
             [frame.pc, frame.last_instr_pc],
         );
         assert_eq!(mask & 0b010, 0, "analyzer must report slot 1 dead");
+
+        let mut all_live_roots = Vec::new();
+        frame.scan_local_objects_all_live(&mut all_live_roots, &heap);
+        assert_eq!(
+            all_live_roots,
+            vec![obj],
+            "all-live snapshot scan must keep the scoped-out reference"
+        );
     }
 
     #[test]

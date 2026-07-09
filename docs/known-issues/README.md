@@ -141,7 +141,7 @@ All three verified against their real Keycloak classes via the suite runner; no 
 
 ## 2026-07-07 GC blocked-thread / stale-Thread-mirror doc RETIRED; real-net GC-blocking audit completed
 
-- ✅ RETIRED to [`docs/internal/gc-blocked-thread-frame-stale-thread-mirror-RESOLVED.md`](../internal/gc-blocked-thread-frame-stale-thread-mirror-RESOLVED.md): the 2026-06-29 six-class Tomcat hard-crash family (blocked thread's live young object reclaimed → SIGSEGV/`CompactValue` panic) is closed — 4297 encoding-suite Tomcat boot/serve/stop cases + all three tribes classes ran with ZERO stale-pointer warnings, ZERO panics, jit and nojit. Executing the doc's remaining audit TODO also landed six real-net GC-blocking fixes on this branch: `MulticastSocket.receive/send` and `DatagramChannel.receive0/send0` bracketted (+ held-ref re-sync), the `Selector.select` epoll wait bracketted (was the dominant STW-stall source — every NIO event loop held up every GC by its select timeout; `TestDataIntegrity --nojit` went from 420s-timeout/44 STW-stall warnings to completing with 0), `net_accept`'s post-wake writes re-synced, `net_connect0` bracketted, and `populate_selected_keys_field`'s `Set.add` loop pinned. The register-resident JIT oop remainder stays tracked in [dohead-jit-heap-corruption-register-invisibility.md](dohead-jit-heap-corruption-register-invisibility.md) + [fork6-fjp-multithread-jit-root-reclamation.md](fork6-fjp-multithread-jit-root-reclamation.md).
+- ✅ RETIRED to [`docs/internal/gc-blocked-thread-frame-stale-thread-mirror-RESOLVED.md`](../internal/gc-blocked-thread-frame-stale-thread-mirror-RESOLVED.md): the 2026-06-29 six-class Tomcat hard-crash family (blocked thread's live young object reclaimed → SIGSEGV/`CompactValue` panic) is closed — 4297 encoding-suite Tomcat boot/serve/stop cases + all three tribes classes ran with ZERO stale-pointer warnings, ZERO panics, jit and nojit. Executing the doc's remaining audit TODO also landed six real-net GC-blocking fixes on this branch: `MulticastSocket.receive/send` and `DatagramChannel.receive0/send0` bracketted (+ held-ref re-sync), the `Selector.select` epoll wait bracketted (was the dominant STW-stall source — every NIO event loop held up every GC by its select timeout; `TestDataIntegrity --nojit` went from 420s-timeout/44 STW-stall warnings to completing with 0), `net_accept`'s post-wake writes re-synced, `net_connect0` bracketted, and `populate_selected_keys_field`'s `Set.add` loop pinned. The historical register-resident JIT oop remainder is now retired: DoHead moved to [dohead-jit-heap-corruption-register-invisibility-FIXED.md](../internal/fixed-suite-bugs/dohead-jit-heap-corruption-register-invisibility-FIXED.md), and Fork6/A4 moved to [fork6-fjp-multithread-jit-root-reclamation-FIXED.md](../internal/fixed-suite-bugs/fork6-fjp-multithread-jit-root-reclamation-FIXED.md).
 - 🔴 NEW [tomcat-defaultservlet-encoding-content-failures.md](tomcat-defaultservlet-encoding-content-failures.md) — with the crash family gone, full 1360-case `TestDefaultServletEncoding{WithoutBom,WithBom}` nojit runs surface 264/228 functional failures (mostly `expected:<200> but was:<-1>`, exotic-output-encoding cases like ibm850 among the first failures; zero GC signal). Untriaged.
 - ✅ FIXED, retired to [`docs/internal/nio-native-side-table-stale-objectref-FIXED.md`](../internal/nio-native-side-table-stale-objectref-FIXED.md) — 2026-07-07 audit: the doc's named `sk_table`/`key_obj` hazard was already covered when written (`gc_scan_selector_roots` + `sk_table_update_after_gc`, landed 2026-06-21, run on every moving-collection path). The audit found a REAL sibling bug in the same file: `build_set` (backing `Selector.selectedKeys()`/`.keys()`) built its `HashSet` via an unpinned Rust local across GC-capable `Set.add` calls — same shape as the already-fixed `populate_selected_keys_field`. Fixed + covered by a new targeted `CRATONVM_GC_STRESS` fixture (`vm/tests/nio_selector_build_set_gc.rs`); reproduced and confirmed gone against Tomcat Tribes `TestDataIntegrity`.
 
@@ -394,22 +394,20 @@ it under `docs/internal`.
   DoHead crash family's FATAL layer is now itself fixed too (2026-07-06,
   `fix/dohead-sweep-freelist`) — doc moved to
   [`docs/internal/fixed-suite-bugs/dohead-jit-heap-corruption-register-invisibility-FIXED.md`](../internal/fixed-suite-bugs/dohead-jit-heap-corruption-register-invisibility-FIXED.md).
-  Its one real residual (Layer 1, register-invisible roots) remains tracked by
-  the still-open [`fork6-fjp-multithread-jit-root-reclamation.md`](fork6-fjp-multithread-jit-root-reclamation.md)
-  (gated on the deferred precise-JIT-stack-maps project).
+  Its one real residual (Layer 1, register-invisible roots) is now retired by
+  the Fork6/A4 fix; see
+  [`fork6-fjp-multithread-jit-root-reclamation-FIXED.md`](../internal/fixed-suite-bugs/fork6-fjp-multithread-jit-root-reclamation-FIXED.md).
 
 ## How many distinct bugs are here?
 
 After consolidation (full re-count 2026-06-18, kafka-bug-B/C status reconciled 2026-07-01),
 the ~30 docs map to **one root-cause family + ~16 distinct standalone bugs**, of which
-**10 are already FIXED on `dev`** (the prior 9 plus the Lucene104 provider
-initialization gap). Headline:
+**11 are already FIXED on `dev`** (the prior 10 plus the Fork6/FJP A4 root-reclamation bug). Headline:
 
-**~8 distinct OPEN defects + 1 latent** (was ~9 — the Lucene104 provider
-initialization gap was fixed 2026-07-02), grouped as:
+**~7 distinct OPEN defects + 1 latent** (was ~8 - Fork6/FJP A4 was fixed 2026-07-09), grouped as:
 
-1. **Family A — GC root coverage under JIT** (one root cause, several manifestations). Open members:
-   **A4** (Fork6 FJP multi-thread, gated) — the last open member. **A1/A2/A3/A5 are FIXED** — **A2**
+1. **Family A - GC root coverage under JIT** (one root cause, several manifestations). Open members:
+   none from the Fork6/FJP lane; **A1/A2/A3/A4/A5 are FIXED**. **A2**
    (`ReflRepro`) was re-diagnosed and fixed 2026-06-23 (`6e3ddb05`): it was **never** a
    register/native-return missed root, but a GC-side non-moving-sweep free-list double-serve
    (overlapping free blocks not coalesced → `Arena::alloc` served the same region twice); A5 was
@@ -542,7 +540,7 @@ deep-recursion item remains — see below).
 - The two Hibernate-JTA docs (`hibernate-jta-narayana-…` + `hibernate-jta-txcontrol-getinetaddress-per-class-report`)
   described the **same** Narayana cluster → merged into `hibernate-jta-narayana-xa-completion-and-socket-loopback.md`;
   the per-class file is now a redirect stub.
-- (2026-06-17) The two Fork6 precise-maps files were already merged into `fork6-fjp-multithread-jit-root-reclamation.md`.
+- (2026-06-17) The two Fork6 precise-maps files were merged into `fork6-fjp-multithread-jit-root-reclamation.md`; the combined A4 note is now retired as [`fork6-fjp-multithread-jit-root-reclamation-FIXED.md`](../internal/fixed-suite-bugs/fork6-fjp-multithread-jit-root-reclamation-FIXED.md).
 
 The former **JIT regalloc callee-saved-register clobber** umbrella family is
 resolved on x64 dev (2026-07-04) by making callee-saved GPR local homes opt-in only;
@@ -577,42 +575,32 @@ root); `-Xmx8g` passes (no young GC).
 > previously `rc=139`. It was **never** a register/native-return missed root — it
 > was a GC-side non-moving-sweep free-list double-serve (overlapping free blocks
 > not coalesced), fixed in the sweep coalescer; precise maps are orthogonal.
-> **A4 is OPEN:** non-stress gated `CRATONVM_REAL_FORKJOINPOOL=1`
-> `Fork6`/`Fork6Hard` remains ALL-OK on current dev (re-verified 2026-07-01).
-> **Correction (2026-07-03): the aggressive `GC_STRESS=262144`/`65536`
-> failures are NOT A4** (or any JIT-root coverage gap) — root-caused as three
-> live-object-freeing races in the *concurrent old-gen* mark/sweep, unrelated
-> to JIT/register roots (reproduces under `--nojit` with zero live JIT frames
-> at every STW). Those three defects are **FIXED on dev** (`57f545be`;
-> [gcstress-concurrent-oldgen-races-FIXED.md](../internal/gcstress-concurrent-oldgen-races-FIXED.md)).
-> A *different*, still-unexplained residual corruption survives that fix on
-> the same aggressive lane — tracked separately at
-> [gcstress-residual-corruption-faces.md](gcstress-residual-corruption-faces.md);
-> face 2 there (JIT lost-tag int-in-ref-slot) may or may not be the same
-> mechanism as A4's register-only residual — unconfirmed. Separately, the
-> cross-thread STW JIT takeover (BUG-03) had a **gate-polarity bug making it
-> silently inert in every default-env run** — fixed 2026-07-02, see the "Fix
-> 2026-07-02" section of the A4 doc. A4's own register-only residual is
-> unaffected by any of this and remains **OPEN**, gated on the deferred
-> precise-JIT-stack-maps project. The *family is not yet formally retired*
-> (A4 + container-app CI remain); **nothing was removed** — all repros, GC
-> guards, `CRATONVM_DBG_*` knobs, and the shadow stack are retained as
-> experimental/debug tools.
->
-> See `docs/feature-designs/precise-jit-maps-default.md` "Step 8 — GC-root family
-> retirement status".
+> **A4 is FIXED (2026-07-09):** the gated real-FJP
+> `CRATONVM_REAL_FORKJOINPOOL=1` repro is retired. The final fix combines
+> live-blocked STW accounting, correct `Unsafe.compareAndExchange*` witness
+> returns, and all-live reference-local scans on the real-FJP non-moving root
+> snapshot path. Final validation: plain `Fork6` and `Fork6Hard 128 20` are
+> `ALL-OK`, and aggressive `Fork6Hard 128 20` with `GC_STRESS=65536` passed
+> 48/48 (`fail=0 timeout=0 signal_logs=0`) on the unique Linux binary
+> `cratonvm-fork6-alllive-caxwitness-20260709-012308`. The separate
+> [gcstress-residual-corruption-faces.md](gcstress-residual-corruption-faces.md)
+> note remains open for warning-only inconsistent-header noise observed under
+> stress, but the A4 stale-receiver / exception / underflow / crash / timeout
+> signatures are closed. The repros and `CRATONVM_DBG_*` knobs are retained as
+> regression tools.
 
-The eventual correct fix for the whole family is **precise JIT stack roots**
+The register-only portions of this family are covered by **precise JIT stack roots**
 (know exactly which registers/slots hold oops at each safepoint), tracked under
-`project_precise_jit_stack_maps`. The `CRATONVM_SHADOW_STACK` mechanism is the
-current (incomplete/buggy) implementation of that.
+`project_precise_jit_stack_maps`. The retired Fork6/FJP A4 path needed separate
+real-FJP root/CAS/local-snapshot fixes. The `CRATONVM_SHADOW_STACK` mechanism is
+retained as experimental scaffolding.
 
 | # | Manifestation | Repro | Status | Doc |
 |---|---|---|---|---|
 | **A1** | Reflection mirror-array builders held an `ObjectRef` array in a Rust local across allocating calls (`Field[]`/`Method[]`/annotation arrays) | `wildfly-suite/repro/MinRepro` | ✅ **FIXED on dev** (`pin_native_root` sweep) | _(doc removed; resolved)_ |
 | **A2** | **`implausible object size` young-sweep-walker crash** (reflection/String-array allocation churn) — a *distinct* bug, NOT the register root: a non-moving-sweep free-list double-serve (overlapping free blocks not coalesced) | [`../internal/repros/A2-reflrepro/`](../internal/repros/A2-reflrepro/) | ✅ **FIXED on dev** (`6e3ddb05`, 2026-06-23; coalesce overlapping free blocks) — `ReflRepro 8000 @ GC_STRESS=65536` → `ok=8000 bad=0` (re-verified 2026-06-29); precise maps orthogonal; moved to docs/internal | [reflrepro-register-resident-jit-root-handoff.md](../internal/app-jvm-bugs/reflrepro-register-resident-jit-root-handoff.md) |
 | **A3** | **Register-invisibility** — a live oop sits only in a CPU register at a young-GC safepoint, invisible to the stack-only scan (single thread) | `apps/spring-boot/buildSrc/runner/MinRegexProbe` | ✅ **FIXED on dev** (`32649b56`, precise maps default-on) | _(doc removed; resolved)_ |
-| **A4** | Multi-thread: live `ForkJoinTask`s reclaimed under **FJP worker threads** + a **lost-tag** interpreter local (register-only residual) | `scratch/xworker/Fork6` / `docs/known-issues/repros/A4-fork6/Fork6Hard.java` (needs `CRATONVM_REAL_FORKJOINPOOL=1`) | 🟡 **OPEN** — non-stress `Fork6`/`Fork6Hard` is ALL-OK on current dev (re-verified 2026-07-01). The `GC_STRESS` lane failures previously attributed to A4 are **re-scoped as a separate bug** (2026-07-03, see [gcstress-residual-corruption-faces.md](gcstress-residual-corruption-faces.md)) — three concurrent-old-gen races were FIXED, a different residual remains. A4's own register-only gap is unaffected, still gated on precise-JIT-stack-maps. | [fork6-fjp-multithread-jit-root-reclamation.md](fork6-fjp-multithread-jit-root-reclamation.md) |
+| **A4** | Real-FJP multi-thread stale task/root reclamation under `Fork6` / `Fork6Hard` | `scratch/xworker/Fork6` / `docs/known-issues/repros/A4-fork6/Fork6Hard.java` (needs `CRATONVM_REAL_FORKJOINPOOL=1`) | FIXED on dev (2026-07-09) - live-blocked STW accounting + `Unsafe.compareAndExchange*` CAS witnesses + all-live real-FJP reference-local snapshots; `Fork6Hard 128 20` `GC_STRESS=65536` 48/48 clean for A4 signatures. Residual inconsistent-header warning noise remains tracked separately. | [fork6-fjp-multithread-jit-root-reclamation-FIXED.md](../internal/fixed-suite-bugs/fork6-fjp-multithread-jit-root-reclamation-FIXED.md) |
 | **A4-gcstress** | Concurrent old-gen mark/sweep: SATB never wired (no production caller), young→old roots never traced, failed remark STW fell through to the sweep — three JIT-**unrelated** live-object-freeing races surfaced by the aggressive `GC_STRESS` lane | `docs/known-issues/repros/A4-fork6/Fork6Hard.java` + `CRATONVM_DBG_GC_STRESS=65536` | ✅ **FIXED on dev** (`57f545be`) — 42/42 focused `cratonvm-gc` unit tests; controls (`Fork6`, `Fork6Hard 256 40`, bt16) green. Residual (different signatures) tracked separately | [../internal/gcstress-concurrent-oldgen-races-FIXED.md](../internal/gcstress-concurrent-oldgen-races-FIXED.md) (fixed) / [gcstress-residual-corruption-faces.md](gcstress-residual-corruption-faces.md) (residual, open) |
 | **A5** | **Object-binarytrees moving-GC corruption** — the compiled entry-point `main`'s JIT frame is invisible to `gc_quiescence` (invoked via `Vm::invoke` without a `JitEntryGuard`), so the **moving** young collector relocates its roots and can't rewrite the raw stack slots → stale all-zero receiver. (The earlier "register-only stale root in `bottomUpTree`" framing was wrong — `bottomUpTree` isn't even compiled at the crash.) | [`../internal/repros/gc-stress-bintrees-main-args/`](../internal/repros/gc-stress-bintrees-main-args/) (`VAAload`) | ✅ **FIXED** (dev `77c98761`) — detect an unregistered JIT frame on the native stack → non-moving sweep + full-stack mark. Repro archived under `docs/internal`. Residual: Windows-only (portable stack-bound is a follow-up) | [docs/internal/.../gc-stress-bintrees-main-args-unregistered-jit-frame-FIXED.md](../internal/app-jvm-bugs/gc-stress-bintrees-main-args-unregistered-jit-frame-FIXED.md) |
 
@@ -631,7 +619,7 @@ current (incomplete/buggy) implementation of that.
 > **Scope correction (verified 2026-06-17): A2 and A4 are NOT closed by this** — they
 > have *separate* bugs. **[SUPERSEDED 2026-06-23: A2 is now FIXED — `6e3ddb05`, a
 > free-list double-serve in the sweep coalescer, not a register root; `ReflRepro`
-> `bad=0`. See the top-of-section refresh + the A2 table row. A4 remains open.]**
+> `bad=0`. See the top-of-section refresh + the A2 table row. A4 is now FIXED by the 2026-07-09 real-FJP root/CAS/local-snapshot work.]**
 > **A2** (`ReflRepro`) *(then)* still crashed with `implausible object
 > size` / `inconsistent header` on the young-sweep WALK (a core array/String
 > allocation↔sweep bug, distinct from the register root — precise maps fix root
@@ -966,7 +954,7 @@ PreviewFeatures native crash. The remaining non-passed rows are tracked here:
 
 - **2026-06-17:** Merged `precise-jit-stack-maps-multithread-fjp-worker-testcase.md`
   (handoff/testcase) and `precise-jit-stack-maps-fork6-findings.md` (findings)
-  into a single [fork6-fjp-multithread-jit-root-reclamation.md](fork6-fjp-multithread-jit-root-reclamation.md)
+  into a single [fork6-fjp-multithread-jit-root-reclamation-FIXED.md](../internal/fixed-suite-bugs/fork6-fjp-multithread-jit-root-reclamation-FIXED.md)
   — they described the *same* Fork6 bug (A4). Added this index framing the
   A1–A4 family + standalone B/C, and recorded the current-`dev` A3 verification.
 

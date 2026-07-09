@@ -818,11 +818,17 @@ fn maybe_gc(shared: &SharedVm, thread: &mut JvmThread) {
                 // (same closure, same barrier lock) for identity-based
                 // takeover excusal.
                 counted_os_tids.clear();
-                shared.gc_barrier.request_stw_counted(thread.thread_id, || {
-                    let (n, tids) = shared.thread_registry.alive_count_and_os_tids();
-                    counted_os_tids = tids;
-                    u32::try_from(n).unwrap_or(u32::MAX)
-                })
+                shared
+                    .gc_barrier
+                    .request_stw_counted_with_live_blocked(thread.thread_id, || {
+                        let (n, blocked, tids) =
+                            shared.thread_registry.alive_count_blocked_and_os_tids();
+                        counted_os_tids = tids;
+                        (
+                            u32::try_from(n).unwrap_or(u32::MAX),
+                            u32::try_from(blocked).unwrap_or(u32::MAX),
+                        )
+                    })
             };
             if should_initiate_gc {
                 // We are the GC initiator. BUG-03 — forcibly stop in-JIT
@@ -951,11 +957,17 @@ fn maybe_gc_forced(shared: &SharedVm, thread: &mut JvmThread) {
             // xt-hardening (2026-07-03): see maybe_gc — atomic counted-set
             // snapshot for identity-based takeover excusal.
             counted_os_tids.clear();
-            shared.gc_barrier.request_stw_counted(thread.thread_id, || {
-                let (n, tids) = shared.thread_registry.alive_count_and_os_tids();
-                counted_os_tids = tids;
-                u32::try_from(n).unwrap_or(u32::MAX)
-            })
+            shared
+                .gc_barrier
+                .request_stw_counted_with_live_blocked(thread.thread_id, || {
+                    let (n, blocked, tids) =
+                        shared.thread_registry.alive_count_blocked_and_os_tids();
+                    counted_os_tids = tids;
+                    (
+                        u32::try_from(n).unwrap_or(u32::MAX),
+                        u32::try_from(blocked).unwrap_or(u32::MAX),
+                    )
+                })
         };
         if should_initiate_gc {
             // BUG-03 — forcibly stop + conservatively scan in-JIT peers.
@@ -1122,11 +1134,17 @@ pub fn force_gc_from_native(shared: &SharedVm, thread: &mut JvmThread) {
             // xt-hardening (2026-07-03): see maybe_gc — atomic counted-set
             // snapshot for identity-based takeover excusal.
             counted_os_tids.clear();
-            shared.gc_barrier.request_stw_counted(thread.thread_id, || {
-                let (n, tids) = shared.thread_registry.alive_count_and_os_tids();
-                counted_os_tids = tids;
-                u32::try_from(n).unwrap_or(u32::MAX)
-            })
+            shared
+                .gc_barrier
+                .request_stw_counted_with_live_blocked(thread.thread_id, || {
+                    let (n, blocked, tids) =
+                        shared.thread_registry.alive_count_blocked_and_os_tids();
+                    counted_os_tids = tids;
+                    (
+                        u32::try_from(n).unwrap_or(u32::MAX),
+                        u32::try_from(blocked).unwrap_or(u32::MAX),
+                    )
+                })
         };
         if should_initiate_gc {
             // BUG-03 — forcibly stop + conservatively scan in-JIT peers.
@@ -2173,7 +2191,15 @@ pub(crate) fn update_root_snapshot(shared: &SharedVm, thread: &mut JvmThread) {
         // (`conservative_locals` was computed above, where it also gates the
         // cached path off so this hardening is never skipped.)
         for frame in &thread.frames {
-            frame.scan_local_objects(&mut snapshot, &shared.heap);
+            if conservative_locals {
+                // The non-moving FJP stress path uses root values as pins. A
+                // liveness-filtered scan can drop an active task receiver at a
+                // call boundary; all-live reference scanning only over-retains
+                // in this collector and prevents reclaiming that receiver.
+                frame.scan_local_objects_all_live(&mut snapshot, &shared.heap);
+            } else {
+                frame.scan_local_objects(&mut snapshot, &shared.heap);
+            }
             if conservative_locals {
                 frame.scan_locals_conservative(&mut snapshot, &shared.heap);
             }
@@ -2790,9 +2816,15 @@ fn maybe_concurrent_gc(shared: &SharedVm, thread: &mut JvmThread) {
     );
 
     // Phase 1: Initial Mark — brief STW pause
-    let initial_mark_done = shared.gc_barrier.brief_stw_counted(
+    let initial_mark_done = shared.gc_barrier.brief_stw_counted_with_live_blocked(
         thread.thread_id,
-        || u32::try_from(shared.thread_registry.alive_count()).unwrap_or(u32::MAX),
+        || {
+            let (n, blocked, _tids) = shared.thread_registry.alive_count_blocked_and_os_tids();
+            (
+                u32::try_from(n).unwrap_or(u32::MAX),
+                u32::try_from(blocked).unwrap_or(u32::MAX),
+            )
+        },
         || {
             // Collect root pointers for old-gen marking
             let roots = collect_roots(shared, thread);
@@ -2906,9 +2938,15 @@ fn maybe_concurrent_gc(shared: &SharedVm, thread: &mut JvmThread) {
 fn g1_concurrent_mark_cycle(shared: &SharedVm, thread: &mut JvmThread) {
     // Phase 1: Initial Mark — brief STW pause
     // Activates SATB write barrier and marks root-reachable objects
-    let initial_mark_done = shared.gc_barrier.brief_stw_counted(
+    let initial_mark_done = shared.gc_barrier.brief_stw_counted_with_live_blocked(
         thread.thread_id,
-        || u32::try_from(shared.thread_registry.alive_count()).unwrap_or(u32::MAX),
+        || {
+            let (n, blocked, _tids) = shared.thread_registry.alive_count_blocked_and_os_tids();
+            (
+                u32::try_from(n).unwrap_or(u32::MAX),
+                u32::try_from(blocked).unwrap_or(u32::MAX),
+            )
+        },
         || {
             // Round-5 fix (CRIT — UAF): drain the initiator's per-thread
             // SATB buffer on the way into initial-mark. Other mutators

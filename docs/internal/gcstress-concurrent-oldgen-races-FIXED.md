@@ -11,7 +11,7 @@ separately at
 Do not re-investigate the three defects below; they are closed.
 
 Split out of
-[fork6-fjp-multithread-jit-root-reclamation.md](../known-issues/fork6-fjp-multithread-jit-root-reclamation.md)
+[fork6-fjp-multithread-jit-root-reclamation-FIXED.md](fixed-suite-bugs/fork6-fjp-multithread-jit-root-reclamation-FIXED.md)
 (2026-07-02 section), which established this family is JIT-free — it
 reproduces under `--nojit` and with `any_thread_in_jit=false` at every STW.
 The GC_STRESS lane failures previously attributed to fork6-fjp's A4 (register-

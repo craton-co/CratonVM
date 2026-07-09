@@ -393,7 +393,7 @@ This is the long-standing residual of
 [`jit-junit-discovery-reflection-corruption.md`](jit-junit-discovery-reflection-corruption.md)
 (bug-06; the reflection mirror-array *pinning* part is fixed). It is the same
 class as the precise-JIT-stack-maps work — see
-[`fork6-fjp-multithread-jit-root-reclamation.md`](fork6-fjp-multithread-jit-root-reclamation.md).
+[`fork6-fjp-multithread-jit-root-reclamation-FIXED.md`](../fixed-suite-bugs/fork6-fjp-multithread-jit-root-reclamation-FIXED.md).
 Detailed writeup: `docs/wildfly-suite-bugs/bug-06b-jit-scan-cache-unsound.md`.
 
 ## Reproduce
