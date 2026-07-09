@@ -3,7 +3,8 @@
 
 //! Per-class compact object-field layout + GC oop-map registry.
 //!
-//! Under the compact reference-field layout (`CRATONVM_COMPACT_REF_FIELDS`),
+//! Under the compact reference-field layout (`CRATONVM_COMPACT_REF_FIELDS=0`
+//! opts out),
 //! reference instance fields are stored as bare 8-byte pointers instead of the
 //! 16-byte tagged [`crate::Value`] cell. The GC can no longer detect a reference
 //! slot by its cell tag, so it consults a per-class **oop-map**: the byte offsets
@@ -75,11 +76,21 @@ static COMPACT_ENABLED: OnceLock<bool> = OnceLock::new();
 ///
 /// Read once from `CRATONVM_COMPACT_REF_FIELDS` and cached for the lifetime of
 /// the process — the layout must be fixed so objects are never read under a
-/// different layout than they were written. Off by default; flag-off behaviour
-/// is byte-identical to the legacy uniform 16-byte-cell layout.
+/// different layout than they were written. On by default; set
+/// `CRATONVM_COMPACT_REF_FIELDS=0` (or `false`/`off`/`no`) to use the legacy
+/// uniform 16-byte-cell layout for A/B runs.
 #[inline]
 pub fn compact_ref_fields_enabled() -> bool {
-    *COMPACT_ENABLED.get_or_init(|| std::env::var_os("CRATONVM_COMPACT_REF_FIELDS").is_some())
+    *COMPACT_ENABLED.get_or_init(|| match std::env::var("CRATONVM_COMPACT_REF_FIELDS") {
+        Ok(value) => {
+            let value = value.trim();
+            !matches!(
+                value,
+                "0" | "false" | "False" | "FALSE" | "off" | "Off" | "OFF" | "no" | "No" | "NO"
+            )
+        }
+        Err(_) => true,
+    })
 }
 
 /// Force the enable flag to a specific value (test-only / explicit VM config).
