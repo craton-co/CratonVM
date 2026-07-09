@@ -2508,6 +2508,17 @@ const BYTEBUDDY_TYPE_LIST_GENERIC_EXPLICIT: &str =
     "net/bytebuddy/description/type/TypeList$Generic$Explicit";
 const BYTEBUDDY_METHOD_GRAPH_FOR_JAVA_METHOD_TOKEN: &str =
     "net/bytebuddy/dynamic/scaffold/MethodGraph$Compiler$Default$Harmonizer$ForJavaMethod$Token";
+const BYTEBUDDY_METHOD_GRAPH_DEFAULT_KEY: &str =
+    "net/bytebuddy/dynamic/scaffold/MethodGraph$Compiler$Default$Key";
+const BYTEBUDDY_METHOD_GRAPH_DEFAULT_KEY_DETACHED: &str =
+    "net/bytebuddy/dynamic/scaffold/MethodGraph$Compiler$Default$Key$Detached";
+const BYTEBUDDY_METHOD_GRAPH_DEFAULT_KEY_HARMONIZED: &str =
+    "net/bytebuddy/dynamic/scaffold/MethodGraph$Compiler$Default$Key$Harmonized";
+const MOCKITO_LOCATION_FACTORY: &str = "org/mockito/internal/debugging/LocationFactory";
+const MOCKITO_LOCATION_FACTORY_DEFAULT: &str =
+    "org/mockito/internal/debugging/LocationFactory$DefaultLocationFactory";
+const MOCKITO_JAVA8_LOCATION_IMPL: &str = "org/mockito/internal/debugging/Java8LocationImpl";
+const MOCKITO_MOCK_METHOD_ADVICE: &str = "org/mockito/internal/creation/bytebuddy/MockMethodAdvice";
 const HIBERNATE_TESTING_UTIL: &str = "org/hibernate/testing/orm/junit/TestingUtil";
 const HIBERNATE_ANNOTATION_TARGET_SUPPORT: &str =
     "org/hibernate/models/internal/AnnotationTargetSupport";
@@ -8011,6 +8022,438 @@ fn native_bytebuddy_method_graph_for_java_method_token_equals(
     result
 }
 
+fn native_bytebuddy_method_graph_default_key_hash_code(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    let this = obj_arg(args, 0)?;
+    let base_pin = ctx.pin_native_root(this);
+    let internal_name = bytebuddy_ref_field(ctx, this, "internalName", 0);
+    let name_hash = bytebuddy_object_hash(ctx, internal_name)?;
+    let this = ctx.read_native_pin(base_pin, this);
+    let parameter_count = bytebuddy_int_field(ctx, this, "parameterCount", 1);
+    ctx.unpin_native_roots(base_pin);
+    Ok(Some(Value::Int(
+        name_hash.wrapping_add(31i32.wrapping_mul(parameter_count)),
+    )))
+}
+
+fn native_bytebuddy_method_graph_default_key_equals(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    let mut this = obj_arg(args, 0)?;
+    let mut other = match args.get(1) {
+        Some(Value::Object(Some(other))) => *other,
+        _ => return Ok(Some(Value::Int(0))),
+    };
+    if this == other {
+        return Ok(Some(Value::Int(1)));
+    }
+    if !bytebuddy_object_is_instance_of(ctx, other, BYTEBUDDY_METHOD_GRAPH_DEFAULT_KEY) {
+        return Ok(Some(Value::Int(0)));
+    }
+
+    let base_pin = ctx.pin_native_root(this);
+    let other_pin = ctx.pin_native_root(other);
+    let result: Result<bool, MethodCallFailed> = (|| {
+        this = ctx.read_native_pin(base_pin, this);
+        other = ctx.read_native_pin(other_pin, other);
+        let this_name = bytebuddy_ref_field(ctx, this, "internalName", 0);
+        let other_name = bytebuddy_ref_field(ctx, other, "internalName", 0);
+        if !bytebuddy_object_equals(ctx, this_name, other_name)? {
+            return Ok(false);
+        }
+
+        this = ctx.read_native_pin(base_pin, this);
+        other = ctx.read_native_pin(other_pin, other);
+        if bytebuddy_int_field(ctx, this, "parameterCount", 1)
+            != bytebuddy_int_field(ctx, other, "parameterCount", 1)
+        {
+            return Ok(false);
+        }
+
+        this = ctx.read_native_pin(base_pin, this);
+        other = ctx.read_native_pin(other_pin, other);
+        let this_identifiers = bytebuddy_method_graph_key_identifiers(ctx, this)?;
+        let this_identifiers_pin =
+            this_identifiers.map(|identifiers| ctx.pin_native_root(identifiers));
+        this = ctx.read_native_pin(base_pin, this);
+        other = ctx.read_native_pin(other_pin, other);
+        let other_identifiers = bytebuddy_method_graph_key_identifiers(ctx, other)?;
+        let this_identifiers = match (this_identifiers, this_identifiers_pin) {
+            (Some(identifiers), Some(pin)) => Some(ctx.read_native_pin(pin, identifiers)),
+            _ => None,
+        };
+        bytebuddy_method_graph_identifier_sets_intersect(ctx, this_identifiers, other_identifiers)
+    })();
+    ctx.unpin_native_roots(base_pin);
+    Ok(Some(antlr_bool(result?)))
+}
+
+fn bytebuddy_object_is_instance_of(
+    ctx: &dyn NativeContext,
+    obj: ObjectRef,
+    class_name: &str,
+) -> bool {
+    let obj_class = ctx.class_id_of_object(obj);
+    if ctx.class_name_of_id(obj_class).as_deref() == Some(class_name) {
+        return true;
+    }
+    ctx.class_id_by_name(class_name)
+        .map(|target| ctx.is_subclass(obj_class, target))
+        .unwrap_or(false)
+}
+
+fn bytebuddy_method_graph_key_identifiers(
+    ctx: &mut dyn NativeContext,
+    key: ObjectRef,
+) -> Result<Option<ObjectRef>, MethodCallFailed> {
+    let class_name = ctx
+        .class_name_of_id(ctx.class_id_of_object(key))
+        .unwrap_or_default();
+    if class_name == BYTEBUDDY_METHOD_GRAPH_DEFAULT_KEY_DETACHED {
+        return Ok(bytebuddy_ref_field(ctx, key, "identifiers", 2));
+    }
+    if class_name == BYTEBUDDY_METHOD_GRAPH_DEFAULT_KEY_HARMONIZED {
+        let Some(identifiers) = bytebuddy_ref_field(ctx, key, "identifiers", 2) else {
+            return Ok(None);
+        };
+        let base_pin = ctx.pin_native_root(identifiers);
+        let result = match ctx.invoke_virtual(identifiers, "keySet", "()Ljava/util/Set;", &[])? {
+            Some(Value::Object(obj)) => obj,
+            _ => None,
+        };
+        ctx.unpin_native_roots(base_pin);
+        return Ok(result);
+    }
+
+    let base_pin = ctx.pin_native_root(key);
+    let result = match ctx.invoke_virtual(key, "getIdentifiers", "()Ljava/util/Set;", &[])? {
+        Some(Value::Object(obj)) => obj,
+        _ => None,
+    };
+    ctx.unpin_native_roots(base_pin);
+    Ok(result)
+}
+
+fn bytebuddy_method_graph_identifier_sets_intersect(
+    ctx: &mut dyn NativeContext,
+    a: Option<ObjectRef>,
+    b: Option<ObjectRef>,
+) -> Result<bool, MethodCallFailed> {
+    if a == b {
+        let Some(set) = a else {
+            return Ok(false);
+        };
+        return Ok(bytebuddy_list_size(ctx, set)? > 0);
+    }
+    let (Some(mut a), Some(mut b)) = (a, b) else {
+        return Ok(false);
+    };
+    let base_pin = ctx.pin_native_root(a);
+    let b_pin = ctx.pin_native_root(b);
+    let a_size = bytebuddy_list_size(ctx, a)?;
+    a = ctx.read_native_pin(base_pin, a);
+    b = ctx.read_native_pin(b_pin, b);
+    let b_size = bytebuddy_list_size(ctx, b)?;
+    a = ctx.read_native_pin(base_pin, a);
+    b = ctx.read_native_pin(b_pin, b);
+    if a_size == 0 || b_size == 0 {
+        ctx.unpin_native_roots(base_pin);
+        return Ok(false);
+    }
+
+    let result: Result<bool, MethodCallFailed> = (|| {
+        let a = ctx.read_native_pin(base_pin, a);
+        let iterator = match ctx.invoke_virtual(a, "iterator", "()Ljava/util/Iterator;", &[])? {
+            Some(Value::Object(Some(iterator))) => iterator,
+            _ => return Ok(false),
+        };
+        let iterator_pin = ctx.pin_native_root(iterator);
+        loop {
+            let iterator = ctx.read_native_pin(iterator_pin, iterator);
+            let has_next = match ctx.invoke_virtual(iterator, "hasNext", "()Z", &[])? {
+                Some(Value::Int(v)) => v != 0,
+                _ => false,
+            };
+            if !has_next {
+                break;
+            }
+            let iterator = ctx.read_native_pin(iterator_pin, iterator);
+            let element = match ctx.invoke_virtual(iterator, "next", "()Ljava/lang/Object;", &[])? {
+                Some(Value::Object(Some(element))) => element,
+                _ => continue,
+            };
+            let element_pin = ctx.pin_native_root(element);
+            let b = ctx.read_native_pin(b_pin, b);
+            if bytebuddy_collection_contains_identifier(ctx, b, element)? {
+                return Ok(true);
+            }
+            ctx.unpin_native_roots(element_pin);
+        }
+        Ok(false)
+    })();
+    ctx.unpin_native_roots(base_pin);
+    result
+}
+
+fn bytebuddy_collection_contains_identifier(
+    ctx: &mut dyn NativeContext,
+    collection: ObjectRef,
+    target: ObjectRef,
+) -> Result<bool, MethodCallFailed> {
+    let base_pin = ctx.pin_native_root(collection);
+    let target_pin = ctx.pin_native_root(target);
+    let result: Result<bool, MethodCallFailed> = (|| {
+        let collection = ctx.read_native_pin(base_pin, collection);
+        let iterator =
+            match ctx.invoke_virtual(collection, "iterator", "()Ljava/util/Iterator;", &[])? {
+                Some(Value::Object(Some(iterator))) => iterator,
+                _ => return Ok(false),
+            };
+        let iterator_pin = ctx.pin_native_root(iterator);
+        loop {
+            let iterator = ctx.read_native_pin(iterator_pin, iterator);
+            let has_next = match ctx.invoke_virtual(iterator, "hasNext", "()Z", &[])? {
+                Some(Value::Int(v)) => v != 0,
+                _ => false,
+            };
+            if !has_next {
+                break;
+            }
+            let iterator = ctx.read_native_pin(iterator_pin, iterator);
+            let element = match ctx.invoke_virtual(iterator, "next", "()Ljava/lang/Object;", &[])? {
+                Some(Value::Object(Some(element))) => element,
+                _ => continue,
+            };
+            let element_pin = ctx.pin_native_root(element);
+            let target = ctx.read_native_pin(target_pin, target);
+            if bytebuddy_method_graph_identifier_equals(ctx, element, target)? {
+                return Ok(true);
+            }
+            ctx.unpin_native_roots(element_pin);
+        }
+        Ok(false)
+    })();
+    ctx.unpin_native_roots(base_pin);
+    result
+}
+
+fn bytebuddy_method_graph_identifier_equals(
+    ctx: &mut dyn NativeContext,
+    a: ObjectRef,
+    b: ObjectRef,
+) -> Result<bool, MethodCallFailed> {
+    if a == b {
+        return Ok(true);
+    }
+    let a_is_type_token = bytebuddy_object_is_exact_class(ctx, a, BYTEBUDDY_METHOD_TYPE_TOKEN);
+    let b_is_type_token = bytebuddy_object_is_exact_class(ctx, b, BYTEBUDDY_METHOD_TYPE_TOKEN);
+    if a_is_type_token && b_is_type_token {
+        return bytebuddy_type_token_equals_by_descriptors(ctx, a, b, true);
+    }
+
+    let a_is_java_method_token =
+        bytebuddy_object_is_exact_class(ctx, a, BYTEBUDDY_METHOD_GRAPH_FOR_JAVA_METHOD_TOKEN);
+    let b_is_java_method_token =
+        bytebuddy_object_is_exact_class(ctx, b, BYTEBUDDY_METHOD_GRAPH_FOR_JAVA_METHOD_TOKEN);
+    if a_is_java_method_token && b_is_java_method_token {
+        let base_pin = ctx.pin_native_root(a);
+        let b_pin = ctx.pin_native_root(b);
+        let result: Result<bool, MethodCallFailed> = (|| {
+            let a = ctx.read_native_pin(base_pin, a);
+            let b = ctx.read_native_pin(b_pin, b);
+            let Some(a_type_token) = bytebuddy_ref_field(ctx, a, "typeToken", 0) else {
+                return Ok(false);
+            };
+            let Some(b_type_token) = bytebuddy_ref_field(ctx, b, "typeToken", 0) else {
+                return Ok(false);
+            };
+            bytebuddy_type_token_equals_by_descriptors(ctx, a_type_token, b_type_token, false)
+        })();
+        ctx.unpin_native_roots(base_pin);
+        return result;
+    }
+
+    bytebuddy_object_equals(ctx, Some(a), Some(b))
+}
+
+fn bytebuddy_type_token_equals_by_descriptors(
+    ctx: &mut dyn NativeContext,
+    mut a: ObjectRef,
+    mut b: ObjectRef,
+    compare_return_type: bool,
+) -> Result<bool, MethodCallFailed> {
+    let base_pin = ctx.pin_native_root(a);
+    let b_pin = ctx.pin_native_root(b);
+    let result: Result<bool, MethodCallFailed> = (|| {
+        if compare_return_type {
+            let a_return = bytebuddy_ref_field(ctx, a, "returnType", 0);
+            let b_return = bytebuddy_ref_field(ctx, b, "returnType", 0);
+            if !bytebuddy_type_description_equals_by_descriptor(ctx, a_return, b_return)? {
+                return Ok(false);
+            }
+        }
+
+        a = ctx.read_native_pin(base_pin, a);
+        b = ctx.read_native_pin(b_pin, b);
+        let a_parameters = bytebuddy_ref_field(ctx, a, "parameterTypes", 1);
+        let b_parameters = bytebuddy_ref_field(ctx, b, "parameterTypes", 1);
+        bytebuddy_type_description_lists_equal(ctx, a_parameters, b_parameters)
+    })();
+    ctx.unpin_native_roots(base_pin);
+    result
+}
+
+fn bytebuddy_type_description_lists_equal(
+    ctx: &mut dyn NativeContext,
+    a: Option<ObjectRef>,
+    b: Option<ObjectRef>,
+) -> Result<bool, MethodCallFailed> {
+    if a == b {
+        return Ok(true);
+    }
+    let (Some(mut a), Some(mut b)) = (a, b) else {
+        return Ok(false);
+    };
+    let base_pin = ctx.pin_native_root(a);
+    let b_pin = ctx.pin_native_root(b);
+    let result: Result<bool, MethodCallFailed> = (|| {
+        let a_size = bytebuddy_list_size(ctx, a)?;
+        a = ctx.read_native_pin(base_pin, a);
+        b = ctx.read_native_pin(b_pin, b);
+        if a_size != bytebuddy_list_size(ctx, b)? {
+            return Ok(false);
+        }
+        a = ctx.read_native_pin(base_pin, a);
+        b = ctx.read_native_pin(b_pin, b);
+        for i in 0..a_size {
+            let a_element = bytebuddy_list_get(ctx, a, i)?;
+            let a_element_pin = a_element.map(|element| ctx.pin_native_root(element));
+            a = ctx.read_native_pin(base_pin, a);
+            b = ctx.read_native_pin(b_pin, b);
+            let b_element = bytebuddy_list_get(ctx, b, i)?;
+            let a_element = match (a_element, a_element_pin) {
+                (Some(element), Some(pin)) => {
+                    let element = ctx.read_native_pin(pin, element);
+                    ctx.unpin_native_roots(pin);
+                    Some(element)
+                }
+                _ => None,
+            };
+            a = ctx.read_native_pin(base_pin, a);
+            b = ctx.read_native_pin(b_pin, b);
+            if !bytebuddy_type_description_equals_by_descriptor(ctx, a_element, b_element)? {
+                return Ok(false);
+            }
+            a = ctx.read_native_pin(base_pin, a);
+            b = ctx.read_native_pin(b_pin, b);
+        }
+        Ok(true)
+    })();
+    ctx.unpin_native_roots(base_pin);
+    result
+}
+
+fn bytebuddy_type_description_equals_by_descriptor(
+    ctx: &mut dyn NativeContext,
+    a: Option<ObjectRef>,
+    b: Option<ObjectRef>,
+) -> Result<bool, MethodCallFailed> {
+    if a == b {
+        return Ok(true);
+    }
+    let (Some(a), Some(b)) = (a, b) else {
+        return Ok(false);
+    };
+    let base_pin = ctx.pin_native_root(a);
+    let b_pin = ctx.pin_native_root(b);
+    let result = (|| {
+        let a = ctx.read_native_pin(base_pin, a);
+        let a_descriptor = bytebuddy_type_description_descriptor(ctx, a)?;
+        let b = ctx.read_native_pin(b_pin, b);
+        let b_descriptor = bytebuddy_type_description_descriptor(ctx, b)?;
+        Ok(a_descriptor.is_some() && a_descriptor == b_descriptor)
+    })();
+    ctx.unpin_native_roots(base_pin);
+    result
+}
+
+fn bytebuddy_type_description_descriptor(
+    ctx: &mut dyn NativeContext,
+    type_description: ObjectRef,
+) -> Result<Option<String>, MethodCallFailed> {
+    let base_pin = ctx.pin_native_root(type_description);
+    let result = match ctx.invoke_virtual(
+        type_description,
+        "getDescriptor",
+        "()Ljava/lang/String;",
+        &[],
+    )? {
+        Some(Value::Object(Some(descriptor))) => ctx.read_string(descriptor),
+        _ => None,
+    };
+    ctx.unpin_native_roots(base_pin);
+    Ok(result)
+}
+
+fn native_mockito_location_factory_create(
+    ctx: &mut dyn NativeContext,
+    _args: &[Value],
+) -> MethodCallResult {
+    let location = match ctx.new_object(MOCKITO_JAVA8_LOCATION_IMPL)? {
+        Some(Value::Object(Some(location))) => location,
+        _ => return Ok(Some(Value::Object(None))),
+    };
+    let base_pin = ctx.pin_native_root(location);
+    let stack_trace_line = ctx.create_string("-> at <<unknown line>>");
+    let line_pin = ctx.pin_native_root(stack_trace_line);
+    let source_file = ctx.create_string("<unknown source file>");
+
+    let location = ctx.read_native_pin(base_pin, location);
+    let stack_trace_line = ctx.read_native_pin(line_pin, stack_trace_line);
+    ctx.set_field_by_name(
+        location,
+        "stackTraceLine",
+        Value::Object(Some(stack_trace_line)),
+    );
+    ctx.set_field_by_name(location, "sourceFile", Value::Object(Some(source_file)));
+    ctx.unpin_native_roots(base_pin);
+    Ok(Some(Value::Object(Some(location))))
+}
+
+fn native_mockito_mock_method_advice_is_overridden(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    let mock = obj_arg(args, 1)?;
+    let method = obj_arg(args, 2)?;
+    let mock_class_name = ctx
+        .class_name_of_id(ctx.class_id_of_object(mock))
+        .unwrap_or_default();
+    if !mock_class_name.contains("$MockitoMock$") {
+        return Ok(Some(Value::Int(0)));
+    }
+
+    let declaring_mirror = match ctx.get_field_by_name(method, "clazz") {
+        Value::Object(Some(mirror)) => mirror,
+        _ => return Ok(Some(Value::Int(0))),
+    };
+    let Some(declaring_class_id) = ctx.class_id_from_mirror(declaring_mirror) else {
+        return Ok(Some(Value::Int(0)));
+    };
+
+    if ctx.is_interface_class(declaring_class_id) {
+        return Ok(Some(Value::Int(0)));
+    }
+
+    // This method is reached only after Mockito has already established that
+    // the receiver is mocked. Falling back to "not overridden" preserves normal
+    // MockHandler interception for class mocks instead of silently bypassing it.
+    Ok(Some(Value::Int(0)))
+}
+
 fn bytebuddy_list_hash(
     ctx: &mut dyn NativeContext,
     list: Option<ObjectRef>,
@@ -9577,6 +10020,45 @@ fn register_bytebuddy_method_token_intrinsics(registry: &mut NativeMethodRegistr
         "equals",
         "(Ljava/lang/Object;)Z",
         native_bytebuddy_method_graph_for_java_method_token_equals,
+    );
+    registry.register(
+        BYTEBUDDY_METHOD_GRAPH_DEFAULT_KEY,
+        "hashCode",
+        "()I",
+        native_bytebuddy_method_graph_default_key_hash_code,
+    );
+    registry.register(
+        BYTEBUDDY_METHOD_GRAPH_DEFAULT_KEY,
+        "equals",
+        "(Ljava/lang/Object;)Z",
+        native_bytebuddy_method_graph_default_key_equals,
+    );
+}
+
+fn register_mockito_debugging_intrinsics(registry: &mut NativeMethodRegistry) {
+    registry.register(
+        MOCKITO_MOCK_METHOD_ADVICE,
+        "isOverridden",
+        "(Ljava/lang/Object;Ljava/lang/reflect/Method;)Z",
+        native_mockito_mock_method_advice_is_overridden,
+    );
+    registry.register(
+        MOCKITO_LOCATION_FACTORY,
+        "create",
+        "()Lorg/mockito/invocation/Location;",
+        native_mockito_location_factory_create,
+    );
+    registry.register(
+        MOCKITO_LOCATION_FACTORY,
+        "create",
+        "(Z)Lorg/mockito/invocation/Location;",
+        native_mockito_location_factory_create,
+    );
+    registry.register(
+        MOCKITO_LOCATION_FACTORY_DEFAULT,
+        "create",
+        "(Z)Lorg/mockito/invocation/Location;",
+        native_mockito_location_factory_create,
     );
 }
 
@@ -11618,6 +12100,51 @@ mod antlr_prediction_context_tests {
                 BYTEBUDDY_METHOD_GRAPH_FOR_JAVA_METHOD_TOKEN,
                 "equals",
                 "(Ljava/lang/Object;)Z",
+            )
+            .is_some());
+        assert!(registry
+            .find(BYTEBUDDY_METHOD_GRAPH_DEFAULT_KEY, "hashCode", "()I")
+            .is_some());
+        assert!(registry
+            .find(
+                BYTEBUDDY_METHOD_GRAPH_DEFAULT_KEY,
+                "equals",
+                "(Ljava/lang/Object;)Z",
+            )
+            .is_some());
+    }
+
+    #[test]
+    fn mockito_debugging_intrinsics_are_registered_for_location_factory() {
+        let mut registry = NativeMethodRegistry::new();
+        register_mockito_debugging_intrinsics(&mut registry);
+
+        assert!(registry
+            .find(
+                MOCKITO_MOCK_METHOD_ADVICE,
+                "isOverridden",
+                "(Ljava/lang/Object;Ljava/lang/reflect/Method;)Z",
+            )
+            .is_some());
+        assert!(registry
+            .find(
+                MOCKITO_LOCATION_FACTORY,
+                "create",
+                "()Lorg/mockito/invocation/Location;",
+            )
+            .is_some());
+        assert!(registry
+            .find(
+                MOCKITO_LOCATION_FACTORY,
+                "create",
+                "(Z)Lorg/mockito/invocation/Location;",
+            )
+            .is_some());
+        assert!(registry
+            .find(
+                MOCKITO_LOCATION_FACTORY_DEFAULT,
+                "create",
+                "(Z)Lorg/mockito/invocation/Location;",
             )
             .is_some());
     }
@@ -14319,6 +14846,7 @@ pub fn register_essential_natives(registry: &mut NativeMethodRegistry) {
         register_antlr_prediction_context_intrinsics(registry);
         register_antlr_token_intrinsics(registry);
         register_bytebuddy_method_token_intrinsics(registry);
+        register_mockito_debugging_intrinsics(registry);
         register_hibernate_testing_util_intrinsics(registry);
         register_hibernate_models_intrinsics(registry);
     });
