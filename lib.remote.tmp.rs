@@ -14684,11 +14684,24 @@ pub fn register_essential_natives(registry: &mut NativeMethodRegistry) {
             _ => return Ok(None),
         };
         if let Some(Value::Object(Some(name))) = args.get(1) {
+            ctx.set_field_by_name(this, "name", Value::Object(Some(*name)));
             ctx.set_field(this, 0, Value::Object(Some(*name)));
         }
         Ok(None)
     };
+    let permission_get_name = |ctx: &mut dyn NativeContext, args: &[Value]| {
+        let this = match args.first() {
+            Some(Value::Object(Some(o))) => *o,
+            _ => return Ok(Some(Value::Object(None))),
+        };
+        match ctx.get_field_by_name(this, "name") {
+            Value::Object(Some(name)) => Ok(Some(Value::Object(Some(name)))),
+            _ => Ok(Some(ctx.get_field(this, 0))),
+        }
+    };
     for permission_cls in [
+        "java/security/Permission",
+        "java/security/BasicPermission",
         "java/lang/RuntimePermission",
         "java/util/PropertyPermission",
         "java/util/logging/LoggingPermission",
@@ -14704,6 +14717,12 @@ pub fn register_essential_natives(registry: &mut NativeMethodRegistry) {
             "<init>",
             "(Ljava/lang/String;Ljava/lang/String;)V",
             permission_init,
+        );
+        registry.register(
+            permission_cls,
+            "getName",
+            "()Ljava/lang/String;",
+            permission_get_name,
         );
         registry.register(permission_cls, "<init>", "()V", |_ctx, _args| Ok(None));
     }
@@ -18162,6 +18181,27 @@ pub fn register_essential_natives(registry: &mut NativeMethodRegistry) {
         "getName",
         "()Ljava/lang/String;",
         lang_class::native_class_get_name,
+    );
+    // Synthetic bootstrap may still stub `java/lang/Class` when no real JDK
+    // classfile is available. Keep the public name accessors declared by the
+    // stub wired to the same native implementations used elsewhere.
+    registry.register(
+        "java/lang/Class",
+        "getSimpleName",
+        "()Ljava/lang/String;",
+        lang_class::native_class_get_simple_name,
+    );
+    registry.register(
+        "java/lang/Class",
+        "getCanonicalName",
+        "()Ljava/lang/String;",
+        lang_class::native_class_get_canonical_name,
+    );
+    registry.register(
+        "java/lang/Class",
+        "getTypeName",
+        "()Ljava/lang/String;",
+        lang_class::native_class_get_type_name,
     );
     registry.register(
         "java/lang/Class",
@@ -25010,6 +25050,7 @@ fn register_annotation_overrides(registry: &mut NativeMethodRegistry) {
     // class is loaded, while `of`/`add`/`contains` etc. link for fallback sets.
     crate::phases_early::register_enum_set_stub_natives(registry);
     register_synchronized_collection_wrapper_natives(registry);
+    register_function_identity_natives(registry);
     // Real-JDK boot can still resolve `java/util/Objects` through a synthetic
     // fallback when java.base stubs are partial. Install the existing spec
     // natives in essentials so `requireNonNull` and friends link in those paths.
@@ -58551,6 +58592,61 @@ fn native_return_self(_ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCal
 
 fn native_return_first_arg(_ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     Ok(Some(args.first().cloned().unwrap_or(Value::Object(None))))
+}
+
+fn native_function_identity(ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
+    let proxy = alloc_concurrent_synthetic(ctx, "java/util/function/Function$Identity", 0);
+    Ok(Some(Value::Object(Some(proxy))))
+}
+
+fn native_function_identity_apply(
+    _ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    Ok(Some(args.get(1).copied().unwrap_or(Value::Object(None))))
+}
+
+fn native_function_identity_return_arg(
+    _ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    Ok(Some(args.get(1).copied().unwrap_or(Value::Object(None))))
+}
+
+fn register_function_identity_natives(registry: &mut NativeMethodRegistry) {
+    let __prev_cat = registry.current_category();
+    registry.set_category(cratonvm_native_api::NativeKind::SyntheticStub);
+    registry.register(
+        "java/util/function/Function",
+        "identity",
+        "()Ljava/util/function/Function;",
+        native_function_identity,
+    );
+    registry.register(
+        "java/util/function/UnaryOperator",
+        "identity",
+        "()Ljava/util/function/UnaryOperator;",
+        native_function_identity,
+    );
+    registry.register(
+        "java/util/function/Function$Identity",
+        "apply",
+        "(Ljava/lang/Object;)Ljava/lang/Object;",
+        native_function_identity_apply,
+    );
+    registry.register(
+        "java/util/function/Function$Identity",
+        "andThen",
+        "(Ljava/util/function/Function;)Ljava/util/function/Function;",
+        native_function_identity_return_arg,
+    );
+    registry.register(
+        "java/util/function/Function$Identity",
+        "compose",
+        "(Ljava/util/function/Function;)Ljava/util/function/Function;",
+        native_function_identity_return_arg,
+    );
+    registry.set_category(__prev_cat);
 }
 
 /// `Collections.synchronizedMap(m)` — return a REAL `Collections$SynchronizedMap`

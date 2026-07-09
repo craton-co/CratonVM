@@ -3094,11 +3094,14 @@ fn register_s2_bytebuffer(r: &mut NativeMethodRegistry) {
     });
 
     // array / hasArray / isDirect / isReadOnly / arrayOffset
-    r.register(bb, "array",      "()[B", |ctx, args| Ok(Some(ctx.get_field(obj_arg(args, 0)?, BB_ARRAY))));
+    r.register(bb, "array",      "()[B", |ctx, args| {
+        let this = obj_arg(args, 0)?;
+        Ok(Some(Value::Object(s2_bb_arr(ctx, this))))
+    });
     r.register(bb, "arrayOffset","()I",  |_ctx, _args| Ok(Some(Value::Int(0))));
     r.register(bb, "hasArray",   "()Z",  |ctx, args| {
         let this = obj_arg(args, 0)?;
-        Ok(Some(Value::Int(match ctx.get_field(this, BB_ARRAY) { Value::Object(Some(_)) => 1, _ => 0 })))
+        Ok(Some(Value::Int(if s2_bb_arr(ctx, this).is_some() { 1 } else { 0 })))
     });
     r.register(bb, "isDirect",   "()Z",  |_ctx, _args| Ok(Some(Value::Int(0))));
     r.register(bb, "isReadOnly", "()Z",  |_ctx, _args| Ok(Some(Value::Int(0))));
@@ -3147,13 +3150,33 @@ fn register_s2_bytebuffer(r: &mut NativeMethodRegistry) {
     r.register(bb, "duplicate", "()Ljava/nio/ByteBuffer;", |ctx, args| {
         let this = obj_arg(args, 0)?;
         let buf  = alloc_concurrent_synthetic(ctx, "java/nio/ByteBuffer", 6);
-        for f in 0..6 { ctx.set_field(buf, f, ctx.get_field(this, f)); }
+        if let Some(src_arr) = s2_bb_arr(ctx, this) {
+            let cap = s2_bb_cap(ctx, this);
+            let pos = s2_bb_pos(ctx, this);
+            let lim = s2_bb_limit(ctx, this);
+            let mark = ctx.get_field(this, BB_MARK).as_int().unwrap_or(-1);
+            bb_write_hb(ctx, buf, src_arr, cap);
+            ctx.set_field(buf, BB_POS,   Value::Int(pos));
+            ctx.set_field(buf, BB_LIMIT, Value::Int(lim));
+            ctx.set_field(buf, BB_MARK,  Value::Int(mark));
+        }
+        ctx.set_field(buf, BB_ORDER, ctx.get_field(this, BB_ORDER));
         Ok(Some(Value::Object(Some(buf))))
     });
     r.register(bb, "asReadOnlyBuffer", "()Ljava/nio/ByteBuffer;", |ctx, args| {
         let this = obj_arg(args, 0)?;
         let buf  = alloc_concurrent_synthetic(ctx, "java/nio/ByteBuffer", 6);
-        for f in 0..6 { ctx.set_field(buf, f, ctx.get_field(this, f)); }
+        if let Some(src_arr) = s2_bb_arr(ctx, this) {
+            let cap = s2_bb_cap(ctx, this);
+            let pos = s2_bb_pos(ctx, this);
+            let lim = s2_bb_limit(ctx, this);
+            let mark = ctx.get_field(this, BB_MARK).as_int().unwrap_or(-1);
+            bb_write_hb(ctx, buf, src_arr, cap);
+            ctx.set_field(buf, BB_POS,   Value::Int(pos));
+            ctx.set_field(buf, BB_LIMIT, Value::Int(lim));
+            ctx.set_field(buf, BB_MARK,  Value::Int(mark));
+        }
+        ctx.set_field(buf, BB_ORDER, ctx.get_field(this, BB_ORDER));
         Ok(Some(Value::Object(Some(buf))))
     });
 

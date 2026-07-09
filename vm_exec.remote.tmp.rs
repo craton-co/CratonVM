@@ -4752,14 +4752,18 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
         // In real-JDK mode the Thread class has many more than 3 instance
         // fields and real-JDK bytecode reads `this.holder.threadStatus`
         // etc.  Allocate with the full field count and populate
-        // `name/tid/holder/priority` by resolved slot index.  In
-        // synthetic-JDK mode we keep the historical 3-slot fixed layout
-        // so existing callers (thread_start, thread_join, many unit
-        // tests) continue to work.
+        // `name/tid/holder/priority` by resolved slot index.  Synthetic-JDK
+        // mode still keeps the historical first three slots stable for
+        // callers (name/priority/tid), but it must allocate at least the
+        // synthetic class's declared field count too.  The synthetic Thread
+        // layout now also declares `contextClassLoader`; allocating only 3
+        // slots made Thread.get/setContextClassLoader hit an undersized
+        // object as soon as reflection users resolved that field.
         let (is_real_jdk, num_fields) = {
             let cm = self.shared.class_manager.read();
             match cm.class_store.get(class_id) {
                 Some(c) if !c.is_synthetic_stub => (true, c.num_total_fields.max(3)),
+                Some(c) => (false, c.num_total_fields.max(3)),
                 _ => (false, 3usize),
             }
         };
@@ -7871,6 +7875,9 @@ pub fn invoke_or_native(
                         | "java/util/concurrent/atomic/AtomicBoolean"
                         | "java/util/EnumSet"
                         | "java/util/StringJoiner"
+                        | "java/io/FileInputStream"
+                        | "java/lang/ref/Cleaner"
+                        | "java/lang/ref/Cleaner$Cleanable"
                         | "java/lang/management/ManagementFactory"
                 ));
         let has_real = real_protected_stub && {
@@ -13151,26 +13158,30 @@ fn invoke_on_class_shared_inner(
                 // extra bytecode-enhancement interfaces/default methods. Retry
                 // against the receiver's real class before falling through to
                 // CP-interface or native-only rescues.
-                if let Some(Value::Object(Some(recv))) = args.first().copied() {
-                    let recv_cid = shared.heap.class_id_of(recv);
-                    if recv_cid != class_id && recv_cid != ClassId::new(0) {
-                        let cm_recv = shared.class_manager.read();
-                        if let Some((m, declaring_id)) = crate::classloading::find_method_recursive(
-                            recv_cid,
-                            method_name,
-                            descriptor,
-                            &cm_recv.class_store,
-                        ) {
-                            if !m.is_abstract() && !m.is_static() {
-                                drop(cm_recv);
-                                return invoke_on_class_shared(
-                                    shared,
-                                    thread,
-                                    declaring_id,
+                if !no_retarget && method_name != "<init>" && method_name != "<clinit>" {
+                    if let Some(Value::Object(Some(recv))) = args.first().copied() {
+                        let recv_cid = shared.heap.class_id_of(recv);
+                        if recv_cid != class_id && recv_cid != ClassId::new(0) {
+                            let cm_recv = shared.class_manager.read();
+                            if let Some((m, declaring_id)) =
+                                crate::classloading::find_method_recursive(
+                                    recv_cid,
                                     method_name,
                                     descriptor,
-                                    args,
-                                );
+                                    &cm_recv.class_store,
+                                )
+                            {
+                                if declaring_id != class_id && !m.is_abstract() && !m.is_static() {
+                                    drop(cm_recv);
+                                    return invoke_on_class_shared_no_retarget(
+                                        shared,
+                                        thread,
+                                        declaring_id,
+                                        method_name,
+                                        descriptor,
+                                        args,
+                                    );
+                                }
                             }
                         }
                     }
