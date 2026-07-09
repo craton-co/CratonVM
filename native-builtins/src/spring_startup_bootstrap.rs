@@ -2792,6 +2792,36 @@ fn unresolved_bean_class_name(ctx: &dyn NativeContext, mbd: ObjectRef) -> String
     }
 }
 
+fn resolve_spel_bean_class_expression(
+    ctx: &mut dyn NativeContext,
+    factory: ObjectRef,
+    expression: &str,
+) -> Option<ObjectRef> {
+    let bean_name = expression
+        .strip_prefix("#{")
+        .and_then(|s| s.strip_suffix(".class}"))?;
+    if bean_name.is_empty() || bean_name.contains(|c: char| c == '#' || c == '{' || c == '}') {
+        return None;
+    }
+    let factory_pin = ctx.pin_native_root(factory);
+    let bean_name_obj = ctx.create_string(bean_name);
+    let factory = ctx.read_native_pin(factory_pin, factory);
+    let bean = ctx.invoke_virtual(
+        factory,
+        "getBean",
+        "(Ljava/lang/String;)Ljava/lang/Object;",
+        &[Value::Object(Some(bean_name_obj))],
+    );
+    ctx.unpin_native_roots(factory_pin);
+    match bean {
+        Ok(Some(Value::Object(Some(bean)))) => {
+            let cid = ctx.class_id_of_object(bean);
+            Some(ctx.get_class_mirror(cid))
+        }
+        _ => None,
+    }
+}
+
 fn m4_abstract_bean_factory_do_resolve_bean_class(
     ctx: &mut dyn NativeContext,
     args: &[Value],
@@ -2812,8 +2842,14 @@ fn m4_abstract_bean_factory_do_resolve_bean_class(
         // PlaceholderConfigurer runs) but must fail loudly for a real
         // instantiation attempt, exactly like `Missing`.
         BeanClassResolution::Missing | BeanClassResolution::Placeholder => {
+            let name = unresolved_bean_class_name(ctx, mbd);
+            if let Some(Value::Object(Some(factory))) = args.first() {
+                if let Some(mirror) = resolve_spel_bean_class_expression(ctx, *factory, &name) {
+                    ctx.set_field_by_name(mbd, "beanClass", Value::Object(Some(mirror)));
+                    return Ok(Some(Value::Object(Some(mirror))));
+                }
+            }
             if types_to_match_is_empty(ctx, args, 2) {
-                let name = unresolved_bean_class_name(ctx, mbd);
                 Err(throw_class_not_found(ctx, &name))
             } else {
                 Ok(Some(Value::Object(None)))
@@ -2906,7 +2942,16 @@ fn m5_abstract_bean_factory_resolve_bean_class_with_name(
                 Ok(Some(Value::Object(None)))
             };
         }
-        BeanClassResolution::Missing => { /* fall through to removal */ }
+        BeanClassResolution::Missing => {
+            let name = unresolved_bean_class_name(ctx, mbd);
+            if let Some(Value::Object(Some(factory))) = this {
+                if let Some(mirror) = resolve_spel_bean_class_expression(ctx, factory, &name) {
+                    ctx.set_field_by_name(mbd, "beanClass", Value::Object(Some(mirror)));
+                    return Ok(Some(Value::Object(Some(mirror))));
+                }
+            }
+            /* fall through to removal */
+        }
     }
 
     // An EMPTY `typesToMatch` (args[3]) is the real instantiation-time call —
@@ -2965,6 +3010,15 @@ fn m5_abstract_bean_factory_resolve_bean_class_with_name(
         })
         .unwrap_or_default();
     let removed_class_name = unresolved_bean_class_name(ctx, mbd);
+    if removed_class_name.contains("#{") {
+        // Spring bean class names may be SpEL expressions (for example
+        // "#{tb0.class}"). During type-matching probes those expressions are
+        // intentionally unresolved; real Spring ignores them for this probe and
+        // keeps the bean definition so creation can evaluate the expression
+        // later. Treat them like placeholders rather than partial-classpath
+        // orphans.
+        return Ok(Some(Value::Object(None)));
+    }
     tracing::warn!(
         "[bean-orphan] m5: removing '{}' (class '{}' not loadable, non-lazy, non-empty typesToMatch)",
         removed_bean_name,

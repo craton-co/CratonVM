@@ -485,6 +485,10 @@ fn throw_name_not_found(ctx: &mut dyn NativeContext, msg: &str) -> MethodCallFai
     throw_naming(ctx, "javax/naming/NameNotFoundException", msg)
 }
 
+fn throw_no_initial_context(ctx: &mut dyn NativeContext, msg: &str) -> MethodCallFailed {
+    throw_naming(ctx, "javax/naming/NoInitialContextException", msg)
+}
+
 fn throw_naming_exception(ctx: &mut dyn NativeContext, msg: &str) -> MethodCallFailed {
     throw_naming(ctx, "javax/naming/NamingException", msg)
 }
@@ -556,6 +560,34 @@ fn read_string_arg(ctx: &dyn NativeContext, args: &[Value], idx: usize) -> Optio
 /// True iff `name` is an absolute JNDI name in the `java:` URL scheme.
 fn is_java_url_scheme(name: &str) -> bool {
     name.trim_start().starts_with("java:")
+}
+
+fn is_plain_relative_name(name: &str) -> bool {
+    !name.trim_start().contains(':')
+}
+
+fn has_initial_context_provider(ctx: &mut dyn NativeContext) -> bool {
+    if matches!(
+        ctx.get_system_property("java.naming.factory.initial"),
+        Some(s) if !s.trim().is_empty()
+    ) {
+        return true;
+    }
+    if ctx
+        .ensure_class_initialized("javax/naming/spi/NamingManager")
+        .is_err()
+    {
+        return false;
+    }
+    matches!(
+        ctx.invoke(
+            "javax/naming/spi/NamingManager",
+            "hasInitialContextFactoryBuilder",
+            "()Z",
+            &[],
+        ),
+        Ok(Some(Value::Int(v))) if v != 0
+    )
 }
 
 /// Ask the JDK's `NamingManager` for the `java:` URL context.
@@ -888,6 +920,16 @@ fn do_context_lookup(ctx: &mut dyn NativeContext, this: ObjectRef, name: &str) -
 
     match lookup_value(name) {
         Ok(obj) => Ok(Some(Value::Object(Some(obj)))),
+        Err(msg)
+            if msg.starts_with("NameNotFoundException")
+                && is_plain_relative_name(name)
+                && !has_initial_context_provider(ctx) =>
+        {
+            Err(throw_no_initial_context(
+                ctx,
+                "Need to specify class name in environment or system property: java.naming.factory.initial",
+            ))
+        }
         Err(msg) => Err(flat_store_error(ctx, &msg)),
     }
 }

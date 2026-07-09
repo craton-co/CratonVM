@@ -6333,6 +6333,25 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
         Vec::new()
     }
 
+    fn method_return_type_argument_annotations(
+        &self,
+        class_id: ClassId,
+        method_name: &str,
+        method_desc: &str,
+    ) -> Vec<Vec<crate::native::registry::AnnotationData>> {
+        let cm = self.shared.class_manager.read();
+        let class = match cm.get_class(class_id) {
+            Some(c) => c,
+            None => return Vec::new(),
+        };
+        for m in &class.methods {
+            if &*m.name == method_name && &*m.descriptor == method_desc {
+                return extract_return_type_argument_annotations(&m.attributes, &class.constant_pool);
+            }
+        }
+        Vec::new()
+    }
+
     fn method_parameter_type_annotations(
         &self,
         class_id: ClassId,
@@ -6365,6 +6384,24 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
         for f in &class.fields {
             if &*f.name == field_name {
                 return extract_field_type_annotations(&f.attributes, &class.constant_pool);
+            }
+        }
+        Vec::new()
+    }
+
+    fn field_type_argument_annotations(
+        &self,
+        class_id: ClassId,
+        field_name: &str,
+    ) -> Vec<Vec<crate::native::registry::AnnotationData>> {
+        let cm = self.shared.class_manager.read();
+        let class = match cm.get_class(class_id) {
+            Some(c) => c,
+            None => return Vec::new(),
+        };
+        for f in &class.fields {
+            if &*f.name == field_name {
+                return extract_field_type_argument_annotations(&f.attributes, &class.constant_pool);
             }
         }
         Vec::new()
@@ -7331,6 +7368,47 @@ pub(super) fn extract_return_type_annotations(
     Vec::new()
 }
 
+/// Extract TYPE_USE annotations targeting the method return type's direct
+/// TYPE ARGUMENTS (`target_type` 0x14, METHOD_RETURN) whose `type_path` is a
+/// single TYPE_ARGUMENT entry (`type_path_kind == 3`) -- e.g. an annotation on
+/// `String` in `List<@NotBlank String> getNames()`.
+pub(super) fn extract_return_type_argument_annotations(
+    attributes: &[cratonvm_reader::attribute::LazyAttribute],
+    cp: &cratonvm_reader::constant_pool::ConstantPool,
+) -> Vec<Vec<crate::native::registry::AnnotationData>> {
+    use cratonvm_reader::attribute::Attribute;
+    const TARGET_METHOD_RETURN: u8 = 0x14;
+    const TYPE_PATH_KIND_TYPE_ARGUMENT: u8 = 3;
+    for lazy in attributes {
+        let attr = match lazy.decoded_or_decode(cp) {
+            Some(a) => a,
+            None => continue,
+        };
+        if let Attribute::RuntimeVisibleTypeAnnotations(tas) = attr.as_ref() {
+            let mut out: Vec<Vec<crate::native::registry::AnnotationData>> = Vec::new();
+            for ta in tas {
+                if ta.target_type != TARGET_METHOD_RETURN {
+                    continue;
+                }
+                let type_arg_idx = match ta.type_path.as_slice() {
+                    [entry] if entry.type_path_kind == TYPE_PATH_KIND_TYPE_ARGUMENT => {
+                        entry.type_argument_index as usize
+                    }
+                    _ => continue,
+                };
+                if let Some(data) = convert_annotation(&ta.annotation, cp) {
+                    if out.len() <= type_arg_idx {
+                        out.resize(type_arg_idx + 1, Vec::new());
+                    }
+                    out[type_arg_idx].push(data);
+                }
+            }
+            return out;
+        }
+    }
+    Vec::new()
+}
+
 /// Extract TYPE_USE annotations targeting the method formal parameters
 /// (`target_type` 0x16, METHOD_FORMAL_PARAMETER) with an empty `type_path`.
 /// The outer `Vec` is indexed by `formal_parameter_index` (sized to the
@@ -7454,6 +7532,47 @@ pub(super) fn extract_field_type_annotations(
                 .filter(|ta| ta.target_type == TARGET_FIELD && ta.type_path.is_empty())
                 .filter_map(|ta| convert_annotation(&ta.annotation, cp))
                 .collect();
+        }
+    }
+    Vec::new()
+}
+
+/// Extract TYPE_USE annotations targeting a field type's direct TYPE ARGUMENTS
+/// (`target_type` 0x13, FIELD) whose `type_path` is a single TYPE_ARGUMENT
+/// entry (`type_path_kind == 3`) -- e.g. an annotation on `String` in
+/// `List<@NotBlank String> names`.
+pub(super) fn extract_field_type_argument_annotations(
+    attributes: &[cratonvm_reader::attribute::LazyAttribute],
+    cp: &cratonvm_reader::constant_pool::ConstantPool,
+) -> Vec<Vec<crate::native::registry::AnnotationData>> {
+    use cratonvm_reader::attribute::Attribute;
+    const TARGET_FIELD: u8 = 0x13;
+    const TYPE_PATH_KIND_TYPE_ARGUMENT: u8 = 3;
+    for lazy in attributes {
+        let attr = match lazy.decoded_or_decode(cp) {
+            Some(a) => a,
+            None => continue,
+        };
+        if let Attribute::RuntimeVisibleTypeAnnotations(tas) = attr.as_ref() {
+            let mut out: Vec<Vec<crate::native::registry::AnnotationData>> = Vec::new();
+            for ta in tas {
+                if ta.target_type != TARGET_FIELD {
+                    continue;
+                }
+                let type_arg_idx = match ta.type_path.as_slice() {
+                    [entry] if entry.type_path_kind == TYPE_PATH_KIND_TYPE_ARGUMENT => {
+                        entry.type_argument_index as usize
+                    }
+                    _ => continue,
+                };
+                if let Some(data) = convert_annotation(&ta.annotation, cp) {
+                    if out.len() <= type_arg_idx {
+                        out.resize(type_arg_idx + 1, Vec::new());
+                    }
+                    out[type_arg_idx].push(data);
+                }
+            }
+            return out;
         }
     }
     Vec::new()
@@ -12828,6 +12947,29 @@ fn invoke_on_class_shared_inner(
                 // those natives against the original receiver's
                 // surrounding HashMap recovers the iterator.
                 if class_name == "java/lang/Object" && !is_object_member(method_name, descriptor) {
+                    // Lambda-proxy receiver rescue: some long-running mixed-mode
+                    // stream/lambda paths reach this slow NSME path with the CP
+                    // dispatch class collapsed to Object, while the heap receiver
+                    // still has a synthetic lambda ClassId tracked only in
+                    // `lambda_proxies` (not in class_store). Mirror the JIT helper
+                    // route and dispatch the functional-interface SAM through the
+                    // lambda metadata before trying generic Object fallbacks.
+                    if let Some(Value::Object(Some(recv))) = args.first().copied() {
+                        let recv_cid = shared.heap.class_id_of(recv);
+                        if shared.lambda_proxies.read().contains_key(&recv_cid) {
+                            if let Some(result) = crate::runtime::interpreter::try_lambda_dispatch(
+                                shared,
+                                thread,
+                                recv,
+                                recv_cid,
+                                method_name,
+                                &args[1..],
+                            )? {
+                                return Ok(result);
+                            }
+                        }
+                    }
+
                     // Synthetic-receiver rescue: when both the dispatch class
                     // AND the heap receiver are bare `java/lang/Object`, the
                     // object was allocated by a native with `ClassId::new(0)`

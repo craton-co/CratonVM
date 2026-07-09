@@ -7620,6 +7620,43 @@ pub(crate) fn native_constructor_new_instance(
 // Class.getDeclaredConstructors / getDeclaredConstructor
 // ---------------------------------------------------------------------------
 
+// JDK 25 exposes java.lang.String public constructors in a VM-specific but
+// stable order. Spring's SpEL constructor resolver keeps the last convertible
+// constructor within the same arity bucket after a stable parameter-count sort;
+// if String(String) appears before String(char[]), new String(3.0d) resolves to
+// the char[] overload and yields "\u0003". Preserve HotSpot's observed order for
+// this core class so reflection-sensitive overload resolution matches.
+fn sort_string_constructors_like_hotspot(
+    ctx: &dyn NativeContext,
+    class_id: cratonvm_types::ClassId,
+    constructors: &mut Vec<&MethodMetadata>,
+) {
+    if ctx.class_name_of_id(class_id).as_deref() != Some("java/lang/String") {
+        return;
+    }
+    fn rank(desc: &str) -> usize {
+        match desc {
+            "(Ljava/lang/StringBuilder;)V" => 0,
+            "([BIILjava/nio/charset/Charset;)V" => 1,
+            "([BLjava/lang/String;)V" => 2,
+            "([BLjava/nio/charset/Charset;)V" => 3,
+            "([BII)V" => 4,
+            "([B)V" => 5,
+            "(Ljava/lang/StringBuffer;)V" => 6,
+            "([CII)V" => 7,
+            "([C)V" => 8,
+            "(Ljava/lang/String;)V" => 9,
+            "()V" => 10,
+            "([BIILjava/lang/String;)V" => 11,
+            "([BI)V" => 12,
+            "([BIII)V" => 13,
+            "([III)V" => 14,
+            _ => 100,
+        }
+    }
+    constructors.sort_by_key(|m| rank(&m.descriptor));
+}
+
 pub(crate) fn native_class_get_declared_constructors(
     ctx: &mut dyn NativeContext,
     args: &[Value],
@@ -7647,10 +7684,11 @@ pub(crate) fn native_class_get_declared_constructors(
     };
 
     let methods = ctx.declared_methods(class_id);
-    let constructors: Vec<&MethodMetadata> = methods
+    let mut constructors: Vec<&MethodMetadata> = methods
         .iter()
         .filter(|m| m.name == "<init>" && (!public_only || (m.access_flags & 0x0001) != 0))
         .collect();
+    sort_string_constructors_like_hotspot(ctx, class_id, &mut constructors);
 
     // GC-safe: `create_constructor_object` allocates (see `build_mirror_array`).
     let arr = build_mirror_array(ctx, constructors.len(), |ctx, i| {
@@ -8217,10 +8255,11 @@ pub(crate) fn native_class_get_constructors(
     };
 
     let methods = ctx.declared_methods(class_id);
-    let public_ctors: Vec<&MethodMetadata> = methods
+    let mut public_ctors: Vec<&MethodMetadata> = methods
         .iter()
         .filter(|m| m.name == "<init>" && (m.access_flags & 0x0001) != 0)
         .collect();
+    sort_string_constructors_like_hotspot(ctx, class_id, &mut public_ctors);
 
     let arr = ctx.new_ref_array(cratonvm_types::ClassId::new(0), public_ctors.len());
     for (i, meta) in public_ctors.iter().enumerate() {
@@ -13814,9 +13853,12 @@ pub(crate) fn native_method_get_annotated_return_type(
     args: &[Value],
 ) -> MethodCallResult {
     let this = obj_arg(args, 0)?;
-    let anns = match method_class_name_desc(ctx, this) {
-        Some((cid, name, desc)) => ctx.method_return_type_annotations(cid, &name, &desc),
-        None => Vec::new(),
+    let (anns, type_arg_anns) = match method_class_name_desc(ctx, this) {
+        Some((cid, name, desc)) => (
+            ctx.method_return_type_annotations(cid, &name, &desc),
+            ctx.method_return_type_argument_annotations(cid, &name, &desc),
+        ),
+        None => (Vec::new(), Vec::new()),
     };
     let type_mirror = match ctx.invoke_virtual(
         this,
@@ -13831,6 +13873,7 @@ pub(crate) fn native_method_get_annotated_return_type(
         },
     };
     let at = make_annotated_type_with_anns(ctx, type_mirror, &anns);
+    stash_annotated_type_argument_anns(at, type_arg_anns);
     Ok(Some(Value::Object(Some(at))))
 }
 
@@ -13867,13 +13910,21 @@ pub(crate) fn native_parameter_get_annotated_type(
         Value::Int(i) => i as usize,
         _ => 0,
     };
-    let anns = match method_class_name_desc(ctx, exec) {
-        Some((cid, name, desc)) => ctx
-            .method_parameter_type_annotations(cid, &name, &desc)
-            .get(idx)
-            .cloned()
-            .unwrap_or_default(),
-        None => Vec::new(),
+    let (anns, type_arg_anns) = match method_class_name_desc(ctx, exec) {
+        Some((cid, name, desc)) => {
+            let anns = ctx
+                .method_parameter_type_annotations(cid, &name, &desc)
+                .get(idx)
+                .cloned()
+                .unwrap_or_default();
+            let type_arg_anns = ctx
+                .method_parameter_type_argument_annotations(cid, &name, &desc)
+                .get(idx)
+                .cloned()
+                .unwrap_or_default();
+            (anns, type_arg_anns)
+        }
+        None => (Vec::new(), Vec::new()),
     };
     let type_mirror = match ctx.invoke_virtual(
         exec,
@@ -13890,6 +13941,7 @@ pub(crate) fn native_parameter_get_annotated_type(
         _ => parameter_erased_type_mirror(ctx, this),
     };
     let at = make_annotated_type_with_anns(ctx, type_mirror, &anns);
+    stash_annotated_type_argument_anns(at, type_arg_anns);
     Ok(Some(Value::Object(Some(at))))
 }
 
@@ -13986,9 +14038,12 @@ pub(crate) fn native_field_get_annotated_type(
     args: &[Value],
 ) -> MethodCallResult {
     let this = obj_arg(args, 0)?;
-    let anns = match field_class_and_name(ctx, this) {
-        Some((cid, name)) => ctx.field_type_annotations(cid, &name),
-        None => Vec::new(),
+    let (anns, type_arg_anns) = match field_class_and_name(ctx, this) {
+        Some((cid, name)) => (
+            ctx.field_type_annotations(cid, &name),
+            ctx.field_type_argument_annotations(cid, &name),
+        ),
+        None => (Vec::new(), Vec::new()),
     };
     let type_mirror =
         match ctx.invoke_virtual(this, "getGenericType", "()Ljava/lang/reflect/Type;", &[]) {
@@ -13999,6 +14054,7 @@ pub(crate) fn native_field_get_annotated_type(
             },
         };
     let at = make_annotated_type_with_anns(ctx, type_mirror, &anns);
+    stash_annotated_type_argument_anns(at, type_arg_anns);
     Ok(Some(Value::Object(Some(at))))
 }
 

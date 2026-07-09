@@ -4115,17 +4115,24 @@ pub(crate) fn native_double_is_infinite(
 
 // --- Float/Double parsing and utilities (Phase 8 Part 7) ---
 
+fn strip_float_type_suffix(trimmed: &str) -> &str {
+    match trimmed.as_bytes().last().copied() {
+        Some(b'f' | b'F' | b'd' | b'D') => &trimmed[..trimmed.len() - 1],
+        _ => trimmed,
+    }
+}
+
 fn parse_float_string(s: &str) -> Result<f32, cratonvm_types::error::RuntimeError> {
     let trimmed = s.trim();
     match trimmed {
         "NaN" => Ok(f32::NAN),
         "Infinity" | "+Infinity" => Ok(f32::INFINITY),
         "-Infinity" => Ok(f32::NEG_INFINITY),
-        _ => trimmed.parse::<f32>().map_err(|_| {
-            cratonvm_types::error::RuntimeError::NumberFormatException {
+        _ => strip_float_type_suffix(trimmed)
+            .parse::<f32>()
+            .map_err(|_| cratonvm_types::error::RuntimeError::NumberFormatException {
                 message: format!("For input string: \"{s}\""),
-            }
-        }),
+            }),
     }
 }
 
@@ -4135,11 +4142,11 @@ fn parse_double_string(s: &str) -> Result<f64, cratonvm_types::error::RuntimeErr
         "NaN" => Ok(f64::NAN),
         "Infinity" | "+Infinity" => Ok(f64::INFINITY),
         "-Infinity" => Ok(f64::NEG_INFINITY),
-        _ => trimmed.parse::<f64>().map_err(|_| {
-            cratonvm_types::error::RuntimeError::NumberFormatException {
+        _ => strip_float_type_suffix(trimmed)
+            .parse::<f64>()
+            .map_err(|_| cratonvm_types::error::RuntimeError::NumberFormatException {
                 message: format!("For input string: \"{s}\""),
-            }
-        }),
+            }),
     }
 }
 
