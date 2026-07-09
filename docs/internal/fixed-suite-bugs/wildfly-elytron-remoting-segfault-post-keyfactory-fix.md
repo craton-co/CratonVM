@@ -183,8 +183,8 @@ frame #4.
    flip; it was simply never reachable under CratonVM before because this WildFly test class never got
    past its `@Before` setup until [[wildfly-keyfactory-translatekey-null-spi]] was fixed today.
 
-**This matches an already-documented, deliberately-deferred gap exactly**: `docs/known-issues/
-gcstress-residual-corruption-faces.md` (§"Precise-JIT-oop-maps do NOT fix this residual") and
+**This matches an already-documented, deliberately-deferred gap exactly**: `docs/internal/
+gcstress-residual-corruption-faces-FIXED.md` (§"Precise-JIT-oop-maps do NOT fix this residual") and
 `docs/known-issues/fork6-fjp-multithread-jit-root-reclamation.md` (the "A4" tracker) both describe —
 and this session's own bisection independently re-confirms — that even with precise JIT stack maps on,
 **`OopMapEntry` has no register-oop bitmap** (`jit/src/lib.rs:52-73`): a register-only oop is covered
@@ -268,6 +268,6 @@ lane than orchestrating `Fork6Hard ... GC_STRESS=...` races.
 Found via [[wildfly-keyfactory-translatekey-null-spi]]'s own fix-verification run — not caused by that
 fix, just newly reachable because of it. Root cause is the same family as
 [[fork6-fjp-multithread-jit-root-reclamation]] (the canonical A4 register-only-oop tracker) and the
-"Precise-JIT-oop-maps do NOT fix this residual" section of `gcstress-residual-corruption-faces.md` —
+"Precise-JIT-oop-maps do NOT fix this residual" section of `docs/internal/gcstress-residual-corruption-faces-FIXED.md` —
 see those docs for the register-oop-bitmap fix design context. NOT caused by `f22a8d8c`'s precise-JIT-
 maps default-ON flip (bisected: identical crash with `CRATONVM_NO_PRECISE_JIT_MAPS=1`).

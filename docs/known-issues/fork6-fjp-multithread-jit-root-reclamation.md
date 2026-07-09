@@ -73,7 +73,7 @@
 > `Fork6Hard`'s own `GC_STRESS` repro (see the "Reconcile before implementing a fix" note above — that
 > repro's mechanism is still believed to differ).
 
-**Status:** 🟡 OPEN. Non-stress `Fork6`/`Fork6Hard` remains non-reproducing on current `dev`. Two infrastructure bugs adjacent to A4 were found and fixed 2026-07-02 (see that section below) — a takeover gate-polarity bug that made the default-on cross-thread STW JIT scan silently inert, and a defense-in-depth helper-window pass — but neither closes A4 itself, whose register-only residual remains gated on the deferred precise-JIT-stack-maps project. The 2026-07-01 aggressive `GC_STRESS` failures were **NOT A4** (zero live JIT frames, zero compiled JIT code at every STW) — root-caused as three unrelated concurrent-old-gen GC races, now FIXED on dev (`57f545be`); a different residual on that same lane is tracked at [`docs/known-issues/gcstress-residual-corruption-faces.md`](gcstress-residual-corruption-faces.md).
+**Status:** 🟡 OPEN. Non-stress `Fork6`/`Fork6Hard` remains non-reproducing on current `dev`. Two infrastructure bugs adjacent to A4 were found and fixed 2026-07-02 (see that section below) — a takeover gate-polarity bug that made the default-on cross-thread STW JIT scan silently inert, and a defense-in-depth helper-window pass — but neither closes A4 itself, whose register-only residual remains gated on the deferred precise-JIT-stack-maps project. The 2026-07-01 aggressive `GC_STRESS` failures were **NOT A4** (zero live JIT frames, zero compiled JIT code at every STW) — root-caused as three unrelated concurrent-old-gen GC races, now FIXED on dev (`57f545be`); a later residual on that same lane is now fixed and archived at [`docs/internal/gcstress-residual-corruption-faces-FIXED.md`](../internal/gcstress-residual-corruption-faces-FIXED.md).
 
 > ## Fix 2026-07-02 — the "default-on" takeover was silently inert; + an initiator-side blocked/helper-window scan; stress lane re-scoped as a separate JIT-free bug
 >
@@ -161,10 +161,10 @@
 > promotion produces — was swept live), and a failed remark STW silently fell
 > through to the sweep with a non-final bitmap. All three fixed and unit-tested
 > on `fix/oldgen-concurrent-mark-races-20260703` (`57f545be`), now on dev. A
-> *different* residual corruption survives that fix on the same aggressive
-> lane — full history in `docs/internal/gcstress-concurrent-oldgen-races-FIXED.md`,
-> residual tracked at
-> [`docs/known-issues/gcstress-residual-corruption-faces.md`](gcstress-residual-corruption-faces.md).
+> later residual corruption survived that fix on the same aggressive
+> lane, but is now **FIXED** too; full history is in
+> `docs/internal/gcstress-concurrent-oldgen-races-FIXED.md` and
+> [`docs/internal/gcstress-residual-corruption-faces-FIXED.md`](../internal/gcstress-residual-corruption-faces-FIXED.md).
 >
 > **Validation (both-fixes binary `cvmp-fork6-hw2-20260702.exe`, real-FJP gate):**
 > plain `Fork6` ALL-OK; `Fork6Hard 256 40` ALL-OK; 8-way concurrent `Fork6` 8/8

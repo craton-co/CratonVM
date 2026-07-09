@@ -570,6 +570,12 @@ pub fn collect_roots(shared: &SharedVm, thread: &JvmThread) -> Vec<ObjectRef> {
     //     `t27_tls::gc_update_tls_ctx_key_manager_refs` in `gc.rs`).
     cratonvm_native_builtins::t27_tls::gc_scan_tls_ctx_key_manager_roots(&mut roots);
 
+    //     ForkJoinTask done/result side-table. Real-JDK ForkJoin overrides cache
+    //     task results in Rust state keyed by task identity; cached Object
+    //     results live in no heap slot, so a GC between `submit` and `get` must
+    //     root them here. Remap companion in `gc.rs`.
+    cratonvm_native_builtins::phases_early::gc_scan_forkjoin_roots(&mut roots);
+
     // 21. Uniform native-root registry. Any native subsystem holding ObjectRefs
     //     in a process-global side-table can register a scan callback here
     //     instead of hand-wiring a new `gc_scan_*` call into this function (see

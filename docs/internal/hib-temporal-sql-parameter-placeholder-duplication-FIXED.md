@@ -190,11 +190,11 @@ pre-existing aarch64 failures; `cargo test -p cratonvm-vm --lib deopt` = 52/52;
 pre-existing by A/B against the unmodified base tree; dev independently fixed a 13th).
 `IndyReplay` (3 shapes) + `TzDstProbe`: `@@PASS` on the merged binary.
 
-The pre-existing residual families are tracked in
+The pre-existing residual families are archived in
 [`hib-temporal-residuals-typename-npe-illegalthreadstate.md`](../known-issues/hib-temporal-residuals-typename-npe-illegalthreadstate.md)
 (typeNamePattern NPE + ITSE) and
-[`gcstress-residual-corruption-faces.md`](../known-issues/gcstress-residual-corruption-faces.md)
-(the ZonedDateTimeTest GC livelock face).
+[`gcstress-residual-corruption-faces-FIXED.md`](gcstress-residual-corruption-faces-FIXED.md)
+(the now-fixed ZonedDateTimeTest GC livelock face).
 
 ## Concurrent finding merged 2026-07-07 — two more affected classes (independent Windows rerun)
 

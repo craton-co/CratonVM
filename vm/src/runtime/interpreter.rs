@@ -2096,15 +2096,15 @@ pub(crate) fn update_root_snapshot(shared: &SharedVm, thread: &mut JvmThread) {
     let mut snapshot = snap_arc.lock();
     snapshot.clear();
 
-    // The frozen-frame cache yields to the default path when the Fork6
-    // multi-thread `conservative_locals` hardening is engaged: the cached
-    // `scan_frame_roots` omits `scan_locals_conservative`, so caching under it
-    // could drop a parked worker's lost-tag local from the snapshot. This flag
-    // is off in the default config (only the opt-in CRATONVM_REAL_FORKJOINPOOL
-    // gate turns it on), so the cache still engages for the deep-stack
-    // native-heavy workloads it fixes.
+    // The frozen-frame cache yields to the default path in the opt-in real
+    // ForkJoinPool lane. Those native overrides recursively re-enter Java from
+    // `fork`/`join`/`submit`; frames that look prefix-stable to the cache can
+    // still expose changing local/operand roots around those native returns.
+    // The default full-frame scan keeps that GC-stress path exact while the
+    // cache remains enabled for the deep-stack native-heavy workloads it fixes.
     let conservative_locals = crate::memory::roots::conservative_locals_enabled();
-    if crate::runtime::env_cache::rootsnap_cache() && !conservative_locals {
+    let real_forkjoinpool = crate::runtime::env_cache::real_forkjoinpool();
+    if crate::runtime::env_cache::rootsnap_cache() && !conservative_locals && !real_forkjoinpool {
         // ── Frozen-frame cached path ────────────────────────────────────────
         // Reuse the cached roots of the deep, continuously-frozen frames and
         // re-scan only the churning top. Correctness rests on the LIFO stack
@@ -2708,18 +2708,22 @@ pub(crate) fn apply_pointer_map_to_thread(
 ///
 /// FAIL-SAFE: `rs_cache_gen` is advanced ONLY here. Any GC path that relocates
 /// this thread's objects WITHOUT calling this leaves `rs_cache_gen` stale, so
-/// the gen gate rebuilds the cache from scratch — a stale cached address is
-/// never trusted. Opt-in + default-OFF (`CRATONVM_ROOTSNAP_CACHE_SURVIVE_GC`);
-/// a no-op unless the `rootsnap_cache` itself is enabled (else `rs_cache` is
-/// empty). Must be called at every site that applies a `pointer_map` to a
-/// thread's frames (`apply_pointer_map_to_thread` here, `update_all_roots` in
-/// memory/gc.rs); missing one only costs a rebuild, never correctness.
+/// the gen gate rebuilds the cache from scratch; a stale cached address is
+/// never trusted. Default-on with opt-outs (`CRATONVM_ROOTSNAP_CACHE=0` or
+/// `CRATONVM_ROOTSNAP_CACHE_SURVIVE_GC=0`), and bypassed in the opt-in real
+/// ForkJoinPool lane. Must be called at every site that applies a `pointer_map`
+/// to a thread's frames (`apply_pointer_map_to_thread` here, `update_all_roots`
+/// in memory/gc.rs); missing one only costs a rebuild, never correctness.
 pub(crate) fn remap_rs_cache_after_gc(
     thread: &mut JvmThread,
     pointer_map: &std::collections::HashMap<usize, usize>,
     heap: &crate::memory::VmHeap,
 ) {
-    if !crate::runtime::env_cache::rootsnap_cache_survive_gc() {
+    if !crate::runtime::env_cache::rootsnap_cache()
+        || !crate::runtime::env_cache::rootsnap_cache_survive_gc()
+        || crate::runtime::env_cache::real_forkjoinpool()
+    {
+        thread.rs_cache.clear();
         return;
     }
     // An empty map means nothing moved → cached addresses are already valid;
@@ -20090,6 +20094,65 @@ pub(crate) fn is_jdk_wrapper_math_native_override(
     }
 }
 
+pub(crate) fn is_forkjoin_native_override(
+    class_name: &str,
+    method_name: &str,
+    descriptor: &str,
+) -> bool {
+    // Under CRATONVM_REAL_FORKJOINPOOL, keep real pool initialization but force
+    // the VM Bridge methods that otherwise enqueue work into ForkJoinPool's
+    // queue/status machinery. The task-family methods share the side-table
+    // state scanned and remapped by GC.
+    if class_name == "java/util/concurrent/ForkJoinPool"
+        && matches!(
+            (method_name, descriptor),
+            ("commonPool", "()Ljava/util/concurrent/ForkJoinPool;")
+                | (
+                    "getFactory",
+                    "()Ljava/util/concurrent/ForkJoinPool$ForkJoinWorkerThreadFactory;"
+                )
+                | ("getParallelism", "()I")
+                | ("getCommonPoolParallelism", "()I")
+                | (
+                    "invoke",
+                    "(Ljava/util/concurrent/ForkJoinTask;)Ljava/lang/Object;"
+                )
+                | (
+                    "submit",
+                    "(Ljava/util/concurrent/ForkJoinTask;)Ljava/util/concurrent/ForkJoinTask;"
+                )
+                | (
+                    "externalSubmit",
+                    "(Ljava/util/concurrent/ForkJoinTask;)Ljava/util/concurrent/ForkJoinTask;"
+                )
+                | ("execute", "(Ljava/lang/Runnable;)V")
+                | ("execute", "(Ljava/util/concurrent/ForkJoinTask;)V")
+        )
+    {
+        return true;
+    }
+
+    matches!(
+        class_name,
+        "java/util/concurrent/ForkJoinTask"
+            | "java/util/concurrent/RecursiveTask"
+            | "java/util/concurrent/RecursiveAction"
+    ) && matches!(
+        (method_name, descriptor),
+        ("fork", "()Ljava/util/concurrent/ForkJoinTask;")
+            | ("join", "()Ljava/lang/Object;")
+            | ("invoke", "()Ljava/lang/Object;")
+            | ("get", "()Ljava/lang/Object;")
+            | ("getRawResult", "()Ljava/lang/Object;")
+            | ("setRawResult", "(Ljava/lang/Object;)V")
+            | ("isDone", "()Z")
+            | ("isCompletedNormally", "()Z")
+            | ("isCancelled", "()Z")
+            | ("cancel", "(Z)Z")
+            | ("complete", "(Ljava/lang/Object;)V")
+    )
+}
+
 pub(crate) fn is_count_down_latch_native_override(
     class_name: &str,
     method_name: &str,
@@ -20176,6 +20239,10 @@ fn force_native_over_real_jdk_bytecode(
     method_name: &str,
     method_descriptor: &str,
 ) -> bool {
+    if is_forkjoin_native_override(class_name, method_name, method_descriptor) {
+        return true;
+    }
+
     // java.lang.Module access checks. CratonVM's `Class.getModule()` returns a
     // synthetic Module mirror with a NULL `descriptor` (real module-path
     // encapsulation does not exist — every class is effectively on the class

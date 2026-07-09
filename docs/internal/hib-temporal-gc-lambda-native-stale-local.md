@@ -16,9 +16,9 @@ all-zero-header stale-receiver storm, SIGSEGV, rc=1 mid-class abort). Per-class:
 `OffsetDateTimeTest` completed (exit=0) with 2 gracefully-degraded `mark_young … implausible extent`
 guard rejections; `ZonedDateTimeTest` never crashes but LIVELOCKS in a continuous
 `mark_young: rejecting object … implausible extent` + `[A2] BREADCRUMB — NO allocation record` loop —
-that is a **DISTINCT, still-open** corruption face (garbage-header object repeatedly reachable by the
-young mark), tracked in
-[`docs/known-issues/gcstress-residual-corruption-faces.md`](../known-issues/gcstress-residual-corruption-faces.md)
+that was a **distinct** corruption face (garbage-header object repeatedly reachable by the
+young mark), now fixed and archived in
+[`docs/internal/gcstress-residual-corruption-faces-FIXED.md`](gcstress-residual-corruption-faces-FIXED.md)
 (see its 2026-07-07 repro note), NOT this doc's (fixed) dispatch-crash family. The classes also surface
 a **functional, non-GC bug** — duplicated JDBC `?` placeholders in generated SQL — tracked as
 [`docs/internal/hib-temporal-sql-parameter-placeholder-duplication-FIXED.md`](hib-temporal-sql-parameter-placeholder-duplication-FIXED.md) (FIXED 2026-07-07 — it was the reopened JIT reason-8 imprecise-resume corruption, not a string bug).

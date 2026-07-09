@@ -333,8 +333,11 @@ pub fn real_proxy_super() -> bool {
 // Correctness rests on the LIFO stack discipline (a frame still present at
 // index k with unchanged seq proves [0..k) stayed continuously frozen). See
 // `update_root_snapshot`. Local writes bump `exec_epoch`, so a frozen-frame
-// cache entry is reused only while that frame's root shape is unchanged.
+// cache entry is reused only while that frame's root shape is unchanged. The
+// real ForkJoinPool lane bypasses both cache reuse and survive-GC remapping.
 //
+cached_is_set!(real_forkjoinpool, "CRATONVM_REAL_FORKJOINPOOL");
+
 // DEFAULT-ON as of 2026-06-16 (SpringRepositoriesExtension hang). Previously
 // default-OFF: `update_root_snapshot` rescans EVERY interpreter frame on every
 // object-returning native call, so a native-call-heavy hot loop running at a
@@ -342,10 +345,10 @@ pub fn real_proxy_super() -> bool {
 // call and hangs (>300s). Measured: parse#0 depth-40 95s→42s with the cache;
 // the real test goes from a 300s-timeout hang to completing. The cached path is
 // byte-identical to the default path in the default config (`conservative_locals`
-// off); `update_root_snapshot` falls back to the default path when the Fork6
-// `conservative_locals` hardening is engaged. Validated: bt16=14985902,
-// bt18=68332206 (== golden, with vs without). Off-switch for diagnosis/bisection:
-// `CRATONVM_ROOTSNAP_CACHE=0`.
+// off); `update_root_snapshot` falls back to the default path when the opt-in
+// real ForkJoinPool lane is active, including its `conservative_locals`
+// hardening. Validated: bt16=14985902, bt18=68332206 (== golden, with vs
+// without). Off-switch for diagnosis/bisection: `CRATONVM_ROOTSNAP_CACHE=0`.
 #[inline]
 pub fn rootsnap_cache() -> bool {
     static CACHE: OnceLock<bool> = OnceLock::new();
