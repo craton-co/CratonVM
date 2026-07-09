@@ -2200,9 +2200,6 @@ fn register_uri_natives(r: &mut NativeMethodRegistry) {
     r.register(uri, "toURL", "()Ljava/net/URL;", |ctx, args| {
         let this = obj_arg(args, 0)?;
         let raw = uri_raw_string(ctx, this);
-        if raw.is_empty() {
-            return Ok(Some(Value::Object(None)));
-        }
         // Scheme = text before the first ':' (RFC 3986 §3.1). The real
         // `java.net.URI.toURL()` rejects two cases that callers RELY on
         // throwing:
@@ -4520,6 +4517,9 @@ fn classpath_resource_via_context_loader(
 /// the first '/' contains '@'.
 fn field5_is_full_url(s: &str) -> bool {
     let before_slash = s.split('/').next().unwrap_or(s);
+    if s.starts_with('[') {
+        return false;
+    }
     if before_slash.contains('@') {
         return false;
     }

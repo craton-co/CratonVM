@@ -4125,7 +4125,7 @@ fn strip_java_float_type_suffix(s: &str) -> &str {
 
     let numeric = &s[..s.len() - 1];
     let has_digit = numeric.bytes().any(|b| b.is_ascii_digit());
-    let suffix_follows_number = matches!(numeric.as_bytes().last(), Some(b'0'..=b'9') | Some(b'.'));
+    let suffix_follows_number = matches!(numeric.as_bytes().last().copied(), Some(b'0'..=b'9') | Some(b'.'));
     if has_digit && suffix_follows_number {
         numeric
     } else {
@@ -4162,7 +4162,6 @@ fn parse_double_string(s: &str) -> Result<f64, cratonvm_types::error::RuntimeErr
         }),
     }
 }
-
 pub(crate) fn native_float_parse_float(
     ctx: &mut dyn NativeContext,
     args: &[Value],

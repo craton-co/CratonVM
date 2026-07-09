@@ -46,7 +46,8 @@ use rustc_hash::FxHashMap;
 use std::sync::OnceLock;
 
 use cratonvm_native_api::registry::{NativeContext, NativeMethodRegistry};
-use cratonvm_types::{error::MethodCallResult, ArrayElementType, ObjectRef, Value};
+use cratonvm_types::error::{MethodCallFailed, MethodCallResult, RuntimeError};
+use cratonvm_types::{ArrayElementType, ObjectRef, Value};
 
 /// Per-object property cap.  10_000 keys * 64 KiB max value = 640 MiB
 /// per object, but in practice `.properties` files are tiny.  This
@@ -66,12 +67,29 @@ const MAX_LOAD_BYTES: usize = 16 * 1024 * 1024;
 /// abuse without rejecting realistic inputs.
 const MAX_KV_LEN: usize = 64 * 1024;
 
+const MALFORMED_UNICODE_MESSAGE: &str = "Malformed \\uxxxx encoding.";
+
 #[inline]
 fn props_stderr_diag() -> bool {
     matches!(
         std::env::var("CRATONVM_DIAG_PROPERTIES").as_deref(),
         Ok("1") | Ok("true") | Ok("yes")
     )
+}
+
+fn throw_malformed_unicode_escape(ctx: &mut dyn NativeContext) -> MethodCallFailed {
+    let msg = ctx.create_string(MALFORMED_UNICODE_MESSAGE);
+    match ctx.new_object_initialized(
+        "java/lang/IllegalArgumentException",
+        "(Ljava/lang/String;)V",
+        &[Value::Object(Some(msg))],
+    ) {
+        Ok(Some(Value::Object(Some(exc)))) => MethodCallFailed::ExceptionThrown(exc),
+        _ => RuntimeError::IllegalArgumentException {
+            message: MALFORMED_UNICODE_MESSAGE.to_string(),
+        }
+        .into(),
+    }
 }
 
 macro_rules! props_diag_eprintln {
@@ -336,7 +354,25 @@ fn parse_properties(bytes: &[u8]) -> Vec<(String, String)> {
     // Decode as ISO-8859-1 (Java spec for `Properties.load(InputStream)`).
     // Each byte maps to one Unicode code point in 0..=255.
     let raw: String = bytes.iter().map(|&b| b as char).collect();
+    parse_properties_text(&raw)
+}
 
+fn parse_properties_strict(bytes: &[u8]) -> Result<Vec<(String, String)>, ()> {
+    // Decode as ISO-8859-1 (Java spec for `Properties.load(InputStream)`).
+    // Each byte maps to one Unicode code point in 0..=255.
+    let raw: String = bytes.iter().map(|&b| b as char).collect();
+    parse_properties_text_strict(&raw)
+}
+
+fn parse_properties_text(raw: &str) -> Vec<(String, String)> {
+    parse_properties_text_inner(raw, false).unwrap_or_default()
+}
+
+fn parse_properties_text_strict(raw: &str) -> Result<Vec<(String, String)>, ()> {
+    parse_properties_text_inner(raw, true)
+}
+
+fn parse_properties_text_inner(raw: &str, strict_unicode: bool) -> Result<Vec<(String, String)>, ()> {
     let mut out = Vec::new();
     let mut iter = raw.split('\n').peekable();
     let mut continued = String::new();
@@ -371,8 +407,8 @@ fn parse_properties(bytes: &[u8]) -> Vec<(String, String)> {
 
         // Split on first unescaped `=`, `:`, or whitespace.
         let (key, value) = split_key_value(&active);
-        let key = unescape(&key);
-        let value = unescape(&value);
+        let key = unescape_inner(&key, strict_unicode)?;
+        let value = unescape_inner(&value, strict_unicode)?;
         if key.len() <= MAX_KV_LEN && value.len() <= MAX_KV_LEN {
             out.push((key, value));
         }
@@ -380,7 +416,7 @@ fn parse_properties(bytes: &[u8]) -> Vec<(String, String)> {
             break;
         }
     }
-    out
+    Ok(out)
 }
 
 /// Split a logical line into (key, value) at the first unescaped `=`,
@@ -461,6 +497,10 @@ fn split_key_value(line: &str) -> (String, String) {
 /// substitute U+FFFD and warn rather than silently dropping the unit. Wiring a
 /// units-aware value channel through the side-table is a separate change.
 fn unescape(s: &str) -> String {
+    unescape_inner(s, false).unwrap_or_default()
+}
+
+fn unescape_inner(s: &str, strict_unicode: bool) -> Result<String, ()> {
     let mut out = String::with_capacity(s.len());
     let mut chars = s.chars().peekable();
     while let Some(c) = chars.next() {
@@ -482,13 +522,14 @@ fn unescape(s: &str) -> String {
                 // `\uXXXX` — a single UTF-16 code unit. Read the hex digits.
                 let (code, seen) = read_u_escape(&mut chars);
                 if seen == 0 {
+                    if strict_unicode {
+                        return Err(());
+                    }
                     // `\u` with no following hex digit at all. The JDK's
                     // `Properties.load` (`loadConvert`) throws
                     // IllegalArgumentException("Malformed \\uxxxx encoding.")
-                    // here. `unescape` has no error channel on this
-                    // best-effort, app-enabling path, so we don't abort the
-                    // whole load — but we must NOT silently swallow the `u`.
-                    // Preserve it literally and warn loudly.
+                    // here. The permissive helper preserves the legacy
+                    // best-effort behavior for non-load callers and tests.
                     tracing::warn!(
                         target: "cratonvm_vm::props_sidetable",
                         "Malformed \\u escape in .properties value (no hex digits); \
@@ -498,10 +539,12 @@ fn unescape(s: &str) -> String {
                     continue;
                 }
                 if seen < 4 {
+                    if strict_unicode {
+                        return Err(());
+                    }
                     // Fewer than 4 hex digits before a non-hex char/EOF. The
-                    // JDK treats this as malformed and throws; we decode the
-                    // digits actually present (so the parsed value is NOT
-                    // silently dropped) and warn.
+                    // JDK treats this as malformed and throws; the permissive
+                    // helper decodes the digits actually present.
                     tracing::warn!(
                         target: "cratonvm_vm::props_sidetable",
                         digits = ?seen,
@@ -558,7 +601,7 @@ fn unescape(s: &str) -> String {
             None => break,
         }
     }
-    out
+    Ok(out)
 }
 
 /// Consume the hex digits of a `\uXXXX` escape (the `\u` prefix has already
@@ -1015,7 +1058,10 @@ fn native_properties_load(ctx: &mut dyn NativeContext, args: &[Value]) -> Method
     if bytes.len() > MAX_LOAD_BYTES {
         return Ok(None);
     }
-    let parsed = parse_properties(&bytes);
+    let parsed = match parse_properties_strict(&bytes) {
+        Ok(parsed) => parsed,
+        Err(()) => return Err(throw_malformed_unicode_escape(ctx)),
+    };
     props_diag_eprintln!(
         "[PROPS-DBG] native_properties_load: parsed {} entries from {} bytes",
         parsed.len(),
@@ -1142,11 +1188,16 @@ fn native_properties_load_reader(ctx: &mut dyn NativeContext, args: &[Value]) ->
         }
     }
 
-    let bytes = iso_8859_1_bytes(&accumulated);
-    if bytes.len() > MAX_LOAD_BYTES {
+    if accumulated.len() > MAX_LOAD_BYTES {
         return Ok(None);
     }
-    let parsed = parse_properties(&bytes);
+    // SPR-TEST-PROPS-READER.1 (2026-07-08) — `Properties.load(Reader)`
+    // parses the already-decoded character stream. Do not downgrade non-Latin-1
+    // chars to `?`; intentionally wrong UTF-8 decoding must preserve U+FFFD.
+    let parsed = match parse_properties_text_strict(&accumulated) {
+        Ok(parsed) => parsed,
+        Err(()) => return Err(throw_malformed_unicode_escape(ctx)),
+    };
     store_parsed_entries(ctx, this, &parsed);
     Ok(None)
 }
