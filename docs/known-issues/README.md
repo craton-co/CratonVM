@@ -4,6 +4,10 @@ This folder collects CratonVM-only defects found while running upstream Java
 suites. The docs had grown to describe the **same underlying bug from several
 angles**; this index is the consolidated map. Read it first.
 
+## 2026-07-09 Tomcat AsyncContext JULI LogManager note retired
+
+- FIXED/RETIRED: [`asynccontext-logmanager-getlogger-null-FIXED.md`](../internal/fixed-suite-bugs/asynccontext-logmanager-getlogger-null-FIXED.md) - `LogManager.addLogger(Logger)` now indexes real-JDK/JULI logger objects by their real `name` field instead of assuming synthetic slot 0 contains the name. The focused native regression passes, and a uniquely named Azure release binary (`/data/data/cratonvm-probes/bin/cratonvm-tomcat-async-logmanager-20260709`) passes a real-VM probe that performs the Tomcat-shaped `addLogger` -> `getLogger(name)` -> `setLevel` sequence for `org.apache.catalina.core.AsyncContextImpl`. The full Tomcat runner was unavailable on the host because the backup fixture lacked `test/` and `output/` artifacts, so future suite reruns should treat this as fixture confirmation rather than an open VM mechanism.
+
 ## 2026-07-09 Tomcat WebSocket close-delay repro blocked by 3 environment bugs (2 fixed, 1 new open)
 
 While chasing `wsremoteendpoint-close-delay-near-deadlock.md`, found the
