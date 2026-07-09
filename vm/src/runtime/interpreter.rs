@@ -20334,6 +20334,85 @@ pub(crate) fn is_xerces_cmstateset_native_override(
         )
 }
 
+pub(crate) fn is_xerces_xml_parser_native_override(
+    class_name: &str,
+    method_name: &str,
+    descriptor: &str,
+) -> bool {
+    match class_name {
+        "com/sun/org/apache/xerces/internal/util/XMLChar" => matches!(
+            (method_name, descriptor),
+            ("isSpace", "(I)Z")
+                | ("isNameStart", "(I)Z")
+                | ("isName", "(I)Z")
+                | ("isNCNameStart", "(I)Z")
+                | ("isNCName", "(I)Z")
+        ),
+        "jdk/xml/internal/XMLLimitAnalyzer" => matches!(
+            (method_name, descriptor),
+            ("addValue", "(ILjava/lang/String;I)V")
+                | (
+                    "addValue",
+                    "(Ljdk/xml/internal/XMLSecurityManager$Limit;Ljava/lang/String;I)V"
+                )
+                | ("getValue", "(I)I")
+                | ("getValue", "(Ljdk/xml/internal/XMLSecurityManager$Limit;)I")
+                | ("getTotalValue", "(I)I")
+                | (
+                    "getTotalValue",
+                    "(Ljdk/xml/internal/XMLSecurityManager$Limit;)I"
+                )
+                | ("getValueByIndex", "(I)I")
+        ),
+        "com/sun/org/apache/xerces/internal/impl/dv/xs/XSSimpleTypeDecl" => matches!(
+            (method_name, descriptor),
+            ("normalize", "(Ljava/lang/String;S)Ljava/lang/String;")
+                | ("normalize", "(Ljava/lang/Object;S)Ljava/lang/String;")
+        ),
+        "com/sun/org/apache/xerces/internal/impl/xs/traversers/XSDHandler$XSDKey" => matches!(
+            (method_name, descriptor),
+            ("hashCode", "()I") | ("equals", "(Ljava/lang/Object;)Z")
+        ),
+        "com/sun/org/apache/xerces/internal/impl/XMLEntityScanner" => matches!(
+            (method_name, descriptor),
+            (
+                "scanContent",
+                "(Lcom/sun/org/apache/xerces/internal/xni/XMLString;)I"
+            ) | ("skipSpaces", "()Z") | (
+                "normalizeNewlines",
+                "(SLcom/sun/org/apache/xerces/internal/xni/XMLString;ZZLcom/sun/org/apache/xerces/internal/impl/XMLScanner$NameType;)Z"
+            ) | (
+                "checkEntityLimit",
+                "(Lcom/sun/org/apache/xerces/internal/impl/XMLScanner$NameType;Lcom/sun/xml/internal/stream/Entity$ScannedEntity;II)V"
+            )
+        ),
+        "com/sun/org/apache/xerces/internal/impl/xs/opti/NodeImpl" => matches!(
+            (method_name, descriptor),
+            ("getNodeName", "()Ljava/lang/String;")
+                | ("getNamespaceURI", "()Ljava/lang/String;")
+                | ("getPrefix", "()Ljava/lang/String;")
+                | ("getLocalName", "()Ljava/lang/String;")
+                | ("getNodeType", "()S")
+                | ("getReadOnly", "()Z")
+        ),
+        "com/sun/org/apache/xerces/internal/impl/xs/opti/ElementImpl" => {
+            matches!((method_name, descriptor), ("getTagName", "()Ljava/lang/String;"))
+        }
+        "com/sun/org/apache/xerces/internal/impl/xs/opti/AttrImpl" => matches!(
+            (method_name, descriptor),
+            ("getName", "()Ljava/lang/String;")
+                | ("getValue", "()Ljava/lang/String;")
+                | ("getNodeValue", "()Ljava/lang/String;")
+                | ("getSpecified", "()Z")
+                | ("isId", "()Z")
+        ),
+        "com/sun/org/apache/xerces/internal/impl/xpath/regex/RangeToken" => {
+            matches!((method_name, descriptor), ("sortRanges", "()V"))
+        }
+        _ => false,
+    }
+}
+
 fn force_native_over_real_jdk_bytecode(
     class_name: &str,
     method_name: &str,
@@ -20924,6 +21003,9 @@ fn force_native_over_real_jdk_bytecode(
         return true;
     }
     if is_xerces_cmstateset_native_override(class_name, method_name, method_descriptor) {
+        return true;
+    }
+    if is_xerces_xml_parser_native_override(class_name, method_name, method_descriptor) {
         return true;
     }
     // Surefire fork bootstrap/teardown: bypass ServiceLoader decoder discovery
@@ -31125,6 +31207,196 @@ mod tests {
             "com/sun/org/apache/xerces/internal/impl/xs/models/XSDFACM",
             "hashCode",
             "()I"
+        ));
+    }
+
+    #[test]
+    fn xerces_xml_parser_force_native_covers_liquibase_parse_hotspots() {
+        let xmlchar = "com/sun/org/apache/xerces/internal/util/XMLChar";
+        for (name, descriptor) in [
+            ("isSpace", "(I)Z"),
+            ("isNameStart", "(I)Z"),
+            ("isName", "(I)Z"),
+            ("isNCNameStart", "(I)Z"),
+            ("isNCName", "(I)Z"),
+        ] {
+            assert!(
+                is_xerces_xml_parser_native_override(xmlchar, name, descriptor),
+                "{name}{descriptor} must route to the registered XMLChar native"
+            );
+            assert!(
+                force_native_over_real_jdk_bytecode(xmlchar, name, descriptor),
+                "{name}{descriptor} must not fall through to interpreted XMLChar bytecode"
+            );
+        }
+
+        let analyzer = "jdk/xml/internal/XMLLimitAnalyzer";
+        for (name, descriptor) in [
+            ("addValue", "(ILjava/lang/String;I)V"),
+            (
+                "addValue",
+                "(Ljdk/xml/internal/XMLSecurityManager$Limit;Ljava/lang/String;I)V",
+            ),
+            ("getValue", "(I)I"),
+            ("getValue", "(Ljdk/xml/internal/XMLSecurityManager$Limit;)I"),
+            ("getTotalValue", "(I)I"),
+            (
+                "getTotalValue",
+                "(Ljdk/xml/internal/XMLSecurityManager$Limit;)I",
+            ),
+            ("getValueByIndex", "(I)I"),
+        ] {
+            assert!(
+                is_xerces_xml_parser_native_override(analyzer, name, descriptor),
+                "{name}{descriptor} must route to the registered XMLLimitAnalyzer native"
+            );
+            assert!(
+                force_native_over_real_jdk_bytecode(analyzer, name, descriptor),
+                "{name}{descriptor} must not fall through to interpreted XMLLimitAnalyzer bytecode"
+            );
+        }
+
+        let simple_type_decl = "com/sun/org/apache/xerces/internal/impl/dv/xs/XSSimpleTypeDecl";
+        for descriptor in [
+            "(Ljava/lang/String;S)Ljava/lang/String;",
+            "(Ljava/lang/Object;S)Ljava/lang/String;",
+        ] {
+            assert!(
+                is_xerces_xml_parser_native_override(simple_type_decl, "normalize", descriptor),
+                "normalize{descriptor} must route to the registered XSSimpleTypeDecl native"
+            );
+            assert!(
+                force_native_over_real_jdk_bytecode(simple_type_decl, "normalize", descriptor),
+                "normalize{descriptor} must not fall through to interpreted XSSimpleTypeDecl bytecode"
+            );
+        }
+
+        let xsd_key = "com/sun/org/apache/xerces/internal/impl/xs/traversers/XSDHandler$XSDKey";
+        for (name, descriptor) in [("hashCode", "()I"), ("equals", "(Ljava/lang/Object;)Z")] {
+            assert!(
+                is_xerces_xml_parser_native_override(xsd_key, name, descriptor),
+                "{name}{descriptor} must route to the registered XSDKey native"
+            );
+            assert!(
+                force_native_over_real_jdk_bytecode(xsd_key, name, descriptor),
+                "{name}{descriptor} must not fall through to interpreted XSDKey bytecode"
+            );
+        }
+
+        let entity_scanner = "com/sun/org/apache/xerces/internal/impl/XMLEntityScanner";
+        for (name, descriptor) in [
+            ("scanContent", "(Lcom/sun/org/apache/xerces/internal/xni/XMLString;)I"),
+            ("skipSpaces", "()Z"),
+            (
+                "normalizeNewlines",
+                "(SLcom/sun/org/apache/xerces/internal/xni/XMLString;ZZLcom/sun/org/apache/xerces/internal/impl/XMLScanner$NameType;)Z",
+            ),
+            (
+                "checkEntityLimit",
+                "(Lcom/sun/org/apache/xerces/internal/impl/XMLScanner$NameType;Lcom/sun/xml/internal/stream/Entity$ScannedEntity;II)V",
+            ),
+        ] {
+            assert!(
+                is_xerces_xml_parser_native_override(entity_scanner, name, descriptor),
+                "{name}{descriptor} must route to the registered XMLEntityScanner native"
+            );
+            assert!(
+                force_native_over_real_jdk_bytecode(entity_scanner, name, descriptor),
+                "{name}{descriptor} must not fall through to interpreted XMLEntityScanner bytecode"
+            );
+        }
+
+        for (class_name, name, descriptor) in [
+            (
+                "com/sun/org/apache/xerces/internal/impl/xs/opti/NodeImpl",
+                "getNodeName",
+                "()Ljava/lang/String;",
+            ),
+            (
+                "com/sun/org/apache/xerces/internal/impl/xs/opti/NodeImpl",
+                "getNamespaceURI",
+                "()Ljava/lang/String;",
+            ),
+            (
+                "com/sun/org/apache/xerces/internal/impl/xs/opti/NodeImpl",
+                "getPrefix",
+                "()Ljava/lang/String;",
+            ),
+            (
+                "com/sun/org/apache/xerces/internal/impl/xs/opti/NodeImpl",
+                "getLocalName",
+                "()Ljava/lang/String;",
+            ),
+            (
+                "com/sun/org/apache/xerces/internal/impl/xs/opti/NodeImpl",
+                "getNodeType",
+                "()S",
+            ),
+            (
+                "com/sun/org/apache/xerces/internal/impl/xs/opti/NodeImpl",
+                "getReadOnly",
+                "()Z",
+            ),
+            (
+                "com/sun/org/apache/xerces/internal/impl/xs/opti/ElementImpl",
+                "getTagName",
+                "()Ljava/lang/String;",
+            ),
+            (
+                "com/sun/org/apache/xerces/internal/impl/xs/opti/AttrImpl",
+                "getName",
+                "()Ljava/lang/String;",
+            ),
+            (
+                "com/sun/org/apache/xerces/internal/impl/xs/opti/AttrImpl",
+                "getValue",
+                "()Ljava/lang/String;",
+            ),
+            (
+                "com/sun/org/apache/xerces/internal/impl/xs/opti/AttrImpl",
+                "getNodeValue",
+                "()Ljava/lang/String;",
+            ),
+            (
+                "com/sun/org/apache/xerces/internal/impl/xs/opti/AttrImpl",
+                "getSpecified",
+                "()Z",
+            ),
+            (
+                "com/sun/org/apache/xerces/internal/impl/xs/opti/AttrImpl",
+                "isId",
+                "()Z",
+            ),
+        ] {
+            assert!(
+                is_xerces_xml_parser_native_override(class_name, name, descriptor),
+                "{class_name}.{name}{descriptor} must route to the registered opti-DOM native"
+            );
+            assert!(
+                force_native_over_real_jdk_bytecode(class_name, name, descriptor),
+                "{class_name}.{name}{descriptor} must not fall through to interpreted opti-DOM bytecode"
+            );
+        }
+
+        let range_token = "com/sun/org/apache/xerces/internal/impl/xpath/regex/RangeToken";
+        assert!(
+            is_xerces_xml_parser_native_override(range_token, "sortRanges", "()V"),
+            "RangeToken.sortRanges must route to the registered regex native"
+        );
+        assert!(
+            force_native_over_real_jdk_bytecode(range_token, "sortRanges", "()V"),
+            "RangeToken.sortRanges must not fall through to interpreted regex bytecode"
+        );
+
+        assert!(!is_xerces_xml_parser_native_override(
+            xmlchar,
+            "isValidName",
+            "(Ljava/lang/String;)Z"
+        ));
+        assert!(!is_xerces_xml_parser_native_override(
+            analyzer,
+            "debugPrint",
+            "(Ljdk/xml/internal/XMLSecurityManager;)V"
         ));
     }
 
