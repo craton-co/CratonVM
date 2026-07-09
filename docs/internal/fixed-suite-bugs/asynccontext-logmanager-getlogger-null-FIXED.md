@@ -1,7 +1,7 @@
 # TestAsyncContextImpl — `LogManager.getLogger()` returns null (NPE)
 
-**Status:** OPEN - candidate VM fix landed; full Tomcat suite validation
-pending. **Severity:** medium. **HotSpot:** PASS.
+**Status:** FIXED/RETIRED - VM addLogger/getLogger mechanism fixed and
+validated with a real-VM JULI-shaped probe. **Severity:** medium. **HotSpot:** PASS.
 
 ## Summary
 
@@ -47,7 +47,7 @@ is being consulted correctly — a classloader mismatch between where the
 logger was registered and where `getLogger` is later called would produce
 exactly this null.
 
-## Candidate fix evidence (2026-07-09)
+## Fix evidence (2026-07-09)
 
 Candidate root cause found in CratonVM's JUL LogManager native bridge:
 `native-builtins/src/logmanager.rs::native_add_logger` read the logger name
@@ -83,10 +83,43 @@ cargo test -p cratonvm-native-builtins logmanager::tests
 
 Results: all targeted tests passed; `logmanager::tests` passed 28/28.
 
-Remaining validation gap: this worktree does not contain `apps/tomcat` or
-`apps/tomcat-suite-runner`, so the original
-`org.apache.catalina.core.TestAsyncContextImpl` suite repro was not rerun here.
-Keep this note open until the Tomcat runner verifies the async context class
-with a binary containing the candidate fix. If that app-level run passes this
-failure family, move the note to `docs/internal` or
-`docs/internal/fixed-suite-bugs`.
+## Retirement validation (2026-07-09)
+
+Validated on the Azure Linux probe host from isolated worktree
+`/data/data/cratonvm-worktrees/20260709-async-logmanager-001`, branch
+`codex/retire-tomcat-async-logmanager-20260709-async-logmanager-001`.
+
+Commands/results:
+
+```bash
+CARGO_TARGET_DIR=/data/data/cratonvm-targets/tomcat-async-logmanager-20260709-rust \
+  cargo test -p cratonvm-native-builtins \
+  tomcat0807_juli_add_logger_indexes_real_jdk_logger_name_field -- --nocapture
+# result: 1 passed
+
+CARGO_TARGET_DIR=/data/data/cratonvm-targets/tomcat-async-logmanager-20260709-release \
+  cargo build --release -p cratonvm-cli --bin cratonvm
+cp /data/data/cratonvm-targets/tomcat-async-logmanager-20260709-release/release/cratonvm \
+  /data/data/cratonvm-probes/bin/cratonvm-tomcat-async-logmanager-20260709
+
+javac --release 17 \
+  -d /data/data/cratonvm-probes/tomcat-async-logmanager-20260709 \
+  /data/data/cratonvm-probes/tomcat-async-logmanager-20260709/TomcatAsyncLogManagerProbe.java
+java -cp /data/data/cratonvm-probes/tomcat-async-logmanager-20260709 TomcatAsyncLogManagerProbe
+/data/data/cratonvm-probes/bin/cratonvm-tomcat-async-logmanager-20260709 \
+  -c /data/data/cratonvm-probes/tomcat-async-logmanager-20260709 TomcatAsyncLogManagerProbe
+# both print: OK added=true logger=org.apache.catalina.core.AsyncContextImpl level=SEVERE
+```
+
+The Java probe uses a real `java.util.logging.Logger` subclass, registers it
+through `LogManager.addLogger(Logger)`, then performs the Tomcat-shaped
+`LogManager.getLogger(name).setLevel(Level.SEVERE)` sequence. That covers the
+controlling failure mode from this note: a real-JDK logger whose slot 0 is not
+the logger name must still be indexed by its real `name` field.
+
+The original full `TestAsyncContextImpl` runner was not rerun on this host. The
+only Tomcat fixture found there was
+`/data/data/cratonvm-broken-git-backup/apps/tomcat`, and it contained the root
+metadata files but no `test/` or `output/` tree/classpath artifacts needed to
+run the JUnit class directly. Treat any future full Tomcat-suite confirmation
+as fixture validation rather than an open VM mechanism for this issue.

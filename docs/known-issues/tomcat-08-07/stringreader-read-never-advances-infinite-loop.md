@@ -69,7 +69,7 @@ that actually runs** (see next section).
 ## Investigation dead-ends (same pattern as the ByteBuffer bug — read first)
 
 Exactly like `ByteBuffer.allocate()`
-(see [`bytebuffer-address-unset-aioobe.md`](bytebuffer-address-unset-aioobe.md)),
+(see the retired [`bytebuffer-address-unset-aioobe.md`](../../internal/tomcat-08-07/bytebuffer-address-unset-aioobe.md)),
 `classloading/src/class_manager.rs` (~line 10985) unconditionally injects
 `java/io/StringReader`'s entire native surface (`<init>`, both `read`
 overloads, `ready`, `close`, `skip`, `reset`, `markSupported`) as
@@ -110,11 +110,12 @@ could not be located.
 
 ## Next steps
 
-Same as [`bytebuffer-address-unset-aioobe.md`](bytebuffer-address-unset-aioobe.md):
-find the actual live dispatch site (likely requires instrumenting
-`vm/src/runtime/interpreter.rs`'s native-call resolution directly, or
-finding a registry/cache CratonVM consults that isn't
-`shared.native_methods`). Once found, apply **both** fixes together:
+The sibling ByteBuffer issue was retired by finding the actual live allocator
+in the always-on builtins path; use that as the precedent here. For
+`StringReader`, still find the actual live dispatch site (likely requires
+instrumenting `vm/src/runtime/interpreter.rs`'s native-call resolution directly,
+or finding a registry/cache CratonVM consults that isn't `shared.native_methods`).
+Once found, apply **both** fixes together:
 1. The index-arithmetic fix in `phases_early.rs` (`ch.len_utf8()` instead of
    `ch` as a byte index) — correct regardless of which registration turns
    out to be live, since the same bug pattern (advance-by-codepoint-value

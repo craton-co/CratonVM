@@ -10492,12 +10492,13 @@ fn synthetic_stub_ctor_methods(name: &str) -> Vec<ClassFileMethod> {
         ]);
     }
     if name == "java/lang/Runtime$Version" {
-        out.push(ClassFileMethod {
+        let mk = |method: &str, descriptor: &str| ClassFileMethod {
             access_flags: MethodAccessFlags::PUBLIC | MethodAccessFlags::NATIVE,
-            name: cratonvm_types::intern_arc("feature"),
-            descriptor: cratonvm_types::intern_arc("()I"),
+            name: cratonvm_types::intern_arc(method),
+            descriptor: cratonvm_types::intern_arc(descriptor),
             attributes: vec![],
-        });
+        };
+        out.extend([mk("feature", "()I"), mk("build", "()Ljava/util/Optional;")]);
     }
     if name == "java/lang/Enum" {
         let mk = |method: &str, descriptor: &str| ClassFileMethod {
@@ -11233,6 +11234,8 @@ fn synthetic_stub_ctor_methods(name: &str) -> Vec<ClassFileMethod> {
         out.extend([
             mk_ctor("(Ljava/lang/String;)V"),
             mk("toString", "()Ljava/lang/String;"),
+            mk("equals", "(Ljava/lang/Object;)Z"),
+            mk("hashCode", "()I"),
         ]);
     }
     if name == "java/lang/Thread" {

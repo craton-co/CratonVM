@@ -5791,6 +5791,10 @@ fn alloc_byte_buffer(ctx: &mut dyn NativeContext, capacity: usize) -> ObjectRef 
     // Real JDK Heap*Buffer backing array is named `hb`.
     ctx.set_field_by_name(obj, "hb", Value::Object(Some(array)));
     buf_write_metadata(ctx, obj, 0, capacity as i32, capacity as i32, -1);
+    // Real HeapByteBuffer.address is ARRAY_BYTE_BASE_OFFSET + offset. Bulk
+    // copy bytecode relies on this value when ScopedMemoryAccess hands the
+    // backing byte[] and offset to Unsafe.copyMemory.
+    ctx.set_field_by_name(obj, "address", Value::Long(16));
     obj
 }
 
@@ -18286,6 +18290,17 @@ mod buffer_bounds_tests {
     fn make_bb(ctx: &mut MockNativeContext, cap: usize) -> ObjectRef {
         // alloc_byte_buffer leaves pos=0, lim=cap, cap=cap.
         alloc_byte_buffer(ctx, cap)
+    }
+
+    #[test]
+    fn allocated_heap_bytebuffer_sets_real_address() {
+        let mut ctx = MockNativeContext::new();
+        let bb = make_bb(&mut ctx, 8);
+        assert_eq!(ctx.get_field_by_name(bb, "position"), Value::Int(0));
+        assert_eq!(ctx.get_field_by_name(bb, "limit"), Value::Int(8));
+        assert_eq!(ctx.get_field_by_name(bb, "capacity"), Value::Int(8));
+        assert_eq!(ctx.get_field_by_name(bb, "mark"), Value::Int(-1));
+        assert_eq!(ctx.get_field_by_name(bb, "address"), Value::Long(16));
     }
 
     // --- B1: bulk get/put destination/source bounds ---
