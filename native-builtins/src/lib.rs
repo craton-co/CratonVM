@@ -2147,6 +2147,28 @@ mod context_class_loader_tests {
             .find(stamped_lock, "unstampedUnlockRead", "()V")
             .is_some());
     }
+
+    #[test]
+    fn essential_natives_include_jdk17_stacktraceelements_bridge() {
+        let mut registry = NativeMethodRegistry::new();
+        register_essential_natives(&mut registry);
+        let ste = "java/lang/StackTraceElement";
+
+        assert!(registry
+            .find(
+                ste,
+                "initStackTraceElements",
+                "([Ljava/lang/StackTraceElement;Ljava/lang/Object;I)V",
+            )
+            .is_some());
+        assert!(registry
+            .find(
+                ste,
+                "initStackTraceElements",
+                "([Ljava/lang/StackTraceElement;Ljava/lang/Throwable;)V",
+            )
+            .is_some());
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -21277,6 +21299,15 @@ pub fn register_essential_natives(registry: &mut NativeMethodRegistry) {
         "java/lang/StackTraceElement",
         "initStackTraceElements",
         "([Ljava/lang/StackTraceElement;Ljava/lang/Object;I)V",
+        native_init_stack_trace_elements,
+    );
+    // JDK 17 uses the older Throwable-shaped native entrypoint while JDK 25
+    // passes the opaque backtrace plus depth. The implementation only needs the
+    // second argument as the captured-trace key, so both descriptors share it.
+    registry.register(
+        "java/lang/StackTraceElement",
+        "initStackTraceElements",
+        "([Ljava/lang/StackTraceElement;Ljava/lang/Throwable;)V",
         native_init_stack_trace_elements,
     );
     // ES-FAIL-06: JDK 25 `StackTraceElement.computeFormat()` does
