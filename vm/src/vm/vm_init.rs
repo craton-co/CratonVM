@@ -1283,8 +1283,8 @@ impl SharedVm {
                 // Override with native implementation to avoid ReentrantLock field layout mismatch
                 // between synthetic natives and real JDK classes
                 // [Bridge] This contiguous run of inline registers (drainTo x3,
-                // ScheduledThreadPoolExecutor.<init>, AtomicBoolean.<init>) all
-                // implement real behavior over the JDK/synthetic field layouts.
+                // AtomicBoolean.<init>) implements real behavior over the
+                // JDK/synthetic field layouts.
                 // Restored to __prev_bridge just before register_io_natives below.
                 let __prev_bridge = native_methods.current_category();
                 native_methods.set_category(cratonvm_native_api::NativeKind::Bridge);
@@ -1414,24 +1414,11 @@ impl SharedVm {
                         Ok(Some(cratonvm_types::Value::Int(to_drain)))
                     },
                 );
-                native_methods.register(
-                    "java/util/concurrent/ScheduledThreadPoolExecutor",
-                    "<init>",
-                    "(ILjava/util/concurrent/ThreadFactory;)V",
-                    |ctx, args| {
-                        let this = match args.first() {
-                            Some(cratonvm_types::Value::Object(Some(o))) => *o,
-                            _ => return Ok(None),
-                        };
-                        let cores = match args.get(1) {
-                            Some(cratonvm_types::Value::Int(v)) => *v,
-                            _ => 1,
-                        };
-                        ctx.set_field(this, 0, cratonvm_types::Value::Int(cores));
-                        ctx.set_field(this, 1, cratonvm_types::Value::Int(0));
-                        Ok(None)
-                    },
-                );
+                // Do not override ScheduledThreadPoolExecutor constructors in
+                // real-JDK mode. The real constructors initialize the inherited
+                // ThreadPoolExecutor state (`ctl`, `workQueue`, `mainLock`,
+                // `workers`) coherently. A two-slot synthetic poke here leaves
+                // `getQueue()` null and breaks Tomcat ContainerBase startup.
                 // CopyOnWriteArrayList addIfAbsent/contains/bulkRemove are registered
                 // by `register_collections_natives` with real-JDK field resolution.
                 // Do not register a synthetic two-slot layout here — it corrupts
