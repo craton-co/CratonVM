@@ -18650,8 +18650,8 @@ pub fn register_essential_natives(registry: &mut NativeMethodRegistry) {
         },
     );
 
-    // URL.equals / URL.hashCode — based on the URL string to avoid NPE from
-    // null `handler` in synthetic URL objects, and to ensure correct
+    // URL.equals / URL.sameFile / URL.hashCode — based on the URL string to avoid
+    // NPE from null `handler` in synthetic URL objects, and to ensure correct
     // deduplication when the same resource URL appears from multiple classloaders
     // (e.g. AggregatedClassLoader iterating N loaders all returning the same
     // persistence.xml path — LinkedHashSet<URL> must deduplicate them).
@@ -18662,6 +18662,12 @@ pub fn register_essential_natives(registry: &mut NativeMethodRegistry) {
         native_url_equals,
     );
     registry.register("java/net/URL", "hashCode", "()I", native_url_hash_code);
+    registry.register(
+        "java/net/URL",
+        "sameFile",
+        "(Ljava/net/URL;)Z",
+        native_url_same_file,
+    );
 
     // --- java.lang.Thread (native methods) ---
     registry.register("java/lang/Thread", "registerNatives", "()V", native_noop);
@@ -51040,6 +51046,12 @@ fn url_external_form(ctx: &mut dyn NativeContext, url: ObjectRef) -> String {
     }
     out
 }
+fn url_same_file_form(ctx: &mut dyn NativeContext, url: ObjectRef) -> String {
+    let mut out = url_external_form(ctx, url);
+    out.truncate(out.find('#').unwrap_or(out.len()));
+    out
+}
+
 fn native_url_equals(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = match args.first() {
         Some(Value::Object(Some(o))) => *o,
@@ -51053,6 +51065,19 @@ fn native_url_equals(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallR
     let b = url_external_form(ctx, other);
     Ok(Some(Value::Int(if a == b { 1 } else { 0 })))
 }
+fn native_url_same_file(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(o))) => *o,
+        _ => return Ok(Some(Value::Int(0))),
+    };
+    let other = match args.get(1) {
+        Some(Value::Object(Some(o))) => *o,
+        _ => return Ok(Some(Value::Int(0))),
+    };
+    let same = url_same_file_form(ctx, this) == url_same_file_form(ctx, other);
+    Ok(Some(Value::Int(if same { 1 } else { 0 })))
+}
+
 fn native_url_hash_code(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = match args.first() {
         Some(Value::Object(Some(o))) => *o,
