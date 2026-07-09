@@ -1,0 +1,33 @@
+# ES CRASH - libs/exponential-histogram org.elasticsearch.exponentialhistogram.QuantileAccuracyTests
+
+Status: OPEN
+
+Observed in:
+- Run: `es-nonpassed-rerun-20260708-191002`
+- Mode/shard: `jit-shard1`
+- VM/JIT: `craton` / `on`
+- rc: `139`
+- status: `CRASH`
+- seconds: `9.416`
+- tests parsed: `0`
+- failed parsed: `0`
+- note: `java.lang.NoSuchMethodError: java/lang/System$1.findNative(Ljava/lang/ClassLoader;Ljava/lang/String;)J`
+
+Re-run one class:
+```powershell
+pwsh -NoProfile -ExecutionPolicy Bypass -File apps/elasticsearch-suite-runner/run-elasticsearch-suite.ps1 -Category others -Jit on -Vm craton -ElasticsearchRoot "/data/data/cratonvm-worktrees/20260708-191002-es-nonpassed-rerun/apps/elasticsearch" -WorkDir "/data/data/cratonvm-worktrees/20260708-191002-es-nonpassed-rerun/apps/elasticsearch-suite-runner/.suite-es-nonpassed-20260708-191002" -Exe /data/data/cratonvm-targets/es-nonpassed-20260708-191002/release/cratonvm-es-nonpassed-20260708-191002 -JdkHome /usr/lib/jvm/java-21-openjdk-amd64 -TimeoutSec 600 -RunName repro-9d55ea4800 -ModeName repro-9d55ea4800 -Start 60 -Count 1
+```
+
+Evidence files:
+- stdout: `/data/data/cratonvm-worktrees/20260708-191002-es-nonpassed-rerun/apps/elasticsearch-suite-runner/.suite-es-nonpassed-20260708-191002/results/es-nonpassed-rerun-20260708-191002/jit-shard1/logs/libs_exponential-histogram.org.elasticsearch.exponentialhistogra.bd183dd75a18.out.log`
+- stderr: `/data/data/cratonvm-worktrees/20260708-191002-es-nonpassed-rerun/apps/elasticsearch-suite-runner/.suite-es-nonpassed-20260708-191002/results/es-nonpassed-rerun-20260708-191002/jit-shard1/logs/libs_exponential-histogram.org.elasticsearch.exponentialhistogra.bd183dd75a18.err.log`
+- result TSV: `/data/data/cratonvm-worktrees/20260708-191002-es-nonpassed-rerun/apps/elasticsearch-suite-runner/.suite-es-nonpassed-20260708-191002/results/es-nonpassed-rerun-20260708-191002/jit-shard1/results.tsv`
+
+Extracted stderr signals:
+- `2026-07-08T22:54:21.019902Z  WARN cratonvm_vm::vm::vm_exec: NoSuchMethodError method="java/lang/System$1.findNative(Ljava/lang/ClassLoader;Ljava/lang/String;)J" caller="java/lang/foreign/SymbolLookup.lambda$loaderLookup$2(Ljava/lang/ClassLoader;Ljava/lang/foreign/Arena;Ljava/lang/String;)Ljava/util/`
+
+Extracted stdout signals:
+- `java.lang.NoSuchMethodError: java/lang/System$1.findNative(Ljava/lang/ClassLoader;Ljava/lang/String;)J`
+
+Current classification:
+- Part of the `System$1.findNative` / JavaLangAccess native-symbol lookup family.

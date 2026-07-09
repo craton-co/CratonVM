@@ -303,10 +303,7 @@ fn native_randomized_context_get_per_thread(
         map,
         "put",
         "(Ljava/lang/Object;Ljava/lang/Object;)Ljava/lang/Object;",
-        &[
-            Value::Object(Some(thread)),
-            Value::Object(Some(resources)),
-        ],
+        &[Value::Object(Some(thread)), Value::Object(Some(resources))],
     )?;
 
     Ok(Some(Value::Object(Some(resources))))
@@ -716,7 +713,9 @@ fn native_lucene_byte_buffers_data_input_read_short(
 ) -> MethodCallResult {
     let this = lucene_bbdin_this(args)?;
     let bytes = lucene_bbdin_read_seq_bytes(ctx, this, 2)?;
-    Ok(Some(Value::Int(i16::from_le_bytes([bytes[0], bytes[1]]) as i32)))
+    Ok(Some(Value::Int(
+        i16::from_le_bytes([bytes[0], bytes[1]]) as i32
+    )))
 }
 
 fn native_lucene_byte_buffers_data_input_read_short_at(
@@ -726,7 +725,9 @@ fn native_lucene_byte_buffers_data_input_read_short_at(
     let this = lucene_bbdin_this(args)?;
     let relative_pos = args.get(1).and_then(Value::as_long).unwrap_or(0);
     let bytes = lucene_bbdin_read_at_bytes(ctx, this, relative_pos, 2)?;
-    Ok(Some(Value::Int(i16::from_le_bytes([bytes[0], bytes[1]]) as i32)))
+    Ok(Some(Value::Int(
+        i16::from_le_bytes([bytes[0], bytes[1]]) as i32
+    )))
 }
 
 fn native_lucene_byte_buffers_data_input_read_int(
@@ -821,7 +822,6 @@ fn native_lucene_byte_buffers_data_input_slice(
 
     Ok(Some(Value::Object(Some(new_obj))))
 }
-
 
 fn register_spring_codec_intrinsics(registry: &mut NativeMethodRegistry) {
     registry.register(
@@ -2112,6 +2112,41 @@ mod context_class_loader_tests {
             other => panic!("defineClass2 did not dispatch to the ByteBuffer handler: {other:?}"),
         }
     }
+
+    #[test]
+    fn essential_natives_include_real_jdk_symbol_lookup_bridge() {
+        let mut registry = NativeMethodRegistry::new();
+        register_essential_natives(&mut registry);
+        let sl = "java/lang/foreign/SymbolLookup";
+
+        assert!(registry
+            .find(sl, "find", "(Ljava/lang/String;)Ljava/util/Optional;")
+            .is_some());
+        assert!(registry
+            .find(
+                sl,
+                "libraryLookup",
+                "(Ljava/lang/String;Ljava/lang/foreign/Arena;)Ljava/lang/foreign/SymbolLookup;",
+            )
+            .is_some());
+        assert!(registry
+            .find(sl, "loaderLookup", "()Ljava/lang/foreign/SymbolLookup;")
+            .is_some());
+    }
+
+    #[test]
+    fn essential_natives_include_stamped_lock_view_unlock_bridges() {
+        let mut registry = NativeMethodRegistry::new();
+        register_essential_natives(&mut registry);
+        let stamped_lock = "java/util/concurrent/locks/StampedLock";
+
+        assert!(registry
+            .find(stamped_lock, "unstampedUnlockWrite", "()V")
+            .is_some());
+        assert!(registry
+            .find(stamped_lock, "unstampedUnlockRead", "()V")
+            .is_some());
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -2633,7 +2668,9 @@ fn antlr_groovy_atn_special_slot(class_name: &str, name: &str) -> Option<usize> 
             Some(3)
         }
         "lexerActionExecutor" if class_name.ends_with("ATNConfig$ActionATNConfig") => Some(3),
-        "lexerActionExecutor" if class_name.ends_with("ATNConfig$ActionSemanticContextATNConfig") => {
+        "lexerActionExecutor"
+            if class_name.ends_with("ATNConfig$ActionSemanticContextATNConfig") =>
+        {
             Some(4)
         }
         "passedThroughNonGreedyDecision" if class_name.ends_with("ATNConfig$ActionATNConfig") => {
@@ -6030,12 +6067,12 @@ fn antlr_semantic_empty_instance(
 ) -> Result<Option<ObjectRef>, MethodCallFailed> {
     if names.pc == GROOVY_ANTLR_PC {
         let class_id = ctx.ensure_class_initialized(GROOVY_ANTLR_SEMANTIC_CONTEXT)?;
-        return Ok(ctx
-            .static_field_index_by_name(class_id, "NONE")
-            .and_then(|field_idx| match ctx.get_static_field(class_id, field_idx) {
+        return Ok(ctx.static_field_index_by_name(class_id, "NONE").and_then(
+            |field_idx| match ctx.get_static_field(class_id, field_idx) {
                 Value::Object(instance) => instance,
                 _ => None,
-            }));
+            },
+        ));
     }
     let class_id = ctx.ensure_class_initialized(names.semantic_empty)?;
     Ok(ctx
@@ -11592,8 +11629,14 @@ struct NettyQueueEntry {
     fallback: ObjectRef,
 }
 
-fn netty_jctools_queue_store() -> &'static std::sync::Mutex<std::collections::HashMap<i32, std::collections::VecDeque<NettyQueueEntry>>> {
-    static STORE: std::sync::OnceLock<std::sync::Mutex<std::collections::HashMap<i32, std::collections::VecDeque<NettyQueueEntry>>>> = std::sync::OnceLock::new();
+fn netty_jctools_queue_store() -> &'static std::sync::Mutex<
+    std::collections::HashMap<i32, std::collections::VecDeque<NettyQueueEntry>>,
+> {
+    static STORE: std::sync::OnceLock<
+        std::sync::Mutex<
+            std::collections::HashMap<i32, std::collections::VecDeque<NettyQueueEntry>>,
+        >,
+    > = std::sync::OnceLock::new();
     STORE.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
 }
 
@@ -11633,7 +11676,8 @@ fn netty_queue_release(ctx: &mut dyn NativeContext, entry: NettyQueueEntry) {
 }
 
 fn netty_queue_retired_store() -> &'static std::sync::Mutex<Vec<NettyQueueEntry>> {
-    static RETIRED: std::sync::OnceLock<std::sync::Mutex<Vec<NettyQueueEntry>>> = std::sync::OnceLock::new();
+    static RETIRED: std::sync::OnceLock<std::sync::Mutex<Vec<NettyQueueEntry>>> =
+        std::sync::OnceLock::new();
     RETIRED.get_or_init(|| std::sync::Mutex::new(Vec::new()))
 }
 
@@ -11666,8 +11710,16 @@ fn native_netty_mpsc_offer(ctx: &mut dyn NativeContext, args: &[Value]) -> Metho
         _ => return Ok(Some(Value::Int(0))),
     };
     let elem_key = ctx.identity_hash_code(elem);
-    let q_class = if netty_queue_dbg_enabled() { Some(netty_queue_obj_class(ctx, this)) } else { None };
-    let elem_class = if netty_queue_dbg_enabled() { Some(netty_queue_obj_class(ctx, elem)) } else { None };
+    let q_class = if netty_queue_dbg_enabled() {
+        Some(netty_queue_obj_class(ctx, this))
+    } else {
+        None
+    };
+    let elem_class = if netty_queue_dbg_enabled() {
+        Some(netty_queue_obj_class(ctx, elem))
+    } else {
+        None
+    };
     let entry = netty_queue_entry(ctx, elem);
     let key = ctx.identity_hash_code(this);
     let len = {
@@ -11762,7 +11814,9 @@ fn native_netty_mpsc_size(ctx: &mut dyn NativeContext, args: &[Value]) -> Method
     };
     let key = ctx.identity_hash_code(this);
     let store = netty_jctools_queue_store().lock().unwrap();
-    Ok(Some(Value::Int(store.get(&key).map(|q| q.len()).unwrap_or(0) as i32)))
+    Ok(Some(Value::Int(
+        store.get(&key).map(|q| q.len()).unwrap_or(0) as i32,
+    )))
 }
 
 fn native_netty_mpsc_is_empty(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
@@ -11841,17 +11895,46 @@ fn register_queue_bridge_natives(registry: &mut NativeMethodRegistry) {
         "io/netty/util/internal/shaded/org/jctools/queues/atomic/MpscAtomicArrayQueue",
     ];
     for class_name in netty_classes {
-        registry.register(class_name, "offer", "(Ljava/lang/Object;)Z", native_netty_mpsc_offer);
-        registry.register(class_name, "relaxedOffer", "(Ljava/lang/Object;)Z", native_netty_mpsc_offer);
-        registry.register(class_name, "poll", "()Ljava/lang/Object;", native_netty_mpsc_poll);
-        registry.register(class_name, "relaxedPoll", "()Ljava/lang/Object;", native_netty_mpsc_poll);
-        registry.register(class_name, "peek", "()Ljava/lang/Object;", native_netty_mpsc_peek);
-        registry.register(class_name, "relaxedPeek", "()Ljava/lang/Object;", native_netty_mpsc_peek);
+        registry.register(
+            class_name,
+            "offer",
+            "(Ljava/lang/Object;)Z",
+            native_netty_mpsc_offer,
+        );
+        registry.register(
+            class_name,
+            "relaxedOffer",
+            "(Ljava/lang/Object;)Z",
+            native_netty_mpsc_offer,
+        );
+        registry.register(
+            class_name,
+            "poll",
+            "()Ljava/lang/Object;",
+            native_netty_mpsc_poll,
+        );
+        registry.register(
+            class_name,
+            "relaxedPoll",
+            "()Ljava/lang/Object;",
+            native_netty_mpsc_poll,
+        );
+        registry.register(
+            class_name,
+            "peek",
+            "()Ljava/lang/Object;",
+            native_netty_mpsc_peek,
+        );
+        registry.register(
+            class_name,
+            "relaxedPeek",
+            "()Ljava/lang/Object;",
+            native_netty_mpsc_peek,
+        );
         registry.register(class_name, "size", "()I", native_netty_mpsc_size);
         registry.register(class_name, "isEmpty", "()Z", native_netty_mpsc_is_empty);
         registry.register(class_name, "clear", "()V", native_netty_mpsc_clear);
     }
-
 }
 fn native_reactor_mono_just(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let value = args.first().copied().unwrap_or(Value::Object(None));
@@ -11888,7 +11971,10 @@ fn set_declared_field(
     }
 }
 
-fn native_spring_receipt_handler_init(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+fn native_spring_receipt_handler_init(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
     let this = match args.first().copied() {
         Some(Value::Object(Some(o))) => o,
         _ => return Ok(None),
@@ -11919,7 +12005,8 @@ fn native_spring_receipt_handler_init(ctx: &mut dyn NativeContext, args: &[Value
     };
     let receipt_callbacks_pin = ctx.pin_native_root(receipt_callbacks);
 
-    let receipt_lost_callbacks = match ctx.new_object_initialized("java/util/ArrayList", "()V", &[]) {
+    let receipt_lost_callbacks = match ctx.new_object_initialized("java/util/ArrayList", "()V", &[])
+    {
         Ok(Some(Value::Object(Some(o)))) => o,
         Ok(_) => {
             ctx.unpin_native_roots(this_pin);
@@ -11939,10 +12026,18 @@ fn native_spring_receipt_handler_init(ctx: &mut dyn NativeContext, args: &[Value
         None => Value::Object(None),
     };
     let receipt_callbacks = ctx.read_native_pin(receipt_callbacks_pin, receipt_callbacks);
-    let receipt_lost_callbacks = ctx.read_native_pin(receipt_lost_callbacks_pin, receipt_lost_callbacks);
+    let receipt_lost_callbacks =
+        ctx.read_native_pin(receipt_lost_callbacks_pin, receipt_lost_callbacks);
 
-    let receipt_handler = "org/springframework/messaging/simp/stomp/DefaultStompSession$ReceiptHandler";
-    set_declared_field(ctx, this, receipt_handler, "this$0", Value::Object(Some(outer)));
+    let receipt_handler =
+        "org/springframework/messaging/simp/stomp/DefaultStompSession$ReceiptHandler";
+    set_declared_field(
+        ctx,
+        this,
+        receipt_handler,
+        "this$0",
+        Value::Object(Some(outer)),
+    );
     set_declared_field(ctx, this, receipt_handler, "receiptId", receipt_id);
     set_declared_field(
         ctx,
@@ -11960,10 +12055,18 @@ fn native_spring_receipt_handler_init(ctx: &mut dyn NativeContext, args: &[Value
     );
     set_declared_field(ctx, this, receipt_handler, "future", Value::Object(None));
     set_declared_field(ctx, this, receipt_handler, "result", Value::Object(None));
-    set_declared_field(ctx, this, receipt_handler, "receiptHeaders", Value::Object(None));
+    set_declared_field(
+        ctx,
+        this,
+        receipt_handler,
+        "receiptHeaders",
+        Value::Object(None),
+    );
 
     if matches!(receipt_id, Value::Object(Some(_))) {
-        if let Value::Object(Some(receipt_handlers)) = ctx.get_field_by_name(outer, "receiptHandlers") {
+        if let Value::Object(Some(receipt_handlers)) =
+            ctx.get_field_by_name(outer, "receiptHandlers")
+        {
             let _ = ctx.invoke_virtual(
                 receipt_handlers,
                 "put",
@@ -11977,7 +12080,10 @@ fn native_spring_receipt_handler_init(ctx: &mut dyn NativeContext, args: &[Value
     Ok(None)
 }
 
-fn native_spring_default_subscription_init(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+fn native_spring_default_subscription_init(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
     let this = match args.first().copied() {
         Some(Value::Object(Some(o))) => o,
         _ => return Ok(None),
@@ -12042,10 +12148,29 @@ fn native_spring_default_subscription_init(ctx: &mut dyn NativeContext, args: &[
         None => Value::Object(None),
     };
 
-    let subscription = "org/springframework/messaging/simp/stomp/DefaultStompSession$DefaultSubscription";
-    set_declared_field(ctx, this, subscription, "this$0", Value::Object(Some(outer)));
-    set_declared_field(ctx, this, subscription, "headers", Value::Object(Some(headers)));
-    set_declared_field(ctx, this, subscription, "handler", Value::Object(Some(handler)));
+    let subscription =
+        "org/springframework/messaging/simp/stomp/DefaultStompSession$DefaultSubscription";
+    set_declared_field(
+        ctx,
+        this,
+        subscription,
+        "this$0",
+        Value::Object(Some(outer)),
+    );
+    set_declared_field(
+        ctx,
+        this,
+        subscription,
+        "headers",
+        Value::Object(Some(headers)),
+    );
+    set_declared_field(
+        ctx,
+        this,
+        subscription,
+        "handler",
+        Value::Object(Some(handler)),
+    );
 
     let sub_id = match ctx.invoke_virtual(headers, "getId", "()Ljava/lang/String;", &[]) {
         Ok(v) => v.unwrap_or(Value::Object(None)),
@@ -12082,7 +12207,10 @@ fn native_spring_default_subscription_init(ctx: &mut dyn NativeContext, args: &[
     Ok(None)
 }
 
-fn native_activemq_abstract_subscription_init(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+fn native_activemq_abstract_subscription_init(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
     let this = match args.first().copied() {
         Some(Value::Object(Some(o))) => o,
         _ => return Ok(None),
@@ -12105,17 +12233,18 @@ fn native_activemq_abstract_subscription_init(ctx: &mut dyn NativeContext, args:
     let context_pin = ctx.pin_native_root(context);
     let info_pin = ctx.pin_native_root(info);
 
-    let destinations = match ctx.new_object_initialized("java/util/concurrent/CopyOnWriteArrayList", "()V", &[]) {
-        Ok(Some(Value::Object(Some(o)))) => o,
-        Ok(_) => {
-            ctx.unpin_native_roots(this_pin);
-            return Ok(None);
-        }
-        Err(e) => {
-            ctx.unpin_native_roots(this_pin);
-            return Err(e);
-        }
-    };
+    let destinations =
+        match ctx.new_object_initialized("java/util/concurrent/CopyOnWriteArrayList", "()V", &[]) {
+            Ok(Some(Value::Object(Some(o)))) => o,
+            Ok(_) => {
+                ctx.unpin_native_roots(this_pin);
+                return Ok(None);
+            }
+            Err(e) => {
+                ctx.unpin_native_roots(this_pin);
+                return Err(e);
+            }
+        };
     let destinations_pin = ctx.pin_native_root(destinations);
 
     let prefetch_extension = match ctx.new_object_initialized(
@@ -12135,7 +12264,11 @@ fn native_activemq_abstract_subscription_init(ctx: &mut dyn NativeContext, args:
     };
     let prefetch_pin = ctx.pin_native_root(prefetch_extension);
 
-    let stats = match ctx.new_object_initialized("org/apache/activemq/broker/region/SubscriptionStatistics", "()V", &[]) {
+    let stats = match ctx.new_object_initialized(
+        "org/apache/activemq/broker/region/SubscriptionStatistics",
+        "()V",
+        &[],
+    ) {
         Ok(Some(Value::Object(Some(o)))) => o,
         Ok(_) => {
             ctx.unpin_native_roots(this_pin);
@@ -12266,23 +12399,101 @@ fn native_activemq_abstract_subscription_init(ctx: &mut dyn NativeContext, args:
     };
 
     let abstract_subscription = "org/apache/activemq/broker/region/AbstractSubscription";
-    set_declared_field(ctx, this, abstract_subscription, "broker", Value::Object(Some(broker)));
-    set_declared_field(ctx, this, abstract_subscription, "context", Value::Object(Some(context)));
-    set_declared_field(ctx, this, abstract_subscription, "info", Value::Object(Some(info)));
-    set_declared_field(ctx, this, abstract_subscription, "destinationFilter", destination_filter);
-    set_declared_field(ctx, this, abstract_subscription, "destinations", Value::Object(Some(destinations)));
-    set_declared_field(ctx, this, abstract_subscription, "prefetchExtension", Value::Object(Some(prefetch_extension)));
-    set_declared_field(ctx, this, abstract_subscription, "usePrefetchExtension", Value::Int(1));
-    set_declared_field(ctx, this, abstract_subscription, "selectorExpression", selector_expression);
-    set_declared_field(ctx, this, abstract_subscription, "objectName", Value::Object(None));
-    set_declared_field(ctx, this, abstract_subscription, "cursorMemoryHighWaterMark", Value::Int(70));
-    set_declared_field(ctx, this, abstract_subscription, "slowConsumer", Value::Int(0));
+    set_declared_field(
+        ctx,
+        this,
+        abstract_subscription,
+        "broker",
+        Value::Object(Some(broker)),
+    );
+    set_declared_field(
+        ctx,
+        this,
+        abstract_subscription,
+        "context",
+        Value::Object(Some(context)),
+    );
+    set_declared_field(
+        ctx,
+        this,
+        abstract_subscription,
+        "info",
+        Value::Object(Some(info)),
+    );
+    set_declared_field(
+        ctx,
+        this,
+        abstract_subscription,
+        "destinationFilter",
+        destination_filter,
+    );
+    set_declared_field(
+        ctx,
+        this,
+        abstract_subscription,
+        "destinations",
+        Value::Object(Some(destinations)),
+    );
+    set_declared_field(
+        ctx,
+        this,
+        abstract_subscription,
+        "prefetchExtension",
+        Value::Object(Some(prefetch_extension)),
+    );
+    set_declared_field(
+        ctx,
+        this,
+        abstract_subscription,
+        "usePrefetchExtension",
+        Value::Int(1),
+    );
+    set_declared_field(
+        ctx,
+        this,
+        abstract_subscription,
+        "selectorExpression",
+        selector_expression,
+    );
+    set_declared_field(
+        ctx,
+        this,
+        abstract_subscription,
+        "objectName",
+        Value::Object(None),
+    );
+    set_declared_field(
+        ctx,
+        this,
+        abstract_subscription,
+        "cursorMemoryHighWaterMark",
+        Value::Int(70),
+    );
+    set_declared_field(
+        ctx,
+        this,
+        abstract_subscription,
+        "slowConsumer",
+        Value::Int(0),
+    );
     let now_ms = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_millis().min(i64::MAX as u128) as i64)
         .unwrap_or(0);
-    set_declared_field(ctx, this, abstract_subscription, "lastAckTime", Value::Long(now_ms));
-    set_declared_field(ctx, this, abstract_subscription, "subscriptionStatistics", Value::Object(Some(stats)));
+    set_declared_field(
+        ctx,
+        this,
+        abstract_subscription,
+        "lastAckTime",
+        Value::Long(now_ms),
+    );
+    set_declared_field(
+        ctx,
+        this,
+        abstract_subscription,
+        "subscriptionStatistics",
+        Value::Object(Some(stats)),
+    );
 
     let _ = selector_pin;
     let _ = additional_pin;
@@ -12290,7 +12501,10 @@ fn native_activemq_abstract_subscription_init(ctx: &mut dyn NativeContext, args:
     Ok(None)
 }
 
-fn native_activemq_topic_subscription_init(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+fn native_activemq_topic_subscription_init(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
     let this = match args.first().copied() {
         Some(Value::Object(Some(o))) => o,
         _ => return Ok(None),
@@ -12353,7 +12567,11 @@ fn native_activemq_topic_subscription_init(ctx: &mut dyn NativeContext, args: &[
         &[]
     );
     let eviction_pin = ctx.pin_native_root(eviction);
-    let discarded = new_obj!("java/util/concurrent/atomic/AtomicInteger", "(I)V", &[Value::Int(0)]);
+    let discarded = new_obj!(
+        "java/util/concurrent/atomic/AtomicInteger",
+        "(I)V",
+        &[Value::Int(0)]
+    );
     let discarded_pin = ctx.pin_native_root(discarded);
     let matched_list_mutex = new_obj!("java/lang/Object", "()V", &[]);
     let matched_list_mutex_pin = ctx.pin_native_root(matched_list_mutex);
@@ -12361,7 +12579,11 @@ fn native_activemq_topic_subscription_init(ctx: &mut dyn NativeContext, args: &[
     let dispatch_lock_pin = ctx.pin_native_root(dispatch_lock);
     let dispatched = new_obj!("java/util/ArrayList", "()V", &[]);
     let dispatched_pin = ctx.pin_native_root(dispatched);
-    let current_dispatched_count = new_obj!("java/util/concurrent/atomic/AtomicInteger", "(I)V", &[Value::Int(0)]);
+    let current_dispatched_count = new_obj!(
+        "java/util/concurrent/atomic/AtomicInteger",
+        "(I)V",
+        &[Value::Int(0)]
+    );
     let current_dispatched_count_pin = ctx.pin_native_root(current_dispatched_count);
     let matched = new_obj!(
         "org/apache/activemq/broker/region/cursors/VMPendingMessageCursor",
@@ -12393,7 +12615,8 @@ fn native_activemq_topic_subscription_init(ctx: &mut dyn NativeContext, args: &[
     let matched_list_mutex = ctx.read_native_pin(matched_list_mutex_pin, matched_list_mutex);
     let dispatch_lock = ctx.read_native_pin(dispatch_lock_pin, dispatch_lock);
     let dispatched = ctx.read_native_pin(dispatched_pin, dispatched);
-    let current_dispatched_count = ctx.read_native_pin(current_dispatched_count_pin, current_dispatched_count);
+    let current_dispatched_count =
+        ctx.read_native_pin(current_dispatched_count_pin, current_dispatched_count);
     let matched = ctx.read_native_pin(matched_pin, matched);
     let scheduler = match scheduler_pin {
         Some((pin, fallback)) => Value::Object(Some(ctx.read_native_pin(pin, fallback))),
@@ -12405,9 +12628,27 @@ fn native_activemq_topic_subscription_init(ctx: &mut dyn NativeContext, args: &[
     set_declared_field(ctx, this, topic, "destination", Value::Object(None));
     set_declared_field(ctx, this, topic, "scheduler", scheduler);
     set_declared_field(ctx, this, topic, "maximumPendingMessages", Value::Int(-1));
-    set_declared_field(ctx, this, topic, "messageEvictionStrategy", Value::Object(Some(eviction)));
-    set_declared_field(ctx, this, topic, "discarded", Value::Object(Some(discarded)));
-    set_declared_field(ctx, this, topic, "matchedListMutex", Value::Object(Some(matched_list_mutex)));
+    set_declared_field(
+        ctx,
+        this,
+        topic,
+        "messageEvictionStrategy",
+        Value::Object(Some(eviction)),
+    );
+    set_declared_field(
+        ctx,
+        this,
+        topic,
+        "discarded",
+        Value::Object(Some(discarded)),
+    );
+    set_declared_field(
+        ctx,
+        this,
+        topic,
+        "matchedListMutex",
+        Value::Object(Some(matched_list_mutex)),
+    );
     set_declared_field(ctx, this, topic, "memoryUsageHighWaterMark", Value::Int(95));
     set_declared_field(ctx, this, topic, "maxProducersToAudit", Value::Int(1024));
     set_declared_field(ctx, this, topic, "maxAuditDepth", Value::Int(1000));
@@ -12415,11 +12656,41 @@ fn native_activemq_topic_subscription_init(ctx: &mut dyn NativeContext, args: &[
     set_declared_field(ctx, this, topic, "audit", Value::Object(None));
     set_declared_field(ctx, this, topic, "active", Value::Int(0));
     set_declared_field(ctx, this, topic, "discarding", Value::Int(0));
-    set_declared_field(ctx, this, topic, "useTopicSubscriptionInflightStats", Value::Int(1));
-    set_declared_field(ctx, this, topic, "dispatchLock", Value::Object(Some(dispatch_lock)));
-    set_declared_field(ctx, this, topic, "dispatched", Value::Object(Some(dispatched)));
-    set_declared_field(ctx, this, topic, "currentDispatchedCount", Value::Object(Some(current_dispatched_count)));
-    set_declared_field(ctx, this, topic, "usageManager", Value::Object(Some(usage_manager)));
+    set_declared_field(
+        ctx,
+        this,
+        topic,
+        "useTopicSubscriptionInflightStats",
+        Value::Int(1),
+    );
+    set_declared_field(
+        ctx,
+        this,
+        topic,
+        "dispatchLock",
+        Value::Object(Some(dispatch_lock)),
+    );
+    set_declared_field(
+        ctx,
+        this,
+        topic,
+        "dispatched",
+        Value::Object(Some(dispatched)),
+    );
+    set_declared_field(
+        ctx,
+        this,
+        topic,
+        "currentDispatchedCount",
+        Value::Object(Some(current_dispatched_count)),
+    );
+    set_declared_field(
+        ctx,
+        this,
+        topic,
+        "usageManager",
+        Value::Object(Some(usage_manager)),
+    );
     set_declared_field(ctx, this, topic, "matched", Value::Object(Some(matched)));
 
     ctx.unpin_native_roots(this_pin);
@@ -12571,7 +12842,10 @@ fn native_activemq_stomp_subscription_on_message_dispatch(
                 headers,
                 "put",
                 "(Ljava/lang/Object;Ljava/lang/Object;)Ljava/lang/Object;",
-                &[Value::Object(Some(key)), Value::Object(Some(subscription_id))],
+                &[
+                    Value::Object(Some(key)),
+                    Value::Object(Some(subscription_id)),
+                ],
             );
             if let Err(e) = put_result {
                 ctx.unpin_native_roots(this_pin);
@@ -12610,7 +12884,6 @@ fn native_activemq_stomp_subscription_on_message_dispatch(
     Ok(None)
 }
 
-
 fn native_byte_buffer_wrap_bytes_offset_len(
     ctx: &mut dyn NativeContext,
     args: &[Value],
@@ -12639,10 +12912,7 @@ fn native_byte_buffer_wrap_bytes_offset_len(
     )
 }
 
-fn native_byte_buffer_wrap_bytes(
-    ctx: &mut dyn NativeContext,
-    args: &[Value],
-) -> MethodCallResult {
+fn native_byte_buffer_wrap_bytes(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let bytes = match args.first().copied() {
         Some(Value::Object(Some(o))) => o,
         _ => return Ok(Some(Value::Object(None))),
@@ -12653,7 +12923,6 @@ fn native_byte_buffer_wrap_bytes(
         &[Value::Object(Some(bytes)), Value::Int(0), Value::Int(len)],
     )
 }
-
 
 fn spring_map_get_key(
     ctx: &mut dyn NativeContext,
@@ -12736,7 +13005,12 @@ fn native_spring_stomp_encoder_encode(
 ) -> MethodCallResult {
     let message = match args.get(1).copied() {
         Some(Value::Object(Some(o))) => o,
-        _ => return Ok(Some(Value::Object(Some(spring_bytes_to_java_array(ctx, &[]))))),
+        _ => {
+            return Ok(Some(Value::Object(Some(spring_bytes_to_java_array(
+                ctx,
+                &[],
+            )))))
+        }
     };
     let headers = match ctx.invoke_virtual(
         message,
@@ -12745,7 +13019,12 @@ fn native_spring_stomp_encoder_encode(
         &[],
     )? {
         Some(Value::Object(Some(o))) => o,
-        _ => return Ok(Some(Value::Object(Some(spring_bytes_to_java_array(ctx, &[]))))),
+        _ => {
+            return Ok(Some(Value::Object(Some(spring_bytes_to_java_array(
+                ctx,
+                &[],
+            )))))
+        }
     };
     let command_value = spring_map_get_key(ctx, headers, "stompCommand")?;
     let command = match command_value {
@@ -12758,7 +13037,10 @@ fn native_spring_stomp_encoder_encode(
         _ => String::new(),
     };
     if command.is_empty() {
-        return Ok(Some(Value::Object(Some(spring_bytes_to_java_array(ctx, &[])))));
+        return Ok(Some(Value::Object(Some(spring_bytes_to_java_array(
+            ctx,
+            &[],
+        )))));
     }
 
     let native_headers = match spring_map_get_key(ctx, headers, "nativeHeaders")? {
@@ -12859,7 +13141,9 @@ fn native_spring_stomp_encoder_encode(
     frame.extend_from_slice(&payload);
     frame.push(0);
 
-    Ok(Some(Value::Object(Some(spring_bytes_to_java_array(ctx, &frame)))))
+    Ok(Some(Value::Object(Some(spring_bytes_to_java_array(
+        ctx, &frame,
+    )))))
 }
 
 fn native_spring_reactor_netty_tcp_connection_send_async(
@@ -12915,7 +13199,8 @@ fn native_spring_reactor_netty_tcp_connection_send_async(
     let allocator_pin = ctx.pin_native_root(allocator);
 
     let allocator = ctx.read_native_pin(allocator_pin, allocator);
-    let byte_buf = match ctx.invoke_virtual(allocator, "buffer", "()Lio/netty/buffer/ByteBuf;", &[]) {
+    let byte_buf = match ctx.invoke_virtual(allocator, "buffer", "()Lio/netty/buffer/ByteBuf;", &[])
+    {
         Ok(Some(Value::Object(Some(o)))) => o,
         Ok(_) => {
             ctx.unpin_native_roots(this_pin);
@@ -12995,14 +13280,15 @@ fn native_spring_reactor_netty_tcp_connection_send_async(
                         let mut wrote_all = false;
                         for _ in 0..1024 {
                             let buffer = ctx.read_native_pin(buffer_pin, buffer);
-                            let has_remaining = match ctx.invoke_virtual(buffer, "hasRemaining", "()Z", &[]) {
-                                Ok(Some(Value::Int(v))) => v != 0,
-                                Ok(_) => false,
-                                Err(e) => {
-                                    ctx.unpin_native_roots(this_pin);
-                                    return Err(e);
-                                }
-                            };
+                            let has_remaining =
+                                match ctx.invoke_virtual(buffer, "hasRemaining", "()Z", &[]) {
+                                    Ok(Some(Value::Int(v))) => v != 0,
+                                    Ok(_) => false,
+                                    Err(e) => {
+                                        ctx.unpin_native_roots(this_pin);
+                                        return Err(e);
+                                    }
+                                };
                             if !has_remaining {
                                 wrote_all = true;
                                 break;
@@ -13091,18 +13377,20 @@ fn native_spring_reactor_netty_tcp_connection_send_async(
         &[Value::Object(None)],
     ) {
         Ok(v) => v.unwrap_or(Value::Object(None)),
-        Err(_) => match ctx.new_object_initialized("java/util/concurrent/CompletableFuture", "()V", &[]) {
-            Ok(Some(Value::Object(Some(f)))) => {
-                let _ = ctx.invoke_virtual(
-                    f,
-                    "complete",
-                    "(Ljava/lang/Object;)Z",
-                    &[Value::Object(None)],
-                );
-                Value::Object(Some(f))
+        Err(_) => {
+            match ctx.new_object_initialized("java/util/concurrent/CompletableFuture", "()V", &[]) {
+                Ok(Some(Value::Object(Some(f)))) => {
+                    let _ = ctx.invoke_virtual(
+                        f,
+                        "complete",
+                        "(Ljava/lang/Object;)Z",
+                        &[Value::Object(None)],
+                    );
+                    Value::Object(Some(f))
+                }
+                _ => Value::Object(None),
             }
-            _ => Value::Object(None),
-        },
+        }
     };
 
     ctx.unpin_native_roots(this_pin);
@@ -13158,7 +13446,13 @@ fn native_activemq_abstract_pending_message_cursor_init(
         _ => false,
     };
     let class_name = "org/apache/activemq/broker/region/cursors/AbstractPendingMessageCursor";
-    set_declared_field(ctx, this, class_name, "memoryUsageHighWaterMark", Value::Int(70));
+    set_declared_field(
+        ctx,
+        this,
+        class_name,
+        "memoryUsageHighWaterMark",
+        Value::Int(70),
+    );
     set_declared_field(ctx, this, class_name, "maxBatchSize", Value::Int(200));
     set_declared_field(ctx, this, class_name, "systemUsage", Value::Object(None));
     set_declared_field(ctx, this, class_name, "maxProducersToAudit", Value::Int(64));
@@ -13169,7 +13463,13 @@ fn native_activemq_abstract_pending_message_cursor_init(
     set_declared_field(ctx, this, class_name, "cacheEnabled", Value::Int(1));
     set_declared_field(ctx, this, class_name, "started", Value::Int(0));
     set_declared_field(ctx, this, class_name, "last", Value::Object(None));
-    set_declared_field(ctx, this, class_name, "prioritizedMessages", Value::Int(if prioritized { 1 } else { 0 }));
+    set_declared_field(
+        ctx,
+        this,
+        class_name,
+        "prioritizedMessages",
+        Value::Int(if prioritized { 1 } else { 0 }),
+    );
     Ok(None)
 }
 
@@ -13250,8 +13550,20 @@ fn native_activemq_ordered_pending_list_init(
     set_declared_field(ctx, this, class_name, "root", Value::Object(None));
     set_declared_field(ctx, this, class_name, "tail", Value::Object(None));
     set_declared_field(ctx, this, class_name, "map", Value::Object(Some(map)));
-    set_declared_field(ctx, this, class_name, "messageSize", Value::Object(Some(message_size)));
-    set_declared_field(ctx, this, class_name, "pendingMessageHelper", Value::Object(Some(helper)));
+    set_declared_field(
+        ctx,
+        this,
+        class_name,
+        "messageSize",
+        Value::Object(Some(message_size)),
+    );
+    set_declared_field(
+        ctx,
+        this,
+        class_name,
+        "pendingMessageHelper",
+        Value::Object(Some(helper)),
+    );
 
     ctx.unpin_native_roots(this_pin);
     Ok(None)
@@ -13302,14 +13614,16 @@ fn native_activemq_vm_pending_message_cursor_init(
     Ok(None)
 }
 
-fn native_return_first_object_arg(_ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+fn native_return_first_object_arg(
+    _ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
     Ok(Some(args.first().copied().unwrap_or(Value::Object(None))))
 }
 
 fn native_netty_pipeline_touch(_ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     Ok(Some(args.get(1).copied().unwrap_or(Value::Object(None))))
 }
-
 
 fn native_activemq_mutex_transport_oneway(
     ctx: &mut dyn NativeContext,
@@ -13328,7 +13642,6 @@ fn native_activemq_mutex_transport_oneway(
     Ok(None)
 }
 
-
 fn native_activemq_mutex_transport_on_command(
     ctx: &mut dyn NativeContext,
     args: &[Value],
@@ -13346,7 +13659,6 @@ fn native_activemq_mutex_transport_on_command(
     Ok(None)
 }
 
-
 fn native_activemq_message_get_object_property(
     ctx: &mut dyn NativeContext,
     args: &[Value],
@@ -13360,7 +13672,12 @@ fn native_activemq_message_get_object_property(
         Value::Object(Some(o)) => o,
         _ => return Ok(Some(Value::Object(None))),
     };
-    ctx.invoke_virtual(map, "get", "(Ljava/lang/Object;)Ljava/lang/Object;", &[name])
+    ctx.invoke_virtual(
+        map,
+        "get",
+        "(Ljava/lang/Object;)Ljava/lang/Object;",
+        &[name],
+    )
 }
 
 fn native_activemq_message_get_string_property(
@@ -13369,7 +13686,9 @@ fn native_activemq_message_get_string_property(
 ) -> MethodCallResult {
     let value = native_activemq_message_get_object_property(ctx, args)?;
     match value {
-        Some(Value::Object(Some(o))) => ctx.invoke_virtual(o, "toString", "()Ljava/lang/String;", &[]),
+        Some(Value::Object(Some(o))) => {
+            ctx.invoke_virtual(o, "toString", "()Ljava/lang/String;", &[])
+        }
         _ => Ok(Some(Value::Object(None))),
     }
 }
@@ -13408,7 +13727,12 @@ fn native_activemq_protocol_converter_on_active_mq_command(
                 return Err(e);
             }
         };
-        let key = match ctx.invoke("java/lang/Integer", "valueOf", "(I)Ljava/lang/Integer;", &[Value::Int(correlation)]) {
+        let key = match ctx.invoke(
+            "java/lang/Integer",
+            "valueOf",
+            "(I)Ljava/lang/Integer;",
+            &[Value::Int(correlation)],
+        ) {
             Ok(v) => v.unwrap_or(Value::Object(None)),
             Err(e) => {
                 ctx.unpin_native_roots(this_pin);
@@ -13507,7 +13831,10 @@ fn native_activemq_protocol_converter_on_active_mq_command(
                 let subscription = ctx.read_native_pin(sub_pin, subscription);
                 if let Err(e) = native_activemq_stomp_subscription_on_message_dispatch(
                     ctx,
-                    &[Value::Object(Some(subscription)), Value::Object(Some(command))],
+                    &[
+                        Value::Object(Some(subscription)),
+                        Value::Object(Some(command)),
+                    ],
                 ) {
                     ctx.unpin_native_roots(this_pin);
                     return Err(e);
@@ -13572,7 +13899,13 @@ fn native_activemq_topic_subscription_init_method(
         let usage = ctx.get_field_by_name(this, "usageManager");
         set_declared_field(ctx, cursor, abstract_cursor, "systemUsage", usage);
         let high_water = ctx.get_field_by_name(this, "cursorMemoryHighWaterMark");
-        set_declared_field(ctx, cursor, abstract_cursor, "memoryUsageHighWaterMark", high_water);
+        set_declared_field(
+            ctx,
+            cursor,
+            abstract_cursor,
+            "memoryUsageHighWaterMark",
+            high_water,
+        );
         set_declared_field(ctx, cursor, abstract_cursor, "started", Value::Int(1));
     }
     set_declared_field(ctx, this, topic, "audit", Value::Object(None));
@@ -13656,10 +13989,9 @@ fn native_activemq_topic_region_create_subscription(
     };
     let sub_pin = ctx.pin_native_root(subscription);
     let subscription = ctx.read_native_pin(sub_pin, subscription);
-    if let Err(e) = native_activemq_topic_subscription_init_method(
-        ctx,
-        &[Value::Object(Some(subscription))],
-    ) {
+    if let Err(e) =
+        native_activemq_topic_subscription_init_method(ctx, &[Value::Object(Some(subscription))])
+    {
         ctx.unpin_native_roots(this_pin);
         return Err(e);
     }
@@ -13785,6 +14117,135 @@ fn register_spring_messaging_bridges(registry: &mut NativeMethodRegistry) {
     );
 }
 
+const XERCES_CMSTATESET: &str = "com/sun/org/apache/xerces/internal/impl/dtd/models/CMStateSet";
+
+fn cmstateset_int_field(ctx: &dyn NativeContext, this: ObjectRef, name: &str) -> i32 {
+    match ctx.get_field_by_name(this, name) {
+        Value::Int(v) => v,
+        Value::Long(v) => v as i32,
+        _ => 0,
+    }
+}
+
+fn cmstateset_byte_array(ctx: &dyn NativeContext, this: ObjectRef) -> Option<ObjectRef> {
+    match ctx.get_field_by_name(this, "fByteArray") {
+        Value::Object(Some(arr)) => Some(arr),
+        _ => None,
+    }
+}
+
+fn cmstateset_read_bytes(
+    ctx: &dyn NativeContext,
+    this: ObjectRef,
+    byte_count: i32,
+) -> Option<Vec<u8>> {
+    let arr = cmstateset_byte_array(ctx, this)?;
+    let requested = byte_count.max(0) as usize;
+    let len = requested.min(ctx.array_length(arr));
+    let mut bytes = vec![0u8; len];
+    let copied = ctx.read_byte_array_into(arr, 0, &mut bytes);
+    bytes.truncate(copied);
+    Some(bytes)
+}
+
+fn cmstateset_same_set(ctx: &dyn NativeContext, a: ObjectRef, b: ObjectRef) -> bool {
+    let bit_count = cmstateset_int_field(ctx, a, "fBitCount");
+    if bit_count != cmstateset_int_field(ctx, b, "fBitCount") {
+        return false;
+    }
+    if bit_count < 65 {
+        return cmstateset_int_field(ctx, a, "fBits1") == cmstateset_int_field(ctx, b, "fBits1")
+            && cmstateset_int_field(ctx, a, "fBits2") == cmstateset_int_field(ctx, b, "fBits2");
+    }
+
+    let byte_count = cmstateset_int_field(ctx, a, "fByteCount");
+    let Some(a_bytes) = cmstateset_read_bytes(ctx, a, byte_count) else {
+        return false;
+    };
+    let Some(b_bytes) = cmstateset_read_bytes(ctx, b, byte_count) else {
+        return false;
+    };
+    a_bytes == b_bytes
+}
+
+fn native_xerces_cmstateset_hash_code(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    let this = obj_arg(args, 0)?;
+    let bit_count = cmstateset_int_field(ctx, this, "fBitCount");
+    if bit_count < 65 {
+        let bits1 = cmstateset_int_field(ctx, this, "fBits1");
+        let bits2 = cmstateset_int_field(ctx, this, "fBits2");
+        return Ok(Some(Value::Int(bits1.wrapping_add(bits2.wrapping_mul(31)))));
+    }
+
+    let byte_count = cmstateset_int_field(ctx, this, "fByteCount");
+    let mut hash = 0i32;
+    if let Some(bytes) = cmstateset_read_bytes(ctx, this, byte_count) {
+        for byte in bytes.iter().rev() {
+            hash = (*byte as i8 as i32).wrapping_add(hash.wrapping_mul(31));
+        }
+    }
+    Ok(Some(Value::Int(hash)))
+}
+
+fn native_xerces_cmstateset_equals(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    let this = obj_arg(args, 0)?;
+    let other = match args.get(1) {
+        Some(Value::Object(Some(other))) => *other,
+        _ => return Ok(Some(Value::Int(0))),
+    };
+    if this.as_ptr() == other.as_ptr() {
+        return Ok(Some(Value::Int(1)));
+    }
+    let other_class = ctx.class_name_of_id(ctx.class_id_of_object(other));
+    if other_class.as_deref() != Some(XERCES_CMSTATESET) {
+        return Ok(Some(Value::Int(0)));
+    }
+    Ok(Some(Value::Int(if cmstateset_same_set(ctx, this, other) {
+        1
+    } else {
+        0
+    })))
+}
+
+fn native_xerces_cmstateset_is_same_set(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    let this = obj_arg(args, 0)?;
+    let other = obj_arg(args, 1)?;
+    Ok(Some(Value::Int(if cmstateset_same_set(ctx, this, other) {
+        1
+    } else {
+        0
+    })))
+}
+
+fn register_xerces_cmstateset_intrinsics(registry: &mut NativeMethodRegistry) {
+    registry.register(
+        XERCES_CMSTATESET,
+        "hashCode",
+        "()I",
+        native_xerces_cmstateset_hash_code,
+    );
+    registry.register(
+        XERCES_CMSTATESET,
+        "equals",
+        "(Ljava/lang/Object;)Z",
+        native_xerces_cmstateset_equals,
+    );
+    registry.register(
+        XERCES_CMSTATESET,
+        "isSameSet",
+        "(Lcom/sun/org/apache/xerces/internal/impl/dtd/models/CMStateSet;)Z",
+        native_xerces_cmstateset_is_same_set,
+    );
+}
 
 /// Register ONLY the truly native methods (`ACC_NATIVE` in real JDK class files).
 /// These methods have no bytecode — they MUST be provided by the VM as native code.
@@ -14186,6 +14647,7 @@ pub fn register_essential_natives(registry: &mut NativeMethodRegistry) {
         "()I",
         native_string_hash_code,
     );
+    register_xerces_cmstateset_intrinsics(registry);
     registry.register("java/lang/String", "indexOf", "(I)I", |ctx, args| {
         let this = match args.first() {
             Some(Value::Object(Some(o))) => *o,
@@ -15054,10 +15516,11 @@ pub fn register_essential_natives(registry: &mut NativeMethodRegistry) {
     // libssl/libcrypto. Registered here (the always-compiled essential path)
     // rather than in the synthetic-only `register_pe_panama`. See the fn doc.
     crate::panama::register_pe_raw_native_libraries(registry);
-    // FFM SymbolLookup bridge: real-JDK mode can still dispatch through the
-    // abstract `SymbolLookup.find(String)` interface declaration on composed
-    // lookup objects. Keep the focused bridge in the essential path so callers
-    // get Optional<MemorySegment>/Optional.empty() instead of AbstractMethodError.
+    // FFM real-JDK SymbolLookup bridge. `Linker.defaultLookup()` is supplied
+    // by the late real-JDK shim, but it returns a real `SymbolLookup` interface
+    // object whose `find(String)` declaration is abstract. Keep the Panama
+    // `find`/lookup natives in the essential registry so off-heap users such as
+    // Infinispan can resolve symbols instead of falling into AbstractMethodError.
     crate::panama::register_pe_symbol_lookup(registry);
     // FFM real-JDK layout/runtime shims. JDK 25's vector/foreign bootstrap
     // reaches `java.lang.foreign.ValueLayout$Of*` interface methods whose real
@@ -20757,12 +21220,11 @@ pub fn register_essential_natives(registry: &mut NativeMethodRegistry) {
         "latestUserDefinedLoader0",
         "()Ljava/lang/ClassLoader;",
         |ctx, _args| {
-            let loader = crate::serialization::latest_user_defined_loader_class(ctx).map(
-                |class_id| {
+            let loader =
+                crate::serialization::latest_user_defined_loader_class(ctx).map(|class_id| {
                     crate::classloader::defining_loader_for(class_id.as_u32())
                         .unwrap_or_else(|| crate::classloader::get_or_create_app_loader(ctx))
-                },
-            );
+                });
             Ok(Some(Value::Object(loader)))
         },
     );
@@ -20877,6 +21339,7 @@ pub fn register_essential_natives(registry: &mut NativeMethodRegistry) {
 
     // --- java.util.concurrent.locks.LockSupport (Session 13) ---
     register_lock_support_natives(registry);
+    register_stamped_lock_natives(registry);
 
     // --- java.util.concurrent.atomic.AtomicInteger (Session 13) ---
     register_atomic_integer_natives(registry);
@@ -22589,9 +23052,7 @@ pub fn register_essential_natives(registry: &mut NativeMethodRegistry) {
             "Europe/Paris" | "Europe/Berlin" | "Europe/Rome" | "Europe/Madrid" | "CET"
             | "Europe/Oslo" | "Europe/Amsterdam" | "Europe/Brussels" | "Europe/Vienna"
             | "Europe/Copenhagen" | "Europe/Stockholm" | "Europe/Zurich" | "Europe/Warsaw"
-            | "Europe/Prague" | "Europe/Budapest" => {
-                Some(3600)
-            }
+            | "Europe/Prague" | "Europe/Budapest" => Some(3600),
             "Europe/Athens" | "Europe/Bucharest" | "Europe/Helsinki" | "EET" => Some(2 * 3600),
             "Europe/Moscow" | "Europe/Istanbul" => Some(3 * 3600),
             "Asia/Dubai" => Some(4 * 3600),
@@ -22721,15 +23182,24 @@ pub fn register_essential_natives(registry: &mut NativeMethodRegistry) {
             "CET" | "Europe/Paris" | "Europe/Berlin" | "Europe/Rome" | "Europe/Madrid"
             | "Europe/Oslo" | "Europe/Amsterdam" | "Europe/Brussels" | "Europe/Vienna"
             | "Europe/Copenhagen" | "Europe/Stockholm" | "Europe/Zurich" | "Europe/Warsaw"
-            | "Europe/Prague" | "Europe/Budapest" | "Europe/London" | "GB"
-            | "Europe/Athens" | "Europe/Bucharest" | "Europe/Helsinki" => Some([
+            | "Europe/Prague" | "Europe/Budapest" | "Europe/London" | "GB" | "Europe/Athens"
+            | "Europe/Bucharest" | "Europe/Helsinki" => Some([
                 MARCH, -1, SUNDAY, HOUR, UTC_TIME, OCTOBER, -1, SUNDAY, HOUR, UTC_TIME, HOUR,
             ]),
             // New Zealand rule: DST from last Sunday of September 02:00 wall
             // to first Sunday of April 03:00 wall (02:00 standard), +1h.
             "Pacific/Auckland" | "NZ" => Some([
-                SEPTEMBER, -1, SUNDAY, 2 * HOUR, WALL_TIME, APRIL, 1, SUNDAY, 3 * HOUR,
-                WALL_TIME, HOUR,
+                SEPTEMBER,
+                -1,
+                SUNDAY,
+                2 * HOUR,
+                WALL_TIME,
+                APRIL,
+                1,
+                SUNDAY,
+                3 * HOUR,
+                WALL_TIME,
+                HOUR,
             ]),
             _ => None,
         }
@@ -28038,10 +28508,11 @@ fn native_surefire_forkedbooter_acknowledged_exit(
                     "(I)V",
                     &[Value::Object(Some(sem)), Value::Int(0)],
                 )?;
-                let listener = match ctx.new_object("org/apache/maven/surefire/booter/ForkedBooter$6")? {
-                    Some(Value::Object(Some(o))) => o,
-                    _ => return Ok(None),
-                };
+                let listener =
+                    match ctx.new_object("org/apache/maven/surefire/booter/ForkedBooter$6")? {
+                        Some(Value::Object(Some(o))) => o,
+                        _ => return Ok(None),
+                    };
                 ctx.invoke_special(
                     "org/apache/maven/surefire/booter/ForkedBooter$6",
                     "<init>",
@@ -29234,11 +29705,7 @@ fn surefire_forwarding_write(
     let is_stdout = matches!(ctx.get_field_by_name(this, "isStdout"), Value::Int(v) if v != 0);
 
     ctx.set_field_by_name(entry, "log", Value::Object(Some(text_obj)));
-    ctx.set_field_by_name(
-        entry,
-        "isStdOut",
-        Value::Int(if is_stdout { 1 } else { 0 }),
-    );
+    ctx.set_field_by_name(entry, "isStdOut", Value::Int(if is_stdout { 1 } else { 0 }));
     ctx.set_field_by_name(entry, "newLine", Value::Int(if newline { 1 } else { 0 }));
     ctx.set_field_by_name(entry, "runMode", Value::Object(None));
     ctx.set_field_by_name(entry, "testRunId", Value::Object(None));
@@ -29863,10 +30330,7 @@ fn native_printstream_write(ctx: &mut dyn NativeContext, args: &[Value]) -> Meth
     Ok(None)
 }
 
-fn native_printstream_write_int(
-    ctx: &mut dyn NativeContext,
-    args: &[Value],
-) -> MethodCallResult {
+fn native_printstream_write_int(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     // args[0]=this, args[1]=int. Java PrintStream.write(int) writes the low
     // eight bits of the argument to the underlying byte stream.
     let b = match args.get(1) {
@@ -33204,66 +33668,42 @@ fn scoped_memory_access_unsafe_args(args: &[Value]) -> Vec<Value> {
     adapted
 }
 
-fn native_scoped_memory_get_byte(
-    ctx: &mut dyn NativeContext,
-    args: &[Value],
-) -> MethodCallResult {
+fn native_scoped_memory_get_byte(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let adapted = scoped_memory_access_unsafe_args(args);
     native_unsafe_get_byte_mb(ctx, &adapted)
 }
 
-fn native_scoped_memory_put_byte(
-    ctx: &mut dyn NativeContext,
-    args: &[Value],
-) -> MethodCallResult {
+fn native_scoped_memory_put_byte(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let adapted = scoped_memory_access_unsafe_args(args);
     native_unsafe_put_byte_mb(ctx, &adapted)
 }
 
-fn native_scoped_memory_get_short(
-    ctx: &mut dyn NativeContext,
-    args: &[Value],
-) -> MethodCallResult {
+fn native_scoped_memory_get_short(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let adapted = scoped_memory_access_unsafe_args(args);
     native_unsafe_get_short_mb(ctx, &adapted)
 }
 
-fn native_scoped_memory_put_short(
-    ctx: &mut dyn NativeContext,
-    args: &[Value],
-) -> MethodCallResult {
+fn native_scoped_memory_put_short(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let adapted = scoped_memory_access_unsafe_args(args);
     native_unsafe_put_short_mb(ctx, &adapted)
 }
 
-fn native_scoped_memory_get_int(
-    ctx: &mut dyn NativeContext,
-    args: &[Value],
-) -> MethodCallResult {
+fn native_scoped_memory_get_int(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let adapted = scoped_memory_access_unsafe_args(args);
     native_unsafe_get_int_mb(ctx, &adapted)
 }
 
-fn native_scoped_memory_put_int(
-    ctx: &mut dyn NativeContext,
-    args: &[Value],
-) -> MethodCallResult {
+fn native_scoped_memory_put_int(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let adapted = scoped_memory_access_unsafe_args(args);
     native_unsafe_put_int_mb(ctx, &adapted)
 }
 
-fn native_scoped_memory_get_long(
-    ctx: &mut dyn NativeContext,
-    args: &[Value],
-) -> MethodCallResult {
+fn native_scoped_memory_get_long(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let adapted = scoped_memory_access_unsafe_args(args);
     native_unsafe_get_long_mb(ctx, &adapted)
 }
 
-fn native_scoped_memory_put_long(
-    ctx: &mut dyn NativeContext,
-    args: &[Value],
-) -> MethodCallResult {
+fn native_scoped_memory_put_long(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let adapted = scoped_memory_access_unsafe_args(args);
     native_unsafe_put_long_mb(ctx, &adapted)
 }
@@ -38693,7 +39133,6 @@ fn register_t19_h2_shared_secrets_shim(registry: &mut NativeMethodRegistry) {
 // is robust to either the real-JDK private-field layout or our
 // synthetic minimum-field allocation.
 
-
 fn module_builder_alloc_with_named_fields(
     ctx: &mut dyn NativeContext,
     class_name: &str,
@@ -38710,10 +39149,9 @@ fn module_builder_alloc_with_named_fields(
 }
 
 fn module_builder_empty_set(ctx: &mut dyn NativeContext) -> Value {
-    Value::Object(Some(cratonvm_native_collections::make_hashset_with_elements(
-        ctx,
-        &[],
-    )))
+    Value::Object(Some(
+        cratonvm_native_collections::make_hashset_with_elements(ctx, &[]),
+    ))
 }
 
 fn module_builder_set_or_empty(ctx: &mut dyn NativeContext, value: Value) -> Value {
@@ -38748,7 +39186,14 @@ pub(crate) fn build_synthetic_module_descriptor(
     ctx.set_field_by_name(desc, "open", Value::Int(if is_open { 1 } else { 0 }));
     ctx.set_field_by_name(desc, "automatic", Value::Int(0));
 
-    for field in ["modifiers", "requires", "exports", "opens", "provides", "packages"] {
+    for field in [
+        "modifiers",
+        "requires",
+        "exports",
+        "opens",
+        "provides",
+        "packages",
+    ] {
         let empty = module_descriptor_empty_set(ctx);
         let desc = ctx.read_native_pin(pin, desc);
         ctx.set_field_by_name(desc, field, Value::Object(Some(empty)));
@@ -38800,17 +39245,11 @@ fn native_module_descriptor_exports(
     module_descriptor_set_field(ctx, args, "exports")
 }
 
-fn native_module_descriptor_opens(
-    ctx: &mut dyn NativeContext,
-    args: &[Value],
-) -> MethodCallResult {
+fn native_module_descriptor_opens(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     module_descriptor_set_field(ctx, args, "opens")
 }
 
-fn native_module_descriptor_uses(
-    ctx: &mut dyn NativeContext,
-    args: &[Value],
-) -> MethodCallResult {
+fn native_module_descriptor_uses(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     module_descriptor_set_field(ctx, args, "uses")
 }
 
@@ -38865,15 +39304,11 @@ fn native_module_builder_new_exports_qualified(
     args: &[Value],
 ) -> MethodCallResult {
     // (Set<Modifier>, String source, Set<String> targets) -> Exports
-    let mods = module_builder_set_or_empty(
-        ctx,
-        args.first().copied().unwrap_or(Value::Object(None)),
-    );
+    let mods =
+        module_builder_set_or_empty(ctx, args.first().copied().unwrap_or(Value::Object(None)));
     let source = args.get(1).copied().unwrap_or(Value::Object(None));
-    let targets = module_builder_set_or_empty(
-        ctx,
-        args.get(2).copied().unwrap_or(Value::Object(None)),
-    );
+    let targets =
+        module_builder_set_or_empty(ctx, args.get(2).copied().unwrap_or(Value::Object(None)));
     let obj = module_builder_alloc_with_named_fields(
         ctx,
         "java/lang/module/ModuleDescriptor$Exports",
@@ -38881,17 +39316,14 @@ fn native_module_builder_new_exports_qualified(
     );
     Ok(Some(Value::Object(Some(obj))))
 }
-
 
 fn native_module_builder_new_exports_unqualified(
     ctx: &mut dyn NativeContext,
     args: &[Value],
 ) -> MethodCallResult {
     // (Set<Modifier>, String source) -> Exports
-    let mods = module_builder_set_or_empty(
-        ctx,
-        args.first().copied().unwrap_or(Value::Object(None)),
-    );
+    let mods =
+        module_builder_set_or_empty(ctx, args.first().copied().unwrap_or(Value::Object(None)));
     let source = args.get(1).copied().unwrap_or(Value::Object(None));
     let targets = module_builder_empty_set(ctx);
     let obj = module_builder_alloc_with_named_fields(
@@ -38902,20 +39334,15 @@ fn native_module_builder_new_exports_unqualified(
     Ok(Some(Value::Object(Some(obj))))
 }
 
-
 fn native_module_builder_new_opens_qualified(
     ctx: &mut dyn NativeContext,
     args: &[Value],
 ) -> MethodCallResult {
-    let mods = module_builder_set_or_empty(
-        ctx,
-        args.first().copied().unwrap_or(Value::Object(None)),
-    );
+    let mods =
+        module_builder_set_or_empty(ctx, args.first().copied().unwrap_or(Value::Object(None)));
     let source = args.get(1).copied().unwrap_or(Value::Object(None));
-    let targets = module_builder_set_or_empty(
-        ctx,
-        args.get(2).copied().unwrap_or(Value::Object(None)),
-    );
+    let targets =
+        module_builder_set_or_empty(ctx, args.get(2).copied().unwrap_or(Value::Object(None)));
     let obj = module_builder_alloc_with_named_fields(
         ctx,
         "java/lang/module/ModuleDescriptor$Opens",
@@ -38924,15 +39351,12 @@ fn native_module_builder_new_opens_qualified(
     Ok(Some(Value::Object(Some(obj))))
 }
 
-
 fn native_module_builder_new_opens_unqualified(
     ctx: &mut dyn NativeContext,
     args: &[Value],
 ) -> MethodCallResult {
-    let mods = module_builder_set_or_empty(
-        ctx,
-        args.first().copied().unwrap_or(Value::Object(None)),
-    );
+    let mods =
+        module_builder_set_or_empty(ctx, args.first().copied().unwrap_or(Value::Object(None)));
     let source = args.get(1).copied().unwrap_or(Value::Object(None));
     let targets = module_builder_empty_set(ctx);
     let obj = module_builder_alloc_with_named_fields(
@@ -38943,16 +39367,13 @@ fn native_module_builder_new_opens_unqualified(
     Ok(Some(Value::Object(Some(obj))))
 }
 
-
 fn native_module_builder_new_requires_versioned(
     ctx: &mut dyn NativeContext,
     args: &[Value],
 ) -> MethodCallResult {
     // (Set<Modifier>, String mn, String compiledVersion) -> Requires
-    let mods = module_builder_set_or_empty(
-        ctx,
-        args.first().copied().unwrap_or(Value::Object(None)),
-    );
+    let mods =
+        module_builder_set_or_empty(ctx, args.first().copied().unwrap_or(Value::Object(None)));
     let mn = args.get(1).copied().unwrap_or(Value::Object(None));
     let compiled = args.get(2).copied().unwrap_or(Value::Object(None));
     let obj = module_builder_alloc_with_named_fields(
@@ -38963,16 +39384,13 @@ fn native_module_builder_new_requires_versioned(
     Ok(Some(Value::Object(Some(obj))))
 }
 
-
 fn native_module_builder_new_requires_short(
     ctx: &mut dyn NativeContext,
     args: &[Value],
 ) -> MethodCallResult {
     // (Set<Modifier>, String mn) -> Requires
-    let mods = module_builder_set_or_empty(
-        ctx,
-        args.first().copied().unwrap_or(Value::Object(None)),
-    );
+    let mods =
+        module_builder_set_or_empty(ctx, args.first().copied().unwrap_or(Value::Object(None)));
     let mn = args.get(1).copied().unwrap_or(Value::Object(None));
     let obj = module_builder_alloc_with_named_fields(
         ctx,
@@ -39011,7 +39429,6 @@ fn native_module_builder_new_version(
     Ok(Some(Value::Object(Some(obj))))
 }
 
-
 fn native_module_builder_build(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     // Instance method: build(int hashCode) -> ModuleDescriptor
     // args[0] = this (Builder), args[1] = hashCode int
@@ -39048,7 +39465,10 @@ fn native_module_builder_build(ctx: &mut dyn NativeContext, args: &[Value]) -> M
         "packages",
     ] {
         let md_current = ctx.read_native_pin(md_pin, md);
-        if !matches!(ctx.get_field_by_name(md_current, field), Value::Object(Some(_))) {
+        if !matches!(
+            ctx.get_field_by_name(md_current, field),
+            Value::Object(Some(_))
+        ) {
             let empty = module_builder_empty_set(ctx);
             let md_current = ctx.read_native_pin(md_pin, md);
             ctx.set_field_by_name(md_current, field, empty);
@@ -39344,7 +39764,15 @@ fn register_module_builder_overrides(registry: &mut NativeMethodRegistry) {
         let name_str = ctx.create_string("synthetic");
         let md = ctx.read_native_pin(md_pin, md);
         ctx.set_field_by_name(md, "name", Value::Object(Some(name_str)));
-        for field in ["modifiers", "requires", "exports", "opens", "uses", "provides", "packages"] {
+        for field in [
+            "modifiers",
+            "requires",
+            "exports",
+            "opens",
+            "uses",
+            "provides",
+            "packages",
+        ] {
             let empty = match ctx.new_object_initialized("java/util/HashSet", "()V", &[])? {
                 Some(Value::Object(Some(o))) => o,
                 _ => {
@@ -43696,10 +44124,7 @@ fn b64_decode_char(c: u8, variant: i32) -> Option<u32> {
 pub(crate) fn pem_block_to_der(bytes: &[u8]) -> Vec<u8> {
     const BEGIN: &[u8] = b"-----BEGIN";
     // Locate the first `-----BEGIN` line; bail (return input) if absent.
-    let Some(begin) = bytes
-        .windows(BEGIN.len())
-        .position(|w| w == BEGIN)
-    else {
+    let Some(begin) = bytes.windows(BEGIN.len()).position(|w| w == BEGIN) else {
         return bytes.to_vec();
     };
     // Body starts after the end of the BEGIN line.
@@ -49085,8 +49510,7 @@ fn native_es_execute(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallR
 /// address via `read_var_handle_root(identity_key)` (use-after-move
 /// otherwise once the pool is relocated by a moving young GC or promotion).
 static ASYNC_POOL: std::sync::Mutex<Option<(i32, ObjectRef)>> = std::sync::Mutex::new(None);
-static LAST_ASYNC_SUBMIT_MS: std::sync::atomic::AtomicU64 =
-    std::sync::atomic::AtomicU64::new(0);
+static LAST_ASYNC_SUBMIT_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 fn monotonicish_epoch_millis() -> u64 {
     std::time::SystemTime::now()
@@ -55843,10 +56267,7 @@ fn native_stamped_unstamped_unlock_write(
     Ok(None)
 }
 
-fn native_stamped_try_unlock_read(
-    ctx: &mut dyn NativeContext,
-    args: &[Value],
-) -> MethodCallResult {
+fn native_stamped_try_unlock_read(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let Some(obj) = stamped_obj(args) else {
         return Ok(Some(Value::Int(0)));
     };
@@ -61917,7 +62338,10 @@ mod vector_support_essential_tests {
             Value::Object(Some(count)),
             "real-JDK LinkedBlockingQueue.count must not be stomped as synthetic size"
         );
-        assert_eq!(ctx.get_field_by_name(queue, "count"), Value::Object(Some(count)));
+        assert_eq!(
+            ctx.get_field_by_name(queue, "count"),
+            Value::Object(Some(count))
+        );
     }
 }
 
@@ -62054,6 +62478,110 @@ mod panama_essential_tests {
                 "(Ljava/lang/String;)Ljava/util/Optional;"
             )
             .is_some());
+    }
+}
+
+#[cfg(test)]
+mod xerces_cmstateset_tests {
+    use super::*;
+    use crate::test_utils::MockNativeContext;
+    use cratonvm_types::ArrayElementType;
+
+    fn new_cmstateset(
+        ctx: &mut MockNativeContext,
+        bit_count: i32,
+        byte_count: i32,
+        bits1: i32,
+        bits2: i32,
+        bytes: &[u8],
+    ) -> ObjectRef {
+        let class_id = ctx
+            .ensure_class_initialized(XERCES_CMSTATESET)
+            .expect("CMStateSet class id");
+        let obj = ctx.alloc_object(class_id, 5);
+        ctx.set_field_by_name(obj, "fBitCount", Value::Int(bit_count));
+        ctx.set_field_by_name(obj, "fByteCount", Value::Int(byte_count));
+        ctx.set_field_by_name(obj, "fBits1", Value::Int(bits1));
+        ctx.set_field_by_name(obj, "fBits2", Value::Int(bits2));
+        let arr = ctx.new_array(ArrayElementType::Byte, bytes.len());
+        for (idx, byte) in bytes.iter().enumerate() {
+            ctx.set_array_element(arr, idx, Value::Int((*byte as i8) as i32));
+        }
+        ctx.set_field_by_name(obj, "fByteArray", Value::Object(Some(arr)));
+        obj
+    }
+
+    fn java_cmstateset_byte_hash(bytes: &[u8]) -> i32 {
+        let mut hash = 0i32;
+        for byte in bytes.iter().rev() {
+            hash = (*byte as i8 as i32).wrapping_add(hash.wrapping_mul(31));
+        }
+        hash
+    }
+
+    #[test]
+    fn essential_natives_include_xerces_cmstateset_intrinsics() {
+        let mut registry = NativeMethodRegistry::new();
+        register_essential_natives(&mut registry);
+        for (name, descriptor) in [
+            ("hashCode", "()I"),
+            ("equals", "(Ljava/lang/Object;)Z"),
+            (
+                "isSameSet",
+                "(Lcom/sun/org/apache/xerces/internal/impl/dtd/models/CMStateSet;)Z",
+            ),
+        ] {
+            assert!(
+                registry.find(XERCES_CMSTATESET, name, descriptor).is_some(),
+                "CMStateSet.{name}{descriptor} must be in the real-JDK essential registry"
+            );
+        }
+    }
+
+    #[test]
+    fn xerces_cmstateset_hash_code_matches_jdk_small_and_byte_array_paths() {
+        let mut ctx = MockNativeContext::new();
+        let small = new_cmstateset(&mut ctx, 64, 0, 17, -9, &[]);
+        let small_result =
+            native_xerces_cmstateset_hash_code(&mut ctx, &[Value::Object(Some(small))])
+                .expect("small hash result")
+                .expect("small hash value");
+        assert_eq!(
+            small_result,
+            Value::Int(17i32.wrapping_add((-9i32).wrapping_mul(31)))
+        );
+
+        let bytes = [0x7f, 0x80, 0xff, 0x01];
+        let large = new_cmstateset(&mut ctx, 65, bytes.len() as i32, 0, 0, &bytes);
+        let large_result =
+            native_xerces_cmstateset_hash_code(&mut ctx, &[Value::Object(Some(large))])
+                .expect("large hash result")
+                .expect("large hash value");
+        assert_eq!(large_result, Value::Int(java_cmstateset_byte_hash(&bytes)));
+    }
+
+    #[test]
+    fn xerces_cmstateset_equals_and_is_same_set_compare_real_fields() {
+        let mut ctx = MockNativeContext::new();
+        let a = new_cmstateset(&mut ctx, 65, 3, 0, 0, &[0xaa, 0x00, 0x7f]);
+        let b = new_cmstateset(&mut ctx, 65, 3, 0, 0, &[0xaa, 0x00, 0x7f]);
+        let c = new_cmstateset(&mut ctx, 65, 3, 0, 0, &[0xaa, 0x01, 0x7f]);
+
+        let eq_ab = native_xerces_cmstateset_equals(
+            &mut ctx,
+            &[Value::Object(Some(a)), Value::Object(Some(b))],
+        )
+        .expect("equals result")
+        .expect("equals value");
+        assert_eq!(eq_ab, Value::Int(1));
+
+        let same_ac = native_xerces_cmstateset_is_same_set(
+            &mut ctx,
+            &[Value::Object(Some(a)), Value::Object(Some(c))],
+        )
+        .expect("isSameSet result")
+        .expect("isSameSet value");
+        assert_eq!(same_ac, Value::Int(0));
     }
 }
 
@@ -62862,7 +63390,10 @@ mod concurrency_tests {
         let mut ctx = make_ctx();
         let sl = stamped_lock_obj(&mut ctx);
         native_stamped_init(&mut ctx, &[Value::Object(Some(sl))]).unwrap();
-        assert_eq!(ctx.get_field_by_name(sl, "state"), Value::Long(STAMPED_ORIGIN));
+        assert_eq!(
+            ctx.get_field_by_name(sl, "state"),
+            Value::Long(STAMPED_ORIGIN)
+        );
 
         native_stamped_write_lock(&mut ctx, &[Value::Object(Some(sl))]).unwrap();
         let write_state = match ctx.get_field_by_name(sl, "state") {
@@ -64525,9 +65056,17 @@ mod regex_lookbehind_tests {
         assert_eq!(pem_block_to_der(&der), der, "raw DER unchanged");
         // A leading-garbage-then-armor PEM still finds the block.
         let noisy = format!("Bag Attributes\n{pem}");
-        assert_eq!(pem_block_to_der(noisy.as_bytes()), der, "armor found past a preamble");
+        assert_eq!(
+            pem_block_to_der(noisy.as_bytes()),
+            der,
+            "armor found past a preamble"
+        );
         // Non-base64 body → hand original bytes back (caller's mirror fallback).
         let bad = b"-----BEGIN CERTIFICATE-----\n@@@@\n-----END CERTIFICATE-----\n";
-        assert_eq!(pem_block_to_der(bad), bad.to_vec(), "invalid base64 falls back to input");
+        assert_eq!(
+            pem_block_to_der(bad),
+            bad.to_vec(),
+            "invalid base64 falls back to input"
+        );
     }
 }

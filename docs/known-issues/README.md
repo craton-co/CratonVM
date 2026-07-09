@@ -8,6 +8,12 @@ angles**; this index is the consolidated map. Read it first.
 
 - FIXED/RETIRED: [Tribes `ParallelNioSender` selected-key `ClassCastException`](../internal/fixed-suite-bugs/nio-selectionkey-classcastexception-tribes-sender-FIXED.md) - the remaining two-key `Selector.selectedKeys().iterator().next()/remove()` GC-stress crash was in native collection map/set helpers, not the selector side table. `HashMap.put`/`remove` now pin their inner receiver/key/value windows, `HashSet.iterator()` pins its receiver/snapshot backing before allocation, and the focused two-`SelectionKey` fixture passes under `CRATONVM_GC_STRESS`.
 
+## 2026-07-08 Keycloak RealmModelTest protobuf metadata residual fixed; Liquibase/Xerces no-JIT timeout opened
+
+- FIXED/VERIFIED: [`keycloak-model-stw-takeover-hang-eventloopgroup-shutdown-FIXED.md`](../internal/fixed-suite-bugs/keycloak-model-stw-takeover-hang-eventloopgroup-shutdown-FIXED.md) - real `RealmModelTest` under CratonVM `--nojit` no longer hangs. The run completed in 108.644s, reached `io.netty.channel.EventLoopGroup` `STOPPING` -> `STOPPED`, and did not emit the repeated STW takeover wait signature.
+- FIXED: [`keycloak-model-protobuf-metadata-cache-config-missing-FIXED.md`](../internal/fixed-suite-bugs/keycloak-model-protobuf-metadata-cache-config-missing-FIXED.md) - real `DefaultCacheManager` cache-existence/configuration-definition calls now delegate into Infinispan's real `ConfigurationManager`, so the internal `___protobuf_metadata` cache configuration is present when internal caches start. The same fix chain also closed the exposed FFM `SymbolLookup`, default C-runtime lookup, StampedLock view-unlock, Liquibase pipeline-order, and Xerces `CMStateSet` hotspots.
+- OPEN: [`keycloak-model-liquibase-xerces-xml-parse-nojit-timeout.md`](keycloak-model-liquibase-xerces-xml-parse-nojit-timeout.md) - after those fixes, `RealmModelTest` reaches Liquibase changelog XML/XSD parsing and still exceeds CratonVM's 900s no-JIT watchdog. A manual stack dump is in `XMLEntityScanner.scanQName -> checkLimit -> XMLLimitAnalyzer.addValue` while resolving `dbchangelog-3.2.xsd`; HotSpot `-Xint` passed the same class/list in 142.649s.
+
 ## 2026-07-07 Five new Spring non-passed-rerun bugs (Azure host, dev, real-JDK/JIT-on)
 
 Found triaging FAIL results from a 516-class Spring non-passed rerun (filtered

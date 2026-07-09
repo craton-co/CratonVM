@@ -213,6 +213,17 @@ fn mock_parameter_field_slot(name: &str) -> Option<usize> {
 fn mock_classloader_field_slot(class_name: Option<&str>, name: &str) -> Option<usize> {
     match (class_name, name) {
         (
+            Some("com/sun/org/apache/xerces/internal/impl/dtd/models/CMStateSet"),
+            "fBitCount" | "fByteCount" | "fBits1" | "fBits2" | "fByteArray",
+        ) => match name {
+            "fBitCount" => Some(0),
+            "fByteCount" => Some(1),
+            "fBits1" => Some(2),
+            "fBits2" => Some(3),
+            "fByteArray" => Some(4),
+            _ => None,
+        },
+        (
             Some(
                 "java/lang/ClassLoader"
                 | "java/net/URLClassLoader"
@@ -230,6 +241,16 @@ fn mock_classloader_field_slot(class_name: Option<&str>, name: &str) -> Option<u
             "subject" => Some(1),
             "callbackHandler" => Some(2),
             "config" => Some(3),
+            _ => None,
+        },
+        (
+            Some("org/infinispan/manager/DefaultCacheManager"),
+            "caches" | "globalComponentRegistry" | "configurationManager" | "defaultCacheName",
+        ) => match name {
+            "caches" => Some(0),
+            "globalComponentRegistry" => Some(1),
+            "configurationManager" => Some(2),
+            "defaultCacheName" => Some(3),
             _ => None,
         },
         _ => None,

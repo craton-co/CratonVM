@@ -11,9 +11,11 @@
 mod common;
 
 use common::{boxed_char, boxed_int, build_registry, call, class_name_of, new_treemap, MockCtx};
-use cratonvm_types::Value;
+use cratonvm_native_api::NativeContext;
+use cratonvm_types::{ObjectRef, Value};
 
 const TM: &str = "java/util/TreeMap";
+const TS: &str = "java/util/TreeSet";
 const PUT: &str = "(Ljava/lang/Object;Ljava/lang/Object;)Ljava/lang/Object;";
 const GET: &str = "(Ljava/lang/Object;)Ljava/lang/Object;";
 
@@ -232,9 +234,155 @@ fn character_key_preserves_wrapper_type_on_readback() {
 /// Read the inner `Int` value from a boxed `java.lang.Integer` heap
 /// object — slot 0 carries the wrapped primitive.
 fn ctx_get_int(ctx: &MockCtx, obj: cratonvm_types::ObjectRef) -> Option<i32> {
-    use cratonvm_native_api::NativeContext;
     match ctx.get_field(obj, 0) {
         Value::Int(v) => Some(v),
         _ => None,
     }
+}
+
+#[test]
+fn tree_map_liquibase_tie_comparator_preserves_insert_order() {
+    let reg = build_registry();
+    let mut ctx = MockCtx::new();
+    let tm = new_treemap_with_tie_comparator(&reg, &mut ctx);
+    let keys = tie_step_keys(&mut ctx);
+
+    for (idx, key) in keys.iter().enumerate() {
+        let value = boxed_int(&mut ctx, idx as i32);
+        call(
+            &reg,
+            &mut ctx,
+            TM,
+            "put",
+            PUT,
+            &[Value::Object(Some(tm)), Value::Object(Some(*key)), value],
+        )
+        .unwrap();
+    }
+
+    let action = alloc_named_object(&mut ctx, "test/BiConsumer", 0);
+    ctx.clear_invoke_virtual_log();
+    call(
+        &reg,
+        &mut ctx,
+        TM,
+        "forEach",
+        "(Ljava/util/function/BiConsumer;)V",
+        &[Value::Object(Some(tm)), Value::Object(Some(action))],
+    )
+    .unwrap();
+
+    let visited = ctx
+        .invoke_virtual_log()
+        .into_iter()
+        .filter(|(_, method, desc, _)| {
+            method == "accept" && desc == "(Ljava/lang/Object;Ljava/lang/Object;)V"
+        })
+        .map(|(_, _, _, args)| match args.first() {
+            Some(Value::Object(Some(o))) => *o,
+            other => panic!("unexpected TreeMap.forEach key arg: {other:?}"),
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        visited, keys,
+        "TreeMap must compare new key against existing key so same-order comparator ties append like HotSpot"
+    );
+}
+
+#[test]
+fn tree_set_liquibase_tie_comparator_preserves_insert_order() {
+    let reg = build_registry();
+    let mut ctx = MockCtx::new();
+    let ts = new_treeset_with_tie_comparator(&reg, &mut ctx);
+    let keys = tie_step_keys(&mut ctx);
+
+    for key in &keys {
+        call(
+            &reg,
+            &mut ctx,
+            TS,
+            "add",
+            "(Ljava/lang/Object;)Z",
+            &[Value::Object(Some(ts)), Value::Object(Some(*key))],
+        )
+        .unwrap();
+    }
+
+    let action = alloc_named_object(&mut ctx, "test/Consumer", 0);
+    ctx.clear_invoke_virtual_log();
+    call(
+        &reg,
+        &mut ctx,
+        TS,
+        "forEach",
+        "(Ljava/util/function/Consumer;)V",
+        &[Value::Object(Some(ts)), Value::Object(Some(action))],
+    )
+    .unwrap();
+
+    let visited = ctx
+        .invoke_virtual_log()
+        .into_iter()
+        .filter(|(_, method, desc, _)| method == "accept" && desc == "(Ljava/lang/Object;)V")
+        .map(|(_, _, _, args)| match args.first() {
+            Some(Value::Object(Some(o))) => *o,
+            other => panic!("unexpected TreeSet.forEach element arg: {other:?}"),
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        visited, keys,
+        "TreeSet must preserve same-order comparator tie insertion order like HotSpot"
+    );
+}
+
+fn new_treemap_with_tie_comparator(
+    reg: &cratonvm_native_api::NativeMethodRegistry,
+    ctx: &mut MockCtx,
+) -> ObjectRef {
+    let tm = alloc_named_object(ctx, TM, 4);
+    let cmp = alloc_named_object(ctx, "test/LiquibaseTieComparator", 0);
+    call(
+        reg,
+        ctx,
+        TM,
+        "<init>",
+        "(Ljava/util/Comparator;)V",
+        &[Value::Object(Some(tm)), Value::Object(Some(cmp))],
+    )
+    .unwrap();
+    tm
+}
+
+fn new_treeset_with_tie_comparator(
+    reg: &cratonvm_native_api::NativeMethodRegistry,
+    ctx: &mut MockCtx,
+) -> ObjectRef {
+    let ts = alloc_named_object(ctx, TS, 4);
+    let cmp = alloc_named_object(ctx, "test/LiquibaseTieComparator", 0);
+    call(
+        reg,
+        ctx,
+        TS,
+        "<init>",
+        "(Ljava/util/Comparator;)V",
+        &[Value::Object(Some(ts)), Value::Object(Some(cmp))],
+    )
+    .unwrap();
+    ts
+}
+
+fn tie_step_keys(ctx: &mut MockCtx) -> Vec<ObjectRef> {
+    [-1, -1, -1, -1, 1000]
+        .into_iter()
+        .map(|order| {
+            let step = alloc_named_object(ctx, "test/LiquibaseStep", 1);
+            ctx.set_field(step, 0, Value::Int(order));
+            step
+        })
+        .collect()
+}
+
+fn alloc_named_object(ctx: &mut MockCtx, class_name: &str, fields: usize) -> ObjectRef {
+    let cid = ctx.ensure_class_initialized(class_name).unwrap();
+    ctx.alloc_object(cid, fields)
 }

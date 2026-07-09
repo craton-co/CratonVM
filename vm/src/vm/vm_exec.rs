@@ -11064,18 +11064,16 @@ fn invoke_on_class_shared_inner(
                         // entrypoints through our hand-rolled
                         // `parking_lot::Mutex+Condvar` natives so the JDK
                         // bytecode never has a chance to mis-tag.
-                        || (class_name == "java/util/concurrent/locks/StampedLock"
-                            && matches!(
-                                method_name,
-                                "<init>"
-                                | "readLock" | "writeLock"
-                                | "tryReadLock" | "tryWriteLock"
-                                | "tryOptimisticRead" | "validate"
-                                | "unlockRead" | "unlockWrite"
-                                | "tryConvertToReadLock" | "tryConvertToWriteLock"
-                                | "isReadLocked" | "isWriteLocked"
-                                | "getReadLockCount"
-                            ))
+                        || crate::runtime::interpreter::is_stamped_lock_native_override(
+                            class_name,
+                            method_name,
+                            descriptor,
+                        )
+                        || crate::runtime::interpreter::is_xerces_cmstateset_native_override(
+                            class_name,
+                            method_name,
+                            descriptor,
+                        )
                         || (matches!(
                                 class_name,
                                 "java/util/concurrent/locks/ReentrantReadWriteLock$ReadLock"
@@ -12093,6 +12091,11 @@ fn invoke_on_class_shared_inner(
                             descriptor,
                         )
                         || crate::runtime::interpreter::is_stamped_lock_native_override(
+                            class_name,
+                            method_name,
+                            descriptor,
+                        )
+                        || crate::runtime::interpreter::is_xerces_cmstateset_native_override(
                             class_name,
                             method_name,
                             descriptor,
@@ -13791,10 +13794,17 @@ fn invoke_on_class_shared_inner(
                     | "isReadOnly"
                     | "scope"
             );
+        let force_ffm_symbol_lookup_interface_native =
+            crate::runtime::interpreter::is_ffm_symbol_lookup_native_override(
+                &class_name_for_override,
+                method_name,
+                descriptor,
+            );
         let override_cb = if declaring_is_interface
             && !is_static
             && !force_ffm_value_layout_interface_native
             && !force_ffm_memory_segment_interface_native
+            && !force_ffm_symbol_lookup_interface_native
         {
             None
         } else {

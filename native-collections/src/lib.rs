@@ -24947,10 +24947,13 @@ fn tm_binary_search(
     while low < high {
         let mid = low + (high - low) / 2;
         let mid_key = ctx.get_array_element(data, mid * 2);
-        let cmp = tree_compare(ctx, comparator, mid_key, *key)?;
-        if cmp < 0 {
+        // Match TreeMap.put/get semantics: compare the searched key with the
+        // current node key. Non-antisymmetric comparators rely on this
+        // orientation, including Liquibase's pipeline-order tie comparator.
+        let cmp = tree_compare(ctx, comparator, *key, mid_key)?;
+        if cmp > 0 {
             low = mid + 1;
-        } else if cmp > 0 {
+        } else if cmp < 0 {
             high = mid;
         } else {
             return Ok(Ok(mid));
@@ -24972,10 +24975,12 @@ fn ts_binary_search(
     while low < high {
         let mid = low + (high - low) / 2;
         let mid_elem = ctx.get_array_element(data, mid);
-        let cmp = tree_compare(ctx, comparator, mid_elem, *key)?;
-        if cmp < 0 {
+        // Keep TreeSet aligned with TreeMap's backing-key behavior:
+        // compare(new_element, existing_element), not the reverse.
+        let cmp = tree_compare(ctx, comparator, *key, mid_elem)?;
+        if cmp > 0 {
             low = mid + 1;
-        } else if cmp > 0 {
+        } else if cmp < 0 {
             high = mid;
         } else {
             return Ok(Ok(mid));
