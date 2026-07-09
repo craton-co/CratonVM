@@ -126,12 +126,6 @@ pub(crate) fn register_collections_extras_natives(r: &mut NativeMethodRegistry) 
     );
     r.register(
         cu,
-        "enumeration",
-        "(Ljava/util/Collection;)Ljava/util/Enumeration;",
-        native_collections_enumeration,
-    );
-    r.register(
-        cu,
         "list",
         "(Ljava/util/Enumeration;)Ljava/util/ArrayList;",
         native_return_first_arg,
@@ -333,18 +327,6 @@ fn native_collections_singleton_map(
     ctx.set_array_element(buckets, idx, Value::Object(Some(node)));
     ctx.set_field(map, 1, Value::Int(1));
     Ok(Some(Value::Object(Some(map))))
-}
-
-fn native_collections_enumeration(
-    ctx: &mut dyn NativeContext,
-    _args: &[Value],
-) -> MethodCallResult {
-    // Return empty iterator as enumeration stub
-    let itr = alloc_concurrent_synthetic(ctx, "java/util/Collections$EmptyEnumeration", 2);
-    let arr = ctx.new_array(cratonvm_types::ArrayElementType::Reference, 0);
-    ctx.set_field(itr, 0, Value::Object(Some(arr)));
-    ctx.set_field(itr, 1, Value::Int(0));
-    Ok(Some(Value::Object(Some(itr))))
 }
 
 fn native_collections_frequency(ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
