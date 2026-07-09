@@ -11,7 +11,7 @@ use std::sync::Arc;
 
 use cratonvm_native_api::{NativeContext, NativeMethodRegistry};
 use cratonvm_types::error::{MethodCallFailed, MethodCallResult, RuntimeError};
-use cratonvm_types::{ClassId, ObjectKind, ObjectRef, Value};
+use cratonvm_types::{ArrayElementType, ClassId, ObjectKind, ObjectRef, Value};
 
 use crate::lang_class::{box_value, mirror_class_id, mirror_class_name};
 use crate::{alloc_concurrent_synthetic, obj_arg};
@@ -1239,6 +1239,34 @@ fn byte_view_width(elem: u8) -> usize {
     }
 }
 
+fn byte_view_desc(elem: u8) -> &'static str {
+    match elem {
+        b'J' => DESC_LONG,
+        b'D' => DESC_DOUBLE,
+        b'I' => DESC_INT,
+        b'F' => DESC_FLOAT,
+        b'S' => DESC_SHORT,
+        b'C' => DESC_CHAR,
+        b'B' => DESC_BYTE,
+        b'Z' => DESC_BOOLEAN,
+        _ => DESC_BYTE,
+    }
+}
+
+fn array_element_desc(ctx: &dyn NativeContext, arr: ObjectRef) -> &'static str {
+    match ctx.heap_element_type_of(arr) {
+        ArrayElementType::Boolean => DESC_BOOLEAN,
+        ArrayElementType::Byte => DESC_BYTE,
+        ArrayElementType::Char => DESC_CHAR,
+        ArrayElementType::Short => DESC_SHORT,
+        ArrayElementType::Int => DESC_INT,
+        ArrayElementType::Long => DESC_LONG,
+        ArrayElementType::Float => DESC_FLOAT,
+        ArrayElementType::Double => DESC_DOUBLE,
+        ArrayElementType::Reference => DESC_REF,
+    }
+}
+
 /// Read `width` bytes of a `byte[]` at BYTE index `idx`, assembled per
 /// endianness, and box them as the view element type. This is the correct
 /// `byteArrayViewVarHandle` get — distinct from an array-element access (which
@@ -1528,6 +1556,20 @@ fn seg_decode_value(shape: SegShape, raw: u64) -> Value {
     }
 }
 
+fn seg_shape_desc(shape: SegShape) -> &'static str {
+    match shape {
+        SegShape::Byte => "B",
+        SegShape::Boolean => "Z",
+        SegShape::Short => "S",
+        SegShape::Char => "C",
+        SegShape::Int => "I",
+        SegShape::Long => "J",
+        SegShape::Float => "F",
+        SegShape::Double => "D",
+        SegShape::Address => "J",
+    }
+}
+
 fn seg_encode_value(value: &Value, width: i64) -> u64 {
     let raw: u64 = match value {
         Value::Long(v) => *v as u64,
@@ -1783,11 +1825,12 @@ fn segment_vh_get(
             })?,
         };
         let raw = if be { seg_swap_bytes(raw, width) } else { raw };
-        Ok(Some(seg_decode_value(shape, raw)))
+        Ok(Some(box_value(ctx, seg_decode_value(shape, raw), seg_shape_desc(shape))))
     })())
 }
 
-/// `SegmentVarHandle.set(segment, offset, value)` — see `segment_vh_get`.
+/// `SegmentVarHandle.set(segment, offset, value)` or path-bound
+/// `SegmentVarHandle.set(segment, value)` - see `segment_vh_get`.
 fn segment_vh_set(
     ctx: &mut dyn NativeContext,
     this: ObjectRef,
@@ -1798,12 +1841,19 @@ fn segment_vh_set(
         Some(Value::Object(Some(s))) => *s,
         _ => return Some(Ok(None)),
     };
-    let coord_offset = match args.get(2) {
-        Some(Value::Long(n)) => *n,
-        Some(Value::Int(n)) => *n as i64,
-        _ => 0,
+    let (coord_offset, value_index) = if args.len() >= 4 {
+        (
+            match args.get(2) {
+                Some(Value::Long(n)) => *n,
+                Some(Value::Int(n)) => *n as i64,
+                _ => 0,
+            },
+            3,
+        )
+    } else {
+        (0, 2)
     };
-    let value = args.get(3).cloned().unwrap_or(Value::Int(0));
+    let value = args.get(value_index).cloned().unwrap_or(Value::Int(0));
     let shape = segment_layout_shape(ctx, enclosing);
     let width = seg_shape_width(shape);
     Some((|| -> MethodCallResult {
@@ -1873,7 +1923,8 @@ fn varhandle_get(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResul
             Some(Value::Int(i)) => *i as usize,
             _ => 0,
         };
-        return Ok(Some(byte_view_get(ctx, arr, idx, elem, le)));
+        let value = byte_view_get(ctx, arr, idx, elem, le);
+        return Ok(Some(box_value(ctx, value, byte_view_desc(elem))));
     }
     if let Some((elem, le)) = byte_buffer_view_kind(meta.as_deref()) {
         let bb = match args.get(1) {
@@ -1884,9 +1935,8 @@ fn varhandle_get(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResul
             Some(Value::Int(i)) if *i >= 0 => *i as usize,
             _ => 0,
         };
-        return Ok(Some(
-            byte_buffer_view_get(ctx, bb, idx, elem, le).unwrap_or(Value::Object(None)),
-        ));
+        let value = byte_buffer_view_get(ctx, bb, idx, elem, le).unwrap_or(Value::Object(None));
+        return Ok(Some(box_value(ctx, value, byte_view_desc(elem))));
     }
     // C38: Array-element VarHandle call — detected by args[1] being an array
     // and args[2] being an Int. Handles real-JDK VarHandleLongs$Array and the
@@ -1896,7 +1946,9 @@ fn varhandle_get(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResul
     // signature-polymorphic call-site descriptor steers it to the right
     // primitive return slot.
     if let Some((arr, idx)) = vh_array_call(ctx, args) {
-        return Ok(Some(ctx.get_array_element(arr, idx)));
+        let desc = array_element_desc(ctx, arr);
+        let value = ctx.get_array_element(arr, idx);
+        return Ok(Some(box_value(ctx, value, desc)));
     }
     let (kind, field_idx) = match meta.as_deref() {
         Some(m) => (m.kind, m.field_index),

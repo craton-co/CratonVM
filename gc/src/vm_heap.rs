@@ -1371,9 +1371,7 @@ impl VmHeap {
             // `GenerationalHeap::is_live_young_survivor` for the soundness
             // argument (STW-window-only, zeroed-span discriminator,
             // moving-collection compatibility).
-            VmHeap::Generational(h) => {
-                h.is_old_gen_addr(addr) || h.is_live_young_survivor(addr)
-            }
+            VmHeap::Generational(h) => h.is_old_gen_addr(addr) || h.is_live_young_survivor(addr),
             VmHeap::G1(h) => h.is_addr_in_live_region(addr),
         }
     }

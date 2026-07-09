@@ -272,11 +272,95 @@ pub(crate) fn register_pe_panama(registry: &mut NativeMethodRegistry) {
 // --- ValueLayout: type descriptors for native memory ---
 // ValueLayout synthetic: [0]=kind (Int), [1]=byteSize (Int)
 
+const PE_VALUE_LAYOUT_NAME_SLOT: usize = 2;
+const PE_P67_LAYOUT_NAME_SLOT: usize = 3;
+
 fn pe_make_layout(ctx: &mut dyn NativeContext, kind: i32) -> ObjectRef {
-    let layout = alloc_concurrent_synthetic(ctx, "java/lang/foreign/ValueLayout", 2);
+    let layout = alloc_concurrent_synthetic(ctx, "java/lang/foreign/ValueLayout", 3);
     ctx.set_field(layout, 0, Value::Int(kind));
     ctx.set_field(layout, 1, Value::Int(ffi::layout_byte_size(kind) as i32));
+    ctx.set_field(layout, PE_VALUE_LAYOUT_NAME_SLOT, Value::Object(None));
     layout
+}
+
+fn pe_optional(ctx: &mut dyn NativeContext, value: Value) -> ObjectRef {
+    let pinned = match value {
+        Value::Object(Some(obj)) => Some((ctx.pin_native_root(obj), obj)),
+        _ => None,
+    };
+    let opt = alloc_concurrent_synthetic(ctx, "java/util/Optional", 1);
+    let value = match pinned {
+        Some((pin, obj)) => {
+            let obj = ctx.read_native_pin(pin, obj);
+            ctx.unpin_native_roots(pin);
+            Value::Object(Some(obj))
+        }
+        None => Value::Object(None),
+    };
+    ctx.set_field(opt, 0, value);
+    opt
+}
+
+fn pe_layout_name_value(ctx: &dyn NativeContext, layout: ObjectRef) -> Value {
+    match ctx.get_field(layout, 0) {
+        Value::Long(_) => {
+            if ctx.object_num_fields(layout) > PE_P67_LAYOUT_NAME_SLOT {
+                ctx.get_field(layout, PE_P67_LAYOUT_NAME_SLOT)
+            } else {
+                Value::Object(None)
+            }
+        }
+        _ => {
+            if ctx.object_num_fields(layout) > PE_VALUE_LAYOUT_NAME_SLOT {
+                ctx.get_field(layout, PE_VALUE_LAYOUT_NAME_SLOT)
+            } else {
+                Value::Object(None)
+            }
+        }
+    }
+}
+
+fn pe_layout_name(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = obj_arg(args, 0)?;
+    let name = pe_layout_name_value(ctx, this);
+    Ok(Some(Value::Object(Some(pe_optional(ctx, name)))))
+}
+
+fn pe_layout_with_name(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = obj_arg(args, 0)?;
+    let name = args.get(1).copied().unwrap_or(Value::Object(None));
+    let class_name = ctx
+        .class_name_of_id(ctx.class_id_of_object(this))
+        .unwrap_or_else(|| "java/lang/foreign/MemoryLayout".to_string());
+    let field_count = ctx.object_num_fields(this);
+    let name_slot = match ctx.get_field(this, 0) {
+        Value::Long(_) => PE_P67_LAYOUT_NAME_SLOT,
+        _ => PE_VALUE_LAYOUT_NAME_SLOT,
+    };
+    let clone_fields = std::cmp::max(field_count, name_slot + 1);
+    let this_pin = ctx.pin_native_root(this);
+    let name_pin = match name {
+        Value::Object(Some(obj)) => Some((ctx.pin_native_root(obj), obj)),
+        _ => None,
+    };
+
+    let cloned = alloc_concurrent_synthetic(ctx, &class_name, clone_fields);
+    let this = ctx.read_native_pin(this_pin, this);
+    for i in 0..field_count {
+        let value = ctx.get_field(this, i);
+        ctx.set_field(cloned, i, value);
+    }
+    let name = match name_pin {
+        Some((pin, obj)) => {
+            let obj = ctx.read_native_pin(pin, obj);
+            ctx.unpin_native_roots(pin);
+            Value::Object(Some(obj))
+        }
+        None => Value::Object(None),
+    };
+    ctx.set_field(cloned, name_slot, name);
+    ctx.unpin_native_roots(this_pin);
+    Ok(Some(Value::Object(Some(cloned))))
 }
 
 fn register_pe_value_layout(r: &mut NativeMethodRegistry) {
@@ -369,9 +453,19 @@ fn register_pe_value_layout(r: &mut NativeMethodRegistry) {
         };
         Ok(Some(Value::Long(size))) // alignment = size for primitive layouts
     });
-    r.register(vl, "name", "()Ljava/util/Optional;", |_ctx, _args| {
-        Ok(Some(Value::Object(None))) // empty Optional
-    });
+    r.register(vl, "name", "()Ljava/util/Optional;", pe_layout_name);
+    r.register(
+        vl,
+        "withName",
+        "(Ljava/lang/String;)Ljava/lang/foreign/ValueLayout;",
+        pe_layout_with_name,
+    );
+    r.register(
+        vl,
+        "withName",
+        "(Ljava/lang/String;)Ljava/lang/foreign/MemoryLayout;",
+        pe_layout_with_name,
+    );
 }
 
 // --- Arena: lifecycle-scoped memory management ---
@@ -2564,27 +2658,74 @@ fn register_pe2_struct_layouts(r: &mut NativeMethodRegistry) {
     );
 
     // Common methods on all layouts
+    fn layout_members_as_list(ctx: &mut dyn NativeContext, members_arr: ObjectRef) -> ObjectRef {
+        let len = ctx.array_length(members_arr);
+        let arr_pin = ctx.pin_native_root(members_arr);
+        let data_slot = ctx
+            .resolve_field_index("java/util/ArrayList", "elementData")
+            .unwrap_or(0);
+        let size_slot = ctx
+            .resolve_field_index("java/util/ArrayList", "size")
+            .unwrap_or(1);
+        let n_fields = std::cmp::max(data_slot, size_slot) + 1;
+        let list = alloc_concurrent_synthetic(ctx, "java/util/ArrayList", n_fields);
+        let members_arr = ctx.read_native_pin(arr_pin, members_arr);
+        ctx.set_field(list, data_slot, Value::Object(Some(members_arr)));
+        ctx.set_field(list, size_slot, Value::Int(len as i32));
+        ctx.unpin_native_roots(arr_pin);
+        list
+    }
+
     let sl = "java/lang/foreign/StructLayout";
-    r.register(sl, "byteSize", "()J", |ctx, args| {
-        let this = obj_arg(args, 0)?;
-        let size = match ctx.get_field(this, 1) {
-            Value::Long(n) => n,
-            _ => 0,
-        };
-        Ok(Some(Value::Long(size)))
-    });
-    r.register(sl, "byteAlignment", "()J", |ctx, args| {
-        let this = obj_arg(args, 0)?;
-        let align = match ctx.get_field(this, 5) {
-            Value::Long(n) => n,
-            _ => 1,
-        };
-        Ok(Some(Value::Long(align)))
-    });
-    r.register(sl, "memberLayouts", "()Ljava/util/List;", |ctx, args| {
-        let this = obj_arg(args, 0)?;
-        Ok(Some(ctx.get_field(this, 2)))
-    });
+    for layout_class in [sl, "java/lang/foreign/GroupLayout"] {
+        r.register(layout_class, "byteSize", "()J", |ctx, args| {
+            let this = obj_arg(args, 0)?;
+            let size = match ctx.get_field(this, 1) {
+                Value::Long(n) => n,
+                _ => 0,
+            };
+            Ok(Some(Value::Long(size)))
+        });
+        r.register(layout_class, "byteAlignment", "()J", |ctx, args| {
+            let this = obj_arg(args, 0)?;
+            let align = match ctx.get_field(this, 5) {
+                Value::Long(n) => n,
+                _ => 1,
+            };
+            Ok(Some(Value::Long(align)))
+        });
+        r.register(
+            layout_class,
+            "name",
+            "()Ljava/util/Optional;",
+            pe_layout_name,
+        );
+        r.register(
+            layout_class,
+            "withName",
+            "(Ljava/lang/String;)Ljava/lang/foreign/MemoryLayout;",
+            pe_layout_with_name,
+        );
+        r.register(
+            layout_class,
+            "memberLayouts",
+            "()Ljava/util/List;",
+            |ctx, args| {
+                let this = obj_arg(args, 0)?;
+                match ctx.get_field(this, 2) {
+                    Value::Object(Some(members_arr)) => Ok(Some(Value::Object(Some(
+                        layout_members_as_list(ctx, members_arr),
+                    )))),
+                    _ => {
+                        let empty = ctx.new_array(cratonvm_types::ArrayElementType::Reference, 0);
+                        Ok(Some(Value::Object(Some(layout_members_as_list(
+                            ctx, empty,
+                        )))))
+                    }
+                }
+            },
+        );
+    }
 
     // byteOffset(PathElement...) — compute offset to a named field
     r.register(
@@ -2632,11 +2773,9 @@ fn register_pe2_struct_layouts(r: &mut NativeMethodRegistry) {
         ml,
         "withName",
         "(Ljava/lang/String;)Ljava/lang/foreign/MemoryLayout;",
-        |_ctx, args| {
-            // For simplicity, return the same layout (names are tracked separately in struct)
-            Ok(Some(args.first().copied().unwrap_or(Value::Object(None))))
-        },
+        pe_layout_with_name,
     );
+    r.register(ml, "name", "()Ljava/util/Optional;", pe_layout_name);
 
     // MemoryLayout.byteSize() fallback for any layout
     r.register(ml, "byteSize", "()J", |ctx, args| {
@@ -2722,7 +2861,7 @@ fn pe_struct_layout(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRe
 
             offset = ffi::align_up(offset, member_align);
             ctx.set_array_element(offsets_arr, i, Value::Long(offset as i64));
-            ctx.set_array_element(names_arr, i, Value::Object(None)); // no name by default
+            ctx.set_array_element(names_arr, i, pe_layout_name_value(ctx, m));
             offset += member_size;
             if member_align > max_align {
                 max_align = member_align;
@@ -4160,6 +4299,43 @@ mod tests {
             _ => 0,
         };
         assert_eq!(alignment, 8);
+    }
+
+    #[test]
+    fn panama_struct_layout_preserves_named_members() {
+        let mut ctx = mock_ctx();
+        let address = make_layout(&mut ctx, LAYOUT_ADDRESS);
+        let name = ctx.create_string("ptr");
+        let named = pe_layout_with_name(
+            &mut ctx,
+            &[Value::Object(Some(address)), Value::Object(Some(name))],
+        )
+        .unwrap()
+        .and_then(|v| match v {
+            Value::Object(Some(obj)) => Some(obj),
+            _ => None,
+        })
+        .expect("withName must return a layout object");
+
+        let members = ctx.new_array(cratonvm_types::ArrayElementType::Reference, 1);
+        ctx.set_array_element(members, 0, Value::Object(Some(named)));
+        let layout = pe_struct_layout(&mut ctx, &[Value::Object(Some(members))])
+            .unwrap()
+            .and_then(|v| match v {
+                Value::Object(Some(obj)) => Some(obj),
+                _ => None,
+            })
+            .expect("structLayout must return a layout object");
+
+        let names_arr = match ctx.get_field(layout, 3) {
+            Value::Object(Some(arr)) => arr,
+            other => panic!("expected names array, got {other:?}"),
+        };
+        let stored_name = match ctx.get_array_element(names_arr, 0) {
+            Value::Object(Some(obj)) => obj,
+            other => panic!("expected stored member name, got {other:?}"),
+        };
+        assert_eq!(ctx.read_string(stored_name).as_deref(), Some("ptr"));
     }
 
     #[test]

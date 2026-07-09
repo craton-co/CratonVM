@@ -4403,12 +4403,11 @@ fn lk_ensure_initialized(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
             .into());
         }
     };
-    let class_id =
-        crate::lang_class::mirror_class_id(ctx, target_class).ok_or_else(|| {
-            cratonvm_types::error::RuntimeError::IllegalArgumentException {
-                message: "Lookup.ensureInitialized target is not a Class mirror".to_string(),
-            }
-        })?;
+    let class_id = crate::lang_class::mirror_class_id(ctx, target_class).ok_or_else(|| {
+        cratonvm_types::error::RuntimeError::IllegalArgumentException {
+            message: "Lookup.ensureInitialized target is not a Class mirror".to_string(),
+        }
+    })?;
     ctx.initialize_class(class_id).map_err(|message| {
         cratonvm_types::error::MethodCallFailed::InternalError(
             cratonvm_types::error::VmError::Internal {

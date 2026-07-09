@@ -864,11 +864,8 @@ mod tests {
         let this = alloc_queue(&mut ctx);
         reset_slot(this);
 
-        let result = sq_offer_callback()(
-            &mut ctx,
-            &[Value::Object(Some(this)), Value::Int(77)],
-        )
-        .unwrap();
+        let result =
+            sq_offer_callback()(&mut ctx, &[Value::Object(Some(this)), Value::Int(77)]).unwrap();
 
         assert_eq!(result, Some(Value::Int(0)));
         let slot = get_or_create_slot(this);
@@ -885,11 +882,8 @@ mod tests {
         let slot = get_or_create_slot(this);
         slot.state.lock().waiting_takers = 1;
 
-        let result = sq_offer_callback()(
-            &mut ctx,
-            &[Value::Object(Some(this)), Value::Int(77)],
-        )
-        .unwrap();
+        let result =
+            sq_offer_callback()(&mut ctx, &[Value::Object(Some(this)), Value::Int(77)]).unwrap();
 
         assert_eq!(result, Some(Value::Int(1)));
         let mut state = slot.state.lock();

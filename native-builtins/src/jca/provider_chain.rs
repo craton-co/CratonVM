@@ -194,7 +194,8 @@ fn remove(name: &str) {
 /// the real object here is what lets `build_jca_instance` reach that map.
 fn real_provider_table() -> &'static parking_lot::Mutex<rustc_hash::FxHashMap<String, usize>> {
     use std::sync::OnceLock;
-    static MAP: OnceLock<parking_lot::Mutex<rustc_hash::FxHashMap<String, usize>>> = OnceLock::new();
+    static MAP: OnceLock<parking_lot::Mutex<rustc_hash::FxHashMap<String, usize>>> =
+        OnceLock::new();
     MAP.get_or_init(|| parking_lot::Mutex::new(rustc_hash::FxHashMap::default()))
 }
 
@@ -206,7 +207,9 @@ fn remember_real_provider(ctx: &mut dyn NativeContext, name: &str, prov: ObjectR
     if handle == 0 {
         return;
     }
-    let old = real_provider_table().lock().insert(name.to_string(), handle);
+    let old = real_provider_table()
+        .lock()
+        .insert(name.to_string(), handle);
     if let Some(old_handle) = old {
         ctx.remove_global_root(old_handle);
     }
@@ -661,12 +664,7 @@ fn empty_collection_value(
     })?;
     let obj = ctx.alloc_object(cid, ctx.class_num_total_fields(cid).max(4));
     let obj_pin = ctx.pin_native_root(obj);
-    ctx.invoke(
-        fallback_class,
-        "<init>",
-        "()V",
-        &[Value::Object(Some(obj))],
-    )?;
+    ctx.invoke(fallback_class, "<init>", "()V", &[Value::Object(Some(obj))])?;
     let obj = ctx.read_native_pin(obj_pin, obj);
     ctx.unpin_native_roots(obj_pin);
     Ok(Value::Object(Some(obj)))
@@ -725,12 +723,8 @@ fn provider_service_init(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
     let this_now = ctx.read_native_pin(this_pin, this);
     ctx.set_field_by_name(this_now, "aliases", aliases);
     if matches!(attributes, Value::Object(None)) {
-        attributes = empty_collection_value(
-            ctx,
-            "emptyMap",
-            "()Ljava/util/Map;",
-            "java/util/HashMap",
-        )?;
+        attributes =
+            empty_collection_value(ctx, "emptyMap", "()Ljava/util/Map;", "java/util/HashMap")?;
     }
     let this_now = ctx.read_native_pin(this_pin, this);
     ctx.set_field_by_name(this_now, "attributes", attributes);
@@ -1424,9 +1418,7 @@ fn provider_put_native(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCal
         .lock()
         .insert((provider_name.clone(), key.clone()), value.clone());
     let ihash = ctx.identity_hash_code(this) as i64;
-    provider_instance_keys()
-        .lock()
-        .insert((ihash, key.clone()));
+    provider_instance_keys().lock().insert((ihash, key.clone()));
     apply_legacy_put(&provider_name, &key, &value);
     // Hashtable.put contract: return previous value (null on first put).
     Ok(Some(Value::Object(None)))
@@ -1964,8 +1956,8 @@ fn build_jca_instance(
             _ => {
                 return Err(cratonvm_types::error::RuntimeError::NotImplemented {
                     feature: format!(
-                        "{type_str} {algo} implementation for provider {provider} returned no object"
-                    ),
+                    "{type_str} {algo} implementation for provider {provider} returned no object"
+                ),
                 }
                 .into())
             }

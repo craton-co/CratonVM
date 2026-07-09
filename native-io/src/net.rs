@@ -1858,7 +1858,9 @@ pub fn register_sun_nio_ch_net(r: &mut NativeMethodRegistry) {
             Ok(Some(Value::Int(0)))
         });
         r.register(lso, "setIpDontFragment0", "(IZZ)V", |_c, _a| Ok(None));
-        r.register(lso, "getQuickAck0", "(I)Z", |_c, _a| Ok(Some(Value::Int(0))));
+        r.register(lso, "getQuickAck0", "(I)Z", |_c, _a| {
+            Ok(Some(Value::Int(0)))
+        });
         r.register(lso, "setQuickAck0", "(IZ)V", |_c, _a| Ok(None));
         r.register(lso, "getSoPeerCred0", "(I)J", |_c, _a| {
             Ok(Some(Value::Long(-1)))

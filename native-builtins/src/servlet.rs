@@ -57,7 +57,6 @@ fn resolve_class_resource_name(
     name.to_string()
 }
 
-
 fn byte_array_to_vec(ctx: &dyn NativeContext, arr: ObjectRef) -> Vec<u8> {
     let len = ctx.array_length(arr);
     let mut bytes = Vec::with_capacity(len);
@@ -92,10 +91,13 @@ fn spring_mock_response_get_content_as_string(
     args: &[Value],
 ) -> MethodCallResult {
     let this = obj_arg(args, 0)?;
-    let charset = match ctx.invoke_virtual(this, "getCharacterEncoding", "()Ljava/lang/String;", &[]) {
-        Ok(Some(Value::Object(Some(s)))) => ctx.read_string(s).unwrap_or_else(|| "UTF-8".to_string()),
-        _ => "UTF-8".to_string(),
-    };
+    let charset =
+        match ctx.invoke_virtual(this, "getCharacterEncoding", "()Ljava/lang/String;", &[]) {
+            Ok(Some(Value::Object(Some(s)))) => {
+                ctx.read_string(s).unwrap_or_else(|| "UTF-8".to_string())
+            }
+            _ => "UTF-8".to_string(),
+        };
     let bytes = spring_mock_response_content_bytes(ctx, this)?;
     let text = crate::charset::decode_str_named(&charset, &bytes);
     Ok(Some(Value::Object(Some(ctx.create_string(&text)))))
@@ -107,15 +109,15 @@ fn spring_mock_response_get_content_as_string_charset(
 ) -> MethodCallResult {
     let this = obj_arg(args, 0)?;
     let charset = match args.get(1) {
-        Some(Value::Object(Some(cs))) => charset_name_from_object(ctx, *cs).unwrap_or_else(|| "UTF-8".to_string()),
+        Some(Value::Object(Some(cs))) => {
+            charset_name_from_object(ctx, *cs).unwrap_or_else(|| "UTF-8".to_string())
+        }
         _ => "UTF-8".to_string(),
     };
     let bytes = spring_mock_response_content_bytes(ctx, this)?;
     let text = crate::charset::decode_str_named(&charset, &bytes);
     Ok(Some(Value::Object(Some(ctx.create_string(&text)))))
 }
-
-
 
 fn jython_py_bool(ctx: &mut dyn NativeContext, value: bool) -> MethodCallResult {
     if let Some(py_cid) = ctx.class_id_by_name("org/python/core/Py") {
@@ -132,7 +134,6 @@ fn jython_py_bool(ctx: &mut dyn NativeContext, value: bool) -> MethodCallResult 
         &[Value::Int(if value { 1 } else { 0 })],
     )
 }
-
 
 fn jython_py_none(ctx: &mut dyn NativeContext) -> Value {
     if let Some(py_cid) = ctx.class_id_by_name("org/python/core/Py") {
@@ -170,7 +171,8 @@ fn jython_pystringmap_put_all(
         return false;
     }
     if !matches!(
-        ctx.class_name_of_id(ctx.class_id_of_object(source)).as_deref(),
+        ctx.class_name_of_id(ctx.class_id_of_object(source))
+            .as_deref(),
         Some("org/python/core/PyStringMap" | "org/python/core/PyDictionary")
     ) {
         return false;
@@ -190,7 +192,6 @@ fn jython_pystringmap_put_all(
     .is_ok()
 }
 
-
 fn jython_new_pystringmap(ctx: &mut dyn NativeContext) -> Result<ObjectRef, MethodCallFailed> {
     match ctx.new_object_initialized("org/python/core/PyStringMap", "()V", &[])? {
         Some(Value::Object(Some(obj))) => Ok(obj),
@@ -201,7 +202,10 @@ fn jython_new_pystringmap(ctx: &mut dyn NativeContext) -> Result<ObjectRef, Meth
     }
 }
 
-fn jython_new_pyinteger(ctx: &mut dyn NativeContext, value: i32) -> Result<ObjectRef, MethodCallFailed> {
+fn jython_new_pyinteger(
+    ctx: &mut dyn NativeContext,
+    value: i32,
+) -> Result<ObjectRef, MethodCallFailed> {
     match ctx.new_object_initialized("org/python/core/PyInteger", "(I)V", &[Value::Int(value)])? {
         Some(Value::Object(Some(obj))) => Ok(obj),
         _ => Err(RuntimeError::IllegalStateException {
@@ -319,7 +323,10 @@ fn jython_pymodule_package_lookup(
     let full_name = format!("{module_name}.{attr}");
     let package_manager = ctx
         .class_id_by_name("org/python/core/PySystemState")
-        .and_then(|cid| ctx.static_field_index_by_name(cid, "packageManager").map(|idx| (cid, idx)))
+        .and_then(|cid| {
+            ctx.static_field_index_by_name(cid, "packageManager")
+                .map(|idx| (cid, idx))
+        })
         .and_then(|(cid, idx)| match ctx.get_static_field(cid, idx) {
             Value::Object(Some(obj)) => Some(obj),
             _ => None,
@@ -497,7 +504,6 @@ fn jython_pyobject_invoke_one(ctx: &mut dyn NativeContext, args: &[Value]) -> Me
     )
 }
 
-
 fn jython_sre_const_value(attr: &str) -> Option<i32> {
     match attr {
         "MAGIC" => Some(20031017),
@@ -550,14 +556,20 @@ fn jython_pyobject_isnot(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
     jython_py_bool(ctx, lhs.as_ptr() != rhs.as_ptr())
 }
 
-fn jython_py_string_value(ctx: &mut dyn NativeContext, obj: cratonvm_types::ObjectRef) -> Option<String> {
+fn jython_py_string_value(
+    ctx: &mut dyn NativeContext,
+    obj: cratonvm_types::ObjectRef,
+) -> Option<String> {
     match ctx.get_field_by_name(obj, "string") {
         Value::Object(Some(s)) => ctx.read_string(s),
         _ => None,
     }
 }
 
-fn jython_py_integer_value(ctx: &mut dyn NativeContext, obj: cratonvm_types::ObjectRef) -> Option<i64> {
+fn jython_py_integer_value(
+    ctx: &mut dyn NativeContext,
+    obj: cratonvm_types::ObjectRef,
+) -> Option<i64> {
     let class_name = ctx.class_name_of_id(ctx.class_id_of_object(obj))?;
     if class_name != "org/python/core/PyInteger"
         && class_name != "org/python/core/PyIntegerDerived"
@@ -637,8 +649,6 @@ pub(crate) fn register_jython_pyobject_natives(r: &mut NativeMethodRegistry) {
         jython_pyobject_ne,
     );
 }
-
-
 
 fn jython_find_module_getattr(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let receiver = obj_arg(args, 0)?;
@@ -720,7 +730,10 @@ pub(crate) fn register_jython_imp_natives(r: &mut NativeMethodRegistry) {
 fn jython_current_thread_system_state(ctx: &mut dyn NativeContext) -> Option<ObjectRef> {
     let mapping = ctx
         .class_id_by_name("org/python/core/Py")
-        .and_then(|py_cid| ctx.static_field_index_by_name(py_cid, "threadStateMapping").map(|idx| (py_cid, idx)))
+        .and_then(|py_cid| {
+            ctx.static_field_index_by_name(py_cid, "threadStateMapping")
+                .map(|idx| (py_cid, idx))
+        })
         .and_then(|(py_cid, idx)| match ctx.get_static_field(py_cid, idx) {
             Value::Object(Some(mapping)) => Some(mapping),
             _ => None,
@@ -754,10 +767,11 @@ fn jython_py_get_or_create_system_state(ctx: &mut dyn NativeContext) -> MethodCa
             if let Value::Object(Some(obj)) = ctx.get_static_field(py_cid, idx) {
                 return Ok(Some(Value::Object(Some(obj))));
             }
-            let state = match ctx.new_object_initialized("org/python/core/PySystemState", "()V", &[])? {
-                Some(Value::Object(Some(obj))) => obj,
-                _ => return Ok(Some(Value::Object(None))),
-            };
+            let state =
+                match ctx.new_object_initialized("org/python/core/PySystemState", "()V", &[])? {
+                    Some(Value::Object(Some(obj))) => obj,
+                    _ => return Ok(Some(Value::Object(None))),
+                };
             ctx.set_static_field(py_cid, idx, Value::Object(Some(state)));
             return Ok(Some(Value::Object(Some(state))));
         }
@@ -798,7 +812,9 @@ fn jython_py_get_thread_state(ctx: &mut dyn NativeContext, args: &[Value]) -> Me
     }
 
     let sys_state = match requested_state {
-        Value::Object(None) => jython_py_get_or_create_system_state(ctx)?.unwrap_or(Value::Object(None)),
+        Value::Object(None) => {
+            jython_py_get_or_create_system_state(ctx)?.unwrap_or(Value::Object(None))
+        }
         v => v,
     };
     ctx.new_object_initialized(
@@ -808,11 +824,17 @@ fn jython_py_get_thread_state(ctx: &mut dyn NativeContext, args: &[Value]) -> Me
     )
 }
 
-fn jython_py_get_thread_state_noarg(ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
+fn jython_py_get_thread_state_noarg(
+    ctx: &mut dyn NativeContext,
+    _args: &[Value],
+) -> MethodCallResult {
     jython_py_get_thread_state(ctx, &[Value::Object(None)])
 }
 
-fn jython_py_import_site_if_selected(ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
+fn jython_py_import_site_if_selected(
+    ctx: &mut dyn NativeContext,
+    _args: &[Value],
+) -> MethodCallResult {
     if let Some(options_cid) = ctx.class_id_by_name("org/python/core/Options") {
         if let Some(idx) = ctx.static_field_index_by_name(options_cid, "importSite") {
             ctx.set_static_field(options_cid, idx, Value::Int(0));
@@ -878,7 +900,6 @@ pub(crate) fn register_spring_mock_response_natives(r: &mut NativeMethodRegistry
     }
 }
 
-
 fn native_bool(value: Option<Value>) -> bool {
     matches!(value, Some(Value::Int(v)) if v != 0)
 }
@@ -929,12 +950,7 @@ fn java_list_size(ctx: &mut dyn NativeContext, list: ObjectRef) -> Option<i32> {
 
 fn java_list_get(ctx: &mut dyn NativeContext, list: ObjectRef, index: i32) -> Option<ObjectRef> {
     match ctx
-        .invoke_virtual(
-            list,
-            "get",
-            "(I)Ljava/lang/Object;",
-            &[Value::Int(index)],
-        )
+        .invoke_virtual(list, "get", "(I)Ljava/lang/Object;", &[Value::Int(index)])
         .ok()
         .flatten()
     {
@@ -1018,15 +1034,11 @@ fn script_engine_manager_get_engine(
         }
     }
 
-    let factories = match ctx.invoke_virtual(
-        manager,
-        "getEngineFactories",
-        "()Ljava/util/List;",
-        &[],
-    )? {
-        Some(Value::Object(Some(factories))) => factories,
-        _ => return Ok(Some(Value::Object(None))),
-    };
+    let factories =
+        match ctx.invoke_virtual(manager, "getEngineFactories", "()Ljava/util/List;", &[])? {
+            Some(Value::Object(Some(factories))) => factories,
+            _ => return Ok(Some(Value::Object(None))),
+        };
     let Some(size) = java_list_size(ctx, factories) else {
         return Ok(Some(Value::Object(None)));
     };

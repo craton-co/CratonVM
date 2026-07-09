@@ -4574,14 +4574,11 @@ pub fn register_io_natives(registry: &mut NativeMethodRegistry) {
         #[cfg(unix)]
         pub const SIZEOF_FAMILY: i32 = std::mem::size_of::<libc::sa_family_t>() as i32;
         #[cfg(unix)]
-        pub const OFFSET_FAMILY: i32 =
-            std::mem::offset_of!(libc::sockaddr_in, sin_family) as i32;
+        pub const OFFSET_FAMILY: i32 = std::mem::offset_of!(libc::sockaddr_in, sin_family) as i32;
         #[cfg(unix)]
-        pub const OFFSET_SIN4_PORT: i32 =
-            std::mem::offset_of!(libc::sockaddr_in, sin_port) as i32;
+        pub const OFFSET_SIN4_PORT: i32 = std::mem::offset_of!(libc::sockaddr_in, sin_port) as i32;
         #[cfg(unix)]
-        pub const OFFSET_SIN4_ADDR: i32 =
-            std::mem::offset_of!(libc::sockaddr_in, sin_addr) as i32;
+        pub const OFFSET_SIN4_ADDR: i32 = std::mem::offset_of!(libc::sockaddr_in, sin_addr) as i32;
         #[cfg(unix)]
         pub const OFFSET_SIN6_PORT: i32 =
             std::mem::offset_of!(libc::sockaddr_in6, sin6_port) as i32;
@@ -4630,12 +4627,18 @@ pub fn register_io_natives(registry: &mut NativeMethodRegistry) {
     // are provided as literals in `sockaddr_abi` below (note AF_INET6 is
     // 23 on Windows vs 10 on Linux).
     use sockaddr_abi as sa;
-    registry.register("sun/nio/ch/NativeSocketAddress", "AFINET", "()I", |_ctx, _args| {
-        Ok(Some(Value::Int(sa::AF_INET)))
-    });
-    registry.register("sun/nio/ch/NativeSocketAddress", "AFINET6", "()I", |_ctx, _args| {
-        Ok(Some(Value::Int(sa::AF_INET6)))
-    });
+    registry.register(
+        "sun/nio/ch/NativeSocketAddress",
+        "AFINET",
+        "()I",
+        |_ctx, _args| Ok(Some(Value::Int(sa::AF_INET))),
+    );
+    registry.register(
+        "sun/nio/ch/NativeSocketAddress",
+        "AFINET6",
+        "()I",
+        |_ctx, _args| Ok(Some(Value::Int(sa::AF_INET6))),
+    );
     registry.register(
         "sun/nio/ch/NativeSocketAddress",
         "sizeofSockAddr4",
@@ -5553,9 +5556,9 @@ fn bb_state(
                 other => {
                     return Err(MethodCallFailed::InternalError(VmError::Internal {
                         message: format!(
-                            "ByteBuffer missing backing array (field {} returned {:?} for object {:?})",
-                            BB_FIELD_ARRAY, other, this
-                        ),
+                        "ByteBuffer missing backing array (field {} returned {:?} for object {:?})",
+                        BB_FIELD_ARRAY, other, this
+                    ),
                     }))
                 }
             },

@@ -19812,6 +19812,27 @@ pub(crate) fn is_bytebuddy_method_token_native_override(
     false
 }
 
+pub(crate) fn is_method_handles_varhandle_factory_native_override(
+    class_name: &str,
+    method_name: &str,
+    method_descriptor: &str,
+) -> bool {
+    class_name == "java/lang/invoke/MethodHandles"
+        && matches!(
+            (method_name, method_descriptor),
+            (
+                "arrayElementVarHandle",
+                "(Ljava/lang/Class;)Ljava/lang/invoke/VarHandle;"
+            ) | (
+                "byteArrayViewVarHandle",
+                "(Ljava/lang/Class;Ljava/nio/ByteOrder;)Ljava/lang/invoke/VarHandle;"
+            ) | (
+                "byteBufferViewVarHandle",
+                "(Ljava/lang/Class;Ljava/nio/ByteOrder;)Ljava/lang/invoke/VarHandle;"
+            )
+        )
+}
+
 pub(crate) fn is_mockito_debugging_native_override(
     class_name: &str,
     method_name: &str,
@@ -20249,9 +20270,35 @@ pub(crate) fn is_ffm_group_layout_native_override(
     method_name: &str,
     descriptor: &str,
 ) -> bool {
-    class_name == "java/lang/foreign/GroupLayout"
-        && method_name == "memberLayouts"
-        && descriptor == "()Ljava/util/List;"
+    (class_name == "java/lang/foreign/GroupLayout"
+        || class_name == "java/lang/foreign/StructLayout")
+        && matches!(
+            (method_name, descriptor),
+            ("memberLayouts", "()Ljava/util/List;")
+                | ("name", "()Ljava/util/Optional;")
+                | (
+                    "withName",
+                    "(Ljava/lang/String;)Ljava/lang/foreign/MemoryLayout;"
+                )
+                | ("byteSize", "()J")
+                | ("byteAlignment", "()J")
+        )
+}
+
+pub(crate) fn is_ffm_memory_layout_native_override(
+    class_name: &str,
+    method_name: &str,
+    descriptor: &str,
+) -> bool {
+    class_name == "java/lang/foreign/MemoryLayout"
+        && matches!(
+            (method_name, descriptor),
+            ("name", "()Ljava/util/Optional;")
+                | (
+                    "withName",
+                    "(Ljava/lang/String;)Ljava/lang/foreign/MemoryLayout;"
+                )
+        )
 }
 
 pub(crate) fn is_file_channel_impl_open_native_override(
@@ -20493,6 +20540,62 @@ fn force_native_over_real_jdk_bytecode(
     {
         return true;
     }
+    // `java.util.jar.JarFile` has real JDK bytecode backed by native ZipFile
+    // state and fields (`manRef`, `jv`, etc.) CratonVM does not initialize.
+    // The native-builtins JarFile bridge stores path/manifest in its compact
+    // synthetic layout and reads ZIP data with Rust's zip crate, so it must win
+    // for both interpreted and shared exec dispatch. Keep this in sync with
+    // the JarFile gate in vm_exec.rs.
+    if class_name == "java/util/jar/JarFile"
+        && matches!(
+            method_name,
+            "<init>"
+                | "getManifest"
+                | "getManifestFromReference"
+                | "stream"
+                | "entries"
+                | "getEntry"
+                | "getJarEntry"
+                | "getInputStream"
+                | "size"
+                | "close"
+                | "getName"
+        )
+    {
+        return true;
+    }
+    // `java.util.jar.Manifest` constructors/accessors are small but depend on
+    // real-JDK stream/parser state that is fragile for synthetic jarfs streams.
+    // Force the bridge parser so `EmbeddedModulePath.moduleNameFromManifestOrNull`
+    // sees a real, non-null Attributes object.
+    if class_name == "java/util/jar/Manifest"
+        && matches!(
+            (method_name, method_descriptor),
+            ("<init>", "()V")
+                | ("<init>", "(Ljava/io/InputStream;)V")
+                | ("<init>", "(Ljava/io/InputStream;Ljava/lang/String;)V")
+                | ("<init>", "(Ljava/util/jar/Manifest;)V")
+                | (
+                    "<init>",
+                    "(Ljava/util/jar/JarVerifier;Ljava/io/InputStream;Ljava/lang/String;)V"
+                )
+                | ("getMainAttributes", "()Ljava/util/jar/Attributes;")
+                | ("getEntries", "()Ljava/util/Map;")
+        )
+    {
+        return true;
+    }
+    // MethodHandles VarHandle factories must return CratonVM synthetic handles
+    // carrying native side-table/layout metadata. The real JDK bytecode creates
+    // private VarHandle subclasses whose layouts our native get/set paths cannot
+    // decode, so byte-array views read back null/zero.
+    if is_method_handles_varhandle_factory_native_override(
+        class_name,
+        method_name,
+        method_descriptor,
+    ) {
+        return true;
+    }
     // FFM layout factories: JDK 25's real `MemoryLayout.sequenceLayout` runs
     // through `jdk/internal/foreign/Utils` while `SharedUtils.<clinit>` is still
     // building its `C_POINTER` constant. That circular path re-enters
@@ -20533,7 +20636,9 @@ fn force_native_over_real_jdk_bytecode(
     // must be served by the registered layout shims instead of falling through
     // to an abstract interface method with no Code attribute.
     if (class_name == "java/lang/foreign/ValueLayout"
-        || class_name.starts_with("java/lang/foreign/ValueLayout$"))
+        || class_name == "java/lang/foreign/AddressLayout"
+        || class_name.starts_with("java/lang/foreign/ValueLayout$")
+        || class_name.starts_with("jdk/internal/foreign/layout/ValueLayouts$"))
         && matches!(
             method_name,
             "byteSize"
@@ -20542,6 +20647,11 @@ fn force_native_over_real_jdk_bytecode(
                 | "withName"
                 | "withOrder"
                 | "varHandle"
+                | "name"
+                | "carrier"
+                | "order"
+                | "targetLayout"
+                | "withTargetLayout"
         )
     {
         return true;
@@ -20991,6 +21101,9 @@ fn force_native_over_real_jdk_bytecode(
         return true;
     }
     if is_ffm_group_layout_native_override(class_name, method_name, method_descriptor) {
+        return true;
+    }
+    if is_ffm_memory_layout_native_override(class_name, method_name, method_descriptor) {
         return true;
     }
     if is_file_channel_impl_open_native_override(class_name, method_name, method_descriptor) {
@@ -31062,6 +31175,144 @@ mod tests {
             group_layout,
             "memberLayouts",
             descriptor
+        ));
+        assert!(is_ffm_group_layout_native_override(
+            "java/lang/foreign/StructLayout",
+            "name",
+            "()Ljava/util/Optional;"
+        ));
+        assert!(force_native_over_real_jdk_bytecode(
+            "java/lang/foreign/MemoryLayout",
+            "withName",
+            "(Ljava/lang/String;)Ljava/lang/foreign/MemoryLayout;"
+        ));
+        assert!(force_native_over_real_jdk_bytecode(
+            "java/lang/foreign/AddressLayout",
+            "withName",
+            "(Ljava/lang/String;)Ljava/lang/foreign/AddressLayout;"
+        ));
+        assert!(force_native_over_real_jdk_bytecode(
+            "java/lang/foreign/ValueLayout",
+            "carrier",
+            "()Ljava/lang/Class;"
+        ));
+        assert!(force_native_over_real_jdk_bytecode(
+            "jdk/internal/foreign/layout/ValueLayouts$OfLongImpl",
+            "carrier",
+            "()Ljava/lang/Class;"
+        ));
+        assert!(force_native_over_real_jdk_bytecode(
+            "java/lang/foreign/ValueLayout",
+            "order",
+            "()Ljava/nio/ByteOrder;"
+        ));
+        assert!(force_native_over_real_jdk_bytecode(
+            "java/lang/foreign/AddressLayout",
+            "targetLayout",
+            "()Ljava/util/Optional;"
+        ));
+        assert!(force_native_over_real_jdk_bytecode(
+            "java/lang/foreign/AddressLayout",
+            "withTargetLayout",
+            "(Ljava/lang/foreign/MemoryLayout;)Ljava/lang/foreign/AddressLayout;"
+        ));
+    }
+
+    #[test]
+    fn jar_file_force_native_covers_registered_surface() {
+        let jar_file = "java/util/jar/JarFile";
+        for (name, descriptor) in [
+            ("<init>", "(Ljava/io/File;)V"),
+            ("<init>", "(Ljava/lang/String;)V"),
+            ("<init>", "(Ljava/lang/String;Z)V"),
+            ("<init>", "(Ljava/io/File;Z)V"),
+            ("<init>", "(Ljava/io/File;ZI)V"),
+            ("<init>", "(Ljava/io/File;ZILjava/lang/Runtime$Version;)V"),
+            ("getManifest", "()Ljava/util/jar/Manifest;"),
+            ("getManifestFromReference", "()Ljava/util/jar/Manifest;"),
+            ("stream", "()Ljava/util/stream/Stream;"),
+            ("entries", "()Ljava/util/Enumeration;"),
+            ("getEntry", "(Ljava/lang/String;)Ljava/util/zip/ZipEntry;"),
+            (
+                "getJarEntry",
+                "(Ljava/lang/String;)Ljava/util/jar/JarEntry;",
+            ),
+            (
+                "getInputStream",
+                "(Ljava/util/zip/ZipEntry;)Ljava/io/InputStream;",
+            ),
+            ("size", "()I"),
+            ("close", "()V"),
+            ("getName", "()Ljava/lang/String;"),
+        ] {
+            assert!(
+                force_native_over_real_jdk_bytecode(jar_file, name, descriptor),
+                "{name}{descriptor} must use native JarFile bridge"
+            );
+        }
+    }
+
+    #[test]
+    fn manifest_force_native_covers_registered_surface() {
+        let manifest = "java/util/jar/Manifest";
+        for (name, descriptor) in [
+            ("<init>", "()V"),
+            ("<init>", "(Ljava/io/InputStream;)V"),
+            ("<init>", "(Ljava/io/InputStream;Ljava/lang/String;)V"),
+            ("<init>", "(Ljava/util/jar/Manifest;)V"),
+            (
+                "<init>",
+                "(Ljava/util/jar/JarVerifier;Ljava/io/InputStream;Ljava/lang/String;)V",
+            ),
+            ("getMainAttributes", "()Ljava/util/jar/Attributes;"),
+            ("getEntries", "()Ljava/util/Map;"),
+        ] {
+            assert!(
+                force_native_over_real_jdk_bytecode(manifest, name, descriptor),
+                "{name}{descriptor} must use native Manifest bridge"
+            );
+        }
+    }
+
+    #[test]
+    fn method_handles_varhandle_factories_force_native() {
+        let method_handles = "java/lang/invoke/MethodHandles";
+        for (name, descriptor) in [
+            (
+                "arrayElementVarHandle",
+                "(Ljava/lang/Class;)Ljava/lang/invoke/VarHandle;",
+            ),
+            (
+                "byteArrayViewVarHandle",
+                "(Ljava/lang/Class;Ljava/nio/ByteOrder;)Ljava/lang/invoke/VarHandle;",
+            ),
+            (
+                "byteBufferViewVarHandle",
+                "(Ljava/lang/Class;Ljava/nio/ByteOrder;)Ljava/lang/invoke/VarHandle;",
+            ),
+        ] {
+            assert!(
+                is_method_handles_varhandle_factory_native_override(
+                    method_handles,
+                    name,
+                    descriptor
+                ),
+                "{name}{descriptor} must route to the registered native factory"
+            );
+            assert!(
+                force_native_over_real_jdk_bytecode(method_handles, name, descriptor),
+                "{name}{descriptor} must bypass real JDK VarHandle factory bytecode"
+            );
+        }
+        assert!(!is_method_handles_varhandle_factory_native_override(
+            method_handles,
+            "byteArrayViewVarHandle",
+            "(Ljava/lang/Class;)Ljava/lang/invoke/VarHandle;"
+        ));
+        assert!(!is_method_handles_varhandle_factory_native_override(
+            "java/lang/invoke/MethodHandle",
+            "byteArrayViewVarHandle",
+            "(Ljava/lang/Class;Ljava/nio/ByteOrder;)Ljava/lang/invoke/VarHandle;"
         ));
     }
 
