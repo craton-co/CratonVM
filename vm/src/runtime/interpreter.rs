@@ -5027,21 +5027,24 @@ pub fn execute(
                                 // this whole block IS that method's own first-call JIT tier-up)
                                 // and the reason/bci recovered from the stashed frame itself
                                 // before discarding it.
-                                if let Some(rframe_for_despec) = cratonvm_jit::deopt::take_last_deopt() {
+                                if let Some(rframe_for_despec) =
+                                    cratonvm_jit::deopt::take_last_deopt()
+                                {
                                     let deopt_reason = compiled
                                         .deopt_points
                                         .iter()
                                         .find(|dp| dp.bci == rframe_for_despec.bci)
                                         .map(|dp| dp.reason)
                                         .unwrap_or(cratonvm_jit::deopt::DeoptReason::UnreachedCode);
-                                    let _ = crate::jit::helpers::DeoptimizationController::deoptimize(
-                                        shared,
-                                        &class_name_str,
-                                        method_name,
-                                        method_descriptor,
-                                        deopt_reason,
-                                        rframe_for_despec.bci,
-                                    );
+                                    let _ =
+                                        crate::jit::helpers::DeoptimizationController::deoptimize(
+                                            shared,
+                                            &class_name_str,
+                                            method_name,
+                                            method_descriptor,
+                                            deopt_reason,
+                                            rframe_for_despec.bci,
+                                        );
                                 }
                                 // Deoptimized — pending-NPE drain was hoisted above the
                                 // i64::MIN branch (round-8 CRIT fix); fall through to
@@ -14362,10 +14365,12 @@ pub(crate) fn aastore_element_assignable(
         }
     }
     .or_else(|| shared.class_manager.read().find_class_by_name(comp_name))
-    .unwrap_or_else(|| match shared.class_manager.write().load_class(comp_name) {
-        Ok(id) => id,
-        Err(_) => ClassId::new(0),
-    });
+    .unwrap_or_else(
+        || match shared.class_manager.write().load_class(comp_name) {
+            Ok(id) => id,
+            Err(_) => ClassId::new(0),
+        },
+    );
     if comp_id == ClassId::new(0) {
         return true;
     }
@@ -15570,7 +15575,9 @@ fn retarget_instance_field_to_receiver(
         } => *name_and_type_index,
         _ => return None,
     };
-    let (field_name, descriptor) = current_class.constant_pool.get_name_and_type(name_and_type_index)?;
+    let (field_name, descriptor) = current_class
+        .constant_pool
+        .get_name_and_type(name_and_type_index)?;
     let resolved_decl = cm.get_class(field.declaring_class_id)?;
     let receiver_class = cm.get_class(receiver_class_id)?;
     if &*receiver_class.name != &*resolved_decl.name {
@@ -16278,7 +16285,11 @@ fn execute_invoke_kind(
     // hierarchy. The slot is also left unset when the resolved class isn't
     // an interface so a malformed CP entry can't poison nested dispatch.
     let cp_resolved_class_id: Option<ClassId> = if is_interface {
-        let loaded = shared.class_manager.write().load_class(&method_class_name).ok();
+        let loaded = shared
+            .class_manager
+            .write()
+            .load_class(&method_class_name)
+            .ok();
         loaded.and_then(|cid| {
             let cm = shared.class_manager.read();
             cm.get_class(cid).filter(|c| c.is_interface()).map(|_| cid)
@@ -17335,68 +17346,69 @@ fn execute_invoke_kind(
     // frame-push path (NO extra recursion), unlike routing through the recursive
     // `invoke_on_class_shared`. Gated + divergence-only → byte-identical in the
     // default (gate-off) / single-class-per-name case.
-    let dispatch_override: Option<ClassId> =
-        if !is_special && crate::runtime::env_cache::loader_aware_resolution() {
-            receiver_class_id.filter(|rcv_cid| {
-                *rcv_cid != ClassId::new(0) && {
-                    let cm = shared.class_manager.read();
-                    cm.get_loaded_class_id(&invoke_class) != Some(*rcv_cid)
-                        && cm
-                            .get_class(*rcv_cid)
-                            .map(|c| &*c.name == &*invoke_class)
-                            .unwrap_or(false)
-                }
-            })
-        } else if is_special && crate::runtime::env_cache::loader_aware_resolution() {
-            // invokespecial owner is the CP-resolved class NAME (`method_class_name`),
-            // which `get_loaded_class_id` collapses to ONE copy per name. Super and
-            // private calls from inside a loader-private enhanced class must reach
-            // that same loader's owner copy. For self-constructors, the receiver is
-            // more precise than the caller: a global harness class can execute
-            // `new C; invokespecial C.<init>` where `new` correctly allocated a
-            // loader-private enhanced C. Running the global C constructor against
-            // that receiver writes the wrong layout slots and leaves enhanced fields
-            // null.
-            let receiver_self_ctor = if &*method_name == "<init>" {
-                match args.first() {
-                    Some(Value::Object(Some(recv))) => {
-                        let recv_cid = shared.heap.class_id_of(*recv);
-                        if recv_cid != ClassId::new(0) {
-                            let cm = shared.class_manager.read();
-                            let recv_matches_owner = cm
-                                .get_class(recv_cid)
-                                .map(|c| {
-                                    &*c.name == &*invoke_class
-                                        && c.find_method(&method_name, &method_descriptor).is_some()
-                                })
-                                .unwrap_or(false);
-                            if recv_matches_owner {
-                                Some(recv_cid)
-                            } else {
-                                None
-                            }
+    let dispatch_override: Option<ClassId> = if !is_special
+        && crate::runtime::env_cache::loader_aware_resolution()
+    {
+        receiver_class_id.filter(|rcv_cid| {
+            *rcv_cid != ClassId::new(0) && {
+                let cm = shared.class_manager.read();
+                cm.get_loaded_class_id(&invoke_class) != Some(*rcv_cid)
+                    && cm
+                        .get_class(*rcv_cid)
+                        .map(|c| &*c.name == &*invoke_class)
+                        .unwrap_or(false)
+            }
+        })
+    } else if is_special && crate::runtime::env_cache::loader_aware_resolution() {
+        // invokespecial owner is the CP-resolved class NAME (`method_class_name`),
+        // which `get_loaded_class_id` collapses to ONE copy per name. Super and
+        // private calls from inside a loader-private enhanced class must reach
+        // that same loader's owner copy. For self-constructors, the receiver is
+        // more precise than the caller: a global harness class can execute
+        // `new C; invokespecial C.<init>` where `new` correctly allocated a
+        // loader-private enhanced C. Running the global C constructor against
+        // that receiver writes the wrong layout slots and leaves enhanced fields
+        // null.
+        let receiver_self_ctor = if &*method_name == "<init>" {
+            match args.first() {
+                Some(Value::Object(Some(recv))) => {
+                    let recv_cid = shared.heap.class_id_of(*recv);
+                    if recv_cid != ClassId::new(0) {
+                        let cm = shared.class_manager.read();
+                        let recv_matches_owner = cm
+                            .get_class(recv_cid)
+                            .map(|c| {
+                                &*c.name == &*invoke_class
+                                    && c.find_method(&method_name, &method_descriptor).is_some()
+                            })
+                            .unwrap_or(false);
+                        if recv_matches_owner {
+                            Some(recv_cid)
                         } else {
                             None
                         }
+                    } else {
+                        None
                     }
-                    _ => None,
                 }
-            } else {
-                None
-            };
-            receiver_self_ctor.or_else(|| {
-                lookup_loader_initiated(shared, current_class_id, &invoke_class).filter(|owner_cid| {
-                    *owner_cid != ClassId::new(0)
-                        && shared
-                            .class_manager
-                            .read()
-                            .get_loaded_class_id(&invoke_class)
-                            != Some(*owner_cid)
-                })
-            })
+                _ => None,
+            }
         } else {
             None
         };
+        receiver_self_ctor.or_else(|| {
+            lookup_loader_initiated(shared, current_class_id, &invoke_class).filter(|owner_cid| {
+                *owner_cid != ClassId::new(0)
+                    && shared
+                        .class_manager
+                        .read()
+                        .get_loaded_class_id(&invoke_class)
+                        != Some(*owner_cid)
+            })
+        })
+    } else {
+        None
+    };
 
     // Try stackless frame push for bytecode methods (avoids Rust stack recursion)
     // For virtual/special calls, do NOT walk the native hierarchy — subclass
@@ -17958,7 +17970,8 @@ pub fn coerce_lambda_args(
     // have performed, so a narrowed type variable still raises
     // `ClassCastException` for an incompatible argument. Runs before the
     // box/unbox coercion below, mirroring the bridge's cast-then-adapt order.
-    if let Err(e) = checkcast_lambda_instantiated_args(shared, sam_desc, inst_desc, args, num_captures)
+    if let Err(e) =
+        checkcast_lambda_instantiated_args(shared, sam_desc, inst_desc, args, num_captures)
     {
         thread.native_pin_roots.truncate(pin_base);
         return Err(e);
@@ -19760,7 +19773,6 @@ pub(crate) fn is_spring_mock_response_native_override(
         )
 }
 
-
 pub(crate) fn is_script_engine_manager_native_override(
     class_name: &str,
     method_name: &str,
@@ -19769,9 +19781,16 @@ pub(crate) fn is_script_engine_manager_native_override(
     class_name == "javax/script/ScriptEngineManager"
         && matches!(
             (method_name, descriptor),
-            ("getEngineByName", "(Ljava/lang/String;)Ljavax/script/ScriptEngine;")
-                | ("getEngineByExtension", "(Ljava/lang/String;)Ljavax/script/ScriptEngine;")
-                | ("getEngineByMimeType", "(Ljava/lang/String;)Ljavax/script/ScriptEngine;")
+            (
+                "getEngineByName",
+                "(Ljava/lang/String;)Ljavax/script/ScriptEngine;"
+            ) | (
+                "getEngineByExtension",
+                "(Ljava/lang/String;)Ljavax/script/ScriptEngine;"
+            ) | (
+                "getEngineByMimeType",
+                "(Ljava/lang/String;)Ljavax/script/ScriptEngine;"
+            )
         )
 }
 
@@ -19809,7 +19828,6 @@ pub(crate) fn is_jython_pyobject_native_override(
                 && descriptor
                     == "(Ljava/lang/String;Lorg/python/core/PyObject;)Lorg/python/core/PyObject;"))
 }
-
 
 pub(crate) fn is_jython_imp_native_override(
     class_name: &str,
@@ -19878,6 +19896,60 @@ pub(crate) fn is_count_down_latch_native_override(
                 | ("getCount", "()J")
                 | ("toString", "()Ljava/lang/String;")
         )
+}
+
+pub(crate) fn is_reflection_factory_serialization_native_override(
+    class_name: &str,
+    method_name: &str,
+    descriptor: &str,
+) -> bool {
+    matches!(
+        class_name,
+        "sun/reflect/ReflectionFactory" | "jdk/internal/reflect/ReflectionFactory"
+    ) && matches!(
+        (method_name, descriptor),
+        ("getReflectionFactory", "()Lsun/reflect/ReflectionFactory;")
+            | (
+                "getReflectionFactory",
+                "()Ljdk/internal/reflect/ReflectionFactory;"
+            )
+            | (
+                "newConstructorForSerialization",
+                "(Ljava/lang/Class;)Ljava/lang/reflect/Constructor;"
+            )
+            | (
+                "newConstructorForSerialization",
+                "(Ljava/lang/Class;Ljava/lang/reflect/Constructor;)Ljava/lang/reflect/Constructor;"
+            )
+            | (
+                "newConstructorForExternalization",
+                "(Ljava/lang/Class;)Ljava/lang/reflect/Constructor;"
+            )
+            | (
+                "readObjectForSerialization",
+                "(Ljava/lang/Class;)Ljava/lang/invoke/MethodHandle;"
+            )
+            | (
+                "readObjectNoDataForSerialization",
+                "(Ljava/lang/Class;)Ljava/lang/invoke/MethodHandle;"
+            )
+            | (
+                "writeObjectForSerialization",
+                "(Ljava/lang/Class;)Ljava/lang/invoke/MethodHandle;"
+            )
+            | (
+                "readResolveForSerialization",
+                "(Ljava/lang/Class;)Ljava/lang/invoke/MethodHandle;"
+            )
+            | (
+                "writeReplaceForSerialization",
+                "(Ljava/lang/Class;)Ljava/lang/invoke/MethodHandle;"
+            )
+            | (
+                "hasStaticInitializerForSerialization",
+                "(Ljava/lang/Class;)Z"
+            )
+    )
 }
 
 fn force_native_over_real_jdk_bytecode(
@@ -20105,7 +20177,10 @@ fn force_native_over_real_jdk_bytecode(
     // the interpreter cache gate in sync so ordinary bytecode dispatch also
     // uses the registered native overloads, including charset-aware toString.
     if class_name == "java/io/ByteArrayOutputStream"
-        && matches!(method_name, "write" | "toByteArray" | "size" | "reset" | "toString")
+        && matches!(
+            method_name,
+            "write" | "toByteArray" | "size" | "reset" | "toString"
+        )
     {
         return true;
     }
@@ -20126,8 +20201,7 @@ fn force_native_over_real_jdk_bytecode(
     // jboss-logmanager bytecode dereferences `this.loggerNode` first. Force the
     // natives for real-JDK class bodies too, matching the existing null-safe
     // logRaw / handler overrides in `native-builtins::logmanager`.
-    if (class_name == "org/jboss/logmanager/Logger"
-        || class_name == "org.jboss.logmanager.Logger")
+    if (class_name == "org/jboss/logmanager/Logger" || class_name == "org.jboss.logmanager.Logger")
         && matches!(
             (method_name, method_descriptor),
             ("getEffectiveLevel", "()I") | ("isLoggable", "(Ljava/util/logging/Level;)Z")
@@ -20444,6 +20518,18 @@ fn force_native_over_real_jdk_bytecode(
     // public surface, including <init>, so the synthetic int[] holder is
     // installed before await/countDown read it.
     if is_count_down_latch_native_override(class_name, method_name, method_descriptor) {
+        return true;
+    }
+    // JBoss Marshalling calls real-JDK `sun.reflect.ReflectionFactory`
+    // bytecode to discover serialization hooks. On CratonVM the registered
+    // natives encode ObjectStreamClass's private/inheritable hook rules and
+    // must win over the bytecode body, or MethodHandle.invoke later tries to
+    // dispatch `java/lang/Object.readObject(ObjectInputStream)`.
+    if is_reflection_factory_serialization_native_override(
+        class_name,
+        method_name,
+        method_descriptor,
+    ) {
         return true;
     }
     // Surefire fork bootstrap/teardown: bypass ServiceLoader decoder discovery
@@ -20907,9 +20993,10 @@ fn intercept_jython_pyjavatype_findattr_ex(
     if recv_name != "org/python/core/PyJavaType" {
         return None;
     }
-    let cb = shared
-        .native_methods
-        .find("org/python/core/PyJavaType", method_name, method_descriptor)?;
+    let cb =
+        shared
+            .native_methods
+            .find("org/python/core/PyJavaType", method_name, method_descriptor)?;
     let ret_type = crate::jit::return_type(method_descriptor);
     Some((|| {
         let result = crate::vm::safe_native_call(shared, thread, cb, args)?;
@@ -20947,9 +21034,10 @@ fn intercept_jython_pymodule_findattr(
     if recv_name != "org/python/core/PyModule" {
         return None;
     }
-    let cb = shared
-        .native_methods
-        .find("org/python/core/PyModule", method_name, method_descriptor)?;
+    let cb =
+        shared
+            .native_methods
+            .find("org/python/core/PyModule", method_name, method_descriptor)?;
     let ret_type = crate::jit::return_type(method_descriptor);
     Some((|| {
         let result = crate::vm::safe_native_call(shared, thread, cb, args)?;
@@ -23892,12 +23980,8 @@ fn try_osr(
             // with the callee's locals/stack. Verify the frame's baked
             // `method_key` names THIS method before transferring; on a
             // mismatch, despeculate the frame's real owner and safe-reject.
-            let identity_ok = deopt_frame_matches_method(
-                &rframe,
-                &class_name,
-                &method_name,
-                &method_descriptor,
-            );
+            let identity_ok =
+                deopt_frame_matches_method(&rframe, &class_name, &method_name, &method_descriptor);
             if !identity_ok {
                 despeculate_stashed_frame_method(shared, &rframe);
                 if std::env::var_os("CRATONVM_DBG_DEOPT").is_some() {
@@ -26278,7 +26362,7 @@ fn resolve_inline_site(
                 scan_pc += 3;
                 continue;
             }
-            0xba => return None,               // invokedynamic
+            0xba => return None, // invokedynamic
             // Array loads/stores + arraylength need a bounds check (and AIOOBE
             // path) that the inline codegen (`x64::try_emit_inline_body`) does
             // NOT emit — it bails on these. Rejecting them HERE keeps the
@@ -27389,9 +27473,9 @@ fn execute_jit_call_decoded(
             // `real_frame_deopt_resume_and_despeculate`; any refusal falls
             // through to the safe re-run below.
             if cratonvm_jit::deopt_real_enabled() && compiled.can_deopt_resume {
-                if let Some(r) =
-                    real_frame_deopt_resume_and_despeculate(shared, thread, compiled, cached, &rframe)
-                {
+                if let Some(r) = real_frame_deopt_resume_and_despeculate(
+                    shared, thread, compiled, cached, &rframe,
+                ) {
                     return Ok(Some(r));
                 }
             } else if !rframe.method_key.is_empty()
@@ -27963,15 +28047,19 @@ fn execute_invokevirtual_vtable_fast(
                                 .is_some();
                             // Suppress an inherited native shadow when the declaring
                             // parent has been redefined by an agent (woven bytecode wins).
-            let parent_redefined = crate::classloading::any_class_redefined()
-                && cm.class_redefine_generation(parent_id) > 0
-                && !redefine_immune_reflection_native(&parent.name, &method_name)
-                && !redefine_immune_string_builder_native(
-                    &parent.name,
-                    &method_name,
-                    &method_descriptor,
-                )
-                && !redefine_immune_path_native(&parent.name, &method_name, &method_descriptor);
+                            let parent_redefined = crate::classloading::any_class_redefined()
+                                && cm.class_redefine_generation(parent_id) > 0
+                                && !redefine_immune_reflection_native(&parent.name, &method_name)
+                                && !redefine_immune_string_builder_native(
+                                    &parent.name,
+                                    &method_name,
+                                    &method_descriptor,
+                                )
+                                && !redefine_immune_path_native(
+                                    &parent.name,
+                                    &method_name,
+                                    &method_descriptor,
+                                );
                             let has_native = !parent_redefined
                                 && shared
                                     .native_methods
@@ -28051,14 +28139,11 @@ fn execute_invokevirtual_vtable_fast(
             .get_class(cratonvm_types::ClassId::new(declaring_class_id as u32))
             .map(|c| c.name.to_string())
             .unwrap_or_else(|| cached.class_name.to_string());
-        if force_native_over_real_jdk_bytecode(
-            &declaring_name,
-            &method_name,
-            &method_descriptor,
-        ) && shared
-            .native_methods
-            .find(&declaring_name, &method_name, &method_descriptor)
-            .is_some()
+        if force_native_over_real_jdk_bytecode(&declaring_name, &method_name, &method_descriptor)
+            && shared
+                .native_methods
+                .find(&declaring_name, &method_name, &method_descriptor)
+                .is_some()
         {
             return Ok(CachedCallResult::CacheMiss);
         }
@@ -29379,19 +29464,15 @@ fn populate_virtual_invoke_cache(
         && method_name.as_ref() == "__findattr__"
         && descriptor.as_ref() == "(Ljava/lang/String;)Lorg/python/core/PyObject;"
     {
-        let receiver_name = store
-            .get(receiver_class_id)
-            .map(|c| &*c.name)
-            .unwrap_or("");
+        let receiver_name = store.get(receiver_class_id).map(|c| &*c.name).unwrap_or("");
         if receiver_name == "org/python/core/PyModule" {
-            if let Some(callback) = shared.native_methods.find(
-                "org/python/core/PyModule",
-                &method_name,
-                &descriptor,
-            ) {
-                let gate = RedefineGate::snapshot(
-                    cm.class_redefine_generation_handle(receiver_class_id),
-                );
+            if let Some(callback) =
+                shared
+                    .native_methods
+                    .find("org/python/core/PyModule", &method_name, &descriptor)
+            {
+                let gate =
+                    RedefineGate::snapshot(cm.class_redefine_generation_handle(receiver_class_id));
                 drop(cm);
                 let target = CachedInvokeTarget::VirtualNative {
                     receiver_class_id,
@@ -29415,19 +29496,15 @@ fn populate_virtual_invoke_cache(
         && method_name.as_ref() == "__findattr_ex__"
         && descriptor.as_ref() == "(Ljava/lang/String;)Lorg/python/core/PyObject;"
     {
-        let receiver_name = store
-            .get(receiver_class_id)
-            .map(|c| &*c.name)
-            .unwrap_or("");
+        let receiver_name = store.get(receiver_class_id).map(|c| &*c.name).unwrap_or("");
         if receiver_name == "org/python/core/PyJavaType" {
-            if let Some(callback) = shared.native_methods.find(
-                "org/python/core/PyJavaType",
-                &method_name,
-                &descriptor,
-            ) {
-                let gate = RedefineGate::snapshot(
-                    cm.class_redefine_generation_handle(receiver_class_id),
-                );
+            if let Some(callback) =
+                shared
+                    .native_methods
+                    .find("org/python/core/PyJavaType", &method_name, &descriptor)
+            {
+                let gate =
+                    RedefineGate::snapshot(cm.class_redefine_generation_handle(receiver_class_id));
                 drop(cm);
                 let target = CachedInvokeTarget::VirtualNative {
                     receiver_class_id,
@@ -30216,12 +30293,18 @@ fn dump_imse_holdcount_state(shared: &SharedVm, thread: &JvmThread, exc: ObjectR
     };
     let tl_map = field(me, "threadLocals");
     let Value::Object(Some(tl_map)) = tl_map else {
-        eprintln!("[imse]   readHolds={:p} but thread has NO threadLocals map", read_holds.as_ptr());
+        eprintln!(
+            "[imse]   readHolds={:p} but thread has NO threadLocals map",
+            read_holds.as_ptr()
+        );
         return;
     };
     let table = field(tl_map, "table");
     let Value::Object(Some(table)) = table else {
-        eprintln!("[imse]   threadLocals map {:p} has NO table", tl_map.as_ptr());
+        eprintln!(
+            "[imse]   threadLocals map {:p} has NO table",
+            tl_map.as_ptr()
+        );
         return;
     };
     let len = shared.heap.array_length(table);
@@ -30232,7 +30315,8 @@ fn dump_imse_holdcount_state(shared: &SharedVm, thread: &JvmThread, exc: ObjectR
         };
         // Entry extends WeakReference<ThreadLocal>; referent is field 0.
         let referent = shared.heap.get_field(entry, 0);
-        let is_ours = matches!(referent, Value::Object(Some(r)) if r.as_ptr() == read_holds.as_ptr());
+        let is_ours =
+            matches!(referent, Value::Object(Some(r)) if r.as_ptr() == read_holds.as_ptr());
         if is_ours {
             found = true;
             let value = field(entry, "value");
@@ -30277,9 +30361,8 @@ mod tests {
     /// losing RRWL read-lock hold counters and WeakHashMap entries.
     #[test]
     fn weakref_pre_gc_watch_includes_reference_objects() {
-        let shared = std::sync::Arc::new(crate::vm::SharedVm::new(
-            crate::config::VmConfig::default(),
-        ));
+        let shared =
+            std::sync::Arc::new(crate::vm::SharedVm::new(crate::config::VmConfig::default()));
         let referent = shared.heap.alloc_object(ClassId::new(0), 1);
         let weak_ref = shared.heap.alloc_object(ClassId::new(0), 2);
         shared.ref_processor.lock().discover_reference(
@@ -30358,6 +30441,43 @@ mod tests {
             "java/util/concurrent/Semaphore",
             "await",
             "()V"
+        ));
+    }
+
+    #[test]
+    fn reflection_factory_force_native_covers_serialization_surface() {
+        for class_name in [
+            "sun/reflect/ReflectionFactory",
+            "jdk/internal/reflect/ReflectionFactory",
+        ] {
+            for (name, descriptor) in [
+                ("newConstructorForSerialization", "(Ljava/lang/Class;)Ljava/lang/reflect/Constructor;"),
+                (
+                    "newConstructorForSerialization",
+                    "(Ljava/lang/Class;Ljava/lang/reflect/Constructor;)Ljava/lang/reflect/Constructor;",
+                ),
+                ("newConstructorForExternalization", "(Ljava/lang/Class;)Ljava/lang/reflect/Constructor;"),
+                ("readObjectForSerialization", "(Ljava/lang/Class;)Ljava/lang/invoke/MethodHandle;"),
+                (
+                    "readObjectNoDataForSerialization",
+                    "(Ljava/lang/Class;)Ljava/lang/invoke/MethodHandle;",
+                ),
+                ("writeObjectForSerialization", "(Ljava/lang/Class;)Ljava/lang/invoke/MethodHandle;"),
+                ("readResolveForSerialization", "(Ljava/lang/Class;)Ljava/lang/invoke/MethodHandle;"),
+                ("writeReplaceForSerialization", "(Ljava/lang/Class;)Ljava/lang/invoke/MethodHandle;"),
+                ("hasStaticInitializerForSerialization", "(Ljava/lang/Class;)Z"),
+            ] {
+                assert!(
+                    is_reflection_factory_serialization_native_override(class_name, name, descriptor),
+                    "{class_name}.{name}{descriptor} must route to the registered native"
+                );
+                assert!(force_native_over_real_jdk_bytecode(class_name, name, descriptor));
+            }
+        }
+        assert!(!is_reflection_factory_serialization_native_override(
+            "java/io/ObjectStreamClass",
+            "getReflector",
+            "(Ljava/lang/Class;)Ljava/lang/Object;"
         ));
     }
 

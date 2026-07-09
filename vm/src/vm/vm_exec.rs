@@ -2712,7 +2712,12 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
         // oldest call still on the stack); reverse so callers see
         // innermost-first, matching `capture_stack_trace`'s `.iter().rev()`
         // convention (see its own callers, e.g. `resolve_caller_class_id`).
-        self.thread.frames.iter().rev().map(|f| f.class_id).collect()
+        self.thread
+            .frames
+            .iter()
+            .rev()
+            .map(|f| f.class_id)
+            .collect()
     }
 
     // -- Heap access methods --
@@ -4182,9 +4187,12 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
         };
 
         // Register thread as alive before spawning
-        self.shared
-            .thread_registry
-            .register_with_daemon(tid, &name, Some(thread_obj), is_daemon);
+        self.shared.thread_registry.register_starting_with_daemon(
+            tid,
+            &name,
+            Some(thread_obj),
+            is_daemon,
+        );
 
         // Record JFR thread start event
         {
@@ -4349,6 +4357,23 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
             // execution on this thread.
             shared_arc.thread_registry.set_os_tid_current(tid);
             jvm_thread.set_vm_state("thread-start:registered");
+            loop {
+                let marked_ready = shared_arc.gc_barrier.run_if_no_stw_requested(|| {
+                    shared_arc.thread_registry.mark_stw_ready(tid);
+                });
+                if marked_ready {
+                    break;
+                }
+
+                let pointer_map = shared_arc.gc_barrier.arrive_and_wait_excluded(tid);
+                if !pointer_map.is_empty() {
+                    crate::runtime::interpreter::apply_pointer_map_to_thread(
+                        &mut jvm_thread,
+                        &pointer_map,
+                        &shared_arc.heap,
+                    );
+                }
+            }
             if shared_arc
                 .gc_barrier
                 .stw_requested
@@ -6057,18 +6082,30 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
                             })?
                         }
                     };
-                    let mut init_args = Vec::with_capacity(1 + full_args.len());
-                    init_args.push(Value::Object(Some(new_obj)));
-                    init_args.extend_from_slice(&full_args);
-                    invoke_on_class_shared(
-                        self.shared,
-                        self.thread,
-                        class_id,
-                        &lcs.impl_handle.member_name,
-                        &lcs.impl_handle.descriptor,
-                        &init_args,
-                    )?;
-                    Ok(Some(Value::Object(Some(new_obj))))
+                    let new_obj_pin = self.thread.native_pin_roots.len();
+                    self.thread.native_pin_roots.push(new_obj);
+                    let init_result = {
+                        let mut init_args = Vec::with_capacity(1 + full_args.len());
+                        init_args.push(Value::Object(Some(new_obj)));
+                        init_args.extend_from_slice(&full_args);
+                        invoke_on_class_shared(
+                            self.shared,
+                            self.thread,
+                            class_id,
+                            &lcs.impl_handle.member_name,
+                            &lcs.impl_handle.descriptor,
+                            &init_args,
+                        )
+                    };
+                    let forwarded = self
+                        .thread
+                        .native_pin_roots
+                        .get(new_obj_pin)
+                        .copied()
+                        .unwrap_or(new_obj);
+                    self.thread.native_pin_roots.truncate(new_obj_pin);
+                    init_result?;
+                    Ok(Some(Value::Object(Some(forwarded))))
                 }
                 _ => {
                     // GetField, GetStatic, PutField, PutStatic вЂ” very rare for
@@ -6083,7 +6120,39 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
                 }
             };
             // Coerce return value from impl's descriptor back to SAM's view.
-            let r = raw_result?;
+            let r = match raw_result {
+                Ok(result) => result,
+                Err(MethodCallFailed::InternalError(VmError::Linkage(
+                    LinkageError::NoSuchMethodError {
+                        class_name,
+                        method_name,
+                        method_descriptor,
+                    },
+                ))) => {
+                    if let Some(result) = object_serialization_hook_neutral_result(
+                        &method_name,
+                        &method_descriptor,
+                        &full_args,
+                    ) {
+                        if std::env::var_os("CRATONVM_DBG_REFLECTION_FACTORY").is_some() {
+                            eprintln!(
+                                "[rf-ser] neutral MethodHandle missing hook {}.{}{}",
+                                class_name, method_name, method_descriptor
+                            );
+                        }
+                        result
+                    } else {
+                        return Err(MethodCallFailed::InternalError(VmError::Linkage(
+                            LinkageError::NoSuchMethodError {
+                                class_name,
+                                method_name,
+                                method_descriptor,
+                            },
+                        )));
+                    }
+                }
+                Err(err) => return Err(err),
+            };
             crate::runtime::interpreter::coerce_return(
                 self.shared,
                 self.thread,
@@ -10580,6 +10649,22 @@ pub fn invoke_on_class_shared_no_retarget(
     )
 }
 
+fn object_serialization_hook_neutral_result(
+    method_name: &str,
+    descriptor: &str,
+    args: &[Value],
+) -> Option<Option<Value>> {
+    match (method_name, descriptor) {
+        ("readObject", "(Ljava/io/ObjectInputStream;)V")
+        | ("readObjectNoData", "()V")
+        | ("writeObject", "(Ljava/io/ObjectOutputStream;)V") => Some(None),
+        ("readResolve", "()Ljava/lang/Object;") | ("writeReplace", "()Ljava/lang/Object;") => {
+            Some(Some(args.first().copied().unwrap_or(Value::Object(None))))
+        }
+        _ => None,
+    }
+}
+
 fn invoke_on_class_shared_inner(
     shared: &SharedVm,
     thread: &mut JvmThread,
@@ -10798,6 +10883,14 @@ fn invoke_on_class_shared_inner(
                         || (class_name == "java/lang/reflect/Constructor"
                             && method_name == "newInstance"
                             && descriptor == "([Ljava/lang/Object;)Ljava/lang/Object;")
+                        // WF-RF: real-JDK ReflectionFactory serialization helpers are
+                        // concrete bytecode methods, but JBoss Marshalling depends on
+                        // ObjectStreamClass hook discovery semantics. Let the native
+                        // bridge in `serialization.rs` shadow the bytecode so absent
+                        // hooks return null instead of handles to Object.readObject.
+                        || crate::runtime::interpreter::is_reflection_factory_serialization_native_override(
+                            class_name, method_name, descriptor
+                        )
                         // SPB.11: Our synthetic MethodDescriptor stores the
                         // wrapped Method at slot 0 (real-JDK MD has a private
                         // `method` field at a different layout). Force the
@@ -12648,11 +12741,14 @@ fn invoke_on_class_shared_inner(
                         if let Some(Value::Object(Some(recv))) = args.first().copied() {
                             let recv_cid = shared.heap.class_id_of(recv);
                             let recv_name = store.get(recv_cid).map(|c| &*c.name).unwrap_or("");
-                            if matches!(recv_name, "org/python/core/PyNullImporter" | "org/python/modules/zipimport/zipimporter")
-                                && shared
-                                    .native_methods
-                                    .find(recv_name, method_name, descriptor)
-                                    .is_some()
+                            if matches!(
+                                recv_name,
+                                "org/python/core/PyNullImporter"
+                                    | "org/python/modules/zipimport/zipimporter"
+                            ) && shared
+                                .native_methods
+                                .find(recv_name, method_name, descriptor)
+                                .is_some()
                             {
                                 native = true;
                                 declaring_id_out = recv_cid;
@@ -13286,6 +13382,21 @@ fn invoke_on_class_shared_inner(
                         );
                     }
                 }
+                if let Some(result) =
+                    object_serialization_hook_neutral_result(method_name, descriptor, args)
+                {
+                    if std::env::var_os("CRATONVM_DBG_REFLECTION_FACTORY").is_some() {
+                        eprintln!(
+                            "[rf-ser] neutral missing serialization hook {}.{}{} caller={}",
+                            class_name,
+                            method_name,
+                            descriptor,
+                            thread.frames.last().map(|f| f.method_name()).unwrap_or("")
+                        );
+                    }
+                    return Ok(result);
+                }
+
                 // Diagnostic aid: a NoSuchMethodError against a
                 // `is_synthetic_stub` class is almost always a masked
                 // classpath gap, not a genuine method-resolution bug — the
@@ -13992,6 +14103,30 @@ mod tests {
         assert_eq!(
             coerce_value_for_return(Value::Int(-1), b'J'),
             Value::Long(-1)
+        );
+    }
+
+    #[test]
+    fn object_serialization_hook_neutral_result_matches_objectstream_hooks() {
+        assert_eq!(
+            object_serialization_hook_neutral_result(
+                "readObject",
+                "(Ljava/io/ObjectInputStream;)V",
+                &[]
+            ),
+            Some(None)
+        );
+        assert_eq!(
+            object_serialization_hook_neutral_result(
+                "writeReplace",
+                "()Ljava/lang/Object;",
+                &[Value::Object(None)]
+            ),
+            Some(Some(Value::Object(None)))
+        );
+        assert_eq!(
+            object_serialization_hook_neutral_result("clone", "()Ljava/lang/Object;", &[]),
+            None
         );
     }
 

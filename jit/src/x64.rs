@@ -1100,46 +1100,46 @@ pub fn jit_scan(code: &[u8], code_len: usize, descriptor: &str) -> Option<JitSca
     let mut ldc2w_ops: Vec<(usize, u16)> = Vec::new(); // (pc, cp_index) for `ldc2_w` (0x14)
     let mut indy_ops: Vec<(usize, u16)> = Vec::new(); // (pc, cp_index) for `invokedynamic` (0xba)
     let mut has_athrow = false; // RBC.6 — method contains 0xbf
-    // BUG-LQB-SCOPE: earliest bytecode pc of any instruction with an
-    // observable, non-idempotent side effect (putfield/putstatic, an array
-    // store, or any invoke* — a callee can mutate arbitrary state). The
-    // `invokedynamic` (0xba) arm below lowers to an UNCONDITIONAL jump to the
-    // shared uncommon-trap deopt stub (reason 8, `UnreachedCode`) — control
-    // never returns from the trap into JIT-compiled code, and the VM's
-    // fallback for that trap (when no precise resume snapshot exists, which
-    // is unconditionally true for reason 8 as of the 2026-07-07 Groovy-
-    // regression revert — see
-    // docs/known-issues/jit-invokedynamic-uncommon-trap-precise-resume-groovy-regression.md)
-    // is to RE-EXECUTE THE WHOLE METHOD FROM ITS INTERPRETER ENTRY. Any
-    // side-effecting bytecode positioned BEFORE the indy in program order
-    // already ran for real once under the (aborted) JIT attempt, so the
-    // interpreter's from-scratch re-run executes it a SECOND time — a
-    // genuine double-execution, not just a performance cost. Confirmed via a
-    // minimal standalone repro (`enter()`-shaped method: `counter++;
-    // ...concat via invokedynamic...`) invoked from a JIT-compiled caller:
-    // the counter field was incremented twice per logical call. This is the
-    // root cause of the Liquibase `Scope` "Cannot end scope X when currently
-    // at scope root" corruption (docs/known-issues/keycloak-07-04/
-    // testsuite-model-liquibase-scope-corruption.md) — `Scope.enter()`-style
-    // methods perform a `putstatic`/field mutation before a string-concat
-    // `invokedynamic`, so the ThreadLocal-tracked scope stack gets pushed
-    // twice for one logical `Scope.enter()` call once such a helper method
-    // gets JIT-compiled and reached from a JIT-compiled (or otherwise
-    // JIT-dispatching) caller.
-    //
-    // Fix: track the earliest such pc; after the scan, if it precedes any
-    // `invokedynamic` site, refuse to compile the WHOLE method (return
-    // `None`, same fail-safe posture as the RBC.6 athrow+exception-table
-    // gate below) rather than emit unconditional-trap codegen that can
-    // double-execute already-committed work. This only affects methods that
-    // have both a live invokedynamic AND an earlier side effect in raw
-    // bytecode-pc order — the overwhelmingly common case (an
-    // `assert cond : "msg" + x;` message-concat sitting on a dead branch
-    // near the end of a method, unrelated to any earlier field/array
-    // mutation reachability) is unaffected and still compiles at full JIT
-    // speed; methods that fail this new gate simply stay fully interpreted
-    // (correct, just not JIT-accelerated), matching the scanner's existing
-    // "when in doubt, don't compile" philosophy.
+                                // BUG-LQB-SCOPE: earliest bytecode pc of any instruction with an
+                                // observable, non-idempotent side effect (putfield/putstatic, an array
+                                // store, or any invoke* — a callee can mutate arbitrary state). The
+                                // `invokedynamic` (0xba) arm below lowers to an UNCONDITIONAL jump to the
+                                // shared uncommon-trap deopt stub (reason 8, `UnreachedCode`) — control
+                                // never returns from the trap into JIT-compiled code, and the VM's
+                                // fallback for that trap (when no precise resume snapshot exists, which
+                                // is unconditionally true for reason 8 as of the 2026-07-07 Groovy-
+                                // regression revert — see
+                                // docs/known-issues/jit-invokedynamic-uncommon-trap-precise-resume-groovy-regression.md)
+                                // is to RE-EXECUTE THE WHOLE METHOD FROM ITS INTERPRETER ENTRY. Any
+                                // side-effecting bytecode positioned BEFORE the indy in program order
+                                // already ran for real once under the (aborted) JIT attempt, so the
+                                // interpreter's from-scratch re-run executes it a SECOND time — a
+                                // genuine double-execution, not just a performance cost. Confirmed via a
+                                // minimal standalone repro (`enter()`-shaped method: `counter++;
+                                // ...concat via invokedynamic...`) invoked from a JIT-compiled caller:
+                                // the counter field was incremented twice per logical call. This is the
+                                // root cause of the Liquibase `Scope` "Cannot end scope X when currently
+                                // at scope root" corruption (docs/known-issues/keycloak-07-04/
+                                // testsuite-model-liquibase-scope-corruption.md) — `Scope.enter()`-style
+                                // methods perform a `putstatic`/field mutation before a string-concat
+                                // `invokedynamic`, so the ThreadLocal-tracked scope stack gets pushed
+                                // twice for one logical `Scope.enter()` call once such a helper method
+                                // gets JIT-compiled and reached from a JIT-compiled (or otherwise
+                                // JIT-dispatching) caller.
+                                //
+                                // Fix: track the earliest such pc; after the scan, if it precedes any
+                                // `invokedynamic` site, refuse to compile the WHOLE method (return
+                                // `None`, same fail-safe posture as the RBC.6 athrow+exception-table
+                                // gate below) rather than emit unconditional-trap codegen that can
+                                // double-execute already-committed work. This only affects methods that
+                                // have both a live invokedynamic AND an earlier side effect in raw
+                                // bytecode-pc order — the overwhelmingly common case (an
+                                // `assert cond : "msg" + x;` message-concat sitting on a dead branch
+                                // near the end of a method, unrelated to any earlier field/array
+                                // mutation reachability) is unaffected and still compiles at full JIT
+                                // speed; methods that fail this new gate simply stay fully interpreted
+                                // (correct, just not JIT-accelerated), matching the scanner's existing
+                                // "when in doubt, don't compile" philosophy.
     let mut first_committing_side_effect_pc: Option<usize> = None;
     let mut pc = 0;
     while pc < code_len {
@@ -21685,20 +21685,19 @@ impl Compiler {
                         // vm_ptr frame slot is what the guard is called with.
                         // Unwired helper (tests, historical callers): emits
                         // nothing, byte-identical legacy code.
-                        let guard_skip_patch = if self.helpers.self_call_stack_guard != 0
-                            && self.needs_heap
-                        {
-                            self.emit_pre_safepoint_spill();
-                            self.emit_load_local(ARG_REGS[0], self.heap_local_offset);
-                            self.emit_call_absolute(self.helpers.self_call_stack_guard);
-                            if self.precise_maps || self.shadow_enabled {
-                                self.emit_oop_map_for_safepoint();
-                            }
-                            self.emit_test_r64_r64(RAX);
-                            Some(self.emit_jcc_rel32_patch(0x85)) // JNE merge
-                        } else {
-                            None
-                        };
+                        let guard_skip_patch =
+                            if self.helpers.self_call_stack_guard != 0 && self.needs_heap {
+                                self.emit_pre_safepoint_spill();
+                                self.emit_load_local(ARG_REGS[0], self.heap_local_offset);
+                                self.emit_call_absolute(self.helpers.self_call_stack_guard);
+                                if self.precise_maps || self.shadow_enabled {
+                                    self.emit_oop_map_for_safepoint();
+                                }
+                                self.emit_test_r64_r64(RAX);
+                                Some(self.emit_jcc_rel32_patch(0x85)) // JNE merge
+                            } else {
+                                None
+                            };
                         // Round-8 wave-3 HIGH fix: stack-arg setup for
                         // self-recursive direct calls past ARG_REGS.
                         let total_sub = self.emit_stack_arg_setup(&arg_slots, self.needs_heap);
@@ -24690,7 +24689,7 @@ pub fn compile(
         // Compact field info staged by the caller (interpreter execute/OSR);
         // empty for tests/AOT → legacy/helper field path.
         PENDING_COMPACT_FIELD_INFO.with(|c| std::mem::take(&mut *c.borrow_mut())),
-        "", // method_key: legacy/test wrapper disables the per-bci de-spec consult
+        "",         // method_key: legacy/test wrapper disables the per-bci de-spec consult
         Vec::new(), // indy_info: legacy/test wrapper passes no invokedynamic sites
     )
 }
@@ -34889,10 +34888,10 @@ mod tests {
 
         let mut callee = make_inline_site(
             &[0x2a, 0xb7, 0x00, 0x02, 0xb1], // aload_0; invokespecial #2; return
-            1,     // max_locals (receiver)
-            1,     // num_args (receiver)
-            false, // instance method
-            b'V',  // void return
+            1,                               // max_locals (receiver)
+            1,                               // num_args (receiver)
+            false,                           // instance method
+            b'V',                            // void return
         );
         callee.elided_invoke_pcs = vec![1];
 
@@ -34926,13 +34925,7 @@ mod tests {
         ];
         let caller_len = 6;
 
-        let callee = make_inline_site(
-            &[0x2a, 0xb7, 0x00, 0x02, 0xb1],
-            1,
-            1,
-            false,
-            b'V',
-        );
+        let callee = make_inline_site(&[0x2a, 0xb7, 0x00, 0x02, 0xb1], 1, 1, false, b'V');
         // elided_invoke_pcs deliberately empty.
 
         let mut sites = HashMap::new();

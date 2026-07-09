@@ -7342,7 +7342,9 @@ pub(crate) fn register_scheduled_executor_natives(r: &mut NativeMethodRegistry) 
                     break;
                 }
                 let chunk = remaining.min(std::time::Duration::from_millis(25));
+                ctx.begin_blocking_region();
                 std::thread::sleep(chunk);
+                ctx.end_blocking_region();
             }
             Ok(Some(Value::Int(1)))
         },

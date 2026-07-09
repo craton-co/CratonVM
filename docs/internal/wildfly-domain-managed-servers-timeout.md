@@ -1,8 +1,42 @@
 # WildFly domain managed servers do not reach started state
 
-Status: OPEN (2026-07-08: stock-config empty-ServiceName collapse, loopback-interface criterion failure, Undertow HttpString parser-clinit, JBoss Modules caller/context ModuleLoader accessors, capability ServiceName null fallback, XNIO TCP accept-server binding, module-alias service-provider lookup, and the process-controller Process.waitFor STW/native watchdog gap are fixed/reduced. Remaining open residuals: no-JIT Arquillian awaitServers propagation gap; JIT-on literal-address WFLYSRV0082; stock domain now reaches Host Controller start-servers and fails the process-controller inventory path with Socket.getOutputStream: not connected, followed by watchdog stack dumps.)
+Status: FIXED (2026-07-09: stock WildFly 32.0.1 domain mode reaches Host Controller start and both managed servers start/connect/register under the clean `probe92` CratonVM build; no remaining `NoSuchMethodError`, CCE/NPE, constructor OOB, native watchdog `pending=1/taken=0`, or fatal signatures.)
 Date found: 2026-07-05
 Area: WildFly domain mode startup under CratonVM
+
+## 2026-07-09 Resolution - managed servers reach started/registered state
+
+Final probe branch/build: `codex/wildfly-close-socket-inventory-20260708-202526`, binaries:
+
+```text
+/data/data/bin/java-wildfly-close-socket-inventory-20260708-202526-probe92
+/data/data/bin/cratonvm-wildfly-close-socket-inventory-20260708-202526-probe92
+/data/data/cratonvm-javahome-wildfly-close-socket-inventory-20260708-202526-probe92
+```
+
+Final root causes closed in the last residual pass:
+
+1. `sun.reflect.ReflectionFactory` / `jdk.internal.reflect.ReflectionFactory` serialization helpers were registered in the essential native set and force-routed over the real JDK bytecode so `readObjectForSerialization`, `writeObjectForSerialization`, `readResolveForSerialization`, `writeReplaceForSerialization`, and serialization constructors return HotSpot-shaped null/MethodHandle/Constructor results.
+2. Real-layout `java.lang.reflect.Constructor` mirrors no longer read CratonVM extra metadata slots past `object_num_fields`; descriptor/parameter/accessibility reads now fall back to standard JDK fields or side-table metadata instead of producing the slot-15 constructor OOB seen immediately before the managed-server `Object.readObject` failure.
+3. Synthetic MethodHandle dispatch now neutralizes missing serialization hooks across static, special, and virtual dispatch paths, so a stale hook handle cannot escape as `java/lang/Object.readObject(ObjectInputStream)` and abort JBoss Marshalling during `DomainServerMain`.
+
+Verification:
+
+```text
+probe: /tmp/wildfly-close-socket-inventory-20260708-202526-probe92-clean-1783614658
+root_alive: yes at +520s
+server-one: root service started, WFLYHC0021 connected, WFLYHC0020 registered
+server-two: root service started, WFLYHC0021 connected, WFLYHC0020 registered
+Host Controller: WFLYSRV0025 started
+NoSuchMethodError: 0
+ClassCastException: 0
+NullPointerException: 0
+gen_heap::get_field OOB: 0
+pending=1 / taken=0 watchdog signature: 0 / 0
+FATAL: 0
+```
+
+A diagnostic run immediately before the clean run (`probe92-rfdbg-1783613991`) produced 725 `[rf-ser]` decisions, showed the ReflectionFactory route returning null for absent hooks and real handles for private hooks, and also reached both managed-server registration points without the previous failures.
 
 ## Symptom
 

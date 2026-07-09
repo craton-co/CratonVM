@@ -799,7 +799,10 @@ fn sc_is_connection_pending(ctx: &mut dyn NativeContext, args: &[Value]) -> Meth
         Some(v) => v,
         None => return Ok(Some(Value::Int(0))),
     };
-    let pending = matches!(tcp_registry().read().get(&id), Some(TcpHandle::Connecting(_)));
+    let pending = matches!(
+        tcp_registry().read().get(&id),
+        Some(TcpHandle::Connecting(_))
+    );
     Ok(Some(Value::Int(if pending { 1 } else { 0 })))
 }
 
@@ -2105,7 +2108,12 @@ pub fn register_socket_channel_real(r: &mut NativeMethodRegistry) {
             "(Ljava/net/SocketOption;)Ljava/lang/Object;",
             sc_get_option,
         );
-        r.register(c, "supportedOptions", "()Ljava/util/Set;", sc_supported_options);
+        r.register(
+            c,
+            "supportedOptions",
+            "()Ljava/util/Set;",
+            sc_supported_options,
+        );
     }
 
     // -- ServerSocketChannel factory + lifecycle --
@@ -2184,7 +2192,12 @@ pub fn register_socket_channel_real(r: &mut NativeMethodRegistry) {
             "(Ljava/net/SocketOption;)Ljava/lang/Object;",
             sc_get_option,
         );
-        r.register(c, "supportedOptions", "()Ljava/util/Set;", sc_supported_options);
+        r.register(
+            c,
+            "supportedOptions",
+            "()Ljava/util/Set;",
+            sc_supported_options,
+        );
         r.register(
             c,
             "getLocalAddress",

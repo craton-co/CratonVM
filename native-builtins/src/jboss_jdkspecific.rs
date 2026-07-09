@@ -472,7 +472,8 @@ pub(crate) fn native_module_layer_modules(
             let layer_pin = ctx.pin_native_root(*layer);
             let map_pin = ctx.pin_native_root(name_to_module);
             let map = ctx.read_native_pin(map_pin, name_to_module);
-            let values_result = ctx.invoke_virtual(map, "values", "()Ljava/util/Collection;", &[])?;
+            let values_result =
+                ctx.invoke_virtual(map, "values", "()Ljava/util/Collection;", &[])?;
             if let Some(Value::Object(Some(values))) = values_result {
                 let values_pin = ctx.pin_native_root(values);
                 let values = ctx.read_native_pin(values_pin, values);
@@ -603,11 +604,7 @@ fn build_unqualified_export(
     ctx: &mut dyn NativeContext,
     package_name: &str,
 ) -> Result<ObjectRef, cratonvm_types::error::MethodCallFailed> {
-    let export = alloc_concurrent_synthetic(
-        ctx,
-        "java/lang/module/ModuleDescriptor$Exports",
-        4,
-    );
+    let export = alloc_concurrent_synthetic(ctx, "java/lang/module/ModuleDescriptor$Exports", 4);
     let export_pin = ctx.pin_native_root(export);
     let mods = new_initialized_object(ctx, "java/util/HashSet", "()V", &[], "export mods")?;
     let targets = new_initialized_object(ctx, "java/util/HashSet", "()V", &[], "export targets")?;
@@ -636,15 +633,25 @@ fn build_boot_resolved_module(
     // Keep descriptor collection accessors from observing null if downstream
     // resolver or layer code asks for packages/exports/opens/etc. Empty
     // collections are sufficient for the boot-configuration resolver paths.
-    for field in ["modifiers", "requires", "exports", "opens", "uses", "provides", "packages"] {
+    for field in [
+        "modifiers",
+        "requires",
+        "exports",
+        "opens",
+        "uses",
+        "provides",
+        "packages",
+    ] {
         let empty = new_initialized_object(ctx, "java/util/HashSet", "()V", &[], field)?;
         let md = ctx.read_native_pin(md_pin, md);
         ctx.set_field_by_name(md, field, Value::Object(Some(empty)));
     }
 
-    let exports = new_initialized_object(ctx, "java/util/HashSet", "()V", &[], "boot module exports")?;
+    let exports =
+        new_initialized_object(ctx, "java/util/HashSet", "()V", &[], "boot module exports")?;
     let exports_pin = ctx.pin_native_root(exports);
-    let packages = new_initialized_object(ctx, "java/util/HashSet", "()V", &[], "boot module packages")?;
+    let packages =
+        new_initialized_object(ctx, "java/util/HashSet", "()V", &[], "boot module packages")?;
     let packages_pin = ctx.pin_native_root(packages);
     for package_name in package_names {
         let export = build_unqualified_export(ctx, package_name)?;
@@ -754,12 +761,14 @@ pub(crate) fn native_module_layer_configuration(
     let java_xml = ctx.read_native_pin(java_xml_pin, java_xml);
     collection_add(ctx, modules, java_xml)?;
 
-    let empty_reads = new_initialized_object(ctx, "java/util/HashSet", "()V", &[], "java.base reads")?;
+    let empty_reads =
+        new_initialized_object(ctx, "java/util/HashSet", "()V", &[], "java.base reads")?;
     let graph = ctx.read_native_pin(graph_pin, graph);
     let java_base = ctx.read_native_pin(java_base_pin, java_base);
     map_put(ctx, graph, java_base, empty_reads)?;
 
-    let java_xml_reads = new_initialized_object(ctx, "java/util/HashSet", "()V", &[], "java.xml reads")?;
+    let java_xml_reads =
+        new_initialized_object(ctx, "java/util/HashSet", "()V", &[], "java.xml reads")?;
     let java_base = ctx.read_native_pin(java_base_pin, java_base);
     collection_add(ctx, java_xml_reads, java_base)?;
     let graph = ctx.read_native_pin(graph_pin, graph);

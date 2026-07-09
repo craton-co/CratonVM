@@ -23,6 +23,7 @@ use cratonvm_types::{ArrayElementType, ClassId, ObjectKind, ObjectRef, Value};
 /// A recorded `invoke_virtual` call.
 #[derive(Debug, Clone)]
 pub(crate) struct InvokeCall {
+    pub declared_class: Option<String>,
     pub method_name: String,
     pub descriptor: String,
     pub args: Vec<Value>,
@@ -250,11 +251,37 @@ impl NativeContext for MockNativeContext {
         // Record the call so tests can assert on it.
         let calls = unsafe { &mut *self.calls.get() };
         calls.push(InvokeCall {
+            declared_class: None,
             method_name: method_name.to_string(),
             descriptor: descriptor.to_string(),
             args: args.to_vec(),
         });
         // Find the first matching script (FIFO per key).
+        if let Some(pos) = self
+            .scripts
+            .iter()
+            .position(|s| s.method_name == method_name && s.descriptor == descriptor)
+        {
+            return self.scripts.remove(pos).result;
+        }
+        Ok(None)
+    }
+
+    fn invoke_virtual_declared(
+        &mut self,
+        declared_class: &str,
+        _receiver: ObjectRef,
+        method_name: &str,
+        descriptor: &str,
+        args: &[Value],
+    ) -> MethodCallResult {
+        let calls = unsafe { &mut *self.calls.get() };
+        calls.push(InvokeCall {
+            declared_class: Some(declared_class.to_string()),
+            method_name: method_name.to_string(),
+            descriptor: descriptor.to_string(),
+            args: args.to_vec(),
+        });
         if let Some(pos) = self
             .scripts
             .iter()

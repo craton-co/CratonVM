@@ -202,7 +202,9 @@ fn stdin_stdio(spec: &StdioRedirect) -> Result<(Stdio, bool), RuntimeError> {
         StdioRedirect::Null => Ok((Stdio::null(), false)),
         StdioRedirect::ReadFile(path) => Ok((Stdio::from(open_redirect_input(path)?), false)),
         StdioRedirect::WriteFile { path, .. } => Err(RuntimeError::IOException {
-            message: format!("ProcessBuilder.redirectInput cannot read from output redirect: {path}"),
+            message: format!(
+                "ProcessBuilder.redirectInput cannot read from output redirect: {path}"
+            ),
         }),
     }
 }
@@ -254,13 +256,17 @@ fn configure_stdio(
             }
             StdioRedirect::WriteFile { path, append } => {
                 let file = open_redirect_output(path, *append)?;
-                let file2 = file.try_clone().map_err(|e| redirect_io_error("redirectError", path, e))?;
+                let file2 = file
+                    .try_clone()
+                    .map_err(|e| redirect_io_error("redirectError", path, e))?;
                 command.stdout(Stdio::from(file));
                 command.stderr(Stdio::from(file2));
                 Ok((stdin_piped, false, false, None))
             }
             StdioRedirect::ReadFile(path) => Err(RuntimeError::IOException {
-                message: format!("ProcessBuilder.redirectOutput cannot write to input redirect: {path}"),
+                message: format!(
+                    "ProcessBuilder.redirectOutput cannot write to input redirect: {path}"
+                ),
             }),
         }
     } else {
@@ -2010,7 +2016,11 @@ mod tests {
 
         let result = native_process_wait_for_timeout(
             &mut ctx,
-            &[Value::Object(Some(proc_ref)), Value::Long(20), Value::Object(None)],
+            &[
+                Value::Object(Some(proc_ref)),
+                Value::Long(20),
+                Value::Object(None),
+            ],
         )
         .unwrap()
         .unwrap();

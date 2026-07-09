@@ -3331,7 +3331,7 @@ fn native_filteros_close(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
     // close the wrapped stream so its close()/finish() runs.
     let _ = ctx.invoke_virtual(this, "flush", "()V", &[]);
     if let Value::Object(Some(out)) = ctx.get_field(this, 0) {
-        let _ = ctx.invoke_virtual(out, "close", "()V", &[]);
+        let _ = ctx.invoke_virtual_declared("java/io/OutputStream", out, "close", "()V", &[]);
     }
     Ok(None)
 }
@@ -4574,14 +4574,11 @@ pub fn register_io_natives(registry: &mut NativeMethodRegistry) {
         #[cfg(unix)]
         pub const SIZEOF_FAMILY: i32 = std::mem::size_of::<libc::sa_family_t>() as i32;
         #[cfg(unix)]
-        pub const OFFSET_FAMILY: i32 =
-            std::mem::offset_of!(libc::sockaddr_in, sin_family) as i32;
+        pub const OFFSET_FAMILY: i32 = std::mem::offset_of!(libc::sockaddr_in, sin_family) as i32;
         #[cfg(unix)]
-        pub const OFFSET_SIN4_PORT: i32 =
-            std::mem::offset_of!(libc::sockaddr_in, sin_port) as i32;
+        pub const OFFSET_SIN4_PORT: i32 = std::mem::offset_of!(libc::sockaddr_in, sin_port) as i32;
         #[cfg(unix)]
-        pub const OFFSET_SIN4_ADDR: i32 =
-            std::mem::offset_of!(libc::sockaddr_in, sin_addr) as i32;
+        pub const OFFSET_SIN4_ADDR: i32 = std::mem::offset_of!(libc::sockaddr_in, sin_addr) as i32;
         #[cfg(unix)]
         pub const OFFSET_SIN6_PORT: i32 =
             std::mem::offset_of!(libc::sockaddr_in6, sin6_port) as i32;
@@ -4630,12 +4627,18 @@ pub fn register_io_natives(registry: &mut NativeMethodRegistry) {
     // are provided as literals in `sockaddr_abi` below (note AF_INET6 is
     // 23 on Windows vs 10 on Linux).
     use sockaddr_abi as sa;
-    registry.register("sun/nio/ch/NativeSocketAddress", "AFINET", "()I", |_ctx, _args| {
-        Ok(Some(Value::Int(sa::AF_INET)))
-    });
-    registry.register("sun/nio/ch/NativeSocketAddress", "AFINET6", "()I", |_ctx, _args| {
-        Ok(Some(Value::Int(sa::AF_INET6)))
-    });
+    registry.register(
+        "sun/nio/ch/NativeSocketAddress",
+        "AFINET",
+        "()I",
+        |_ctx, _args| Ok(Some(Value::Int(sa::AF_INET))),
+    );
+    registry.register(
+        "sun/nio/ch/NativeSocketAddress",
+        "AFINET6",
+        "()I",
+        |_ctx, _args| Ok(Some(Value::Int(sa::AF_INET6))),
+    );
     registry.register(
         "sun/nio/ch/NativeSocketAddress",
         "sizeofSockAddr4",
@@ -8230,7 +8233,7 @@ fn native_dos_flush(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRe
         _ => return Ok(None),
     };
     if let Value::Object(Some(inner)) = ctx.get_field(this, DOS_FIELD_OUT) {
-        ctx.invoke_virtual(inner, "flush", "()V", &[])?;
+        ctx.invoke_virtual_declared("java/io/OutputStream", inner, "flush", "()V", &[])?;
     }
     Ok(None)
 }
@@ -8243,8 +8246,8 @@ fn native_dos_close(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRe
         _ => return Ok(None),
     };
     if let Value::Object(Some(inner)) = ctx.get_field(this, DOS_FIELD_OUT) {
-        let _ = ctx.invoke_virtual(inner, "flush", "()V", &[]);
-        ctx.invoke_virtual(inner, "close", "()V", &[])?;
+        let _ = ctx.invoke_virtual_declared("java/io/OutputStream", inner, "flush", "()V", &[]);
+        ctx.invoke_virtual_declared("java/io/OutputStream", inner, "close", "()V", &[])?;
     }
     Ok(None)
 }
@@ -11014,7 +11017,7 @@ fn native_bos_close(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRe
     //    `try (out) {}` block in BufferedOutputStream.close).
     let (out_slot, _, _) = bos_slots(ctx);
     if let Value::Object(Some(inner)) = ctx.get_field(this, out_slot) {
-        ctx.invoke_virtual(inner, "close", "()V", &[])?;
+        ctx.invoke_virtual_declared("java/io/OutputStream", inner, "close", "()V", &[])?;
     }
     Ok(None)
 }
@@ -15878,6 +15881,31 @@ mod io_tests {
         assert!(r.find(dos, "<init>", "(Ljava/io/OutputStream;)V").is_some());
         assert!(r.find(dos, "writeInt", "(I)V").is_some());
         assert!(r.find(dos, "writeLong", "(J)V").is_some());
+    }
+
+    #[test]
+    fn data_output_stream_close_uses_declared_outputstream_for_inner_close() {
+        let mut ctx = MockNativeContext::new();
+        let dos = ctx.alloc_object(1);
+        let inner = ctx.alloc_object_with_class(0, "java/lang/Object");
+        ctx.set_field(dos, DOS_FIELD_OUT, Value::Object(Some(inner)));
+
+        native_dos_close(&mut ctx, &[Value::Object(Some(dos))]).unwrap();
+
+        let calls = ctx.recorded_calls();
+        assert_eq!(calls.len(), 2);
+        assert_eq!(
+            calls[0].declared_class.as_deref(),
+            Some("java/io/OutputStream")
+        );
+        assert_eq!(calls[0].method_name, "flush");
+        assert_eq!(calls[0].descriptor, "()V");
+        assert_eq!(
+            calls[1].declared_class.as_deref(),
+            Some("java/io/OutputStream")
+        );
+        assert_eq!(calls[1].method_name, "close");
+        assert_eq!(calls[1].descriptor, "()V");
     }
 
     // BufferedReader / BufferedWriter overrides are synthetic-jdk only;

@@ -81,7 +81,7 @@ use std::time::Duration;
 
 use cratonvm_native_api::{NativeContext, NativeMethodRegistry};
 use cratonvm_types::error::{MethodCallFailed, MethodCallResult, RuntimeError, VmError};
-use cratonvm_types::{ObjectRef, Value};
+use cratonvm_types::{ArrayElementType, ObjectRef, Value};
 
 use crate::{alloc_concurrent_synthetic, obj_arg};
 
@@ -229,6 +229,40 @@ fn alloc_header_map_id() -> u64 {
     id
 }
 
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+struct HeaderMapObjKey {
+    vm: usize,
+    identity: i32,
+}
+
+fn header_map_obj_key(ctx: &dyn NativeContext, obj: ObjectRef) -> HeaderMapObjKey {
+    HeaderMapObjKey {
+        vm: ctx.vm_identity(),
+        identity: ctx.identity_hash_code(obj),
+    }
+}
+
+fn header_map_obj_registry() -> &'static Mutex<HashMap<HeaderMapObjKey, u64>> {
+    static R: OnceLock<Mutex<HashMap<HeaderMapObjKey, u64>>> = OnceLock::new();
+    R.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn remember_header_map_obj(ctx: &dyn NativeContext, obj: ObjectRef, id: u64) {
+    header_map_obj_registry()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .insert(header_map_obj_key(ctx, obj), id);
+}
+
+fn header_map_id_of(ctx: &dyn NativeContext, obj: ObjectRef) -> u64 {
+    header_map_obj_registry()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(&header_map_obj_key(ctx, obj))
+        .copied()
+        .unwrap_or_else(|| ctx.get_field(obj, HM_FIELD_ID).as_long().unwrap_or(0) as u64)
+}
+
 /// Put a header into the referenced map. Rejects values containing CR/LF to
 /// prevent HTTP response splitting.
 pub fn header_map_put(id: u64, name: &str, value: &str) -> Result<(), &'static str> {
@@ -250,6 +284,22 @@ pub fn header_map_get(id: u64, name: &str) -> Option<String> {
     t.get(&id)
         .and_then(|m| m.get(&name.to_ascii_lowercase()))
         .and_then(|v| v.first().cloned())
+}
+
+/// Read the value at a specific header index (case-insensitive), or `None`.
+pub fn header_map_get_at(id: u64, name: &str, index: usize) -> Option<String> {
+    let t = header_maps().lock().unwrap_or_else(|e| e.into_inner());
+    t.get(&id)
+        .and_then(|m| m.get(&name.to_ascii_lowercase()))
+        .and_then(|v| v.get(index).cloned())
+}
+
+/// Count values for a header (case-insensitive).
+pub fn header_map_count(id: u64, name: &str) -> usize {
+    let t = header_maps().lock().unwrap_or_else(|e| e.into_inner());
+    t.get(&id)
+        .and_then(|m| m.get(&name.to_ascii_lowercase()))
+        .map_or(0, Vec::len)
 }
 
 /// Free a header map id (release the inner HashMap so closed exchanges
@@ -653,13 +703,19 @@ fn native_undertow_stop(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCa
 fn native_header_map_init(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = obj_arg(args, 0)?;
     let id = alloc_header_map_id();
-    ctx.set_field(this, HM_FIELD_ID, Value::Long(id as i64));
+    remember_header_map_obj(ctx, this, id);
+    if !class_has_field(ctx, CLS_HEADER_MAP, "table") {
+        ctx.set_field(this, HM_FIELD_ID, Value::Long(id as i64));
+    }
+    let table = ctx.new_ref_array(cratonvm_types::ClassId::new(0), 16);
+    ctx.set_field_by_name(this, "table", Value::Object(Some(table)));
+    ctx.set_field_by_name(this, "size", Value::Int(0));
     Ok(None)
 }
 
 fn native_header_map_put(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = obj_arg(args, 0)?;
-    let id = ctx.get_field(this, HM_FIELD_ID).as_long().unwrap_or(0) as u64;
+    let id = header_map_id_of(ctx, this);
     let name = read_http_string(ctx, args.get(1).copied()).unwrap_or_default();
     let value = match args.get(2).copied() {
         Some(Value::Object(Some(o))) => ctx.read_string(o).unwrap_or_default(),
@@ -670,12 +726,75 @@ fn native_header_map_put(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
             message: msg.to_string(),
         }))
     })?;
+    if class_has_field(ctx, CLS_HEADER_MAP, "table") {
+        let this_pin = ctx.pin_native_root(this);
+        if let Some(Value::Object(Some(name))) = args.get(1).copied() {
+            ctx.pin_native_root(name);
+        }
+        if let Some(Value::Object(Some(value))) = args.get(2).copied() {
+            ctx.pin_native_root(value);
+        }
+        let _ = ctx.invoke(
+            CLS_HEADER_MAP,
+            "remove",
+            "(Lio/undertow/util/HttpString;)Ljava/util/Collection;",
+            &args[..2],
+        )?;
+        let this = ctx.read_native_pin(this_pin, this);
+        let result = if matches!(args.get(2), Some(Value::Object(None)) | None) {
+            Ok(Some(Value::Object(Some(this))))
+        } else {
+            ctx.invoke(
+                CLS_HEADER_MAP,
+                "addLast",
+                "(Lio/undertow/util/HttpString;Ljava/lang/String;)Lio/undertow/util/HeaderMap;",
+                args,
+            )
+        };
+        ctx.unpin_native_roots(this_pin);
+        return result;
+    }
     Ok(Some(Value::Object(Some(this))))
+}
+
+fn native_header_map_add(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = obj_arg(args, 0)?;
+    let id = header_map_id_of(ctx, this);
+    let name = read_http_string(ctx, args.get(1).copied()).unwrap_or_default();
+    let value = match args.get(2).copied() {
+        Some(Value::Object(Some(o))) => ctx.read_string(o).unwrap_or_default(),
+        _ => String::new(),
+    };
+    header_map_put(id, &name, &value).map_err(|msg| {
+        MethodCallFailed::InternalError(VmError::Runtime(RuntimeError::IOException {
+            message: msg.to_string(),
+        }))
+    })?;
+    if class_has_field(ctx, CLS_HEADER_MAP, "table") {
+        return ctx.invoke(
+            CLS_HEADER_MAP,
+            "addLast",
+            "(Lio/undertow/util/HttpString;Ljava/lang/String;)Lio/undertow/util/HeaderMap;",
+            args,
+        );
+    }
+    Ok(Some(Value::Object(Some(this))))
+}
+
+fn native_header_map_contains(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = obj_arg(args, 0)?;
+    let id = header_map_id_of(ctx, this);
+    let name = read_http_string(ctx, args.get(1).copied()).unwrap_or_default();
+    Ok(Some(Value::Int(if header_map_get(id, &name).is_some() {
+        1
+    } else {
+        0
+    })))
 }
 
 fn native_header_map_get(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = obj_arg(args, 0)?;
-    let id = ctx.get_field(this, HM_FIELD_ID).as_long().unwrap_or(0) as u64;
+    let id = header_map_id_of(ctx, this);
     let name = read_http_string(ctx, args.get(1).copied()).unwrap_or_default();
     match header_map_get(id, &name) {
         Some(v) => {
@@ -686,11 +805,72 @@ fn native_header_map_get(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
     }
 }
 
+fn native_header_map_get_indexed(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = obj_arg(args, 0)?;
+    let id = header_map_id_of(ctx, this);
+    let name = read_http_string(ctx, args.get(1).copied()).unwrap_or_default();
+    let index = args.get(2).and_then(|v| v.as_int()).unwrap_or(0);
+    if index < 0 {
+        return Ok(Some(Value::Object(None)));
+    }
+    match header_map_get_at(id, &name, index as usize) {
+        Some(v) => {
+            let s = ctx.create_string(&v);
+            Ok(Some(Value::Object(Some(s))))
+        }
+        None => Ok(Some(Value::Object(None))),
+    }
+}
+
+fn native_header_map_count(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = obj_arg(args, 0)?;
+    let id = header_map_id_of(ctx, this);
+    let name = read_http_string(ctx, args.get(1).copied()).unwrap_or_default();
+    Ok(Some(Value::Int(header_map_count(id, &name) as i32)))
+}
+
+fn http_string_higher(b: u8) -> i32 {
+    if b.is_ascii_lowercase() {
+        (b & 0xdf) as i32
+    } else {
+        b as i32
+    }
+}
+
+fn http_string_hash_code(bytes: &[u8]) -> i32 {
+    let mut hash = 17i32;
+    for b in bytes {
+        hash = hash.wrapping_mul(17).wrapping_add(http_string_higher(*b));
+    }
+    hash
+}
+
 fn native_http_string_init(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = obj_arg(args, 0)?;
-    let text = args.get(1).copied().unwrap_or(Value::Object(None));
-    ctx.set_field(this, HS_FIELD_BYTES, text);
-    ctx.set_field_by_name(this, "string", text);
+    let text_arg = args.get(1).copied().unwrap_or(Value::Object(None));
+    let text = match text_arg {
+        Value::Object(Some(s)) => ctx.read_string(s).unwrap_or_default(),
+        _ => String::new(),
+    };
+    let string_obj = match text_arg {
+        Value::Object(Some(s)) if ctx.read_string(s).is_some() => s,
+        _ => ctx.create_string(&text),
+    };
+
+    if class_has_field(ctx, CLS_HTTP_STRING, "bytes") {
+        let bytes = text.as_bytes();
+        let arr = ctx.new_array(ArrayElementType::Byte, bytes.len());
+        for (i, b) in bytes.iter().enumerate() {
+            ctx.set_array_element(arr, i, Value::Int(*b as i8 as i32));
+        }
+        ctx.set_field_by_name(this, "bytes", Value::Object(Some(arr)));
+        ctx.set_field_by_name(this, "hashCode", Value::Int(http_string_hash_code(bytes)));
+        ctx.set_field_by_name(this, "orderInt", Value::Int(0));
+        ctx.set_field_by_name(this, "string", Value::Object(Some(string_obj)));
+    } else {
+        ctx.set_field(this, HS_FIELD_BYTES, Value::Object(Some(string_obj)));
+        ctx.set_field_by_name(this, "string", Value::Object(Some(string_obj)));
+    }
     Ok(None)
 }
 
@@ -723,6 +903,37 @@ fn native_http_string_to_string(ctx: &mut dyn NativeContext, args: &[Value]) -> 
     Ok(Some(Value::Object(http_string_text(ctx, this))))
 }
 
+fn native_http_string_append_to(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = obj_arg(args, 0)?;
+    let buffer = obj_arg(args, 1)?;
+    let text = read_http_string(ctx, Some(Value::Object(Some(this)))).unwrap_or_default();
+    let bytes = text.as_bytes();
+    let arr = ctx.new_array(ArrayElementType::Byte, bytes.len());
+    for (i, b) in bytes.iter().enumerate() {
+        ctx.set_array_element(arr, i, Value::Int(*b as i8 as i32));
+    }
+    ctx.invoke_virtual(
+        buffer,
+        "put",
+        "([B)Ljava/nio/ByteBuffer;",
+        &[Value::Object(Some(arr))],
+    )?;
+    Ok(None)
+}
+
+fn read_ascii_byte_array(ctx: &dyn NativeContext, arr: ObjectRef) -> Option<String> {
+    if !ctx.object_is_array(arr) {
+        return None;
+    }
+    let len = ctx.array_length(arr);
+    let mut out = String::with_capacity(len);
+    for i in 0..len {
+        let b = ctx.get_array_element(arr, i).as_int().unwrap_or(0) as u8;
+        out.push(char::from(b));
+    }
+    Some(out)
+}
+
 /// Read a `HttpString` (or plain String) back into a Rust `String`.
 fn read_http_string(ctx: &dyn NativeContext, v: Option<Value>) -> Option<String> {
     match v? {
@@ -734,6 +945,9 @@ fn read_http_string(ctx: &dyn NativeContext, v: Option<Value>) -> Option<String>
             if nf >= 1 {
                 if let Value::Object(Some(inner)) = ctx.get_field(o, HS_FIELD_BYTES) {
                     if let Some(s) = ctx.read_string(inner) {
+                        return Some(s);
+                    }
+                    if let Some(s) = read_ascii_byte_array(ctx, inner) {
                         return Some(s);
                     }
                 }
@@ -753,12 +967,85 @@ fn read_http_string(ctx: &dyn NativeContext, v: Option<Value>) -> Option<String>
 // Natives — HttpServerExchange
 // ---------------------------------------------------------------------------
 
+const UNDERTOW_RESPONSE_CODE_MASK: i32 = 0x3ff;
+
+fn class_has_field(ctx: &dyn NativeContext, class_name: &str, field_name: &str) -> bool {
+    ctx.resolve_field_index(class_name, field_name).is_some()
+}
+
+fn exchange_uses_real_layout(ctx: &dyn NativeContext, this: ObjectRef, field_name: &str) -> bool {
+    class_has_field(ctx, CLS_EXCHANGE, field_name) && ctx.object_num_fields(this) > EX_NUM_SLOTS
+}
+
+fn exchange_field_or_synthetic(
+    ctx: &dyn NativeContext,
+    this: ObjectRef,
+    field_name: &str,
+    synthetic_slot: usize,
+) -> Value {
+    if exchange_uses_real_layout(ctx, this, field_name) {
+        ctx.get_field_by_name(this, field_name)
+    } else {
+        ctx.get_field(this, synthetic_slot)
+    }
+}
+
+fn alloc_header_map_for_exchange(
+    ctx: &mut dyn NativeContext,
+) -> Result<ObjectRef, MethodCallFailed> {
+    if class_has_field(ctx, CLS_HEADER_MAP, "table") {
+        match ctx.new_object_initialized(CLS_HEADER_MAP, "()V", &[])? {
+            Some(Value::Object(Some(map))) => Ok(map),
+            other => Err(MethodCallFailed::InternalError(VmError::Internal {
+                message: format!("HeaderMap allocation returned {other:?}"),
+            })),
+        }
+    } else {
+        let map = alloc_concurrent_synthetic(ctx, CLS_HEADER_MAP, HM_NUM_SLOTS);
+        native_header_map_init(ctx, &[Value::Object(Some(map))])?;
+        Ok(map)
+    }
+}
+
+fn exchange_header_map_or_create(
+    ctx: &mut dyn NativeContext,
+    this: ObjectRef,
+    field_name: &str,
+    synthetic_slot: usize,
+) -> MethodCallResult {
+    if exchange_uses_real_layout(ctx, this, field_name) {
+        if let Value::Object(Some(map)) = ctx.get_field_by_name(this, field_name) {
+            return Ok(Some(Value::Object(Some(map))));
+        }
+        let this_pin = ctx.pin_native_root(this);
+        let map = alloc_header_map_for_exchange(ctx)?;
+        let this = ctx.read_native_pin(this_pin, this);
+        ctx.set_field_by_name(this, field_name, Value::Object(Some(map)));
+        ctx.unpin_native_roots(this_pin);
+        Ok(Some(Value::Object(Some(map))))
+    } else {
+        match ctx.get_field(this, synthetic_slot) {
+            Value::Object(Some(map)) => Ok(Some(Value::Object(Some(map)))),
+            _ => {
+                let map = alloc_header_map_for_exchange(ctx)?;
+                ctx.set_field(this, synthetic_slot, Value::Object(Some(map)));
+                Ok(Some(Value::Object(Some(map))))
+            }
+        }
+    }
+}
+
 fn native_exchange_get_request_method(
     ctx: &mut dyn NativeContext,
     args: &[Value],
 ) -> MethodCallResult {
     let this = obj_arg(args, 0)?;
-    Ok(Some(ctx.get_field(this, EX_FIELD_METHOD)))
+    Ok(Some(exchange_field_or_synthetic(
+        ctx,
+        this,
+        "requestMethod",
+        EX_FIELD_METHOD,
+    )))
 }
 
 fn native_exchange_get_request_uri(
@@ -766,7 +1053,12 @@ fn native_exchange_get_request_uri(
     args: &[Value],
 ) -> MethodCallResult {
     let this = obj_arg(args, 0)?;
-    Ok(Some(ctx.get_field(this, EX_FIELD_URI)))
+    Ok(Some(exchange_field_or_synthetic(
+        ctx,
+        this,
+        "requestURI",
+        EX_FIELD_URI,
+    )))
 }
 
 fn native_exchange_get_request_headers(
@@ -774,7 +1066,7 @@ fn native_exchange_get_request_headers(
     args: &[Value],
 ) -> MethodCallResult {
     let this = obj_arg(args, 0)?;
-    Ok(Some(ctx.get_field(this, EX_FIELD_REQUEST_HEADERS)))
+    exchange_header_map_or_create(ctx, this, "requestHeaders", EX_FIELD_REQUEST_HEADERS)
 }
 
 fn native_exchange_get_response_headers(
@@ -782,7 +1074,7 @@ fn native_exchange_get_response_headers(
     args: &[Value],
 ) -> MethodCallResult {
     let this = obj_arg(args, 0)?;
-    Ok(Some(ctx.get_field(this, EX_FIELD_RESPONSE_HEADERS)))
+    exchange_header_map_or_create(ctx, this, "responseHeaders", EX_FIELD_RESPONSE_HEADERS)
 }
 
 fn native_exchange_set_status_code(
@@ -791,7 +1083,13 @@ fn native_exchange_set_status_code(
 ) -> MethodCallResult {
     let this = obj_arg(args, 0)?;
     let status = args.get(1).and_then(|v| v.as_int()).unwrap_or(200);
-    ctx.set_field(this, EX_FIELD_RESPONSE_STATUS, Value::Int(status));
+    if exchange_uses_real_layout(ctx, this, "state") {
+        let state = ctx.get_field_by_name(this, "state").as_int().unwrap_or(0);
+        let next = (state & !UNDERTOW_RESPONSE_CODE_MASK) | (status & UNDERTOW_RESPONSE_CODE_MASK);
+        ctx.set_field_by_name(this, "state", Value::Int(next));
+    } else {
+        ctx.set_field(this, EX_FIELD_RESPONSE_STATUS, Value::Int(status));
+    }
     Ok(Some(Value::Object(Some(this))))
 }
 
@@ -802,15 +1100,54 @@ fn native_exchange_get_response_sender(
     let this = obj_arg(args, 0)?;
     // If a sender hasn't been allocated yet, mint one whose field 0 points
     // back to the exchange so `send()` can find the body slot.
-    match ctx.get_field(this, EX_FIELD_RESPONSE_SENDER) {
+    let existing = if exchange_uses_real_layout(ctx, this, "sender") {
+        ctx.get_field_by_name(this, "sender")
+    } else {
+        ctx.get_field(this, EX_FIELD_RESPONSE_SENDER)
+    };
+    match existing {
         Value::Object(Some(s)) => Ok(Some(Value::Object(Some(s)))),
         _ => {
             let sender = alloc_concurrent_synthetic(ctx, CLS_SENDER, 1);
             ctx.set_field(sender, 0, Value::Object(Some(this)));
-            ctx.set_field(this, EX_FIELD_RESPONSE_SENDER, Value::Object(Some(sender)));
+            if exchange_uses_real_layout(ctx, this, "sender") {
+                ctx.set_field_by_name(this, "sender", Value::Object(Some(sender)));
+            } else {
+                ctx.set_field(this, EX_FIELD_RESPONSE_SENDER, Value::Object(Some(sender)));
+            }
             Ok(Some(Value::Object(Some(sender))))
         }
     }
+}
+
+fn real_exchange_force_empty_response_body(
+    ctx: &mut dyn NativeContext,
+    exchange: ObjectRef,
+) -> MethodCallResult {
+    let Some(Value::Object(Some(headers))) =
+        native_exchange_get_response_headers(ctx, &[Value::Object(Some(exchange))])?
+    else {
+        return Ok(None);
+    };
+    let name_text = ctx.create_string("Content-Length");
+    let name = match ctx.new_object_initialized(
+        CLS_HTTP_STRING,
+        "(Ljava/lang/String;)V",
+        &[Value::Object(Some(name_text))],
+    )? {
+        Some(Value::Object(Some(o))) => o,
+        _ => name_text,
+    };
+    let zero = ctx.create_string("0");
+    let _ = native_header_map_put(
+        ctx,
+        &[
+            Value::Object(Some(headers)),
+            Value::Object(Some(name)),
+            Value::Object(Some(zero)),
+        ],
+    )?;
+    Ok(None)
 }
 
 fn native_sender_send(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
@@ -821,10 +1158,16 @@ fn native_sender_send(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
         _ => return Ok(None),
     };
     if let Some(body_v) = args.get(1).copied() {
-        // Store directly into EX_FIELD_RESPONSE_SENDER's body slot — we
-        // reuse the request_body field for response body as well to
-        // avoid growing the synthetic layout.
-        ctx.set_field(exchange, EX_FIELD_REQUEST_BODY, body_v);
+        // Synthetic exchanges use slot 3 as a test-only response body stash.
+        // Real Undertow's `HttpServerExchange` inherits one field from
+        // `AbstractAttachable`, making slot 3 its actual `responseHeaders`
+        // HeaderMap. Writing a body String there corrupts
+        // `closeAndFlushResponse()` into `String.put(HttpString, String)`.
+        if !exchange_uses_real_layout(ctx, exchange, "responseHeaders") {
+            ctx.set_field(exchange, EX_FIELD_REQUEST_BODY, body_v);
+        } else {
+            real_exchange_force_empty_response_body(ctx, exchange)?;
+        }
     }
     Ok(None)
 }
@@ -879,7 +1222,11 @@ pub fn dispatch_handler(
     match outcome {
         Ok(r) => r,
         Err(_payload) => {
-            ctx.set_field(exchange, EX_FIELD_RESPONSE_STATUS, Value::Int(500));
+            if exchange_uses_real_layout(ctx, exchange, "state") {
+                ctx.set_field_by_name(exchange, "state", Value::Int(500));
+            } else {
+                ctx.set_field(exchange, EX_FIELD_RESPONSE_STATUS, Value::Int(500));
+            }
             Ok(None)
         }
     }
@@ -953,9 +1300,63 @@ pub fn register_undertow_natives(r: &mut NativeMethodRegistry) {
     );
     r.register(
         CLS_HEADER_MAP,
+        "add",
+        "(Lio/undertow/util/HttpString;Ljava/lang/String;)Lio/undertow/util/HeaderMap;",
+        native_header_map_add,
+    );
+    r.register(
+        CLS_HEADER_MAP,
+        "contains",
+        "(Lio/undertow/util/HttpString;)Z",
+        native_header_map_contains,
+    );
+    r.register(
+        CLS_HEADER_MAP,
+        "getFirst",
+        "(Lio/undertow/util/HttpString;)Ljava/lang/String;",
+        native_header_map_get,
+    );
+    r.register(
+        CLS_HEADER_MAP,
+        "getFirst",
+        "(Ljava/lang/String;)Ljava/lang/String;",
+        native_header_map_get,
+    );
+    r.register(
+        CLS_HEADER_MAP,
         "get",
         "(Lio/undertow/util/HttpString;)Ljava/lang/String;",
         native_header_map_get,
+    );
+    r.register(
+        CLS_HEADER_MAP,
+        "get",
+        "(Lio/undertow/util/HttpString;I)Ljava/lang/String;",
+        native_header_map_get_indexed,
+    );
+    r.register(
+        CLS_HEADER_MAP,
+        "get",
+        "(Ljava/lang/String;I)Ljava/lang/String;",
+        native_header_map_get_indexed,
+    );
+    r.register(
+        CLS_HEADER_MAP,
+        "contains",
+        "(Ljava/lang/String;)Z",
+        native_header_map_contains,
+    );
+    r.register(
+        CLS_HEADER_MAP,
+        "count",
+        "(Lio/undertow/util/HttpString;)I",
+        native_header_map_count,
+    );
+    r.register(
+        CLS_HEADER_MAP,
+        "count",
+        "(Ljava/lang/String;)I",
+        native_header_map_count,
     );
     // Convenience string-named overload for tests.
     r.register(
@@ -981,6 +1382,12 @@ pub fn register_undertow_natives(r: &mut NativeMethodRegistry) {
         "toString",
         "()Ljava/lang/String;",
         native_http_string_to_string,
+    );
+    r.register(
+        CLS_HTTP_STRING,
+        "appendTo",
+        "(Ljava/nio/ByteBuffer;)V",
+        native_http_string_append_to,
     );
     // Let Undertow's real Headers.<clinit> populate HttpString constants.
     // HttpRequestParser reflects over Headers/Methods/Protocols and expects
@@ -1071,6 +1478,7 @@ pub fn register_undertow_natives(r: &mut NativeMethodRegistry) {
 mod tests {
     use super::*;
     use crate::test_utils::mock_ctx;
+    use cratonvm_native_api::NativeMethodRegistry;
 
     // -------- Parser-only unit tests --------
 
@@ -1286,6 +1694,33 @@ mod tests {
     }
 
     #[test]
+    fn t19_2_d_http_string_hash_is_ascii_case_insensitive() {
+        assert_eq!(http_string_higher(b'a'), b'A' as i32);
+        assert_eq!(http_string_higher(b'Z'), b'Z' as i32);
+        assert_eq!(
+            http_string_hash_code(b"Connection"),
+            http_string_hash_code(b"connection")
+        );
+        assert_ne!(http_string_hash_code(b"HTTP/1.1"), 0);
+    }
+
+    #[test]
+    fn t19_2_d_http_string_synthetic_init_round_trips_text() {
+        let mut ctx = mock_ctx();
+        let hs = alloc_concurrent_synthetic(&mut ctx, CLS_HTTP_STRING, HS_NUM_SLOTS);
+        let text = ctx.create_string("HTTP/1.1");
+        native_http_string_init(
+            &mut ctx,
+            &[Value::Object(Some(hs)), Value::Object(Some(text))],
+        )
+        .unwrap();
+        assert_eq!(
+            read_http_string(&ctx, Some(Value::Object(Some(hs)))),
+            Some("HTTP/1.1".to_string())
+        );
+    }
+
+    #[test]
     fn t19_2_d_header_map_put_get_round_trip() {
         let mut ctx = mock_ctx();
         let hm = alloc_concurrent_synthetic(&mut ctx, CLS_HEADER_MAP, HM_NUM_SLOTS);
@@ -1310,6 +1745,61 @@ mod tests {
             other => panic!("expected string, got {other:?}"),
         };
         assert_eq!(got_s, "application/json");
+    }
+
+    #[test]
+    fn t19_2_d_header_map_get_first_string_round_trip_remoting_key() {
+        let mut ctx = mock_ctx();
+        let hm = alloc_concurrent_synthetic(&mut ctx, CLS_HEADER_MAP, HM_NUM_SLOTS);
+        native_header_map_init(&mut ctx, &[Value::Object(Some(hm))]).unwrap();
+        let k = ctx.create_string("Sec-JbossRemoting-Key");
+        let v = ctx.create_string("2DDsEnGla2nNyCzrLngBkw==");
+        native_header_map_add(
+            &mut ctx,
+            &[
+                Value::Object(Some(hm)),
+                Value::Object(Some(k)),
+                Value::Object(Some(v)),
+            ],
+        )
+        .unwrap();
+
+        let lookup = ctx.create_string("Sec-JbossRemoting-Key");
+        let got = native_header_map_get(
+            &mut ctx,
+            &[Value::Object(Some(hm)), Value::Object(Some(lookup))],
+        )
+        .unwrap()
+        .unwrap();
+        let got_s = match got {
+            Value::Object(Some(o)) => ctx.read_string(o).unwrap_or_default(),
+            other => panic!("expected string, got {other:?}"),
+        };
+        assert_eq!(got_s, "2DDsEnGla2nNyCzrLngBkw==");
+
+        let count = native_header_map_count(
+            &mut ctx,
+            &[Value::Object(Some(hm)), Value::Object(Some(lookup))],
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(count, Value::Int(1));
+    }
+
+    #[test]
+    fn t19_2_d_header_map_registers_real_string_lookup_overloads() {
+        let mut r = NativeMethodRegistry::new();
+        register_undertow_natives(&mut r);
+        assert!(r
+            .find(
+                CLS_HEADER_MAP,
+                "getFirst",
+                "(Ljava/lang/String;)Ljava/lang/String;"
+            )
+            .is_some());
+        assert!(r
+            .find(CLS_HEADER_MAP, "contains", "(Ljava/lang/String;)Z")
+            .is_some());
     }
 
     #[test]
@@ -1404,6 +1894,44 @@ mod tests {
         assert!(s.starts_with("HTTP/1.1 200 OK\r\n"));
         assert!(s.contains("Content-Length: 5\r\n"));
         assert!(s.ends_with("\r\n\r\nHello"));
+    }
+
+    #[test]
+    fn t19_2_d_real_exchange_sender_send_preserves_response_headers() {
+        let mut ctx = mock_ctx();
+        let exchange_cid = ctx.ensure_class_initialized(CLS_EXCHANGE).unwrap();
+        let ex = ctx.alloc_object(exchange_cid, 31);
+        let header_map = ctx.fresh_object_ref();
+        ctx.set_field_by_name(ex, "responseHeaders", Value::Object(Some(header_map)));
+
+        let got = native_exchange_get_response_headers(&mut ctx, &[Value::Object(Some(ex))])
+            .unwrap()
+            .unwrap();
+        assert_eq!(got, Value::Object(Some(header_map)));
+
+        let sender = match native_exchange_get_response_sender(&mut ctx, &[Value::Object(Some(ex))])
+            .unwrap()
+            .unwrap()
+        {
+            Value::Object(Some(sender)) => sender,
+            other => panic!("expected sender, got {other:?}"),
+        };
+        let body = ctx.create_string("management auth response");
+        native_sender_send(
+            &mut ctx,
+            &[Value::Object(Some(sender)), Value::Object(Some(body))],
+        )
+        .unwrap();
+
+        assert_eq!(
+            ctx.get_field_by_name(ex, "responseHeaders"),
+            Value::Object(Some(header_map)),
+            "real Undertow responseHeaders must not be overwritten by Sender.send body storage",
+        );
+        let got = native_exchange_get_response_headers(&mut ctx, &[Value::Object(Some(ex))])
+            .unwrap()
+            .unwrap();
+        assert_eq!(got, Value::Object(Some(header_map)));
     }
 
     #[test]

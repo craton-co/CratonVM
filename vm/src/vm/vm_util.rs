@@ -451,8 +451,7 @@ pub fn ensure_class_initialized_shared(
                     // is unset; any wake (notify, timeout, spurious) falls
                     // through to the outer loop's state re-check.
                     if !*guard {
-                        let _result =
-                            cvar.wait_for(&mut guard, std::time::Duration::from_secs(30));
+                        let _result = cvar.wait_for(&mut guard, std::time::Duration::from_secs(30));
                     }
                     drop(guard);
                     drop(blk);

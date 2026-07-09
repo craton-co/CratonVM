@@ -11,7 +11,10 @@ use std::collections::HashMap;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Mutex;
 
-use crate::lang_class::{create_constructor_object, create_method_object};
+use crate::lang_class::{
+    create_constructor_object, create_method_object, read_constructor_descriptor,
+};
+use crate::lang_invoke::alloc_method_handle;
 use crate::{alloc_concurrent_synthetic, native_noop, native_noop_with_this, obj_arg};
 use cratonvm_native_api::{MethodMetadata, NativeContext, NativeMethodRegistry};
 use cratonvm_types::error::{MethodCallResult, RuntimeError};
@@ -2264,7 +2267,8 @@ fn ois_read_object(ctx: &mut dyn NativeContext, addr: usize) -> Value {
     if let Some(caller_class_id) = latest_user_defined_loader_class(ctx) {
         let loader_id = ctx.loader_id_of_class(caller_class_id);
         if loader_id >= 3 {
-            loader_aware_class_id = ctx.class_id_by_name_and_loader(&desc.class_name, loader_id as u32);
+            loader_aware_class_id =
+                ctx.class_id_by_name_and_loader(&desc.class_name, loader_id as u32);
         }
     }
     let resolved = match loader_aware_class_id {
@@ -3087,6 +3091,7 @@ const OSC_FLAG_ENUM: i32 = 0x04;
 /// Access flags we care about for field / method filtering.
 /// (Kept local rather than importing from reader so serialization.rs
 /// stays self-contained.)
+const ACC_PUBLIC: u16 = 0x0001;
 const ACC_STATIC: u16 = 0x0008;
 const ACC_PRIVATE: u16 = 0x0002;
 const ACC_ENUM: u16 = 0x4000;
@@ -3469,6 +3474,369 @@ pub(crate) fn class_has_static_initializer(ctx: &mut dyn NativeContext, args: &[
     ctx.declared_methods(class_id)
         .iter()
         .any(|m| &*m.name == "<clinit>")
+}
+
+const MH_KIND_SPECIAL_FOR_SERIALIZATION_HOOK: i32 = 2;
+
+fn native_sun_reflection_factory_get(
+    ctx: &mut dyn NativeContext,
+    _args: &[Value],
+) -> MethodCallResult {
+    let obj = alloc_concurrent_synthetic(ctx, "sun/reflect/ReflectionFactory", 1);
+    Ok(Some(Value::Object(Some(obj))))
+}
+
+fn native_jdk_reflection_factory_get(
+    ctx: &mut dyn NativeContext,
+    _args: &[Value],
+) -> MethodCallResult {
+    let obj = alloc_concurrent_synthetic(ctx, "jdk/internal/reflect/ReflectionFactory", 1);
+    Ok(Some(Value::Object(Some(obj))))
+}
+
+fn reflection_factory_debug_enabled() -> bool {
+    std::env::var_os("CRATONVM_DBG_REFLECTION_FACTORY").is_some()
+}
+
+fn reflection_factory_class_arg(
+    ctx: &dyn NativeContext,
+    args: &[Value],
+) -> Option<(ClassId, ObjectRef)> {
+    for idx in [1usize, 0] {
+        if let Some(Value::Object(Some(mirror))) = args.get(idx) {
+            if let Some(class_id) = class_id_of_mirror(ctx, *mirror) {
+                return Some((class_id, *mirror));
+            }
+        }
+    }
+    None
+}
+
+fn reflection_factory_hook_handle(
+    ctx: &mut dyn NativeContext,
+    requested_class_id: ClassId,
+    method: MethodMetadata,
+) -> MethodCallResult {
+    let class_name = ctx
+        .class_name_of_id(method.declaring_class_id)
+        .or_else(|| ctx.class_name_of_id(requested_class_id))
+        .unwrap_or_default();
+    if class_name.is_empty() {
+        return Ok(Some(Value::Object(None)));
+    }
+    let mh = alloc_method_handle(
+        ctx,
+        &class_name,
+        &method.name,
+        &method.descriptor,
+        MH_KIND_SPECIAL_FOR_SERIALIZATION_HOOK,
+    );
+    Ok(Some(Value::Object(Some(mh))))
+}
+
+fn reflection_factory_private_hook(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+    name: &str,
+    descriptor: &str,
+) -> MethodCallResult {
+    let Some((class_id, _)) = reflection_factory_class_arg(ctx, args) else {
+        return Ok(Some(Value::Object(None)));
+    };
+    let target_name = ctx.class_name_of_id(class_id).unwrap_or_default();
+    let method = find_private_method(ctx, class_id, name, descriptor);
+    if reflection_factory_debug_enabled() {
+        match &method {
+            Some(m) => eprintln!(
+                "[rf-ser] private {}{} target={} cid={} -> handle decl_cid={} decl={} meta_desc={}",
+                name,
+                descriptor,
+                target_name,
+                class_id.as_u32(),
+                m.declaring_class_id.as_u32(),
+                ctx.class_name_of_id(m.declaring_class_id)
+                    .unwrap_or_default(),
+                m.descriptor
+            ),
+            None => eprintln!(
+                "[rf-ser] private {}{} target={} cid={} -> null",
+                name,
+                descriptor,
+                target_name,
+                class_id.as_u32()
+            ),
+        }
+    }
+    match method {
+        Some(method) => reflection_factory_hook_handle(ctx, class_id, method),
+        None => Ok(Some(Value::Object(None))),
+    }
+}
+
+fn reflection_factory_inheritable_hook(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+    name: &str,
+    descriptor: &str,
+) -> MethodCallResult {
+    let Some((class_id, _)) = reflection_factory_class_arg(ctx, args) else {
+        return Ok(Some(Value::Object(None)));
+    };
+    let target_name = ctx.class_name_of_id(class_id).unwrap_or_default();
+    let method = find_inheritable_method(ctx, class_id, name, descriptor);
+    if reflection_factory_debug_enabled() {
+        match &method {
+            Some(m) => eprintln!(
+                "[rf-ser] inheritable {}{} target={} cid={} -> handle decl_cid={} decl={} meta_desc={}",
+                name,
+                descriptor,
+                target_name,
+                class_id.as_u32(),
+                m.declaring_class_id.as_u32(),
+                ctx.class_name_of_id(m.declaring_class_id).unwrap_or_default(),
+                m.descriptor
+            ),
+            None => eprintln!(
+                "[rf-ser] inheritable {}{} target={} cid={} -> null",
+                name,
+                descriptor,
+                target_name,
+                class_id.as_u32()
+            ),
+        }
+    }
+    match method {
+        Some(method) => reflection_factory_hook_handle(ctx, class_id, method),
+        None => Ok(Some(Value::Object(None))),
+    }
+}
+
+fn native_reflection_factory_read_object(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    reflection_factory_private_hook(ctx, args, "readObject", "(Ljava/io/ObjectInputStream;)V")
+}
+
+fn native_reflection_factory_read_object_no_data(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    reflection_factory_private_hook(ctx, args, "readObjectNoData", "()V")
+}
+
+fn native_reflection_factory_write_object(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    reflection_factory_private_hook(ctx, args, "writeObject", "(Ljava/io/ObjectOutputStream;)V")
+}
+
+fn native_reflection_factory_read_resolve(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    reflection_factory_inheritable_hook(ctx, args, "readResolve", "()Ljava/lang/Object;")
+}
+
+fn native_reflection_factory_write_replace(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    reflection_factory_inheritable_hook(ctx, args, "writeReplace", "()Ljava/lang/Object;")
+}
+
+fn native_reflection_factory_has_static_initializer(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    let Some((class_id, _)) = reflection_factory_class_arg(ctx, args) else {
+        return Ok(Some(Value::Int(0)));
+    };
+    let has_clinit = ctx
+        .declared_methods(class_id)
+        .iter()
+        .any(|m| &*m.name == "<clinit>");
+    Ok(Some(Value::Int(has_clinit as i32)))
+}
+
+fn install_serialization_constructor_accessor(
+    ctx: &mut dyn NativeContext,
+    ctor_obj: ObjectRef,
+    target_mirror: ObjectRef,
+) {
+    let base_pin = ctx.pin_native_root(ctor_obj);
+    let target_mirror_pin = ctx.pin_native_root(target_mirror);
+
+    let target =
+        alloc_concurrent_synthetic(ctx, "java/lang/invoke/DirectMethodHandle$Constructor", 1);
+    let target_pin = ctx.pin_native_root(target);
+    let target_mirror = ctx.read_native_pin(target_mirror_pin, target_mirror);
+    ctx.set_field_by_name(target, "instanceClass", Value::Object(Some(target_mirror)));
+
+    let accessor = alloc_concurrent_synthetic(
+        ctx,
+        "jdk/internal/reflect/DirectConstructorHandleAccessor",
+        1,
+    );
+    let target = ctx.read_native_pin(target_pin, target);
+    let ctor_obj = ctx.read_native_pin(base_pin, ctor_obj);
+    ctx.set_field_by_name(accessor, "target", Value::Object(Some(target)));
+    ctx.set_field_by_name(
+        ctor_obj,
+        "constructorAccessor",
+        Value::Object(Some(accessor)),
+    );
+    ctx.unpin_native_roots(base_pin);
+}
+
+fn constructor_meta_from_constructor_object(
+    ctx: &dyn NativeContext,
+    ctor_obj: ObjectRef,
+) -> Option<MethodMetadata> {
+    let declaring_mirror = match ctx.get_field_by_name(ctor_obj, "clazz") {
+        Value::Object(Some(mirror)) => mirror,
+        _ => return None,
+    };
+    let declaring_class_id = class_id_of_mirror(ctx, declaring_mirror)?;
+    let descriptor = read_constructor_descriptor(ctx, ctor_obj)?;
+    let access_flags = match ctx.get_field_by_name(ctor_obj, "modifiers") {
+        Value::Int(flags) => flags as u16,
+        _ => 0,
+    };
+    if reflection_factory_debug_enabled() {
+        eprintln!(
+            "[rf-ser] ctor-copy obj={:?} decl_cid={} decl={} desc={} flags=0x{:x}",
+            ctor_obj,
+            declaring_class_id.as_u32(),
+            ctx.class_name_of_id(declaring_class_id).unwrap_or_default(),
+            descriptor,
+            access_flags
+        );
+    }
+    Some(MethodMetadata {
+        name: "<init>".to_string(),
+        descriptor,
+        access_flags,
+        declaring_class_id,
+        exceptions: Vec::new(),
+    })
+}
+
+fn native_reflection_factory_new_constructor_for_serialization(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    let Some((class_id, target_mirror)) = reflection_factory_class_arg(ctx, args) else {
+        return Ok(Some(Value::Object(None)));
+    };
+
+    let ctor_obj = match args.get(2) {
+        Some(Value::Object(Some(ctor))) => {
+            match constructor_meta_from_constructor_object(ctx, *ctor) {
+                Some(meta) => create_constructor_object(ctx, &meta),
+                None => return Ok(Some(Value::Object(None))),
+            }
+        }
+        _ => match find_serializable_constructor(ctx, class_id) {
+            Some((_, ctor_meta)) => create_constructor_object(ctx, &ctor_meta),
+            None => return Ok(Some(Value::Object(None))),
+        },
+    };
+    install_serialization_constructor_accessor(ctx, ctor_obj, target_mirror);
+    Ok(Some(Value::Object(Some(ctor_obj))))
+}
+
+fn native_reflection_factory_new_constructor_for_externalization(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    let Some((class_id, _)) = reflection_factory_class_arg(ctx, args) else {
+        return Ok(Some(Value::Object(None)));
+    };
+    let Some(ctor_meta) = find_no_arg_constructor(ctx, class_id) else {
+        return Ok(Some(Value::Object(None)));
+    };
+    if (ctor_meta.access_flags & ACC_PUBLIC) == 0 {
+        return Ok(Some(Value::Object(None)));
+    }
+    let ctor_obj = create_constructor_object(ctx, &ctor_meta);
+    Ok(Some(Value::Object(Some(ctor_obj))))
+}
+
+pub(crate) fn register_reflection_factory_serialization(r: &mut NativeMethodRegistry) {
+    r.register(
+        "sun/reflect/ReflectionFactory",
+        "getReflectionFactory",
+        "()Lsun/reflect/ReflectionFactory;",
+        native_sun_reflection_factory_get,
+    );
+    r.register(
+        "jdk/internal/reflect/ReflectionFactory",
+        "getReflectionFactory",
+        "()Ljdk/internal/reflect/ReflectionFactory;",
+        native_jdk_reflection_factory_get,
+    );
+
+    for cls in [
+        "sun/reflect/ReflectionFactory",
+        "jdk/internal/reflect/ReflectionFactory",
+    ] {
+        r.register(
+            cls,
+            "newConstructorForSerialization",
+            "(Ljava/lang/Class;)Ljava/lang/reflect/Constructor;",
+            native_reflection_factory_new_constructor_for_serialization,
+        );
+        r.register(
+            cls,
+            "newConstructorForSerialization",
+            "(Ljava/lang/Class;Ljava/lang/reflect/Constructor;)Ljava/lang/reflect/Constructor;",
+            native_reflection_factory_new_constructor_for_serialization,
+        );
+        r.register(
+            cls,
+            "newConstructorForExternalization",
+            "(Ljava/lang/Class;)Ljava/lang/reflect/Constructor;",
+            native_reflection_factory_new_constructor_for_externalization,
+        );
+        r.register(
+            cls,
+            "readObjectForSerialization",
+            "(Ljava/lang/Class;)Ljava/lang/invoke/MethodHandle;",
+            native_reflection_factory_read_object,
+        );
+        r.register(
+            cls,
+            "readObjectNoDataForSerialization",
+            "(Ljava/lang/Class;)Ljava/lang/invoke/MethodHandle;",
+            native_reflection_factory_read_object_no_data,
+        );
+        r.register(
+            cls,
+            "writeObjectForSerialization",
+            "(Ljava/lang/Class;)Ljava/lang/invoke/MethodHandle;",
+            native_reflection_factory_write_object,
+        );
+        r.register(
+            cls,
+            "readResolveForSerialization",
+            "(Ljava/lang/Class;)Ljava/lang/invoke/MethodHandle;",
+            native_reflection_factory_read_resolve,
+        );
+        r.register(
+            cls,
+            "writeReplaceForSerialization",
+            "(Ljava/lang/Class;)Ljava/lang/invoke/MethodHandle;",
+            native_reflection_factory_write_replace,
+        );
+        r.register(
+            cls,
+            "hasStaticInitializerForSerialization",
+            "(Ljava/lang/Class;)Z",
+            native_reflection_factory_has_static_initializer,
+        );
+    }
 }
 
 fn register_object_stream_class(r: &mut NativeMethodRegistry) {
@@ -4350,6 +4718,7 @@ pub(crate) fn register_serialization_natives(r: &mut NativeMethodRegistry) {
     register_not_serializable_exception(r);
     register_stream_corrupted_exception(r);
     register_byte_array_output_stream(r);
+    register_reflection_factory_serialization(r);
 }
 
 /// WP0.2 — public forwarder used by `phases_late::objectstreamclass_natives`.
@@ -4559,26 +4928,40 @@ pub(crate) fn register_byte_array_output_stream(r: &mut NativeMethodRegistry) {
         let s = decode_baos_bytes(&bytes, "UTF-8");
         Ok(Some(Value::Object(Some(ctx.create_string(&s)))))
     });
-    r.register(cls, "toString", "(Ljava/lang/String;)Ljava/lang/String;", |ctx, args| {
-        let this = obj_arg(args, 0)?;
-        let charset = match args.get(1) {
-            Some(Value::Object(Some(s))) => ctx.read_string(*s).unwrap_or_else(|| "UTF-8".to_string()),
-            _ => "UTF-8".to_string(),
-        };
-        let bytes = baos_buffer_bytes(ctx, this);
-        let s = decode_baos_bytes(&bytes, &charset);
-        Ok(Some(Value::Object(Some(ctx.create_string(&s)))))
-    });
-    r.register(cls, "toString", "(Ljava/nio/charset/Charset;)Ljava/lang/String;", |ctx, args| {
-        let this = obj_arg(args, 0)?;
-        let charset = match args.get(1) {
-            Some(Value::Object(Some(c))) => charset_object_name(ctx, *c).unwrap_or_else(|| "UTF-8".to_string()),
-            _ => "UTF-8".to_string(),
-        };
-        let bytes = baos_buffer_bytes(ctx, this);
-        let s = decode_baos_bytes(&bytes, &charset);
-        Ok(Some(Value::Object(Some(ctx.create_string(&s)))))
-    });
+    r.register(
+        cls,
+        "toString",
+        "(Ljava/lang/String;)Ljava/lang/String;",
+        |ctx, args| {
+            let this = obj_arg(args, 0)?;
+            let charset = match args.get(1) {
+                Some(Value::Object(Some(s))) => {
+                    ctx.read_string(*s).unwrap_or_else(|| "UTF-8".to_string())
+                }
+                _ => "UTF-8".to_string(),
+            };
+            let bytes = baos_buffer_bytes(ctx, this);
+            let s = decode_baos_bytes(&bytes, &charset);
+            Ok(Some(Value::Object(Some(ctx.create_string(&s)))))
+        },
+    );
+    r.register(
+        cls,
+        "toString",
+        "(Ljava/nio/charset/Charset;)Ljava/lang/String;",
+        |ctx, args| {
+            let this = obj_arg(args, 0)?;
+            let charset = match args.get(1) {
+                Some(Value::Object(Some(c))) => {
+                    charset_object_name(ctx, *c).unwrap_or_else(|| "UTF-8".to_string())
+                }
+                _ => "UTF-8".to_string(),
+            };
+            let bytes = baos_buffer_bytes(ctx, this);
+            let s = decode_baos_bytes(&bytes, &charset);
+            Ok(Some(Value::Object(Some(ctx.create_string(&s)))))
+        },
+    );
     r.register(cls, "flush", "()V", |_ctx, _args| Ok(None));
     r.register(cls, "close", "()V", |_ctx, _args| Ok(None));
 }
@@ -6527,6 +6910,138 @@ mod wp02_tests {
             ],
         );
         (ctx, foo)
+    }
+
+    fn mh_string_field(
+        ctx: &MockNativeContext,
+        mh: cratonvm_types::ObjectRef,
+        slot: usize,
+    ) -> String {
+        match ctx.get_field(mh, slot) {
+            Value::Object(Some(s)) => ctx.read_string(s).unwrap_or_default(),
+            other => panic!("expected MethodHandle string slot {slot}, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn reflection_factory_read_object_returns_null_without_private_hook() {
+        let mut ctx = MockNativeContext::new();
+        let no_hook = ctx.ensure_class_initialized("example/NoHook").unwrap();
+        let mirror = ctx.get_class_mirror(no_hook);
+        let result = native_reflection_factory_read_object(
+            &mut ctx,
+            &[Value::Object(None), Value::Object(Some(mirror))],
+        )
+        .expect("native must return normally");
+        assert_eq!(result, Some(Value::Object(None)));
+    }
+
+    #[test]
+    fn reflection_factory_read_object_returns_special_handle_for_private_hook() {
+        let mut ctx = MockNativeContext::new();
+        let hook_class = ctx.ensure_class_initialized("example/HasHook").unwrap();
+        ctx.set_declared_methods(
+            hook_class,
+            vec![mm(
+                "readObject",
+                "(Ljava/io/ObjectInputStream;)V",
+                ACC_WP02_PRIVATE,
+                hook_class,
+            )],
+        );
+        let mirror = ctx.get_class_mirror(hook_class);
+
+        let result = native_reflection_factory_read_object(
+            &mut ctx,
+            &[Value::Object(None), Value::Object(Some(mirror))],
+        )
+        .expect("native must return normally");
+        let mh = match result {
+            Some(Value::Object(Some(mh))) => mh,
+            other => panic!("expected MethodHandle, got {:?}", other),
+        };
+
+        // Keep these in sync with lang_invoke's synthetic MethodHandle tail
+        // slots: class, name, descriptor, kind start at slot 16.
+        assert_eq!(mh_string_field(&ctx, mh, 16), "example/HasHook");
+        assert_eq!(mh_string_field(&ctx, mh, 17), "readObject");
+        assert_eq!(
+            mh_string_field(&ctx, mh, 18),
+            "(Ljava/io/ObjectInputStream;)V"
+        );
+        assert_eq!(ctx.get_field(mh, 19), Value::Int(2));
+    }
+
+    #[test]
+    fn reflection_factory_two_arg_constructor_returns_widened_copy() {
+        let mut ctx = MockNativeContext::new();
+        let target = ctx.ensure_class_initialized("example/CtorTarget").unwrap();
+        let _ctor_class = ctx
+            .ensure_class_initialized("java/lang/reflect/Constructor")
+            .unwrap();
+        let incoming =
+            create_constructor_object(&mut ctx, &mm("<init>", "()V", ACC_PUBLIC, target));
+        let target_mirror = ctx.get_class_mirror(target);
+
+        let result = native_reflection_factory_new_constructor_for_serialization(
+            &mut ctx,
+            &[
+                Value::Object(None),
+                Value::Object(Some(target_mirror)),
+                Value::Object(Some(incoming)),
+            ],
+        )
+        .expect("native must return normally");
+        let widened = match result {
+            Some(Value::Object(Some(ctor))) => ctor,
+            other => panic!("expected Constructor copy, got {:?}", other),
+        };
+
+        assert_ne!(widened, incoming);
+        assert_eq!(
+            read_constructor_descriptor(&ctx, widened).as_deref(),
+            Some("()V")
+        );
+    }
+
+    #[test]
+    fn reflection_factory_serialization_methods_registered() {
+        let mut r = NativeMethodRegistry::new();
+        register_serialization_natives(&mut r);
+
+        for cls in [
+            "sun/reflect/ReflectionFactory",
+            "jdk/internal/reflect/ReflectionFactory",
+        ] {
+            assert!(r
+                .find(
+                    cls,
+                    "readObjectForSerialization",
+                    "(Ljava/lang/Class;)Ljava/lang/invoke/MethodHandle;"
+                )
+                .is_some());
+            assert!(r
+                .find(
+                    cls,
+                    "writeObjectForSerialization",
+                    "(Ljava/lang/Class;)Ljava/lang/invoke/MethodHandle;"
+                )
+                .is_some());
+            assert!(r
+                .find(
+                    cls,
+                    "newConstructorForSerialization",
+                    "(Ljava/lang/Class;Ljava/lang/reflect/Constructor;)Ljava/lang/reflect/Constructor;"
+                )
+                .is_some());
+            assert!(r
+                .find(
+                    cls,
+                    "hasStaticInitializerForSerialization",
+                    "(Ljava/lang/Class;)Z"
+                )
+                .is_some());
+        }
     }
 
     #[test]

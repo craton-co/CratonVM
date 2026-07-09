@@ -1393,6 +1393,73 @@ fn drain_all_pending_runnables(ctx: &mut dyn NativeContext) {
     let _ = iterations;
 }
 
+fn async_future_status_is(a: &Value, b: &Value) -> bool {
+    match (a, b) {
+        (Value::Object(Some(a)), Value::Object(Some(b))) => a == b,
+        _ => false,
+    }
+}
+
+fn async_future_status_is_named(
+    ctx: &dyn NativeContext,
+    status: &Value,
+    singleton: &Value,
+    expected_name: &str,
+) -> bool {
+    if async_future_status_is(status, singleton) {
+        return true;
+    }
+    let status_obj = match status {
+        Value::Object(Some(obj)) => *obj,
+        _ => return false,
+    };
+    match ctx.get_field_by_name(status_obj, "name") {
+        Value::Object(Some(name)) => ctx.read_string(name).as_deref() == Some(expected_name),
+        _ => false,
+    }
+}
+
+fn async_future_payload_result_matters(ctx: &dyn NativeContext, this: ObjectRef) -> bool {
+    let class_name = ctx
+        .class_name_of_id(ctx.class_id_of_object(this))
+        .unwrap_or_default();
+    matches!(
+        class_name.as_str(),
+        "org/jboss/as/protocol/mgmt/ActiveOperationImpl"
+            | "org/jboss/as/server/mgmt/domain/ServerBootOperationsService$FutureBootUpdates"
+    )
+}
+
+fn async_future_wait_keepalive(
+    ctx: &mut dyn NativeContext,
+    obj: ObjectRef,
+    timeout_ms: Option<u64>,
+) -> Result<ObjectRef, MethodCallFailed> {
+    let pin = ctx.pin_native_root(obj);
+    ctx.monitor_enter(obj);
+    let obj = ctx.read_native_pin(pin, obj);
+    let wr = ctx.monitor_wait(obj, timeout_ms);
+    let obj = ctx.read_native_pin(pin, obj);
+    ctx.monitor_exit(obj);
+    ctx.unpin_native_roots(pin);
+    wr?;
+    Ok(obj)
+}
+
+fn async_future_await_payload_result(
+    ctx: &mut dyn NativeContext,
+    mut this: ObjectRef,
+    waiting: &Value,
+) -> MethodCallResult {
+    loop {
+        let status = ctx.get_field_by_name(this, "status");
+        if !async_future_status_is_named(ctx, &status, waiting, "WAITING") {
+            return Ok(Some(status));
+        }
+        this = async_future_wait_keepalive(ctx, this, Some(5))?;
+    }
+}
+
 fn native_exec_execute(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     if args.len() < 2 {
         return Err(MethodCallFailed::InternalError(VmError::Internal {
@@ -1497,11 +1564,11 @@ fn native_async_future_task_await(ctx: &mut dyn NativeContext, args: &[Value]) -
     };
     // Identity-compare against WAITING. Status is a singleton enum so
     // pointer equality is the right check.
-    let is_waiting = match (&status, &waiting) {
-        (Value::Object(Some(a)), Value::Object(Some(b))) => a == b,
-        _ => false,
-    };
+    let is_waiting = async_future_status_is_named(ctx, &status, &waiting, "WAITING");
     if is_waiting {
+        if async_future_payload_result_matters(ctx, this) {
+            return async_future_await_payload_result(ctx, this, &waiting);
+        }
         // Round 88: scope this bypass more narrowly. The unconditional flip
         // to COMPLETE was added for Keycloak's `org/jboss/modules/Main.main`
         // boot path (which discards the future result). But WildFly's

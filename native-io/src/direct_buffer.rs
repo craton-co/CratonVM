@@ -565,6 +565,15 @@ fn dbb_allocate_direct0(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCa
     ctx.set_field_by_name(buf, "limit", Value::Int(cap as i32));
     ctx.set_field_by_name(buf, "position", Value::Int(0));
     ctx.set_field_by_name(buf, "mark", Value::Int(-1));
+    // ByteBuffer defaults to BIG_ENDIAN. This allocator bypasses the Java
+    // DirectByteBuffer constructor, so seed the order fields explicitly; XNIO
+    // Remoting frames depend on putInt writing network-order lengths.
+    ctx.set_field_by_name(buf, "bigEndian", Value::Int(1));
+    ctx.set_field_by_name(
+        buf,
+        "nativeByteOrder",
+        Value::Int(if cfg!(target_endian = "big") { 1 } else { 0 }),
+    );
     // NIO-DIRECTBUFFER FIX (2026-06-04): the fixed-slot writes below assume a
     // layout (position@0/limit@1/capacity@2/mark@3) that does NOT match the real
     // `java.nio.Buffer` layout (mark@0/position@1/limit@2/capacity@3/address@4/
@@ -1208,6 +1217,31 @@ mod tests {
         assert_eq!(bits().reserved.load(Ordering::Relaxed), baseline + 4096);
         dbb_free(addr2, 4096);
         assert_eq!(bits().reserved.load(Ordering::Relaxed), baseline);
+    }
+
+    #[test]
+    fn wp35_allocate_direct0_defaults_to_big_endian_order() {
+        let _g = bits_test_lock();
+        let baseline = bits().reserved.load(Ordering::Relaxed);
+        let mut ctx = MockNativeContext::new();
+
+        let result = dbb_allocate_direct0(&mut ctx, &[Value::Int(0)])
+            .expect("allocateDirect0 should not throw");
+        let buf = match result {
+            Some(Value::Object(Some(o))) => o,
+            other => panic!("allocateDirect0 returned {other:?}"),
+        };
+
+        assert_eq!(ctx.get_field_by_name(buf, "bigEndian"), Value::Int(1));
+        assert_eq!(
+            ctx.get_field_by_name(buf, "nativeByteOrder"),
+            Value::Int(if cfg!(target_endian = "big") { 1 } else { 0 })
+        );
+        assert_eq!(
+            bits().reserved.load(Ordering::Relaxed),
+            baseline,
+            "zero-capacity allocation should not touch Bits accounting"
+        );
     }
 
     #[test]

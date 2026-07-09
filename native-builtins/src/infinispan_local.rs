@@ -982,7 +982,11 @@ fn native_dcm_define_configuration(
                 .flatten()
             {
                 Some(Value::Object(Some(mem))) => {
-                    match ctx.invoke_virtual(mem, "maxCount", "()J", &[]).ok().flatten() {
+                    match ctx
+                        .invoke_virtual(mem, "maxCount", "()J", &[])
+                        .ok()
+                        .flatten()
+                    {
                         Some(Value::Long(v)) if v > 0 => v as usize,
                         _ => DEFAULT_SIZE_LIMIT,
                     }
@@ -1000,7 +1004,11 @@ fn native_dcm_define_configuration(
                 .flatten()
             {
                 Some(Value::Object(Some(exp))) => {
-                    match ctx.invoke_virtual(exp, "lifespan", "()J", &[]).ok().flatten() {
+                    match ctx
+                        .invoke_virtual(exp, "lifespan", "()J", &[])
+                        .ok()
+                        .flatten()
+                    {
                         Some(Value::Long(v)) if v > 0 => Some(Duration::from_millis(v as u64)),
                         _ => None,
                     }
@@ -2215,7 +2223,10 @@ mod tests {
                 Value::Object(Some(config_obj)),
             ],
         );
-        assert!(result.is_ok(), "defineConfiguration must succeed: {result:?}");
+        assert!(
+            result.is_ok(),
+            "defineConfiguration must succeed: {result:?}"
+        );
 
         let cache = global_manager().get_cache("real-cfg-cache").unwrap();
         assert_eq!(

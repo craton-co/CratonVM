@@ -639,9 +639,7 @@ impl ServiceContainer {
     /// invocations.
     fn run_start_local(&self, id: u64) {
         if msc_dbg() {
-            eprintln!(
-                "[msc] run_start_local (bookkeeping-only, NO real start() invoked) id={id}"
-            );
+            eprintln!("[msc] run_start_local (bookkeeping-only, NO real start() invoked) id={id}");
         }
         let name = {
             let state = self.inner.lock().unwrap_or_else(|e| e.into_inner());
@@ -1567,7 +1565,9 @@ fn fire_lifecycle_event(
 fn fire_lifecycle_event_all(ctx: &mut dyn NativeContext, id: u64, event: &str) {
     let listeners: Vec<ObjectRef> = {
         let map = service_roots().lock().unwrap_or_else(|e| e.into_inner());
-        map.get(&id).map(|r| r.listeners.clone()).unwrap_or_default()
+        map.get(&id)
+            .map(|r| r.listeners.clone())
+            .unwrap_or_default()
     };
     fire_lifecycle_event(ctx, id, event, &listeners);
 }
@@ -1951,7 +1951,6 @@ fn native_ihs_iter_next(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCa
     )))
 }
 
-
 fn opt_obj_arg(args: &[Value], index: usize) -> Option<ObjectRef> {
     match args.get(index) {
         Some(Value::Object(Some(o))) => Some(*o),
@@ -2021,7 +2020,6 @@ fn time_unit_to_nanos(ctx: &mut dyn NativeContext, unit: ObjectRef, timeout: i64
         _ => timeout.max(0) as i128 * 1_000_000,
     }
 }
-
 
 fn remove_null_service_controller_from_set(
     ctx: &mut dyn NativeContext,
@@ -2130,7 +2128,8 @@ fn native_service_container_await_stability_common(
         _ => None,
     };
     let failed_dest_cur = failed_pin.map(|h| ctx.read_native_pin(h, failed_dest.unwrap()));
-    let failed_copy = copy_non_null_identity_hash_set(ctx, failed_source, failed_dest_cur, "failed");
+    let failed_copy =
+        copy_non_null_identity_hash_set(ctx, failed_source, failed_dest_cur, "failed");
     if let Err(e) = failed_copy {
         ctx.unpin_native_roots(base);
         return Err(e);
@@ -2146,7 +2145,8 @@ fn native_service_container_await_stability_common(
         _ => None,
     };
     let problems_dest_cur = problems_pin.map(|h| ctx.read_native_pin(h, problems_dest.unwrap()));
-    let problems_copy = copy_non_null_identity_hash_set(ctx, problems_source, problems_dest_cur, "problems");
+    let problems_copy =
+        copy_non_null_identity_hash_set(ctx, problems_source, problems_dest_cur, "problems");
     if let Err(e) = problems_copy {
         ctx.unpin_native_roots(base);
         return Err(e);
@@ -2163,8 +2163,13 @@ fn native_service_container_await_stability_sets(
     let this = obj_arg(args, 0)?;
     let failed_dest = opt_obj_arg(args, 1);
     let problems_dest = opt_obj_arg(args, 2);
-    match native_service_container_await_stability_common(ctx, this, None, failed_dest, problems_dest)
-    {
+    match native_service_container_await_stability_common(
+        ctx,
+        this,
+        None,
+        failed_dest,
+        problems_dest,
+    ) {
         Ok(_) => Ok(None),
         Err(e) => Err(e),
     }
@@ -2630,14 +2635,19 @@ fn capture_dependency_injections(ctx: &mut dyn NativeContext, builder: ObjectRef
 fn inject_dependency_values(ctx: &mut dyn NativeContext, id: u64) -> Result<(), MethodCallFailed> {
     let pairs: Vec<(ObjectRef, ObjectRef)> = {
         let map = service_roots().lock().unwrap_or_else(|e| e.into_inner());
-        map.get(&id).map(|r| r.dep_injections.clone()).unwrap_or_default()
+        map.get(&id)
+            .map(|r| r.dep_injections.clone())
+            .unwrap_or_default()
     };
     for (idx, _) in pairs.iter().enumerate() {
         // Re-read the (GC-remapped) pair on every iteration — each
         // invoke_virtual below can move objects captured earlier.
         let (reg, inj) = {
             let map = service_roots().lock().unwrap_or_else(|e| e.into_inner());
-            match map.get(&id).and_then(|r| r.dep_injections.get(idx).copied()) {
+            match map
+                .get(&id)
+                .and_then(|r| r.dep_injections.get(idx).copied())
+            {
                 Some(p) => p,
                 None => continue,
             }
@@ -3850,29 +3860,28 @@ fn native_construct_message_logger(
         _ => Value::Object(None),
     };
 
-    // 3. `new <impl_name>(log)` — the canonical generated constructor takes
+    // 3. `new <impl_name>(log)` - the canonical generated constructor takes
     //    a single `Logger` parameter and `super(log)`s into
-    //    `DelegatingBasicLogger`.
-    let new_obj = match ctx.new_object(&impl_name) {
-        Ok(Some(Value::Object(Some(o)))) => o,
-        _ => return Value::Object(None),
-    };
-    let init_args = [Value::Object(Some(new_obj)), log_obj];
-    match ctx.invoke(
-        &impl_name,
-        "<init>",
-        "(Lorg/jboss/logging/Logger;)V",
-        &init_args,
-    ) {
-        Ok(_) => Value::Object(Some(new_obj)),
-        Err(_) => {
-            // Constructor failed — return the bare instance anyway. The
-            // `log` field will be null but downstream NPE-tolerant shims
-            // (DelegatingBasicLogger.is*Enabled, ServiceLogger_$logger
-            // method no-ops) keep boot going. Beats a null return that
-            // propagates into static fields whose readers do raw
-            // invokeinterface without null checks.
-            Value::Object(Some(new_obj))
+    //    `DelegatingBasicLogger`. Use the pinned allocation+constructor helper:
+    //    message logger constructors can allocate enough to trigger a moving GC,
+    //    and returning the pre-<init> raw ref can later resolve as java/lang/Object
+    //    and fail the interface checkcast in `<intf>.<clinit>`.
+    let _ = ctx.load_class(&impl_name);
+    match ctx.new_object_initialized(&impl_name, "(Lorg/jboss/logging/Logger;)V", &[log_obj]) {
+        Ok(Some(Value::Object(Some(o)))) => Value::Object(Some(o)),
+        _ => {
+            // Last-ditch fallback: a bare instance is useful only if allocation
+            // really produced the generated logger class. Returning a stale or
+            // generic Object here fails the caller's typed checkcast.
+            match ctx.new_object(&impl_name) {
+                Ok(Some(Value::Object(Some(o))))
+                    if ctx.class_name_of_id(ctx.class_id_of_object(o)).as_deref()
+                        == Some(impl_name.as_str()) =>
+                {
+                    Value::Object(Some(o))
+                }
+                _ => Value::Object(None),
+            }
         }
     }
 }

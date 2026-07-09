@@ -797,7 +797,7 @@ pub(crate) fn native_thread_join_timed(
     ctx: &mut dyn NativeContext,
     args: &[Value],
 ) -> MethodCallResult {
-    let this = match args.first() {
+    let mut this = match args.first() {
         Some(Value::Object(Some(obj))) => *obj,
         _ => return Ok(None),
     };
@@ -852,7 +852,13 @@ pub(crate) fn native_thread_join_timed(
             ));
         }
         let sleep_time = remaining.min(std::time::Duration::from_millis(2));
+        let mut blocked_refs = [Value::Object(Some(this))];
+        ctx.begin_blocking_region();
         std::thread::sleep(sleep_time);
+        ctx.end_blocking_region_refs(&mut blocked_refs);
+        if let Value::Object(Some(cur)) = blocked_refs[0] {
+            this = cur;
+        }
     }
     Ok(None)
 }
@@ -971,7 +977,7 @@ pub(crate) fn native_system_get_property(
     let key = crate::property_key_from_java_string(ctx, key_obj);
     match ctx
         .get_system_property(&key)
-        .or_else(|| crate::bootstrap_property_fallback(&key))
+        .or_else(|| crate::system_property_fallback(ctx, &key))
     {
         Some(val) => {
             let result = ctx.create_string(&val);
@@ -993,7 +999,7 @@ pub(crate) fn native_system_get_property_default(
     let key = crate::property_key_from_java_string(ctx, key_obj);
     match ctx
         .get_system_property(&key)
-        .or_else(|| crate::bootstrap_property_fallback(&key))
+        .or_else(|| crate::system_property_fallback(ctx, &key))
     {
         Some(val) => {
             let result = ctx.create_string(&val);

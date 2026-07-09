@@ -6426,14 +6426,12 @@ fn try_compile_inner(
     // (docs/known-issues/jasper-jdt-parser-arrayindexoutofbounds.md): an
     // always-deopting reference-array `System.arraycopy` call inside a method
     // with a live `this` made every single invocation re-run from entry.
-    let param_oop_mask = if x64::precise_jit_maps_enabled()
-        || x64::moving_young_enabled()
-        || deopt_real_enabled()
-    {
-        compute_param_oop_mask(&cached.method_descriptor, cached.is_static)
-    } else {
-        0
-    };
+    let param_oop_mask =
+        if x64::precise_jit_maps_enabled() || x64::moving_young_enabled() || deopt_real_enabled() {
+            compute_param_oop_mask(&cached.method_descriptor, cached.is_static)
+        } else {
+            0
+        };
 
     // deopt-osr Step 9 follow-up (c): the per-bci de-spec key for this method
     // (same `"<class>.<method>:<descriptor>"` form the deopt log / method_epochs
@@ -7515,7 +7513,7 @@ mod tests {
         let c2 = try_compile(
             &cached, None, None, None, None, None, None, None, None, None, &helpers, None, None,
             None, None, true, false, false, false, false, false,
-        None, // cp_invokedynamic_descriptor_resolver: no indy in these test methods
+            None, // cp_invokedynamic_descriptor_resolver: no indy in these test methods
         );
         let c2_used_ir = IR_LOWER_COMPILES.with(|c| c.get());
         assert!(c2.is_some(), "optimize=true (C2) must compile `add`");
@@ -7529,7 +7527,7 @@ mod tests {
         let c1 = try_compile(
             &cached, None, None, None, None, None, None, None, None, None, &helpers, None, None,
             None, None, false, false, false, false, false, false,
-        None, // cp_invokedynamic_descriptor_resolver: no indy in these test methods
+            None, // cp_invokedynamic_descriptor_resolver: no indy in these test methods
         );
         let c1_used_ir = IR_LOWER_COMPILES.with(|c| c.get());
         assert!(
@@ -7616,7 +7614,7 @@ mod tests {
             false,
             false,
             false,
-        None, // cp_invokedynamic_descriptor_resolver: no indy in these test methods
+            None, // cp_invokedynamic_descriptor_resolver: no indy in these test methods
         );
         assert!(c2.is_some(), "optimize=true (C2) must compile `get`");
         assert_eq!(
@@ -7633,7 +7631,7 @@ mod tests {
         let _ = try_compile(
             &cached, None, None, None, None, None, None, None, None, None, &helpers, None, None,
             None, None, true, false, false, false, false, false,
-        None, // cp_invokedynamic_descriptor_resolver: no indy in these test methods
+            None, // cp_invokedynamic_descriptor_resolver: no indy in these test methods
         );
         assert_eq!(
             IR_LOWER_COMPILES.with(|c| c.get()),
@@ -8061,7 +8059,7 @@ mod tests {
             false,
             false,
             false,
-        None, // cp_invokedynamic_descriptor_resolver: no indy in these test methods
+            None, // cp_invokedynamic_descriptor_resolver: no indy in these test methods
         );
         assert!(r.is_some(), "an elidable `new` method must compile via IR");
         assert_eq!(
@@ -8094,7 +8092,7 @@ mod tests {
             false,
             false,
             false,
-        None, // cp_invokedynamic_descriptor_resolver: no indy in these test methods
+            None, // cp_invokedynamic_descriptor_resolver: no indy in these test methods
         );
         assert_eq!(
             IR_LOWER_COMPILES.with(|c| c.get()),
@@ -8167,7 +8165,7 @@ mod tests {
             false, // ir_emit_long
             false, // ir_emit_virtual_calls
             false, // ir_emit_fp
-        None, // cp_invokedynamic_descriptor_resolver: no indy in these test methods
+            None,  // cp_invokedynamic_descriptor_resolver: no indy in these test methods
         );
         assert!(
             with.is_some(),
@@ -8207,7 +8205,7 @@ mod tests {
             false, // ir_emit_long OFF
             false, // ir_emit_virtual_calls OFF
             false, // ir_emit_fp OFF
-        None, // cp_invokedynamic_descriptor_resolver: no indy in these test methods
+            None,  // cp_invokedynamic_descriptor_resolver: no indy in these test methods
         );
         assert_eq!(
             IR_LOWER_COMPILES.with(|c| c.get()),
@@ -8281,7 +8279,7 @@ mod tests {
             false, // ir_emit_long
             false, // ir_emit_virtual_calls OFF
             false, // ir_emit_fp OFF
-        None, // cp_invokedynamic_descriptor_resolver: no indy in these test methods
+            None,  // cp_invokedynamic_descriptor_resolver: no indy in these test methods
         );
         assert!(
             with.is_some(),
@@ -8323,7 +8321,7 @@ mod tests {
             false, // ir_emit_long OFF
             false, // ir_emit_virtual_calls OFF
             false, // ir_emit_fp OFF
-        None, // cp_invokedynamic_descriptor_resolver: no indy in these test methods
+            None,  // cp_invokedynamic_descriptor_resolver: no indy in these test methods
         );
         assert_eq!(
             IR_LOWER_COMPILES.with(|c| c.get()),
@@ -8367,7 +8365,7 @@ mod tests {
         let with = try_compile(
             &cached, None, None, None, None, None, None, None, None, None, &helpers, None, None,
             None, None, true, false, false, true, false, false,
-        None, // cp_invokedynamic_descriptor_resolver: no indy in these test methods
+            None, // cp_invokedynamic_descriptor_resolver: no indy in these test methods
         );
         assert!(with.is_some(), "long method must compile with ir_emit_long");
         assert_eq!(
@@ -8381,7 +8379,7 @@ mod tests {
         let _without = try_compile(
             &cached, None, None, None, None, None, None, None, None, None, &helpers, None, None,
             None, None, true, false, false, false, false, false,
-        None, // cp_invokedynamic_descriptor_resolver: no indy in these test methods
+            None, // cp_invokedynamic_descriptor_resolver: no indy in these test methods
         );
         assert_eq!(
             IR_LOWER_COMPILES.with(|c| c.get()),
@@ -8424,7 +8422,7 @@ mod tests {
         let with = try_compile(
             &cached, None, None, None, None, None, None, None, None, None, &helpers, None, None,
             None, None, true, false, false, false, false, true,
-        None, // cp_invokedynamic_descriptor_resolver: no indy in these test methods
+            None, // cp_invokedynamic_descriptor_resolver: no indy in these test methods
         );
         assert!(with.is_some(), "FP method must compile with ir_emit_fp");
         assert_eq!(
@@ -8438,7 +8436,7 @@ mod tests {
         let _without = try_compile(
             &cached, None, None, None, None, None, None, None, None, None, &helpers, None, None,
             None, None, true, false, false, false, false, false,
-        None, // cp_invokedynamic_descriptor_resolver: no indy in these test methods
+            None, // cp_invokedynamic_descriptor_resolver: no indy in these test methods
         );
         assert_eq!(
             IR_LOWER_COMPILES.with(|c| c.get()),
@@ -8511,7 +8509,7 @@ mod tests {
             false, // ir_emit_long
             true,  // ir_emit_virtual_calls ON
             false, // ir_emit_fp OFF
-        None, // cp_invokedynamic_descriptor_resolver: no indy in these test methods
+            None,  // cp_invokedynamic_descriptor_resolver: no indy in these test methods
         );
         assert!(
             with.is_some(),
@@ -8553,7 +8551,7 @@ mod tests {
             false, // ir_emit_long
             false, // ir_emit_virtual_calls OFF
             false, // ir_emit_fp OFF
-        None, // cp_invokedynamic_descriptor_resolver: no indy in these test methods
+            None,  // cp_invokedynamic_descriptor_resolver: no indy in these test methods
         );
         assert_eq!(
             IR_LOWER_COMPILES.with(|c| c.get()),
@@ -9612,7 +9610,7 @@ mod tests {
                     false,
                     false,
                     false,
-                None, // cp_invokedynamic_descriptor_resolver: no indy in these test methods
+                    None, // cp_invokedynamic_descriptor_resolver: no indy in these test methods
                 )?;
                 assert_eq!(
                     compiled_b._jit_invoke_infos.len(),
@@ -9645,7 +9643,7 @@ mod tests {
             false,
             false,
             false,
-        None, // cp_invokedynamic_descriptor_resolver: no indy in these test methods
+            None, // cp_invokedynamic_descriptor_resolver: no indy in these test methods
         )
         .expect("A should compile");
 
