@@ -414,6 +414,96 @@ fn mock_infinispan_dcm_field_slot(class_name: Option<&str>, name: &str) -> Optio
     }
 }
 
+fn mock_h2_field_slot(class_name: Option<&str>, name: &str) -> Option<usize> {
+    match (class_name, name) {
+        (Some("org/h2/table/Column"), "name") => Some(0),
+        (Some("org/h2/table/Column"), "table") => Some(1),
+        (
+            Some(
+                "org/h2/engine/DbObject"
+                | "org/h2/table/Table"
+                | "org/h2/table/TableBase"
+                | "org/h2/table/RegularTable",
+            ),
+            "id",
+        ) => Some(0),
+        (Some("org/h2/engine/Session" | "org/h2/engine/SessionLocal"), "serialId") => Some(0),
+        _ => None,
+    }
+}
+
+fn mock_liquibase_field_slot(class_name: Option<&str>, name: &str) -> Option<usize> {
+    match (class_name, name) {
+        (Some("liquibase/change/AbstractChange$1"), "this$0") => Some(0),
+        (
+            Some("liquibase/change/ColumnConfig"),
+            "name"
+            | "computed"
+            | "type"
+            | "value"
+            | "valueNumeric"
+            | "valueDate"
+            | "valueBoolean"
+            | "valueBlobFile"
+            | "valueClobFile"
+            | "encoding"
+            | "valueComputed"
+            | "valueSequenceNext"
+            | "valueSequenceCurrent"
+            | "defaultValue"
+            | "defaultValueNumeric"
+            | "defaultValueDate"
+            | "defaultValueBoolean"
+            | "defaultValueComputed"
+            | "defaultValueSequenceNext"
+            | "defaultValueConstraintName"
+            | "constraints"
+            | "autoIncrement"
+            | "generationType"
+            | "defaultOnNull"
+            | "startWith"
+            | "incrementBy"
+            | "remarks"
+            | "descending"
+            | "included"
+            | "rawDateValue",
+        ) => match name {
+            "name" => Some(0),
+            "computed" => Some(1),
+            "type" => Some(2),
+            "value" => Some(3),
+            "valueNumeric" => Some(4),
+            "valueDate" => Some(5),
+            "valueBoolean" => Some(6),
+            "valueBlobFile" => Some(7),
+            "valueClobFile" => Some(8),
+            "encoding" => Some(9),
+            "valueComputed" => Some(10),
+            "valueSequenceNext" => Some(11),
+            "valueSequenceCurrent" => Some(12),
+            "defaultValue" => Some(13),
+            "defaultValueNumeric" => Some(14),
+            "defaultValueDate" => Some(15),
+            "defaultValueBoolean" => Some(16),
+            "defaultValueComputed" => Some(17),
+            "defaultValueSequenceNext" => Some(18),
+            "defaultValueConstraintName" => Some(19),
+            "constraints" => Some(20),
+            "autoIncrement" => Some(21),
+            "generationType" => Some(22),
+            "defaultOnNull" => Some(23),
+            "startWith" => Some(24),
+            "incrementBy" => Some(25),
+            "remarks" => Some(26),
+            "descending" => Some(27),
+            "included" => Some(28),
+            "rawDateValue" => Some(29),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
 fn mock_stamped_lock_field_slot(class_name: Option<&str>, name: &str) -> Option<usize> {
     match (class_name, name) {
         (Some("java/util/concurrent/locks/StampedLock"), "state") => Some(5),
@@ -1063,6 +1153,8 @@ impl NativeContext for MockNativeContext {
                 .or_else(|| mock_lucene_field_slot(class_name.as_deref(), field_name))
                 .or_else(|| mock_concurrent_field_slot(class_name.as_deref(), field_name))
                 .or_else(|| mock_infinispan_dcm_field_slot(class_name.as_deref(), field_name))
+                .or_else(|| mock_h2_field_slot(class_name.as_deref(), field_name))
+                .or_else(|| mock_liquibase_field_slot(class_name.as_deref(), field_name))
                 .or_else(|| mock_stamped_lock_field_slot(class_name.as_deref(), field_name))
                 .or_else(|| mock_jdk_field_slot(field_name))
         };
@@ -1083,6 +1175,8 @@ impl NativeContext for MockNativeContext {
                 .or_else(|| mock_lucene_field_slot(class_name.as_deref(), field_name))
                 .or_else(|| mock_concurrent_field_slot(class_name.as_deref(), field_name))
                 .or_else(|| mock_infinispan_dcm_field_slot(class_name.as_deref(), field_name))
+                .or_else(|| mock_h2_field_slot(class_name.as_deref(), field_name))
+                .or_else(|| mock_liquibase_field_slot(class_name.as_deref(), field_name))
                 .or_else(|| mock_stamped_lock_field_slot(class_name.as_deref(), field_name))
                 .or_else(|| mock_jdk_field_slot(field_name))
         };

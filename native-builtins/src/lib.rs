@@ -14752,6 +14752,7 @@ const STREAM_SCANNED_ENTITY: &str = "com/sun/xml/internal/stream/Entity$ScannedE
 const XML_LIMIT_ANALYZER: &str = "jdk/xml/internal/XMLLimitAnalyzer";
 const XML_SECURITY_LIMIT: &str = "jdk/xml/internal/XMLSecurityManager$Limit";
 const LIQUIBASE_ABSTRACT_CHANGE_FIELD_FILTER: &str = "liquibase/change/AbstractChange$1";
+const LIQUIBASE_COLUMN_CONFIG: &str = "liquibase/change/ColumnConfig";
 
 const XML_LIMIT_ENTITY_EXPANSION: i32 = 0;
 const XML_LIMIT_MAX_OCCUR_NODE: i32 = 1;
@@ -17319,12 +17320,139 @@ fn native_liquibase_abstract_change_field_filter_include(
     result
 }
 
+fn native_liquibase_column_config_get_serializable_field_value(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    let this = obj_arg(args, 0)?;
+    let field_name_obj = match args.get(1) {
+        Some(Value::Object(Some(field_name))) => *field_name,
+        _ => return Ok(Some(Value::Object(None))),
+    };
+    let field_name = match ctx.read_string(field_name_obj) {
+        Some(field_name) => field_name,
+        None => return Ok(Some(Value::Object(None))),
+    };
+    let value = ctx.get_field_by_name(this, &field_name);
+
+    if !matches!(field_name.as_str(), "valueDate" | "defaultValueDate") {
+        return Ok(Some(value));
+    }
+
+    let date_value = match value {
+        Value::Object(Some(value)) => value,
+        Value::Object(None) => return Ok(Some(Value::Object(None))),
+        other => return Ok(Some(other)),
+    };
+
+    let Some(formatted) = liquibase_format_iso_date_value(ctx, date_value) else {
+        return Ok(Some(Value::Object(Some(date_value))));
+    };
+    let formatted = ctx.create_string(&formatted);
+    Ok(Some(Value::Object(Some(formatted))))
+}
+
+fn liquibase_format_iso_date_value(
+    ctx: &mut dyn NativeContext,
+    date_value: ObjectRef,
+) -> Option<String> {
+    let class_id = ctx.class_id_of_object(date_value);
+    let class_name = ctx.class_name_of_id(class_id)?;
+    let date_base = ctx.class_id_by_name("java/util/Date");
+    let is_date_like = matches!(
+        class_name.as_str(),
+        "java/util/Date" | "java/sql/Date" | "java/sql/Time" | "java/sql/Timestamp"
+    ) || date_base
+        .is_some_and(|base| class_id == base || ctx.is_subclass(class_id, base));
+    if !is_date_like {
+        return None;
+    }
+
+    let millis = liquibase_date_millis(ctx, date_value);
+    let parts = crate::deprecated_util::millis_to_default_date_parts(ctx, millis);
+    let (year, month, day, hour, minute, second) = (
+        parts.year,
+        parts.month + 1,
+        parts.date,
+        parts.hrs,
+        parts.min,
+        parts.sec,
+    );
+
+    match class_name.as_str() {
+        "java/sql/Date" => Some(format!("{year:04}-{month:02}-{day:02}")),
+        "java/sql/Time" => Some(format!("{hour:02}:{minute:02}:{second:02}")),
+        "java/sql/Timestamp" => Some(liquibase_format_timestamp(
+            year,
+            month,
+            day,
+            hour,
+            minute,
+            second,
+            liquibase_timestamp_nanos(ctx, date_value),
+        )),
+        _ => Some(liquibase_format_timestamp(
+            year,
+            month,
+            day,
+            hour,
+            minute,
+            second,
+            (millis.rem_euclid(1_000) * 1_000_000) as i32,
+        )),
+    }
+}
+
+fn liquibase_date_millis(ctx: &dyn NativeContext, date_value: ObjectRef) -> i64 {
+    match ctx.get_field(date_value, 0) {
+        Value::Long(value) => value,
+        Value::Int(value) => value as i64,
+        _ => 0,
+    }
+}
+
+fn liquibase_timestamp_nanos(ctx: &dyn NativeContext, date_value: ObjectRef) -> i32 {
+    let class_name = ctx
+        .class_name_of_id(ctx.class_id_of_object(date_value))
+        .unwrap_or_default();
+    if class_name != "java/sql/Timestamp" || ctx.object_num_fields(date_value) < 2 {
+        return 0;
+    }
+    match ctx.get_field(date_value, ctx.object_num_fields(date_value) - 1) {
+        Value::Int(value) => value,
+        _ => 0,
+    }
+}
+
+fn liquibase_format_timestamp(
+    year: i32,
+    month: i32,
+    day: i32,
+    hour: i32,
+    minute: i32,
+    second: i32,
+    nanos: i32,
+) -> String {
+    let base = format!("{year:04}-{month:02}-{day:02}T{hour:02}:{minute:02}:{second:02}");
+    if nanos == 0 {
+        return base;
+    }
+    let fraction = format!("{nanos:09}").trim_end_matches('0').to_string();
+    format!("{base}.{fraction}")
+}
+
 fn register_liquibase_checksum_intrinsics(registry: &mut NativeMethodRegistry) {
     registry.register(
         LIQUIBASE_ABSTRACT_CHANGE_FIELD_FILTER,
         "include",
         "(Ljava/lang/Object;Ljava/lang/String;Ljava/lang/Object;)Z",
         native_liquibase_abstract_change_field_filter_include,
+    );
+    registry.register(
+        LIQUIBASE_COLUMN_CONFIG,
+        "getSerializableFieldValue",
+        "(Ljava/lang/String;)Ljava/lang/Object;",
+        native_liquibase_column_config_get_serializable_field_value,
     );
 }
 
@@ -18717,7 +18845,8 @@ pub fn register_essential_natives(registry: &mut NativeMethodRegistry) {
                 // represented by the private CompletableFuture.NIL AltResult
                 // sentinel; otherwise waitingGet()/join() will spin/park
                 // forever after completeValue(null).
-                let cf_id = ctx.ensure_class_initialized("java/util/concurrent/CompletableFuture")?;
+                let cf_id =
+                    ctx.ensure_class_initialized("java/util/concurrent/CompletableFuture")?;
                 ctx.static_field_index_by_name(cf_id, "NIL")
                     .map(|idx| ctx.get_static_field(cf_id, idx))
                     .filter(|v| matches!(v, Value::Object(Some(_))))
@@ -26320,8 +26449,17 @@ pub fn register_essential_natives(registry: &mut NativeMethodRegistry) {
             // US rule (2007+): DST from second Sunday of March 02:00
             // wall time to first Sunday of November 02:00 wall time, +1h.
             "US/Pacific" | "America/Los_Angeles" | "PST" => Some([
-                MARCH, 8, -SUNDAY, 2 * HOUR, WALL_TIME, NOVEMBER, 1, -SUNDAY, 2 * HOUR,
-                WALL_TIME, HOUR,
+                MARCH,
+                8,
+                -SUNDAY,
+                2 * HOUR,
+                WALL_TIME,
+                NOVEMBER,
+                1,
+                -SUNDAY,
+                2 * HOUR,
+                WALL_TIME,
+                HOUR,
             ]),
             // New Zealand rule: DST from last Sunday of September 02:00 wall
             // to first Sunday of April 03:00 wall (02:00 standard), +1h.
@@ -38740,7 +38878,13 @@ fn native_unsafe_compare_and_exchange_int(
     }
     if let Some(obj_ref) = obj {
         let old = if is_synthetic_offset(offset) {
-            unsafe_compare_exchange_synthetic_field(ctx, obj_ref, offset, expected_value, update_value)
+            unsafe_compare_exchange_synthetic_field(
+                ctx,
+                obj_ref,
+                offset,
+                expected_value,
+                update_value,
+            )
         } else {
             let index = if ctx.heap_kind_of(obj_ref) == cratonvm_types::ObjectKind::Array {
                 match unsafe_checked_array_index(ctx, obj_ref, offset) {
@@ -38792,7 +38936,13 @@ fn native_unsafe_compare_and_exchange_long(
     }
     if let Some(obj_ref) = obj {
         let old = if is_synthetic_offset(offset) {
-            unsafe_compare_exchange_synthetic_field(ctx, obj_ref, offset, expected_value, update_value)
+            unsafe_compare_exchange_synthetic_field(
+                ctx,
+                obj_ref,
+                offset,
+                expected_value,
+                update_value,
+            )
         } else {
             let index = if ctx.heap_kind_of(obj_ref) == cratonvm_types::ObjectKind::Array {
                 match unsafe_checked_array_index(ctx, obj_ref, offset) {
@@ -38822,12 +38972,9 @@ fn native_unsafe_compare_and_exchange_reference(
     let expected = recover_object_arg(args.get(3).copied().unwrap_or(Value::Object(None)));
     let update = recover_object_arg(args.get(4).copied().unwrap_or(Value::Object(None)));
     if obj.is_none() {
-        if let Some(old) = unsafe_compare_exchange_static_field(
-            ctx,
-            offset,
-            expected.clone(),
-            update.clone(),
-        ) {
+        if let Some(old) =
+            unsafe_compare_exchange_static_field(ctx, offset, expected.clone(), update.clone())
+        {
             return Ok(Some(recover_object_arg(old)));
         }
     }
@@ -39835,7 +39982,6 @@ fn native_objects_hash(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCal
     }
     Ok(Some(Value::Int(result)))
 }
-
 
 fn native_objects_to_string(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let s = match args.first() {
@@ -65805,11 +65951,7 @@ mod charset_alias_tests {
             )
             .expect("Charset.forName native");
         let aliases = registry
-            .find(
-                "java/nio/charset/Charset",
-                "aliases",
-                "()Ljava/util/Set;",
-            )
+            .find("java/nio/charset/Charset", "aliases", "()Ljava/util/Set;")
             .expect("Charset.aliases native");
 
         let mut ctx = MockNativeContext::new();
@@ -66987,6 +67129,13 @@ mod liquibase_checksum_tests {
 
     const ABSTRACT_CHANGE: &str = "liquibase/change/core/CreateTableChange";
 
+    fn new_column_config(ctx: &mut MockNativeContext) -> ObjectRef {
+        let class_id = ctx
+            .ensure_class_initialized(LIQUIBASE_COLUMN_CONFIG)
+            .expect("ColumnConfig test class id");
+        ctx.alloc_object(class_id, 30)
+    }
+
     fn new_abstract_change_filter(ctx: &mut MockNativeContext) -> (ObjectRef, ObjectRef) {
         let outer_class = ctx
             .ensure_class_initialized(ABSTRACT_CHANGE)
@@ -66998,6 +67147,34 @@ mod liquibase_checksum_tests {
         let filter = ctx.alloc_object(filter_class, 1);
         ctx.set_field_by_name(filter, "this$0", Value::Object(Some(outer)));
         (filter, outer)
+    }
+
+    fn new_date_object(
+        ctx: &mut MockNativeContext,
+        class_name: &str,
+        millis: i64,
+        nanos: Option<i32>,
+    ) -> ObjectRef {
+        let date_class = ctx
+            .ensure_class_initialized("java/util/Date")
+            .expect("Date test class id");
+        let class_id = ctx
+            .ensure_class_initialized(class_name)
+            .expect("date subtype test class id");
+        if class_id != date_class {
+            ctx.set_superclass(class_id, date_class);
+        }
+        let fields = if class_name == "java/sql/Timestamp" {
+            3
+        } else {
+            2
+        };
+        let obj = ctx.alloc_object(class_id, fields);
+        ctx.set_field(obj, 0, Value::Long(millis));
+        if let Some(nanos) = nanos {
+            ctx.set_field(obj, fields - 1, Value::Int(nanos));
+        }
+        obj
     }
 
     fn excluded_field_filters_hook(
@@ -67037,6 +67214,16 @@ mod liquibase_checksum_tests {
                 )
                 .is_some(),
             "AbstractChange$1.include must be registered for the checksum/status hot path"
+        );
+        assert!(
+            registry
+                .find(
+                    LIQUIBASE_COLUMN_CONFIG,
+                    "getSerializableFieldValue",
+                    "(Ljava/lang/String;)Ljava/lang/Object;",
+                )
+                .is_some(),
+            "ColumnConfig.getSerializableFieldValue must be registered for the checksum/status hot path"
         );
     }
 
@@ -67079,6 +67266,60 @@ mod liquibase_checksum_tests {
             Value::Int(1)
         );
         assert_eq!(ctx.native_pin_count_for_test(), 0);
+    }
+
+    #[test]
+    fn column_config_get_serializable_field_value_reads_regular_fields_directly() {
+        let mut ctx = MockNativeContext::new();
+        let column = new_column_config(&mut ctx);
+        let name = ctx.create_string("USER_LABEL");
+        ctx.set_field_by_name(column, "name", Value::Object(Some(name)));
+
+        let field_name = ctx.create_string("name");
+        let value = native_liquibase_column_config_get_serializable_field_value(
+            &mut ctx,
+            &[Value::Object(Some(column)), Value::Object(Some(field_name))],
+        )
+        .expect("ColumnConfig.getSerializableFieldValue")
+        .expect("field value");
+
+        match value {
+            Value::Object(Some(value)) => {
+                assert_eq!(ctx.read_string(value).as_deref(), Some("USER_LABEL"));
+            }
+            other => panic!("unexpected value: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn column_config_get_serializable_field_value_formats_date_fields_without_iso_date_format() {
+        let mut ctx = MockNativeContext::new();
+        let column = new_column_config(&mut ctx);
+        let timestamp = new_date_object(
+            &mut ctx,
+            "java/sql/Timestamp",
+            1_682_944_496_000,
+            Some(789_000_000),
+        );
+        ctx.set_field_by_name(column, "valueDate", Value::Object(Some(timestamp)));
+
+        let field_name = ctx.create_string("valueDate");
+        let value = native_liquibase_column_config_get_serializable_field_value(
+            &mut ctx,
+            &[Value::Object(Some(column)), Value::Object(Some(field_name))],
+        )
+        .expect("ColumnConfig.getSerializableFieldValue")
+        .expect("field value");
+
+        match value {
+            Value::Object(Some(value)) => {
+                assert_eq!(
+                    ctx.read_string(value).as_deref(),
+                    Some("2023-05-01T12:34:56.789")
+                );
+            }
+            other => panic!("unexpected value: {other:?}"),
+        }
     }
 }
 

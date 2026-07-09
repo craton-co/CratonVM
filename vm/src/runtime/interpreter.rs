@@ -20000,6 +20000,24 @@ pub(crate) fn is_h2_parser_native_override(
                 "(Lorg/h2/mvstore/tx/TransactionStore;IJILjava/lang/String;JIILorg/h2/engine/IsolationLevel;Lorg/h2/mvstore/tx/TransactionStore$RollbackListener;)V",
             );
     }
+    if class_name == "org/h2/table/Column" {
+        return matches!(
+            (method_name, descriptor),
+            ("equals", "(Ljava/lang/Object;)Z") | ("hashCode", "()I")
+        );
+    }
+    if class_name == "org/h2/engine/DbObject" {
+        return matches!(
+            (method_name, descriptor),
+            ("equals", "(Ljava/lang/Object;)Z") | ("hashCode", "()I")
+        );
+    }
+    if matches!(
+        class_name,
+        "org/h2/engine/Session" | "org/h2/engine/SessionLocal"
+    ) {
+        return (method_name, descriptor) == ("hashCode", "()I");
+    }
     if class_name == "org/h2/command/ParserBase" {
         return matches!(
             (method_name, descriptor),
@@ -20506,12 +20524,18 @@ pub(crate) fn is_liquibase_checksum_native_override(
     method_name: &str,
     descriptor: &str,
 ) -> bool {
-    class_name == "liquibase/change/AbstractChange$1"
-        && (method_name, descriptor)
-            == (
-                "include",
-                "(Ljava/lang/Object;Ljava/lang/String;Ljava/lang/Object;)Z",
-            )
+    matches!(
+        (class_name, method_name, descriptor),
+        (
+            "liquibase/change/AbstractChange$1",
+            "include",
+            "(Ljava/lang/Object;Ljava/lang/String;Ljava/lang/Object;)Z",
+        ) | (
+            "liquibase/change/ColumnConfig",
+            "getSerializableFieldValue",
+            "(Ljava/lang/String;)Ljava/lang/Object;",
+        )
+    )
 }
 
 fn force_native_over_real_jdk_bytecode(
@@ -31603,21 +31627,59 @@ mod tests {
     }
 
     #[test]
-    fn liquibase_checksum_force_native_covers_abstract_change_filter() {
-        let class_name = "liquibase/change/AbstractChange$1";
-        let descriptor = "(Ljava/lang/Object;Ljava/lang/String;Ljava/lang/Object;)Z";
-        assert!(
-            is_liquibase_checksum_native_override(class_name, "include", descriptor),
-            "AbstractChange$1.include must route to the registered native"
-        );
-        assert!(
-            force_native_over_real_jdk_bytecode(class_name, "include", descriptor),
-            "AbstractChange$1.include must not fall through to interpreted stream bytecode"
-        );
+    fn liquibase_checksum_force_native_covers_status_hotpath_intrinsics() {
+        for (class_name, method_name, descriptor) in [
+            (
+                "liquibase/change/AbstractChange$1",
+                "include",
+                "(Ljava/lang/Object;Ljava/lang/String;Ljava/lang/Object;)Z",
+            ),
+            (
+                "liquibase/change/ColumnConfig",
+                "getSerializableFieldValue",
+                "(Ljava/lang/String;)Ljava/lang/Object;",
+            ),
+        ] {
+            assert!(
+                is_liquibase_checksum_native_override(class_name, method_name, descriptor),
+                "{class_name}.{method_name}{descriptor} must route to the registered native"
+            );
+            assert!(
+                force_native_over_real_jdk_bytecode(class_name, method_name, descriptor),
+                "{class_name}.{method_name}{descriptor} must not fall through to interpreted stream bytecode"
+            );
+        }
         assert!(!is_liquibase_checksum_native_override(
             "liquibase/serializer/core/string/StringChangeLogSerializer$FieldFilter",
             "include",
-            descriptor
+            "(Ljava/lang/Object;Ljava/lang/String;Ljava/lang/Object;)Z"
+        ));
+    }
+
+    #[test]
+    fn h2_liquibase_force_native_covers_ddl_hotpath_intrinsics() {
+        for (class_name, name, descriptor) in [
+            ("org/h2/table/Column", "equals", "(Ljava/lang/Object;)Z"),
+            ("org/h2/table/Column", "hashCode", "()I"),
+            ("org/h2/engine/DbObject", "equals", "(Ljava/lang/Object;)Z"),
+            ("org/h2/engine/DbObject", "hashCode", "()I"),
+            ("org/h2/engine/Session", "hashCode", "()I"),
+            ("org/h2/engine/SessionLocal", "hashCode", "()I"),
+        ] {
+            assert!(
+                is_h2_parser_native_override(class_name, name, descriptor),
+                "{class_name}.{name}{descriptor} must route to the registered H2 native"
+            );
+            assert!(
+                force_native_over_real_jdk_bytecode(class_name, name, descriptor),
+                "{class_name}.{name}{descriptor} must not fall through to interpreted H2 bytecode"
+            );
+        }
+
+        assert!(!is_h2_parser_native_override(
+            "org/h2/table/Column",
+            "getName",
+            "()Ljava/lang/String;"
         ));
     }
 

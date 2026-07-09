@@ -142,8 +142,15 @@ watchdog fires.
 
 ## Follow-up
 
-The still-open follow-up is tracked separately as:
+The Liquibase checksum/status follow-up was later fixed and retired as:
 
 ```text
-docs/known-issues/keycloak-model-liquibase-checksum-status-nojit-timeout.md
+docs/internal/fixed-suite-bugs/keycloak-model-liquibase-checksum-status-nojit-timeout-FIXED.md
+```
+
+The still-open `RealmModelTest` residual after Liquibase completion is tracked
+separately as:
+
+```text
+docs/known-issues/keycloak-model-realmmodeltest-h2-auth-after-liquibase-nojit.md
 ```
