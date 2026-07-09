@@ -290,6 +290,15 @@ fn jla_blocked_on(_ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallRe
     Ok(None)
 }
 
+fn jla_get_carrier_thread_local(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    match args.get(1) {
+        Some(Value::Object(Some(tl))) => {
+            ctx.invoke_virtual(*tl, "get", "()Ljava/lang/Object;", &[])
+        }
+        _ => Ok(Some(Value::Object(None))),
+    }
+}
+
 fn jla_set_cause(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     // `setCause(Throwable t, Throwable cause)` sets the `cause`
     // field on `t` directly, bypassing the normal
@@ -744,6 +753,23 @@ fn jla_find_bootstrap_class_or_null(
     }
 }
 
+/// `JavaLangAccess.findNative(ClassLoader, String)` -> native address.
+///
+/// The real JDK's `SymbolLookup.loaderLookup()` lambda reaches this method via
+/// `SharedSecrets.getJavaLangAccess()`. CratonVM cannot currently map the Java
+/// `ClassLoader` object back to a per-loader native-library list, so use the
+/// VM's default native-symbol lookup: all loaded libraries first, then the
+/// process lookup. A missing symbol returns 0, matching the native lookup
+/// convention used by `NativeLibrary.findEntry0`.
+fn jla_find_native(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let name = match args.get(2) {
+        Some(Value::Object(Some(s))) => ctx.read_string(*s).unwrap_or_default(),
+        _ => String::new(),
+    };
+    let addr = ctx.find_native_symbol(-1, &name).unwrap_or(0);
+    Ok(Some(Value::Long(addr as i64)))
+}
+
 fn register_java_lang_access(registry: &mut NativeMethodRegistry) {
     let owner = "java/lang/System$1";
     registry.register(
@@ -769,6 +795,18 @@ fn register_java_lang_access(registry: &mut NativeMethodRegistry) {
         "blockedOn",
         "(Ljava/lang/Thread;Lsun/nio/ch/Interruptible;)V",
         jla_blocked_on,
+    );
+    registry.register(
+        owner,
+        "blockedOn",
+        "(Lsun/nio/ch/Interruptible;)V",
+        jla_blocked_on,
+    );
+    registry.register(
+        owner,
+        "getCarrierThreadLocal",
+        "(Ljdk/internal/misc/CarrierThreadLocal;)Ljava/lang/Object;",
+        jla_get_carrier_thread_local,
     );
     registry.register(
         owner,
@@ -905,6 +943,12 @@ fn register_java_lang_access(registry: &mut NativeMethodRegistry) {
     );
     registry.register(
         owner,
+        "findNative",
+        "(Ljava/lang/ClassLoader;Ljava/lang/String;)J",
+        jla_find_native,
+    );
+    registry.register(
+        owner,
         "join",
         "(Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;[Ljava/lang/String;I)Ljava/lang/String;",
         jla_join,
@@ -924,6 +968,18 @@ fn register_java_lang_access(registry: &mut NativeMethodRegistry) {
         "currentThread0",
         "()Ljava/lang/Thread;",
         jla_current_carrier_thread,
+    );
+    registry.register(
+        iface,
+        "blockedOn",
+        "(Lsun/nio/ch/Interruptible;)V",
+        jla_blocked_on,
+    );
+    registry.register(
+        iface,
+        "getCarrierThreadLocal",
+        "(Ljdk/internal/misc/CarrierThreadLocal;)Ljava/lang/Object;",
+        jla_get_carrier_thread_local,
     );
     // BootLoader.<clinit> invokes these via `invokeinterface JavaLangAccess`.
     registry.register(
@@ -967,6 +1023,12 @@ fn register_java_lang_access(registry: &mut NativeMethodRegistry) {
         "join",
         "(Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;[Ljava/lang/String;I)Ljava/lang/String;",
         jla_join,
+    );
+    registry.register(
+        iface,
+        "findNative",
+        "(Ljava/lang/ClassLoader;Ljava/lang/String;)J",
+        jla_find_native,
     );
     for name in ["getBytesNoRepl", "uncheckedGetBytesNoRepl"] {
         registry.register(
@@ -2213,6 +2275,63 @@ mod tests {
             )
             .is_some(),
             "JavaLangAccess.findBootstrapClassOrNull not registered on java/lang/System$1"
+        );
+    }
+
+    #[test]
+    fn java_lang_access_blocked_on_jdk21_overload_registered() {
+        let mut r = NativeMethodRegistry::new();
+        register_wp1_4_shared_secrets(&mut r);
+        let desc = "(Lsun/nio/ch/Interruptible;)V";
+        assert!(
+            r.find("java/lang/System$1", "blockedOn", desc).is_some(),
+            "JavaLangAccess.blockedOn(Interruptible) not registered on java/lang/System$1"
+        );
+        assert!(
+            r.find("jdk/internal/access/JavaLangAccess", "blockedOn", desc)
+                .is_some(),
+            "JavaLangAccess.blockedOn(Interruptible) not registered on interface fallback"
+        );
+    }
+
+    #[test]
+    fn java_lang_access_carrier_thread_local_registered() {
+        let mut r = NativeMethodRegistry::new();
+        register_wp1_4_shared_secrets(&mut r);
+        let desc = "(Ljdk/internal/misc/CarrierThreadLocal;)Ljava/lang/Object;";
+        assert!(
+            r.find("java/lang/System$1", "getCarrierThreadLocal", desc)
+                .is_some(),
+            "JavaLangAccess.getCarrierThreadLocal not registered on java/lang/System$1"
+        );
+        assert!(
+            r.find(
+                "jdk/internal/access/JavaLangAccess",
+                "getCarrierThreadLocal",
+                desc,
+            )
+            .is_some(),
+            "JavaLangAccess.getCarrierThreadLocal not registered on interface fallback"
+        );
+    }
+
+    #[test]
+    fn java_lang_access_find_native_registered() {
+        // `java.lang.foreign.SymbolLookup.loaderLookup()` calls through the
+        // real JDK `JavaLangAccess.findNative(ClassLoader, String)` bridge.
+        // The System$1 concrete owner is the normal dispatch target; the
+        // interface registration covers fallback invokeinterface resolution.
+        let mut r = NativeMethodRegistry::new();
+        register_wp1_4_shared_secrets(&mut r);
+        let desc = "(Ljava/lang/ClassLoader;Ljava/lang/String;)J";
+        assert!(
+            r.find("java/lang/System$1", "findNative", desc).is_some(),
+            "JavaLangAccess.findNative not registered on java/lang/System$1"
+        );
+        assert!(
+            r.find("jdk/internal/access/JavaLangAccess", "findNative", desc)
+                .is_some(),
+            "JavaLangAccess.findNative not registered on interface fallback"
         );
     }
 }

@@ -38,6 +38,37 @@ extern "system" {
     ) -> *mut std::ffi::c_void;
 }
 
+#[cfg(not(target_os = "windows"))]
+fn lookup_known_system_library_symbol(name: &str, c_name: &std::ffi::CStr) -> Option<usize> {
+    if !name.starts_with("ZSTD_") {
+        return None;
+    }
+
+    static LIBZSTD_HANDLE: std::sync::OnceLock<Option<usize>> = std::sync::OnceLock::new();
+    let handle = *LIBZSTD_HANDLE.get_or_init(|| {
+        for lib in [b"libzstd.so.1\0".as_slice(), b"libzstd.so\0".as_slice()] {
+            let handle = unsafe { libc::dlopen(lib.as_ptr() as *const i8, libc::RTLD_LAZY) };
+            if !handle.is_null() {
+                return Some(handle as usize);
+            }
+        }
+        None
+    });
+
+    let handle = handle? as *mut libc::c_void;
+    let addr = unsafe { libc::dlsym(handle, c_name.as_ptr()) };
+    if addr.is_null() {
+        None
+    } else {
+        Some(addr as usize)
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn lookup_known_system_library_symbol(_name: &str, _c_name: &std::ffi::CStr) -> Option<usize> {
+    None
+}
+
 fn lookup_process_native_symbol(name: &str) -> Option<usize> {
     let c_name = std::ffi::CString::new(name).ok()?;
     #[cfg(target_os = "windows")]
@@ -52,17 +83,17 @@ fn lookup_process_native_symbol(name: &str) -> Option<usize> {
                 return Some(addr as usize);
             }
         }
-        None
+        return None;
     }
     #[cfg(not(target_os = "windows"))]
     {
         let addr = unsafe { libc::dlsym(libc::RTLD_DEFAULT, c_name.as_ptr()) };
-        if addr.is_null() {
-            None
-        } else {
-            Some(addr as usize)
+        if !addr.is_null() {
+            return Some(addr as usize);
         }
     }
+
+    lookup_known_system_library_symbol(name, c_name.as_c_str())
 }
 
 /// DBG (CRATONVM_DBG_WATCHREF, extended): RandomizedContext WeakHashMap
@@ -12692,6 +12723,26 @@ fn invoke_on_class_shared_inner(
                             method_name,
                             descriptor,
                         )
+                        || crate::runtime::interpreter::is_ffm_symbol_lookup_native_override(
+                            class_name,
+                            method_name,
+                            descriptor,
+                        )
+                        || crate::runtime::interpreter::is_ffm_group_layout_native_override(
+                            class_name,
+                            method_name,
+                            descriptor,
+                        )
+                        || crate::runtime::interpreter::is_file_channel_impl_open_native_override(
+                            class_name,
+                            method_name,
+                            descriptor,
+                        )
+                        || crate::runtime::interpreter::is_native_thread_set_native_override(
+                            class_name,
+                            method_name,
+                            descriptor,
+                        )
                         || crate::runtime::interpreter::is_jdk_wrapper_math_native_override(
                             class_name,
                             method_name,
@@ -13833,11 +13884,18 @@ fn invoke_on_class_shared_inner(
                 method_name,
                 descriptor,
             );
+        let force_ffm_group_layout_interface_native =
+            crate::runtime::interpreter::is_ffm_group_layout_native_override(
+                &class_name_for_override,
+                method_name,
+                descriptor,
+            );
         let override_cb = if declaring_is_interface
             && !is_static
             && !force_ffm_value_layout_interface_native
             && !force_ffm_memory_segment_interface_native
             && !force_ffm_symbol_lookup_interface_native
+            && !force_ffm_group_layout_interface_native
         {
             None
         } else {

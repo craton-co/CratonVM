@@ -31,7 +31,7 @@ use parking_lot::Mutex;
 use cratonvm_native_api::fd_table::FdId;
 use cratonvm_native_api::{NativeContext, NativeMethodRegistry};
 use cratonvm_types::error::{MethodCallFailed, MethodCallResult, RuntimeError, VmError};
-use cratonvm_types::{ObjectRef, Value};
+use cratonvm_types::{ArrayElementType, ObjectRef, Value};
 
 // ---------------------------------------------------------------------------
 // IOStatus constants — mirror the JDK's sun.nio.ch.IOStatus values so the
@@ -354,6 +354,99 @@ fn native_fc_max_direct_transfer_size0(
     _args: &[Value],
 ) -> MethodCallResult {
     Ok(Some(Value::Int(0x7fff_ffff)))
+}
+
+fn new_object_ref(
+    ctx: &mut dyn NativeContext,
+    class_name: &'static str,
+) -> Result<ObjectRef, MethodCallFailed> {
+    match ctx.new_object(class_name)? {
+        Some(Value::Object(Some(o))) => Ok(o),
+        _ => Err(io_error(format!("{class_name}: allocation returned null"))),
+    }
+}
+
+fn new_native_thread_set(ctx: &mut dyn NativeContext) -> Result<ObjectRef, MethodCallFailed> {
+    if let Ok(Some(Value::Object(Some(o)))) =
+        ctx.new_object_initialized("sun/nio/ch/NativeThreadSet", "(I)V", &[Value::Int(2)])
+    {
+        return Ok(o);
+    }
+
+    let threads = new_object_ref(ctx, "sun/nio/ch/NativeThreadSet")?;
+    let thread_slots = ctx.new_array(ArrayElementType::Long, 2);
+    ctx.set_field_by_name(threads, "elts", Value::Object(Some(thread_slots)));
+    ctx.set_field_by_name(threads, "used", Value::Int(0));
+    ctx.set_field_by_name(threads, "waitingToEmpty", Value::Int(0));
+    Ok(threads)
+}
+
+/// `FileChannelImpl.open(FileDescriptor, String, boolean readable, boolean writable, ...)`.
+///
+/// The CratonVM provider shim can call the JDK 25 factory shape even when the
+/// boot image does not expose that exact method. Materialize the real
+/// `FileChannelImpl` field layout directly, so callers do not fall back to the
+/// synthetic abstract `java.nio.channels.FileChannel`.
+fn native_fcimpl_open(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let fd = match args.first() {
+        Some(Value::Object(Some(o))) => Value::Object(Some(*o)),
+        _ => return Err(io_error("FileChannelImpl.open: null FileDescriptor")),
+    };
+    let path = args.get(1).copied().unwrap_or(Value::Object(None));
+    let readable = args.get(2).copied().unwrap_or(Value::Int(0));
+    let writable = args.get(3).copied().unwrap_or(Value::Int(0));
+    let jdk21_direct = args.get(4).copied().unwrap_or(Value::Int(0));
+    let jdk25_direct = args.get(5).copied().unwrap_or(Value::Int(0));
+    let direct = if args.len() >= 7 {
+        jdk25_direct
+    } else {
+        jdk21_direct
+    };
+    let parent = args.last().copied().unwrap_or(Value::Object(None));
+
+    let channel = new_object_ref(ctx, "sun/nio/ch/FileChannelImpl")?;
+    let close_lock = new_object_ref(ctx, "java/lang/Object")?;
+    let position_lock = new_object_ref(ctx, "java/lang/Object")?;
+    let dispatcher = new_object_ref(ctx, "sun/nio/ch/FileDispatcherImpl")?;
+    let threads = new_native_thread_set(ctx)?;
+
+    ctx.set_field_by_name(channel, "closeLock", Value::Object(Some(close_lock)));
+    ctx.set_field_by_name(channel, "closed", Value::Int(0));
+    ctx.set_field_by_name(channel, "interruptor", Value::Object(None));
+    ctx.set_field_by_name(channel, "interrupted", Value::Object(None));
+
+    ctx.set_field_by_name(channel, "threads", Value::Object(Some(threads)));
+    ctx.set_field_by_name(channel, "positionLock", Value::Object(Some(position_lock)));
+    ctx.set_field_by_name(channel, "fd", fd);
+    ctx.set_field_by_name(channel, "readable", readable);
+    ctx.set_field_by_name(channel, "writable", writable);
+    ctx.set_field_by_name(channel, "parent", parent);
+    ctx.set_field_by_name(channel, "path", path);
+    ctx.set_field_by_name(channel, "direct", direct);
+    ctx.set_field_by_name(channel, "alignment", Value::Int(-1));
+    ctx.set_field_by_name(channel, "nd", Value::Object(Some(dispatcher)));
+    ctx.set_field_by_name(channel, "closer", Value::Object(None));
+    ctx.set_field_by_name(channel, "fileLockTable", Value::Object(None));
+
+    Ok(Some(Value::Object(Some(channel))))
+}
+
+fn native_native_thread_set_add(_ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
+    Ok(Some(Value::Int(0)))
+}
+
+fn native_native_thread_set_remove(
+    _ctx: &mut dyn NativeContext,
+    _args: &[Value],
+) -> MethodCallResult {
+    Ok(None)
+}
+
+fn native_native_thread_set_signal_and_wait(
+    _ctx: &mut dyn NativeContext,
+    _args: &[Value],
+) -> MethodCallResult {
+    Ok(None)
 }
 
 /// `transferTo0(int srcFD, long position, long count, int dstFD [, boolean append]) -> long`
@@ -783,6 +876,27 @@ pub fn register_file_channel_real(r: &mut NativeMethodRegistry) {
     // --- legacy FileChannelImpl surface (older JDKs / fallback). The
     // signatures here use raw int fds rather than FileDescriptor. ---
     let fci = "sun/nio/ch/FileChannelImpl";
+    r.register(
+        fci,
+        "open",
+        "(Ljava/io/FileDescriptor;Ljava/lang/String;ZZZZLjava/io/Closeable;)Ljava/nio/channels/FileChannel;",
+        native_fcimpl_open,
+    );
+    r.register(
+        fci,
+        "open",
+        "(Ljava/io/FileDescriptor;Ljava/lang/String;ZZZLjava/lang/Object;)Ljava/nio/channels/FileChannel;",
+        native_fcimpl_open,
+    );
+    let nts = "sun/nio/ch/NativeThreadSet";
+    r.register(nts, "add", "()I", native_native_thread_set_add);
+    r.register(nts, "remove", "(I)V", native_native_thread_set_remove);
+    r.register(
+        nts,
+        "signalAndWait",
+        "()V",
+        native_native_thread_set_signal_and_wait,
+    );
     r.register(fci, "map0", "(IJJZ)J", native_fc_map0_legacy);
     r.register(fci, "map0", "(IJJ)J", native_fc_map0_legacy);
     r.register(fci, "unmap0", "(JJ)I", native_fc_unmap0);
@@ -818,6 +932,15 @@ pub fn register_file_channel_real(r: &mut NativeMethodRegistry) {
         "init",
         "(Ljava/io/FileDescriptor;[J)V",
         native_filekey_init_longs,
+    );
+    r.register("sun/nio/ch/FileKey", "initIDs", "()V", |_ctx, _args| {
+        Ok(None)
+    });
+    r.register(
+        "sun/nio/ch/FileKey",
+        "init",
+        "(Ljava/io/FileDescriptor;)V",
+        native_filekey_init_instance,
     );
     r.set_category(__prev_cat);
 }
@@ -953,6 +1076,22 @@ fn native_filekey_init_longs(ctx: &mut dyn NativeContext, args: &[Value]) -> Met
         ctx.set_array_element(arr, 0, Value::Long(dev));
         ctx.set_array_element(arr, 1, Value::Long(ino));
     }
+    Ok(None)
+}
+
+/// `sun/nio/ch/FileKey.init(FileDescriptor fd)` — older real-JDK instance
+/// shape. Fill the receiver's `st_dev` / `st_ino` fields directly.
+fn native_filekey_init_instance(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(o))) => *o,
+        _ => return Err(io_error("FileKey.init: null receiver")),
+    };
+    let fd_obj = fd_arg(args, 1)?;
+    let fd = fd_from_descriptor(ctx, fd_obj)
+        .ok_or_else(|| io_error("FileKey.init: FileDescriptor has no open handle"))?;
+    let (dev, ino) = file_identity_pair(ctx, fd);
+    ctx.set_field_by_name(this, "st_dev", Value::Long(dev));
+    ctx.set_field_by_name(this, "st_ino", Value::Long(ino));
     Ok(None)
 }
 
@@ -1316,6 +1455,29 @@ mod tests {
     fn wp3_3_register_file_channel_real_smoke() {
         let mut r = NativeMethodRegistry::new();
         register_file_channel_real(&mut r);
+        let fci = "sun/nio/ch/FileChannelImpl";
+        assert!(
+            r.find(
+                fci,
+                "open",
+                "(Ljava/io/FileDescriptor;Ljava/lang/String;ZZZZLjava/io/Closeable;)Ljava/nio/channels/FileChannel;"
+            )
+            .is_some(),
+            "JDK 25 FileChannelImpl.open bridge must be registered"
+        );
+        assert!(
+            r.find(
+                fci,
+                "open",
+                "(Ljava/io/FileDescriptor;Ljava/lang/String;ZZZLjava/lang/Object;)Ljava/nio/channels/FileChannel;"
+            )
+            .is_some(),
+            "JDK 21 FileChannelImpl.open bridge must be registered"
+        );
+        let nts = "sun/nio/ch/NativeThreadSet";
+        assert!(r.find(nts, "add", "()I").is_some());
+        assert!(r.find(nts, "remove", "(I)V").is_some());
+        assert!(r.find(nts, "signalAndWait", "()V").is_some());
         // Touch each of the registered methods via the registry's
         // public API so we know the signatures parsed.  We rely
         // on the fact that the registry maintains internal counts.

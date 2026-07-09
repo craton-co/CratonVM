@@ -38578,6 +38578,15 @@ pub(crate) fn register_p67_foreign_memory(r: &mut NativeMethodRegistry) {
     );
 
     // Linker
+    let gl = "java/lang/foreign/GroupLayout";
+    r.register(gl, "memberLayouts", "()Ljava/util/List;", |ctx, _args| {
+        let list = match ctx.new_object_initialized("java/util/ArrayList", "()V", &[])? {
+            Some(Value::Object(Some(o))) => o,
+            _ => alloc_concurrent_synthetic(ctx, "java/util/ArrayList", 2),
+        };
+        Ok(Some(Value::Object(Some(list))))
+    });
+
     let linker = "java/lang/foreign/Linker";
     r.register(
         linker,

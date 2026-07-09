@@ -1,6 +1,6 @@
 # ES CRASH - server org.elasticsearch.cluster.metadata.DataStreamFailureStoreTemplateTests
 
-Status: OPEN
+Status: FIXED
 
 Observed in:
 - Run: `es-nonpassed-rerun-20260708-191002`
@@ -31,3 +31,9 @@ Extracted stdout signals:
 
 Current classification:
 - Part of the `System$1.findNative` / JavaLangAccess native-symbol lookup family.
+
+
+Fixed in codex/es-fixture-20260708-220010:
+- Added JavaLangAccess.findNative(ClassLoader,String) on both java/lang/System$1 and jdk/internal/access/JavaLangAccess.
+- Routed SymbolLookup/JavaLangAccess native lookup through CratonVM's native-symbol resolver instead of falling through to NoSuchMethodError.
+- Verification representative: ClusterShardHealthTests, CratonVM JIT on, probe-es-fixture-20260708-220010-clustershard-r3 -> PASS, 8 tests, 0 failed.

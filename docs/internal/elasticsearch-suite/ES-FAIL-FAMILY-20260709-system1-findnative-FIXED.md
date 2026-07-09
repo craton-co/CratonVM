@@ -1,6 +1,6 @@
 # ES failure family - JavaLangAccess System$1.findNative missing / JIT crash tail
 
-Status: OPEN
+Status: FIXED
 
 Signal:
 - `java.lang.NoSuchMethodError: java/lang/System$1.findNative(Ljava/lang/ClassLoader;Ljava/lang/String;)J`
@@ -27,3 +27,9 @@ Likely fix direction:
 - Route it to CratonVM native-library/symbol lookup, probably defaulting to the loader or process lookup when the ClassLoader cannot be modeled.
 - Keep the existing synthetic `SymbolLookup.find` bridge; this issue is specifically the real-JDK `loaderLookup` lambda path.
 - Investigate the JIT-only rc=139 tail separately: some current crash logs include `gen_heap::get_field` OOB warnings before exit, so the missing bridge is not the whole crash mechanism.
+
+
+Fixed in codex/es-fixture-20260708-220010:
+- Added JavaLangAccess.findNative(ClassLoader,String) on both java/lang/System$1 and jdk/internal/access/JavaLangAccess.
+- Routed SymbolLookup/JavaLangAccess native lookup through CratonVM's native-symbol resolver instead of falling through to NoSuchMethodError.
+- Verification representative: ClusterShardHealthTests, CratonVM JIT on, probe-es-fixture-20260708-220010-clustershard-r3 -> PASS, 8 tests, 0 failed.
