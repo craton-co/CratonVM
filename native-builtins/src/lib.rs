@@ -15522,6 +15522,10 @@ pub fn register_essential_natives(registry: &mut NativeMethodRegistry) {
     // `find`/lookup natives in the essential registry so off-heap users such as
     // Infinispan can resolve symbols instead of falling into AbstractMethodError.
     crate::panama::register_pe_symbol_lookup(registry);
+    // FFM real-JDK Linker option compatibility. Elasticsearch native access
+    // compiled against newer JDKs calls Linker.Option.critical(boolean),
+    // which is absent from the Java 21 runtime used by this suite.
+    crate::panama::register_pe_linker_options(registry);
     // FFM real-JDK layout/runtime shims. JDK 25's vector/foreign bootstrap
     // reaches `java.lang.foreign.ValueLayout$Of*` interface methods whose real
     // declarations are abstract/covariant. Register the phase-67 foreign-memory
@@ -62476,6 +62480,14 @@ mod panama_essential_tests {
                 symbol_lookup,
                 "find",
                 "(Ljava/lang/String;)Ljava/util/Optional;"
+            )
+            .is_some());
+        let linker_option = "java/lang/foreign/Linker$Option";
+        assert!(registry
+            .find(
+                linker_option,
+                "critical",
+                "(Z)Ljava/lang/foreign/Linker$Option;"
             )
             .is_some());
     }

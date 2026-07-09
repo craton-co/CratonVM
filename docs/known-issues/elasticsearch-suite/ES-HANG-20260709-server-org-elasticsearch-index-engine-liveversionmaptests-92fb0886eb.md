@@ -30,5 +30,5 @@ Extracted stdout signals:
 - `java.lang.NoSuchMethodError: java/lang/System$1.findNative(Ljava/lang/ClassLoader;Ljava/lang/String;)J`
 
 Current classification:
-- Part of the `System$1.findNative` / JavaLangAccess native-symbol lookup family.
-- This row reached the suite hang timeout and was killed at 600 seconds; keep separate from ordinary `findNative` failures.
+- The original `System$1.findNative` signal is fixed by the JavaLangAccess bridge, but this row remains an open hang.
+- Post-bridge reruns no longer stop on `findNative`; prior current signals included native-access initialization warnings and leaked/zombie randomized-runner threads. Keep this issue open until the representative no longer times out.

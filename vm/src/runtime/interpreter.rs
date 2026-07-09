@@ -20117,6 +20117,42 @@ pub(crate) fn is_ffm_symbol_lookup_native_override(
         && descriptor == "(Ljava/lang/String;)Ljava/util/Optional;"
 }
 
+pub(crate) fn is_ffm_group_layout_native_override(
+    class_name: &str,
+    method_name: &str,
+    descriptor: &str,
+) -> bool {
+    class_name == "java/lang/foreign/GroupLayout"
+        && method_name == "memberLayouts"
+        && descriptor == "()Ljava/util/List;"
+}
+
+pub(crate) fn is_file_channel_impl_open_native_override(
+    class_name: &str,
+    method_name: &str,
+    descriptor: &str,
+) -> bool {
+    class_name == "sun/nio/ch/FileChannelImpl"
+        && method_name == "open"
+        && matches!(
+            descriptor,
+            "(Ljava/io/FileDescriptor;Ljava/lang/String;ZZZZLjava/io/Closeable;)Ljava/nio/channels/FileChannel;"
+                | "(Ljava/io/FileDescriptor;Ljava/lang/String;ZZZLjava/lang/Object;)Ljava/nio/channels/FileChannel;"
+        )
+}
+
+pub(crate) fn is_native_thread_set_native_override(
+    class_name: &str,
+    method_name: &str,
+    descriptor: &str,
+) -> bool {
+    class_name == "sun/nio/ch/NativeThreadSet"
+        && matches!(
+            (method_name, descriptor),
+            ("add", "()I") | ("remove", "(I)V") | ("signalAndWait", "()V")
+        )
+}
+
 pub(crate) fn is_stamped_lock_native_override(
     class_name: &str,
     method_name: &str,
@@ -20742,6 +20778,15 @@ fn force_native_over_real_jdk_bytecode(
         return true;
     }
     if is_ffm_symbol_lookup_native_override(class_name, method_name, method_descriptor) {
+        return true;
+    }
+    if is_ffm_group_layout_native_override(class_name, method_name, method_descriptor) {
+        return true;
+    }
+    if is_file_channel_impl_open_native_override(class_name, method_name, method_descriptor) {
+        return true;
+    }
+    if is_native_thread_set_native_override(class_name, method_name, method_descriptor) {
         return true;
     }
     if is_stamped_lock_native_override(class_name, method_name, method_descriptor) {
@@ -30789,6 +30834,67 @@ mod tests {
             "find",
             descriptor
         ));
+    }
+
+    #[test]
+    fn ffm_group_layout_force_native_covers_member_layouts() {
+        let group_layout = "java/lang/foreign/GroupLayout";
+        let descriptor = "()Ljava/util/List;";
+        assert!(is_ffm_group_layout_native_override(
+            group_layout,
+            "memberLayouts",
+            descriptor
+        ));
+        assert!(force_native_over_real_jdk_bytecode(
+            group_layout,
+            "memberLayouts",
+            descriptor
+        ));
+    }
+
+    #[test]
+    fn file_channel_impl_open_force_native_covers_registered_factories() {
+        let fci = "sun/nio/ch/FileChannelImpl";
+        let descriptor =
+            "(Ljava/io/FileDescriptor;Ljava/lang/String;ZZZZLjava/io/Closeable;)Ljava/nio/channels/FileChannel;";
+        assert!(
+            is_file_channel_impl_open_native_override(fci, "open", descriptor),
+            "FileChannelImpl.open{descriptor} must route to the registered native factory"
+        );
+        assert!(
+            force_native_over_real_jdk_bytecode(fci, "open", descriptor),
+            "real-JDK bytecode dispatch must force the FileChannelImpl.open native"
+        );
+        let jdk21_descriptor =
+            "(Ljava/io/FileDescriptor;Ljava/lang/String;ZZZLjava/lang/Object;)Ljava/nio/channels/FileChannel;";
+        assert!(
+            is_file_channel_impl_open_native_override(fci, "open", jdk21_descriptor),
+            "JDK 21 FileChannelImpl.open{jdk21_descriptor} must route to native too"
+        );
+        assert!(
+            force_native_over_real_jdk_bytecode(fci, "open", jdk21_descriptor),
+            "real-JDK bytecode dispatch must force the JDK 21 FileChannelImpl.open native"
+        );
+        assert!(!is_file_channel_impl_open_native_override(
+            fci,
+            "tryLock",
+            "(JJZ)Ljava/nio/channels/FileLock;"
+        ));
+    }
+
+    #[test]
+    fn native_thread_set_force_native_covers_filechannel_blocking_bookkeeping() {
+        let nts = "sun/nio/ch/NativeThreadSet";
+        for (name, descriptor) in [("add", "()I"), ("remove", "(I)V"), ("signalAndWait", "()V")] {
+            assert!(
+                is_native_thread_set_native_override(nts, name, descriptor),
+                "NativeThreadSet.{name}{descriptor} must route to native bookkeeping"
+            );
+            assert!(
+                force_native_over_real_jdk_bytecode(nts, name, descriptor),
+                "real-JDK bytecode dispatch must force NativeThreadSet.{name}{descriptor}"
+            );
+        }
     }
 
     #[test]

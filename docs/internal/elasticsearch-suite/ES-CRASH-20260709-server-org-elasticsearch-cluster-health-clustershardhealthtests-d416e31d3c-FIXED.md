@@ -1,6 +1,6 @@
 # ES CRASH - server org.elasticsearch.cluster.health.ClusterShardHealthTests
 
-Status: OPEN
+Status: FIXED
 
 Observed in:
 - Run: `es-nonpassed-rerun-20260708-191002`
@@ -45,3 +45,9 @@ Current classification:
 Focused probe results:
 - HotSpot: status=PASS, rc=0, seconds=7.525, tests=8, mode=triage-crash-hotspot
 - CratonVM --nojit: status=PASS, rc=0, seconds=40.497, tests=8, mode=triage-crash-nojit
+
+
+Fixed in codex/es-fixture-20260708-220010:
+- Added JavaLangAccess.findNative(ClassLoader,String) on both java/lang/System$1 and jdk/internal/access/JavaLangAccess.
+- Routed SymbolLookup/JavaLangAccess native lookup through CratonVM's native-symbol resolver instead of falling through to NoSuchMethodError.
+- Verification representative: ClusterShardHealthTests, CratonVM JIT on, probe-es-fixture-20260708-220010-clustershard-r3 -> PASS, 8 tests, 0 failed.

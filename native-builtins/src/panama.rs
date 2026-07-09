@@ -1424,6 +1424,22 @@ pub(crate) fn register_pe_raw_native_libraries(r: &mut NativeMethodRegistry) {
 // --- Linker: create downcall handles ---
 // DowncallHandle synthetic: [0]=function_address (Long), [1]=descriptor (Object)
 
+pub(crate) fn register_pe_linker_options(r: &mut NativeMethodRegistry) {
+    let option = "java/lang/foreign/Linker$Option";
+    r.register(
+        option,
+        "critical",
+        "(Z)Ljava/lang/foreign/Linker$Option;",
+        |ctx, args| {
+            let enabled = args.first().and_then(|v| v.as_int()).unwrap_or(0) != 0;
+            let opt = alloc_concurrent_synthetic(ctx, "java/lang/foreign/Linker$Option", 2);
+            ctx.set_field(opt, 0, Value::Int(1)); // kind = critical
+            ctx.set_field(opt, 1, Value::Long(enabled as i64));
+            Ok(Some(Value::Object(Some(opt))))
+        },
+    );
+}
+
 fn register_pe_linker(r: &mut NativeMethodRegistry) {
     let linker = "java/lang/foreign/Linker";
 
@@ -1511,6 +1527,7 @@ fn register_pe_linker(r: &mut NativeMethodRegistry) {
             Ok(Some(Value::Object(Some(opt))))
         },
     );
+    register_pe_linker_options(r);
 
     // DowncallHandle.invoke(Object... args) → Object
     // This is the actual native function call entry point.

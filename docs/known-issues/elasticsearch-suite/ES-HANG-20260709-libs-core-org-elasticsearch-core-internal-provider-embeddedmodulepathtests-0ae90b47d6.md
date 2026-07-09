@@ -33,8 +33,8 @@ Extracted stdout signals:
 - `java.lang.NoSuchMethodError: java/lang/System$1.findNative(Ljava/lang/ClassLoader;Ljava/lang/String;)J`
 
 Current classification:
-- Part of the `System$1.findNative` / JavaLangAccess native-symbol lookup family.
-- This row reached the suite hang timeout and was killed at 600 seconds; keep separate from ordinary `findNative` failures.
+- The original `System$1.findNative` signal is fixed by the JavaLangAccess bridge, but this row remains an open hang.
+- Current post-fix probe `probe-es-fixture-20260708-220010-embeddedmodule-r6` still times out at 240 seconds. Native access now advances past `findNative`, `ZSTD_compressBound`, `Linker$Option.critical`, and `GroupLayout.memberLayouts`; the current residual signal is `ExceptionInInitializerError` from `JdkZstdLibrary` caused by `Bad layout path: cannot resolve ptr`, followed by the suite timeout.
 
 Focused probe results:
 - HotSpot: status=PASS, rc=0, seconds=7.721, tests=15, mode=triage-hang-hotspot

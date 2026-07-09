@@ -16,3 +16,9 @@ Probe results:
 Interpretation:
 - HotSpot passes, CratonVM `--nojit` fails with the same zero-score assertion, so this is a broader runtime/native/vector implementation issue rather than a JIT miscompile.
 - The affected classes sit around ES/Lucene vector formats and native/vector access paths.
+
+
+Current probe after es-fixture branch:
+- `probe-es-fixture-20260708-220010-vectorzero-r6`, CratonVM --nojit, still FAIL: 52 tests, 10 failures.
+- The previous FileChannelImpl.open missing-method warnings are gone after registering both JDK 21 and JDK 25 FileChannelImpl.open descriptors, plus NativeThreadSet/FileKey bridges.
+- Remaining signal is unchanged vector score zero assertions plus one Lucene `CorruptIndexException` footer mismatch; keep this issue open.

@@ -503,6 +503,21 @@ fn should_skip_jit_internal(
         {
             return Some(SkipReason::RustJvmTestFixture);
         }
+
+        // ES-HAMCREST.1 (2026-07-09) - after the Elasticsearch FFM
+        // `System$1.findNative` bridge fix, `ClusterShardHealthTests` reaches
+        // its real test body under JIT but Hamcrest's equality matcher reports
+        // equal-looking boxed hash values as unequal. `--nojit` passes, and
+        // package bisection (`CRATONVM_JIT_BISECT_ONLY=org/hamcrest/`) keeps the
+        // failure while JUnit/randomizedtesting/java.lang-only runs pass. Keep
+        // Hamcrest interpreted under Conservative until the matcher-codegen
+        // producer is narrowed. Liftable for bisection with
+        // `CRATONVM_JIT_ALLOW_PACKAGES=org/hamcrest/`.
+        if class_name.starts_with("org/hamcrest/")
+            && !package_allowed("org/hamcrest/", allow_packages)
+        {
+            return Some(SkipReason::RustJvmTestFixture);
+        }
         // HIB-TEMPORAL.1 (2026-07-08) - Hibernate temporal suite residuals.
         // The `InstantTests` failure cluster was not a Hibernate data bug: with
         // default JIT, `DdlTypeImpl.getRawTypeName` saw a null `typeNamePattern`
@@ -3024,15 +3039,10 @@ mod tests {
 
     #[test]
     fn rxjava3_package_skips_under_conservative_for_keycloak_reactive_wait() {
-        let class_name = "io/reactivex/rxjava3/internal/operators/flowable/BlockingFlowableIterable";
+        let class_name =
+            "io/reactivex/rxjava3/internal/operators/flowable/BlockingFlowableIterable";
         assert_eq!(
-            check(
-                class_name,
-                "hasNext",
-                false,
-                true,
-                SkipPolicy::Conservative,
-            ),
+            check(class_name, "hasNext", false, true, SkipPolicy::Conservative,),
             Some(SkipReason::RustJvmTestFixture),
             "RxJava3 must stay interpreted under the conservative policy"
         );
@@ -3106,6 +3116,33 @@ mod tests {
             ),
             Some(SkipReason::RustJvmTestFixture),
             "Lucene vector leaves must stay interpreted by the separate Lucene package ban"
+        );
+    }
+
+    #[test]
+    fn hamcrest_matchers_stay_interpreted_for_elasticsearch_assertions() {
+        let class_name = "org/hamcrest/core/IsEqual";
+        assert_eq!(
+            check(class_name, "matches", false, true, SkipPolicy::Conservative),
+            Some(SkipReason::RustJvmTestFixture),
+            "Hamcrest matchers must stay interpreted under the conservative policy"
+        );
+        assert_eq!(
+            check(class_name, "matches", false, true, SkipPolicy::Aggressive),
+            None,
+            "aggressive policy must lift the Hamcrest package ban"
+        );
+        assert_eq!(
+            check_with(
+                class_name,
+                "matches",
+                false,
+                true,
+                SkipPolicy::Conservative,
+                &["org/hamcrest/"],
+            ),
+            None,
+            "CRATONVM_JIT_ALLOW_PACKAGES=org/hamcrest/ must lift Hamcrest"
         );
     }
 
