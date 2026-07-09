@@ -126,3 +126,139 @@ Current status: still OPEN. Focus next on
 `native_cdl_count_down`, `vm/src/vm/vm_exec.rs::monitor_wait`, and
 `native-io/src/async_socket.rs` handler-form read dispatch on the
 `cratonvm-aio-dispatch` thread.
+
+## 2026-07-09 (later session) — root-cause hypothesis strengthened via source reading; repro blocked by 3 separate environment bugs (2 now fixed)
+
+### Hypothesis: bounded blocking-send timeout expiring, not a permanent deadlock
+
+Read the real Tomcat source (`org/apache/tomcat/websocket/{Constants,WsSession,WsRemoteEndpointImplBase}.java`,
+`org/apache/tomcat/websocket/server/{WsRemoteEndpointImplServer,TestWsRemoteEndpointImplServerDeadlock}.java`)
+rather than guessing. Key findings:
+
+- The test's own comment: *"Send times out after 20s so test should
+  complete in less than that."* — `Constants.DEFAULT_BLOCKING_SEND_TIMEOUT
+  = 20 * 1000` ms. This is the timeout passed to
+  `WsRemoteEndpointImplBase.sendMessageBlockInternal` when the server sends
+  its close-frame response, and it bounds
+  `WsRemoteEndpointImplServer.acquireMessagePartInProgressSemaphore`'s
+  wait/yield loop for the `messagePartInProgress` semaphore.
+- `Bug66508Endpoint.serverSession`'s `state` field (polled by the test)
+  only flips to `CLOSED` once the server finishes sending its own close
+  response, which requires `messagePartInProgress` to become available —
+  it's held by the background thread's async `sendText(MSG)` call that got
+  stuck because the client wasn't reading.
+- The observed ~19.0-19.15s delay is **just under** 20s (short by the
+  ~0.85-1s the test's own polling loop takes to reach `count==10` and
+  release `clientReceiveLatch`), consistent with the semaphore holder
+  *never* completing/releasing within the 20s budget, rather than a
+  genuinely permanent deadlock (which the loop's `Thread.yield()`-based
+  design is explicitly there to avoid, per the extensive doc comment on
+  `acquireMessagePartInProgressSemaphore`) or a quick release.
+
+This means: whatever normally lets the server's stuck async write resume
+(and release the semaphore) once the client resumes reading at the ~1s
+mark — either the socket write-readiness notification never fires, or the
+`clientReceiveLatch.countDown()` signal / the client's resumed read never
+actually drains the socket — isn't happening on CratonVM, so the
+`acquireMessagePartInProgressSemaphore` loop just burns its full 20s
+budget and returns `false`, at which point `sendMessageBlockInternal`
+calls `doClose(...)` (marking `state = CLOSED`), matching the observed
+"just under 20s" delay precisely. **Not yet empirically confirmed** — see
+"Blocked" below — but this is a materially stronger, source-grounded
+version of the original close-look hypothesis, and rules out treating this
+as a classic AB-BA lock-ordering deadlock.
+
+Ruled out as the cause (tested directly, standalone, not just inferred):
+`java.util.concurrent.CountDownLatch` cross-thread wake latency is fine —
+a `native_cdl_await`/`native_cdl_count_down` micro-benchmark (waiter
+thread parks, main thread sleeps 500ms then `countDown()`s) shows 0ms
+delay from `countDown()` to the waiter unblocking, on this exact build.
+`native_cdl_await`'s design (10ms-bounded `monitor_wait` loop, re-checking
+`cdl_count` every iteration rather than relying purely on
+`monitor_notify_all`) is self-healing even if notify were lost. So
+`Bug66508Client.onMessage()`'s `clientReceiveLatch.await()` is very
+unlikely to be where the ~19s comes from; the leading suspect is now the
+**server-side socket write-readiness / async-send-completion path**
+(`native-io/src/async_socket.rs`, `native-io/src/nio_selector.rs`, or the
+`WsRemoteEndpointImplServer.doWrite`/`onWritePossible` interaction with
+whatever backs `SocketWrapperBase.isReadyForWrite()`/write-listener
+dispatch under real-JDK NIO), **not** yet directly confirmed via a live
+gdb backtrace or targeted tracing during an actual repro run — that's the
+next step once the repro is unblocked (see below).
+
+### Blocked: 3 separate, pre-existing environment bugs prevented ever reaching this code path
+
+Attempting the exact repro command from this doc (`JUnitCore
+TestWsRemoteEndpointImplServerDeadlock`, real JDK 25, Linux, fresh `dev`
+worktree build) no longer reproduces the "~19s close delay" assertion at
+all — instead **`Tomcat.start()` itself fails** before the test's own
+close-handshake logic is ever exercised. This is a *regression* relative
+to the state this doc was originally written in (the 2026-07-07 Linux
+confirmation referenced above, `/data/wt-linux-nonpassed1200/...`, shows
+zero occurrences of any of the errors below) — something changed on `dev`
+between then and 2026-07-09 that exposed (or newly introduced) these
+bugs. Root-caused and two of the three fixed this session:
+
+1. **`java.io.File.FS` never set by the native `<clinit>` override for
+   `java/io/File`** — FIXED, see
+   `docs/internal/fixed-suite-bugs/file-fs-native-clinit-never-set-FIXED.md`.
+   Caused Tomcat's `Digester`/`SAXParserFactory` bootstrap (loading
+   `mbeans-descriptors.xml`) to NPE repeatedly on
+   `FileSystem.isInvalid(File)`, cascading into
+   `StandardContext startup failed due to previous errors`. 100%
+   reproducible pre-fix, every run.
+2. **`java.lang.ThreadGroup` native accessors used a stale/swapped field
+   layout** — FIXED, see
+   `docs/internal/fixed-suite-bugs/threadgroup-native-field-index-mismatch-FIXED.md`.
+   Corrupted every `ThreadGroup` built via the VM's own bootstrap
+   (`parent`/`name` swapped), so
+   `jdk.internal.misc.InnocuousThread.<clinit>` (triggered by
+   `java.lang.ref.Cleaner`, itself triggered very early during
+   `StandardServer` init) threw `ClassCastException: String cannot be cast
+   to ThreadGroup`, failing `LifecycleException: Failed to initialize
+   component [StandardServer[-1]]`. Also 100% reproducible pre-fix.
+3. **`EnumSet.of(...)` silently returns a broken/empty set for non-JDK
+   enums** (e.g. `jakarta.servlet.DispatcherType`) — **still OPEN**, see
+   `docs/known-issues/enumset-of-broken-for-non-jdk-enums.md`. This is the
+   *current* blocker: with (1) and (2) fixed, Tomcat now gets as far as
+   `WsServerContainer`'s constructor (`EnumSet.of(DispatcherType.REQUEST,
+   DispatcherType.FORWARD)` for the WebSocket filter mapping), which
+   returns an unusable set, and the subsequent for-each NPEs
+   (`Iterator.hasNext()` on a null iterator), failing every
+   `StandardContext` that registers a websocket endpoint — including this
+   test's `Bug66508Config`. Root-cause narrowed to two candidate
+   explanations (see that doc) but not fully confirmed or fixed.
+
+**Net effect: the original close-delay bug in this doc has not yet been
+re-confirmed, root-caused at the I/O level, or fixed this session** — the
+entire session's effort after the initial source-reading went into
+unblocking the repro path, which is not yet fully unblocked. The two
+fixes above are real, verified, valuable fixes in their own right
+(committed to `dev` independently — see their docs for verification
+detail) but are not the fix for *this* bug.
+
+### What a future session should do
+
+1. Fix (or work around) `docs/known-issues/enumset-of-broken-for-non-jdk-enums.md`
+   first — it's the last known blocker preventing
+   `TestWsRemoteEndpointImplServerDeadlock` from starting Tomcat at all.
+2. Re-run the exact repro from this doc on a fresh worktree build once
+   unblocked. Confirm whether the ~19s delay is still present (it may not
+   be — none of the three environment bugs above are obviously related to
+   the close-handshake path itself, but this doc's original evidence
+   predates all of them, so treat the delay's continued presence as
+   needing re-confirmation, not an assumption).
+3. If still present: attach `gdb -p <pid> -batch -ex 'thread apply all bt'`
+   to the CratonVM process during the ~1-19s window (not just at a single
+   timeout-triggered snapshot) to see whether the server thread is
+   genuinely parked waiting on the socket (native syscall, e.g. `epoll`/
+   `poll`) vs. spinning in the `acquireMessagePartInProgressSemaphore`
+   yield loop the whole time — this directly distinguishes "write-ready
+   notification never fires" from "notification fires but something else
+   in the completion chain drops it." Cross-reference with the
+   `DEFAULT_BLOCKING_SEND_TIMEOUT` hypothesis above.
+4. If the timeout hypothesis holds, the actual fix is almost certainly in
+   `native-io/src/async_socket.rs`/`nio_selector.rs` (or wherever
+   `SocketWrapperBase.isReadyForWrite()`/the NIO write-listener dispatch
+   is backed) — not in `Semaphore`/`CountDownLatch` (already tried and
+   ruled out respectively by a prior session and this one).

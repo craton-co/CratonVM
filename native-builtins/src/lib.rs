@@ -58527,6 +58527,49 @@ fn native_file_clinit(ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCal
         "pathSeparatorChar",
         Value::Int(path_separator.chars().next().unwrap_or(':') as i32),
     );
+    // WSCLOSE-08-07: this native override REPLACES the real <clinit>
+    // bytecode wholesale (registered unconditionally below), so the real
+    // FS = DefaultFileSystem.getFileSystem() assignment (JVMS: the FIRST
+    // static assigned, before separatorChar/pathSeparator) never runs and
+    // File.FS was left permanently null. Any real-JDK File method NOT
+    // covered by our check_override allow-list (e.g. isInvalid(),
+    // length(), lastModified(), delete(), mkdir(), list(), ...)
+    // executes real bytecode that dereferences FS directly (e.g.
+    // FS.isInvalid(this)), so every such call NPE'd with "Cannot invoke
+    // ... because \"java.io.File.FS\" is null" -- observed first via
+    // Tomcat's Digester (SAXParserFactory internals stat a File through
+    // a non-overridden path while probing mbeans-descriptors.xml),
+    // cascading into full StandardContext startup failure. Build and
+    // publish a real (non-null) FileSystem instance the same way the
+    // JDK's UnixFileSystem/WinNTFileSystem constructors would, so
+    // FS.isInvalid/getBooleanAttributes/etc. all resolve to our real
+    // native filesystem natives instead of NPEing on a null receiver.
+    let user_dir = ctx
+        .get_system_property("user.dir")
+        .or_else(|| {
+            std::env::current_dir()
+                .ok()
+                .map(|p| p.to_string_lossy().into_owned())
+        })
+        .unwrap_or_else(|| ".".to_string());
+    let user_dir_str = ctx.create_string(&user_dir);
+    #[cfg(windows)]
+    {
+        let fs_obj = alloc_concurrent_synthetic(ctx, "java/io/WinNTFileSystem", 4);
+        ctx.set_field_by_name(fs_obj, "slash", Value::Int(std::path::MAIN_SEPARATOR as i32));
+        ctx.set_field_by_name(fs_obj, "semicolon", Value::Int(';' as i32));
+        ctx.set_field_by_name(fs_obj, "altSlash", Value::Int('/' as i32));
+        ctx.set_field_by_name(fs_obj, "userDir", Value::Object(Some(user_dir_str)));
+        ctx.set_static_field_by_name("java/io/File", "FS", Value::Object(Some(fs_obj)));
+    }
+    #[cfg(not(windows))]
+    {
+        let fs_obj = alloc_concurrent_synthetic(ctx, "java/io/UnixFileSystem", 3);
+        ctx.set_field_by_name(fs_obj, "slash", Value::Int(std::path::MAIN_SEPARATOR as i32));
+        ctx.set_field_by_name(fs_obj, "colon", Value::Int(':' as i32));
+        ctx.set_field_by_name(fs_obj, "userDir", Value::Object(Some(user_dir_str)));
+        ctx.set_static_field_by_name("java/io/File", "FS", Value::Object(Some(fs_obj)));
+    }
     Ok(None)
 }
 
