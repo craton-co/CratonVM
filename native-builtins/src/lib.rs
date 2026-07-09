@@ -14649,6 +14649,7 @@ const XERCES_XMLCHAR: &str = "com/sun/org/apache/xerces/internal/util/XMLChar";
 const XERCES_XML_ENTITY_SCANNER: &str = "com/sun/org/apache/xerces/internal/impl/XMLEntityScanner";
 const XERCES_XML_SCANNER_NAME_TYPE: &str =
     "com/sun/org/apache/xerces/internal/impl/XMLScanner$NameType";
+const XERCES_QNAME: &str = "com/sun/org/apache/xerces/internal/xni/QName";
 const XERCES_XML_STRING: &str = "com/sun/org/apache/xerces/internal/xni/XMLString";
 const XERCES_XSSIMPLE_TYPE_DECL: &str =
     "com/sun/org/apache/xerces/internal/impl/dv/xs/XSSimpleTypeDecl";
@@ -15672,6 +15673,484 @@ fn native_xml_entity_scanner_check_entity_limit(
     xml_entity_scanner_check_entity_limit_impl(ctx, scanner, nt, entity, offset, length)
 }
 
+fn xml_entity_scanner_check_name_limit_impl(
+    ctx: &mut dyn NativeContext,
+    scanner: ObjectRef,
+    entity: ObjectRef,
+    length: i32,
+) -> MethodCallResult {
+    if length <= 0 {
+        return Ok(None);
+    }
+    let Some(analyzer) = object_field_ref(ctx, scanner, "fLimitAnalyzer") else {
+        return Ok(None);
+    };
+    let entity_name = object_field_ref(ctx, entity, "name");
+    xml_limit_add_value_index(ctx, analyzer, XML_LIMIT_MAX_NAME, entity_name, length)
+}
+
+fn xml_entity_scanner_units(
+    ctx: &dyn NativeContext,
+    chars: ObjectRef,
+    offset: i32,
+    length: i32,
+) -> Result<Vec<u16>, MethodCallFailed> {
+    if offset < 0 || length < 0 {
+        return Err(RuntimeError::ArrayIndexOutOfBoundsException { index: offset }.into());
+    }
+    let end =
+        offset
+            .checked_add(length)
+            .ok_or_else(|| RuntimeError::ArrayIndexOutOfBoundsException {
+                index: offset.wrapping_add(length),
+            })?;
+    if end as usize > ctx.array_length(chars) {
+        return Err(RuntimeError::ArrayIndexOutOfBoundsException { index: end }.into());
+    }
+    let mut units = Vec::with_capacity(length as usize);
+    for slot in offset..end {
+        units.push(xml_entity_scanner_char_at(ctx, chars, slot)? as u16);
+    }
+    Ok(units)
+}
+
+fn xml_entity_scanner_symbol(
+    ctx: &mut dyn NativeContext,
+    scanner: ObjectRef,
+    chars: ObjectRef,
+    offset: i32,
+    length: i32,
+) -> Result<ObjectRef, MethodCallFailed> {
+    if let Some(symbol_table) = object_field_ref(ctx, scanner, "fSymbolTable") {
+        if let Some(Value::Object(Some(symbol))) = ctx.invoke_virtual(
+            symbol_table,
+            "addSymbol",
+            "([CII)Ljava/lang/String;",
+            &[
+                Value::Object(Some(chars)),
+                Value::Int(offset),
+                Value::Int(length),
+            ],
+        )? {
+            return Ok(symbol);
+        }
+    }
+
+    let units = xml_entity_scanner_units(ctx, chars, offset, length)?;
+    Ok(ctx.create_string_uninterned(&String::from_utf16_lossy(&units)))
+}
+
+fn xml_entity_scanner_set_qname_values(
+    ctx: &dyn NativeContext,
+    qname: ObjectRef,
+    prefix: Option<ObjectRef>,
+    localpart: Option<ObjectRef>,
+    rawname: Option<ObjectRef>,
+    uri: Option<ObjectRef>,
+) {
+    ctx.set_field_by_name(qname, "prefix", Value::Object(prefix));
+    ctx.set_field_by_name(qname, "localpart", Value::Object(localpart));
+    ctx.set_field_by_name(qname, "rawname", Value::Object(rawname));
+    ctx.set_field_by_name(qname, "uri", Value::Object(uri));
+}
+
+fn xerces_valid_ascii_name_unit(unit: i32) -> bool {
+    (b'A' as i32..=b'Z' as i32).contains(&unit)
+        || (b'a' as i32..=b'z' as i32).contains(&unit)
+        || (b'0' as i32..=b'9' as i32).contains(&unit)
+        || unit == b'-' as i32
+        || unit == b'.' as i32
+        || unit == b':' as i32
+        || unit == b'_' as i32
+}
+
+fn xerces_is_name_start_unit(
+    ctx: &dyn NativeContext,
+    chars_table: Option<ObjectRef>,
+    unit: i32,
+) -> bool {
+    if let Some(table) = chars_table {
+        xmlchar_has_mask_in_table(ctx, table, unit, XMLCHAR_MASK_NAME_START)
+    } else {
+        (b'A' as i32..=b'Z' as i32).contains(&unit)
+            || (b'a' as i32..=b'z' as i32).contains(&unit)
+            || unit == b'_' as i32
+            || unit == b':' as i32
+    }
+}
+
+fn xerces_is_name_unit(ctx: &dyn NativeContext, chars_table: Option<ObjectRef>, unit: i32) -> bool {
+    if unit < 127 && xerces_valid_ascii_name_unit(unit) {
+        return true;
+    }
+    chars_table.is_some_and(|table| xmlchar_has_mask_in_table(ctx, table, unit, XMLCHAR_MASK_NAME))
+}
+
+fn xerces_is_ncname_start_unit(
+    ctx: &dyn NativeContext,
+    chars_table: Option<ObjectRef>,
+    unit: i32,
+) -> bool {
+    if let Some(table) = chars_table {
+        xmlchar_has_mask_in_table(ctx, table, unit, XMLCHAR_MASK_NCNAME_START)
+    } else {
+        (b'A' as i32..=b'Z' as i32).contains(&unit)
+            || (b'a' as i32..=b'z' as i32).contains(&unit)
+            || unit == b'_' as i32
+    }
+}
+
+fn native_xml_entity_scanner_scan_qname(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    let scanner = obj_arg(args, 0)?;
+    let qname = obj_arg(args, 1)?;
+    let nt = match args.get(2) {
+        Some(Value::Object(Some(obj))) => Some(*obj),
+        _ => None,
+    };
+    let scanner_pin = ctx.pin_native_root(scanner);
+    let qname_pin = ctx.pin_native_root(qname);
+    let nt_pin = nt.map(|obj| (ctx.pin_native_root(obj), obj));
+    let result = (|| -> MethodCallResult {
+        let mut scanner = ctx.read_native_pin(scanner_pin, scanner);
+        let mut qname = ctx.read_native_pin(qname_pin, qname);
+        let mut entity = object_field_ref(ctx, scanner, "fCurrentEntity").ok_or_else(|| {
+            RuntimeError::NullPointerException {
+                message: Some("XMLEntityScanner.fCurrentEntity is null".to_string()),
+            }
+        })?;
+
+        if int_field_named(ctx, entity, "position") == int_field_named(ctx, entity, "count") {
+            ctx.invoke(
+                XERCES_XML_ENTITY_SCANNER,
+                "load",
+                "(IZZ)Z",
+                &[
+                    Value::Object(Some(scanner)),
+                    Value::Int(0),
+                    Value::Int(1),
+                    Value::Int(1),
+                ],
+            )?;
+            scanner = ctx.read_native_pin(scanner_pin, scanner);
+            qname = ctx.read_native_pin(qname_pin, qname);
+            entity = object_field_ref(ctx, scanner, "fCurrentEntity").ok_or_else(|| {
+                RuntimeError::NullPointerException {
+                    message: Some("XMLEntityScanner.fCurrentEntity is null".to_string()),
+                }
+            })?;
+        }
+
+        let offset = int_field_named(ctx, entity, "position");
+        set_int_field_named(ctx, scanner, "offset", offset);
+        let mut chars = object_field_ref(ctx, entity, "ch").ok_or_else(|| {
+            RuntimeError::NullPointerException {
+                message: Some("ScannedEntity.ch is null".to_string()),
+            }
+        })?;
+        let chars_pin = ctx.pin_native_root(chars);
+        let chars_table = xmlchar_chars_array(ctx);
+        scanner = ctx.read_native_pin(scanner_pin, scanner);
+        entity = object_field_ref(ctx, scanner, "fCurrentEntity").ok_or_else(|| {
+            RuntimeError::NullPointerException {
+                message: Some("XMLEntityScanner.fCurrentEntity is null".to_string()),
+            }
+        })?;
+        chars = ctx.read_native_pin(chars_pin, chars);
+        let first = xml_entity_scanner_char_at(ctx, chars, offset)?;
+        if !xerces_is_name_start_unit(ctx, chars_table, first) {
+            return Ok(Some(Value::Int(0)));
+        }
+
+        let mut position = offset.wrapping_add(1);
+        set_int_field_named(ctx, entity, "position", position);
+        if position == int_field_named(ctx, entity, "count") {
+            ctx.invoke(
+                XERCES_XML_ENTITY_SCANNER,
+                "invokeListeners",
+                "(I)V",
+                &[Value::Object(Some(scanner)), Value::Int(1)],
+            )?;
+            scanner = ctx.read_native_pin(scanner_pin, scanner);
+            entity = object_field_ref(ctx, scanner, "fCurrentEntity").ok_or_else(|| {
+                RuntimeError::NullPointerException {
+                    message: Some("XMLEntityScanner.fCurrentEntity is null".to_string()),
+                }
+            })?;
+            chars = object_field_ref(ctx, entity, "ch").ok_or_else(|| {
+                RuntimeError::NullPointerException {
+                    message: Some("ScannedEntity.ch is null".to_string()),
+                }
+            })?;
+            xml_entity_scanner_set_char(ctx, chars, 0, first)?;
+            set_int_field_named(ctx, scanner, "offset", 0);
+            let loaded = ctx.invoke(
+                XERCES_XML_ENTITY_SCANNER,
+                "load",
+                "(IZZ)Z",
+                &[
+                    Value::Object(Some(scanner)),
+                    Value::Int(1),
+                    Value::Int(0),
+                    Value::Int(0),
+                ],
+            )?;
+            scanner = ctx.read_native_pin(scanner_pin, scanner);
+            qname = ctx.read_native_pin(qname_pin, qname);
+            entity = object_field_ref(ctx, scanner, "fCurrentEntity").ok_or_else(|| {
+                RuntimeError::NullPointerException {
+                    message: Some("XMLEntityScanner.fCurrentEntity is null".to_string()),
+                }
+            })?;
+            if loaded.and_then(|value| value.as_int()).unwrap_or(0) != 0 {
+                set_int_field_named(
+                    ctx,
+                    entity,
+                    "columnNumber",
+                    int_field_named(ctx, entity, "columnNumber").wrapping_add(1),
+                );
+                chars = object_field_ref(ctx, entity, "ch").ok_or_else(|| {
+                    RuntimeError::NullPointerException {
+                        message: Some("ScannedEntity.ch is null".to_string()),
+                    }
+                })?;
+                let name = xml_entity_scanner_symbol(ctx, scanner, chars, 0, 1)?;
+                qname = ctx.read_native_pin(qname_pin, qname);
+                xml_entity_scanner_set_qname_values(ctx, qname, None, Some(name), Some(name), None);
+                let nt_now = nt_pin.map(|(pin, fallback)| ctx.read_native_pin(pin, fallback));
+                xml_entity_scanner_check_entity_limit_impl(
+                    ctx,
+                    scanner,
+                    nt_now,
+                    Some(entity),
+                    0,
+                    1,
+                )?;
+                return Ok(Some(Value::Int(1)));
+            }
+            set_int_field_named(ctx, entity, "position", 1);
+            position = 1;
+        }
+
+        let mut index = -1;
+        loop {
+            scanner = ctx.read_native_pin(scanner_pin, scanner);
+            entity = object_field_ref(ctx, scanner, "fCurrentEntity").ok_or_else(|| {
+                RuntimeError::NullPointerException {
+                    message: Some("XMLEntityScanner.fCurrentEntity is null".to_string()),
+                }
+            })?;
+            chars = object_field_ref(ctx, entity, "ch").ok_or_else(|| {
+                RuntimeError::NullPointerException {
+                    message: Some("ScannedEntity.ch is null".to_string()),
+                }
+            })?;
+            position = int_field_named(ctx, entity, "position");
+            if position >= int_field_named(ctx, entity, "count") {
+                break;
+            }
+            let c = xml_entity_scanner_char_at(ctx, chars, position)?;
+            if !xerces_is_name_unit(ctx, chars_table, c) {
+                break;
+            }
+            if c == ':' as i32 {
+                if index != -1 {
+                    break;
+                }
+                index = position;
+                let offset_now = int_field_named(ctx, scanner, "offset");
+                xml_entity_scanner_check_name_limit_impl(
+                    ctx,
+                    scanner,
+                    entity,
+                    index.wrapping_sub(offset_now),
+                )?;
+                scanner = ctx.read_native_pin(scanner_pin, scanner);
+                entity = object_field_ref(ctx, scanner, "fCurrentEntity").ok_or_else(|| {
+                    RuntimeError::NullPointerException {
+                        message: Some("XMLEntityScanner.fCurrentEntity is null".to_string()),
+                    }
+                })?;
+            }
+
+            let offset_now = int_field_named(ctx, scanner, "offset");
+            let next_position = int_field_named(ctx, entity, "position").wrapping_add(1);
+            set_int_field_named(ctx, entity, "position", next_position);
+            if next_position == int_field_named(ctx, entity, "count") {
+                let length = next_position.wrapping_sub(offset_now);
+                let name_length = if index != -1 {
+                    length.wrapping_sub(index.wrapping_sub(offset_now))
+                } else {
+                    length
+                };
+                xml_entity_scanner_check_name_limit_impl(ctx, scanner, entity, name_length)?;
+                ctx.invoke(
+                    XERCES_XML_ENTITY_SCANNER,
+                    "invokeListeners",
+                    "(I)V",
+                    &[Value::Object(Some(scanner)), Value::Int(length)],
+                )?;
+                scanner = ctx.read_native_pin(scanner_pin, scanner);
+                entity = object_field_ref(ctx, scanner, "fCurrentEntity").ok_or_else(|| {
+                    RuntimeError::NullPointerException {
+                        message: Some("XMLEntityScanner.fCurrentEntity is null".to_string()),
+                    }
+                })?;
+                chars = object_field_ref(ctx, entity, "ch").ok_or_else(|| {
+                    RuntimeError::NullPointerException {
+                        message: Some("ScannedEntity.ch is null".to_string()),
+                    }
+                })?;
+                if length as usize == ctx.array_length(chars) {
+                    let buffer_size = int_field_named(ctx, entity, "fBufferSize");
+                    let new_len = if buffer_size > 0 {
+                        (buffer_size as usize).saturating_mul(2)
+                    } else {
+                        ctx.array_length(chars)
+                            .saturating_mul(2)
+                            .max(length as usize)
+                    };
+                    let tmp = ctx.new_array(cratonvm_types::ArrayElementType::Char, new_len);
+                    for slot in 0..length {
+                        let value = xml_entity_scanner_char_at(ctx, chars, offset_now + slot)?;
+                        xml_entity_scanner_set_char(ctx, tmp, slot, value)?;
+                    }
+                    ctx.set_field_by_name(entity, "ch", Value::Object(Some(tmp)));
+                    if buffer_size > 0 {
+                        set_int_field_named(
+                            ctx,
+                            entity,
+                            "fBufferSize",
+                            buffer_size.saturating_mul(2),
+                        );
+                    }
+                } else {
+                    for slot in 0..length {
+                        let value = xml_entity_scanner_char_at(ctx, chars, offset_now + slot)?;
+                        xml_entity_scanner_set_char(ctx, chars, slot, value)?;
+                    }
+                }
+                if index != -1 {
+                    index = index.wrapping_sub(offset_now);
+                }
+                set_int_field_named(ctx, scanner, "offset", 0);
+                let loaded = ctx.invoke(
+                    XERCES_XML_ENTITY_SCANNER,
+                    "load",
+                    "(IZZ)Z",
+                    &[
+                        Value::Object(Some(scanner)),
+                        Value::Int(length),
+                        Value::Int(0),
+                        Value::Int(0),
+                    ],
+                )?;
+                if loaded.and_then(|value| value.as_int()).unwrap_or(0) != 0 {
+                    break;
+                }
+            }
+        }
+
+        scanner = ctx.read_native_pin(scanner_pin, scanner);
+        qname = ctx.read_native_pin(qname_pin, qname);
+        entity = object_field_ref(ctx, scanner, "fCurrentEntity").ok_or_else(|| {
+            RuntimeError::NullPointerException {
+                message: Some("XMLEntityScanner.fCurrentEntity is null".to_string()),
+            }
+        })?;
+        chars = object_field_ref(ctx, entity, "ch").ok_or_else(|| {
+            RuntimeError::NullPointerException {
+                message: Some("ScannedEntity.ch is null".to_string()),
+            }
+        })?;
+        let offset = int_field_named(ctx, scanner, "offset");
+        let length = int_field_named(ctx, entity, "position").wrapping_sub(offset);
+        set_int_field_named(
+            ctx,
+            entity,
+            "columnNumber",
+            int_field_named(ctx, entity, "columnNumber").wrapping_add(length),
+        );
+        if length <= 0 {
+            return Ok(Some(Value::Int(0)));
+        }
+
+        let rawname = xml_entity_scanner_symbol(ctx, scanner, chars, offset, length)?;
+        let rawname_pin = ctx.pin_native_root(rawname);
+        scanner = ctx.read_native_pin(scanner_pin, scanner);
+        qname = ctx.read_native_pin(qname_pin, qname);
+        entity = object_field_ref(ctx, scanner, "fCurrentEntity").ok_or_else(|| {
+            RuntimeError::NullPointerException {
+                message: Some("XMLEntityScanner.fCurrentEntity is null".to_string()),
+            }
+        })?;
+        chars = object_field_ref(ctx, entity, "ch").ok_or_else(|| {
+            RuntimeError::NullPointerException {
+                message: Some("ScannedEntity.ch is null".to_string()),
+            }
+        })?;
+
+        let (prefix_pin, localpart_pin) = if index != -1 {
+            let prefix_length = index.wrapping_sub(offset);
+            xml_entity_scanner_check_name_limit_impl(ctx, scanner, entity, prefix_length)?;
+            let prefix = xml_entity_scanner_symbol(ctx, scanner, chars, offset, prefix_length)?;
+            let prefix_pin = ctx.pin_native_root(prefix);
+            scanner = ctx.read_native_pin(scanner_pin, scanner);
+            entity = object_field_ref(ctx, scanner, "fCurrentEntity").ok_or_else(|| {
+                RuntimeError::NullPointerException {
+                    message: Some("XMLEntityScanner.fCurrentEntity is null".to_string()),
+                }
+            })?;
+            chars = object_field_ref(ctx, entity, "ch").ok_or_else(|| {
+                RuntimeError::NullPointerException {
+                    message: Some("ScannedEntity.ch is null".to_string()),
+                }
+            })?;
+            let local_length = length.wrapping_sub(prefix_length).wrapping_sub(1);
+            let local_start = index.wrapping_add(1);
+            let local_first = xml_entity_scanner_char_at(ctx, chars, local_start)?;
+            if !xerces_is_ncname_start_unit(ctx, chars_table, local_first) {
+                // The JDK reports IllegalQName here and still finishes the scan.
+                // The cold error-reporting path is left to interpreted Xerces.
+            }
+            xml_entity_scanner_check_name_limit_impl(ctx, scanner, entity, local_length)?;
+            let localpart =
+                xml_entity_scanner_symbol(ctx, scanner, chars, local_start, local_length)?;
+            let localpart_pin = ctx.pin_native_root(localpart);
+            (Some((prefix_pin, prefix)), Some((localpart_pin, localpart)))
+        } else {
+            xml_entity_scanner_check_name_limit_impl(ctx, scanner, entity, length)?;
+            (None, Some((rawname_pin, rawname)))
+        };
+
+        qname = ctx.read_native_pin(qname_pin, qname);
+        let prefix = prefix_pin.map(|(pin, fallback)| ctx.read_native_pin(pin, fallback));
+        let localpart = localpart_pin.map(|(pin, fallback)| ctx.read_native_pin(pin, fallback));
+        let rawname = ctx.read_native_pin(rawname_pin, rawname);
+        xml_entity_scanner_set_qname_values(ctx, qname, prefix, localpart, Some(rawname), None);
+        scanner = ctx.read_native_pin(scanner_pin, scanner);
+        entity = object_field_ref(ctx, scanner, "fCurrentEntity").ok_or_else(|| {
+            RuntimeError::NullPointerException {
+                message: Some("XMLEntityScanner.fCurrentEntity is null".to_string()),
+            }
+        })?;
+        let nt_now = nt_pin.map(|(pin, fallback)| ctx.read_native_pin(pin, fallback));
+        xml_entity_scanner_check_entity_limit_impl(
+            ctx,
+            scanner,
+            nt_now,
+            Some(entity),
+            offset,
+            length,
+        )?;
+        Ok(Some(Value::Int(1)))
+    })();
+    ctx.unpin_native_roots(scanner_pin);
+    result
+}
+
 fn xerces_normalized_newline(version: i32, unit: i32, is_external: bool, initial: bool) -> bool {
     unit == '\n' as i32
         || unit == '\r' as i32
@@ -16568,6 +17047,12 @@ fn register_xerces_xml_parser_intrinsics(registry: &mut NativeMethodRegistry) {
         "scanContent",
         &format!("(L{XERCES_XML_STRING};)I"),
         native_xml_entity_scanner_scan_content,
+    );
+    registry.register(
+        XERCES_XML_ENTITY_SCANNER,
+        "scanQName",
+        &format!("(L{XERCES_QNAME};L{XERCES_XML_SCANNER_NAME_TYPE};)Z"),
+        native_xml_entity_scanner_scan_qname,
     );
     registry.register(
         XERCES_XML_ENTITY_SCANNER,
@@ -65296,6 +65781,37 @@ mod xerces_xml_parser_tests {
             }],
         );
         let chars = ctx.new_array(ArrayElementType::Byte, 128);
+        for ch in b'A'..=b'Z' {
+            ctx.set_array_element(
+                chars,
+                ch as usize,
+                Value::Int(
+                    (XMLCHAR_MASK_NAME_START
+                        | XMLCHAR_MASK_NAME
+                        | XMLCHAR_MASK_NCNAME_START
+                        | XMLCHAR_MASK_NCNAME) as i32,
+                ),
+            );
+        }
+        for ch in b'a'..=b'z' {
+            ctx.set_array_element(
+                chars,
+                ch as usize,
+                Value::Int(
+                    (XMLCHAR_MASK_NAME_START
+                        | XMLCHAR_MASK_NAME
+                        | XMLCHAR_MASK_NCNAME_START
+                        | XMLCHAR_MASK_NCNAME) as i32,
+                ),
+            );
+        }
+        for ch in b'0'..=b'9' {
+            ctx.set_array_element(
+                chars,
+                ch as usize,
+                Value::Int((XMLCHAR_MASK_NAME | XMLCHAR_MASK_NCNAME) as i32),
+            );
+        }
         for (ch, mask) in [
             (
                 'A',
@@ -65313,6 +65829,7 @@ mod xerces_xml_parser_tests {
             ),
             (':', XMLCHAR_MASK_NAME_START | XMLCHAR_MASK_NAME),
             ('-', XMLCHAR_MASK_NAME | XMLCHAR_MASK_NCNAME),
+            ('.', XMLCHAR_MASK_NAME | XMLCHAR_MASK_NCNAME),
             (' ', XMLCHAR_MASK_SPACE),
         ] {
             ctx.set_array_element(chars, ch as usize, Value::Int((mask as u8 as i8) as i32));
@@ -65419,8 +65936,8 @@ mod xerces_xml_parser_tests {
         let xml_string_class = ctx
             .ensure_class_initialized(XERCES_XML_STRING)
             .expect("XMLString class id");
-        let scanner = ctx.alloc_object(scanner_class, 6);
-        let entity = ctx.alloc_object(entity_class, 7);
+        let scanner = ctx.alloc_object(scanner_class, 7);
+        let entity = ctx.alloc_object(entity_class, 8);
         let xml_string = ctx.alloc_object(xml_string_class, 3);
         let units: Vec<u16> = text.encode_utf16().collect();
         let chars = ctx.new_array(ArrayElementType::Char, units.len());
@@ -65434,6 +65951,7 @@ mod xerces_xml_parser_tests {
         ctx.set_field_by_name(scanner, "newlines", Value::Int(0));
         ctx.set_field_by_name(scanner, "counted", Value::Int(1));
         ctx.set_field_by_name(scanner, "fLimitAnalyzer", Value::Object(None));
+        ctx.set_field_by_name(scanner, "fSymbolTable", Value::Object(None));
         ctx.set_field_by_name(entity, "ch", Value::Object(Some(chars)));
         ctx.set_field_by_name(entity, "position", Value::Int(0));
         ctx.set_field_by_name(entity, "count", Value::Int(units.len() as i32));
@@ -65441,10 +65959,18 @@ mod xerces_xml_parser_tests {
         ctx.set_field_by_name(entity, "lineNumber", Value::Int(1));
         ctx.set_field_by_name(entity, "isGE", Value::Int(0));
         ctx.set_field_by_name(entity, "name", Value::Object(None));
+        ctx.set_field_by_name(entity, "fBufferSize", Value::Int(units.len() as i32));
         ctx.set_field_by_name(xml_string, "ch", Value::Object(None));
         ctx.set_field_by_name(xml_string, "offset", Value::Int(0));
         ctx.set_field_by_name(xml_string, "length", Value::Int(0));
         (scanner, entity, xml_string, chars)
+    }
+
+    fn new_qname(ctx: &mut MockNativeContext) -> ObjectRef {
+        let class_id = ctx
+            .ensure_class_initialized(XERCES_QNAME)
+            .expect("QName class id");
+        ctx.alloc_object(class_id, 4)
     }
 
     fn new_xerces_opti_node(
@@ -65522,6 +66048,11 @@ mod xerces_xml_parser_tests {
                 XERCES_XML_ENTITY_SCANNER,
                 "scanContent",
                 "(Lcom/sun/org/apache/xerces/internal/xni/XMLString;)I",
+            ),
+            (
+                XERCES_XML_ENTITY_SCANNER,
+                "scanQName",
+                "(Lcom/sun/org/apache/xerces/internal/xni/QName;Lcom/sun/org/apache/xerces/internal/impl/XMLScanner$NameType;)Z",
             ),
             (XERCES_XML_ENTITY_SCANNER, "skipSpaces", "()Z"),
             (
@@ -65844,6 +66375,70 @@ mod xerces_xml_parser_tests {
         );
         assert_eq!(ctx.get_field_by_name(xml_string, "offset"), Value::Int(0));
         assert_eq!(ctx.get_field_by_name(xml_string, "length"), Value::Int(3));
+    }
+
+    #[test]
+    fn xml_entity_scanner_scan_qname_sets_qname_and_updates_limits() {
+        let mut ctx = MockNativeContext::new();
+        seed_xmlchar_table(&mut ctx);
+        let (analyzer, values, names, total_value, _caches) = new_xml_limit_analyzer(&mut ctx);
+        let (scanner, entity, _xml_string, _chars) =
+            new_entity_scanner_fixture(&mut ctx, "xsd:element ");
+        let qname = new_qname(&mut ctx);
+        let entity_name = ctx.create_string("liquibase-entity");
+        ctx.set_field_by_name(scanner, "fLimitAnalyzer", Value::Object(Some(analyzer)));
+        ctx.set_field_by_name(entity, "isGE", Value::Int(1));
+        ctx.set_field_by_name(entity, "name", Value::Object(Some(entity_name)));
+
+        assert_eq!(
+            native_xml_entity_scanner_scan_qname(
+                &mut ctx,
+                &[
+                    Value::Object(Some(scanner)),
+                    Value::Object(Some(qname)),
+                    Value::Object(None),
+                ],
+            )
+            .expect("scanQName")
+            .expect("scan result"),
+            Value::Int(1)
+        );
+
+        assert_eq!(ctx.get_field_by_name(scanner, "offset"), Value::Int(0));
+        assert_eq!(ctx.get_field_by_name(entity, "position"), Value::Int(11));
+        assert_eq!(
+            ctx.get_field_by_name(entity, "columnNumber"),
+            Value::Int(11)
+        );
+        assert_eq!(
+            string_result(&ctx, ctx.get_field_by_name(qname, "prefix")),
+            "xsd"
+        );
+        assert_eq!(
+            string_result(&ctx, ctx.get_field_by_name(qname, "localpart")),
+            "element"
+        );
+        assert_eq!(
+            string_result(&ctx, ctx.get_field_by_name(qname, "rawname")),
+            "xsd:element"
+        );
+        assert_eq!(ctx.get_field_by_name(qname, "uri"), Value::Object(None));
+        assert_eq!(
+            ctx.get_array_element(values, XML_LIMIT_MAX_NAME as usize),
+            Value::Int(7)
+        );
+        assert_eq!(
+            ctx.get_array_element(values, XML_LIMIT_GENERAL_ENTITY_SIZE as usize),
+            Value::Int(11)
+        );
+        assert_eq!(
+            ctx.get_array_element(total_value, XML_LIMIT_TOTAL_ENTITY_SIZE as usize),
+            Value::Int(11)
+        );
+        assert_eq!(
+            ctx.get_array_element(names, XML_LIMIT_GENERAL_ENTITY_SIZE as usize),
+            Value::Object(Some(entity_name))
+        );
     }
 
     #[test]
