@@ -3461,7 +3461,12 @@ pub(crate) fn register_thread_local_natives(r: &mut NativeMethodRegistry) {
     r.set_category(cratonvm_native_api::NativeKind::Intrinsic);
     let c = "java/lang/ThreadLocal";
     r.register(c, "<init>", "()V", native_tl_init);
-    r.register(c, "initialValue", "()Ljava/lang/Object;", native_tl_initial_value);
+    r.register(
+        c,
+        "initialValue",
+        "()Ljava/lang/Object;",
+        native_tl_initial_value,
+    );
     r.register(c, "get", "()Ljava/lang/Object;", native_tl_get);
     r.register(c, "set", "(Ljava/lang/Object;)V", native_tl_set);
     r.register(c, "remove", "()V", native_tl_remove);
@@ -7499,7 +7504,9 @@ pub(crate) fn register_scheduled_executor_natives(r: &mut NativeMethodRegistry) 
                     break;
                 }
                 let chunk = remaining.min(std::time::Duration::from_millis(25));
+                ctx.begin_blocking_region();
                 std::thread::sleep(chunk);
+                ctx.end_blocking_region();
             }
             Ok(Some(Value::Int(1)))
         },
@@ -8994,13 +9001,7 @@ fn p52_hex_val(b: u8) -> Option<u8> {
 // ---------------------------------------------------------------------------
 // java.net.InetSocketAddress — holder-shaped synthetic
 // ---------------------------------------------------------------------------
-fn p52_isa_set(
-    ctx: &mut dyn NativeContext,
-    this: ObjectRef,
-    host: Value,
-    addr: Value,
-    port: i32,
-) {
+fn p52_isa_set(ctx: &mut dyn NativeContext, this: ObjectRef, host: Value, addr: Value, port: i32) {
     let holder =
         alloc_concurrent_synthetic(ctx, "java/net/InetSocketAddress$InetSocketAddressHolder", 3);
     ctx.set_field(holder, 0, host);
@@ -9092,7 +9093,13 @@ pub(crate) fn register_phase52_inet_socket_address(r: &mut NativeMethodRegistry)
         let this = obj_arg(args, 0)?;
         let host = obj_arg(args, 1)?;
         let port = args[2].as_int().unwrap_or(0);
-        p52_isa_set(ctx, this, Value::Object(Some(host)), Value::Object(None), port);
+        p52_isa_set(
+            ctx,
+            this,
+            Value::Object(Some(host)),
+            Value::Object(None),
+            port,
+        );
         Ok(Some(Value::Object(None)))
     });
     r.register(isa, "<init>", "(Ljava/net/InetAddress;I)V", |ctx, args| {
@@ -9111,7 +9118,13 @@ pub(crate) fn register_phase52_inet_socket_address(r: &mut NativeMethodRegistry)
             let host = obj_arg(args, 0)?;
             let port = args[1].as_int().unwrap_or(0);
             let obj = alloc_concurrent_synthetic(ctx, "java/net/InetSocketAddress", 3);
-            p52_isa_set(ctx, obj, Value::Object(Some(host)), Value::Object(None), port);
+            p52_isa_set(
+                ctx,
+                obj,
+                Value::Object(Some(host)),
+                Value::Object(None),
+                port,
+            );
             Ok(Some(Value::Object(Some(obj))))
         },
     );
@@ -9231,9 +9244,12 @@ pub(crate) fn register_phase52_server_socket_factory(r: &mut NativeMethodRegistr
             Ok(Some(Value::Object(Some(obj))))
         },
     );
-    r.register(ssf, "createServerSocket", "()Ljava/net/ServerSocket;", |ctx, _args| {
-        ctx.new_object_initialized("java/net/ServerSocket", "()V", &[])
-    });
+    r.register(
+        ssf,
+        "createServerSocket",
+        "()Ljava/net/ServerSocket;",
+        |ctx, _args| ctx.new_object_initialized("java/net/ServerSocket", "()V", &[]),
+    );
     r.register(
         ssf,
         "createServerSocket",
@@ -15440,15 +15456,10 @@ pub(crate) fn register_phase54_logging_extras(r: &mut NativeMethodRegistry) {
         ctx.set_field(this, 5, args[1]);
         Ok(Some(Value::Object(None)))
     });
-    r.register(
-        lr,
-        "getParameters",
-        "()[Ljava/lang/Object;",
-        |ctx, args| {
-            let this = obj_arg(args, 0)?;
-            Ok(Some(ctx.get_field(this, 6)))
-        },
-    );
+    r.register(lr, "getParameters", "()[Ljava/lang/Object;", |ctx, args| {
+        let this = obj_arg(args, 0)?;
+        Ok(Some(ctx.get_field(this, 6)))
+    });
     r.register(
         lr,
         "setParameters",
@@ -15519,16 +15530,11 @@ pub(crate) fn register_phase54_logging_extras(r: &mut NativeMethodRegistry) {
         let this = obj_arg(args, 0)?;
         Ok(Some(ctx.get_field(this, 11)))
     });
-    r.register(
-        lr,
-        "setThrown",
-        "(Ljava/lang/Throwable;)V",
-        |ctx, args| {
-            let this = obj_arg(args, 0)?;
-            ctx.set_field(this, 11, args[1]);
-            Ok(Some(Value::Object(None)))
-        },
-    );
+    r.register(lr, "setThrown", "(Ljava/lang/Throwable;)V", |ctx, args| {
+        let this = obj_arg(args, 0)?;
+        ctx.set_field(this, 11, args[1]);
+        Ok(Some(Value::Object(None)))
+    });
 
     // --- Handler (abstract base, 1-field: level=0) ---
     let handler = "java/util/logging/Handler";

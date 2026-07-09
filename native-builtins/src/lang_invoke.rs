@@ -10,7 +10,9 @@ use std::borrow::Cow;
 use std::sync::Arc;
 
 use cratonvm_native_api::{NativeContext, NativeMethodRegistry};
-use cratonvm_types::error::{MethodCallFailed, MethodCallResult, RuntimeError};
+use cratonvm_types::error::{
+    LinkageError, MethodCallFailed, MethodCallResult, RuntimeError, VmError,
+};
 use cratonvm_types::{ArrayElementType, ClassId, ObjectKind, ObjectRef, Value};
 
 use crate::lang_class::{box_value, mirror_class_id, mirror_class_name};
@@ -1825,7 +1827,11 @@ fn segment_vh_get(
             })?,
         };
         let raw = if be { seg_swap_bytes(raw, width) } else { raw };
-        Ok(Some(box_value(ctx, seg_decode_value(shape, raw), seg_shape_desc(shape))))
+        Ok(Some(box_value(
+            ctx,
+            seg_decode_value(shape, raw),
+            seg_shape_desc(shape),
+        )))
     })())
 }
 
@@ -4649,6 +4655,58 @@ fn desc_has_two_params(desc: &str) -> bool {
     count == 2
 }
 
+fn serialization_hook_neutral_result(
+    method_name: &str,
+    descriptor: &str,
+    args: &[Value],
+) -> Option<Option<Value>> {
+    match (method_name, descriptor) {
+        ("readObject", "(Ljava/io/ObjectInputStream;)V")
+        | ("readObjectNoData", "()V")
+        | ("writeObject", "(Ljava/io/ObjectOutputStream;)V") => Some(None),
+        ("readResolve", "()Ljava/lang/Object;") | ("writeReplace", "()Ljava/lang/Object;") => {
+            Some(Some(args.first().copied().unwrap_or(Value::Object(None))))
+        }
+        _ => None,
+    }
+}
+
+fn neutralize_missing_serialization_hook(
+    result: MethodCallResult,
+    args: &[Value],
+) -> MethodCallResult {
+    match result {
+        Err(MethodCallFailed::InternalError(VmError::Linkage(
+            LinkageError::NoSuchMethodError {
+                class_name,
+                method_name,
+                method_descriptor,
+            },
+        ))) => {
+            if let Some(result) =
+                serialization_hook_neutral_result(&method_name, &method_descriptor, args)
+            {
+                if std::env::var_os("CRATONVM_DBG_REFLECTION_FACTORY").is_some() {
+                    eprintln!(
+                        "[rf-ser] neutral MethodHandle missing hook {}.{}{}",
+                        class_name, method_name, method_descriptor
+                    );
+                }
+                Ok(result)
+            } else {
+                Err(MethodCallFailed::InternalError(VmError::Linkage(
+                    LinkageError::NoSuchMethodError {
+                        class_name,
+                        method_name,
+                        method_descriptor,
+                    },
+                )))
+            }
+        }
+        other => other,
+    }
+}
+
 const MH_KIND_STATIC: i32 = 0;
 const MH_KIND_VIRTUAL: i32 = 1;
 const MH_KIND_SPECIAL: i32 = 2;
@@ -5522,7 +5580,12 @@ pub(crate) fn mh_dispatch(
             let full = collect_trailing_varargs(ctx, &class, &name, &desc, &full);
             let adapted = adapt_invoke_args(ctx, &full, &desc);
             let result = ctx.invoke(&class, &name, &desc, &adapted);
-            box_direct_primitive_return(ctx, mh, result, &desc)
+            box_direct_primitive_return(
+                ctx,
+                mh,
+                neutralize_missing_serialization_hook(result, &adapted),
+                &desc,
+            )
         }
         MH_KIND_CONSTRUCTOR => {
             // Constructor: allocate new object then call <init>
@@ -5839,7 +5902,12 @@ pub(crate) fn mh_dispatch(
                 }
             }
             let result = ctx.invoke_special(&class_for_dispatch, &name, &desc, &full_args);
-            box_direct_primitive_return(ctx, mh, result, &desc)
+            box_direct_primitive_return(
+                ctx,
+                mh,
+                neutralize_missing_serialization_hook(result, &full_args),
+                &desc,
+            )
         }
         MH_KIND_RECORD_DESER => {
             // Record deserialization constructor. extra_args =
@@ -6047,12 +6115,20 @@ pub(crate) fn mh_dispatch(
                         .map(|(i, arg)| read_pinned_mh_arg(ctx, adapted_handles[i], *arg))
                         .collect();
                     let r = ctx.read_native_pin(recv_pin, r);
+                    let mut full_args = Vec::with_capacity(1 + adapted.len());
+                    full_args.push(Value::Object(Some(r)));
+                    full_args.extend_from_slice(&adapted);
                     let result = ctx.invoke_virtual_declared(&class, r, &name, &desc, &adapted);
                     if adapted_pin_base != usize::MAX {
                         ctx.unpin_native_roots(adapted_pin_base);
                     }
                     ctx.unpin_native_roots(recv_pin);
-                    box_direct_primitive_return(ctx, mh, result, &desc)
+                    box_direct_primitive_return(
+                        ctx,
+                        mh,
+                        neutralize_missing_serialization_hook(result, &full_args),
+                        &desc,
+                    )
                 }
                 _ => match extra_args.first() {
                     Some(Value::Object(Some(receiver))) => {
@@ -6068,13 +6144,21 @@ pub(crate) fn mh_dispatch(
                             .map(|(i, arg)| read_pinned_mh_arg(ctx, adapted_handles[i], *arg))
                             .collect();
                         let receiver = ctx.read_native_pin(recv_pin, receiver);
+                        let mut full_args = Vec::with_capacity(1 + adapted.len());
+                        full_args.push(Value::Object(Some(receiver)));
+                        full_args.extend_from_slice(&adapted);
                         let result =
                             ctx.invoke_virtual_declared(&class, receiver, &name, &desc, &adapted);
                         if adapted_pin_base != usize::MAX {
                             ctx.unpin_native_roots(adapted_pin_base);
                         }
                         ctx.unpin_native_roots(recv_pin);
-                        box_direct_primitive_return(ctx, mh, result, &desc)
+                        box_direct_primitive_return(
+                            ctx,
+                            mh,
+                            neutralize_missing_serialization_hook(result, &full_args),
+                            &desc,
+                        )
                     }
                     _ => Ok(Some(Value::Object(None))),
                 },
@@ -8378,6 +8462,26 @@ mod tests {
                 other
             ),
         }
+    }
+
+    #[test]
+    fn serialization_hook_neutral_result_matches_objectstream_hooks() {
+        assert_eq!(
+            serialization_hook_neutral_result("readObject", "(Ljava/io/ObjectInputStream;)V", &[]),
+            Some(None)
+        );
+        assert_eq!(
+            serialization_hook_neutral_result(
+                "readResolve",
+                "()Ljava/lang/Object;",
+                &[Value::Object(None)]
+            ),
+            Some(Some(Value::Object(None)))
+        );
+        assert_eq!(
+            serialization_hook_neutral_result("clone", "()Ljava/lang/Object;", &[]),
+            None
+        );
     }
 
     // Sanity check: build_method_type_from_descriptor turns a plain

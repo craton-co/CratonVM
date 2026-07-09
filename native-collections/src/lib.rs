@@ -6667,7 +6667,12 @@ fn register_hashset_natives(r: &mut NativeMethodRegistry) {
             native_hs_for_each,
         );
         r.register(c, "stream", "()Ljava/util/stream/Stream;", native_hs_stream);
-        r.register(c, "spliterator", "()Ljava/util/Spliterator;", native_hs_spliterator);
+        r.register(
+            c,
+            "spliterator",
+            "()Ljava/util/Spliterator;",
+            native_hs_spliterator,
+        );
         r.register(c, "addAll", "(Ljava/util/Collection;)Z", native_hs_add_all);
         r.register(
             c,
@@ -10520,7 +10525,10 @@ fn drain_spliterator_to_array_capped(
 /// materialised element array yet), drain the spliterator into slot 0 and clear
 /// the lazy slot. Idempotent; a no-op for ordinary streams. Called at the top of
 /// `stream_elements` so EVERY non-forEach op transparently materialises.
-fn materialize_lazy_stream(ctx: &mut dyn NativeContext, stream: ObjectRef) -> Result<(), MethodCallFailed> {
+fn materialize_lazy_stream(
+    ctx: &mut dyn NativeContext,
+    stream: ObjectRef,
+) -> Result<(), MethodCallFailed> {
     let spl = match stream_lazy_spliterator(ctx, stream) {
         Some(s) => s,
         None => return Ok(()),
@@ -10872,10 +10880,9 @@ fn stream_new_pull_state(chain_len: usize) -> StreamPullState {
 
 fn value_is_exact_class(ctx: &dyn NativeContext, v: Value, class_name: &str) -> bool {
     match v {
-        Value::Object(Some(o)) => ctx
-            .class_name_of_id(ctx.class_id_of_object(o))
-            .as_deref()
-            == Some(class_name),
+        Value::Object(Some(o)) => {
+            ctx.class_name_of_id(ctx.class_id_of_object(o)).as_deref() == Some(class_name)
+        }
         _ => false,
     }
 }
@@ -10884,7 +10891,11 @@ fn object_is_exact_class(ctx: &dyn NativeContext, o: ObjectRef, class_name: &str
     ctx.class_name_of_id(ctx.class_id_of_object(o)).as_deref() == Some(class_name)
 }
 
-fn is_placeholder_object_class_cast(ctx: &dyn NativeContext, input: Value, err: &MethodCallFailed) -> bool {
+fn is_placeholder_object_class_cast(
+    ctx: &dyn NativeContext,
+    input: Value,
+    err: &MethodCallFailed,
+) -> bool {
     value_is_exact_class(ctx, input, "java/lang/Object")
         && matches!(err, MethodCallFailed::ExceptionThrown(ex) if object_is_exact_class(ctx, *ex, "java/lang/ClassCastException"))
 }
@@ -12892,12 +12903,12 @@ fn native_stream_to_array_gen(ctx: &mut dyn NativeContext, args: &[Value]) -> Me
         }
     };
     let generator = args.get(1).copied().unwrap_or(Value::Object(None));
-    let elements = stream_elements(ctx, this)?;
-    let (elem_base, elem_handles) = pin_value_slice(ctx, &elements);
     let gen_pin = match generator {
         Value::Object(Some(g)) => Some(ctx.pin_native_root(g)),
         _ => None,
     };
+    let elements = stream_elements(ctx, this)?;
+    let (elem_base, elem_handles) = pin_value_slice(ctx, &elements);
     let len = elements.len();
     // Try to use the generator's apply(int) to allocate a typed array.
     let arr = match generator {
@@ -12935,11 +12946,12 @@ fn native_stream_to_array_gen(ctx: &mut dyn NativeContext, args: &[Value]) -> Me
         ctx.set_array_element(arr, i, val);
     }
     let arr = ctx.read_native_pin(arr_pin, arr);
-    ctx.unpin_native_roots(if elem_base == usize::MAX {
-        gen_pin.unwrap_or(arr_pin)
+    let root_base = gen_pin.unwrap_or(if elem_base == usize::MAX {
+        arr_pin
     } else {
         elem_base
     });
+    ctx.unpin_native_roots(root_base);
     Ok(Some(Value::Object(Some(arr))))
 }
 
@@ -13605,6 +13617,34 @@ fn register_collectors_natives(r: &mut NativeMethodRegistry) {
         "()Ljava/util/function/BinaryOperator;",
         native_collector_combiner,
     );
+    // Some real-JDK interface dispatch paths can arrive with a tagged
+    // synthetic Collector whose runtime class has collapsed to Object. Keep
+    // the standard Collector contract methods available under Object as a
+    // defensive bridge; the callbacks still validate the receiver layout/tag.
+    r.register(
+        "java/lang/Object",
+        "supplier",
+        "()Ljava/util/function/Supplier;",
+        native_collector_supplier,
+    );
+    r.register(
+        "java/lang/Object",
+        "accumulator",
+        "()Ljava/util/function/BiConsumer;",
+        native_collector_accumulator,
+    );
+    r.register(
+        "java/lang/Object",
+        "finisher",
+        "()Ljava/util/function/Function;",
+        native_collector_finisher,
+    );
+    r.register(
+        "java/lang/Object",
+        "combiner",
+        "()Ljava/util/function/BinaryOperator;",
+        native_collector_combiner,
+    );
     r.register(
         "java/util/function/Supplier",
         "get",
@@ -13632,12 +13672,36 @@ fn register_collectors_natives(r: &mut NativeMethodRegistry) {
     r.set_category(__prev_cat);
 }
 
+fn is_known_collector_tag(tag: i32) -> bool {
+    matches!(
+        tag,
+        COLLECTOR_TAG_TO_LIST
+            | COLLECTOR_TAG_TO_SET
+            | COLLECTOR_TAG_JOINING
+            | COLLECTOR_TAG_JOINING_DELIM
+            | COLLECTOR_TAG_TO_MAP
+            | COLLECTOR_TAG_COUNTING
+            | COLLECTOR_TAG_GROUPING_BY
+            | COLLECTOR_TAG_PARTITIONING_BY
+            | COLLECTOR_TAG_GROUPING_BY_DOWNSTREAM
+            | COLLECTOR_TAG_GROUPING_BY_SUPPLIER
+            | COLLECTOR_TAG_PARTITIONING_BY_DOWNSTREAM
+            | COLLECTOR_TAG_TO_MAP_MERGE
+            | COLLECTOR_TAG_COLLECTING_AND_THEN
+            | COLLECTOR_TAG_TO_COLLECTION
+            | COLLECTOR_TAG_MAPPING
+    )
+}
+
 /// True iff `v` is one of our synthetic tagged `java/util/stream/Collector`
 /// objects; if so, returns its tag.
 fn collector_tag_of(ctx: &mut dyn NativeContext, v: Value) -> Option<i32> {
     if let Value::Object(Some(c)) = v {
-        if ctx.class_name_of_id(ctx.class_id_of_object(c)).as_deref()
-            == Some("java/util/stream/Collector")
+        let is_named_collector = ctx.class_name_of_id(ctx.class_id_of_object(c)).as_deref()
+            == Some("java/util/stream/Collector");
+        let has_collector_layout = ctx.object_num_fields(c) >= COLLECTOR_NUM_FIELDS;
+        if (is_named_collector || has_collector_layout)
+            && matches!(ctx.get_field(c, COLLECTOR_FIELD_TAG), Value::Int(t) if is_known_collector_tag(t))
         {
             if let Value::Int(t) = ctx.get_field(c, COLLECTOR_FIELD_TAG) {
                 return Some(t);
@@ -13745,6 +13809,14 @@ fn make_collector(ctx: &mut dyn NativeContext, tag: i32) -> ObjectRef {
     let collector = alloc_synthetic(ctx, "java/util/stream/Collector", COLLECTOR_NUM_FIELDS);
     ctx.set_field(collector, COLLECTOR_FIELD_TAG, Value::Int(tag));
     collector
+}
+
+pub fn make_to_list_collector(ctx: &mut dyn NativeContext) -> ObjectRef {
+    make_collector(ctx, COLLECTOR_TAG_TO_LIST)
+}
+
+pub fn make_to_set_collector(ctx: &mut dyn NativeContext) -> ObjectRef {
+    make_collector(ctx, COLLECTOR_TAG_TO_SET)
 }
 
 fn native_collectors_to_list(ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
@@ -13925,10 +13997,15 @@ fn collect_via_collector_protocol(
     // receiver raises NoSuchMethodError and poisons discovery; the only safe
     // sequential fallback is the standard list accumulation shape used by
     // Collectors.toCollection(ArrayList::new) in ReflectionUtils.
-    if ctx.class_name_of_id(ctx.class_id_of_object(collector)).as_deref() == Some("java/lang/Object") {
+    if ctx
+        .class_name_of_id(ctx.class_id_of_object(collector))
+        .as_deref()
+        == Some("java/lang/Object")
+    {
         return make_list_of(ctx, elements);
     }
-    let supplier = match ctx.invoke_virtual(
+    let supplier = match ctx.invoke_virtual_declared(
+        "java/util/stream/Collector",
         collector,
         "supplier",
         "()Ljava/util/function/Supplier;",
@@ -13940,7 +14017,8 @@ fn collect_via_collector_protocol(
     let container = ctx
         .invoke_virtual(supplier, "get", "()Ljava/lang/Object;", &[])?
         .unwrap_or(Value::Object(None));
-    let accumulator = match ctx.invoke_virtual(
+    let accumulator = match ctx.invoke_virtual_declared(
+        "java/util/stream/Collector",
         collector,
         "accumulator",
         "()Ljava/util/function/BiConsumer;",
@@ -13957,7 +14035,8 @@ fn collect_via_collector_protocol(
             &[container, *elem],
         )?;
     }
-    let finisher = match ctx.invoke_virtual(
+    let finisher = match ctx.invoke_virtual_declared(
+        "java/util/stream/Collector",
         collector,
         "finisher",
         "()Ljava/util/function/Function;",
@@ -14035,12 +14114,14 @@ fn native_stream_collect(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
         _ => return Ok(Some(Value::Object(None))),
     };
     let elements = stream_elements_mut(ctx, this)?;
-    let tag = match ctx.get_field(collector, COLLECTOR_FIELD_TAG) {
-        Value::Int(t) => t,
-        // Not one of our `make_collector` tagged fast-path collectors —
+    let tag = match collector_tag_of(ctx, Value::Object(Some(collector))) {
+        Some(t) => t,
+        // Not one of our `make_collector` tagged fast-path collectors -
         // a real JDK/Guava `Collector`. Honour the standard contract
-        // instead of returning `null`.
-        _ => return collect_via_collector_protocol(ctx, collector, &elements),
+        // instead of returning `null`. The class-aware tag probe also avoids
+        // reading slot 0 from a receiver that dispatch has collapsed to a bare
+        // java/lang/Object; declared dispatch below recovers that exact shape.
+        None => return collect_via_collector_protocol(ctx, collector, &elements),
     };
 
     match tag {
@@ -18317,10 +18398,7 @@ fn register_string_joiner_natives_with_category(
 }
 
 fn register_string_joiner_natives(registry: &mut NativeMethodRegistry) {
-    register_string_joiner_natives_with_category(
-        registry,
-        cratonvm_native_api::NativeKind::Bridge,
-    );
+    register_string_joiner_natives_with_category(registry, cratonvm_native_api::NativeKind::Bridge);
 }
 
 /// Register the synthetic StringJoiner fallback surface without stealing real
@@ -33267,10 +33345,20 @@ fn register_linked_blocking_deque_stub_natives(r: &mut NativeMethodRegistry) {
     r.register(lbd, "offerLast", "(Ljava/lang/Object;)Z", native_clq_offer);
     r.register(lbd, "poll", "()Ljava/lang/Object;", native_clq_poll);
     r.register(lbd, "pollFirst", "()Ljava/lang/Object;", native_clq_poll);
-    r.register(lbd, "pollLast", "()Ljava/lang/Object;", native_cld_poll_last);
+    r.register(
+        lbd,
+        "pollLast",
+        "()Ljava/lang/Object;",
+        native_cld_poll_last,
+    );
     r.register(lbd, "peek", "()Ljava/lang/Object;", native_clq_peek);
     r.register(lbd, "peekFirst", "()Ljava/lang/Object;", native_clq_peek);
-    r.register(lbd, "peekLast", "()Ljava/lang/Object;", native_cld_peek_last);
+    r.register(
+        lbd,
+        "peekLast",
+        "()Ljava/lang/Object;",
+        native_cld_peek_last,
+    );
     r.register(lbd, "size", "()I", native_lbq_size);
     r.register(lbd, "isEmpty", "()Z", native_lbq_is_empty);
     r.register(
@@ -38056,6 +38144,28 @@ mod tests {
             )
             .is_some(),
             "Collector.combiner"
+        );
+
+        let object = "java/lang/Object";
+        assert!(
+            r.find(object, "supplier", "()Ljava/util/function/Supplier;")
+                .is_some(),
+            "Object.supplier fallback"
+        );
+        assert!(
+            r.find(object, "accumulator", "()Ljava/util/function/BiConsumer;")
+                .is_some(),
+            "Object.accumulator fallback"
+        );
+        assert!(
+            r.find(object, "finisher", "()Ljava/util/function/Function;")
+                .is_some(),
+            "Object.finisher fallback"
+        );
+        assert!(
+            r.find(object, "combiner", "()Ljava/util/function/BinaryOperator;")
+                .is_some(),
+            "Object.combiner fallback"
         );
 
         assert!(

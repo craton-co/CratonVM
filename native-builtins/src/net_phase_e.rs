@@ -187,11 +187,28 @@ pub(crate) struct SsSide {
     pub listener_id: i32,
 }
 
-// Socket and ServerSocket side-table state must survive object relocation.
-// Key these maps by identity hash rather than ObjectRef so a moving GC cannot
-// make an established socket look unconnected after its object address changes.
-fn sock_side_table() -> &'static Mutex<HashMap<i32, SockSide>> {
-    static T: OnceLock<Mutex<HashMap<i32, SockSide>>> = OnceLock::new();
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+struct NativeObjKey {
+    vm: usize,
+    identity: i32,
+}
+
+fn native_obj_key(ctx: &dyn NativeContext, obj: ObjectRef) -> NativeObjKey {
+    NativeObjKey {
+        vm: ctx.vm_identity(),
+        identity: ctx.identity_hash_code(obj),
+    }
+}
+
+// GC note (gc-followups-20260706): Socket state used to be keyed by the raw
+// ObjectRef address. A moving GC can relocate a connected Socket between
+// connect()/accept() and a later getInputStream()/getOutputStream(), making the
+// lookup miss and default to stream_id=-1 ("not connected"). Key Socket state
+// by VM identity + System.identityHashCode instead; both are stable across
+// relocation, and the payload contains only plain integers. ServerSocket /
+// DatagramSocket / InetAddress side tables still need the same treatment.
+fn sock_side_table() -> &'static Mutex<HashMap<NativeObjKey, SockSide>> {
+    static T: OnceLock<Mutex<HashMap<NativeObjKey, SockSide>>> = OnceLock::new();
     T.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
@@ -200,10 +217,8 @@ fn ss_side_table() -> &'static Mutex<HashMap<i32, SsSide>> {
     T.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
-fn sock_get(ctx: &dyn NativeContext, this: ObjectRef) -> SockSide {
-    let key = ctx.identity_hash_code(this);
-    let t = sock_side_table().lock();
-    t.get(&key).copied().unwrap_or(SockSide {
+fn sock_default() -> SockSide {
+    SockSide {
         host_id: 0,
         port: 0,
         local_port: 0,
@@ -211,21 +226,21 @@ fn sock_get(ctx: &dyn NativeContext, this: ObjectRef) -> SockSide {
         stream_id: -1,
         input_shutdown: 0,
         output_shutdown: 0,
-    })
+    }
+}
+
+fn sock_get(ctx: &dyn NativeContext, this: ObjectRef) -> SockSide {
+    let t = sock_side_table().lock();
+    t.get(&native_obj_key(ctx, this))
+        .copied()
+        .unwrap_or_else(sock_default)
 }
 
 fn sock_set<F: FnOnce(&mut SockSide)>(ctx: &dyn NativeContext, this: ObjectRef, f: F) {
-    let key = ctx.identity_hash_code(this);
     let mut t = sock_side_table().lock();
-    let entry = t.entry(key).or_insert(SockSide {
-        host_id: 0,
-        port: 0,
-        local_port: 0,
-        closed: 0,
-        stream_id: -1,
-        input_shutdown: 0,
-        output_shutdown: 0,
-    });
+    let entry = t
+        .entry(native_obj_key(ctx, this))
+        .or_insert_with(sock_default);
     f(entry);
 }
 
@@ -1042,6 +1057,21 @@ fn java_byte_array_to_vec(
     Ok(out)
 }
 
+fn socket_dbg_bytes(data: &[u8]) -> String {
+    let preview_len = data.len().min(32);
+    let mut preview = String::new();
+    for (idx, byte) in data.iter().take(preview_len).enumerate() {
+        if idx != 0 {
+            preview.push(' ');
+        }
+        preview.push_str(&format!("{byte:02x}"));
+    }
+    if data.len() > preview_len {
+        preview.push_str(" ...");
+    }
+    preview
+}
+
 fn copy_bytes_into_java_array(
     ctx: &dyn NativeContext,
     arr: ObjectRef,
@@ -1687,10 +1717,7 @@ fn uri_split(
                     .chars()
                     .all(|c| c.is_ascii_alphanumeric() || matches!(c, '+' | '-' | '.')) =>
         {
-            (
-                Some(without_frag[..i].to_string()),
-                &without_frag[i + 1..],
-            )
+            (Some(without_frag[..i].to_string()), &without_frag[i + 1..])
         }
         _ => (None, without_frag),
     };
@@ -2644,6 +2671,12 @@ fn re1_socket_read_stream(
     let n = read_result.map_err(|e| ioex(format!("Socket read failed: {e}")))?;
     if dbg {
         eprintln!("[dbg-sock] read: sid={stream_id} got={n}");
+        if std::env::var_os("CRATONVM_DBG_SOCK_BYTES").is_some() && n != 0 {
+            eprintln!(
+                "[dbg-sock-bytes] read: sid={stream_id} data={}",
+                socket_dbg_bytes(&tmp[..n])
+            );
+        }
     }
     if n == 0 {
         return Ok(Some(Value::Int(-1)));
@@ -2691,6 +2724,12 @@ fn re1_socket_write_stream(
             "[dbg-sock] write: sid={stream_id} sent={} bytes",
             data.len()
         );
+        if std::env::var_os("CRATONVM_DBG_SOCK_BYTES").is_some() {
+            eprintln!(
+                "[dbg-sock-bytes] write: sid={stream_id} data={}",
+                socket_dbg_bytes(&data)
+            );
+        }
     }
     Ok(None)
 }
@@ -2751,15 +2790,18 @@ fn re1_connect_socket(
     .map_err(|e| ioex(format!("ConnectException: {host}:{port}: {e}")))?;
     let local_port = stream.local_addr().map(|a| a.port() as i32).unwrap_or(0);
     let stream_id = s2_alloc_stream(stream);
+    let pin_base = ctx.pin_native_root(this);
     let host_str = ctx.create_string(host);
-    ctx.set_field(this, SOCK_HOST, Value::Object(Some(host_str)));
-    sock_set(ctx, this, |s| {
+    let this_now = ctx.read_native_pin(pin_base, this);
+    ctx.set_field(this_now, SOCK_HOST, Value::Object(Some(host_str)));
+    sock_set(ctx, this_now, |s| {
         s.port = port;
         s.local_port = local_port;
         s.closed = 0;
         s.stream_id = stream_id;
     });
-    let _ = re1_init_socket_locks(ctx, this);
+    let _ = re1_init_socket_locks(ctx, this_now);
+    ctx.unpin_native_roots(pin_base);
     Ok(None)
 }
 
@@ -3145,8 +3187,11 @@ fn register_re1_socket(r: &mut NativeMethodRegistry) {
         let owner =
             stream_owner_get(ctx, this).ok_or_else(|| ioex("SocketInputStream has no owner"))?;
         let one = ctx.new_array(ArrayElementType::Byte, 1);
-        let r = re1_socket_read_stream(ctx, owner, one, 0, 1)?;
-        match r {
+        let pin = ctx.pin_native_root(one);
+        let r = re1_socket_read_stream(ctx, owner, one, 0, 1);
+        let one = ctx.read_native_pin(pin, one);
+        ctx.unpin_native_roots(pin);
+        match r? {
             Some(Value::Int(-1)) => Ok(Some(Value::Int(-1))),
             Some(Value::Int(_)) => {
                 let b = ctx.get_array_element(one, 0).as_int().unwrap_or(0);
@@ -5489,17 +5534,22 @@ fn register_re4_url_http(r: &mut NativeMethodRegistry) {
     r.register("java/net/URLConnection", "connect", "()V", |_ctx, _args| {
         Ok(None)
     });
-    r.register("java/net/URLConnection", "getContentLength", "()I", |ctx, args| {
-        let this = obj_arg(args, 0)?;
-        let url = huc_url_string(ctx, this);
-        let len = synthetic_resource_url_content_len(ctx, &url);
-        let v = if len < 0 || len > i32::MAX as i64 {
-            -1
-        } else {
-            len as i32
-        };
-        Ok(Some(Value::Int(v)))
-    });
+    r.register(
+        "java/net/URLConnection",
+        "getContentLength",
+        "()I",
+        |ctx, args| {
+            let this = obj_arg(args, 0)?;
+            let url = huc_url_string(ctx, this);
+            let len = synthetic_resource_url_content_len(ctx, &url);
+            let v = if len < 0 || len > i32::MAX as i64 {
+                -1
+            } else {
+                len as i32
+            };
+            Ok(Some(Value::Int(v)))
+        },
+    );
     r.register(
         "java/net/URLConnection",
         "getContentLengthLong",
@@ -5507,7 +5557,9 @@ fn register_re4_url_http(r: &mut NativeMethodRegistry) {
         |ctx, args| {
             let this = obj_arg(args, 0)?;
             let url = huc_url_string(ctx, this);
-            Ok(Some(Value::Long(synthetic_resource_url_content_len(ctx, &url))))
+            Ok(Some(Value::Long(synthetic_resource_url_content_len(
+                ctx, &url,
+            ))))
         },
     );
     // URLConnection.getInputStream — defer to URL.openStream by reading
@@ -8184,7 +8236,9 @@ fn register_re6_ssl_context(r: &mut NativeMethodRegistry) {
             let rid = connect_result.map_err(|e| ioex(format!("TLS connect: {e}")))?;
             let id = crate::servlet::RUSTLS_SOCK_ID_BASE + rid;
             let sock = alloc_concurrent_synthetic(ctx, "javax/net/ssl/SSLSocket", 5);
+            let pin_base = ctx.pin_native_root(sock);
             let host_s = ctx.create_string(&host);
+            let sock = ctx.read_native_pin(pin_base, sock);
             ctx.set_field(sock, SOCK_HOST, Value::Object(Some(host_s)));
             sock_set(ctx, sock, |s| {
                 s.port = port;
@@ -8192,6 +8246,8 @@ fn register_re6_ssl_context(r: &mut NativeMethodRegistry) {
                 s.closed = 0;
                 s.stream_id = id;
             });
+            let sock = ctx.read_native_pin(pin_base, sock);
+            ctx.unpin_native_roots(pin_base);
             if std::env::var_os("CRATONVM_DBG_TLS_SOCK").is_some() {
                 eprintln!(
                     "[dbg-tls-sock] thread={:?} net_phase_e createSocket(String,int) built sock={:?} stream_id={}",
@@ -10344,6 +10400,28 @@ mod tests {
         assert!(s.contains("Host: h"));
         assert!(s.contains("Content-Length: 5"));
         assert!(s.ends_with("hello"));
+    }
+
+    #[test]
+    fn re1_socket_side_table_is_identity_keyed() {
+        let mut ctx = MockNativeContext::new();
+        let sock = match ctx.new_object("java/net/Socket").unwrap() {
+            Some(Value::Object(Some(o))) => o,
+            other => panic!("expected socket object, got {other:?}"),
+        };
+
+        sock_set(&ctx, sock, |s| {
+            s.port = 9999;
+            s.stream_id = 123;
+        });
+
+        let side = sock_get(&ctx, sock);
+        assert_eq!(side.port, 9999);
+        assert_eq!(side.stream_id, 123);
+        assert_eq!(
+            native_obj_key(&ctx, sock).identity,
+            ctx.identity_hash_code(sock)
+        );
     }
 
     #[test]

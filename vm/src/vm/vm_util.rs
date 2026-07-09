@@ -2530,7 +2530,9 @@ fn post_clinit_fixup(shared: &SharedVm, class_id: ClassId, class_name: &str) {
             };
             let ordinal_idx = find_instance_field_index("ordinal").unwrap_or(0);
             let name_idx = find_instance_field_index("name");
-            let alloc_fields = num_fields.max(ordinal_idx + 1).max(name_idx.map_or(0, |i| i + 1));
+            let alloc_fields = num_fields
+                .max(ordinal_idx + 1)
+                .max(name_idx.map_or(0, |i| i + 1));
 
             let mut filled = 0usize;
             for (ord, &name) in NAMES.iter().enumerate() {
@@ -2540,7 +2542,9 @@ fn post_clinit_fixup(shared: &SharedVm, class_id: ClassId, class_name: &str) {
                 let Some(obj) = shared.heap.try_alloc_object(class_id, alloc_fields) else {
                     continue;
                 };
-                shared.heap.set_field(obj, ordinal_idx, Value::Int(ord as i32));
+                shared
+                    .heap
+                    .set_field(obj, ordinal_idx, Value::Int(ord as i32));
                 if let Some(name_idx) = name_idx {
                     let nm = super::vm_object::create_java_string(shared, name);
                     shared
@@ -2565,10 +2569,11 @@ fn post_clinit_fixup(shared: &SharedVm, class_id: ClassId, class_name: &str) {
                 {
                     for (i, &name) in NAMES.iter().enumerate() {
                         if let Some(Value::Object(Some(o))) = read_static_named(name) {
-                            let _ =
-                                shared
-                                    .heap
-                                    .set_array_element(values_arr, i, Value::Object(Some(o)));
+                            let _ = shared.heap.set_array_element(
+                                values_arr,
+                                i,
+                                Value::Object(Some(o)),
+                            );
                         }
                     }
                     if !set_static_by_name("$VALUES", Value::Object(Some(values_arr))) {

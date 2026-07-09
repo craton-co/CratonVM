@@ -12181,7 +12181,8 @@ fn execute_instruction(
                 }
             } else {
                 ensure_class_initialized_shared(shared, thread, field.declaring_class_id)?;
-                let mut value = get_static_shared(shared, field.declaring_class_id, field.field_index);
+                let mut value =
+                    get_static_shared(shared, field.declaring_class_id, field.field_index);
                 if matches!(value, Value::Object(None)) {
                     let boolean_const = {
                         let cm = shared.class_manager.read();
@@ -12208,7 +12209,12 @@ fn execute_instruction(
                         let obj = gc_alloc_object(shared, thread, field.declaring_class_id, 1)?;
                         shared.heap.set_field(obj, 0, Value::Int(i32::from(b)));
                         value = Value::Object(Some(obj));
-                        set_static_shared(shared, field.declaring_class_id, field.field_index, value);
+                        set_static_shared(
+                            shared,
+                            field.declaring_class_id,
+                            field.field_index,
+                            value,
+                        );
                     }
                 }
                 if field.is_volatile {
@@ -12628,9 +12634,7 @@ fn execute_instruction(
                     // Same jobject-as-Long contract as `astore` / `coerce_value_for_return`
                     // in vm_exec: invoke returns can sit on the stack as compact long bits.
                     match desc_byte {
-                        Some(d @ (b'L' | b'[')) => {
-                            coerce_value_for_return_validated(shared, v, d)
-                        }
+                        Some(d @ (b'L' | b'[')) => coerce_value_for_return_validated(shared, v, d),
                         // JVMS putfield: narrow the popped int to the field's
                         // declared sub-int width (byte/boolean/char/short) before
                         // storing, so a wide int producer can't leave out-of-range
@@ -20618,6 +20622,60 @@ pub(crate) fn is_liquibase_checksum_native_override(
     )
 }
 
+pub(crate) fn is_reflection_factory_serialization_native_override(
+    class_name: &str,
+    method_name: &str,
+    descriptor: &str,
+) -> bool {
+    matches!(
+        class_name,
+        "sun/reflect/ReflectionFactory" | "jdk/internal/reflect/ReflectionFactory"
+    ) && matches!(
+        (method_name, descriptor),
+        ("getReflectionFactory", "()Lsun/reflect/ReflectionFactory;")
+            | (
+                "getReflectionFactory",
+                "()Ljdk/internal/reflect/ReflectionFactory;"
+            )
+            | (
+                "newConstructorForSerialization",
+                "(Ljava/lang/Class;)Ljava/lang/reflect/Constructor;"
+            )
+            | (
+                "newConstructorForSerialization",
+                "(Ljava/lang/Class;Ljava/lang/reflect/Constructor;)Ljava/lang/reflect/Constructor;"
+            )
+            | (
+                "newConstructorForExternalization",
+                "(Ljava/lang/Class;)Ljava/lang/reflect/Constructor;"
+            )
+            | (
+                "readObjectForSerialization",
+                "(Ljava/lang/Class;)Ljava/lang/invoke/MethodHandle;"
+            )
+            | (
+                "readObjectNoDataForSerialization",
+                "(Ljava/lang/Class;)Ljava/lang/invoke/MethodHandle;"
+            )
+            | (
+                "writeObjectForSerialization",
+                "(Ljava/lang/Class;)Ljava/lang/invoke/MethodHandle;"
+            )
+            | (
+                "readResolveForSerialization",
+                "(Ljava/lang/Class;)Ljava/lang/invoke/MethodHandle;"
+            )
+            | (
+                "writeReplaceForSerialization",
+                "(Ljava/lang/Class;)Ljava/lang/invoke/MethodHandle;"
+            )
+            | (
+                "hasStaticInitializerForSerialization",
+                "(Ljava/lang/Class;)Z"
+            )
+    )
+}
+
 fn force_native_over_real_jdk_bytecode(
     class_name: &str,
     method_name: &str,
@@ -21278,6 +21336,18 @@ fn force_native_over_real_jdk_bytecode(
         return true;
     }
     if is_liquibase_checksum_native_override(class_name, method_name, method_descriptor) {
+        return true;
+    }
+    // JBoss Marshalling calls real-JDK `sun.reflect.ReflectionFactory`
+    // bytecode to discover serialization hooks. On CratonVM the registered
+    // natives encode ObjectStreamClass's private/inheritable hook rules and
+    // must win over the bytecode body, or MethodHandle.invoke later tries to
+    // dispatch `java/lang/Object.readObject(ObjectInputStream)`.
+    if is_reflection_factory_serialization_native_override(
+        class_name,
+        method_name,
+        method_descriptor,
+    ) {
         return true;
     }
     // Surefire fork bootstrap/teardown: bypass ServiceLoader decoder discovery
@@ -31980,6 +32050,43 @@ mod tests {
             "org/h2/table/Column",
             "getName",
             "()Ljava/lang/String;"
+        ));
+    }
+
+    #[test]
+    fn reflection_factory_force_native_covers_serialization_surface() {
+        for class_name in [
+            "sun/reflect/ReflectionFactory",
+            "jdk/internal/reflect/ReflectionFactory",
+        ] {
+            for (name, descriptor) in [
+                ("newConstructorForSerialization", "(Ljava/lang/Class;)Ljava/lang/reflect/Constructor;"),
+                (
+                    "newConstructorForSerialization",
+                    "(Ljava/lang/Class;Ljava/lang/reflect/Constructor;)Ljava/lang/reflect/Constructor;",
+                ),
+                ("newConstructorForExternalization", "(Ljava/lang/Class;)Ljava/lang/reflect/Constructor;"),
+                ("readObjectForSerialization", "(Ljava/lang/Class;)Ljava/lang/invoke/MethodHandle;"),
+                (
+                    "readObjectNoDataForSerialization",
+                    "(Ljava/lang/Class;)Ljava/lang/invoke/MethodHandle;",
+                ),
+                ("writeObjectForSerialization", "(Ljava/lang/Class;)Ljava/lang/invoke/MethodHandle;"),
+                ("readResolveForSerialization", "(Ljava/lang/Class;)Ljava/lang/invoke/MethodHandle;"),
+                ("writeReplaceForSerialization", "(Ljava/lang/Class;)Ljava/lang/invoke/MethodHandle;"),
+                ("hasStaticInitializerForSerialization", "(Ljava/lang/Class;)Z"),
+            ] {
+                assert!(
+                    is_reflection_factory_serialization_native_override(class_name, name, descriptor),
+                    "{class_name}.{name}{descriptor} must route to the registered native"
+                );
+                assert!(force_native_over_real_jdk_bytecode(class_name, name, descriptor));
+            }
+        }
+        assert!(!is_reflection_factory_serialization_native_override(
+            "java/io/ObjectStreamClass",
+            "getReflector",
+            "(Ljava/lang/Class;)Ljava/lang/Object;"
         ));
     }
 

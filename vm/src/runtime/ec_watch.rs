@@ -103,7 +103,7 @@ pub fn record(holder: ObjectRef, field_idx: usize, expected: usize, class_id: u3
 /// `+8`.
 #[inline]
 fn slot_addr(holder: ObjectRef, idx: u32) -> usize {
-    use cratonvm_gc::heap::{SLOT_SIZE};
+    use cratonvm_gc::heap::SLOT_SIZE;
     use cratonvm_gc::{class_layout, is_compact_object};
     use cratonvm_types::ObjectHeader;
 

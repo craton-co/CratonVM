@@ -3395,7 +3395,7 @@ fn native_filteros_close(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
     // close the wrapped stream so its close()/finish() runs.
     let _ = ctx.invoke_virtual(this, "flush", "()V", &[]);
     if let Value::Object(Some(out)) = ctx.get_field(this, 0) {
-        let _ = ctx.invoke_virtual(out, "close", "()V", &[]);
+        let _ = ctx.invoke_virtual_declared("java/io/OutputStream", out, "close", "()V", &[]);
     }
     Ok(None)
 }
@@ -8584,7 +8584,7 @@ fn native_dos_flush(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRe
         _ => return Ok(None),
     };
     if let Value::Object(Some(inner)) = ctx.get_field(this, DOS_FIELD_OUT) {
-        ctx.invoke_virtual(inner, "flush", "()V", &[])?;
+        ctx.invoke_virtual_declared("java/io/OutputStream", inner, "flush", "()V", &[])?;
     }
     Ok(None)
 }
@@ -8597,8 +8597,8 @@ fn native_dos_close(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRe
         _ => return Ok(None),
     };
     if let Value::Object(Some(inner)) = ctx.get_field(this, DOS_FIELD_OUT) {
-        let _ = ctx.invoke_virtual(inner, "flush", "()V", &[]);
-        ctx.invoke_virtual(inner, "close", "()V", &[])?;
+        let _ = ctx.invoke_virtual_declared("java/io/OutputStream", inner, "flush", "()V", &[]);
+        ctx.invoke_virtual_declared("java/io/OutputStream", inner, "close", "()V", &[])?;
     }
     Ok(None)
 }
@@ -11368,7 +11368,7 @@ fn native_bos_close(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRe
     //    `try (out) {}` block in BufferedOutputStream.close).
     let (out_slot, _, _) = bos_slots(ctx);
     if let Value::Object(Some(inner)) = ctx.get_field(this, out_slot) {
-        ctx.invoke_virtual(inner, "close", "()V", &[])?;
+        ctx.invoke_virtual_declared("java/io/OutputStream", inner, "close", "()V", &[])?;
     }
     Ok(None)
 }
@@ -16291,6 +16291,31 @@ mod io_tests {
         assert!(r.find(dos, "<init>", "(Ljava/io/OutputStream;)V").is_some());
         assert!(r.find(dos, "writeInt", "(I)V").is_some());
         assert!(r.find(dos, "writeLong", "(J)V").is_some());
+    }
+
+    #[test]
+    fn data_output_stream_close_uses_declared_outputstream_for_inner_close() {
+        let mut ctx = MockNativeContext::new();
+        let dos = ctx.alloc_object(1);
+        let inner = ctx.alloc_object_with_class(0, "java/lang/Object");
+        ctx.set_field(dos, DOS_FIELD_OUT, Value::Object(Some(inner)));
+
+        native_dos_close(&mut ctx, &[Value::Object(Some(dos))]).unwrap();
+
+        let calls = ctx.recorded_calls();
+        assert_eq!(calls.len(), 2);
+        assert_eq!(
+            calls[0].declared_class.as_deref(),
+            Some("java/io/OutputStream")
+        );
+        assert_eq!(calls[0].method_name, "flush");
+        assert_eq!(calls[0].descriptor, "()V");
+        assert_eq!(
+            calls[1].declared_class.as_deref(),
+            Some("java/io/OutputStream")
+        );
+        assert_eq!(calls[1].method_name, "close");
+        assert_eq!(calls[1].descriptor, "()V");
     }
 
     // BufferedReader / BufferedWriter overrides are synthetic-jdk only;

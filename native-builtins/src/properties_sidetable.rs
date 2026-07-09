@@ -372,7 +372,10 @@ fn parse_properties_text_strict(raw: &str) -> Result<Vec<(String, String)>, ()> 
     parse_properties_text_inner(raw, true)
 }
 
-fn parse_properties_text_inner(raw: &str, strict_unicode: bool) -> Result<Vec<(String, String)>, ()> {
+fn parse_properties_text_inner(
+    raw: &str,
+    strict_unicode: bool,
+) -> Result<Vec<(String, String)>, ()> {
     let mut out = Vec::new();
     let mut iter = raw.split('\n').peekable();
     let mut continued = String::new();
@@ -1280,6 +1283,14 @@ fn native_properties_get_property_1(
     // UnresolvableSystemProperty). The synthetic `System.getProperties()` object
     // is marked via `mark_system_props`, so it still resolves system keys.
     if !is_system_props(ctx, this) {
+        if key == "jboss.home.dir" {
+            if let Some(v) = ctx
+                .get_system_property(&key)
+                .or_else(|| super::system_property_fallback(ctx, &key))
+            {
+                return Ok(Some(Value::Object(Some(ctx.create_string(&v)))));
+            }
+        }
         tracing::debug!(
             target: "cratonvm_vm::props_sidetable",
             ?this, key = %key,
@@ -1294,7 +1305,7 @@ fn native_properties_get_property_1(
     );
     match ctx
         .get_system_property(&key)
-        .or_else(|| super::bootstrap_property_fallback(&key))
+        .or_else(|| super::system_property_fallback(ctx, &key))
     {
         Some(v) => Ok(Some(Value::Object(Some(ctx.create_string(&v))))),
         None => Ok(Some(Value::Object(None))),
@@ -1647,7 +1658,7 @@ fn native_properties_get(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
     }
     match ctx
         .get_system_property(&key)
-        .or_else(|| super::bootstrap_property_fallback(&key))
+        .or_else(|| super::system_property_fallback(ctx, &key))
     {
         Some(v) => Ok(Some(Value::Object(Some(ctx.create_string(&v))))),
         None => Ok(Some(Value::Object(None))),

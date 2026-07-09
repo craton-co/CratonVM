@@ -3890,8 +3890,7 @@ pub(crate) fn register_phase56_collectors_extras(r: &mut NativeMethodRegistry) {
         "toUnmodifiableList",
         "()Ljava/util/stream/Collector;",
         |ctx, _args| {
-            let c = alloc_concurrent_synthetic(ctx, "java/util/stream/Collector", 4);
-            ctx.set_field(c, 0, Value::Int(P56_COLLECTOR_TO_UNMODIFIABLE_LIST));
+            let c = cratonvm_native_collections::make_to_list_collector(ctx);
             Ok(Some(Value::Object(Some(c))))
         },
     );
@@ -3902,8 +3901,7 @@ pub(crate) fn register_phase56_collectors_extras(r: &mut NativeMethodRegistry) {
         "toUnmodifiableSet",
         "()Ljava/util/stream/Collector;",
         |ctx, _args| {
-            let c = alloc_concurrent_synthetic(ctx, "java/util/stream/Collector", 4);
-            ctx.set_field(c, 0, Value::Int(P56_COLLECTOR_TO_UNMODIFIABLE_SET));
+            let c = cratonvm_native_collections::make_to_set_collector(ctx);
             Ok(Some(Value::Object(Some(c))))
         },
     );
@@ -12364,7 +12362,8 @@ fn jarfs_rewrite_entry(jar: &str, entry: &str, data: Option<&[u8]>) -> std::io::
         }
         if !std::path::Path::new(jar).exists() {
             let f = std::fs::File::create(jar)?;
-            zip::ZipWriter::new(f).finish()
+            zip::ZipWriter::new(f)
+                .finish()
                 .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))?;
         }
         return Ok(());
@@ -12403,27 +12402,32 @@ fn jarfs_rewrite_entry(jar: &str, entry: &str, data: Option<&[u8]>) -> std::io::
     let tmp = format!("{jar}.cratonvm-tmp-{}", std::process::id());
     let file = std::fs::File::create(&tmp)?;
     let mut writer = zip::ZipWriter::new(file);
-    let opts = zip::write::SimpleFileOptions::default()
-        .compression_method(zip::CompressionMethod::Stored);
+    let opts =
+        zip::write::SimpleFileOptions::default().compression_method(zip::CompressionMethod::Stored);
     for (name, bytes) in existing {
         if let Some(bytes) = bytes {
-            writer.start_file(name, opts)
+            writer
+                .start_file(name, opts)
                 .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))?;
             writer.write_all(&bytes)?;
         } else {
-            writer.add_directory(name, opts)
+            writer
+                .add_directory(name, opts)
                 .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))?;
         }
     }
     if let Some(bytes) = data {
-        writer.start_file(target, opts)
+        writer
+            .start_file(target, opts)
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))?;
         writer.write_all(bytes)?;
     } else {
-        writer.add_directory(target, opts)
+        writer
+            .add_directory(target, opts)
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))?;
     }
-    writer.finish()
+    writer
+        .finish()
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))?;
     std::fs::rename(tmp, jar)?;
     Ok(())
@@ -17220,7 +17224,7 @@ pub(crate) fn register_p58_completable_future(r: &mut NativeMethodRegistry) {
         "(Ljava/lang/Runnable;)V",
         |ctx, args| {
             let this = obj_arg(args, 0)?;
-            let runnable = match args.get(1) {
+            let mut runnable = match args.get(1) {
                 Some(Value::Object(Some(r))) => *r,
                 _ => return Ok(None),
             };
@@ -17230,7 +17234,13 @@ pub(crate) fn register_p58_completable_future(r: &mut NativeMethodRegistry) {
                 _ => 0,
             };
             if delay_ms > 0 {
+                let mut blocked_refs = [Value::Object(Some(runnable))];
+                ctx.begin_blocking_region();
                 std::thread::sleep(std::time::Duration::from_millis(delay_ms));
+                ctx.end_blocking_region_refs(&mut blocked_refs);
+                if let Value::Object(Some(cur)) = blocked_refs[0] {
+                    runnable = cur;
+                }
             }
             let _ = ctx.invoke_virtual(runnable, "run", "()V", &[]);
             Ok(None)
@@ -29271,22 +29281,27 @@ pub(crate) fn register_p62_char_buffer(r: &mut NativeMethodRegistry) {
         ];
         cb_to_string_range(ctx, &args2)
     });
-    r.register("java/nio/StringCharBuffer", "toString", "()Ljava/lang/String;", |ctx, args| {
-        let this = match args.first() {
-            Some(Value::Object(Some(o))) => *o,
-            _ => return Ok(Some(Value::Object(None))),
-        };
-        let pos = match ctx.get_field_by_name(this, "position") {
-            Value::Int(v) => v,
-            _ => 0,
-        };
-        let lim = match ctx.get_field_by_name(this, "limit") {
-            Value::Int(v) => v,
-            _ => pos,
-        };
-        let args2 = [Value::Object(Some(this)), Value::Int(pos), Value::Int(lim)];
-        cb_to_string_range(ctx, &args2)
-    });
+    r.register(
+        "java/nio/StringCharBuffer",
+        "toString",
+        "()Ljava/lang/String;",
+        |ctx, args| {
+            let this = match args.first() {
+                Some(Value::Object(Some(o))) => *o,
+                _ => return Ok(Some(Value::Object(None))),
+            };
+            let pos = match ctx.get_field_by_name(this, "position") {
+                Value::Int(v) => v,
+                _ => 0,
+            };
+            let lim = match ctx.get_field_by_name(this, "limit") {
+                Value::Int(v) => v,
+                _ => pos,
+            };
+            let args2 = [Value::Object(Some(this)), Value::Int(pos), Value::Int(lim)];
+            cb_to_string_range(ctx, &args2)
+        },
+    );
     // subSequence(II)Ljava/nio/CharBuffer; — abstract on CharBuffer, so
     // an unbacked synthetic instance would AbstractMethodError. Allocate
     // a fresh CharBuffer with the same backing array and adjusted
@@ -30835,7 +30850,7 @@ pub(crate) fn register_p62_stamped_lock(r: &mut NativeMethodRegistry) {
         "tryReadLock",
         "(JLjava/util/concurrent/TimeUnit;)J",
         |ctx, args| {
-            let this = obj_arg(args, 0)?;
+            let mut this = obj_arg(args, 0)?;
             let wl = ctx.get_field(this, 1).as_int().unwrap_or(0);
             if wl != 0 {
                 // Try waiting briefly
@@ -30845,7 +30860,13 @@ pub(crate) fn register_p62_stamped_lock(r: &mut NativeMethodRegistry) {
                 };
                 if delay > 0 {
                     let ms = delay.min(100); // cap at 100ms
+                    let mut blocked_refs = [Value::Object(Some(this))];
+                    ctx.begin_blocking_region();
                     std::thread::sleep(std::time::Duration::from_millis(ms as u64));
+                    ctx.end_blocking_region_refs(&mut blocked_refs);
+                    if let Value::Object(Some(cur)) = blocked_refs[0] {
+                        this = cur;
+                    }
                 }
                 let wl2 = ctx.get_field(this, 1).as_int().unwrap_or(0);
                 if wl2 != 0 {
@@ -30867,7 +30888,7 @@ pub(crate) fn register_p62_stamped_lock(r: &mut NativeMethodRegistry) {
         "tryWriteLock",
         "(JLjava/util/concurrent/TimeUnit;)J",
         |ctx, args| {
-            let this = obj_arg(args, 0)?;
+            let mut this = obj_arg(args, 0)?;
             let state = match ctx.get_field(this, 0) {
                 Value::Long(v) => v,
                 _ => 0,
@@ -30879,7 +30900,13 @@ pub(crate) fn register_p62_stamped_lock(r: &mut NativeMethodRegistry) {
                 };
                 if delay > 0 {
                     let ms = delay.min(100);
+                    let mut blocked_refs = [Value::Object(Some(this))];
+                    ctx.begin_blocking_region();
                     std::thread::sleep(std::time::Duration::from_millis(ms as u64));
+                    ctx.end_blocking_region_refs(&mut blocked_refs);
+                    if let Value::Object(Some(cur)) = blocked_refs[0] {
+                        this = cur;
+                    }
                 }
                 let state2 = match ctx.get_field(this, 0) {
                     Value::Long(v) => v,
@@ -31985,7 +32012,7 @@ pub(crate) fn register_p63_scheduled_executor(r: &mut NativeMethodRegistry) {
     }
 
     r.register(stpe, "schedule", "(Ljava/lang/Runnable;JLjava/util/concurrent/TimeUnit;)Ljava/util/concurrent/ScheduledFuture;", |ctx, args| {
-        let runnable = match args.get(1) {
+        let mut runnable = match args.get(1) {
             Some(Value::Object(Some(r))) => *r,
             _ => return Ok(Some(Value::Object(None))),
         };
@@ -32006,7 +32033,7 @@ pub(crate) fn register_p63_scheduled_executor(r: &mut NativeMethodRegistry) {
     });
     // scheduleAtFixedRate — periodic firing driven by the pump.
     r.register(stpe, "scheduleAtFixedRate", "(Ljava/lang/Runnable;JJLjava/util/concurrent/TimeUnit;)Ljava/util/concurrent/ScheduledFuture;", |ctx, args| {
-        let runnable = match args.get(1) {
+        let mut runnable = match args.get(1) {
             Some(Value::Object(Some(r))) => *r,
             _ => return Ok(Some(Value::Object(None))),
         };
@@ -32154,7 +32181,7 @@ pub(crate) fn register_p63_scheduled_executor(r: &mut NativeMethodRegistry) {
     // ScheduledExecutorService interface
     let ses = "java/util/concurrent/ScheduledExecutorService";
     r.register(ses, "schedule", "(Ljava/lang/Runnable;JLjava/util/concurrent/TimeUnit;)Ljava/util/concurrent/ScheduledFuture;", |ctx, args| {
-        let runnable = match args.get(1) {
+        let mut runnable = match args.get(1) {
             Some(Value::Object(Some(r))) => *r,
             _ => return Ok(Some(Value::Object(None))),
         };
@@ -32167,7 +32194,13 @@ pub(crate) fn register_p63_scheduled_executor(r: &mut NativeMethodRegistry) {
         };
         let delay_ms = scheduled_convert_to_millis(ctx, delay, args.get(3));
         if delay_ms > 0 {
+            let mut blocked_refs = [Value::Object(Some(runnable))];
+            ctx.begin_blocking_region();
             std::thread::sleep(std::time::Duration::from_millis(delay_ms as u64));
+            ctx.end_blocking_region_refs(&mut blocked_refs);
+            if let Value::Object(Some(cur)) = blocked_refs[0] {
+                runnable = cur;
+            }
         }
         let _ = ctx.invoke_virtual(runnable, "run", "()V", &[]);
         let cf = p58_new_cf(ctx, Value::Object(None), true);
@@ -35471,6 +35504,7 @@ fn watch_service_poll(
     ws: cratonvm_types::ObjectRef,
     timeout_ms: Option<u64>,
 ) -> MethodCallResult {
+    let mut ws = ws;
     let dir_path = match ctx.get_field(ws, 0) {
         Value::Object(Some(s)) => ctx.read_string(s).unwrap_or_default(),
         _ => return Ok(Some(Value::Object(None))),
@@ -35504,7 +35538,13 @@ fn watch_service_poll(
     // If timeout specified and no change, sleep briefly and retry once
     if !changed && timeout_ms.is_some() {
         let wait = timeout_ms.unwrap().min(100);
+        let mut blocked_refs = [Value::Object(Some(ws))];
+        ctx.begin_blocking_region();
         std::thread::sleep(std::time::Duration::from_millis(wait));
+        ctx.end_blocking_region_refs(&mut blocked_refs);
+        if let Value::Object(Some(cur)) = blocked_refs[0] {
+            ws = cur;
+        }
         // Don't loop — return null after single poll attempt
     }
 
@@ -40862,7 +40902,9 @@ fn new13_do_create_socket(
     }
 
     let sock = alloc_concurrent_synthetic(ctx, "javax/net/ssl/SSLSocket", NEW13_SSL_SOCK_FIELDS);
+    let pin_base = ctx.pin_native_root(sock);
     let host_obj = ctx.create_string(host);
+    let sock = ctx.read_native_pin(pin_base, sock);
     ctx.set_field(sock, NEW13_SOCK_HOST, Value::Object(Some(host_obj)));
     ctx.set_field(sock, NEW13_SOCK_PORT, Value::Int(port as i32));
     // FIX (netty-client-socket-write-after-close): do NOT rely on the raw
@@ -40883,7 +40925,10 @@ fn new13_do_create_socket(
     ctx.set_field(sock, NEW13_SOCK_TLSID, Value::Int(tls_id));
     ctx.set_field(sock, NEW13_SOCK_CLOSED, Value::Int(0));
     let session = new13_alloc_ssl_session(ctx, tls_id);
+    let sock = ctx.read_native_pin(pin_base, sock);
     ctx.set_field(sock, NEW13_SOCK_SESSION, Value::Object(Some(session)));
+    let sock = ctx.read_native_pin(pin_base, sock);
+    ctx.unpin_native_roots(pin_base);
     if std::env::var_os("CRATONVM_DBG_TLS_SOCK").is_some() {
         eprintln!(
             "[dbg-tls-sock] thread={:?} new13_do_create_socket built sock={:?} tls_id={}",
@@ -47563,9 +47608,12 @@ pub(crate) fn register_p69_cleaner(r: &mut NativeMethodRegistry) {
             Ok(Some(Value::Object(Some(cleanable))))
         },
     );
-    r.register("java/lang/ref/Cleaner$Cleanable", "clean", "()V", |_ctx, _args| {
-        Ok(None)
-    });
+    r.register(
+        "java/lang/ref/Cleaner$Cleanable",
+        "clean",
+        "()V",
+        |_ctx, _args| Ok(None),
+    );
     r.set_category(__prev_cat);
 }
 

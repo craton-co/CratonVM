@@ -205,6 +205,23 @@ impl GcBarrier {
         true
     }
 
+    /// Run `f` only if no STW request is active, serialized with
+    /// `request_stw_counted`'s expected-count snapshot.
+    ///
+    /// Startup threads use this to become STW-countable only when a
+    /// concurrent request cannot have just excluded them from `expected`.
+    pub fn run_if_no_stw_requested<F>(&self, f: F) -> bool
+    where
+        F: FnOnce(),
+    {
+        let _inner = self.inner.lock();
+        if self.stw_requested.load(Ordering::Acquire) {
+            return false;
+        }
+        f();
+        true
+    }
+
     /// T19.H1 — mark the calling thread as entering a blocking native
     /// operation (about to park in `wait`/`park`/`sleep`/`select`/…) and
     /// return a [`BlockedGuard`] that clears the mark on drop.

@@ -7339,7 +7339,11 @@ pub(crate) fn read_constructor_descriptor(
     }
     let class_id = ctx.class_id_of_object(ctor_obj);
     let base = constructor_extra_base(ctx, class_id);
-    match ctx.get_field(ctor_obj, base + CONSTRUCTOR_EXTRA_OFFSET_DESC) {
+    let idx = base.saturating_add(CONSTRUCTOR_EXTRA_OFFSET_DESC);
+    if ctx.object_num_fields(ctor_obj) <= idx {
+        return None;
+    }
+    match ctx.get_field(ctor_obj, idx) {
         Value::Object(Some(s)) => ctx.read_string(s),
         _ => None,
     }
@@ -7454,7 +7458,11 @@ fn read_constructor_param_count(
     }
     let class_id = ctx.class_id_of_object(ctor_obj);
     let base = constructor_extra_base(ctx, class_id);
-    match ctx.get_field(ctor_obj, base + CONSTRUCTOR_EXTRA_OFFSET_PARAM_COUNT) {
+    let idx = base.saturating_add(CONSTRUCTOR_EXTRA_OFFSET_PARAM_COUNT);
+    if ctx.object_num_fields(ctor_obj) <= idx {
+        return 0;
+    }
+    match ctx.get_field(ctor_obj, idx) {
         Value::Int(v) => v,
         _ => 0,
     }
@@ -7486,7 +7494,11 @@ fn read_constructor_accessible(
     }
     let class_id = ctx.class_id_of_object(ctor_obj);
     let base = constructor_extra_base(ctx, class_id);
-    match ctx.get_field(ctor_obj, base + CONSTRUCTOR_EXTRA_OFFSET_ACCESSIBLE) {
+    let idx = base.saturating_add(CONSTRUCTOR_EXTRA_OFFSET_ACCESSIBLE);
+    if ctx.object_num_fields(ctor_obj) <= idx {
+        return false;
+    }
+    match ctx.get_field(ctor_obj, idx) {
         Value::Int(v) => v != 0,
         _ => false,
     }
@@ -7508,11 +7520,10 @@ pub(crate) fn write_constructor_accessible(
     }
     let class_id = ctx.class_id_of_object(ctor_obj);
     let base = constructor_extra_base(ctx, class_id);
-    ctx.set_field(
-        ctor_obj,
-        base + CONSTRUCTOR_EXTRA_OFFSET_ACCESSIBLE,
-        Value::Int(if value { 1 } else { 0 }),
-    );
+    let idx = base.saturating_add(CONSTRUCTOR_EXTRA_OFFSET_ACCESSIBLE);
+    if ctx.object_num_fields(ctor_obj) > idx {
+        ctx.set_field(ctor_obj, idx, Value::Int(if value { 1 } else { 0 }));
+    }
 }
 
 /// Public wrapper used by `lang_reflect::native_constructor_try_set_accessible`.

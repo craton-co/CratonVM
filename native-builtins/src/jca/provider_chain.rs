@@ -677,6 +677,10 @@ fn provider_service_init(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
     let svc_type = args.get(2).copied().unwrap_or(Value::Object(None));
     let algorithm = args.get(3).copied().unwrap_or(Value::Object(None));
     let class_name = args.get(4).copied().unwrap_or(Value::Object(None));
+    let class_name_text = match class_name {
+        Value::Object(Some(s)) => ctx.read_string(s).unwrap_or_default(),
+        _ => String::new(),
+    };
     let mut aliases = args.get(5).copied().unwrap_or(Value::Object(None));
     let mut attributes = args.get(6).copied().unwrap_or(Value::Object(None));
 
@@ -705,6 +709,9 @@ fn provider_service_init(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
     if nfields > 2 {
         ctx.set_field(this, 2, provider);
     }
+    if nfields > 3 {
+        ctx.set_field(this, 3, class_name);
+    }
 
     // OpenJDK Provider.Service turns null aliases/attributes into immutable
     // empty collections. Real provider constructors pass null for the common
@@ -728,6 +735,10 @@ fn provider_service_init(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
     }
     let this_now = ctx.read_native_pin(this_pin, this);
     ctx.set_field_by_name(this_now, "attributes", attributes);
+    if !class_name_text.is_empty() {
+        let ih = ctx.identity_hash_code(this_now) as i64;
+        service_classname_table().lock().insert(ih, class_name_text);
+    }
     ctx.unpin_native_roots(this_pin);
 
     Ok(None)
@@ -1489,21 +1500,27 @@ fn provider_put_service_native(ctx: &mut dyn NativeContext, args: &[Value]) -> M
         Some(Value::Object(Some(s))) => *s,
         _ => return Ok(None),
     };
-    let read_str_field = |ctx: &mut dyn NativeContext, field: &str| -> String {
-        match ctx.get_field_by_name(service, field) {
-            Value::Object(Some(s)) => ctx.read_string(s).unwrap_or_default(),
-            _ => String::new(),
-        }
-    };
-    let type_str = read_str_field(ctx, "type");
-    let algorithm = read_str_field(ctx, "algorithm");
-    let class_name = read_str_field(ctx, "className");
+    let type_str = provider_service_string_field(ctx, service, "type", 0).unwrap_or_default();
+    let algorithm = provider_service_string_field(ctx, service, "algorithm", 1).unwrap_or_default();
+    let class_name = provider_service_string_field(ctx, service, "className", 3)
+        .or_else(|| {
+            let ih = ctx.identity_hash_code(service) as i64;
+            service_classname_table().lock().get(&ih).cloned()
+        })
+        .unwrap_or_default();
     if type_str.is_empty() || algorithm.is_empty() {
         // Malformed/partial Service — nothing sensible to register.
         return Ok(None);
     }
     let provider_name = provider_name_of(ctx, this);
     put_service(&provider_name, &type_str, &algorithm, &class_name);
+
+    if !class_name.is_empty() {
+        let ih = ctx.identity_hash_code(service) as i64;
+        service_classname_table()
+            .lock()
+            .insert(ih, class_name.clone());
+    }
 
     // Mirror the legacy `put` path's raw-property bookkeeping so
     // `getProperty`/`containsKey` on the equivalent legacy key also see
@@ -1738,6 +1755,54 @@ fn provider_get_services_native(ctx: &mut dyn NativeContext, args: &[Value]) -> 
     Ok(Some(Value::Object(Some(set))))
 }
 
+fn provider_service_string_field(
+    ctx: &mut dyn NativeContext,
+    service: ObjectRef,
+    field: &str,
+    slot: usize,
+) -> Option<String> {
+    fn non_empty_string(ctx: &mut dyn NativeContext, value: Value) -> Option<String> {
+        match value {
+            Value::Object(Some(s)) => ctx.read_string(s).filter(|s| !s.is_empty()),
+            _ => None,
+        }
+    }
+
+    let by_name = ctx.get_field_by_name(service, field);
+    if let Some(s) = non_empty_string(ctx, by_name) {
+        return Some(s);
+    }
+    let by_slot = ctx.get_field(service, slot);
+    non_empty_string(ctx, by_slot)
+}
+
+fn provider_service_provider_obj(
+    ctx: &mut dyn NativeContext,
+    service: ObjectRef,
+) -> Option<ObjectRef> {
+    match ctx.get_field_by_name(service, "provider") {
+        Value::Object(Some(p)) => Some(p),
+        _ => match ctx.get_field(service, 2) {
+            Value::Object(Some(p)) => Some(p),
+            _ => None,
+        },
+    }
+}
+
+fn provider_service_class_name_from_registry(
+    ctx: &mut dyn NativeContext,
+    service: ObjectRef,
+) -> Option<String> {
+    let provider = provider_service_provider_obj(ctx, service)?;
+    let provider_name = provider_name_of(ctx, provider);
+    if provider_name.is_empty() {
+        return None;
+    }
+    let type_str = provider_service_string_field(ctx, service, "type", 0)?;
+    let algorithm = provider_service_string_field(ctx, service, "algorithm", 1)?;
+    get_service_entry(&provider_name, &type_str, &algorithm).map(|entry| entry.class_name)
+}
+
 /// `Provider$Service.getClassName()` native — returns the entry's
 /// implementation class name.  Required by the BC fallback path and by
 /// `Cipher.getInstance(algo, providerName)` to render diagnostics when
@@ -1747,12 +1812,13 @@ fn provider_service_get_class_name(
     args: &[Value],
 ) -> MethodCallResult {
     let this = obj_arg(args, 0)?;
-    // Real-JDK path first.
-    let by_name = ctx.get_field_by_name(this, "className");
-    if matches!(&by_name, Value::Object(Some(_))) {
-        return Ok(Some(by_name));
+    if let Some(class_name) = provider_service_string_field(ctx, this, "className", 3)
+        .or_else(|| provider_service_class_name_from_registry(ctx, this))
+    {
+        let s = ctx.create_string(&class_name);
+        return Ok(Some(Value::Object(Some(s))));
     }
-    Ok(Some(ctx.get_field(this, 3)))
+    Ok(Some(Value::Object(None)))
 }
 
 // ---------------------------------------------------------------------------
@@ -2147,19 +2213,10 @@ fn provider_service_new_instance(ctx: &mut dyn NativeContext, args: &[Value]) ->
         // preserved across relocation — see `service_classname_table`).
         let ih = ctx.identity_hash_code(this) as i64;
         let from_id = service_classname_table().lock().get(&ih).cloned();
-        // Fallbacks: real `className` field, then the slot-3 mirror.
-        let fallback = || {
-            let by_name = ctx.get_field_by_name(this, "className");
-            let raw = match by_name {
-                Value::Object(Some(s)) => Some(s),
-                _ => match ctx.get_field(this, 3) {
-                    Value::Object(Some(s)) => Some(s),
-                    _ => None,
-                },
-            };
-            raw.and_then(|s| ctx.read_string(s))
-        };
-        let resolved = from_id.filter(|s| !s.is_empty()).or_else(fallback);
+        let resolved = from_id
+            .filter(|s| !s.is_empty())
+            .or_else(|| provider_service_string_field(ctx, this, "className", 3))
+            .or_else(|| provider_service_class_name_from_registry(ctx, this));
         match resolved {
             Some(s) if !s.is_empty() => s,
             _ => {
@@ -2740,6 +2797,18 @@ mod tests {
             matches!(ctx.get_field(this, 2), Value::Object(Some(o)) if o == provider),
             "slot 2 must hold the `provider` argument (synthetic getProvider())"
         );
+        assert!(
+            matches!(ctx.get_field(this, 3), Value::Object(Some(o)) if o == class_name),
+            "slot 3 must hold the `className` argument (synthetic getClassName())"
+        );
+        let ih = ctx.identity_hash_code(this) as i64;
+        assert_eq!(
+            service_classname_table()
+                .lock()
+                .get(&ih)
+                .map(String::as_str),
+            Some("org.bouncycastle.jcajce.provider.digest.SHA256$Digest")
+        );
     }
 
     #[test]
@@ -3013,6 +3082,90 @@ mod tests {
         assert!(res.is_ok());
         // Null = NoSuchAlgorithmException at the JDK call site.
         assert!(matches!(res.unwrap(), Some(Value::Object(None))));
+    }
+
+    #[test]
+    fn provider_service_new_instance_recovers_class_name_from_registry() {
+        let _lock = reset_service_state_for_tests();
+        apply_legacy_put(
+            "WildFlyElytron",
+            "SaslServerFactory.JBOSS-LOCAL-USER",
+            "com.example.NoSuchSaslServerFactory",
+        );
+
+        let mut ctx = MockNativeContext::new();
+        let provider = ctx.alloc_object(cratonvm_types::ClassId::new(0), 8);
+        let provider_name = ctx.create_string("WildFlyElytron");
+        ctx.set_field(provider, 0, Value::Object(Some(provider_name)));
+        ctx.set_field(provider, 1, Value::Double(1.0));
+
+        let service = alloc_service(&mut ctx);
+        let svc_type = ctx.create_string("SaslServerFactory");
+        let algorithm = ctx.create_string("JBOSS-LOCAL-USER");
+        ctx.set_field(service, 0, Value::Object(Some(svc_type)));
+        ctx.set_field(service, 1, Value::Object(Some(algorithm)));
+        ctx.set_field(service, 2, Value::Object(Some(provider)));
+        ctx.set_field(service, 3, Value::Object(None));
+
+        let recovered = provider_service_get_class_name(&mut ctx, &[Value::Object(Some(service))])
+            .expect("getClassName should not throw");
+        let recovered = match recovered {
+            Some(Value::Object(Some(s))) => ctx.read_string(s).unwrap_or_default(),
+            other => panic!("expected recovered className string, got {other:?}"),
+        };
+        assert_eq!(recovered, "com.example.NoSuchSaslServerFactory");
+
+        let instantiated = provider_service_new_instance(
+            &mut ctx,
+            &[Value::Object(Some(service)), Value::Object(None)],
+        )
+        .expect("registry-recovered className should reach instantiation in the mock VM");
+        assert!(
+            matches!(instantiated, Some(Value::Object(Some(_)))),
+            "expected mock VM allocation after registry fallback, got {instantiated:?}"
+        );
+    }
+
+    #[test]
+    fn provider_put_service_native_uses_slot_fallback_and_remembers_class_name() {
+        let _lock = reset_service_state_for_tests();
+        let mut ctx = MockNativeContext::new();
+        let provider = ctx.alloc_object(cratonvm_types::ClassId::new(0), 8);
+        let provider_name = ctx.create_string("WildFlyElytron");
+        ctx.set_field(provider, 0, Value::Object(Some(provider_name)));
+        ctx.set_field(provider, 1, Value::Double(1.0));
+
+        let service = alloc_service(&mut ctx);
+        let svc_type = ctx.create_string("SaslServerFactory");
+        let algorithm = ctx.create_string("JBOSS-LOCAL-USER");
+        let class_name =
+            ctx.create_string("org.wildfly.security.sasl.localuser.LocalUserServerFactory");
+        ctx.set_field(service, 0, Value::Object(Some(svc_type)));
+        ctx.set_field(service, 1, Value::Object(Some(algorithm)));
+        ctx.set_field(service, 2, Value::Object(Some(provider)));
+        ctx.set_field(service, 3, Value::Object(Some(class_name)));
+
+        provider_put_service_native(
+            &mut ctx,
+            &[Value::Object(Some(provider)), Value::Object(Some(service))],
+        )
+        .expect("putService native should not throw");
+
+        let entry = get_service_entry("WildFlyElytron", "SaslServerFactory", "JBOSS-LOCAL-USER")
+            .expect("putService should populate the provider service registry");
+        assert_eq!(
+            entry.class_name,
+            "org.wildfly.security.sasl.localuser.LocalUserServerFactory"
+        );
+        let ih = ctx.identity_hash_code(service) as i64;
+        assert_eq!(
+            service_classname_table()
+                .lock()
+                .get(&ih)
+                .cloned()
+                .as_deref(),
+            Some("org.wildfly.security.sasl.localuser.LocalUserServerFactory")
+        );
     }
 
     #[test]
