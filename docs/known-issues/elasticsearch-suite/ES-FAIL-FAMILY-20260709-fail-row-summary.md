@@ -58,3 +58,19 @@ Interpretation:
 - The two largest old FAIL families were already fixed on `dev`, but current-dev probes reveal deeper residual bugs behind them.
 - The remaining old FAIL rows are dominated by vector codec/runtime behavior, not randomizedtesting or LuceneTestCase harness failures.
 - Several current JIT runs turn the same classes into rc=139 crashes before Java can report the underlying assertion. Use the `--nojit` rows for the cleanest Java-level bug signatures.
+
+## Current-dev 120s full non-passed rerun
+
+- Run: `es-nonpassed-currentdev-20260709-082115`
+- Selected rows: 2649
+- PASS: 7
+- FAIL: 2
+- CRASH: 2640
+- HANG: 0
+- The source non-passed list had one class that was not recorded in the old completed result TSVs: `server org.elasticsearch.index.fieldstats.FieldStatsProviderRefreshTests`.
+
+The two FAIL rows were:
+- `server org.elasticsearch.index.codec.vectors.es93.ES93FlatVectorFormatTests` -> `CorruptIndexException: codec footer mismatch`.
+- `server org.elasticsearch.search.vectors.DiversifyingChildrenIVFKnnFloatVectorQueryTests` -> `java.lang.AssertionError`.
+
+The old 10 HANG classes were rerun separately with a 1500s timeout in `es-hung10-currentdev-20260709-082115`; all 10 became rc=139 CRASH rows and none hung.

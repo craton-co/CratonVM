@@ -48,3 +48,11 @@ Current interpretation:
 - The zero-score family still reproduces on current `dev` without JIT, so it remains a runtime/vector-codec bug.
 - Current JIT often exits 139 before reaching the Java assertion; treat that as a separate crash surface, not as evidence this family is fixed.
 - Closely related vector residuals now have their own docs: footer/checksum corruption, null vector values, and `updateDocument` linkage failures.
+
+## Current-dev 120s full non-passed rerun
+
+- Run: `es-nonpassed-currentdev-20260709-082115`
+- `DiversifyingChildrenIVFKnnFloatVectorQueryTests` remains one of only two Java-level FAIL rows after the current-dev rerun.
+- Result: FAIL, rc=1, 6.411s.
+- Note: `java.lang.AssertionError`.
+- Other vector-score representatives mostly crash rc=139 before Java-level assertion reporting, so this row keeps the vector assertion family open but no longer gives the broader old 17-row FAIL spread on current `dev`.

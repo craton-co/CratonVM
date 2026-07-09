@@ -35,3 +35,19 @@ Interpretation:
 Next investigation:
 - Implement or bridge `java/lang/foreign/MemoryLayout.varHandle([MemoryLayout$PathElement])VarHandle` consistently with the real JDK 25 foreign-memory API.
 - Add a narrow FFM regression before relying on the Elasticsearch suite, because many ES classes initialize `NativeAccess` and can mask the same missing method behind unrelated test names.
+
+## Full current-dev non-passed rerun at 120s
+
+- Run: `es-nonpassed-currentdev-20260709-082115`
+- Binary: `/data/data/cratonvm-targets/es-rerun-currentdev-20260709-082115/release/cratonvm-es-rerun-currentdev-20260709-082115`
+- Selected rows: 2649
+- Result: 2640 CRASH, 2 FAIL, 7 PASS, 0 HANG.
+- All crash rows exited rc=139.
+- 2583 crash result notes directly contain the `MemoryLayout.varHandle` AbstractMethodError.
+- 2585 crash logs contain the `MemoryLayout.varHandle` marker.
+- This confirms that the FFM `MemoryLayout.varHandle(PathElement...)` gap is the dominant current Elasticsearch suite blocker on `dev`.
+
+Old-HANG rerun at 1500s:
+- Run: `es-hung10-currentdev-20260709-082115`
+- Result: 10 CRASH, 0 HANG.
+- Four rows carried direct `MemoryLayout.varHandle` notes; the rest crashed before Java-level note capture.

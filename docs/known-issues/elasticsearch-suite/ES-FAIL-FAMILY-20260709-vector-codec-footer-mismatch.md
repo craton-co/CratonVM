@@ -35,3 +35,11 @@ Interpretation:
 Next investigation:
 - Start from a minimal Lucene `Directory` write/read probe that writes footer-bearing vector codec files and compares raw bytes before Lucene validation.
 - Capture whether the zero footer is already present on disk, appears through CratonVM's NIO read path, or is introduced by a buffer/view conversion.
+
+## Current-dev 120s full non-passed rerun
+
+- Run: `es-nonpassed-currentdev-20260709-082115`
+- `ES93FlatVectorFormatTests` remains one of only two Java-level FAIL rows after the current-dev rerun.
+- Result: FAIL, rc=1, 4.807s.
+- Note: `CorruptIndexException: codec footer mismatch (file truncated?): actual footer=0 vs expected footer=-1071082520`.
+- Most neighboring vector classes now crash rc=139 before reaching this Java-level assertion, so this row is still the clearest current proof for the footer/checksum family.
