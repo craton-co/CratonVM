@@ -1715,10 +1715,7 @@ mod tests {
             Some(object_id),
             vec![],
             vec![],
-            vec![make_method(
-                "build",
-                "()Lcom/example/config/WidgetConfig;",
-            )],
+            vec![make_method("build", "()Lcom/example/config/WidgetConfig;")],
             0,
             0,
         ));
@@ -1739,9 +1736,8 @@ mod tests {
 
         // Resolving isClustered() on the class that actually declares it
         // (WidgetConfig) must succeed and must be attributed to WidgetConfig.
-        let (method, declaring) =
-            find_method_recursive(config_id, "isClustered", "()Z", &store)
-                .expect("isClustered() must resolve on WidgetConfig, the declaring class");
+        let (method, declaring) = find_method_recursive(config_id, "isClustered", "()Z", &store)
+            .expect("isClustered() must resolve on WidgetConfig, the declaring class");
         assert_eq!(&*method.name, "isClustered");
         assert_eq!(declaring, config_id);
 

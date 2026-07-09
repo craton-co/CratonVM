@@ -4982,7 +4982,9 @@ pub(crate) fn native_string_region_matches_ic(
     let s_units: Vec<u16> = s.encode_utf16().collect();
     let o_units: Vec<u16> = other.encode_utf16().collect();
 
-    if toffset.checked_add(len).map_or(true, |end| end > s_units.len())
+    if toffset
+        .checked_add(len)
+        .map_or(true, |end| end > s_units.len())
         || ooffset
             .checked_add(len)
             .map_or(true, |end| end > o_units.len())
@@ -5059,7 +5061,9 @@ pub(crate) fn native_string_region_matches(
     let s_units: Vec<u16> = s.encode_utf16().collect();
     let o_units: Vec<u16> = other.encode_utf16().collect();
 
-    if toffset.checked_add(len).map_or(true, |end| end > s_units.len())
+    if toffset
+        .checked_add(len)
+        .map_or(true, |end| end > s_units.len())
         || ooffset
             .checked_add(len)
             .map_or(true, |end| end > o_units.len())

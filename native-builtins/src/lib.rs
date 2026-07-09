@@ -44896,6 +44896,74 @@ fn native_module_builder_new_version(
     Ok(Some(Value::Object(Some(obj))))
 }
 
+fn module_descriptor_version_text(ctx: &dyn NativeContext, obj: ObjectRef) -> String {
+    match ctx.get_field_by_name(obj, "version") {
+        Value::Object(Some(s)) => ctx.read_string(s).unwrap_or_default(),
+        _ => String::new(),
+    }
+}
+
+fn native_module_descriptor_version_to_string(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    let this = obj_arg(args, 0)?;
+    match ctx.get_field_by_name(this, "version") {
+        Value::Object(Some(s)) => Ok(Some(Value::Object(Some(s)))),
+        _ => Ok(Some(Value::Object(Some(ctx.create_string(""))))),
+    }
+}
+
+fn native_module_descriptor_version_equals(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    let this = obj_arg(args, 0)?;
+    let Some(Value::Object(Some(other))) = args.get(1) else {
+        return Ok(Some(Value::Int(0)));
+    };
+    if this == *other {
+        return Ok(Some(Value::Int(1)));
+    }
+    let a = module_descriptor_version_text(ctx, this);
+    let b = module_descriptor_version_text(ctx, *other);
+    Ok(Some(Value::Int(if !a.is_empty() && a == b {
+        1
+    } else {
+        0
+    })))
+}
+
+fn native_module_descriptor_version_hash_code(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    let this = obj_arg(args, 0)?;
+    let mut hash = 0_i32;
+    for ch in module_descriptor_version_text(ctx, this).encode_utf16() {
+        hash = hash.wrapping_mul(31).wrapping_add(ch as i32);
+    }
+    Ok(Some(Value::Int(hash)))
+}
+
+fn native_module_descriptor_version_compare_to(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    let this = obj_arg(args, 0)?;
+    let Some(Value::Object(Some(other))) = args.get(1) else {
+        return Ok(Some(Value::Int(1)));
+    };
+    let a = module_descriptor_version_text(ctx, this);
+    let b = module_descriptor_version_text(ctx, *other);
+    let ord = match a.cmp(&b) {
+        std::cmp::Ordering::Less => -1,
+        std::cmp::Ordering::Equal => 0,
+        std::cmp::Ordering::Greater => 1,
+    };
+    Ok(Some(Value::Int(ord)))
+}
+
 fn native_module_builder_build(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     // Instance method: build(int hashCode) -> ModuleDescriptor
     // args[0] = this (Builder), args[1] = hashCode int
@@ -45087,6 +45155,30 @@ fn register_module_builder_overrides(registry: &mut NativeMethodRegistry) {
             Ok(Some(Value::Int(ha.cmp(&hb) as i32)))
         });
     }
+    registry.register(
+        "java/lang/module/ModuleDescriptor$Version",
+        "toString",
+        "()Ljava/lang/String;",
+        native_module_descriptor_version_to_string,
+    );
+    registry.register(
+        "java/lang/module/ModuleDescriptor$Version",
+        "equals",
+        "(Ljava/lang/Object;)Z",
+        native_module_descriptor_version_equals,
+    );
+    registry.register(
+        "java/lang/module/ModuleDescriptor$Version",
+        "hashCode",
+        "()I",
+        native_module_descriptor_version_hash_code,
+    );
+    registry.register(
+        "java/lang/module/ModuleDescriptor$Version",
+        "compareTo",
+        "(Ljava/lang/Object;)I",
+        native_module_descriptor_version_compare_to,
+    );
 
     // -----------------------------------------------------------------
     // ModuleFinder.ofSystem() — lazy system-module finder

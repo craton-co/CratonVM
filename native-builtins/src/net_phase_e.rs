@@ -1345,9 +1345,7 @@ pub(crate) fn uri_equals(ctx: &dyn NativeContext, a: ObjectRef, b: ObjectRef) ->
                     // case-insensitive (RFC 3986 §3.2.2 — host is
                     // case-insensitive; this is the fix for the WHATWG
                     // IPv6-casing case above).
-                    a_user == b_user
-                        && opt_str_eq_ignore_case(&a_host, &b_host)
-                        && a_port == b_port
+                    a_user == b_user && opt_str_eq_ignore_case(&a_host, &b_host) && a_port == b_port
                 }
                 // Registry-based (or unparsable) authority: compare the raw
                 // authority string exactly, matching JDK's fallback branch.
@@ -2009,13 +2007,9 @@ fn register_uri_natives(r: &mut NativeMethodRegistry) {
         let mut raw_path = parsed;
         if let Value::Object(Some(s)) = ctx.get_field_by_name(this, "path") {
             if let Some(v) = ctx.read_string(s) {
-                let relative_without_authority = !raw.starts_with('/')
-                    && !raw.starts_with("//")
-                    && raw.find(':').is_none();
-                if !v.is_empty()
-                    && v != raw
-                    && !(relative_without_authority && v != raw_path)
-                {
+                let relative_without_authority =
+                    !raw.starts_with('/') && !raw.starts_with("//") && raw.find(':').is_none();
+                if !v.is_empty() && v != raw && !(relative_without_authority && v != raw_path) {
                     raw_path = v;
                 }
             }
@@ -2037,13 +2031,9 @@ fn register_uri_natives(r: &mut NativeMethodRegistry) {
         let mut raw_path = parsed;
         if let Value::Object(Some(s)) = ctx.get_field_by_name(this, "path") {
             if let Some(v) = ctx.read_string(s) {
-                let relative_without_authority = !raw.starts_with('/')
-                    && !raw.starts_with("//")
-                    && raw.find(':').is_none();
-                if !v.is_empty()
-                    && v != raw
-                    && !(relative_without_authority && v != raw_path)
-                {
+                let relative_without_authority =
+                    !raw.starts_with('/') && !raw.starts_with("//") && raw.find(':').is_none();
+                if !v.is_empty() && v != raw && !(relative_without_authority && v != raw_path) {
                     raw_path = v;
                 }
             }
@@ -2424,7 +2414,11 @@ fn register_uri_natives(r: &mut NativeMethodRegistry) {
             Some(Value::Object(Some(o))) => *o,
             _ => return Ok(Some(Value::Int(0))),
         };
-        Ok(Some(Value::Int(if uri_equals(ctx, this, other) { 1 } else { 0 })))
+        Ok(Some(Value::Int(if uri_equals(ctx, this, other) {
+            1
+        } else {
+            0
+        })))
     });
 
     // hashCode() — must agree with `equals` (see `uri_hash_code`): hashing the
@@ -4109,9 +4103,23 @@ fn http_perform_request(
             _ => headers,
         };
         let resp = if https {
-            http_exchange_tls(&host, port, &path, &current_method, eff_headers, &current_body)?
+            http_exchange_tls(
+                &host,
+                port,
+                &path,
+                &current_method,
+                eff_headers,
+                &current_body,
+            )?
         } else {
-            http_exchange_plain(&host, port, &path, &current_method, eff_headers, &current_body)?
+            http_exchange_plain(
+                &host,
+                port,
+                &path,
+                &current_method,
+                eff_headers,
+                &current_body,
+            )?
         };
         match resp.status {
             301 | 302 | 303 | 307 | 308 => {
@@ -6669,10 +6677,7 @@ fn re5_replay_subscription_request(
 /// `Flow.Subscription.cancel()` for the one-shot replay subscription: mark
 /// cancelled and drop the parked references. Idempotent; a cancel after
 /// delivery is a no-op (the fields are already cleared).
-fn re5_replay_subscription_cancel(
-    ctx: &mut dyn NativeContext,
-    args: &[Value],
-) -> MethodCallResult {
+fn re5_replay_subscription_cancel(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = obj_arg(args, 0)?;
     if matches!(ctx.get_field(this, RE5_SUB_STATE), Value::Int(0)) {
         ctx.set_field(this, RE5_SUB_STATE, Value::Int(2));
@@ -6756,8 +6761,7 @@ fn re5_drive_body_handler(
         }
         Some((ctx.pin_native_root(arr), arr))
     };
-    let subscription =
-        alloc_concurrent_synthetic(ctx, RE5_REPLAY_SUBSCRIPTION, RE5_SUB_NUM_FIELDS);
+    let subscription = alloc_concurrent_synthetic(ctx, RE5_REPLAY_SUBSCRIPTION, RE5_SUB_NUM_FIELDS);
     {
         let subscriber_now = ctx.read_native_pin(subscriber_pin, subscriber);
         ctx.set_field(
@@ -8289,7 +8293,8 @@ fn register_re6_ssl_context(r: &mut NativeMethodRegistry) {
             // T19.H1: see the matching comment on `createSocket` above — this
             // reconnect blocks on real network I/O too and must announce it.
             ctx.begin_blocking_region();
-            let connect_result = crate::t27_tls::rustls_client_connect(cfg, &host, side.port as u16);
+            let connect_result =
+                crate::t27_tls::rustls_client_connect(cfg, &host, side.port as u16);
             ctx.end_blocking_region();
             match connect_result {
                 Ok(rid) => {
@@ -8663,7 +8668,11 @@ fn register_re8_network_interface(r: &mut NativeMethodRegistry) {
             Some(Value::Int(i)) => i,
             _ => 0,
         };
-        Ok(Some(Value::Int(if name == "lo" || index == 1 { 1 } else { 0 })))
+        Ok(Some(Value::Int(if name == "lo" || index == 1 {
+            1
+        } else {
+            0
+        })))
     });
     r.register(ni, "isP2P0", "(Ljava/lang/String;I)Z", |_ctx, _args| {
         Ok(Some(Value::Int(0)))
@@ -10519,7 +10528,11 @@ mod tests {
     ) -> ObjectRef {
         let subscription =
             alloc_concurrent_synthetic(ctx, RE5_REPLAY_SUBSCRIPTION, RE5_SUB_NUM_FIELDS);
-        ctx.set_field(subscription, RE5_SUB_SUBSCRIBER, Value::Object(Some(subscriber)));
+        ctx.set_field(
+            subscription,
+            RE5_SUB_SUBSCRIBER,
+            Value::Object(Some(subscriber)),
+        );
         ctx.set_field(subscription, RE5_SUB_BODY, Value::Object(None));
         ctx.set_field(subscription, RE5_SUB_STATE, Value::Int(0));
         subscription

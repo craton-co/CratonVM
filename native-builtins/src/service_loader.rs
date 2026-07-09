@@ -429,7 +429,8 @@ fn load_provider_class(
         ) {
             return Some(c);
         }
-        if let Some(c) = load_provider_class_from_loader_jars(ctx, loader_r, &fqn.replace('.', "/")) {
+        if let Some(c) = load_provider_class_from_loader_jars(ctx, loader_r, &fqn.replace('.', "/"))
+        {
             return Some(c);
         }
     }
@@ -533,7 +534,10 @@ fn discover_providers(
                 "jdk/internal/module/ServicesCatalog",
                 "findServices",
                 "(Ljava/lang/String;)Ljava/util/List;",
-                &[Value::Object(Some(catalog)), Value::Object(Some(service_name_obj))],
+                &[
+                    Value::Object(Some(catalog)),
+                    Value::Object(Some(service_name_obj)),
+                ],
             ) {
                 let list_pin = ctx.pin_native_root(service_list);
                 let size = match ctx.invoke(
@@ -565,7 +569,8 @@ fn discover_providers(
                         }
                     }
                     if let Value::Object(Some(module)) = ctx.get_field_by_name(sp, "module") {
-                        if let Value::Object(Some(loader)) = ctx.get_field_by_name(module, "loader") {
+                        if let Value::Object(Some(loader)) = ctx.get_field_by_name(module, "loader")
+                        {
                             let loader_class = ctx
                                 .class_name_of_id(ctx.class_id_of_object(loader))
                                 .unwrap_or_default();
@@ -622,8 +627,7 @@ fn discover_providers(
     };
     let loader_is_jboss_module = loader_ref_opt
         .map(|r| {
-            ctx.class_name_of_id(ctx.class_id_of_object(r))
-                .as_deref()
+            ctx.class_name_of_id(ctx.class_id_of_object(r)).as_deref()
                 == Some("org/jboss/modules/ModuleClassLoader")
         })
         .unwrap_or(false);
@@ -635,7 +639,8 @@ fn discover_providers(
 
     if loader_is_jboss_module {
         if let Some(loader_r) = loader_ref_opt {
-            if let Some(module_name) = crate::jboss_module_loader::module_name_of_mcl(ctx, loader_r) {
+            if let Some(module_name) = crate::jboss_module_loader::module_name_of_mcl(ctx, loader_r)
+            {
                 providers.extend(crate::jboss_module_loader::module_service_provider_names(
                     &module_name,
                     &service_name,
@@ -2011,7 +2016,6 @@ mod tests {
         parse_provider_lines(body, &mut out);
         assert!(out.is_empty());
     }
-
 
     #[test]
     fn read_jar_url_entry_reads_exact_jar_descriptor() {
