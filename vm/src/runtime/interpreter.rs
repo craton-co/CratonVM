@@ -20304,6 +20304,9 @@ pub(crate) fn is_xerces_xml_parser_native_override(
             (
                 "scanContent",
                 "(Lcom/sun/org/apache/xerces/internal/xni/XMLString;)I"
+            ) | (
+                "scanQName",
+                "(Lcom/sun/org/apache/xerces/internal/xni/QName;Lcom/sun/org/apache/xerces/internal/impl/XMLScanner$NameType;)Z"
             ) | ("skipSpaces", "()Z") | (
                 "normalizeNewlines",
                 "(SLcom/sun/org/apache/xerces/internal/xni/XMLString;ZZLcom/sun/org/apache/xerces/internal/impl/XMLScanner$NameType;)Z"
@@ -20344,6 +20347,13 @@ fn force_native_over_real_jdk_bytecode(
     method_name: &str,
     method_descriptor: &str,
 ) -> bool {
+    if class_name == "java/lang/Object"
+        && method_name == "clone"
+        && method_descriptor == "()Ljava/lang/Object;"
+    {
+        return true;
+    }
+
     if is_forkjoin_native_override(class_name, method_name, method_descriptor) {
         return true;
     }
@@ -31067,6 +31077,18 @@ mod tests {
     }
 
     #[test]
+    fn object_clone_force_native_covers_super_clone() {
+        assert!(
+            force_native_over_real_jdk_bytecode(
+                "java/lang/Object",
+                "clone",
+                "()Ljava/lang/Object;"
+            ),
+            "Object.clone must route to the registered shallow-clone native"
+        );
+    }
+
+    #[test]
     fn xerces_xml_parser_force_native_covers_liquibase_parse_hotspots() {
         let xmlchar = "com/sun/org/apache/xerces/internal/util/XMLChar";
         for (name, descriptor) in [
@@ -31142,6 +31164,10 @@ mod tests {
         let entity_scanner = "com/sun/org/apache/xerces/internal/impl/XMLEntityScanner";
         for (name, descriptor) in [
             ("scanContent", "(Lcom/sun/org/apache/xerces/internal/xni/XMLString;)I"),
+            (
+                "scanQName",
+                "(Lcom/sun/org/apache/xerces/internal/xni/QName;Lcom/sun/org/apache/xerces/internal/impl/XMLScanner$NameType;)Z",
+            ),
             ("skipSpaces", "()Z"),
             (
                 "normalizeNewlines",
