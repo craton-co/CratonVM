@@ -11154,19 +11154,16 @@ fn invoke_on_class_shared_inner(
                         // `Collections.singletonList(locale)`.
                         || (class_name == "java/util/ResourceBundle$Control"
                             && method_name == "getCandidateLocales")
-                        // WP4.2: ForkJoinPool.execute(Runnable) /
-                        // execute(ForkJoinTask) вЂ” the real JDK bytecode
-                        // queues the runnable for a worker thread that
-                        // never runs Java in our impl (NativeContext is
-                        // not Send). Force the eager-inline native
-                        // override so CompletableFuture.supplyAsync /
-                        // thenApplyAsync / runAsync actually complete
-                        // their stages instead of leaving a Signaller
-                        // placeholder in the result slot.
-                        || (class_name == "java/util/concurrent/ForkJoinPool"
-                            && method_name == "execute"
-                            && (descriptor == "(Ljava/lang/Runnable;)V"
-                                || descriptor == "(Ljava/util/concurrent/ForkJoinTask;)V"))
+                        // ForkJoin Bridge overrides: selected real JDK pool/task
+                        // methods queue work into worker machinery that our
+                        // NativeContext-backed real-FJP lane cannot safely run. Keep
+                        // those side-table-backed native methods coherent as one
+                        // model.
+                        || crate::runtime::interpreter::is_forkjoin_native_override(
+                            class_name,
+                            method_name,
+                            descriptor,
+                        )
                         // T19_K3_FJP_NATIVE_OVERRIDE: ForkJoinPool.commonPool() /
                         // getFactory() вЂ” the real JDK bytecode for these reads
                         // the `common` static field and the `factory` instance

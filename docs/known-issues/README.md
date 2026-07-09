@@ -111,9 +111,17 @@ All three verified against their real Keycloak classes via the suite runner; no 
   pre-existing aarch64 failures). Doc moved to
   [`docs/internal/jit-invokedynamic-uncommon-trap-precise-resume-groovy-regression-FIXED.md`](../internal/jit-invokedynamic-uncommon-trap-precise-resume-groovy-regression-FIXED.md).
 
-## 2026-07-07 GC_STRESS residual corruption re-assessed (still OPEN, two hypotheses refuted)
+## 2026-07-09 GC_STRESS residual Fork6Hard lane - FIXED
 
-- 🟡 Re-ran the Fork6Hard `GC_STRESS` lane on current dev (commit `3a1a95b5`): **0 crashes in 56 runs** — the severe SIGSEGV/`CompactValue`-panic faces the doc opened for are gone (contained by the 2026-07-06 `2dfdfddc` slot-tearing + map-node + guard/recovery wave). Residual is now a *contained* stale-reference young-mark rejection that still surfaces as a rep-level `ClassCastException`/`NoSuchMethodError`/`nullchild` (32/56) or a rare wedge (5/56). **Refuted both leading producers**: disabling JIT inline-`new` (4→3/12) and compact-ref-fields (→3/12) change nothing, and it reproduces under `--nojit` too, so it is a shared-core missed-root/missed-remap bug, not JIT allocation codegen. The cheap `ZonedDateTimeTest` livelock repro is CLOSED (completes clean now). Kept in known-issues (unfixed). Full write-up in [gcstress-residual-corruption-faces.md](gcstress-residual-corruption-faces.md).
+- FIXED: the post-oldgen Fork6Hard `GC_STRESS` residual is closed by keeping
+  the real-JDK ForkJoinPool/ForkJoinTask Bridge surface registered and forcing
+  those bridge methods as a single side-table-backed model, plus GC scan/remap
+  of the ForkJoin side table and root-snapshot cache bypass in the real-FJP
+  lane. Verification on the Azure Linux probe host: default-JIT `Fork6Hard 128
+  20` was 12/12 and 48/48 `ALL-OK`; `CRATONVM_DISABLE_JIT=1` was 12/12
+  `ALL-OK`; all three lanes had 0 `mark_young` corrupt-header markers, 0
+  timeouts, and 0 bad signatures. Full write-up moved to
+  [gcstress-residual-corruption-faces-FIXED.md](../internal/gcstress-residual-corruption-faces-FIXED.md).
 
 ## 2026-07-06 Infinispan Cache.config null after real DefaultCacheManager.start() — FIXED; two new residuals found one/two layers deeper
 
@@ -595,11 +603,9 @@ root); `-Xmx8g` passes (no young GC).
 > to JIT/register roots (reproduces under `--nojit` with zero live JIT frames
 > at every STW). Those three defects are **FIXED on dev** (`57f545be`;
 > [gcstress-concurrent-oldgen-races-FIXED.md](../internal/gcstress-concurrent-oldgen-races-FIXED.md)).
-> A *different*, still-unexplained residual corruption survives that fix on
-> the same aggressive lane — tracked separately at
-> [gcstress-residual-corruption-faces.md](gcstress-residual-corruption-faces.md);
-> face 2 there (JIT lost-tag int-in-ref-slot) may or may not be the same
-> mechanism as A4's register-only residual — unconfirmed. Separately, the
+> A later residual corruption survived that fix on the same aggressive lane,
+> but is now **FIXED** too; see
+> [gcstress-residual-corruption-faces-FIXED.md](../internal/gcstress-residual-corruption-faces-FIXED.md). Separately, the
 > cross-thread STW JIT takeover (BUG-03) had a **gate-polarity bug making it
 > silently inert in every default-env run** — fixed 2026-07-02, see the "Fix
 > 2026-07-02" section of the A4 doc. A4's own register-only residual is
@@ -622,8 +628,8 @@ current (incomplete/buggy) implementation of that.
 | **A1** | Reflection mirror-array builders held an `ObjectRef` array in a Rust local across allocating calls (`Field[]`/`Method[]`/annotation arrays) | `wildfly-suite/repro/MinRepro` | ✅ **FIXED on dev** (`pin_native_root` sweep) | _(doc removed; resolved)_ |
 | **A2** | **`implausible object size` young-sweep-walker crash** (reflection/String-array allocation churn) — a *distinct* bug, NOT the register root: a non-moving-sweep free-list double-serve (overlapping free blocks not coalesced) | [`../internal/repros/A2-reflrepro/`](../internal/repros/A2-reflrepro/) | ✅ **FIXED on dev** (`6e3ddb05`, 2026-06-23; coalesce overlapping free blocks) — `ReflRepro 8000 @ GC_STRESS=65536` → `ok=8000 bad=0` (re-verified 2026-06-29); precise maps orthogonal; moved to docs/internal | [reflrepro-register-resident-jit-root-handoff.md](../internal/app-jvm-bugs/reflrepro-register-resident-jit-root-handoff.md) |
 | **A3** | **Register-invisibility** — a live oop sits only in a CPU register at a young-GC safepoint, invisible to the stack-only scan (single thread) | `apps/spring-boot/buildSrc/runner/MinRegexProbe` | ✅ **FIXED on dev** (`32649b56`, precise maps default-on) | _(doc removed; resolved)_ |
-| **A4** | Multi-thread: live `ForkJoinTask`s reclaimed under **FJP worker threads** + a **lost-tag** interpreter local (register-only residual) | `scratch/xworker/Fork6` / `docs/known-issues/repros/A4-fork6/Fork6Hard.java` (needs `CRATONVM_REAL_FORKJOINPOOL=1`) | 🟡 **OPEN** — non-stress `Fork6`/`Fork6Hard` is ALL-OK on current dev (re-verified 2026-07-01). The `GC_STRESS` lane failures previously attributed to A4 are **re-scoped as a separate bug** (2026-07-03, see [gcstress-residual-corruption-faces.md](gcstress-residual-corruption-faces.md)) — three concurrent-old-gen races were FIXED, a different residual remains. A4's own register-only gap is unaffected, still gated on precise-JIT-stack-maps. | [fork6-fjp-multithread-jit-root-reclamation.md](fork6-fjp-multithread-jit-root-reclamation.md) |
-| **A4-gcstress** | Concurrent old-gen mark/sweep: SATB never wired (no production caller), young→old roots never traced, failed remark STW fell through to the sweep — three JIT-**unrelated** live-object-freeing races surfaced by the aggressive `GC_STRESS` lane | `docs/known-issues/repros/A4-fork6/Fork6Hard.java` + `CRATONVM_DBG_GC_STRESS=65536` | ✅ **FIXED on dev** (`57f545be`) — 42/42 focused `cratonvm-gc` unit tests; controls (`Fork6`, `Fork6Hard 256 40`, bt16) green. Residual (different signatures) tracked separately | [../internal/gcstress-concurrent-oldgen-races-FIXED.md](../internal/gcstress-concurrent-oldgen-races-FIXED.md) (fixed) / [gcstress-residual-corruption-faces.md](gcstress-residual-corruption-faces.md) (residual, open) |
+| **A4** | Multi-thread: live `ForkJoinTask`s reclaimed under **FJP worker threads** + a **lost-tag** interpreter local (register-only residual) | `scratch/xworker/Fork6` / `docs/known-issues/repros/A4-fork6/Fork6Hard.java` (needs `CRATONVM_REAL_FORKJOINPOOL=1`) | 🟡 **OPEN** — non-stress `Fork6`/`Fork6Hard` is ALL-OK on current dev (re-verified 2026-07-01). The `GC_STRESS` lane failures previously attributed to A4 are **re-scoped as a separate bug** (2026-07-03, see [gcstress-residual-corruption-faces-FIXED.md](../internal/gcstress-residual-corruption-faces-FIXED.md)) — three concurrent-old-gen races were FIXED, the later residual is also FIXED (2026-07-09). A4's own register-only gap is unaffected, still gated on precise-JIT-stack-maps. | [fork6-fjp-multithread-jit-root-reclamation.md](fork6-fjp-multithread-jit-root-reclamation.md) |
+| **A4-gcstress** | Concurrent old-gen mark/sweep: SATB never wired (no production caller), young→old roots never traced, failed remark STW fell through to the sweep — three JIT-**unrelated** live-object-freeing races surfaced by the aggressive `GC_STRESS` lane | `docs/known-issues/repros/A4-fork6/Fork6Hard.java` + `CRATONVM_DBG_GC_STRESS=65536` | ✅ **FIXED on dev** (`57f545be`) — 42/42 focused `cratonvm-gc` unit tests; controls (`Fork6`, `Fork6Hard 256 40`, bt16) green. Later residual (different signatures) fixed separately | [../internal/gcstress-concurrent-oldgen-races-FIXED.md](../internal/gcstress-concurrent-oldgen-races-FIXED.md) (fixed) / [gcstress-residual-corruption-faces-FIXED.md](../internal/gcstress-residual-corruption-faces-FIXED.md) (residual fixed) |
 | **A5** | **Object-binarytrees moving-GC corruption** — the compiled entry-point `main`'s JIT frame is invisible to `gc_quiescence` (invoked via `Vm::invoke` without a `JitEntryGuard`), so the **moving** young collector relocates its roots and can't rewrite the raw stack slots → stale all-zero receiver. (The earlier "register-only stale root in `bottomUpTree`" framing was wrong — `bottomUpTree` isn't even compiled at the crash.) | [`../internal/repros/gc-stress-bintrees-main-args/`](../internal/repros/gc-stress-bintrees-main-args/) (`VAAload`) | ✅ **FIXED** (dev `77c98761`) — detect an unregistered JIT frame on the native stack → non-moving sweep + full-stack mark. Repro archived under `docs/internal`. Residual: Windows-only (portable stack-bound is a follow-up) | [docs/internal/.../gc-stress-bintrees-main-args-unregistered-jit-frame-FIXED.md](../internal/app-jvm-bugs/gc-stress-bintrees-main-args-unregistered-jit-frame-FIXED.md) |
 
 > ## ✅ FIX (2026-06-17, dev `32649b56`): **precise JIT oop maps, default-on** — closes the register-invisibility root-scan gap (A3)

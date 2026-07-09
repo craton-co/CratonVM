@@ -4,10 +4,9 @@
 commit `57f545be`). Three unambiguous live-object-freeing defects in the
 concurrent old-gen mark/sweep, described below, are fixed and unit-tested.
 Moved to `docs/internal/` per the known-issues triage rule: the *primary*
-defects this doc investigated are resolved. A **residual** — different
-corruption signatures the fix does not touch — remains open and is tracked
-separately at
-[../known-issues/gcstress-residual-corruption-faces.md](../known-issues/gcstress-residual-corruption-faces.md).
+defects this doc investigated are resolved. A later **residual** with different
+corruption signatures was fixed separately and is archived at
+[gcstress-residual-corruption-faces-FIXED.md](gcstress-residual-corruption-faces-FIXED.md).
 Do not re-investigate the three defects below; they are closed.
 
 Split out of

@@ -6617,10 +6617,111 @@ pub(crate) fn fjp_state_set_done(o: ObjectRef, result: Value) {
     }
 }
 
+fn fjp_remap_value_ref(value: &mut Value, pointer_map: &std::collections::HashMap<usize, usize>) {
+    if let Value::Object(Some(obj)) = value {
+        let old_addr = obj.as_ptr() as usize;
+        if let Some(&new_addr) = pointer_map.get(&old_addr) {
+            debug_assert!(new_addr != 0, "GC pointer map contains null address");
+            *obj = unsafe { ObjectRef::from_raw(new_addr as *mut u8) };
+        }
+    }
+}
+
+/// GC root scan hook for ForkJoinTask's native done/result side-table.
+///
+/// The table owns both the task key and any cached Object result until the
+/// bounded reaper drops the entry. Rooting the key is important: otherwise a
+/// young GC can reclaim the task, reuse its address for a different task, and
+/// the new task inherits the old cached result.
+pub fn gc_scan_forkjoin_roots(out: &mut Vec<ObjectRef>) {
+    let m = fjp_state().lock();
+    for (&key, entry) in m.iter() {
+        if key != 0 {
+            out.push(unsafe { ObjectRef::from_raw(key as *mut u8) });
+        }
+        if let Value::Object(Some(obj)) = entry.result {
+            out.push(obj);
+        }
+    }
+}
+
+/// Post-GC remap companion to [`gc_scan_forkjoin_roots`].
+///
+/// Remaps cached Object results and rekeys task entries when a moving
+/// collection relocates the rooted task object.
+pub fn gc_update_forkjoin_refs(pointer_map: &std::collections::HashMap<usize, usize>) {
+    if pointer_map.is_empty() {
+        return;
+    }
+    let mut m = fjp_state().lock();
+    let mut remapped = rustc_hash::FxHashMap::default();
+    for (key, mut entry) in m.drain() {
+        let new_key = pointer_map.get(&key).copied().unwrap_or(key);
+        fjp_remap_value_ref(&mut entry.result, pointer_map);
+        remapped.insert(new_key, entry);
+    }
+    *m = remapped;
+}
+
+fn fjp_compute_object_result(ctx: &mut dyn NativeContext, task: ObjectRef) -> (ObjectRef, Value) {
+    let task_pin = ctx.pin_native_root(task);
+    let mut live_task = task;
+    let result = match ctx.invoke_virtual(live_task, "compute", "()Ljava/lang/Object;", &[]) {
+        Ok(Some(val)) => val,
+        _ => {
+            live_task = ctx.read_native_pin(task_pin, live_task);
+            let _ = ctx.invoke_virtual(live_task, "compute", "()V", &[]);
+            Value::Object(None)
+        }
+    };
+    live_task = ctx.read_native_pin(task_pin, live_task);
+    ctx.unpin_native_roots(task_pin);
+    (live_task, result)
+}
+
+fn fjp_compute_void(ctx: &mut dyn NativeContext, task: ObjectRef) -> ObjectRef {
+    let task_pin = ctx.pin_native_root(task);
+    let _ = ctx.invoke_virtual(task, "compute", "()V", &[]);
+    let live_task = ctx.read_native_pin(task_pin, task);
+    ctx.unpin_native_roots(task_pin);
+    live_task
+}
+
 /// Reset the side-table (used by tests; production never calls this).
 #[cfg(test)]
 fn fjp_state_clear() {
     fjp_state().lock().clear();
+}
+
+#[cfg(test)]
+mod fjp_gc_tests {
+    use super::*;
+
+    #[test]
+    fn gc_hooks_scan_result_and_remap_key_and_result() {
+        fjp_state_clear();
+        let task = unsafe { ObjectRef::from_raw(0x1000usize as *mut u8) };
+        let result = unsafe { ObjectRef::from_raw(0x2000usize as *mut u8) };
+        let task_new = unsafe { ObjectRef::from_raw(0x3000usize as *mut u8) };
+        let result_new = unsafe { ObjectRef::from_raw(0x4000usize as *mut u8) };
+
+        fjp_state_set_done(task, Value::Object(Some(result)));
+        let mut roots = Vec::new();
+        gc_scan_forkjoin_roots(&mut roots);
+        assert_eq!(roots, vec![task, result]);
+
+        let mut map = std::collections::HashMap::new();
+        map.insert(task.as_ptr() as usize, task_new.as_ptr() as usize);
+        map.insert(result.as_ptr() as usize, result_new.as_ptr() as usize);
+        gc_update_forkjoin_refs(&map);
+
+        assert!(!fjp_state_get(task).0, "old task key must be retired");
+        assert_eq!(
+            fjp_state_get(task_new),
+            (true, Value::Object(Some(result_new)))
+        );
+        fjp_state_clear();
+    }
 }
 
 pub(crate) fn register_forkjoin_natives(r: &mut NativeMethodRegistry) {
@@ -6688,14 +6789,7 @@ pub(crate) fn register_forkjoin_natives(r: &mut NativeMethodRegistry) {
             if done {
                 return Ok(Some(cached));
             }
-            // Try RecursiveTask's compute first, fall back to RecursiveAction's
-            let result = match ctx.invoke_virtual(task, "compute", "()Ljava/lang/Object;", &[]) {
-                Ok(Some(val)) => val,
-                _ => {
-                    let _ = ctx.invoke_virtual(task, "compute", "()V", &[]);
-                    Value::Object(None)
-                }
-            };
+            let (task, result) = fjp_compute_object_result(ctx, task);
             fjp_state_set_done(task, result);
             Ok(Some(result))
         },
@@ -6706,17 +6800,11 @@ pub(crate) fn register_forkjoin_natives(r: &mut NativeMethodRegistry) {
         "submit",
         "(Ljava/util/concurrent/ForkJoinTask;)Ljava/util/concurrent/ForkJoinTask;",
         |ctx, args| {
-            let task = obj_arg(args, 1)?;
+            let mut task = obj_arg(args, 1)?;
             let (done, _) = fjp_state_get(task);
             if !done {
-                let result = match ctx.invoke_virtual(task, "compute", "()Ljava/lang/Object;", &[])
-                {
-                    Ok(Some(val)) => val,
-                    _ => {
-                        let _ = ctx.invoke_virtual(task, "compute", "()V", &[]);
-                        Value::Object(None)
-                    }
-                };
+                let (live_task, result) = fjp_compute_object_result(ctx, task);
+                task = live_task;
                 fjp_state_set_done(task, result);
             }
             Ok(Some(Value::Object(Some(task))))
@@ -6771,11 +6859,7 @@ pub(crate) fn register_forkjoin_natives(r: &mut NativeMethodRegistry) {
         if done {
             return Ok(Some(cached));
         }
-        let result = ctx
-            .invoke_virtual(this, "compute", "()Ljava/lang/Object;", &[])
-            .ok()
-            .flatten()
-            .unwrap_or(Value::Object(None));
+        let (this, result) = fjp_compute_object_result(ctx, this);
         fjp_state_set_done(this, result);
         Ok(Some(result))
     });
@@ -6785,11 +6869,7 @@ pub(crate) fn register_forkjoin_natives(r: &mut NativeMethodRegistry) {
         if done {
             return Ok(Some(cached));
         }
-        let result = ctx
-            .invoke_virtual(this, "compute", "()Ljava/lang/Object;", &[])
-            .ok()
-            .flatten()
-            .unwrap_or(Value::Object(None));
+        let (this, result) = fjp_compute_object_result(ctx, this);
         fjp_state_set_done(this, result);
         Ok(Some(result))
     });
@@ -6799,11 +6879,7 @@ pub(crate) fn register_forkjoin_natives(r: &mut NativeMethodRegistry) {
         if done {
             return Ok(Some(cached));
         }
-        let result = ctx
-            .invoke_virtual(this, "compute", "()Ljava/lang/Object;", &[])
-            .ok()
-            .flatten()
-            .unwrap_or(Value::Object(None));
+        let (this, result) = fjp_compute_object_result(ctx, this);
         fjp_state_set_done(this, result);
         Ok(Some(result))
     });
@@ -6851,11 +6927,7 @@ pub(crate) fn register_forkjoin_natives(r: &mut NativeMethodRegistry) {
         if done {
             return Ok(Some(cached));
         }
-        let result = ctx
-            .invoke_virtual(this, "compute", "()Ljava/lang/Object;", &[])
-            .ok()
-            .flatten()
-            .unwrap_or(Value::Object(None));
+        let (this, result) = fjp_compute_object_result(ctx, this);
         fjp_state_set_done(this, result);
         Ok(Some(result))
     });
@@ -6865,11 +6937,7 @@ pub(crate) fn register_forkjoin_natives(r: &mut NativeMethodRegistry) {
         if done {
             return Ok(Some(cached));
         }
-        let result = ctx
-            .invoke_virtual(this, "compute", "()Ljava/lang/Object;", &[])
-            .ok()
-            .flatten()
-            .unwrap_or(Value::Object(None));
+        let (this, result) = fjp_compute_object_result(ctx, this);
         fjp_state_set_done(this, result);
         Ok(Some(result))
     });
@@ -6894,11 +6962,7 @@ pub(crate) fn register_forkjoin_natives(r: &mut NativeMethodRegistry) {
         if done {
             return Ok(Some(cached));
         }
-        let result = ctx
-            .invoke_virtual(this, "compute", "()Ljava/lang/Object;", &[])
-            .ok()
-            .flatten()
-            .unwrap_or(Value::Object(None));
+        let (this, result) = fjp_compute_object_result(ctx, this);
         fjp_state_set_done(this, result);
         Ok(Some(result))
     });
@@ -6936,7 +7000,7 @@ pub(crate) fn register_forkjoin_natives(r: &mut NativeMethodRegistry) {
         let this = obj_arg(args, 0)?;
         let (done, _) = fjp_state_get(this);
         if !done {
-            let _ = ctx.invoke_virtual(this, "compute", "()V", &[]);
+            let this = fjp_compute_void(ctx, this);
             fjp_state_set_done(this, Value::Object(None));
         }
         Ok(Some(Value::Object(None)))
@@ -6945,7 +7009,7 @@ pub(crate) fn register_forkjoin_natives(r: &mut NativeMethodRegistry) {
         let this = obj_arg(args, 0)?;
         let (done, _) = fjp_state_get(this);
         if !done {
-            let _ = ctx.invoke_virtual(this, "compute", "()V", &[]);
+            let this = fjp_compute_void(ctx, this);
             fjp_state_set_done(this, Value::Object(None));
         }
         Ok(Some(Value::Object(None)))
@@ -6991,18 +7055,39 @@ pub fn register_real_jdk_forkjoin_essentials(r: &mut NativeMethodRegistry) {
                 tracing::debug!(target: "fjp", task = format!("0x{:x}", fjp_key(task)), cached = ?cached, "pool.invoke done");
                 return Ok(Some(cached));
             }
-            let result = match ctx.invoke_virtual(task, "compute", "()Ljava/lang/Object;", &[]) {
-                Ok(Some(val)) => val,
-                _ => {
-                    let _ = ctx.invoke_virtual(task, "compute", "()V", &[]);
-                    Value::Object(None)
-                }
-            };
+            let (task, result) = fjp_compute_object_result(ctx, task);
             tracing::debug!(target: "fjp", task = format!("0x{:x}", fjp_key(task)), result = ?result, "pool.invoke result");
             fjp_state_set_done(task, result);
             Ok(Some(result))
         },
     );
+
+    // ForkJoinPool.submit(ForkJoinTask) / externalSubmit(ForkJoinTask) - keep the
+    // public real-JDK submit path on the same side-table-backed semantics as
+    // invoke(). Letting the concrete JDK submit bytecode enqueue into the real
+    // pool exposes WorkQueue/status machinery that CratonVM only partially
+    // models under CRATONVM_REAL_FORKJOINPOOL, and Fork6Hard observes stale
+    // task/result objects there under GC stress.
+    for submit_name in ["submit", "externalSubmit"] {
+        r.register(
+            "java/util/concurrent/ForkJoinPool",
+            submit_name,
+            "(Ljava/util/concurrent/ForkJoinTask;)Ljava/util/concurrent/ForkJoinTask;",
+            |ctx, args| {
+                let mut task = match args.get(1).copied() {
+                    Some(Value::Object(Some(r))) => r,
+                    _ => return Ok(args.get(1).copied()),
+                };
+                let (done, _) = fjp_state_get(task);
+                if !done {
+                    let (live_task, result) = fjp_compute_object_result(ctx, task);
+                    task = live_task;
+                    fjp_state_set_done(task, result);
+                }
+                Ok(Some(Value::Object(Some(task))))
+            },
+        );
+    }
 
     // ForkJoinTask.fork / join / invoke / get / isDone / isCompletedNormally /
     // isCancelled / cancel / complete — all routed through the side-table.
@@ -7027,8 +7112,7 @@ pub fn register_real_jdk_forkjoin_essentials(r: &mut NativeMethodRegistry) {
             tracing::debug!(target: "fjp", task = format!("0x{:x}", fjp_key(this)), cached = ?cached, "fjt.join cached");
             return Ok(Some(cached));
         }
-        let result = ctx.invoke_virtual(this, "compute", "()Ljava/lang/Object;", &[])
-            .ok().flatten().unwrap_or(Value::Object(None));
+        let (this, result) = fjp_compute_object_result(ctx, this);
         tracing::debug!(target: "fjp", task = format!("0x{:x}", fjp_key(this)), result = ?result, "fjt.join recompute");
         fjp_state_set_done(this, result);
         Ok(Some(result))
@@ -7039,11 +7123,7 @@ pub fn register_real_jdk_forkjoin_essentials(r: &mut NativeMethodRegistry) {
         if done {
             return Ok(Some(cached));
         }
-        let result = ctx
-            .invoke_virtual(this, "compute", "()Ljava/lang/Object;", &[])
-            .ok()
-            .flatten()
-            .unwrap_or(Value::Object(None));
+        let (this, result) = fjp_compute_object_result(ctx, this);
         fjp_state_set_done(this, result);
         Ok(Some(result))
     });
@@ -7053,11 +7133,7 @@ pub fn register_real_jdk_forkjoin_essentials(r: &mut NativeMethodRegistry) {
         if done {
             return Ok(Some(cached));
         }
-        let result = ctx
-            .invoke_virtual(this, "compute", "()Ljava/lang/Object;", &[])
-            .ok()
-            .flatten()
-            .unwrap_or(Value::Object(None));
+        let (this, result) = fjp_compute_object_result(ctx, this);
         fjp_state_set_done(this, result);
         Ok(Some(result))
     });
@@ -7115,8 +7191,7 @@ pub fn register_real_jdk_forkjoin_essentials(r: &mut NativeMethodRegistry) {
             tracing::debug!(target: "fjp", task = format!("0x{:x}", fjp_key(this)), cached = ?cached, "rt.join cached");
             return Ok(Some(cached));
         }
-        let result = ctx.invoke_virtual(this, "compute", "()Ljava/lang/Object;", &[])
-            .ok().flatten().unwrap_or(Value::Object(None));
+        let (this, result) = fjp_compute_object_result(ctx, this);
         tracing::debug!(target: "fjp", task = format!("0x{:x}", fjp_key(this)), result = ?result, "rt.join compute");
         fjp_state_set_done(this, result);
         Ok(Some(result))
@@ -7127,11 +7202,7 @@ pub fn register_real_jdk_forkjoin_essentials(r: &mut NativeMethodRegistry) {
         if done {
             return Ok(Some(cached));
         }
-        let result = ctx
-            .invoke_virtual(this, "compute", "()Ljava/lang/Object;", &[])
-            .ok()
-            .flatten()
-            .unwrap_or(Value::Object(None));
+        let (this, result) = fjp_compute_object_result(ctx, this);
         fjp_state_set_done(this, result);
         Ok(Some(result))
     });
@@ -7141,11 +7212,7 @@ pub fn register_real_jdk_forkjoin_essentials(r: &mut NativeMethodRegistry) {
         if done {
             return Ok(Some(cached));
         }
-        let result = ctx
-            .invoke_virtual(this, "compute", "()Ljava/lang/Object;", &[])
-            .ok()
-            .flatten()
-            .unwrap_or(Value::Object(None));
+        let (this, result) = fjp_compute_object_result(ctx, this);
         fjp_state_set_done(this, result);
         Ok(Some(result))
     });
@@ -7191,7 +7258,7 @@ pub fn register_real_jdk_forkjoin_essentials(r: &mut NativeMethodRegistry) {
         let this = obj_arg(args, 0)?;
         let (done, _) = fjp_state_get(this);
         if !done {
-            let _ = ctx.invoke_virtual(this, "compute", "()V", &[]);
+            let this = fjp_compute_void(ctx, this);
             fjp_state_set_done(this, Value::Object(None));
         }
         Ok(Some(Value::Object(None)))
@@ -7200,7 +7267,7 @@ pub fn register_real_jdk_forkjoin_essentials(r: &mut NativeMethodRegistry) {
         let this = obj_arg(args, 0)?;
         let (done, _) = fjp_state_get(this);
         if !done {
-            let _ = ctx.invoke_virtual(this, "compute", "()V", &[]);
+            let this = fjp_compute_void(ctx, this);
             fjp_state_set_done(this, Value::Object(None));
         }
         Ok(Some(Value::Object(None)))

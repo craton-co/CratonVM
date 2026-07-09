@@ -2995,27 +2995,70 @@ impl NativeMethodRegistry {
         // avoiding the cross-worker read, so CF keeps working WHILE the real
         // pool services Weld's `invokeAll`. `ForkJoinWorkerThread` natives are
         // also kept (the real pool needs them).
+        //
+        // Keep a small Bridge-only pool surface that real-JDK mode cannot
+        // safely execute as bytecode under GC stress. These entries are not
+        // synthetic layout shims; they are VM policy bridges registered by the
+        // real-JDK native path and explicitly forced by the interpreter.
+        let keep_real_forkjoinpool_bridge =
+            self.current_category == NativeKind::Bridge
+                && class_name == "java/util/concurrent/ForkJoinPool"
+                && matches!(
+                (method_name, descriptor),
+                ("commonPool", "()Ljava/util/concurrent/ForkJoinPool;")
+                    | (
+                        "getFactory",
+                        "()Ljava/util/concurrent/ForkJoinPool$ForkJoinWorkerThreadFactory;",
+                    )
+                    | ("getParallelism", "()I")
+                    | ("getCommonPoolParallelism", "()I")
+                    | ("invoke", "(Ljava/util/concurrent/ForkJoinTask;)Ljava/lang/Object;")
+                    | (
+                        "submit",
+                        "(Ljava/util/concurrent/ForkJoinTask;)Ljava/util/concurrent/ForkJoinTask;",
+                    )
+                    | (
+                        "externalSubmit",
+                        "(Ljava/util/concurrent/ForkJoinTask;)Ljava/util/concurrent/ForkJoinTask;",
+                    )
+            );
         if real_forkjoinpool_enabled()
             && class_name == "java/util/concurrent/ForkJoinPool"
             && method_name != "execute"
+            && !keep_real_forkjoinpool_bridge
         {
             return;
         }
-        // REAL-FORKJOINPOOL (opt-in) — also drop the synthetic FJP *task-family*
-        // natives (`ForkJoinTask` / `RecursiveTask` / `RecursiveAction` /
-        // `CountedCompleter`). These track each task's done-flag and result in a
-        // process-global `fjp_state` SIDE-TABLE (phases_early), but under the real
-        // pool the task is completed by REAL `exec()` bytecode which writes the
-        // real `result` field (and CASes the real `status`). The side-table is
-        // never populated on that path, so `getRawResult()`/`get()`/`join()` —
-        // still served by the synthetic native — return the side-table's stale
-        // default (a bare `Object`/null) while the real field (and reflection)
-        // hold the true result. That mismatch is the actual "cross-worker"
-        // failure (NOT a memory-ordering / publication bug): the value is written
-        // and read on the SAME object but through two different stores. Dropping
-        // the task-family natives lets the real bytecode run end-to-end, so the
-        // completing worker and the reading thread agree. `ForkJoinWorkerThread`
-        // natives are still kept above (the real pool needs them).
+        // REAL-FORKJOINPOOL (opt-in): drop ordinary synthetic FJP task-family
+        // natives so real JDK task bytecode can remain coherent with real pool
+        // bootstrap state. The exception is the Bridge subset below: those
+        // fork/join/get/result helpers are a deliberate VM policy surface used
+        // by the real-FJP GC-stress lane. They share one side-table with the
+        // pool Bridge methods above, and that side-table is scanned/remapped by
+        // GC; letting `ForkJoinTask.fork()` fall through to bytecode reaches the
+        // real WorkQueue/CAS path and reopens the residual timeout/corruption
+        // face.
+        let keep_real_forkjointask_bridge = self.current_category == NativeKind::Bridge
+            && matches!(
+                class_name,
+                "java/util/concurrent/ForkJoinTask"
+                    | "java/util/concurrent/RecursiveTask"
+                    | "java/util/concurrent/RecursiveAction"
+            )
+            && matches!(
+                (method_name, descriptor),
+                ("fork", "()Ljava/util/concurrent/ForkJoinTask;")
+                    | ("join", "()Ljava/lang/Object;")
+                    | ("invoke", "()Ljava/lang/Object;")
+                    | ("get", "()Ljava/lang/Object;")
+                    | ("getRawResult", "()Ljava/lang/Object;")
+                    | ("setRawResult", "(Ljava/lang/Object;)V")
+                    | ("isDone", "()Z")
+                    | ("isCompletedNormally", "()Z")
+                    | ("isCancelled", "()Z")
+                    | ("cancel", "(Z)Z")
+                    | ("complete", "(Ljava/lang/Object;)V")
+            );
         if real_forkjoinpool_enabled()
             && matches!(
                 class_name,
@@ -3024,6 +3067,7 @@ impl NativeMethodRegistry {
                     | "java/util/concurrent/RecursiveAction"
                     | "java/util/concurrent/CountedCompleter"
             )
+            && !keep_real_forkjointask_bridge
         {
             return;
         }

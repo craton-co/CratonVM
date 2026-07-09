@@ -1,17 +1,33 @@
-# GC_STRESS — residual corruption faces (post concurrent-old-gen fix)
+# GC_STRESS - residual corruption faces (FIXED)
 
-**Status:** 🟡 OPEN (residual). **Severe manifestations RESOLVED** — the
-doc's original *critical* framing (SIGSEGV / `CompactValue` panic / hard
-crash, "5/6 soak runs crash") no longer reproduces: **0 crashes across 56
-Fork6Hard GC_STRESS runs on current dev** (2026-07-07, commit `3a1a95b5`).
-What remains is a **contained** young-mark stale-reference residual (guard
-rejects the corrupt header; the run usually completes) that still escalates
-to a Java-level `ClassCastException` / `NoSuchMethodError` / `nullchild`
-rep-failure in a minority of runs and to a rare STW wedge. Split off
-`gcstress-concurrent-oldgen-races-FIXED.md` (in `docs/internal/`, defects
-fixed on dev `57f545be`). Root cause of the residual not yet identified;
-see the 2026-07-07 re-assessment below, which **refutes** the two leading
-producer hypotheses.
+**Status:** FIXED on dev (2026-07-09). The remaining Fork6Hard
+`CRATONVM_REAL_FORKJOINPOOL=1` + `CRATONVM_DBG_GC_STRESS=65536` residual was
+not a JIT allocation producer or compact-ref-field race. The real-FJP lane was
+splitting ForkJoin state between real JDK queue/status bytecode and CratonVM
+Bridge side-table natives, while GC did not scan/remap the side table and the
+root-snapshot cache could reuse stale roots across recursive native re-entry.
+
+**Fix:** keep and force the real-JDK ForkJoinPool/ForkJoinTask Bridge surface as
+a single model (`commonPool`, `invoke`, `submit`, `externalSubmit`,
+`fork`/`join`/`get`/result/status helpers), route recursive task execution
+through the side-table path, scan/remap the side-table task/result references
+during GC, pin the task across native `compute()` re-entry, and bypass/remap-clear
+the frozen-frame root snapshot cache in the opt-in real-FJP lane. This removes
+the real WorkQueue/CAS path from the repro while keeping real-FJP bootstrap
+compatibility.
+
+**Verification (Azure Linux probe host, branch
+`codex/fix-gcstress-residual-faces-20260709-024700`, binary
+`/data/data/cratonvm-probes/cratonvm-gcsres-fjpfullbridge-20260709-024700`):**
+
+- `cargo test -p cratonvm-native-builtins fjp_gc_tests::gc_hooks_scan_result_and_remap_key_and_result -- --nocapture` - PASS.
+- `cargo build --release -p cratonvm-cli` - PASS.
+- `Fork6Hard 128 20`, default JIT, 12/12 - `ALL-OK`, 0 `mark_young` corrupt-header markers, 0 timeouts, 0 bad signatures.
+- `Fork6Hard 128 20`, default JIT, 48/48 - `ALL-OK`, 0 markers, 0 timeouts, 0 bad signatures.
+- `Fork6Hard 128 20`, `CRATONVM_DISABLE_JIT=1`, 12/12 - `ALL-OK`, 0 markers, 0 timeouts, 0 bad signatures.
+
+Moved from `docs/known-issues/` to `docs/internal/` per project policy. The
+historical investigation below is retained for provenance.
 
 ## Repro
 

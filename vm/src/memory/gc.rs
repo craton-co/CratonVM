@@ -549,6 +549,10 @@ pub fn update_all_roots(
     // companion `t27_tls::gc_scan_tls_ctx_key_manager_roots` in `roots.rs`.
     cratonvm_native_builtins::t27_tls::gc_update_tls_ctx_key_manager_refs(pointer_map);
 
+    // ForkJoinTask done/result side-table; scan companion
+    // `phases_early::gc_scan_forkjoin_roots` in `roots.rs`.
+    cratonvm_native_builtins::phases_early::gc_update_forkjoin_refs(pointer_map);
+
     // 20. Blocked-thread root maintenance (the H2 TestScript stale-receiver
     //     SEGV fix). Threads parked in a blocking native (Object.wait /
     //     Thread.join / LockSupport.park / ReferenceQueue.remove) are
