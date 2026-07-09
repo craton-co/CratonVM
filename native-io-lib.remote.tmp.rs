@@ -4460,6 +4460,57 @@ pub fn register_io_natives(registry: &mut NativeMethodRegistry) {
         registry.register("java/io/FileInputStream", "close", "()V", native_fis_close);
     }
 
+    // Real-JDK fallback: keep the public FileInputStream surface available for
+    // synthetic fallback classes without stealing a real FileInputStream
+    // constructor. `vm_exec` protects SyntheticStub-tagged FileInputStream
+    // methods by preferring real bytecode when it exists.
+    {
+        let __prev_cat = registry.current_category();
+        registry.set_category(cratonvm_native_api::NativeKind::SyntheticStub);
+        registry.register(
+            "java/io/FileInputStream",
+            "<init>",
+            "(Ljava/lang/String;)V",
+            native_fis_open0,
+        );
+        registry.register("java/io/FileInputStream", "read", "()I", native_fis_read);
+        registry.register(
+            "java/io/FileInputStream",
+            "read",
+            "([BII)I",
+            native_fis_read_bytes,
+        );
+        registry.register("java/io/FileInputStream", "read", "([B)I", |ctx, args| {
+            let this = match args.first() {
+                Some(Value::Object(Some(o))) => *o,
+                _ => return Ok(Some(Value::Int(-1))),
+            };
+            let arr = match args.get(1) {
+                Some(Value::Object(Some(a))) => *a,
+                _ => return Ok(Some(Value::Int(-1))),
+            };
+            let len = ctx.array_length(arr) as i32;
+            native_fis_read_bytes(
+                ctx,
+                &[
+                    Value::Object(Some(this)),
+                    Value::Object(Some(arr)),
+                    Value::Int(0),
+                    Value::Int(len),
+                ],
+            )
+        });
+        registry.register(
+            "java/io/FileInputStream",
+            "available",
+            "()I",
+            native_fis_available,
+        );
+        registry.register("java/io/FileInputStream", "skip", "(J)J", native_fis_skip);
+        registry.register("java/io/FileInputStream", "close", "()V", native_fis_close);
+        registry.set_category(__prev_cat);
+    }
+
     // --- JDK 25 real bytecode uses different method names for I/O natives ---
     // FileInputStream: open0, read0, readBytes, skip0, available0 etc.
     registry.register("java/io/FileInputStream", "initIDs", "()V", native_noop);
@@ -5005,6 +5056,12 @@ pub fn register_io_natives(registry: &mut NativeMethodRegistry) {
         "(Ljava/lang/String;)Ljava/lang/String;",
         native_baos_to_string_charset,
     );
+    registry.register(
+        baos,
+        "toString",
+        "(Ljava/nio/charset/Charset;)Ljava/lang/String;",
+        native_baos_to_string_charset,
+    );
     registry.register(baos, "close", "()V", native_baos_close);
     registry.register(baos, "flush", "()V", native_baos_flush);
 
@@ -5541,24 +5598,19 @@ fn bb_state(
     ctx: &dyn NativeContext,
     this: ObjectRef,
 ) -> Result<(ObjectRef, i32, i32, i32), MethodCallFailed> {
-    // Prefer the real-JDK `hb` field. Some real heap-buffer subclasses land
-    // here without superclass by-name field resolution, so fall back to the
-    // real-JDK HeapByteBuffer slot (`hb` @ 5) before synthetic slot 0.
+    // Prefer the real-JDK `hb` field; fall back to synthetic slot 0.
     let arr = match ctx.get_field_by_name(this, "hb") {
         Value::Object(Some(a)) => a,
-        _ => match ctx.get_field(this, 5) {
+        _ => match ctx.get_field(this, BB_FIELD_ARRAY) {
             Value::Object(Some(a)) => a,
-            _ => match ctx.get_field(this, BB_FIELD_ARRAY) {
-                Value::Object(Some(a)) => a,
-                other => {
-                    return Err(MethodCallFailed::InternalError(VmError::Internal {
-                        message: format!(
-                            "ByteBuffer missing backing array (field {} returned {:?} for object {:?})",
-                            BB_FIELD_ARRAY, other, this
-                        ),
-                    }))
-                }
-            },
+            other => {
+                return Err(MethodCallFailed::InternalError(VmError::Internal {
+                    message: format!(
+                        "ByteBuffer missing backing array (field {} returned {:?} for object {:?})",
+                        BB_FIELD_ARRAY, other, this
+                    ),
+                }))
+            }
         },
     };
     let pos = buf_read_position(ctx, this);
@@ -6683,42 +6735,15 @@ fn native_bb_array(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRes
         Some(Value::Object(Some(o))) => *o,
         _ => return Ok(Some(Value::Object(None))),
     };
-    let arr = match ctx.get_field_by_name(this, "hb") {
-        Value::Object(Some(a)) => Some(a),
-        _ => match ctx.get_field(this, 5) {
-            Value::Object(Some(a)) => Some(a),
-            _ => match ctx.get_field(this, BB_FIELD_ARRAY) {
-                Value::Object(Some(a)) => Some(a),
-                _ => None,
-            },
-        },
-    };
-    Ok(Some(Value::Object(arr)))
+    Ok(Some(ctx.get_field(this, BB_FIELD_ARRAY)))
 }
 
-fn native_bb_has_array(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    let this = match args.first() {
-        Some(Value::Object(Some(o))) => *o,
-        _ => return Ok(Some(Value::Int(0))),
-    };
-    let has = matches!(ctx.get_field_by_name(this, "hb"), Value::Object(Some(_)))
-        || matches!(ctx.get_field(this, 5), Value::Object(Some(_)))
-        || matches!(ctx.get_field(this, BB_FIELD_ARRAY), Value::Object(Some(_)));
-    Ok(Some(Value::Int(if has { 1 } else { 0 })))
+fn native_bb_has_array(_ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
+    Ok(Some(Value::Int(1))) // always heap-backed
 }
 
-fn native_bb_array_offset(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    let this = match args.first() {
-        Some(Value::Object(Some(o))) => *o,
-        _ => return Ok(Some(Value::Int(0))),
-    };
-    if let Value::Int(v) = ctx.get_field_by_name(this, "offset") {
-        return Ok(Some(Value::Int(v.max(0))));
-    }
-    match ctx.get_field(this, 6) {
-        Value::Int(v) => Ok(Some(Value::Int(v.max(0)))),
-        _ => Ok(Some(Value::Int(0))),
-    }
+fn native_bb_array_offset(_ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
+    Ok(Some(Value::Int(0)))
 }
 
 fn native_bb_is_direct(_ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
@@ -7010,16 +7035,11 @@ fn sw_set_count(ctx: &mut dyn NativeContext, this: ObjectRef, count: usize) {
 fn register_string_rw_natives(registry: &mut NativeMethodRegistry) {
     let __prev_cat = registry.current_category();
     registry.set_category(cratonvm_native_api::NativeKind::Bridge);
-    // RDR-MIGRATION 2026-06-01: the synthetic StringReader natives below use a
-    // 3-field layout (content/pos/length) that does not match the real JDK
-    // StringReader (str/length/next/mark). They shadowed the real bytecode and
-    // — combined with the synthetic BufferedReader natives — made
-    // `new BufferedReader(new StringReader(...)).readLine()` return 0 lines.
-    // Real StringReader bytecode is self-contained (no native primitives), so
-    // it runs correctly on its own and feeds a real BufferedReader. Keep the
-    // synthetic StringReader natives only under `synthetic-jdk`.
-    #[cfg(feature = "synthetic-jdk")]
-    {
+    // RDR-MIGRATION 2026-06-01: these StringReader natives use the synthetic
+    // 3-field layout (content/pos/length). Register them as SyntheticStub so
+    // fake-JDK StringReader links, while real JDK bytecode still wins when the
+    // class is loaded from a real java.base.
+    registry.with_category(cratonvm_native_api::NativeKind::SyntheticStub, |registry| {
         let sr = "java/io/StringReader";
         registry.register(sr, "<init>", "(Ljava/lang/String;)V", native_sr_init);
         registry.register(sr, "read", "()I", native_sr_read);
@@ -7031,7 +7051,7 @@ fn register_string_rw_natives(registry: &mut NativeMethodRegistry) {
         registry.register(sr, "markSupported", "()Z", |_ctx, _args| {
             Ok(Some(Value::Int(1)))
         });
-    }
+    });
 
     // HIB-CV-25b sibling: the synthetic StringWriter natives below model the
     // writer as a `char[] buf` (slot 0) + `int count` (slot 1). The REAL JDK
