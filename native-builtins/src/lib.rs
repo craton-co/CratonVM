@@ -14663,6 +14663,7 @@ const XERCES_REGEX_RANGE_TOKEN: &str =
 const STREAM_SCANNED_ENTITY: &str = "com/sun/xml/internal/stream/Entity$ScannedEntity";
 const XML_LIMIT_ANALYZER: &str = "jdk/xml/internal/XMLLimitAnalyzer";
 const XML_SECURITY_LIMIT: &str = "jdk/xml/internal/XMLSecurityManager$Limit";
+const LIQUIBASE_ABSTRACT_CHANGE_FIELD_FILTER: &str = "liquibase/change/AbstractChange$1";
 
 const XML_LIMIT_ENTITY_EXPANSION: i32 = 0;
 const XML_LIMIT_MAX_OCCUR_NODE: i32 = 1;
@@ -16670,6 +16671,91 @@ fn register_xerces_xml_parser_intrinsics(registry: &mut NativeMethodRegistry) {
 /// Register ONLY the truly native methods (`ACC_NATIVE` in real JDK class files).
 /// These methods have no bytecode — they MUST be provided by the VM as native code.
 /// Used when `use_synthetic_jdk == false` (real JDK mode).
+fn native_liquibase_abstract_change_field_filter_include(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    let this = obj_arg(args, 0)?;
+    let field_name = match args.get(2) {
+        Some(Value::Object(Some(field_name))) => *field_name,
+        _ => return Ok(Some(Value::Int(1))),
+    };
+    let outer = match ctx.get_field_by_name(this, "this$0") {
+        Value::Object(Some(outer)) => outer,
+        _ => return Ok(Some(Value::Int(1))),
+    };
+
+    let root = ctx.pin_native_root(this);
+    let field_pin = ctx.pin_native_root(field_name);
+    let outer_pin = ctx.pin_native_root(outer);
+
+    let result: MethodCallResult = (|| {
+        let checksum_version = match ctx.invoke(
+            "liquibase/Scope",
+            "getCurrentScope",
+            "()Lliquibase/Scope;",
+            &[],
+        )? {
+            Some(Value::Object(Some(scope))) => {
+                let scope_pin = ctx.pin_native_root(scope);
+                match ctx.invoke_virtual(
+                    ctx.read_native_pin(scope_pin, scope),
+                    "getChecksumVersion",
+                    "()Lliquibase/ChecksumVersion;",
+                    &[],
+                )? {
+                    Some(Value::Object(version)) => version,
+                    _ => None,
+                }
+            }
+            _ => None,
+        };
+        let checksum_version_pin = checksum_version.map(|version| ctx.pin_native_root(version));
+        let checksum_version_arg = Value::Object(
+            checksum_version
+                .map(|version| ctx.read_native_pin(checksum_version_pin.unwrap_or(root), version)),
+        );
+
+        let excluded_fields = match ctx.invoke_virtual(
+            ctx.read_native_pin(outer_pin, outer),
+            "getExcludedFieldFilters",
+            "(Lliquibase/ChecksumVersion;)[Ljava/lang/String;",
+            &[checksum_version_arg],
+        )? {
+            Some(Value::Object(Some(fields))) => fields,
+            _ => return Ok(Some(Value::Int(1))),
+        };
+        let excluded_pin = ctx.pin_native_root(excluded_fields);
+        let field_name = match ctx.read_string(ctx.read_native_pin(field_pin, field_name)) {
+            Some(field_name) => field_name,
+            None => return Ok(Some(Value::Int(1))),
+        };
+        let excluded_fields = ctx.read_native_pin(excluded_pin, excluded_fields);
+        for idx in 0..ctx.array_length(excluded_fields) {
+            let excluded = match ctx.get_array_element(excluded_fields, idx) {
+                Value::Object(Some(excluded)) => excluded,
+                _ => continue,
+            };
+            if ctx.read_string(excluded).as_deref() == Some(field_name.as_str()) {
+                return Ok(Some(Value::Int(0)));
+            }
+        }
+        Ok(Some(Value::Int(1)))
+    })();
+
+    ctx.unpin_native_roots(root);
+    result
+}
+
+fn register_liquibase_checksum_intrinsics(registry: &mut NativeMethodRegistry) {
+    registry.register(
+        LIQUIBASE_ABSTRACT_CHANGE_FIELD_FILTER,
+        "include",
+        "(Ljava/lang/Object;Ljava/lang/String;Ljava/lang/Object;)Z",
+        native_liquibase_abstract_change_field_filter_include,
+    );
+}
+
 pub fn register_essential_natives(registry: &mut NativeMethodRegistry) {
     let before = registry.len();
     // These are the ACC_NATIVE methods with no bytecode — they ARE the real
@@ -17070,6 +17156,7 @@ pub fn register_essential_natives(registry: &mut NativeMethodRegistry) {
     );
     register_xerces_cmstateset_intrinsics(registry);
     register_xerces_xml_parser_intrinsics(registry);
+    register_liquibase_checksum_intrinsics(registry);
     registry.register("java/lang/String", "indexOf", "(I)I", |ctx, args| {
         let this = match args.first() {
             Some(Value::Object(Some(o))) => *o,
@@ -66043,6 +66130,109 @@ mod xerces_xml_parser_tests {
         assert_eq!(sorted, vec![1, 2, 5, 5, 5, 6]);
         assert_eq!(ctx.get_field_by_name(token, "sorted"), Value::Int(1));
         assert_eq!(ctx.get_field_by_name(token, "compacted"), Value::Int(0));
+    }
+}
+
+#[cfg(test)]
+mod liquibase_checksum_tests {
+    use super::*;
+    use crate::test_utils::MockNativeContext;
+    use cratonvm_types::ArrayElementType;
+
+    const ABSTRACT_CHANGE: &str = "liquibase/change/core/CreateTableChange";
+
+    fn new_abstract_change_filter(ctx: &mut MockNativeContext) -> (ObjectRef, ObjectRef) {
+        let outer_class = ctx
+            .ensure_class_initialized(ABSTRACT_CHANGE)
+            .expect("AbstractChange test class id");
+        let outer = ctx.alloc_object(outer_class, 1);
+        let filter_class = ctx
+            .ensure_class_initialized(LIQUIBASE_ABSTRACT_CHANGE_FIELD_FILTER)
+            .expect("AbstractChange$1 class id");
+        let filter = ctx.alloc_object(filter_class, 1);
+        ctx.set_field_by_name(filter, "this$0", Value::Object(Some(outer)));
+        (filter, outer)
+    }
+
+    fn excluded_field_filters_hook(
+        ctx: &mut MockNativeContext,
+        receiver: ObjectRef,
+        method_name: &str,
+        descriptor: &str,
+        _args: &[Value],
+    ) -> Option<MethodCallResult> {
+        if ctx
+            .class_name_of_id(ctx.class_id_of_object(receiver))
+            .as_deref()
+            != Some(ABSTRACT_CHANGE)
+            || method_name != "getExcludedFieldFilters"
+            || descriptor != "(Lliquibase/ChecksumVersion;)[Ljava/lang/String;"
+        {
+            return None;
+        }
+        let fields = ctx.new_array(ArrayElementType::Reference, 2);
+        let catalog_name = ctx.create_string("catalogName");
+        let schema_name = ctx.create_string("schemaName");
+        ctx.set_array_element(fields, 0, Value::Object(Some(catalog_name)));
+        ctx.set_array_element(fields, 1, Value::Object(Some(schema_name)));
+        Some(Ok(Some(Value::Object(Some(fields)))))
+    }
+
+    #[test]
+    fn essential_natives_include_liquibase_checksum_filter_intrinsic() {
+        let mut registry = NativeMethodRegistry::new();
+        register_essential_natives(&mut registry);
+        assert!(
+            registry
+                .find(
+                    LIQUIBASE_ABSTRACT_CHANGE_FIELD_FILTER,
+                    "include",
+                    "(Ljava/lang/Object;Ljava/lang/String;Ljava/lang/Object;)Z",
+                )
+                .is_some(),
+            "AbstractChange$1.include must be registered for the checksum/status hot path"
+        );
+    }
+
+    #[test]
+    fn abstract_change_filter_include_scans_excluded_field_array_directly() {
+        let mut ctx = MockNativeContext::new();
+        ctx.set_invoke_virtual_hook(excluded_field_filters_hook);
+        let (filter, owner) = new_abstract_change_filter(&mut ctx);
+        let value = ctx.create_string("kc");
+
+        let field_name = ctx.create_string("catalogName");
+        assert_eq!(
+            native_liquibase_abstract_change_field_filter_include(
+                &mut ctx,
+                &[
+                    Value::Object(Some(filter)),
+                    Value::Object(Some(owner)),
+                    Value::Object(Some(field_name)),
+                    Value::Object(Some(value)),
+                ],
+            )
+            .unwrap()
+            .unwrap(),
+            Value::Int(0)
+        );
+
+        let field_name = ctx.create_string("tableName");
+        assert_eq!(
+            native_liquibase_abstract_change_field_filter_include(
+                &mut ctx,
+                &[
+                    Value::Object(Some(filter)),
+                    Value::Object(Some(owner)),
+                    Value::Object(Some(field_name)),
+                    Value::Object(Some(value)),
+                ],
+            )
+            .unwrap()
+            .unwrap(),
+            Value::Int(1)
+        );
+        assert_eq!(ctx.native_pin_count_for_test(), 0);
     }
 }
 

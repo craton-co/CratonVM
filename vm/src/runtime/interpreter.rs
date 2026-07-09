@@ -20484,6 +20484,19 @@ pub(crate) fn is_awt_imageio_native_override(
             == "(Ljavax/imageio/metadata/IIOMetadata;Ljavax/imageio/IIOImage;Ljavax/imageio/ImageWriteParam;)V"
 }
 
+pub(crate) fn is_liquibase_checksum_native_override(
+    class_name: &str,
+    method_name: &str,
+    descriptor: &str,
+) -> bool {
+    class_name == "liquibase/change/AbstractChange$1"
+        && (method_name, descriptor)
+            == (
+                "include",
+                "(Ljava/lang/Object;Ljava/lang/String;Ljava/lang/Object;)Z",
+            )
+}
+
 fn force_native_over_real_jdk_bytecode(
     class_name: &str,
     method_name: &str,
@@ -21038,6 +21051,9 @@ fn force_native_over_real_jdk_bytecode(
         return true;
     }
     if is_xerces_xml_parser_native_override(class_name, method_name, method_descriptor) {
+        return true;
+    }
+    if is_liquibase_checksum_native_override(class_name, method_name, method_descriptor) {
         return true;
     }
     // Surefire fork bootstrap/teardown: bypass ServiceLoader decoder discovery
@@ -31487,6 +31503,25 @@ mod tests {
             analyzer,
             "debugPrint",
             "(Ljdk/xml/internal/XMLSecurityManager;)V"
+        ));
+    }
+
+    #[test]
+    fn liquibase_checksum_force_native_covers_abstract_change_filter() {
+        let class_name = "liquibase/change/AbstractChange$1";
+        let descriptor = "(Ljava/lang/Object;Ljava/lang/String;Ljava/lang/Object;)Z";
+        assert!(
+            is_liquibase_checksum_native_override(class_name, "include", descriptor),
+            "AbstractChange$1.include must route to the registered native"
+        );
+        assert!(
+            force_native_over_real_jdk_bytecode(class_name, "include", descriptor),
+            "AbstractChange$1.include must not fall through to interpreted stream bytecode"
+        );
+        assert!(!is_liquibase_checksum_native_override(
+            "liquibase/serializer/core/string/StringChangeLogSerializer$FieldFilter",
+            "include",
+            descriptor
         ));
     }
 

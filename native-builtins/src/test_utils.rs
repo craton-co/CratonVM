@@ -312,6 +312,7 @@ fn mock_classloader_field_slot(class_name: Option<&str>, name: &str) -> Option<u
             "compacted" => Some(2),
             _ => None,
         },
+        (Some("liquibase/change/AbstractChange$1"), "this$0") => Some(0),
         (
             Some(
                 "java/lang/ClassLoader"
