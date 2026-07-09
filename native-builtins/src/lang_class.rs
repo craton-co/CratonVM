@@ -121,26 +121,7 @@ pub(crate) fn array_descriptor_to_type_name(desc: &str) -> Option<String> {
         return None;
     }
     let elem = &desc[dims..];
-    let elem_name: String = if let Some(stripped) = elem.strip_prefix('L') {
-        stripped
-            .strip_suffix(';')
-            .unwrap_or(stripped)
-            .replace('/', ".")
-    } else {
-        match elem {
-            "I" => "int",
-            "J" => "long",
-            "D" => "double",
-            "F" => "float",
-            "Z" => "boolean",
-            "B" => "byte",
-            "C" => "char",
-            "S" => "short",
-            "V" => "void",
-            _ => return None,
-        }
-        .to_string()
-    };
+    let elem_name = array_descriptor_element_name(elem, false)?;
     let mut out = String::with_capacity(elem_name.len() + dims * 2);
     out.push_str(&elem_name);
     for _ in 0..dims {
@@ -149,11 +130,92 @@ pub(crate) fn array_descriptor_to_type_name(desc: &str) -> Option<String> {
     Some(out)
 }
 
+fn primitive_descriptor_name(elem: &str) -> Option<&'static str> {
+    match elem {
+        "I" => Some("int"),
+        "J" => Some("long"),
+        "D" => Some("double"),
+        "F" => Some("float"),
+        "Z" => Some("boolean"),
+        "B" => Some("byte"),
+        "C" => Some("char"),
+        "S" => Some("short"),
+        "V" => Some("void"),
+        _ => None,
+    }
+}
+
+fn array_descriptor_element_name(elem: &str, canonical: bool) -> Option<String> {
+    if let Some(stripped) = elem.strip_prefix('L') {
+        let name = stripped.strip_suffix(';').unwrap_or(stripped);
+        let dotted = name.replace('/', ".");
+        return Some(if canonical {
+            dotted.replace('$', ".")
+        } else {
+            dotted
+        });
+    }
+    primitive_descriptor_name(elem).map(str::to_string)
+}
+
+fn append_array_suffix(mut elem_name: String, dims: usize) -> String {
+    elem_name.reserve(dims * 2);
+    for _ in 0..dims {
+        elem_name.push_str("[]");
+    }
+    elem_name
+}
+
+fn array_descriptor_to_canonical_name(desc: &str) -> Option<String> {
+    let dims = desc.bytes().take_while(|&b| b == b'[').count();
+    if dims == 0 {
+        return None;
+    }
+    let elem_name = array_descriptor_element_name(&desc[dims..], true)?;
+    Some(append_array_suffix(elem_name, dims))
+}
+
+fn array_descriptor_to_simple_name(desc: &str) -> Option<String> {
+    let dims = desc.bytes().take_while(|&b| b == b'[').count();
+    if dims == 0 {
+        return None;
+    }
+    let elem = &desc[dims..];
+    let elem_name = if let Some(stripped) = elem.strip_prefix('L') {
+        let name = stripped.strip_suffix(';').unwrap_or(stripped);
+        name.rsplit(&['/', '.', '$'][..])
+            .next()
+            .unwrap_or(name)
+            .to_string()
+    } else {
+        primitive_descriptor_name(elem)?.to_string()
+    };
+    Some(append_array_suffix(elem_name, dims))
+}
+
+fn array_descriptor_to_package_name(desc: &str) -> Option<String> {
+    let dims = desc.bytes().take_while(|&b| b == b'[').count();
+    if dims == 0 {
+        return None;
+    }
+    let elem = &desc[dims..];
+    if let Some(stripped) = elem.strip_prefix('L') {
+        let name = stripped.strip_suffix(';').unwrap_or(stripped);
+        let pos = name.rfind('/').into_iter().chain(name.rfind('.')).max();
+        return Some(pos.map(|p| name[..p].replace('/', ".")).unwrap_or_default());
+    }
+    primitive_descriptor_name(elem).map(|_| "java.lang".to_string())
+}
+
 /// Last segment of a class's name after `/`, `.`, or `$` (the
 /// `Class.getSimpleName()` rule). Cached per `ClassId`.
 pub(crate) fn simple_class_name(class_id: ClassId, raw: &str) -> Arc<str> {
     if let Some(arc) = cache_get(&SIMPLE_CLASS_NAME_CACHE, class_id) {
         return arc;
+    }
+    if raw.starts_with('[') {
+        let simple: Arc<str> = Arc::from(array_descriptor_to_simple_name(raw).unwrap_or_default());
+        return cache_insert(&SIMPLE_CLASS_NAME_CACHE, class_id, simple);
     }
     let after_slash_or_dot = raw.rsplit(&['/', '.'][..]).next().unwrap_or(raw);
     let after_dollar = after_slash_or_dot
@@ -170,7 +232,9 @@ pub(crate) fn canonical_class_name(class_id: ClassId, slashed: &str) -> Arc<str>
     if let Some(arc) = cache_get(&CANONICAL_CLASS_NAME_CACHE, class_id) {
         return arc;
     }
-    let canonical: Arc<str> = if slashed.contains('/') || slashed.contains('$') {
+    let canonical: Arc<str> = if slashed.starts_with('[') {
+        Arc::from(array_descriptor_to_canonical_name(slashed).unwrap_or_default())
+    } else if slashed.contains('/') || slashed.contains('$') {
         Arc::from(slashed.replace(['/', '$'], "."))
     } else {
         Arc::from(slashed)
@@ -179,13 +243,16 @@ pub(crate) fn canonical_class_name(class_id: ClassId, slashed: &str) -> Arc<str>
 }
 
 /// Package name (dotted) for a class. For `java/lang/Object` returns
-/// `java.lang`; for default-package or array-of-primitive classes returns
-/// the empty string. Cached per `ClassId`.
+/// `java.lang`; for arrays returns the component package reported by
+/// `Class.getPackageName()` (`java.lang` for primitive arrays); for
+/// default-package classes returns the empty string. Cached per `ClassId`.
 pub(crate) fn package_name_of(class_id: ClassId, slashed: &str) -> Arc<str> {
     if let Some(arc) = cache_get(&PACKAGE_NAME_CACHE, class_id) {
         return arc;
     }
-    let pkg: Arc<str> = if let Some(pos) = slashed.rfind('/') {
+    let pkg: Arc<str> = if slashed.starts_with('[') {
+        Arc::from(array_descriptor_to_package_name(slashed).unwrap_or_default())
+    } else if let Some(pos) = slashed.rfind('/') {
         Arc::from(slashed[..pos].replace('/', "."))
     } else {
         Arc::from("")
@@ -2729,9 +2796,13 @@ pub(crate) fn native_class_get_simple_name(
     // Fallback: original per-call derivation. Used by test fixtures and
     // primitive mirrors that fall outside the reverse map.
     let name = mirror_class_name(ctx, this).unwrap_or_default();
-    let simple = name.rsplit(&['/', '.'][..]).next().unwrap_or(&name);
-    let simple = simple.rsplit('$').next().unwrap_or(simple);
-    let result = ctx.create_string(simple);
+    let simple = if name.starts_with('[') {
+        array_descriptor_to_simple_name(&name).unwrap_or_default()
+    } else {
+        let simple = name.rsplit(&['/', '.'][..]).next().unwrap_or(&name);
+        simple.rsplit('$').next().unwrap_or(simple).to_string()
+    };
+    let result = ctx.create_string(&simple);
     Ok(Some(Value::Object(Some(result))))
 }
 
@@ -11929,8 +12000,12 @@ pub(crate) fn native_class_get_package_name(
     }
     // Fallback (test fixtures, primitives) вЂ” original per-call derivation.
     let name = mirror_class_name(ctx, this).unwrap_or_default();
-    let pkg = if let Some(pos) = name.rfind('/') {
+    let pkg = if name.starts_with('[') {
+        array_descriptor_to_package_name(&name).unwrap_or_default()
+    } else if let Some(pos) = name.rfind('/') {
         name[..pos].replace('/', ".")
+    } else if let Some(pos) = name.rfind('.') {
+        name[..pos].to_string()
     } else {
         String::new()
     };
@@ -12199,8 +12274,9 @@ pub(crate) fn native_class_get_package(
         _ => return Ok(Some(Value::Object(None))),
     };
     let name = mirror_class_name(ctx, this).unwrap_or_default();
-    // Array of primitive (e.g. `[I`) and bare primitives have no package.
-    if name.is_empty() || (name.starts_with('[') && !name.contains('/')) {
+    // Array classes have no Package object; Class.getPackageName() separately
+    // reports the component package (java.lang for primitive arrays).
+    if name.is_empty() || name.starts_with('[') {
         return Ok(Some(Value::Object(None)));
     }
     // Cache the dotted package prefix per `ClassId` for VM-registered
@@ -12443,7 +12519,7 @@ pub(crate) fn i2_classloader_define_package_class(
         _ => return Ok(Some(Value::Object(None))),
     };
     let class_name = mirror_class_name(ctx, class_arg).unwrap_or_default();
-    if class_name.is_empty() || (class_name.starts_with('[') && !class_name.contains('/')) {
+    if class_name.is_empty() || class_name.starts_with('[') {
         return Ok(Some(Value::Object(None)));
     }
     // Cache the dotted package prefix per `ClassId` for VM-registered
@@ -12739,7 +12815,11 @@ pub(crate) fn native_class_get_canonical_name(
         }
     }
     let name = mirror_class_name(ctx, this).unwrap_or_default();
-    let canonical = name.replace(['/', '$'], ".");
+    let canonical = if name.starts_with('[') {
+        array_descriptor_to_canonical_name(&name).unwrap_or_default()
+    } else {
+        name.replace(['/', '$'], ".")
+    };
     Ok(Some(Value::Object(Some(ctx.create_string(&canonical)))))
 }
 
@@ -14668,6 +14748,58 @@ mod tests {
             Some(Value::Object(Some(arr))) => ctx.array_length(arr),
             other => panic!("expected Annotation[] from AnnotatedType, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn array_descriptor_name_helpers_match_hotspot_surfaces() {
+        assert_eq!(
+            array_descriptor_to_type_name("[Ljava/lang/Integer;").as_deref(),
+            Some("java.lang.Integer[]")
+        );
+        assert_eq!(
+            array_descriptor_to_canonical_name("[Ljava/lang/Integer;").as_deref(),
+            Some("java.lang.Integer[]")
+        );
+        assert_eq!(
+            array_descriptor_to_simple_name("[Ljava/lang/Integer;").as_deref(),
+            Some("Integer[]")
+        );
+        assert_eq!(
+            array_descriptor_to_package_name("[Ljava/lang/Integer;").as_deref(),
+            Some("java.lang")
+        );
+        assert_eq!(
+            array_descriptor_to_type_name("[I").as_deref(),
+            Some("int[]")
+        );
+        assert_eq!(
+            array_descriptor_to_canonical_name("[I").as_deref(),
+            Some("int[]")
+        );
+        assert_eq!(
+            array_descriptor_to_simple_name("[I").as_deref(),
+            Some("int[]")
+        );
+        assert_eq!(
+            array_descriptor_to_package_name("[I").as_deref(),
+            Some("java.lang")
+        );
+        assert_eq!(
+            array_descriptor_to_type_name("[[Lpkg/Outer$Inner;").as_deref(),
+            Some("pkg.Outer$Inner[][]")
+        );
+        assert_eq!(
+            array_descriptor_to_canonical_name("[[Lpkg/Outer$Inner;").as_deref(),
+            Some("pkg.Outer.Inner[][]")
+        );
+        assert_eq!(
+            array_descriptor_to_simple_name("[[Lpkg/Outer$Inner;").as_deref(),
+            Some("Inner[][]")
+        );
+        assert_eq!(
+            array_descriptor_to_package_name("[[Lpkg/Outer$Inner;").as_deref(),
+            Some("pkg")
+        );
     }
 
     #[test]

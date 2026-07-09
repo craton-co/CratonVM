@@ -4115,13 +4115,32 @@ pub(crate) fn native_double_is_infinite(
 
 // --- Float/Double parsing and utilities (Phase 8 Part 7) ---
 
+fn strip_java_float_type_suffix(s: &str) -> &str {
+    let Some(&suffix) = s.as_bytes().last() else {
+        return s;
+    };
+    if !matches!(suffix, b'd' | b'D' | b'f' | b'F') {
+        return s;
+    }
+
+    let numeric = &s[..s.len() - 1];
+    let has_digit = numeric.bytes().any(|b| b.is_ascii_digit());
+    let suffix_follows_number = matches!(numeric.as_bytes().last(), Some(b'0'..=b'9') | Some(b'.'));
+    if has_digit && suffix_follows_number {
+        numeric
+    } else {
+        s
+    }
+}
+
 fn parse_float_string(s: &str) -> Result<f32, cratonvm_types::error::RuntimeError> {
     let trimmed = s.trim();
-    match trimmed {
+    let numeric = strip_java_float_type_suffix(trimmed);
+    match numeric {
         "NaN" => Ok(f32::NAN),
         "Infinity" | "+Infinity" => Ok(f32::INFINITY),
         "-Infinity" => Ok(f32::NEG_INFINITY),
-        _ => trimmed.parse::<f32>().map_err(|_| {
+        _ => numeric.parse::<f32>().map_err(|_| {
             cratonvm_types::error::RuntimeError::NumberFormatException {
                 message: format!("For input string: \"{s}\""),
             }
@@ -4131,11 +4150,12 @@ fn parse_float_string(s: &str) -> Result<f32, cratonvm_types::error::RuntimeErro
 
 fn parse_double_string(s: &str) -> Result<f64, cratonvm_types::error::RuntimeError> {
     let trimmed = s.trim();
-    match trimmed {
+    let numeric = strip_java_float_type_suffix(trimmed);
+    match numeric {
         "NaN" => Ok(f64::NAN),
         "Infinity" | "+Infinity" => Ok(f64::INFINITY),
         "-Infinity" => Ok(f64::NEG_INFINITY),
-        _ => trimmed.parse::<f64>().map_err(|_| {
+        _ => numeric.parse::<f64>().map_err(|_| {
             cratonvm_types::error::RuntimeError::NumberFormatException {
                 message: format!("For input string: \"{s}\""),
             }
@@ -4414,6 +4434,42 @@ pub(crate) fn native_long_compare_to(
 mod tests {
     use super::*;
     use crate::test_utils::mock_ctx;
+
+    // -----------------------------------------------------------------------
+    // Float/Double parsing
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn parse_double_string_accepts_java_float_type_suffixes() {
+        assert_eq!(parse_double_string("1d").unwrap(), 1.0);
+        assert_eq!(parse_double_string("1D").unwrap(), 1.0);
+        assert_eq!(parse_double_string("1f").unwrap(), 1.0);
+        assert_eq!(parse_double_string("1.25f").unwrap(), 1.25);
+        assert_eq!(parse_double_string("6.0221415E+23d").unwrap(), 6.0221415E23);
+        assert_eq!(parse_double_string("  +1d  ").unwrap(), 1.0);
+    }
+
+    #[test]
+    fn parse_float_string_accepts_java_float_type_suffixes() {
+        assert_eq!(parse_float_string("1d").unwrap(), 1.0);
+        assert_eq!(parse_float_string("1D").unwrap(), 1.0);
+        assert_eq!(parse_float_string("1f").unwrap(), 1.0);
+        assert_eq!(parse_float_string("1.25f").unwrap(), 1.25);
+        assert_eq!(
+            parse_float_string("6.0221415E+23d").unwrap(),
+            6.0221415E23_f32
+        );
+        assert_eq!(parse_float_string("  +1d  ").unwrap(), 1.0);
+    }
+
+    #[test]
+    fn parse_float_type_suffix_stays_numeric_only() {
+        assert!(parse_double_string("NaNd").is_err());
+        assert!(parse_double_string("Infinityd").is_err());
+        assert!(parse_float_string("-InfinityF").is_err());
+        assert!(parse_double_string("1dd").is_err());
+        assert!(parse_float_string("1_0d").is_err());
+    }
 
     // -----------------------------------------------------------------------
     // abs

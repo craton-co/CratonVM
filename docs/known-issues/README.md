@@ -35,15 +35,10 @@ throws). Retired here; docs moved to `docs/internal/fixed-suite-bugs`.
 - FIXED/RETIRED: [`linkedcaseinsensitivemap-this0-deserialization-FIXED.md`](../internal/fixed-suite-bugs/linkedcaseinsensitivemap-this0-deserialization-FIXED.md) - `LinkedCaseInsensitiveMap` inner-class `this$0` null after deserialize; fixed by suppressing `removeEldestEntry` during `HashMap.readObject` replay.
 - FIXED/RETIRED: [`reflection-arenestmates-native.md`](../internal/fixed-suite-bugs/reflection-arenestmates-native.md) — `jdk.internal.reflect.Reflection.areNestMates` had no native registered at all.
 
-Also confirmed (not new, corroborating evidence only, no new doc needed):
-`expression.spel.*` SpEL `EL1040E` double-literal-suffix parse failures (33
-occurrences, matches an already-known SpEL bug); `NoSuchMethodError:
-Object.accept/Object.test` in `SpelCompilerTests`/`BeanOverrideHandlerTests`
-matches the general JIT wrong-receiver-type/virtual-dispatch bug called out
-in `docs/internal/fixed-suite-bugs/jit-osr-linux-regression-triad.md` (that
-doc's top-level FIXED status covers only one narrow OSR-entry sub-case; this
-broader dispatch signature is explicitly noted there as still needing a
-general-path fix) — new evidence it also hits Spring, not just Hibernate.
+Also confirmed (not new, corroborating evidence only):
+- FIXED/RETIRED: [`expression.spel.*` SpEL `EL1040E` double-literal-suffix parse failures](../internal/fixed-suite-bugs/spring-expression-double-literal-suffix-FIXED.md) - Java `Float.parseFloat`/`Double.parseDouble` type suffixes (`d/D/f/F`) now parse in native-builtins, closing the 33 suffix parse failures.
+- OPEN corroborating evidence: `NoSuchMethodError: Object.accept/Object.test` in `SpelCompilerTests`/`BeanOverrideHandlerTests` matches the general JIT wrong-receiver-type/virtual-dispatch bug called out in `docs/internal/fixed-suite-bugs/jit-osr-linux-regression-triad.md` (that doc's top-level FIXED status covers only one narrow OSR-entry sub-case; this broader dispatch signature is explicitly noted there as still needing a general-path fix) - new evidence it also hits Spring, not just Hibernate.
+
 ## 2026-07-08 Hibernate bytecode-enhancement loader/lazytoone family retired; residual basic/merge/version bugs split out
 ## 2026-07-08 Hibernate bytecode-enhancement loader/lazytoone and residual basic/merge/version bugs retired
 
