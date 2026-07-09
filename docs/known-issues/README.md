@@ -4,6 +4,10 @@ This folder collects CratonVM-only defects found while running upstream Java
 suites. The docs had grown to describe the **same underlying bug from several
 angles**; this index is the consolidated map. Read it first.
 
+## 2026-07-09 New: BC-java `asn1-regression` X9Test SIGSEGV (progresses past the retired StackOverflowError, still blocks the suite)
+
+- OPEN: [`bc-asn1-x9test-array-descriptor-of-checkcast-sigsegv.md`](bc-asn1-x9test-array-descriptor-of-checkcast-sigsegv.md) — found rerunning `org.bouncycastle.asn1.test.RegressionTest` after the `InputStream` super-read fix above landed. `PKCS12Test` now passes, but the suite crashes six tests later with a real `SIGSEGV` (native core dump, no Java exception) inside `array_descriptor_of` during `checkcast` handling in `X9Test`. gdb backtrace + a suspicious `r12 = i64::MIN` register value captured; not yet root-caused to a stale GC reference vs. an unrelated register.
+
 ## 2026-07-09 BC-java `asn1-regression` StackOverflowError retired
 
 - FIXED/RETIRED: [`bc-asn1-pkcs12test-indefinitelengthinputstream-stackoverflow-FIXED.md`](../internal/fixed-suite-bugs/bc-asn1-pkcs12test-indefinitelengthinputstream-stackoverflow-FIXED.md) - the base `InputStream.read([BII)` native no longer redispatches an explicit `super.read([BII)` call back to the receiver's three-arg override. The committed reduced probe covers the Bouncy Castle-shaped recursion and the earlier normal virtual-dispatch case; the local checkout does not include `apps/bc-java`, so full-suite rerun remains fixture validation rather than an open known issue.
