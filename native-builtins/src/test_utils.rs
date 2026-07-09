@@ -224,6 +224,95 @@ fn mock_classloader_field_slot(class_name: Option<&str>, name: &str) -> Option<u
             _ => None,
         },
         (
+            Some("jdk/xml/internal/XMLLimitAnalyzer"),
+            "values" | "names" | "totalValue" | "caches" | "entityStart" | "entityEnd",
+        ) => match name {
+            "values" => Some(0),
+            "names" => Some(1),
+            "totalValue" => Some(2),
+            "caches" => Some(3),
+            "entityStart" => Some(4),
+            "entityEnd" => Some(5),
+            _ => None,
+        },
+        (
+            Some("com/sun/org/apache/xerces/internal/impl/dv/xs/XSSimpleTypeDecl"),
+            "fValidationDV" | "fFacetsDefined" | "fWhiteSpace",
+        ) => match name {
+            "fValidationDV" => Some(10),
+            "fFacetsDefined" => Some(11),
+            "fWhiteSpace" => Some(13),
+            _ => None,
+        },
+        (
+            Some("com/sun/org/apache/xerces/internal/impl/xs/traversers/XSDHandler$XSDKey"),
+            "systemId" | "referType" | "referNS",
+        ) => match name {
+            "systemId" => Some(0),
+            "referType" => Some(1),
+            "referNS" => Some(2),
+            _ => None,
+        },
+        (
+            Some("com/sun/org/apache/xerces/internal/impl/XMLEntityScanner"),
+            "fCurrentEntity" | "isExternal" | "offset" | "newlines" | "counted" | "fLimitAnalyzer",
+        ) => match name {
+            "fCurrentEntity" => Some(0),
+            "isExternal" => Some(1),
+            "offset" => Some(2),
+            "newlines" => Some(3),
+            "counted" => Some(4),
+            "fLimitAnalyzer" => Some(5),
+            _ => None,
+        },
+        (
+            Some("com/sun/xml/internal/stream/Entity$ScannedEntity"),
+            "ch" | "position" | "count" | "columnNumber" | "lineNumber" | "isGE" | "name",
+        ) => match name {
+            "ch" => Some(0),
+            "position" => Some(1),
+            "count" => Some(2),
+            "columnNumber" => Some(3),
+            "lineNumber" => Some(4),
+            "isGE" => Some(5),
+            "name" => Some(6),
+            _ => None,
+        },
+        (Some("com/sun/org/apache/xerces/internal/xni/XMLString"), "ch" | "offset" | "length") => {
+            match name {
+                "ch" => Some(0),
+                "offset" => Some(1),
+                "length" => Some(2),
+                _ => None,
+            }
+        }
+        (
+            Some(
+                "com/sun/org/apache/xerces/internal/impl/xs/opti/NodeImpl"
+                | "com/sun/org/apache/xerces/internal/impl/xs/opti/ElementImpl"
+                | "com/sun/org/apache/xerces/internal/impl/xs/opti/AttrImpl",
+            ),
+            "prefix" | "localpart" | "rawname" | "uri" | "nodeType" | "hidden" | "value",
+        ) => match name {
+            "prefix" => Some(0),
+            "localpart" => Some(1),
+            "rawname" => Some(2),
+            "uri" => Some(3),
+            "nodeType" => Some(4),
+            "hidden" => Some(5),
+            "value" => Some(6),
+            _ => None,
+        },
+        (
+            Some("com/sun/org/apache/xerces/internal/impl/xpath/regex/RangeToken"),
+            "ranges" | "sorted" | "compacted",
+        ) => match name {
+            "ranges" => Some(0),
+            "sorted" => Some(1),
+            "compacted" => Some(2),
+            _ => None,
+        },
+        (
             Some(
                 "java/lang/ClassLoader"
                 | "java/net/URLClassLoader"
