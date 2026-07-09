@@ -678,6 +678,15 @@ fn build_headless_toolkit(ctx: &mut dyn NativeContext) -> MethodCallResult {
 }
 
 fn register_toolkit_natives(registry: &mut NativeMethodRegistry) {
+    registry.register("sun/java2d/Disposer", "initIDs", "()V", |_ctx, _args| {
+        void_ok()
+    });
+    // Toolkit.<clinit> calls this JNI bootstrap before ImageIO and Spring's
+    // HTTP image converter can initialize desktop classes. CratonVM keeps the
+    // relevant IDs in Rust-side registries, so the HotSpot native is a no-op.
+    registry.register("java/awt/Toolkit", "initIDs", "()V", |_ctx, _args| {
+        void_ok()
+    });
     // java.awt.Toolkit.getDefaultToolkit — return a real HeadlessToolkit.
     // The previous implementation returned `new java/awt/Toolkit`, but
     // `java.awt.Toolkit` is abstract; instances of it have no concrete
@@ -1834,6 +1843,75 @@ fn decode_buffered_image(ctx: &mut dyn NativeContext, bytes: &[u8]) -> MethodCal
     obj_ok(obj)
 }
 
+fn imageio_reader_input_stream(ctx: &dyn NativeContext, reader: ObjectRef) -> Option<ObjectRef> {
+    for field in ["iis", "input"] {
+        if let Value::Object(Some(stream)) = ctx.get_field_by_name(reader, field) {
+            return Some(stream);
+        }
+    }
+    None
+}
+
+fn imageio_writer_output_stream(
+    ctx: &mut dyn NativeContext,
+    writer: ObjectRef,
+) -> Result<ObjectRef, MethodCallFailed> {
+    for field in ["stream", "output"] {
+        if let Value::Object(Some(output)) = ctx.get_field_by_name(writer, field) {
+            return Ok(output);
+        }
+    }
+    match ctx.invoke_virtual(writer, "getOutput", "()Ljava/lang/Object;", &[])? {
+        Some(Value::Object(Some(output))) => Ok(output),
+        _ => Err(imageio_io_error("ImageWriter output is not set")),
+    }
+}
+
+fn iio_image_rendered_image(
+    ctx: &mut dyn NativeContext,
+    iio_image: ObjectRef,
+) -> Result<ObjectRef, MethodCallFailed> {
+    if let Value::Object(Some(image)) = ctx.get_field_by_name(iio_image, "image") {
+        return Ok(image);
+    }
+    match ctx.invoke_virtual(
+        iio_image,
+        "getRenderedImage",
+        "()Ljava/awt/image/RenderedImage;",
+        &[],
+    )? {
+        Some(Value::Object(Some(image))) => Ok(image),
+        _ => Err(imageio_illegal_arg("image == null!")),
+    }
+}
+
+fn imageio_reader_read(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+    format: image::EncodedImageFormat,
+) -> MethodCallResult {
+    let _ = format;
+    let reader = get_obj(args, 0).ok_or_else(|| imageio_illegal_arg("reader == null!"))?;
+    let stream = imageio_reader_input_stream(ctx, reader)
+        .ok_or_else(|| imageio_io_error("ImageReader input is not set"))?;
+    let bytes = read_all_from_input_stream(ctx, stream)?;
+    decode_buffered_image(ctx, &bytes)
+}
+
+fn imageio_writer_write(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+    format: image::EncodedImageFormat,
+) -> MethodCallResult {
+    let writer = get_obj(args, 0).ok_or_else(|| imageio_illegal_arg("writer == null!"))?;
+    let iio_image = get_obj(args, 2).ok_or_else(|| imageio_illegal_arg("image == null!"))?;
+    let image_obj = iio_image_rendered_image(ctx, iio_image)?;
+    let output = imageio_writer_output_stream(ctx, writer)?;
+    let bytes = encode_rendered_image(ctx, image_obj, format)?;
+    write_all_to_output_stream(ctx, output, &bytes)?;
+    Ok(None)
+}
+
 fn encode_rendered_image(
     ctx: &dyn NativeContext,
     image_obj: ObjectRef,
@@ -2164,6 +2242,23 @@ fn register_image_natives(registry: &mut NativeMethodRegistry) {
     registry.register(
         "javax/imageio/ImageIO",
         "write",
+        "(Ljava/awt/image/RenderedImage;Ljava/lang/String;Ljavax/imageio/stream/ImageOutputStream;)Z",
+        |ctx, args| {
+            let image_obj = get_obj(args, 0).ok_or_else(|| imageio_illegal_arg("im == null!"))?;
+            let format_name = read_string(ctx, args, 1)
+                .ok_or_else(|| imageio_illegal_arg("formatName == null!"))?;
+            let output = get_obj(args, 2).ok_or_else(|| imageio_illegal_arg("output == null!"))?;
+            let Some(format) = image::EncodedImageFormat::parse(&format_name) else {
+                return bool_ok(false);
+            };
+            let bytes = encode_rendered_image(ctx, image_obj, format)?;
+            write_all_to_output_stream(ctx, output, &bytes)?;
+            bool_ok(true)
+        },
+    );
+    registry.register(
+        "javax/imageio/ImageIO",
+        "write",
         "(Ljava/awt/image/RenderedImage;Ljava/lang/String;Ljava/io/File;)Z",
         |ctx, args| {
             let image_obj = get_obj(args, 0).ok_or_else(|| imageio_illegal_arg("im == null!"))?;
@@ -2198,7 +2293,68 @@ fn register_image_natives(registry: &mut NativeMethodRegistry) {
     // `initIDs` natives cache JNI field/method IDs for the real JDK image
     // classes. CratonVM resolves fields by name, so no IDs need caching —
     // register these as no-ops so the real-JDK `<clinit>` of each class can
-    // complete (it would otherwise throw UnsatisfiedLinkError).
+    // complete (it would otherwise throw UnsatisfiedLinkError). The JPEG plugin
+    // uses method-specific bootstrap names rather than `initIDs`.
+    registry.register(
+        "com/sun/imageio/plugins/jpeg/JPEGImageReader",
+        "initReaderIDs",
+        "(Ljava/lang/Class;Ljava/lang/Class;Ljava/lang/Class;)V",
+        |_ctx, _args| void_ok(),
+    );
+    registry.register(
+        "com/sun/imageio/plugins/jpeg/JPEGImageWriter",
+        "initWriterIDs",
+        "(Ljava/lang/Class;Ljava/lang/Class;)V",
+        |_ctx, _args| void_ok(),
+    );
+    registry.register(
+        "com/sun/imageio/plugins/jpeg/JPEGImageReader",
+        "initJPEGImageReader",
+        "()J",
+        |_ctx, _args| Ok(Some(Value::Long(1))),
+    );
+    registry.register(
+        "com/sun/imageio/plugins/jpeg/JPEGImageReader",
+        "setSource",
+        "(J)V",
+        |_ctx, _args| Ok(None),
+    );
+    registry.register(
+        "com/sun/imageio/plugins/jpeg/JPEGImageReader",
+        "resetReader",
+        "(J)V",
+        |_ctx, _args| Ok(None),
+    );
+    registry.register(
+        "com/sun/imageio/plugins/jpeg/JPEGImageReader",
+        "resetLibraryState",
+        "(J)V",
+        |_ctx, _args| Ok(None),
+    );
+    registry.register(
+        "com/sun/imageio/plugins/jpeg/JPEGImageReader",
+        "disposeReader",
+        "(J)V",
+        |_ctx, _args| Ok(None),
+    );
+    registry.register(
+        "com/sun/imageio/plugins/jpeg/JPEGImageReader",
+        "dispose",
+        "()V",
+        |_ctx, _args| Ok(None),
+    );
+    registry.register(
+        "com/sun/imageio/plugins/jpeg/JPEGImageReader",
+        "read",
+        "(ILjavax/imageio/ImageReadParam;)Ljava/awt/image/BufferedImage;",
+        |ctx, args| imageio_reader_read(ctx, args, image::EncodedImageFormat::Jpeg),
+    );
+    registry.register(
+        "com/sun/imageio/plugins/png/PNGImageWriter",
+        "write",
+        "(Ljavax/imageio/metadata/IIOMetadata;Ljavax/imageio/IIOImage;Ljavax/imageio/ImageWriteParam;)V",
+        |ctx, args| imageio_writer_write(ctx, args, image::EncodedImageFormat::Png),
+    );
     for class in [
         "java/awt/image/BufferedImage",
         "java/awt/image/ColorModel",
