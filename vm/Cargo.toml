@@ -34,7 +34,7 @@ exclude = [
 # synthetic test suite or to debug against Rust-side stubs, pass
 # `--features synthetic-jdk` explicitly. See `docs/roadmap.md` NEW-11
 # for the rationale and the census-driven migration plan.
-default = ["awt", "experimental-tls", "experimental-jmx", "experimental-serialization", "experimental-aot", "experimental-debug"]
+default = ["awt", "experimental-tls", "experimental-jmx", "experimental-serialization", "experimental-aot", "experimental-debug", "zgc"]
 # AWT/Swing/Java2D desktop natives. On by default so the standard build
 # registers them exactly as before. `cratonvm-native-awt` sets
 # `publish = false`, so this feature is what makes the dependency optional:
@@ -57,6 +57,8 @@ experimental-t19-diag = []
 # safepoint coordination. Off by default. With this feature off, the VM crate
 # compiles no GPU code paths and does not link `cuda-bridge` or `jit-cuda`.
 gpu-offload = ["dep:cuda-bridge", "dep:jit-cuda", "cratonvm-gc/gpu-offload", "cratonvm-native-builtins/gpu-offload", "dep:bytemuck"]
+# Selectable memory-backed ZGC-real backend (`-XX:+UseZGC`).
+zgc = ["cratonvm-gc/zgc"]
 
 [dependencies]
 cratonvm-reader = { path = "../reader", version = "0.3.0" }

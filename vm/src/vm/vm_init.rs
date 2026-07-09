@@ -1179,6 +1179,8 @@ impl SharedVm {
         let gc_backend = match config.gc_algorithm {
             crate::config::GcAlgorithm::Generational => GcBackend::Generational,
             crate::config::GcAlgorithm::G1 => GcBackend::G1,
+            #[cfg(feature = "zgc")]
+            crate::config::GcAlgorithm::Zgc => GcBackend::Zgc,
         };
         let g1_overrides = G1ConfigOverrides {
             region_size: config.g1_region_size,
@@ -5492,6 +5494,8 @@ impl crate::runtime::serviceability::VmDiagnosticState for SharedVm {
         let gc_name = match self.config.gc_algorithm {
             crate::config::GcAlgorithm::Generational => "UseGenerationalGC",
             crate::config::GcAlgorithm::G1 => "UseG1GC",
+            #[cfg(feature = "zgc")]
+            crate::config::GcAlgorithm::Zgc => "UseZGC",
         };
         flags.push(format!("-XX:+{}", gc_name));
         flags.push(format!("-XX:MaxHeapSize={}", self.config.max_heap_size));
