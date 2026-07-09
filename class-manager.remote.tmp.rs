@@ -5344,11 +5344,6 @@ impl ClassManager {
             name,
             "jdk/internal/loader/ClassLoaders$AppClassLoader"
                 | "jdk/internal/loader/ClassLoaders$PlatformClassLoader"
-                | "java/util/Collections$SynchronizedObject"
-                | "java/util/Collections$SynchronizedCollection"
-                | "java/util/Collections$SynchronizedSet"
-                | "java/util/Collections$SynchronizedMap"
-                | "java/util/function/Function$Identity"
         );
         // LETSGO_S1: Curated list of well-known JDK interfaces whose names
         // aren't matched by the `$` / `*able` / heuristic. Without this,
@@ -6316,12 +6311,6 @@ fn jdk_superclass(name: &str) -> &'static str {
         "java/util/concurrent/ConcurrentHashMap" => "java/util/AbstractMap",
         "java/util/concurrent/ConcurrentSkipListMap" => "java/util/AbstractMap",
         "java/util/Hashtable" => "java/util/Dictionary",
-        "java/util/Collections$SynchronizedObject" => "java/lang/Object",
-        "java/util/Collections$SynchronizedCollection" => {
-            "java/util/Collections$SynchronizedObject"
-        },
-        "java/util/Collections$SynchronizedSet" => "java/util/Collections$SynchronizedCollection",
-        "java/util/Collections$SynchronizedMap" => "java/util/Collections$SynchronizedObject",
 
         // Default: everything else extends Object
         _ => "java/lang/Object",
@@ -6407,18 +6396,6 @@ fn jdk_interfaces(name: &str) -> &'static [&'static str] {
             "java/io/Serializable",
             "java/lang/Cloneable",
         ],
-        "java/util/Collections$SynchronizedCollection" => &[
-            "java/util/Collection",
-            "java/lang/Iterable",
-            "java/io/Serializable",
-        ],
-        "java/util/Collections$SynchronizedSet" => &[
-            "java/util/Set",
-            "java/util/Collection",
-            "java/lang/Iterable",
-            "java/io/Serializable",
-        ],
-        "java/util/Collections$SynchronizedMap" => &["java/util/Map", "java/io/Serializable"],
         "java/util/Dictionary" => &[],
         "java/util/ArrayDeque" => &[
             "java/util/Deque",
@@ -6462,13 +6439,9 @@ fn jdk_interfaces(name: &str) -> &'static [&'static str] {
         "java/nio/charset/Charset" => &["java/lang/Comparable"],
 
         // Synthetic functional interface composition classes (M3 fix)
-        "java/util/function/UnaryOperator" => &["java/util/function/Function"],
-        "java/util/function/Function$AndThen" | "java/util/function/Function$Compose" => {
-            &["java/util/function/Function"]
-        },
-        "java/util/function/Function$Identity" => {
-            &["java/util/function/UnaryOperator", "java/util/function/Function"]
-        },
+        "java/util/function/Function$AndThen"
+        | "java/util/function/Function$Compose"
+        | "java/util/function/Function$Identity" => &["java/util/function/Function"],
         "java/util/function/Consumer$AndThen" => &["java/util/function/Consumer"],
         "java/util/function/Predicate$And"
         | "java/util/function/Predicate$Or"
@@ -6738,19 +6711,13 @@ fn synthetic_stub_fields(name: &str) -> Vec<cratonvm_reader::field::ClassFileFie
             fields.extend(instance_fields(1));
             fields
         }
-        "java/util/Collections$SynchronizedObject" => vec![ClassFileField {
-            access_flags: FieldAccessFlags::PRIVATE,
-            name: cratonvm_types::intern_arc("mutex"),
-            descriptor: cratonvm_types::intern_arc("Ljava/lang/Object;"),
-            attributes: vec![],
-        }],
-        "java/util/Collections$SynchronizedCollection" => vec![ClassFileField {
+        "java/util/Collections$SynchronizedSet"
+        | "java/util/Collections$SynchronizedCollection" => vec![ClassFileField {
             access_flags: FieldAccessFlags::PRIVATE,
             name: cratonvm_types::intern_arc("c"),
             descriptor: cratonvm_types::intern_arc("Ljava/util/Collection;"),
             attributes: vec![],
         }],
-        "java/util/Collections$SynchronizedSet" => vec![],
         "java/util/Collections$SynchronizedMap" => vec![ClassFileField {
             access_flags: FieldAccessFlags::PRIVATE,
             name: cratonvm_types::intern_arc("m"),
@@ -9475,20 +9442,6 @@ fn synthetic_stub_ctor_methods(name: &str) -> Vec<ClassFileMethod> {
             "(Ljava/lang/reflect/InvocationHandler;[Ljava/lang/Class;)V",
         ));
     }
-    if name == "java/lang/Class" {
-        let mk = |method: &str, descriptor: &str| ClassFileMethod {
-            access_flags: MethodAccessFlags::PUBLIC | MethodAccessFlags::NATIVE,
-            name: cratonvm_types::intern_arc(method),
-            descriptor: cratonvm_types::intern_arc(descriptor),
-            attributes: vec![],
-        };
-        out.extend([
-            mk("getSimpleName", "()Ljava/lang/String;"),
-            mk("getCanonicalName", "()Ljava/lang/String;"),
-            mk("getTypeName", "()Ljava/lang/String;"),
-            mk("getPackageName", "()Ljava/lang/String;"),
-        ]);
-    }
     if name == "java/nio/file/attribute/PosixFilePermission" {
         out.push(ClassFileMethod {
             access_flags: MethodAccessFlags::STATIC | MethodAccessFlags::NATIVE,
@@ -9690,45 +9643,6 @@ fn synthetic_stub_ctor_methods(name: &str) -> Vec<ClassFileMethod> {
                 mk("toArray", "()[Ljava/lang/Object;"),
             ]);
         }
-    }
-    if name == "java/util/function/Function" {
-        out.push(ClassFileMethod {
-            access_flags: MethodAccessFlags::PUBLIC
-                | MethodAccessFlags::STATIC
-                | MethodAccessFlags::NATIVE,
-            name: cratonvm_types::intern_arc("identity"),
-            descriptor: cratonvm_types::intern_arc("()Ljava/util/function/Function;"),
-            attributes: vec![],
-        });
-    }
-    if name == "java/util/function/UnaryOperator" {
-        out.push(ClassFileMethod {
-            access_flags: MethodAccessFlags::PUBLIC
-                | MethodAccessFlags::STATIC
-                | MethodAccessFlags::NATIVE,
-            name: cratonvm_types::intern_arc("identity"),
-            descriptor: cratonvm_types::intern_arc("()Ljava/util/function/UnaryOperator;"),
-            attributes: vec![],
-        });
-    }
-    if name == "java/util/function/Function$Identity" {
-        let mk = |method: &str, descriptor: &str| ClassFileMethod {
-            access_flags: MethodAccessFlags::PUBLIC | MethodAccessFlags::NATIVE,
-            name: cratonvm_types::intern_arc(method),
-            descriptor: cratonvm_types::intern_arc(descriptor),
-            attributes: vec![],
-        };
-        out.extend([
-            mk("apply", "(Ljava/lang/Object;)Ljava/lang/Object;"),
-            mk(
-                "andThen",
-                "(Ljava/util/function/Function;)Ljava/util/function/Function;",
-            ),
-            mk(
-                "compose",
-                "(Ljava/util/function/Function;)Ljava/util/function/Function;",
-            ),
-        ]);
     }
     if name == "java/lang/Runtime$Version" {
         out.push(ClassFileMethod {
@@ -9977,27 +9891,7 @@ fn synthetic_stub_ctor_methods(name: &str) -> Vec<ClassFileMethod> {
     }
     if matches!(
         name,
-        "java/security/Permission"
-            | "java/security/BasicPermission"
-            | "java/lang/RuntimePermission"
-            | "java/util/PropertyPermission"
-            | "java/util/logging/LoggingPermission"
-    ) {
-        let mk = |method: &str, descriptor: &str| ClassFileMethod {
-            access_flags: MethodAccessFlags::PUBLIC | MethodAccessFlags::NATIVE,
-            name: cratonvm_types::intern_arc(method),
-            descriptor: cratonvm_types::intern_arc(descriptor),
-            attributes: vec![],
-        };
-        out.push(mk("getName", "()Ljava/lang/String;"));
-    }
-    if name == "java/security/Permission" {
-        out.push(mk_ctor("(Ljava/lang/String;)V"));
-    }
-    if matches!(
-        name,
-        "java/security/BasicPermission"
-            | "java/lang/RuntimePermission"
+        "java/lang/RuntimePermission"
             | "java/util/PropertyPermission"
             | "java/util/logging/LoggingPermission"
     ) {

@@ -10,7 +10,7 @@
 > below is retained for the root-cause trail.
 
 > This is **manifestation A3** of the GC-root-coverage-under-JIT family — see
-> [README.md](../README.md) for the family map. Multi-thread sibling = [Fork6](fork6-fjp-multithread-jit-root-reclamation.md) (A4).
+> [README.md](../README.md) for the family map. Multi-thread sibling = [Fork6](fork6-fjp-multithread-jit-root-reclamation-FIXED.md) (A4).
 
 ---
 ## SESSION UPDATE 2026-06-17 (#5) — ✅ `CRATONVM_PRECISE_JIT_MAPS` is the verified fix for A3 (correct; perf lever is the only thing gating default-on)

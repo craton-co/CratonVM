@@ -806,7 +806,11 @@ impl ThreadRegistry {
             let os_tid = entry.os_tid.load(Ordering::Acquire);
             let vm_state = {
                 let s = entry.vm_state.lock();
-                if s.is_empty() { "<unset>".to_string() } else { s.clone() }
+                if s.is_empty() {
+                    "<unset>".to_string()
+                } else {
+                    s.clone()
+                }
             };
             let trace = entry.frame_trace.lock();
             let mut top = String::new();
@@ -1112,6 +1116,34 @@ impl ThreadRegistry {
             }
         }
         (n, tids)
+    }
+
+    /// Alive-thread count, live blocked-thread count, and alive OS tids read
+    /// under one registry lock.
+    ///
+    /// The blocked count is the production STW exclusion count: a thread sets
+    /// `in_blocked_region` only after depositing its root snapshot, and that
+    /// publication can race ahead of the barrier's anonymous `threads_blocked`
+    /// counter. Reading it with the alive set keeps the expected mutator quota
+    /// aligned with the root/fixup state the collector will actually scan.
+    pub fn alive_count_blocked_and_os_tids(&self) -> (usize, usize, Vec<u32>) {
+        let threads = self.threads.lock();
+        let mut alive = 0usize;
+        let mut blocked = 0usize;
+        let mut tids = Vec::with_capacity(threads.len());
+        for e in threads.values() {
+            if e.alive.load(Ordering::Acquire) {
+                alive += 1;
+                if e.gc_block_state.in_blocked_region.load(Ordering::Acquire) {
+                    blocked += 1;
+                }
+                let t = e.os_tid.load(Ordering::Acquire);
+                if t != 0 {
+                    tids.push(t);
+                }
+            }
+        }
+        (alive, blocked, tids)
     }
 
     /// Get Java Thread objects for all alive threads (up to `max` entries).
