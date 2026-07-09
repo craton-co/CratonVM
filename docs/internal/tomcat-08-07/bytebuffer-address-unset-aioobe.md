@@ -1,14 +1,14 @@
 # `ByteBuffer.allocate()` never sets `Buffer.address` → AIOOBE on every bulk `get(byte[])`/`put(byte[])`
 
-**Status:** OPEN — root-caused with a minimal, Tomcat-independent repro; NOT
-fixed (the live dispatch site could not be located — see "Investigation
-dead-ends" below). **Severity: HIGH** — breaks essentially any real-net-mode
-NIO server that reads incoming bytes into a `byte[]` via a bulk
+**Status:** FIXED 2026-07-09 - the live default-release allocator was
+found and now seeds `java.nio.Buffer.address = 16` for heap buffers returned by
+`ByteBuffer.allocate(int)`. **Severity: HIGH** - this previously broke real-net
+NIO servers that read incoming bytes into a `byte[]` via bulk
 `ByteBuffer.get(byte[])`/`put(byte[])`, e.g. Tomcat's `NioEndpoint`.
-**HotSpot:** unaffected (n/a — this is a CratonVM-only synthetic-object gap).
+**HotSpot:** unaffected (n/a - this was a CratonVM-only synthetic-object gap).
 
 Found 2026-07-09 while re-verifying
-[`accesslogvalve-rewritevalve-connection-failures.md`](accesslogvalve-rewritevalve-connection-failures.md).
+[`accesslogvalve-rewritevalve-connection-failures.md`](../../known-issues/tomcat-08-07/accesslogvalve-rewritevalve-connection-failures.md).
 
 ## Symptom
 
@@ -98,7 +98,7 @@ i.e. `wrap()` takes a different (working) path than `allocate()`.
 consistently shows `address=-1` for any `allocate()`d buffer, both before and
 after every fix attempt below.
 
-## Investigation dead-ends (read before attempting another fix here)
+## Historical investigation dead-ends
 
 Two natural-looking fix locations were tried, both proven **not** to be the
 live dispatch path via an *unconditional* `eprintln!` placed directly inside
@@ -125,11 +125,11 @@ var, so this is conclusive, not a logging mistake):
    build compiles this registration out entirely. Matches the previously
    documented [[reference_synthetic_jdk_feature_gate_trap]] pattern exactly.
 
-Both attempted fixes (add `ctx.set_field_by_name(obj, "address",
-Value::Long(16))`, matching the already-merged, proven-working precedent in
-`native-builtins/src/charset.rs`'s `CharsetEncoder`-result buffer allocator)
-were reverted after failing to change observed behavior, to keep the landed
-diff honest.
+Those attempted fixes were correctly reverted during investigation because they
+were not the live default-release allocator. The same `address = 16` write is
+now applied at the actual live site (`native-builtins/src/lib.rs`) and also in
+`native-io/src/lib.rs::alloc_byte_buffer` so the feature-gated bridge path stays
+consistent.
 
 `classloading/src/class_manager.rs` (around line 10685) explains *why*
 `allocate()` even goes through native dispatch instead of running real
@@ -146,21 +146,35 @@ something is not `shared.native_methods.find(...)`'s normal registry lookup
 (or if it is, the winning entry could not be found by any of the exhaustive
 class/method/descriptor greps performed in this investigation).
 
-## Next steps
+## Fix
 
-Before attempting a third fix location: instrument
-`vm/src/runtime/interpreter.rs` directly (not a `native-builtins`/`native-io`
-Rust closure) around whichever of its ~15 `shared.native_methods.find(...)`
-call sites actually fires for `("java/nio/ByteBuffer", "allocate",
-"(I)Ljava/nio/ByteBuffer;")`, to print the resolved callback's identity
-(e.g. its address/debug name) — or check for a second, independent
-`NativeMethodRegistry` / resolution cache that isn't `shared.native_methods`.
-Once the true live implementation is found, the fix itself is a one-line
-`ctx.set_field_by_name(obj, "address", Value::Long(16))` (see the two
-already-drafted-but-reverted patches in this investigation's commit history
-on branch `investigate/valveconn-reverify-20260709` for the exact shape).
+The live default-release dispatch site is
+`native-builtins/src/lib.rs::native_heap_bytebuffer_allocate`, registered by
+`register_essential_natives` as a `SyntheticStub` for
+`java/nio/ByteBuffer.allocate(I)Ljava/nio/ByteBuffer;`. Its helper
+`alloc_heap_bytebuffer` wrote `hb`, `offset`, `position`, `limit`, `capacity`,
+and `mark`, but never wrote inherited `Buffer.address`.
 
-Worktree: `/data/data/wt-valveconn-reverify` on the Azure host (branch
-`investigate/valveconn-reverify-20260709`), left in place. Repro Java files:
-`ServerOnlyProbe2.java`, `NioHttpProbe2.java`, `BufAddrProbe.java`,
-`rawclient.py`, `rawserver.py` in `/data/data/` on that host.
+The fix writes `ctx.set_field_by_name(buf, "address", Value::Long(16))` last,
+matching HotSpot's `ARRAY_BYTE_BASE_OFFSET + offset` for a fresh heap byte
+buffer. Writing it last is important because the synthetic compatibility slots
+can overlap the real-JDK `Buffer.address` field layout.
+
+`native-io/src/lib.rs::alloc_byte_buffer` now does the same for the bridge
+allocator, even though that path is not the default-release dispatch path, so
+future synthetic/bridge runs keep the same invariant.
+
+## Validation
+
+Validated in worktree
+`/data/data/cratonvm-worktrees/20260709-bytebuffer-address-aioobe-001` with a
+unique release target directory and unique probes:
+
+- `CARGO_TARGET_DIR=/data/data/target-bytebuffer-address-aioobe-20260709-001 cargo test -p cratonvm-native-builtins bytebuffer_allocate_initializes_real_address_for_bulk_copy -- --nocapture`
+- `CARGO_TARGET_DIR=/data/data/target-bytebuffer-address-aioobe-20260709-002 cargo test -p cratonvm-native-io allocated_heap_bytebuffer_sets_real_address -- --nocapture`
+- `CARGO_TARGET_DIR=/data/data/target-bytebuffer-address-aioobe-20260709-release cargo build --release --bin cratonvm`
+- `ServerOnlyAddressProbe20260709A` in `/data/data/bytebuffer-address-aioobe-serverprobe-20260709-001`: CratonVM accepted a localhost HTTP request, executed `SocketChannel.read(ByteBuffer.allocate(...))`, `flip()`, bulk `get(byte[])`, `clear()`, and returned `HTTP/1.1 200 OK` with body `OK`.
+
+Full workspace `cargo fmt --check` was not used as a gate because current `dev`
+already reports unrelated formatting drift in `jit/src/ir_lower.rs` and
+`vm/src/vm/vm_util.rs`.

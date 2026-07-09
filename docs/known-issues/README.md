@@ -23,7 +23,7 @@ deadlock, `CountDownLatch` ruled out, socket write-readiness path now the
 leading suspect) and the concrete next steps once the `EnumSet` blocker
 above is cleared.
 
-## 2026-07-09 AccessLogValve/RewriteValve re-verify: 1 severe regression FIXED, 2 new foundational bugs found (OPEN)
+## 2026-07-09 AccessLogValve/RewriteValve re-verify: 2 severe regressions FIXED, 1 new foundational bug found (OPEN)
 
 Re-verified `tomcat-08-07/accesslogvalve-rewritevalve-connection-failures.md`
 in isolation (`-Parallel 1`, idle Azure host) per its own recommendation.
@@ -36,14 +36,13 @@ surfaced three distinct, layered issues:
   Huge blast radius — anything doing `(HttpURLConnection)
   url.openConnection()` on a real-bytecode URL was broken. Fixed in
   `net_phase_e.rs`, verified byte-identical to HotSpot.
-- OPEN: [`bytebuffer-address-unset-aioobe.md`](tomcat-08-07/bytebuffer-address-unset-aioobe.md)
-  — `ByteBuffer.allocate()`'s synthetic carrier never sets
-  `Buffer.address`, so any bulk `get(byte[])`/`put(byte[])` throws
-  `ArrayIndexOutOfBoundsException` via `Unsafe.copyMemory` — breaks any
-  real-net-mode NIO server reading requests into a byte array (e.g.
-  Tomcat's `NioEndpoint`). Root-caused with a minimal repro; the actual
-  live dispatch site could not be located (two plausible fix locations
-  both proven dead code).
+- FIXED/RETIRED: [`bytebuffer-address-unset-aioobe.md`](../internal/tomcat-08-07/bytebuffer-address-unset-aioobe.md)
+  ? `ByteBuffer.allocate()`'s synthetic carrier did not set
+  `Buffer.address`, so any bulk `get(byte[])`/`put(byte[])` threw
+  `ArrayIndexOutOfBoundsException` via `Unsafe.copyMemory`. The live
+  default-release allocator is `native-builtins/src/lib.rs::alloc_heap_bytebuffer`;
+  it now seeds `address = 16`, and the socket-read/bulk-get repro returns
+  `HTTP/1.1 200 OK`.
 - OPEN: [`stringreader-read-never-advances-infinite-loop.md`](tomcat-08-07/stringreader-read-never-advances-infinite-loop.md)
   — `StringReader.read()` never advances position, infinite-looping any
   `BufferedReader`/`StringReader`-based text parser (e.g.
