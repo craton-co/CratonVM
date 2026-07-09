@@ -4,6 +4,10 @@ This folder collects CratonVM-only defects found while running upstream Java
 suites. The docs had grown to describe the **same underlying bug from several
 angles**; this index is the consolidated map. Read it first.
 
+## 2026-07-09 Spring suite genuine-bug list, updated (125, down from 159)
+
+- [`CRATONVM-SPRING-GENUINE-BUGLIST-125.md`](CRATONVM-SPRING-GENUINE-BUGLIST-125.md) — full per-test-method detail for 125 CratonVM-unique Spring failures (HotSpot passes, CratonVM doesn't), cross-referenced against a clean HotSpot baseline with the classpath-dump gap fixed (spring-websocket/oxm/jms/orm/core-test jars were never built — `./gradlew jar testFixturesJar testClasses` fixed it). Down from 159 two dev commits ago: 65 newly fixed (entire SpEL cluster + spring-jms module), 31 "newly broken" are **not** new regressions — root-caused to the already-tracked HIB-CV-32 batch/load-dependent heap-corruption family (25/31 SIGSEGV, one test confirmed passing standalone but ABEND under full-suite load).
+
 ## 2026-07-09 New: BC-java `asn1-regression` X9Test SIGSEGV (progresses past the retired StackOverflowError, still blocks the suite)
 
 - OPEN: [`bc-asn1-x9test-array-descriptor-of-checkcast-sigsegv.md`](bc-asn1-x9test-array-descriptor-of-checkcast-sigsegv.md) — found rerunning `org.bouncycastle.asn1.test.RegressionTest` after the `InputStream` super-read fix above landed. `PKCS12Test` now passes, but the suite crashes six tests later with a real `SIGSEGV` (native core dump, no Java exception) inside `array_descriptor_of` during `checkcast` handling in `X9Test`. gdb backtrace + a suspicious `r12 = i64::MIN` register value captured; not yet root-caused to a stale GC reference vs. an unrelated register.

@@ -1,0 +1,78 @@
+diff --git a/native-builtins/src/wildfly_undertow.rs b/native-builtins/src/wildfly_undertow.rs
+--- a/native-builtins/src/wildfly_undertow.rs
++++ b/native-builtins/src/wildfly_undertow.rs
+@@ -976,13 +976,17 @@ fn class_has_field(ctx: &dyn NativeContext, class_name: &str, field_name: &str)
+     ctx.resolve_field_index(class_name, field_name).is_some()
+ }
+ 
++fn exchange_uses_real_layout(ctx: &dyn NativeContext, this: ObjectRef, field_name: &str) -> bool {
++    class_has_field(ctx, CLS_EXCHANGE, field_name) && ctx.object_num_fields(this) > EX_NUM_SLOTS
++}
++
+ fn exchange_field_or_synthetic(
+     ctx: &dyn NativeContext,
+     this: ObjectRef,
+     field_name: &str,
+     synthetic_slot: usize,
+ ) -> Value {
+-    if class_has_field(ctx, CLS_EXCHANGE, field_name) {
++    if exchange_uses_real_layout(ctx, this, field_name) {
+         ctx.get_field_by_name(this, field_name)
+     } else {
+         ctx.get_field(this, synthetic_slot)
+@@ -1009,7 +1018,7 @@ fn exchange_header_map_or_create(
+     field_name: &str,
+     synthetic_slot: usize,
+ ) -> MethodCallResult {
+-    if class_has_field(ctx, CLS_EXCHANGE, field_name) {
++    if exchange_uses_real_layout(ctx, this, field_name) {
+         if let Value::Object(Some(map)) = ctx.get_field_by_name(this, field_name) {
+             return Ok(Some(Value::Object(Some(map))));
+         }
+@@ -1072,7 +1081,7 @@ fn native_exchange_set_status_code(
+ ) -> MethodCallResult {
+     let this = obj_arg(args, 0)?;
+     let status = args.get(1).and_then(|v| v.as_int()).unwrap_or(200);
+-    if class_has_field(ctx, CLS_EXCHANGE, "state") {
++    if exchange_uses_real_layout(ctx, this, "state") {
+         let state = ctx.get_field_by_name(this, "state").as_int().unwrap_or(0);
+         let next = (state & !UNDERTOW_RESPONSE_CODE_MASK) | (status & UNDERTOW_RESPONSE_CODE_MASK);
+         ctx.set_field_by_name(this, "state", Value::Int(next));
+@@ -1099,7 +1108,7 @@ fn native_exchange_get_response_sender(
+     let this = obj_arg(args, 0)?;
+     // If a sender hasn't been allocated yet, mint one whose field 0 points
+     // back to the exchange so `send()` can find the body slot.
+-    let existing = if class_has_field(ctx, CLS_EXCHANGE, "sender") {
++    let existing = if exchange_uses_real_layout(ctx, this, "sender") {
+         ctx.get_field_by_name(this, "sender")
+     } else {
+         ctx.get_field(this, EX_FIELD_RESPONSE_SENDER)
+@@ -1110,7 +1119,7 @@ fn native_exchange_get_response_sender(
+         _ => {
+             let sender = alloc_concurrent_synthetic(ctx, CLS_SENDER, 1);
+             ctx.set_field(sender, 0, Value::Object(Some(this)));
+-            if class_has_field(ctx, CLS_EXCHANGE, "sender") {
++            if exchange_uses_real_layout(ctx, this, "sender") {
+                 ctx.set_field_by_name(this, "sender", Value::Object(Some(sender)));
+             } else {
+                 ctx.set_field(this, EX_FIELD_RESPONSE_SENDER, Value::Object(Some(sender)));
+@@ -1134,5 +1143,5 @@ fn native_sender_send(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
+         // HeaderMap. Writing a body String there corrupts
+         // `closeAndFlushResponse()` into `String.put(HttpString, String)`.
+-        if !class_has_field(ctx, CLS_EXCHANGE, "responseHeaders") {
++        if !exchange_uses_real_layout(ctx, exchange, "responseHeaders") {
+             ctx.set_field(exchange, EX_FIELD_REQUEST_BODY, body_v);
+         }
+@@ -1185,7 +1194,11 @@ pub fn dispatch_handler(
+     match outcome {
+         Ok(r) => r,
+         Err(_payload) => {
+-            ctx.set_field(exchange, EX_FIELD_RESPONSE_STATUS, Value::Int(500));
++            if exchange_uses_real_layout(ctx, exchange, "state") {
++                ctx.set_field_by_name(exchange, "state", Value::Int(500));
++            } else {
++                ctx.set_field(exchange, EX_FIELD_RESPONSE_STATUS, Value::Int(500));
++            }
+             Ok(None)
+         }
+     }
