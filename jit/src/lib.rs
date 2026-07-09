@@ -7709,10 +7709,15 @@ mod tests {
             None, // cp_invokedynamic_descriptor_resolver: no indy in these test methods
         );
         assert!(c2.is_some(), "optimize=true (C2) must compile `get`");
+        let expected_ir_compiles = if cratonvm_types::compact_ref_fields_enabled() {
+            0
+        } else {
+            1
+        };
         assert_eq!(
             IR_LOWER_COMPILES.with(|c| c.get()),
-            1,
-            "an int getfield method must route through the IR pipeline"
+            expected_ir_compiles,
+            "compact field layout bails to single-pass; legacy layout routes int getfield through IR"
         );
 
         // Without the field resolver the builder cannot resolve the field, so

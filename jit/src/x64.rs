@@ -1404,6 +1404,11 @@ pub fn jit_scan(code: &[u8], code_len: usize, descriptor: &str) -> Option<JitSca
                 }
                 let cp_idx = ((code[pc + 1] as u16) << 8) | (code[pc + 2] as u16); // Widening: always safe
                 field_ops.push((pc, cp_idx));
+                // Default getfield codegen routes through the checked helper,
+                // which needs the hidden SharedVm pointer. Reserving the
+                // context slot is harmless when raw inlining is explicitly
+                // enabled.
+                needs_heap = true;
                 pc += 3;
             }
             // putfield — object field write. A reference-typed putfield
@@ -2119,6 +2124,17 @@ pub fn inline_putfield_enabled() -> bool {
     use std::sync::OnceLock;
     static G: OnceLock<bool> = OnceLock::new();
     *G.get_or_init(|| std::env::var_os("CRATONVM_JIT_INLINE_PUTFIELD").is_some())
+}
+
+/// Opt-IN inline `getfield` fast path (`CRATONVM_JIT_INLINE_GETFIELD`).
+///
+/// The raw inline path can only null-check the receiver before reading object
+/// headers/field cells. Default to the checked helper so stale or truncated
+/// receiver bits are validated against the live heap before any dereference.
+pub fn inline_getfield_enabled() -> bool {
+    use std::sync::OnceLock;
+    static G: OnceLock<bool> = OnceLock::new();
+    *G.get_or_init(|| std::env::var_os("CRATONVM_JIT_INLINE_GETFIELD").is_some())
 }
 
 /// Step 1 of `docs/feature-designs/precise-jit-maps-default.md` — opt-IN
@@ -7657,7 +7673,11 @@ impl Compiler {
         // has no paired reload). OSR entries zero both slots (clobber-free) so
         // the null-guards make those frames skip shadow tracking safely.
         let shadow_slots = if shadow_enabled { 3 } else { 0 };
-        let jit_thread_slots = if cache_jit_thread_for_inline_new { 1 } else { 0 };
+        let jit_thread_slots = if cache_jit_thread_for_inline_new {
+            1
+        } else {
+            0
+        };
         let extra_slots = (if needs_heap { 1 } else { 0 })
             + num_hoists
             + num_arith_hoists
@@ -7697,8 +7717,7 @@ impl Compiler {
         // slots when those gates are on, so the reserved slots never alias.
         let sp_id_slot_off: i32 = if precise_maps {
             // Cast: value to i32 (encoding immediate/displacement)
-            (total_locals as i32 - shadow_slots as i32 - jit_thread_slots as i32)
-                .saturating_mul(8)
+            (total_locals as i32 - shadow_slots as i32 - jit_thread_slots as i32).saturating_mul(8)
         } else {
             0
         };
@@ -14203,8 +14222,9 @@ impl Compiler {
                         site.field_info.iter().find(|(p, _, _)| *p == cpc).copied()
                     {
                         let obj_slot = self.pop_stack();
-                        self.load_slot_to_reg(ARG_REGS[0], obj_slot);
-                        self.emit_mov_imm32_sx(ARG_REGS[1], field_index as i32); // Cast: x86-64 immediate encoding
+                        self.emit_load_local(ARG_REGS[0], self.heap_local_offset);
+                        self.load_slot_to_reg(ARG_REGS[1], obj_slot);
+                        self.emit_mov_imm32_sx(ARG_REGS[2], field_index as i32); // Cast: x86-64 immediate encoding
                         self.emit_call_absolute(self.helpers.getfield);
                         self.push_from_rax();
                     } else {
@@ -19358,7 +19378,7 @@ impl Compiler {
                     } else if let Some(&(c_off, c_is_ref)) = self
                         .compact_field_off
                         .get(&pc)
-                        .filter(|_| std::env::var_os("DISABLE_INLINE_GETFIELD").is_none())
+                        .filter(|_| inline_getfield_enabled())
                     {
                         if std::env::var_os("CRATONVM_DBG_COMPACT_INLINE").is_some() {
                             eprintln!(
@@ -19496,7 +19516,7 @@ impl Compiler {
                     } else if let Some(&info_idx) = self
                         .field_info_idx
                         .get(&pc)
-                        .filter(|_| std::env::var_os("DISABLE_INLINE_GETFIELD").is_none())
+                        .filter(|_| inline_getfield_enabled())
                         // Compact layout: a reference field is an 8-byte pointer
                         // and a primitive field sits at a packed offset, so the
                         // baked `HEADER + index*SLOT_SIZE` 16-byte-cell load is
@@ -19586,13 +19606,30 @@ impl Compiler {
                             self.mark_top_as_oop();
                         }
                         pc += 3;
+                    } else if let Some(&info_idx) = self.field_info_idx.get(&pc) {
+                        // Statically resolved field, but the raw inline path
+                        // is disabled. Route through the checked helper while
+                        // preserving the resolved slot index and oop marking.
+                        let (_, field_index, type_tag) = self.field_info[info_idx];
+                        self.flush_scratch_registers();
+                        let obj_slot = self.pop_stack();
+                        self.emit_load_local(ARG_REGS[0], self.heap_local_offset);
+                        self.load_slot_to_reg(ARG_REGS[1], obj_slot);
+                        self.emit_mov_imm32_sx(ARG_REGS[2], field_index as i32);
+                        self.emit_call_absolute(self.helpers.getfield);
+                        self.push_from_rax();
+                        if type_tag == b'L' || type_tag == b'[' {
+                            self.mark_top_as_oop();
+                        }
+                        pc += 3;
                     } else {
                         // No statically-resolved field metadata for this
                         // getfield PC — fall back to the runtime helper.
                         self.flush_scratch_registers();
                         let obj_slot = self.pop_stack();
-                        self.load_slot_to_reg(ARG_REGS[0], obj_slot);
-                        self.emit_mov_imm32_sx(ARG_REGS[1], 0); // Cast: x86-64 immediate encoding
+                        self.emit_load_local(ARG_REGS[0], self.heap_local_offset);
+                        self.load_slot_to_reg(ARG_REGS[1], obj_slot);
+                        self.emit_mov_imm32_sx(ARG_REGS[2], 0); // Cast: x86-64 immediate encoding
                         self.emit_call_absolute(self.helpers.getfield);
                         self.push_from_rax();
                         pc += 3;
@@ -25944,7 +25981,7 @@ mod tests {
 
     // SAFETY: Called from JIT-compiled code which passes a valid heap-allocated object pointer
     // and a field index that is bounds-checked within the function body before any dereference.
-    unsafe extern "C" fn stub_getfield(obj_ptr: i64, field_index: i64) -> i64 {
+    unsafe extern "C" fn stub_getfield(_vm_ptr: i64, obj_ptr: i64, field_index: i64) -> i64 {
         if obj_ptr == 0 {
             return 0;
         }
@@ -26667,7 +26704,10 @@ mod tests {
         // getfield (0xb4) is now JIT-compatible
         let code: Vec<u8> = vec![0x2a, 0xb4, 0x00, 0x01, 0xac, 0, 0];
         let result = jit_scan(&code, 5, "(Ljava/lang/Object;)I").unwrap();
-        assert!(!result.needs_heap); // getfield doesn't need heap
+        assert!(
+            result.needs_heap,
+            "default checked getfield helper needs the hidden VM pointer"
+        );
         assert_eq!(result.field_ops.len(), 1);
         assert_eq!(result.field_ops[0], (1, 1)); // pc=1, cp_idx=1
 
@@ -30067,7 +30107,7 @@ mod tests {
             heap.set_field(obj, 0, Value::Int(v));
             // Helper reference result.
             // SAFETY: obj is a live heap object with field index 0 in bounds.
-            let helper = unsafe { stub_getfield(obj.as_ptr() as i64, 0) };
+            let helper = unsafe { stub_getfield(0, obj.as_ptr() as i64, 0) };
             // SAFETY: executing JIT-compiled machine code produced from valid bytecode.
             let inline = unsafe {
                 compiled

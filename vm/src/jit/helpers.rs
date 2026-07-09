@@ -2594,10 +2594,14 @@ unsafe fn jit_field_cell_ptr(obj_ptr: i64, field_index: i64) -> *mut u8 {
     (obj_ptr as *mut u8).add(HEADER_SIZE + off)
 }
 
-// SAFETY: Called from JIT-compiled code. obj_ptr must be 0 (null) or a valid heap pointer
-// to a live object. field_index is the resolved field slot index within the object layout.
-// ptr::read is used because Value may contain non-Copy variants (ObjectRef).
-pub unsafe extern "C" fn jit_getfield(obj_ptr: i64, field_index: i64) -> i64 {
+// SAFETY: Called from JIT-compiled code. vm_ptr must be a valid SharedVm pointer.
+// obj_ptr may be 0 (null), a valid heap pointer, or stale/corrupt raw bits from
+// a miscompiled JIT frame; this helper validates it against the live heap before
+// reading any object header. field_index is the resolved field slot index within
+// the object layout. ptr::read is used because Value may contain non-Copy
+// variants (ObjectRef).
+#[allow(clippy::not_unsafe_ptr_arg_deref)]
+pub unsafe extern "C" fn jit_getfield(vm_ptr: i64, obj_ptr: i64, field_index: i64) -> i64 {
     // WS1: Rust<->JIT boundary — invalidate the per-thread JIT-scan cache
     // (see conservative_roots::note_jit_boundary).
     crate::jit::conservative_roots::note_jit_boundary();
@@ -2614,6 +2618,11 @@ pub unsafe extern "C" fn jit_getfield(obj_ptr: i64, field_index: i64) -> i64 {
         // Flag the pending NPE (drained on every JIT method return — see
         // `take_jit_pending_npe` in runtime/interpreter.rs) and return the
         // `i64::MIN` deopt sentinel, mirroring `jit_arraylength`.
+        set_jit_pending_npe();
+        return i64::MIN;
+    }
+    let vm = &*(vm_ptr as *const SharedVm);
+    if vm.heap.is_object_address(obj_ptr as usize).is_none() {
         set_jit_pending_npe();
         return i64::MIN;
     }
@@ -5857,7 +5866,7 @@ mod tests {
         // deopt sentinel, mirroring `jit_arraylength`.
         let _ = take_jit_pending_npe(); // clear any prior state
                                         // SAFETY: obj_ptr is 0 (null), so the function returns early without dereferencing.
-        let result = unsafe { jit_getfield(0, 0) };
+        let result = unsafe { jit_getfield(0, 0, 0) };
         assert_eq!(
             result,
             i64::MIN,
@@ -5882,27 +5891,54 @@ mod tests {
         use crate::vm::SharedVm;
         let _ = take_jit_pending_npe();
         let vm_box: Box<SharedVm> = Box::new(SharedVm::new(VmConfig::default()));
+        let vm_ptr = (&*vm_box as *const SharedVm) as i64;
         // Object with exactly 2 reference fields (num_slots == 2).
         let obj = vm_box.heap.alloc_object(ClassId::new(0), 2);
         let obj_ptr = obj.as_ptr() as i64;
         // SAFETY: obj_ptr is a live 2-field object; slot indices 2 and 5 are
         // out of range so the helper takes the bounds-check arm and never
         // dereferences past the object. A negative index is likewise rejected.
-        let oob_hi = unsafe { jit_getfield(obj_ptr, 2) };
+        let oob_hi = unsafe { jit_getfield(vm_ptr, obj_ptr, 2) };
         assert_eq!(
             oob_hi, 0,
             "getfield on an out-of-range slot must not read OOB"
         );
         // SAFETY: `obj_ptr` is a valid test object header built above; `jit_getfield`
         // bounds-checks the slot index and returns 0 rather than reading OOB.
-        let oob_far = unsafe { jit_getfield(obj_ptr, 5) };
+        let oob_far = unsafe { jit_getfield(vm_ptr, obj_ptr, 5) };
         assert_eq!(oob_far, 0, "getfield far past num_slots must not read OOB");
-        let oob_neg = unsafe { jit_getfield(obj_ptr, -1) };
+        let oob_neg = unsafe { jit_getfield(vm_ptr, obj_ptr, -1) };
         assert_eq!(oob_neg, 0, "getfield on a negative slot must not read OOB");
         assert!(
             !take_jit_pending_npe(),
             "an in-range receiver with an OOB slot must not raise NPE"
         );
+    }
+
+    #[test]
+    fn jit_getfield_rejects_pointer_shaped_non_heap_receiver() {
+        use crate::config::VmConfig;
+        use crate::vm::SharedVm;
+
+        let _ = take_jit_pending_npe();
+        let vm_box: Box<SharedVm> = Box::new(SharedVm::new(VmConfig::default()));
+        let vm_ptr = (&*vm_box as *const SharedVm) as i64;
+        // Aligned, above the null guard, and below 47 bits: it passes the
+        // context-free plausibility filter, but it is not a heap address in
+        // this VM. This is the Tomcat rc=139 shape where generated code had
+        // stale/truncated receiver bits before getfield.
+        let mut bad_receiver = 0x1000_i64;
+        while vm_box
+            .heap
+            .is_object_address(bad_receiver as usize)
+            .is_some()
+        {
+            bad_receiver += 0x1000;
+        }
+        assert!(cratonvm_types::plausible_heap_pointer(bad_receiver as u64));
+        let result = unsafe { jit_getfield(vm_ptr, bad_receiver, 0) };
+        assert_eq!(result, i64::MIN);
+        assert!(take_jit_pending_npe());
     }
 
     #[test]
@@ -5913,12 +5949,13 @@ mod tests {
         use crate::vm::SharedVm;
         let _ = take_jit_pending_npe();
         let vm_box: Box<SharedVm> = Box::new(SharedVm::new(VmConfig::default()));
+        let vm_ptr = (&*vm_box as *const SharedVm) as i64;
         let obj = vm_box.heap.alloc_object(ClassId::new(0), 2);
         // Write via the interpreter path (the helper read must observe it).
         vm_box.heap.set_field(obj, 1, Value::Int(0x5A5A));
         let obj_ptr = obj.as_ptr() as i64;
         // SAFETY: obj_ptr is a live 2-field object; slot 1 is in bounds.
-        let v = unsafe { jit_getfield(obj_ptr, 1) };
+        let v = unsafe { jit_getfield(vm_ptr, obj_ptr, 1) };
         assert_eq!(
             v, 0x5A5A,
             "in-bounds getfield must read back the stored value"
@@ -5945,6 +5982,7 @@ mod tests {
         use std::sync::Arc;
 
         let vm_box: Arc<SharedVm> = Arc::new(SharedVm::new(VmConfig::default()));
+        let vm_ptr = Arc::as_ptr(&vm_box) as i64;
         let obj = vm_box.heap.alloc_object(ClassId::new(0), 1);
         let obj_ptr = obj.as_ptr() as i64;
 
@@ -5980,7 +6018,7 @@ mod tests {
                 while !stop.load(Ordering::Acquire) {
                     // SAFETY: obj_ptr is a live, single-field object; slot 0
                     // is in bounds.
-                    let v = unsafe { jit_getfield(obj_ptr, 0) } as i32;
+                    let v = unsafe { jit_getfield(vm_ptr, obj_ptr, 0) } as i32;
                     if v == A {
                         seen_a += 1;
                     } else if v == B {
