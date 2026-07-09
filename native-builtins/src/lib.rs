@@ -50640,8 +50640,9 @@ fn native_uri_get_scheme_specific_part(
         _ => String::new(),
     };
     let ssp = if let Some(pos) = full.find(':') {
-        full[pos + 1..].to_string()
+        full[pos + 1..].split('#').next().unwrap_or("").to_string()
     } else {
+        // Preserve the old fallback for scheme-less synthetic URIs.
         full
     };
     Ok(Some(Value::Object(Some(ctx.create_string(&ssp)))))
@@ -51068,7 +51069,8 @@ pub(crate) fn uri_store_named(ctx: &mut dyn NativeContext, this: ObjectRef, full
     ctx.set_field_by_name(this, "string", Value::Object(Some(full_obj)));
     if let Some(colon) = full.find(':') {
         let scheme = &full[..colon];
-        let ssp = &full[colon + 1..];
+        let raw_ssp = &full[colon + 1..];
+        let ssp = raw_ssp.split('#').next().unwrap_or(raw_ssp);
         if !scheme.is_empty() {
             let scheme_obj = ctx.create_string(scheme);
             ctx.set_field_by_name(this, "scheme", Value::Object(Some(scheme_obj)));
