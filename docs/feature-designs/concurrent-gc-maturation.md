@@ -1,28 +1,25 @@
-# Concurrent GC Maturation: G1 from gated scaffolding to a gauntlet-validated, selectable collector
+# Concurrent GC Maturation: G1 validation plus selectable ZGC-real backend
 
-Status: design + scaffold plan. Target branch: `design-concurrent-gc`.
+Status: implementation progress + remaining validation plan. Target branch: `design-concurrent-gc`.
 Author note: this doc is grounded in a read of `gc/src/{g1,g1_concurrent,zgc,zgc_concurrent,concurrent_mark,satb,vm_heap}.rs`,
 `vm/src/config.rs`, `vm/src/vm/vm_init.rs`, `vm/src/runtime/interpreter.rs`, and
 `docs/internal/reviews/full-review-2026-06-20.md` (findings #18, the `gc-collectors` section, and the docs-governance row).
 
 ### Implementation progress
 
-- **Step 1 (CLI flag wiring) — DONE** (branch `feat/g1-cli-flag`). `-XX:+UseG1GC`
-  now selects the G1 backend; `-XX:-UseG1GC` reverts to Generational; any other
-  `-XX:+Use*GC` (Serial/Parallel/Z/Shenandoah/Epsilon) warns and falls back to
-  Generational (lenient-with-warning, §3.1). Generational remains the default —
-  G1 is opt-in. Implementation: `parse_gc_algorithm()` in `vm/src/config.rs`;
-  `-XX:+Use<name>GC` → `--XX:UseGc <name>` rewrite + `gc_selector` clap field +
-  config-apply in `vm-cli/src/main.rs`. Unit-tested (parser + normalize +
-  full-pipeline + last-wins). The existing `vm_init.rs` `GcAlgorithm`→`GcBackend`
-  map and `-XX:+PrintFlagsFinal` collector string already reflect the selection
-  truthfully. Still open within §3.1.3: JMX `GarbageCollectorMXBean` names
-  ("G1 Young/Old Generation").
-- **Step 2 (doc truth-up) — DONE** (branch `feat/g1-cli-flag`). Reconciled the
-  docs-governance gap now that G1 is selectable: `README.md` (feature bullet +
-  crate-tree line), `CONTRIBUTING.md` (the `gc` crate row dropped "no G1"), and
-  `ARCHITECTURE.md` (Generational = default safety net, G1 = opt-in via
-  `-XX:+UseG1GC`, ZGC = simulation + a built-but-undispatched `ZgcRealHeap`).
+- **Step 1 (CLI flag wiring) - DONE** (branch `feat/g1-cli-flag`, updated by `codex/zgc-feature-concurrent-maturation-20260709`). `-XX:+UseG1GC`
+  now selects the G1 backend; `-XX:-UseG1GC` reverts to Generational; `-XX:+UseZGC`
+  now selects the memory-backed `ZgcRealHeap` backend. Other `-XX:+Use*GC`
+  selectors (Serial/Parallel/Shenandoah/Epsilon) warn and fall back to Generational
+  (lenient-with-warning, section 3.1). Generational remains the default. Implementation:
+  `parse_gc_algorithm()` in `vm/src/config.rs`; `-XX:+Use<name>GC` -> `--XX:UseGc <name>`
+  rewrite + `gc_selector` clap field + config-apply in `vm-cli/src/main.rs`; `GcAlgorithm`
+  -> `GcBackend` mapping and `PrintFlagsFinal` strings in `vm/src/vm/vm_init.rs`.
+- **Step 2 (doc truth-up) - DONE** (branch `feat/g1-cli-flag`, updated by `codex/zgc-feature-concurrent-maturation-20260709`). Reconciled the
+  docs-governance gap now that G1 and ZGC-real are selectable: Generational remains the
+  default safety net, G1 is opt-in via `-XX:+UseG1GC`, and ZGC-real is opt-in via
+  `-XX:+UseZGC`. The simulation-only colored-pointer ZGC scaffolding remains explicitly
+  non-production and separate from the selectable real heap.
 - **Step 3 (SATB drain enforcement, finding #18) — G1 path DONE** (branch
   `feat/g1-cli-flag`). The per-thread SATB buffer registry + collector-side
   `flush_all_thread_satb_buffers` already existed (and are wired into
@@ -638,44 +635,38 @@ e2e on real Java bytecode. Those are **long-lived server workloads** with multi-
 where HotSpot's default is G1 and the operationally relevant metrics are *pause time* and
 *throughput under sustained allocation*, not just correctness on a short program.
 
-Two collectors beyond Generational already exist in-tree but neither is a selectable, validated
-backend:
+Two collectors beyond Generational now exist in-tree with different maturity profiles:
 
-- **G1** (`gc/src/g1.rs`, 5362 LOC) is substantially built: region-based heap, young/mixed/full
-  collection drivers, SATB concurrent marking with a real background worker thread
-  (`g1_concurrent.rs`), IHOP triggering, humongous allocation, remembered sets, region pinning,
-  and string dedup config. It **is** wired into the `VmHeap` dispatch enum and into the
-  interpreter safepoint path. But it is **not reachable from the command line** and has not been
-  run against the gauntlet.
+- **G1** (`gc/src/g1.rs`, 5362 LOC) is substantially built and selectable: region-based heap,
+  young/mixed/full collection drivers, SATB concurrent marking with a real background worker
+  thread (`g1_concurrent.rs`), IHOP triggering, humongous allocation, remembered sets, region
+  pinning, and string dedup config. It is wired into `VmHeap`, VM safepoints, and
+  `-XX:+UseG1GC`; remaining work is gauntlet validation and pause/throughput hardening.
 - **ZGC** (`gc/src/zgc.rs`) is split into an honest **simulation** (`ZgcCollector`/`ZgcHeap`,
   metadata-only, no backing storage, emits a one-time `warn_zgc_simulation_selected()`) and a
-  real STW mark-sweep (`ZgcRealHeap`). The simulation cannot hold Java objects; `ZgcRealHeap` is
-  real but non-moving, does no reference processing, and — critically — **is not in the
-  `GcBackend` dispatch enum at all** (`vm_heap.rs` only has `Generational` and `G1`).
+  real STW mark-sweep (`ZgcRealHeap`). `ZgcRealHeap` is now wired as `GcBackend::Zgc` /
+  `VmHeap::Zgc` and is selectable with `-XX:+UseZGC`. It is deliberately non-moving and
+  stop-the-world; the low-latency colored-pointer/load-barrier implementation remains future work.
 
-The result is a **maturity/perception gap**: `ARCHITECTURE.md` claims "full G1+ZGC" while
-`README.md:236` and `CONTRIBUTING.md:66` say "no G1, experimental zgc stub" (full-review
-docs-governance row). Neither is right: G1 is ~80% built but unselectable; ZGC-real is built but
-undispatched.
+The command-line/backend truth now matches the code; the remaining gap is validation depth and how
+honestly each collector is described.
 
 **This design picks G1 as the maturation target** and lays out the path to make
 `-XX:+UseG1GC` a real, gauntlet-validated, selectable collector with HotSpot-comparable pause and
 throughput behaviour on server apps.
 
-### Why G1 over ZGC first
+### Why G1 over production low-latency ZGC first
 
-- G1 is already integrated end-to-end (dispatch + safepoint driver); ZGC-real is not even in the
-  enum and the colored-pointer/load-barrier machinery that makes ZGC *low-latency* is an explicit
-  simulation (`zgc.rs` module docs). Maturing ZGC means building real multi-mapped colored-pointer
-  address space + an atomic CAS load barrier — a much larger, riskier effort.
-- G1 is HotSpot's default; matching the *default* collector behaviour is the highest-value target
-  for gauntlet credibility and for differential comparison against `java`.
+- G1 remains the gauntlet-maturation target because it is HotSpot's default and is already the
+  collector most app-server workloads expect operationally.
+- ZGC-real is now selectable, which closes the backend reachability gap, but it is intentionally a
+  stop-the-world non-moving collector. Maturing production ZGC still means real colored pointers,
+  an atomic load barrier, and concurrent relocation/compaction.
 - G1's barriers (SATB pre-barrier + RSet post-barrier) already exist and are exercised; the work
   is hardening + validation, not green-field.
 
-ZGC-real maturation is tracked as a **follow-up** (see §8). The scaffolding in this doc
-(`GcBackend` plumbing, CLI flag parsing, validation harness) is deliberately collector-agnostic so
-ZGC reuses it.
+ZGC-real now reuses the collector-agnostic CLI/config/backend plumbing from this design. Production
+low-latency ZGC remains tracked as follow-up work in section 8.
 
 ---
 
@@ -683,36 +674,20 @@ ZGC reuses it.
 
 ### 2.1 Backend selection plumbing
 
-- `vm/src/config.rs:8` — `enum GcAlgorithm { Generational, G1 }`. **No ZGC, Parallel, Serial, or
-  Shenandoah variants.** `VmConfig::gc_algorithm` field at `config.rs:82`, defaulting to
-  `GcAlgorithm::Generational` at `config.rs:330`.
-- `vm/src/vm/vm_init.rs:989-993` — the *only* place `GcAlgorithm` is mapped to a `GcBackend`:
-  ```
-  let gc_backend = match config.gc_algorithm {
-      GcAlgorithm::Generational => GcBackend::Generational,
-      GcAlgorithm::G1          => GcBackend::G1,
-  };
-  let heap = VmHeap::new(gc_backend, config.max_heap_size);
-  ```
-- `gc/src/vm_heap.rs:62` — `enum GcBackend { Generational, G1 }`. `VmHeap` (line 178) is
-  `enum { Generational(GenerationalHeap), G1(G1State) }`. **`ZgcRealHeap` is NOT a `VmHeap`
-  variant and NOT a `GcBackend` variant** — the key gap for ZGC. `VmHeap::new` (line 199) scales
-  G1 region size to 2 MB for heaps > 4 GB.
+- `vm/src/config.rs` - `enum GcAlgorithm { Generational, G1, Zgc }` when the `zgc`
+  feature is enabled. `parse_gc_algorithm` accepts `g1`, `generational`, `z`, and `zgc`.
+- `vm/src/vm/vm_init.rs` - `GcAlgorithm` maps to `GcBackend::{Generational,G1,Zgc}`;
+  `PrintFlagsFinal` reports `UseGenerationalGC`, `UseG1GC`, or `UseZGC` truthfully.
+- `gc/src/vm_heap.rs` - `GcBackend::Zgc` and `VmHeap::Zgc(ZgcRealHeap)` are wired under
+  the `zgc` feature. Core allocation, field/array access, GC, address validation, stats, and heap
+  walking dispatch to `ZgcRealHeap`; G1/generational-only helpers return neutral no-op values on
+  ZGC.
 
-### 2.2 The CLI gap (G1 is unselectable today)
+### 2.2 CLI selection status
 
-A repo-wide grep for `UseG1GC` / `gc_algorithm =` / `GcAlgorithm::G1` shows **no argument-parse
-path that sets `gc_algorithm` to `G1`**:
-
-- `vm_init.rs:5024` and `serviceability.rs:332,418` only *emit* the string `"-XX:+UseG1GC"` (in
-  diagnostic / `-XX:+PrintFlagsFinal`-style output and a sample command line).
-- `config.rs:330` hard-defaults to `Generational`.
-- There is no `-XX:+UseG1GC` → `config.gc_algorithm = GcAlgorithm::G1` assignment in the launcher
-  argument handling.
-
-So G1 is implemented and dispatched but **only reachable via constructing `VmConfig`
-programmatically** (e.g. the test at `interpreter.rs:23547` builds `GcBackend::G1` directly). This
-is the single most important "scaffolding to land first" item (§7): wire the flag.
+`-XX:+UseG1GC` and `-XX:+UseZGC` now survive the launcher normalization pipeline and land in
+`Args::gc_selector`; config-apply validates them through `parse_gc_algorithm` and selects the
+matching backend. Unsupported `Use*GC` selectors still warn and fall back to Generational.
 
 ### 2.3 G1 collector internals (`gc/src/g1.rs`)
 
@@ -776,16 +751,16 @@ is the single most important "scaffolding to land first" item (§7): wire the fl
     the initiator flushes in `g1_concurrent_mark_cycle`), but this is **not verified** and not
     covered by a multi-mutator test. Maturing G1 must close this.
 
-### 2.7 ZGC (for completeness / why it's deferred)
+### 2.7 ZGC
 
-- `gc/src/zgc.rs` module docs are unusually honest: the `ColoredPointer`/`LoadBarrier`/`ZPage`/
-  `ZgcCollector`/`GenerationalZgc` machinery is an **explicit simulation** (synthetic `u64`
-  addresses, no `*mut u8`, no byte-copy relocation, non-atomic `&mut self` "barrier", no pause
-  benefit). `ZgcRealHeap` (line 1563 `impl GarbageCollector for ZgcRealHeap`) is a **real,
-  memory-backed STW mark-sweep** but: non-moving (no compaction), and **no weak/soft/phantom
-  reference processing** (full-review `gc-collectors` row, `zgc.rs:1744-1828`).
-- `g1_concurrent.rs:57-65` and `zgc_concurrent.rs` note the controller API is intentionally narrow
-  so ZGC can reuse it once it moves off the simulation.
+- `gc/src/zgc.rs` module docs remain explicit that `ColoredPointer`/`LoadBarrier`/`ZPage`/
+  `ZgcCollector`/`GenerationalZgc` are simulations: synthetic addresses, no object backing storage,
+  no byte-copy relocation, and no production load barrier.
+- `ZgcRealHeap` is the selectable backend behind `-XX:+UseZGC`. It is memory-backed and runs a
+  real stop-the-world mark-sweep with shared reference processing. It does not compact and does
+  not provide ZGC's low-latency concurrent relocation guarantees.
+- `zgc_concurrent.rs` remains scaffold for future convergence once a production colored-pointer
+  implementation exists.
 
 ### 2.8 Other full-review GC findings relevant to maturation
 
@@ -1006,9 +981,7 @@ pause within band, throughput within margin, soak clean.
 - **Default-flip blast radius.** Flipping the default to G1 changes behaviour for every app and
   every existing test that assumes Generational. Step 10 must be its own change with a full suite
   re-run, not bundled.
-- **ZGC scope.** Deferred — but the simulation vs `ZgcRealHeap` split, and `ZgcRealHeap`'s absence
-  from `GcBackend`, mean "ship ZGC" is a separate, larger project (real colored pointers + load
-  barrier). This doc deliberately does not attempt it.
+- **ZGC scope.** `ZgcRealHeap` is selectable now, but production low-latency ZGC remains a separate, larger project: real colored pointers, an atomic load barrier, concurrent relocation, and compaction. This doc deliberately treats that as future work.
 
 ---
 
@@ -1017,14 +990,12 @@ pause within band, throughput within margin, soak clean.
 These are the smallest, build-green pieces that unblock everything else. Described here; landed in
 their own steps (§4). None require risky GC-internal surgery.
 
-1. **`-XX:+UseG1GC` / `-XX:-UseG1GC` argument parsing** → `VmConfig.gc_algorithm`. The `GcAlgorithm`
-   enum and the `vm_init.rs:989` mapping already exist; this is purely the missing *parse* edge.
-   Add a small `parse_gc_algorithm(&str) -> Option<GcAlgorithm>` helper + a warn-and-fallback for
-   unrecognized `Use*GC` flags. (Unit-testable with zero GC behaviour change.)
-2. **A `GcBackend::Zgc` placeholder is intentionally NOT added yet** — adding it would require a
-   `VmHeap::Zgc(ZgcRealHeap)` variant and dispatch arms across `vm_heap.rs`, which is the ZGC
-   follow-up's first scaffold, not G1's. Documented here so the omission is deliberate, not an
-   oversight: the `GcBackend` enum is the seam where ZGC plugs in later.
+1. **`-XX:+UseG1GC` / `-XX:-UseG1GC` / `-XX:+UseZGC` argument parsing** -> `VmConfig.gc_algorithm`.
+   This is landed: `parse_gc_algorithm(&str)` accepts G1, ZGC, and Generational selectors; unknown
+   `Use*GC` flags warn and fall back to Generational.
+2. **`GcBackend::Zgc` is now real plumbing, not a placeholder.** The `zgc` feature adds
+   `VmHeap::Zgc(ZgcRealHeap)` plus dispatch arms across `vm_heap.rs`, and the CLI selects it with
+   `-XX:+UseZGC`. The remaining ZGC work is production low-latency semantics, not backend reachability.
 3. **SATB thread-buffer registry type** (inert stub first): a `pub struct SatbBufferRegistry` with
    `register(thread_id)` / `drain_all() -> Vec<usize>` that is a no-op/empty until step 3 populates
    it. Lets the remark path call `drain_all()` unconditionally and compile, with behaviour added
@@ -1049,10 +1020,9 @@ their own steps (§4). None require risky GC-internal surgery.
 
 ## 8. Follow-ups (explicitly out of scope here)
 
-- **ZGC-real as a selectable backend:** add `GcBackend::Zgc` + `VmHeap::Zgc(ZgcRealHeap)` dispatch,
-  wire `ReferenceProcessor` into `ZgcRealHeap::collect_garbage` (currently absent,
-  `zgc.rs:1744-1828`), then the real low-latency work (multi-mapped colored pointers, atomic CAS
-  load barrier, concurrent relocation/compaction) — a major separate feature.
+- **Production low-latency ZGC:** `ZgcRealHeap` is selectable and reference-processing aware.
+  Remaining work is the real ZGC design: multi-mapped colored pointers, atomic CAS load barrier,
+  concurrent relocation/compaction, and validation under app workloads.
 - **G1 + compact object headers:** blocked on the `CompactHeader` 8 GB forwarding-pointer
   truncation fix (full-review `gc-heap`/`gc-collectors`).
 - **Parallel evacuation throughput** (step 9) graduating to default-on.

@@ -10,6 +10,9 @@ pub enum GcAlgorithm {
     Generational,
     /// G1 (Garbage-First) region-based collector.
     G1,
+    /// ZGC-real backend: a memory-backed stop-the-world mark-sweep collector.
+    #[cfg(feature = "zgc")]
+    Zgc,
 }
 
 /// Map a garbage-collector selector name to a supported [`GcAlgorithm`].
@@ -22,7 +25,10 @@ pub enum GcAlgorithm {
 /// - `Some(GcAlgorithm::G1)` for `g1`,
 /// - `Some(GcAlgorithm::Generational)` for `generational`,
 /// - `None` for collectors CratonVM does not implement (`Serial`, `Parallel`,
-///   `Z`, `Shenandoah`, `Epsilon`) or any unrecognized name.
+///   `Shenandoah`, `Epsilon`) or any unrecognized name.
+///
+/// When the `zgc` cargo feature is enabled, `z` and `zgc` also map to the
+/// memory-backed [`GcAlgorithm::Zgc`] backend.
 ///
 /// On `None` the launcher warns and falls back to the default `Generational`
 /// collector. HotSpot instead errors on an unknown `-XX:+Use*GC`; CratonVM is
@@ -32,6 +38,8 @@ pub fn parse_gc_algorithm(name: &str) -> Option<GcAlgorithm> {
     match name.trim().to_ascii_lowercase().as_str() {
         "g1" => Some(GcAlgorithm::G1),
         "generational" => Some(GcAlgorithm::Generational),
+        #[cfg(feature = "zgc")]
+        "z" | "zgc" => Some(GcAlgorithm::Zgc),
         _ => None,
     }
 }
@@ -995,6 +1003,12 @@ mod tests {
     fn parse_gc_algorithm_supported() {
         assert_eq!(parse_gc_algorithm("g1"), Some(GcAlgorithm::G1));
         assert_eq!(parse_gc_algorithm("G1"), Some(GcAlgorithm::G1));
+        #[cfg(feature = "zgc")]
+        {
+            assert_eq!(parse_gc_algorithm("Z"), Some(GcAlgorithm::Zgc));
+            assert_eq!(parse_gc_algorithm("ZGC"), Some(GcAlgorithm::Zgc));
+            assert_eq!(parse_gc_algorithm("  zGc  "), Some(GcAlgorithm::Zgc));
+        }
         assert_eq!(
             parse_gc_algorithm("Generational"),
             Some(GcAlgorithm::Generational)
@@ -1010,7 +1024,7 @@ mod tests {
     fn parse_gc_algorithm_unsupported_is_none() {
         // Known HotSpot collectors CratonVM does not implement → None so the
         // launcher warns and falls back to Generational.
-        for name in ["Serial", "Parallel", "Z", "Shenandoah", "Epsilon"] {
+        for name in ["Serial", "Parallel", "Shenandoah", "Epsilon"] {
             assert_eq!(
                 parse_gc_algorithm(name),
                 None,
