@@ -4,6 +4,10 @@ This folder collects CratonVM-only defects found while running upstream Java
 suites. The docs had grown to describe the **same underlying bug from several
 angles**; this index is the consolidated map. Read it first.
 
+## 2026-07-08 New: `JettyClientHttpRequestFactoryTests` NPE (third distinct bug on this class)
+
+- OPEN: [`jetty-clienthttprequestfactory-httpexchange-getrequest-npe.md`](jetty-clienthttprequestfactory-httpexchange-getrequest-npe.md) — `HttpExchange.getRequest()` NPE on a null `exchange`, 5 test methods. Found triaging a fresh-dev Spring non-passed rerun on Azure. Distinct from this class's two other already-fixed/tracked bugs (`StackOverflowError` dispatch cycle, NIO selector gap).
+
 ## 2026-07-08 NIO selected-key `ClassCastException` retired
 
 - FIXED/RETIRED: [Tribes `ParallelNioSender` selected-key `ClassCastException`](../internal/fixed-suite-bugs/nio-selectionkey-classcastexception-tribes-sender-FIXED.md) - the remaining two-key `Selector.selectedKeys().iterator().next()/remove()` GC-stress crash was in native collection map/set helpers, not the selector side table. `HashMap.put`/`remove` now pin their inner receiver/key/value windows, `HashSet.iterator()` pins its receiver/snapshot backing before allocation, and the focused two-`SelectionKey` fixture passes under `CRATONVM_GC_STRESS`.
@@ -18,16 +22,18 @@ angles**; this index is the consolidated map. Read it first.
 
 Found triaging FAIL results from a 516-class Spring non-passed rerun (filtered
 out ~250 environmental classpath-dump gaps first — missing cross-module
-Spring test-fixture jars, not CratonVM bugs). All 5 below are genuine,
-distinct CratonVM defects. Three remain OPEN here; the Groovy PhaseOperation
-AME and LCIM deserialization NPE were fixed 2026-07-08 and moved to
-`docs/internal/fixed-suite-bugs`.
+Spring test-fixture jars, not CratonVM bugs). All 5 were genuine, distinct
+CratonVM defects — **all 5 are now FIXED** (landed 2026-07-07/08, confirmed
+by a follow-up rerun on fresh dev: `BufferingStompDecoderTests` 11/11 OK,
+`MimeTypeTests` 47/47 OK, `MediaTypeTests` 28/28 OK,
+`DefaultListableBeanFactoryTests.beanProviderSerialization()` no longer
+throws). Retired here; docs moved to `docs/internal/fixed-suite-bugs`.
 
-- OPEN: [`web-x509trustmanager-getacceptedissuers-abstractmethoderror.md`](../internal/web-x509trustmanager-getacceptedissuers-abstractmethoderror.md) — `X509TrustManager.getAcceptedIssuers()` AbstractMethodError, identical across all 4 HTTP server backends in one WebFlux test.
+- FIXED/RETIRED: [`x509trustmanager-getacceptedissuers-abstractmethod-FIXED.md`](../internal/fixed-suite-bugs/x509trustmanager-getacceptedissuers-abstractmethod-FIXED.md) — `X509TrustManager.getAcceptedIssuers()` AbstractMethodError, identical across all 4 HTTP server backends in one WebFlux test.
 - FIXED/RETIRED: [`groovy-compilationunit-phaseoperation-abstractmethoderror-FIXED.md`](../internal/fixed-suite-bugs/groovy-compilationunit-phaseoperation-abstractmethoderror-FIXED.md) - Groovy `CompilationUnit$PhaseOperation.doPhaseOperation` AbstractMethodError, 4 `GroovyScriptFactoryTests` methods.
-- OPEN: [`stomp-bufferingdecoder-atomicinteger-count-npe.md`](../internal/stomp-bufferingdecoder-atomicinteger-count-npe.md) — `BufferingStompDecoder`'s `count` `AtomicInteger` field null, 5 STOMP decoder test methods.
+- FIXED/RETIRED: [`stomp-bufferingdecoder-atomicinteger-count-npe-FIXED.md`](../internal/fixed-suite-bugs/stomp-bufferingdecoder-atomicinteger-count-npe-FIXED.md) — `BufferingStompDecoder`'s `count` `AtomicInteger` field null, 5 STOMP decoder test methods; real cause was `LinkedBlockingQueue.clear()` stomping the real-JDK field slot with a synthetic-layout write.
 - FIXED/RETIRED: [`linkedcaseinsensitivemap-this0-deserialization-FIXED.md`](../internal/fixed-suite-bugs/linkedcaseinsensitivemap-this0-deserialization-FIXED.md) - `LinkedCaseInsensitiveMap` inner-class `this$0` null after deserialize; fixed by suppressing `removeEldestEntry` during `HashMap.readObject` replay.
-- OPEN: [`reflection-arenestmates-missing-native.md`](../internal/reflection-arenestmates-missing-native.md) — `jdk.internal.reflect.Reflection.areNestMates` has no native registered at all.
+- FIXED/RETIRED: [`reflection-arenestmates-native.md`](../internal/fixed-suite-bugs/reflection-arenestmates-native.md) — `jdk.internal.reflect.Reflection.areNestMates` had no native registered at all.
 
 Also confirmed (not new, corroborating evidence only, no new doc needed):
 `expression.spel.*` SpEL `EL1040E` double-literal-suffix parse failures (33
