@@ -39783,7 +39783,7 @@ fn new13_resolve_tls_id(ctx: &dyn NativeContext, this: ObjectRef) -> i32 {
             return id;
         }
     }
-    crate::net_phase_e::sock_stream_id_for_upcall(this)
+    crate::net_phase_e::sock_stream_id_for_upcall(ctx, this)
 }
 
 // SSLSession field layout: 3 fields.
@@ -40066,7 +40066,7 @@ fn new13_do_create_socket(
     // getOutputStream/close/isClosed/isConnected below) finds it. The raw
     // writes are kept too: harmless if dropped, and a free win if some
     // future JDK's field layout happens not to collide.
-    crate::net_phase_e::sock_set_for_create(sock, port as i32, tls_id);
+    crate::net_phase_e::sock_set_for_create(ctx, sock, port as i32, tls_id);
     ctx.set_field(sock, NEW13_SOCK_TLSID, Value::Int(tls_id));
     ctx.set_field(sock, NEW13_SOCK_CLOSED, Value::Int(0));
     let session = new13_alloc_ssl_session(ctx, tls_id);
@@ -40629,7 +40629,7 @@ pub(crate) fn register_p68_ssl(r: &mut NativeMethodRegistry) {
         // Keep net_phase_e's side table (if this socket was built through
         // its createSocket(String,int) — see new13_resolve_tls_id) in sync,
         // so any other code path that consults it also observes closed.
-        crate::net_phase_e::sock_mark_closed_for_upcall(this);
+        crate::net_phase_e::sock_mark_closed_for_upcall(ctx, this);
         ctx.set_field(this, NEW13_SOCK_CLOSED, Value::Int(1));
         Ok(None)
     });
@@ -40637,7 +40637,7 @@ pub(crate) fn register_p68_ssl(r: &mut NativeMethodRegistry) {
         let this = obj_arg(args, 0)?;
         let closed = match ctx.get_field(this, NEW13_SOCK_CLOSED) {
             Value::Int(c) => c != 0,
-            _ => crate::net_phase_e::sock_is_closed_for_upcall(this),
+            _ => crate::net_phase_e::sock_is_closed_for_upcall(ctx, this),
         };
         if std::env::var_os("CRATONVM_DBG_TLS_SOCK").is_some() {
             eprintln!(
@@ -40653,7 +40653,7 @@ pub(crate) fn register_p68_ssl(r: &mut NativeMethodRegistry) {
         let this = obj_arg(args, 0)?;
         let closed = match ctx.get_field(this, NEW13_SOCK_CLOSED) {
             Value::Int(c) => c != 0,
-            _ => crate::net_phase_e::sock_is_closed_for_upcall(this),
+            _ => crate::net_phase_e::sock_is_closed_for_upcall(ctx, this),
         };
         if std::env::var_os("CRATONVM_DBG_TLS_SOCK").is_some() {
             eprintln!(
