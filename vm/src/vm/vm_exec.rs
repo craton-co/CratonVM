@@ -12617,6 +12617,11 @@ fn invoke_on_class_shared_inner(
                             method_name,
                             descriptor,
                         )
+                        || crate::runtime::interpreter::is_mockito_debugging_native_override(
+                            class_name,
+                            method_name,
+                            descriptor,
+                        )
                         || crate::runtime::interpreter::is_hibernate_testing_util_native_override(
                             class_name,
                             method_name,

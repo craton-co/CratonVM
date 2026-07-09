@@ -19727,6 +19727,7 @@ pub(crate) fn is_bytebuddy_method_token_native_override(
         "net/bytebuddy/description/method/MethodDescription$TypeToken"
             | "net/bytebuddy/description/method/MethodDescription$SignatureToken"
             | "net/bytebuddy/dynamic/scaffold/MethodGraph$Compiler$Default$Harmonizer$ForJavaMethod$Token"
+            | "net/bytebuddy/dynamic/scaffold/MethodGraph$Compiler$Default$Key"
     ) {
         return matches!(
             (method_name, descriptor),
@@ -19767,6 +19768,29 @@ pub(crate) fn is_bytebuddy_method_token_native_override(
                 );
     }
     false
+}
+
+pub(crate) fn is_mockito_debugging_native_override(
+    class_name: &str,
+    method_name: &str,
+    descriptor: &str,
+) -> bool {
+    if class_name == "org/mockito/internal/creation/bytebuddy/MockMethodAdvice" {
+        return method_name == "isOverridden"
+            && descriptor == "(Ljava/lang/Object;Ljava/lang/reflect/Method;)Z";
+    }
+    if !matches!(
+        class_name,
+        "org/mockito/internal/debugging/LocationFactory"
+            | "org/mockito/internal/debugging/LocationFactory$DefaultLocationFactory"
+    ) {
+        return false;
+    }
+    method_name == "create"
+        && matches!(
+            descriptor,
+            "()Lorg/mockito/invocation/Location;" | "(Z)Lorg/mockito/invocation/Location;"
+        )
 }
 
 pub(crate) fn is_hibernate_testing_util_native_override(
