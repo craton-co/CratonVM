@@ -12181,36 +12181,7 @@ fn execute_instruction(
                 }
             } else {
                 ensure_class_initialized_shared(shared, thread, field.declaring_class_id)?;
-                let mut value = get_static_shared(shared, field.declaring_class_id, field.field_index);
-                if matches!(value, Value::Object(None)) {
-                    let boolean_const = {
-                        let cm = shared.class_manager.read();
-                        cm.get_class(field.declaring_class_id)
-                            .filter(|c| &*c.name == "java/lang/Boolean")
-                            .and_then(|c| {
-                                let mut static_idx = 0usize;
-                                for f in &c.fields {
-                                    if f.is_static() {
-                                        if static_idx == field.field_index {
-                                            return match &*f.name {
-                                                "TRUE" => Some(true),
-                                                "FALSE" => Some(false),
-                                                _ => None,
-                                            };
-                                        }
-                                        static_idx += 1;
-                                    }
-                                }
-                                None
-                            })
-                    };
-                    if let Some(b) = boolean_const {
-                        let obj = gc_alloc_object(shared, thread, field.declaring_class_id, 1)?;
-                        shared.heap.set_field(obj, 0, Value::Int(i32::from(b)));
-                        value = Value::Object(Some(obj));
-                        set_static_shared(shared, field.declaring_class_id, field.field_index, value);
-                    }
-                }
+                let value = get_static_shared(shared, field.declaring_class_id, field.field_index);
                 if field.is_volatile {
                     std::sync::atomic::fence(std::sync::atomic::Ordering::SeqCst);
                 }
@@ -12628,9 +12599,7 @@ fn execute_instruction(
                     // Same jobject-as-Long contract as `astore` / `coerce_value_for_return`
                     // in vm_exec: invoke returns can sit on the stack as compact long bits.
                     match desc_byte {
-                        Some(d @ (b'L' | b'[')) => {
-                            coerce_value_for_return_validated(shared, v, d)
-                        }
+                        Some(d @ (b'L' | b'[')) => coerce_value_for_return(v, d),
                         // JVMS putfield: narrow the popped int to the field's
                         // declared sub-int width (byte/boolean/char/short) before
                         // storing, so a wide int producer can't leave out-of-range
@@ -13520,23 +13489,12 @@ fn execute_instruction(
                             })?
                             .to_string()
                     };
-                    // GC-safety: `obj_ref` has been popped off the operand stack,
-                    // so keep it in a remappable native root until this opcode either
-                    // pushes it back or decides to throw. Array assignability and
-                    // loader-aware resolution can both take paths that may safepoint.
-                    let pin = thread.native_pin_roots.len();
-                    thread.native_pin_roots.push(obj_ref);
                     // If the object is an array, use descriptor-based assignability
                     // to correctly reject invalid casts (e.g. int[] -> Object[]).
                     let cast_ok = if let Some(src_desc) = array_descriptor_of(shared, obj_ref) {
-                        let ok = array_is_assignable_to(shared, &src_desc, &target_class_name);
-                        obj_ref = thread.native_pin_roots.get(pin).copied().unwrap_or(obj_ref);
-                        thread.native_pin_roots.truncate(pin);
-                        ok
+                        array_is_assignable_to(shared, &src_desc, &target_class_name)
                     } else if target_class_name.starts_with('[') {
                         // Non-array object cannot be cast to an array type.
-                        obj_ref = thread.native_pin_roots.get(pin).copied().unwrap_or(obj_ref);
-                        thread.native_pin_roots.truncate(pin);
                         false
                     } else {
                         // Use load_class_concurrent (read-lock fast path) not
@@ -13544,6 +13502,17 @@ fn execute_instruction(
                         // would block if any JIT thread holds a read lock during
                         // compilation, causing interpreter hangs under concurrent JIT.
                         //
+                        // GC-safety: `obj_ref` was popped off the operand stack at
+                        // the top of this handler, so it is no longer a GC root.
+                        // Under the loader-aware gate `resolve_class_loader_aware`
+                        // may re-enter Java (`ClassLoader.loadClass`) and trigger a
+                        // *moving* GC; the stale Rust-local `obj_ref` would then be a
+                        // dangling pointer, and pushing it back below would poison the
+                        // next root scan (observed: unrelated heap fields nulled →
+                        // spurious NPE/CCE). Pin it across the call and rebind to the
+                        // GC-forwarded address.
+                        let pin = thread.native_pin_roots.len();
+                        thread.native_pin_roots.push(obj_ref);
                         let resolved = resolve_class_loader_aware(
                             shared,
                             thread,
@@ -13694,27 +13663,25 @@ fn execute_instruction(
                     // Arrays: use descriptor-based assignability. instanceof is
                     // strict (SBR-03): a genuine `Object[]` is not an instance of
                     // an unrelated `T[]`.
-                    let pin = thread.native_pin_roots.len();
-                    thread.native_pin_roots.push(obj_ref);
                     let result = if let Some(src_desc) = array_descriptor_of(shared, obj_ref) {
-                        let result = if array_is_instance_of(shared, &src_desc, &target_class_name)
-                        {
+                        if array_is_instance_of(shared, &src_desc, &target_class_name) {
                             1
                         } else {
                             0
-                        };
-                        obj_ref = thread.native_pin_roots.get(pin).copied().unwrap_or(obj_ref);
-                        thread.native_pin_roots.truncate(pin);
-                        result
+                        }
                     } else if target_class_name.starts_with('[') {
                         // Non-array object is not instanceof any array type.
-                        obj_ref = thread.native_pin_roots.get(pin).copied().unwrap_or(obj_ref);
-                        thread.native_pin_roots.truncate(pin);
                         0
                     } else {
-                        // GC-safety: see the Checkcast arm above; this object has
-                        // been popped from the operand stack and is only rooted by
-                        // `native_pin_roots` until the type check completes.
+                        // GC-safety: `obj_ref` was popped off the operand stack, so
+                        // it is no longer a GC root. The loader-aware resolve may
+                        // re-enter `ClassLoader.loadClass` and trigger a moving GC;
+                        // a stale Rust-local `obj_ref` would then read garbage
+                        // (observed as `instanceof` returning the wrong answer — the
+                        // "wrong-boolean" enhancement failures). Pin across the call
+                        // and rebind to the forwarded address. See the Checkcast arm.
+                        let pin = thread.native_pin_roots.len();
+                        thread.native_pin_roots.push(obj_ref);
                         let resolved = resolve_class_loader_aware(
                             shared,
                             thread,
@@ -19845,6 +19812,27 @@ pub(crate) fn is_bytebuddy_method_token_native_override(
     false
 }
 
+pub(crate) fn is_method_handles_varhandle_factory_native_override(
+    class_name: &str,
+    method_name: &str,
+    method_descriptor: &str,
+) -> bool {
+    class_name == "java/lang/invoke/MethodHandles"
+        && matches!(
+            (method_name, method_descriptor),
+            (
+                "arrayElementVarHandle",
+                "(Ljava/lang/Class;)Ljava/lang/invoke/VarHandle;"
+            ) | (
+                "byteArrayViewVarHandle",
+                "(Ljava/lang/Class;Ljava/nio/ByteOrder;)Ljava/lang/invoke/VarHandle;"
+            ) | (
+                "byteBufferViewVarHandle",
+                "(Ljava/lang/Class;Ljava/nio/ByteOrder;)Ljava/lang/invoke/VarHandle;"
+            )
+        )
+}
+
 pub(crate) fn is_mockito_debugging_native_override(
     class_name: &str,
     method_name: &str,
@@ -20032,24 +20020,6 @@ pub(crate) fn is_h2_parser_native_override(
                 "<init>",
                 "(Lorg/h2/mvstore/tx/TransactionStore;IJILjava/lang/String;JIILorg/h2/engine/IsolationLevel;Lorg/h2/mvstore/tx/TransactionStore$RollbackListener;)V",
             );
-    }
-    if class_name == "org/h2/table/Column" {
-        return matches!(
-            (method_name, descriptor),
-            ("equals", "(Ljava/lang/Object;)Z") | ("hashCode", "()I")
-        );
-    }
-    if class_name == "org/h2/engine/DbObject" {
-        return matches!(
-            (method_name, descriptor),
-            ("equals", "(Ljava/lang/Object;)Z") | ("hashCode", "()I")
-        );
-    }
-    if matches!(
-        class_name,
-        "org/h2/engine/Session" | "org/h2/engine/SessionLocal"
-    ) {
-        return (method_name, descriptor) == ("hashCode", "()I");
     }
     if class_name == "org/h2/command/ParserBase" {
         return matches!(
@@ -20300,9 +20270,35 @@ pub(crate) fn is_ffm_group_layout_native_override(
     method_name: &str,
     descriptor: &str,
 ) -> bool {
-    class_name == "java/lang/foreign/GroupLayout"
-        && method_name == "memberLayouts"
-        && descriptor == "()Ljava/util/List;"
+    (class_name == "java/lang/foreign/GroupLayout"
+        || class_name == "java/lang/foreign/StructLayout")
+        && matches!(
+            (method_name, descriptor),
+            ("memberLayouts", "()Ljava/util/List;")
+                | ("name", "()Ljava/util/Optional;")
+                | (
+                    "withName",
+                    "(Ljava/lang/String;)Ljava/lang/foreign/MemoryLayout;"
+                )
+                | ("byteSize", "()J")
+                | ("byteAlignment", "()J")
+        )
+}
+
+pub(crate) fn is_ffm_memory_layout_native_override(
+    class_name: &str,
+    method_name: &str,
+    descriptor: &str,
+) -> bool {
+    class_name == "java/lang/foreign/MemoryLayout"
+        && matches!(
+            (method_name, descriptor),
+            ("name", "()Ljava/util/Optional;")
+                | (
+                    "withName",
+                    "(Ljava/lang/String;)Ljava/lang/foreign/MemoryLayout;"
+                )
+        )
 }
 
 pub(crate) fn is_file_channel_impl_open_native_override(
@@ -20329,20 +20325,6 @@ pub(crate) fn is_native_thread_set_native_override(
             (method_name, descriptor),
             ("add", "()I") | ("remove", "(I)V") | ("signalAndWait", "()V")
         )
-}
-
-/// JavaNioAccess methods that must dispatch through CratonVM natives even when
-/// the real JDK returns an anonymous/synthetic access singleton. JDK 17's
-/// `VM$BufferPoolsHolder.<clinit>` invokes this through the interface, and a
-/// receiver-class lookup alone can miss the bridge native.
-pub(crate) fn is_java_nio_access_native_override(
-    class_name: &str,
-    method_name: &str,
-    descriptor: &str,
-) -> bool {
-    class_name == "jdk/internal/access/JavaNioAccess"
-        && method_name == "getDirectBufferPool"
-        && descriptor == "()Ljdk/internal/misc/VM$BufferPool;"
 }
 
 pub(crate) fn is_stamped_lock_native_override(
@@ -20443,9 +20425,6 @@ pub(crate) fn is_xerces_xml_parser_native_override(
             (
                 "scanContent",
                 "(Lcom/sun/org/apache/xerces/internal/xni/XMLString;)I"
-            ) | (
-                "scanQName",
-                "(Lcom/sun/org/apache/xerces/internal/xni/QName;Lcom/sun/org/apache/xerces/internal/impl/XMLScanner$NameType;)Z"
             ) | ("skipSpaces", "()Z") | (
                 "normalizeNewlines",
                 "(SLcom/sun/org/apache/xerces/internal/xni/XMLString;ZZLcom/sun/org/apache/xerces/internal/impl/XMLScanner$NameType;)Z"
@@ -20481,108 +20460,11 @@ pub(crate) fn is_xerces_xml_parser_native_override(
     }
 }
 
-pub(crate) fn is_awt_imageio_native_override(
-    class_name: &str,
-    method_name: &str,
-    descriptor: &str,
-) -> bool {
-    // java.awt.image.BufferedImage side-table raster. CratonVM stores pixels in
-    // native-awt's ARGB registry and stamps the Java object with an imageId;
-    // the real JDK methods expect populated Raster/ColorModel internals.
-    if class_name == "java/awt/image/BufferedImage"
-        && matches!(
-            (method_name, descriptor),
-            ("<init>", "(III)V")
-                | ("getWidth", "()I")
-                | ("getHeight", "()I")
-                | ("getRGB", "(II)I")
-                | ("setRGB", "(III)V")
-                | ("getType", "()I")
-                | ("createGraphics", "()Ljava/awt/Graphics2D;")
-                | ("flush", "()V")
-                | ("getRGB", "(IIII[III)[I")
-        )
-    {
-        return true;
-    }
-
-    // javax.imageio.ImageIO codec bridge. The real-JDK ImageIO SPI expects
-    // raster/color-model internals that CratonVM's memory-backed BufferedImage
-    // does not populate. Force the native bridge so Spring and desktop code can
-    // read/write the ARGB side-table image data through PNG/JPEG codecs.
-    if class_name == "javax/imageio/ImageIO"
-        && matches!(
-            (method_name, descriptor),
-            (
-                "read",
-                "(Ljava/io/InputStream;)Ljava/awt/image/BufferedImage;"
-            ) | ("read", "(Ljava/io/File;)Ljava/awt/image/BufferedImage;")
-                | (
-                    "write",
-                    "(Ljava/awt/image/RenderedImage;Ljava/lang/String;Ljava/io/OutputStream;)Z"
-                )
-                | (
-                    "write",
-                    "(Ljava/awt/image/RenderedImage;Ljava/lang/String;Ljavax/imageio/stream/ImageOutputStream;)Z"
-                )
-                | (
-                    "write",
-                    "(Ljava/awt/image/RenderedImage;Ljava/lang/String;Ljava/io/File;)Z"
-                )
-        )
-    {
-        return true;
-    }
-
-    if class_name == "com/sun/imageio/plugins/jpeg/JPEGImageReader"
-        && matches!(
-            (method_name, descriptor),
-            (
-                "read",
-                "(ILjavax/imageio/ImageReadParam;)Ljava/awt/image/BufferedImage;"
-            ) | ("dispose", "()V")
-        )
-    {
-        return true;
-    }
-
-    class_name == "com/sun/imageio/plugins/png/PNGImageWriter"
-        && method_name == "write"
-        && descriptor
-            == "(Ljavax/imageio/metadata/IIOMetadata;Ljavax/imageio/IIOImage;Ljavax/imageio/ImageWriteParam;)V"
-}
-
-pub(crate) fn is_liquibase_checksum_native_override(
-    class_name: &str,
-    method_name: &str,
-    descriptor: &str,
-) -> bool {
-    matches!(
-        (class_name, method_name, descriptor),
-        (
-            "liquibase/change/AbstractChange$1",
-            "include",
-            "(Ljava/lang/Object;Ljava/lang/String;Ljava/lang/Object;)Z",
-        ) | (
-            "liquibase/change/ColumnConfig",
-            "getSerializableFieldValue",
-            "(Ljava/lang/String;)Ljava/lang/Object;",
-        )
-    )
-}
-
 fn force_native_over_real_jdk_bytecode(
     class_name: &str,
     method_name: &str,
     method_descriptor: &str,
 ) -> bool {
-    if class_name == "java/lang/Object"
-        && method_name == "clone"
-        && method_descriptor == "()Ljava/lang/Object;"
-    {
-        return true;
-    }
-
     if is_forkjoin_native_override(class_name, method_name, method_descriptor) {
         return true;
     }
@@ -20658,20 +20540,60 @@ fn force_native_over_real_jdk_bytecode(
     {
         return true;
     }
-    // `ServerSocket.getLocalSocketAddress()` is pure Java in the real JDK:
-    // it calls `getInetAddress()` and then constructs an InetSocketAddress.
-    // CratonVM's real ServerSocket instances carry their live listener state
-    // in native side-tables / synthetic slots, while some real SocketImpl
-    // fields remain unpopulated. Force the registered natives for these
-    // accessors so WildFly's process controller sees a resolved bound address
-    // instead of `/0.0.0.0:PORT` with a null InetAddress.
-    if class_name == "java/net/ServerSocket"
+    // `java.util.jar.JarFile` has real JDK bytecode backed by native ZipFile
+    // state and fields (`manRef`, `jv`, etc.) CratonVM does not initialize.
+    // The native-builtins JarFile bridge stores path/manifest in its compact
+    // synthetic layout and reads ZIP data with Rust's zip crate, so it must win
+    // for both interpreted and shared exec dispatch. Keep this in sync with
+    // the JarFile gate in vm_exec.rs.
+    if class_name == "java/util/jar/JarFile"
         && matches!(
-            (method_name, method_descriptor),
-            ("getInetAddress", "()Ljava/net/InetAddress;")
-                | ("getLocalSocketAddress", "()Ljava/net/SocketAddress;")
+            method_name,
+            "<init>"
+                | "getManifest"
+                | "getManifestFromReference"
+                | "stream"
+                | "entries"
+                | "getEntry"
+                | "getJarEntry"
+                | "getInputStream"
+                | "size"
+                | "close"
+                | "getName"
         )
     {
+        return true;
+    }
+    // `java.util.jar.Manifest` constructors/accessors are small but depend on
+    // real-JDK stream/parser state that is fragile for synthetic jarfs streams.
+    // Force the bridge parser so `EmbeddedModulePath.moduleNameFromManifestOrNull`
+    // sees a real, non-null Attributes object.
+    if class_name == "java/util/jar/Manifest"
+        && matches!(
+            (method_name, method_descriptor),
+            ("<init>", "()V")
+                | ("<init>", "(Ljava/io/InputStream;)V")
+                | ("<init>", "(Ljava/io/InputStream;Ljava/lang/String;)V")
+                | ("<init>", "(Ljava/util/jar/Manifest;)V")
+                | (
+                    "<init>",
+                    "(Ljava/util/jar/JarVerifier;Ljava/io/InputStream;Ljava/lang/String;)V"
+                )
+                | ("getMainAttributes", "()Ljava/util/jar/Attributes;")
+                | ("getEntries", "()Ljava/util/Map;")
+        )
+    {
+        return true;
+    }
+    // MethodHandles VarHandle factories must return CratonVM synthetic handles
+    // carrying native side-table/layout metadata. The real JDK bytecode creates
+    // private VarHandle subclasses whose layouts our native get/set paths cannot
+    // decode, so byte-array views read back null/zero.
+    if is_method_handles_varhandle_factory_native_override(
+        class_name,
+        method_name,
+        method_descriptor,
+    ) {
         return true;
     }
     // FFM layout factories: JDK 25's real `MemoryLayout.sequenceLayout` runs
@@ -20704,10 +20626,6 @@ fn force_native_over_real_jdk_bytecode(
                 "([Ljava/lang/foreign/MemoryLayout;)Ljava/lang/foreign/MemoryLayout;"
             ) | ("paddingLayout", "(J)Ljava/lang/foreign/PaddingLayout;")
                 | ("paddingLayout", "(J)Ljava/lang/foreign/MemoryLayout;")
-                | (
-                    "varHandle",
-                    "([Ljava/lang/foreign/MemoryLayout$PathElement;)Ljava/lang/invoke/VarHandle;"
-                )
         )
     {
         return true;
@@ -20718,7 +20636,9 @@ fn force_native_over_real_jdk_bytecode(
     // must be served by the registered layout shims instead of falling through
     // to an abstract interface method with no Code attribute.
     if (class_name == "java/lang/foreign/ValueLayout"
-        || class_name.starts_with("java/lang/foreign/ValueLayout$"))
+        || class_name == "java/lang/foreign/AddressLayout"
+        || class_name.starts_with("java/lang/foreign/ValueLayout$")
+        || class_name.starts_with("jdk/internal/foreign/layout/ValueLayouts$"))
         && matches!(
             method_name,
             "byteSize"
@@ -20727,6 +20647,11 @@ fn force_native_over_real_jdk_bytecode(
                 | "withName"
                 | "withOrder"
                 | "varHandle"
+                | "name"
+                | "carrier"
+                | "order"
+                | "targetLayout"
+                | "withTargetLayout"
         )
     {
         return true;
@@ -20840,13 +20765,6 @@ fn force_native_over_real_jdk_bytecode(
         || is_jython_pyobject_native_override(class_name, method_name, method_descriptor)
         || is_jython_imp_native_override(class_name, method_name, method_descriptor)
         || is_jython_pymodule_native_override(class_name, method_name, method_descriptor)
-    {
-        return true;
-    }
-
-    if class_name == "java/nio/charset/Charset"
-        && ((method_name == "availableCharsets" && method_descriptor == "()Ljava/util/SortedMap;")
-            || (method_name == "aliases" && method_descriptor == "()Ljava/util/Set;"))
     {
         return true;
     }
@@ -20977,7 +20895,46 @@ fn force_native_over_real_jdk_bytecode(
     if class_name == "java/text/Normalizer" && matches!(method_name, "normalize" | "isNormalized") {
         return true;
     }
-    if is_awt_imageio_native_override(class_name, method_name, method_descriptor) {
+    // java.awt.image.BufferedImage side-table raster. CratonVM stores pixels in
+    // native-awt's ARGB registry and stamps the Java object with an imageId;
+    // the real JDK methods expect populated Raster/ColorModel internals.
+    if class_name == "java/awt/image/BufferedImage"
+        && matches!(
+            (method_name, method_descriptor),
+            ("<init>", "(III)V")
+                | ("getWidth", "()I")
+                | ("getHeight", "()I")
+                | ("getRGB", "(II)I")
+                | ("setRGB", "(III)V")
+                | ("getType", "()I")
+                | ("createGraphics", "()Ljava/awt/Graphics2D;")
+                | ("flush", "()V")
+                | ("getRGB", "(IIII[III)[I")
+        )
+    {
+        return true;
+    }
+    // javax.imageio.ImageIO codec bridge. The real-JDK ImageIO SPI expects
+    // raster/color-model internals that CratonVM's memory-backed BufferedImage
+    // does not populate. Force the native bridge so Spring and desktop code can
+    // read/write the ARGB side-table image data through PNG/JPEG codecs.
+    if class_name == "javax/imageio/ImageIO"
+        && matches!(
+            (method_name, method_descriptor),
+            (
+                "read",
+                "(Ljava/io/InputStream;)Ljava/awt/image/BufferedImage;"
+            ) | ("read", "(Ljava/io/File;)Ljava/awt/image/BufferedImage;")
+                | (
+                    "write",
+                    "(Ljava/awt/image/RenderedImage;Ljava/lang/String;Ljava/io/OutputStream;)Z"
+                )
+                | (
+                    "write",
+                    "(Ljava/awt/image/RenderedImage;Ljava/lang/String;Ljava/io/File;)Z"
+                )
+        )
+    {
         return true;
     }
     // SBR-02 / bug-03: fast native regex. The real-JDK `String.replaceAll` /
@@ -21146,13 +21103,13 @@ fn force_native_over_real_jdk_bytecode(
     if is_ffm_group_layout_native_override(class_name, method_name, method_descriptor) {
         return true;
     }
+    if is_ffm_memory_layout_native_override(class_name, method_name, method_descriptor) {
+        return true;
+    }
     if is_file_channel_impl_open_native_override(class_name, method_name, method_descriptor) {
         return true;
     }
     if is_native_thread_set_native_override(class_name, method_name, method_descriptor) {
-        return true;
-    }
-    if is_java_nio_access_native_override(class_name, method_name, method_descriptor) {
         return true;
     }
     if is_stamped_lock_native_override(class_name, method_name, method_descriptor) {
@@ -21162,9 +21119,6 @@ fn force_native_over_real_jdk_bytecode(
         return true;
     }
     if is_xerces_xml_parser_native_override(class_name, method_name, method_descriptor) {
-        return true;
-    }
-    if is_liquibase_checksum_native_override(class_name, method_name, method_descriptor) {
         return true;
     }
     // Surefire fork bootstrap/teardown: bypass ServiceLoader decoder discovery
@@ -21760,7 +21714,7 @@ fn intercept_urlclassloader_subclass_find_class(
     let ret_type = crate::jit::return_type(method_descriptor);
     Some((|| {
         let result = crate::vm::safe_native_call(shared, thread, cb, args)?;
-        if let Some(value) = result.filter(|_| ret_type != b'V') {
+        if let Some(value) = result {
             push_invoke_return_value(
                 &mut thread.frames[frame_idx].stack,
                 coerce_value_for_return(value, ret_type),
@@ -21933,7 +21887,7 @@ fn try_stackless_invoke(
                 .find("java/lang/reflect/Constructor", method_name, descriptor)
         {
             let result = safe_native_call(shared, thread, callback, args)?;
-            if let Some(value) = result.filter(|_| ret_type != b'V') {
+            if let Some(value) = result {
                 push_invoke_return_value(
                     &mut thread.frames[frame_idx].stack,
                     coerce_value_for_return(value, ret_type),
@@ -22067,17 +22021,15 @@ fn try_stackless_invoke(
                     class_name, method_name, descriptor, value
                 );
             }
-            if ret_type != b'V' {
-                // T18.K4 — tag-exact push for J/D native-override return values.
-                // `coerce_value_for_return` may widen/narrow the type-erased
-                // native result; we then push via the category-2 aware path so
-                // J/D retain their bits across the operand-stack boundary.
-                push_invoke_return_value(
-                    &mut thread.frames[frame_idx].stack,
-                    coerce_value_for_return(value, ret_type),
-                )?;
-                native_return_pushed_to_stack(shared, thread);
-            }
+            // T18.K4 — tag-exact push for J/D native-override return values.
+            // `coerce_value_for_return` may widen/narrow the type-erased
+            // native result; we then push via the category-2 aware path so
+            // J/D retain their bits across the operand-stack boundary.
+            push_invoke_return_value(
+                &mut thread.frames[frame_idx].stack,
+                coerce_value_for_return(value, ret_type),
+            )?;
+            native_return_pushed_to_stack(shared, thread);
         }
         if crate::runtime::env_cache::resume_pc_dbg() && method_name == "enhance" {
             let f = &thread.frames[frame_idx];
@@ -22149,7 +22101,7 @@ fn try_stackless_invoke(
             .find(&declaring_name, method_name, descriptor)
         {
             let result = safe_native_call(shared, thread, callback, args)?;
-            if let Some(value) = result.filter(|_| ret_type != b'V') {
+            if let Some(value) = result {
                 // T18.K4 — tag-exact push for J/D native-bytecode method return values.
                 push_invoke_return_value(
                     &mut thread.frames[frame_idx].stack,
@@ -22217,7 +22169,7 @@ fn try_stackless_invoke(
             .find(&class_name_arc, method_name, descriptor)
         {
             let result = safe_native_call(shared, thread, callback, args)?;
-            if let Some(value) = result.filter(|_| ret_type != b'V') {
+            if let Some(value) = result {
                 // T18.K4 — tag-exact push for J/D native-override (on bytecode method) return values.
                 push_invoke_return_value(
                     &mut thread.frames[frame_idx].stack,
@@ -22710,17 +22662,19 @@ fn execute_invokestatic(
     };
     if let Some(value) = result {
         let ret = crate::jit::return_type(&method_descriptor);
-        if ret != b'V' {
-            let value = coerce_value_for_return(value, ret);
-            // T18.K4 — tag-exact push for J/D fallback invokestatic return values.
-            push_invoke_return_value(&mut thread.frames[frame_idx].stack, value)?;
-            // Hypothesis (b): symmetric clear-after-push for the slow invokestatic
-            // path. `invoke_or_native` may recursively run `safe_native_call` which
-            // pins the object return in `thread.native_pending_return`; without
-            // this clear, the field outlives the call site and `update_root_snapshot`
-            // re-roots a stale (already-popped) ObjectRef across GC.
-            crate::vm::native_return_pushed_to_stack(shared, thread);
-        }
+        let value = if ret != b'V' {
+            coerce_value_for_return(value, ret)
+        } else {
+            value
+        };
+        // T18.K4 — tag-exact push for J/D fallback invokestatic return values.
+        push_invoke_return_value(&mut thread.frames[frame_idx].stack, value)?;
+        // Hypothesis (b): symmetric clear-after-push for the slow invokestatic
+        // path. `invoke_or_native` may recursively run `safe_native_call` which
+        // pins the object return in `thread.native_pending_return`; without
+        // this clear, the field outlives the call site and `update_root_snapshot`
+        // re-roots a stale (already-popped) ObjectRef across GC.
+        crate::vm::native_return_pushed_to_stack(shared, thread);
     }
 
     // Populate invoke cache for future fast-path hits
@@ -22771,8 +22725,12 @@ fn invoke_cached_intrinsic(
 ) -> Result<(), MethodCallFailed> {
     INTRINSIC_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let result = crate::vm::safe_native_call(shared, thread, callback, args)?;
-    if let Some(value) = result.filter(|_| return_type != b'V') {
-        let value = coerce_value_for_return(value, return_type);
+    if let Some(value) = result {
+        let value = if return_type != b'V' {
+            coerce_value_for_return(value, return_type)
+        } else {
+            value
+        };
         push_invoke_return_value(&mut thread.frames[frame_idx].stack, value)?;
         crate::vm::native_return_pushed_to_stack(shared, thread);
     }
@@ -31218,29 +31176,143 @@ mod tests {
             "memberLayouts",
             descriptor
         ));
+        assert!(is_ffm_group_layout_native_override(
+            "java/lang/foreign/StructLayout",
+            "name",
+            "()Ljava/util/Optional;"
+        ));
+        assert!(force_native_over_real_jdk_bytecode(
+            "java/lang/foreign/MemoryLayout",
+            "withName",
+            "(Ljava/lang/String;)Ljava/lang/foreign/MemoryLayout;"
+        ));
+        assert!(force_native_over_real_jdk_bytecode(
+            "java/lang/foreign/AddressLayout",
+            "withName",
+            "(Ljava/lang/String;)Ljava/lang/foreign/AddressLayout;"
+        ));
+        assert!(force_native_over_real_jdk_bytecode(
+            "java/lang/foreign/ValueLayout",
+            "carrier",
+            "()Ljava/lang/Class;"
+        ));
+        assert!(force_native_over_real_jdk_bytecode(
+            "jdk/internal/foreign/layout/ValueLayouts$OfLongImpl",
+            "carrier",
+            "()Ljava/lang/Class;"
+        ));
+        assert!(force_native_over_real_jdk_bytecode(
+            "java/lang/foreign/ValueLayout",
+            "order",
+            "()Ljava/nio/ByteOrder;"
+        ));
+        assert!(force_native_over_real_jdk_bytecode(
+            "java/lang/foreign/AddressLayout",
+            "targetLayout",
+            "()Ljava/util/Optional;"
+        ));
+        assert!(force_native_over_real_jdk_bytecode(
+            "java/lang/foreign/AddressLayout",
+            "withTargetLayout",
+            "(Ljava/lang/foreign/MemoryLayout;)Ljava/lang/foreign/AddressLayout;"
+        ));
     }
 
     #[test]
-    fn java_nio_access_force_native_covers_jdk17_direct_buffer_pool() {
-        let access = "jdk/internal/access/JavaNioAccess";
-        let descriptor = "()Ljdk/internal/misc/VM$BufferPool;";
-        assert!(
-            is_java_nio_access_native_override(access, "getDirectBufferPool", descriptor),
-            "JDK 17 VM$BufferPoolsHolder must route JavaNioAccess.getDirectBufferPool to the native bridge"
-        );
-        assert!(
-            force_native_over_real_jdk_bytecode(access, "getDirectBufferPool", descriptor),
-            "invokeinterface JavaNioAccess.getDirectBufferPool must force the registered native"
-        );
-        assert!(!is_java_nio_access_native_override(
-            "java/nio/Buffer$1",
-            "getDirectBufferPool",
-            descriptor
+    fn jar_file_force_native_covers_registered_surface() {
+        let jar_file = "java/util/jar/JarFile";
+        for (name, descriptor) in [
+            ("<init>", "(Ljava/io/File;)V"),
+            ("<init>", "(Ljava/lang/String;)V"),
+            ("<init>", "(Ljava/lang/String;Z)V"),
+            ("<init>", "(Ljava/io/File;Z)V"),
+            ("<init>", "(Ljava/io/File;ZI)V"),
+            ("<init>", "(Ljava/io/File;ZILjava/lang/Runtime$Version;)V"),
+            ("getManifest", "()Ljava/util/jar/Manifest;"),
+            ("getManifestFromReference", "()Ljava/util/jar/Manifest;"),
+            ("stream", "()Ljava/util/stream/Stream;"),
+            ("entries", "()Ljava/util/Enumeration;"),
+            ("getEntry", "(Ljava/lang/String;)Ljava/util/zip/ZipEntry;"),
+            (
+                "getJarEntry",
+                "(Ljava/lang/String;)Ljava/util/jar/JarEntry;",
+            ),
+            (
+                "getInputStream",
+                "(Ljava/util/zip/ZipEntry;)Ljava/io/InputStream;",
+            ),
+            ("size", "()I"),
+            ("close", "()V"),
+            ("getName", "()Ljava/lang/String;"),
+        ] {
+            assert!(
+                force_native_over_real_jdk_bytecode(jar_file, name, descriptor),
+                "{name}{descriptor} must use native JarFile bridge"
+            );
+        }
+    }
+
+    #[test]
+    fn manifest_force_native_covers_registered_surface() {
+        let manifest = "java/util/jar/Manifest";
+        for (name, descriptor) in [
+            ("<init>", "()V"),
+            ("<init>", "(Ljava/io/InputStream;)V"),
+            ("<init>", "(Ljava/io/InputStream;Ljava/lang/String;)V"),
+            ("<init>", "(Ljava/util/jar/Manifest;)V"),
+            (
+                "<init>",
+                "(Ljava/util/jar/JarVerifier;Ljava/io/InputStream;Ljava/lang/String;)V",
+            ),
+            ("getMainAttributes", "()Ljava/util/jar/Attributes;"),
+            ("getEntries", "()Ljava/util/Map;"),
+        ] {
+            assert!(
+                force_native_over_real_jdk_bytecode(manifest, name, descriptor),
+                "{name}{descriptor} must use native Manifest bridge"
+            );
+        }
+    }
+
+    #[test]
+    fn method_handles_varhandle_factories_force_native() {
+        let method_handles = "java/lang/invoke/MethodHandles";
+        for (name, descriptor) in [
+            (
+                "arrayElementVarHandle",
+                "(Ljava/lang/Class;)Ljava/lang/invoke/VarHandle;",
+            ),
+            (
+                "byteArrayViewVarHandle",
+                "(Ljava/lang/Class;Ljava/nio/ByteOrder;)Ljava/lang/invoke/VarHandle;",
+            ),
+            (
+                "byteBufferViewVarHandle",
+                "(Ljava/lang/Class;Ljava/nio/ByteOrder;)Ljava/lang/invoke/VarHandle;",
+            ),
+        ] {
+            assert!(
+                is_method_handles_varhandle_factory_native_override(
+                    method_handles,
+                    name,
+                    descriptor
+                ),
+                "{name}{descriptor} must route to the registered native factory"
+            );
+            assert!(
+                force_native_over_real_jdk_bytecode(method_handles, name, descriptor),
+                "{name}{descriptor} must bypass real JDK VarHandle factory bytecode"
+            );
+        }
+        assert!(!is_method_handles_varhandle_factory_native_override(
+            method_handles,
+            "byteArrayViewVarHandle",
+            "(Ljava/lang/Class;)Ljava/lang/invoke/VarHandle;"
         ));
-        assert!(!is_java_nio_access_native_override(
-            access,
-            "getBufferPool",
-            "()Ljava/lang/management/BufferPoolMXBean;"
+        assert!(!is_method_handles_varhandle_factory_native_override(
+            "java/lang/invoke/MethodHandle",
+            "byteArrayViewVarHandle",
+            "(Ljava/lang/Class;Ljava/nio/ByteOrder;)Ljava/lang/invoke/VarHandle;"
         ));
     }
 
@@ -31287,86 +31359,6 @@ mod tests {
                 "real-JDK bytecode dispatch must force NativeThreadSet.{name}{descriptor}"
             );
         }
-    }
-
-    #[test]
-    fn awt_imageio_force_native_covers_registered_surface() {
-        let bi = "java/awt/image/BufferedImage";
-        for (name, descriptor) in [
-            ("<init>", "(III)V"),
-            ("getWidth", "()I"),
-            ("getHeight", "()I"),
-            ("getRGB", "(II)I"),
-            ("setRGB", "(III)V"),
-            ("getType", "()I"),
-            ("createGraphics", "()Ljava/awt/Graphics2D;"),
-            ("flush", "()V"),
-            ("getRGB", "(IIII[III)[I"),
-        ] {
-            assert!(is_awt_imageio_native_override(bi, name, descriptor));
-            assert!(force_native_over_real_jdk_bytecode(bi, name, descriptor));
-        }
-
-        let imageio = "javax/imageio/ImageIO";
-        for descriptor in [
-            "(Ljava/io/InputStream;)Ljava/awt/image/BufferedImage;",
-            "(Ljava/io/File;)Ljava/awt/image/BufferedImage;",
-            "(Ljava/awt/image/RenderedImage;Ljava/lang/String;Ljava/io/OutputStream;)Z",
-            "(Ljava/awt/image/RenderedImage;Ljava/lang/String;Ljavax/imageio/stream/ImageOutputStream;)Z",
-            "(Ljava/awt/image/RenderedImage;Ljava/lang/String;Ljava/io/File;)Z",
-        ] {
-            let name = if descriptor.ends_with("BufferedImage;") { "read" } else { "write" };
-            assert!(is_awt_imageio_native_override(imageio, name, descriptor));
-            assert!(force_native_over_real_jdk_bytecode(imageio, name, descriptor));
-        }
-
-        let jpeg_reader = "com/sun/imageio/plugins/jpeg/JPEGImageReader";
-        assert!(is_awt_imageio_native_override(
-            jpeg_reader,
-            "read",
-            "(ILjavax/imageio/ImageReadParam;)Ljava/awt/image/BufferedImage;"
-        ));
-        assert!(force_native_over_real_jdk_bytecode(
-            jpeg_reader,
-            "read",
-            "(ILjavax/imageio/ImageReadParam;)Ljava/awt/image/BufferedImage;"
-        ));
-        assert!(is_awt_imageio_native_override(
-            jpeg_reader,
-            "dispose",
-            "()V"
-        ));
-
-        let png_writer = "com/sun/imageio/plugins/png/PNGImageWriter";
-        let write_desc = "(Ljavax/imageio/metadata/IIOMetadata;Ljavax/imageio/IIOImage;Ljavax/imageio/ImageWriteParam;)V";
-        assert!(is_awt_imageio_native_override(
-            png_writer, "write", write_desc
-        ));
-        assert!(force_native_over_real_jdk_bytecode(
-            png_writer, "write", write_desc
-        ));
-    }
-
-    #[test]
-    fn charset_force_native_covers_tomcat_cache_surface() {
-        let charset = "java/nio/charset/Charset";
-        assert!(
-            force_native_over_real_jdk_bytecode(
-                charset,
-                "availableCharsets",
-                "()Ljava/util/SortedMap;"
-            ),
-            "Tomcat B2CConverter must use native Charset.availableCharsets"
-        );
-        assert!(
-            force_native_over_real_jdk_bytecode(charset, "aliases", "()Ljava/util/Set;"),
-            "Tomcat CharsetCache must use native Charset.aliases on synthetic Charset objects"
-        );
-        assert!(!force_native_over_real_jdk_bytecode(
-            charset,
-            "aliases",
-            "()Ljava/util/List;"
-        ));
     }
 
     #[test]
@@ -31470,18 +31462,6 @@ mod tests {
     }
 
     #[test]
-    fn object_clone_force_native_covers_super_clone() {
-        assert!(
-            force_native_over_real_jdk_bytecode(
-                "java/lang/Object",
-                "clone",
-                "()Ljava/lang/Object;"
-            ),
-            "Object.clone must route to the registered shallow-clone native"
-        );
-    }
-
-    #[test]
     fn xerces_xml_parser_force_native_covers_liquibase_parse_hotspots() {
         let xmlchar = "com/sun/org/apache/xerces/internal/util/XMLChar";
         for (name, descriptor) in [
@@ -31557,10 +31537,6 @@ mod tests {
         let entity_scanner = "com/sun/org/apache/xerces/internal/impl/XMLEntityScanner";
         for (name, descriptor) in [
             ("scanContent", "(Lcom/sun/org/apache/xerces/internal/xni/XMLString;)I"),
-            (
-                "scanQName",
-                "(Lcom/sun/org/apache/xerces/internal/xni/QName;Lcom/sun/org/apache/xerces/internal/impl/XMLScanner$NameType;)Z",
-            ),
             ("skipSpaces", "()Z"),
             (
                 "normalizeNewlines",
@@ -31672,63 +31648,6 @@ mod tests {
             analyzer,
             "debugPrint",
             "(Ljdk/xml/internal/XMLSecurityManager;)V"
-        ));
-    }
-
-    #[test]
-    fn liquibase_checksum_force_native_covers_status_hotpath_intrinsics() {
-        for (class_name, method_name, descriptor) in [
-            (
-                "liquibase/change/AbstractChange$1",
-                "include",
-                "(Ljava/lang/Object;Ljava/lang/String;Ljava/lang/Object;)Z",
-            ),
-            (
-                "liquibase/change/ColumnConfig",
-                "getSerializableFieldValue",
-                "(Ljava/lang/String;)Ljava/lang/Object;",
-            ),
-        ] {
-            assert!(
-                is_liquibase_checksum_native_override(class_name, method_name, descriptor),
-                "{class_name}.{method_name}{descriptor} must route to the registered native"
-            );
-            assert!(
-                force_native_over_real_jdk_bytecode(class_name, method_name, descriptor),
-                "{class_name}.{method_name}{descriptor} must not fall through to interpreted stream bytecode"
-            );
-        }
-        assert!(!is_liquibase_checksum_native_override(
-            "liquibase/serializer/core/string/StringChangeLogSerializer$FieldFilter",
-            "include",
-            "(Ljava/lang/Object;Ljava/lang/String;Ljava/lang/Object;)Z"
-        ));
-    }
-
-    #[test]
-    fn h2_liquibase_force_native_covers_ddl_hotpath_intrinsics() {
-        for (class_name, name, descriptor) in [
-            ("org/h2/table/Column", "equals", "(Ljava/lang/Object;)Z"),
-            ("org/h2/table/Column", "hashCode", "()I"),
-            ("org/h2/engine/DbObject", "equals", "(Ljava/lang/Object;)Z"),
-            ("org/h2/engine/DbObject", "hashCode", "()I"),
-            ("org/h2/engine/Session", "hashCode", "()I"),
-            ("org/h2/engine/SessionLocal", "hashCode", "()I"),
-        ] {
-            assert!(
-                is_h2_parser_native_override(class_name, name, descriptor),
-                "{class_name}.{name}{descriptor} must route to the registered H2 native"
-            );
-            assert!(
-                force_native_over_real_jdk_bytecode(class_name, name, descriptor),
-                "{class_name}.{name}{descriptor} must not fall through to interpreted H2 bytecode"
-            );
-        }
-
-        assert!(!is_h2_parser_native_override(
-            "org/h2/table/Column",
-            "getName",
-            "()Ljava/lang/String;"
         ));
     }
 

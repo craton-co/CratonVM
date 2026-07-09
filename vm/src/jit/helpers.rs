@@ -3443,6 +3443,10 @@ pub unsafe extern "C" fn jit_checkcast(
     }
     // SAFETY: vm_ptr originates from JIT code that received it from the interpreter's SharedVm reference.
     let vm = &*(vm_ptr as *const SharedVm);
+    let obj_ref = match vm.heap.is_object_address(obj_ptr as usize) {
+        Some(r) => r,
+        None => return 0,
+    };
     // SAFETY: class_name_ptr is non-null (checked above) and class_name_len > 0.
     // The pointer comes from the JIT string table which outlives this call.
     let class_name = match std::str::from_utf8(std::slice::from_raw_parts(
@@ -3452,8 +3456,6 @@ pub unsafe extern "C" fn jit_checkcast(
         Ok(s) => s,
         Err(_) => return 0,
     };
-    // SAFETY: obj_ptr is non-null (checked above) and points to a live heap object.
-    let obj_ref = ObjectRef::from_raw(obj_ptr as usize as *mut u8);
     let obj_class_id = vm.heap.class_id_of(obj_ref);
     // checkcast: lenient (SBR-03).
     if jit_typecheck_resolve(vm, obj_class_id, obj_ref, class_name, true) {
@@ -5440,6 +5442,27 @@ mod tests {
         // SAFETY: Passing all-zero/null arguments exercises the null-object fast path;
         // no heap pointers are dereferenced.
         let result = unsafe { jit_checkcast(0, 0, std::ptr::null(), 0) };
+        assert_eq!(result, 0);
+    }
+
+    #[test]
+    fn jit_checkcast_non_heap_ptr_returns_zero() {
+        use crate::config::VmConfig;
+        use crate::vm::SharedVm;
+
+        let vm = SharedVm::new(VmConfig::default());
+        let target = "java/lang/Object";
+        // SAFETY: vm points to a live SharedVm and target is a valid UTF-8
+        // string. The fake receiver is aligned and pointer-shaped, but outside
+        // the VM heap; jit_checkcast must reject it before any header read.
+        let result = unsafe {
+            jit_checkcast(
+                &vm as *const SharedVm as i64,
+                0x1000,
+                target.as_ptr(),
+                target.len() as i64,
+            )
+        };
         assert_eq!(result, 0);
     }
 
