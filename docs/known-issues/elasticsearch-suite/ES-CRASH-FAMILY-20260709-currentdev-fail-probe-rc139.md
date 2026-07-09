@@ -36,3 +36,21 @@ Interpretation:
 - This is not a full-suite crash count; it is a current-dev residual probe count from old FAIL rows.
 - The rc=139 behavior often hides the Java-level residual that is visible under `--nojit`, so use this doc to track the JIT/runtime crash surface and use the fail-family docs for cleaner root-cause signals.
 - The `ES812PostingsFormatTests` stderr guard warnings suggest at least one crash path still touches foreign API method-handle/SymbolLookup layout handling.
+
+## Full non-passed rerun update
+
+- Run: `es-nonpassed-currentdev-20260709-082115`
+- Binary: `/data/data/cratonvm-targets/es-rerun-currentdev-20260709-082115/release/cratonvm-es-rerun-currentdev-20260709-082115`
+- Class list: 2649 non-passed rows from the prior ES selection.
+- Timeout: 120 seconds.
+- Shards: 4.
+- Result: 2640 CRASH, 2 FAIL, 7 PASS, 0 HANG.
+- All crash rows exited rc=139.
+- 2583 crash result notes directly contain `MemoryLayout.varHandle`; 2585 crash logs contain the same marker.
+- 50 crash rows had blank result notes, including 8 with CratonVM GC guard out-of-bounds field markers in captured logs.
+
+Old-HANG rerun update:
+- Run: `es-hung10-currentdev-20260709-082115`
+- Timeout: 1500 seconds.
+- Result: 10 CRASH, 0 HANG.
+- All ten old-HANG classes now exit rc=139 before the long timeout matters.
