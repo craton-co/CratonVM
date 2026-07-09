@@ -11408,6 +11408,18 @@ fn invoke_on_class_shared_inner(
                             method_name,
                             descriptor,
                         )
+                        // Spring CacheAdviceNamespaceTests: keep Spring XML
+                        // namespace validation active but force our
+                        // DefaultDocumentLoader factory bridge so it can attach
+                        // a shared Xerces grammar pool. Without this gate the
+                        // protected concrete Java method wins over the native
+                        // and every GenericXmlApplicationContext reparses the
+                        // same Spring XSDs from scratch.
+                        || (class_name
+                            == "org/springframework/beans/factory/xml/DefaultDocumentLoader"
+                            && method_name == "createDocumentBuilderFactory"
+                            && descriptor
+                                == "(IZ)Ljavax/xml/parsers/DocumentBuilderFactory;")
                         || crate::runtime::interpreter::is_liquibase_checksum_native_override(
                             class_name,
                             method_name,
@@ -12459,6 +12471,18 @@ fn invoke_on_class_shared_inner(
                             method_name,
                             descriptor,
                         )
+                        // Spring CacheAdviceNamespaceTests: keep Spring XML
+                        // namespace validation active but force our
+                        // DefaultDocumentLoader factory bridge so it can attach
+                        // a shared Xerces grammar pool. Without this gate the
+                        // protected concrete Java method wins over the native
+                        // and every GenericXmlApplicationContext reparses the
+                        // same Spring XSDs from scratch.
+                        || (class_name
+                            == "org/springframework/beans/factory/xml/DefaultDocumentLoader"
+                            && method_name == "createDocumentBuilderFactory"
+                            && descriptor
+                                == "(IZ)Ljavax/xml/parsers/DocumentBuilderFactory;")
                         || crate::runtime::interpreter::is_liquibase_checksum_native_override(
                             class_name,
                             method_name,

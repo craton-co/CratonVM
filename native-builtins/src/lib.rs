@@ -43,6 +43,139 @@ pub(crate) fn bootstrap_property_fallback(key: &str) -> Option<String> {
     }
 }
 
+#[derive(Clone, Copy)]
+struct SpringXmlGrammarPoolEntry {
+    root: usize,
+    fallback: ObjectRef,
+}
+
+fn spring_xml_grammar_pool_store(
+) -> &'static std::sync::Mutex<std::collections::HashMap<usize, SpringXmlGrammarPoolEntry>> {
+    static STORE: std::sync::OnceLock<
+        std::sync::Mutex<std::collections::HashMap<usize, SpringXmlGrammarPoolEntry>>,
+    > = std::sync::OnceLock::new();
+    STORE.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+}
+
+fn spring_xml_resolve_grammar_pool(
+    ctx: &dyn NativeContext,
+    entry: SpringXmlGrammarPoolEntry,
+) -> Option<ObjectRef> {
+    if entry.root != 0 {
+        ctx.resolve_global_root(entry.root).or(Some(entry.fallback))
+    } else {
+        Some(entry.fallback)
+    }
+}
+
+fn spring_xml_shared_grammar_pool(ctx: &mut dyn NativeContext) -> Option<ObjectRef> {
+    let scope = ctx.vm_identity();
+    if let Some(entry) = spring_xml_grammar_pool_store()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(&scope)
+        .copied()
+    {
+        if let Some(pool) = spring_xml_resolve_grammar_pool(ctx, entry) {
+            return Some(pool);
+        }
+    }
+
+    let pool = match ctx.new_object_initialized(
+        "com/sun/org/apache/xerces/internal/util/XMLGrammarPoolImpl",
+        "()V",
+        &[],
+    ) {
+        Ok(Some(Value::Object(Some(pool)))) => pool,
+        _ => return None,
+    };
+    let entry = SpringXmlGrammarPoolEntry {
+        root: ctx.add_global_root(pool),
+        fallback: pool,
+    };
+
+    let mut store = spring_xml_grammar_pool_store()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    if let Some(existing) = store.get(&scope).copied() {
+        if entry.root != 0 {
+            let _ = ctx.remove_global_root(entry.root);
+        }
+        return spring_xml_resolve_grammar_pool(ctx, existing);
+    }
+    store.insert(scope, entry);
+    Some(pool)
+}
+
+fn spring_xml_set_factory_bool(
+    ctx: &mut dyn NativeContext,
+    factory: ObjectRef,
+    method: &str,
+    value: bool,
+) -> MethodCallResult {
+    let value = if value { 1 } else { 0 };
+    ctx.invoke_virtual(factory, method, "(Z)V", &[Value::Int(value)])?;
+    Ok(None)
+}
+
+fn spring_xml_set_factory_attribute(
+    ctx: &mut dyn NativeContext,
+    factory: ObjectRef,
+    name: &str,
+    value: Value,
+) -> MethodCallResult {
+    let name = ctx.create_string(name);
+    ctx.invoke_virtual(
+        factory,
+        "setAttribute",
+        "(Ljava/lang/String;Ljava/lang/Object;)V",
+        &[Value::Object(Some(name)), value],
+    )?;
+    Ok(None)
+}
+
+fn native_spring_default_document_loader_create_document_builder_factory(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    let validation_mode = args.get(1).and_then(|v| v.as_int()).unwrap_or(0);
+    let namespace_aware = args.get(2).and_then(|v| v.as_int()).unwrap_or(0) != 0;
+    let factory = match ctx.invoke(
+        "javax/xml/parsers/DocumentBuilderFactory",
+        "newInstance",
+        "()Ljavax/xml/parsers/DocumentBuilderFactory;",
+        &[],
+    )? {
+        Some(Value::Object(Some(factory))) => factory,
+        _ => return Ok(Some(Value::Object(None))),
+    };
+
+    spring_xml_set_factory_bool(ctx, factory, "setNamespaceAware", namespace_aware)?;
+    if validation_mode != 0 {
+        spring_xml_set_factory_bool(ctx, factory, "setValidating", true)?;
+        if validation_mode == 3 {
+            spring_xml_set_factory_bool(ctx, factory, "setNamespaceAware", true)?;
+            let schema = ctx.create_string("http://www.w3.org/2001/XMLSchema");
+            spring_xml_set_factory_attribute(
+                ctx,
+                factory,
+                "http://java.sun.com/xml/jaxp/properties/schemaLanguage",
+                Value::Object(Some(schema)),
+            )?;
+            if let Some(pool) = spring_xml_shared_grammar_pool(ctx) {
+                spring_xml_set_factory_attribute(
+                    ctx,
+                    factory,
+                    "http://apache.org/xml/properties/internal/grammar-pool",
+                    Value::Object(Some(pool)),
+                )?;
+            }
+        }
+    }
+
+    Ok(Some(Value::Object(Some(factory))))
+}
+
 fn osw_wrapped_output(ctx: &dyn NativeContext, this: ObjectRef) -> Option<ObjectRef> {
     match ctx.get_field_by_name(this, "out") {
         Value::Object(Some(out)) => Some(out),
@@ -29633,6 +29766,17 @@ fn register_annotation_overrides(registry: &mut NativeMethodRegistry) {
     // identity/return-this no-ops are available without the JIT/interpreter
     // having to resolve the override on the receiver's pipeline class.
     crate::streams::register_stream_overrides(registry);
+
+    // Spring XML namespace parsing: preserve validation and namespace-aware
+    // parsing, but attach a VM-wide Xerces grammar pool so repeated
+    // GenericXmlApplicationContext loads of the same Spring XSDs reuse parsed
+    // grammars instead of reparsing them for every inherited JUnit method.
+    registry.register(
+        "org/springframework/beans/factory/xml/DefaultDocumentLoader",
+        "createDocumentBuilderFactory",
+        "(IZ)Ljavax/xml/parsers/DocumentBuilderFactory;",
+        native_spring_default_document_loader_create_document_builder_factory,
+    );
 
     // EUREKA-LOGBACK-CLEANUP: Spring Boot's `LogbackLoggingSystem.cleanUp`
     // crashes every Spring Boot app (eureka-server is the canonical
