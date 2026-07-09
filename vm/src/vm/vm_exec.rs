@@ -480,6 +480,66 @@ fn pin_value_for_native_call(shared: &SharedVm, roots: &mut Vec<ObjectRef>, v: &
     }
 }
 
+fn recover_stale_lambda_receiver_from_native_pins(
+    shared: &SharedVm,
+    thread: &JvmThread,
+    receiver_class_id: ClassId,
+    method_name: &str,
+    descriptor: &str,
+    args: &[Value],
+) -> Option<ObjectRef> {
+    if is_object_member(method_name, descriptor) {
+        return None;
+    }
+
+    let stale_object_receiver = receiver_class_id == ClassId::new(0)
+        || receiver_class_id == ClassId::new(u32::MAX)
+        || shared
+            .class_manager
+            .read()
+            .get_class(receiver_class_id)
+            .map(|class| class.name.as_ref() == "java/lang/Object")
+            .unwrap_or(false);
+    if !stale_object_receiver {
+        return None;
+    }
+
+    let sam_arg_count = crate::runtime::interpreter::split_method_descriptor(descriptor)
+        .0
+        .len();
+    if sam_arg_count != args.len() {
+        return None;
+    }
+
+    let proxies = shared.lambda_proxies.read();
+    for pinned in thread.native_pin_roots.iter().rev().copied() {
+        let pinned = shared.heap.load_and_forward(pinned);
+        let pinned_class_id = shared.heap.class_id_of(pinned);
+        let Some(call_site) = proxies.get(&pinned_class_id) else {
+            continue;
+        };
+
+        if method_name == &*call_site.sam_method_name
+            && descriptor == &*call_site.sam_descriptor
+            && crate::runtime::interpreter::lambda_args_sam_compatible(
+                shared,
+                &call_site.sam_descriptor,
+                args,
+            )
+        {
+            if crate::runtime::env_cache::nsme_dbg() {
+                eprintln!(
+                    "[NSME_DBG] recovered stale lambda receiver for {}{} from native pins",
+                    method_name, descriptor
+                );
+            }
+            return Some(pinned);
+        }
+    }
+
+    None
+}
+
 /// Call a native callback, catching panics and converting them to
 /// `MethodCallFailed` so that a bug in a native method doesn't crash the VM.
 /// Cached `CRATONVM_DBG_YOUNGSCAN` gate (bc math-ec `0x4` mutator-write hunt).
@@ -5812,7 +5872,19 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
         descriptor: &str,
         args: &[Value],
     ) -> MethodCallResult {
-        let receiver_class_id = self.shared.heap.class_id_of(receiver);
+        let mut receiver = self.shared.heap.load_and_forward(receiver);
+        let mut receiver_class_id = self.shared.heap.class_id_of(receiver);
+        if let Some(recovered) = recover_stale_lambda_receiver_from_native_pins(
+            self.shared,
+            &*self.thread,
+            receiver_class_id,
+            method_name,
+            descriptor,
+            args,
+        ) {
+            receiver = recovered;
+            receiver_class_id = self.shared.heap.class_id_of(receiver);
+        }
 
         // Check if the receiver is a lambda proxy.
         let call_site = {
