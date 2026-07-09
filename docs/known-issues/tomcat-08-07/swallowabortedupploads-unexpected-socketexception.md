@@ -47,3 +47,42 @@ semantics. Likely a real-socket / NIO-connector behavioral gap rather than a
 pure VM correctness bug — worth checking against other socket-abort-related
 findings from this investigation (`TestAccessLogValve`/`TestRewriteValve`'s
 `-1` symptom, if related).
+
+## 2026-07-09 worker isolation
+
+Candidate root cause confirmed at the native socket contract level:
+`native-io/src/socket_channel.rs::sc_close` unconditionally called
+`TcpStream::shutdown(Shutdown::Both)` before dropping a Tomcat NIO
+`SocketChannel`. On Windows, closing the read side while the peer is still
+uploading request-body bytes is abortive/RST-prone and matches the client-side
+`WSAECONNABORTED` (`os error 10053`) observed here.
+
+Candidate fix in branch `codex/fix-tomcat0807-http-close-20260709-001`:
+`sc_close` now sends only the write-side FIN and starts a bounded background
+drain on a cloned stream (`lingering_channel_close`) so a client can finish
+writing already-in-flight upload bytes without receiving a reset. This preserves
+the earlier selector-wakeup requirement (the peer still sees EOF) without using
+`Shutdown::Both`.
+
+Focused proof run:
+
+```powershell
+$env:CARGO_TARGET_DIR='C:\craton\target-tomcat0807-http-private-20260709-001'
+cargo test -p cratonvm-native-io socket_channel::tests -- --nocapture
+# 7 passed, including tomcat0807_http_lingering_channel_close_drains_peer_upload
+```
+
+Connector smoke run:
+
+```powershell
+# Unique binary:
+# C:\craton\target-tomcat0807-http-private-20260709-001\debug\cratonvm-tomcat0807-http-20260709-001.exe
+# Unique probe class:
+# C:\craton\smoke-cache-tomcat0807-http-20260709-001\fixture\Tomcat0807HttpSmoke.java
+# Result:
+# TOMCAT0807_HTTP_BODY=TOMCAT0807_HTTP_SMOKE_OK
+```
+
+The full `apps/tomcat-suite-runner` checkout is not present in this worktree,
+so `org.apache.catalina.core.TestSwallowAbortedUploads` itself still needs an
+isolated rerun before this note can be archived.
