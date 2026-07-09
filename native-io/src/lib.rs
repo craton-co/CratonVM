@@ -5568,6 +5568,182 @@ fn bb_state(
     Ok((arr, pos, lim, cap))
 }
 
+#[derive(Clone, Copy)]
+enum BbStorage {
+    Heap { arr: ObjectRef, offset: usize },
+    Direct { addr: i64 },
+}
+
+#[derive(Clone, Copy)]
+struct BbView {
+    storage: BbStorage,
+    pos: i32,
+    lim: i32,
+    cap: i32,
+}
+
+fn bb_storage_view(ctx: &dyn NativeContext, this: ObjectRef) -> Result<BbView, MethodCallFailed> {
+    let pos = buf_read_position(ctx, this).max(0);
+    let lim = buf_read_limit(ctx, this).max(pos);
+    let cap = if let Value::Int(v) = ctx.get_field_by_name(this, "capacity") {
+        v.max(0)
+    } else if let Value::Int(v) = ctx.get_field(this, BB_FIELD_CAPACITY) {
+        v.max(0)
+    } else {
+        lim
+    };
+
+    if let Some(arr) = match ctx.get_field_by_name(this, "hb") {
+        Value::Object(Some(a)) => Some(a),
+        _ => match ctx.get_field(this, 5) {
+            Value::Object(Some(a)) => Some(a),
+            _ => match ctx.get_field(this, BB_FIELD_ARRAY) {
+                Value::Object(Some(a)) => Some(a),
+                _ => None,
+            },
+        },
+    } {
+        let offset = match ctx.get_field_by_name(this, "offset") {
+            Value::Int(v) if v >= 0 => v as usize,
+            _ => match ctx.get_field(this, 6) {
+                Value::Int(v) if v >= 0 => v as usize,
+                _ => 0,
+            },
+        };
+        return Ok(BbView {
+            storage: BbStorage::Heap { arr, offset },
+            pos,
+            lim,
+            cap,
+        });
+    }
+
+    let addr = match ctx.get_field_by_name(this, "address") {
+        Value::Long(v) if v != 0 => v,
+        _ => match ctx.get_field(this, 4) {
+            Value::Long(v) if v != 0 => v,
+            _ => {
+                return Err(MethodCallFailed::InternalError(VmError::Internal {
+                    message: format!(
+                        "ByteBuffer missing backing storage (hb/slot5/address absent; field {} returned {:?} for object {:?})",
+                        BB_FIELD_ARRAY,
+                        ctx.get_field(this, BB_FIELD_ARRAY),
+                        this
+                    ),
+                }))
+            }
+        },
+    };
+    Ok(BbView {
+        storage: BbStorage::Direct { addr },
+        pos,
+        lim,
+        cap,
+    })
+}
+
+fn bb_read_byte(
+    ctx: &dyn NativeContext,
+    view: BbView,
+    index: usize,
+) -> Result<u8, MethodCallFailed> {
+    match view.storage {
+        BbStorage::Heap { arr, offset } => Ok(match ctx.get_array_element(arr, offset + index) {
+            Value::Int(v) => v as u8,
+            _ => 0,
+        }),
+        BbStorage::Direct { addr } => {
+            let mut b = [0u8; 1];
+            if ctx.copy_from_native_memory(addr.saturating_add(index as i64), &mut b) {
+                Ok(b[0])
+            } else {
+                Err(MethodCallFailed::InternalError(VmError::Internal {
+                    message: format!("ByteBuffer direct read failed at address 0x{:x}", addr),
+                }))
+            }
+        }
+    }
+}
+
+fn bb_write_byte(
+    ctx: &mut dyn NativeContext,
+    view: BbView,
+    index: usize,
+    byte: u8,
+) -> Result<(), MethodCallFailed> {
+    match view.storage {
+        BbStorage::Heap { arr, offset } => {
+            ctx.set_array_element(arr, offset + index, Value::Int(byte as i8 as i32));
+            Ok(())
+        }
+        BbStorage::Direct { addr } => {
+            if ctx.copy_to_native_memory(addr.saturating_add(index as i64), &[byte]) {
+                Ok(())
+            } else {
+                Err(MethodCallFailed::InternalError(VmError::Internal {
+                    message: format!("ByteBuffer direct write failed at address 0x{:x}", addr),
+                }))
+            }
+        }
+    }
+}
+
+fn bb_read_bytes(
+    ctx: &dyn NativeContext,
+    view: BbView,
+    start: usize,
+    out: &mut [u8],
+) -> Result<(), MethodCallFailed> {
+    match view.storage {
+        BbStorage::Heap { arr, offset } => {
+            for (i, byte) in out.iter_mut().enumerate() {
+                *byte = match ctx.get_array_element(arr, offset + start + i) {
+                    Value::Int(v) => v as u8,
+                    _ => 0,
+                };
+            }
+            Ok(())
+        }
+        BbStorage::Direct { addr } => {
+            if ctx.copy_from_native_memory(addr.saturating_add(start as i64), out) {
+                Ok(())
+            } else {
+                Err(MethodCallFailed::InternalError(VmError::Internal {
+                    message: format!("ByteBuffer direct bulk read failed at address 0x{:x}", addr),
+                }))
+            }
+        }
+    }
+}
+
+fn bb_write_bytes(
+    ctx: &mut dyn NativeContext,
+    view: BbView,
+    start: usize,
+    data: &[u8],
+) -> Result<(), MethodCallFailed> {
+    match view.storage {
+        BbStorage::Heap { arr, offset } => {
+            for (i, &byte) in data.iter().enumerate() {
+                ctx.set_array_element(arr, offset + start + i, Value::Int(byte as i8 as i32));
+            }
+            Ok(())
+        }
+        BbStorage::Direct { addr } => {
+            if ctx.copy_to_native_memory(addr.saturating_add(start as i64), data) {
+                Ok(())
+            } else {
+                Err(MethodCallFailed::InternalError(VmError::Internal {
+                    message: format!(
+                        "ByteBuffer direct bulk write failed at address 0x{:x}",
+                        addr
+                    ),
+                }))
+            }
+        }
+    }
+}
+
 /// JDK-faithful bounds test for a typed-buffer ABSOLUTE accessor: a `width`-byte
 /// read/write at `index` is valid iff `0 <= index` and `index + width <= bound`.
 /// Uses checked arithmetic so a large positive `index` (near `i32::MAX`) cannot
@@ -6223,12 +6399,16 @@ fn native_bb_compact(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallR
         Some(Value::Object(Some(o))) => *o,
         _ => return Ok(Some(Value::Object(None))),
     };
-    let (arr, pos, lim, cap) = bb_state(ctx, this)?;
+    let view = bb_storage_view(ctx, this)?;
+    let pos = view.pos;
+    let lim = view.lim;
+    let cap = view.cap;
     let remaining = (lim - pos) as usize;
     // Copy remaining bytes to beginning
+    let mut bytes = vec![0u8; remaining];
+    bb_read_bytes(ctx, view, pos as usize, &mut bytes)?;
     for i in 0..remaining {
-        let v = ctx.get_array_element(arr, pos as usize + i);
-        ctx.set_array_element(arr, i, v);
+        bb_write_byte(ctx, view, i, bytes[i])?;
     }
     buf_set_position(ctx, this, remaining as i32);
     buf_set_limit(ctx, this, cap);
@@ -6243,14 +6423,16 @@ fn native_bb_get(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResul
         Some(Value::Object(Some(o))) => *o,
         _ => return Ok(Some(Value::Int(0))),
     };
-    let (arr, pos, lim, _) = bb_state(ctx, this)?;
+    let view = bb_storage_view(ctx, this)?;
+    let pos = view.pos;
+    let lim = view.lim;
     if pos >= lim {
         return Err(RuntimeError::IllegalStateException {
             message: "BufferUnderflowException".to_string(),
         }
         .into());
     }
-    let byte = ctx.get_array_element(arr, pos as usize);
+    let byte = Value::Int(bb_read_byte(ctx, view, pos as usize)? as i8 as i32);
     buf_set_position(ctx, this, pos + 1);
     Ok(Some(byte))
 }
@@ -6264,14 +6446,15 @@ fn native_bb_get_abs(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallR
         Some(Value::Int(v)) => *v,
         _ => 0,
     };
-    let (arr, _, _, cap) = bb_state(ctx, this)?;
+    let view = bb_storage_view(ctx, this)?;
+    let cap = view.cap;
     if index < 0 || index >= cap {
         return Err(RuntimeError::IllegalArgumentException {
             message: "IndexOutOfBoundsException".to_string(),
         }
         .into());
     }
-    let byte = ctx.get_array_element(arr, index as usize);
+    let byte = Value::Int(bb_read_byte(ctx, view, index as usize)? as i8 as i32);
     Ok(Some(byte))
 }
 
@@ -6298,7 +6481,9 @@ fn native_bb_get_bulk(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
     // checking the buffer's `remaining`. Without this a negative Java offset
     // becomes a huge usize and the per-element loop writes out of range.
     check_array_bounds(offset, length, ctx.array_length(dst))?;
-    let (arr, pos, lim, _) = bb_state(ctx, this)?;
+    let view = bb_storage_view(ctx, this)?;
+    let pos = view.pos;
+    let lim = view.lim;
     let remaining = (lim - pos) as usize;
     let length = length as usize;
     let offset = offset as usize;
@@ -6306,8 +6491,8 @@ fn native_bb_get_bulk(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
         return Err(RuntimeError::BufferUnderflowException.into());
     }
     for i in 0..length {
-        let v = ctx.get_array_element(arr, pos as usize + i);
-        ctx.set_array_element(dst, offset + i, v);
+        let v = bb_read_byte(ctx, view, pos as usize + i)? as i8 as i32;
+        ctx.set_array_element(dst, offset + i, Value::Int(v));
     }
     buf_set_position(ctx, this, pos + length as i32);
     Ok(Some(Value::Object(Some(this))))
@@ -6319,14 +6504,16 @@ fn native_bb_put(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResul
         _ => return Ok(Some(Value::Object(None))),
     };
     let byte = args.get(1).copied().unwrap_or(Value::Int(0));
-    let (arr, pos, lim, _) = bb_state(ctx, this)?;
+    let view = bb_storage_view(ctx, this)?;
+    let pos = view.pos;
+    let lim = view.lim;
     if pos >= lim {
         return Err(RuntimeError::IllegalStateException {
             message: "BufferOverflowException".to_string(),
         }
         .into());
     }
-    ctx.set_array_element(arr, pos as usize, byte);
+    bb_write_byte(ctx, view, pos as usize, byte.as_int().unwrap_or(0) as u8)?;
     buf_set_position(ctx, this, pos + 1);
     Ok(Some(Value::Object(Some(this))))
 }
@@ -6341,14 +6528,15 @@ fn native_bb_put_abs(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallR
         _ => 0,
     };
     let byte = args.get(2).copied().unwrap_or(Value::Int(0));
-    let (arr, _, _, cap) = bb_state(ctx, this)?;
+    let view = bb_storage_view(ctx, this)?;
+    let cap = view.cap;
     if index < 0 || index >= cap {
         return Err(RuntimeError::IllegalArgumentException {
             message: "IndexOutOfBoundsException".to_string(),
         }
         .into());
     }
-    ctx.set_array_element(arr, index as usize, byte);
+    bb_write_byte(ctx, view, index as usize, byte.as_int().unwrap_or(0) as u8)?;
     Ok(Some(Value::Object(Some(this))))
 }
 
@@ -6374,7 +6562,9 @@ fn native_bb_put_bulk(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
     // IndexOutOfBoundsException), rejecting negatives and overflow, BEFORE
     // checking the buffer's `remaining`.
     check_array_bounds(offset, length, ctx.array_length(src))?;
-    let (arr, pos, lim, _) = bb_state(ctx, this)?;
+    let view = bb_storage_view(ctx, this)?;
+    let pos = view.pos;
+    let lim = view.lim;
     let remaining = (lim - pos) as usize;
     let length = length as usize;
     let offset = offset as usize;
@@ -6382,8 +6572,11 @@ fn native_bb_put_bulk(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
         return Err(RuntimeError::BufferOverflowException.into());
     }
     for i in 0..length {
-        let v = ctx.get_array_element(src, offset + i);
-        ctx.set_array_element(arr, pos as usize + i, v);
+        let v = match ctx.get_array_element(src, offset + i) {
+            Value::Int(v) => v as u8,
+            _ => 0,
+        };
+        bb_write_byte(ctx, view, pos as usize + i, v)?;
     }
     buf_set_position(ctx, this, pos + length as i32);
     Ok(Some(Value::Object(Some(this))))
@@ -6398,9 +6591,13 @@ fn native_bb_put_bb(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRe
         Some(Value::Object(Some(o))) => *o,
         _ => return Ok(Some(Value::Object(Some(this)))),
     };
-    let (src_arr, src_pos, src_lim, _) = bb_state(ctx, src)?;
+    let src_view = bb_storage_view(ctx, src)?;
+    let src_pos = src_view.pos;
+    let src_lim = src_view.lim;
     let src_remaining = (src_lim - src_pos) as usize;
-    let (arr, pos, lim, _) = bb_state(ctx, this)?;
+    let view = bb_storage_view(ctx, this)?;
+    let pos = view.pos;
+    let lim = view.lim;
     let remaining = (lim - pos) as usize;
     if src_remaining > remaining {
         return Err(RuntimeError::IllegalStateException {
@@ -6409,8 +6606,8 @@ fn native_bb_put_bb(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRe
         .into());
     }
     for i in 0..src_remaining {
-        let v = ctx.get_array_element(src_arr, src_pos as usize + i);
-        ctx.set_array_element(arr, pos as usize + i, v);
+        let v = bb_read_byte(ctx, src_view, src_pos as usize + i)?;
+        bb_write_byte(ctx, view, pos as usize + i, v)?;
     }
     buf_set_position(ctx, this, pos + src_remaining as i32);
     buf_set_position(ctx, src, src_lim);
@@ -6424,7 +6621,9 @@ fn native_bb_get_int(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallR
         Some(Value::Object(Some(o))) => *o,
         _ => return Ok(Some(Value::Int(0))),
     };
-    let (arr, pos, lim, _) = bb_state(ctx, this)?;
+    let view = bb_storage_view(ctx, this)?;
+    let pos = view.pos;
+    let lim = view.lim;
     if pos + 4 > lim {
         return Err(RuntimeError::IllegalStateException {
             message: "BufferUnderflowException".to_string(),
@@ -6432,12 +6631,7 @@ fn native_bb_get_int(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallR
         .into());
     }
     let mut bytes = [0u8; 4];
-    for (i, byte) in bytes.iter_mut().enumerate() {
-        *byte = match ctx.get_array_element(arr, (pos + i as i32) as usize) {
-            Value::Int(v) => v as u8,
-            _ => 0,
-        };
-    }
+    bb_read_bytes(ctx, view, pos as usize, &mut bytes)?;
     buf_set_position(ctx, this, pos + 4);
     Ok(Some(Value::Int(i32::from_be_bytes(bytes))))
 }
@@ -6451,7 +6645,8 @@ fn native_bb_get_int_abs(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
         Some(Value::Int(v)) => *v,
         _ => 0,
     };
-    let (arr, _, _, cap) = bb_state(ctx, this)?;
+    let view = bb_storage_view(ctx, this)?;
+    let cap = view.cap;
     if !abs_access_in_bounds(index, 4, cap) {
         return Err(RuntimeError::IllegalArgumentException {
             message: "IndexOutOfBoundsException".to_string(),
@@ -6459,12 +6654,7 @@ fn native_bb_get_int_abs(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
         .into());
     }
     let mut bytes = [0u8; 4];
-    for (i, byte) in bytes.iter_mut().enumerate() {
-        *byte = match ctx.get_array_element(arr, (index + i as i32) as usize) {
-            Value::Int(v) => v as u8,
-            _ => 0,
-        };
-    }
+    bb_read_bytes(ctx, view, index as usize, &mut bytes)?;
     Ok(Some(Value::Int(i32::from_be_bytes(bytes))))
 }
 
@@ -6477,7 +6667,9 @@ fn native_bb_put_int(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallR
         Some(Value::Int(v)) => *v,
         _ => 0,
     };
-    let (arr, pos, lim, _) = bb_state(ctx, this)?;
+    let view = bb_storage_view(ctx, this)?;
+    let pos = view.pos;
+    let lim = view.lim;
     if pos + 4 > lim {
         return Err(RuntimeError::IllegalStateException {
             message: "BufferOverflowException".to_string(),
@@ -6485,9 +6677,7 @@ fn native_bb_put_int(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallR
         .into());
     }
     let bytes = val.to_be_bytes();
-    for (i, &b) in bytes.iter().enumerate() {
-        ctx.set_array_element(arr, (pos + i as i32) as usize, Value::Int(b as i32));
-    }
+    bb_write_bytes(ctx, view, pos as usize, &bytes)?;
     buf_set_position(ctx, this, pos + 4);
     Ok(Some(Value::Object(Some(this))))
 }
@@ -6505,7 +6695,8 @@ fn native_bb_put_int_abs(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
         Some(Value::Int(v)) => *v,
         _ => 0,
     };
-    let (arr, _, _, cap) = bb_state(ctx, this)?;
+    let view = bb_storage_view(ctx, this)?;
+    let cap = view.cap;
     if !abs_access_in_bounds(index, 4, cap) {
         return Err(RuntimeError::IllegalArgumentException {
             message: "IndexOutOfBoundsException".to_string(),
@@ -6513,9 +6704,7 @@ fn native_bb_put_int_abs(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
         .into());
     }
     let bytes = val.to_be_bytes();
-    for (i, &b) in bytes.iter().enumerate() {
-        ctx.set_array_element(arr, (index + i as i32) as usize, Value::Int(b as i32));
-    }
+    bb_write_bytes(ctx, view, index as usize, &bytes)?;
     Ok(Some(Value::Object(Some(this))))
 }
 
@@ -6524,7 +6713,9 @@ fn native_bb_get_long(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
         Some(Value::Object(Some(o))) => *o,
         _ => return Ok(Some(Value::Long(0))),
     };
-    let (arr, pos, lim, _) = bb_state(ctx, this)?;
+    let view = bb_storage_view(ctx, this)?;
+    let pos = view.pos;
+    let lim = view.lim;
     if pos + 8 > lim {
         return Err(RuntimeError::IllegalStateException {
             message: "BufferUnderflowException".to_string(),
@@ -6532,12 +6723,7 @@ fn native_bb_get_long(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
         .into());
     }
     let mut bytes = [0u8; 8];
-    for (i, byte) in bytes.iter_mut().enumerate() {
-        *byte = match ctx.get_array_element(arr, (pos + i as i32) as usize) {
-            Value::Int(v) => v as u8,
-            _ => 0,
-        };
-    }
+    bb_read_bytes(ctx, view, pos as usize, &mut bytes)?;
     buf_set_position(ctx, this, pos + 8);
     Ok(Some(Value::Long(i64::from_be_bytes(bytes))))
 }
@@ -6551,7 +6737,9 @@ fn native_bb_put_long(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
         Some(Value::Long(v)) => *v,
         _ => 0,
     };
-    let (arr, pos, lim, _) = bb_state(ctx, this)?;
+    let view = bb_storage_view(ctx, this)?;
+    let pos = view.pos;
+    let lim = view.lim;
     if pos + 8 > lim {
         return Err(RuntimeError::IllegalStateException {
             message: "BufferOverflowException".to_string(),
@@ -6559,9 +6747,7 @@ fn native_bb_put_long(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
         .into());
     }
     let bytes = val.to_be_bytes();
-    for (i, &b) in bytes.iter().enumerate() {
-        ctx.set_array_element(arr, (pos + i as i32) as usize, Value::Int(b as i32));
-    }
+    bb_write_bytes(ctx, view, pos as usize, &bytes)?;
     buf_set_position(ctx, this, pos + 8);
     Ok(Some(Value::Object(Some(this))))
 }
@@ -6571,23 +6757,19 @@ fn native_bb_get_short(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCal
         Some(Value::Object(Some(o))) => *o,
         _ => return Ok(Some(Value::Int(0))),
     };
-    let (arr, pos, lim, _) = bb_state(ctx, this)?;
+    let view = bb_storage_view(ctx, this)?;
+    let pos = view.pos;
+    let lim = view.lim;
     if pos + 2 > lim {
         return Err(RuntimeError::IllegalStateException {
             message: "BufferUnderflowException".to_string(),
         }
         .into());
     }
-    let b0 = match ctx.get_array_element(arr, pos as usize) {
-        Value::Int(v) => v as u8,
-        _ => 0,
-    };
-    let b1 = match ctx.get_array_element(arr, (pos + 1) as usize) {
-        Value::Int(v) => v as u8,
-        _ => 0,
-    };
+    let mut bytes = [0u8; 2];
+    bb_read_bytes(ctx, view, pos as usize, &mut bytes)?;
     buf_set_position(ctx, this, pos + 2);
-    Ok(Some(Value::Int(i16::from_be_bytes([b0, b1]) as i32)))
+    Ok(Some(Value::Int(i16::from_be_bytes(bytes) as i32)))
 }
 
 fn native_bb_put_short(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
@@ -6599,7 +6781,9 @@ fn native_bb_put_short(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCal
         Some(Value::Int(v)) => *v as i16,
         _ => 0,
     };
-    let (arr, pos, lim, _) = bb_state(ctx, this)?;
+    let view = bb_storage_view(ctx, this)?;
+    let pos = view.pos;
+    let lim = view.lim;
     if pos + 2 > lim {
         return Err(RuntimeError::IllegalStateException {
             message: "BufferOverflowException".to_string(),
@@ -6607,8 +6791,7 @@ fn native_bb_put_short(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCal
         .into());
     }
     let bytes = val.to_be_bytes();
-    ctx.set_array_element(arr, pos as usize, Value::Int(bytes[0] as i32));
-    ctx.set_array_element(arr, (pos + 1) as usize, Value::Int(bytes[1] as i32));
+    bb_write_bytes(ctx, view, pos as usize, &bytes)?;
     buf_set_position(ctx, this, pos + 2);
     Ok(Some(Value::Object(Some(this))))
 }
@@ -6678,19 +6861,53 @@ fn native_bb_array(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRes
         Some(Value::Object(Some(o))) => *o,
         _ => return Ok(Some(Value::Object(None))),
     };
-    Ok(Some(ctx.get_field(this, BB_FIELD_ARRAY)))
+    match bb_storage_view(ctx, this)?.storage {
+        BbStorage::Heap { arr, .. } => Ok(Some(Value::Object(Some(arr)))),
+        BbStorage::Direct { .. } => Err(RuntimeError::UnsupportedOperationException {
+            message: "ByteBuffer has no backing array".into(),
+        }
+        .into()),
+    }
 }
 
-fn native_bb_has_array(_ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
-    Ok(Some(Value::Int(1))) // always heap-backed
+fn native_bb_has_array(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(o))) => *o,
+        _ => return Ok(Some(Value::Int(0))),
+    };
+    Ok(Some(Value::Int(
+        match bb_storage_view(ctx, this)?.storage {
+            BbStorage::Heap { .. } => 1,
+            BbStorage::Direct { .. } => 0,
+        },
+    )))
 }
 
-fn native_bb_array_offset(_ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
-    Ok(Some(Value::Int(0)))
+fn native_bb_array_offset(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(o))) => *o,
+        _ => return Ok(Some(Value::Int(0))),
+    };
+    match bb_storage_view(ctx, this)?.storage {
+        BbStorage::Heap { offset, .. } => Ok(Some(Value::Int(offset as i32))),
+        BbStorage::Direct { .. } => Err(RuntimeError::UnsupportedOperationException {
+            message: "ByteBuffer has no backing array".into(),
+        }
+        .into()),
+    }
 }
 
-fn native_bb_is_direct(_ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
-    Ok(Some(Value::Int(0))) // always heap
+fn native_bb_is_direct(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(o))) => *o,
+        _ => return Ok(Some(Value::Int(0))),
+    };
+    Ok(Some(Value::Int(
+        match bb_storage_view(ctx, this)?.storage {
+            BbStorage::Heap { .. } => 0,
+            BbStorage::Direct { .. } => 1,
+        },
+    )))
 }
 
 fn native_bb_is_read_only(_ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
@@ -6702,14 +6919,17 @@ fn native_bb_duplicate(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCal
         Some(Value::Object(Some(o))) => *o,
         _ => return Ok(Some(Value::Object(None))),
     };
-    let (arr, pos, lim, cap) = bb_state(ctx, this)?;
+    let view = bb_storage_view(ctx, this)?;
+    let pos = view.pos;
+    let lim = view.lim;
+    let cap = view.cap;
     let mark = buf_read_mark(ctx, this);
-    let dup = match ctx.ensure_class_initialized("java/nio/ByteBuffer") {
-        Ok(cid) => ctx.alloc_object(cid, BB_NUM_FIELDS),
-        Err(_) => ctx.alloc_object(cratonvm_types::ClassId::new(0), BB_NUM_FIELDS),
-    };
-    ctx.set_field(dup, BB_FIELD_ARRAY, Value::Object(Some(arr))); // shares backing array
-    ctx.set_field_by_name(dup, "hb", Value::Object(Some(arr)));
+    let dup = alloc_byte_buffer(ctx, cap as usize);
+    let dup_view = bb_storage_view(ctx, dup)?;
+    for i in 0..cap as usize {
+        let b = bb_read_byte(ctx, view, i)?;
+        bb_write_byte(ctx, dup_view, i, b)?;
+    }
     buf_write_metadata(ctx, dup, pos, lim, cap, mark);
     Ok(Some(Value::Object(Some(dup))))
 }
@@ -6719,14 +6939,16 @@ fn native_bb_slice(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRes
         Some(Value::Object(Some(o))) => *o,
         _ => return Ok(Some(Value::Object(None))),
     };
-    let (arr, pos, lim, _) = bb_state(ctx, this)?;
+    let view = bb_storage_view(ctx, this)?;
+    let pos = view.pos;
+    let lim = view.lim;
     let remaining = (lim - pos) as usize;
     // Create a new buffer with a copy of the remaining bytes
     let new_bb = alloc_byte_buffer(ctx, remaining);
-    let (new_arr, _, _, _) = bb_state(ctx, new_bb)?;
+    let new_view = bb_storage_view(ctx, new_bb)?;
     for i in 0..remaining {
-        let v = ctx.get_array_element(arr, pos as usize + i);
-        ctx.set_array_element(new_arr, i, v);
+        let v = bb_read_byte(ctx, view, pos as usize + i)?;
+        bb_write_byte(ctx, new_view, i, v)?;
     }
     Ok(Some(Value::Object(Some(new_bb))))
 }
@@ -6736,8 +6958,15 @@ fn native_bb_to_string(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCal
         Some(Value::Object(Some(o))) => *o,
         _ => return Ok(Some(Value::Object(None))),
     };
-    let (_, pos, lim, cap) = bb_state(ctx, this)?;
-    let s = format!("java.nio.HeapByteBuffer[pos={pos} lim={lim} cap={cap}]");
+    let view = bb_storage_view(ctx, this)?;
+    let kind = match view.storage {
+        BbStorage::Heap { .. } => "HeapByteBuffer",
+        BbStorage::Direct { .. } => "DirectByteBuffer",
+    };
+    let s = format!(
+        "java.nio.{kind}[pos={} lim={} cap={}]",
+        view.pos, view.lim, view.cap
+    );
     let obj = ctx.create_string(&s);
     Ok(Some(Value::Object(Some(obj))))
 }
@@ -6802,7 +7031,9 @@ fn native_fc_read(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResu
         Value::Int(v) => v as u32,
         _ => return Ok(Some(Value::Int(-1))),
     };
-    let (arr, pos, lim, _) = bb_state(ctx, bb)?;
+    let view = bb_storage_view(ctx, bb)?;
+    let pos = view.pos;
+    let lim = view.lim;
     let remaining = (lim - pos) as usize;
     if remaining == 0 {
         return Ok(Some(Value::Int(0)));
@@ -6821,7 +7052,7 @@ fn native_fc_read(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResu
     }
 
     for (i, &b) in buf.iter().enumerate().take(n) {
-        ctx.set_array_element(arr, pos as usize + i, Value::Int(b as i8 as i32));
+        bb_write_byte(ctx, view, pos as usize + i, b)?;
     }
     buf_set_position(ctx, bb, pos + n as i32);
     // Update file position
@@ -6846,19 +7077,16 @@ fn native_fc_write(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRes
         Value::Int(v) => v as u32,
         _ => return Ok(Some(Value::Int(0))),
     };
-    let (arr, pos, lim, _) = bb_state(ctx, bb)?;
+    let view = bb_storage_view(ctx, bb)?;
+    let pos = view.pos;
+    let lim = view.lim;
     let remaining = (lim - pos) as usize;
     if remaining == 0 {
         return Ok(Some(Value::Int(0)));
     }
 
     let mut buf = vec![0u8; remaining];
-    for (i, byte) in buf.iter_mut().enumerate() {
-        *byte = match ctx.get_array_element(arr, pos as usize + i) {
-            Value::Int(v) => v as u8,
-            _ => 0,
-        };
-    }
+    bb_read_bytes(ctx, view, pos as usize, &mut buf)?;
     // I/O-error-fix: previously the write result was `unwrap_or(())`-ed and
     // we unconditionally claimed `n == buf.len()` bytes written, advancing
     // the buffer position and file position even when the underlying write
@@ -13738,7 +13966,9 @@ fn native_afc_read(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRes
         _ => return Ok(Some(Value::Int(-1))),
     };
 
-    let (arr, pos, lim, _) = bb_state(ctx, bb)?;
+    let view = bb_storage_view(ctx, bb)?;
+    let pos = view.pos;
+    let lim = view.lim;
     let remaining = (lim - pos) as usize;
     if remaining == 0 {
         return Ok(Some(wrap_completed_future(ctx, Value::Int(0))));
@@ -13754,7 +13984,7 @@ fn native_afc_read(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRes
     }
 
     for (i, &b) in buf.iter().enumerate().take(n) {
-        ctx.set_array_element(arr, pos as usize + i, Value::Int(b as i8 as i32));
+        bb_write_byte(ctx, view, pos as usize + i, b)?;
     }
     buf_set_position(ctx, bb, pos + n as i32);
     Ok(Some(wrap_completed_future(ctx, Value::Int(n as i32))))
@@ -13777,18 +14007,16 @@ fn native_afc_write(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRe
         _ => return Ok(Some(Value::Int(-1))),
     };
 
-    let (arr, pos, lim, _) = bb_state(ctx, bb)?;
+    let view = bb_storage_view(ctx, bb)?;
+    let pos = view.pos;
+    let lim = view.lim;
     let remaining = (lim - pos) as usize;
     if remaining == 0 {
         return Ok(Some(wrap_completed_future(ctx, Value::Int(0))));
     }
 
     let mut data = vec![0u8; remaining];
-    for i in 0..remaining {
-        if let Value::Int(b) = ctx.get_array_element(arr, pos as usize + i) {
-            data[i] = b as u8;
-        }
-    }
+    bb_read_bytes(ctx, view, pos as usize, &mut data)?;
 
     let n = afc_write_at(handle_id, &data, position).map_err(|e| RuntimeError::IOException {
         message: format!("async write: {e}"),
@@ -14691,7 +14919,9 @@ fn native_dc_receive(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallR
         _ => return Ok(Some(Value::Object(None))),
     };
 
-    let (arr, pos, lim, _) = bb_state(ctx, bb)?;
+    let view = bb_storage_view(ctx, bb)?;
+    let pos = view.pos;
+    let lim = view.lim;
     let remaining = (lim - pos) as usize;
     if remaining == 0 {
         return Ok(Some(Value::Object(None)));
@@ -14706,7 +14936,7 @@ fn native_dc_receive(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallR
             })?;
 
     for (i, &b) in buf.iter().enumerate().take(n) {
-        ctx.set_array_element(arr, pos as usize + i, Value::Int(b as i8 as i32));
+        bb_write_byte(ctx, view, pos as usize + i, b)?;
     }
     buf_set_position(ctx, bb, pos + n as i32);
 
@@ -17492,6 +17722,68 @@ mod buffer_bounds_tests {
         for i in 0..4 {
             assert_eq!(ctx.get_array_element(dst, i), Value::Int((i as i32) + 1));
         }
+    }
+
+    #[test]
+    fn bb_get_bulk_reads_real_heap_layout_slot_hb() {
+        let mut ctx = MockNativeContext::new();
+        let arr = ctx.new_array(ArrayElementType::Byte, 8);
+        for (i, b) in [9, 10, 11, 12].iter().enumerate() {
+            ctx.set_array_element(arr, 2 + i, Value::Int(*b));
+        }
+        let bb = ctx.alloc_object(8);
+        ctx.set_field(bb, 0, Value::Int(-1)); // mark
+        ctx.set_field(bb, 1, Value::Int(1)); // position
+        ctx.set_field(bb, 2, Value::Int(4)); // limit
+        ctx.set_field(bb, 3, Value::Int(4)); // capacity
+        ctx.set_field(bb, 5, Value::Object(Some(arr))); // ByteBuffer.hb
+        ctx.set_field(bb, 6, Value::Int(2)); // ByteBuffer.offset
+
+        let dst = ctx.new_array(ArrayElementType::Byte, 3);
+        native_bb_get_bulk(
+            &mut ctx,
+            &[
+                Value::Object(Some(bb)),
+                Value::Object(Some(dst)),
+                Value::Int(0),
+                Value::Int(3),
+            ],
+        )
+        .unwrap();
+
+        assert_eq!(ctx.get_array_element(dst, 0), Value::Int(10));
+        assert_eq!(ctx.get_array_element(dst, 1), Value::Int(11));
+        assert_eq!(ctx.get_array_element(dst, 2), Value::Int(12));
+        assert_eq!(ctx.get_field(bb, 1), Value::Int(4));
+    }
+
+    #[test]
+    fn bb_get_bulk_reads_direct_buffer_address() {
+        let mut ctx = MockNativeContext::new();
+        let mut native = vec![21u8, 22, 23, 24];
+        let bb = ctx.alloc_object(8);
+        ctx.set_field(bb, 0, Value::Int(-1)); // mark
+        ctx.set_field(bb, 1, Value::Int(1)); // position
+        ctx.set_field(bb, 2, Value::Int(4)); // limit
+        ctx.set_field(bb, 3, Value::Int(4)); // capacity
+        ctx.set_field(bb, 4, Value::Long(native.as_mut_ptr() as i64)); // address
+
+        let dst = ctx.new_array(ArrayElementType::Byte, 3);
+        native_bb_get_bulk(
+            &mut ctx,
+            &[
+                Value::Object(Some(bb)),
+                Value::Object(Some(dst)),
+                Value::Int(0),
+                Value::Int(3),
+            ],
+        )
+        .unwrap();
+
+        assert_eq!(ctx.get_array_element(dst, 0), Value::Int(22));
+        assert_eq!(ctx.get_array_element(dst, 1), Value::Int(23));
+        assert_eq!(ctx.get_array_element(dst, 2), Value::Int(24));
+        assert_eq!(ctx.get_field(bb, 1), Value::Int(4));
     }
 
     #[test]
