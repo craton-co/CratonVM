@@ -3441,6 +3441,57 @@ pub fn register_enumeration_impl_natives(r: &mut NativeMethodRegistry) {
         ctx.set_field(this, 1, Value::Int((idx + 1) as i32));
         Ok(Some(elem))
     });
+    let anon_enm = "cratonvm/synthetic/AnonymousObject$2";
+    r.register(anon_enm, "hasMoreElements", "()Z", |ctx, args| {
+        let this = obj_arg(args, 0)?;
+        let idx = ctx.get_field(this, 1).as_int().unwrap_or(0) as usize;
+        let arr = match ctx.get_field(this, 0) {
+            Value::Object(Some(a)) => a,
+            _ => return Ok(Some(Value::Int(0))),
+        };
+        let len = ctx.array_length(arr);
+        Ok(Some(Value::Int(if idx < len { 1 } else { 0 })))
+    });
+    r.register(anon_enm, "nextElement", "()Ljava/lang/Object;", |ctx, args| {
+        let this = obj_arg(args, 0)?;
+        let idx = ctx.get_field(this, 1).as_int().unwrap_or(0) as usize;
+        let arr = match ctx.get_field(this, 0) {
+            Value::Object(Some(a)) => a,
+            _ => return Ok(Some(Value::Object(None))),
+        };
+        let len = ctx.array_length(arr);
+        if idx >= len {
+            return Ok(Some(Value::Object(None)));
+        }
+        let elem = ctx.get_array_element(arr, idx);
+        ctx.set_field(this, 1, Value::Int((idx + 1) as i32));
+        Ok(Some(elem))
+    });
+    r.register(anon_enm, "hasNext", "()Z", |ctx, args| {
+        let this = obj_arg(args, 0)?;
+        let idx = ctx.get_field(this, 1).as_int().unwrap_or(0) as usize;
+        let arr = match ctx.get_field(this, 0) {
+            Value::Object(Some(a)) => a,
+            _ => return Ok(Some(Value::Int(0))),
+        };
+        let len = ctx.array_length(arr);
+        Ok(Some(Value::Int(if idx < len { 1 } else { 0 })))
+    });
+    r.register(anon_enm, "next", "()Ljava/lang/Object;", |ctx, args| {
+        let this = obj_arg(args, 0)?;
+        let idx = ctx.get_field(this, 1).as_int().unwrap_or(0) as usize;
+        let arr = match ctx.get_field(this, 0) {
+            Value::Object(Some(a)) => a,
+            _ => return Ok(Some(Value::Object(None))),
+        };
+        let len = ctx.array_length(arr);
+        if idx >= len {
+            return Ok(Some(Value::Object(None)));
+        }
+        let elem = ctx.get_array_element(arr, idx);
+        ctx.set_field(this, 1, Value::Int((idx + 1) as i32));
+        Ok(Some(elem))
+    });
 }
 
 /// `ClassLoader.getSystemResources(String)` — static. Delegates to the
@@ -3450,17 +3501,25 @@ fn cl_get_system_resources(ctx: &mut dyn NativeContext, args: &[Value]) -> Metho
     cl_get_resources(ctx, args)
 }
 
+pub fn cl_get_resource_as_stream_essential(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    cl_get_resource_as_stream(ctx, args)
+}
+
 fn cl_get_resource_as_stream(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     // ClassLoader.getResourceAsStream(String) → InputStream.  Mirrors the
     // T19.H10 hardening on `Class.getResourceAsStream`: validate the name
     // (length, control bytes, `..`, `\`) before consulting `find_resource`,
     // and route the BAIS allocation through the shared helper so
     // ClassLoader-side and Class-side resource lookups stay layout-equal.
-    let name_obj = match args.get(1) {
-        Some(Value::Object(Some(o))) => *o,
-        _ => return Ok(Some(Value::Object(None))),
+    let Some(name) = args.iter().rev().find_map(|v| match v {
+        Value::Object(Some(o)) => ctx.read_string(*o),
+        _ => None,
+    }) else {
+        return Ok(Some(Value::Object(None)));
     };
-    let name = ctx.read_string(name_obj).unwrap_or_default();
     let resource_name = name.trim_start_matches('/');
     if crate::lang_class::t19_h10_validate_resource_name_pub(resource_name).is_none() {
         return Ok(Some(Value::Object(None)));
@@ -5655,6 +5714,18 @@ pub(crate) fn register_classloader_natives(r: &mut NativeMethodRegistry) {
         "(Ljava/lang/String;)Ljava/io/InputStream;",
         cl_get_resource_as_stream,
     );
+    for builtin_cl in [
+        "jdk/internal/loader/BuiltinClassLoader",
+        "jdk/internal/loader/ClassLoaders$AppClassLoader",
+        "jdk/internal/loader/ClassLoaders$PlatformClassLoader",
+    ] {
+        r.register(
+            builtin_cl,
+            "getResourceAsStream",
+            "(Ljava/lang/String;)Ljava/io/InputStream;",
+            cl_get_resource_as_stream,
+        );
+    }
     r.register(
         cl,
         "getDefinedPackage",

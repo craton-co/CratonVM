@@ -1604,6 +1604,9 @@ impl SharedVm {
                 // UnsatisfiedLinkError. Lives outside register_jmx_natives
                 // (which is synthetic-only) so the real-JDK path picks it up.
                 cratonvm_native_builtins::jmx::register_vm_management_impl(&mut native_methods);
+                cratonvm_native_builtins::jmx::register_management_factory_platform_server_stub(
+                    &mut native_methods,
+                );
                 // Surefire ForkedBooter: ManagementFactory.getRuntimeMXBean() and
                 // friends. The real-JDK bytecode delegates to
                 // `getPlatformMXBean(Class)` which throws "X is not a platform
@@ -2126,6 +2129,9 @@ impl SharedVm {
             // RKC16N.10: VMManagementImpl natives. See companion call
             // in the `feature = "synthetic-jdk"` branch above.
             cratonvm_native_builtins::jmx::register_vm_management_impl(&mut native_methods);
+            cratonvm_native_builtins::jmx::register_management_factory_platform_server_stub(
+                &mut native_methods,
+            );
             // Surefire ForkedBooter: ManagementFactory.getRuntimeMXBean() and
             // friends. See companion call in the `feature = "synthetic-jdk"`
             // branch above for the rationale (real-JDK bytecode delegates

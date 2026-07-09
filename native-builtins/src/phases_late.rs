@@ -1156,6 +1156,25 @@ pub(crate) fn register_phase55_executors(r: &mut NativeMethodRegistry) {
     );
     r.register(
         execs,
+        "newCachedThreadPool",
+        "(Ljava/util/concurrent/ThreadFactory;)Ljava/util/concurrent/ExecutorService;",
+        |ctx, _args| {
+            let es = alloc_concurrent_synthetic(ctx, "java/util/concurrent/ExecutorService", 4);
+            // Pin across the queue alloc below — a moving young GC there would
+            // relocate the fresh executor (native stale-local family).
+            let es_pin = ctx.pin_native_root(es);
+            ctx.set_field(es, 0, Value::Int(0));
+            ctx.set_field(es, 1, Value::Int(i32::MAX)); // unbounded
+            let queue = ctx.new_array(cratonvm_types::ArrayElementType::Reference, 64);
+            let es = ctx.read_native_pin(es_pin, es);
+            ctx.set_field(es, 2, Value::Object(Some(queue)));
+            ctx.set_field(es, 3, Value::Int(0));
+            ctx.unpin_native_roots(es_pin);
+            Ok(Some(Value::Object(Some(es))))
+        },
+    );
+    r.register(
+        execs,
         "newScheduledThreadPool",
         "(I)Ljava/util/concurrent/ScheduledExecutorService;",
         |ctx, args| {
@@ -19581,6 +19600,43 @@ pub fn register_p58_charset_coder(r: &mut NativeMethodRegistry) {
         "()Ljava/nio/charset/CharsetDecoder;",
         |_ctx, args| Ok(Some(args.first().copied().unwrap_or(Value::Object(None)))),
     );
+    r.register(
+        dec,
+        "onMalformedInput",
+        "(Ljava/nio/charset/CodingErrorAction;)Ljava/nio/charset/CharsetDecoder;",
+        |ctx, args| {
+            let this = obj_arg(args, 0)?;
+            let action = args.get(1).copied().unwrap_or(Value::Object(None));
+            ctx.set_field_by_name(this, "malformedInputAction", action);
+            Ok(Some(Value::Object(Some(this))))
+        },
+    );
+    r.register(
+        dec,
+        "onUnmappableCharacter",
+        "(Ljava/nio/charset/CodingErrorAction;)Ljava/nio/charset/CharsetDecoder;",
+        |ctx, args| {
+            let this = obj_arg(args, 0)?;
+            let action = args.get(1).copied().unwrap_or(Value::Object(None));
+            ctx.set_field_by_name(this, "unmappableCharacterAction", action);
+            Ok(Some(Value::Object(Some(this))))
+        },
+    );
+    r.register(
+        dec,
+        "replaceWith",
+        "(Ljava/lang/String;)Ljava/nio/charset/CharsetDecoder;",
+        |ctx, args| {
+            let this = obj_arg(args, 0)?;
+            let replacement = args.get(1).copied().unwrap_or(Value::Object(None));
+            ctx.set_field_by_name(this, "replacement", replacement);
+            Ok(Some(Value::Object(Some(this))))
+        },
+    );
+    r.register(dec, "replacement", "()Ljava/lang/String;", |ctx, args| {
+        let this = obj_arg(args, 0)?;
+        Ok(Some(ctx.get_field_by_name(this, "replacement")))
+    });
 
     // CoderResult constants
     let cr = "java/nio/charset/CoderResult";
@@ -19639,7 +19695,7 @@ pub fn register_p58_charset_coder(r: &mut NativeMethodRegistry) {
             };
             let avg = cratonvm_native_api::charset::average_bytes_per_char(&name);
             let max = cratonvm_native_api::charset::max_bytes_per_char(&name);
-            let enc_obj = alloc_concurrent_synthetic(ctx, "java/nio/charset/CharsetEncoder", 3);
+            let enc_obj = alloc_concurrent_synthetic(ctx, "java/nio/charset/CharsetEncoder", 6);
             ctx.set_field(enc_obj, 0, Value::Object(Some(this)));
             ctx.set_field(enc_obj, 1, Value::Float(avg));
             ctx.set_field(enc_obj, 2, Value::Float(max));
@@ -19659,10 +19715,12 @@ pub fn register_p58_charset_coder(r: &mut NativeMethodRegistry) {
             };
             let avg = cratonvm_native_api::charset::average_chars_per_byte(&name);
             let max = cratonvm_native_api::charset::max_chars_per_byte(&name);
-            let dec_obj = alloc_concurrent_synthetic(ctx, "java/nio/charset/CharsetDecoder", 3);
+            let dec_obj = alloc_concurrent_synthetic(ctx, "java/nio/charset/CharsetDecoder", 6);
             ctx.set_field(dec_obj, 0, Value::Object(Some(this)));
             ctx.set_field(dec_obj, 1, Value::Float(avg));
             ctx.set_field(dec_obj, 2, Value::Float(max));
+            let replacement = ctx.create_string("\u{fffd}");
+            ctx.set_field_by_name(dec_obj, "replacement", Value::Object(Some(replacement)));
             seed_coder_error_actions(ctx, dec_obj);
             Ok(Some(Value::Object(Some(dec_obj))))
         },
@@ -46707,7 +46765,7 @@ pub(crate) fn register_phase69_natives(registry: &mut NativeMethodRegistry) {
 // `Cleaner.create()` now runs unmodified once Thread `holder` is
 // populated — see `register_p69_cleaner` for the full rationale.
 
-pub(crate) fn register_p69_cleaner(_r: &mut NativeMethodRegistry) {
+pub(crate) fn register_p69_cleaner(r: &mut NativeMethodRegistry) {
     // P69-Cleaner-realfix: the synthetic `Cleaner.create`/`register`/
     // `Cleaner$Cleanable.clean` overrides have been removed.  They existed
     // only to dodge an `InnocuousThread.setPriority` NPE inside the real
@@ -46721,6 +46779,35 @@ pub(crate) fn register_p69_cleaner(_r: &mut NativeMethodRegistry) {
     // That in turn fixes `jdk.internal.ref.CleanerImpl.getCleanerImpl`
     // (the `checkcast jdk/internal/ref/CleanerImpl` no longer throws),
     // so `FileCleanable.register` and `PhantomCleanable.<init>` work.
+    //
+    // WildFly real-JDK fallback can still resolve `java/lang/ref/Cleaner` as a
+    // synthetic stub when class bytes are unavailable. Keep a tiny
+    // SyntheticStub surface for that case; real Cleaner bytecode still wins
+    // whenever the real class is loaded.
+    let __prev_cat = r.current_category();
+    r.set_category(cratonvm_native_api::NativeKind::SyntheticStub);
+    r.register(
+        "java/lang/ref/Cleaner",
+        "create",
+        "()Ljava/lang/ref/Cleaner;",
+        |ctx, _args| {
+            let cleaner = alloc_concurrent_synthetic(ctx, "java/lang/ref/Cleaner", 1);
+            Ok(Some(Value::Object(Some(cleaner))))
+        },
+    );
+    r.register(
+        "java/lang/ref/Cleaner",
+        "register",
+        "(Ljava/lang/Object;Ljava/lang/Runnable;)Ljava/lang/ref/Cleaner$Cleanable;",
+        |ctx, _args| {
+            let cleanable = alloc_concurrent_synthetic(ctx, "java/lang/ref/Cleaner$Cleanable", 1);
+            Ok(Some(Value::Object(Some(cleanable))))
+        },
+    );
+    r.register("java/lang/ref/Cleaner$Cleanable", "clean", "()V", |_ctx, _args| {
+        Ok(None)
+    });
+    r.set_category(__prev_cat);
 }
 
 // =============================================================================
@@ -55933,7 +56020,23 @@ pub(crate) fn register_p72_server_socket(r: &mut NativeMethodRegistry) {
                 return Ok(None);
             }
         }
-        Ok(None)
+        use crate::servlet::s2_alloc_listener;
+        use std::net::TcpListener;
+        let addr_obj = args.get(1).copied().unwrap_or(Value::Object(None));
+        let addr_str = p98_extract_socket_addr(ctx, addr_obj);
+        match TcpListener::bind(&addr_str) {
+            Ok(listener) => {
+                let actual_port = listener.local_addr().map(|a| a.port() as i32).unwrap_or(0);
+                let id = s2_alloc_listener(listener);
+                ctx.set_field(this, 0, Value::Int(actual_port));
+                ctx.set_field(this, 3, Value::Int(id));
+                Ok(None)
+            }
+            Err(e) => Err(RuntimeError::IOException {
+                message: format!("bind {addr_str}: {e}"),
+            }
+            .into()),
+        }
     });
     r.register(ss, "getLocalPort", "()I", |ctx, args| {
         let this = obj_arg(args, 0)?;
@@ -55959,13 +56062,98 @@ pub(crate) fn register_p72_server_socket(r: &mut NativeMethodRegistry) {
         ss,
         "getInetAddress",
         "()Ljava/net/InetAddress;",
-        |_ctx, _args| Ok(Some(Value::Object(None))),
+        |ctx, args| {
+            let this = obj_arg(args, 0)?;
+            let local_ip = if ctx.object_num_fields(this) >= 5 {
+                if let Value::Object(Some(ssc)) = ctx.get_field(this, 4) {
+                    let fd = ctx.get_field(ssc, 2).as_int().unwrap_or(-1);
+                    if fd >= 0 {
+                        ctx.fd_table().tcp_local_addr(fd as u32).ok().and_then(|s| {
+                            s.rsplit_once(':')
+                                .map(|(host, _)| host.trim_matches(&['[', ']'][..]).to_string())
+                        })
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                }
+            } else {
+                let lid = ctx.get_field(this, 3).as_int().unwrap_or(-1);
+                if lid >= 0 {
+                    let reg = crate::servlet::s2_registry().lock();
+                    reg.listeners
+                        .get(&lid)
+                        .and_then(|l| l.local_addr().ok())
+                        .map(|a| a.ip().to_string())
+                } else {
+                    None
+                }
+            };
+            match local_ip {
+                Some(ip) => Ok(Some(Value::Object(Some(
+                    crate::net_phase_e::alloc_inet_address_external(ctx, &ip, &ip),
+                )))),
+                None => Ok(Some(Value::Object(None))),
+            }
+        },
     );
     r.register(
         ss,
         "getLocalSocketAddress",
         "()Ljava/net/SocketAddress;",
-        |_ctx, _args| Ok(Some(Value::Object(None))),
+        |ctx, args| {
+            let this = obj_arg(args, 0)?;
+            let local = if ctx.object_num_fields(this) >= 5 {
+                if let Value::Object(Some(ssc)) = ctx.get_field(this, 4) {
+                    let fd = ctx.get_field(ssc, 2).as_int().unwrap_or(-1);
+                    if fd >= 0 {
+                        ctx.fd_table().tcp_local_addr(fd as u32).ok().and_then(|s| {
+                            s.rsplit_once(':').and_then(|(host, port)| {
+                                port.parse::<i32>()
+                                    .ok()
+                                    .map(|p| (host.trim_matches(&['[', ']'][..]).to_string(), p))
+                            })
+                        })
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                }
+            } else {
+                let lid = ctx.get_field(this, 3).as_int().unwrap_or(-1);
+                if lid >= 0 {
+                    let reg = crate::servlet::s2_registry().lock();
+                    reg.listeners
+                        .get(&lid)
+                        .and_then(|l| l.local_addr().ok())
+                        .map(|a| (a.ip().to_string(), a.port() as i32))
+                } else {
+                    None
+                }
+            };
+            match local {
+                Some((ip, port)) => {
+                    let isa = alloc_concurrent_synthetic(ctx, "java/net/InetSocketAddress", 3);
+                    let holder = alloc_concurrent_synthetic(
+                        ctx,
+                        "java/net/InetSocketAddress$InetSocketAddressHolder",
+                        3,
+                    );
+                    let host = ctx.create_string(&ip);
+                    let addr = crate::net_phase_e::alloc_inet_address_external(ctx, &ip, &ip);
+                    ctx.set_field(holder, 0, Value::Object(Some(host)));
+                    ctx.set_field(holder, 1, Value::Object(Some(addr)));
+                    ctx.set_field(holder, 2, Value::Int(port));
+                    ctx.set_field(isa, 0, Value::Object(Some(holder)));
+                    ctx.set_field(isa, 1, Value::Int(port));
+                    ctx.set_field(isa, 2, Value::Object(Some(addr)));
+                    Ok(Some(Value::Object(Some(isa))))
+                }
+                None => Ok(Some(Value::Object(None))),
+            }
+        },
     );
     r.register(ss, "getSoTimeout", "()I", |_ctx, _args| {
         Ok(Some(Value::Int(0)))

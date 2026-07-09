@@ -1166,6 +1166,18 @@ pub(crate) fn register_runtime_natives(registry: &mut NativeMethodRegistry) {
         "()I",
         native_runtime_version_feature,
     );
+    registry.register(
+        "java/lang/Runtime",
+        "addShutdownHook",
+        "(Ljava/lang/Thread;)V",
+        |_ctx, _args| Ok(None),
+    );
+    registry.register(
+        "java/lang/Runtime",
+        "removeShutdownHook",
+        "(Ljava/lang/Thread;)Z",
+        |_ctx, _args| Ok(Some(Value::Int(1))),
+    );
     registry.register("java/lang/Runtime", "gc", "()V", |ctx, _args| {
         ctx.force_gc();
         Ok(None)

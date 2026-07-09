@@ -3104,11 +3104,15 @@ impl NativeMethodRegistry {
         {
             return;
         }
-        // Real-JDK mode: drop the synthetic `java/util/StringJoiner` natives
-        // (fake 5-field layout) so the real 7-field-layout bytecode runs — the
-        // synthetic `add` reads the wrong slot on a real object and silently
-        // no-ops, leaving `size`/`len` at 0. See `drop_real_layout_synthetic`.
-        if self.drop_real_layout_synthetic && class_name == "java/util/StringJoiner" {
+        // Real-JDK mode: drop bridge/intrinsic `java/util/StringJoiner` natives
+        // with hardcoded synthetic layouts so the real 7-field-layout bytecode
+        // runs. Keep SyntheticStub-tagged fallbacks registered: dispatch skips
+        // them for a loaded real StringJoiner, but synthetic fallback classes
+        // still need a small native surface.
+        if self.drop_real_layout_synthetic
+            && class_name == "java/util/StringJoiner"
+            && self.current_category != NativeKind::SyntheticStub
+        {
             return;
         }
         // Real-JDK mode: drop the synthetic `ThreadPoolExecutor` lifecycle/stat

@@ -54,6 +54,9 @@ fn uptime_ms() -> u64 {
 pub fn register_jmx_natives(r: &mut NativeMethodRegistry) {
     let __prev_cat = r.current_category();
     r.set_category(cratonvm_native_api::NativeKind::Bridge);
+    register_object_name(r);
+    register_object_instance(r);
+    register_mbean_server(r);
     register_management_factory(r);
     register_runtime_mxbean(r);
     register_memory_mxbean(r);
@@ -63,21 +66,15 @@ pub fn register_jmx_natives(r: &mut NativeMethodRegistry) {
     register_operating_system_mxbean(r);
     register_compilation_mxbean(r);
     register_gc_mxbean(r);
-    // NOTE: `register_mbean_server` is intentionally NOT called here. The
-    // synthetic in-process MBeanServer (built on the *interface*
-    // `javax/management/MBeanServer`) is only correct in pure-synthetic-JDK
-    // mode, where there is no real `java.management` module. In real-JDK mode
-    // it shadows the real JDK's concrete `com.sun.jmx.mbeanserver.JmxMBeanServer`
-    // (via the `MBeanServerFactory.createMBeanServer` override) and its
-    // interface-only receiver makes every un-overridden MBeanServer method
-    // (e.g. `addNotificationListener`) throw `AbstractMethodError: ... has no
-    // Code attribute` — exactly the failure the `getPlatformMBeanServer`
-    // KAFKA-MBEAN note (below) already avoids. `register_builtins`
-    // (pure-synthetic mode only) calls `register_mbean_server` explicitly; the
-    // real-JDK boot paths deliberately skip it so real `javax.management`
-    // bytecode runs end-to-end.
+    // NOTE: `register_mbean_server` is called above as a `SyntheticStub`
+    // fallback for runs where `ManagementFactory.getPlatformMBeanServer()`
+    // returns the synthetic interface object. The real-JDK hazard is the
+    // MBeanServerFactory synthetic override, not these fallback methods: when a
+    // concrete `com.sun.jmx.mbeanserver.JmxMBeanServer` exists, its bytecode
+    // should still win over SyntheticStub registrations.
     //
-    // The SAME reasoning applies to `register_mbean_server_factory_synthetic`
+    // The original shadowing problem applies to
+    // `register_mbean_server_factory_synthetic`
     // (the `MBeanServerFactory.createMBeanServer`/`newMBeanServer` overrides,
     // previously inlined into `register_management_factory` above and called
     // unconditionally by `register_jmx_natives` in BOTH real- and
@@ -89,6 +86,312 @@ pub fn register_jmx_natives(r: &mut NativeMethodRegistry) {
     // synthetic-JDK registration path (see `vm_init.rs`) — this function
     // does NOT call it.
     register_vm_management_impl(r);
+    r.set_category(__prev_cat);
+}
+
+fn register_object_name(r: &mut NativeMethodRegistry) {
+    let cls = "javax/management/ObjectName";
+    r.register(
+        cls,
+        "<init>",
+        "(Ljava/lang/String;)V",
+        native_object_name_init_string,
+    );
+    r.register(
+        cls,
+        "<init>",
+        "(Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;)V",
+        native_object_name_init_domain_key_value,
+    );
+    r.register(
+        cls,
+        "<init>",
+        "(Ljava/lang/String;Ljava/util/Hashtable;)V",
+        native_object_name_init_domain_table,
+    );
+    r.register(
+        cls,
+        "getInstance",
+        "(Ljava/lang/String;)Ljavax/management/ObjectName;",
+        native_object_name_get_instance_string,
+    );
+    r.register(
+        cls,
+        "getInstance",
+        "(Ljavax/management/ObjectName;)Ljavax/management/ObjectName;",
+        native_object_name_get_instance_object,
+    );
+    r.register(
+        cls,
+        "quote",
+        "(Ljava/lang/String;)Ljava/lang/String;",
+        native_object_name_quote,
+    );
+    r.register(
+        cls,
+        "getCanonicalName",
+        "()Ljava/lang/String;",
+        native_object_name_to_string,
+    );
+    r.register(cls, "toString", "()Ljava/lang/String;", native_object_name_to_string);
+    r.register(cls, "getDomain", "()Ljava/lang/String;", native_object_name_domain);
+    r.register(
+        cls,
+        "apply",
+        "(Ljavax/management/ObjectName;)Z",
+        native_object_name_apply,
+    );
+    r.register(
+        cls,
+        "equals",
+        "(Ljava/lang/Object;)Z",
+        native_object_name_equals,
+    );
+    r.register(cls, "hashCode", "()I", native_object_name_hash_code);
+}
+
+fn object_name_string_arg(ctx: &dyn NativeContext, args: &[Value], index: usize) -> String {
+    match args.get(index) {
+        Some(Value::Object(Some(s))) => ctx.read_string(*s).unwrap_or_default(),
+        _ => String::new(),
+    }
+}
+
+fn object_name_text(ctx: &dyn NativeContext, obj: ObjectRef) -> String {
+    match ctx.get_field(obj, 0) {
+        Value::Object(Some(s)) => ctx.read_string(s).unwrap_or_default(),
+        _ => ctx.read_string(obj).unwrap_or_default(),
+    }
+}
+
+fn object_name_set_text(ctx: &mut dyn NativeContext, obj: ObjectRef, text: String) {
+    let s = ctx.create_string(&text);
+    ctx.set_field(obj, 0, Value::Object(Some(s)));
+}
+
+fn object_name_new(ctx: &mut dyn NativeContext, text: String) -> ObjectRef {
+    let obj = alloc_concurrent_synthetic(ctx, "javax/management/ObjectName", 1);
+    object_name_set_text(ctx, obj, text);
+    obj
+}
+
+fn register_object_instance(r: &mut NativeMethodRegistry) {
+    let cls = "javax/management/ObjectInstance";
+    r.register(cls, "getObjectName", "()Ljavax/management/ObjectName;", |ctx, args| {
+        let this = obj_arg(args, 0)?;
+        Ok(Some(ctx.get_field_by_name(this, "name")))
+    });
+    r.register(cls, "getClassName", "()Ljava/lang/String;", |ctx, args| {
+        let this = obj_arg(args, 0)?;
+        Ok(Some(ctx.get_field_by_name(this, "className")))
+    });
+}
+
+fn object_name_quote_text(input: &str) -> String {
+    let mut out = String::with_capacity(input.len() + 2);
+    out.push('"');
+    for ch in input.chars() {
+        match ch {
+            '\\' => out.push_str("\\\\"),
+            '"' => out.push_str("\\\""),
+            '\n' => out.push_str("\\n"),
+            '*' => out.push_str("\\*"),
+            '?' => out.push_str("\\?"),
+            _ => out.push(ch),
+        }
+    }
+    out.push('"');
+    out
+}
+
+fn object_name_table_get(ctx: &mut dyn NativeContext, table: ObjectRef, key: &str) -> Option<String> {
+    let key_obj = ctx.create_string(key);
+    match ctx.invoke_virtual(
+        table,
+        "get",
+        "(Ljava/lang/Object;)Ljava/lang/Object;",
+        &[Value::Object(Some(key_obj))],
+    ) {
+        Ok(Some(Value::Object(Some(v)))) => ctx.read_string(v),
+        _ => None,
+    }
+}
+
+fn object_name_from_domain_table(
+    ctx: &mut dyn NativeContext,
+    domain: &str,
+    table: Option<ObjectRef>,
+) -> String {
+    let mut pairs = Vec::new();
+    if let Some(table) = table {
+        for key in ["name", "type"] {
+            if let Some(value) = object_name_table_get(ctx, table, key) {
+                if !value.is_empty() {
+                    pairs.push(format!("{key}={value}"));
+                }
+            }
+        }
+    }
+    if pairs.is_empty() {
+        format!("{domain}:*")
+    } else {
+        format!("{domain}:{}", pairs.join(","))
+    }
+}
+
+fn native_object_name_init_string(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(o))) => *o,
+        _ => return Ok(None),
+    };
+    let text = object_name_string_arg(ctx, args, 1);
+    object_name_set_text(ctx, this, text);
+    Ok(None)
+}
+
+fn native_object_name_init_domain_key_value(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(o))) => *o,
+        _ => return Ok(None),
+    };
+    let domain = object_name_string_arg(ctx, args, 1);
+    let key = object_name_string_arg(ctx, args, 2);
+    let value = object_name_string_arg(ctx, args, 3);
+    let text = if key.is_empty() {
+        format!("{domain}:*")
+    } else {
+        format!("{domain}:{key}={value}")
+    };
+    object_name_set_text(ctx, this, text);
+    Ok(None)
+}
+
+fn native_object_name_init_domain_table(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(o))) => *o,
+        _ => return Ok(None),
+    };
+    let domain = object_name_string_arg(ctx, args, 1);
+    let table = match args.get(2) {
+        Some(Value::Object(Some(o))) => Some(*o),
+        _ => None,
+    };
+    let text = object_name_from_domain_table(ctx, &domain, table);
+    object_name_set_text(ctx, this, text);
+    Ok(None)
+}
+
+fn native_object_name_get_instance_string(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    let text = object_name_string_arg(ctx, args, 0);
+    Ok(Some(Value::Object(Some(object_name_new(ctx, text)))))
+}
+
+fn native_object_name_get_instance_object(
+    _ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    Ok(Some(args.first().copied().unwrap_or(Value::Object(None))))
+}
+
+fn native_object_name_quote(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let text = object_name_string_arg(ctx, args, 0);
+    let quoted = ctx.create_string(&object_name_quote_text(&text));
+    Ok(Some(Value::Object(Some(quoted))))
+}
+
+fn native_object_name_to_string(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(o))) => *o,
+        _ => return Ok(Some(Value::Object(None))),
+    };
+    let s = ctx.create_string(&object_name_text(ctx, this));
+    Ok(Some(Value::Object(Some(s))))
+}
+
+fn native_object_name_domain(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(o))) => *o,
+        _ => return Ok(Some(Value::Object(None))),
+    };
+    let text = object_name_text(ctx, this);
+    let domain = text.split_once(':').map(|(d, _)| d).unwrap_or(text.as_str());
+    let s = ctx.create_string(domain);
+    Ok(Some(Value::Object(Some(s))))
+}
+
+fn native_object_name_apply(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(o))) => *o,
+        _ => return Ok(Some(Value::Int(0))),
+    };
+    let target = match args.get(1) {
+        Some(Value::Object(Some(o))) => *o,
+        _ => return Ok(Some(Value::Int(0))),
+    };
+    let pattern = object_name_text(ctx, this);
+    let candidate = object_name_text(ctx, target);
+    let matches = pattern == candidate
+        || pattern == "*"
+        || pattern == "*:*"
+        || pattern
+            .strip_suffix(":*")
+            .is_some_and(|prefix| candidate.starts_with(prefix))
+        || pattern.contains('*')
+        || pattern.contains('?');
+    Ok(Some(Value::Int(if matches { 1 } else { 0 })))
+}
+
+fn native_object_name_equals(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(o))) => *o,
+        _ => return Ok(Some(Value::Int(0))),
+    };
+    let other = match args.get(1) {
+        Some(Value::Object(Some(o))) => *o,
+        _ => return Ok(Some(Value::Int(0))),
+    };
+    Ok(Some(Value::Int(
+        (object_name_text(ctx, this) == object_name_text(ctx, other)) as i32,
+    )))
+}
+
+fn native_object_name_hash_code(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(o))) => *o,
+        _ => return Ok(Some(Value::Int(0))),
+    };
+    let mut hash = 0i32;
+    for b in object_name_text(ctx, this).bytes() {
+        hash = hash.wrapping_mul(31).wrapping_add(b as i32);
+    }
+    Ok(Some(Value::Int(hash)))
+}
+
+/// Fake-JDK fallback for `ManagementFactory.getPlatformMBeanServer()`.
+///
+/// Real-JDK mode must normally run the JDK bytecode for this method so it can
+/// construct a concrete `JmxMBeanServer`. This native is tagged as a
+/// SyntheticStub and the dispatcher protects the real bytecode path; it only
+/// exists for fake-JDK launches where `ManagementFactory` itself is a synthetic
+/// stub and the method would otherwise be missing.
+pub fn register_management_factory_platform_server_stub(r: &mut NativeMethodRegistry) {
+    let __prev_cat = r.current_category();
+    r.set_category(cratonvm_native_api::NativeKind::SyntheticStub);
+    r.register(
+        "java/lang/management/ManagementFactory",
+        "getPlatformMBeanServer",
+        "()Ljavax/management/MBeanServer;",
+        |ctx, _args| Ok(Some(Value::Object(Some(alloc_mbean_server(ctx))))),
+    );
     r.set_category(__prev_cat);
 }
 

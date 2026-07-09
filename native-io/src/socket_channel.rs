@@ -2467,7 +2467,28 @@ fn ssc_local_address(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallR
             .unwrap_or_else(|_| "0.0.0.0".to_string()),
         _ => "0.0.0.0".to_string(),
     };
-    let h = ctx.create_string(&host);
+    new_resolved_inet_socket_address(ctx, &host, port)
+}
+
+fn new_resolved_inet_socket_address(
+    ctx: &mut dyn NativeContext,
+    host: &str,
+    port: i32,
+) -> MethodCallResult {
+    let h = ctx.create_string(host);
+    if let Ok(Some(Value::Object(Some(addr)))) = ctx.invoke(
+        "java/net/InetAddress",
+        "getByName",
+        "(Ljava/lang/String;)Ljava/net/InetAddress;",
+        &[Value::Object(Some(h))],
+    ) {
+        return ctx.new_object_initialized(
+            "java/net/InetSocketAddress",
+            "(Ljava/net/InetAddress;I)V",
+            &[Value::Object(Some(addr)), Value::Int(port)],
+        );
+    }
+    let h = ctx.create_string(host);
     ctx.new_object_initialized(
         "java/net/InetSocketAddress",
         "(Ljava/lang/String;I)V",
@@ -2560,31 +2581,32 @@ fn ss_wrapper_local_address(ctx: &mut dyn NativeContext, args: &[Value]) -> Meth
         };
         (port, host)
     } else {
-        // Plain ServerSocket — read the port recorded by the binder (BUG-04),
-        // same channel ss_wrapper_local_port uses. No channel registry entry
-        // to resolve a real host from here, so keep the wildcard text.
-        let port = cratonvm_native_api::server_socket_ports::get(ctx.identity_hash_code(this))
-            .unwrap_or(0);
-        (port, "0.0.0.0".to_string())
+        // Plain ServerSocket — read the address recorded by the binder (BUG-04),
+        // same channel ss_wrapper_local_port uses. The binder lives in
+        // native-builtins, while this last-registered wrapper lives in native-io,
+        // so the native-api side table is the cross-crate handoff.
+        let identity = ctx.identity_hash_code(this);
+        match cratonvm_native_api::server_socket_ports::get_addr(identity) {
+            Some((host, port)) => (port, host),
+            None => (
+                cratonvm_native_api::server_socket_ports::get(identity).unwrap_or(0),
+                "0.0.0.0".to_string(),
+            ),
+        }
     };
     if port <= 0 {
         return Ok(Some(Value::Object(None)));
     }
-    // Build via the REAL `InetSocketAddress(String,int)` ctor (like
+    // Build via the REAL `InetSocketAddress(InetAddress,int)` ctor (like
     // `ssc_local_address` above), NOT a flat 2-slot synthetic: the real
     // `getPort()`/`getHostString()`/`toString()` bytecode reads
     // `this.holder.port` / `this.holder.hostname`, and a flat object has a null
     // `holder` → `getPort()` returns 0. okhttp's `MockWebServer.getPort()` reads
     // `(serverSocket.localSocketAddress as InetSocketAddress).port`, so the flat
     // object made it 0 → every Spring HTTP-client test connected to
-    // `http://localhost:0` and failed (BUG-04). The real ctor populates the
-    // holder so `getPort()` returns the bound ephemeral port.
-    let h = ctx.create_string(&host);
-    ctx.new_object_initialized(
-        "java/net/InetSocketAddress",
-        "(Ljava/lang/String;I)V",
-        &[Value::Object(Some(h)), Value::Int(port)],
-    )
+    // `http://localhost:0` and failed (BUG-04). The resolved real ctor also
+    // populates holder.addr, which WildFly's process controller dereferences.
+    new_resolved_inet_socket_address(ctx, &host, port)
 }
 
 fn ss_wrapper_is_bound(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
