@@ -50426,23 +50426,7 @@ pub(crate) fn register_p70_misc(r: &mut NativeMethodRegistry) {
         es,
         "range",
         "(Ljava/lang/Enum;Ljava/lang/Enum;)Ljava/util/EnumSet;",
-        |ctx, _args| {
-            let set = alloc_concurrent_synthetic(ctx, "java/util/EnumSet", 2);
-            // Pin across the array/backing allocs below — a moving young GC
-            // there would relocate them (native stale-local family).
-            let set_pin = ctx.pin_native_root(set);
-            let arr = ctx.new_array(cratonvm_types::ArrayElementType::Reference, 0);
-            let arr_pin = ctx.pin_native_root(arr);
-            let backing = alloc_concurrent_synthetic(ctx, "java/util/ArrayList", 2);
-            let set = ctx.read_native_pin(set_pin, set);
-            let arr = ctx.read_native_pin(arr_pin, arr);
-            ctx.set_field(backing, 0, Value::Object(Some(arr)));
-            ctx.set_field(backing, 1, Value::Int(0));
-            ctx.set_field(set, 0, Value::Object(Some(backing)));
-            ctx.set_field(set, 1, Value::Object(None));
-            ctx.unpin_native_roots(set_pin);
-            Ok(Some(Value::Object(Some(set))))
-        },
+        crate::phases_early::native_es_range,
     );
 
     // java.io.Serializable — marker interface (no methods, but sometimes referenced)

@@ -298,8 +298,16 @@ fn native_collections_singleton_set(
     ctx: &mut dyn NativeContext,
     args: &[Value],
 ) -> MethodCallResult {
-    // Create as ArrayList-backed set (simplified)
-    native_collections_singleton_list(ctx, args)
+    let elem = args.first().copied().unwrap_or(Value::Object(None));
+    let set = alloc_concurrent_synthetic(ctx, "java/util/HashSet", 1);
+    let map = alloc_concurrent_synthetic(ctx, "java/util/HashMap", 3);
+    cratonvm_native_collections::native_map_init(ctx, &[Value::Object(Some(map))])?;
+    cratonvm_native_collections::native_map_put_pub(
+        ctx,
+        &[Value::Object(Some(map)), elem, Value::Object(None)],
+    )?;
+    ctx.set_field(set, 0, Value::Object(Some(map)));
+    Ok(Some(Value::Object(Some(set))))
 }
 
 fn native_collections_singleton_map(
@@ -1914,12 +1922,15 @@ pub(crate) fn register_core_stdlib_extras(r: &mut NativeMethodRegistry) {
         "singleton",
         "(Ljava/lang/Object;)Ljava/util/Set;",
         |ctx, args| {
-            let _elem = args.first().cloned().unwrap_or(Value::Object(None));
-            let set = alloc_concurrent_synthetic(ctx, "java/util/HashSet", 3);
-            ctx.set_field(set, 0, Value::Object(None));
-            ctx.set_field(set, 1, Value::Int(1));
-            ctx.set_field(set, 2, Value::Int(16));
-            // Simple: store element, won't iterate properly but satisfies contains/size
+            let elem = args.first().cloned().unwrap_or(Value::Object(None));
+            let set = alloc_concurrent_synthetic(ctx, "java/util/HashSet", 1);
+            let map = alloc_concurrent_synthetic(ctx, "java/util/HashMap", 3);
+            cratonvm_native_collections::native_map_init(ctx, &[Value::Object(Some(map))])?;
+            cratonvm_native_collections::native_map_put_pub(
+                ctx,
+                &[Value::Object(Some(map)), elem, Value::Object(None)],
+            )?;
+            ctx.set_field(set, 0, Value::Object(Some(map)));
             Ok(Some(Value::Object(Some(set))))
         },
     );
@@ -4718,6 +4729,22 @@ fn native_bs_stream(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRe
 const ES_FIELD_ELEMENTS: usize = 0;
 const ES_FIELD_TYPE: usize = 1;
 
+fn enum_set_backing_list(ctx: &mut dyn NativeContext, arr: ObjectRef, size: i32) -> ObjectRef {
+    let backing = alloc_concurrent_synthetic(ctx, "java/util/ArrayList", 2);
+    let arr_value = Value::Object(Some(arr));
+    ctx.set_field(backing, 0, arr_value);
+    ctx.set_field(backing, 1, Value::Int(size));
+    ctx.set_field_by_name(backing, "elementData", arr_value);
+    ctx.set_field_by_name(backing, "size", Value::Int(size));
+    if let Some(slot) = ctx.resolve_field_index("java/util/ArrayList", "elementData") {
+        ctx.set_field(backing, slot, arr_value);
+    }
+    if let Some(slot) = ctx.resolve_field_index("java/util/ArrayList", "size") {
+        ctx.set_field(backing, slot, Value::Int(size));
+    }
+    backing
+}
+
 fn register_enum_set_natives_with_category(
     r: &mut NativeMethodRegistry,
     kind: cratonvm_native_api::NativeKind,
@@ -4758,6 +4785,12 @@ fn register_enum_set_natives_with_category(
     r.register(
         c,
         "of",
+        "(Ljava/lang/Enum;Ljava/lang/Enum;Ljava/lang/Enum;Ljava/lang/Enum;)Ljava/util/EnumSet;",
+        native_es_of_four,
+    );
+    r.register(
+        c,
+        "of",
         "(Ljava/lang/Enum;[Ljava/lang/Enum;)Ljava/util/EnumSet;",
         native_es_of_varargs,
     );
@@ -4773,7 +4806,14 @@ fn register_enum_set_natives_with_category(
         "(Ljava/util/Collection;)Ljava/util/EnumSet;",
         native_es_copy_of,
     );
+    r.register(
+        c,
+        "complementOf",
+        "(Ljava/util/EnumSet;)Ljava/util/EnumSet;",
+        native_es_complement_of,
+    );
     r.register(c, "add", "(Ljava/lang/Object;)Z", native_es_add);
+    r.register(c, "addAll", "(Ljava/util/Collection;)Z", native_es_add_all);
     r.register(c, "remove", "(Ljava/lang/Object;)Z", native_es_remove);
     r.register(c, "contains", "(Ljava/lang/Object;)Z", native_es_contains);
     r.register(c, "size", "()I", native_es_size);
@@ -4817,9 +4857,7 @@ pub(crate) fn register_enum_set_stub_natives(r: &mut NativeMethodRegistry) {
 fn native_es_none_of(ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
     let es = alloc_concurrent_synthetic(ctx, "java/util/EnumSet", 2);
     let arr = ctx.new_array(cratonvm_types::ArrayElementType::Reference, 0);
-    let backing = alloc_concurrent_synthetic(ctx, "java/util/ArrayList", 2);
-    ctx.set_field(backing, 0, Value::Object(Some(arr)));
-    ctx.set_field(backing, 1, Value::Int(0));
+    let backing = enum_set_backing_list(ctx, arr, 0);
     ctx.set_field(es, ES_FIELD_ELEMENTS, Value::Object(Some(backing)));
     ctx.set_field(es, ES_FIELD_TYPE, Value::Object(None));
     Ok(Some(Value::Object(Some(es))))
@@ -4830,9 +4868,7 @@ fn native_es_of_one(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRe
     let es = alloc_concurrent_synthetic(ctx, "java/util/EnumSet", 2);
     let arr = ctx.new_array(cratonvm_types::ArrayElementType::Reference, 4);
     ctx.set_array_element(arr, 0, elem);
-    let backing = alloc_concurrent_synthetic(ctx, "java/util/ArrayList", 2);
-    ctx.set_field(backing, 0, Value::Object(Some(arr)));
-    ctx.set_field(backing, 1, Value::Int(1));
+    let backing = enum_set_backing_list(ctx, arr, 1);
     ctx.set_field(es, ES_FIELD_ELEMENTS, Value::Object(Some(backing)));
     ctx.set_field(es, ES_FIELD_TYPE, Value::Object(None));
     Ok(Some(Value::Object(Some(es))))
@@ -4875,6 +4911,116 @@ fn try_jdk_enum_set_of_elements(ctx: &mut dyn NativeContext, elems: &[Value]) ->
     Some(set)
 }
 
+fn enum_value_ordinal(ctx: &mut dyn NativeContext, value: Value) -> Option<i32> {
+    let Value::Object(Some(obj)) = value else {
+        return None;
+    };
+    if let Ok(Some(Value::Int(n))) = ctx.invoke_virtual(obj, "ordinal", "()I", &[]) {
+        return Some(n);
+    }
+    match ctx.get_field_by_name(obj, "ordinal") {
+        Value::Int(n) => Some(n),
+        _ => match ctx.get_field(obj, 1) {
+            Value::Int(n) => Some(n),
+            _ => None,
+        },
+    }
+}
+
+fn enum_range_elements(ctx: &mut dyn NativeContext, from: Value, to: Value) -> Vec<Value> {
+    let Some(from_ord) = enum_value_ordinal(ctx, from) else {
+        return vec![from, to];
+    };
+    let Some(to_ord) = enum_value_ordinal(ctx, to) else {
+        return vec![from, to];
+    };
+    let (Value::Object(Some(from_obj)), Value::Object(Some(_))) = (from, to) else {
+        return vec![from, to];
+    };
+    let enum_cid = ctx.class_id_of_object(from_obj);
+    let constants = match ctx
+        .static_field_index_by_name(enum_cid, "$VALUES")
+        .map(|idx| ctx.get_static_field(enum_cid, idx))
+    {
+        Some(Value::Object(Some(a))) => a,
+        _ => {
+            let enum_class =
+                match ctx.invoke_virtual(from_obj, "getClass", "()Ljava/lang/Class;", &[]) {
+                    Ok(Some(Value::Object(Some(c)))) => c,
+                    _ => return vec![from, to],
+                };
+            match ctx.invoke_virtual(enum_class, "getEnumConstants", "()[Ljava/lang/Object;", &[]) {
+                Ok(Some(Value::Object(Some(a)))) => a,
+                _ => return vec![from, to],
+            }
+        }
+    };
+    let mut elems = Vec::new();
+    let len = ctx.array_length(constants);
+    for i in 0..len {
+        let elem = ctx.get_array_element(constants, i);
+        if let Some(ord) = enum_value_ordinal(ctx, elem) {
+            if ord >= from_ord && ord <= to_ord {
+                elems.push(elem);
+            }
+        }
+    }
+    if elems.is_empty() {
+        vec![from, to]
+    } else {
+        elems
+    }
+}
+
+fn enum_set_elements(ctx: &mut dyn NativeContext, set: ObjectRef) -> Vec<Value> {
+    if let Ok(Some(Value::Object(Some(arr)))) =
+        ctx.invoke_virtual(set, "toArray", "()[Ljava/lang/Object;", &[])
+    {
+        return (0..ctx.array_length(arr))
+            .map(|i| ctx.get_array_element(arr, i))
+            .collect();
+    }
+    let Some(backing) = es_get_backing(ctx, set) else {
+        return Vec::new();
+    };
+    let size = ctx.get_field(backing, 1).as_int().unwrap_or(0).max(0) as usize;
+    let Value::Object(Some(arr)) = ctx.get_field(backing, 0) else {
+        return Vec::new();
+    };
+    (0..size.min(ctx.array_length(arr)))
+        .map(|i| ctx.get_array_element(arr, i))
+        .collect()
+}
+
+fn enum_universe_for_value(ctx: &mut dyn NativeContext, value: Value) -> Vec<Value> {
+    let Value::Object(Some(obj)) = value else {
+        return Vec::new();
+    };
+    let enum_cid = ctx.class_id_of_object(obj);
+    if let Some(Value::Object(Some(values))) = ctx
+        .static_field_index_by_name(enum_cid, "$VALUES")
+        .map(|idx| ctx.get_static_field(enum_cid, idx))
+    {
+        return (0..ctx.array_length(values))
+            .map(|i| ctx.get_array_element(values, i))
+            .collect();
+    }
+    let enum_class = match ctx.invoke_virtual(obj, "getClass", "()Ljava/lang/Class;", &[]) {
+        Ok(Some(Value::Object(Some(c)))) => c,
+        _ => return Vec::new(),
+    };
+    match ctx.invoke_virtual(enum_class, "getEnumConstants", "()[Ljava/lang/Object;", &[]) {
+        Ok(Some(Value::Object(Some(values)))) => (0..ctx.array_length(values))
+            .map(|i| ctx.get_array_element(values, i))
+            .collect(),
+        _ => Vec::new(),
+    }
+}
+
+fn enum_values_same(a: Value, b: Value) -> bool {
+    matches!((a, b), (Value::Object(Some(x)), Value::Object(Some(y))) if x.as_ptr() == y.as_ptr())
+}
+
 /// `EnumSet.of(E, E)` — same linkage gap as the 3-arg overload on some JDK
 /// loads; mirror the `noneOf` + `add` bridge used by [`native_es_of_three`].
 pub(crate) fn native_es_of_two(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
@@ -4887,9 +5033,7 @@ pub(crate) fn native_es_of_two(ctx: &mut dyn NativeContext, args: &[Value]) -> M
     let arr = ctx.new_array(cratonvm_types::ArrayElementType::Reference, 4);
     ctx.set_array_element(arr, 0, e1);
     ctx.set_array_element(arr, 1, e2);
-    let backing = alloc_concurrent_synthetic(ctx, "java/util/ArrayList", 2);
-    ctx.set_field(backing, 0, Value::Object(Some(arr)));
-    ctx.set_field(backing, 1, Value::Int(2));
+    let backing = enum_set_backing_list(ctx, arr, 2);
     ctx.set_field(es, ES_FIELD_ELEMENTS, Value::Object(Some(backing)));
     ctx.set_field(es, ES_FIELD_TYPE, Value::Object(None));
     Ok(Some(Value::Object(Some(es))))
@@ -4913,9 +5057,30 @@ pub(crate) fn native_es_of_three(ctx: &mut dyn NativeContext, args: &[Value]) ->
     ctx.set_array_element(arr, 0, e1);
     ctx.set_array_element(arr, 1, e2);
     ctx.set_array_element(arr, 2, e3);
-    let backing = alloc_concurrent_synthetic(ctx, "java/util/ArrayList", 2);
-    ctx.set_field(backing, 0, Value::Object(Some(arr)));
-    ctx.set_field(backing, 1, Value::Int(3));
+    let backing = enum_set_backing_list(ctx, arr, 3);
+    ctx.set_field(es, ES_FIELD_ELEMENTS, Value::Object(Some(backing)));
+    ctx.set_field(es, ES_FIELD_TYPE, Value::Object(None));
+    Ok(Some(Value::Object(Some(es))))
+}
+
+/// `EnumSet.of(E, E, E, E)` — same bridge as the other fixed-arity overloads.
+pub(crate) fn native_es_of_four(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let e1 = args.first().copied().unwrap_or(Value::Object(None));
+    let e2 = args.get(1).copied().unwrap_or(Value::Object(None));
+    let e3 = args.get(2).copied().unwrap_or(Value::Object(None));
+    let e4 = args.get(3).copied().unwrap_or(Value::Object(None));
+
+    if let Some(set) = try_jdk_enum_set_of_elements(ctx, &[e1, e2, e3, e4]) {
+        return Ok(Some(Value::Object(Some(set))));
+    }
+
+    let es = alloc_concurrent_synthetic(ctx, "java/util/EnumSet", 2);
+    let arr = ctx.new_array(cratonvm_types::ArrayElementType::Reference, 4);
+    ctx.set_array_element(arr, 0, e1);
+    ctx.set_array_element(arr, 1, e2);
+    ctx.set_array_element(arr, 2, e3);
+    ctx.set_array_element(arr, 3, e4);
+    let backing = enum_set_backing_list(ctx, arr, 4);
     ctx.set_field(es, ES_FIELD_ELEMENTS, Value::Object(Some(backing)));
     ctx.set_field(es, ES_FIELD_TYPE, Value::Object(None));
     Ok(Some(Value::Object(Some(es))))
@@ -4945,9 +5110,7 @@ pub(crate) fn native_es_of_varargs(
     for (i, elem) in elems.iter().enumerate() {
         ctx.set_array_element(arr, i, *elem);
     }
-    let backing = alloc_concurrent_synthetic(ctx, "java/util/ArrayList", 2);
-    ctx.set_field(backing, 0, Value::Object(Some(arr)));
-    ctx.set_field(backing, 1, Value::Int(elems.len() as i32));
+    let backing = enum_set_backing_list(ctx, arr, elems.len() as i32);
     ctx.set_field(es, ES_FIELD_ELEMENTS, Value::Object(Some(backing)));
     ctx.set_field(es, ES_FIELD_TYPE, Value::Object(None));
     Ok(Some(Value::Object(Some(es))))
@@ -4956,20 +5119,19 @@ pub(crate) fn native_es_of_varargs(
 pub(crate) fn native_es_range(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let from = args.first().copied().unwrap_or(Value::Object(None));
     let to = args.get(1).copied().unwrap_or(Value::Object(None));
-    if let Some(set) = try_jdk_enum_set_of_elements(ctx, &[from, to]) {
+    let elems = enum_range_elements(ctx, from, to);
+    if let Some(set) = try_jdk_enum_set_of_elements(ctx, &elems) {
         return Ok(Some(Value::Object(Some(set))));
     }
     let es = alloc_concurrent_synthetic(ctx, "java/util/EnumSet", 2);
-    let arr = ctx.new_array(cratonvm_types::ArrayElementType::Reference, 4);
-    ctx.set_array_element(arr, 0, from);
-    let mut size = 1;
-    if from != to {
-        ctx.set_array_element(arr, 1, to);
-        size = 2;
+    let arr = ctx.new_array(
+        cratonvm_types::ArrayElementType::Reference,
+        elems.len().max(4),
+    );
+    for (i, elem) in elems.iter().enumerate() {
+        ctx.set_array_element(arr, i, *elem);
     }
-    let backing = alloc_concurrent_synthetic(ctx, "java/util/ArrayList", 2);
-    ctx.set_field(backing, 0, Value::Object(Some(arr)));
-    ctx.set_field(backing, 1, Value::Int(size));
+    let backing = enum_set_backing_list(ctx, arr, elems.len() as i32);
     ctx.set_field(es, ES_FIELD_ELEMENTS, Value::Object(Some(backing)));
     ctx.set_field(es, ES_FIELD_TYPE, Value::Object(None));
     Ok(Some(Value::Object(Some(es))))
@@ -4978,6 +5140,43 @@ pub(crate) fn native_es_range(ctx: &mut dyn NativeContext, args: &[Value]) -> Me
 fn native_es_copy_of(ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
     // Simplified: return empty set
     native_es_none_of(ctx, &[])
+}
+
+fn native_es_complement_of(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let source = obj_arg(args, 0)?;
+    let source_elems = enum_set_elements(ctx, source);
+    let Some(seed) = source_elems
+        .iter()
+        .copied()
+        .find(|v| matches!(v, Value::Object(Some(_))))
+    else {
+        return native_es_none_of(ctx, &[]);
+    };
+    let elems: Vec<Value> = enum_universe_for_value(ctx, seed)
+        .into_iter()
+        .filter(|candidate| {
+            !source_elems
+                .iter()
+                .copied()
+                .any(|present| enum_values_same(*candidate, present))
+        })
+        .collect();
+
+    if let Some(set) = try_jdk_enum_set_of_elements(ctx, &elems) {
+        return Ok(Some(Value::Object(Some(set))));
+    }
+    let es = alloc_concurrent_synthetic(ctx, "java/util/EnumSet", 2);
+    let arr = ctx.new_array(
+        cratonvm_types::ArrayElementType::Reference,
+        elems.len().max(4),
+    );
+    for (i, elem) in elems.iter().enumerate() {
+        ctx.set_array_element(arr, i, *elem);
+    }
+    let backing = enum_set_backing_list(ctx, arr, elems.len() as i32);
+    ctx.set_field(es, ES_FIELD_ELEMENTS, Value::Object(Some(backing)));
+    ctx.set_field(es, ES_FIELD_TYPE, Value::Object(None));
+    Ok(Some(Value::Object(Some(es))))
 }
 
 fn es_get_backing(ctx: &mut dyn NativeContext, this: ObjectRef) -> Option<ObjectRef> {
@@ -4995,6 +5194,31 @@ pub(crate) fn native_es_add(ctx: &mut dyn NativeContext, args: &[Value]) -> Meth
         cratonvm_native_collections::native_al_add(ctx, &[Value::Object(Some(backing)), elem])?;
     }
     Ok(Some(Value::Int(1)))
+}
+
+fn native_es_add_all(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = obj_arg(args, 0)?;
+    let coll = match args.get(1).copied() {
+        Some(Value::Object(Some(coll))) => coll,
+        _ => return Ok(Some(Value::Int(0))),
+    };
+    let elems = if let Ok(Some(Value::Object(Some(arr)))) =
+        ctx.invoke_virtual(coll, "toArray", "()[Ljava/lang/Object;", &[])
+    {
+        (0..ctx.array_length(arr))
+            .map(|i| ctx.get_array_element(arr, i))
+            .collect::<Vec<_>>()
+    } else {
+        enum_set_elements(ctx, coll)
+    };
+    let mut modified = false;
+    for elem in elems {
+        if matches!(elem, Value::Object(Some(_))) {
+            native_es_add(ctx, &[Value::Object(Some(this)), elem])?;
+            modified = true;
+        }
+    }
+    Ok(Some(Value::Int(i32::from(modified))))
 }
 
 fn native_es_remove(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
@@ -5512,9 +5736,147 @@ pub(crate) fn register_phase51_natives(registry: &mut NativeMethodRegistry) {
     register_timer_natives(registry);
     register_forkjoin_natives(registry);
     register_scheduled_executor_natives(registry);
+    register_qname_natives(registry);
     register_timeunit_natives(registry);
     register_object_stream_natives(registry);
     registry.set_category(__prev_cat);
+}
+
+fn qname_value_or_empty(ctx: &mut dyn NativeContext, v: Option<Value>) -> ObjectRef {
+    match v {
+        Some(Value::Object(Some(s))) => s,
+        _ => ctx.create_string(""),
+    }
+}
+
+fn qname_parts_table(
+) -> &'static std::sync::Mutex<std::collections::HashMap<i32, (String, String, String)>> {
+    static T: std::sync::OnceLock<
+        std::sync::Mutex<std::collections::HashMap<i32, (String, String, String)>>,
+    > = std::sync::OnceLock::new();
+    T.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+}
+
+fn qname_set_parts(
+    ctx: &mut dyn NativeContext,
+    this: ObjectRef,
+    namespace_uri: ObjectRef,
+    local_part: ObjectRef,
+    prefix: ObjectRef,
+) {
+    let namespace_uri_text = ctx.read_string(namespace_uri).unwrap_or_default();
+    let local_part_text = ctx.read_string(local_part).unwrap_or_default();
+    let prefix_text = ctx.read_string(prefix).unwrap_or_default();
+    if let Ok(mut table) = qname_parts_table().lock() {
+        table.insert(
+            ctx.identity_hash_code(this),
+            (namespace_uri_text, local_part_text, prefix_text),
+        );
+    }
+    ctx.set_field_by_name(this, "namespaceURI", Value::Object(Some(namespace_uri)));
+    ctx.set_field_by_name(this, "localPart", Value::Object(Some(local_part)));
+    ctx.set_field_by_name(this, "prefix", Value::Object(Some(prefix)));
+}
+
+fn qname_part_text(
+    ctx: &dyn NativeContext,
+    this: ObjectRef,
+    name: &str,
+    slot: usize,
+    index: usize,
+) -> String {
+    if let Ok(table) = qname_parts_table().lock() {
+        if let Some(parts) = table.get(&ctx.identity_hash_code(this)) {
+            return match index {
+                0 => parts.0.clone(),
+                1 => parts.1.clone(),
+                _ => parts.2.clone(),
+            };
+        }
+    }
+    match ctx.get_field_by_name(this, name) {
+        Value::Object(Some(s)) => ctx.read_string(s).unwrap_or_default(),
+        _ if ctx.object_num_fields(this) > slot => match ctx.get_field(this, slot) {
+            Value::Object(Some(s)) => ctx.read_string(s).unwrap_or_default(),
+            _ => String::new(),
+        },
+        _ => String::new(),
+    }
+}
+
+fn qname_part(
+    ctx: &mut dyn NativeContext,
+    this: ObjectRef,
+    name: &str,
+    slot: usize,
+    index: usize,
+) -> Value {
+    let text = qname_part_text(ctx, this, name, slot, index);
+    Value::Object(Some(ctx.create_string(&text)))
+}
+
+pub(crate) fn register_qname_natives(r: &mut NativeMethodRegistry) {
+    let c = "javax/xml/namespace/QName";
+    r.register(c, "<init>", "(Ljava/lang/String;)V", |ctx, args| {
+        let this = obj_arg(args, 0)?;
+        let local = qname_value_or_empty(ctx, args.get(1).copied());
+        let empty_ns = ctx.create_string("");
+        let empty_prefix = ctx.create_string("");
+        qname_set_parts(ctx, this, empty_ns, local, empty_prefix);
+        Ok(None)
+    });
+    r.register(
+        c,
+        "<init>",
+        "(Ljava/lang/String;Ljava/lang/String;)V",
+        |ctx, args| {
+            let this = obj_arg(args, 0)?;
+            let ns = qname_value_or_empty(ctx, args.get(1).copied());
+            let local = qname_value_or_empty(ctx, args.get(2).copied());
+            let prefix = ctx.create_string("");
+            qname_set_parts(ctx, this, ns, local, prefix);
+            Ok(None)
+        },
+    );
+    r.register(
+        c,
+        "<init>",
+        "(Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;)V",
+        |ctx, args| {
+            let this = obj_arg(args, 0)?;
+            let ns = qname_value_or_empty(ctx, args.get(1).copied());
+            let local = qname_value_or_empty(ctx, args.get(2).copied());
+            let prefix = qname_value_or_empty(ctx, args.get(3).copied());
+            qname_set_parts(ctx, this, ns, local, prefix);
+            Ok(None)
+        },
+    );
+    r.register(c, "getNamespaceURI", "()Ljava/lang/String;", |ctx, args| {
+        Ok(Some(qname_part(
+            ctx,
+            obj_arg(args, 0)?,
+            "namespaceURI",
+            0,
+            0,
+        )))
+    });
+    r.register(c, "getLocalPart", "()Ljava/lang/String;", |ctx, args| {
+        Ok(Some(qname_part(ctx, obj_arg(args, 0)?, "localPart", 1, 1)))
+    });
+    r.register(c, "getPrefix", "()Ljava/lang/String;", |ctx, args| {
+        Ok(Some(qname_part(ctx, obj_arg(args, 0)?, "prefix", 2, 2)))
+    });
+    r.register(c, "toString", "()Ljava/lang/String;", |ctx, args| {
+        let this = obj_arg(args, 0)?;
+        let ns = qname_part_text(ctx, this, "namespaceURI", 0, 0);
+        let local = qname_part_text(ctx, this, "localPart", 1, 1);
+        let text = if ns.is_empty() {
+            local
+        } else {
+            format!("{{{ns}}}{local}")
+        };
+        Ok(Some(Value::Object(Some(ctx.create_string(&text)))))
+    });
 }
 
 // ---------------------------------------------------------------------------
@@ -7427,13 +7789,38 @@ pub(crate) fn register_scheduled_executor_natives(r: &mut NativeMethodRegistry) 
             Some(Value::Int(v)) => *v,
             _ => 1,
         };
-        ctx.set_field(this, 0, Value::Int(ps));
-        ctx.set_field(this, 1, Value::Int(0));
+        if ctx.object_num_fields(this) > 0 {
+            ctx.set_field(this, 0, Value::Int(ps));
+        }
+        if ctx.object_num_fields(this) > 1 {
+            ctx.set_field(this, 1, Value::Int(0));
+        }
         Ok(Some(Value::Object(None)))
     });
+    r.register(
+        ses,
+        "<init>",
+        "(ILjava/util/concurrent/ThreadFactory;)V",
+        |ctx, args| {
+            let this = obj_arg(args, 0)?;
+            let ps = match args.get(1) {
+                Some(Value::Int(v)) => *v,
+                _ => 1,
+            };
+            if ctx.object_num_fields(this) > 0 {
+                ctx.set_field(this, 0, Value::Int(ps));
+            }
+            if ctx.object_num_fields(this) > 1 {
+                ctx.set_field(this, 1, Value::Int(0));
+            }
+            Ok(Some(Value::Object(None)))
+        },
+    );
     r.register(ses, "shutdown", "()V", |ctx, args| {
         let this = obj_arg(args, 0)?;
-        ctx.set_field(this, 1, Value::Int(1));
+        if ctx.object_num_fields(this) > 1 {
+            ctx.set_field(this, 1, Value::Int(1));
+        }
         Ok(Some(Value::Object(None)))
     });
     r.register(ses, "shutdownNow", "()Ljava/util/List;", |ctx, _args| {
@@ -7443,19 +7830,63 @@ pub(crate) fn register_scheduled_executor_natives(r: &mut NativeMethodRegistry) 
         ctx.set_field(list, 1, Value::Int(0));
         Ok(Some(Value::Object(Some(list))))
     });
+    r.register(
+        ses,
+        "setContinueExistingPeriodicTasksAfterShutdownPolicy",
+        "(Z)V",
+        |_ctx, _args| Ok(Some(Value::Object(None))),
+    );
+    r.register(
+        ses,
+        "setExecuteExistingDelayedTasksAfterShutdownPolicy",
+        "(Z)V",
+        |_ctx, _args| Ok(Some(Value::Object(None))),
+    );
+    r.register(ses, "setRemoveOnCancelPolicy", "(Z)V", |_ctx, _args| {
+        Ok(Some(Value::Object(None)))
+    });
+    r.register(
+        ses,
+        "getContinueExistingPeriodicTasksAfterShutdownPolicy",
+        "()Z",
+        |_ctx, _args| Ok(Some(Value::Int(0))),
+    );
+    r.register(
+        ses,
+        "getExecuteExistingDelayedTasksAfterShutdownPolicy",
+        "()Z",
+        |_ctx, _args| Ok(Some(Value::Int(1))),
+    );
+    r.register(ses, "getRemoveOnCancelPolicy", "()Z", |_ctx, _args| {
+        Ok(Some(Value::Int(0)))
+    });
+    r.register(ses, "execute", "(Ljava/lang/Runnable;)V", |ctx, args| {
+        if let Some(Value::Object(Some(task))) = args.get(1).copied() {
+            ctx.invoke_virtual(task, "run", "()V", &[])?;
+        }
+        Ok(None)
+    });
     r.register(ses, "isShutdown", "()Z", |ctx, args| {
         let this = obj_arg(args, 0)?;
-        let shut = match ctx.get_field(this, 1) {
-            Value::Int(v) => v,
-            _ => 0,
+        let shut = if ctx.object_num_fields(this) > 1 {
+            match ctx.get_field(this, 1) {
+                Value::Int(v) => v,
+                _ => 0,
+            }
+        } else {
+            0
         };
         Ok(Some(Value::Int(shut)))
     });
     r.register(ses, "isTerminated", "()Z", |ctx, args| {
         let this = obj_arg(args, 0)?;
-        let shut = match ctx.get_field(this, 1) {
-            Value::Int(v) => v,
-            _ => 0,
+        let shut = if ctx.object_num_fields(this) > 1 {
+            match ctx.get_field(this, 1) {
+                Value::Int(v) => v,
+                _ => 0,
+            }
+        } else {
+            0
         };
         Ok(Some(Value::Int(shut)))
     });
@@ -7517,7 +7948,11 @@ pub(crate) fn register_scheduled_executor_natives(r: &mut NativeMethodRegistry) 
     // fork shutdown sequencing.
     r.register(ses, "getCorePoolSize", "()I", |ctx, args| {
         let this = obj_arg(args, 0)?;
-        Ok(Some(ctx.get_field(this, 0)))
+        if ctx.object_num_fields(this) > 0 {
+            Ok(Some(ctx.get_field(this, 0)))
+        } else {
+            Ok(Some(Value::Int(1)))
+        }
     });
     r.register(ses, "getPoolSize", "()I", |_ctx, _args| {
         Ok(Some(Value::Int(0)))
@@ -7552,6 +7987,25 @@ pub(crate) fn register_scheduled_executor_natives(r: &mut NativeMethodRegistry) 
         ex,
         "newScheduledThreadPool",
         "(I)Ljava/util/concurrent/ScheduledExecutorService;",
+        |ctx, args| {
+            let ps = match args.first() {
+                Some(Value::Int(v)) => *v,
+                _ => 1,
+            };
+            let sv = alloc_concurrent_synthetic(
+                ctx,
+                "java/util/concurrent/ScheduledThreadPoolExecutor",
+                2,
+            );
+            ctx.set_field(sv, 0, Value::Int(ps));
+            ctx.set_field(sv, 1, Value::Int(0));
+            Ok(Some(Value::Object(Some(sv))))
+        },
+    );
+    r.register(
+        ex,
+        "newScheduledThreadPool",
+        "(ILjava/util/concurrent/ThreadFactory;)Ljava/util/concurrent/ScheduledExecutorService;",
         |ctx, args| {
             let ps = match args.first() {
                 Some(Value::Int(v)) => *v,
@@ -9231,9 +9685,151 @@ pub(crate) fn register_phase52_inet_socket_address(r: &mut NativeMethodRegistry)
     r.set_category(__prev_cat);
 }
 
+fn phase52_alloc_socket(ctx: &mut dyn NativeContext) -> ObjectRef {
+    let sock = alloc_concurrent_synthetic(ctx, "java/net/Socket", 5);
+    let empty = ctx.create_string("");
+    ctx.set_field(sock, SOCK_HOST, Value::Object(Some(empty)));
+    ctx.set_field(sock, SOCK_PORT, Value::Int(0));
+    ctx.set_field(sock, SOCK_LOCAL_PORT, Value::Int(0));
+    ctx.set_field(sock, SOCK_CLOSED, Value::Int(0));
+    ctx.set_field(sock, SOCK_STREAM_ID, Value::Int(-1));
+    sock
+}
+
+fn phase52_socket_connect(
+    ctx: &mut dyn NativeContext,
+    host_value: Value,
+    port_value: Value,
+) -> MethodCallResult {
+    let sock = phase52_alloc_socket(ctx);
+    let host = match host_value {
+        Value::Object(Some(s)) => ctx
+            .read_string(s)
+            .unwrap_or_else(|| "127.0.0.1".to_string()),
+        _ => "127.0.0.1".to_string(),
+    };
+    let port = port_value.as_int().unwrap_or(0);
+    let host_obj = ctx.create_string(&host);
+    ctx.set_field(sock, SOCK_HOST, Value::Object(Some(host_obj)));
+    ctx.set_field(sock, SOCK_PORT, Value::Int(port));
+
+    match std::net::TcpStream::connect(format!("{host}:{port}")) {
+        Ok(stream) => {
+            let local_port = stream.local_addr().map(|a| a.port() as i32).unwrap_or(0);
+            let id = crate::servlet::s2_alloc_stream(stream);
+            ctx.set_field(sock, SOCK_STREAM_ID, Value::Int(id));
+            ctx.set_field(sock, SOCK_LOCAL_PORT, Value::Int(local_port));
+            Ok(Some(Value::Object(Some(sock))))
+        }
+        Err(e) => Err(RuntimeError::IOException {
+            message: format!("SocketFactory.createSocket failed: {host}:{port}: {e}"),
+        }
+        .into()),
+    }
+}
+
 pub(crate) fn register_phase52_server_socket_factory(r: &mut NativeMethodRegistry) {
     let __prev_cat = r.current_category();
     r.set_category(cratonvm_native_api::NativeKind::Bridge);
+    let sf = "javax/net/SocketFactory";
+    r.register(
+        sf,
+        "getDefault",
+        "()Ljavax/net/SocketFactory;",
+        |ctx, _args| {
+            let obj = alloc_concurrent_synthetic(ctx, "javax/net/SocketFactory", 0);
+            Ok(Some(Value::Object(Some(obj))))
+        },
+    );
+    r.register(sf, "createSocket", "()Ljava/net/Socket;", |ctx, _args| {
+        Ok(Some(Value::Object(Some(phase52_alloc_socket(ctx)))))
+    });
+    r.register(
+        sf,
+        "createSocket",
+        "(Ljava/lang/String;I)Ljava/net/Socket;",
+        |ctx, args| {
+            let host = args.get(1).copied().unwrap_or(Value::Object(None));
+            let port = args.get(2).copied().unwrap_or(Value::Int(0));
+            phase52_socket_connect(ctx, host, port)
+        },
+    );
+    r.register(
+        sf,
+        "createSocket",
+        "(Ljava/net/InetAddress;I)Ljava/net/Socket;",
+        |ctx, args| {
+            let host = match args.get(1).copied().unwrap_or(Value::Object(None)) {
+                Value::Object(Some(addr)) => ctx
+                    .invoke_virtual(addr, "getHostAddress", "()Ljava/lang/String;", &[])
+                    .ok()
+                    .flatten()
+                    .unwrap_or(Value::Object(None)),
+                _ => Value::Object(None),
+            };
+            let port = args.get(2).copied().unwrap_or(Value::Int(0));
+            phase52_socket_connect(ctx, host, port)
+        },
+    );
+    r.register(
+        sf,
+        "createSocket",
+        "(Ljava/lang/String;ILjava/net/InetAddress;I)Ljava/net/Socket;",
+        |ctx, args| {
+            let host = args.get(1).copied().unwrap_or(Value::Object(None));
+            let port = args.get(2).copied().unwrap_or(Value::Int(0));
+            phase52_socket_connect(ctx, host, port)
+        },
+    );
+    r.register(
+        sf,
+        "createSocket",
+        "(Ljava/net/InetAddress;ILjava/net/InetAddress;I)Ljava/net/Socket;",
+        |ctx, args| {
+            let host = match args.get(1).copied().unwrap_or(Value::Object(None)) {
+                Value::Object(Some(addr)) => ctx
+                    .invoke_virtual(addr, "getHostAddress", "()Ljava/lang/String;", &[])
+                    .ok()
+                    .flatten()
+                    .unwrap_or(Value::Object(None)),
+                _ => Value::Object(None),
+            };
+            let port = args.get(2).copied().unwrap_or(Value::Int(0));
+            phase52_socket_connect(ctx, host, port)
+        },
+    );
+    let sock = "java/net/Socket";
+    r.register(
+        sock,
+        "getRemoteSocketAddress",
+        "()Ljava/net/SocketAddress;",
+        |ctx, args| {
+            let this = obj_arg(args, 0)?;
+            let host = ctx.get_field(this, SOCK_HOST);
+            let port = ctx.get_field(this, SOCK_PORT);
+            ctx.new_object_initialized(
+                "java/net/InetSocketAddress",
+                "(Ljava/lang/String;I)V",
+                &[host, port],
+            )
+        },
+    );
+    r.register(
+        sock,
+        "getLocalSocketAddress",
+        "()Ljava/net/SocketAddress;",
+        |ctx, args| {
+            let this = obj_arg(args, 0)?;
+            let host = Value::Object(Some(ctx.create_string("127.0.0.1")));
+            let port = ctx.get_field(this, SOCK_LOCAL_PORT);
+            ctx.new_object_initialized(
+                "java/net/InetSocketAddress",
+                "(Ljava/lang/String;I)V",
+                &[host, port],
+            )
+        },
+    );
+
     let ssf = "javax/net/ServerSocketFactory";
     r.register(
         ssf,
@@ -13325,6 +13921,36 @@ pub(crate) fn register_phase53_socket_stubs(r: &mut NativeMethodRegistry) {
             }
         },
     );
+    r.register(
+        sock,
+        "getRemoteSocketAddress",
+        "()Ljava/net/SocketAddress;",
+        |ctx, args| {
+            let this = obj_arg(args, 0)?;
+            let host = ctx.get_field(this, SOCK_HOST);
+            let port = ctx.get_field(this, SOCK_PORT);
+            ctx.new_object_initialized(
+                "java/net/InetSocketAddress",
+                "(Ljava/lang/String;I)V",
+                &[host, port],
+            )
+        },
+    );
+    r.register(
+        sock,
+        "getLocalSocketAddress",
+        "()Ljava/net/SocketAddress;",
+        |ctx, args| {
+            let this = obj_arg(args, 0)?;
+            let host = Value::Object(Some(ctx.create_string("127.0.0.1")));
+            let port = ctx.get_field(this, SOCK_LOCAL_PORT);
+            ctx.new_object_initialized(
+                "java/net/InetSocketAddress",
+                "(Ljava/lang/String;I)V",
+                &[host, port],
+            )
+        },
+    );
 
     // getInputStream() → returns a SocketInputStream backed by stream_id
     r.register(
@@ -13583,11 +14209,17 @@ pub(crate) fn register_phase53_socket_stubs(r: &mut NativeMethodRegistry) {
             return Ok(Some(Value::Int(-1)));
         }
         let mut buf = [0u8; 1];
-        let mut reg = s2_registry().lock();
-        if let Some(stream) = reg.streams.get_mut(&sid) {
-            match (&**stream).read(&mut buf) {
+        let stream = {
+            let reg = s2_registry().lock();
+            reg.streams.get(&sid).cloned()
+        };
+        if let Some(stream) = stream {
+            let mut stream_ref = &*stream;
+            match stream_ref.read(&mut buf) {
                 Ok(0) => Ok(Some(Value::Int(-1))),
                 Ok(_) => Ok(Some(Value::Int(buf[0] as i32))),
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => Ok(Some(Value::Int(0))),
+                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => Ok(Some(Value::Int(0))),
                 Err(_) => Ok(Some(Value::Int(-1))),
             }
         } else {
@@ -13599,17 +14231,26 @@ pub(crate) fn register_phase53_socket_stubs(r: &mut NativeMethodRegistry) {
         let arr = obj_arg(args, 1)?;
         let off = args[2].as_int().unwrap_or(0) as usize;
         let len = args[3].as_int().unwrap_or(0) as usize;
+        if len == 0 {
+            return Ok(Some(Value::Int(0)));
+        }
         let sid = ctx.get_field(this, SIO_STREAM_ID).as_int().unwrap_or(-1);
         if sid < 0 {
             return Ok(Some(Value::Int(-1)));
         }
         let mut tmp = vec![0u8; len];
         let n = {
-            let mut reg = s2_registry().lock();
-            if let Some(stream) = reg.streams.get_mut(&sid) {
-                match (&**stream).read(&mut tmp) {
+            let stream = {
+                let reg = s2_registry().lock();
+                reg.streams.get(&sid).cloned()
+            };
+            if let Some(stream) = stream {
+                let mut stream_ref = &*stream;
+                match stream_ref.read(&mut tmp) {
                     Ok(0) => -1i32,
                     Ok(n) => n as i32,
+                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => 0,
+                    Err(e) if e.kind() == std::io::ErrorKind::Interrupted => 0,
                     Err(_) => -1,
                 }
             } else {
@@ -13627,17 +14268,26 @@ pub(crate) fn register_phase53_socket_stubs(r: &mut NativeMethodRegistry) {
         let this = obj_arg(args, 0)?;
         let arr = obj_arg(args, 1)?;
         let len = ctx.array_length(arr) as usize;
+        if len == 0 {
+            return Ok(Some(Value::Int(0)));
+        }
         let sid = ctx.get_field(this, SIO_STREAM_ID).as_int().unwrap_or(-1);
         if sid < 0 {
             return Ok(Some(Value::Int(-1)));
         }
         let mut tmp = vec![0u8; len];
         let n = {
-            let mut reg = s2_registry().lock();
-            if let Some(stream) = reg.streams.get_mut(&sid) {
-                match (&**stream).read(&mut tmp) {
+            let stream = {
+                let reg = s2_registry().lock();
+                reg.streams.get(&sid).cloned()
+            };
+            if let Some(stream) = stream {
+                let mut stream_ref = &*stream;
+                match stream_ref.read(&mut tmp) {
                     Ok(0) => -1i32,
                     Ok(n) => n as i32,
+                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => 0,
+                    Err(e) if e.kind() == std::io::ErrorKind::Interrupted => 0,
                     Err(_) => -1,
                 }
             } else {
@@ -13686,9 +14336,13 @@ pub(crate) fn register_phase53_socket_stubs(r: &mut NativeMethodRegistry) {
             }
             .into());
         }
-        let mut reg = s2_registry().lock();
-        if let Some(stream) = reg.streams.get_mut(&sid) {
-            let _ = (&**stream).write_all(&[b]);
+        let stream = {
+            let reg = s2_registry().lock();
+            reg.streams.get(&sid).cloned()
+        };
+        if let Some(stream) = stream {
+            let mut stream_ref = &*stream;
+            let _ = stream_ref.write_all(&[b]);
         }
         Ok(Some(Value::Object(None)))
     });
@@ -13709,9 +14363,13 @@ pub(crate) fn register_phase53_socket_stubs(r: &mut NativeMethodRegistry) {
             let v = ctx.get_array_element(arr, off + i).as_int().unwrap_or(0);
             data.push(v as u8);
         }
-        let mut reg = s2_registry().lock();
-        if let Some(stream) = reg.streams.get_mut(&sid) {
-            let _ = (&**stream).write_all(&data);
+        let stream = {
+            let reg = s2_registry().lock();
+            reg.streams.get(&sid).cloned()
+        };
+        if let Some(stream) = stream {
+            let mut stream_ref = &*stream;
+            let _ = stream_ref.write_all(&data);
         }
         Ok(Some(Value::Object(None)))
     });
@@ -13731,9 +14389,13 @@ pub(crate) fn register_phase53_socket_stubs(r: &mut NativeMethodRegistry) {
             let v = ctx.get_array_element(arr, i).as_int().unwrap_or(0);
             data.push(v as u8);
         }
-        let mut reg = s2_registry().lock();
-        if let Some(stream) = reg.streams.get_mut(&sid) {
-            let _ = (&**stream).write_all(&data);
+        let stream = {
+            let reg = s2_registry().lock();
+            reg.streams.get(&sid).cloned()
+        };
+        if let Some(stream) = stream {
+            let mut stream_ref = &*stream;
+            let _ = stream_ref.write_all(&data);
         }
         Ok(Some(Value::Object(None)))
     });
@@ -13741,9 +14403,13 @@ pub(crate) fn register_phase53_socket_stubs(r: &mut NativeMethodRegistry) {
         let this = obj_arg(args, 0)?;
         let sid = ctx.get_field(this, SIO_STREAM_ID).as_int().unwrap_or(-1);
         if sid >= 0 {
-            let mut reg = s2_registry().lock();
-            if let Some(stream) = reg.streams.get_mut(&sid) {
-                let _ = (&**stream).flush();
+            let stream = {
+                let reg = s2_registry().lock();
+                reg.streams.get(&sid).cloned()
+            };
+            if let Some(stream) = stream {
+                let mut stream_ref = &*stream;
+                let _ = stream_ref.flush();
             }
         }
         Ok(Some(Value::Object(None)))

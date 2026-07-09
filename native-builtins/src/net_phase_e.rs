@@ -2734,6 +2734,50 @@ fn re1_socket_write_stream(
     Ok(None)
 }
 
+fn native_socket_input_stream_read_bytes(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    let this = obj_arg(args, 0)?;
+    let owner =
+        stream_owner_get(ctx, this).ok_or_else(|| ioex("SocketInputStream has no owner"))?;
+    let buf = obj_arg(args, 1)?;
+    let off = args.get(2).and_then(|v| v.as_int()).unwrap_or(0);
+    let len = args.get(3).and_then(|v| v.as_int()).unwrap_or(0);
+    re1_socket_read_stream(ctx, owner, buf, off, len)
+}
+
+fn native_socket_input_stream_read_array(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    let this = obj_arg(args, 0)?;
+    let owner =
+        stream_owner_get(ctx, this).ok_or_else(|| ioex("SocketInputStream has no owner"))?;
+    let buf = obj_arg(args, 1)?;
+    let len = ctx.array_length(buf) as i32;
+    re1_socket_read_stream(ctx, owner, buf, 0, len)
+}
+
+fn native_socket_input_stream_read_one(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    let this = obj_arg(args, 0)?;
+    let owner =
+        stream_owner_get(ctx, this).ok_or_else(|| ioex("SocketInputStream has no owner"))?;
+    let one = ctx.new_array(ArrayElementType::Byte, 1);
+    let r = re1_socket_read_stream(ctx, owner, one, 0, 1)?;
+    match r {
+        Some(Value::Int(-1)) => Ok(Some(Value::Int(-1))),
+        Some(Value::Int(_)) => {
+            let b = ctx.get_array_element(one, 0).as_int().unwrap_or(0);
+            Ok(Some(Value::Int(b & 0xff)))
+        }
+        _ => Ok(Some(Value::Int(-1))),
+    }
+}
+
 /// The real `java.net.Socket` constructor initializes `socketLock = new Object()`
 /// via a field initializer; the synthetic `<init>` natives skip it, so
 /// `socketLock` reads back null. Real `Socket.getImpl()` bytecode — reached by
@@ -3157,15 +3201,12 @@ fn register_re1_socket(r: &mut NativeMethodRegistry) {
     );
 
     let sis = "java/net/Socket$SocketInputStream";
-    r.register(sis, "read", "([BII)I", |ctx, args| {
-        let this = obj_arg(args, 0)?;
-        let owner =
-            stream_owner_get(ctx, this).ok_or_else(|| ioex("SocketInputStream has no owner"))?;
-        let buf = obj_arg(args, 1)?;
-        let off = args.get(2).and_then(|v| v.as_int()).unwrap_or(0);
-        let len = args.get(3).and_then(|v| v.as_int()).unwrap_or(0);
-        re1_socket_read_stream(ctx, owner, buf, off, len)
-    });
+    r.register(
+        sis,
+        "read",
+        "([BII)I",
+        native_socket_input_stream_read_bytes,
+    );
     // read([B)I — MUST be registered directly. Without it, `in.read(byte[])`
     // falls to the default java.io.InputStream.read(byte[]) bytecode, which
     // reads ONE byte then loops single-byte read() to fill the ENTIRE array,
@@ -3174,32 +3215,17 @@ fn register_re1_socket(r: &mut NativeMethodRegistry) {
     // A single bulk read returning whatever is currently available (>=1 byte)
     // is the correct InputStream.read(byte[]) contract and unblocks every
     // server-side request read (okhttp MockWebServer, loopback HTTP). BUG-04.
-    r.register(sis, "read", "([B)I", |ctx, args| {
-        let this = obj_arg(args, 0)?;
-        let owner =
-            stream_owner_get(ctx, this).ok_or_else(|| ioex("SocketInputStream has no owner"))?;
-        let buf = obj_arg(args, 1)?;
-        let len = ctx.array_length(buf) as i32;
-        re1_socket_read_stream(ctx, owner, buf, 0, len)
-    });
-    r.register(sis, "read", "()I", |ctx, args| {
-        let this = obj_arg(args, 0)?;
-        let owner =
-            stream_owner_get(ctx, this).ok_or_else(|| ioex("SocketInputStream has no owner"))?;
-        let one = ctx.new_array(ArrayElementType::Byte, 1);
-        let pin = ctx.pin_native_root(one);
-        let r = re1_socket_read_stream(ctx, owner, one, 0, 1);
-        let one = ctx.read_native_pin(pin, one);
-        ctx.unpin_native_roots(pin);
-        match r? {
-            Some(Value::Int(-1)) => Ok(Some(Value::Int(-1))),
-            Some(Value::Int(_)) => {
-                let b = ctx.get_array_element(one, 0).as_int().unwrap_or(0);
-                Ok(Some(Value::Int(b & 0xff)))
-            }
-            _ => Ok(Some(Value::Int(-1))),
-        }
-    });
+    r.register(sis, "read", "([B)I", native_socket_input_stream_read_array);
+    r.register(sis, "read", "()I", native_socket_input_stream_read_one);
+    cratonvm_native_api::socket_input_stream_read::set_read_bytes(
+        native_socket_input_stream_read_bytes,
+    );
+    cratonvm_native_api::socket_input_stream_read::set_read_array(
+        native_socket_input_stream_read_array,
+    );
+    cratonvm_native_api::socket_input_stream_read::set_read_one(
+        native_socket_input_stream_read_one,
+    );
     r.register(sis, "close", "()V", |_ctx, _args| Ok(None));
     r.register(sis, "available", "()I", |_ctx, args| {
         // Real BufferedReader.readLine asks via available()? No — it calls
