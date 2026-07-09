@@ -15345,9 +15345,10 @@ pub(crate) fn register_phase54_net_extras(r: &mut NativeMethodRegistry) {
         if let Some(scheme) = scheme_text {
             let named_scheme = ctx.create_string(scheme);
             ctx.set_field_by_name(this, "scheme", Value::Object(Some(named_scheme)));
-            let named_ssp = ctx.create_string(rest);
+            let raw_ssp = rest.split('#').next().unwrap_or(rest);
+            let named_ssp = ctx.create_string(raw_ssp);
             ctx.set_field_by_name(this, "schemeSpecificPart", Value::Object(Some(named_ssp)));
-            let named_dssp = ctx.create_string(rest);
+            let named_dssp = ctx.create_string(raw_ssp);
             ctx.set_field_by_name(
                 this,
                 "decodedSchemeSpecificPart",
