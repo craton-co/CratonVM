@@ -63,9 +63,9 @@ this confirms the original known-issue report was real, just partially
 masked by the (now-fixed) more-severe Layer 1 bug.
 
 Root cause fully diagnosed with a minimal, Tomcat-independent repro — see
-[`bytebuffer-address-unset-aioobe.md`](bytebuffer-address-unset-aioobe.md).
+[`bytebuffer-address-unset-aioobe.md`](../../internal/tomcat-08-07/bytebuffer-address-unset-aioobe.md).
 Short version: any `ByteBuffer` returned by CratonVM's synthetic
-`ByteBuffer.allocate()` carrier never has its `java.nio.Buffer.address`
+`ByteBuffer.allocate()` carrier did not have its `java.nio.Buffer.address`
 field populated. Real bulk-transfer bytecode
 (`ByteBuffer.get(byte[])` → `getArray` → `ScopedMemoryAccess.copyMemory`)
 computes a source offset of `address + position`, which comes out `0` instead
