@@ -2637,6 +2637,12 @@ fn register_pe2_struct_layouts(r: &mut NativeMethodRegistry) {
             Ok(Some(args.first().copied().unwrap_or(Value::Object(None))))
         },
     );
+    r.register(
+        ml,
+        "varHandle",
+        "([Ljava/lang/foreign/MemoryLayout$PathElement;)Ljava/lang/invoke/VarHandle;",
+        pe_memory_layout_var_handle,
+    );
 
     // MemoryLayout.byteSize() fallback for any layout
     r.register(ml, "byteSize", "()J", |ctx, args| {
@@ -2683,6 +2689,114 @@ fn register_pe2_struct_layouts(r: &mut NativeMethodRegistry) {
             Ok(Some(Value::Object(Some(elem))))
         },
     );
+}
+
+fn pe_memory_layout_width(ctx: &mut dyn NativeContext, layout: ObjectRef) -> i64 {
+    let kind = match ctx.get_field(layout, 0) {
+        Value::Int(v) => v,
+        _ => -1,
+    };
+    if kind < 10 {
+        ffi::layout_byte_size(kind) as i64
+    } else {
+        match ctx.get_field(layout, 1) {
+            Value::Long(v) => v,
+            _ => 1,
+        }
+    }
+}
+
+fn pe_memory_layout_path_target(
+    ctx: &mut dyn NativeContext,
+    layout: ObjectRef,
+    path_arr: ObjectRef,
+) -> ObjectRef {
+    let mut current = layout;
+    let mut i = 0;
+    let len = ctx.array_length(path_arr);
+    while i < len {
+        let pe = match ctx.get_array_element(path_arr, i) {
+            Value::Object(Some(pe)) => pe,
+            _ => break,
+        };
+        let path_kind = match ctx.get_field(pe, 1) {
+            Value::Int(v) => v,
+            _ => -1,
+        };
+        match path_kind {
+            0 => {
+                let target_name = match ctx.get_field(pe, 0) {
+                    Value::Object(Some(s)) => ctx.read_string(s).unwrap_or_default(),
+                    _ => String::new(),
+                };
+                if target_name.is_empty() {
+                    break;
+                }
+                let current_kind = match ctx.get_field(current, 0) {
+                    Value::Int(v) => v,
+                    _ => -1,
+                };
+                if current_kind != LAYOUT_STRUCT && current_kind != LAYOUT_UNION {
+                    break;
+                }
+                let names_arr = match ctx.get_field(current, 3) {
+                    Value::Object(Some(arr)) => arr,
+                    _ => break,
+                };
+                let members_arr = match ctx.get_field(current, 2) {
+                    Value::Object(Some(arr)) => arr,
+                    _ => break,
+                };
+                let mut found = false;
+                let name_len = ctx.array_length(names_arr);
+                let mut j = 0;
+                while j < name_len {
+                    if let Value::Object(Some(name_ref)) = ctx.get_array_element(names_arr, j) {
+                        if ctx.read_string(name_ref).as_deref() == Some(&target_name) {
+                            if let Value::Object(Some(member_layout)) =
+                                ctx.get_array_element(members_arr, j)
+                            {
+                                current = member_layout;
+                                found = true;
+                                break;
+                            }
+                        }
+                    }
+                    j += 1;
+                }
+                if !found {
+                    break;
+                }
+            }
+            1 => {
+                if let Value::Object(Some(element)) = ctx.get_field(current, 2) {
+                    current = element;
+                } else {
+                    break;
+                }
+            }
+            _ => break,
+        }
+        i += 1;
+    }
+    current
+}
+
+fn pe_memory_layout_var_handle(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = obj_arg(args, 0)?;
+    let target_layout = match args.get(1) {
+        Some(Value::Object(Some(path_arr))) => pe_memory_layout_path_target(ctx, this, *path_arr),
+        _ => this,
+    };
+    let mut width = pe_memory_layout_width(ctx, target_layout);
+    if !(1..=8).contains(&width) {
+        width = 1;
+    }
+    let vh = alloc_concurrent_synthetic(ctx, "java/lang/invoke/VarHandle", 3);
+    ctx.set_field(vh, 0, Value::Int(1)); // little-endian marker for memory-segment varhandles
+    ctx.set_field(vh, 1, Value::Int(width as i32));
+    ctx.set_field(vh, 2, Value::Int(3)); // VH_KIND_MEMORY_SEGMENT
+    Ok(Some(Value::Object(Some(vh))))
 }
 
 /// Compute struct layout: iterate members, align each, compute offsets and total size.

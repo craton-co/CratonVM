@@ -20702,6 +20702,10 @@ fn force_native_over_real_jdk_bytecode(
                 "([Ljava/lang/foreign/MemoryLayout;)Ljava/lang/foreign/MemoryLayout;"
             ) | ("paddingLayout", "(J)Ljava/lang/foreign/PaddingLayout;")
                 | ("paddingLayout", "(J)Ljava/lang/foreign/MemoryLayout;")
+                | (
+                    "varHandle",
+                    "([Ljava/lang/foreign/MemoryLayout$PathElement;)Ljava/lang/invoke/VarHandle;"
+                )
         )
     {
         return true;
