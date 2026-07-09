@@ -179,6 +179,28 @@ fn alloc_singleton(ctx: &mut dyn NativeContext, owner_class: &str) -> ObjectRef 
     }
 }
 
+fn alloc_owner_instance(ctx: &mut dyn NativeContext, owner_class: &str) -> Option<ObjectRef> {
+    let cid = ctx.ensure_class_initialized(owner_class).ok()?;
+    let real_fields = ctx.class_num_total_fields(cid);
+    Some(ctx.alloc_object(cid, real_fields.max(1)))
+}
+
+fn alloc_named_synthetic_singleton(ctx: &mut dyn NativeContext, owner_class: &str) -> ObjectRef {
+    let cid = ctx.ensure_synthetic_class(owner_class, 1);
+    let fields = ctx.class_num_total_fields(cid).max(1);
+    ctx.alloc_object(cid, fields)
+}
+
+fn alloc_java_nio_access_singleton(ctx: &mut dyn NativeContext) -> ObjectRef {
+    // JDK 25 implements JavaNioAccess as Buffer$2; JDK 17 implements it as
+    // Buffer$1. If neither class is loadable, keep a named owner so
+    // invokeinterface resolves against registered JavaNioAccess bridge methods
+    // instead of the generic AnonymousObject$1 fallback.
+    alloc_owner_instance(ctx, "java/nio/Buffer$2")
+        .or_else(|| alloc_owner_instance(ctx, "java/nio/Buffer$1"))
+        .unwrap_or_else(|| alloc_named_synthetic_singleton(ctx, "java/nio/Buffer$2"))
+}
+
 /// Register the `SharedSecrets.getJavaXxxAccess()` factories.
 ///
 /// Each factory returns a synthetic object of the matching owner
@@ -228,13 +250,17 @@ fn make_factory_callback(owner_class: &'static str) -> cratonvm_native_api::Nati
     gen_factory!(f_jiofd, "java/io/FileDescriptor$1");
     gen_factory!(f_jniaa, "java/net/InetAddress$1");
     gen_factory!(f_jnuri, "cratonvm/internal/ss/JavaNetUriAccess$1");
-    gen_factory!(f_jnio, "java/nio/Buffer$2");
     gen_factory!(f_jsec, "java/security/AccessController$1");
     gen_factory!(f_jujar, "cratonvm/internal/ss/JavaUtilJarAccess$1");
     gen_factory!(f_juzf, "java/util/zip/ZipFile$1");
     gen_factory!(f_jnhc, "cratonvm/internal/ss/JavaNetHttpCookieAccess$1");
     gen_factory!(f_jois, "java/io/ObjectInputStream$1");
     gen_factory!(f_jurb, "java/util/ResourceBundle$1");
+
+    fn f_jnio(ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
+        let obj = alloc_java_nio_access_singleton(ctx);
+        Ok(Some(Value::Object(Some(obj))))
+    }
 
     match owner_class {
         "java/lang/System$1" => f_jla,
@@ -1712,18 +1738,24 @@ fn register_java_nio_access(registry: &mut NativeMethodRegistry) {
     registry.register(owner, "reserveMemory", "(JJ)V", jnio_reserve_memory_noop);
     registry.register(owner, "unreserveMemory", "(JJ)V", jnio_reserve_memory_noop);
     registry.register(owner, "pageSize", "()I", jnio_page_size);
-    // RKC16N.10 follow-on / RKC16N.11: legacy JDK 8/9 SharedSecrets
-    // accessor still referenced by ManagementFactory.<clinit> in some
-    // JDK 25 builds. Originally returned null, which downstream NPE'd
-    // when the caller dereferenced the result. Now returns a synthetic
-    // `jdk.internal.misc.VM$BufferPool` whose four natives — registered
-    // just below — yield safe defaults.
-    registry.register(
+    // RKC16N.10 follow-on / RKC16N.11 / TOMCAT0807: legacy SharedSecrets
+    // accessor used by JDK 17's `VM$BufferPoolsHolder.<clinit>`.
+    // JDK 25 exposes JavaNioAccess as Buffer$2, JDK 17 as Buffer$1, and
+    // CratonVM can also see a synthetic anonymous receiver when real class
+    // metadata is incomplete. Register the method on both known owners and on
+    // the interface so the forced invokeinterface path has a stable target.
+    for direct_owner in [
         owner,
-        "getDirectBufferPool",
-        "()Ljdk/internal/misc/VM$BufferPool;",
-        jnio_get_direct_buffer_pool,
-    );
+        "java/nio/Buffer$1",
+        "jdk/internal/access/JavaNioAccess",
+    ] {
+        registry.register(
+            direct_owner,
+            "getDirectBufferPool",
+            "()Ljdk/internal/misc/VM$BufferPool;",
+            jnio_get_direct_buffer_pool,
+        );
+    }
 
     // RKC16N.11: the four `VM$BufferPool` interface methods. The
     // returned synthetic from `jnio_get_direct_buffer_pool` carries
@@ -2169,6 +2201,42 @@ mod tests {
             assert!(
                 r.find(owner, method, desc).is_some(),
                 "expected method {owner}.{method}{desc} not registered"
+            );
+        }
+    }
+
+    #[test]
+    fn java_nio_access_direct_buffer_pool_registered_for_jdk17_shape() {
+        // JDK 17's VM$BufferPoolsHolder invokes
+        // SharedSecrets.getJavaNioAccess().getDirectBufferPool() through the
+        // JavaNioAccess interface. Depending on host JDK shape and CratonVM
+        // anonymous-class metadata, the receiver can be Buffer$1, Buffer$2, or
+        // reached only via the interface owner.
+        let mut r = NativeMethodRegistry::new();
+        register_wp1_4_shared_secrets(&mut r);
+        let descriptor = "()Ljdk/internal/misc/VM$BufferPool;";
+
+        for owner in [
+            "java/nio/Buffer$1",
+            "java/nio/Buffer$2",
+            "jdk/internal/access/JavaNioAccess",
+        ] {
+            assert!(
+                r.find(owner, "getDirectBufferPool", descriptor).is_some(),
+                "JavaNioAccess.getDirectBufferPool missing on {owner}"
+            );
+        }
+
+        for (method, desc) in [
+            ("getName", "()Ljava/lang/String;"),
+            ("getCount", "()J"),
+            ("getTotalCapacity", "()J"),
+            ("getMemoryUsed", "()J"),
+        ] {
+            assert!(
+                r.find("jdk/internal/misc/VM$BufferPool", method, desc)
+                    .is_some(),
+                "VM$BufferPool.{method}{desc} must be registered"
             );
         }
     }

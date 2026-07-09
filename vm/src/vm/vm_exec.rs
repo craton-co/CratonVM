@@ -11092,6 +11092,11 @@ fn invoke_on_class_shared_inner(
                             method_name,
                             descriptor,
                         )
+                        || crate::runtime::interpreter::is_java_nio_access_native_override(
+                            class_name,
+                            method_name,
+                            descriptor,
+                        )
                         || crate::runtime::interpreter::is_xerces_cmstateset_native_override(
                             class_name,
                             method_name,
