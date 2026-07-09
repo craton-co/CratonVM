@@ -18833,6 +18833,10 @@ pub fn register_essential_natives(registry: &mut NativeMethodRegistry) {
         // docs/known-issues/gc-blocked-thread-frame-stale-thread-mirror.md.
         let pin_base = ctx.pin_native_root(this);
         ctx.set_field_by_name(this, "name", name);
+        // JDK 17 keeps the Runnable directly on Thread.target and has no
+        // Thread$FieldHolder. Seed the direct field before attempting the newer
+        // holder layout so app-created threads still run on that JDK shape.
+        ctx.set_field_by_name(this, "target", target);
         // Don't clobber an already-populated holder (e.g. if the real
         // Java constructor somehow ran first, or a re-entrant call).
         if let Value::Object(Some(_)) = ctx.get_field_by_name(this, "holder") {
