@@ -125,6 +125,9 @@ struct ReaderState {
     /// to event 0 on the first call (matches StAX semantics where
     /// `getEventType()` after construction returns START_DOCUMENT).
     cursor: isize,
+    /// XML declaration encoding, as reported by
+    /// XMLStreamReader.getCharacterEncodingScheme().
+    character_encoding_scheme: Option<String>,
 }
 
 impl ReaderState {
@@ -300,6 +303,83 @@ fn split_qname(qname: &[u8]) -> (String, String) {
     }
 }
 
+struct PreparedXml {
+    bytes: Vec<u8>,
+    character_encoding_scheme: Option<String>,
+}
+
+fn prepare_xml_bytes(bytes: &[u8]) -> PreparedXml {
+    let text = if bytes.starts_with(&[0xEF, 0xBB, 0xBF]) {
+        String::from_utf8_lossy(&bytes[3..]).into_owned()
+    } else if bytes.starts_with(&[0xFE, 0xFF]) {
+        decode_utf16_bytes(&bytes[2..], true)
+    } else if bytes.starts_with(&[0xFF, 0xFE]) {
+        decode_utf16_bytes(&bytes[2..], false)
+    } else if bytes.len() >= 4
+        && bytes[0] == 0x00
+        && bytes[1] == 0x3C
+        && bytes[2] == 0x00
+        && bytes[3] == 0x3F
+    {
+        decode_utf16_bytes(bytes, true)
+    } else if bytes.len() >= 4
+        && bytes[0] == 0x3C
+        && bytes[1] == 0x00
+        && bytes[2] == 0x3F
+        && bytes[3] == 0x00
+    {
+        decode_utf16_bytes(bytes, false)
+    } else {
+        String::from_utf8_lossy(bytes).into_owned()
+    };
+
+    let declared = xml_decl_encoding(&text);
+    PreparedXml {
+        bytes: text.into_bytes(),
+        character_encoding_scheme: declared,
+    }
+}
+
+fn decode_utf16_bytes(bytes: &[u8], big_endian: bool) -> String {
+    let mut units = Vec::with_capacity(bytes.len() / 2);
+    for pair in bytes.chunks_exact(2) {
+        let unit = if big_endian {
+            u16::from_be_bytes([pair[0], pair[1]])
+        } else {
+            u16::from_le_bytes([pair[0], pair[1]])
+        };
+        units.push(unit);
+    }
+    String::from_utf16_lossy(&units)
+}
+
+fn xml_decl_encoding(text: &str) -> Option<String> {
+    let s = text.strip_prefix('\u{FEFF}').unwrap_or(text).trim_start();
+    let rest = s.strip_prefix("<?xml")?;
+    let end = rest.find("?>").unwrap_or(rest.len());
+    let decl = &rest[..end];
+    let key = "encoding";
+    let key_pos = decl.find(key)?;
+    let mut tail = &decl[key_pos + key.len()..];
+    tail = tail.trim_start();
+    if !tail.starts_with('=') {
+        return None;
+    }
+    tail = tail[1..].trim_start();
+    let quote = tail.chars().next()?;
+    if quote != '"' && quote != '\'' {
+        return None;
+    }
+    let after = &tail[quote.len_utf8()..];
+    let end = after.find(quote)?;
+    let value = &after[..end];
+    if value.is_empty() {
+        None
+    } else {
+        Some(value.to_string())
+    }
+}
+
 fn parse_to_events(bytes: &[u8]) -> Vec<StaxEvent> {
     let mut events: Vec<StaxEvent> = Vec::new();
     // START_DOCUMENT sits at the very start of the source (line 1, col 1, offset 0).
@@ -472,6 +552,16 @@ fn parse_to_events(bytes: &[u8]) -> Vec<StaxEvent> {
         ..Default::default()
     });
     events
+}
+
+fn make_reader_state(bytes: &[u8]) -> ReaderState {
+    let prepared = prepare_xml_bytes(bytes);
+    let events = parse_to_events(&prepared.bytes);
+    ReaderState {
+        events,
+        cursor: 0,
+        character_encoding_scheme: prepared.character_encoding_scheme,
+    }
 }
 
 fn make_element_event(
@@ -819,9 +909,8 @@ fn native_create_reader_from_input_stream(
         }
     };
     let bytes = drain_input_stream(ctx, stream);
-    let events = parse_to_events(&bytes);
     let reader = alloc_synthetic(ctx, "javax/xml/stream/XMLStreamReader")?;
-    store_state(ctx, reader, ReaderState { events, cursor: 0 });
+    store_state(ctx, reader, make_reader_state(&bytes));
     Ok(Some(Value::Object(Some(reader))))
 }
 
@@ -873,9 +962,8 @@ fn native_create_reader_from_reader(
             break;
         }
     }
-    let events = parse_to_events(text.as_bytes());
     let reader = alloc_synthetic(ctx, "javax/xml/stream/XMLStreamReader")?;
-    store_state(ctx, reader, ReaderState { events, cursor: 0 });
+    store_state(ctx, reader, make_reader_state(text.as_bytes()));
     Ok(Some(Value::Object(Some(reader))))
 }
 
@@ -896,9 +984,8 @@ fn make_cursor_reader(
     ctx: &mut dyn NativeContext,
     bytes: &[u8],
 ) -> Result<ObjectRef, MethodCallFailed> {
-    let events = parse_to_events(bytes);
     let reader = alloc_synthetic(ctx, "javax/xml/stream/XMLStreamReader")?;
-    store_state(ctx, reader, ReaderState { events, cursor: 0 });
+    store_state(ctx, reader, make_reader_state(bytes));
     Ok(reader)
 }
 
@@ -1919,7 +2006,7 @@ pub fn register(registry: &mut NativeMethodRegistry) {
         "javax/xml/stream/XMLStreamReader",
         "getCharacterEncodingScheme",
         "()Ljava/lang/String;",
-        |_ctx, _args| Ok(Some(Value::Object(None))),
+        native_get_character_encoding_scheme,
     );
     registry.register(
         "javax/xml/stream/XMLStreamReader",
@@ -2221,6 +2308,18 @@ fn native_get_text_length(ctx: &mut dyn NativeContext, args: &[Value]) -> Method
     Ok(Some(Value::Int(len as i32)))
 }
 
+fn native_get_character_encoding_scheme(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    let this = this_obj(args)?;
+    require_state(ctx, this)?;
+    let scheme = with_state(ctx, this, |s| s.character_encoding_scheme.clone()).flatten();
+    Ok(Some(Value::Object(
+        scheme.map(|encoding| ctx.create_string(&encoding)),
+    )))
+}
+
 /// `com.sun.xml.internal.stream.events.EndElementEvent.getNamespaces()` — return
 /// the namespaces that go out of scope at this end tag. The JDK body always
 /// returns an empty `ReadOnlyIterator` (it computes `fNamespaces.iterator()` then
@@ -2371,4 +2470,50 @@ fn native_require(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResu
         );
     }
     Ok(None)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn tomcat0807_jasper_stax_reports_utf16be_xml_decl_encoding() {
+        let text = "<?xml version=\"1.0\" encoding=\"UTF-16BE\"?><root/>";
+        let mut bytes = Vec::new();
+        for unit in text.encode_utf16() {
+            bytes.extend_from_slice(&unit.to_be_bytes());
+        }
+
+        let prepared = prepare_xml_bytes(&bytes);
+
+        assert_eq!(
+            prepared.character_encoding_scheme.as_deref(),
+            Some("UTF-16BE")
+        );
+        assert_eq!(String::from_utf8(prepared.bytes).unwrap(), text);
+    }
+
+    #[test]
+    fn tomcat0807_jasper_stax_reports_utf8_bom_decl_encoding() {
+        let mut bytes = vec![0xEF, 0xBB, 0xBF];
+        bytes.extend_from_slice(b"<?xml version='1.0' encoding='UTF-8'?><root/>");
+
+        let prepared = prepare_xml_bytes(&bytes);
+
+        assert_eq!(prepared.character_encoding_scheme.as_deref(), Some("UTF-8"));
+        assert!(String::from_utf8(prepared.bytes)
+            .unwrap()
+            .starts_with("<?xml"));
+    }
+
+    #[test]
+    fn tomcat0807_jasper_stax_bom_without_decl_has_no_character_scheme() {
+        let mut bytes = vec![0xEF, 0xBB, 0xBF];
+        bytes.extend_from_slice(b"<root/>");
+
+        let prepared = prepare_xml_bytes(&bytes);
+
+        assert_eq!(prepared.character_encoding_scheme, None);
+        assert_eq!(String::from_utf8(prepared.bytes).unwrap(), "<root/>");
+    }
 }

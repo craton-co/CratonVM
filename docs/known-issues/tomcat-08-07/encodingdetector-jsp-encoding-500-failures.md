@@ -54,3 +54,42 @@ pattern — this will likely point directly at a `java.nio.charset` or
 real-JDK charset handling, similar in spirit to prior charset/decode gaps
 found elsewhere in this codebase (e.g. `.par` classpath URI decode,
 `reference_par_classpath_extension_uri_decode`).
+
+## 2026-07-09 worker evidence
+
+The local `C:\craton\CratonVM-tomcat-0807-fixture-20260709-001` worktree does
+not contain `apps\tomcat-suite-runner`, so the class-level Tomcat repro could
+not be rerun here. A narrower upstream-fixture read of Tomcat 9.0.83 shows
+`TestEncodingDetector` has 22 parameters, of which 14 expect HTTP 200 and 8
+intentionally expect HTTP 500. The originally observed "14/22 returned 500
+instead of 200" therefore matches "all success cases failed", not a random
+charset subset.
+
+One concrete CratonVM gap was fixed in `native-builtins/src/xml_stax.rs`:
+Tomcat's `org.apache.jasper.compiler.EncodingDetector.getPrologEncoding`
+uses `XMLInputFactory.createXMLStreamReader(stream).getCharacterEncodingScheme()`
+to read the XML declaration, but CratonVM's StAX shim returned `null` for
+`getCharacterEncodingScheme()` and parsed the raw byte stream as UTF-8 even
+when the JSPX prolog was UTF-16BE/UTF-16LE. The fix decodes UTF-8 BOM,
+UTF-16BE, and UTF-16LE XML inputs to UTF-8 for the quick-xml cursor and stores
+the XML declaration encoding in the `XMLStreamReader` side table.
+
+Focused proof:
+
+```powershell
+$env:CARGO_TARGET_DIR='C:\craton\target-tomcat0807-jasper'
+cargo test -p cratonvm-native-builtins tomcat0807_jasper --lib
+# 3 passed
+
+cargo build -p cratonvm-cli
+javac -d apps\tomcat0807_jasper_probe\classes `
+  apps\tomcat0807_jasper_probe\Tomcat0807JasperStaxProbe.java
+C:\craton\target-tomcat0807-jasper\debug\cratonvm.exe --java-home "$env:JAVA_HOME" `
+  -c apps\tomcat0807_jasper_probe\classes Tomcat0807JasperStaxProbe
+# utf16be=UTF-16BE
+# utf8bom=UTF-8
+# OK
+```
+
+Keep this note open until `org.apache.jasper.compiler.TestEncodingDetector`
+itself is rerun and the 14 success-expected cases return 200.
