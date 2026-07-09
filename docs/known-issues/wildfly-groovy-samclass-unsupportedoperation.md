@@ -110,3 +110,11 @@ Not the same as the already-fixed Groovy/invokedynocard uncommon-trap regression
 `4ee4eb9a` / `4224c705` and siblings, already in this session's binary) — that was about JIT deopt-path
 side-effect double-execution during Groovy dynamic dispatch; this is a plain reflection-API gap hit during
 Groovy's `ClassInfo`/SAM-detection bookkeeping, a different code path entirely.
+
+**Possibly related, not confirmed:** `org.wildfly.test.integration.vdx.domain.HostXmlSmokeTestCase` (1
+instance, same run) throws a bare `org.codehaus.groovy.GroovyBugError` (no message captured) from
+`CompilationUnit.applyToPrimaryClassNodes` — i.e. during Groovy *script compilation*, not instantiation of
+an already-compiled class. Different Groovy subsystem, different stack, but same underlying app
+(`creaper`'s `Subtree.SubtreeCreator`) and same module. Not investigated further this session; whoever
+picks up the SAM-detection fix above should check whether fixing that also resolves this, or if it needs
+separate root-causing.
