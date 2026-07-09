@@ -2175,6 +2175,130 @@ fn post_clinit_fixup(shared: &SharedVm, class_id: ClassId, class_name: &str) {
             n += set_static_by_name("pathSeparatorChar", Value::Int(path_sep_char as i32)) as i32;
             n += set_static_by_name("pathSeparator", Value::Object(Some(path_sep_str))) as i32;
             tracing::warn!("Post-clinit fixup: File separator/pathSeparator populated ({n}/4)");
+
+            // tomcat-08-07 follow-up: the four fields above are all that were
+            // ever backfilled here, but the REAL bytecode assigns `FS` itself
+            // FIRST (`private static final FileSystem FS =
+            // DefaultFileSystem.getFileSystem();` — see javap of java/io/File
+            // on jdk25: offsets 16-19), before any of separatorChar/
+            // separator/pathSeparatorChar/pathSeparator are read off of it.
+            // `DefaultFileSystem.getFileSystem()` is just `new
+            // UnixFileSystem()`, and `UnixFileSystem::<init>` IS natively
+            // overridden (`native_platform_filesystem_init` in
+            // native-builtins/src/lib.rs, registered in
+            // `register_essential_natives`) to avoid touching
+            // `System.getProperties()` — but `File.<clinit>` runs during very
+            // early VM bootstrap, before that native override is wired up
+            // for this call site, so the constructor's real, unshimmed
+            // bytecode runs instead, reads the synthetic system-properties
+            // singleton's null `map` field, NPEs, and `FS` is left null (a
+            // manual reflective `new UnixFileSystem()` performed *after*
+            // bootstrap completes works fine — confirmed via probe — which
+            // is why this is a bootstrap-ordering gap, not a broken native).
+            // Any later real-JDK code that calls `File.isInvalid()` (e.g.
+            // `FileOutputStream`'s constructor, `TestVirtualContext.
+            // testAdditionalWebInfClassesPaths`) dereferences the null
+            // static `FS` and NPEs. Backfill `FS` too, with a synthetic
+            // FileSystem instance carrying the same platform-correct field
+            // values `native_platform_filesystem_init` sets on success, but
+            // only if `FS` is still null — unlike the four fields above
+            // (pure constants, always safe to clobber), `FS` is a real
+            // object reference, so if `<clinit>` already produced a valid
+            // one we must not replace it and lose identity.
+            let fs_already_set = {
+                let cm = shared.class_manager.read();
+                cm.get_class(class_id).and_then(|cls| {
+                    let mut static_idx = 0usize;
+                    let mut found = None;
+                    for f in &cls.fields {
+                        if f.is_static() {
+                            if &*f.name == "FS" {
+                                found = Some(static_idx);
+                                break;
+                            }
+                            static_idx += 1;
+                        }
+                    }
+                    found
+                })
+            }
+            .map(|idx| matches!(super::get_static_shared(shared, class_id, idx), Value::Object(Some(_))))
+            .unwrap_or(false);
+            if !fs_already_set {
+                let fs_class_name = if cfg!(windows) {
+                    "java/io/WinNTFileSystem"
+                } else {
+                    "java/io/UnixFileSystem"
+                };
+                // Use `load_class_concurrent` (per-class-name locking, read-lock
+                // fast path — see vm_init.rs) rather than a find-only lookup:
+                // UnixFileSystem is not yet registered under its simple name at
+                // this point even though `new UnixFileSystem()` was already
+                // attempted by File's own (swallowed-failure) <clinit>. This is
+                // also safe to call from here re: the write-lock/JIT-deadlock
+                // caution documented at interpreter.rs's cast-resolution site,
+                // since `load_class_concurrent` only takes the write lock for
+                // the brief parse/register step, not for the whole call.
+                let fs_class_id = shared.load_class_concurrent(fs_class_name).ok();
+                if let Some(fs_cls_id) = fs_class_id {
+                    let fs_num_fields = {
+                        let cm = shared.class_manager.read();
+                        cm.get_class(fs_cls_id)
+                            .map(|c| c.num_total_fields)
+                            .unwrap_or(0)
+                    };
+                    let find_fs_instance_field = |field_name: &str| -> Option<usize> {
+                        let cm = shared.class_manager.read();
+                        let cls = cm.get_class(fs_cls_id)?;
+                        let mut idx = 0usize;
+                        for f in &cls.fields {
+                            if !f.is_static() {
+                                if &*f.name == field_name {
+                                    return Some(idx);
+                                }
+                                idx += 1;
+                            }
+                        }
+                        None
+                    };
+                    if let Some(fs_obj) = shared.heap.try_alloc_object(fs_cls_id, fs_num_fields) {
+                        if let Some(idx) = find_fs_instance_field("slash") {
+                            shared
+                                .heap
+                                .set_field(fs_obj, idx, Value::Int(sep_char as i32));
+                        }
+                        // UnixFileSystem names its path-separator field
+                        // `colon`; WinNTFileSystem names it `semicolon`.
+                        if let Some(idx) = find_fs_instance_field("colon")
+                            .or_else(|| find_fs_instance_field("semicolon"))
+                        {
+                            shared
+                                .heap
+                                .set_field(fs_obj, idx, Value::Int(path_sep_char as i32));
+                        }
+                        if let Some(idx) = find_fs_instance_field("altSlash") {
+                            let alt_slash = if sep_char == '\\' { '/' } else { '\\' };
+                            shared
+                                .heap
+                                .set_field(fs_obj, idx, Value::Int(alt_slash as i32));
+                        }
+                        if let Some(idx) = find_fs_instance_field("userDir") {
+                            let user_dir = std::env::current_dir()
+                                .ok()
+                                .map(|p| p.to_string_lossy().into_owned())
+                                .unwrap_or_else(|| ".".to_string());
+                            let user_dir_str =
+                                super::vm_object::create_java_string(shared, &user_dir);
+                            shared
+                                .heap
+                                .set_field(fs_obj, idx, Value::Object(Some(user_dir_str)));
+                        }
+                        if set_static_by_name("FS", Value::Object(Some(fs_obj))) {
+                            tracing::warn!("Post-clinit fixup: File.FS backfilled with synthetic {fs_class_name}");
+                        }
+                    }
+                }
+            }
         }
         // (Removed) "org/jboss/modules/Module" arm.
         //

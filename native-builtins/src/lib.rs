@@ -33476,8 +33476,16 @@ fn native_platform_filesystem_init(
 
     // Works for both WinNTFileSystem and UnixFileSystem (fields absent in one
     // class are ignored by the field-by-name setter implementation).
+    // WinNTFileSystem names its path-separator field `semicolon`;
+    // UnixFileSystem names the same concept `colon` (tomcat-08-07 follow-up:
+    // this used to only set `semicolon`, which silently no-ops on
+    // UnixFileSystem, so `colon` stayed at its zero-init default and any
+    // pure-Java FileSystem method that reads it, e.g. path joining, saw a
+    // NUL separator on Linux). Set both by the same value; each is a no-op
+    // on the class that doesn't declare it.
     ctx.set_field_by_name(this, "slash", Value::Int(slash));
     ctx.set_field_by_name(this, "semicolon", Value::Int(semicolon));
+    ctx.set_field_by_name(this, "colon", Value::Int(semicolon));
     ctx.set_field_by_name(this, "altSlash", Value::Int(alt_slash));
     let user_dir_str = ctx.create_string(&user_dir);
     ctx.set_field_by_name(this, "userDir", Value::Object(Some(user_dir_str)));
