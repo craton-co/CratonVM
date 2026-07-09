@@ -358,21 +358,20 @@ declared layout would let these classes go compact too (more footprint win), but
 is a larger, riskier change; the per-object flag already makes both layouts
 correct, so this is left as a throughput lever, not a correctness fix.
 
-## Stage 5 — observability (deferred, non-critical)
+## Stage 5 — observability (implemented)
 
 HPROF instance dump (`serviceability.rs`) and the field-watch corruption
 detector (`ec_watch.rs`) still assume the uniform 16-byte cell layout under the
-compact flag. Both are **safe** (no crash / no heap corruption) — HPROF's
-`slot_offset + N <= total_size` bounds check fails closed (reads 0 for an
-out-of-range compact offset), and ec_watch reads within the always-mapped
-arena — they are merely **inaccurate** for compact objects (heap dumps show
-wrong field values; the debug `CRATONVM_DBG_BADREF` watcher checks the wrong
-offset). Both are debug/observability features (HPROF dumps, JVMTI/debug
-watch), off by default, with no effect on execution, GC, or bt checksums.
-Making them compact-aware is a follow-up (use `class_layout` for the packed
-offset + 8-byte ref read). NB: the HPROF field-value reads were already
-approximate before this work (they read the cell start, not the `Value`
-payload offsets).
+compact flag are now compact-layout-aware:
+
+- `serviceability.rs` resolves per-class packed offsets from `class_layout` and
+  reads compact object references as raw pointers at offset `0` in compact
+  reference fields.
+- `ec_watch.rs` resolves packed field offsets and compacts-flag-aware watched
+  slot kinds; compact reference watches read the watched 8-byte pointer payload.
+
+Both features remain debug-only/off by default and do not affect execution,
+GC, or benchmark checksums.
 
 ## Residuals / future
 
