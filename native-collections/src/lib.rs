@@ -10599,7 +10599,6 @@ struct LazyOp {
     aux: i64,
 }
 
-
 /// `true` if `this` is a synthetic stream that currently carries a non-empty
 /// deferred op-chain (slot 3). Cheap guard used by terminals to pick the lazy path.
 fn stream_has_chain(ctx: &dyn NativeContext, this: ObjectRef) -> bool {
