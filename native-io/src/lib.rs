@@ -13656,6 +13656,20 @@ fn register_async_file_channel(r: &mut NativeMethodRegistry) {
         "(Ljava/nio/file/Path;[Ljava/nio/file/OpenOption;)Ljava/nio/channels/AsynchronousFileChannel;",
         native_afc_open,
     );
+    // FileSystemProvider.newAsynchronousFileChannel(Path, Set, ExecutorService,
+    // FileAttribute...) → AsynchronousFileChannel. Spring's DataBufferUtils
+    // reaches this provider overload; in real-JDK mode Craton was executing the
+    // abstract provider default, which throws UnsupportedOperationException,
+    // instead of the Unix provider implementation. Bridge it to the same
+    // synthetic AFC backend; the executor and attributes are accepted but
+    // ignored, matching the completion-on-caller-thread behavior of the rest of
+    // this native AFC implementation.
+    r.register(
+        "java/nio/file/spi/FileSystemProvider",
+        "newAsynchronousFileChannel",
+        "(Ljava/nio/file/Path;Ljava/util/Set;Ljava/util/concurrent/ExecutorService;[Ljava/nio/file/attribute/FileAttribute;)Ljava/nio/channels/AsynchronousFileChannel;",
+        native_afc_provider_open,
+    );
 
     // read(ByteBuffer, long position) → Future<Integer>
     r.register(
@@ -13732,12 +13746,12 @@ fn register_async_file_channel(r: &mut NativeMethodRegistry) {
     r.set_category(__prev_cat);
 }
 
-pub(crate) fn native_afc_open(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    let path_obj = obj_arg92(args, 0)?;
-    let path_str = validated_path(&read_path_str(ctx, path_obj))?;
-    let options = parse_afc_open_options(ctx, args.get(1))?;
-
-    let handle_id = afc_open_file(&path_str, options).map_err(|e| RuntimeError::IOException {
+fn alloc_afc_channel(
+    ctx: &mut dyn NativeContext,
+    path_str: &str,
+    options: AfcOpenOptions,
+) -> MethodCallResult {
+    let handle_id = afc_open_file(path_str, options).map_err(|e| RuntimeError::IOException {
         message: format!("AsynchronousFileChannel.open: {e}"),
     })?;
 
@@ -13747,10 +13761,38 @@ pub(crate) fn native_afc_open(ctx: &mut dyn NativeContext, args: &[Value]) -> Me
         AFC_NUM_FIELDS,
     );
     ctx.set_field(afc, AFC_FIELD_FD, Value::Int(handle_id as i32));
-    let path_s = ctx.create_string(&path_str);
+    let path_s = ctx.create_string(path_str);
     ctx.set_field(afc, AFC_FIELD_PATH, Value::Object(Some(path_s)));
     ctx.set_field(afc, AFC_FIELD_OPEN, Value::Int(1));
     Ok(Some(Value::Object(Some(afc))))
+}
+
+pub(crate) fn native_afc_open(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let path_obj = obj_arg92(args, 0)?;
+    let path_str = validated_path(&read_path_str(ctx, path_obj))?;
+    let options = parse_afc_open_options(ctx, args.get(1))?;
+    alloc_afc_channel(ctx, &path_str, options)
+}
+
+fn native_afc_provider_open(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    // Receiver is args[0]. Provider overload args are path, options Set,
+    // executor, attrs.
+    let path_obj = obj_arg92(args, 1)?;
+    let path_str = validated_path(&read_path_str(ctx, path_obj))?;
+    let option_array_value = match args.get(2) {
+        Some(Value::Object(Some(set_obj))) => match ctx.invoke_virtual(
+            *set_obj,
+            "toArray",
+            "()[Ljava/lang/Object;",
+            &[],
+        )? {
+            Some(Value::Object(Some(arr))) => Value::Object(Some(arr)),
+            _ => Value::Object(None),
+        },
+        _ => Value::Object(None),
+    };
+    let options = parse_afc_open_options(ctx, Some(&option_array_value))?;
+    alloc_afc_channel(ctx, &path_str, options)
 }
 
 fn native_afc_read(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
@@ -13830,6 +13872,12 @@ fn native_afc_write(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRe
     Ok(Some(wrap_completed_future(ctx, Value::Int(n as i32))))
 }
 
+fn afc_box_integer(ctx: &mut dyn NativeContext, n: i32) -> Value {
+    let obj = alloc_synthetic(ctx, "java/lang/Integer", 1);
+    ctx.set_field(obj, 0, Value::Int(n));
+    Value::Object(Some(obj))
+}
+
 /// Read with CompletionHandler callback — performs read then invokes handler.completed()
 fn native_afc_read_handler(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = obj_arg92(args, 0)?;
@@ -13854,12 +13902,17 @@ fn native_afc_read_handler(ctx: &mut dyn NativeContext, args: &[Value]) -> Metho
             } else {
                 Value::Int(-1)
             };
-            // Call handler.completed(result, attachment)
+            // CompletionHandler.completed erases to (Object,Object); box the
+            // byte count just like HotSpot's AsynchronousFileChannel does.
+            let completed_arg = match bytes_read {
+                Value::Int(n) => afc_box_integer(ctx, n),
+                other => other,
+            };
             let _ = ctx.invoke_virtual(
                 handler,
                 "completed",
                 "(Ljava/lang/Object;Ljava/lang/Object;)V",
-                &[bytes_read, attachment],
+                &[completed_arg, attachment],
             );
         }
         Err(e) => {
@@ -13900,11 +13953,15 @@ fn native_afc_write_handler(ctx: &mut dyn NativeContext, args: &[Value]) -> Meth
             } else {
                 Value::Int(0)
             };
+            let completed_arg = match bytes_written {
+                Value::Int(n) => afc_box_integer(ctx, n),
+                other => other,
+            };
             let _ = ctx.invoke_virtual(
                 handler,
                 "completed",
                 "(Ljava/lang/Object;Ljava/lang/Object;)V",
-                &[bytes_written, attachment],
+                &[completed_arg, attachment],
             );
         }
         Err(e) => {
