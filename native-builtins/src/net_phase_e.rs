@@ -3285,9 +3285,18 @@ fn re2_accept_into(
                 "(Ljava/lang/String;)V",
                 &[Value::Object(Some(jmsg))],
             ) {
-                Ok(Some(Value::Object(Some(exc)))) => Err(
-                    cratonvm_types::error::MethodCallFailed::ExceptionThrown(exc),
-                ),
+                Ok(Some(Value::Object(Some(exc)))) => {
+                    // Keep the native-thrown exception rooted until
+                    // safe_native_call can publish it as native_pending_return.
+                    // The caller's Java frame has no catch-local root yet, and
+                    // new_object_initialized releases its constructor pin before
+                    // returning here.
+                    let exc_pin = ctx.pin_native_root(exc);
+                    let exc = ctx.read_native_pin(exc_pin, exc);
+                    Err(cratonvm_types::error::MethodCallFailed::ExceptionThrown(
+                        exc,
+                    ))
+                }
                 _ => Err(ioex("ServerSocket.accept: Socket closed")),
             };
         }

@@ -580,6 +580,7 @@ pub fn safe_native_call(
         pin_value_for_native_call(shared, &mut thread.native_pin_roots, a);
         arg_root_indices.push((thread.native_pin_roots.len() > before).then_some(before));
     }
+    let native_pin_base = thread.native_pin_roots.len();
 
     let mut remapped_args = None;
     if shared
@@ -748,12 +749,12 @@ pub fn safe_native_call(
         }
     }
 
-    let out: MethodCallResult = match result {
+    let mut out: MethodCallResult = match result {
         Ok(method_result) => {
             if let Some(exc_handle) = crate::native::jni::take_jni_pending_exception() {
-                thread.native_pin_roots.truncate(pin_base);
                 thread.native_pending_return = None;
                 if exc_handle == u64::MAX {
+                    thread.native_pin_roots.truncate(pin_base);
                     return Err(crate::runtime::exceptions::throw_runtime_error(
                         shared,
                         thread,
@@ -765,8 +766,12 @@ pub fn safe_native_call(
                 let ptr = exc_handle as *mut u8;
                 if !ptr.is_null() && (ptr as usize) % 8 == 0 {
                     let exc_ref = unsafe { crate::types::ObjectRef::from_raw(ptr) };
+                    thread.native_pending_return = Some(exc_ref);
+                    thread.native_pin_roots.truncate(pin_base);
+                    crate::runtime::interpreter::update_root_snapshot(shared, thread);
                     return Err(MethodCallFailed::ExceptionThrown(exc_ref));
                 }
+                thread.native_pin_roots.truncate(pin_base);
             }
             method_result
         }
@@ -820,16 +825,33 @@ pub fn safe_native_call(
     };
 
     thread.native_pending_return = None;
-    if let Ok(Some(v)) = &out {
-        if let Some(o) = value_as_validated_object_ref(shared, *v) {
-            thread.native_pending_return = Some(o);
+    match &mut out {
+        Ok(Some(v)) => {
+            if let Some(o) = value_as_validated_object_ref(shared, *v) {
+                thread.native_pending_return = Some(o);
+            }
         }
+        Err(MethodCallFailed::ExceptionThrown(exc)) => {
+            let exc_is_current = shared.heap.is_object_address(exc.as_ptr() as usize).is_some();
+            if !exc_is_current {
+                if let Some(obj) = thread
+                    .native_pin_roots
+                    .get(native_pin_base..)
+                    .and_then(|pins| pins.last())
+                    .copied()
+                {
+                    *exc = obj;
+                }
+            }
+            thread.native_pending_return = Some(*exc);
+        }
+        _ => {}
     }
-    // Install the object-return root before unwinding native pins. Some natives
-    // intentionally leave a freshly-created return object pinned until this
-    // point, covering blocked-region snapshots and cross-thread GC while the
-    // object still exists only in Rust locals. Dropping pins first opens a
-    // reclaim window before the pending-return slot can take over.
+    // Install the post-native object root before unwinding native pins. This
+    // covers both object returns and Java exceptions thrown by the native. When
+    // an exception ref has already gone stale, a native may leave the live
+    // exception as a handoff pin above the argument-root watermark; do not use
+    // those temporary pins to reinterpret normal object returns.
     thread.native_pin_roots.truncate(pin_base);
     if thread.native_pending_return.is_some() {
         crate::runtime::interpreter::update_root_snapshot(shared, thread);
@@ -4475,6 +4497,7 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
                 // a buggy handler can't take down the VM further than the
                 // original exception already did).
                 if let MethodCallFailed::ExceptionThrown(exc) = &e {
+                    let exc = jvm_thread.native_pending_return.take().unwrap_or(*exc);
                     // GC-root gap: `exc_ref` is a bare Rust local at this
                     // point — `run()`'s frame has already popped (the
                     // exception unwound past it) and
@@ -4491,7 +4514,7 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
                     // `native_pin_roots` for the call, matching every other
                     // raw-ObjectRef-across-a-reentrant-call site.
                     let pin_base = jvm_thread.native_pin_roots.len();
-                    jvm_thread.native_pin_roots.push(*exc);
+                    jvm_thread.native_pin_roots.push(exc);
                     let exc_ref = jvm_thread.native_pin_roots[pin_base];
                     if std::env::var_os("CRATONVM_DBG_UNCAUGHT").is_some() {
                         let cid = shared_arc.heap.class_id_of(exc_ref);
@@ -13953,6 +13976,55 @@ mod tests {
     fn default_process_lookup_finds_c_runtime_allocator_symbols() {
         assert!(lookup_process_native_symbol("malloc").is_some());
         assert!(lookup_process_native_symbol("free").is_some());
+    }
+
+    #[test]
+    fn safe_native_call_roots_thrown_java_exception_until_router_consumes() {
+        fn throwing_native(
+            ctx: &mut dyn cratonvm_native_api::NativeContext,
+            _args: &[Value],
+        ) -> MethodCallResult {
+            let stale =
+                unsafe { ObjectRef::from_raw(0xfeed_face_0000_1000usize as *mut u8) };
+            let live = ctx.alloc_object(ClassId::new(0), 0);
+            ctx.pin_native_root(live);
+            Err(MethodCallFailed::ExceptionThrown(stale))
+        }
+
+        let shared = test_shared();
+        let mut thread = JvmThread::new(ThreadId(0), "test");
+        let result = safe_native_call(
+            &shared,
+            &mut thread,
+            throwing_native,
+            &[],
+        );
+        let thrown = match result {
+            Err(MethodCallFailed::ExceptionThrown(exc)) => exc,
+            other => panic!("expected native Java exception, got {other:?}"),
+        };
+        assert_ne!(
+            thrown.as_ptr() as usize,
+            0xfeed_face_0000_1000usize,
+            "stale native exception refs must be replaced from the handoff pin"
+        );
+        assert!(
+            shared
+                .heap
+                .is_object_address(thrown.as_ptr() as usize)
+                .is_some(),
+            "native exception handoff must resolve to a live heap object"
+        );
+        assert_eq!(
+            thread.native_pending_return,
+            Some(thrown),
+            "native-thrown exception must stay rooted until the exception router consumes it"
+        );
+        assert_eq!(
+            thread.native_pin_roots.len(),
+            0,
+            "safe_native_call still owns and releases native handoff pins"
+        );
     }
 
     // -----------------------------------------------------------------------
