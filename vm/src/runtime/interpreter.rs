@@ -20688,6 +20688,82 @@ fn force_native_over_real_jdk_bytecode(
         return true;
     }
 
+    // Real-JDK `Thread.run()` bytecode is layout-variant: older JDKs read
+    // direct `Thread.target`, while newer layouts also carry the task in
+    // `Thread$FieldHolder.task`. CratonVM's registered native mirrors VM
+    // thread-start target resolution (direct field, holder task, synthetic
+    // slot), so force it to win for normal and invokespecial `super.run()`
+    // calls from Thread subclasses such as WildFly's JBossThread.
+    if class_name == "java/lang/Thread" && method_name == "run" && method_descriptor == "()V" {
+        return true;
+    }
+
+    if class_name == "java/lang/Thread"
+        && method_name == "getThreadGroup"
+        && method_descriptor == "()Ljava/lang/ThreadGroup;"
+    {
+        return true;
+    }
+
+    if class_name == "org/jboss/threads/JBossThread"
+        && method_name == "run"
+        && method_descriptor == "()V"
+    {
+        return true;
+    }
+
+    if class_name == "org/jboss/threads/JBossThread"
+        && method_name == "onExit"
+        && method_descriptor == "(Ljava/lang/Runnable;)Z"
+    {
+        return true;
+    }
+
+    if class_name == "org/jboss/threads/JBossThreadFactory"
+        && ((method_name == "newThread"
+            && method_descriptor == "(Ljava/lang/Runnable;)Ljava/lang/Thread;")
+            || (method_name == "access$100"
+                && method_descriptor
+                    == "(Lorg/jboss/threads/JBossThreadFactory;Ljava/lang/Runnable;)Ljava/lang/Thread;"))
+    {
+        return true;
+    }
+
+    if class_name == "java/io/InputStreamReader"
+        && method_name == "close"
+        && method_descriptor == "()V"
+    {
+        return true;
+    }
+
+    if class_name == "java/lang/SecurityManager"
+        && method_name == "getRootGroup"
+        && method_descriptor == "()Ljava/lang/ThreadGroup;"
+    {
+        return true;
+    }
+
+    if class_name == "java/util/AbstractSet"
+        && method_name == "hashCode"
+        && method_descriptor == "()I"
+    {
+        return true;
+    }
+
+    if class_name == "java/util/AbstractCollection"
+        && method_name == "contains"
+        && method_descriptor == "(Ljava/lang/Object;)Z"
+    {
+        return true;
+    }
+
+    if class_name == "java/lang/Class"
+        && (method_name == "getEnumConstants" || method_name == "getEnumConstantsShared")
+        && method_descriptor == "()[Ljava/lang/Object;"
+    {
+        return true;
+    }
+
     if is_forkjoin_native_override(class_name, method_name, method_descriptor) {
         return true;
     }

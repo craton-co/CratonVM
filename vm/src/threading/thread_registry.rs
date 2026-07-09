@@ -387,23 +387,72 @@ impl ThreadRegistry {
             "--- T19.H1 thread summary: {} registered thread(s) ---",
             threads.len()
         );
-        let mut rows: Vec<(u64, String, bool, bool, usize)> = threads
+        struct SummaryRow {
+            tid: u64,
+            os_tid: u64,
+            name: String,
+            alive: bool,
+            daemon: bool,
+            blocked: bool,
+            roots: usize,
+            state: String,
+            top: String,
+        }
+        let mut rows: Vec<SummaryRow> = threads
             .iter()
             .map(|(tid, e)| {
-                (
-                    tid.0,
-                    e.name.clone(),
-                    e.alive.load(std::sync::atomic::Ordering::Acquire),
-                    e.daemon.load(std::sync::atomic::Ordering::Acquire),
-                    e.root_snapshot.lock().len(),
-                )
+                let state = {
+                    let s = e.vm_state.lock();
+                    if s.is_empty() {
+                        "<unset>".to_string()
+                    } else {
+                        s.clone()
+                    }
+                };
+                let trace = e.frame_trace.lock();
+                let mut top = String::new();
+                for (i, frame) in trace.iter().rev().take(3).enumerate() {
+                    if i > 0 {
+                        top.push_str(" <- ");
+                    }
+                    top.push_str(&format!(
+                        "{}.{}@{}",
+                        frame.class_name, frame.method_name, frame.byte_code_index
+                    ));
+                }
+                if top.is_empty() {
+                    top.push_str("<no-frame-trace>");
+                }
+                SummaryRow {
+                    tid: tid.0,
+                    os_tid: e.os_tid.load(std::sync::atomic::Ordering::Acquire) as u64,
+                    name: e.name.clone(),
+                    alive: e.alive.load(std::sync::atomic::Ordering::Acquire),
+                    daemon: e.daemon.load(std::sync::atomic::Ordering::Acquire),
+                    blocked: e
+                        .gc_block_state
+                        .in_blocked_region
+                        .load(std::sync::atomic::Ordering::Acquire),
+                    roots: e.root_snapshot.lock().len(),
+                    state,
+                    top,
+                }
             })
             .collect();
-        rows.sort_by_key(|r| r.0);
-        for (tid, name, alive, daemon, roots) in rows {
+        rows.sort_by_key(|r| r.tid);
+        for row in rows {
             let _ = writeln!(
                 h,
-                "  tid={tid} name={name:?} alive={alive} daemon={daemon} roots={roots}"
+                "  tid={} os_tid={} name={:?} alive={} daemon={} blocked={} roots={} state={:?} top={}",
+                row.tid,
+                row.os_tid,
+                row.name,
+                row.alive,
+                row.daemon,
+                row.blocked,
+                row.roots,
+                row.state,
+                row.top
             );
         }
         let _ = writeln!(h, "--- T19.H1 end thread summary ---");

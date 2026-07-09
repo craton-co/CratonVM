@@ -4994,12 +4994,13 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
         thread_obj = self.thread.java_thread_obj.unwrap_or(thread_obj);
 
         if is_real_jdk {
-            let (name_slot, tid_slot, holder_slot, priority_slot) = {
+            let (name_slot, tid_slot, holder_slot, group_slot, priority_slot) = {
                 let cm = self.shared.class_manager.read();
                 (
                     resolve_field_index_in_hierarchy(class_id, "name", &cm.class_store),
                     resolve_field_index_in_hierarchy(class_id, "tid", &cm.class_store),
                     resolve_field_index_in_hierarchy(class_id, "holder", &cm.class_store),
+                    resolve_field_index_in_hierarchy(class_id, "group", &cm.class_store),
                     resolve_field_index_in_hierarchy(class_id, "priority", &cm.class_store),
                 )
             };
@@ -5048,6 +5049,21 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
                     self.shared
                         .heap
                         .set_field(thread_obj, slot, Value::Object(Some(holder)));
+                    if let Some(group_slot) = group_slot {
+                        let holder_group = {
+                            let cm = self.shared.class_manager.read();
+                            let holder_class = self.shared.heap.class_id_of(holder);
+                            resolve_field_index_in_hierarchy(holder_class, "group", &cm.class_store)
+                                .map(|slot| self.shared.heap.get_field(holder, slot))
+                        };
+                        if let Some(Value::Object(Some(group))) = holder_group {
+                            self.shared.heap.set_field(
+                                thread_obj,
+                                group_slot,
+                                Value::Object(Some(group)),
+                            );
+                        }
+                    }
                 }
             }
             // C9: initialize contextClassLoader so SLF4J and other users
@@ -11246,6 +11262,48 @@ fn invoke_on_class_shared_inner(
                         || crate::runtime::interpreter::is_reflection_factory_serialization_native_override(
                             class_name, method_name, descriptor
                         )
+                        // Real-JDK `Thread.run()` bytecode is layout-variant:
+                        // some JDKs read the legacy direct `Thread.target`,
+                        // while CratonVM constructors also populate newer
+                        // `Thread$FieldHolder.task`. Thread subclasses such
+                        // as WildFly's `JBossThread` call `super.run()` via
+                        // invokespecial; force the registered native so the
+                        // Runnable target is resolved with the same
+                        // direct-field/holder fallback as VM thread startup.
+                        || (class_name == "java/lang/Thread"
+                            && method_name == "run"
+                            && descriptor == "()V")
+                        || (class_name == "java/lang/Thread"
+                            && method_name == "getThreadGroup"
+                            && descriptor == "()Ljava/lang/ThreadGroup;")
+                        || (class_name == "org/jboss/threads/JBossThread"
+                            && method_name == "run"
+                            && descriptor == "()V")
+                        || (class_name == "org/jboss/threads/JBossThread"
+                            && method_name == "onExit"
+                            && descriptor == "(Ljava/lang/Runnable;)Z")
+                        || (class_name == "org/jboss/threads/JBossThreadFactory"
+                            && ((method_name == "newThread"
+                                && descriptor == "(Ljava/lang/Runnable;)Ljava/lang/Thread;")
+                                || (method_name == "access$100"
+                                    && descriptor
+                                        == "(Lorg/jboss/threads/JBossThreadFactory;Ljava/lang/Runnable;)Ljava/lang/Thread;")))
+                        || (class_name == "java/io/InputStreamReader"
+                            && method_name == "close"
+                            && descriptor == "()V")
+                        || (class_name == "java/lang/SecurityManager"
+                            && method_name == "getRootGroup"
+                            && descriptor == "()Ljava/lang/ThreadGroup;")
+                        || (class_name == "java/util/AbstractSet"
+                            && method_name == "hashCode"
+                            && descriptor == "()I")
+                        || (class_name == "java/util/AbstractCollection"
+                            && method_name == "contains"
+                            && descriptor == "(Ljava/lang/Object;)Z")
+                        || (class_name == "java/lang/Class"
+                            && (method_name == "getEnumConstants"
+                                || method_name == "getEnumConstantsShared")
+                            && descriptor == "()[Ljava/lang/Object;")
                         // SPB.11: Our synthetic MethodDescriptor stores the
                         // wrapped Method at slot 0 (real-JDK MD has a private
                         // `method` field at a different layout). Force the

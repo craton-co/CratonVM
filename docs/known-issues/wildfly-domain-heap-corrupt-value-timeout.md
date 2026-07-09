@@ -753,3 +753,77 @@ then wedged at `pending=1 taken=0`. The JIT-on comparison wedged at
 `pending=2 taken=0`. The STW fix should be handled as a separate barrier/blocked-region
 change with an identity-aware reproducer; do not conflate it with the fixed BindInfo or
 collector layout issues.
+
+## 2026-07-09 update — process-controller/STW watchdog blocker cleared; later HC boot residuals remain
+
+Branch `codex/fix-wildfly-pc-respawn-20260709-103040` moved the hand-driven WildFly
+32.0.1.Final `domain.sh` probe past the process-controller VM native/STW watchdog path.
+The key fixed run used:
+
+```text
+/data/data/probes/wildfly-pc-respawn-20260709-103040/bin/java-wildfly-pc-enumset-addall-20260709-210535
+/data/data/probes/wildfly-pc-respawn-20260709-103040/runs/domain-enumset-addall-20260709-210549.log
+```
+
+After rebasing this branch on current `dev`, the final verification used the same
+domain probe path with `CRATONVM_MSC_REAL_START=1` set explicitly:
+
+```text
+/data/data/probes/wildfly-pc-respawn-20260709-103040/bin/java-wildfly-pc-postrebase-20260709-212221
+/data/data/probes/wildfly-pc-respawn-20260709-103040/runs/domain-postrebase-mscreal-20260709-214000.log
+```
+
+Result:
+
+```text
+rc=0
+[Host Controller] [msc] <- start id=3 OK
+[Host Controller] TRACE ... Connected to 127.0.0.1:40695
+[Host Controller] TRACE ... Sent initial greeting message
+INFO [org.jboss.as.process.Host Controller.status] WFLYPC0011: Process 'Host Controller' finished with an exit status of %d
+INFO [org.jboss.as.process] WFLYPC0017: Shutting down process controller
+INFO [org.jboss.as.process] WFLYPC0016: All processes finished; exiting
+```
+
+The rebased verification also exits `rc=0`, reaches the Host Controller
+process-controller connection (`Connected to 127.0.0.1:42563`, `Sent initial greeting
+message`), and then shuts the process controller down normally after the later Host
+Controller residuals trigger `System.exit(99)`.
+
+Important intermediate residuals were also cleared in this session:
+
+```text
+/data/data/probes/wildfly-pc-respawn-20260709-103040/runs/domain-qname-essential-20260709-202257.log
+  NoSuchMethodError Executors.newScheduledThreadPool(int, ThreadFactory)
+
+/data/data/probes/wildfly-pc-respawn-20260709-103040/runs/domain-verify-debug-20260709-204532.log
+  [cratonvm-verify] org/jboss/as/controller/ModelController.<clinit>: expected java/security/Permission, found ControllerPermission
+
+/data/data/probes/wildfly-pc-respawn-20260709-103040/runs/domain-npe-stack-20260709-205240.log
+  NPE in ConcreteResourceRegistration.registerSubModel at PathElement.getValue()
+
+/data/data/probes/wildfly-pc-respawn-20260709-103040/runs/domain-path-address-20260709-210020.log
+  NoSuchMethodError java/util/EnumSet.addAll(Collection)
+```
+
+The fixes in this branch cover the synthetic socket read path that had made the Host
+Controller see EOF before the process-controller greeting, the no-arg `Object.wait()`
+bridge needed by the process protocol pipe, `QName` construction, scheduled executor
+factory overloads, WildFly controller permission verifier edges, a `PathAddress`
+varargs bridge, and `EnumSet.addAll(Collection)`.
+
+The remaining front-line blockers are now ordinary Host Controller boot residuals, not
+the original STW watchdog/respawn lifecycle failure:
+
+```text
+NoSuchMethodError javax/management/AttributeChangeNotification.<init>(Object,long,long,String,String,String,Object,Object)
+ClassCastException in org.jboss.as.server.deployment.ContentCleanerService.start(ContentCleanerService.java:101)
+NoSuchMethodError java/io/FileInputStream.<init>(java.io.File)
+WFLYHC0034: Host Controller boot has failed in an unrecoverable manner; exiting
+```
+
+Keep this document under `docs/known-issues` for now. The specific process-controller
+watchdog blocker is cleared, but the older HIB-CV-32 heap-corrupt/sustained-load
+question still has not been revalidated because WildFly domain boot now stops at later
+Host Controller configuration-loading/JMX/content-cleaner gaps before reaching a long
+managed-server workload.

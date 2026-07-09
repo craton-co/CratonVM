@@ -2732,26 +2732,12 @@ fn run() -> Result<()> {
         // GC-barrier fix: this thread never runs Java bytecode again once it
         // reaches this wait (it is parked in a raw `pthread_join` loop, not
         // Java-level parking), so it can never cooperatively reach an
-        // interpreter safepoint and call `arrive_and_wait`. Left uncounted,
-        // any GC requested while non-daemon threads are still running finds
-        // this thread "alive" and "not blocked" and waits for it forever --
-        // e.g. WildFly-under-CratonVM booting: `main-vm` finishes `main()`
-        // while ServerService threads are still starting, and the first GC
-        // any of them triggers wedges the STW barrier permanently (confirmed
-        // via live gdb: `main-vm` sat in `pthread_join`, uncounted as
-        // blocked, while `stw_take_over_and_wait` spun waiting for it).
-        // Mark this as a blocked region for the whole wait, mirroring the
-        // exact pattern `NativeContextImpl::park` already uses for the same
-        // "genuinely blocking, no bytecode running" shape.
-        let pre_stw = vm.shared.gc_barrier.mark_blocked_region_enter();
-        if pre_stw {
-            let _ = vm
-                .shared
-                .gc_barrier
-                .arrive_and_wait(vm.main_thread.thread_id);
-        }
+        // interpreter safepoint and call `arrive_and_wait`. Publish the main
+        // thread's roots and enter the full per-thread blocked-region protocol
+        // for the whole wait, mirroring native socket/pipe waits.
+        vm.begin_main_thread_blocking_region("vm-main:wait-non-daemon");
         let joined = vm.shared.thread_registry.wait_for_non_daemon_threads(None);
-        vm.shared.gc_barrier.mark_blocked_region_leave();
+        vm.end_main_thread_blocking_region();
         if joined > 0 {
             tracing::info!("cratonvm: joined {joined} non-daemon thread(s) after main() returned");
         }
