@@ -41,11 +41,10 @@ current state. CratonVM remains research-grade software; numbers are targets we
 are aiming at, and may shift as priorities change.
 
 - **Performance vs HotSpot C2** - narrow the current QuickBench TOTAL gap
-  (3.7x default, 3.8x with `CRATONVM_JIT_THRESHOLD=1` in the 2026-07-08
-  snapshot, now that back-edge OSR is default-on) toward <=1.2x of JDK 25 C2
-  runtime, with no single QuickBench micro above 1.5x. Bring Binary Trees
-  (depth=18), currently 23.7x in default mode and 24.7x with the low
-  threshold in the 2026-07-08 recheck, under 5x through GC throughput work.
+  (3.7x default in the 2026-07-08 snapshot, now that back-edge OSR is
+  default-on) toward <=1.2x of JDK 25 C2 runtime, with no single QuickBench
+  micro above 1.5x. Bring Binary Trees (depth=18), currently 23.7x in the
+  2026-07-08 recheck, under 5x through GC throughput work.
 - **Bytecode verifier** - reach 100% of the structural/type checks needed to
   verify the pre-Java-7 split-verifier class-file corpus without `--noverify`.
 - **JCK / compliance** - target >=90% pass rate on a single chosen JCK area,

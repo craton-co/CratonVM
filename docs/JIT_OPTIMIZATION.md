@@ -51,8 +51,7 @@ A Java Virtual Machine written entirely in Rust:
   default-on, was 46.2x slower by default and 8.25x slower with
   `CRATONVM_JIT_OSR=1 CRATONVM_JIT_THRESHOLD=1`.
 - Current 2026-07-08 snapshot (`bfc26c2d`), with OSR default-on since
-  2026-07-04, is 3.7x slower by default and 3.8x slower with
-  `CRATONVM_JIT_THRESHOLD=1`.
+  2026-07-04, is 3.7x slower by default.
 
 ---
 
@@ -515,4 +514,4 @@ for the 2026-07-02 `b80c50b5` numbers.*
 | Optimization rounds | **26** |
 | Total speedup (small) | **253x** (5064ms → 20ms) |
 | vs JDK -Xint | **~28x FASTER** |
-| vs JDK C2 | Historical March 2026: **1.50x QuickBench (Fibonacci 1.31x)**; historical 2026-07-02 (pre-OSR-flip): **46.2x default / 8.25x OSR+threshold**; current 2026-07-08: **3.7x default / 3.8x OSR+threshold** |
+| vs JDK C2 | Historical March 2026: **1.50x QuickBench (Fibonacci 1.31x)**; historical 2026-07-02 (pre-OSR-flip): **46.2x default / 8.25x OSR+threshold**; current 2026-07-08: **3.7x default** |
