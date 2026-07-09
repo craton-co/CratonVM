@@ -40,16 +40,16 @@ standard library, so it can run with **no JDK installation, no `JAVA_HOME`, no `
 
 ### Benchmark (vs HotSpot JDK 25 C2)
 
-| Benchmark               | JDK 25 C2    | CratonVM default | Default ratio |
-|-------------------------|--------------|------------------|---------------|
-| Arithmetic 300M         | 343 ms       | 692 ms           | 2.0x          |
-| Fibonacci(42)           | 603 ms       | 2,944 ms         | 4.9x          |
-| Sieve 100Kx500          | 70 ms        | 349 ms           | 5.0x          |
-| Matrix 500x500          | 161 ms       | 370 ms           | 2.3x          |
-| **QuickBench TOTAL**    | **1,177 ms** | **4,355 ms**     | **3.7x**      |
-| Binary Trees (depth=18) | 347 ms       | 8,214 ms         | 23.7x         |
+| Benchmark                  | JDK 25 C2    | CratonVM default | Default ratio |
+|----------------------------|--------------|------------------|---------------|
+| Arithmetic (1.8B ops)      | 1,906 ms     | 3,919 ms         | 2.06x         |
+| Fibonacci(41) x5           | 1,793 ms     | 8,845 ms         | 4.93x         |
+| Sieve (100K x 16,700)      | 1,972 ms     | 11,267 ms        | 5.71x         |
+| Matrix 1230x1230           | 1,927 ms     | 5,427 ms         | 2.82x         |
+| **QuickBench TOTAL**       | **7,700 ms** | **29,458 ms**    | **3.83x**     |
+| Binary Trees (depth=18)    | 347 ms       | 8,214 ms         | 23.7x         |
 
-*Best-of-N snapshot measured 2026-07-08 on a shared Azure Linux build host (16 cores; sustained `uptime` load average 10-16 from concurrent sessions) against JDK 25.0.3 Temurin C2 and a CratonVM release build off `dev` at `bfc26c2d`. N=10 samples for JDK 25, N=7 for CratonVM (one run of 50,516 ms excluded as a host-contention outlier); reported as best-of-N rather than a single run because run-to-run variance on this shared, multi-tenant host was 2-4x. The benchmark sources are the historical `bench/QuickBench.java` and `bench/binarytrees.java` from commit `2cea208`; `bench/` remains untracked — restore via `git show 2cea208:bench/<file>`. `CRATONVM_JIT_OSR` back-edge OSR is default-on (flipped 2026-07-04), so this column already includes OSR; forcing `CRATONVM_JIT_THRESHOLD=1` on top no longer showed a distinct benefit in this snapshot, so that tuned column was dropped. Absolute times are not comparable to the pre-2026-07-04 Windows-box snapshot this replaces (different host, different JDK patch, different dev commit) — only the CratonVM/HotSpot ratio, measured on the same host, carries over. Fibonacci and Binary Trees remain the largest gaps, matching the JIT call-dispatch and GC-throughput work still tracked on the roadmap.*
+*QuickBench rows measured 2026-07-09 on a shared Azure Linux build host (same host as the Binary Trees row) against JDK 25.0.3 Temurin C2 and a CratonVM release build off `dev` at `bfc26c2d` (best of 3 HotSpot runs, best of 5 CratonVM runs). This is a rescaled variant of QuickBench (not the historical `bench/QuickBench.java` from commit `2cea208`) with each sub-test's workload sized so HotSpot lands around 2 seconds per test — the original 300M-iteration/fib(42)/500-rep/500x500 sizes were dominated by JVM startup and JIT-warmup noise (2-4x run-to-run swings on this shared host) rather than steady-state throughput. Scale-up: Arithmetic 300M → 1.8B iterations, Fibonacci fib(42) single call → fib(41) ×5 reps (recursion-depth steps are too coarse-grained for fine control, so it's repeated like the Sieve loop instead), Sieve 500 → 16,700 reps, Matrix 500x500 → 1230x1230. Sieve and Matrix ratios are both meaningfully worse at this steady-state size (5.0x→5.71x, 2.3x→2.82x) than the old short-run numbers, which were flattering CratonVM by diluting its slower steady-state throughput with a larger fixed-cost fraction. Binary Trees is unchanged from the 2026-07-08 snapshot (still the historical `bench/binarytrees.java` from `2cea208`, `--Xmx 4g`, best of 7 runs, one CratonVM-default run of 50,516 ms excluded as a contention outlier) and uses a different methodology than the rescaled QuickBench rows above it — only ratios, not absolute times, are meaningful across rows/snapshots. `CRATONVM_JIT_OSR` back-edge OSR is default-on (flipped 2026-07-04); `CRATONVM_JIT_THRESHOLD=1` on top showed no distinct benefit in either snapshot.*
 
 See [docs/JIT_OPTIMIZATION.md](docs/JIT_OPTIMIZATION.md) for the full 26-round JIT optimization journey.
 
