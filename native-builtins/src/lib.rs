@@ -58960,6 +58960,12 @@ fn alloc_heap_bytebuffer(ctx: &mut dyn NativeContext, capacity: usize) -> Object
     ctx.set_field_by_name(buf, "limit", Value::Int(cap));
     ctx.set_field_by_name(buf, "capacity", Value::Int(cap));
     ctx.set_field_by_name(buf, "mark", Value::Int(-1));
+    // Real HeapByteBuffer seeds Buffer.address to ARRAY_BYTE_BASE_OFFSET +
+    // offset. Bulk get/put bytecode routes through ScopedMemoryAccess and
+    // expects this base-offset-relative value when copying from/to hb.
+    // Keep this last so synthetic indexed compatibility writes cannot clobber
+    // the inherited real-JDK Buffer.address slot.
+    ctx.set_field_by_name(buf, "address", Value::Long(16));
     buf
 }
 
@@ -70308,6 +70314,30 @@ mod nio_heap_byte_buffer_tests {
     use super::*;
     use crate::test_utils::MockNativeContext;
     use cratonvm_types::ArrayElementType;
+
+    #[test]
+    fn bytebuffer_allocate_initializes_real_address_for_bulk_copy() {
+        let mut ctx = MockNativeContext::new();
+        let result = native_heap_bytebuffer_allocate(&mut ctx, &[Value::Int(8)])
+            .expect("ByteBuffer.allocate native succeeds")
+            .expect("ByteBuffer.allocate returns object");
+        let buffer = match result {
+            Value::Object(Some(buffer)) => buffer,
+            other => panic!("expected ByteBuffer object, got {other:?}"),
+        };
+
+        assert_eq!(ctx.get_field_by_name(buffer, "position"), Value::Int(0));
+        assert_eq!(ctx.get_field_by_name(buffer, "limit"), Value::Int(8));
+        assert_eq!(ctx.get_field_by_name(buffer, "capacity"), Value::Int(8));
+        assert_eq!(ctx.get_field_by_name(buffer, "mark"), Value::Int(-1));
+        assert_eq!(ctx.get_field_by_name(buffer, "offset"), Value::Int(0));
+        assert_eq!(ctx.get_field_by_name(buffer, "address"), Value::Long(16));
+        let hb = match ctx.get_field_by_name(buffer, "hb") {
+            Value::Object(Some(hb)) => hb,
+            other => panic!("expected hb byte array, got {other:?}"),
+        };
+        assert_eq!(ctx.array_length(hb), 8);
+    }
 
     #[test]
     fn heap_byte_buffer_memorysegment_constructors_initialize_real_fields() {
