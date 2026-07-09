@@ -4019,6 +4019,57 @@ fn empty_enumeration_impl(ctx: &mut dyn NativeContext) -> ObjectRef {
     enm
 }
 
+fn loader_constructor_url_paths(ctx: &dyn NativeContext, loader: ObjectRef) -> Vec<String> {
+    let mut out = Vec::new();
+
+    // Synthetic-JDK URLClassLoader instances store constructor URLs directly on
+    // the loader. Real-JDK instances stash the original URL[] on the shimmed ucp
+    // placeholder (see `record_ucl_urls`).
+    if let Value::Object(Some(urls)) = ctx.get_field(loader, UCL_URLS_ARRAY) {
+        let count = match ctx.get_field(loader, UCL_URL_COUNT) {
+            Value::Int(n) if n > 0 => (n as usize).min(ctx.array_length(urls)),
+            _ => 0,
+        };
+        for i in 0..count {
+            if let Value::Object(Some(url)) = ctx.get_array_element(urls, i) {
+                if let Some(path) = extract_url_path(ctx, url) {
+                    if !path.is_empty() {
+                        out.push(path);
+                    }
+                }
+            }
+        }
+    }
+
+    if let Value::Object(Some(ucp)) = ctx.get_field_by_name(loader, "ucp") {
+        if let Value::Object(Some(urls)) = ctx.get_field(ucp, UCP_STASHED_URLS) {
+            for i in 0..ctx.array_length(urls) {
+                if let Value::Object(Some(url)) = ctx.get_array_element(urls, i) {
+                    if let Some(path) = extract_url_path(ctx, url) {
+                        if !path.is_empty() {
+                            out.push(path);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    out
+}
+
+fn loader_local_resource_urls(
+    ctx: &dyn NativeContext,
+    loader: ObjectRef,
+    resource_name: &str,
+) -> Vec<String> {
+    let paths = loader_constructor_url_paths(ctx, loader);
+    if paths.is_empty() {
+        return Vec::new();
+    }
+    cratonvm_classloading::ClassPath::new(&paths).find_all_resource_urls(resource_name)
+}
+
 /// `jdk.internal.loader.URLClassPath.addURL(URL)` for real-JDK mode.
 ///
 /// `URLClassLoader.addURL` is inherited and almost always invoked via the
@@ -4072,6 +4123,13 @@ pub(crate) fn ucl_find_resource(ctx: &mut dyn NativeContext, args: &[Value]) -> 
     };
     let name = ctx.read_string(name_obj).unwrap_or_default();
     let resource_name = name.trim_start_matches('/');
+    if let Some(Value::Object(Some(this))) = args.first().copied() {
+        let local_urls = loader_local_resource_urls(ctx, this, resource_name);
+        if let Some(first) = local_urls.first() {
+            let url = crate::jboss_module_loader::build_synthetic_url(ctx, first);
+            return Ok(Some(Value::Object(Some(url))));
+        }
+    }
     // Mirror cl_get_resource's lookup order: structured URL walk FIRST.
     // URLClassLoader-constructor URLs are registered into the global walk
     // but NOT into the raw-bytes `find_resource` store, so consulting only
@@ -4204,21 +4262,49 @@ pub(crate) fn ucl_find_resources(ctx: &mut dyn NativeContext, args: &[Value]) ->
     };
     let p_std = std_ref.map(|e| ctx.pin_native_root(e));
 
+    let this = ctx.read_native_pin(p_this, this);
+    let local_urls = loader_local_resource_urls(ctx, this, &resource_name);
+    let local_enum = if local_urls.is_empty() {
+        None
+    } else {
+        let arr = ctx.new_array(
+            cratonvm_types::ArrayElementType::Reference,
+            local_urls.len(),
+        );
+        for (i, url) in local_urls.iter().enumerate() {
+            let url_obj = crate::jboss_module_loader::build_synthetic_url(ctx, url);
+            ctx.set_array_element(arr, i, Value::Object(Some(url_obj)));
+        }
+        let enm = alloc_concurrent_synthetic(ctx, "java/util/Enumeration$Impl", 2);
+        ctx.set_field(enm, 0, Value::Object(Some(arr)));
+        ctx.set_field(enm, 1, Value::Int(0));
+        Some(enm)
+    };
+    let p_local = local_enum.map(|e| ctx.pin_native_root(e));
+
     // Custom-handler matches (ShrinkWrap `archive:`), recorded by `addURL`.
     let this = ctx.read_native_pin(p_this, this);
     let custom = build_custom_handler_url_list(ctx, this, &resource_name);
 
+    let local_ref = match (local_enum, p_local) {
+        (Some(e), Some(p)) => Some(ctx.read_native_pin(p, e)),
+        _ => None,
+    };
     let std_ref = match (std_ref, p_std) {
         (Some(e), Some(p)) => Some(ctx.read_native_pin(p, e)),
         _ => None,
     };
     let result = match custom {
         Some(custom) => Some(Value::Object(Some(merge_enum_with_list(
-            ctx, std_ref, custom,
+            ctx,
+            local_ref.or(std_ref),
+            custom,
         )))),
-        // No custom matches: return the standard enumeration verbatim (its ref
-        // re-read post-GC), leaving ordinary loaders byte-for-byte unchanged.
-        None => match std_ref {
+        // No custom matches: prefer the receiver-local URLClassLoader
+        // enumeration when constructor URLs can answer the query. Otherwise
+        // return the standard flattened enumeration verbatim (its ref re-read
+        // post-GC), leaving ordinary loaders without local hits unchanged.
+        None => match local_ref.or(std_ref) {
             Some(e) => Some(Value::Object(Some(e))),
             None => std_enum,
         },
@@ -6347,6 +6433,55 @@ mod classloader_tests {
         ctx.set_invoke_virtual_hook(panic_on_size_call);
 
         assert!(build_custom_handler_url_list(&mut ctx, loader, "META-INF/services/x").is_none());
+    }
+
+    #[test]
+    fn test_urlclassloader_find_resource_prefers_receiver_urls() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::create_dir_all(dir.path().join("virtual")).expect("mkdir");
+        std::fs::write(
+            dir.path().join("virtual").join("tomcat0807_webapp.txt"),
+            b"ok",
+        )
+        .expect("write fixture");
+
+        let mut ctx = MockNativeContext::new();
+        let loader = new_object_ref(&mut ctx, "java/net/URLClassLoader");
+        let ucp = new_object_ref(&mut ctx, "jdk/internal/loader/URLClassPath");
+        let url = new_object_ref(&mut ctx, "java/net/URL");
+        let path = ctx.create_string(&dir.path().to_string_lossy());
+        ctx.set_field(url, 3, Value::Object(Some(path)));
+        ctx.set_field_by_name(loader, "ucp", Value::Object(Some(ucp)));
+        let urls = ctx.new_array(cratonvm_types::ArrayElementType::Reference, 1);
+        ctx.set_array_element(urls, 0, Value::Object(Some(url)));
+        ctx.set_field(ucp, UCP_STASHED_URLS, Value::Object(Some(urls)));
+
+        let hits = loader_local_resource_urls(&ctx, loader, "virtual/tomcat0807_webapp.txt");
+        assert_eq!(
+            hits.len(),
+            1,
+            "receiver-local URLClassLoader path must be searched"
+        );
+
+        let name = ctx.create_string("virtual/tomcat0807_webapp.txt");
+        let found = ucl_find_resource(
+            &mut ctx,
+            &[Value::Object(Some(loader)), Value::Object(Some(name))],
+        )
+        .expect("findResource native")
+        .expect("return value");
+        let found = match found {
+            Value::Object(Some(o)) => o,
+            other => panic!("expected URL object, got {other:?}"),
+        };
+        let file_field = match ctx.get_field(found, 0) {
+            Value::Object(Some(s)) => ctx.read_string(s).unwrap_or_default(),
+            other => panic!("expected URL path field, got {other:?}"),
+        };
+        assert!(
+            file_field.contains("tomcat0807_webapp.txt"),
+            "returned URL should point at the receiver-local resource, got {file_field}"
+        );
     }
 
     #[test]
