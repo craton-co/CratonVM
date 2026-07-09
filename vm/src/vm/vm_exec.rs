@@ -11055,8 +11055,33 @@ fn invoke_on_class_shared_inner(
                         // entry is the gate that lets a registered native take
                         // precedence over a non-`ACC_NATIVE` JDK Java method).
                         || (class_name == "java/lang/Class"
-                            && (method_name == "getGenericInterfaces"
+                            && (method_name == "getTypeParameters"
+                                || method_name == "getGenericInterfaces"
                                 || method_name == "getGenericSuperclass"))
+                        // Spring generic metadata: Method/Constructor/Field generic
+                        // accessors are concrete JDK bytecode methods, but their
+                        // sun.reflect.generics repository path is incomplete under
+                        // CratonVM and can throw or lose Signature data. Prefer the
+                        // registered natives that parse JVMS Signature attributes.
+                        || (class_name == "java/lang/reflect/Method"
+                            && matches!(
+                                (method_name, descriptor),
+                                ("getGenericParameterTypes", "()[Ljava/lang/reflect/Type;")
+                                    | ("getGenericReturnType", "()Ljava/lang/reflect/Type;")
+                                    | ("getTypeParameters", "()[Ljava/lang/reflect/TypeVariable;")
+                            ))
+                        || (class_name == "java/lang/reflect/Constructor"
+                            && matches!(
+                                (method_name, descriptor),
+                                ("getGenericParameterTypes", "()[Ljava/lang/reflect/Type;")
+                                    | ("getTypeParameters", "()[Ljava/lang/reflect/TypeVariable;")
+                            ))
+                        || (class_name == "java/lang/reflect/Field"
+                            && method_name == "getGenericType"
+                            && descriptor == "()Ljava/lang/reflect/Type;")
+                        || (class_name == "java/lang/reflect/RecordComponent"
+                            && method_name == "getGenericType"
+                            && descriptor == "()Ljava/lang/reflect/Type;")
                         // SPB.10 / Spring `BeanWrapperImpl`: the real-JDK
                         // `java.beans.Introspector.getBeanInfo` walks
                         // `com.sun.beans.introspect.*` reflection — that

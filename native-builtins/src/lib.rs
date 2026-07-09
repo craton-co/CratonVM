@@ -22501,6 +22501,12 @@ pub fn register_essential_natives(registry: &mut NativeMethodRegistry) {
     // non-`ACC_NATIVE` JDK bytecode.
     registry.register(
         "java/lang/Class",
+        "getTypeParameters",
+        "()[Ljava/lang/reflect/TypeVariable;",
+        lang_class::native_class_get_type_parameters,
+    );
+    registry.register(
+        "java/lang/Class",
         "getGenericInterfaces",
         "()[Ljava/lang/reflect/Type;",
         lang_class::native_class_get_generic_interfaces,

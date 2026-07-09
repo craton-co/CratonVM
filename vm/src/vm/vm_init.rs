@@ -4116,7 +4116,16 @@ impl SharedVm {
         if let Some(&obj) = locks.get(&class_id) {
             return obj;
         }
-        let obj = self.heap.alloc_object(class_id, 0);
+        // This object is only a monitor token; it is not a real instance of
+        // `class_id`. Keeping its heap header as java/lang/Object avoids
+        // creating zero-slot "instances" of fieldful classes, which the GC
+        // reports as undersized object layouts when scanning class-lock roots.
+        let lock_class_id = self
+            .class_manager
+            .read()
+            .get_loaded_class_id("java/lang/Object")
+            .unwrap_or(ClassId::new(0));
+        let obj = self.heap.alloc_object(lock_class_id, 0);
         locks.insert(class_id, obj);
         obj
     }
@@ -5860,6 +5869,26 @@ mod tests {
         let lock_a = shared.get_class_lock_object(ClassId::new(1));
         let lock_b = shared.get_class_lock_object(ClassId::new(2));
         assert_ne!(lock_a.as_ptr(), lock_b.as_ptr());
+    }
+
+    #[test]
+    fn class_lock_object_for_fieldful_class_is_plain_zero_slot_object() {
+        let shared = SharedVm::new(VmConfig::default());
+        let fieldful_id = shared
+            .class_manager
+            .write()
+            .ensure_synthetic_class("cratonvm/test/FieldfulStaticLockTarget", 3);
+        let object_id = shared
+            .class_manager
+            .read()
+            .get_loaded_class_id("java/lang/Object")
+            .unwrap_or(ClassId::new(0));
+
+        let lock = shared.get_class_lock_object(fieldful_id);
+        let header = shared.heap.get_header(lock);
+
+        assert_eq!(header.class_id, object_id);
+        assert_eq!(header.num_slots, 0);
     }
 
     // -----------------------------------------------------------------------
