@@ -19871,8 +19871,10 @@ pub fn register_essential_natives(registry: &mut NativeMethodRegistry) {
     // late StackWalker phase; use the same implementation earlier.
     crate::phases_late::register_p59_stackwalker(registry);
     // Logging bootstrap can see synthetic LogRecord/EnumMap before the normal
-    // phase-50/54 registrations are installed.
-    crate::phases_early::register_enum_map_natives(registry);
+    // phase-50/54 registrations are installed. Only `<init>` is registered
+    // here — see `register_enum_map_init_native`'s doc comment for why the
+    // rest of `register_enum_map_natives` must stay synthetic-mode-only.
+    crate::phases_early::register_enum_map_init_native(registry);
     crate::phases_early::register_phase54_logging_extras(registry);
     // JBoss Modules can resolve ThreadLocal as a synthetic real-JDK stub during
     // early module bootstrap, but its withInitial body lives in phase 50.

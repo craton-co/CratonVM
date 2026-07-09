@@ -242,6 +242,12 @@ fn stack_walk_skip_internals(class_name: &str, method_name: &str) -> bool {
 /// inner→outer with VM-internal walker frames stripped from the inner end.
 /// `fetchStackFrames` reuses the same ordering with `anchor` as an index into
 /// this vector (not into the raw reversed physical trace).
+///
+/// `pub(crate)` so `phases_late::p59_sw_walk`/`p59_sw_for_each` — the
+/// primary, always-registered `StackWalker.walk`/`forEach` natives, which do
+/// NOT route through `AbstractStackWalker.callStackWalk` — share this same
+/// ordering instead of handing the caller the raw outer→inner
+/// `capture_stack_trace` order.
 pub(crate) fn ordered_stack_walk_frames(trace: &[StackTraceEntry]) -> Vec<StackTraceEntry> {
     let mut iter = trace.iter().rev().peekable();
     while let Some(e) = iter.peek() {
