@@ -4,6 +4,10 @@ This folder collects CratonVM-only defects found while running upstream Java
 suites. The docs had grown to describe the **same underlying bug from several
 angles**; this index is the consolidated map. Read it first.
 
+## 2026-07-08/09 Hibernate remote rerun: 88/121 now pass; classloader-poisoning bug found
+
+- [hib-remote-rerun-20260708-classloader-poisoning.md](hib-remote-rerun-20260708-classloader-poisoning.md) — 4-shard rerun of the 121-class non-passed list on a fresh remote host confirms massive fleet progress (16→88 passing since the 2026-07-07 local run); traces all 7 new `LOADERR` entries to a single cascading root cause: `JpaLargeBlobTest` (still slow/broken, ~19min) leaves classloading corrupted for every subsequent class in the same batch process, not 7 independent bugs.
+
 ## 2026-07-08 New: `JettyClientHttpRequestFactoryTests` NPE (third distinct bug on this class)
 
 - OPEN: [`jetty-clienthttprequestfactory-httpexchange-getrequest-npe.md`](jetty-clienthttprequestfactory-httpexchange-getrequest-npe.md) — `HttpExchange.getRequest()` NPE on a null `exchange`, 5 test methods. Found triaging a fresh-dev Spring non-passed rerun on Azure. Distinct from this class's two other already-fixed/tracked bugs (`StackOverflowError` dispatch cycle, NIO selector gap).
