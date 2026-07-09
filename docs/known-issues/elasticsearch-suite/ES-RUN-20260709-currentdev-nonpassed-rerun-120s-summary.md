@@ -1,6 +1,11 @@
 # ES run summary - current-dev non-passed rerun at 120s
 
-Status: OPEN
+Status: RESOLVED (crash family). This run started at 08:21:15, before the
+`MemoryLayout.varHandle` fix (commit `9494a0a5`, landed 09:17:23 the same
+day) reached `dev` — its counts below are stale. See the 2026-07-09
+verification update at the bottom: the dominant rc=139 crash family is
+confirmed fixed, but the ES suite is still far from green (a different,
+already-tracked `EnumSet` bug is now the dominant blocker).
 
 Run identity:
 - Run: `es-nonpassed-currentdev-20260709-082115`
@@ -71,3 +76,24 @@ Interpretation:
 - The dominant actionable root is still the foreign-memory `MemoryLayout.varHandle(PathElement...)` gap, now confirmed across 2583 result notes and 2585 logs in a 2649-class current-dev rerun.
 - The two surviving Java-level FAIL rows match the already-open vector codec/footer and vector assertion families.
 - No new HANG document is added for this run because both requested reruns produced zero HANG rows.
+
+## 2026-07-09 verification update
+
+Rebuilt from current `dev` (which already includes the varHandle fix) and
+re-ran the exact same 2649-class `others.tsv` selection after finding and
+fixing two more bugs the varHandle crash had been hiding — real-JDK-mode
+`EnumMap.<init>` field corruption and reversed `StackWalker.walk()` frame
+order; see
+`docs/internal/fixed-suite-bugs/enummap-realmode-corruption-and-stackwalker-frame-order-FIXED.md`
+and the parallel update in
+`docs/known-issues/elasticsearch-suite/ES-CRASH-FAMILY-20260709-currentdev-fail-probe-rc139.md`
+for the full before/after story and fresh counts (run
+`es-fullrerun-fixed-20260709-211207`: 0 rc=139 crashes, 2646 FAIL, 2 HANG).
+
+The FAIL rows are now dominated by `EnumSet.allOf`/`of` returning a broken
+object for non-JDK enums (hit via `Log4j Level.<clinit>` at logging
+bootstrap in nearly every class) — already tracked in
+`docs/known-issues/enumset-of-broken-for-non-jdk-enums.md`, not fixed this
+session. Once that's fixed, refresh this selection against current `dev`
+(`-RefreshLists`) rather than reusing the stale `others.tsv`, since the
+PASS/FAIL boundary has moved substantially.
