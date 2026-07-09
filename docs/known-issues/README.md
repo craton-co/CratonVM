@@ -8,9 +8,9 @@ angles**; this index is the consolidated map. Read it first.
 
 - [`CRATONVM-SPRING-GENUINE-BUGLIST-125.md`](CRATONVM-SPRING-GENUINE-BUGLIST-125.md) — full per-test-method detail for 125 CratonVM-unique Spring failures (HotSpot passes, CratonVM doesn't), cross-referenced against a clean HotSpot baseline with the classpath-dump gap fixed (spring-websocket/oxm/jms/orm/core-test jars were never built — `./gradlew jar testFixturesJar testClasses` fixed it). Down from 159 two dev commits ago: 65 newly fixed (entire SpEL cluster + spring-jms module), 31 "newly broken" are **not** new regressions — root-caused to the already-tracked HIB-CV-32 batch/load-dependent heap-corruption family (25/31 SIGSEGV, one test confirmed passing standalone but ABEND under full-suite load).
 
-## 2026-07-09 New: BC-java `asn1-regression` X9Test SIGSEGV (progresses past the retired StackOverflowError, still blocks the suite)
+## 2026-07-09 BC-java `asn1-regression` X9Test SIGSEGV retired
 
-- OPEN: [`bc-asn1-x9test-array-descriptor-of-checkcast-sigsegv.md`](bc-asn1-x9test-array-descriptor-of-checkcast-sigsegv.md) — found rerunning `org.bouncycastle.asn1.test.RegressionTest` after the `InputStream` super-read fix above landed. `PKCS12Test` now passes, but the suite crashes six tests later with a real `SIGSEGV` (native core dump, no Java exception) inside `array_descriptor_of` during `checkcast` handling in `X9Test`. gdb backtrace + a suspicious `r12 = i64::MIN` register value captured; not yet root-caused to a stale GC reference vs. an unrelated register.
+- FIXED/RETIRED: [`bc-asn1-x9test-array-descriptor-of-checkcast-sigsegv-FIXED.md`](../internal/fixed-suite-bugs/bc-asn1-x9test-array-descriptor-of-checkcast-sigsegv-FIXED.md) - the interpreter now keeps popped `checkcast`/`instanceof` receivers pinned through the full type-check, including array descriptor handling, and the JIT `checkcast` helper rejects non-heap pointer-shaped receivers before reading object headers. `X9Test` now reports `X9: Okay`; the full ASN.1 regression run gets past X9 and only hits the unrelated `X500Name` Turkish-locale residual.
 
 ## 2026-07-09 BC-java `asn1-regression` StackOverflowError retired
 
