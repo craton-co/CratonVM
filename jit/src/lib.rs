@@ -1129,6 +1129,10 @@ pub struct CompiledMethod {
     pub osr_xmm_saved_base: i32,
     /// OSR metadata: offset of VM context pointer in frame.
     pub osr_heap_local_offset: i32,
+    /// OSR metadata: frame offset of the inline-TLAB cached `JvmThread*` slot.
+    /// Normal entry initializes this in the prologue; OSR entry initializes it
+    /// in the trampoline because it jumps past that prologue. 0 when unused.
+    pub jit_thread_slot_off: i32,
     /// OSR metadata: optional `jit_frame_record` helper pointer. Normal method
     /// entry records exact RBP from the JIT prologue; OSR bypasses that
     /// prologue, so the trampoline records its own RBP after `mov rbp, rsp`.
@@ -1428,6 +1432,7 @@ impl CompiledMethod {
             osr_callee_saved_xmms: None,
             osr_xmm_saved_base: 0,
             osr_heap_local_offset: 0,
+            jit_thread_slot_off: 0,
             osr_frame_record: 0,
             shadow_thread_slot_off: 0,
             shadow_savetop_slot_off: 0,
@@ -1486,6 +1491,7 @@ impl CompiledMethod {
             osr_callee_saved_xmms: None,
             osr_xmm_saved_base: 0,
             osr_heap_local_offset: 0,
+            jit_thread_slot_off: 0,
             osr_frame_record: 0,
             shadow_thread_slot_off: 0,
             shadow_savetop_slot_off: 0,
@@ -1886,6 +1892,7 @@ impl CompiledMethod {
             self.osr_callee_saved_xmms.as_deref(),
             self.osr_xmm_saved_base,
             self.osr_heap_local_offset,
+            self.jit_thread_slot_off,
             self.osr_frame_record,
             self.needs_context,
             dead_mask,
@@ -1946,6 +1953,7 @@ unsafe fn emit_osr_trampoline(
     callee_saved_xmms: Option<&[u8]>,
     xmm_saved_base: i32,
     heap_local_offset: i32,
+    jit_thread_slot_off: i32,
     frame_record: usize,
     needs_context: bool,
     dead_mask: u64,
@@ -2076,6 +2084,15 @@ unsafe fn emit_osr_trampoline(
         tramp.emit_byte(0x48); // REX.W
         tramp.emit_byte(0x89); // MOV r/m64, r64
         tramp.emit_byte(0x85 | ((arg1_reg & 7) << 3));
+        tramp.emit(&neg_off.to_le_bytes());
+    }
+
+    if jit_thread_slot_off != 0 {
+        let neg_off = -jit_thread_slot_off;
+        let rex = 0x48 | if arg2_reg >= 8 { 0x04 } else { 0x00 };
+        tramp.emit_byte(rex);
+        tramp.emit_byte(0x89);
+        tramp.emit_byte(0x85 | ((arg2_reg & 7) << 3));
         tramp.emit(&neg_off.to_le_bytes());
     }
 
@@ -2280,6 +2297,7 @@ unsafe fn osr_trampoline(
     callee_saved_xmms: Option<&[u8]>,
     xmm_saved_base: i32,
     heap_local_offset: i32,
+    jit_thread_slot_off: i32,
     frame_record: usize,
     needs_context: bool,
     dead_mask: u64,
@@ -2322,6 +2340,7 @@ unsafe fn osr_trampoline(
                 callee_saved_xmms,
                 xmm_saved_base,
                 heap_local_offset,
+                jit_thread_slot_off,
                 frame_record,
                 needs_context,
                 dead_mask,

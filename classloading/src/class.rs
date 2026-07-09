@@ -791,7 +791,7 @@ impl ClassStore {
         self.classes.push(class);
         // Compact reference-field layout: register this class's oop-map / offset
         // table so the heap + GC can place and scan its reference fields as
-        // 8-byte pointers. No-op unless `CRATONVM_COMPACT_REF_FIELDS` is set.
+        // 8-byte pointers. No-op when `CRATONVM_COMPACT_REF_FIELDS=0` opts out.
         self.register_compact_layout_if_enabled(id);
         id
     }

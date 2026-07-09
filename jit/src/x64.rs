@@ -6665,6 +6665,9 @@ struct Compiler {
     needs_heap: bool,
     /// Frame offset where heap pointer is stored (valid when needs_heap is true).
     heap_local_offset: i32,
+    /// Frame offset where allocation-heavy methods cache this invocation's
+    /// `*mut JvmThread` for inline TLAB `new`. 0 when no cache slot is reserved.
+    jit_thread_slot_off: i32,
     /// Frame offset of the first XMM save slot (from RBP).
     xmm_saved_base: i32,
     /// Resolved multianewarray metadata: (bytecode_pc, leaf_element_type_code).
@@ -7603,6 +7606,7 @@ impl Compiler {
         alloc_result: super::regalloc::RegAllocResult,
         helpers: JitRuntimeHelpers,
         num_scalar_slots: usize,
+        cache_jit_thread_for_inline_new: bool,
     ) -> Self {
         // Compact arrays: byte[] uses 1-byte elements, int[] uses 4-byte, ref[] uses 8-byte.
         // Each local takes 8 bytes: [rbp - 8], [rbp - 16], ...
@@ -7653,12 +7657,14 @@ impl Compiler {
         // has no paired reload). OSR entries zero both slots (clobber-free) so
         // the null-guards make those frames skip shadow tracking safely.
         let shadow_slots = if shadow_enabled { 3 } else { 0 };
+        let jit_thread_slots = if cache_jit_thread_for_inline_new { 1 } else { 0 };
         let extra_slots = (if needs_heap { 1 } else { 0 })
             + num_hoists
             + num_arith_hoists
             + arith_scratch_depth
             + num_scalar_slots
             + (if precise_maps { 1 } else { 0 })
+            + jit_thread_slots
             + shadow_slots;
         let total_locals = num_locals.saturating_add(extra_slots);
         // Shadow-stack thread-pointer cache slot: the ABSOLUTE last reserved
@@ -7687,11 +7693,16 @@ impl Compiler {
         // table), captured before `helpers` is moved into the struct below.
         // Cast: value to i32 (encoding immediate/displacement)
         let shadow_off_in_thread: i32 = helpers.shadow_stack_offset_in_thread as i32;
-        // The safepoint-id slot sits below the shadow slots when both gates are
-        // on (so they never alias). Value at `[rbp - sp_id_slot_off]`. 0 when
-        // `precise_maps` is off.
+        // The safepoint-id slot sits below the cached JIT-thread and shadow
+        // slots when those gates are on, so the reserved slots never alias.
         let sp_id_slot_off: i32 = if precise_maps {
             // Cast: value to i32 (encoding immediate/displacement)
+            (total_locals as i32 - shadow_slots as i32 - jit_thread_slots as i32)
+                .saturating_mul(8)
+        } else {
+            0
+        };
+        let jit_thread_slot_off: i32 = if cache_jit_thread_for_inline_new {
             (total_locals as i32 - shadow_slots as i32).saturating_mul(8)
         } else {
             0
@@ -7858,6 +7869,7 @@ impl Compiler {
             frame_size,
             needs_heap,
             heap_local_offset,
+            jit_thread_slot_off,
             xmm_saved_base,
             multianewarray_info,
             field_info,
@@ -12292,6 +12304,13 @@ impl Compiler {
             self.patch_rel32_to_here(skip);
             self.shadow_fetch_end = self.buf.pos();
         }
+        // Inline TLAB allocation caches the JvmThread pointer once per invocation.
+        if self.jit_thread_slot_off != 0 && self.helpers.get_current_thread != 0 {
+            self.emit_xor_reg_self(RAX);
+            self.emit_store_local(self.jit_thread_slot_off, RAX);
+            self.emit_call_absolute(self.helpers.get_current_thread);
+            self.emit_store_local(self.jit_thread_slot_off, RAX);
+        }
         // spring-bug-10 watchpoint: arm a HW data breakpoint on this frame's
         // savebase slot (rbp - savebase_off) by calling the registered helper.
         // Prologue position = no ABI args staged yet, so clobbering ARG_REGS[0]
@@ -12929,8 +12948,8 @@ impl Compiler {
         // Cast: value to i32 (encoding immediate/displacement)
         let class_id_off = self.helpers.class_id_offset_in_obj as i32;
 
-        // Step 1: fetch the JvmThread* via the small TLS helper.
-        // (One CALL + one TEST; ~10 cycles overhead.)
+        // Step 1: fetch the JvmThread*. Allocation-heavy methods cache it in
+        // the prologue/OSR trampoline; otherwise use the small TLS helper.
         //
         // HIGH-2 / Fix 2 — direct `MOV reg, FS:[off]` TLS load is the
         // ideal sequence (saves ~5 ns per `new`). It is NOT applied
@@ -12957,7 +12976,17 @@ impl Compiler {
         //
         // Until that plumbing lands, the helper call stays — see the
         // task notes for the planned approach.
-        self.emit_call_absolute(self.helpers.get_current_thread);
+        // Common case: one prologue/OSR helper call per invocation, not per `new`.
+        if self.jit_thread_slot_off != 0 {
+            self.emit_load_local(RAX, self.jit_thread_slot_off);
+            self.emit_test_r64_r64(RAX);
+            let have_cached_thread = self.emit_jcc_rel32_patch(0x85); // JNE have_thread
+            self.emit_call_absolute(self.helpers.get_current_thread);
+            self.emit_store_local(self.jit_thread_slot_off, RAX);
+            self.patch_rel32_to_here(have_cached_thread);
+        } else {
+            self.emit_call_absolute(self.helpers.get_current_thread);
+        }
         self.emit_test_r64_r64(RAX);
         let null_thread_patch = self.emit_jcc_rel32_patch(0x84); // JE slow_path
 
@@ -25095,6 +25124,14 @@ pub fn compile_with_param_slots(
         scalar_base,
     );
     let num_scalar_slots = sr_plan.total_slots;
+    let cache_jit_thread_for_inline_new = needs_heap
+        && helpers.get_current_thread != 0
+        && helpers.tlab_post_init != 0
+        && helpers.new_object != 0
+        && std::env::var_os("CRATONVM_JIT_DISABLE_INLINE_NEW").is_none()
+        && new_info.iter().any(|(_, _, num_fields, _, _)| {
+            HEADER_SIZE + num_fields.saturating_mul(SLOT_SIZE) <= 256
+        });
 
     let mut compiler = Compiler::new(
         method_key.to_string(),
@@ -25112,6 +25149,7 @@ pub fn compile_with_param_slots(
         alloc_result,
         *helpers,
         num_scalar_slots,
+        cache_jit_thread_for_inline_new,
     );
     compiler.param_jvm_slots = param_jvm_slots.to_vec();
     compiler.param_slot_span = param_slot_span;
@@ -25502,6 +25540,7 @@ pub fn compile_with_param_slots(
     cm.osr_callee_saved_xmms = Some(compiler.alloc_used_xmms.clone());
     cm.osr_xmm_saved_base = compiler.xmm_saved_base;
     cm.osr_heap_local_offset = compiler.heap_local_offset;
+    cm.jit_thread_slot_off = compiler.jit_thread_slot_off;
     cm.osr_frame_record = compiler.helpers.frame_record;
 
     // T1.1.a — transfer precise oop maps collected during codegen.
@@ -25875,6 +25914,7 @@ mod tests {
             alloc_result,
             test_helpers(),
             0,
+            false,
         );
 
         assert!(matches!(compiler.push_stack(), Some(StackSlot::Frame(_))));

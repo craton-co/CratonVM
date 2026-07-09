@@ -1,11 +1,12 @@
 # Compact reference-field layout (architectural lever #1)
 
-**Status:** implemented + validated (branch `feat/compact-ref-fields`, worktree
-`CratonVM-movingyoung`; NOT pushed). Gated **default-OFF** behind
-`CRATONVM_COMPACT_REF_FIELDS`; flag-off is byte-identical to dev. Correctness ==
+**Status:** implemented, validated, and default-ON. Set
+`CRATONVM_COMPACT_REF_FIELDS=0` (also accepts `false`/`off`/`no`) to force the
+legacy uniform 16-byte-cell layout for A/B runs. Correctness ==
 HotSpot (bt10–18, GC_STRESS, HashMap/ArrayList/inheritance mix). Footprint
 reduced (node 56 vs 72 B). Throughput **bt16 ~10 % faster, bt18 parity** with
-the compact-aware inline codegen. Default-on flip still needs the app gauntlet.
+the compact-aware inline codegen; current Binary Trees reruns keep this as the
+default allocation-footprint lever.
 
 **Goal:** shrink allocation-heavy object footprint by storing **reference
 instance fields as bare 8-byte pointers** instead of the 16-byte tagged `Value`
@@ -109,10 +110,9 @@ and layout indexing.
 
 `CRATONVM_COMPACT_REF_FIELDS` is read **once at startup** into an immutable
 global (`compact_ref_fields_enabled()`); the layout is fixed for the process so
-objects are never read under a different layout than they were written. Every
-migrated site is `if compact_ref_fields_enabled() { new } else { legacy }` with
-the legacy arm kept **verbatim**, so flag-off is byte-identical to dev. The
-registry is only populated when the flag is on.
+objects are never read under a different layout than they were written. The
+default is compact; `CRATONVM_COMPACT_REF_FIELDS=0` selects the legacy arm for
+A/B runs. The registry is populated only when the compact layout is enabled.
 
 ## Migration checklist (by subsystem)
 
