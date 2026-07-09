@@ -10,29 +10,29 @@ with hardware, OS load, JDK version, and VM configuration.
 *Best-of-N snapshot measured 2026-07-08 on a shared Azure Linux build host (16
 cores, sustained load average 10-16 from concurrent sessions) against JDK
 25.0.3 Temurin C2 and a CratonVM release build off `dev` at `bfc26c2d`. N=10
-samples for JDK 25, N=7 per CratonVM column (one CratonVM-default run of
-50,516 ms excluded as a host-contention outlier) — best-of-N rather than a
-single run because run-to-run variance on this shared host was 2-4x. Ratio =
-CratonVM time / HotSpot time (lower is better; 1.00x is parity). `dev` enables
-back-edge OSR by default (flipped 2026-07-04), so the default column already
-includes OSR; the OSR column additionally sets `CRATONVM_JIT_THRESHOLD=1`.
-Set `CRATONVM_JIT_OSR=0` to reproduce the old OSR-off lane.*
+samples for JDK 25, N=7 for CratonVM (one run of 50,516 ms excluded as a
+host-contention outlier) — best-of-N rather than a single run because
+run-to-run variance on this shared host was 2-4x. Ratio = CratonVM time /
+HotSpot time (lower is better; 1.00x is parity). `dev` enables back-edge OSR
+by default (flipped 2026-07-04), so this column already includes OSR; forcing
+`CRATONVM_JIT_THRESHOLD=1` on top no longer showed a distinct benefit in this
+snapshot, so that tuned column was dropped. Set `CRATONVM_JIT_OSR=0` to
+reproduce the old OSR-off lane.*
 
-| Benchmark                 | JDK 25 C2    | CratonVM default | Default ratio | CratonVM OSR, threshold=1 | OSR ratio |
-|---------------------------|--------------|------------------|---------------|---------------------------|-----------|
-| Arithmetic (300M ops)     | 343 ms       | 692 ms           | 2.0x          | 740 ms                    | 2.2x      |
-| Fibonacci(42), recursive  | 603 ms       | 2,944 ms         | 4.9x          | 2,975 ms                  | 4.9x      |
-| Sieve (100K x 500 reps)   | 70 ms        | 349 ms           | 5.0x          | 354 ms                    | 5.1x      |
-| Matrix 500x500 multiply   | 161 ms       | 370 ms           | 2.3x          | 380 ms                    | 2.4x      |
-| **QuickBench TOTAL**      | **1,177 ms** | **4,355 ms**     | **3.7x**      | **4,449 ms**              | **3.8x**  |
-| Binary Trees (depth = 18) | 347 ms       | 8,214 ms         | 23.7x         | 8,554 ms                  | 24.7x     |
+| Benchmark                 | JDK 25 C2    | CratonVM default | Default ratio |
+|---------------------------|--------------|------------------|---------------|
+| Arithmetic (300M ops)     | 343 ms       | 692 ms           | 2.0x          |
+| Fibonacci(42), recursive  | 603 ms       | 2,944 ms         | 4.9x          |
+| Sieve (100K x 500 reps)   | 70 ms        | 349 ms           | 5.0x          |
+| Matrix 500x500 multiply   | 161 ms       | 370 ms           | 2.3x          |
+| **QuickBench TOTAL**      | **1,177 ms** | **4,355 ms**     | **3.7x**      |
+| Binary Trees (depth = 18) | 347 ms       | 8,214 ms         | 23.7x         |
 
 **Reading the results:**
 
-- Now that back-edge OSR defaults on, the default column is already close to
-  the tuned OSR/low-threshold column — forcing `CRATONVM_JIT_THRESHOLD=1` no
-  longer buys a distinct advantage; both columns agree within run-to-run
-  noise. That tuning only mattered previously, when OSR itself was opt-in.
+- Now that back-edge OSR defaults on, forcing `CRATONVM_JIT_THRESHOLD=1` on
+  top no longer buys a distinct advantage over the plain default — that
+  tuning only mattered previously, when OSR itself was opt-in.
 - Arithmetic, Sieve, and Matrix now run within ~2-5x of HotSpot C2. Recursive
   Fibonacci and Binary Trees remain the largest gaps — Fibonacci from
   call-heavy JIT dispatch overhead, Binary Trees from allocation/GC
