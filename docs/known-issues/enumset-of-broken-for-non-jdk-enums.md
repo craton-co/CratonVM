@@ -1,9 +1,15 @@
 # `EnumSet.of(...)` silently returns an empty/broken set for non-JDK enums
 
-**Status:** OPEN. **Severity:** high — blocks any real-JDK-mode webapp
-whose bootstrap path uses `EnumSet.of(...)` on an application/framework
-enum (very common pattern; e.g. `jakarta.servlet.DispatcherType` for filter
-mapping). **HotSpot:** presumably PASS (this is a CratonVM-only defect).
+**Status:** OPEN. **Severity:** critical — confirmed 2026-07-09 (see the ES
+update at the bottom) to also break `EnumSet.allOf(Class)`, and to be the
+**dominant blocker for the entire real-JDK-mode Elasticsearch suite**: every
+class hits it via `org.apache.logging.log4j.Level.<clinit>` at logging
+bootstrap (2646/2648 non-passed classes FAIL in a fresh full-suite rerun,
+essentially all through this one gap). Originally scoped as "blocks any
+real-JDK-mode webapp whose bootstrap path uses `EnumSet.of(...)` on an
+application/framework enum" (e.g. `jakarta.servlet.DispatcherType` for
+filter mapping) — that undersold it. **HotSpot:** presumably PASS (this is
+a CratonVM-only defect).
 
 Found 2026-07-09 while investigating
 `docs/known-issues/tomcat-08-07/wsremoteendpoint-close-delay-near-deadlock.md`
@@ -132,3 +138,60 @@ during startup (Spring's `EnumSet` usage on JDK enums like
 `RoundingMode`/`TimeUnit` is probably fine, since those may go through
 different codepaths already covered by existing fixups — but hasn't been
 checked).
+
+## 2026-07-09 update: also breaks `allOf`, confirmed as the ES-suite-wide blocker
+
+Found independently while verifying
+`docs/known-issues/elasticsearch-suite/ES-RUN-20260709-currentdev-nonpassed-rerun-120s-summary.md`
+after fixing two other masking bugs (real-JDK `EnumMap.<init>` corruption
+and reversed `StackWalker` frame order — see
+`docs/internal/fixed-suite-bugs/enummap-realmode-corruption-and-stackwalker-frame-order-FIXED.md`).
+A fresh full rerun of the 2649-class ES non-passed selection against a
+`dev` build with both of those fixed shows 2646/2648 rows FAIL, almost all
+through this bug:
+
+```
+java.lang.NullPointerException: Cannot invoke "java.util.Iterator.hasNext()" because "<local2>" is null
+	at org/apache/logging/log4j/spi/StandardLevel.getStandardLevel(StandardLevel.java:91)
+	at org/apache/logging/log4j/Level.<init>(Level.java:145)
+	at org/apache/logging/log4j/Level.<clinit>(Level.java:86)
+	at org/elasticsearch/common/logging/LogConfigurator.<clinit>(LogConfigurator.java:76)
+```
+
+`org.apache.logging.log4j.spi.StandardLevel` (log4j-api, not bootstrap
+classloader — a non-JDK enum, same shape as the `DispatcherType` repro
+above) evidently builds/consumes an `EnumSet` here, and every ES test
+class initializes logging, so this single call site blocks virtually the
+whole suite.
+
+Confirms **Hypothesis 2 exactly**, and extends it: `EnumSet.allOf(Class)`
+is equally broken, not just `of(...)`. Minimal repro:
+
+```java
+import java.util.EnumSet;
+public class Repro {
+    enum Color { RED, GREEN, BLUE }
+    public static void main(String[] a) {
+        EnumSet<Color> all = EnumSet.allOf(Color.class);
+        System.out.println(all);           // Object@55 (not "[RED, GREEN, BLUE]")
+        System.out.println(all.size());     // 0 (should be 3)
+        System.out.println(all.iterator()); // null
+    }
+}
+```
+
+Note `EnumSet.allOf`/`noneOf` are *both* registered (in
+`native-builtins/src/phases_early.rs::register_enum_set_natives_with_category`)
+to the same `native_es_none_of` — which ignores its `Class` argument and
+always builds an empty synthetic 2-field bridge — so `allOf`'s brokenness
+may not even need the `try_jdk_enum_set_of_elements` real-object path
+implicated in Hypothesis 2 for `of(...)`; it could be failing for a
+simpler reason (always-empty by construction) that then hits the *same*
+downstream `size()`/`iterator()`/`toString()` dispatch confusion once
+something (real bytecode?) expects a non-empty real object. Worth checking
+both paths converge on the same root cause before fixing only one.
+
+Not fixed this session — flagging severity/scope only, per the note at
+the top. Recommended starting point is still the debug-print step already
+suggested above, now on the `allOf`/`Level.<clinit>` repro (a much shorter,
+non-Tomcat repro path) rather than the original Tomcat one.
