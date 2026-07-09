@@ -370,6 +370,18 @@ fn build_updater(
     ctx.set_field(impl_obj, FU_SLOT_DESC_TAG, Value::Int(tag));
     ctx.set_field(impl_obj, FU_SLOT_VCLASS_ID, Value::Int(vclass_id));
 
+    if atomic_updater_diag_enabled() {
+        tracing::warn!(
+            field = %field_name,
+            target_class = %ctx.class_name_of_id(tclass_id).unwrap_or_default(),
+            field_slot = meta.slot_index,
+            descriptor = %meta.descriptor,
+            impl_class = %object_class_name(ctx, impl_obj),
+            impl_slots = ctx.object_num_fields(impl_obj),
+            "T19.H5: AtomicFieldUpdater impl allocated"
+        );
+    }
+
     Ok(Some(Value::Object(Some(impl_obj))))
 }
 
@@ -438,6 +450,31 @@ fn impl_slot(ctx: &dyn NativeContext, impl_obj: ObjectRef) -> Option<usize> {
     match ctx.get_field(impl_obj, FU_SLOT_FIELD_INDEX) {
         Value::Int(v) if v >= 0 => Some(v as usize),
         _ => None,
+    }
+}
+
+fn atomic_updater_diag_enabled() -> bool {
+    std::env::var_os("CRATONVM_DBG_ATOMIC_UPDATER").is_some()
+}
+
+fn object_class_name(ctx: &dyn NativeContext, obj: ObjectRef) -> String {
+    let cid = ctx.class_id_of_object(obj);
+    ctx.class_name_of_id(cid)
+        .unwrap_or_else(|| format!("<class {:?}>", cid))
+}
+
+fn describe_value(ctx: &dyn NativeContext, value: Value) -> String {
+    match value {
+        Value::Object(Some(obj)) => {
+            format!("Object({})", object_class_name(ctx, obj))
+        }
+        Value::Object(None) => "Object(null)".to_string(),
+        Value::Int(v) => format!("Int({v})"),
+        Value::Long(v) => format!("Long({v})"),
+        Value::Float(v) => format!("Float({v})"),
+        Value::Double(v) => format!("Double({v})"),
+        Value::ReturnAddress(v) => format!("ReturnAddress({v})"),
+        Value::Uninitialized => "Uninitialized".to_string(),
     }
 }
 
@@ -512,7 +549,19 @@ fn native_arfu_get(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRes
     let this = arg_obj_or_npe(args, 0, "updater")?;
     let target = require_target(args, 1)?;
     let slot = impl_slot(ctx, this).unwrap_or(0);
-    Ok(Some(ctx.get_field_volatile(target, slot)))
+    let value = ctx.get_field_volatile(target, slot);
+    if atomic_updater_diag_enabled() {
+        tracing::warn!(
+            updater_class = %object_class_name(ctx, this),
+            updater_slots = ctx.object_num_fields(this),
+            slot,
+            target_class = %object_class_name(ctx, target),
+            target_slots = ctx.object_num_fields(target),
+            value = %describe_value(ctx, value),
+            "T19.H5: AtomicReferenceFieldUpdater.get"
+        );
+    }
+    Ok(Some(value))
 }
 
 fn native_arfu_set(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
@@ -520,6 +569,17 @@ fn native_arfu_set(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRes
     let target = require_target(args, 1)?;
     let new_val = arg_value(args, 2);
     let slot = impl_slot(ctx, this).unwrap_or(0);
+    if atomic_updater_diag_enabled() {
+        tracing::warn!(
+            updater_class = %object_class_name(ctx, this),
+            updater_slots = ctx.object_num_fields(this),
+            slot,
+            target_class = %object_class_name(ctx, target),
+            target_slots = ctx.object_num_fields(target),
+            value = %describe_value(ctx, new_val),
+            "T19.H5: AtomicReferenceFieldUpdater.set"
+        );
+    }
     ctx.set_field_volatile(target, slot, new_val);
     Ok(None)
 }

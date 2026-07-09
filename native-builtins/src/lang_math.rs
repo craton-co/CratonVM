@@ -177,6 +177,12 @@ pub(crate) fn register_wrapper_natives(registry: &mut NativeMethodRegistry) {
     );
     registry.register(
         "java/lang/Integer",
+        "getInteger",
+        "(Ljava/lang/String;I)Ljava/lang/Integer;",
+        native_integer_get_integer_default,
+    );
+    registry.register(
+        "java/lang/Integer",
         "toString",
         "(I)Ljava/lang/String;",
         native_string_value_of_int,
@@ -250,6 +256,12 @@ pub(crate) fn register_wrapper_natives(registry: &mut NativeMethodRegistry) {
     );
     registry.register(
         "java/lang/Long",
+        "getLong",
+        "(Ljava/lang/String;J)Ljava/lang/Long;",
+        native_long_get_long_default,
+    );
+    registry.register(
+        "java/lang/Long",
         "toString",
         "(J)Ljava/lang/String;",
         native_string_value_of_long,
@@ -315,8 +327,20 @@ pub(crate) fn register_wrapper_natives(registry: &mut NativeMethodRegistry) {
     );
     registry.register(
         "java/lang/Character",
+        "isDigit",
+        "(I)Z",
+        native_character_is_digit,
+    );
+    registry.register(
+        "java/lang/Character",
         "isLetter",
         "(C)Z",
+        native_character_is_letter,
+    );
+    registry.register(
+        "java/lang/Character",
+        "isLetter",
+        "(I)Z",
         native_character_is_letter,
     );
     registry.register(
@@ -327,14 +351,32 @@ pub(crate) fn register_wrapper_natives(registry: &mut NativeMethodRegistry) {
     );
     registry.register(
         "java/lang/Character",
+        "isWhitespace",
+        "(I)Z",
+        native_character_is_whitespace,
+    );
+    registry.register(
+        "java/lang/Character",
         "isUpperCase",
         "(C)Z",
         native_character_is_upper_case,
     );
     registry.register(
         "java/lang/Character",
+        "isUpperCase",
+        "(I)Z",
+        native_character_is_upper_case,
+    );
+    registry.register(
+        "java/lang/Character",
         "isLowerCase",
         "(C)Z",
+        native_character_is_lower_case,
+    );
+    registry.register(
+        "java/lang/Character",
+        "isLowerCase",
+        "(I)Z",
         native_character_is_lower_case,
     );
     registry.register(
@@ -376,6 +418,12 @@ pub(crate) fn register_wrapper_natives(registry: &mut NativeMethodRegistry) {
         "java/lang/Character",
         "isLetterOrDigit",
         "(C)Z",
+        native_character_is_letter_or_digit,
+    );
+    registry.register(
+        "java/lang/Character",
+        "isLetterOrDigit",
+        "(I)Z",
         native_character_is_letter_or_digit,
     );
     // Float
@@ -998,6 +1046,18 @@ pub(crate) fn register_wrapper_natives(registry: &mut NativeMethodRegistry) {
         "isBmpCodePoint",
         "(I)Z",
         native_character_is_bmp_code_point,
+    );
+    registry.register(
+        "java/lang/Character",
+        "isValidCodePoint",
+        "(I)Z",
+        native_character_is_valid_code_point,
+    );
+    registry.register(
+        "java/lang/Character",
+        "isISOControl",
+        "(I)Z",
+        native_character_is_iso_control,
     );
     registry.register(
         "java/lang/Character",
@@ -2636,6 +2696,25 @@ pub(crate) fn native_integer_value_of(
     Ok(Some(Value::Object(Some(obj))))
 }
 
+pub(crate) fn native_integer_get_integer_default(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    let default = match args.get(1) {
+        Some(Value::Int(v)) => *v,
+        _ => 0,
+    };
+    let value = match args.first() {
+        Some(Value::Object(Some(name_obj))) => ctx
+            .read_string(*name_obj)
+            .and_then(|name| ctx.get_system_property(&name))
+            .and_then(|raw| raw.trim().parse::<i32>().ok())
+            .unwrap_or(default),
+        _ => default,
+    };
+    native_integer_value_of(ctx, &[Value::Int(value)])
+}
+
 /// Shared unboxing for Integer.intValue(), Boolean.booleanValue(),
 /// Character.charValue(), Byte.byteValue(), Short.shortValue().
 pub(crate) fn native_wrapper_int_value(
@@ -2929,6 +3008,22 @@ pub(crate) fn native_wrapper_long_value(
         Value::Long(_) => Ok(Some(val)),
         _ => Ok(Some(Value::Long(0))),
     }
+}
+
+fn native_long_get_long_default(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let default = match args.get(1) {
+        Some(Value::Long(v)) => *v,
+        _ => 0,
+    };
+    let value = match args.first() {
+        Some(Value::Object(Some(name_obj))) => ctx
+            .read_string(*name_obj)
+            .and_then(|name| ctx.get_system_property(&name))
+            .and_then(|raw| raw.trim().parse::<i64>().ok())
+            .unwrap_or(default),
+        _ => default,
+    };
+    native_long_value_of(ctx, &[Value::Long(value)])
 }
 
 pub(crate) fn native_long_parse_long(
@@ -3801,6 +3896,36 @@ pub(crate) fn native_character_is_bmp_code_point(
         _ => return Ok(Some(Value::Int(1))),
     };
     Ok(Some(Value::Int(if cp <= 0xFFFF { 1 } else { 0 })))
+}
+
+pub(crate) fn native_character_is_valid_code_point(
+    _ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    let cp = match args.first() {
+        Some(Value::Int(v)) => *v,
+        _ => -1,
+    };
+    Ok(Some(Value::Int(if (0..=0x10FFFF).contains(&cp) {
+        1
+    } else {
+        0
+    })))
+}
+
+pub(crate) fn native_character_is_iso_control(
+    _ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    let cp = match args.first() {
+        Some(Value::Int(v)) => *v,
+        _ => -1,
+    };
+    Ok(Some(Value::Int(if (0x00..=0x1F).contains(&cp) || (0x7F..=0x9F).contains(&cp) {
+        1
+    } else {
+        0
+    })))
 }
 
 pub(crate) fn native_character_static_to_string(

@@ -25,16 +25,34 @@
 use std::collections::HashMap;
 use std::sync::{Mutex, OnceLock};
 
-fn table() -> &'static Mutex<HashMap<i32, i32>> {
-    static T: OnceLock<Mutex<HashMap<i32, i32>>> = OnceLock::new();
+#[derive(Clone)]
+struct BoundServerSocket {
+    host: String,
+    port: i32,
+}
+
+fn table() -> &'static Mutex<HashMap<i32, BoundServerSocket>> {
+    static T: OnceLock<Mutex<HashMap<i32, BoundServerSocket>>> = OnceLock::new();
     T.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
 /// Record the actual bound (ephemeral-resolved) local port of a plain synthetic
 /// `ServerSocket`, keyed by its identity hash. Called from the binding native.
 pub fn record(identity_hash: i32, port: i32) {
+    record_addr(identity_hash, "0.0.0.0", port);
+}
+
+/// Record the actual bound local address of a plain synthetic `ServerSocket`,
+/// keyed by its identity hash.
+pub fn record_addr(identity_hash: i32, host: &str, port: i32) {
     if let Ok(mut t) = table().lock() {
-        t.insert(identity_hash, port);
+        t.insert(
+            identity_hash,
+            BoundServerSocket {
+                host: host.to_string(),
+                port,
+            },
+        );
     }
 }
 
@@ -45,7 +63,17 @@ pub fn get(identity_hash: i32) -> Option<i32> {
     table()
         .lock()
         .ok()
-        .and_then(|t| t.get(&identity_hash).copied())
+        .and_then(|t| t.get(&identity_hash).map(|bound| bound.port))
+}
+
+/// Look up the bound local address previously recorded for this `ServerSocket`'s
+/// identity hash, if any.
+pub fn get_addr(identity_hash: i32) -> Option<(String, i32)> {
+    table()
+        .lock()
+        .ok()
+        .and_then(|t| t.get(&identity_hash).cloned())
+        .map(|bound| (bound.host, bound.port))
 }
 
 /// Drop the recorded port for a closed `ServerSocket` (best-effort).

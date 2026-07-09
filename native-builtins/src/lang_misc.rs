@@ -116,6 +116,10 @@ fn cached_ste_class_id(ctx: &mut dyn NativeContext) -> ClassId {
         STE_CLASS_ID.store(cid.as_u32(), Ordering::Relaxed);
         return cid;
     }
+    if let Ok(cid) = ctx.ensure_class_initialized("java/lang/StackTraceElement") {
+        STE_CLASS_ID.store(cid.as_u32(), Ordering::Relaxed);
+        return cid;
+    }
     // Class not loaded yet — return the legacy fallback but DO NOT cache,
     // so a later call (after the class loads) can re-resolve correctly.
     ClassId::new(0)
@@ -406,6 +410,64 @@ pub(crate) fn native_exc_init_cause(
         capture_throwable_trace(ctx, *this);
     }
     Ok(None)
+}
+
+/// InvocationTargetException(Throwable) — store the wrapped throwable in the
+/// JDK `target` field rather than the inherited Throwable `cause` field.
+pub(crate) fn native_invocation_target_exception_init_target(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    if let Some(Value::Object(Some(this))) = args.first() {
+        let target = args.get(1).cloned().unwrap_or(Value::Object(None));
+        ctx.set_field_by_name(*this, "target", target);
+        write_throwable_cause(ctx, *this, Value::Object(None));
+        write_throwable_detail_message(ctx, *this, Value::Object(None));
+        capture_throwable_trace(ctx, *this);
+    }
+    Ok(None)
+}
+
+/// InvocationTargetException(Throwable,String) — same target-field semantics,
+/// with an explicit detail message.
+pub(crate) fn native_invocation_target_exception_init_target_message(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    if let Some(Value::Object(Some(this))) = args.first() {
+        let target = args.get(1).cloned().unwrap_or(Value::Object(None));
+        let msg = args.get(2).cloned().unwrap_or(Value::Object(None));
+        ctx.set_field_by_name(*this, "target", target);
+        write_throwable_cause(ctx, *this, Value::Object(None));
+        write_throwable_detail_message(ctx, *this, msg);
+        capture_throwable_trace(ctx, *this);
+    }
+    Ok(None)
+}
+
+/// InvocationTargetException.getCause()/getTargetException() — both return
+/// the wrapped target throwable, independent of the inherited Throwable.cause.
+pub(crate) fn native_invocation_target_exception_get_target(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(obj))) => *obj,
+        _ => return Ok(Some(Value::Object(None))),
+    };
+    let target = ctx.get_field_by_name(this, "target");
+    match target {
+        Value::Object(Some(target_obj)) if target_obj == this => Ok(Some(Value::Object(None))),
+        Value::Object(_) => Ok(Some(target)),
+        _ => {
+            let cause = ctx.get_field_by_name(this, "cause");
+            match cause {
+                Value::Object(Some(cause_obj)) if cause_obj == this => Ok(Some(Value::Object(None))),
+                Value::Object(_) => Ok(Some(cause)),
+                _ => Ok(Some(Value::Object(None))),
+            }
+        }
+    }
 }
 
 /// Exception <init>()V — no message, no cause. Mirrors the JDK
@@ -1241,7 +1303,8 @@ pub(crate) fn native_throwable_get_stack_trace_array(
         .unwrap_or_default();
 
     let len = trace_data.len();
-    let arr = ctx.new_ref_array(ClassId::new(0), len);
+    let ste_cid = cached_ste_class_id(ctx);
+    let arr = ctx.new_ref_array(ste_cid, len);
     // stored trace is outermost-first; getStackTrace() wants index 0 = the
     // throw site (innermost), so fill the array reversed.
     for (i, (cls_slashed, meth, file, line)) in trace_data.iter().rev().enumerate() {
@@ -1276,6 +1339,19 @@ pub(crate) fn native_throwable_get_stack_trace_array(
         }
     }
     Ok(Some(Value::Object(Some(arr))))
+}
+
+pub(crate) fn native_throwable_set_stack_trace(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(r))) => *r,
+        _ => return Ok(None),
+    };
+    let stack = args.get(1).copied().unwrap_or(Value::Object(None));
+    ctx.set_field_by_name(this, "stackTrace", stack);
+    Ok(None)
 }
 
 // ===========================================================================
@@ -1783,31 +1859,59 @@ pub fn register_throwable_subclass_natives(r: &mut NativeMethodRegistry) {
         "java/lang/Error",
         "java/lang/LinkageError",
         "java/lang/NoClassDefFoundError",
+        "java/lang/SecurityException",
+        "java/lang/ReflectiveOperationException",
         "java/lang/ClassNotFoundException",
         "java/lang/NoSuchMethodError",
         "java/lang/NoSuchFieldError",
         "java/lang/NoSuchMethodException",
         "java/lang/NoSuchFieldException",
+        "java/lang/CloneNotSupportedException",
+        "java/lang/InstantiationException",
+        "java/lang/IllegalAccessException",
+        "java/lang/reflect/InaccessibleObjectException",
+        "java/lang/reflect/InvocationTargetException",
+        "java/lang/InterruptedException",
         "java/lang/NullPointerException",
         "java/lang/ArithmeticException",
         "java/lang/ArrayIndexOutOfBoundsException",
         "java/lang/IndexOutOfBoundsException",
+        "java/lang/StringIndexOutOfBoundsException",
         "java/lang/ClassCastException",
         "java/lang/IllegalArgumentException",
         "java/lang/IllegalStateException",
         "java/lang/UnsupportedOperationException",
+        "java/lang/TypeNotPresentException",
         "java/lang/StackOverflowError",
         "java/lang/OutOfMemoryError",
         "java/util/NoSuchElementException",
         "java/util/InputMismatchException",
+        "java/util/MissingResourceException",
+        "java/util/FormatterClosedException",
         "java/io/IOException",
         "java/io/FileNotFoundException",
+        "java/io/UncheckedIOException",
+        "java/io/NotSerializableException",
+        "java/io/InvalidClassException",
+        "java/io/EOFException",
+        "java/io/UnsupportedEncodingException",
+        "java/net/MalformedURLException",
+        "java/net/UnknownHostException",
         "java/lang/NumberFormatException",
         "java/util/ConcurrentModificationException",
+        "java/util/concurrent/TimeoutException",
+        "java/util/concurrent/RejectedExecutionException",
+        "java/util/concurrent/CancellationException",
+        "java/util/concurrent/CompletionException",
+        "java/util/concurrent/ExecutionException",
+        "java/util/concurrent/BrokenBarrierException",
+        "java/text/ParseException",
+        "java/util/regex/PatternSyntaxException",
         "java/lang/NegativeArraySizeException",
         "java/lang/AssertionError",
         "java/lang/MatchException",
         "java/lang/IncompatibleClassChangeError",
+        "java/lang/IllegalAccessError",
         "java/lang/ExceptionInInitializerError",
         "java/lang/VerifyError",
         "java/lang/AbstractMethodError",
@@ -1816,6 +1920,78 @@ pub fn register_throwable_subclass_natives(r: &mut NativeMethodRegistry) {
     ];
 
     for cls in throwable_classes.iter() {
+        if *cls == "java/lang/reflect/InvocationTargetException" {
+            r.register(cls, "<init>", "()V", native_exc_init_noargs);
+            r.register(
+                cls,
+                "<init>",
+                "(Ljava/lang/String;)V",
+                native_exc_init_message,
+            );
+            r.register(
+                cls,
+                "<init>",
+                "(Ljava/lang/String;Ljava/lang/Throwable;)V",
+                native_exc_init_message_cause,
+            );
+            r.register(
+                cls,
+                "<init>",
+                "(Ljava/lang/Throwable;)V",
+                native_invocation_target_exception_init_target,
+            );
+            r.register(
+                cls,
+                "<init>",
+                "(Ljava/lang/Throwable;Ljava/lang/String;)V",
+                native_invocation_target_exception_init_target_message,
+            );
+            r.register(cls, "getMessage", "()Ljava/lang/String;", native_throwable_get_message);
+            r.register(
+                cls,
+                "getLocalizedMessage",
+                "()Ljava/lang/String;",
+                native_throwable_get_message,
+            );
+            r.register(
+                cls,
+                "printStackTrace",
+                "()V",
+                native_throwable_print_stack_trace,
+            );
+            r.register(
+                cls,
+                "printStackTrace",
+                "(Ljava/io/PrintStream;)V",
+                native_throwable_print_stack_trace_to_stream,
+            );
+            r.register(
+                cls,
+                "printStackTrace",
+                "(Ljava/io/PrintWriter;)V",
+                native_throwable_print_stack_trace_to_stream,
+            );
+            r.register(cls, "toString", "()Ljava/lang/String;", native_throwable_to_string);
+            r.register(
+                cls,
+                "getCause",
+                "()Ljava/lang/Throwable;",
+                native_invocation_target_exception_get_target,
+            );
+            r.register(
+                cls,
+                "getTargetException",
+                "()Ljava/lang/Throwable;",
+                native_invocation_target_exception_get_target,
+            );
+            r.register(
+                cls,
+                "initCause",
+                "(Ljava/lang/Throwable;)Ljava/lang/Throwable;",
+                native_throwable_init_cause,
+            );
+            continue;
+        }
         // Constructor overloads for synthetic Throwable-family stubs.
         // Some bootstrap paths instantiate subclasses directly (for example
         // InternalError and NoSuchMethodError wrappers). Register all common
@@ -1894,6 +2070,36 @@ pub fn register_throwable_subclass_natives(r: &mut NativeMethodRegistry) {
             "getCause",
             "()Ljava/lang/Throwable;",
             native_throwable_get_cause,
+        );
+        r.register(
+            cls,
+            "initCause",
+            "(Ljava/lang/Throwable;)Ljava/lang/Throwable;",
+            native_throwable_init_cause,
+        );
+        r.register(
+            cls,
+            "addSuppressed",
+            "(Ljava/lang/Throwable;)V",
+            native_throwable_add_suppressed,
+        );
+        r.register(
+            cls,
+            "getSuppressed",
+            "()[Ljava/lang/Throwable;",
+            native_throwable_get_suppressed,
+        );
+        r.register(
+            cls,
+            "getStackTrace",
+            "()[Ljava/lang/StackTraceElement;",
+            native_throwable_get_stack_trace_array,
+        );
+        r.register(
+            cls,
+            "setStackTrace",
+            "([Ljava/lang/StackTraceElement;)V",
+            native_throwable_set_stack_trace,
         );
     }
     r.set_category(__prev_cat);

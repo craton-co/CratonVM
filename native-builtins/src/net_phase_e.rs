@@ -3400,10 +3400,11 @@ fn re2_bind_listener(
     let addr = SocketAddr::new(ip, port.clamp(0, 65535) as u16);
     let listener =
         TcpListener::bind(addr).map_err(|e| ioex(format!("BindException: {addr}: {e}")))?;
-    let actual_port = listener
-        .local_addr()
-        .map(|a| a.port() as i32)
-        .unwrap_or(port);
+    let local_addr = listener.local_addr().ok();
+    let actual_port = local_addr.map(|a| a.port() as i32).unwrap_or(port);
+    let actual_host = local_addr
+        .map(|a| a.ip().to_string())
+        .unwrap_or_else(|| ip.to_string());
     let listener_id = s2_alloc_listener(listener);
     ss_set(ctx, this, |s| {
         s.port = actual_port;
@@ -3421,7 +3422,11 @@ fn re2_bind_listener(
     // lets that winner return the real ephemeral port instead of 0 — without which
     // `new ServerSocket(0).getLocalPort()` is 0 and any connect-to-advertised-port
     // (Narayana's TransactionStatusManager recovery listener) fails / hangs.
-    cratonvm_native_api::server_socket_ports::record(ctx.identity_hash_code(this), actual_port);
+    cratonvm_native_api::server_socket_ports::record_addr(
+        ctx.identity_hash_code(this),
+        &actual_host,
+        actual_port,
+    );
     Ok(None)
 }
 
@@ -3628,9 +3633,9 @@ fn register_re2_server_socket(r: &mut NativeMethodRegistry) {
                     .map(|a| (a.ip().to_string(), a.port() as i32))
             };
             match local {
-                Some((ip, port)) => Ok(Some(Value::Object(Some(alloc_inet_socket_address(
-                    ctx, &ip, port,
-                ))))),
+                Some((ip, port)) => Ok(Some(Value::Object(Some(
+                    alloc_inet_socket_address_resolved(ctx, &ip, &ip, port),
+                )))),
                 None => Ok(Some(Value::Object(None))),
             }
         },

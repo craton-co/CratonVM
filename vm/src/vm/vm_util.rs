@@ -116,6 +116,7 @@ fn clinit_swallow_has_recovery(class_name: &str) -> bool {
             | "io/quarkus/bootstrap/logging/InitialConfigurator"
             | "org/jboss/modules/DefaultBootModuleLoaderHolder"
             | "java/math/BigInteger"
+            | "java/util/concurrent/TimeUnit"
             | "java/nio/file/attribute/PosixFilePermission"
             | "java/math/BigDecimal"
             | "org/jboss/msc/service/ServiceContainerImpl"
@@ -2472,6 +2473,111 @@ fn post_clinit_fixup(shared: &SharedVm, class_id: ClassId, class_name: &str) {
         // must be non-null for `EnumSet.of` / `Set.of` in `JarFileArchive.<clinit>`.
         // When static slots stay null after `<clinit>`, allocate real enum-shaped
         // instances on the loaded `PosixFilePermission` class (jrt-backed).
+        "java/util/concurrent/TimeUnit" => {
+            const NAMES: &[&str] = &[
+                "NANOSECONDS",
+                "MICROSECONDS",
+                "MILLISECONDS",
+                "SECONDS",
+                "MINUTES",
+                "HOURS",
+                "DAYS",
+            ];
+            let read_static_named = |field_name: &str| -> Option<Value> {
+                let cm = shared.class_manager.read();
+                let cls = cm.get_class(class_id)?;
+                let mut static_idx = 0usize;
+                for f in &cls.fields {
+                    if f.is_static() {
+                        if &*f.name == field_name {
+                            drop(cm);
+                            return Some(super::vm_object::get_static_shared(
+                                shared, class_id, static_idx,
+                            ));
+                        }
+                        static_idx += 1;
+                    }
+                }
+                None
+            };
+            let find_instance_field_index = |field_name: &str| -> Option<usize> {
+                let cm = shared.class_manager.read();
+                let store = &cm.class_store;
+                let mut current_id = Some(class_id);
+                while let Some(cid) = current_id {
+                    if let Some(class) = store.get(cid) {
+                        let mut instance_offset = 0usize;
+                        for field in &class.fields {
+                            if field.is_static() {
+                                continue;
+                            }
+                            if &*field.name == field_name {
+                                return Some(class.first_field_index + instance_offset);
+                            }
+                            instance_offset += 1;
+                        }
+                        current_id = class.superclass;
+                    } else {
+                        break;
+                    }
+                }
+                None
+            };
+            let num_fields = {
+                let cm = shared.class_manager.read();
+                cm.get_class(class_id)
+                    .map(|c| c.num_total_fields)
+                    .unwrap_or(0)
+            };
+            let ordinal_idx = find_instance_field_index("ordinal").unwrap_or(0);
+            let name_idx = find_instance_field_index("name");
+            let alloc_fields = num_fields.max(ordinal_idx + 1).max(name_idx.map_or(0, |i| i + 1));
+
+            let mut filled = 0usize;
+            for (ord, &name) in NAMES.iter().enumerate() {
+                if matches!(read_static_named(name), Some(Value::Object(Some(_)))) {
+                    continue;
+                }
+                let Some(obj) = shared.heap.try_alloc_object(class_id, alloc_fields) else {
+                    continue;
+                };
+                shared.heap.set_field(obj, ordinal_idx, Value::Int(ord as i32));
+                if let Some(name_idx) = name_idx {
+                    let nm = super::vm_object::create_java_string(shared, name);
+                    shared
+                        .heap
+                        .set_field(obj, name_idx, Value::Object(Some(nm)));
+                }
+                if set_static_by_name(name, Value::Object(Some(obj))) {
+                    filled += 1;
+                }
+            }
+            if filled > 0 {
+                tracing::warn!(
+                    "Post-clinit fixup: TimeUnit backfilled {filled}/{} enum statics",
+                    NAMES.len()
+                );
+            }
+            if !matches!(read_static_named("$VALUES"), Some(Value::Object(Some(_)))) {
+                if let Some(values_arr) =
+                    shared
+                        .heap
+                        .try_alloc_array(class_id, ArrayElementType::Reference, NAMES.len())
+                {
+                    for (i, &name) in NAMES.iter().enumerate() {
+                        if let Some(Value::Object(Some(o))) = read_static_named(name) {
+                            let _ =
+                                shared
+                                    .heap
+                                    .set_array_element(values_arr, i, Value::Object(Some(o)));
+                        }
+                    }
+                    if !set_static_by_name("$VALUES", Value::Object(Some(values_arr))) {
+                        let _ = set_static_by_name("ENUM$VALUES", Value::Object(Some(values_arr)));
+                    }
+                }
+            }
+        }
         "java/nio/file/attribute/PosixFilePermission" => {
             const NAMES: &[&str] = &[
                 "OWNER_READ",

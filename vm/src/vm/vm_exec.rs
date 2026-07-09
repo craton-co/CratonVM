@@ -4923,14 +4923,18 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
         // In real-JDK mode the Thread class has many more than 3 instance
         // fields and real-JDK bytecode reads `this.holder.threadStatus`
         // etc.  Allocate with the full field count and populate
-        // `name/tid/holder/priority` by resolved slot index.  In
-        // synthetic-JDK mode we keep the historical 3-slot fixed layout
-        // so existing callers (thread_start, thread_join, many unit
-        // tests) continue to work.
+        // `name/tid/holder/priority` by resolved slot index.  Synthetic-JDK
+        // mode still keeps the historical first three slots stable for
+        // callers (name/priority/tid), but it must allocate at least the
+        // synthetic class's declared field count too.  The synthetic Thread
+        // layout now also declares `contextClassLoader`; allocating only 3
+        // slots made Thread.get/setContextClassLoader hit an undersized
+        // object as soon as reflection users resolved that field.
         let (is_real_jdk, num_fields) = {
             let cm = self.shared.class_manager.read();
             match cm.class_store.get(class_id) {
                 Some(c) if !c.is_synthetic_stub => (true, c.num_total_fields.max(3)),
+                Some(c) => (false, c.num_total_fields.max(3)),
                 _ => (false, 3usize),
             }
         };
@@ -8157,29 +8161,48 @@ pub fn invoke_or_native(
         // CRATONVM_REAL differential switch: when this native is tagged a
         // SyntheticStub AND the selector prefers real bytecode for this class,
         // skip the fake and fall through to the real-bytecode dispatch at the
-        // end of this function — provided real (non-synthetic, non-ACC_NATIVE)
-        // bytecode actually exists. When CRATONVM_REAL / CRATONVM_REAL_JCA are
-        // unset the selector matches nothing, so `gated` is always false and
-        // behaviour is byte-identical to before.
-        let gated = shared
+        // end of this function — provided real bytecode actually exists. The
+        // ReentrantLock fallback is also protected this way: it exists only for
+        // fake-JDK synthetic lock stubs and must not steal real AQS bytecode.
+        let synthetic_stub_native = shared
             .native_methods
             .kind_of(effective_class, method_name, descriptor)
-            == Some(cratonvm_native_api::NativeKind::SyntheticStub)
-            && crate::runtime::env_cache::real_bytecode_selector().prefers_real(effective_class);
-        let has_real = gated && {
+            == Some(cratonvm_native_api::NativeKind::SyntheticStub);
+        let real_protected_stub = synthetic_stub_native
+            && (crate::runtime::env_cache::real_bytecode_selector().prefers_real(effective_class)
+                || matches!(
+                    effective_class,
+                    "java/util/concurrent/locks/ReentrantLock"
+                        | "java/util/concurrent/LinkedBlockingDeque"
+                        | "java/util/concurrent/atomic/AtomicBoolean"
+                        | "java/util/EnumSet"
+                        | "java/util/StringJoiner"
+                        | "java/io/FileInputStream"
+                        | "java/lang/ref/Cleaner"
+                        | "java/lang/ref/Cleaner$Cleanable"
+                        | "java/lang/management/ManagementFactory"
+                ));
+        let has_real = real_protected_stub && {
             let cm = shared.class_manager.read();
             cm.get_loaded_class_id(effective_class)
-                .and_then(|cid| cm.get_class(cid))
-                .map(|cls| {
-                    !cls.is_synthetic_stub
-                        && cls
-                            .find_method(method_name, descriptor)
-                            .map(|m| !m.is_native())
-                            .unwrap_or(false)
+                .and_then(|cid| {
+                    cm.get_class(cid).and_then(|cls| {
+                        if cls.is_synthetic_stub {
+                            None
+                        } else {
+                            crate::classloading::find_method_recursive(
+                                cid,
+                                method_name,
+                                descriptor,
+                                &cm.class_store,
+                            )
+                            .map(|(m, _)| !m.is_native() && m.code().is_some())
+                        }
+                    })
                 })
                 .unwrap_or(false)
         };
-        if !(gated && has_real) {
+        if !has_real {
             return safe_native_call(shared, thread, callback, args)
                 .map(|v| coerce_native_return(v, descriptor));
         }
@@ -11151,6 +11174,19 @@ fn invoke_on_class_shared_inner(
                         || (class_name == "java/lang/ClassLoader"
                             && (method_name == "getResources"
                                 || method_name == "getSystemResources"))
+                        // WildFly process-controller bootstrap: real
+                        // ServerSocket.getLocalSocketAddress() is Java bytecode
+                        // that builds from ServerSocket's internal impl fields.
+                        // CratonVM binds the listener through native side tables,
+                        // so force the registered accessors to report the actual
+                        // resolved bound address instead of constructing an
+                        // InetSocketAddress with a null InetAddress.
+                        || (class_name == "java/net/ServerSocket"
+                            && matches!(
+                                (method_name, descriptor),
+                                ("getInetAddress", "()Ljava/net/InetAddress;")
+                                    | ("getLocalSocketAddress", "()Ljava/net/SocketAddress;")
+                            ))
                         // URLClassLoader.findResource / findResources +
                         // URLClassPath.addURL: the real bytecode routes through
                         // `jdk.internal.loader.URLClassPath`, whose CratonVM shim
@@ -13516,26 +13552,30 @@ fn invoke_on_class_shared_inner(
                 // extra bytecode-enhancement interfaces/default methods. Retry
                 // against the receiver's real class before falling through to
                 // CP-interface or native-only rescues.
-                if let Some(Value::Object(Some(recv))) = args.first().copied() {
-                    let recv_cid = shared.heap.class_id_of(recv);
-                    if recv_cid != class_id && recv_cid != ClassId::new(0) {
-                        let cm_recv = shared.class_manager.read();
-                        if let Some((m, declaring_id)) = crate::classloading::find_method_recursive(
-                            recv_cid,
-                            method_name,
-                            descriptor,
-                            &cm_recv.class_store,
-                        ) {
-                            if !m.is_abstract() && !m.is_static() {
-                                drop(cm_recv);
-                                return invoke_on_class_shared(
-                                    shared,
-                                    thread,
-                                    declaring_id,
+                if !no_retarget && method_name != "<init>" && method_name != "<clinit>" {
+                    if let Some(Value::Object(Some(recv))) = args.first().copied() {
+                        let recv_cid = shared.heap.class_id_of(recv);
+                        if recv_cid != class_id && recv_cid != ClassId::new(0) {
+                            let cm_recv = shared.class_manager.read();
+                            if let Some((m, declaring_id)) =
+                                crate::classloading::find_method_recursive(
+                                    recv_cid,
                                     method_name,
                                     descriptor,
-                                    args,
-                                );
+                                    &cm_recv.class_store,
+                                )
+                            {
+                                if declaring_id != class_id && !m.is_abstract() && !m.is_static() {
+                                    drop(cm_recv);
+                                    return invoke_on_class_shared_no_retarget(
+                                        shared,
+                                        thread,
+                                        declaring_id,
+                                        method_name,
+                                        descriptor,
+                                        args,
+                                    );
+                                }
                             }
                         }
                     }

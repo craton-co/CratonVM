@@ -445,6 +445,8 @@ pub fn register_collections_natives(registry: &mut NativeMethodRegistry) {
     // in JDK 25) NPEs on `takeLock.lock()`.  Gate behind synthetic-jdk only.
     #[cfg(feature = "synthetic-jdk")]
     register_blocking_queue_natives(registry);
+    #[cfg(not(feature = "synthetic-jdk"))]
+    register_linked_blocking_deque_stub_natives(registry);
     register_iterator_protocol_natives(registry);
     // ScheduledThreadPoolExecutor.schedule is implemented in
     // native-builtins `register_p63_scheduled_executor` (scheduled_pump +
@@ -2162,13 +2164,17 @@ fn native_collection_to_array_generator(
 
     // The generator call and the target allocation can move objects already
     // captured in `elems`; pin all element refs and refresh before storing.
+    let inferred_component = elems.iter().find_map(|v| match v {
+        Value::Object(Some(o)) => Some(ctx.class_id_of_object(*o)),
+        _ => None,
+    });
     let (pin_base, elem_handles) = pin_value_slice(ctx, &elems);
     let gen_pin = match generator {
         Value::Object(Some(g)) => Some(ctx.pin_native_root(g)),
         _ => None,
     };
 
-    let target = match generator {
+    let mut target = match generator {
         Value::Object(Some(g)) => {
             let g = gen_pin.map_or(g, |pin| ctx.read_native_pin(pin, g));
             match ctx.invoke_virtual(
@@ -2177,16 +2183,27 @@ fn native_collection_to_array_generator(
                 "(I)Ljava/lang/Object;",
                 &[Value::Int(size as i32)],
             ) {
-                Ok(Some(Value::Object(Some(arr)))) if ctx.array_length(arr) >= size => arr,
-                Ok(Some(Value::Object(Some(arr)))) => {
-                    let comp = ctx.class_id_of_object(arr);
-                    ctx.new_ref_array(comp, size)
-                }
-                _ => alloc_ref_array(ctx, size),
+                Ok(Some(Value::Object(Some(arr)))) if ctx.object_is_array(arr) => arr,
+                _ => inferred_component
+                    .map(|cid| ctx.new_ref_array(cid, size))
+                    .unwrap_or_else(|| alloc_ref_array(ctx, size)),
             }
         }
-        _ => alloc_ref_array(ctx, size),
+        _ => inferred_component
+            .map(|cid| ctx.new_ref_array(cid, size))
+            .unwrap_or_else(|| alloc_ref_array(ctx, size)),
     };
+
+    if ctx.array_length(target) < size {
+        target = if ctx.object_is_array(target) {
+            let comp = ctx.class_id_of_object(target);
+            ctx.new_ref_array(comp, size)
+        } else {
+            inferred_component
+                .map(|cid| ctx.new_ref_array(cid, size))
+                .unwrap_or_else(|| alloc_ref_array(ctx, size))
+        };
+    }
 
     let target_pin = ctx.pin_native_root(target);
     let elems = read_value_slice(ctx, &elem_handles, &elems);
@@ -2195,8 +2212,7 @@ fn native_collection_to_array_generator(
         ctx.set_array_element(target, i, *val);
     }
     let target = ctx.read_native_pin(target_pin, target);
-    let target_len = ctx.array_length(target);
-    if target_len > size {
+    if ctx.array_length(target) > size {
         ctx.set_array_element(target, size, Value::Object(None));
     }
 
@@ -7808,6 +7824,13 @@ fn native_arrays_as_list(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
 const OPT_FIELD_VALUE: usize = 0;
 const OPT_NUM_FIELDS: usize = 1;
 
+fn opt_value_is_empty(value: Value) -> bool {
+    matches!(
+        value,
+        Value::Object(None) | Value::Int(0) | Value::Long(0) | Value::Uninitialized
+    )
+}
+
 // Primitive Optionals (`OptionalInt`/`OptionalLong`/`OptionalDouble`) do NOT
 // share the generic `Optional` layout. The real JDK classes declare
 // `boolean isPresent` first (field 0) and the primitive `value` second
@@ -7980,7 +8003,10 @@ fn native_opt_empty(ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallR
 
 fn native_opt_of(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     match args.first() {
-        Some(Value::Object(None)) | None => {
+        Some(val) if opt_value_is_empty(*val) => {
+            Err(cratonvm_types::error::RuntimeError::NullPointerException { message: None }.into())
+        }
+        None => {
             Err(cratonvm_types::error::RuntimeError::NullPointerException { message: None }.into())
         }
         Some(val) => {
@@ -7994,7 +8020,7 @@ fn native_opt_of(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResul
 fn native_opt_of_nullable(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let val = args.first().copied().unwrap_or(Value::Object(None));
     // Real JDK: `ofNullable(null)` is `empty()` — return the shared singleton.
-    if matches!(val, Value::Object(None)) {
+    if opt_value_is_empty(val) {
         return Ok(Some(opt_empty_singleton(ctx)));
     }
     let opt = alloc_synthetic(ctx, "java/util/Optional", OPT_NUM_FIELDS);
@@ -8009,7 +8035,7 @@ fn native_opt_get(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResu
     };
     let val = ctx.get_field(this, OPT_FIELD_VALUE);
     match val {
-        Value::Object(None) => Err(
+        _ if opt_value_is_empty(val) => Err(
             cratonvm_types::error::RuntimeError::NoSuchElementException {
                 message: "No value present".to_string(),
             }
@@ -8025,7 +8051,7 @@ fn native_opt_is_present(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
         _ => return Ok(Some(Value::Int(0))),
     };
     let val = ctx.get_field(this, OPT_FIELD_VALUE);
-    Ok(Some(Value::Int(if matches!(val, Value::Object(None)) {
+    Ok(Some(Value::Int(if opt_value_is_empty(val) {
         0
     } else {
         1
@@ -8038,7 +8064,7 @@ fn native_opt_is_empty(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCal
         _ => return Ok(Some(Value::Int(1))),
     };
     let val = ctx.get_field(this, OPT_FIELD_VALUE);
-    Ok(Some(Value::Int(if matches!(val, Value::Object(None)) {
+    Ok(Some(Value::Int(if opt_value_is_empty(val) {
         1
     } else {
         0
@@ -8054,12 +8080,11 @@ fn native_opt_or_else(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
         }
     };
     let val = ctx.get_field(this, OPT_FIELD_VALUE);
-    match val {
-        Value::Object(None) => {
-            let default = args.get(1).copied().unwrap_or(Value::Object(None));
-            Ok(Some(default))
-        }
-        _ => Ok(Some(val)),
+    if opt_value_is_empty(val) {
+        let default = args.get(1).copied().unwrap_or(Value::Object(None));
+        Ok(Some(default))
+    } else {
+        Ok(Some(val))
     }
 }
 
@@ -8076,14 +8101,15 @@ fn native_opt_or_else_throw(ctx: &mut dyn NativeContext, args: &[Value]) -> Meth
         }
     };
     let val = ctx.get_field(this, OPT_FIELD_VALUE);
-    match val {
-        Value::Object(None) => Err(
+    if opt_value_is_empty(val) {
+        Err(
             cratonvm_types::error::RuntimeError::NoSuchElementException {
                 message: "No value present".to_string(),
             }
             .into(),
-        ),
-        _ => Ok(Some(val)),
+        )
+    } else {
+        Ok(Some(val))
     }
 }
 
@@ -8126,8 +8152,8 @@ fn opt_value_equals(
     b: Value,
 ) -> Result<bool, MethodCallFailed> {
     match (a, b) {
-        (Value::Object(None), Value::Object(None)) => Ok(true),
-        (Value::Object(None), _) | (_, Value::Object(None)) => Ok(false),
+        (x, y) if opt_value_is_empty(x) && opt_value_is_empty(y) => Ok(true),
+        (x, y) if opt_value_is_empty(x) || opt_value_is_empty(y) => Ok(false),
         (Value::Object(Some(ra)), Value::Object(Some(rb))) => {
             if ra.as_ptr() == rb.as_ptr() {
                 return Ok(true);
@@ -8159,6 +8185,7 @@ fn native_opt_hash_code(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCa
     // `hashCode` rather than returning its identity hash (which made
     // `Optional.hashCode` non-value-based and broke hash-keyed lookups).
     match val {
+        _ if opt_value_is_empty(val) => Ok(Some(Value::Int(0))),
         Value::Object(Some(obj)) => match ctx.invoke_virtual(obj, "hashCode", "()I", &[])? {
             Some(Value::Int(h)) => Ok(Some(Value::Int(h))),
             _ => Ok(Some(Value::Int(0))),
@@ -8177,7 +8204,7 @@ fn native_opt_to_string(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCa
     };
     let val = ctx.get_field(this, OPT_FIELD_VALUE);
     let s = match val {
-        Value::Object(None) => "Optional.empty".to_string(),
+        _ if opt_value_is_empty(val) => "Optional.empty".to_string(),
         _ => {
             let display = obj_to_display_string(ctx, &val);
             format!("Optional[{display}]")
@@ -8570,6 +8597,7 @@ fn register_collections_utility_natives(r: &mut NativeMethodRegistry) {
     let __prev_cat = r.current_category();
     r.set_category(cratonvm_native_api::NativeKind::Bridge);
     let c = "java/util/Collections";
+    r.register(c, "<clinit>", "()V", native_collections_clinit);
     r.register(c, "sort", "(Ljava/util/List;)V", native_collections_sort);
     r.register(
         c,
@@ -8684,11 +8712,56 @@ fn native_collections_sort(ctx: &mut dyn NativeContext, args: &[Value]) -> Metho
 fn collections_empty_singleton(ctx: &mut dyn NativeContext, field: &str) -> Option<Value> {
     let cid = ctx.class_id_by_name("java/util/Collections")?;
     let _ = ctx.ensure_class_initialized("java/util/Collections");
+    let _ = ensure_collections_empty_singletons(ctx);
     let idx = ctx.static_field_index_by_name(cid, field)?;
     match ctx.get_static_field(cid, idx) {
         v @ Value::Object(Some(_)) => Some(v),
         _ => None,
     }
+}
+
+fn native_collections_clinit(ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
+    ensure_collections_empty_singletons(ctx)?;
+    Ok(None)
+}
+
+fn ensure_collections_empty_singletons(
+    ctx: &mut dyn NativeContext,
+) -> Result<(), MethodCallFailed> {
+    let Some(cid) = ctx.class_id_by_name("java/util/Collections") else {
+        return Ok(());
+    };
+
+    if let Some(idx) = ctx.static_field_index_by_name(cid, "EMPTY_LIST") {
+        if !matches!(ctx.get_static_field(cid, idx), Value::Object(Some(_))) {
+            let __al_n_fields = al_slots(ctx).2;
+            let list = alloc_synthetic(ctx, "java/util/ArrayList", __al_n_fields);
+            let arr = alloc_ref_array(ctx, 0);
+            al_set_data(ctx, list, arr);
+            al_set_size(ctx, list, 0);
+            ctx.set_static_field(cid, idx, Value::Object(Some(list)));
+        }
+    }
+
+    if let Some(idx) = ctx.static_field_index_by_name(cid, "EMPTY_MAP") {
+        if !matches!(ctx.get_static_field(cid, idx), Value::Object(Some(_))) {
+            let map = alloc_backing_map(ctx);
+            native_map_init(ctx, &[Value::Object(Some(map))])?;
+            ctx.set_static_field(cid, idx, Value::Object(Some(map)));
+        }
+    }
+
+    if let Some(idx) = ctx.static_field_index_by_name(cid, "EMPTY_SET") {
+        if !matches!(ctx.get_static_field(cid, idx), Value::Object(Some(_))) {
+            let set = alloc_synthetic(ctx, "java/util/HashSet", HS_NUM_FIELDS);
+            let inner_map = alloc_backing_map(ctx);
+            native_map_init(ctx, &[Value::Object(Some(inner_map))])?;
+            ctx.set_field(set, HS_FIELD_MAP, Value::Object(Some(inner_map)));
+            ctx.set_static_field(cid, idx, Value::Object(Some(set)));
+        }
+    }
+
+    Ok(())
 }
 
 fn native_collections_empty_list(ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
@@ -8941,7 +9014,7 @@ fn native_opt_if_present(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
         _ => return Ok(None),
     };
     let val = ctx.get_field(this, OPT_FIELD_VALUE);
-    if !matches!(val, Value::Object(None)) {
+    if !opt_value_is_empty(val) {
         ctx.invoke_virtual(action, "accept", "(Ljava/lang/Object;)V", &[val])?;
     }
     Ok(None)
@@ -8954,10 +9027,18 @@ fn native_opt_map(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResu
     };
     let mapper = match args.get(1) {
         Some(Value::Object(Some(r))) => *r,
-        _ => return native_opt_empty(ctx, &[]),
+        _ => {
+            // Missing invokedynamic lambda during fake-JDK bootstrap: preserve
+            // a present value instead of turning Optional.map into empty.
+            let val = ctx.get_field(this, OPT_FIELD_VALUE);
+            if opt_value_is_empty(val) {
+                return native_opt_empty(ctx, &[]);
+            }
+            return Ok(Some(Value::Object(Some(this))));
+        }
     };
     let val = ctx.get_field(this, OPT_FIELD_VALUE);
-    if matches!(val, Value::Object(None)) {
+    if opt_value_is_empty(val) {
         return native_opt_empty(ctx, &[]);
     }
     let result = ctx.invoke_virtual(
@@ -8980,7 +9061,7 @@ fn native_opt_flat_map(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCal
         _ => return native_opt_empty(ctx, &[]),
     };
     let val = ctx.get_field(this, OPT_FIELD_VALUE);
-    if matches!(val, Value::Object(None)) {
+    if opt_value_is_empty(val) {
         return native_opt_empty(ctx, &[]);
     }
     let result = ctx.invoke_virtual(
@@ -9000,10 +9081,11 @@ fn native_opt_filter(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallR
     };
     let predicate = match args.get(1) {
         Some(Value::Object(Some(r))) => *r,
-        _ => return native_opt_empty(ctx, &[]),
+        // Missing invokedynamic predicate: keep the Optional unfiltered.
+        _ => return Ok(Some(Value::Object(Some(this)))),
     };
     let val = ctx.get_field(this, OPT_FIELD_VALUE);
-    if matches!(val, Value::Object(None)) {
+    if opt_value_is_empty(val) {
         return native_opt_empty(ctx, &[]);
     }
     let result = ctx.invoke_virtual(predicate, "test", "(Ljava/lang/Object;)Z", &[val])?;
@@ -9029,7 +9111,7 @@ fn native_opt_or_else_get(ctx: &mut dyn NativeContext, args: &[Value]) -> Method
         }
     };
     let val = ctx.get_field(this, OPT_FIELD_VALUE);
-    if matches!(val, Value::Object(None)) {
+    if opt_value_is_empty(val) {
         let supplier = match args.get(1) {
             Some(Value::Object(Some(r))) => *r,
             _ => return Ok(Some(Value::Object(None))),
@@ -9046,7 +9128,7 @@ fn native_opt_if_present_or_else(ctx: &mut dyn NativeContext, args: &[Value]) ->
         _ => return Ok(None),
     };
     let val = ctx.get_field(this, OPT_FIELD_VALUE);
-    if !matches!(val, Value::Object(None)) {
+    if !opt_value_is_empty(val) {
         let consumer = match args.get(1) {
             Some(Value::Object(Some(r))) => *r,
             _ => return Ok(None),
@@ -9075,7 +9157,7 @@ fn native_opt_or(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResul
         }
     };
     let val = ctx.get_field(this, OPT_FIELD_VALUE);
-    if matches!(val, Value::Object(None)) {
+    if opt_value_is_empty(val) {
         let supplier = match args.get(1) {
             Some(Value::Object(Some(r))) => *r,
             _ => return native_opt_empty(ctx, &[]),
@@ -9092,7 +9174,7 @@ fn native_opt_stream(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallR
         _ => return make_stream(ctx, &[]),
     };
     let val = ctx.get_field(this, OPT_FIELD_VALUE);
-    if matches!(val, Value::Object(None)) {
+    if opt_value_is_empty(val) {
         make_stream(ctx, &[])
     } else {
         make_stream(ctx, &[val])
@@ -9115,7 +9197,7 @@ fn native_opt_or_else_throw_supplier(
         }
     };
     let val = ctx.get_field(this, OPT_FIELD_VALUE);
-    if matches!(val, Value::Object(None)) {
+    if opt_value_is_empty(val) {
         // Empty Optional → `throw exceptionSupplier.get()` (NOT the default
         // NoSuchElementException). The previous code ignored the supplier and
         // always threw "No value present", so callers relying on a custom
@@ -18153,9 +18235,12 @@ const SJ_FIELD_PREFIX: usize = 1;
 const SJ_FIELD_SUFFIX: usize = 2;
 const SJ_FIELD_ELEMENTS: usize = 3;
 const SJ_FIELD_EMPTY_VALUE: usize = 4;
-fn register_string_joiner_natives(registry: &mut NativeMethodRegistry) {
+fn register_string_joiner_natives_with_category(
+    registry: &mut NativeMethodRegistry,
+    kind: cratonvm_native_api::NativeKind,
+) {
     let __prev_cat = registry.current_category();
-    registry.set_category(cratonvm_native_api::NativeKind::Bridge);
+    registry.set_category(kind);
     registry.register(
         "java/util/StringJoiner",
         "<init>",
@@ -18194,6 +18279,24 @@ fn register_string_joiner_natives(registry: &mut NativeMethodRegistry) {
         native_sj_set_empty_value,
     );
     registry.set_category(__prev_cat);
+}
+
+fn register_string_joiner_natives(registry: &mut NativeMethodRegistry) {
+    register_string_joiner_natives_with_category(
+        registry,
+        cratonvm_native_api::NativeKind::Bridge,
+    );
+}
+
+/// Register the synthetic StringJoiner fallback surface without stealing real
+/// JDK bytecode. Real-JDK mode drops the Bridge registrar above because its
+/// field layout corrupts a real StringJoiner, but synthetic fallback classes
+/// still need these methods when no real bytecode exists.
+pub fn register_string_joiner_stub_natives(registry: &mut NativeMethodRegistry) {
+    register_string_joiner_natives_with_category(
+        registry,
+        cratonvm_native_api::NativeKind::SyntheticStub,
+    );
 }
 
 fn native_sj_init_delim(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
@@ -33111,6 +33214,38 @@ fn register_blocking_queue_natives(r: &mut NativeMethodRegistry) {
 // `Collections.synchronizedQueue(queue)`, so semantically identical from
 // the bytecode side. NOT lock-free in the throughput sense; treat as a
 // correctness-only stopgap until a real Michael-Scott port lands.
+
+#[cfg(not(feature = "synthetic-jdk"))]
+fn register_linked_blocking_deque_stub_natives(r: &mut NativeMethodRegistry) {
+    let __prev_cat = r.current_category();
+    r.set_category(cratonvm_native_api::NativeKind::SyntheticStub);
+    let lbd = "java/util/concurrent/LinkedBlockingDeque";
+    r.register(lbd, "<init>", "()V", native_lbq_init);
+    r.register(lbd, "offer", "(Ljava/lang/Object;)Z", native_clq_offer);
+    r.register(lbd, "add", "(Ljava/lang/Object;)Z", native_clq_offer);
+    r.register(
+        lbd,
+        "offerFirst",
+        "(Ljava/lang/Object;)Z",
+        native_cld_offer_first,
+    );
+    r.register(lbd, "offerLast", "(Ljava/lang/Object;)Z", native_clq_offer);
+    r.register(lbd, "poll", "()Ljava/lang/Object;", native_clq_poll);
+    r.register(lbd, "pollFirst", "()Ljava/lang/Object;", native_clq_poll);
+    r.register(lbd, "pollLast", "()Ljava/lang/Object;", native_cld_poll_last);
+    r.register(lbd, "peek", "()Ljava/lang/Object;", native_clq_peek);
+    r.register(lbd, "peekFirst", "()Ljava/lang/Object;", native_clq_peek);
+    r.register(lbd, "peekLast", "()Ljava/lang/Object;", native_cld_peek_last);
+    r.register(lbd, "size", "()I", native_lbq_size);
+    r.register(lbd, "isEmpty", "()Z", native_lbq_is_empty);
+    r.register(
+        lbd,
+        "iterator",
+        "()Ljava/util/Iterator;",
+        native_lbq_iterator,
+    );
+    r.set_category(__prev_cat);
+}
 
 fn native_clq_offer(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let Some(Value::Object(Some(this))) = args.first().copied() else {

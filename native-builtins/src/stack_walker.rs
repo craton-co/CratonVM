@@ -288,10 +288,32 @@ pub(crate) fn native_get_caller_class(
     Ok(Some(Value::Object(None)))
 }
 
+fn native_option_clinit(ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
+    for name in [
+        "RETAIN_CLASS_REFERENCE",
+        "SHOW_HIDDEN_FRAMES",
+        "SHOW_REFLECT_FRAMES",
+    ] {
+        let option = alloc_concurrent_synthetic(ctx, "java/lang/StackWalker$Option", 0);
+        ctx.set_static_field_by_name(
+            "java/lang/StackWalker$Option",
+            name,
+            Value::Object(Some(option)),
+        );
+    }
+    Ok(None)
+}
+
 /// Install every StackWalker boot-path native this module owns.
 pub fn register_stack_walker_boot(registry: &mut NativeMethodRegistry) {
     let __prev_cat = registry.current_category();
     registry.set_category(cratonvm_native_api::NativeKind::Bridge);
+    registry.register(
+        "java/lang/StackWalker$Option",
+        "<clinit>",
+        "()V",
+        native_option_clinit,
+    );
     let sw = "java/lang/StackWalker";
     registry.register(
         sw,

@@ -12181,7 +12181,36 @@ fn execute_instruction(
                 }
             } else {
                 ensure_class_initialized_shared(shared, thread, field.declaring_class_id)?;
-                let value = get_static_shared(shared, field.declaring_class_id, field.field_index);
+                let mut value = get_static_shared(shared, field.declaring_class_id, field.field_index);
+                if matches!(value, Value::Object(None)) {
+                    let boolean_const = {
+                        let cm = shared.class_manager.read();
+                        cm.get_class(field.declaring_class_id)
+                            .filter(|c| &*c.name == "java/lang/Boolean")
+                            .and_then(|c| {
+                                let mut static_idx = 0usize;
+                                for f in &c.fields {
+                                    if f.is_static() {
+                                        if static_idx == field.field_index {
+                                            return match &*f.name {
+                                                "TRUE" => Some(true),
+                                                "FALSE" => Some(false),
+                                                _ => None,
+                                            };
+                                        }
+                                        static_idx += 1;
+                                    }
+                                }
+                                None
+                            })
+                    };
+                    if let Some(b) = boolean_const {
+                        let obj = gc_alloc_object(shared, thread, field.declaring_class_id, 1)?;
+                        shared.heap.set_field(obj, 0, Value::Int(i32::from(b)));
+                        value = Value::Object(Some(obj));
+                        set_static_shared(shared, field.declaring_class_id, field.field_index, value);
+                    }
+                }
                 if field.is_volatile {
                     std::sync::atomic::fence(std::sync::atomic::Ordering::SeqCst);
                 }
@@ -12599,7 +12628,9 @@ fn execute_instruction(
                     // Same jobject-as-Long contract as `astore` / `coerce_value_for_return`
                     // in vm_exec: invoke returns can sit on the stack as compact long bits.
                     match desc_byte {
-                        Some(d @ (b'L' | b'[')) => coerce_value_for_return(v, d),
+                        Some(d @ (b'L' | b'[')) => {
+                            coerce_value_for_return_validated(shared, v, d)
+                        }
                         // JVMS putfield: narrow the popped int to the field's
                         // declared sub-int width (byte/boolean/char/short) before
                         // storing, so a wide int producer can't leave out-of-range
@@ -20588,6 +20619,22 @@ fn force_native_over_real_jdk_bytecode(
     {
         return true;
     }
+    // `ServerSocket.getLocalSocketAddress()` is pure Java in the real JDK:
+    // it calls `getInetAddress()` and then constructs an InetSocketAddress.
+    // CratonVM's real ServerSocket instances carry their live listener state
+    // in native side-tables / synthetic slots, while some real SocketImpl
+    // fields remain unpopulated. Force the registered natives for these
+    // accessors so WildFly's process controller sees a resolved bound address
+    // instead of `/0.0.0.0:PORT` with a null InetAddress.
+    if class_name == "java/net/ServerSocket"
+        && matches!(
+            (method_name, method_descriptor),
+            ("getInetAddress", "()Ljava/net/InetAddress;")
+                | ("getLocalSocketAddress", "()Ljava/net/SocketAddress;")
+        )
+    {
+        return true;
+    }
     // FFM layout factories: JDK 25's real `MemoryLayout.sequenceLayout` runs
     // through `jdk/internal/foreign/Utils` while `SharedUtils.<clinit>` is still
     // building its `C_POINTER` constant. That circular path re-enters
@@ -21667,7 +21714,7 @@ fn intercept_urlclassloader_subclass_find_class(
     let ret_type = crate::jit::return_type(method_descriptor);
     Some((|| {
         let result = crate::vm::safe_native_call(shared, thread, cb, args)?;
-        if let Some(value) = result {
+        if let Some(value) = result.filter(|_| ret_type != b'V') {
             push_invoke_return_value(
                 &mut thread.frames[frame_idx].stack,
                 coerce_value_for_return(value, ret_type),
@@ -21840,7 +21887,7 @@ fn try_stackless_invoke(
                 .find("java/lang/reflect/Constructor", method_name, descriptor)
         {
             let result = safe_native_call(shared, thread, callback, args)?;
-            if let Some(value) = result {
+            if let Some(value) = result.filter(|_| ret_type != b'V') {
                 push_invoke_return_value(
                     &mut thread.frames[frame_idx].stack,
                     coerce_value_for_return(value, ret_type),
@@ -21974,15 +22021,17 @@ fn try_stackless_invoke(
                     class_name, method_name, descriptor, value
                 );
             }
-            // T18.K4 — tag-exact push for J/D native-override return values.
-            // `coerce_value_for_return` may widen/narrow the type-erased
-            // native result; we then push via the category-2 aware path so
-            // J/D retain their bits across the operand-stack boundary.
-            push_invoke_return_value(
-                &mut thread.frames[frame_idx].stack,
-                coerce_value_for_return(value, ret_type),
-            )?;
-            native_return_pushed_to_stack(shared, thread);
+            if ret_type != b'V' {
+                // T18.K4 — tag-exact push for J/D native-override return values.
+                // `coerce_value_for_return` may widen/narrow the type-erased
+                // native result; we then push via the category-2 aware path so
+                // J/D retain their bits across the operand-stack boundary.
+                push_invoke_return_value(
+                    &mut thread.frames[frame_idx].stack,
+                    coerce_value_for_return(value, ret_type),
+                )?;
+                native_return_pushed_to_stack(shared, thread);
+            }
         }
         if crate::runtime::env_cache::resume_pc_dbg() && method_name == "enhance" {
             let f = &thread.frames[frame_idx];
@@ -22054,7 +22103,7 @@ fn try_stackless_invoke(
             .find(&declaring_name, method_name, descriptor)
         {
             let result = safe_native_call(shared, thread, callback, args)?;
-            if let Some(value) = result {
+            if let Some(value) = result.filter(|_| ret_type != b'V') {
                 // T18.K4 — tag-exact push for J/D native-bytecode method return values.
                 push_invoke_return_value(
                     &mut thread.frames[frame_idx].stack,
@@ -22122,7 +22171,7 @@ fn try_stackless_invoke(
             .find(&class_name_arc, method_name, descriptor)
         {
             let result = safe_native_call(shared, thread, callback, args)?;
-            if let Some(value) = result {
+            if let Some(value) = result.filter(|_| ret_type != b'V') {
                 // T18.K4 — tag-exact push for J/D native-override (on bytecode method) return values.
                 push_invoke_return_value(
                     &mut thread.frames[frame_idx].stack,
@@ -22615,19 +22664,17 @@ fn execute_invokestatic(
     };
     if let Some(value) = result {
         let ret = crate::jit::return_type(&method_descriptor);
-        let value = if ret != b'V' {
-            coerce_value_for_return(value, ret)
-        } else {
-            value
-        };
-        // T18.K4 — tag-exact push for J/D fallback invokestatic return values.
-        push_invoke_return_value(&mut thread.frames[frame_idx].stack, value)?;
-        // Hypothesis (b): symmetric clear-after-push for the slow invokestatic
-        // path. `invoke_or_native` may recursively run `safe_native_call` which
-        // pins the object return in `thread.native_pending_return`; without
-        // this clear, the field outlives the call site and `update_root_snapshot`
-        // re-roots a stale (already-popped) ObjectRef across GC.
-        crate::vm::native_return_pushed_to_stack(shared, thread);
+        if ret != b'V' {
+            let value = coerce_value_for_return(value, ret);
+            // T18.K4 — tag-exact push for J/D fallback invokestatic return values.
+            push_invoke_return_value(&mut thread.frames[frame_idx].stack, value)?;
+            // Hypothesis (b): symmetric clear-after-push for the slow invokestatic
+            // path. `invoke_or_native` may recursively run `safe_native_call` which
+            // pins the object return in `thread.native_pending_return`; without
+            // this clear, the field outlives the call site and `update_root_snapshot`
+            // re-roots a stale (already-popped) ObjectRef across GC.
+            crate::vm::native_return_pushed_to_stack(shared, thread);
+        }
     }
 
     // Populate invoke cache for future fast-path hits
@@ -22678,12 +22725,8 @@ fn invoke_cached_intrinsic(
 ) -> Result<(), MethodCallFailed> {
     INTRINSIC_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let result = crate::vm::safe_native_call(shared, thread, callback, args)?;
-    if let Some(value) = result {
-        let value = if return_type != b'V' {
-            coerce_value_for_return(value, return_type)
-        } else {
-            value
-        };
+    if let Some(value) = result.filter(|_| return_type != b'V') {
+        let value = coerce_value_for_return(value, return_type);
         push_invoke_return_value(&mut thread.frames[frame_idx].stack, value)?;
         crate::vm::native_return_pushed_to_stack(shared, thread);
     }

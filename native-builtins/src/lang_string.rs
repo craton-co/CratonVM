@@ -3762,6 +3762,47 @@ pub(crate) fn native_string_join(ctx: &mut dyn NativeContext, args: &[Value]) ->
     Ok(Some(Value::Object(Some(ctx.create_string(&joined)))))
 }
 
+pub(crate) fn native_string_join_iterable(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    let delim = match args.first() {
+        Some(Value::Object(Some(obj))) => ctx.read_string(*obj).unwrap_or_default(),
+        _ => String::new(),
+    };
+    let iterable = match args.get(1) {
+        Some(Value::Object(Some(obj))) => *obj,
+        _ => return Ok(Some(Value::Object(Some(ctx.create_string(""))))),
+    };
+    let iterator = match ctx.invoke_virtual(iterable, "iterator", "()Ljava/util/Iterator;", &[])? {
+        Some(Value::Object(Some(obj))) => obj,
+        _ => return Ok(Some(Value::Object(Some(ctx.create_string(""))))),
+    };
+    let iterator_pin = ctx.pin_native_root(iterator);
+    let mut parts = Vec::new();
+    for _ in 0..1_000_000 {
+        let iterator = ctx.read_native_pin(iterator_pin, iterator);
+        let has_next = match ctx.invoke_virtual(iterator, "hasNext", "()Z", &[])? {
+            Some(Value::Int(v)) => v != 0,
+            _ => false,
+        };
+        if !has_next {
+            break;
+        }
+        let iterator = ctx.read_native_pin(iterator_pin, iterator);
+        let elem = ctx.invoke_virtual(iterator, "next", "()Ljava/lang/Object;", &[])?;
+        let text = match elem {
+            Some(Value::Object(Some(obj))) => invoke_to_string(ctx, obj)?,
+            Some(Value::Object(None)) | None => "null".to_string(),
+            _ => "null".to_string(),
+        };
+        parts.push(text);
+    }
+    ctx.unpin_native_roots(iterator_pin);
+    let joined = parts.join(&delim);
+    Ok(Some(Value::Object(Some(ctx.create_string(&joined)))))
+}
+
 pub(crate) fn native_string_replace_all(
     ctx: &mut dyn NativeContext,
     args: &[Value],
