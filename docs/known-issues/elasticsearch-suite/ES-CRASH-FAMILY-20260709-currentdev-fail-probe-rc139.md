@@ -1,6 +1,9 @@
 # ES CRASH family - current-dev fail-probe representatives exit 139
 
-Status: OPEN
+Status: RESOLVED (crash family) — see 2026-07-09 verification update below.
+The `rc=139` crash family described here is fixed; the doc is kept for
+history and because the ES suite is still far from green (new blockers
+found during verification, see below).
 
 Update (2026-07-09):
 - The rc=139 crash surface is now known to be triggered by Panama synthetic layout mismatches in two fallback paths:
@@ -61,3 +64,55 @@ Old-HANG rerun update:
 - Timeout: 1500 seconds.
 - Result: 10 CRASH, 0 HANG.
 - All ten old-HANG classes now exit rc=139 before the long timeout matters.
+
+## 2026-07-09 verification update — rc=139 crash family RESOLVED
+
+The `es-nonpassed-currentdev-20260709-082115` run above started at
+08:21:15, **before** the `MemoryLayout.varHandle` fix in commit `9494a0a5`
+landed on `dev` (09:17:23 the same day) — its 2640 rc=139 crash count is
+stale.
+
+Rebuilding from current `dev` and re-verifying surfaced two more bugs the
+varHandle crash had been masking end-to-end (both now fixed, see
+`docs/internal/fixed-suite-bugs/enummap-realmode-corruption-and-stackwalker-frame-order-FIXED.md`):
+
+1. `EnumMap.<init>` corrupting real-JDK objects (every `EnumMap.put()`
+   threw `ClassCastException`, hit via
+   `com.carrotsearch.randomizedtesting.Threads.<clinit>` on every JUnit run).
+2. `StackWalker.walk()`/`forEach()` handing callers stack frames in
+   reversed order, breaking Lucene's `TestSecrets.ensureCaller()` caller
+   check (`UnsupportedOperationException: Lucene TestSecrets can only be
+   used by the test-framework.`), hit by ~97% of a 99-class worst-offender
+   probe once bug 1 was fixed.
+
+With both fixed, a full rerun of the exact same 2649-class `others.tsv`
+selection (run `es-fullrerun-fixed-20260709-211207`, same JIT-on / 120s
+timeout / 4-shard config, binary built from `dev` merge `528fde12`):
+
+- **0** `rc=139` crashes (down from 2640).
+- 2646 FAIL, 2 HANG, 2648/2649 rows collected (1 class,
+  `server org.elasticsearch.persistent.PersistentTasksClusterServiceTests`,
+  is missing from the aggregated results — likely a concurrent-write drop
+  from running 4 shards against one shared `results.tsv`; not
+  investigated, rerun it standalone before trusting a future full count).
+- The 2 HANG rows are `client/rest RestClientGzipCompressionTests` and
+  `client/rest RestClientSingleHostIntegTests` — both **PASSED** in the
+  stale 08:21:15 baseline, so this looks like a newly-exposed (not newly
+  introduced) timing/network bug, same "next layer" pattern as the two
+  bugs above. Not investigated further this session.
+- The FAIL rows are now dominated by a **different, already-tracked**
+  bug: `EnumSet.allOf`/`EnumSet.of` returns a broken object (`size()==0`,
+  `iterator()==null`, `toString()` falls through to `Object@hash`) for
+  non-JDK enums, hit via `org.apache.logging.log4j.Level.<clinit>` at
+  logging bootstrap in nearly every class. See
+  `docs/known-issues/enumset-of-broken-for-non-jdk-enums.md` (already open
+  before this session, root-caused by a concurrent session against a
+  narrower Tomcat repro) — this session's full-suite rerun confirms it is
+  now the dominant ES-suite blocker and adds a new symptom (`toString()`
+  falling through to `Object.toString()`, not just empty size/null
+  iterator) to that doc.
+
+No full non-passed rerun was re-selected against the *current* `dev` HEAD
+(others.tsv reused the original 2649-class list) — once `EnumSet` is
+fixed, a fresh `-RefreshLists` run against current `dev` is worth doing
+since the PASS/FAIL boundary has likely shifted again.
