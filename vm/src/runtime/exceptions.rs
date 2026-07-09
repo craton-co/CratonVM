@@ -947,6 +947,8 @@ pub fn create_exception_object(
                 })?
         }
     };
+    let pin_base = thread.native_pin_roots.len();
+    thread.native_pin_roots.push(obj_ref);
 
     // 3. Call the constructor
     // Try (Ljava/lang/String;)V if we have a message, otherwise ()V
@@ -960,14 +962,19 @@ pub fn create_exception_object(
         // does not allocate a Java object, so the message string is the only
         // remaining abort point.)
         let Some(string_ref) = try_create_java_string(shared, msg) else {
+            thread.native_pin_roots.truncate(pin_base);
             return Err(MethodCallFailed::InternalError(VmError::Runtime(
                 RuntimeError::OutOfMemoryError {
                     message: "Java heap space".to_string(),
                 },
             )));
         };
+        let string_pin = thread.native_pin_roots.len();
+        thread.native_pin_roots.push(string_ref);
 
         // Try calling (Ljava/lang/String;)V constructor first
+        let obj_ref = thread.native_pin_roots[pin_base];
+        let string_ref = thread.native_pin_roots[string_pin];
         let init_result = invoke_on_class_shared(
             shared,
             thread,
@@ -987,6 +994,7 @@ pub fn create_exception_object(
                 // manually set detailMessage. Resolve by name so we hit the
                 // real-JDK Throwable layout slot (slot 1, after backtrace),
                 // not slot 0 (which is `backtrace`, an internal Object ref).
+                let obj_ref = thread.native_pin_roots[pin_base];
                 let _ = invoke_on_class_shared(
                     shared,
                     thread,
@@ -995,15 +1003,20 @@ pub fn create_exception_object(
                     "()V",
                     &[Value::Object(Some(obj_ref))],
                 );
+                let obj_ref = thread.native_pin_roots[pin_base];
+                let string_ref = thread.native_pin_roots[string_pin];
                 set_detail_message_by_name(shared, obj_ref, string_ref);
             }
             Err(MethodCallFailed::ExceptionThrown(_)) => {
+                let obj_ref = thread.native_pin_roots[pin_base];
+                let string_ref = thread.native_pin_roots[string_pin];
                 // Constructor threw — still set the message field manually
                 // by name so we honour the real-JDK Throwable layout.
                 set_detail_message_by_name(shared, obj_ref, string_ref);
             }
         }
     } else {
+        let obj_ref = thread.native_pin_roots[pin_base];
         let init_result = invoke_on_class_shared(
             shared,
             thread,
@@ -1020,6 +1033,7 @@ pub fn create_exception_object(
     // 4. Call fillInStackTrace
     // This is done automatically by the Throwable constructor in most JDK versions,
     // but we call it explicitly just in case.
+    let obj_ref = thread.native_pin_roots[pin_base];
     let _ = invoke_on_class_shared(
         shared,
         thread,
@@ -1029,6 +1043,8 @@ pub fn create_exception_object(
         &[Value::Object(Some(obj_ref)), Value::Int(0)],
     );
 
+    let obj_ref = thread.native_pin_roots[pin_base];
+    thread.native_pin_roots.truncate(pin_base);
     Ok(obj_ref)
 }
 
@@ -1779,6 +1795,25 @@ mod tests {
             result,
             MethodCallFailed::InternalError(_) | MethodCallFailed::ExceptionThrown(_)
         ));
+    }
+
+    #[test]
+    fn throw_runtime_error_releases_exception_construction_pins() {
+        let mut vm = test_vm();
+        let pin_base = vm.main_thread.native_pin_roots.len();
+        let error = RuntimeError::IOException {
+            message: "read error".to_string(),
+        };
+        let result = throw_runtime_error(&vm.shared, &mut vm.main_thread, error);
+        assert!(matches!(
+            result,
+            MethodCallFailed::InternalError(_) | MethodCallFailed::ExceptionThrown(_)
+        ));
+        assert_eq!(
+            vm.main_thread.native_pin_roots.len(),
+            pin_base,
+            "exception construction pins must not leak after throw_runtime_error returns"
+        );
     }
 
     #[test]

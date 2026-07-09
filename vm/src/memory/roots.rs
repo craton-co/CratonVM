@@ -146,8 +146,9 @@ pub fn collect_roots(shared: &SharedVm, thread: &JvmThread) -> Vec<ObjectRef> {
         roots.push(*obj_ref);
     }
 
-    // 4c. Native return in flight — object result after `safe_native_call`
-    //     returns but before the interpreter pushes it onto the operand stack.
+    // 4c. Native object in flight — object return before the interpreter pushes
+    //     it onto the operand stack, or native-thrown exception before it is
+    //     routed into a Java handler / uncaught dispatch.
     if let Some(obj_ref) = thread.native_pending_return {
         roots.push(obj_ref);
     }

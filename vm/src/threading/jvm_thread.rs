@@ -353,9 +353,10 @@ pub struct JvmThread {
     /// `enhance` returns the original `Class`).
     pub native_pin_roots: Vec<ObjectRef>,
 
-    /// Object return value from the last `safe_native_call` that returned
-    /// `Ok(Some(Value::Object(..)))`, kept alive until the interpreter pushes it
-    /// onto the operand stack (cross-thread GC window after the call returns).
+    /// Object result from the last `safe_native_call`: either an object return
+    /// value before the interpreter pushes it onto the operand stack, or a
+    /// native-thrown Java exception before the interpreter routes it through a
+    /// catch handler. Covers the cross-thread GC window after the call returns.
     pub native_pending_return: Option<ObjectRef>,
 
     /// Thread-local invoke cache — maps (caller_class, cp_index) to resolved targets.

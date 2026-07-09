@@ -5705,6 +5705,56 @@ fn execute_frame(shared: &SharedVm, thread: &mut JvmThread) -> MethodCallResult 
     // stack at most once when the watchdog flag is sticky-true.
     let mut stack_dump_emitted = false;
     loop {
+        // Route callee-thrown Java exceptions before the safepoint poll below.
+        // `pending_java_exception` is only a Rust local between the callee's
+        // return and this block; it is not present in any GC-scanned frame slot
+        // yet. Polling first can let STW reclaim the Throwable before a caller
+        // catch handler stores it.
+        if let Some((exc, invoke_pc)) = pending_java_exception.take() {
+            let mut exc_pc = invoke_pc;
+            // GC-root gap: this loop can pop MANY frames while searching for a
+            // handler (unwinding all the way out of the method if none is
+            // found), and `find_exception_handler` -> `find_exception_handler_impl`
+            // lazily loads an unresolved catch-type class on a cache miss
+            // (`load_class_concurrent`, which runs <clinit> and can allocate/
+            // trigger a GC). Once a frame is popped it no longer roots the
+            // propagating exception, and nothing else does until a handler is
+            // found (pushed onto a frame's stack) or the method returns it as
+            // an Err - pin it in `native_pin_roots` for the whole walk so a GC
+            // mid-unwind can't reclaim it.
+            let pin_base = thread.native_pin_roots.len();
+            thread.native_pin_roots.push(exc);
+            loop {
+                let current_exc = thread.native_pin_roots[pin_base];
+                match find_exception_handler(shared, &thread.frames[frame_idx], exc_pc, current_exc)
+                {
+                    Some((handler_pc, exc_ref)) => {
+                        thread.frames[frame_idx].stack.clear();
+                        thread.frames[frame_idx]
+                            .stack
+                            .push(Value::Object(Some(exc_ref)))
+                            .map_err(|e| MethodCallFailed::InternalError(VmError::Runtime(e)))?;
+                        thread.frames[frame_idx].pc = handler_pc;
+                        fire_jvmti_exception_catch(&thread.frames[frame_idx], handler_pc);
+                        thread.native_pin_roots.truncate(pin_base);
+                        break;
+                    }
+                    None => {
+                        if frame_idx > initial_frame_idx {
+                            pop_and_recycle_frame_with_reason(shared, thread, true);
+                            frame_idx -= 1;
+                            exc_pc = thread.frames[frame_idx].last_instr_pc;
+                        } else {
+                            let current_exc = thread.native_pin_roots[pin_base];
+                            thread.native_pin_roots.truncate(pin_base);
+                            return Err(MethodCallFailed::ExceptionThrown(current_exc));
+                        }
+                    }
+                }
+            }
+            continue;
+        }
+
         // T19.H1 — opportunistic stack-dump hook.
         //
         // When the CLI watchdog fires (`--stack-dump-on-timeout=N`), it sets
@@ -5741,55 +5791,6 @@ fn execute_frame(shared: &SharedVm, thread: &mut JvmThread) -> MethodCallResult 
             .load(std::sync::atomic::Ordering::Acquire)
         {
             safepoint_check(shared, thread);
-        }
-
-        // Handle any pending Java exception from a previous invoke (e.g. JIT dispatch).
-        if let Some((exc, invoke_pc)) = pending_java_exception.take() {
-            let mut exc_pc = invoke_pc;
-            // GC-root gap: this loop can pop MANY frames while searching for a
-            // handler (unwinding all the way out of the method if none is
-            // found), and `find_exception_handler` -> `find_exception_handler_impl`
-            // lazily loads an unresolved catch-type class on a cache miss
-            // (`load_class_concurrent`, which runs <clinit> and can allocate/
-            // trigger a GC). Once a frame is popped it no longer roots the
-            // propagating exception, and nothing else does until a handler is
-            // found (pushed onto a frame's stack) or the method returns it as
-            // an Err — pin it in `native_pin_roots` for the whole walk so a GC
-            // mid-unwind can't reclaim it (observed: an uncaught exception
-            // propagating out of a thread's run() corrupted before
-            // dispatchUncaughtException/printStackTrace ever saw it).
-            let pin_base = thread.native_pin_roots.len();
-            thread.native_pin_roots.push(exc);
-            loop {
-                let current_exc = thread.native_pin_roots[pin_base];
-                match find_exception_handler(shared, &thread.frames[frame_idx], exc_pc, current_exc)
-                {
-                    Some((handler_pc, exc_ref)) => {
-                        thread.frames[frame_idx].stack.clear();
-                        thread.frames[frame_idx]
-                            .stack
-                            .push(Value::Object(Some(exc_ref)))
-                            .map_err(|e| MethodCallFailed::InternalError(VmError::Runtime(e)))?;
-                        thread.frames[frame_idx].pc = handler_pc;
-                        fire_jvmti_exception_catch(&thread.frames[frame_idx], handler_pc);
-                        thread.native_pin_roots.truncate(pin_base);
-                        break;
-                    }
-                    None => {
-                        if frame_idx > initial_frame_idx {
-                            // T17.Δ — exception-unwind of this frame.
-                            pop_and_recycle_frame_with_reason(shared, thread, true);
-                            frame_idx -= 1;
-                            exc_pc = thread.frames[frame_idx].last_instr_pc;
-                        } else {
-                            let current_exc = thread.native_pin_roots[pin_base];
-                            thread.native_pin_roots.truncate(pin_base);
-                            return Err(MethodCallFailed::ExceptionThrown(current_exc));
-                        }
-                    }
-                }
-            }
-            continue;
         }
 
         // Handle any pending runtime error from the previous iteration's fast path.
@@ -8304,6 +8305,7 @@ fn execute_frame(shared: &SharedVm, thread: &mut JvmThread) -> MethodCallResult 
                 return Err(MethodCallFailed::InternalError(e));
             }
             Err(MethodCallFailed::ExceptionThrown(exc)) => {
+                let exc = thread.native_pending_return.take().unwrap_or(exc);
                 // Try to find handler, unwinding through stackless frames
                 // GC-root gap: see the pin in the `pending_java_exception` arm
                 // earlier in this function — same
