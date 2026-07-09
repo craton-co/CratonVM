@@ -1017,7 +1017,7 @@ fn huc_upcall_create_socket_if_custom_factory(
         Some(Value::Object(Some(s))) => s,
         _ => return Ok(None),
     };
-    let stream_id = crate::net_phase_e::sock_stream_id_for_upcall(socket);
+    let stream_id = crate::net_phase_e::sock_stream_id_for_upcall(ctx, socket);
     if stream_id < 0 {
         return Ok(None);
     }
