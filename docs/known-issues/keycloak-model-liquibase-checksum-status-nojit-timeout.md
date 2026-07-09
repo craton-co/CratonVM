@@ -1,51 +1,56 @@
-# RealmModelTest no-JIT timeout in Liquibase checksum/status serialization
+# RealmModelTest no-JIT Liquibase SnapshotGeneratorFactory comparator NSME
 
 Status: open
 
-Date observed: 2026-07-09, after fixing the first Liquibase/Xerces XML parse
-timeout.
+Date observed: 2026-07-09, after fixing the Liquibase/Xerces parse timeout and
+the Liquibase checksum/status filter hot leaf.
 
 ## Summary
 
 `RealmModelTest` under CratonVM `--nojit` now gets past the earlier
-Liquibase/Xerces XML schema parsing hotspot. The old stack in
+Liquibase/Xerces XML schema parsing hotspot. The resurfaced stack in
 `XMLEntityScanner.scanQName -> checkLimit -> XMLLimitAnalyzer.addValue` no
-longer appears in the representative watchdog evidence.
+longer appears after the 2026-07-09 `scanQName` native follow-up.
 
-The first open residual was the Liquibase checksum/status serializer path:
-`ChangeSet.generateCheckSum -> AbstractChange.generateCheckSum ->
-StringChangeLogSerializer.serializeObject -> AbstractChange$1.include`. A
-native override now covers `AbstractChange$1.include` and directly scans the
-excluded-field array instead of interpreting the per-field stream/`anyMatch`
-predicate.
+This branch also removes one checksum/status interpreter hot layer by forcing
+`liquibase/change/AbstractChange$1.include(Object,String,Object)` to the
+native registry. The native implementation directly scans
+`AbstractChange.getExcludedFieldFilters(...)` instead of interpreting the
+per-field `Arrays.stream(...).anyMatch(...)` predicate for every serialized
+change field.
 
-That mitigation is not sufficient to retire the issue. With the override in
-place, the class still exceeds the 900-second suite-runner watchdog. A
-300-second direct stack-dump run samples the main thread in
-`LiquibaseJpaUpdaterProvider.validate -> getLiquibaseUnrunChangeSets`, while
-Liquibase is parsing included changelog XML and Xerces is traversing schema
-grammar attributes.
+With those layers in place, the class no longer hits the 900-second watchdog.
+The latest current-dev validation exits in 851.630s with a later Liquibase
+failure:
+
+```text
+java.lang.NoSuchMethodError: java/lang/Object.compare(Ljava/lang/Object;Ljava/lang/Object;)I
+  at liquibase.snapshot.SnapshotGeneratorFactory.getGenerators(SnapshotGeneratorFactory.java:125)
+```
+
+The open residual is now a lambda/SAM dispatch bug in Liquibase's
+`SnapshotGeneratorFactory` comparator chain, not the old XML parse timeout and
+not the `AbstractChange$1.include` checksum filter loop.
 
 HotSpot `-Xint` previously passed the same class/list in 142.649s, so this
-remains a CratonVM no-JIT throughput residual rather than a Keycloak functional
-failure.
+remains a CratonVM correctness/dispatch residual.
 
 ## Evidence
 
 The unique CratonVM binary used for the latest validation was:
 
 ```text
-C:\craton\cargo-targets\keycloak-liquibase-checksum-status-20260709-002\release\cratonvm-keycloak-liquibase-checksum-status-20260709-002.exe
+C:\craton\cargo-targets\keycloak-liquibase-checksum-status-20260709-003\release\cratonvm-keycloak-liquibase-checksum-status-20260709-003.exe
 ```
 
 Focused native/dispatch tests:
 
 ```powershell
-$env:CARGO_TARGET_DIR='C:\craton\cargo-targets\keycloak-liquibase-devtests-20260709-006'
-cargo test -p cratonvm-native-builtins liquibase_checksum -- --nocapture
+$env:CARGO_TARGET_DIR='C:\craton\cargo-targets\keycloak-liquibase-devtests-20260709-008'
+cargo test -p cratonvm-native-builtins --lib liquibase_checksum -- --nocapture
 
-$env:CARGO_TARGET_DIR='C:\craton\cargo-targets\keycloak-liquibase-vmtests-20260709-006'
-cargo test -p cratonvm-vm liquibase_checksum_force_native_covers_abstract_change_filter -- --nocapture
+$env:CARGO_TARGET_DIR='C:\craton\cargo-targets\keycloak-liquibase-vmtests-20260709-008'
+cargo test -p cratonvm-vm --lib liquibase_checksum_force_native_covers_abstract_change_filter -- --nocapture
 ```
 
 Results:
@@ -61,72 +66,79 @@ Suite-runner command:
 & 'C:\craton\CratonVM\apps\keycloak-suite-runner\run-keycloak-suite.ps1' `
   -Vm craton -Category others -Jit off `
   -ClassList 'C:\craton\CratonVM\apps\keycloak-suite-runner\.suite\keycloak-model-realm-stw-20260708-001.tsv' `
-  -RunName 'keycloak-liquibase-checksum-status-verify-20260709-002' `
+  -RunName 'keycloak-liquibase-checksum-status-verify-20260709-003' `
   -Parallel 1 -TimeoutSec 900 `
   -KeycloakRoot 'C:\craton\CratonVM\apps\keycloak' `
   -WorkDir 'C:\craton\CratonVM\apps\keycloak-suite-runner\.suite' `
-  -Exe 'C:\craton\cargo-targets\keycloak-liquibase-checksum-status-20260709-002\release\cratonvm-keycloak-liquibase-checksum-status-20260709-002.exe' `
+  -Exe 'C:\craton\cargo-targets\keycloak-liquibase-checksum-status-20260709-003\release\cratonvm-keycloak-liquibase-checksum-status-20260709-003.exe' `
   -JdkHome 'C:\Program Files\Java\jdk-25'
 ```
 
 Result:
 
 ```text
-HANG 900.113s org.keycloak.testsuite.model.RealmModelTest
+FAIL 851.630s org.keycloak.testsuite.model.RealmModelTest
 ```
 
-The direct stack-dump run used the same unique binary with
-`--stack-dump-on-timeout 300 --Xmx 2g --nojit` from
-`apps/keycloak/testsuite/model`, with the pathing jar
-`apps/keycloak-suite-runner/.suite/pathing-jars/testsuite_model-122e55ba66167a16.jar`.
-The run directory was
-`apps/keycloak-suite-runner/.suite/results/keycloak-liquibase-checksum-status-direct-stack-20260709-003`.
-It exited after the watchdog dump with process status `-1073740791`.
-
-Representative main-thread stack:
+`results.tsv` records:
 
 ```text
-org.keycloak.connections.jpa.updater.liquibase.LiquibaseJpaUpdaterProvider.validate
-org.keycloak.connections.jpa.updater.liquibase.LiquibaseJpaUpdaterProvider.validateSynch
-org.keycloak.connections.jpa.updater.liquibase.LiquibaseJpaUpdaterProvider.validateChangeSet
-org.keycloak.connections.jpa.updater.liquibase.LiquibaseJpaUpdaterProvider.getLiquibaseUnrunChangeSets
-liquibase.Liquibase.listUnrunChangeSets
-liquibase.Liquibase.getDatabaseChangeLog
-liquibase.parser.core.xml.AbstractChangeLogParser.parse
-liquibase.changelog.DatabaseChangeLog.handleInclude
-liquibase.parser.core.xml.XMLChangeLogSAXParser.parseToNode
-com.sun.org.apache.xerces.internal.jaxp.SAXParserImpl$JAXPSAXParser.parse
-com.sun.org.apache.xerces.internal.parsers.XMLParser.parse
-com.sun.org.apache.xerces.internal.parsers.XML11Configuration.parse
-com.sun.org.apache.xerces.internal.impl.XMLDocumentFragmentScannerImpl.scanDocument
-com.sun.org.apache.xerces.internal.impl.XMLNSDocumentScannerImpl.scanStartElement
-com.sun.org.apache.xerces.internal.impl.xs.XMLSchemaValidator.findSchemaGrammar
-com.sun.org.apache.xerces.internal.impl.xs.XMLSchemaLoader.loadSchema
-com.sun.org.apache.xerces.internal.impl.xs.traversers.XSDHandler.parseSchema
-com.sun.org.apache.xerces.internal.impl.xs.traversers.XSDHandler.traverseSchemas
-com.sun.org.apache.xerces.internal.impl.xs.traversers.XSDComplexTypeTraverser.traverseGlobal
-com.sun.org.apache.xerces.internal.impl.xs.traversers.XSDAbstractTraverser.traverseAttrsAndAttrGrps
-com.sun.org.apache.xerces.internal.impl.xs.XSAttributeGroupDecl.getAttributeUseNoProhibited
+=> java.lang.NoSuchMethodError: java/lang/Object.compare(Ljava/lang/Object;Ljava/lang/Object;)I
+```
+
+The runner stdout failure stack starts:
+
+```text
+java.lang.NoSuchMethodError: java/lang/Object.compare(Ljava/lang/Object;Ljava/lang/Object;)I
+liquibase.snapshot.SnapshotGeneratorFactory.getGenerators(SnapshotGeneratorFactory.java:125)
+liquibase.snapshot.DatabaseSnapshot.createGeneratorChain(DatabaseSnapshot.java:578)
+liquibase.snapshot.DatabaseSnapshot.include(DatabaseSnapshot.java:314)
+liquibase.snapshot.DatabaseSnapshot.init(DatabaseSnapshot.java:112)
+liquibase.snapshot.JdbcDatabaseSnapshot.<init>(JdbcDatabaseSnapshot.java:37)
+liquibase.snapshot.SnapshotGeneratorFactory.createSnapshot(SnapshotGeneratorFactory.java:343)
+liquibase.snapshot.SnapshotGeneratorFactory.checkExistence(SnapshotGeneratorFactory.java:260)
+liquibase.snapshot.SnapshotGeneratorFactory.has(SnapshotGeneratorFactory.java:220)
+org.keycloak.connections.jpa.updater.liquibase.custom.CustomCreateIndexChange.generateStatements(CustomCreateIndexChange.java:82)
+```
+
+The stderr log shows the run reached Liquibase update execution and completed
+substantial DDL/index work before the comparator failure:
+
+```text
+CREATE INDEX PUBLIC.IDX_REALM_ATTR_REALM ON PUBLIC.REALM_ATTRIBUTE(REALM_ID)
+NoSuchMethodError method="java/lang/Object.compare(Ljava/lang/Object;Ljava/lang/Object;)I"
+  caller="liquibase/snapshot/SnapshotGeneratorFactory.getGenerators(Ljava/lang/Class;Lliquibase/database/Database;)Ljava/util/SortedSet; @pc=70"
+NoSuchMethodError method="java/lang/Object.apply(Ljava/lang/Object;)Ljava/lang/Object;"
+  caller="liquibase/snapshot/SnapshotGeneratorFactory.getGenerators(Ljava/lang/Class;Lliquibase/database/Database;)Ljava/util/SortedSet; @pc=70"
+UPDATE SUMMARY
+Run:                         42
+Total change sets:          195
 ```
 
 ## Current hypothesis
 
-This remains a Liquibase no-JIT throughput family rather than a single fixed
-method. The checksum/status filter was one hot layer and now has a direct native
-override. The latest sampled residual is back in changelog XML parsing, but not
-the already-fixed `scanQName/checkLimit/XMLLimitAnalyzer.addValue` path. The
-current evidence points at Xerces schema grammar loading/traversal during
-Liquibase validation, especially `XMLSchemaValidator.findSchemaGrammar`,
-`XMLSchemaLoader.loadSchema`, and XSD traverser attribute-group handling.
+The active failure is a generic lambda-proxy / functional-interface dispatch
+gap exposed by Liquibase's comparator construction in
+`SnapshotGeneratorFactory.getGenerators`. The `Object.compare` and
+`Object.apply` names suggest a comparator/function lambda body is being invoked
+through a receiver or fallback class of `java/lang/Object` instead of through
+the lambda proxy's SAM dispatch metadata.
+
+The checksum `AbstractChange$1.include` native shortcut should stay: it removes
+a confirmed hot leaf in the earlier status/checksum stack, but the remaining
+suite blocker is now the comparator lambda dispatch.
 
 ## Next leads
 
-- Compare the 300-second schema traversal stack against HotSpot `-Xint` method
-  counts for the same changelog include.
-- Instrument Xerces XSD traversal methods under CratonVM `--nojit`, starting at
-  `XMLSchemaValidator.findSchemaGrammar`, `XMLSchemaLoader.loadSchema`,
-  `XSDHandler.parseSchema`, `XSDAbstractTraverser.traverseAttrsAndAttrGrps`, and
-  `XSAttributeGroupDecl.getAttributeUseNoProhibited`.
-- Keep the checksum `AbstractChange$1.include` native override in place; it is a
-  proven shortcut for the prior status/checksum stack, but it does not close the
-  current timeout alone.
+- Build a minimal Java probe for `Comparator.comparing(...).thenComparing(...)`
+  or the exact `SnapshotGeneratorFactory.getGenerators` comparator chain under
+  CratonVM `--nojit`.
+- Instrument `try_lambda_dispatch` for `java/util/Comparator.compare` and
+  `java/util/function/Function.apply` call sites that resolve to
+  `java/lang/Object`.
+- Check whether the receiver-is-lambda-proxy rescue handles this nested
+  comparator/function shape or whether `coerce_lambda_args` is losing the
+  captured comparator/function receiver.
+- Keep the Xerces parser intrinsics and `AbstractChange$1.include` native
+  shortcut in place; both are necessary progress but neither closes the current
+  suite failure alone.

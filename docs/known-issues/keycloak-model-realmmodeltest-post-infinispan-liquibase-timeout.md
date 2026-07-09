@@ -28,8 +28,14 @@ been fixed and retired to
 `docs/internal/fixed-suite-bugs/keycloak-model-liquibase-xerces-xml-parse-nojit-timeout-FIXED.md`.
 The active remaining layer is now
 `docs/known-issues/keycloak-model-liquibase-checksum-status-nojit-timeout.md`,
-where the main thread is in Liquibase checksum/status serialization rather than
-Xerces schema parsing.
+where the run is in Liquibase update/checksum work rather than Xerces schema
+parsing. The 2026-07-09 `scanQName` follow-up also cleared the intermediate
+`XMLEntityScanner.skipString` empty-rawname failure and H2 `BitSet.clone`
+failure. The 2026-07-09 checksum-filter follow-up then moved the class off the
+900-second watchdog: the current terminal residual is a later
+`liquibase.snapshot.SnapshotGeneratorFactory.getGenerators` comparator lambda
+dispatch failure,
+`NoSuchMethodError: java/lang/Object.compare(Object,Object)I`.
 
 ## Evidence
 
@@ -78,16 +84,18 @@ Liquibase. The skip is deliberately narrow:
 
 ## Not yet root-caused / fixed
 
-The remaining timeout needs a fresh Liquibase checksum/status investigation.
+The remaining failure needs a fresh Liquibase comparator/lambda dispatch
+investigation.
 Useful next steps:
 
-1. Instrument `StringChangeLogSerializer.serializeObject` and
-   `AbstractChange.generateCheckSum` under `--nojit`.
-2. Compare the checksum/status path against HotSpot `-Xint` on the same
-   class/list.
-3. If JIT-on with the RxJava3 skip-list reaches the same layer, decide whether
-   the shared no-JIT/JIT-denied cost is reflection/property traversal, repeated
-   checksum work, string serialization, or another Liquibase visitor hot path.
+1. Build a focused probe for
+   `SnapshotGeneratorFactory.getGenerators` or the equivalent
+   `Comparator.comparing(...).thenComparing(...)` chain under `--nojit`.
+2. Instrument `try_lambda_dispatch` for `Comparator.compare` and
+   `Function.apply` receivers that fall back to `java/lang/Object`.
+3. Keep the Liquibase update/checksum throughput evidence: the
+   `AbstractChange$1.include` native shortcut is real progress, but the current
+   suite blocker is now SAM dispatch rather than the old timeout.
 
 ## Repro
 

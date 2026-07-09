@@ -1382,7 +1382,10 @@ impl HprofWriter {
         class_info: &HprofClassInfo,
         all_classes: &std::collections::HashMap<u32, HprofClassInfo>,
     ) {
-        use cratonvm_gc::heap::{HEADER_SIZE, SLOT_SIZE};
+        use cratonvm_gc::{class_layout, is_compact_object, ObjectHeader};
+        use cratonvm_gc::heap::SLOT_SIZE;
+        use cratonvm_types::FIELD_CELL_PAYLOAD64_OFFSET;
+        use cratonvm_gc::heap::HEADER_SIZE;
 
         buf.push(Self::GC_INSTANCE_DUMP);
         buf.extend_from_slice(&obj.object_id.to_be_bytes());
@@ -1416,26 +1419,54 @@ impl HprofWriter {
         buf.extend_from_slice(&data_size.to_be_bytes());
 
         // Write field values by reading raw memory from the heap object.
-        // Internal layout: fields are at HEADER_SIZE + field_index * SLOT_SIZE,
-        // each slot is 16 bytes containing a Value enum.
-        // We read each slot and convert to the HPROF typed representation.
+        // Internal layout:
+        // - Legacy object: fields are at HEADER_SIZE + field_index * SLOT_SIZE, each
+        //   slot is 16 bytes containing a Value enum.
+        // - Compact object: reference fields are 8-byte pointers; primitive fields are
+        //   still 16-byte Value cells at compact-packed offsets from the class layout.
         let mut field_index: usize = 0;
+        let header = unsafe { &*(obj.data_ptr as *const ObjectHeader) };
+        let compact_layout = if is_compact_object(header) {
+            class_layout(header.class_id.as_u32())
+        } else {
+            None
+        };
+
         for fields in &field_chain {
             for (_fname, fdesc) in *fields {
                 let htype = HprofBasicType::from_descriptor(fdesc);
-                let slot_offset = HEADER_SIZE + field_index * SLOT_SIZE;
+                let slot_offset = compact_layout
+                    .as_ref()
+                    .and_then(|layout| layout.field_offset(field_index))
+                    .map_or_else(
+                        || HEADER_SIZE + field_index * SLOT_SIZE,
+                        |off| HEADER_SIZE + off as usize,
+                    );
+
                 // Safety: obj.data_ptr points to a valid heap object with at least
-                // HEADER_SIZE + num_total_fields * SLOT_SIZE bytes allocated.
-                // We read raw bytes and interpret according to the Value layout.
+                // obj.total_size bytes allocated.
                 let slot_ptr = unsafe { obj.data_ptr.add(slot_offset) };
+                let is_compact_ref = compact_layout
+                    .as_ref()
+                    .and_then(|layout| layout.field_is_ref(field_index))
+                    .unwrap_or(false);
 
                 match htype {
                     HprofBasicType::Object => {
-                        // Value::Object is discriminant + 8 bytes pointer.
-                        // In our Value layout, the pointer is at offset 0 of the enum payload.
-                        // We read 8 bytes as a potential pointer value.
-                        let val = if slot_offset + 8 <= obj.total_size {
-                            unsafe { std::ptr::read_unaligned(slot_ptr as *const u64) }
+                        // Legacy: Value::Object stores the reference in the 8-byte Value payload.
+                        // Compact: reference fields are raw pointers at field offsets.
+                        let val = if is_compact_ref {
+                            if slot_offset + 8 <= obj.total_size {
+                                unsafe { std::ptr::read_unaligned(slot_ptr as *const u64) }
+                            } else {
+                                0u64
+                            }
+                        } else if slot_offset + FIELD_CELL_PAYLOAD64_OFFSET + 8 <= obj.total_size {
+                            unsafe {
+                                std::ptr::read_unaligned(
+                                    slot_ptr.add(FIELD_CELL_PAYLOAD64_OFFSET) as *const u64,
+                                )
+                            }
                         } else {
                             0u64
                         };
@@ -3583,6 +3614,76 @@ mod tests {
                                   // Field value at 25..29 (big-endian)
         let fval = i32::from_be_bytes(buf[25..29].try_into().unwrap());
         assert_eq!(fval, 0x12345678);
+    }
+
+    #[test]
+    fn test_hprof_instance_dump_reads_compact_ref_field_value() {
+        use cratonvm_gc::heap::{ObjectHeader, ObjectKind, ArrayElementType, HEADER_SIZE};
+        use cratonvm_types::{clear_class_layouts, CompactLayout, GC_FLAG_COMPACT};
+        use cratonvm_gc::register_class_layout;
+        use std::sync::Arc;
+
+        clear_class_layouts();
+        register_class_layout(
+            1,
+            Arc::new(CompactLayout {
+                field_offsets: vec![0],
+                is_ref: vec![true],
+                ref_offsets: vec![0],
+                body_size: 8,
+            }),
+        );
+
+        let classes_map: std::collections::HashMap<u32, HprofClassInfo> = [(
+            1u32,
+            HprofClassInfo {
+                class_id: 1,
+                name: "RefHolder".to_string(),
+                super_class_id: 0,
+                instance_fields: vec![("ref".to_string(), "Ljava/lang/Object;".to_string())],
+                static_fields: vec![],
+                source_file: None,
+                instance_size: (HEADER_SIZE + 8) as u32,
+            },
+        )]
+        .into_iter()
+        .collect();
+
+        let total_size = HEADER_SIZE + 8;
+        let mut mem = vec![0u8; total_size];
+        let expected_ref = 0x1_2345_6789_abcd_u64;
+        let mut header = ObjectHeader::new(
+            cratonvm_types::ClassId::new(1),
+            ObjectKind::Object,
+            ArrayElementType::Boolean,
+            0,
+            0,
+            1,
+        );
+        header.array_length = 8;
+        header.gc_flags = GC_FLAG_COMPACT;
+        unsafe {
+            std::ptr::write(mem.as_mut_ptr() as *mut ObjectHeader, header);
+            std::ptr::write_unaligned(mem.as_mut_ptr().add(HEADER_SIZE) as *mut u64, expected_ref);
+        }
+
+        let ci = classes_map.get(&1).unwrap();
+        let obj = HprofObjectInfo {
+            object_id: 0xABCD,
+            class_id: 1,
+            is_array: false,
+            element_type: 0,
+            array_length: 0,
+            total_size,
+            data_ptr: mem.as_ptr(),
+        };
+
+        let mut buf = Vec::new();
+        HprofWriter::write_gc_instance_dump(&mut buf, &obj, ci, &classes_map);
+
+        let fval = u64::from_be_bytes(buf[25..33].try_into().unwrap());
+        assert_eq!(fval, expected_ref);
+        clear_class_layouts();
     }
 
     // --- HSDB protocol tests ---

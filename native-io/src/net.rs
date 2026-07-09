@@ -22,7 +22,7 @@ use cratonvm_types::error::{MethodCallFailed, MethodCallResult, RuntimeError};
 use cratonvm_types::{ObjectRef, Value};
 use parking_lot::{Mutex, RwLock};
 use std::io::{ErrorKind, Read, Write};
-use std::net::{SocketAddr, TcpListener, TcpStream};
+use std::net::{Shutdown, SocketAddr, TcpListener, TcpStream};
 use std::sync::atomic::{AtomicI32, Ordering};
 use std::sync::Arc;
 use std::sync::OnceLock;
@@ -552,18 +552,17 @@ fn ms_sockaddr_ipv4(ctx: &mut dyn NativeContext, sa: ObjectRef) -> Option<std::n
 /// Drop is automatic on removal from the map; Rust's `std::net::TcpListener`
 /// / `TcpStream` close their underlying file descriptor on drop.
 ///
-/// AUDIT 2026-05-17: each live OS handle is wrapped in `Arc<Mutex<_>>`
-/// so callers can clone the inner handle out of the map under a brief
-/// read-lock, drop the map lock, then perform the blocking syscall
-/// (`read` / `write` / `accept`) without serializing every Net op in
-/// the process. This mirrors the `random_access_file::with_file` pattern.
+/// AUDIT 2026-05-17: listeners are wrapped in `Arc<Mutex<_>>` for close-aware
+/// accept coordination. Streams are plain `Arc<TcpStream>` so a blocking read
+/// on one Java thread does not exclude a write on the same socket from another
+/// Java thread.
 pub enum NetSocketHandle {
     /// Freshly created via `socket0` but not yet bound / connected.
     Unbound,
     /// Bound + listening (post `bind0`).
     Listener(Arc<Mutex<TcpListener>>),
     /// Active stream (connected via `connect0` or accepted).
-    Stream(Arc<Mutex<TcpStream>>),
+    Stream(Arc<TcpStream>),
     /// Marked closed but still in the map so `close(fd)` is idempotent.
     Closed,
 }
@@ -599,6 +598,36 @@ fn register_handle(h: NetSocketHandle) -> i32 {
     let id = next_net_fd();
     net_sockets().write().insert(id, h);
     id
+}
+
+fn close_net_fd(fd: i32) {
+    let old = {
+        let mut map = net_sockets().write();
+        map.insert(fd, NetSocketHandle::Closed)
+    };
+    if std::env::var_os("CRATONVM_DBG_NET").is_some() {
+        let kind = match &old {
+            Some(NetSocketHandle::Unbound) => "unbound",
+            Some(NetSocketHandle::Listener(_)) => "listener",
+            Some(NetSocketHandle::Stream(_)) => "stream",
+            Some(NetSocketHandle::Closed) => "closed",
+            None => "missing",
+        };
+        eprintln!("[NET] close fd={fd:#x} old={kind}");
+    }
+    if let Some(NetSocketHandle::Stream(stream)) = old {
+        let _ = stream.shutdown(Shutdown::Both);
+    }
+}
+
+fn close_net_fd_descriptor(ctx: &mut dyn NativeContext, fd_obj: ObjectRef, clear_fields: bool) {
+    if let Some(fd) = net_fd_from_descriptor(ctx, fd_obj) {
+        close_net_fd(fd);
+    }
+    if clear_fields {
+        ctx.set_field_by_name(fd_obj, "fd", Value::Int(-1));
+        ctx.set_field_by_name(fd_obj, "handle", Value::Long(-1));
+    }
 }
 
 const NET_ACCEPT_CLOSE_POLL: Duration = Duration::from_millis(10);
@@ -953,7 +982,7 @@ fn net_accept(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     };
     let _ = stream.set_nonblocking(false);
 
-    let new_fd = register_handle(NetSocketHandle::Stream(Arc::new(Mutex::new(stream))));
+    let new_fd = register_handle(NetSocketHandle::Stream(Arc::new(stream)));
     dbgnet!("accept fd={fd:#x} -> newfd={new_fd:#x} peer={peer}");
 
     // NIO-SERVER-SOCKET: mirror the JDK `Net.accept` native contract for the
@@ -1036,7 +1065,7 @@ fn net_connect0(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult
 
     net_sockets()
         .write()
-        .insert(fd, NetSocketHandle::Stream(Arc::new(Mutex::new(stream))));
+        .insert(fd, NetSocketHandle::Stream(Arc::new(stream)));
 
     // Return 1 to indicate connection completed (matching JDK IOStatus).
     Ok(Some(Value::Int(1)))
@@ -1063,8 +1092,7 @@ fn net_shutdown(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult
             _ => None,
         }
     };
-    if let Some(handle) = stream_handle {
-        let s = handle.lock();
+    if let Some(s) = stream_handle {
         let _ = s.shutdown(dir);
     }
     Ok(None)
@@ -1076,16 +1104,7 @@ fn net_shutdown(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult
 /// then marks the slot `Closed` so subsequent calls don't error.
 fn net_close(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let fd_obj = obj_arg(args, 0)?;
-    let Some(fd) = net_fd_from_descriptor(ctx, fd_obj) else {
-        return Ok(None);
-    };
-    {
-        let mut map = net_sockets().write();
-        map.insert(fd, NetSocketHandle::Closed);
-    }
-    // Also clear the FileDescriptor's fields so later native calls see -1.
-    ctx.set_field_by_name(fd_obj, "fd", Value::Int(-1));
-    ctx.set_field_by_name(fd_obj, "handle", Value::Long(-1));
+    close_net_fd_descriptor(ctx, fd_obj, true);
     Ok(None)
 }
 
@@ -1224,10 +1243,9 @@ fn net_read0(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     // Stage into a reusable per-thread scratch buffer (no per-call alloc/zero).
     with_io_scratch(len_usize, |buf| {
         let n = {
-            let s = stream_handle.lock();
-            // The std impl is `impl Read for &TcpStream` so we can
-            // read through a &TcpStream without needing &mut.
-            let mut r = &*s;
+            // The std impl is `impl Read for &TcpStream` so we can read through
+            // a shared TcpStream without excluding a peer writer on this fd.
+            let mut r = &*stream_handle;
             // A blocking read can park in the OS indefinitely (waiting for the
             // peer to send / close). Bracket it in a GC-blocking region so a
             // stop-the-world GC requested meanwhile doesn't deadlock
@@ -1292,8 +1310,7 @@ fn net_write0(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
             }
         };
         let n = {
-            let s = stream_handle.lock();
-            let mut w = &*s;
+            let mut w = &*stream_handle;
             // A blocking write can park behind socket backpressure just like
             // read0 parks waiting for peer data. Keep it in the same
             // GC-blocking protocol as accept/read so STW does not wait for a
@@ -1333,8 +1350,7 @@ fn net_available(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResul
             _ => None,
         }
     };
-    if let Some(handle) = stream_handle {
-        let s = handle.lock();
+    if let Some(s) = stream_handle {
         return Ok(Some(Value::Int(socket_available_stream(&s).unwrap_or(0))));
     }
 
@@ -1375,8 +1391,7 @@ fn net_set_int_option0(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCal
             _ => None,
         }
     };
-    if let Some(handle) = stream_handle {
-        let s = handle.lock();
+    if let Some(s) = stream_handle {
         match (level, opt) {
             (IPPROTO_TCP, TCP_NODELAY) => {
                 s.set_nodelay(val != 0)
@@ -1429,8 +1444,7 @@ fn net_get_int_option0(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCal
             _ => None,
         }
     };
-    if let Some(handle) = stream_handle {
-        let s = handle.lock();
+    if let Some(s) = stream_handle {
         if level == IPPROTO_TCP && opt == TCP_NODELAY {
             let v = s.nodelay().unwrap_or(false);
             return Ok(Some(Value::Int(if v { 1 } else { 0 })));
@@ -1455,7 +1469,7 @@ fn net_local_port(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResu
     // then drop the map lock before issuing the syscall.
     enum Handle {
         L(Arc<Mutex<TcpListener>>),
-        S(Arc<Mutex<TcpStream>>),
+        S(Arc<TcpStream>),
         None,
     }
     let handle = {
@@ -1468,7 +1482,7 @@ fn net_local_port(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResu
     };
     let port = match handle {
         Handle::L(l) => l.lock().local_addr().map(|a| a.port() as i32).unwrap_or(0),
-        Handle::S(s) => s.lock().local_addr().map(|a| a.port() as i32).unwrap_or(0),
+        Handle::S(s) => s.local_addr().map(|a| a.port() as i32).unwrap_or(0),
         Handle::None => 0,
     };
     dbgnet!("localPort fd={fd:#x} -> {port}");
@@ -1482,7 +1496,7 @@ fn net_local_inet_address(ctx: &mut dyn NativeContext, args: &[Value]) -> Method
     // AUDIT 2026-05-17: clone handle Arc, drop map lock, then syscall.
     enum Handle {
         L(Arc<Mutex<TcpListener>>),
-        S(Arc<Mutex<TcpStream>>),
+        S(Arc<TcpStream>),
         None,
     }
     let handle = {
@@ -1500,7 +1514,6 @@ fn net_local_inet_address(ctx: &mut dyn NativeContext, args: &[Value]) -> Method
             .map(|a| a.ip().to_string())
             .unwrap_or_else(|_| "0.0.0.0".to_string()),
         Handle::S(s) => s
-            .lock()
             .local_addr()
             .map(|a| a.ip().to_string())
             .unwrap_or_else(|_| "0.0.0.0".to_string()),
@@ -1532,7 +1545,7 @@ fn net_remote_port(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRes
         }
     };
     let port = match stream_handle {
-        Some(s) => s.lock().peer_addr().map(|a| a.port() as i32).unwrap_or(0),
+        Some(s) => s.peer_addr().map(|a| a.port() as i32).unwrap_or(0),
         None => 0,
     };
     Ok(Some(Value::Int(port)))
@@ -1552,7 +1565,6 @@ fn net_remote_inet_address(ctx: &mut dyn NativeContext, args: &[Value]) -> Metho
     };
     let addr_text = match stream_handle {
         Some(s) => s
-            .lock()
             .peer_addr()
             .map(|a| a.ip().to_string())
             .unwrap_or_else(|_| "0.0.0.0".to_string()),
@@ -1677,8 +1689,38 @@ pub fn register_sun_nio_ch_net(r: &mut NativeMethodRegistry) {
         "(I)V",
         |_ctx, args| {
             if let Some(Value::Int(fd)) = args.first().copied() {
-                net_sockets().write().insert(fd, NetSocketHandle::Closed);
+                close_net_fd(fd);
             }
+            Ok(None)
+        },
+    );
+    r.register(
+        "sun/nio/ch/SocketDispatcher",
+        "close",
+        "(Ljava/io/FileDescriptor;)V",
+        |ctx, args| {
+            let fd_obj = obj_arg(args, 1)?;
+            close_net_fd_descriptor(ctx, fd_obj, true);
+            Ok(None)
+        },
+    );
+    r.register(
+        "sun/nio/ch/SocketDispatcher",
+        "invalidateAndClose",
+        "(Ljava/io/FileDescriptor;)V",
+        |ctx, args| {
+            let fd_obj = obj_arg(args, 0)?;
+            close_net_fd_descriptor(ctx, fd_obj, true);
+            Ok(None)
+        },
+    );
+    r.register(
+        "sun/nio/ch/NativeDispatcher",
+        "preClose",
+        "(Ljava/io/FileDescriptor;JJ)V",
+        |ctx, args| {
+            let fd_obj = obj_arg(args, 1)?;
+            close_net_fd_descriptor(ctx, fd_obj, false);
             Ok(None)
         },
     );
@@ -1702,15 +1744,18 @@ pub fn register_sun_nio_ch_net(r: &mut NativeMethodRegistry) {
         "(Ljava/io/FileDescriptor;)V",
         net_close,
     );
-    // `preClose0` marks the fd closed without actually closing it (used to
-    // unblock a concurrent blocking reader/writer before the real close()
-    // runs) — our socket I/O is already synchronous/blocking, so no-op,
-    // mirroring `nio_native.rs`'s analogous `FileDispatcherImpl` handling.
+    // `preClose0` exists to unblock concurrent socket I/O before the final
+    // close runs. Wake any blocked read/write by shutting down the old stream
+    // handle, but leave Java's FileDescriptor fields intact for close0.
     r.register(
         "sun/nio/ch/UnixDispatcher",
         "preClose0",
         "(Ljava/io/FileDescriptor;)V",
-        |_ctx, _args| Ok(None),
+        |ctx, args| {
+            let fd_obj = obj_arg(args, 0)?;
+            close_net_fd_descriptor(ctx, fd_obj, false);
+            Ok(None)
+        },
     );
 
     // Options
@@ -2098,7 +2143,7 @@ mod tests {
         });
 
         let client = TcpStream::connect(("127.0.0.1", port)).unwrap();
-        let fd = register_handle(NetSocketHandle::Stream(Arc::new(Mutex::new(client))));
+        let fd = register_handle(NetSocketHandle::Stream(Arc::new(client)));
         let mut ctx = MockNativeContext::new();
         let fd_obj = ctx.alloc_object(0);
         ctx.set_field_by_name(fd_obj, "fd", Value::Int(fd));
@@ -2186,7 +2231,7 @@ mod tests {
         let client = TcpStream::connect(("127.0.0.1", port)).unwrap();
         let peer = client.peer_addr().unwrap();
         assert_eq!(peer.ip().to_string(), "127.0.0.1");
-        let fd = register_handle(NetSocketHandle::Stream(Arc::new(Mutex::new(client))));
+        let fd = register_handle(NetSocketHandle::Stream(Arc::new(client)));
         // Confirm the handle is indexed as a Stream.
         assert_eq!(_test_peek_kind(fd), "stream");
         remove_fd(fd);
@@ -2213,7 +2258,7 @@ mod tests {
         let fd = register_handle(NetSocketHandle::Unbound);
         assert_eq!(_test_peek_kind(fd), "unbound");
         // Call close via the internal API (bypasses FileDescriptor obj).
-        net_sockets().write().insert(fd, NetSocketHandle::Closed);
+        close_net_fd(fd);
         assert_eq!(_test_peek_kind(fd), "closed");
         remove_fd(fd);
         assert_eq!(_test_peek_kind(fd), "missing");
@@ -2233,12 +2278,51 @@ mod tests {
         });
 
         thread::sleep(Duration::from_millis(50));
-        net_sockets().write().insert(fd, NetSocketHandle::Closed);
+        close_net_fd(fd);
         let (kind, elapsed) = waiter.join().unwrap();
         assert_eq!(kind, ErrorKind::Interrupted);
         assert!(
             elapsed < Duration::from_secs(2),
             "close-aware Net.accept should wake promptly, got {elapsed:?}"
+        );
+        remove_fd(fd);
+    }
+
+    #[test]
+    fn t19_5_close_unblocks_blocking_stream_read() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+
+        let waiter = thread::spawn(move || {
+            let (mut server_side, _) = listener.accept().unwrap();
+            let mut buf = [0_u8; 1];
+            let start = std::time::Instant::now();
+            let result = server_side.read(&mut buf);
+            (result, start.elapsed())
+        });
+
+        let client = TcpStream::connect(("127.0.0.1", port)).unwrap();
+        let fd = register_handle(NetSocketHandle::Stream(Arc::new(client)));
+        thread::sleep(Duration::from_millis(50));
+        close_net_fd(fd);
+
+        let (result, elapsed) = waiter.join().unwrap();
+        match result {
+            Ok(n) => assert_eq!(n, 0, "shutdown should surface as EOF, got {n} bytes"),
+            Err(e) => assert!(
+                matches!(
+                    e.kind(),
+                    ErrorKind::ConnectionAborted
+                        | ErrorKind::ConnectionReset
+                        | ErrorKind::NotConnected
+                        | ErrorKind::BrokenPipe
+                ),
+                "unexpected read error after close: {e:?}"
+            ),
+        }
+        assert!(
+            elapsed < Duration::from_secs(2),
+            "close should wake blocked stream read promptly, got {elapsed:?}"
         );
         remove_fd(fd);
     }
@@ -2253,7 +2337,7 @@ mod tests {
         let map = net_sockets().read();
         match map.get(&fd) {
             Some(NetSocketHandle::Stream(s)) => {
-                let _ = s.lock().shutdown(std::net::Shutdown::Both);
+                let _ = s.shutdown(std::net::Shutdown::Both);
             }
             _ => {}
         }

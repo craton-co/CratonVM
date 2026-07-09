@@ -103,8 +103,26 @@ pub fn record(holder: ObjectRef, field_idx: usize, expected: usize, class_id: u3
 /// `+8`.
 #[inline]
 fn slot_addr(holder: ObjectRef, idx: u32) -> usize {
-    use cratonvm_gc::heap::{HEADER_SIZE, SLOT_SIZE};
-    holder.as_ptr() as usize + HEADER_SIZE + (idx as usize) * SLOT_SIZE
+    use cratonvm_gc::heap::{SLOT_SIZE};
+    use cratonvm_gc::{class_layout, is_compact_object};
+    use cratonvm_types::ObjectHeader;
+
+    let header = unsafe { &*(holder.as_ptr() as *const ObjectHeader) };
+    if is_compact_object(header) {
+        if let Some(layout) = class_layout(header.class_id.as_u32()) {
+            if let Some(offset) = layout.field_offset(idx as usize) {
+                return header_base(holder) + offset as usize;
+            }
+        }
+    }
+
+    header_base(holder) + (idx as usize) * SLOT_SIZE
+}
+
+#[inline]
+fn header_base(holder: ObjectRef) -> usize {
+    use cratonvm_gc::heap::HEADER_SIZE;
+    holder.as_ptr() as usize + HEADER_SIZE
 }
 
 /// `Value` discriminant value for the `Object` variant (Int=0, Long=1, Float=2,
@@ -132,24 +150,43 @@ pub fn detect() -> Vec<(usize, u32, usize, usize)> {
         if class_id_at(holder.as_ptr() as usize) != class_id {
             return false;
         }
-        // SAFETY: `holder` is remapped on every GC ([`remap`]), so its address
-        // is current managed memory; the semispaces / old-gen stay mapped, so a
-        // 16-byte read at a field-cell offset cannot fault. Reading raw bytes
-        // (not as `Value`) avoids any invalid-discriminant UB on a reused slot.
-        let bytes = unsafe { std::ptr::read(slot_addr(holder, idx) as *const [u8; 16]) };
-        let tag = u32::from_ne_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
-        if tag != VALUE_DISC_OBJECT {
-            return false; // re-typed / reclaimed — prune
+        // SAFETY: `holder` is remapped on every GC (`remap`), so its address
+        // is current managed memory; semispaces / old-gen stay mapped.
+        let slot_ptr = slot_addr(holder, idx);
+        let header = unsafe { &*(holder.as_ptr() as *const cratonvm_types::ObjectHeader) };
+        let is_compact_slot = cratonvm_gc::is_compact_object(header)
+            && cratonvm_gc::class_layout(header.class_id.as_u32())
+                .and_then(|layout| layout.field_is_ref(idx as usize))
+                .unwrap_or(false);
+
+        if is_compact_slot {
+            let now = unsafe { std::ptr::read(slot_ptr as *const usize) };
+            if now == 0 {
+                return false; // Object(None) — prune
+            }
+            if now != expected && now < 0x1000 {
+                hits.push((holder.as_ptr() as usize, idx, expected, now));
+                return false; // reported — drop
+            }
+            true
+        } else {
+            // SAFETY: legacy path reads a 16-byte field cell and validates the
+            // Value::Object tag before using payload bytes.
+            let bytes = unsafe { std::ptr::read(slot_ptr as *const [u8; 16]) };
+            let tag = u32::from_ne_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
+            if tag != VALUE_DISC_OBJECT {
+                return false; // re-typed / reclaimed — prune
+            }
+            let now = usize::from_ne_bytes(bytes[8..16].try_into().unwrap());
+            if now == 0 {
+                return false; // Object(None) — prune
+            }
+            if now != expected && now < 0x1000 {
+                hits.push((holder.as_ptr() as usize, idx, expected, now));
+                return false; // reported — drop
+            }
+            true
         }
-        let now = usize::from_ne_bytes(bytes[8..16].try_into().unwrap());
-        if now == 0 {
-            return false; // Object(None) — prune
-        }
-        if now != expected && now < 0x1000 {
-            hits.push((holder.as_ptr() as usize, idx, expected, now));
-            return false; // reported — drop
-        }
-        true
     });
     hits
 }

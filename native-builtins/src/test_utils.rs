@@ -255,7 +255,8 @@ fn mock_classloader_field_slot(class_name: Option<&str>, name: &str) -> Option<u
         },
         (
             Some("com/sun/org/apache/xerces/internal/impl/XMLEntityScanner"),
-            "fCurrentEntity" | "isExternal" | "offset" | "newlines" | "counted" | "fLimitAnalyzer",
+            "fCurrentEntity" | "isExternal" | "offset" | "newlines" | "counted" | "fLimitAnalyzer"
+            | "fSymbolTable",
         ) => match name {
             "fCurrentEntity" => Some(0),
             "isExternal" => Some(1),
@@ -263,11 +264,13 @@ fn mock_classloader_field_slot(class_name: Option<&str>, name: &str) -> Option<u
             "newlines" => Some(3),
             "counted" => Some(4),
             "fLimitAnalyzer" => Some(5),
+            "fSymbolTable" => Some(6),
             _ => None,
         },
         (
             Some("com/sun/xml/internal/stream/Entity$ScannedEntity"),
-            "ch" | "position" | "count" | "columnNumber" | "lineNumber" | "isGE" | "name",
+            "ch" | "position" | "count" | "columnNumber" | "lineNumber" | "isGE" | "name"
+            | "fBufferSize",
         ) => match name {
             "ch" => Some(0),
             "position" => Some(1),
@@ -276,6 +279,17 @@ fn mock_classloader_field_slot(class_name: Option<&str>, name: &str) -> Option<u
             "lineNumber" => Some(4),
             "isGE" => Some(5),
             "name" => Some(6),
+            "fBufferSize" => Some(7),
+            _ => None,
+        },
+        (
+            Some("com/sun/org/apache/xerces/internal/xni/QName"),
+            "prefix" | "localpart" | "rawname" | "uri",
+        ) => match name {
+            "prefix" => Some(0),
+            "localpart" => Some(1),
+            "rawname" => Some(2),
+            "uri" => Some(3),
             _ => None,
         },
         (Some("com/sun/org/apache/xerces/internal/xni/XMLString"), "ch" | "offset" | "length") => {
