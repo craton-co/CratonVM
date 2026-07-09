@@ -15449,6 +15449,12 @@ pub(crate) fn register_phase54_net_extras(r: &mut NativeMethodRegistry) {
         let this = obj_arg(args, 0)?;
         // Create a URL from the raw string (see residual-3 fix note above).
         let raw = crate::net_phase_e::uri_raw_string(ctx, this);
+        if !raw.contains(':') {
+            return Err(RuntimeError::IllegalArgumentException {
+                message: "URI is not absolute".to_string(),
+            }
+            .into());
+        }
         let raw_obj = ctx.create_string(&raw);
         let url_obj = alloc_concurrent_synthetic(ctx, "java/net/URL", 1);
         ctx.set_field(url_obj, 0, Value::Object(Some(raw_obj)));

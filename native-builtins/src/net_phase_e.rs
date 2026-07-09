@@ -778,6 +778,27 @@ fn jar_url_conn_ext(ctx: &mut dyn NativeContext, this: ObjectRef) -> String {
     ext
 }
 
+fn synthetic_resource_url_content_len(ctx: &mut dyn NativeContext, url: &str) -> i64 {
+    let resource = if let Some(rest) = url.strip_prefix("jrt:") {
+        let path = rest.trim_start_matches('/');
+        match path.split_once('/') {
+            Some((_module, entry)) => entry,
+            None => path,
+        }
+    } else if let Some(rest) = url
+        .strip_prefix("classpath:")
+        .or_else(|| url.strip_prefix("resource:"))
+    {
+        rest.trim_start_matches('/')
+    } else {
+        return -1;
+    };
+
+    ctx.find_resource(resource)
+        .map(|bytes| bytes.len() as i64)
+        .unwrap_or(-1)
+}
+
 /// `JarURLConnection.getJarEntry()` — build the `java/util/jar/JarEntry` for the
 /// entry named in the `jar:…!/entry` URL by reading the zip central directory.
 /// Returns `Value::Object(None)` when the URL has no entry or the jar/entry is
@@ -2218,7 +2239,7 @@ fn register_uri_natives(r: &mut NativeMethodRegistry) {
         let this = obj_arg(args, 0)?;
         let raw = uri_raw_string(ctx, this);
         if raw.is_empty() {
-            return Ok(Some(Value::Object(None)));
+            return Err(iae("URI is not absolute"));
         }
         // Scheme = text before the first ':' (RFC 3986 §3.1). The real
         // `java.net.URI.toURL()` rejects two cases that callers RELY on
@@ -5169,8 +5190,10 @@ fn register_re4_url_http(r: &mut NativeMethodRegistry) {
             // generic URLConnection path.
             let carrier = if ext.starts_with("jar:") {
                 "java/net/JarURLConnection"
-            } else {
+            } else if ext.starts_with("http://") || ext.starts_with("https://") {
                 "java/net/HttpURLConnection"
+            } else {
+                "java/net/URLConnection"
             };
             let conn = alloc_concurrent_synthetic(ctx, carrier, 16);
             // Field HUC_URL holds the originating URL so `huc_url_string`
@@ -5438,6 +5461,27 @@ fn register_re4_url_http(r: &mut NativeMethodRegistry) {
     r.register("java/net/URLConnection", "connect", "()V", |_ctx, _args| {
         Ok(None)
     });
+    r.register("java/net/URLConnection", "getContentLength", "()I", |ctx, args| {
+        let this = obj_arg(args, 0)?;
+        let url = huc_url_string(ctx, this);
+        let len = synthetic_resource_url_content_len(ctx, &url);
+        let v = if len < 0 || len > i32::MAX as i64 {
+            -1
+        } else {
+            len as i32
+        };
+        Ok(Some(Value::Int(v)))
+    });
+    r.register(
+        "java/net/URLConnection",
+        "getContentLengthLong",
+        "()J",
+        |ctx, args| {
+            let this = obj_arg(args, 0)?;
+            let url = huc_url_string(ctx, this);
+            Ok(Some(Value::Long(synthetic_resource_url_content_len(ctx, &url))))
+        },
+    );
     // URLConnection.getInputStream — defer to URL.openStream by reading
     // the URL stored in HUC_URL during openConnection above.
     r.register(
@@ -5887,6 +5931,10 @@ fn register_re4_url_http(r: &mut NativeMethodRegistry) {
     );
     r.register(huc, "getContentLength", "()I", |ctx, args| {
         let this = obj_arg(args, 0)?;
+        let url = huc_url_string(ctx, this);
+        if !(url.starts_with("http://") || url.starts_with("https://")) {
+            return Ok(Some(Value::Int(-1)));
+        }
         huc_perform(ctx, this)?;
         match ctx.get_field(this, HUC_BODY) {
             Value::Object(Some(a)) => Ok(Some(Value::Int(ctx.array_length(a) as i32))),

@@ -22081,6 +22081,18 @@ pub fn register_essential_natives(registry: &mut NativeMethodRegistry) {
         "(Ljava/lang/String;)Ljava/io/InputStream;",
         classloader::module_get_resource_as_stream,
     );
+    registry.register(
+        "jdk/internal/loader/BootLoader",
+        "findResourceAsStream",
+        "(Ljava/lang/String;Ljava/lang/String;)Ljava/io/InputStream;",
+        classloader::bootloader_find_resource_as_stream,
+    );
+    registry.register(
+        "jdk/internal/loader/BuiltinClassLoader",
+        "findResourceAsStream",
+        "(Ljava/lang/String;Ljava/lang/String;)Ljava/io/InputStream;",
+        classloader::builtin_classloader_find_resource_as_stream,
+    );
     // URLClassLoader.findResource/findResources — the real bytecode walks
     // URLClassPath, whose essential-mode stubs return null/empty, so a
     // direct findResource() call (or a getResource() override delegating to
