@@ -64148,19 +64148,47 @@ fn native_function_identity_return_arg(
     Ok(Some(args.get(1).copied().unwrap_or(Value::Object(None))))
 }
 
+fn native_arraylist_list_itr_slots(
+    ctx: &dyn NativeContext,
+) -> (usize, usize, Option<usize>, usize, Option<usize>) {
+    let cursor = ctx
+        .resolve_field_index("java/util/ArrayList$Itr", "cursor")
+        .unwrap_or(1);
+    let last_ret = ctx
+        .resolve_field_index("java/util/ArrayList$Itr", "lastRet")
+        .unwrap_or(2);
+    let expected_mod_count = ctx.resolve_field_index(
+        "java/util/ArrayList$Itr",
+        "expectedModCount",
+    );
+    let parent_list = ctx
+        .resolve_field_index("java/util/ArrayList$Itr", "this$0")
+        .unwrap_or(0);
+    let child_list = ctx
+        .resolve_field_index("java/util/ArrayList$ListItr", "this$0")
+        .filter(|slot| *slot != parent_list);
+    (cursor, last_ret, expected_mod_count, parent_list, child_list)
+}
+
+fn set_field_if_present(ctx: &mut dyn NativeContext, obj: ObjectRef, slot: usize, value: Value) {
+    if slot < ctx.object_num_fields(obj) {
+        ctx.set_field(obj, slot, value);
+    }
+}
+
+fn native_arraylist_size(ctx: &mut dyn NativeContext, list: ObjectRef) -> i32 {
+    match cratonvm_native_collections::native_al_size(ctx, &[Value::Object(Some(list))]) {
+        Ok(Some(Value::Int(size))) => size.max(0),
+        _ => 0,
+    }
+}
+
 fn native_arraylist_list_iterator(
     ctx: &mut dyn NativeContext,
     args: &[Value],
 ) -> MethodCallResult {
     let this = obj_arg(args, 0)?;
-    let arr = match cratonvm_native_collections::native_al_to_array(
-        ctx,
-        &[Value::Object(Some(this))],
-    )? {
-        Some(Value::Object(Some(arr))) => arr,
-        _ => ctx.new_array(cratonvm_types::ArrayElementType::Reference, 0),
-    };
-    let len = ctx.array_length(arr) as i32;
+    let len = native_arraylist_size(ctx, this);
     let mut cursor = match args.get(1) {
         Some(Value::Int(v)) => *v,
         _ => 0,
@@ -64170,10 +64198,37 @@ fn native_arraylist_list_iterator(
     } else if cursor > len {
         cursor = len;
     }
-    let itr = alloc_concurrent_synthetic(ctx, "java/util/ArrayList$ListItr", 2);
-    ctx.set_field(itr, 0, Value::Object(Some(arr)));
-    ctx.set_field(itr, 1, Value::Int(cursor));
+
+    let itr = alloc_concurrent_synthetic(ctx, "java/util/ArrayList$ListItr", 5);
+    let (cursor_slot, last_ret_slot, expected_slot, parent_list_slot, child_list_slot) =
+        native_arraylist_list_itr_slots(ctx);
+    set_field_if_present(ctx, itr, parent_list_slot, Value::Object(Some(this)));
+    if let Some(slot) = child_list_slot {
+        set_field_if_present(ctx, itr, slot, Value::Object(Some(this)));
+    }
+    set_field_if_present(ctx, itr, cursor_slot, Value::Int(cursor));
+    set_field_if_present(ctx, itr, last_ret_slot, Value::Int(-1));
+    if let Some(slot) = expected_slot {
+        let mod_count = ctx.get_field_by_name(this, "modCount").as_int().unwrap_or(0);
+        set_field_if_present(ctx, itr, slot, Value::Int(mod_count));
+    }
     Ok(Some(Value::Object(Some(itr))))
+}
+
+fn native_arraylist_list_itr_list(
+    ctx: &mut dyn NativeContext,
+    this: ObjectRef,
+) -> Option<ObjectRef> {
+    let (_, _, _, parent_list_slot, child_list_slot) = native_arraylist_list_itr_slots(ctx);
+    if let Some(slot) = child_list_slot {
+        if let Value::Object(Some(list)) = ctx.get_field(this, slot) {
+            return Some(list);
+        }
+    }
+    match ctx.get_field(this, parent_list_slot) {
+        Value::Object(Some(list)) => Some(list),
+        _ => None,
+    }
 }
 
 fn native_snapshot_itr_has_next(
@@ -64181,12 +64236,12 @@ fn native_snapshot_itr_has_next(
     args: &[Value],
 ) -> MethodCallResult {
     let this = obj_arg(args, 0)?;
-    let cursor = ctx.get_field(this, 1).as_int().unwrap_or(0).max(0) as usize;
-    let len = match ctx.get_field(this, 0) {
-        Value::Object(Some(arr)) => ctx.array_length(arr),
-        _ => 0,
-    };
-    Ok(Some(Value::Int((cursor < len) as i32)))
+    let (cursor_slot, _, _, _, _) = native_arraylist_list_itr_slots(ctx);
+    let cursor = ctx.get_field(this, cursor_slot).as_int().unwrap_or(0).max(0);
+    let size = native_arraylist_list_itr_list(ctx, this)
+        .map(|list| native_arraylist_size(ctx, list))
+        .unwrap_or(0);
+    Ok(Some(Value::Int((cursor < size) as i32)))
 }
 
 fn native_snapshot_itr_next(
@@ -64194,17 +64249,22 @@ fn native_snapshot_itr_next(
     args: &[Value],
 ) -> MethodCallResult {
     let this = obj_arg(args, 0)?;
-    let arr = match ctx.get_field(this, 0) {
-        Value::Object(Some(arr)) => arr,
-        _ => return Ok(Some(Value::Object(None))),
+    let (cursor_slot, last_ret_slot, _, _, _) = native_arraylist_list_itr_slots(ctx);
+    let cursor = ctx.get_field(this, cursor_slot).as_int().unwrap_or(0).max(0);
+    let list = match native_arraylist_list_itr_list(ctx, this) {
+        Some(list) => list,
+        None => return Ok(Some(Value::Object(None))),
     };
-    let cursor = ctx.get_field(this, 1).as_int().unwrap_or(0).max(0) as usize;
-    if cursor >= ctx.array_length(arr) {
+    if cursor >= native_arraylist_size(ctx, list) {
         return Ok(Some(Value::Object(None)));
     }
-    let value = ctx.get_array_element(arr, cursor);
-    ctx.set_field(this, 1, Value::Int((cursor + 1) as i32));
-    Ok(Some(value))
+    let value = cratonvm_native_collections::native_al_get(
+        ctx,
+        &[Value::Object(Some(list)), Value::Int(cursor)],
+    )?;
+    ctx.set_field(this, cursor_slot, Value::Int(cursor + 1));
+    ctx.set_field(this, last_ret_slot, Value::Int(cursor));
+    Ok(value)
 }
 
 fn native_snapshot_list_itr_has_previous(
@@ -64212,8 +64272,9 @@ fn native_snapshot_list_itr_has_previous(
     args: &[Value],
 ) -> MethodCallResult {
     let this = obj_arg(args, 0)?;
+    let (cursor_slot, _, _, _, _) = native_arraylist_list_itr_slots(ctx);
     Ok(Some(Value::Int(
-        (ctx.get_field(this, 1).as_int().unwrap_or(0) > 0) as i32,
+        (ctx.get_field(this, cursor_slot).as_int().unwrap_or(0) > 0) as i32,
     )))
 }
 
@@ -64222,17 +64283,23 @@ fn native_snapshot_list_itr_previous(
     args: &[Value],
 ) -> MethodCallResult {
     let this = obj_arg(args, 0)?;
-    let arr = match ctx.get_field(this, 0) {
-        Value::Object(Some(arr)) => arr,
-        _ => return Ok(Some(Value::Object(None))),
-    };
-    let cursor = ctx.get_field(this, 1).as_int().unwrap_or(0);
+    let (cursor_slot, last_ret_slot, _, _, _) = native_arraylist_list_itr_slots(ctx);
+    let cursor = ctx.get_field(this, cursor_slot).as_int().unwrap_or(0);
     if cursor <= 0 {
         return Ok(Some(Value::Object(None)));
     }
+    let list = match native_arraylist_list_itr_list(ctx, this) {
+        Some(list) => list,
+        None => return Ok(Some(Value::Object(None))),
+    };
     let next_cursor = cursor - 1;
-    ctx.set_field(this, 1, Value::Int(next_cursor));
-    Ok(Some(ctx.get_array_element(arr, next_cursor as usize)))
+    let value = cratonvm_native_collections::native_al_get(
+        ctx,
+        &[Value::Object(Some(list)), Value::Int(next_cursor)],
+    )?;
+    ctx.set_field(this, cursor_slot, Value::Int(next_cursor));
+    ctx.set_field(this, last_ret_slot, Value::Int(next_cursor));
+    Ok(value)
 }
 
 fn native_snapshot_list_itr_next_index(
@@ -64240,7 +64307,10 @@ fn native_snapshot_list_itr_next_index(
     args: &[Value],
 ) -> MethodCallResult {
     let this = obj_arg(args, 0)?;
-    Ok(Some(Value::Int(ctx.get_field(this, 1).as_int().unwrap_or(0))))
+    let (cursor_slot, _, _, _, _) = native_arraylist_list_itr_slots(ctx);
+    Ok(Some(Value::Int(
+        ctx.get_field(this, cursor_slot).as_int().unwrap_or(0),
+    )))
 }
 
 fn native_snapshot_list_itr_previous_index(
@@ -64248,8 +64318,9 @@ fn native_snapshot_list_itr_previous_index(
     args: &[Value],
 ) -> MethodCallResult {
     let this = obj_arg(args, 0)?;
+    let (cursor_slot, _, _, _, _) = native_arraylist_list_itr_slots(ctx);
     Ok(Some(Value::Int(
-        ctx.get_field(this, 1).as_int().unwrap_or(0) - 1,
+        ctx.get_field(this, cursor_slot).as_int().unwrap_or(0) - 1,
     )))
 }
 
@@ -64694,18 +64765,19 @@ pub(crate) fn native_synchronized_collection(
 fn sync_collection_backing(ctx: &mut dyn NativeContext, this: ObjectRef) -> Option<ObjectRef> {
     match ctx.get_field_by_name(this, "c") {
         Value::Object(Some(c)) => Some(c),
-        _ => match ctx.get_field(this, 0) {
-            Value::Object(Some(c)) => Some(c),
-            _ => None,
-        },
+        _ => None,
     }
 }
 
 fn native_sync_collection_init(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = obj_arg(args, 0)?;
     let backing = args.get(1).copied().unwrap_or(Value::Object(None));
+    let mutex = match args.get(2).copied() {
+        Some(Value::Object(Some(mutex))) => Value::Object(Some(mutex)),
+        _ => Value::Object(Some(this)),
+    };
     ctx.set_field_by_name(this, "c", backing);
-    ctx.set_field(this, 0, backing);
+    ctx.set_field_by_name(this, "mutex", mutex);
     Ok(None)
 }
 
@@ -64786,18 +64858,19 @@ fn native_sync_collection_to_array(
 fn sync_map_backing(ctx: &mut dyn NativeContext, this: ObjectRef) -> Option<ObjectRef> {
     match ctx.get_field_by_name(this, "m") {
         Value::Object(Some(m)) => Some(m),
-        _ => match ctx.get_field(this, 0) {
-            Value::Object(Some(m)) => Some(m),
-            _ => None,
-        },
+        _ => None,
     }
 }
 
 fn native_sync_map_init(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = obj_arg(args, 0)?;
     let backing = args.get(1).copied().unwrap_or(Value::Object(None));
+    let mutex = match args.get(2).copied() {
+        Some(Value::Object(Some(mutex))) => Value::Object(Some(mutex)),
+        _ => Value::Object(Some(this)),
+    };
     ctx.set_field_by_name(this, "m", backing);
-    ctx.set_field(this, 0, backing);
+    ctx.set_field_by_name(this, "mutex", mutex);
     Ok(None)
 }
 
@@ -64947,6 +65020,12 @@ fn register_synchronized_collection_wrapper_natives(registry: &mut NativeMethodR
         ),
     ] {
         registry.register(class, "<init>", ctor_desc, native_sync_collection_init);
+        let two_arg_ctor_desc = if class == "java/util/Collections$SynchronizedSet" {
+            "(Ljava/util/Set;Ljava/lang/Object;)V"
+        } else {
+            "(Ljava/util/Collection;Ljava/lang/Object;)V"
+        };
+        registry.register(class, "<init>", two_arg_ctor_desc, native_sync_collection_init);
         registry.register(class, "add", "(Ljava/lang/Object;)Z", native_sync_collection_add);
         registry.register(
             class,
@@ -64977,6 +65056,12 @@ fn register_synchronized_collection_wrapper_natives(registry: &mut NativeMethodR
     }
     let map = "java/util/Collections$SynchronizedMap";
     registry.register(map, "<init>", "(Ljava/util/Map;)V", native_sync_map_init);
+    registry.register(
+        map,
+        "<init>",
+        "(Ljava/util/Map;Ljava/lang/Object;)V",
+        native_sync_map_init,
+    );
     registry.register(
         map,
         "get",
