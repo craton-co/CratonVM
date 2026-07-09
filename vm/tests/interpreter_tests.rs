@@ -2883,6 +2883,27 @@ fn test_s19_wildcard_extends_number() {
     }
 }
 
+// Spring GenericTypeResolver regression: same-named type variables declared by
+// different interfaces must compare by their declaring GenericDeclaration.
+#[test]
+fn test_s19_same_named_interface_type_variables() {
+    if !require_extended_interpreter_tests("test_s19_same_named_interface_type_variables") {
+        return;
+    }
+    require_class_files!();
+    let mut vm = test_vm();
+    let result = vm.invoke(
+        "cratonvm/GenericReflectionTest",
+        "testSameNamedInterfaceTypeVariables",
+        "()I",
+        &[],
+    );
+    match result {
+        Ok(Some(Value::Int(1))) => {}
+        other => panic!("Expected Ok(Some(Int(1))), got: {other:?}"),
+    }
+}
+
 // =========================================================================
 // Session 20: Full java.util.stream Support
 // =========================================================================

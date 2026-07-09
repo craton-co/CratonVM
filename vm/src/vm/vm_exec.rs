@@ -923,7 +923,10 @@ pub fn safe_native_call(
             }
         }
         Err(MethodCallFailed::ExceptionThrown(exc)) => {
-            let exc_is_current = shared.heap.is_object_address(exc.as_ptr() as usize).is_some();
+            let exc_is_current = shared
+                .heap
+                .is_object_address(exc.as_ptr() as usize)
+                .is_some();
             if !exc_is_current {
                 if let Some(obj) = thread
                     .native_pin_roots
@@ -11052,8 +11055,33 @@ fn invoke_on_class_shared_inner(
                         // entry is the gate that lets a registered native take
                         // precedence over a non-`ACC_NATIVE` JDK Java method).
                         || (class_name == "java/lang/Class"
-                            && (method_name == "getGenericInterfaces"
+                            && (method_name == "getTypeParameters"
+                                || method_name == "getGenericInterfaces"
                                 || method_name == "getGenericSuperclass"))
+                        // Spring generic metadata: Method/Constructor/Field generic
+                        // accessors are concrete JDK bytecode methods, but their
+                        // sun.reflect.generics repository path is incomplete under
+                        // CratonVM and can throw or lose Signature data. Prefer the
+                        // registered natives that parse JVMS Signature attributes.
+                        || (class_name == "java/lang/reflect/Method"
+                            && matches!(
+                                (method_name, descriptor),
+                                ("getGenericParameterTypes", "()[Ljava/lang/reflect/Type;")
+                                    | ("getGenericReturnType", "()Ljava/lang/reflect/Type;")
+                                    | ("getTypeParameters", "()[Ljava/lang/reflect/TypeVariable;")
+                            ))
+                        || (class_name == "java/lang/reflect/Constructor"
+                            && matches!(
+                                (method_name, descriptor),
+                                ("getGenericParameterTypes", "()[Ljava/lang/reflect/Type;")
+                                    | ("getTypeParameters", "()[Ljava/lang/reflect/TypeVariable;")
+                            ))
+                        || (class_name == "java/lang/reflect/Field"
+                            && method_name == "getGenericType"
+                            && descriptor == "()Ljava/lang/reflect/Type;")
+                        || (class_name == "java/lang/reflect/RecordComponent"
+                            && method_name == "getGenericType"
+                            && descriptor == "()Ljava/lang/reflect/Type;")
                         // SPB.10 / Spring `BeanWrapperImpl`: the real-JDK
                         // `java.beans.Introspector.getBeanInfo` walks
                         // `com.sun.beans.introspect.*` reflection — that
@@ -11380,6 +11408,18 @@ fn invoke_on_class_shared_inner(
                             method_name,
                             descriptor,
                         )
+                        // Spring CacheAdviceNamespaceTests: keep Spring XML
+                        // namespace validation active but force our
+                        // DefaultDocumentLoader factory bridge so it can attach
+                        // a shared Xerces grammar pool. Without this gate the
+                        // protected concrete Java method wins over the native
+                        // and every GenericXmlApplicationContext reparses the
+                        // same Spring XSDs from scratch.
+                        || (class_name
+                            == "org/springframework/beans/factory/xml/DefaultDocumentLoader"
+                            && method_name == "createDocumentBuilderFactory"
+                            && descriptor
+                                == "(IZ)Ljavax/xml/parsers/DocumentBuilderFactory;")
                         || crate::runtime::interpreter::is_liquibase_checksum_native_override(
                             class_name,
                             method_name,
@@ -11770,6 +11810,7 @@ fn invoke_on_class_shared_inner(
                                 method_name,
                                 "<init>"
                                 | "getManifest"
+                                | "getManifestFromReference"
                                 | "stream"
                                 | "entries"
                                 | "getEntry"
@@ -11778,6 +11819,20 @@ fn invoke_on_class_shared_inner(
                                 | "size"
                                 | "close"
                                 | "getName"
+                            ))
+                        || (class_name == "java/util/jar/Manifest"
+                            && matches!(
+                                (method_name, descriptor),
+                                ("<init>", "()V")
+                                    | ("<init>", "(Ljava/io/InputStream;)V")
+                                    | ("<init>", "(Ljava/io/InputStream;Ljava/lang/String;)V")
+                                    | ("<init>", "(Ljava/util/jar/Manifest;)V")
+                                    | (
+                                        "<init>",
+                                        "(Ljava/util/jar/JarVerifier;Ljava/io/InputStream;Ljava/lang/String;)V"
+                                    )
+                                    | ("getMainAttributes", "()Ljava/util/jar/Attributes;")
+                                    | ("getEntries", "()Ljava/util/Map;")
                             ))
                         // Spring Boot 3 fat-jar launcher: short-circuit
                         // JarFileArchive.getClassPathUrls so our native
@@ -12416,6 +12471,18 @@ fn invoke_on_class_shared_inner(
                             method_name,
                             descriptor,
                         )
+                        // Spring CacheAdviceNamespaceTests: keep Spring XML
+                        // namespace validation active but force our
+                        // DefaultDocumentLoader factory bridge so it can attach
+                        // a shared Xerces grammar pool. Without this gate the
+                        // protected concrete Java method wins over the native
+                        // and every GenericXmlApplicationContext reparses the
+                        // same Spring XSDs from scratch.
+                        || (class_name
+                            == "org/springframework/beans/factory/xml/DefaultDocumentLoader"
+                            && method_name == "createDocumentBuilderFactory"
+                            && descriptor
+                                == "(IZ)Ljavax/xml/parsers/DocumentBuilderFactory;")
                         || crate::runtime::interpreter::is_liquibase_checksum_native_override(
                             class_name,
                             method_name,
@@ -12835,6 +12902,11 @@ fn invoke_on_class_shared_inner(
                                 // passthrough native.
                                 | "explicitCastArguments"
                             ))
+                        || crate::runtime::interpreter::is_method_handles_varhandle_factory_native_override(
+                            class_name,
+                            method_name,
+                            descriptor,
+                        )
                         // METHODHANDLE.ASCOLLECTOR/ASSPREADER: unimplemented (real
                         // bytecode → species); Groovy's dispatch chains use
                         // `asCollector(Object[].class, n)` / `asSpreader(...)`. Pin
@@ -14146,7 +14218,9 @@ fn invoke_on_class_shared_inner(
         }
         let force_ffm_value_layout_interface_native = (class_name_for_override
             == "java/lang/foreign/ValueLayout"
-            || class_name_for_override.starts_with("java/lang/foreign/ValueLayout$"))
+            || class_name_for_override == "java/lang/foreign/AddressLayout"
+            || class_name_for_override.starts_with("java/lang/foreign/ValueLayout$")
+            || class_name_for_override.starts_with("jdk/internal/foreign/layout/ValueLayouts$"))
             && matches!(
                 method_name,
                 "byteSize"
@@ -14155,6 +14229,11 @@ fn invoke_on_class_shared_inner(
                     | "withName"
                     | "withOrder"
                     | "varHandle"
+                    | "name"
+                    | "carrier"
+                    | "order"
+                    | "targetLayout"
+                    | "withTargetLayout"
             );
         let force_ffm_memory_segment_interface_native = class_name_for_override
             == "java/lang/foreign/MemorySegment"
@@ -14184,12 +14263,19 @@ fn invoke_on_class_shared_inner(
                 method_name,
                 descriptor,
             );
+        let force_ffm_memory_layout_interface_native =
+            crate::runtime::interpreter::is_ffm_memory_layout_native_override(
+                &class_name_for_override,
+                method_name,
+                descriptor,
+            );
         let override_cb = if declaring_is_interface
             && !is_static
             && !force_ffm_value_layout_interface_native
             && !force_ffm_memory_segment_interface_native
             && !force_ffm_symbol_lookup_interface_native
             && !force_ffm_group_layout_interface_native
+            && !force_ffm_memory_layout_interface_native
         {
             None
         } else {
@@ -14346,8 +14432,7 @@ mod tests {
             ctx: &mut dyn cratonvm_native_api::NativeContext,
             _args: &[Value],
         ) -> MethodCallResult {
-            let stale =
-                unsafe { ObjectRef::from_raw(0xfeed_face_0000_1000usize as *mut u8) };
+            let stale = unsafe { ObjectRef::from_raw(0xfeed_face_0000_1000usize as *mut u8) };
             let live = ctx.alloc_object(ClassId::new(0), 0);
             ctx.pin_native_root(live);
             Err(MethodCallFailed::ExceptionThrown(stale))
@@ -14355,12 +14440,7 @@ mod tests {
 
         let shared = test_shared();
         let mut thread = JvmThread::new(ThreadId(0), "test");
-        let result = safe_native_call(
-            &shared,
-            &mut thread,
-            throwing_native,
-            &[],
-        );
+        let result = safe_native_call(&shared, &mut thread, throwing_native, &[]);
         let thrown = match result {
             Err(MethodCallFailed::ExceptionThrown(exc)) => exc,
             other => panic!("expected native Java exception, got {other:?}"),

@@ -196,12 +196,7 @@ pub fn keystore_set_cert_entry(id: i32, alias: &str, cert_der: Vec<u8>) -> bool 
 /// to `keystore_set_pending_km_identity` -- so `KeyManagerFactory.init`
 /// found no identity to stage for the TLS layer. Returns true if the store
 /// existed.
-pub fn keystore_set_key_entry(
-    id: i32,
-    alias: &str,
-    key_der: Vec<u8>,
-    chain: Vec<Vec<u8>>,
-) -> bool {
+pub fn keystore_set_key_entry(id: i32, alias: &str, key_der: Vec<u8>, chain: Vec<Vec<u8>>) -> bool {
     let mut g = registry().write();
     if let Some(store) = g.stores.get_mut(&id) {
         store.entries.insert(

@@ -78,8 +78,8 @@
 #![allow(clippy::needless_pass_by_value)]
 
 use std::collections::{HashMap, VecDeque};
-use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::net::TcpListener;
+use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex, OnceLock};
 use std::thread::{self, JoinHandle};
@@ -92,7 +92,7 @@ use cratonvm_types::{ObjectRef, Value};
 use crate::xnio_conduits::{
     SETTER_FIELD_CHANNEL_HANDLE, SETTER_FIELD_LISTENER_SLOT_INDEX, SETTER_NUM_SLOTS,
 };
-use crate::{alloc_concurrent_synthetic, obj_arg};
+use crate::{alloc_concurrent_synthetic, obj_arg, spawn_runnable_on_real_thread};
 
 // ---------------------------------------------------------------------------
 // Class names & field offsets (mirrored in class_manager.rs)
@@ -814,18 +814,21 @@ fn decode_xnio_bind_address(
         Ok(Some(Value::Int(v))) if (0..=u16::MAX as i32).contains(&v) => Some(v as u16),
         _ => None,
     };
-    let host_via_method = match ctx.invoke_virtual(
-        addr,
-        "getHostString",
-        "()Ljava/lang/String;",
-        &[],
-    ) {
-        Ok(Some(Value::Object(Some(s)))) => ctx.read_string(s),
-        _ => None,
-    };
+    let host_via_method =
+        match ctx.invoke_virtual(addr, "getHostString", "()Ljava/lang/String;", &[]) {
+            Ok(Some(Value::Object(Some(s)))) => ctx.read_string(s),
+            _ => None,
+        };
     if let Some(port) = port_via_method {
         let host = host_via_method.unwrap_or_else(|| "0.0.0.0".to_string());
-        return Ok((if host.is_empty() { "0.0.0.0".to_string() } else { host }, port));
+        return Ok((
+            if host.is_empty() {
+                "0.0.0.0".to_string()
+            } else {
+                host
+            },
+            port,
+        ));
     }
 
     let holder = match ctx.get_field_by_name(addr, "holder") {
@@ -848,9 +851,18 @@ fn decode_xnio_bind_address(
     }
     .unwrap_or_else(|| "0.0.0.0".to_string());
     let Some(port) = port else {
-        return Err(mcf_io("XnioWorker.createTcpConnectionServer: invalid bind address"));
+        return Err(mcf_io(
+            "XnioWorker.createTcpConnectionServer: invalid bind address",
+        ));
     };
-    Ok((if host.is_empty() { "0.0.0.0".to_string() } else { host }, port))
+    Ok((
+        if host.is_empty() {
+            "0.0.0.0".to_string()
+        } else {
+            host
+        },
+        port,
+    ))
 }
 
 fn alloc_accepting_channel_mirror(
@@ -861,13 +873,21 @@ fn alloc_accepting_channel_mirror(
     listener_id: u64,
 ) -> ObjectRef {
     let obj = alloc_concurrent_synthetic(ctx, CLS_ACCEPTING_CHANNEL, ACCEPT_NUM_SLOTS);
-    ctx.set_field(obj, ACCEPT_FIELD_LOCAL_ADDRESS, Value::Object(Some(local_address)));
+    ctx.set_field(
+        obj,
+        ACCEPT_FIELD_LOCAL_ADDRESS,
+        Value::Object(Some(local_address)),
+    );
     ctx.set_field(obj, ACCEPT_FIELD_ACCEPT_LISTENER, accept_listener);
     ctx.set_field(obj, ACCEPT_FIELD_CLOSE_LISTENER, Value::Object(None));
     ctx.set_field(obj, ACCEPT_FIELD_OPEN, Value::Int(1));
     ctx.set_field(obj, ACCEPT_FIELD_RESUMED, Value::Int(0));
     ctx.set_field(obj, ACCEPT_FIELD_WORKER, Value::Object(Some(worker)));
-    ctx.set_field(obj, ACCEPT_FIELD_LISTENER_ID, Value::Long(listener_id as i64));
+    ctx.set_field(
+        obj,
+        ACCEPT_FIELD_LISTENER_ID,
+        Value::Long(listener_id as i64),
+    );
     obj
 }
 
@@ -895,13 +915,8 @@ fn native_xnio_create_tcp_connection_server(
     })?;
     let _ = listener.set_nonblocking(true);
     let listener_id = register_accepting_listener(listener);
-    let channel = alloc_accepting_channel_mirror(
-        ctx,
-        worker,
-        bind_addr,
-        accept_listener,
-        listener_id,
-    );
+    let channel =
+        alloc_accepting_channel_mirror(ctx, worker, bind_addr, accept_listener, listener_id);
     Ok(Some(Value::Object(Some(channel))))
 }
 
@@ -910,7 +925,8 @@ fn make_accepting_listener_setter(
     channel: ObjectRef,
     listener_slot: usize,
 ) -> ObjectRef {
-    let setter = alloc_concurrent_synthetic(ctx, "org/xnio/ChannelListener$Setter", SETTER_NUM_SLOTS);
+    let setter =
+        alloc_concurrent_synthetic(ctx, "org/xnio/ChannelListener$Setter", SETTER_NUM_SLOTS);
     ctx.set_field(
         setter,
         SETTER_FIELD_CHANNEL_HANDLE,
@@ -981,7 +997,10 @@ fn native_accepting_is_accept_resumed(
     Ok(Some(Value::Int(if resumed { 1 } else { 0 })))
 }
 
-fn native_accepting_wakeup_accepts(_ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
+fn native_accepting_wakeup_accepts(
+    _ctx: &mut dyn NativeContext,
+    _args: &[Value],
+) -> MethodCallResult {
     Ok(None)
 }
 
@@ -1000,7 +1019,9 @@ fn native_accepting_get_worker(ctx: &mut dyn NativeContext, args: &[Value]) -> M
 fn native_accepting_get_io_thread(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = obj_arg(args, 0)?;
     match ctx.get_field(this, ACCEPT_FIELD_WORKER) {
-        Value::Object(Some(worker)) => native_worker_get_io_thread(ctx, &[Value::Object(Some(worker))]),
+        Value::Object(Some(worker)) => {
+            native_worker_get_io_thread(ctx, &[Value::Object(Some(worker))])
+        }
         _ => Ok(Some(Value::Object(None))),
     }
 }
@@ -1073,22 +1094,26 @@ fn native_worker_get_io_threads(ctx: &mut dyn NativeContext, args: &[Value]) -> 
 
 fn native_worker_execute(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = obj_arg(args, 0)?;
+    let runnable = match args.get(1) {
+        Some(Value::Object(Some(runnable))) => *runnable,
+        _ => {
+            return Err(MethodCallFailed::InternalError(VmError::Runtime(
+                RuntimeError::NullPointerException {
+                    message: Some("XnioWorker.execute: null Runnable".to_string()),
+                },
+            )));
+        }
+    };
     let worker =
         read_worker(ctx, this).ok_or_else(|| mcf_runtime("XnioWorker.execute: not registered"))?;
-    // We can't capture the bytecode Runnable across threads in the
-    // synthetic path (no JvmThread handle here).  Instead submit a
-    // no-op and let the bytecode layer post-process the result.  The
-    // Rust-facing `execute` API (tested) does the real work.
-    let submitted = worker.execute(|| {});
-    if submitted.is_err() {
+    if worker.is_shutdown() {
         return Err(MethodCallFailed::InternalError(VmError::Runtime(
             RuntimeError::IllegalStateException {
                 message: "XnioWorker.execute: worker is shutdown".to_string(),
             },
         )));
     }
-    let _ = args.get(1);
-    Ok(None)
+    spawn_runnable_on_real_thread(ctx, runnable)
 }
 
 // --- XnioWorker.shutdown / shutdownNow ---
@@ -1217,11 +1242,26 @@ fn register_accepting_channel_surface(r: &mut NativeMethodRegistry, cls: &str) {
         "(Ljava/lang/Class;)Ljava/net/SocketAddress;",
         native_accepting_get_local_address,
     );
-    r.register(cls, "suspendAccepts", "()V", native_accepting_suspend_accepts);
+    r.register(
+        cls,
+        "suspendAccepts",
+        "()V",
+        native_accepting_suspend_accepts,
+    );
     r.register(cls, "resumeAccepts", "()V", native_accepting_resume_accepts);
-    r.register(cls, "isAcceptResumed", "()Z", native_accepting_is_accept_resumed);
+    r.register(
+        cls,
+        "isAcceptResumed",
+        "()Z",
+        native_accepting_is_accept_resumed,
+    );
     r.register(cls, "wakeupAccepts", "()V", native_accepting_wakeup_accepts);
-    r.register(cls, "awaitAcceptable", "()V", native_accepting_await_acceptable);
+    r.register(
+        cls,
+        "awaitAcceptable",
+        "()V",
+        native_accepting_await_acceptable,
+    );
     r.register(
         cls,
         "awaitAcceptable",
@@ -1398,7 +1438,37 @@ pub fn register_xnio_worker_natives(r: &mut NativeMethodRegistry) {
 mod tests {
     use super::*;
     use crate::test_utils::mock_ctx;
-    use std::sync::atomic::AtomicI32;
+    use std::sync::atomic::{AtomicI32, AtomicUsize};
+
+    static NATIVE_EXECUTE_EXPECTED_RUNNABLE: AtomicUsize = AtomicUsize::new(0);
+    static NATIVE_EXECUTE_SEEN_RUNNABLE: AtomicUsize = AtomicUsize::new(0);
+
+    fn native_execute_runnable_hook(
+        _ctx: &mut crate::test_utils::MockNativeContext,
+        receiver: ObjectRef,
+        method_name: &str,
+        descriptor: &str,
+        args: &[Value],
+    ) -> Option<MethodCallResult> {
+        let expected = NATIVE_EXECUTE_EXPECTED_RUNNABLE.load(Ordering::SeqCst);
+        if expected == 0 {
+            return None;
+        }
+        let receiver_matches = receiver.as_ptr() as usize == expected;
+        let arg_matches = matches!(
+            args.first(),
+            Some(Value::Object(Some(arg))) if arg.as_ptr() as usize == expected
+        );
+        if receiver_matches && method_name == "run" && descriptor == "()V" {
+            NATIVE_EXECUTE_SEEN_RUNNABLE.fetch_add(1, Ordering::SeqCst);
+            return Some(Ok(None));
+        }
+        if arg_matches && method_name == "execute" && descriptor == "(Ljava/lang/Runnable;)V" {
+            NATIVE_EXECUTE_SEEN_RUNNABLE.fetch_add(1, Ordering::SeqCst);
+            return Some(Ok(None));
+        }
+        None
+    }
 
     #[test]
     fn t19_7_b_xnio_get_instance_returns_singleton() {
@@ -1512,6 +1582,35 @@ mod tests {
         assert_eq!(counter.load(Ordering::SeqCst), 1);
         w.shutdown_now();
         assert!(w.await_termination(Duration::from_secs(30)));
+    }
+
+    #[test]
+    fn t19_7_b_native_execute_runs_java_runnable() {
+        let w = XnioWorker::new(
+            "t19_7_b_native_exec",
+            OptionMap {
+                worker_io_threads: Some(1),
+                worker_task_core_threads: Some(1),
+            },
+        );
+        let mut ctx = mock_ctx();
+        let mirror = alloc_worker_mirror(&mut ctx, CLS_XNIO_WORKER, &w);
+        register_worker(w.clone());
+        let runnable = ctx.fresh_object_ref();
+        NATIVE_EXECUTE_EXPECTED_RUNNABLE.store(runnable.as_ptr() as usize, Ordering::SeqCst);
+        NATIVE_EXECUTE_SEEN_RUNNABLE.store(0, Ordering::SeqCst);
+        ctx.set_invoke_virtual_hook(native_execute_runnable_hook);
+
+        native_worker_execute(
+            &mut ctx,
+            &[Value::Object(Some(mirror)), Value::Object(Some(runnable))],
+        )
+        .expect("native execute should accept runnable");
+
+        assert_eq!(NATIVE_EXECUTE_SEEN_RUNNABLE.load(Ordering::SeqCst), 1);
+        NATIVE_EXECUTE_EXPECTED_RUNNABLE.store(0, Ordering::SeqCst);
+        w.shutdown_now();
+        assert!(w.await_termination(Duration::from_secs(2)));
     }
 
     #[test]
@@ -1751,16 +1850,14 @@ mod tests {
             Value::Int(1)
         );
 
-        let setter = match native_accepting_get_accept_setter(
-            &mut ctx,
-            &[Value::Object(Some(channel))],
-        )
-        .unwrap()
-        .unwrap()
-        {
-            Value::Object(Some(o)) => o,
-            other => panic!("expected setter, got {:?}", other),
-        };
+        let setter =
+            match native_accepting_get_accept_setter(&mut ctx, &[Value::Object(Some(channel))])
+                .unwrap()
+                .unwrap()
+            {
+                Value::Object(Some(o)) => o,
+                other => panic!("expected setter, got {:?}", other),
+            };
         assert_eq!(
             ctx.get_field(setter, SETTER_FIELD_CHANNEL_HANDLE),
             Value::Object(Some(channel))

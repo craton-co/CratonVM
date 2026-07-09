@@ -2494,7 +2494,10 @@ mod tls_tests {
     fn engine_result_code_translation_maps_conventions_onto_real_ordinals() {
         // This file's fake-engine convention → t27_tls real-JDK-ordinal codes.
         assert_eq!(tls_status_code_to_real(STATUS_OK), crate::t27_tls::SR_OK);
-        assert_eq!(tls_status_code_to_real(STATUS_CLOSED), crate::t27_tls::SR_CLOSED);
+        assert_eq!(
+            tls_status_code_to_real(STATUS_CLOSED),
+            crate::t27_tls::SR_CLOSED
+        );
         assert_eq!(
             tls_status_code_to_real(STATUS_BUFFER_UNDERFLOW),
             crate::t27_tls::SR_BUFFER_UNDERFLOW
@@ -2507,10 +2510,22 @@ mod tls_tests {
             tls_hs_code_to_real(HS_NOT_HANDSHAKING),
             crate::t27_tls::HS_NOT_HANDSHAKING_R
         );
-        assert_eq!(tls_hs_code_to_real(HS_NEED_WRAP), crate::t27_tls::HS_NEED_WRAP_R);
-        assert_eq!(tls_hs_code_to_real(HS_NEED_UNWRAP), crate::t27_tls::HS_NEED_UNWRAP_R);
-        assert_eq!(tls_hs_code_to_real(HS_NEED_TASK), crate::t27_tls::HS_NEED_TASK_R);
-        assert_eq!(tls_hs_code_to_real(HS_FINISHED), crate::t27_tls::HS_FINISHED_R);
+        assert_eq!(
+            tls_hs_code_to_real(HS_NEED_WRAP),
+            crate::t27_tls::HS_NEED_WRAP_R
+        );
+        assert_eq!(
+            tls_hs_code_to_real(HS_NEED_UNWRAP),
+            crate::t27_tls::HS_NEED_UNWRAP_R
+        );
+        assert_eq!(
+            tls_hs_code_to_real(HS_NEED_TASK),
+            crate::t27_tls::HS_NEED_TASK_R
+        );
+        assert_eq!(
+            tls_hs_code_to_real(HS_FINISHED),
+            crate::t27_tls::HS_FINISHED_R
+        );
         // The two conventions genuinely disagree on these — the whole reason
         // the translation exists (e.g. raw code 3 is NEED_TASK here but
         // NEED_WRAP in real-JDK ordinals).

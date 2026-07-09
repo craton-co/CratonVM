@@ -1246,11 +1246,7 @@ pub fn has_last_deopt() -> bool {
 /// helper just invoked. A non-matching frame must stay stashed so it
 /// propagates (with the sentinel) to the outer consumer that CAN attribute it.
 pub fn peek_last_deopt_identity() -> Option<(String, u32)> {
-    LAST_DEOPT.with(|c| {
-        c.borrow()
-            .as_ref()
-            .map(|f| (f.method_key.clone(), f.bci))
-    })
+    LAST_DEOPT.with(|c| c.borrow().as_ref().map(|f| (f.method_key.clone(), f.bci)))
 }
 
 /// Put a taken frame back (the take-inspect-restash pattern for consumers that
@@ -1482,7 +1478,10 @@ mod x64_deopt_entry_tests {
         assert_eq!(r, i64::MIN);
         let frame = take_last_deopt().expect("retain-mode superseded path reconstructs normally");
         assert_eq!(frame.bci, 21, "real bci, not the u32::MAX re-run sentinel");
-        assert_eq!(frame.method_key, "T.m:()V", "identity preserved for the resume sinks");
+        assert_eq!(
+            frame.method_key, "T.m:()V",
+            "identity preserved for the resume sinks"
+        );
         assert_eq!(frame.locals[0], FrameValue::Int(7));
     }
 

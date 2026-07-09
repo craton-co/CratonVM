@@ -14,7 +14,9 @@ use cratonvm_types::{ObjectRef, Value};
 
 use crate::{alloc_concurrent_synthetic, native_noop, native_noop_with_this, obj_arg};
 use crate::{native_cf_then_accept, native_cf_then_apply};
-use crate::{BI_FIELD_SIGNUM, BI_FIELD_VALUE, CHARSET_FIELD_NAME, FUT_FIELD_DONE, FUT_FIELD_RESULT};
+use crate::{
+    BI_FIELD_SIGNUM, BI_FIELD_VALUE, CHARSET_FIELD_NAME, FUT_FIELD_DONE, FUT_FIELD_RESULT,
+};
 
 // Helpers defined in lib.rs that we need
 use crate::bi_alloc;
@@ -2645,18 +2647,14 @@ fn p56_stream_flat_map_to_int(ctx: &mut dyn NativeContext, args: &[Value]) -> Me
     for (v, p) in elems.iter().zip(&pins) {
         let f = ctx.read_native_pin(func_pin, func);
         let v = read_pinned_object_value(ctx, *p, *v);
-        let int_stream_val = match ctx.invoke_virtual(
-            f,
-            "apply",
-            "(Ljava/lang/Object;)Ljava/lang/Object;",
-            &[v],
-        ) {
-            Ok(r) => r,
-            Err(e) => {
-                ctx.unpin_native_roots(func_pin);
-                return Err(e);
-            }
-        };
+        let int_stream_val =
+            match ctx.invoke_virtual(f, "apply", "(Ljava/lang/Object;)Ljava/lang/Object;", &[v]) {
+                Ok(r) => r,
+                Err(e) => {
+                    ctx.unpin_native_roots(func_pin);
+                    return Err(e);
+                }
+            };
         if let Some(Value::Object(Some(is))) = int_stream_val {
             let inner = p56_read_stream_elems(ctx, is);
             ints.extend(inner);
@@ -2680,18 +2678,14 @@ fn p56_stream_flat_map_to_long(ctx: &mut dyn NativeContext, args: &[Value]) -> M
     for (v, p) in elems.iter().zip(&pins) {
         let f = ctx.read_native_pin(func_pin, func);
         let v = read_pinned_object_value(ctx, *p, *v);
-        let long_stream_val = match ctx.invoke_virtual(
-            f,
-            "apply",
-            "(Ljava/lang/Object;)Ljava/lang/Object;",
-            &[v],
-        ) {
-            Ok(r) => r,
-            Err(e) => {
-                ctx.unpin_native_roots(func_pin);
-                return Err(e);
-            }
-        };
+        let long_stream_val =
+            match ctx.invoke_virtual(f, "apply", "(Ljava/lang/Object;)Ljava/lang/Object;", &[v]) {
+                Ok(r) => r,
+                Err(e) => {
+                    ctx.unpin_native_roots(func_pin);
+                    return Err(e);
+                }
+            };
         if let Some(Value::Object(Some(ls))) = long_stream_val {
             let inner = p56_read_stream_elems(ctx, ls);
             longs.extend(inner);
@@ -2715,18 +2709,14 @@ fn p56_stream_flat_map_to_double(ctx: &mut dyn NativeContext, args: &[Value]) ->
     for (v, p) in elems.iter().zip(&pins) {
         let f = ctx.read_native_pin(func_pin, func);
         let v = read_pinned_object_value(ctx, *p, *v);
-        let dbl_stream_val = match ctx.invoke_virtual(
-            f,
-            "apply",
-            "(Ljava/lang/Object;)Ljava/lang/Object;",
-            &[v],
-        ) {
-            Ok(r) => r,
-            Err(e) => {
-                ctx.unpin_native_roots(func_pin);
-                return Err(e);
-            }
-        };
+        let dbl_stream_val =
+            match ctx.invoke_virtual(f, "apply", "(Ljava/lang/Object;)Ljava/lang/Object;", &[v]) {
+                Ok(r) => r,
+                Err(e) => {
+                    ctx.unpin_native_roots(func_pin);
+                    return Err(e);
+                }
+            };
         if let Some(Value::Object(Some(ds))) = dbl_stream_val {
             let inner = p56_read_stream_elems(ctx, ds);
             doubles.extend(inner);
@@ -4417,7 +4407,11 @@ pub(crate) fn register_phase56_function_extras(r: &mut NativeMethodRegistry) {
             let composite = alloc_concurrent_synthetic(ctx, "java/util/function/Predicate$And", 2);
             let this = ctx.read_native_pin(this_pin, this);
             ctx.set_field(composite, 0, Value::Object(Some(this)));
-            ctx.set_field(composite, 1, read_pinned_object_value(ctx, other_pin, other));
+            ctx.set_field(
+                composite,
+                1,
+                read_pinned_object_value(ctx, other_pin, other),
+            );
             ctx.unpin_native_roots(this_pin);
             Ok(Some(Value::Object(Some(composite))))
         },
@@ -4436,7 +4430,11 @@ pub(crate) fn register_phase56_function_extras(r: &mut NativeMethodRegistry) {
             let composite = alloc_concurrent_synthetic(ctx, "java/util/function/Predicate$Or", 2);
             let this = ctx.read_native_pin(this_pin, this);
             ctx.set_field(composite, 0, Value::Object(Some(this)));
-            ctx.set_field(composite, 1, read_pinned_object_value(ctx, other_pin, other));
+            ctx.set_field(
+                composite,
+                1,
+                read_pinned_object_value(ctx, other_pin, other),
+            );
             ctx.unpin_native_roots(this_pin);
             Ok(Some(Value::Object(Some(composite))))
         },
@@ -4470,7 +4468,11 @@ pub(crate) fn register_phase56_function_extras(r: &mut NativeMethodRegistry) {
             let target_pin = pinned_object_value(ctx, target);
             let composite =
                 alloc_concurrent_synthetic(ctx, "java/util/function/Predicate$Negate", 1);
-            ctx.set_field(composite, 0, read_pinned_object_value(ctx, target_pin, target));
+            ctx.set_field(
+                composite,
+                0,
+                read_pinned_object_value(ctx, target_pin, target),
+            );
             if let Some((h, _)) = target_pin {
                 ctx.unpin_native_roots(h);
             }
@@ -4495,17 +4497,20 @@ pub(crate) fn register_phase56_function_extras(r: &mut NativeMethodRegistry) {
                 // would relocate `second`/`input` (native stale-local family).
                 let second_pin = pinned_object_value(ctx, second);
                 let input_pin = pinned_object_value(ctx, input);
-                let r1 =
-                    match ctx.invoke_virtual(first_ref, "test", "(Ljava/lang/Object;)Z", &[input])
-                    {
-                        Ok(r) => r,
-                        Err(e) => {
-                            if let Some((h, _)) = second_pin.or(input_pin) {
-                                ctx.unpin_native_roots(h);
-                            }
-                            return Err(e);
+                let r1 = match ctx.invoke_virtual(
+                    first_ref,
+                    "test",
+                    "(Ljava/lang/Object;)Z",
+                    &[input],
+                ) {
+                    Ok(r) => r,
+                    Err(e) => {
+                        if let Some((h, _)) = second_pin.or(input_pin) {
+                            ctx.unpin_native_roots(h);
                         }
-                    };
+                        return Err(e);
+                    }
+                };
                 second = read_pinned_object_value(ctx, second_pin, second);
                 input = read_pinned_object_value(ctx, input_pin, input);
                 if let Some((h, _)) = second_pin.or(input_pin) {
@@ -4537,17 +4542,20 @@ pub(crate) fn register_phase56_function_extras(r: &mut NativeMethodRegistry) {
                 // would relocate `second`/`input` (native stale-local family).
                 let second_pin = pinned_object_value(ctx, second);
                 let input_pin = pinned_object_value(ctx, input);
-                let r1 =
-                    match ctx.invoke_virtual(first_ref, "test", "(Ljava/lang/Object;)Z", &[input])
-                    {
-                        Ok(r) => r,
-                        Err(e) => {
-                            if let Some((h, _)) = second_pin.or(input_pin) {
-                                ctx.unpin_native_roots(h);
-                            }
-                            return Err(e);
+                let r1 = match ctx.invoke_virtual(
+                    first_ref,
+                    "test",
+                    "(Ljava/lang/Object;)Z",
+                    &[input],
+                ) {
+                    Ok(r) => r,
+                    Err(e) => {
+                        if let Some((h, _)) = second_pin.or(input_pin) {
+                            ctx.unpin_native_roots(h);
                         }
-                    };
+                        return Err(e);
+                    }
+                };
                 second = read_pinned_object_value(ctx, second_pin, second);
                 input = read_pinned_object_value(ctx, input_pin, input);
                 if let Some((h, _)) = second_pin.or(input_pin) {
@@ -4603,7 +4611,11 @@ pub(crate) fn register_phase56_function_extras(r: &mut NativeMethodRegistry) {
                 alloc_concurrent_synthetic(ctx, "java/util/function/Function$Compose", 2);
             let this = ctx.read_native_pin(this_pin, this);
             ctx.set_field(composite, 0, Value::Object(Some(this)));
-            ctx.set_field(composite, 1, read_pinned_object_value(ctx, before_pin, before));
+            ctx.set_field(
+                composite,
+                1,
+                read_pinned_object_value(ctx, before_pin, before),
+            );
             ctx.unpin_native_roots(this_pin);
             Ok(Some(Value::Object(Some(composite))))
         },
@@ -4623,7 +4635,11 @@ pub(crate) fn register_phase56_function_extras(r: &mut NativeMethodRegistry) {
                 alloc_concurrent_synthetic(ctx, "java/util/function/Function$AndThen", 2);
             let this = ctx.read_native_pin(this_pin, this);
             ctx.set_field(composite, 0, Value::Object(Some(this)));
-            ctx.set_field(composite, 1, read_pinned_object_value(ctx, after_pin, after));
+            ctx.set_field(
+                composite,
+                1,
+                read_pinned_object_value(ctx, after_pin, after),
+            );
             ctx.unpin_native_roots(this_pin);
             Ok(Some(Value::Object(Some(composite))))
         },
@@ -4656,7 +4672,11 @@ pub(crate) fn register_phase56_function_extras(r: &mut NativeMethodRegistry) {
                 alloc_concurrent_synthetic(ctx, "java/util/function/Consumer$AndThen", 2);
             let this = ctx.read_native_pin(this_pin, this);
             ctx.set_field(composite, 0, Value::Object(Some(this)));
-            ctx.set_field(composite, 1, read_pinned_object_value(ctx, after_pin, after));
+            ctx.set_field(
+                composite,
+                1,
+                read_pinned_object_value(ctx, after_pin, after),
+            );
             ctx.unpin_native_roots(this_pin);
             Ok(Some(Value::Object(Some(composite))))
         },
@@ -5471,7 +5491,8 @@ fn native_quarkus_logging_handle_failed_start(
         let recorder_pin = ctx.pin_native_root(recorder);
         let log_build_cur = ctx.read_native_pin(log_build_pin, log_build);
         let log_runtime_rv_cur = ctx.read_native_pin(log_runtime_rv_pin, log_runtime_rv);
-        let console_runtime_rv_cur = ctx.read_native_pin(console_runtime_rv_pin, console_runtime_rv);
+        let console_runtime_rv_cur =
+            ctx.read_native_pin(console_runtime_rv_pin, console_runtime_rv);
         ctx.invoke(
             "io/quarkus/runtime/logging/LoggingSetupRecorder",
             "<init>",
@@ -7418,18 +7439,24 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
 
         let this = ctx.read_native_pin(root_pin, this);
         ctx.set_field_by_name(result, "this$0", ctx.get_field_by_name(this, "this$0"));
-        ctx.set_field_by_name(result, "maxLength", ctx.get_field_by_name(this, "maxLength"));
+        ctx.set_field_by_name(
+            result,
+            "maxLength",
+            ctx.get_field_by_name(this, "maxLength"),
+        );
         ctx.set_field_by_name(result, "from", Value::Int(0));
         ctx.set_field_by_name(result, "length", Value::Int(combined_len));
         ctx.set_field_by_name(result, "plain", Value::Object(Some(plain)));
         ctx.set_field_by_name(result, "sections", Value::Object(Some(section_list)));
         ctx.unpin_native_roots(section_list_pin);
-        ctx.set_field_by_name(result, "colorScheme", ctx.get_field_by_name(this, "colorScheme"));
+        ctx.set_field_by_name(
+            result,
+            "colorScheme",
+            ctx.get_field_by_name(this, "colorScheme"),
+        );
         ctx.unpin_native_roots(root_pin);
         Ok(Some(Value::Object(Some(result))))
     }
-
-
 
     fn picocli_is_code_point_cjk(cp: i32) -> bool {
         cp == 0x00B1
@@ -7453,7 +7480,11 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
     fn picocli_cjk_adjusted_len(s: &str) -> i32 {
         let mut width: i32 = 0;
         for ch in s.chars() {
-            width = width.saturating_add(if picocli_is_code_point_cjk(ch as i32) { 2 } else { 1 });
+            width = width.saturating_add(if picocli_is_code_point_cjk(ch as i32) {
+                2
+            } else {
+                1
+            });
         }
         width
     }
@@ -7479,7 +7510,11 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
             Some(Value::Int(v)) => *v,
             _ => 0,
         };
-        Ok(Some(Value::Int(if picocli_is_code_point_cjk(cp) { 1 } else { 0 })))
+        Ok(Some(Value::Int(if picocli_is_code_point_cjk(cp) {
+            1
+        } else {
+            0
+        })))
     }
 
     fn native_picocli_text_get_cjk_adjusted_length(
@@ -7536,7 +7571,6 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
         native_picocli_text_get_cjk_adjusted_length,
     );
 
-
     // --- Keycloak PropertyMappers$WildcardMappersConfig.get(String) ---
     // `PicocliTest` repeatedly walks SmallRye config property names while
     // sanitizing command mappers. The Java implementation routes every kc.* /
@@ -7547,8 +7581,7 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
     fn keycloak_wildcard_value_valid(value: &str) -> bool {
         !value.is_empty()
             && value.chars().all(|ch| {
-                ch.is_ascii_alphanumeric()
-                    || matches!(ch, '[' | ']' | '$' | '-' | '.' | '_')
+                ch.is_ascii_alphanumeric() || matches!(ch, '[' | ']' | '$' | '-' | '.' | '_')
             })
     }
 
@@ -7675,7 +7708,6 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
         Value::Object(Some(optional))
     }
 
-
     fn keycloak_is_not_blank(value: &str) -> bool {
         value.chars().any(|ch| !ch.is_whitespace())
     }
@@ -7786,7 +7818,6 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
         "(Ljava/lang/String;)Ljava/util/Optional;",
         native_keycloak_wildcard_extract_value,
     );
-
 
     // --- SmallRyeConfigSources.getValue / MapBackedConfigValueConfigSource.getConfigValue ---
     // These methods are tiny dispatch loops in SmallRye config, but Picocli's
@@ -8009,7 +8040,6 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
         native_keycloak_transform_datasource_to,
     );
 
-
     fn native_keycloak_property_mapping_has_inferred_value(
         _ctx: &mut dyn NativeContext,
         _args: &[Value],
@@ -8113,147 +8143,145 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
         ctx: &mut dyn NativeContext,
         _args: &[Value],
     ) -> MethodCallResult {
-        Ok(Some(Value::Int(if keycloak_log_handler_enabled(ctx, "console") {
-            1
-        } else {
-            0
-        })))
+        Ok(Some(Value::Int(
+            if keycloak_log_handler_enabled(ctx, "console") {
+                1
+            } else {
+                0
+            },
+        )))
     }
 
     fn native_keycloak_log_file_enabled(
         ctx: &mut dyn NativeContext,
         _args: &[Value],
     ) -> MethodCallResult {
-        Ok(Some(Value::Int(if keycloak_log_handler_enabled(ctx, "file") {
-            1
-        } else {
-            0
-        })))
+        Ok(Some(Value::Int(
+            if keycloak_log_handler_enabled(ctx, "file") {
+                1
+            } else {
+                0
+            },
+        )))
     }
 
     fn native_keycloak_log_syslog_enabled(
         ctx: &mut dyn NativeContext,
         _args: &[Value],
     ) -> MethodCallResult {
-        Ok(Some(Value::Int(if keycloak_log_handler_enabled(ctx, "syslog") {
-            1
-        } else {
-            0
-        })))
+        Ok(Some(Value::Int(
+            if keycloak_log_handler_enabled(ctx, "syslog") {
+                1
+            } else {
+                0
+            },
+        )))
     }
 
     fn native_keycloak_log_console_async_enabled(
         ctx: &mut dyn NativeContext,
         _args: &[Value],
     ) -> MethodCallResult {
-        Ok(Some(Value::Int(if keycloak_log_async_enabled(
-            ctx,
-            "console",
-            "log-console-async",
-        ) {
-            1
-        } else {
-            0
-        })))
+        Ok(Some(Value::Int(
+            if keycloak_log_async_enabled(ctx, "console", "log-console-async") {
+                1
+            } else {
+                0
+            },
+        )))
     }
 
     fn native_keycloak_log_file_async_enabled(
         ctx: &mut dyn NativeContext,
         _args: &[Value],
     ) -> MethodCallResult {
-        Ok(Some(Value::Int(if keycloak_log_async_enabled(
-            ctx,
-            "file",
-            "log-file-async",
-        ) {
-            1
-        } else {
-            0
-        })))
+        Ok(Some(Value::Int(
+            if keycloak_log_async_enabled(ctx, "file", "log-file-async") {
+                1
+            } else {
+                0
+            },
+        )))
     }
 
     fn native_keycloak_log_syslog_async_enabled(
         ctx: &mut dyn NativeContext,
         _args: &[Value],
     ) -> MethodCallResult {
-        Ok(Some(Value::Int(if keycloak_log_async_enabled(
-            ctx,
-            "syslog",
-            "log-syslog-async",
-        ) {
-            1
-        } else {
-            0
-        })))
+        Ok(Some(Value::Int(
+            if keycloak_log_async_enabled(ctx, "syslog", "log-syslog-async") {
+                1
+            } else {
+                0
+            },
+        )))
     }
 
     fn native_keycloak_log_console_json_enabled(
         ctx: &mut dyn NativeContext,
         _args: &[Value],
     ) -> MethodCallResult {
-        Ok(Some(Value::Int(if keycloak_log_output_json(
-            ctx,
-            "console",
-            "log-console-output",
-        ) {
-            1
-        } else {
-            0
-        })))
+        Ok(Some(Value::Int(
+            if keycloak_log_output_json(ctx, "console", "log-console-output") {
+                1
+            } else {
+                0
+            },
+        )))
     }
 
     fn native_keycloak_log_file_json_enabled(
         ctx: &mut dyn NativeContext,
         _args: &[Value],
     ) -> MethodCallResult {
-        Ok(Some(Value::Int(if keycloak_log_output_json(
-            ctx,
-            "file",
-            "log-file-output",
-        ) {
-            1
-        } else {
-            0
-        })))
+        Ok(Some(Value::Int(
+            if keycloak_log_output_json(ctx, "file", "log-file-output") {
+                1
+            } else {
+                0
+            },
+        )))
     }
 
     fn native_keycloak_log_syslog_json_enabled(
         ctx: &mut dyn NativeContext,
         _args: &[Value],
     ) -> MethodCallResult {
-        Ok(Some(Value::Int(if keycloak_log_output_json(
-            ctx,
-            "syslog",
-            "log-syslog-output",
-        ) {
-            1
-        } else {
-            0
-        })))
+        Ok(Some(Value::Int(
+            if keycloak_log_output_json(ctx, "syslog", "log-syslog-output") {
+                1
+            } else {
+                0
+            },
+        )))
     }
 
     fn native_keycloak_log_file_rotation_enabled(
         ctx: &mut dyn NativeContext,
         _args: &[Value],
     ) -> MethodCallResult {
-        Ok(Some(Value::Int(if keycloak_log_handler_enabled(ctx, "file")
-            && keycloak_cli_bool(ctx, "log-file-rotation-enabled").unwrap_or(false)
-        {
-            1
-        } else {
-            0
-        })))
+        Ok(Some(Value::Int(
+            if keycloak_log_handler_enabled(ctx, "file")
+                && keycloak_cli_bool(ctx, "log-file-rotation-enabled").unwrap_or(false)
+            {
+                1
+            } else {
+                0
+            },
+        )))
     }
 
     fn native_keycloak_log_mdc_active(
         ctx: &mut dyn NativeContext,
         _args: &[Value],
     ) -> MethodCallResult {
-        Ok(Some(Value::Int(if keycloak_cli_bool(ctx, "log-mdc-enabled").unwrap_or(false) {
-            1
-        } else {
-            0
-        })))
+        Ok(Some(Value::Int(
+            if keycloak_cli_bool(ctx, "log-mdc-enabled").unwrap_or(false) {
+                1
+            } else {
+                0
+            },
+        )))
     }
 
     fn keycloak_boolean_result(enabled: bool) -> Value {
@@ -8303,7 +8331,9 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
         ctx: &mut dyn NativeContext,
         _args: &[Value],
     ) -> MethodCallResult {
-        Ok(Some(keycloak_boolean_result(keycloak_cache_set_to_infinispan(ctx))))
+        Ok(Some(keycloak_boolean_result(
+            keycloak_cache_set_to_infinispan(ctx),
+        )))
     }
 
     fn native_keycloak_tracing_enabled(
@@ -8326,21 +8356,27 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
         ctx: &mut dyn NativeContext,
         _args: &[Value],
     ) -> MethodCallResult {
-        Ok(Some(keycloak_boolean_result(keycloak_telemetry_enabled(ctx))))
+        Ok(Some(keycloak_boolean_result(keycloak_telemetry_enabled(
+            ctx,
+        ))))
     }
 
     fn native_keycloak_telemetry_logs_enabled(
         ctx: &mut dyn NativeContext,
         _args: &[Value],
     ) -> MethodCallResult {
-        Ok(Some(keycloak_boolean_result(keycloak_telemetry_logs_enabled(ctx))))
+        Ok(Some(keycloak_boolean_result(
+            keycloak_telemetry_logs_enabled(ctx),
+        )))
     }
 
     fn native_keycloak_telemetry_metrics_enabled(
         ctx: &mut dyn NativeContext,
         _args: &[Value],
     ) -> MethodCallResult {
-        Ok(Some(keycloak_boolean_result(keycloak_telemetry_metrics_enabled(ctx))))
+        Ok(Some(keycloak_boolean_result(
+            keycloak_telemetry_metrics_enabled(ctx),
+        )))
     }
 
     fn native_jaxrs_multivalued_map_add(
@@ -8384,13 +8420,14 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
         let list = match list_value {
             Some(Value::Object(Some(o))) => o,
             _ => {
-                let new_list = match ctx.new_object_initialized("java/util/LinkedList", "()V", &[])? {
-                    Some(Value::Object(Some(o))) => o,
-                    _ => {
-                        ctx.unpin_native_roots(base_pin);
-                        return Ok(None);
-                    }
-                };
+                let new_list =
+                    match ctx.new_object_initialized("java/util/LinkedList", "()V", &[])? {
+                        Some(Value::Object(Some(o))) => o,
+                        _ => {
+                            ctx.unpin_native_roots(base_pin);
+                            return Ok(None);
+                        }
+                    };
                 let list_pin = ctx.pin_native_root(new_list);
                 let current_key = match (key, key_pin) {
                     (Value::Object(Some(o)), Some(pin)) => {
@@ -8460,7 +8497,9 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
         let element_class = ctx.class_name_of_id(ctx.class_id_of_object(element));
         match element_class.as_deref() {
             Some("java/lang/reflect/Field") => {
-                if let Some((class_id, field_name)) = crate::lang_class::field_class_and_name(ctx, element) {
+                if let Some((class_id, field_name)) =
+                    crate::lang_class::field_class_and_name(ctx, element)
+                {
                     let present = ctx
                         .field_annotations(class_id, &field_name)
                         .iter()
@@ -8566,7 +8605,11 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
             (value, ctx.read_string(default_obj))
         {
             if let Some(value_string) = ctx.read_string(value_obj) {
-                return Ok(Some(Value::Int(if value_string != default_string { 1 } else { 0 })));
+                return Ok(Some(Value::Int(if value_string != default_string {
+                    1
+                } else {
+                    0
+                })));
             }
         }
 
@@ -8617,7 +8660,6 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
         })))
     }
 
-
     fn keycloak_similarity_bigram_frequency(s: &str) -> rustc_hash::FxHashMap<(u16, u16), i32> {
         let units: Vec<u16> = s.encode_utf16().collect();
         let mut freq = rustc_hash::FxHashMap::default();
@@ -8639,14 +8681,21 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
             .sum()
     }
 
-    fn keycloak_cosine_similarity(lower_input_freq: &rustc_hash::FxHashMap<(u16, u16), i32>, candidate: &str) -> f64 {
+    fn keycloak_cosine_similarity(
+        lower_input_freq: &rustc_hash::FxHashMap<(u16, u16), i32>,
+        candidate: &str,
+    ) -> f64 {
         let candidate_lower = candidate.to_lowercase();
         let candidate_freq = keycloak_similarity_bigram_frequency(&candidate_lower);
         let dot = keycloak_similarity_dot(lower_input_freq, &candidate_freq);
         let norm_input = keycloak_similarity_dot(lower_input_freq, lower_input_freq);
         let norm_candidate = keycloak_similarity_dot(&candidate_freq, &candidate_freq);
         let denominator = (norm_input * norm_candidate).sqrt();
-        if denominator == 0.0 { 0.0 } else { dot / denominator }
+        if denominator == 0.0 {
+            0.0
+        } else {
+            dot / denominator
+        }
     }
 
     fn keycloak_similarity_result_list(
@@ -8912,7 +8961,6 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
         native_keycloak_similarity_find_similar,
     );
 
-
     // --- picocli CommandLine$Help$Ansi$Style.fg(String) / .bg(String) ---
     // Round 92: Keycloak's startup banner contains markup like `@|red ...|@`,
     // which picocli parses via `Ansi.string` -> `Style.parse` -> `Style.fg("red")`.
@@ -9096,7 +9144,12 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
         // Pin across the emptyMap invoke below — a moving young GC there would
         // relocate the fresh transformer (native stale-local family).
         let obj_pin = ctx.pin_native_root(obj);
-        if let Ok(Some(empty_map)) = ctx.invoke("java/util/Collections", "emptyMap", "()Ljava/util/Map;", &[]) {
+        if let Ok(Some(empty_map)) = ctx.invoke(
+            "java/util/Collections",
+            "emptyMap",
+            "()Ljava/util/Map;",
+            &[],
+        ) {
             let obj = ctx.read_native_pin(obj_pin, obj);
             ctx.set_field_by_name(obj, "replacements", empty_map);
             ctx.set_field_by_name(obj, "synopsis", empty_map);
@@ -9368,6 +9421,44 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
                 _ => usize::MAX,
             };
             files_walk_stream(ctx, path_obj, max_depth)
+        },
+    );
+    r.register(
+        files,
+        "find",
+        "(Ljava/nio/file/Path;ILjava/util/function/BiPredicate;[Ljava/nio/file/FileVisitOption;)Ljava/util/stream/Stream;",
+        |ctx, args| {
+            let path_obj = obj_arg(args, 0)?;
+            let p = p57_read_path(ctx, path_obj);
+            let max_depth = match args.get(1) {
+                Some(Value::Int(n)) if *n >= 0 => *n as usize,
+                _ => usize::MAX,
+            };
+            let _matcher = args.get(2).copied().unwrap_or(Value::Object(None));
+            let mut paths = Vec::new();
+            vfs_or_host_walk(&p, 0, max_depth, &mut paths);
+            let mut vals = Vec::with_capacity(paths.len());
+            for e in &paths {
+                let ep = p57_alloc_path(ctx, e);
+                let ep_pin = ctx.pin_native_root(ep);
+                let attrs = match p59_files_read_attributes(ctx, &[Value::Object(Some(ep))])? {
+                    Some(Value::Object(Some(attrs))) => attrs,
+                    _ => {
+                        ctx.unpin_native_roots(ep_pin);
+                        continue;
+                    }
+                };
+                let attrs_pin = ctx.pin_native_root(attrs);
+                let attrs = ctx.read_native_pin(attrs_pin, attrs);
+                let keep = !matches!(ctx.get_field(attrs, 3), Value::Int(v) if v != 0);
+                let ep = ctx.read_native_pin(ep_pin, ep);
+                ctx.unpin_native_roots(attrs_pin);
+                ctx.unpin_native_roots(ep_pin);
+                if keep {
+                    vals.push(Value::Object(Some(ep)));
+                }
+            }
+            cratonvm_native_collections::make_stream_from_elements(ctx, &vals)
         },
     );
 
@@ -12231,7 +12322,10 @@ fn jar_index(jar: &str) -> Option<std::sync::Arc<Vec<String>>> {
         let bytes = jar_bytes_cached(jar)?;
         let cursor = std::io::Cursor::new(bytes.as_slice());
         let zip = zip::ZipArchive::new(cursor).ok()?;
-        let mut names: Vec<String> = zip.file_names().map(|s| s.to_string()).collect();
+        let mut names: Vec<String> = zip
+            .file_names()
+            .map(|s| s.trim_start_matches('/').to_string())
+            .collect();
         names.sort_unstable();
         names.dedup();
         Some(Arc::new(names))
@@ -12248,8 +12342,13 @@ fn jarfs_read_entry(jar: &str, entry: &str) -> std::io::Result<Vec<u8>> {
     let cursor = std::io::Cursor::new(jar_bytes.as_slice());
     let mut zip = zip::ZipArchive::new(cursor)
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string()))?;
+    let entry_name = if zip.file_names().any(|name| name == entry) {
+        entry.to_string()
+    } else {
+        format!("/{entry}")
+    };
     let mut f = zip
-        .by_name(entry)
+        .by_name(&entry_name)
         .map_err(|_| std::io::Error::from(std::io::ErrorKind::NotFound))?;
     let mut buf = Vec::with_capacity(f.size().min(1 << 27) as usize);
     f.read_to_end(&mut buf)?;
@@ -12418,6 +12517,9 @@ fn jarfs_list_dir_classified(jar: &str, dir: &str) -> Vec<(String, bool)> {
             Some(j) => (&trimmed[..j], true),
             None => (trimmed, rest.ends_with('/')),
         };
+        if child.is_empty() {
+            continue;
+        }
         let e = seen.entry(format!("{prefix}{child}")).or_insert(false);
         *e = *e || is_dir;
     }
@@ -13408,13 +13510,18 @@ pub(crate) fn register_phase57_process(r: &mut NativeMethodRegistry) {
 
     // Process.toHandle() (JDK 9+) — build a ProcessHandle from the real
     // child pid captured at spawn time (see PROC_FIELD_PID above).
-    r.register(proc, "toHandle", "()Ljava/lang/ProcessHandle;", |ctx, args| {
-        let this = obj_arg(args, 0)?;
-        let pid = ctx.get_field(this, PROC_FIELD_PID);
-        let handle = alloc_concurrent_synthetic(ctx, "java/lang/ProcessHandle", 1);
-        ctx.set_field(handle, 0, pid);
-        Ok(Some(Value::Object(Some(handle))))
-    });
+    r.register(
+        proc,
+        "toHandle",
+        "()Ljava/lang/ProcessHandle;",
+        |ctx, args| {
+            let this = obj_arg(args, 0)?;
+            let pid = ctx.get_field(this, PROC_FIELD_PID);
+            let handle = alloc_concurrent_synthetic(ctx, "java/lang/ProcessHandle", 1);
+            ctx.set_field(handle, 0, pid);
+            Ok(Some(Value::Object(Some(handle))))
+        },
+    );
 
     // Process.getInputStream() — returns ByteArrayInputStream wrapping stdout bytes
     r.register(
@@ -19154,7 +19261,8 @@ fn p58_zlib_deflate(data: &[u8]) -> Option<Vec<u8>> {
     use std::os::raw::{c_char, c_int, c_ulong};
 
     type CompressBound = unsafe extern "C" fn(c_ulong) -> c_ulong;
-    type Compress2 = unsafe extern "C" fn(*mut u8, *mut c_ulong, *const u8, c_ulong, c_int) -> c_int;
+    type Compress2 =
+        unsafe extern "C" fn(*mut u8, *mut c_ulong, *const u8, c_ulong, c_int) -> c_int;
 
     unsafe fn sym<T>(handle: *mut c_void, name: &'static [u8]) -> Option<T> {
         let ptr = libc::dlsym(handle, name.as_ptr() as *const c_char);
@@ -20742,6 +20850,7 @@ pub fn register_p59_jar(r: &mut NativeMethodRegistry) {
     r.set_category(cratonvm_native_api::NativeKind::Bridge);
     let jf = "java/util/jar/JarFile";
     r.register(jf, "<init>", "(Ljava/lang/String;)V", p59_jar_file_init);
+    r.register(jf, "<init>", "(Ljava/lang/String;Z)V", p59_jar_file_init);
     r.register(jf, "<init>", "(Ljava/io/File;)V", p59_jar_file_init_file);
     // File-first overloads. `p59_jar_file_init_file` only reads args[1] (the
     // File) and ignores the rest, so the verify/mode/Runtime.Version variants
@@ -20762,10 +20871,13 @@ pub fn register_p59_jar(r: &mut NativeMethodRegistry) {
         jf,
         "getManifest",
         "()Ljava/util/jar/Manifest;",
-        |ctx, args| {
-            let this = obj_arg(args, 0)?;
-            Ok(Some(ctx.get_field(this, 1)))
-        },
+        p59_jar_file_manifest,
+    );
+    r.register(
+        jf,
+        "getManifestFromReference",
+        "()Ljava/util/jar/Manifest;",
+        p59_jar_file_manifest,
     );
     r.register(
         jf,
@@ -21056,6 +21168,8 @@ pub fn register_p59_jar(r: &mut NativeMethodRegistry) {
         let attrs = ctx.read_native_pin(attrs_pin, attrs);
         ctx.set_field(this, 0, Value::Object(Some(attrs)));
         ctx.set_field(this, 1, Value::Object(Some(entries)));
+        ctx.set_field_by_name(this, "attr", Value::Object(Some(attrs)));
+        ctx.set_field_by_name(this, "entries", Value::Object(Some(entries)));
         ctx.unpin_native_roots(this_pin);
         Ok(None)
     });
@@ -21067,15 +21181,41 @@ pub fn register_p59_jar(r: &mut NativeMethodRegistry) {
     );
     r.register(
         mf,
+        "<init>",
+        "(Ljava/io/InputStream;Ljava/lang/String;)V",
+        p59_manifest_init_from_input_stream,
+    );
+    r.register(
+        mf,
+        "<init>",
+        "(Ljava/util/jar/JarVerifier;Ljava/io/InputStream;Ljava/lang/String;)V",
+        p59_manifest_init_from_verified_input_stream,
+    );
+    r.register(
+        mf,
+        "<init>",
+        "(Ljava/util/jar/Manifest;)V",
+        p59_manifest_init_copy,
+    );
+    r.register(
+        mf,
         "getMainAttributes",
         "()Ljava/util/jar/Attributes;",
         |ctx, args| {
             let this = obj_arg(args, 0)?;
+            let by_name = ctx.get_field_by_name(this, "attr");
+            if matches!(by_name, Value::Object(Some(_))) {
+                return Ok(Some(by_name));
+            }
             Ok(Some(ctx.get_field(this, 0)))
         },
     );
     r.register(mf, "getEntries", "()Ljava/util/Map;", |ctx, args| {
         let this = obj_arg(args, 0)?;
+        let by_name = ctx.get_field_by_name(this, "entries");
+        if matches!(by_name, Value::Object(Some(_))) {
+            return Ok(Some(by_name));
+        }
         Ok(Some(ctx.get_field(this, 1)))
     });
 
@@ -22340,8 +22480,8 @@ fn sb2_launcher_create_class_loader_bypass_archive_walk(
 ) -> MethodCallResult {
     let this = obj_arg(args, 0)?;
     let _ = args.get(1); // ignored — rebuilt from the launcher mirror
-    // Pin across the archive scan / URL[] alloc below — a moving young GC
-    // there would relocate them (native stale-local family).
+                         // Pin across the archive scan / URL[] alloc below — a moving young GC
+                         // there would relocate them (native stale-local family).
     let this_pin = ctx.pin_native_root(this);
     let archives = sb2_launcher_build_archive_list(ctx, this);
     let mut urls: Vec<ObjectRef> = Vec::with_capacity(archives.len());
@@ -22474,10 +22614,40 @@ fn p59_jar_file_init(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallR
     };
     let this = ctx.read_native_pin(this_pin, this);
     ctx.set_field(this, 0, slot0_val);
+    ctx.set_field_by_name(this, "name", slot0_val);
     // Try to read the real MANIFEST.MF
     let manifest = p98_read_jar_manifest(ctx, &path);
+    let manifest_pin = match manifest {
+        Value::Object(Some(m)) => Some((ctx.pin_native_root(m), m)),
+        _ => None,
+    };
+    let manifest_ref = if let Some((pin, fallback)) = manifest_pin {
+        let manifest_obj = ctx.read_native_pin(pin, fallback);
+        match ctx.new_object_initialized(
+            "java/lang/ref/SoftReference",
+            "(Ljava/lang/Object;)V",
+            &[Value::Object(Some(manifest_obj))],
+        ) {
+            Ok(Some(Value::Object(Some(sr)))) => {
+                let manifest_obj = ctx.read_native_pin(pin, fallback);
+                ctx.set_field_by_name(sr, "referent", Value::Object(Some(manifest_obj)));
+                Value::Object(Some(sr))
+            }
+            _ => Value::Object(None),
+        }
+    } else {
+        Value::Object(None)
+    };
     let this = ctx.read_native_pin(this_pin, this);
+    let manifest = match manifest_pin {
+        Some((pin, fallback)) => Value::Object(Some(ctx.read_native_pin(pin, fallback))),
+        None => manifest,
+    };
     ctx.set_field(this, 1, manifest);
+    ctx.set_field_by_name(this, "manRef", manifest_ref);
+    if let Some((pin, _)) = manifest_pin {
+        ctx.unpin_native_roots(pin);
+    }
     ctx.unpin_native_roots(this_pin);
     Ok(None)
 }
@@ -22490,6 +22660,7 @@ fn p59_jar_file_init_file(ctx: &mut dyn NativeContext, args: &[Value]) -> Method
         Value::Object(None)
     };
     ctx.set_field(this, 0, path_val);
+    ctx.set_field_by_name(this, "name", path_val);
     let path = if let Value::Object(Some(s)) = path_val {
         ctx.read_string(s).unwrap_or_default()
     } else {
@@ -22502,10 +22673,55 @@ fn p59_jar_file_init_file(ctx: &mut dyn NativeContext, args: &[Value]) -> Method
     // relocate `this` (native stale-local family).
     let this_pin = ctx.pin_native_root(this);
     let manifest = p98_read_jar_manifest(ctx, &path);
+    let manifest_pin = match manifest {
+        Value::Object(Some(m)) => Some((ctx.pin_native_root(m), m)),
+        _ => None,
+    };
+    let manifest_ref = if let Some((pin, fallback)) = manifest_pin {
+        let manifest_obj = ctx.read_native_pin(pin, fallback);
+        match ctx.new_object_initialized(
+            "java/lang/ref/SoftReference",
+            "(Ljava/lang/Object;)V",
+            &[Value::Object(Some(manifest_obj))],
+        ) {
+            Ok(Some(Value::Object(Some(sr)))) => {
+                let manifest_obj = ctx.read_native_pin(pin, fallback);
+                ctx.set_field_by_name(sr, "referent", Value::Object(Some(manifest_obj)));
+                Value::Object(Some(sr))
+            }
+            _ => Value::Object(None),
+        }
+    } else {
+        Value::Object(None)
+    };
     let this = ctx.read_native_pin(this_pin, this);
+    let manifest = match manifest_pin {
+        Some((pin, fallback)) => Value::Object(Some(ctx.read_native_pin(pin, fallback))),
+        None => manifest,
+    };
     ctx.set_field(this, 1, manifest);
+    ctx.set_field_by_name(this, "manRef", manifest_ref);
+    if let Some((pin, _)) = manifest_pin {
+        ctx.unpin_native_roots(pin);
+    }
     ctx.unpin_native_roots(this_pin);
     Ok(None)
+}
+
+fn p59_jar_file_path(ctx: &mut dyn NativeContext, this: ObjectRef) -> String {
+    match ctx.get_field(this, 0) {
+        Value::Object(Some(s)) => ctx.read_string(s).unwrap_or_default(),
+        _ => match ctx.get_field_by_name(this, "name") {
+            Value::Object(Some(s)) => ctx.read_string(s).unwrap_or_default(),
+            _ => String::new(),
+        },
+    }
+}
+
+fn p59_jar_file_manifest(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = obj_arg(args, 0)?;
+    let path = p59_jar_file_path(ctx, this);
+    Ok(Some(p98_read_jar_manifest(ctx, &path)))
 }
 
 /// Read MANIFEST.MF from a JAR file and create a Manifest synthetic object.
@@ -22558,10 +22774,13 @@ fn p98_read_jar_manifest(ctx: &mut dyn NativeContext, path: &str) -> Value {
     let man_pin = ctx.pin_native_root(manifest);
     let attrs = match ctx.get_field(manifest, 0) {
         Value::Object(Some(a)) => a,
-        _ => {
-            ctx.unpin_native_roots(man_pin);
-            return Value::Object(None);
-        }
+        _ => match ctx.get_field_by_name(manifest, "attr") {
+            Value::Object(Some(a)) => a,
+            _ => {
+                ctx.unpin_native_roots(man_pin);
+                return Value::Object(None);
+            }
+        },
     };
     let attrs_pin = ctx.pin_native_root(attrs);
     let ok = p59_attrs_populate_real(ctx, attrs_pin, attrs, &pairs).is_ok();
@@ -22639,15 +22858,25 @@ fn p59_read_input_stream_fully(
     let class_name = ctx.class_name_of_id(cid).unwrap_or_default();
     if class_name == "java/io/ByteArrayInputStream" {
         // Layout: buf=0 ([B), pos=1 (I), mark=2 (I), count=3 (I).
-        let pos = match ctx.get_field(stream, 1) {
+        let pos = match ctx.get_field_by_name(stream, "pos") {
             Value::Int(v) => v.max(0) as usize,
-            _ => 0,
+            _ => match ctx.get_field(stream, 1) {
+                Value::Int(v) => v.max(0) as usize,
+                _ => 0,
+            },
         };
-        let count = match ctx.get_field(stream, 3) {
+        let count = match ctx.get_field_by_name(stream, "count") {
             Value::Int(v) => v.max(0) as usize,
-            _ => 0,
+            _ => match ctx.get_field(stream, 3) {
+                Value::Int(v) => v.max(0) as usize,
+                _ => 0,
+            },
         };
-        if let Value::Object(Some(arr)) = ctx.get_field(stream, 0) {
+        let buf = match ctx.get_field_by_name(stream, "buf") {
+            Value::Object(Some(arr)) => Value::Object(Some(arr)),
+            _ => ctx.get_field(stream, 0),
+        };
+        if let Value::Object(Some(arr)) = buf {
             let arr_len = ctx.array_length(arr);
             let end = count.min(arr_len);
             if pos >= end {
@@ -22839,8 +23068,61 @@ pub(crate) fn p59_manifest_init_from_input_stream(
     ctx: &mut dyn NativeContext,
     args: &[Value],
 ) -> MethodCallResult {
+    p59_manifest_init_from_input_stream_at(ctx, args, 1)
+}
+
+pub(crate) fn p59_manifest_init_from_verified_input_stream(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    p59_manifest_init_from_input_stream_at(ctx, args, 2)
+}
+
+fn p59_manifest_init_copy(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = obj_arg(args, 0)?;
-    let stream = match args.get(1) {
+    let source = match args.get(1) {
+        Some(Value::Object(Some(o))) => Some(*o),
+        _ => None,
+    };
+    let source_field =
+        |ctx: &mut dyn NativeContext, obj: ObjectRef, name: &str, slot: usize| match ctx
+            .get_field_by_name(obj, name)
+        {
+            Value::Object(Some(o)) => Some(o),
+            _ => match ctx.get_field(obj, slot) {
+                Value::Object(Some(o)) => Some(o),
+                _ => None,
+            },
+        };
+
+    let this_pin = ctx.pin_native_root(this);
+    let attrs = source
+        .and_then(|src| source_field(ctx, src, "attr", 0))
+        .unwrap_or_else(|| p59_manifest_new_attributes(ctx));
+    let attrs_pin = ctx.pin_native_root(attrs);
+    let entries = source
+        .and_then(|src| source_field(ctx, src, "entries", 1))
+        .unwrap_or_else(|| p59_manifest_new_entries_map(ctx));
+    let entries_pin = ctx.pin_native_root(entries);
+
+    let this = ctx.read_native_pin(this_pin, this);
+    let attrs = ctx.read_native_pin(attrs_pin, attrs);
+    let entries = ctx.read_native_pin(entries_pin, entries);
+    ctx.set_field(this, 0, Value::Object(Some(attrs)));
+    ctx.set_field(this, 1, Value::Object(Some(entries)));
+    ctx.set_field_by_name(this, "attr", Value::Object(Some(attrs)));
+    ctx.set_field_by_name(this, "entries", Value::Object(Some(entries)));
+    ctx.unpin_native_roots(this_pin);
+    Ok(None)
+}
+
+fn p59_manifest_init_from_input_stream_at(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+    stream_index: usize,
+) -> MethodCallResult {
+    let this = obj_arg(args, 0)?;
+    let stream = match args.get(stream_index) {
         Some(Value::Object(Some(s))) => *s,
         _ => {
             return Err(MethodCallFailed::InternalError(
@@ -22903,6 +23185,8 @@ pub(crate) fn p59_manifest_init_from_input_stream(
         let entries_map = ctx.read_native_pin(entries_pin, entries_map);
         ctx.set_field(this, 0, Value::Object(Some(main_attrs)));
         ctx.set_field(this, 1, Value::Object(Some(entries_map)));
+        ctx.set_field_by_name(this, "attr", Value::Object(Some(main_attrs)));
+        ctx.set_field_by_name(this, "entries", Value::Object(Some(entries_map)));
         Ok(None)
     })();
     ctx.unpin_native_roots(this_pin);
@@ -23774,7 +24058,6 @@ fn vh_array_set(ctx: &mut dyn NativeContext, args: &[Value], value_arg_index: us
     }
 }
 
-
 fn vh_byte_array_view_width(elem: u8) -> usize {
     match elem {
         b'J' | b'D' => 8,
@@ -23818,7 +24101,10 @@ fn vh_byte_order_is_little(ctx: &dyn NativeContext, arg: Option<&Value>) -> bool
             }
         }
     }
-    ctx.get_field(*order, 0).as_int().map(|v| v != 0).unwrap_or(true)
+    ctx.get_field(*order, 0)
+        .as_int()
+        .map(|v| v != 0)
+        .unwrap_or(true)
 }
 
 fn vh_byte_array_view_target(args: &[Value]) -> Option<(ObjectRef, usize)> {
@@ -24024,11 +24310,19 @@ fn vh_memory_segment_set(ctx: &dyn NativeContext, vh: ObjectRef, args: &[Value])
                 addr.copy_from_nonoverlapping(bytes.as_ptr(), 2);
             }
             (4, Value::Int(v)) => {
-                let bytes = if little_endian { v.to_le_bytes() } else { v.to_be_bytes() };
+                let bytes = if little_endian {
+                    v.to_le_bytes()
+                } else {
+                    v.to_be_bytes()
+                };
                 addr.copy_from_nonoverlapping(bytes.as_ptr(), 4);
             }
             (8, Value::Long(v)) => {
-                let bytes = if little_endian { v.to_le_bytes() } else { v.to_be_bytes() };
+                let bytes = if little_endian {
+                    v.to_le_bytes()
+                } else {
+                    v.to_be_bytes()
+                };
                 addr.copy_from_nonoverlapping(bytes.as_ptr(), 8);
             }
             _ => {}
@@ -25400,9 +25694,7 @@ fn p59_files_size(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResu
 
     match std::fs::metadata(&path_str) {
         Ok(meta) => Ok(Some(Value::Long(meta.len() as i64))),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            Err(p57_no_such_file(ctx, &path_str))
-        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Err(p57_no_such_file(ctx, &path_str)),
         Err(e) => Err(p57_io_error(&e)),
     }
 }
@@ -28116,14 +28408,20 @@ pub(crate) fn register_p61_reflect(r: &mut NativeMethodRegistry) {
         if this == other {
             return Ok(Some(Value::Int(1)));
         }
-        if ctx.class_name_of_id(ctx.class_id_of_object(other)).as_deref()
+        if ctx
+            .class_name_of_id(ctx.class_id_of_object(other))
+            .as_deref()
             != Some("java/lang/reflect/Method")
         {
             return Ok(Some(Value::Int(0)));
         }
         let left = crate::lang_class::method_class_name_desc(ctx, this);
         let right = crate::lang_class::method_class_name_desc(ctx, other);
-        Ok(Some(Value::Int(if left.is_some() && left == right { 1 } else { 0 })))
+        Ok(Some(Value::Int(if left.is_some() && left == right {
+            1
+        } else {
+            0
+        })))
     });
     r.register(
         method,
@@ -30885,13 +31183,7 @@ fn make_string_array(ctx: &mut dyn NativeContext, items: &[&str]) -> ObjectRef {
 /// handle for `map` — the string/array allocations below can trigger a moving
 /// young GC, so the current map ref is re-read from the pin before the put
 /// (native stale-local family).
-fn put_arr(
-    ctx: &mut dyn NativeContext,
-    map_pin: usize,
-    map: ObjectRef,
-    key: &str,
-    items: &[&str],
-) {
+fn put_arr(ctx: &mut dyn NativeContext, map_pin: usize, map: ObjectRef, key: &str, items: &[&str]) {
     let k = ctx.create_string(key);
     let k_pin = ctx.pin_native_root(k);
     let arr = make_string_array(ctx, items);
@@ -31086,7 +31378,13 @@ fn populate_format_data_en(ctx: &mut dyn NativeContext, map: ObjectRef) {
         "QuarterNames",
         &["1st quarter", "2nd quarter", "3rd quarter", "4th quarter"],
     );
-    put_arr(ctx, map_pin, map, "QuarterAbbreviations", &["Q1", "Q2", "Q3", "Q4"]);
+    put_arr(
+        ctx,
+        map_pin,
+        map,
+        "QuarterAbbreviations",
+        &["Q1", "Q2", "Q3", "Q4"],
+    );
     put_arr(ctx, map_pin, map, "QuarterNarrows", &["1", "2", "3", "4"]);
     put_arr(
         ctx,
@@ -31102,7 +31400,13 @@ fn populate_format_data_en(ctx: &mut dyn NativeContext, map: ObjectRef) {
         "standalone.QuarterAbbreviations",
         &["Q1", "Q2", "Q3", "Q4"],
     );
-    put_arr(ctx, map_pin, map, "standalone.QuarterNarrows", &["1", "2", "3", "4"]);
+    put_arr(
+        ctx,
+        map_pin,
+        map,
+        "standalone.QuarterNarrows",
+        &["1", "2", "3", "4"],
+    );
     // Standard 9-element layout used by SimpleDateFormat:
     // 4 time patterns (FULL/LONG/MEDIUM/SHORT), 4 date patterns, 1 date-time combiner.
     put_arr(
@@ -34362,9 +34666,8 @@ fn bi_find_next(text: &str, pos: usize, kind: i32) -> Option<usize> {
     match kind {
         BI_WORD => {
             // Word boundary: transition between word chars and non-word chars
-            let at_word =
-                start < bytes.len()
-                    && (bytes[start].is_ascii_alphanumeric() || bytes[start] == b'_');
+            let at_word = start < bytes.len()
+                && (bytes[start].is_ascii_alphanumeric() || bytes[start] == b'_');
             let mut i = start;
             if at_word {
                 // Skip word chars to find end of word
@@ -37419,11 +37722,188 @@ fn p67_layout_object(
     byte_size: i64,
     byte_alignment: i64,
 ) -> ObjectRef {
-    let obj = alloc_concurrent_synthetic(ctx, class_name, 3);
+    let obj = alloc_concurrent_synthetic(ctx, class_name, 4);
     ctx.set_field(obj, 0, Value::Long(byte_size));
     ctx.set_field(obj, 1, Value::Long(byte_alignment));
     ctx.set_field(obj, 2, Value::Int(0));
+    ctx.set_field(obj, 3, Value::Object(None));
     obj
+}
+
+fn p67_optional(ctx: &mut dyn NativeContext, value: Value) -> ObjectRef {
+    let pinned = match value {
+        Value::Object(Some(obj)) => Some((ctx.pin_native_root(obj), obj)),
+        _ => None,
+    };
+    let opt = alloc_concurrent_synthetic(ctx, "java/util/Optional", 1);
+    let value = match pinned {
+        Some((pin, obj)) => {
+            let obj = ctx.read_native_pin(pin, obj);
+            ctx.unpin_native_roots(pin);
+            Value::Object(Some(obj))
+        }
+        None => Value::Object(None),
+    };
+    ctx.set_field(opt, 0, value);
+    opt
+}
+
+fn p67_layout_name_value(ctx: &dyn NativeContext, layout: ObjectRef) -> Value {
+    if matches!(ctx.get_field(layout, 0), Value::Int(_)) {
+        if ctx.object_num_fields(layout) > 2 {
+            ctx.get_field(layout, 2)
+        } else {
+            Value::Object(None)
+        }
+    } else if ctx.object_num_fields(layout) > 3 {
+        ctx.get_field(layout, 3)
+    } else {
+        Value::Object(None)
+    }
+}
+
+fn p67_layout_name(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = obj_arg(args, 0)?;
+    let name = p67_layout_name_value(ctx, this);
+    Ok(Some(Value::Object(Some(p67_optional(ctx, name)))))
+}
+
+fn p67_layout_carrier_name(class_name: &str) -> &'static str {
+    if class_name == "java/lang/foreign/AddressLayout"
+        || class_name.ends_with("ValueLayouts$OfAddressImpl")
+    {
+        "java/lang/foreign/MemorySegment"
+    } else if class_name.contains("OfBoolean") {
+        "boolean"
+    } else if class_name.contains("OfByte") {
+        "byte"
+    } else if class_name.contains("OfChar") {
+        "char"
+    } else if class_name.contains("OfShort") {
+        "short"
+    } else if class_name.contains("OfInt") {
+        "int"
+    } else if class_name.contains("OfLong") {
+        "long"
+    } else if class_name.contains("OfFloat") {
+        "float"
+    } else if class_name.contains("OfDouble") {
+        "double"
+    } else {
+        "java/lang/Object"
+    }
+}
+
+fn p67_class_mirror(ctx: &mut dyn NativeContext, class_name: &str) -> ObjectRef {
+    match class_name {
+        "boolean" | "byte" | "char" | "short" | "int" | "long" | "float" | "double" | "void" => {
+            ctx.primitive_class_mirror(class_name)
+        }
+        _ => {
+            if let Some(cid) = ctx.class_id_by_name(class_name) {
+                return ctx.get_class_mirror(cid);
+            }
+            if let Ok(cid) = ctx.ensure_class_initialized(class_name) {
+                return ctx.get_class_mirror(cid);
+            }
+            alloc_concurrent_synthetic(ctx, "java/lang/Class", 2)
+        }
+    }
+}
+
+fn p67_layout_carrier(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = obj_arg(args, 0)?;
+    let class_name = ctx
+        .class_name_of_id(ctx.class_id_of_object(this))
+        .unwrap_or_else(|| "java/lang/foreign/ValueLayout".to_string());
+    let carrier_name = p67_layout_carrier_name(&class_name);
+    Ok(Some(Value::Object(Some(p67_class_mirror(
+        ctx,
+        carrier_name,
+    )))))
+}
+
+fn p67_layout_with_name(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = obj_arg(args, 0)?;
+    let name = args.get(1).copied().unwrap_or(Value::Object(None));
+    let class_name = ctx
+        .class_name_of_id(ctx.class_id_of_object(this))
+        .unwrap_or_else(|| "java/lang/foreign/MemoryLayout".to_string());
+    let field_count = ctx.object_num_fields(this);
+    let name_slot = if matches!(ctx.get_field(this, 0), Value::Int(_)) {
+        2
+    } else {
+        3
+    };
+    let clone_fields = std::cmp::max(field_count, name_slot + 1);
+    let this_pin = ctx.pin_native_root(this);
+    let name_pin = match name {
+        Value::Object(Some(obj)) => Some((ctx.pin_native_root(obj), obj)),
+        _ => None,
+    };
+    let cloned = alloc_concurrent_synthetic(ctx, &class_name, clone_fields);
+    let this = ctx.read_native_pin(this_pin, this);
+    for i in 0..field_count {
+        ctx.set_field(cloned, i, ctx.get_field(this, i));
+    }
+    let name = match name_pin {
+        Some((pin, obj)) => {
+            let obj = ctx.read_native_pin(pin, obj);
+            ctx.unpin_native_roots(pin);
+            Value::Object(Some(obj))
+        }
+        None => Value::Object(None),
+    };
+    ctx.set_field(cloned, name_slot, name);
+    ctx.unpin_native_roots(this_pin);
+    Ok(Some(Value::Object(Some(cloned))))
+}
+
+fn p67_address_layout_target_layout(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    let this = obj_arg(args, 0)?;
+    let target = if ctx.object_num_fields(this) > 4 {
+        ctx.get_field(this, 4)
+    } else {
+        Value::Object(None)
+    };
+    Ok(Some(Value::Object(Some(p67_optional(ctx, target)))))
+}
+
+fn p67_address_layout_with_target_layout(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    let this = obj_arg(args, 0)?;
+    let target = args.get(1).copied().unwrap_or(Value::Object(None));
+    let class_name = ctx
+        .class_name_of_id(ctx.class_id_of_object(this))
+        .unwrap_or_else(|| "java/lang/foreign/AddressLayout".to_string());
+    let field_count = ctx.object_num_fields(this);
+    let clone_fields = std::cmp::max(field_count, 5);
+    let this_pin = ctx.pin_native_root(this);
+    let target_pin = match target {
+        Value::Object(Some(obj)) => Some((ctx.pin_native_root(obj), obj)),
+        _ => None,
+    };
+    let cloned = alloc_concurrent_synthetic(ctx, &class_name, clone_fields);
+    let this = ctx.read_native_pin(this_pin, this);
+    for i in 0..field_count {
+        ctx.set_field(cloned, i, ctx.get_field(this, i));
+    }
+    let target = match target_pin {
+        Some((pin, obj)) => {
+            let obj = ctx.read_native_pin(pin, obj);
+            ctx.unpin_native_roots(pin);
+            Value::Object(Some(obj))
+        }
+        None => Value::Object(None),
+    };
+    ctx.set_field(cloned, 4, target);
+    ctx.unpin_native_roots(this_pin);
+    Ok(Some(Value::Object(Some(cloned))))
 }
 
 fn p67_set_value_layout_static(
@@ -37444,18 +37924,48 @@ fn p67_set_value_layout_static(
 fn p67_value_layout_clinit(ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
     for (field_name, class_name, byte_size, byte_alignment) in [
         ("ADDRESS", "java/lang/foreign/AddressLayout", 8_i64, 8_i64),
-        ("JAVA_BYTE", "java/lang/foreign/ValueLayout$OfByte", 1_i64, 1_i64),
+        (
+            "JAVA_BYTE",
+            "java/lang/foreign/ValueLayout$OfByte",
+            1_i64,
+            1_i64,
+        ),
         (
             "JAVA_BOOLEAN",
             "java/lang/foreign/ValueLayout$OfBoolean",
             1_i64,
             1_i64,
         ),
-        ("JAVA_CHAR", "java/lang/foreign/ValueLayout$OfChar", 2_i64, 2_i64),
-        ("JAVA_SHORT", "java/lang/foreign/ValueLayout$OfShort", 2_i64, 2_i64),
-        ("JAVA_INT", "java/lang/foreign/ValueLayout$OfInt", 4_i64, 4_i64),
-        ("JAVA_LONG", "java/lang/foreign/ValueLayout$OfLong", 8_i64, 8_i64),
-        ("JAVA_FLOAT", "java/lang/foreign/ValueLayout$OfFloat", 4_i64, 4_i64),
+        (
+            "JAVA_CHAR",
+            "java/lang/foreign/ValueLayout$OfChar",
+            2_i64,
+            2_i64,
+        ),
+        (
+            "JAVA_SHORT",
+            "java/lang/foreign/ValueLayout$OfShort",
+            2_i64,
+            2_i64,
+        ),
+        (
+            "JAVA_INT",
+            "java/lang/foreign/ValueLayout$OfInt",
+            4_i64,
+            4_i64,
+        ),
+        (
+            "JAVA_LONG",
+            "java/lang/foreign/ValueLayout$OfLong",
+            8_i64,
+            8_i64,
+        ),
+        (
+            "JAVA_FLOAT",
+            "java/lang/foreign/ValueLayout$OfFloat",
+            4_i64,
+            4_i64,
+        ),
         (
             "JAVA_DOUBLE",
             "java/lang/foreign/ValueLayout$OfDouble",
@@ -37538,6 +38048,21 @@ fn p67_layout_is_little(ctx: &dyn NativeContext, layout: ObjectRef) -> bool {
         .unwrap_or(true)
 }
 
+fn p67_byte_order_object(ctx: &mut dyn NativeContext, little_endian: bool) -> ObjectRef {
+    let obj = alloc_concurrent_synthetic(ctx, "java/nio/ByteOrder", 1);
+    ctx.set_field(obj, 0, Value::Int(if little_endian { 1 } else { 0 }));
+    obj
+}
+
+fn p67_layout_order(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = obj_arg(args, 0)?;
+    let little_endian = p67_layout_is_little(ctx, this);
+    Ok(Some(Value::Object(Some(p67_byte_order_object(
+        ctx,
+        little_endian,
+    )))))
+}
+
 fn p67_layout_with_order(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = obj_arg(args, 0)?;
     let class_name = ctx
@@ -37557,8 +38082,13 @@ fn p67_layout_with_order(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
     ctx.set_field(
         obj,
         2,
-        Value::Int(if vh_byte_order_is_little(ctx, args.get(1)) { 1 } else { 0 }),
+        Value::Int(if vh_byte_order_is_little(ctx, args.get(1)) {
+            1
+        } else {
+            0
+        }),
     );
+    ctx.set_field(obj, 3, p67_layout_name_value(ctx, this));
     Ok(Some(Value::Object(Some(obj))))
 }
 
@@ -37590,7 +38120,11 @@ fn p67_var_handle(ctx: &mut dyn NativeContext, args: &[Value]) -> Value {
         _ => true,
     };
     let vh = alloc_concurrent_synthetic(ctx, "java/lang/invoke/VarHandle", VH_NUM_FIELDS);
-    ctx.set_field(vh, VH_CLASS_OR_TARGET, Value::Int(if little_endian { 1 } else { 0 }));
+    ctx.set_field(
+        vh,
+        VH_CLASS_OR_TARGET,
+        Value::Int(if little_endian { 1 } else { 0 }),
+    );
     ctx.set_field(vh, VH_FIELD_INDEX, Value::Int(width));
     ctx.set_field(vh, VH_IS_STATIC, Value::Int(VH_KIND_MEMORY_SEGMENT));
     Value::Object(Some(vh))
@@ -37610,15 +38144,22 @@ fn p67_segment_parts(
         if ptr == 0 || offset < 0 || offset.saturating_add(width) > size {
             return None;
         }
-        return Some(((ptr as usize).wrapping_add(offset as usize) as *mut u8, size));
+        return Some((
+            (ptr as usize).wrapping_add(offset as usize) as *mut u8,
+            size,
+        ));
     }
     if ctx.object_num_fields(seg) >= 4 {
-        if let (Value::Long(size), Value::Long(ptr)) = (ctx.get_field(seg, 0), ctx.get_field(seg, 3))
+        if let (Value::Long(size), Value::Long(ptr)) =
+            (ctx.get_field(seg, 0), ctx.get_field(seg, 3))
         {
             if ptr == 0 || offset < 0 || offset.saturating_add(width) > size {
                 return None;
             }
-            return Some(((ptr as usize).wrapping_add(offset as usize) as *mut u8, size));
+            return Some((
+                (ptr as usize).wrapping_add(offset as usize) as *mut u8,
+                size,
+            ));
         }
     }
     if ctx.object_num_fields(seg) < 6 {
@@ -37640,7 +38181,10 @@ fn p67_segment_parts(
         return None;
     }
     let absolute_offset = base_offset.saturating_add(offset);
-    Some(((ptr as usize).wrapping_add(absolute_offset as usize) as *mut u8, size))
+    Some((
+        (ptr as usize).wrapping_add(absolute_offset as usize) as *mut u8,
+        size,
+    ))
 }
 
 fn p67_segment_byte_size(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
@@ -37701,7 +38245,11 @@ fn p67_segment_get_width(
         _ => false,
     };
     let Some((addr, _size)) = p67_segment_parts(ctx, seg, offset, width) else {
-        return Ok(Some(if width == 8 { Value::Long(0) } else { Value::Int(0) }));
+        return Ok(Some(if width == 8 {
+            Value::Long(0)
+        } else {
+            Value::Int(0)
+        }));
     };
     unsafe {
         Ok(Some(match width {
@@ -37781,11 +38329,19 @@ fn p67_segment_set_width(
                 addr.copy_from_nonoverlapping(bytes.as_ptr(), 2);
             }
             (4, Value::Int(v)) => {
-                let bytes = if little_endian { v.to_le_bytes() } else { v.to_be_bytes() };
+                let bytes = if little_endian {
+                    v.to_le_bytes()
+                } else {
+                    v.to_be_bytes()
+                };
                 addr.copy_from_nonoverlapping(bytes.as_ptr(), 4);
             }
             (8, Value::Long(v)) => {
-                let bytes = if little_endian { v.to_le_bytes() } else { v.to_be_bytes() };
+                let bytes = if little_endian {
+                    v.to_le_bytes()
+                } else {
+                    v.to_be_bytes()
+                };
                 addr.copy_from_nonoverlapping(bytes.as_ptr(), 8);
             }
             _ => {}
@@ -37880,7 +38436,11 @@ fn lucene_buffered_checksum_flush(ctx: &mut dyn NativeContext, this: ObjectRef) 
         Value::Object(Some(buffer)) => buffer,
         _ => return,
     };
-    let upto = ctx.get_field_by_name(this, "upto").as_int().unwrap_or(0).max(0) as usize;
+    let upto = ctx
+        .get_field_by_name(this, "upto")
+        .as_int()
+        .unwrap_or(0)
+        .max(0) as usize;
     if upto == 0 {
         return;
     }
@@ -37905,10 +38465,18 @@ fn lucene_buffered_checksum_write(ctx: &mut dyn NativeContext, this: ObjectRef, 
         _ => return,
     };
     let cap = ctx.array_length(buffer);
-    let mut upto = ctx.get_field_by_name(this, "upto").as_int().unwrap_or(0).max(0) as usize;
+    let mut upto = ctx
+        .get_field_by_name(this, "upto")
+        .as_int()
+        .unwrap_or(0)
+        .max(0) as usize;
     if upto.saturating_add(bytes.len()) > cap {
         lucene_buffered_checksum_flush(ctx, this);
-        upto = ctx.get_field_by_name(this, "upto").as_int().unwrap_or(0).max(0) as usize;
+        upto = ctx
+            .get_field_by_name(this, "upto")
+            .as_int()
+            .unwrap_or(0)
+            .max(0) as usize;
     }
     if upto.saturating_add(bytes.len()) > cap {
         return;
@@ -37919,14 +38487,20 @@ fn lucene_buffered_checksum_write(ctx: &mut dyn NativeContext, this: ObjectRef, 
     ctx.set_field_by_name(this, "upto", Value::Int((upto + bytes.len()) as i32));
 }
 
-fn lucene_buffered_checksum_update_int(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+fn lucene_buffered_checksum_update_int(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
     let this = obj_arg(args, 0)?;
     let value = args.get(1).and_then(|v| v.as_int()).unwrap_or(0);
     lucene_buffered_checksum_write(ctx, this, &value.to_le_bytes());
     Ok(None)
 }
 
-fn lucene_buffered_checksum_update_long(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+fn lucene_buffered_checksum_update_long(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
     let this = obj_arg(args, 0)?;
     let value = match args.get(1) {
         Some(Value::Long(v)) => *v,
@@ -37937,7 +38511,10 @@ fn lucene_buffered_checksum_update_long(ctx: &mut dyn NativeContext, args: &[Val
     Ok(None)
 }
 
-fn lucene_buffered_checksum_update_longs(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+fn lucene_buffered_checksum_update_longs(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
     let this = obj_arg(args, 0)?;
     let arr = obj_arg(args, 1)?;
     let mut off = args.get(2).and_then(|v| v.as_int()).unwrap_or(0).max(0) as usize;
@@ -37994,15 +38571,11 @@ fn lucene_buffered_checksum_index_input_get_checksum(
             _ => Ok(Some(Value::Long(0))),
         };
     }
-    let input0 = match ctx.invoke_virtual(
-        main,
-        "clone",
-        "()Lorg/apache/lucene/store/IndexInput;",
-        &[],
-    )? {
-        Some(Value::Object(Some(clone))) => clone,
-        _ => main,
-    };
+    let input0 =
+        match ctx.invoke_virtual(main, "clone", "()Lorg/apache/lucene/store/IndexInput;", &[])? {
+            Some(Value::Object(Some(clone))) => clone,
+            _ => main,
+        };
     let input_pin = ctx.pin_native_root(input0);
     let result: MethodCallResult = (|| {
         let mut input = ctx.read_native_pin(input_pin, input0);
@@ -38227,9 +38800,12 @@ pub(crate) fn register_p67_foreign_memory(r: &mut NativeMethodRegistry) {
         "(Ljava/lang/Runnable;)V",
         native_noop_with_this,
     );
-    r.register(session, "ownerThread", "()Ljava/lang/Thread;", |ctx, _args| {
-        Ok(Some(Value::Object(Some(ctx.current_thread_object()))))
-    });
+    r.register(
+        session,
+        "ownerThread",
+        "()Ljava/lang/Thread;",
+        |ctx, _args| Ok(Some(Value::Object(Some(ctx.current_thread_object())))),
+    );
     r.register(
         session,
         "isAccessibleBy",
@@ -38406,8 +38982,12 @@ pub(crate) fn register_p67_foreign_memory(r: &mut NativeMethodRegistry) {
             "(Ljava/lang/foreign/ValueLayout$OfLong;J)J",
             |ctx, args| p67_segment_get_width(ctx, args, 8),
         );
-        r.register(ms_impl, "isNative", "()Z", |_ctx, _args| Ok(Some(Value::Int(1))));
-        r.register(ms_impl, "isMapped", "()Z", |_ctx, _args| Ok(Some(Value::Int(1))));
+        r.register(ms_impl, "isNative", "()Z", |_ctx, _args| {
+            Ok(Some(Value::Int(1)))
+        });
+        r.register(ms_impl, "isMapped", "()Z", |_ctx, _args| {
+            Ok(Some(Value::Int(1)))
+        });
         r.register(ms_impl, "isReadOnly", "()Z", |_ctx, _args| {
             Ok(Some(Value::Int(0)))
         });
@@ -38518,9 +39098,14 @@ pub(crate) fn register_p67_foreign_memory(r: &mut NativeMethodRegistry) {
     ] {
         r.register(class, "byteSize", "()J", p67_layout_byte_size);
         r.register(class, "byteAlignment", "()J", p67_layout_byte_alignment);
-        r.register(class, "varHandle", "()Ljava/lang/invoke/VarHandle;", |ctx, args| {
-            Ok(Some(p67_var_handle(ctx, args)))
-        });
+        r.register(class, "carrier", "()Ljava/lang/Class;", p67_layout_carrier);
+        r.register(class, "order", "()Ljava/nio/ByteOrder;", p67_layout_order);
+        r.register(
+            class,
+            "varHandle",
+            "()Ljava/lang/invoke/VarHandle;",
+            |ctx, args| Ok(Some(p67_var_handle(ctx, args))),
+        );
     }
     for (class, specific_desc) in [
         (
@@ -38564,9 +39149,14 @@ pub(crate) fn register_p67_foreign_memory(r: &mut NativeMethodRegistry) {
             p67_return_this,
         );
         let with_name_specific = format!("(Ljava/lang/String;){specific_desc}");
-        r.register(class, "withName", &with_name_specific, p67_return_this);
+        r.register(class, "withName", &with_name_specific, p67_layout_with_name);
         let with_order_specific = format!("(Ljava/nio/ByteOrder;){specific_desc}");
-        r.register(class, "withOrder", &with_order_specific, p67_layout_with_order);
+        r.register(
+            class,
+            "withOrder",
+            &with_order_specific,
+            p67_layout_with_order,
+        );
         r.register(
             class,
             "withByteAlignment",
@@ -38583,13 +39173,13 @@ pub(crate) fn register_p67_foreign_memory(r: &mut NativeMethodRegistry) {
             class,
             "withName",
             "(Ljava/lang/String;)Ljava/lang/foreign/MemoryLayout;",
-            p67_return_this,
+            p67_layout_with_name,
         );
         r.register(
             class,
             "withName",
             "(Ljava/lang/String;)Ljava/lang/foreign/ValueLayout;",
-            p67_return_this,
+            p67_layout_with_name,
         );
         r.register(
             class,
@@ -38597,16 +39187,21 @@ pub(crate) fn register_p67_foreign_memory(r: &mut NativeMethodRegistry) {
             "(Ljava/nio/ByteOrder;)Ljava/lang/foreign/ValueLayout;",
             p67_layout_with_order,
         );
+        r.register(class, "name", "()Ljava/util/Optional;", p67_layout_name);
+        r.register(class, "carrier", "()Ljava/lang/Class;", p67_layout_carrier);
+        r.register(class, "order", "()Ljava/nio/ByteOrder;", p67_layout_order);
     }
     r.register(
         "java/lang/foreign/AddressLayout",
         "withTargetLayout",
         "(Ljava/lang/foreign/MemoryLayout;)Ljava/lang/foreign/AddressLayout;",
-        |ctx, args| {
-            let this = obj_arg(args, 0)?;
-            let _target = args.get(1).copied().unwrap_or(Value::Object(None));
-            Ok(Some(Value::Object(Some(this))))
-        },
+        p67_address_layout_with_target_layout,
+    );
+    r.register(
+        "java/lang/foreign/AddressLayout",
+        "targetLayout",
+        "()Ljava/util/Optional;",
+        p67_address_layout_target_layout,
     );
     r.register(
         "java/lang/foreign/MemoryLayout",
@@ -38624,7 +39219,19 @@ pub(crate) fn register_p67_foreign_memory(r: &mut NativeMethodRegistry) {
         "java/lang/foreign/ValueLayout",
         "withName",
         "(Ljava/lang/String;)Ljava/lang/foreign/ValueLayout;",
-        |_ctx, args| Ok(Some(args.first().copied().unwrap_or(Value::Object(None)))),
+        p67_layout_with_name,
+    );
+    r.register(
+        "java/lang/foreign/ValueLayout",
+        "carrier",
+        "()Ljava/lang/Class;",
+        p67_layout_carrier,
+    );
+    r.register(
+        "java/lang/foreign/ValueLayout",
+        "order",
+        "()Ljava/nio/ByteOrder;",
+        p67_layout_order,
     );
     r.register(
         "java/lang/foreign/AddressLayout",
@@ -38636,7 +39243,19 @@ pub(crate) fn register_p67_foreign_memory(r: &mut NativeMethodRegistry) {
         "java/lang/foreign/AddressLayout",
         "withName",
         "(Ljava/lang/String;)Ljava/lang/foreign/AddressLayout;",
-        |_ctx, args| Ok(Some(args.first().copied().unwrap_or(Value::Object(None)))),
+        p67_layout_with_name,
+    );
+    r.register(
+        "java/lang/foreign/AddressLayout",
+        "carrier",
+        "()Ljava/lang/Class;",
+        p67_layout_carrier,
+    );
+    r.register(
+        "java/lang/foreign/AddressLayout",
+        "order",
+        "()Ljava/nio/ByteOrder;",
+        p67_layout_order,
     );
     for (class, specific_desc) in [
         (
@@ -38677,15 +39296,21 @@ pub(crate) fn register_p67_foreign_memory(r: &mut NativeMethodRegistry) {
         ),
     ] {
         let byte_alignment_specific = format!("(J){specific_desc}");
-        r.register(class, "withByteAlignment", &byte_alignment_specific, |_ctx, args| {
-            Ok(Some(args.first().copied().unwrap_or(Value::Object(None))))
-        });
+        r.register(
+            class,
+            "withByteAlignment",
+            &byte_alignment_specific,
+            |_ctx, args| Ok(Some(args.first().copied().unwrap_or(Value::Object(None)))),
+        );
         let with_name_specific = format!("(Ljava/lang/String;){specific_desc}");
-        r.register(class, "withName", &with_name_specific, |_ctx, args| {
-            Ok(Some(args.first().copied().unwrap_or(Value::Object(None))))
-        });
+        r.register(class, "withName", &with_name_specific, p67_layout_with_name);
         let with_order_specific = format!("(Ljava/nio/ByteOrder;){specific_desc}");
-        r.register(class, "withOrder", &with_order_specific, p67_layout_with_order);
+        r.register(
+            class,
+            "withOrder",
+            &with_order_specific,
+            p67_layout_with_order,
+        );
         r.register(
             class,
             "withByteAlignment",
@@ -38702,13 +39327,13 @@ pub(crate) fn register_p67_foreign_memory(r: &mut NativeMethodRegistry) {
             class,
             "withName",
             "(Ljava/lang/String;)Ljava/lang/foreign/MemoryLayout;",
-            |_ctx, args| Ok(Some(args.first().copied().unwrap_or(Value::Object(None)))),
+            p67_layout_with_name,
         );
         r.register(
             class,
             "withName",
             "(Ljava/lang/String;)Ljava/lang/foreign/ValueLayout;",
-            |_ctx, args| Ok(Some(args.first().copied().unwrap_or(Value::Object(None)))),
+            p67_layout_with_name,
         );
         r.register(
             class,
@@ -38716,12 +39341,21 @@ pub(crate) fn register_p67_foreign_memory(r: &mut NativeMethodRegistry) {
             "(Ljava/nio/ByteOrder;)Ljava/lang/foreign/ValueLayout;",
             p67_layout_with_order,
         );
+        r.register(class, "name", "()Ljava/util/Optional;", p67_layout_name);
+        r.register(class, "carrier", "()Ljava/lang/Class;", p67_layout_carrier);
+        r.register(class, "order", "()Ljava/nio/ByteOrder;", p67_layout_order);
     }
     r.register(
         "jdk/internal/foreign/layout/ValueLayouts$OfAddressImpl",
         "withTargetLayout",
         "(Ljava/lang/foreign/MemoryLayout;)Ljava/lang/foreign/AddressLayout;",
-        |_ctx, args| Ok(Some(args.first().copied().unwrap_or(Value::Object(None)))),
+        p67_address_layout_with_target_layout,
+    );
+    r.register(
+        "jdk/internal/foreign/layout/ValueLayouts$OfAddressImpl",
+        "targetLayout",
+        "()Ljava/util/Optional;",
+        p67_address_layout_target_layout,
     );
 
     // MemoryLayout
@@ -38730,9 +39364,47 @@ pub(crate) fn register_p67_foreign_memory(r: &mut NativeMethodRegistry) {
         ml,
         "structLayout",
         "([Ljava/lang/foreign/MemoryLayout;)Ljava/lang/foreign/StructLayout;",
-        |ctx, _args| {
-            let obj = alloc_concurrent_synthetic(ctx, "java/lang/foreign/StructLayout", 1);
-            ctx.set_field(obj, 0, Value::Long(0));
+        |ctx, args| {
+            let members = match args.first() {
+                Some(Value::Object(Some(arr))) => *arr,
+                _ => ctx.new_array(cratonvm_types::ArrayElementType::Reference, 0),
+            };
+            let count = ctx.array_length(members);
+            let mut offset = 0_i64;
+            let mut max_align = 1_i64;
+            for i in 0..count {
+                let Some(member) = (match ctx.get_array_element(members, i) {
+                    Value::Object(Some(obj)) => Some(obj),
+                    _ => None,
+                }) else {
+                    continue;
+                };
+                let size = match ctx.get_field(member, 0) {
+                    Value::Long(v) => v,
+                    _ => match ctx.get_field(member, 1) {
+                        Value::Int(v) => v as i64,
+                        Value::Long(v) => v,
+                        _ => 0,
+                    },
+                };
+                let align = match ctx.get_field(member, 1) {
+                    Value::Long(v) if v > 0 => v,
+                    Value::Int(v) if v > 0 => v as i64,
+                    _ => size.max(1),
+                };
+                offset = ((offset + align - 1) / align) * align;
+                offset = offset.saturating_add(size.max(0));
+                max_align = max_align.max(align);
+            }
+            let total_size = ((offset + max_align - 1) / max_align) * max_align;
+            let members_pin = ctx.pin_native_root(members);
+            let obj = alloc_concurrent_synthetic(ctx, "java/lang/foreign/StructLayout", 4);
+            let members = ctx.read_native_pin(members_pin, members);
+            ctx.set_field(obj, 0, Value::Long(total_size));
+            ctx.set_field(obj, 1, Value::Long(max_align));
+            ctx.set_field(obj, 2, Value::Object(Some(members)));
+            ctx.set_field(obj, 3, Value::Object(None));
+            ctx.unpin_native_roots(members_pin);
             Ok(Some(Value::Object(Some(obj))))
         },
     );
@@ -38774,16 +39446,69 @@ pub(crate) fn register_p67_foreign_memory(r: &mut NativeMethodRegistry) {
             Ok(Some(Value::Object(Some(obj))))
         },
     );
+    r.register(
+        ml,
+        "withName",
+        "(Ljava/lang/String;)Ljava/lang/foreign/MemoryLayout;",
+        p67_layout_with_name,
+    );
+    r.register(ml, "name", "()Ljava/util/Optional;", p67_layout_name);
 
     // Linker
     let gl = "java/lang/foreign/GroupLayout";
-    r.register(gl, "memberLayouts", "()Ljava/util/List;", |ctx, _args| {
-        let list = match ctx.new_object_initialized("java/util/ArrayList", "()V", &[])? {
-            Some(Value::Object(Some(o))) => o,
-            _ => alloc_concurrent_synthetic(ctx, "java/util/ArrayList", 2),
-        };
-        Ok(Some(Value::Object(Some(list))))
-    });
+    for layout_class in [gl, "java/lang/foreign/StructLayout"] {
+        r.register(
+            layout_class,
+            "memberLayouts",
+            "()Ljava/util/List;",
+            |ctx, args| {
+                let members =
+                    match obj_arg(args, 0)
+                        .ok()
+                        .and_then(|this| match ctx.get_field(this, 2) {
+                            Value::Object(Some(arr)) => Some(arr),
+                            _ => None,
+                        }) {
+                        Some(arr) => arr,
+                        None => ctx.new_array(cratonvm_types::ArrayElementType::Reference, 0),
+                    };
+                let len = ctx.array_length(members);
+                let members_pin = ctx.pin_native_root(members);
+                let data_slot = ctx
+                    .resolve_field_index("java/util/ArrayList", "elementData")
+                    .unwrap_or(0);
+                let size_slot = ctx
+                    .resolve_field_index("java/util/ArrayList", "size")
+                    .unwrap_or(1);
+                let n_fields = std::cmp::max(data_slot, size_slot) + 1;
+                let list = alloc_concurrent_synthetic(ctx, "java/util/ArrayList", n_fields);
+                let members = ctx.read_native_pin(members_pin, members);
+                ctx.set_field(list, data_slot, Value::Object(Some(members)));
+                ctx.set_field(list, size_slot, Value::Int(len as i32));
+                ctx.unpin_native_roots(members_pin);
+                Ok(Some(Value::Object(Some(list))))
+            },
+        );
+        r.register(
+            layout_class,
+            "name",
+            "()Ljava/util/Optional;",
+            p67_layout_name,
+        );
+        r.register(
+            layout_class,
+            "withName",
+            "(Ljava/lang/String;)Ljava/lang/foreign/MemoryLayout;",
+            p67_layout_with_name,
+        );
+        r.register(layout_class, "byteSize", "()J", p67_layout_byte_size);
+        r.register(
+            layout_class,
+            "byteAlignment",
+            "()J",
+            p67_layout_byte_alignment,
+        );
+    }
 
     let linker = "java/lang/foreign/Linker";
     r.register(
@@ -41112,9 +41837,10 @@ pub(crate) fn register_p68_ssl(r: &mut NativeMethodRegistry) {
                 }
                 .into());
             };
-            let (subject, _issuer) =
-                basic_der_extract_names(leaf).unwrap_or_else(|| ("CN=Unknown".into(), String::new()));
-            let princ = alloc_concurrent_synthetic(ctx, "javax/security/auth/x500/X500Principal", 1);
+            let (subject, _issuer) = basic_der_extract_names(leaf)
+                .unwrap_or_else(|| ("CN=Unknown".into(), String::new()));
+            let princ =
+                alloc_concurrent_synthetic(ctx, "javax/security/auth/x500/X500Principal", 1);
             let s = ctx.create_string(&subject);
             ctx.set_field(princ, 0, Value::Object(Some(s)));
             Ok(Some(Value::Object(Some(princ))))
@@ -41375,7 +42101,8 @@ pub(crate) fn register_p68_ssl(r: &mut NativeMethodRegistry) {
             // keeps this consistent with `Security.getProvider("SunJSSE")`.
             let (version, coverage) = crate::jca::provider_chain::find("SunJSSE")
                 .unwrap_or((25.0, "coverage: KeyManagerFactory{SunX509,NewSunX509,PKIX}"));
-            let provider = crate::jca::provider_chain::make_provider(ctx, "SunJSSE", version, coverage);
+            let provider =
+                crate::jca::provider_chain::make_provider(ctx, "SunJSSE", version, coverage);
             ctx.set_field(obj, 0, Value::Object(Some(provider)));
             ctx.set_field(obj, 1, Value::Object(None)); // factorySpi — unused by this stub
             ctx.set_field(obj, 2, args.get(0).copied().unwrap_or(Value::Object(None))); // algorithm
@@ -41502,7 +42229,9 @@ pub(crate) fn register_p68_ssl(r: &mut NativeMethodRegistry) {
             let km = if ks_id != 0 {
                 let state = crate::x509_manager::build_key_manager_state(ks_id);
                 let km_id = crate::x509_manager::next_km_id();
-                crate::x509_manager::km_registry().write().insert(km_id, state);
+                crate::x509_manager::km_registry()
+                    .write()
+                    .insert(km_id, state);
                 let km = alloc_concurrent_synthetic(ctx, crate::x509_manager::FQN_SUN_X509_KM, 2);
                 crate::x509_manager::set_km_id(ctx, km, km_id);
                 km
@@ -42326,9 +43055,9 @@ pub(crate) fn register_p68_security_cert(r: &mut NativeMethodRegistry) {
                 let alias = basic_der_extract_names(&data)
                     .map(|(subject, _)| subject)
                     .unwrap_or_else(|| "CN=Unknown".into());
-                return Ok(Some(Value::Object(Some(crate::keystore::make_x509_mirror(
-                    ctx, &alias, &data,
-                )))));
+                return Ok(Some(Value::Object(Some(
+                    crate::keystore::make_x509_mirror(ctx, &alias, &data),
+                ))));
             }
 
             // Fallback: the input stream had no readable bytes at all.

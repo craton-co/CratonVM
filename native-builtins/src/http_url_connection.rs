@@ -356,11 +356,13 @@ fn huc_real_perform(
         // silently reports "-1" for a rejected/aborted handshake, and several
         // Tomcat tests specifically assert on catching that exception type
         // (e.g. a required client certificate that was not presented).
-        Err(ref e) if e.starts_with(TLS_HANDSHAKE_FAILURE_SENTINEL) => Err(crate::phases_early::throw_jca_exc(
-            ctx,
-            "javax/net/ssl/SSLHandshakeException",
-            e.trim_start_matches(TLS_HANDSHAKE_FAILURE_SENTINEL),
-        )),
+        Err(ref e) if e.starts_with(TLS_HANDSHAKE_FAILURE_SENTINEL) => {
+            Err(crate::phases_early::throw_jca_exc(
+                ctx,
+                "javax/net/ssl/SSLHandshakeException",
+                e.trim_start_matches(TLS_HANDSHAKE_FAILURE_SENTINEL),
+            ))
+        }
         // Other I/O failures (premature EOF, connection refused) follow the
         // real JDK's `getResponseCode` contract of returning -1.
         Err(_) => Ok(-1),
@@ -1642,7 +1644,10 @@ fn huc_get_output_stream(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
     Ok(Some(Value::Object(Some(baos))))
 }
 
-pub(crate) fn huc_get_header_field_named(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+pub(crate) fn huc_get_header_field_named(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
     let this = obj_arg(args, 0)?;
     let name = match args.get(1) {
         Some(Value::Object(Some(s))) => ctx.read_string(*s).unwrap_or_default(),
@@ -1790,15 +1795,15 @@ fn content_length_of(headers: &[(String, String)], body_len: usize) -> i64 {
         .unwrap_or(body_len as i64)
 }
 
-pub(crate) fn huc_get_content_length(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+pub(crate) fn huc_get_content_length(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
     let this = obj_arg(args, 0)?;
     if let Some(url_str) = huc_real_object_url(ctx, this) {
         if url_str.starts_with("http://") || url_str.starts_with("https://") {
             huc_real_perform(ctx, this, &url_str)?;
-            let n = content_length_of(
-                &huc_real_headers(ctx, this),
-                huc_real_body(ctx, this).len(),
-            );
+            let n = content_length_of(&huc_real_headers(ctx, this), huc_real_body(ctx, this).len());
             return Ok(Some(Value::Int(n as i32)));
         }
     }
@@ -1812,15 +1817,15 @@ pub(crate) fn huc_get_content_length(ctx: &mut dyn NativeContext, args: &[Value]
     Ok(Some(Value::Int(n)))
 }
 
-pub(crate) fn huc_get_content_length_long(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+pub(crate) fn huc_get_content_length_long(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
     let this = obj_arg(args, 0)?;
     if let Some(url_str) = huc_real_object_url(ctx, this) {
         if url_str.starts_with("http://") || url_str.starts_with("https://") {
             huc_real_perform(ctx, this, &url_str)?;
-            let n = content_length_of(
-                &huc_real_headers(ctx, this),
-                huc_real_body(ctx, this).len(),
-            );
+            let n = content_length_of(&huc_real_headers(ctx, this), huc_real_body(ctx, this).len());
             return Ok(Some(Value::Long(n)));
         }
     }

@@ -43,6 +43,139 @@ pub(crate) fn bootstrap_property_fallback(key: &str) -> Option<String> {
     }
 }
 
+#[derive(Clone, Copy)]
+struct SpringXmlGrammarPoolEntry {
+    root: usize,
+    fallback: ObjectRef,
+}
+
+fn spring_xml_grammar_pool_store(
+) -> &'static std::sync::Mutex<std::collections::HashMap<usize, SpringXmlGrammarPoolEntry>> {
+    static STORE: std::sync::OnceLock<
+        std::sync::Mutex<std::collections::HashMap<usize, SpringXmlGrammarPoolEntry>>,
+    > = std::sync::OnceLock::new();
+    STORE.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+}
+
+fn spring_xml_resolve_grammar_pool(
+    ctx: &dyn NativeContext,
+    entry: SpringXmlGrammarPoolEntry,
+) -> Option<ObjectRef> {
+    if entry.root != 0 {
+        ctx.resolve_global_root(entry.root).or(Some(entry.fallback))
+    } else {
+        Some(entry.fallback)
+    }
+}
+
+fn spring_xml_shared_grammar_pool(ctx: &mut dyn NativeContext) -> Option<ObjectRef> {
+    let scope = ctx.vm_identity();
+    if let Some(entry) = spring_xml_grammar_pool_store()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(&scope)
+        .copied()
+    {
+        if let Some(pool) = spring_xml_resolve_grammar_pool(ctx, entry) {
+            return Some(pool);
+        }
+    }
+
+    let pool = match ctx.new_object_initialized(
+        "com/sun/org/apache/xerces/internal/util/XMLGrammarPoolImpl",
+        "()V",
+        &[],
+    ) {
+        Ok(Some(Value::Object(Some(pool)))) => pool,
+        _ => return None,
+    };
+    let entry = SpringXmlGrammarPoolEntry {
+        root: ctx.add_global_root(pool),
+        fallback: pool,
+    };
+
+    let mut store = spring_xml_grammar_pool_store()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    if let Some(existing) = store.get(&scope).copied() {
+        if entry.root != 0 {
+            let _ = ctx.remove_global_root(entry.root);
+        }
+        return spring_xml_resolve_grammar_pool(ctx, existing);
+    }
+    store.insert(scope, entry);
+    Some(pool)
+}
+
+fn spring_xml_set_factory_bool(
+    ctx: &mut dyn NativeContext,
+    factory: ObjectRef,
+    method: &str,
+    value: bool,
+) -> MethodCallResult {
+    let value = if value { 1 } else { 0 };
+    ctx.invoke_virtual(factory, method, "(Z)V", &[Value::Int(value)])?;
+    Ok(None)
+}
+
+fn spring_xml_set_factory_attribute(
+    ctx: &mut dyn NativeContext,
+    factory: ObjectRef,
+    name: &str,
+    value: Value,
+) -> MethodCallResult {
+    let name = ctx.create_string(name);
+    ctx.invoke_virtual(
+        factory,
+        "setAttribute",
+        "(Ljava/lang/String;Ljava/lang/Object;)V",
+        &[Value::Object(Some(name)), value],
+    )?;
+    Ok(None)
+}
+
+fn native_spring_default_document_loader_create_document_builder_factory(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    let validation_mode = args.get(1).and_then(|v| v.as_int()).unwrap_or(0);
+    let namespace_aware = args.get(2).and_then(|v| v.as_int()).unwrap_or(0) != 0;
+    let factory = match ctx.invoke(
+        "javax/xml/parsers/DocumentBuilderFactory",
+        "newInstance",
+        "()Ljavax/xml/parsers/DocumentBuilderFactory;",
+        &[],
+    )? {
+        Some(Value::Object(Some(factory))) => factory,
+        _ => return Ok(Some(Value::Object(None))),
+    };
+
+    spring_xml_set_factory_bool(ctx, factory, "setNamespaceAware", namespace_aware)?;
+    if validation_mode != 0 {
+        spring_xml_set_factory_bool(ctx, factory, "setValidating", true)?;
+        if validation_mode == 3 {
+            spring_xml_set_factory_bool(ctx, factory, "setNamespaceAware", true)?;
+            let schema = ctx.create_string("http://www.w3.org/2001/XMLSchema");
+            spring_xml_set_factory_attribute(
+                ctx,
+                factory,
+                "http://java.sun.com/xml/jaxp/properties/schemaLanguage",
+                Value::Object(Some(schema)),
+            )?;
+            if let Some(pool) = spring_xml_shared_grammar_pool(ctx) {
+                spring_xml_set_factory_attribute(
+                    ctx,
+                    factory,
+                    "http://apache.org/xml/properties/internal/grammar-pool",
+                    Value::Object(Some(pool)),
+                )?;
+            }
+        }
+    }
+
+    Ok(Some(Value::Object(Some(factory))))
+}
+
 fn osw_wrapped_output(ctx: &dyn NativeContext, this: ObjectRef) -> Option<ObjectRef> {
     match ctx.get_field_by_name(this, "out") {
         Value::Object(Some(out)) => Some(out),
@@ -22501,6 +22634,12 @@ pub fn register_essential_natives(registry: &mut NativeMethodRegistry) {
     // non-`ACC_NATIVE` JDK bytecode.
     registry.register(
         "java/lang/Class",
+        "getTypeParameters",
+        "()[Ljava/lang/reflect/TypeVariable;",
+        lang_class::native_class_get_type_parameters,
+    );
+    registry.register(
+        "java/lang/Class",
         "getGenericInterfaces",
         "()[Ljava/lang/reflect/Type;",
         lang_class::native_class_get_generic_interfaces,
@@ -29627,6 +29766,17 @@ fn register_annotation_overrides(registry: &mut NativeMethodRegistry) {
     // identity/return-this no-ops are available without the JIT/interpreter
     // having to resolve the override on the receiver's pipeline class.
     crate::streams::register_stream_overrides(registry);
+
+    // Spring XML namespace parsing: preserve validation and namespace-aware
+    // parsing, but attach a VM-wide Xerces grammar pool so repeated
+    // GenericXmlApplicationContext loads of the same Spring XSDs reuse parsed
+    // grammars instead of reparsing them for every inherited JUnit method.
+    registry.register(
+        "org/springframework/beans/factory/xml/DefaultDocumentLoader",
+        "createDocumentBuilderFactory",
+        "(IZ)Ljavax/xml/parsers/DocumentBuilderFactory;",
+        native_spring_default_document_loader_create_document_builder_factory,
+    );
 
     // EUREKA-LOGBACK-CLEANUP: Spring Boot's `LogbackLoggingSystem.cleanUp`
     // crashes every Spring Boot app (eureka-server is the canonical
@@ -44896,6 +45046,74 @@ fn native_module_builder_new_version(
     Ok(Some(Value::Object(Some(obj))))
 }
 
+fn module_descriptor_version_text(ctx: &dyn NativeContext, obj: ObjectRef) -> String {
+    match ctx.get_field_by_name(obj, "version") {
+        Value::Object(Some(s)) => ctx.read_string(s).unwrap_or_default(),
+        _ => String::new(),
+    }
+}
+
+fn native_module_descriptor_version_to_string(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    let this = obj_arg(args, 0)?;
+    match ctx.get_field_by_name(this, "version") {
+        Value::Object(Some(s)) => Ok(Some(Value::Object(Some(s)))),
+        _ => Ok(Some(Value::Object(Some(ctx.create_string(""))))),
+    }
+}
+
+fn native_module_descriptor_version_equals(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    let this = obj_arg(args, 0)?;
+    let Some(Value::Object(Some(other))) = args.get(1) else {
+        return Ok(Some(Value::Int(0)));
+    };
+    if this == *other {
+        return Ok(Some(Value::Int(1)));
+    }
+    let a = module_descriptor_version_text(ctx, this);
+    let b = module_descriptor_version_text(ctx, *other);
+    Ok(Some(Value::Int(if !a.is_empty() && a == b {
+        1
+    } else {
+        0
+    })))
+}
+
+fn native_module_descriptor_version_hash_code(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    let this = obj_arg(args, 0)?;
+    let mut hash = 0_i32;
+    for ch in module_descriptor_version_text(ctx, this).encode_utf16() {
+        hash = hash.wrapping_mul(31).wrapping_add(ch as i32);
+    }
+    Ok(Some(Value::Int(hash)))
+}
+
+fn native_module_descriptor_version_compare_to(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    let this = obj_arg(args, 0)?;
+    let Some(Value::Object(Some(other))) = args.get(1) else {
+        return Ok(Some(Value::Int(1)));
+    };
+    let a = module_descriptor_version_text(ctx, this);
+    let b = module_descriptor_version_text(ctx, *other);
+    let ord = match a.cmp(&b) {
+        std::cmp::Ordering::Less => -1,
+        std::cmp::Ordering::Equal => 0,
+        std::cmp::Ordering::Greater => 1,
+    };
+    Ok(Some(Value::Int(ord)))
+}
+
 fn native_module_builder_build(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     // Instance method: build(int hashCode) -> ModuleDescriptor
     // args[0] = this (Builder), args[1] = hashCode int
@@ -45087,6 +45305,30 @@ fn register_module_builder_overrides(registry: &mut NativeMethodRegistry) {
             Ok(Some(Value::Int(ha.cmp(&hb) as i32)))
         });
     }
+    registry.register(
+        "java/lang/module/ModuleDescriptor$Version",
+        "toString",
+        "()Ljava/lang/String;",
+        native_module_descriptor_version_to_string,
+    );
+    registry.register(
+        "java/lang/module/ModuleDescriptor$Version",
+        "equals",
+        "(Ljava/lang/Object;)Z",
+        native_module_descriptor_version_equals,
+    );
+    registry.register(
+        "java/lang/module/ModuleDescriptor$Version",
+        "hashCode",
+        "()I",
+        native_module_descriptor_version_hash_code,
+    );
+    registry.register(
+        "java/lang/module/ModuleDescriptor$Version",
+        "compareTo",
+        "(Ljava/lang/Object;)I",
+        native_module_descriptor_version_compare_to,
+    );
 
     // -----------------------------------------------------------------
     // ModuleFinder.ofSystem() — lazy system-module finder

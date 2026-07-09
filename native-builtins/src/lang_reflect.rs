@@ -1540,6 +1540,28 @@ pub(crate) fn register_wp2_1_natives(registry: &mut NativeMethodRegistry) {
         crate::lang_class::native_field_get_generic_type,
     );
 
+    // Real-JDK Method generic accessors delegate into sun.reflect.generics,
+    // which CratonVM does not fully support. Prefer Signature-attribute natives
+    // so Spring generic method resolution sees declaration-scoped variables.
+    registry.register(
+        "java/lang/reflect/Method",
+        "getGenericParameterTypes",
+        "()[Ljava/lang/reflect/Type;",
+        crate::lang_class::native_method_get_generic_param_types,
+    );
+    registry.register(
+        "java/lang/reflect/Method",
+        "getGenericReturnType",
+        "()Ljava/lang/reflect/Type;",
+        crate::lang_class::native_method_get_generic_return_type,
+    );
+    registry.register(
+        "java/lang/reflect/Method",
+        "getTypeParameters",
+        "()[Ljava/lang/reflect/TypeVariable;",
+        crate::lang_class::native_method_get_type_parameters,
+    );
+
     // --- Constructor.getGenericParameterTypes / RecordComponent.getGenericType ---
     // Same rationale as Field.getGenericType above: real-JDK
     // Constructor/RecordComponent generic accessors delegate to a

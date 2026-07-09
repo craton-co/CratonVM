@@ -2677,6 +2677,23 @@ const BAIS_FIELD_POS: usize = 1; // int pos
 const BAIS_FIELD_MARK: usize = 2; // int mark
 const BAIS_FIELD_COUNT: usize = 3; // int count
 
+fn input_stream_has_bais_layout(ctx: &dyn NativeContext, obj: ObjectRef) -> bool {
+    if ctx.object_num_fields(obj) <= BAIS_FIELD_COUNT {
+        return false;
+    }
+
+    let cid = ctx.class_id_of_object(obj);
+    let class_name = ctx.class_name_of_id(cid).unwrap_or_default();
+    if class_name == "java/io/ByteArrayInputStream" || class_name == "java/io/InputStream" {
+        return true;
+    }
+
+    match ctx.class_id_by_name("java/io/ByteArrayInputStream") {
+        Some(bais_cid) => ctx.is_subclass(cid, bais_cid),
+        None => false,
+    }
+}
+
 fn native_bais_init(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = match args.first() {
         Some(Value::Object(Some(obj))) => *obj,
@@ -2725,6 +2742,9 @@ fn native_bais_read(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRe
         Some(Value::Object(Some(obj))) => *obj,
         _ => return Ok(Some(Value::Int(-1))),
     };
+    if !input_stream_has_bais_layout(ctx, this) {
+        return Ok(Some(Value::Int(-1)));
+    }
     let data = match ctx.get_field(this, BAIS_FIELD_DATA) {
         Value::Object(Some(arr)) => arr,
         _ => return Ok(Some(Value::Int(-1))),
@@ -2849,14 +2869,14 @@ fn native_bais_read_bytes(ctx: &mut dyn NativeContext, args: &[Value]) -> Method
     let cls_name = ctx
         .class_name_of_id(ctx.class_id_of_object(this))
         .unwrap_or_default();
-    let is_bais = cls_name == "java/io/ByteArrayInputStream";
+    let has_bais_layout = input_stream_has_bais_layout(ctx, this);
     // Mockito subclass mocks inherit concrete InputStream helpers; let Mockito's
     // default-answer machinery own those inherited methods instead of spinning
     // here on the mock's default read() == 0.
     if cls_name.contains("$MockitoMock$") {
         return Ok(Some(Value::Int(0)));
     }
-    if !is_bais {
+    if !has_bais_layout {
         if cls_name == "org/hibernate/orm/test/lob/JpaLargeBlobTest$LobInputStream" {
             return hibernate_jpa_large_blob_read_bytes(ctx, this, buf, off, len);
         }
@@ -2991,6 +3011,9 @@ fn native_bais_available(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
         Some(Value::Object(Some(obj))) => *obj,
         _ => return Ok(Some(Value::Int(0))),
     };
+    if !input_stream_has_bais_layout(ctx, this) {
+        return Ok(Some(Value::Int(0)));
+    }
     let pos = match ctx.get_field(this, BAIS_FIELD_POS) {
         Value::Int(v) => v,
         _ => 0,
@@ -3007,6 +3030,9 @@ fn native_bais_skip(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRe
         Some(Value::Object(Some(obj))) => *obj,
         _ => return Ok(Some(Value::Long(0))),
     };
+    if !input_stream_has_bais_layout(ctx, this) {
+        return Ok(Some(Value::Long(0)));
+    }
     let n = match args.get(1) {
         Some(Value::Long(v)) => *v,
         _ => 0,
@@ -3031,6 +3057,9 @@ fn native_bais_reset(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallR
         Some(Value::Object(Some(obj))) => *obj,
         _ => return Ok(None),
     };
+    if !input_stream_has_bais_layout(ctx, this) {
+        return Ok(None);
+    }
     let mark = match ctx.get_field(this, BAIS_FIELD_MARK) {
         Value::Int(v) => v,
         _ => 0,
@@ -4660,14 +4689,11 @@ pub fn register_io_natives(registry: &mut NativeMethodRegistry) {
         #[cfg(unix)]
         pub const SIZEOF_FAMILY: i32 = std::mem::size_of::<libc::sa_family_t>() as i32;
         #[cfg(unix)]
-        pub const OFFSET_FAMILY: i32 =
-            std::mem::offset_of!(libc::sockaddr_in, sin_family) as i32;
+        pub const OFFSET_FAMILY: i32 = std::mem::offset_of!(libc::sockaddr_in, sin_family) as i32;
         #[cfg(unix)]
-        pub const OFFSET_SIN4_PORT: i32 =
-            std::mem::offset_of!(libc::sockaddr_in, sin_port) as i32;
+        pub const OFFSET_SIN4_PORT: i32 = std::mem::offset_of!(libc::sockaddr_in, sin_port) as i32;
         #[cfg(unix)]
-        pub const OFFSET_SIN4_ADDR: i32 =
-            std::mem::offset_of!(libc::sockaddr_in, sin_addr) as i32;
+        pub const OFFSET_SIN4_ADDR: i32 = std::mem::offset_of!(libc::sockaddr_in, sin_addr) as i32;
         #[cfg(unix)]
         pub const OFFSET_SIN6_PORT: i32 =
             std::mem::offset_of!(libc::sockaddr_in6, sin6_port) as i32;
@@ -4716,12 +4742,18 @@ pub fn register_io_natives(registry: &mut NativeMethodRegistry) {
     // are provided as literals in `sockaddr_abi` below (note AF_INET6 is
     // 23 on Windows vs 10 on Linux).
     use sockaddr_abi as sa;
-    registry.register("sun/nio/ch/NativeSocketAddress", "AFINET", "()I", |_ctx, _args| {
-        Ok(Some(Value::Int(sa::AF_INET)))
-    });
-    registry.register("sun/nio/ch/NativeSocketAddress", "AFINET6", "()I", |_ctx, _args| {
-        Ok(Some(Value::Int(sa::AF_INET6)))
-    });
+    registry.register(
+        "sun/nio/ch/NativeSocketAddress",
+        "AFINET",
+        "()I",
+        |_ctx, _args| Ok(Some(Value::Int(sa::AF_INET))),
+    );
+    registry.register(
+        "sun/nio/ch/NativeSocketAddress",
+        "AFINET6",
+        "()I",
+        |_ctx, _args| Ok(Some(Value::Int(sa::AF_INET6))),
+    );
     registry.register(
         "sun/nio/ch/NativeSocketAddress",
         "sizeofSockAddr4",
@@ -5645,9 +5677,9 @@ fn bb_state(
                 other => {
                     return Err(MethodCallFailed::InternalError(VmError::Internal {
                         message: format!(
-                            "ByteBuffer missing backing array (field {} returned {:?} for object {:?})",
-                            BB_FIELD_ARRAY, other, this
-                        ),
+                        "ByteBuffer missing backing array (field {} returned {:?} for object {:?})",
+                        BB_FIELD_ARRAY, other, this
+                    ),
                     }))
                 }
             },
@@ -7401,9 +7433,11 @@ fn register_string_rw_natives(registry: &mut NativeMethodRegistry) {
     // every OTHER Writer subclass — keep it under `synthetic-jdk` only (same
     // base-class hazard the `Reader.read` migration above fixed).
     #[cfg(feature = "synthetic-jdk")]
-    registry.register("java/io/Writer", "write", "(I)V", native_sw_write_int);
-    registry.register("java/io/Writer", "flush", "()V", native_noop_void);
-    registry.register("java/io/Writer", "close", "()V", native_noop_void);
+    {
+        registry.register("java/io/Writer", "write", "(I)V", native_sw_write_int);
+        registry.register("java/io/Writer", "flush", "()V", native_noop_void);
+        registry.register("java/io/Writer", "close", "()V", native_noop_void);
+    }
     registry.set_category(__prev_cat);
 }
 
@@ -17829,6 +17863,21 @@ mod bais_layout_tests {
         native_bais_read(&mut ctx, &[Value::Object(Some(this))]).unwrap();
         let av2 = native_bais_available(&mut ctx, &[Value::Object(Some(this))]).unwrap();
         assert_eq!(av2, Some(Value::Int(3)));
+    }
+
+    #[test]
+    fn foreign_input_stream_does_not_probe_bais_slots() {
+        let mut ctx = MockNativeContext::new();
+        let text_io = ctx.alloc_object_with_class(1, "org/python/core/io/TextIOInputStream");
+
+        let available = native_bais_available(&mut ctx, &[Value::Object(Some(text_io))]).unwrap();
+        assert_eq!(available, Some(Value::Int(0)));
+        let read = native_bais_read(&mut ctx, &[Value::Object(Some(text_io))]).unwrap();
+        assert_eq!(read, Some(Value::Int(-1)));
+
+        assert_eq!(ctx.field_read_count(text_io, BAIS_FIELD_DATA), 0);
+        assert_eq!(ctx.field_read_count(text_io, BAIS_FIELD_POS), 0);
+        assert_eq!(ctx.field_read_count(text_io, BAIS_FIELD_COUNT), 0);
     }
 
     #[test]
