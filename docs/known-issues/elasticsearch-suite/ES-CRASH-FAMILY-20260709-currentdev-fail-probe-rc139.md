@@ -2,6 +2,13 @@
 
 Status: OPEN
 
+Update (2026-07-09):
+- The rc=139 crash surface is now known to be triggered by Panama synthetic layout mismatches in two fallback paths:
+  - `java/lang/foreign/Linker.defaultLookup()` was allocating a 0-field `SymbolLookup`.
+  - `java/lang/foreign/Linker.downcallHandle(..., [Ljava/lang/foreign/Linker$Option;)Ljava/lang/invoke/MethodHandle;` was allocating a short `MethodHandle` shape.
+- The crash-family code path is now aligned in `native-builtins/src/phases_late.rs` to return a 2-field `SymbolLookup` (with `-1` default lib marker) and a 4-field `java/lang/foreign/DowncallHandle` carrying `fn_addr`, descriptor, and variadic metadata.
+- No full non-passed rerun has been completed since this change, so `Status` remains OPEN until the `es-nonpassed-currentdev` family is re-run and 139s drop.
+
 Source:
 - Probe run: `es-faildocs-probe-20260709-073704`
 - Trigger: representative rerun of old FAIL rows after the large `findNative` and `SymbolLookup.find` families were fixed on `dev`.

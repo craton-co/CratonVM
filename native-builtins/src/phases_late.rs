@@ -38800,21 +38800,51 @@ pub(crate) fn register_p67_foreign_memory(r: &mut NativeMethodRegistry) {
         "defaultLookup",
         "()Ljava/lang/foreign/SymbolLookup;",
         |ctx, _args| {
-            let obj = alloc_concurrent_synthetic(ctx, "java/lang/foreign/SymbolLookup", 0);
+            let obj = alloc_concurrent_synthetic(ctx, "java/lang/foreign/SymbolLookup", 2);
+            ctx.set_field(obj, 0, Value::Long(-1)); // -1 = default/system lookup
             Ok(Some(Value::Object(Some(obj))))
         },
     );
-    r.register(linker, "downcallHandle", "(Ljava/lang/foreign/MemorySegment;Ljava/lang/foreign/FunctionDescriptor;[Ljava/lang/foreign/Linker$Option;)Ljava/lang/invoke/MethodHandle;", |ctx, _args| {
-        // C19: allocate past the real-JDK instance-field count (6) so the
-        // `type:MethodType` field at slot 0 can be populated without our
-        // synthetic data colliding. Synthesize a trivial `()V` MethodType
-        // so `mh.type()` is non-null on this fallback path.
-        let mh = alloc_concurrent_synthetic(ctx, "java/lang/invoke/MethodHandle", 17);
-        if let Some(mt) = crate::lang_invoke::build_method_type_from_descriptor(ctx, "()V") {
-            ctx.set_field_by_name(mh, "type", Value::Object(Some(mt)));
+    r.register(
+        linker,
+        "downcallHandle",
+        "(Ljava/lang/foreign/MemorySegment;Ljava/lang/foreign/FunctionDescriptor;[Ljava/lang/foreign/Linker$Option;)Ljava/lang/invoke/MethodHandle;",
+        |ctx, args| {
+            let addr_seg = obj_arg(args, 0)?;
+            let descriptor = obj_arg(args, 1)?;
+            let fn_addr = match ctx.get_field(addr_seg, 0) {
+                Value::Long(v) => v,
+                _ => 0,
+            };
+
+            let mut variadic_fixed: i64 = -1;
+            if let Some(Value::Object(Some(opts))) = args.get(2) {
+                let n = ctx.array_length(*opts);
+                for i in 0..n {
+                    if let Value::Object(Some(opt)) = ctx.get_array_element(*opts, i) {
+                        let kind = match ctx.get_field(opt, 0) {
+                            Value::Int(k) => k,
+                            _ => -1,
+                        };
+                        if kind == 0 {
+                            variadic_fixed = match ctx.get_field(opt, 1) {
+                                Value::Long(v) => v,
+                                Value::Int(v) => v as i64,
+                                _ => -1,
+                            };
+                        }
+                    }
+                }
+            }
+
+            let dh = alloc_concurrent_synthetic(ctx, "java/lang/foreign/DowncallHandle", 4);
+            ctx.set_field(dh, 0, Value::Long(fn_addr));
+            ctx.set_field(dh, 1, Value::Object(Some(descriptor)));
+            ctx.set_field(dh, 2, Value::Long(variadic_fixed));
+            ctx.set_field(dh, 3, Value::Long(0)); // cif cache not yet built
+            Ok(Some(Value::Object(Some(dh))))
         }
-        Ok(Some(Value::Object(Some(mh))))
-    });
+    );
 
     // FunctionDescriptor
     let fd = "java/lang/foreign/FunctionDescriptor";
