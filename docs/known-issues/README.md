@@ -4,9 +4,9 @@ This folder collects CratonVM-only defects found while running upstream Java
 suites. The docs had grown to describe the **same underlying bug from several
 angles**; this index is the consolidated map. Read it first.
 
-## 2026-07-09 New: BC-java `asn1-regression` StackOverflowError blocks whole suite
+## 2026-07-09 BC-java `asn1-regression` StackOverflowError retired
 
-- OPEN: [`bc-asn1-pkcs12test-indefinitelengthinputstream-stackoverflow.md`](bc-asn1-pkcs12test-indefinitelengthinputstream-stackoverflow.md) — found timing `apps/bc-java`'s core-module suites against HotSpot. `org.bouncycastle.asn1.test.RegressionTest` crashes with a real `StackOverflowError` in `IndefiniteLengthInputStream.read()` during `PKCS12Test`, killing the whole suite (no per-test try/catch in `RegressionTest.main()`). Not a tunable-stack-size issue — `main()` already runs on the 128 MiB main VM thread; `RUST_MIN_STACK` (which only affects spawned/child threads) has no effect.
+- FIXED/RETIRED: [`bc-asn1-pkcs12test-indefinitelengthinputstream-stackoverflow-FIXED.md`](../internal/fixed-suite-bugs/bc-asn1-pkcs12test-indefinitelengthinputstream-stackoverflow-FIXED.md) - the base `InputStream.read([BII)` native no longer redispatches an explicit `super.read([BII)` call back to the receiver's three-arg override. The committed reduced probe covers the Bouncy Castle-shaped recursion and the earlier normal virtual-dispatch case; the local checkout does not include `apps/bc-java`, so full-suite rerun remains fixture validation rather than an open known issue.
 
 ## 2026-07-08/09 Hibernate remote rerun note retired
 

@@ -7,6 +7,7 @@ that `docs/known-issues/` holds only **open** items. Kept for traceability (repr
 
 | Doc | Fix |
 |---|---|
+| `bc-asn1-pkcs12test-indefinitelengthinputstream-stackoverflow-FIXED.md` | `codex/fix-bc-pkcs12-stackoverflow-20260709-001` - base `InputStream.read([BII)` no longer redispatches explicit `super.read([BII)` to the receiver override; reduced VM probe covers the BC recursion shape and normal virtual override dispatch. |
 | `bug-03-priorityqueue-boxed-ordering.md` | `936b8e19` — verified vs HotSpot |
 | `crash-01-arraylist-capacity-oom-abend.md` | `fix/oom-array-alloc-abend` (base `0e3f0398`) |
 | `crash-02-native-capacity-ctor-abort-family.md` | `da58ff4e` — verified vs HotSpot |
