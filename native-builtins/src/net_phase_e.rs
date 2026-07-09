@@ -5260,7 +5260,17 @@ fn register_re4_url_http(r: &mut NativeMethodRegistry) {
             // which is swallowed and forces a wrong `../.` home fallback.
             let ext = {
                 let s5 = read_field_string_or(ctx, this, 5, "");
-                let s = if s5.contains(':') {
+                // `s5.contains(':')` alone false-positives on a real-JDK
+                // URL's field 5 (`authority`, e.g. "localhost:8080" — always
+                // has a colon), skipping the toExternalForm() fallback below
+                // and leaving `ext` as the bare authority. That misses both
+                // the `jar:` and `http(s)://` prefix checks, so every real
+                // http(s) URL fell to the generic URLConnection carrier and
+                // `(HttpURLConnection) url.openConnection()` threw
+                // ClassCastException everywhere (e.g. Tomcat's
+                // TomcatBaseTest.methodUrl). Use the same synthetic-vs-real
+                // discriminator as the openStream/toExternalForm paths above.
+                let s = if field5_is_full_url(&s5) {
                     s5
                 } else {
                     match ctx.invoke_virtual(this, "toExternalForm", "()Ljava/lang/String;", &[]) {

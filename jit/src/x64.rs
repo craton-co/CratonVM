@@ -14218,7 +14218,7 @@ impl Compiler {
                     // CP index here silently mismatched — a multi-field
                     // callee could pick another field op's `field_index`
                     // and read/write the wrong slot. Look up by `cpc`.
-                    if let Some((_, field_index, _type_tag)) =
+                    if let Some((_, field_index, type_tag)) =
                         site.field_info.iter().find(|(p, _, _)| *p == cpc).copied()
                     {
                         let obj_slot = self.pop_stack();
@@ -14226,6 +14226,13 @@ impl Compiler {
                         self.load_slot_to_reg(ARG_REGS[1], obj_slot);
                         self.emit_mov_imm32_sx(ARG_REGS[2], field_index as i32); // Cast: x86-64 immediate encoding
                         self.emit_call_absolute(self.helpers.getfield);
+                        // The checked helper returns the `i64::MIN` deopt/NPE
+                        // sentinel on a bad (stale/corrupt) receiver instead of a
+                        // real field value — without this guard the sentinel is
+                        // pushed and treated as legitimate data, turning what used
+                        // to be an immediate SIGSEGV into silent corruption/hangs
+                        // downstream. Mirrors the invoke-site guard below.
+                        self.emit_post_invoke_exception_check(type_tag);
                         self.push_from_rax();
                     } else {
                         // Cannot resolve field — bail out
@@ -19617,6 +19624,11 @@ impl Compiler {
                         self.load_slot_to_reg(ARG_REGS[1], obj_slot);
                         self.emit_mov_imm32_sx(ARG_REGS[2], field_index as i32);
                         self.emit_call_absolute(self.helpers.getfield);
+                        // See the inlined-callee getfield site above: the checked
+                        // helper's `i64::MIN` sentinel must be caught here, before
+                        // it's pushed/tagged as a live value, or a bad receiver
+                        // silently corrupts execution instead of throwing.
+                        self.emit_post_invoke_exception_check(type_tag);
                         self.push_from_rax();
                         if type_tag == b'L' || type_tag == b'[' {
                             self.mark_top_as_oop();
@@ -19624,13 +19636,19 @@ impl Compiler {
                         pc += 3;
                     } else {
                         // No statically-resolved field metadata for this
-                        // getfield PC — fall back to the runtime helper.
+                        // getfield PC — fall back to the runtime helper. The
+                        // field's real type is unknown here, so pass `b'J'` to
+                        // force the ambiguity-safe (peek-dispatch_threw) sentinel
+                        // check unconditionally — safe for every type, since a
+                        // non-J/D/F field can never legitimately produce
+                        // `i64::MIN` anyway.
                         self.flush_scratch_registers();
                         let obj_slot = self.pop_stack();
                         self.emit_load_local(ARG_REGS[0], self.heap_local_offset);
                         self.load_slot_to_reg(ARG_REGS[1], obj_slot);
                         self.emit_mov_imm32_sx(ARG_REGS[2], 0); // Cast: x86-64 immediate encoding
                         self.emit_call_absolute(self.helpers.getfield);
+                        self.emit_post_invoke_exception_check(b'J');
                         self.push_from_rax();
                         pc += 3;
                     }
