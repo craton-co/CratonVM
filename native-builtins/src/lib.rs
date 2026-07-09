@@ -44568,6 +44568,7 @@ fn register_charset_natives(registry: &mut NativeMethodRegistry) {
         "()Ljava/lang/String;",
         native_charset_name,
     );
+    registry.register(cs, "aliases", "()Ljava/util/Set;", native_charset_aliases);
     registry.register(cs, "toString", "()Ljava/lang/String;", native_charset_name);
     registry.register(cs, "equals", "(Ljava/lang/Object;)Z", native_charset_equals);
     registry.register(cs, "hashCode", "()I", native_charset_hash_code);
@@ -45435,9 +45436,21 @@ pub fn register_charset_natives_pub(registry: &mut NativeMethodRegistry) {
 }
 
 fn charset_alloc(ctx: &mut dyn NativeContext, name: &str) -> ObjectRef {
-    let charset = alloc_concurrent_synthetic(ctx, "java/nio/charset/Charset", 1);
+    let charset = alloc_concurrent_synthetic(ctx, "java/nio/charset/Charset", 3);
+    let charset_pin = ctx.pin_native_root(charset);
+    let aliases = ctx.new_array(cratonvm_types::ArrayElementType::Reference, 0);
+    let aliases_pin = ctx.pin_native_root(aliases);
     let name_obj = ctx.create_string(name);
+    let charset = ctx.read_native_pin(charset_pin, charset);
+    let aliases = ctx.read_native_pin(aliases_pin, aliases);
     ctx.set_field(charset, CHARSET_FIELD_NAME, Value::Object(Some(name_obj)));
+    ctx.set_field(charset, 1, Value::Object(Some(aliases)));
+    ctx.set_field(charset, 2, Value::Object(None));
+    ctx.set_field_by_name(charset, "name", Value::Object(Some(name_obj)));
+    ctx.set_field_by_name(charset, "aliases", Value::Object(Some(aliases)));
+    ctx.set_field_by_name(charset, "aliasSet", Value::Object(None));
+    ctx.unpin_native_roots(aliases_pin);
+    ctx.unpin_native_roots(charset_pin);
     charset
 }
 
@@ -45555,6 +45568,24 @@ fn native_charset_name(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCal
     };
     let name_val = ctx.get_field(this, CHARSET_FIELD_NAME);
     Ok(Some(name_val))
+}
+
+fn native_charset_aliases(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(o))) => *o,
+        _ => return Ok(Some(Value::Object(None))),
+    };
+    if let Value::Object(Some(alias_set)) = ctx.get_field_by_name(this, "aliasSet") {
+        return Ok(Some(Value::Object(Some(alias_set))));
+    }
+
+    let this_pin = ctx.pin_native_root(this);
+    let set = build_real_layout_string_hashset(ctx, &[]);
+    let this = ctx.read_native_pin(this_pin, this);
+    ctx.set_field_by_name(this, "aliasSet", Value::Object(Some(set)));
+    ctx.set_field(this, 2, Value::Object(Some(set)));
+    ctx.unpin_native_roots(this_pin);
+    Ok(Some(Value::Object(Some(set))))
 }
 
 fn native_charset_equals(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
@@ -62504,6 +62535,64 @@ mod nio_heap_byte_buffer_tests {
         );
         assert_eq!(ctx.get_field_by_name(buffer, "offset"), Value::Int(0));
         assert_eq!(ctx.get_field_by_name(buffer, "address"), Value::Long(16));
+    }
+}
+
+#[cfg(test)]
+mod charset_alias_tests {
+    use super::*;
+    use crate::test_utils::MockNativeContext;
+
+    #[test]
+    fn charset_for_name_initializes_alias_fields_and_aliases_native_caches_set() {
+        let mut registry = NativeMethodRegistry::new();
+        register_charset_natives(&mut registry);
+        let for_name = registry
+            .find(
+                "java/nio/charset/Charset",
+                "forName",
+                "(Ljava/lang/String;)Ljava/nio/charset/Charset;",
+            )
+            .expect("Charset.forName native");
+        let aliases = registry
+            .find(
+                "java/nio/charset/Charset",
+                "aliases",
+                "()Ljava/util/Set;",
+            )
+            .expect("Charset.aliases native");
+
+        let mut ctx = MockNativeContext::new();
+        let name = ctx.create_string("UTF-8");
+        let charset = match for_name(&mut ctx, &[Value::Object(Some(name))])
+            .expect("forName succeeds")
+            .expect("forName returns value")
+        {
+            Value::Object(Some(o)) => o,
+            other => panic!("forName should return Charset, got {other:?}"),
+        };
+
+        let alias_array = match ctx.get_field_by_name(charset, "aliases") {
+            Value::Object(Some(o)) => o,
+            other => panic!("Charset.aliases field should be an empty array, got {other:?}"),
+        };
+        assert_eq!(ctx.array_length(alias_array), 0);
+        assert_eq!(
+            ctx.get_field_by_name(charset, "aliasSet"),
+            Value::Object(None)
+        );
+
+        let alias_set = match aliases(&mut ctx, &[Value::Object(Some(charset))])
+            .expect("aliases native succeeds")
+            .expect("aliases returns value")
+        {
+            Value::Object(Some(o)) => o,
+            other => panic!("aliases should return Set, got {other:?}"),
+        };
+        assert_eq!(
+            ctx.get_field_by_name(charset, "aliasSet"),
+            Value::Object(Some(alias_set))
+        );
     }
 }
 

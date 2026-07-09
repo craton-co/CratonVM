@@ -20429,6 +20429,13 @@ fn force_native_over_real_jdk_bytecode(
         return true;
     }
 
+    if class_name == "java/nio/charset/Charset"
+        && ((method_name == "availableCharsets" && method_descriptor == "()Ljava/util/SortedMap;")
+            || (method_name == "aliases" && method_descriptor == "()Ljava/util/Set;"))
+    {
+        return true;
+    }
+
     // JBoss LogManager fallback. CratonVM often creates synthetic
     // `org.jboss.logmanager.Logger` instances without a real `LoggerNode` graph.
     // The native-builtins logmanager shim already registers null-safe
@@ -30831,6 +30838,28 @@ mod tests {
             access,
             "getBufferPool",
             "()Ljava/lang/management/BufferPoolMXBean;"
+        ));
+    }
+
+    #[test]
+    fn charset_force_native_covers_tomcat_cache_surface() {
+        let charset = "java/nio/charset/Charset";
+        assert!(
+            force_native_over_real_jdk_bytecode(
+                charset,
+                "availableCharsets",
+                "()Ljava/util/SortedMap;"
+            ),
+            "Tomcat B2CConverter must use native Charset.availableCharsets"
+        );
+        assert!(
+            force_native_over_real_jdk_bytecode(charset, "aliases", "()Ljava/util/Set;"),
+            "Tomcat CharsetCache must use native Charset.aliases on synthetic Charset objects"
+        );
+        assert!(!force_native_over_real_jdk_bytecode(
+            charset,
+            "aliases",
+            "()Ljava/util/List;"
         ));
     }
 

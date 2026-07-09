@@ -12103,12 +12103,15 @@ fn invoke_on_class_shared_inner(
                         // SportMe / Tomcat startup: real-JDK `Charset.availableCharsets()`
                         // (Charset.java:610) enumerates `CharsetProvider` SPI and calls
                         // `Charset.put` which dereferences a null name, NPEing during
-                        // `B2CConverter.<clinit>` -> `Connector.setURIEncoding`. Force
-                        // our native (registered in `register_p61_charset`) that returns
-                        // a populated TreeMap with the standard charsets directly.
+                        // `B2CConverter.<clinit>` -> `Connector.setURIEncoding`. The same
+                        // Tomcat path calls `Charset.aliases()` on native-produced Charset
+                        // objects whose real-JDK `aliases` field may be empty/null. Force
+                        // our registered natives for both methods.
                         || (class_name == "java/nio/charset/Charset"
-                            && method_name == "availableCharsets"
-                            && descriptor == "()Ljava/util/SortedMap;")
+                            && ((method_name == "availableCharsets"
+                                && descriptor == "()Ljava/util/SortedMap;")
+                                || (method_name == "aliases"
+                                    && descriptor == "()Ljava/util/Set;")))
                         // SLF4J replay: force `LinkedBlockingQueue.clear` native over JDK
                         // bytecode so the synthetic field slots used by `drainTo` stay consistent.
                         || (class_name == "java/util/concurrent/LinkedBlockingQueue"
