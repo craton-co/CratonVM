@@ -855,6 +855,62 @@ fn is_directory_resolvable_resource_name(name: &str) -> bool {
         || name.contains(':'))
 }
 
+fn simple_resource_glob(name: &str) -> Option<(&str, &str)> {
+    if !name.contains('*') && !name.contains('?') {
+        return None;
+    }
+    let split = name.rfind('/').map(|idx| idx + 1).unwrap_or(0);
+    let (prefix, pattern) = name.split_at(split);
+    if prefix.contains('*')
+        || prefix.contains('?')
+        || (!prefix.is_empty() && !is_safe_resource_name(prefix))
+        || pattern.is_empty()
+    {
+        return None;
+    }
+    Some((prefix, pattern))
+}
+
+fn glob_segment_matches(pattern: &str, candidate: &str) -> bool {
+    let pattern = pattern.as_bytes();
+    let candidate = candidate.as_bytes();
+    let (mut pi, mut ci) = (0usize, 0usize);
+    let mut star: Option<usize> = None;
+    let mut star_match = 0usize;
+
+    while ci < candidate.len() {
+        if pi < pattern.len() && (pattern[pi] == b'?' || pattern[pi] == candidate[ci]) {
+            pi += 1;
+            ci += 1;
+        } else if pi < pattern.len() && pattern[pi] == b'*' {
+            star = Some(pi);
+            pi += 1;
+            star_match = ci;
+        } else if let Some(star_idx) = star {
+            pi = star_idx + 1;
+            star_match += 1;
+            ci = star_match;
+        } else {
+            return false;
+        }
+    }
+
+    while pi < pattern.len() && pattern[pi] == b'*' {
+        pi += 1;
+    }
+    pi == pattern.len()
+}
+
+fn resource_name_matches_simple_glob(glob: &str, candidate: &str) -> bool {
+    let Some((prefix, pattern)) = simple_resource_glob(glob) else {
+        return false;
+    };
+    let Some(tail) = candidate.strip_prefix(prefix) else {
+        return false;
+    };
+    !tail.is_empty() && !tail.contains('/') && glob_segment_matches(pattern, tail)
+}
+
 /// Parse a `<jar-path>!/<prefix>/` specification of the form produced by
 /// stripping `file:`/`jar:` off a `jar:file:/.../foo.jar!/some/dir/` URL.
 /// Returns `Some((jar_path, prefix_with_trailing_slash))` if the input
@@ -919,6 +975,89 @@ impl ClassPath {
             .lock()
             .insert(path.to_path_buf(), canon.clone());
         Ok(canon)
+    }
+
+    fn matching_directory_resource_paths(dir: &Path, name: &str) -> Vec<PathBuf> {
+        let Some((prefix, pattern)) = simple_resource_glob(name) else {
+            return Vec::new();
+        };
+        let base = dir.join(prefix);
+        let mut matches = Vec::new();
+        let Ok(entries) = fs::read_dir(base) else {
+            return matches;
+        };
+        for entry in entries.flatten() {
+            let file_name = entry.file_name();
+            let Some(file_name) = file_name.to_str() else {
+                continue;
+            };
+            if glob_segment_matches(pattern, file_name) {
+                matches.push(entry.path());
+            }
+        }
+        matches.sort();
+        matches
+    }
+
+    fn matching_resource_entry_names<'a, I>(names: I, glob: &str) -> Vec<String>
+    where
+        I: IntoIterator<Item = &'a String>,
+    {
+        let mut matches: Vec<String> = names
+            .into_iter()
+            .filter(|name| resource_name_matches_simple_glob(glob, name))
+            .cloned()
+            .collect();
+        matches.sort();
+        matches
+    }
+
+    fn checked_directory_resource_canonical(
+        &self,
+        dir: &Path,
+        full_path: &Path,
+        name: &str,
+    ) -> Option<PathBuf> {
+        let canon_dir = match self.canonicalize_cached(dir) {
+            Ok(p) => p,
+            Err(e) => {
+                debug!(
+                    "Refusing to read resource {name}: cannot canonicalize classpath root {}: {e}",
+                    dir.display()
+                );
+                return None;
+            }
+        };
+        let canon_path = match self.canonicalize_cached(full_path) {
+            Ok(p) => p,
+            Err(e) => {
+                debug!(
+                    "Refusing to read resource {name}: cannot canonicalize resolved path {}: {e}",
+                    full_path.display()
+                );
+                return None;
+            }
+        };
+        if !canon_path.starts_with(&canon_dir) {
+            debug!(
+                "Resource path traversal blocked: {} escapes {}",
+                canon_path.display(),
+                canon_dir.display()
+            );
+            return None;
+        }
+        Some(canon_path)
+    }
+
+    fn directory_resource_url_from_canonical(canon_path: &Path) -> String {
+        let p = canon_path.to_string_lossy().replace('\\', "/");
+        let p = p.strip_prefix("//?/").unwrap_or(&p);
+        let p = p.trim_start_matches('/');
+        if canon_path.is_dir() && !p.ends_with('/') {
+            format!("file:/{p}/")
+        } else {
+            format!("file:/{p}")
+        }
     }
 
     /// Audit-fix #7: build (once) the set of `META-INF/versions/<N>/`
@@ -2428,6 +2567,25 @@ impl ClassPath {
                     if !directory_safe {
                         continue;
                     }
+                    if simple_resource_glob(name).is_some() {
+                        for full_path in Self::matching_directory_resource_paths(dir, name) {
+                            if self
+                                .checked_directory_resource_canonical(dir, &full_path, name)
+                                .is_none()
+                            {
+                                continue;
+                            }
+                            if let Ok(data) = read_file_for_classpath(&full_path) {
+                                debug!(
+                                    "Found resource glob {name} in directory {} as {}",
+                                    dir.display(),
+                                    full_path.display()
+                                );
+                                return Some(data);
+                            }
+                        }
+                        continue;
+                    }
                     let full_path = dir.join(Path::new(name));
                     if full_path.exists() {
                         // C35 audit fix (HIGH security): mirror
@@ -2495,6 +2653,31 @@ impl ClassPath {
                     if !archive_safe {
                         continue;
                     }
+                    if simple_resource_glob(name).is_some() {
+                        let candidates = Self::matching_resource_entry_names(
+                            entry_index
+                                .iter()
+                                .filter(|entry| !entry.starts_with("META-INF/versions/")),
+                            name,
+                        );
+                        for candidate in candidates {
+                            let found = if *multi_release {
+                                Self::find_in_multi_release_archive(
+                                    archive,
+                                    versions_cache,
+                                    Some(entry_index),
+                                    &candidate,
+                                )
+                            } else {
+                                Self::find_in_indexed_archive(archive, entry_index, &candidate)
+                            };
+                            if let Some(data) = found {
+                                debug!("Found resource glob {name} in JAR as {candidate}");
+                                return Some(data);
+                            }
+                        }
+                        continue;
+                    }
                     let found = if *multi_release {
                         Self::find_in_multi_release_archive(
                             archive,
@@ -2536,6 +2719,19 @@ impl ClassPath {
                     if !archive_safe {
                         continue;
                     }
+                    if simple_resource_glob(name).is_some() {
+                        let candidates =
+                            Self::matching_resource_entry_names(entries_cache.keys(), name);
+                        if let Some(candidate) = candidates.first() {
+                            if let Some(data) = entries_cache.get(candidate) {
+                                debug!(
+                                    "Found resource glob {name} in nested directory as {candidate}"
+                                );
+                                return Some(data.clone());
+                            }
+                        }
+                        continue;
+                    }
                     if let Some(data) = entries_cache.get(name) {
                         debug!("Found resource {name} in nested directory");
                         return Some(data.clone());
@@ -2550,6 +2746,21 @@ impl ClassPath {
                     if !archive_safe {
                         continue;
                     }
+                    if simple_resource_glob(name).is_some() {
+                        let candidates =
+                            Self::matching_resource_entry_names(entry_index.iter(), name);
+                        for candidate in candidates {
+                            if let Some(data) =
+                                Self::find_in_indexed_archive(archive, entry_index, &candidate)
+                            {
+                                debug!(
+                                    "Found resource glob {name} in nested JAR {nested_path} as {candidate}"
+                                );
+                                return Some(data);
+                            }
+                        }
+                        continue;
+                    }
                     if let Some(data) = Self::find_in_indexed_archive(archive, entry_index, name) {
                         debug!("Found resource {name} in nested JAR {nested_path}");
                         return Some(data);
@@ -2562,6 +2773,20 @@ impl ClassPath {
                     ..
                 } => {
                     if !archive_safe {
+                        continue;
+                    }
+                    if simple_resource_glob(name).is_some() {
+                        let candidates =
+                            Self::matching_resource_entry_names(classes_cache.keys(), name);
+                        if let Some(candidate) = candidates.first() {
+                            if let Some(data) = classes_cache.get(candidate) {
+                                debug!(
+                                    "Found resource glob {name} in JMOD {} as {candidate} (cached)",
+                                    path.display()
+                                );
+                                return Some(data.clone());
+                            }
+                        }
                         continue;
                     }
                     // Try the pre-extracted classes cache first (covers .class + resources under classes/)
@@ -2608,6 +2833,29 @@ impl ClassPath {
                             }
                         };
                     let _ = is_class;
+                    if simple_resource_glob(name).is_some() {
+                        let candidates =
+                            Self::matching_resource_entry_names(resource_to_modules.keys(), name);
+                        for candidate in candidates {
+                            if let Some(modules) = resource_to_modules.get(&candidate) {
+                                for module in modules {
+                                    let attempt = format!("/{module}/{candidate}");
+                                    match reader.find_resource(&attempt) {
+                                        Ok(Some(bytes)) => {
+                                            debug!(
+                                                "Found resource glob {name} in jimage {} at {attempt}",
+                                                path.display()
+                                            );
+                                            return Some(bytes);
+                                        }
+                                        Ok(None) => continue,
+                                        Err(_) => continue,
+                                    }
+                                }
+                            }
+                        }
+                        continue;
+                    }
                     for attempt in full_path_attempts {
                         match reader.find_resource(&attempt) {
                             Ok(Some(bytes)) => {
@@ -2659,6 +2907,20 @@ impl ClassPath {
                     if !directory_safe {
                         continue;
                     }
+                    if simple_resource_glob(name).is_some() {
+                        for full_path in Self::matching_directory_resource_paths(dir, name) {
+                            if self
+                                .checked_directory_resource_canonical(dir, &full_path, name)
+                                .is_none()
+                            {
+                                continue;
+                            }
+                            if let Ok(bytes) = read_file_for_classpath(&full_path) {
+                                out.push(bytes);
+                            }
+                        }
+                        continue;
+                    }
                     let full_path = dir.join(Path::new(name));
                     // C35 audit fix (HIGH security): fail-CLOSED on
                     // canonicalize error. The previous
@@ -2694,6 +2956,30 @@ impl ClassPath {
                     if !archive_safe {
                         continue;
                     }
+                    if simple_resource_glob(name).is_some() {
+                        let candidates = Self::matching_resource_entry_names(
+                            entry_index
+                                .iter()
+                                .filter(|entry| !entry.starts_with("META-INF/versions/")),
+                            name,
+                        );
+                        for candidate in candidates {
+                            let bytes = if *multi_release {
+                                Self::find_in_multi_release_archive(
+                                    archive,
+                                    versions_cache,
+                                    Some(entry_index),
+                                    &candidate,
+                                )
+                            } else {
+                                Self::find_in_indexed_archive(archive, entry_index, &candidate)
+                            };
+                            if let Some(b) = bytes {
+                                out.push(b);
+                            }
+                        }
+                        continue;
+                    }
                     let bytes = if *multi_release {
                         Self::find_in_multi_release_archive(
                             archive,
@@ -2712,6 +2998,16 @@ impl ClassPath {
                     if !archive_safe {
                         continue;
                     }
+                    if simple_resource_glob(name).is_some() {
+                        for candidate in
+                            Self::matching_resource_entry_names(entries_cache.keys(), name)
+                        {
+                            if let Some(b) = entries_cache.get(&candidate) {
+                                out.push(b.clone());
+                            }
+                        }
+                        continue;
+                    }
                     if let Some(b) = entries_cache.get(name) {
                         out.push(b.clone());
                     }
@@ -2724,6 +3020,18 @@ impl ClassPath {
                     if !archive_safe {
                         continue;
                     }
+                    if simple_resource_glob(name).is_some() {
+                        for candidate in
+                            Self::matching_resource_entry_names(entry_index.iter(), name)
+                        {
+                            if let Some(b) =
+                                Self::find_in_indexed_archive(archive, entry_index, &candidate)
+                            {
+                                out.push(b);
+                            }
+                        }
+                        continue;
+                    }
                     if let Some(b) = Self::find_in_indexed_archive(archive, entry_index, name) {
                         out.push(b);
                     }
@@ -2734,6 +3042,16 @@ impl ClassPath {
                     ..
                 } => {
                     if !archive_safe {
+                        continue;
+                    }
+                    if simple_resource_glob(name).is_some() {
+                        for candidate in
+                            Self::matching_resource_entry_names(classes_cache.keys(), name)
+                        {
+                            if let Some(b) = classes_cache.get(&candidate) {
+                                out.push(b.clone());
+                            }
+                        }
                         continue;
                     }
                     if let Some(b) = classes_cache.get(name) {
@@ -2769,6 +3087,21 @@ impl ClassPath {
                                 None => Vec::new(),
                             }
                         };
+                    if simple_resource_glob(name).is_some() {
+                        for candidate in
+                            Self::matching_resource_entry_names(resource_to_modules.keys(), name)
+                        {
+                            if let Some(modules) = resource_to_modules.get(&candidate) {
+                                for module in modules {
+                                    let attempt = format!("/{module}/{candidate}");
+                                    if let Ok(Some(b)) = reader.find_resource(&attempt) {
+                                        out.push(b);
+                                    }
+                                }
+                            }
+                        }
+                        continue;
+                    }
                     for attempt in attempts {
                         if let Ok(Some(b)) = reader.find_resource(&attempt) {
                             out.push(b);
@@ -2809,6 +3142,16 @@ impl ClassPath {
             match entry {
                 ClassPathEntry::Directory(dir) => {
                     if !directory_safe {
+                        continue;
+                    }
+                    if simple_resource_glob(name).is_some() {
+                        for full_path in Self::matching_directory_resource_paths(dir, name) {
+                            if let Some(canon_path) =
+                                self.checked_directory_resource_canonical(dir, &full_path, name)
+                            {
+                                urls.push(Self::directory_resource_url_from_canonical(&canon_path));
+                            }
+                        }
                         continue;
                     }
                     let full_path = dir.join(Path::new(name));
@@ -2890,6 +3233,34 @@ impl ClassPath {
                         }
                         continue;
                     }
+                    if simple_resource_glob(name).is_some() {
+                        let candidates = Self::matching_resource_entry_names(
+                            entry_index
+                                .iter()
+                                .filter(|entry| !entry.starts_with("META-INF/versions/")),
+                            name,
+                        );
+                        if dbg {
+                            eprintln!(
+                                "[GRES-DBG]   jar {} mr={} -> {}",
+                                path.display(),
+                                multi_release,
+                                if candidates.is_empty() { "miss" } else { "HIT" }
+                            );
+                        }
+                        if !candidates.is_empty() {
+                            let abs = self
+                                .canonicalize_cached(path)
+                                .unwrap_or_else(|_| path.clone());
+                            let p = abs.to_string_lossy().replace('\\', "/");
+                            let p = p.strip_prefix("//?/").unwrap_or(&p);
+                            let p = p.trim_start_matches('/');
+                            for candidate in candidates {
+                                urls.push(format!("jar:file:/{p}!/{candidate}"));
+                            }
+                        }
+                        continue;
+                    }
                     let direct = if *multi_release {
                         Self::find_in_multi_release_archive(
                             archive,
@@ -2956,6 +3327,16 @@ impl ClassPath {
                     if !archive_safe {
                         continue;
                     }
+                    if simple_resource_glob(name).is_some() {
+                        let p = parent_jar.to_string_lossy().replace('\\', "/");
+                        let p = p.trim_start_matches('/');
+                        for candidate in
+                            Self::matching_resource_entry_names(entries_cache.keys(), name)
+                        {
+                            urls.push(format!("jar:file:/{p}!/{prefix}{candidate}"));
+                        }
+                        continue;
+                    }
                     if entries_cache.contains_key(name) {
                         let p = parent_jar.to_string_lossy().replace('\\', "/");
                         let p = p.trim_start_matches('/');
@@ -2972,6 +3353,16 @@ impl ClassPath {
                     if !archive_safe {
                         continue;
                     }
+                    if simple_resource_glob(name).is_some() {
+                        let p = parent_jar.to_string_lossy().replace('\\', "/");
+                        let p = p.trim_start_matches('/');
+                        for candidate in
+                            Self::matching_resource_entry_names(entry_index.iter(), name)
+                        {
+                            urls.push(format!("jar:file:/{p}!/{nested_path}!/{candidate}"));
+                        }
+                        continue;
+                    }
                     if Self::find_in_indexed_archive(archive, entry_index, name).is_some() {
                         let p = parent_jar.to_string_lossy().replace('\\', "/");
                         let p = p.trim_start_matches('/');
@@ -2985,6 +3376,16 @@ impl ClassPath {
                     ..
                 } => {
                     if !archive_safe {
+                        continue;
+                    }
+                    if simple_resource_glob(name).is_some() {
+                        let p = path.to_string_lossy().replace('\\', "/");
+                        let p = p.trim_start_matches('/');
+                        for candidate in
+                            Self::matching_resource_entry_names(classes_cache.keys(), name)
+                        {
+                            urls.push(format!("jar:file:/{p}!/{candidate}"));
+                        }
                         continue;
                     }
                     let found = classes_cache.contains_key(name) || {
@@ -3021,6 +3422,21 @@ impl ClassPath {
                                 None => Vec::new(),
                             }
                         };
+                    if simple_resource_glob(name).is_some() {
+                        for candidate in
+                            Self::matching_resource_entry_names(resource_to_modules.keys(), name)
+                        {
+                            if let Some(modules) = resource_to_modules.get(&candidate) {
+                                for module in modules {
+                                    let attempt = format!("/{module}/{candidate}");
+                                    if matches!(reader.find_resource(&attempt), Ok(Some(_))) {
+                                        urls.push(format!("jrt:{attempt}"));
+                                    }
+                                }
+                            }
+                        }
+                        continue;
+                    }
                     for attempt in attempts {
                         if matches!(reader.find_resource(&attempt), Ok(Some(_))) {
                             // JEP 220 jrt URL scheme: `jrt:/<module>/<resource>`.
@@ -3642,6 +4058,41 @@ mod tests {
         assert_eq!(data, b"hello world");
 
         assert!(cp.find_resource("missing.txt").is_none());
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn find_resource_simple_glob_from_directory() {
+        let dir = std::env::temp_dir().join("cratonvm_test_resource_dir_glob");
+        let _ = fs::remove_dir_all(&dir);
+        let web_inf = dir.join("org/springframework/web/context/WEB-INF");
+        fs::create_dir_all(&web_inf).unwrap();
+        fs::write(web_inf.join("myplaceholder.properties"), b"name=Rod").unwrap();
+        fs::write(web_inf.join("myoverride.properties"), b"age=42").unwrap();
+        fs::write(web_inf.join("other.properties"), b"ignored=true").unwrap();
+
+        let cp = ClassPath::new(&[dir.to_string_lossy().into_owned()]);
+        let pattern = "org/springframework/web/context/WEB-INF/myplace*.properties";
+        let data = cp.find_resource(pattern).expect("globbed resource");
+        assert_eq!(data, b"name=Rod");
+
+        let bytes = cp.find_all_resource_bytes(pattern);
+        assert_eq!(bytes, vec![b"name=Rod".to_vec()]);
+
+        let urls = cp.find_all_resource_urls(pattern);
+        assert_eq!(urls.len(), 1);
+        assert!(
+            urls[0].ends_with("/org/springframework/web/context/WEB-INF/myplaceholder.properties"),
+            "unexpected URL for globbed resource: {:?}",
+            urls
+        );
+
+        assert!(
+            cp.find_resource("org/springframework/web/*/WEB-INF/myplace*.properties")
+                .is_none(),
+            "wildcards in directory segments are intentionally unsupported"
+        );
 
         let _ = fs::remove_dir_all(&dir);
     }

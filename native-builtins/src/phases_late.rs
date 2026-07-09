@@ -6535,18 +6535,15 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
             }
             let mut fs = p57_alloc_default_filesystem(ctx);
             if let Some(jar) = p57_jar_uri_to_os_path(&text) {
-                // Only mount paths that exist as regular files — a `file:`
-                // URI naming a directory is not a mountable archive.
-                if std::path::Path::new(&jar).is_file() {
-                    // Pin across the create_string below — a moving young GC
-                    // there would relocate the fresh FileSystem (native
-                    // stale-local family).
-                    let fs_pin = ctx.pin_native_root(fs);
-                    let jp = ctx.create_string(&jar);
-                    fs = ctx.read_native_pin(fs_pin, fs);
-                    ctx.set_field(fs, P57_FS_JAR_FIELD, Value::Object(Some(jp)));
-                    ctx.unpin_native_roots(fs_pin);
-                }
+                // Mount file-backed jar/zip URIs even when the archive does not
+                // exist yet. HotSpot's zipfs supports Map.of("create", "true");
+                // callers then populate it through Files.createDirectories/copy.
+                // CratonVM's jarfs writer below creates the archive lazily.
+                let fs_pin = ctx.pin_native_root(fs);
+                let jp = ctx.create_string(&jar);
+                fs = ctx.read_native_pin(fs_pin, fs);
+                ctx.set_field(fs, P57_FS_JAR_FIELD, Value::Object(Some(jp)));
+                ctx.unpin_native_roots(fs_pin);
             }
             Ok(Some(Value::Object(Some(fs))))
         },
@@ -9594,7 +9591,14 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
             let src_is_dir = std::fs::symlink_metadata(&src_path)
                 .map(|m| m.is_dir())
                 .unwrap_or(false);
-            let result = if src_is_dir {
+            let result = if let Some((jar, entry)) = jarfs_decode(&dst_path) {
+                if src_is_dir {
+                    jarfs_create_dir_entry(&jar, &entry)
+                } else {
+                    std::fs::read(&src_path)
+                        .and_then(|bytes| jarfs_write_file_entry(&jar, &entry, &bytes))
+                }
+            } else if src_is_dir {
                 match std::fs::create_dir(&dst_path) {
                     Ok(()) => Ok(()),
                     Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => Ok(()),
@@ -9639,6 +9643,12 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
         |ctx, args| {
             let path_obj = obj_arg(args, 0)?;
             let p = p57_read_path(ctx, path_obj);
+            if let Some((jar, entry)) = jarfs_decode(&p) {
+                return match jarfs_create_dir_entry(&jar, &entry) {
+                    Ok(()) => Ok(Some(Value::Object(Some(path_obj)))),
+                    Err(e) => Err(p57_io_error(&e)),
+                };
+            }
             match std::fs::create_dir_all(&p) {
                 Ok(()) => Ok(Some(Value::Object(Some(path_obj)))),
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
@@ -9675,6 +9685,12 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
         |ctx, args| {
             let path_obj = obj_arg(args, 0)?;
             let p = p57_read_path(ctx, path_obj);
+            if let Some((jar, entry)) = jarfs_decode(&p) {
+                return match jarfs_create_dir_entry(&jar, &entry) {
+                    Ok(()) => Ok(Some(Value::Object(Some(path_obj)))),
+                    Err(e) => Err(p57_io_error(&e)),
+                };
+            }
             match std::fs::create_dir(&p) {
                 Ok(()) => Ok(Some(Value::Object(Some(path_obj)))),
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
@@ -12219,6 +12235,88 @@ fn jarfs_read_entry(jar: &str, entry: &str) -> std::io::Result<Vec<u8>> {
     let mut buf = Vec::with_capacity(f.size().min(1 << 27) as usize);
     f.read_to_end(&mut buf)?;
     Ok(buf)
+}
+
+fn jarfs_rewrite_entry(jar: &str, entry: &str, data: Option<&[u8]>) -> std::io::Result<()> {
+    use std::io::{Read, Write};
+    let entry = entry.trim_start_matches('/').trim_end_matches('/');
+    if entry.is_empty() {
+        if let Some(parent) = std::path::Path::new(jar).parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        if !std::path::Path::new(jar).exists() {
+            let f = std::fs::File::create(jar)?;
+            zip::ZipWriter::new(f).finish()
+                .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))?;
+        }
+        return Ok(());
+    }
+    let target = if data.is_some() {
+        entry.to_string()
+    } else {
+        format!("{entry}/")
+    };
+    let mut existing: Vec<(String, Option<Vec<u8>>)> = Vec::new();
+    if std::path::Path::new(jar).is_file() {
+        if let Ok(file) = std::fs::File::open(jar) {
+            if let Ok(mut archive) = zip::ZipArchive::new(file) {
+                for i in 0..archive.len() {
+                    let mut f = archive.by_index(i).map_err(|e| {
+                        std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string())
+                    })?;
+                    let name = f.name().to_string();
+                    if name == target || name.trim_end_matches('/') == entry {
+                        continue;
+                    }
+                    if f.is_dir() {
+                        existing.push((name, None));
+                    } else {
+                        let mut bytes = Vec::with_capacity(f.size().min(1 << 27) as usize);
+                        f.read_to_end(&mut bytes)?;
+                        existing.push((name, Some(bytes)));
+                    }
+                }
+            }
+        }
+    }
+    if let Some(parent) = std::path::Path::new(jar).parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let tmp = format!("{jar}.cratonvm-tmp-{}", std::process::id());
+    let file = std::fs::File::create(&tmp)?;
+    let mut writer = zip::ZipWriter::new(file);
+    let opts = zip::write::SimpleFileOptions::default()
+        .compression_method(zip::CompressionMethod::Stored);
+    for (name, bytes) in existing {
+        if let Some(bytes) = bytes {
+            writer.start_file(name, opts)
+                .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))?;
+            writer.write_all(&bytes)?;
+        } else {
+            writer.add_directory(name, opts)
+                .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))?;
+        }
+    }
+    if let Some(bytes) = data {
+        writer.start_file(target, opts)
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))?;
+        writer.write_all(bytes)?;
+    } else {
+        writer.add_directory(target, opts)
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))?;
+    }
+    writer.finish()
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))?;
+    std::fs::rename(tmp, jar)?;
+    Ok(())
+}
+
+fn jarfs_create_dir_entry(jar: &str, entry: &str) -> std::io::Result<()> {
+    jarfs_rewrite_entry(jar, entry, None)
+}
+
+fn jarfs_write_file_entry(jar: &str, entry: &str, bytes: &[u8]) -> std::io::Result<()> {
+    jarfs_rewrite_entry(jar, entry, Some(bytes))
 }
 
 /// Kind of a jar-FS path: regular file, directory, or absent.

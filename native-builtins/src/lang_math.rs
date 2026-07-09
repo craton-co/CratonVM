@@ -4442,8 +4442,11 @@ mod tests {
     fn parse_double_string_accepts_java_float_type_suffixes() {
         assert_eq!(parse_double_string("1d").unwrap(), 1.0);
         assert_eq!(parse_double_string("1D").unwrap(), 1.0);
+        assert_eq!(parse_double_string("3.0d").unwrap(), 3.0);
         assert_eq!(parse_double_string("1f").unwrap(), 1.0);
         assert_eq!(parse_double_string("1.25f").unwrap(), 1.25);
+        assert_eq!(parse_double_string("10F").unwrap(), 10.0);
+        assert_eq!(parse_double_string("9.99F").unwrap(), 9.99);
         assert_eq!(parse_double_string("6.0221415E+23d").unwrap(), 6.0221415E23);
         assert_eq!(parse_double_string("  +1d  ").unwrap(), 1.0);
     }
@@ -4452,8 +4455,10 @@ mod tests {
     fn parse_float_string_accepts_java_float_type_suffixes() {
         assert_eq!(parse_float_string("1d").unwrap(), 1.0);
         assert_eq!(parse_float_string("1D").unwrap(), 1.0);
+        assert_eq!(parse_float_string("3.0d").unwrap(), 3.0);
         assert_eq!(parse_float_string("1f").unwrap(), 1.0);
         assert_eq!(parse_float_string("1.25f").unwrap(), 1.25);
+        assert_eq!(parse_float_string("10F").unwrap(), 10.0);
         assert_eq!(
             parse_float_string("6.0221415E+23d").unwrap(),
             6.0221415E23_f32

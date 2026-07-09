@@ -778,6 +778,27 @@ fn jar_url_conn_ext(ctx: &mut dyn NativeContext, this: ObjectRef) -> String {
     ext
 }
 
+fn synthetic_resource_url_content_len(ctx: &mut dyn NativeContext, url: &str) -> i64 {
+    let resource = if let Some(rest) = url.strip_prefix("jrt:") {
+        let path = rest.trim_start_matches('/');
+        match path.split_once('/') {
+            Some((_module, entry)) => entry,
+            None => path,
+        }
+    } else if let Some(rest) = url
+        .strip_prefix("classpath:")
+        .or_else(|| url.strip_prefix("resource:"))
+    {
+        rest.trim_start_matches('/')
+    } else {
+        return -1;
+    };
+
+    ctx.find_resource(resource)
+        .map(|bytes| bytes.len() as i64)
+        .unwrap_or(-1)
+}
+
 /// `JarURLConnection.getJarEntry()` — build the `java/util/jar/JarEntry` for the
 /// entry named in the `jar:…!/entry` URL by reading the zip central directory.
 /// Returns `Value::Object(None)` when the URL has no entry or the jar/entry is
@@ -1578,6 +1599,18 @@ pub(crate) fn uri_select_raw_path(raw: &str) -> Option<String> {
     Some(after_auth[..end].to_string())
 }
 
+/// Raw scheme-specific part, excluding the fragment delimiter and fragment.
+/// `java.net.URI` treats `#fragment` as outside the SSP for both opaque
+/// (`mailto:a#b`) and hierarchical (`https://h/p#b`) URIs.
+fn uri_raw_scheme_specific_part(raw: &str) -> String {
+    let Some(colon) = raw.find(':') else {
+        return raw.to_string();
+    };
+    let ssp = &raw[colon + 1..];
+    let end = ssp.find('#').unwrap_or(ssp.len());
+    ssp[..end].to_string()
+}
+
 /// RFC 3986 §5.3 path-merge: combine a base hierarchical path with a
 /// relative reference path.
 fn uri_merge_paths(base_path: &str, ref_path: &str, base_has_authority: bool) -> String {
@@ -1640,35 +1673,42 @@ fn uri_split(
         Some(i) => (&s[..i], Some(s[i + 1..].to_string())),
         None => (s, None),
     };
-    let (without_query, query) = match without_frag.find('?') {
-        Some(i) => (&without_frag[..i], Some(without_frag[i + 1..].to_string())),
-        None => (without_frag, None),
-    };
     // scheme: leading "alpha *( alpha / digit / + / - / . ) :"
-    let (scheme, rest) = match without_query.find(':') {
+    let (scheme, rest) = match without_frag.find(':') {
         Some(i)
             if i > 0
-                && without_query[..i]
+                && without_frag[..i]
                     .chars()
                     .next()
                     .map(|c| c.is_ascii_alphabetic())
                     .unwrap_or(false)
-                && without_query[..i]
+                && without_frag[..i]
                     .chars()
                     .all(|c| c.is_ascii_alphanumeric() || matches!(c, '+' | '-' | '.')) =>
         {
             (
-                Some(without_query[..i].to_string()),
-                &without_query[i + 1..],
+                Some(without_frag[..i].to_string()),
+                &without_frag[i + 1..],
             )
         }
-        _ => (None, without_query),
+        _ => (None, without_frag),
     };
-    let (authority, path) = if let Some(after) = rest.strip_prefix("//") {
+
+    // Opaque absolute URIs (`scheme:ssp`) do not have authority, path, or query
+    // components. A literal '?' belongs to the SSP; only '#' starts a fragment.
+    if scheme.is_some() && !rest.starts_with('/') {
+        return (scheme, None, rest.to_string(), None, fragment);
+    }
+
+    let (without_query, query) = match rest.find('?') {
+        Some(i) => (&rest[..i], Some(rest[i + 1..].to_string())),
+        None => (rest, None),
+    };
+    let (authority, path) = if let Some(after) = without_query.strip_prefix("//") {
         let end = after.find('/').unwrap_or(after.len());
         (Some(after[..end].to_string()), after[end..].to_string())
     } else {
-        (None, rest.to_string())
+        (None, without_query.to_string())
     };
     (scheme, authority, path, query, fragment)
 }
@@ -1913,11 +1953,7 @@ fn register_uri_natives(r: &mut NativeMethodRegistry) {
         |ctx, args| {
             let this = obj_arg(args, 0)?;
             let raw = uri_raw_string(ctx, this);
-            let ssp = if let Some(i) = raw.find(':') {
-                raw[i + 1..].to_string()
-            } else {
-                raw.clone()
-            };
+            let ssp = uri_raw_scheme_specific_part(&raw);
             let decoded = uri_percent_decode(&ssp);
             Ok(Some(Value::Object(Some(ctx.create_string(&decoded)))))
         },
@@ -1931,11 +1967,7 @@ fn register_uri_natives(r: &mut NativeMethodRegistry) {
         |ctx, args| {
             let this = obj_arg(args, 0)?;
             let raw = uri_raw_string(ctx, this);
-            let ssp = if let Some(i) = raw.find(':') {
-                raw[i + 1..].to_string()
-            } else {
-                raw.clone()
-            };
+            let ssp = uri_raw_scheme_specific_part(&raw);
             Ok(Some(Value::Object(Some(ctx.create_string(&ssp)))))
         },
     );
@@ -2085,27 +2117,29 @@ fn register_uri_natives(r: &mut NativeMethodRegistry) {
         Ok(Some(Value::Object(None)))
     });
 
-    // getQuery() → `query` field by name (slot-order safe), else parse the
-    // raw string between '?' and '#'. Reading raw slot 4 was wrong for a
-    // real-JDK-constructed URI (the 5-arg ctor runs bytecode whose field
-    // layout differs from the synthetic one), the same flaw that made
-    // `getFragment` emit a spurious "null". Like getPath (and unlike the
-    // raw `query` field / getRawQuery), `getQuery()` returns the DECODED
-    // query, so percent-decode before returning.
+    // getQuery() → decoded hierarchical query. Opaque URIs keep a literal '?'
+    // inside the scheme-specific part, so parse from `uri_split` rather than a
+    // raw `find('?')` fallback.
     r.register(uri, "getQuery", "()Ljava/lang/String;", |ctx, args| {
         let this = obj_arg(args, 0)?;
+        let raw = uri_raw_string(ctx, this);
+        if !raw.is_empty() {
+            let (_, _, _, query, _) = uri_split(&raw);
+            return match query {
+                Some(q) => {
+                    let decoded = uri_percent_decode(&q);
+                    Ok(Some(Value::Object(Some(ctx.create_string(&decoded)))))
+                }
+                None => Ok(Some(Value::Object(None))),
+            };
+        }
+        // Last-ditch field fallback for any pre-populated real-JDK URI object
+        // that has a query field but no raw-string cache visible to CratonVM.
         if let Value::Object(Some(s)) = ctx.get_field_by_name(this, "query") {
             if let Some(v) = ctx.read_string(s) {
                 let decoded = uri_percent_decode(&v);
                 return Ok(Some(Value::Object(Some(ctx.create_string(&decoded)))));
             }
-        }
-        let raw = uri_raw_string(ctx, this);
-        if let Some(q) = raw.find('?') {
-            let after = &raw[q + 1..];
-            let end = after.find('#').unwrap_or(after.len());
-            let decoded = uri_percent_decode(&after[..end]);
-            return Ok(Some(Value::Object(Some(ctx.create_string(&decoded)))));
         }
         Ok(Some(Value::Object(None)))
     });
@@ -2145,17 +2179,21 @@ fn register_uri_natives(r: &mut NativeMethodRegistry) {
         },
     );
 
-    // getRawQuery() → raw (undecoded) query between '?' and '#', else null.
-    // Was unregistered (real bytecode read a mis-populated field → null).
+    // getRawQuery() → raw hierarchical query, else null. For opaque URIs,
+    // '?' is part of the raw scheme-specific part and must not surface here.
     r.register(uri, "getRawQuery", "()Ljava/lang/String;", |ctx, args| {
         let this = obj_arg(args, 0)?;
         let raw = uri_raw_string(ctx, this);
-        let before_frag = raw.split('#').next().unwrap_or(&raw);
-        match before_frag.find('?') {
-            Some(i) => Ok(Some(Value::Object(Some(
-                ctx.create_string(&before_frag[i + 1..]),
-            )))),
-            None => Ok(Some(Value::Object(None))),
+        if !raw.is_empty() {
+            let (_, _, _, query, _) = uri_split(&raw);
+            return match query {
+                Some(q) => Ok(Some(Value::Object(Some(ctx.create_string(&q))))),
+                None => Ok(Some(Value::Object(None))),
+            };
+        }
+        match ctx.get_field_by_name(this, "query") {
+            Value::Object(Some(s)) => Ok(Some(Value::Object(Some(s)))),
+            _ => Ok(Some(Value::Object(None))),
         }
     });
 
@@ -2200,6 +2238,9 @@ fn register_uri_natives(r: &mut NativeMethodRegistry) {
     r.register(uri, "toURL", "()Ljava/net/URL;", |ctx, args| {
         let this = obj_arg(args, 0)?;
         let raw = uri_raw_string(ctx, this);
+        if raw.is_empty() {
+            return Err(iae("URI is not absolute"));
+        }
         // Scheme = text before the first ':' (RFC 3986 §3.1). The real
         // `java.net.URI.toURL()` rejects two cases that callers RELY on
         // throwing:
@@ -5161,8 +5202,10 @@ fn register_re4_url_http(r: &mut NativeMethodRegistry) {
             // generic URLConnection path.
             let carrier = if ext.starts_with("jar:") {
                 "java/net/JarURLConnection"
-            } else {
+            } else if ext.starts_with("http://") || ext.starts_with("https://") {
                 "java/net/HttpURLConnection"
+            } else {
+                "java/net/URLConnection"
             };
             let conn = alloc_concurrent_synthetic(ctx, carrier, 16);
             // Field HUC_URL holds the originating URL so `huc_url_string`
@@ -5430,6 +5473,27 @@ fn register_re4_url_http(r: &mut NativeMethodRegistry) {
     r.register("java/net/URLConnection", "connect", "()V", |_ctx, _args| {
         Ok(None)
     });
+    r.register("java/net/URLConnection", "getContentLength", "()I", |ctx, args| {
+        let this = obj_arg(args, 0)?;
+        let url = huc_url_string(ctx, this);
+        let len = synthetic_resource_url_content_len(ctx, &url);
+        let v = if len < 0 || len > i32::MAX as i64 {
+            -1
+        } else {
+            len as i32
+        };
+        Ok(Some(Value::Int(v)))
+    });
+    r.register(
+        "java/net/URLConnection",
+        "getContentLengthLong",
+        "()J",
+        |ctx, args| {
+            let this = obj_arg(args, 0)?;
+            let url = huc_url_string(ctx, this);
+            Ok(Some(Value::Long(synthetic_resource_url_content_len(ctx, &url))))
+        },
+    );
     // URLConnection.getInputStream — defer to URL.openStream by reading
     // the URL stored in HUC_URL during openConnection above.
     r.register(
@@ -5879,6 +5943,10 @@ fn register_re4_url_http(r: &mut NativeMethodRegistry) {
     );
     r.register(huc, "getContentLength", "()I", |ctx, args| {
         let this = obj_arg(args, 0)?;
+        let url = huc_url_string(ctx, this);
+        if !(url.starts_with("http://") || url.starts_with("https://")) {
+            return Ok(Some(Value::Int(-1)));
+        }
         huc_perform(ctx, this)?;
         match ctx.get_field(this, HUC_BODY) {
             Value::Object(Some(a)) => Ok(Some(Value::Int(ctx.array_length(a) as i32))),
@@ -10221,6 +10289,34 @@ mod tests {
         assert!(!field5_is_full_url("localhost:8080"));
         assert!(!field5_is_full_url("alice:secret@localhost:8080"));
         assert!(!field5_is_full_url("alice@localhost:8080"));
+    }
+
+    #[test]
+    fn uri_split_keeps_opaque_question_mark_inside_ssp() {
+        let (scheme, authority, path, query, fragment) =
+            uri_split("mailto:user@example.com?subject=hello#frag");
+
+        assert_eq!(scheme.as_deref(), Some("mailto"));
+        assert_eq!(authority, None);
+        assert_eq!(path, "user@example.com?subject=hello");
+        assert_eq!(query, None);
+        assert_eq!(fragment.as_deref(), Some("frag"));
+    }
+
+    #[test]
+    fn uri_scheme_specific_part_excludes_fragment() {
+        assert_eq!(
+            uri_raw_scheme_specific_part("mailto:foo@bar.com#baz"),
+            "foo@bar.com"
+        );
+        assert_eq!(
+            uri_raw_scheme_specific_part("mailto:user@example.com?subject=hello"),
+            "user@example.com?subject=hello"
+        );
+        assert_eq!(
+            uri_raw_scheme_specific_part("https://example.com/foo?bar#baz"),
+            "//example.com/foo?bar"
+        );
     }
 
     #[test]

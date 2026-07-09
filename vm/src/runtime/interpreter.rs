@@ -20413,6 +20413,77 @@ pub(crate) fn is_xerces_xml_parser_native_override(
     }
 }
 
+pub(crate) fn is_awt_imageio_native_override(
+    class_name: &str,
+    method_name: &str,
+    descriptor: &str,
+) -> bool {
+    // java.awt.image.BufferedImage side-table raster. CratonVM stores pixels in
+    // native-awt's ARGB registry and stamps the Java object with an imageId;
+    // the real JDK methods expect populated Raster/ColorModel internals.
+    if class_name == "java/awt/image/BufferedImage"
+        && matches!(
+            (method_name, descriptor),
+            ("<init>", "(III)V")
+                | ("getWidth", "()I")
+                | ("getHeight", "()I")
+                | ("getRGB", "(II)I")
+                | ("setRGB", "(III)V")
+                | ("getType", "()I")
+                | ("createGraphics", "()Ljava/awt/Graphics2D;")
+                | ("flush", "()V")
+                | ("getRGB", "(IIII[III)[I")
+        )
+    {
+        return true;
+    }
+
+    // javax.imageio.ImageIO codec bridge. The real-JDK ImageIO SPI expects
+    // raster/color-model internals that CratonVM's memory-backed BufferedImage
+    // does not populate. Force the native bridge so Spring and desktop code can
+    // read/write the ARGB side-table image data through PNG/JPEG codecs.
+    if class_name == "javax/imageio/ImageIO"
+        && matches!(
+            (method_name, descriptor),
+            (
+                "read",
+                "(Ljava/io/InputStream;)Ljava/awt/image/BufferedImage;"
+            ) | ("read", "(Ljava/io/File;)Ljava/awt/image/BufferedImage;")
+                | (
+                    "write",
+                    "(Ljava/awt/image/RenderedImage;Ljava/lang/String;Ljava/io/OutputStream;)Z"
+                )
+                | (
+                    "write",
+                    "(Ljava/awt/image/RenderedImage;Ljava/lang/String;Ljavax/imageio/stream/ImageOutputStream;)Z"
+                )
+                | (
+                    "write",
+                    "(Ljava/awt/image/RenderedImage;Ljava/lang/String;Ljava/io/File;)Z"
+                )
+        )
+    {
+        return true;
+    }
+
+    if class_name == "com/sun/imageio/plugins/jpeg/JPEGImageReader"
+        && matches!(
+            (method_name, descriptor),
+            (
+                "read",
+                "(ILjavax/imageio/ImageReadParam;)Ljava/awt/image/BufferedImage;"
+            ) | ("dispose", "()V")
+        )
+    {
+        return true;
+    }
+
+    class_name == "com/sun/imageio/plugins/png/PNGImageWriter"
+        && method_name == "write"
+        && descriptor
+            == "(Ljavax/imageio/metadata/IIOMetadata;Ljavax/imageio/IIOImage;Ljavax/imageio/ImageWriteParam;)V"
+}
+
 fn force_native_over_real_jdk_bytecode(
     class_name: &str,
     method_name: &str,
@@ -20785,46 +20856,7 @@ fn force_native_over_real_jdk_bytecode(
     if class_name == "java/text/Normalizer" && matches!(method_name, "normalize" | "isNormalized") {
         return true;
     }
-    // java.awt.image.BufferedImage side-table raster. CratonVM stores pixels in
-    // native-awt's ARGB registry and stamps the Java object with an imageId;
-    // the real JDK methods expect populated Raster/ColorModel internals.
-    if class_name == "java/awt/image/BufferedImage"
-        && matches!(
-            (method_name, method_descriptor),
-            ("<init>", "(III)V")
-                | ("getWidth", "()I")
-                | ("getHeight", "()I")
-                | ("getRGB", "(II)I")
-                | ("setRGB", "(III)V")
-                | ("getType", "()I")
-                | ("createGraphics", "()Ljava/awt/Graphics2D;")
-                | ("flush", "()V")
-                | ("getRGB", "(IIII[III)[I")
-        )
-    {
-        return true;
-    }
-    // javax.imageio.ImageIO codec bridge. The real-JDK ImageIO SPI expects
-    // raster/color-model internals that CratonVM's memory-backed BufferedImage
-    // does not populate. Force the native bridge so Spring and desktop code can
-    // read/write the ARGB side-table image data through PNG/JPEG codecs.
-    if class_name == "javax/imageio/ImageIO"
-        && matches!(
-            (method_name, method_descriptor),
-            (
-                "read",
-                "(Ljava/io/InputStream;)Ljava/awt/image/BufferedImage;"
-            ) | ("read", "(Ljava/io/File;)Ljava/awt/image/BufferedImage;")
-                | (
-                    "write",
-                    "(Ljava/awt/image/RenderedImage;Ljava/lang/String;Ljava/io/OutputStream;)Z"
-                )
-                | (
-                    "write",
-                    "(Ljava/awt/image/RenderedImage;Ljava/lang/String;Ljava/io/File;)Z"
-                )
-        )
-    {
+    if is_awt_imageio_native_override(class_name, method_name, method_descriptor) {
         return true;
     }
     // SBR-02 / bug-03: fast native regex. The real-JDK `String.replaceAll` /
@@ -31108,6 +31140,64 @@ mod tests {
                 "real-JDK bytecode dispatch must force NativeThreadSet.{name}{descriptor}"
             );
         }
+    }
+
+    #[test]
+    fn awt_imageio_force_native_covers_registered_surface() {
+        let bi = "java/awt/image/BufferedImage";
+        for (name, descriptor) in [
+            ("<init>", "(III)V"),
+            ("getWidth", "()I"),
+            ("getHeight", "()I"),
+            ("getRGB", "(II)I"),
+            ("setRGB", "(III)V"),
+            ("getType", "()I"),
+            ("createGraphics", "()Ljava/awt/Graphics2D;"),
+            ("flush", "()V"),
+            ("getRGB", "(IIII[III)[I"),
+        ] {
+            assert!(is_awt_imageio_native_override(bi, name, descriptor));
+            assert!(force_native_over_real_jdk_bytecode(bi, name, descriptor));
+        }
+
+        let imageio = "javax/imageio/ImageIO";
+        for descriptor in [
+            "(Ljava/io/InputStream;)Ljava/awt/image/BufferedImage;",
+            "(Ljava/io/File;)Ljava/awt/image/BufferedImage;",
+            "(Ljava/awt/image/RenderedImage;Ljava/lang/String;Ljava/io/OutputStream;)Z",
+            "(Ljava/awt/image/RenderedImage;Ljava/lang/String;Ljavax/imageio/stream/ImageOutputStream;)Z",
+            "(Ljava/awt/image/RenderedImage;Ljava/lang/String;Ljava/io/File;)Z",
+        ] {
+            let name = if descriptor.ends_with("BufferedImage;") { "read" } else { "write" };
+            assert!(is_awt_imageio_native_override(imageio, name, descriptor));
+            assert!(force_native_over_real_jdk_bytecode(imageio, name, descriptor));
+        }
+
+        let jpeg_reader = "com/sun/imageio/plugins/jpeg/JPEGImageReader";
+        assert!(is_awt_imageio_native_override(
+            jpeg_reader,
+            "read",
+            "(ILjavax/imageio/ImageReadParam;)Ljava/awt/image/BufferedImage;"
+        ));
+        assert!(force_native_over_real_jdk_bytecode(
+            jpeg_reader,
+            "read",
+            "(ILjavax/imageio/ImageReadParam;)Ljava/awt/image/BufferedImage;"
+        ));
+        assert!(is_awt_imageio_native_override(
+            jpeg_reader,
+            "dispose",
+            "()V"
+        ));
+
+        let png_writer = "com/sun/imageio/plugins/png/PNGImageWriter";
+        let write_desc = "(Ljavax/imageio/metadata/IIOMetadata;Ljavax/imageio/IIOImage;Ljavax/imageio/ImageWriteParam;)V";
+        assert!(is_awt_imageio_native_override(
+            png_writer, "write", write_desc
+        ));
+        assert!(force_native_over_real_jdk_bytecode(
+            png_writer, "write", write_desc
+        ));
     }
 
     #[test]
