@@ -2842,6 +2842,10 @@ fn native_bais_read_bytes(ctx: &mut dyn NativeContext, args: &[Value]) -> Method
     // int, int)`'s JDK default impl by looping over the subclass's
     // overridden `read()I` via virtual dispatch — which is what real-JDK
     // bytecode would do.
+    // If this native was reached through an explicit `super.read([BII)` call,
+    // the base default implementation must stay on this path. A normal
+    // virtual call to a subclass three-arg override resolves before this
+    // native is entered.
     let cls_name = ctx
         .class_name_of_id(ctx.class_id_of_object(this))
         .unwrap_or_default();
@@ -2856,26 +2860,6 @@ fn native_bais_read_bytes(ctx: &mut dyn NativeContext, args: &[Value]) -> Method
         if cls_name == "org/hibernate/orm/test/lob/JpaLargeBlobTest$LobInputStream" {
             return hibernate_jpa_large_blob_read_bytes(ctx, this, buf, off, len);
         }
-        if ctx.class_declares_method(ctx.class_id_of_object(this), "read", "([BII)I") {
-            let this_pin = ctx.pin_native_root(this);
-            let buf_pin = ctx.pin_native_root(buf);
-            let this_cur = ctx.read_native_pin(this_pin, this);
-            let buf_cur = ctx.read_native_pin(buf_pin, buf);
-            let result = ctx.invoke(
-                &cls_name,
-                "read",
-                "([BII)I",
-                &[
-                    Value::Object(Some(this_cur)),
-                    Value::Object(Some(buf_cur)),
-                    Value::Int(off as i32),
-                    Value::Int(len as i32),
-                ],
-            );
-            ctx.unpin_native_roots(this_pin);
-            return result;
-        }
-
         // Match InputStream.read(byte[],int,int) default impl: one read()
         // call per byte, stop on -1, return count read (or -1 if none).
         if len == 0 {
@@ -17751,6 +17735,37 @@ mod bais_layout_tests {
 
         assert_eq!(n, Some(Value::Int(-1)));
         assert_eq!(ctx.get_field_by_name(stream, "read"), Value::Int(1));
+    }
+
+    #[test]
+    fn inputstream_super_read_bytes_uses_base_default_loop() {
+        let mut ctx = MockNativeContext::new();
+        let class = "org/bouncycastle/asn1/IndefiniteLengthInputStream";
+        let this = ctx.alloc_object_with_class(2, class);
+        ctx.declare_method(class, "read", "([BII)I");
+        let dst = ctx.new_array(ArrayElementType::Byte, 4);
+        ctx.script("read", "()I", Ok(Some(Value::Int(0x41))));
+        ctx.script("read", "()I", Ok(Some(Value::Int(0x42))));
+
+        let n = native_bais_read_bytes(
+            &mut ctx,
+            &[
+                Value::Object(Some(this)),
+                Value::Object(Some(dst)),
+                Value::Int(0),
+                Value::Int(2),
+            ],
+        )
+        .unwrap();
+
+        assert_eq!(n, Some(Value::Int(2)));
+        assert_eq!(ctx.get_array_element(dst, 0), Value::Int(0x41));
+        assert_eq!(ctx.get_array_element(dst, 1), Value::Int(0x42));
+        let calls = ctx.recorded_calls();
+        assert_eq!(calls.len(), 2);
+        assert!(calls
+            .iter()
+            .all(|c| c.method_name == "read" && c.descriptor == "()I"));
     }
 
     #[test]

@@ -11,7 +11,7 @@
 #![cfg(test)]
 
 use std::cell::UnsafeCell;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use cratonvm_native_api::{
     AnnotationData, AnnotationElementValue, FieldMetadata, MethodMetadata, NativeContext,
@@ -59,6 +59,7 @@ pub(crate) struct MockNativeContext {
     /// unknown, preserving the historic `class_id_of_object == 0` default.
     class_table: Vec<String>,
     obj_class: HashMap<usize, ClassId>,
+    declared_methods: HashSet<(ClassId, String, String)>,
 }
 
 impl MockNativeContext {
@@ -75,6 +76,7 @@ impl MockNativeContext {
             strings: UnsafeCell::new(HashMap::new()),
             class_table: vec![String::new()],
             obj_class: HashMap::new(),
+            declared_methods: HashSet::new(),
         }
     }
 
@@ -101,6 +103,12 @@ impl MockNativeContext {
         let cid = self.ensure_mock_class(class_name);
         self.obj_class.insert(obj.as_ptr() as usize, cid);
         obj
+    }
+
+    pub(crate) fn declare_method(&mut self, class_name: &str, method: &str, desc: &str) {
+        let cid = self.ensure_mock_class(class_name);
+        self.declared_methods
+            .insert((cid, method.to_string(), desc.to_string()));
     }
 
     fn strings_mut(&self) -> &mut HashMap<usize, String> {
@@ -312,6 +320,10 @@ impl NativeContext for MockNativeContext {
     }
     fn method_exists(&self, _c: &str, _m: &str, _d: &str) -> bool {
         false
+    }
+    fn class_declares_method(&self, class_id: ClassId, name: &str, descriptor: &str) -> bool {
+        self.declared_methods
+            .contains(&(class_id, name.to_string(), descriptor.to_string()))
     }
     fn new_ref_array(&mut self, _c: ClassId, length: usize) -> ObjectRef {
         self.alloc_entry(HeapEntry::Array {

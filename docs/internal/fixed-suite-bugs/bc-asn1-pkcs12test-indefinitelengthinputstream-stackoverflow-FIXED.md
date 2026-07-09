@@ -1,9 +1,31 @@
-# BC asn1-regression `PKCS12Test` StackOverflowError (blocks entire suite)
+# BC asn1-regression `PKCS12Test` StackOverflowError (FIXED)
 
-Status: open
+Status: fixed
 
 Date observed: 2026-07-09, timing CratonVM against HotSpot for the
 `apps/bc-java` core-module suites (Azure build host, `dev` @ `885e936c`).
+
+Date fixed: 2026-07-09, branch
+`codex/fix-bc-pkcs12-stackoverflow-20260709-001`.
+
+## Fix
+
+Root cause was the base `java/io/InputStream.read([BII)I` native fallback in
+`native-io/src/lib.rs`. For non-`ByteArrayInputStream` receivers it checked
+whether the receiver class declared its own three-arg `read` override and then
+called that override again. That is wrong once the base method has already been
+selected by an explicit superclass call.
+
+Bouncy Castle's `IndefiniteLengthInputStream.read([BII)` intentionally calls
+`super.read([BII)` for small/default reads. CratonVM re-dispatched that
+super-call back to `IndefiniteLengthInputStream.read([BII)`, creating the
+unbounded recursion seen in `PKCS12Test`.
+
+The fix removes that redispatch. Once the base `InputStream.read([BII)` native
+is entered for a non-BAIS receiver, it now stays on the JDK default
+implementation: loop over the receiver's virtual `read()I`, copy bytes, and
+return the count or `-1`. Normal virtual calls to a subclass's three-arg
+override still resolve before this native is entered.
 
 ## Summary
 
@@ -92,7 +114,24 @@ sibling BC core-suite timing results (not yet written up as a doc) for
 interpreter-throughput wall (org/bouncycastle/ is JIT-banned per
 `vm/src/jit/skip_list.rs`, timeout at 600s) rather than crashing.
 
-## Next leads
+## Validation
+
+- `cargo test -p cratonvm-native-io inputstream_super_read_bytes_uses_base_default_loop -- --nocapture`
+  passes and proves the fallback ignores a receiver-declared three-arg override
+  after the base method is selected.
+- Built unique binary
+  `target/bc-pkcs12-soe-20260709-001/release/cratonvm-bc-pkcs12-soe-20260709-001.exe`.
+- `CRATONVM_BIN=.../cratonvm-bc-pkcs12-soe-20260709-001.exe cargo test -p cratonvm-vm --test inputstream_super_read_probe -- --nocapture`
+  passes. The probe covers both the Bouncy Castle-shaped `super.read([BII)`
+  recursion and the earlier Jetty-shaped normal virtual dispatch case where
+  inherited `read([B)I` must still reach a subclass `read([BII)I` override.
+
+The local checkout does not contain `apps/bc-java`, so the full
+`org.bouncycastle.asn1.test.RegressionTest` suite was not rerun here. The
+committed probe validates the controlling VM mechanism that produced the
+`IndefiniteLengthInputStream.read()` recursion.
+
+## Original leads (superseded)
 
 - Reproduce standalone with a minimal indefinite-length BER fixture to
   confirm whether the recursion depth genuinely tracks input structure
