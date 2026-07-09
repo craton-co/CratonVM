@@ -1900,6 +1900,23 @@ pub trait NativeContext {
         Vec::new()
     }
 
+    /// Get the runtime-visible TYPE_USE annotations that target a method return
+    /// type's direct TYPE ARGUMENTS (JVMS 4.7.20 `target_type` 0x14,
+    /// METHOD_RETURN, with a single TYPE_ARGUMENT `type_path` entry) -- e.g.
+    /// `List<@NotBlank String> getNames()`.
+    ///
+    /// The outer `Vec` is indexed by `type_argument_index` (0-based, per JVMS
+    /// 4.7.20.2); entries with no annotations are empty `Vec`s. Default impl
+    /// returns an empty `Vec`.
+    fn method_return_type_argument_annotations(
+        &self,
+        _class_id: ClassId,
+        _method_name: &str,
+        _method_desc: &str,
+    ) -> Vec<Vec<AnnotationData>> {
+        Vec::new()
+    }
+
     /// Get the runtime-visible TYPE_USE annotations that target a method's
     /// formal parameters (JVMS 4.7.20 `target_type` 0x16,
     /// METHOD_FORMAL_PARAMETER) with an empty `type_path`. The outer `Vec` is
@@ -1922,6 +1939,22 @@ pub trait NativeContext {
     /// Backs `Field.getAnnotatedType().getDeclaredAnnotations()`. Default impl
     /// returns an empty `Vec`.
     fn field_type_annotations(&self, _class_id: ClassId, _field_name: &str) -> Vec<AnnotationData> {
+        Vec::new()
+    }
+
+    /// Get the runtime-visible TYPE_USE annotations that target a field type's
+    /// direct TYPE ARGUMENTS (JVMS 4.7.20 `target_type` 0x13, FIELD, with a
+    /// single TYPE_ARGUMENT `type_path` entry) -- e.g.
+    /// `List<@NotBlank String> names`.
+    ///
+    /// The outer `Vec` is indexed by `type_argument_index` (0-based, per JVMS
+    /// 4.7.20.2); entries with no annotations are empty `Vec`s. Default impl
+    /// returns an empty `Vec`.
+    fn field_type_argument_annotations(
+        &self,
+        _class_id: ClassId,
+        _field_name: &str,
+    ) -> Vec<Vec<AnnotationData>> {
         Vec::new()
     }
 
