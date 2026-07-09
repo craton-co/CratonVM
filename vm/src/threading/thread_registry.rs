@@ -28,6 +28,13 @@ struct ThreadEntry {
     java_thread_obj: Option<ObjectRef>,
     /// Whether this thread is still running.
     alive: AtomicBool,
+    /// Whether this thread can currently participate in counted STW barriers.
+    ///
+    /// `Thread.start()` registers the Java mirror before the spawned carrier has
+    /// published its GC state or reached a safepoint-capable startup point. Such
+    /// entries are alive for Java APIs but must not contribute to STW `expected`
+    /// until the child marks itself ready.
+    stw_ready: AtomicBool,
     /// T19.K1 — Whether this thread is a daemon. Default `false` matches
     /// the JLS rule that newly created threads inherit the parent's
     /// daemon status, which is `false` for the main thread. The CLI
@@ -183,12 +190,35 @@ impl ThreadRegistry {
         java_thread_obj: Option<ObjectRef>,
         daemon: bool,
     ) {
+        self.register_with_daemon_stw_ready(thread_id, name, java_thread_obj, daemon, true);
+    }
+
+    /// Register a thread that is alive but not yet able to answer STW barriers.
+    pub fn register_starting_with_daemon(
+        &self,
+        thread_id: ThreadId,
+        name: &str,
+        java_thread_obj: Option<ObjectRef>,
+        daemon: bool,
+    ) {
+        self.register_with_daemon_stw_ready(thread_id, name, java_thread_obj, daemon, false);
+    }
+
+    fn register_with_daemon_stw_ready(
+        &self,
+        thread_id: ThreadId,
+        name: &str,
+        java_thread_obj: Option<ObjectRef>,
+        daemon: bool,
+        stw_ready: bool,
+    ) {
         let park_state = Arc::new(ParkState::new());
         let entry = ThreadEntry {
             name: name.to_string(),
             join_handle: None,
             java_thread_obj,
             alive: AtomicBool::new(true),
+            stw_ready: AtomicBool::new(stw_ready),
             daemon: AtomicBool::new(daemon),
             park_state: park_state.clone(),
             interrupted: Arc::new(AtomicBool::new(false)),
@@ -357,23 +387,72 @@ impl ThreadRegistry {
             "--- T19.H1 thread summary: {} registered thread(s) ---",
             threads.len()
         );
-        let mut rows: Vec<(u64, String, bool, bool, usize)> = threads
+        struct SummaryRow {
+            tid: u64,
+            os_tid: u64,
+            name: String,
+            alive: bool,
+            daemon: bool,
+            blocked: bool,
+            roots: usize,
+            state: String,
+            top: String,
+        }
+        let mut rows: Vec<SummaryRow> = threads
             .iter()
             .map(|(tid, e)| {
-                (
-                    tid.0,
-                    e.name.clone(),
-                    e.alive.load(std::sync::atomic::Ordering::Acquire),
-                    e.daemon.load(std::sync::atomic::Ordering::Acquire),
-                    e.root_snapshot.lock().len(),
-                )
+                let state = {
+                    let s = e.vm_state.lock();
+                    if s.is_empty() {
+                        "<unset>".to_string()
+                    } else {
+                        s.clone()
+                    }
+                };
+                let trace = e.frame_trace.lock();
+                let mut top = String::new();
+                for (i, frame) in trace.iter().rev().take(3).enumerate() {
+                    if i > 0 {
+                        top.push_str(" <- ");
+                    }
+                    top.push_str(&format!(
+                        "{}.{}@{}",
+                        frame.class_name, frame.method_name, frame.byte_code_index
+                    ));
+                }
+                if top.is_empty() {
+                    top.push_str("<no-frame-trace>");
+                }
+                SummaryRow {
+                    tid: tid.0,
+                    os_tid: e.os_tid.load(std::sync::atomic::Ordering::Acquire) as u64,
+                    name: e.name.clone(),
+                    alive: e.alive.load(std::sync::atomic::Ordering::Acquire),
+                    daemon: e.daemon.load(std::sync::atomic::Ordering::Acquire),
+                    blocked: e
+                        .gc_block_state
+                        .in_blocked_region
+                        .load(std::sync::atomic::Ordering::Acquire),
+                    roots: e.root_snapshot.lock().len(),
+                    state,
+                    top,
+                }
             })
             .collect();
-        rows.sort_by_key(|r| r.0);
-        for (tid, name, alive, daemon, roots) in rows {
+        rows.sort_by_key(|r| r.tid);
+        for row in rows {
             let _ = writeln!(
                 h,
-                "  tid={tid} name={name:?} alive={alive} daemon={daemon} roots={roots}"
+                "  tid={} os_tid={} name={:?} alive={} daemon={} blocked={} roots={} state={:?} top={}",
+                row.tid,
+                row.os_tid,
+                row.name,
+                row.alive,
+                row.daemon,
+                row.blocked,
+                row.roots,
+                row.state,
+                row.top
             );
         }
         let _ = writeln!(h, "--- T19.H1 end thread summary ---");
@@ -431,6 +510,14 @@ impl ThreadRegistry {
             .get(&thread_id)
             .map(|e| e.alive.load(Ordering::Acquire))
             .unwrap_or(false)
+    }
+
+    /// Mark a started carrier as able to participate in counted STW barriers.
+    pub fn mark_stw_ready(&self, thread_id: ThreadId) {
+        let threads = self.threads.lock();
+        if let Some(entry) = threads.get(&thread_id) {
+            entry.stw_ready.store(true, Ordering::Release);
+        }
     }
 
     /// Block the calling OS thread until the target thread finishes.
@@ -802,6 +889,7 @@ impl ThreadRegistry {
                 .gc_block_state
                 .in_blocked_region
                 .load(Ordering::Acquire);
+            let stw_ready = entry.stw_ready.load(Ordering::Acquire);
             let snapshot_len = entry.root_snapshot.lock().len();
             let os_tid = entry.os_tid.load(Ordering::Acquire);
             let vm_state = {
@@ -829,8 +917,8 @@ impl ThreadRegistry {
             }
             let _ = write!(
                 out,
-                "\n  t{} os_tid={} name={:?} blocked={} snapshot={} state={:?} top={}",
-                tid.0, os_tid, entry.name, blocked, snapshot_len, vm_state, top
+                "\n  t{} os_tid={} name={:?} blocked={} ready={} snapshot={} state={:?} top={}",
+                tid.0, os_tid, entry.name, blocked, stw_ready, snapshot_len, vm_state, top
             );
         }
         out
@@ -1095,19 +1183,21 @@ impl ThreadRegistry {
         }
     }
 
-    /// xt-hardening (2026-07-03): alive-thread count PLUS the published OS
-    /// tids of those alive threads, read under one registry lock so the GC
-    /// barrier's `expected` and the takeover's counted-set snapshot cannot
-    /// disagree about which threads exist. A thread whose OS tid is still 0
-    /// (registered, not yet started) is counted but yields no tid — it
-    /// cannot be executing JIT code yet, so it can never be frozen, and the
-    /// missing tid cannot cause a missed excusal deadlock.
+    /// xt-hardening (2026-07-03): STW-ready alive-thread count PLUS the
+    /// published OS tids of those counted threads, read under one registry lock
+    /// so the GC barrier's `expected` and the takeover's counted-set snapshot
+    /// cannot disagree about which threads exist.
+    ///
+    /// A `Thread.start()` child is alive before its carrier can answer a
+    /// safepoint. It stays out of this counted set until `mark_stw_ready` flips
+    /// the startup gate; if an STW is already active, the child waits it out via
+    /// `arrive_and_wait_excluded` first.
     pub fn alive_count_and_os_tids(&self) -> (usize, Vec<u32>) {
         let threads = self.threads.lock();
         let mut n = 0usize;
         let mut tids = Vec::with_capacity(threads.len());
         for e in threads.values() {
-            if e.alive.load(Ordering::Acquire) {
+            if e.alive.load(Ordering::Acquire) && e.stw_ready.load(Ordering::Acquire) {
                 n += 1;
                 let t = e.os_tid.load(Ordering::Acquire);
                 if t != 0 {
@@ -1285,6 +1375,7 @@ mod tests {
         assert!(registry.is_alive(tid));
         assert_eq!(registry.count(), 1);
         assert_eq!(registry.alive_count(), 1);
+        assert_eq!(registry.alive_count_and_os_tids().0, 1);
     }
 
     #[test]
@@ -1298,6 +1389,20 @@ mod tests {
         assert!(!registry.is_alive(tid));
         assert_eq!(registry.count(), 1);
         assert_eq!(registry.alive_count(), 0);
+    }
+
+    #[test]
+    fn starting_thread_is_not_stw_counted_until_ready() {
+        let registry = ThreadRegistry::new();
+        let tid = ThreadId(1);
+        registry.register_starting_with_daemon(tid, "starting", None, false);
+
+        assert!(registry.is_alive(tid));
+        assert_eq!(registry.alive_count(), 1);
+        assert_eq!(registry.alive_count_and_os_tids().0, 0);
+
+        registry.mark_stw_ready(tid);
+        assert_eq!(registry.alive_count_and_os_tids().0, 1);
     }
 
     #[test]

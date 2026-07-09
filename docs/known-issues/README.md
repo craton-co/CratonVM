@@ -4,6 +4,54 @@ This folder collects CratonVM-only defects found while running upstream Java
 suites. The docs had grown to describe the **same underlying bug from several
 angles**; this index is the consolidated map. Read it first.
 
+## 2026-07-09 Tomcat WebSocket close-delay repro blocked by 3 environment bugs (2 fixed, 1 new open)
+
+While chasing `wsremoteendpoint-close-delay-near-deadlock.md`, found the
+real-JDK-mode Tomcat repro no longer starts at all (regression vs. the
+2026-07-07 evidence in that doc). Root-caused and fixed two of three
+blockers; the third is a new open issue:
+
+- FIXED/RETIRED: [`file-fs-native-clinit-never-set-FIXED.md`](../internal/fixed-suite-bugs/file-fs-native-clinit-never-set-FIXED.md) — `native_file_clinit` (the native override for `java/io/File.<clinit>`) never set the `FS` field, so any real-bytecode `File` method not in the `check_override` allow-list (`isInvalid()` and everything built on it — `length()`, `delete()`, `mkdir()`, `list()`, …) NPE'd. 100% reproducible; broke Tomcat's `Digester`/`mbeans-descriptors.xml` bootstrap on every real-JDK-mode `Tomcat.start()`.
+- FIXED/RETIRED: [`threadgroup-native-field-index-mismatch-FIXED.md`](../internal/fixed-suite-bugs/threadgroup-native-field-index-mismatch-FIXED.md) — the native `java.lang.ThreadGroup` accessors used a stale/swapped field-index layout (`name`/`parent` swapped vs. the real JDK 25 class layout), corrupting every VM-bootstrapped `ThreadGroup`. Broke `jdk.internal.misc.InnocuousThread.<clinit>` (`Cleaner.create()`) with a `ClassCastException`, failing `StandardServer` init before any application code ran.
+- OPEN (new): [`enumset-of-broken-for-non-jdk-enums.md`](enumset-of-broken-for-non-jdk-enums.md) — `EnumSet.of(...)` silently returns a broken/empty, non-iterable set for non-JDK enums (e.g. `jakarta.servlet.DispatcherType`). Current blocker: Tomcat's `WsServerContainer` constructor uses this exact pattern for filter-dispatcher-type registration, so every websocket-enabled `StandardContext` fails to start. Root-cause narrowed to two candidates in the doc, not yet fixed.
+
+The original websocket close-delay bug itself remains OPEN and
+unconfirmed at the I/O level — see the doc's 2026-07-09 addendum for the
+strengthened (but not yet empirically verified) root-cause hypothesis
+(a bounded 20s blocking-send timeout expiring rather than a permanent
+deadlock, `CountDownLatch` ruled out, socket write-readiness path now the
+leading suspect) and the concrete next steps once the `EnumSet` blocker
+above is cleared.
+
+## 2026-07-09 AccessLogValve/RewriteValve re-verify: 1 severe regression FIXED, 2 new foundational bugs found (OPEN)
+
+Re-verified `tomcat-08-07/accesslogvalve-rewritevalve-connection-failures.md`
+in isolation (`-Parallel 1`, idle Azure host) per its own recommendation.
+Both classes are CONFIRMED genuine bugs, not contention. Investigating them
+surfaced three distinct, layered issues:
+
+- FIXED: `URL.openConnection()` returned the wrong carrier type
+  (`ClassCastException`) for any real http(s) URL, due to a field-5
+  (authority) parsing bug introduced by commit `b0dd2e72` (2026-07-07).
+  Huge blast radius — anything doing `(HttpURLConnection)
+  url.openConnection()` on a real-bytecode URL was broken. Fixed in
+  `net_phase_e.rs`, verified byte-identical to HotSpot.
+- OPEN: [`bytebuffer-address-unset-aioobe.md`](tomcat-08-07/bytebuffer-address-unset-aioobe.md)
+  — `ByteBuffer.allocate()`'s synthetic carrier never sets
+  `Buffer.address`, so any bulk `get(byte[])`/`put(byte[])` throws
+  `ArrayIndexOutOfBoundsException` via `Unsafe.copyMemory` — breaks any
+  real-net-mode NIO server reading requests into a byte array (e.g.
+  Tomcat's `NioEndpoint`). Root-caused with a minimal repro; the actual
+  live dispatch site could not be located (two plausible fix locations
+  both proven dead code).
+- OPEN: [`stringreader-read-never-advances-infinite-loop.md`](tomcat-08-07/stringreader-read-never-advances-infinite-loop.md)
+  — `StringReader.read()` never advances position, infinite-looping any
+  `BufferedReader`/`StringReader`-based text parser (e.g.
+  `RewriteValve.parse()`). Same unresolved "phantom native" dispatch
+  mystery as the ByteBuffer bug above.
+- Updated: [`tomcat-08-07/accesslogvalve-rewritevalve-connection-failures.md`](tomcat-08-07/accesslogvalve-rewritevalve-connection-failures.md)
+  now reflects all three findings.
+
 ## 2026-07-09 Spring suite genuine-bug list, updated (125, down from 159)
 
 - [`CRATONVM-SPRING-GENUINE-BUGLIST-125.md`](CRATONVM-SPRING-GENUINE-BUGLIST-125.md) — full per-test-method detail for 125 CratonVM-unique Spring failures (HotSpot passes, CratonVM doesn't), cross-referenced against a clean HotSpot baseline with the classpath-dump gap fixed (spring-websocket/oxm/jms/orm/core-test jars were never built — `./gradlew jar testFixturesJar testClasses` fixed it). Down from 159 two dev commits ago: 65 newly fixed (entire SpEL cluster + spring-jms module), 31 "newly broken" are **not** new regressions — root-caused to the already-tracked HIB-CV-32 batch/load-dependent heap-corruption family (25/31 SIGSEGV, one test confirmed passing standalone but ABEND under full-suite load).

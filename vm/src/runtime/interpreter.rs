@@ -20622,6 +20622,60 @@ pub(crate) fn is_liquibase_checksum_native_override(
     )
 }
 
+pub(crate) fn is_reflection_factory_serialization_native_override(
+    class_name: &str,
+    method_name: &str,
+    descriptor: &str,
+) -> bool {
+    matches!(
+        class_name,
+        "sun/reflect/ReflectionFactory" | "jdk/internal/reflect/ReflectionFactory"
+    ) && matches!(
+        (method_name, descriptor),
+        ("getReflectionFactory", "()Lsun/reflect/ReflectionFactory;")
+            | (
+                "getReflectionFactory",
+                "()Ljdk/internal/reflect/ReflectionFactory;"
+            )
+            | (
+                "newConstructorForSerialization",
+                "(Ljava/lang/Class;)Ljava/lang/reflect/Constructor;"
+            )
+            | (
+                "newConstructorForSerialization",
+                "(Ljava/lang/Class;Ljava/lang/reflect/Constructor;)Ljava/lang/reflect/Constructor;"
+            )
+            | (
+                "newConstructorForExternalization",
+                "(Ljava/lang/Class;)Ljava/lang/reflect/Constructor;"
+            )
+            | (
+                "readObjectForSerialization",
+                "(Ljava/lang/Class;)Ljava/lang/invoke/MethodHandle;"
+            )
+            | (
+                "readObjectNoDataForSerialization",
+                "(Ljava/lang/Class;)Ljava/lang/invoke/MethodHandle;"
+            )
+            | (
+                "writeObjectForSerialization",
+                "(Ljava/lang/Class;)Ljava/lang/invoke/MethodHandle;"
+            )
+            | (
+                "readResolveForSerialization",
+                "(Ljava/lang/Class;)Ljava/lang/invoke/MethodHandle;"
+            )
+            | (
+                "writeReplaceForSerialization",
+                "(Ljava/lang/Class;)Ljava/lang/invoke/MethodHandle;"
+            )
+            | (
+                "hasStaticInitializerForSerialization",
+                "(Ljava/lang/Class;)Z"
+            )
+    )
+}
+
 fn force_native_over_real_jdk_bytecode(
     class_name: &str,
     method_name: &str,
@@ -20630,6 +20684,82 @@ fn force_native_over_real_jdk_bytecode(
     if class_name == "java/lang/Object"
         && method_name == "clone"
         && method_descriptor == "()Ljava/lang/Object;"
+    {
+        return true;
+    }
+
+    // Real-JDK `Thread.run()` bytecode is layout-variant: older JDKs read
+    // direct `Thread.target`, while newer layouts also carry the task in
+    // `Thread$FieldHolder.task`. CratonVM's registered native mirrors VM
+    // thread-start target resolution (direct field, holder task, synthetic
+    // slot), so force it to win for normal and invokespecial `super.run()`
+    // calls from Thread subclasses such as WildFly's JBossThread.
+    if class_name == "java/lang/Thread" && method_name == "run" && method_descriptor == "()V" {
+        return true;
+    }
+
+    if class_name == "java/lang/Thread"
+        && method_name == "getThreadGroup"
+        && method_descriptor == "()Ljava/lang/ThreadGroup;"
+    {
+        return true;
+    }
+
+    if class_name == "org/jboss/threads/JBossThread"
+        && method_name == "run"
+        && method_descriptor == "()V"
+    {
+        return true;
+    }
+
+    if class_name == "org/jboss/threads/JBossThread"
+        && method_name == "onExit"
+        && method_descriptor == "(Ljava/lang/Runnable;)Z"
+    {
+        return true;
+    }
+
+    if class_name == "org/jboss/threads/JBossThreadFactory"
+        && ((method_name == "newThread"
+            && method_descriptor == "(Ljava/lang/Runnable;)Ljava/lang/Thread;")
+            || (method_name == "access$100"
+                && method_descriptor
+                    == "(Lorg/jboss/threads/JBossThreadFactory;Ljava/lang/Runnable;)Ljava/lang/Thread;"))
+    {
+        return true;
+    }
+
+    if class_name == "java/io/InputStreamReader"
+        && method_name == "close"
+        && method_descriptor == "()V"
+    {
+        return true;
+    }
+
+    if class_name == "java/lang/SecurityManager"
+        && method_name == "getRootGroup"
+        && method_descriptor == "()Ljava/lang/ThreadGroup;"
+    {
+        return true;
+    }
+
+    if class_name == "java/util/AbstractSet"
+        && method_name == "hashCode"
+        && method_descriptor == "()I"
+    {
+        return true;
+    }
+
+    if class_name == "java/util/AbstractCollection"
+        && method_name == "contains"
+        && method_descriptor == "(Ljava/lang/Object;)Z"
+    {
+        return true;
+    }
+
+    if class_name == "java/lang/Class"
+        && (method_name == "getEnumConstants" || method_name == "getEnumConstantsShared")
+        && method_descriptor == "()[Ljava/lang/Object;"
     {
         return true;
     }
@@ -21301,6 +21431,18 @@ fn force_native_over_real_jdk_bytecode(
         return true;
     }
     if is_liquibase_checksum_native_override(class_name, method_name, method_descriptor) {
+        return true;
+    }
+    // JBoss Marshalling calls real-JDK `sun.reflect.ReflectionFactory`
+    // bytecode to discover serialization hooks. On CratonVM the registered
+    // natives encode ObjectStreamClass's private/inheritable hook rules and
+    // must win over the bytecode body, or MethodHandle.invoke later tries to
+    // dispatch `java/lang/Object.readObject(ObjectInputStream)`.
+    if is_reflection_factory_serialization_native_override(
+        class_name,
+        method_name,
+        method_descriptor,
+    ) {
         return true;
     }
     // Surefire fork bootstrap/teardown: bypass ServiceLoader decoder discovery
@@ -32003,6 +32145,43 @@ mod tests {
             "org/h2/table/Column",
             "getName",
             "()Ljava/lang/String;"
+        ));
+    }
+
+    #[test]
+    fn reflection_factory_force_native_covers_serialization_surface() {
+        for class_name in [
+            "sun/reflect/ReflectionFactory",
+            "jdk/internal/reflect/ReflectionFactory",
+        ] {
+            for (name, descriptor) in [
+                ("newConstructorForSerialization", "(Ljava/lang/Class;)Ljava/lang/reflect/Constructor;"),
+                (
+                    "newConstructorForSerialization",
+                    "(Ljava/lang/Class;Ljava/lang/reflect/Constructor;)Ljava/lang/reflect/Constructor;",
+                ),
+                ("newConstructorForExternalization", "(Ljava/lang/Class;)Ljava/lang/reflect/Constructor;"),
+                ("readObjectForSerialization", "(Ljava/lang/Class;)Ljava/lang/invoke/MethodHandle;"),
+                (
+                    "readObjectNoDataForSerialization",
+                    "(Ljava/lang/Class;)Ljava/lang/invoke/MethodHandle;",
+                ),
+                ("writeObjectForSerialization", "(Ljava/lang/Class;)Ljava/lang/invoke/MethodHandle;"),
+                ("readResolveForSerialization", "(Ljava/lang/Class;)Ljava/lang/invoke/MethodHandle;"),
+                ("writeReplaceForSerialization", "(Ljava/lang/Class;)Ljava/lang/invoke/MethodHandle;"),
+                ("hasStaticInitializerForSerialization", "(Ljava/lang/Class;)Z"),
+            ] {
+                assert!(
+                    is_reflection_factory_serialization_native_override(class_name, name, descriptor),
+                    "{class_name}.{name}{descriptor} must route to the registered native"
+                );
+                assert!(force_native_over_real_jdk_bytecode(class_name, name, descriptor));
+            }
+        }
+        assert!(!is_reflection_factory_serialization_native_override(
+            "java/io/ObjectStreamClass",
+            "getReflector",
+            "(Ljava/lang/Class;)Ljava/lang/Object;"
         ));
     }
 

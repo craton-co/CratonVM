@@ -1534,6 +1534,12 @@ fn register_arraylist_natives(r: &mut NativeMethodRegistry) {
         "()[Ljava/lang/Object;",
         native_al_to_array,
     );
+    r.register(
+        "java/util/AbstractCollection",
+        "contains",
+        "(Ljava/lang/Object;)Z",
+        native_al_contains,
+    );
     r.register(c, "iterator", "()Ljava/util/Iterator;", native_al_iterator);
     r.register(c, "ensureCapacity", "(I)V", native_al_ensure_capacity);
     r.register(c, "trimToSize", "()V", native_al_trim_to_size);
@@ -1952,15 +1958,36 @@ pub fn native_al_contains(ctx: &mut dyn NativeContext, args: &[Value]) -> Method
     };
     resync_values_view(ctx, this);
     let target = args.get(1).copied().unwrap_or(Value::Object(None));
+    if let Some(cls_name) = ctx.class_name_of_id(ctx.class_id_of_object(this)) {
+        if cls_name == "java/util/EnumSet" {
+            if let Value::Object(Some(backing)) = ctx.get_field(this, 0) {
+                return native_al_contains(ctx, &[Value::Object(Some(backing)), target]);
+            }
+        }
+        if cls_name == "java/util/RegularEnumSet" || cls_name == "java/util/JumboEnumSet" {
+            let contained = match target {
+                Value::Object(Some(elem)) => {
+                    enum_set_contains_member(&*ctx, this, elem).unwrap_or(false)
+                }
+                _ => false,
+            };
+            return Ok(Some(Value::Int(if contained { 1 } else { 0 })));
+        }
+    }
     let (data, size) = al_state(ctx, this);
-    let data = match data {
-        Some(d) => d,
-        None => return Ok(Some(Value::Int(0))),
-    };
-    for i in 0..(size as usize) {
-        let elem = ctx.get_array_element(data, i);
-        if list_element_matches(ctx, &elem, &target) {
-            return Ok(Some(Value::Int(1)));
+    if let Some(data) = data {
+        for i in 0..(size as usize) {
+            let elem = ctx.get_array_element(data, i);
+            if list_element_matches(ctx, &elem, &target) {
+                return Ok(Some(Value::Int(1)));
+            }
+        }
+    } else {
+        let elems = collect_collection_elements(ctx, this);
+        for elem in elems {
+            if list_element_matches(ctx, &elem, &target) {
+                return Ok(Some(Value::Int(1)));
+            }
         }
     }
     Ok(Some(Value::Int(0)))
@@ -3400,6 +3427,56 @@ fn enum_key_identity(ctx: &dyn NativeContext, obj: ObjectRef) -> Option<(String,
         _ => return None,
     };
     Some((class_name, const_name))
+}
+
+fn enum_ordinal_value(ctx: &dyn NativeContext, obj: ObjectRef) -> Option<i32> {
+    match ctx.get_field_by_name(obj, "ordinal") {
+        Value::Int(n) => Some(n),
+        _ => match ctx.get_field(obj, 1) {
+            Value::Int(n) => Some(n),
+            _ => None,
+        },
+    }
+}
+
+fn enum_set_contains_member(
+    ctx: &dyn NativeContext,
+    set: ObjectRef,
+    elem: ObjectRef,
+) -> Option<bool> {
+    let ordinal = enum_ordinal_value(ctx, elem)?;
+    if ordinal < 0 {
+        return Some(false);
+    }
+    let word = (ordinal as usize) / 64;
+    let bit = 1u64.checked_shl((ordinal as u32) & 63)?;
+    match ctx.get_field_by_name(set, "elements") {
+        Value::Long(mask) => {
+            if word == 0 {
+                Some(((mask as u64) & bit) != 0)
+            } else {
+                Some(false)
+            }
+        }
+        Value::Int(mask) => {
+            if word == 0 {
+                Some(((mask as u32 as u64) & bit) != 0)
+            } else {
+                Some(false)
+            }
+        }
+        Value::Object(Some(words)) if ctx.heap_kind_of(words) == ObjectKind::Array => {
+            if word >= ctx.array_length(words) {
+                return Some(false);
+            }
+            match ctx.get_array_element(words, word) {
+                Value::Long(mask) => Some(((mask as u64) & bit) != 0),
+                Value::Int(mask) => Some(((mask as u32 as u64) & bit) != 0),
+                _ => None,
+            }
+        }
+        _ => None,
+    }
 }
 
 /// Compute hash for a key.
@@ -6414,7 +6491,25 @@ fn ts_view_source(ctx: &dyn NativeContext, ts: ObjectRef) -> Option<ObjectRef> {
 }
 
 /// Get the backing HashMap from a HashSet.
+fn is_hashset_native_backed(ctx: &dyn NativeContext, this: ObjectRef) -> bool {
+    let cid = ctx.class_id_of_object(this);
+    for class_name in [
+        "java/util/HashSet",
+        "java/util/concurrent/CopyOnWriteArraySet",
+    ] {
+        if let Some(base) = ctx.class_id_by_name(class_name) {
+            if cid == base || ctx.is_subclass(cid, base) {
+                return true;
+            }
+        }
+    }
+    false
+}
+
 fn hs_backing_map(ctx: &dyn NativeContext, this: ObjectRef) -> Option<ObjectRef> {
+    if !is_hashset_native_backed(ctx, this) {
+        return None;
+    }
     match ctx.get_field(this, HS_FIELD_MAP) {
         Value::Object(Some(m)) => Some(m),
         _ => None,
@@ -6667,7 +6762,12 @@ fn register_hashset_natives(r: &mut NativeMethodRegistry) {
             native_hs_for_each,
         );
         r.register(c, "stream", "()Ljava/util/stream/Stream;", native_hs_stream);
-        r.register(c, "spliterator", "()Ljava/util/Spliterator;", native_hs_spliterator);
+        r.register(
+            c,
+            "spliterator",
+            "()Ljava/util/Spliterator;",
+            native_hs_spliterator,
+        );
         r.register(c, "addAll", "(Ljava/util/Collection;)Z", native_hs_add_all);
         r.register(
             c,
@@ -6688,6 +6788,12 @@ fn register_hashset_natives(r: &mut NativeMethodRegistry) {
             native_hs_contains_all,
         );
     }
+    r.register(
+        "java/util/AbstractSet",
+        "hashCode",
+        "()I",
+        native_hs_hash_code,
+    );
     r.set_category(__prev_cat);
 }
 
@@ -6768,11 +6874,10 @@ fn native_hs_hash_code(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCal
         Some(Value::Object(Some(obj))) => *obj,
         _ => return Ok(Some(Value::Int(0))),
     };
-    let backing = match hs_backing_map(ctx, this) {
-        Some(m) => m,
-        None => return Ok(Some(Value::Int(0))),
+    let keys = match hs_backing_map(ctx, this) {
+        Some(m) => map_collect_keys(ctx, m),
+        None => collect_collection_elements(ctx, this),
     };
-    let keys = map_collect_keys(ctx, backing);
     let mut h: i32 = 0;
     for k in &keys {
         // Set.hashCode contract: sum of element hashCode()s (0 for null).
@@ -7701,6 +7806,21 @@ fn register_arrays_natives(r: &mut NativeMethodRegistry) {
         "([Ljava/lang/Object;)Ljava/util/List;",
         native_arrays_as_list,
     );
+    let aal = "java/util/Arrays$ArrayList";
+    r.register(aal, "size", "()I", native_arrays_array_list_size);
+    r.register(aal, "isEmpty", "()Z", native_arrays_array_list_is_empty);
+    r.register(
+        aal,
+        "get",
+        "(I)Ljava/lang/Object;",
+        native_arrays_array_list_get,
+    );
+    r.register(
+        aal,
+        "iterator",
+        "()Ljava/util/Iterator;",
+        native_arrays_array_list_iterator,
+    );
     r.register("java/util/Arrays", "sort", "([I)V", native_arrays_sort_int);
     r.register(
         "java/util/Arrays",
@@ -7813,6 +7933,80 @@ fn native_arrays_as_list(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
         "([Ljava/lang/Object;)V",
         &[Value::Object(Some(arr))],
     )
+}
+
+fn arrays_array_list_backing(ctx: &mut dyn NativeContext, list: ObjectRef) -> Option<ObjectRef> {
+    if let Value::Object(Some(arr)) = ctx.get_field_by_name(list, "a") {
+        if ctx.heap_kind_of(arr) == ObjectKind::Array {
+            return Some(arr);
+        }
+    }
+    let slot = ctx
+        .resolve_field_index("java/util/Arrays$ArrayList", "a")
+        .unwrap_or(0);
+    if slot < ctx.object_num_fields(list) {
+        if let Value::Object(Some(arr)) = ctx.get_field(list, slot) {
+            if ctx.heap_kind_of(arr) == ObjectKind::Array {
+                return Some(arr);
+            }
+        }
+    }
+    None
+}
+
+fn native_arrays_array_list_size(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(o))) => *o,
+        _ => return Ok(Some(Value::Int(0))),
+    };
+    let size = arrays_array_list_backing(ctx, this)
+        .map(|arr| ctx.array_length(arr) as i32)
+        .unwrap_or(0);
+    Ok(Some(Value::Int(size)))
+}
+
+fn native_arrays_array_list_is_empty(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    match native_arrays_array_list_size(ctx, args)? {
+        Some(Value::Int(n)) => Ok(Some(Value::Int(i32::from(n == 0)))),
+        _ => Ok(Some(Value::Int(1))),
+    }
+}
+
+fn native_arrays_array_list_get(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(o))) => *o,
+        _ => return Ok(Some(Value::Object(None))),
+    };
+    let index = match args.get(1) {
+        Some(Value::Int(i)) => *i,
+        _ => 0,
+    };
+    let Some(arr) = arrays_array_list_backing(ctx, this) else {
+        return Ok(Some(Value::Object(None)));
+    };
+    if index < 0 || index as usize >= ctx.array_length(arr) {
+        return Err(RuntimeError::ArrayIndexOutOfBoundsException { index }.into());
+    }
+    Ok(Some(ctx.get_array_element(arr, index as usize)))
+}
+
+fn native_arrays_array_list_iterator(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(o))) => *o,
+        _ => {
+            let empty = alloc_ref_array(ctx, 0);
+            return make_iterator_from_array(ctx, empty, 0);
+        }
+    };
+    let arr = arrays_array_list_backing(ctx, this).unwrap_or_else(|| alloc_ref_array(ctx, 0));
+    let len = ctx.array_length(arr);
+    make_iterator_from_array(ctx, arr, len)
 }
 
 // ===========================================================================
@@ -10520,7 +10714,10 @@ fn drain_spliterator_to_array_capped(
 /// materialised element array yet), drain the spliterator into slot 0 and clear
 /// the lazy slot. Idempotent; a no-op for ordinary streams. Called at the top of
 /// `stream_elements` so EVERY non-forEach op transparently materialises.
-fn materialize_lazy_stream(ctx: &mut dyn NativeContext, stream: ObjectRef) -> Result<(), MethodCallFailed> {
+fn materialize_lazy_stream(
+    ctx: &mut dyn NativeContext,
+    stream: ObjectRef,
+) -> Result<(), MethodCallFailed> {
     let spl = match stream_lazy_spliterator(ctx, stream) {
         Some(s) => s,
         None => return Ok(()),
@@ -10872,10 +11069,9 @@ fn stream_new_pull_state(chain_len: usize) -> StreamPullState {
 
 fn value_is_exact_class(ctx: &dyn NativeContext, v: Value, class_name: &str) -> bool {
     match v {
-        Value::Object(Some(o)) => ctx
-            .class_name_of_id(ctx.class_id_of_object(o))
-            .as_deref()
-            == Some(class_name),
+        Value::Object(Some(o)) => {
+            ctx.class_name_of_id(ctx.class_id_of_object(o)).as_deref() == Some(class_name)
+        }
         _ => false,
     }
 }
@@ -10884,7 +11080,11 @@ fn object_is_exact_class(ctx: &dyn NativeContext, o: ObjectRef, class_name: &str
     ctx.class_name_of_id(ctx.class_id_of_object(o)).as_deref() == Some(class_name)
 }
 
-fn is_placeholder_object_class_cast(ctx: &dyn NativeContext, input: Value, err: &MethodCallFailed) -> bool {
+fn is_placeholder_object_class_cast(
+    ctx: &dyn NativeContext,
+    input: Value,
+    err: &MethodCallFailed,
+) -> bool {
     value_is_exact_class(ctx, input, "java/lang/Object")
         && matches!(err, MethodCallFailed::ExceptionThrown(ex) if object_is_exact_class(ctx, *ex, "java/lang/ClassCastException"))
 }
@@ -12892,12 +13092,12 @@ fn native_stream_to_array_gen(ctx: &mut dyn NativeContext, args: &[Value]) -> Me
         }
     };
     let generator = args.get(1).copied().unwrap_or(Value::Object(None));
-    let elements = stream_elements(ctx, this)?;
-    let (elem_base, elem_handles) = pin_value_slice(ctx, &elements);
     let gen_pin = match generator {
         Value::Object(Some(g)) => Some(ctx.pin_native_root(g)),
         _ => None,
     };
+    let elements = stream_elements(ctx, this)?;
+    let (elem_base, elem_handles) = pin_value_slice(ctx, &elements);
     let len = elements.len();
     // Try to use the generator's apply(int) to allocate a typed array.
     let arr = match generator {
@@ -12935,11 +13135,12 @@ fn native_stream_to_array_gen(ctx: &mut dyn NativeContext, args: &[Value]) -> Me
         ctx.set_array_element(arr, i, val);
     }
     let arr = ctx.read_native_pin(arr_pin, arr);
-    ctx.unpin_native_roots(if elem_base == usize::MAX {
-        gen_pin.unwrap_or(arr_pin)
+    let root_base = gen_pin.unwrap_or(if elem_base == usize::MAX {
+        arr_pin
     } else {
         elem_base
     });
+    ctx.unpin_native_roots(root_base);
     Ok(Some(Value::Object(Some(arr))))
 }
 
@@ -13605,6 +13806,34 @@ fn register_collectors_natives(r: &mut NativeMethodRegistry) {
         "()Ljava/util/function/BinaryOperator;",
         native_collector_combiner,
     );
+    // Some real-JDK interface dispatch paths can arrive with a tagged
+    // synthetic Collector whose runtime class has collapsed to Object. Keep
+    // the standard Collector contract methods available under Object as a
+    // defensive bridge; the callbacks still validate the receiver layout/tag.
+    r.register(
+        "java/lang/Object",
+        "supplier",
+        "()Ljava/util/function/Supplier;",
+        native_collector_supplier,
+    );
+    r.register(
+        "java/lang/Object",
+        "accumulator",
+        "()Ljava/util/function/BiConsumer;",
+        native_collector_accumulator,
+    );
+    r.register(
+        "java/lang/Object",
+        "finisher",
+        "()Ljava/util/function/Function;",
+        native_collector_finisher,
+    );
+    r.register(
+        "java/lang/Object",
+        "combiner",
+        "()Ljava/util/function/BinaryOperator;",
+        native_collector_combiner,
+    );
     r.register(
         "java/util/function/Supplier",
         "get",
@@ -13632,12 +13861,36 @@ fn register_collectors_natives(r: &mut NativeMethodRegistry) {
     r.set_category(__prev_cat);
 }
 
+fn is_known_collector_tag(tag: i32) -> bool {
+    matches!(
+        tag,
+        COLLECTOR_TAG_TO_LIST
+            | COLLECTOR_TAG_TO_SET
+            | COLLECTOR_TAG_JOINING
+            | COLLECTOR_TAG_JOINING_DELIM
+            | COLLECTOR_TAG_TO_MAP
+            | COLLECTOR_TAG_COUNTING
+            | COLLECTOR_TAG_GROUPING_BY
+            | COLLECTOR_TAG_PARTITIONING_BY
+            | COLLECTOR_TAG_GROUPING_BY_DOWNSTREAM
+            | COLLECTOR_TAG_GROUPING_BY_SUPPLIER
+            | COLLECTOR_TAG_PARTITIONING_BY_DOWNSTREAM
+            | COLLECTOR_TAG_TO_MAP_MERGE
+            | COLLECTOR_TAG_COLLECTING_AND_THEN
+            | COLLECTOR_TAG_TO_COLLECTION
+            | COLLECTOR_TAG_MAPPING
+    )
+}
+
 /// True iff `v` is one of our synthetic tagged `java/util/stream/Collector`
 /// objects; if so, returns its tag.
 fn collector_tag_of(ctx: &mut dyn NativeContext, v: Value) -> Option<i32> {
     if let Value::Object(Some(c)) = v {
-        if ctx.class_name_of_id(ctx.class_id_of_object(c)).as_deref()
-            == Some("java/util/stream/Collector")
+        let is_named_collector = ctx.class_name_of_id(ctx.class_id_of_object(c)).as_deref()
+            == Some("java/util/stream/Collector");
+        let has_collector_layout = ctx.object_num_fields(c) >= COLLECTOR_NUM_FIELDS;
+        if (is_named_collector || has_collector_layout)
+            && matches!(ctx.get_field(c, COLLECTOR_FIELD_TAG), Value::Int(t) if is_known_collector_tag(t))
         {
             if let Value::Int(t) = ctx.get_field(c, COLLECTOR_FIELD_TAG) {
                 return Some(t);
@@ -13745,6 +13998,14 @@ fn make_collector(ctx: &mut dyn NativeContext, tag: i32) -> ObjectRef {
     let collector = alloc_synthetic(ctx, "java/util/stream/Collector", COLLECTOR_NUM_FIELDS);
     ctx.set_field(collector, COLLECTOR_FIELD_TAG, Value::Int(tag));
     collector
+}
+
+pub fn make_to_list_collector(ctx: &mut dyn NativeContext) -> ObjectRef {
+    make_collector(ctx, COLLECTOR_TAG_TO_LIST)
+}
+
+pub fn make_to_set_collector(ctx: &mut dyn NativeContext) -> ObjectRef {
+    make_collector(ctx, COLLECTOR_TAG_TO_SET)
 }
 
 fn native_collectors_to_list(ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
@@ -13925,10 +14186,15 @@ fn collect_via_collector_protocol(
     // receiver raises NoSuchMethodError and poisons discovery; the only safe
     // sequential fallback is the standard list accumulation shape used by
     // Collectors.toCollection(ArrayList::new) in ReflectionUtils.
-    if ctx.class_name_of_id(ctx.class_id_of_object(collector)).as_deref() == Some("java/lang/Object") {
+    if ctx
+        .class_name_of_id(ctx.class_id_of_object(collector))
+        .as_deref()
+        == Some("java/lang/Object")
+    {
         return make_list_of(ctx, elements);
     }
-    let supplier = match ctx.invoke_virtual(
+    let supplier = match ctx.invoke_virtual_declared(
+        "java/util/stream/Collector",
         collector,
         "supplier",
         "()Ljava/util/function/Supplier;",
@@ -13940,7 +14206,8 @@ fn collect_via_collector_protocol(
     let container = ctx
         .invoke_virtual(supplier, "get", "()Ljava/lang/Object;", &[])?
         .unwrap_or(Value::Object(None));
-    let accumulator = match ctx.invoke_virtual(
+    let accumulator = match ctx.invoke_virtual_declared(
+        "java/util/stream/Collector",
         collector,
         "accumulator",
         "()Ljava/util/function/BiConsumer;",
@@ -13957,7 +14224,8 @@ fn collect_via_collector_protocol(
             &[container, *elem],
         )?;
     }
-    let finisher = match ctx.invoke_virtual(
+    let finisher = match ctx.invoke_virtual_declared(
+        "java/util/stream/Collector",
         collector,
         "finisher",
         "()Ljava/util/function/Function;",
@@ -14035,12 +14303,14 @@ fn native_stream_collect(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
         _ => return Ok(Some(Value::Object(None))),
     };
     let elements = stream_elements_mut(ctx, this)?;
-    let tag = match ctx.get_field(collector, COLLECTOR_FIELD_TAG) {
-        Value::Int(t) => t,
-        // Not one of our `make_collector` tagged fast-path collectors —
+    let tag = match collector_tag_of(ctx, Value::Object(Some(collector))) {
+        Some(t) => t,
+        // Not one of our `make_collector` tagged fast-path collectors -
         // a real JDK/Guava `Collector`. Honour the standard contract
-        // instead of returning `null`.
-        _ => return collect_via_collector_protocol(ctx, collector, &elements),
+        // instead of returning `null`. The class-aware tag probe also avoids
+        // reading slot 0 from a receiver that dispatch has collapsed to a bare
+        // java/lang/Object; declared dispatch below recovers that exact shape.
+        None => return collect_via_collector_protocol(ctx, collector, &elements),
     };
 
     match tag {
@@ -18317,10 +18587,7 @@ fn register_string_joiner_natives_with_category(
 }
 
 fn register_string_joiner_natives(registry: &mut NativeMethodRegistry) {
-    register_string_joiner_natives_with_category(
-        registry,
-        cratonvm_native_api::NativeKind::Bridge,
-    );
+    register_string_joiner_natives_with_category(registry, cratonvm_native_api::NativeKind::Bridge);
 }
 
 /// Register the synthetic StringJoiner fallback surface without stealing real
@@ -23219,6 +23486,12 @@ fn collect_collection_elements(ctx: &mut dyn NativeContext, coll: ObjectRef) -> 
     // zero elements and the auto-configuration pipeline collapses.
     let cid = ctx.class_id_of_object(coll);
     if let Some(cls_name) = ctx.class_name_of_id(cid) {
+        if cls_name == "java/util/EnumSet" {
+            if let Value::Object(Some(backing)) = ctx.get_field(coll, 0) {
+                return collect_collection_elements(ctx, backing);
+            }
+            return Vec::new();
+        }
         // CratonVM's own unmodifiable-view wrappers store the backing
         // collection at slot 0 — recurse into it so `new HashSet(unmodList)`
         // and friends see the wrapped elements.
@@ -23393,24 +23666,22 @@ fn collect_collection_elements(ctx: &mut dyn NativeContext, coll: ObjectRef) -> 
         }
         if cls_name == "java/util/RegularEnumSet" || cls_name == "java/util/JumboEnumSet" {
             if let Value::Object(Some(universe)) = ctx.get_field_by_name(coll, "universe") {
-                // Membership: walk the inherited `universe` (all constants of the
-                // enum, in ordinal order) and keep those the set contains. We
-                // deliberately use `contains()` rather than the `elements`
-                // bitmask: native slot-access of the inherited `long elements`
-                // field reads 0 here (a category-2 / inherited-layout
-                // name→slot bug — the real `getfield` bytecode in
-                // `RegularEnumSet.contains` reads the true value, so `contains`
-                // is reliable). This yields the correct subset for partial sets,
-                // not just `allOf`. Iterating in ordinal order matches
-                // EnumSet's iteration contract.
+                // Membership: walk the inherited `universe` (all constants of
+                // the enum, in ordinal order) and keep bits present in the
+                // RegularEnumSet/JumboEnumSet `elements` mask. Do this directly
+                // instead of routing through `contains()`: inherited
+                // AbstractCollection/Set dispatch can land back in this generic
+                // native before the concrete RegularEnumSet bytecode is selected.
                 let ulen = ctx.array_length(universe);
                 let mut out = Vec::with_capacity(ulen);
                 for i in 0..ulen {
                     let elem = ctx.get_array_element(universe, i);
-                    let contained = matches!(
-                        ctx.invoke_virtual(coll, "contains", "(Ljava/lang/Object;)Z", &[elem]),
-                        Ok(Some(Value::Int(v))) if v != 0
-                    );
+                    let contained = match elem {
+                        Value::Object(Some(e)) => {
+                            enum_set_contains_member(&*ctx, coll, e).unwrap_or(false)
+                        }
+                        _ => false,
+                    };
                     if contained {
                         out.push(elem);
                     }
@@ -32788,11 +33059,10 @@ fn native_collections_empty_iterator(
 
 fn native_collections_singleton(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let elem = args.first().cloned().unwrap_or(Value::Object(None));
-    // Real-JDK: a real `Collections$SingletonSet` (field `element`).
-    if let Some(o) = alloc_real_jdk(ctx, "java/util/Collections$SingletonSet") {
-        ctx.set_field_by_name(o, "element", elem);
-        return Ok(Some(Value::Object(Some(o))));
-    }
+    // Keep Set singleton native-backed. WildFly's PathManagerService iterates
+    // this object during Host Controller bootstrap, and the real
+    // Collections$SingletonSet path currently depends on iterator internals
+    // that are not stable this early in the boot graph.
     let set = alloc_synthetic(ctx, "java/util/HashSet", HS_NUM_FIELDS);
     let inner_map = alloc_backing_map(ctx);
     native_map_init(ctx, &[Value::Object(Some(inner_map))])?;
@@ -32811,12 +33081,9 @@ fn native_collections_singleton_map(
 ) -> MethodCallResult {
     let key = args.first().cloned().unwrap_or(Value::Object(None));
     let val = args.get(1).cloned().unwrap_or(Value::Object(None));
-    // Real-JDK: a real `Collections$SingletonMap` (fields `k`, `v`).
-    if let Some(o) = alloc_real_jdk(ctx, "java/util/Collections$SingletonMap") {
-        ctx.set_field_by_name(o, "k", key);
-        ctx.set_field_by_name(o, "v", val);
-        return Ok(Some(Value::Object(Some(o))));
-    }
+    // Keep singletonMap native-backed for the same bootstrap reason as
+    // singleton Set: WildFly calls simple Map methods before the real
+    // Collections$SingletonMap wrapper's method surface is fully bridged.
     let map = alloc_backing_map(ctx);
     native_map_init(ctx, &[Value::Object(Some(map))])?;
     native_map_put(ctx, &[Value::Object(Some(map)), key, val])?;
@@ -33267,10 +33534,20 @@ fn register_linked_blocking_deque_stub_natives(r: &mut NativeMethodRegistry) {
     r.register(lbd, "offerLast", "(Ljava/lang/Object;)Z", native_clq_offer);
     r.register(lbd, "poll", "()Ljava/lang/Object;", native_clq_poll);
     r.register(lbd, "pollFirst", "()Ljava/lang/Object;", native_clq_poll);
-    r.register(lbd, "pollLast", "()Ljava/lang/Object;", native_cld_poll_last);
+    r.register(
+        lbd,
+        "pollLast",
+        "()Ljava/lang/Object;",
+        native_cld_poll_last,
+    );
     r.register(lbd, "peek", "()Ljava/lang/Object;", native_clq_peek);
     r.register(lbd, "peekFirst", "()Ljava/lang/Object;", native_clq_peek);
-    r.register(lbd, "peekLast", "()Ljava/lang/Object;", native_cld_peek_last);
+    r.register(
+        lbd,
+        "peekLast",
+        "()Ljava/lang/Object;",
+        native_cld_peek_last,
+    );
     r.register(lbd, "size", "()I", native_lbq_size);
     r.register(lbd, "isEmpty", "()Z", native_lbq_is_empty);
     r.register(
@@ -38056,6 +38333,28 @@ mod tests {
             )
             .is_some(),
             "Collector.combiner"
+        );
+
+        let object = "java/lang/Object";
+        assert!(
+            r.find(object, "supplier", "()Ljava/util/function/Supplier;")
+                .is_some(),
+            "Object.supplier fallback"
+        );
+        assert!(
+            r.find(object, "accumulator", "()Ljava/util/function/BiConsumer;")
+                .is_some(),
+            "Object.accumulator fallback"
+        );
+        assert!(
+            r.find(object, "finisher", "()Ljava/util/function/Function;")
+                .is_some(),
+            "Object.finisher fallback"
+        );
+        assert!(
+            r.find(object, "combiner", "()Ljava/util/function/BinaryOperator;")
+                .is_some(),
+            "Object.combiner fallback"
         );
 
         assert!(

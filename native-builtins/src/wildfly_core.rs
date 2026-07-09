@@ -111,6 +111,34 @@ impl std::hash::Hash for AttachmentKeyIdentity {
     }
 }
 
+fn native_path_address_from_elements(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    let arr = obj_arg(args, 0)?;
+    let list = match ctx.new_object_initialized("java/util/ArrayList", "()V", &[])? {
+        Some(Value::Object(Some(list))) => list,
+        _ => alloc_concurrent_synthetic(ctx, "java/util/ArrayList", 2),
+    };
+    for i in 0..ctx.array_length(arr) {
+        let elem = ctx.get_array_element(arr, i);
+        ctx.invoke_virtual(list, "add", "(Ljava/lang/Object;)Z", &[elem])?;
+    }
+    match ctx.invoke(
+        "org/jboss/as/controller/PathAddress",
+        "pathAddress",
+        "(Ljava/util/List;)Lorg/jboss/as/controller/PathAddress;",
+        &[Value::Object(Some(list))],
+    ) {
+        Ok(Some(v @ Value::Object(Some(_)))) => Ok(Some(v)),
+        _ => ctx.new_object_initialized(
+            "org/jboss/as/controller/PathAddress",
+            "(Ljava/util/List;)V",
+            &[Value::Object(Some(list))],
+        ),
+    }
+}
+
 /// One deployment in flight.  `name` is the archive name as the WildFly
 /// server sees it (`keycloak-server.war`, etc.).  The service name
 /// derived from it follows the WildFly convention
@@ -551,6 +579,51 @@ fn panic_payload_to_string(payload: &(dyn std::any::Any + Send)) -> String {
     } else {
         "task panicked (unknown payload)".to_string()
     }
+}
+
+/// `JBossThread.run()` is mostly a logging/exit-handler wrapper around
+/// `super.run()`.  In CratonVM's current real-JDK layout, the Runnable target
+/// is reliably stored in `Thread$FieldHolder.task`, while the JDK bytecode
+/// reached by JBossThread's `invokespecial Thread.run()` can still read a
+/// layout-variant direct `Thread.target` slot and silently return.  Bridge the
+/// core behavior by invoking the resolved Runnable directly.
+fn native_jboss_thread_run(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = obj_arg(args, 0)?;
+    let mut target = ctx.get_field_by_name(this, "target");
+    if matches!(target, Value::Object(None)) {
+        if let Value::Object(Some(holder)) = ctx.get_field_by_name(this, "holder") {
+            target = ctx.get_field_by_name(holder, "task");
+        }
+    }
+    if matches!(target, Value::Object(None)) && ctx.object_num_fields(this) >= 4 {
+        target = ctx.get_field(this, 3);
+    }
+    if let Value::Object(Some(runnable)) = target {
+        ctx.invoke_virtual(runnable, "run", "()V", &[])?;
+    }
+    Ok(None)
+}
+
+fn native_jboss_thread_factory_new_thread(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    let runnable = args.get(1).copied().unwrap_or(Value::Object(None));
+    if let Some(Value::Object(Some(thread))) = ctx.new_object_initialized(
+        "org/jboss/threads/JBossThread",
+        "(Ljava/lang/Runnable;)V",
+        &[runnable],
+    )? {
+        return Ok(Some(Value::Object(Some(thread))));
+    }
+
+    let thread = alloc_concurrent_synthetic(ctx, "org/jboss/threads/JBossThread", 5);
+    let name = ctx.create_string("jboss-thread");
+    ctx.set_field(thread, 0, Value::Object(Some(name)));
+    ctx.set_field(thread, 1, Value::Int(5));
+    ctx.set_field(thread, 3, runnable);
+    ctx.set_field(thread, 4, Value::Int(0));
+    Ok(Some(Value::Object(Some(thread))))
 }
 
 /// `JBossExecutors.protectedCallable(Callable)` — wraps a callable so
@@ -1393,6 +1466,73 @@ fn drain_all_pending_runnables(ctx: &mut dyn NativeContext) {
     let _ = iterations;
 }
 
+fn async_future_status_is(a: &Value, b: &Value) -> bool {
+    match (a, b) {
+        (Value::Object(Some(a)), Value::Object(Some(b))) => a == b,
+        _ => false,
+    }
+}
+
+fn async_future_status_is_named(
+    ctx: &dyn NativeContext,
+    status: &Value,
+    singleton: &Value,
+    expected_name: &str,
+) -> bool {
+    if async_future_status_is(status, singleton) {
+        return true;
+    }
+    let status_obj = match status {
+        Value::Object(Some(obj)) => *obj,
+        _ => return false,
+    };
+    match ctx.get_field_by_name(status_obj, "name") {
+        Value::Object(Some(name)) => ctx.read_string(name).as_deref() == Some(expected_name),
+        _ => false,
+    }
+}
+
+fn async_future_payload_result_matters(ctx: &dyn NativeContext, this: ObjectRef) -> bool {
+    let class_name = ctx
+        .class_name_of_id(ctx.class_id_of_object(this))
+        .unwrap_or_default();
+    matches!(
+        class_name.as_str(),
+        "org/jboss/as/protocol/mgmt/ActiveOperationImpl"
+            | "org/jboss/as/server/mgmt/domain/ServerBootOperationsService$FutureBootUpdates"
+    )
+}
+
+fn async_future_wait_keepalive(
+    ctx: &mut dyn NativeContext,
+    obj: ObjectRef,
+    timeout_ms: Option<u64>,
+) -> Result<ObjectRef, MethodCallFailed> {
+    let pin = ctx.pin_native_root(obj);
+    ctx.monitor_enter(obj);
+    let obj = ctx.read_native_pin(pin, obj);
+    let wr = ctx.monitor_wait(obj, timeout_ms);
+    let obj = ctx.read_native_pin(pin, obj);
+    ctx.monitor_exit(obj);
+    ctx.unpin_native_roots(pin);
+    wr?;
+    Ok(obj)
+}
+
+fn async_future_await_payload_result(
+    ctx: &mut dyn NativeContext,
+    mut this: ObjectRef,
+    waiting: &Value,
+) -> MethodCallResult {
+    loop {
+        let status = ctx.get_field_by_name(this, "status");
+        if !async_future_status_is_named(ctx, &status, waiting, "WAITING") {
+            return Ok(Some(status));
+        }
+        this = async_future_wait_keepalive(ctx, this, Some(5))?;
+    }
+}
+
 fn native_exec_execute(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     if args.len() < 2 {
         return Err(MethodCallFailed::InternalError(VmError::Internal {
@@ -1497,11 +1637,11 @@ fn native_async_future_task_await(ctx: &mut dyn NativeContext, args: &[Value]) -
     };
     // Identity-compare against WAITING. Status is a singleton enum so
     // pointer equality is the right check.
-    let is_waiting = match (&status, &waiting) {
-        (Value::Object(Some(a)), Value::Object(Some(b))) => a == b,
-        _ => false,
-    };
+    let is_waiting = async_future_status_is_named(ctx, &status, &waiting, "WAITING");
     if is_waiting {
+        if async_future_payload_result_matters(ctx, this) {
+            return async_future_await_payload_result(ctx, this, &waiting);
+        }
         // Round 88: scope this bypass more narrowly. The unconditional flip
         // to COMPLETE was added for Keycloak's `org/jboss/modules/Main.main`
         // boot path (which discards the future result). But WildFly's
@@ -1565,6 +1705,43 @@ fn native_async_future_task_await(ctx: &mut dyn NativeContext, args: &[Value]) -
 
 /// Register all WildFly Core kernel natives with the method registry.
 pub fn register_wildfly_core_natives(r: &mut NativeMethodRegistry) {
+    r.register(
+        "org/jboss/as/controller/PathAddress",
+        "pathAddress",
+        "([Lorg/jboss/as/controller/PathElement;)Lorg/jboss/as/controller/PathAddress;",
+        native_path_address_from_elements,
+    );
+    r.register(
+        "org/jboss/threads/JBossThread",
+        "run",
+        "()V",
+        native_jboss_thread_run,
+    );
+    r.register(
+        "org/jboss/threads/JBossThread",
+        "dispatchUncaughtException",
+        "(Ljava/lang/Throwable;)V",
+        |_ctx, _args| Ok(None),
+    );
+    r.register(
+        "org/jboss/threads/JBossThread",
+        "onExit",
+        "(Ljava/lang/Runnable;)Z",
+        |_ctx, _args| Ok(Some(Value::Int(0))),
+    );
+    r.register(
+        "org/jboss/threads/JBossThreadFactory",
+        "newThread",
+        "(Ljava/lang/Runnable;)Ljava/lang/Thread;",
+        native_jboss_thread_factory_new_thread,
+    );
+    r.register(
+        "org/jboss/threads/JBossThreadFactory",
+        "access$100",
+        "(Lorg/jboss/threads/JBossThreadFactory;Ljava/lang/Runnable;)Ljava/lang/Thread;",
+        native_jboss_thread_factory_new_thread,
+    );
+
     // --- DIAGNOSTIC (CRATONVM_DBG_CAPVAL): trace the two inputs of
     // OperationContextImpl.validateCapabilities' `tolerant` flag
     // (`getRunningMode() == ADMIN_ONLY && (capabilitiesAlreadyBroken ||

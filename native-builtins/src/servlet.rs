@@ -4409,9 +4409,13 @@ fn register_s2_socket_channel(r: &mut NativeMethodRegistry) {
         }
         let mut tmp = vec![0u8; cap];
         let n = {
-            let mut reg = s2_registry().lock();
-            if let Some(stream) = reg.streams.get_mut(&sock_id) {
-                match (&**stream).read(&mut tmp) {
+            let stream = {
+                let reg = s2_registry().lock();
+                reg.streams.get(&sock_id).cloned()
+            };
+            if let Some(stream) = stream {
+                let mut stream_ref = &*stream;
+                match stream_ref.read(&mut tmp) {
                     Ok(0) => -1i32,
                     Ok(n) => n as i32,
                     Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => 0,
@@ -4446,9 +4450,13 @@ fn register_s2_socket_channel(r: &mut NativeMethodRegistry) {
             return Ok(Some(Value::Int(0)));
         }
         let n = {
-            let mut reg = s2_registry().lock();
-            if let Some(stream) = reg.streams.get_mut(&sock_id) {
-                match (&**stream).write(&data) {
+            let stream = {
+                let reg = s2_registry().lock();
+                reg.streams.get(&sock_id).cloned()
+            };
+            if let Some(stream) = stream {
+                let mut stream_ref = &*stream;
+                match stream_ref.write(&data) {
                     Ok(n) => n as i32,
                     Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => 0,
                     Err(_) => -1,

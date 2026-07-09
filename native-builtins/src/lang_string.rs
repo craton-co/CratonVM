@@ -1406,12 +1406,16 @@ pub(crate) fn sb_state(
         Value::Object(Some(arr)) => Some(arr),
         _ => None,
     };
-    let count = match ctx.get_field(this, 2) {
-        Value::Int(v) => v,
-        _ => match ctx.get_field(this, 1) {
+    let count = if ctx.object_num_fields(this) >= 3 {
+        match ctx.get_field(this, 2) {
             Value::Int(v) => v,
             _ => 0,
-        },
+        }
+    } else {
+        match ctx.get_field(this, 1) {
+            Value::Int(v) => v,
+            _ => 0,
+        }
     };
     (buf, count)
 }

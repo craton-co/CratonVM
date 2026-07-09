@@ -3860,29 +3860,28 @@ fn native_construct_message_logger(
         _ => Value::Object(None),
     };
 
-    // 3. `new <impl_name>(log)` — the canonical generated constructor takes
+    // 3. `new <impl_name>(log)` - the canonical generated constructor takes
     //    a single `Logger` parameter and `super(log)`s into
-    //    `DelegatingBasicLogger`.
-    let new_obj = match ctx.new_object(&impl_name) {
-        Ok(Some(Value::Object(Some(o)))) => o,
-        _ => return Value::Object(None),
-    };
-    let init_args = [Value::Object(Some(new_obj)), log_obj];
-    match ctx.invoke(
-        &impl_name,
-        "<init>",
-        "(Lorg/jboss/logging/Logger;)V",
-        &init_args,
-    ) {
-        Ok(_) => Value::Object(Some(new_obj)),
-        Err(_) => {
-            // Constructor failed — return the bare instance anyway. The
-            // `log` field will be null but downstream NPE-tolerant shims
-            // (DelegatingBasicLogger.is*Enabled, ServiceLogger_$logger
-            // method no-ops) keep boot going. Beats a null return that
-            // propagates into static fields whose readers do raw
-            // invokeinterface without null checks.
-            Value::Object(Some(new_obj))
+    //    `DelegatingBasicLogger`. Use the pinned allocation+constructor helper:
+    //    message logger constructors can allocate enough to trigger a moving GC,
+    //    and returning the pre-<init> raw ref can later resolve as java/lang/Object
+    //    and fail the interface checkcast in `<intf>.<clinit>`.
+    let _ = ctx.load_class(&impl_name);
+    match ctx.new_object_initialized(&impl_name, "(Lorg/jboss/logging/Logger;)V", &[log_obj]) {
+        Ok(Some(Value::Object(Some(o)))) => Value::Object(Some(o)),
+        _ => {
+            // Last-ditch fallback: a bare instance is useful only if allocation
+            // really produced the generated logger class. Returning a stale or
+            // generic Object here fails the caller's typed checkcast.
+            match ctx.new_object(&impl_name) {
+                Ok(Some(Value::Object(Some(o))))
+                    if ctx.class_name_of_id(ctx.class_id_of_object(o)).as_deref()
+                        == Some(impl_name.as_str()) =>
+                {
+                    Value::Object(Some(o))
+                }
+                _ => Value::Object(None),
+            }
         }
     }
 }

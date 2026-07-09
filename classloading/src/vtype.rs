@@ -266,6 +266,7 @@ impl VType {
                 // `checkcast` / `invoke*` resolution is a defence in
                 // depth, not a substitute for verification.
                 hierarchy.is_subclass(child, parent)
+                    || is_known_jdk_subtype(child, parent)
                     || hierarchy.is_interface(parent)
                     || is_known_jdk_interface(parent)
             }
@@ -467,6 +468,36 @@ fn merge_arrays(a: &str, b: &str, hierarchy: &dyn ClassHierarchy) -> VType {
         // Otherwise → Object (arrays of different primitive types, etc.)
         _ => VType::ObjectRef(Arc::from("java/lang/Object")),
     }
+}
+
+// ---------------------------------------------------------------------------
+// RVERIF.4 — name-based JDK superclass fallback
+// ---------------------------------------------------------------------------
+
+/// Return `true` for narrow bootstrap superclass edges that synthetic-stub
+/// hierarchy metadata can fail to prove during early bootstrap.
+///
+/// This is intentionally much smaller than [`is_known_jdk_interface`]: these
+/// are concrete class-to-superclass relationships, so every accepted edge must
+/// be an actual inheritance relation.
+pub(crate) fn is_known_jdk_subtype(child: &str, parent: &str) -> bool {
+    matches!(
+        (child, parent),
+        ("java/security/BasicPermission", "java/security/Permission")
+            | (
+                "java/lang/RuntimePermission",
+                "java/security/BasicPermission"
+            )
+            | ("java/lang/RuntimePermission", "java/security/Permission")
+            | (
+                "org/jboss/as/controller/security/ControllerPermission",
+                "java/security/BasicPermission"
+            )
+            | (
+                "org/jboss/as/controller/security/ControllerPermission",
+                "java/security/Permission"
+            )
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -1118,6 +1149,43 @@ mod tests {
         let al = VType::ObjectRef(Arc::from("java/util/ArrayList"));
         let iter = VType::ObjectRef(Arc::from("java/lang/Iterable"));
         assert!(al.is_assignable_to(&iter, &h));
+    }
+
+    #[test]
+    fn runtime_permission_assignable_to_permission_via_jdk_table() {
+        // WildFly's JBossThread.onExit calls
+        // SecurityManager.checkPermission(Permission) with a RuntimePermission
+        // static. When RuntimePermission is still represented by sparse
+        // bootstrap metadata, the verifier must still accept this real JDK
+        // superclass edge.
+        let h = StubHierarchyMissingInterfaceFlag;
+        let runtime_permission = VType::ObjectRef(Arc::from("java/lang/RuntimePermission"));
+        let permission = VType::ObjectRef(Arc::from("java/security/Permission"));
+
+        assert!(!h.is_subclass("java/lang/RuntimePermission", "java/security/Permission"));
+        assert!(runtime_permission.is_assignable_to(&permission, &h));
+    }
+
+    #[test]
+    fn wildfly_controller_permission_assignable_to_permission_via_bootstrap_table() {
+        // WildFly's ModelController.<clinit> initializes ControllerPermission
+        // constants and stores them where java.security.Permission is expected.
+        // When ControllerPermission/BasicPermission hierarchy metadata is sparse
+        // during early host-controller bootstrap, the verifier still needs this
+        // real superclass edge.
+        let h = StubHierarchyMissingInterfaceFlag;
+        let controller_permission = VType::ObjectRef(Arc::from(
+            "org/jboss/as/controller/security/ControllerPermission",
+        ));
+        let basic_permission = VType::ObjectRef(Arc::from("java/security/BasicPermission"));
+        let permission = VType::ObjectRef(Arc::from("java/security/Permission"));
+
+        assert!(!h.is_subclass(
+            "org/jboss/as/controller/security/ControllerPermission",
+            "java/security/Permission"
+        ));
+        assert!(controller_permission.is_assignable_to(&basic_permission, &h));
+        assert!(controller_permission.is_assignable_to(&permission, &h));
     }
 
     #[test]

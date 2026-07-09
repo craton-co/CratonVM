@@ -1301,15 +1301,33 @@ fn fis_get_fd(ctx: &dyn NativeContext, this: ObjectRef) -> Option<FdId> {
             _ => {}
         }
     }
+    if let Value::Object(Some(fd_obj)) = ctx.get_field(this, 0) {
+        match ctx.get_field_by_name(fd_obj, "fd") {
+            Value::Int(v) if v >= 0 => return Some(v as FdId),
+            _ => {}
+        }
+        match ctx.get_field_by_name(fd_obj, "handle") {
+            Value::Long(v) if v >= 0 => return Some(v as FdId),
+            _ => {}
+        }
+    }
     // Legacy synthetic layouts.
     match ctx.get_field(this, 0) {
         Value::Int(v) if v >= 0 => return Some(v as FdId),
         _ => {}
     }
     // `System.in`: slot 1 holds `fd+1` (0 means "unset").
-    match ctx.get_field(this, 1) {
-        Value::Int(v) if v > 0 => return Some((v - 1) as FdId),
-        _ => {}
+    if ctx.object_num_fields(this) > 1 {
+        match ctx.get_field(this, 1) {
+            Value::Int(v) if v > 0 => return Some((v - 1) as FdId),
+            _ => {}
+        }
+    }
+    if ctx
+        .get_system_stream("in")
+        .is_some_and(|stdin| stdin == this)
+    {
+        return Some(0);
     }
     None
 }
@@ -1617,15 +1635,27 @@ fn fos_get_fd(ctx: &dyn NativeContext, this: ObjectRef) -> Option<FdId> {
             _ => {}
         }
     }
+    if let Value::Object(Some(fd_obj)) = ctx.get_field(this, 0) {
+        match ctx.get_field_by_name(fd_obj, "fd") {
+            Value::Int(v) if v >= 0 => return Some(v as FdId),
+            _ => {}
+        }
+        match ctx.get_field_by_name(fd_obj, "handle") {
+            Value::Long(v) if v >= 0 => return Some(v as FdId),
+            _ => {}
+        }
+    }
     // Legacy synthetic layout.
     match ctx.get_field(this, 0) {
         Value::Int(v) if v >= 0 => return Some(v as FdId),
         _ => {}
     }
     // `System.out`/`System.err`: slot 1 holds `fd+1`.
-    match ctx.get_field(this, 1) {
-        Value::Int(v) if v > 0 => return Some((v - 1) as FdId),
-        _ => {}
+    if ctx.object_num_fields(this) > 1 {
+        match ctx.get_field(this, 1) {
+            Value::Int(v) if v > 0 => return Some((v - 1) as FdId),
+            _ => {}
+        }
     }
     None
 }
@@ -2742,6 +2772,14 @@ fn native_bais_read(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRe
         Some(Value::Object(Some(obj))) => *obj,
         _ => return Ok(Some(Value::Int(-1))),
     };
+    if let Some(result) = maybe_socket_input_stream_read(
+        ctx,
+        this,
+        args,
+        cratonvm_native_api::socket_input_stream_read::get_read_one(),
+    ) {
+        return result;
+    }
     if !input_stream_has_bais_layout(ctx, this) {
         return Ok(Some(Value::Int(-1)));
     }
@@ -2766,6 +2804,27 @@ fn native_bais_read(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRe
     };
     ctx.set_field(this, BAIS_FIELD_POS, Value::Int(pos + 1));
     Ok(Some(Value::Int(byte_val)))
+}
+
+fn maybe_socket_input_stream_read(
+    ctx: &mut dyn NativeContext,
+    this: ObjectRef,
+    args: &[Value],
+    hook: Option<cratonvm_native_api::NativeCallback>,
+) -> Option<MethodCallResult> {
+    let cls_name = ctx
+        .class_name_of_id(ctx.class_id_of_object(this))
+        .unwrap_or_default();
+    if cls_name == "java/net/Socket$SocketInputStream" {
+        return Some(match hook {
+            Some(cb) => cb(ctx, args),
+            None => Err(RuntimeError::IOException {
+                message: "SocketInputStream read hook not installed".into(),
+            }
+            .into()),
+        });
+    }
+    None
 }
 
 fn boxed_long(ctx: &mut dyn NativeContext, val: i64) -> ObjectRef {
@@ -2825,6 +2884,14 @@ fn native_bais_read_bytes(ctx: &mut dyn NativeContext, args: &[Value]) -> Method
         Some(Value::Object(Some(arr))) => *arr,
         _ => return Ok(Some(Value::Int(-1))),
     };
+    if let Some(result) = maybe_socket_input_stream_read(
+        ctx,
+        this,
+        args,
+        cratonvm_native_api::socket_input_stream_read::get_read_bytes(),
+    ) {
+        return result;
+    }
     let off = match args.get(2) {
         Some(Value::Int(v)) => *v,
         _ => 0,
@@ -2963,6 +3030,14 @@ fn native_bais_read_byte_array(ctx: &mut dyn NativeContext, args: &[Value]) -> M
         Some(Value::Object(Some(obj))) => *obj,
         _ => return Ok(Some(Value::Int(-1))),
     };
+    if let Some(result) = maybe_socket_input_stream_read(
+        ctx,
+        this,
+        args,
+        cratonvm_native_api::socket_input_stream_read::get_read_array(),
+    ) {
+        return result;
+    }
     let buf = match args.get(1) {
         Some(Value::Object(Some(arr))) => *arr,
         _ => return Ok(Some(Value::Int(-1))),
@@ -3105,6 +3180,37 @@ fn receiver_is_baos(ctx: &dyn NativeContext, this: ObjectRef) -> bool {
     false
 }
 
+const PROCESS_PIPE_OUTPUT_STREAM: &str = "cratonvm/synthetic/ProcessPipeOutputStream";
+
+fn receiver_is_process_pipe_output(ctx: &dyn NativeContext, this: ObjectRef) -> bool {
+    let mut cid = Some(ctx.class_id_of_object(this));
+    while let Some(c) = cid {
+        if ctx.class_name_of_id(c).as_deref() == Some(PROCESS_PIPE_OUTPUT_STREAM) {
+            return true;
+        }
+        cid = ctx.superclass_of(c);
+    }
+    false
+}
+
+fn process_pipe_output_fd(ctx: &dyn NativeContext, this: ObjectRef) -> Option<FdId> {
+    if !receiver_is_process_pipe_output(ctx, this) {
+        return None;
+    }
+    match ctx.get_field(this, 0) {
+        Value::Int(v) if v >= 0 => Some(v as FdId),
+        _ => None,
+    }
+}
+
+fn process_pipe_output_close(ctx: &mut dyn NativeContext, this: ObjectRef) {
+    if let Some(fd) = process_pipe_output_fd(ctx, this) {
+        let _ = ctx.fd_table().flush(fd);
+        let _ = ctx.fd_table().close(fd);
+        ctx.set_field(this, 0, Value::Int(-1));
+    }
+}
+
 fn native_baos_init(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = match args.first() {
         Some(Value::Object(Some(obj))) => *obj,
@@ -3163,6 +3269,12 @@ fn native_baos_write(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallR
         Some(Value::Int(v)) => *v,
         _ => 0,
     };
+    if let Some(fd) = process_pipe_output_fd(ctx, this) {
+        ctx.fd_table()
+            .write_byte(fd, (byte_val & 0xFF) as u8)
+            .map_err(io_err)?;
+        return Ok(None);
+    }
     // Registered on the base `java/io/OutputStream` class as a fallback for
     // synthetic streams with the BAOS layout. For non-BAOS receivers,
     // `baos_ensure_capacity` below would allocate a fresh byte[] and write
@@ -3201,14 +3313,23 @@ fn native_baos_write_bytes(ctx: &mut dyn NativeContext, args: &[Value]) -> Metho
         Some(Value::Object(Some(arr))) => *arr,
         _ => return Ok(None),
     };
-    let off = match args.get(2) {
-        Some(Value::Int(v)) => *v as usize,
+    let off_i = match args.get(2) {
+        Some(Value::Int(v)) => *v,
         _ => 0,
     };
-    let len = match args.get(3) {
-        Some(Value::Int(v)) => *v as usize,
+    let len_i = match args.get(3) {
+        Some(Value::Int(v)) => *v,
         _ => 0,
     };
+    check_array_bounds(off_i, len_i, ctx.array_length(buf))?;
+    let off = off_i as usize;
+    let len = len_i as usize;
+    if let Some(fd) = process_pipe_output_fd(ctx, this) {
+        let mut bytes = vec![0u8; len];
+        ctx.read_byte_array_into(buf, off, &mut bytes);
+        ctx.fd_table().write_bytes(fd, &bytes).map_err(io_err)?;
+        return Ok(None);
+    }
     // This native is registered on the base `java/io/OutputStream` class as
     // a fallback for synthetic streams that have the
     // ByteArrayOutputStream layout in slots 0..1 (`data:[B`, `count:int`).
@@ -3374,8 +3495,13 @@ fn native_baos_to_string_charset(ctx: &mut dyn NativeContext, args: &[Value]) ->
     native_baos_to_string(ctx, args)
 }
 
-fn native_baos_close(_ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
-    Ok(None) // no-op
+fn native_baos_close(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(obj))) => *obj,
+        _ => return Ok(None),
+    };
+    process_pipe_output_close(ctx, this);
+    Ok(None)
 }
 
 /// `java.io.FilterOutputStream.close()` — flush this stream, then close the
@@ -3395,13 +3521,20 @@ fn native_filteros_close(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
     // close the wrapped stream so its close()/finish() runs.
     let _ = ctx.invoke_virtual(this, "flush", "()V", &[]);
     if let Value::Object(Some(out)) = ctx.get_field(this, 0) {
-        let _ = ctx.invoke_virtual(out, "close", "()V", &[]);
+        let _ = ctx.invoke_virtual_declared("java/io/OutputStream", out, "close", "()V", &[]);
     }
     Ok(None)
 }
 
-fn native_baos_flush(_ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
-    Ok(None) // no-op
+fn native_baos_flush(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(obj))) => *obj,
+        _ => return Ok(None),
+    };
+    if let Some(fd) = process_pipe_output_fd(ctx, this) {
+        ctx.fd_table().flush(fd).map_err(io_err)?;
+    }
+    Ok(None)
 }
 
 // ---------------------------------------------------------------------------
@@ -8584,7 +8717,7 @@ fn native_dos_flush(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRe
         _ => return Ok(None),
     };
     if let Value::Object(Some(inner)) = ctx.get_field(this, DOS_FIELD_OUT) {
-        ctx.invoke_virtual(inner, "flush", "()V", &[])?;
+        ctx.invoke_virtual_declared("java/io/OutputStream", inner, "flush", "()V", &[])?;
     }
     Ok(None)
 }
@@ -8597,8 +8730,8 @@ fn native_dos_close(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRe
         _ => return Ok(None),
     };
     if let Value::Object(Some(inner)) = ctx.get_field(this, DOS_FIELD_OUT) {
-        let _ = ctx.invoke_virtual(inner, "flush", "()V", &[]);
-        ctx.invoke_virtual(inner, "close", "()V", &[])?;
+        let _ = ctx.invoke_virtual_declared("java/io/OutputStream", inner, "flush", "()V", &[]);
+        ctx.invoke_virtual_declared("java/io/OutputStream", inner, "close", "()V", &[])?;
     }
     Ok(None)
 }
@@ -10793,6 +10926,173 @@ fn bos_slots(ctx: &dyn NativeContext) -> (usize, usize, usize) {
     (out, buf, count)
 }
 
+fn bos_has_buffer_slots(
+    ctx: &dyn NativeContext,
+    this: ObjectRef,
+    buf_slot: usize,
+    count_slot: usize,
+) -> bool {
+    let fields = ctx.object_num_fields(this);
+    buf_slot < fields && count_slot < fields
+}
+
+fn bos_inner(ctx: &dyn NativeContext, this: ObjectRef, out_slot: usize) -> Option<ObjectRef> {
+    if out_slot >= ctx.object_num_fields(this) {
+        return None;
+    }
+    match ctx.get_field(this, out_slot) {
+        Value::Object(Some(o)) => Some(o),
+        _ => None,
+    }
+}
+
+#[derive(Default)]
+struct BosSideBuffer {
+    bytes: Vec<u8>,
+    capacity: usize,
+}
+
+fn bos_side_buffers() -> &'static Mutex<HashMap<i32, BosSideBuffer>> {
+    static BUFS: OnceLock<Mutex<HashMap<i32, BosSideBuffer>>> = OnceLock::new();
+    BUFS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn bos_side_key(ctx: &mut dyn NativeContext, this: ObjectRef) -> i32 {
+    ctx.identity_hash_code(this)
+}
+
+fn bos_side_init(ctx: &mut dyn NativeContext, this: ObjectRef, capacity: usize) {
+    let key = bos_side_key(ctx, this);
+    let capacity = capacity.max(1);
+    bos_side_buffers().lock().insert(
+        key,
+        BosSideBuffer {
+            bytes: Vec::with_capacity(capacity),
+            capacity,
+        },
+    );
+}
+
+fn bos_side_flush(
+    ctx: &mut dyn NativeContext,
+    this: ObjectRef,
+    out_slot: usize,
+    flush_inner: bool,
+) -> MethodCallResult {
+    let key = bos_side_key(ctx, this);
+    let bytes = {
+        let mut bufs = bos_side_buffers().lock();
+        bufs.get_mut(&key)
+            .map(|state| std::mem::take(&mut state.bytes))
+            .unwrap_or_default()
+    };
+    let Some(inner) = bos_inner(ctx, this, out_slot) else {
+        return Ok(None);
+    };
+    if !bytes.is_empty() {
+        let arr = ctx.new_array(ArrayElementType::Byte, bytes.len());
+        for (idx, b) in bytes.iter().enumerate() {
+            ctx.set_array_element(arr, idx, Value::Int(*b as i32));
+        }
+        ctx.invoke_virtual(
+            inner,
+            "write",
+            "([BII)V",
+            &[
+                Value::Object(Some(arr)),
+                Value::Int(0),
+                Value::Int(bytes.len() as i32),
+            ],
+        )?;
+    }
+    if flush_inner {
+        ctx.invoke_virtual(inner, "flush", "()V", &[])?;
+    }
+    Ok(None)
+}
+
+fn bos_side_write_byte(
+    ctx: &mut dyn NativeContext,
+    this: ObjectRef,
+    out_slot: usize,
+    byte_val: i32,
+) -> MethodCallResult {
+    let key = bos_side_key(ctx, this);
+    let should_flush = {
+        let mut bufs = bos_side_buffers().lock();
+        let state = bufs.entry(key).or_insert_with(|| BosSideBuffer {
+            bytes: Vec::with_capacity(8192),
+            capacity: 8192,
+        });
+        state.bytes.len() >= state.capacity
+    };
+    if should_flush {
+        bos_side_flush(ctx, this, out_slot, false)?;
+    }
+    let mut bufs = bos_side_buffers().lock();
+    let state = bufs.entry(key).or_insert_with(|| BosSideBuffer {
+        bytes: Vec::with_capacity(8192),
+        capacity: 8192,
+    });
+    state.bytes.push((byte_val & 0xFF) as u8);
+    Ok(None)
+}
+
+fn bos_side_write_bulk(
+    ctx: &mut dyn NativeContext,
+    this: ObjectRef,
+    out_slot: usize,
+    src: ObjectRef,
+    off: usize,
+    len: usize,
+) -> MethodCallResult {
+    let key = bos_side_key(ctx, this);
+    let capacity = {
+        let mut bufs = bos_side_buffers().lock();
+        let state = bufs.entry(key).or_insert_with(|| BosSideBuffer {
+            bytes: Vec::with_capacity(8192),
+            capacity: 8192,
+        });
+        state.capacity
+    };
+    if len >= capacity {
+        bos_side_flush(ctx, this, out_slot, false)?;
+        if let Some(inner) = bos_inner(ctx, this, out_slot) {
+            ctx.invoke_virtual(
+                inner,
+                "write",
+                "([BII)V",
+                &[
+                    Value::Object(Some(src)),
+                    Value::Int(off as i32),
+                    Value::Int(len as i32),
+                ],
+            )?;
+        }
+        return Ok(None);
+    }
+
+    let needs_flush = {
+        let bufs = bos_side_buffers().lock();
+        bufs.get(&key)
+            .map(|state| len > state.capacity.saturating_sub(state.bytes.len()))
+            .unwrap_or(false)
+    };
+    if needs_flush {
+        bos_side_flush(ctx, this, out_slot, false)?;
+    }
+
+    let mut bytes = vec![0u8; len];
+    ctx.read_byte_array_into(src, off, &mut bytes);
+    let mut bufs = bos_side_buffers().lock();
+    let state = bufs.entry(key).or_insert_with(|| BosSideBuffer {
+        bytes: Vec::with_capacity(capacity),
+        capacity,
+    });
+    state.bytes.extend_from_slice(&bytes);
+    Ok(None)
+}
+
 fn register_buffered_stream_natives(registry: &mut NativeMethodRegistry) {
     let __prev_cat = registry.current_category();
     registry.set_category(cratonvm_native_api::NativeKind::Bridge);
@@ -11128,9 +11428,15 @@ fn native_bos_init(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRes
     let inner = args.get(1).cloned().unwrap_or(Value::Object(None));
     let buf = ctx.new_array(ArrayElementType::Byte, 8192);
     let (out_slot, buf_slot, count_slot) = bos_slots(ctx);
-    ctx.set_field(this, out_slot, inner);
-    ctx.set_field(this, buf_slot, Value::Object(Some(buf)));
-    ctx.set_field(this, count_slot, Value::Int(0));
+    if out_slot < ctx.object_num_fields(this) {
+        ctx.set_field(this, out_slot, inner);
+    }
+    if bos_has_buffer_slots(ctx, this, buf_slot, count_slot) {
+        ctx.set_field(this, buf_slot, Value::Object(Some(buf)));
+        ctx.set_field(this, count_slot, Value::Int(0));
+    } else {
+        bos_side_init(ctx, this, 8192);
+    }
     Ok(None)
 }
 
@@ -11146,9 +11452,15 @@ fn native_bos_init_size(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCa
     };
     let buf = ctx.new_array(ArrayElementType::Byte, size.max(1) as usize);
     let (out_slot, buf_slot, count_slot) = bos_slots(ctx);
-    ctx.set_field(this, out_slot, inner);
-    ctx.set_field(this, buf_slot, Value::Object(Some(buf)));
-    ctx.set_field(this, count_slot, Value::Int(0));
+    if out_slot < ctx.object_num_fields(this) {
+        ctx.set_field(this, out_slot, inner);
+    }
+    if bos_has_buffer_slots(ctx, this, buf_slot, count_slot) {
+        ctx.set_field(this, buf_slot, Value::Object(Some(buf)));
+        ctx.set_field(this, count_slot, Value::Int(0));
+    } else {
+        bos_side_init(ctx, this, size.max(1) as usize);
+    }
     Ok(None)
 }
 
@@ -11186,6 +11498,10 @@ fn native_bos_write_locked(ctx: &mut dyn NativeContext, args: &[Value]) -> Metho
         _ => 0,
     };
     let (_out_slot, buf_slot, count_slot) = bos_slots(ctx);
+    if !bos_has_buffer_slots(ctx, this, buf_slot, count_slot) {
+        let (out_slot, _, _) = bos_slots(ctx);
+        return bos_side_write_byte(ctx, this, out_slot, byte_val);
+    }
     let count = match ctx.get_field(this, count_slot) {
         Value::Int(v) => v,
         _ => 0,
@@ -11252,6 +11568,9 @@ fn native_bos_write_bulk_locked(ctx: &mut dyn NativeContext, args: &[Value]) -> 
     // native_bos_write_locked). OutputStreamPublisherTests.chunkSize() (chunk
     // size 3, writes of "foo"/"bar"/"baz") got "foo","b","arb","a","z".
     let (out_slot, buf_slot, count_slot) = bos_slots(ctx);
+    if !bos_has_buffer_slots(ctx, this, buf_slot, count_slot) {
+        return bos_side_write_bulk(ctx, this, out_slot, src, off, len);
+    }
     let buf_len = match ctx.get_field(this, buf_slot) {
         Value::Object(Some(b)) => ctx.array_length(b),
         _ => return Ok(None),
@@ -11310,6 +11629,9 @@ fn native_bos_flush_locked(ctx: &mut dyn NativeContext, args: &[Value]) -> Metho
         _ => return Ok(None),
     };
     let (out_slot, buf_slot, count_slot) = bos_slots(ctx);
+    if !bos_has_buffer_slots(ctx, this, buf_slot, count_slot) {
+        return bos_side_flush(ctx, this, out_slot, true);
+    }
     let count = match ctx.get_field(this, count_slot) {
         Value::Int(v) => v,
         _ => 0,
@@ -11367,9 +11689,10 @@ fn native_bos_close(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRe
     // 2) Close the inner stream (matches the JDK
     //    `try (out) {}` block in BufferedOutputStream.close).
     let (out_slot, _, _) = bos_slots(ctx);
-    if let Value::Object(Some(inner)) = ctx.get_field(this, out_slot) {
-        ctx.invoke_virtual(inner, "close", "()V", &[])?;
+    if let Some(inner) = bos_inner(ctx, this, out_slot) {
+        ctx.invoke_virtual_declared("java/io/OutputStream", inner, "close", "()V", &[])?;
     }
+    bos_side_buffers().lock().remove(&bos_side_key(ctx, this));
     Ok(None)
 }
 
@@ -14102,15 +14425,12 @@ fn native_afc_provider_open(ctx: &mut dyn NativeContext, args: &[Value]) -> Meth
     let path_obj = obj_arg92(args, 1)?;
     let path_str = validated_path(&read_path_str(ctx, path_obj))?;
     let option_array_value = match args.get(2) {
-        Some(Value::Object(Some(set_obj))) => match ctx.invoke_virtual(
-            *set_obj,
-            "toArray",
-            "()[Ljava/lang/Object;",
-            &[],
-        )? {
-            Some(Value::Object(Some(arr))) => Value::Object(Some(arr)),
-            _ => Value::Object(None),
-        },
+        Some(Value::Object(Some(set_obj))) => {
+            match ctx.invoke_virtual(*set_obj, "toArray", "()[Ljava/lang/Object;", &[])? {
+                Some(Value::Object(Some(arr))) => Value::Object(Some(arr)),
+                _ => Value::Object(None),
+            }
+        }
         _ => Value::Object(None),
     };
     let options = parse_afc_open_options(ctx, Some(&option_array_value))?;
@@ -16291,6 +16611,31 @@ mod io_tests {
         assert!(r.find(dos, "<init>", "(Ljava/io/OutputStream;)V").is_some());
         assert!(r.find(dos, "writeInt", "(I)V").is_some());
         assert!(r.find(dos, "writeLong", "(J)V").is_some());
+    }
+
+    #[test]
+    fn data_output_stream_close_uses_declared_outputstream_for_inner_close() {
+        let mut ctx = MockNativeContext::new();
+        let dos = ctx.alloc_object(1);
+        let inner = ctx.alloc_object_with_class(0, "java/lang/Object");
+        ctx.set_field(dos, DOS_FIELD_OUT, Value::Object(Some(inner)));
+
+        native_dos_close(&mut ctx, &[Value::Object(Some(dos))]).unwrap();
+
+        let calls = ctx.recorded_calls();
+        assert_eq!(calls.len(), 2);
+        assert_eq!(
+            calls[0].declared_class.as_deref(),
+            Some("java/io/OutputStream")
+        );
+        assert_eq!(calls[0].method_name, "flush");
+        assert_eq!(calls[0].descriptor, "()V");
+        assert_eq!(
+            calls[1].declared_class.as_deref(),
+            Some("java/io/OutputStream")
+        );
+        assert_eq!(calls[1].method_name, "close");
+        assert_eq!(calls[1].descriptor, "()V");
     }
 
     // BufferedReader / BufferedWriter overrides are synthetic-jdk only;

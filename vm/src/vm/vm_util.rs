@@ -2191,15 +2191,14 @@ fn post_clinit_fixup(shared: &SharedVm, class_id: ClassId, class_name: &str) {
             let fs_class_name = "java/io/WinNTFileSystem";
             #[cfg(not(windows))]
             let fs_class_name = "java/io/UnixFileSystem";
-            let fs_class = {
+            let fs_class_id = shared.load_class_concurrent(fs_class_name).ok();
+            let fs_class = fs_class_id.and_then(|id| {
                 let cm = shared.class_manager.read();
-                cm.find_class_by_name(fs_class_name).and_then(|id| {
-                    cm.get_class(id).map(|cls| {
-                        let fields = cls.fields.iter().filter(|f| !f.is_static()).count();
-                        (id, fields)
-                    })
+                cm.get_class(id).map(|cls| {
+                    let fields = cls.fields.iter().filter(|f| !f.is_static()).count();
+                    (id, fields)
                 })
-            };
+            });
             if let Some((fs_class_id, fs_fields)) = fs_class {
                 if let Some(fs_obj) = shared.heap.try_alloc_object(fs_class_id, fs_fields) {
                     let (java_home, user_dir) = {

@@ -1,4 +1,4 @@
-﻿// SPDX-License-Identifier: Apache-2.0
+// SPDX-License-Identifier: Apache-2.0
 // Copyright 2024-2026 Craton Software Company
 
 //! System, Runtime, ProcessBuilder, and Thread native method implementations.
@@ -797,7 +797,7 @@ pub(crate) fn native_thread_join_timed(
     ctx: &mut dyn NativeContext,
     args: &[Value],
 ) -> MethodCallResult {
-    let this = match args.first() {
+    let mut this = match args.first() {
         Some(Value::Object(Some(obj))) => *obj,
         _ => return Ok(None),
     };
@@ -852,7 +852,13 @@ pub(crate) fn native_thread_join_timed(
             ));
         }
         let sleep_time = remaining.min(std::time::Duration::from_millis(2));
+        let mut blocked_refs = [Value::Object(Some(this))];
+        ctx.begin_blocking_region();
         std::thread::sleep(sleep_time);
+        ctx.end_blocking_region_refs(&mut blocked_refs);
+        if let Value::Object(Some(cur)) = blocked_refs[0] {
+            this = cur;
+        }
     }
     Ok(None)
 }
@@ -971,7 +977,7 @@ pub(crate) fn native_system_get_property(
     let key = crate::property_key_from_java_string(ctx, key_obj);
     match ctx
         .get_system_property(&key)
-        .or_else(|| crate::bootstrap_property_fallback(&key))
+        .or_else(|| crate::system_property_fallback(ctx, &key))
     {
         Some(val) => {
             let result = ctx.create_string(&val);
@@ -993,7 +999,7 @@ pub(crate) fn native_system_get_property_default(
     let key = crate::property_key_from_java_string(ctx, key_obj);
     match ctx
         .get_system_property(&key)
-        .or_else(|| crate::bootstrap_property_fallback(&key))
+        .or_else(|| crate::system_property_fallback(ctx, &key))
     {
         Some(val) => {
             let result = ctx.create_string(&val);
@@ -2477,12 +2483,33 @@ pub(crate) fn native_system_init_phase1(
             let fis_class_id = ctx.ensure_class_initialized("java/io/FileInputStream")?;
             let num_fields = ctx.class_num_total_fields(fis_class_id).max(2);
             let new_in = ctx.alloc_object(fis_class_id, num_fields);
-            // Stdin fd id is 0; encode as `Int(1)` so `coerce_field_value_by_descriptor`
-            // does not collapse it to `Object(None)` on the way into the slot.
-            ctx.set_field(new_in, 1, Value::Int(1));
+            let fd_class_id = ctx.ensure_class_initialized("java/io/FileDescriptor")?;
+            let fd_fields = ctx.class_num_total_fields(fd_class_id).max(2);
+            let fd_obj = ctx.alloc_object(fd_class_id, fd_fields);
+            ctx.set_field_by_name(fd_obj, "fd", Value::Int(0));
+            ctx.set_field_by_name(fd_obj, "handle", Value::Long(0));
+            ctx.set_field_by_name(new_in, "fd", Value::Object(Some(fd_obj)));
+            if !matches!(ctx.get_field_by_name(new_in, "fd"), Value::Object(Some(_))) {
+                // Legacy synthetic fallback: encode stdin as `fd + 1` so the
+                // reference-slot coercion path cannot collapse fd 0 to null.
+                ctx.set_field(new_in, 1, Value::Int(1));
+            }
             ctx.cache_system_stdin(new_in);
             new_in
         };
+        let fd_obj = match ctx.get_field_by_name(in_obj, "fd") {
+            Value::Object(Some(fd_obj)) => fd_obj,
+            _ => {
+                let fd_class_id = ctx.ensure_class_initialized("java/io/FileDescriptor")?;
+                let fd_fields = ctx.class_num_total_fields(fd_class_id).max(2);
+                let fd_obj = ctx.alloc_object(fd_class_id, fd_fields);
+                ctx.set_field_by_name(in_obj, "fd", Value::Object(Some(fd_obj)));
+                fd_obj
+            }
+        };
+        ctx.set_field_by_name(fd_obj, "fd", Value::Int(0));
+        ctx.set_field_by_name(fd_obj, "handle", Value::Long(0));
+        ctx.cache_system_stdin(in_obj);
         ctx.set_static_field_by_name("java/lang/System", "in", Value::Object(Some(in_obj)));
     }
 

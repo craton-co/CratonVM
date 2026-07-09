@@ -6836,6 +6836,7 @@ fn synthetic_stub_fields(name: &str) -> Vec<cratonvm_reader::field::ClassFileFie
         | "java/lang/NoSuchMethodException"
         | "java/lang/StackOverflowError"
         | "java/lang/OutOfMemoryError"
+        | "java/lang/VerifyError"
         | "java/util/NoSuchElementException"
         | "java/util/InputMismatchException"
         | "java/io/IOException"
@@ -10341,10 +10342,13 @@ fn synthetic_stub_ctor_methods(name: &str) -> Vec<ClassFileMethod> {
         };
         if name == "java/util/Collections$SynchronizedSet" {
             out.push(mk("<init>", "(Ljava/util/Set;)V"));
+            out.push(mk("<init>", "(Ljava/util/Set;Ljava/lang/Object;)V"));
         } else if name == "java/util/Collections$SynchronizedMap" {
             out.push(mk("<init>", "(Ljava/util/Map;)V"));
+            out.push(mk("<init>", "(Ljava/util/Map;Ljava/lang/Object;)V"));
         } else {
             out.push(mk("<init>", "(Ljava/util/Collection;)V"));
+            out.push(mk("<init>", "(Ljava/util/Collection;Ljava/lang/Object;)V"));
         }
         if name == "java/util/Collections$SynchronizedMap" {
             out.extend([

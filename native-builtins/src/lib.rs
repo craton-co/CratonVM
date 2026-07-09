@@ -22,6 +22,69 @@ fn normalize_java_property_key(key: &str) -> String {
 
 /// Defaults for critical bootstrap keys when the VM store misses a lookup.
 #[inline]
+fn jboss_home_from_modules_dir(path: &std::path::Path) -> Option<String> {
+    if path.file_name().and_then(|n| n.to_str()) == Some("modules") {
+        return path.parent().map(|p| p.to_string_lossy().into_owned());
+    }
+    None
+}
+
+#[inline]
+fn jboss_home_from_home_dir(path: &std::path::Path) -> Option<String> {
+    if path.join("modules").is_dir() && path.join("jboss-modules.jar").is_file() {
+        return Some(path.to_string_lossy().into_owned());
+    }
+    None
+}
+
+fn jboss_home_from_module_path(module_path: &str) -> Option<String> {
+    std::env::split_paths(module_path).find_map(|p| jboss_home_from_modules_dir(&p))
+}
+
+fn jboss_home_from_class_path(class_path: &str) -> Option<String> {
+    std::env::split_paths(class_path).find_map(|p| {
+        if p.file_name().and_then(|n| n.to_str()) == Some("jboss-modules.jar") {
+            return p
+                .parent()
+                .map(|parent| parent.to_string_lossy().into_owned());
+        }
+        None
+    })
+}
+
+fn jboss_home_dir_fallback() -> Option<String> {
+    if let Ok(home) = std::env::var("JBOSS_HOME") {
+        if !home.is_empty() {
+            return Some(home);
+        }
+    }
+    std::env::var("CRATONVM_JBOSS_MP_ROOT")
+        .ok()
+        .and_then(|mp_root| jboss_home_from_modules_dir(std::path::Path::new(&mp_root)))
+        .or_else(|| {
+            std::env::current_dir()
+                .ok()
+                .and_then(|cwd| jboss_home_from_home_dir(&cwd))
+        })
+}
+
+pub(crate) fn system_property_fallback(ctx: &dyn NativeContext, key: &str) -> Option<String> {
+    if key == "jboss.home.dir" {
+        return bootstrap_property_fallback(key)
+            .or_else(|| {
+                ctx.get_system_property("module.path")
+                    .or_else(|| ctx.get_system_property("modules.path"))
+                    .and_then(|mp| jboss_home_from_module_path(&mp))
+            })
+            .or_else(|| {
+                ctx.get_system_property("java.class.path")
+                    .and_then(|cp| jboss_home_from_class_path(&cp))
+            });
+    }
+    bootstrap_property_fallback(key)
+}
+
+#[inline]
 pub(crate) fn bootstrap_property_fallback(key: &str) -> Option<String> {
     match key {
         "file.separator" => Some(std::path::MAIN_SEPARATOR.to_string()),
@@ -35,6 +98,7 @@ pub(crate) fn bootstrap_property_fallback(key: &str) -> Option<String> {
         } else {
             "\n".to_string()
         }),
+        "jboss.home.dir" => jboss_home_dir_fallback(),
         // Reactor Netty normally sizes workers from host CPU count. Keep a small
         // deterministic pool, but use at least four workers: smaller pools can
         // strand simultaneous STOMP connects under real-JDK mode.
@@ -337,13 +401,130 @@ fn native_output_stream_write_all(ctx: &mut dyn NativeContext, args: &[Value]) -
         _ => return Ok(None),
     };
     let len = ctx.array_length(arr) as i32;
-    let _ = ctx.invoke_virtual(
+    let res = ctx.invoke_virtual(
         this,
         "write",
         "([BII)V",
         &[Value::Object(Some(arr)), Value::Int(0), Value::Int(len)],
     )?;
     Ok(None)
+}
+
+#[cfg(test)]
+mod bootstrap_property_fallback_tests {
+    use super::*;
+    use std::sync::{Mutex, OnceLock};
+
+    fn env_lock() -> std::sync::MutexGuard<'static, ()> {
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| Mutex::new(())).lock().unwrap()
+    }
+
+    #[test]
+    fn jboss_home_dir_falls_back_to_jboss_home_env() {
+        let _guard = env_lock();
+        let old_home = std::env::var("JBOSS_HOME").ok();
+        let old_mp = std::env::var("CRATONVM_JBOSS_MP_ROOT").ok();
+        std::env::set_var("JBOSS_HOME", "/opt/wildfly");
+        std::env::remove_var("CRATONVM_JBOSS_MP_ROOT");
+
+        assert_eq!(
+            bootstrap_property_fallback("jboss.home.dir"),
+            Some("/opt/wildfly".to_string())
+        );
+
+        match old_home {
+            Some(v) => std::env::set_var("JBOSS_HOME", v),
+            None => std::env::remove_var("JBOSS_HOME"),
+        }
+        match old_mp {
+            Some(v) => std::env::set_var("CRATONVM_JBOSS_MP_ROOT", v),
+            None => std::env::remove_var("CRATONVM_JBOSS_MP_ROOT"),
+        }
+    }
+
+    #[test]
+    fn jboss_home_dir_falls_back_to_module_path_property() {
+        let _guard = env_lock();
+        let old_home = std::env::var("JBOSS_HOME").ok();
+        let old_mp = std::env::var("CRATONVM_JBOSS_MP_ROOT").ok();
+        std::env::remove_var("JBOSS_HOME");
+        std::env::remove_var("CRATONVM_JBOSS_MP_ROOT");
+
+        let mut ctx = crate::test_utils::mock_ctx();
+        ctx.set_system_property("module.path", "/opt/wildfly/modules");
+        assert_eq!(
+            system_property_fallback(&ctx, "jboss.home.dir"),
+            Some("/opt/wildfly".to_string())
+        );
+
+        match old_home {
+            Some(v) => std::env::set_var("JBOSS_HOME", v),
+            None => std::env::remove_var("JBOSS_HOME"),
+        }
+        match old_mp {
+            Some(v) => std::env::set_var("CRATONVM_JBOSS_MP_ROOT", v),
+            None => std::env::remove_var("CRATONVM_JBOSS_MP_ROOT"),
+        }
+    }
+
+    #[test]
+    fn jboss_home_dir_falls_back_to_java_class_path_property() {
+        let _guard = env_lock();
+        let old_home = std::env::var("JBOSS_HOME").ok();
+        let old_mp = std::env::var("CRATONVM_JBOSS_MP_ROOT").ok();
+        std::env::remove_var("JBOSS_HOME");
+        std::env::remove_var("CRATONVM_JBOSS_MP_ROOT");
+
+        let mut ctx = crate::test_utils::mock_ctx();
+        ctx.set_system_property("java.class.path", "/opt/wildfly/jboss-modules.jar");
+        assert_eq!(
+            system_property_fallback(&ctx, "jboss.home.dir"),
+            Some("/opt/wildfly".to_string())
+        );
+
+        match old_home {
+            Some(v) => std::env::set_var("JBOSS_HOME", v),
+            None => std::env::remove_var("JBOSS_HOME"),
+        }
+        match old_mp {
+            Some(v) => std::env::set_var("CRATONVM_JBOSS_MP_ROOT", v),
+            None => std::env::remove_var("CRATONVM_JBOSS_MP_ROOT"),
+        }
+    }
+
+    #[test]
+    fn jboss_home_dir_falls_back_to_wildfly_current_dir() {
+        let _guard = env_lock();
+        let old_home = std::env::var("JBOSS_HOME").ok();
+        let old_mp = std::env::var("CRATONVM_JBOSS_MP_ROOT").ok();
+        let old_cwd = std::env::current_dir().unwrap();
+        std::env::remove_var("JBOSS_HOME");
+        std::env::remove_var("CRATONVM_JBOSS_MP_ROOT");
+
+        let tmp =
+            std::env::temp_dir().join(format!("cratonvm-wildfly-home-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(tmp.join("modules")).unwrap();
+        std::fs::write(tmp.join("jboss-modules.jar"), []).unwrap();
+        std::env::set_current_dir(&tmp).unwrap();
+
+        assert_eq!(
+            bootstrap_property_fallback("jboss.home.dir"),
+            Some(tmp.to_string_lossy().into_owned())
+        );
+
+        std::env::set_current_dir(old_cwd).unwrap();
+        let _ = std::fs::remove_dir_all(&tmp);
+        match old_home {
+            Some(v) => std::env::set_var("JBOSS_HOME", v),
+            None => std::env::remove_var("JBOSS_HOME"),
+        }
+        match old_mp {
+            Some(v) => std::env::set_var("CRATONVM_JBOSS_MP_ROOT", v),
+            None => std::env::remove_var("CRATONVM_JBOSS_MP_ROOT"),
+        }
+    }
 }
 
 fn os_env_bytes(s: &std::ffi::OsStr) -> Vec<u8> {
@@ -1879,6 +2060,25 @@ pub(crate) fn property_key_from_java_string(
     normalize_java_property_key(&out)
 }
 
+fn native_wildfly_security_manager_get_property_privileged(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    let default = args.get(1).copied().unwrap_or(Value::Object(None));
+    let key_obj = match args.first() {
+        Some(Value::Object(Some(k))) => *k,
+        _ => return Ok(Some(default)),
+    };
+    let key = property_key_from_java_string(ctx, key_obj);
+    match ctx
+        .get_system_property(&key)
+        .or_else(|| system_property_fallback(ctx, &key))
+    {
+        Some(v) => Ok(Some(Value::Object(Some(ctx.create_string(&v))))),
+        None => Ok(Some(default)),
+    }
+}
+
 pub mod lang_class;
 pub mod lang_string;
 // WP2.1: java.lang.reflect full coverage — supplements lang_class.rs with
@@ -2470,6 +2670,28 @@ mod context_class_loader_tests {
                 ste,
                 "initStackTraceElements",
                 "([Ljava/lang/StackTraceElement;Ljava/lang/Throwable;)V",
+            )
+            .is_some());
+    }
+
+    #[cfg(feature = "experimental-serialization")]
+    #[test]
+    fn essential_registers_reflection_factory_serialization_hooks() {
+        let mut registry = NativeMethodRegistry::new();
+        register_essential_natives(&mut registry);
+
+        assert!(registry
+            .find(
+                "sun/reflect/ReflectionFactory",
+                "readObjectForSerialization",
+                "(Ljava/lang/Class;)Ljava/lang/invoke/MethodHandle;"
+            )
+            .is_some());
+        assert!(registry
+            .find(
+                "sun/reflect/ReflectionFactory",
+                "getReflectionFactory",
+                "()Lsun/reflect/ReflectionFactory;"
             )
             .is_some());
     }
@@ -17862,6 +18084,14 @@ pub fn register_essential_natives(registry: &mut NativeMethodRegistry) {
     // but test VMs use real-JDK mode and still need the print capture natives.
     register_test_harness_natives(registry);
 
+    // Real-JDK mode does not call the full synthetic/experimental
+    // `register_builtins` surface, but JBoss Marshalling calls
+    // `sun.reflect.ReflectionFactory` directly for serialization hooks.
+    // Register only that narrow bridge here so private hook discovery obeys
+    // the ObjectStreamClass rules before Java-side MethodHandle fallback runs.
+    #[cfg(feature = "experimental-serialization")]
+    serialization::register_reflection_factory_serialization(registry);
+
     registry.with_category(cratonvm_native_api::NativeKind::Intrinsic, |registry| {
         register_spring_codec_intrinsics(registry);
     });
@@ -18667,6 +18897,7 @@ pub fn register_essential_natives(registry: &mut NativeMethodRegistry) {
         "java/lang/SecurityException",
         "java/lang/NoSuchMethodError",
         "java/lang/NoSuchFieldError",
+        "java/lang/VerifyError",
     ] {
         let cls_static: &'static str = Box::leak(cls.to_string().into_boxed_str());
         registry.register(
@@ -18998,6 +19229,13 @@ pub fn register_essential_natives(registry: &mut NativeMethodRegistry) {
                 Ok(None)
             },
         );
+        registry.register("java/io/InputStreamReader", "close", "()V", |ctx, args| {
+            let this = obj_arg(args, 0)?;
+            if let Value::Object(Some(sd)) = ctx.get_field_by_name(this, "sd") {
+                let _ = ctx.invoke_virtual(sd, "close", "()V", &[])?;
+            }
+            Ok(None)
+        });
         registry.register(
             "java/io/InputStreamReader",
             "read",
@@ -19650,6 +19888,51 @@ pub fn register_essential_natives(registry: &mut NativeMethodRegistry) {
     // Base64.getEncoder() while running under JBoss Modules; expose the existing
     // Base64 intrinsics in essentials instead of waiting for the full phase table.
     register_base64_natives(registry);
+    registry.register(
+        "java/lang/Integer",
+        "valueOf",
+        "(Ljava/lang/String;)Ljava/lang/Integer;",
+        |ctx, args| match crate::lang_math::native_integer_parse_int(ctx, args)? {
+            Some(Value::Int(v)) => crate::lang_math::native_integer_value_of(ctx, &[Value::Int(v)]),
+            _ => crate::lang_math::native_integer_value_of(ctx, &[Value::Int(0)]),
+        },
+    );
+    registry.register("java/util/Arrays", "equals", "([B[B)Z", |ctx, args| {
+        let a_ref = match args.first() {
+            Some(Value::Object(o)) => *o,
+            _ => None,
+        };
+        let b_ref = match args.get(1) {
+            Some(Value::Object(o)) => *o,
+            _ => None,
+        };
+        if a_ref == b_ref {
+            return Ok(Some(Value::Int(1)));
+        }
+        let (Some(a), Some(b)) = (a_ref, b_ref) else {
+            return Ok(Some(Value::Int(0)));
+        };
+        let len = ctx.array_length(a);
+        if len != ctx.array_length(b) {
+            return Ok(Some(Value::Int(0)));
+        }
+        for i in 0..len {
+            let av = match ctx.get_array_element(a, i) {
+                Value::Int(v) => v as i8,
+                Value::Long(v) => v as i8,
+                _ => 0,
+            };
+            let bv = match ctx.get_array_element(b, i) {
+                Value::Int(v) => v as i8,
+                Value::Long(v) => v as i8,
+                _ => 0,
+            };
+            if av != bv {
+                return Ok(Some(Value::Int(0)));
+            }
+        }
+        Ok(Some(Value::Int(1)))
+    });
     registry.register("java/util/Arrays", "hashCode", "([B)I", |ctx, args| {
         let arr = match args.first() {
             Some(Value::Object(Some(a))) => *a,
@@ -19695,6 +19978,21 @@ pub fn register_essential_natives(registry: &mut NativeMethodRegistry) {
         "write",
         "([B)V",
         native_output_stream_write_all,
+    );
+    registry.register(
+        "java/io/FilterInputStream",
+        "<init>",
+        "(Ljava/io/InputStream;)V",
+        |ctx, args| {
+            let this = match args.first() {
+                Some(Value::Object(Some(o))) => *o,
+                _ => return Ok(None),
+            };
+            let input = args.get(1).copied().unwrap_or(Value::Object(None));
+            ctx.set_field_by_name(this, "in", input);
+            ctx.set_field(this, 0, input);
+            Ok(None)
+        },
     );
     registry.register(
         "java/io/FilterOutputStream",
@@ -19985,6 +20283,8 @@ pub fn register_essential_natives(registry: &mut NativeMethodRegistry) {
     // Domain process-controller also constructs its read executor before the
     // normal concurrent phase; register the Executors factory bridge early.
     register_executor_natives(registry);
+    crate::phases_early::register_scheduled_executor_natives(registry);
+    crate::phases_early::register_qname_natives(registry);
 
     // WP1.9: StackStreamFactory.AbstractStackWalker.{callStackWalk,
     // fetchStackFrames} + StackFrameInfo accessors (getByteCodeIndex,
@@ -20251,6 +20551,7 @@ pub fn register_essential_natives(registry: &mut NativeMethodRegistry) {
         "()V",
         native_object_notify_all,
     );
+    registry.register("java/lang/Object", "wait", "()V", native_object_wait);
     // BUG FIX: `wait(J)` / `wait0(J)` must honor the millisecond timeout.
     // These were wired to `native_object_wait` (which passes `None` = wait
     // forever), so `Object.wait(100)` blocked indefinitely with no notify —
@@ -20330,7 +20631,7 @@ pub fn register_essential_natives(registry: &mut NativeMethodRegistry) {
             let key = property_key_from_java_string(ctx, key_obj);
             match ctx
                 .get_system_property(&key)
-                .or_else(|| bootstrap_property_fallback(&key))
+                .or_else(|| system_property_fallback(ctx, &key))
             {
                 Some(v) => Ok(Some(Value::Object(Some(ctx.create_string(&v))))),
                 None => Ok(Some(Value::Object(None))),
@@ -20349,7 +20650,7 @@ pub fn register_essential_natives(registry: &mut NativeMethodRegistry) {
             let key = property_key_from_java_string(ctx, key_obj);
             match ctx
                 .get_system_property(&key)
-                .or_else(|| bootstrap_property_fallback(&key))
+                .or_else(|| system_property_fallback(ctx, &key))
             {
                 Some(v) => Ok(Some(Value::Object(Some(ctx.create_string(&v))))),
                 None => Ok(Some(args.get(1).copied().unwrap_or(Value::Object(None)))),
@@ -20417,6 +20718,12 @@ pub fn register_essential_natives(registry: &mut NativeMethodRegistry) {
                 None => Ok(Some(Value::Object(None))),
             }
         },
+    );
+    registry.register(
+        "org/wildfly/security/manager/WildFlySecurityManager",
+        "getPropertyPrivileged",
+        "(Ljava/lang/String;Ljava/lang/String;)Ljava/lang/String;",
+        native_wildfly_security_manager_get_property_privileged,
     );
     registry.register(
         "java/lang/System",
@@ -23522,11 +23829,22 @@ pub fn register_essential_natives(registry: &mut NativeMethodRegistry) {
         // for the bootstrap main-thread holder construction. See
         // docs/known-issues/gc-blocked-thread-frame-stale-thread-mirror.md.
         let pin_base = ctx.pin_native_root(this);
+        let target_handle = match target {
+            Value::Object(Some(o)) => Some((ctx.pin_native_root(o), o)),
+            _ => None,
+        };
         ctx.set_field_by_name(this, "name", name);
         // JDK 17 keeps the Runnable directly on Thread.target and has no
         // Thread$FieldHolder. Seed the direct field before attempting the newer
         // holder layout so app-created threads still run on that JDK shape.
         ctx.set_field_by_name(this, "target", target);
+        // On some real subclass mirrors, name-based lookup from the concrete
+        // receiver can miss legacy fields declared by java.lang.Thread. Seed
+        // the resolved Thread slot explicitly so bytecode `Thread.run()` bodies
+        // that read `this.target` observe the Runnable.
+        if let Some(target_slot) = ctx.resolve_field_index("java/lang/Thread", "target") {
+            ctx.set_field(this, target_slot, target);
+        }
         // Don't clobber an already-populated holder (e.g. if the real
         // Java constructor somehow ran first, or a re-entrant call).
         if let Value::Object(Some(_)) = ctx.get_field_by_name(this, "holder") {
@@ -23577,6 +23895,14 @@ pub fn register_essential_natives(registry: &mut NativeMethodRegistry) {
         // relocated either (or both) of them.
         let holder = ctx.read_native_pin(holder_handle, holder);
         let this = ctx.read_native_pin(pin_base, this);
+        let target = match target_handle {
+            Some((handle, old)) => Value::Object(Some(ctx.read_native_pin(handle, old))),
+            None => target,
+        };
+        ctx.set_field_by_name(this, "target", target);
+        if let Some(target_slot) = ctx.resolve_field_index("java/lang/Thread", "target") {
+            ctx.set_field(this, target_slot, target);
+        }
         if !ctor_ok {
             // Constructor unavailable — populate the known fields directly
             // so the holder is still usable by getPriority/isDaemon/getState.
@@ -23588,6 +23914,16 @@ pub fn register_essential_natives(registry: &mut NativeMethodRegistry) {
             ctx.set_field_by_name(holder, "threadStatus", Value::Int(0));
         }
         ctx.set_field_by_name(this, "holder", Value::Object(Some(holder)));
+        if let Some(holder_slot) = ctx.resolve_field_index("java/lang/Thread", "holder") {
+            ctx.set_field(this, holder_slot, Value::Object(Some(holder)));
+        }
+        if matches!(ctx.get_field_by_name(this, "target"), Value::Object(None))
+            && matches!(ctx.get_field_by_name(this, "holder"), Value::Object(None))
+            && ctx.object_num_fields(this) >= 4
+        {
+            ctx.set_field(this, 2, group);
+            ctx.set_field(this, 3, target);
+        }
         ctx.unpin_native_roots(pin_base);
     }
     registry.register(
@@ -26123,8 +26459,10 @@ pub fn register_essential_natives(registry: &mut NativeMethodRegistry) {
         "java/lang/ref/Reference",
         "waitForReferenceProcessing",
         "()Z",
-        |_ctx, _args| {
+        |ctx, _args| {
+            ctx.begin_blocking_region();
             std::thread::sleep(std::time::Duration::from_millis(1));
+            ctx.end_blocking_region();
             Ok(Some(Value::Int(0)))
         },
     );
@@ -30926,6 +31264,7 @@ pub fn register_synthetic_overrides(registry: &mut NativeMethodRegistry) {
         "java/lang/RuntimeException",
         "java/lang/Error",
         "java/lang/LinkageError",
+        "java/lang/VerifyError",
         "java/lang/NoClassDefFoundError",
         "java/lang/NullPointerException",
         "java/lang/ArithmeticException",
@@ -31327,15 +31666,276 @@ pub fn register_synthetic_overrides(registry: &mut NativeMethodRegistry) {
         "()Ljava/lang/Thread$State;",
         thread_state_runnable,
     );
-    // Thread.run() — delegates to target Runnable stored in field 3 (if present)
+    // Thread constructors/run: keep the final essential-native registrations
+    // aligned with the real-JDK holder-backed layout. Earlier registrations in
+    // this file already do this, but this later essential block used to
+    // re-register synthetic slot-3-only variants; last-write-wins made
+    // Thread subclasses such as JBossThread start and immediately return
+    // without ever invoking their Runnable target.
+    registry.register("java/lang/Thread", "<init>", "()V", |ctx, args| {
+        let this = match args.first() {
+            Some(Value::Object(Some(o))) => *o,
+            _ => return Ok(None),
+        };
+        let name = Value::Object(Some(ctx.create_string("Thread")));
+        if is_synthetic_thread_layout(ctx.object_num_fields(this)) {
+            ctx.set_field(this, 0, name);
+            ctx.set_field(this, 1, Value::Int(5));
+        } else {
+            populate_real_thread_holder(ctx, this, Value::Object(None), Value::Object(None), name);
+        }
+        Ok(None)
+    });
+    registry.register(
+        "java/lang/Thread",
+        "<init>",
+        "(Ljava/lang/String;)V",
+        |ctx, args| {
+            let this = match args.first() {
+                Some(Value::Object(Some(o))) => *o,
+                _ => return Ok(None),
+            };
+            let name = match args.get(1).copied().unwrap_or(Value::Object(None)) {
+                Value::Object(Some(s)) => Value::Object(Some(s)),
+                _ => Value::Object(Some(ctx.create_string("Thread"))),
+            };
+            if is_synthetic_thread_layout(ctx.object_num_fields(this)) {
+                ctx.set_field(this, 0, name);
+                ctx.set_field(this, 1, Value::Int(5));
+            } else {
+                populate_real_thread_holder(
+                    ctx,
+                    this,
+                    Value::Object(None),
+                    Value::Object(None),
+                    name,
+                );
+            }
+            Ok(None)
+        },
+    );
+    registry.register(
+        "java/lang/Thread",
+        "<init>",
+        "(Ljava/lang/Runnable;)V",
+        |ctx, args| {
+            let this = match args.first() {
+                Some(Value::Object(Some(o))) => *o,
+                _ => return Ok(None),
+            };
+            let target = args.get(1).copied().unwrap_or(Value::Object(None));
+            let name = Value::Object(Some(ctx.create_string("Thread")));
+            if is_synthetic_thread_layout(ctx.object_num_fields(this)) {
+                ctx.set_field(this, 0, name);
+                ctx.set_field(this, 1, Value::Int(5));
+                ctx.set_field(this, 3, target);
+            } else {
+                populate_real_thread_holder(ctx, this, Value::Object(None), target, name);
+            }
+            Ok(None)
+        },
+    );
+    registry.register(
+        "java/lang/Thread",
+        "<init>",
+        "(Ljava/lang/Runnable;Ljava/lang/String;)V",
+        |ctx, args| {
+            let this = match args.first() {
+                Some(Value::Object(Some(o))) => *o,
+                _ => return Ok(None),
+            };
+            let target = args.get(1).copied().unwrap_or(Value::Object(None));
+            let name = match args.get(2).copied().unwrap_or(Value::Object(None)) {
+                Value::Object(Some(s)) => Value::Object(Some(s)),
+                _ => Value::Object(Some(ctx.create_string("Thread"))),
+            };
+            if is_synthetic_thread_layout(ctx.object_num_fields(this)) {
+                ctx.set_field(this, 0, name);
+                ctx.set_field(this, 1, Value::Int(5));
+                ctx.set_field(this, 3, target);
+            } else {
+                populate_real_thread_holder(ctx, this, Value::Object(None), target, name);
+            }
+            Ok(None)
+        },
+    );
+    registry.register(
+        "java/lang/Thread",
+        "<init>",
+        "(Ljava/lang/ThreadGroup;Ljava/lang/Runnable;)V",
+        |ctx, args| {
+            let this = match args.first() {
+                Some(Value::Object(Some(o))) => *o,
+                _ => return Ok(None),
+            };
+            let group = args.get(1).copied().unwrap_or(Value::Object(None));
+            let target = args.get(2).copied().unwrap_or(Value::Object(None));
+            let name = Value::Object(Some(ctx.create_string("Thread")));
+            if is_synthetic_thread_layout(ctx.object_num_fields(this)) {
+                ctx.set_field(this, 0, name);
+                ctx.set_field(this, 1, Value::Int(5));
+                ctx.set_field(this, 2, group);
+                ctx.set_field(this, 3, target);
+            } else {
+                populate_real_thread_holder(ctx, this, group, target, name);
+            }
+            Ok(None)
+        },
+    );
+    registry.register(
+        "java/lang/Thread",
+        "<init>",
+        "(Ljava/lang/ThreadGroup;Ljava/lang/String;)V",
+        |ctx, args| {
+            let this = match args.first() {
+                Some(Value::Object(Some(o))) => *o,
+                _ => return Ok(None),
+            };
+            let group = args.get(1).copied().unwrap_or(Value::Object(None));
+            let name = match args.get(2).copied().unwrap_or(Value::Object(None)) {
+                Value::Object(Some(s)) => Value::Object(Some(s)),
+                _ => Value::Object(Some(ctx.create_string("Thread"))),
+            };
+            if is_synthetic_thread_layout(ctx.object_num_fields(this)) {
+                ctx.set_field(this, 0, name);
+                ctx.set_field(this, 1, Value::Int(5));
+                ctx.set_field(this, 2, group);
+            } else {
+                populate_real_thread_holder(ctx, this, group, Value::Object(None), name);
+            }
+            Ok(None)
+        },
+    );
+    registry.register(
+        "java/lang/Thread",
+        "<init>",
+        "(Ljava/lang/ThreadGroup;Ljava/lang/Runnable;Ljava/lang/String;)V",
+        |ctx, args| {
+            let this = match args.first() {
+                Some(Value::Object(Some(o))) => *o,
+                _ => return Ok(None),
+            };
+            let group = args.get(1).copied().unwrap_or(Value::Object(None));
+            let target = args.get(2).copied().unwrap_or(Value::Object(None));
+            let name = match args.get(3).copied().unwrap_or(Value::Object(None)) {
+                Value::Object(Some(s)) => Value::Object(Some(s)),
+                _ => Value::Object(Some(ctx.create_string("Thread"))),
+            };
+            if is_synthetic_thread_layout(ctx.object_num_fields(this)) {
+                ctx.set_field(this, 0, name);
+                ctx.set_field(this, 1, Value::Int(5));
+                ctx.set_field(this, 2, group);
+                ctx.set_field(this, 3, target);
+            } else {
+                populate_real_thread_holder(ctx, this, group, target, name);
+            }
+            Ok(None)
+        },
+    );
+    registry.register(
+        "java/lang/Thread",
+        "<init>",
+        "(Ljava/lang/ThreadGroup;Ljava/lang/Runnable;Ljava/lang/String;J)V",
+        |ctx, args| {
+            let this = match args.first() {
+                Some(Value::Object(Some(o))) => *o,
+                _ => return Ok(None),
+            };
+            let group = args.get(1).copied().unwrap_or(Value::Object(None));
+            let target = args.get(2).copied().unwrap_or(Value::Object(None));
+            let name = match args.get(3).copied().unwrap_or(Value::Object(None)) {
+                Value::Object(Some(s)) => Value::Object(Some(s)),
+                _ => Value::Object(Some(ctx.create_string("Thread"))),
+            };
+            if is_synthetic_thread_layout(ctx.object_num_fields(this)) {
+                ctx.set_field(this, 0, name);
+                ctx.set_field(this, 1, Value::Int(5));
+                ctx.set_field(this, 2, group);
+                ctx.set_field(this, 3, target);
+            } else {
+                populate_real_thread_holder(ctx, this, group, target, name);
+            }
+            Ok(None)
+        },
+    );
+    registry.register(
+        "java/lang/Thread",
+        "<init>",
+        "(Ljava/lang/ThreadGroup;Ljava/lang/Runnable;Ljava/lang/String;JZ)V",
+        |ctx, args| {
+            let this = match args.first() {
+                Some(Value::Object(Some(o))) => *o,
+                _ => return Ok(None),
+            };
+            let group = args.get(1).copied().unwrap_or(Value::Object(None));
+            let target = args.get(2).copied().unwrap_or(Value::Object(None));
+            let name = match args.get(3).copied().unwrap_or(Value::Object(None)) {
+                Value::Object(Some(s)) => Value::Object(Some(s)),
+                _ => Value::Object(Some(ctx.create_string("Thread"))),
+            };
+            if is_synthetic_thread_layout(ctx.object_num_fields(this)) {
+                ctx.set_field(this, 0, name);
+                ctx.set_field(this, 1, Value::Int(5));
+                ctx.set_field(this, 2, group);
+                ctx.set_field(this, 3, target);
+            } else {
+                populate_real_thread_holder(ctx, this, group, target, name);
+            }
+            Ok(None)
+        },
+    );
+    registry.register(
+        "java/lang/Thread",
+        "<init>",
+        "(Ljava/lang/ThreadGroup;Ljava/lang/String;ILjava/lang/Runnable;J)V",
+        |ctx, args| {
+            let this = match args.first() {
+                Some(Value::Object(Some(o))) => *o,
+                _ => return Ok(None),
+            };
+            let group = args.get(1).copied().unwrap_or(Value::Object(None));
+            let name = match args.get(2).copied().unwrap_or(Value::Object(None)) {
+                Value::Object(Some(s)) => Value::Object(Some(s)),
+                _ => Value::Object(Some(ctx.create_string("Thread"))),
+            };
+            let prio = match args.get(3) {
+                Some(Value::Int(p)) => *p,
+                _ => 5,
+            };
+            let target = args.get(4).copied().unwrap_or(Value::Object(None));
+            if is_synthetic_thread_layout(ctx.object_num_fields(this)) {
+                ctx.set_field(this, 0, name);
+                ctx.set_field(this, 1, Value::Int(prio));
+                ctx.set_field(this, 2, group);
+                ctx.set_field(this, 3, target);
+            } else {
+                populate_real_thread_holder(ctx, this, group, target, name);
+            }
+            Ok(None)
+        },
+    );
+    // Thread.run() delegates to the target Runnable stored either in the
+    // synthetic slot layout or in real JDK 25's Thread$FieldHolder.task.
     registry.register("java/lang/Thread", "run", "()V", |ctx, args| {
         let this = match args.first() {
             Some(Value::Object(Some(o))) => *o,
             _ => return Ok(None),
         };
         let num_fields = ctx.object_num_fields(this);
-        if num_fields >= 4 {
-            if let Value::Object(Some(target)) = ctx.get_field(this, 3) {
+        if is_synthetic_thread_layout(num_fields) {
+            if num_fields >= 4 {
+                if let Value::Object(Some(target)) = ctx.get_field(this, 3) {
+                    let _ = ctx.invoke_virtual(target, "run", "()V", &[]);
+                }
+            }
+        } else {
+            let mut target_val = ctx.get_field_by_name(this, "target");
+            if matches!(target_val, Value::Object(None)) {
+                if let Value::Object(Some(holder)) = ctx.get_field_by_name(this, "holder") {
+                    target_val = ctx.get_field_by_name(holder, "task");
+                }
+            }
+            if let Value::Object(Some(target)) = target_val {
                 let _ = ctx.invoke_virtual(target, "run", "()V", &[]);
             }
         }
@@ -32969,11 +33569,11 @@ fn native_platform_filesystem_init(
     };
     let file_sep = ctx
         .get_system_property("file.separator")
-        .or_else(|| bootstrap_property_fallback("file.separator"))
+        .or_else(|| system_property_fallback(ctx, "file.separator"))
         .unwrap_or_else(|| std::path::MAIN_SEPARATOR.to_string());
     let path_sep = ctx
         .get_system_property("path.separator")
-        .or_else(|| bootstrap_property_fallback("path.separator"))
+        .or_else(|| system_property_fallback(ctx, "path.separator"))
         .unwrap_or_else(|| {
             if cfg!(windows) {
                 ";".to_string()
@@ -33003,8 +33603,16 @@ fn native_platform_filesystem_init(
 
     // Works for both WinNTFileSystem and UnixFileSystem (fields absent in one
     // class are ignored by the field-by-name setter implementation).
+    // WinNTFileSystem names its path-separator field `semicolon`;
+    // UnixFileSystem names the same concept `colon` (tomcat-08-07 follow-up:
+    // this used to only set `semicolon`, which silently no-ops on
+    // UnixFileSystem, so `colon` stayed at its zero-init default and any
+    // pure-Java FileSystem method that reads it, e.g. path joining, saw a
+    // NUL separator on Linux). Set both by the same value; each is a no-op
+    // on the class that doesn't declare it.
     ctx.set_field_by_name(this, "slash", Value::Int(slash));
     ctx.set_field_by_name(this, "semicolon", Value::Int(semicolon));
+    ctx.set_field_by_name(this, "colon", Value::Int(semicolon));
     ctx.set_field_by_name(this, "altSlash", Value::Int(alt_slash));
     let user_dir_str = ctx.create_string(&user_dir);
     ctx.set_field_by_name(this, "userDir", Value::Object(Some(user_dir_str)));
@@ -33349,7 +33957,7 @@ fn native_surefire_properties_wrapper_get_property_1(
     }
     match ctx
         .get_system_property(&key)
-        .or_else(|| bootstrap_property_fallback(&key))
+        .or_else(|| system_property_fallback(ctx, &key))
     {
         Some(v) => Ok(Some(Value::Object(Some(ctx.create_string(&v))))),
         None => Ok(Some(Value::Object(None))),
@@ -33394,7 +34002,7 @@ fn native_surefire_properties_wrapper_get_property_2(
     }
     match ctx
         .get_system_property(&key)
-        .or_else(|| bootstrap_property_fallback(&key))
+        .or_else(|| system_property_fallback(ctx, &key))
     {
         Some(v) => Ok(Some(Value::Object(Some(ctx.create_string(&v))))),
         None => Ok(Some(default)),
@@ -55847,7 +56455,9 @@ pub(crate) fn spawn_runnable_on_real_thread(
         if grace.is_zero() {
             std::thread::yield_now();
         } else {
+            ctx.begin_blocking_region();
             std::thread::sleep(grace);
+            ctx.end_blocking_region();
         }
         return Ok(None);
     }
@@ -58654,6 +59264,57 @@ fn native_file_clinit(ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCal
         "pathSeparatorChar",
         Value::Int(path_separator.chars().next().unwrap_or(':') as i32),
     );
+    // WSCLOSE-08-07: this native override REPLACES the real <clinit>
+    // bytecode wholesale (registered unconditionally below), so the real
+    // FS = DefaultFileSystem.getFileSystem() assignment (JVMS: the FIRST
+    // static assigned, before separatorChar/pathSeparator) never runs and
+    // File.FS was left permanently null. Any real-JDK File method NOT
+    // covered by our check_override allow-list (e.g. isInvalid(),
+    // length(), lastModified(), delete(), mkdir(), list(), ...)
+    // executes real bytecode that dereferences FS directly (e.g.
+    // FS.isInvalid(this)), so every such call NPE'd with "Cannot invoke
+    // ... because \"java.io.File.FS\" is null" -- observed first via
+    // Tomcat's Digester (SAXParserFactory internals stat a File through
+    // a non-overridden path while probing mbeans-descriptors.xml),
+    // cascading into full StandardContext startup failure. Build and
+    // publish a real (non-null) FileSystem instance the same way the
+    // JDK's UnixFileSystem/WinNTFileSystem constructors would, so
+    // FS.isInvalid/getBooleanAttributes/etc. all resolve to our real
+    // native filesystem natives instead of NPEing on a null receiver.
+    let user_dir = ctx
+        .get_system_property("user.dir")
+        .or_else(|| {
+            std::env::current_dir()
+                .ok()
+                .map(|p| p.to_string_lossy().into_owned())
+        })
+        .unwrap_or_else(|| ".".to_string());
+    let user_dir_str = ctx.create_string(&user_dir);
+    #[cfg(windows)]
+    {
+        let fs_obj = alloc_concurrent_synthetic(ctx, "java/io/WinNTFileSystem", 4);
+        ctx.set_field_by_name(
+            fs_obj,
+            "slash",
+            Value::Int(std::path::MAIN_SEPARATOR as i32),
+        );
+        ctx.set_field_by_name(fs_obj, "semicolon", Value::Int(';' as i32));
+        ctx.set_field_by_name(fs_obj, "altSlash", Value::Int('/' as i32));
+        ctx.set_field_by_name(fs_obj, "userDir", Value::Object(Some(user_dir_str)));
+        ctx.set_static_field_by_name("java/io/File", "FS", Value::Object(Some(fs_obj)));
+    }
+    #[cfg(not(windows))]
+    {
+        let fs_obj = alloc_concurrent_synthetic(ctx, "java/io/UnixFileSystem", 3);
+        ctx.set_field_by_name(
+            fs_obj,
+            "slash",
+            Value::Int(std::path::MAIN_SEPARATOR as i32),
+        );
+        ctx.set_field_by_name(fs_obj, "colon", Value::Int(':' as i32));
+        ctx.set_field_by_name(fs_obj, "userDir", Value::Object(Some(user_dir_str)));
+        ctx.set_static_field_by_name("java/io/File", "FS", Value::Object(Some(fs_obj)));
+    }
     Ok(None)
 }
 
@@ -64015,6 +64676,7 @@ fn register_exception_extras_natives(registry: &mut NativeMethodRegistry) {
         "java/lang/ExceptionInInitializerError",
         "java/lang/NoClassDefFoundError",
         "java/lang/LinkageError",
+        "java/lang/VerifyError",
         "java/lang/SecurityException",
         "java/lang/TypeNotPresentException",
         "java/lang/ReflectiveOperationException",
@@ -64573,14 +65235,47 @@ fn native_function_identity_return_arg(
     Ok(Some(args.get(1).copied().unwrap_or(Value::Object(None))))
 }
 
+fn native_arraylist_list_itr_slots(
+    ctx: &dyn NativeContext,
+) -> (usize, usize, Option<usize>, usize, Option<usize>) {
+    let cursor = ctx
+        .resolve_field_index("java/util/ArrayList$Itr", "cursor")
+        .unwrap_or(1);
+    let last_ret = ctx
+        .resolve_field_index("java/util/ArrayList$Itr", "lastRet")
+        .unwrap_or(2);
+    let expected_mod_count = ctx.resolve_field_index("java/util/ArrayList$Itr", "expectedModCount");
+    let parent_list = ctx
+        .resolve_field_index("java/util/ArrayList$Itr", "this$0")
+        .unwrap_or(0);
+    let child_list = ctx
+        .resolve_field_index("java/util/ArrayList$ListItr", "this$0")
+        .filter(|slot| *slot != parent_list);
+    (
+        cursor,
+        last_ret,
+        expected_mod_count,
+        parent_list,
+        child_list,
+    )
+}
+
+fn set_field_if_present(ctx: &mut dyn NativeContext, obj: ObjectRef, slot: usize, value: Value) {
+    if slot < ctx.object_num_fields(obj) {
+        ctx.set_field(obj, slot, value);
+    }
+}
+
+fn native_arraylist_size(ctx: &mut dyn NativeContext, list: ObjectRef) -> i32 {
+    match cratonvm_native_collections::native_al_size(ctx, &[Value::Object(Some(list))]) {
+        Ok(Some(Value::Int(size))) => size.max(0),
+        _ => 0,
+    }
+}
+
 fn native_arraylist_list_iterator(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = obj_arg(args, 0)?;
-    let arr =
-        match cratonvm_native_collections::native_al_to_array(ctx, &[Value::Object(Some(this))])? {
-            Some(Value::Object(Some(arr))) => arr,
-            _ => ctx.new_array(cratonvm_types::ArrayElementType::Reference, 0),
-        };
-    let len = ctx.array_length(arr) as i32;
+    let len = native_arraylist_size(ctx, this);
     let mut cursor = match args.get(1) {
         Some(Value::Int(v)) => *v,
         _ => 0,
@@ -64590,35 +65285,78 @@ fn native_arraylist_list_iterator(ctx: &mut dyn NativeContext, args: &[Value]) -
     } else if cursor > len {
         cursor = len;
     }
-    let itr = alloc_concurrent_synthetic(ctx, "java/util/ArrayList$ListItr", 2);
-    ctx.set_field(itr, 0, Value::Object(Some(arr)));
-    ctx.set_field(itr, 1, Value::Int(cursor));
+
+    let itr = alloc_concurrent_synthetic(ctx, "java/util/ArrayList$ListItr", 5);
+    let (cursor_slot, last_ret_slot, expected_slot, parent_list_slot, child_list_slot) =
+        native_arraylist_list_itr_slots(ctx);
+    set_field_if_present(ctx, itr, parent_list_slot, Value::Object(Some(this)));
+    if let Some(slot) = child_list_slot {
+        set_field_if_present(ctx, itr, slot, Value::Object(Some(this)));
+    }
+    set_field_if_present(ctx, itr, cursor_slot, Value::Int(cursor));
+    set_field_if_present(ctx, itr, last_ret_slot, Value::Int(-1));
+    if let Some(slot) = expected_slot {
+        let mod_count = ctx
+            .get_field_by_name(this, "modCount")
+            .as_int()
+            .unwrap_or(0);
+        set_field_if_present(ctx, itr, slot, Value::Int(mod_count));
+    }
     Ok(Some(Value::Object(Some(itr))))
+}
+
+fn native_arraylist_list_itr_list(
+    ctx: &mut dyn NativeContext,
+    this: ObjectRef,
+) -> Option<ObjectRef> {
+    let (_, _, _, parent_list_slot, child_list_slot) = native_arraylist_list_itr_slots(ctx);
+    if let Some(slot) = child_list_slot {
+        if let Value::Object(Some(list)) = ctx.get_field(this, slot) {
+            return Some(list);
+        }
+    }
+    match ctx.get_field(this, parent_list_slot) {
+        Value::Object(Some(list)) => Some(list),
+        _ => None,
+    }
 }
 
 fn native_snapshot_itr_has_next(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = obj_arg(args, 0)?;
-    let cursor = ctx.get_field(this, 1).as_int().unwrap_or(0).max(0) as usize;
-    let len = match ctx.get_field(this, 0) {
-        Value::Object(Some(arr)) => ctx.array_length(arr),
-        _ => 0,
-    };
-    Ok(Some(Value::Int((cursor < len) as i32)))
+    let (cursor_slot, _, _, _, _) = native_arraylist_list_itr_slots(ctx);
+    let cursor = ctx
+        .get_field(this, cursor_slot)
+        .as_int()
+        .unwrap_or(0)
+        .max(0);
+    let size = native_arraylist_list_itr_list(ctx, this)
+        .map(|list| native_arraylist_size(ctx, list))
+        .unwrap_or(0);
+    Ok(Some(Value::Int((cursor < size) as i32)))
 }
 
 fn native_snapshot_itr_next(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = obj_arg(args, 0)?;
-    let arr = match ctx.get_field(this, 0) {
-        Value::Object(Some(arr)) => arr,
-        _ => return Ok(Some(Value::Object(None))),
+    let (cursor_slot, last_ret_slot, _, _, _) = native_arraylist_list_itr_slots(ctx);
+    let cursor = ctx
+        .get_field(this, cursor_slot)
+        .as_int()
+        .unwrap_or(0)
+        .max(0);
+    let list = match native_arraylist_list_itr_list(ctx, this) {
+        Some(list) => list,
+        None => return Ok(Some(Value::Object(None))),
     };
-    let cursor = ctx.get_field(this, 1).as_int().unwrap_or(0).max(0) as usize;
-    if cursor >= ctx.array_length(arr) {
+    if cursor >= native_arraylist_size(ctx, list) {
         return Ok(Some(Value::Object(None)));
     }
-    let value = ctx.get_array_element(arr, cursor);
-    ctx.set_field(this, 1, Value::Int((cursor + 1) as i32));
-    Ok(Some(value))
+    let value = cratonvm_native_collections::native_al_get(
+        ctx,
+        &[Value::Object(Some(list)), Value::Int(cursor)],
+    )?;
+    ctx.set_field(this, cursor_slot, Value::Int(cursor + 1));
+    ctx.set_field(this, last_ret_slot, Value::Int(cursor));
+    Ok(value)
 }
 
 fn native_snapshot_list_itr_has_previous(
@@ -64626,8 +65364,9 @@ fn native_snapshot_list_itr_has_previous(
     args: &[Value],
 ) -> MethodCallResult {
     let this = obj_arg(args, 0)?;
+    let (cursor_slot, _, _, _, _) = native_arraylist_list_itr_slots(ctx);
     Ok(Some(Value::Int(
-        (ctx.get_field(this, 1).as_int().unwrap_or(0) > 0) as i32,
+        (ctx.get_field(this, cursor_slot).as_int().unwrap_or(0) > 0) as i32,
     )))
 }
 
@@ -64636,17 +65375,23 @@ fn native_snapshot_list_itr_previous(
     args: &[Value],
 ) -> MethodCallResult {
     let this = obj_arg(args, 0)?;
-    let arr = match ctx.get_field(this, 0) {
-        Value::Object(Some(arr)) => arr,
-        _ => return Ok(Some(Value::Object(None))),
-    };
-    let cursor = ctx.get_field(this, 1).as_int().unwrap_or(0);
+    let (cursor_slot, last_ret_slot, _, _, _) = native_arraylist_list_itr_slots(ctx);
+    let cursor = ctx.get_field(this, cursor_slot).as_int().unwrap_or(0);
     if cursor <= 0 {
         return Ok(Some(Value::Object(None)));
     }
+    let list = match native_arraylist_list_itr_list(ctx, this) {
+        Some(list) => list,
+        None => return Ok(Some(Value::Object(None))),
+    };
     let next_cursor = cursor - 1;
-    ctx.set_field(this, 1, Value::Int(next_cursor));
-    Ok(Some(ctx.get_array_element(arr, next_cursor as usize)))
+    let value = cratonvm_native_collections::native_al_get(
+        ctx,
+        &[Value::Object(Some(list)), Value::Int(next_cursor)],
+    )?;
+    ctx.set_field(this, cursor_slot, Value::Int(next_cursor));
+    ctx.set_field(this, last_ret_slot, Value::Int(next_cursor));
+    Ok(value)
 }
 
 fn native_snapshot_list_itr_next_index(
@@ -64654,8 +65399,9 @@ fn native_snapshot_list_itr_next_index(
     args: &[Value],
 ) -> MethodCallResult {
     let this = obj_arg(args, 0)?;
+    let (cursor_slot, _, _, _, _) = native_arraylist_list_itr_slots(ctx);
     Ok(Some(Value::Int(
-        ctx.get_field(this, 1).as_int().unwrap_or(0),
+        ctx.get_field(this, cursor_slot).as_int().unwrap_or(0),
     )))
 }
 
@@ -64664,8 +65410,9 @@ fn native_snapshot_list_itr_previous_index(
     args: &[Value],
 ) -> MethodCallResult {
     let this = obj_arg(args, 0)?;
+    let (cursor_slot, _, _, _, _) = native_arraylist_list_itr_slots(ctx);
     Ok(Some(Value::Int(
-        ctx.get_field(this, 1).as_int().unwrap_or(0) - 1,
+        ctx.get_field(this, cursor_slot).as_int().unwrap_or(0) - 1,
     )))
 }
 
@@ -65124,19 +65871,20 @@ pub(crate) fn native_synchronized_collection(
 fn sync_collection_backing(ctx: &mut dyn NativeContext, this: ObjectRef) -> Option<ObjectRef> {
     match ctx.get_field_by_name(this, "c") {
         Value::Object(Some(c)) => Some(c),
-        _ => match ctx.get_field(this, 0) {
-            Value::Object(Some(c)) => Some(c),
-            _ => None,
-        },
+        _ => None,
     }
 }
 
 fn native_sync_collection_init(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = obj_arg(args, 0)?;
     let backing = args.get(1).copied().unwrap_or(Value::Object(None));
+    let mutex = match args.get(2).copied() {
+        Some(Value::Object(Some(mutex))) => Value::Object(Some(mutex)),
+        _ => Value::Object(Some(this)),
+    };
     ctx.set_field_by_name(this, "c", backing);
     ctx.set_field(this, 0, backing);
-    ctx.set_field_by_name(this, "mutex", Value::Object(Some(this)));
+    ctx.set_field_by_name(this, "mutex", mutex);
     Ok(None)
 }
 
@@ -65217,19 +65965,20 @@ fn native_sync_collection_to_array(
 fn sync_map_backing(ctx: &mut dyn NativeContext, this: ObjectRef) -> Option<ObjectRef> {
     match ctx.get_field_by_name(this, "m") {
         Value::Object(Some(m)) => Some(m),
-        _ => match ctx.get_field(this, 0) {
-            Value::Object(Some(m)) => Some(m),
-            _ => None,
-        },
+        _ => None,
     }
 }
 
 fn native_sync_map_init(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = obj_arg(args, 0)?;
     let backing = args.get(1).copied().unwrap_or(Value::Object(None));
+    let mutex = match args.get(2).copied() {
+        Some(Value::Object(Some(mutex))) => Value::Object(Some(mutex)),
+        _ => Value::Object(Some(this)),
+    };
     ctx.set_field_by_name(this, "m", backing);
     ctx.set_field(this, 0, backing);
-    ctx.set_field_by_name(this, "mutex", Value::Object(Some(this)));
+    ctx.set_field_by_name(this, "mutex", mutex);
     Ok(None)
 }
 
@@ -65382,6 +66131,17 @@ fn register_synchronized_collection_wrapper_natives(registry: &mut NativeMethodR
         ),
     ] {
         registry.register(class, "<init>", ctor_desc, native_sync_collection_init);
+        let two_arg_ctor_desc = if class == "java/util/Collections$SynchronizedSet" {
+            "(Ljava/util/Set;Ljava/lang/Object;)V"
+        } else {
+            "(Ljava/util/Collection;Ljava/lang/Object;)V"
+        };
+        registry.register(
+            class,
+            "<init>",
+            two_arg_ctor_desc,
+            native_sync_collection_init,
+        );
         registry.register(
             class,
             "add",
@@ -65417,6 +66177,12 @@ fn register_synchronized_collection_wrapper_natives(registry: &mut NativeMethodR
     }
     let map = "java/util/Collections$SynchronizedMap";
     registry.register(map, "<init>", "(Ljava/util/Map;)V", native_sync_map_init);
+    registry.register(
+        map,
+        "<init>",
+        "(Ljava/util/Map;Ljava/lang/Object;)V",
+        native_sync_map_init,
+    );
     registry.register(
         map,
         "get",
