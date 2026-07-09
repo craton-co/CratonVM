@@ -21090,8 +21090,8 @@ pub fn register_essential_natives(registry: &mut NativeMethodRegistry) {
         },
     );
 
-    // URL.equals / URL.hashCode — based on the URL string to avoid NPE from
-    // null `handler` in synthetic URL objects, and to ensure correct
+    // URL.equals / URL.sameFile / URL.hashCode — based on the URL string to avoid
+    // NPE from null `handler` in synthetic URL objects, and to ensure correct
     // deduplication when the same resource URL appears from multiple classloaders
     // (e.g. AggregatedClassLoader iterating N loaders all returning the same
     // persistence.xml path — LinkedHashSet<URL> must deduplicate them).
@@ -21102,6 +21102,12 @@ pub fn register_essential_natives(registry: &mut NativeMethodRegistry) {
         native_url_equals,
     );
     registry.register("java/net/URL", "hashCode", "()I", native_url_hash_code);
+    registry.register(
+        "java/net/URL",
+        "sameFile",
+        "(Ljava/net/URL;)Z",
+        native_url_same_file,
+    );
 
     // --- java.lang.Thread (native methods) ---
     registry.register("java/lang/Thread", "registerNatives", "()V", native_noop);
@@ -24521,6 +24527,18 @@ pub fn register_essential_natives(registry: &mut NativeMethodRegistry) {
         "(Ljava/lang/String;)Ljava/io/InputStream;",
         classloader::module_get_resource_as_stream,
     );
+    registry.register(
+        "jdk/internal/loader/BootLoader",
+        "findResourceAsStream",
+        "(Ljava/lang/String;Ljava/lang/String;)Ljava/io/InputStream;",
+        classloader::bootloader_find_resource_as_stream,
+    );
+    registry.register(
+        "jdk/internal/loader/BuiltinClassLoader",
+        "findResourceAsStream",
+        "(Ljava/lang/String;Ljava/lang/String;)Ljava/io/InputStream;",
+        classloader::builtin_classloader_find_resource_as_stream,
+    );
     // URLClassLoader.findResource/findResources — the real bytecode walks
     // URLClassPath, whose essential-mode stubs return null/empty, so a
     // direct findResource() call (or a getResource() override delegating to
@@ -27825,7 +27843,7 @@ pub fn register_synthetic_overrides(registry: &mut NativeMethodRegistry) {
         "java/lang/Throwable",
         "getLocalizedMessage",
         "()Ljava/lang/String;",
-        native_throwable_get_message, // delegates to getMessage
+        native_throwable_get_localized_message,
     );
     registry.register(
         "java/lang/Throwable",
@@ -53279,8 +53297,9 @@ fn native_uri_get_scheme_specific_part(
         _ => String::new(),
     };
     let ssp = if let Some(pos) = full.find(':') {
-        full[pos + 1..].to_string()
+        full[pos + 1..].split('#').next().unwrap_or("").to_string()
     } else {
+        // Preserve the old fallback for scheme-less synthetic URIs.
         full
     };
     Ok(Some(Value::Object(Some(ctx.create_string(&ssp)))))
@@ -53666,6 +53685,12 @@ fn url_external_form(ctx: &mut dyn NativeContext, url: ObjectRef) -> String {
     }
     out
 }
+fn url_same_file_form(ctx: &mut dyn NativeContext, url: ObjectRef) -> String {
+    let mut out = url_external_form(ctx, url);
+    out.truncate(out.find('#').unwrap_or(out.len()));
+    out
+}
+
 fn native_url_equals(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = match args.first() {
         Some(Value::Object(Some(o))) => *o,
@@ -53679,6 +53704,19 @@ fn native_url_equals(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallR
     let b = url_external_form(ctx, other);
     Ok(Some(Value::Int(if a == b { 1 } else { 0 })))
 }
+fn native_url_same_file(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(o))) => *o,
+        _ => return Ok(Some(Value::Int(0))),
+    };
+    let other = match args.get(1) {
+        Some(Value::Object(Some(o))) => *o,
+        _ => return Ok(Some(Value::Int(0))),
+    };
+    let same = url_same_file_form(ctx, this) == url_same_file_form(ctx, other);
+    Ok(Some(Value::Int(if same { 1 } else { 0 })))
+}
+
 fn native_url_hash_code(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = match args.first() {
         Some(Value::Object(Some(o))) => *o,
@@ -53707,7 +53745,8 @@ pub(crate) fn uri_store_named(ctx: &mut dyn NativeContext, this: ObjectRef, full
     ctx.set_field_by_name(this, "string", Value::Object(Some(full_obj)));
     if let Some(colon) = full.find(':') {
         let scheme = &full[..colon];
-        let ssp = &full[colon + 1..];
+        let raw_ssp = &full[colon + 1..];
+        let ssp = raw_ssp.split('#').next().unwrap_or(raw_ssp);
         if !scheme.is_empty() {
             let scheme_obj = ctx.create_string(scheme);
             ctx.set_field_by_name(this, "scheme", Value::Object(Some(scheme_obj)));

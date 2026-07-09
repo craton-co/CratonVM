@@ -9306,6 +9306,8 @@ fn register_map_entry_natives(r: &mut NativeMethodRegistry) {
         "(Ljava/lang/Object;)Ljava/lang/Object;",
         native_entry_set_value,
     );
+    r.register(c, "hashCode", "()I", native_entry_hash_code);
+    r.register(c, "equals", "(Ljava/lang/Object;)Z", native_entry_equals);
     r.set_category(__prev_cat);
 }
 
@@ -9388,6 +9390,57 @@ fn native_entry_set_value(ctx: &mut dyn NativeContext, args: &[Value]) -> Method
         }
     }
     Ok(Some(old_val))
+}
+
+fn native_entry_hash_code(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(obj))) => *obj,
+        _ => return Ok(Some(Value::Int(0))),
+    };
+    let key = ctx
+        .invoke_virtual(this, "getKey", "()Ljava/lang/Object;", &[])?
+        .unwrap_or(Value::Object(None));
+    let value = ctx
+        .invoke_virtual(this, "getValue", "()Ljava/lang/Object;", &[])?
+        .unwrap_or(Value::Object(None));
+    Ok(Some(Value::Int(
+        element_hash_code(ctx, &key) ^ element_hash_code(ctx, &value),
+    )))
+}
+
+fn native_entry_equals(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(obj))) => *obj,
+        _ => return Ok(Some(Value::Int(0))),
+    };
+    let other = match args.get(1) {
+        Some(Value::Object(Some(obj))) => *obj,
+        _ => return Ok(Some(Value::Int(0))),
+    };
+    if std::ptr::eq(this.as_ptr(), other.as_ptr()) {
+        return Ok(Some(Value::Int(1)));
+    }
+    if !obj_is_instance_of(ctx, other, "java/util/Map$Entry") {
+        return Ok(Some(Value::Int(0)));
+    }
+
+    let this_key = ctx
+        .invoke_virtual(this, "getKey", "()Ljava/lang/Object;", &[])?
+        .unwrap_or(Value::Object(None));
+    let this_value = ctx
+        .invoke_virtual(this, "getValue", "()Ljava/lang/Object;", &[])?
+        .unwrap_or(Value::Object(None));
+    let other_key = ctx
+        .invoke_virtual(other, "getKey", "()Ljava/lang/Object;", &[])?
+        .unwrap_or(Value::Object(None));
+    if !values_equal_deep(ctx, &this_key, &other_key)? {
+        return Ok(Some(Value::Int(0)));
+    }
+    let other_value = ctx
+        .invoke_virtual(other, "getValue", "()Ljava/lang/Object;", &[])?
+        .unwrap_or(Value::Object(None));
+    let eq = values_equal_deep(ctx, &this_value, &other_value)?;
+    Ok(Some(Value::Int(if eq { 1 } else { 0 })))
 }
 
 /// True when `this`'s runtime class is `java/util/Hashtable` or a subclass
@@ -10546,44 +10599,6 @@ struct LazyOp {
     aux: i64,
 }
 
-
-fn pin_lazy_chain_lambdas(
-    ctx: &mut dyn NativeContext,
-    chain: &[LazyOp],
-) -> (Vec<Option<usize>>, usize) {
-    let mut base = usize::MAX;
-    let mut pins = Vec::with_capacity(chain.len());
-    for op in chain {
-        if let Some(lambda) = op.lambda {
-            let h = ctx.pin_native_root(lambda);
-            if base == usize::MAX {
-                base = h;
-            }
-            pins.push(Some(h));
-        } else {
-            pins.push(None);
-        }
-    }
-    (pins, base)
-}
-
-fn read_lazy_lambda(
-    ctx: &mut dyn NativeContext,
-    op: &LazyOp,
-    pin: Option<usize>,
-) -> Option<ObjectRef> {
-    match (op.lambda, pin) {
-        (Some(lambda), Some(handle)) => Some(ctx.read_native_pin(handle, lambda)),
-        (Some(lambda), None) => Some(lambda),
-        _ => None,
-    }
-}
-
-fn unpin_lazy_chain_lambdas(ctx: &mut dyn NativeContext, base: usize) {
-    if base != usize::MAX {
-        ctx.unpin_native_roots(base);
-    }
-}
 
 /// `true` if `this` is a synthetic stream that currently carries a non-empty
 /// deferred op-chain (slot 3). Cheap guard used by terminals to pick the lazy path.
@@ -17004,6 +17019,18 @@ fn register_interface_natives(registry: &mut NativeMethodRegistry) {
         "(Ljava/lang/Object;)Ljava/lang/Object;",
         native_entry_set_value,
     );
+    registry.register(
+        "java/util/Map$Entry",
+        "hashCode",
+        "()I",
+        native_entry_hash_code,
+    );
+    registry.register(
+        "java/util/Map$Entry",
+        "equals",
+        "(Ljava/lang/Object;)Z",
+        native_entry_equals,
+    );
     // Also register under AbstractMap$SimpleEntry for completeness
     registry.register(
         "java/util/AbstractMap$SimpleEntry",
@@ -17022,6 +17049,18 @@ fn register_interface_natives(registry: &mut NativeMethodRegistry) {
         "setValue",
         "(Ljava/lang/Object;)Ljava/lang/Object;",
         native_entry_set_value,
+    );
+    registry.register(
+        "java/util/AbstractMap$SimpleEntry",
+        "hashCode",
+        "()I",
+        native_entry_hash_code,
+    );
+    registry.register(
+        "java/util/AbstractMap$SimpleEntry",
+        "equals",
+        "(Ljava/lang/Object;)Z",
+        native_entry_equals,
     );
     registry.set_category(__prev_cat);
 }
@@ -29749,12 +29788,59 @@ fn native_chm_key_set_view(ctx: &mut dyn NativeContext, args: &[Value]) -> Metho
     native_chm_key_set(ctx, args)
 }
 
+fn make_snapshot_enumeration(ctx: &mut dyn NativeContext, elems: &[Value]) -> ObjectRef {
+    let (elem_base, elem_handles) = pin_value_slice(ctx, elems);
+    let arr = alloc_ref_array(ctx, elems.len());
+    let arr_pin = ctx.pin_native_root(arr);
+    for (i, val) in elems.iter().enumerate() {
+        let arr = ctx.read_native_pin(arr_pin, arr);
+        let val = read_pinned_elem(ctx, elem_handles[i], *val);
+        ctx.set_array_element(arr, i, val);
+    }
+    let en = alloc_synthetic(ctx, "cratonvm/internal/SnapshotEnumeration", 2);
+    let en_pin = ctx.pin_native_root(en);
+    let arr = ctx.read_native_pin(arr_pin, arr);
+    let en = ctx.read_native_pin(en_pin, en);
+    ctx.set_field(en, 0, Value::Object(Some(arr)));
+    ctx.set_field(en, 1, Value::Int(0));
+    ctx.unpin_native_roots(if elem_base == usize::MAX {
+        arr_pin
+    } else {
+        elem_base
+    });
+    en
+}
+
 fn native_chm_elements(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    native_chm_values(ctx, args)
+    let this = match args.first() {
+        Some(Value::Object(Some(o))) => *o,
+        _ => {
+            return Ok(Some(Value::Object(Some(make_snapshot_enumeration(
+                ctx,
+                &[],
+            )))))
+        }
+    };
+    let vals = chm_collect_all_values(ctx, this);
+    Ok(Some(Value::Object(Some(make_snapshot_enumeration(
+        ctx, &vals,
+    )))))
 }
 
 fn native_chm_keys(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    native_chm_key_set(ctx, args)
+    let this = match args.first() {
+        Some(Value::Object(Some(o))) => *o,
+        _ => {
+            return Ok(Some(Value::Object(Some(make_snapshot_enumeration(
+                ctx,
+                &[],
+            )))))
+        }
+    };
+    let keys = chm_collect_all_keys(ctx, this);
+    Ok(Some(Value::Object(Some(make_snapshot_enumeration(
+        ctx, &keys,
+    )))))
 }
 
 // ===========================================================================
