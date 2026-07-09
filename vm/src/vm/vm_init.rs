@@ -4762,6 +4762,42 @@ pub struct Vm {
 }
 
 impl Vm {
+    /// Mark the primordial launcher thread as parked outside Java bytecode.
+    ///
+    /// After `main()` returns the CLI may still wait for non-daemon Java
+    /// threads. That wait runs in Rust, so the main thread will not reach an
+    /// interpreter safepoint; publish its roots/frame trace and enter the same
+    /// blocked-region protocol native waits use.
+    pub fn begin_main_thread_blocking_region(&mut self, state: &'static str) {
+        self.main_thread.set_vm_state(state);
+        self.main_thread.tlab.retire();
+        {
+            let ctx = crate::vm::vm_exec::NativeContextImpl {
+                shared: &self.shared,
+                thread: &mut self.main_thread,
+            };
+            ctx.deposit_root_snapshot();
+        }
+        if self.shared.gc_barrier.mark_blocked_region_enter() {
+            let _ = self
+                .shared
+                .gc_barrier
+                .arrive_and_wait(self.main_thread.thread_id);
+        }
+    }
+
+    /// Leave a region opened by [`Self::begin_main_thread_blocking_region`].
+    pub fn end_main_thread_blocking_region(&mut self) {
+        self.shared.gc_barrier.mark_blocked_region_leave();
+        let mut ctx = crate::vm::vm_exec::NativeContextImpl {
+            shared: &self.shared,
+            thread: &mut self.main_thread,
+        };
+        ctx.check_post_block_gc();
+        self.main_thread
+            .set_vm_state("vm-main:blocking-region-returned");
+    }
+
     /// Create a new VM with the given configuration.
     pub fn new(config: VmConfig) -> Self {
         let shared = Arc::new(SharedVm::new(config));
@@ -4827,6 +4863,14 @@ impl Vm {
         shared
             .thread_registry
             .set_root_snapshot(ThreadId(0), main_thread.root_snapshot.clone());
+        // Match spawned threads: the watchdog summary and cross-thread stack
+        // probes must see the primordial thread's parked Java frames too.
+        shared
+            .thread_registry
+            .set_frame_trace(ThreadId(0), main_thread.frame_trace.clone());
+        shared
+            .thread_registry
+            .set_vm_state(ThreadId(0), main_thread.vm_state.clone());
         // Share blocked-region GC state so initiators can maintain the main
         // thread's roots while it parks in a blocking native (wait/join/park)
         shared

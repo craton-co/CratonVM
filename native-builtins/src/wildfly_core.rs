@@ -111,6 +111,34 @@ impl std::hash::Hash for AttachmentKeyIdentity {
     }
 }
 
+fn native_path_address_from_elements(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    let arr = obj_arg(args, 0)?;
+    let list = match ctx.new_object_initialized("java/util/ArrayList", "()V", &[])? {
+        Some(Value::Object(Some(list))) => list,
+        _ => alloc_concurrent_synthetic(ctx, "java/util/ArrayList", 2),
+    };
+    for i in 0..ctx.array_length(arr) {
+        let elem = ctx.get_array_element(arr, i);
+        ctx.invoke_virtual(list, "add", "(Ljava/lang/Object;)Z", &[elem])?;
+    }
+    match ctx.invoke(
+        "org/jboss/as/controller/PathAddress",
+        "pathAddress",
+        "(Ljava/util/List;)Lorg/jboss/as/controller/PathAddress;",
+        &[Value::Object(Some(list))],
+    ) {
+        Ok(Some(v @ Value::Object(Some(_)))) => Ok(Some(v)),
+        _ => ctx.new_object_initialized(
+            "org/jboss/as/controller/PathAddress",
+            "(Ljava/util/List;)V",
+            &[Value::Object(Some(list))],
+        ),
+    }
+}
+
 /// One deployment in flight.  `name` is the archive name as the WildFly
 /// server sees it (`keycloak-server.war`, etc.).  The service name
 /// derived from it follows the WildFly convention
@@ -551,6 +579,51 @@ fn panic_payload_to_string(payload: &(dyn std::any::Any + Send)) -> String {
     } else {
         "task panicked (unknown payload)".to_string()
     }
+}
+
+/// `JBossThread.run()` is mostly a logging/exit-handler wrapper around
+/// `super.run()`.  In CratonVM's current real-JDK layout, the Runnable target
+/// is reliably stored in `Thread$FieldHolder.task`, while the JDK bytecode
+/// reached by JBossThread's `invokespecial Thread.run()` can still read a
+/// layout-variant direct `Thread.target` slot and silently return.  Bridge the
+/// core behavior by invoking the resolved Runnable directly.
+fn native_jboss_thread_run(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = obj_arg(args, 0)?;
+    let mut target = ctx.get_field_by_name(this, "target");
+    if matches!(target, Value::Object(None)) {
+        if let Value::Object(Some(holder)) = ctx.get_field_by_name(this, "holder") {
+            target = ctx.get_field_by_name(holder, "task");
+        }
+    }
+    if matches!(target, Value::Object(None)) && ctx.object_num_fields(this) >= 4 {
+        target = ctx.get_field(this, 3);
+    }
+    if let Value::Object(Some(runnable)) = target {
+        ctx.invoke_virtual(runnable, "run", "()V", &[])?;
+    }
+    Ok(None)
+}
+
+fn native_jboss_thread_factory_new_thread(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    let runnable = args.get(1).copied().unwrap_or(Value::Object(None));
+    if let Some(Value::Object(Some(thread))) = ctx.new_object_initialized(
+        "org/jboss/threads/JBossThread",
+        "(Ljava/lang/Runnable;)V",
+        &[runnable],
+    )? {
+        return Ok(Some(Value::Object(Some(thread))));
+    }
+
+    let thread = alloc_concurrent_synthetic(ctx, "org/jboss/threads/JBossThread", 5);
+    let name = ctx.create_string("jboss-thread");
+    ctx.set_field(thread, 0, Value::Object(Some(name)));
+    ctx.set_field(thread, 1, Value::Int(5));
+    ctx.set_field(thread, 3, runnable);
+    ctx.set_field(thread, 4, Value::Int(0));
+    Ok(Some(Value::Object(Some(thread))))
 }
 
 /// `JBossExecutors.protectedCallable(Callable)` — wraps a callable so
@@ -1632,6 +1705,43 @@ fn native_async_future_task_await(ctx: &mut dyn NativeContext, args: &[Value]) -
 
 /// Register all WildFly Core kernel natives with the method registry.
 pub fn register_wildfly_core_natives(r: &mut NativeMethodRegistry) {
+    r.register(
+        "org/jboss/as/controller/PathAddress",
+        "pathAddress",
+        "([Lorg/jboss/as/controller/PathElement;)Lorg/jboss/as/controller/PathAddress;",
+        native_path_address_from_elements,
+    );
+    r.register(
+        "org/jboss/threads/JBossThread",
+        "run",
+        "()V",
+        native_jboss_thread_run,
+    );
+    r.register(
+        "org/jboss/threads/JBossThread",
+        "dispatchUncaughtException",
+        "(Ljava/lang/Throwable;)V",
+        |_ctx, _args| Ok(None),
+    );
+    r.register(
+        "org/jboss/threads/JBossThread",
+        "onExit",
+        "(Ljava/lang/Runnable;)Z",
+        |_ctx, _args| Ok(Some(Value::Int(0))),
+    );
+    r.register(
+        "org/jboss/threads/JBossThreadFactory",
+        "newThread",
+        "(Ljava/lang/Runnable;)Ljava/lang/Thread;",
+        native_jboss_thread_factory_new_thread,
+    );
+    r.register(
+        "org/jboss/threads/JBossThreadFactory",
+        "access$100",
+        "(Lorg/jboss/threads/JBossThreadFactory;Ljava/lang/Runnable;)Ljava/lang/Thread;",
+        native_jboss_thread_factory_new_thread,
+    );
+
     // --- DIAGNOSTIC (CRATONVM_DBG_CAPVAL): trace the two inputs of
     // OperationContextImpl.validateCapabilities' `tolerant` flag
     // (`getRunningMode() == ADMIN_ONLY && (capabilitiesAlreadyBroken ||

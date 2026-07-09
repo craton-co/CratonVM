@@ -611,6 +611,40 @@ fn register_security_manager(r: &mut NativeMethodRegistry) {
         Ok(None)
     });
 
+    // getRootGroup()Ljava/lang/ThreadGroup;
+    //
+    // JBoss Modules asks the SecurityManager for the root thread group during
+    // Host Controller bootstrap. Real-JDK bytecode walks ThreadGroup parents
+    // through the current Thread mirror, which is exactly the pre-bootstrap
+    // layout window where CratonVM may still have only a synthetic thread
+    // holder. Return a minimal "system" group directly so callers get a real
+    // ThreadGroup object without depending on that fragile walk.
+    r.register(
+        sm,
+        "getRootGroup",
+        "()Ljava/lang/ThreadGroup;",
+        |ctx, _args| {
+            let group = alloc_concurrent_synthetic(ctx, "java/lang/ThreadGroup", 4);
+            let pin_base = ctx.pin_native_root(group);
+            let name = ctx.create_string("system");
+            let group = ctx.read_native_pin(pin_base, group);
+            let name = Value::Object(Some(name));
+
+            ctx.set_field_by_name(group, "name", name.clone());
+            ctx.set_field_by_name(group, "parent", Value::Object(None));
+            ctx.set_field_by_name(group, "destroyed", Value::Int(0));
+            ctx.set_field_by_name(group, "maxPriority", Value::Int(10));
+            if ctx.object_num_fields(group) >= 4 {
+                ctx.set_field(group, 0, name);
+                ctx.set_field(group, 1, Value::Object(None));
+                ctx.set_field(group, 2, Value::Int(0));
+                ctx.set_field(group, 3, Value::Int(10));
+            }
+            ctx.unpin_native_roots(pin_base);
+            Ok(Some(Value::Object(Some(group))))
+        },
+    );
+
     // checkPermission(Permission)V
     r.register(
         sm,

@@ -401,7 +401,7 @@ fn native_output_stream_write_all(ctx: &mut dyn NativeContext, args: &[Value]) -
         _ => return Ok(None),
     };
     let len = ctx.array_length(arr) as i32;
-    let _ = ctx.invoke_virtual(
+    let res = ctx.invoke_virtual(
         this,
         "write",
         "([BII)V",
@@ -18877,6 +18877,7 @@ pub fn register_essential_natives(registry: &mut NativeMethodRegistry) {
         "java/lang/SecurityException",
         "java/lang/NoSuchMethodError",
         "java/lang/NoSuchFieldError",
+        "java/lang/VerifyError",
     ] {
         let cls_static: &'static str = Box::leak(cls.to_string().into_boxed_str());
         registry.register(
@@ -19208,6 +19209,13 @@ pub fn register_essential_natives(registry: &mut NativeMethodRegistry) {
                 Ok(None)
             },
         );
+        registry.register("java/io/InputStreamReader", "close", "()V", |ctx, args| {
+            let this = obj_arg(args, 0)?;
+            if let Value::Object(Some(sd)) = ctx.get_field_by_name(this, "sd") {
+                let _ = ctx.invoke_virtual(sd, "close", "()V", &[])?;
+            }
+            Ok(None)
+        });
         registry.register(
             "java/io/InputStreamReader",
             "read",
@@ -19819,6 +19827,51 @@ pub fn register_essential_natives(registry: &mut NativeMethodRegistry) {
     // Base64.getEncoder() while running under JBoss Modules; expose the existing
     // Base64 intrinsics in essentials instead of waiting for the full phase table.
     register_base64_natives(registry);
+    registry.register(
+        "java/lang/Integer",
+        "valueOf",
+        "(Ljava/lang/String;)Ljava/lang/Integer;",
+        |ctx, args| match crate::lang_math::native_integer_parse_int(ctx, args)? {
+            Some(Value::Int(v)) => crate::lang_math::native_integer_value_of(ctx, &[Value::Int(v)]),
+            _ => crate::lang_math::native_integer_value_of(ctx, &[Value::Int(0)]),
+        },
+    );
+    registry.register("java/util/Arrays", "equals", "([B[B)Z", |ctx, args| {
+        let a_ref = match args.first() {
+            Some(Value::Object(o)) => *o,
+            _ => None,
+        };
+        let b_ref = match args.get(1) {
+            Some(Value::Object(o)) => *o,
+            _ => None,
+        };
+        if a_ref == b_ref {
+            return Ok(Some(Value::Int(1)));
+        }
+        let (Some(a), Some(b)) = (a_ref, b_ref) else {
+            return Ok(Some(Value::Int(0)));
+        };
+        let len = ctx.array_length(a);
+        if len != ctx.array_length(b) {
+            return Ok(Some(Value::Int(0)));
+        }
+        for i in 0..len {
+            let av = match ctx.get_array_element(a, i) {
+                Value::Int(v) => v as i8,
+                Value::Long(v) => v as i8,
+                _ => 0,
+            };
+            let bv = match ctx.get_array_element(b, i) {
+                Value::Int(v) => v as i8,
+                Value::Long(v) => v as i8,
+                _ => 0,
+            };
+            if av != bv {
+                return Ok(Some(Value::Int(0)));
+            }
+        }
+        Ok(Some(Value::Int(1)))
+    });
     registry.register("java/util/Arrays", "hashCode", "([B)I", |ctx, args| {
         let arr = match args.first() {
             Some(Value::Object(Some(a))) => *a,
@@ -19864,6 +19917,21 @@ pub fn register_essential_natives(registry: &mut NativeMethodRegistry) {
         "write",
         "([B)V",
         native_output_stream_write_all,
+    );
+    registry.register(
+        "java/io/FilterInputStream",
+        "<init>",
+        "(Ljava/io/InputStream;)V",
+        |ctx, args| {
+            let this = match args.first() {
+                Some(Value::Object(Some(o))) => *o,
+                _ => return Ok(None),
+            };
+            let input = args.get(1).copied().unwrap_or(Value::Object(None));
+            ctx.set_field_by_name(this, "in", input);
+            ctx.set_field(this, 0, input);
+            Ok(None)
+        },
     );
     registry.register(
         "java/io/FilterOutputStream",
@@ -20154,6 +20222,8 @@ pub fn register_essential_natives(registry: &mut NativeMethodRegistry) {
     // Domain process-controller also constructs its read executor before the
     // normal concurrent phase; register the Executors factory bridge early.
     register_executor_natives(registry);
+    crate::phases_early::register_scheduled_executor_natives(registry);
+    crate::phases_early::register_qname_natives(registry);
 
     // WP1.9: StackStreamFactory.AbstractStackWalker.{callStackWalk,
     // fetchStackFrames} + StackFrameInfo accessors (getByteCodeIndex,
@@ -20420,6 +20490,7 @@ pub fn register_essential_natives(registry: &mut NativeMethodRegistry) {
         "()V",
         native_object_notify_all,
     );
+    registry.register("java/lang/Object", "wait", "()V", native_object_wait);
     // BUG FIX: `wait(J)` / `wait0(J)` must honor the millisecond timeout.
     // These were wired to `native_object_wait` (which passes `None` = wait
     // forever), so `Object.wait(100)` blocked indefinitely with no notify —
@@ -23696,11 +23767,22 @@ pub fn register_essential_natives(registry: &mut NativeMethodRegistry) {
         // for the bootstrap main-thread holder construction. See
         // docs/known-issues/gc-blocked-thread-frame-stale-thread-mirror.md.
         let pin_base = ctx.pin_native_root(this);
+        let target_handle = match target {
+            Value::Object(Some(o)) => Some((ctx.pin_native_root(o), o)),
+            _ => None,
+        };
         ctx.set_field_by_name(this, "name", name);
         // JDK 17 keeps the Runnable directly on Thread.target and has no
         // Thread$FieldHolder. Seed the direct field before attempting the newer
         // holder layout so app-created threads still run on that JDK shape.
         ctx.set_field_by_name(this, "target", target);
+        // On some real subclass mirrors, name-based lookup from the concrete
+        // receiver can miss legacy fields declared by java.lang.Thread. Seed
+        // the resolved Thread slot explicitly so bytecode `Thread.run()` bodies
+        // that read `this.target` observe the Runnable.
+        if let Some(target_slot) = ctx.resolve_field_index("java/lang/Thread", "target") {
+            ctx.set_field(this, target_slot, target);
+        }
         // Don't clobber an already-populated holder (e.g. if the real
         // Java constructor somehow ran first, or a re-entrant call).
         if let Value::Object(Some(_)) = ctx.get_field_by_name(this, "holder") {
@@ -23751,6 +23833,14 @@ pub fn register_essential_natives(registry: &mut NativeMethodRegistry) {
         // relocated either (or both) of them.
         let holder = ctx.read_native_pin(holder_handle, holder);
         let this = ctx.read_native_pin(pin_base, this);
+        let target = match target_handle {
+            Some((handle, old)) => Value::Object(Some(ctx.read_native_pin(handle, old))),
+            None => target,
+        };
+        ctx.set_field_by_name(this, "target", target);
+        if let Some(target_slot) = ctx.resolve_field_index("java/lang/Thread", "target") {
+            ctx.set_field(this, target_slot, target);
+        }
         if !ctor_ok {
             // Constructor unavailable — populate the known fields directly
             // so the holder is still usable by getPriority/isDaemon/getState.
@@ -23762,6 +23852,16 @@ pub fn register_essential_natives(registry: &mut NativeMethodRegistry) {
             ctx.set_field_by_name(holder, "threadStatus", Value::Int(0));
         }
         ctx.set_field_by_name(this, "holder", Value::Object(Some(holder)));
+        if let Some(holder_slot) = ctx.resolve_field_index("java/lang/Thread", "holder") {
+            ctx.set_field(this, holder_slot, Value::Object(Some(holder)));
+        }
+        if matches!(ctx.get_field_by_name(this, "target"), Value::Object(None))
+            && matches!(ctx.get_field_by_name(this, "holder"), Value::Object(None))
+            && ctx.object_num_fields(this) >= 4
+        {
+            ctx.set_field(this, 2, group);
+            ctx.set_field(this, 3, target);
+        }
         ctx.unpin_native_roots(pin_base);
     }
     registry.register(
@@ -31037,6 +31137,7 @@ pub fn register_synthetic_overrides(registry: &mut NativeMethodRegistry) {
         "java/lang/RuntimeException",
         "java/lang/Error",
         "java/lang/LinkageError",
+        "java/lang/VerifyError",
         "java/lang/NoClassDefFoundError",
         "java/lang/NullPointerException",
         "java/lang/ArithmeticException",
@@ -31438,15 +31539,276 @@ pub fn register_synthetic_overrides(registry: &mut NativeMethodRegistry) {
         "()Ljava/lang/Thread$State;",
         thread_state_runnable,
     );
-    // Thread.run() — delegates to target Runnable stored in field 3 (if present)
+    // Thread constructors/run: keep the final essential-native registrations
+    // aligned with the real-JDK holder-backed layout. Earlier registrations in
+    // this file already do this, but this later essential block used to
+    // re-register synthetic slot-3-only variants; last-write-wins made
+    // Thread subclasses such as JBossThread start and immediately return
+    // without ever invoking their Runnable target.
+    registry.register("java/lang/Thread", "<init>", "()V", |ctx, args| {
+        let this = match args.first() {
+            Some(Value::Object(Some(o))) => *o,
+            _ => return Ok(None),
+        };
+        let name = Value::Object(Some(ctx.create_string("Thread")));
+        if is_synthetic_thread_layout(ctx.object_num_fields(this)) {
+            ctx.set_field(this, 0, name);
+            ctx.set_field(this, 1, Value::Int(5));
+        } else {
+            populate_real_thread_holder(ctx, this, Value::Object(None), Value::Object(None), name);
+        }
+        Ok(None)
+    });
+    registry.register(
+        "java/lang/Thread",
+        "<init>",
+        "(Ljava/lang/String;)V",
+        |ctx, args| {
+            let this = match args.first() {
+                Some(Value::Object(Some(o))) => *o,
+                _ => return Ok(None),
+            };
+            let name = match args.get(1).copied().unwrap_or(Value::Object(None)) {
+                Value::Object(Some(s)) => Value::Object(Some(s)),
+                _ => Value::Object(Some(ctx.create_string("Thread"))),
+            };
+            if is_synthetic_thread_layout(ctx.object_num_fields(this)) {
+                ctx.set_field(this, 0, name);
+                ctx.set_field(this, 1, Value::Int(5));
+            } else {
+                populate_real_thread_holder(
+                    ctx,
+                    this,
+                    Value::Object(None),
+                    Value::Object(None),
+                    name,
+                );
+            }
+            Ok(None)
+        },
+    );
+    registry.register(
+        "java/lang/Thread",
+        "<init>",
+        "(Ljava/lang/Runnable;)V",
+        |ctx, args| {
+            let this = match args.first() {
+                Some(Value::Object(Some(o))) => *o,
+                _ => return Ok(None),
+            };
+            let target = args.get(1).copied().unwrap_or(Value::Object(None));
+            let name = Value::Object(Some(ctx.create_string("Thread")));
+            if is_synthetic_thread_layout(ctx.object_num_fields(this)) {
+                ctx.set_field(this, 0, name);
+                ctx.set_field(this, 1, Value::Int(5));
+                ctx.set_field(this, 3, target);
+            } else {
+                populate_real_thread_holder(ctx, this, Value::Object(None), target, name);
+            }
+            Ok(None)
+        },
+    );
+    registry.register(
+        "java/lang/Thread",
+        "<init>",
+        "(Ljava/lang/Runnable;Ljava/lang/String;)V",
+        |ctx, args| {
+            let this = match args.first() {
+                Some(Value::Object(Some(o))) => *o,
+                _ => return Ok(None),
+            };
+            let target = args.get(1).copied().unwrap_or(Value::Object(None));
+            let name = match args.get(2).copied().unwrap_or(Value::Object(None)) {
+                Value::Object(Some(s)) => Value::Object(Some(s)),
+                _ => Value::Object(Some(ctx.create_string("Thread"))),
+            };
+            if is_synthetic_thread_layout(ctx.object_num_fields(this)) {
+                ctx.set_field(this, 0, name);
+                ctx.set_field(this, 1, Value::Int(5));
+                ctx.set_field(this, 3, target);
+            } else {
+                populate_real_thread_holder(ctx, this, Value::Object(None), target, name);
+            }
+            Ok(None)
+        },
+    );
+    registry.register(
+        "java/lang/Thread",
+        "<init>",
+        "(Ljava/lang/ThreadGroup;Ljava/lang/Runnable;)V",
+        |ctx, args| {
+            let this = match args.first() {
+                Some(Value::Object(Some(o))) => *o,
+                _ => return Ok(None),
+            };
+            let group = args.get(1).copied().unwrap_or(Value::Object(None));
+            let target = args.get(2).copied().unwrap_or(Value::Object(None));
+            let name = Value::Object(Some(ctx.create_string("Thread")));
+            if is_synthetic_thread_layout(ctx.object_num_fields(this)) {
+                ctx.set_field(this, 0, name);
+                ctx.set_field(this, 1, Value::Int(5));
+                ctx.set_field(this, 2, group);
+                ctx.set_field(this, 3, target);
+            } else {
+                populate_real_thread_holder(ctx, this, group, target, name);
+            }
+            Ok(None)
+        },
+    );
+    registry.register(
+        "java/lang/Thread",
+        "<init>",
+        "(Ljava/lang/ThreadGroup;Ljava/lang/String;)V",
+        |ctx, args| {
+            let this = match args.first() {
+                Some(Value::Object(Some(o))) => *o,
+                _ => return Ok(None),
+            };
+            let group = args.get(1).copied().unwrap_or(Value::Object(None));
+            let name = match args.get(2).copied().unwrap_or(Value::Object(None)) {
+                Value::Object(Some(s)) => Value::Object(Some(s)),
+                _ => Value::Object(Some(ctx.create_string("Thread"))),
+            };
+            if is_synthetic_thread_layout(ctx.object_num_fields(this)) {
+                ctx.set_field(this, 0, name);
+                ctx.set_field(this, 1, Value::Int(5));
+                ctx.set_field(this, 2, group);
+            } else {
+                populate_real_thread_holder(ctx, this, group, Value::Object(None), name);
+            }
+            Ok(None)
+        },
+    );
+    registry.register(
+        "java/lang/Thread",
+        "<init>",
+        "(Ljava/lang/ThreadGroup;Ljava/lang/Runnable;Ljava/lang/String;)V",
+        |ctx, args| {
+            let this = match args.first() {
+                Some(Value::Object(Some(o))) => *o,
+                _ => return Ok(None),
+            };
+            let group = args.get(1).copied().unwrap_or(Value::Object(None));
+            let target = args.get(2).copied().unwrap_or(Value::Object(None));
+            let name = match args.get(3).copied().unwrap_or(Value::Object(None)) {
+                Value::Object(Some(s)) => Value::Object(Some(s)),
+                _ => Value::Object(Some(ctx.create_string("Thread"))),
+            };
+            if is_synthetic_thread_layout(ctx.object_num_fields(this)) {
+                ctx.set_field(this, 0, name);
+                ctx.set_field(this, 1, Value::Int(5));
+                ctx.set_field(this, 2, group);
+                ctx.set_field(this, 3, target);
+            } else {
+                populate_real_thread_holder(ctx, this, group, target, name);
+            }
+            Ok(None)
+        },
+    );
+    registry.register(
+        "java/lang/Thread",
+        "<init>",
+        "(Ljava/lang/ThreadGroup;Ljava/lang/Runnable;Ljava/lang/String;J)V",
+        |ctx, args| {
+            let this = match args.first() {
+                Some(Value::Object(Some(o))) => *o,
+                _ => return Ok(None),
+            };
+            let group = args.get(1).copied().unwrap_or(Value::Object(None));
+            let target = args.get(2).copied().unwrap_or(Value::Object(None));
+            let name = match args.get(3).copied().unwrap_or(Value::Object(None)) {
+                Value::Object(Some(s)) => Value::Object(Some(s)),
+                _ => Value::Object(Some(ctx.create_string("Thread"))),
+            };
+            if is_synthetic_thread_layout(ctx.object_num_fields(this)) {
+                ctx.set_field(this, 0, name);
+                ctx.set_field(this, 1, Value::Int(5));
+                ctx.set_field(this, 2, group);
+                ctx.set_field(this, 3, target);
+            } else {
+                populate_real_thread_holder(ctx, this, group, target, name);
+            }
+            Ok(None)
+        },
+    );
+    registry.register(
+        "java/lang/Thread",
+        "<init>",
+        "(Ljava/lang/ThreadGroup;Ljava/lang/Runnable;Ljava/lang/String;JZ)V",
+        |ctx, args| {
+            let this = match args.first() {
+                Some(Value::Object(Some(o))) => *o,
+                _ => return Ok(None),
+            };
+            let group = args.get(1).copied().unwrap_or(Value::Object(None));
+            let target = args.get(2).copied().unwrap_or(Value::Object(None));
+            let name = match args.get(3).copied().unwrap_or(Value::Object(None)) {
+                Value::Object(Some(s)) => Value::Object(Some(s)),
+                _ => Value::Object(Some(ctx.create_string("Thread"))),
+            };
+            if is_synthetic_thread_layout(ctx.object_num_fields(this)) {
+                ctx.set_field(this, 0, name);
+                ctx.set_field(this, 1, Value::Int(5));
+                ctx.set_field(this, 2, group);
+                ctx.set_field(this, 3, target);
+            } else {
+                populate_real_thread_holder(ctx, this, group, target, name);
+            }
+            Ok(None)
+        },
+    );
+    registry.register(
+        "java/lang/Thread",
+        "<init>",
+        "(Ljava/lang/ThreadGroup;Ljava/lang/String;ILjava/lang/Runnable;J)V",
+        |ctx, args| {
+            let this = match args.first() {
+                Some(Value::Object(Some(o))) => *o,
+                _ => return Ok(None),
+            };
+            let group = args.get(1).copied().unwrap_or(Value::Object(None));
+            let name = match args.get(2).copied().unwrap_or(Value::Object(None)) {
+                Value::Object(Some(s)) => Value::Object(Some(s)),
+                _ => Value::Object(Some(ctx.create_string("Thread"))),
+            };
+            let prio = match args.get(3) {
+                Some(Value::Int(p)) => *p,
+                _ => 5,
+            };
+            let target = args.get(4).copied().unwrap_or(Value::Object(None));
+            if is_synthetic_thread_layout(ctx.object_num_fields(this)) {
+                ctx.set_field(this, 0, name);
+                ctx.set_field(this, 1, Value::Int(prio));
+                ctx.set_field(this, 2, group);
+                ctx.set_field(this, 3, target);
+            } else {
+                populate_real_thread_holder(ctx, this, group, target, name);
+            }
+            Ok(None)
+        },
+    );
+    // Thread.run() delegates to the target Runnable stored either in the
+    // synthetic slot layout or in real JDK 25's Thread$FieldHolder.task.
     registry.register("java/lang/Thread", "run", "()V", |ctx, args| {
         let this = match args.first() {
             Some(Value::Object(Some(o))) => *o,
             _ => return Ok(None),
         };
         let num_fields = ctx.object_num_fields(this);
-        if num_fields >= 4 {
-            if let Value::Object(Some(target)) = ctx.get_field(this, 3) {
+        if is_synthetic_thread_layout(num_fields) {
+            if num_fields >= 4 {
+                if let Value::Object(Some(target)) = ctx.get_field(this, 3) {
+                    let _ = ctx.invoke_virtual(target, "run", "()V", &[]);
+                }
+            }
+        } else {
+            let mut target_val = ctx.get_field_by_name(this, "target");
+            if matches!(target_val, Value::Object(None)) {
+                if let Value::Object(Some(holder)) = ctx.get_field_by_name(this, "holder") {
+                    target_val = ctx.get_field_by_name(holder, "task");
+                }
+            }
+            if let Value::Object(Some(target)) = target_val {
                 let _ = ctx.invoke_virtual(target, "run", "()V", &[]);
             }
         }
@@ -63886,6 +64248,7 @@ fn register_exception_extras_natives(registry: &mut NativeMethodRegistry) {
         "java/lang/ExceptionInInitializerError",
         "java/lang/NoClassDefFoundError",
         "java/lang/LinkageError",
+        "java/lang/VerifyError",
         "java/lang/SecurityException",
         "java/lang/TypeNotPresentException",
         "java/lang/ReflectiveOperationException",

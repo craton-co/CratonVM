@@ -21,13 +21,13 @@ mod value;
 
 pub use class_id::{ClassId, ClassLoaderId};
 pub use compact_value::{CompactTag, CompactValue, CompactValueError};
+#[cfg(any(test, debug_assertions))]
+pub use field_layout::clear_class_layouts;
 pub use field_layout::{
     class_layout, compact_field_slot, compact_ref_fields_enabled, is_compact_object,
     layout_generation, object_body_size, register_class_layout, set_compact_ref_fields_enabled,
     CompactLayout,
 };
-#[cfg(any(test, debug_assertions))]
-pub use field_layout::clear_class_layouts;
 pub use float_format::{java_double_to_string, java_float_to_string};
 pub use heap_types::{
     array_data_size, array_data_size_checked, array_element_type_from_tag, element_byte_size,

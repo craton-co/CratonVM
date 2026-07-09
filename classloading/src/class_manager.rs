@@ -6182,13 +6182,9 @@ fn jdk_superclass(name: &str) -> &'static str {
 
         // Filter streams wrap another stream
         "java/io/FilterInputStream" => "java/io/InputStream",
-        "java/io/BufferedInputStream" | "java/io/DataInputStream" => {
-            "java/io/FilterInputStream"
-        }
+        "java/io/BufferedInputStream" | "java/io/DataInputStream" => "java/io/FilterInputStream",
         "java/io/FilterOutputStream" => "java/io/OutputStream",
-        "java/io/BufferedOutputStream" | "java/io/DataOutputStream" => {
-            "java/io/FilterOutputStream"
-        }
+        "java/io/BufferedOutputStream" | "java/io/DataOutputStream" => "java/io/FilterOutputStream",
 
         // File streams extend base streams directly
         "java/io/FileInputStream"
@@ -6332,7 +6328,7 @@ fn jdk_superclass(name: &str) -> &'static str {
         "java/util/Collections$SynchronizedObject" => "java/lang/Object",
         "java/util/Collections$SynchronizedCollection" => {
             "java/util/Collections$SynchronizedObject"
-        },
+        }
         "java/util/Collections$SynchronizedSet" => "java/util/Collections$SynchronizedCollection",
         "java/util/Collections$SynchronizedMap" => "java/util/Collections$SynchronizedObject",
         "java/util/Collections$SingletonList" | "java/util/Collections$EmptyList" => {
@@ -6456,10 +6452,8 @@ fn jdk_interfaces(name: &str) -> &'static [&'static str] {
         ],
         "java/util/Collections$SingletonMap" | "java/util/Collections$EmptyMap" => {
             &["java/util/Map", "java/io/Serializable"]
-        },
-        "java/util/Collections$EmptyIterator" => {
-            &["java/util/Iterator", "java/io/Serializable"]
-        },
+        }
+        "java/util/Collections$EmptyIterator" => &["java/util/Iterator", "java/io/Serializable"],
         "java/util/Collections$EmptyListIterator" => &[
             "java/util/ListIterator",
             "java/util/Iterator",
@@ -6467,7 +6461,7 @@ fn jdk_interfaces(name: &str) -> &'static [&'static str] {
         ],
         "java/util/Collections$EmptyEnumeration" => {
             &["java/util/Enumeration", "java/io/Serializable"]
-        },
+        }
         "java/util/ArrayList$Itr" => &["java/util/Iterator"],
         "java/util/ArrayList$ListItr" => &["java/util/ListIterator", "java/util/Iterator"],
         "java/util/Dictionary" => &[],
@@ -6516,10 +6510,11 @@ fn jdk_interfaces(name: &str) -> &'static [&'static str] {
         "java/util/function/UnaryOperator" => &["java/util/function/Function"],
         "java/util/function/Function$AndThen" | "java/util/function/Function$Compose" => {
             &["java/util/function/Function"]
-        },
-        "java/util/function/Function$Identity" => {
-            &["java/util/function/UnaryOperator", "java/util/function/Function"]
-        },
+        }
+        "java/util/function/Function$Identity" => &[
+            "java/util/function/UnaryOperator",
+            "java/util/function/Function",
+        ],
         "java/util/function/Consumer$AndThen" => &["java/util/function/Consumer"],
         "java/util/function/Predicate$And"
         | "java/util/function/Predicate$Or"
@@ -6841,6 +6836,7 @@ fn synthetic_stub_fields(name: &str) -> Vec<cratonvm_reader::field::ClassFileFie
         | "java/lang/NoSuchMethodException"
         | "java/lang/StackOverflowError"
         | "java/lang/OutOfMemoryError"
+        | "java/lang/VerifyError"
         | "java/util/NoSuchElementException"
         | "java/util/InputMismatchException"
         | "java/io/IOException"
@@ -7052,7 +7048,7 @@ fn synthetic_stub_fields(name: &str) -> Vec<cratonvm_reader::field::ClassFileFie
                 field("mainAttrs", "Ljava/util/jar/Attributes;"),
                 field("entries", "Ljava/util/Map;"),
             ]
-        },
+        }
         "java/util/jar/Attributes" => vec![ClassFileField {
             access_flags: FieldAccessFlags::empty(),
             name: cratonvm_types::intern_arc("map"),
@@ -7078,7 +7074,7 @@ fn synthetic_stub_fields(name: &str) -> Vec<cratonvm_reader::field::ClassFileFie
                 static_name("MANIFEST_VERSION"),
                 static_name("MAIN_CLASS"),
             ]
-        },
+        }
         // File = 1 instance field (path string) plus standard separator statics.
         "java/io/File" => vec![
             ClassFileField {
@@ -7149,7 +7145,7 @@ fn synthetic_stub_fields(name: &str) -> Vec<cratonvm_reader::field::ClassFileFie
                 static_locale("US"),
                 static_locale("CANADA"),
             ]
-        },
+        }
         "java/nio/charset/Charset" => instance_fields(2),
         "java/nio/charset/CharsetDecoder" => {
             let field = |n: &'static str, d: &'static str| ClassFileField {
@@ -7163,8 +7159,14 @@ fn synthetic_stub_fields(name: &str) -> Vec<cratonvm_reader::field::ClassFileFie
                 field("averageCharsPerByte", "F"),
                 field("maxCharsPerByte", "F"),
                 field("replacement", "Ljava/lang/String;"),
-                field("malformedInputAction", "Ljava/nio/charset/CodingErrorAction;"),
-                field("unmappableCharacterAction", "Ljava/nio/charset/CodingErrorAction;"),
+                field(
+                    "malformedInputAction",
+                    "Ljava/nio/charset/CodingErrorAction;",
+                ),
+                field(
+                    "unmappableCharacterAction",
+                    "Ljava/nio/charset/CodingErrorAction;",
+                ),
             ]
         }
         "java/nio/charset/CharsetEncoder" => {
@@ -7179,8 +7181,14 @@ fn synthetic_stub_fields(name: &str) -> Vec<cratonvm_reader::field::ClassFileFie
                 field("averageBytesPerChar", "F"),
                 field("maxBytesPerChar", "F"),
                 field("replacement", "[B"),
-                field("malformedInputAction", "Ljava/nio/charset/CodingErrorAction;"),
-                field("unmappableCharacterAction", "Ljava/nio/charset/CodingErrorAction;"),
+                field(
+                    "malformedInputAction",
+                    "Ljava/nio/charset/CodingErrorAction;",
+                ),
+                field(
+                    "unmappableCharacterAction",
+                    "Ljava/nio/charset/CodingErrorAction;",
+                ),
             ]
         }
         "java/nio/charset/CodingErrorAction" => {
@@ -7189,9 +7197,7 @@ fn synthetic_stub_fields(name: &str) -> Vec<cratonvm_reader::field::ClassFileFie
                     | FieldAccessFlags::STATIC
                     | FieldAccessFlags::FINAL,
                 name: cratonvm_types::intern_arc(n),
-                descriptor: cratonvm_types::intern_arc(
-                    "Ljava/nio/charset/CodingErrorAction;",
-                ),
+                descriptor: cratonvm_types::intern_arc("Ljava/nio/charset/CodingErrorAction;"),
                 attributes: vec![],
             };
             vec![
@@ -7301,7 +7307,7 @@ fn synthetic_stub_fields(name: &str) -> Vec<cratonvm_reader::field::ClassFileFie
                 attributes: vec![],
             });
             fields
-        },
+        }
         "java/lang/Thread$FieldHolder" => vec![
             ClassFileField {
                 access_flags: FieldAccessFlags::empty(),
@@ -7375,7 +7381,7 @@ fn synthetic_stub_fields(name: &str) -> Vec<cratonvm_reader::field::ClassFileFie
                 descriptor: cratonvm_types::intern_arc("Ljava/lang/Object;"),
                 attributes: vec![],
             }]
-        },
+        }
         "java/lang/Thread$State" => vec![
             ClassFileField {
                 access_flags: FieldAccessFlags::PUBLIC
@@ -7472,8 +7478,9 @@ fn synthetic_stub_fields(name: &str) -> Vec<cratonvm_reader::field::ClassFileFie
         // CompletableFuture: 4 fields (result=0, done=1, source=2, handler=3)
         "java/util/concurrent/CompletableFuture" => instance_fields(4),
         // LinkedBlockingQueue/Deque: 4 fields (head=0, tail=1, size=2, capacity=3)
-        "java/util/concurrent/LinkedBlockingQueue"
-        | "java/util/concurrent/LinkedBlockingDeque" => instance_fields(4),
+        "java/util/concurrent/LinkedBlockingQueue" | "java/util/concurrent/LinkedBlockingDeque" => {
+            instance_fields(4)
+        }
         // ArrayBlockingQueue: 4 fields (same as LBQ)
         "java/util/concurrent/ArrayBlockingQueue" => instance_fields(4),
         // ConcurrentLinkedQueue/Deque: 4 fields (same layout as LBQ)
@@ -9881,9 +9888,7 @@ fn synthetic_stub_ctor_methods(name: &str) -> Vec<ClassFileMethod> {
         out.push(ClassFileMethod {
             access_flags: MethodAccessFlags::PUBLIC | MethodAccessFlags::NATIVE,
             name: cratonvm_types::intern_arc("getResourceAsStream"),
-            descriptor: cratonvm_types::intern_arc(
-                "(Ljava/lang/String;)Ljava/io/InputStream;",
-            ),
+            descriptor: cratonvm_types::intern_arc("(Ljava/lang/String;)Ljava/io/InputStream;"),
             attributes: vec![],
         });
     }
@@ -9933,9 +9938,7 @@ fn synthetic_stub_ctor_methods(name: &str) -> Vec<ClassFileMethod> {
                     | MethodAccessFlags::STATIC
                     | MethodAccessFlags::NATIVE,
                 name: cratonvm_types::intern_arc("getDefault"),
-                descriptor: cratonvm_types::intern_arc(
-                    "()Ljavax/net/ServerSocketFactory;",
-                ),
+                descriptor: cratonvm_types::intern_arc("()Ljavax/net/ServerSocketFactory;"),
                 attributes: vec![],
             },
             mk("createServerSocket", "()Ljava/net/ServerSocket;"),
@@ -10145,9 +10148,7 @@ fn synthetic_stub_ctor_methods(name: &str) -> Vec<ClassFileMethod> {
             ClassFileMethod {
                 access_flags: MethodAccessFlags::PROTECTED | MethodAccessFlags::NATIVE,
                 name: cratonvm_types::intern_arc("<init>"),
-                descriptor: cratonvm_types::intern_arc(
-                    "(Ljava/lang/String;ILjava/lang/String;)V",
-                ),
+                descriptor: cratonvm_types::intern_arc("(Ljava/lang/String;ILjava/lang/String;)V"),
                 attributes: vec![],
             },
             mk("getName", "()Ljava/lang/String;"),
@@ -10207,7 +10208,10 @@ fn synthetic_stub_ctor_methods(name: &str) -> Vec<ClassFileMethod> {
         out.extend([
             mk_static("compile", "(Ljava/lang/String;)Ljava/util/regex/Pattern;"),
             mk_static("compile", "(Ljava/lang/String;I)Ljava/util/regex/Pattern;"),
-            mk("matcher", "(Ljava/lang/CharSequence;)Ljava/util/regex/Matcher;"),
+            mk(
+                "matcher",
+                "(Ljava/lang/CharSequence;)Ljava/util/regex/Matcher;",
+            ),
         ]);
     }
     if name == "java/util/regex/Matcher" {
@@ -10238,14 +10242,13 @@ fn synthetic_stub_ctor_methods(name: &str) -> Vec<ClassFileMethod> {
         ]);
     }
     if name == "java/lang/Runtime" {
-        let mk = |method: &str, descriptor: &str, access_flags: MethodAccessFlags| {
-            ClassFileMethod {
+        let mk =
+            |method: &str, descriptor: &str, access_flags: MethodAccessFlags| ClassFileMethod {
                 access_flags,
                 name: cratonvm_types::intern_arc(method),
                 descriptor: cratonvm_types::intern_arc(descriptor),
                 attributes: vec![],
-            }
-        };
+            };
         out.extend([
             mk(
                 "version",
@@ -10280,21 +10283,18 @@ fn synthetic_stub_ctor_methods(name: &str) -> Vec<ClassFileMethod> {
                 | MethodAccessFlags::STATIC
                 | MethodAccessFlags::NATIVE,
             name: cratonvm_types::intern_arc("getLong"),
-            descriptor: cratonvm_types::intern_arc(
-                "(Ljava/lang/String;J)Ljava/lang/Long;",
-            ),
+            descriptor: cratonvm_types::intern_arc("(Ljava/lang/String;J)Ljava/lang/Long;"),
             attributes: vec![],
         });
     }
     if name == "java/lang/ref/Cleaner" {
-        let mk = |method: &str, descriptor: &str, access_flags: MethodAccessFlags| {
-            ClassFileMethod {
+        let mk =
+            |method: &str, descriptor: &str, access_flags: MethodAccessFlags| ClassFileMethod {
                 access_flags,
                 name: cratonvm_types::intern_arc(method),
                 descriptor: cratonvm_types::intern_arc(descriptor),
                 attributes: vec![],
-            }
-        };
+            };
         out.extend([
             mk(
                 "create",
@@ -10353,7 +10353,10 @@ fn synthetic_stub_ctor_methods(name: &str) -> Vec<ClassFileMethod> {
         if name == "java/util/Collections$SynchronizedMap" {
             out.extend([
                 mk("get", "(Ljava/lang/Object;)Ljava/lang/Object;"),
-                mk("put", "(Ljava/lang/Object;Ljava/lang/Object;)Ljava/lang/Object;"),
+                mk(
+                    "put",
+                    "(Ljava/lang/Object;Ljava/lang/Object;)Ljava/lang/Object;",
+                ),
                 mk("containsKey", "(Ljava/lang/Object;)Z"),
                 mk("remove", "(Ljava/lang/Object;)Ljava/lang/Object;"),
                 mk("size", "()I"),
@@ -10550,10 +10553,7 @@ fn synthetic_stub_ctor_methods(name: &str) -> Vec<ClassFileMethod> {
                 "(Ljava/lang/StackWalker$Option;)Ljava/lang/StackWalker;",
             ),
             mk_static("getInstance", "(Ljava/util/Set;)Ljava/lang/StackWalker;"),
-            mk_static(
-                "getInstance",
-                "(Ljava/util/Set;I)Ljava/lang/StackWalker;",
-            ),
+            mk_static("getInstance", "(Ljava/util/Set;I)Ljava/lang/StackWalker;"),
             mk("walk", "(Ljava/util/function/Function;)Ljava/lang/Object;"),
             mk("forEach", "(Ljava/util/function/Consumer;)V"),
             mk("getCallerClass", "()Ljava/lang/Class;"),
@@ -10721,13 +10721,19 @@ fn synthetic_stub_ctor_methods(name: &str) -> Vec<ClassFileMethod> {
                 "onUnmappableCharacter",
                 "(Ljava/nio/charset/CodingErrorAction;)Ljava/nio/charset/CharsetDecoder;",
             ),
-            mk("replaceWith", "(Ljava/lang/String;)Ljava/nio/charset/CharsetDecoder;"),
+            mk(
+                "replaceWith",
+                "(Ljava/lang/String;)Ljava/nio/charset/CharsetDecoder;",
+            ),
             mk("replacement", "()Ljava/lang/String;"),
             mk(
                 "decode",
                 "(Ljava/nio/ByteBuffer;Ljava/nio/CharBuffer;Z)Ljava/nio/charset/CoderResult;",
             ),
-            mk("flush", "(Ljava/nio/CharBuffer;)Ljava/nio/charset/CoderResult;"),
+            mk(
+                "flush",
+                "(Ljava/nio/CharBuffer;)Ljava/nio/charset/CoderResult;",
+            ),
             mk("reset", "()Ljava/nio/charset/CharsetDecoder;"),
         ]);
     }
@@ -11080,7 +11086,10 @@ fn synthetic_stub_ctor_methods(name: &str) -> Vec<ClassFileMethod> {
         };
         out.extend([
             mk("<init>", "(Ljava/lang/Class;)V"),
-            mk("put", "(Ljava/lang/Object;Ljava/lang/Object;)Ljava/lang/Object;"),
+            mk(
+                "put",
+                "(Ljava/lang/Object;Ljava/lang/Object;)Ljava/lang/Object;",
+            ),
             mk("get", "(Ljava/lang/Object;)Ljava/lang/Object;"),
             mk("remove", "(Ljava/lang/Object;)Ljava/lang/Object;"),
             mk("containsKey", "(Ljava/lang/Object;)Z"),
@@ -11105,13 +11114,14 @@ fn synthetic_stub_ctor_methods(name: &str) -> Vec<ClassFileMethod> {
         };
         out.extend([
             mk_ctor("(Ljava/lang/CharSequence;)V"),
-            mk_ctor(
-                "(Ljava/lang/CharSequence;Ljava/lang/CharSequence;Ljava/lang/CharSequence;)V",
-            ),
+            mk_ctor("(Ljava/lang/CharSequence;Ljava/lang/CharSequence;Ljava/lang/CharSequence;)V"),
             mk("add", "(Ljava/lang/CharSequence;)Ljava/util/StringJoiner;"),
             mk("toString", "()Ljava/lang/String;"),
             mk("length", "()I"),
-            mk("merge", "(Ljava/util/StringJoiner;)Ljava/util/StringJoiner;"),
+            mk(
+                "merge",
+                "(Ljava/util/StringJoiner;)Ljava/util/StringJoiner;",
+            ),
             mk(
                 "setEmptyValue",
                 "(Ljava/lang/CharSequence;)Ljava/util/StringJoiner;",
@@ -11199,10 +11209,16 @@ fn synthetic_stub_ctor_methods(name: &str) -> Vec<ClassFileMethod> {
         out.extend([
             mk_ctor("()V"),
             mk_ctor("(I)V"),
-            mk("putValue", "(Ljava/lang/String;Ljava/lang/String;)Ljava/lang/String;"),
+            mk(
+                "putValue",
+                "(Ljava/lang/String;Ljava/lang/String;)Ljava/lang/String;",
+            ),
             mk("getValue", "(Ljava/lang/String;)Ljava/lang/String;"),
             mk("get", "(Ljava/lang/Object;)Ljava/lang/Object;"),
-            mk("put", "(Ljava/lang/Object;Ljava/lang/Object;)Ljava/lang/Object;"),
+            mk(
+                "put",
+                "(Ljava/lang/Object;Ljava/lang/Object;)Ljava/lang/Object;",
+            ),
             mk("size", "()I"),
             mk("entrySet", "()Ljava/util/Set;"),
         ]);
@@ -11214,7 +11230,10 @@ fn synthetic_stub_ctor_methods(name: &str) -> Vec<ClassFileMethod> {
             descriptor: cratonvm_types::intern_arc(descriptor),
             attributes: vec![],
         };
-        out.extend([mk_ctor("(Ljava/lang/String;)V"), mk("toString", "()Ljava/lang/String;")]);
+        out.extend([
+            mk_ctor("(Ljava/lang/String;)V"),
+            mk("toString", "()Ljava/lang/String;"),
+        ]);
     }
     if name == "java/lang/Thread" {
         for desc in [
