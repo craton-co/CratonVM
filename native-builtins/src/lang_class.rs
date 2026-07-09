@@ -269,8 +269,8 @@ pub(crate) fn package_name_of(class_id: ClassId, slashed: &str) -> Arc<str> {
 // ---------------------------------------------------------------------------
 
 use cratonvm_types::access_flags::{
-    ACC_FINAL_I32 as ACC_FINAL, ACC_PUBLIC_I32 as ACC_PUBLIC, ACC_STATIC_I32 as ACC_STATIC,
-    ACC_VOLATILE_I32 as ACC_VOLATILE,
+    ACC_ENUM, ACC_FINAL_I32 as ACC_FINAL, ACC_PUBLIC_I32 as ACC_PUBLIC,
+    ACC_STATIC_I32 as ACC_STATIC, ACC_VOLATILE_I32 as ACC_VOLATILE,
 };
 
 /// WP2.1-field вЂ” final-field write check for `Field.set*`.
@@ -12784,9 +12784,27 @@ pub(crate) fn native_class_is_enum(
         Some(id) => id,
         None => return Ok(Some(Value::Int(0))),
     };
-    let flags = ctx.class_access_flags(class_id);
-    // ACC_ENUM = 0x4000
-    Ok(Some(Value::Int(if (flags & 0x4000) != 0 { 1 } else { 0 })))
+    Ok(Some(Value::Int(if class_is_declared_enum(ctx, class_id) {
+        1
+    } else {
+        0
+    })))
+}
+
+fn class_is_declared_enum(ctx: &dyn NativeContext, class_id: ClassId) -> bool {
+    if (ctx.class_access_flags(class_id) & ACC_ENUM) == 0 {
+        return false;
+    }
+    let Some(parent_id) = ctx.superclass_of(class_id) else {
+        return false;
+    };
+    if let Some(enum_id) = ctx.class_id_by_name("java/lang/Enum") {
+        return parent_id == enum_id;
+    }
+    matches!(
+        ctx.class_name_of_id(parent_id).as_deref(),
+        Some("java/lang/Enum")
+    )
 }
 
 pub(crate) fn native_class_get_canonical_name(
@@ -12901,8 +12919,7 @@ pub(crate) fn native_class_get_enum_constants(
         None => return Ok(Some(Value::Object(None))),
     };
     // Non-enum classes must return null (per JDK spec).
-    let flags = ctx.class_access_flags(class_id);
-    if (flags & 0x4000) == 0 {
+    if !class_is_declared_enum(ctx, class_id) {
         return Ok(Some(Value::Object(None)));
     }
     // Ensure the enum's <clinit> has run so `$VALUES` is populated.
@@ -15129,9 +15146,11 @@ mod tests {
         let cid = ctx
             .ensure_class_initialized("java/util/concurrent/TimeUnit")
             .unwrap();
+        let enum_base = ctx.ensure_class_initialized("java/lang/Enum").unwrap();
+        ctx.set_superclass(cid, enum_base);
         // Flag the class as an enum (ACC_ENUM = 0x4000).
         unsafe {
-            (*ctx.class_flags_override.get()).insert(cid.as_u32(), 0x4000);
+            (*ctx.class_flags_override.get()).insert(cid.as_u32(), ACC_ENUM);
         }
         // Populate a synthetic `$VALUES` array with 7 non-null entries вЂ”
         // one per TimeUnit constant (NANOSECONDS .. DAYS).
@@ -15160,6 +15179,40 @@ mod tests {
         // Returned array must be a copy, not the backing $VALUES itself,
         // so callers can mutate (e.g. clone()) without aliasing.
         assert_ne!(arr.as_ptr() as usize, values_arr.as_ptr() as usize);
+    }
+
+    #[test]
+    fn class_is_enum_rejects_constant_specific_subclass() {
+        let mut ctx = mock_ctx();
+        let enum_base = ctx.ensure_class_initialized("java/lang/Enum").unwrap();
+        let enum_cid = ctx.ensure_class_initialized("com/example/SubFoo").unwrap();
+        let subclass_cid = ctx
+            .ensure_class_initialized("com/example/SubFoo$1")
+            .unwrap();
+        ctx.set_superclass(enum_cid, enum_base);
+        ctx.set_superclass(subclass_cid, enum_cid);
+        unsafe {
+            (*ctx.class_flags_override.get()).insert(enum_cid.as_u32(), ACC_ENUM);
+            (*ctx.class_flags_override.get()).insert(subclass_cid.as_u32(), ACC_ENUM);
+        }
+
+        let enum_mirror = make_class_mirror(&mut ctx, enum_cid.as_u32(), "com/example/SubFoo");
+        let subclass_mirror =
+            make_class_mirror(&mut ctx, subclass_cid.as_u32(), "com/example/SubFoo$1");
+
+        assert_eq!(
+            native_class_is_enum(&mut ctx, &[Value::Object(Some(enum_mirror))]).unwrap(),
+            Some(Value::Int(1))
+        );
+        assert_eq!(
+            native_class_is_enum(&mut ctx, &[Value::Object(Some(subclass_mirror))]).unwrap(),
+            Some(Value::Int(0))
+        );
+        assert_eq!(
+            native_class_get_enum_constants(&mut ctx, &[Value::Object(Some(subclass_mirror))])
+                .unwrap(),
+            Some(Value::Object(None))
+        );
     }
 
     // -----------------------------------------------------------------------
