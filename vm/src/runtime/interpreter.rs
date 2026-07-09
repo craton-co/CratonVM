@@ -19880,6 +19880,60 @@ pub(crate) fn is_count_down_latch_native_override(
         )
 }
 
+pub(crate) fn is_ffm_symbol_lookup_native_override(
+    class_name: &str,
+    method_name: &str,
+    descriptor: &str,
+) -> bool {
+    class_name == "java/lang/foreign/SymbolLookup"
+        && method_name == "find"
+        && descriptor == "(Ljava/lang/String;)Ljava/util/Optional;"
+}
+
+pub(crate) fn is_stamped_lock_native_override(
+    class_name: &str,
+    method_name: &str,
+    _descriptor: &str,
+) -> bool {
+    class_name == "java/util/concurrent/locks/StampedLock"
+        && matches!(
+            method_name,
+            "<init>"
+                | "readLock"
+                | "writeLock"
+                | "tryReadLock"
+                | "tryWriteLock"
+                | "tryOptimisticRead"
+                | "validate"
+                | "unlockRead"
+                | "unlockWrite"
+                | "unstampedUnlockRead"
+                | "unstampedUnlockWrite"
+                | "tryConvertToReadLock"
+                | "tryConvertToWriteLock"
+                | "isReadLocked"
+                | "isWriteLocked"
+                | "getReadLockCount"
+        )
+}
+
+pub(crate) fn is_xerces_cmstateset_native_override(
+    class_name: &str,
+    method_name: &str,
+    descriptor: &str,
+) -> bool {
+    class_name == "com/sun/org/apache/xerces/internal/impl/dtd/models/CMStateSet"
+        && matches!(
+            (method_name, descriptor),
+            ("hashCode", "()I")
+                | ("equals", "(Ljava/lang/Object;)Z")
+                | (
+                    "isSameSet",
+                    "(Lcom/sun/org/apache/xerces/internal/impl/dtd/models/CMStateSet;)Z"
+                )
+        )
+}
+
 fn force_native_over_real_jdk_bytecode(
     class_name: &str,
     method_name: &str,
@@ -20444,6 +20498,15 @@ fn force_native_over_real_jdk_bytecode(
     // public surface, including <init>, so the synthetic int[] holder is
     // installed before await/countDown read it.
     if is_count_down_latch_native_override(class_name, method_name, method_descriptor) {
+        return true;
+    }
+    if is_ffm_symbol_lookup_native_override(class_name, method_name, method_descriptor) {
+        return true;
+    }
+    if is_stamped_lock_native_override(class_name, method_name, method_descriptor) {
+        return true;
+    }
+    if is_xerces_cmstateset_native_override(class_name, method_name, method_descriptor) {
         return true;
     }
     // Surefire fork bootstrap/teardown: bypass ServiceLoader decoder discovery
@@ -30358,6 +30421,92 @@ mod tests {
             "java/util/concurrent/Semaphore",
             "await",
             "()V"
+        ));
+    }
+
+    #[test]
+    fn ffm_symbol_lookup_force_native_covers_find() {
+        let symbol_lookup = "java/lang/foreign/SymbolLookup";
+        let descriptor = "(Ljava/lang/String;)Ljava/util/Optional;";
+        assert!(
+            is_ffm_symbol_lookup_native_override(symbol_lookup, "find", descriptor),
+            "SymbolLookup.find must route to the registered native instead of the abstract interface method"
+        );
+        assert!(
+            force_native_over_real_jdk_bytecode(symbol_lookup, "find", descriptor),
+            "real-JDK bytecode dispatch must force the SymbolLookup.find native"
+        );
+        assert!(!is_ffm_symbol_lookup_native_override(
+            symbol_lookup,
+            "findOrThrow",
+            "(Ljava/lang/String;)Ljava/lang/foreign/MemorySegment;"
+        ));
+        assert!(!is_ffm_symbol_lookup_native_override(
+            "java/lang/foreign/Linker",
+            "find",
+            descriptor
+        ));
+    }
+
+    #[test]
+    fn stamped_lock_force_native_covers_view_unlock_helpers() {
+        let stamped_lock = "java/util/concurrent/locks/StampedLock";
+        for (name, descriptor) in [
+            ("unstampedUnlockWrite", "()V"),
+            ("unstampedUnlockRead", "()V"),
+            ("unlockWrite", "(J)V"),
+            ("unlockRead", "(J)V"),
+        ] {
+            assert!(
+                is_stamped_lock_native_override(stamped_lock, name, descriptor),
+                "{name}{descriptor} must route to the registered StampedLock native"
+            );
+            assert!(
+                force_native_over_real_jdk_bytecode(stamped_lock, name, descriptor),
+                "{name}{descriptor} must not fall through to real JDK StampedLock bytecode"
+            );
+        }
+        assert!(!is_stamped_lock_native_override(
+            "java/util/concurrent/locks/StampedLock$WriteLockView",
+            "unlock",
+            "()V"
+        ));
+        assert!(!is_stamped_lock_native_override(
+            stamped_lock,
+            "asWriteLock",
+            "()Ljava/util/concurrent/locks/Lock;"
+        ));
+    }
+
+    #[test]
+    fn xerces_cmstateset_force_native_covers_hash_and_equals_hotspots() {
+        let cmstateset = "com/sun/org/apache/xerces/internal/impl/dtd/models/CMStateSet";
+        for (name, descriptor) in [
+            ("hashCode", "()I"),
+            ("equals", "(Ljava/lang/Object;)Z"),
+            (
+                "isSameSet",
+                "(Lcom/sun/org/apache/xerces/internal/impl/dtd/models/CMStateSet;)Z",
+            ),
+        ] {
+            assert!(
+                is_xerces_cmstateset_native_override(cmstateset, name, descriptor),
+                "{name}{descriptor} must route to the registered CMStateSet native"
+            );
+            assert!(
+                force_native_over_real_jdk_bytecode(cmstateset, name, descriptor),
+                "{name}{descriptor} must not fall through to interpreted Xerces bytecode"
+            );
+        }
+        assert!(!is_xerces_cmstateset_native_override(
+            cmstateset,
+            "setBit",
+            "(I)V"
+        ));
+        assert!(!is_xerces_cmstateset_native_override(
+            "com/sun/org/apache/xerces/internal/impl/xs/models/XSDFACM",
+            "hashCode",
+            "()I"
         ));
     }
 

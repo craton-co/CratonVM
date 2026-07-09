@@ -930,12 +930,70 @@ fn native_dcm_get_cache_names(_ctx: &mut dyn NativeContext, _args: &[Value]) -> 
 
 /// `DefaultCacheManager.cacheExists(String)Z`
 fn native_dcm_cache_exists(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    if let Some(this) = obj_arg(args, 0) {
+        if is_real_dcm(ctx, this) {
+            return native_real_dcm_cache_exists(ctx, this, args);
+        }
+    }
     let name = match string_arg(ctx, args, 1) {
         Some(s) => s,
         None => return Ok(Some(Value::Int(0))),
     };
     let exists = global_manager().cache_names().iter().any(|n| n == &name);
     Ok(Some(Value::Int(if exists { 1 } else { 0 })))
+}
+
+fn native_real_dcm_cache_exists(
+    ctx: &mut dyn NativeContext,
+    this: ObjectRef,
+    args: &[Value],
+) -> MethodCallResult {
+    let name = match obj_arg(args, 1) {
+        Some(o) => o,
+        None => return Ok(Some(Value::Int(0))),
+    };
+
+    let this_pin = ctx.pin_native_root(this);
+    let name_pin = ctx.pin_native_root(name);
+    let result = (|| -> MethodCallResult {
+        let this_cur = ctx.read_native_pin(this_pin, this);
+        let name_cur = ctx.read_native_pin(name_pin, name);
+
+        let configuration_manager = match ctx.get_field_by_name(this_cur, "configurationManager") {
+            Value::Object(Some(o)) => o,
+            _ => return Ok(Some(Value::Int(0))),
+        };
+        let caches = match ctx.get_field_by_name(this_cur, "caches") {
+            Value::Object(Some(o)) => o,
+            _ => return Ok(Some(Value::Int(0))),
+        };
+        let configuration_manager_pin = ctx.pin_native_root(configuration_manager);
+        let caches_pin = ctx.pin_native_root(caches);
+
+        let selected = ctx.invoke_virtual(
+            configuration_manager,
+            "selectCache",
+            "(Ljava/lang/String;)Ljava/lang/String;",
+            &[Value::Object(Some(name_cur))],
+        )?;
+
+        let caches_cur = ctx.read_native_pin(caches_pin, caches);
+        let selected_name = match selected {
+            Some(Value::Object(Some(o))) => o,
+            _ => return Ok(Some(Value::Int(0))),
+        };
+        let selected_pin = ctx.pin_native_root(selected_name);
+        let selected_cur = ctx.read_native_pin(selected_pin, selected_name);
+
+        ctx.invoke_virtual(
+            caches_cur,
+            "containsKey",
+            "(Ljava/lang/Object;)Z",
+            &[Value::Object(Some(selected_cur))],
+        )
+    })();
+    ctx.unpin_native_roots(this_pin);
+    result
 }
 
 /// `DefaultCacheManager.defineConfiguration(String, Configuration)` — read
@@ -959,6 +1017,12 @@ fn native_dcm_define_configuration(
     ctx: &mut dyn NativeContext,
     args: &[Value],
 ) -> MethodCallResult {
+    if let Some(this) = obj_arg(args, 0) {
+        if is_real_dcm(ctx, this) {
+            return native_real_dcm_define_configuration(ctx, this, args);
+        }
+    }
+
     let name = match string_arg(ctx, args, 1) {
         Some(s) => s,
         None => {
@@ -982,7 +1046,11 @@ fn native_dcm_define_configuration(
                 .flatten()
             {
                 Some(Value::Object(Some(mem))) => {
-                    match ctx.invoke_virtual(mem, "maxCount", "()J", &[]).ok().flatten() {
+                    match ctx
+                        .invoke_virtual(mem, "maxCount", "()J", &[])
+                        .ok()
+                        .flatten()
+                    {
                         Some(Value::Long(v)) if v > 0 => v as usize,
                         _ => DEFAULT_SIZE_LIMIT,
                     }
@@ -1000,7 +1068,11 @@ fn native_dcm_define_configuration(
                 .flatten()
             {
                 Some(Value::Object(Some(exp))) => {
-                    match ctx.invoke_virtual(exp, "lifespan", "()J", &[]).ok().flatten() {
+                    match ctx
+                        .invoke_virtual(exp, "lifespan", "()J", &[])
+                        .ok()
+                        .flatten()
+                    {
                         Some(Value::Long(v)) if v > 0 => Some(Duration::from_millis(v as u64)),
                         _ => None,
                     }
@@ -1024,6 +1096,109 @@ fn native_dcm_define_configuration(
             .map(|o| Value::Object(Some(o)))
             .unwrap_or(Value::Object(None)),
     ))
+}
+
+fn native_real_dcm_define_configuration(
+    ctx: &mut dyn NativeContext,
+    this: ObjectRef,
+    args: &[Value],
+) -> MethodCallResult {
+    let name = match obj_arg(args, 1) {
+        Some(o) => o,
+        None => {
+            return Err(RuntimeError::IllegalArgumentException {
+                message: "defineConfiguration: name is null".to_string(),
+            }
+            .into());
+        }
+    };
+    let config = match obj_arg(args, 2) {
+        Some(o) => o,
+        None => {
+            return Err(RuntimeError::IllegalArgumentException {
+                message: "defineConfiguration: configuration is null".to_string(),
+            }
+            .into());
+        }
+    };
+
+    let this_pin = ctx.pin_native_root(this);
+    let name_pin = ctx.pin_native_root(name);
+    let config_pin = ctx.pin_native_root(config);
+    let result = (|| -> MethodCallResult {
+        let this_cur = ctx.read_native_pin(this_pin, this);
+        let mut name_cur = ctx.read_native_pin(name_pin, name);
+        let mut config_cur = ctx.read_native_pin(config_pin, config);
+
+        let configuration_manager = match ctx.get_field_by_name(this_cur, "configurationManager") {
+            Value::Object(Some(o)) => o,
+            _ => {
+                return Err(RuntimeError::IllegalStateException {
+                    message: "defineConfiguration: missing configurationManager".to_string(),
+                }
+                .into());
+            }
+        };
+        let configuration_manager_pin = ctx.pin_native_root(configuration_manager);
+
+        let builder = match ctx.new_object_initialized(CLS_CONFIG_BUILDER, "()V", &[])? {
+            Some(Value::Object(Some(o))) => o,
+            _ => {
+                return Err(RuntimeError::IllegalStateException {
+                    message: "defineConfiguration: failed to allocate ConfigurationBuilder"
+                        .to_string(),
+                }
+                .into());
+            }
+        };
+        name_cur = ctx.read_native_pin(name_pin, name_cur);
+        config_cur = ctx.read_native_pin(config_pin, config_cur);
+        let configuration_manager_cur =
+            ctx.read_native_pin(configuration_manager_pin, configuration_manager);
+        let builder_pin = ctx.pin_native_root(builder);
+        let mut builder_cur = ctx.read_native_pin(builder_pin, builder);
+
+        ctx.invoke_virtual(
+            builder_cur,
+            "read",
+            "(Lorg/infinispan/configuration/cache/Configuration;)Lorg/infinispan/configuration/cache/ConfigurationBuilder;",
+            &[Value::Object(Some(config_cur))],
+        )?;
+        name_cur = ctx.read_native_pin(name_pin, name_cur);
+        config_cur = ctx.read_native_pin(config_pin, config_cur);
+        builder_cur = ctx.read_native_pin(builder_pin, builder_cur);
+        let configuration_manager_cur =
+            ctx.read_native_pin(configuration_manager_pin, configuration_manager_cur);
+
+        let template = match ctx.invoke_virtual(config_cur, "isTemplate", "()Z", &[])? {
+            Some(Value::Int(v)) => v != 0,
+            _ => false,
+        };
+        name_cur = ctx.read_native_pin(name_pin, name_cur);
+        builder_cur = ctx.read_native_pin(builder_pin, builder_cur);
+        let configuration_manager_cur =
+            ctx.read_native_pin(configuration_manager_pin, configuration_manager_cur);
+
+        ctx.invoke_virtual(
+            builder_cur,
+            "template",
+            "(Z)Lorg/infinispan/configuration/cache/ConfigurationBuilder;",
+            &[Value::Int(if template { 1 } else { 0 })],
+        )?;
+        name_cur = ctx.read_native_pin(name_pin, name_cur);
+        builder_cur = ctx.read_native_pin(builder_pin, builder_cur);
+        let configuration_manager_cur =
+            ctx.read_native_pin(configuration_manager_pin, configuration_manager_cur);
+
+        ctx.invoke_virtual(
+            configuration_manager_cur,
+            "putConfiguration",
+            "(Ljava/lang/String;Lorg/infinispan/configuration/cache/ConfigurationBuilder;)Lorg/infinispan/configuration/cache/Configuration;",
+            &[Value::Object(Some(name_cur)), Value::Object(Some(builder_cur))],
+        )
+    })();
+    ctx.unpin_native_roots(this_pin);
+    result
 }
 
 /// Distinguish a REAL `DefaultCacheManager` (built via the un-shimmed
@@ -2215,7 +2390,10 @@ mod tests {
                 Value::Object(Some(config_obj)),
             ],
         );
-        assert!(result.is_ok(), "defineConfiguration must succeed: {result:?}");
+        assert!(
+            result.is_ok(),
+            "defineConfiguration must succeed: {result:?}"
+        );
 
         let cache = global_manager().get_cache("real-cfg-cache").unwrap();
         assert_eq!(
@@ -2228,6 +2406,183 @@ mod tests {
             "default_ttl must come from expiration().lifespan(), not a default/garbage slot read"
         );
         assert_ne!(cache.size_limit, DEFAULT_SIZE_LIMIT);
+    }
+
+    fn real_dcm_define_configuration_hook(
+        ctx: &mut crate::test_utils::MockNativeContext,
+        receiver: ObjectRef,
+        method_name: &str,
+        descriptor: &str,
+        args: &[Value],
+    ) -> Option<MethodCallResult> {
+        match (method_name, descriptor) {
+            (
+                "read",
+                "(Lorg/infinispan/configuration/cache/Configuration;)Lorg/infinispan/configuration/cache/ConfigurationBuilder;",
+            ) => {
+                assert_eq!(args.len(), 1);
+                ctx.set_field(receiver, 0, args[0]);
+                Some(Ok(Some(Value::Object(Some(receiver)))))
+            }
+            ("isTemplate", "()Z") => Some(Ok(Some(Value::Int(0)))),
+            (
+                "template",
+                "(Z)Lorg/infinispan/configuration/cache/ConfigurationBuilder;",
+            ) => {
+                assert_eq!(args.len(), 1);
+                ctx.set_field(receiver, 1, args[0]);
+                Some(Ok(Some(Value::Object(Some(receiver)))))
+            }
+            (
+                "putConfiguration",
+                "(Ljava/lang/String;Lorg/infinispan/configuration/cache/ConfigurationBuilder;)Lorg/infinispan/configuration/cache/Configuration;",
+            ) => {
+                assert_eq!(args.len(), 2);
+                let builder = match args[1] {
+                    Value::Object(Some(o)) => o,
+                    other => panic!("expected builder object, got {other:?}"),
+                };
+                ctx.set_field(receiver, 0, args[0]);
+                ctx.set_field(receiver, 1, args[1]);
+                Some(Ok(Some(ctx.get_field(builder, 0))))
+            }
+            _ => None,
+        }
+    }
+
+    #[test]
+    fn t19_10_real_dcm_define_configuration_delegates_to_real_configuration_manager() {
+        let _g = test_lock();
+        reset_manager_for_tests();
+
+        let mut ctx = mock_ctx();
+        ctx.set_invoke_virtual_hook(real_dcm_define_configuration_hook);
+
+        let manager_class = ctx.ensure_class_initialized(CLS_MANAGER).unwrap();
+        let this = ctx.alloc_object(manager_class, 4);
+        let global_component_registry = ctx.fresh_object_ref();
+        let configuration_manager = ctx.fresh_object_ref();
+        ctx.set_field_by_name(
+            this,
+            "globalComponentRegistry",
+            Value::Object(Some(global_component_registry)),
+        );
+        ctx.set_field_by_name(
+            this,
+            "configurationManager",
+            Value::Object(Some(configuration_manager)),
+        );
+
+        let name = ctx.create_string("___protobuf_metadata");
+        let config = ctx.fresh_object_ref();
+        let result = native_dcm_define_configuration(
+            &mut ctx,
+            &[
+                Value::Object(Some(this)),
+                Value::Object(Some(name)),
+                Value::Object(Some(config)),
+            ],
+        )
+        .expect("real DefaultCacheManager defineConfiguration should delegate");
+
+        assert_eq!(result, Some(Value::Object(Some(config))));
+        assert_eq!(
+            ctx.get_field(configuration_manager, 0),
+            Value::Object(Some(name)),
+            "real manager path must pass the cache name to ConfigurationManager"
+        );
+        let builder = match ctx.get_field(configuration_manager, 1) {
+            Value::Object(Some(o)) => o,
+            other => panic!("expected builder passed to putConfiguration, got {other:?}"),
+        };
+        assert_eq!(
+            ctx.class_name_of_id(ctx.class_id_of_object(builder))
+                .as_deref(),
+            Some(CLS_CONFIG_BUILDER)
+        );
+        assert_eq!(
+            ctx.get_field(builder, 0),
+            Value::Object(Some(config)),
+            "builder.read(Configuration) must receive the original real configuration"
+        );
+        assert_eq!(
+            ctx.get_field(builder, 1),
+            Value::Int(0),
+            "builder.template(false) should mirror the real config template bit"
+        );
+        assert_eq!(ctx.native_pin_count_for_test(), 0);
+    }
+
+    fn real_dcm_cache_exists_hook(
+        ctx: &mut crate::test_utils::MockNativeContext,
+        receiver: ObjectRef,
+        method_name: &str,
+        descriptor: &str,
+        args: &[Value],
+    ) -> Option<MethodCallResult> {
+        match (method_name, descriptor) {
+            ("selectCache", "(Ljava/lang/String;)Ljava/lang/String;") => {
+                assert_eq!(args.len(), 1);
+                ctx.set_field(receiver, 0, args[0]);
+                let selected = ctx.create_string("___protobuf_metadata");
+                Some(Ok(Some(Value::Object(Some(selected)))))
+            }
+            ("containsKey", "(Ljava/lang/Object;)Z") => {
+                assert_eq!(args.len(), 1);
+                ctx.set_field(receiver, 0, args[0]);
+                Some(Ok(Some(Value::Int(1))))
+            }
+            _ => None,
+        }
+    }
+
+    #[test]
+    fn t19_10_real_dcm_cache_exists_uses_real_alias_resolution_and_cache_map() {
+        let _g = test_lock();
+        reset_manager_for_tests();
+
+        let mut ctx = mock_ctx();
+        ctx.set_invoke_virtual_hook(real_dcm_cache_exists_hook);
+
+        let manager_class = ctx.ensure_class_initialized(CLS_MANAGER).unwrap();
+        let this = ctx.alloc_object(manager_class, 4);
+        let global_component_registry = ctx.fresh_object_ref();
+        let configuration_manager = ctx.fresh_object_ref();
+        let caches = ctx.fresh_object_ref();
+        ctx.set_field_by_name(
+            this,
+            "globalComponentRegistry",
+            Value::Object(Some(global_component_registry)),
+        );
+        ctx.set_field_by_name(
+            this,
+            "configurationManager",
+            Value::Object(Some(configuration_manager)),
+        );
+        ctx.set_field_by_name(this, "caches", Value::Object(Some(caches)));
+
+        let alias = ctx.create_string("protobuf-alias");
+        let result = native_dcm_cache_exists(
+            &mut ctx,
+            &[Value::Object(Some(this)), Value::Object(Some(alias))],
+        )
+        .expect("real DefaultCacheManager cacheExists should delegate");
+
+        assert_eq!(result, Some(Value::Int(1)));
+        assert_eq!(
+            ctx.get_field(configuration_manager, 0),
+            Value::Object(Some(alias)),
+            "cacheExists must ask ConfigurationManager.selectCache for aliases"
+        );
+        let selected = match ctx.get_field(caches, 0) {
+            Value::Object(Some(o)) => o,
+            other => panic!("expected selected cache name passed to containsKey, got {other:?}"),
+        };
+        assert_eq!(
+            ctx.read_string(selected).as_deref(),
+            Some("___protobuf_metadata")
+        );
+        assert_eq!(ctx.native_pin_count_for_test(), 0);
     }
 
     #[test]

@@ -1328,6 +1328,41 @@ fn normalize_system_property_key(key: &str) -> &str {
     key.trim_matches(|c: char| c.is_ascii_control() || c == '\0')
 }
 
+#[cfg(windows)]
+fn lookup_default_native_symbol(c_name: &std::ffi::CStr) -> Option<usize> {
+    // Windows has no RTLD_DEFAULT equivalent. For FFM defaultLookup() use the
+    // CRT modules that provide the portable C heap symbols Infinispan asks for.
+    for module in [
+        "ucrtbase.dll",
+        "msvcrt.dll",
+        "api-ms-win-crt-heap-l1-1-0.dll",
+    ] {
+        let lib = match libloading::os::windows::Library::open_already_loaded(module) {
+            Ok(lib) => lib,
+            Err(_) => continue,
+        };
+        if let Ok(sym) = unsafe { lib.get::<*const ()>(c_name.to_bytes_with_nul()) } {
+            return Some(*sym as usize);
+        }
+    }
+    None
+}
+
+#[cfg(unix)]
+fn lookup_default_native_symbol(c_name: &std::ffi::CStr) -> Option<usize> {
+    let lib = libloading::os::unix::Library::this();
+    unsafe {
+        lib.get::<*const ()>(c_name.to_bytes_with_nul())
+            .ok()
+            .map(|sym| *sym as usize)
+    }
+}
+
+#[cfg(not(any(windows, unix)))]
+fn lookup_default_native_symbol(_c_name: &std::ffi::CStr) -> Option<usize> {
+    None
+}
+
 impl<'a> NativeContextImpl<'a> {
     /// Deposit a root snapshot of this thread's frames into the shared registry.
     /// Called before any blocking operation so GC can scan this thread's roots.
@@ -7322,7 +7357,7 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
                     return Some(*sym as usize);
                 }
             }
-            None
+            lookup_default_native_symbol(&c_name)
         }
     }
 }
@@ -10990,18 +11025,16 @@ fn invoke_on_class_shared_inner(
                         // entrypoints through our hand-rolled
                         // `parking_lot::Mutex+Condvar` natives so the JDK
                         // bytecode never has a chance to mis-tag.
-                        || (class_name == "java/util/concurrent/locks/StampedLock"
-                            && matches!(
-                                method_name,
-                                "<init>"
-                                | "readLock" | "writeLock"
-                                | "tryReadLock" | "tryWriteLock"
-                                | "tryOptimisticRead" | "validate"
-                                | "unlockRead" | "unlockWrite"
-                                | "tryConvertToReadLock" | "tryConvertToWriteLock"
-                                | "isReadLocked" | "isWriteLocked"
-                                | "getReadLockCount"
-                            ))
+                        || crate::runtime::interpreter::is_stamped_lock_native_override(
+                            class_name,
+                            method_name,
+                            descriptor,
+                        )
+                        || crate::runtime::interpreter::is_xerces_cmstateset_native_override(
+                            class_name,
+                            method_name,
+                            descriptor,
+                        )
                         || (matches!(
                                 class_name,
                                 "java/util/concurrent/locks/ReentrantReadWriteLock$ReadLock"
@@ -13709,10 +13742,17 @@ fn invoke_on_class_shared_inner(
                     | "isReadOnly"
                     | "scope"
             );
+        let force_ffm_symbol_lookup_interface_native =
+            crate::runtime::interpreter::is_ffm_symbol_lookup_native_override(
+                &class_name_for_override,
+                method_name,
+                descriptor,
+            );
         let override_cb = if declaring_is_interface
             && !is_static
             && !force_ffm_value_layout_interface_native
             && !force_ffm_memory_segment_interface_native
+            && !force_ffm_symbol_lookup_interface_native
         {
             None
         } else {
@@ -14776,6 +14816,15 @@ mod tests {
         let mut thread = JvmThread::new(ThreadId(0), "test");
         let result = invoke_or_native(&shared, &mut thread, "invalid class", "method", "()V", &[]);
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn default_native_symbol_lookup_resolves_c_runtime_malloc() {
+        let c_name = std::ffi::CString::new("malloc").unwrap();
+        assert!(
+            lookup_default_native_symbol(&c_name).is_some(),
+            "FFM defaultLookup() must resolve C runtime symbols such as malloc"
+        );
     }
 
     // =====================================================================

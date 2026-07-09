@@ -1795,6 +1795,41 @@ mod context_class_loader_tests {
             other => panic!("defineClass2 did not dispatch to the ByteBuffer handler: {other:?}"),
         }
     }
+
+    #[test]
+    fn essential_natives_include_real_jdk_symbol_lookup_bridge() {
+        let mut registry = NativeMethodRegistry::new();
+        register_essential_natives(&mut registry);
+        let sl = "java/lang/foreign/SymbolLookup";
+
+        assert!(registry
+            .find(sl, "find", "(Ljava/lang/String;)Ljava/util/Optional;")
+            .is_some());
+        assert!(registry
+            .find(
+                sl,
+                "libraryLookup",
+                "(Ljava/lang/String;Ljava/lang/foreign/Arena;)Ljava/lang/foreign/SymbolLookup;",
+            )
+            .is_some());
+        assert!(registry
+            .find(sl, "loaderLookup", "()Ljava/lang/foreign/SymbolLookup;")
+            .is_some());
+    }
+
+    #[test]
+    fn essential_natives_include_stamped_lock_view_unlock_bridges() {
+        let mut registry = NativeMethodRegistry::new();
+        register_essential_natives(&mut registry);
+        let stamped_lock = "java/util/concurrent/locks/StampedLock";
+
+        assert!(registry
+            .find(stamped_lock, "unstampedUnlockWrite", "()V")
+            .is_some());
+        assert!(registry
+            .find(stamped_lock, "unstampedUnlockRead", "()V")
+            .is_some());
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -11269,6 +11304,136 @@ mod antlr_prediction_context_tests {
     }
 }
 
+const XERCES_CMSTATESET: &str = "com/sun/org/apache/xerces/internal/impl/dtd/models/CMStateSet";
+
+fn cmstateset_int_field(ctx: &dyn NativeContext, this: ObjectRef, name: &str) -> i32 {
+    match ctx.get_field_by_name(this, name) {
+        Value::Int(v) => v,
+        Value::Long(v) => v as i32,
+        _ => 0,
+    }
+}
+
+fn cmstateset_byte_array(ctx: &dyn NativeContext, this: ObjectRef) -> Option<ObjectRef> {
+    match ctx.get_field_by_name(this, "fByteArray") {
+        Value::Object(Some(arr)) => Some(arr),
+        _ => None,
+    }
+}
+
+fn cmstateset_read_bytes(
+    ctx: &dyn NativeContext,
+    this: ObjectRef,
+    byte_count: i32,
+) -> Option<Vec<u8>> {
+    let arr = cmstateset_byte_array(ctx, this)?;
+    let requested = byte_count.max(0) as usize;
+    let len = requested.min(ctx.array_length(arr));
+    let mut bytes = vec![0u8; len];
+    let copied = ctx.read_byte_array_into(arr, 0, &mut bytes);
+    bytes.truncate(copied);
+    Some(bytes)
+}
+
+fn cmstateset_same_set(ctx: &dyn NativeContext, a: ObjectRef, b: ObjectRef) -> bool {
+    let bit_count = cmstateset_int_field(ctx, a, "fBitCount");
+    if bit_count != cmstateset_int_field(ctx, b, "fBitCount") {
+        return false;
+    }
+    if bit_count < 65 {
+        return cmstateset_int_field(ctx, a, "fBits1") == cmstateset_int_field(ctx, b, "fBits1")
+            && cmstateset_int_field(ctx, a, "fBits2") == cmstateset_int_field(ctx, b, "fBits2");
+    }
+
+    let byte_count = cmstateset_int_field(ctx, a, "fByteCount");
+    let Some(a_bytes) = cmstateset_read_bytes(ctx, a, byte_count) else {
+        return false;
+    };
+    let Some(b_bytes) = cmstateset_read_bytes(ctx, b, byte_count) else {
+        return false;
+    };
+    a_bytes == b_bytes
+}
+
+fn native_xerces_cmstateset_hash_code(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    let this = obj_arg(args, 0)?;
+    let bit_count = cmstateset_int_field(ctx, this, "fBitCount");
+    if bit_count < 65 {
+        let bits1 = cmstateset_int_field(ctx, this, "fBits1");
+        let bits2 = cmstateset_int_field(ctx, this, "fBits2");
+        return Ok(Some(Value::Int(bits1.wrapping_add(bits2.wrapping_mul(31)))));
+    }
+
+    let byte_count = cmstateset_int_field(ctx, this, "fByteCount");
+    let mut hash = 0i32;
+    if let Some(bytes) = cmstateset_read_bytes(ctx, this, byte_count) {
+        for byte in bytes.iter().rev() {
+            hash = (*byte as i8 as i32).wrapping_add(hash.wrapping_mul(31));
+        }
+    }
+    Ok(Some(Value::Int(hash)))
+}
+
+fn native_xerces_cmstateset_equals(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    let this = obj_arg(args, 0)?;
+    let other = match args.get(1) {
+        Some(Value::Object(Some(other))) => *other,
+        _ => return Ok(Some(Value::Int(0))),
+    };
+    if this.as_ptr() == other.as_ptr() {
+        return Ok(Some(Value::Int(1)));
+    }
+    let other_class = ctx.class_name_of_id(ctx.class_id_of_object(other));
+    if other_class.as_deref() != Some(XERCES_CMSTATESET) {
+        return Ok(Some(Value::Int(0)));
+    }
+    Ok(Some(Value::Int(if cmstateset_same_set(ctx, this, other) {
+        1
+    } else {
+        0
+    })))
+}
+
+fn native_xerces_cmstateset_is_same_set(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    let this = obj_arg(args, 0)?;
+    let other = obj_arg(args, 1)?;
+    Ok(Some(Value::Int(if cmstateset_same_set(ctx, this, other) {
+        1
+    } else {
+        0
+    })))
+}
+
+fn register_xerces_cmstateset_intrinsics(registry: &mut NativeMethodRegistry) {
+    registry.register(
+        XERCES_CMSTATESET,
+        "hashCode",
+        "()I",
+        native_xerces_cmstateset_hash_code,
+    );
+    registry.register(
+        XERCES_CMSTATESET,
+        "equals",
+        "(Ljava/lang/Object;)Z",
+        native_xerces_cmstateset_equals,
+    );
+    registry.register(
+        XERCES_CMSTATESET,
+        "isSameSet",
+        "(Lcom/sun/org/apache/xerces/internal/impl/dtd/models/CMStateSet;)Z",
+        native_xerces_cmstateset_is_same_set,
+    );
+}
+
 /// Register ONLY the truly native methods (`ACC_NATIVE` in real JDK class files).
 /// These methods have no bytecode — they MUST be provided by the VM as native code.
 /// Used when `use_synthetic_jdk == false` (real JDK mode).
@@ -11657,6 +11822,7 @@ pub fn register_essential_natives(registry: &mut NativeMethodRegistry) {
         "()I",
         native_string_hash_code,
     );
+    register_xerces_cmstateset_intrinsics(registry);
     registry.register("java/lang/String", "indexOf", "(I)I", |ctx, args| {
         let this = match args.first() {
             Some(Value::Object(Some(o))) => *o,
@@ -12525,6 +12691,12 @@ pub fn register_essential_natives(registry: &mut NativeMethodRegistry) {
     // libssl/libcrypto. Registered here (the always-compiled essential path)
     // rather than in the synthetic-only `register_pe_panama`. See the fn doc.
     crate::panama::register_pe_raw_native_libraries(registry);
+    // FFM real-JDK SymbolLookup bridge. `Linker.defaultLookup()` is supplied
+    // by the late real-JDK shim, but it returns a real `SymbolLookup` interface
+    // object whose `find(String)` declaration is abstract. Keep the Panama
+    // `find`/lookup natives in the essential registry so off-heap users such as
+    // Infinispan can resolve symbols instead of falling into AbstractMethodError.
+    crate::panama::register_pe_symbol_lookup(registry);
     // FFM real-JDK layout/runtime shims. JDK 25's vector/foreign bootstrap
     // reaches `java.lang.foreign.ValueLayout$Of*` interface methods whose real
     // declarations are abstract/covariant. Register the phase-67 foreign-memory
@@ -18241,6 +18413,7 @@ pub fn register_essential_natives(registry: &mut NativeMethodRegistry) {
 
     // --- java.util.concurrent.locks.LockSupport (Session 13) ---
     register_lock_support_natives(registry);
+    register_stamped_lock_natives(registry);
 
     // --- java.util.concurrent.atomic.AtomicInteger (Session 13) ---
     register_atomic_integer_natives(registry);
@@ -52732,6 +52905,10 @@ fn register_rwlock_natives(registry: &mut NativeMethodRegistry) {
 
     // StampedLock — real optimistic read / exclusive write lock with stamp validation.
     // Uses a global state map keyed by object address for per-lock state.
+    register_stamped_lock_natives(registry);
+}
+
+fn register_stamped_lock_natives(registry: &mut NativeMethodRegistry) {
     let sl = "java/util/concurrent/locks/StampedLock";
     registry.register(sl, "<init>", "()V", native_stamped_init);
     registry.register(sl, "readLock", "()J", native_stamped_read_lock);
@@ -52739,6 +52916,13 @@ fn register_rwlock_natives(registry: &mut NativeMethodRegistry) {
     registry.register(sl, "tryOptimisticRead", "()J", native_stamped_optimistic);
     registry.register(sl, "unlockRead", "(J)V", native_stamped_unlock_read);
     registry.register(sl, "unlockWrite", "(J)V", native_stamped_unlock_write);
+    registry.register(sl, "unstampedUnlockRead", "()V", native_stamped_unlock_read);
+    registry.register(
+        sl,
+        "unstampedUnlockWrite",
+        "()V",
+        native_stamped_unlock_write,
+    );
     registry.register(sl, "validate", "(J)Z", native_stamped_validate);
     registry.register(sl, "tryReadLock", "()J", native_stamped_try_read_lock);
     registry.register(sl, "tryWriteLock", "()J", native_stamped_try_write_lock);
@@ -59084,6 +59268,111 @@ mod module_can_read_essential_tests {
 }
 
 #[cfg(test)]
+mod xerces_cmstateset_tests {
+    use super::*;
+    use crate::test_utils::MockNativeContext;
+    use cratonvm_types::ArrayElementType;
+
+    fn new_cmstateset(
+        ctx: &mut MockNativeContext,
+        bit_count: i32,
+        byte_count: i32,
+        bits1: i32,
+        bits2: i32,
+        bytes: &[u8],
+    ) -> ObjectRef {
+        let class_id = ctx
+            .ensure_class_initialized(XERCES_CMSTATESET)
+            .expect("CMStateSet class id");
+        let obj = ctx.alloc_object(class_id, 5);
+        ctx.set_field_by_name(obj, "fBitCount", Value::Int(bit_count));
+        ctx.set_field_by_name(obj, "fByteCount", Value::Int(byte_count));
+        ctx.set_field_by_name(obj, "fBits1", Value::Int(bits1));
+        ctx.set_field_by_name(obj, "fBits2", Value::Int(bits2));
+        let arr = ctx.new_array(ArrayElementType::Byte, bytes.len());
+        for (idx, byte) in bytes.iter().enumerate() {
+            ctx.set_array_element(arr, idx, Value::Int((*byte as i8) as i32));
+        }
+        ctx.set_field_by_name(obj, "fByteArray", Value::Object(Some(arr)));
+        obj
+    }
+
+    fn java_cmstateset_byte_hash(bytes: &[u8]) -> i32 {
+        let mut hash = 0i32;
+        for byte in bytes.iter().rev() {
+            hash = (*byte as i8 as i32).wrapping_add(hash.wrapping_mul(31));
+        }
+        hash
+    }
+
+    #[test]
+    fn essential_natives_include_xerces_cmstateset_intrinsics() {
+        let mut registry = NativeMethodRegistry::new();
+        register_essential_natives(&mut registry);
+        for (name, descriptor) in [
+            ("hashCode", "()I"),
+            ("equals", "(Ljava/lang/Object;)Z"),
+            (
+                "isSameSet",
+                "(Lcom/sun/org/apache/xerces/internal/impl/dtd/models/CMStateSet;)Z",
+            ),
+        ] {
+            assert!(
+                registry.find(XERCES_CMSTATESET, name, descriptor).is_some(),
+                "CMStateSet.{name}{descriptor} must be in the real-JDK essential registry"
+            );
+        }
+    }
+
+    #[test]
+    fn xerces_cmstateset_hash_code_matches_jdk_small_and_byte_array_paths() {
+        let mut ctx = MockNativeContext::new();
+        let small = new_cmstateset(&mut ctx, 64, 0, 17, -9, &[]);
+        let small_result = native_xerces_cmstateset_hash_code(
+            &mut ctx,
+            &[Value::Object(Some(small))],
+        )
+        .expect("small hash result")
+        .expect("small hash value");
+        assert_eq!(small_result, Value::Int(17i32.wrapping_add((-9i32).wrapping_mul(31))));
+
+        let bytes = [0x7f, 0x80, 0xff, 0x01];
+        let large = new_cmstateset(&mut ctx, 65, bytes.len() as i32, 0, 0, &bytes);
+        let large_result = native_xerces_cmstateset_hash_code(
+            &mut ctx,
+            &[Value::Object(Some(large))],
+        )
+        .expect("large hash result")
+        .expect("large hash value");
+        assert_eq!(large_result, Value::Int(java_cmstateset_byte_hash(&bytes)));
+    }
+
+    #[test]
+    fn xerces_cmstateset_equals_and_is_same_set_compare_real_fields() {
+        let mut ctx = MockNativeContext::new();
+        let a = new_cmstateset(&mut ctx, 65, 3, 0, 0, &[0xaa, 0x00, 0x7f]);
+        let b = new_cmstateset(&mut ctx, 65, 3, 0, 0, &[0xaa, 0x00, 0x7f]);
+        let c = new_cmstateset(&mut ctx, 65, 3, 0, 0, &[0xaa, 0x01, 0x7f]);
+
+        let eq_ab = native_xerces_cmstateset_equals(
+            &mut ctx,
+            &[Value::Object(Some(a)), Value::Object(Some(b))],
+        )
+        .expect("equals result")
+        .expect("equals value");
+        assert_eq!(eq_ab, Value::Int(1));
+
+        let same_ac = native_xerces_cmstateset_is_same_set(
+            &mut ctx,
+            &[Value::Object(Some(a)), Value::Object(Some(c))],
+        )
+        .expect("isSameSet result")
+        .expect("isSameSet value");
+        assert_eq!(same_ac, Value::Int(0));
+    }
+}
+
+#[cfg(test)]
 mod unsafe_static_field_offset_tests {
     use super::*;
     use crate::test_utils::MockNativeContext;
@@ -59785,6 +60074,36 @@ mod concurrency_tests {
             .unwrap()
             .unwrap();
         assert_eq!(locked, Value::Int(0), "lock/unlock must agree on the slot");
+    }
+
+    #[test]
+    fn m18_stamped_unstamped_view_unlocks_release_native_slot() {
+        let _guard = stamped_test_lock();
+        let mut ctx = make_ctx();
+        let sl = ctx.alloc_object(ClassId::new(0), 1);
+        native_stamped_init(&mut ctx, &[Value::Object(Some(sl))]).unwrap();
+
+        native_stamped_write_lock(&mut ctx, &[Value::Object(Some(sl))]).unwrap();
+        native_stamped_unlock_write(&mut ctx, &[Value::Object(Some(sl))]).unwrap();
+        let write_locked = native_stamped_is_write_locked(&mut ctx, &[Value::Object(Some(sl))])
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            write_locked,
+            Value::Int(0),
+            "WriteLockView.unlock() must release the native StampedLock slot"
+        );
+
+        native_stamped_read_lock(&mut ctx, &[Value::Object(Some(sl))]).unwrap();
+        native_stamped_unlock_read(&mut ctx, &[Value::Object(Some(sl))]).unwrap();
+        let read_count = native_stamped_get_read_lock_count(&mut ctx, &[Value::Object(Some(sl))])
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            read_count,
+            Value::Int(0),
+            "ReadLockView.unlock() must release the native StampedLock slot"
+        );
     }
 
     #[test]

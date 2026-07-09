@@ -88,7 +88,7 @@ Changed status of io.netty.channel.EventLoopGroup to STOPPED
 and contains no `STW cross-thread JIT takeover is still waiting` signature.
 This confirms the original EventLoopGroup shutdown hang is closed.
 
-The class now fails later and cleanly with a separate CratonVM-specific
+The class then failed later and cleanly with a separate CratonVM-specific
 residual:
 
 ```text
@@ -106,8 +106,10 @@ HotSpot `-Xint` control for the same class/list passes in 142.6s:
   -KeycloakRoot 'C:\craton\CratonVM\apps\keycloak' -WorkDir $suite
 ```
 
-The new residual is tracked separately in
-[`docs/known-issues/keycloak-model-protobuf-metadata-cache-config-missing.md`](../../known-issues/keycloak-model-protobuf-metadata-cache-config-missing.md).
+That protobuf metadata residual is now fixed and archived in
+[`keycloak-model-protobuf-metadata-cache-config-missing-FIXED.md`](keycloak-model-protobuf-metadata-cache-config-missing-FIXED.md).
+The remaining deeper no-JIT timeout is tracked separately in
+[`docs/known-issues/keycloak-model-liquibase-xerces-xml-parse-nojit-timeout.md`](../../known-issues/keycloak-model-liquibase-xerces-xml-parse-nojit-timeout.md).
 
 Narrow native selector regression group covering the root mechanism:
 

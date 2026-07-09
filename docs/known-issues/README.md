@@ -4,10 +4,11 @@ This folder collects CratonVM-only defects found while running upstream Java
 suites. The docs had grown to describe the **same underlying bug from several
 angles**; this index is the consolidated map. Read it first.
 
-## 2026-07-08 Keycloak RealmModelTest STW residual verified fixed; protobuf metadata residual opened
+## 2026-07-08 Keycloak RealmModelTest protobuf metadata residual fixed; Liquibase/Xerces no-JIT timeout opened
 
 - FIXED/VERIFIED: [`keycloak-model-stw-takeover-hang-eventloopgroup-shutdown-FIXED.md`](../internal/fixed-suite-bugs/keycloak-model-stw-takeover-hang-eventloopgroup-shutdown-FIXED.md) - real `RealmModelTest` under CratonVM `--nojit` no longer hangs. The run completed in 108.644s, reached `io.netty.channel.EventLoopGroup` `STOPPING` -> `STOPPED`, and did not emit the repeated STW takeover wait signature.
-- OPEN: [`keycloak-model-protobuf-metadata-cache-config-missing.md`](keycloak-model-protobuf-metadata-cache-config-missing.md) - the same CratonVM run now fails cleanly with `ExceptionInInitializerError` caused by `ISPN000436: Cache '___protobuf_metadata' has been requested, but no matching cache configuration exists`. HotSpot `-Xint` passes the same class/list in 142.6s, so this is a new CratonVM-specific residual.
+- FIXED: [`keycloak-model-protobuf-metadata-cache-config-missing-FIXED.md`](../internal/fixed-suite-bugs/keycloak-model-protobuf-metadata-cache-config-missing-FIXED.md) - real `DefaultCacheManager` cache-existence/configuration-definition calls now delegate into Infinispan's real `ConfigurationManager`, so the internal `___protobuf_metadata` cache configuration is present when internal caches start. The same fix chain also closed the exposed FFM `SymbolLookup`, default C-runtime lookup, StampedLock view-unlock, Liquibase pipeline-order, and Xerces `CMStateSet` hotspots.
+- OPEN: [`keycloak-model-liquibase-xerces-xml-parse-nojit-timeout.md`](keycloak-model-liquibase-xerces-xml-parse-nojit-timeout.md) - after those fixes, `RealmModelTest` reaches Liquibase changelog XML/XSD parsing and still exceeds CratonVM's 900s no-JIT watchdog. A manual stack dump is in `XMLEntityScanner.scanQName -> checkLimit -> XMLLimitAnalyzer.addValue` while resolving `dbchangelog-3.2.xsd`; HotSpot `-Xint` passed the same class/list in 142.649s.
 
 ## 2026-07-08 Hibernate bytecode-enhancement loader/lazytoone family retired; residual basic/merge/version bugs split out
 
