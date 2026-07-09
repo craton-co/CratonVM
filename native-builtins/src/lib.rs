@@ -25396,7 +25396,7 @@ pub fn register_synthetic_overrides(registry: &mut NativeMethodRegistry) {
         "java/lang/Throwable",
         "getLocalizedMessage",
         "()Ljava/lang/String;",
-        native_throwable_get_message, // delegates to getMessage
+        native_throwable_get_localized_message,
     );
     registry.register(
         "java/lang/Throwable",
