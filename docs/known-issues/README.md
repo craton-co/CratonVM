@@ -4,6 +4,35 @@ This folder collects CratonVM-only defects found while running upstream Java
 suites. The docs had grown to describe the **same underlying bug from several
 angles**; this index is the consolidated map. Read it first.
 
+## 2026-07-09 AccessLogValve/RewriteValve re-verify: 1 severe regression FIXED, 2 new foundational bugs found (OPEN)
+
+Re-verified `tomcat-08-07/accesslogvalve-rewritevalve-connection-failures.md`
+in isolation (`-Parallel 1`, idle Azure host) per its own recommendation.
+Both classes are CONFIRMED genuine bugs, not contention. Investigating them
+surfaced three distinct, layered issues:
+
+- FIXED: `URL.openConnection()` returned the wrong carrier type
+  (`ClassCastException`) for any real http(s) URL, due to a field-5
+  (authority) parsing bug introduced by commit `b0dd2e72` (2026-07-07).
+  Huge blast radius — anything doing `(HttpURLConnection)
+  url.openConnection()` on a real-bytecode URL was broken. Fixed in
+  `net_phase_e.rs`, verified byte-identical to HotSpot.
+- OPEN: [`bytebuffer-address-unset-aioobe.md`](tomcat-08-07/bytebuffer-address-unset-aioobe.md)
+  — `ByteBuffer.allocate()`'s synthetic carrier never sets
+  `Buffer.address`, so any bulk `get(byte[])`/`put(byte[])` throws
+  `ArrayIndexOutOfBoundsException` via `Unsafe.copyMemory` — breaks any
+  real-net-mode NIO server reading requests into a byte array (e.g.
+  Tomcat's `NioEndpoint`). Root-caused with a minimal repro; the actual
+  live dispatch site could not be located (two plausible fix locations
+  both proven dead code).
+- OPEN: [`stringreader-read-never-advances-infinite-loop.md`](tomcat-08-07/stringreader-read-never-advances-infinite-loop.md)
+  — `StringReader.read()` never advances position, infinite-looping any
+  `BufferedReader`/`StringReader`-based text parser (e.g.
+  `RewriteValve.parse()`). Same unresolved "phantom native" dispatch
+  mystery as the ByteBuffer bug above.
+- Updated: [`tomcat-08-07/accesslogvalve-rewritevalve-connection-failures.md`](tomcat-08-07/accesslogvalve-rewritevalve-connection-failures.md)
+  now reflects all three findings.
+
 ## 2026-07-09 Spring suite genuine-bug list, updated (125, down from 159)
 
 - [`CRATONVM-SPRING-GENUINE-BUGLIST-125.md`](CRATONVM-SPRING-GENUINE-BUGLIST-125.md) — full per-test-method detail for 125 CratonVM-unique Spring failures (HotSpot passes, CratonVM doesn't), cross-referenced against a clean HotSpot baseline with the classpath-dump gap fixed (spring-websocket/oxm/jms/orm/core-test jars were never built — `./gradlew jar testFixturesJar testClasses` fixed it). Down from 159 two dev commits ago: 65 newly fixed (entire SpEL cluster + spring-jms module), 31 "newly broken" are **not** new regressions — root-caused to the already-tracked HIB-CV-32 batch/load-dependent heap-corruption family (25/31 SIGSEGV, one test confirmed passing standalone but ABEND under full-suite load).
