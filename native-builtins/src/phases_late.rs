@@ -25407,8 +25407,17 @@ fn populate_stack_frame(
 }
 
 fn p59_sw_walk(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    // Capture the current call stack and build a Stream<StackFrame>
-    let trace = ctx.capture_stack_trace(0); // key 0 = temporary
+    // Capture the current call stack and build a Stream<StackFrame>.
+    // `capture_stack_trace` returns outer→inner (oldest frame first); a
+    // `StackWalker` stream must be inner→outer (the walk()-caller first),
+    // matching real JDK — reuse the same reversal + VM-internal-frame
+    // stripping that `AbstractStackWalker.callStackWalk` already applies
+    // (`lang_stackwalker::ordered_stack_walk_frames`) instead of handing
+    // the caller the raw outer→inner order. Without this, `skip`/`limit`
+    // chains over the stream (e.g. Lucene's `TestSecrets.ensureCaller`)
+    // land on the wrong frame and misidentify the caller.
+    let raw_trace = ctx.capture_stack_trace(0); // key 0 = temporary
+    let trace = crate::lang_stackwalker::ordered_stack_walk_frames(&raw_trace);
     let frame_count = trace.len();
     let arr = ctx.new_ref_array(ClassId::new(0), frame_count);
     // GC-SAFETY: `populate_stack_frame` allocates, so pin `arr` (which also
@@ -25444,7 +25453,9 @@ fn p59_sw_for_each(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRes
         Some(Value::Object(Some(r))) => *r,
         _ => return Ok(None),
     };
-    let trace = ctx.capture_stack_trace(0);
+    // Same inner→outer ordering as `p59_sw_walk` — see its comment.
+    let raw_trace = ctx.capture_stack_trace(0);
+    let trace = crate::lang_stackwalker::ordered_stack_walk_frames(&raw_trace);
     for entry in &trace {
         let sf = populate_stack_frame(ctx, entry);
         ctx.invoke_virtual(

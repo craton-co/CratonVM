@@ -5412,6 +5412,31 @@ fn native_es_clone(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRes
 // EnumMap — 3-field synthetic (same as HashMap: buckets=0, size=1, capacity=2)
 // Simplified: delegates to HashMap implementation
 // ---------------------------------------------------------------------------
+/// Registers only `EnumMap.<init>(Class)` — safe to call from the essential
+/// (both-mode) registration path. `<init>` runs via invokespecial, where a
+/// registered native always wins over bytecode (see `native_em_init`'s
+/// comment), so this narrow registration is what lets early bootstrap (e.g.
+/// logging, before the synthetic phase-50 registrations land) see a working
+/// synthetic EnumMap. The rest of `register_enum_map_natives` (put/get/size/
+/// etc) must stay synthetic-mode-only: those are normal invokevirtual calls
+/// that already run correctly against real EnumMap bytecode once `<init>`
+/// leaves the object properly initialized, and registering them on the
+/// concrete class defeats `try_delegate_real_collection`'s real-JDK fallback
+/// (its `invoke_special` resolves straight back to this same native, the
+/// re-entrancy guard trips, and the caller gets a stale synthetic answer —
+/// e.g. `EnumMap.size()`/`get()` reporting empty after a real `put()`).
+pub(crate) fn register_enum_map_init_native(r: &mut NativeMethodRegistry) {
+    let __prev_cat = r.current_category();
+    r.set_category(cratonvm_native_api::NativeKind::Intrinsic);
+    r.register(
+        "java/util/EnumMap",
+        "<init>",
+        "(Ljava/lang/Class;)V",
+        native_em_init,
+    );
+    r.set_category(__prev_cat);
+}
+
 pub(crate) fn register_enum_map_natives(r: &mut NativeMethodRegistry) {
     let __prev_cat = r.current_category();
     r.set_category(cratonvm_native_api::NativeKind::Intrinsic);
@@ -5511,6 +5536,36 @@ pub(crate) fn register_enum_map_natives(r: &mut NativeMethodRegistry) {
 
 fn native_em_init(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = obj_arg(args, 0)?;
+    // `<init>` is dispatched via invokespecial, where a registered native
+    // ALWAYS wins over bytecode (see `invoke_special_shared`'s "Native
+    // override always wins" priority) — unlike invokevirtual calls such as
+    // `put`/`get`, which prefer real bytecode unless force-listed. This
+    // native was promoted into the essential (both-mode) registration set
+    // so early logging bootstrap can see a synthetic EnumMap before the
+    // synthetic phase-50 registrations land, but that means it *also* fires
+    // for a real `java/util/EnumMap` loaded from the real JDK in real-JDK
+    // mode, where the hardcoded buckets/size/capacity indices below don't
+    // match the real class's keyType/keyUniverse/vals/size/entrySet field
+    // layout — clobbering `keyType` (real field index 2, not 0) with a
+    // buckets array and coercing `keyUniverse`/`vals` (ref-typed fields hit
+    // with `Value::Int`) to null, so `EnumMap.put`'s real-bytecode
+    // `typeCheck` sees `keyType == null` and throws ClassCastException.
+    // Mirror the real constructor's semantics by field name instead.
+    if !ctx.is_class_synthetic_stub("java/util/EnumMap") {
+        let key_type = args.get(1).copied().unwrap_or(Value::Object(None));
+        ctx.set_field_by_name(this, "keyType", key_type);
+        if let Value::Object(Some(kt)) = key_type {
+            if let Ok(Some(Value::Object(Some(universe)))) =
+                ctx.invoke_virtual(kt, "getEnumConstants", "()[Ljava/lang/Object;", &[])
+            {
+                let len = ctx.array_length(universe);
+                ctx.set_field_by_name(this, "keyUniverse", Value::Object(Some(universe)));
+                let vals = ctx.new_array(cratonvm_types::ArrayElementType::Reference, len);
+                ctx.set_field_by_name(this, "vals", Value::Object(Some(vals)));
+            }
+        }
+        return Ok(None);
+    }
     let cap = 16;
     let buckets = ctx.new_array(cratonvm_types::ArrayElementType::Reference, cap);
     ctx.set_field(this, 0, Value::Object(Some(buckets)));
