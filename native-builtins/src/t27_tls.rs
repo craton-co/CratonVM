@@ -6950,6 +6950,76 @@ pub fn gc_update_tls_ctx_key_manager_refs(map: &std::collections::HashMap<usize,
     }
 }
 
+/// The process-wide default `SSLContext`, as most recently installed by
+/// `SSLContext.setDefault(ctx)`. Holds the SAME live `ObjectRef` that was
+/// passed to `setDefault` -- not a copy -- so that `SSLContext.getDefault()`
+/// (see `net_phase_e.rs::register_re6_ssl_context`) can return an object that
+/// already carries whatever per-context identity/trust-manager state
+/// `SSLContext.init()` attached to it via `ctx_trust_managers_table`/
+/// `ctx_key_managers_table` above (those tables are keyed off this same
+/// object's GC-stable identity hash, so returning the identical object is
+/// enough -- no data needs to be copied/re-attached here).
+///
+/// A moving GC can relocate the referenced object, so this raw `ObjectRef`
+/// MUST stay in the GC root set: see `gc_scan_default_ssl_context_root` /
+/// `gc_update_default_ssl_context_ref` below (wired into
+/// `vm/src/memory/roots.rs` and `vm/src/memory/gc.rs`, mirroring
+/// `ctx_trust_managers_table`'s wiring exactly).
+fn default_ssl_context_slot() -> &'static Mutex<Option<ObjectRef>> {
+    static T: OnceLock<Mutex<Option<ObjectRef>>> = OnceLock::new();
+    T.get_or_init(|| Mutex::new(None))
+}
+
+/// `SSLContext.setDefault(SSLContext)` (native registration lives in
+/// `net_phase_e.rs`, alongside `getDefault`) -- install `ctx_obj` as the
+/// process-wide default so a subsequent `SSLContext.getDefault()` returns
+/// this SAME object. See `default_ssl_context_slot`'s doc for why identity,
+/// not a copy, is what makes this work.
+pub(crate) fn set_runtime_default_ssl_context(ctx_obj: ObjectRef) {
+    if std::env::var("CRATONVM_DBG_TLS_AUTH").is_ok() {
+        eprintln!(
+            "[dbg-tls-auth] set_runtime_default_ssl_context ptr={:p}",
+            ctx_obj.as_ptr()
+        );
+    }
+    *default_ssl_context_slot().lock() = Some(ctx_obj);
+}
+
+/// The `SSLContext` most recently installed via `setDefault`, if any --
+/// consulted by `SSLContext.getDefault()` so it returns the caller-configured
+/// object instead of always allocating a fresh, unconfigured one.
+pub(crate) fn get_runtime_default_ssl_context() -> Option<ObjectRef> {
+    *default_ssl_context_slot().lock()
+}
+
+/// GC root scan for `default_ssl_context_slot` -- mirrors
+/// `gc_scan_tls_ctx_trust_manager_roots` exactly (see that table's doc for
+/// why a raw `ObjectRef` held outside the Java heap needs this).
+pub fn gc_scan_default_ssl_context_root(roots: &mut Vec<ObjectRef>) {
+    if let Some(ctx_obj) = *default_ssl_context_slot().lock() {
+        if !ctx_obj.as_ptr().is_null() {
+            roots.push(ctx_obj);
+        }
+    }
+}
+
+/// Post-move remap companion to `gc_scan_default_ssl_context_root`.
+pub fn gc_update_default_ssl_context_ref(map: &std::collections::HashMap<usize, usize>) {
+    if map.is_empty() {
+        return;
+    }
+    let mut slot = default_ssl_context_slot().lock();
+    if let Some(ctx_obj) = slot.as_mut() {
+        let old = ctx_obj.as_ptr() as usize;
+        if let Some(&new) = map.get(&old) {
+            debug_assert!(new != 0, "GC pointer map contains null address");
+            // SAFETY: `new` is a live, 8-byte-aligned heap address produced
+            // by the moving collector for the object previously at `old`.
+            *ctx_obj = unsafe { ObjectRef::from_raw(new as *mut u8) };
+        }
+    }
+}
+
 pub fn register_sslengine_real(r: &mut NativeMethodRegistry) {
     let __prev_cat = r.current_category();
     r.set_category(cratonvm_native_api::NativeKind::Bridge);
