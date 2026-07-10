@@ -73,6 +73,21 @@ pub fn volatile_stripe_lock(
 pub trait MonitorCleanup {
     /// Re-key monitors using the old-address-to-new-address mapping.
     fn remap_after_gc(&self, pointer_map: &HashMap<usize, usize>);
+
+    /// Prune registry entries keyed by addresses a WHOLE-HEAP collection
+    /// just swept (`dead` is exact: every element was a live allocation
+    /// base before this collection and its memory is now freed).
+    ///
+    /// Needed by non-moving whole-heap collectors (the ZGC backend), whose
+    /// `pointer_map` is always empty: `remap_after_gc` early-returns on an
+    /// empty map, so no collection ever pruned the monitor/cas-lock tables —
+    /// an unbounded leak, and worse, a NEW object allocated at a recycled
+    /// address silently inherited the dead object's monitor (a non-idle
+    /// inherited monitor deadlocks the new object's first `synchronized`).
+    ///
+    /// Default no-op so moving collectors (whose remap path already handles
+    /// reclamation) need no change.
+    fn prune_dead(&self, _dead: &[usize]) {}
 }
 
 // ---------------------------------------------------------------------------

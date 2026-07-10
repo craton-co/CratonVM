@@ -436,14 +436,20 @@ mod tests {
         controller.request_stop_and_join().expect("worker joined");
         crate::satb::flush_thread_satb_buffer(g1.satb_queue());
 
-        // The SATB queue (still active until cleanup) must hold B's
-        // old reference. We pull the queue via deactivate_and_drain
-        // (which is how `cleanup()` would normally retrieve it).
+        // B's overwritten reference must have reached the MARKER: either it
+        // is still in the queue (final-drain path) or — since G1MARK-6 — the
+        // background worker already pulled it into the gray set mid-cycle
+        // (`concurrent_mark_step` drains the shards each step) and marked it
+        // in its region's bitmap. Both routes deliver the SATB guarantee;
+        // asserting on raw queue contents alone now under-approximates it.
         let drained = g1.satb_queue().deactivate_and_drain();
+        let grayed_or_marked = g1.dbg_is_grayed_or_marked(b_addr);
         assert!(
-            drained.contains(&b_addr),
-            "SATB log must capture B's overwritten reference (got {:?})",
-            drained
+            drained.contains(&b_addr) || grayed_or_marked,
+            "SATB log must capture B's overwritten reference \
+             (drained={:?} grayed_or_marked={})",
+            drained,
+            grayed_or_marked
         );
     }
 

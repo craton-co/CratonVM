@@ -1576,6 +1576,31 @@ impl cratonvm_gc::MonitorCleanup for MonitorTable {
     fn remap_after_gc(&self, pointer_map: &std::collections::HashMap<usize, usize>) {
         self.remap_after_gc(pointer_map);
     }
+
+    /// Whole-heap dead-address prune (ZGC backend — see the trait doc).
+    /// `dead` is EXACT (every element's object was just swept), so removal
+    /// is unconditional: a thread still blocked on a dead object's monitor
+    /// holds its own `Arc<Monitor>` clone (dropping the registry entry
+    /// cannot free it under that thread), and no future locker can exist
+    /// for a dead object — while a NEW object reusing the address MUST get
+    /// a fresh monitor, not the dead object's.
+    fn prune_dead(&self, dead: &[usize]) {
+        if dead.is_empty() {
+            return;
+        }
+        {
+            let mut monitors = self.monitors.lock().expect("monitors registry poisoned");
+            for d in dead {
+                monitors.remove(d);
+            }
+        }
+        {
+            let mut cas = self.cas_locks.lock().expect("cas_locks registry poisoned");
+            for d in dead {
+                cas.remove(d);
+            }
+        }
+    }
 }
 
 impl std::fmt::Debug for MonitorTable {

@@ -1593,6 +1593,15 @@ impl<'a> NativeContextImpl<'a> {
         if let Some(r) = self.thread.native_pending_return {
             snapshot.push(r);
         }
+        // JNI local references (INT-5): this thread's `JNI_LOCAL_FRAMES`
+        // handles. A JNI native that obtained local refs and then re-entered
+        // Java (parking at a safepoint) or blocked leaves them populated —
+        // and a cross-thread collector marks this thread ONLY from this
+        // deposited snapshot, so an object reachable solely through a parked
+        // thread's JNI local was reclaimed. Thread-local storage; this
+        // deposit always runs on the owning thread. The wake-side remap is
+        // `update_local_refs_after_gc` in `check_post_block_gc_refs`.
+        crate::native::jni::collect_local_ref_roots(&mut snapshot);
         // This thread's own `java.lang.Thread` mirror (and any pending async
         // exception). They live in `JvmThread` fields, not on any frame, so the
         // frame scan never captures them — yet `Thread.currentThread()` hands
@@ -1827,6 +1836,13 @@ impl<'a> NativeContextImpl<'a> {
             for val in extra_refs.iter_mut() {
                 update_value_ref(val, &fixup);
             }
+            // JNI local references (INT-2, blocked-wake half): rewrite THIS
+            // thread's `JNI_LOCAL_FRAMES` handles through the composed fixup —
+            // a JNI native that blocked mid-call (monitor, join, park) and
+            // slept through moving collections must not resume with dangling
+            // local jobjects. The storage is thread-local, so this wake path
+            // is the only place that can reach this thread's handles.
+            crate::native::jni::update_local_refs_after_gc(&fixup);
         }
 
         // Refresh (don't clear) the snapshot: we are runnable again but may

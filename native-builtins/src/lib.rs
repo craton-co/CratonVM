@@ -8602,6 +8602,11 @@ mod context_class_loader_tests {
 /// Reference layout: field 0 = referent (Object or null), field 1 = queue
 pub(crate) const REF_FIELD_REFERENT: usize = 0;
 pub(crate) const REF_FIELD_QUEUE: usize = 1;
+/// Real-JDK `java.lang.ref.Reference` layout slot 2: the `next` field
+/// (queue linkage). References with fewer than 3 fields (legacy synthetic
+/// shape) fall back to referent-slot linkage — see
+/// `reference::ref_next_slot`.
+pub(crate) const REF_FIELD_NEXT: usize = 2;
 
 /// ReferenceQueue layout: field 0 = head of linked list, field 1 = size
 pub(crate) const RQ_FIELD_HEAD: usize = 0;
