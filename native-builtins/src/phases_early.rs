@@ -10332,13 +10332,26 @@ pub(crate) fn register_phase52_inet_socket_address(r: &mut NativeMethodRegistry)
         let this = obj_arg(args, 0)?;
         let host = obj_arg(args, 1)?;
         let port = args[2].as_int().unwrap_or(0);
-        p52_isa_set(
-            ctx,
-            this,
-            Value::Object(Some(host)),
-            Value::Object(None),
-            port,
-        );
+        // Real JDK resolves the hostname via `InetAddress.getByName(host)`
+        // here, falling back to an unresolved address only on
+        // UnknownHostException. Leaving `addr` unconditionally null made
+        // EVERY `new InetSocketAddress(String,int)` permanently unresolved
+        // (`getAddress()` always null, `isUnresolved()` always true), even
+        // for trivially-resolvable literals like "127.0.0.1" — this broke
+        // `sun.nio.ch.SocketAdaptor.getInetAddress()` (its private
+        // `remoteAddress()` builds one of these from the channel's peer IP
+        // string), which in turn NPE'd `RemoteCIDRValve.isAllowed` on any
+        // Tomcat context configured with that valve (e.g. the examples
+        // webapp's `META-INF/context.xml`).
+        let host_str = ctx.read_string(host).unwrap_or_default();
+        let addr = crate::net_phase_e::resolve_host_external(&host_str)
+            .map(|ip| {
+                Value::Object(Some(crate::net_phase_e::alloc_inet_address_external(
+                    ctx, &host_str, &ip,
+                )))
+            })
+            .unwrap_or(Value::Object(None));
+        p52_isa_set(ctx, this, Value::Object(Some(host)), addr, port);
         Ok(Some(Value::Object(None)))
     });
     r.register(isa, "<init>", "(Ljava/net/InetAddress;I)V", |ctx, args| {
