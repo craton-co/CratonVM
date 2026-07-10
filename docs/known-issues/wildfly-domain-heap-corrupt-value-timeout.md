@@ -1086,3 +1086,24 @@ the Host Controller child process) but did **not** land a fix — see that doc's
 (`AttributeChangeNotification`, `ContentCleanerService`, `FileInputStream(File)`, `WFLYHC0034`)
 remain unreachable and unobserved; nothing changed for this doc specifically. This doc stays OPEN,
 still gated by the sibling SIGSEGV doc.
+
+
+## 2026-07-10 update (third session, same day) — the gating Host Controller SIGSEGV is FIXED; residual hunt is unblocked
+
+The Host Controller SIGSEGV that gated this doc's four front-line residuals is fixed — root
+cause: fabricated `(0, false)` compact-field slots poisoning the JIT's inline getfield
+(reference field read as a 32-bit sign-extended slice of a `Value` cell → bogus non-null
+receiver into the invoke inline cache; crashing method `ReentrantLock.lock()`). Full write-up:
+`docs/internal/wildfly-domain-hostcontroller-sigsegv-inline-cache-null-receiver-FIXED.md`
+(also fixes a `BufferedReader.readLine` global-mutex-across-blocking-read starvation that made
+the post-fix Host Controller look silent).
+
+With both fixes the domain boot invokes `host=foo:add()` once, never respawns, and proceeds
+into management-model territory. The four front-line residuals
+(`AttributeChangeNotification`, `ContentCleanerService`, `FileInputStream(File)`,
+`WFLYHC0034`) did **not** re-appear verbatim in a 150 s bounded run; what surfaces instead:
+`WFLYCTL0013 Operation("add") failed` on
+`host=primary/core-service=management/management-interface=http-interface`
+(`IllegalStateException: Container is down`) and a `StackOverflowError` from
+`ScheduledThreadPoolExecutor.shutdown` recursing into itself (dispatch-bug shaped, sibling of
+the prior TPE fixes). Those are the new front line for this doc's hunt.
