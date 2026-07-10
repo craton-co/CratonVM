@@ -69,7 +69,7 @@ use std::collections::HashMap;
 use std::sync::{Mutex, OnceLock};
 
 use cratonvm_native_api::{NativeContext, NativeMethodRegistry};
-use cratonvm_types::error::MethodCallResult;
+use cratonvm_types::error::{MethodCallResult, RuntimeError};
 use cratonvm_types::{ArrayElementType, ObjectRef, Value};
 
 use crate::alloc_concurrent_synthetic;
@@ -82,6 +82,20 @@ const CLS_JUL_LOG_MANAGER: &str = "java/util/logging/LogManager";
 const CLS_JBOSS_LOG_MANAGER: &str = "org/jboss/logmanager/LogManager";
 const CLS_JUL_LOGGER: &str = "java/util/logging/Logger";
 const CLS_LOGGER_ENUMERATION: &str = "java/util/logging/LogManager$StringEnumeration";
+const CLS_JUL_LEVEL: &str = "java/util/logging/Level";
+const CLS_JBOSS_LEVEL: &str = "org/jboss/logmanager/Level";
+
+/// The 9 standard `java.util.logging.Level` public static constants.
+const STANDARD_LEVEL_NAMES: [&str; 9] = [
+    "OFF", "SEVERE", "WARNING", "INFO", "CONFIG", "FINE", "FINER", "FINEST", "ALL",
+];
+
+/// `org.jboss.logmanager.Level`'s extended constants (JBoss config files —
+/// including WildFly's own `host.xml`/`domain.xml` — use these names, e.g.
+/// `<level name="WARN"/>`). `INFO` is intentionally omitted: it aliases the
+/// standard `java.util.logging.Level.INFO` constant, which is already
+/// checked first.
+const JBOSS_LEVEL_NAMES: [&str; 5] = ["FATAL", "ERROR", "WARN", "DEBUG", "TRACE"];
 
 /// Synthetic slot layout for the singleton `LogManager` instance.  The
 /// real JDK `LogManager` has many more fields but our native-only
@@ -893,6 +907,98 @@ fn native_jboss_log_context_get_logger(
     };
     let logger = get_or_create_jboss_logger(ctx, &name);
     Ok(Some(Value::Object(Some(logger))))
+}
+
+/// `java.util.logging.Level.parse(String)` — static factory that resolves a
+/// level name (or its decimal `intValue()`) to the canonical `Level` object.
+///
+/// Real JDK 25 bytecode resolves this through `KnownLevel.findByName`, which
+/// (per `docs/internal/gaps/kc16-blocker-map.md`'s KC16 investigation) walks
+/// a `ClassLoaderValue`-keyed cache that needs a non-null `Module` for a
+/// class/classloader CratonVM's module-system synthesis doesn't fully cover
+/// — the lookup throws `NullPointerException: Cannot invoke "isNamed" on
+/// null` internally, which real `Level.parse`'s own catch-all then reports as
+/// `IllegalArgumentException: Bad level "<name>"` regardless of whether the
+/// name is a genuine standard constant (`WARNING`) or a JBoss LogManager
+/// extension (`WARN`). This broke WildFly's own `host.xml`/`domain.xml`
+/// parsing, which resolves `<level name="WARN"/>` via this exact method.
+///
+/// Bypass the broken registry lookup entirely (matching the same
+/// static-field-by-name technique already used by
+/// [`native_jboss_log_context_get_level_for_name`] for JBoss's
+/// `LogContext.getLevelForName`): check the 9 standard `java.util.logging.
+/// Level` constants, then JBoss LogManager's extended constants if that
+/// class is already resolvable, then fall back to a numeric parse — only
+/// throwing the real `IllegalArgumentException` when none of those match,
+/// same as the genuine JDK contract.
+fn native_level_parse(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let name_obj = match args.first() {
+        Some(Value::Object(Some(s))) => *s,
+        _ => {
+            return Err(RuntimeError::NullPointerException {
+                message: Some("Name cannot be null".to_string()),
+            }
+            .into());
+        }
+    };
+    let name = ctx.read_string(name_obj).unwrap_or_default();
+    let upper = name.to_uppercase();
+
+    if let Ok(level_cid) = ctx.ensure_class_initialized(CLS_JUL_LEVEL) {
+        if STANDARD_LEVEL_NAMES.contains(&upper.as_str()) {
+            if let Some(idx) = ctx.static_field_index_by_name(level_cid, &upper) {
+                let v = ctx.get_static_field(level_cid, idx);
+                if let Value::Object(Some(_)) = v {
+                    return Ok(Some(v));
+                }
+            }
+        }
+    }
+    if JBOSS_LEVEL_NAMES.contains(&upper.as_str()) {
+        if let Ok(jb_cid) = ctx.ensure_class_initialized(CLS_JBOSS_LEVEL) {
+            if let Some(idx) = ctx.static_field_index_by_name(jb_cid, &upper) {
+                let v = ctx.get_static_field(jb_cid, idx);
+                if let Value::Object(Some(_)) = v {
+                    return Ok(Some(v));
+                }
+            }
+        }
+    }
+    // Numeric fallback, matching `Level.parse`'s own integer-name path: scan
+    // every known constant for an exact `intValue()` match before giving up.
+    if let Ok(target) = upper.parse::<i32>() {
+        for (cls, names) in [
+            (CLS_JUL_LEVEL, STANDARD_LEVEL_NAMES.as_slice()),
+            (CLS_JBOSS_LEVEL, JBOSS_LEVEL_NAMES.as_slice()),
+        ] {
+            if let Ok(cid) = ctx.ensure_class_initialized(cls) {
+                for candidate in names {
+                    if let Some(idx) = ctx.static_field_index_by_name(cid, candidate) {
+                        if let Value::Object(Some(level_obj)) = ctx.get_static_field(cid, idx) {
+                            if let Value::Int(v) =
+                                ctx.get_field_by_name(level_obj, "value")
+                            {
+                                if v == target {
+                                    return Ok(Some(Value::Object(Some(level_obj))));
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        // No exact match — real `Level.parse` synthesizes a fresh, unnamed
+        // Level for a numeric name it hasn't seen before.
+        return ctx.new_object_initialized(
+            CLS_JUL_LEVEL,
+            "(Ljava/lang/String;I)V",
+            &[Value::Object(Some(name_obj)), Value::Int(target)],
+        );
+    }
+    Err(RuntimeError::IllegalArgumentException {
+        message: format!("Bad level \"{name}\""),
+    }
+    .into())
 }
 
 fn native_jboss_log_context_get_level_for_name(
@@ -2280,6 +2386,13 @@ pub fn gc_update_logmanager_refs(pointer_map: &std::collections::HashMap<usize, 
 /// from `register_essential_natives` in `lib.rs` BEFORE the fallback
 /// stubs so these win in the `NativeMethodRegistry` lookup.
 pub fn register_logmanager_natives(registry: &mut NativeMethodRegistry) {
+    // ---------------- java.util.logging.Level ----------------
+    registry.register(
+        CLS_JUL_LEVEL,
+        "parse",
+        "(Ljava/lang/String;)Ljava/util/logging/Level;",
+        native_level_parse,
+    );
     // ---------------- java.util.logging.LogManager ----------------
     registry.register(
         CLS_JUL_LOG_MANAGER,

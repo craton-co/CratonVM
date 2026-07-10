@@ -693,7 +693,7 @@ pub(crate) fn native_thread_start0(
     // `drain_inherited_for_current_thread` in phases_early.rs). We do
     // this *before* spawning so there's no race between parent's
     // post-start mutations and the child's drain.
-    if let Some(snap) = crate::phases_early::snapshot_inheritable_tl_entries() {
+    if let Some(snap) = crate::phases_early::snapshot_inheritable_tl_entries(ctx) {
         let child_hash = ctx.identity_hash_code(this);
         crate::phases_early::queue_inherited_tl_for_child(child_hash, snap);
     }
@@ -1263,7 +1263,7 @@ pub(crate) fn native_runtime_get_runtime(
 ) -> MethodCallResult {
     let class_id = match ctx.ensure_class_initialized("java/lang/Runtime") {
         Ok(id) => id,
-        Err(_) => cratonvm_types::ClassId::new(0),
+        Err(_) => ctx.ensure_synthetic_class("java/lang/Runtime", 8),
     };
     let obj = ctx.alloc_object(class_id, 0);
     Ok(Some(Value::Object(Some(obj))))
@@ -3109,6 +3109,30 @@ fn preload_supertypes_via_loader(ctx: &mut dyn NativeContext, loader_obj: Object
     ctx.unpin_native_roots(p_loader);
 }
 
+fn same_loader_already_defined_mirror(
+    ctx: &mut dyn NativeContext,
+    loader_obj: ObjectRef,
+    internal_name: &str,
+    loader_id: u32,
+    msg: &str,
+) -> Option<ObjectRef> {
+    if internal_name.is_empty() || !msg.contains("already defined") {
+        return None;
+    }
+    if let Some(mirror) =
+        crate::classloader::find_loaded_class_for_loader(ctx, loader_obj, internal_name)
+    {
+        return Some(mirror);
+    }
+    if loader_id != 0 {
+        if let Some(class_id) = ctx.class_id_defined_by_loader_exact(internal_name, loader_id) {
+            crate::classloader::register_defining_loader(class_id.as_u32(), loader_obj);
+            return Some(ctx.get_class_mirror(class_id));
+        }
+    }
+    None
+}
+
 pub(crate) fn native_classloader_define_class1(
     ctx: &mut dyn NativeContext,
     args: &[Value],
@@ -3218,6 +3242,13 @@ pub(crate) fn native_classloader_define_class1(
             Ok(Some(Value::Object(Some(mirror))))
         }
         Err(msg) => {
+            if let Some(Value::Object(Some(loader_obj))) = args.first() {
+                if let Some(mirror) =
+                    same_loader_already_defined_mirror(ctx, *loader_obj, &name, loader_id, &msg)
+                {
+                    return Ok(Some(Value::Object(Some(mirror))));
+                }
+            }
             tracing::warn!("ClassLoader.defineClass1({name}) failed: {msg}");
             Err(define_class_format_error(&name, "defineClass1", msg))
         }
@@ -3301,6 +3332,13 @@ pub(crate) fn native_classloader_define_class2(
             Ok(Some(Value::Object(Some(mirror))))
         }
         Err(msg) => {
+            if let Some(Value::Object(Some(loader_obj))) = args.first() {
+                if let Some(mirror) =
+                    same_loader_already_defined_mirror(ctx, *loader_obj, &name, loader_id, &msg)
+                {
+                    return Ok(Some(Value::Object(Some(mirror))));
+                }
+            }
             tracing::warn!("ClassLoader.defineClass2({name}) failed: {msg}");
             Err(define_class_format_error(&name, "defineClass2", msg))
         }
@@ -3428,6 +3466,19 @@ pub(crate) fn native_classloader_define_class0(
             Ok(Some(Value::Object(Some(mirror))))
         }
         Err(msg) => {
+            if !hidden {
+                if let Some(Value::Object(Some(loader_obj))) = args.first() {
+                    if let Some(mirror) = same_loader_already_defined_mirror(
+                        ctx,
+                        *loader_obj,
+                        &effective_name,
+                        loader_id,
+                        &msg,
+                    ) {
+                        return Ok(Some(Value::Object(Some(mirror))));
+                    }
+                }
+            }
             tracing::warn!("ClassLoader.defineClass0({effective_name}) failed: {msg}");
             Err(define_class_format_error(
                 &effective_name,

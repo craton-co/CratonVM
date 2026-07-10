@@ -104,7 +104,21 @@ pub(crate) fn alloc_stream_decoder(
 ) -> ObjectRef {
     let cid = match ctx.ensure_class_initialized("sun/nio/cs/StreamDecoder") {
         Ok(c) => c,
-        Err(_) => cratonvm_types::ClassId::new(0),
+        // `ensure_class_initialized` can transiently fail under concurrent
+        // class-loading pressure (many test methods hammering readLine()
+        // back-to-back, each racing to initialize this same class the first
+        // time). Falling back to `ClassId::new(0)` (`java/lang/Object`, zero
+        // declared fields) here produced an object whose class is literally
+        // `Object` -- every later `sd.read(...)` call then failed with
+        // `NoSuchMethodError: java/lang/Object.read([CII)I`, surfacing as an
+        // intermittent, non-deterministic failure anywhere a
+        // `BufferedReader`/`InputStreamReader` chain happened to construct a
+        // fresh decoder at the wrong moment (observed in
+        // TestFormAuthenticatorA/B/C's SimpleHttpClient.readLine). Use the
+        // documented `ensure_synthetic_class` fallback instead -- it always
+        // returns a class that actually declares `SD_NUM_FIELDS` fields, so
+        // the object stays usable even on the rare initialization race.
+        Err(_) => ctx.ensure_synthetic_class("sun/nio/cs/StreamDecoder", SD_NUM_FIELDS),
     };
     let obj = ctx.alloc_object(cid, SD_NUM_FIELDS);
     let id = SD_NEXT_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);

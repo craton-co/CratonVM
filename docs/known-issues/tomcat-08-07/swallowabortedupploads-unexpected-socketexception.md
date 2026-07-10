@@ -330,6 +330,170 @@ Tests run: 10, Failures: 6
 6) testAbortedPOSTOKNoSwallow
 ```
 
-Status remains OPEN. The next swallow-upload investigation should account for
+Status remains OPEN (as of the section above). The next swallow-upload investigation should account for
 the stale/lost-local finding above and then re-check these six behavioral
 assertion failures once the HTTP socket processor path is stable.
+
+## 2026-07-10: `TestRewriteValve` independently confirms the `lock is null` NPE is gone on current `dev`
+
+Cross-checking the "lock is null" symptom mentioned above against a
+completely different suite class:
+`org.apache.catalina.valves.rewrite.TestRewriteValve` (see
+`docs/known-issues/tomcat-08-07/accesslogvalve-rewritevalve-connection-failures.md`)
+hit the exact same
+```
+ERROR [org.apache.tomcat.util.net.NioEndpoint] Error running socket processor
+  (java/lang/NullPointerException: Cannot invoke "java.util.concurrent.locks.ReentrantLock.lock()" because "lock" is null)
+```
+on every one of its 121 tests when run against a `dev` tip that predated
+commit `9cbbc82c` ("Fix Tomcat WebSocket close-delay blockers",
+2026-07-10). Re-ran the identical repro (worktree
+`/data/data/wt-rewritevalve-lockcheck`, branch
+`investigate/rewritevalve-lockcheck-20260710`, off `origin/dev` @
+`9bc80788`, which includes `9cbbc82c`):
+
+```
+grep -c 'lock is null' <full run output>   # -> 0
+Tests run: 121,  Failures: 156   # down from 229 pre-9cbbc82c
+```
+
+**Zero** `lock is null` occurrences, in either a debug build (101/121 tests
+reached before its own shorter timeout, zero NPEs) or a release build (full
+121/121 in ~150s). Comparing the two runs' failure content directly (same
+worktree lineage, same test class, same env):
+
+| | pre-`9cbbc82c` | post-`9cbbc82c` |
+|---|---|---|
+| `lock is null` NPE | 100% of connections | **0** |
+| `AssertionError: expected:<200> but was:<-1>` | 99 | 0 |
+| `AssertionError: expected:<400> but was:<-1>` | 10 | 4 |
+| `AssertionError: expected:<200> but was:<302>` | 0 | 15 (new) |
+| `AssertionError: expected:<400> but was:<302>` | 0 | 6 (new) |
+| `ComparisonFailure` (UTF-8 percent-encoding round-trip) | 0 | 11 (new) |
+| `LifecycleException: A child container failed during stop` | 115 | 115 (unchanged — pre-existing, unrelated teardown noise present in both runs identically; not investigated) |
+
+105 of the 109 tests that previously got a dead-connection `-1` (99+10) now
+get a real HTTP response (mostly `302` where `200`/`400` was expected — a
+new, narrower, unrelated behavioral bug, not investigated here); 4 still
+show `-1`. This is strong independent
+corroboration that `9cbbc82c` fixed (or at minimum reliably suppresses) the
+`SocketWrapperBase`/`SocketProcessorBase` `lock is null` NPE for the
+*general* Tomcat NIO-connector path, not just the WebSocket/swallow-upload
+cases it was written for — consistent with the "worth checking if it
+explains other mysteriously-100%-failing Tomcat NIO test classes" note near
+the top of the "stale/lost local variable" section above.
+
+**Open question, not resolved here:** `9cbbc82c` bundled three changes
+(drop synthetic `java/io/StringReader` in real-JDK mode, drop synthetic
+`LinkedBlockingDeque` in real-JDK mode, fix `AtomicReference.toString`).
+This doc's own "WebSocket close-delay branch correction" section above
+attributes the `SocketWrapperBase.lock` fix to the `LinkedBlockingDeque`
+change specifically (via `TestWsRemoteEndpointImplServerDeadlock`'s
+`WriteBuffer.clear()` NPE) — but that's a different class/lock than the one
+this doc's "stale/lost local variable" section root-caused
+(`SocketWrapperBase.lock` via `SocketProcessorBase.run()`), and the two
+mechanisms were never obviously connected. It's also possible the
+`StringReader` drop contributed (`TestRewriteValve`'s own
+`RewriteValve.parse()` uses `BufferedReader`/`StringReader` directly, so
+that class is live on its exact request path, unlike
+`TestSwallowAbortedUploads`). **No bisection was done to isolate which of
+the three changes (or the combination) is responsible.** Given the "stale
+local variable across a GC safepoint/JIT tier-transition" theory was reached
+from isolated repros that never included a live synthetic-layout-mismatched
+object (`LinkedBlockingDeque` or `StringReader`) allocated nearby, an
+alternative reading is that the true mechanism was always a
+synthetic/real-layout heap-corruption effect from one of those two classes
+(the same well-established bug family as `StringJoiner`/`EnumSet`/
+`ScheduledThreadPoolExecutor` elsewhere in this codebase — see
+[[cratonvm-real-switch-synthetic-stub-wins-by-default]]) — the deep GC/JIT
+root-scanner theory may have been chasing a red herring that happened to
+correlate with GC-safepoint timing. Whoever revisits `CRATONVM_DBG_PRECISE`/
+`CRATONVM_DBG_VERIFY_OOP_MAPS` per the recommended next step above should
+first try a plain bisection (rebuild with only the `LinkedBlockingDeque`
+drop, or only the `StringReader` drop, and rerun `TestRewriteValve`) before
+assuming the GC/JIT subsystem itself needs fixing — it may already be moot.
+
+## 2026-07-10: bisected — `LinkedBlockingDeque` (not `StringReader`) fixed it; NOT a GC/JIT bug
+
+Did the bisection the previous section asked for, directly against
+`TestSwallowAbortedUploads` (not `TestRewriteValve`, but the same NPE). Two
+isolated worktrees off the same `dev` tip (`d8e79b43`), each reverting
+exactly one of `9cbbc82c`'s two synthetic-native drops back to the old
+(buggy) behavior:
+
+| Build | `StringReader` | `LinkedBlockingDeque` | `lock is null` count | `Tests run: 10, Failures:` |
+|---|---|---|---|---|
+| Variant A | synthetic (reverted) | dropped (real bytecode) | **0** | 10 |
+| Variant B | dropped (real bytecode) | synthetic (reverted) | **9** | 6 |
+| current `dev` (both dropped) | dropped | dropped | 0 (6/6 clean runs) | 6 |
+
+Reverting `StringReader`'s drop alone (Variant A) does **not** bring the NPE
+back. Reverting `LinkedBlockingDeque`'s drop alone (Variant B) **does** —
+same signature, same log line, same "no response reaches the client"
+symptom as the original bug. This conclusively settles the open question:
+**`LinkedBlockingDeque`'s synthetic-native drop is the fix; `StringReader`
+was never relevant to this particular NPE** (it likely explains
+`TestRewriteValve`'s *own* separate `RewriteValve.parse()`/`BufferedReader`
+issue instead, per that class's direct use of `StringReader`).
+
+**The "deep GC/JIT root-scanning bug" theory in the section above was a
+misdiagnosis.** There is no stale-local/safepoint bug to fix in
+`vm/src/jit/conservative_roots.rs` or `gc/src/gen_heap.rs` — the isolated
+repros in that section never reproduced the NPE in a standalone program
+specifically because they never constructed a real
+`java.util.concurrent.LinkedBlockingDeque` under the old synthetic native.
+The actual mechanism is the same well-precedented "synthetic native writes a
+fake small-field-count layout over a real, differently-laid-out JDK object"
+corruption family as `StringJoiner`/`EnumSet`/`ScheduledThreadPoolExecutor`
+(see `native-collections/src/lib.rs::native_lbq_init`, now dead code behind
+`#[cfg(not(feature = "synthetic-jdk"))]` but still registered pre-fix — it
+writes `Value::Int`/array refs into 4 hardcoded field indices [0..3] via
+`ctx.set_field`, assuming its own fake `(head,tail,size,capacity)` layout
+regardless of the real JDK class's actual field order/count).
+
+The structural link to `SocketWrapperBase.lock` specifically:
+`SocketWrapperBase` itself declares
+`protected final WriteBuffer nonBlockingWriteBuffer = new WriteBuffer(bufferedWriteSize);`
+(`SocketWrapperBase.java:130`), and `WriteBuffer`'s own constructor does
+`private final LinkedBlockingDeque<ByteBufferHolder> buffers = new LinkedBlockingDeque<>();`
+(`WriteBuffer.java:38`) — so **every** `NioSocketWrapper` construction
+(i.e. every accepted connection, not just WebSocket) transitively
+constructs a `LinkedBlockingDeque` as part of its own field-initializer
+chain, in the same object-construction sequence as `lock`
+(`SocketWrapperBase.java:66`). The exact byte-level path from the buggy
+`LinkedBlockingDeque` native's field writes to `SocketWrapperBase.lock`
+specifically reading back null was not traced at the Rust/interpreter level
+(candidates: a field-index/write-cursor mixup across the nested `<init>`
+call, or a heap-adjacency effect from the undersized synthetic write) — but
+the bisection above proves causation empirically regardless of the exact
+mechanism, and that's enough to close this out: **no VM/GC/JIT code change
+is needed beyond what `9cbbc82c` already shipped.**
+
+**Status of the swallow-upload behavior itself: still OPEN**, now cleanly
+characterized without any NPE noise (`Tests run: 10, Failures: 6`, stable
+across 6 consecutive runs on current `dev`):
+- 3 failures are the real `sc_close` behavioral gap this doc is about:
+  `testAbortedUploadLimitedNoSwallow`, `testAbortedPOST413NoSwallow`,
+  `testChunkedPUTLimit` all want a `SocketException` when Tomcat
+  intentionally aborts-without-swallowing, but the lingering-drain fix is
+  now too gentle to ever produce one (see the analysis two sections above —
+  `sc_close` cannot distinguish "help me finish draining" from "the app
+  wants this aborted" from the raw socket alone).
+- 3 failures (`testAbortedPOSTOKSwallow`, `testAbortedPOST413Swallow`,
+  `testAbortedPOSTOKNoSwallow` — all `AbortedPOSTClient`/`AbortedPOSTServlet`
+  tests, i.e. the simple non-multipart POST that never reads its own body)
+  get a **completely empty response** (`responseLine == null`, `ex == null`,
+  no exception, no error logged anywhere) regardless of the swallow setting —
+  a **different, not-yet-diagnosed bug**, newly visible now that the NPE
+  isn't masking it. Confirmed via the same debug-instrumented
+  `TestSwallowAbortedUploads.java` technique used earlier in this doc
+  (`DEBUG_RESPLINE=[null]`, `DEBUG_EX=[null]`, no server-side ERROR/WARN
+  logged in between). Not investigated further this session — worth its own
+  focused pass (does `doPost()` even run? does the response get written but
+  never flushed to the socket? does swallowing the still-unread ~10 MB body
+  block/starve the write somehow?).
+
+The four `AbortedUploadClient`/multipart tests (`testChunkedPUTNoLimit`,
+`testAbortedUploadUnlimitedSwallow`, `testAbortedUploadLimitedSwallow`,
+`testAbortedUploadUnlimitedNoSwallow`) now pass their real assertions
+cleanly.

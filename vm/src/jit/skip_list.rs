@@ -541,6 +541,37 @@ fn should_skip_jit_internal(
         {
             return Some(SkipReason::RustJvmTestFixture);
         }
+
+        // JASPER-JDT.3 (2026-07-10) - a second, independent Eclipse JDT
+        // miscompile family, this one in the AST/flow-analysis package
+        // rather than JASPER-JDT.2's parser package. Real Tomcat FORM-auth
+        // repro (`TestFormAuthenticatorA/B/C` forwarding to the login-page
+        // JSP): `Servlet.service()` intermittently threw `JasperException:
+        // Unable to compile class for JSP` with root cause
+        // `ArrayIndexOutOfBoundsException: Index 1 out of bounds for
+        // length 1` — reported stack frame was
+        // `QualifiedNameReference.analyseCode(QualifiedNameReference.java:170)`,
+        // which is JUST a trivial 3-arg-to-4-arg delegating wrapper
+        // (`return analyseCode(scope, ctx, info, true);`, no array access
+        // of its own) — i.e. the JIT lost/mis-attributed the inlined
+        // callee's own frame, the same symptom shape as JASPER-JDT.2's
+        // "size varies run to run" AIOOBEs. `--nojit` never reproduces (0/8
+        // hits across repeated full-class runs vs. consistent hits with JIT
+        // on); `CRATONVM_JIT_BISECT_SKIP=.../QualifiedNameReference.analyseCode`
+        // alone eliminates it (confirmed clean across 3 repeat runs). Not
+        // yet root-caused to a specific backend bug (unlike JASPER-JDT.2's
+        // three fully-diagnosed getfield/deopt/arraycopy bugs) — the AST
+        // package's many `analyseCode` overrides likely share a similar
+        // "small final-array-length loop across an inlined overload
+        // boundary" shape, so interpret the whole `ast` package rather than
+        // just this one class, mirroring JASPER-JDT.2's package-wide scope.
+        // Liftable for diagnosis with
+        // `CRATONVM_JIT_ALLOW_PACKAGES=org/eclipse/jdt/internal/compiler/ast/`.
+        if class_name.starts_with("org/eclipse/jdt/internal/compiler/ast/")
+            && !package_allowed("org/eclipse/jdt/internal/compiler/ast/", allow_packages)
+        {
+            return Some(SkipReason::RustJvmTestFixture);
+        }
         if is_elasticsearch_suite_jit_fragile_cluster(class_name, method_name)
             && !package_allowed(class_name, allow_packages)
         {
@@ -741,6 +772,7 @@ fn should_skip_jit_internal(
         // is found and fixed, or until the EC `AllTests` run completes
         // cleanly under the allow-packages override.
         if class_name.starts_with("org/bouncycastle/")
+            && !is_bouncycastle_crypto_hotpath_carveout(class_name, method_name)
             && !package_allowed("org/bouncycastle/", allow_packages)
         {
             return Some(SkipReason::RustJvmTestFixture);
@@ -2593,6 +2625,42 @@ fn package_allowed(prefix: &str, allow_packages: &[&str]) -> bool {
         .any(|entry| !entry.is_empty() && prefix.starts_with(entry))
 }
 
+fn is_bouncycastle_crypto_hotpath_carveout(class_name: &str, method_name: &str) -> bool {
+    let is_crypto_hotpath = matches!(
+        class_name,
+        "org/bouncycastle/crypto/BufferedBlockCipher"
+            | "org/bouncycastle/crypto/DefaultBufferedBlockCipher"
+    ) || matches!(
+        class_name,
+        c if c.starts_with("org/bouncycastle/crypto/engines/")
+            || c.starts_with("org/bouncycastle/crypto/io/")
+            || c.starts_with("org/bouncycastle/crypto/modes/")
+            || c.starts_with("org/bouncycastle/crypto/paddings/")
+    );
+    if !is_crypto_hotpath {
+        return false;
+    }
+
+    // CAST key schedule code corrupts S-box indices when compiled in the full
+    // stream test; keep setup interpreted while allowing block operations.
+    if matches!(
+        class_name,
+        "org/bouncycastle/crypto/engines/CAST5Engine"
+            | "org/bouncycastle/crypto/engines/CAST6Engine"
+    ) && matches!(method_name, "init" | "setKey")
+    {
+        return false;
+    }
+
+    // NIST CTS mode hit a compiled processBytes watchdog during the same
+    // validation pass. It is not a dominant hot path, so keep it guarded.
+    if class_name == "org/bouncycastle/crypto/modes/NISTCTSBlockCipher" {
+        return false;
+    }
+
+    true
+}
+
 /// Parse the `CRATONVM_JIT_ALLOW_PACKAGES` env var into a list of allowed
 /// package prefixes. The result is cached at first call so repeated
 /// `should_skip_jit` invocations do not re-parse.
@@ -3767,5 +3835,49 @@ mod tests {
             "getPasswordCredentialData"
         ));
         assert!(!is_known_miscompile("com/example/Foo", "bar"));
+    }
+
+    #[test]
+    fn bouncycastle_crypto_hotpath_carveout_keeps_math_ec_banned() {
+        assert_eq!(
+            check(
+                "org/bouncycastle/math/ec/ECPoint",
+                "normalize",
+                false,
+                true,
+                SkipPolicy::Conservative
+            ),
+            Some(SkipReason::RustJvmTestFixture)
+        );
+        assert_eq!(
+            check(
+                "org/bouncycastle/crypto/BufferedBlockCipher",
+                "getUpdateOutputSize",
+                false,
+                true,
+                SkipPolicy::Conservative
+            ),
+            None
+        );
+        assert_eq!(
+            check(
+                "org/bouncycastle/crypto/DefaultBufferedBlockCipher",
+                "getUpdateOutputSize",
+                false,
+                true,
+                SkipPolicy::Conservative
+            ),
+            None
+        );
+        assert_eq!(
+            check(
+                "org/bouncycastle/crypto/engines/CAST5Engine",
+                "init",
+                false,
+                true,
+                SkipPolicy::Conservative
+            ),
+            Some(SkipReason::RustJvmTestFixture)
+        );
     }
 }

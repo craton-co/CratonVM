@@ -991,23 +991,6 @@ pub fn native_return_pushed_to_stack(shared: &SharedVm, thread: &mut JvmThread) 
     crate::runtime::interpreter::update_root_snapshot(shared, thread);
 }
 
-/// Return the post-GC remapped object result published by [`safe_native_call`].
-///
-/// `safe_native_call` stores object returns in `native_pending_return` and
-/// publishes that slot as a root before native pins are unwound. If a moving GC
-/// runs before the caller pushes the raw `Value` returned by the native, the
-/// pending slot is updated but the raw `Value` is not. Native push sites should
-/// call this immediately before pushing/coercing object returns.
-#[inline]
-pub fn remap_pending_native_return(thread: &JvmThread, value: Value) -> Value {
-    if matches!(value, Value::Object(Some(_))) {
-        if let Some(obj) = thread.native_pending_return {
-            return Value::Object(Some(obj));
-        }
-    }
-    value
-}
-
 /// Acquire a Java monitor, blocking GC-SAFELY on contention. Returns the
 /// (possibly GC-relocated) object ref — the caller MUST use the returned
 /// ref for any later monitor operation (exit pairing).
@@ -3176,55 +3159,12 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
     }
 
     fn new_array(&mut self, element_type: ArrayElementType, length: usize) -> ObjectRef {
-        if std::env::var_os("CRATONVM_DBG_LARGE_ARRAY_ALLOC").is_some() && length > 100_000_000 {
-            eprintln!(
-                "[DBG_LARGE_ARRAY_ALLOC native] class_id=0 element_type={:?} length={} (0x{:x}) frames={}",
-                element_type,
-                length,
-                length,
-                self.thread.frames.len()
-            );
-            for (i, frame) in self.thread.frames.iter().rev().take(64).enumerate() {
-                eprintln!(
-                    "[DBG_LARGE_ARRAY_ALLOC native frame {}] {}.{}{} pc={}",
-                    i,
-                    frame.class_name(),
-                    frame.method_name(),
-                    frame.method_descriptor(),
-                    frame.pc
-                );
-            }
-            eprintln!(
-                "[DBG_LARGE_ARRAY_ALLOC native rust]
-{}",
-                std::backtrace::Backtrace::force_capture()
-            );
-        }
         self.shared
             .heap
             .alloc_array(ClassId::new(0), element_type, length)
     }
 
     fn new_ref_array(&mut self, class_id: ClassId, length: usize) -> ObjectRef {
-        if std::env::var_os("CRATONVM_DBG_LARGE_ARRAY_ALLOC").is_some() && length > 100_000_000 {
-            eprintln!(
-                "[DBG_LARGE_ARRAY_ALLOC native_ref] class_id={} length={} (0x{:x}) frames={}",
-                class_id.as_u32(),
-                length,
-                length,
-                self.thread.frames.len()
-            );
-            for (i, frame) in self.thread.frames.iter().rev().take(64).enumerate() {
-                eprintln!(
-                    "[DBG_LARGE_ARRAY_ALLOC native_ref frame {}] {}.{}{} pc={}",
-                    i,
-                    frame.class_name(),
-                    frame.method_name(),
-                    frame.method_descriptor(),
-                    frame.pc
-                );
-            }
-        }
         if class_id.as_u32() == 0 && crate::runtime::env_cache::dbg_toarray() {
             let frame = self
                 .thread
@@ -3805,12 +3745,10 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
                 let cached = self.shared.anon_class_cache[num_fields]
                     .load(std::sync::atomic::Ordering::Relaxed);
                 if cached != 0 {
-                    let cached_id = ClassId::new(cached);
                     return self
                         .shared
                         .heap
-                        .try_alloc_object_old(cached_id, num_fields)
-                        .unwrap_or_else(|| self.shared.heap.alloc_object(cached_id, num_fields));
+                        .alloc_object(ClassId::new(cached), num_fields);
                 }
             }
             let name = format!("cratonvm/synthetic/AnonymousObject${num_fields}");
@@ -3876,13 +3814,7 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
             .map(|c| c.num_total_fields)
             .unwrap_or(0);
         let slots = num_fields.max(real_fields);
-        // Native helpers frequently hold raw ObjectRefs across Rust calls while
-        // constructing return values. Prefer old-gen allocation so moving-young
-        // GC cannot relocate such a helper before the Java caller stores it.
-        self.shared
-            .heap
-            .try_alloc_object_old(class_id, slots)
-            .unwrap_or_else(|| self.shared.heap.alloc_object(class_id, slots))
+        self.shared.heap.alloc_object(class_id, slots)
     }
 
     fn ensure_class_initialized(&mut self, name: &str) -> Result<ClassId, MethodCallFailed> {
@@ -3903,16 +3835,7 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
         // returns the existing id when the name is already registered, so a
         // successful load here keeps native allocations on the real layout.
         if let Ok(cid) = self.shared.load_class_concurrent(name) {
-            let exact = self
-                .shared
-                .class_manager
-                .read()
-                .get_class(cid)
-                .map(|c| c.name.as_ref() == name)
-                .unwrap_or(false);
-            if exact && (name == "java/lang/Object" || cid != ClassId::new(0)) {
-                return cid;
-            }
+            return cid;
         }
         // Real class unavailable: register a minimal synthetic class that
         // declares `num_fields` instance fields. This guarantees the object
@@ -4764,11 +4687,27 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
                             .get_class(cid)
                             .map(|c| c.name.to_string())
                             .unwrap_or_else(|| format!("<unknown class_id={}>", cid.as_u32()));
+                        let to_string = invoke_on_class_shared(
+                            &shared_arc,
+                            &mut jvm_thread,
+                            cid,
+                            "toString",
+                            "()Ljava/lang/String;",
+                            &[Value::Object(Some(exc_ref))],
+                        )
+                        .ok()
+                        .flatten()
+                        .and_then(|v| match v {
+                            Value::Object(Some(s)) => super::read_java_string(&shared_arc.heap, s),
+                            _ => None,
+                        })
+                        .unwrap_or_else(|| "<toString unavailable>".to_string());
                         eprintln!(
-                            "[dbg-uncaught] tid={} thread_name={:?} exc_class={} ptr={:p}",
+                            "[dbg-uncaught] tid={} thread_name={:?} exc_class={} exc={} ptr={:p}",
                             tid.0,
                             name,
                             cname,
+                            to_string,
                             exc_ref.as_ptr(),
                         );
                     }
@@ -8316,6 +8255,45 @@ pub fn invoke_or_native(
     // for both synthetic stubs AND real JDK classes.  Many JDK Java methods
     // (e.g. VM.getSavedProperty) depend on JVM-internal state we haven't set up,
     // so our Rust native registration must take priority over bytecode.
+    // `java/util/concurrent/ThreadPoolExecutor.execute(Runnable)`: the
+    // registered native (`native_es_execute`) assumes CratonVM's synthetic
+    // 2-field `Executors.new*ThreadPool()` receiver. It is NOT disambiguated
+    // by the general SyntheticStub/CRATONVM_REAL `real_protected_stub` logic
+    // below, because that check is CLASS-scoped and the real
+    // `ThreadPoolExecutor` *class* bytecode is always loaded regardless of
+    // whether a given *instance* is genuinely real or one of our synthetic
+    // stand-ins. A genuinely real, bytecode-constructed `ThreadPoolExecutor`
+    // (its own real `<init>` ran, so its real `workers` field is populated --
+    // e.g. `spawn_runnable_on_real_thread`'s own singleton async pool) must
+    // run its own real `execute()` bytecode here too, or calling `.execute()`
+    // on it from native code (via `ctx.invoke_virtual`) recurses back into
+    // this same native forever (a real stack overflow, confirmed via gdb).
+    // See docs/known-issues/threadpoolexecutor-execute-npe-on-ctl-regression.md.
+    if effective_class == "java/util/concurrent/ThreadPoolExecutor"
+        && method_name == "execute"
+        && descriptor == "(Ljava/lang/Runnable;)V"
+    {
+        if let Some(Value::Object(Some(recv))) = args.first() {
+            let recv_class_id = shared.heap.class_id_of(*recv);
+            let has_real_workers = {
+                let cm = shared.class_manager.read();
+                resolve_field_index_in_hierarchy(recv_class_id, "workers", &cm.class_store)
+                    .map(|idx| matches!(shared.heap.get_field(*recv, idx), Value::Object(Some(_))))
+                    .unwrap_or(false)
+            };
+            if has_real_workers {
+                return invoke_on_class_shared(
+                    shared,
+                    thread,
+                    recv_class_id,
+                    method_name,
+                    descriptor,
+                    args,
+                );
+            }
+        }
+    }
+
     if let Some(callback) = shared
         .native_methods
         .find(effective_class, method_name, descriptor)
@@ -8344,7 +8322,6 @@ pub fn invoke_or_native(
                         | "java/util/EnumSet"
                         | "java/util/StringJoiner"
                         | "java/io/FileInputStream"
-                        | "java/io/InputStreamReader"
                         | "java/lang/ref/Cleaner"
                         | "java/lang/ref/Cleaner$Cleanable"
                         | "java/lang/management/ManagementFactory"
@@ -11475,10 +11452,21 @@ fn invoke_on_class_shared_inner(
                             && ((method_name == "findClass"
                                 && descriptor == "(Ljava/lang/String;)Ljava/lang/Class;")
                                 || (method_name == "findResource"
-                                && descriptor == "(Ljava/lang/String;)Ljava/net/URL;")
+                                    && descriptor == "(Ljava/lang/String;)Ljava/net/URL;")
                                 || (method_name == "findResources"
                                     && descriptor
-                                        == "(Ljava/lang/String;)Ljava/util/Enumeration;")))
+                                        == "(Ljava/lang/String;)Ljava/util/Enumeration;")
+                                || (method_name == "<init>"
+                                    && matches!(
+                                        descriptor,
+                                        "([Ljava/net/URL;)V"
+                                            | "([Ljava/net/URL;Ljava/lang/ClassLoader;)V"
+                                            | "(Ljava/lang/String;[Ljava/net/URL;Ljava/lang/ClassLoader;)V"
+                                            | "([Ljava/net/URL;Ljava/lang/ClassLoader;Ljava/net/URLStreamHandlerFactory;)V"
+                                            | "(Ljava/lang/String;[Ljava/net/URL;Ljava/lang/ClassLoader;Ljava/net/URLStreamHandlerFactory;)V"
+                                            | "([Ljava/net/URL;Ljava/security/AccessControlContext;)V"
+                                            | "(Ljava/lang/String;[Ljava/net/URL;Ljava/lang/ClassLoader;Ljava/security/AccessControlContext;)V"
+                                    ))))
                         || (matches!(
                             class_name,
                             "jdk/internal/loader/URLClassPath" | "sun/misc/URLClassPath"
@@ -12675,12 +12663,26 @@ fn invoke_on_class_shared_inner(
                         || (class_name == "java/util/concurrent/LinkedBlockingQueue"
                             && method_name == "clear"
                             && descriptor == "()V")
-                        // Keep the slow stackless/native path aligned with
-                        // interpreter.rs::force_native_over_real_jdk_bytecode
-                        // for Map's default forEach implementation.
-                        || (class_name == "java/util/Map"
-                            && method_name == "forEach"
-                            && descriptor == "(Ljava/util/function/BiConsumer;)V")
+                        || (class_name == "java/util/concurrent/LinkedBlockingDeque"
+                            && method_name == "clear"
+                            && descriptor == "()V")
+                        || (class_name == "java/io/BufferedInputStream"
+                            && matches!(
+                                (method_name, descriptor),
+                                ("read", "()I")
+                                    | ("read", "([BII)I")
+                                    | ("skip", "(J)J")
+                                    | ("available", "()I")
+                                    | ("mark", "(I)V")
+                                    | ("reset", "()V")
+                                    | ("markSupported", "()Z")
+                                    | ("close", "()V")
+                            ))
+                        || (matches!(class_name, "java/lang/Iterable" | "java/util/Collection" | "java/util/Set" | "java/util/EnumSet")
+                            && method_name == "iterator"
+                            && descriptor == "()Ljava/util/Iterator;")
+                        || (class_name == "java/util/Iterator"
+                            && matches!(method_name, "hasNext" | "next" | "remove"))
                         // Spring Reactor StepVerifier uses timed
                         // CountDownLatch.await during cancel/timeout tests. The
                         // real JDK latch parks through AQS/Unsafe machinery; the
@@ -12688,76 +12690,6 @@ fn invoke_on_class_shared_inner(
                         // and waits on the object monitor. Keep this slow-path
                         // gate in sync with force_native_over_real_jdk_bytecode.
                         || crate::runtime::interpreter::is_count_down_latch_native_override(
-                            class_name,
-                            method_name,
-                            descriptor,
-                        )
-                        || crate::runtime::interpreter::is_enum_set_native_override(
-                            class_name,
-                            method_name,
-                            descriptor,
-                        )
-                        || crate::runtime::interpreter::is_unsafe_object_field_offset_native_override(
-                            class_name,
-                            method_name,
-                            descriptor,
-                        )
-                        || crate::runtime::interpreter::is_sun_unsafe_ordered_write_native_override(
-                            class_name,
-                            method_name,
-                            descriptor,
-                        )
-                        || crate::runtime::interpreter::is_java_util_hash_native_override(
-                            class_name,
-                            method_name,
-                            descriptor,
-                        )
-                        || crate::runtime::interpreter::is_collectors_native_override(
-                            class_name,
-                            method_name,
-                            descriptor,
-                        )
-                        || crate::runtime::interpreter::is_smallrye_process_native_override(
-                            class_name,
-                            method_name,
-                            descriptor,
-                        )
-                        || crate::runtime::interpreter::is_regex_matcher_native_override(
-                            class_name,
-                            method_name,
-                            descriptor,
-                        )
-                        || crate::runtime::interpreter::is_liquibase_parser_factory_native_override(
-                            class_name,
-                            method_name,
-                            descriptor,
-                        )
-                        || crate::runtime::interpreter::is_file_is_invalid_native_override(
-                            class_name,
-                            method_name,
-                            descriptor,
-                        )
-                        || crate::runtime::interpreter::is_sax_parser_factory_set_validating_native_override(
-                            class_name,
-                            method_name,
-                            descriptor,
-                        )
-                        || crate::runtime::interpreter::is_liquibase_entity_resolver_native_override(
-                            class_name,
-                            method_name,
-                            descriptor,
-                        )
-                        || crate::runtime::interpreter::is_liquibase_configuration_definition_native_override(
-                            class_name,
-                            method_name,
-                            descriptor,
-                        )
-                        || crate::runtime::interpreter::is_liquibase_expression_expander_native_override(
-                            class_name,
-                            method_name,
-                            descriptor,
-                        )
-                        || crate::runtime::interpreter::is_hibernate_query_engine_validate_named_queries_native_override(
                             class_name,
                             method_name,
                             descriptor,
@@ -12913,11 +12845,6 @@ fn invoke_on_class_shared_inner(
                         // cglib_probe: defensive Unsafe.defineClass shim (null bytecode → null).
                         || (matches!(class_name, "sun/misc/Unsafe" | "jdk/internal/misc/Unsafe")
                             && method_name == "defineClass")
-                        || crate::runtime::interpreter::is_unsafe_object_field_offset_native_override(
-                            class_name,
-                            method_name,
-                            descriptor,
-                        )
                         // sportme (Spring Boot 2): AbstractBeanFactory / AbstractBeanDefinition
                         // resolveBeanClass — real-JDK bytecode calls ClassUtils.forName which
                         // throws ClassNotFoundException for beans whose class is missing on
@@ -13439,6 +13366,11 @@ fn invoke_on_class_shared_inner(
                             descriptor,
                         )
                         || crate::runtime::interpreter::is_jdk_wrapper_math_native_override(
+                            class_name,
+                            method_name,
+                            descriptor,
+                        )
+                        || crate::runtime::interpreter::is_bc_crypto_math_native_override(
                             class_name,
                             method_name,
                             descriptor,
@@ -14285,6 +14217,52 @@ fn invoke_on_class_shared_inner(
                 descriptor,
                 receiver_type.as_deref(),
             );
+        }
+    }
+
+    if !is_native {
+        let class_name_for_force = shared
+            .class_manager
+            .read()
+            .get_class(declaring_class_id)
+            .map(|c| c.name.to_string())
+            .unwrap_or_default();
+        // See the identical guard + comment in `invoke_or_native` above: a
+        // genuinely real, bytecode-constructed `ThreadPoolExecutor` (real
+        // `workers` field populated) must keep running its own real
+        // `execute()` bytecode -- only CratonVM's synthetic 2-field
+        // `Executors.new*ThreadPool()` objects need the forced native. This
+        // call site (`invoke_on_class_shared_inner`) is a SEPARATE dispatch
+        // path from `invoke_or_native` (e.g. reached from the interpreter's
+        // reflection/initial-invoke routes) that independently consults
+        // `should_force_registered_native_over_bytecode`, so it needs its own
+        // copy of the receiver check. See docs/known-issues/
+        // threadpoolexecutor-execute-npe-on-ctl-regression.md.
+        let force_native_receiver_exempt = class_name_for_force
+            == "java/util/concurrent/ThreadPoolExecutor"
+            && method_name == "execute"
+            && matches!(args.first(), Some(Value::Object(Some(recv))) if {
+                let recv_class_id = shared.heap.class_id_of(*recv);
+                let cm = shared.class_manager.read();
+                resolve_field_index_in_hierarchy(recv_class_id, "workers", &cm.class_store)
+                    .map(|idx| matches!(shared.heap.get_field(*recv, idx), Value::Object(Some(_))))
+                    .unwrap_or(false)
+            });
+        if !force_native_receiver_exempt
+            && crate::runtime::interpreter::should_force_registered_native_over_bytecode(
+                shared,
+                &class_name_for_force,
+                method_name,
+                descriptor,
+            )
+        {
+            if let Some(callback) =
+                shared
+                    .native_methods
+                    .find(&class_name_for_force, method_name, descriptor)
+            {
+                return safe_native_call(shared, thread, callback, args);
+            }
         }
     }
 

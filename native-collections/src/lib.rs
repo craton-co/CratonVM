@@ -2366,7 +2366,8 @@ pub fn native_al_iterator(ctx: &mut dyn NativeContext, args: &[Value]) -> Method
         // and iterate the snapshot — mirroring the EnumSet path below. The
         // Path-class `iterator()` native (phases_late) still serves direct
         // `path.iterator()` calls.
-        if cls == "java/util/RegularEnumSet"
+        if cls == "java/util/EnumSet"
+            || cls == "java/util/RegularEnumSet"
             || cls == "java/util/JumboEnumSet"
             || cls == "java/nio/file/Path"
         {
@@ -7352,6 +7353,14 @@ fn native_hs_iterator(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
         Some(Value::Object(Some(obj))) => *obj,
         _ => return Ok(Some(Value::Object(None))),
     };
+    if let Some(cls) = ctx.class_name_of_id(ctx.class_id_of_object(this)) {
+        if cls == "java/util/EnumSet"
+            || cls == "java/util/RegularEnumSet"
+            || cls == "java/util/JumboEnumSet"
+        {
+            return native_al_iterator(ctx, args);
+        }
+    }
     resync_view_set(ctx, this);
     let backing = match hs_backing_map(ctx, this) {
         Some(m) => m,
@@ -26336,8 +26345,12 @@ fn native_tm_clear(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRes
         _ => return Ok(None),
     };
     // Fast-mode side-table needs clearing too — without this an iter
-    // helper would return stale entries from before the clear.
-    tm_fast_with(ctx, this, |bt| bt.clear());
+    // helper would return stale entries from before the clear. Remove the
+    // entry directly instead of going through `tm_fast_with`: comparator-backed
+    // TreeMaps live in array mode, and creating an empty fast entry here would
+    // make subsequent reads ignore the array store after clear()+put().
+    let key = tm_obj_key(ctx, this);
+    tm_fast_table().lock().unwrap().remove(&key);
     let buf = alloc_ref_array(ctx, TM_DEFAULT_CAPACITY * 2);
     tm_set_slot(ctx, this, TM_FIELD_DATA, Value::Object(Some(buf)));
     tm_set_slot(ctx, this, TM_FIELD_SIZE, Value::Int(0));
@@ -33834,6 +33847,7 @@ fn register_linked_blocking_deque_stub_natives(r: &mut NativeMethodRegistry) {
     );
     r.register(lbd, "size", "()I", native_lbq_size);
     r.register(lbd, "isEmpty", "()Z", native_lbq_is_empty);
+    r.register(lbd, "clear", "()V", native_lbq_clear);
     r.register(
         lbd,
         "iterator",

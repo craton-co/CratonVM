@@ -625,7 +625,6 @@ fn build_request(
     }
     let mut has_user_agent = false;
     let mut has_content_length = false;
-    let mut has_connection = false;
     let mut has_content_type = false;
     let mut has_authorization = false;
     for (k, v) in headers {
@@ -635,9 +634,6 @@ fn build_request(
         }
         if lk == "content-length" {
             has_content_length = true;
-        }
-        if lk == "connection" {
-            has_connection = true;
         }
         if lk == "content-type" {
             has_content_type = true;
@@ -675,10 +671,6 @@ fn build_request(
     // never parsed as parameters).
     if !has_content_type && is_output_method {
         out.extend_from_slice(b"Content-Type: application/x-www-form-urlencoded\r\n");
-    }
-    if !has_connection {
-        // HttpURLConnection in real-JDK defaults to closing the connection.
-        out.extend_from_slice(b"Connection: close\r\n");
     }
     out.extend_from_slice(b"\r\n");
     out.extend_from_slice(body);
@@ -1235,14 +1227,12 @@ fn perform(
         drop(active_ctx_guard);
         outcome
     } else {
-        ctx.begin_blocking_region();
         let mut s = tcp;
         let result = (|| -> Result<(i32, Vec<(String, String)>, Vec<u8>), String> {
             s.write_all(&req).map_err(|e| format!("write: {e}"))?;
             s.flush().map_err(|e| format!("flush: {e}"))?;
             read_response(&mut s, head)
         })();
-        ctx.end_blocking_region();
         result
     }
 }
@@ -2413,7 +2403,6 @@ mod http_url_connection_tests {
         assert!(s.starts_with("GET /foo HTTP/1.1\r\n"));
         assert!(s.contains("Host: example.com\r\n"));
         assert!(s.contains("User-Agent: Java/CratonVM\r\n"));
-        assert!(s.contains("Connection: close\r\n"));
     }
 
     #[test]

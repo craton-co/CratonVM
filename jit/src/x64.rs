@@ -1100,46 +1100,47 @@ pub fn jit_scan(code: &[u8], code_len: usize, descriptor: &str) -> Option<JitSca
     let mut ldc2w_ops: Vec<(usize, u16)> = Vec::new(); // (pc, cp_index) for `ldc2_w` (0x14)
     let mut indy_ops: Vec<(usize, u16)> = Vec::new(); // (pc, cp_index) for `invokedynamic` (0xba)
     let mut has_athrow = false; // RBC.6 — method contains 0xbf
-                                // BUG-LQB-SCOPE: earliest bytecode pc of any instruction with an
-                                // observable, non-idempotent side effect (putfield/putstatic, an array
-                                // store, or any invoke* — a callee can mutate arbitrary state). The
-                                // `invokedynamic` (0xba) arm below lowers to an UNCONDITIONAL jump to the
-                                // shared uncommon-trap deopt stub (reason 8, `UnreachedCode`) — control
-                                // never returns from the trap into JIT-compiled code, and the VM's
-                                // fallback for that trap (when no precise resume snapshot exists, which
-                                // is unconditionally true for reason 8 as of the 2026-07-07 Groovy-
-                                // regression revert — see
-                                // docs/known-issues/jit-invokedynamic-uncommon-trap-precise-resume-groovy-regression.md)
-                                // is to RE-EXECUTE THE WHOLE METHOD FROM ITS INTERPRETER ENTRY. Any
-                                // side-effecting bytecode positioned BEFORE the indy in program order
-                                // already ran for real once under the (aborted) JIT attempt, so the
-                                // interpreter's from-scratch re-run executes it a SECOND time — a
-                                // genuine double-execution, not just a performance cost. Confirmed via a
-                                // minimal standalone repro (`enter()`-shaped method: `counter++;
-                                // ...concat via invokedynamic...`) invoked from a JIT-compiled caller:
-                                // the counter field was incremented twice per logical call. This is the
-                                // root cause of the Liquibase `Scope` "Cannot end scope X when currently
-                                // at scope root" corruption (docs/known-issues/keycloak-07-04/
-                                // testsuite-model-liquibase-scope-corruption.md) — `Scope.enter()`-style
-                                // methods perform a `putstatic`/field mutation before a string-concat
-                                // `invokedynamic`, so the ThreadLocal-tracked scope stack gets pushed
-                                // twice for one logical `Scope.enter()` call once such a helper method
-                                // gets JIT-compiled and reached from a JIT-compiled (or otherwise
-                                // JIT-dispatching) caller.
-                                //
-                                // Fix: track the earliest such pc; after the scan, if it precedes any
-                                // `invokedynamic` site, refuse to compile the WHOLE method (return
-                                // `None`, same fail-safe posture as the RBC.6 athrow+exception-table
-                                // gate below) rather than emit unconditional-trap codegen that can
-                                // double-execute already-committed work. This only affects methods that
-                                // have both a live invokedynamic AND an earlier side effect in raw
-                                // bytecode-pc order — the overwhelmingly common case (an
-                                // `assert cond : "msg" + x;` message-concat sitting on a dead branch
-                                // near the end of a method, unrelated to any earlier field/array
-                                // mutation reachability) is unaffected and still compiles at full JIT
-                                // speed; methods that fail this new gate simply stay fully interpreted
-                                // (correct, just not JIT-accelerated), matching the scanner's existing
-                                // "when in doubt, don't compile" philosophy.
+    let mut has_newarray = false; // Primitive array allocation (0xbc)
+                                  // BUG-LQB-SCOPE: earliest bytecode pc of any instruction with an
+                                  // observable, non-idempotent side effect (putfield/putstatic, an array
+                                  // store, or any invoke* — a callee can mutate arbitrary state). The
+                                  // `invokedynamic` (0xba) arm below lowers to an UNCONDITIONAL jump to the
+                                  // shared uncommon-trap deopt stub (reason 8, `UnreachedCode`) — control
+                                  // never returns from the trap into JIT-compiled code, and the VM's
+                                  // fallback for that trap (when no precise resume snapshot exists, which
+                                  // is unconditionally true for reason 8 as of the 2026-07-07 Groovy-
+                                  // regression revert — see
+                                  // docs/known-issues/jit-invokedynamic-uncommon-trap-precise-resume-groovy-regression.md)
+                                  // is to RE-EXECUTE THE WHOLE METHOD FROM ITS INTERPRETER ENTRY. Any
+                                  // side-effecting bytecode positioned BEFORE the indy in program order
+                                  // already ran for real once under the (aborted) JIT attempt, so the
+                                  // interpreter's from-scratch re-run executes it a SECOND time — a
+                                  // genuine double-execution, not just a performance cost. Confirmed via a
+                                  // minimal standalone repro (`enter()`-shaped method: `counter++;
+                                  // ...concat via invokedynamic...`) invoked from a JIT-compiled caller:
+                                  // the counter field was incremented twice per logical call. This is the
+                                  // root cause of the Liquibase `Scope` "Cannot end scope X when currently
+                                  // at scope root" corruption (docs/known-issues/keycloak-07-04/
+                                  // testsuite-model-liquibase-scope-corruption.md) — `Scope.enter()`-style
+                                  // methods perform a `putstatic`/field mutation before a string-concat
+                                  // `invokedynamic`, so the ThreadLocal-tracked scope stack gets pushed
+                                  // twice for one logical `Scope.enter()` call once such a helper method
+                                  // gets JIT-compiled and reached from a JIT-compiled (or otherwise
+                                  // JIT-dispatching) caller.
+                                  //
+                                  // Fix: track the earliest such pc; after the scan, if it precedes any
+                                  // `invokedynamic` site, refuse to compile the WHOLE method (return
+                                  // `None`, same fail-safe posture as the RBC.6 athrow+exception-table
+                                  // gate below) rather than emit unconditional-trap codegen that can
+                                  // double-execute already-committed work. This only affects methods that
+                                  // have both a live invokedynamic AND an earlier side effect in raw
+                                  // bytecode-pc order — the overwhelmingly common case (an
+                                  // `assert cond : "msg" + x;` message-concat sitting on a dead branch
+                                  // near the end of a method, unrelated to any earlier field/array
+                                  // mutation reachability) is unaffected and still compiles at full JIT
+                                  // speed; methods that fail this new gate simply stay fully interpreted
+                                  // (correct, just not JIT-accelerated), matching the scanner's existing
+                                  // "when in doubt, don't compile" philosophy.
     let mut first_committing_side_effect_pc: Option<usize> = None;
     let mut pc = 0;
     while pc < code_len {
@@ -1441,6 +1442,7 @@ pub fn jit_scan(code: &[u8], code_len: usize, descriptor: &str) -> Option<JitSca
                 if pc + 1 >= code_len {
                     return None;
                 }
+                has_newarray = true;
                 needs_heap = true;
                 pc += 2;
             }
@@ -1799,6 +1801,7 @@ pub fn jit_scan(code: &[u8], code_len: usize, descriptor: &str) -> Option<JitSca
         ldc2w_ops,
         indy_ops,
         has_athrow,
+        has_newarray,
     })
 }
 
@@ -1835,6 +1838,8 @@ pub struct JitScanResult {
     /// stashes the exception and returns the deopt sentinel; it cannot
     /// branch to an in-method handler), and never via OSR.
     pub has_athrow: bool,
+    /// The method contains primitive `newarray` (0xbc).
+    pub has_newarray: bool,
 }
 
 /// Check if a bytecode method can be JIT-compiled (backward-compatible wrapper).
@@ -13349,8 +13354,13 @@ impl Compiler {
         let callee_num_args = site.callee_num_args;
         let callee_max_locals = site.callee_max_locals;
         let _return_type = site.return_type;
+        let (callee_param_jvm_slots, callee_param_slot_span) =
+            crate::compute_param_jvm_slots(&site.descriptor, site.callee_is_static);
+        if callee_param_jvm_slots.len() != callee_num_args {
+            return false;
+        }
 
-        let callee_locals_size = callee_max_locals.max(callee_num_args);
+        let callee_locals_size = callee_max_locals.max(callee_param_slot_span);
         // Allocate callee locals in caller's spill area.
         let Some(callee_local_base) = self.reserve_spill_slots(callee_locals_size) else {
             return false;
@@ -13365,16 +13375,25 @@ impl Compiler {
             return false;
         }
 
-        // Store args into callee locals (in reverse order from stack)
+        // Store args into the callee's JVM local slots. Category-2 parameters
+        // consume two JVM slots while the JIT operand stack carries one i64
+        // value, so the descriptor-derived slot map must mirror the normal
+        // prologue layout (`(JJI)J` -> slots 0, 2, 4).
         for i in (0..callee_num_args).rev() {
             let slot = self.pop_stack();
-            let local_off = callee_local_base + (i as i32) * 8; // Cast: x86-64 immediate encoding
+            let local_idx = callee_param_jvm_slots[i];
+            let local_off = callee_local_base + (local_idx as i32) * 8; // Cast: x86-64 immediate encoding
             self.load_slot_to_reg(RAX, slot);
             self.emit_store_local(local_off, RAX);
         }
 
-        // Zero-init remaining callee locals
-        for i in callee_num_args..callee_locals_size {
+        // Zero-init every non-parameter callee local. Do not start at
+        // `callee_num_args`: that compact arg count is not a JVM local index
+        // when category-2 parameters are present.
+        for i in 0..callee_locals_size {
+            if callee_param_jvm_slots.contains(&i) {
+                continue;
+            }
             let local_off = callee_local_base + (i as i32) * 8; // Cast: x86-64 immediate encoding
             self.emit_xor_reg_self(RAX);
             self.emit_store_local(local_off, RAX);
@@ -23321,8 +23340,28 @@ impl Compiler {
                             //      fits in ARG_REGS.
                             let needs_ctx_arg_count = n + 1; // vm_ptr + n receiver/params
                             let args_fit = n >= 1 && needs_ctx_arg_count <= ARG_REGS.len();
-                            let pic_inline = pic_ptr.is_some() && args_fit;
-                            let mic_inline = !pic_inline && mic_ptr.is_some() && args_fit;
+                            // Spring SpEL's flawed-pattern threshold test drives
+                            // catastrophic regex backtracking through the mutually
+                            // recursive BmpCharPropertyGreedy/GroupHead pair. The
+                            // raw inline IC direct-call path skips the dispatch
+                            // helper's frame bookkeeping for that recursion shape
+                            // and short-circuits the search after only ~2k
+                            // CharSequence accesses. Keep just this pair on the
+                            // helper path; the helper can still call compiled
+                            // callees, but preserves the backtracking state.
+                            let regex_backtracking_frame = self
+                                .method_label
+                                .starts_with("java/util/regex/Pattern$BmpCharPropertyGreedy.match")
+                                || self
+                                    .method_label
+                                    .starts_with("java/util/regex/Pattern$GroupHead.match");
+                            let inline_virtual_ic_allowed = !regex_backtracking_frame;
+                            let pic_inline =
+                                inline_virtual_ic_allowed && pic_ptr.is_some() && args_fit;
+                            let mic_inline = inline_virtual_ic_allowed
+                                && !pic_inline
+                                && mic_ptr.is_some()
+                                && args_fit;
                             // `.done` patches collected from each emitted
                             // fast-path. Multiple in PIC's case (one per
                             // slot), one in MIC's, none if neither inline
@@ -24914,7 +24953,12 @@ pub fn compile_with_param_slots(
     // operand depth); the total is bounded by `MAX_INLINE_BUDGET`.
     let inline_stack_reserve: usize = inline_sites
         .values()
-        .map(|s| s.callee_max_locals.saturating_add(s.callee_code_len))
+        .map(|s| {
+            let (_, param_span) = crate::compute_param_jvm_slots(&s.descriptor, s.callee_is_static);
+            s.callee_max_locals
+                .max(param_span)
+                .saturating_add(s.callee_code_len)
+        })
         .sum();
     let max_stack = max_stack
         .saturating_add(max_invoke_args)
@@ -26748,6 +26792,7 @@ mod tests {
         let pure_code: Vec<u8> = vec![0x1a, 0x1b, 0x60, 0xac, 0, 0]; // iload_0, iload_1, iadd, ireturn
         let result = jit_scan(&pure_code, 4, "(II)I").unwrap();
         assert!(!result.needs_heap);
+        assert!(!result.has_newarray);
         assert!(result.multianewarray_ops.is_empty());
 
         // Method with newarray needs heap
@@ -26762,6 +26807,7 @@ mod tests {
         ];
         let result = jit_scan(&array_code, 7, "(I)I").unwrap();
         assert!(result.needs_heap);
+        assert!(result.has_newarray);
     }
 
     #[test]
@@ -34951,6 +34997,20 @@ mod tests {
         let mut callee_code = callee_bytecode.to_vec();
         callee_code.push(0); // padding
         callee_code.push(0);
+        let declared_args = if callee_is_static {
+            callee_num_args
+        } else {
+            callee_num_args.saturating_sub(1)
+        };
+        let descriptor = format!(
+            "({}){}",
+            "I".repeat(declared_args),
+            if return_type == b'V' {
+                "V".to_string()
+            } else {
+                "I".to_string()
+            }
+        );
         crate::InlineSite {
             callee_code,
             callee_code_len: callee_bytecode.len(),
@@ -34965,7 +35025,7 @@ mod tests {
             needs_heap: false,
             class_name: "Test".to_string(),
             method_name: "inlined".to_string(),
-            descriptor: "()I".to_string(),
+            descriptor,
             elided_invoke_pcs: Vec::new(),
         }
     }
@@ -35434,6 +35494,83 @@ mod tests {
                 compiled.try_call(&[-7i32 as i64]).expect("test JIT call"),
                 -14
             ); // Cast: JIT ABI convention
+        }
+    }
+
+    #[test]
+    fn s31_inline_category2_params_use_jvm_local_slots() {
+        // Mirrors Bouncy Castle Bits.bitPermuteStep(JJI)J:
+        //   long x -> local 0/1, long m -> local 2/3, int s -> local 4.
+        // The inline emitter used to deposit the three JIT args compactly into
+        // locals 0, 1, 2, so `lload_2` read the shift count and `iload 4` read
+        // zero. That miscompiled Interleave.expand64To128 after tiered inlining.
+        let callee_bc: Vec<u8> = vec![
+            0x1e, // 0: lload_0
+            0x1e, // 1: lload_0
+            0x15, 0x04, // 2: iload 4
+            0x7d, // 4: lushr
+            0x83, // 5: lxor
+            0x20, // 6: lload_2
+            0x7f, // 7: land
+            0x37, 0x05, // 8: lstore 5
+            0x16, 0x05, // 10: lload 5
+            0x16, 0x05, // 12: lload 5
+            0x15, 0x04, // 14: iload 4
+            0x79, // 16: lshl
+            0x83, // 17: lxor
+            0x1e, // 18: lload_0
+            0x83, // 19: lxor
+            0xad, // 20: lreturn
+        ];
+
+        let caller_code: Vec<u8> = vec![
+            0x1a, // 0: iload_0 (x, represented as i64 in this JIT ABI)
+            0x1b, // 1: iload_1 (m)
+            0x1c, // 2: iload_2 (s)
+            0xb8, 0x00, 0x01, // 3: invokestatic
+            0xad, // 6: lreturn
+            0, 0,
+        ];
+        let caller_len = 7;
+
+        let mut callee = make_inline_site(&callee_bc, 7, 3, true, b'J');
+        callee.descriptor = "(JJI)J".to_string();
+        let mut sites = HashMap::new();
+        sites.insert(3, callee);
+
+        let compiled = compile_with_inlines(&caller_code, caller_len, 3, 3, sites)
+            .expect("category-2 inline callee must compile");
+
+        let expect = |x: i64, m: i64, s: i64| -> i64 {
+            let x = x as u64;
+            let m = m as u64;
+            let s = (s as u32) & 0x3f;
+            let t = (x ^ (x >> s)) & m;
+            (x ^ t ^ (t << s)) as i64
+        };
+
+        // SAFETY: Calling JIT-compiled machine code in a test; the CompiledMethod was
+        // produced by the JIT compiler from valid bytecode and the mmap region is executable.
+        unsafe {
+            let cases = [
+                (0x0123_4567_89ab_cdef_i64, 0x0000_ffff_0000_0000_i64, 16_i64),
+                (
+                    0x8000_0000_0000_0001_u64 as i64,
+                    0x2222_2222_2222_2222_i64,
+                    1_i64,
+                ),
+                (
+                    0xfedc_ba98_7654_3210_u64 as i64,
+                    0x0c0c_0c0c_0c0c_0c0c_i64,
+                    2_i64,
+                ),
+            ];
+            for (x, m, s) in cases {
+                assert_eq!(
+                    compiled.try_call(&[x, m, s]).expect("test JIT call"),
+                    expect(x, m, s)
+                );
+            }
         }
     }
 

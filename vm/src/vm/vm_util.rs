@@ -2081,7 +2081,7 @@ impl<'a> crate::classloading::vtype::ClassHierarchy for ClassStoreHierarchy<'a> 
             }
         }
 
-        "java/lang/Object".to_string()
+        crate::classloading::static_common_superclass_lookup(a, b)
     }
 
     fn is_interface(&self, name: &str) -> bool {
@@ -3350,6 +3350,23 @@ mod tests {
         assert_eq!(
             hierarchy.common_superclass("com/unknown/A", "com/unknown/B"),
             "java/lang/Object"
+        );
+    }
+
+    #[test]
+    fn hierarchy_common_superclass_xstream_exception_siblings() {
+        let shared = test_shared();
+        let cm = shared.class_manager.read();
+        let hierarchy = ClassStoreHierarchy {
+            store: &cm.class_store,
+        };
+        use crate::classloading::vtype::ClassHierarchy;
+        assert_eq!(
+            hierarchy.common_superclass(
+                "com/thoughtworks/xstream/converters/reflection/ObjectAccessException",
+                "com/thoughtworks/xstream/converters/ConversionException",
+            ),
+            "com/thoughtworks/xstream/converters/ErrorWritingException"
         );
     }
 

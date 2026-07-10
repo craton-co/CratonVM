@@ -1393,24 +1393,6 @@ fn process_references_after_gc(
 
     let result = ref_proc.process_references(&is_marked, 64, 0);
 
-    let is_reference_object = |obj: ObjectRef| -> bool {
-        if shared.heap.num_fields(obj) < 2 {
-            return false;
-        }
-        let mut current = Some(shared.heap.class_id_of(obj));
-        let cm = shared.class_manager.read();
-        while let Some(cid) = current {
-            let Some(cls) = cm.class_store.get(cid) else {
-                return false;
-            };
-            if cls.name.as_ref() == "java/lang/ref/Reference" {
-                return true;
-            }
-            current = cls.superclass;
-        }
-        false
-    };
-
     // bc math-ec 0x4 ROOT-CAUSE FIX (2026-06-09, hexdump-proven): the
     // cleared/enqueue lists hold PRE-GC addresses; `pointer_map.get(..)
     // .unwrap_or(addr)` keeps the STALE address for a Reference that was
@@ -1628,18 +1610,10 @@ fn process_references_after_gc(
             };
             // SAFETY: both addresses are live post-collection object headers.
             let ro = unsafe { ObjectRef::from_raw(ref_obj_new as *mut u8) };
-            if !is_reference_object(ro) {
-                if straystack_enabled() {
-                    eprintln!(
-                        "[refproc] SKIP stale RESTORE ref @0x{ref_obj_new:x} (not Reference)"
-                    );
-                }
-                continue;
-            }
             let rt = unsafe { ObjectRef::from_raw(referent_new as *mut u8) };
             // Slot 0 = REF_FIELD_REFERENT. `set_field` fires the write barrier,
             // so a young referent restored into a promoted (old-gen) Reference
-            // re-marks the old-to-young card.
+            // re-marks the old→young card.
             shared.heap.set_field(ro, 0, Value::Object(Some(rt)));
         }
         // Drop entries whose Reference object was collected this cycle so the
@@ -2047,26 +2021,6 @@ fn gc_alloc_array(
     element_type: ArrayElementType,
     length: usize,
 ) -> Result<ObjectRef, MethodCallFailed> {
-    if std::env::var_os("CRATONVM_DBG_LARGE_ARRAY_ALLOC").is_some() && length > 100_000_000 {
-        eprintln!(
-            "[DBG_LARGE_ARRAY_ALLOC] class_id={} element_type={:?} length={} (0x{:x}) frames={}",
-            class_id.as_u32(),
-            element_type,
-            length,
-            length,
-            thread.frames.len()
-        );
-        for (i, frame) in thread.frames.iter().rev().take(64).enumerate() {
-            eprintln!(
-                "[DBG_LARGE_ARRAY_ALLOC frame {}] {}.{}{} pc={}",
-                i,
-                frame.class_name(),
-                frame.method_name(),
-                frame.method_descriptor(),
-                frame.pc
-            );
-        }
-    }
     if let Some(arr) = shared.heap.try_alloc_array(class_id, element_type, length) {
         return Ok(arr);
     }
@@ -5728,9 +5682,11 @@ pub(crate) fn try_osr_with_backoff(
             // compile (idempotent), and back off so we re-probe later rather
             // than spin. A subsequent hot back-edge finds the published
             // artifact and falls through to the reuse-enter below.
-            ensure_bg_compiler_started(shared);
             let key = crate::jit::tiered::MethodKey::new(cn, mn, md);
-            let _ = shared.tiered_manager.request_osr(&key, entry_pc as u32);
+            if !crate::jit::tiered::is_osr_denied(&key) {
+                ensure_bg_compiler_started(shared);
+                let _ = shared.tiered_manager.request_osr(&key, entry_pc as u32);
+            }
             thread.frames[*frame_idx].record_osr_rejection(entry_pc);
             return OsrBackoffOutcome::Skip;
         }
@@ -12520,29 +12476,6 @@ fn execute_instruction(
             } else {
                 shared.heap.get_field(obj_ref, field.field_index)
             };
-            if std::env::var_os("CRATONVM_DBG_PEEKMAP").is_some() {
-                let field_name = resolve_field_name(shared, current_class_id, *index);
-                if matches!(field_name.as_deref(), Some("map")) {
-                    let cm = shared.class_manager.read();
-                    let recv_cid = shared.heap.class_id_of(obj_ref);
-                    let recv_name = cm
-                        .get_class(recv_cid)
-                        .map(|c| c.name.to_string())
-                        .unwrap_or_default();
-                    if recv_name.contains("PeekableTouchable") {
-                        eprintln!(
-                            "[peekmap] GET recv={} obj=0x{:x} slot={} value={:?} in {}.{} pc={}",
-                            recv_name,
-                            obj_ref.as_ptr() as usize,
-                            field.field_index,
-                            value,
-                            thread.frames[frame_idx].class_name(),
-                            thread.frames[frame_idx].method_name(),
-                            thread.frames[frame_idx].pc
-                        );
-                    }
-                }
-            }
             // K2 (T10.9.E) — J/D direct-CompactValue fast path.
             //
             // For long/double fields, build the CompactValue with the exact
@@ -12963,29 +12896,6 @@ fn execute_instruction(
             let old_value = shared.heap.get_field(obj_ref, field.field_index);
             if let Value::Object(Some(old_ref)) = old_value {
                 shared.heap.write_barrier_pre(std::ptr::null_mut(), old_ref);
-            }
-            if std::env::var_os("CRATONVM_DBG_PEEKMAP").is_some() {
-                let field_name = resolve_field_name(shared, current_class_id, *index);
-                if matches!(field_name.as_deref(), Some("map")) {
-                    let cm = shared.class_manager.read();
-                    let recv_cid = shared.heap.class_id_of(obj_ref);
-                    let recv_name = cm
-                        .get_class(recv_cid)
-                        .map(|c| c.name.to_string())
-                        .unwrap_or_default();
-                    if recv_name.contains("PeekableTouchable") {
-                        eprintln!(
-                            "[peekmap] PUT recv={} obj=0x{:x} slot={} value={:?} in {}.{} pc={}",
-                            recv_name,
-                            obj_ref.as_ptr() as usize,
-                            field.field_index,
-                            value,
-                            thread.frames[frame_idx].class_name(),
-                            thread.frames[frame_idx].method_name(),
-                            thread.frames[frame_idx].pc
-                        );
-                    }
-                }
             }
             if field.is_volatile {
                 shared
@@ -16754,7 +16664,6 @@ fn execute_invoke_kind(
             )? {
                 if let Some(value) = result {
                     let ret = crate::jit::return_type(&method_descriptor);
-                    let value = crate::vm::remap_pending_native_return(thread, value);
                     let value = coerce_value_for_return(value, ret);
                     // T18.K4 — tag-exact push for J/D lambda return values.
                     push_invoke_return_value(&mut thread.frames[frame_idx].stack, value)?;
@@ -17791,7 +17700,6 @@ fn execute_invoke_kind(
     if let Some(value) = result {
         let ret = crate::jit::return_type(&method_descriptor);
         if ret != b'V' {
-            let value = crate::vm::remap_pending_native_return(thread, value);
             let value = coerce_value_for_return(value, ret);
             // T18.K4 — tag-exact push for J/D fallback invoke return values.
             push_invoke_return_value(&mut thread.frames[frame_idx].stack, value)?;
@@ -19383,7 +19291,6 @@ fn invoke_cached_native_callback(
         // its `max_stack` — kafka-clients `Crc32CTest.testUpdate` panicked at
         // `value_stack.rs` "len 24 index 24". Only push for non-void returns.
         if ret != b'V' {
-            let value = crate::vm::remap_pending_native_return(thread, value);
             let value = coerce_value_for_return(value, ret);
             push_invoke_return_value(&mut thread.frames[frame_idx].stack, value)?;
             crate::vm::native_return_pushed_to_stack(shared, thread);
@@ -20405,6 +20312,379 @@ pub(crate) fn is_jdk_wrapper_math_native_override(
     }
 }
 
+fn is_bc_sect_field_class(class_name: &str) -> bool {
+    matches!(
+        class_name,
+        "org/bouncycastle/math/ec/custom/sec/SecT113Field"
+            | "org/bouncycastle/math/ec/custom/sec/SecT131Field"
+            | "org/bouncycastle/math/ec/custom/sec/SecT163Field"
+            | "org/bouncycastle/math/ec/custom/sec/SecT193Field"
+            | "org/bouncycastle/math/ec/custom/sec/SecT233Field"
+            | "org/bouncycastle/math/ec/custom/sec/SecT239Field"
+            | "org/bouncycastle/math/ec/custom/sec/SecT283Field"
+            | "org/bouncycastle/math/ec/custom/sec/SecT409Field"
+            | "org/bouncycastle/math/ec/custom/sec/SecT571Field"
+    )
+}
+
+fn is_bc_sect_field_native_override(class_name: &str, method_name: &str, descriptor: &str) -> bool {
+    if !is_bc_sect_field_class(class_name) {
+        return false;
+    }
+    matches!(
+        (method_name, descriptor),
+        (
+            "add" | "addBothTo" | "addExt" | "multiply" | "multiplyAddToExt",
+            "([J[J[J)V"
+        ) | (
+            "addOne" | "halfTrace" | "invert" | "reduce" | "sqrt" | "square" | "squareAddToExt",
+            "([J[J)V"
+        ) | ("squareN", "([JI[J)V")
+            | ("trace", "([J)I")
+    ) || (class_name == "org/bouncycastle/math/ec/custom/sec/SecT571Field"
+        && matches!(
+            (method_name, descriptor),
+            ("precompMultiplicand", "([J)[J")
+                | ("multiplyPrecomp" | "multiplyPrecompAddToExt", "([J[J[J)V")
+        ))
+}
+
+fn is_bc_sect_point_class(class_name: &str) -> bool {
+    matches!(
+        class_name,
+        "org/bouncycastle/math/ec/custom/sec/SecT113R1Point"
+            | "org/bouncycastle/math/ec/custom/sec/SecT113R2Point"
+            | "org/bouncycastle/math/ec/custom/sec/SecT131R1Point"
+            | "org/bouncycastle/math/ec/custom/sec/SecT131R2Point"
+            | "org/bouncycastle/math/ec/custom/sec/SecT163K1Point"
+            | "org/bouncycastle/math/ec/custom/sec/SecT163R1Point"
+            | "org/bouncycastle/math/ec/custom/sec/SecT163R2Point"
+            | "org/bouncycastle/math/ec/custom/sec/SecT193R1Point"
+            | "org/bouncycastle/math/ec/custom/sec/SecT193R2Point"
+            | "org/bouncycastle/math/ec/custom/sec/SecT233K1Point"
+            | "org/bouncycastle/math/ec/custom/sec/SecT233R1Point"
+            | "org/bouncycastle/math/ec/custom/sec/SecT239K1Point"
+            | "org/bouncycastle/math/ec/custom/sec/SecT283K1Point"
+            | "org/bouncycastle/math/ec/custom/sec/SecT283R1Point"
+            | "org/bouncycastle/math/ec/custom/sec/SecT409K1Point"
+            | "org/bouncycastle/math/ec/custom/sec/SecT409R1Point"
+            | "org/bouncycastle/math/ec/custom/sec/SecT571K1Point"
+            | "org/bouncycastle/math/ec/custom/sec/SecT571R1Point"
+    )
+}
+
+pub(crate) fn is_bc_crypto_math_native_override(
+    class_name: &str,
+    method_name: &str,
+    descriptor: &str,
+) -> bool {
+    if is_bc_sect_field_native_override(class_name, method_name, descriptor) {
+        return true;
+    }
+    if class_name == "org/bouncycastle/math/ec/ECPoint"
+        && method_name == "timesPow2"
+        && descriptor == "(I)Lorg/bouncycastle/math/ec/ECPoint;"
+    {
+        return true;
+    }
+    if is_bc_sect_point_class(class_name)
+        && method_name == "twice"
+        && descriptor == "()Lorg/bouncycastle/math/ec/ECPoint;"
+    {
+        return true;
+    }
+    match class_name {
+        "org/bouncycastle/math/ec/ECFieldElement$Fp" => matches!(
+            (method_name, descriptor),
+            (
+                "add" | "subtract" | "multiply" | "divide",
+                "(Lorg/bouncycastle/math/ec/ECFieldElement;)Lorg/bouncycastle/math/ec/ECFieldElement;"
+            ) | ("addOne" | "square" | "negate" | "invert", "()Lorg/bouncycastle/math/ec/ECFieldElement;")
+                | (
+                    "modAdd" | "modMult" | "modSubtract",
+                    "(Ljava/math/BigInteger;Ljava/math/BigInteger;)Ljava/math/BigInteger;"
+                )
+                | (
+                    "modDouble" | "modHalf" | "modHalfAbs" | "modInverse" | "modReduce",
+                    "(Ljava/math/BigInteger;)Ljava/math/BigInteger;"
+                )
+                | (
+                    "multiplyPlusProduct" | "multiplyMinusProduct",
+                    "(Lorg/bouncycastle/math/ec/ECFieldElement;Lorg/bouncycastle/math/ec/ECFieldElement;Lorg/bouncycastle/math/ec/ECFieldElement;)Lorg/bouncycastle/math/ec/ECFieldElement;"
+                )
+                | (
+                    "squarePlusProduct" | "squareMinusProduct",
+                    "(Lorg/bouncycastle/math/ec/ECFieldElement;Lorg/bouncycastle/math/ec/ECFieldElement;)Lorg/bouncycastle/math/ec/ECFieldElement;"
+                )
+        ),
+        "org/bouncycastle/math/ec/ECFieldElement$F2m" => matches!(
+            (method_name, descriptor),
+            (
+                "add" | "subtract" | "multiply" | "divide",
+                "(Lorg/bouncycastle/math/ec/ECFieldElement;)Lorg/bouncycastle/math/ec/ECFieldElement;"
+            ) | ("addOne" | "square" | "negate" | "invert", "()Lorg/bouncycastle/math/ec/ECFieldElement;")
+                | (
+                    "multiplyPlusProduct" | "multiplyMinusProduct",
+                    "(Lorg/bouncycastle/math/ec/ECFieldElement;Lorg/bouncycastle/math/ec/ECFieldElement;Lorg/bouncycastle/math/ec/ECFieldElement;)Lorg/bouncycastle/math/ec/ECFieldElement;"
+                )
+                | (
+                    "squarePlusProduct" | "squareMinusProduct",
+                    "(Lorg/bouncycastle/math/ec/ECFieldElement;Lorg/bouncycastle/math/ec/ECFieldElement;)Lorg/bouncycastle/math/ec/ECFieldElement;"
+                )
+                | ("squarePow", "(I)Lorg/bouncycastle/math/ec/ECFieldElement;")
+        ),
+        "org/bouncycastle/math/ec/ECPoint$F2m" => matches!(
+            (method_name, descriptor),
+            (
+                "add" | "twicePlus",
+                "(Lorg/bouncycastle/math/ec/ECPoint;)Lorg/bouncycastle/math/ec/ECPoint;"
+            ) | ("twice", "()Lorg/bouncycastle/math/ec/ECPoint;")
+        ),
+        "org/bouncycastle/math/ec/ECPoint$Fp" => matches!(
+            (method_name, descriptor),
+            (
+                "add" | "twicePlus",
+                "(Lorg/bouncycastle/math/ec/ECPoint;)Lorg/bouncycastle/math/ec/ECPoint;"
+            ) | (
+                "twice" | "threeTimes" | "negate",
+                "()Lorg/bouncycastle/math/ec/ECPoint;"
+            ) | ("timesPow2", "(I)Lorg/bouncycastle/math/ec/ECPoint;")
+        ),
+        "org/bouncycastle/math/ec/ECAlgorithms" => matches!(
+            (method_name, descriptor),
+            (
+                "implShamirsTrickJsf",
+                "(Lorg/bouncycastle/math/ec/ECPoint;Ljava/math/BigInteger;Lorg/bouncycastle/math/ec/ECPoint;Ljava/math/BigInteger;)Lorg/bouncycastle/math/ec/ECPoint;"
+            )
+        ),
+        "org/bouncycastle/math/ec/LongArray" => matches!(
+            (method_name, descriptor),
+            ("modReduce" | "modSquare" | "modInverse", "(I[I)Lorg/bouncycastle/math/ec/LongArray;")
+                | ("reduce", "(I[I)V")
+                | (
+                    "modMultiply" | "multiply",
+                    "(Lorg/bouncycastle/math/ec/LongArray;I[I)Lorg/bouncycastle/math/ec/LongArray;"
+                )
+                | ("square", "(I[I)Lorg/bouncycastle/math/ec/LongArray;")
+                | ("modSquareN", "(II[I)Lorg/bouncycastle/math/ec/LongArray;")
+        ),
+        "org/bouncycastle/math/Primes" => matches!(
+            (method_name, descriptor),
+            ("implHasAnySmallFactors", "(Ljava/math/BigInteger;)Z")
+                | (
+                    "isMRProbablePrime",
+                    "(Ljava/math/BigInteger;Ljava/security/SecureRandom;I)Z"
+                )
+                | (
+                    "isMRProbablePrimeToBase",
+                    "(Ljava/math/BigInteger;Ljava/math/BigInteger;)Z"
+                )
+        ),
+        "org/bouncycastle/math/ec/rfc7748/X25519Field" => {
+            method_name == "mul" && descriptor == "([I[I[I)V"
+        }
+        "org/bouncycastle/math/ec/rfc7748/X448Field" => matches!(
+            (method_name, descriptor),
+            ("mul", "([I[I[I)V")
+                | ("mul", "([II[I)V")
+                | ("sqr", "([I[I)V")
+                | ("sqr", "([II[I)V")
+        ),
+        "org/bouncycastle/util/BigIntegers" => matches!(
+            (method_name, descriptor),
+            ("hasAnySmallFactors", "(Ljava/math/BigInteger;)Z")
+                | (
+                    "modOddInverse" | "modOddInverseVar",
+                    "(Ljava/math/BigInteger;Ljava/math/BigInteger;)Ljava/math/BigInteger;"
+                )
+        ),
+        "org/bouncycastle/crypto/prng/DigestRandomGenerator" => matches!(
+            (method_name, descriptor),
+            ("nextBytes", "([B)V") | ("nextBytes", "([BII)V")
+        ),
+        "org/bouncycastle/crypto/engines/GOST3412_2015Engine" => {
+            method_name == "processBlock" && descriptor == "([BI[BI)I"
+        }
+        "org/bouncycastle/crypto/engines/SM4Engine" => {
+            method_name == "processBlock" && descriptor == "([BI[BI)I"
+        }
+        "org/bouncycastle/crypto/engines/XTEAEngine" => {
+            method_name == "processBlock" && descriptor == "([BI[BI)I"
+        }
+        "org/bouncycastle/crypto/engines/Salsa20Engine" => {
+            (method_name == "salsaCore" && descriptor == "(I[I[I)V")
+                || (method_name == "processBytes" && descriptor == "([BII[BI)I")
+        }
+        "org/bouncycastle/crypto/engines/XSalsa20Engine"
+        | "org/bouncycastle/crypto/engines/ChaChaEngine"
+        | "org/bouncycastle/crypto/engines/ChaCha7539Engine"
+        | "org/bouncycastle/crypto/engines/XChaCha20Engine" => {
+            method_name == "processBytes" && descriptor == "([BII[BI)I"
+        }
+        "org/bouncycastle/crypto/engines/VMPCEngine"
+        | "org/bouncycastle/crypto/engines/VMPCKSA3Engine" => {
+            method_name == "processBytes" && descriptor == "([BII[BI)I"
+        }
+        "org/bouncycastle/crypto/engines/AESEngine" => matches!(
+            (method_name, descriptor),
+            ("encryptBlock" | "decryptBlock", "([BI[BI[[I)V")
+                | ("<init>", "()V")
+                | (
+                    "newInstance",
+                    "()Lorg/bouncycastle/crypto/MultiBlockCipher;"
+                )
+                | ("generateWorkingKey", "([BZ)[[I")
+                | (
+                    "init",
+                    "(ZLorg/bouncycastle/crypto/CipherParameters;)V"
+                )
+                | ("processBlock", "([BI[BI)I")
+        ),
+        "org/bouncycastle/crypto/engines/AESLightEngine"
+        | "org/bouncycastle/crypto/engines/AESFastEngine" => matches!(
+            (method_name, descriptor),
+            ("encryptBlock" | "decryptBlock", "([BI[BI[[I)V")
+                | ("<init>", "()V")
+                | ("generateWorkingKey", "([BZ)[[I")
+                | (
+                    "init",
+                    "(ZLorg/bouncycastle/crypto/CipherParameters;)V"
+                )
+                | ("processBlock", "([BI[BI)I")
+        ),
+        "org/bouncycastle/crypto/modes/SICBlockCipher" => matches!(
+            (method_name, descriptor),
+            ("reset", "()V")
+                | ("seekTo", "(J)J")
+                | (
+                    "init",
+                    "(ZLorg/bouncycastle/crypto/CipherParameters;)V"
+                )
+                | ("processBlock", "([BI[BI)I")
+                | ("processBytes", "([BII[BI)I")
+        ),
+        "org/bouncycastle/crypto/modes/CBCBlockCipher" => {
+            method_name == "processBlock" && descriptor == "([BI[BI)I"
+        }
+        "org/bouncycastle/util/Pack" => matches!(
+            (method_name, descriptor),
+            ("bigEndianToInt" | "littleEndianToInt", "([BI)I")
+                | ("bigEndianToInt" | "littleEndianToInt", "([BI[I)V")
+                | ("bigEndianToInt" | "littleEndianToInt", "([BI[III)V")
+                | ("intToBigEndian" | "intToLittleEndian", "(I[BI)V")
+                | ("intToBigEndian" | "intToLittleEndian", "([I[BI)V")
+                | ("intToBigEndian" | "intToLittleEndian", "([III[BI)V")
+        ),
+        "org/bouncycastle/util/Arrays" => method_name == "copyOf" && descriptor == "([BI)[B",
+        "org/bouncycastle/crypto/params/KeyParameter" => matches!(
+            (method_name, descriptor),
+            ("<init>", "([B)V") | ("<init>", "([BII)V")
+        ),
+        "org/bouncycastle/crypto/params/ParametersWithIV" => matches!(
+            (method_name, descriptor),
+            (
+                "<init>",
+                "(Lorg/bouncycastle/crypto/CipherParameters;[B)V"
+            ) | (
+                "<init>",
+                "(Lorg/bouncycastle/crypto/CipherParameters;[BII)V"
+            )
+        ),
+        "org/bouncycastle/crypto/digests/Blake2sDigest" => {
+            (method_name == "G" && descriptor == "(IIIIII)V")
+                || (method_name == "compress" && descriptor == "([BI)V")
+        }
+        "org/bouncycastle/crypto/digests/KeccakDigest" => matches!(
+            (method_name, descriptor),
+            ("KeccakPermutation" | "KeccakExtract", "()V") | ("KeccakAbsorb", "([BI)V")
+        ),
+        "org/bouncycastle/crypto/digests/GOST3411Digest" => {
+            method_name == "processBlock" && descriptor == "([BI)V"
+        }
+        "org/bouncycastle/crypto/digests/WhirlpoolDigest" => matches!(
+            (method_name, descriptor),
+            ("processBlock", "()V") | ("update", "([BII)V")
+        ),
+        "org/bouncycastle/crypto/macs/Poly1305" => matches!(
+            (method_name, descriptor),
+            ("update", "([BII)V") | ("doFinal", "([BI)I")
+        ),
+        "org/bouncycastle/crypto/generators/SCrypt" => {
+            method_name == "generate" && descriptor == "([B[BIIII)[B"
+        }
+        "org/bouncycastle/crypto/generators/Argon2BytesGenerator" => matches!(
+            (method_name, descriptor),
+            ("generateBytes", "([B[BII)I")
+                | (
+                    "roundFunction",
+                    "(Lorg/bouncycastle/crypto/generators/Argon2BytesGenerator$Block;IIIIIIIIIIIIIIII)V"
+                )
+        ),
+        "org/bouncycastle/crypto/generators/Argon2BytesGenerator$Block" => matches!(
+            (method_name, descriptor),
+            ("fromBytes" | "toBytes", "([B)V")
+                | (
+                    "copyBlock" | "xorWith",
+                    "(Lorg/bouncycastle/crypto/generators/Argon2BytesGenerator$Block;)V"
+                )
+                | (
+                    "xor" | "xorWith",
+                    "(Lorg/bouncycastle/crypto/generators/Argon2BytesGenerator$Block;Lorg/bouncycastle/crypto/generators/Argon2BytesGenerator$Block;)V"
+                )
+                | (
+                    "clear",
+                    "()Lorg/bouncycastle/crypto/generators/Argon2BytesGenerator$Block;"
+                )
+        ),
+        "org/bouncycastle/crypto/generators/Argon2BytesGenerator$FillBlock" => matches!(
+            (method_name, descriptor),
+            ("applyBlake", "()V")
+                | (
+                    "fillBlock",
+                    "(Lorg/bouncycastle/crypto/generators/Argon2BytesGenerator$Block;Lorg/bouncycastle/crypto/generators/Argon2BytesGenerator$Block;)V"
+                )
+                | (
+                    "fillBlock" | "fillBlockWithXor",
+                    "(Lorg/bouncycastle/crypto/generators/Argon2BytesGenerator$Block;Lorg/bouncycastle/crypto/generators/Argon2BytesGenerator$Block;Lorg/bouncycastle/crypto/generators/Argon2BytesGenerator$Block;)V"
+                )
+        ),
+        "org/bouncycastle/crypto/generators/Argon2BytesGenerator$FixedBlockPool" => matches!(
+            (method_name, descriptor),
+            (
+                "allocate",
+                "()Lorg/bouncycastle/crypto/generators/Argon2BytesGenerator$Block;"
+            ) | (
+                "deallocate",
+                "(Lorg/bouncycastle/crypto/generators/Argon2BytesGenerator$Block;)V"
+            )
+        ),
+        "org/bouncycastle/crypto/generators/PKCS5S2ParametersGenerator" => matches!(
+            (method_name, descriptor),
+            (
+                "generateDerivedParameters" | "generateDerivedMacParameters",
+                "(I)Lorg/bouncycastle/crypto/CipherParameters;"
+            ) | (
+                "generateDerivedParameters",
+                "(II)Lorg/bouncycastle/crypto/CipherParameters;"
+            )
+        ),
+        "org/bouncycastle/crypto/generators/PKCS12ParametersGenerator" => matches!(
+            (method_name, descriptor),
+            (
+                "generateDerivedParameters" | "generateDerivedMacParameters",
+                "(I)Lorg/bouncycastle/crypto/CipherParameters;"
+            ) | (
+                "generateDerivedParameters",
+                "(II)Lorg/bouncycastle/crypto/CipherParameters;"
+            )
+        ),
+        "org/bouncycastle/crypto/generators/BCrypt" => {
+            method_name == "generate" && descriptor == "([B[BI)[B"
+        }
+        _ => false,
+    }
+}
+
 pub(crate) fn is_forkjoin_native_override(
     class_name: &str,
     method_name: &str,
@@ -20479,231 +20759,6 @@ pub(crate) fn is_count_down_latch_native_override(
                 | ("getCount", "()J")
                 | ("toString", "()Ljava/lang/String;")
         )
-}
-
-pub(crate) fn is_enum_set_native_override(
-    class_name: &str,
-    method_name: &str,
-    descriptor: &str,
-) -> bool {
-    (class_name == "java/util/EnumSet"
-        && matches!(
-            (method_name, descriptor),
-            ("allOf", "(Ljava/lang/Class;)Ljava/util/EnumSet;")
-                | ("size", "()I")
-                | ("iterator", "()Ljava/util/Iterator;")
-        ))
-        || (matches!(
-            class_name,
-            "java/util/RegularEnumSet" | "java/util/JumboEnumSet"
-        ) && matches!(
-            (method_name, descriptor),
-            ("addAll", "()V") | ("size", "()I") | ("iterator", "()Ljava/util/Iterator;")
-        ))
-        || (class_name == "java/util/EnumSet$Itr"
-            && matches!(
-                (method_name, descriptor),
-                ("hasNext", "()Z") | ("next", "()Ljava/lang/Object;")
-            ))
-}
-
-pub(crate) fn is_unsafe_object_field_offset_native_override(
-    class_name: &str,
-    method_name: &str,
-    descriptor: &str,
-) -> bool {
-    matches!(class_name, "sun/misc/Unsafe" | "jdk/internal/misc/Unsafe")
-        && method_name == "objectFieldOffset"
-        && matches!(
-            descriptor,
-            "(Ljava/lang/Class;Ljava/lang/String;)J" | "(Ljava/lang/reflect/Field;)J"
-        )
-}
-
-pub(crate) fn is_sun_unsafe_ordered_write_native_override(
-    class_name: &str,
-    method_name: &str,
-    descriptor: &str,
-) -> bool {
-    class_name == "sun/misc/Unsafe"
-        && matches!(
-            (method_name, descriptor),
-            ("putOrderedInt", "(Ljava/lang/Object;JI)V")
-                | ("putOrderedLong", "(Ljava/lang/Object;JJ)V")
-                | (
-                    "putOrderedObject",
-                    "(Ljava/lang/Object;JLjava/lang/Object;)V"
-                )
-        )
-}
-
-pub(crate) fn is_java_util_hash_native_override(
-    class_name: &str,
-    method_name: &str,
-    descriptor: &str,
-) -> bool {
-    matches!(
-        (class_name, method_name, descriptor),
-        ("java/util/Arrays", "hashCode", "([Ljava/lang/Object;)I")
-            | ("java/util/Objects", "hash", "([Ljava/lang/Object;)I")
-            | (
-                "org/infinispan/configuration/parsing/ParserRegistry$QName",
-                "hashCode",
-                "()I",
-            )
-    )
-}
-
-pub(crate) fn is_collectors_native_override(
-    class_name: &str,
-    method_name: &str,
-    descriptor: &str,
-) -> bool {
-    class_name == "java/util/stream/Collectors"
-        && method_name == "joining"
-        && matches!(
-            descriptor,
-            "()Ljava/util/stream/Collector;"
-                | "(Ljava/lang/CharSequence;)Ljava/util/stream/Collector;"
-                | "(Ljava/lang/CharSequence;Ljava/lang/CharSequence;Ljava/lang/CharSequence;)Ljava/util/stream/Collector;"
-        )
-}
-
-pub(crate) fn is_smallrye_process_native_override(
-    class_name: &str,
-    method_name: &str,
-    descriptor: &str,
-) -> bool {
-    class_name == "io/smallrye/common/os/Process"
-        && matches!(
-            (method_name, descriptor),
-            ("<clinit>", "()V")
-                | ("getProcessName", "()Ljava/lang/String;")
-                | ("getProcessId", "()J")
-                | ("getCurrentProcess", "()Lio/smallrye/common/os/ProcessInfo;")
-        )
-}
-
-pub(crate) fn is_regex_matcher_native_override(
-    class_name: &str,
-    method_name: &str,
-    descriptor: &str,
-) -> bool {
-    class_name == "java/util/regex/Matcher"
-        && matches!(
-            (method_name, descriptor),
-            ("find", "()Z")
-                | ("find", "(I)Z")
-                | ("matches", "()Z")
-                | ("lookingAt", "()Z")
-                | ("group", "()Ljava/lang/String;")
-                | ("group", "(I)Ljava/lang/String;")
-                | ("start", "()I")
-                | ("start", "(I)I")
-                | ("end", "()I")
-                | ("end", "(I)I")
-                | ("groupCount", "()I")
-                | ("replaceAll", "(Ljava/lang/String;)Ljava/lang/String;")
-                | ("replaceFirst", "(Ljava/lang/String;)Ljava/lang/String;")
-                | (
-                    "appendReplacement",
-                    "(Ljava/lang/StringBuffer;Ljava/lang/String;)Ljava/util/regex/Matcher;",
-                )
-                | (
-                    "appendReplacement",
-                    "(Ljava/lang/StringBuilder;Ljava/lang/String;)Ljava/util/regex/Matcher;",
-                )
-                | (
-                    "appendTail",
-                    "(Ljava/lang/StringBuffer;)Ljava/lang/StringBuffer;"
-                )
-                | (
-                    "appendTail",
-                    "(Ljava/lang/StringBuilder;)Ljava/lang/StringBuilder;"
-                )
-                | ("reset", "()Ljava/util/regex/Matcher;")
-                | (
-                    "reset",
-                    "(Ljava/lang/CharSequence;)Ljava/util/regex/Matcher;"
-                )
-        )
-}
-
-pub(crate) fn is_liquibase_parser_factory_native_override(
-    class_name: &str,
-    method_name: &str,
-    descriptor: &str,
-) -> bool {
-    class_name == "liquibase/parser/ChangeLogParserFactory"
-        && method_name == "getParser"
-        && descriptor
-            == "(Ljava/lang/String;Lliquibase/resource/ResourceAccessor;)Lliquibase/parser/ChangeLogParser;"
-}
-
-pub(crate) fn is_file_is_invalid_native_override(
-    class_name: &str,
-    method_name: &str,
-    descriptor: &str,
-) -> bool {
-    class_name == "java/io/File" && method_name == "isInvalid" && descriptor == "()Z"
-}
-
-pub(crate) fn is_sax_parser_factory_set_validating_native_override(
-    class_name: &str,
-    method_name: &str,
-    descriptor: &str,
-) -> bool {
-    matches!(
-        class_name,
-        "javax/xml/parsers/SAXParserFactory"
-            | "com/sun/org/apache/xerces/internal/jaxp/SAXParserFactoryImpl"
-    ) && method_name == "setValidating"
-        && descriptor == "(Z)V"
-}
-
-pub(crate) fn is_liquibase_entity_resolver_native_override(
-    class_name: &str,
-    method_name: &str,
-    descriptor: &str,
-) -> bool {
-    class_name == "liquibase/parser/core/xml/LiquibaseEntityResolver"
-        && method_name == "resolveEntity"
-        && matches!(
-            descriptor,
-            "(Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;)Lorg/xml/sax/InputSource;"
-                | "(Ljava/lang/String;Ljava/lang/String;)Lorg/xml/sax/InputSource;"
-        )
-}
-
-pub(crate) fn is_liquibase_configuration_definition_native_override(
-    class_name: &str,
-    method_name: &str,
-    descriptor: &str,
-) -> bool {
-    class_name == "liquibase/configuration/ConfigurationDefinition"
-        && method_name == "getCurrentValue"
-        && descriptor == "()Ljava/lang/Object;"
-}
-
-pub(crate) fn is_liquibase_expression_expander_native_override(
-    class_name: &str,
-    method_name: &str,
-    descriptor: &str,
-) -> bool {
-    class_name == "liquibase/changelog/ExpressionExpander"
-        && method_name == "expandExpressions"
-        && descriptor
-            == "(Ljava/lang/String;Lliquibase/changelog/DatabaseChangeLog;)Ljava/lang/String;"
-}
-
-pub(crate) fn is_hibernate_query_engine_validate_named_queries_native_override(
-    class_name: &str,
-    method_name: &str,
-    descriptor: &str,
-) -> bool {
-    class_name == "org/hibernate/query/internal/QueryEngineImpl"
-        && method_name == "validateNamedQueries"
-        && descriptor == "()V"
 }
 
 pub(crate) fn is_ffm_symbol_lookup_native_override(
@@ -21118,6 +21173,155 @@ fn force_native_over_real_jdk_bytecode(
         return true;
     }
 
+    // `Executors.newSingleThreadExecutor()`/`newFixedThreadPool()`/
+    // `newCachedThreadPool()` (native-builtins/src/lib.rs's
+    // `native_new_single_thread`/`native_new_fixed_pool`/`native_new_cached_pool`)
+    // allocate their return value under the REAL class name
+    // `java/util/concurrent/ThreadPoolExecutor` but never run it through the
+    // real `<init>` -- real fields like `ctl`/`workQueue`/`mainLock` are never
+    // set. Once `execute(Runnable)` (invoked via `invokeinterface
+    // Executor.execute`/`ExecutorService.execute`) resolves to the concrete
+    // class's own real bytecode, that bytecode reads the never-initialized
+    // `ctl` AtomicInteger and NPEs immediately (docs/known-issues/
+    // threadpoolexecutor-execute-npe-on-ctl-regression.md). Force the
+    // registered native (`native_es_execute`) to win for this triple;
+    // `intercept_force_registered_native` additionally checks the receiver's
+    // real `workers` field so a genuinely real, bytecode-constructed
+    // `ThreadPoolExecutor` still runs its own real `execute()` bytecode.
+    if class_name == "java/util/concurrent/ThreadPoolExecutor"
+        && method_name == "execute"
+        && method_descriptor == "(Ljava/lang/Runnable;)V"
+    {
+        return true;
+    }
+
+    if class_name == "java/nio/ByteBuffer"
+        && matches!(
+            (method_name, method_descriptor),
+            ("allocate", "(I)Ljava/nio/ByteBuffer;")
+                | ("allocateDirect", "(I)Ljava/nio/ByteBuffer;")
+                | ("wrap", "([B)Ljava/nio/ByteBuffer;")
+                | ("wrap", "([BII)Ljava/nio/ByteBuffer;")
+                | ("get", "()B")
+                | ("get", "(I)B")
+                | ("get", "([B)Ljava/nio/ByteBuffer;")
+                | ("get", "([BII)Ljava/nio/ByteBuffer;")
+                | ("put", "(B)Ljava/nio/ByteBuffer;")
+                | ("put", "(IB)Ljava/nio/ByteBuffer;")
+                | ("put", "([B)Ljava/nio/ByteBuffer;")
+                | ("put", "([BII)Ljava/nio/ByteBuffer;")
+                | ("put", "(Ljava/nio/ByteBuffer;)Ljava/nio/ByteBuffer;")
+                | ("getShort", "()S")
+                | ("getShort", "(I)S")
+                | ("putShort", "(S)Ljava/nio/ByteBuffer;")
+                | ("putShort", "(IS)Ljava/nio/ByteBuffer;")
+                | ("getChar", "()C")
+                | ("getChar", "(I)C")
+                | ("putChar", "(C)Ljava/nio/ByteBuffer;")
+                | ("putChar", "(IC)Ljava/nio/ByteBuffer;")
+                | ("getInt", "()I")
+                | ("getInt", "(I)I")
+                | ("putInt", "(I)Ljava/nio/ByteBuffer;")
+                | ("putInt", "(II)Ljava/nio/ByteBuffer;")
+                | ("getLong", "()J")
+                | ("getLong", "(I)J")
+                | ("putLong", "(J)Ljava/nio/ByteBuffer;")
+                | ("putLong", "(IJ)Ljava/nio/ByteBuffer;")
+                | ("getFloat", "()F")
+                | ("getFloat", "(I)F")
+                | ("putFloat", "(F)Ljava/nio/ByteBuffer;")
+                | ("getDouble", "()D")
+                | ("putDouble", "(D)Ljava/nio/ByteBuffer;")
+                | ("flip", "()Ljava/nio/Buffer;")
+                | ("flip", "()Ljava/nio/ByteBuffer;")
+                | ("clear", "()Ljava/nio/Buffer;")
+                | ("clear", "()Ljava/nio/ByteBuffer;")
+                | ("rewind", "()Ljava/nio/Buffer;")
+                | ("rewind", "()Ljava/nio/ByteBuffer;")
+                | ("mark", "()Ljava/nio/Buffer;")
+                | ("mark", "()Ljava/nio/ByteBuffer;")
+                | ("reset", "()Ljava/nio/Buffer;")
+                | ("position", "()I")
+                | ("position", "(I)Ljava/nio/Buffer;")
+                | ("position", "(I)Ljava/nio/ByteBuffer;")
+                | ("limit", "()I")
+                | ("limit", "(I)Ljava/nio/Buffer;")
+                | ("limit", "(I)Ljava/nio/ByteBuffer;")
+                | ("capacity", "()I")
+                | ("remaining", "()I")
+                | ("hasRemaining", "()Z")
+                | ("compact", "()Ljava/nio/ByteBuffer;")
+                | ("array", "()[B")
+                | ("arrayOffset", "()I")
+                | ("hasArray", "()Z")
+                | ("isDirect", "()Z")
+                | ("isReadOnly", "()Z")
+                | ("order", "()Ljava/nio/ByteOrder;")
+                | ("order", "(Ljava/nio/ByteOrder;)Ljava/nio/ByteBuffer;")
+                | ("slice", "()Ljava/nio/ByteBuffer;")
+                | ("duplicate", "()Ljava/nio/ByteBuffer;")
+                | ("equals", "(Ljava/lang/Object;)Z")
+                | ("hashCode", "()I")
+                | ("compareTo", "(Ljava/nio/ByteBuffer;)I")
+                | ("toString", "()Ljava/lang/String;")
+        )
+    {
+        return true;
+    }
+
+    if class_name == "java/util/concurrent/LinkedBlockingDeque"
+        && method_name == "clear"
+        && method_descriptor == "()V"
+    {
+        return true;
+    }
+
+    if class_name == "jdk/internal/util/ArraysSupport"
+        && matches!(
+            (method_name, method_descriptor),
+            ("vectorizedHashCode", "(Ljava/lang/Object;IIII)I")
+                | (
+                    "vectorizedMismatch",
+                    "(Ljava/lang/Object;JLjava/lang/Object;JII)I"
+                )
+                | ("mismatch", "([B[BI)I")
+                | ("mismatch", "([BI[BII)I")
+                | ("mismatch", "([C[CI)I")
+                | ("mismatch", "([CI[CII)I")
+        )
+    {
+        return true;
+    }
+
+    if class_name == "java/io/BufferedInputStream"
+        && matches!(
+            (method_name, method_descriptor),
+            ("read", "()I")
+                | ("read", "([BII)I")
+                | ("skip", "(J)J")
+                | ("available", "()I")
+                | ("mark", "(I)V")
+                | ("reset", "()V")
+                | ("markSupported", "()Z")
+                | ("close", "()V")
+        )
+    {
+        return true;
+    }
+
+    if (matches!(
+        class_name,
+        "java/lang/Iterable" | "java/util/Collection" | "java/util/Set" | "java/util/EnumSet"
+    ) && method_name == "iterator"
+        && method_descriptor == "()Ljava/util/Iterator;")
+    {
+        return true;
+    }
+
+    if class_name == "java/util/Iterator" && matches!(method_name, "hasNext" | "next" | "remove") {
+        return true;
+    }
+
     if class_name == "java/lang/Thread"
         && method_name == "getThreadGroup"
         && method_descriptor == "()Ljava/lang/ThreadGroup;"
@@ -21184,7 +21388,28 @@ fn force_native_over_real_jdk_bytecode(
         return true;
     }
 
+    // `java.util.logging.Level.parse(String)` real bytecode resolves custom
+    // and even standard level names through `KnownLevel.findByName`, which
+    // on JDK 25 throws internally (a `Module`-null NPE the method's own
+    // catch-all reports as a generic `IllegalArgumentException: Bad level`)
+    // — see `docs/internal/gaps/kc16-blocker-map.md`'s KC16 investigation.
+    // This broke WildFly's own `host.xml`/`domain.xml` parsing of
+    // `<level name="WARN"/>` (org.jboss.logmanager's extended levels) before
+    // it ever reached a genuinely-unknown name. Force the registered native
+    // (`native_level_parse`, native-builtins/src/logmanager.rs), which
+    // answers from the standard + JBoss LogManager static Level constants
+    // directly, bypassing the broken registry lookup.
+    if class_name == "java/util/logging/Level"
+        && method_name == "parse"
+        && method_descriptor == "(Ljava/lang/String;)Ljava/util/logging/Level;"
+    {
+        return true;
+    }
+
     if is_forkjoin_native_override(class_name, method_name, method_descriptor) {
+        return true;
+    }
+    if is_bc_crypto_math_native_override(class_name, method_name, method_descriptor) {
         return true;
     }
 
@@ -21257,66 +21482,6 @@ fn force_native_over_real_jdk_bytecode(
                 | "implAddOpensToAllUnnamed"
         )
     {
-        return true;
-    }
-    // `EnumSet.allOf` is real bytecode in JDK 25 and constructs specialized
-    // Regular/JumboEnumSet instances through paths CratonVM does not fully
-    // materialize yet. Keycloak's X500SAMLProfileConstants static initializer
-    // iterates `EnumSet.allOf(...)`; force only that factory so size()/iterator()
-    // remain coherent with the real JDK EnumSet object returned by the native.
-    if is_enum_set_native_override(class_name, method_name, method_descriptor) {
-        return true;
-    }
-    if is_unsafe_object_field_offset_native_override(class_name, method_name, method_descriptor) {
-        return true;
-    }
-    if is_sun_unsafe_ordered_write_native_override(class_name, method_name, method_descriptor) {
-        return true;
-    }
-    if is_java_util_hash_native_override(class_name, method_name, method_descriptor) {
-        return true;
-    }
-    if is_collectors_native_override(class_name, method_name, method_descriptor) {
-        return true;
-    }
-    if is_smallrye_process_native_override(class_name, method_name, method_descriptor) {
-        return true;
-    }
-    if is_regex_matcher_native_override(class_name, method_name, method_descriptor) {
-        return true;
-    }
-    if is_liquibase_parser_factory_native_override(class_name, method_name, method_descriptor) {
-        return true;
-    }
-    if is_file_is_invalid_native_override(class_name, method_name, method_descriptor) {
-        return true;
-    }
-    if is_sax_parser_factory_set_validating_native_override(
-        class_name,
-        method_name,
-        method_descriptor,
-    ) {
-        return true;
-    }
-    if is_liquibase_entity_resolver_native_override(class_name, method_name, method_descriptor) {
-        return true;
-    }
-    if is_liquibase_configuration_definition_native_override(
-        class_name,
-        method_name,
-        method_descriptor,
-    ) {
-        return true;
-    }
-    if is_liquibase_expression_expander_native_override(class_name, method_name, method_descriptor)
-    {
-        return true;
-    }
-    if is_hibernate_query_engine_validate_named_queries_native_override(
-        class_name,
-        method_name,
-        method_descriptor,
-    ) {
         return true;
     }
     // `ServerSocket.getLocalSocketAddress()` is pure Java in the real JDK:
@@ -21983,16 +22148,6 @@ fn force_native_over_real_jdk_bytecode(
             // `MXBeanSupport.findMXBeanInterface` `it.remove()` reduction
             // loop to succeed.
             | ("java/util/Iterator", "remove", "()V")
-            // `Map.forEach(BiConsumer)` is also an interface default method.
-            // Force the registered bridge for the exact default-method surface
-            // so receiver-aware map natives win over bytecode that loops through
-            // partially modelled entrySet views. Keycloak RealmModelTest drives
-            // this through Hibernate/Infinispan map implementations.
-            | (
-                "java/util/Map",
-                "forEach",
-                "(Ljava/util/function/BiConsumer;)V",
-            )
             // `ConstantCallSite.getTarget`. On JDK 25 the body is no
             // longer a plain `getfield target` — it first reads
             // `private boolean isFrozen` and throws
@@ -22189,7 +22344,18 @@ fn force_native_over_real_jdk_bytecode(
         // delegates to the base classpath (where `<init>` already registered the
         // loader's URLs), matching HotSpot.
         || (class_name == "java/net/URLClassLoader"
-            && matches!(method_name, "findClass" | "findResource" | "findResources"))
+            && (matches!(method_name, "findClass" | "findResource" | "findResources")
+                || (method_name == "<init>"
+                    && matches!(
+                        method_descriptor,
+                        "([Ljava/net/URL;)V"
+                            | "([Ljava/net/URL;Ljava/lang/ClassLoader;)V"
+                            | "(Ljava/lang/String;[Ljava/net/URL;Ljava/lang/ClassLoader;)V"
+                            | "([Ljava/net/URL;Ljava/lang/ClassLoader;Ljava/net/URLStreamHandlerFactory;)V"
+                            | "(Ljava/lang/String;[Ljava/net/URL;Ljava/lang/ClassLoader;Ljava/net/URLStreamHandlerFactory;)V"
+                            | "([Ljava/net/URL;Ljava/security/AccessControlContext;)V"
+                            | "(Ljava/lang/String;[Ljava/net/URL;Ljava/lang/ClassLoader;Ljava/security/AccessControlContext;)V"
+                    ))))
         || (matches!(
             class_name,
             "jdk/internal/loader/URLClassPath" | "sun/misc/URLClassPath"
@@ -22320,12 +22486,45 @@ fn redefine_immune_forced_native(
     redefine_immune_reflection_native(class_name, method_name)
         || redefine_immune_string_builder_native(class_name, method_name, method_descriptor)
         || redefine_immune_path_native(class_name, method_name, method_descriptor)
+        || is_bc_crypto_math_native_override(class_name, method_name, method_descriptor)
         || is_stamped_lock_native_override(class_name, method_name, method_descriptor)
+}
+
+pub(crate) fn should_force_registered_native_over_bytecode(
+    shared: &SharedVm,
+    class_name: &str,
+    method_name: &str,
+    method_descriptor: &str,
+) -> bool {
+    force_native_over_real_jdk_bytecode(class_name, method_name, method_descriptor)
+        && (!native_shadow_suppressed_by_redefine(shared, class_name)
+            || redefine_immune_forced_native(class_name, method_name, method_descriptor))
 }
 
 /// Dispatch a force-native override via `safe_native_call`, pushing any return
 /// value onto the caller operand stack.
 #[inline]
+/// Whether `recv` (the receiver of a `ThreadPoolExecutor.execute()` call) is
+/// a genuinely real, bytecode-constructed `ThreadPoolExecutor` rather than
+/// one of CratonVM's synthetic 2-field `Executors.new*ThreadPool()` stand-ins.
+/// Mirrors `native-builtins::executor_has_real_workers` (same check, same
+/// field) but works from the interpreter, which only has `SharedVm`/`JvmThread`
+/// -- not a `NativeContext` -- available at this dispatch point.
+fn threadpool_executor_has_real_workers(shared: &SharedVm, recv: &Value) -> bool {
+    let Value::Object(Some(recv)) = recv else {
+        return false;
+    };
+    let class_id = shared.heap.class_id_of(*recv);
+    let cm = shared.class_manager.read();
+    let Some(index) =
+        crate::vm::vm_exec::resolve_field_index_in_hierarchy(class_id, "workers", &cm.class_store)
+    else {
+        return false;
+    };
+    drop(cm);
+    matches!(shared.heap.get_field(*recv, index), Value::Object(Some(_)))
+}
+
 fn intercept_force_registered_native(
     shared: &SharedVm,
     thread: &mut JvmThread,
@@ -22345,16 +22544,27 @@ fn intercept_force_registered_native(
             force_native_over_real_jdk_bytecode(class_name, method_name, method_descriptor),
         );
     }
-    if !force_native_over_real_jdk_bytecode(class_name, method_name, method_descriptor) {
-        return None;
-    }
     // A JVMTI agent that redefined this class (e.g. a Mockito inline mock)
     // makes its woven bytecode authoritative — cede to it instead of forcing
     // the native, so the instrumentation advice runs. Reflection-metadata
     // natives are exempt (see `redefine_immune_reflection_native`): the real
     // bytecode cannot reproduce them under CratonVM.
-    if native_shadow_suppressed_by_redefine(shared, class_name)
-        && !redefine_immune_forced_native(class_name, method_name, method_descriptor)
+    if !should_force_registered_native_over_bytecode(
+        shared,
+        class_name,
+        method_name,
+        method_descriptor,
+    ) {
+        return None;
+    }
+    // A genuinely real, bytecode-constructed `ThreadPoolExecutor` (its own
+    // real `<init>` ran, so its real `workers` field is populated) must keep
+    // running its own real `execute()` -- only CratonVM's synthetic 2-field
+    // `Executors.new*ThreadPool()` objects need the forced native. See
+    // docs/known-issues/threadpoolexecutor-execute-npe-on-ctl-regression.md.
+    if class_name == "java/util/concurrent/ThreadPoolExecutor"
+        && method_name == "execute"
+        && threadpool_executor_has_real_workers(shared, &args[0])
     {
         return None;
     }
@@ -22368,7 +22578,6 @@ fn intercept_force_registered_native(
     Some((|| {
         let result = crate::vm::safe_native_call(shared, thread, cb, args)?;
         if let Some(value) = result.filter(|_| ret_type != b'V') {
-            let value = crate::vm::remap_pending_native_return(thread, value);
             push_invoke_return_value(
                 &mut thread.frames[frame_idx].stack,
                 coerce_value_for_return(value, ret_type),
@@ -22414,7 +22623,6 @@ fn intercept_jython_pyjavatype_findattr_ex(
     Some((|| {
         let result = crate::vm::safe_native_call(shared, thread, cb, args)?;
         if let Some(value) = result.filter(|_| ret_type != b'V') {
-            let value = crate::vm::remap_pending_native_return(thread, value);
             push_invoke_return_value(
                 &mut thread.frames[frame_idx].stack,
                 coerce_value_for_return(value, ret_type),
@@ -22456,7 +22664,6 @@ fn intercept_jython_pymodule_findattr(
     Some((|| {
         let result = crate::vm::safe_native_call(shared, thread, cb, args)?;
         if let Some(value) = result.filter(|_| ret_type != b'V') {
-            let value = crate::vm::remap_pending_native_return(thread, value);
             push_invoke_return_value(
                 &mut thread.frames[frame_idx].stack,
                 coerce_value_for_return(value, ret_type),
@@ -22532,7 +22739,6 @@ fn intercept_urlclassloader_subclass_find_class(
     Some((|| {
         let result = crate::vm::safe_native_call(shared, thread, cb, args)?;
         if let Some(value) = result.filter(|_| ret_type != b'V') {
-            let value = crate::vm::remap_pending_native_return(thread, value);
             push_invoke_return_value(
                 &mut thread.frames[frame_idx].stack,
                 coerce_value_for_return(value, ret_type),
@@ -22598,6 +22804,61 @@ fn surefire_lazy_launcher_discover_native(
         return None;
     }
     Some(cb)
+}
+
+/// Synthetic stubs are fallback implementations for fake or incomplete JDK
+/// classes. When the real class bytecode is loaded and explicitly protected,
+/// dispatch must prefer that bytecode over the approximate stub.
+fn synthetic_stub_should_yield_to_real_bytecode(
+    shared: &SharedVm,
+    class_name: &str,
+    method_name: &str,
+    descriptor: &str,
+) -> bool {
+    let synthetic_stub_native = shared
+        .native_methods
+        .kind_of(class_name, method_name, descriptor)
+        == Some(cratonvm_native_api::NativeKind::SyntheticStub);
+    if !synthetic_stub_native {
+        return false;
+    }
+
+    let real_protected_stub = crate::runtime::env_cache::real_bytecode_selector()
+        .prefers_real(class_name)
+        || matches!(
+            class_name,
+            "java/util/concurrent/locks/ReentrantLock"
+                | "java/util/concurrent/LinkedBlockingDeque"
+                | "java/util/concurrent/atomic/AtomicBoolean"
+                | "java/util/EnumSet"
+                | "java/util/StringJoiner"
+                | "java/io/FileInputStream"
+                | "java/lang/ref/Cleaner"
+                | "java/lang/ref/Cleaner$Cleanable"
+                | "java/lang/management/ManagementFactory"
+        );
+    if !real_protected_stub {
+        return false;
+    }
+
+    let cm = shared.class_manager.read();
+    cm.get_loaded_class_id(class_name)
+        .and_then(|cid| {
+            cm.get_class(cid).and_then(|cls| {
+                if cls.is_synthetic_stub {
+                    None
+                } else {
+                    crate::classloading::find_method_recursive(
+                        cid,
+                        method_name,
+                        descriptor,
+                        &cm.class_store,
+                    )
+                    .map(|(m, _)| !m.is_native() && m.code().is_some())
+                }
+            })
+        })
+        .unwrap_or(false)
 }
 
 /// Stackless invoke: resolve a method and either call native (Handled) or push
@@ -22683,7 +22944,6 @@ fn try_stackless_invoke(
         {
             let result = safe_native_call(shared, thread, callback, args)?;
             if let Some(value) = result.filter(|_| ret_type != b'V') {
-                let value = crate::vm::remap_pending_native_return(thread, value);
                 push_invoke_return_value(
                     &mut thread.frames[frame_idx].stack,
                     coerce_value_for_return(value, ret_type),
@@ -22707,7 +22967,6 @@ fn try_stackless_invoke(
         {
             let result = safe_native_call(shared, thread, callback, args)?;
             if let Some(value) = result.filter(|_| ret_type != b'V') {
-                let value = crate::vm::remap_pending_native_return(thread, value);
                 push_invoke_return_value(
                     &mut thread.frames[frame_idx].stack,
                     coerce_value_for_return(value, ret_type),
@@ -22809,6 +23068,16 @@ fn try_stackless_invoke(
     } else {
         native_cb
     };
+    let native_cb = if synthetic_stub_should_yield_to_real_bytecode(
+        shared,
+        class_name,
+        method_name,
+        descriptor,
+    ) {
+        None
+    } else {
+        native_cb
+    };
     if crate::runtime::env_cache::bd_debug()
         && (method_name == "intValue"
             || (class_name.contains("BigDecimal")
@@ -22842,7 +23111,6 @@ fn try_stackless_invoke(
                 );
             }
             if ret_type != b'V' {
-                let value = crate::vm::remap_pending_native_return(thread, value);
                 // T18.K4 — tag-exact push for J/D native-override return values.
                 // `coerce_value_for_return` may widen/narrow the type-erased
                 // native result; we then push via the category-2 aware path so
@@ -22925,7 +23193,6 @@ fn try_stackless_invoke(
         {
             let result = safe_native_call(shared, thread, callback, args)?;
             if let Some(value) = result.filter(|_| ret_type != b'V') {
-                let value = crate::vm::remap_pending_native_return(thread, value);
                 // T18.K4 — tag-exact push for J/D native-bytecode method return values.
                 push_invoke_return_value(
                     &mut thread.frames[frame_idx].stack,
@@ -22992,17 +23259,23 @@ fn try_stackless_invoke(
             .native_methods
             .find(&class_name_arc, method_name, descriptor)
         {
-            let result = safe_native_call(shared, thread, callback, args)?;
-            if let Some(value) = result.filter(|_| ret_type != b'V') {
-                let value = crate::vm::remap_pending_native_return(thread, value);
-                // T18.K4 — tag-exact push for J/D native-override (on bytecode method) return values.
-                push_invoke_return_value(
-                    &mut thread.frames[frame_idx].stack,
-                    coerce_value_for_return(value, ret_type),
-                )?;
-                native_return_pushed_to_stack(shared, thread);
+            if !synthetic_stub_should_yield_to_real_bytecode(
+                shared,
+                &class_name_arc,
+                method_name,
+                descriptor,
+            ) {
+                let result = safe_native_call(shared, thread, callback, args)?;
+                if let Some(value) = result.filter(|_| ret_type != b'V') {
+                    // T18.K4 — tag-exact push for J/D native-override (on bytecode method) return values.
+                    push_invoke_return_value(
+                        &mut thread.frames[frame_idx].stack,
+                        coerce_value_for_return(value, ret_type),
+                    )?;
+                    native_return_pushed_to_stack(shared, thread);
+                }
+                return Ok(CachedCallResult::Handled);
             }
-            return Ok(CachedCallResult::Handled);
         }
     }
 
@@ -23488,7 +23761,6 @@ fn execute_invokestatic(
     if let Some(value) = result {
         let ret = crate::jit::return_type(&method_descriptor);
         if ret != b'V' {
-            let value = crate::vm::remap_pending_native_return(thread, value);
             let value = coerce_value_for_return(value, ret);
             // T18.K4 — tag-exact push for J/D fallback invokestatic return values.
             push_invoke_return_value(&mut thread.frames[frame_idx].stack, value)?;
@@ -23550,7 +23822,6 @@ fn invoke_cached_intrinsic(
     INTRINSIC_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let result = crate::vm::safe_native_call(shared, thread, callback, args)?;
     if let Some(value) = result.filter(|_| return_type != b'V') {
-        let value = crate::vm::remap_pending_native_return(thread, value);
         let value = coerce_value_for_return(value, return_type);
         push_invoke_return_value(&mut thread.frames[frame_idx].stack, value)?;
         crate::vm::native_return_pushed_to_stack(shared, thread);
@@ -24396,6 +24667,10 @@ fn compile_osr_artifact(
     max_locals: usize,
     entry_pc: usize,
 ) -> Option<Arc<crate::jit::CompiledMethod>> {
+    let osr_key = crate::jit::tiered::MethodKey::new(&class_name, &method_name, &method_descriptor);
+    if crate::jit::tiered::is_osr_denied(&osr_key) {
+        return None;
+    }
     // Kill-switch: CRATONVM_DISABLE_JIT=1 forces interpreter-only execution.
     // OSR is a JIT entry point distinct from `try_jit_compile_callee` /
     // `try_jit_upgrade_with_gate`, so it needs its own gate so the user-facing
@@ -24524,6 +24799,15 @@ fn compile_osr_artifact(
             // JIT-return exception drains) remains available, so do NOT
             // bail-list here.
             if scan.has_athrow {
+                return None;
+            }
+            // BC GOST3412_2015Engine.init_gf256_mul_table showed that OSR
+            // entering a nested primitive-array allocation loop can resume with
+            // corrupt stack state for the next `newarray` length. Keep normal
+            // method-entry JIT enabled, but decline OSR until the x64 OSR stack
+            // mapper models primitive allocation loops safely.
+            if scan.has_newarray {
+                crate::jit::tiered::mark_osr_denied(osr_key.clone());
                 return None;
             }
 
@@ -27560,6 +27844,9 @@ fn background_compile_task(
         None => return fail(0), // VM dropped (teardown) — nothing to compile.
     };
     if crate::classloading::any_class_redefined() {
+        return fail(0);
+    }
+    if task.osr_bci.is_some() && crate::jit::tiered::is_osr_denied(&task.method_key) {
         return fail(0);
     }
     let optimized = crate::jit::tiered::tier_uses_optimized_backend(task.target_tier);
@@ -31973,49 +32260,6 @@ mod tests {
     }
 
     #[test]
-    fn enum_set_force_native_covers_keycloak_allof_iteration_surface() {
-        for (class_name, name, descriptor) in [
-            (
-                "java/util/EnumSet",
-                "allOf",
-                "(Ljava/lang/Class;)Ljava/util/EnumSet;",
-            ),
-            ("java/util/EnumSet", "size", "()I"),
-            ("java/util/EnumSet", "iterator", "()Ljava/util/Iterator;"),
-            ("java/util/JumboEnumSet", "addAll", "()V"),
-            ("java/util/JumboEnumSet", "size", "()I"),
-            (
-                "java/util/JumboEnumSet",
-                "iterator",
-                "()Ljava/util/Iterator;",
-            ),
-            ("java/util/RegularEnumSet", "addAll", "()V"),
-            ("java/util/RegularEnumSet", "size", "()I"),
-            (
-                "java/util/RegularEnumSet",
-                "iterator",
-                "()Ljava/util/Iterator;",
-            ),
-            ("java/util/EnumSet$Itr", "hasNext", "()Z"),
-            ("java/util/EnumSet$Itr", "next", "()Ljava/lang/Object;"),
-        ] {
-            assert!(
-                is_enum_set_native_override(class_name, name, descriptor),
-                "{class_name}.{name}{descriptor} must route to the registered native"
-            );
-            assert!(
-                force_native_over_real_jdk_bytecode(class_name, name, descriptor),
-                "real-JDK bytecode dispatch must force {class_name}.{name}{descriptor}"
-            );
-        }
-        assert!(!is_enum_set_native_override(
-            "java/util/EnumSet",
-            "copyOf",
-            "(Ljava/util/Collection;)Ljava/util/EnumSet;"
-        ));
-    }
-
-    #[test]
     fn ffm_symbol_lookup_force_native_covers_find() {
         let symbol_lookup = "java/lang/foreign/SymbolLookup";
         let descriptor = "(Ljava/lang/String;)Ljava/util/Optional;";
@@ -32425,6 +32669,638 @@ mod tests {
             "java/util/concurrent/locks/StampedLock$WriteLockView",
             "newCondition",
             "()Ljava/util/concurrent/locks/Condition;"
+        ));
+    }
+
+    #[test]
+    fn bc_crypto_math_force_native_covers_longarray_helpers() {
+        let long_array = "org/bouncycastle/math/ec/LongArray";
+        for (name, descriptor) in [
+            ("modReduce", "(I[I)Lorg/bouncycastle/math/ec/LongArray;"),
+            (
+                "modMultiply",
+                "(Lorg/bouncycastle/math/ec/LongArray;I[I)Lorg/bouncycastle/math/ec/LongArray;",
+            ),
+            ("modSquare", "(I[I)Lorg/bouncycastle/math/ec/LongArray;"),
+            ("modSquareN", "(II[I)Lorg/bouncycastle/math/ec/LongArray;"),
+            ("modInverse", "(I[I)Lorg/bouncycastle/math/ec/LongArray;"),
+            ("reduce", "(I[I)V"),
+            (
+                "multiply",
+                "(Lorg/bouncycastle/math/ec/LongArray;I[I)Lorg/bouncycastle/math/ec/LongArray;",
+            ),
+            ("square", "(I[I)Lorg/bouncycastle/math/ec/LongArray;"),
+        ] {
+            assert!(
+                is_bc_crypto_math_native_override(long_array, name, descriptor),
+                "{name}{descriptor} must route to the registered BC native"
+            );
+            assert!(
+                force_native_over_real_jdk_bytecode(long_array, name, descriptor),
+                "{name}{descriptor} must not fall through to interpreted BC bytecode"
+            );
+            assert!(
+                redefine_immune_forced_native(long_array, name, descriptor),
+                "{name}{descriptor} must stay native after unrelated redefinition"
+            );
+        }
+
+        let f2m = "org/bouncycastle/math/ec/ECFieldElement$F2m";
+        for (name, descriptor) in [
+            (
+                "add",
+                "(Lorg/bouncycastle/math/ec/ECFieldElement;)Lorg/bouncycastle/math/ec/ECFieldElement;",
+            ),
+            (
+                "subtract",
+                "(Lorg/bouncycastle/math/ec/ECFieldElement;)Lorg/bouncycastle/math/ec/ECFieldElement;",
+            ),
+            (
+                "multiply",
+                "(Lorg/bouncycastle/math/ec/ECFieldElement;)Lorg/bouncycastle/math/ec/ECFieldElement;",
+            ),
+            (
+                "divide",
+                "(Lorg/bouncycastle/math/ec/ECFieldElement;)Lorg/bouncycastle/math/ec/ECFieldElement;",
+            ),
+            (
+                "multiplyPlusProduct",
+                "(Lorg/bouncycastle/math/ec/ECFieldElement;Lorg/bouncycastle/math/ec/ECFieldElement;Lorg/bouncycastle/math/ec/ECFieldElement;)Lorg/bouncycastle/math/ec/ECFieldElement;",
+            ),
+            (
+                "squarePlusProduct",
+                "(Lorg/bouncycastle/math/ec/ECFieldElement;Lorg/bouncycastle/math/ec/ECFieldElement;)Lorg/bouncycastle/math/ec/ECFieldElement;",
+            ),
+            ("addOne", "()Lorg/bouncycastle/math/ec/ECFieldElement;"),
+            ("square", "()Lorg/bouncycastle/math/ec/ECFieldElement;"),
+            ("squarePow", "(I)Lorg/bouncycastle/math/ec/ECFieldElement;"),
+            ("invert", "()Lorg/bouncycastle/math/ec/ECFieldElement;"),
+        ] {
+            assert!(
+                is_bc_crypto_math_native_override(f2m, name, descriptor),
+                "{name}{descriptor} must route to the registered BC F2m native"
+            );
+            assert!(
+                force_native_over_real_jdk_bytecode(f2m, name, descriptor),
+                "{name}{descriptor} must not fall through to interpreted BC F2m bytecode"
+            );
+            assert!(
+                redefine_immune_forced_native(f2m, name, descriptor),
+                "{name}{descriptor} must stay native after unrelated redefinition"
+            );
+        }
+
+        let f2m_point = "org/bouncycastle/math/ec/ECPoint$F2m";
+        for (name, descriptor) in [
+            (
+                "add",
+                "(Lorg/bouncycastle/math/ec/ECPoint;)Lorg/bouncycastle/math/ec/ECPoint;",
+            ),
+            ("twice", "()Lorg/bouncycastle/math/ec/ECPoint;"),
+            (
+                "twicePlus",
+                "(Lorg/bouncycastle/math/ec/ECPoint;)Lorg/bouncycastle/math/ec/ECPoint;",
+            ),
+        ] {
+            assert!(
+                is_bc_crypto_math_native_override(f2m_point, name, descriptor),
+                "{name}{descriptor} must route to the registered BC F2m point native"
+            );
+            assert!(
+                force_native_over_real_jdk_bytecode(f2m_point, name, descriptor),
+                "{name}{descriptor} must not fall through to interpreted BC F2m point bytecode"
+            );
+            assert!(
+                redefine_immune_forced_native(f2m_point, name, descriptor),
+                "{name}{descriptor} must stay native after unrelated redefinition"
+            );
+        }
+
+        let ec_algorithms = "org/bouncycastle/math/ec/ECAlgorithms";
+        assert!(is_bc_crypto_math_native_override(
+            ec_algorithms,
+            "implShamirsTrickJsf",
+            "(Lorg/bouncycastle/math/ec/ECPoint;Ljava/math/BigInteger;Lorg/bouncycastle/math/ec/ECPoint;Ljava/math/BigInteger;)Lorg/bouncycastle/math/ec/ECPoint;"
+        ));
+        assert!(force_native_over_real_jdk_bytecode(
+            ec_algorithms,
+            "implShamirsTrickJsf",
+            "(Lorg/bouncycastle/math/ec/ECPoint;Ljava/math/BigInteger;Lorg/bouncycastle/math/ec/ECPoint;Ljava/math/BigInteger;)Lorg/bouncycastle/math/ec/ECPoint;"
+        ));
+        assert!(redefine_immune_forced_native(
+            ec_algorithms,
+            "implShamirsTrickJsf",
+            "(Lorg/bouncycastle/math/ec/ECPoint;Ljava/math/BigInteger;Lorg/bouncycastle/math/ec/ECPoint;Ljava/math/BigInteger;)Lorg/bouncycastle/math/ec/ECPoint;"
+        ));
+
+        let x25519_field = "org/bouncycastle/math/ec/rfc7748/X25519Field";
+        assert!(is_bc_crypto_math_native_override(
+            x25519_field,
+            "mul",
+            "([I[I[I)V"
+        ));
+        assert!(force_native_over_real_jdk_bytecode(
+            x25519_field,
+            "mul",
+            "([I[I[I)V"
+        ));
+        assert!(redefine_immune_forced_native(
+            x25519_field,
+            "mul",
+            "([I[I[I)V"
+        ));
+
+        let x448_field = "org/bouncycastle/math/ec/rfc7748/X448Field";
+        for (name, descriptor) in [
+            ("mul", "([I[I[I)V"),
+            ("mul", "([II[I)V"),
+            ("sqr", "([I[I)V"),
+            ("sqr", "([II[I)V"),
+        ] {
+            assert!(is_bc_crypto_math_native_override(
+                x448_field, name, descriptor
+            ));
+            assert!(force_native_over_real_jdk_bytecode(
+                x448_field, name, descriptor
+            ));
+            assert!(redefine_immune_forced_native(x448_field, name, descriptor));
+        }
+
+        let fp_point = "org/bouncycastle/math/ec/ECPoint$Fp";
+        for (name, descriptor) in [
+            (
+                "add",
+                "(Lorg/bouncycastle/math/ec/ECPoint;)Lorg/bouncycastle/math/ec/ECPoint;",
+            ),
+            ("twice", "()Lorg/bouncycastle/math/ec/ECPoint;"),
+            (
+                "twicePlus",
+                "(Lorg/bouncycastle/math/ec/ECPoint;)Lorg/bouncycastle/math/ec/ECPoint;",
+            ),
+            ("threeTimes", "()Lorg/bouncycastle/math/ec/ECPoint;"),
+            ("timesPow2", "(I)Lorg/bouncycastle/math/ec/ECPoint;"),
+            ("negate", "()Lorg/bouncycastle/math/ec/ECPoint;"),
+        ] {
+            assert!(
+                is_bc_crypto_math_native_override(fp_point, name, descriptor),
+                "{name}{descriptor} must route to the registered BC Fp point native"
+            );
+            assert!(
+                force_native_over_real_jdk_bytecode(fp_point, name, descriptor),
+                "{name}{descriptor} must not fall through to interpreted BC Fp point bytecode"
+            );
+            assert!(
+                redefine_immune_forced_native(fp_point, name, descriptor),
+                "{name}{descriptor} must stay native after unrelated redefinition"
+            );
+        }
+
+        let sect571 = "org/bouncycastle/math/ec/custom/sec/SecT571Field";
+        for (name, descriptor) in [
+            ("add", "([J[J[J)V"),
+            ("addBothTo", "([J[J[J)V"),
+            ("addExt", "([J[J[J)V"),
+            ("multiply", "([J[J[J)V"),
+            ("multiplyAddToExt", "([J[J[J)V"),
+            ("reduce", "([J[J)V"),
+            ("square", "([J[J)V"),
+            ("squareAddToExt", "([J[J)V"),
+            ("squareN", "([JI[J)V"),
+            ("invert", "([J[J)V"),
+            ("sqrt", "([J[J)V"),
+            ("halfTrace", "([J[J)V"),
+            ("trace", "([J)I"),
+            ("precompMultiplicand", "([J)[J"),
+            ("multiplyPrecomp", "([J[J[J)V"),
+            ("multiplyPrecompAddToExt", "([J[J[J)V"),
+        ] {
+            assert!(
+                is_bc_crypto_math_native_override(sect571, name, descriptor),
+                "{name}{descriptor} must route to the registered SecT native"
+            );
+            assert!(
+                force_native_over_real_jdk_bytecode(sect571, name, descriptor),
+                "{name}{descriptor} must not fall through to interpreted SecT bytecode"
+            );
+            assert!(
+                redefine_immune_forced_native(sect571, name, descriptor),
+                "{name}{descriptor} must stay native after unrelated redefinition"
+            );
+        }
+
+        assert!(is_bc_crypto_math_native_override(
+            "org/bouncycastle/math/ec/custom/sec/SecT233Field",
+            "multiply",
+            "([J[J[J)V"
+        ));
+        assert!(is_bc_crypto_math_native_override(
+            "org/bouncycastle/math/ec/ECPoint",
+            "timesPow2",
+            "(I)Lorg/bouncycastle/math/ec/ECPoint;"
+        ));
+        assert!(force_native_over_real_jdk_bytecode(
+            "org/bouncycastle/math/ec/ECPoint",
+            "timesPow2",
+            "(I)Lorg/bouncycastle/math/ec/ECPoint;"
+        ));
+        assert!(redefine_immune_forced_native(
+            "org/bouncycastle/math/ec/ECPoint",
+            "timesPow2",
+            "(I)Lorg/bouncycastle/math/ec/ECPoint;"
+        ));
+
+        let cbc = "org/bouncycastle/crypto/modes/CBCBlockCipher";
+        assert!(is_bc_crypto_math_native_override(
+            cbc,
+            "processBlock",
+            "([BI[BI)I"
+        ));
+        assert!(force_native_over_real_jdk_bytecode(
+            cbc,
+            "processBlock",
+            "([BI[BI)I"
+        ));
+        assert!(redefine_immune_forced_native(
+            cbc,
+            "processBlock",
+            "([BI[BI)I"
+        ));
+
+        let sic = "org/bouncycastle/crypto/modes/SICBlockCipher";
+        for (name, descriptor) in [
+            ("processBlock", "([BI[BI)I"),
+            ("processBytes", "([BII[BI)I"),
+        ] {
+            assert!(is_bc_crypto_math_native_override(sic, name, descriptor));
+            assert!(force_native_over_real_jdk_bytecode(sic, name, descriptor));
+            assert!(redefine_immune_forced_native(sic, name, descriptor));
+        }
+
+        let sm4 = "org/bouncycastle/crypto/engines/SM4Engine";
+        assert!(is_bc_crypto_math_native_override(
+            sm4,
+            "processBlock",
+            "([BI[BI)I"
+        ));
+        assert!(force_native_over_real_jdk_bytecode(
+            sm4,
+            "processBlock",
+            "([BI[BI)I"
+        ));
+        assert!(redefine_immune_forced_native(
+            sm4,
+            "processBlock",
+            "([BI[BI)I"
+        ));
+
+        let xtea = "org/bouncycastle/crypto/engines/XTEAEngine";
+        assert!(is_bc_crypto_math_native_override(
+            xtea,
+            "processBlock",
+            "([BI[BI)I"
+        ));
+        assert!(force_native_over_real_jdk_bytecode(
+            xtea,
+            "processBlock",
+            "([BI[BI)I"
+        ));
+        assert!(redefine_immune_forced_native(
+            xtea,
+            "processBlock",
+            "([BI[BI)I"
+        ));
+
+        let salsa = "org/bouncycastle/crypto/engines/Salsa20Engine";
+        assert!(is_bc_crypto_math_native_override(
+            salsa,
+            "salsaCore",
+            "(I[I[I)V"
+        ));
+        assert!(force_native_over_real_jdk_bytecode(
+            salsa,
+            "salsaCore",
+            "(I[I[I)V"
+        ));
+        assert!(redefine_immune_forced_native(
+            salsa,
+            "salsaCore",
+            "(I[I[I)V"
+        ));
+        for stream_engine in [
+            "org/bouncycastle/crypto/engines/Salsa20Engine",
+            "org/bouncycastle/crypto/engines/XSalsa20Engine",
+            "org/bouncycastle/crypto/engines/ChaChaEngine",
+            "org/bouncycastle/crypto/engines/ChaCha7539Engine",
+            "org/bouncycastle/crypto/engines/XChaCha20Engine",
+        ] {
+            assert!(is_bc_crypto_math_native_override(
+                stream_engine,
+                "processBytes",
+                "([BII[BI)I"
+            ));
+            assert!(force_native_over_real_jdk_bytecode(
+                stream_engine,
+                "processBytes",
+                "([BII[BI)I"
+            ));
+            assert!(redefine_immune_forced_native(
+                stream_engine,
+                "processBytes",
+                "([BII[BI)I"
+            ));
+        }
+
+        for vmpc_engine in [
+            "org/bouncycastle/crypto/engines/VMPCEngine",
+            "org/bouncycastle/crypto/engines/VMPCKSA3Engine",
+        ] {
+            assert!(is_bc_crypto_math_native_override(
+                vmpc_engine,
+                "processBytes",
+                "([BII[BI)I"
+            ));
+            assert!(force_native_over_real_jdk_bytecode(
+                vmpc_engine,
+                "processBytes",
+                "([BII[BI)I"
+            ));
+            assert!(redefine_immune_forced_native(
+                vmpc_engine,
+                "processBytes",
+                "([BII[BI)I"
+            ));
+        }
+
+        let gost3411 = "org/bouncycastle/crypto/digests/GOST3411Digest";
+        assert!(is_bc_crypto_math_native_override(
+            gost3411,
+            "processBlock",
+            "([BI)V"
+        ));
+        assert!(force_native_over_real_jdk_bytecode(
+            gost3411,
+            "processBlock",
+            "([BI)V"
+        ));
+        assert!(redefine_immune_forced_native(
+            gost3411,
+            "processBlock",
+            "([BI)V"
+        ));
+
+        let whirlpool = "org/bouncycastle/crypto/digests/WhirlpoolDigest";
+        for (name, descriptor) in [("processBlock", "()V"), ("update", "([BII)V")] {
+            assert!(is_bc_crypto_math_native_override(
+                whirlpool, name, descriptor
+            ));
+            assert!(force_native_over_real_jdk_bytecode(
+                whirlpool, name, descriptor
+            ));
+            assert!(redefine_immune_forced_native(whirlpool, name, descriptor));
+        }
+
+        let poly1305 = "org/bouncycastle/crypto/macs/Poly1305";
+        for (name, descriptor) in [("update", "([BII)V"), ("doFinal", "([BI)I")] {
+            assert!(is_bc_crypto_math_native_override(
+                poly1305, name, descriptor
+            ));
+            assert!(force_native_over_real_jdk_bytecode(
+                poly1305, name, descriptor
+            ));
+            assert!(redefine_immune_forced_native(poly1305, name, descriptor));
+        }
+
+        let pkcs12 = "org/bouncycastle/crypto/generators/PKCS12ParametersGenerator";
+        for (name, descriptor) in [
+            (
+                "generateDerivedParameters",
+                "(I)Lorg/bouncycastle/crypto/CipherParameters;",
+            ),
+            (
+                "generateDerivedParameters",
+                "(II)Lorg/bouncycastle/crypto/CipherParameters;",
+            ),
+            (
+                "generateDerivedMacParameters",
+                "(I)Lorg/bouncycastle/crypto/CipherParameters;",
+            ),
+        ] {
+            assert!(is_bc_crypto_math_native_override(pkcs12, name, descriptor));
+            assert!(force_native_over_real_jdk_bytecode(
+                pkcs12, name, descriptor
+            ));
+            assert!(redefine_immune_forced_native(pkcs12, name, descriptor));
+        }
+
+        for (class_name, name, descriptor) in [
+            (
+                "org/bouncycastle/crypto/digests/Blake2sDigest",
+                "compress",
+                "([BI)V",
+            ),
+            (
+                "org/bouncycastle/crypto/digests/Blake2sDigest",
+                "G",
+                "(IIIIII)V",
+            ),
+            (
+                "org/bouncycastle/crypto/digests/KeccakDigest",
+                "KeccakPermutation",
+                "()V",
+            ),
+            (
+                "org/bouncycastle/crypto/digests/KeccakDigest",
+                "KeccakAbsorb",
+                "([BI)V",
+            ),
+            (
+                "org/bouncycastle/crypto/digests/KeccakDigest",
+                "KeccakExtract",
+                "()V",
+            ),
+            (
+                "org/bouncycastle/crypto/generators/SCrypt",
+                "generate",
+                "([B[BIIII)[B",
+            ),
+            (
+                "org/bouncycastle/crypto/generators/Argon2BytesGenerator",
+                "generateBytes",
+                "([B[BII)I",
+            ),
+            (
+                "org/bouncycastle/crypto/generators/Argon2BytesGenerator",
+                "roundFunction",
+                "(Lorg/bouncycastle/crypto/generators/Argon2BytesGenerator$Block;IIIIIIIIIIIIIIII)V",
+            ),
+        ] {
+            assert!(is_bc_crypto_math_native_override(
+                class_name, name, descriptor
+            ));
+            assert!(force_native_over_real_jdk_bytecode(
+                class_name, name, descriptor
+            ));
+            assert!(redefine_immune_forced_native(class_name, name, descriptor));
+        }
+
+        let argon2_block = "org/bouncycastle/crypto/generators/Argon2BytesGenerator$Block";
+        for (name, descriptor) in [
+            ("fromBytes", "([B)V"),
+            ("toBytes", "([B)V"),
+            (
+                "copyBlock",
+                "(Lorg/bouncycastle/crypto/generators/Argon2BytesGenerator$Block;)V",
+            ),
+            (
+                "xor",
+                "(Lorg/bouncycastle/crypto/generators/Argon2BytesGenerator$Block;Lorg/bouncycastle/crypto/generators/Argon2BytesGenerator$Block;)V",
+            ),
+            (
+                "xorWith",
+                "(Lorg/bouncycastle/crypto/generators/Argon2BytesGenerator$Block;)V",
+            ),
+            (
+                "xorWith",
+                "(Lorg/bouncycastle/crypto/generators/Argon2BytesGenerator$Block;Lorg/bouncycastle/crypto/generators/Argon2BytesGenerator$Block;)V",
+            ),
+            (
+                "clear",
+                "()Lorg/bouncycastle/crypto/generators/Argon2BytesGenerator$Block;",
+            ),
+        ] {
+            assert!(is_bc_crypto_math_native_override(
+                argon2_block,
+                name,
+                descriptor
+            ));
+            assert!(force_native_over_real_jdk_bytecode(
+                argon2_block,
+                name,
+                descriptor
+            ));
+            assert!(redefine_immune_forced_native(
+                argon2_block,
+                name,
+                descriptor
+            ));
+        }
+
+        let argon2_fill_block = "org/bouncycastle/crypto/generators/Argon2BytesGenerator$FillBlock";
+        for (name, descriptor) in [
+            ("applyBlake", "()V"),
+            (
+                "fillBlock",
+                "(Lorg/bouncycastle/crypto/generators/Argon2BytesGenerator$Block;Lorg/bouncycastle/crypto/generators/Argon2BytesGenerator$Block;)V",
+            ),
+            (
+                "fillBlock",
+                "(Lorg/bouncycastle/crypto/generators/Argon2BytesGenerator$Block;Lorg/bouncycastle/crypto/generators/Argon2BytesGenerator$Block;Lorg/bouncycastle/crypto/generators/Argon2BytesGenerator$Block;)V",
+            ),
+            (
+                "fillBlockWithXor",
+                "(Lorg/bouncycastle/crypto/generators/Argon2BytesGenerator$Block;Lorg/bouncycastle/crypto/generators/Argon2BytesGenerator$Block;Lorg/bouncycastle/crypto/generators/Argon2BytesGenerator$Block;)V",
+            ),
+        ] {
+            assert!(is_bc_crypto_math_native_override(
+                argon2_fill_block,
+                name,
+                descriptor
+            ));
+            assert!(force_native_over_real_jdk_bytecode(
+                argon2_fill_block,
+                name,
+                descriptor
+            ));
+            assert!(redefine_immune_forced_native(
+                argon2_fill_block,
+                name,
+                descriptor
+            ));
+        }
+
+        let argon2_fixed_pool =
+            "org/bouncycastle/crypto/generators/Argon2BytesGenerator$FixedBlockPool";
+        for (name, descriptor) in [
+            (
+                "allocate",
+                "()Lorg/bouncycastle/crypto/generators/Argon2BytesGenerator$Block;",
+            ),
+            (
+                "deallocate",
+                "(Lorg/bouncycastle/crypto/generators/Argon2BytesGenerator$Block;)V",
+            ),
+        ] {
+            assert!(is_bc_crypto_math_native_override(
+                argon2_fixed_pool,
+                name,
+                descriptor
+            ));
+            assert!(force_native_over_real_jdk_bytecode(
+                argon2_fixed_pool,
+                name,
+                descriptor
+            ));
+            assert!(redefine_immune_forced_native(
+                argon2_fixed_pool,
+                name,
+                descriptor
+            ));
+        }
+
+        let pack = "org/bouncycastle/util/Pack";
+        for (name, descriptor) in [
+            ("bigEndianToInt", "([BI)I"),
+            ("littleEndianToInt", "([BI)I"),
+            ("bigEndianToInt", "([BI[I)V"),
+            ("littleEndianToInt", "([BI[I)V"),
+            ("bigEndianToInt", "([BI[III)V"),
+            ("littleEndianToInt", "([BI[III)V"),
+            ("intToBigEndian", "(I[BI)V"),
+            ("intToLittleEndian", "(I[BI)V"),
+            ("intToBigEndian", "([I[BI)V"),
+            ("intToLittleEndian", "([I[BI)V"),
+            ("intToBigEndian", "([III[BI)V"),
+            ("intToLittleEndian", "([III[BI)V"),
+        ] {
+            assert!(is_bc_crypto_math_native_override(pack, name, descriptor));
+            assert!(force_native_over_real_jdk_bytecode(pack, name, descriptor));
+            assert!(redefine_immune_forced_native(pack, name, descriptor));
+        }
+
+        for point in [
+            "org/bouncycastle/math/ec/custom/sec/SecT283R1Point",
+            "org/bouncycastle/math/ec/custom/sec/SecT571K1Point",
+            "org/bouncycastle/math/ec/custom/sec/SecT163K1Point",
+        ] {
+            assert!(
+                is_bc_crypto_math_native_override(
+                    point,
+                    "twice",
+                    "()Lorg/bouncycastle/math/ec/ECPoint;"
+                ),
+                "{point}.twice must route to the registered SecT point native"
+            );
+            assert!(
+                force_native_over_real_jdk_bytecode(
+                    point,
+                    "twice",
+                    "()Lorg/bouncycastle/math/ec/ECPoint;"
+                ),
+                "{point}.twice must not fall through to interpreted SecT point bytecode"
+            );
+            assert!(
+                redefine_immune_forced_native(
+                    point,
+                    "twice",
+                    "()Lorg/bouncycastle/math/ec/ECPoint;"
+                ),
+                "{point}.twice must stay native after unrelated redefinition"
+            );
+        }
+        assert!(!is_bc_crypto_math_native_override(
+            "org/bouncycastle/math/ec/custom/sec/SecP224K1Field",
+            "multiply",
+            "([I[I[I)V"
         ));
     }
 

@@ -1332,6 +1332,39 @@ fn fis_get_fd(ctx: &dyn NativeContext, this: ObjectRef) -> Option<FdId> {
     None
 }
 
+fn fis_ensure_fd_object(ctx: &mut dyn NativeContext, this: ObjectRef) -> Option<ObjectRef> {
+    if let Some(fd_obj) = fis_fd_object(ctx, this) {
+        return Some(fd_obj);
+    }
+    match ctx.new_object("java/io/FileDescriptor") {
+        Ok(Some(Value::Object(Some(fd_obj)))) => {
+            ctx.set_field_by_name(this, "fd", Value::Object(Some(fd_obj)));
+            Some(fd_obj)
+        }
+        _ => None,
+    }
+}
+
+fn fis_backfill_constructor_fields(
+    ctx: &mut dyn NativeContext,
+    this: ObjectRef,
+    path_obj: Option<ObjectRef>,
+) {
+    let _ = fis_ensure_fd_object(ctx, this);
+    if let Some(path_obj) = path_obj {
+        ctx.set_field_by_name(this, "path", Value::Object(Some(path_obj)));
+    }
+    if !matches!(
+        ctx.get_field_by_name(this, "closeLock"),
+        Value::Object(Some(_))
+    ) {
+        if let Ok(Some(Value::Object(Some(lock)))) = ctx.new_object("java/lang/Object") {
+            ctx.set_field_by_name(this, "closeLock", Value::Object(Some(lock)));
+        }
+    }
+    ctx.set_field_by_name(this, "closed", Value::Int(0));
+}
+
 fn native_fis_open0(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     // args[0] = this (FileInputStream), args[1] = path (String).
     // Invoked by the JDK constructor after it has allocated `this.fd`.
@@ -1343,8 +1376,12 @@ fn native_fis_open0(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRe
             }))
         }
     };
-    let path = match args.get(1) {
-        Some(Value::Object(Some(s))) => ctx.read_string(*s).unwrap_or_default(),
+    let path_obj = match args.get(1) {
+        Some(Value::Object(Some(s))) => Some(*s),
+        _ => None,
+    };
+    let path = match path_obj {
+        Some(s) => ctx.read_string(s).unwrap_or_default(),
         _ => String::new(),
     };
     let path = validated_path(&path)?;
@@ -1352,6 +1389,13 @@ fn native_fis_open0(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRe
         .fd_table()
         .open_read(&path)
         .map_err(|_| file_not_found(&path))?;
+    // Defensive real-layout backfill for the SyntheticStub constructor path.
+    // The default real-JDK constructor allocates `fd`, `closeLock`, and `path`
+    // before calling open0. If a dispatch path accidentally takes the native
+    // `<init>(String)` fallback, those fields are still unset; populate them so
+    // the public real bytecode (`read(...) -> readBytes`, `getFD`, `close`) sees
+    // the same shape as HotSpot rather than an empty/closed stream.
+    fis_backfill_constructor_fields(ctx, this, path_obj);
     fis_set_fd(ctx, this, fd);
     Ok(None)
 }
@@ -8042,6 +8086,23 @@ const DOS_FIELD_OUT: usize = 0;
 // Access `written` by NAME so the native and real bytecode agree on the slot.
 const DOS_WRITTEN_FIELD: &str = "written";
 
+#[derive(Default)]
+struct DisSideBuffer {
+    bytes: Vec<u8>,
+    pos: usize,
+}
+
+fn dis_side_buffers() -> &'static Mutex<HashMap<i32, DisSideBuffer>> {
+    static BUFS: OnceLock<Mutex<HashMap<i32, DisSideBuffer>>> = OnceLock::new();
+    BUFS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn dis_side_key(ctx: &mut dyn NativeContext, this: ObjectRef) -> i32 {
+    ctx.identity_hash_code(this)
+}
+
+const DIS_SIDE_BUFFER_SIZE: usize = 8192;
+
 fn register_data_stream_natives(registry: &mut NativeMethodRegistry) {
     let __prev_cat = registry.current_category();
     registry.set_category(cratonvm_native_api::NativeKind::Bridge);
@@ -8122,16 +8183,90 @@ fn dis_read_one(
     ctx: &mut dyn NativeContext,
     this: ObjectRef,
 ) -> Result<i32, cratonvm_types::error::MethodCallFailed> {
+    let key = dis_side_key(ctx, this);
+    {
+        let mut bufs = dis_side_buffers().lock();
+        if let Some(state) = bufs.get_mut(&key) {
+            if state.pos < state.bytes.len() {
+                let b = state.bytes[state.pos];
+                state.pos += 1;
+                if state.pos >= state.bytes.len() {
+                    bufs.remove(&key);
+                }
+                return Ok(b as i32);
+            }
+            bufs.remove(&key);
+        }
+    }
+
     let inner = match ctx.get_field(this, DIS_FIELD_IN) {
         Value::Object(Some(s)) => s,
         _ => return Ok(-1),
     };
-    // Delegate to the inner stream's read() via invoke_virtual
-    let result = ctx.invoke_virtual(inner, "read", "()I", &[])?;
-    match result {
-        Some(Value::Int(v)) => Ok(v),
-        _ => Ok(-1),
+    let tmp = ctx.new_array(ArrayElementType::Byte, DIS_SIDE_BUFFER_SIZE);
+    let this_pin = ctx.pin_native_root(this);
+    let tmp_pin = ctx.pin_native_root(tmp);
+    let result = match ctx.invoke_virtual(
+        inner,
+        "read",
+        "([BII)I",
+        &[
+            Value::Object(Some(tmp)),
+            Value::Int(0),
+            Value::Int(DIS_SIDE_BUFFER_SIZE as i32),
+        ],
+    ) {
+        Ok(v) => v,
+        Err(e) => {
+            ctx.unpin_native_roots(this_pin);
+            return Err(e);
+        }
+    };
+    let tmp = ctx.read_native_pin(tmp_pin, tmp);
+    let n = match result {
+        Some(Value::Int(v)) if v > 0 => v as usize,
+        _ => {
+            ctx.unpin_native_roots(this_pin);
+            return Ok(-1);
+        }
+    };
+    let mut bytes = vec![0u8; n];
+    ctx.read_byte_array_into(tmp, 0, &mut bytes);
+    ctx.unpin_native_roots(this_pin);
+    let first = bytes[0];
+    if n > 1 {
+        dis_side_buffers()
+            .lock()
+            .insert(key, DisSideBuffer { bytes, pos: 1 });
     }
+    Ok(first as i32)
+}
+
+fn dis_read_exact(
+    ctx: &mut dyn NativeContext,
+    this: ObjectRef,
+    len: usize,
+) -> Result<Vec<u8>, MethodCallFailed> {
+    let this_pin = ctx.pin_native_root(this);
+    let mut this = this;
+    let mut out = Vec::with_capacity(len);
+    for _ in 0..len {
+        let b = match dis_read_one(ctx, this) {
+            Ok(v) => v,
+            Err(e) => {
+                ctx.unpin_native_roots(this_pin);
+                return Err(e);
+            }
+        };
+        this = ctx.read_native_pin(this_pin, this);
+        if b < 0 {
+            ctx.unpin_native_roots(this_pin);
+            return Err(eof_exception());
+        }
+        out.push(b as u8);
+    }
+    ctx.unpin_native_roots(this_pin);
+    Ok(out)
 }
 
 fn native_dis_read(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
@@ -8160,52 +8295,36 @@ fn native_dis_read_bytes(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
         Some(Value::Int(v)) => *v,
         _ => 0,
     };
-    if len == 0 {
+    if len <= 0 {
         return Ok(Some(Value::Int(0)));
     }
-    // Delegate bulk read to inner stream
-    let inner = match ctx.get_field(this, DIS_FIELD_IN) {
-        Value::Object(Some(s)) => s,
-        _ => return Ok(Some(Value::Int(-1))),
-    };
-    // PIN: `this`/`buf` are re-used after the re-entrant `invoke_virtual`
-    // calls below, which run real bytecode and can trigger a moving GC --
-    // an unpinned `ObjectRef` goes stale and the eventual `set_array_element`
-    // then writes through a dangling pointer (see
-    // docs/known-issues/hib-jpalargeblobtest-object-read-nosuchmethod.md).
     let this_pin = ctx.pin_native_root(this);
     let buf_pin = ctx.pin_native_root(buf);
-    let result = match ctx.invoke_virtual(
-        inner,
-        "read",
-        "([BII)I",
-        &[Value::Object(Some(buf)), Value::Int(off), Value::Int(len)],
-    ) {
-        Ok(v) => v,
-        Err(e) => {
-            ctx.unpin_native_roots(this_pin);
-            return Err(e);
-        }
-    };
-    let this = ctx.read_native_pin(this_pin, this);
-    let buf = ctx.read_native_pin(buf_pin, buf);
-    let out = match result {
-        Some(Value::Int(v)) if v > 0 => Ok(Some(Value::Int(v))),
-        Some(Value::Int(0)) => {
-            // Bulk returned 0 — try single byte
-            let b = dis_read_one(ctx, this)?;
-            let buf = ctx.read_native_pin(buf_pin, buf);
-            if b == -1 {
-                Ok(Some(Value::Int(-1)))
-            } else {
-                ctx.set_array_element(buf, off as usize, Value::Int(b));
-                Ok(Some(Value::Int(1)))
+    let mut this = this;
+    let mut buf = buf;
+    let mut read = 0usize;
+    for i in 0..(len as usize) {
+        let b = match dis_read_one(ctx, this) {
+            Ok(v) => v,
+            Err(e) => {
+                ctx.unpin_native_roots(this_pin);
+                return Err(e);
             }
+        };
+        this = ctx.read_native_pin(this_pin, this);
+        buf = ctx.read_native_pin(buf_pin, buf);
+        if b < 0 {
+            break;
         }
-        _ => Ok(Some(Value::Int(-1))),
-    };
+        ctx.set_array_element(buf, off as usize + i, Value::Int(b));
+        read += 1;
+    }
     ctx.unpin_native_roots(this_pin);
-    out
+    if read == 0 {
+        Ok(Some(Value::Int(-1)))
+    } else {
+        Ok(Some(Value::Int(read as i32)))
+    }
 }
 
 fn native_dis_read_boolean(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
@@ -8213,8 +8332,8 @@ fn native_dis_read_boolean(ctx: &mut dyn NativeContext, args: &[Value]) -> Metho
         Some(Value::Object(Some(o))) => *o,
         _ => return Ok(Some(Value::Int(0))),
     };
-    let b = dis_read_one(ctx, this)?;
-    Ok(Some(Value::Int(if b != 0 { 1 } else { 0 })))
+    let bytes = dis_read_exact(ctx, this, 1)?;
+    Ok(Some(Value::Int(if bytes[0] != 0 { 1 } else { 0 })))
 }
 
 fn native_dis_read_byte(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
@@ -8222,8 +8341,8 @@ fn native_dis_read_byte(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCa
         Some(Value::Object(Some(o))) => *o,
         _ => return Ok(Some(Value::Int(0))),
     };
-    let b = dis_read_one(ctx, this)?;
-    Ok(Some(Value::Int(b as i8 as i32)))
+    let bytes = dis_read_exact(ctx, this, 1)?;
+    Ok(Some(Value::Int(bytes[0] as i8 as i32)))
 }
 
 fn native_dis_read_unsigned_byte(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
@@ -8231,8 +8350,8 @@ fn native_dis_read_unsigned_byte(ctx: &mut dyn NativeContext, args: &[Value]) ->
         Some(Value::Object(Some(o))) => *o,
         _ => return Ok(Some(Value::Int(0))),
     };
-    let b = dis_read_one(ctx, this)?;
-    Ok(Some(Value::Int(b & 0xFF)))
+    let bytes = dis_read_exact(ctx, this, 1)?;
+    Ok(Some(Value::Int(bytes[0] as i32)))
 }
 
 fn native_dis_read_short(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
@@ -8240,10 +8359,9 @@ fn native_dis_read_short(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
         Some(Value::Object(Some(o))) => *o,
         _ => return Ok(Some(Value::Int(0))),
     };
-    let b0 = dis_read_one(ctx, this)?;
-    let b1 = dis_read_one(ctx, this)?;
-    let val = ((b0 & 0xFF) << 8) | (b1 & 0xFF);
-    Ok(Some(Value::Int(val as i16 as i32)))
+    let bytes = dis_read_exact(ctx, this, 2)?;
+    let val = i16::from_be_bytes([bytes[0], bytes[1]]);
+    Ok(Some(Value::Int(val as i32)))
 }
 
 fn native_dis_read_unsigned_short(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
@@ -8251,10 +8369,9 @@ fn native_dis_read_unsigned_short(ctx: &mut dyn NativeContext, args: &[Value]) -
         Some(Value::Object(Some(o))) => *o,
         _ => return Ok(Some(Value::Int(0))),
     };
-    let b0 = dis_read_one(ctx, this)?;
-    let b1 = dis_read_one(ctx, this)?;
-    let val = ((b0 & 0xFF) << 8) | (b1 & 0xFF);
-    Ok(Some(Value::Int(val)))
+    let bytes = dis_read_exact(ctx, this, 2)?;
+    let val = u16::from_be_bytes([bytes[0], bytes[1]]);
+    Ok(Some(Value::Int(val as i32)))
 }
 
 fn native_dis_read_char(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
@@ -8266,19 +8383,10 @@ fn native_dis_read_int(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCal
         Some(Value::Object(Some(o))) => *o,
         _ => return Ok(Some(Value::Int(0))),
     };
-    let mut val: i32 = 0;
-    for _ in 0..4 {
-        let b = dis_read_one(ctx, this)?;
-        if b < 0 {
-            return Err(MethodCallFailed::InternalError(VmError::Runtime(
-                RuntimeError::EOFException {
-                    message: "Unexpected EOF".to_string(),
-                },
-            )));
-        }
-        val = (val << 8) | (b & 0xFF);
-    }
-    Ok(Some(Value::Int(val)))
+    let bytes = dis_read_exact(ctx, this, 4)?;
+    Ok(Some(Value::Int(i32::from_be_bytes([
+        bytes[0], bytes[1], bytes[2], bytes[3],
+    ]))))
 }
 
 fn native_dis_read_long(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
@@ -8286,12 +8394,10 @@ fn native_dis_read_long(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCa
         Some(Value::Object(Some(o))) => *o,
         _ => return Ok(Some(Value::Long(0))),
     };
-    let mut val: i64 = 0;
-    for _ in 0..8 {
-        let b = dis_read_one(ctx, this)?;
-        val = (val << 8) | ((b & 0xFF) as i64);
-    }
-    Ok(Some(Value::Long(val)))
+    let bytes = dis_read_exact(ctx, this, 8)?;
+    Ok(Some(Value::Long(i64::from_be_bytes([
+        bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5], bytes[6], bytes[7],
+    ]))))
 }
 
 fn native_dis_read_float(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
@@ -8333,61 +8439,9 @@ fn native_dis_read_utf(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCal
         Some(Value::Object(Some(o))) => *o,
         _ => return Ok(Some(Value::Object(None))),
     };
-    let b0 = dis_read_one(ctx, this)?;
-    let b1 = dis_read_one(ctx, this)?;
-    let len = (((b0 & 0xFF) as usize) << 8) | ((b1 & 0xFF) as usize);
-    // Read all UTF bytes in bulk via a temporary array
-    let tmp_arr = ctx.new_array(ArrayElementType::Byte, len);
-    let inner = match ctx.get_field(this, DIS_FIELD_IN) {
-        Value::Object(Some(s)) => s,
-        _ => {
-            // Fallback: byte-by-byte
-            let mut bytes = Vec::with_capacity(len);
-            for _ in 0..len {
-                let b = dis_read_one(ctx, this)?;
-                bytes.push(b as u8);
-            }
-            let s = decode_modified_utf8(&bytes).map_err(|e| {
-                cratonvm_types::error::RuntimeError::IOException {
-                    message: format!("readUTF: {e}"),
-                }
-            })?;
-            let result = ctx.create_string(&s);
-            return Ok(Some(Value::Object(Some(result))));
-        }
-    };
-    // Bulk read via inner stream's read([BII)I
-    let mut filled = 0usize;
-    while filled < len {
-        let remaining = (len - filled) as i32;
-        let n = ctx.invoke_virtual(
-            inner,
-            "read",
-            "([BII)I",
-            &[
-                Value::Object(Some(tmp_arr)),
-                Value::Int(filled as i32),
-                Value::Int(remaining),
-            ],
-        )?;
-        match n {
-            Some(Value::Int(v)) if v > 0 => filled += v as usize,
-            _ => {
-                // Fallback: fill remaining byte-by-byte
-                for i in filled..len {
-                    let b = dis_read_one(ctx, this)?;
-                    ctx.set_array_element(tmp_arr, i, Value::Int(b));
-                }
-                filled = len;
-            }
-        }
-    }
-    // Extract bytes from array
-    let mut bytes = Vec::with_capacity(len);
-    for i in 0..len {
-        let b = ctx.get_array_element(tmp_arr, i).as_int().unwrap_or(0);
-        bytes.push(b as u8);
-    }
+    let len_bytes = dis_read_exact(ctx, this, 2)?;
+    let len = u16::from_be_bytes([len_bytes[0], len_bytes[1]]) as usize;
+    let bytes = dis_read_exact(ctx, this, len)?;
     let s = decode_modified_utf8(&bytes).map_err(|e| {
         cratonvm_types::error::RuntimeError::IOException {
             message: format!("readUTF: {e}"),
@@ -8576,36 +8630,12 @@ fn dis_read_fully_impl(
     off: usize,
     len: usize,
 ) -> MethodCallResult {
-    let inner = match ctx.get_field(this, DIS_FIELD_IN) {
-        Value::Object(Some(s)) => s,
-        _ => return Err(eof_exception()),
-    };
-    // Same stale-local hazard as native_bais_read_bytes/native_dis_read_bytes:
-    // every invoke_virtual below can run bytecode and trigger a moving GC.
-    // Keep all object refs reused after those calls as native roots and reload
-    // them before any further dispatch or array store.
     let this_pin = ctx.pin_native_root(this);
     let buf_pin = ctx.pin_native_root(buf);
-    let inner_pin = ctx.pin_native_root(inner);
     let mut this = this;
     let mut buf = buf;
-    let mut inner = inner;
-    let mut filled = 0usize;
-    let out = loop {
-        if filled >= len {
-            break Ok(None);
-        }
-        let remaining = (len - filled) as i32;
-        let n = match ctx.invoke_virtual(
-            inner,
-            "read",
-            "([BII)I",
-            &[
-                Value::Object(Some(buf)),
-                Value::Int((off + filled) as i32),
-                Value::Int(remaining),
-            ],
-        ) {
+    for i in 0..len {
+        let b = match dis_read_one(ctx, this) {
             Ok(v) => v,
             Err(e) => {
                 ctx.unpin_native_roots(this_pin);
@@ -8614,36 +8644,14 @@ fn dis_read_fully_impl(
         };
         this = ctx.read_native_pin(this_pin, this);
         buf = ctx.read_native_pin(buf_pin, buf);
-        inner = ctx.read_native_pin(inner_pin, inner);
-        match n {
-            Some(Value::Int(v)) if v > 0 => {
-                filled += v as usize;
-            }
-            _ => {
-                // EOF (0 or -1) before all bytes were delivered → byte-by-byte fallback.
-                // dis_read_one returns -1 on EOF; we throw EOFException if that happens.
-                for i in filled..len {
-                    let b = match dis_read_one(ctx, this) {
-                        Ok(v) => v,
-                        Err(e) => {
-                            ctx.unpin_native_roots(this_pin);
-                            return Err(e);
-                        }
-                    };
-                    this = ctx.read_native_pin(this_pin, this);
-                    buf = ctx.read_native_pin(buf_pin, buf);
-                    if b < 0 {
-                        ctx.unpin_native_roots(this_pin);
-                        return Err(eof_exception());
-                    }
-                    ctx.set_array_element(buf, off + i, Value::Int(b));
-                }
-                break Ok(None);
-            }
+        if b < 0 {
+            ctx.unpin_native_roots(this_pin);
+            return Err(eof_exception());
         }
-    };
+        ctx.set_array_element(buf, off + i, Value::Int(b));
+    }
     ctx.unpin_native_roots(this_pin);
-    out
+    Ok(None)
 }
 
 fn native_dis_skip_bytes(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
@@ -8658,27 +8666,24 @@ fn native_dis_skip_bytes(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
     if n <= 0 {
         return Ok(Some(Value::Int(0)));
     }
-    // Delegate to inner stream's skip()
-    let inner = match ctx.get_field(this, DIS_FIELD_IN) {
-        Value::Object(Some(s)) => s,
-        _ => return Ok(Some(Value::Int(0))),
-    };
-    let mut total_skipped: i64 = 0;
+    let this_pin = ctx.pin_native_root(this);
+    let mut this = this;
+    let mut total_skipped = 0i64;
     while total_skipped < n {
-        let remaining = n - total_skipped;
-        let result = ctx.invoke_virtual(inner, "skip", "(J)J", &[Value::Long(remaining)])?;
-        match result {
-            Some(Value::Long(s)) if s > 0 => total_skipped += s,
-            _ => {
-                // skip returned 0 — try reading one byte to check for EOF
-                let b = dis_read_one(ctx, this)?;
-                if b == -1 {
-                    break;
-                }
-                total_skipped += 1;
+        let b = match dis_read_one(ctx, this) {
+            Ok(v) => v,
+            Err(e) => {
+                ctx.unpin_native_roots(this_pin);
+                return Err(e);
             }
+        };
+        this = ctx.read_native_pin(this_pin, this);
+        if b < 0 {
+            break;
         }
+        total_skipped += 1;
     }
+    ctx.unpin_native_roots(this_pin);
     Ok(Some(Value::Int(total_skipped as i32)))
 }
 

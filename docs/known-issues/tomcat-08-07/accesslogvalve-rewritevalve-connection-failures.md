@@ -1,16 +1,18 @@
 # TestAccessLogValve / TestRewriteValve — connection-level `-1` response failures
 
-**Status:** All three root causes found in this investigation now have fixes
-**landed on `dev`** (2026-07-09/10) — Layer 1 (`URL.openConnection()` CCE),
-Layer 2 (`ByteBuffer.address`, fixed by a separate session — see
-`docs/internal/tomcat-08-07/bytebuffer-address-unset-aioobe.md`), and Layer 3
-(`StringReader.read()`, fixed in this session — see
-`docs/internal/fixed-suite-bugs/stringreader-read-never-advances-infinite-loop-FIXED.md`).
-`TestRewriteValve` (Layer 3's reproducer) was re-run against the Layer 3 fix
-and now completes all 121 tests instead of hanging. **`TestAccessLogValve`
-(Layer 2's reproducer) has not been independently re-run against the Layer 2
-fix in this session** — recommend a follow-up full re-run of both classes
-together before moving this doc out of `known-issues/`. **HotSpot:** PASS on
+**Status:** OPEN. Four layered root causes found across this investigation;
+three (Layer 1 `URL.openConnection()` CCE, Layer 2 `ByteBuffer.address`,
+Layer 3 `StringReader.read()`) plus a cross-cutting fourth
+(`SocketWrapperBase.lock`, tracked in the swallow-uploads doc) are all
+FIXED and landed on `dev`. **`TestRewriteValve` improved dramatically**
+(was: 0/121, complete hang; now: 80/121 pass, remaining 41 are mostly an
+unrelated `302`-vs-`200`/`400` rewrite-rule logic bug plus 4 residual
+`-1`s). **`TestAccessLogValve` does NOT pass yet** — re-run 2026-07-10
+against all four fixes together shows it still fails **94/94** with the
+exact same `-1` symptom, and this is confirmed to be a **fifth, distinct,
+not-yet-root-caused cause** (see the 2026-07-10 section below — none of the
+four known fixes explain it, and no server-side exception is ever logged).
+Keep this doc in `known-issues/` until that's found. **HotSpot:** PASS on
 both.
 
 ## 2026-07-09 re-verification (Azure host, dev @ `7e382917`, `-Parallel 1`)
@@ -112,19 +114,135 @@ progress).
 ## Recommendation for the next session
 
 1. **Layer 1 fix is landed and verified** — no further action needed there.
-2. **Layer 2 fix is landed** (separate session) — recommend an isolated
-   `TestAccessLogValve` re-run to confirm the `-1`/`400` symptom is actually
-   gone now (not independently re-verified in this session).
-3. **Layer 3 fix is landed and verified in this session** —
-   `TestRewriteValve` completes all 121 tests. The remaining failures in
-   that run (`NullPointerException: Cannot enter synchronized block because
-   "this.lock" is null` in the NIO socket/lock path, and the
-   `LifecycleException` cascades it triggers) are a distinct,
-   previously-undocumented issue, not investigated further here — worth a
-   new known-issue doc if it reproduces outside this suite.
-4. Once both Layer 2 and Layer 3 re-runs are independently confirmed clean
-   (or at least free of these three specific symptoms), this doc can move
-   to `docs/internal/` per the known-issues convention.
+2. **Layer 2 fix is landed**, but did NOT resolve `TestAccessLogValve` —
+   see the 2026-07-10 re-run section below for a fifth, still-open cause.
+3. **Layer 3 fix is landed and verified** — `TestRewriteValve` goes from a
+   complete hang to 80/121 passing.
+4. **`SocketWrapperBase.lock` fix (commit `9cbbc82c`) is landed and
+   verified** — zero `lock is null` NPEs in either class now.
+5. Do NOT move this doc to `docs/internal/` yet — `TestAccessLogValve`
+   still fails 94/94 for an undiagnosed fifth reason. Follow the candidate
+   next steps in the 2026-07-10 section below.
+
+## 2026-07-10: the `SocketWrapperBase.lock` NPE noted above is a known,
+## cross-cutting bug — now empirically resolved on current `dev`
+
+The `NullPointerException: ... "this.lock" is null` failure flagged as "a
+distinct, previously-undocumented issue" in an earlier version of this
+section is neither distinct nor previously undocumented — it's the exact
+`SocketWrapperBase`/`SocketProcessorBase` NPE root-caused across two prior
+sessions in
+`docs/known-issues/tomcat-08-07/swallowabortedupploads-unexpected-socketexception.md`
+(root-caused as a stale/lost local variable, `TestSwallowAbortedUploads`;
+also hit `TestNonBlockingAPI`/`TestHttp11Processor` per
+`nonblockingapi-http11processor-http2limits-bare-assertions.md`).
+
+Re-ran `TestRewriteValve` against a fresh `origin/dev` tip (worktree
+`/data/data/wt-rewritevalve-lockcheck`) that includes commit `9cbbc82c`
+("Fix Tomcat WebSocket close-delay blockers", landed after this doc's Layer
+3 fix above): **zero** `lock is null` occurrences across all 121 tests
+(previously: every single connection). `Tests run: 121, Failures: 156`
+(down from 229 before `9cbbc82c`) — the 109 tests that previously died with
+a connection-level `-1` mostly now get a real HTTP response (a new,
+narrower `200`/`400`-vs-`302` behavioral mismatch, not investigated).
+Full comparison table and the open question of exactly which of
+`9cbbc82c`'s three bundled changes is responsible are in the swallow-upload
+doc's own "`TestRewriteValve` independently confirms" section — read that
+before doing further work here.
+
+**Practical upshot:** don't write a new known-issue doc for this NPE — it
+already has one, and it's evidently no longer reproducing (at least for
+these two test classes) on current `dev`. The remaining `TestRewriteValve`
+failures (200/400-vs-302, UTF-8 percent-encoding round-trip — see the
+swallow-upload doc's comparison table for exact counts) are the actual
+next-actionable item for this class, not the old NPE.
+
+## 2026-07-10: `TestAccessLogValve` re-run against ALL four fixes together — still 94/94 fail at `-1`. A fourth, distinct, unexplained cause remains.
+
+Did the follow-up re-run this doc's "Recommendation" section asked for.
+Rebuilt worktree `/data/data/wt-valveconn-reverify` fully current with
+`origin/dev` (includes Layer 1/2/3 fixes above AND commit `9cbbc82c`'s
+`SocketWrapperBase.lock` fix). Restored the harness's missing
+`output/build/conf/logging.properties` first (a separate, non-VM fixture
+gap on this Azure copy — was causing a `FileNotFoundException` on every
+test's teardown and inflating the failure count; unrelated to any of this
+doc's bugs, just noise on top of them).
+
+**Result: `Tests run: 94, Failures: 94`, every single failure still
+`AssertionError: expected:<200> but was:<-1>`.** `grep -c 'lock is null'`
+on the full run: **0** — so this is NOT the `SocketWrapperBase.lock` NPE
+either. No exception of any kind appears anywhere in the server-side log
+for any of the 94 tests (checked with `org.apache.tomcat.util.net`,
+`org.apache.coyote`, and `org.apache.tomcat.util.http.parser.Cookie` bumped
+to `FINEST`). The first test does get far enough to log a real, expected
+`INFO [org.apache.tomcat.util.http.parser.Cookie] A cookie header was
+received ... that contained an invalid cookie` — meaning the request headers
+(including the Cookie/custom headers `TestAccessLogValve.test()` sets) DO
+reach and get parsed by the server — yet the client still sees `-1`. Total
+wall time (~1m53s for 94 tests) rules out each test blocking for the full
+300s client read timeout; something fails within roughly a second per test,
+just not in a way any of this doc's four already-fixed bugs, or any logged
+exception, explains.
+
+**Ruled out as the same-shaped bug** (each independently confirmed against
+this exact binary):
+- `ByteBuffer.address`/AIOOBE (Layer 2) — a direct minimal repro
+  (`SocketChannel.read` into an `allocate()`d buffer, `get(byte[])` on it)
+  against both a trusted external Python client/server AND a pure-CratonVM
+  client+server round trip both return `200`/correct bytes now.
+- `StringReader.read()` (Layer 3) — direct repro terminates correctly
+  (`h,e,l,l,o,-1`), no longer relevant to this class anyway (`AccessLogValve`
+  doesn't use `StringReader`).
+- `SocketWrapperBase.lock` — `grep -c 'lock is null'` = 0.
+- Client request-header construction — a minimal repro sending the exact
+  same `Cookie`/custom-header set (`HeaderProbe.java`) against a trusted
+  Python server gets a clean `200` with correctly-formed headers.
+- `ByteBuffer.allocateDirect()` — also verified correct (`DirectByteBuffer`,
+  real address, working `put`/`get` round trip) in case Tomcat's
+  `NioEndpoint` uses direct buffers on this code path; not conclusively
+  ruled in or out as relevant since the exact buffer-allocation call site
+  actually used by `Http11InputBuffer`/`SocketBufferHandler` during a live
+  request wasn't traced.
+- General regression: `TestConnector` (a different, previously-fixed Tomcat
+  NIO class, see `reference_tomcat_triage_20260629`) still passes 11/12 on
+  this exact binary — so this is not a blanket Tomcat-NIO regression, it is
+  specific to something `TestAccessLogValve` (or `AccessLogValve` itself)
+  does that the other classes don't.
+
+**Not root-caused.** Candidate next steps for whoever picks this up:
+1. Trace the exact `ByteBuffer`/`CharBuffer` allocation and encoding call
+   chain `AccessLogValve.log()` and/or Tomcat's response
+   `OutputBuffer`/`CoyoteOutputStream` actually use for this specific test
+   (`resp.getWriter().print(...)` with `setCharacterEncoding("UTF-8")`) —
+   distinct from the plain `SocketChannel.read()`-side path already fixed
+   in Layer 2. `native-builtins/src/charset.rs`'s `CharsetEncoder`-result
+   buffer allocator already has the equivalent `address=16` fix as
+   precedent; worth confirming whether a *different*, still-unfixed
+   allocation site is what `AccessLogValve`'s response-writing path hits.
+2. Add server-side instrumentation directly in
+   `org.apache.tomcat.util.net.NioEndpoint`/`SocketWrapperBase`'s write
+   path (same recompile-and-classpath-override technique used for the
+   `SocketWrapperBase.lock` investigation) to see whether the response is
+   ever actually handed to the socket for writing, or something swallows it
+   silently before that point — the total absence of ANY server-side log
+   line (even at FINEST) for the failure itself is the most suspicious
+   single fact here and suggests either a genuinely silent failure path or
+   a logging configuration gap distinct from the `conf/logging.properties`
+   fixture issue already fixed.
+3. Since this is deterministic (94/94, not a subset), a bisection isolating
+   which specific behavior of `TestAccessLogValve` vs `TestConnector`
+   triggers it (e.g. try `TestConnector` with an `AccessLogValve` added to
+   its pipeline, or `TestAccessLogValve` with the valve removed) would
+   likely narrow this down faster than further blind tracing.
+
+Given the host was under heavy concurrent load during this specific
+re-verification (`uptime` load average 10-14 on 16 cores, 45 other
+`cratonvm` processes from parallel sessions — unlike the original
+idle-host re-verification at the top of this doc), also worth a **repeat
+confirmation on a quiet host** before fully trusting the 94/94 determinism,
+though the identical, exception-free `-1` signature every time (not varying
+counts run to run, unlike typical contention noise) argues against pure
+load-induced flakiness.
 
 ## Reproduction
 

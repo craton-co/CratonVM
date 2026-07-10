@@ -461,12 +461,13 @@ impl<'a> ClassHierarchy for ClassStoreHierarchy<'a> {
         if a == b {
             return a.to_string();
         }
+        let fallback = || static_common_superclass_lookup(a, b);
         let (Some(a_id), Some(b_id)) = (self.lookup(a), self.lookup(b)) else {
-            return "java/lang/Object".to_string();
+            return fallback();
         };
         let a_cls = match self.class_for(a_id) {
             Some(c) => c,
-            None => return "java/lang/Object".to_string(),
+            None => return fallback(),
         };
         let mut current = Some(a_cls);
         let mut depth = 0usize;
@@ -483,7 +484,7 @@ impl<'a> ClassHierarchy for ClassStoreHierarchy<'a> {
             }
             current = cls.superclass.and_then(|sid| self.class_store.get(sid));
         }
-        "java/lang/Object".to_string()
+        fallback()
     }
 
     fn is_interface(&self, name: &str) -> bool {
@@ -6044,6 +6045,49 @@ pub fn jdk_superclass_lookup(name: &str) -> &'static str {
     jdk_superclass(name)
 }
 
+/// Return the least common superclass known to the static hierarchy table.
+///
+/// This is a verifier fallback for pre-Java-7 classfiles that have no
+/// StackMapTable. Their types are inferred by merging control-flow frames, but
+/// sibling exception classes are often not loaded yet when a merge happens. The
+/// dynamic store remains authoritative when it can answer; this helper keeps
+/// the fallback from unnecessarily widening known sibling classes to Object.
+pub fn static_common_superclass_lookup(a: &str, b: &str) -> String {
+    if a == b {
+        return a.to_string();
+    }
+
+    let mut a_chain = Vec::with_capacity(8);
+    let mut current = a;
+    for _ in 0..64 {
+        a_chain.push(current);
+        if current == "java/lang/Object" {
+            break;
+        }
+        let next = jdk_superclass(current);
+        if next == current {
+            break;
+        }
+        current = next;
+    }
+
+    let mut current = b;
+    for _ in 0..64 {
+        if a_chain.iter().any(|ancestor| *ancestor == current) {
+            return current.to_string();
+        }
+        if current == "java/lang/Object" {
+            break;
+        }
+        let next = jdk_superclass(current);
+        if next == current {
+            break;
+        }
+        current = next;
+    }
+    "java/lang/Object".to_string()
+}
+
 /// Verifier fallback: is `child` a subclass of `parent` according to the
 /// static JDK superclass table?
 ///
@@ -6121,6 +6165,22 @@ fn jdk_superclass(name: &str) -> &'static str {
         | "java/lang/UnsatisfiedLinkError"
         | "java/lang/SecurityException"
         | "java/lang/MatchException" => "java/lang/RuntimeException",
+
+        // XStream 1.4.x ships Java 6-era bytecode without StackMapTable.
+        // Its SerializationMembers verifier frames merge these sibling
+        // exception types before the classes have been loaded; keeping this
+        // real chain prevents a valid `athrow` from being widened to Object.
+        "com/thoughtworks/xstream/converters/reflection/ObjectAccessException"
+        | "com/thoughtworks/xstream/converters/ConversionException" => {
+            "com/thoughtworks/xstream/converters/ErrorWritingException"
+        }
+        "com/thoughtworks/xstream/converters/ErrorWritingException" => {
+            "com/thoughtworks/xstream/XStreamException"
+        }
+        "com/thoughtworks/xstream/XStreamException" => {
+            "com/thoughtworks/xstream/core/BaseException"
+        }
+        "com/thoughtworks/xstream/core/BaseException" => "java/lang/RuntimeException",
 
         // java.util exceptions
         "java/util/NoSuchElementException"
@@ -11574,6 +11634,43 @@ mod tests {
             descriptor: cratonvm_types::intern_arc("I"),
             attributes: vec![],
         }
+    }
+
+    #[test]
+    fn static_common_superclass_finds_xstream_exception_lub() {
+        assert_eq!(
+            static_common_superclass_lookup(
+                "com/thoughtworks/xstream/converters/reflection/ObjectAccessException",
+                "com/thoughtworks/xstream/converters/ConversionException",
+            ),
+            "com/thoughtworks/xstream/converters/ErrorWritingException"
+        );
+        assert_eq!(
+            static_common_superclass_lookup(
+                "com/thoughtworks/xstream/converters/ConversionException",
+                "java/lang/RuntimeException",
+            ),
+            "java/lang/RuntimeException"
+        );
+    }
+
+    #[test]
+    fn verifier_hierarchy_common_superclass_uses_static_xstream_chain() {
+        let cm = ClassManager::new(&[], &[], &[]);
+        let hierarchy = ClassStoreHierarchy {
+            class_store: &cm.class_store,
+            loaded_classes: &cm.loaded_classes,
+            in_flight: None,
+            requesting_loader: None,
+        };
+        use crate::vtype::ClassHierarchy;
+        assert_eq!(
+            hierarchy.common_superclass(
+                "com/thoughtworks/xstream/converters/reflection/ObjectAccessException",
+                "com/thoughtworks/xstream/converters/ConversionException",
+            ),
+            "com/thoughtworks/xstream/converters/ErrorWritingException"
+        );
     }
 
     // --- BUG-06: reflective Class.forName must not be satisfied by an
