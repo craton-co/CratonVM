@@ -3139,70 +3139,19 @@ pub(crate) fn register_scanner_natives(r: &mut NativeMethodRegistry) {
     // close()
     r.register(sc, "close", "()V", |_ctx, _args| Ok(None));
 
-    // --- java.io.StringReader (1-field: source=0, position tracked via field 1) ---
-    let sr = "java/io/StringReader";
-    r.register(sr, "<init>", "(Ljava/lang/String;)V", |ctx, args| {
-        let this = obj_arg(args, 0)?;
-        ctx.set_field(this, 0, args[1]);
-        Ok(None)
-    });
-    r.register(sr, "read", "()I", |ctx, args| {
-        let this = obj_arg(args, 0)?;
-        let source = match ctx.get_field(this, 0) {
-            Value::Object(Some(s)) => ctx.read_string(s).unwrap_or_default(),
-            _ => return Ok(Some(Value::Int(-1))),
-        };
-        // Simple: return first char then consume
-        if source.is_empty() {
-            Ok(Some(Value::Int(-1)))
-        } else {
-            let ch = source.chars().next().unwrap_or('\0') as i32;
-            let rest = ctx.create_string(&source[ch.min(source.len() as i32) as usize..]);
-            ctx.set_field(this, 0, Value::Object(Some(rest)));
-            Ok(Some(Value::Int(ch)))
-        }
-    });
-    r.register(sr, "close", "()V", |_ctx, _args| Ok(None));
-
-    // --- java.io.StringWriter (1-field: buffer string) ---
-    let sw = "java/io/StringWriter";
-    r.register(sw, "<init>", "()V", |ctx, args| {
-        let this = obj_arg(args, 0)?;
-        let empty = ctx.create_string("");
-        ctx.set_field(this, 0, Value::Object(Some(empty)));
-        Ok(None)
-    });
-    r.register(sw, "write", "(Ljava/lang/String;)V", |ctx, args| {
-        let this = obj_arg(args, 0)?;
-        let existing = match ctx.get_field(this, 0) {
-            Value::Object(Some(s)) => ctx.read_string(s).unwrap_or_default(),
-            _ => String::new(),
-        };
-        let to_add = match args.get(1) {
-            Some(Value::Object(Some(s))) => ctx.read_string(*s).unwrap_or_default(),
-            _ => String::new(),
-        };
-        let combined = format!("{}{}", existing, to_add);
-        let s = ctx.create_string(&combined);
-        ctx.set_field(this, 0, Value::Object(Some(s)));
-        Ok(None)
-    });
-    r.register(sw, "toString", "()Ljava/lang/String;", |ctx, args| {
-        let this = obj_arg(args, 0)?;
-        Ok(Some(ctx.get_field(this, 0)))
-    });
-    r.register(
-        sw,
-        "getBuffer",
-        "()Ljava/lang/StringBuffer;",
-        |ctx, args| {
-            let this = obj_arg(args, 0)?;
-            // Return the string as-is (StringBuffer and String share representation)
-            Ok(Some(ctx.get_field(this, 0)))
-        },
-    );
-    r.register(sw, "flush", "()V", |_ctx, _args| Ok(None));
-    r.register(sw, "close", "()V", |_ctx, _args| Ok(None));
+    // java.io.StringReader / StringWriter registrations used to live here,
+    // but this function is only ever reached via `register_synthetic_overrides`
+    // (synthetic-jdk feature only), which itself runs BEFORE
+    // `native-io`'s `register_io_natives` in the vm_init.rs boot sequence —
+    // so `register_string_rw_natives` (native-io/src/lib.rs) always
+    // overwrote these entries in `NativeMethodRegistry`'s last-write-wins
+    // map, in every build configuration. They were dead code, and their
+    // buggy `read()` (`ch as i32` used as a byte index instead of
+    // `ch.len_utf8()`) sent an earlier investigation down a blind alley
+    // chasing a registration that could never run — see
+    // docs/known-issues/tomcat-08-07/stringreader-read-never-advances-infinite-loop.md.
+    // Removed rather than fixed in place; the real, live StringReader
+    // natives are `native_sr_*` in native-io/src/lib.rs.
     r.set_category(__prev_cat);
 }
 
