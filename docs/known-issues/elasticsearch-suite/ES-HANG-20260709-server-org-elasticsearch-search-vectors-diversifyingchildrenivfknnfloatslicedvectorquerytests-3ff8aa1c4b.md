@@ -189,3 +189,49 @@ re-tested with `CRATONVM_JIT_GUARDED_GETFIELD=1` (forcing the guard back on)
 — still SIGSEGVs. The two are separate, if superficially similar
 (compact/legacy-layout dispatch), bugs in different code paths (generic
 getfield inline arms vs. hand-rolled String-intrinsic field loads).
+
+
+---
+
+## 2026-07-10 follow-up: confirmed as the GC audit's Finding 1 (STW/monitor race)
+
+Deep-dived the underlying interpreter hang with live gdb + a full-debug-info
+rebuild (`CARGO_PROFILE_RELEASE_DEBUG=2 CARGO_PROFILE_RELEASE_STRIP=none` —
+the normal release profile is line-tables-only and can't resolve locals/args
+for a `self`-based inspection). Found this is the SAME bug as
+`docs/known-issues/gc-audit-2026-07-10-open-findings.md` finding 1
+("STW/monitor race family: GC and monitors vs excluded threads"), an
+actively-investigated VM-core defect discovered independently via a
+synthetic MTChurn stress harness. Full cross-reference and new evidence
+(a genuine Lucene NPE manifestation, not just the deadlock) recorded in
+that doc. Summary:
+
+- Direct live-gdb inspection (multiple attempts) confirms the worker thread
+  AND a `Lucene Merge Thread` genuinely parked in
+  `parking_lot::Condvar::wait` inside `Monitor::block_enter`/`enter`
+  (`vm/src/threading/monitor.rs:457/500`) simultaneously — with only 6
+  threads total in the process and the other 4 idle/legitimately elsewhere,
+  no live thread is positioned to ever release/notify what these two are
+  waiting on.
+- The manifestation is **non-deterministic run to run, same seed**: most
+  runs hang forever; one 153s run instead completed with 2 real failures,
+  including `NullPointerException` on `ReadersAndUpdates.dropMergingUpdates()`
+  (`rld` null — should never happen) thrown from a Lucene merge thread,
+  immediately preceded by a 544+ occurrence burst of the
+  `gen_heap::get_field` OOB-field WARNs this doc originally flagged. This
+  is the same "corruption escaping as a downstream exception" shape the GC
+  audit doc describes for finding 1(b), via a different (real, non-synthetic)
+  trigger workload.
+- Did NOT attempt a fix. `vm/src/threading/monitor.rs`/the STW barrier is
+  already being investigated by a dedicated effort with its own probe
+  tooling; a WIP attempt at part of the fix
+  (`wip/gc-stw-quota-race-20260710`) is explicitly parked as unsafe
+  ("DO NOT MERGE... hangs completely under load... still SEGVs"). This ES
+  repro is left as an additional, real-world validation case for whoever
+  picks that investigation back up — see the GC audit doc for the repro
+  recipe cross-reference and status.
+
+**Status stays OPEN** — root cause is now well-characterized and tied to a
+known, tracked, actively-investigated VM-core defect rather than an
+ES/Lucene-specific bug. Not expected to be independently fixable without
+the GC-audit team's monitor/STW-barrier work landing first.

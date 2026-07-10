@@ -9,6 +9,7 @@
 // Re-export everything from the JIT crate so existing `crate::jit::*` paths work.
 pub use cratonvm_jit::*;
 
+pub mod alloc_class_cache;
 pub mod conservative_roots;
 pub mod disasm;
 pub mod helpers;

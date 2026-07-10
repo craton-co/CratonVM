@@ -1,6 +1,281 @@
-# CratonVM JIT Compiler — Round 26 Performance Results
+# CratonVM JIT Compiler — Architecture and Optimization Level
 
-## The Journey: From 97x Slower to the March 2026 Round 26 Snapshot
+*Last verified against source 2026-07-10 (branch `claude/reverent-engelbart-84796b`,
+based on `dev`). The "Round 8–26" material below (through the March 2026
+snapshot) is preserved as **historical narrative** — it describes an earlier,
+much smaller JIT and its own benchmark numbers, which are no longer
+representative of current `dev`. The "Current JIT Architecture" section
+replaces it as the source of truth for what the JIT does today.*
+
+---
+
+## Current JIT Architecture (as of 2026-07-10)
+
+The JIT has grown well past the single-pass-only, ~140-opcode, ~7,200-line
+compiler the Round 26 snapshot describes. It is now a tiered, two-backend
+compiler with a background compilation pipeline, a real deoptimization
+framework, and a second (AArch64) target. Every claim below was verified by
+reading the current source, not by trusting comments or older docs.
+
+### Module size (verified `wc -l`, 2026-07-10)
+
+| Location | Lines | Role |
+|---|---|---|
+| `jit/src/` (crate `cratonvm-jit`) | **81,903** across 17 files | codegen backends, IR pipeline, tiering, deopt |
+| `jit/tests/` | 8,307 | differential / IR-vs-singlepass / intrinsic test suites |
+| `vm/src/jit/` (part of `cratonvm-vm`) | **15,197** across 7 files | VM-side glue: JIT-called helpers, skip-list, GC root scanning |
+| **Total (jit crate + vm/src/jit)** | **~105,400** | |
+
+`jit/src/x64.rs` alone is 37,327 lines (still the largest single file — the
+x86-64 single-pass emitter, including several hundred unit tests). A second,
+independent backend now exists: `jit/src/aarch64.rs` (2,293 lines) +
+`jit/src/aarch64_backend.rs` (5,734 lines) — CratonVM has a real ARM64 JIT
+backend that did not exist at Round 26. Excluding both AArch64 files, the
+x86-64-only portion of `jit/src` is ~73,900 lines — roughly **10x** the old
+"~7,200 line" figure even before counting `vm/src/jit/`.
+
+The IR pipeline itself is substantial: `ir.rs` (3,149, graph builder),
+`ir_lower.rs` (3,342, IR→x64 lowering), `ir_optimize.rs` (4,039, optimization
+passes), `ir_schedule.rs` (737, scheduling), `escape_analysis.rs` (2,280,
+escape analysis / scalar replacement), `scev.rs` (665, scalar evolution),
+`null_check_elim.rs` (658), `loop_analysis.rs` (555). Supporting
+infrastructure: `tiered.rs` (2,549), `deopt.rs` (2,407), `regalloc.rs` (1,830,
+graph-coloring register allocator), `pgo.rs` (1,981, profile-guided
+optimization data), `profile.rs` (1,150, interpreter-side profile collection),
+`platform.rs` (537, W^X executable-memory allocation).
+
+### Tiered compilation — background pipeline is DEFAULT-ON
+
+`jit/src/tiered.rs` implements a HotSpot-style tiering scheme
+(`Interpreter → C1 → C1WithProfiling → FullProfile → C2`). Default policy
+(`CompilationPolicy`, `tiered.rs`): C1 threshold 200 invocations, C2 threshold
+5,000, `c2_min_invocations` 1,000 — each overridable via
+`CRATONVM_TIER_C1_THRESHOLD` / `_C2_THRESHOLD` / `_C2_MIN_INVOCATIONS`.
+
+As of the "wire-tiered-manager Step 7" change, **the background compilation
+pipeline is default-on** (`bg_compile()`, `vm/src/runtime/env_cache.rs`;
+opt-out `CRATONVM_BG_COMPILE=0`): a hot method's invocation-count trigger
+enqueues a `CompilationTask` for a worker thread instead of compiling inline
+on the mutator; the mutator keeps interpreting until the worker publishes into
+the shared JIT cache. **C1→C2 supersede is also default-on**
+(`c2_supersede()`, opt-out `CRATONVM_C2_SUPERSEDE=0`): once a method's C1
+(single-pass) body is published, an eligible candidate is enqueued for a
+low-priority C2 (IR-optimized) recompile; on publish, cached invoke-site
+entries are invalidated so callers re-resolve to the new body. Net effect
+under default settings: a hot method is first eagerly compiled by the mutator
+via the single-pass backend on its first call (unchanged from before Step 7),
+then re-tiered off-thread to the optimizing backend once profiling confirms
+its shape.
+
+### Two backends: single-pass (x64.rs) vs IR pipeline
+
+The older single-pass emitter (`x64.rs`) remains the universal fallback and
+handles every JIT-eligible method. A separate IR-based backend
+(`ir.rs`/`ir_lower.rs`/`ir_optimize.rs`) is used for a bounded but broad
+subset of methods by default. Admission gate (`ir_compatible()`, `ir.rs`)
+declines (falls back to single-pass) on: `athrow`, any `invokedynamic`, more
+than 5 simple invokes / field ops / static-field ops, more than 3 `new` /
+`anewarray`, any `multianewarray`, and any `checkcast`/`instanceof` (no IR
+lowering exists for these yet).
+
+At the VM layer (`vm/src/runtime/env_cache.rs`, which is what actually governs
+the running VM — the per-flag doc comments inside the `jit` crate itself are
+stale and describe an earlier, narrower default), the IR path by default
+admits: pure-int/ref methods, plus methods using `long`, plus methods using
+`float`/`double`, plus `invokestatic` and non-`<init>` `invokespecial` calls
+to oop-free-int callees. `invokevirtual`/`invokeinterface` sites remain
+single-pass-only by default (`CRATONVM_JIT_IR_CALL_VIRTUAL` opts in). So: the
+IR backend is on by default for a fairly broad "simple, call-light,
+exception-free, non-virtual-dispatch" method shape, not an experimental
+opt-in feature.
+
+### On-Stack Replacement (OSR) — default-ON, live threshold 1000
+
+Master gate `osr_backedge_enabled()` (`CRATONVM_JIT_OSR`) defaults to on. The
+threshold that actually gates an OSR attempt is **1,000 back-edges**
+(`OSR_THRESHOLD` in `interpreter.rs`, override `CRATONVM_TIER_OSR_BACKEDGE`) —
+not the 10,000 figure a dead `CompilationPolicy.osr_threshold` field would
+suggest (that field's only consumer, `TieredCompilationManager::on_backedge`,
+has zero call sites in the running VM). Since the background pipeline is
+default-on, OSR compilation also happens off-thread by default: a hot
+back-edge enqueues an OSR request, and the mutator only *enters* a
+worker-published OSR artifact; only `CRATONVM_BG_COMPILE=0` restores the older
+synchronous inline OSR compile.
+
+A prior blanket rule had permanently denied OSR for any method containing a
+primitive `newarray`, added as a workaround for a suspected corruption
+(`GOST3412_2015Engine.init_gf256_mul_table`). That workaround has been
+default-lifted (`osr_newarray_allowed()`, opt-out `CRATONVM_OSR_NEWARRAY=0`) —
+the corruption did not reproduce after later GC-root-coverage fixes
+(ThreadLocal value rooting, precise JIT maps, moving-young), and the blanket
+deny had been silently costing `sieve250k` ~55x (3.2s → 177s) before it was
+lifted.
+
+### Guarded-inline getfield — default-ON, region-bounds-guarded
+
+`guarded_inline_getfield_enabled()` (`x64.rs`) is on unless
+`CRATONVM_JIT_GETFIELD_HELPER` is set. History: a 2026-07-09 hardening routed
+every JIT `getfield` through the checked `jit_getfield` helper to close a
+stale/garbage-receiver SIGSEGV — at a measured ~4.7x cost on field-heavy
+workloads like `bintrees-16`. The current default instead null/alignment-checks
+the receiver and validates it against the GC's published `[base, end)` heap
+region bounds (the same containment check `is_object_address` uses) before a
+raw inline load; anything that fails the check falls back to the checked
+helper, preserving its NPE / `i64::MIN`-sentinel semantics exactly. A separate,
+still-opt-in `CRATONVM_JIT_INLINE_GETFIELD` raw (unguarded) path exists only
+for A/B measurement, not as a production default.
+
+### Compact reference-field layout — default-ON
+
+`compact_ref_fields_enabled()` (`types/src/field_layout.rs`) is on unless
+`CRATONVM_COMPACT_REF_FIELDS=0`. Reference instance fields are stored as bare
+8-byte pointers instead of the legacy 16-byte tagged `Value` cell; the GC
+consults a per-class oop-map (byte offsets of reference fields) built at
+class-define time instead of detecting references by cell tag.
+
+Two independent inline `putfield` (reference-field write) paths exist:
+- **Legacy 16-byte inline putfield** — opt-in (`CRATONVM_JIT_INLINE_PUTFIELD`,
+  default off) and additionally gated on the compact layout being *disabled* —
+  under an unmodified default config it is unreachable.
+- **Compact inline putfield** — default-on, riding entirely on
+  `compact_ref_fields_enabled()` with no separate gate. Emits an 8-byte
+  bare-pointer store on the barrier-free fast path (non-null, young-gen
+  receiver, null old value, in-bounds index), falling back to the compact-aware
+  `jit_putfield_object` helper (full SATB pre-barrier + card write-barrier)
+  otherwise.
+
+### Deoptimization and scalar replacement
+
+`jit/src/deopt.rs` implements a real deopt framework: `DeoptReason`
+(`NullCheck`, `ClassCheck`, `BoundsCheck`, `DivByZero`, `ReceiverTypeChanged`,
+`UncommonTrap`, `OsrExit`, ...), `DeoptAction`
+(`Reinterpret`/`RecompileAndReinterpret`/`MakeNotEntrant`/`MakeNotCompilable`),
+and `DeoptimizationPoint` (native offset, bci, reason, action, frame state).
+`Op::Guard` IR nodes tie a speculative optimization (a bounds-check elision, a
+null/type assumption, a loop-header bounds guard, ...) to a specific bytecode
+index and a `FrameState` describing how to reconstruct every live interpreter
+local/stack slot from register/spill locations. On a guard failure, control
+transfers to a deopt trampoline that materializes a precise interpreter frame
+at the trapping bci and resumes there — not a whole-method re-run.
+
+The master gate `deopt_real_enabled()` (`CRATONVM_DEOPT_REAL`) has been
+default-on since 2026-06-22. A further extension, guard-surviving scalar
+replacement (`CRATONVM_SCALAR_DEOPT`, default **off**, opt-in), lets an
+escape-analysis-eliminated object survive a guard failure by materializing it
+on demand from a `FrameValue::VirtualObject` descriptor instead of forcing a
+full method re-run whenever a scalar-replaced object is live at a deopt point.
+Scalar replacement itself (`jit/src/escape_analysis.rs`) runs as part of the
+IR optimizer for eligible allocations and includes monitor/lock elision over
+scalar-replaced receivers.
+
+### Self-recursive call inlining — default-ON
+
+`inline_self_guard_enabled()` (`x64.rs`, opt-out
+`CRATONVM_JIT_INLINE_SELF_GUARD=0`). A method with direct self-recursive call
+sites reserves one frame slot, fills it once in the prologue from a leaf
+helper, and each self-call site emits a cheap inline stack-depth compare
+instead of calling the full `self_call_stack_guard` helper on every call — the
+helper remains as the fallback that actually raises `StackOverflowError`. OSR
+trampolines initialize the slot to a sentinel so OSR-entered frames always
+take the helper path (they bypass the prologue).
+
+### BouncyCastle JIT eligibility
+
+`vm/src/jit/skip_list.rs` is the single source of truth for JIT eligibility.
+Under the default (`Conservative`) policy, `org/bouncycastle/` is blanket-banned
+from JIT compilation *except* for an explicit carveout:
+`org/bouncycastle/crypto/{BufferedBlockCipher,DefaultBufferedBlockCipher}` and
+everything under `crypto/{engines,io,modes,paddings}/`, plus — as of a 2026-07-10
+change — everything under `org/bouncycastle/math/` (EC + field arithmetic),
+with narrow forced-interpreted exceptions (`CAST5Engine`/`CAST6Engine` key
+schedule, `NISTCTSBlockCipher.processBytes`). The blanket ban traces to a
+suspected cross-package JIT arg-marshalling miscompile first seen during BC
+provider registration; it was deliberately held in place across several JIT
+hardening rounds pending a clean `org.bouncycastle.math.ec.test.AllTests` run
+under the allow-override, which now passes (14/14 OK) after later
+root-coverage fixes (moving-young GC + precise JIT maps, RRWL/refproc roots,
+ThreadLocal value rooting, guarded-inline getfield). The rest of BC
+(`asn1/`, `util/`, ...) remains banned.
+
+### Precise JIT stack maps — default-ON
+
+`precise_jit_maps_enabled()` (`x64.rs`, opt-out
+`CRATONVM_NO_PRECISE_JIT_MAPS`) was re-flipped to default-on 2026-07-07. It
+had originally shipped default-off (a ~6x throughput tax on call-heavy code,
+"BUG-01") but re-measurement found the tax gone on current `dev` — more
+aggressive inlining leaves far fewer real call safepoints in hot
+reflection/framework methods. A dependent flag,
+`precise_inline_frame_record_enabled()` (also default-on), further optimizes
+this by storing the frame pointer inline instead of via a helper call.
+
+### Bytecode and intrinsic coverage
+
+Core coverage is close to the old ~140-opcode set (loads/stores/arrays/
+arithmetic/branches/fields/invokes/`newarray`/`multianewarray`) plus
+`new`/`anewarray`/`checkcast`/`instanceof`/`tableswitch`/`lookupswitch`/
+`athrow`/`monitorenter`/`monitorexit` (with lock elision over scalar-replaced
+receivers). `invokedynamic` is no longer a permanent compile-time bail on the
+single-pass backend: the call site itself lowers to an uncommon-trap deopt
+stub, so the rest of the method still compiles (the IR backend still declines
+any method containing `invokedynamic`).
+
+A significant addition since Round 26 is a call-site intrinsics layer
+(`JitIntrinsic`, `jit/src/lib.rs`) — roughly 40 intrinsics, each with a
+receiver/type guard that deopts to the normal call path on mismatch:
+- `Math`/`StrictMath`: `sqrt`, `floor`, `ceil`, `rint`, `abs`, `fma`, `min`/`max`,
+  `multiplyHigh`, `unsignedMultiplyHigh`
+- `Integer`/`Long` bit ops: `bitCount`, `numberOfLeadingZeros`,
+  `numberOfTrailingZeros`, `reverseBytes`, `highestOneBit`, `lowestOneBit`,
+  `reverse`, `compare`, `rotateLeft`, `rotateRight`
+- `System.arraycopy` (inline memmove fast path)
+- `String`: `length`, `isEmpty`, `charAt`, `hashCode`, `equals`, `compareTo`,
+  `indexOf(int)`, `indexOf(String)` (coder-aware for LATIN1/UTF16)
+- `Arrays.fill`/`Arrays.equals` (4 element widths each), `Arrays.sort` for
+  primitive arrays (insertion sort, inline)
+- `CRC32`/`CRC32C.update`
+
+### Summary table
+
+| Feature | Default | Opt-out / opt-in var |
+|---|---|---|
+| Background compilation pipeline | **ON** | `CRATONVM_BG_COMPILE=0` |
+| C1→C2 supersede | **ON** | `CRATONVM_C2_SUPERSEDE=0` |
+| IR backend (int/ref/long/FP, non-virtual calls) | **ON** (bounded shape) | see `ir_compatible()` |
+| IR backend for virtual/interface calls | off | `CRATONVM_JIT_IR_CALL_VIRTUAL` |
+| Back-edge OSR | **ON**, threshold 1000 | `CRATONVM_JIT_OSR=0` |
+| OSR for `newarray`-containing methods | **ON** | `CRATONVM_OSR_NEWARRAY=0` |
+| Guarded-inline getfield (region-bounds-checked) | **ON** | `CRATONVM_JIT_GETFIELD_HELPER=1` |
+| Raw (unguarded) inline getfield | off | `CRATONVM_JIT_INLINE_GETFIELD` |
+| Compact reference-field layout | **ON** | `CRATONVM_COMPACT_REF_FIELDS=0` |
+| Compact inline putfield | **ON** (rides on layout) | — |
+| Legacy 16-byte inline putfield | off (and dead under default layout) | `CRATONVM_JIT_INLINE_PUTFIELD` |
+| Deopt framework (`DEOPT_REAL`) | **ON** | `CRATONVM_DEOPT_REAL=0` |
+| Guard-surviving scalar replacement | off | `CRATONVM_SCALAR_DEOPT` |
+| Self-recursive inline stack guard | **ON** | `CRATONVM_JIT_INLINE_SELF_GUARD=0` |
+| BC `crypto/{engines,io,modes,paddings}` + `math/` JIT | **allowed** | — |
+| BC blanket ban (`asn1/`, `util/`, ...) | still banned | `CRATONVM_JIT_ALLOW_PACKAGES` |
+| Precise JIT stack maps | **ON** | `CRATONVM_NO_PRECISE_JIT_MAPS` |
+
+### Performance — current status
+
+Checksums stay exact (e.g. `bintrees-18` = 68332206) across all the changes
+above; timing has not been captured in a single clean, apples-to-apples
+JDK-C2-comparison pass since the Round 26 snapshot. The most recent trustworthy
+data point (2026-07-10, checksums cross-checked, same-host interleaved A/B, no
+regression vs the prior dev tip) is from merging the SATB clone-free +
+allocation-init-cache work on top of this JIT state: `bintrees-18` and
+`sieve250k`/`fib44` all matched golden checksums with timing at-or-better than
+the pre-merge baseline. A cdb sampling profile of `bintrees-20` around that
+point found the dominant cost is now allocation + young-GC throughput (sweep,
+free-list scan, old-gen spill for the live tree) rather than JIT codegen —
+i.e. further *JIT* optimization has limited headroom left for that workload;
+GC throughput is the next lever. Refreshing the JDK-C2 ratio table below
+requires an idle benchmark host — the primary Windows dev box currently has a
+background process pegging CPU that invalidates timing runs until cleared.
+
+---
+
+## Historical Journey: From 97x Slower to the March 2026 Round 26 Snapshot
 
 ```
                     Performance vs OpenJDK -Xint (interpreter mode)
@@ -32,26 +307,35 @@
                ▏  ◀═════                                           ←── OpenJDK C2 (historical R26)
 ```
 
+*Everything below this point describes the JIT as of the March 2026 Round 26
+snapshot and its immediate 2026-07 follow-ups, preserved for historical
+context. See "Current JIT Architecture" above for what the JIT actually does
+today.*
+
 ---
 
 ## What Is CratonVM?
 
 A Java Virtual Machine written entirely in Rust:
 
-- **~323,000+ lines** of Rust code
+- **~323,000+ lines** of Rust code (project-wide; the JIT alone is now
+  ~105,400 lines across `jit/src`, `jit/tests`, and `vm/src/jit` — see above)
 - Large Rust/Java test corpus with clippy and formatting tracked as release gates
 - **~3,100+ native method** registrations (java.lang, java.util, java.io, java.time, ...)
 - Full interpreter with 140+ fast-path bytecodes
 - Generational garbage collector with write barriers
 - Multi-threading with monitors, locks, and barriers
 - Lambda/invokedynamic support
-- **x86-64 JIT compiler** (~7,200 lines, ~140 bytecodes, 26 optimization rounds)
+- **Two JIT backends**: x86-64 (single-pass + IR-optimizing, ~130 opcodes plus
+  ~40 call-site intrinsics) and a newer AArch64 backend
 - Historical March 2026 Round 26 snapshot reached 1.50x of JDK C2 on QuickBench.
 - Historical 2026-07-02 snapshot (`b80c50b5`), before back-edge OSR flipped
   default-on, was 46.2x slower by default and 8.25x slower with
   `CRATONVM_JIT_OSR=1 CRATONVM_JIT_THRESHOLD=1`.
-- Current 2026-07-08 snapshot (`bfc26c2d`), with OSR default-on since
-  2026-07-04, is 3.7x slower by default.
+- Historical 2026-07-08 snapshot (`bfc26c2d`), with OSR default-on since
+  2026-07-04, was 3.7x slower by default.
+- See "Performance — current status" above for why this ratio has not been
+  refreshed since.
 
 ---
 
@@ -131,6 +415,12 @@ A Java Virtual Machine written entirely in Rust:
 | R26 | OSR fast-path | OSR-compiled methods reused for normal invocation-level calls |
 | R26 | Invocation counting | Profile-guided JIT at 2000-call threshold |
 
+*Post-R26, current dev (see "Current JIT Architecture" above): tiered
+background compilation (C1/C2), a second IR-optimizing backend alongside the
+single-pass emitter, a real deoptimization framework with guard-surviving
+scalar replacement, guarded-inline getfield with heap-region bounds checking,
+an AArch64 backend, and roughly 40 call-site intrinsics.*
+
 ### Peephole Optimizations
 
 ```
@@ -155,8 +445,8 @@ A Java Virtual Machine written entirely in Rust:
 ### QuickBench — Scaled Workloads (Historical Round 26)
 
 *Historical measurement from 2026-03-31 on Windows 11, JDK 25.0.1 LTS. This is
-not the current benchmark snapshot; see the README and mdBook Benchmarks page
-for the 2026-07-02 `b80c50b5` numbers.*
+not the current benchmark snapshot — see "Performance — current status" above
+for why a fresh comparison has not yet been captured.*
 
 ```
   Benchmark               JDK C2      CratonVM R26    Ratio     Notes
@@ -322,6 +612,10 @@ for the 2026-07-02 `b80c50b5` numbers.*
 
 ### Round 17: Object Field Access (getfield/putfield)
 
+*See "Guarded-inline getfield" and "Compact reference-field layout" above for
+the current default-on behavior — the description below is the original R17
+mechanism (unconditional helper call), since superseded.*
+
 ```
   getfield (0xb4) — read object field:
   ═════════════════════════════════════
@@ -382,12 +676,26 @@ for the 2026-07-02 `b80c50b5` numbers.*
 
 ## Technical Implementation
 
-### JIT Module (~7,100 lines)
+### JIT Module (current, ~105,400 lines — see "Current JIT Architecture" above for the full breakdown)
 
 | File | Lines | Purpose |
 |------|-------|---------|
-| `vm/src/jit/mod.rs` | ~1800 | ExecutableBuffer, CompiledMethod, JitCache, helpers, OSR trampoline |
-| `vm/src/jit/x64.rs` | ~5300 | x86-64 emitter, Compiler, LICM/BCE/SIMD analysis, ~80 tests |
+| `jit/src/x64.rs` | 37,327 | x86-64 single-pass emitter, Compiler, ~hundreds of unit tests |
+| `jit/src/lib.rs` | 10,670 | `try_compile`/`try_compile_inner`, intrinsics registry, feature flags |
+| `jit/src/aarch64_backend.rs` | 5,734 | AArch64 codegen backend |
+| `jit/src/ir_optimize.rs` | 4,039 | IR optimization passes |
+| `jit/src/ir_lower.rs` | 3,342 | IR → x64 lowering |
+| `jit/src/ir.rs` | 3,149 | IR graph builder, `ir_compatible` admission gate |
+| `jit/src/tiered.rs` | 2,549 | tiered compilation manager |
+| `jit/src/deopt.rs` | 2,407 | deoptimization framework |
+| `jit/src/aarch64.rs` | 2,293 | AArch64 instruction encoding |
+| `jit/src/escape_analysis.rs` | 2,280 | escape analysis / scalar replacement |
+| `jit/src/pgo.rs` | 1,981 | profile-guided optimization data |
+| `jit/src/regalloc.rs` | 1,830 | graph-coloring register allocator |
+| `vm/src/jit/helpers.rs` | 7,075 | JIT-called runtime helpers (getfield/putfield/invoke/newarray/...) |
+| `vm/src/jit/skip_list.rs` | 3,898 | JIT eligibility policy (see "BouncyCastle JIT eligibility" above) |
+| `vm/src/jit/conservative_roots.rs` | 2,411 | GC root scanning for JIT frames |
+| *(remaining files, `jit/src` + `vm/src/jit`)* | ~24,900 | `profile.rs`, `ir_schedule.rs`, `scev.rs`, `null_check_elim.rs`, `loop_analysis.rs`, `platform.rs`, `xt_root_scan.rs`, `alloc_class_cache.rs`, `disasm.rs`, `mod.rs` |
 
 ### x86-64 Instructions Emitted
 
@@ -406,7 +714,17 @@ for the 2026-07-02 `b80c50b5` numbers.*
 | **SSE convert** | CVTSI2SS/SD, CVTTSS/SD2SI, CVTSS2SD, CVTSD2SS |
 | **Stack frame** | MOV save/restore callee-saved (R12-R15,RBX,RSI,RDI) |
 
-### JIT-Compiled JVM Bytecodes (130 opcodes)
+A parallel AArch64 encoder (`jit/src/aarch64.rs`) targets the equivalent
+instruction classes for the ARM64 backend.
+
+### JIT-Compiled JVM Bytecodes and Intrinsics
+
+See "Bytecode and intrinsic coverage" under "Current JIT Architecture" above
+for the current, verified list — coverage has grown beyond the historical
+130-opcode table below with `new`/`anewarray`/`checkcast`/`instanceof`/
+`tableswitch`/`lookupswitch`/`athrow`/`monitorenter`/`monitorexit`/partial-
+`invokedynamic`, plus ~40 call-site intrinsics (Math, Integer/Long bit ops,
+String access/search, Arrays, CRC32).
 
 ```
   Constants:    iconst_m1..5, lconst_0/1, fconst_0/1/2, dconst_0/1,
@@ -470,7 +788,7 @@ for the 2026-07-02 `b80c50b5` numbers.*
 
 ---
 
-## Optimization Roadmap: All Phases Complete
+## Optimization Roadmap
 
 ```
   Phase 1 (R15-16)  SSE Float/Double                              COMPLETE
@@ -481,6 +799,16 @@ for the 2026-07-02 `b80c50b5` numbers.*
   Phase 6 (R26)     Loop unrolling + speculative BCE + regalloc    COMPLETE
   -----------------------------------------------------------------------
   March 2026 result: 1.50x vs JDK C2 (Fibonacci 1.31x)            HISTORICAL
+
+  Post-R26 (2026-07, ongoing)  Tiered compilation (C1/C2,
+    background pipeline), IR-optimizing backend, real deopt +
+    guard-surviving scalar replacement, guarded-inline getfield,
+    AArch64 backend, ~40 call-site intrinsics, BC crypto/math
+    JIT eligibility, precise JIT stack maps                       ONGOING
+  -----------------------------------------------------------------------
+  Current focus: allocation + young-GC throughput is now the dominant
+    cost on allocation-heavy workloads (e.g. binarytrees) — see
+    "Performance — current status" above.                         CURRENT
 ```
 
 ### Timeline
@@ -504,14 +832,14 @@ for the 2026-07-02 `b80c50b5` numbers.*
 | Metric | Value |
 |--------|-------|
 | Total Rust LoC | **~323,000+** |
-| JIT module LoC | **~7,200** |
-| JIT bytecodes | **~140 opcodes** |
-| JIT unit tests | **~80** |
+| JIT LoC (jit crate + vm/src/jit) | **~105,400** (`jit/src` 81,903 + `jit/tests` 8,307 + `vm/src/jit` 15,197) |
+| JIT backends | x86-64 (single-pass + IR-optimizing), AArch64 |
+| JIT bytecodes | ~130 core opcodes + ~40 call-site intrinsics |
+| JIT unit/integration tests | ~hundreds in `x64.rs` + differential/IR-vs-singlepass/intrinsic suites in `jit/tests/` |
 | Test corpus | Large Rust/Java unit, integration, regression, difftest, and fuzz layers |
 | Lint status | `clippy -D warnings` is a release gate, not a baked-in metric |
 | Native methods | **~3,100+** |
-| Phases completed | **73** (0-72 + perf) |
-| Optimization rounds | **26** |
-| Total speedup (small) | **253x** (5064ms → 20ms) |
-| vs JDK -Xint | **~28x FASTER** |
-| vs JDK C2 | Historical March 2026: **1.50x QuickBench (Fibonacci 1.31x)**; historical 2026-07-02 (pre-OSR-flip): **46.2x default / 8.25x OSR+threshold**; current 2026-07-08: **3.7x default** |
+| Optimization rounds (historical, through March 2026) | **26** |
+| Total speedup (small, historical R26) | **253x** (5064ms → 20ms) |
+| vs JDK -Xint (historical R26) | **~28x FASTER** |
+| vs JDK C2 | Historical March 2026: **1.50x QuickBench (Fibonacci 1.31x)**; historical 2026-07-02 (pre-OSR-flip): **46.2x default / 8.25x OSR+threshold**; historical 2026-07-08: **3.7x default**; current: not yet refreshed post-tiering/IR-backend/deopt work — see "Performance — current status" |
