@@ -115,40 +115,51 @@ diagnosis with `CRATONVM_JIT_ALLOW_PACKAGES=org/eclipse/jdt/internal/compiler/as
 
 **Verification:** real Tomcat fixture re-run of TestFormAuthenticatorA/B/C
 (private `webapps/examples` + `conf/logging.properties` fixture, real JDK
-25): 0 `JasperException`/AIOOBE hits across every rerun with this fix (vs.
-consistent hits without it).
-- `TestFormAuthenticatorB`: **6/6 PASS**, matching HotSpot exactly.
-- `TestFormAuthenticatorA`: 8/9 — one residual, see below.
-- `TestFormAuthenticatorC`: 6/7 — one residual, see below.
+25), **4 full reruns of all three classes** across a wide range of host
+load (average 40 to 135): **0 `JasperException`/AIOOBE hits in any run** —
+the fix is solid. `TestFormAuthenticatorB` hit 6/6 PASS (matching HotSpot
+exactly) in 3 of 4 runs. Two OTHER, unrelated single-method failures
+appear intermittently across A/B/C (never more than one per class per
+run) — see below.
 
 ## 2 new, small, unrelated residuals found while verifying the fix — NOT investigated further
 
 Both surfaced only after (1)-(3) stopped masking them; both are single
-methods, different mechanisms, and were found on a host that hit **load
-average 135** partway through this investigation (SSH itself started
-timing out), so re-verification on an idle host is the first recommended
-step before deeper investigation.
+methods, different mechanisms. 4 full reruns distinguish their character:
 
 - **`TestFormAuthenticatorA.testNoChangedSessidWithoutCookies`** — plain
   `assertTrue` failure at `TestFormAuthenticatorA.java:302` (no exception,
-  no server-side error logged), reproduced consistently across 2 reruns.
-  Method exercises `SERVER_FREEZE_SESSID` + `CLIENT_NO_COOKIES` (session ID
-  must NOT change across the login flow while the client relies on
-  path-parameter session tracking). Not root-caused.
-- **`TestFormAuthenticatorC.testPostWithContinueNoServerCookies`** —
-  `java.lang.NoSuchMethodError: java/lang/Object.read([CII)I` at
+  no server-side error logged). **Reproduced consistently in EVERY rerun
+  (3/3) that included class A** — looks like a real, reproducible bug, not
+  host noise. Method exercises `SERVER_FREEZE_SESSID` + `CLIENT_NO_COOKIES`
+  (session ID must NOT change across the login flow while the client
+  relies on path-parameter session tracking). Not root-caused — worth its
+  own known-issues doc.
+- **`java.lang.NoSuchMethodError: java/lang/Object.read([CII)I`** at
   `SimpleHttpClient.readLine` (client-side test-harness code, not server
   Tomcat code) — looks like a `Reader.read(char[],int,int)` virtual dispatch
-  resolving onto `Object` instead of the real `Reader` subclass. Only one
-  data point so far (host became unreachable before a repeat run
-  completed) — could not yet distinguish a real dispatch bug from host-load
-  corruption artifacts at load average 135. Not root-caused.
+  resolving onto `Object` instead of the real `Reader` subclass. **Confirmed
+  genuinely intermittent/non-deterministic across reruns**: hit
+  `TestFormAuthenticatorC.testPostWithContinueNoServerCookies` in one run,
+  then `TestFormAuthenticatorB.testPostNoContinuePostRedirectNoClientCookies`
+  in a later run (with C then clean) — different class, different method,
+  same signature. This rules out "one broken test method" and points at a
+  rare dispatch-resolution bug that can strike any `Reader.read`-driven
+  request/response cycle, similar in flavor (rare, non-deterministic,
+  wrong-method-resolved) to this investigation's own JASPER-JDT.3 finding
+  but in a completely different subsystem (method resolution, not JIT
+  array-bounds). Was initially suspected to be a host-load-135 artifact —
+  the moving target across otherwise-clean reruns keeps that possibility
+  open too (a stale/racy method-cache entry surfacing only under heavy
+  concurrent host load is plausible) — but a genuine rare correctness bug
+  hasn't been ruled out either. Not root-caused.
 
-Neither residual involves JSP compilation, `RemoteCIDRValve`, or
-`InetSocketAddress` — both are new territory. Recommend: re-run both
-methods in isolation on an idle host first; if `testNoChangedSessidWithoutCookies`
-still fails consistently and `NoSuchMethodError: Object.read([CII)I`
-reproduces again, each deserves its own known-issues doc.
+Both are new territory, unrelated to JSP compilation, `RemoteCIDRValve`, or
+`InetSocketAddress`. Recommend: `testNoChangedSessidWithoutCookies` looks
+solid enough (3/3) to root-cause directly and deserves its own
+known-issues doc now; re-run the `NoSuchMethodError` a few more times on an
+idle host first to separate "rare real bug" from "load artifact" before
+writing it up.
 
 ## Reproduction
 
