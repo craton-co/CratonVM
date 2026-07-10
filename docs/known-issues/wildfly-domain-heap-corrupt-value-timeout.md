@@ -1074,3 +1074,15 @@ than the original `ThreadPoolExecutor` regression. Recommended next step: fix th
 doc's own recommended next steps (get the exact crash-site source line via `addr2line` against the
 captured instruction offset, since it's ASLR-base-independent and was confirmed constant across
 multiple captures), then re-run this doc's harness recipe again.
+
+## 2026-07-10 update (later same day) — SIGSEGV investigation continued, still not fixed; no new information for this doc
+
+Picked up the gating SIGSEGV doc (`wildfly-domain-hostcontroller-sigsegv-inline-cache-null-receiver.md`)
+per its own recommended next step. Made substantial progress there (crash site conclusively
+identified as a JIT-compiled `ReentrantLock.lock()`, a specific named root-cause candidate found
+in classloading field-layout padding, and a separate confirmed finding that env vars do not reach
+the Host Controller child process) but did **not** land a fix — see that doc's own 2026-07-10
+"new session" entry for full detail. The four front-line residuals this doc tracks
+(`AttributeChangeNotification`, `ContentCleanerService`, `FileInputStream(File)`, `WFLYHC0034`)
+remain unreachable and unobserved; nothing changed for this doc specifically. This doc stays OPEN,
+still gated by the sibling SIGSEGV doc.

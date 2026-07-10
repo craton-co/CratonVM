@@ -595,6 +595,12 @@ pub fn collect_roots(shared: &SharedVm, thread: &JvmThread) -> Vec<ObjectRef> {
     //     SSLContext.init returned (remap companion
     //     `t27_tls::gc_update_tls_ctx_key_manager_refs` in `gc.rs`).
     cratonvm_native_builtins::t27_tls::gc_scan_tls_ctx_key_manager_roots(&mut roots);
+    //     The process-wide default SSLContext (t27_tls::default_ssl_context_slot),
+    //     installed by SSLContext.setDefault(ctx) and returned by later
+    //     SSLContext.getDefault() calls -- held long after setDefault
+    //     returned (remap companion `t27_tls::gc_update_default_ssl_context_ref`
+    //     in `gc.rs`).
+    cratonvm_native_builtins::t27_tls::gc_scan_default_ssl_context_root(&mut roots);
 
     //     ForkJoinTask done/result side-table. Real-JDK ForkJoin overrides cache
     //     task results in Rust state keyed by task identity; cached Object
