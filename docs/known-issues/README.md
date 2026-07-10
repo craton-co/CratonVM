@@ -4,6 +4,20 @@ This folder collects CratonVM-only defects found while running upstream Java
 suites. The docs had grown to describe the **same underlying bug from several
 angles**; this index is the consolidated map. Read it first.
 
+## 2026-07-10 Tomcat NIO/HTTP2 bare-assertions doc RETIRED; ByteBuffer.mark()/reset() found broken for real-JDK objects (FIXED); 1 narrow residual split off
+
+Fixed the doc's own `\p{XDigit}` regex residual, and — while root-causing
+the other two — found and fixed an unrelated, much bigger bug:
+`ByteBuffer.mark()`/`reset()` were completely broken for real-JDK
+`ByteBuffer`/`DirectByteBuffer` objects (`InvalidMarkException` on every
+`reset()`, even right after a matching `mark()`; SIGSEGV on direct buffers
+after the first `mark()` call). This explained both the `TestHttp2Limits`
+regression and the previously-unexplained Jasper JSP failure in
+`TestHttp11Processor`.
+
+- FIXED/RETIRED: [`nonblockingapi-http11processor-http2limits-bare-assertions-FIXED.md`](../internal/fixed-suite-bugs/nonblockingapi-http11processor-http2limits-bare-assertions-FIXED.md) — 5/6 of the doc's originally-failing methods now pass (`testDelayedNBWrite`, `testPipelining`, `testWithTEChunkedWithCL`, `testHeaderLimits100x32`, `testPostWithTrailerHeadersSize0`); root cause and fix for both the regex gap and the `ByteBuffer` bug are in the doc's final section.
+- OPEN (new, split off): [`tomcat-08-07/nonblockingreadignoreisready-async-error-response-completion-gap.md`](tomcat-08-07/nonblockingreadignoreisready-async-error-response-completion-gap.md) — `TestNonBlockingAPI.testNonBlockingReadIgnoreIsReady`'s Java-level `onError`/`onComplete` callback sequence is confirmed byte-for-byte identical to HotSpot (via socket-capture + log diff), but CratonVM then writes zero bytes to the socket where HotSpot's container commits an implicit `200` response. Narrowed but not root-caused; low priority (narrow, deliberately-adversarial test scenario).
+
 ## 2026-07-10 ES storedscripts crash trio FIXED; Object.contains signal gone (masked); new Executors factory mainLock NPE found (OPEN, partially fixed)
 
 Re-verified the 3 `findNative`-crash-family docs for
