@@ -916,7 +916,11 @@ impl ConcurrentMarker {
     }
 }
 
-fn concurrent_mark_object_size(header: *const ObjectHeader) -> Option<usize> {
+/// Torn/garbage-header gate shared by the Generational marker's `scan_object`
+/// and (G1MARK-8) G1's `concurrent_mark_step`: reads the header field-by-field
+/// with unaligned loads and cross-validates kind tag, element tag, gc-flag
+/// universe and size arithmetic. `None` means "do not trust this header".
+pub(crate) fn concurrent_mark_object_size(header: *const ObjectHeader) -> Option<usize> {
     let snapshot = ConcurrentMarkHeaderSnapshot::read(header);
     match snapshot.kind_tag {
         tag if tag == ObjectKind::Array as u8 => {
