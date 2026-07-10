@@ -4250,14 +4250,10 @@ fn http_build_request(
         let _ = write!(&mut out, "Host: {host}:{port}\r\n");
     }
     let mut has_content_length = false;
-    let mut has_connection = false;
     let mut has_user_agent = false;
     for (k, v) in headers {
         if k.eq_ignore_ascii_case("content-length") {
             has_content_length = true;
-        }
-        if k.eq_ignore_ascii_case("connection") {
-            has_connection = true;
         }
         if k.eq_ignore_ascii_case("user-agent") {
             has_user_agent = true;
@@ -4266,9 +4262,6 @@ fn http_build_request(
     }
     if !has_user_agent {
         out.extend_from_slice(b"User-Agent: cratonvm-phaseE/1.0\r\n");
-    }
-    if !has_connection {
-        out.extend_from_slice(b"Connection: close\r\n");
     }
     if !has_content_length && (!body.is_empty() || matches!(method, "POST" | "PUT" | "PATCH")) {
         let _ = write!(&mut out, "Content-Length: {}\r\n", body.len());

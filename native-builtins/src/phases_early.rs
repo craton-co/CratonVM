@@ -3389,14 +3389,52 @@ fn atomic_reference_update_with_operator(
 // the live set of ThreadLocals, which is small for typical applications.
 const TL_FIELD_VALUE: usize = 0;
 
+#[derive(Clone, Copy)]
+pub(crate) enum ThreadLocalValue {
+    Root { handle: usize, fallback: ObjectRef },
+    Plain(Value),
+}
+
 std::thread_local! {
     /// Per-OS-thread map: TL identity hash → value held by this thread.
-    static TL_MAP: std::cell::RefCell<rustc_hash::FxHashMap<i32, Value>> =
+    static TL_MAP: std::cell::RefCell<rustc_hash::FxHashMap<i32, ThreadLocalValue>> =
         std::cell::RefCell::new(rustc_hash::FxHashMap::default());
     /// One-shot flag: has this OS thread drained any inherited ITL entries
     /// queued for the Java Thread it is running? Reset path: not needed
     /// because OS threads are 1:1 with Java threads in CratonVM.
     static TL_INHERITED_DRAINED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+fn tl_value_from_java(ctx: &mut dyn NativeContext, value: Value) -> ThreadLocalValue {
+    match value {
+        Value::Object(Some(obj)) => ThreadLocalValue::Root {
+            handle: ctx.add_global_root(obj),
+            fallback: obj,
+        },
+        other => ThreadLocalValue::Plain(other),
+    }
+}
+
+fn tl_value_to_java(ctx: &dyn NativeContext, value: ThreadLocalValue) -> Value {
+    match value {
+        ThreadLocalValue::Root { handle, fallback } => {
+            let obj = if handle != 0 {
+                ctx.resolve_global_root(handle).unwrap_or(fallback)
+            } else {
+                fallback
+            };
+            Value::Object(Some(obj))
+        }
+        ThreadLocalValue::Plain(value) => value,
+    }
+}
+
+fn tl_drop_value_root(ctx: &mut dyn NativeContext, value: ThreadLocalValue) {
+    if let ThreadLocalValue::Root { handle, .. } = value {
+        if handle != 0 {
+            let _ = ctx.remove_global_root(handle);
+        }
+    }
 }
 
 /// `withInitial` suppliers, keyed by the ThreadLocal's JLS identity hash.
@@ -3432,10 +3470,13 @@ pub(crate) fn tl_inheritable_ids() -> &'static parking_lot::Mutex<rustc_hash::Fx
 /// Map from a child Java Thread's identity hash → snapshot of inherited
 /// (TL idhash → value) entries to seed when that thread first accesses
 /// any ThreadLocal. Consumed (drained) exactly once per OS thread.
-pub(crate) fn tl_inherited_pending(
-) -> &'static parking_lot::Mutex<rustc_hash::FxHashMap<i32, rustc_hash::FxHashMap<i32, Value>>> {
+pub(crate) fn tl_inherited_pending() -> &'static parking_lot::Mutex<
+    rustc_hash::FxHashMap<i32, rustc_hash::FxHashMap<i32, ThreadLocalValue>>,
+> {
     static S: std::sync::OnceLock<
-        parking_lot::Mutex<rustc_hash::FxHashMap<i32, rustc_hash::FxHashMap<i32, Value>>>,
+        parking_lot::Mutex<
+            rustc_hash::FxHashMap<i32, rustc_hash::FxHashMap<i32, ThreadLocalValue>>,
+        >,
     > = std::sync::OnceLock::new();
     S.get_or_init(|| parking_lot::Mutex::new(rustc_hash::FxHashMap::default()))
 }
@@ -3456,7 +3497,14 @@ fn drain_inherited_for_current_thread(ctx: &mut dyn NativeContext) {
         TL_MAP.with(|m| {
             let mut map = m.borrow_mut();
             for (k, v) in entries {
-                map.entry(k).or_insert(v);
+                match map.entry(k) {
+                    std::collections::hash_map::Entry::Vacant(e) => {
+                        e.insert(v);
+                    }
+                    std::collections::hash_map::Entry::Occupied(_) => {
+                        tl_drop_value_root(ctx, v);
+                    }
+                }
             }
         });
     }
@@ -3528,7 +3576,7 @@ fn native_tl_get(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResul
     drain_inherited_for_current_thread(ctx);
     let key = tl_key(ctx, this);
     if let Some(v) = TL_MAP.with(|m| m.borrow().get(&key).copied()) {
-        return Ok(Some(v));
+        return Ok(Some(tl_value_to_java(ctx, v)));
     }
     // Miss path: if a supplier was registered via `withInitial`, invoke it
     // on the current thread, cache the result, and return.
@@ -3536,30 +3584,27 @@ fn native_tl_get(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResul
         .lock()
         .get(&key)
         .map(|&(skey, cached)| {
-            // Re-read the CURRENT (post-GC) address — the var-handle-root
-            // registry entry is remapped after a move, this raw copy is not.
+            // Re-read the current post-GC address; this raw copy is not remapped.
             ctx.read_var_handle_root(skey).unwrap_or(cached)
         });
     if let Some(s) = supplier {
         let initial = ctx
             .invoke_virtual(s, "get", "()Ljava/lang/Object;", &[])?
             .unwrap_or(Value::Object(None));
+        let stored = tl_value_from_java(ctx, initial);
         TL_MAP.with(|m| {
-            m.borrow_mut().insert(key, initial);
+            m.borrow_mut().insert(key, stored);
         });
-        return Ok(Some(initial));
+        return Ok(Some(tl_value_to_java(ctx, stored)));
     }
-    // JDK ThreadLocal.get() calls initialValue() on first access and caches
-    // even a null result. Mockito's ThreadSafeMockingProgress uses an
-    // anonymous ThreadLocal subclass rather than ThreadLocal.withInitial(), so
-    // skipping this virtual call leaves its per-thread state uninitialized.
     let initial = ctx
         .invoke_virtual(this, "initialValue", "()Ljava/lang/Object;", &[])?
         .unwrap_or(Value::Object(None));
+    let stored = tl_value_from_java(ctx, initial);
     TL_MAP.with(|m| {
-        m.borrow_mut().insert(key, initial);
+        m.borrow_mut().insert(key, stored);
     });
-    Ok(Some(initial))
+    Ok(Some(tl_value_to_java(ctx, stored)))
 }
 
 fn native_tl_set(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
@@ -3567,9 +3612,11 @@ fn native_tl_set(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResul
     drain_inherited_for_current_thread(ctx);
     let val = args.get(1).copied().unwrap_or(Value::Object(None));
     let key = tl_key(ctx, this);
-    TL_MAP.with(|m| {
-        m.borrow_mut().insert(key, val);
-    });
+    let stored = tl_value_from_java(ctx, val);
+    let old = TL_MAP.with(|m| m.borrow_mut().insert(key, stored));
+    if let Some(old) = old {
+        tl_drop_value_root(ctx, old);
+    }
     Ok(None)
 }
 
@@ -3577,29 +3624,22 @@ fn native_tl_remove(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRe
     let this = obj_arg(args, 0)?;
     drain_inherited_for_current_thread(ctx);
     let key = tl_key(ctx, this);
-    TL_MAP.with(|m| {
-        m.borrow_mut().remove(&key);
-    });
+    let old = TL_MAP.with(|m| m.borrow_mut().remove(&key));
+    if let Some(old) = old {
+        tl_drop_value_root(ctx, old);
+    }
     Ok(None)
 }
 
 fn native_tl_with_initial(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     // Allocate a SuppliedThreadLocal, register the supplier in the side
-    // table (so every thread can lazily invoke it on first read), and
-    // eagerly seed the creating thread so the call-site sees a value
-    // without an extra invoke round-trip.
+    // table, and eagerly seed the creating thread.
     let supplier = match args.first() {
         Some(Value::Object(Some(s))) => *s,
         _ => return Ok(Some(Value::Object(None))),
     };
     let tl = alloc_concurrent_synthetic(ctx, "java/lang/ThreadLocal", 1);
     let key = ctx.identity_hash_code(tl);
-    // Keep the supplier alive + registry-remapped across GC moves
-    // (VarHandle-root pattern); key computed on the just-registered address,
-    // no allocation in between. NOTE: `supplier` was read from args BEFORE
-    // the `alloc_concurrent_synthetic` above; registration keys off the
-    // address as currently seen, matching the pre-existing exposure of raw
-    // arg refs across allocations in this native.
     ctx.register_var_handle_root(supplier);
     let skey = ctx.identity_hash_code(supplier);
     tl_with_initial_suppliers()
@@ -3608,9 +3648,11 @@ fn native_tl_with_initial(ctx: &mut dyn NativeContext, args: &[Value]) -> Method
     let initial = ctx
         .invoke_virtual(supplier, "get", "()Ljava/lang/Object;", &[])?
         .unwrap_or(Value::Object(None));
-    TL_MAP.with(|m| {
-        m.borrow_mut().insert(key, initial);
-    });
+    let stored = tl_value_from_java(ctx, initial);
+    let old = TL_MAP.with(|m| m.borrow_mut().insert(key, stored));
+    if let Some(old) = old {
+        tl_drop_value_root(ctx, old);
+    }
     Ok(Some(Value::Object(Some(tl))))
 }
 
@@ -3624,16 +3666,21 @@ fn native_tl_with_initial(ctx: &mut dyn NativeContext, args: &[Value]) -> Method
 /// first `get()` will invoke its own supplier copy. That matches JDK
 /// semantics: `InheritableThreadLocal` inherits only set values, and
 /// `withInitial` ThreadLocals are not inheritable by default anyway.
-pub(crate) fn snapshot_inheritable_tl_entries() -> Option<rustc_hash::FxHashMap<i32, Value>> {
+pub(crate) fn snapshot_inheritable_tl_entries(
+    ctx: &mut dyn NativeContext,
+) -> Option<rustc_hash::FxHashMap<i32, ThreadLocalValue>> {
     let inheritable = tl_inheritable_ids().lock();
     if inheritable.is_empty() {
         return None;
     }
-    let snap: rustc_hash::FxHashMap<i32, Value> = TL_MAP.with(|m| {
+    let snap: rustc_hash::FxHashMap<i32, ThreadLocalValue> = TL_MAP.with(|m| {
         let map = m.borrow();
         map.iter()
             .filter(|(k, _)| inheritable.contains(k))
-            .map(|(k, v)| (*k, *v))
+            .map(|(k, v)| {
+                let java_value = tl_value_to_java(ctx, *v);
+                (*k, tl_value_from_java(ctx, java_value))
+            })
             .collect()
     });
     if snap.is_empty() {
@@ -3648,7 +3695,7 @@ pub(crate) fn snapshot_inheritable_tl_entries() -> Option<rustc_hash::FxHashMap<
 /// `drain_inherited_for_current_thread`.
 pub(crate) fn queue_inherited_tl_for_child(
     child_thread_hash: i32,
-    snapshot: rustc_hash::FxHashMap<i32, Value>,
+    snapshot: rustc_hash::FxHashMap<i32, ThreadLocalValue>,
 ) {
     tl_inherited_pending()
         .lock()
@@ -5286,26 +5333,25 @@ fn native_es_clear(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRes
 fn native_es_iterator(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = obj_arg(args, 0)?;
     if let Some(backing) = es_get_backing(ctx, this) {
-        // Create snapshot iterator
         let size = match ctx.get_field(backing, 1) {
-            Value::Int(n) => n as usize,
+            Value::Int(n) if n > 0 => n as usize,
             _ => 0,
         };
         let data = match ctx.get_field(backing, 0) {
-            Value::Object(Some(o)) => o,
-            _ => return Ok(Some(Value::Object(None))),
+            Value::Object(Some(o)) => Some(o),
+            _ => None,
         };
         let snap = ctx.new_array(cratonvm_types::ArrayElementType::Reference, size);
-        for i in 0..size {
-            let v = ctx.get_array_element(data, i);
-            ctx.set_array_element(snap, i, v);
+        if let Some(data) = data {
+            for i in 0..size.min(ctx.array_length(data)) {
+                let v = ctx.get_array_element(data, i);
+                ctx.set_array_element(snap, i, v);
+            }
         }
-        let itr = alloc_concurrent_synthetic(ctx, "java/util/EnumSet$Itr", 2);
-        ctx.set_field(itr, 0, Value::Object(Some(snap)));
-        ctx.set_field(itr, 1, Value::Int(0));
-        return Ok(Some(Value::Object(Some(itr))));
+        return cratonvm_native_collections::make_iterator_from_array(ctx, snap, size);
     }
-    Ok(Some(Value::Object(None)))
+    let empty = ctx.new_array(cratonvm_types::ArrayElementType::Reference, 0);
+    cratonvm_native_collections::make_iterator_from_array(ctx, empty, 0)
 }
 
 fn native_es_to_array(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
@@ -7834,23 +7880,138 @@ pub fn register_real_jdk_forkjoin_essentials(r: &mut NativeMethodRegistry) {
 // ---------------------------------------------------------------------------
 // ScheduledExecutorService — stubs
 // ---------------------------------------------------------------------------
+
+fn stpe_new_delayed_work_queue(ctx: &mut dyn NativeContext) -> Option<ObjectRef> {
+    match ctx.new_object_initialized(
+        "java/util/concurrent/ScheduledThreadPoolExecutor$DelayedWorkQueue",
+        "()V",
+        &[],
+    ) {
+        Ok(Some(Value::Object(Some(q)))) => Some(q),
+        _ => match ctx.new_object_initialized(
+            "java/util/concurrent/PriorityBlockingQueue",
+            "()V",
+            &[],
+        ) {
+            Ok(Some(Value::Object(Some(q)))) => Some(q),
+            _ => None,
+        },
+    }
+}
+
+fn stpe_time_unit_millis(ctx: &mut dyn NativeContext) -> Option<ObjectRef> {
+    let cid = ctx
+        .ensure_class_initialized("java/util/concurrent/TimeUnit")
+        .ok()?;
+    let idx = ctx.static_field_index_by_name(cid, "MILLISECONDS")?;
+    match ctx.get_static_field(cid, idx) {
+        Value::Object(Some(unit)) => Some(unit),
+        _ => None,
+    }
+}
+
+fn stpe_legacy_slot_init(ctx: &mut dyn NativeContext, this: ObjectRef, cores: i32) {
+    let cores = cores.max(1);
+    if ctx.object_num_fields(this) > 0 {
+        ctx.set_field(this, 0, Value::Int(cores));
+    }
+    if ctx.object_num_fields(this) > 1 {
+        ctx.set_field(this, 1, Value::Int(0));
+    }
+}
+
+pub(crate) fn initialize_real_scheduled_thread_pool_executor(
+    ctx: &mut dyn NativeContext,
+    this: ObjectRef,
+    cores: i32,
+    thread_factory: Option<ObjectRef>,
+) -> MethodCallResult {
+    let cores = cores.max(1);
+    let pin_base = ctx.pin_native_root(this);
+    let factory_pin = thread_factory.map(|factory| ctx.pin_native_root(factory));
+
+    let Some(queue) = stpe_new_delayed_work_queue(ctx) else {
+        let this = ctx.read_native_pin(pin_base, this);
+        stpe_legacy_slot_init(ctx, this, cores);
+        ctx.unpin_native_roots(pin_base);
+        return Ok(None);
+    };
+    let queue_pin = ctx.pin_native_root(queue);
+
+    let Some(unit) = stpe_time_unit_millis(ctx) else {
+        let this = ctx.read_native_pin(pin_base, this);
+        let queue = ctx.read_native_pin(queue_pin, queue);
+        stpe_legacy_slot_init(ctx, this, cores);
+        ctx.set_field_by_name(this, "workQueue", Value::Object(Some(queue)));
+        ctx.unpin_native_roots(pin_base);
+        return Ok(None);
+    };
+    let unit_pin = ctx.pin_native_root(unit);
+
+    let this_arg = ctx.read_native_pin(pin_base, this);
+    let queue_arg = ctx.read_native_pin(queue_pin, queue);
+    let unit_arg = ctx.read_native_pin(unit_pin, unit);
+    let result = if let Some(factory) = thread_factory {
+        let factory_arg = ctx.read_native_pin(factory_pin.unwrap_or(pin_base), factory);
+        ctx.invoke_special(
+            "java/util/concurrent/ThreadPoolExecutor",
+            "<init>",
+            "(IIJLjava/util/concurrent/TimeUnit;Ljava/util/concurrent/BlockingQueue;Ljava/util/concurrent/ThreadFactory;)V",
+            &[
+                Value::Object(Some(this_arg)),
+                Value::Int(cores),
+                Value::Int(i32::MAX),
+                Value::Long(10),
+                Value::Object(Some(unit_arg)),
+                Value::Object(Some(queue_arg)),
+                Value::Object(Some(factory_arg)),
+            ],
+        )
+    } else {
+        ctx.invoke_special(
+            "java/util/concurrent/ThreadPoolExecutor",
+            "<init>",
+            "(IIJLjava/util/concurrent/TimeUnit;Ljava/util/concurrent/BlockingQueue;)V",
+            &[
+                Value::Object(Some(this_arg)),
+                Value::Int(cores),
+                Value::Int(i32::MAX),
+                Value::Long(10),
+                Value::Object(Some(unit_arg)),
+                Value::Object(Some(queue_arg)),
+            ],
+        )
+    };
+
+    let this = ctx.read_native_pin(pin_base, this);
+    if result.is_ok() {
+        ctx.set_field_by_name(
+            this,
+            "continueExistingPeriodicTasksAfterShutdown",
+            Value::Int(0),
+        );
+        ctx.set_field_by_name(
+            this,
+            "executeExistingDelayedTasksAfterShutdown",
+            Value::Int(1),
+        );
+        ctx.set_field_by_name(this, "removeOnCancel", Value::Int(0));
+    }
+    ctx.unpin_native_roots(pin_base);
+    result.map(|_| None)
+}
+
 pub(crate) fn register_scheduled_executor_natives(r: &mut NativeMethodRegistry) {
     let __prev_cat = r.current_category();
     r.set_category(cratonvm_native_api::NativeKind::Intrinsic);
     let ses = "java/util/concurrent/ScheduledThreadPoolExecutor";
     r.register(ses, "<init>", "(I)V", |ctx, args| {
         let this = obj_arg(args, 0)?;
-        let ps = match args.get(1) {
+        let cores = match args.get(1) {
             Some(Value::Int(v)) => *v,
             _ => 1,
         };
-        if ctx.object_num_fields(this) > 0 {
-            ctx.set_field(this, 0, Value::Int(ps));
-        }
-        if ctx.object_num_fields(this) > 1 {
-            ctx.set_field(this, 1, Value::Int(0));
-        }
-        Ok(Some(Value::Object(None)))
+        initialize_real_scheduled_thread_pool_executor(ctx, this, cores, None)
     });
     r.register(
         ses,
@@ -7858,17 +8019,15 @@ pub(crate) fn register_scheduled_executor_natives(r: &mut NativeMethodRegistry) 
         "(ILjava/util/concurrent/ThreadFactory;)V",
         |ctx, args| {
             let this = obj_arg(args, 0)?;
-            let ps = match args.get(1) {
+            let cores = match args.get(1) {
                 Some(Value::Int(v)) => *v,
                 _ => 1,
             };
-            if ctx.object_num_fields(this) > 0 {
-                ctx.set_field(this, 0, Value::Int(ps));
-            }
-            if ctx.object_num_fields(this) > 1 {
-                ctx.set_field(this, 1, Value::Int(0));
-            }
-            Ok(Some(Value::Object(None)))
+            let factory = match args.get(2) {
+                Some(Value::Object(Some(factory))) => Some(*factory),
+                _ => None,
+            };
+            initialize_real_scheduled_thread_pool_executor(ctx, this, cores, factory)
         },
     );
     r.register(ses, "shutdown", "()V", |ctx, args| {
@@ -17630,8 +17789,75 @@ pub fn register_arrays_support_natives(r: &mut NativeMethodRegistry) {
         }
         Ok(Some(Value::Int(-1)))
     });
+    // Direct native for mismatch(char[], char[], int). ECJ's
+    // CharOperation.equals delegates to Arrays.equals(char[]), which reaches
+    // this helper for class-file attribute names such as ModuleHashes. Running
+    // the JDK bytecode here depends on Unsafe.getLongUnaligned over char[] and
+    // can incorrectly report long equal ranges.
+    r.register(c, "mismatch", "([C[CI)I", |ctx, args| {
+        let a = match args.first() {
+            Some(Value::Object(Some(o))) => *o,
+            _ => return Ok(Some(Value::Int(-1))),
+        };
+        let b = match args.get(1) {
+            Some(Value::Object(Some(o))) => *o,
+            _ => return Ok(Some(Value::Int(-1))),
+        };
+        let length = match args.get(2) {
+            Some(Value::Int(v)) => (*v).max(0) as usize,
+            _ => 0,
+        };
+        let a_len = ctx.array_length(a);
+        let b_len = ctx.array_length(b);
+        let n = length.min(a_len).min(b_len);
+        for i in 0..n {
+            let va = ctx.get_array_element(a, i);
+            let vb = ctx.get_array_element(b, i);
+            if va != vb {
+                return Ok(Some(Value::Int(i as i32)));
+            }
+        }
+        Ok(Some(Value::Int(-1)))
+    });
     // Direct native for mismatch(byte[], int, byte[], int, int)
     r.register(c, "mismatch", "([BI[BII)I", |ctx, args| {
+        let a = match args.first() {
+            Some(Value::Object(Some(o))) => *o,
+            _ => return Ok(Some(Value::Int(-1))),
+        };
+        let a_from = match args.get(1) {
+            Some(Value::Int(v)) => (*v).max(0) as usize,
+            _ => 0,
+        };
+        let b = match args.get(2) {
+            Some(Value::Object(Some(o))) => *o,
+            _ => return Ok(Some(Value::Int(-1))),
+        };
+        let b_from = match args.get(3) {
+            Some(Value::Int(v)) => (*v).max(0) as usize,
+            _ => 0,
+        };
+        let length = match args.get(4) {
+            Some(Value::Int(v)) => (*v).max(0) as usize,
+            _ => 0,
+        };
+        let a_len = ctx.array_length(a);
+        let b_len = ctx.array_length(b);
+        let n = length
+            .min(a_len.saturating_sub(a_from))
+            .min(b_len.saturating_sub(b_from));
+        for i in 0..n {
+            let va = ctx.get_array_element(a, a_from + i);
+            let vb = ctx.get_array_element(b, b_from + i);
+            if va != vb {
+                return Ok(Some(Value::Int(i as i32)));
+            }
+        }
+        Ok(Some(Value::Int(-1)))
+    });
+    // Direct native for mismatch(char[], int, char[], int, int), same rationale
+    // as the whole-array char[] overload above.
+    r.register(c, "mismatch", "([CI[CII)I", |ctx, args| {
         let a = match args.first() {
             Some(Value::Object(Some(o))) => *o,
             _ => return Ok(Some(Value::Int(-1))),

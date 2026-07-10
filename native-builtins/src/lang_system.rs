@@ -693,7 +693,7 @@ pub(crate) fn native_thread_start0(
     // `drain_inherited_for_current_thread` in phases_early.rs). We do
     // this *before* spawning so there's no race between parent's
     // post-start mutations and the child's drain.
-    if let Some(snap) = crate::phases_early::snapshot_inheritable_tl_entries() {
+    if let Some(snap) = crate::phases_early::snapshot_inheritable_tl_entries(ctx) {
         let child_hash = ctx.identity_hash_code(this);
         crate::phases_early::queue_inherited_tl_for_child(child_hash, snap);
     }

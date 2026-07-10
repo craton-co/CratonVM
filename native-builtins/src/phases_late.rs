@@ -11655,6 +11655,11 @@ fn p57_parse_win_root(s: &str) -> (Option<String>, Vec<String>) {
             .map(|seg| seg.to_string())
             .collect()
     };
+    if let Some((_tag, _container, entry)) = vfs_decode(s) {
+        let entry = entry.trim_start_matches('/');
+        return (Some("/".to_string()), split_names(entry));
+    }
+
     let (work, verbatim) = {
         let b = s.as_bytes();
         if b.len() >= 4 && is_sep(b[0]) && is_sep(b[1]) && b[2] == b'?' && is_sep(b[3]) {
@@ -12550,6 +12555,7 @@ fn jarfs_list_dir_classified(jar: &str, dir: &str) -> Vec<(String, bool)> {
 struct JrtImage {
     reader: cratonvm_reader::JImageReader,
     entries: Vec<String>,
+    package_modules: std::collections::BTreeMap<String, Vec<String>>,
 }
 
 fn jrt_image(java_home: &str) -> Option<std::sync::Arc<JrtImage>> {
@@ -12574,7 +12580,38 @@ fn jrt_image(java_home: &str) -> Option<std::sync::Arc<JrtImage>> {
                 .collect();
             entries.sort_unstable();
             entries.dedup();
-            Arc::new(JrtImage { reader, entries })
+            let mut package_modules: std::collections::BTreeMap<
+                String,
+                std::collections::BTreeSet<String>,
+            > = std::collections::BTreeMap::new();
+            for p in &entries {
+                let s = p.trim_start_matches('/');
+                let Some((module, resource)) = s.split_once('/') else {
+                    continue;
+                };
+                if module.is_empty() || module == "modules" || module == "packages" {
+                    continue;
+                }
+                let Some((package, _name)) = resource.rsplit_once('/') else {
+                    continue;
+                };
+                if package.is_empty() {
+                    continue;
+                }
+                package_modules
+                    .entry(package.to_string())
+                    .or_default()
+                    .insert(module.to_string());
+            }
+            let package_modules = package_modules
+                .into_iter()
+                .map(|(package, modules)| (package, modules.into_iter().collect()))
+                .collect();
+            Arc::new(JrtImage {
+                reader,
+                entries,
+                package_modules,
+            })
         });
     guard.insert(java_home.to_string(), built.clone());
     built
@@ -12607,6 +12644,33 @@ fn jrt_img_is_dir(img: &JrtImage, path: &str) -> bool {
     img.entries.get(idx).is_some_and(|e| e.starts_with(&prefix))
 }
 
+fn jrt_package_path_kind(img: &JrtImage, rest: &str) -> JarFsKind {
+    let rest = rest.trim_matches('/');
+    if rest.is_empty() {
+        return JarFsKind::Dir;
+    }
+    if let Some((package, module)) = rest.rsplit_once('/') {
+        if img
+            .package_modules
+            .get(package)
+            .is_some_and(|modules| modules.iter().any(|m| m == module))
+        {
+            return JarFsKind::File;
+        }
+    }
+    let dir_prefix = format!("{rest}/");
+    if img.package_modules.contains_key(rest)
+        || img
+            .package_modules
+            .keys()
+            .any(|pkg| pkg.starts_with(&dir_prefix))
+    {
+        JarFsKind::Dir
+    } else {
+        JarFsKind::Absent
+    }
+}
+
 fn jrtfs_classify(java_home: &str, entry: &str) -> JarFsKind {
     let img = match jrt_image(java_home) {
         Some(i) => i,
@@ -12614,8 +12678,11 @@ fn jrtfs_classify(java_home: &str, entry: &str) -> JarFsKind {
     };
     let e = entry.trim_matches('/');
     // Synthetic container directories that have no backing jimage resource.
-    if e.is_empty() || e == "modules" {
+    if e.is_empty() || e == "modules" || e == "packages" {
         return JarFsKind::Dir;
+    }
+    if let Some(rest) = e.strip_prefix("packages/") {
+        return jrt_package_path_kind(&img, rest);
     }
     match jrt_entry_to_image(e) {
         Some(img_path) => {
@@ -12641,7 +12708,48 @@ fn jrtfs_list_dir_classified(java_home: &str, entry: &str) -> Vec<(String, bool)
     };
     let e = entry.trim_matches('/');
     if e.is_empty() {
-        return vec![("modules".to_string(), true)];
+        return vec![
+            ("modules".to_string(), true),
+            ("packages".to_string(), true),
+        ];
+    }
+    if e == "packages" {
+        let mut seen = std::collections::BTreeMap::new();
+        for package in img.package_modules.keys() {
+            let Some((head, rest)) = package.split_once('/') else {
+                seen.insert(format!("packages/{package}"), false);
+                continue;
+            };
+            seen.insert(format!("packages/{head}"), !rest.is_empty());
+        }
+        return seen.into_iter().collect();
+    }
+    if let Some(rest) = e.strip_prefix("packages/") {
+        let mut seen: std::collections::BTreeMap<String, bool> = std::collections::BTreeMap::new();
+        if let Some(modules) = img.package_modules.get(rest) {
+            for module in modules {
+                seen.insert(format!("packages/{rest}/{module}"), false);
+            }
+        }
+        let prefix = format!("{rest}/");
+        for package in img.package_modules.keys() {
+            let Some(tail) = package.strip_prefix(&prefix) else {
+                continue;
+            };
+            if tail.is_empty() {
+                continue;
+            }
+            let (child, is_dir) = match tail.split_once('/') {
+                Some((child, more)) => (child, !more.is_empty()),
+                None => (tail, false),
+            };
+            if !child.is_empty() {
+                let child_entry = format!("packages/{rest}/{child}");
+                let v = seen.entry(child_entry).or_insert(false);
+                *v = *v || is_dir;
+            }
+        }
+        return seen.into_iter().collect();
     }
     if e == "modules" {
         // Distinct module names = the first segment of each `/<module>/...`
@@ -28728,7 +28836,7 @@ pub(crate) fn register_p61_files_path(r: &mut NativeMethodRegistry) {
             Value::Object(Some(s)) => ctx.read_string(s).unwrap_or_default(),
             _ => return Ok(Some(Value::Int(0))),
         };
-        let entry = jarfs_decode(&path_str).map(|(_, e)| e).unwrap_or(path_str);
+        let entry = vfs_decode(&path_str).map(|(_, _, e)| e).unwrap_or(path_str);
         // keycloak-15: count name elements after the (explicitly parsed) Windows
         // drive/UNC root, not std::path components (which mis-count `C:` as a name).
         let count = p57_parse_win_root(&entry).1.len() as i32;
@@ -31952,15 +32060,12 @@ pub(crate) fn register_p63_scheduled_executor(r: &mut NativeMethodRegistry) {
             ctx.set_field_by_name(this, "workQueue", Value::Object(Some(q)));
         }
     }
-    fn stpe_init_common(ctx: &mut dyn NativeContext, this: ObjectRef, cores: i32) {
-        let cores = cores.max(1);
-        ctx.set_field(this, 0, Value::Int(cores));
-        ctx.set_field(this, 1, Value::Int(0));
-        ctx.set_field_by_name(this, "corePoolSize", Value::Int(cores));
-        ctx.set_field_by_name(this, "maximumPoolSize", Value::Int(cores.max(1)));
-        ctx.set_field_by_name(this, "largestPoolSize", Value::Int(cores.max(1)));
-        ctx.set_field_by_name(this, "poolSize", Value::Int(cores.max(1)));
-        stpe_ensure_work_queue(ctx, this);
+    fn stpe_init_common(
+        ctx: &mut dyn NativeContext,
+        this: ObjectRef,
+        cores: i32,
+    ) -> MethodCallResult {
+        crate::phases_early::initialize_real_scheduled_thread_pool_executor(ctx, this, cores, None)
     }
     fn stpe_new_executor(ctx: &mut dyn NativeContext, cores: i32) -> Option<ObjectRef> {
         let cores = cores.max(1);
@@ -31968,13 +32073,7 @@ pub(crate) fn register_p63_scheduled_executor(r: &mut NativeMethodRegistry) {
             Ok(Some(Value::Object(Some(o)))) => o,
             _ => return None,
         };
-        let _ = ctx.invoke_special(
-            "java/util/concurrent/ScheduledThreadPoolExecutor",
-            "<init>",
-            "(I)V",
-            &[Value::Object(Some(obj)), Value::Int(cores)],
-        );
-        stpe_init_common(ctx, obj, cores);
+        let _ = stpe_init_common(ctx, obj, cores);
         Some(obj)
     }
 
@@ -31985,8 +32084,7 @@ pub(crate) fn register_p63_scheduled_executor(r: &mut NativeMethodRegistry) {
             Some(Value::Int(v)) => *v,
             _ => 1,
         };
-        stpe_init_common(ctx, this, cores);
-        Ok(None)
+        stpe_init_common(ctx, this, cores)
     });
     r.register(
         stpe,
@@ -31998,8 +32096,13 @@ pub(crate) fn register_p63_scheduled_executor(r: &mut NativeMethodRegistry) {
                 Some(Value::Int(v)) => *v,
                 _ => 1,
             };
-            stpe_init_common(ctx, this, cores);
-            Ok(None)
+            let factory = match args.get(2) {
+                Some(Value::Object(Some(factory))) => Some(*factory),
+                _ => None,
+            };
+            crate::phases_early::initialize_real_scheduled_thread_pool_executor(
+                ctx, this, cores, factory,
+            )
         },
     );
     // WP4.5 — registry-driven scheduling. The pump in
