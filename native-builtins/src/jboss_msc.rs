@@ -719,6 +719,58 @@ impl ServiceContainer {
     /// `start()` invocation; this method takes and releases `inner` itself.
     fn take_ready_start(&self) -> Option<u64> {
         let mut state = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        // Demand-propagation pre-pass (BUG FIX 2026-07-10): real MSC treats
+        // "an Active/Passive/demanded-Lazy service depends on X" as an
+        // implicit demand on X whenever X is OnDemand/Lazy — the mere
+        // existence of a want-to-start dependent is what makes an OnDemand
+        // dependency start-eligible at all (JBoss MSC's own
+        // `ServiceControllerImpl` links a demand up the dependency edge as
+        // part of normal service linking, independent of any Java-code
+        // `setMode(ACTIVE)` call). Before this fix, `demand()` only ever
+        // fired reactively from the one production call site backing
+        // `ServiceController.setMode(Mode.ACTIVE)` — an OnDemand service
+        // reachable ONLY via a dependency edge (never given an explicit
+        // `setMode(ACTIVE)` call by any Java code) never got
+        // `demanded = true`, so `can_start` on its dependent(s) could NEVER
+        // return true: a permanent deadlock. First observed booting a
+        // WildFly Host Controller: `org.wildfly.management.http.extensible`
+        // (OnDemand) is only reachable via its ACTIVE dependent
+        // `org.wildfly.management.http.extensible.shutdown`'s dependency
+        // edge, so it never started, the http-management service chain
+        // never came up, `WFLYCTL0459: Triggering roll back due to missing
+        // management services` fired, and a later `http-interface` `add`
+        // then saw `IllegalStateException: Container is down`.
+        //
+        // Runs on every call (this method is polled repeatedly by the drive
+        // loop until quiescent) but is cheap: the `!d.demanded` check makes
+        // already-demanded services a no-op, and a multi-level OnDemand
+        // chain (A active -> B on-demand -> C on-demand) converges within a
+        // few calls — demanding B here makes B itself a demand-propagation
+        // source (`c.demanded && matches!(c.mode, OnDemand | Lazy)`, mirrored
+        // from the eligibility check below) on a subsequent call, which then
+        // demands C. Two passes (collect target names, then mutate) because
+        // the collection pass borrows `state.services` while iterating it.
+        let mut to_demand: Vec<Arc<ServiceName>> = Vec::new();
+        for c in state.services.values() {
+            let propagates_demand = matches!(c.mode, Mode::Active | Mode::Passive)
+                || (c.demanded && matches!(c.mode, Mode::OnDemand | Mode::Lazy));
+            if !propagates_demand {
+                continue;
+            }
+            for dep in &c.dependencies {
+                let resolved = state.resolve(dep).clone();
+                if let Some(d) = state.services.get(&resolved) {
+                    if matches!(d.mode, Mode::OnDemand | Mode::Lazy) && !d.demanded {
+                        to_demand.push(resolved);
+                    }
+                }
+            }
+        }
+        for name in to_demand {
+            if let Some(d) = state.services.get_mut(&name) {
+                d.demanded = true;
+            }
+        }
         let mut chosen: Option<(Arc<ServiceName>, u64)> = None;
         for (name, c) in state.services.iter() {
             // Auto-start modes are always eligible; OnDemand/Lazy become
