@@ -21173,6 +21173,28 @@ fn force_native_over_real_jdk_bytecode(
         return true;
     }
 
+    // `Executors.newSingleThreadExecutor()`/`newFixedThreadPool()`/
+    // `newCachedThreadPool()` (native-builtins/src/lib.rs's
+    // `native_new_single_thread`/`native_new_fixed_pool`/`native_new_cached_pool`)
+    // allocate their return value under the REAL class name
+    // `java/util/concurrent/ThreadPoolExecutor` but never run it through the
+    // real `<init>` -- real fields like `ctl`/`workQueue`/`mainLock` are never
+    // set. Once `execute(Runnable)` (invoked via `invokeinterface
+    // Executor.execute`/`ExecutorService.execute`) resolves to the concrete
+    // class's own real bytecode, that bytecode reads the never-initialized
+    // `ctl` AtomicInteger and NPEs immediately (docs/known-issues/
+    // threadpoolexecutor-execute-npe-on-ctl-regression.md). Force the
+    // registered native (`native_es_execute`) to win for this triple;
+    // `intercept_force_registered_native` additionally checks the receiver's
+    // real `workers` field so a genuinely real, bytecode-constructed
+    // `ThreadPoolExecutor` still runs its own real `execute()` bytecode.
+    if class_name == "java/util/concurrent/ThreadPoolExecutor"
+        && method_name == "execute"
+        && method_descriptor == "(Ljava/lang/Runnable;)V"
+    {
+        return true;
+    }
+
     if class_name == "java/nio/ByteBuffer"
         && matches!(
             (method_name, method_descriptor),
@@ -22482,6 +22504,27 @@ pub(crate) fn should_force_registered_native_over_bytecode(
 /// Dispatch a force-native override via `safe_native_call`, pushing any return
 /// value onto the caller operand stack.
 #[inline]
+/// Whether `recv` (the receiver of a `ThreadPoolExecutor.execute()` call) is
+/// a genuinely real, bytecode-constructed `ThreadPoolExecutor` rather than
+/// one of CratonVM's synthetic 2-field `Executors.new*ThreadPool()` stand-ins.
+/// Mirrors `native-builtins::executor_has_real_workers` (same check, same
+/// field) but works from the interpreter, which only has `SharedVm`/`JvmThread`
+/// -- not a `NativeContext` -- available at this dispatch point.
+fn threadpool_executor_has_real_workers(shared: &SharedVm, recv: &Value) -> bool {
+    let Value::Object(Some(recv)) = recv else {
+        return false;
+    };
+    let class_id = shared.heap.class_id_of(*recv);
+    let cm = shared.class_manager.read();
+    let Some(index) =
+        crate::vm::vm_exec::resolve_field_index_in_hierarchy(class_id, "workers", &cm.class_store)
+    else {
+        return false;
+    };
+    drop(cm);
+    matches!(shared.heap.get_field(*recv, index), Value::Object(Some(_)))
+}
+
 fn intercept_force_registered_native(
     shared: &SharedVm,
     thread: &mut JvmThread,
@@ -22512,6 +22555,17 @@ fn intercept_force_registered_native(
         method_name,
         method_descriptor,
     ) {
+        return None;
+    }
+    // A genuinely real, bytecode-constructed `ThreadPoolExecutor` (its own
+    // real `<init>` ran, so its real `workers` field is populated) must keep
+    // running its own real `execute()` -- only CratonVM's synthetic 2-field
+    // `Executors.new*ThreadPool()` objects need the forced native. See
+    // docs/known-issues/threadpoolexecutor-execute-npe-on-ctl-regression.md.
+    if class_name == "java/util/concurrent/ThreadPoolExecutor"
+        && method_name == "execute"
+        && threadpool_executor_has_real_workers(shared, &args[0])
+    {
         return None;
     }
     let cb = shared

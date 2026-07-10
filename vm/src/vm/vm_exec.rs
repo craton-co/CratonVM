@@ -8255,6 +8255,45 @@ pub fn invoke_or_native(
     // for both synthetic stubs AND real JDK classes.  Many JDK Java methods
     // (e.g. VM.getSavedProperty) depend on JVM-internal state we haven't set up,
     // so our Rust native registration must take priority over bytecode.
+    // `java/util/concurrent/ThreadPoolExecutor.execute(Runnable)`: the
+    // registered native (`native_es_execute`) assumes CratonVM's synthetic
+    // 2-field `Executors.new*ThreadPool()` receiver. It is NOT disambiguated
+    // by the general SyntheticStub/CRATONVM_REAL `real_protected_stub` logic
+    // below, because that check is CLASS-scoped and the real
+    // `ThreadPoolExecutor` *class* bytecode is always loaded regardless of
+    // whether a given *instance* is genuinely real or one of our synthetic
+    // stand-ins. A genuinely real, bytecode-constructed `ThreadPoolExecutor`
+    // (its own real `<init>` ran, so its real `workers` field is populated --
+    // e.g. `spawn_runnable_on_real_thread`'s own singleton async pool) must
+    // run its own real `execute()` bytecode here too, or calling `.execute()`
+    // on it from native code (via `ctx.invoke_virtual`) recurses back into
+    // this same native forever (a real stack overflow, confirmed via gdb).
+    // See docs/known-issues/threadpoolexecutor-execute-npe-on-ctl-regression.md.
+    if effective_class == "java/util/concurrent/ThreadPoolExecutor"
+        && method_name == "execute"
+        && descriptor == "(Ljava/lang/Runnable;)V"
+    {
+        if let Some(Value::Object(Some(recv))) = args.first() {
+            let recv_class_id = shared.heap.class_id_of(*recv);
+            let has_real_workers = {
+                let cm = shared.class_manager.read();
+                resolve_field_index_in_hierarchy(recv_class_id, "workers", &cm.class_store)
+                    .map(|idx| matches!(shared.heap.get_field(*recv, idx), Value::Object(Some(_))))
+                    .unwrap_or(false)
+            };
+            if has_real_workers {
+                return invoke_on_class_shared(
+                    shared,
+                    thread,
+                    recv_class_id,
+                    method_name,
+                    descriptor,
+                    args,
+                );
+            }
+        }
+    }
+
     if let Some(callback) = shared
         .native_methods
         .find(effective_class, method_name, descriptor)
@@ -14188,12 +14227,35 @@ fn invoke_on_class_shared_inner(
             .get_class(declaring_class_id)
             .map(|c| c.name.to_string())
             .unwrap_or_default();
-        if crate::runtime::interpreter::should_force_registered_native_over_bytecode(
-            shared,
-            &class_name_for_force,
-            method_name,
-            descriptor,
-        ) {
+        // See the identical guard + comment in `invoke_or_native` above: a
+        // genuinely real, bytecode-constructed `ThreadPoolExecutor` (real
+        // `workers` field populated) must keep running its own real
+        // `execute()` bytecode -- only CratonVM's synthetic 2-field
+        // `Executors.new*ThreadPool()` objects need the forced native. This
+        // call site (`invoke_on_class_shared_inner`) is a SEPARATE dispatch
+        // path from `invoke_or_native` (e.g. reached from the interpreter's
+        // reflection/initial-invoke routes) that independently consults
+        // `should_force_registered_native_over_bytecode`, so it needs its own
+        // copy of the receiver check. See docs/known-issues/
+        // threadpoolexecutor-execute-npe-on-ctl-regression.md.
+        let force_native_receiver_exempt = class_name_for_force
+            == "java/util/concurrent/ThreadPoolExecutor"
+            && method_name == "execute"
+            && matches!(args.first(), Some(Value::Object(Some(recv))) if {
+                let recv_class_id = shared.heap.class_id_of(*recv);
+                let cm = shared.class_manager.read();
+                resolve_field_index_in_hierarchy(recv_class_id, "workers", &cm.class_store)
+                    .map(|idx| matches!(shared.heap.get_field(*recv, idx), Value::Object(Some(_))))
+                    .unwrap_or(false)
+            });
+        if !force_native_receiver_exempt
+            && crate::runtime::interpreter::should_force_registered_native_over_bytecode(
+                shared,
+                &class_name_for_force,
+                method_name,
+                descriptor,
+            )
+        {
             if let Some(callback) =
                 shared
                     .native_methods

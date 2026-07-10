@@ -60917,6 +60917,29 @@ fn native_es_execute(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallR
     // apply the same fix here: hand the task to the shared bounded real
     // `ThreadPoolExecutor` so it runs on an actual worker thread and the
     // caller returns immediately, matching HotSpot's `execute()` semantics.
+    // Defense in depth: several independent interpreter dispatch points
+    // decide whether to force this native over real bytecode for
+    // `ThreadPoolExecutor.execute()`, each with its own receiver-real-check
+    // (see docs/known-issues/threadpoolexecutor-execute-npe-on-ctl-regression.md).
+    // If this native is EVER reached for a genuinely real, bytecode-
+    // constructed `ThreadPoolExecutor` anyway (its real `workers` field is
+    // populated) -- e.g. this exact function's own shared async worker pool
+    // singleton (`async_worker_pool`, itself a real `ThreadPoolExecutor`)
+    // calling `.execute()` on itself via `spawn_runnable_on_real_thread`
+    // below -- do NOT hand off through `spawn_runnable_on_real_thread` again:
+    // that would call `pool.execute(...)`, which (if ALSO routed to this
+    // native) recurses forever and stack-overflows. Running the task inline
+    // here breaks that recursion; it only degrades a real pool's execute()
+    // to synchronous in the narrow case some dispatch path still lands here
+    // for a real receiver.
+    if let Some(Value::Object(Some(this))) = args.first() {
+        if executor_has_real_workers(ctx, *this) {
+            if let Some(Value::Object(Some(runnable))) = args.get(1) {
+                ctx.invoke_virtual(*runnable, "run", "()V", &[])?;
+            }
+            return Ok(None);
+        }
+    }
     if let Some(Value::Object(Some(runnable))) = args.get(1) {
         return spawn_runnable_on_real_thread(ctx, *runnable);
     }
