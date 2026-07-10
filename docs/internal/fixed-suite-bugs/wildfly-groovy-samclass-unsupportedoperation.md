@@ -77,3 +77,14 @@ Groovy probe. The release JIT binary passed the same probe, and the source-built
 /data/data/wt-wildfly-bugbash-20260707-runner/out/rerun4-s1of2-jit-real-all-20260708-143042/surefire-reports/00695-org.wildfly.test.integration.vdx.standalone.NoSchemaTestCase/
 /data/data/wt-wildfly-bugbash-20260707-runner/out/hscheck-vdx-hotspot-all-20260708-201951/
 ```
+
+## Residual, NOT covered by this fix — separate GroovyBugError during compilation
+
+`org.wildfly.test.integration.vdx.domain.HostXmlSmokeTestCase` (1 instance, same 2026-07-08 run) threw a
+bare `org.codehaus.groovy.GroovyBugError` (no message captured) from
+`CompilationUnit.applyToPrimaryClassNodes` -- i.e. during Groovy *script compilation*, not instantiation
+of an already-compiled class (the SAM-detection path fixed above). Different Groovy subsystem, different
+stack, but same underlying app (`creaper`'s `Subtree.SubtreeCreator`) and same module. Not confirmed
+whether this fix also resolved it (only 1 low-confidence instance observed, not re-verified against the
+fixed binary) -- whoever next runs the `vdx.domain.HostXmlSmokeTestCase` class should check, and re-open a
+known-issues doc if it still reproduces.

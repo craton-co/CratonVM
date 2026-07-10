@@ -346,6 +346,42 @@ fn native_output_stream_writer_write_string_range(
     write_bytes_from_output_stream_writer(ctx, this, &bytes)
 }
 
+fn native_output_stream_writer_write_chars(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(o))) => *o,
+        _ => return Ok(None),
+    };
+    let chars = match args.get(1) {
+        Some(Value::Object(Some(a))) => *a,
+        _ => return Err(RuntimeError::NullPointerException { message: None }.into()),
+    };
+    let off = args.get(2).and_then(|v| v.as_int()).unwrap_or(0);
+    let len = args.get(3).and_then(|v| v.as_int()).unwrap_or(0);
+    let arr_len = ctx.array_length(chars) as i32;
+    let end = off.checked_add(len).unwrap_or(i32::MAX);
+    if off < 0 || len < 0 || end > arr_len {
+        return Err(RuntimeError::ArrayIndexOutOfBoundsException { index: end }.into());
+    }
+    if len == 0 {
+        return Ok(None);
+    }
+
+    let mut units = Vec::with_capacity(len as usize);
+    for i in off..end {
+        let ch = match ctx.get_array_element(chars, i as usize) {
+            Value::Int(v) => v as u16,
+            _ => 0,
+        };
+        units.push(ch);
+    }
+    let text = String::from_utf16_lossy(&units);
+    let bytes = text.into_bytes();
+    write_bytes_from_output_stream_writer(ctx, this, &bytes)
+}
+
 fn native_output_stream_writer_write_int(
     ctx: &mut dyn NativeContext,
     args: &[Value],
@@ -391,7 +427,21 @@ fn native_output_stream_writer_close(
     Ok(None)
 }
 
-fn native_output_stream_write_all(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+fn native_input_stream_reader_close(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    let this = obj_arg(args, 0)?;
+    if let Value::Object(Some(input)) = ctx.get_field(this, 0) {
+        let _ = ctx.invoke_virtual(input, "close", "()V", &[]);
+    }
+    Ok(None)
+}
+
+fn native_output_stream_write_all(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
     let this = match args.first() {
         Some(Value::Object(Some(o))) => *o,
         _ => return Ok(None),
@@ -19229,13 +19279,6 @@ pub fn register_essential_natives(registry: &mut NativeMethodRegistry) {
                 Ok(None)
             },
         );
-        registry.register("java/io/InputStreamReader", "close", "()V", |ctx, args| {
-            let this = obj_arg(args, 0)?;
-            if let Value::Object(Some(sd)) = ctx.get_field_by_name(this, "sd") {
-                let _ = ctx.invoke_virtual(sd, "close", "()V", &[])?;
-            }
-            Ok(None)
-        });
         registry.register(
             "java/io/InputStreamReader",
             "read",
@@ -19287,7 +19330,7 @@ pub fn register_essential_natives(registry: &mut NativeMethodRegistry) {
             "java/io/InputStreamReader",
             "close",
             "()V",
-            native_noop_with_this,
+            native_input_stream_reader_close,
         );
         registry.register(
             "java/util/jar/Attributes",
@@ -20019,6 +20062,12 @@ pub fn register_essential_natives(registry: &mut NativeMethodRegistry) {
         "write",
         "(I)V",
         native_output_stream_writer_write_int,
+    );
+    registry.register(
+        "java/io/OutputStreamWriter",
+        "write",
+        "([CII)V",
+        native_output_stream_writer_write_chars,
     );
     registry.register(
         "java/io/OutputStreamWriter",

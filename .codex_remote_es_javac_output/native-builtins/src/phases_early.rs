@@ -5078,8 +5078,8 @@ fn enum_range_elements(ctx: &mut dyn NativeContext, from: Value, to: Value) -> V
 }
 
 fn enum_set_elements(ctx: &mut dyn NativeContext, set: ObjectRef) -> Vec<Value> {
-    if es_real_kind(ctx, set).is_some() {
-        return es_real_elements(ctx, set);
+    if let Some(elems) = real_enum_set_elements(ctx, set) {
+        return elems;
     }
     if let Ok(Some(Value::Object(Some(arr)))) =
         ctx.invoke_virtual(set, "toArray", "()[Ljava/lang/Object;", &[])
@@ -5098,6 +5098,111 @@ fn enum_set_elements(ctx: &mut dyn NativeContext, set: ObjectRef) -> Vec<Value> 
     (0..size.min(ctx.array_length(arr)))
         .map(|i| ctx.get_array_element(arr, i))
         .collect()
+}
+
+fn real_enum_set_elements(ctx: &mut dyn NativeContext, set: ObjectRef) -> Option<Vec<Value>> {
+    let cls = ctx
+        .class_name_of_id(ctx.class_id_of_object(set))
+        .unwrap_or_default();
+    match cls.as_str() {
+        "java/util/RegularEnumSet" => real_regular_enum_set_elements(ctx, set),
+        "java/util/JumboEnumSet" => real_jumbo_enum_set_elements(ctx, set),
+        _ => None,
+    }
+}
+
+fn real_enum_set_universe(ctx: &mut dyn NativeContext, set: ObjectRef) -> Option<ObjectRef> {
+    match ctx.get_field_by_name(set, "universe") {
+        Value::Object(Some(universe)) => Some(universe),
+        _ => None,
+    }
+}
+
+fn real_regular_enum_set_elements(
+    ctx: &mut dyn NativeContext,
+    set: ObjectRef,
+) -> Option<Vec<Value>> {
+    let universe = real_enum_set_universe(ctx, set)?;
+    let bits = match ctx.get_field_by_name(set, "elements") {
+        Value::Long(bits) => bits as u64,
+        Value::Int(bits) => bits as u64,
+        _ => 0,
+    };
+    let len = ctx.array_length(universe).min(64);
+    let mut elems = Vec::new();
+    for i in 0..len {
+        if ((bits >> i) & 1) != 0 {
+            let elem = ctx.get_array_element(universe, i);
+            if !matches!(elem, Value::Object(None)) {
+                elems.push(elem);
+            }
+        }
+    }
+    Some(elems)
+}
+
+fn real_jumbo_enum_set_elements(ctx: &mut dyn NativeContext, set: ObjectRef) -> Option<Vec<Value>> {
+    let universe = real_enum_set_universe(ctx, set)?;
+    let words = match ctx.get_field_by_name(set, "elements") {
+        Value::Object(Some(words)) => words,
+        _ => return Some(Vec::new()),
+    };
+    let universe_len = ctx.array_length(universe);
+    let mut elems = Vec::new();
+    for word_idx in 0..ctx.array_length(words) {
+        let bits = match ctx.get_array_element(words, word_idx) {
+            Value::Long(bits) => bits as u64,
+            Value::Int(bits) => bits as u64,
+            _ => 0,
+        };
+        if bits == 0 {
+            continue;
+        }
+        for bit in 0..64 {
+            let enum_idx = word_idx * 64 + bit;
+            if enum_idx >= universe_len {
+                break;
+            }
+            if ((bits >> bit) & 1) != 0 {
+                let elem = ctx.get_array_element(universe, enum_idx);
+                if !matches!(elem, Value::Object(None)) {
+                    elems.push(elem);
+                }
+            }
+        }
+    }
+    Some(elems)
+}
+
+fn enum_values_to_object_array(ctx: &mut dyn NativeContext, elems: &[Value]) -> ObjectRef {
+    let arr = ctx.new_array(cratonvm_types::ArrayElementType::Reference, elems.len());
+    for (i, elem) in elems.iter().copied().enumerate() {
+        ctx.set_array_element(arr, i, elem);
+    }
+    arr
+}
+
+fn enum_values_to_typed_array(
+    ctx: &mut dyn NativeContext,
+    elems: &[Value],
+    template: Value,
+) -> ObjectRef {
+    let size = elems.len();
+    let target = match template {
+        Value::Object(Some(arr)) if ctx.array_length(arr) >= size => arr,
+        Value::Object(Some(arr)) => {
+            let comp_cid = ctx.class_id_of_object(arr);
+            ctx.new_ref_array(comp_cid, size)
+        }
+        _ => ctx.new_array(cratonvm_types::ArrayElementType::Reference, size),
+    };
+    for (i, elem) in elems.iter().copied().enumerate() {
+        ctx.set_array_element(target, i, elem);
+    }
+    if ctx.array_length(target) > size {
+        ctx.set_array_element(target, size, Value::Object(None));
+    }
+    target
 }
 
 fn enum_universe_for_value(ctx: &mut dyn NativeContext, value: Value) -> Vec<Value> {
@@ -5270,6 +5375,9 @@ fn native_es_copy_of(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallR
 }
 
 fn enum_set_copy_source_values(ctx: &mut dyn NativeContext, src: ObjectRef) -> Vec<Value> {
+    if let Some(elems) = real_enum_set_elements(ctx, src) {
+        return elems;
+    }
     let arr = match ctx.invoke_virtual(src, "toArray", "()[Ljava/lang/Object;", &[]) {
         Ok(Some(Value::Object(Some(arr)))) => arr,
         _ => return Vec::new(),
@@ -5365,206 +5473,14 @@ fn es_get_backing(ctx: &mut dyn NativeContext, this: ObjectRef) -> Option<Object
     }
 }
 
-fn es_real_kind(ctx: &mut dyn NativeContext, this: ObjectRef) -> Option<&'static str> {
-    match ctx
-        .class_name_of_id(ctx.class_id_of_object(this))
-        .as_deref()
-    {
-        Some("java/util/RegularEnumSet") => Some("regular"),
-        Some("java/util/JumboEnumSet") => Some("jumbo"),
-        _ => None,
-    }
-}
-
-fn es_enum_ordinal(ctx: &mut dyn NativeContext, elem: Value) -> Option<usize> {
-    let ord = enum_value_ordinal(ctx, elem)?;
-    if ord >= 0 {
-        Some(ord as usize)
-    } else {
-        None
-    }
-}
-
-fn es_real_contains_ordinal(ctx: &mut dyn NativeContext, this: ObjectRef, ord: usize) -> bool {
-    let word = ord / 64;
-    let bit = 1u64 << (ord & 63);
-    match ctx.get_field_by_name(this, "elements") {
-        Value::Long(mask) if word == 0 => ((mask as u64) & bit) != 0,
-        Value::Int(mask) if word == 0 => ((mask as u32 as u64) & bit) != 0,
-        Value::Object(Some(words)) => {
-            if word >= ctx.array_length(words) {
-                return false;
-            }
-            match ctx.get_array_element(words, word) {
-                Value::Long(mask) => ((mask as u64) & bit) != 0,
-                Value::Int(mask) => ((mask as u32 as u64) & bit) != 0,
-                _ => false,
-            }
-        }
-        _ => false,
-    }
-}
-
-fn es_real_add_ordinal(ctx: &mut dyn NativeContext, this: ObjectRef, ord: usize) -> bool {
-    let word = ord / 64;
-    let bit = 1u64 << (ord & 63);
-    match ctx.get_field_by_name(this, "elements") {
-        Value::Long(mask) if word == 0 => {
-            let old = mask as u64;
-            let new = old | bit;
-            if new != old {
-                ctx.set_field_by_name(this, "elements", Value::Long(new as i64));
-                true
-            } else {
-                false
-            }
-        }
-        Value::Int(mask) if word == 0 => {
-            let old = mask as u32 as u64;
-            let new = old | bit;
-            if new != old {
-                ctx.set_field_by_name(this, "elements", Value::Long(new as i64));
-                true
-            } else {
-                false
-            }
-        }
-        Value::Object(Some(words)) => {
-            if word >= ctx.array_length(words) {
-                return false;
-            }
-            let old = match ctx.get_array_element(words, word) {
-                Value::Long(mask) => mask as u64,
-                Value::Int(mask) => mask as u32 as u64,
-                _ => 0,
-            };
-            let new = old | bit;
-            if new != old {
-                ctx.set_array_element(words, word, Value::Long(new as i64));
-                let size = es_real_size(ctx, this);
-                ctx.set_field_by_name(this, "size", Value::Int(size));
-                true
-            } else {
-                false
-            }
-        }
-        _ => false,
-    }
-}
-
-fn es_real_remove_ordinal(ctx: &mut dyn NativeContext, this: ObjectRef, ord: usize) -> bool {
-    let word = ord / 64;
-    let bit = 1u64 << (ord & 63);
-    match ctx.get_field_by_name(this, "elements") {
-        Value::Long(mask) if word == 0 => {
-            let old = mask as u64;
-            let new = old & !bit;
-            if new != old {
-                ctx.set_field_by_name(this, "elements", Value::Long(new as i64));
-                true
-            } else {
-                false
-            }
-        }
-        Value::Int(mask) if word == 0 => {
-            let old = mask as u32 as u64;
-            let new = old & !bit;
-            if new != old {
-                ctx.set_field_by_name(this, "elements", Value::Long(new as i64));
-                true
-            } else {
-                false
-            }
-        }
-        Value::Object(Some(words)) => {
-            if word >= ctx.array_length(words) {
-                return false;
-            }
-            let old = match ctx.get_array_element(words, word) {
-                Value::Long(mask) => mask as u64,
-                Value::Int(mask) => mask as u32 as u64,
-                _ => 0,
-            };
-            let new = old & !bit;
-            if new != old {
-                ctx.set_array_element(words, word, Value::Long(new as i64));
-                let size = es_real_size(ctx, this);
-                ctx.set_field_by_name(this, "size", Value::Int(size));
-                true
-            } else {
-                false
-            }
-        }
-        _ => false,
-    }
-}
-
-fn es_real_size(ctx: &mut dyn NativeContext, this: ObjectRef) -> i32 {
-    match ctx.get_field_by_name(this, "elements") {
-        Value::Long(mask) => (mask as u64).count_ones() as i32,
-        Value::Int(mask) => (mask as u32).count_ones() as i32,
-        Value::Object(Some(words)) => {
-            let mut size = 0i32;
-            for i in 0..ctx.array_length(words) {
-                size += match ctx.get_array_element(words, i) {
-                    Value::Long(mask) => (mask as u64).count_ones() as i32,
-                    Value::Int(mask) => (mask as u32).count_ones() as i32,
-                    _ => 0,
-                };
-            }
-            size
-        }
-        _ => ctx.get_field_by_name(this, "size").as_int().unwrap_or(0),
-    }
-}
-
-fn es_real_clear(ctx: &mut dyn NativeContext, this: ObjectRef) {
-    match ctx.get_field_by_name(this, "elements") {
-        Value::Long(_) | Value::Int(_) => {
-            ctx.set_field_by_name(this, "elements", Value::Long(0));
-        }
-        Value::Object(Some(words)) => {
-            for i in 0..ctx.array_length(words) {
-                ctx.set_array_element(words, i, Value::Long(0));
-            }
-            ctx.set_field_by_name(this, "size", Value::Int(0));
-        }
-        _ => {}
-    }
-}
-
-fn es_real_elements(ctx: &mut dyn NativeContext, this: ObjectRef) -> Vec<Value> {
-    let universe = match ctx.get_field_by_name(this, "universe") {
-        Value::Object(Some(universe)) => universe,
-        _ => return Vec::new(),
-    };
-    let mut elems = Vec::new();
-    for ord in 0..ctx.array_length(universe) {
-        if es_real_contains_ordinal(ctx, this, ord) {
-            let elem = ctx.get_array_element(universe, ord);
-            if !matches!(elem, Value::Object(None)) {
-                elems.push(elem);
-            }
-        }
-    }
-    elems
-}
-
 pub(crate) fn native_es_add(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = obj_arg(args, 0)?;
     let elem = args.get(1).copied().unwrap_or(Value::Object(None));
-    if es_real_kind(ctx, this).is_some() {
-        let modified = es_enum_ordinal(ctx, elem)
-            .map(|ord| es_real_add_ordinal(ctx, this, ord))
-            .unwrap_or(false);
-        return Ok(Some(Value::Int(i32::from(modified))));
-    }
     if let Some(backing) = es_get_backing(ctx, this) {
         // Delegate to ArrayList add
         cratonvm_native_collections::native_al_add(ctx, &[Value::Object(Some(backing)), elem])?;
-        return Ok(Some(Value::Int(1)));
     }
-    Ok(Some(Value::Int(0)))
+    Ok(Some(Value::Int(1)))
 }
 
 fn native_es_add_all(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
@@ -5594,13 +5510,7 @@ fn native_es_add_all(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallR
 
 fn native_es_remove(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = obj_arg(args, 0)?;
-    let elem = args.get(1).copied().unwrap_or(Value::Object(None));
-    if es_real_kind(ctx, this).is_some() {
-        let modified = es_enum_ordinal(ctx, elem)
-            .map(|ord| es_real_remove_ordinal(ctx, this, ord))
-            .unwrap_or(false);
-        return Ok(Some(Value::Int(i32::from(modified))));
-    }
+    let _elem = args.get(1).copied().unwrap_or(Value::Object(None));
     if let Some(backing) = es_get_backing(ctx, this) {
         let size = match ctx.get_field(backing, 1) {
             Value::Int(n) => n,
@@ -5617,27 +5527,19 @@ fn native_es_remove(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRe
 
 fn native_es_contains(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = obj_arg(args, 0)?;
-    let elem = args.get(1).copied().unwrap_or(Value::Object(None));
-    if es_real_kind(ctx, this).is_some() {
-        let contained = es_enum_ordinal(ctx, elem)
-            .map(|ord| es_real_contains_ordinal(ctx, this, ord))
-            .unwrap_or(false);
-        return Ok(Some(Value::Int(i32::from(contained))));
-    }
+    let _elem = args.get(1).copied().unwrap_or(Value::Object(None));
     if let Some(backing) = es_get_backing(ctx, this) {
-        return cratonvm_native_collections::native_al_contains(
-            ctx,
-            &[Value::Object(Some(backing)), elem],
-        );
+        let size = match ctx.get_field(backing, 1) {
+            Value::Int(n) => n,
+            _ => 0,
+        };
+        return Ok(Some(Value::Int(if size > 0 { 1 } else { 0 })));
     }
     Ok(Some(Value::Int(0)))
 }
 
 fn native_es_size(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = obj_arg(args, 0)?;
-    if es_real_kind(ctx, this).is_some() {
-        return Ok(Some(Value::Int(es_real_size(ctx, this))));
-    }
     if let Some(backing) = es_get_backing(ctx, this) {
         let size = match ctx.get_field(backing, 1) {
             Value::Int(n) => n,
@@ -5650,13 +5552,6 @@ fn native_es_size(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResu
 
 fn native_es_is_empty(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = obj_arg(args, 0)?;
-    if es_real_kind(ctx, this).is_some() {
-        return Ok(Some(Value::Int(if es_real_size(ctx, this) == 0 {
-            1
-        } else {
-            0
-        })));
-    }
     if let Some(backing) = es_get_backing(ctx, this) {
         let size = match ctx.get_field(backing, 1) {
             Value::Int(n) => n,
@@ -5669,10 +5564,6 @@ fn native_es_is_empty(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
 
 fn native_es_clear(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = obj_arg(args, 0)?;
-    if es_real_kind(ctx, this).is_some() {
-        es_real_clear(ctx, this);
-        return Ok(None);
-    }
     if let Some(backing) = es_get_backing(ctx, this) {
         ctx.set_field(backing, 1, Value::Int(0));
     }
@@ -5712,13 +5603,10 @@ fn native_es_iterator(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
 
 fn native_es_to_array(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = obj_arg(args, 0)?;
-    if es_real_kind(ctx, this).is_some() {
-        let elems = es_real_elements(ctx, this);
-        let arr = ctx.new_array(cratonvm_types::ArrayElementType::Reference, elems.len());
-        for (i, elem) in elems.iter().enumerate() {
-            ctx.set_array_element(arr, i, *elem);
-        }
-        return Ok(Some(Value::Object(Some(arr))));
+    if let Some(elems) = real_enum_set_elements(ctx, this) {
+        return Ok(Some(Value::Object(Some(enum_values_to_object_array(
+            ctx, &elems,
+        )))));
     }
     if let Some(backing) = es_get_backing(ctx, this) {
         let size = match ctx.get_field(backing, 1) {
@@ -5748,34 +5636,26 @@ fn native_es_to_array(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
 fn native_es_to_array_typed(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = obj_arg(args, 0)?;
     let template = args.get(1).copied().unwrap_or(Value::Object(None));
-    let real_elems = if es_real_kind(ctx, this).is_some() {
-        Some(es_real_elements(ctx, this))
-    } else {
-        None
-    };
-    let backing = if real_elems.is_some() {
-        None
-    } else {
-        match es_get_backing(ctx, this) {
-            Some(b) => Some(b),
-            None => {
-                // No backing: return the template (or an empty Object[]).
-                return Ok(Some(template));
-            }
+    if let Some(elems) = real_enum_set_elements(ctx, this) {
+        return Ok(Some(Value::Object(Some(enum_values_to_typed_array(
+            ctx, &elems, template,
+        )))));
+    }
+    let backing = match es_get_backing(ctx, this) {
+        Some(b) => b,
+        None => {
+            // No backing — return the template (or an empty Object[]).
+            return Ok(Some(template));
         }
     };
-    let size = real_elems.as_ref().map_or_else(
-        || match backing.map(|b| ctx.get_field(b, 1)) {
-            Some(Value::Int(n)) => n.max(0) as usize,
-            _ => 0,
-        },
-        |elems| elems.len(),
-    );
-    let data = backing.and_then(|b| match ctx.get_field(b, 0) {
+    let size = match ctx.get_field(backing, 1) {
+        Value::Int(n) => n.max(0) as usize,
+        _ => 0,
+    };
+    let data = match ctx.get_field(backing, 0) {
         Value::Object(Some(o)) => Some(o),
         _ => None,
-    });
-
+    };
     // Pick destination: reuse template if big enough, else allocate fresh
     // with the same component as template (or a plain Object[] if template
     // is null).
@@ -5788,11 +5668,7 @@ fn native_es_to_array_typed(ctx: &mut dyn NativeContext, args: &[Value]) -> Meth
         }
         _ => ctx.new_array(cratonvm_types::ArrayElementType::Reference, size),
     };
-    if let Some(elems) = real_elems {
-        for (i, elem) in elems.iter().enumerate().take(size) {
-            ctx.set_array_element(target, i, *elem);
-        }
-    } else if let Some(d) = data {
+    if let Some(d) = data {
         let copy = size.min(ctx.array_length(d));
         for i in 0..copy {
             ctx.set_array_element(target, i, ctx.get_array_element(d, i));
