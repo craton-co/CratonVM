@@ -139,7 +139,7 @@ fn thread_start_handoff_grace() -> std::time::Duration {
         let millis = std::env::var("CRATONVM_THREAD_START_GRACE_MS")
             .ok()
             .and_then(|s| s.parse::<u64>().ok())
-            .unwrap_or(80);
+            .unwrap_or(0);
         std::time::Duration::from_millis(millis)
     })
 }
@@ -4879,14 +4879,13 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
 
         self.shared.thread_registry.set_join_handle(tid, handle);
         if !is_executor_worker {
-            // Give newly-started plain Java workers a short handoff window before
-            // the parent immediately closes an async context or enters a tight
-            // timed wait. Spring's @Async tests expose this under OSR: diagnostic
-            // ring recording or the watchdog thread adds enough pacing; without
-            // it, a Mockito-backed SimpleAsyncTaskExecutor worker can be starved
-            // long enough to hang class execution. Do not apply this to real
-            // ThreadPoolExecutor workers: CompletableFuture concurrency-limit
-            // tests depend on their first tasks entering within a 10 ms window.
+            // Preserve HotSpot-like parent scheduling by default: Thread.start()
+            // should not sleep the submitting thread. The env knob remains for
+            // diagnosing legacy starvation cases, but a non-zero default lets
+            // tiny async tasks complete before callers can close/cancel them.
+            // Do not apply this to real ThreadPoolExecutor workers: CompletableFuture
+            // concurrency-limit tests depend on their first tasks entering within
+            // a 10 ms window.
             let grace = thread_start_handoff_grace();
             if grace.is_zero() {
                 std::thread::yield_now();
