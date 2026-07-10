@@ -4,6 +4,11 @@ This folder collects CratonVM-only defects found while running upstream Java
 suites. The docs had grown to describe the **same underlying bug from several
 angles**; this index is the consolidated map. Read it first.
 
+## 2026-07-10 TestEncodingDetector retired; UTF-16/prolog-conflict residual split off
+
+- FIXED/RETIRED: [`encodingdetector-jsp-encoding-500-failures-FIXED.md`](../internal/fixed-suite-bugs/encodingdetector-jsp-encoding-500-failures-FIXED.md) - the StAX prolog-encoding fix (`1b60c103`) was already merged; verifying it end-to-end against the real `TestEncodingDetector` class required also picking up a concurrent session's fix for two independent blockers (`FileInputStream.<init>(String)` native-fallback backfill gap; `defineClass1` duplicate-define during repeated Tomcat webapp stop/start in one process, commit `45cc4f4f`). With both merged, the class went from 22/22 failing to 5/22 failing.
+- OPEN (new, split off): [`tomcat-08-07/encodingdetector-utf16-and-conflicting-prolog-residuals.md`](tomcat-08-07/encodingdetector-utf16-and-conflicting-prolog-residuals.md) — the remaining 5/22: 3 deliberately-invalid BOM/prolog-conflict fixtures now return 200 instead of HotSpot's 500, and 2 plain-`.jsp` UTF-16 (no-prolog) cases either decode garbled or hang.
+
 ## 2026-07-10 ES tdigest SortingDigestTests crash FIXED, 2 new correctness residuals found (OPEN)
 
 Re-verified `ES-CRASH-20260709-libs-tdigest-org-elasticsearch-tdigest-sortingdigesttests-0249530511.md` on current `dev` per its own note ("re-run on current dev before assigning ownership"). The crash is CONFIRMED fixed, and with it gone the tests now run far enough to expose two independent, previously-hidden bugs:
