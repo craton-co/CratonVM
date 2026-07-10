@@ -914,3 +914,240 @@ done
 (`MultiMethodRunner` is a ~25-line `Request.method`+`JUnitCore` loop over
 `(className, methodName)` pairs; not committed to the repo, trivial to
 recreate from this description if the original isn't available.)
+
+## 2026-07-10: register-invisible-root diagnostic pass — Case B confirmed (known gap, not a wrong-but-present precise map)
+
+Dedicated diagnostic follow-up to the "blank-response follow-up" SIGSEGV
+section above, per the recommended next step ("reproduce with
+`CRATONVM_DBG_PRECISE=1` / `CRATONVM_DBG_VERIFY_OOP_MAPS=1`... neither tried
+yet"). Isolated worktree `wt-regroots-precisedbg-20260710` (branch
+`investigate/regroots-precisedbg-20260710`) off a freshly-fetched
+`origin/dev` @ `ba23c02b`, release binary
+`cratonvm-regroots-precisedbg-20260710.bin`. **Diagnostic only — no code
+changes**, per this pass's scope.
+
+### First: the two named debug vars, verified from source (not assumed)
+
+Before running anything, grepped `vm/src/jit/conservative_roots.rs`,
+`jit/src/lib.rs`, `jit/src/x64.rs` to confirm what these two vars actually
+do:
+
+- `CRATONVM_DBG_PRECISE=1` — `remap_active_jit_frames` (the Stage-3 *moving*-GC
+  precise relocation walker) prints one `[PRECISE] remap: chain_entries=...
+  precise=... frames_walked=... maps_found=... slots_examined=...
+  slots_rewritten=... reg_size=...` line per call, so `precise=0` throughout a
+  run means no JIT frame ever carried precise-map metadata during any
+  relocation pass on that thread.
+- `CRATONVM_DBG_VERIFY_OOP_MAPS=1` — for every precise-scanned JIT frame during
+  a GC *mark* pass, runs `verify_precise_covers_conservative`: it diffs the
+  frame's oop-map slot union against a conservative sweep of the SAME
+  `[scanner_sp, frame_base)` band and logs `[VERIFY-OOP-MAPS] unmapped in-band
+  oop: ...` for any word that looks like a live heap pointer but isn't
+  recorded by any of the method's oop maps. Read-only; does not change scan
+  behavior.
+
+### Critical scoping fact, discovered from source (not in any existing doc,
+### and corrects a stale assumption several earlier sections in this doc make)
+
+`jit/src/x64.rs::precise_jit_maps_enabled()` — the actual gate for whether the
+JIT emits oop-map metadata at all — has been **DEFAULT ON since commit
+5b8864a0-era work landed 2026-07-07** ("re-flipped 2026-07-07", per its own
+doc comment). `CRATONVM_PRECISE_JIT_MAPS` (the name several earlier sections
+of this doc, and the DoHead doc, refer to as the opt-in switch) is now a
+**no-op**; the only live knob is the opt-*out* `CRATONVM_NO_PRECISE_JIT_MAPS=1`.
+So on the exact `dev` tip this crash reproduces on (2026-07-10, well after the
+flip), every freshly JIT-compiled method already gets: prologue frame-record,
+per-safepoint sp-id slots, operand-stack oop-map entries, a forward
+must-be-oop dataflow for locals (`compute_local_oop_masks`), and (since
+`moving_young` is off by default) a post-safepoint register reload
+(`emit_post_safepoint_reload`). The "no oop maps are written today" comment on
+`JitEntryGuard::enter_with_compiled` in `conservative_roots.rs` is stale,
+predating the flip — verified empirically below (`CRATONVM_DBG_PRECISE=1`
+shows `precise>0`, not `precise=0`, on ordinary runs).
+
+Second scoping fact: which GC actually runs during this crash. Live JIT
+frames make `gc_quiescence::is_active()` true almost continuously while the
+test loop runs, and `gen_heap.rs::collect_garbage_inner` explicitly diverts to
+the **non-moving young mark-sweep + selective promotion** whenever
+conservative JIT roots are live and `CRATONVM_MOVING_YOUNG` (a separate,
+still-default-off flag) isn't set — precisely *because*, per that function's
+own comment, "a semispace cannot pin a conservative JIT root nor rewrite a
+register-resident one, so some live nodes go stale after the swap." So the
+crash's actual collector is a **non-relocating mark-sweep**: nothing moves,
+`remap_active_jit_frames` is not exercised, and correctness depends entirely
+on the *marking* side finding every live root — i.e. exactly the
+precise-oop-map-plus-conservative-backstop machinery `CRATONVM_DBG_PRECISE`
+and `CRATONVM_DBG_VERIFY_OOP_MAPS` instrument.
+
+### The decisive source find: a NAMED, already-catalogued gap in the
+### default-on precise/local-tracking machinery — SB-CRASH-04
+
+`jit/src/x64.rs::emit_pre_safepoint_spill` (~line 8925), verbatim:
+
+> "SB-CRASH-04 (register-invisibility) — blind-spill the CURRENT value of
+> every used callee-saved GPR into its reserved frame slot. The local flush
+> above only covers register-resident *locals*; an oop can also live in a
+> callee-saved register as an operand-stack temporary that survives the call,
+> **or via a value the per-slot oop tracker fails to tag**."
+
+This blind-everything-spill mitigation exists but is gated behind
+`CRATONVM_JIT_SAFEPOINT_REG_SPILL` (`safepoint_reg_spill_enabled()`,
+`jit/src/x64.rs` ~line 2551) — **default OFF**, fully independent of the
+now-default-on `precise_maps`/oop-map gate. The default-on local-oop dataflow
+(`compute_local_oop_masks`) is a forward must-analysis that **intersects
+(AND) at merge points** ("First real predecessor seeds; later ones intersect")
+— a sound-for-"definitely oop" but incomplete-for-"actually still live oop"
+analysis by construction: any control-flow shape where a slot is oop-typed on
+one incoming edge and not on another under-reports that slot as non-oop at
+the merge, exactly the "value the per-slot oop tracker fails to tag" case the
+SB-CRASH-04 comment names. Operand-stack *temporaries* (not named locals) that
+outlive a call are explicitly called out as uncovered by the default path too.
+
+`docs/known-issues/README.md`'s own SB-CRASH-04 entries independently confirm
+this is not hypothetical: for the A3 repro, "every conservative trick
+(`CRATONVM_NO_JIT_SCAN_CACHE`, `CRATONVM_JIT_SAFEPOINT_REG_SPILL`,
+`CRATONVM_DBG_FULLSTACK_SCAN`, and combinations) still crashes — confirming
+the root is genuinely register-resident and unreachable by any stack scan."
+This is the same bug *family*, not necessarily the same site — the swallow-
+upload crash was not traced to a specific Java method/bytecode offset (the
+JIT code buffer is an anonymous mapping; `CRATONVM_DBG_JIT_NAMES=1` /
+`lookup_jit_method_name` would be needed for that, not attempted this pass —
+see "confidence" below).
+
+### Empirical run
+
+Ran the doc's own repro (`MultiMethodRunner`, 3× `AbortedPOSTClient` methods
+looped, JIT on, `--java-home /home/victor/jdk25`) with `core_pattern` +
+`ulimit -c unlimited` core dumping armed (same technique as the section
+above; `core_pattern` restored to its pre-session value afterward), across
+four configurations: both debug vars together, each alone, and a pure
+baseline. **Headline result: this session could NOT reproduce the SIGSEGV at
+all** — 50 completed process launches (heavy dual-flag: 6; `CRATONVM_DBG_PRECISE`
+alone: 15; `CRATONVM_DBG_VERIFY_OOP_MAPS` alone: 15; no debug flags: 11, plus
+an initial 3-attempt sanity check), covering well over 1,500 individual test-
+method invocations, produced zero SIGSEGVs. This is a materially lower hit
+rate than the prior session's (which needed ~10-30 invocations per crash).
+
+The dominant confound: **72% of all attempts (36/50) hung instead**, hitting
+the *already-documented, unrelated* `STW cross-thread JIT takeover is still
+waiting for cooperative mutators` bug (`vm/src/runtime/interpreter.rs`) before
+ever reaching a crash-eligible iteration count — the same hang the prior
+session also hit exploring this exact repro. `ps aux` on the shared host
+during the hunt showed the likely reason: multiple *other* concurrent
+sessions' heavyweight CratonVM processes pegged at high CPU for extended
+periods (an Elasticsearch `SortingDigestTests` run at 100% CPU for 10+
+minutes straight, a WildFly `domain.sh` boot) — genuine host contention that
+starves the STW barrier's bounded-rounds wait, independent of anything this
+pass did. (Side effect worth flagging for whoever investigates next: this
+session's `core_pattern` change is process-wide, so 13 *foreign* core dumps
+from other sessions' unrelated crashes accumulated in this pass's
+`/data/data/regroots-precisedbg-cores/` directory during the hunt — none of
+them are from this pass's own binary, verified by the complete absence of any
+`rc=139` result across all 50 attempts; left untouched since they belong to
+other in-flight investigations.)
+
+One genuine empirical data point was still obtained: in the clean
+(non-hung, non-crashed) runs under `CRATONVM_DBG_PRECISE=1`, `[PRECISE]
+remap:` fired on every `update_all_roots` call (confirming the promotion/
+compaction machinery does run and does produce non-trivial `pointer_map`s —
+observed sizes 8606 to 40843 entries) but **`chain_entries=0 precise=0
+frames_walked=0` every single time**, with `reg_size` (the live JIT-code-range
+count) climbing into the 180-191 range as the run warmed up. This confirms,
+directly, that the *moving*-GC relocation walker (`remap_active_jit_frames`)
+never has any JIT frame registered in its thread-local chain at the instant
+each collection's root-remap phase runs on the calling thread — consistent
+with (not contradicting) the "non-moving sweep + selective promotion is what
+actually runs while JIT frames are live" analysis above: promotions still
+happen (hence the large `pointer_map`s), but they promote only heap-interior
+objects that survived marking, not the JIT-frame-rooted objects themselves
+(those are pinned, per `gen_heap.rs`'s own "PINNING conservative roots +
+tenuring only heap-interior nodes" comment) — so `remap_active_jit_frames`
+finding nothing to do here is expected, not a bug in itself. It does confirm
+that whatever protects a JIT-rooted object from going stale is entirely a
+function of the **marking** side (which `CRATONVM_DBG_VERIFY_OOP_MAPS` probes)
+rather than the relocation side — which is exactly the piece SB-CRASH-04
+documents as incomplete by default.
+
+### Verdict: Case B (known gap), not Case A — with a specific, named root cause
+
+The evidence points cleanly to **Case B**, but more precisely than the two
+generic cases originally sketched: this is not "the crashing safepoint was
+never in a precise-mapped method at all" (precise maps are default-on and
+engage for essentially every JIT-compiled method reached in this repro) — it
+is that the default-on precise/local-tracking machinery has a **named,
+already-catalogued, structurally-inherent incompleteness** (SB-CRASH-04) for
+exactly the shape of value the crash's own disassembly shows (a
+class/identity-comparison fast path reading a stack-resident temporary that
+should have held a live object reference and instead held obvious garbage,
+`0xffffffff94a08430` / `0x198ca4f8` — neither a plausible tagged heap pointer
+nor a "points at now-freed-but-still-mapped memory" shape, consistent with
+the slot's backing memory having been reclaimed as garbage and reused for
+unrelated data). The two structural facts that jointly explain it:
+
+1. The GC that actually runs while this test's JIT frames are live is the
+   **non-moving young sweep**, which relies entirely on *marking* (not
+   relocation) to keep every live JIT-rooted object alive. Marking IS
+   backstopped by a full conservative sweep of `[scanner_sp, frame_base)` for
+   every frame that has a `JitEntryGuard` chain entry — but that backstop only
+   covers what is *in that thread's chain and in-band on the stack at scan
+   time*. It provides zero protection for a value that is register-resident
+   only, or that belongs to a call shape that never pushes a chain entry for
+   the frame in question (an inlined callee, certain nested-call shapes) — the
+   same "narrower-than-it-looks" property the OSR/nested-call machinery in
+   `conservative_roots.rs` and `precise-jit-maps-default.md` repeatedly flags
+   as an accepted, un-closed residual.
+2. The one general-purpose mitigation this codebase already built for exactly
+   this failure mode — `CRATONVM_JIT_SAFEPOINT_REG_SPILL` (blind-spill every
+   used register at every safepoint, `emit_pre_safepoint_spill`) — is **not
+   engaged by default**. `docs/known-issues/README.md`'s own SB-CRASH-04
+   history shows that even with it (and every other conservative-scan
+   diagnostic knob) turned on, at least one known repro in this exact family
+   (`MinRegexProbe`/A3) still crashes, "confirming the root is genuinely
+   register-resident and unreachable by any stack scan." `docs/feature-
+   designs/precise-jit-maps-default.md`'s own acceptance-sweep plan
+   explicitly lists "tomcat-style register-invisibility reclaims named in the
+   README" as work the precise-maps-default rollout has **not yet validated**
+   — i.e. the project's own roadmap already anticipated that a Tomcat-shaped
+   crash like this one could still be open under the current default.
+
+Neither of the two mechanisms this pass's task description offered as
+alternatives to Case B applies: it is not that a *map exists, covers this
+exact safepoint, and is wrong* (Case A) — the map machinery's own doc comments
+are explicit that it is *incomplete by construction* for register-resident
+operand-stack temporaries and certain locals, with a known (but default-off)
+partial fix. This is the deep, general-infrastructure gap, not a narrow,
+easily-patchable soundness bug in one map-generation code path.
+
+### Confidence: high on the classification, not fully closed on the specific site
+
+High confidence that this is the SB-CRASH-04 register-invisible-root family
+(Case B), based on: (a) the structural argument above, grounded in specific,
+quoted source (not inference from symptom-matching alone), (b) the crash
+disassembly's own signature (garbage-looking, non-tagged-pointer bit patterns
+in exactly the "read a value expected to be a live oop" position) matching
+the family's established fingerprint from three independent prior sessions
+(DoHead, Hibernate global-temp-table, and this doc's own prior SIGSEGV
+section), and (c) the project's own design docs independently anticipating
+this exact gap for this exact application (Tomcat) ahead of any of these
+investigations.
+
+**Not fully closed**, and explicitly flagged as such: this pass could not
+reproduce the crash fresh, so — unlike the "SocketWrapperBase.lock" bisection
+earlier in this doc — there is no *this-session* core dump or debug log tying
+the specific faulting PC/frame to a specific Java method or to a live
+`CRATONVM_DBG_VERIFY_OOP_MAPS` "unmapped in-band oop" hit. It remains
+possible (though it would be a coincidence given how well the signature
+matches) that the swallow-upload crash specifically is a related-but-distinct
+bug in the same fragile machinery (e.g. a frame_base/scanner_sp bookkeeping
+error for one particular nested-call shape, rather than a plain uncaptured
+register) rather than the generic "value lived only in a register" case.
+Recommended next steps for whoever revisits this with a quieter host: (1)
+repeat this pass's exact repro with `CRATONVM_JIT_SAFEPOINT_REG_SPILL=all`
+added — if it measurably suppresses the crash (even partially, matching the
+DoHead doc's "still crashed 3/6" outcome for a different repro), that is
+strong independent confirmation; if it does not help at all, that points
+toward the rarer "unreachable by any stack scan" or bookkeeping-bug subtype
+instead; (2) once a fresh core is caught, cross-reference its crash PC against
+`CRATONVM_DBG_JIT_NAMES=1`'s `lookup_jit_method_name` output (not attempted
+this pass) to identify the actual Java method/bytecode offset, which no prior
+session in this bug's history has done.
