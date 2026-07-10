@@ -21162,6 +21162,133 @@ fn force_native_over_real_jdk_bytecode(
         return true;
     }
 
+    if class_name == "java/nio/ByteBuffer"
+        && matches!(
+            (method_name, method_descriptor),
+            ("allocate", "(I)Ljava/nio/ByteBuffer;")
+                | ("allocateDirect", "(I)Ljava/nio/ByteBuffer;")
+                | ("wrap", "([B)Ljava/nio/ByteBuffer;")
+                | ("wrap", "([BII)Ljava/nio/ByteBuffer;")
+                | ("get", "()B")
+                | ("get", "(I)B")
+                | ("get", "([B)Ljava/nio/ByteBuffer;")
+                | ("get", "([BII)Ljava/nio/ByteBuffer;")
+                | ("put", "(B)Ljava/nio/ByteBuffer;")
+                | ("put", "(IB)Ljava/nio/ByteBuffer;")
+                | ("put", "([B)Ljava/nio/ByteBuffer;")
+                | ("put", "([BII)Ljava/nio/ByteBuffer;")
+                | ("put", "(Ljava/nio/ByteBuffer;)Ljava/nio/ByteBuffer;")
+                | ("getShort", "()S")
+                | ("getShort", "(I)S")
+                | ("putShort", "(S)Ljava/nio/ByteBuffer;")
+                | ("putShort", "(IS)Ljava/nio/ByteBuffer;")
+                | ("getChar", "()C")
+                | ("getChar", "(I)C")
+                | ("putChar", "(C)Ljava/nio/ByteBuffer;")
+                | ("putChar", "(IC)Ljava/nio/ByteBuffer;")
+                | ("getInt", "()I")
+                | ("getInt", "(I)I")
+                | ("putInt", "(I)Ljava/nio/ByteBuffer;")
+                | ("putInt", "(II)Ljava/nio/ByteBuffer;")
+                | ("getLong", "()J")
+                | ("getLong", "(I)J")
+                | ("putLong", "(J)Ljava/nio/ByteBuffer;")
+                | ("putLong", "(IJ)Ljava/nio/ByteBuffer;")
+                | ("getFloat", "()F")
+                | ("getFloat", "(I)F")
+                | ("putFloat", "(F)Ljava/nio/ByteBuffer;")
+                | ("getDouble", "()D")
+                | ("putDouble", "(D)Ljava/nio/ByteBuffer;")
+                | ("flip", "()Ljava/nio/Buffer;")
+                | ("flip", "()Ljava/nio/ByteBuffer;")
+                | ("clear", "()Ljava/nio/Buffer;")
+                | ("clear", "()Ljava/nio/ByteBuffer;")
+                | ("rewind", "()Ljava/nio/Buffer;")
+                | ("rewind", "()Ljava/nio/ByteBuffer;")
+                | ("mark", "()Ljava/nio/Buffer;")
+                | ("mark", "()Ljava/nio/ByteBuffer;")
+                | ("reset", "()Ljava/nio/Buffer;")
+                | ("position", "()I")
+                | ("position", "(I)Ljava/nio/Buffer;")
+                | ("position", "(I)Ljava/nio/ByteBuffer;")
+                | ("limit", "()I")
+                | ("limit", "(I)Ljava/nio/Buffer;")
+                | ("limit", "(I)Ljava/nio/ByteBuffer;")
+                | ("capacity", "()I")
+                | ("remaining", "()I")
+                | ("hasRemaining", "()Z")
+                | ("compact", "()Ljava/nio/ByteBuffer;")
+                | ("array", "()[B")
+                | ("arrayOffset", "()I")
+                | ("hasArray", "()Z")
+                | ("isDirect", "()Z")
+                | ("isReadOnly", "()Z")
+                | ("order", "()Ljava/nio/ByteOrder;")
+                | ("order", "(Ljava/nio/ByteOrder;)Ljava/nio/ByteBuffer;")
+                | ("slice", "()Ljava/nio/ByteBuffer;")
+                | ("duplicate", "()Ljava/nio/ByteBuffer;")
+                | ("equals", "(Ljava/lang/Object;)Z")
+                | ("hashCode", "()I")
+                | ("compareTo", "(Ljava/nio/ByteBuffer;)I")
+                | ("toString", "()Ljava/lang/String;")
+        )
+    {
+        return true;
+    }
+
+    if class_name == "java/util/concurrent/LinkedBlockingDeque"
+        && method_name == "clear"
+        && method_descriptor == "()V"
+    {
+        return true;
+    }
+
+    if class_name == "jdk/internal/util/ArraysSupport"
+        && matches!(
+            (method_name, method_descriptor),
+            ("vectorizedHashCode", "(Ljava/lang/Object;IIII)I")
+                | (
+                    "vectorizedMismatch",
+                    "(Ljava/lang/Object;JLjava/lang/Object;JII)I"
+                )
+                | ("mismatch", "([B[BI)I")
+                | ("mismatch", "([BI[BII)I")
+                | ("mismatch", "([C[CI)I")
+                | ("mismatch", "([CI[CII)I")
+        )
+    {
+        return true;
+    }
+
+    if class_name == "java/io/BufferedInputStream"
+        && matches!(
+            (method_name, method_descriptor),
+            ("read", "()I")
+                | ("read", "([BII)I")
+                | ("skip", "(J)J")
+                | ("available", "()I")
+                | ("mark", "(I)V")
+                | ("reset", "()V")
+                | ("markSupported", "()Z")
+                | ("close", "()V")
+        )
+    {
+        return true;
+    }
+
+    if (matches!(
+        class_name,
+        "java/lang/Iterable" | "java/util/Collection" | "java/util/Set" | "java/util/EnumSet"
+    ) && method_name == "iterator"
+        && method_descriptor == "()Ljava/util/Iterator;")
+    {
+        return true;
+    }
+
+    if class_name == "java/util/Iterator" && matches!(method_name, "hasNext" | "next" | "remove") {
+        return true;
+    }
+
     if class_name == "java/lang/Thread"
         && method_name == "getThreadGroup"
         && method_descriptor == "()Ljava/lang/ThreadGroup;"
@@ -22166,7 +22293,18 @@ fn force_native_over_real_jdk_bytecode(
         // delegates to the base classpath (where `<init>` already registered the
         // loader's URLs), matching HotSpot.
         || (class_name == "java/net/URLClassLoader"
-            && matches!(method_name, "findClass" | "findResource" | "findResources"))
+            && (matches!(method_name, "findClass" | "findResource" | "findResources")
+                || (method_name == "<init>"
+                    && matches!(
+                        method_descriptor,
+                        "([Ljava/net/URL;)V"
+                            | "([Ljava/net/URL;Ljava/lang/ClassLoader;)V"
+                            | "(Ljava/lang/String;[Ljava/net/URL;Ljava/lang/ClassLoader;)V"
+                            | "([Ljava/net/URL;Ljava/lang/ClassLoader;Ljava/net/URLStreamHandlerFactory;)V"
+                            | "(Ljava/lang/String;[Ljava/net/URL;Ljava/lang/ClassLoader;Ljava/net/URLStreamHandlerFactory;)V"
+                            | "([Ljava/net/URL;Ljava/security/AccessControlContext;)V"
+                            | "(Ljava/lang/String;[Ljava/net/URL;Ljava/lang/ClassLoader;Ljava/security/AccessControlContext;)V"
+                    ))))
         || (matches!(
             class_name,
             "jdk/internal/loader/URLClassPath" | "sun/misc/URLClassPath"
@@ -22301,6 +22439,17 @@ fn redefine_immune_forced_native(
         || is_stamped_lock_native_override(class_name, method_name, method_descriptor)
 }
 
+pub(crate) fn should_force_registered_native_over_bytecode(
+    shared: &SharedVm,
+    class_name: &str,
+    method_name: &str,
+    method_descriptor: &str,
+) -> bool {
+    force_native_over_real_jdk_bytecode(class_name, method_name, method_descriptor)
+        && (!native_shadow_suppressed_by_redefine(shared, class_name)
+            || redefine_immune_forced_native(class_name, method_name, method_descriptor))
+}
+
 /// Dispatch a force-native override via `safe_native_call`, pushing any return
 /// value onto the caller operand stack.
 #[inline]
@@ -22323,17 +22472,17 @@ fn intercept_force_registered_native(
             force_native_over_real_jdk_bytecode(class_name, method_name, method_descriptor),
         );
     }
-    if !force_native_over_real_jdk_bytecode(class_name, method_name, method_descriptor) {
-        return None;
-    }
     // A JVMTI agent that redefined this class (e.g. a Mockito inline mock)
     // makes its woven bytecode authoritative — cede to it instead of forcing
     // the native, so the instrumentation advice runs. Reflection-metadata
     // natives are exempt (see `redefine_immune_reflection_native`): the real
     // bytecode cannot reproduce them under CratonVM.
-    if native_shadow_suppressed_by_redefine(shared, class_name)
-        && !redefine_immune_forced_native(class_name, method_name, method_descriptor)
-    {
+    if !should_force_registered_native_over_bytecode(
+        shared,
+        class_name,
+        method_name,
+        method_descriptor,
+    ) {
         return None;
     }
     let cb = shared

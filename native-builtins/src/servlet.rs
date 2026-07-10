@@ -3207,6 +3207,11 @@ pub(crate) fn register_s2_nio(r: &mut NativeMethodRegistry) {
     register_s2_selector(r);
 }
 
+pub(crate) fn register_s2_bytebuffer_essentials(r: &mut NativeMethodRegistry) {
+    register_s2_bytebuffer(r);
+    register_s2_byteorder(r);
+}
+
 // ---- ByteBuffer ------------------------------------------------------------
 
 #[allow(clippy::too_many_lines)]

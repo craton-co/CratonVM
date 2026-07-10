@@ -2335,7 +2335,8 @@ pub fn native_al_iterator(ctx: &mut dyn NativeContext, args: &[Value]) -> Method
         // and iterate the snapshot — mirroring the EnumSet path below. The
         // Path-class `iterator()` native (phases_late) still serves direct
         // `path.iterator()` calls.
-        if cls == "java/util/RegularEnumSet"
+        if cls == "java/util/EnumSet"
+            || cls == "java/util/RegularEnumSet"
             || cls == "java/util/JumboEnumSet"
             || cls == "java/nio/file/Path"
         {
@@ -7312,6 +7313,14 @@ fn native_hs_iterator(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
         Some(Value::Object(Some(obj))) => *obj,
         _ => return Ok(Some(Value::Object(None))),
     };
+    if let Some(cls) = ctx.class_name_of_id(ctx.class_id_of_object(this)) {
+        if cls == "java/util/EnumSet"
+            || cls == "java/util/RegularEnumSet"
+            || cls == "java/util/JumboEnumSet"
+        {
+            return native_al_iterator(ctx, args);
+        }
+    }
     resync_view_set(ctx, this);
     let backing = match hs_backing_map(ctx, this) {
         Some(m) => m,
@@ -33550,6 +33559,7 @@ fn register_linked_blocking_deque_stub_natives(r: &mut NativeMethodRegistry) {
     );
     r.register(lbd, "size", "()I", native_lbq_size);
     r.register(lbd, "isEmpty", "()Z", native_lbq_is_empty);
+    r.register(lbd, "clear", "()V", native_lbq_clear);
     r.register(
         lbd,
         "iterator",

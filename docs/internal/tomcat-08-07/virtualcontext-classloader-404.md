@@ -1,6 +1,61 @@
 # TestVirtualContext — virtual classloader resource returns 404 instead of 200
 
-**Status:** OPEN. **Severity:** medium. **HotSpot:** PASS.
+**Status:** FIXED (2026-07-10). **Severity:** medium. **HotSpot:** PASS.
+
+## 2026-07-10 resolution
+
+Fixed on branch `codex/fix-virtualcontext-threadgroup-20260709`.
+
+Final root causes:
+
+- Runtime-generated Jasper JSP classes were found through
+  `URLClassLoader.findClass`, but CratonVM defined them through the global
+  application loader. The JSP then used the wrong defining classloader and could
+  not see virtual webapp resources under `WEB-INF/classes`.
+- `ClassLoader.getResources(String)` for URLClassLoader subclasses returned only
+  the receiver's `findResources` results. For JasperLoader this meant the JSP
+  scratch directory only; HotSpot returns parent resources first, then receiver
+  resources, so the webapp parent loader's virtual resource roots were missing
+  from `classpathGetResources.jsp`.
+- Jasper compilation had also been blocked by `FileInputStream.<init>(String)`
+  native fallback state: the backing `FileDescriptor`, `path`, `closeLock`, and
+  `closed` fields were not backfilled, so buffered source reads could return EOF
+  from non-empty generated JSP source files.
+- Post-merge validation exposed a Tomcat shutdown edge where
+  `WebappClassLoaderBase.clearReferencesJdbc()` can reach the active
+  `defineClass1` native after `JdbcLeakPrevention` is already owned by the same
+  loader namespace. The final branch returns that same-loader mirror for this
+  narrow duplicate-define case instead of surfacing a lifecycle-breaking
+  `ClassFormatError`.
+
+Key fixes:
+
+- `URLClassLoader.findClass` now tries the receiver's own recorded URLs first and
+  defines matching class bytes under that receiver's loader namespace, recording
+  the exact defining loader object for `Class.getClassLoader()`.
+- `ClassLoader.getResources` now preserves parent-first semantics for
+  user-defined loaders, merging parent `getResources(name)` results with the
+  receiver's `findResources(name)` results.
+- `FileInputStream.open0` backfills the real-JDK instance fields needed by
+  `InputStreamReader` / `BufferedReader` paths after synthetic constructor
+  fallback.
+- The active `ClassLoader.defineClass0/1/2` natives now recover only from
+  backend "already defined" errors when the exact same loader namespace already
+  owns the requested class.
+
+Validation on Azure host with final binary
+`/data/data/bin/cratonvm-virtualcontext-threadgroup-20260709-r37`:
+
+- `org.junit.runner.JUnitCore org.apache.catalina.loader.TestVirtualContext`:
+  `OK (2 tests)`.
+- Focused JSP page probe:
+  `classpathGetResourceAsStream.jsp?path=rsrc/resourceA.properties` returned
+  HTTP 200 with `resourceAInWebInfClasses=true`; `classpathGetResources.jsp`
+  listed the expected webapp-a, webapp-b, WEB-INF/lib JAR, target/classes, and
+  dependent library resource URLs.
+- Spot regressions: `FisReadProbe`, `ReaderReadProbe`, `CharArrayEqualsProbe`,
+  `VectorMismatchProbe`, `EcjClassFileReaderProbe`, and `EcjJrtLookupProbe`
+  passed.
 
 ## Summary
 
