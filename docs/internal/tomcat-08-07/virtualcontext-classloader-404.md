@@ -21,6 +21,12 @@ Final root causes:
   native fallback state: the backing `FileDescriptor`, `path`, `closeLock`, and
   `closed` fields were not backfilled, so buffered source reads could return EOF
   from non-empty generated JSP source files.
+- Post-merge validation exposed a Tomcat shutdown edge where
+  `WebappClassLoaderBase.clearReferencesJdbc()` can reach the active
+  `defineClass1` native after `JdbcLeakPrevention` is already owned by the same
+  loader namespace. The final branch returns that same-loader mirror for this
+  narrow duplicate-define case instead of surfacing a lifecycle-breaking
+  `ClassFormatError`.
 
 Key fixes:
 
@@ -33,9 +39,12 @@ Key fixes:
 - `FileInputStream.open0` backfills the real-JDK instance fields needed by
   `InputStreamReader` / `BufferedReader` paths after synthetic constructor
   fallback.
+- The active `ClassLoader.defineClass0/1/2` natives now recover only from
+  backend "already defined" errors when the exact same loader namespace already
+  owns the requested class.
 
 Validation on Azure host with final binary
-`/data/data/bin/cratonvm-virtualcontext-threadgroup-20260709-r35`:
+`/data/data/bin/cratonvm-virtualcontext-threadgroup-20260709-r37`:
 
 - `org.junit.runner.JUnitCore org.apache.catalina.loader.TestVirtualContext`:
   `OK (2 tests)`.
