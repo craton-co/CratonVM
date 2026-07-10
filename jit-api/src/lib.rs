@@ -325,6 +325,23 @@ pub struct JitRuntimeHelpers {
     /// calls through `invoke_dispatch` (historical behaviour). Appended at
     /// the END of the struct so all prior golden offsets stay stable.
     pub self_call_stack_guard: usize,
+    /// Guarded inline `getfield` — address of the GC's process-global
+    /// `JIT_REGION_BOUNDS` table (`[yf_base, yf_end, yt_base, yt_end,
+    /// og_base, og_end]`, six consecutive `AtomicUsize` words), NOT a
+    /// function pointer.
+    ///
+    /// When non-zero, the single-pass backend's default `getfield` arm emits
+    /// an inline receiver guard — null/alignment bit-tests plus the same
+    /// three-region `[base, end)` containment check `jit_getfield`'s
+    /// `is_object_address` gate performs — and on success reads the field
+    /// cell directly (a receiver inside a published region points at arena
+    /// memory that stays mapped, so the raw load cannot fault). Guard
+    /// failures branch to the checked `jit_getfield` helper, preserving its
+    /// NPE/sentinel semantics for null and implausible receivers. `0` = not
+    /// wired (G1/ZGC backends, or before the first publish) → every getfield
+    /// keeps the checked-helper path. Appended at the END of the struct so
+    /// all prior golden offsets stay stable.
+    pub region_bounds_addr: usize,
 }
 
 /// Classifies each field of [`JitRuntimeHelpers`] for the validator.
@@ -461,6 +478,9 @@ helper_fields! {
     (jit_frem,                       FieldKind::RequiredPtr),
     (jit_drem,                       FieldKind::RequiredPtr),
     (self_call_stack_guard,          FieldKind::OptionalPtr),
+    // NOT a pointer: address of the GC's JIT_REGION_BOUNDS table, baked as an
+    // immediate by the guarded inline getfield. 0 = not wired (helper-only).
+    (region_bounds_addr,             FieldKind::Offset),
 }
 
 // Compile-time integrity check: the macro-generated NUM_FIELDS must
@@ -486,7 +506,7 @@ const _: () = assert!(
 // struct field AND its macro entry simultaneously would still satisfy
 // the ratio assert above and silently change the JIT ABI.
 const _: () = assert!(
-    JitRuntimeHelpers::NUM_FIELDS == 47,
+    JitRuntimeHelpers::NUM_FIELDS == 48,
     "JitRuntimeHelpers field count changed — bump the literal here and update \
      the golden-offset test in mod tests if the change is intentional",
 );
@@ -641,6 +661,7 @@ mod tests {
             jit_frem: 0x1130,
             jit_drem: 0x1138,
             self_call_stack_guard: 0x1140,
+            region_bounds_addr: 0x1148,
         }
     }
 
@@ -859,6 +880,7 @@ mod tests {
             jit_frem: 0,
             jit_drem: 0,
             self_call_stack_guard: 0,
+            region_bounds_addr: 0,
         };
         assert_eq!(h.newarray, 0);
         assert_eq!(h.write_barrier, 0);
@@ -1034,8 +1056,8 @@ mod tests {
             std::mem::size_of::<JitRuntimeHelpers>(),
             JitRuntimeHelpers::NUM_FIELDS * FIELD_WIDTH,
         );
-        // And the macro-driven count is the canonical 47.
-        assert_eq!(JitRuntimeHelpers::NUM_FIELDS, 47);
+        // And the macro-driven count is the canonical 48.
+        assert_eq!(JitRuntimeHelpers::NUM_FIELDS, 48);
     }
 
     #[test]
@@ -1268,6 +1290,11 @@ mod tests {
                 "self_call_stack_guard",
                 std::mem::offset_of!(JitRuntimeHelpers, self_call_stack_guard),
             ),
+            (
+                47,
+                "region_bounds_addr",
+                std::mem::offset_of!(JitRuntimeHelpers, region_bounds_addr),
+            ),
         ];
 
         // (a) Each field is at its documented sequential byte offset.
@@ -1304,8 +1331,8 @@ mod tests {
 
     #[test]
     fn jit_runtime_helpers_all_fields_classified() {
-        // The macro must classify every field. 39 RequiredPtr + 4
-        // Offset + 4 OptionalPtr = 47. A new field whose classification
+        // The macro must classify every field. 39 RequiredPtr + 5
+        // Offset + 4 OptionalPtr = 48. A new field whose classification
         // is omitted will fail to compile (the macro requires both
         // arms); this test pins the *counts* so a reclassification
         // (e.g. demoting a RequiredPtr to OptionalPtr) is also a
@@ -1323,7 +1350,7 @@ mod tests {
         let off = f.iter().filter(|e| e.kind == FieldKind::Offset).count();
         assert_eq!(req, 39, "required-pointer count drifted");
         assert_eq!(opt, 4, "optional-pointer count drifted");
-        assert_eq!(off, 4, "offset-field count drifted");
+        assert_eq!(off, 5, "offset-field count drifted");
         assert_eq!(req + opt + off, JitRuntimeHelpers::NUM_FIELDS);
     }
 

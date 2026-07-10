@@ -323,9 +323,12 @@ opt-level = 3
 lto = "fat"
 codegen-units = 1
 panic = "unwind"
-strip = "debuginfo"
+# Perf-session note (perf/throughput-20260710): line-tables-only + no strip so
+# the PDB carries function symbols for sampling profilers (cdb attach). No
+# codegen impact — only fatter debug artifacts on disk.
+strip = "none"
 incremental = false
-debug = false
+debug = "line-tables-only"
 
 # Same as release but keep line-tables-only debuginfo, useful for
 # perf/profilers (perf record, samply, vtune) without paying the size

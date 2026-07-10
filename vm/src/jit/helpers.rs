@@ -6813,6 +6813,10 @@ pub fn build_helpers() -> JitRuntimeHelpers {
         // BUG-1 companion — native-stack headroom guard enabling direct
         // (non-dispatch) self-recursive CALLs. See `jit_self_call_stack_guard`.
         self_call_stack_guard: jit_self_call_stack_guard as *const () as usize,
+        // Guarded inline getfield — address of the GC's process-global region
+        // bounds table. Non-zero even under G1/ZGC (the table just stays
+        // all-zero there, so every guard falls through to the checked helper).
+        region_bounds_addr: cratonvm_gc::jit_region_bounds_addr(),
     }
 }
 

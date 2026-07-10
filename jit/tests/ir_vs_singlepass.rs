@@ -83,6 +83,7 @@ fn dummy_helpers() -> JitRuntimeHelpers {
         jit_frem: s,
         jit_drem: s,
         self_call_stack_guard: 0,
+        region_bounds_addr: 0,
     }
 }
 
@@ -2294,6 +2295,7 @@ fn frem_helpers() -> JitRuntimeHelpers {
         jit_frem: test_frem as *const () as usize,
         jit_drem: test_drem as *const () as usize,
         self_call_stack_guard: 0,
+        region_bounds_addr: 0,
         ..dummy_helpers()
     }
 }

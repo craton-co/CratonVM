@@ -459,6 +459,62 @@ impl HeapStats {
     }
 }
 
+/// Process-global mirror of the generational heap's three region `[base, end)`
+/// bounds — layout `[yf_base, yf_end, yt_base, yt_end, og_base, og_end]`.
+///
+/// The JIT's guarded inline `getfield` bakes this table's address as an
+/// immediate and emits the same containment check `is_object_address` performs
+/// as its first gate: a receiver inside one of these `[base, end)` ranges
+/// points into an arena that is mapped for the heap's lifetime, so a raw field
+/// load cannot fault; anything else branches to the checked `jit_getfield`
+/// helper (which throws the NPE / runs the full validation). Updated in
+/// `store_region_bounds_locked` alongside the per-heap `region_bounds` cache —
+/// same freshness contract (construction + GC start/end), same
+/// Acquire/Release pairing.
+///
+/// All-zero entries match nothing, so before the first publish — or for heap
+/// backends that don't publish (G1/ZGC) — every guarded site simply falls
+/// through to the helper. [`GenerationalHeap`]'s `Drop` re-zeroes the table so
+/// a torn-down heap (embedding / unit tests) can never leave stale bounds that
+/// would admit a pointer into freed arena memory.
+#[repr(C)]
+pub struct JitRegionBoundsTable {
+    pub words: [AtomicUsize; 6],
+}
+
+pub static JIT_REGION_BOUNDS: JitRegionBoundsTable = JitRegionBoundsTable {
+    // Written out element-by-element (not `[const { ... }; 6]`) to stay under
+    // the workspace MSRV — inline-const repeat expressions landed in 1.79.
+    words: [
+        AtomicUsize::new(0),
+        AtomicUsize::new(0),
+        AtomicUsize::new(0),
+        AtomicUsize::new(0),
+        AtomicUsize::new(0),
+        AtomicUsize::new(0),
+    ],
+};
+
+/// Address of [`JIT_REGION_BOUNDS`] for the JIT helpers table
+/// (`JitRuntimeHelpers::region_bounds_addr`).
+pub fn jit_region_bounds_addr() -> usize {
+    &JIT_REGION_BOUNDS as *const _ as usize
+}
+
+impl Drop for GenerationalHeap {
+    fn drop(&mut self) {
+        // The guarded inline getfield's safety argument is "anything inside the
+        // published bounds points at a mapped arena". Once this heap's arenas
+        // free, that stops holding — zero the global table so every guarded
+        // site degrades to the checked helper. (If another live heap owns the
+        // table it re-publishes at its next GC; until then helper-only is a
+        // safe, merely slower, state.)
+        for w in JIT_REGION_BOUNDS.words.iter() {
+            w.store(0, Ordering::Release);
+        }
+    }
+}
+
 /// A generational garbage-collected heap.
 ///
 /// Young generation: two semi-spaces (from/to) using Cheney copying.
@@ -678,9 +734,13 @@ impl GenerationalHeap {
             (yt.base_ptr() as usize, yt.capacity()),
             (og.base_ptr() as usize, og.capacity()),
         ];
-        for (slot, (base, cap)) in self.region_bounds.iter().zip(pairs) {
+        for (i, (slot, (base, cap))) in self.region_bounds.iter().zip(pairs).enumerate() {
             slot.0.store(base, Ordering::Release);
             slot.1.store(base.wrapping_add(cap), Ordering::Release);
+            // Mirror into the process-global table the JIT's guarded inline
+            // getfield bakes as an absolute address (see JIT_REGION_BOUNDS).
+            JIT_REGION_BOUNDS.words[i * 2].store(base, Ordering::Release);
+            JIT_REGION_BOUNDS.words[i * 2 + 1].store(base.wrapping_add(cap), Ordering::Release);
         }
     }
 
