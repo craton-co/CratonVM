@@ -292,14 +292,50 @@ old-gen concurrent sweep, so it would not have caught the now-fixed defects
 either; confirm before trusting a "clean" `SWEEP_ZERO` run on any old-gen
 corruption).
 
+5. **ES `BufferUnderflowException.cause` -> live-but-wrong `Object`, single-
+   threaded, no `GC_STRESS` needed (2026-07-10).** Found independently while
+   investigating
+   `docs/known-issues/elasticsearch-suite/ES-FAIL-FAMILY-20260710-vector-codec-exception-cause-object.md`
+   (`ES93FlatBFloat16VectorFormatTests.testMultiClose`, default heap, no
+   `CRATONVM_REAL_FORKJOINPOOL`/`CRATONVM_DBG_GC_STRESS`, reproduces under
+   both JIT-on and `--nojit`). Different symptom shape from faces 1-4 (a
+   *valid, live* `Value::Object` pointer lands in the field, not a raw
+   untagged pointer or a lost tag) but the same `CRATONVM_DBG_CELLCORRUPT`
+   tool caught the same underlying signature: a `dump_corrupt_cell_holder`
+   shift-test proving an **8-byte element-addressing misalignment** on a
+   1-element `Object[]` array (its element decodes as garbage at the nominal
+   offset, valid 8 bytes earlier) — the same "header/field-cell aliasing,
+   off-by-8-within-a-16-byte-`Value`-cell" shape as
+   `docs/internal/gaps/bc-math-ec-gc-0x4-handoff.md` §4's structural clue.
+   Confirmed NOT a GC-relocation/self-forwarding bug (new regression test
+   `self_referential_field_survives_promotion` in `gc/src/gen_heap.rs`
+   passes cleanly; the victim object's address is provably identical at
+   write and read time on the real repro) and NOT a plain interpreted
+   `putfield` (new `[WATCHFIELD]` java-stack hook at `Instruction::Putfield`
+   never fires). Full evidence, a new dynamic-watchpoint mechanism
+   (`cratonvm_gc::heap::{set_dynamic_watch,dynamic_watch_addr}` +
+   `NativeContext::dbg_set_watch_cell`), and `CRATONVM_DBG_CAUSE` are on
+   branch `fix/es-vector-codec-exception-cause-object-20260710` (not yet
+   merged). **Worth trying against this face-1/bc-math-ec cluster too**: the
+   ES repro is single-threaded and deterministic (no stress lane, no load
+   dependence) — likely the cheapest reliable repro this whole investigation
+   has had so far for the shared "off-by-8" structural clue.
+
 ## Next steps
 
 1. Reproduce each face in isolation with a targeted, deterministic repro
    (parallel to `HwBlocked.java` in `repros/A4-fork6/`) rather than the noisy
-   aggressive stress lane.
+   aggressive stress lane. **Face 5's ES repro may already BE this** — it is
+   already single-threaded, default-heap, and deterministic; try it first
+   before building a new one.
 2. For face 1: check the young-arena `grow()`/realloc path for a stale
    pre-grow address baked into any long-lived structure (thread-local cache,
    GC diagnostic sample, etc.) that survives past the grow.
 3. For face 2: determine whether this is the SAME register-only oop gap as
    A4, or a distinct tag-tracking bug in the compact-ref-fields layout under
    `CRATONVM_REAL_FORKJOINPOOL`.
+4. For face 5 (and possibly 1): build the hardware watchpoint
+   `bc-math-ec-gc-0x4-handoff.md` §6.2 recommended but never built (VEH
+   infra already in `vm/src/runtime/crash_handler.rs`) — software
+   watchpoints have now been tried and found wanting on two separate
+   corruption hunts in this codebase.

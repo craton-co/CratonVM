@@ -2336,6 +2336,18 @@ pub(crate) fn bb_write_hb(ctx: &mut dyn NativeContext, buf: ObjectRef, arr: Obje
     ctx.set_field_by_name(buf, "limit", Value::Int(cap));
     ctx.set_field_by_name(buf, "capacity", Value::Int(cap));
     ctx.set_field_by_name(buf, "mark", Value::Int(-1));
+    // Mirror the JDK field initializer: fresh buffers default to
+    // BIG_ENDIAN. In real-JDK mode `alloc_concurrent_synthetic` resolves
+    // the REAL (abstract) `java.nio.ByteBuffer` class and allocates its
+    // full field layout, so without this seed the named `bigEndian` slot
+    // reads back Int(0) — which `s2_bb_order` would decode as
+    // LITTLE_ENDIAN by default.
+    ctx.set_field_by_name(buf, "bigEndian", Value::Int(1));
+    ctx.set_field_by_name(
+        buf,
+        "nativeByteOrder",
+        Value::Int(if cfg!(target_endian = "big") { 1 } else { 0 }),
+    );
     // Synthetic-mode indexed fallback.
     ctx.set_field(buf, BB_ARRAY, Value::Object(Some(arr)));
     ctx.set_field(buf, BB_POS, Value::Int(0));
@@ -2406,9 +2418,69 @@ fn s2_bb_set_mark(ctx: &mut dyn NativeContext, buf: ObjectRef, value: i32) {
         _ => ctx.set_field_by_name(buf, "mark", Value::Int(value)),
     }
 }
+/// True for the 6-slot pure-synthetic ByteBuffer layout that the indexed
+/// `BB_*` accessors address. In REAL-JDK mode this is false for every s2
+/// buffer: `alloc_concurrent_synthetic(_, "java/nio/ByteBuffer", 6)`
+/// resolves the real (abstract) class and allocates its FULL field layout
+/// (11 slots — `Buffer{mark,position,limit,capacity,address,segment}` +
+/// `ByteBuffer{hb,offset,isReadOnly,bigEndian,nativeByteOrder}`), where
+/// slot 5 aliases `segment`, not the synthetic order slot. Physical field
+/// count is the only reliable discriminator — class name is shared between
+/// both modes, and name-based field resolution succeeds on both.
+#[inline]
+fn s2_bb_synthetic_layout(ctx: &dyn NativeContext, buf: ObjectRef) -> bool {
+    ctx.object_num_fields(buf) == 6
+}
+
 #[inline]
 fn s2_bb_order(ctx: &dyn NativeContext, buf: ObjectRef) -> i32 {
-    ctx.get_field(buf, BB_ORDER).as_int().unwrap_or(0)
+    // Real-layout ByteBuffers keep their byte order in the named
+    // `bigEndian` boolean (seeded to the JDK BIG_ENDIAN default by
+    // `bb_write_hb`, mirrored by the `order(ByteOrder)` native below). The
+    // indexed `BB_ORDER` slot (5) only exists on the pure-synthetic
+    // layout — on a real-layout buffer that index aliases `segment`, so
+    // the old slot read never yielded the order Int and every buffer
+    // decoded as BIG_ENDIAN no matter what `order(LITTLE_ENDIAN)` was
+    // called: Lucene's `BufferedIndexInput` (LE-ordered buffer from
+    // `ByteBuffer.allocate(...).order(LITTLE_ENDIAN)`) then byteswapped
+    // every buffered `getShort`/`getInt`/`getLong` — surfacing as
+    // `CorruptIndexException: truncated file: length=79 but
+    // expectedLength==5692549928996306944` (79 byte-reversed) in
+    // `Lucene104PostingsReader` under the ES vector-codec tests.
+    if s2_bb_synthetic_layout(ctx, buf) {
+        return ctx.get_field(buf, BB_ORDER).as_int().unwrap_or(0);
+    }
+    match ctx.get_field_by_name(buf, "bigEndian") {
+        Value::Int(v) => {
+            if v != 0 {
+                0
+            } else {
+                1
+            }
+        }
+        // Unresolvable / non-Int on this non-synthetic buffer object — use
+        // the JDK default BIG_ENDIAN rather than reading a junk slot.
+        _ => 0,
+    }
+}
+
+/// Write a buffer's byte order — the mutation counterpart of
+/// `s2_bb_order`, with the same layout discrimination. Used by the
+/// `order(ByteOrder)` native and by slice/view creation when propagating
+/// the source buffer's order.
+fn s2_bb_set_order(ctx: &mut dyn NativeContext, buf: ObjectRef, ord: i32) {
+    if s2_bb_synthetic_layout(ctx, buf) {
+        ctx.set_field(buf, BB_ORDER, Value::Int(ord));
+    } else {
+        ctx.set_field_by_name(buf, "bigEndian", Value::Int(if ord == 1 { 0 } else { 1 }));
+        // nativeByteOrder = (bigEndian == platform-is-big-endian); every
+        // CratonVM target is little-endian, so it is "order == LITTLE_ENDIAN".
+        ctx.set_field_by_name(
+            buf,
+            "nativeByteOrder",
+            Value::Int(if ord == 1 { 1 } else { 0 }),
+        );
+    }
 }
 #[inline]
 fn s2_bb_arr(ctx: &dyn NativeContext, buf: ObjectRef) -> Option<ObjectRef> {
@@ -2421,6 +2493,34 @@ fn s2_bb_arr(ctx: &dyn NativeContext, buf: ObjectRef) -> Option<ObjectRef> {
     match ctx.get_field(buf, BB_ARRAY) {
         Value::Object(Some(a)) => Some(a),
         _ => None,
+    }
+}
+
+/// Native-memory address of a DIRECT buffer (real-JDK `DirectByteBuffer`
+/// has no `hb` heap array; its storage lives at the `address` field). Same
+/// name-first/slot-4-fallback resolution as native-io's
+/// `directbuffer_address`. `None` for heap buffers and storage-less
+/// synthetics.
+fn s2_bb_direct_addr(ctx: &dyn NativeContext, buf: ObjectRef) -> Option<i64> {
+    match ctx.get_field_by_name(buf, "address") {
+        Value::Long(v) if v != 0 => Some(v),
+        _ => match ctx.get_field(buf, 4) {
+            Value::Long(v) if v != 0 => Some(v),
+            _ => None,
+        },
+    }
+}
+
+/// Write a buffer's `position`. Buffers with a heap array keep this
+/// family's historic `BB_POS` slot write (self-consistent with `s2_bb_pos`
+/// on both real heap and synthetic buffers). DIRECT buffers are otherwise
+/// managed by name-based natives whose layout the `BB_POS` slot is not
+/// guaranteed to match — write their `position` by name.
+fn s2_bb_set_pos(ctx: &mut dyn NativeContext, buf: ObjectRef, v: i32) {
+    if s2_bb_arr(ctx, buf).is_some() {
+        ctx.set_field(buf, BB_POS, Value::Int(v));
+    } else {
+        ctx.set_field_by_name(buf, "position", Value::Int(v));
     }
 }
 
@@ -3278,7 +3378,10 @@ macro_rules! s2_view_buf_fn {
             ctx.set_field(vb, BB_LIMIT, Value::Int(rem));
             ctx.set_field(vb, BB_CAP, Value::Int(rem));
             ctx.set_field(vb, BB_MARK, Value::Int(-(pos + 1)));
-            ctx.set_field(vb, BB_ORDER, ctx.get_field(this, BB_ORDER));
+            // Propagate the source buffer's order via the layout-aware
+            // accessors (the source may be real-layout: order in `bigEndian`).
+            let ord = s2_bb_order(ctx, this);
+            s2_bb_set_order(ctx, vb, ord);
             Ok(Some(Value::Object(Some(vb))))
         }
     };
@@ -3619,25 +3722,58 @@ fn register_s2_bytebuffer(r: &mut NativeMethodRegistry) {
             let src = obj_arg(args, 1)?;
             let src_pos = s2_bb_pos(ctx, src);
             let src_lim = s2_bb_limit(ctx, src);
-            let n = (src_lim - src_pos).max(0);
+            let n = (src_lim - src_pos).max(0) as usize;
             let pos = s2_bb_pos(ctx, this);
-            if pos + n > s2_bb_limit(ctx, this) {
+            if pos + n as i32 > s2_bb_limit(ctx, this) {
                 return Err(RuntimeError::BufferOverflowException.into());
             }
-            let src_arr = match s2_bb_arr(ctx, src) {
-                Some(a) => a,
-                None => return Ok(Some(Value::Object(Some(this)))),
-            };
-            let dst_arr = match s2_bb_arr(ctx, this) {
-                Some(a) => a,
-                None => return Ok(Some(Value::Object(Some(this)))),
-            };
-            for i in 0..n as usize {
-                let b = ctx.get_array_element(src_arr, src_pos as usize + i);
-                ctx.set_array_element(dst_arr, pos as usize + i, b);
+            // Either side may be a DIRECT buffer (real-JDK `DirectByteBuffer`:
+            // `hb == null`, storage at `address`). The pre-fix code silently
+            // returned without copying OR advancing positions whenever a side
+            // had no heap array. `IOUtil.read` routes every buffered
+            // `FileChannel` read through a temporary direct buffer and then
+            // `dst.put(directSrc)`, so file reads "succeeded" (count
+            // returned) while delivering ZERO bytes with an unmoved
+            // destination position — Lucene's `BufferedIndexInput.refill()`
+            // then flipped an empty buffer and the first `readByte()` threw
+            // `BufferUnderflowException` (doc:
+            // ES-FAIL-FAMILY-20260710-vector-codec-exception-cause-object).
+            let mut bytes = vec![0u8; n];
+            if let Some(src_arr) = s2_bb_arr(ctx, src) {
+                for (i, b) in bytes.iter_mut().enumerate() {
+                    *b = ctx
+                        .get_array_element(src_arr, src_pos as usize + i)
+                        .as_int()
+                        .unwrap_or(0) as u8;
+                }
+            } else if let Some(addr) = s2_bb_direct_addr(ctx, src) {
+                if !ctx.copy_from_native_memory(addr.saturating_add(src_pos as i64), &mut bytes) {
+                    return Err(RuntimeError::IllegalStateException {
+                        message: "ByteBuffer.put: direct source read failed".to_string(),
+                    }
+                    .into());
+                }
+            } else {
+                // Genuinely storage-less synthetic buffer — keep the historic
+                // silent no-op so half-built synthetic buffers stay benign.
+                return Ok(Some(Value::Object(Some(this))));
             }
-            ctx.set_field(src, BB_POS, Value::Int(src_lim));
-            ctx.set_field(this, BB_POS, Value::Int(pos + n));
+            if let Some(dst_arr) = s2_bb_arr(ctx, this) {
+                for (i, b) in bytes.iter().enumerate() {
+                    ctx.set_array_element(dst_arr, pos as usize + i, Value::Int(*b as i8 as i32));
+                }
+            } else if let Some(addr) = s2_bb_direct_addr(ctx, this) {
+                if !ctx.copy_to_native_memory(addr.saturating_add(pos as i64), &bytes) {
+                    return Err(RuntimeError::IllegalStateException {
+                        message: "ByteBuffer.put: direct destination write failed".to_string(),
+                    }
+                    .into());
+                }
+            } else {
+                return Ok(Some(Value::Object(Some(this))));
+            }
+            s2_bb_set_pos(ctx, src, src_lim);
+            s2_bb_set_pos(ctx, this, pos + n as i32);
             Ok(Some(Value::Object(Some(this))))
         },
     );
@@ -3980,6 +4116,19 @@ fn register_s2_bytebuffer(r: &mut NativeMethodRegistry) {
     r.register(bb, "order", "()Ljava/nio/ByteOrder;", |ctx, args| {
         let this = obj_arg(args, 0)?;
         let ord = s2_bb_order(ctx, this);
+        // Prefer the REAL ByteOrder statics: JDK and library bytecode
+        // compares the result with `==` against `ByteOrder.LITTLE_ENDIAN`
+        // (e.g. Lucene's `assert buffer.order() == LITTLE_ENDIAN`), and a
+        // synthetic stand-in also corrupts its `name` field in real-JDK
+        // mode (slot 0 is the name String there, not an order int).
+        if let Some(cid) = ctx.class_id_by_name("java/nio/ByteOrder") {
+            let field = if ord == 1 { "LITTLE_ENDIAN" } else { "BIG_ENDIAN" };
+            if let Some(idx) = ctx.static_field_index_by_name(cid, field) {
+                if let Value::Object(Some(o)) = ctx.get_static_field(cid, idx) {
+                    return Ok(Some(Value::Object(Some(o))));
+                }
+            }
+        }
         let bo = alloc_concurrent_synthetic(ctx, "java/nio/ByteOrder", 1);
         ctx.set_field(bo, 0, Value::Int(ord));
         Ok(Some(Value::Object(Some(bo))))
@@ -3990,12 +4139,25 @@ fn register_s2_bytebuffer(r: &mut NativeMethodRegistry) {
         "(Ljava/nio/ByteOrder;)Ljava/nio/ByteBuffer;",
         |ctx, args| {
             let this = obj_arg(args, 0)?;
+            // The argument is usually one of the REAL `ByteOrder` statics,
+            // whose field 0 is the `name` String — the old
+            // `get_field(bo, 0).as_int()` decode silently yielded 0
+            // (BIG_ENDIAN) for every real constant, so
+            // `order(LITTLE_ENDIAN)` was a no-op in real-JDK mode. Decode
+            // both representations.
             let ord = match args.get(1) {
-                Some(Value::Object(Some(bo))) => ctx.get_field(*bo, 0).as_int().unwrap_or(0),
+                Some(Value::Object(Some(bo))) => match ctx.get_field(*bo, 0) {
+                    Value::Int(v) => v,
+                    Value::Object(Some(name)) => match ctx.read_string(name).as_deref() {
+                        Some("LITTLE_ENDIAN") => 1,
+                        _ => 0,
+                    },
+                    _ => 0,
+                },
                 Some(Value::Int(v)) => *v,
                 _ => 0,
             };
-            ctx.set_field(this, BB_ORDER, Value::Int(ord));
+            s2_bb_set_order(ctx, this, ord);
             Ok(Some(Value::Object(Some(this))))
         },
     );
@@ -4016,7 +4178,10 @@ fn register_s2_bytebuffer(r: &mut NativeMethodRegistry) {
         let buf = alloc_concurrent_synthetic(ctx, "java/nio/ByteBuffer", 6);
         bb_write_hb(ctx, buf, new_arr, rem as i32);
         ctx.set_field_by_name(buf, "isReadOnly", Value::Int(0));
-        ctx.set_field(buf, BB_ORDER, ctx.get_field(this, BB_ORDER));
+        // Propagate the source buffer's order via the layout-aware
+        // accessors (the source may be real-layout: order in `bigEndian`).
+        let ord = s2_bb_order(ctx, this);
+        s2_bb_set_order(ctx, buf, ord);
         Ok(Some(Value::Object(Some(buf))))
     });
     r.register(bb, "duplicate", "()Ljava/nio/ByteBuffer;", |ctx, args| {

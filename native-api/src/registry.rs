@@ -539,6 +539,15 @@ pub trait NativeContext {
     /// Get the identity hash code of an ObjectRef.
     fn identity_hash_code(&self, obj: ObjectRef) -> i32;
 
+    /// ES-FAIL-FAMILY-20260710 hunt: arm the GC's dynamic software
+    /// write-watchpoint (see `cratonvm_gc::heap::set_dynamic_watch`) at a
+    /// raw heap address, so any subsequent write through an instrumented
+    /// heap write primitive that covers this address prints its call site.
+    /// `addr = 0` disarms. Default no-op so mock/test `NativeContext` impls
+    /// don't need to implement it; only the real VM's impl (which has a
+    /// live heap to watch) overrides it.
+    fn dbg_set_watch_cell(&mut self, _addr: usize) {}
+
     /// Stable identity for the owning VM/heap.
     ///
     /// Native side caches that store heap `ObjectRef`s must scope entries to
@@ -3226,6 +3235,36 @@ impl NativeMethodRegistry {
         if self.drop_real_layout_synthetic
             && class_name == "java/util/StringJoiner"
             && self.current_category != NativeKind::SyntheticStub
+        {
+            return;
+        }
+        // Real-JDK mode: drop the synthetic `java/lang/ref/Cleaner`/
+        // `Cleaner$Cleanable` natives (`create()`, `register(Object,Runnable)`,
+        // `Cleanable.clean()`). These were meant only as a fallback for when
+        // real class bytes are unavailable (see this block's own comment at
+        // the registration site, phases_late.rs::register_p68_cleaner: "real
+        // Cleaner bytecode still wins whenever the real class is loaded") --
+        // but `create()` is a STATIC factory method, and static dispatch has
+        // no per-instance real-vs-synthetic safety net the way concrete
+        // instance methods do, so the native unconditionally wins there and
+        // allocates a bare Cleaner with its real `impl` field left null.
+        // `register(Object,Runnable)` (an instance method) then correctly
+        // prefers real bytecode -- which calls `PhantomCleanable.<init>` ->
+        // `CleanerImpl.getCleanerImpl(this)` -> reads the null `impl` field
+        // and NPEs ("Cannot read field \"queue\" because the return value of
+        // ... getCleanerImpl(...) is null"), first seen booting a WildFly
+        // Host Controller (`ServiceContainer$Factory.create()` calls
+        // `Cleaner.create()` then `.register(...)`). Same half-real-object
+        // bug class as the ThreadPoolExecutor/Executors-factory NPEs above --
+        // drop the synthetic surface entirely so real bytecode constructs and
+        // wires up the Cleaner end-to-end (matches this file's own stated
+        // intent, just enforced from the registration side since dispatch
+        // does not enforce it uniformly for static factory methods).
+        if self.drop_real_layout_synthetic
+            && matches!(
+                class_name,
+                "java/lang/ref/Cleaner" | "java/lang/ref/Cleaner$Cleanable"
+            )
         {
             return;
         }
