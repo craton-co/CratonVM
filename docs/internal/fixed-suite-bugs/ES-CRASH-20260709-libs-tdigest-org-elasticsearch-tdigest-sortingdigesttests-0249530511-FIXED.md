@@ -58,3 +58,12 @@ Result: `FAIL 26.5s org.elasticsearch.tdigest.SortingDigestTests`, `rc=1`,
 `System$1.findNative` anywhere in stdout/stderr. This confirms the
 documented defect is gone; the remaining 6 failures are the new residual
 tracked in the doc linked above.
+
+Re-verified after merging `origin/dev` forward to `c9e68f12` (this
+branch's merge commit `51b8acfc`, which pulled in unrelated interpreter/
+JIT changes touching `vm/src/runtime/interpreter.rs` and `jit/src/*`):
+rebuilt and reran both `-Jit on` and `-Jit off`. Still no crash and no
+`findNative`/`System$1` `NoSuchMethodError` in either mode — the fix holds
+across the merge. (The residual's exact failure signatures shifted
+slightly between the two builds; see the residual doc for details — this
+does not affect the crash verdict here.)

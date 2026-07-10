@@ -22,7 +22,9 @@ Collection context:
 - Worktree: `/data/data/cratonvm-worktrees/20260710-093821-es-tdigest-sortingdigest`
 - Branch used for collection: `fix/es-tdigest-sortingdigest-20260710-093821`
 - Collection binary: `/data/data/cratonvm-targets/es-tdigest-sortingdigest-20260710-093821/release/cratonvm-es-tdigest-sortingdigest-20260710-093821`
-- Binary base dev SHA: `df1650e1dcbc825d295faee60b844b9236d91493`
+- Binary base dev SHA: `df1650e1dcbc825d295faee60b844b9236d91493`, reverified after
+  merging forward to `c9e68f12` (post-merge commit `51b8acfc`) — same 6/20
+  failures in the same test methods in both modes, crash still absent
 
 Re-run one class:
 ```powershell
@@ -51,7 +53,7 @@ java.lang.AbstractMethodError: method java/lang/foreign/SegmentAllocator.allocat
 1) testMidPointRule
 java.lang.AssertionError: expected:<1.0> but was:<0.7>
 2) testSorted
-java.lang.ArrayIndexOutOfBoundsException: Index 7598259162470311681 out of bounds for length 57100
+java.lang.ArrayIndexOutOfBoundsException: Index 1106770591 out of bounds for length 57100
 3) testSingletonAtEnd
 java.lang.AssertionError: expected:<0.25> but was:<0.125>
 4) testSingletonAtEnd
@@ -61,7 +63,7 @@ Expected: <0L>
 5) testFewRepeatedValues
 java.lang.AssertionError: expected:<3000.0> but was:<2.1E-322>
 6) testMonotonicity
-java.lang.ArrayIndexOutOfBoundsException: Index 7598259162470311681 out of bounds for length 102899
+java.lang.ArrayIndexOutOfBoundsException: Index -1 out of bounds for length 102899
 ```
 
 Two symptom clusters:
@@ -72,13 +74,19 @@ Two symptom clusters:
   zero) instead of `3000.0` is a strong signal of reading
   garbage/uninitialized memory as a double rather than a simple
   off-by-one arithmetic error.
-- **Garbage array index** (`testSorted`, `testMonotonicity`): both hit the
-  *exact same* nonsensical index `7598259162470311681`
-  (`0x6972707372666701`) against two different backing array lengths
-  (57100 and 102899). The identical garbage value recurring across two
-  unrelated test methods/arrays suggests one stale/uninitialized 64-bit
-  slot (register, stack slot, or field) being read as an array index,
-  rather than two independent bugs.
+- **Garbage array index** (`testSorted`, `testMonotonicity`): the *specific*
+  bad index is NOT stable across builds — an initial build (base SHA
+  `df1650e1`) hit the identical value `7598259162470311681`
+  (`0x6972707372666701`) in both methods; after merging forward to
+  `c9e68f12`/`51b8acfc` and rebuilding, the same two methods instead hit
+  `1106770591` and `-1` respectively. The *pattern* is stable (`testSorted`
+  and `testMonotonicity` always throw `ArrayIndexOutOfBoundsException` at
+  the same call site), but the value itself is clearly garbage/uninitialized
+  rather than a deterministic off-by-one, and is sensitive to unrelated
+  code changes elsewhere in the VM — consistent with reading a stale/
+  uninitialized slot (register, stack slot, or field) whose contents shift
+  with codegen/layout changes rather than with anything `SortingDigest`
+  itself computes.
 
 ## Failures with `-Jit off` (6 of 20) — different tests, different bugs
 
@@ -129,11 +137,12 @@ pre-existing residuals became visible for the first time under this class.
 
 ## Next steps
 
-- `-Jit on` cluster: investigate the garbage-index bug first — the
-  identical `7598259162470311681` value recurring across two unrelated
-  array-length contexts is the strongest, most specific lead (stale
-  64-bit slot / register reuse). Fixing it may also resolve or clarify the
-  wrong-quantile-value failures in the same mode.
+- `-Jit on` cluster: investigate the garbage-index bug first — it
+  reproduces at the same two call sites (`testSorted`, `testMonotonicity`)
+  across builds even though the actual bad index value changes per build,
+  the strongest lead for a stale 64-bit slot / register reuse. Fixing it
+  may also resolve or clarify the wrong-quantile-value failures in the
+  same mode.
 - `-Jit off` cluster: root-cause why `Dist.quantile`'s `Function`-typed
   parameter resolves to receiver class `java.lang.Object` at the
   interpreter's invokeinterface dispatch — likely a lambda/functional
