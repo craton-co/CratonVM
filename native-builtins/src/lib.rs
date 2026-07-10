@@ -27260,12 +27260,13 @@ pub fn register_essential_natives(registry: &mut NativeMethodRegistry) {
             };
             let avail = count - pos;
             let to_read = len.min(avail);
-            for i in 0..to_read {
-                let b = ctx.get_array_element(buf, pos + i);
-                ctx.set_array_element(dest, off + i, b);
+            let mut bytes = vec![0u8; to_read];
+            let copied = ctx.read_byte_array_into(buf, pos, &mut bytes);
+            if copied > 0 {
+                ctx.write_byte_array_from(dest, off, &bytes[..copied]);
             }
-            ctx.set_field(this, pos_idx, Value::Int((pos + to_read) as i32));
-            Ok(Some(Value::Int(to_read as i32)))
+            ctx.set_field(this, pos_idx, Value::Int((pos + copied) as i32));
+            Ok(Some(Value::Int(copied as i32)))
         },
     );
     registry.register(

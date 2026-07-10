@@ -9459,7 +9459,10 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
                 Some(Value::Int(n)) if *n >= 0 => *n as usize,
                 _ => usize::MAX,
             };
-            let _matcher = args.get(2).copied().unwrap_or(Value::Object(None));
+            let matcher = match args.get(2).copied().unwrap_or(Value::Object(None)) {
+                Value::Object(Some(o)) => Some(o),
+                _ => None,
+            };
             let mut paths = Vec::new();
             vfs_or_host_walk(&p, 0, max_depth, &mut paths);
             let mut vals = Vec::with_capacity(paths.len());
@@ -9475,7 +9478,20 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
                 };
                 let attrs_pin = ctx.pin_native_root(attrs);
                 let attrs = ctx.read_native_pin(attrs_pin, attrs);
-                let keep = !matches!(ctx.get_field(attrs, 3), Value::Int(v) if v != 0);
+                let ep_current = ctx.read_native_pin(ep_pin, ep);
+                let keep = if let Some(matcher) = matcher {
+                    match ctx.invoke_virtual(
+                        matcher,
+                        "test",
+                        "(Ljava/lang/Object;Ljava/lang/Object;)Z",
+                        &[Value::Object(Some(ep_current)), Value::Object(Some(attrs))],
+                    )? {
+                        Some(Value::Int(v)) => v != 0,
+                        _ => false,
+                    }
+                } else {
+                    !matches!(ctx.get_field(attrs, 3), Value::Int(v) if v != 0)
+                };
                 let ep = ctx.read_native_pin(ep_pin, ep);
                 ctx.unpin_native_roots(attrs_pin);
                 ctx.unpin_native_roots(ep_pin);
@@ -10043,9 +10059,7 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
                     let arr = ctx.new_array(ArrayElementType::Byte, data.len());
                     let stream = ctx.read_native_pin(stream_pin, stream);
                     ctx.unpin_native_roots(stream_pin);
-                    for (i, &b) in data.iter().enumerate() {
-                        ctx.set_array_element(arr, i, Value::Int(b as i8 as i32));
-                    }
+                    ctx.write_byte_array_from(arr, 0, &data);
                     ctx.set_field_by_name(stream, "buf", Value::Object(Some(arr)));
                     ctx.set_field_by_name(stream, "pos", Value::Int(0));
                     ctx.set_field_by_name(stream, "mark", Value::Int(0));
@@ -10885,9 +10899,7 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
                 Ok(data) => {
                     use cratonvm_types::ArrayElementType;
                     let arr = ctx.new_array(ArrayElementType::Byte, data.len());
-                    for (i, &b) in data.iter().enumerate() {
-                        ctx.set_array_element(arr, i, Value::Int(b as i8 as i32));
-                    }
+                    ctx.write_byte_array_from(arr, 0, &data);
                     Ok(Some(Value::Object(Some(arr))))
                 }
                 // NIO contract: missing file → NoSuchFileException (see
@@ -12334,9 +12346,15 @@ fn jar_bytes_cached(jar: &str) -> Option<std::sync::Arc<Vec<u8>>> {
 /// decompression) turns those into O(log N) binary-search / prefix scans, which
 /// is what makes walking a large classpath (the Hibernate suite's 241 jars)
 /// tractable in the interpreter.
-fn jar_index(jar: &str) -> Option<std::sync::Arc<Vec<String>>> {
+struct JarFsIndex {
+    names: Vec<String>,
+    sizes: std::collections::HashMap<String, u64>,
+    raw_names: std::collections::HashMap<String, String>,
+}
+
+fn jar_index(jar: &str) -> Option<std::sync::Arc<JarFsIndex>> {
     use std::sync::{Arc, Mutex, OnceLock};
-    static CACHE: OnceLock<Mutex<std::collections::HashMap<String, Option<Arc<Vec<String>>>>>> =
+    static CACHE: OnceLock<Mutex<std::collections::HashMap<String, Option<Arc<JarFsIndex>>>>> =
         OnceLock::new();
     let cache = CACHE.get_or_init(|| Mutex::new(std::collections::HashMap::new()));
     let mut guard = cache.lock().unwrap_or_else(|e| e.into_inner());
@@ -12346,14 +12364,25 @@ fn jar_index(jar: &str) -> Option<std::sync::Arc<Vec<String>>> {
     let built = (|| {
         let bytes = jar_bytes_cached(jar)?;
         let cursor = std::io::Cursor::new(bytes.as_slice());
-        let zip = zip::ZipArchive::new(cursor).ok()?;
-        let mut names: Vec<String> = zip
-            .file_names()
-            .map(|s| s.trim_start_matches('/').to_string())
-            .collect();
+        let mut zip = zip::ZipArchive::new(cursor).ok()?;
+        let mut names = Vec::with_capacity(zip.len());
+        let mut sizes = std::collections::HashMap::with_capacity(zip.len());
+        let mut raw_names = std::collections::HashMap::with_capacity(zip.len());
+        for i in 0..zip.len() {
+            let f = zip.by_index(i).ok()?;
+            let raw = f.name().to_string();
+            let name = raw.trim_start_matches('/').to_string();
+            sizes.insert(name.clone(), f.size());
+            raw_names.insert(name.clone(), raw);
+            names.push(name);
+        }
         names.sort_unstable();
         names.dedup();
-        Some(Arc::new(names))
+        Some(Arc::new(JarFsIndex {
+            names,
+            sizes,
+            raw_names,
+        }))
     })();
     guard.insert(jar.to_string(), built.clone());
     built
@@ -12367,11 +12396,9 @@ fn jarfs_read_entry(jar: &str, entry: &str) -> std::io::Result<Vec<u8>> {
     let cursor = std::io::Cursor::new(jar_bytes.as_slice());
     let mut zip = zip::ZipArchive::new(cursor)
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string()))?;
-    let entry_name = if zip.file_names().any(|name| name == entry) {
-        entry.to_string()
-    } else {
-        format!("/{entry}")
-    };
+    let entry_name = jar_index(jar)
+        .and_then(|idx| idx.raw_names.get(entry).cloned())
+        .unwrap_or_else(|| entry.to_string());
     let mut f = zip
         .by_name(&entry_name)
         .map_err(|_| std::io::Error::from(std::io::ErrorKind::NotFound))?;
@@ -12382,20 +12409,12 @@ fn jarfs_read_entry(jar: &str, entry: &str) -> std::io::Result<Vec<u8>> {
 
 fn jarfs_entry_size(jar: &str, entry: &str) -> std::io::Result<i64> {
     let entry = entry.trim_start_matches('/');
-    let jar_bytes =
-        jar_bytes_cached(jar).ok_or_else(|| std::io::Error::from(std::io::ErrorKind::NotFound))?;
-    let cursor = std::io::Cursor::new(jar_bytes.as_slice());
-    let mut zip = zip::ZipArchive::new(cursor)
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string()))?;
-    let entry_name = if zip.file_names().any(|name| name == entry) {
-        entry.to_string()
-    } else {
-        format!("/{entry}")
-    };
-    let f = zip
-        .by_name(&entry_name)
-        .map_err(|_| std::io::Error::from(std::io::ErrorKind::NotFound))?;
-    Ok(f.size() as i64)
+    let index = jar_index(jar).ok_or_else(|| std::io::Error::from(std::io::ErrorKind::NotFound))?;
+    index
+        .sizes
+        .get(entry)
+        .map(|size| *size as i64)
+        .ok_or_else(|| std::io::Error::from(std::io::ErrorKind::NotFound))
 }
 
 fn jarfs_rewrite_entry(jar: &str, entry: &str, data: Option<&[u8]>) -> std::io::Result<()> {
@@ -12508,10 +12527,11 @@ fn jarfs_classify(jar: &str, entry: &str) -> JarFsKind {
     if entry.is_empty() {
         return JarFsKind::Dir;
     }
-    let names = match jar_index(jar) {
+    let index = match jar_index(jar) {
         Some(n) => n,
         None => return JarFsKind::Absent,
     };
+    let names = &index.names;
     // Exact entry → a regular file.
     if names.binary_search_by(|n| n.as_str().cmp(entry)).is_ok() {
         return JarFsKind::File;
@@ -12545,10 +12565,11 @@ fn jarfs_list_dir_classified(jar: &str, dir: &str) -> Vec<(String, bool)> {
     } else {
         format!("{dir}/")
     };
-    let names = match jar_index(jar) {
+    let index = match jar_index(jar) {
         Some(n) => n,
         None => return Vec::new(),
     };
+    let names = &index.names;
     let start = names.partition_point(|n| n.as_str() < prefix.as_str());
     let mut seen: std::collections::BTreeMap<String, bool> = std::collections::BTreeMap::new();
     for name in &names[start..] {
