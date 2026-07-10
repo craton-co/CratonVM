@@ -51512,15 +51512,28 @@ pub(crate) fn register_p71_thread_extras(r: &mut NativeMethodRegistry) {
         Ok(Some(Value::Object(Some(arr))))
     });
 
-    // ThreadGroup = 4-field (name=0, parent=1, daemon=2, maxPriority=3)
+    // ThreadGroup — real java.lang.ThreadGroup field layout (verified via
+    // `javap -p java.lang.ThreadGroup` on JDK 25): parent=0 (ThreadGroup),
+    // name=1 (String), maxPriority=2 (int), daemon=3 (boolean). Some
+    // ThreadGroup instances (e.g. the root "system" group, built via the
+    // real package-private no-arg `ThreadGroup()` ctor, which has no native
+    // override here and so runs as genuine bytecode) get these fields
+    // populated by REAL bytecode using the compiled offsets above — so these
+    // natives MUST agree with that layout, not invent their own, or a
+    // native-constructed instance and a bytecode-constructed instance of the
+    // same class disagree on what each slot means (e.g. `getParent()` on the
+    // bytecode-built "system" group would read slot 1 = its name String
+    // instead of its null parent, throwing a ClassCastException the first
+    // time real JDK code — e.g. `InnocuousThread.createThreadGroup()` — walks
+    // the parent chain to the root).
     let tg = "java/lang/ThreadGroup";
     r.register(tg, "<init>", "(Ljava/lang/String;)V", |ctx, args| {
         let this = obj_arg(args, 0)?;
-        ctx.set_field(this, 0, args.get(1).copied().unwrap_or(Value::Object(None)));
-        ctx.set_field(this, 1, Value::Object(None));
-        ctx.set_field(this, 2, Value::Int(0));
+        ctx.set_field(this, 0, Value::Object(None));
+        ctx.set_field(this, 1, args.get(1).copied().unwrap_or(Value::Object(None)));
+        ctx.set_field(this, 2, Value::Int(10)); // Thread.MAX_PRIORITY
         if ctx.object_num_fields(this) > 3 {
-            ctx.set_field(this, 3, Value::Int(10)); // Thread.MAX_PRIORITY
+            ctx.set_field(this, 3, Value::Int(0));
         }
         Ok(None)
     });
@@ -51530,43 +51543,50 @@ pub(crate) fn register_p71_thread_extras(r: &mut NativeMethodRegistry) {
         "(Ljava/lang/ThreadGroup;Ljava/lang/String;)V",
         |ctx, args| {
             let this = obj_arg(args, 0)?;
-            ctx.set_field(this, 1, args.get(1).copied().unwrap_or(Value::Object(None)));
-            ctx.set_field(this, 0, args.get(2).copied().unwrap_or(Value::Object(None)));
-            ctx.set_field(this, 2, Value::Int(0));
-            if ctx.object_num_fields(this) > 3 {
-                // Inherit parent's max priority if possible
-                let parent_max = match args.get(1) {
-                    Some(Value::Object(Some(p))) => {
-                        if ctx.object_num_fields(*p) > 3 {
-                            ctx.get_field(*p, 3).as_int().unwrap_or(10)
-                        } else {
-                            10
-                        }
+            ctx.set_field(this, 0, args.get(1).copied().unwrap_or(Value::Object(None)));
+            ctx.set_field(this, 1, args.get(2).copied().unwrap_or(Value::Object(None)));
+            // Inherit parent's max priority if possible
+            let parent_max = match args.get(1) {
+                Some(Value::Object(Some(p))) => {
+                    if ctx.object_num_fields(*p) > 2 {
+                        ctx.get_field(*p, 2).as_int().unwrap_or(10)
+                    } else {
+                        10
                     }
-                    _ => 10,
-                };
-                ctx.set_field(this, 3, Value::Int(parent_max));
+                }
+                _ => 10,
+            };
+            ctx.set_field(this, 2, Value::Int(parent_max));
+            if ctx.object_num_fields(this) > 3 {
+                ctx.set_field(this, 3, Value::Int(0));
             }
             Ok(None)
         },
     );
     r.register(tg, "getName", "()Ljava/lang/String;", |ctx, args| {
-        Ok(Some(ctx.get_field(obj_arg(args, 0)?, 0)))
-    });
-    r.register(tg, "getParent", "()Ljava/lang/ThreadGroup;", |ctx, args| {
         Ok(Some(ctx.get_field(obj_arg(args, 0)?, 1)))
     });
+    r.register(tg, "getParent", "()Ljava/lang/ThreadGroup;", |ctx, args| {
+        Ok(Some(ctx.get_field(obj_arg(args, 0)?, 0)))
+    });
     r.register(tg, "isDaemon", "()Z", |ctx, args| {
-        Ok(Some(ctx.get_field(obj_arg(args, 0)?, 2)))
+        let this = obj_arg(args, 0)?;
+        if ctx.object_num_fields(this) > 3 {
+            Ok(Some(ctx.get_field(this, 3)))
+        } else {
+            Ok(Some(Value::Int(0)))
+        }
     });
     r.register(tg, "setDaemon", "(Z)V", |ctx, args| {
         let this = obj_arg(args, 0)?;
-        ctx.set_field(this, 2, args.get(1).copied().unwrap_or(Value::Int(0)));
+        if ctx.object_num_fields(this) > 3 {
+            ctx.set_field(this, 3, args.get(1).copied().unwrap_or(Value::Int(0)));
+        }
         Ok(None)
     });
     r.register(tg, "toString", "()Ljava/lang/String;", |ctx, args| {
         let this = obj_arg(args, 0)?;
-        let name = match ctx.get_field(this, 0) {
+        let name = match ctx.get_field(this, 1) {
             Value::Object(Some(s)) => ctx.read_string(s).unwrap_or_else(|| "main".into()),
             _ => "main".into(),
         };
@@ -51592,8 +51612,8 @@ pub(crate) fn register_p71_thread_extras(r: &mut NativeMethodRegistry) {
     });
     r.register(tg, "getMaxPriority", "()I", |ctx, args| {
         let this = obj_arg(args, 0)?;
-        if ctx.object_num_fields(this) > 3 {
-            Ok(Some(ctx.get_field(this, 3)))
+        if ctx.object_num_fields(this) > 2 {
+            Ok(Some(ctx.get_field(this, 2)))
         } else {
             Ok(Some(Value::Int(10)))
         }
@@ -51603,8 +51623,8 @@ pub(crate) fn register_p71_thread_extras(r: &mut NativeMethodRegistry) {
         let prio = args.get(1).and_then(|v| v.as_int()).unwrap_or(10);
         // Clamp to Thread.MIN_PRIORITY..MAX_PRIORITY
         let clamped = prio.max(1).min(10);
-        if ctx.object_num_fields(this) > 3 {
-            ctx.set_field(this, 3, Value::Int(clamped));
+        if ctx.object_num_fields(this) > 2 {
+            ctx.set_field(this, 2, Value::Int(clamped));
         }
         Ok(None)
     });
@@ -51622,12 +51642,12 @@ pub(crate) fn register_p71_thread_extras(r: &mut NativeMethodRegistry) {
     });
     r.register(tg, "list", "()V", |ctx, args| {
         let this = obj_arg(args, 0)?;
-        let name = match ctx.get_field(this, 0) {
+        let name = match ctx.get_field(this, 1) {
             Value::Object(Some(s)) => ctx.read_string(s).unwrap_or_else(|| "main".into()),
             _ => "main".into(),
         };
-        let max_prio = if ctx.object_num_fields(this) > 3 {
-            ctx.get_field(this, 3).as_int().unwrap_or(10)
+        let max_prio = if ctx.object_num_fields(this) > 2 {
+            ctx.get_field(this, 2).as_int().unwrap_or(10)
         } else {
             10
         };
@@ -51687,7 +51707,7 @@ pub(crate) fn register_p71_thread_extras(r: &mut NativeMethodRegistry) {
             if c == this {
                 return Ok(Some(Value::Int(1)));
             }
-            current = match ctx.get_field(c, 1) {
+            current = match ctx.get_field(c, 0) {
                 Value::Object(Some(p)) => Some(p),
                 _ => None,
             };
