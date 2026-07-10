@@ -1049,6 +1049,33 @@ impl MonitorTable {
                     // and its registry insert is closed by the registry
                     // mutex inside `inflate_locked`, so this branch only
                     // fires on a true invariant violation — see C8.
+                    //
+                    // GC-audit finding 1(b) tripwire (2026-07-10): this
+                    // branch is the prime suspect for the MTChurn
+                    // lost-wakeup pile-up. If a pause's monitor-registry
+                    // remap races a thread the STW quota hole let run
+                    // mid-collection, that thread can miss here and
+                    // RE-INFLATE a SECOND Monitor for the same Java object
+                    // — every waiter parked on the first is orphaned (the
+                    // gdb-captured 5-waiters-none-woken picture). Loud,
+                    // rate-limited, and counted so an MTChurn round can
+                    // confirm or kill the hypothesis cheaply.
+                    {
+                        static REINFLATE_MISSES: std::sync::atomic::AtomicUsize =
+                            std::sync::atomic::AtomicUsize::new(0);
+                        let n = REINFLATE_MISSES
+                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        if n < 8 {
+                            tracing::warn!(
+                                obj = obj_ref.as_ptr() as usize,
+                                occurrence = n + 1,
+                                "monitor registry miss with INFLATED mark word — \
+                                 re-inflating a second Monitor for this object \
+                                 (audit finding 1(b) tripwire: waiters on the \
+                                 original monitor are now orphaned)"
+                            );
+                        }
+                    }
                     let m = self
                         .inflate_locked(obj_ref, header)
                         .expect("monitor inflation invariant: registry/mark-word desync");
