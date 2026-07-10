@@ -17646,6 +17646,7 @@ fn execute_invoke_kind(
                         current_class_id,
                         cp_index,
                         rcv_cid,
+                        &args[0],
                     );
                 }
             }
@@ -17662,6 +17663,7 @@ fn execute_invoke_kind(
                         current_class_id,
                         cp_index,
                         rcv_cid,
+                        &args[0],
                     );
                 }
             }
@@ -17719,7 +17721,14 @@ fn execute_invoke_kind(
         populate_invoke_cache(thread, shared, current_class_id, cp_index, is_special);
     } else if private_virtual_target.is_none() {
         if let Some(rcv_cid) = receiver_class_id {
-            populate_virtual_invoke_cache(thread, shared, current_class_id, cp_index, rcv_cid);
+            populate_virtual_invoke_cache(
+                thread,
+                shared,
+                current_class_id,
+                cp_index,
+                rcv_cid,
+                &args[0],
+            );
         }
     }
 
@@ -23078,6 +23087,29 @@ fn try_stackless_invoke(
     } else {
         native_cb
     };
+    // ThreadPoolExecutor.execute(Runnable): the registered native
+    // (`native_es_execute`) is exempted from the real-JDK-mode registration
+    // drop (native-api/src/registry.rs) specifically so it stays available
+    // for CratonVM's synthetic-layout Executors.* stand-ins (docs/known-issues/
+    // threadpoolexecutor-execute-npe-on-ctl-regression.md). But this "native
+    // override" step is unconditional -- it has no receiver awareness -- so
+    // it was ALSO winning for a genuinely real, bytecode-constructed
+    // ThreadPoolExecutor (its own real `workers` field populated), routing
+    // every `execute()` call through `native_es_execute`'s defense-in-depth
+    // "run inline" fallback instead of real async bytecode.
+    // `intercept_force_registered_native` above already carries this exact
+    // receiver check for the FORCE-native case; mirror it here so a real
+    // receiver's native shadow is dropped too. See docs/known-issues/
+    // threadpoolexecutor-execute-dispatch-degrades-to-synchronous.md.
+    let native_cb = if class_name == "java/util/concurrent/ThreadPoolExecutor"
+        && method_name == "execute"
+        && descriptor == "(Ljava/lang/Runnable;)V"
+        && matches!(args.first(), Some(recv) if threadpool_executor_has_real_workers(shared, recv))
+    {
+        None
+    } else {
+        native_cb
+    };
     if crate::runtime::env_cache::bd_debug()
         && (method_name == "intValue"
             || (class_name.contains("BigDecimal")
@@ -23259,7 +23291,22 @@ fn try_stackless_invoke(
             .native_methods
             .find(&class_name_arc, method_name, descriptor)
         {
-            if !synthetic_stub_should_yield_to_real_bytecode(
+            // Same ThreadPoolExecutor.execute(Runnable) receiver-aware
+            // exemption as step 1 above -- this is a SEPARATE, independent
+            // "double-check for a native override" that runs even after
+            // real bytecode was already resolved at step 4/5. Without this,
+            // a genuinely real ThreadPoolExecutor still gets shunted to
+            // `native_es_execute`'s inline "run synchronously" fallback right
+            // here, even though the real `execute()` bytecode was correctly
+            // found and would otherwise run. See docs/known-issues/
+            // threadpoolexecutor-execute-dispatch-degrades-to-synchronous.md.
+            let is_real_tpe_execute_step6 = class_name_arc.as_ref()
+                == "java/util/concurrent/ThreadPoolExecutor"
+                && method_name == "execute"
+                && descriptor == "(Ljava/lang/Runnable;)V"
+                && matches!(args.first(), Some(recv) if threadpool_executor_has_real_workers(shared, recv));
+            if !is_real_tpe_execute_step6
+                && !synthetic_stub_should_yield_to_real_bytecode(
                 shared,
                 &class_name_arc,
                 method_name,
@@ -30791,6 +30838,7 @@ fn populate_virtual_invoke_cache(
     caller_class_id: ClassId,
     cp_index: u16,
     receiver_class_id: ClassId,
+    receiver_value: &Value,
 ) {
     // T10.4 fast path — the VM-wide `SharedResolutionState` may already
     // hold a fully-built `CachedInvokeTarget` that a sibling thread promoted
@@ -30997,7 +31045,25 @@ fn populate_virtual_invoke_cache(
         let native_signature_may_exist = shared
             .native_methods
             .might_have_method_descriptor(&method_name, &descriptor);
-        let direct_native_callback = if native_signature_may_exist {
+        // ThreadPoolExecutor.execute(Runnable): same receiver-aware
+        // exemption as `try_stackless_invoke`'s step-1 native lookup above --
+        // a genuinely real ThreadPoolExecutor (its own `workers` field
+        // populated by a real `<init>`) must not have its native shadow
+        // cached here. This cache is keyed by (call site, receiver
+        // class_id) alone, so caching `VirtualNative` here would
+        // permanently route EVERY future call at this call site -- any
+        // instance of this class_id -- through `native_es_execute`'s
+        // inline "run synchronously" fallback instead of real async
+        // bytecode. Falling through instead lets the bytecode-resolution
+        // path below cache `VirtualBytecode`, whose dispatch-time
+        // `intercept_force_registered_native` check re-validates the
+        // ACTUAL receiver on every hit (not just at population time). See
+        // docs/known-issues/threadpoolexecutor-execute-dispatch-degrades-to-synchronous.md.
+        let is_real_tpe_execute = lookup_name == "java/util/concurrent/ThreadPoolExecutor"
+            && method_name.as_ref() == "execute"
+            && descriptor.as_ref() == "(Ljava/lang/Runnable;)V"
+            && threadpool_executor_has_real_workers(shared, receiver_value);
+        let direct_native_callback = if native_signature_may_exist && !is_real_tpe_execute {
             shared
                 .native_methods
                 .find(&lookup_name, &method_name, &descriptor)
@@ -31217,7 +31283,23 @@ fn populate_virtual_invoke_cache(
     // through this call-site.
     {
         let declaring_name = store.get(declaring_id).map(|c| &*c.name).unwrap_or("");
-        let force = force_native_over_real_jdk_bytecode(declaring_name, &method_name, &descriptor)
+        // ThreadPoolExecutor.execute(Runnable): `force_native_over_real_jdk_bytecode`
+        // is a pure (class, method, descriptor) allowlist with no receiver
+        // awareness -- it unconditionally returns true for this triple (see
+        // its own entry, added alongside the receiver-aware checks at
+        // `intercept_force_registered_native`/`invoke_or_native`/
+        // `invoke_on_class_shared_inner`). Consulting it directly here,
+        // bypassing those receiver checks entirely, is what actually poisons
+        // this call site's inline cache with `VirtualNative` for a
+        // genuinely real ThreadPoolExecutor. Exempt it the same way as the
+        // other call sites. See docs/known-issues/
+        // threadpoolexecutor-execute-dispatch-degrades-to-synchronous.md.
+        let is_real_tpe_execute_force = declaring_name == "java/util/concurrent/ThreadPoolExecutor"
+            && method_name.as_ref() == "execute"
+            && descriptor.as_ref() == "(Ljava/lang/Runnable;)V"
+            && threadpool_executor_has_real_workers(shared, receiver_value);
+        let force = !is_real_tpe_execute_force
+            && (force_native_over_real_jdk_bytecode(declaring_name, &method_name, &descriptor)
             || (matches!(
                 declaring_name,
                 "java/util/HashMap"
@@ -31242,7 +31324,7 @@ fn populate_virtual_invoke_cache(
             // store data in a side-store, so the JDK bytecode sees an empty
             // table. See companion entry in `force_native_over_real_jdk_bytecode`.
             | "keys" | "elements"
-            ));
+            )));
         if force {
             if let Some(callback) =
                 shared
