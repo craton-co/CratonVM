@@ -1,6 +1,144 @@
 # ES FAIL family - vector codec exceptions with corrupted Throwable cause output
 
-Status: OPEN (narrowed — 2 of 3 rows now PASS; 1 residual root-caused, not yet fixed)
+Status: FIXED (2026-07-10) — all 3 rows PASS; both root causes found and fixed
+
+## Fix summary (2026-07-10, second follow-up session)
+
+All three family rows now pass with the family seed (`B17AC9D3E1F2A0C4`,
+`--nojit` and JIT-on, Linux build host, ES server-module harness at
+`/data/data/es-jit-deopt-gc-bundle-20260708-214648/elasticsearch`):
+
+- `ES815BitFlatVectorFormatTests` — PASS, `OK (6 tests)` (was AIOOBE).
+- `ES93HnswBFloat16VectorsFormatTests` — PASS, `OK (17 tests)` (was AIOOBE).
+- `ES93FlatBFloat16VectorFormatTests` — PASS, `OK (53 tests)` (was
+  `BufferUnderflowException` + `Caused by: java.lang.Object`).
+
+Three distinct bugs stacked under this doc's face (on top of the
+`RandomizedContext.current()` regression fixed by the first follow-up
+session, see
+`docs/internal/fixed-suite-bugs/randomizedcontext-current-null-instead-of-throw-FIXED.md`):
+
+### 1. `ByteBuffer.put(ByteBuffer)` silently no-oped when either side is a direct buffer
+
+`native-builtins/src/servlet.rs`'s live s2 `put(Ljava/nio/ByteBuffer;)`
+native returned early — copying nothing and advancing neither position —
+whenever a side had no heap array (`s2_bb_arr == None`), which is exactly
+what a real-JDK `DirectByteBuffer` looks like (`hb == null`, storage at
+`address`). `IOUtil.read` routes **every buffered `FileChannel` read**
+through a temporary direct buffer and then `dst.put(directSrc)`, so file
+reads "succeeded" (correct byte count returned by `pread`) while delivering
+ZERO bytes into an unmoved heap buffer. Lucene's
+`BufferedIndexInput.refill()` then `flip()`ed an empty buffer and the first
+`readByte()` threw `BufferUnderflowException` — the doc's testMultiClose
+face (testMultiClose is the one test whose seed-chosen directory is
+FS-backed; forcing `-Dtests.directory=NIOFSDirectory` produced 35 identical
+underflows pre-fix, and a 40-line probe — `NIOFSDirectory` write 5000 bytes,
+`openInput().readByte()` — reproduced it standalone).
+
+Fixed by teaching the copy loop to read/write direct buffers through
+`address` + `copy_from/to_native_memory` (same resolution as native-io's
+`directbuffer_address`), in both the live `servlet.rs` registration and its
+`tests_extracted.rs` sibling.
+
+### 2. `Throwable.addSuppressed` wrote the suppressed list into the real-JDK `cause` slot — the `Caused by: java.lang.Object` corruption
+
+`native_throwable_add_suppressed` (`native-builtins/src/lang_misc.rs`)
+stored its suppressed ref-array in POSITIONAL field 2. That matches only an
+old 3-field synthetic throwable layout; on the real-JDK `Throwable` layout
+(`backtrace`(0), `detailMessage`(1), `cause`(2), ...) field 2 is **`cause`**.
+`CodecUtil.checkFooter(in, priorException)` calls
+`priorException.addSuppressed(t)` before `IOUtils.rethrowAlways`, so the
+BufferUnderflowException's self-sentinel cause was overwritten with an
+`Object[]` (element class id 0 = `java/lang/Object` → printed as
+`Caused by: java.lang.Object`; the trace printer then walked the array as a
+Throwable, which is what tripped the `gen_heap::read_slot` corrupt-Value-cell
+guard seen in the same runs).
+
+This fully explains the previous session's `CRATONVM_DBG_CAUSE` evidence and
+**refutes the GC self-forward relocation theory** in the update below: the
+mystery cause value (hash `493742`, never seen on any WRITE line) was the
+suppressed-array write bypassing `write_throwable_cause` entirely — plain
+deterministic slot aliasing, no GC involvement (consistent with the failure
+being deterministic in 3s runs).
+
+Fixed by rewriting `addSuppressed`/`getSuppressed` to real-JDK semantics on
+the NAMED `suppressedExceptions` field (SUPPRESSED_SENTINEL swap to a real
+`java.util.ArrayList`, `List.add`, `toArray()` on read), with the legacy
+ref-array representation still honored if encountered.
+
+### 3. (unmasked by #1) `order(LITTLE_ENDIAN)` ignored on real-JDK buffers — byteswapped `getShort`/`getInt`/`getLong`
+
+With #1 fixed, testMultiClose progressed to
+`CorruptIndexException: truncated file: length=79 but
+expectedLength==5692549928996306944` — that magic number is **79
+byte-reversed**. `order(LITTLE_ENDIAN)` (exactly what
+`BufferedIndexInput.refill` sets on its buffer) was a complete no-op on
+s2-managed buffers in real-JDK mode, for three stacked reasons:
+
+- The `order(ByteOrder)` native decoded its argument as
+  `get_field(bo, 0).as_int()` — but the REAL `ByteOrder` statics store the
+  `name` String in field 0, so every real constant silently decoded to
+  0 = BIG_ENDIAN.
+- `s2_bb_order` read/wrote the synthetic slot 5 (`BB_ORDER`); on
+  real-layout buffers that index aliases `segment`. (Load-bearing
+  discovery: in real-JDK mode `alloc_concurrent_synthetic(_,
+  "java/nio/ByteBuffer", 6)` resolves the REAL abstract class and
+  allocates its full 11-field layout — there are no 6-slot synthetic
+  buffers at all; slots 1/2/3 aligning with position/limit/capacity is
+  what kept the rest of the family working.)
+- Nothing seeded the named `bigEndian` field to the JDK BIG_ENDIAN default
+  on ctor-bypassing allocation.
+
+`Lucene104PostingsReader`'s `expectedDocFileLength = metaIn.readLong()`
+therefore came back byteswapped. Fixed by decoding both ByteOrder
+representations, discriminating the layout by PHYSICAL FIELD COUNT (6-slot
+pure-synthetic → `BB_ORDER` slot; otherwise the named
+`bigEndian`/`nativeByteOrder` booleans that native-io's
+`dbb_allocate_direct0` already seeds), seeding the JDK default in
+`bb_write_hb`, returning the real `ByteOrder` statics from `order()`
+(identity comparisons), and routing slice/view order propagation through
+the layout-aware accessors. Note: neither class name nor name-based field
+resolution discriminates the two layouts — both succeed on both.
+
+### Diagnostics added
+
+- `CRATONVM_DBG_BUFUNDER=1` (`vm/src/runtime/exceptions.rs`): dumps the live
+  Java stack when a `BufferUnderflowException` is raised Rust-side — these
+  never pass the `Athrow` opcode, so `CRATONVM_DBG_ATHROW` only ever showed
+  the later Java-level rethrow (`IOUtils.rethrowAlways`), which is what sent
+  the original triage to `CodecUtil.checkFooter` instead of the true origin
+  (`BufferedIndexInput.readByte` → forced-native `ByteBuffer.get()`).
+
+### Residuals (split out, NOT this family)
+
+- The s2 synthetic ByteBuffer family has further real-JDK direct-buffer gaps
+  (`get([BII)`/`get([B)` fall back to reading from the DESTINATION array on
+  a direct receiver; `equals`/`hashCode`/`compareTo`/`compact` are
+  heap-array-only) — see
+  `docs/known-issues/s2-bytebuffer-natives-real-jdk-direct-buffer-gaps.md`.
+- Forcing `-Dtests.directory=ByteBuffersDirectory` fails testMultiClose with
+  `NoSuchMethodException: <init>` (reflective `Directory` reconstruction
+  gap), and a Lucene `ChecksumIndexInput.getChecksum()` value diverges from
+  HotSpot on identical file bytes (self-consistent within CratonVM, so
+  same-VM write/read cycles pass; `java.util.zip.CRC32` itself verified
+  correct) — both noted in the same residual doc.
+
+Validation runs (Azure Linux host, `/data/data/esvec-probe-results/`):
+`fixed-final-20260710` (fixes #1+#2 at dev `4b08ffad`: ES815 6/6 PASS, Hnsw
+17/17 PASS, Flat progressed underflow→byteswap face) and
+`base-validated-20260710` (all three fixes at dev `4b08ffad`: all 3 rows
+PASS). Standalone probes in `/tmp/Probe{Put,ChanRead2,NIOFS,LongRT,Order,Crc}.java`.
+
+NOTE on the validation base: the 3-class suite validation ran at dev
+`4b08ffad` + these fixes, NOT at the merge-time dev tip — every
+`RandomizedRunner`-based ES class at the current tip is killed at bootstrap
+by the unrelated OPEN regression
+`docs/known-issues/elasticsearch-suite/ES-FAIL-20260710-randomizedrunner-classmodel-modifier-stringjoiner-cce.md`
+(introduced by `aa21e334`, bisected by another session). The standalone
+probes (which do not use RandomizedRunner) pass identically when built at
+the tip with these fixes. Re-run the three classes once that regression is
+fixed.
+
 
 ## Update 2026-07-10 (follow-up session)
 
