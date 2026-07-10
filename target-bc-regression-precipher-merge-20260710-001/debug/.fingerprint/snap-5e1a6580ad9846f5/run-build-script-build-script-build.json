@@ -1,1 +1,0 @@
-{"rustc":1562763049001146449,"features":"","declared_features":"","target":0,"profile":0,"path":0,"deps":[[18412833500638531047,"build_script_build",false,11855395881959573649]],"local":[{"Precalculated":"1.1.1"}],"rustflags":["-C","target-feature=+sse4.2,+pclmulqdq","-C","link-arg=/STACK:16777216"],"config":0,"compile_kind":0}
