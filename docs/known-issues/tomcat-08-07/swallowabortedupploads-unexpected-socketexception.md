@@ -302,3 +302,34 @@ aborted, don't drain" (both look identical at the raw-socket level — see the
 2026-07-09 candidate-fix section above and Tomcat's own
 `IdentityInputFilter.end()` / `checkSwallowInput()` — there is no separate
 `SO_LINGER`-style signal to key off).
+
+## 2026-07-10 WebSocket close-delay branch correction
+
+The WebSocket close-delay investigation found a separate `lock is null` signal
+that should not be conflated with the HTTP swallow-upload blocker above. In
+`TestWsRemoteEndpointImplServerDeadlock`, the misleading `lock` message came
+from `java.util.concurrent.LinkedBlockingDeque.clear()` on Tomcat's WebSocket
+`WriteBuffer`, not from `SocketWrapperBase.lock`; direct `SocketWrapperBase`
+construction/read probes kept its `lock` field non-null.
+
+This branch drops the synthetic `LinkedBlockingDeque` fallback surface in
+real-JDK mode so the real JDK constructor initializes `lock`, `notEmpty`,
+`notFull`, and the linked-node fields. A pre-merge run of
+`TestSwallowAbortedUploads` with the final WebSocket-close binary and a
+temporary logging basedir no longer showed the old `NioEndpoint ...
+ReentrantLock.lock() because "lock" is null` processor error, and instead
+reached request/response assertions:
+
+```text
+Tests run: 10, Failures: 6
+1) testAbortedPOSTOKSwallow
+2) testAbortedUploadLimitedNoSwallow
+3) testChunkedPUTLimit
+4) testAbortedPOST413Swallow
+5) testAbortedPOST413NoSwallow
+6) testAbortedPOSTOKNoSwallow
+```
+
+Status remains OPEN. The next swallow-upload investigation should account for
+the stale/lost-local finding above and then re-check these six behavioral
+assertion failures once the HTTP socket processor path is stable.
