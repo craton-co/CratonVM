@@ -18430,6 +18430,18 @@ pub fn register_essential_natives(registry: &mut NativeMethodRegistry) {
         "(I)I",
         native_matcher_end_idx,
     );
+    registry.register(
+        "java/util/regex/Matcher",
+        "replaceAll",
+        "(Ljava/lang/String;)Ljava/lang/String;",
+        native_matcher_replace_all,
+    );
+    registry.register(
+        "java/util/regex/Matcher",
+        "replaceFirst",
+        "(Ljava/lang/String;)Ljava/lang/String;",
+        native_matcher_replace_first,
+    );
 
     // bug-26 (kafka SCRAM): `javax.crypto.Mac` (getInstance/init/update/doFinal)
     // was only registered inside `register_synthetic_overrides`, which real-JDK
@@ -44565,7 +44577,7 @@ fn native_matcher_replace_all(ctx: &mut dyn NativeContext, args: &[Value]) -> Me
         None => return Ok(Some(Value::Object(Some(ctx.create_string(&input))))),
     };
     let re = read_pattern_regex(ctx, pat_obj)?;
-    let result = re.replace_all(&input, replacement.as_str());
+    let result = re.replace_all_java(&input, replacement.as_str());
     Ok(Some(Value::Object(Some(ctx.create_string(&result)))))
 }
 
@@ -44584,7 +44596,7 @@ fn native_matcher_replace_first(ctx: &mut dyn NativeContext, args: &[Value]) -> 
         None => return Ok(Some(Value::Object(Some(ctx.create_string(&input))))),
     };
     let re = read_pattern_regex(ctx, pat_obj)?;
-    let result = re.replace_first(&input, replacement.as_str());
+    let result = re.replace_first_java(&input, replacement.as_str());
     Ok(Some(Value::Object(Some(ctx.create_string(&result)))))
 }
 
