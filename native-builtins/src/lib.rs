@@ -18411,8 +18411,9 @@ pub fn register_essential_natives(registry: &mut NativeMethodRegistry) {
         registry.register(cond, "signalAll", "()V", native_cond_signal_all);
     });
 
-    // JBoss Modules' Java-version gate reaches regex while Pattern/Matcher are
-    // still synthetic stubs in this bootstrap path.
+    // JBoss Modules' Java-version gate can reach regex while Pattern/Matcher are
+    // still synthetic stubs. Real-JDK mode drops these legacy layout natives via
+    // `NativeMethodRegistry::set_drop_real_layout_synthetic`.
     registry.register(
         "java/util/regex/Pattern",
         "compile",
