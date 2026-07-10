@@ -1204,12 +1204,39 @@ fn print_throwable_chain_to_stream_obj(
     ctx.unpin_native_roots(pin);
 }
 
-/// addSuppressed(Throwable) — append to suppressed list stored in field 2
+/// Resolve the `Throwable.SUPPRESSED_SENTINEL` static (the immutable "no
+/// suppressed exceptions yet, but suppression is enabled" marker list).
+/// `None` before `Throwable.<clinit>` has run.
+fn throwable_suppressed_sentinel(ctx: &dyn NativeContext) -> Option<ObjectRef> {
+    let cid = ctx.class_id_by_name("java/lang/Throwable")?;
+    let idx = ctx.static_field_index_by_name(cid, "SUPPRESSED_SENTINEL")?;
+    match ctx.get_static_field(cid, idx) {
+        Value::Object(Some(o)) => Some(o),
+        _ => None,
+    }
+}
+
+/// addSuppressed(Throwable) — mirror the real-JDK semantics on the NAMED
+/// `suppressedExceptions` field.
+///
+/// The previous implementation appended a ref-array into POSITIONAL field 2.
+/// That slot only matched an old 3-field synthetic throwable layout; on the
+/// real-JDK `Throwable` layout (`backtrace`(0), `detailMessage`(1),
+/// `cause`(2), ...) field 2 is `cause`, so every `addSuppressed` call
+/// OVERWROTE THE CAUSE with an `Object[]`. Lucene's
+/// `CodecUtil.checkFooter(in, priorException)` calls
+/// `priorException.addSuppressed(t)` before rethrowing, so every JUnit
+/// failure trace through that path printed the corrupted chain as
+/// `Caused by: java.lang.Object` (and walking the array-as-Throwable tripped
+/// the gen_heap corrupt-Value-cell guard). This is also why the
+/// `CRATONVM_DBG_CAUSE` instrumentation above never saw a WRITE for the
+/// mystery cause value: the clobber bypassed `write_throwable_cause`
+/// entirely. Doc: ES-FAIL-FAMILY-20260710-vector-codec-exception-cause-object.
 pub(crate) fn native_throwable_add_suppressed(
     ctx: &mut dyn NativeContext,
     args: &[Value],
 ) -> MethodCallResult {
-    use cratonvm_types::ClassId;
+    use cratonvm_types::ObjectKind;
     let this = match args.first() {
         Some(Value::Object(Some(r))) => *r,
         _ => return Ok(None),
@@ -1222,56 +1249,96 @@ pub(crate) fn native_throwable_add_suppressed(
     if this == suppressed {
         return Ok(None);
     }
-    // Check if the object has enough fields for suppressed storage (field 2)
-    let num_fields = ctx.object_num_fields(this);
-    if num_fields < 3 {
-        return Ok(None); // object too small, silently ignore
-    }
-    // Get existing suppressed array from field 2
-    let existing = ctx.get_field(this, 2);
-    match existing {
-        Value::Object(Some(arr)) => {
-            // Grow the array: copy old elements + append new one
-            let old_len = ctx.array_length(arr);
-            let new_arr = ctx.new_ref_array(ClassId::new(0), old_len + 1);
-            for i in 0..old_len {
-                let elem = ctx.get_array_element(arr, i);
-                ctx.set_array_element(new_arr, i, elem);
-            }
-            ctx.set_array_element(new_arr, old_len, Value::Object(Some(suppressed)));
-            ctx.set_field(this, 2, Value::Object(Some(new_arr)));
+    let sentinel = throwable_suppressed_sentinel(ctx);
+    let current = ctx.get_field_by_name(this, "suppressedExceptions");
+    match current {
+        // A live list that is NOT the shared sentinel: append via List.add,
+        // exactly like the real `Throwable.addSuppressed` bytecode. (A
+        // ref-array here would be a leftover from the old positional
+        // representation; treat it below like "no list yet" rather than
+        // calling List methods on it.)
+        Value::Object(Some(list))
+            if Some(list) != sentinel && ctx.heap_kind_of(list) != ObjectKind::Array =>
+        {
+            let _ = ctx.invoke_virtual(
+                list,
+                "add",
+                "(Ljava/lang/Object;)Z",
+                &[Value::Object(Some(suppressed))],
+            );
         }
+        // Sentinel / unset / legacy array: swap in a fresh ArrayList holding
+        // the element (JDK: `suppressedExceptions = new ArrayList<>(1);
+        // suppressedExceptions.add(exception);`). The JDK treats a null list
+        // as "suppression disabled", but our shadowed constructors can leave
+        // the field unset on bootstrap-era throwables, so be lenient and
+        // enable suppression instead of dropping the exception.
         _ => {
-            // No existing array — create one with single element
-            let new_arr = ctx.new_ref_array(ClassId::new(0), 1);
-            ctx.set_array_element(new_arr, 0, Value::Object(Some(suppressed)));
-            ctx.set_field(this, 2, Value::Object(Some(new_arr)));
+            // The ArrayList allocation + add can GC; pin the throwable and
+            // the suppressed exception across them.
+            let pin = ctx.pin_native_root(this);
+            let suppressed_pin = ctx.pin_native_root(suppressed);
+            if let Ok(Some(Value::Object(Some(list)))) =
+                ctx.new_object_initialized("java/util/ArrayList", "()V", &[])
+            {
+                let suppressed = ctx.read_native_pin(suppressed_pin, suppressed);
+                let list_pin = ctx.pin_native_root(list);
+                let _ = ctx.invoke_virtual(
+                    list,
+                    "add",
+                    "(Ljava/lang/Object;)Z",
+                    &[Value::Object(Some(suppressed))],
+                );
+                let list = ctx.read_native_pin(list_pin, list);
+                let this = ctx.read_native_pin(pin, this);
+                ctx.set_field_by_name(this, "suppressedExceptions", Value::Object(Some(list)));
+            }
+            ctx.unpin_native_roots(pin);
         }
     }
     Ok(None)
 }
 
-/// getSuppressed() — return Throwable[] from field 2, or empty array if not set
+/// getSuppressed() — return `Throwable[]` from the named
+/// `suppressedExceptions` list, mirroring the real-JDK accessor (sentinel or
+/// null/unset → empty array). See `native_throwable_add_suppressed` for why
+/// the old positional-field-2 representation was wrong.
 pub(crate) fn native_throwable_get_suppressed(
     ctx: &mut dyn NativeContext,
     args: &[Value],
 ) -> MethodCallResult {
-    use cratonvm_types::ClassId;
+    use cratonvm_types::{ClassId, ObjectKind};
+    let elem_cid = ctx
+        .class_id_by_name("java/lang/Throwable")
+        .unwrap_or(ClassId::new(0));
     let this = match args.first() {
         Some(Value::Object(Some(r))) => *r,
         _ => {
-            let arr = ctx.new_ref_array(ClassId::new(0), 0);
+            let arr = ctx.new_ref_array(elem_cid, 0);
             return Ok(Some(Value::Object(Some(arr))));
         }
     };
-    let num_fields = ctx.object_num_fields(this);
-    if num_fields >= 3 {
-        if let Value::Object(Some(arr)) = ctx.get_field(this, 2) {
-            return Ok(Some(Value::Object(Some(arr))));
+    let sentinel = throwable_suppressed_sentinel(ctx);
+    match ctx.get_field_by_name(this, "suppressedExceptions") {
+        Value::Object(Some(o)) if Some(o) == sentinel => {}
+        // Leftover from the old positional ref-array representation — return
+        // it verbatim (it already is a reference array of throwables).
+        Value::Object(Some(o)) if ctx.heap_kind_of(o) == ObjectKind::Array => {
+            return Ok(Some(Value::Object(Some(o))));
         }
+        Value::Object(Some(list)) => {
+            // Real java.util.List — copy out via toArray(), like the JDK's
+            // `suppressedExceptions.toArray(EMPTY_THROWABLE_ARRAY)`.
+            if let Ok(Some(v @ Value::Object(Some(_)))) =
+                ctx.invoke_virtual(list, "toArray", "()[Ljava/lang/Object;", &[])
+            {
+                return Ok(Some(v));
+            }
+        }
+        _ => {}
     }
     // No suppressed exceptions stored — return empty array
-    let arr = ctx.new_ref_array(ClassId::new(0), 0);
+    let arr = ctx.new_ref_array(elem_cid, 0);
     Ok(Some(Value::Object(Some(arr))))
 }
 
