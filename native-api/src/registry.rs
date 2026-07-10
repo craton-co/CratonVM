@@ -3211,8 +3211,24 @@ impl NativeMethodRegistry {
         // `ThreadPoolExecutor` bytecode runs end-to-end on CratonVM
         // (submit/execute/addWorker/runWorker/getTask), so dropping these lets
         // `shutdownNow` interrupt workers correctly. See `drop_real_layout_synthetic`.
+        // `execute(Runnable)` is exempted from this drop: CratonVM's
+        // `Executors.newSingleThreadExecutor()`/`newFixedThreadPool()`/
+        // `newCachedThreadPool()` factories (native-builtins's
+        // `native_new_single_thread`/`native_new_fixed_pool`/
+        // `native_new_cached_pool`) stamp their return value with this real
+        // class name but never run it through the real `<init>`, so real
+        // `execute()` bytecode NPEs on the uninitialized `ctl` AtomicInteger
+        // (docs/known-issues/threadpoolexecutor-execute-npe-on-ctl-regression.md).
+        // The registered native must stay available so the interpreter's
+        // force-list (`force_native_over_real_jdk_bytecode` in
+        // vm/src/runtime/interpreter.rs) can select it for these synthetic
+        // objects; `intercept_force_registered_native` there additionally
+        // checks the receiver's real `workers` field so a genuinely real,
+        // bytecode-constructed `ThreadPoolExecutor` still runs its own real
+        // `execute()`.
         if self.drop_real_layout_synthetic
             && class_name == "java/util/concurrent/ThreadPoolExecutor"
+            && !(method_name == "execute" && descriptor == "(Ljava/lang/Runnable;)V")
         {
             return;
         }

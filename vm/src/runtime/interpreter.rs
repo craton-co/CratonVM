@@ -21173,6 +21173,28 @@ fn force_native_over_real_jdk_bytecode(
         return true;
     }
 
+    // `Executors.newSingleThreadExecutor()`/`newFixedThreadPool()`/
+    // `newCachedThreadPool()` (native-builtins/src/lib.rs's
+    // `native_new_single_thread`/`native_new_fixed_pool`/`native_new_cached_pool`)
+    // allocate their return value under the REAL class name
+    // `java/util/concurrent/ThreadPoolExecutor` but never run it through the
+    // real `<init>` -- real fields like `ctl`/`workQueue`/`mainLock` are never
+    // set. Once `execute(Runnable)` (invoked via `invokeinterface
+    // Executor.execute`/`ExecutorService.execute`) resolves to the concrete
+    // class's own real bytecode, that bytecode reads the never-initialized
+    // `ctl` AtomicInteger and NPEs immediately (docs/known-issues/
+    // threadpoolexecutor-execute-npe-on-ctl-regression.md). Force the
+    // registered native (`native_es_execute`) to win for this triple;
+    // `intercept_force_registered_native` additionally checks the receiver's
+    // real `workers` field so a genuinely real, bytecode-constructed
+    // `ThreadPoolExecutor` still runs its own real `execute()` bytecode.
+    if class_name == "java/util/concurrent/ThreadPoolExecutor"
+        && method_name == "execute"
+        && method_descriptor == "(Ljava/lang/Runnable;)V"
+    {
+        return true;
+    }
+
     if class_name == "java/nio/ByteBuffer"
         && matches!(
             (method_name, method_descriptor),
@@ -22482,6 +22504,27 @@ pub(crate) fn should_force_registered_native_over_bytecode(
 /// Dispatch a force-native override via `safe_native_call`, pushing any return
 /// value onto the caller operand stack.
 #[inline]
+/// Whether `recv` (the receiver of a `ThreadPoolExecutor.execute()` call) is
+/// a genuinely real, bytecode-constructed `ThreadPoolExecutor` rather than
+/// one of CratonVM's synthetic 2-field `Executors.new*ThreadPool()` stand-ins.
+/// Mirrors `native-builtins::executor_has_real_workers` (same check, same
+/// field) but works from the interpreter, which only has `SharedVm`/`JvmThread`
+/// -- not a `NativeContext` -- available at this dispatch point.
+fn threadpool_executor_has_real_workers(shared: &SharedVm, recv: &Value) -> bool {
+    let Value::Object(Some(recv)) = recv else {
+        return false;
+    };
+    let class_id = shared.heap.class_id_of(*recv);
+    let cm = shared.class_manager.read();
+    let Some(index) =
+        crate::vm::vm_exec::resolve_field_index_in_hierarchy(class_id, "workers", &cm.class_store)
+    else {
+        return false;
+    };
+    drop(cm);
+    matches!(shared.heap.get_field(*recv, index), Value::Object(Some(_)))
+}
+
 fn intercept_force_registered_native(
     shared: &SharedVm,
     thread: &mut JvmThread,
@@ -22512,6 +22555,17 @@ fn intercept_force_registered_native(
         method_name,
         method_descriptor,
     ) {
+        return None;
+    }
+    // A genuinely real, bytecode-constructed `ThreadPoolExecutor` (its own
+    // real `<init>` ran, so its real `workers` field is populated) must keep
+    // running its own real `execute()` -- only CratonVM's synthetic 2-field
+    // `Executors.new*ThreadPool()` objects need the forced native. See
+    // docs/known-issues/threadpoolexecutor-execute-npe-on-ctl-regression.md.
+    if class_name == "java/util/concurrent/ThreadPoolExecutor"
+        && method_name == "execute"
+        && threadpool_executor_has_real_workers(shared, &args[0])
+    {
         return None;
     }
     let cb = shared
@@ -22752,6 +22806,61 @@ fn surefire_lazy_launcher_discover_native(
     Some(cb)
 }
 
+/// Synthetic stubs are fallback implementations for fake or incomplete JDK
+/// classes. When the real class bytecode is loaded and explicitly protected,
+/// dispatch must prefer that bytecode over the approximate stub.
+fn synthetic_stub_should_yield_to_real_bytecode(
+    shared: &SharedVm,
+    class_name: &str,
+    method_name: &str,
+    descriptor: &str,
+) -> bool {
+    let synthetic_stub_native = shared
+        .native_methods
+        .kind_of(class_name, method_name, descriptor)
+        == Some(cratonvm_native_api::NativeKind::SyntheticStub);
+    if !synthetic_stub_native {
+        return false;
+    }
+
+    let real_protected_stub = crate::runtime::env_cache::real_bytecode_selector()
+        .prefers_real(class_name)
+        || matches!(
+            class_name,
+            "java/util/concurrent/locks/ReentrantLock"
+                | "java/util/concurrent/LinkedBlockingDeque"
+                | "java/util/concurrent/atomic/AtomicBoolean"
+                | "java/util/EnumSet"
+                | "java/util/StringJoiner"
+                | "java/io/FileInputStream"
+                | "java/lang/ref/Cleaner"
+                | "java/lang/ref/Cleaner$Cleanable"
+                | "java/lang/management/ManagementFactory"
+        );
+    if !real_protected_stub {
+        return false;
+    }
+
+    let cm = shared.class_manager.read();
+    cm.get_loaded_class_id(class_name)
+        .and_then(|cid| {
+            cm.get_class(cid).and_then(|cls| {
+                if cls.is_synthetic_stub {
+                    None
+                } else {
+                    crate::classloading::find_method_recursive(
+                        cid,
+                        method_name,
+                        descriptor,
+                        &cm.class_store,
+                    )
+                    .map(|(m, _)| !m.is_native() && m.code().is_some())
+                }
+            })
+        })
+        .unwrap_or(false)
+}
+
 /// Stackless invoke: resolve a method and either call native (Handled) or push
 /// a bytecode frame (FramePushed).  Returns `CacheMiss` for exotic cases that
 /// cannot be handled stacklessly (signature-polymorphic, JNI, etc.), in which
@@ -22959,6 +23068,16 @@ fn try_stackless_invoke(
     } else {
         native_cb
     };
+    let native_cb = if synthetic_stub_should_yield_to_real_bytecode(
+        shared,
+        class_name,
+        method_name,
+        descriptor,
+    ) {
+        None
+    } else {
+        native_cb
+    };
     if crate::runtime::env_cache::bd_debug()
         && (method_name == "intValue"
             || (class_name.contains("BigDecimal")
@@ -23140,16 +23259,23 @@ fn try_stackless_invoke(
             .native_methods
             .find(&class_name_arc, method_name, descriptor)
         {
-            let result = safe_native_call(shared, thread, callback, args)?;
-            if let Some(value) = result.filter(|_| ret_type != b'V') {
-                // T18.K4 — tag-exact push for J/D native-override (on bytecode method) return values.
-                push_invoke_return_value(
-                    &mut thread.frames[frame_idx].stack,
-                    coerce_value_for_return(value, ret_type),
-                )?;
-                native_return_pushed_to_stack(shared, thread);
+            if !synthetic_stub_should_yield_to_real_bytecode(
+                shared,
+                &class_name_arc,
+                method_name,
+                descriptor,
+            ) {
+                let result = safe_native_call(shared, thread, callback, args)?;
+                if let Some(value) = result.filter(|_| ret_type != b'V') {
+                    // T18.K4 — tag-exact push for J/D native-override (on bytecode method) return values.
+                    push_invoke_return_value(
+                        &mut thread.frames[frame_idx].stack,
+                        coerce_value_for_return(value, ret_type),
+                    )?;
+                    native_return_pushed_to_stack(shared, thread);
+                }
+                return Ok(CachedCallResult::Handled);
             }
-            return Ok(CachedCallResult::Handled);
         }
     }
 

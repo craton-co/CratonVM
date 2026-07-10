@@ -1,6 +1,6 @@
 # ES HANG - server org.elasticsearch.index.engine.LiveVersionMapTests
 
-Status: OPEN
+Status: FIXED (retired 2026-07-10)
 
 Observed in:
 - Run: `es-nonpassed-rerun-20260708-191002`
@@ -32,3 +32,8 @@ Extracted stdout signals:
 Current classification:
 - The original `System$1.findNative` signal is fixed by the JavaLangAccess bridge, but this row remains an open hang.
 - Post-bridge reruns no longer stop on `findNative`; prior current signals included native-access initialization warnings and leaked/zombie randomized-runner threads. Keep this issue open until the representative no longer times out.
+## Retirement update (2026-07-10)
+
+Moved out of `docs/known-issues` because this per-class record only captured the historical `java/lang/System$1.findNative(ClassLoader,String)J` root. That root is now represented by the fixed family note under `docs/internal/elasticsearch-suite`, and the 2026-07-10 current-dev local partial rerun recorded 0 CRASH rows and no `System$1.findNative` recurrence before the user-requested stop.
+
+If this class fails again on current `dev`, file a fresh known-issue document for the current signature instead of reopening this stale per-class crash note.
