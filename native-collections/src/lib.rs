@@ -26061,8 +26061,12 @@ fn native_tm_clear(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRes
         _ => return Ok(None),
     };
     // Fast-mode side-table needs clearing too — without this an iter
-    // helper would return stale entries from before the clear.
-    tm_fast_with(ctx, this, |bt| bt.clear());
+    // helper would return stale entries from before the clear. Remove the
+    // entry directly instead of going through `tm_fast_with`: comparator-backed
+    // TreeMaps live in array mode, and creating an empty fast entry here would
+    // make subsequent reads ignore the array store after clear()+put().
+    let key = tm_obj_key(ctx, this);
+    tm_fast_table().lock().unwrap().remove(&key);
     let buf = alloc_ref_array(ctx, TM_DEFAULT_CAPACITY * 2);
     tm_set_slot(ctx, this, TM_FIELD_DATA, Value::Object(Some(buf)));
     tm_set_slot(ctx, this, TM_FIELD_SIZE, Value::Int(0));
