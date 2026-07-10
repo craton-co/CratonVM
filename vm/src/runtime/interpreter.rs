@@ -21366,6 +21366,24 @@ fn force_native_over_real_jdk_bytecode(
         return true;
     }
 
+    // `java.util.logging.Level.parse(String)` real bytecode resolves custom
+    // and even standard level names through `KnownLevel.findByName`, which
+    // on JDK 25 throws internally (a `Module`-null NPE the method's own
+    // catch-all reports as a generic `IllegalArgumentException: Bad level`)
+    // — see `docs/internal/gaps/kc16-blocker-map.md`'s KC16 investigation.
+    // This broke WildFly's own `host.xml`/`domain.xml` parsing of
+    // `<level name="WARN"/>` (org.jboss.logmanager's extended levels) before
+    // it ever reached a genuinely-unknown name. Force the registered native
+    // (`native_level_parse`, native-builtins/src/logmanager.rs), which
+    // answers from the standard + JBoss LogManager static Level constants
+    // directly, bypassing the broken registry lookup.
+    if class_name == "java/util/logging/Level"
+        && method_name == "parse"
+        && method_descriptor == "(Ljava/lang/String;)Ljava/util/logging/Level;"
+    {
+        return true;
+    }
+
     if is_forkjoin_native_override(class_name, method_name, method_descriptor) {
         return true;
     }
