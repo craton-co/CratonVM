@@ -59,10 +59,25 @@ pub const MAX_STRUCT_BYTES: usize = 4096;
 /// or hostile descriptor.
 pub const MAX_LAYOUT_DEPTH: usize = 16;
 
-/// Read the layout-kind discriminator (field 0) from a layout synthetic.
+/// Read the layout-kind discriminator from a layout synthetic.
 pub fn read_layout_kind(ctx: &dyn NativeContext, layout: ObjectRef) -> i32 {
     match ctx.get_field(layout, 0) {
         Value::Int(k) => k,
+        Value::Long(_) => {
+            let class_name = ctx.class_name_of_id(ctx.class_id_of_object(layout));
+            match class_name.as_deref() {
+                Some("java/lang/foreign/ValueLayout$OfByte") => LAYOUT_BYTE,
+                Some("java/lang/foreign/ValueLayout$OfBoolean") => LAYOUT_BOOLEAN,
+                Some("java/lang/foreign/ValueLayout$OfChar") => LAYOUT_CHAR,
+                Some("java/lang/foreign/ValueLayout$OfShort") => LAYOUT_SHORT,
+                Some("java/lang/foreign/ValueLayout$OfInt") => LAYOUT_INT,
+                Some("java/lang/foreign/ValueLayout$OfLong") => LAYOUT_LONG,
+                Some("java/lang/foreign/ValueLayout$OfFloat") => LAYOUT_FLOAT,
+                Some("java/lang/foreign/ValueLayout$OfDouble") => LAYOUT_DOUBLE,
+                Some("java/lang/foreign/AddressLayout") => LAYOUT_ADDRESS,
+                _ => LAYOUT_LONG,
+            }
+        }
         _ => LAYOUT_LONG, // safe default
     }
 }

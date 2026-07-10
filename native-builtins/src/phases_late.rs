@@ -10,7 +10,7 @@ use cratonvm_types::error::{
     LinkageError, MethodCallFailed, MethodCallResult, RuntimeError, VmError,
 };
 use cratonvm_types::ClassId;
-use cratonvm_types::{ObjectRef, Value};
+use cratonvm_types::{ArrayElementType, ObjectRef, Value};
 
 use crate::{alloc_concurrent_synthetic, native_noop, native_noop_with_this, obj_arg};
 use crate::{native_cf_then_accept, native_cf_then_apply};
@@ -39683,15 +39683,15 @@ pub(crate) fn register_p67_foreign_memory(r: &mut NativeMethodRegistry) {
         "downcallHandle",
         "(Ljava/lang/foreign/MemorySegment;Ljava/lang/foreign/FunctionDescriptor;[Ljava/lang/foreign/Linker$Option;)Ljava/lang/invoke/MethodHandle;",
         |ctx, args| {
-            let addr_seg = obj_arg(args, 0)?;
-            let descriptor = obj_arg(args, 1)?;
+            let addr_seg = obj_arg(args, 1)?;
+            let descriptor = obj_arg(args, 2)?;
             let fn_addr = match ctx.get_field(addr_seg, 0) {
                 Value::Long(v) => v,
                 _ => 0,
             };
 
             let mut variadic_fixed: i64 = -1;
-            if let Some(Value::Object(Some(opts))) = args.get(2) {
+            if let Some(Value::Object(Some(opts))) = args.get(3) {
                 let n = ctx.array_length(*opts);
                 for i in 0..n {
                     if let Value::Object(Some(opt)) = ctx.get_array_element(*opts, i) {
@@ -39718,19 +39718,50 @@ pub(crate) fn register_p67_foreign_memory(r: &mut NativeMethodRegistry) {
             Ok(Some(Value::Object(Some(dh))))
         }
     );
+    let dh = "java/lang/foreign/DowncallHandle";
+    r.register(
+        dh,
+        "invoke",
+        "([Ljava/lang/Object;)Ljava/lang/Object;",
+        crate::panama::pe_downcall_invoke,
+    );
+    r.register(
+        dh,
+        "invokeExact",
+        "([Ljava/lang/Object;)Ljava/lang/Object;",
+        crate::panama::pe_downcall_invoke,
+    );
 
     // FunctionDescriptor
     let fd = "java/lang/foreign/FunctionDescriptor";
-    r.register(fd, "of", "(Ljava/lang/foreign/MemoryLayout;[Ljava/lang/foreign/MemoryLayout;)Ljava/lang/foreign/FunctionDescriptor;", |ctx, _args| {
-        let obj = alloc_concurrent_synthetic(ctx, "java/lang/foreign/FunctionDescriptor", 0);
-        Ok(Some(Value::Object(Some(obj))))
-    });
+    r.register(
+        fd,
+        "of",
+        "(Ljava/lang/foreign/MemoryLayout;[Ljava/lang/foreign/MemoryLayout;)Ljava/lang/foreign/FunctionDescriptor;",
+        |ctx, args| {
+            let return_layout = obj_arg(args, 0)?;
+            let params = match args.get(1) {
+                Some(Value::Object(Some(arr))) => *arr,
+                _ => ctx.new_array(ArrayElementType::Reference, 0),
+            };
+            let obj = alloc_concurrent_synthetic(ctx, "java/lang/foreign/FunctionDescriptor", 2);
+            ctx.set_field(obj, 0, Value::Object(Some(return_layout)));
+            ctx.set_field(obj, 1, Value::Object(Some(params)));
+            Ok(Some(Value::Object(Some(obj))))
+        },
+    );
     r.register(
         fd,
         "ofVoid",
         "([Ljava/lang/foreign/MemoryLayout;)Ljava/lang/foreign/FunctionDescriptor;",
-        |ctx, _args| {
-            let obj = alloc_concurrent_synthetic(ctx, "java/lang/foreign/FunctionDescriptor", 0);
+        |ctx, args| {
+            let params = match args.first() {
+                Some(Value::Object(Some(arr))) => *arr,
+                _ => ctx.new_array(ArrayElementType::Reference, 0),
+            };
+            let obj = alloc_concurrent_synthetic(ctx, "java/lang/foreign/FunctionDescriptor", 2);
+            ctx.set_field(obj, 0, Value::Object(None));
+            ctx.set_field(obj, 1, Value::Object(Some(params)));
             Ok(Some(Value::Object(Some(obj))))
         },
     );

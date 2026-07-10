@@ -425,6 +425,23 @@ pub fn unbox_poly_return(
     }
 }
 
+fn is_method_handle_signature_polymorphic_receiver(class_name: &str) -> bool {
+    class_name == "java/lang/invoke/MethodHandle"
+        || class_name.starts_with("java/lang/invoke/MethodHandle")
+        || (class_name.starts_with("java/lang/invoke/") && class_name.contains("MethodHandle"))
+        || class_name == "java/lang/foreign/DowncallHandle"
+}
+
+fn is_var_handle_signature_polymorphic_receiver(class_name: &str) -> bool {
+    class_name == "java/lang/invoke/VarHandle"
+        || class_name.starts_with("java/lang/invoke/VarHandle")
+        || (class_name.starts_with("java/lang/invoke/") && class_name.contains("VarHandle"))
+}
+
+fn prefers_exact_signature_polymorphic_receiver(class_name: &str) -> bool {
+    class_name == "java/lang/foreign/DowncallHandle"
+}
+
 // ---------------------------------------------------------------------------
 // Safe native callback invocation
 // ---------------------------------------------------------------------------
@@ -13447,10 +13464,7 @@ fn invoke_on_class_shared_inner(
                     // DirectMethodHandle$Constructor, so its readValue silently
                     // failed. Recognise any java/lang/invoke class carrying
                     // "MethodHandle" in its name as a signature-polymorphic receiver.
-                    let is_mh = class_name == "java/lang/invoke/MethodHandle"
-                        || class_name.starts_with("java/lang/invoke/MethodHandle")
-                        || (class_name.starts_with("java/lang/invoke/")
-                            && class_name.contains("MethodHandle"));
+                    let is_mh = is_method_handle_signature_polymorphic_receiver(&class_name);
                     // Recognise any java/lang/invoke class carrying "VarHandle" in
                     // its name, not just ones literally prefixed "VarHandle" — the
                     // JEP 454 FFM API's `SegmentVarHandle` (used by
@@ -13458,10 +13472,7 @@ fn invoke_on_class_shared_inner(
                     // share that prefix, and previously fell through to normal
                     // method resolution and threw NoSuchMethodError. Mirrors the
                     // analogous `is_mh` broadening above.
-                    let is_vh = class_name == "java/lang/invoke/VarHandle"
-                        || class_name.starts_with("java/lang/invoke/VarHandle")
-                        || (class_name.starts_with("java/lang/invoke/")
-                            && class_name.contains("VarHandle"));
+                    let is_vh = is_var_handle_signature_polymorphic_receiver(&class_name);
                     if is_mh || is_vh {
                         let base = if is_mh {
                             "java/lang/invoke/MethodHandle"
@@ -13475,6 +13486,20 @@ fn invoke_on_class_shared_inner(
                             "([Ljava/lang/Object;)V",
                             "([Ljava/lang/Object;)Z",
                         ];
+                        let prefer_exact =
+                            prefers_exact_signature_polymorphic_receiver(&class_name);
+                        if prefer_exact {
+                            for poly_desc in &poly_descs {
+                                if let Some(cb) =
+                                    shared
+                                        .native_methods
+                                        .find(&class_name, method_name, poly_desc)
+                                {
+                                    let r = safe_native_call(shared, thread, cb, args)?;
+                                    return Ok(unbox_poly_return(shared, r, descriptor));
+                                }
+                            }
+                        }
                         for poly_desc in &poly_descs {
                             if let Some(cb) =
                                 shared.native_methods.find(base, method_name, poly_desc)
@@ -13483,15 +13508,17 @@ fn invoke_on_class_shared_inner(
                                 return Ok(unbox_poly_return(shared, r, descriptor));
                             }
                         }
-                        // Also try the exact class name
-                        for poly_desc in &poly_descs {
-                            if let Some(cb) =
-                                shared
-                                    .native_methods
-                                    .find(&class_name, method_name, poly_desc)
-                            {
-                                let r = safe_native_call(shared, thread, cb, args)?;
-                                return Ok(unbox_poly_return(shared, r, descriptor));
+                        if !prefer_exact {
+                            // Also try the exact class name
+                            for poly_desc in &poly_descs {
+                                if let Some(cb) =
+                                    shared
+                                        .native_methods
+                                        .find(&class_name, method_name, poly_desc)
+                                {
+                                    let r = safe_native_call(shared, thread, cb, args)?;
+                                    return Ok(unbox_poly_return(shared, r, descriptor));
+                                }
                             }
                         }
                     }
@@ -14613,6 +14640,28 @@ mod tests {
 
     fn test_shared() -> Arc<SharedVm> {
         Arc::new(SharedVm::new(VmConfig::default()))
+    }
+
+    #[test]
+    fn downcall_handle_uses_method_handle_signature_polymorphic_dispatch() {
+        assert!(is_method_handle_signature_polymorphic_receiver(
+            "java/lang/invoke/MethodHandle"
+        ));
+        assert!(is_method_handle_signature_polymorphic_receiver(
+            "java/lang/invoke/DirectMethodHandle$Constructor"
+        ));
+        assert!(is_method_handle_signature_polymorphic_receiver(
+            "java/lang/foreign/DowncallHandle"
+        ));
+        assert!(!is_method_handle_signature_polymorphic_receiver(
+            "java/lang/foreign/MemorySegment"
+        ));
+        assert!(prefers_exact_signature_polymorphic_receiver(
+            "java/lang/foreign/DowncallHandle"
+        ));
+        assert!(!prefers_exact_signature_polymorphic_receiver(
+            "java/lang/invoke/MethodHandle"
+        ));
     }
 
     #[test]
