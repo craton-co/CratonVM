@@ -6541,6 +6541,30 @@ fn compute_self_call_stack_floor(sp_now: usize) -> usize {
     }
 }
 
+/// Leaf floor query for the INLINE self-recursion check: get-or-compute the
+/// current OS thread's native-stack floor (the same TLS value
+/// `jit_self_call_stack_guard` consults). Called ONCE from the prologue of a
+/// method with direct self-recursive call sites; each site then compares RSP
+/// against the frame-cached value inline. Touches no VM state and never GCs
+/// (no scan-cache boundary note needed — a leaf like `jit_get_current_thread`).
+///
+/// SAFETY: no arguments, reads only this thread's TLS + stack bounds.
+#[no_mangle]
+pub unsafe extern "C" fn jit_native_stack_floor() -> i64 {
+    let probe = 0u8;
+    let sp_now = &probe as *const u8 as usize;
+    JIT_SELF_CALL_STACK_FLOOR.with(|f| {
+        let v = f.get();
+        if v != usize::MAX {
+            v
+        } else {
+            let computed = compute_self_call_stack_floor(sp_now);
+            f.set(computed);
+            computed
+        }
+    }) as i64
+}
+
 /// The self-call stack guard baked before every direct self-recursive CALL.
 /// Returns `0` (proceed) or the `i64::MIN` deopt sentinel with a catchable
 /// `java/lang/StackOverflowError` stashed in `JIT_PENDING_EXCEPTION`.
@@ -6610,7 +6634,7 @@ fn ra_is_reset(ra: usize) -> bool {
 /// just publishes its current savebase address; the watcher keeps DR0 pinned to
 /// it (reset is called at a stable stack depth, so this is steady-state idle).
 #[cfg(windows)]
-mod savebase_watcher {
+pub(crate) mod savebase_watcher {
     use std::sync::atomic::{AtomicBool, AtomicIsize, AtomicUsize, Ordering};
 
     pub static ARM_ADDR: AtomicUsize = AtomicUsize::new(0);
@@ -6882,6 +6906,13 @@ pub fn build_helpers() -> JitRuntimeHelpers {
         // BUG-1 companion — native-stack headroom guard enabling direct
         // (non-dispatch) self-recursive CALLs. See `jit_self_call_stack_guard`.
         self_call_stack_guard: jit_self_call_stack_guard as *const () as usize,
+        // Guarded inline getfield — address of the GC's process-global region
+        // bounds table. Non-zero even under G1/ZGC (the table just stays
+        // all-zero there, so every guard falls through to the checked helper).
+        region_bounds_addr: cratonvm_gc::jit_region_bounds_addr(),
+        // Inline self-recursion check — leaf floor-query helper (see the
+        // jit-api field doc; prologue-called once per self-recursive method).
+        native_stack_floor_fn: jit_native_stack_floor as *const () as usize,
     }
 }
 

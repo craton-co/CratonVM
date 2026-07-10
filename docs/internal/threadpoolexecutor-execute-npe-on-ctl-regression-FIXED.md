@@ -4,6 +4,50 @@ Status: FIXED — 2026-07-10, branch `fix/tpe-npe-dispatch-20260710`, root-cause
 Severity: High (broad blast radius — any code using these three `Executors` factories and calling `.execute()`)
 First confirmed: 2026-07-10, while investigating `wildfly-domain-heap-corrupt-value-timeout.md`
 
+## 2026-07-10 update (later same day) — extended to `submit()`/`shutdown()`; the "real pool loses async semantics" oddity explained and fixed
+
+A separate, parallel session (branch `fix/wildfly-hib32-gate-20260710`, working the same gating
+regression from `wildfly-domain-heap-corrupt-value-timeout.md`, independently) converged on this
+exact same root cause before discovering this fix had already landed, and merged a follow-up on
+top of it:
+
+- **Root cause of the "genuinely real `ThreadPoolExecutor` didn't run truly async" oddity flagged
+  below**: `try_stackless_invoke`'s own direct native-registry lookup (`vm/src/runtime/
+  interpreter.rs`) is a **fourth** dispatch point that reaches `native_es_execute` unconditionally —
+  not one of the three this fix's receiver-aware exemptions patched
+  (`intercept_force_registered_native`, `invoke_or_native`, `invoke_on_class_shared_inner`). A real
+  receiver reaching native via that path hit this fix's "defense in depth" branch in
+  `native_es_execute`, which ran the task inline/synchronously instead of via real bytecode —
+  exactly the discrepancy this doc's last paragraph observed between a pristine and a fixed build.
+- **Fix**: rather than patching a fifth dispatch point, the registry-level drop
+  (`native-api/src/registry.rs`) is now removed entirely for `java/util/concurrent/
+  ThreadPoolExecutor` (not just `execute(Runnable)`), and the real-vs-synthetic decision moved
+  fully into the native callbacks themselves via a new `NativeContext::invoke_virtual_bytecode_only`
+  (bypasses every native check, calling `interpreter::execute` directly — `invoke_on_class_shared`
+  was tried first and found to have its own unconditional native re-check for concrete declaring
+  classes, which reintroduced the recursion this fix's defense-in-depth guarded against). This
+  covers `native_es_execute` regardless of which of the (now at least four) dispatch paths reaches
+  it, with genuine real-bytecode dispatch instead of a synchronous fallback — and applies the same
+  per-instance `executor_has_real_workers` pattern to `submit(Runnable)`/`submit(Callable)`/the
+  `shutdown` closures, closing
+  `docs/internal/threadpoolexecutor-shutdown-npe-on-mainlock-synthetic-executor-FIXED.md` (this
+  doc's sibling) in the same push.
+- This fix's own `intercept_force_registered_native`/`invoke_or_native`/
+  `invoke_on_class_shared_inner` receiver-exemption checks and the `force_native_over_real_jdk_bytecode`
+  allowlist entry for `execute` are left in place — harmless (they just make some paths reach
+  bytecode slightly earlier, without ever reaching native at all) and require no changes.
+- The now-redundant synchronous-inline defense-in-depth branch inside `native_es_execute` was
+  removed (dead code once the earlier `invoke_virtual_bytecode_only` check unconditionally returns
+  first for a real receiver).
+
+Re-verified with this doc's own `ExecProbe.java`, an equivalent of the extended repro
+(`newFixedThreadPool`/`newCachedThreadPool`/`submit()`), a `submit()`+`shutdown()` repro, and a
+genuinely-real `new ThreadPoolExecutor(...)`: `execute()` now runs the task on a real worker thread
+(not synchronously on the caller) and `shutdown()`/`awaitTermination()` complete normally.
+`cargo test -p cratonvm-native-api --lib` (179/179) and `cargo test -p cratonvm-native-builtins
+--lib` (2964/2965 passed — 1 pre-existing, unrelated `ByteBuffer` failure confirmed present on
+unmodified `dev` too) both pass.
+
 ## Symptom (recap)
 
 ```java

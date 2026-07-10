@@ -539,6 +539,15 @@ pub trait NativeContext {
     /// Get the identity hash code of an ObjectRef.
     fn identity_hash_code(&self, obj: ObjectRef) -> i32;
 
+    /// ES-FAIL-FAMILY-20260710 hunt: arm the GC's dynamic software
+    /// write-watchpoint (see `cratonvm_gc::heap::set_dynamic_watch`) at a
+    /// raw heap address, so any subsequent write through an instrumented
+    /// heap write primitive that covers this address prints its call site.
+    /// `addr = 0` disarms. Default no-op so mock/test `NativeContext` impls
+    /// don't need to implement it; only the real VM's impl (which has a
+    /// live heap to watch) overrides it.
+    fn dbg_set_watch_cell(&mut self, _addr: usize) {}
+
     /// Stable identity for the owning VM/heap.
     ///
     /// Native side caches that store heap `ObjectRef`s must scope entries to
@@ -2082,6 +2091,37 @@ pub trait NativeContext {
         self.invoke_virtual(receiver, method_name, descriptor, args)
     }
 
+    /// Invoke a virtual method on `receiver`, skipping the native-override
+    /// check entirely so a registered Rust native for this exact
+    /// (class, method, descriptor) triple is NOT re-entered — dispatch goes
+    /// straight to the receiver's real JDK bytecode.
+    ///
+    /// This exists for natives that must distinguish a genuinely-real object
+    /// from a same-named synthetic one by *instance* state rather than by
+    /// class name (registration is static/global and can't make that call).
+    /// The canonical example is `ThreadPoolExecutor.execute`/`submit`/
+    /// `shutdown`: CratonVM's synthetic `Executors.newSingleThreadExecutor()`
+    /// et al. stamp their 2-field placeholder with the REAL `ThreadPoolExecutor`
+    /// class name, so a real executor (e.g. the internal async worker pool in
+    /// `native-builtins`) and a synthetic one are indistinguishable by class
+    /// name alone. The native override checks `executor_has_real_workers`
+    /// per-instance and calls this method for a real receiver instead of
+    /// recursing back into itself via [`Self::invoke_virtual`] (which would
+    /// hit the same native registration again and loop forever).
+    ///
+    /// Default implementation falls back to [`Self::invoke_virtual`] — safe
+    /// for any context that has no such real/synthetic ambiguity to resolve
+    /// (mocks, tests, other native contexts).
+    fn invoke_virtual_bytecode_only(
+        &mut self,
+        receiver: ObjectRef,
+        method_name: &str,
+        descriptor: &str,
+        args: &[Value],
+    ) -> MethodCallResult {
+        self.invoke_virtual(receiver, method_name, descriptor, args)
+    }
+
     /// Invoke a method with invokespecial semantics — *exactly* the resolved
     /// method on `class_name`, with no virtual dispatch and no interface
     /// retarget to the receiver's concrete class.
@@ -3198,40 +3238,70 @@ impl NativeMethodRegistry {
         {
             return;
         }
-        // Real-JDK mode: drop the synthetic `ThreadPoolExecutor` lifecycle/stat
-        // natives (`shutdownNow`, `shutdown`, `isShutdown`, `isTerminated`,
-        // `awaitTermination`, `getPoolSize`, `getActiveCount`, …). They assume a
-        // fake 2-field layout (`poolSize=0`, `isShutdown=1`) and, on a *real*
-        // `ThreadPoolExecutor`, corrupt slot 0/1 and lie. Critically, the
-        // synthetic `shutdownNow` returns an empty list WITHOUT interrupting the
-        // pool's worker threads — so a real worker blocked in
-        // `getTask()`/`BlockingQueue.take()` never terminates and a non-daemon
-        // executor (e.g. JUnit's `@Timeout(SEPARATE_THREAD)` preemptive-timeout
-        // executor) keeps the VM alive past `main()` (false "hang"). The real
-        // `ThreadPoolExecutor` bytecode runs end-to-end on CratonVM
-        // (submit/execute/addWorker/runWorker/getTask), so dropping these lets
-        // `shutdownNow` interrupt workers correctly. See `drop_real_layout_synthetic`.
-        // `execute(Runnable)` is exempted from this drop: CratonVM's
-        // `Executors.newSingleThreadExecutor()`/`newFixedThreadPool()`/
-        // `newCachedThreadPool()` factories (native-builtins's
-        // `native_new_single_thread`/`native_new_fixed_pool`/
-        // `native_new_cached_pool`) stamp their return value with this real
-        // class name but never run it through the real `<init>`, so real
-        // `execute()` bytecode NPEs on the uninitialized `ctl` AtomicInteger
-        // (docs/known-issues/threadpoolexecutor-execute-npe-on-ctl-regression.md).
-        // The registered native must stay available so the interpreter's
-        // force-list (`force_native_over_real_jdk_bytecode` in
-        // vm/src/runtime/interpreter.rs) can select it for these synthetic
-        // objects; `intercept_force_registered_native` there additionally
-        // checks the receiver's real `workers` field so a genuinely real,
-        // bytecode-constructed `ThreadPoolExecutor` still runs its own real
-        // `execute()`.
+        // Real-JDK mode: drop the synthetic `java/lang/ref/Cleaner`/
+        // `Cleaner$Cleanable` natives (`create()`, `register(Object,Runnable)`,
+        // `Cleanable.clean()`). These were meant only as a fallback for when
+        // real class bytes are unavailable (see this block's own comment at
+        // the registration site, phases_late.rs::register_p68_cleaner: "real
+        // Cleaner bytecode still wins whenever the real class is loaded") --
+        // but `create()` is a STATIC factory method, and static dispatch has
+        // no per-instance real-vs-synthetic safety net the way concrete
+        // instance methods do, so the native unconditionally wins there and
+        // allocates a bare Cleaner with its real `impl` field left null.
+        // `register(Object,Runnable)` (an instance method) then correctly
+        // prefers real bytecode -- which calls `PhantomCleanable.<init>` ->
+        // `CleanerImpl.getCleanerImpl(this)` -> reads the null `impl` field
+        // and NPEs ("Cannot read field \"queue\" because the return value of
+        // ... getCleanerImpl(...) is null"), first seen booting a WildFly
+        // Host Controller (`ServiceContainer$Factory.create()` calls
+        // `Cleaner.create()` then `.register(...)`). Same half-real-object
+        // bug class as the ThreadPoolExecutor/Executors-factory NPEs above --
+        // drop the synthetic surface entirely so real bytecode constructs and
+        // wires up the Cleaner end-to-end (matches this file's own stated
+        // intent, just enforced from the registration side since dispatch
+        // does not enforce it uniformly for static factory methods).
         if self.drop_real_layout_synthetic
-            && class_name == "java/util/concurrent/ThreadPoolExecutor"
-            && !(method_name == "execute" && descriptor == "(Ljava/lang/Runnable;)V")
+            && matches!(
+                class_name,
+                "java/lang/ref/Cleaner" | "java/lang/ref/Cleaner$Cleanable"
+            )
         {
             return;
         }
+        // NOTE: real-JDK mode used to drop EVERY native registered directly on
+        // `java/util/concurrent/ThreadPoolExecutor` here (submit/execute/
+        // shutdown included), on the theory that only genuinely-real
+        // `ThreadPoolExecutor` instances carry that class name. That's false:
+        // `Executors.newSingleThreadExecutor()`/`newFixedThreadPool()`/
+        // `newCachedThreadPool()` (registered on `Executors` below) also stamp
+        // their synthetic 2-field return object with this exact class name
+        // (see `alloc_concurrent_synthetic` call sites in
+        // `register_executor_natives`), so a class-name-keyed drop can't tell
+        // the two apart — it silently starved the synthetic objects' own
+        // `execute()`/`submit()`/`shutdown()` overrides too, sending them
+        // straight to real JDK bytecode that dereferences an uninitialized
+        // `ctl`/`mainLock` field and NPEs
+        // (`docs/internal/threadpoolexecutor-execute-npe-on-ctl-regression-FIXED.md`,
+        // `docs/known-issues/threadpoolexecutor-shutdown-npe-on-mainlock-synthetic-executor.md`).
+        // A prior narrower fix (merged separately, same day) exempted only
+        // `execute(Runnable)` from this drop and pushed the real-vs-synthetic
+        // distinction into the interpreter's dispatch layer instead
+        // (`force_native_over_real_jdk_bytecode` / `intercept_force_registered_native`
+        // in vm/src/runtime/interpreter.rs, plus matching checks in
+        // vm/src/vm/vm_exec.rs) — those checks are still in place and harmless,
+        // but they don't cover every dispatch path (`try_stackless_invoke`'s own
+        // direct native lookup isn't one of the patched call sites), so a real
+        // receiver could still reach `native_es_execute` and — in that fix —
+        // degrade to synchronous inline execution. This drop is now removed
+        // entirely (not just for `execute`), and the real-vs-synthetic
+        // distinction happens per-*instance* inside
+        // `native_es_execute`/`native_es_submit_*`/the `shutdown` closures
+        // (`executor_has_real_workers`), which forward a genuinely-real
+        // receiver to real bytecode via
+        // `NativeContext::invoke_virtual_bytecode_only` — regardless of which
+        // dispatch path reached the native, and preserving true async
+        // semantics for a real pool's `execute()` (not just synchronous
+        // fallback).
         let key = native_method_hash(class_name, method_name, descriptor);
         // With 128-bit composite keys, collisions on our keyspace are
         // vanishingly unlikely. We keep a cheap `debug_assert!` as

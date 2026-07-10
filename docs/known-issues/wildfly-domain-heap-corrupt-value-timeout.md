@@ -942,3 +942,135 @@ there are still the most recent direct evidence for all four).
    the JBoss-Modules `ModuleClassLoader` resolving them to synthetic stubs
    rather than real JDK bytecode; not re-confirmed this session, still the
    best lead for whoever picks this up next).
+
+## 2026-07-10 update (this session) — the gating `ThreadPoolExecutor` regression is FIXED; the four residuals still need a live domain boot to re-observe
+
+Picked this up specifically to clear step 1 of the 2026-07-10 recommended
+steps above. Root-caused and fixed on branch `fix/wildfly-hib32-gate-20260710`
+(Windows worktree; no Azure host access this session) — full writeup in
+`docs/internal/threadpoolexecutor-execute-npe-on-ctl-regression-FIXED.md`
+(a narrower, `execute()`-only fix for the same bug landed on `dev`
+independently while this session was in progress, branch
+`fix/tpe-npe-dispatch-20260710`; this generalizes it to `submit()`/
+`shutdown()` too — see that doc's own "later same day" section for the
+reconciliation). Short version: the earlier bisection to `f28d6ae6` was a red herring — the
+actual cause is a `native-api/src/registry.rs` registration-time gate
+(`f157de8a`, 2026-06-17) that unconditionally dropped every native
+registered on class name `java/util/concurrent/ThreadPoolExecutor` in
+real-JDK mode, including `execute`/`submit`/`shutdown`, which starved
+CratonVM's own synthetic `Executors.*` placeholder objects (they share that
+exact class name) of their native overrides. An independent, parallel
+Elasticsearch-suite investigation hit and documented the identical bug the
+same day — see
+`docs/internal/elasticsearch-suite/ES-FAIL-20260710-executors-factory-synthetic-mainlock-npe-FIXED.md`
+(a THIRD independent fix, landed while this session was mid-verification,
+took a different tack for that specific doc — constructing genuinely real
+`ThreadPoolExecutor`/`Thread` objects via their real constructors — which is
+also a legitimate resolution and doesn't conflict with this fix). A related,
+separately-filed dispatch bug
+(`docs/internal/threadpoolexecutor-execute-dispatch-degrades-to-synchronous-FIXED.md`
+— any real `ThreadPoolExecutor.execute()` losing async semantics, found by
+yet another session verifying the above) turned out to share this exact same
+root cause and is fixed by the same change.
+Fix moves the real-vs-synthetic distinction from registration time to
+dispatch time via a new `NativeContext::invoke_virtual_bytecode_only`
+escape hatch. Verified with three standalone probes (no WildFly): the
+original `ExecProbe.java` repro, the ES doc's `submit()`/`shutdown()` repro,
+and a genuinely-real `new ThreadPoolExecutor(...)` (confirms the original
+`f157de8a` intent — real executors still get real bytecode — still holds).
+`cargo test -p cratonvm-native-api --lib` (179 tests, including the
+pre-existing STPE/EnumSet-drop coverage this change didn't touch) and
+`cargo test -p cratonvm-native-builtins --lib` both pass. Merged to `dev`.
+
+**The four front-line residuals themselves were NOT re-observed this
+session** — this Windows box has no WildFly Maven/domain-boot harness set
+up and no access to the Azure Linux host used by every prior session on
+this doc (its IP is ephemeral; needs to be re-obtained from whoever's
+running that host). Two narrower, WildFly-independent checks were done
+instead, since both looked like plain-JDK classloading gaps per the
+2026-07-09 update's own hypothesis:
+
+- **`javax.management.AttributeChangeNotification` and
+  `java.io.FileInputStream(File)`: standalone probes (JDK-only, no
+  WildFly/JBoss-Modules involved) both construct and use these classes
+  correctly** on the fixed binary — `new AttributeChangeNotification(source,
+  1L, 2L, "msg", "attrName", "attrType", "oldVal", "newVal")` and `new
+  FileInputStream(File)` (opening a real temp file) both succeed with no
+  NoSuchMethodError. This rules out a *plain* JDK-bytecode/native-registry
+  bug for either constructor and reinforces the 2026-07-09 hypothesis that
+  the NoSuchMethodError is specific to how WildFly's JBoss Modules
+  `ModuleClassLoader` resolves these classes (a per-module class definition
+  that isn't the same one these standalone probes exercise) — a live
+  domain boot (or at minimum a JBoss-Modules-driven classloading harness,
+  which this session did not have time to stand up) is still needed to
+  reproduce and fix this pair; the probes at least save the next session
+  from re-checking "is this a generic bug" first.
+- **`ContentCleanerService.start(StartContext)` (WildFly's own
+  `org.jboss.as.server.deployment.ContentCleanerService`,
+  `wildfly-server-24.0.1.Final.jar` inside the 32.0.1.Final distribution):
+  disassembled with `javap -c -l`** to at least scope the crash without a
+  live boot. Line 101 is entirely the sequence `aload_0; getfield
+  clientFactorySupplier:Ljava/util/function/Supplier;; invokeinterface
+  Supplier.get:()Ljava/lang/Object;; checkcast
+  org/jboss/as/controller/ModelControllerClientFactory` — i.e. the
+  `ClassCastException` is on the value an MSC-injected
+  `Supplier<ModelControllerClientFactory>` capability field hands back from
+  `.get()`. This points at CratonVM's MSC capability-injection machinery
+  (`native-builtins/src/jboss_msc.rs`) constructing or wiring that
+  particular `Supplier` with the wrong value type, but confirming that (and
+  ruling out it being isolated to just this one capability) needs a live
+  `CRATONVM_MSC_REAL_START=1` boot trace, not static bytecode reading —
+  not attempted further this session.
+
+**Recommended next step:** get access to a Linux host with the WildFly
+Maven/domain-boot harness (or rebuild one — a pristine WildFly 32.0.1.Final
+distribution download is enough per the 2026-07-10-earlier-session recipe
+above; no Maven needed for the `bin/domain.sh` hand-driven path) and re-run
+this doc's harness recipe now that the gating regression is cleared. If
+`host.xml`/`domain.xml` parsing and the process-controller/Host-Controller
+handshake complete, the four front-line residuals should become observable
+again — use `CRATONVM_DBG_UNCAUGHT=1`/`CRATONVM_DBG_MCL=1` as the 2026-07-09
+update recommended, and for `ContentCleanerService` specifically, trace
+which capability's `Supplier` resolves to the wrong type first (add tracing
+in `jboss_msc.rs`'s capability-injection path rather than guessing further
+from bytecode alone).
+
+
+## 2026-07-10 update (Azure host session, later same day) — one real blocker found+fixed (Cleaner), a second found but not yet fixed (Host Controller SIGSEGV); the four residuals still not reached
+
+Continued directly from the "gate is fixed" update above, now with Azure host access
+(`victor@20.83.144.174`, branch `fix/wildfly-residuals-20260710`, worktree per the standing
+isolated-worktree workflow). Re-ran this doc's own harness recipe (pristine WildFly 32.0.1.Final,
+`bin/domain.sh`, `CRATONVM_MSC_REAL_START=1`).
+
+**Confirmed the gate fix works**: process-controller/Host-Controller handshake now completes
+cleanly (no more `ThreadPoolExecutor` NPE killing the process-controller's read thread).
+
+**New blocker #1, found and FIXED**: Host Controller crashed immediately after with a
+`NullPointerException` in `java.lang.ref.Cleaner.register()` → `CleanerImpl.getCleanerImpl()`
+returning null, while `org.jboss.msc.service.ServiceContainer$Factory.create()` was setting up its
+shutdown hook. Same bug class as the `ThreadPoolExecutor` regression: a synthetic `Cleaner.create()`
+native (meant only as a fallback stub) was winning over real bytecode for this **static** factory
+method, returning a Cleaner with its real `impl` field left null, which real `register()` bytecode
+then NPE'd on. Fixed by extending the `drop_real_layout_synthetic` registry gate to
+`java/lang/ref/Cleaner`/`Cleaner$Cleanable`, same pattern already used for `ThreadPoolExecutor`.
+See `docs/internal/java-lang-ref-cleaner-static-native-half-initialized-object-FIXED.md`.
+
+**New blocker #2, found but NOT fixed**: with the Cleaner fix in place, boot progresses much
+further — extensions parse, Elytron initializes, `host=foo:add()` op runs — then Host Controller
+**segfaults** (confirmed via `strace -f -e trace=exit_group`: genuine `SIGSEGV`/`SEGV_MAPERR`,
+`si_addr=NULL`, not a Java exception or clean exit) and respawns forever until the boot times out.
+Confirmed independent of the JIT (`CRATONVM_DISABLE_JIT=1` reproduces identically). Live-gdb
+(temporarily relaxing `ptrace_scope`, restored afterward) pinned the crash to a specific,
+reproducible instruction sequence — a monomorphic inline-cache dispatch stub dereferencing a NULL
+receiver — but the exact Rust source line was not identified before this session's budget ran out.
+Filed as `docs/known-issues/wildfly-domain-hostcontroller-sigsegv-inline-cache-null-receiver.md`,
+with the live-gdb recipe and disassembly included for whoever continues.
+
+**The four original front-line residuals (`AttributeChangeNotification`, `ContentCleanerService`,
+`FileInputStream(File)`, `WFLYHC0034`) still have not been re-observed** — this SIGSEGV is now the
+gating blocker, one step later in the boot sequence than the Cleaner bug, itself one step later
+than the original `ThreadPoolExecutor` regression. Recommended next step: fix the SIGSEGV per that
+doc's own recommended next steps (get the exact crash-site source line via `addr2line` against the
+captured instruction offset, since it's ASLR-base-independent and was confirmed constant across
+multiple captures), then re-run this doc's harness recipe again.
