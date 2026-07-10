@@ -3627,6 +3627,10 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
         super::create_java_string_uninterned(self.shared, text)
     }
 
+    fn init_string_from_units(&mut self, this: ObjectRef, units: &[u16]) -> bool {
+        super::populate_java_string_fields(self.shared, this, units)
+    }
+
     fn read_string(&self, obj: ObjectRef) -> Option<String> {
         let class_id = self.shared.heap.class_id_of(obj);
         // Guard by class identity BEFORE the structural reader. `read_java_string`
