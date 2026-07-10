@@ -692,6 +692,612 @@ fn register_test_harness_natives(registry: &mut NativeMethodRegistry) {
         native_randomized_context_get_per_thread,
     );
     registry.register(
+        "com/carrotsearch/randomizedtesting/RandomizedContext",
+        "current",
+        "()Lcom/carrotsearch/randomizedtesting/RandomizedContext;",
+        native_randomized_context_current,
+    );
+    registry.register(
+        "com/carrotsearch/randomizedtesting/RandomizedContext",
+        "context",
+        "(Ljava/lang/Thread;)Lcom/carrotsearch/randomizedtesting/RandomizedContext;",
+        native_randomized_context_context,
+    );
+    registry.register(
+        "com/carrotsearch/randomizedtesting/RandomizedContext",
+        "getRandomness",
+        "()Lcom/carrotsearch/randomizedtesting/Randomness;",
+        native_randomized_context_get_randomness,
+    );
+    registry.register(
+        "com/carrotsearch/randomizedtesting/RandomizedContext",
+        "getRandom",
+        "()Ljava/util/Random;",
+        native_randomized_context_get_random,
+    );
+    registry.register(
+        "com/carrotsearch/randomizedtesting/RandomizedContext",
+        "push",
+        "(Lcom/carrotsearch/randomizedtesting/Randomness;)V",
+        native_randomized_context_push,
+    );
+    registry.register(
+        "com/carrotsearch/randomizedtesting/RandomizedContext",
+        "popAndDestroy",
+        "()V",
+        native_randomized_context_pop_and_destroy,
+    );
+    registry.register(
+        "com/carrotsearch/randomizedtesting/Randomness",
+        "getRandom",
+        "()Ljava/util/Random;",
+        native_randomness_get_random,
+    );
+    registry.register(
+        "com/carrotsearch/randomizedtesting/RandomizedTest",
+        "getContext",
+        "()Lcom/carrotsearch/randomizedtesting/RandomizedContext;",
+        native_randomized_test_get_context,
+    );
+    registry.register(
+        "com/carrotsearch/randomizedtesting/RandomizedTest",
+        "getRandom",
+        "()Ljava/util/Random;",
+        native_randomized_test_get_random,
+    );
+    registry.register(
+        "com/carrotsearch/randomizedtesting/RandomizedTest",
+        "randomFloat",
+        "()F",
+        native_randomized_test_random_float,
+    );
+    registry.register(
+        "com/carrotsearch/randomizedtesting/Xoroshiro128PlusRandom",
+        "nextLong",
+        "()J",
+        native_xoroshiro128_plus_random_next_long,
+    );
+    registry.register(
+        "com/carrotsearch/randomizedtesting/Xoroshiro128PlusRandom",
+        "nextInt",
+        "()I",
+        native_xoroshiro128_plus_random_next_int,
+    );
+    registry.register(
+        "com/carrotsearch/randomizedtesting/Xoroshiro128PlusRandom",
+        "nextInt",
+        "(I)I",
+        native_xoroshiro128_plus_random_next_int_bound,
+    );
+    registry.register(
+        "com/carrotsearch/randomizedtesting/Xoroshiro128PlusRandom",
+        "next",
+        "(I)I",
+        native_xoroshiro128_plus_random_next_bits,
+    );
+    registry.register(
+        "com/carrotsearch/randomizedtesting/Xoroshiro128PlusRandom",
+        "nextFloat",
+        "()F",
+        native_xoroshiro128_plus_random_next_float,
+    );
+    registry.register(
+        "com/carrotsearch/randomizedtesting/Xoroshiro128PlusRandom",
+        "nextDouble",
+        "()D",
+        native_xoroshiro128_plus_random_next_double,
+    );
+    registry.register(
+        "com/carrotsearch/randomizedtesting/Xoroshiro128PlusRandom",
+        "nextBoolean",
+        "()Z",
+        native_xoroshiro128_plus_random_next_boolean,
+    );
+    registry.register(
+        "com/carrotsearch/randomizedtesting/Xoroshiro128PlusRandom",
+        "nextBytes",
+        "([B)V",
+        native_xoroshiro128_plus_random_next_bytes,
+    );
+    registry.register(
+        "org/elasticsearch/simdvec/ESVectorUtil",
+        "dotProduct",
+        "([F[F)F",
+        native_es_vector_util_dot_product_f32,
+    );
+    registry.register(
+        "org/elasticsearch/simdvec/ESVectorUtil",
+        "squareDistance",
+        "([F[F)F",
+        native_es_vector_util_square_distance_f32,
+    );
+    registry.register(
+        "org/elasticsearch/simdvec/ESVectorUtil",
+        "squareDistance",
+        "([F[FII)F",
+        native_es_vector_util_square_distance_f32_offset,
+    );
+    registry.register(
+        "org/elasticsearch/simdvec/ESVectorUtil",
+        "calculateOSQLoss",
+        "([FFFIFF[I)F",
+        native_es_vector_util_calculate_osq_loss_f32,
+    );
+    registry.register(
+        "org/elasticsearch/simdvec/ESVectorUtil",
+        "calculateOSQGridPoints",
+        "([F[II[F)V",
+        native_es_vector_util_calculate_osq_grid_points_f32,
+    );
+    registry.register(
+        "org/elasticsearch/simdvec/ESVectorUtil",
+        "centerAndCalculateOSQStatsEuclidean",
+        "([F[F[F[F)V",
+        native_es_vector_util_center_stats_euclidean_f32,
+    );
+    registry.register(
+        "org/elasticsearch/simdvec/ESVectorUtil",
+        "centerAndCalculateOSQStatsDp",
+        "([F[F[F[F)V",
+        native_es_vector_util_center_stats_dp_f32,
+    );
+    registry.register(
+        "org/elasticsearch/simdvec/ESVectorUtil",
+        "centerAndCalculateOSQStatsEuclidean",
+        "([B[B[F[F)V",
+        native_es_vector_util_center_stats_euclidean_i8,
+    );
+    registry.register(
+        "org/elasticsearch/simdvec/ESVectorUtil",
+        "centerAndCalculateOSQStatsDp",
+        "([B[B[F[F)V",
+        native_es_vector_util_center_stats_dp_i8,
+    );
+    registry.register(
+        "org/elasticsearch/simdvec/ESVectorUtil",
+        "quantizeVectorWithIntervals",
+        "([F[IFFB)I",
+        native_es_vector_util_quantize_vector_with_intervals_f32,
+    );
+    registry.register(
+        "org/elasticsearch/simdvec/ESVectorUtil",
+        "packAsBinary",
+        "([I[B)V",
+        native_es_vector_util_pack_as_binary,
+    );
+    registry.register(
+        "org/elasticsearch/index/codec/vectors/diskbbq/next/ESNextDiskBBQVectorsWriter",
+        "lambda$buildAndWritePostingsLists$1",
+        "([II)I",
+        native_es_next_diskbbq_vectors_writer_iarray_at_i,
+    );
+    registry.register(
+        "org/elasticsearch/index/codec/vectors/diskbbq/next/ESNextDiskBBQVectorsWriter",
+        "lambda$buildAndWritePostingsLists$2",
+        "([I[II)I",
+        native_es_next_diskbbq_vectors_writer_iarray_at_iarray_at_i,
+    );
+    registry.register(
+        "org/elasticsearch/index/codec/vectors/diskbbq/next/ESNextDiskBBQVectorsWriter",
+        "lambda$buildAndWritePostingsLists$3",
+        "([II)I",
+        native_es_next_diskbbq_vectors_writer_iarray_at_i,
+    );
+    registry.register(
+        "org/elasticsearch/index/codec/vectors/diskbbq/next/ESNextDiskBBQVectorsWriter",
+        "lambda$buildAndWritePostingsLists$4",
+        "([III)I",
+        native_es_next_diskbbq_vectors_writer_iarray_at_i_plus_j,
+    );
+    registry.register(
+        "org/elasticsearch/index/codec/vectors/diskbbq/next/ESNextDiskBBQVectorsWriter",
+        "lambda$buildAndWritePostingsLists$6",
+        "([II)I",
+        native_es_next_diskbbq_vectors_writer_iarray_at_i,
+    );
+    registry.register(
+        "org/elasticsearch/index/codec/vectors/diskbbq/next/ESNextDiskBBQVectorsWriter",
+        "lambda$buildAndWritePostingsLists$7",
+        "([II)I",
+        native_es_next_diskbbq_vectors_writer_iarray_at_i,
+    );
+    registry.register(
+        "org/elasticsearch/index/codec/vectors/diskbbq/next/ESNextDiskBBQVectorsWriter",
+        "lambda$buildAndWritePostingsLists$8",
+        "([Z[II)Z",
+        native_es_next_diskbbq_vectors_writer_barray_at_iarray_at_i,
+    );
+    registry.register(
+        "org/elasticsearch/index/codec/vectors/diskbbq/next/ESNextDiskBBQVectorsWriter",
+        "lambda$buildAndWritePostingsLists$9",
+        "([I[II)I",
+        native_es_next_diskbbq_vectors_writer_iarray_at_iarray_at_i,
+    );
+    registry.register(
+        "org/elasticsearch/index/codec/vectors/diskbbq/next/ESNextDiskBBQVectorsWriter",
+        "lambda$buildAndWritePostingsLists$10",
+        "([III)I",
+        native_es_next_diskbbq_vectors_writer_iarray_at_i_plus_j,
+    );
+    registry.register(
+        "org/elasticsearch/index/codec/vectors/diskbbq/next/ESNextDiskBBQVectorsWriter",
+        "lambda$doWriteCentroids$13",
+        "([II)I",
+        native_es_next_diskbbq_vectors_writer_iarray_at_i,
+    );
+    registry.register(
+        "org/elasticsearch/index/codec/vectors/diskbbq/next/ESNextDiskBBQVectorsWriter",
+        "lambda$writeCentroidsWithParents$14",
+        "([II)I",
+        native_es_next_diskbbq_vectors_writer_iarray_at_i,
+    );
+    registry.register(
+        "org/elasticsearch/index/codec/vectors/diskbbq/next/ESNextDiskBBQVectorsWriter",
+        "lambda$createCentroidSupplier$12",
+        "(II)I",
+        native_es_next_diskbbq_vectors_writer_i_plus_j,
+    );
+    registry.register(
+        "org/elasticsearch/index/codec/vectors/diskbbq/next/ESNextDiskBBQVectorsWriter",
+        "lambda$calculateCentroidsFullRebuildSliced$15",
+        "(II)I",
+        native_es_next_diskbbq_vectors_writer_i_plus_j,
+    );
+    registry.register(
+        "org/elasticsearch/index/codec/vectors/diskbbq/next/ESNextDiskBBQVectorsWriter",
+        "writeSlicesOffsets",
+        "(Lorg/apache/lucene/store/IndexOutput;Lorg/elasticsearch/index/codec/vectors/diskbbq/CentroidSlices;)V",
+        native_es_next_diskbbq_vectors_writer_write_slices_offsets,
+    );
+    registry.register(
+        "org/elasticsearch/index/codec/vectors/cluster/ClusteringFloatVectorValuesSlice",
+        "lambda$createRandomSlice$0",
+        "([II)I",
+        native_es_next_diskbbq_vectors_writer_iarray_at_i,
+    );
+    registry.register(
+        "org/elasticsearch/index/codec/vectors/cluster/ClusteringFloatVectorValuesSlice",
+        "lambda$createRandomSlice$1",
+        "([II)I",
+        native_es_next_diskbbq_vectors_writer_iarray_at_i,
+    );
+    registry.register(
+        "org/elasticsearch/index/codec/vectors/cluster/ClusteringFloatVectorValuesSlice",
+        "vectorValue",
+        "(I)[F",
+        native_es_clustering_float_vector_values_slice_vector_value,
+    );
+    registry.register(
+        "org/elasticsearch/index/codec/vectors/cluster/ClusteringFloatVectorValuesSlice",
+        "vectorValue",
+        "(I)Ljava/lang/Object;",
+        native_es_clustering_float_vector_values_slice_vector_value,
+    );
+    registry.register(
+        "org/elasticsearch/index/codec/vectors/cluster/ClusteringFloatVectorValuesSlice",
+        "ordToDoc",
+        "(I)I",
+        native_es_clustering_float_vector_values_slice_ord_to_doc,
+    );
+    registry.register(
+        "org/elasticsearch/index/codec/vectors/cluster/ClusteringFloatVectorValuesSlice",
+        "size",
+        "()I",
+        native_es_clustering_float_vector_values_slice_size,
+    );
+    registry.register(
+        "org/elasticsearch/index/codec/vectors/cluster/ClusteringFloatVectorValuesSlice",
+        "dimension",
+        "()I",
+        native_es_clustering_float_vector_values_slice_dimension,
+    );
+    registry.register(
+        "org/elasticsearch/index/codec/vectors/diskbbq/CentroidSlices",
+        "sliceOffsets",
+        "()[I",
+        native_es_centroid_slices_slice_offsets,
+    );
+    registry.register(
+        "org/elasticsearch/index/codec/vectors/diskbbq/CentroidSlices",
+        "sliceNumVectors",
+        "()[I",
+        native_es_centroid_slices_slice_num_vectors,
+    );
+    registry.register(
+        "org/elasticsearch/index/codec/vectors/diskbbq/CentroidSlices",
+        "maxSliceSize",
+        "()I",
+        native_es_centroid_slices_max_slice_size,
+    );
+    registry.register(
+        "org/elasticsearch/index/codec/vectors/diskbbq/CentroidAssignments",
+        "numCentroids",
+        "()I",
+        native_es_centroid_assignments_num_centroids,
+    );
+    registry.register(
+        "org/elasticsearch/index/codec/vectors/diskbbq/CentroidAssignments",
+        "centroids",
+        "()[[F",
+        native_es_centroid_assignments_centroids,
+    );
+    registry.register(
+        "org/elasticsearch/index/codec/vectors/diskbbq/CentroidAssignments",
+        "assignments",
+        "()[I",
+        native_es_centroid_assignments_assignments,
+    );
+    registry.register(
+        "org/elasticsearch/index/codec/vectors/diskbbq/CentroidAssignments",
+        "overspillAssignments",
+        "()[I",
+        native_es_centroid_assignments_overspill_assignments,
+    );
+    registry.register(
+        "org/elasticsearch/index/codec/vectors/diskbbq/CentroidAssignments",
+        "globalCentroid",
+        "()[F",
+        native_es_centroid_assignments_global_centroid,
+    );
+    registry.register(
+        "org/elasticsearch/index/codec/vectors/diskbbq/CentroidAssignments",
+        "centroidSlices",
+        "()Lorg/elasticsearch/index/codec/vectors/diskbbq/CentroidSlices;",
+        native_es_centroid_assignments_centroid_slices,
+    );
+    registry.register(
+        "org/elasticsearch/index/codec/vectors/cluster/KMeansResult",
+        "centroids",
+        "()[Ljava/lang/Object;",
+        native_es_kmeans_result_centroids,
+    );
+    registry.register(
+        "org/elasticsearch/index/codec/vectors/cluster/KMeansResult",
+        "assignments",
+        "()[I",
+        native_es_kmeans_result_assignments,
+    );
+    registry.register(
+        "org/elasticsearch/index/codec/vectors/cluster/KMeansResult",
+        "clusterCounts",
+        "()[I",
+        native_es_kmeans_result_cluster_counts,
+    );
+    registry.register(
+        "org/elasticsearch/index/codec/vectors/cluster/KMeansResult",
+        "soarAssignments",
+        "()[I",
+        native_es_kmeans_result_soar_assignments,
+    );
+    registry.register(
+        "org/elasticsearch/index/codec/vectors/cluster/KMeansFloatVectorValues",
+        "size",
+        "()I",
+        native_es_kmeans_float_vector_values_size,
+    );
+    registry.register(
+        "org/elasticsearch/search/vectors/KnnScoreDocQuery",
+        "<init>",
+        "([Lorg/apache/lucene/search/ScoreDoc;Lorg/apache/lucene/index/IndexReader;)V",
+        native_es_knn_score_doc_query_init,
+    );
+    registry.register(
+        "org/elasticsearch/search/vectors/MaxScoreTopKnnCollector",
+        "unsortedTopK",
+        "()Lorg/apache/lucene/search/TopDocs;",
+        native_es_max_score_top_knn_collector_unsorted_top_k,
+    );
+    registry.register(
+        "java/util/Arrays",
+        "sort",
+        "([JII)V",
+        native_java_arrays_sort_long_range,
+    );
+    registry.register(
+        "org/apache/lucene/index/IndexReaderContext",
+        "id",
+        "()Ljava/lang/Object;",
+        native_lucene_index_reader_context_id,
+    );
+    registry.register(
+        "org/apache/lucene/store/DataOutput",
+        "writeVInt",
+        "(I)V",
+        native_lucene_data_output_write_vint,
+    );
+    registry.register(
+        "org/apache/lucene/store/DataOutput",
+        "writeZInt",
+        "(I)V",
+        native_lucene_data_output_write_zint,
+    );
+    registry.register(
+        "org/apache/lucene/store/DataOutput",
+        "writeVLong",
+        "(J)V",
+        native_lucene_data_output_write_vlong,
+    );
+    registry.register(
+        "org/apache/lucene/store/DataOutput",
+        "writeZLong",
+        "(J)V",
+        native_lucene_data_output_write_zlong,
+    );
+    registry.register(
+        "org/apache/lucene/store/ByteBuffersDataOutput",
+        "writeByte",
+        "(B)V",
+        native_lucene_byte_buffers_data_output_write_byte,
+    );
+    registry.register(
+        "org/apache/lucene/store/ByteBuffersDataOutput",
+        "writeBytes",
+        "([BII)V",
+        native_lucene_byte_buffers_data_output_write_bytes,
+    );
+    registry.register(
+        "org/apache/lucene/store/ByteBuffersDataOutput",
+        "writeBytes",
+        "([BI)V",
+        native_lucene_byte_buffers_data_output_write_bytes_len,
+    );
+    registry.register(
+        "org/apache/lucene/store/ByteBuffersDataOutput",
+        "writeBytes",
+        "([B)V",
+        native_lucene_byte_buffers_data_output_write_bytes_all,
+    );
+    registry.register(
+        "org/apache/lucene/store/ByteBuffersDataOutput",
+        "writeShort",
+        "(S)V",
+        native_lucene_byte_buffers_data_output_write_short,
+    );
+    registry.register(
+        "org/apache/lucene/store/ByteBuffersDataOutput",
+        "writeInt",
+        "(I)V",
+        native_lucene_byte_buffers_data_output_write_int,
+    );
+    registry.register(
+        "org/apache/lucene/store/ByteBuffersDataOutput",
+        "writeLong",
+        "(J)V",
+        native_lucene_byte_buffers_data_output_write_long,
+    );
+    registry.register(
+        "org/apache/lucene/store/ByteBuffersDataOutput",
+        "copyBytes",
+        "(Lorg/apache/lucene/store/DataInput;J)V",
+        native_lucene_byte_buffers_data_output_copy_bytes,
+    );
+    registry.register(
+        "org/apache/lucene/store/ByteBuffersDataOutput$ByteBufferRecycler",
+        "reuse",
+        "(Ljava/nio/ByteBuffer;)V",
+        native_lucene_byte_buffers_byte_buffer_recycler_reuse,
+    );
+    registry.register(
+        "org/apache/lucene/store/ByteBuffersIndexOutput",
+        "writeByte",
+        "(B)V",
+        native_lucene_byte_buffers_index_output_write_byte,
+    );
+    registry.register(
+        "org/apache/lucene/store/ByteBuffersIndexOutput",
+        "writeBytes",
+        "([BII)V",
+        native_lucene_byte_buffers_index_output_write_bytes,
+    );
+    registry.register(
+        "org/apache/lucene/store/ByteBuffersIndexOutput",
+        "writeBytes",
+        "([BI)V",
+        native_lucene_byte_buffers_index_output_write_bytes_len,
+    );
+    registry.register(
+        "org/apache/lucene/store/ByteBuffersIndexOutput",
+        "writeShort",
+        "(S)V",
+        native_lucene_byte_buffers_index_output_write_short,
+    );
+    registry.register(
+        "org/apache/lucene/store/ByteBuffersIndexOutput",
+        "writeInt",
+        "(I)V",
+        native_lucene_byte_buffers_index_output_write_int,
+    );
+    registry.register(
+        "org/apache/lucene/store/ByteBuffersIndexOutput",
+        "writeLong",
+        "(J)V",
+        native_lucene_byte_buffers_index_output_write_long,
+    );
+    registry.register(
+        "org/apache/lucene/store/ByteBuffersIndexOutput",
+        "copyBytes",
+        "(Lorg/apache/lucene/store/DataInput;J)V",
+        native_lucene_byte_buffers_index_output_copy_bytes,
+    );
+    registry.register(
+        "org/apache/lucene/tests/store/MockIndexOutputWrapper",
+        "writeByte",
+        "(B)V",
+        native_lucene_mock_index_output_wrapper_write_byte,
+    );
+    registry.register(
+        "org/apache/lucene/index/TermsEnumIndex",
+        "prefix8ToComparableUnsignedLong",
+        "(Lorg/apache/lucene/util/BytesRef;)J",
+        native_lucene_terms_enum_index_prefix8,
+    );
+    registry.register(
+        "org/apache/lucene/index/TermsEnumIndex",
+        "next",
+        "()Lorg/apache/lucene/util/BytesRef;",
+        native_lucene_terms_enum_index_next,
+    );
+    registry.register(
+        "org/apache/lucene/index/TermsEnumIndex",
+        "compareTermTo",
+        "(Lorg/apache/lucene/index/TermsEnumIndex;)I",
+        native_lucene_terms_enum_index_compare_term_to,
+    );
+    registry.register(
+        "org/apache/lucene/index/TermsEnumIndex",
+        "termEquals",
+        "(Lorg/apache/lucene/index/TermsEnumIndex$TermState;)Z",
+        native_lucene_terms_enum_index_term_equals,
+    );
+    registry.register(
+        "org/apache/lucene/index/TermsEnumIndex$TermState",
+        "copyFrom",
+        "(Lorg/apache/lucene/index/TermsEnumIndex;)V",
+        native_lucene_terms_enum_index_term_state_copy_from,
+    );
+    registry.register(
+        "org/apache/lucene/index/OrdinalMap$SegmentMap",
+        "newToOld",
+        "(I)I",
+        native_lucene_ordinal_map_segment_map_new_to_old,
+    );
+    registry.register(
+        "org/apache/lucene/index/OrdinalMap$SegmentMap",
+        "oldToNew",
+        "(I)I",
+        native_lucene_ordinal_map_segment_map_old_to_new,
+    );
+    registry.register(
+        "org/apache/lucene/index/OrdinalMap$TermsEnumPriorityQueue",
+        "lessThan",
+        "(Lorg/apache/lucene/index/TermsEnumIndex;Lorg/apache/lucene/index/TermsEnumIndex;)Z",
+        native_lucene_terms_enum_priority_queue_less_than,
+    );
+    registry.register(
+        "org/apache/lucene/index/OrdinalMap$TermsEnumPriorityQueue",
+        "lessThan",
+        "(Ljava/lang/Object;Ljava/lang/Object;)Z",
+        native_lucene_terms_enum_priority_queue_less_than,
+    );
+    registry.register(
+        "org/apache/lucene/util/PriorityQueue",
+        "<init>",
+        "(I)V",
+        native_lucene_priority_queue_init_int,
+    );
+    registry.register(
+        "org/apache/lucene/util/PriorityQueue",
+        "size",
+        "()I",
+        native_lucene_priority_queue_size,
+    );
+    registry.register(
+        "org/apache/lucene/util/PriorityQueue",
+        "top",
+        "()Ljava/lang/Object;",
+        native_lucene_priority_queue_top,
+    );
+    registry.register(
         "org/apache/lucene/store/ByteBuffersDataInput",
         "readByte",
         "()B",
@@ -745,6 +1351,1764 @@ fn register_test_harness_natives(registry: &mut NativeMethodRegistry) {
         "(JJ)Lorg/apache/lucene/store/ByteBuffersDataInput;",
         native_lucene_byte_buffers_data_input_slice,
     );
+    registry.register(
+        "org/apache/lucene/store/ByteBuffersDataInput",
+        "readBytes",
+        "([BII)V",
+        native_lucene_byte_buffers_data_input_read_bytes,
+    );
+    registry.register(
+        "org/apache/lucene/store/ByteBuffersDataInput",
+        "readBytes",
+        "([BIIZ)V",
+        native_lucene_byte_buffers_data_input_read_bytes_bool,
+    );
+    registry.register(
+        "org/apache/lucene/store/ByteBuffersDataInput",
+        "readBytes",
+        "(J[BII)V",
+        native_lucene_byte_buffers_data_input_read_bytes_at,
+    );
+    registry.register(
+        "org/apache/lucene/store/ByteBuffersDataInput",
+        "readFloats",
+        "([FII)V",
+        native_lucene_byte_buffers_data_input_read_floats,
+    );
+    registry.register(
+        "org/apache/lucene/store/ByteBuffersDataInput",
+        "readLongs",
+        "([JII)V",
+        native_lucene_byte_buffers_data_input_read_longs,
+    );
+    registry.register(
+        "org/apache/lucene/store/ByteBuffersDataInput",
+        "length",
+        "()J",
+        native_lucene_byte_buffers_data_input_length,
+    );
+    registry.register(
+        "org/apache/lucene/store/ByteBuffersDataInput",
+        "position",
+        "()J",
+        native_lucene_byte_buffers_data_input_position,
+    );
+    registry.register(
+        "org/apache/lucene/store/ByteBuffersDataInput",
+        "seek",
+        "(J)V",
+        native_lucene_byte_buffers_data_input_seek,
+    );
+    registry.register(
+        "org/apache/lucene/store/ByteBuffersIndexInput",
+        "getFilePointer",
+        "()J",
+        native_lucene_byte_buffers_index_input_get_file_pointer,
+    );
+    registry.register(
+        "org/apache/lucene/store/ByteBuffersIndexInput",
+        "seek",
+        "(J)V",
+        native_lucene_byte_buffers_index_input_seek,
+    );
+    registry.register(
+        "org/apache/lucene/store/ByteBuffersIndexInput",
+        "length",
+        "()J",
+        native_lucene_byte_buffers_index_input_length,
+    );
+    registry.register(
+        "org/apache/lucene/store/ByteBuffersIndexInput",
+        "readByte",
+        "()B",
+        native_lucene_byte_buffers_index_input_read_byte,
+    );
+    registry.register(
+        "org/apache/lucene/store/ByteBuffersIndexInput",
+        "readBytes",
+        "([BII)V",
+        native_lucene_byte_buffers_index_input_read_bytes,
+    );
+    registry.register(
+        "org/apache/lucene/store/ByteBuffersIndexInput",
+        "readBytes",
+        "([BIIZ)V",
+        native_lucene_byte_buffers_index_input_read_bytes_bool,
+    );
+    registry.register(
+        "org/apache/lucene/store/ByteBuffersIndexInput",
+        "readFloats",
+        "([FII)V",
+        native_lucene_byte_buffers_index_input_read_floats,
+    );
+    registry.register(
+        "org/apache/lucene/store/ByteBuffersIndexInput",
+        "readLongs",
+        "([JII)V",
+        native_lucene_byte_buffers_index_input_read_longs,
+    );
+    registry.register(
+        "org/apache/lucene/store/ByteBuffersIndexInput",
+        "readShort",
+        "()S",
+        native_lucene_byte_buffers_index_input_read_short,
+    );
+    registry.register(
+        "org/apache/lucene/store/ByteBuffersIndexInput",
+        "readInt",
+        "()I",
+        native_lucene_byte_buffers_index_input_read_int,
+    );
+    registry.register(
+        "org/apache/lucene/store/ByteBuffersIndexInput",
+        "readLong",
+        "()J",
+        native_lucene_byte_buffers_index_input_read_long,
+    );
+    registry.register(
+        "org/apache/lucene/store/ByteBuffersIndexInput",
+        "readByte",
+        "(J)B",
+        native_lucene_byte_buffers_index_input_read_byte_at,
+    );
+    registry.register(
+        "org/apache/lucene/store/ByteBuffersIndexInput",
+        "readBytes",
+        "(J[BII)V",
+        native_lucene_byte_buffers_index_input_read_bytes_at,
+    );
+    registry.register(
+        "org/apache/lucene/store/ByteBuffersIndexInput",
+        "readShort",
+        "(J)S",
+        native_lucene_byte_buffers_index_input_read_short_at,
+    );
+    registry.register(
+        "org/apache/lucene/store/ByteBuffersIndexInput",
+        "readInt",
+        "(J)I",
+        native_lucene_byte_buffers_index_input_read_int_at,
+    );
+    registry.register(
+        "org/apache/lucene/store/ByteBuffersIndexInput",
+        "readLong",
+        "(J)J",
+        native_lucene_byte_buffers_index_input_read_long_at,
+    );
+    registry.register(
+        "org/apache/lucene/store/IndexInput",
+        "toString",
+        "()Ljava/lang/String;",
+        native_lucene_index_input_to_string,
+    );
+    registry.register(
+        "org/apache/lucene/tests/store/MockIndexInputWrapper",
+        "length",
+        "()J",
+        native_lucene_mock_index_input_wrapper_length,
+    );
+    registry.register(
+        "org/apache/lucene/tests/store/MockIndexInputWrapper",
+        "readByte",
+        "()B",
+        native_lucene_mock_index_input_wrapper_read_byte,
+    );
+    registry.register(
+        "org/apache/lucene/tests/store/MockIndexInputWrapper",
+        "readBytes",
+        "([BII)V",
+        native_lucene_mock_index_input_wrapper_read_bytes,
+    );
+    registry.register(
+        "org/apache/lucene/tests/store/MockIndexInputWrapper",
+        "readBytes",
+        "([BIIZ)V",
+        native_lucene_mock_index_input_wrapper_read_bytes_bool,
+    );
+    registry.register(
+        "org/apache/lucene/tests/store/MockIndexInputWrapper",
+        "readFloats",
+        "([FII)V",
+        native_lucene_mock_index_input_wrapper_read_floats,
+    );
+    registry.register(
+        "org/apache/lucene/tests/store/MockIndexInputWrapper",
+        "readLongs",
+        "([JII)V",
+        native_lucene_mock_index_input_wrapper_read_longs,
+    );
+    registry.register(
+        "org/apache/lucene/tests/store/MockIndexInputWrapper",
+        "readShort",
+        "()S",
+        native_lucene_mock_index_input_wrapper_read_short,
+    );
+    registry.register(
+        "org/apache/lucene/tests/store/MockIndexInputWrapper",
+        "readInt",
+        "()I",
+        native_lucene_mock_index_input_wrapper_read_int,
+    );
+    registry.register(
+        "org/apache/lucene/tests/store/MockIndexInputWrapper",
+        "readLong",
+        "()J",
+        native_lucene_mock_index_input_wrapper_read_long,
+    );
+}
+
+#[derive(Clone, Copy)]
+struct RandomizedRootEntry {
+    root: usize,
+    fallback: ObjectRef,
+    identity: i32,
+}
+
+fn randomized_root_entry(ctx: &mut dyn NativeContext, obj: ObjectRef) -> RandomizedRootEntry {
+    RandomizedRootEntry {
+        root: ctx.add_global_root(obj),
+        fallback: obj,
+        identity: ctx.identity_hash_code(obj),
+    }
+}
+
+fn randomized_resolve_root(ctx: &dyn NativeContext, entry: RandomizedRootEntry) -> Option<ObjectRef> {
+    let obj = if entry.root != 0 {
+        ctx.resolve_global_root(entry.root).or(Some(entry.fallback))?
+    } else {
+        entry.fallback
+    };
+    if ctx.identity_hash_code(obj) == entry.identity {
+        Some(obj)
+    } else {
+        None
+    }
+}
+
+fn randomized_release_root(ctx: &mut dyn NativeContext, entry: RandomizedRootEntry) {
+    if entry.root != 0 {
+        let _ = ctx.remove_global_root(entry.root);
+    }
+}
+
+#[derive(Clone, Copy, Eq, Hash, PartialEq)]
+struct RandomizedContextCacheKey {
+    vm: usize,
+    thread: i32,
+    group: i32,
+}
+
+fn randomized_context_cache(
+) -> &'static parking_lot::Mutex<std::collections::HashMap<RandomizedContextCacheKey, RandomizedRootEntry>> {
+    static CACHE: std::sync::OnceLock<
+        parking_lot::Mutex<std::collections::HashMap<RandomizedContextCacheKey, RandomizedRootEntry>>,
+    > = std::sync::OnceLock::new();
+    CACHE.get_or_init(|| parking_lot::Mutex::new(std::collections::HashMap::new()))
+}
+
+fn randomized_context_cache_lookup(
+    ctx: &dyn NativeContext,
+    key: RandomizedContextCacheKey,
+) -> Option<ObjectRef> {
+    let entry = randomized_context_cache().lock().get(&key).copied()?;
+    randomized_resolve_root(ctx, entry)
+}
+
+fn randomized_context_cache_store(
+    ctx: &mut dyn NativeContext,
+    key: RandomizedContextCacheKey,
+    context: ObjectRef,
+) {
+    let entry = randomized_root_entry(ctx, context);
+    let old = randomized_context_cache().lock().insert(key, entry);
+    if let Some(old) = old {
+        if old.root != entry.root {
+            randomized_release_root(ctx, old);
+        }
+    }
+}
+
+#[derive(Clone, Copy, Eq, Hash, PartialEq)]
+struct RandomizedRandomCacheKey {
+    vm: usize,
+    context: i32,
+    thread: i32,
+}
+
+fn randomized_random_cache(
+) -> &'static parking_lot::Mutex<std::collections::HashMap<RandomizedRandomCacheKey, RandomizedRootEntry>> {
+    static CACHE: std::sync::OnceLock<
+        parking_lot::Mutex<std::collections::HashMap<RandomizedRandomCacheKey, RandomizedRootEntry>>,
+    > = std::sync::OnceLock::new();
+    CACHE.get_or_init(|| parking_lot::Mutex::new(std::collections::HashMap::new()))
+}
+
+fn randomized_random_cache_lookup(
+    ctx: &dyn NativeContext,
+    key: RandomizedRandomCacheKey,
+) -> Option<ObjectRef> {
+    let entry = randomized_random_cache().lock().get(&key).copied()?;
+    randomized_resolve_root(ctx, entry)
+}
+
+fn randomized_random_cache_store(
+    ctx: &mut dyn NativeContext,
+    key: RandomizedRandomCacheKey,
+    random: ObjectRef,
+) {
+    let entry = randomized_root_entry(ctx, random);
+    let old = randomized_random_cache().lock().insert(key, entry);
+    if let Some(old) = old {
+        if old.root != entry.root {
+            randomized_release_root(ctx, old);
+        }
+    }
+}
+
+fn randomized_random_cache_invalidate(ctx: &mut dyn NativeContext, key: RandomizedRandomCacheKey) {
+    let old = randomized_random_cache().lock().remove(&key);
+    if let Some(old) = old {
+        randomized_release_root(ctx, old);
+    }
+}
+
+fn randomized_random_cache_key_for_context(
+    ctx: &mut dyn NativeContext,
+    context: ObjectRef,
+) -> RandomizedRandomCacheKey {
+    let thread = ctx.current_thread_object();
+    RandomizedRandomCacheKey {
+        vm: ctx.vm_identity(),
+        context: ctx.identity_hash_code(context),
+        thread: ctx.identity_hash_code(thread),
+    }
+}
+
+fn randomized_context_static_contexts(ctx: &dyn NativeContext) -> Option<ObjectRef> {
+    let class_id = ctx.class_id_by_name("com/carrotsearch/randomizedtesting/RandomizedContext")?;
+    let idx = ctx.static_field_index_by_name(class_id, "contexts")?;
+    match ctx.get_static_field(class_id, idx) {
+        Value::Object(Some(contexts)) => Some(contexts),
+        _ => None,
+    }
+}
+
+fn randomized_thread_group(ctx: &mut dyn NativeContext, thread: ObjectRef) -> MethodCallResult {
+    ctx.invoke_virtual(thread, "getThreadGroup", "()Ljava/lang/ThreadGroup;", &[])
+}
+
+fn randomized_context_for_thread(
+    ctx: &mut dyn NativeContext,
+    thread: ObjectRef,
+) -> MethodCallResult {
+    let group_result = randomized_thread_group(ctx, thread)?;
+    let group = match group_result {
+        Some(Value::Object(Some(group))) => group,
+        _ => return Ok(Some(Value::Object(None))),
+    };
+    let key = RandomizedContextCacheKey {
+        vm: ctx.vm_identity(),
+        thread: ctx.identity_hash_code(thread),
+        group: ctx.identity_hash_code(group),
+    };
+    if let Some(context) = randomized_context_cache_lookup(ctx, key) {
+        return Ok(Some(Value::Object(Some(context))));
+    }
+
+    let contexts = match randomized_context_static_contexts(ctx) {
+        Some(contexts) => contexts,
+        None => return Ok(Some(Value::Object(None))),
+    };
+    let mut current_group = group;
+    loop {
+        let contexts_pin = ctx.pin_native_root(contexts);
+        let group_pin = ctx.pin_native_root(current_group);
+        let candidate = ctx.invoke_virtual(
+            contexts,
+            "get",
+            "(Ljava/lang/Object;)Ljava/lang/Object;",
+            &[Value::Object(Some(current_group))],
+        )?;
+        current_group = ctx.read_native_pin(group_pin, current_group);
+        ctx.unpin_native_roots(contexts_pin);
+        if let Some(Value::Object(Some(context))) = candidate {
+            randomized_context_cache_store(ctx, key, context);
+            return Ok(Some(Value::Object(Some(context))));
+        }
+        let parent_result = ctx.invoke_virtual(
+            current_group,
+            "getParent",
+            "()Ljava/lang/ThreadGroup;",
+            &[],
+        )?;
+        current_group = match parent_result {
+            Some(Value::Object(Some(parent))) => parent,
+            _ => return Ok(Some(Value::Object(None))),
+        };
+    }
+}
+
+fn randomized_context_current_obj(ctx: &mut dyn NativeContext) -> MethodCallResult {
+    let thread = ctx.current_thread_object();
+    randomized_context_for_thread(ctx, thread)
+}
+
+fn randomized_context_randomness(ctx: &mut dyn NativeContext, context: ObjectRef) -> MethodCallResult {
+    let resources = match native_randomized_context_get_per_thread(ctx, &[Value::Object(Some(context))])? {
+        Some(Value::Object(Some(resources))) => resources,
+        _ => return Ok(Some(Value::Object(None))),
+    };
+    let deque = match ctx.get_field_by_name(resources, "randomnesses") {
+        Value::Object(Some(deque)) => deque,
+        _ => return Ok(Some(Value::Object(None))),
+    };
+    ctx.invoke_virtual(deque, "peekFirst", "()Ljava/lang/Object;", &[])
+}
+
+fn randomized_random_from_context(ctx: &mut dyn NativeContext, context: ObjectRef) -> MethodCallResult {
+    let key = randomized_random_cache_key_for_context(ctx, context);
+    if let Some(random) = randomized_random_cache_lookup(ctx, key) {
+        return Ok(Some(Value::Object(Some(random))));
+    }
+    let randomness = match randomized_context_randomness(ctx, context)? {
+        Some(Value::Object(Some(randomness))) => randomness,
+        _ => return Ok(Some(Value::Object(None))),
+    };
+    let random = match ctx.get_field_by_name(randomness, "random") {
+        Value::Object(Some(random)) => random,
+        _ => return Ok(Some(Value::Object(None))),
+    };
+    randomized_random_cache_store(ctx, key, random);
+    Ok(Some(Value::Object(Some(random))))
+}
+
+fn native_randomized_context_current(
+    ctx: &mut dyn NativeContext,
+    _args: &[Value],
+) -> MethodCallResult {
+    randomized_context_current_obj(ctx)
+}
+
+fn native_randomized_context_context(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    let thread = obj_arg(args, 0)?;
+    randomized_context_for_thread(ctx, thread)
+}
+
+fn native_randomized_context_get_randomness(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    let this = obj_arg(args, 0)?;
+    randomized_context_randomness(ctx, this)
+}
+
+fn native_randomized_context_get_random(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    let this = obj_arg(args, 0)?;
+    randomized_random_from_context(ctx, this)
+}
+
+fn native_randomized_context_push(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    let this = obj_arg(args, 0)?;
+    let randomness = obj_arg(args, 1)?;
+    let key = randomized_random_cache_key_for_context(ctx, this);
+    randomized_random_cache_invalidate(ctx, key);
+    let resources = match native_randomized_context_get_per_thread(ctx, &[Value::Object(Some(this))])? {
+        Some(Value::Object(Some(resources))) => resources,
+        _ => return Ok(None),
+    };
+    let deque = match ctx.get_field_by_name(resources, "randomnesses") {
+        Value::Object(Some(deque)) => deque,
+        _ => return Ok(None),
+    };
+    ctx.invoke_virtual(deque, "push", "(Ljava/lang/Object;)V", &[Value::Object(Some(randomness))])?;
+    Ok(None)
+}
+
+fn native_randomized_context_pop_and_destroy(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    let this = obj_arg(args, 0)?;
+    let key = randomized_random_cache_key_for_context(ctx, this);
+    randomized_random_cache_invalidate(ctx, key);
+    let resources = match native_randomized_context_get_per_thread(ctx, &[Value::Object(Some(this))])? {
+        Some(Value::Object(Some(resources))) => resources,
+        _ => return Ok(None),
+    };
+    let deque = match ctx.get_field_by_name(resources, "randomnesses") {
+        Value::Object(Some(deque)) => deque,
+        _ => return Ok(None),
+    };
+    let popped = ctx.invoke_virtual(deque, "pop", "()Ljava/lang/Object;", &[])?;
+    if let Some(Value::Object(Some(randomness))) = popped {
+        let _ = ctx.invoke_virtual(randomness, "destroy", "()V", &[])?;
+    }
+    Ok(None)
+}
+
+fn native_randomness_get_random(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = obj_arg(args, 0)?;
+    Ok(Some(ctx.get_field_by_name(this, "random")))
+}
+
+fn native_randomized_test_get_context(
+    ctx: &mut dyn NativeContext,
+    _args: &[Value],
+) -> MethodCallResult {
+    randomized_context_current_obj(ctx)
+}
+
+fn native_randomized_test_get_random(
+    ctx: &mut dyn NativeContext,
+    _args: &[Value],
+) -> MethodCallResult {
+    let context = match randomized_context_current_obj(ctx)? {
+        Some(Value::Object(Some(context))) => context,
+        _ => return Ok(Some(Value::Object(None))),
+    };
+    randomized_random_from_context(ctx, context)
+}
+
+fn native_randomized_test_random_float(
+    ctx: &mut dyn NativeContext,
+    _args: &[Value],
+) -> MethodCallResult {
+    let random = match native_randomized_test_get_random(ctx, &[])? {
+        Some(Value::Object(Some(random))) => random,
+        _ => return Ok(Some(Value::Float(0.0))),
+    };
+    ctx.invoke_virtual(random, "nextFloat", "()F", &[])
+}
+
+#[inline]
+fn xoroshiro_state(ctx: &dyn NativeContext, this: ObjectRef) -> (u64, u64) {
+    let s0 = match ctx.get_field_by_name(this, "s0") {
+        Value::Long(v) => v as u64,
+        _ => 0,
+    };
+    let s1 = match ctx.get_field_by_name(this, "s1") {
+        Value::Long(v) => v as u64,
+        _ => 0,
+    };
+    (s0, s1)
+}
+
+#[inline]
+fn xoroshiro_next_long_raw(ctx: &mut dyn NativeContext, this: ObjectRef) -> i64 {
+    let (s0, mut s1) = xoroshiro_state(ctx, this);
+    let result = s0.wrapping_add(s1);
+    s1 ^= s0;
+    let new_s0 = s0.rotate_left(55) ^ s1 ^ s1.wrapping_shl(14);
+    let new_s1 = s1.rotate_left(36);
+    ctx.set_field_by_name(this, "s0", Value::Long(new_s0 as i64));
+    ctx.set_field_by_name(this, "s1", Value::Long(new_s1 as i64));
+    result as i64
+}
+
+#[inline]
+fn xoroshiro_next_int_raw(ctx: &mut dyn NativeContext, this: ObjectRef) -> i32 {
+    xoroshiro_next_long_raw(ctx, this) as i32
+}
+
+#[inline]
+fn xoroshiro_next_bits_raw(ctx: &mut dyn NativeContext, this: ObjectRef, bits: i32) -> i32 {
+    let shift = (32 - bits).clamp(0, 32) as u32;
+    ((xoroshiro_next_int_raw(ctx, this) as u32) >> shift) as i32
+}
+
+fn native_xoroshiro128_plus_random_next_long(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    let this = obj_arg(args, 0)?;
+    Ok(Some(Value::Long(xoroshiro_next_long_raw(ctx, this))))
+}
+
+fn native_xoroshiro128_plus_random_next_int(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    let this = obj_arg(args, 0)?;
+    Ok(Some(Value::Int(xoroshiro_next_int_raw(ctx, this))))
+}
+
+fn native_xoroshiro128_plus_random_next_bits(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    let this = obj_arg(args, 0)?;
+    let bits = args.get(1).and_then(|v| v.as_int()).unwrap_or(0);
+    Ok(Some(Value::Int(xoroshiro_next_bits_raw(ctx, this, bits))))
+}
+
+fn native_xoroshiro128_plus_random_next_int_bound(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    let this = obj_arg(args, 0)?;
+    let bound = args.get(1).and_then(|v| v.as_int()).unwrap_or(0);
+    if bound <= 0 {
+        return Err(RuntimeError::IllegalArgumentException {
+            message: "bound must be positive".to_string(),
+        }
+        .into());
+    }
+    if (bound & bound.wrapping_neg()) == bound {
+        let bits = xoroshiro_next_bits_raw(ctx, this, 31) as i64;
+        return Ok(Some(Value::Int(((bound as i64 * bits) >> 31) as i32)));
+    }
+    loop {
+        let bits = xoroshiro_next_bits_raw(ctx, this, 31);
+        let value = bits % bound;
+        if bits.wrapping_sub(value).wrapping_add(bound - 1) >= 0 {
+            return Ok(Some(Value::Int(value)));
+        }
+    }
+}
+
+fn native_xoroshiro128_plus_random_next_float(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    let this = obj_arg(args, 0)?;
+    let bits = (xoroshiro_next_int_raw(ctx, this) as u32) >> 8;
+    Ok(Some(Value::Float((bits as f32) * 5.960_464_5e-8_f32)))
+}
+
+fn native_xoroshiro128_plus_random_next_double(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    let this = obj_arg(args, 0)?;
+    let bits = (xoroshiro_next_long_raw(ctx, this) as u64) >> 11;
+    Ok(Some(Value::Double((bits as f64) * 1.110_223_024_625_156_5e-16_f64)))
+}
+
+fn native_xoroshiro128_plus_random_next_boolean(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    let this = obj_arg(args, 0)?;
+    Ok(Some(Value::Int(if xoroshiro_next_long_raw(ctx, this) >= 0 { 1 } else { 0 })))
+}
+
+fn native_xoroshiro128_plus_random_next_bytes(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    let this = obj_arg(args, 0)?;
+    let bytes = obj_arg(args, 1)?;
+    let len = ctx.array_length(bytes);
+    let mut index = 0;
+    while index < len {
+        let mut rnd = xoroshiro_next_int_raw(ctx, this) as i64 as u64;
+        let chunk = std::cmp::min(len - index, 8);
+        for _ in 0..chunk {
+            ctx.set_array_element(bytes, index, Value::Int(rnd as u8 as i8 as i32));
+            index += 1;
+            rnd >>= 8;
+        }
+    }
+    Ok(None)
+}
+
+#[derive(Clone, Copy, Eq, Hash, PartialEq)]
+struct RandomizedPerThreadCacheKey {
+    vm: usize,
+    context: i32,
+    map: i32,
+    thread: i32,
+}
+
+#[derive(Clone, Copy)]
+struct RandomizedPerThreadCacheEntry {
+    root: usize,
+    fallback: ObjectRef,
+    resource_id: i32,
+}
+
+fn randomized_per_thread_cache(
+) -> &'static parking_lot::Mutex<std::collections::HashMap<RandomizedPerThreadCacheKey, RandomizedPerThreadCacheEntry>> {
+    static CACHE: std::sync::OnceLock<
+        parking_lot::Mutex<std::collections::HashMap<RandomizedPerThreadCacheKey, RandomizedPerThreadCacheEntry>>,
+    > = std::sync::OnceLock::new();
+    CACHE.get_or_init(|| parking_lot::Mutex::new(std::collections::HashMap::new()))
+}
+
+fn randomized_per_thread_key(
+    ctx: &dyn NativeContext,
+    this: ObjectRef,
+    map: ObjectRef,
+    thread: ObjectRef,
+) -> RandomizedPerThreadCacheKey {
+    RandomizedPerThreadCacheKey {
+        vm: ctx.vm_identity(),
+        context: ctx.identity_hash_code(this),
+        map: ctx.identity_hash_code(map),
+        thread: ctx.identity_hash_code(thread),
+    }
+}
+
+fn randomized_per_thread_cache_lookup(
+    ctx: &dyn NativeContext,
+    key: RandomizedPerThreadCacheKey,
+) -> Option<ObjectRef> {
+    let entry = randomized_per_thread_cache().lock().get(&key).copied()?;
+    let resource = if entry.root != 0 {
+        ctx.resolve_global_root(entry.root).or(Some(entry.fallback))?
+    } else {
+        entry.fallback
+    };
+    if ctx.identity_hash_code(resource) == entry.resource_id {
+        Some(resource)
+    } else {
+        None
+    }
+}
+
+fn randomized_per_thread_cache_store(
+    ctx: &mut dyn NativeContext,
+    key: RandomizedPerThreadCacheKey,
+    resources: ObjectRef,
+) {
+    let entry = RandomizedPerThreadCacheEntry {
+        root: ctx.add_global_root(resources),
+        fallback: resources,
+        resource_id: ctx.identity_hash_code(resources),
+    };
+    let old = randomized_per_thread_cache().lock().insert(key, entry);
+    if let Some(old) = old {
+        if old.root != 0 && old.root != entry.root {
+            let _ = ctx.remove_global_root(old.root);
+        }
+    }
+}
+
+fn float_array_elem(ctx: &dyn NativeContext, arr: ObjectRef, index: usize) -> f32 {
+    match ctx.get_array_element(arr, index) {
+        Value::Float(v) => v,
+        Value::Int(v) => f32::from_bits(v as u32),
+        _ => 0.0,
+    }
+}
+
+fn native_es_vector_util_dot_product_f32(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    let a = obj_arg(args, 0)?;
+    let b = obj_arg(args, 1)?;
+    let len = ctx.array_length(a).min(ctx.array_length(b));
+    let mut sum = 0.0f32;
+    for i in 0..len {
+        sum += float_array_elem(ctx, a, i) * float_array_elem(ctx, b, i);
+    }
+    Ok(Some(Value::Float(sum)))
+}
+
+fn native_es_vector_util_square_distance_f32(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    let a = obj_arg(args, 0)?;
+    let b = obj_arg(args, 1)?;
+    let len = ctx.array_length(a).min(ctx.array_length(b));
+    let mut sum = 0.0f32;
+    for i in 0..len {
+        let d = float_array_elem(ctx, a, i) - float_array_elem(ctx, b, i);
+        sum += d * d;
+    }
+    Ok(Some(Value::Float(sum)))
+}
+
+fn native_es_vector_util_square_distance_f32_offset(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    let a = obj_arg(args, 0)?;
+    let b = obj_arg(args, 1)?;
+    let offset = match args.get(2) {
+        Some(Value::Int(v)) => (*v).max(0) as usize,
+        _ => 0,
+    };
+    let requested = match args.get(3) {
+        Some(Value::Int(v)) => (*v).max(0) as usize,
+        _ => 0,
+    };
+    let max_len = ctx.array_length(a).min(ctx.array_length(b));
+    let end = offset.saturating_add(requested).min(max_len);
+    let mut sum = 0.0f32;
+    for i in offset..end {
+        let d = float_array_elem(ctx, a, i) - float_array_elem(ctx, b, i);
+        sum += d * d;
+    }
+    Ok(Some(Value::Float(sum)))
+}
+
+#[inline]
+fn float_arg(args: &[Value], index: usize) -> f32 {
+    match args.get(index) {
+        Some(Value::Float(v)) => *v,
+        Some(Value::Int(v)) => f32::from_bits(*v as u32),
+        _ => 0.0,
+    }
+}
+
+#[inline]
+fn java_f32_min(a: f32, b: f32) -> f32 {
+    if a.is_nan() || b.is_nan() {
+        f32::NAN
+    } else if a == 0.0 && b == 0.0 {
+        if a.is_sign_negative() || b.is_sign_negative() { -0.0 } else { 0.0 }
+    } else if a < b {
+        a
+    } else {
+        b
+    }
+}
+
+#[inline]
+fn java_f32_max(a: f32, b: f32) -> f32 {
+    if a.is_nan() || b.is_nan() {
+        f32::NAN
+    } else if a == 0.0 && b == 0.0 {
+        if a.is_sign_positive() || b.is_sign_positive() { 0.0 } else { -0.0 }
+    } else if a > b {
+        a
+    } else {
+        b
+    }
+}
+
+#[inline]
+fn java_math_round_f32(v: f32) -> i32 {
+    let rounded = (v + 0.5).floor();
+    if rounded.is_nan() {
+        0
+    } else if rounded >= i32::MAX as f32 {
+        i32::MAX
+    } else if rounded <= i32::MIN as f32 {
+        i32::MIN
+    } else {
+        rounded as i32
+    }
+}
+
+#[inline]
+fn set_float_array_elem(ctx: &dyn NativeContext, arr: ObjectRef, index: usize, value: f32) {
+    ctx.set_array_element(arr, index, Value::Float(value));
+}
+
+#[inline]
+fn set_int_array_elem(ctx: &dyn NativeContext, arr: ObjectRef, index: usize, value: i32) {
+    ctx.set_array_element(arr, index, Value::Int(value));
+}
+
+#[inline]
+fn byte_array_elem(ctx: &dyn NativeContext, arr: ObjectRef, index: usize) -> i32 {
+    ctx.get_array_element(arr, index).as_int().unwrap_or(0) as i8 as i32
+}
+
+fn native_es_vector_util_calculate_osq_loss_f32(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    let vector = obj_arg(args, 0)?;
+    let lower = float_arg(args, 1);
+    let upper = float_arg(args, 2);
+    let points = args.get(3).and_then(|v| v.as_int()).unwrap_or(0);
+    let norm2 = float_arg(args, 4);
+    let lambda = float_arg(args, 5);
+    let scratch = obj_arg(args, 6)?;
+    let step = (upper - lower) / ((points as f32) - 1.0);
+    let inv_step = 1.0 / step;
+    let mut xe = 0.0f32;
+    let mut e2 = 0.0f32;
+    for i in 0..ctx.array_length(vector) {
+        let v = float_array_elem(ctx, vector, i);
+        let clamped = java_f32_min(java_f32_max(v, lower), upper);
+        let q = java_math_round_f32((clamped - lower) * inv_step);
+        set_int_array_elem(ctx, scratch, i, q);
+        let dequantized = step.mul_add(q as f32, lower);
+        let error = v - dequantized;
+        e2 = error.mul_add(error, e2);
+        xe = v.mul_add(error, xe);
+    }
+    Ok(Some(Value::Float((1.0 - lambda) * xe * xe / norm2 + lambda * e2)))
+}
+
+fn native_es_vector_util_calculate_osq_grid_points_f32(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    let vector = obj_arg(args, 0)?;
+    let quantized = obj_arg(args, 1)?;
+    let points = args.get(2).and_then(|v| v.as_int()).unwrap_or(0);
+    let scratch = obj_arg(args, 3)?;
+    let mut a = 0.0f32;
+    let mut b = 0.0f32;
+    let mut c = 0.0f32;
+    let mut d = 0.0f32;
+    let mut e = 0.0f32;
+    let inv = 1.0 / ((points as f32) - 1.0);
+    for i in 0..ctx.array_length(vector) {
+        let v = float_array_elem(ctx, vector, i);
+        let q = int_array_elem(ctx, quantized, i) as f32;
+        let x = q * inv;
+        let y = 1.0 - x;
+        a = y.mul_add(y, a);
+        b = y.mul_add(x, b);
+        c = x.mul_add(x, c);
+        d = y.mul_add(v, d);
+        e = x.mul_add(v, e);
+    }
+    set_float_array_elem(ctx, scratch, 0, a);
+    set_float_array_elem(ctx, scratch, 1, b);
+    set_float_array_elem(ctx, scratch, 2, c);
+    set_float_array_elem(ctx, scratch, 3, d);
+    set_float_array_elem(ctx, scratch, 4, e);
+    Ok(None)
+}
+
+fn es_vector_util_center_stats_common<F>(
+    ctx: &mut dyn NativeContext,
+    len: usize,
+    centered: ObjectRef,
+    stats: ObjectRef,
+    mut value_at: F,
+    track_dot_product: bool,
+) where
+    F: FnMut(&dyn NativeContext, usize) -> (f32, f32, f32),
+{
+    let mut mean = 0.0f32;
+    let mut variance_sum = 0.0f32;
+    let mut norm2 = 0.0f32;
+    let mut dot_product = 0.0f32;
+    let mut min = f32::MAX;
+    let mut max = -f32::MAX;
+    for i in 0..len {
+        let (value, center, dot_value) = value_at(ctx, i);
+        if track_dot_product {
+            dot_product = value.mul_add(dot_value, dot_product);
+        }
+        let c = value - center;
+        set_float_array_elem(ctx, centered, i, c);
+        min = java_f32_min(min, c);
+        max = java_f32_max(max, c);
+        norm2 = c.mul_add(c, norm2);
+        let delta = c - mean;
+        mean += delta / ((i + 1) as f32);
+        let delta2 = c - mean;
+        variance_sum = delta.mul_add(delta2, variance_sum);
+    }
+    set_float_array_elem(ctx, stats, 0, mean);
+    set_float_array_elem(ctx, stats, 1, variance_sum / (len as f32));
+    set_float_array_elem(ctx, stats, 2, norm2);
+    set_float_array_elem(ctx, stats, 3, min);
+    set_float_array_elem(ctx, stats, 4, max);
+    if track_dot_product {
+        set_float_array_elem(ctx, stats, 5, dot_product);
+    }
+}
+
+fn native_es_vector_util_center_stats_euclidean_f32(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    let vector = obj_arg(args, 0)?;
+    let centroid = obj_arg(args, 1)?;
+    let centered = obj_arg(args, 2)?;
+    let stats = obj_arg(args, 3)?;
+    let len = ctx.array_length(vector);
+    es_vector_util_center_stats_common(ctx, len, centered, stats, |ctx, i| {
+        (float_array_elem(ctx, vector, i), float_array_elem(ctx, centroid, i), 0.0)
+    }, false);
+    Ok(None)
+}
+
+fn native_es_vector_util_center_stats_dp_f32(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    let vector = obj_arg(args, 0)?;
+    let centroid = obj_arg(args, 1)?;
+    let centered = obj_arg(args, 2)?;
+    let stats = obj_arg(args, 3)?;
+    let len = ctx.array_length(vector);
+    es_vector_util_center_stats_common(ctx, len, centered, stats, |ctx, i| {
+        let value = float_array_elem(ctx, vector, i);
+        let center = float_array_elem(ctx, centroid, i);
+        (value, center, center)
+    }, true);
+    Ok(None)
+}
+
+fn native_es_vector_util_center_stats_euclidean_i8(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    let vector = obj_arg(args, 0)?;
+    let centroid = obj_arg(args, 1)?;
+    let centered = obj_arg(args, 2)?;
+    let stats = obj_arg(args, 3)?;
+    let len = ctx.array_length(vector);
+    es_vector_util_center_stats_common(ctx, len, centered, stats, |ctx, i| {
+        (byte_array_elem(ctx, vector, i) as f32, byte_array_elem(ctx, centroid, i) as f32, 0.0)
+    }, false);
+    Ok(None)
+}
+
+fn native_es_vector_util_center_stats_dp_i8(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    let vector = obj_arg(args, 0)?;
+    let centroid = obj_arg(args, 1)?;
+    let centered = obj_arg(args, 2)?;
+    let stats = obj_arg(args, 3)?;
+    let len = ctx.array_length(vector);
+    es_vector_util_center_stats_common(ctx, len, centered, stats, |ctx, i| {
+        let value = byte_array_elem(ctx, vector, i) as f32;
+        let center = byte_array_elem(ctx, centroid, i) as f32;
+        (value, center, center)
+    }, true);
+    Ok(None)
+}
+
+fn native_es_vector_util_quantize_vector_with_intervals_f32(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    let vector = obj_arg(args, 0)?;
+    let destination = obj_arg(args, 1)?;
+    let lower = float_arg(args, 2);
+    let upper = float_arg(args, 3);
+    let bits = args.get(4).and_then(|v| v.as_int()).unwrap_or(0);
+    let max_quant = ((1_i32 << bits) - 1) as f32;
+    let inv = max_quant / (upper - lower);
+    let mut sum = 0_i32;
+    for i in 0..ctx.array_length(vector) {
+        let v = java_f32_min(java_f32_max(float_array_elem(ctx, vector, i), lower), upper);
+        let q = java_math_round_f32((v - lower) * inv);
+        sum = sum.wrapping_add(q);
+        set_int_array_elem(ctx, destination, i, q);
+    }
+    Ok(Some(Value::Int(sum)))
+}
+
+fn native_es_vector_util_pack_as_binary(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    let values = obj_arg(args, 0)?;
+    let packed = obj_arg(args, 1)?;
+    let len = ctx.array_length(values);
+    if len == 0 {
+        return Ok(None);
+    }
+    let out_len = (len + 7) / 8;
+    let mut out = vec![0u8; out_len.min(ctx.array_length(packed))];
+    let mut src = 0usize;
+    let mut dst = 0usize;
+    while src + 7 < len && dst < out.len() {
+        let byte = (((int_array_elem(ctx, values, src) & 1) as u8) << 7)
+            | (((int_array_elem(ctx, values, src + 1) & 1) as u8) << 6)
+            | (((int_array_elem(ctx, values, src + 2) & 1) as u8) << 5)
+            | (((int_array_elem(ctx, values, src + 3) & 1) as u8) << 4)
+            | (((int_array_elem(ctx, values, src + 4) & 1) as u8) << 3)
+            | (((int_array_elem(ctx, values, src + 5) & 1) as u8) << 2)
+            | (((int_array_elem(ctx, values, src + 6) & 1) as u8) << 1)
+            | ((int_array_elem(ctx, values, src + 7) & 1) as u8);
+        out[dst] = byte;
+        src += 8;
+        dst += 1;
+    }
+    if src < len && dst < out.len() {
+        let mut byte = 0u8;
+        let mut shift = 7i32;
+        while shift >= 0 && src < len {
+            byte |= ((int_array_elem(ctx, values, src) & 1) as u8) << shift;
+            src += 1;
+            shift -= 1;
+        }
+        out[dst] = byte;
+    }
+    if !ctx.write_byte_array_from(packed, 0, &out) {
+        return Err(lucene_iobe("ESVectorUtil.packAsBinary destination byte[] write failed"));
+    }
+    Ok(None)
+}
+
+#[inline]
+fn int_array_elem(ctx: &dyn NativeContext, arr: ObjectRef, index: usize) -> i32 {
+    match ctx.get_array_element(arr, index) {
+        Value::Int(v) => v,
+        _ => 0,
+    }
+}
+
+#[inline]
+fn bool_array_elem(ctx: &dyn NativeContext, arr: ObjectRef, index: usize) -> bool {
+    match ctx.get_array_element(arr, index) {
+        Value::Int(v) => v != 0,
+        _ => false,
+    }
+}
+
+fn native_es_next_diskbbq_vectors_writer_iarray_at_i(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    let arr = obj_arg(args, 0)?;
+    let index = match args.get(1) {
+        Some(Value::Int(v)) if *v >= 0 => *v as usize,
+        _ => 0,
+    };
+    Ok(Some(Value::Int(int_array_elem(ctx, arr, index))))
+}
+
+fn native_es_next_diskbbq_vectors_writer_iarray_at_iarray_at_i(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    let outer = obj_arg(args, 0)?;
+    let inner = obj_arg(args, 1)?;
+    let index = match args.get(2) {
+        Some(Value::Int(v)) if *v >= 0 => *v as usize,
+        _ => 0,
+    };
+    let inner_index = int_array_elem(ctx, inner, index).max(0) as usize;
+    Ok(Some(Value::Int(int_array_elem(ctx, outer, inner_index))))
+}
+
+fn native_es_next_diskbbq_vectors_writer_iarray_at_i_plus_j(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    let arr = obj_arg(args, 0)?;
+    let i = match args.get(1) {
+        Some(Value::Int(v)) => *v,
+        _ => 0,
+    };
+    let j = match args.get(2) {
+        Some(Value::Int(v)) => *v,
+        _ => 0,
+    };
+    let index = i.saturating_add(j).max(0) as usize;
+    Ok(Some(Value::Int(int_array_elem(ctx, arr, index))))
+}
+
+fn native_es_next_diskbbq_vectors_writer_barray_at_iarray_at_i(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    let outer = obj_arg(args, 0)?;
+    let inner = obj_arg(args, 1)?;
+    let index = match args.get(2) {
+        Some(Value::Int(v)) if *v >= 0 => *v as usize,
+        _ => 0,
+    };
+    let inner_index = int_array_elem(ctx, inner, index).max(0) as usize;
+    Ok(Some(Value::Int(if bool_array_elem(ctx, outer, inner_index) { 1 } else { 0 })))
+}
+
+fn native_es_next_diskbbq_vectors_writer_i_plus_j(
+    _ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    let i = match args.get(0) {
+        Some(Value::Int(v)) => *v,
+        _ => 0,
+    };
+    let j = match args.get(1) {
+        Some(Value::Int(v)) => *v,
+        _ => 0,
+    };
+    Ok(Some(Value::Int(i.saturating_add(j))))
+}
+
+fn native_es_clustering_float_vector_values_slice_translated_ord(
+    ctx: &mut dyn NativeContext,
+    this: ObjectRef,
+    ord: i32,
+) -> Result<i32, MethodCallFailed> {
+    let translator = match ctx.get_field_by_name(this, "ordTranslator") {
+        Value::Object(Some(translator)) => translator,
+        _ => return Ok(ord),
+    };
+    Ok(match ctx.invoke_virtual(translator, "apply", "(I)I", &[Value::Int(ord)])? {
+        Some(Value::Int(mapped)) => mapped,
+        _ => ord,
+    })
+}
+
+fn native_es_clustering_float_vector_values_slice_vector_value(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    let this = obj_arg(args, 0)?;
+    let ord = args.get(1).and_then(Value::as_int).unwrap_or(0);
+    let all_values = match ctx.get_field_by_name(this, "allValues") {
+        Value::Object(Some(all_values)) => all_values,
+        _ => return Ok(Some(Value::Object(None))),
+    };
+
+    let all_values_pin = ctx.pin_native_root(all_values);
+    let translated = native_es_clustering_float_vector_values_slice_translated_ord(ctx, this, ord);
+    let all_values = ctx.read_native_pin(all_values_pin, all_values);
+    ctx.unpin_native_roots(all_values_pin);
+    let translated = translated?;
+
+    ctx.invoke_virtual(
+        all_values,
+        "vectorValue",
+        "(I)Ljava/lang/Object;",
+        &[Value::Int(translated)],
+    )
+}
+
+fn native_es_clustering_float_vector_values_slice_ord_to_doc(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    let this = obj_arg(args, 0)?;
+    let ord = args.get(1).and_then(Value::as_int).unwrap_or(0);
+    Ok(Some(Value::Int(
+        native_es_clustering_float_vector_values_slice_translated_ord(ctx, this, ord)?,
+    )))
+}
+
+fn native_es_clustering_float_vector_values_slice_size(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    let this = obj_arg(args, 0)?;
+    Ok(Some(Value::Int(
+        ctx.get_field_by_name(this, "size").as_int().unwrap_or(0),
+    )))
+}
+
+fn native_es_clustering_float_vector_values_slice_dimension(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    let this = obj_arg(args, 0)?;
+    let all_values = match ctx.get_field_by_name(this, "allValues") {
+        Value::Object(Some(all_values)) => all_values,
+        _ => return Ok(Some(Value::Int(0))),
+    };
+    ctx.invoke_virtual(all_values, "dimension", "()I", &[])
+}
+
+fn native_es_field_value(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+    field_name: &str,
+) -> MethodCallResult {
+    let this = obj_arg(args, 0)?;
+    Ok(Some(ctx.get_field_by_name(this, field_name)))
+}
+
+fn native_es_field_int(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+    field_name: &str,
+) -> MethodCallResult {
+    let this = obj_arg(args, 0)?;
+    Ok(Some(Value::Int(
+        ctx.get_field_by_name(this, field_name).as_int().unwrap_or(0),
+    )))
+}
+
+fn native_es_centroid_slices_slice_offsets(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    native_es_field_value(ctx, args, "sliceOffsets")
+}
+
+fn native_es_centroid_slices_slice_num_vectors(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    native_es_field_value(ctx, args, "sliceNumVectors")
+}
+
+fn native_es_centroid_slices_max_slice_size(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    native_es_field_int(ctx, args, "maxSliceSize")
+}
+
+fn native_es_centroid_assignments_num_centroids(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    native_es_field_int(ctx, args, "numCentroids")
+}
+
+fn native_es_centroid_assignments_centroids(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    native_es_field_value(ctx, args, "centroids")
+}
+
+fn native_es_centroid_assignments_assignments(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    native_es_field_value(ctx, args, "assignments")
+}
+
+fn native_es_centroid_assignments_overspill_assignments(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    native_es_field_value(ctx, args, "overspillAssignments")
+}
+
+fn native_es_centroid_assignments_global_centroid(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    native_es_field_value(ctx, args, "globalCentroid")
+}
+
+fn native_es_centroid_assignments_centroid_slices(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    native_es_field_value(ctx, args, "centroidSlices")
+}
+
+fn native_es_kmeans_result_centroids(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    native_es_field_value(ctx, args, "centroids")
+}
+
+fn native_es_kmeans_result_assignments(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    native_es_field_value(ctx, args, "assignments")
+}
+
+fn native_es_kmeans_result_cluster_counts(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    native_es_field_value(ctx, args, "clusterCounts")
+}
+
+fn native_es_kmeans_result_soar_assignments(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    native_es_field_value(ctx, args, "soarAssignments")
+}
+
+fn native_es_kmeans_float_vector_values_size(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    native_es_field_int(ctx, args, "numVectors")
+}
+
+fn native_es_next_diskbbq_vectors_writer_write_slices_offsets(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    let output = obj_arg(args, 1)?;
+    let slices = match args.get(2) {
+        Some(Value::Object(Some(slices))) => *slices,
+        _ => return Ok(None),
+    };
+    let offsets = match ctx.get_field_by_name(slices, "sliceOffsets") {
+        Value::Object(Some(offsets)) => offsets,
+        _ => return Ok(None),
+    };
+    let len = ctx.array_length(offsets);
+    if len == 0 {
+        return Ok(None);
+    }
+
+    let mut bytes = vec![0u8; len.saturating_mul(4)];
+    for i in 0..len {
+        let base = i * 4;
+        bytes[base..base + 4].copy_from_slice(&int_array_elem(ctx, offsets, i).to_le_bytes());
+    }
+
+    let output_pin = ctx.pin_native_root(output);
+    let byte_arr = ctx.new_array(cratonvm_types::ArrayElementType::Byte, bytes.len());
+    let byte_arr_pin = ctx.pin_native_root(byte_arr);
+    let result = if ctx.write_byte_array_from(byte_arr, 0, &bytes) {
+        let output = ctx.read_native_pin(output_pin, output);
+        let byte_arr = ctx.read_native_pin(byte_arr_pin, byte_arr);
+        ctx.invoke_virtual(
+            output,
+            "writeBytes",
+            "([BII)V",
+            &[
+                Value::Object(Some(byte_arr)),
+                Value::Int(0),
+                Value::Int(bytes.len().min(i32::MAX as usize) as i32),
+            ],
+        )?;
+        Ok(None)
+    } else {
+        Err(lucene_iobe("writeSlicesOffsets byte[] write failed"))
+    };
+    ctx.unpin_native_roots(byte_arr_pin);
+    ctx.unpin_native_roots(output_pin);
+    result
+}
+
+fn native_java_arrays_sort_long_range(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    let arr = obj_arg(args, 0)?;
+    let from = args.get(1).and_then(Value::as_int).unwrap_or(0);
+    let to = args.get(2).and_then(Value::as_int).unwrap_or(0);
+    let len = ctx.array_length(arr);
+    if from < 0 {
+        return Err(lucene_aioobe(from));
+    }
+    if to < from {
+        return Err(lucene_iobe("fromIndex > toIndex"));
+    }
+    let from = from as usize;
+    let to = to as usize;
+    if to > len {
+        return Err(lucene_aioobe(to.min(i32::MAX as usize) as i32));
+    }
+    if to.saturating_sub(from) <= 1 {
+        return Ok(None);
+    }
+    let mut values = Vec::with_capacity(to - from);
+    for i in from..to {
+        values.push(ctx.get_array_element(arr, i).as_long().unwrap_or(0));
+    }
+    values.sort();
+    for (i, value) in values.into_iter().enumerate() {
+        ctx.set_array_element(arr, from + i, Value::Long(value));
+    }
+    Ok(None)
+}
+
+fn java_string_hash_code_ascii(s: &str) -> i32 {
+    let mut h = 0i32;
+    for b in s.bytes() {
+        h = h.wrapping_mul(31).wrapping_add(b as i32);
+    }
+    h
+}
+
+fn lucene_missing_static(class_name: &str, field_name: &str) -> MethodCallFailed {
+    MethodCallFailed::InternalError(VmError::Runtime(RuntimeError::IllegalArgumentException {
+        message: format!("missing static field {class_name}.{field_name}"),
+    }))
+}
+
+fn lucene_static_object(
+    ctx: &mut dyn NativeContext,
+    class_name: &str,
+    field_name: &str,
+) -> Result<ObjectRef, MethodCallFailed> {
+    let class_id = ctx.ensure_class_initialized(class_name)?;
+    let field_idx = ctx
+        .static_field_index_by_name(class_id, field_name)
+        .ok_or_else(|| lucene_missing_static(class_name, field_name))?;
+    match ctx.get_static_field(class_id, field_idx) {
+        Value::Object(Some(obj)) => Ok(obj),
+        _ => Err(lucene_missing_static(class_name, field_name)),
+    }
+}
+
+fn lucene_sortable_i32_to_float(sortable: i32) -> f32 {
+    let bits = sortable ^ ((sortable >> 31) & 0x7fff_ffff);
+    f32::from_bits(bits as u32)
+}
+
+fn es_bulk_neighbor_decode_score(raw: i64) -> f32 {
+    lucene_sortable_i32_to_float((raw >> 32) as i32)
+}
+
+fn es_bulk_neighbor_decode_doc(raw: i64) -> i32 {
+    (!raw) as i32
+}
+
+fn native_es_new_score_doc(
+    ctx: &mut dyn NativeContext,
+    class_id: ClassId,
+    total_fields: usize,
+    raw: i64,
+) -> ObjectRef {
+    let hit = ctx.alloc_object(class_id, total_fields);
+    ctx.set_field_by_name(hit, "doc", Value::Int(es_bulk_neighbor_decode_doc(raw)));
+    ctx.set_field_by_name(
+        hit,
+        "score",
+        Value::Float(es_bulk_neighbor_decode_score(raw)),
+    );
+    ctx.set_field_by_name(hit, "shardIndex", Value::Int(-1));
+    hit
+}
+
+fn native_es_reservoir_values(ctx: &dyn NativeContext, reservoir: ObjectRef) -> Vec<i64> {
+    let max_size = lucene_field_int(ctx, reservoir, "maxSize").max(0) as usize;
+    let raw_size = lucene_field_int(ctx, reservoir, "size").max(0) as usize;
+    let values_arr = match ctx.get_field_by_name(reservoir, "values") {
+        Value::Object(Some(values)) => values,
+        _ => return Vec::new(),
+    };
+    let array_len = ctx.array_length(values_arr);
+    let read_len = raw_size.min(array_len);
+    if read_len == 0 || max_size == 0 {
+        return Vec::new();
+    }
+
+    if read_len <= max_size {
+        let mut values = Vec::with_capacity(read_len);
+        for i in 0..read_len {
+            values.push(ctx.get_array_element(values_arr, i).as_long().unwrap_or(0));
+        }
+        return values;
+    }
+
+    let mut values = Vec::with_capacity(read_len);
+    for i in 0..read_len {
+        values.push(ctx.get_array_element(values_arr, i).as_long().unwrap_or(0));
+    }
+    values.sort();
+    values.split_off(read_len - max_size)
+}
+
+fn native_es_reset_reservoir(ctx: &mut dyn NativeContext, reservoir: ObjectRef) {
+    ctx.set_field_by_name(reservoir, "size", Value::Int(0));
+    ctx.set_field_by_name(reservoir, "threshold", Value::Long(i64::MIN));
+    ctx.set_field_by_name(reservoir, "thresholdScore", Value::Float(f32::NEG_INFINITY));
+}
+
+fn native_es_tiny_heap_values(ctx: &dyn NativeContext, heap: ObjectRef) -> Vec<i64> {
+    let size = lucene_field_int(ctx, heap, "size").max(0) as usize;
+    let heap_arr = match ctx.get_field_by_name(heap, "heap") {
+        Value::Object(Some(heap_arr)) => heap_arr,
+        _ => return Vec::new(),
+    };
+    let array_len = ctx.array_length(heap_arr);
+    let mut values = Vec::with_capacity(size);
+    for i in 1..=size.min(array_len.saturating_sub(1)) {
+        values.push(ctx.get_array_element(heap_arr, i).as_long().unwrap_or(0));
+    }
+    values
+}
+
+fn native_es_reset_tiny_heap(ctx: &mut dyn NativeContext, heap: ObjectRef) {
+    ctx.set_field_by_name(heap, "size", Value::Int(0));
+}
+
+fn native_es_make_top_docs(
+    ctx: &mut dyn NativeContext,
+    score_docs: ObjectRef,
+    visited_count: i64,
+    relation: ObjectRef,
+) -> MethodCallResult {
+    let relation_pin = ctx.pin_native_root(relation);
+    let docs_pin = ctx.pin_native_root(score_docs);
+    let total_hits_class = ctx.ensure_class_initialized("org/apache/lucene/search/TotalHits")?;
+    let total_hits = ctx.alloc_object(
+        total_hits_class,
+        ctx.class_num_total_fields(total_hits_class).max(2),
+    );
+    let relation = ctx.read_native_pin(relation_pin, relation);
+    ctx.set_field_by_name(total_hits, "value", Value::Long(visited_count));
+    ctx.set_field_by_name(total_hits, "relation", Value::Object(Some(relation)));
+
+    let total_hits_pin = ctx.pin_native_root(total_hits);
+    let top_docs_class = ctx.ensure_class_initialized("org/apache/lucene/search/TopDocs")?;
+    let top_docs = ctx.alloc_object(top_docs_class, ctx.class_num_total_fields(top_docs_class).max(2));
+    let total_hits = ctx.read_native_pin(total_hits_pin, total_hits);
+    let score_docs = ctx.read_native_pin(docs_pin, score_docs);
+    ctx.set_field_by_name(top_docs, "totalHits", Value::Object(Some(total_hits)));
+    ctx.set_field_by_name(top_docs, "scoreDocs", Value::Object(Some(score_docs)));
+    ctx.unpin_native_roots(total_hits_pin);
+    ctx.unpin_native_roots(docs_pin);
+    ctx.unpin_native_roots(relation_pin);
+    Ok(Some(Value::Object(Some(top_docs))))
+}
+
+fn native_es_max_score_top_knn_collector_unsorted_top_k(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    let this = obj_arg(args, 0)?;
+    let queue = lucene_field_obj(ctx, this, "queue")?;
+    let mut values = match ctx.get_field_by_name(queue, "tinyHeap") {
+        Value::Object(Some(heap)) => {
+            let values = native_es_tiny_heap_values(ctx, heap);
+            native_es_reset_tiny_heap(ctx, heap);
+            values
+        }
+        _ => match ctx.get_field_by_name(queue, "collector") {
+            Value::Object(Some(reservoir)) => {
+                let values = native_es_reservoir_values(ctx, reservoir);
+                native_es_reset_reservoir(ctx, reservoir);
+                values
+            }
+            _ => Vec::new(),
+        },
+    };
+
+    let len = values.len();
+    let score_docs = ctx.new_array(cratonvm_types::ArrayElementType::Reference, len);
+    if len > 0 {
+        let score_docs_pin = ctx.pin_native_root(score_docs);
+        let score_doc_class = ctx.ensure_class_initialized("org/apache/lucene/search/ScoreDoc")?;
+        let score_doc_fields = ctx.class_num_total_fields(score_doc_class).max(3);
+        for (i, raw) in values.drain(..).enumerate() {
+            let hit = native_es_new_score_doc(ctx, score_doc_class, score_doc_fields, raw);
+            let score_docs = ctx.read_native_pin(score_docs_pin, score_docs);
+            ctx.set_array_element(score_docs, i, Value::Object(Some(hit)));
+        }
+        ctx.unpin_native_roots(score_docs_pin);
+    }
+
+    let early_terminated = matches!(
+        ctx.invoke_virtual(this, "earlyTerminated", "()Z", &[])?,
+        Some(Value::Int(v)) if v != 0
+    );
+    let relation_name = if early_terminated {
+        "GREATER_THAN_OR_EQUAL_TO"
+    } else {
+        "EQUAL_TO"
+    };
+    let relation = lucene_static_object(
+        ctx,
+        "org/apache/lucene/search/TotalHits$Relation",
+        relation_name,
+    )?;
+    let visited_count = match ctx.invoke_virtual(this, "visitedCount", "()J", &[])? {
+        Some(Value::Long(v)) => v,
+        Some(Value::Int(v)) => v as i64,
+        _ => 0,
+    };
+    native_es_make_top_docs(ctx, score_docs, visited_count, relation)
+}
+
+fn native_lucene_index_reader_context_id(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    let this = obj_arg(args, 0)?;
+    Ok(Some(ctx.get_field_by_name(this, "identity")))
+}
+
+fn native_es_knn_score_doc_query_init(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    let this = obj_arg(args, 0)?;
+    let score_docs = obj_arg(args, 1)?;
+    let reader = obj_arg(args, 2)?;
+    let len = ctx.array_length(score_docs);
+
+    let mut hits: Vec<(i32, f32, ObjectRef, usize)> = Vec::with_capacity(len);
+    for i in 0..len {
+        let hit = match ctx.get_array_element(score_docs, i) {
+            Value::Object(Some(hit)) => hit,
+            _ => return Err(RuntimeError::NullPointerException { message: None }.into()),
+        };
+        let doc = ctx.get_field_by_name(hit, "doc").as_int().unwrap_or(0);
+        let score = match ctx.get_field_by_name(hit, "score") {
+            Value::Float(v) => v,
+            Value::Int(v) => f32::from_bits(v as u32),
+            _ => 0.0,
+        };
+        hits.push((doc, score, hit, i));
+    }
+    hits.sort_by(|a, b| a.0.cmp(&b.0).then(a.3.cmp(&b.3)));
+
+    let docs_arr = ctx.new_array(cratonvm_types::ArrayElementType::Int, len);
+    let scores_arr = ctx.new_array(cratonvm_types::ArrayElementType::Float, len);
+    let mut docs = Vec::with_capacity(len);
+    for (i, (doc, score, hit, _)) in hits.into_iter().enumerate() {
+        docs.push(doc);
+        ctx.set_array_element(score_docs, i, Value::Object(Some(hit)));
+        ctx.set_array_element(docs_arr, i, Value::Int(doc));
+        ctx.set_array_element(scores_arr, i, Value::Float(score));
+    }
+
+    let leaves = match ctx.invoke_virtual(reader, "leaves", "()Ljava/util/List;", &[])? {
+        Some(Value::Object(Some(leaves))) => leaves,
+        _ => return Err(RuntimeError::NullPointerException { message: None }.into()),
+    };
+    let leaves_size = match ctx.invoke_virtual(leaves, "size", "()I", &[])? {
+        Some(Value::Int(v)) if v >= 0 => v as usize,
+        _ => 0,
+    };
+    let starts_len = leaves_size.saturating_add(1);
+    let segment_starts = ctx.new_array(cratonvm_types::ArrayElementType::Int, starts_len);
+    if starts_len > 0 {
+        ctx.set_array_element(segment_starts, starts_len - 1, Value::Int(len as i32));
+    }
+    if starts_len != 2 {
+        let mut search_from = 0usize;
+        for segment in 1..starts_len.saturating_sub(1) {
+            let leaf = match ctx.invoke_virtual(leaves, "get", "(I)Ljava/lang/Object;", &[Value::Int(segment as i32)])? {
+                Some(Value::Object(Some(leaf))) => leaf,
+                _ => return Err(RuntimeError::NullPointerException { message: None }.into()),
+            };
+            let doc_base = ctx.get_field_by_name(leaf, "docBase").as_int().unwrap_or(0);
+            let rel = match docs[search_from..].binary_search(&doc_base) {
+                Ok(idx) | Err(idx) => idx,
+            };
+            search_from = search_from.saturating_add(rel).min(docs.len());
+            ctx.set_array_element(segment_starts, segment, Value::Int(search_from as i32));
+        }
+    }
+
+    let context_identity = match ctx.get_field_by_name(reader, "readerContext") {
+        Value::Object(Some(context)) => ctx.get_field_by_name(context, "identity"),
+        _ => {
+            let context = match ctx.invoke_virtual(
+                reader,
+                "getContext",
+                "()Lorg/apache/lucene/index/IndexReaderContext;",
+                &[],
+            )? {
+                Some(Value::Object(Some(context))) => context,
+                _ => return Err(RuntimeError::NullPointerException { message: None }.into()),
+            };
+            ctx.get_field_by_name(context, "identity")
+        }
+    };
+
+    ctx.set_field_by_name(
+        this,
+        "CLASS_NAME_HASH",
+        Value::Int(java_string_hash_code_ascii(
+            "org.elasticsearch.search.vectors.KnnScoreDocQuery",
+        )),
+    );
+    ctx.set_field_by_name(this, "docs", Value::Object(Some(docs_arr)));
+    ctx.set_field_by_name(this, "scores", Value::Object(Some(scores_arr)));
+    ctx.set_field_by_name(this, "segmentStarts", Value::Object(Some(segment_starts)));
+    ctx.set_field_by_name(this, "contextIdentity", context_identity);
+    Ok(None)
 }
 
 fn native_randomized_context_get_per_thread(
@@ -761,14 +3125,25 @@ fn native_randomized_context_get_per_thread(
         Value::Object(Some(map)) => map,
         _ => return Ok(Some(Value::Object(None))),
     };
+    let cache_key = randomized_per_thread_key(ctx, this, map, thread);
+    if let Some(resources) = randomized_per_thread_cache_lookup(ctx, cache_key) {
+        return Ok(Some(Value::Object(Some(resources))));
+    }
+
+    let map_pin = ctx.pin_native_root(map);
+    let thread_pin = ctx.pin_native_root(thread);
     let existing = ctx.invoke_virtual(
         map,
         "get",
         "(Ljava/lang/Object;)Ljava/lang/Object;",
         &[Value::Object(Some(thread))],
     )?;
-    if matches!(existing, Some(Value::Object(Some(_)))) {
-        return Ok(existing);
+    let map = ctx.read_native_pin(map_pin, map);
+    let thread = ctx.read_native_pin(thread_pin, thread);
+    ctx.unpin_native_roots(map_pin);
+    if let Some(Value::Object(Some(resources))) = existing {
+        randomized_per_thread_cache_store(ctx, cache_key, resources);
+        return Ok(Some(Value::Object(Some(resources))));
     }
 
     let map_pin = ctx.pin_native_root(map);
@@ -833,13 +3208,19 @@ fn native_randomized_context_get_per_thread(
     let thread = ctx.read_native_pin(thread_pin, thread);
     ctx.unpin_native_roots(resources_pin);
 
+    let resources_pin = ctx.pin_native_root(resources);
+    let map_pin = ctx.pin_native_root(map);
+    let thread_pin = ctx.pin_native_root(thread);
     ctx.invoke_virtual(
         map,
         "put",
         "(Ljava/lang/Object;Ljava/lang/Object;)Ljava/lang/Object;",
         &[Value::Object(Some(thread)), Value::Object(Some(resources))],
     )?;
+    let resources = ctx.read_native_pin(resources_pin, resources);
+    ctx.unpin_native_roots(resources_pin);
 
+    randomized_per_thread_cache_store(ctx, cache_key, resources);
     Ok(Some(Value::Object(Some(resources))))
 }
 
@@ -1078,6 +3459,892 @@ fn lucene_iobe(message: &str) -> MethodCallFailed {
     }))
 }
 
+fn lucene_byte_buffers_data_output_current_block(
+    ctx: &dyn NativeContext,
+    this: ObjectRef,
+) -> Option<ObjectRef> {
+    match ctx.get_field_by_name(this, "currentBlock") {
+        Value::Object(Some(block)) => Some(block),
+        _ => None,
+    }
+}
+
+fn heap_byte_buffer_remaining(ctx: &dyn NativeContext, block: ObjectRef) -> i32 {
+    let position = ctx.get_field_by_name(block, "position").as_int().unwrap_or(0);
+    let limit = ctx.get_field_by_name(block, "limit").as_int().unwrap_or(0);
+    limit.saturating_sub(position).max(0)
+}
+
+fn heap_byte_buffer_write_slice(
+    ctx: &mut dyn NativeContext,
+    block: ObjectRef,
+    bytes: &[u8],
+) -> usize {
+    let position = ctx.get_field_by_name(block, "position").as_int().unwrap_or(0);
+    let limit = ctx.get_field_by_name(block, "limit").as_int().unwrap_or(0);
+    let offset = ctx.get_field_by_name(block, "offset").as_int().unwrap_or(0);
+    let hb = match ctx.get_field_by_name(block, "hb") {
+        Value::Object(Some(hb)) => hb,
+        _ => return 0,
+    };
+    if position < 0 || limit < position {
+        return 0;
+    }
+    let writable = (limit - position) as usize;
+    let n = writable.min(bytes.len());
+    if n == 0 {
+        return 0;
+    }
+    let raw = offset as i64 + position as i64;
+    if raw < 0 {
+        return 0;
+    }
+    if !ctx.write_byte_array_from(hb, raw as usize, &bytes[..n]) {
+        return 0;
+    }
+    ctx.set_field_by_name(block, "position", Value::Int(position + n as i32));
+    n
+}
+
+fn lucene_byte_buffers_data_output_append_block(
+    ctx: &mut dyn NativeContext,
+    this: ObjectRef,
+) -> Result<ObjectRef, MethodCallFailed> {
+    let pin = ctx.pin_native_root(this);
+    ctx.invoke_virtual(this, "appendBlock", "()V", &[])?;
+    let this = ctx.read_native_pin(pin, this);
+    ctx.unpin_native_roots(pin);
+    lucene_byte_buffers_data_output_current_block(ctx, this)
+        .ok_or_else(|| lucene_iobe("ByteBuffersDataOutput currentBlock is null"))
+}
+
+fn lucene_byte_buffers_data_output_write_raw(
+    ctx: &mut dyn NativeContext,
+    this: ObjectRef,
+    bytes: &[u8],
+) -> MethodCallResult {
+    let this_root = ctx.add_global_root(this);
+    let result: MethodCallResult = (|| {
+        let mut this = this;
+        let mut written = 0;
+        while written < bytes.len() {
+            let mut block = lucene_byte_buffers_data_output_current_block(ctx, this)
+                .ok_or_else(|| lucene_iobe("ByteBuffersDataOutput currentBlock is null"))?;
+            if heap_byte_buffer_remaining(ctx, block) == 0 {
+                block = lucene_byte_buffers_data_output_append_block(ctx, this)?;
+                this = ctx.resolve_global_root(this_root).unwrap_or(this);
+            }
+            let n = heap_byte_buffer_write_slice(ctx, block, &bytes[written..]);
+            if n == 0 {
+                return Err(lucene_iobe("ByteBuffersDataOutput could not write to current block"));
+            }
+            written += n;
+        }
+        Ok(None)
+    })();
+    if this_root != 0 {
+        let _ = ctx.remove_global_root(this_root);
+    }
+    result
+}
+
+fn lucene_data_output_write_byte_direct(
+    ctx: &mut dyn NativeContext,
+    this: ObjectRef,
+    byte: u8,
+) -> MethodCallResult {
+    if ctx
+        .class_name_of_id(ctx.class_id_of_object(this))
+        .as_deref()
+        == Some("org/apache/lucene/store/ByteBuffersDataOutput")
+    {
+        return lucene_byte_buffers_data_output_write_raw(ctx, this, &[byte]);
+    }
+    ctx.invoke_virtual(
+        this,
+        "writeByte",
+        "(B)V",
+        &[Value::Int(byte as i8 as i32)],
+    )?;
+    Ok(None)
+}
+
+fn lucene_data_output_write_vint_raw(
+    ctx: &mut dyn NativeContext,
+    this: ObjectRef,
+    value: i32,
+) -> MethodCallResult {
+    let mut v = value as u32;
+    let mut buf = [0u8; 5];
+    let mut len = 0;
+    while (v & !0x7f) != 0 {
+        buf[len] = ((v & 0x7f) | 0x80) as u8;
+        len += 1;
+        v >>= 7;
+    }
+    buf[len] = v as u8;
+    len += 1;
+    if ctx
+        .class_name_of_id(ctx.class_id_of_object(this))
+        .as_deref()
+        == Some("org/apache/lucene/store/ByteBuffersDataOutput")
+    {
+        lucene_byte_buffers_data_output_write_raw(ctx, this, &buf[..len])
+    } else {
+        for b in &buf[..len] {
+            lucene_data_output_write_byte_direct(ctx, this, *b)?;
+        }
+        Ok(None)
+    }
+}
+
+fn lucene_data_output_write_signed_vlong_raw(
+    ctx: &mut dyn NativeContext,
+    this: ObjectRef,
+    value: i64,
+) -> MethodCallResult {
+    let mut v = value as u64;
+    let mut buf = [0u8; 10];
+    let mut len = 0;
+    while (v & !0x7f) != 0 {
+        buf[len] = ((v & 0x7f) | 0x80) as u8;
+        len += 1;
+        v >>= 7;
+    }
+    buf[len] = v as u8;
+    len += 1;
+    if ctx
+        .class_name_of_id(ctx.class_id_of_object(this))
+        .as_deref()
+        == Some("org/apache/lucene/store/ByteBuffersDataOutput")
+    {
+        lucene_byte_buffers_data_output_write_raw(ctx, this, &buf[..len])
+    } else {
+        for b in &buf[..len] {
+            lucene_data_output_write_byte_direct(ctx, this, *b)?;
+        }
+        Ok(None)
+    }
+}
+
+fn native_lucene_data_output_write_vint(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    let this = obj_arg(args, 0)?;
+    let value = args.get(1).and_then(|v| v.as_int()).unwrap_or(0);
+    lucene_data_output_write_vint_raw(ctx, this, value)
+}
+
+fn native_lucene_data_output_write_zint(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    let this = obj_arg(args, 0)?;
+    let value = args.get(1).and_then(|v| v.as_int()).unwrap_or(0);
+    lucene_data_output_write_vint_raw(ctx, this, (value << 1) ^ (value >> 31))
+}
+
+fn native_lucene_data_output_write_vlong(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    let this = obj_arg(args, 0)?;
+    let value = args.get(1).and_then(|v| v.as_long()).unwrap_or(0);
+    if value < 0 {
+        return Err(RuntimeError::IllegalArgumentException {
+            message: format!("cannot write negative vLong: {value}"),
+        }
+        .into());
+    }
+    lucene_data_output_write_signed_vlong_raw(ctx, this, value)
+}
+
+fn native_lucene_data_output_write_zlong(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    let this = obj_arg(args, 0)?;
+    let value = args.get(1).and_then(|v| v.as_long()).unwrap_or(0);
+    lucene_data_output_write_signed_vlong_raw(ctx, this, (value << 1) ^ (value >> 63))
+}
+
+fn native_lucene_byte_buffers_data_output_write_byte(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    let this = obj_arg(args, 0)?;
+    let byte = args.get(1).and_then(|v| v.as_int()).unwrap_or(0) as u8;
+    lucene_byte_buffers_data_output_write_raw(ctx, this, &[byte])
+}
+
+fn lucene_byte_buffers_data_output_write_byte_array(
+    ctx: &mut dyn NativeContext,
+    this: ObjectRef,
+    src: ObjectRef,
+    off: usize,
+    len: usize,
+) -> MethodCallResult {
+    if len == 0 {
+        return Ok(None);
+    }
+    let mut tmp = vec![0u8; len];
+    let copied = ctx.read_byte_array_into(src, off, &mut tmp);
+    if copied != len {
+        return Err(lucene_iobe("ByteBuffersDataOutput source byte[] read failed"));
+    }
+    lucene_byte_buffers_data_output_write_raw(ctx, this, &tmp)
+}
+
+fn native_lucene_byte_buffers_data_output_write_bytes(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    let this = obj_arg(args, 0)?;
+    let src = obj_arg(args, 1)?;
+    let off = args.get(2).and_then(|v| v.as_int()).unwrap_or(0).max(0) as usize;
+    let len = args.get(3).and_then(|v| v.as_int()).unwrap_or(0).max(0) as usize;
+    lucene_byte_buffers_data_output_write_byte_array(ctx, this, src, off, len)
+}
+
+fn native_lucene_byte_buffers_data_output_write_bytes_len(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    let this = obj_arg(args, 0)?;
+    let src = obj_arg(args, 1)?;
+    let len = args.get(2).and_then(|v| v.as_int()).unwrap_or(0);
+    native_lucene_byte_buffers_data_output_write_bytes(
+        ctx,
+        &[Value::Object(Some(this)), Value::Object(Some(src)), Value::Int(0), Value::Int(len)],
+    )
+}
+
+fn native_lucene_byte_buffers_data_output_write_bytes_all(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    let this = obj_arg(args, 0)?;
+    let src = obj_arg(args, 1)?;
+    let len = ctx.array_length(src) as i32;
+    native_lucene_byte_buffers_data_output_write_bytes(
+        ctx,
+        &[Value::Object(Some(this)), Value::Object(Some(src)), Value::Int(0), Value::Int(len)],
+    )
+}
+
+fn native_lucene_byte_buffers_data_output_write_short(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    let this = obj_arg(args, 0)?;
+    let value = args.get(1).and_then(|v| v.as_int()).unwrap_or(0) as i16;
+    lucene_byte_buffers_data_output_write_raw(ctx, this, &value.to_le_bytes())
+}
+
+fn native_lucene_byte_buffers_data_output_write_int(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    let this = obj_arg(args, 0)?;
+    let value = args.get(1).and_then(|v| v.as_int()).unwrap_or(0);
+    lucene_byte_buffers_data_output_write_raw(ctx, this, &value.to_le_bytes())
+}
+
+fn native_lucene_byte_buffers_data_output_write_long(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    let this = obj_arg(args, 0)?;
+    let value = args.get(1).and_then(|v| v.as_long()).unwrap_or(0);
+    lucene_byte_buffers_data_output_write_raw(ctx, this, &value.to_le_bytes())
+}
+
+fn lucene_byte_buffers_data_output_copy_bytes_from(
+    ctx: &mut dyn NativeContext,
+    this: ObjectRef,
+    input: ObjectRef,
+    remaining: usize,
+) -> MethodCallResult {
+    let this_root = ctx.add_global_root(this);
+    let result: MethodCallResult = (|| {
+        let mut this = this;
+        let mut input = input;
+        let mut remaining = remaining;
+        while remaining > 0 {
+            let mut block = lucene_byte_buffers_data_output_current_block(ctx, this)
+                .ok_or_else(|| lucene_iobe("ByteBuffersDataOutput currentBlock is null"))?;
+            if heap_byte_buffer_remaining(ctx, block) == 0 {
+                block = lucene_byte_buffers_data_output_append_block(ctx, this)?;
+                this = ctx.resolve_global_root(this_root).unwrap_or(this);
+            }
+            let position = ctx.get_field_by_name(block, "position").as_int().unwrap_or(0);
+            let limit = ctx.get_field_by_name(block, "limit").as_int().unwrap_or(0);
+            let offset = ctx.get_field_by_name(block, "offset").as_int().unwrap_or(0);
+            let hb = match ctx.get_field_by_name(block, "hb") {
+                Value::Object(Some(hb)) => hb,
+                _ => return Err(lucene_iobe("ByteBuffersDataOutput current block has no array")),
+            };
+            if position < 0 || limit < position {
+                return Err(lucene_iobe("ByteBuffersDataOutput invalid block position"));
+            }
+            let n = (limit - position).max(0) as usize;
+            let n = n.min(remaining);
+            if n == 0 {
+                return Err(lucene_iobe("ByteBuffersDataOutput could not make write progress"));
+            }
+            let raw = offset as i64 + position as i64;
+            if raw < 0 || raw as usize + n > ctx.array_length(hb) {
+                return Err(lucene_iobe("ByteBuffersDataOutput block array offset out of bounds"));
+            }
+            let this_pin = ctx.pin_native_root(this);
+            let input_pin = ctx.pin_native_root(input);
+            let block_pin = ctx.pin_native_root(block);
+            let hb_pin = ctx.pin_native_root(hb);
+            ctx.invoke_virtual(
+                input,
+                "readBytes",
+                "([BII)V",
+                &[
+                    Value::Object(Some(hb)),
+                    Value::Int(raw as i32),
+                    Value::Int(n as i32),
+                ],
+            )?;
+            this = ctx.read_native_pin(this_pin, this);
+            input = ctx.read_native_pin(input_pin, input);
+            block = ctx.read_native_pin(block_pin, block);
+            let _hb = ctx.read_native_pin(hb_pin, hb);
+            ctx.unpin_native_roots(this_pin);
+            ctx.unpin_native_roots(input_pin);
+            ctx.unpin_native_roots(block_pin);
+            ctx.unpin_native_roots(hb_pin);
+            ctx.set_field_by_name(block, "position", Value::Int(position + n as i32));
+            remaining -= n;
+            this = ctx.resolve_global_root(this_root).unwrap_or(this);
+        }
+        Ok(None)
+    })();
+    if this_root != 0 {
+        let _ = ctx.remove_global_root(this_root);
+    }
+    result
+}
+
+fn native_lucene_byte_buffers_data_output_copy_bytes(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    let this = obj_arg(args, 0)?;
+    let input = obj_arg(args, 1)?;
+    let remaining = args.get(2).and_then(|v| v.as_long()).unwrap_or(0).max(0) as usize;
+    lucene_byte_buffers_data_output_copy_bytes_from(ctx, this, input, remaining)
+}
+
+fn array_deque_size_direct(ctx: &dyn NativeContext, deque: ObjectRef) -> Result<i32, MethodCallFailed> {
+    let tail = ctx.get_field_by_name(deque, "tail").as_int().unwrap_or(0);
+    let head = ctx.get_field_by_name(deque, "head").as_int().unwrap_or(0);
+    let elements = match ctx.get_field_by_name(deque, "elements") {
+        Value::Object(Some(elements)) => elements,
+        _ => return Ok(0),
+    };
+    let len = ctx.array_length(elements) as i32;
+    if len <= 0 {
+        return Ok(0);
+    }
+    let mut size = tail - head;
+    if size < 0 {
+        size += len;
+    }
+    Ok(size)
+}
+
+fn lucene_byte_buffers_data_output_size_direct(
+    ctx: &dyn NativeContext,
+    this: ObjectRef,
+) -> Result<i64, MethodCallFailed> {
+    let blocks = match ctx.get_field_by_name(this, "blocks") {
+        Value::Object(Some(blocks)) => blocks,
+        _ => return Ok(0),
+    };
+    let block_count = array_deque_size_direct(ctx, blocks)?;
+    if block_count < 1 {
+        return Ok(0);
+    }
+    let block_bits = ctx.get_field_by_name(this, "blockBits").as_int().unwrap_or(0);
+    let block_size = if (0..63).contains(&block_bits) {
+        1_i64 << block_bits
+    } else {
+        0
+    };
+    let current = lucene_byte_buffers_data_output_current_block(ctx, this)
+        .ok_or_else(|| lucene_iobe("ByteBuffersDataOutput currentBlock is null"))?;
+    let position = ctx.get_field_by_name(current, "position").as_int().unwrap_or(0) as i64;
+    Ok((block_count as i64 - 1) * block_size + position)
+}
+
+fn native_lucene_byte_buffers_data_output_size(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    let this = obj_arg(args, 0)?;
+    Ok(Some(Value::Long(lucene_byte_buffers_data_output_size_direct(ctx, this)?)))
+}
+
+fn native_lucene_byte_buffers_byte_buffer_recycler_reuse(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    let this = obj_arg(args, 0)?;
+    let block = obj_arg(args, 1)?;
+    ctx.set_field_by_name(block, "mark", Value::Int(-1));
+    ctx.set_field_by_name(block, "position", Value::Int(0));
+    let reuse = lucene_field_obj(ctx, this, "reuse")?;
+    ctx.invoke_virtual(
+        reuse,
+        "addLast",
+        "(Ljava/lang/Object;)V",
+        &[Value::Object(Some(block))],
+    )?;
+    Ok(None)
+}
+
+fn lucene_byte_buffers_index_output_delegate(
+    ctx: &dyn NativeContext,
+    this: ObjectRef,
+) -> Result<ObjectRef, MethodCallFailed> {
+    match ctx.get_field_by_name(this, "delegate") {
+        Value::Object(Some(delegate)) => Ok(delegate),
+        _ => Err(RuntimeError::IllegalStateException {
+            message: "Already closed.".to_string(),
+        }
+        .into()),
+    }
+}
+
+fn native_lucene_byte_buffers_index_output_get_file_pointer(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    let this = obj_arg(args, 0)?;
+    let delegate = lucene_byte_buffers_index_output_delegate(ctx, this)?;
+    Ok(Some(Value::Long(lucene_byte_buffers_data_output_size_direct(ctx, delegate)?)))
+}
+
+fn native_lucene_byte_buffers_index_output_write_byte(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    let this = obj_arg(args, 0)?;
+    let delegate = lucene_byte_buffers_index_output_delegate(ctx, this)?;
+    let byte = args.get(1).and_then(|v| v.as_int()).unwrap_or(0) as u8;
+    lucene_byte_buffers_data_output_write_raw(ctx, delegate, &[byte])
+}
+
+fn native_lucene_byte_buffers_index_output_write_bytes(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    let this = obj_arg(args, 0)?;
+    let delegate = lucene_byte_buffers_index_output_delegate(ctx, this)?;
+    let src = obj_arg(args, 1)?;
+    let off = args.get(2).and_then(|v| v.as_int()).unwrap_or(0).max(0) as usize;
+    let len = args.get(3).and_then(|v| v.as_int()).unwrap_or(0).max(0) as usize;
+    lucene_byte_buffers_data_output_write_byte_array(ctx, delegate, src, off, len)
+}
+
+fn native_lucene_byte_buffers_index_output_write_bytes_len(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    let this = obj_arg(args, 0)?;
+    let delegate = lucene_byte_buffers_index_output_delegate(ctx, this)?;
+    let src = obj_arg(args, 1)?;
+    let len = args.get(2).and_then(|v| v.as_int()).unwrap_or(0).max(0) as usize;
+    lucene_byte_buffers_data_output_write_byte_array(ctx, delegate, src, 0, len)
+}
+
+fn native_lucene_byte_buffers_index_output_write_short(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    let this = obj_arg(args, 0)?;
+    let delegate = lucene_byte_buffers_index_output_delegate(ctx, this)?;
+    let value = args.get(1).and_then(|v| v.as_int()).unwrap_or(0) as i16;
+    lucene_byte_buffers_data_output_write_raw(ctx, delegate, &value.to_le_bytes())
+}
+
+fn native_lucene_byte_buffers_index_output_write_int(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    let this = obj_arg(args, 0)?;
+    let delegate = lucene_byte_buffers_index_output_delegate(ctx, this)?;
+    let value = args.get(1).and_then(|v| v.as_int()).unwrap_or(0);
+    lucene_byte_buffers_data_output_write_raw(ctx, delegate, &value.to_le_bytes())
+}
+
+fn native_lucene_byte_buffers_index_output_write_long(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    let this = obj_arg(args, 0)?;
+    let delegate = lucene_byte_buffers_index_output_delegate(ctx, this)?;
+    let value = args.get(1).and_then(|v| v.as_long()).unwrap_or(0);
+    lucene_byte_buffers_data_output_write_raw(ctx, delegate, &value.to_le_bytes())
+}
+
+fn native_lucene_byte_buffers_index_output_copy_bytes(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    let this = obj_arg(args, 0)?;
+    let delegate = lucene_byte_buffers_index_output_delegate(ctx, this)?;
+    let input = obj_arg(args, 1)?;
+    let remaining = args.get(2).and_then(|v| v.as_long()).unwrap_or(0).max(0) as usize;
+    lucene_byte_buffers_data_output_copy_bytes_from(ctx, delegate, input, remaining)
+}
+
+fn lucene_bytes_ref_parts(
+    ctx: &dyn NativeContext,
+    bytes_ref: ObjectRef,
+) -> Result<(ObjectRef, usize, usize), MethodCallFailed> {
+    let bytes = lucene_field_obj(ctx, bytes_ref, "bytes")?;
+    let offset = ctx.get_field_by_name(bytes_ref, "offset").as_int().unwrap_or(0).max(0) as usize;
+    let length = ctx.get_field_by_name(bytes_ref, "length").as_int().unwrap_or(0).max(0) as usize;
+    Ok((bytes, offset, length))
+}
+
+fn lucene_byte_array_unsigned_at(ctx: &dyn NativeContext, arr: ObjectRef, index: usize) -> u8 {
+    ctx.get_array_element(arr, index).as_int().unwrap_or(0) as i8 as u8
+}
+
+fn lucene_bytes_ref_prefix8_from_parts(
+    ctx: &dyn NativeContext,
+    bytes: ObjectRef,
+    offset: usize,
+    length: usize,
+) -> i64 {
+    let available = ctx.array_length(bytes).saturating_sub(offset);
+    let n = length.min(available).min(8);
+    let mut value = 0u64;
+    for i in 0..n {
+        value = (value << 8) | lucene_byte_array_unsigned_at(ctx, bytes, offset + i) as u64;
+    }
+    value <<= (8 - n) * 8;
+    value as i64
+}
+
+fn lucene_bytes_ref_prefix8(ctx: &dyn NativeContext, bytes_ref: ObjectRef) -> Result<i64, MethodCallFailed> {
+    let (bytes, offset, length) = lucene_bytes_ref_parts(ctx, bytes_ref)?;
+    Ok(lucene_bytes_ref_prefix8_from_parts(ctx, bytes, offset, length))
+}
+
+fn lucene_bytes_ref_compare_unsigned(
+    ctx: &dyn NativeContext,
+    left: ObjectRef,
+    right: ObjectRef,
+) -> Result<i32, MethodCallFailed> {
+    let (left_bytes, left_off, left_len) = lucene_bytes_ref_parts(ctx, left)?;
+    let (right_bytes, right_off, right_len) = lucene_bytes_ref_parts(ctx, right)?;
+    let left_avail = ctx.array_length(left_bytes).saturating_sub(left_off);
+    let right_avail = ctx.array_length(right_bytes).saturating_sub(right_off);
+    let left_len = left_len.min(left_avail);
+    let right_len = right_len.min(right_avail);
+    let common = left_len.min(right_len);
+    for i in 0..common {
+        let a = lucene_byte_array_unsigned_at(ctx, left_bytes, left_off + i);
+        let b = lucene_byte_array_unsigned_at(ctx, right_bytes, right_off + i);
+        if a != b {
+            return Ok(a as i32 - b as i32);
+        }
+    }
+    Ok(left_len as i32 - right_len as i32)
+}
+
+fn lucene_bytes_ref_equals(
+    ctx: &dyn NativeContext,
+    left: ObjectRef,
+    right: ObjectRef,
+) -> Result<bool, MethodCallFailed> {
+    Ok(lucene_bytes_ref_compare_unsigned(ctx, left, right)? == 0)
+}
+
+fn native_lucene_terms_enum_index_prefix8(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    let bytes_ref = obj_arg(args, 0)?;
+    Ok(Some(Value::Long(lucene_bytes_ref_prefix8(ctx, bytes_ref)?)))
+}
+
+fn native_lucene_terms_enum_index_next(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    let this = obj_arg(args, 0)?;
+    let this_root = ctx.add_global_root(this);
+    let result: MethodCallResult = (|| {
+        let mut this = this;
+        let terms_enum = lucene_field_obj(ctx, this, "termsEnum")?;
+        let next = ctx.invoke_virtual(terms_enum, "next", "()Lorg/apache/lucene/util/BytesRef;", &[])?;
+        this = ctx.resolve_global_root(this_root).unwrap_or(this);
+        let current = match next {
+            Some(Value::Object(obj)) => obj,
+            _ => None,
+        };
+        ctx.set_field_by_name(this, "currentTerm", Value::Object(current));
+        let prefix = match current {
+            Some(bytes_ref) => lucene_bytes_ref_prefix8(ctx, bytes_ref)?,
+            None => 0,
+        };
+        ctx.set_field_by_name(this, "currentTermPrefix8", Value::Long(prefix));
+        Ok(Some(Value::Object(current)))
+    })();
+    if this_root != 0 {
+        let _ = ctx.remove_global_root(this_root);
+    }
+    result
+}
+
+fn native_lucene_terms_enum_index_compare_term_to(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    let this = obj_arg(args, 0)?;
+    let other = obj_arg(args, 1)?;
+    let left_prefix = ctx.get_field_by_name(this, "currentTermPrefix8").as_long().unwrap_or(0) as u64;
+    let right_prefix = ctx.get_field_by_name(other, "currentTermPrefix8").as_long().unwrap_or(0) as u64;
+    if left_prefix != right_prefix {
+        return Ok(Some(Value::Int(if left_prefix < right_prefix { -1 } else { 1 })));
+    }
+    let left_term = lucene_field_obj(ctx, this, "currentTerm")?;
+    let right_term = lucene_field_obj(ctx, other, "currentTerm")?;
+    Ok(Some(Value::Int(lucene_bytes_ref_compare_unsigned(ctx, left_term, right_term)?)))
+}
+
+fn native_lucene_terms_enum_index_term_equals(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    let this = obj_arg(args, 0)?;
+    let state = obj_arg(args, 1)?;
+    let left_prefix = ctx.get_field_by_name(this, "currentTermPrefix8").as_long().unwrap_or(0);
+    let right_prefix = ctx.get_field_by_name(state, "termPrefix8").as_long().unwrap_or(0);
+    if left_prefix != right_prefix {
+        return Ok(Some(Value::Int(0)));
+    }
+    let current = lucene_field_obj(ctx, this, "currentTerm")?;
+    let builder = lucene_field_obj(ctx, state, "term")?;
+    let builder_ref = lucene_field_obj(ctx, builder, "ref")?;
+    Ok(Some(Value::Int(if lucene_bytes_ref_equals(ctx, current, builder_ref)? { 1 } else { 0 })))
+}
+
+fn native_lucene_terms_enum_index_term_state_copy_from(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    let state = obj_arg(args, 0)?;
+    let index = obj_arg(args, 1)?;
+    let state_root = ctx.add_global_root(state);
+    let index_root = ctx.add_global_root(index);
+    let result: MethodCallResult = (|| {
+        let mut state = state;
+        let mut index = index;
+        let src = lucene_field_obj(ctx, index, "currentTerm")?;
+        let (src_bytes, src_off, src_len) = lucene_bytes_ref_parts(ctx, src)?;
+        let builder = lucene_field_obj(ctx, state, "term")?;
+        let mut builder_ref = lucene_field_obj(ctx, builder, "ref")?;
+        let mut dst_bytes = lucene_field_obj(ctx, builder_ref, "bytes")?;
+        if ctx.array_length(dst_bytes) < src_len {
+            ctx.invoke_virtual(builder, "growNoCopy", "(I)V", &[Value::Int(src_len as i32)])?;
+            state = ctx.resolve_global_root(state_root).unwrap_or(state);
+            index = ctx.resolve_global_root(index_root).unwrap_or(index);
+            let builder = lucene_field_obj(ctx, state, "term")?;
+            builder_ref = lucene_field_obj(ctx, builder, "ref")?;
+            dst_bytes = lucene_field_obj(ctx, builder_ref, "bytes")?;
+        }
+        if ctx.array_length(dst_bytes) < src_len {
+            return Err(lucene_iobe("TermsEnumIndex.TermState copy destination too small"));
+        }
+        let mut tmp = vec![0u8; src_len];
+        let copied = ctx.read_byte_array_into(src_bytes, src_off, &mut tmp);
+        if copied != src_len {
+            return Err(lucene_iobe("TermsEnumIndex.TermState source copy failed"));
+        }
+        if !ctx.write_byte_array_from(dst_bytes, 0, &tmp) {
+            return Err(lucene_iobe("TermsEnumIndex.TermState destination copy failed"));
+        }
+        ctx.set_field_by_name(builder_ref, "offset", Value::Int(0));
+        ctx.set_field_by_name(builder_ref, "length", Value::Int(src_len as i32));
+        let prefix = ctx.get_field_by_name(index, "currentTermPrefix8").as_long().unwrap_or(0);
+        ctx.set_field_by_name(state, "termPrefix8", Value::Long(prefix));
+        Ok(None)
+    })();
+    if state_root != 0 {
+        let _ = ctx.remove_global_root(state_root);
+    }
+    if index_root != 0 {
+        let _ = ctx.remove_global_root(index_root);
+    }
+    result
+}
+
+fn native_lucene_ordinal_map_segment_map_new_to_old(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    let this = obj_arg(args, 0)?;
+    let index = args.get(1).and_then(|v| v.as_int()).unwrap_or(0).max(0) as usize;
+    let arr = lucene_field_obj(ctx, this, "newToOld")?;
+    Ok(Some(Value::Int(ctx.get_array_element(arr, index).as_int().unwrap_or(0))))
+}
+
+fn native_lucene_ordinal_map_segment_map_old_to_new(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    let this = obj_arg(args, 0)?;
+    let index = args.get(1).and_then(|v| v.as_int()).unwrap_or(0).max(0) as usize;
+    let arr = lucene_field_obj(ctx, this, "oldToNew")?;
+    Ok(Some(Value::Int(ctx.get_array_element(arr, index).as_int().unwrap_or(0))))
+}
+
+fn native_lucene_terms_enum_priority_queue_less_than(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    let left = obj_arg(args, 1)?;
+    let right = obj_arg(args, 2)?;
+    let cmp = native_lucene_terms_enum_index_compare_term_to(
+        ctx,
+        &[Value::Object(Some(left)), Value::Object(Some(right))],
+    )?;
+    Ok(Some(Value::Int(if matches!(cmp, Some(Value::Int(v)) if v < 0) { 1 } else { 0 })))
+}
+
+fn native_lucene_priority_queue_init_int(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    let this = obj_arg(args, 0)?;
+    let max_size = args.get(1).and_then(Value::as_int).unwrap_or(0);
+    if max_size < 0 {
+        return Err(lucene_iobe("maxSize must be non-negative"));
+    }
+    let heap_len = if max_size == 0 {
+        2usize
+    } else {
+        (max_size as usize)
+            .checked_add(1)
+            .ok_or_else(|| lucene_iobe("maxSize is too large"))?
+    };
+    let heap = ctx.new_array(cratonvm_types::ArrayElementType::Reference, heap_len);
+    ctx.set_field_by_name(this, "size", Value::Int(0));
+    ctx.set_field_by_name(this, "maxSize", Value::Int(max_size));
+    ctx.set_field_by_name(this, "heap", Value::Object(Some(heap)));
+    Ok(None)
+}
+
+fn native_lucene_priority_queue_size(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    let this = obj_arg(args, 0)?;
+    Ok(Some(Value::Int(ctx.get_field_by_name(this, "size").as_int().unwrap_or(0))))
+}
+
+fn native_lucene_priority_queue_top(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    let this = obj_arg(args, 0)?;
+    let heap = lucene_field_obj(ctx, this, "heap")?;
+    Ok(Some(ctx.get_array_element(heap, 1)))
+}
+
+fn native_lucene_mock_index_output_wrapper_write_byte(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    let this = obj_arg(args, 0)?;
+    let byte = args.get(1).and_then(|v| v.as_int()).unwrap_or(0) as u8;
+    let this_root = ctx.add_global_root(this);
+    let result: MethodCallResult = (|| {
+        let mut this = this;
+        if ctx.get_field_by_name(this, "closed").as_int().unwrap_or(0) != 0 {
+            return Err(RuntimeError::IllegalStateException {
+                message: "Already closed.".to_string(),
+            }
+            .into());
+        }
+        let dir = lucene_field_obj(ctx, this, "dir")?;
+        if ctx.get_field_by_name(dir, "crashed").as_int().unwrap_or(0) != 0 {
+            return Err(RuntimeError::IOException {
+                message: "MockDirectoryWrapper has crashed".to_string(),
+            }
+            .into());
+        }
+
+        // Rare disk-full simulation is deliberately left to Lucene's Java body.
+        if ctx.get_field_by_name(dir, "maxSize").as_long().unwrap_or(0) != 0 {
+            let single = lucene_field_obj(ctx, this, "singleByte")?;
+            if !ctx.write_byte_array_from(single, 0, &[byte]) {
+                return Err(lucene_iobe("MockIndexOutputWrapper singleByte write failed"));
+            }
+            return ctx.invoke_virtual(
+                this,
+                "writeBytes",
+                "([BII)V",
+                &[
+                    Value::Object(Some(single)),
+                    Value::Int(0),
+                    Value::Int(1),
+                ],
+            );
+        }
+
+        if let Value::Object(Some(random)) = ctx.get_field_by_name(dir, "randomState") {
+            let split = ctx.invoke_virtual(random, "nextInt", "(I)I", &[Value::Int(200)])?;
+            this = ctx.resolve_global_root(this_root).unwrap_or(this);
+            if matches!(split, Some(Value::Int(0))) {
+                ctx.invoke("java/lang/Thread", "yield", "()V", &[])?;
+                this = ctx.resolve_global_root(this_root).unwrap_or(this);
+            }
+        }
+
+        let out = lucene_field_obj(ctx, this, "out")?;
+        ctx.invoke_virtual(
+            out,
+            "writeByte",
+            "(B)V",
+            &[Value::Int(byte as i8 as i32)],
+        )?;
+        this = ctx.resolve_global_root(this_root).unwrap_or(this);
+
+        let dir = lucene_field_obj(ctx, this, "dir")?;
+        ctx.invoke_virtual(dir, "maybeThrowDeterministicException", "()V", &[])?;
+        this = ctx.resolve_global_root(this_root).unwrap_or(this);
+
+        if ctx.get_field_by_name(this, "first").as_int().unwrap_or(0) != 0 {
+            ctx.set_field_by_name(this, "first", Value::Int(0));
+            let dir = lucene_field_obj(ctx, this, "dir")?;
+            let name = lucene_field_obj(ctx, this, "name")?;
+            ctx.invoke_virtual(
+                dir,
+                "maybeThrowIOException",
+                "(Ljava/lang/String;)V",
+                &[Value::Object(Some(name))],
+            )?;
+        }
+        Ok(None)
+    })();
+    if this_root != 0 {
+        let _ = ctx.remove_global_root(this_root);
+    }
+    result
+}
+
 fn lucene_field_int(ctx: &dyn NativeContext, obj: ObjectRef, name: &str) -> i32 {
     ctx.get_field_by_name(obj, name).as_int().unwrap_or(0)
 }
@@ -1220,6 +4487,623 @@ fn lucene_bbdin_read_at_bytes(
         out[i] = lucene_bbdin_read_abs(ctx, this, absolute_pos + i as i64)?;
     }
     Ok(out)
+}
+
+fn lucene_bbdin_copy_abs_to_array(
+    ctx: &mut dyn NativeContext,
+    this: ObjectRef,
+    mut absolute_pos: i64,
+    dst: ObjectRef,
+    mut dst_off: usize,
+    mut len: usize,
+) -> MethodCallResult {
+    let blocks = lucene_field_obj(ctx, this, "blocks")?;
+    let block_bits = lucene_field_int(ctx, this, "blockBits");
+    let block_mask = lucene_field_int(ctx, this, "blockMask");
+    if !(0..63).contains(&block_bits) {
+        return Err(lucene_iobe("invalid ByteBuffersDataInput blockBits"));
+    }
+    while len > 0 {
+        if absolute_pos < 0 {
+            return Err(lucene_eof());
+        }
+        let block_index = ((absolute_pos as u64) >> (block_bits as u32)) as usize;
+        if block_index >= ctx.array_length(blocks) {
+            return Err(lucene_eof());
+        }
+        let block = match ctx.get_array_element(blocks, block_index) {
+            Value::Object(Some(block)) => block,
+            _ => return Err(lucene_eof()),
+        };
+        let block_offset = if block_mask < 0 {
+            absolute_pos as usize
+        } else {
+            ((absolute_pos as u64) & (block_mask as u32 as u64)) as usize
+        };
+        let limit = lucene_field_int(ctx, block, "limit").max(0) as usize;
+        if block_offset >= limit {
+            return Err(lucene_eof());
+        }
+        let n = len.min(limit - block_offset);
+        let hb = lucene_field_obj(ctx, block, "hb")?;
+        let array_offset = lucene_field_int(ctx, block, "offset") as i64;
+        let raw_index = array_offset
+            .checked_add(block_offset as i64)
+            .ok_or_else(lucene_eof)?;
+        if raw_index < 0 || raw_index as usize + n > ctx.array_length(hb) {
+            return Err(lucene_eof());
+        }
+        let mut tmp = vec![0u8; n];
+        if ctx.read_byte_array_into(hb, raw_index as usize, &mut tmp) != n {
+            return Err(lucene_eof());
+        }
+        if !ctx.write_byte_array_from(dst, dst_off, &tmp) {
+            return Err(lucene_iobe("ByteBuffersDataInput destination byte[] write failed"));
+        }
+        absolute_pos += n as i64;
+        dst_off += n;
+        len -= n;
+    }
+    Ok(None)
+}
+
+fn lucene_bbdin_copy_abs_to_vec(
+    ctx: &dyn NativeContext,
+    this: ObjectRef,
+    mut absolute_pos: i64,
+    dst: &mut [u8],
+) -> MethodCallResult {
+    let blocks = lucene_field_obj(ctx, this, "blocks")?;
+    let block_bits = lucene_field_int(ctx, this, "blockBits");
+    let block_mask = lucene_field_int(ctx, this, "blockMask");
+    if !(0..63).contains(&block_bits) {
+        return Err(lucene_iobe("invalid ByteBuffersDataInput blockBits"));
+    }
+    let mut written = 0usize;
+    while written < dst.len() {
+        if absolute_pos < 0 {
+            return Err(lucene_eof());
+        }
+        let block_index = ((absolute_pos as u64) >> (block_bits as u32)) as usize;
+        if block_index >= ctx.array_length(blocks) {
+            return Err(lucene_eof());
+        }
+        let block = match ctx.get_array_element(blocks, block_index) {
+            Value::Object(Some(block)) => block,
+            _ => return Err(lucene_eof()),
+        };
+        let block_offset = if block_mask < 0 {
+            absolute_pos as usize
+        } else {
+            ((absolute_pos as u64) & (block_mask as u32 as u64)) as usize
+        };
+        let limit = lucene_field_int(ctx, block, "limit").max(0) as usize;
+        if block_offset >= limit {
+            return Err(lucene_eof());
+        }
+        let n = (dst.len() - written).min(limit - block_offset);
+        let hb = lucene_field_obj(ctx, block, "hb")?;
+        let array_offset = lucene_field_int(ctx, block, "offset") as i64;
+        let raw_index = array_offset
+            .checked_add(block_offset as i64)
+            .ok_or_else(lucene_eof)?;
+        if raw_index < 0 || raw_index as usize + n > ctx.array_length(hb) {
+            return Err(lucene_eof());
+        }
+        if ctx.read_byte_array_into(hb, raw_index as usize, &mut dst[written..written + n]) != n {
+            return Err(lucene_eof());
+        }
+        absolute_pos += n as i64;
+        written += n;
+    }
+    Ok(None)
+}
+
+fn lucene_array_read_range(
+    ctx: &dyn NativeContext,
+    arr: ObjectRef,
+    off: i32,
+    len: i32,
+) -> Result<Option<(usize, usize)>, MethodCallFailed> {
+    if len <= 0 {
+        return Ok(None);
+    }
+    if off < 0 {
+        return Err(lucene_aioobe(off));
+    }
+    let off = off as usize;
+    let len = len as usize;
+    let end = off
+        .checked_add(len)
+        .ok_or_else(|| lucene_aioobe(i32::MAX))?;
+    if end > ctx.array_length(arr) {
+        return Err(lucene_aioobe(end.min(i32::MAX as usize) as i32));
+    }
+    Ok(Some((off, len)))
+}
+
+fn lucene_bbdin_read_primitive_bytes(
+    ctx: &mut dyn NativeContext,
+    this: ObjectRef,
+    byte_len: usize,
+) -> Result<Vec<u8>, MethodCallFailed> {
+    if byte_len == 0 {
+        return Ok(Vec::new());
+    }
+    let pos = lucene_field_long(ctx, this, "pos");
+    let offset = lucene_field_long(ctx, this, "offset");
+    let length = lucene_field_long(ctx, this, "length");
+    if pos < offset || (pos - offset) as i128 + byte_len as i128 > length as i128 {
+        return Err(lucene_eof());
+    }
+    let new_pos = pos
+        .checked_add(byte_len as i64)
+        .ok_or_else(lucene_eof)?;
+    let mut bytes = vec![0u8; byte_len];
+    lucene_bbdin_copy_abs_to_vec(ctx, this, pos, &mut bytes)?;
+    ctx.set_field_by_name(this, "pos", Value::Long(new_pos));
+    Ok(bytes)
+}
+
+fn native_lucene_byte_buffers_data_input_read_floats(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    let this = lucene_bbdin_this(args)?;
+    let dst = obj_arg(args, 1)?;
+    let off = args.get(2).and_then(Value::as_int).unwrap_or(0);
+    let len = args.get(3).and_then(Value::as_int).unwrap_or(0);
+    let Some((off, len)) = lucene_array_read_range(ctx, dst, off, len)? else {
+        return Ok(None);
+    };
+    let byte_len = len
+        .checked_mul(4)
+        .ok_or_else(|| lucene_aioobe(i32::MAX))?;
+    let bytes = lucene_bbdin_read_primitive_bytes(ctx, this, byte_len)?;
+    for i in 0..len {
+        let j = i * 4;
+        let bits = i32::from_le_bytes([bytes[j], bytes[j + 1], bytes[j + 2], bytes[j + 3]]);
+        ctx.set_array_element(dst, off + i, Value::Float(f32::from_bits(bits as u32)));
+    }
+    Ok(None)
+}
+
+fn native_lucene_byte_buffers_data_input_read_longs(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    let this = lucene_bbdin_this(args)?;
+    let dst = obj_arg(args, 1)?;
+    let off = args.get(2).and_then(Value::as_int).unwrap_or(0);
+    let len = args.get(3).and_then(Value::as_int).unwrap_or(0);
+    let Some((off, len)) = lucene_array_read_range(ctx, dst, off, len)? else {
+        return Ok(None);
+    };
+    let byte_len = len
+        .checked_mul(8)
+        .ok_or_else(|| lucene_aioobe(i32::MAX))?;
+    let bytes = lucene_bbdin_read_primitive_bytes(ctx, this, byte_len)?;
+    for i in 0..len {
+        let j = i * 8;
+        ctx.set_array_element(
+            dst,
+            off + i,
+            Value::Long(i64::from_le_bytes([
+                bytes[j],
+                bytes[j + 1],
+                bytes[j + 2],
+                bytes[j + 3],
+                bytes[j + 4],
+                bytes[j + 5],
+                bytes[j + 6],
+                bytes[j + 7],
+            ])),
+        );
+    }
+    Ok(None)
+}
+
+fn lucene_bbdin_read_bytes_common(
+    ctx: &mut dyn NativeContext,
+    this: ObjectRef,
+    dst: ObjectRef,
+    dst_off: usize,
+    len: usize,
+    update_pos: bool,
+    relative_pos: i64,
+) -> MethodCallResult {
+    if len == 0 {
+        return Ok(None);
+    }
+    let length = lucene_field_long(ctx, this, "length");
+    let offset = lucene_field_long(ctx, this, "offset");
+    if relative_pos < 0 || (relative_pos as i128) + (len as i128) > length as i128 {
+        return Err(lucene_eof());
+    }
+    let absolute_pos = offset
+        .checked_add(relative_pos)
+        .ok_or_else(lucene_eof)?;
+    lucene_bbdin_copy_abs_to_array(ctx, this, absolute_pos, dst, dst_off, len)?;
+    if update_pos {
+        ctx.set_field_by_name(this, "pos", Value::Long(absolute_pos + len as i64));
+    }
+    Ok(None)
+}
+
+fn native_lucene_byte_buffers_data_input_read_bytes(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    let this = lucene_bbdin_this(args)?;
+    let dst = obj_arg(args, 1)?;
+    let off = args.get(2).and_then(Value::as_int).unwrap_or(0).max(0) as usize;
+    let len = args.get(3).and_then(Value::as_int).unwrap_or(0).max(0) as usize;
+    let relative_pos = lucene_field_long(ctx, this, "pos") - lucene_field_long(ctx, this, "offset");
+    lucene_bbdin_read_bytes_common(ctx, this, dst, off, len, true, relative_pos)
+}
+
+fn native_lucene_byte_buffers_data_input_read_bytes_bool(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    native_lucene_byte_buffers_data_input_read_bytes(ctx, args)
+}
+
+fn native_lucene_byte_buffers_data_input_read_bytes_at(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    let this = lucene_bbdin_this(args)?;
+    let relative_pos = args.get(1).and_then(Value::as_long).unwrap_or(0);
+    let dst = obj_arg(args, 2)?;
+    let off = args.get(3).and_then(Value::as_int).unwrap_or(0).max(0) as usize;
+    let len = args.get(4).and_then(Value::as_int).unwrap_or(0).max(0) as usize;
+    lucene_bbdin_read_bytes_common(ctx, this, dst, off, len, false, relative_pos)
+}
+
+fn native_lucene_byte_buffers_data_input_length(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    let this = lucene_bbdin_this(args)?;
+    Ok(Some(Value::Long(lucene_field_long(ctx, this, "length"))))
+}
+
+fn native_lucene_byte_buffers_data_input_position(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    let this = lucene_bbdin_this(args)?;
+    Ok(Some(Value::Long(lucene_field_long(ctx, this, "pos") - lucene_field_long(ctx, this, "offset"))))
+}
+
+fn native_lucene_byte_buffers_data_input_seek(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    let this = lucene_bbdin_this(args)?;
+    let relative_pos = args.get(1).and_then(Value::as_long).unwrap_or(0);
+    let length = lucene_field_long(ctx, this, "length");
+    if relative_pos > length {
+        ctx.set_field_by_name(this, "pos", Value::Long(length));
+        return Err(lucene_eof());
+    }
+    let absolute_pos = lucene_field_long(ctx, this, "offset")
+        .checked_add(relative_pos)
+        .ok_or_else(lucene_eof)?;
+    ctx.set_field_by_name(this, "pos", Value::Long(absolute_pos));
+    Ok(None)
+}
+
+fn lucene_byte_buffers_index_input_delegate(
+    ctx: &dyn NativeContext,
+    this: ObjectRef,
+) -> Result<ObjectRef, MethodCallFailed> {
+    match ctx.get_field_by_name(this, "in") {
+        Value::Object(Some(input)) => Ok(input),
+        _ => Err(RuntimeError::IllegalStateException {
+            message: "Already closed.".to_string(),
+        }
+        .into()),
+    }
+}
+
+fn native_lucene_byte_buffers_index_input_get_file_pointer(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    let input = lucene_byte_buffers_index_input_delegate(ctx, obj_arg(args, 0)?)?;
+    native_lucene_byte_buffers_data_input_position(ctx, &[Value::Object(Some(input))])
+}
+
+fn native_lucene_byte_buffers_index_input_seek(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    let input = lucene_byte_buffers_index_input_delegate(ctx, obj_arg(args, 0)?)?;
+    native_lucene_byte_buffers_data_input_seek(ctx, &[Value::Object(Some(input)), args.get(1).copied().unwrap_or(Value::Long(0))])
+}
+
+fn native_lucene_byte_buffers_index_input_length(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    let input = lucene_byte_buffers_index_input_delegate(ctx, obj_arg(args, 0)?)?;
+    native_lucene_byte_buffers_data_input_length(ctx, &[Value::Object(Some(input))])
+}
+
+fn native_lucene_byte_buffers_index_input_read_byte(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    let input = lucene_byte_buffers_index_input_delegate(ctx, obj_arg(args, 0)?)?;
+    native_lucene_byte_buffers_data_input_read_byte(ctx, &[Value::Object(Some(input))])
+}
+
+fn native_lucene_byte_buffers_index_input_read_bytes(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    let input = lucene_byte_buffers_index_input_delegate(ctx, obj_arg(args, 0)?)?;
+    native_lucene_byte_buffers_data_input_read_bytes(
+        ctx,
+        &[
+            Value::Object(Some(input)),
+            args.get(1).copied().unwrap_or(Value::Object(None)),
+            args.get(2).copied().unwrap_or(Value::Int(0)),
+            args.get(3).copied().unwrap_or(Value::Int(0)),
+        ],
+    )
+}
+
+fn native_lucene_byte_buffers_index_input_read_bytes_bool(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    native_lucene_byte_buffers_index_input_read_bytes(ctx, args)
+}
+
+fn native_lucene_byte_buffers_index_input_read_floats(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    let input = lucene_byte_buffers_index_input_delegate(ctx, obj_arg(args, 0)?)?;
+    native_lucene_byte_buffers_data_input_read_floats(
+        ctx,
+        &[
+            Value::Object(Some(input)),
+            args.get(1).copied().unwrap_or(Value::Object(None)),
+            args.get(2).copied().unwrap_or(Value::Int(0)),
+            args.get(3).copied().unwrap_or(Value::Int(0)),
+        ],
+    )
+}
+
+fn native_lucene_byte_buffers_index_input_read_longs(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    let input = lucene_byte_buffers_index_input_delegate(ctx, obj_arg(args, 0)?)?;
+    native_lucene_byte_buffers_data_input_read_longs(
+        ctx,
+        &[
+            Value::Object(Some(input)),
+            args.get(1).copied().unwrap_or(Value::Object(None)),
+            args.get(2).copied().unwrap_or(Value::Int(0)),
+            args.get(3).copied().unwrap_or(Value::Int(0)),
+        ],
+    )
+}
+
+fn native_lucene_byte_buffers_index_input_read_short(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    let input = lucene_byte_buffers_index_input_delegate(ctx, obj_arg(args, 0)?)?;
+    native_lucene_byte_buffers_data_input_read_short(ctx, &[Value::Object(Some(input))])
+}
+
+fn native_lucene_byte_buffers_index_input_read_int(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    let input = lucene_byte_buffers_index_input_delegate(ctx, obj_arg(args, 0)?)?;
+    native_lucene_byte_buffers_data_input_read_int(ctx, &[Value::Object(Some(input))])
+}
+
+fn native_lucene_byte_buffers_index_input_read_long(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    let input = lucene_byte_buffers_index_input_delegate(ctx, obj_arg(args, 0)?)?;
+    native_lucene_byte_buffers_data_input_read_long(ctx, &[Value::Object(Some(input))])
+}
+
+fn native_lucene_byte_buffers_index_input_read_byte_at(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    let input = lucene_byte_buffers_index_input_delegate(ctx, obj_arg(args, 0)?)?;
+    native_lucene_byte_buffers_data_input_read_byte_at(ctx, &[Value::Object(Some(input)), args.get(1).copied().unwrap_or(Value::Long(0))])
+}
+
+fn native_lucene_byte_buffers_index_input_read_bytes_at(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    let input = lucene_byte_buffers_index_input_delegate(ctx, obj_arg(args, 0)?)?;
+    native_lucene_byte_buffers_data_input_read_bytes_at(
+        ctx,
+        &[
+            Value::Object(Some(input)),
+            args.get(1).copied().unwrap_or(Value::Long(0)),
+            args.get(2).copied().unwrap_or(Value::Object(None)),
+            args.get(3).copied().unwrap_or(Value::Int(0)),
+            args.get(4).copied().unwrap_or(Value::Int(0)),
+        ],
+    )
+}
+
+fn native_lucene_byte_buffers_index_input_read_short_at(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    let input = lucene_byte_buffers_index_input_delegate(ctx, obj_arg(args, 0)?)?;
+    native_lucene_byte_buffers_data_input_read_short_at(ctx, &[Value::Object(Some(input)), args.get(1).copied().unwrap_or(Value::Long(0))])
+}
+
+fn native_lucene_byte_buffers_index_input_read_int_at(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    let input = lucene_byte_buffers_index_input_delegate(ctx, obj_arg(args, 0)?)?;
+    native_lucene_byte_buffers_data_input_read_int_at(ctx, &[Value::Object(Some(input)), args.get(1).copied().unwrap_or(Value::Long(0))])
+}
+
+fn native_lucene_byte_buffers_index_input_read_long_at(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    let input = lucene_byte_buffers_index_input_delegate(ctx, obj_arg(args, 0)?)?;
+    native_lucene_byte_buffers_data_input_read_long_at(ctx, &[Value::Object(Some(input)), args.get(1).copied().unwrap_or(Value::Long(0))])
+}
+
+fn native_lucene_index_input_to_string(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    let this = obj_arg(args, 0)?;
+    Ok(Some(ctx.get_field_by_name(this, "resourceDescription")))
+}
+
+fn lucene_mock_index_input_delegate(
+    ctx: &dyn NativeContext,
+    this: ObjectRef,
+) -> Result<ObjectRef, MethodCallFailed> {
+    if ctx.get_field_by_name(this, "closed").as_int().unwrap_or(0) != 0 {
+        return Err(RuntimeError::IllegalStateException {
+            message: "Abusing closed IndexInput!".to_string(),
+        }
+        .into());
+    }
+    if let Value::Object(Some(parent)) = ctx.get_field_by_name(this, "parent") {
+        if ctx.get_field_by_name(parent, "closed").as_int().unwrap_or(0) != 0 {
+            return Err(RuntimeError::IllegalStateException {
+                message: "Abusing clone of a closed IndexInput!".to_string(),
+            }
+            .into());
+        }
+    }
+    lucene_field_obj(ctx, this, "in")
+}
+
+fn native_lucene_mock_index_input_wrapper_length(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    let input = lucene_mock_index_input_delegate(ctx, obj_arg(args, 0)?)?;
+    ctx.invoke_virtual(input, "length", "()J", &[])
+}
+
+fn native_lucene_mock_index_input_wrapper_read_byte(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    let input = lucene_mock_index_input_delegate(ctx, obj_arg(args, 0)?)?;
+    ctx.invoke_virtual(input, "readByte", "()B", &[])
+}
+
+fn native_lucene_mock_index_input_wrapper_read_bytes(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    let input = lucene_mock_index_input_delegate(ctx, obj_arg(args, 0)?)?;
+    ctx.invoke_virtual(
+        input,
+        "readBytes",
+        "([BII)V",
+        &[
+            args.get(1).copied().unwrap_or(Value::Object(None)),
+            args.get(2).copied().unwrap_or(Value::Int(0)),
+            args.get(3).copied().unwrap_or(Value::Int(0)),
+        ],
+    )
+}
+
+fn native_lucene_mock_index_input_wrapper_read_bytes_bool(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    let input = lucene_mock_index_input_delegate(ctx, obj_arg(args, 0)?)?;
+    ctx.invoke_virtual(
+        input,
+        "readBytes",
+        "([BIIZ)V",
+        &[
+            args.get(1).copied().unwrap_or(Value::Object(None)),
+            args.get(2).copied().unwrap_or(Value::Int(0)),
+            args.get(3).copied().unwrap_or(Value::Int(0)),
+            args.get(4).copied().unwrap_or(Value::Int(0)),
+        ],
+    )
+}
+
+fn native_lucene_mock_index_input_wrapper_read_floats(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    let input = lucene_mock_index_input_delegate(ctx, obj_arg(args, 0)?)?;
+    ctx.invoke_virtual(
+        input,
+        "readFloats",
+        "([FII)V",
+        &[
+            args.get(1).copied().unwrap_or(Value::Object(None)),
+            args.get(2).copied().unwrap_or(Value::Int(0)),
+            args.get(3).copied().unwrap_or(Value::Int(0)),
+        ],
+    )
+}
+
+fn native_lucene_mock_index_input_wrapper_read_longs(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    let input = lucene_mock_index_input_delegate(ctx, obj_arg(args, 0)?)?;
+    ctx.invoke_virtual(
+        input,
+        "readLongs",
+        "([JII)V",
+        &[
+            args.get(1).copied().unwrap_or(Value::Object(None)),
+            args.get(2).copied().unwrap_or(Value::Int(0)),
+            args.get(3).copied().unwrap_or(Value::Int(0)),
+        ],
+    )
+}
+
+fn native_lucene_mock_index_input_wrapper_read_short(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    let input = lucene_mock_index_input_delegate(ctx, obj_arg(args, 0)?)?;
+    ctx.invoke_virtual(input, "readShort", "()S", &[])
+}
+
+fn native_lucene_mock_index_input_wrapper_read_int(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    let input = lucene_mock_index_input_delegate(ctx, obj_arg(args, 0)?)?;
+    ctx.invoke_virtual(input, "readInt", "()I", &[])
+}
+
+fn native_lucene_mock_index_input_wrapper_read_long(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    let input = lucene_mock_index_input_delegate(ctx, obj_arg(args, 0)?)?;
+    ctx.invoke_virtual(input, "readLong", "()J", &[])
 }
 
 fn native_lucene_byte_buffers_data_input_read_byte(
