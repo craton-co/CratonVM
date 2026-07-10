@@ -1129,6 +1129,18 @@ pub fn force_gc_from_native(shared: &SharedVm, thread: &mut JvmThread) {
         for new_addr in &dead_finalizers {
             shared.finalizer_thread.enqueue(*new_addr);
         }
+        // Once-only finalization: flag the processor entries for the objects
+        // just enqueued. `process_references_after_gc` above already ran
+        // `update_after_gc`, so entry referents hold post-GC addresses
+        // matching `dead_finalizers`. Without this, the resurrected object
+        // looks alive to every later cycle and the GC re-resurrects +
+        // re-enqueues it (finalize() observed running 3× per object).
+        if !dead_finalizers.is_empty() {
+            shared
+                .ref_processor
+                .lock()
+                .mark_finalizer_enqueued(&dead_finalizers);
+        }
     } else {
         let mut counted_os_tids: Vec<u32> = Vec::new();
         let should_initiate_gc = {
@@ -1175,6 +1187,13 @@ pub fn force_gc_from_native(shared: &SharedVm, thread: &mut JvmThread) {
             crate::runtime::ec_watch::remap(&result.pointer_map);
             for new_addr in &dead_finalizers {
                 shared.finalizer_thread.enqueue(*new_addr);
+            }
+            // Once-only finalization — see the single-threaded arm above.
+            if !dead_finalizers.is_empty() {
+                shared
+                    .ref_processor
+                    .lock()
+                    .mark_finalizer_enqueued(&dead_finalizers);
             }
             // xt-hardening (2026-07-03): clear regions + resume BEFORE
             // complete_gc (see maybe_gc's epilogue for the race rationale).
@@ -1407,9 +1426,13 @@ fn process_references_after_gc(
     // in EITHER young semispace that is NOT a pointer-map key did not
     // survive — skip it entirely. Old-gen addresses don't move in a minor GC
     // (major relocations ARE merged into the map) and stay processed.
-    let is_stale_young = |addr: usize| -> bool {
-        !pointer_map.contains_key(&addr) && shared.heap.is_in_young_addr(addr)
-    };
+    // Backend-generic since 2026-07-10 (`pre_gc_addr_did_not_survive`): the
+    // original closure checked only the Generational young semispaces, so it
+    // was hardwired inert for G1/ZGC — dead finalize/cleaner/enqueue
+    // addresses flowed through unguarded and `run_finalizers` later
+    // dereferenced freed CSet memory (finalize-on-recycled-object UAF).
+    let is_stale_young =
+        |addr: usize| -> bool { shared.heap.pre_gc_addr_did_not_survive(addr, pointer_map) };
 
     // Null referent field (field 0) on cleared weak/soft references.
     // ROOT-CAUSE FIX (2026-06-10): once-only emission — the legacy
@@ -1505,12 +1528,25 @@ fn process_references_after_gc(
             }
             continue;
         }
-        // Push onto queue's linked list head (field 0 = head, field 1 = size)
+        // Push onto queue's linked list head (field 0 = head, field 1 = size).
+        //
+        // Queue linkage uses the Reference's `next` field (slot 2, matching
+        // the real-JDK `java.lang.ref.Reference` layout: referent, queue,
+        // next, discovered) — NOT the referent slot. The old protocol reused
+        // slot 0 (the referent) as the next pointer, so every
+        // enqueued-but-not-yet-polled WeakReference answered `get()` with
+        // the NEXT Reference in the queue instead of null (only the
+        // first-enqueued, whose next was null, read as cleared — the
+        // RefCheck `deadCleared=1/256 enqueued=256` signature). References
+        // with fewer than 3 fields (legacy synthetic shape) fall back to the
+        // old slot-0 linkage, which is at least consistent with the poll
+        // side's identical fallback.
         let old_head = shared.heap.get_field(q_obj, 0); // RQ_FIELD_HEAD
         shared
             .heap
             .set_field(q_obj, 0, Value::Object(Some(ref_obj))); // new head
-        shared.heap.set_field(ref_obj, 0, old_head); // REF_FIELD_REFERENT = next ptr
+        let next_slot = if shared.heap.num_fields(ref_obj) > 2 { 2 } else { 0 };
+        shared.heap.set_field(ref_obj, next_slot, old_head); // REF_FIELD_NEXT
         let size = match shared.heap.get_field(q_obj, 1) {
             // RQ_FIELD_SIZE
             Value::Int(v) => v,

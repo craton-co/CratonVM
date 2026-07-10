@@ -1427,6 +1427,14 @@ pub struct ZgcRealHeap {
     /// NO reference processing, so finalizers/cleaners and `WeakReference`
     /// semantics silently broke under this collector.
     ref_processor: Mutex<ReferenceProcessor>,
+    /// Finalizer-resurrection input for the current collection — see
+    /// [`Self::collect_garbage_with_finalizers`]. Consumed (taken) by the
+    /// mark phase; empty on every plain `collect_garbage`.
+    pending_finalizer_roots: Mutex<Vec<usize>>,
+    /// Output half: addresses of dead-but-finalizable objects the mark phase
+    /// resurrected (non-moving, so pre == post address). Drained by
+    /// [`Self::collect_garbage_with_finalizers`].
+    resurrected_finalizers: Mutex<Vec<usize>>,
 }
 
 // SAFETY: identical argument to `Heap`/`G1Collector` (heap.rs:143). The only
@@ -1456,7 +1464,35 @@ impl ZgcRealHeap {
             gc_rearm: AtomicUsize::new(0),
             gc_count: AtomicUsize::new(0),
             ref_processor: Mutex::new(ReferenceProcessor::new()),
+            pending_finalizer_roots: Mutex::new(Vec::new()),
+            resurrected_finalizers: Mutex::new(Vec::new()),
         }
+    }
+
+    /// Run a collection with finalizer-aware resurrection: any address in
+    /// `finalizer_addrs` (registered, not-yet-enqueued finalizable objects)
+    /// that the mark phase finds DEAD is marked live — with its transitive
+    /// closure — so the sweep keeps it and `finalize()` can later run
+    /// against valid memory. Non-moving, so the returned dead-finalizer
+    /// addresses are the same addresses that went in. The caller must
+    /// enqueue them for finalization AND mark their processor entries
+    /// enqueued (once-only finalization) — mirrors the generational
+    /// backend's contract.
+    pub fn collect_garbage_with_finalizers(
+        &self,
+        stw: &crate::collector::StopTheWorldToken,
+        roots: &mut [ObjectRef],
+        finalizer_addrs: &[usize],
+        monitors: &dyn MonitorCleanup,
+    ) -> (GcResult, Vec<usize>) {
+        *self.pending_finalizer_roots.lock() = finalizer_addrs.to_vec();
+        self.resurrected_finalizers.lock().clear();
+        let result = <Self as crate::collector::GarbageCollector>::collect_garbage(
+            self, stw, roots, monitors,
+        );
+        self.pending_finalizer_roots.lock().clear();
+        let dead = std::mem::take(&mut *self.resurrected_finalizers.lock());
+        (result, dead)
     }
 
     /// Register a discovered `java.lang.ref.Reference` with this heap's shared
@@ -2030,6 +2066,41 @@ impl GarbageCollector for ZgcRealHeap {
             }
             header.gc_flags |= GC_FLAG_MARKED;
             self.enumerate_references(addr as *mut u8, &mut work);
+        }
+
+        // ---- Finalizer resurrection (see collect_garbage_with_finalizers):
+        // mark dead-but-finalizable objects (and their subtrees) live so the
+        // sweep keeps them for the finalizer thread. Runs after the main
+        // closure so "unmarked" == dead, and before the sweep decides.
+        let fin_candidates = std::mem::take(&mut *self.pending_finalizer_roots.lock());
+        if !fin_candidates.is_empty() {
+            let registered: std::collections::HashSet<usize> = all.iter().copied().collect();
+            let mut resurrected = Vec::new();
+            for addr in fin_candidates {
+                if !registered.contains(&addr) {
+                    continue; // not a current allocation (already swept earlier)
+                }
+                let header = self.header_mut(addr as *mut u8);
+                if header.gc_flags & GC_FLAG_MARKED != 0 {
+                    continue; // survived normally — stays registered, not finalized
+                }
+                resurrected.push(addr); // non-moving: address unchanged
+                work.push(addr);
+                while let Some(a) = work.pop() {
+                    if a == 0 {
+                        continue;
+                    }
+                    let h = self.header_mut(a as *mut u8);
+                    if h.gc_flags & GC_FLAG_MARKED != 0 {
+                        continue;
+                    }
+                    h.gc_flags |= GC_FLAG_MARKED;
+                    self.enumerate_references(a as *mut u8, &mut work);
+                }
+            }
+            if !resurrected.is_empty() {
+                *self.resurrected_finalizers.lock() = resurrected;
+            }
         }
 
         // ---- Reference processing ---------------------------------------

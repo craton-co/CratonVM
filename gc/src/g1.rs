@@ -1271,6 +1271,18 @@ pub struct G1Collector {
     /// time/correctness trade — no crash, just longer mark.
     mark_worklist_overflowed: AtomicBool,
 
+    /// Finalizer-resurrection input for the CURRENT collection (see
+    /// [`Self::collect_garbage_with_finalizers`]): referent addresses of
+    /// registered, not-yet-enqueued finalizable objects. Consumed (taken)
+    /// by the serial young/mixed paths' Phase 3.5, which evacuates any of
+    /// them that died in the CSet so `finalize()` can still run against
+    /// valid memory. Empty on every plain `collect_garbage` call.
+    pending_finalizer_roots: Mutex<Vec<usize>>,
+    /// Output half of the finalizer-resurrection protocol: the POST-copy
+    /// addresses of objects Phase 3.5 resurrected this collection. Drained
+    /// by [`Self::collect_garbage_with_finalizers`].
+    resurrected_finalizers: Mutex<Vec<usize>>,
+
     /// SECURITY FIX (V7a): RSet write-barrier TLS-cache epoch.
     ///
     /// `post_write_barrier_rset`'s fast path caches a stable `*const
@@ -1403,6 +1415,8 @@ impl G1Collector {
             mixed_gc_remaining: AtomicU64::new(0),
             mark_worklist: Mutex::new(Vec::new()),
             mark_worklist_overflowed: AtomicBool::new(false),
+            pending_finalizer_roots: Mutex::new(Vec::new()),
+            resurrected_finalizers: Mutex::new(Vec::new()),
             // SECURITY FIX (V7a): start the RSet TLS-cache epoch at 0.
             rset_cache_epoch: AtomicU64::new(0),
             region_lookup,
@@ -1900,7 +1914,14 @@ impl G1Collector {
         // parallel evacuator would relocate a JIT-rooted object whose holder
         // slot cannot be rewritten). When parallel DOES run (no thread in JIT)
         // there are no conservative JIT roots to pin, so it stays correct.
-        if parallel_evac_enabled() && !crate::gc_quiescence::is_active() {
+        // Finalizer resurrection (Phase 3.5) is implemented only on the
+        // serial paths — force serial while resurrection candidates are
+        // pending (System.gc with registered finalizables; rare and already
+        // a full-STW slow path).
+        if parallel_evac_enabled()
+            && !crate::gc_quiescence::is_active()
+            && self.pending_finalizer_roots.lock().is_empty()
+        {
             return self.young_collection_parallel(roots, monitors);
         }
         let start = std::time::Instant::now();
@@ -2092,6 +2113,19 @@ impl G1Collector {
                 &mut work_list,
             );
         }
+
+        // Phase 3.5: finalizer resurrection (see
+        // `collect_garbage_with_finalizers`). Must run after the closure is
+        // complete (so "not forwarded" == dead) and before Phase 5 resets
+        // the CSet regions (after that, the bytes are gone).
+        self.resurrect_dead_finalizers(
+            &mut regions,
+            &cset_set,
+            &mut pointer_map,
+            &mut objects_copied,
+            &mut bytes_copied,
+            &mut work_list,
+        );
 
         // Phase 4: Update forwarding pointers in non-CSet regions
         self.update_references_in_regions(&mut regions, &cset_set, &pointer_map);
@@ -2467,6 +2501,16 @@ impl G1Collector {
                 &mut work_list,
             );
         }
+
+        // Phase 3.5: finalizer resurrection — see young_collection.
+        self.resurrect_dead_finalizers(
+            &mut regions,
+            &cset_set,
+            &mut pointer_map,
+            &mut objects_copied,
+            &mut bytes_copied,
+            &mut work_list,
+        );
 
         // Update references and free evacuated regions
         self.update_references_in_regions(&mut regions, &cset_set, &pointer_map);
@@ -3149,6 +3193,117 @@ impl G1Collector {
     /// instead means the parallel evacuator can later derive it from the
     /// atomic CAS-forwarding install in the object header (`forwarding_ptr`)
     /// without changing the call sites.
+    /// Run a collection with finalizer-aware resurrection: any address in
+    /// `finalizer_addrs` (registered, not-yet-enqueued finalizable objects,
+    /// from `ReferenceProcessor::finalizer_referent_addresses`) that DIES in
+    /// this collection's CSet is evacuated anyway — with its transitive
+    /// closure — so `finalize()` can later run against valid memory, exactly
+    /// like the generational backend's Phase 2.5. Returns the collection
+    /// result plus the POST-copy addresses of the resurrected objects; the
+    /// caller must enqueue them for finalization AND mark their processor
+    /// entries enqueued (once-only finalization).
+    ///
+    /// Dead finalizables OUTSIDE the CSet (e.g. promoted to an Old region a
+    /// young pause does not collect) are left in place, still registered —
+    /// they are picked up by whichever later collection selects their
+    /// region.
+    pub fn collect_garbage_with_finalizers(
+        &self,
+        stw: &crate::collector::StopTheWorldToken,
+        roots: &mut [ObjectRef],
+        finalizer_addrs: &[usize],
+        monitors: &dyn MonitorCleanup,
+    ) -> (GcResult, Vec<usize>) {
+        *self.pending_finalizer_roots.lock() = finalizer_addrs.to_vec();
+        self.resurrected_finalizers.lock().clear();
+        let result =
+            <Self as crate::collector::GarbageCollector>::collect_garbage(self, stw, roots, monitors);
+        // Belt-and-braces: clear any candidates a path did not consume
+        // (e.g. an empty-CSet early return) so a later plain collection
+        // never sees stale candidates.
+        self.pending_finalizer_roots.lock().clear();
+        let mut dead = std::mem::take(&mut *self.resurrected_finalizers.lock());
+        // `retry_after_evacuation_failure` (run inside collect_garbage,
+        // after Phase 3.5) can relocate objects AGAIN via the kept-region
+        // drain and composes those forwards into the final pointer map —
+        // resolve each resurrected address through it so the caller never
+        // enqueues an intermediate (already-vacated) address.
+        for addr in dead.iter_mut() {
+            if let Some(&fixed) = result.pointer_map.get(&*addr) {
+                *addr = fixed;
+            }
+        }
+        (result, dead)
+    }
+
+    /// Phase 3.5 (serial young/mixed): evacuate dead-but-finalizable CSet
+    /// objects (and their transitive closure, via the same Phase-3 scan)
+    /// so `finalize()` can run against valid memory. See
+    /// [`Self::collect_garbage_with_finalizers`]. No-op when no candidates
+    /// are pending (every plain collection).
+    fn resurrect_dead_finalizers(
+        &self,
+        regions: &mut Vec<G1Region>,
+        cset_set: &std::collections::HashSet<usize>,
+        pointer_map: &mut HashMap<usize, usize>,
+        objects_copied: &mut usize,
+        bytes_copied: &mut usize,
+        work_list: &mut Vec<*mut u8>,
+    ) {
+        let candidates = std::mem::take(&mut *self.pending_finalizer_roots.lock());
+        if candidates.is_empty() {
+            return;
+        }
+        let mut resurrected = Vec::new();
+        let scan_resume = work_list.len();
+        for old_addr in candidates {
+            if pointer_map.contains_key(&old_addr) {
+                continue; // survived normally (or already self-forwarded)
+            }
+            let Some(ridx) = self.lookup_region_for_addr(old_addr) else {
+                continue; // not a current heap address
+            };
+            if !cset_set.contains(&ridx) {
+                continue; // not dying this pause — stays registered
+            }
+            // Dead in the CSet: evacuate it like a root and let the scan
+            // below pull its subtree out too.
+            if let Some((new_ptr, fresh)) = self.evacuate_object(
+                regions,
+                old_addr as *mut u8,
+                pointer_map,
+                objects_copied,
+                bytes_copied,
+                cset_set,
+            ) {
+                if fresh {
+                    work_list.push(new_ptr);
+                }
+                resurrected.push(new_ptr as usize);
+            }
+        }
+        // Re-run the Phase-3 closure over the resurrected subtree.
+        let mut scan_idx = scan_resume;
+        while scan_idx < work_list.len() {
+            let obj_ptr = work_list[scan_idx];
+            scan_idx += 1;
+            let header = unsafe { &*(obj_ptr as *const ObjectHeader) };
+            self.scan_and_evacuate_refs(
+                regions,
+                obj_ptr,
+                header,
+                cset_set,
+                pointer_map,
+                objects_copied,
+                bytes_copied,
+                work_list,
+            );
+        }
+        if !resurrected.is_empty() {
+            self.resurrected_finalizers.lock().extend(resurrected);
+        }
+    }
+
     fn evacuate_object(
         &self,
         regions: &mut Vec<G1Region>,
