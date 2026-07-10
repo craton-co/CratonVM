@@ -289,18 +289,27 @@ pub(crate) fn native_get_caller_class(
 }
 
 fn native_option_clinit(ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
+    let class_name = "java/lang/StackWalker$Option";
+    let mut values = Vec::with_capacity(3);
+
     for name in [
         "RETAIN_CLASS_REFERENCE",
         "SHOW_HIDDEN_FRAMES",
         "SHOW_REFLECT_FRAMES",
     ] {
-        let option = alloc_concurrent_synthetic(ctx, "java/lang/StackWalker$Option", 0);
-        ctx.set_static_field_by_name(
-            "java/lang/StackWalker$Option",
-            name,
-            Value::Object(Some(option)),
-        );
+        let option = alloc_concurrent_synthetic(ctx, class_name, 0);
+        ctx.set_static_field_by_name(class_name, name, Value::Object(Some(option)));
+        values.push(option);
     }
+
+    let option_class = ctx.class_id_of_object(values[0]);
+    let values_array = ctx.new_ref_array(option_class, values.len());
+    for (idx, option) in values.into_iter().enumerate() {
+        ctx.set_array_element(values_array, idx, Value::Object(Some(option)));
+    }
+    ctx.set_static_field_by_name(class_name, "$VALUES", Value::Object(Some(values_array)));
+    ctx.set_static_field_by_name(class_name, "ENUM$VALUES", Value::Object(Some(values_array)));
+
     Ok(None)
 }
 
@@ -612,6 +621,58 @@ mod tests {
             }
         } else {
             panic!("expected non-null walker");
+        }
+    }
+
+    #[test]
+    fn option_clinit_populates_enum_values_array() {
+        use cratonvm_native_api::FieldMetadata;
+
+        let mut ctx = MockNativeContext::new();
+        let option_class = ctx
+            .ensure_class_initialized("java/lang/StackWalker$Option")
+            .unwrap();
+        let fields = [
+            ("RETAIN_CLASS_REFERENCE", "Ljava/lang/StackWalker$Option;"),
+            ("SHOW_HIDDEN_FRAMES", "Ljava/lang/StackWalker$Option;"),
+            ("SHOW_REFLECT_FRAMES", "Ljava/lang/StackWalker$Option;"),
+            ("$VALUES", "[Ljava/lang/StackWalker$Option;"),
+        ]
+        .into_iter()
+        .enumerate()
+        .map(|(slot_index, (name, descriptor))| FieldMetadata {
+            name: name.to_string(),
+            descriptor: descriptor.to_string(),
+            access_flags: 0,
+            slot_index,
+            declaring_class_id: option_class,
+            is_static: true,
+        })
+        .collect();
+        ctx.set_declared_fields(option_class, fields);
+
+        native_option_clinit(&mut ctx, &[]).expect("clinit should succeed");
+
+        let values_slot = ctx
+            .static_field_index_by_name(option_class, "$VALUES")
+            .unwrap();
+        let values_array = match ctx.get_static_field(option_class, values_slot) {
+            Value::Object(Some(array)) => array,
+            other => panic!("expected non-null $VALUES array, got {:?}", other),
+        };
+        assert_eq!(ctx.array_length(values_array), 3);
+
+        for (idx, name) in [
+            "RETAIN_CLASS_REFERENCE",
+            "SHOW_HIDDEN_FRAMES",
+            "SHOW_REFLECT_FRAMES",
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let slot = ctx.static_field_index_by_name(option_class, name).unwrap();
+            let static_value = ctx.get_static_field(option_class, slot);
+            assert_eq!(ctx.get_array_element(values_array, idx), static_value);
         }
     }
 
