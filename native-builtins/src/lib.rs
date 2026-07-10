@@ -40631,7 +40631,7 @@ fn uuid_get_lsb(ctx: &mut dyn NativeContext, obj: cratonvm_types::ObjectRef) -> 
 fn alloc_uuid(ctx: &mut dyn NativeContext, msb: i64, lsb: i64) -> cratonvm_types::ObjectRef {
     let class_id = match ctx.ensure_class_initialized("java/util/UUID") {
         Ok(id) => id,
-        Err(_) => cratonvm_types::ClassId::new(0),
+        Err(_) => ctx.ensure_synthetic_class("java/util/UUID", 2),
     };
     let obj = ctx.alloc_object(class_id, 2);
     uuid_set_msb(ctx, obj, msb);
@@ -48677,7 +48677,7 @@ fn native_pattern_split_impl(
 
     let string_class_id = match ctx.ensure_class_initialized("java/lang/String") {
         Ok(id) => id,
-        Err(_) => cratonvm_types::ClassId::new(0),
+        Err(_) => ctx.ensure_synthetic_class("java/lang/String", 8),
     };
     let arr = ctx.new_ref_array(string_class_id, parts.len());
     for (i, part) in parts.iter().enumerate() {

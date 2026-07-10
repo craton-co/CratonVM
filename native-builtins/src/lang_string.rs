@@ -3606,7 +3606,7 @@ pub(crate) fn native_string_split_private(
 fn string_array_from_parts(ctx: &mut dyn NativeContext, parts: &[String]) -> MethodCallResult {
     let string_class_id = match ctx.ensure_class_initialized("java/lang/String") {
         Ok(id) => id,
-        Err(_) => cratonvm_types::ClassId::new(0),
+        Err(_) => ctx.ensure_synthetic_class("java/lang/String", 8),
     };
     let arr = ctx.new_ref_array(string_class_id, parts.len());
     for (i, part) in parts.iter().enumerate() {
@@ -4264,7 +4264,7 @@ pub(crate) fn native_string_lines(ctx: &mut dyn NativeContext, args: &[Value]) -
     // Use the Stream pattern from collections
     let stream_class_id = match ctx.ensure_class_initialized("java/util/stream/Stream") {
         Ok(id) => id,
-        Err(_) => cratonvm_types::ClassId::new(0),
+        Err(_) => ctx.ensure_synthetic_class("java/util/stream/Stream", 1),
     };
     let stream = ctx.alloc_object(stream_class_id, 1);
     let arr = ctx.new_ref_array(cratonvm_types::ClassId::new(0), elements.len());
