@@ -25747,7 +25747,15 @@ pub fn register_essential_natives(registry: &mut NativeMethodRegistry) {
                 let mut saw_any = false;
                 let key = ctx.identity_hash_code(this);
                 loop {
-                    let ch = if let Some(ch) = r3_br_pending_chars().lock().remove(&key) {
+                    // Take the pending char in its own statement: an `if let`
+                    // scrutinee's temporaries (the MutexGuard!) live through
+                    // the ENTIRE if/else in edition 2021, and the else branch
+                    // below does a BLOCKING `read` through invoke_virtual —
+                    // holding this global mutex across that park starved every
+                    // other reader (Process Controller stderr-drain thread →
+                    // child stderr never relayed → child blocks on full pipe).
+                    let pending = r3_br_pending_chars().lock().remove(&key);
+                    let ch = if let Some(ch) = pending {
                         ch
                     } else {
                         let n = match ctx.invoke_virtual(
