@@ -22752,6 +22752,61 @@ fn surefire_lazy_launcher_discover_native(
     Some(cb)
 }
 
+/// Synthetic stubs are fallback implementations for fake or incomplete JDK
+/// classes. When the real class bytecode is loaded and explicitly protected,
+/// dispatch must prefer that bytecode over the approximate stub.
+fn synthetic_stub_should_yield_to_real_bytecode(
+    shared: &SharedVm,
+    class_name: &str,
+    method_name: &str,
+    descriptor: &str,
+) -> bool {
+    let synthetic_stub_native = shared
+        .native_methods
+        .kind_of(class_name, method_name, descriptor)
+        == Some(cratonvm_native_api::NativeKind::SyntheticStub);
+    if !synthetic_stub_native {
+        return false;
+    }
+
+    let real_protected_stub = crate::runtime::env_cache::real_bytecode_selector()
+        .prefers_real(class_name)
+        || matches!(
+            class_name,
+            "java/util/concurrent/locks/ReentrantLock"
+                | "java/util/concurrent/LinkedBlockingDeque"
+                | "java/util/concurrent/atomic/AtomicBoolean"
+                | "java/util/EnumSet"
+                | "java/util/StringJoiner"
+                | "java/io/FileInputStream"
+                | "java/lang/ref/Cleaner"
+                | "java/lang/ref/Cleaner$Cleanable"
+                | "java/lang/management/ManagementFactory"
+        );
+    if !real_protected_stub {
+        return false;
+    }
+
+    let cm = shared.class_manager.read();
+    cm.get_loaded_class_id(class_name)
+        .and_then(|cid| {
+            cm.get_class(cid).and_then(|cls| {
+                if cls.is_synthetic_stub {
+                    None
+                } else {
+                    crate::classloading::find_method_recursive(
+                        cid,
+                        method_name,
+                        descriptor,
+                        &cm.class_store,
+                    )
+                    .map(|(m, _)| !m.is_native() && m.code().is_some())
+                }
+            })
+        })
+        .unwrap_or(false)
+}
+
 /// Stackless invoke: resolve a method and either call native (Handled) or push
 /// a bytecode frame (FramePushed).  Returns `CacheMiss` for exotic cases that
 /// cannot be handled stacklessly (signature-polymorphic, JNI, etc.), in which
@@ -22959,6 +23014,16 @@ fn try_stackless_invoke(
     } else {
         native_cb
     };
+    let native_cb = if synthetic_stub_should_yield_to_real_bytecode(
+        shared,
+        class_name,
+        method_name,
+        descriptor,
+    ) {
+        None
+    } else {
+        native_cb
+    };
     if crate::runtime::env_cache::bd_debug()
         && (method_name == "intValue"
             || (class_name.contains("BigDecimal")
@@ -23140,16 +23205,23 @@ fn try_stackless_invoke(
             .native_methods
             .find(&class_name_arc, method_name, descriptor)
         {
-            let result = safe_native_call(shared, thread, callback, args)?;
-            if let Some(value) = result.filter(|_| ret_type != b'V') {
-                // T18.K4 — tag-exact push for J/D native-override (on bytecode method) return values.
-                push_invoke_return_value(
-                    &mut thread.frames[frame_idx].stack,
-                    coerce_value_for_return(value, ret_type),
-                )?;
-                native_return_pushed_to_stack(shared, thread);
+            if !synthetic_stub_should_yield_to_real_bytecode(
+                shared,
+                &class_name_arc,
+                method_name,
+                descriptor,
+            ) {
+                let result = safe_native_call(shared, thread, callback, args)?;
+                if let Some(value) = result.filter(|_| ret_type != b'V') {
+                    // T18.K4 — tag-exact push for J/D native-override (on bytecode method) return values.
+                    push_invoke_return_value(
+                        &mut thread.frames[frame_idx].stack,
+                        coerce_value_for_return(value, ret_type),
+                    )?;
+                    native_return_pushed_to_stack(shared, thread);
+                }
+                return Ok(CachedCallResult::Handled);
             }
-            return Ok(CachedCallResult::Handled);
         }
     }
 
