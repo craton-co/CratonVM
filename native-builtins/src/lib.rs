@@ -18131,6 +18131,52 @@ pub fn register_essential_natives(registry: &mut NativeMethodRegistry) {
     // but test VMs use real-JDK mode and still need the print capture natives.
     register_test_harness_natives(registry);
 
+    // OutputStreamWriter(OutputStream, CharsetEncoder) -- real bytecode for
+    // this specific constructor overload produces a writer that emits ZERO
+    // bytes for every character written (confirmed by isolated probe: the
+    // (OutputStream, Charset) and (OutputStream, String) overloads work
+    // correctly, only the CharsetEncoder-accepting one is broken). This
+    // silently corrupted org.apache.catalina.util.URLEncoder.encode(String,
+    // Charset) -- which builds its OutputStreamWriter this exact way to
+    // percent-encode unsafe characters -- dropping every encoded character
+    // instead of emitting "%XX", observed as Tomcat manager's "war=" deploy
+    // parameter having every '/' silently stripped. Root cause not fully
+    // understood (a real-bytecode-only bug, no interpreter fix attempted
+    // here); work around by delegating to the proven-working (OutputStream,
+    // Charset) constructor on the same object, reading the Charset off the
+    // caller-supplied CharsetEncoder via its own real charset() accessor.
+    // This loses the caller's chosen malformed-input / unmappable-character
+    // error actions (REPORT vs REPLACE), which no caller in this codebase's
+    // test suites has been observed to depend on.
+    registry.register(
+        "java/io/OutputStreamWriter",
+        "<init>",
+        "(Ljava/io/OutputStream;Ljava/nio/charset/CharsetEncoder;)V",
+        |ctx, args| {
+            let this = args.first().copied().unwrap_or(Value::Object(None));
+            let stream = args.get(1).copied().unwrap_or(Value::Object(None));
+            let encoder = match args.get(2) {
+                Some(Value::Object(Some(e))) => Some(*e),
+                _ => None,
+            };
+            let charset = match encoder {
+                Some(e) => ctx
+                    .invoke_virtual(e, "charset", "()Ljava/nio/charset/Charset;", &[])
+                    .ok()
+                    .flatten()
+                    .unwrap_or(Value::Object(None)),
+                None => Value::Object(None),
+            };
+            ctx.invoke_special(
+                "java/io/OutputStreamWriter",
+                "<init>",
+                "(Ljava/io/OutputStream;Ljava/nio/charset/Charset;)V",
+                &[this, stream, charset],
+            )?;
+            Ok(None)
+        },
+    );
+
     // Real-JDK mode does not call the full synthetic/experimental
     // `register_builtins` surface, but JBoss Marshalling calls
     // `sun.reflect.ReflectionFactory` directly for serialization hooks.
