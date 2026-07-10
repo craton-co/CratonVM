@@ -12364,6 +12364,37 @@ fn invoke_on_class_shared_inner(
                                 | "getLocalAddress"
                                 | "socket"
                             ))
+                        // SocketAdaptor address accessors need the same channel
+                        // shims: the real JDK bytecode returns the unresolved
+                        // InetSocketAddress we synthesize for accepted peers,
+                        // so Socket.getInetAddress() becomes null and Tomcat's
+                        // request remoteAddr/remoteHost population fails.
+                        || (class_name == "sun/nio/ch/SocketAdaptor"
+                            && matches!(method_name, "getInetAddress" | "getLocalAddress"))
+                        || (class_name == "java/net/Socket"
+                            && matches!(method_name, "getInetAddress" | "getLocalAddress"))
+                        // Jasper's embedded ECJ can surface a CratonVM-only
+                        // false-positive "must implement
+                        // ServletConfig.getInitParameterNames()" problem for
+                        // generated JSP classes. Let the narrow native
+                        // DefaultProblem.isError override demote only that
+                        // problem so Jasper still treats real ECJ errors as
+                        // fatal.
+                        || (matches!(
+                            class_name,
+                            "org/eclipse/jdt/internal/compiler/problem/DefaultProblem"
+                                | "org/eclipse/jdt/core/compiler/CategorizedProblem"
+                                | "org/eclipse/jdt/core/compiler/IProblem"
+                        )
+                            && method_name == "isError"
+                            && descriptor == "()Z")
+                        || (class_name == "org/apache/tomcat/util/buf/MessageBytes"
+                            && method_name == "toString"
+                            && descriptor == "()Ljava/lang/String;")
+                        || (class_name == "org/apache/jasper/servlet/JspServlet"
+                            && method_name == "handleMissingResource"
+                            && descriptor
+                                == "(Ljakarta/servlet/http/HttpServletRequest;Ljakarta/servlet/http/HttpServletResponse;Ljava/lang/String;)V")
                         // SelectableChannel.register — JDK bytecode walks
                         // SelectorProvider state we don't initialize.
                         || (matches!(
