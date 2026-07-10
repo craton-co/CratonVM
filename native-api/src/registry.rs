@@ -3229,6 +3229,36 @@ impl NativeMethodRegistry {
         {
             return;
         }
+        // Real-JDK mode: drop the synthetic `java/lang/ref/Cleaner`/
+        // `Cleaner$Cleanable` natives (`create()`, `register(Object,Runnable)`,
+        // `Cleanable.clean()`). These were meant only as a fallback for when
+        // real class bytes are unavailable (see this block's own comment at
+        // the registration site, phases_late.rs::register_p68_cleaner: "real
+        // Cleaner bytecode still wins whenever the real class is loaded") --
+        // but `create()` is a STATIC factory method, and static dispatch has
+        // no per-instance real-vs-synthetic safety net the way concrete
+        // instance methods do, so the native unconditionally wins there and
+        // allocates a bare Cleaner with its real `impl` field left null.
+        // `register(Object,Runnable)` (an instance method) then correctly
+        // prefers real bytecode -- which calls `PhantomCleanable.<init>` ->
+        // `CleanerImpl.getCleanerImpl(this)` -> reads the null `impl` field
+        // and NPEs ("Cannot read field \"queue\" because the return value of
+        // ... getCleanerImpl(...) is null"), first seen booting a WildFly
+        // Host Controller (`ServiceContainer$Factory.create()` calls
+        // `Cleaner.create()` then `.register(...)`). Same half-real-object
+        // bug class as the ThreadPoolExecutor/Executors-factory NPEs above --
+        // drop the synthetic surface entirely so real bytecode constructs and
+        // wires up the Cleaner end-to-end (matches this file's own stated
+        // intent, just enforced from the registration side since dispatch
+        // does not enforce it uniformly for static factory methods).
+        if self.drop_real_layout_synthetic
+            && matches!(
+                class_name,
+                "java/lang/ref/Cleaner" | "java/lang/ref/Cleaner$Cleanable"
+            )
+        {
+            return;
+        }
         // NOTE: real-JDK mode used to drop EVERY native registered directly on
         // `java/util/concurrent/ThreadPoolExecutor` here (submit/execute/
         // shutdown included), on the theory that only genuinely-real
