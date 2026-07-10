@@ -135,6 +135,40 @@ pub fn pinned_addrs() -> Vec<usize> {
     table().lock().keys().copied().collect()
 }
 
+/// Re-key pins whose object a moving collection relocated (INT-10 pairing
+/// for the [`pinned_addrs`] root splice). The pin table is keyed by object
+/// base address; after a move, the matching `Release`-side `unpin` (which
+/// looks the object up by its CURRENT base) and any `is_pinned` query must
+/// find the entry under the NEW address. Refcounts are merged if both old
+/// and new keys exist (defensive — cannot happen for a bijective map).
+pub fn update_after_gc(pointer_map: &HashMap<usize, usize>) {
+    if PINNED_COUNT.load(Ordering::Relaxed) == 0 || pointer_map.is_empty() {
+        return;
+    }
+    let mut t = table().lock();
+    // Collect first: mutating while iterating is UB-adjacent for HashMap.
+    let moved: Vec<(usize, usize, usize)> = t
+        .iter()
+        .filter_map(|(&old, &count)| {
+            pointer_map
+                .get(&old)
+                .filter(|&&new| new != old)
+                .map(|&new| (old, new, count))
+        })
+        .collect();
+    for (old, new, count) in moved {
+        t.remove(&old);
+        let entry = t.entry(new).or_insert(0);
+        if *entry == 0 && count > 0 {
+            // net distinct-count unchanged: one removed, one added
+        } else if count > 0 {
+            // merged into an existing key — one distinct member fewer
+            PINNED_COUNT.fetch_sub(1, Ordering::Relaxed);
+        }
+        *entry += count;
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

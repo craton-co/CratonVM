@@ -869,6 +869,34 @@ impl ReferenceProcessor {
             .collect()
     }
 
+    /// Mark the finalizer entries whose CURRENT referent address appears in
+    /// `referents` as enqueued.
+    ///
+    /// Called by the VM after the GC's resurrection channel
+    /// (`collect_garbage_with_finalizers`) reports which finalizables were
+    /// dead-but-resurrected: without this flag, a resurrected object looks
+    /// ALIVE to the next collection's `is_marked` (it is in the pointer map),
+    /// so `process_final_refs` never claims it and
+    /// `finalizer_referent_addresses` keeps re-returning it — the GC then
+    /// resurrects and re-enqueues it EVERY cycle and `finalize()` runs
+    /// repeatedly (observed 3× per object) instead of exactly once.
+    ///
+    /// Must be called AFTER `update_after_gc` for the same collection, so
+    /// entry referents already hold the post-GC addresses the resurrection
+    /// channel reports.
+    pub fn mark_finalizer_enqueued(&mut self, referents: &[usize]) {
+        if referents.is_empty() {
+            return;
+        }
+        let set: HashSet<usize> = referents.iter().copied().collect();
+        for e in &mut self.finalizer_refs {
+            if !e.enqueued && set.contains(&e.referent) {
+                e.enqueued = true;
+                self.stats.finalizer_refs_enqueued += 1;
+            }
+        }
+    }
+
     // -- Stats & config -----------------------------------------------------
 
     pub fn stats(&self) -> &ReferenceProcessingStats {
