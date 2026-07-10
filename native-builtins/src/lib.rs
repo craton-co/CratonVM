@@ -45911,9 +45911,16 @@ fn native_module_descriptor_packages(
 }
 
 fn native_module_descriptor_is_automatic(
-    _ctx: &mut dyn NativeContext,
-    _args: &[Value],
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
 ) -> MethodCallResult {
+    let this = match args.first().copied() {
+        Some(Value::Object(Some(o))) => o,
+        _ => return Ok(Some(Value::Int(0))),
+    };
+    if let Value::Int(v) = ctx.get_field_by_name(this, "automatic") {
+        return Ok(Some(Value::Int(if v != 0 { 1 } else { 0 })));
+    }
     Ok(Some(Value::Int(0)))
 }
 
@@ -45935,11 +45942,45 @@ fn native_module_descriptor_is_open(
     Ok(Some(Value::Int(flags & 1)))
 }
 
-fn native_module_descriptor_optional_empty(
+fn native_module_descriptor_optional_field(
     ctx: &mut dyn NativeContext,
-    _args: &[Value],
+    args: &[Value],
+    field: &str,
 ) -> MethodCallResult {
-    ctx.invoke("java/util/Optional", "empty", "()Ljava/util/Optional;", &[])
+    let value = match args.first().copied() {
+        Some(Value::Object(Some(this))) => ctx.get_field_by_name(this, field),
+        _ => Value::Object(None),
+    };
+    match value {
+        Value::Object(Some(o)) => ctx.invoke(
+            "java/util/Optional",
+            "of",
+            "(Ljava/lang/Object;)Ljava/util/Optional;",
+            &[Value::Object(Some(o))],
+        ),
+        _ => ctx.invoke("java/util/Optional", "empty", "()Ljava/util/Optional;", &[]),
+    }
+}
+
+fn native_module_descriptor_version(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    native_module_descriptor_optional_field(ctx, args, "version")
+}
+
+fn native_module_descriptor_raw_version(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    native_module_descriptor_optional_field(ctx, args, "rawVersionString")
+}
+
+fn native_module_descriptor_main_class(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    native_module_descriptor_optional_field(ctx, args, "mainClass")
 }
 
 fn native_module_builder_new_exports_qualified(
@@ -46153,6 +46194,10 @@ fn native_module_builder_build(ctx: &mut dyn NativeContext, args: &[Value]) -> M
         for f in [
             "name",
             "version",
+            "rawVersionString",
+            "modifiers",
+            "open",
+            "automatic",
             "requires",
             "exports",
             "opens",
@@ -46631,14 +46676,24 @@ fn register_module_builder_overrides(registry: &mut NativeMethodRegistry) {
         "()Z",
         native_module_descriptor_is_open,
     );
-    for method in ["version", "rawVersion", "mainClass"] {
-        registry.register(
-            "java/lang/module/ModuleDescriptor",
-            method,
-            "()Ljava/util/Optional;",
-            native_module_descriptor_optional_empty,
-        );
-    }
+    registry.register(
+        "java/lang/module/ModuleDescriptor",
+        "version",
+        "()Ljava/util/Optional;",
+        native_module_descriptor_version,
+    );
+    registry.register(
+        "java/lang/module/ModuleDescriptor",
+        "rawVersion",
+        "()Ljava/util/Optional;",
+        native_module_descriptor_raw_version,
+    );
+    registry.register(
+        "java/lang/module/ModuleDescriptor",
+        "mainClass",
+        "()Ljava/util/Optional;",
+        native_module_descriptor_main_class,
+    );
     registry.set_category(__prev_cat);
 }
 
