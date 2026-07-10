@@ -260,11 +260,44 @@ pub(crate) fn write_throwable_cause(ctx: &mut dyn NativeContext, this: ObjectRef
             other => format!("{other:?}"),
         };
         eprintln!(
-            "CAUSE_DBG_WRITE this={this_cls} hash={} cause={cause_desc}",
-            ctx.identity_hash_code(this)
+            "CAUSE_DBG_WRITE this={this_cls} hash={} ptr={:?} cause={cause_desc}",
+            ctx.identity_hash_code(this),
+            this.as_ptr()
         );
     }
     write_throwable_field_cached(ctx, &THROWABLE_CAUSE_INDEX, "cause", this, cause);
+
+    // ES-FAIL-FAMILY-20260710 hunt: arm a dynamic write-watchpoint (see
+    // `NativeContext::dbg_set_watch_cell`) on the cause slot right after
+    // writing the self-referential "uninitialized" sentinel into it, for
+    // the next constructed instance of a specific class (set via
+    // `CRATONVM_DBG_WATCH_CAUSE_SELF=<slash-separated class name>`) — to
+    // catch, with a full Rust backtrace, whatever later overwrites that
+    // exact memory slot with something else. Re-arms on every matching
+    // construction (last one wins), since we don't know in advance which
+    // instance will end up being the one that's actually printed/observed.
+    if let Value::Object(Some(c)) = cause {
+        if c == this {
+            if let Ok(watch_cls) = std::env::var("CRATONVM_DBG_WATCH_CAUSE_SELF") {
+                let this_cls = ctx
+                    .class_name_of_id(ctx.class_id_of_object(this))
+                    .unwrap_or_default();
+                if this_cls == watch_cls {
+                    let idx = THROWABLE_CAUSE_INDEX.load(Ordering::Relaxed);
+                    if idx != UNRESOLVED_FIELD_INDEX {
+                        let addr = this.as_ptr() as usize
+                            + cratonvm_types::HEADER_SIZE
+                            + idx * cratonvm_types::SLOT_SIZE;
+                        eprintln!(
+                            "CAUSE_DBG_ARM watch={addr:#x} for {this_cls} hash={}",
+                            ctx.identity_hash_code(this)
+                        );
+                        ctx.dbg_set_watch_cell(addr);
+                    }
+                }
+            }
+        }
+    }
 }
 
 /// Capture the current call stack for a freshly-constructed throwable.
@@ -1011,9 +1044,11 @@ fn throwable_cause(ctx: &mut dyn NativeContext, t: ObjectRef) -> Option<ObjectRe
                 .class_name_of_id(ctx.class_id_of_object(c))
                 .unwrap_or_default();
             eprintln!(
-                "CAUSE_DBG_READ this={t_cls} hash={} cause={c_cls} cause_hash={}",
+                "CAUSE_DBG_READ this={t_cls} hash={} ptr={:?} cause={c_cls} cause_hash={} cause_ptr={:?}",
                 ctx.identity_hash_code(t),
-                ctx.identity_hash_code(c)
+                t.as_ptr(),
+                ctx.identity_hash_code(c),
+                c.as_ptr()
             );
         }
         return Some(c);
@@ -1204,39 +1239,26 @@ fn print_throwable_chain_to_stream_obj(
     ctx.unpin_native_roots(pin);
 }
 
-/// Resolve the `Throwable.SUPPRESSED_SENTINEL` static (the immutable "no
-/// suppressed exceptions yet, but suppression is enabled" marker list).
-/// `None` before `Throwable.<clinit>` has run.
-fn throwable_suppressed_sentinel(ctx: &dyn NativeContext) -> Option<ObjectRef> {
-    let cid = ctx.class_id_by_name("java/lang/Throwable")?;
-    let idx = ctx.static_field_index_by_name(cid, "SUPPRESSED_SENTINEL")?;
-    match ctx.get_static_field(cid, idx) {
-        Value::Object(Some(o)) => Some(o),
-        _ => None,
-    }
-}
-
-/// addSuppressed(Throwable) — mirror the real-JDK semantics on the NAMED
-/// `suppressedExceptions` field.
+/// addSuppressed(Throwable) — append to the `suppressedExceptions` list.
 ///
-/// The previous implementation appended a ref-array into POSITIONAL field 2.
-/// That slot only matched an old 3-field synthetic throwable layout; on the
-/// real-JDK `Throwable` layout (`backtrace`(0), `detailMessage`(1),
-/// `cause`(2), ...) field 2 is `cause`, so every `addSuppressed` call
-/// OVERWROTE THE CAUSE with an `Object[]`. Lucene's
-/// `CodecUtil.checkFooter(in, priorException)` calls
-/// `priorException.addSuppressed(t)` before rethrowing, so every JUnit
-/// failure trace through that path printed the corrupted chain as
-/// `Caused by: java.lang.Object` (and walking the array-as-Throwable tripped
-/// the gen_heap corrupt-Value-cell guard). This is also why the
-/// `CRATONVM_DBG_CAUSE` instrumentation above never saw a WRITE for the
-/// mystery cause value: the clobber bypassed `write_throwable_cause`
-/// entirely. Doc: ES-FAIL-FAMILY-20260710-vector-codec-exception-cause-object.
+/// ES-FAIL-FAMILY-20260710: this used to hardcode field **index 2** for
+/// "suppressed storage". Index 2 is `cause` in the real-JDK Throwable
+/// layout used consistently everywhere else in this file (`backtrace`=0,
+/// `detailMessage`=1, `cause`=2, `stackTrace`=3, `suppressedExceptions`=4 —
+/// see `write_throwable_cause`'s own doc comment). Every real `addSuppressed`
+/// call therefore silently clobbered the receiver's `cause` field with a
+/// freshly-allocated 1-element `Object[]` array instead of touching
+/// `suppressedExceptions` — surfacing later as a corrupted `Caused by:` line
+/// in `printStackTrace` (root-caused via a hardware watchpoint catching the
+/// exact `set_field(this, 2, …)` write; see the known-issues doc). Fixed by
+/// resolving `suppressedExceptions` **by name** instead of a hardcoded
+/// index, matching the pattern `init_suppressed_sentinel` already used
+/// correctly for the same field.
 pub(crate) fn native_throwable_add_suppressed(
     ctx: &mut dyn NativeContext,
     args: &[Value],
 ) -> MethodCallResult {
-    use cratonvm_types::ObjectKind;
+    use cratonvm_types::ClassId;
     let this = match args.first() {
         Some(Value::Object(Some(r))) => *r,
         _ => return Ok(None),
@@ -1249,96 +1271,55 @@ pub(crate) fn native_throwable_add_suppressed(
     if this == suppressed {
         return Ok(None);
     }
-    let sentinel = throwable_suppressed_sentinel(ctx);
-    let current = ctx.get_field_by_name(this, "suppressedExceptions");
-    match current {
-        // A live list that is NOT the shared sentinel: append via List.add,
-        // exactly like the real `Throwable.addSuppressed` bytecode. (A
-        // ref-array here would be a leftover from the old positional
-        // representation; treat it below like "no list yet" rather than
-        // calling List methods on it.)
-        Value::Object(Some(list))
-            if Some(list) != sentinel && ctx.heap_kind_of(list) != ObjectKind::Array =>
-        {
-            let _ = ctx.invoke_virtual(
-                list,
-                "add",
-                "(Ljava/lang/Object;)Z",
-                &[Value::Object(Some(suppressed))],
-            );
-        }
-        // Sentinel / unset / legacy array: swap in a fresh ArrayList holding
-        // the element (JDK: `suppressedExceptions = new ArrayList<>(1);
-        // suppressedExceptions.add(exception);`). The JDK treats a null list
-        // as "suppression disabled", but our shadowed constructors can leave
-        // the field unset on bootstrap-era throwables, so be lenient and
-        // enable suppression instead of dropping the exception.
-        _ => {
-            // The ArrayList allocation + add can GC; pin the throwable and
-            // the suppressed exception across them.
-            let pin = ctx.pin_native_root(this);
-            let suppressed_pin = ctx.pin_native_root(suppressed);
-            if let Ok(Some(Value::Object(Some(list)))) =
-                ctx.new_object_initialized("java/util/ArrayList", "()V", &[])
-            {
-                let suppressed = ctx.read_native_pin(suppressed_pin, suppressed);
-                let list_pin = ctx.pin_native_root(list);
-                let _ = ctx.invoke_virtual(
-                    list,
-                    "add",
-                    "(Ljava/lang/Object;)Z",
-                    &[Value::Object(Some(suppressed))],
-                );
-                let list = ctx.read_native_pin(list_pin, list);
-                let this = ctx.read_native_pin(pin, this);
-                ctx.set_field_by_name(this, "suppressedExceptions", Value::Object(Some(list)));
+    // Get existing suppressed array (or the SUPPRESSED_SENTINEL / null).
+    let existing = ctx.get_field_by_name(this, "suppressedExceptions");
+    match existing {
+        Value::Object(Some(arr)) if ctx.heap_kind_of(arr) == cratonvm_types::ObjectKind::Array => {
+            // Grow the array: copy old elements + append new one
+            let old_len = ctx.array_length(arr);
+            let new_arr = ctx.new_ref_array(ClassId::new(0), old_len + 1);
+            for i in 0..old_len {
+                let elem = ctx.get_array_element(arr, i);
+                ctx.set_array_element(new_arr, i, elem);
             }
-            ctx.unpin_native_roots(pin);
+            ctx.set_array_element(new_arr, old_len, Value::Object(Some(suppressed)));
+            ctx.set_field_by_name(this, "suppressedExceptions", Value::Object(Some(new_arr)));
+        }
+        _ => {
+            // No existing array (null, or still the SUPPRESSED_SENTINEL list)
+            // — create one with a single element.
+            let new_arr = ctx.new_ref_array(ClassId::new(0), 1);
+            ctx.set_array_element(new_arr, 0, Value::Object(Some(suppressed)));
+            ctx.set_field_by_name(this, "suppressedExceptions", Value::Object(Some(new_arr)));
         }
     }
     Ok(None)
 }
 
-/// getSuppressed() — return `Throwable[]` from the named
-/// `suppressedExceptions` list, mirroring the real-JDK accessor (sentinel or
-/// null/unset → empty array). See `native_throwable_add_suppressed` for why
-/// the old positional-field-2 representation was wrong.
+/// getSuppressed() — return Throwable[] from `suppressedExceptions`, or an
+/// empty array if none were added. See `native_throwable_add_suppressed`'s
+/// doc comment for why this reads by field NAME rather than a hardcoded
+/// index.
 pub(crate) fn native_throwable_get_suppressed(
     ctx: &mut dyn NativeContext,
     args: &[Value],
 ) -> MethodCallResult {
-    use cratonvm_types::{ClassId, ObjectKind};
-    let elem_cid = ctx
-        .class_id_by_name("java/lang/Throwable")
-        .unwrap_or(ClassId::new(0));
+    use cratonvm_types::ClassId;
     let this = match args.first() {
         Some(Value::Object(Some(r))) => *r,
         _ => {
-            let arr = ctx.new_ref_array(elem_cid, 0);
+            let arr = ctx.new_ref_array(ClassId::new(0), 0);
             return Ok(Some(Value::Object(Some(arr))));
         }
     };
-    let sentinel = throwable_suppressed_sentinel(ctx);
-    match ctx.get_field_by_name(this, "suppressedExceptions") {
-        Value::Object(Some(o)) if Some(o) == sentinel => {}
-        // Leftover from the old positional ref-array representation — return
-        // it verbatim (it already is a reference array of throwables).
-        Value::Object(Some(o)) if ctx.heap_kind_of(o) == ObjectKind::Array => {
-            return Ok(Some(Value::Object(Some(o))));
+    if let Value::Object(Some(arr)) = ctx.get_field_by_name(this, "suppressedExceptions") {
+        if ctx.heap_kind_of(arr) == cratonvm_types::ObjectKind::Array {
+            return Ok(Some(Value::Object(Some(arr))));
         }
-        Value::Object(Some(list)) => {
-            // Real java.util.List — copy out via toArray(), like the JDK's
-            // `suppressedExceptions.toArray(EMPTY_THROWABLE_ARRAY)`.
-            if let Ok(Some(v @ Value::Object(Some(_)))) =
-                ctx.invoke_virtual(list, "toArray", "()[Ljava/lang/Object;", &[])
-            {
-                return Ok(Some(v));
-            }
-        }
-        _ => {}
     }
-    // No suppressed exceptions stored — return empty array
-    let arr = ctx.new_ref_array(elem_cid, 0);
+    // No suppressed exceptions stored (null, or still SUPPRESSED_SENTINEL) —
+    // return an empty array.
+    let arr = ctx.new_ref_array(ClassId::new(0), 0);
     Ok(Some(Value::Object(Some(arr))))
 }
 

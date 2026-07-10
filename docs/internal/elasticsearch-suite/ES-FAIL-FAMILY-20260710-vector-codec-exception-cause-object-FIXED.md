@@ -61,10 +61,16 @@ suppressed-array write bypassing `write_throwable_cause` entirely — plain
 deterministic slot aliasing, no GC involvement (consistent with the failure
 being deterministic in 3s runs).
 
-Fixed by rewriting `addSuppressed`/`getSuppressed` to real-JDK semantics on
-the NAMED `suppressedExceptions` field (SUPPRESSED_SENTINEL swap to a real
-`java.util.ArrayList`, `List.add`, `toArray()` on read), with the legacy
-ref-array representation still honored if encountered.
+Fixed on dev by the concurrent session's `8a4064f8` ("fix:
+Throwable.addSuppressed() clobbered cause via wrong field index" — resolves
+`suppressedExceptions` by NAME, keeps the ref-array representation; found
+independently via a hardware data-write breakpoint on the victim's cause
+slot, see
+`docs/internal/fixed-suite-bugs/throwable-addsuppressed-clobbers-cause-FIXED.md`).
+This session root-caused the same bug from the slot-aliasing side and
+carried an equivalent rewrite (real-JDK `List` semantics on the named
+field); the landed name-based fix was kept in the merge, the duplicate
+rewrite dropped.
 
 ### 3. (unmasked by #1) `order(LITTLE_ENDIAN)` ignored on real-JDK buffers — byteswapped `getShort`/`getInt`/`getLong`
 

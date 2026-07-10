@@ -58,6 +58,39 @@ pub static SAVEBASE_WATCH_CAUGHT: AtomicBool = AtomicBool::new(false);
 // Count of -2 writes the watchpoint VEH has observed (caps log spam).
 pub static SAVEBASE_WATCH_HITS: std::sync::atomic::AtomicUsize =
     std::sync::atomic::AtomicUsize::new(0);
+/// ES-FAIL-FAMILY-20260710 hunt: generalization of the spring-bug-10
+/// hardware watchpoint (see `jit::helpers::savebase_watcher`, reused
+/// as-is via `arm_generic_heap_watch` below) for "report the writer of
+/// ANY value at this address" instead of savebase's specific `-2`
+/// sentinel match. Shares the watcher-thread's arm/disarm signaling
+/// (`SAVEBASE_WATCH_CAUGHT`) since only one hardware watch is ever
+/// active at a time in practice. When set, the VEH's DR0 branch reports
+/// + disarms on the FIRST write to the watched address, regardless of
+/// the value written.
+pub static GENERIC_HEAP_WATCH_MODE: AtomicBool = AtomicBool::new(false);
+
+/// Arm a hardware data-write breakpoint on `addr` (8 bytes) for the
+/// CURRENT thread via the existing spring-bug-10 watcher-thread
+/// infrastructure, but in "generic" mode: the VEH reports the RIP of
+/// whatever instruction writes there NEXT, for any value — not just
+/// savebase's `-2` sentinel. One-shot: disarms itself after the first
+/// report (shared `SAVEBASE_WATCH_CAUGHT` latch).
+#[cfg(windows)]
+pub fn arm_generic_heap_watch(addr: usize) {
+    GENERIC_HEAP_WATCH_MODE.store(true, Ordering::SeqCst);
+    SAVEBASE_WATCH_CAUGHT.store(false, Ordering::SeqCst);
+    // SAFETY: `publish` only suspends/resumes/SetThreadContext's a
+    // duplicated handle to the CURRENT thread (see its own SAFETY
+    // comment); calling it here from a normal native-call context is
+    // exactly the same calling convention as its JIT-prologue caller.
+    unsafe {
+        crate::jit::helpers::savebase_watcher::publish(addr);
+    }
+}
+
+#[cfg(not(windows))]
+pub fn arm_generic_heap_watch(_addr: usize) {}
+
 /// True once the savebase-watchpoint VEH has reported the -2 writer.
 pub fn savebase_watch_caught() -> bool {
     SAVEBASE_WATCH_CAUGHT.load(Ordering::Relaxed)
@@ -580,6 +613,31 @@ mod windows_fault {
             }
             let dr0 = core::ptr::read_unaligned(ctx.add(0x48) as *const u64);
             let rip = core::ptr::read_unaligned(ctx.add(0xF8) as *const u64);
+            // ES-FAIL-FAMILY-20260710 hunt: generic mode reports the writer of
+            // ANY value at the watched address (armed via
+            // `arm_generic_heap_watch`), unlike savebase's `-2`-specific match
+            // below. HEAP address, not a stack slot, so there's no
+            // "cross-frame" stack-reuse distinction to make — report and
+            // disarm on the very first hit.
+            if dr0 != 0
+                && crate::runtime::crash_handler::GENERIC_HEAP_WATCH_MODE.load(Ordering::Relaxed)
+                && !crate::runtime::crash_handler::SAVEBASE_WATCH_CAUGHT.swap(true, Ordering::SeqCst)
+            {
+                let val = core::ptr::read_unaligned(dr0 as *const u64);
+                let mb = GetModuleHandleW(core::ptr::null()) as u64;
+                let jit = cratonvm_jit::lookup_jit_method_name(rip as usize)
+                    .unwrap_or_else(|| "<none>".to_string());
+                let rva = if rip >= mb { rip - mb } else { 0 };
+                let wrsp = core::ptr::read_unaligned(ctx.add(0x98) as *const u64);
+                let wrbp = core::ptr::read_unaligned(ctx.add(0xA0) as *const u64);
+                eprintln!(
+                    "[HEAPWATCH] write @0x{dr0:016X} val=0x{val:016X} RIP=0x{rip:016X} (exe+0x{rva:X}) jit={jit} wrsp=0x{wrsp:016X} wrbp=0x{wrbp:016X}\n{}",
+                    std::backtrace::Backtrace::force_capture(),
+                );
+                core::ptr::write_unaligned(ctx.add(0x70) as *mut u64, 0); // disarm DR7
+                core::ptr::write_unaligned(ctx.add(0x68) as *mut u64, 0); // clear DR6 (ack)
+                return EXCEPTION_CONTINUE_EXECUTION;
+            }
             if dr0 != 0 {
                 let val = core::ptr::read_unaligned(dr0 as *const u64);
                 if val == 0xFFFF_FFFF_FFFF_FFFE {
