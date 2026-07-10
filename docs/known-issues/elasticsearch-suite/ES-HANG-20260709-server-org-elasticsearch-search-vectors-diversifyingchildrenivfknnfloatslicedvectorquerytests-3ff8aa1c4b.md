@@ -42,3 +42,142 @@ Extracted stderr signals:
 Current classification:
 - 600 second class watchdog timeout in the completed four-shard collection run.
 - Treat as an open hang until reproduced or disproved on current `dev`.
+
+
+---
+
+## 2026-07-10 investigation (fix/es-vectors-ivfknn-hang-20260710)
+
+**Status: OPEN** (unchanged) — the underlying interpreter-level deadlock this
+doc describes is real and NOT fixed. What changed: a JIT regression that had
+started masking the hang behind a much-faster SIGSEGV is now fixed, so the
+suite runner will show the original 600s HANG again (not a crash) until the
+deadlock itself is root-caused.
+
+### Regression found and fixed: guarded-inline-getfield SIGSEGV
+
+Reproducing on current `dev` (tip `f4ee4065` at investigation time, worktree
+`/data/data/wt-es-vectors-ivfknn-hang-20260710`, binary
+`cratonvm-es-vectors-ivfknn-hang-20260710`) with the doc's own repro command
+(`-Dtests.method=testSlicesDense`, same seed) no longer hangs for 600s under
+JIT — it **SIGSEGVs almost immediately** (~1-2s in):
+
+```
+dmesg: SUITE-Diversify[97470]: segfault at 4c ip 0000760e80332071 sp ... error 4
+```
+
+gdb (`handle SIGUSR1/SIGUSR2 nostop noprint pass` first, per
+[[reference_linux_gdb_signal_passthrough]]) shows the fault inside JIT-compiled
+code, an array bounds-check/load sequence (`mov 0xc(%rax),%r10d` = array
+length read) with `rax=0x40` — a small int-shaped value, not a real object
+pointer, being dereferenced as one; `0x40 + 0xc = 0x4c` matches the dmesg
+fault address exactly. The corrupted value traces back to a local variable
+slot fed by a preceding `getfield`.
+
+**Bisection:**
+- `CRATONVM_JIT_GETFIELD_HELPER=1` (forces the checked-helper-only getfield
+  path) makes the SIGSEGV disappear — the run reverts to the ORIGINAL
+  interpreter hang this doc describes (confirms the SIGSEGV is a NEW
+  regression sitting on top of the pre-existing hang, not a different bug).
+- `CRATONVM_OSR_NEWARRAY=0` (the sibling `perf/throughput-20260710` change)
+  does NOT avoid the crash — rules out OSR-newarray re-enable as the cause.
+- Root cause isolated to commit `07dfa5e0` ("Guard inline JIT getfield with
+  heap-region bounds check (default on)", merged to dev via `756c4b84`,
+  see [[project_perf_throughput_20260710]]). Static review of the guard's
+  region-containment codegen and the per-object `GC_FLAG_COMPACT` routing did
+  not surface a specific wrong-instruction bug with full confidence — this is
+  hot JIT x64 codegen and a wrong guess risks a worse regression, so rather
+  than patch the codegen blind, `guarded_inline_getfield_enabled()`
+  (`jit/src/x64.rs`) was flipped from default-ON to opt-in
+  (`CRATONVM_JIT_GUARDED_GETFIELD=1`), matching this codebase's own established
+  pattern for an unproven fast path. This is a real, measurable performance
+  give-back (bt18 was 7080ms/8.2x with the guard on, vs ~13s helper-only per
+  the original commit's own A/B) until someone re-derives the exact
+  corrupting instruction and re-enables it default-on.
+- Fixed on branch `fix/es-vectors-ivfknn-hang-20260710`, JIT test suite
+  (970 tests: 888 lib + 82 `ir_vs_singlepass` differential) green after the
+  flip (one new test and one whole differential-test file —
+  `ir_vs_singlepass.rs`, purpose-built around the guarded-inline path — needed
+  updating to explicitly opt in via the same env var, since they'd relied on
+  the old default-on behavior).
+
+### Underlying interpreter hang — now characterized in detail, still OPEN
+
+Reproduced directly (bypassing the suite runner) with
+`CRATONVM_JIT_GETFIELD_HELPER=1` (or `--nojit`) and
+`--stack-dump-on-timeout=90`. The process genuinely spins (82-112% CPU, not
+blocked/idle) with **zero forward progress** across repeated watchdog dumps
+during Lucene's `IndexWriter` flush/merge machinery for `testSlicesDense`.
+Exact contention point **varies run to run** (seed is fixed but real-thread
+scheduling isn't) — seen stuck in, across different runs:
+- `org/apache/lucene/util/FileDeleter.decRef`/`getRefCountInternal`
+  (confirmed via `javap` these are NOT `synchronized` in Lucene 10.4's
+  `FileDeleter`, so this is not a lock — the interpreter frame table's `pc`
+  simply stops advancing here across the 3s grace period)
+- `IndexFileDeleter.logInfo` (also not synchronized)
+- A live `Lucene Merge Thread` blocked entering
+  `MockDirectoryWrapper.maybeThrowDeterministicException()` — confirmed
+  `synchronized` via `javap` on the real `lucene-test-framework` jar — while
+  another `Lucene Merge Thread` (`IndexWriter.mergeMiddle`) sits in a
+  legitimate `Object.wait()` (wait-site frame captured via
+  `CRATONVM_DBG_MONENTER=1`)
+
+A live gdb attach (`gdb -p <pid>`, no signal needed since it's spinning, not
+crashed) during one run caught a genuine two-thread situation: the worker
+thread and a `Lucene Merge Thread` each blocked in
+`vm/src/threading/monitor.rs::Monitor::enter` (`monitor_enter_synchronized_method`,
+`vm/src/vm/vm_exec.rs:1104`) at the same moment, on different Lucene
+`synchronized` methods.
+
+**Ruled out:**
+- `Monitor::enter`/`wait`/`notify` (`vm/src/threading/monitor.rs`) were
+  read in full — the reentrant-owner fast path and the wait/notify condvar
+  loops are already hardened with explicit "LOST-WAKEUP FIX" handling for the
+  interrupt-races-notify case. No obvious bug found by inspection.
+- A GC/monitor-registry desync matching the historical
+  [[reference_bugv_nonmoving_sweep_monitor_remap]] (BUG-V) shape was
+  considered (this workload allocates heavily) — a differential test with
+  `--Xmx 8g` (much less GC pressure) still hung, weakening but not
+  conclusively ruling this out (8g can still GC under this workload's
+  allocation volume).
+- The `gen_heap.rs`/`g1.rs` OOB-field-read WARN bursts this doc originally
+  flagged (`class_id=ClassId(0) num_slots=0 java/lang/Object`) fire in a tight
+  ~1.6ms burst and then stop — they are NOT the hang itself (the thread keeps
+  running for tens of seconds afterward before getting stuck elsewhere); per
+  the guard's own log message these are believed-benign speculative
+  collection-layout probes, not corruption.
+
+**Not yet found:** the actual mechanism that leaves a thread spinning forever
+with no forward progress. Given the contention point moves between runs, this
+smells like a genuine timing-dependent VM-core bug (lock-order or a
+notify/wakeup gap under specific interleavings) rather than one fixed bad
+instruction — needs dedicated concurrency-debugging time, ideally with
+`RUST_BACKTRACE`+`CARGO_PROFILE_RELEASE_DEBUG=2` symbols and a tighter, more
+deterministic repro (e.g. forcing single-threaded merging) than this full ES
+suite test.
+
+**Repro recipe** (direct invocation, bypasses the suite runner's own
+possibly-broken jstack — see below):
+```bash
+ES=/data/data/cratonvm-worktrees/20260708-191002-es-nonpassed-rerun/apps/elasticsearch
+CP=$(tr -d '\r' < "$ES/server/build/craton-testcp.txt" | tr '\n' ':' | sed 's/:$//')
+CRATONVM_ENABLE_NATIVE_RING=1 CRATONVM_DBG_MONENTER=1 "$EXE" \
+  --java-home /home/victor/jdk25 --stack-dump-on-timeout 90 --Xmx 2g \
+  -Dtests.seed=B17AC9D3E1F2A0C4 -Des.path.home="$ES" -Djava.awt.headless=true \
+  -Dtests.method=testSlicesDense \
+  <standard ES test JVM args - see run-elasticsearch-suite.ps1 Get-EsJavaArgs> \
+  -cp "$CP" org.junit.runner.JUnitCore \
+  org.elasticsearch.search.vectors.DiversifyingChildrenIVFKnnFloatSlicedVectorQueryTests
+```
+Note: `apps/elasticsearch-suite-runner/run-elasticsearch-suite.ps1`'s own
+`craton-testcp.txt` classpath files have **CRLF line endings** — a naive
+`tr '\n' ':'` leaves a trailing `\r` on every path component and breaks
+classloading (`Could not find or load main class org.junit.runner.JUnitCore`)
+before you even get to the hang; strip with `tr -d '\r'` first.
+
+Also: the suite runner's own `"==== jstack at approximately timeout time ===="`
+section (visible in this doc's original evidence) is **empty** — no thread
+dump content follows it, on this build. Use CratonVM's own
+`--stack-dump-on-timeout=N` watchdog (dumps real interpreter frame chains +
+a thread summary) instead of relying on that marker for future repros of this
+cluster.

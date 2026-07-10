@@ -36,3 +36,34 @@ Extracted stderr signals:
 Current classification:
 - 600 second class watchdog timeout in the completed four-shard collection run.
 - Treat as an open hang until reproduced or disproved on current `dev`.
+
+
+---
+
+## 2026-07-10 investigation (fix/es-vectors-ivfknn-hang-20260710)
+
+**Status: OPEN** (unchanged) — same underlying interpreter-level deadlock
+family as
+[the DiversifyingChildrenIVFKnnFloatSlicedVectorQueryTests doc](ES-HANG-20260709-server-org-elasticsearch-search-vectors-diversifyingchildrenivfknnfloatslicedvectorquerytests-3ff8aa1c4b.md)
+(same class of Lucene `IndexWriter`/`MockDirectoryWrapper` `synchronized`-method
+contention during a flush/merge, seen across both test classes) — see that
+doc for the full investigation writeup, thread-dump evidence, and repro
+recipe. Summary for this class specifically:
+
+- A NEW JIT regression (guarded-inline-getfield SIGSEGV, root-caused to
+  commit `07dfa5e0`) had started masking this hang behind a much faster
+  crash. Fixed on branch `fix/es-vectors-ivfknn-hang-20260710` by flipping
+  `guarded_inline_getfield_enabled()` (`jit/src/x64.rs`) from default-ON to
+  opt-in (`CRATONVM_JIT_GUARDED_GETFIELD=1`) — the exact corrupting
+  instruction was not pinned down with full confidence via static review, so
+  rather than patch hot JIT codegen on a guess, the unproven fast path was
+  made opt-in again, matching this codebase's own established pattern.
+- The underlying interpreter hang itself (this doc's original subject,
+  `IVFKnnFloatVectorQueryTests.testRandomWithFilter`) is a genuine spinning
+  deadlock (82-112% CPU, zero forward progress) in Lucene's IndexWriter
+  flush/merge synchronization, NOT fixed — needs dedicated concurrency
+  debugging time. This class's suite run also showed 3 separate test
+  failures earlier in the same class (`testScoreEuclidean`, `testScoreCosine`,
+  `testSkewedIndex` — each produced a `NOTE: reproduce with` line before the
+  timeout) that were not investigated in this session; only the hang
+  (`testRandomWithFilter`) was in scope.
