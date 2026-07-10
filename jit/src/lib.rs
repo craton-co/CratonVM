@@ -1133,6 +1133,11 @@ pub struct CompiledMethod {
     /// Normal entry initializes this in the prologue; OSR entry initializes it
     /// in the trampoline because it jumps past that prologue. 0 when unused.
     pub jit_thread_slot_off: i32,
+    /// Frame slot of the prologue-cached native-stack floor for the inline
+    /// self-call check. OSR trampolines initialise it to `usize::MAX`
+    /// (`RSP > MAX` is unsatisfiable) so OSR-entered frames always take the
+    /// out-of-line guard helper. `0` = not reserved.
+    pub stack_floor_slot_off: i32,
     /// OSR metadata: optional `jit_frame_record` helper pointer. Normal method
     /// entry records exact RBP from the JIT prologue; OSR bypasses that
     /// prologue, so the trampoline records its own RBP after `mov rbp, rsp`.
@@ -1433,6 +1438,7 @@ impl CompiledMethod {
             osr_xmm_saved_base: 0,
             osr_heap_local_offset: 0,
             jit_thread_slot_off: 0,
+            stack_floor_slot_off: 0,
             osr_frame_record: 0,
             shadow_thread_slot_off: 0,
             shadow_savetop_slot_off: 0,
@@ -1492,6 +1498,7 @@ impl CompiledMethod {
             osr_xmm_saved_base: 0,
             osr_heap_local_offset: 0,
             jit_thread_slot_off: 0,
+            stack_floor_slot_off: 0,
             osr_frame_record: 0,
             shadow_thread_slot_off: 0,
             shadow_savetop_slot_off: 0,
@@ -1893,6 +1900,7 @@ impl CompiledMethod {
             self.osr_xmm_saved_base,
             self.osr_heap_local_offset,
             self.jit_thread_slot_off,
+            self.stack_floor_slot_off,
             self.osr_frame_record,
             self.needs_context,
             dead_mask,
@@ -1954,6 +1962,7 @@ unsafe fn emit_osr_trampoline(
     xmm_saved_base: i32,
     heap_local_offset: i32,
     jit_thread_slot_off: i32,
+    stack_floor_slot_off: i32,
     frame_record: usize,
     needs_context: bool,
     dead_mask: u64,
@@ -2094,6 +2103,22 @@ unsafe fn emit_osr_trampoline(
         tramp.emit_byte(0x89);
         tramp.emit_byte(0x85 | ((arg2_reg & 7) << 3));
         tramp.emit(&neg_off.to_le_bytes());
+    }
+
+    // Inline self-recursion check: OSR bypasses the compiled prologue that
+    // caches the native-stack floor, so initialise the slot to usize::MAX
+    // (`MOV qword [rbp - off], -1` -- imm32 sign-extends). `RSP > MAX` is
+    // unsatisfiable, so every self-call site in an OSR-entered frame takes
+    // the out-of-line guard helper (safe, merely slower). Leaving the slot
+    // uninitialised could skip the guard on garbage and miss a
+    // StackOverflowError.
+    if stack_floor_slot_off != 0 {
+        let neg_off = -stack_floor_slot_off;
+        tramp.emit_byte(0x48); // REX.W
+        tramp.emit_byte(0xC7); // MOV r/m64, imm32 (sign-extended)
+        tramp.emit_byte(0x85); // mod=10, reg=/0, rm=rbp
+        tramp.emit(&neg_off.to_le_bytes());
+        tramp.emit(&(-1i32).to_le_bytes());
     }
 
     // OSR bypasses the compiled method's normal prologue, including the exact
@@ -2298,6 +2323,7 @@ unsafe fn osr_trampoline(
     xmm_saved_base: i32,
     heap_local_offset: i32,
     jit_thread_slot_off: i32,
+    stack_floor_slot_off: i32,
     frame_record: usize,
     needs_context: bool,
     dead_mask: u64,
@@ -2341,6 +2367,7 @@ unsafe fn osr_trampoline(
                 xmm_saved_base,
                 heap_local_offset,
                 jit_thread_slot_off,
+                stack_floor_slot_off,
                 frame_record,
                 needs_context,
                 dead_mask,

@@ -24887,12 +24887,30 @@ fn compile_osr_artifact(
             if scan.has_athrow {
                 return None;
             }
-            // BC GOST3412_2015Engine.init_gf256_mul_table showed that OSR
-            // entering a nested primitive-array allocation loop can resume with
-            // corrupt stack state for the next `newarray` length. Keep normal
-            // method-entry JIT enabled, but decline OSR until the x64 OSR stack
-            // mapper models primitive allocation loops safely.
-            if scan.has_newarray {
+            // 2026-07-10 BC-crypto session: OSR of `GOST3412_2015Engine.
+            // init_gf256_mul_table` (a nested primitive-array allocation loop)
+            // was observed to "resume with corrupt stack state for the next
+            // newarray length", and a blanket per-method OSR deny for any
+            // `newarray`-containing method was added as a workaround.
+            //
+            // perf/throughput-20260710: the deny is now DEFAULT-OFF. It was a
+            // huge hammer — any hot loop in any method that allocates a
+            // primitive array anywhere ran interpreted forever (BenchSuite
+            // sieve250k: 3.2s → 177s, ~55x; every BC math/EC kernel under
+            // JIT-allow lost OSR) — and the corruption does not reproduce on
+            // the current tree (GOST3412Test 10/10 at -Xmx256m across both
+            // getfield modes; an exact-shape nested-allocation repro is
+            // checksum-identical to HotSpot under heap pressure; EC AllTests
+            // passes under full JIT-allow). See `osr_newarray_allowed` for the
+            // full evidence trail; `CRATONVM_OSR_NEWARRAY=0` restores the deny
+            // for bisection.
+            if scan.has_newarray && !crate::runtime::env_cache::osr_newarray_allowed() {
+                if crate::runtime::env_cache::dbg_jitc() {
+                    eprintln!(
+                        "[cratonvm-jitc] osr-DENY (has_newarray, CRATONVM_OSR_NEWARRAY=0) {}.{}{}",
+                        class_name, method_name, method_descriptor
+                    );
+                }
                 crate::jit::tiered::mark_osr_denied(osr_key.clone());
                 return None;
             }
