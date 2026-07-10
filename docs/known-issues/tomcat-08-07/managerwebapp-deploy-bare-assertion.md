@@ -36,14 +36,19 @@ producing `NullPointerException: Cannot invoke "String.indexOf(int)" because
 up exactly as the "no message, no clue" bare `AssertionError`s this doc
 originally described.
 
-**Fix** (`native-builtins/src/phases_early.rs`,
+**Fix:** `native-builtins/src/phases_early.rs`'s
 `register_phase52_inet_socket_address`'s `<init>(Ljava/lang/String;I)V`
-handler): attempt real resolution via `ctx.invoke("java/net/InetAddress",
-"getByName", ...)` before falling back to unresolved, matching real
-`InetSocketAddress(String, int)` semantics. Verified with isolated probes
-(`new InetSocketAddress("127.0.0.1", N)` now correctly resolves;
-`SocketChannel.socket().getInetAddress()` off an accepted server socket now
-returns the real peer address instead of `null`) and the existing
+handler now attempts real resolution before falling back to unresolved,
+matching real `InetSocketAddress(String, int)` semantics. This exact bug was
+independently found and fixed in a concurrent session the same day, landed
+as dev commit `0e8c0df4` ("Fix InetSocketAddress(String,int) never resolving
+hostname to an address") via `net_phase_e::resolve_host_external` — see
+[`form-authenticator-cookie-session-bare-assertion.md`](form-authenticator-cookie-session-bare-assertion.md)
+for that investigation's parallel write-up (same root cause, reached via
+`TestFormAuthenticatorA/B/C` instead of `TestManagerWebapp`). Verified here
+with isolated probes (`new InetSocketAddress("127.0.0.1", N)` now correctly
+resolves; `SocketChannel.socket().getInetAddress()` off an accepted server
+socket now returns the real peer address instead of `null`) and the existing
 `vm/tests/wave3_b2_dispatch.rs` regression tests (`getPort()` round-trip
 through this exact constructor) still pass.
 

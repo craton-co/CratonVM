@@ -483,6 +483,15 @@ pub(crate) fn alloc_inet_address_external(
     alloc_inet_address(ctx, host, ip)
 }
 
+/// `pub(crate)` re-export of [`resolve_host`] for sibling modules that need
+/// to resolve a hostname/literal to an IP string without duplicating the
+/// IPv4/IPv6-literal-then-DNS-fallback logic (used by `phases_early.rs`'s
+/// synthetic `InetSocketAddress(String,int)` constructor — see its call site
+/// for why an unconditionally-unresolved address is wrong there).
+pub(crate) fn resolve_host_external(host: &str) -> Option<String> {
+    resolve_host(host).ok().map(|ip| ip.to_string())
+}
+
 /// Read an InetAddress's `(hostName, ipAddress)` from the side table.
 /// Returns `None` for an InetAddress we never recorded.
 ///
@@ -4264,14 +4273,10 @@ fn http_build_request(
         let _ = write!(&mut out, "Host: {host}:{port}\r\n");
     }
     let mut has_content_length = false;
-    let mut has_connection = false;
     let mut has_user_agent = false;
     for (k, v) in headers {
         if k.eq_ignore_ascii_case("content-length") {
             has_content_length = true;
-        }
-        if k.eq_ignore_ascii_case("connection") {
-            has_connection = true;
         }
         if k.eq_ignore_ascii_case("user-agent") {
             has_user_agent = true;
@@ -4280,9 +4285,6 @@ fn http_build_request(
     }
     if !has_user_agent {
         out.extend_from_slice(b"User-Agent: cratonvm-phaseE/1.0\r\n");
-    }
-    if !has_connection {
-        out.extend_from_slice(b"Connection: close\r\n");
     }
     if !has_content_length && (!body.is_empty() || matches!(method, "POST" | "PUT" | "PATCH")) {
         let _ = write!(&mut out, "Content-Length: {}\r\n", body.len());

@@ -946,10 +946,12 @@ fn cl_real_load_class_base(
 /// (`jdk.internal.loader.URLClassPath`) field, which CratonVM shims to a bare
 /// synthetic instance (`register_url_class_path_safe_stubs`) whose `getResource`
 /// returns null — so the real `findClass` ALWAYS throws `ClassNotFoundException`.
-/// CratonVM instead serves `URLClassLoader` resolution from its global dynamic
-/// classpath, where each loader's `<init>` registered its URLs via
-/// [`register_url_array`]. Resolve `name` there and throw `ClassNotFoundException`
-/// on a genuine miss, matching the JDK `findClass` contract.
+/// CratonVM instead first serves `URLClassLoader` resolution from the receiver's
+/// own recorded URLs, defining the class under that receiver's loader namespace,
+/// then falls back to the historical global dynamic classpath path where each
+/// loader's `<init>` registered its URLs via [`register_url_array`]. Throw
+/// `ClassNotFoundException` on a genuine miss, matching the JDK `findClass`
+/// contract.
 ///
 /// `URLClassLoader.findClass` is normally reached only from `loadClass` (which
 /// CratonVM serves natively via [`cl_real_load_class`], never touching the real
@@ -964,12 +966,19 @@ pub fn ucl_real_find_class(
     ctx: &mut dyn NativeContext,
     args: &[Value],
 ) -> cratonvm_types::error::MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(o))) => *o,
+        _ => return Ok(Some(Value::Object(None))),
+    };
     let name_obj = match args.get(1) {
         Some(Value::Object(Some(o))) => *o,
         _ => return Ok(Some(Value::Object(None))),
     };
     let class_name = ctx.read_string(name_obj).unwrap_or_default();
     let internal = class_name.replace('.', "/");
+    if let Some(result) = crate::classloader::ucl_try_define_local_class(ctx, this, &internal) {
+        return result;
+    }
     if let Ok(Some(mirror)) = ctx.load_class(&internal) {
         return Ok(Some(mirror));
     }

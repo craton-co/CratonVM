@@ -438,10 +438,7 @@ fn native_input_stream_reader_close(
     Ok(None)
 }
 
-fn native_output_stream_write_all(
-    ctx: &mut dyn NativeContext,
-    args: &[Value],
-) -> MethodCallResult {
+fn native_output_stream_write_all(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = match args.first() {
         Some(Value::Object(Some(o))) => *o,
         _ => return Ok(None),
@@ -18308,6 +18305,12 @@ pub fn register_essential_natives(registry: &mut NativeMethodRegistry) {
             native_coding_error_action_to_string,
         );
     });
+    // Real-JDK mode still allocates synthetic `java/nio/ByteBuffer` objects for
+    // `ByteBuffer.allocate*`; those receivers are stamped with the abstract
+    // ByteBuffer class, so abstract instance methods such as `put(int, byte)`
+    // need the S2 native surface in the essential registry too. Keep this to
+    // ByteBuffer + ByteOrder rather than enabling the full synthetic NIO stack.
+    servlet::register_s2_bytebuffer_essentials(registry);
     registry.register(
         "java/util/logging/Level",
         "<clinit>",
@@ -18347,69 +18350,78 @@ pub fn register_essential_natives(registry: &mut NativeMethodRegistry) {
 
     // The fake-JDK WildFly launcher can resolve java.util.concurrent locks as
     // synthetic stubs before any real AQS bytecode is available. Tag these as
-    // SyntheticStub and keep the dispatcher honest: real loaded bytecode still
-    // wins, while true stubs have the native bodies they declare.
-    registry.with_category(cratonvm_native_api::NativeKind::SyntheticStub, |registry| {
-        let rl = "java/util/concurrent/locks/ReentrantLock";
-        registry.register(rl, "<init>", "()V", native_rl_init);
-        registry.register(rl, "<init>", "(Z)V", native_rl_init_fair);
-        registry.register(rl, "lock", "()V", native_rl_lock);
-        registry.register(rl, "lockInterruptibly", "()V", native_rl_lock);
-        registry.register(rl, "unlock", "()V", native_rl_unlock);
-        registry.register(rl, "tryLock", "()Z", native_rl_try_lock);
-        registry.register(
-            rl,
-            "tryLock",
-            "(JLjava/util/concurrent/TimeUnit;)Z",
-            native_rl_try_lock_timeout,
-        );
-        registry.register(rl, "isLocked", "()Z", native_rl_is_locked);
-        registry.register(
-            rl,
-            "isHeldByCurrentThread",
-            "()Z",
-            native_rl_is_held_by_current_thread,
-        );
-        registry.register(rl, "getHoldCount", "()I", native_rl_get_hold_count);
-        registry.register(rl, "isFair", "()Z", native_rl_is_fair);
-        registry.register(
-            rl,
-            "newCondition",
-            "()Ljava/util/concurrent/locks/Condition;",
-            native_rl_new_condition,
-        );
-        registry.register(rl, "toString", "()Ljava/lang/String;", native_rl_to_string);
+    // SyntheticStub and keep the dispatcher honest. In default real-JDK mode,
+    // however, these registrations must not exist: several dispatch paths can
+    // see a registered native before they have enough class context to prefer
+    // real AQS bytecode, which lets the legacy monitor-backed ReentrantLock /
+    // Condition bridge steal LinkedBlockingQueue's real lock operations and hang
+    // executor shutdown. Keep the legacy surface opt-in and aligned with
+    // `register_concurrent_natives` below.
+    let synthetic_aqs = std::env::var_os("CRATONVM_SYNTHETIC_AQS").is_some()
+        && std::env::var_os("CRATONVM_REAL_AQS").is_none();
+    if synthetic_aqs {
+        registry.with_category(cratonvm_native_api::NativeKind::SyntheticStub, |registry| {
+            let rl = "java/util/concurrent/locks/ReentrantLock";
+            registry.register(rl, "<init>", "()V", native_rl_init);
+            registry.register(rl, "<init>", "(Z)V", native_rl_init_fair);
+            registry.register(rl, "lock", "()V", native_rl_lock);
+            registry.register(rl, "lockInterruptibly", "()V", native_rl_lock);
+            registry.register(rl, "unlock", "()V", native_rl_unlock);
+            registry.register(rl, "tryLock", "()Z", native_rl_try_lock);
+            registry.register(
+                rl,
+                "tryLock",
+                "(JLjava/util/concurrent/TimeUnit;)Z",
+                native_rl_try_lock_timeout,
+            );
+            registry.register(rl, "isLocked", "()Z", native_rl_is_locked);
+            registry.register(
+                rl,
+                "isHeldByCurrentThread",
+                "()Z",
+                native_rl_is_held_by_current_thread,
+            );
+            registry.register(rl, "getHoldCount", "()I", native_rl_get_hold_count);
+            registry.register(rl, "isFair", "()Z", native_rl_is_fair);
+            registry.register(
+                rl,
+                "newCondition",
+                "()Ljava/util/concurrent/locks/Condition;",
+                native_rl_new_condition,
+            );
+            registry.register(rl, "toString", "()Ljava/lang/String;", native_rl_to_string);
 
-        let lock = "java/util/concurrent/locks/Lock";
-        registry.register(lock, "lock", "()V", native_rl_lock);
-        registry.register(lock, "unlock", "()V", native_rl_unlock);
-        registry.register(lock, "tryLock", "()Z", native_rl_try_lock);
-        registry.register(
-            lock,
-            "newCondition",
-            "()Ljava/util/concurrent/locks/Condition;",
-            native_rl_new_condition,
-        );
+            let lock = "java/util/concurrent/locks/Lock";
+            registry.register(lock, "lock", "()V", native_rl_lock);
+            registry.register(lock, "unlock", "()V", native_rl_unlock);
+            registry.register(lock, "tryLock", "()Z", native_rl_try_lock);
+            registry.register(
+                lock,
+                "newCondition",
+                "()Ljava/util/concurrent/locks/Condition;",
+                native_rl_new_condition,
+            );
 
-        let cond = "java/util/concurrent/locks/Condition";
-        registry.register(cond, "await", "()V", native_cond_await);
-        registry.register(cond, "awaitUninterruptibly", "()V", native_cond_await);
-        registry.register(
-            cond,
-            "await",
-            "(JLjava/util/concurrent/TimeUnit;)Z",
-            native_cond_await_timeout,
-        );
-        registry.register(cond, "awaitNanos", "(J)J", native_cond_await_nanos);
-        registry.register(
-            cond,
-            "awaitUntil",
-            "(Ljava/util/Date;)Z",
-            native_cond_await_until,
-        );
-        registry.register(cond, "signal", "()V", native_cond_signal);
-        registry.register(cond, "signalAll", "()V", native_cond_signal_all);
-    });
+            let cond = "java/util/concurrent/locks/Condition";
+            registry.register(cond, "await", "()V", native_cond_await);
+            registry.register(cond, "awaitUninterruptibly", "()V", native_cond_await);
+            registry.register(
+                cond,
+                "await",
+                "(JLjava/util/concurrent/TimeUnit;)Z",
+                native_cond_await_timeout,
+            );
+            registry.register(cond, "awaitNanos", "(J)J", native_cond_await_nanos);
+            registry.register(
+                cond,
+                "awaitUntil",
+                "(Ljava/util/Date;)Z",
+                native_cond_await_until,
+            );
+            registry.register(cond, "signal", "()V", native_cond_signal);
+            registry.register(cond, "signalAll", "()V", native_cond_signal_all);
+        });
+    }
 
     // JBoss Modules' Java-version gate can reach regex while Pattern/Matcher are
     // still synthetic stubs. Real-JDK mode drops these legacy layout natives via
@@ -20185,6 +20197,14 @@ pub fn register_essential_natives(registry: &mut NativeMethodRegistry) {
             let input = args.get(1).copied().unwrap_or(Value::Object(None));
             ctx.set_field_by_name(this, "in", input);
             ctx.set_field(this, 0, input);
+            let buf = ctx.new_array(cratonvm_types::ArrayElementType::Byte, 8192);
+            ctx.set_field_by_name(this, "initialSize", Value::Int(8192));
+            ctx.set_field_by_name(this, "buf", Value::Object(Some(buf)));
+            ctx.set_field_by_name(this, "count", Value::Int(0));
+            ctx.set_field_by_name(this, "pos", Value::Int(0));
+            ctx.set_field_by_name(this, "markpos", Value::Int(-1));
+            ctx.set_field_by_name(this, "marklimit", Value::Int(0));
+            ctx.set_field(this, 1, Value::Object(Some(buf)));
             Ok(None)
         },
     );
@@ -20198,8 +20218,17 @@ pub fn register_essential_natives(registry: &mut NativeMethodRegistry) {
                 _ => return Ok(None),
             };
             let input = args.get(1).copied().unwrap_or(Value::Object(None));
+            let size = args.get(2).and_then(Value::as_int).unwrap_or(8192).max(1);
             ctx.set_field_by_name(this, "in", input);
             ctx.set_field(this, 0, input);
+            let buf = ctx.new_array(cratonvm_types::ArrayElementType::Byte, size as usize);
+            ctx.set_field_by_name(this, "initialSize", Value::Int(size));
+            ctx.set_field_by_name(this, "buf", Value::Object(Some(buf)));
+            ctx.set_field_by_name(this, "count", Value::Int(0));
+            ctx.set_field_by_name(this, "pos", Value::Int(0));
+            ctx.set_field_by_name(this, "markpos", Value::Int(-1));
+            ctx.set_field_by_name(this, "marklimit", Value::Int(0));
+            ctx.set_field(this, 1, Value::Object(Some(buf)));
             Ok(None)
         },
     );
@@ -20255,6 +20284,80 @@ pub fn register_essential_natives(registry: &mut NativeMethodRegistry) {
             }
         },
     );
+    registry.register(
+        "java/io/BufferedInputStream",
+        "skip",
+        "(J)J",
+        |ctx, args| {
+            let this = match args.first() {
+                Some(Value::Object(Some(o))) => *o,
+                _ => return Ok(Some(Value::Long(0))),
+            };
+            let n = args.get(1).and_then(Value::as_long).unwrap_or(0).max(0);
+            if n == 0 {
+                return Ok(Some(Value::Long(0)));
+            }
+            let input = match ctx.get_field_by_name(this, "in") {
+                Value::Object(Some(o)) => Some(o),
+                _ => match ctx.get_field(this, 0) {
+                    Value::Object(Some(o)) => Some(o),
+                    _ => None,
+                },
+            };
+            match input {
+                Some(input) => Ok(ctx
+                    .invoke_virtual(input, "skip", "(J)J", &[Value::Long(n)])?
+                    .or(Some(Value::Long(0)))),
+                None => Ok(Some(Value::Long(0))),
+            }
+        },
+    );
+    registry.register(
+        "java/io/BufferedInputStream",
+        "mark",
+        "(I)V",
+        |ctx, args| {
+            let this = match args.first() {
+                Some(Value::Object(Some(o))) => *o,
+                _ => return Ok(None),
+            };
+            let readlimit = args.get(1).and_then(Value::as_int).unwrap_or(0).max(0);
+            let pos = ctx
+                .get_field_by_name(this, "pos")
+                .as_int()
+                .unwrap_or(0)
+                .max(0);
+            ctx.set_field_by_name(this, "marklimit", Value::Int(readlimit));
+            ctx.set_field_by_name(this, "markpos", Value::Int(pos));
+            Ok(None)
+        },
+    );
+    registry.register(
+        "java/io/BufferedInputStream",
+        "reset",
+        "()V",
+        |ctx, args| {
+            let this = match args.first() {
+                Some(Value::Object(Some(o))) => *o,
+                _ => return Ok(None),
+            };
+            let markpos = ctx
+                .get_field_by_name(this, "markpos")
+                .as_int()
+                .unwrap_or(-1);
+            if markpos >= 0 {
+                ctx.set_field_by_name(this, "pos", Value::Int(markpos));
+            }
+            Ok(None)
+        },
+    );
+    registry.register(
+        "java/io/BufferedInputStream",
+        "markSupported",
+        "()Z",
+        |_ctx, _args| Ok(Some(Value::Int(1))),
+    );
+
     registry.register(
         "java/io/BufferedInputStream",
         "available",
@@ -27705,10 +27808,12 @@ pub fn register_essential_natives(registry: &mut NativeMethodRegistry) {
     );
     // URLClassLoader.findClass — the real bytecode resolves via the shimmed
     // `ucp` (URLClassPath) and so throws CNFE for everything. Serve it from the
-    // global dynamic classpath instead (the loader's `<init>` registered its
-    // URLs). Reached when a subclass overrides `loadClass` and calls `findClass`
-    // directly (Jasper's `JasperLoader` loading runtime-compiled
-    // `org.apache.jsp.*_jsp` servlets); forced onto this native by
+    // receiver's own recorded URLs first so the class is defined under that
+    // loader, then keep the global dynamic classpath fallback for legacy paths
+    // whose loader `<init>` registered URLs there. Reached when a subclass
+    // overrides `loadClass` and calls `findClass` directly (Jasper's
+    // `JasperLoader` loading runtime-compiled `org.apache.jsp.*_jsp` servlets);
+    // forced onto this native by
     // `intercept_urlclassloader_subclass_find_class`. Only registered here
     // (real-JDK mode); synthetic-JDK mode registers `ucl_find_class` via
     // `register_classloader_natives`.
@@ -43949,19 +44054,31 @@ pub(crate) fn compile_anchored_cached(full: &str) -> Option<JavaRegex> {
 ///   that escapes `StatusLogger$Config.<clinit>` and aborts WildFly boot.
 /// - `\p{IsScriptName}` / `\P{IsScriptName}` (Java Unicode-script prefix) →
 ///   `\p{ScriptName}` / `\P{ScriptName}` (same accepted-without-prefix shape).
+/// - `\p{java*}` / `\P{java*}` (the predefined Java character-class aliases
+///   from `java.util.regex.Pattern`'s `CharPredicates.forProperty` table,
+///   e.g. `\p{javaWhitespace}`, `\p{javaDigit}`) → an explicit Rust-regex
+///   class body matching the corresponding `java.lang.Character.isXxx(int)`
+///   predicate (see `map_java_predefined_class`). These are direct method
+///   aliases, not Unicode property/category names, so neither `regex` nor
+///   `fancy-regex` understands them by name. `java.util.Scanner`'s static
+///   initializer depends on `\p{javaWhitespace}` and `\p{javaDigit}`
+///   (`WHITESPACE_PATTERN` / `NON_ASCII_DIGIT`), so leaving these
+///   untranslated makes `Scanner`'s `<clinit>` throw unconditionally.
+///   Residual: does not honor `Pattern.CASE_INSENSITIVE` widening
+///   `javaLowerCase`/`javaUpperCase`/`javaTitleCase` into a tri-case union
+///   (rare — needs both the flag and one of these three classes together).
 fn translate_java_regex(pattern: &str) -> std::borrow::Cow<'_, str> {
-    // Fast path: if the pattern doesn't contain `\p{In` or `\p{Is` (or the
-    // capital-P negated forms), and no `\Q...\E` quoted-literal blocks,
-    // there's nothing to rewrite.
+    // Fast path: if the pattern doesn't contain `\p{In`, `\p{Is`, or `\p{java`
+    // (or the capital-P negated forms), and no `\Q...\E` quoted-literal
+    // blocks, there's nothing to rewrite.
     let has_quote_block = pattern.contains("\\Q");
-    let has_all_class = pattern.contains("\\p{all}") || pattern.contains("\\P{all}");
-    if !has_quote_block
-        && !has_all_class
-        && !(pattern.contains("\\p{In")
-            || pattern.contains("\\P{In")
-            || pattern.contains("\\p{Is")
-            || pattern.contains("\\P{Is"))
-    {
+    // Any `\p{...}`/`\P{...}` needs the loop below: it covers Unicode
+    // block/script prefixes (In/Is), `Character.is*` names (java*), the
+    // `all` alias, AND the POSIX character classes (Alpha, Digit, XDigit,
+    // ...) handled by `map_java_character_property`, which don't share a
+    // common prefix so can't be cheaply pre-filtered individually.
+    let has_property_class = pattern.contains("\\p{") || pattern.contains("\\P{");
+    if !has_quote_block && !has_property_class {
         return std::borrow::Cow::Borrowed(pattern);
     }
     let mut out = String::with_capacity(pattern.len());
@@ -44037,6 +44154,52 @@ fn translate_java_regex(pattern: &str) -> std::borrow::Cow<'_, str> {
             i += 7;
             continue;
         }
+        // Look for `\p{Name}` / `\P{Name}` POSIX character classes (Lower,
+        // Upper, ASCII, Alpha, Digit, Alnum, Punct, Graph, Print, Blank,
+        // Cntrl, XDigit, Space -- java.util.regex.Pattern javadoc, "POSIX
+        // character classes (US-ASCII only)"). Rust's `regex` crate only
+        // recognizes Unicode property names in `\p{...}` (no notion of
+        // "XDigit"/"Alpha"/etc.), so without this these patterns fail to
+        // compile in BOTH the `regex` and `fancy-regex` fallback, and
+        // `compile_java_regex` returns an Err. That Err was observed to
+        // silently corrupt `String.matches` (see `native_string_matches`'s
+        // literal-equality fallback on compile failure) -- e.g.
+        // `"5".matches("\\p{XDigit}+")` returned `false` instead of `true`,
+        // while `Pattern.matches("\\p{XDigit}+", "5")` (real bytecode,
+        // unaffected by this translation layer) correctly returned `true`.
+        // Found via Tomcat's `TestHttp2Limits.testPostWithTrailerHeadersSize0`.
+        // Checked before the `In`/`Is`/`java*` branches below since POSIX
+        // names never collide with those prefixes; unrecognized names fall
+        // through unchanged to let those branches (or the literal copy at
+        // the bottom) handle them. See `map_posix_character_class` for the
+        // US-ASCII-only rationale (matches Java's default; the rarely-used
+        // `UNICODE_CHARACTER_CLASS` flag is not special-cased here, same as
+        // the `java*` branch below).
+        if i + 3 < bytes.len()
+            && bytes[i] == b'\\'
+            && (bytes[i + 1] == b'p' || bytes[i + 1] == b'P')
+            && bytes[i + 2] == b'{'
+        {
+            if let Some(close_off) = pattern[i + 3..].find('}') {
+                let name = &pattern[i + 3..i + 3 + close_off];
+                if let Some(class_body) = map_posix_character_class(name) {
+                    let negated = bytes[i + 1] == b'P';
+                    if negated {
+                        out.push_str("[^");
+                        out.push_str(class_body);
+                        out.push(']');
+                    } else {
+                        out.push('[');
+                        out.push_str(class_body);
+                        out.push(']');
+                    }
+                    i = i + 3 + close_off + 1;
+                    continue;
+                }
+                // Not a POSIX name: fall through to the In/Is/java* checks
+                // below (or literal copy if none match either).
+            }
+        }
         // Look for `\p{In` or `\p{Is` (both cases of p) followed by a name and `}`.
         // All matched bytes are ASCII so byte indexing is safe.
         if i + 5 < bytes.len()
@@ -44071,6 +44234,34 @@ fn translate_java_regex(pattern: &str) -> std::borrow::Cow<'_, str> {
                 }
                 i = i + 5 + close_off + 1;
                 continue;
+            }
+        }
+        // Look for `\p{java...}` / `\P{java...}` — the predefined Java
+        // character-class aliases (see `map_java_predefined_class`).
+        if i + 3 < bytes.len()
+            && bytes[i] == b'\\'
+            && (bytes[i + 1] == b'p' || bytes[i + 1] == b'P')
+            && bytes[i + 2] == b'{'
+            && pattern[i + 3..].starts_with("java")
+        {
+            if let Some(close_off) = pattern[i + 3..].find('}') {
+                let name = &pattern[i + 3..i + 3 + close_off];
+                let negated = bytes[i + 1] == b'P';
+                if let Some(class_body) = map_java_predefined_class(name) {
+                    if negated {
+                        out.push_str("[^");
+                        out.push_str(class_body);
+                        out.push(']');
+                    } else {
+                        out.push('[');
+                        out.push_str(class_body);
+                        out.push(']');
+                    }
+                    i = i + 3 + close_off + 1;
+                    continue;
+                }
+                // Unknown `java*` name: fall through and copy the escape
+                // literally below, same as any other unrecognized pattern.
             }
         }
         // Copy one full UTF-8 character.
@@ -44179,6 +44370,32 @@ fn ascii_perl_classes(pattern: &str) -> String {
     out
 }
 
+/// Map a Java POSIX character-class name (`\p{Name}` with no `In`/`Is`/`java`
+/// prefix) to a Rust regex character-class body. See the loop branch above
+/// for why this table exists. Always US-ASCII-only, matching Java's default.
+fn map_posix_character_class(name: &str) -> Option<&'static str> {
+    match name {
+        "Lower" => Some("a-z"),
+        "Upper" => Some("A-Z"),
+        "ASCII" => Some(r"\x00-\x7F"),
+        "Alpha" => Some("a-zA-Z"),
+        "Digit" => Some("0-9"),
+        "Alnum" => Some("a-zA-Z0-9"),
+        // `!"#$%&'()*+,-./` (\x21-\x2F) + `:;<=>?@` (\x3A-\x40) +
+        // `[\]^_`` (\x5B-\x60) + `{|}~` (\x7B-\x7E) -- printable ASCII
+        // minus letters and digits, as four contiguous byte ranges
+        // (sidesteps escaping `]`/`\`/`-` as literal bracket-class chars).
+        "Punct" => Some(r"\x21-\x2F\x3A-\x40\x5B-\x60\x7B-\x7E"),
+        "Graph" => Some(r"\x21-\x7E"),
+        "Print" => Some(r"\x20-\x7E"),
+        "Blank" => Some(" \t"),
+        "Cntrl" => Some(r"\x00-\x1F\x7F"),
+        "XDigit" => Some("0-9a-fA-F"),
+        "Space" => Some(r" \t\n\x0B\f\r"),
+        _ => None,
+    }
+}
+
 /// Map a Java Unicode block name (used after the `In` prefix in `\p{InXxx}`)
 /// to a Rust regex character-class body covering the same code points. The
 /// Rust regex crate doesn't expose Unicode blocks natively, so we substitute
@@ -44210,6 +44427,237 @@ fn map_java_unicode_block(name: &str, is_block: bool) -> Option<&'static str> {
         "Katakana" => Some(r"\u{30A0}-\u{30FF}"),
         "Hangul_Syllables" | "HangulSyllables" => Some(r"\u{AC00}-\u{D7AF}"),
         _ => None,
+    }
+}
+
+/// Translate a `\p{java*}` / `\P{java*}` predefined Java character-class
+/// name (see `java.util.regex.Pattern`'s `CharPredicates.forProperty`) into
+/// a Rust-regex-crate-compatible class body — i.e. text valid to place
+/// inside a single pair of `[...]` brackets. Returns `None` for names
+/// outside this family (letting the caller fall back to copying the escape
+/// literally, same as any other unrecognized `\p{...}` form).
+///
+/// Each entry mirrors the exact semantics documented on the corresponding
+/// `java.lang.Character.isXxx(int)` method (verified against JDK 25
+/// source), not a convenient approximation. Notably:
+/// - `javaWhitespace` (`Character.isWhitespace`) is Unicode space
+///   separators (`Zs`/`Zl`/`Zp`) *excluding* the three non-breaking spaces
+///   (U+00A0, U+2007, U+202F), plus the ASCII control-whitespace range
+///   U+0009-U+000D and the separator controls U+001C-U+001F. Expressed as
+///   explicit codepoints/ranges rather than `\p{Z}` minus a subtraction, so
+///   it doesn't depend on character-class set-operator support.
+/// - `javaJavaIdentifierStart`/`javaJavaIdentifierPart` follow the older,
+///   simpler `Character.isJavaIdentifierStart`/`Part` rules (letter/digit +
+///   currency + connector punctuation, + combining/non-spacing marks for
+///   `Part`) — NOT the same as `javaUnicodeIdentifierStart`/`Part`, which
+///   follow the newer `ID_Start`/`ID_Continue`-based UAX31 profile.
+fn map_java_predefined_class(name: &str) -> Option<&'static str> {
+    match name {
+        "javaLowerCase" => Some(r"\p{Lowercase}"),
+        "javaUpperCase" => Some(r"\p{Uppercase}"),
+        "javaAlphabetic" => Some(r"\p{Alphabetic}"),
+        "javaIdeographic" => Some(r"\p{Ideographic}"),
+        "javaTitleCase" => Some(r"\p{Lt}"),
+        "javaDigit" => Some(r"\p{Nd}"),
+        // isDefined = NOT unassigned (Cn) — enumerate every other general
+        // category rather than relying on `--`/negation-inside-brackets.
+        "javaDefined" => Some(r"\p{L}\p{M}\p{N}\p{P}\p{S}\p{Z}\p{Cc}\p{Cf}\p{Co}\p{Cs}"),
+        "javaLetter" => Some(r"\p{L}"),
+        "javaLetterOrDigit" => Some(r"\p{L}\p{Nd}"),
+        // isJavaIdentifierStart: isLetter || LETTER_NUMBER || currency
+        // symbol || connector punctuation.
+        "javaJavaIdentifierStart" => Some(r"\p{L}\p{Nl}\p{Sc}\p{Pc}"),
+        // isJavaIdentifierPart: the above plus digit, combining/non-spacing
+        // marks, and isIdentifierIgnorable.
+        "javaJavaIdentifierPart" => {
+            Some(r"\p{L}\p{Nl}\p{Nd}\p{Mc}\p{Mn}\p{Sc}\p{Pc}\p{Cf}\x00-\x08\x0E-\x1B\x7F-\x9F")
+        }
+        // isUnicodeIdentifierStart: ID_Start plus VERTICAL TILDE (U+2E2F,
+        // kept for backward compatibility per the UAX31 profile in the
+        // javadoc).
+        "javaUnicodeIdentifierStart" => Some(r"\p{ID_Start}\u{2E2F}"),
+        // isUnicodeIdentifierPart: ID_Start + ID_Continue + U+2E2F +
+        // isIdentifierIgnorable.
+        "javaUnicodeIdentifierPart" => {
+            Some(r"\p{ID_Start}\p{ID_Continue}\u{2E2F}\p{Cf}\x00-\x08\x0E-\x1B\x7F-\x9F")
+        }
+        // isIdentifierIgnorable: non-whitespace ISO control ranges plus the
+        // FORMAT (Cf) general category.
+        "javaIdentifierIgnorable" => Some(r"\x00-\x08\x0E-\x1B\x7F-\x9F\p{Cf}"),
+        "javaSpaceChar" => Some(r"\p{Z}"),
+        // isWhitespace: see the function-level doc comment above.
+        "javaWhitespace" => Some(
+            r"\x09-\x0D\x1C-\x1F\x20\u{1680}\u{2000}-\u{2006}\u{2008}-\u{200A}\u{2028}\u{2029}\u{205F}\u{3000}",
+        ),
+        "javaISOControl" => Some(r"\x00-\x1F\x7F-\x9F"),
+        "javaMirrored" => Some(r"\p{Bidi_Mirrored}"),
+        _ => None,
+    }
+}
+
+#[cfg(test)]
+mod java_predefined_class_tests {
+    use super::compile_java_regex;
+
+    fn m(pat: &str, s: &str) -> bool {
+        compile_java_regex(pat, 0)
+            .unwrap_or_else(|e| panic!("pattern {pat:?} failed to compile: {e:?}"))
+            .is_match(s)
+    }
+
+    const ALL_NAMES: &[&str] = &[
+        "javaLowerCase",
+        "javaUpperCase",
+        "javaAlphabetic",
+        "javaIdeographic",
+        "javaTitleCase",
+        "javaDigit",
+        "javaDefined",
+        "javaLetter",
+        "javaLetterOrDigit",
+        "javaJavaIdentifierStart",
+        "javaJavaIdentifierPart",
+        "javaUnicodeIdentifierStart",
+        "javaUnicodeIdentifierPart",
+        "javaIdentifierIgnorable",
+        "javaSpaceChar",
+        "javaWhitespace",
+        "javaISOControl",
+        "javaMirrored",
+    ];
+
+    #[test]
+    fn all_names_compile_positive_and_negated() {
+        for name in ALL_NAMES {
+            let pos = format!("\\p{{{name}}}");
+            compile_java_regex(&pos, 0)
+                .unwrap_or_else(|e| panic!("{pos:?} failed to compile: {e:?}"));
+            let neg = format!("\\P{{{name}}}");
+            compile_java_regex(&neg, 0)
+                .unwrap_or_else(|e| panic!("{neg:?} failed to compile: {e:?}"));
+        }
+    }
+
+    #[test]
+    fn scanner_whitespace_pattern() {
+        // java.util.Scanner.WHITESPACE_PATTERN, Scanner.java:415.
+        assert!(m(r"\p{javaWhitespace}+", " \t\n"));
+        assert!(!m(r"^\p{javaWhitespace}+$", "abc"));
+    }
+
+    #[test]
+    fn scanner_non_ascii_digit_pattern() {
+        // java.util.Scanner.NON_ASCII_DIGIT, Scanner.java:422-423. Must match
+        // a non-ASCII decimal digit but NOT an ASCII one.
+        assert!(m(r"[\p{javaDigit}&&[^0-9]]", "\u{0660}")); // ARABIC-INDIC DIGIT ZERO
+        assert!(!m(r"[\p{javaDigit}&&[^0-9]]", "5"));
+    }
+
+    #[test]
+    fn java_whitespace_excludes_nbsp_but_includes_controls() {
+        assert!(m(r"\p{javaWhitespace}", " "));
+        assert!(m(r"\p{javaWhitespace}", "\t"));
+        assert!(m(r"\p{javaWhitespace}", "\u{001C}"));
+        assert!(m(r"\p{javaWhitespace}", "\u{2028}"));
+        assert!(!m(r"\p{javaWhitespace}", "\u{00A0}"));
+        assert!(!m(r"\p{javaWhitespace}", "\u{2007}"));
+        assert!(!m(r"\p{javaWhitespace}", "\u{202F}"));
+        assert!(!m(r"\p{javaWhitespace}", "a"));
+    }
+
+    #[test]
+    fn java_space_char_includes_nbsp_unlike_whitespace() {
+        // isSpaceChar has NO non-breaking-space exclusion, unlike isWhitespace.
+        assert!(m(r"\p{javaSpaceChar}", " "));
+        assert!(m(r"\p{javaSpaceChar}", "\u{00A0}"));
+        assert!(!m(r"\p{javaSpaceChar}", "a"));
+    }
+
+    #[test]
+    fn java_digit_and_case() {
+        assert!(m(r"\p{javaDigit}", "5"));
+        assert!(!m(r"\p{javaDigit}", "a"));
+        assert!(m(r"\p{javaUpperCase}", "A"));
+        assert!(!m(r"\p{javaUpperCase}", "a"));
+        assert!(m(r"\p{javaLowerCase}", "a"));
+        assert!(!m(r"\p{javaLowerCase}", "A"));
+    }
+
+    #[test]
+    fn java_letter_vs_alphabetic_letter_number() {
+        // U+2160 ROMAN NUMERAL ONE: general category Nl (Letter_Number).
+        // isLetter() excludes it; isAlphabetic() includes it.
+        assert!(!m(r"\p{javaLetter}", "\u{2160}"));
+        assert!(m(r"\p{javaAlphabetic}", "\u{2160}"));
+        assert!(m(r"\p{javaLetter}", "a"));
+    }
+
+    #[test]
+    fn java_ideographic_and_titlecase() {
+        assert!(m(r"\p{javaIdeographic}", "\u{4E2D}")); // 中
+        assert!(!m(r"\p{javaIdeographic}", "a"));
+        assert!(m(r"\p{javaTitleCase}", "\u{01C5}")); // Dz with caron (titlecase)
+        assert!(!m(r"\p{javaTitleCase}", "a"));
+    }
+
+    #[test]
+    fn java_letter_or_digit() {
+        assert!(m(r"\p{javaLetterOrDigit}", "a"));
+        assert!(m(r"\p{javaLetterOrDigit}", "5"));
+        assert!(!m(r"\p{javaLetterOrDigit}", " "));
+    }
+
+    #[test]
+    fn java_identifier_start_and_part() {
+        assert!(m(r"\p{javaJavaIdentifierStart}", "a"));
+        assert!(m(r"\p{javaJavaIdentifierStart}", "$"));
+        assert!(m(r"\p{javaJavaIdentifierStart}", "_"));
+        assert!(!m(r"\p{javaJavaIdentifierStart}", "5"));
+        assert!(m(r"\p{javaJavaIdentifierPart}", "5"));
+        assert!(m(r"\p{javaJavaIdentifierPart}", "$"));
+    }
+
+    #[test]
+    fn unicode_identifier_start_excludes_currency_unlike_java_identifier_start() {
+        // isUnicodeIdentifierStart is ID_Start-based and does NOT special-case
+        // currency symbols, unlike isJavaIdentifierStart.
+        assert!(m(r"\p{javaUnicodeIdentifierStart}", "a"));
+        assert!(!m(r"\p{javaUnicodeIdentifierStart}", "$"));
+        assert!(m(r"\p{javaUnicodeIdentifierPart}", "5"));
+        assert!(!m(r"\p{javaUnicodeIdentifierPart}", "$"));
+    }
+
+    #[test]
+    fn java_identifier_ignorable() {
+        assert!(m(r"\p{javaIdentifierIgnorable}", "\u{0000}"));
+        assert!(!m(r"\p{javaIdentifierIgnorable}", "a"));
+    }
+
+    #[test]
+    fn java_iso_control() {
+        assert!(m(r"\p{javaISOControl}", "\u{0007}"));
+        assert!(!m(r"\p{javaISOControl}", "a"));
+    }
+
+    #[test]
+    fn java_mirrored() {
+        assert!(m(r"\p{javaMirrored}", "(")); // LEFT PARENTHESIS is mirrored
+        assert!(!m(r"\p{javaMirrored}", "a"));
+    }
+
+    #[test]
+    fn java_defined_excludes_noncharacter() {
+        assert!(m(r"\p{javaDefined}", "a"));
+        // U+FFFE is a permanently-reserved noncharacter (gc=Cn) per the
+        // Unicode stability policy, so this holds across Unicode versions.
+        assert!(!m(r"\p{javaDefined}", "\u{FFFE}"));
+        assert!(m(r"\P{javaDefined}", "\u{FFFE}"));
+    }
+
+    #[test]
+    fn negated_form_wraps_correctly() {
+        assert!(m(r"\P{javaDigit}", "a"));
+        assert!(!m(r"\P{javaDigit}", "5"));
     }
 }
 
@@ -44246,12 +44694,197 @@ pub(crate) fn read_pattern_regex(
     compile_java_regex(&source, flags)
 }
 
-fn register_regex_natives(_registry: &mut NativeMethodRegistry) {
-    // synthetic-stub removed: defers to real JDK bytecode
-    // java.util.regex.Pattern / java.util.regex.Matcher have real JDK
-    // bytecode. The previous Rust-regex-engine substitutes (which did not
-    // match Java regex semantics) are removed so the real .class bytecode
-    // runs instead.
+fn register_regex_natives(registry: &mut NativeMethodRegistry) {
+    // Tomcat VirtualContext uses UriUtil.makeSafeForJarUrl, which calls
+    // Pattern.compile(...).matcher(...).replaceAll(...). In real-JDK mode we
+    // still force Pattern.matcher through the synthetic Rust regex bridge
+    // during bootstrap, so every Matcher method that may touch the same object
+    // must stay on that coherent synthetic surface. Letting real Matcher
+    // bytecode run on the bridge-allocated object leaves real-JDK internals
+    // such as `locals` null and fails in Matcher.reset().
+    registry.register(
+        "java/util/regex/Pattern",
+        "compile",
+        "(Ljava/lang/String;)Ljava/util/regex/Pattern;",
+        native_pattern_compile,
+    );
+    registry.register(
+        "java/util/regex/Pattern",
+        "compile",
+        "(Ljava/lang/String;I)Ljava/util/regex/Pattern;",
+        native_pattern_compile_flags,
+    );
+    registry.register(
+        "java/util/regex/Pattern",
+        "matcher",
+        "(Ljava/lang/CharSequence;)Ljava/util/regex/Matcher;",
+        native_pattern_matcher,
+    );
+    registry.register(
+        "java/util/regex/Pattern",
+        "matches",
+        "(Ljava/lang/String;Ljava/lang/CharSequence;)Z",
+        native_pattern_matches_static,
+    );
+    registry.register(
+        "java/util/regex/Pattern",
+        "pattern",
+        "()Ljava/lang/String;",
+        native_pattern_pattern,
+    );
+    registry.register(
+        "java/util/regex/Pattern",
+        "flags",
+        "()I",
+        native_pattern_flags,
+    );
+    registry.register(
+        "java/util/regex/Pattern",
+        "split",
+        "(Ljava/lang/CharSequence;)[Ljava/lang/String;",
+        native_pattern_split,
+    );
+    registry.register(
+        "java/util/regex/Pattern",
+        "split",
+        "(Ljava/lang/CharSequence;I)[Ljava/lang/String;",
+        native_pattern_split_limit,
+    );
+    registry.register(
+        "java/util/regex/Pattern",
+        "quote",
+        "(Ljava/lang/String;)Ljava/lang/String;",
+        native_pattern_quote,
+    );
+
+    registry.register(
+        "java/util/regex/Matcher",
+        "find",
+        "()Z",
+        native_matcher_find,
+    );
+    registry.register(
+        "java/util/regex/Matcher",
+        "find",
+        "(I)Z",
+        native_matcher_find_at,
+    );
+    registry.register(
+        "java/util/regex/Matcher",
+        "matches",
+        "()Z",
+        native_matcher_matches,
+    );
+    registry.register(
+        "java/util/regex/Matcher",
+        "lookingAt",
+        "()Z",
+        native_matcher_looking_at,
+    );
+    registry.register(
+        "java/util/regex/Matcher",
+        "group",
+        "()Ljava/lang/String;",
+        native_matcher_group,
+    );
+    registry.register(
+        "java/util/regex/Matcher",
+        "group",
+        "(I)Ljava/lang/String;",
+        native_matcher_group_idx,
+    );
+    registry.register(
+        "java/util/regex/Matcher",
+        "group",
+        "(Ljava/lang/String;)Ljava/lang/String;",
+        native_matcher_group_named,
+    );
+    registry.register(
+        "java/util/regex/Matcher",
+        "groupCount",
+        "()I",
+        native_matcher_group_count,
+    );
+    registry.register(
+        "java/util/regex/Matcher",
+        "start",
+        "()I",
+        native_matcher_start,
+    );
+    registry.register(
+        "java/util/regex/Matcher",
+        "start",
+        "(I)I",
+        native_matcher_start,
+    );
+    registry.register("java/util/regex/Matcher", "end", "()I", native_matcher_end);
+    registry.register("java/util/regex/Matcher", "end", "(I)I", native_matcher_end);
+    registry.register(
+        "java/util/regex/Matcher",
+        "reset",
+        "()Ljava/util/regex/Matcher;",
+        native_matcher_reset,
+    );
+    registry.register(
+        "java/util/regex/Matcher",
+        "reset",
+        "(Ljava/lang/CharSequence;)Ljava/util/regex/Matcher;",
+        native_matcher_reset_input,
+    );
+    registry.register(
+        "java/util/regex/Matcher",
+        "replaceAll",
+        "(Ljava/lang/String;)Ljava/lang/String;",
+        native_matcher_replace_all,
+    );
+    registry.register(
+        "java/util/regex/Matcher",
+        "replaceFirst",
+        "(Ljava/lang/String;)Ljava/lang/String;",
+        native_matcher_replace_first,
+    );
+    registry.register(
+        "java/util/regex/Matcher",
+        "region",
+        "(II)Ljava/util/regex/Matcher;",
+        native_matcher_region,
+    );
+    registry.register(
+        "java/util/regex/Matcher",
+        "regionStart",
+        "()I",
+        native_matcher_region_start,
+    );
+    registry.register(
+        "java/util/regex/Matcher",
+        "regionEnd",
+        "()I",
+        native_matcher_region_end,
+    );
+    registry.register(
+        "java/util/regex/Matcher",
+        "appendReplacement",
+        "(Ljava/lang/StringBuffer;Ljava/lang/String;)Ljava/util/regex/Matcher;",
+        native_matcher_append_replacement,
+    );
+    registry.register(
+        "java/util/regex/Matcher",
+        "appendTail",
+        "(Ljava/lang/StringBuffer;)Ljava/lang/StringBuffer;",
+        native_matcher_append_tail,
+    );
+    registry.register(
+        "java/util/regex/Matcher",
+        "quoteReplacement",
+        "(Ljava/lang/String;)Ljava/lang/String;",
+        native_matcher_quote_replacement,
+    );
+    registry.register(
+        "java/util/regex/Matcher",
+        "hasMatch",
+        "()Z",
+        native_matcher_has_match,
+    );
 }
 
 fn r3_br_pending_chars() -> &'static parking_lot::Mutex<std::collections::HashMap<i32, i32>> {

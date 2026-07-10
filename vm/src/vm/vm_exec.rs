@@ -11397,10 +11397,21 @@ fn invoke_on_class_shared_inner(
                             && ((method_name == "findClass"
                                 && descriptor == "(Ljava/lang/String;)Ljava/lang/Class;")
                                 || (method_name == "findResource"
-                                && descriptor == "(Ljava/lang/String;)Ljava/net/URL;")
+                                    && descriptor == "(Ljava/lang/String;)Ljava/net/URL;")
                                 || (method_name == "findResources"
                                     && descriptor
-                                        == "(Ljava/lang/String;)Ljava/util/Enumeration;")))
+                                        == "(Ljava/lang/String;)Ljava/util/Enumeration;")
+                                || (method_name == "<init>"
+                                    && matches!(
+                                        descriptor,
+                                        "([Ljava/net/URL;)V"
+                                            | "([Ljava/net/URL;Ljava/lang/ClassLoader;)V"
+                                            | "(Ljava/lang/String;[Ljava/net/URL;Ljava/lang/ClassLoader;)V"
+                                            | "([Ljava/net/URL;Ljava/lang/ClassLoader;Ljava/net/URLStreamHandlerFactory;)V"
+                                            | "(Ljava/lang/String;[Ljava/net/URL;Ljava/lang/ClassLoader;Ljava/net/URLStreamHandlerFactory;)V"
+                                            | "([Ljava/net/URL;Ljava/security/AccessControlContext;)V"
+                                            | "(Ljava/lang/String;[Ljava/net/URL;Ljava/lang/ClassLoader;Ljava/security/AccessControlContext;)V"
+                                    ))))
                         || (matches!(
                             class_name,
                             "jdk/internal/loader/URLClassPath" | "sun/misc/URLClassPath"
@@ -12597,6 +12608,26 @@ fn invoke_on_class_shared_inner(
                         || (class_name == "java/util/concurrent/LinkedBlockingQueue"
                             && method_name == "clear"
                             && descriptor == "()V")
+                        || (class_name == "java/util/concurrent/LinkedBlockingDeque"
+                            && method_name == "clear"
+                            && descriptor == "()V")
+                        || (class_name == "java/io/BufferedInputStream"
+                            && matches!(
+                                (method_name, descriptor),
+                                ("read", "()I")
+                                    | ("read", "([BII)I")
+                                    | ("skip", "(J)J")
+                                    | ("available", "()I")
+                                    | ("mark", "(I)V")
+                                    | ("reset", "()V")
+                                    | ("markSupported", "()Z")
+                                    | ("close", "()V")
+                            ))
+                        || (matches!(class_name, "java/lang/Iterable" | "java/util/Collection" | "java/util/Set" | "java/util/EnumSet")
+                            && method_name == "iterator"
+                            && descriptor == "()Ljava/util/Iterator;")
+                        || (class_name == "java/util/Iterator"
+                            && matches!(method_name, "hasNext" | "next" | "remove"))
                         // Spring Reactor StepVerifier uses timed
                         // CountDownLatch.await during cancel/timeout tests. The
                         // real JDK latch parks through AQS/Unsafe machinery; the
@@ -14131,6 +14162,29 @@ fn invoke_on_class_shared_inner(
                 descriptor,
                 receiver_type.as_deref(),
             );
+        }
+    }
+
+    if !is_native {
+        let class_name_for_force = shared
+            .class_manager
+            .read()
+            .get_class(declaring_class_id)
+            .map(|c| c.name.to_string())
+            .unwrap_or_default();
+        if crate::runtime::interpreter::should_force_registered_native_over_bytecode(
+            shared,
+            &class_name_for_force,
+            method_name,
+            descriptor,
+        ) {
+            if let Some(callback) =
+                shared
+                    .native_methods
+                    .find(&class_name_for_force, method_name, descriptor)
+            {
+                return safe_native_call(shared, thread, callback, args);
+            }
         }
     }
 
