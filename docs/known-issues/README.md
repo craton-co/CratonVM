@@ -4,6 +4,15 @@ This folder collects CratonVM-only defects found while running upstream Java
 suites. The docs had grown to describe the **same underlying bug from several
 angles**; this index is the consolidated map. Read it first.
 
+## 2026-07-10 WildFly corrupt-Value doc: `Level.parse` FIXED, new `ThreadPoolExecutor.execute()` regression found (OPEN, blocking)
+
+Investigating `wildfly-domain-heap-corrupt-value-timeout.md`'s front-line
+residuals surfaced two unrelated, earlier-gating bugs before those residuals
+could be reached again:
+
+- FIXED: [`java-util-logging-level-parse-throws-for-all-names-FIXED.md`](../internal/fixed-suite-bugs/java-util-logging-level-parse-throws-for-all-names-FIXED.md) — `java.util.logging.Level.parse(String)` threw `IllegalArgumentException` for *every* name, including standard JDK constants (`Level.parse("WARNING")` itself failed), due to a JDK-25 `KnownLevel`/module-synthesis gap. Broke WildFly's own `host.xml`/`domain.xml` parsing of `<level name="WARN"/>`. Fixed with a targeted native override.
+- OPEN (new, blocking): [`threadpoolexecutor-execute-npe-on-ctl-regression.md`](threadpoolexecutor-execute-npe-on-ctl-regression.md) — `Executors.newSingleThreadExecutor()`/`newFixedThreadPool()`/`newCachedThreadPool()` return objects whose `.execute(Runnable)` now NPEs on `ThreadPoolExecutor`'s uninitialized `ctl` field — a **completely standalone-reproducible regression**, bisected (via fresh rebuilds) to `be605560..f28d6ae6` (2026-07-09) but the exact dispatch mechanism was NOT located despite three separate print-tracing attempts (all reverted). This now kills WildFly's process-controller "Read thread" before the Host Controller handshake completes, gating the original doc's own residuals from being re-observed live.
+
 ## 2026-07-10 Tomcat NIO/HTTP2 bare-assertions doc RETIRED; ByteBuffer.mark()/reset() found broken for real-JDK objects (FIXED); 1 narrow residual split off
 
 Fixed the doc's own `\p{XDigit}` regex residual, and — while root-causing
