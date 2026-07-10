@@ -962,7 +962,16 @@ CratonVM's own synthetic `Executors.*` placeholder objects (they share that
 exact class name) of their native overrides. An independent, parallel
 Elasticsearch-suite investigation hit and documented the identical bug the
 same day — see
-`docs/internal/fixed-suite-bugs/elasticsearch-suite/ES-FAIL-20260710-executors-factory-synthetic-mainlock-npe-FIXED.md`.
+`docs/internal/elasticsearch-suite/ES-FAIL-20260710-executors-factory-synthetic-mainlock-npe-FIXED.md`
+(a THIRD independent fix, landed while this session was mid-verification,
+took a different tack for that specific doc — constructing genuinely real
+`ThreadPoolExecutor`/`Thread` objects via their real constructors — which is
+also a legitimate resolution and doesn't conflict with this fix). A related,
+separately-filed dispatch bug
+(`docs/internal/threadpoolexecutor-execute-dispatch-degrades-to-synchronous-FIXED.md`
+— any real `ThreadPoolExecutor.execute()` losing async semantics, found by
+yet another session verifying the above) turned out to share this exact same
+root cause and is fixed by the same change.
 Fix moves the real-vs-synthetic distinction from registration time to
 dispatch time via a new `NativeContext::invoke_virtual_bytecode_only`
 escape hatch. Verified with three standalone probes (no WildFly): the

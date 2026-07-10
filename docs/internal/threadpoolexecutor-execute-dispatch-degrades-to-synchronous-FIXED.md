@@ -1,6 +1,38 @@
 # Real `ThreadPoolExecutor.execute()` degraded to synchronous (or, before `306cd352`, silently dropped) — receiver-real check not fully effective
 
-Status: OPEN — bisected, not root-caused (out of scope for the fix that surfaced it)
+Status: RESOLVED (2026-07-10) — root cause pinned down and fixed by the very next session to touch
+this area (branch `fix/wildfly-hib32-gate-20260710`); see the "Root-caused and fixed" update below.
+Moved to `docs/internal/`.
+
+## 2026-07-10 update (root-caused and fixed)
+
+This doc's own analysis correctly suspected "a fourth, unpatched dispatch path" — confirmed: it's
+`try_stackless_invoke`'s own direct, unconditional native-registry lookup
+(`vm/src/runtime/interpreter.rs`), which is NOT one of the three receiver-aware exemptions
+`306cd352` patched (`intercept_force_registered_native`, `invoke_or_native`,
+`invoke_on_class_shared_inner`). A real `ThreadPoolExecutor.execute()` call reaching dispatch
+through that path still finds `native_es_execute` registered (correctly — the registration itself
+is receiver-agnostic) and calls it, landing on `306cd352`'s own defense-in-depth branch, which ran
+the task inline/synchronously specifically to break the shared async-pool's self-recursion — but
+fired for every real receiver reaching native this way, not just that one case.
+
+**Fix**: rather than patching a fifth dispatch point with the same kind of check, the registry-level
+drop for `java/util/concurrent/ThreadPoolExecutor` (`native-api/src/registry.rs`) was removed
+entirely, and the real-vs-synthetic decision moved fully into the native callbacks via a new
+`NativeContext::invoke_virtual_bytecode_only` (calls `interpreter::execute` directly, bypassing
+every native check — not just the primary one; `invoke_on_class_shared` was tried first and found
+to have its own unconditional native re-check for concrete declaring classes, which would have
+reintroduced this exact bug). `native_es_execute`'s old synchronous-inline defense-in-depth branch
+was removed as dead code once the earlier check unconditionally routes a real receiver to genuine
+bytecode instead. See
+`docs/internal/threadpoolexecutor-execute-npe-on-ctl-regression-FIXED.md` for the full writeup.
+
+**Verified** with this doc's own exact repro (`ExecProbe3.java`, plain `new ThreadPoolExecutor(...)`,
+3 tasks): all 3 now run on distinct worker threads (`Thread[#1,...]`/`Thread[#2,...]`/`Thread[#3,...]`),
+confirmed not the calling thread — matches the "correct" behavior this doc's own bisection
+described for `4b08ffad` before either receiver-check fix landed.
+
+## Original report
 
 Found: 2026-07-10, while verifying
 `docs/known-issues/elasticsearch-suite/ES-FAIL-20260710-executors-factory-synthetic-mainlock-npe-FIXED.md`
