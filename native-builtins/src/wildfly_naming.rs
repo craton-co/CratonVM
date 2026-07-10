@@ -1292,7 +1292,7 @@ fn native_context_list_bindings(ctx: &mut dyn NativeContext, args: &[Value]) -> 
     // NamingEnumeration backing.
     let binding_cid = match ctx.ensure_class_initialized("javax/naming/Binding") {
         Ok(cid) => cid,
-        Err(_) => cratonvm_types::ClassId::new(0),
+        Err(_) => ctx.ensure_synthetic_class("javax/naming/Binding", 8),
     };
     let arr = ctx.new_ref_array(binding_cid, children.len());
     for (i, (k, v)) in children.iter().enumerate() {

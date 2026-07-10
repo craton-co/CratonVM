@@ -1263,7 +1263,7 @@ pub(crate) fn native_runtime_get_runtime(
 ) -> MethodCallResult {
     let class_id = match ctx.ensure_class_initialized("java/lang/Runtime") {
         Ok(id) => id,
-        Err(_) => cratonvm_types::ClassId::new(0),
+        Err(_) => ctx.ensure_synthetic_class("java/lang/Runtime", 8),
     };
     let obj = ctx.alloc_object(class_id, 0);
     Ok(Some(Value::Object(Some(obj))))

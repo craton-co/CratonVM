@@ -179,7 +179,7 @@ disable a default-on behavior.
 | `CRATONVM_NO_STUBS` | Drop **every** `SyntheticStub` native at registration so calls fall through to real JDK bytecode (or a clear `NoSuchMethodError`) instead of a fake. Opt-in; surfaces real gaps as errors. `Intrinsic`/`Bridge` natives are unaffected. | Off (stubs present) |
 | `CRATONVM_REAL_NET_SOCKETS` | Use the real `java.net` socket bytecode (the central registry drops the synthetic `java/net/Socket`/`ServerSocket` natives) instead of the synthetic socket layer. | Off (synthetic) |
 | `CRATONVM_REAL_AQS` | Route `AbstractQueuedSynchronizer` / `ReentrantLock` etc. through real `java.util.concurrent` bytecode instead of the synthetic lock natives. | Off (synthetic) |
-| `CRATONVM_REAL_ANNOTATIONS` | Route annotation reflection (`getAnnotation`/`annotationType`/attribute reads) through real JDK bytecode. | Off (synthetic) |
+| `CRATONVM_REAL_ANNOTATIONS` | Annotation reflection uses real proxy-backed annotation objects by default; set to `0` to use the old synthetic representation. | On (real); opt out with `CRATONVM_REAL_ANNOTATIONS=0` or `CRATONVM_SYNTHETIC_ANNOTATIONS=1` |
 | `CRATONVM_REAL_FORKJOINPOOL` | Drop the synthetic `ForkJoinPool` natives and run the real `java.util.concurrent` pool. **Experimental** (see Family A4 in known-issues). | Off (synthetic) |
 | `CRATONVM_REAL_RAF` / `CRATONVM_SYNTHETIC_RAF` | Force real / synthetic `RandomAccessFile`. | Real (auto) |
 | `CRATONVM_REAL_PROXY_SUPER` | Use the real `java.lang.reflect.Proxy` super-class path. Opt out to the synthetic experimental path with `=0`. | On (real) |
