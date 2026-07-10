@@ -923,7 +923,10 @@ pub fn safe_native_call(
             }
         }
         Err(MethodCallFailed::ExceptionThrown(exc)) => {
-            let exc_is_current = shared.heap.is_object_address(exc.as_ptr() as usize).is_some();
+            let exc_is_current = shared
+                .heap
+                .is_object_address(exc.as_ptr() as usize)
+                .is_some();
             if !exc_is_current {
                 if let Some(obj) = thread
                     .native_pin_roots
@@ -969,6 +972,23 @@ pub fn native_return_pushed_to_stack(shared: &SharedVm, thread: &mut JvmThread) 
         return;
     }
     crate::runtime::interpreter::update_root_snapshot(shared, thread);
+}
+
+/// Return the post-GC remapped object result published by [`safe_native_call`].
+///
+/// `safe_native_call` stores object returns in `native_pending_return` and
+/// publishes that slot as a root before native pins are unwound. If a moving GC
+/// runs before the caller pushes the raw `Value` returned by the native, the
+/// pending slot is updated but the raw `Value` is not. Native push sites should
+/// call this immediately before pushing/coercing object returns.
+#[inline]
+pub fn remap_pending_native_return(thread: &JvmThread, value: Value) -> Value {
+    if matches!(value, Value::Object(Some(_))) {
+        if let Some(obj) = thread.native_pending_return {
+            return Value::Object(Some(obj));
+        }
+    }
+    value
 }
 
 /// Acquire a Java monitor, blocking GC-SAFELY on contention. Returns the
@@ -3129,12 +3149,55 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
     }
 
     fn new_array(&mut self, element_type: ArrayElementType, length: usize) -> ObjectRef {
+        if std::env::var_os("CRATONVM_DBG_LARGE_ARRAY_ALLOC").is_some() && length > 100_000_000 {
+            eprintln!(
+                "[DBG_LARGE_ARRAY_ALLOC native] class_id=0 element_type={:?} length={} (0x{:x}) frames={}",
+                element_type,
+                length,
+                length,
+                self.thread.frames.len()
+            );
+            for (i, frame) in self.thread.frames.iter().rev().take(64).enumerate() {
+                eprintln!(
+                    "[DBG_LARGE_ARRAY_ALLOC native frame {}] {}.{}{} pc={}",
+                    i,
+                    frame.class_name(),
+                    frame.method_name(),
+                    frame.method_descriptor(),
+                    frame.pc
+                );
+            }
+            eprintln!(
+                "[DBG_LARGE_ARRAY_ALLOC native rust]
+{}",
+                std::backtrace::Backtrace::force_capture()
+            );
+        }
         self.shared
             .heap
             .alloc_array(ClassId::new(0), element_type, length)
     }
 
     fn new_ref_array(&mut self, class_id: ClassId, length: usize) -> ObjectRef {
+        if std::env::var_os("CRATONVM_DBG_LARGE_ARRAY_ALLOC").is_some() && length > 100_000_000 {
+            eprintln!(
+                "[DBG_LARGE_ARRAY_ALLOC native_ref] class_id={} length={} (0x{:x}) frames={}",
+                class_id.as_u32(),
+                length,
+                length,
+                self.thread.frames.len()
+            );
+            for (i, frame) in self.thread.frames.iter().rev().take(64).enumerate() {
+                eprintln!(
+                    "[DBG_LARGE_ARRAY_ALLOC native_ref frame {}] {}.{}{} pc={}",
+                    i,
+                    frame.class_name(),
+                    frame.method_name(),
+                    frame.method_descriptor(),
+                    frame.pc
+                );
+            }
+        }
         if class_id.as_u32() == 0 && crate::runtime::env_cache::dbg_toarray() {
             let frame = self
                 .thread
@@ -3715,10 +3778,12 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
                 let cached = self.shared.anon_class_cache[num_fields]
                     .load(std::sync::atomic::Ordering::Relaxed);
                 if cached != 0 {
+                    let cached_id = ClassId::new(cached);
                     return self
                         .shared
                         .heap
-                        .alloc_object(ClassId::new(cached), num_fields);
+                        .try_alloc_object_old(cached_id, num_fields)
+                        .unwrap_or_else(|| self.shared.heap.alloc_object(cached_id, num_fields));
                 }
             }
             let name = format!("cratonvm/synthetic/AnonymousObject${num_fields}");
@@ -3784,7 +3849,13 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
             .map(|c| c.num_total_fields)
             .unwrap_or(0);
         let slots = num_fields.max(real_fields);
-        self.shared.heap.alloc_object(class_id, slots)
+        // Native helpers frequently hold raw ObjectRefs across Rust calls while
+        // constructing return values. Prefer old-gen allocation so moving-young
+        // GC cannot relocate such a helper before the Java caller stores it.
+        self.shared
+            .heap
+            .try_alloc_object_old(class_id, slots)
+            .unwrap_or_else(|| self.shared.heap.alloc_object(class_id, slots))
     }
 
     fn ensure_class_initialized(&mut self, name: &str) -> Result<ClassId, MethodCallFailed> {
@@ -3805,7 +3876,16 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
         // returns the existing id when the name is already registered, so a
         // successful load here keeps native allocations on the real layout.
         if let Ok(cid) = self.shared.load_class_concurrent(name) {
-            return cid;
+            let exact = self
+                .shared
+                .class_manager
+                .read()
+                .get_class(cid)
+                .map(|c| c.name.as_ref() == name)
+                .unwrap_or(false);
+            if exact && (name == "java/lang/Object" || cid != ClassId::new(0)) {
+                return cid;
+            }
         }
         // Real class unavailable: register a minimal synthetic class that
         // declares `num_fields` instance fields. This guarantees the object
@@ -6651,7 +6731,10 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
         };
         for m in &class.methods {
             if &*m.name == method_name && &*m.descriptor == method_desc {
-                return extract_return_type_argument_annotations(&m.attributes, &class.constant_pool);
+                return extract_return_type_argument_annotations(
+                    &m.attributes,
+                    &class.constant_pool,
+                );
             }
         }
         Vec::new()
@@ -6706,7 +6789,10 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
         };
         for f in &class.fields {
             if &*f.name == field_name {
-                return extract_field_type_argument_annotations(&f.attributes, &class.constant_pool);
+                return extract_field_type_argument_annotations(
+                    &f.attributes,
+                    &class.constant_pool,
+                );
             }
         }
         Vec::new()
@@ -8164,10 +8250,11 @@ pub fn invoke_or_native(
         // end of this function — provided real bytecode actually exists. The
         // ReentrantLock fallback is also protected this way: it exists only for
         // fake-JDK synthetic lock stubs and must not steal real AQS bytecode.
-        let synthetic_stub_native = shared
-            .native_methods
-            .kind_of(effective_class, method_name, descriptor)
-            == Some(cratonvm_native_api::NativeKind::SyntheticStub);
+        let synthetic_stub_native =
+            shared
+                .native_methods
+                .kind_of(effective_class, method_name, descriptor)
+                == Some(cratonvm_native_api::NativeKind::SyntheticStub);
         let real_protected_stub = synthetic_stub_native
             && (crate::runtime::env_cache::real_bytecode_selector().prefers_real(effective_class)
                 || matches!(
@@ -8178,6 +8265,7 @@ pub fn invoke_or_native(
                         | "java/util/EnumSet"
                         | "java/util/StringJoiner"
                         | "java/io/FileInputStream"
+                        | "java/io/InputStreamReader"
                         | "java/lang/ref/Cleaner"
                         | "java/lang/ref/Cleaner$Cleanable"
                         | "java/lang/management/ManagementFactory"
@@ -12390,6 +12478,12 @@ fn invoke_on_class_shared_inner(
                         || (class_name == "java/util/concurrent/LinkedBlockingQueue"
                             && method_name == "clear"
                             && descriptor == "()V")
+                        // Keep the slow stackless/native path aligned with
+                        // interpreter.rs::force_native_over_real_jdk_bytecode
+                        // for Map's default forEach implementation.
+                        || (class_name == "java/util/Map"
+                            && method_name == "forEach"
+                            && descriptor == "(Ljava/util/function/BiConsumer;)V")
                         // Spring Reactor StepVerifier uses timed
                         // CountDownLatch.await during cancel/timeout tests. The
                         // real JDK latch parks through AQS/Unsafe machinery; the
@@ -12397,6 +12491,76 @@ fn invoke_on_class_shared_inner(
                         // and waits on the object monitor. Keep this slow-path
                         // gate in sync with force_native_over_real_jdk_bytecode.
                         || crate::runtime::interpreter::is_count_down_latch_native_override(
+                            class_name,
+                            method_name,
+                            descriptor,
+                        )
+                        || crate::runtime::interpreter::is_enum_set_native_override(
+                            class_name,
+                            method_name,
+                            descriptor,
+                        )
+                        || crate::runtime::interpreter::is_unsafe_object_field_offset_native_override(
+                            class_name,
+                            method_name,
+                            descriptor,
+                        )
+                        || crate::runtime::interpreter::is_sun_unsafe_ordered_write_native_override(
+                            class_name,
+                            method_name,
+                            descriptor,
+                        )
+                        || crate::runtime::interpreter::is_java_util_hash_native_override(
+                            class_name,
+                            method_name,
+                            descriptor,
+                        )
+                        || crate::runtime::interpreter::is_collectors_native_override(
+                            class_name,
+                            method_name,
+                            descriptor,
+                        )
+                        || crate::runtime::interpreter::is_smallrye_process_native_override(
+                            class_name,
+                            method_name,
+                            descriptor,
+                        )
+                        || crate::runtime::interpreter::is_regex_matcher_native_override(
+                            class_name,
+                            method_name,
+                            descriptor,
+                        )
+                        || crate::runtime::interpreter::is_liquibase_parser_factory_native_override(
+                            class_name,
+                            method_name,
+                            descriptor,
+                        )
+                        || crate::runtime::interpreter::is_file_is_invalid_native_override(
+                            class_name,
+                            method_name,
+                            descriptor,
+                        )
+                        || crate::runtime::interpreter::is_sax_parser_factory_set_validating_native_override(
+                            class_name,
+                            method_name,
+                            descriptor,
+                        )
+                        || crate::runtime::interpreter::is_liquibase_entity_resolver_native_override(
+                            class_name,
+                            method_name,
+                            descriptor,
+                        )
+                        || crate::runtime::interpreter::is_liquibase_configuration_definition_native_override(
+                            class_name,
+                            method_name,
+                            descriptor,
+                        )
+                        || crate::runtime::interpreter::is_liquibase_expression_expander_native_override(
+                            class_name,
+                            method_name,
+                            descriptor,
+                        )
+                        || crate::runtime::interpreter::is_hibernate_query_engine_validate_named_queries_native_override(
                             class_name,
                             method_name,
                             descriptor,
@@ -12540,6 +12704,11 @@ fn invoke_on_class_shared_inner(
                         // cglib_probe: defensive Unsafe.defineClass shim (null bytecode → null).
                         || (matches!(class_name, "sun/misc/Unsafe" | "jdk/internal/misc/Unsafe")
                             && method_name == "defineClass")
+                        || crate::runtime::interpreter::is_unsafe_object_field_offset_native_override(
+                            class_name,
+                            method_name,
+                            descriptor,
+                        )
                         // sportme (Spring Boot 2): AbstractBeanFactory / AbstractBeanDefinition
                         // resolveBeanClass — real-JDK bytecode calls ClassUtils.forName which
                         // throws ClassNotFoundException for beans whose class is missing on
@@ -14346,8 +14515,7 @@ mod tests {
             ctx: &mut dyn cratonvm_native_api::NativeContext,
             _args: &[Value],
         ) -> MethodCallResult {
-            let stale =
-                unsafe { ObjectRef::from_raw(0xfeed_face_0000_1000usize as *mut u8) };
+            let stale = unsafe { ObjectRef::from_raw(0xfeed_face_0000_1000usize as *mut u8) };
             let live = ctx.alloc_object(ClassId::new(0), 0);
             ctx.pin_native_root(live);
             Err(MethodCallFailed::ExceptionThrown(stale))
@@ -14355,12 +14523,7 @@ mod tests {
 
         let shared = test_shared();
         let mut thread = JvmThread::new(ThreadId(0), "test");
-        let result = safe_native_call(
-            &shared,
-            &mut thread,
-            throwing_native,
-            &[],
-        );
+        let result = safe_native_call(&shared, &mut thread, throwing_native, &[]);
         let thrown = match result {
             Err(MethodCallFailed::ExceptionThrown(exc)) => exc,
             other => panic!("expected native Java exception, got {other:?}"),

@@ -133,8 +133,18 @@ fn register_object_name(r: &mut NativeMethodRegistry) {
         "()Ljava/lang/String;",
         native_object_name_to_string,
     );
-    r.register(cls, "toString", "()Ljava/lang/String;", native_object_name_to_string);
-    r.register(cls, "getDomain", "()Ljava/lang/String;", native_object_name_domain);
+    r.register(
+        cls,
+        "toString",
+        "()Ljava/lang/String;",
+        native_object_name_to_string,
+    );
+    r.register(
+        cls,
+        "getDomain",
+        "()Ljava/lang/String;",
+        native_object_name_domain,
+    );
     r.register(
         cls,
         "apply",
@@ -177,10 +187,15 @@ fn object_name_new(ctx: &mut dyn NativeContext, text: String) -> ObjectRef {
 
 fn register_object_instance(r: &mut NativeMethodRegistry) {
     let cls = "javax/management/ObjectInstance";
-    r.register(cls, "getObjectName", "()Ljavax/management/ObjectName;", |ctx, args| {
-        let this = obj_arg(args, 0)?;
-        Ok(Some(ctx.get_field_by_name(this, "name")))
-    });
+    r.register(
+        cls,
+        "getObjectName",
+        "()Ljavax/management/ObjectName;",
+        |ctx, args| {
+            let this = obj_arg(args, 0)?;
+            Ok(Some(ctx.get_field_by_name(this, "name")))
+        },
+    );
     r.register(cls, "getClassName", "()Ljava/lang/String;", |ctx, args| {
         let this = obj_arg(args, 0)?;
         Ok(Some(ctx.get_field_by_name(this, "className")))
@@ -204,7 +219,11 @@ fn object_name_quote_text(input: &str) -> String {
     out
 }
 
-fn object_name_table_get(ctx: &mut dyn NativeContext, table: ObjectRef, key: &str) -> Option<String> {
+fn object_name_table_get(
+    ctx: &mut dyn NativeContext,
+    table: ObjectRef,
+    key: &str,
+) -> Option<String> {
     let key_obj = ctx.create_string(key);
     match ctx.invoke_virtual(
         table,
@@ -323,7 +342,10 @@ fn native_object_name_domain(ctx: &mut dyn NativeContext, args: &[Value]) -> Met
         _ => return Ok(Some(Value::Object(None))),
     };
     let text = object_name_text(ctx, this);
-    let domain = text.split_once(':').map(|(d, _)| d).unwrap_or(text.as_str());
+    let domain = text
+        .split_once(':')
+        .map(|(d, _)| d)
+        .unwrap_or(text.as_str());
     let s = ctx.create_string(domain);
     Ok(Some(Value::Object(Some(s))))
 }

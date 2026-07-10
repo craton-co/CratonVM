@@ -145,6 +145,12 @@ pub fn register_h2_parser_fastpaths(registry: &mut NativeMethodRegistry) {
         h2_parser_set_token_index,
     );
     registry.register(
+        H2_SESSION_LOCAL,
+        "prepareLocal",
+        "(Ljava/lang/String;)Lorg/h2/command/Command;",
+        h2_session_prepare_local_no_cache,
+    );
+    registry.register(
         "org/h2/constraint/ConstraintReferential",
         "checkExistingData",
         "(Lorg/h2/engine/SessionLocal;)V",
@@ -624,6 +630,35 @@ fn h2_long_data_type_binary_search(
     }
 
     Ok(Some(Value::Int(low ^ -1)))
+}
+
+
+fn h2_session_prepare_local_no_cache(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(o))) => *o,
+        _ => return Ok(Some(Value::Object(None))),
+    };
+    let sql = match args.get(1) {
+        Some(Value::Object(Some(o))) => *o,
+        _ => return Ok(Some(Value::Object(None))),
+    };
+
+    let parser = match ctx.new_object_initialized(
+        "org/h2/command/Parser",
+        "(Lorg/h2/engine/SessionLocal;)V",
+        &[Value::Object(Some(this))],
+    )? {
+        Some(Value::Object(Some(o))) => o,
+        _ => return Ok(Some(Value::Object(None))),
+    };
+    let command = ctx.invoke_virtual(
+        parser,
+        "prepareCommand",
+        "(Ljava/lang/String;)Lorg/h2/command/Command;",
+        &[Value::Object(Some(sql))],
+    )?;
+    ctx.set_field_by_name(this, "derivedTableIndexCache", Value::Object(None));
+    Ok(command)
 }
 
 fn h2_constraint_check_existing_data(

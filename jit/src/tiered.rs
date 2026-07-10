@@ -1672,10 +1672,7 @@ mod tests {
         let key = test_key();
 
         // 1st invocation crosses c1_threshold=1 and enqueues C1.
-        assert_eq!(
-            mgr.on_method_invocation(&key),
-            Some(CompilationTier::C1)
-        );
+        assert_eq!(mgr.on_method_invocation(&key), Some(CompilationTier::C1));
         // Fail it MAX_TIER_FAIL_RETRIES - 1 times; each failure must still
         // leave the method eligible for another attempt (queued_for_compilation
         // reset, current_tier untouched).

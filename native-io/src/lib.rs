@@ -4660,14 +4660,11 @@ pub fn register_io_natives(registry: &mut NativeMethodRegistry) {
         #[cfg(unix)]
         pub const SIZEOF_FAMILY: i32 = std::mem::size_of::<libc::sa_family_t>() as i32;
         #[cfg(unix)]
-        pub const OFFSET_FAMILY: i32 =
-            std::mem::offset_of!(libc::sockaddr_in, sin_family) as i32;
+        pub const OFFSET_FAMILY: i32 = std::mem::offset_of!(libc::sockaddr_in, sin_family) as i32;
         #[cfg(unix)]
-        pub const OFFSET_SIN4_PORT: i32 =
-            std::mem::offset_of!(libc::sockaddr_in, sin_port) as i32;
+        pub const OFFSET_SIN4_PORT: i32 = std::mem::offset_of!(libc::sockaddr_in, sin_port) as i32;
         #[cfg(unix)]
-        pub const OFFSET_SIN4_ADDR: i32 =
-            std::mem::offset_of!(libc::sockaddr_in, sin_addr) as i32;
+        pub const OFFSET_SIN4_ADDR: i32 = std::mem::offset_of!(libc::sockaddr_in, sin_addr) as i32;
         #[cfg(unix)]
         pub const OFFSET_SIN6_PORT: i32 =
             std::mem::offset_of!(libc::sockaddr_in6, sin6_port) as i32;
@@ -4716,12 +4713,18 @@ pub fn register_io_natives(registry: &mut NativeMethodRegistry) {
     // are provided as literals in `sockaddr_abi` below (note AF_INET6 is
     // 23 on Windows vs 10 on Linux).
     use sockaddr_abi as sa;
-    registry.register("sun/nio/ch/NativeSocketAddress", "AFINET", "()I", |_ctx, _args| {
-        Ok(Some(Value::Int(sa::AF_INET)))
-    });
-    registry.register("sun/nio/ch/NativeSocketAddress", "AFINET6", "()I", |_ctx, _args| {
-        Ok(Some(Value::Int(sa::AF_INET6)))
-    });
+    registry.register(
+        "sun/nio/ch/NativeSocketAddress",
+        "AFINET",
+        "()I",
+        |_ctx, _args| Ok(Some(Value::Int(sa::AF_INET))),
+    );
+    registry.register(
+        "sun/nio/ch/NativeSocketAddress",
+        "AFINET6",
+        "()I",
+        |_ctx, _args| Ok(Some(Value::Int(sa::AF_INET6))),
+    );
     registry.register(
         "sun/nio/ch/NativeSocketAddress",
         "sizeofSockAddr4",
@@ -5645,9 +5648,9 @@ fn bb_state(
                 other => {
                     return Err(MethodCallFailed::InternalError(VmError::Internal {
                         message: format!(
-                            "ByteBuffer missing backing array (field {} returned {:?} for object {:?})",
-                            BB_FIELD_ARRAY, other, this
-                        ),
+                        "ByteBuffer missing backing array (field {} returned {:?} for object {:?})",
+                        BB_FIELD_ARRAY, other, this
+                    ),
                     }))
                 }
             },
@@ -7307,6 +7310,7 @@ fn register_string_rw_natives(registry: &mut NativeMethodRegistry) {
     // 3-field layout (content/pos/length). Register them as SyntheticStub so
     // fake-JDK StringReader links, while real JDK bytecode still wins when the
     // class is loaded from a real java.base.
+    #[cfg(feature = "synthetic-jdk")]
     registry.with_category(cratonvm_native_api::NativeKind::SyntheticStub, |registry| {
         let sr = "java/io/StringReader";
         registry.register(sr, "<init>", "(Ljava/lang/String;)V", native_sr_init);
@@ -10463,37 +10467,69 @@ fn native_car_ready(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRe
 const CAW_FIELD_BUF: usize = 0;
 const CAW_FIELD_COUNT: usize = 1;
 
+fn caw_buf(ctx: &dyn NativeContext, this: ObjectRef) -> Option<ObjectRef> {
+    match ctx.get_field_by_name(this, "buf") {
+        Value::Object(Some(o)) if ctx.object_is_array(o) => Some(o),
+        _ => match ctx.get_field(this, CAW_FIELD_BUF) {
+            Value::Object(Some(o)) if ctx.object_is_array(o) => Some(o),
+            _ => None,
+        },
+    }
+}
+
+fn caw_set_buf(ctx: &dyn NativeContext, this: ObjectRef, buf: ObjectRef) {
+    ctx.set_field_by_name(this, "buf", Value::Object(Some(buf)));
+    if caw_buf(ctx, this) != Some(buf) {
+        ctx.set_field(this, CAW_FIELD_BUF, Value::Object(Some(buf)));
+    }
+}
+
+fn caw_count(ctx: &dyn NativeContext, this: ObjectRef) -> usize {
+    match ctx.get_field_by_name(this, "count") {
+        Value::Int(v) => v.max(0) as usize,
+        _ => match ctx.get_field(this, CAW_FIELD_COUNT) {
+            Value::Int(v) => v.max(0) as usize,
+            _ => 0,
+        },
+    }
+}
+
+fn caw_set_count(ctx: &dyn NativeContext, this: ObjectRef, count: usize) {
+    let value = Value::Int(count.min(i32::MAX as usize) as i32);
+    ctx.set_field_by_name(this, "count", value);
+    if caw_count(ctx, this) != count.min(i32::MAX as usize) {
+        ctx.set_field(this, CAW_FIELD_COUNT, value);
+    }
+}
+
 fn native_caw_init(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = match args.first() {
         Some(Value::Object(Some(o))) => *o,
         _ => return Ok(None),
     };
     let buf = ctx.new_array(cratonvm_types::ArrayElementType::Char, 32);
-    ctx.set_field(this, CAW_FIELD_BUF, Value::Object(Some(buf)));
-    ctx.set_field(this, CAW_FIELD_COUNT, Value::Int(0));
+    caw_set_buf(ctx, this, buf);
+    caw_set_count(ctx, this, 0);
     Ok(None)
 }
 
 fn caw_ensure_capacity(ctx: &mut dyn NativeContext, this: ObjectRef, needed: usize) {
-    let buf = match ctx.get_field(this, CAW_FIELD_BUF) {
-        Value::Object(Some(o)) => o,
+    let buf = match caw_buf(ctx, this) {
+        Some(o) => o,
         _ => return,
     };
     let cap = ctx.array_length(buf);
     if needed <= cap {
         return;
     }
-    let new_cap = std::cmp::max(needed, cap * 2);
+    let new_cap = std::cmp::max(needed, cap.saturating_mul(2));
     let new_buf = ctx.new_array(cratonvm_types::ArrayElementType::Char, new_cap);
-    let count = match ctx.get_field(this, CAW_FIELD_COUNT) {
-        Value::Int(v) => v as usize,
-        _ => 0,
-    };
+    let count = caw_count(ctx, this).min(cap);
     for i in 0..count {
         let v = ctx.get_array_element(buf, i);
         ctx.set_array_element(new_buf, i, v);
     }
-    ctx.set_field(this, CAW_FIELD_BUF, Value::Object(Some(new_buf)));
+    caw_set_buf(ctx, this, new_buf);
 }
 
 fn native_caw_write(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
@@ -10505,17 +10541,14 @@ fn native_caw_write(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRe
         Some(Value::Int(v)) => *v,
         _ => 0,
     };
-    let count = match ctx.get_field(this, CAW_FIELD_COUNT) {
-        Value::Int(v) => v as usize,
-        _ => 0,
-    };
+    let count = caw_count(ctx, this);
     caw_ensure_capacity(ctx, this, count + 1);
-    let buf = match ctx.get_field(this, CAW_FIELD_BUF) {
-        Value::Object(Some(o)) => o,
+    let buf = match caw_buf(ctx, this) {
+        Some(o) => o,
         _ => return Ok(None),
     };
     ctx.set_array_element(buf, count, Value::Int(ch));
-    ctx.set_field(this, CAW_FIELD_COUNT, Value::Int((count + 1) as i32));
+    caw_set_count(ctx, this, count + 1);
     Ok(None)
 }
 
@@ -10529,27 +10562,26 @@ fn native_caw_write_bulk(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
         _ => return Ok(None),
     };
     let off = match args.get(2) {
-        Some(Value::Int(v)) => *v as usize,
+        Some(Value::Int(v)) => (*v).max(0) as usize,
         _ => 0,
     };
     let len = match args.get(3) {
-        Some(Value::Int(v)) => *v as usize,
+        Some(Value::Int(v)) => (*v).max(0) as usize,
         _ => 0,
     };
-    let count = match ctx.get_field(this, CAW_FIELD_COUNT) {
-        Value::Int(v) => v as usize,
-        _ => 0,
-    };
+    let src_len = ctx.array_length(src);
+    let len = len.min(src_len.saturating_sub(off));
+    let count = caw_count(ctx, this);
     caw_ensure_capacity(ctx, this, count + len);
-    let buf = match ctx.get_field(this, CAW_FIELD_BUF) {
-        Value::Object(Some(o)) => o,
+    let buf = match caw_buf(ctx, this) {
+        Some(o) => o,
         _ => return Ok(None),
     };
     for i in 0..len {
         let v = ctx.get_array_element(src, off + i);
         ctx.set_array_element(buf, count + i, v);
     }
-    ctx.set_field(this, CAW_FIELD_COUNT, Value::Int((count + len) as i32));
+    caw_set_count(ctx, this, count + len);
     Ok(None)
 }
 
@@ -10558,14 +10590,11 @@ fn native_caw_to_string(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCa
         Some(Value::Object(Some(o))) => *o,
         _ => return Ok(Some(Value::Object(None))),
     };
-    let buf = match ctx.get_field(this, CAW_FIELD_BUF) {
-        Value::Object(Some(o)) => o,
+    let buf = match caw_buf(ctx, this) {
+        Some(o) => o,
         _ => return Ok(Some(Value::Object(None))),
     };
-    let count = match ctx.get_field(this, CAW_FIELD_COUNT) {
-        Value::Int(v) => v as usize,
-        _ => 0,
-    };
+    let count = caw_count(ctx, this).min(ctx.array_length(buf));
     let mut chars = Vec::with_capacity(count);
     for i in 0..count {
         if let Value::Int(ch) = ctx.get_array_element(buf, i) {
@@ -10582,14 +10611,11 @@ fn native_caw_to_char_array(ctx: &mut dyn NativeContext, args: &[Value]) -> Meth
         Some(Value::Object(Some(o))) => *o,
         _ => return Ok(Some(Value::Object(None))),
     };
-    let buf = match ctx.get_field(this, CAW_FIELD_BUF) {
-        Value::Object(Some(o)) => o,
+    let buf = match caw_buf(ctx, this) {
+        Some(o) => o,
         _ => return Ok(Some(Value::Object(None))),
     };
-    let count = match ctx.get_field(this, CAW_FIELD_COUNT) {
-        Value::Int(v) => v as usize,
-        _ => 0,
-    };
+    let count = caw_count(ctx, this).min(ctx.array_length(buf));
     let arr = ctx.new_array(cratonvm_types::ArrayElementType::Char, count);
     for i in 0..count {
         let v = ctx.get_array_element(buf, i);
@@ -10603,7 +10629,9 @@ fn native_caw_size(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRes
         Some(Value::Object(Some(o))) => *o,
         _ => return Ok(Some(Value::Int(0))),
     };
-    Ok(Some(ctx.get_field(this, CAW_FIELD_COUNT)))
+    Ok(Some(Value::Int(
+        caw_count(ctx, this).min(i32::MAX as usize) as i32,
+    )))
 }
 
 fn native_caw_reset(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
@@ -10611,7 +10639,7 @@ fn native_caw_reset(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRe
         Some(Value::Object(Some(o))) => *o,
         _ => return Ok(None),
     };
-    ctx.set_field(this, CAW_FIELD_COUNT, Value::Int(0));
+    caw_set_count(ctx, this, 0);
     Ok(None)
 }
 
@@ -14068,15 +14096,12 @@ fn native_afc_provider_open(ctx: &mut dyn NativeContext, args: &[Value]) -> Meth
     let path_obj = obj_arg92(args, 1)?;
     let path_str = validated_path(&read_path_str(ctx, path_obj))?;
     let option_array_value = match args.get(2) {
-        Some(Value::Object(Some(set_obj))) => match ctx.invoke_virtual(
-            *set_obj,
-            "toArray",
-            "()[Ljava/lang/Object;",
-            &[],
-        )? {
-            Some(Value::Object(Some(arr))) => Value::Object(Some(arr)),
-            _ => Value::Object(None),
-        },
+        Some(Value::Object(Some(set_obj))) => {
+            match ctx.invoke_virtual(*set_obj, "toArray", "()[Ljava/lang/Object;", &[])? {
+                Some(Value::Object(Some(arr))) => Value::Object(Some(arr)),
+                _ => Value::Object(None),
+            }
+        }
         _ => Value::Object(None),
     };
     let options = parse_afc_open_options(ctx, Some(&option_array_value))?;

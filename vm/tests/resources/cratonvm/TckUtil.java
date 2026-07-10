@@ -7,8 +7,11 @@ import java.util.LinkedList;
 import java.util.TreeMap;
 import java.util.Arrays;
 import java.util.Collections;
+import java.util.EnumSet;
 import java.util.Optional;
 import java.util.Iterator;
+import java.util.ListIterator;
+import java.util.concurrent.atomic.AtomicInteger;
 
 /**
  * TCK tests for java.util classes.
@@ -16,6 +19,9 @@ import java.util.Iterator;
  * Each test method returns 1 on success, 0 on failure.
  */
 public class TckUtil {
+
+    enum SmallEnumSetProbe { FIRST, SECOND }
+    enum LargeEnumSetProbe { E0, E1, E2, E3, E4, E5, E6, E7, E8, E9, E10, E11, E12, E13, E14, E15, E16, E17, E18, E19, E20, E21, E22, E23, E24, E25, E26, E27, E28, E29, E30, E31, E32, E33, E34, E35, E36, E37, E38, E39, E40, E41, E42, E43, E44, E45, E46, E47, E48, E49, E50, E51, E52, E53, E54, E55, E56, E57, E58, E59, E60, E61, E62, E63, E64, E65, E66, E67, E68, E69 }
 
     // -----------------------------------------------------------------------
     // ArrayList
@@ -104,6 +110,23 @@ public class TckUtil {
             count++;
         }
         if (count != 3) return 0;
+        return 1;
+    }
+
+    /** Test ArrayList ListIterator reverse traversal. */
+    public static int testArrayListListIteratorPrevious() {
+        ArrayList list = new ArrayList();
+        list.add("first");
+        list.add("second");
+
+        ListIterator it = list.listIterator(list.size());
+        if (!it.hasPrevious()) return 0;
+        if (!"second".equals(it.previous())) return 0;
+        if (it.nextIndex() != 1) return 0;
+        if (it.previousIndex() != 0) return 0;
+        if (!it.hasPrevious()) return 0;
+        if (!"first".equals(it.previous())) return 0;
+        if (it.hasPrevious()) return 0;
         return 1;
     }
 
@@ -486,6 +509,33 @@ public class TckUtil {
         Integer v = (Integer) map.get(Integer.valueOf(15));
         if (v == null || v.intValue() != 150) return 0;
         return 1;
+    }
+
+    /** Test EnumSet.allOf iterator traversal. */
+    public static int testEnumSetAllOfIterator() {
+        int count = 0;
+        for (SmallEnumSetProbe ignored : EnumSet.allOf(SmallEnumSetProbe.class)) {
+            count++;
+        }
+        return count == 2 ? 1 : 0;
+    }
+
+    public static int testLargeEnumSetAllOfIterator() {
+        int count = 0;
+        for (LargeEnumSetProbe ignored : EnumSet.allOf(LargeEnumSetProbe.class)) {
+            count++;
+        }
+        return count == 70 ? 1 : 0;
+    }
+
+    /** Test synchronizedCollection forEach delegates with an initialized mutex. */
+    public static int testCollectionsSynchronizedCollectionForEach() {
+        ArrayList list = new ArrayList();
+        list.add(Integer.valueOf(1));
+        list.add(Integer.valueOf(2));
+        AtomicInteger sum = new AtomicInteger(0);
+        Collections.synchronizedCollection(list).forEach(v -> sum.addAndGet(((Integer) v).intValue()));
+        return sum.get() == 3 ? 1 : 0;
     }
 
     /** Test ArrayList toArray. */

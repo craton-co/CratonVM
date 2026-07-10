@@ -1227,11 +1227,9 @@ fn native_option_map_get(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
     let (inner, key, default_val) = option_map_get_key(ctx, args)?;
 
     match inner.entries.get(&key) {
-        Some(OptionValue::Int(n)) => Ok(Some(crate::lang_class::box_value(
-            ctx,
-            Value::Int(*n),
-            "I",
-        ))),
+        Some(OptionValue::Int(n)) => {
+            Ok(Some(crate::lang_class::box_value(ctx, Value::Int(*n), "I")))
+        }
         Some(OptionValue::Long(n)) => Ok(Some(crate::lang_class::box_value(
             ctx,
             Value::Long(*n),

@@ -67,4 +67,4 @@ Keycloak probes:
   `IllegalMonitorStateException`, or GC breadcrumb signatures.
 
 The remaining later timeout is not this bug. It is tracked separately in
-[`../../known-issues/keycloak-model-realmmodeltest-post-infinispan-liquibase-timeout.md`](../../known-issues/keycloak-model-realmmodeltest-post-infinispan-liquibase-timeout.md).
+[`keycloak-model-realmmodeltest-post-infinispan-liquibase-timeout-FIXED.md`](keycloak-model-realmmodeltest-post-infinispan-liquibase-timeout-FIXED.md).

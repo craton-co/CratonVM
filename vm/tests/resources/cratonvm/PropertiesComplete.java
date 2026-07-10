@@ -257,4 +257,24 @@ public class PropertiesComplete {
         String val = System.getenv("DEFINITELY_NONEXISTENT_VAR_XYZ_123");
         return (val == null) ? 1 : 0;
     }
+
+    // ---- Test 31: ordinary Properties.get does not read System properties ----
+    public static int testPlainPropertiesGetIgnoresSystemProperties() {
+        String old = System.setProperty("password", "masked-global-password");
+        try {
+            Properties props = new Properties();
+            if (props.get("password") != null) return 0;
+            props.setProperty("password", "");
+            return "".equals(props.get("password")) ? 1 : 0;
+        } finally {
+            if (old == null) System.clearProperty("password");
+            else System.setProperty("password", old);
+        }
+    }
+
+    // ---- Test 32: regex split used by Keycloak model parameter parsing ----
+    public static int testStringSplitWhitespaceCommaRegex() {
+        String[] parts = "Infinispan,Jpa".split("\\s*,\\s*");
+        return parts.length == 2 && "Infinispan".equals(parts[0]) && "Jpa".equals(parts[1]) ? 1 : 0;
+    }
 }

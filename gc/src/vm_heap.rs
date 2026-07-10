@@ -280,6 +280,16 @@ impl VmHeap {
         }
     }
 
+    /// Try to allocate directly in the old generation. This is only available
+    /// for the generational heap; other heap implementations return `None` so
+    /// callers can fall back to their normal allocation path.
+    pub fn try_alloc_object_old(&self, class_id: ClassId, num_fields: usize) -> Option<ObjectRef> {
+        match self {
+            VmHeap::Generational(h) => h.try_alloc_object_old(class_id, num_fields),
+            VmHeap::G1(_) => None,
+        }
+    }
+
     /// Fallible twin of [`alloc_object`](Self::alloc_object): same (no-GC)
     /// allocation path including the old-generation spill, but returns `None`
     /// on true heap exhaustion instead of aborting the VM. Lets the JIT
@@ -1371,9 +1381,7 @@ impl VmHeap {
             // `GenerationalHeap::is_live_young_survivor` for the soundness
             // argument (STW-window-only, zeroed-span discriminator,
             // moving-collection compatibility).
-            VmHeap::Generational(h) => {
-                h.is_old_gen_addr(addr) || h.is_live_young_survivor(addr)
-            }
+            VmHeap::Generational(h) => h.is_old_gen_addr(addr) || h.is_live_young_survivor(addr),
             VmHeap::G1(h) => h.is_addr_in_live_region(addr),
         }
     }

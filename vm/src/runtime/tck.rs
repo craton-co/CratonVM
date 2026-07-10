@@ -4355,6 +4355,7 @@ impl CoreLanguageTck {
                 // StringReader / StringWriter
                 ("sw_basic", 1),
                 ("sr_readChar", 1),
+                ("sr_readCharArrayMultiline", 1),
                 // ByteBuffer
                 ("bb_allocateCapacity", 1),
                 ("bb_putGetFlip", 1),

@@ -1598,7 +1598,10 @@ pub fn cell_watch_addr() -> usize {
             .ok()
             .and_then(|s| {
                 let s = s.trim();
-                let s = s.strip_prefix("0x").or_else(|| s.strip_prefix("0X")).unwrap_or(s);
+                let s = s
+                    .strip_prefix("0x")
+                    .or_else(|| s.strip_prefix("0X"))
+                    .unwrap_or(s);
                 usize::from_str_radix(s, 16).ok()
             })
             .unwrap_or(0)
@@ -1631,7 +1634,12 @@ pub unsafe fn write_prim_element(base: *mut u8, index: usize, et: ArrayElementTy
             ArrayElementType::Int | ArrayElementType::Float => 4,
             _ => 8,
         };
-        cell_watch_check(base as usize + index * width, width, "write_prim_element", &value);
+        cell_watch_check(
+            base as usize + index * width,
+            width,
+            "write_prim_element",
+            &value,
+        );
     }
     match et {
         ArrayElementType::Int => {

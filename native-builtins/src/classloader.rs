@@ -3452,21 +3452,26 @@ pub fn register_enumeration_impl_natives(r: &mut NativeMethodRegistry) {
         let len = ctx.array_length(arr);
         Ok(Some(Value::Int(if idx < len { 1 } else { 0 })))
     });
-    r.register(anon_enm, "nextElement", "()Ljava/lang/Object;", |ctx, args| {
-        let this = obj_arg(args, 0)?;
-        let idx = ctx.get_field(this, 1).as_int().unwrap_or(0) as usize;
-        let arr = match ctx.get_field(this, 0) {
-            Value::Object(Some(a)) => a,
-            _ => return Ok(Some(Value::Object(None))),
-        };
-        let len = ctx.array_length(arr);
-        if idx >= len {
-            return Ok(Some(Value::Object(None)));
-        }
-        let elem = ctx.get_array_element(arr, idx);
-        ctx.set_field(this, 1, Value::Int((idx + 1) as i32));
-        Ok(Some(elem))
-    });
+    r.register(
+        anon_enm,
+        "nextElement",
+        "()Ljava/lang/Object;",
+        |ctx, args| {
+            let this = obj_arg(args, 0)?;
+            let idx = ctx.get_field(this, 1).as_int().unwrap_or(0) as usize;
+            let arr = match ctx.get_field(this, 0) {
+                Value::Object(Some(a)) => a,
+                _ => return Ok(Some(Value::Object(None))),
+            };
+            let len = ctx.array_length(arr);
+            if idx >= len {
+                return Ok(Some(Value::Object(None)));
+            }
+            let elem = ctx.get_array_element(arr, idx);
+            ctx.set_field(this, 1, Value::Int((idx + 1) as i32));
+            Ok(Some(elem))
+        },
+    );
     r.register(anon_enm, "hasNext", "()Z", |ctx, args| {
         let this = obj_arg(args, 0)?;
         let idx = ctx.get_field(this, 1).as_int().unwrap_or(0) as usize;
@@ -4598,12 +4603,11 @@ fn lk_ensure_initialized(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
             .into());
         }
     };
-    let class_id =
-        crate::lang_class::mirror_class_id(ctx, target_class).ok_or_else(|| {
-            cratonvm_types::error::RuntimeError::IllegalArgumentException {
-                message: "Lookup.ensureInitialized target is not a Class mirror".to_string(),
-            }
-        })?;
+    let class_id = crate::lang_class::mirror_class_id(ctx, target_class).ok_or_else(|| {
+        cratonvm_types::error::RuntimeError::IllegalArgumentException {
+            message: "Lookup.ensureInitialized target is not a Class mirror".to_string(),
+        }
+    })?;
     ctx.initialize_class(class_id).map_err(|message| {
         cratonvm_types::error::MethodCallFailed::InternalError(
             cratonvm_types::error::VmError::Internal {

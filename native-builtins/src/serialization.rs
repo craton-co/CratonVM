@@ -2264,7 +2264,8 @@ fn ois_read_object(ctx: &mut dyn NativeContext, addr: usize) -> Value {
     if let Some(caller_class_id) = latest_user_defined_loader_class(ctx) {
         let loader_id = ctx.loader_id_of_class(caller_class_id);
         if loader_id >= 3 {
-            loader_aware_class_id = ctx.class_id_by_name_and_loader(&desc.class_name, loader_id as u32);
+            loader_aware_class_id =
+                ctx.class_id_by_name_and_loader(&desc.class_name, loader_id as u32);
         }
     }
     let resolved = match loader_aware_class_id {
@@ -4559,26 +4560,40 @@ pub(crate) fn register_byte_array_output_stream(r: &mut NativeMethodRegistry) {
         let s = decode_baos_bytes(&bytes, "UTF-8");
         Ok(Some(Value::Object(Some(ctx.create_string(&s)))))
     });
-    r.register(cls, "toString", "(Ljava/lang/String;)Ljava/lang/String;", |ctx, args| {
-        let this = obj_arg(args, 0)?;
-        let charset = match args.get(1) {
-            Some(Value::Object(Some(s))) => ctx.read_string(*s).unwrap_or_else(|| "UTF-8".to_string()),
-            _ => "UTF-8".to_string(),
-        };
-        let bytes = baos_buffer_bytes(ctx, this);
-        let s = decode_baos_bytes(&bytes, &charset);
-        Ok(Some(Value::Object(Some(ctx.create_string(&s)))))
-    });
-    r.register(cls, "toString", "(Ljava/nio/charset/Charset;)Ljava/lang/String;", |ctx, args| {
-        let this = obj_arg(args, 0)?;
-        let charset = match args.get(1) {
-            Some(Value::Object(Some(c))) => charset_object_name(ctx, *c).unwrap_or_else(|| "UTF-8".to_string()),
-            _ => "UTF-8".to_string(),
-        };
-        let bytes = baos_buffer_bytes(ctx, this);
-        let s = decode_baos_bytes(&bytes, &charset);
-        Ok(Some(Value::Object(Some(ctx.create_string(&s)))))
-    });
+    r.register(
+        cls,
+        "toString",
+        "(Ljava/lang/String;)Ljava/lang/String;",
+        |ctx, args| {
+            let this = obj_arg(args, 0)?;
+            let charset = match args.get(1) {
+                Some(Value::Object(Some(s))) => {
+                    ctx.read_string(*s).unwrap_or_else(|| "UTF-8".to_string())
+                }
+                _ => "UTF-8".to_string(),
+            };
+            let bytes = baos_buffer_bytes(ctx, this);
+            let s = decode_baos_bytes(&bytes, &charset);
+            Ok(Some(Value::Object(Some(ctx.create_string(&s)))))
+        },
+    );
+    r.register(
+        cls,
+        "toString",
+        "(Ljava/nio/charset/Charset;)Ljava/lang/String;",
+        |ctx, args| {
+            let this = obj_arg(args, 0)?;
+            let charset = match args.get(1) {
+                Some(Value::Object(Some(c))) => {
+                    charset_object_name(ctx, *c).unwrap_or_else(|| "UTF-8".to_string())
+                }
+                _ => "UTF-8".to_string(),
+            };
+            let bytes = baos_buffer_bytes(ctx, this);
+            let s = decode_baos_bytes(&bytes, &charset);
+            Ok(Some(Value::Object(Some(ctx.create_string(&s)))))
+        },
+    );
     r.register(cls, "flush", "()V", |_ctx, _args| Ok(None));
     r.register(cls, "close", "()V", |_ctx, _args| Ok(None));
 }

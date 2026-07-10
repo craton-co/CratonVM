@@ -462,7 +462,9 @@ pub(crate) fn native_invocation_target_exception_get_target(
         _ => {
             let cause = ctx.get_field_by_name(this, "cause");
             match cause {
-                Value::Object(Some(cause_obj)) if cause_obj == this => Ok(Some(Value::Object(None))),
+                Value::Object(Some(cause_obj)) if cause_obj == this => {
+                    Ok(Some(Value::Object(None)))
+                }
                 Value::Object(_) => Ok(Some(cause)),
                 _ => Ok(Some(Value::Object(None))),
             }
@@ -1946,7 +1948,12 @@ pub fn register_throwable_subclass_natives(r: &mut NativeMethodRegistry) {
                 "(Ljava/lang/Throwable;Ljava/lang/String;)V",
                 native_invocation_target_exception_init_target_message,
             );
-            r.register(cls, "getMessage", "()Ljava/lang/String;", native_throwable_get_message);
+            r.register(
+                cls,
+                "getMessage",
+                "()Ljava/lang/String;",
+                native_throwable_get_message,
+            );
             r.register(
                 cls,
                 "getLocalizedMessage",
@@ -1971,7 +1978,12 @@ pub fn register_throwable_subclass_natives(r: &mut NativeMethodRegistry) {
                 "(Ljava/io/PrintWriter;)V",
                 native_throwable_print_stack_trace_to_stream,
             );
-            r.register(cls, "toString", "()Ljava/lang/String;", native_throwable_to_string);
+            r.register(
+                cls,
+                "toString",
+                "()Ljava/lang/String;",
+                native_throwable_to_string,
+            );
             r.register(
                 cls,
                 "getCause",

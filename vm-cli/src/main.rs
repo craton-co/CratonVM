@@ -2743,6 +2743,9 @@ fn run() -> Result<()> {
         // Mark this as a blocked region for the whole wait, mirroring the
         // exact pattern `NativeContextImpl::park` already uses for the same
         // "genuinely blocking, no bytecode running" shape.
+        vm.shared
+            .thread_registry
+            .mark_native_thread_blocked(vm.main_thread.thread_id);
         let pre_stw = vm.shared.gc_barrier.mark_blocked_region_enter();
         if pre_stw {
             let _ = vm
@@ -2752,6 +2755,9 @@ fn run() -> Result<()> {
         }
         let joined = vm.shared.thread_registry.wait_for_non_daemon_threads(None);
         vm.shared.gc_barrier.mark_blocked_region_leave();
+        vm.shared
+            .thread_registry
+            .mark_native_thread_unblocked(vm.main_thread.thread_id);
         if joined > 0 {
             tracing::info!("cratonvm: joined {joined} non-daemon thread(s) after main() returned");
         }
