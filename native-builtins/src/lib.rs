@@ -1085,6 +1085,12 @@ fn register_test_harness_natives(registry: &mut NativeMethodRegistry) {
         native_es_max_score_top_knn_collector_unsorted_top_k,
     );
     registry.register(
+        "org/elasticsearch/simdvec/ES92Int7VectorsScorer",
+        "int7DotProductBulk",
+        "([BI[F)V",
+        native_es92_int7_vectors_scorer_int7_dot_product_bulk,
+    );
+    registry.register(
         "java/util/Arrays",
         "sort",
         "([JII)V",
@@ -3012,6 +3018,60 @@ fn native_lucene_index_reader_context_id(
 ) -> MethodCallResult {
     let this = obj_arg(args, 0)?;
     Ok(Some(ctx.get_field_by_name(this, "identity")))
+}
+
+fn native_es92_int7_vectors_scorer_int7_dot_product_bulk(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    let this = obj_arg(args, 0)?;
+    let query = obj_arg(args, 1)?;
+    let count = args.get(2).and_then(Value::as_int).unwrap_or(0);
+    let scores = obj_arg(args, 3)?;
+    if count <= 0 {
+        return Ok(None);
+    }
+
+    let dimensions = ctx.get_field_by_name(this, "dimensions").as_int().unwrap_or(0);
+    if dimensions <= 0 || count as usize > ctx.array_length(scores) {
+        return Ok(None);
+    }
+    let input = lucene_field_obj(ctx, this, "in")?;
+    let byte_len = (count as usize)
+        .checked_mul(dimensions as usize)
+        .ok_or_else(|| lucene_aioobe(i32::MAX))?;
+    let packed = ctx.new_array(cratonvm_types::ArrayElementType::Byte, byte_len);
+    ctx.invoke_virtual(
+        input,
+        "readBytes",
+        "([BII)V",
+        &[
+            Value::Object(Some(packed)),
+            Value::Int(0),
+            Value::Int(byte_len as i32),
+        ],
+    )?;
+
+    let mut query_bytes = vec![0u8; dimensions as usize];
+    if ctx.read_byte_array_into(query, 0, &mut query_bytes) != query_bytes.len() {
+        return Ok(None);
+    }
+    let mut packed_bytes = vec![0u8; byte_len];
+    if ctx.read_byte_array_into(packed, 0, &mut packed_bytes) != byte_len {
+        return Ok(None);
+    }
+    for vector in 0..count as usize {
+        let start = vector * dimensions as usize;
+        let mut dot = 0i32;
+        for dimension in 0..dimensions as usize {
+            dot = dot.wrapping_add(
+                (packed_bytes[start + dimension] as i8 as i32)
+                    .wrapping_mul(query_bytes[dimension] as i8 as i32),
+            );
+        }
+        ctx.set_array_element(scores, vector, Value::Float(dot as f32));
+    }
+    Ok(None)
 }
 
 fn native_es_knn_score_doc_query_init(
@@ -18071,6 +18131,29 @@ fn native_byte_buffer_wrap_bytes(ctx: &mut dyn NativeContext, args: &[Value]) ->
     )
 }
 
+fn native_float_buffer_order(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let order_name = match args.first() {
+        Some(Value::Object(Some(this))) => {
+            let cname = ctx
+                .class_name_of_id(ctx.class_id_of_object(*this))
+                .unwrap_or_default();
+            if cname.ends_with("FloatBufferB") || cname.ends_with("FloatBufferRB") {
+                "BIG_ENDIAN"
+            } else if cname.ends_with("FloatBufferL") || cname.ends_with("FloatBufferRL") {
+                "LITTLE_ENDIAN"
+            } else {
+                "NATIVE_ORDER"
+            }
+        }
+        _ => "NATIVE_ORDER",
+    };
+    Ok(Some(Value::Object(Some(lucene_static_object(
+        ctx,
+        "java/nio/ByteOrder",
+        order_name,
+    )?))))
+}
+
 fn spring_map_get_key(
     ctx: &mut dyn NativeContext,
     map: ObjectRef,
@@ -32237,6 +32320,13 @@ pub fn register_essential_natives(registry: &mut NativeMethodRegistry) {
     // subclass that the JDK 25 NIO hierarchy uses for direct/heap
     // buffers. (Buffer itself covers any rare invokespecial-on-Buffer
     // sites that bypass the virtual cache.)
+    registry.register(
+        "java/nio/FloatBuffer",
+        "order",
+        "()Ljava/nio/ByteOrder;",
+        native_float_buffer_order,
+    );
+
     for buf in [
         "java/nio/Buffer",
         "java/nio/ByteBuffer",
