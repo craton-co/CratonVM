@@ -302,3 +302,113 @@ aborted, don't drain" (both look identical at the raw-socket level — see the
 2026-07-09 candidate-fix section above and Tomcat's own
 `IdentityInputFilter.end()` / `checkSwallowInput()` — there is no separate
 `SO_LINGER`-style signal to key off).
+
+## 2026-07-10 WebSocket close-delay branch correction
+
+The WebSocket close-delay investigation found a separate `lock is null` signal
+that should not be conflated with the HTTP swallow-upload blocker above. In
+`TestWsRemoteEndpointImplServerDeadlock`, the misleading `lock` message came
+from `java.util.concurrent.LinkedBlockingDeque.clear()` on Tomcat's WebSocket
+`WriteBuffer`, not from `SocketWrapperBase.lock`; direct `SocketWrapperBase`
+construction/read probes kept its `lock` field non-null.
+
+This branch drops the synthetic `LinkedBlockingDeque` fallback surface in
+real-JDK mode so the real JDK constructor initializes `lock`, `notEmpty`,
+`notFull`, and the linked-node fields. A pre-merge run of
+`TestSwallowAbortedUploads` with the final WebSocket-close binary and a
+temporary logging basedir no longer showed the old `NioEndpoint ...
+ReentrantLock.lock() because "lock" is null` processor error, and instead
+reached request/response assertions:
+
+```text
+Tests run: 10, Failures: 6
+1) testAbortedPOSTOKSwallow
+2) testAbortedUploadLimitedNoSwallow
+3) testChunkedPUTLimit
+4) testAbortedPOST413Swallow
+5) testAbortedPOST413NoSwallow
+6) testAbortedPOSTOKNoSwallow
+```
+
+Status remains OPEN (as of the section above). The next swallow-upload investigation should account for
+the stale/lost-local finding above and then re-check these six behavioral
+assertion failures once the HTTP socket processor path is stable.
+
+## 2026-07-10: `TestRewriteValve` independently confirms the `lock is null` NPE is gone on current `dev`
+
+Cross-checking the "lock is null" symptom mentioned above against a
+completely different suite class:
+`org.apache.catalina.valves.rewrite.TestRewriteValve` (see
+`docs/known-issues/tomcat-08-07/accesslogvalve-rewritevalve-connection-failures.md`)
+hit the exact same
+```
+ERROR [org.apache.tomcat.util.net.NioEndpoint] Error running socket processor
+  (java/lang/NullPointerException: Cannot invoke "java.util.concurrent.locks.ReentrantLock.lock()" because "lock" is null)
+```
+on every one of its 121 tests when run against a `dev` tip that predated
+commit `9cbbc82c` ("Fix Tomcat WebSocket close-delay blockers",
+2026-07-10). Re-ran the identical repro (worktree
+`/data/data/wt-rewritevalve-lockcheck`, branch
+`investigate/rewritevalve-lockcheck-20260710`, off `origin/dev` @
+`9bc80788`, which includes `9cbbc82c`):
+
+```
+grep -c 'lock is null' <full run output>   # -> 0
+Tests run: 121,  Failures: 156   # down from 229 pre-9cbbc82c
+```
+
+**Zero** `lock is null` occurrences, in either a debug build (101/121 tests
+reached before its own shorter timeout, zero NPEs) or a release build (full
+121/121 in ~150s). Comparing the two runs' failure content directly (same
+worktree lineage, same test class, same env):
+
+| | pre-`9cbbc82c` | post-`9cbbc82c` |
+|---|---|---|
+| `lock is null` NPE | 100% of connections | **0** |
+| `AssertionError: expected:<200> but was:<-1>` | 99 | 0 |
+| `AssertionError: expected:<400> but was:<-1>` | 10 | 4 |
+| `AssertionError: expected:<200> but was:<302>` | 0 | 15 (new) |
+| `AssertionError: expected:<400> but was:<302>` | 0 | 6 (new) |
+| `ComparisonFailure` (UTF-8 percent-encoding round-trip) | 0 | 11 (new) |
+| `LifecycleException: A child container failed during stop` | 115 | 115 (unchanged — pre-existing, unrelated teardown noise present in both runs identically; not investigated) |
+
+105 of the 109 tests that previously got a dead-connection `-1` (99+10) now
+get a real HTTP response (mostly `302` where `200`/`400` was expected — a
+new, narrower, unrelated behavioral bug, not investigated here); 4 still
+show `-1`. This is strong independent
+corroboration that `9cbbc82c` fixed (or at minimum reliably suppresses) the
+`SocketWrapperBase`/`SocketProcessorBase` `lock is null` NPE for the
+*general* Tomcat NIO-connector path, not just the WebSocket/swallow-upload
+cases it was written for — consistent with the "worth checking if it
+explains other mysteriously-100%-failing Tomcat NIO test classes" note near
+the top of the "stale/lost local variable" section above.
+
+**Open question, not resolved here:** `9cbbc82c` bundled three changes
+(drop synthetic `java/io/StringReader` in real-JDK mode, drop synthetic
+`LinkedBlockingDeque` in real-JDK mode, fix `AtomicReference.toString`).
+This doc's own "WebSocket close-delay branch correction" section above
+attributes the `SocketWrapperBase.lock` fix to the `LinkedBlockingDeque`
+change specifically (via `TestWsRemoteEndpointImplServerDeadlock`'s
+`WriteBuffer.clear()` NPE) — but that's a different class/lock than the one
+this doc's "stale/lost local variable" section root-caused
+(`SocketWrapperBase.lock` via `SocketProcessorBase.run()`), and the two
+mechanisms were never obviously connected. It's also possible the
+`StringReader` drop contributed (`TestRewriteValve`'s own
+`RewriteValve.parse()` uses `BufferedReader`/`StringReader` directly, so
+that class is live on its exact request path, unlike
+`TestSwallowAbortedUploads`). **No bisection was done to isolate which of
+the three changes (or the combination) is responsible.** Given the "stale
+local variable across a GC safepoint/JIT tier-transition" theory was reached
+from isolated repros that never included a live synthetic-layout-mismatched
+object (`LinkedBlockingDeque` or `StringReader`) allocated nearby, an
+alternative reading is that the true mechanism was always a
+synthetic/real-layout heap-corruption effect from one of those two classes
+(the same well-established bug family as `StringJoiner`/`EnumSet`/
+`ScheduledThreadPoolExecutor` elsewhere in this codebase — see
+[[cratonvm-real-switch-synthetic-stub-wins-by-default]]) — the deep GC/JIT
+root-scanner theory may have been chasing a red herring that happened to
+correlate with GC-safepoint timing. Whoever revisits `CRATONVM_DBG_PRECISE`/
+`CRATONVM_DBG_VERIFY_OOP_MAPS` per the recommended next step above should
+first try a plain bisection (rebuild with only the `LinkedBlockingDeque`
+drop, or only the `StringReader` drop, and rerun `TestRewriteValve`) before
+assuming the GC/JIT subsystem itself needs fixing — it may already be moot.
