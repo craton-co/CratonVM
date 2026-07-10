@@ -2605,6 +2605,21 @@ fn is_bouncycastle_crypto_hotpath_carveout(class_name: &str, method_name: &str) 
             || c.starts_with("org/bouncycastle/crypto/io/")
             || c.starts_with("org/bouncycastle/crypto/modes/")
             || c.starts_with("org/bouncycastle/crypto/paddings/")
+            // perf/throughput-20260710 — BC math (EC + field arithmetic)
+            // un-banned. The RBC.1 comment's own lifting criterion — "the EC
+            // AllTests run completes cleanly under the allow-packages
+            // override" — is now met on this tree: `org.bouncycastle.math.ec.
+            // test.AllTests` = OK (14 tests) under
+            // CRATONVM_JIT_ALLOW_PACKAGES=org/bouncycastle/ (the historic
+            // deterministic rc=139 config), FixedPointTest passes repeatedly
+            // at the June-05 -Xmx256m 100%-corruption repro config, and
+            // GOST3412Test soaks 10/10 with OSR-for-newarray re-enabled. The
+            // upstream producers were retired by the accumulated fixes since
+            // June (locals/stack NaN-box kind tags, moving-young + precise JIT
+            // maps, RRWL/refproc root fixes, ThreadLocal value rooting, the
+            // guarded inline getfield). Interpreted EC was the BC suite's
+            // dominant cost: NISTECC alone 94.8s interpreted → 43.2s JIT'd.
+            || c.starts_with("org/bouncycastle/math/")
     );
     if !is_crypto_hotpath {
         return false;
