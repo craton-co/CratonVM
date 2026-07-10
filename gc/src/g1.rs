@@ -4634,6 +4634,24 @@ impl G1Collector {
         }
     }
 
+    /// Test/diagnostic: has `addr` been grayed or marked by the current
+    /// mark cycle? True if its region's bitmap has it marked OR it sits in
+    /// the mark worklist. Used by the g1_concurrent SATB delivery test,
+    /// whose raw queue-contents assertion under-approximates delivery now
+    /// that the marker drains the shards mid-cycle (G1MARK-6). Takes the
+    /// regions lock then (after dropping it) the worklist lock — never both.
+    pub(crate) fn dbg_is_grayed_or_marked(&self, addr: usize) -> bool {
+        {
+            let regions = self.regions.lock();
+            if let Some(idx) = self.region_for_ptr(&regions, addr as *mut u8) {
+                if regions[idx].mark_bitmap.is_marked(addr) {
+                    return true;
+                }
+            }
+        }
+        self.mark_worklist.lock().contains(&addr)
+    }
+
     /// Abort an in-flight marking cycle WITHOUT acting on the (incomplete)
     /// bitmap: discard the gray set, deactivate the SATB barrier, return the
     /// phase to `Idle`. No cleanup verdicts are computed — the next cycle
@@ -5411,6 +5429,19 @@ impl G1Collector {
     /// address on a hit and only returned a `bool`, so the caller had no
     /// way to actually perform the dedup. Returning the canonical address
     /// makes the function correct on its own terms.
+    ///
+    /// # DO NOT WIRE UP without a remap (G1CORE-6)
+    ///
+    /// The table stores RAW canonical object addresses and NO collection
+    /// path remaps or purges them: a canonical String registered in Eden is
+    /// evacuated or freed by the very next young pause, after which a HIT
+    /// returns a dangling from-space address the caller would install as a
+    /// live reference (UAF). There are currently no production callers
+    /// (`string_dedup_enabled` plumbs from `-XX:+UseStringDeduplication`
+    /// but nothing invokes this API). Before adding one: remap
+    /// `string_dedup_table` values through the pointer map (and drop
+    /// entries whose value died) in every collection's fix-up phase, or
+    /// register only non-moving (post-promotion Old) addresses.
     pub fn deduplicate_string(&self, hash: u64, addr: usize) -> Option<usize> {
         if !self.config.string_dedup_enabled {
             return None;
@@ -7906,14 +7937,19 @@ mod tests {
     fn mixed_collection_selects_old_regions() {
         let gc = make_collector();
 
-        // Manually set up some old regions with gc_efficiency data
+        // Manually set up some old regions with gc_efficiency data.
+        // `live_bytes > 0` marks them as carrying marking data from a
+        // completed cycle — regions without it (post-cleanup promotions)
+        // are ineligible for the mixed CSet (G1CORE-7 gate).
         {
             let mut regions = gc.regions.lock();
             regions[0].region_type = RegionType::Old;
             regions[0].cursor = 100;
+            regions[0].live_bytes = 10;
             regions[0].gc_efficiency = 0.1; // 10% live = 90% garbage, best candidate
             regions[1].region_type = RegionType::Old;
             regions[1].cursor = 100;
+            regions[1].live_bytes = 90;
             regions[1].gc_efficiency = 0.9; // 90% live = 10% garbage, poor candidate
         }
 
