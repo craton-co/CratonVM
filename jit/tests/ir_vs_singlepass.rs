@@ -27,6 +27,20 @@ use std::sync::Arc;
 /// Dummy runtime helpers — the corpus is pure arithmetic / branches / counted
 /// loops, so no helper (alloc, field, dispatch) is ever invoked; the stub
 /// pointer is baked but never called.
+/// Wide-open region bounds table for the guarded inline getfield: one region
+/// spanning [0x1000, usize::MAX) so every 8-aligned non-null test object
+/// passes the inline receiver guard and is raw-loaded (no helper call) —
+/// the same "no runtime helper reachable" contract these tests were written
+/// against when raw-inline getfield was the default.
+static TEST_REGION_BOUNDS: [std::sync::atomic::AtomicUsize; 6] = [
+    std::sync::atomic::AtomicUsize::new(0x1000),
+    std::sync::atomic::AtomicUsize::new(usize::MAX),
+    std::sync::atomic::AtomicUsize::new(0),
+    std::sync::atomic::AtomicUsize::new(0),
+    std::sync::atomic::AtomicUsize::new(0),
+    std::sync::atomic::AtomicUsize::new(0),
+];
+
 fn dummy_helpers() -> JitRuntimeHelpers {
     unsafe extern "C" fn stub() {
         panic!("ir_vs_singlepass invoked an unwired runtime helper");
@@ -83,7 +97,8 @@ fn dummy_helpers() -> JitRuntimeHelpers {
         jit_frem: s,
         jit_drem: s,
         self_call_stack_guard: 0,
-        region_bounds_addr: 0,
+        region_bounds_addr: TEST_REGION_BOUNDS.as_ptr() as usize,
+        native_stack_floor_fn: 0,
     }
 }
 
@@ -1073,11 +1088,17 @@ fn ir_vs_singlepass_sum_loop() {
 /// at `FIELD_CELL_PAYLOAD32_OFFSET` within its cell with a zero (`Value::Int`)
 /// discriminant tag (the all-zero buffer supplies the tag). The returned
 /// buffer must outlive every call that reads it.
-fn make_object(fields: &[i32]) -> Vec<u8> {
-    let mut buf = vec![0u8; HEADER_SIZE + fields.len() * SLOT_SIZE];
+fn make_object(fields: &[i32]) -> Vec<u64> {
+    // u64 backing so the buffer is 8-aligned: the guarded inline getfield's
+    // receiver check (alignment bit-test + region bounds) requires real
+    // object headers to be 8-aligned, and Vec<u8> guarantees nothing.
+    let bytes = HEADER_SIZE + fields.len() * SLOT_SIZE;
+    let mut buf = vec![0u64; bytes.div_ceil(8)];
+    let base = buf.as_mut_ptr() as *mut u8;
     for (i, &v) in fields.iter().enumerate() {
         let off = HEADER_SIZE + i * SLOT_SIZE + FIELD_CELL_PAYLOAD32_OFFSET;
-        buf[off..off + 4].copy_from_slice(&v.to_le_bytes());
+        // SAFETY: off + 4 <= bytes <= buf.len()*8 by construction.
+        unsafe { std::ptr::write_unaligned(base.add(off) as *mut i32, v) };
     }
     buf
 }
@@ -1136,18 +1157,34 @@ fn check_field(
         .unwrap_or_else(|| panic!("{name}: optimize=true (IR pipeline) failed to compile"));
     let sp = compile_opt_fields(&cm, &helpers, field_resolver, false)
         .unwrap_or_else(|| panic!("{name}: optimize=false (single-pass) failed to compile"));
+    // getfield methods are `needs_heap` (the checked-helper fallback wants the
+    // hidden vm_ptr), so the artifact ABI has the context in ARG0 and the
+    // receiver in ARG1 — calling `try_call` without a context would feed the
+    // receiver INTO the context slot and a garbage register into local 0. The
+    // int getfield's guarded-inline fast path never dereferences the context,
+    // so a zeroed dummy buffer is a safe placeholder (a receiver that fails
+    // the inline guard reaches the panicking stub helper, which is exactly
+    // the signal these tests want).
+    let dummy_vm = [0u8; 64];
     for (fields, expected) in cases {
         let obj = make_object(fields);
         let args = [obj.as_ptr() as i64];
         // SAFETY: both bodies were JIT-compiled from valid getfield bytecode;
-        // `obj` is a live, correctly-laid-out heap object whose address is the
-        // sole (reference) argument, and it outlives both calls (dropped at the
-        // end of this iteration). No runtime helper is reachable (inline
-        // getfield emits no call).
-        let r_sp = unsafe { sp.try_call(&args) }
-            .unwrap_or_else(|e| panic!("{name}: single-pass call {fields:?}: {e:?}"));
-        let r_ir = unsafe { ir.try_call(&args) }
-            .unwrap_or_else(|e| panic!("{name}: IR call {fields:?}: {e:?}"));
+        // `obj` is a live, 8-aligned, correctly-laid-out object whose address
+        // is the sole (reference) Java argument, and it outlives both calls
+        // (dropped at the end of this iteration). The guarded inline getfield
+        // raw-loads it (inside the wide-open TEST_REGION_BOUNDS); no runtime
+        // helper is reachable for a valid receiver.
+        let call = |m: &CompiledMethod| unsafe {
+            if m.needs_context() {
+                m.try_call_with_context(dummy_vm.as_ptr() as i64, &args)
+            } else {
+                m.try_call(&args)
+            }
+        };
+        let r_sp =
+            call(&sp).unwrap_or_else(|e| panic!("{name}: single-pass call {fields:?}: {e:?}"));
+        let r_ir = call(&ir).unwrap_or_else(|e| panic!("{name}: IR call {fields:?}: {e:?}"));
         assert_eq!(
             r_ir as i32, r_sp as i32,
             "{name}: IR vs single-pass DIVERGE for {fields:?}: IR={}, single-pass={}",
@@ -1348,9 +1385,11 @@ fn field_helpers() -> JitRuntimeHelpers {
 }
 
 /// Read the int payload of field `i` from a synthetic object buffer.
-fn read_field(buf: &[u8], i: usize) -> i32 {
+fn read_field(buf: &[u64], i: usize) -> i32 {
     let off = HEADER_SIZE + i * SLOT_SIZE + FIELD_CELL_PAYLOAD32_OFFSET;
-    i32::from_le_bytes([buf[off], buf[off + 1], buf[off + 2], buf[off + 3]])
+    let base = buf.as_ptr() as *const u8;
+    // SAFETY: off + 4 is within the buffer by make_object's construction.
+    unsafe { std::ptr::read_unaligned(base.add(off) as *const i32) }
 }
 
 /// Compile a `(L…; <int args>)I` method both ways; for each case run each
@@ -2295,7 +2334,8 @@ fn frem_helpers() -> JitRuntimeHelpers {
         jit_frem: test_frem as *const () as usize,
         jit_drem: test_drem as *const () as usize,
         self_call_stack_guard: 0,
-        region_bounds_addr: 0,
+        region_bounds_addr: TEST_REGION_BOUNDS.as_ptr() as usize,
+        native_stack_floor_fn: 0,
         ..dummy_helpers()
     }
 }

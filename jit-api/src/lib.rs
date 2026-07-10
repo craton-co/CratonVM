@@ -342,6 +342,24 @@ pub struct JitRuntimeHelpers {
     /// keeps the checked-helper path. Appended at the END of the struct so
     /// all prior golden offsets stay stable.
     pub region_bounds_addr: usize,
+    /// Inline self-recursion guard — address of the leaf
+    /// `jit_native_stack_floor` helper (`extern "C" fn() -> i64`), which
+    /// returns the current OS thread's native-stack floor (get-or-compute of
+    /// the same TLS value `self_call_stack_guard` uses; touches no VM state,
+    /// never GCs).
+    ///
+    /// When wired, a method with direct self-recursive call sites reserves a
+    /// frame slot, calls this once in its prologue, and each self-call site
+    /// emits `CMP RSP, [rbp - floor_slot]; JA <skip guard>` — replacing the
+    /// per-recursion-level `self_call_stack_guard` helper CALL (plus its
+    /// safepoint spill / shadow push+reload bracketing) on the common path.
+    /// The helper CALL remains verbatim as the fallback and still owns the
+    /// catchable StackOverflowError raise. OSR trampolines initialise the
+    /// slot to `usize::MAX` (`RSP > MAX` is unsatisfiable), so OSR-entered
+    /// frames always take the helper. `0` = not wired → sites keep the
+    /// unconditional helper CALL. Appended at the END of the struct so all
+    /// prior golden offsets stay stable.
+    pub native_stack_floor_fn: usize,
 }
 
 /// Classifies each field of [`JitRuntimeHelpers`] for the validator.
@@ -481,6 +499,8 @@ helper_fields! {
     // NOT a pointer: address of the GC's JIT_REGION_BOUNDS table, baked as an
     // immediate by the guarded inline getfield. 0 = not wired (helper-only).
     (region_bounds_addr,             FieldKind::Offset),
+    // Leaf floor-query helper for the inline self-recursion check.
+    (native_stack_floor_fn,          FieldKind::OptionalPtr),
 }
 
 // Compile-time integrity check: the macro-generated NUM_FIELDS must
@@ -506,7 +526,7 @@ const _: () = assert!(
 // struct field AND its macro entry simultaneously would still satisfy
 // the ratio assert above and silently change the JIT ABI.
 const _: () = assert!(
-    JitRuntimeHelpers::NUM_FIELDS == 48,
+    JitRuntimeHelpers::NUM_FIELDS == 49,
     "JitRuntimeHelpers field count changed — bump the literal here and update \
      the golden-offset test in mod tests if the change is intentional",
 );
@@ -662,6 +682,7 @@ mod tests {
             jit_drem: 0x1138,
             self_call_stack_guard: 0x1140,
             region_bounds_addr: 0x1148,
+            native_stack_floor_fn: 0x1150,
         }
     }
 
@@ -881,6 +902,7 @@ mod tests {
             jit_drem: 0,
             self_call_stack_guard: 0,
             region_bounds_addr: 0,
+            native_stack_floor_fn: 0,
         };
         assert_eq!(h.newarray, 0);
         assert_eq!(h.write_barrier, 0);
@@ -1056,8 +1078,8 @@ mod tests {
             std::mem::size_of::<JitRuntimeHelpers>(),
             JitRuntimeHelpers::NUM_FIELDS * FIELD_WIDTH,
         );
-        // And the macro-driven count is the canonical 48.
-        assert_eq!(JitRuntimeHelpers::NUM_FIELDS, 48);
+        // And the macro-driven count is the canonical 49.
+        assert_eq!(JitRuntimeHelpers::NUM_FIELDS, 49);
     }
 
     #[test]
@@ -1295,6 +1317,11 @@ mod tests {
                 "region_bounds_addr",
                 std::mem::offset_of!(JitRuntimeHelpers, region_bounds_addr),
             ),
+            (
+                48,
+                "native_stack_floor_fn",
+                std::mem::offset_of!(JitRuntimeHelpers, native_stack_floor_fn),
+            ),
         ];
 
         // (a) Each field is at its documented sequential byte offset.
@@ -1332,7 +1359,7 @@ mod tests {
     #[test]
     fn jit_runtime_helpers_all_fields_classified() {
         // The macro must classify every field. 39 RequiredPtr + 5
-        // Offset + 4 OptionalPtr = 48. A new field whose classification
+        // Offset + 5 OptionalPtr = 49. A new field whose classification
         // is omitted will fail to compile (the macro requires both
         // arms); this test pins the *counts* so a reclassification
         // (e.g. demoting a RequiredPtr to OptionalPtr) is also a
@@ -1349,7 +1376,7 @@ mod tests {
             .count();
         let off = f.iter().filter(|e| e.kind == FieldKind::Offset).count();
         assert_eq!(req, 39, "required-pointer count drifted");
-        assert_eq!(opt, 4, "optional-pointer count drifted");
+        assert_eq!(opt, 5, "optional-pointer count drifted");
         assert_eq!(off, 5, "offset-field count drifted");
         assert_eq!(req + opt + off, JitRuntimeHelpers::NUM_FIELDS);
     }

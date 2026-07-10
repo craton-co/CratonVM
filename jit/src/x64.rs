@@ -2175,6 +2175,27 @@ pub fn guarded_inline_getfield_enabled() -> bool {
     *G.get_or_init(|| std::env::var_os("CRATONVM_JIT_GETFIELD_HELPER").is_none())
 }
 
+/// Default-ON inline self-recursion stack check (perf/throughput-20260710).
+///
+/// A method with direct self-recursive call sites reserves one frame slot,
+/// fills it once in the prologue from the leaf `jit_native_stack_floor`
+/// helper, and each self-call site emits `CMP RSP, [rbp - floor_slot]; JA
+/// <skip>` -- bypassing the `self_call_stack_guard` helper CALL (and its
+/// safepoint spill / shadow push+reload bracketing) on the common path. The
+/// helper call remains verbatim as the fallback and still owns the catchable
+/// StackOverflowError raise; OSR trampolines initialise the slot to
+/// `usize::MAX` so OSR-entered frames always take the helper.
+/// `CRATONVM_JIT_INLINE_SELF_GUARD=0` restores the helper-per-call shape for
+/// bisection.
+pub fn inline_self_guard_enabled() -> bool {
+    use std::sync::OnceLock;
+    static G: OnceLock<bool> = OnceLock::new();
+    *G.get_or_init(|| match std::env::var("CRATONVM_JIT_INLINE_SELF_GUARD") {
+        Ok(v) => v != "0" && !v.eq_ignore_ascii_case("false"),
+        Err(_) => true,
+    })
+}
+
 /// Step 1 of `docs/feature-designs/precise-jit-maps-default.md` — opt-IN
 /// **inline** frame-record. When on (and precise maps are on, and the OS TLS
 /// probe in [`inline_rbp_tls_disp`] succeeds), the JIT prologue stores RBP
@@ -6722,6 +6743,10 @@ struct Compiler {
     /// Frame offset where allocation-heavy methods cache this invocation's
     /// `*mut JvmThread` for inline TLAB `new`. 0 when no cache slot is reserved.
     jit_thread_slot_off: i32,
+    /// Frame slot holding the prologue-cached native-stack floor for the
+    /// inline self-call check (`0` = not reserved -> sites emit the plain
+    /// guard-helper CALL).
+    stack_floor_slot_off: i32,
     /// Frame offset of the first XMM save slot (from RBP).
     xmm_saved_base: i32,
     /// Resolved multianewarray metadata: (bytecode_pc, leaf_element_type_code).
@@ -7661,6 +7686,7 @@ impl Compiler {
         helpers: JitRuntimeHelpers,
         num_scalar_slots: usize,
         cache_jit_thread_for_inline_new: bool,
+        reserve_stack_floor: bool,
     ) -> Self {
         // Compact arrays: byte[] uses 1-byte elements, int[] uses 4-byte, ref[] uses 8-byte.
         // Each local takes 8 bytes: [rbp - 8], [rbp - 16], ...
@@ -7716,6 +7742,9 @@ impl Compiler {
         } else {
             0
         };
+        // Inline self-recursion check: one slot for the prologue-cached
+        // native-stack floor.
+        let stack_floor_slots = if reserve_stack_floor { 1 } else { 0 };
         let extra_slots = (if needs_heap { 1 } else { 0 })
             + num_hoists
             + num_arith_hoists
@@ -7723,6 +7752,7 @@ impl Compiler {
             + num_scalar_slots
             + (if precise_maps { 1 } else { 0 })
             + jit_thread_slots
+            + stack_floor_slots
             + shadow_slots;
         let total_locals = num_locals.saturating_add(extra_slots);
         // Shadow-stack thread-pointer cache slot: the ABSOLUTE last reserved
@@ -7761,6 +7791,18 @@ impl Compiler {
         };
         let jit_thread_slot_off: i32 = if cache_jit_thread_for_inline_new {
             (total_locals as i32 - shadow_slots as i32).saturating_mul(8)
+        } else {
+            0
+        };
+        // Inline self-recursion floor slot: sits below the sp-id slot (which
+        // itself sits below the cached JIT-thread + shadow slots), so the
+        // reserved tail slots never alias.
+        let stack_floor_slot_off: i32 = if reserve_stack_floor {
+            (total_locals as i32
+                - shadow_slots as i32
+                - jit_thread_slots as i32
+                - (if precise_maps { 1 } else { 0 }))
+            .saturating_mul(8)
         } else {
             0
         };
@@ -7927,6 +7969,7 @@ impl Compiler {
             needs_heap,
             heap_local_offset,
             jit_thread_slot_off,
+            stack_floor_slot_off,
             xmm_saved_base,
             multianewarray_info,
             field_info,
@@ -12368,6 +12411,12 @@ impl Compiler {
             self.emit_call_absolute(self.helpers.get_current_thread);
             self.emit_store_local(self.jit_thread_slot_off, RAX);
         }
+        // Inline self-recursion check: cache this thread's native-stack floor
+        // once per invocation (leaf helper -- reads TLS only, cannot GC).
+        if self.stack_floor_slot_off != 0 && self.helpers.native_stack_floor_fn != 0 {
+            self.emit_call_absolute(self.helpers.native_stack_floor_fn);
+            self.emit_store_local(self.stack_floor_slot_off, RAX);
+        }
         // spring-bug-10 watchpoint: arm a HW data breakpoint on this frame's
         // savebase slot (rbp - savebase_off) by calling the registered helper.
         // Prologue position = no ABI args staged yet, so clobbering ARG_REGS[0]
@@ -12992,6 +13041,15 @@ impl Compiler {
     /// fault, so the caller may emit the direct MOV sequence. Returns the
     /// patch offsets that the caller MUST patch to its helper slow path.
     /// Clobbers RCX and RDX; preserves RAX (the receiver).
+    /// Emit `CMP reg, [rbp - offset]` against a frame local (same rbp-relative
+    /// addressing as [`Self::emit_load_local`]). Used by the inline self-call
+    /// stack check (`CMP RSP, [rbp - floor_slot]`).
+    fn emit_cmp_r64_rbp_local(&mut self, reg: u8, offset: i32) {
+        self.rex_w_r(reg);
+        self.buf.emit_byte(0x3B); // CMP r64, r/m64
+        self.modrm_rbp_disp(reg, offset);
+    }
+
     fn emit_guarded_getfield_receiver_check(&mut self, bounds_addr: usize) -> Vec<usize> {
         let mut slow: Vec<usize> = Vec::new();
         // 1. null → slow (helper throws the NPE).
@@ -21971,6 +22029,30 @@ impl Compiler {
                         // nothing, byte-identical legacy code.
                         let guard_skip_patch =
                             if self.helpers.self_call_stack_guard != 0 && self.needs_heap {
+                                // perf/throughput-20260710 -- INLINE floor fast
+                                // path: the prologue cached this thread's
+                                // native-stack floor in a frame slot, so the
+                                // common case is:
+                                //   CMP RSP, [rbp - floor_slot]
+                                //   JA  <skip helper guard>   (headroom ok)
+                                // OSR-entered frames have the slot initialised
+                                // to usize::MAX by the trampoline (`RSP > MAX`
+                                // is unsatisfiable), so they always take the
+                                // helper. The skipped block is the guard CALL
+                                // plus its safepoint spill and shadow
+                                // push/reload bracketing (skipped TOGETHER, so
+                                // the shadow stack stays balanced); the
+                                // recursive CALL below still emits its own
+                                // spill + oop map, so GC coverage of the
+                                // actual recursion is unchanged. This constant
+                                // was the dominant per-level cost of
+                                // fib/binarytrees-style recursion.
+                                let fast_skip = if self.stack_floor_slot_off != 0 {
+                                    self.emit_cmp_r64_rbp_local(RSP, self.stack_floor_slot_off);
+                                    Some(self.emit_jcc_rel32_patch(0x87)) // JA
+                                } else {
+                                    None
+                                };
                                 self.emit_pre_safepoint_spill();
                                 self.emit_load_local(ARG_REGS[0], self.heap_local_offset);
                                 self.emit_call_absolute(self.helpers.self_call_stack_guard);
@@ -21978,7 +22060,11 @@ impl Compiler {
                                     self.emit_oop_map_for_safepoint();
                                 }
                                 self.emit_test_r64_r64(RAX);
-                                Some(self.emit_jcc_rel32_patch(0x85)) // JNE merge
+                                let jne_merge = Some(self.emit_jcc_rel32_patch(0x85)); // JNE merge
+                                if let Some(skip) = fast_skip {
+                                    self.patch_rel32_to_here(skip);
+                                }
+                                jne_merge
                             } else {
                                 None
                             };
@@ -25404,6 +25490,35 @@ pub fn compile_with_param_slots(
         && new_info.iter().any(|(_, _, num_fields, _, _)| {
             HEADER_SIZE + num_fields.saturating_mul(SLOT_SIZE) <= 256
         });
+    // Inline self-recursion stack check: a raw self-call site is an
+    // `invokestatic` pc with neither an invoke-info entry nor a direct-call
+    // plan (the exact condition the 0xb8 arm's "Self-recursive call"
+    // else-branch keys on -- `try_compile` deliberately skips creating invoke
+    // metadata for them). When one exists, reserve the floor frame slot so
+    // each such site can do the two-instruction `CMP RSP, [rbp - floor]`
+    // instead of a `self_call_stack_guard` helper CALL per recursion level.
+    // The walk uses `bytecode_len_at`; a desync past a variable-length switch
+    // can at worst set the flag spuriously, which only reserves an unused
+    // slot + one prologue helper call (never unsound).
+    let reserve_stack_floor = needs_heap
+        && helpers.self_call_stack_guard != 0
+        && helpers.native_stack_floor_fn != 0
+        && inline_self_guard_enabled()
+        && {
+            let mut found = false;
+            let mut pc = 0usize;
+            while pc < code_len {
+                if code[pc] == 0xb8
+                    && !invoke_info.iter().any(|(p, _)| *p == pc)
+                    && !direct_calls.iter().any(|(p, _)| *p == pc)
+                {
+                    found = true;
+                    break;
+                }
+                pc += bytecode_len_at(code, pc);
+            }
+            found
+        };
 
     let mut compiler = Compiler::new(
         method_key.to_string(),
@@ -25422,6 +25537,7 @@ pub fn compile_with_param_slots(
         *helpers,
         num_scalar_slots,
         cache_jit_thread_for_inline_new,
+        reserve_stack_floor,
     );
     compiler.param_jvm_slots = param_jvm_slots.to_vec();
     compiler.param_slot_span = param_slot_span;
@@ -25813,6 +25929,7 @@ pub fn compile_with_param_slots(
     cm.osr_xmm_saved_base = compiler.xmm_saved_base;
     cm.osr_heap_local_offset = compiler.heap_local_offset;
     cm.jit_thread_slot_off = compiler.jit_thread_slot_off;
+    cm.stack_floor_slot_off = compiler.stack_floor_slot_off;
     cm.osr_frame_record = compiler.helpers.frame_record;
 
     // T1.1.a — transfer precise oop maps collected during codegen.
@@ -26187,6 +26304,7 @@ mod tests {
             test_helpers(),
             0,
             false,
+            false,
         );
 
         assert!(matches!(compiler.push_stack(), Some(StackSlot::Frame(_))));
@@ -26395,6 +26513,7 @@ mod tests {
             // with no stack guard, keeping these tests byte-identical.
             self_call_stack_guard: 0,
             region_bounds_addr: 0,
+            native_stack_floor_fn: 0,
         }
     }
 
