@@ -45152,6 +45152,55 @@ fn rl_with<R>(key: i32, f: impl FnOnce(&mut RlState) -> R) -> R {
     f(st)
 }
 
+/// Wait on `obj`'s monitor for up to `timeout_ms`. The caller must already
+/// hold the monitor (via a preceding `ctx.monitor_enter(obj)`) before
+/// calling this. ALWAYS releases the monitor before returning -- including
+/// when `monitor_wait` itself errors (e.g. `InterruptedException`, which
+/// `monitor_wait` throws exactly like `Object.wait()` does on either an
+/// entry-time or wake-time interrupt).
+///
+/// A bare `ctx.monitor_wait(obj, ms)?;` immediately followed by
+/// `ctx.monitor_exit(obj);` -- the pattern this replaces -- never reaches
+/// the `monitor_exit` call when `monitor_wait` errors: the `?` returns
+/// early, permanently leaking `obj`'s monitor as held by this thread.
+/// Every subsequent `monitor_enter(obj)` on the same object (from ANY
+/// thread, including this native's own retry loop and `native_rl_unlock`'s
+/// notify step) then blocks forever.
+///
+/// Confirmed live via `gdb -p <pid> -batch -ex 'thread apply all bt'`
+/// during the Tomcat `TestWsRemoteEndpointImplServerDeadlock` investigation
+/// (2026-07-09, docs/known-issues/tomcat-08-07/wsremoteendpoint-close-delay-near-deadlock.md):
+/// every one of ~10 worker threads was piled up inside `native_rl_unlock`'s
+/// `monitor_enter`, all blocked on the same wedged monitor, after a prior
+/// `native_rl_lock` caller hit exactly this leak on a `Thread.interrupt()`.
+/// Only surfaced once real `ScheduledThreadPoolExecutor`/`ThreadPoolExecutor`
+/// contention started reaching these natives (see
+/// `docs/internal/fixed-suite-bugs/enumset-synthetic-surface-drop-realmode-FIXED.md`).
+fn monitor_wait_release(
+    ctx: &mut dyn NativeContext,
+    obj: ObjectRef,
+    timeout_ms: Option<u64>,
+) -> MethodCallResult {
+    let result = ctx.monitor_wait(obj, timeout_ms);
+    ctx.monitor_exit(obj);
+    result
+}
+
+/// `true` iff `e` is the VM's `InterruptedException` (the error
+/// `monitor_wait` raises on an entry-time or wake-time interrupt). Used by
+/// `native_rl_lock` to distinguish "must absorb and retry" (this) from any
+/// other error (must propagate).
+fn is_interrupted_exception(e: &cratonvm_types::error::MethodCallFailed) -> bool {
+    matches!(
+        e,
+        cratonvm_types::error::MethodCallFailed::InternalError(
+            cratonvm_types::error::VmError::Runtime(
+                cratonvm_types::error::RuntimeError::InterruptedException
+            )
+        )
+    )
+}
+
 const CDL_FIELD_COUNT: usize = 0;
 
 const SEM_FIELD_PERMITS: usize = 0;
@@ -48130,8 +48179,7 @@ fn register_m18_concurrent_fixes(registry: &mut NativeMethodRegistry) {
                     ctx.monitor_exit(this);
                     return Ok(None);
                 }
-                ctx.monitor_wait(this, Some(10))?;
-                ctx.monitor_exit(this);
+                monitor_wait_release(ctx, this, Some(10))?;
             }
         });
         registry.register(abq, "offer", "(Ljava/lang/Object;)Z", |ctx, args| {
@@ -48219,8 +48267,7 @@ fn register_m18_concurrent_fixes(registry: &mut NativeMethodRegistry) {
                     ctx.monitor_exit(this);
                     return Ok(Some(result));
                 }
-                ctx.monitor_wait(this, Some(10))?;
-                ctx.monitor_exit(this);
+                monitor_wait_release(ctx, this, Some(10))?;
             }
         });
         registry.register(abq, "poll", "()Ljava/lang/Object;", |ctx, args| {
@@ -48280,8 +48327,7 @@ fn register_m18_concurrent_fixes(registry: &mut NativeMethodRegistry) {
                         return Ok(Some(Value::Object(None))); // timed out
                     }
                     let wait_ms = bounded_monitor_wait_ms(remaining, 10);
-                    ctx.monitor_wait(this, Some(wait_ms))?;
-                    ctx.monitor_exit(this);
+                    monitor_wait_release(ctx, this, Some(wait_ms))?;
                 }
             },
         );
@@ -48966,8 +49012,7 @@ fn register_t31_concurrent_extras(registry: &mut NativeMethodRegistry) {
                     return Ok(None);
                 }
                 ctx.monitor_enter(this);
-                ctx.monitor_wait(this, Some(5))?;
-                ctx.monitor_exit(this);
+                monitor_wait_release(ctx, this, Some(5))?;
             }
         });
         // tryTransfer(E) — non-blocking: add if there's a waiting consumer
@@ -49061,8 +49106,7 @@ fn register_t31_concurrent_extras(registry: &mut NativeMethodRegistry) {
                         return Ok(Some(Value::Object(None)));
                     }
                     let wait_ms = bounded_monitor_wait_ms(remaining, 10);
-                    ctx.monitor_wait(this, Some(wait_ms))?;
-                    ctx.monitor_exit(this);
+                    monitor_wait_release(ctx, this, Some(wait_ms))?;
                 }
             },
         );
@@ -49084,8 +49128,7 @@ fn register_t31_concurrent_extras(registry: &mut NativeMethodRegistry) {
                     ctx.monitor_exit(this);
                     return Ok(Some(result));
                 }
-                ctx.monitor_wait(this, Some(10))?;
-                ctx.monitor_exit(this);
+                monitor_wait_release(ctx, this, Some(10))?;
             }
         });
         // peek() — non-blocking
@@ -49305,9 +49348,28 @@ fn native_rl_lock(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResu
             st.owner != RL_UNOWNED && st.owner != tid
         };
         if still_owned {
-            ctx.monitor_wait(this, Some(5))?;
+            // `ReentrantLock.lock()` (unlike `lockInterruptibly()` /
+            // `tryLock(timeout, unit)`) is specified to never throw on
+            // interrupt -- it defers: per the `Lock#lock()` javadoc, "If the
+            // current thread... is interrupted while acquiring the lock...
+            // it will continue to wait... but upon acquiring the lock its
+            // interrupted status will be set." `monitor_wait` throws
+            // `InterruptedException` just like `Object.wait()` does (and
+            // already consumes the thread's interrupt flag when it does) --
+            // absorb that here, restore the flag via `thread_interrupt` on
+            // our own thread object, and keep retrying instead of
+            // propagating the exception out of a method that must not throw.
+            if let Err(e) = monitor_wait_release(ctx, this, Some(5)) {
+                if is_interrupted_exception(&e) {
+                    let self_thread = ctx.current_thread_object();
+                    ctx.thread_interrupt(self_thread);
+                    continue;
+                }
+                return Err(e);
+            }
+        } else {
+            ctx.monitor_exit(this);
         }
-        ctx.monitor_exit(this);
     }
 }
 
@@ -49409,8 +49471,7 @@ fn native_rl_try_lock_timeout(ctx: &mut dyn NativeContext, args: &[Value]) -> Me
         }
         let wait_ms = remaining.as_millis().min(5).max(1) as u64;
         ctx.monitor_enter(this);
-        ctx.monitor_wait(this, Some(wait_ms))?;
-        ctx.monitor_exit(this);
+        monitor_wait_release(ctx, this, Some(wait_ms))?;
         if ctx.is_interrupted(true) {
             return Err(cratonvm_types::error::MethodCallFailed::InternalError(
                 cratonvm_types::error::VmError::Runtime(
@@ -56790,8 +56851,7 @@ fn native_fut_get_timed(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCa
         let remaining = deadline.saturating_duration_since(std::time::Instant::now());
         let wait_ms = remaining.as_millis().min(5).max(1) as u64;
         ctx.monitor_enter(this);
-        ctx.monitor_wait(this, Some(wait_ms))?;
-        ctx.monitor_exit(this);
+        monitor_wait_release(ctx, this, Some(wait_ms))?;
     }
 }
 

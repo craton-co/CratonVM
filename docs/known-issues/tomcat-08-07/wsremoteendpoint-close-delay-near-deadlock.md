@@ -262,3 +262,72 @@ detail) but are not the fix for *this* bug.
    `SocketWrapperBase.isReadyForWrite()`/the NIO write-listener dispatch
    is backed) — not in `Semaphore`/`CountDownLatch` (already tried and
    ruled out respectively by a prior session and this one).
+
+## 2026-07-09 (session 3) — repro unblocked by the EnumSet fix; found and fixed a SEVERE regression (permanent deadlock, not just a 19s delay); test still blocked by a separate, already-tracked bug
+
+With `docs/internal/fixed-suite-bugs/enumset-synthetic-surface-drop-realmode-FIXED.md`
+merged to `dev`, Tomcat starts successfully under real-JDK mode for the
+first time in this investigation, and `WsServerContainer` constructs
+without error. Re-running the exact repro from this doc:
+
+```
+<EXE> --java-home /home/victor/jdk25 -Xmx2g -cp "$(cat /data/data/apps/tomcat/.suite/cp-linux-fixed.txt)" \
+  org.junit.runner.JUnitCore org.apache.tomcat.websocket.server.TestWsRemoteEndpointImplServerDeadlock
+```
+
+**The ~19.1s bounded delay from the original report is GONE — replaced by
+an unbounded hang** (observed past 180s with no sign of terminating on its
+own). This is a *more severe* symptom than originally documented, not
+progress on its own — root-caused and fixed this session; see
+`docs/internal/fixed-suite-bugs/reentrantlock-monitor-leak-on-interrupt-FIXED.md`
+for full detail. Summary: `gdb -p <pid> -batch -ex 'thread apply all bt'`
+attached during the stall showed every worker thread (and the main VM
+thread) piled up inside `native_rl_unlock`'s `monitor_enter`, all
+blocked on the same permanently-wedged VM monitor. Root cause:
+`native_rl_lock` (`ReentrantLock.lock()`) and 8 sibling blocking-queue/
+future natives called `ctx.monitor_wait(this, N)?;` immediately followed
+by `ctx.monitor_exit(this);` — the `?` skipped the `monitor_exit` call
+whenever `monitor_wait` threw `InterruptedException`, permanently
+leaking the monitor. This had presumably always been latently present but
+was never exercised under real-JDK mode until real `ThreadPoolExecutor`
+contention (itself only reachable after the EnumSet fix's bundled
+`ScheduledThreadPoolExecutor` fix) started hitting these natives for the
+first time. Fixed via a shared `monitor_wait_release` helper that always
+releases the monitor before propagating any error, applied to all 9
+affected call sites, plus a JLS-motivated refinement so
+`ReentrantLock.lock()` specifically absorbs-and-retries on interrupt
+(matching the real, non-interruptible `Lock#lock()` contract) rather than
+incorrectly throwing.
+
+**Net effect on this test: the deadlock is fixed (confirmed via 3
+consecutive runs, 9-14s each, down from an unbounded hang), but the test
+still does not pass.** All 4 param combos now fail fast with
+`jakarta.websocket.DeploymentException` / `EOFException ... Status Code
+[0]` — the WebSocket upgrade handshake itself never completes, because
+every socket read on the server hits (confirmed via matching log lines,
+one per test case):
+```
+ERROR [org.apache.coyote.http11.Http11NioProtocol] Error reading request, ignored (java/lang/NullPointerException: Cannot invoke "java.io.Reader.mark(int)")
+ERROR [org.apache.tomcat.util.net.NioEndpoint] Error running socket processor (java/lang/NullPointerException: Cannot invoke "java.util.concurrent.locks.ReentrantLock.lock()" because "lock" is null)
+```
+This is a **separate, already-tracked bug** — `SocketWrapperBase`'s own
+`private final ReentrantLock lock` field is null — documented in detail
+(with two untested hypotheses: cross-thread stale-field visibility vs. a
+JIT field-initializer miscompilation) in
+`docs/known-issues/tomcat-08-07/swallowabortedupploads-unexpected-socketexception.md`
+("New blocker #3", found independently by a concurrent session the same
+day). Not this investigation's bug to fix — it blocks the WebSocket
+handshake before the server ever reaches the close-handshake code path
+this doc is about, so the *original* ~19.1s-delay-vs-permanent-deadlock
+question genuinely cannot be re-observed until that bug is fixed.
+
+**Status stays OPEN**, narrowed to a single, precise next step: once
+`docs/known-issues/tomcat-08-07/swallowabortedupploads-unexpected-socketexception.md`'s
+`SocketWrapperBase.lock` bug is fixed (by whichever session gets there
+first), re-run this exact repro. Expect one of two outcomes: the test
+passes cleanly (the close-handshake path was never actually broken, only
+unreachable), or the original ~19.1s-class assertion resurfaces (in which
+case the `DEFAULT_BLOCKING_SEND_TIMEOUT`-expiring hypothesis from the
+2026-07-09 (later session) entry above is still the leading explanation
+and the gdb-during-stall technique demonstrated in this session — attach
+mid-window, not just at a final timeout — is the way to confirm it).
