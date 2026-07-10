@@ -22,7 +22,7 @@ use std::ops::{Deref, DerefMut};
 use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU64, AtomicUsize, Ordering};
 
 use parking_lot::Mutex;
-use rustc_hash::FxHashMap;
+use rustc_hash::{FxHashMap, FxHashSet};
 use std::sync::Arc;
 
 use crate::collector::{GarbageCollector, MonitorCleanup};
@@ -1283,6 +1283,21 @@ pub struct G1Collector {
     /// "mark all old-gen for this cycle" fail-safe, region-flavored.
     mark_saw_implausible: AtomicBool,
 
+    /// INT-8 — referent-slot hiding. Addresses of every Weak/Soft/Phantom
+    /// `Reference` OBJECT registered with the VM's `ReferenceProcessor` at
+    /// mark start (published by the initial-mark STW via
+    /// [`Self::set_reference_skip_set`]). While a cycle is active,
+    /// `scan_object_refs` skips slot 0 (the referent) of exactly these
+    /// objects, so the trace cannot keep a weakly-reachable referent alive
+    /// through its (strongly-reachable) Reference — the taint that made
+    /// bitmap-based reference processing inert. Maintained across every
+    /// mid-cycle evacuation pause by [`Self::remap_reference_skip_set`]:
+    /// survivors are re-keyed through the pause's pointer map and CSet
+    /// casualties are PRUNED (a stale entry could alias a reused address
+    /// and hide an innocent object's slot 0 — under-marking). Cleared at
+    /// cleanup/abort; empty outside a cycle.
+    reference_skip: Mutex<FxHashSet<usize>>,
+
     /// Finalizer-resurrection input for the CURRENT collection (see
     /// [`Self::collect_garbage_with_finalizers`]): referent addresses of
     /// registered, not-yet-enqueued finalizable objects. Consumed (taken)
@@ -1446,6 +1461,7 @@ impl G1Collector {
             mark_worklist: Mutex::new(Vec::new()),
             mark_worklist_overflowed: AtomicBool::new(false),
             mark_saw_implausible: AtomicBool::new(false),
+            reference_skip: Mutex::new(FxHashSet::default()),
             pending_finalizer_roots: Mutex::new(Vec::new()),
             resurrected_finalizers: Mutex::new(Vec::new()),
             kept_unresolved_regions: Mutex::new(std::collections::HashSet::new()),
@@ -1965,6 +1981,10 @@ impl G1Collector {
         self.recompute_old_gen_bytes(&regions);
 
         monitors.remap_after_gc(&pointer_map);
+        // INT-8: carry the referent-slot skip set across this pause
+        // (re-key survivors, prune CSet casualties) — same protocol
+        // point as the monitor-table remap. No-op outside a mark cycle.
+        self.remap_reference_skip_set(&cset_set, &pointer_map);
 
         // Remap (or drop) stale concurrent-mark worklist entries — same
         // protocol as the young paths (done under STW, guard held).
@@ -2284,6 +2304,10 @@ impl G1Collector {
 
         // Remap monitors
         monitors.remap_after_gc(&pointer_map);
+        // INT-8: carry the referent-slot skip set across this pause
+        // (re-key survivors, prune CSet casualties) — same protocol
+        // point as the monitor-table remap. No-op outside a mark cycle.
+        self.remap_reference_skip_set(&cset_set, &pointer_map);
 
         // Round-7 fix (HIGH, audit §12): the concurrent mark worklist holds
         // raw object addresses that may have just been evacuated by this
@@ -2673,6 +2697,10 @@ impl G1Collector {
         self.recompute_old_gen_bytes(&regions);
 
         monitors.remap_after_gc(&pointer_map);
+        // INT-8: carry the referent-slot skip set across this pause
+        // (re-key survivors, prune CSet casualties) — same protocol
+        // point as the monitor-table remap. No-op outside a mark cycle.
+        self.remap_reference_skip_set(&cset_set, &pointer_map);
 
         // Remap (or drop) stale concurrent-mark worklist entries — same
         // protocol as the young paths. A mixed pause moves OLD objects, where
@@ -3112,6 +3140,10 @@ impl G1Collector {
         self.recompute_old_gen_bytes(&regions);
 
         monitors.remap_after_gc(&pointer_map);
+        // INT-8: carry the referent-slot skip set across this pause
+        // (re-key survivors, prune CSet casualties) — same protocol
+        // point as the monitor-table remap. No-op outside a mark cycle.
+        self.remap_reference_skip_set(&cset_set, &pointer_map);
 
         // Remap (or drop) stale concurrent-mark worklist entries — identical to
         // the serial young path. Done under STW (guard held) so no marker step
@@ -3255,6 +3287,10 @@ impl G1Collector {
         self.recompute_old_gen_bytes(&regions);
 
         monitors.remap_after_gc(&pointer_map);
+        // INT-8: carry the referent-slot skip set across this pause
+        // (re-key survivors, prune CSet casualties) — same protocol
+        // point as the monitor-table remap. No-op outside a mark cycle.
+        self.remap_reference_skip_set(&cset_set, &pointer_map);
 
         // Remap (or drop) stale concurrent-mark worklist entries — same
         // protocol as the young paths (the mixed CSet includes Old regions,
@@ -4676,6 +4712,8 @@ impl G1Collector {
         self.mark_worklist_overflowed
             .store(false, Ordering::Relaxed);
         self.mark_saw_implausible.store(false, Ordering::Relaxed);
+        // INT-8: the skip set is per-cycle state.
+        self.reference_skip.lock().clear();
         let _ = self.satb_queue.deactivate_and_drain();
         self.gc_state.set_phase(ConcurrentGcPhase::Idle);
     }
@@ -4713,7 +4751,152 @@ impl G1Collector {
             .store(false, Ordering::Relaxed);
         // G1MARK-8: same per-cycle reset for the implausible-header flag.
         self.mark_saw_implausible.store(false, Ordering::Relaxed);
+        // INT-8: stale skip entries from a previous cycle must never hide a
+        // reused address's slot 0 — the VM re-publishes the current set
+        // right after this call (still inside the initial-mark STW).
+        self.reference_skip.lock().clear();
         self.gc_state.set_phase(ConcurrentGcPhase::ConcurrentMark);
+    }
+
+    /// INT-8: publish the referent-slot skip set for the cycle that
+    /// [`Self::start_concurrent_mark`] just opened. `addrs` are the
+    /// Weak/Soft/Phantom `Reference` OBJECT addresses from the VM's
+    /// `ReferenceProcessor` registry, snapshotted inside the same
+    /// initial-mark STW (so no mutator can move or free them between the
+    /// snapshot and this publish). See the `reference_skip` field doc.
+    pub fn set_reference_skip_set(&self, addrs: &[usize]) {
+        let mut skip = self.reference_skip.lock();
+        skip.clear();
+        skip.extend(addrs.iter().copied());
+    }
+
+    /// Test/diagnostic: current size of the referent-slot skip set.
+    #[cfg(test)]
+    pub(crate) fn dbg_reference_skip_len(&self) -> usize {
+        self.reference_skip.lock().len()
+    }
+
+    /// Test/diagnostic: does the skip set contain `addr`?
+    #[cfg(test)]
+    pub(crate) fn dbg_reference_skip_contains(&self, addr: usize) -> bool {
+        self.reference_skip.lock().contains(&addr)
+    }
+
+    /// INT-8: carry the referent-slot skip set across an evacuation pause.
+    /// Survivors are re-keyed through `pointer_map`; entries that sat in a
+    /// CSet region and were NOT forwarded died with their region — they are
+    /// PRUNED, because their address can be recycled later in the cycle and
+    /// a stale entry would then hide the slot 0 of whatever innocent object
+    /// reuses the memory (under-marking → freed-live corruption). A
+    /// self-forwarded kept-region object maps to itself and is retained.
+    /// Pruning a live entry is impossible by construction (non-CSet objects
+    /// do not move and CSet survivors are always in the map), but even if a
+    /// wedged drain dropped one, the failure mode is over-retention of its
+    /// referent for one cycle — never under-marking.
+    ///
+    /// Called with the pause's regions lock held, after evacuation composed
+    /// the final `pointer_map` (same protocol point as the monitor-table
+    /// remap). No-op when no cycle is active (set empty).
+    fn remap_reference_skip_set(
+        &self,
+        cset_set: &std::collections::HashSet<usize>,
+        pointer_map: &HashMap<usize, usize>,
+    ) {
+        let mut skip = self.reference_skip.lock();
+        if skip.is_empty() {
+            return;
+        }
+        let old: Vec<usize> = skip.drain().collect();
+        for addr in old {
+            if let Some(&new_addr) = pointer_map.get(&addr) {
+                skip.insert(new_addr);
+            } else {
+                let in_cset = self
+                    .lookup_region_for_addr(addr)
+                    .is_some_and(|idx| cset_set.contains(&idx));
+                if !in_cset {
+                    skip.insert(addr); // untouched region — object did not move
+                }
+                // else: died in the CSet — prune.
+            }
+        }
+    }
+
+    /// INT-8: post-remark liveness verdict for reference processing. Valid
+    /// ONLY between the final remark's fixed-point drain and `cleanup()`
+    /// (the mark bitmap is complete and nothing has been freed yet).
+    /// Mirrors cleanup's own liveness walk:
+    /// - not a heap address / no cycle data → LIVE (never claim dead
+    ///   without positive evidence);
+    /// - region freed earlier in the cycle → DEAD;
+    /// - region recycled/re-typed since the mark-start snapshot → LIVE
+    ///   (its entire content postdates the snapshot);
+    /// - allocated above the snapshot cursor (TAMS) → LIVE;
+    /// - otherwise → the region's mark-bitmap verdict.
+    pub fn is_live_after_mark(&self, addr: usize) -> bool {
+        let regions = self.regions.lock();
+        let Some(idx) = self.region_for_ptr(&regions, addr as *mut u8) else {
+            return true;
+        };
+        let region = &regions[idx];
+        if region.region_type == RegionType::Free {
+            return false;
+        }
+        // Same regions→snapshot lock order as `cleanup` / `start_concurrent_mark`.
+        let snap = self.mark_start_snapshot.lock();
+        if snap.is_empty() {
+            return true;
+        }
+        match snap.get(idx) {
+            Some(&(epoch, snap_cursor, snap_type))
+                if epoch == region.reuse_epoch && snap_type == region.region_type =>
+            {
+                let base = region.data.as_ptr() as usize;
+                if addr.wrapping_sub(base) >= snap_cursor {
+                    return true; // TAMS: allocated after mark start
+                }
+                region.mark_bitmap.is_marked(addr)
+            }
+            _ => true,
+        }
+    }
+
+    /// INT-8: resurrect objects the remark-time reference processor decided
+    /// to hand out (dead finalizables about to be finalize()d, pending
+    /// cleaner chains, policy-retained soft referents): mark each gray and
+    /// drain the closure to a fixed point so this cycle's `cleanup` cannot
+    /// free them or anything they reach. Must run between the remark drain
+    /// and `cleanup()`. Addresses outside a live region are skipped — the
+    /// caller's own staleness guards already dropped those.
+    pub fn resurrect_after_remark(&self, addrs: &[usize]) {
+        if addrs.is_empty() {
+            return;
+        }
+        {
+            let regions = self.regions.lock();
+            for &addr in addrs {
+                if let Some(idx) = self.region_for_ptr(&regions, addr as *mut u8) {
+                    if regions[idx].region_type != RegionType::Free {
+                        self.push_gray_or_mark(&regions, addr);
+                    }
+                }
+            }
+        }
+        while !self.concurrent_mark_step(usize::MAX) {}
+    }
+
+    /// INT-8: store a field WITHOUT firing the SATB pre-barrier. Reserved
+    /// for the weak-reference PROTOCOL writes — the pre-collection referent
+    /// null pass (whose value is restored before mutators resume, so the
+    /// snapshot graph is unchanged) and the remark-time referent clears
+    /// (whose edge removal is the reference processor's decided verdict,
+    /// which SATB must not resurrect). Every semantic mutator store must
+    /// keep using `set_field`. Bounds/humongous handling and the RSet
+    /// post-barrier are identical to `set_field` — only the pre-barrier is
+    /// suppressed, via a same-thread RAII scope around the normal path.
+    pub(crate) fn set_field_no_satb(&self, obj: ObjectRef, index: usize, value: Value) {
+        let _guard = SatbPreSuppressGuard::new();
+        <Self as crate::collector::GarbageCollector>::set_field(self, obj, index, value);
     }
 
     /// Perform an incremental step of concurrent marking.
@@ -4971,8 +5154,25 @@ impl G1Collector {
             }
             // Primitive arrays carry no references.
         } else {
+            // INT-8: referent-slot hiding. A Weak/Soft/Phantom Reference
+            // object (registered in `reference_skip` at mark start, re-keyed
+            // across every evacuation pause) has its slot 0 — the referent —
+            // EXCLUDED from the trace: weak reachability must not keep the
+            // referent alive, or remark-time reference processing can never
+            // see a dead verdict for it (the INT-8 bitmap taint). All other
+            // slots (queue, next, discovered, subclass fields) trace
+            // normally. Lock order: regions (held by every caller) →
+            // reference_skip — same as `remap_reference_skip_set`'s callers.
+            let first_slot = {
+                let skip = self.reference_skip.lock();
+                if !skip.is_empty() && skip.contains(&(obj_ptr as usize)) {
+                    1
+                } else {
+                    0
+                }
+            };
             // Object: 16-byte Value slot per field.
-            for slot_idx in 0..header.num_slots as usize {
+            for slot_idx in first_slot..header.num_slots as usize {
                 let payload_off = slot_idx * SLOT_SIZE;
                 let value = if let Some((start, total_payload)) = humongous_start {
                     // Region-aware 16-byte read for humongous objects.
@@ -5298,6 +5498,8 @@ impl G1Collector {
         // cycle starts in a clean state.
         self.mark_worklist_overflowed
             .store(false, Ordering::Relaxed);
+        // INT-8: referent-slot hiding ends with the cycle.
+        self.reference_skip.lock().clear();
         // Round-5 CRIT #4: close the SATB barrier with a drain-then-flip
         // protocol so no mutator log push that observed the gate as
         // active can be stranded after the cycle ends. The drained
@@ -6664,8 +6866,16 @@ impl GarbageCollector for G1Collector {
         // tracked. This mirrors how `GenerationalHeap::set_field` fires its
         // barrier internally; callers do NOT need to call the barriers
         // separately. Primitive stores skip both barriers.
+        //
+        // INT-8: `satb_pre_suppressed()` exempts the weak-reference PROTOCOL
+        // writes (the pre-pause referent null pass and the remark-time
+        // referent clears) — those are not semantic overwrites, and logging
+        // them recorded every active referent as a mark root at every
+        // mid-cycle young pause, tainting the bitmap verdicts remark-time
+        // reference processing depends on. The TLS read is gated behind the
+        // marking-active check, so the non-marking hot path pays nothing.
         let is_ref_store = matches!(value, Value::Object(_));
-        if is_ref_store && self.gc_state.is_marking_active() {
+        if is_ref_store && self.gc_state.is_marking_active() && !satb_pre_suppressed() {
             let old = self.get_field(obj, index);
             if let Value::Object(Some(old_ref)) = old {
                 self.satb_pre_barrier(old_ref.as_ptr() as usize);
@@ -7103,6 +7313,42 @@ fn object_total_size(header: &ObjectHeader) -> usize {
 #[inline]
 fn is_humongous_filler(header: &ObjectHeader) -> bool {
     matches!(header.kind, ObjectKind::HumongousFiller)
+}
+
+thread_local! {
+    /// INT-8: same-thread SATB pre-barrier suppression window. Set only by
+    /// [`SatbPreSuppressGuard`] around the weak-reference protocol writes
+    /// (`G1Collector::set_field_no_satb`); consulted by `set_field`'s SATB
+    /// block ONLY while marking is active, so the non-marking store path
+    /// never touches TLS.
+    static SATB_PRE_SUPPRESSED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// INT-8: is the current thread inside a `set_field_no_satb` protocol write?
+#[inline]
+fn satb_pre_suppressed() -> bool {
+    SATB_PRE_SUPPRESSED.with(std::cell::Cell::get)
+}
+
+/// RAII scope for [`SATB_PRE_SUPPRESSED`] — restores the flag on drop (also
+/// on unwind), so a panicking store can never leak suppression into later,
+/// semantic stores on the same thread.
+struct SatbPreSuppressGuard {
+    prev: bool,
+}
+
+impl SatbPreSuppressGuard {
+    fn new() -> Self {
+        let prev = SATB_PRE_SUPPRESSED.with(|f| f.replace(true));
+        Self { prev }
+    }
+}
+
+impl Drop for SatbPreSuppressGuard {
+    fn drop(&mut self) {
+        let prev = self.prev;
+        SATB_PRE_SUPPRESSED.with(|f| f.set(prev));
+    }
 }
 
 /// G1MARK-8: can `obj_addr` be trusted as an object start for a mark scan?
@@ -8952,6 +9198,208 @@ mod tests {
             RegionType::Free,
             "next clean cycle must reclaim the wholly-dead Old region"
         );
+    }
+
+    /// INT-8 core: with referent-slot hiding, a weakly-only-reachable
+    /// OLD-region referent is unmarked at cycle end and cleanup frees its
+    /// region — while WITHOUT the skip set the trace through the (live)
+    /// Reference keeps it alive forever (the pre-fix taint).
+    #[test]
+    fn referent_slot_hiding_lets_cleanup_free_weak_old_referent() {
+        let run = |hide: bool| -> RegionType {
+            let cfg = G1CollectorConfig {
+                promotion_age: 1,
+                ..small_config()
+            };
+            let gc = G1Collector::new(cfg);
+
+            // X: promoted to Old; after promotion its ONLY path is R.slot0.
+            let x = gc.alloc_object(ClassId::new(1), 0);
+            let mut roots = vec![x];
+            gc.young_collection(&mut roots, &NoopMonitors);
+            gc.young_collection(&mut roots, &NoopMonitors);
+            let x = roots[0];
+            let x_region = {
+                let regions = gc.regions.lock();
+                let idx = gc.region_for_ptr(&regions, x.as_ptr()).unwrap();
+                assert_eq!(regions[idx].region_type, RegionType::Old);
+                idx
+            };
+
+            // R: a live "WeakReference" (2 slots: referent, queue) whose
+            // slot 0 is the only edge to X.
+            let r = gc.alloc_object(ClassId::new(2), 2);
+            gc.set_field(r, 0, Value::Object(Some(x)));
+
+            gc.start_concurrent_mark();
+            if hide {
+                gc.set_reference_skip_set(&[r.as_ptr() as usize]);
+            }
+            gc.remark(&[r]);
+            while !gc.concurrent_mark_step(usize::MAX) {}
+            gc.cleanup();
+
+            let regions = gc.regions.lock();
+            regions[x_region].region_type
+        };
+
+        assert_eq!(
+            run(false),
+            RegionType::Old,
+            "baseline (no hiding): the trace through R keeps X's region live"
+        );
+        assert_eq!(
+            run(true),
+            RegionType::Free,
+            "with referent-slot hiding, cleanup must free the weakly-only-reachable Old region"
+        );
+    }
+
+    /// INT-8: the skip set follows a Reference object through a mid-cycle
+    /// evacuation pause (survivor re-keyed), and a Reference that dies in
+    /// the CSet is pruned.
+    #[test]
+    fn reference_skip_set_remaps_survivors_and_prunes_casualties() {
+        let gc = G1Collector::new(small_config());
+
+        // Survivor case: R is rooted through the pause.
+        let r = gc.alloc_object(ClassId::new(2), 2);
+        gc.start_concurrent_mark();
+        gc.set_reference_skip_set(&[r.as_ptr() as usize]);
+        let mut roots = vec![r];
+        gc.young_collection(&mut roots, &NoopMonitors);
+        let r_new = roots[0];
+        assert_eq!(gc.dbg_reference_skip_len(), 1);
+        assert!(
+            gc.dbg_reference_skip_contains(r_new.as_ptr() as usize),
+            "skip set must hold R's POST-evacuation address"
+        );
+        gc.abort_concurrent_mark();
+        assert_eq!(gc.dbg_reference_skip_len(), 0, "abort clears the set");
+
+        // Casualty case: R2 is unrooted and dies in the young CSet.
+        let r2 = gc.alloc_object(ClassId::new(2), 2);
+        gc.start_concurrent_mark();
+        gc.set_reference_skip_set(&[r2.as_ptr() as usize]);
+        let mut no_roots: Vec<ObjectRef> = vec![];
+        gc.young_collection(&mut no_roots, &NoopMonitors);
+        assert_eq!(
+            gc.dbg_reference_skip_len(),
+            0,
+            "a CSet casualty must be pruned (stale entries can alias reused addresses)"
+        );
+        gc.abort_concurrent_mark();
+    }
+
+    /// INT-8: `set_field_no_satb` suppresses exactly the SATB pre-barrier —
+    /// the same overwrite through plain `set_field` logs the old value as a
+    /// mark root; the protocol variant does not.
+    #[test]
+    fn set_field_no_satb_suppresses_pre_barrier_only() {
+        let run = |suppress: bool| -> bool {
+            let gc = G1Collector::new(small_config());
+            let holder = gc.alloc_object(ClassId::new(1), 1);
+            let old_val = gc.alloc_object(ClassId::new(2), 0);
+            gc.set_field(holder, 0, Value::Object(Some(old_val)));
+
+            gc.start_concurrent_mark();
+            if suppress {
+                gc.set_field_no_satb(holder, 0, Value::Object(None));
+            } else {
+                gc.set_field(holder, 0, Value::Object(None));
+            }
+            // remark flushes every thread-local SATB buffer into the gray set.
+            gc.remark(&[]);
+            let grayed = gc.dbg_is_grayed_or_marked(old_val.as_ptr() as usize);
+            gc.abort_concurrent_mark();
+            grayed
+        };
+
+        assert!(
+            run(false),
+            "plain set_field must SATB-log the overwritten referent while marking"
+        );
+        assert!(
+            !run(true),
+            "set_field_no_satb must not log the protocol null's old value"
+        );
+    }
+
+    /// INT-8: `is_live_after_mark` verdicts — bitmap-marked ⇒ live,
+    /// unmarked pre-TAMS ⇒ dead, post-mark-start allocation ⇒ live (TAMS),
+    /// non-heap address ⇒ live (never claim dead without evidence).
+    #[test]
+    fn is_live_after_mark_verdicts() {
+        let cfg = G1CollectorConfig {
+            promotion_age: 1,
+            ..small_config()
+        };
+        let gc = G1Collector::new(cfg);
+
+        // live_old: promoted + kept as a root. dead_old: promoted + dropped.
+        let live = gc.alloc_object(ClassId::new(1), 0);
+        let dead = gc.alloc_object(ClassId::new(2), 0);
+        let mut roots = vec![live, dead];
+        gc.young_collection(&mut roots, &NoopMonitors);
+        gc.young_collection(&mut roots, &NoopMonitors);
+        let (live, dead) = (roots[0], roots[1]);
+
+        gc.start_concurrent_mark();
+        gc.remark(&[live]);
+        while !gc.concurrent_mark_step(usize::MAX) {}
+
+        // Post-mark-start allocation: TAMS says live despite no mark bit.
+        let fresh = gc.alloc_object(ClassId::new(3), 0);
+
+        assert!(gc.is_live_after_mark(live.as_ptr() as usize));
+        assert!(!gc.is_live_after_mark(dead.as_ptr() as usize));
+        assert!(gc.is_live_after_mark(fresh.as_ptr() as usize));
+        assert!(
+            gc.is_live_after_mark(0x10),
+            "non-heap address must read live (conservative)"
+        );
+        gc.abort_concurrent_mark();
+    }
+
+    /// INT-8: `resurrect_after_remark` keeps a dead-by-mark object (and its
+    /// subtree) alive through cleanup — the finalize()/cleaner handout
+    /// protocol.
+    #[test]
+    fn resurrect_after_remark_survives_cleanup() {
+        let cfg = G1CollectorConfig {
+            promotion_age: 1,
+            ..small_config()
+        };
+        let gc = G1Collector::new(cfg);
+
+        let d = gc.alloc_object(ClassId::new(1), 0);
+        let mut roots = vec![d];
+        gc.young_collection(&mut roots, &NoopMonitors);
+        gc.young_collection(&mut roots, &NoopMonitors);
+        let d = roots[0];
+        let d_region = {
+            let regions = gc.regions.lock();
+            let idx = gc.region_for_ptr(&regions, d.as_ptr()).unwrap();
+            assert_eq!(regions[idx].region_type, RegionType::Old);
+            idx
+        };
+        roots.clear(); // D is dead at mark start
+
+        gc.start_concurrent_mark();
+        gc.remark(&[]);
+        while !gc.concurrent_mark_step(usize::MAX) {}
+        assert!(!gc.is_live_after_mark(d.as_ptr() as usize));
+
+        gc.resurrect_after_remark(&[d.as_ptr() as usize]);
+        gc.cleanup();
+
+        let regions = gc.regions.lock();
+        assert_eq!(
+            regions[d_region].region_type,
+            RegionType::Old,
+            "a resurrected finalizable's region must survive this cycle's cleanup"
+        );
+        assert!(regions[d_region].live_bytes > 0);
     }
 
     // -- Needs GC --

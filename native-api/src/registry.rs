@@ -2553,6 +2553,22 @@ pub trait NativeContext {
     /// no-op keeps mock/test contexts compiling.
     fn touch_soft_reference(&mut self, _reference_obj: ObjectRef) {}
 
+    /// INT-8: GC keep-alive for a referent a `Reference.get()` just handed to
+    /// the mutator — the HotSpot `G1ReferenceGet` intrinsic barrier
+    /// equivalent. While a G1 concurrent mark cycle is active, the marker
+    /// deliberately does NOT trace through referent slots (referent-slot
+    /// hiding); a mutator that reads a referent and stores it into an
+    /// already-scanned (black) object would create the only strong path via
+    /// an edge the snapshot cannot see, and the remark-time reference
+    /// processor could then clear the weak ref and free the referent while
+    /// strongly reachable (use-after-free). The VM overrides this with the
+    /// heap's SATB pre-barrier (`VmHeap::write_barrier_pre`), which logs the
+    /// value as a mark root when marking is active and is a no-op otherwise.
+    /// `refersTo` intentionally does NOT call this — its JDK contract is to
+    /// test the referent WITHOUT keeping it alive. The default no-op keeps
+    /// mock/test contexts compiling.
+    fn gc_reference_keep_alive(&mut self, _referent: ObjectRef) {}
+
     /// Record a JFR thread sleep event. Called by Thread.sleep implementations.
     /// Default is no-op; the VM overrides this with the real JFR recorder.
     fn record_thread_sleep(&mut self, _sleep_nanos: i64, _actual_duration_nanos: u64) {}
