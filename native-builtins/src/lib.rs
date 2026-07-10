@@ -19334,96 +19334,24 @@ pub fn register_essential_natives(registry: &mut NativeMethodRegistry) {
     // are reachable in BOTH synthetic-jdk and real-JDK feature configurations.
     crate::lang_misc::register_throwable_subclass_natives(registry);
 
-    // Some bootstraps still receive synthetic-stub Reader classes from
-    // class_manager.rs; those stubs declare these ctors as native, so the
-    // registry must provide matching bodies even in real-JDK mode.
+    // java/io/InputStreamReader: removed the synthetic <init>/read([CII)I/close
+    // overrides here. read([CII)I) did a dumb byte-for-byte passthrough --
+    // chars[i] = stream.read() & 0xff -- ignoring the charset entirely. Real
+    // JDK 25 InputStreamReader.read(char[],int,int) is real bytecode delegating to
+    // sd.read(...) (a sun.nio.cs.StreamDecoder built via
+    // StreamDecoder.forInputStreamReader(...), already correctly registered with
+    // full charset support in native-io/src/stream_decoder.rs). This synthetic
+    // block unconditionally shadowed that real bytecode for EVERY InputStreamReader
+    // (not just genuinely-synthetic-stub ones) because the interpreter invokevirtual
+    // vtable fast path (execute_invokevirtual_vtable_fast in interpreter.rs) treats
+    // "any native registered for this (class, method, descriptor)" as an
+    // authoritative shadow -- it does not consult the NativeKind::SyntheticStub
+    // category the way vm_exec.rs::invoke_or_native real_protected_stub check does,
+    // so tagging this SyntheticStub alone (tried first) did not help; only removing
+    // it does. Broke every multi-byte decode through InputStreamReader, most
+    // visibly UTF-16BE/LE (each 2-byte code unit decoded as two separate
+    // Latin-1-ish chars).
     {
-        registry.register(
-            "java/io/InputStreamReader",
-            "<init>",
-            "(Ljava/io/InputStream;)V",
-            |ctx, args| {
-                let this = obj_arg(args, 0)?;
-                let stream = args.get(1).copied().unwrap_or(Value::Object(None));
-                ctx.set_field(this, 0, stream);
-                Ok(None)
-            },
-        );
-        registry.register(
-            "java/io/InputStreamReader",
-            "<init>",
-            "(Ljava/io/InputStream;Ljava/nio/charset/Charset;)V",
-            |ctx, args| {
-                let this = obj_arg(args, 0)?;
-                let stream = args.get(1).copied().unwrap_or(Value::Object(None));
-                ctx.set_field(this, 0, stream);
-                Ok(None)
-            },
-        );
-        registry.register(
-            "java/io/InputStreamReader",
-            "<init>",
-            "(Ljava/io/InputStream;Ljava/lang/String;)V",
-            |ctx, args| {
-                let this = obj_arg(args, 0)?;
-                let stream = args.get(1).copied().unwrap_or(Value::Object(None));
-                ctx.set_field(this, 0, stream);
-                Ok(None)
-            },
-        );
-        registry.register(
-            "java/io/InputStreamReader",
-            "read",
-            "([CII)I",
-            |ctx, args| {
-                let this = obj_arg(args, 0)?;
-                let chars = match args.get(1) {
-                    Some(Value::Object(Some(arr))) => *arr,
-                    _ => {
-                        return Err(RuntimeError::NullPointerException { message: None }.into());
-                    }
-                };
-                let off = match args.get(2) {
-                    Some(Value::Int(v)) => *v,
-                    _ => 0,
-                };
-                let len = match args.get(3) {
-                    Some(Value::Int(v)) => *v,
-                    _ => 0,
-                };
-                let arr_len = ctx.array_length(chars) as i32;
-                let end = off.checked_add(len).unwrap_or(i32::MAX);
-                if off < 0 || len < 0 || end > arr_len {
-                    return Err(RuntimeError::ArrayIndexOutOfBoundsException { index: end }.into());
-                }
-                if len == 0 {
-                    return Ok(Some(Value::Int(0)));
-                }
-                let stream = match ctx.get_field(this, 0) {
-                    Value::Object(Some(stream)) => stream,
-                    _ => return Ok(Some(Value::Int(-1))),
-                };
-                let mut read = 0i32;
-                while read < len {
-                    let b = match ctx.invoke_virtual(stream, "read", "()I", &[])? {
-                        Some(Value::Int(v)) => v,
-                        _ => -1,
-                    };
-                    if b < 0 {
-                        return Ok(Some(Value::Int(if read == 0 { -1 } else { read })));
-                    }
-                    ctx.set_array_element(chars, (off + read) as usize, Value::Int(b & 0xff));
-                    read += 1;
-                }
-                Ok(Some(Value::Int(read)))
-            },
-        );
-        registry.register(
-            "java/io/InputStreamReader",
-            "close",
-            "()V",
-            native_input_stream_reader_close,
-        );
         registry.register(
             "java/util/jar/Attributes",
             "<init>",
@@ -20185,225 +20113,24 @@ pub fn register_essential_natives(registry: &mut NativeMethodRegistry) {
         "()V",
         native_output_stream_writer_close,
     );
-    registry.register(
-        "java/io/BufferedInputStream",
-        "<init>",
-        "(Ljava/io/InputStream;)V",
-        |ctx, args| {
-            let this = match args.first() {
-                Some(Value::Object(Some(o))) => *o,
-                _ => return Ok(None),
-            };
-            let input = args.get(1).copied().unwrap_or(Value::Object(None));
-            ctx.set_field_by_name(this, "in", input);
-            ctx.set_field(this, 0, input);
-            let buf = ctx.new_array(cratonvm_types::ArrayElementType::Byte, 8192);
-            ctx.set_field_by_name(this, "initialSize", Value::Int(8192));
-            ctx.set_field_by_name(this, "buf", Value::Object(Some(buf)));
-            ctx.set_field_by_name(this, "count", Value::Int(0));
-            ctx.set_field_by_name(this, "pos", Value::Int(0));
-            ctx.set_field_by_name(this, "markpos", Value::Int(-1));
-            ctx.set_field_by_name(this, "marklimit", Value::Int(0));
-            ctx.set_field(this, 1, Value::Object(Some(buf)));
-            Ok(None)
-        },
-    );
-    registry.register(
-        "java/io/BufferedInputStream",
-        "<init>",
-        "(Ljava/io/InputStream;I)V",
-        |ctx, args| {
-            let this = match args.first() {
-                Some(Value::Object(Some(o))) => *o,
-                _ => return Ok(None),
-            };
-            let input = args.get(1).copied().unwrap_or(Value::Object(None));
-            let size = args.get(2).and_then(Value::as_int).unwrap_or(8192).max(1);
-            ctx.set_field_by_name(this, "in", input);
-            ctx.set_field(this, 0, input);
-            let buf = ctx.new_array(cratonvm_types::ArrayElementType::Byte, size as usize);
-            ctx.set_field_by_name(this, "initialSize", Value::Int(size));
-            ctx.set_field_by_name(this, "buf", Value::Object(Some(buf)));
-            ctx.set_field_by_name(this, "count", Value::Int(0));
-            ctx.set_field_by_name(this, "pos", Value::Int(0));
-            ctx.set_field_by_name(this, "markpos", Value::Int(-1));
-            ctx.set_field_by_name(this, "marklimit", Value::Int(0));
-            ctx.set_field(this, 1, Value::Object(Some(buf)));
-            Ok(None)
-        },
-    );
-    registry.register("java/io/BufferedInputStream", "read", "()I", |ctx, args| {
-        let this = match args.first() {
-            Some(Value::Object(Some(o))) => *o,
-            _ => return Ok(Some(Value::Int(-1))),
-        };
-        let input = match ctx.get_field_by_name(this, "in") {
-            Value::Object(Some(o)) => Some(o),
-            _ => match ctx.get_field(this, 0) {
-                Value::Object(Some(o)) => Some(o),
-                _ => None,
-            },
-        };
-        match input {
-            Some(input) => Ok(ctx
-                .invoke_virtual(input, "read", "()I", &[])?
-                .or(Some(Value::Int(-1)))),
-            None => Ok(Some(Value::Int(-1))),
-        }
-    });
-    registry.register(
-        "java/io/BufferedInputStream",
-        "read",
-        "([BII)I",
-        |ctx, args| {
-            let this = match args.first() {
-                Some(Value::Object(Some(o))) => *o,
-                _ => return Ok(Some(Value::Int(-1))),
-            };
-            let input = match ctx.get_field_by_name(this, "in") {
-                Value::Object(Some(o)) => Some(o),
-                _ => match ctx.get_field(this, 0) {
-                    Value::Object(Some(o)) => Some(o),
-                    _ => None,
-                },
-            };
-            match input {
-                Some(input) => Ok(ctx
-                    .invoke_virtual(
-                        input,
-                        "read",
-                        "([BII)I",
-                        &[
-                            args.get(1).copied().unwrap_or(Value::Object(None)),
-                            args.get(2).copied().unwrap_or(Value::Int(0)),
-                            args.get(3).copied().unwrap_or(Value::Int(0)),
-                        ],
-                    )?
-                    .or(Some(Value::Int(-1)))),
-                None => Ok(Some(Value::Int(-1))),
-            }
-        },
-    );
-    registry.register(
-        "java/io/BufferedInputStream",
-        "skip",
-        "(J)J",
-        |ctx, args| {
-            let this = match args.first() {
-                Some(Value::Object(Some(o))) => *o,
-                _ => return Ok(Some(Value::Long(0))),
-            };
-            let n = args.get(1).and_then(Value::as_long).unwrap_or(0).max(0);
-            if n == 0 {
-                return Ok(Some(Value::Long(0)));
-            }
-            let input = match ctx.get_field_by_name(this, "in") {
-                Value::Object(Some(o)) => Some(o),
-                _ => match ctx.get_field(this, 0) {
-                    Value::Object(Some(o)) => Some(o),
-                    _ => None,
-                },
-            };
-            match input {
-                Some(input) => Ok(ctx
-                    .invoke_virtual(input, "skip", "(J)J", &[Value::Long(n)])?
-                    .or(Some(Value::Long(0)))),
-                None => Ok(Some(Value::Long(0))),
-            }
-        },
-    );
-    registry.register(
-        "java/io/BufferedInputStream",
-        "mark",
-        "(I)V",
-        |ctx, args| {
-            let this = match args.first() {
-                Some(Value::Object(Some(o))) => *o,
-                _ => return Ok(None),
-            };
-            let readlimit = args.get(1).and_then(Value::as_int).unwrap_or(0).max(0);
-            let pos = ctx
-                .get_field_by_name(this, "pos")
-                .as_int()
-                .unwrap_or(0)
-                .max(0);
-            ctx.set_field_by_name(this, "marklimit", Value::Int(readlimit));
-            ctx.set_field_by_name(this, "markpos", Value::Int(pos));
-            Ok(None)
-        },
-    );
-    registry.register(
-        "java/io/BufferedInputStream",
-        "reset",
-        "()V",
-        |ctx, args| {
-            let this = match args.first() {
-                Some(Value::Object(Some(o))) => *o,
-                _ => return Ok(None),
-            };
-            let markpos = ctx
-                .get_field_by_name(this, "markpos")
-                .as_int()
-                .unwrap_or(-1);
-            if markpos >= 0 {
-                ctx.set_field_by_name(this, "pos", Value::Int(markpos));
-            }
-            Ok(None)
-        },
-    );
-    registry.register(
-        "java/io/BufferedInputStream",
-        "markSupported",
-        "()Z",
-        |_ctx, _args| Ok(Some(Value::Int(1))),
-    );
-
-    registry.register(
-        "java/io/BufferedInputStream",
-        "available",
-        "()I",
-        |ctx, args| {
-            let this = match args.first() {
-                Some(Value::Object(Some(o))) => *o,
-                _ => return Ok(Some(Value::Int(0))),
-            };
-            let input = match ctx.get_field_by_name(this, "in") {
-                Value::Object(Some(o)) => Some(o),
-                _ => match ctx.get_field(this, 0) {
-                    Value::Object(Some(o)) => Some(o),
-                    _ => None,
-                },
-            };
-            match input {
-                Some(input) => Ok(ctx
-                    .invoke_virtual(input, "available", "()I", &[])?
-                    .or(Some(Value::Int(0)))),
-                None => Ok(Some(Value::Int(0))),
-            }
-        },
-    );
-    registry.register(
-        "java/io/BufferedInputStream",
-        "close",
-        "()V",
-        |ctx, args| {
-            let this = match args.first() {
-                Some(Value::Object(Some(o))) => *o,
-                _ => return Ok(None),
-            };
-            let input = match ctx.get_field_by_name(this, "in") {
-                Value::Object(Some(o)) => Some(o),
-                _ => match ctx.get_field(this, 0) {
-                    Value::Object(Some(o)) => Some(o),
-                    _ => None,
-                },
-            };
-            if let Some(input) = input {
-                let _ = ctx.invoke_virtual(input, "close", "()V", &[])?;
-            }
-            Ok(None)
-        },
-    );
+    // java/io/BufferedInputStream: removed the synthetic <init>/read/mark/reset/
+    // available/close overrides added in 45cc4f4f. That implementation allocated
+    // buf/count/pos/markpos fields correctly on construction, but read()/read([BII)I
+    // delegated straight to the underlying stream (ctx.invoke_virtual(input, "read", ...))
+    // without ever touching buf/pos/count, so mark()/reset() only updated a `pos` field
+    // that nothing else consulted -- reset() was a silent no-op against the real
+    // (already-advanced) underlying stream. This broke every mark(N); read...; reset();
+    // consumer, notably org.apache.jasper.compiler.EncodingDetector's BOM-sniff-then-
+    // rewind-then-reread-with-detected-encoding sequence: after reset() failed to
+    // rewind, getPrologEncoding() read starting mid-XML-declaration instead of at byte
+    // 0, so xml_decl_encoding() never found "<?xml" and every prolog-declared encoding
+    // silently fell back to the BOM-inferred one.
+    //
+    // Real JDK 25 BufferedInputStream (see FIS-FIX / "Wave2 H2 fix" in
+    // native-io/src/lib.rs, 2026-05-04) already implements buf/pos/count/markpos/mark/
+    // reset correctly via Unsafe.compareAndSetReference on `buf`, and relies only on the
+    // real FileInputStream open0/read0/readBytes natives underneath (which now backfill
+    // fd/path/closeLock correctly per the same 45cc4f4f fix). Let real bytecode run.
     registry.register(
         "java/io/FilterOutputStream",
         "<init>",
