@@ -1958,13 +1958,22 @@ pub(crate) fn alloc_object_shared(
             },
         )));
     }
+    if let Some(obj) = shared.heap.try_alloc_object(class_id, num_fields) {
+        shared
+            .bytes_allocated_total
+            // Widening: smaller integer -> 64-bit (zero/sign-extended, value preserved)
+            .fetch_add(total_size as u64, std::sync::atomic::Ordering::Relaxed);
+        return Ok(obj);
+    }
+    // G1 last-ditch: see `gc_alloc_array` — dead Old/humongous spans need a
+    // completed mark cycle's cleanup; run one synchronously and retry once.
+    g1_force_full_cycle(shared, thread);
     shared
         .heap
         .try_alloc_object(class_id, num_fields)
         .map(|obj| {
             shared
                 .bytes_allocated_total
-                // Widening: smaller integer -> 64-bit (zero/sign-extended, value preserved)
                 .fetch_add(total_size as u64, std::sync::atomic::Ordering::Relaxed);
             obj
         })
@@ -2037,6 +2046,13 @@ fn gc_alloc_array(
             },
         )));
     }
+    if let Some(arr) = shared.heap.try_alloc_array(class_id, element_type, length) {
+        return Ok(arr);
+    }
+    // G1 last-ditch: the young pause above cannot reclaim dead Old/humongous
+    // spans — only a completed mark cycle's cleanup can. Run one
+    // synchronously and retry once before surfacing OOM.
+    g1_force_full_cycle(shared, thread);
     shared
         .heap
         .try_alloc_array(class_id, element_type, length)
@@ -2291,7 +2307,29 @@ pub(crate) fn update_root_snapshot(shared: &SharedVm, thread: &mut JvmThread) {
     // roots and with the concurrent old-gen collector disabled). See
     // docs/real-raf-segv-root-cause.md.
     if !moving_young_precise_only {
+        let jit_scan_start = snapshot.len();
         crate::jit::conservative_roots::scan_active_jit_frames(&shared.heap, &mut snapshot);
+        // G1 pin-in-place, cross-thread half: the snapshot keeps these
+        // conservatively-discovered objects ALIVE, but under G1 (a moving
+        // collector) their regions must also be EXCLUDED from the collection
+        // set — the JIT register/spill slots holding them cannot be
+        // rewritten when the object moves. The initiator only publishes its
+        // OWN JIT roots (roots.rs); every parked/blocked mutator must
+        // publish here, into the process-global per-thread pin registry
+        // consumed by `G1Collector::jit_pinned_region_set`. Replace
+        // semantics: a deposit with no live JIT frames clears this thread's
+        // stale pins.
+        if shared.heap.is_g1() {
+            let addrs: Vec<usize> = snapshot[jit_scan_start..]
+                .iter()
+                .map(|r| r.as_ptr() as usize)
+                .collect();
+            cratonvm_gc::gc_quiescence::publish_pinned_jit_roots(&addrs);
+        }
+    } else if shared.heap.is_g1() {
+        // Precise-relocation mode covers every JIT oop with rewritable
+        // shadow-stack slots — no conservative pins needed; drop stale ones.
+        cratonvm_gc::gc_quiescence::publish_pinned_jit_roots(&[]);
     }
 
     // §4 (multi-thread shadow scan, marking half). Also publish THIS thread's
@@ -3041,6 +3079,54 @@ fn g1_final_remark_cleanup(shared: &SharedVm, thread: &mut JvmThread) {
     );
     if !done {
         tracing::debug!("[G1] Final remark lost the STW race — retrying at next GC");
+    }
+}
+
+/// Last-ditch G1 full marking cycle before declaring OutOfMemoryError.
+///
+/// Young/mixed pauses reclaim only collection-set regions; dead Old regions
+/// and dead humongous spans are reclaimed exclusively by a completed mark
+/// cycle's cleanup phase (`reclaim_dead_humongous_spans_locked`). When an
+/// allocation still fails after the forced young GC, the heap may simply be
+/// full of *unmarked dead* Old/humongous data — run one complete cycle
+/// synchronously (start → drain → final remark → cleanup) and let the caller
+/// retry the allocation once more before throwing OOM. Mirrors HotSpot's
+/// last-ditch full GC on allocation failure.
+///
+/// No-op on non-G1 backends. Bounded: gives up after ~2s if the background
+/// marker never quiesces or the STW races never resolve — the caller then
+/// proceeds to OOM; this can delay an inevitable OOM slightly but never
+/// hangs the allocation path.
+pub(crate) fn g1_force_full_cycle(shared: &SharedVm, thread: &mut JvmThread) {
+    if !shared.heap.is_g1() {
+        return;
+    }
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+    // If a cycle is already mid-flight we simply help finish it — its
+    // cleanup reclaims the same dead spans a fresh cycle would.
+    let mut saw_active = shared.heap.g1_is_marking_active();
+    loop {
+        if shared.heap.g1_is_marking_active() {
+            saw_active = true;
+            if shared.heap.g1_concurrent_mark_finished() {
+                // Runs remark+cleanup under a brief STW; on a lost STW race
+                // the cycle stays open and the loop retries.
+                g1_final_remark_cleanup(shared, thread);
+            } else {
+                std::thread::yield_now();
+            }
+        } else if saw_active {
+            return; // cycle completed — cleanup has run
+        } else {
+            // Not started yet (or the initial-mark STW lost its race —
+            // g1_concurrent_mark_cycle returns without activating in that
+            // case). Start/retry it.
+            g1_concurrent_mark_cycle(shared, thread);
+        }
+        if std::time::Instant::now() >= deadline {
+            tracing::debug!("[G1] last-ditch full cycle timed out — proceeding to OOM");
+            return;
+        }
     }
 }
 
@@ -12747,6 +12833,44 @@ fn execute_instruction(
             // block still re-checks its own cached gate, so behaviour is
             // byte-for-byte identical to the original sequence. See
             // `env_cache::any_field_diag`.
+            // ES-FAIL-FAMILY-20260710 hunt: java-level-stack companion to
+            // `cratonvm_gc::heap::dynamic_watch_addr()` (armed by
+            // `NativeContext::dbg_set_watch_cell`, see
+            // `native_builtins::lang_misc::write_throwable_cause`). The
+            // watch's own `[CELLWATCH]` report captures a Rust backtrace,
+            // which is unreliable here (JIT frames lack Windows unwind
+            // info and the walk comes back garbled) — this prints the
+            // actual JAVA call stack instead, which is always available.
+            {
+                let watch = cratonvm_gc::heap::dynamic_watch_addr();
+                if watch != 0 {
+                    let addr = obj_ref.as_ptr() as usize
+                        + cratonvm_types::HEADER_SIZE
+                        + field.field_index * cratonvm_types::SLOT_SIZE;
+                    if addr == watch {
+                        eprintln!(
+                            "[WATCHFIELD] putfield HIT watch={watch:#x} obj=0x{:x} field_index={} value={:?} in {}.{}{} pc={}",
+                            obj_ref.as_ptr() as usize,
+                            field.field_index,
+                            value,
+                            thread.frames[frame_idx].class_name(),
+                            thread.frames[frame_idx].method_name(),
+                            thread.frames[frame_idx].method_descriptor(),
+                            thread.frames[frame_idx].pc,
+                        );
+                        eprintln!("[WATCHFIELD] Java stack (top first):");
+                        for f in thread.frames.iter().rev().take(30) {
+                            eprintln!(
+                                "[WATCHFIELD]   {}.{}{} pc={}",
+                                f.class_name(),
+                                f.method_name(),
+                                f.method_descriptor(),
+                                f.pc,
+                            );
+                        }
+                    }
+                }
+            }
             if crate::runtime::env_cache::any_field_diag() {
                 // Gated diagnostic (CRATONVM_DBG_FIELDADDR): trace put for specific
                 // fields — object address + resolved slot — to localize a write
@@ -17646,6 +17770,7 @@ fn execute_invoke_kind(
                         current_class_id,
                         cp_index,
                         rcv_cid,
+                        &args[0],
                     );
                 }
             }
@@ -17662,6 +17787,7 @@ fn execute_invoke_kind(
                         current_class_id,
                         cp_index,
                         rcv_cid,
+                        &args[0],
                     );
                 }
             }
@@ -17719,7 +17845,14 @@ fn execute_invoke_kind(
         populate_invoke_cache(thread, shared, current_class_id, cp_index, is_special);
     } else if private_virtual_target.is_none() {
         if let Some(rcv_cid) = receiver_class_id {
-            populate_virtual_invoke_cache(thread, shared, current_class_id, cp_index, rcv_cid);
+            populate_virtual_invoke_cache(
+                thread,
+                shared,
+                current_class_id,
+                cp_index,
+                rcv_cid,
+                &args[0],
+            );
         }
     }
 
@@ -22867,7 +23000,24 @@ fn synthetic_stub_should_yield_to_real_bytecode(
                 | "java/util/concurrent/LinkedBlockingDeque"
                 | "java/util/concurrent/atomic/AtomicBoolean"
                 | "java/util/EnumSet"
-                | "java/util/StringJoiner"
+                // NOT "java/util/StringJoiner" (2026-07-10): yielding this
+                // class's SyntheticStub natives to real bytecode here exposes
+                // a deterministic heap-reference-integrity defect (the
+                // `gen_heap::read_slot` "corrupt Value cell"/HIB-CV-32 guard
+                // fires reading StringJoiner's own `size`/`elts` fields back
+                // after a `putfield`, on the SECOND `add()` call onward) that
+                // does not reproduce for an equivalent user-defined class with
+                // the identical bytecode shape and field count/layout (ruled
+                // out via a standalone MicroProbe repro) — something specific
+                // to this being a natively-registered bootstrap class, not the
+                // bytecode pattern itself. See docs/known-issues/
+                // stringjoiner-synthetic-native-real-jdk-field-mismatch.md. Path 2
+                // (`invoke_or_native` in vm/src/vm/vm_exec.rs) still protects
+                // StringJoiner via its own, separate, long-standing allowlist
+                // — this only reverts the NEW path-1 (interpreter
+                // try_stackless_invoke) preference added here, back to the
+                // proven-safe pre-existing behavior (always dispatch to the
+                // SyntheticStub native uniformly for this class at this path).
                 | "java/io/FileInputStream"
                 | "java/lang/ref/Cleaner"
                 | "java/lang/ref/Cleaner$Cleanable"
@@ -23114,6 +23264,29 @@ fn try_stackless_invoke(
     } else {
         native_cb
     };
+    // ThreadPoolExecutor.execute(Runnable): the registered native
+    // (`native_es_execute`) is exempted from the real-JDK-mode registration
+    // drop (native-api/src/registry.rs) specifically so it stays available
+    // for CratonVM's synthetic-layout Executors.* stand-ins (docs/known-issues/
+    // threadpoolexecutor-execute-npe-on-ctl-regression.md). But this "native
+    // override" step is unconditional -- it has no receiver awareness -- so
+    // it was ALSO winning for a genuinely real, bytecode-constructed
+    // ThreadPoolExecutor (its own real `workers` field populated), routing
+    // every `execute()` call through `native_es_execute`'s defense-in-depth
+    // "run inline" fallback instead of real async bytecode.
+    // `intercept_force_registered_native` above already carries this exact
+    // receiver check for the FORCE-native case; mirror it here so a real
+    // receiver's native shadow is dropped too. See docs/known-issues/
+    // threadpoolexecutor-execute-dispatch-degrades-to-synchronous.md.
+    let native_cb = if class_name == "java/util/concurrent/ThreadPoolExecutor"
+        && method_name == "execute"
+        && descriptor == "(Ljava/lang/Runnable;)V"
+        && matches!(args.first(), Some(recv) if threadpool_executor_has_real_workers(shared, recv))
+    {
+        None
+    } else {
+        native_cb
+    };
     if crate::runtime::env_cache::bd_debug()
         && (method_name == "intValue"
             || (class_name.contains("BigDecimal")
@@ -23295,7 +23468,22 @@ fn try_stackless_invoke(
             .native_methods
             .find(&class_name_arc, method_name, descriptor)
         {
-            if !synthetic_stub_should_yield_to_real_bytecode(
+            // Same ThreadPoolExecutor.execute(Runnable) receiver-aware
+            // exemption as step 1 above -- this is a SEPARATE, independent
+            // "double-check for a native override" that runs even after
+            // real bytecode was already resolved at step 4/5. Without this,
+            // a genuinely real ThreadPoolExecutor still gets shunted to
+            // `native_es_execute`'s inline "run synchronously" fallback right
+            // here, even though the real `execute()` bytecode was correctly
+            // found and would otherwise run. See docs/known-issues/
+            // threadpoolexecutor-execute-dispatch-degrades-to-synchronous.md.
+            let is_real_tpe_execute_step6 = class_name_arc.as_ref()
+                == "java/util/concurrent/ThreadPoolExecutor"
+                && method_name == "execute"
+                && descriptor == "(Ljava/lang/Runnable;)V"
+                && matches!(args.first(), Some(recv) if threadpool_executor_has_real_workers(shared, recv));
+            if !is_real_tpe_execute_step6
+                && !synthetic_stub_should_yield_to_real_bytecode(
                 shared,
                 &class_name_arc,
                 method_name,
@@ -24837,12 +25025,30 @@ fn compile_osr_artifact(
             if scan.has_athrow {
                 return None;
             }
-            // BC GOST3412_2015Engine.init_gf256_mul_table showed that OSR
-            // entering a nested primitive-array allocation loop can resume with
-            // corrupt stack state for the next `newarray` length. Keep normal
-            // method-entry JIT enabled, but decline OSR until the x64 OSR stack
-            // mapper models primitive allocation loops safely.
-            if scan.has_newarray {
+            // 2026-07-10 BC-crypto session: OSR of `GOST3412_2015Engine.
+            // init_gf256_mul_table` (a nested primitive-array allocation loop)
+            // was observed to "resume with corrupt stack state for the next
+            // newarray length", and a blanket per-method OSR deny for any
+            // `newarray`-containing method was added as a workaround.
+            //
+            // perf/throughput-20260710: the deny is now DEFAULT-OFF. It was a
+            // huge hammer — any hot loop in any method that allocates a
+            // primitive array anywhere ran interpreted forever (BenchSuite
+            // sieve250k: 3.2s → 177s, ~55x; every BC math/EC kernel under
+            // JIT-allow lost OSR) — and the corruption does not reproduce on
+            // the current tree (GOST3412Test 10/10 at -Xmx256m across both
+            // getfield modes; an exact-shape nested-allocation repro is
+            // checksum-identical to HotSpot under heap pressure; EC AllTests
+            // passes under full JIT-allow). See `osr_newarray_allowed` for the
+            // full evidence trail; `CRATONVM_OSR_NEWARRAY=0` restores the deny
+            // for bisection.
+            if scan.has_newarray && !crate::runtime::env_cache::osr_newarray_allowed() {
+                if crate::runtime::env_cache::dbg_jitc() {
+                    eprintln!(
+                        "[cratonvm-jitc] osr-DENY (has_newarray, CRATONVM_OSR_NEWARRAY=0) {}.{}{}",
+                        class_name, method_name, method_descriptor
+                    );
+                }
                 crate::jit::tiered::mark_osr_denied(osr_key.clone());
                 return None;
             }
@@ -30827,6 +31033,7 @@ fn populate_virtual_invoke_cache(
     caller_class_id: ClassId,
     cp_index: u16,
     receiver_class_id: ClassId,
+    receiver_value: &Value,
 ) {
     // T10.4 fast path — the VM-wide `SharedResolutionState` may already
     // hold a fully-built `CachedInvokeTarget` that a sibling thread promoted
@@ -31033,7 +31240,25 @@ fn populate_virtual_invoke_cache(
         let native_signature_may_exist = shared
             .native_methods
             .might_have_method_descriptor(&method_name, &descriptor);
-        let direct_native_callback = if native_signature_may_exist {
+        // ThreadPoolExecutor.execute(Runnable): same receiver-aware
+        // exemption as `try_stackless_invoke`'s step-1 native lookup above --
+        // a genuinely real ThreadPoolExecutor (its own `workers` field
+        // populated by a real `<init>`) must not have its native shadow
+        // cached here. This cache is keyed by (call site, receiver
+        // class_id) alone, so caching `VirtualNative` here would
+        // permanently route EVERY future call at this call site -- any
+        // instance of this class_id -- through `native_es_execute`'s
+        // inline "run synchronously" fallback instead of real async
+        // bytecode. Falling through instead lets the bytecode-resolution
+        // path below cache `VirtualBytecode`, whose dispatch-time
+        // `intercept_force_registered_native` check re-validates the
+        // ACTUAL receiver on every hit (not just at population time). See
+        // docs/known-issues/threadpoolexecutor-execute-dispatch-degrades-to-synchronous.md.
+        let is_real_tpe_execute = lookup_name == "java/util/concurrent/ThreadPoolExecutor"
+            && method_name.as_ref() == "execute"
+            && descriptor.as_ref() == "(Ljava/lang/Runnable;)V"
+            && threadpool_executor_has_real_workers(shared, receiver_value);
+        let direct_native_callback = if native_signature_may_exist && !is_real_tpe_execute {
             shared
                 .native_methods
                 .find(&lookup_name, &method_name, &descriptor)
@@ -31253,7 +31478,23 @@ fn populate_virtual_invoke_cache(
     // through this call-site.
     {
         let declaring_name = store.get(declaring_id).map(|c| &*c.name).unwrap_or("");
-        let force = force_native_over_real_jdk_bytecode(declaring_name, &method_name, &descriptor)
+        // ThreadPoolExecutor.execute(Runnable): `force_native_over_real_jdk_bytecode`
+        // is a pure (class, method, descriptor) allowlist with no receiver
+        // awareness -- it unconditionally returns true for this triple (see
+        // its own entry, added alongside the receiver-aware checks at
+        // `intercept_force_registered_native`/`invoke_or_native`/
+        // `invoke_on_class_shared_inner`). Consulting it directly here,
+        // bypassing those receiver checks entirely, is what actually poisons
+        // this call site's inline cache with `VirtualNative` for a
+        // genuinely real ThreadPoolExecutor. Exempt it the same way as the
+        // other call sites. See docs/known-issues/
+        // threadpoolexecutor-execute-dispatch-degrades-to-synchronous.md.
+        let is_real_tpe_execute_force = declaring_name == "java/util/concurrent/ThreadPoolExecutor"
+            && method_name.as_ref() == "execute"
+            && descriptor.as_ref() == "(Ljava/lang/Runnable;)V"
+            && threadpool_executor_has_real_workers(shared, receiver_value);
+        let force = !is_real_tpe_execute_force
+            && (force_native_over_real_jdk_bytecode(declaring_name, &method_name, &descriptor)
             || (matches!(
                 declaring_name,
                 "java/util/HashMap"
@@ -31278,7 +31519,7 @@ fn populate_virtual_invoke_cache(
             // store data in a side-store, so the JDK bytecode sees an empty
             // table. See companion entry in `force_native_over_real_jdk_bytecode`.
             | "keys" | "elements"
-            ));
+            )));
         if force {
             if let Some(callback) =
                 shared

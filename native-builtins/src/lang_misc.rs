@@ -244,7 +244,60 @@ pub(crate) fn write_throwable_detail_message(
 /// the mirror clobbered the message field whenever both helpers ran
 /// (e.g. via `<init>(String, Throwable)`).
 pub(crate) fn write_throwable_cause(ctx: &mut dyn NativeContext, this: ObjectRef, cause: Value) {
+    if std::env::var_os("CRATONVM_DBG_CAUSE").is_some() {
+        let this_cls = ctx
+            .class_name_of_id(ctx.class_id_of_object(this))
+            .unwrap_or_default();
+        let cause_desc = match cause {
+            Value::Object(Some(c)) if c == this => "SELF".to_string(),
+            Value::Object(Some(c)) => {
+                let cn = ctx
+                    .class_name_of_id(ctx.class_id_of_object(c))
+                    .unwrap_or_default();
+                format!("{cn} hash={}", ctx.identity_hash_code(c))
+            }
+            Value::Object(None) => "NULL".to_string(),
+            other => format!("{other:?}"),
+        };
+        eprintln!(
+            "CAUSE_DBG_WRITE this={this_cls} hash={} ptr={:?} cause={cause_desc}",
+            ctx.identity_hash_code(this),
+            this.as_ptr()
+        );
+    }
     write_throwable_field_cached(ctx, &THROWABLE_CAUSE_INDEX, "cause", this, cause);
+
+    // ES-FAIL-FAMILY-20260710 hunt: arm a dynamic write-watchpoint (see
+    // `NativeContext::dbg_set_watch_cell`) on the cause slot right after
+    // writing the self-referential "uninitialized" sentinel into it, for
+    // the next constructed instance of a specific class (set via
+    // `CRATONVM_DBG_WATCH_CAUSE_SELF=<slash-separated class name>`) — to
+    // catch, with a full Rust backtrace, whatever later overwrites that
+    // exact memory slot with something else. Re-arms on every matching
+    // construction (last one wins), since we don't know in advance which
+    // instance will end up being the one that's actually printed/observed.
+    if let Value::Object(Some(c)) = cause {
+        if c == this {
+            if let Ok(watch_cls) = std::env::var("CRATONVM_DBG_WATCH_CAUSE_SELF") {
+                let this_cls = ctx
+                    .class_name_of_id(ctx.class_id_of_object(this))
+                    .unwrap_or_default();
+                if this_cls == watch_cls {
+                    let idx = THROWABLE_CAUSE_INDEX.load(Ordering::Relaxed);
+                    if idx != UNRESOLVED_FIELD_INDEX {
+                        let addr = this.as_ptr() as usize
+                            + cratonvm_types::HEADER_SIZE
+                            + idx * cratonvm_types::SLOT_SIZE;
+                        eprintln!(
+                            "CAUSE_DBG_ARM watch={addr:#x} for {this_cls} hash={}",
+                            ctx.identity_hash_code(this)
+                        );
+                        ctx.dbg_set_watch_cell(addr);
+                    }
+                }
+            }
+        }
+    }
 }
 
 /// Capture the current call stack for a freshly-constructed throwable.
@@ -983,6 +1036,21 @@ fn throwable_cause(ctx: &mut dyn NativeContext, t: ObjectRef) -> Option<ObjectRe
         if c == t {
             return None;
         }
+        if std::env::var_os("CRATONVM_DBG_CAUSE").is_some() {
+            let t_cls = ctx
+                .class_name_of_id(ctx.class_id_of_object(t))
+                .unwrap_or_default();
+            let c_cls = ctx
+                .class_name_of_id(ctx.class_id_of_object(c))
+                .unwrap_or_default();
+            eprintln!(
+                "CAUSE_DBG_READ this={t_cls} hash={} ptr={:?} cause={c_cls} cause_hash={} cause_ptr={:?}",
+                ctx.identity_hash_code(t),
+                t.as_ptr(),
+                ctx.identity_hash_code(c),
+                c.as_ptr()
+            );
+        }
         return Some(c);
     }
     None
@@ -1171,7 +1239,21 @@ fn print_throwable_chain_to_stream_obj(
     ctx.unpin_native_roots(pin);
 }
 
-/// addSuppressed(Throwable) — append to suppressed list stored in field 2
+/// addSuppressed(Throwable) — append to the `suppressedExceptions` list.
+///
+/// ES-FAIL-FAMILY-20260710: this used to hardcode field **index 2** for
+/// "suppressed storage". Index 2 is `cause` in the real-JDK Throwable
+/// layout used consistently everywhere else in this file (`backtrace`=0,
+/// `detailMessage`=1, `cause`=2, `stackTrace`=3, `suppressedExceptions`=4 —
+/// see `write_throwable_cause`'s own doc comment). Every real `addSuppressed`
+/// call therefore silently clobbered the receiver's `cause` field with a
+/// freshly-allocated 1-element `Object[]` array instead of touching
+/// `suppressedExceptions` — surfacing later as a corrupted `Caused by:` line
+/// in `printStackTrace` (root-caused via a hardware watchpoint catching the
+/// exact `set_field(this, 2, …)` write; see the known-issues doc). Fixed by
+/// resolving `suppressedExceptions` **by name** instead of a hardcoded
+/// index, matching the pattern `init_suppressed_sentinel` already used
+/// correctly for the same field.
 pub(crate) fn native_throwable_add_suppressed(
     ctx: &mut dyn NativeContext,
     args: &[Value],
@@ -1189,15 +1271,10 @@ pub(crate) fn native_throwable_add_suppressed(
     if this == suppressed {
         return Ok(None);
     }
-    // Check if the object has enough fields for suppressed storage (field 2)
-    let num_fields = ctx.object_num_fields(this);
-    if num_fields < 3 {
-        return Ok(None); // object too small, silently ignore
-    }
-    // Get existing suppressed array from field 2
-    let existing = ctx.get_field(this, 2);
+    // Get existing suppressed array (or the SUPPRESSED_SENTINEL / null).
+    let existing = ctx.get_field_by_name(this, "suppressedExceptions");
     match existing {
-        Value::Object(Some(arr)) => {
+        Value::Object(Some(arr)) if ctx.heap_kind_of(arr) == cratonvm_types::ObjectKind::Array => {
             // Grow the array: copy old elements + append new one
             let old_len = ctx.array_length(arr);
             let new_arr = ctx.new_ref_array(ClassId::new(0), old_len + 1);
@@ -1206,19 +1283,23 @@ pub(crate) fn native_throwable_add_suppressed(
                 ctx.set_array_element(new_arr, i, elem);
             }
             ctx.set_array_element(new_arr, old_len, Value::Object(Some(suppressed)));
-            ctx.set_field(this, 2, Value::Object(Some(new_arr)));
+            ctx.set_field_by_name(this, "suppressedExceptions", Value::Object(Some(new_arr)));
         }
         _ => {
-            // No existing array — create one with single element
+            // No existing array (null, or still the SUPPRESSED_SENTINEL list)
+            // — create one with a single element.
             let new_arr = ctx.new_ref_array(ClassId::new(0), 1);
             ctx.set_array_element(new_arr, 0, Value::Object(Some(suppressed)));
-            ctx.set_field(this, 2, Value::Object(Some(new_arr)));
+            ctx.set_field_by_name(this, "suppressedExceptions", Value::Object(Some(new_arr)));
         }
     }
     Ok(None)
 }
 
-/// getSuppressed() — return Throwable[] from field 2, or empty array if not set
+/// getSuppressed() — return Throwable[] from `suppressedExceptions`, or an
+/// empty array if none were added. See `native_throwable_add_suppressed`'s
+/// doc comment for why this reads by field NAME rather than a hardcoded
+/// index.
 pub(crate) fn native_throwable_get_suppressed(
     ctx: &mut dyn NativeContext,
     args: &[Value],
@@ -1231,13 +1312,13 @@ pub(crate) fn native_throwable_get_suppressed(
             return Ok(Some(Value::Object(Some(arr))));
         }
     };
-    let num_fields = ctx.object_num_fields(this);
-    if num_fields >= 3 {
-        if let Value::Object(Some(arr)) = ctx.get_field(this, 2) {
+    if let Value::Object(Some(arr)) = ctx.get_field_by_name(this, "suppressedExceptions") {
+        if ctx.heap_kind_of(arr) == cratonvm_types::ObjectKind::Array {
             return Ok(Some(Value::Object(Some(arr))));
         }
     }
-    // No suppressed exceptions stored — return empty array
+    // No suppressed exceptions stored (null, or still SUPPRESSED_SENTINEL) —
+    // return an empty array.
     let arr = ctx.new_ref_array(ClassId::new(0), 0);
     Ok(Some(Value::Object(Some(arr))))
 }

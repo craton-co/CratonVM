@@ -66,6 +66,7 @@ pub fn register_jmx_natives(r: &mut NativeMethodRegistry) {
     register_operating_system_mxbean(r);
     register_compilation_mxbean(r);
     register_gc_mxbean(r);
+    register_platform_logging_mxbean(r);
     // NOTE: `register_mbean_server` is called above as a `SyntheticStub`
     // fallback for runs where `ManagementFactory.getPlatformMBeanServer()`
     // returns the synthetic interface object. The real-JDK hazard is the
@@ -144,6 +145,12 @@ fn register_object_name(r: &mut NativeMethodRegistry) {
         "getDomain",
         "()Ljava/lang/String;",
         native_object_name_domain,
+    );
+    r.register(
+        cls,
+        "getKeyProperty",
+        "(Ljava/lang/String;)Ljava/lang/String;",
+        native_object_name_get_key_property,
     );
     r.register(
         cls,
@@ -350,6 +357,66 @@ fn native_object_name_domain(ctx: &mut dyn NativeContext, args: &[Value]) -> Met
     Ok(Some(Value::Object(Some(s))))
 }
 
+fn native_object_name_get_key_property(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(o))) => *o,
+        _ => return Ok(Some(Value::Object(None))),
+    };
+    let key = object_name_string_arg(ctx, args, 1);
+    let text = object_name_text(ctx, this);
+    let props = text.split_once(':').map(|(_, p)| p).unwrap_or("");
+    for pair in props.split(',') {
+        if let Some((k, v)) = pair.split_once('=') {
+            if k == key {
+                let unquoted = v
+                    .strip_prefix('"')
+                    .and_then(|s| s.strip_suffix('"'))
+                    .unwrap_or(v);
+                let s = ctx.create_string(unquoted);
+                return Ok(Some(Value::Object(Some(s))));
+            }
+        }
+    }
+    // Real JDK semantics: no such key property -> null (not an exception).
+    Ok(Some(Value::Object(None)))
+}
+
+/// Simple JMX-style glob match:  = any run of characters,  = any
+/// single character, everything else literal. No escaping (matches the
+/// simplicity level of the rest of this synthetic ObjectName model).
+fn object_name_glob_match(pattern: &str, text: &str) -> bool {
+    fn go(p: &[u8], t: &[u8]) -> bool {
+        match p.first() {
+            None => t.is_empty(),
+            Some(b'*') => go(&p[1..], t) || (!t.is_empty() && go(p, &t[1..])),
+            Some(b'?') => !t.is_empty() && go(&p[1..], &t[1..]),
+            Some(pc) => t.first() == Some(pc) && go(&p[1..], &t[1..]),
+        }
+    }
+    go(pattern.as_bytes(), text.as_bytes())
+}
+
+/// Split a canonical ObjectName string into (domain, key=value pairs,
+/// is_property_pattern). is_property_pattern is true for a trailing ",*"
+/// or a bare "*" property list (JMX's "any additional properties allowed"
+/// wildcard) -- as opposed to an exact/full property list, which must match
+/// the candidate's property count exactly, not just be a subset.
+fn object_name_parts(text: &str) -> (String, Vec<(String, String)>, bool) {
+    let (domain, props_str) = text.split_once(':').unwrap_or((text, ""));
+    let is_pattern = props_str == "*" || props_str.ends_with(",*");
+    let props_str = props_str.strip_suffix(",*").unwrap_or(props_str);
+    let props_str = if props_str == "*" { "" } else { props_str };
+    let mut props = Vec::new();
+    if !props_str.is_empty() {
+        for pair in props_str.split(',') {
+            if let Some((k, v)) = pair.split_once('=') {
+                props.push((k.to_string(), v.to_string()));
+            }
+        }
+    }
+    (domain.to_string(), props, is_pattern)
+}
+
 fn native_object_name_apply(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = match args.first() {
         Some(Value::Object(Some(o))) => *o,
@@ -361,15 +428,39 @@ fn native_object_name_apply(ctx: &mut dyn NativeContext, args: &[Value]) -> Meth
     };
     let pattern = object_name_text(ctx, this);
     let candidate = object_name_text(ctx, target);
-    let matches = pattern == candidate
-        || pattern == "*"
-        || pattern == "*:*"
-        || pattern
-            .strip_suffix(":*")
-            .is_some_and(|prefix| candidate.starts_with(prefix))
-        || pattern.contains('*')
-        || pattern.contains('?');
-    Ok(Some(Value::Int(if matches { 1 } else { 0 })))
+
+    let (p_domain, p_props, p_is_pattern) = object_name_parts(&pattern);
+    let (c_domain, c_props, _) = object_name_parts(&candidate);
+
+    // Domain: empty pattern domain ("" from a leading ":") means "any
+    // domain"; otherwise exact match or, if the pattern domain itself
+    // carries a wildcard, a glob match.
+    let domain_ok = p_domain.is_empty()
+        || p_domain == c_domain
+        || ((p_domain.contains('*') || p_domain.contains('?'))
+            && object_name_glob_match(&p_domain, &c_domain));
+
+    // Properties: a pure property pattern ("domain:*", no explicit
+    // key=value pairs) matches any property set once the domain matches.
+    // Otherwise every pattern key must be present in the candidate with a
+    // matching value (glob-matched if the pattern's value carries a
+    // wildcard); a non-pattern (exact) property list additionally requires
+    // the candidate to have exactly that many properties, not a superset.
+    let props_ok = if p_props.is_empty() && p_is_pattern {
+        true
+    } else {
+        let all_match = p_props.iter().all(|(pk, pv)| {
+            c_props.iter().any(|(ck, cv)| {
+                ck == pk
+                    && (cv == pv
+                        || ((pv.contains('*') || pv.contains('?'))
+                            && object_name_glob_match(pv, cv)))
+            })
+        });
+        all_match && (p_is_pattern || c_props.len() == p_props.len())
+    };
+
+    Ok(Some(Value::Int((domain_ok && props_ok) as i32)))
 }
 
 fn native_object_name_equals(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
@@ -802,6 +893,7 @@ pub fn register_vm_management_impl(r: &mut NativeMethodRegistry) {
                 "java/lang/management/OperatingSystemMXBean"
                 | "com/sun/management/OperatingSystemMXBean" => Some(alloc_os_mxbean(ctx)),
                 "java/lang/management/CompilationMXBean" => Some(alloc_compilation_mxbean(ctx)),
+                "java/lang/management/PlatformLoggingMXBean" => Some(alloc_logging_mxbean(ctx)),
                 // Optional HotSpot-only diagnostics. Returning null mirrors a
                 // JVM without that platform bean and lets Elasticsearch keep
                 // its documented fallback defaults for these VM options.
@@ -1350,6 +1442,21 @@ pub fn register_memory_pool_impl(r: &mut NativeMethodRegistry) {
     // an UnsatisfiedLinkError.
     r.register(cls, "resetPeakUsage0", "()V", native_noop_with_this);
 
+    // getMemoryManagers0()[Ljava/lang/management/MemoryManagerMXBean; --
+    // backs the pure-Java getMemoryManagerNames(), which Tomcat's
+    // Diagnostics.getVMInfo() calls unprotected (no try/catch). Return an
+    // empty array so the accessor doesn't trip on a missing native, mirroring
+    // MemoryManagerImpl.getMemoryPools0's same-shape stub above.
+    r.register(
+        cls,
+        "getMemoryManagers0",
+        "()[Ljava/lang/management/MemoryManagerMXBean;",
+        |ctx, _args| {
+            let arr = ctx.new_array(cratonvm_types::ArrayElementType::Reference, 0);
+            Ok(Some(Value::Object(Some(arr))))
+        },
+    );
+
     r.set_category(__prev_cat);
 }
 
@@ -1805,6 +1912,20 @@ fn register_runtime_mxbean(r: &mut NativeMethodRegistry) {
         let this = obj_arg(args, 0)?;
         Ok(Some(ctx.get_field(this, 6)))
     });
+    // getManagementSpecVersion() -- the JMX Management Interface spec
+    // version (distinct from getSpecVersion(), which is the JVM Language
+    // Spec version). Not one of the 10 synthetic fields; a plain constant
+    // is enough since callers (e.g. Tomcat's ManagerServlet vminfo command)
+    // just print it.
+    r.register(
+        cls,
+        "getManagementSpecVersion",
+        "()Ljava/lang/String;",
+        |ctx, _args| {
+            let s = ctx.create_string("1.2");
+            Ok(Some(Value::Object(Some(s))))
+        },
+    );
     r.register(cls, "getStartTime", "()J", |ctx, args| {
         let this = obj_arg(args, 0)?;
         Ok(Some(ctx.get_field(this, 7)))
@@ -1826,6 +1947,13 @@ fn register_runtime_mxbean(r: &mut NativeMethodRegistry) {
             .get_system_property("java.class.path")
             .unwrap_or_default();
         let s = ctx.create_string(&cp);
+        Ok(Some(Value::Object(Some(s))))
+    });
+    r.register(cls, "getLibraryPath", "()Ljava/lang/String;", |ctx, _args| {
+        let lp = ctx
+            .get_system_property("java.library.path")
+            .unwrap_or_default();
+        let s = ctx.create_string(&lp);
         Ok(Some(Value::Object(Some(s))))
     });
     r.register(
@@ -1859,6 +1987,57 @@ fn register_runtime_mxbean(r: &mut NativeMethodRegistry) {
                 "()Ljava/util/Properties;",
                 &[],
             )
+        },
+    );
+    r.set_category(__prev_cat);
+}
+
+// ---------------------------------------------------------------------------
+// PlatformLoggingMXBean -- 0-field synthetic (no per-instance state; the
+// real java.util.logging.LogManager backs all queries directly).
+//
+// Needed by Tomcat's Diagnostics.getVMInfo() (manager vminfo command),
+// via ManagementFactory.getPlatformMXBean(PlatformLoggingMXBean.class).
+// Before this, that lookup fell through getPlatformMXBean's "_ => None"
+// arm, leaving Diagnostics' loggingMXBean field null and turning its
+// final getLoggerNames() call into a NullPointerException instead of the
+// AbstractMethodError family this whole MXBean surface otherwise hits.
+// ---------------------------------------------------------------------------
+
+fn alloc_logging_mxbean(ctx: &mut dyn NativeContext) -> ObjectRef {
+    alloc_concurrent_synthetic(ctx, "java/lang/management/PlatformLoggingMXBean", 0)
+}
+
+fn register_platform_logging_mxbean(r: &mut NativeMethodRegistry) {
+    let __prev_cat = r.current_category();
+    r.set_category(cratonvm_native_api::NativeKind::Bridge);
+    let cls = "java/lang/management/PlatformLoggingMXBean";
+    r.register(cls, "<init>", "()V", native_noop_with_this);
+    r.register(cls, "getLoggerNames", "()Ljava/util/List;", |ctx, _args| {
+        match ctx.new_object_initialized("java/util/ArrayList", "()V", &[]) {
+            Ok(Some(v @ Value::Object(Some(_)))) => Ok(Some(v)),
+            _ => Ok(Some(Value::Object(None))),
+        }
+    });
+    r.register(
+        cls,
+        "getLoggerLevel",
+        "(Ljava/lang/String;)Ljava/lang/String;",
+        |_ctx, _args| Ok(Some(Value::Object(None))),
+    );
+    r.register(
+        cls,
+        "setLoggerLevel",
+        "(Ljava/lang/String;Ljava/lang/String;)V",
+        |_ctx, _args| Ok(None),
+    );
+    r.register(
+        cls,
+        "getParentLoggerName",
+        "(Ljava/lang/String;)Ljava/lang/String;",
+        |ctx, _args| {
+            let s = ctx.create_string("");
+            Ok(Some(Value::Object(Some(s))))
         },
     );
     r.set_category(__prev_cat);
@@ -1957,6 +2136,9 @@ fn register_memory_mxbean(r: &mut NativeMethodRegistry) {
         ctx.force_gc();
         Ok(None)
     });
+    // isVerbose() -- not one of the 6 synthetic fields; matches
+    // ClassLoadingMXBean.isVerbose's fixed-sentinel style.
+    r.register(cls, "isVerbose", "()Z", |_ctx, _args| Ok(Some(Value::Int(0))));
     r.set_category(__prev_cat);
 }
 
@@ -2100,6 +2282,56 @@ fn alloc_basic_thread_info(
     Ok(info)
 }
 
+/// Same shape as alloc_basic_thread_info, but with a caller-supplied real
+/// thread name instead of the hardcoded "main" -- used by dumpAllThreads to
+/// build one ThreadInfo per actually-enumerated live thread (Tomcat's
+/// Diagnostics.getThreadDump() calls dumpAllThreads and greps the result for
+/// connector I/O thread names like "http-nio-...").
+fn alloc_named_thread_info(
+    ctx: &mut dyn NativeContext,
+    thread_id: i64,
+    name: &str,
+) -> ObjectRef {
+    let stack_element_cid = jmx_class_id_or_object(ctx, "java/lang/StackTraceElement");
+    let monitor_info_cid = jmx_class_id_or_object(ctx, "java/lang/management/MonitorInfo");
+    let lock_info_cid = jmx_class_id_or_object(ctx, "java/lang/management/LockInfo");
+
+    let thread_name = ctx.create_string(name);
+    let name_pin = ctx.pin_native_root(thread_name);
+    let stack_trace = ctx.new_ref_array(stack_element_cid, 0);
+    let stack_pin = ctx.pin_native_root(stack_trace);
+    let locked_monitors = ctx.new_ref_array(monitor_info_cid, 0);
+    let monitors_pin = ctx.pin_native_root(locked_monitors);
+    let locked_synchronizers = ctx.new_ref_array(lock_info_cid, 0);
+    let synchronizers_pin = ctx.pin_native_root(locked_synchronizers);
+
+    let info = alloc_concurrent_synthetic(ctx, "java/lang/management/ThreadInfo", 18);
+
+    let thread_name = ctx.read_native_pin(name_pin, thread_name);
+    let stack_trace = ctx.read_native_pin(stack_pin, stack_trace);
+    let locked_monitors = ctx.read_native_pin(monitors_pin, locked_monitors);
+    let locked_synchronizers = ctx.read_native_pin(synchronizers_pin, locked_synchronizers);
+
+    ctx.set_field_by_name(info, "threadName", Value::Object(Some(thread_name)));
+    ctx.set_field_by_name(info, "threadId", Value::Long(thread_id));
+    ctx.set_field_by_name(info, "blockedTime", Value::Long(-1));
+    ctx.set_field_by_name(info, "blockedCount", Value::Long(0));
+    ctx.set_field_by_name(info, "waitedTime", Value::Long(-1));
+    ctx.set_field_by_name(info, "waitedCount", Value::Long(0));
+    ctx.set_field_by_name(info, "lockOwnerId", Value::Long(-1));
+    ctx.set_field_by_name(info, "priority", Value::Int(5));
+    ctx.set_field_by_name(info, "stackTrace", Value::Object(Some(stack_trace)));
+    ctx.set_field_by_name(info, "lockedMonitors", Value::Object(Some(locked_monitors)));
+    ctx.set_field_by_name(
+        info,
+        "lockedSynchronizers",
+        Value::Object(Some(locked_synchronizers)),
+    );
+
+    ctx.unpin_native_roots(name_pin);
+    info
+}
+
 fn alloc_thread_mxbean(ctx: &mut dyn NativeContext) -> ObjectRef {
     let obj = alloc_concurrent_synthetic(ctx, "java/lang/management/ThreadMXBean", 6);
     let thread_count = ctx.active_thread_count();
@@ -2140,12 +2372,43 @@ fn register_thread_mxbean(r: &mut NativeMethodRegistry) {
     r.register(cls, "getCurrentThreadUserTime", "()J", |_ctx, _args| {
         Ok(Some(Value::Long(-1)))
     });
+    // Per-thread-id variants (same "not supported" sentinel as the
+    // current-thread ones above) -- Tomcat's Diagnostics formats these for
+    // every ThreadInfo in a dump.
+    r.register(cls, "getThreadCpuTime", "(J)J", |_ctx, _args| {
+        Ok(Some(Value::Long(-1)))
+    });
+    r.register(cls, "getThreadUserTime", "(J)J", |_ctx, _args| {
+        Ok(Some(Value::Long(-1)))
+    });
     r.register(cls, "isThreadCpuTimeSupported", "()Z", |_ctx, _args| {
         Ok(Some(Value::Int(0)))
     });
     r.register(cls, "isThreadCpuTimeEnabled", "()Z", |_ctx, _args| {
         Ok(Some(Value::Int(0)))
     });
+    // Tomcat's Diagnostics.getVMInfo() (manager vminfo command) calls these
+    // three unconditionally, same family as isThreadCpuTimeSupported above
+    // -- not backed by any real per-thread accounting, so report
+    // conservatively unsupported.
+    r.register(
+        cls,
+        "isCurrentThreadCpuTimeSupported",
+        "()Z",
+        |_ctx, _args| Ok(Some(Value::Int(0))),
+    );
+    r.register(
+        cls,
+        "isObjectMonitorUsageSupported",
+        "()Z",
+        |_ctx, _args| Ok(Some(Value::Int(0))),
+    );
+    r.register(
+        cls,
+        "isSynchronizerUsageSupported",
+        "()Z",
+        |_ctx, _args| Ok(Some(Value::Int(0))),
+    );
     // ES-FAIL-05 — Elasticsearch `HotThreads.initializeRuntimeMonitoring()` (run
     // from `ESTestCase.<clinit>`) calls `isThreadContentionMonitoringSupported()`;
     // it was unregistered on the synthetic ThreadMXBean → AbstractMethodError
@@ -2237,13 +2500,45 @@ fn register_thread_mxbean(r: &mut NativeMethodRegistry) {
         "()[J",
         |_ctx, _args| Ok(Some(Value::Object(None))),
     );
+    // dumpAllThreads(boolean, boolean) -- Tomcat's Diagnostics.getThreadDump()
+    // (manager threaddump command) calls this and greps the result for
+    // connector I/O thread names (e.g. "http-nio-..."). Build one
+    // (name-only) ThreadInfo per actually-live thread via enumerate_threads
+    // rather than returning an empty array -- lock/monitor/synchronizer
+    // details (the two boolean params) are out of scope, matching the
+    // "basic" ThreadInfo helper's existing level of fidelity.
     r.register(
         cls,
         "dumpAllThreads",
         "(ZZ)[Ljava/lang/management/ThreadInfo;",
         |ctx, _args| {
-            let arr = ctx.new_ref_array(ClassId::new(0), 0);
-            Ok(Some(Value::Object(Some(arr))))
+            let threads = ctx.enumerate_threads(256);
+            let info_cid = jmx_class_id_or_object(ctx, "java/lang/management/ThreadInfo");
+            let arr = ctx.new_ref_array(info_cid, threads.len());
+            let arr_pin = ctx.pin_native_root(arr);
+            for (i, thread_obj) in threads.into_iter().enumerate() {
+                // Each iteration allocates (thread name string, ThreadInfo's
+                // own arrays, the ThreadInfo itself), so a moving GC can run
+                // mid-loop -- pin the still-unvisited thread object before
+                // dereferencing it, and re-read the (possibly relocated)
+                // array each time before writing into it.
+                let t_pin = ctx.pin_native_root(thread_obj);
+                let t = ctx.read_native_pin(t_pin, thread_obj);
+                let name = ctx
+                    .invoke_virtual(t, "getName", "()Ljava/lang/String;", &[])
+                    .ok()
+                    .flatten()
+                    .and_then(|v| match v {
+                        Value::Object(Some(s)) => ctx.read_string(s),
+                        _ => None,
+                    })
+                    .unwrap_or_else(|| format!("Thread-{i}"));
+                let info = alloc_named_thread_info(ctx, (i + 1) as i64, &name);
+                let arr_fresh = ctx.read_native_pin(arr_pin, arr);
+                ctx.set_array_element(arr_fresh, i, Value::Object(Some(info)));
+            }
+            let arr_final = ctx.read_native_pin(arr_pin, arr);
+            Ok(Some(Value::Object(Some(arr_final))))
         },
     );
     r.set_category(__prev_cat);
@@ -2890,6 +3185,30 @@ pub fn register_mbean_server(r: &mut NativeMethodRegistry) {
         },
     );
 
+    // add/removeNotificationListener(ObjectName, NotificationListener,
+    // NotificationFilter, Object). The synthetic registry doesn't implement
+    // real notification broadcasting (no MBean here ever fires a
+    // Notification), so there's nothing to actually wire up -- but real
+    // callers (e.g. Tomcat's StatusManagerServlet.init()/destroy(), which
+    // listens for MBeanServerNotification on the
+    // JMImplementation:type=MBeanServerDelegate delegate) need the call
+    // itself to succeed rather than AbstractMethodError on the un-overridden
+    // interface method. Match the file's existing leniency (unregisterMBean
+    // above no-ops rather than throwing InstanceNotFound too) -- accept
+    // unconditionally.
+    r.register(
+        cls,
+        "addNotificationListener",
+        "(Ljavax/management/ObjectName;Ljavax/management/NotificationListener;Ljavax/management/NotificationFilter;Ljava/lang/Object;)V",
+        |_ctx, _args| Ok(None),
+    );
+    r.register(
+        cls,
+        "removeNotificationListener",
+        "(Ljavax/management/ObjectName;Ljavax/management/NotificationListener;Ljavax/management/NotificationFilter;Ljava/lang/Object;)V",
+        |_ctx, _args| Ok(None),
+    );
+
     // registerMBean(Object, ObjectName) -> ObjectInstance. We store the
     // bean under its ObjectName key and return the ObjectName-bearing
     // ObjectInstance (callers mostly ignore the return or read getObjectName).
@@ -3146,11 +3465,18 @@ pub fn register_mbean_server(r: &mut NativeMethodRegistry) {
                 Some(Value::Object(opt)) => *opt,
                 _ => None,
             };
-            let op_name = match args.get(2) {
-                Some(Value::Object(Some(s))) => ctx.read_string(*s).unwrap_or_default(),
-                _ => String::new(),
+            let op_name_ref = match args.get(2) {
+                Some(Value::Object(Some(s))) => Some(*s),
+                _ => None,
             };
+            let op_name = op_name_ref
+                .and_then(|s| ctx.read_string(s))
+                .unwrap_or_default();
             let params = match args.get(3) {
+                Some(Value::Object(Some(a))) => Some(*a),
+                _ => None,
+            };
+            let signature = match args.get(4) {
                 Some(Value::Object(Some(a))) => Some(*a),
                 _ => None,
             };
@@ -3159,11 +3485,31 @@ pub fn register_mbean_server(r: &mut NativeMethodRegistry) {
                 Some(b) => b,
                 None => return Err(jmx_instance_not_found(&key)),
             };
-            // Build the argument list from the params Object[]. Construct a
-            // descriptor of (Ljava/lang/Object;)* matching the arity, which
-            // dispatches to a no-arg or N-Object-arg method. This covers the
-            // common JMX operation shapes (no-arg lifecycle ops, Object-typed
-            // operation params); typed primitive operations are out of scope.
+            // DynamicMBean (e.g. Tomcat modeler's BaseModelMBean, which wraps
+            // a real managed resource like HostConfig) exposes operations
+            // through its own invoke(String, Object[], String[]) -- that
+            // reflects into the WRAPPED RESOURCE's real method, not a method
+            // literally named op_name on the registered bean/wrapper
+            // itself. Try that first, passing the real params/signature
+            // arrays through faithfully (mirrors the getAttribute delegation
+            // above, which already does this for attribute reads).
+            if let Ok(Some(v)) = ctx.invoke_virtual(
+                bean,
+                "invoke",
+                "(Ljava/lang/String;[Ljava/lang/Object;[Ljava/lang/String;)Ljava/lang/Object;",
+                &[
+                    Value::Object(op_name_ref),
+                    Value::Object(params),
+                    Value::Object(signature),
+                ],
+            ) {
+                return Ok(Some(v));
+            }
+            // Fall back: build a descriptor of (Ljava/lang/Object;)* matching
+            // the arity, which dispatches to a no-arg or N-Object-arg method
+            // directly on bean. Covers plain user MBeans (a raw registered
+            // object whose operation IS a real Object-typed method on it),
+            // which is what this path was originally written for.
             let mut call_args: Vec<Value> = Vec::new();
             let mut desc = String::from("(");
             if let Some(arr) = params {

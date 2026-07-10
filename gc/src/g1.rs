@@ -603,6 +603,11 @@ impl<'a> SharedEvac<'a> {
         let mut offset = 0usize;
         while offset < cursor {
             let obj_ptr = base.add(offset);
+            // TLAB-retire gap sentinel: skip its exact span.
+            if let Some(gap) = gap_filler_len(obj_ptr) {
+                offset += gap;
+                continue;
+            }
             let (kind, etype, alen, nslots, is_filler, obj_size) = {
                 let header = &*(obj_ptr as *const ObjectHeader);
                 let is_filler = is_humongous_filler(header);
@@ -1534,6 +1539,13 @@ impl G1Collector {
             std::ptr::write_bytes(start_addr as *mut u8, 0, size);
         }
 
+        // Humongous bytes count toward the IHOP occupancy statistic (see
+        // `recompute_old_gen_bytes`). Bump it here too so a burst of
+        // humongous allocation can cross the marking threshold *between*
+        // pauses — the next pause's recompute replaces this running total,
+        // so drift never accumulates.
+        self.old_gen_bytes.fetch_add(size, Ordering::Relaxed);
+
         Some((start_addr as *mut u8, start))
     }
 
@@ -1815,12 +1827,7 @@ impl G1Collector {
             self.current_eden.store(usize::MAX, Ordering::Relaxed);
         }
 
-        let old_bytes: usize = regions
-            .iter()
-            .filter(|r| r.region_type == RegionType::Old)
-            .map(|r| r.cursor)
-            .sum();
-        self.old_gen_bytes.store(old_bytes, Ordering::Relaxed);
+        self.recompute_old_gen_bytes(&regions);
 
         monitors.remap_after_gc(&pointer_map);
 
@@ -1916,6 +1923,14 @@ impl G1Collector {
         // from the CSet, exactly like JNI-pinned regions. Empty unless a thread
         // is in JIT (the common case for a JIT-triggered young GC).
         let jit_pinned_regions = self.jit_pinned_region_set();
+        if std::env::var_os("CRATONVM_G1_DBG_PINS").is_some() {
+            eprintln!(
+                "[g1][PINS] young pause: jit_active={} pin_addrs={} pin_regions={:?}",
+                crate::gc_quiescence::is_active(),
+                crate::gc_quiescence::pinned_jit_root_count(),
+                jit_pinned_regions,
+            );
+        }
 
         // Build collection set: all Eden + Survivor regions (skip pinned + any
         // region holding a conservative JIT root)
@@ -2110,12 +2125,7 @@ impl G1Collector {
         // Update old gen bytes tracking.
         // Relaxed ordering: this is a statistics counter read only by IHOP heuristics;
         // exact inter-thread visibility ordering is not required.
-        let old_bytes: usize = regions
-            .iter()
-            .filter(|r| r.region_type == RegionType::Old)
-            .map(|r| r.cursor)
-            .sum();
-        self.old_gen_bytes.store(old_bytes, Ordering::Relaxed);
+        self.recompute_old_gen_bytes(&regions);
 
         // Remap monitors
         monitors.remap_after_gc(&pointer_map);
@@ -2481,12 +2491,7 @@ impl G1Collector {
         }
 
         // Relaxed ordering: statistics counter for IHOP heuristics only.
-        let old_bytes: usize = regions
-            .iter()
-            .filter(|r| r.region_type == RegionType::Old)
-            .map(|r| r.cursor)
-            .sum();
-        self.old_gen_bytes.store(old_bytes, Ordering::Relaxed);
+        self.recompute_old_gen_bytes(&regions);
 
         monitors.remap_after_gc(&pointer_map);
 
@@ -2855,11 +2860,18 @@ impl G1Collector {
         // before any reclassification (see `rset_cache_epoch`).
         self.rset_cache_epoch.fetch_add(1, Ordering::Release);
 
+        // Same conservative-JIT-root region exclusion as the serial path:
+        // objects held by un-rewritable JIT register/spill slots must not
+        // move. Empty (free) unless a thread is in JIT, and the young path
+        // only dispatches here when none is — this keeps the invariant even
+        // if that gate is ever loosened or the fn is called directly.
+        let jit_pinned_regions = self.jit_pinned_region_set();
         let cset: Vec<usize> = regions
             .iter()
             .enumerate()
-            .filter(|(_, r)| {
+            .filter(|(i, r)| {
                 !r.pinned
+                    && !jit_pinned_regions.contains(i)
                     && (r.region_type == RegionType::Eden || r.region_type == RegionType::Survivor)
             })
             .map(|(i, _)| i)
@@ -2918,12 +2930,7 @@ impl G1Collector {
             self.current_eden.store(usize::MAX, Ordering::Relaxed);
         }
 
-        let old_bytes: usize = regions
-            .iter()
-            .filter(|r| r.region_type == RegionType::Old)
-            .map(|r| r.cursor)
-            .sum();
-        self.old_gen_bytes.store(old_bytes, Ordering::Relaxed);
+        self.recompute_old_gen_bytes(&regions);
 
         monitors.remap_after_gc(&pointer_map);
 
@@ -2971,11 +2978,14 @@ impl G1Collector {
         // Build CSet: all young regions + worst (most-garbage) old regions,
         // bounded by both the percentage cap and the Step-7 pause budget —
         // identical selection to the serial `mixed_collection`.
+        // Conservative-JIT-root region exclusion — see young_collection_parallel.
+        let jit_pinned_regions = self.jit_pinned_region_set();
         let mut cset: Vec<usize> = regions
             .iter()
             .enumerate()
-            .filter(|(_, r)| {
+            .filter(|(i, r)| {
                 !r.pinned
+                    && !jit_pinned_regions.contains(i)
                     && (r.region_type == RegionType::Eden || r.region_type == RegionType::Survivor)
             })
             .map(|(i, _)| i)
@@ -2988,7 +2998,11 @@ impl G1Collector {
         let mut old_candidates: Vec<(usize, f64)> = regions
             .iter()
             .enumerate()
-            .filter(|(_, r)| r.region_type == RegionType::Old && !r.pinned)
+            .filter(|(i, r)| {
+                r.region_type == RegionType::Old
+                    && !r.pinned
+                    && !jit_pinned_regions.contains(i)
+            })
             .map(|(i, r)| (i, r.gc_efficiency))
             .collect();
         old_candidates.sort_by(|a, b| {
@@ -3056,12 +3070,7 @@ impl G1Collector {
             self.current_eden.store(usize::MAX, Ordering::Relaxed);
         }
 
-        let old_bytes: usize = regions
-            .iter()
-            .filter(|r| r.region_type == RegionType::Old)
-            .map(|r| r.cursor)
-            .sum();
-        self.old_gen_bytes.store(old_bytes, Ordering::Relaxed);
+        self.recompute_old_gen_bytes(&regions);
 
         monitors.remap_after_gc(&pointer_map);
 
@@ -3419,6 +3428,13 @@ impl G1Collector {
         let mut offset = 0usize;
         while offset < cursor {
             let obj_ptr = unsafe { base.add(offset) };
+            // TLAB-retire gap sentinel: skip its exact span (NOT a walkable
+            // header — see `gap_filler_len`; `break`ing here would skip the
+            // rest of a possibly-pinned source region's objects).
+            if let Some(gap) = gap_filler_len(obj_ptr) {
+                offset += gap;
+                continue;
+            }
             let header = unsafe { &*(obj_ptr as *const ObjectHeader) };
             // Round-9 gc CRIT-1: humongous continuation filler covers the
             // entire region; skip without trying to follow any oops.
@@ -3556,6 +3572,13 @@ impl G1Collector {
 
             while offset < cursor {
                 let obj_ptr = unsafe { base.add(offset) };
+                // TLAB-retire gap sentinel: skip its exact span — breaking
+                // here would leave the rest of this region's references
+                // un-fixed-up after evacuation (stale pointers).
+                if let Some(gap) = gap_filler_len(obj_ptr) {
+                    offset += gap;
+                    continue;
+                }
                 let header = unsafe { &*(obj_ptr as *const ObjectHeader) };
                 // Round-9 gc CRIT-1: humongous continuation filler covers
                 // the entire region; skip the rest.
@@ -3704,6 +3727,11 @@ impl G1Collector {
 
             while offset < cursor {
                 let obj_ptr = unsafe { base.add(offset) };
+                // TLAB-retire gap sentinel: skip its exact span.
+                if let Some(gap) = gap_filler_len(obj_ptr) {
+                    offset += gap;
+                    continue;
+                }
                 let header = unsafe { &*(obj_ptr as *const ObjectHeader) };
                 if is_humongous_filler(header) {
                     break;
@@ -3889,6 +3917,11 @@ impl G1Collector {
             let mut offset = 0usize;
             while offset < cursor {
                 let obj_ptr = unsafe { base.add(offset) };
+                // TLAB-retire gap sentinel: skip its exact span.
+                if let Some(gap) = gap_filler_len(obj_ptr) {
+                    offset += gap;
+                    continue;
+                }
                 let header = unsafe { &*(obj_ptr as *const ObjectHeader) };
                 if is_humongous_filler(header) {
                     break;
@@ -3981,6 +4014,11 @@ impl G1Collector {
             let mut off = 0usize;
             while off < cursor {
                 let obj_ptr = unsafe { base.add(off) };
+                // TLAB-retire gap sentinel: skip its exact span.
+                if let Some(gap) = gap_filler_len(obj_ptr) {
+                    off += gap;
+                    continue;
+                }
                 let header = unsafe { &*(obj_ptr as *const ObjectHeader) };
                 if is_humongous_filler(header) {
                     break;
@@ -4453,6 +4491,11 @@ impl G1Collector {
                 let mut offset = 0usize;
                 while offset < region.cursor {
                     let obj_addr = base + offset;
+                    // TLAB-retire gap sentinel: skip its exact span.
+                    if let Some(gap) = gap_filler_len(obj_addr as *const u8) {
+                        offset += gap;
+                        continue;
+                    }
                     // SAFETY: offset < cursor; header is within the region.
                     let header = unsafe { &*(obj_addr as *const ObjectHeader) };
                     if is_humongous_filler(header) {
@@ -4775,6 +4818,11 @@ impl G1Collector {
 
             while offset < region.cursor {
                 let obj_addr = base + offset;
+                // TLAB-retire gap sentinel: skip its exact span.
+                if let Some(gap) = gap_filler_len(obj_addr as *const u8) {
+                    offset += gap;
+                    continue;
+                }
                 let header = unsafe { &*(obj_addr as *const ObjectHeader) };
                 // Round-9 gc CRIT-1: humongous continuation filler covers
                 // the entire region with no live objects of its own; skip.
@@ -4859,6 +4907,13 @@ impl G1Collector {
         }
 
         self.reclaim_dead_humongous_spans_locked(&mut regions);
+
+        // Refresh the IHOP occupancy statistic NOW: cleanup just freed Old
+        // regions and dead humongous spans, and leaving the pre-cleanup sum
+        // in place until the next evacuation pause lets
+        // `g1_should_start_marking` immediately re-fire a pointless
+        // back-to-back mark cycle against stale occupancy.
+        self.recompute_old_gen_bytes(&regions);
 
         // Audit fix (HIGH-3): clear any stragglers from the gray set and
         // deactivate the SATB write barrier — the cycle is fully done.
@@ -4950,8 +5005,18 @@ impl G1Collector {
         let current_threshold = self.marking_threshold_bytes.load(Ordering::Relaxed);
 
         let new_threshold = if actual_pause_ms > target {
-            // Pause too long: lower threshold to start marking earlier
-            (current_threshold as f64 * 0.9) as usize
+            // Pause too long: lower threshold to start marking earlier —
+            // but FLOOR the decay at 1% of the heap (min one region). With
+            // no floor, a chronically-slow host (every pause > target)
+            // decays the threshold to 0 through integer truncation; the
+            // raise branch can never recover it (0 * 1.05 == 0) and the
+            // VM-side trigger gate (`g1_should_start_marking` requires
+            // `marking_threshold_bytes() > 0`) then reads a zero threshold
+            // as "marking disabled" — permanently: no cycle ever starts,
+            // Old/humongous garbage is never reclaimed, and the heap OOMs
+            // while mostly dead.
+            let floor = (self.config.heap_size / 100).max(self.config.region_size);
+            ((current_threshold as f64 * 0.9) as usize).max(floor)
         } else if actual_pause_ms < target / 2 {
             // Pause well under target: raise threshold — but NEVER above the
             // statically-configured IHOP. G1 has no full-GC fallback: letting
@@ -5285,6 +5350,38 @@ impl G1Collector {
     /// Get old-gen byte count.
     pub fn old_gen_bytes(&self) -> usize {
         self.old_gen_bytes.load(Ordering::Relaxed)
+    }
+
+    /// Recompute the IHOP occupancy statistic (`old_gen_bytes`) from the
+    /// region table: bytes in `Old` regions PLUS humongous spans.
+    ///
+    /// Humongous objects are logically part of the old generation — HotSpot's
+    /// IHOP compares old occupancy *including* humongous regions to the
+    /// threshold. Counting only `Old` regions here meant a humongous-heavy
+    /// workload (large arrays churned faster than they promote ordinary
+    /// objects) never crossed IHOP, so concurrent marking — the ONLY path
+    /// that reclaims dead humongous spans (`cleanup` →
+    /// `reclaim_dead_humongous_spans_locked`) — never started and the heap
+    /// filled with unreclaimable dead spans until OOM, while young pauses
+    /// spun freeing nothing.
+    ///
+    /// A `HumongousStart` region's `cursor` is the FULL object size (its
+    /// continuations carry `cursor = 0`), so summing both types counts each
+    /// humongous object exactly once.
+    fn recompute_old_gen_bytes(&self, regions: &[G1Region]) {
+        let old_bytes: usize = regions
+            .iter()
+            .filter(|r| {
+                matches!(
+                    r.region_type,
+                    RegionType::Old
+                        | RegionType::HumongousStart
+                        | RegionType::HumongousContinuation
+                )
+            })
+            .map(|r| r.cursor)
+            .sum();
+        self.old_gen_bytes.store(old_bytes, Ordering::Relaxed);
     }
 
     /// Get the IHOP marking threshold.
@@ -5941,19 +6038,21 @@ impl G1Collector {
             let mut offset = 0;
             while offset < used {
                 let ptr = (base + offset) as *mut u8;
+                // TLAB-retire gap sentinel: skip its exact span.
+                if let Some(gap) = gap_filler_len(ptr) {
+                    offset += gap;
+                    continue;
+                }
                 let header = unsafe { &*(ptr as *const ObjectHeader) };
                 // Round-9 gc CRIT-1: HumongousFiller is a walker sentinel;
                 // never report it as a real object.
                 if is_humongous_filler(header) {
                     break;
                 }
-                let total_size = if header.kind == ObjectKind::Array {
-                    HEADER_SIZE
-                        + array_data_size(header.array_length as usize, header.element_type)
-                            .unwrap_or(0)
-                } else {
-                    HEADER_SIZE + header.num_slots as usize * SLOT_SIZE
-                };
+                // `object_total_size` (not an inline recompute): its 0
+                // sentinel on a corrupt/overflowing array header stops the
+                // walk instead of yielding a HEADER_SIZE-strided phantom.
+                let total_size = object_total_size(header);
                 if total_size < HEADER_SIZE || offset + total_size > used {
                     break;
                 }
@@ -6598,6 +6697,35 @@ fn object_total_size(header: &ObjectHeader) -> usize {
 #[inline]
 fn is_humongous_filler(header: &ObjectHeader) -> bool {
     matches!(header.kind, ObjectKind::HumongousFiller)
+}
+
+/// TLAB-retire GAP sentinel probe (see `Tlab::retire`, tlab.rs): a
+/// sub-`HEADER_SIZE` TLAB tail cannot hold a walkable `int[]` filler, so it
+/// is stamped with `GAP_FILLER_CLASS_ID` at offset 0 and the exact gap
+/// length at offset 4. Such a span is NOT a walkable object — its "kind"
+/// byte is the low byte of the gap length. G1 refills TLABs from Eden
+/// regions, so every linear region walker in this file must skip these
+/// spans by their recorded length; treating one as an object header either
+/// desyncs the stride or (via the defensive size check) `break`s the walk
+/// and silently skips the REST of the region — fatal when the walk is a
+/// pinned-region source scan or the Phase-4 reference fix-up (missed
+/// evacuations / stale pointers). Returns the 8-aligned gap length when
+/// `ptr` points at a gap sentinel.
+///
+/// SAFETY contract: caller guarantees `ptr` points at >= 8 readable bytes
+/// inside a region (every walk loop checks `offset < cursor` first, and a
+/// gap is always a trailing 8..=32-byte span fully inside the region).
+#[inline]
+fn gap_filler_len(ptr: *const u8) -> Option<usize> {
+    let cid = unsafe { std::ptr::read(ptr as *const u32) };
+    if cid == crate::tlab::GAP_FILLER_CLASS_ID.as_u32() {
+        let len = unsafe { std::ptr::read((ptr as usize + 4) as *const u32) } as usize;
+        // Defensive: round a corrupt length up to a positive 8-multiple so
+        // the walk can never wedge in place.
+        Some(((len + 7) & !7).max(8))
+    } else {
+        None
+    }
 }
 
 /// True iff a region of this type can be a member of a collection set —

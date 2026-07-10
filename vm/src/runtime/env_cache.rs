@@ -235,6 +235,35 @@ pub fn tier_osr_backedge() -> Option<u32> {
     })
 }
 
+/// `CRATONVM_OSR_NEWARRAY` — back-edge OSR for methods containing a primitive
+/// `newarray` (0xbc). **Default: ON** (perf/throughput-20260710).
+///
+/// The 2026-07-10 BC-crypto session permanently OSR-denied any such method as
+/// a blanket workaround for an OSR corruption it attributed to
+/// `GOST3412_2015Engine.init_gf256_mul_table` ("resume with corrupt stack
+/// state for the next newarray length"). That deny forced every
+/// array-allocating hot loop in every program to stay interpreted forever —
+/// BenchSuite sieve250k regressed 3.2s → 177s (~55x), and BC's math/EC
+/// kernels lost OSR entirely under JIT-allow.
+///
+/// The corruption does not reproduce on the current tree: GOST3412Test soaks
+/// 10/10 at -Xmx256m across both getfield modes, a purpose-built
+/// nested-allocation-loop repro (OsrNewArrayRepro, the exact
+/// init_gf256_mul_table shape) is checksum-exact vs HotSpot under heap
+/// pressure, and the EC AllTests suite passes under full JIT-allow. The
+/// trigger was most plausibly one of the concurrently-fixed root gaps
+/// (ThreadLocal value rooting landed in the SAME commit as the deny). Set
+/// `CRATONVM_OSR_NEWARRAY=0` to restore the deny for bisection if a
+/// suspicious newarray-loop corruption ever resurfaces. Read once and cached.
+#[inline]
+pub fn osr_newarray_allowed() -> bool {
+    static CACHE: OnceLock<bool> = OnceLock::new();
+    *CACHE.get_or_init(|| match std::env::var("CRATONVM_OSR_NEWARRAY") {
+        Ok(v) => v != "0" && !v.eq_ignore_ascii_case("false"),
+        Err(_) => true,
+    })
+}
+
 /// `CRATONVM_DISABLE_INTRINSICS` — kill-switch that prevents the interpreter
 /// from ever populating a `CachedInvokeTarget::Intrinsic` inline-cache entry,
 /// forcing every call through the ordinary native/bytecode dispatch path.

@@ -1095,6 +1095,35 @@ pub fn throw_runtime_error(
             }
         }
     }
+    // CRATONVM_DBG_BUFUNDER: companion to the AIOOBE dump above for
+    // `BufferUnderflowException` raised Rust-side (native ByteBuffer /
+    // buffer-view helpers). These never pass through the `Athrow` opcode, so
+    // `CRATONVM_DBG_ATHROW` only ever shows the later Java-level rethrow
+    // (e.g. Lucene's `IOUtils.rethrowAlways`) — this dump names the true
+    // origin frame instead.
+    if std::env::var_os("CRATONVM_DBG_BUFUNDER").is_some()
+        && matches!(&error, RuntimeError::BufferUnderflowException)
+    {
+        eprintln!(
+            "[BUFUNDER-THROW] — full live Java thread stack ({} frames, deepest first):",
+            thread.frames.len()
+        );
+        for (i, f) in thread.frames.iter().enumerate().rev().take(25) {
+            let cn = shared
+                .class_manager
+                .read()
+                .get_class(f.class_id)
+                .map(|c| c.name.to_string())
+                .unwrap_or_default();
+            eprintln!(
+                "[BUFUNDER-STK {i}] {}.{}{} pc={}",
+                cn,
+                f.method_name(),
+                f.method_descriptor(),
+                f.pc
+            );
+        }
+    }
     if crate::runtime::env_cache::charset_dbg() {
         if let RuntimeError::NullPointerException { message: Some(m) } = &error {
             if m == "charset" {
