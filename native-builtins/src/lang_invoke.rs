@@ -245,6 +245,35 @@ pub(crate) fn vh_meta_update_field_index(ctx: &mut dyn NativeContext, vh: Object
 }
 
 // ---------------------------------------------------------------------------
+static P67_MEMORY_SEGMENT_VH_TABLE: std::sync::OnceLock<
+    parking_lot::Mutex<rustc_hash::FxHashMap<i32, i32>>,
+> = std::sync::OnceLock::new();
+
+fn p67_memory_segment_vh_table() -> &'static parking_lot::Mutex<rustc_hash::FxHashMap<i32, i32>> {
+    P67_MEMORY_SEGMENT_VH_TABLE
+        .get_or_init(|| parking_lot::Mutex::new(rustc_hash::FxHashMap::default()))
+}
+
+pub(crate) fn register_p67_memory_segment_var_handle(
+    ctx: &mut dyn NativeContext,
+    vh: ObjectRef,
+    width: i32,
+) {
+    ctx.register_var_handle_root(vh);
+    let key = ctx.identity_hash_code(vh);
+    p67_memory_segment_vh_table()
+        .lock()
+        .insert(key, width.clamp(1, 8));
+}
+
+pub(crate) fn p67_memory_segment_var_handle_width(
+    ctx: &dyn NativeContext,
+    vh: ObjectRef,
+) -> Option<i32> {
+    let key = ctx.identity_hash_code(vh);
+    p67_memory_segment_vh_table().lock().get(&key).copied()
+}
+
 // Descriptor helpers — reconstruct JVM descriptor from MethodType object
 // ---------------------------------------------------------------------------
 
@@ -909,6 +938,13 @@ pub fn register_phase54_method_handle(r: &mut NativeMethodRegistry) {
         |_ctx, args| Ok(Some(args.first().copied().unwrap_or(Value::Object(None)))),
     );
 
+    r.register(
+        vh,
+        "accessModeTypeUncached",
+        "(Ljava/lang/invoke/VarHandle$AccessType;)Ljava/lang/invoke/MethodType;",
+        varhandle_access_mode_type_uncached,
+    );
+
     // VarHandle.get(Object...) → Object
     // For instance fields: args = [receiver]; for static: args = []
     r.register(
@@ -1266,6 +1302,169 @@ fn array_element_desc(ctx: &dyn NativeContext, arr: ObjectRef) -> &'static str {
         ArrayElementType::Float => DESC_FLOAT,
         ArrayElementType::Double => DESC_DOUBLE,
         ArrayElementType::Reference => DESC_REF,
+    }
+}
+
+fn vh_access_type_ordinal(ctx: &mut dyn NativeContext, access_type: ObjectRef) -> i32 {
+    if let Value::Int(v) = ctx.get_field(access_type, 1) {
+        return v;
+    }
+    if let Value::Int(v) = ctx.get_field_by_name(access_type, "ordinal") {
+        return v;
+    }
+    match ctx.invoke_virtual(access_type, "ordinal", "()I", &[]) {
+        Ok(Some(Value::Int(v))) => v,
+        _ => 0,
+    }
+}
+
+fn vh_width_descriptor(width: i32) -> &'static str {
+    match width {
+        1 => DESC_BYTE,
+        2 => DESC_SHORT,
+        4 => DESC_INT,
+        8 => DESC_LONG,
+        _ => DESC_OBJECT,
+    }
+}
+
+fn vh_sanitize_value_descriptor(desc: &str) -> Cow<'static, str> {
+    if desc == DESC_REF || desc.is_empty() {
+        Cow::Borrowed(DESC_OBJECT)
+    } else if desc.len() == 1
+        || desc.starts_with('[')
+        || (desc.starts_with('L') && desc.ends_with(';'))
+    {
+        Cow::Owned(desc.to_string())
+    } else {
+        Cow::Borrowed(DESC_OBJECT)
+    }
+}
+
+fn vh_access_mode_descriptor(access_type: i32, coords: &[String], value_desc: &str) -> String {
+    let value_desc = vh_sanitize_value_descriptor(value_desc);
+    let mut params = String::new();
+    for coord in coords {
+        params.push_str(coord);
+    }
+    let mut desc = String::from("(");
+    match access_type {
+        1 => {
+            desc.push_str(&params);
+            desc.push_str(&value_desc);
+            desc.push(')');
+            desc.push_str(DESC_VOID);
+        }
+        2 => {
+            desc.push_str(&params);
+            desc.push_str(&value_desc);
+            desc.push_str(&value_desc);
+            desc.push(')');
+            desc.push_str(DESC_BOOLEAN);
+        }
+        3 => {
+            desc.push_str(&params);
+            desc.push_str(&value_desc);
+            desc.push_str(&value_desc);
+            desc.push(')');
+            desc.push_str(&value_desc);
+        }
+        4 => {
+            desc.push_str(&params);
+            desc.push_str(&value_desc);
+            desc.push(')');
+            desc.push_str(&value_desc);
+        }
+        _ => {
+            desc.push_str(&params);
+            desc.push(')');
+            desc.push_str(&value_desc);
+        }
+    }
+    desc
+}
+
+fn p67_memory_segment_varhandle_descriptor(
+    ctx: &mut dyn NativeContext,
+    vh: ObjectRef,
+    access_type: i32,
+) -> Option<String> {
+    let slot_width = if ctx.get_field(vh, 2).as_int() == Some(3) {
+        ctx.get_field(vh, 1).as_int()
+    } else {
+        None
+    };
+    if let Some(width) = p67_memory_segment_var_handle_width(ctx, vh).or(slot_width) {
+        let coords = vec![
+            "Ljava/lang/foreign/MemorySegment;".to_string(),
+            DESC_LONG.to_string(),
+        ];
+        return Some(vh_access_mode_descriptor(
+            access_type,
+            &coords,
+            vh_width_descriptor(width),
+        ));
+    }
+    if is_segment_var_handle(ctx, vh) {
+        let value_desc = segment_vh_fields(ctx, vh)
+            .map(|(layout, _, _)| seg_shape_desc(segment_layout_shape(ctx, layout)))
+            .unwrap_or(DESC_LONG);
+        let coords = vec![
+            "Ljava/lang/foreign/MemorySegment;".to_string(),
+            DESC_LONG.to_string(),
+        ];
+        return Some(vh_access_mode_descriptor(access_type, &coords, value_desc));
+    }
+    None
+}
+
+fn varhandle_access_mode_type_uncached(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    let this = obj_arg(args, 0)?;
+    let access_type = match args.get(1) {
+        Some(Value::Object(Some(access_type))) => *access_type,
+        _ => return Ok(None),
+    };
+    let access_type = vh_access_type_ordinal(ctx, access_type);
+
+    let desc = if let Some(desc) = p67_memory_segment_varhandle_descriptor(ctx, this, access_type) {
+        desc
+    } else {
+        let meta = vh_meta_get(ctx, this);
+        let kind = meta
+            .as_deref()
+            .map(|m| m.kind)
+            .or_else(|| ctx.get_field(this, VH_KIND).as_int())
+            .unwrap_or(VH_KIND_INSTANCE);
+        let value_desc = meta
+            .as_deref()
+            .map(|m| Cow::Owned(m.field_desc.clone()))
+            .unwrap_or_else(|| vh_field_desc(ctx, this));
+        let coords = match kind {
+            VH_KIND_STATIC => Vec::new(),
+            VH_KIND_ARRAY => vec![DESC_OBJECT.to_string(), DESC_INT.to_string()],
+            VH_KIND_BYTE_VIEW_LE | VH_KIND_BYTE_VIEW_BE => {
+                vec!["[B".to_string(), DESC_INT.to_string()]
+            }
+            VH_KIND_BYTE_BUFFER_VIEW_LE | VH_KIND_BYTE_BUFFER_VIEW_BE => {
+                vec!["Ljava/nio/ByteBuffer;".to_string(), DESC_INT.to_string()]
+            }
+            _ => {
+                let receiver = meta
+                    .as_deref()
+                    .map(|m| class_name_to_descriptor(&m.class_name).into_owned())
+                    .unwrap_or_else(|| DESC_OBJECT.to_string());
+                vec![receiver]
+            }
+        };
+        vh_access_mode_descriptor(access_type, &coords, &value_desc)
+    };
+
+    match build_method_type_from_descriptor(ctx, &desc) {
+        Some(mt) => Ok(Some(Value::Object(Some(mt)))),
+        None => Ok(None),
     }
 }
 
@@ -8783,6 +8982,47 @@ mod tests {
             ctx.get_field(recv, 0),
             Value::Int(99),
             "field must be the new value"
+        );
+    }
+
+    #[test]
+    fn p67_memory_segment_varhandle_access_mode_type_uses_segment_and_offset_coordinates() {
+        let mut ctx = MockNativeContext::new();
+        let vh = alloc_concurrent_synthetic(&mut ctx, "java/lang/invoke/VarHandle", 3);
+        register_p67_memory_segment_var_handle(&mut ctx, vh, 4);
+
+        let access_type =
+            alloc_concurrent_synthetic(&mut ctx, "java/lang/invoke/VarHandle$AccessType", 2);
+        ctx.set_field(access_type, 1, Value::Int(0));
+        let get_mt = match varhandle_access_mode_type_uncached(
+            &mut ctx,
+            &[Value::Object(Some(vh)), Value::Object(Some(access_type))],
+        )
+        .unwrap()
+        .unwrap()
+        {
+            Value::Object(Some(mt)) => mt,
+            other => panic!("expected MethodType, got {other:?}"),
+        };
+        assert_eq!(
+            descriptor_from_method_type(&ctx, get_mt),
+            "(Ljava/lang/foreign/MemorySegment;J)I"
+        );
+
+        ctx.set_field(access_type, 1, Value::Int(1));
+        let set_mt = match varhandle_access_mode_type_uncached(
+            &mut ctx,
+            &[Value::Object(Some(vh)), Value::Object(Some(access_type))],
+        )
+        .unwrap()
+        .unwrap()
+        {
+            Value::Object(Some(mt)) => mt,
+            other => panic!("expected MethodType, got {other:?}"),
+        };
+        assert_eq!(
+            descriptor_from_method_type(&ctx, set_mt),
+            "(Ljava/lang/foreign/MemorySegment;JI)V"
         );
     }
 

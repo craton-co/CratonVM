@@ -20348,7 +20348,31 @@ pub(crate) fn is_ffm_memory_layout_native_override(
     class_name == "java/lang/foreign/MemoryLayout"
         && matches!(
             (method_name, descriptor),
-            ("name", "()Ljava/util/Optional;")
+            (
+                "sequenceLayout",
+                "(JLjava/lang/foreign/MemoryLayout;)Ljava/lang/foreign/SequenceLayout;"
+            ) | (
+                "sequenceLayout",
+                "(JLjava/lang/foreign/MemoryLayout;)Ljava/lang/foreign/MemoryLayout;"
+            ) | (
+                "structLayout",
+                "([Ljava/lang/foreign/MemoryLayout;)Ljava/lang/foreign/StructLayout;"
+            ) | (
+                "structLayout",
+                "([Ljava/lang/foreign/MemoryLayout;)Ljava/lang/foreign/MemoryLayout;"
+            ) | (
+                "unionLayout",
+                "([Ljava/lang/foreign/MemoryLayout;)Ljava/lang/foreign/UnionLayout;"
+            ) | (
+                "unionLayout",
+                "([Ljava/lang/foreign/MemoryLayout;)Ljava/lang/foreign/MemoryLayout;"
+            ) | ("paddingLayout", "(J)Ljava/lang/foreign/PaddingLayout;")
+                | ("paddingLayout", "(J)Ljava/lang/foreign/MemoryLayout;")
+                | (
+                    "varHandle",
+                    "([Ljava/lang/foreign/MemoryLayout$PathElement;)Ljava/lang/invoke/VarHandle;"
+                )
+                | ("name", "()Ljava/util/Optional;")
                 | (
                     "withName",
                     "(Ljava/lang/String;)Ljava/lang/foreign/MemoryLayout;"
@@ -31478,6 +31502,22 @@ mod tests {
         assert!(!is_ffm_symbol_lookup_native_override(
             "java/lang/foreign/Linker",
             "find",
+            descriptor
+        ));
+    }
+
+    #[test]
+    fn ffm_memory_layout_force_native_covers_varhandle() {
+        let descriptor =
+            "([Ljava/lang/foreign/MemoryLayout$PathElement;)Ljava/lang/invoke/VarHandle;";
+        assert!(is_ffm_memory_layout_native_override(
+            "java/lang/foreign/MemoryLayout",
+            "varHandle",
+            descriptor
+        ));
+        assert!(force_native_over_real_jdk_bytecode(
+            "java/lang/foreign/MemoryLayout",
+            "varHandle",
             descriptor
         ));
     }
