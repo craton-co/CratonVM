@@ -21366,33 +21366,6 @@ fn force_native_over_real_jdk_bytecode(
         return true;
     }
 
-    // `Executors.newSingleThreadExecutor()`/`newFixedThreadPool()`/
-    // `newCachedThreadPool()` (native-builtins/src/lib.rs's
-    // `native_new_single_thread`/`native_new_fixed_pool`/`native_new_cached_pool`)
-    // allocate their return value under the REAL class name
-    // `java/util/concurrent/ThreadPoolExecutor` with only a 2-field synthetic
-    // layout (poolSize/isShutdown) — real fields like `ctl`/`workQueue`/
-    // `mainLock` are never set. `execute(Runnable)` is invoked via
-    // `invokeinterface Executor.execute`/`ExecutorService.execute` on these
-    // objects; once the interface call resolves to the concrete class's own
-    // real `ThreadPoolExecutor.execute()` bytecode (which the real class
-    // genuinely declares), that bytecode reads the never-initialized `ctl`
-    // AtomicInteger and NPEs immediately — observed killing WildFly's
-    // process-controller "Read thread" (org.jboss.as.process.protocol.
-    // ConnectionImpl$2, `readExecutor.execute(this)`) before host.xml is ever
-    // parsed. The registered native (`native_es_execute`, also registered
-    // directly on this class alongside the ExecutorService interface) runs
-    // the task immediately on the calling thread — correct for these
-    // synthetic single-purpose executors, and the behavior every prior
-    // session's test suite already validated against before this regression.
-    // Force it so real bytecode never sees the half-initialized receiver.
-    if class_name == "java/util/concurrent/ThreadPoolExecutor"
-        && method_name == "execute"
-        && method_descriptor == "(Ljava/lang/Runnable;)V"
-    {
-        return true;
-    }
-
     // `java.util.logging.Level.parse(String)` real bytecode resolves custom
     // and even standard level names through `KnownLevel.findByName`, which
     // on JDK 25 throws internally (a `Module`-null NPE the method's own
@@ -29334,15 +29307,6 @@ fn execute_invokevirtual_vtable_fast(
         }
     };
 
-    if std::env::var_os("CRATONVM_DBG_TPEXEC").is_some()
-        && &*method_name == "execute"
-        && &*method_descriptor == "(Ljava/lang/Runnable;)V"
-    {
-        eprintln!(
-            "[dbg-tpexec] vtable_fast ENTERED method_class_name={}",
-            method_class_name
-        );
-    }
     // Step 3 — peek the receiver. The receiver sits `num_params_slots`
     // down the operand stack from the top.
     let num_params = num_params_slots;
@@ -29661,15 +29625,6 @@ fn execute_invokevirtual_vtable_fast(
                         .native_methods
                         .find(rcv_name, &method_name, &method_descriptor)
                         .is_some();
-                if std::env::var_os("CRATONVM_DBG_TPEXEC").is_some()
-                    && &*method_name == "execute"
-                    && &*method_descriptor == "(Ljava/lang/Runnable;)V"
-                {
-                    eprintln!(
-                        "[dbg-tpexec] direct_native_shadow rcv_name={} direct={}",
-                        rcv_name, direct_native_shadow
-                    );
-                }
                 if direct_native_shadow {
                     remember_vtable_native_shadow(thread, native_shadow_cache_key, true);
                     if &**rcv_name == "java/lang/invoke/ConstantCallSite"
@@ -29825,17 +29780,6 @@ fn execute_invokevirtual_vtable_fast(
             .get_class(cratonvm_types::ClassId::new(declaring_class_id as u32))
             .map(|c| c.name.to_string())
             .unwrap_or_else(|| cached.class_name.to_string());
-        if std::env::var_os("CRATONVM_DBG_TPEXEC").is_some()
-            && &*method_name == "execute"
-            && &*method_descriptor == "(Ljava/lang/Runnable;)V"
-        {
-            eprintln!(
-                "[dbg-tpexec] vtable_fast Step4 declaring_name={} force={} has_native={}",
-                declaring_name,
-                force_native_over_real_jdk_bytecode(&declaring_name, &method_name, &method_descriptor),
-                shared.native_methods.find(&declaring_name, &method_name, &method_descriptor).is_some(),
-            );
-        }
         if force_native_over_real_jdk_bytecode(&declaring_name, &method_name, &method_descriptor)
             && shared
                 .native_methods

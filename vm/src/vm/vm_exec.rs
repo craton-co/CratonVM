@@ -14188,23 +14188,6 @@ fn invoke_on_class_shared_inner(
             .get_class(declaring_class_id)
             .map(|c| c.name.to_string())
             .unwrap_or_default();
-        if std::env::var_os("CRATONVM_DBG_TPEXEC").is_some()
-            && method_name == "execute"
-            && descriptor == "(Ljava/lang/Runnable;)V"
-        {
-            eprintln!(
-                "[dbg-tpexec] class_id={} declaring_class_id={} class_name_for_force={} force={}",
-                class_id.as_u32(),
-                declaring_class_id.as_u32(),
-                class_name_for_force,
-                crate::runtime::interpreter::should_force_registered_native_over_bytecode(
-                    shared,
-                    &class_name_for_force,
-                    method_name,
-                    descriptor,
-                ),
-            );
-        }
         if crate::runtime::interpreter::should_force_registered_native_over_bytecode(
             shared,
             &class_name_for_force,
